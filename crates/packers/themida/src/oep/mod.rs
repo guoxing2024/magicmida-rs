@@ -18,7 +18,7 @@ pub use restore::{
     restore_stolen_oep_msvc6, restore_stolen_oep_msvc9_dll, write_msvc_oep_x64,
 };
 
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, info, warn};
 
 use mida_core::DebuggerCore;
 
