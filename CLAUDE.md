@@ -42,6 +42,8 @@ crates/
 
 - 优先用 trait + 泛型而非动态分发，除非确实需要运行时多态（如 packer 插件）
 - 模块文件不超过 500 行；超过就拆子模块
+  - **例外**：包含单一超大编排函数的文件（如 `dumper.rs` 的 `dump_process` 943行、`windows_debugger.rs` 的 `impl WindowsDebugger` 整块、`cli/unpacker/mod.rs` 的 `unpack()` 主流程），强拆会破坏逻辑内聚性，允许超标但必须在文件头注明 `// eslint-allow-over-500-lines: <reason>`
+  - **例外**：纯数据表文件（如 `apiset_data.rs` 1540行 const 数组）不受此规则约束
 - 测试和代码放一起（#[cfg(test)] mod tests）
 - 公开类型实现 Debug；敏感类型（含句柄/指针）手动实现 Debug 脱敏
 
