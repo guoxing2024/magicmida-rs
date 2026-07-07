@@ -26,9 +26,7 @@ pub use decision::{trace_is_at_api, TraceStepDecision};
 #[cfg(test)]
 pub(crate) use decision::is_real_api_address;
 
-use tracing::debug;
-
-use mida_core::debugger::{ContinueStatus, DebugEvent, DebuggerCore};
+use mida_core::debugger::{DebugEvent, DebuggerCore};
 use mida_tracer::LogMsgType;
 
 use crate::common::ThemidaState;
@@ -442,9 +440,6 @@ pub(crate) fn thread_id_of(ev: &DebugEvent) -> u32 {
         DebugEvent::ExitProcess { .. } => 0,
     }
 }
-
-// Keep debug referenced (used in slot.rs but imported here for completeness).
-const _: fn() = || { let _ = debug; };
 
 // ===========================================================================
 // Tests
