@@ -23,6 +23,7 @@ pub mod section;
 pub mod utils;
 pub mod import_table;
 pub mod apiset;
+pub mod apiset_data;
 pub mod dumper;
 pub mod original_imports;
 pub mod relocation;
