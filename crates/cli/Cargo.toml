@@ -1,0 +1,16 @@
+[package]
+name = "mida-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Command-line interface for Magicmida-RS"
+
+[dependencies]
+mida-core = { path = "../core" }
+mida-pe = { path = "../pe" }
+mida-disasm = { path = "../disasm" }
+mida-tracer = { path = "../tracer" }
+mida-packers-themida = { path = "../packers/themida" }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+windows = { workspace = true }

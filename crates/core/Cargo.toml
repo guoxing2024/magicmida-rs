@@ -1,0 +1,11 @@
+[package]
+name = "mida-core"
+version = "0.1.0"
+edition = "2021"
+description = "Debugger core: process creation, breakpoints, debug event loop"
+
+[dependencies]
+pelite = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+windows = { workspace = true }

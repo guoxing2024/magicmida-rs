@@ -1,0 +1,12 @@
+[package]
+name = "mida-tracer"
+version = "0.1.0"
+edition = "2021"
+description = "Single-step trace engine for following unpacker control flow"
+
+[dependencies]
+mida-core = { path = "../core" }
+mida-disasm = { path = "../disasm" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+windows = { workspace = true }

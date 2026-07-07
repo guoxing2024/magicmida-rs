@@ -1,0 +1,16 @@
+[package]
+name = "mida-packers-themida"
+version = "0.1.0"
+edition = "2021"
+description = "Themida unpacker implementation"
+
+[dependencies]
+mida-core = { path = "../../core" }
+mida-pe = { path = "../../pe" }
+mida-disasm = { path = "../../disasm" }
+mida-tracer = { path = "../../tracer" }
+iced-x86 = { workspace = true }
+sha2 = "0.10"
+thiserror = { workspace = true }
+tracing = { workspace = true }
+windows = { workspace = true }

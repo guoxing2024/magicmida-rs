@@ -1,0 +1,13 @@
+[package]
+name = "mida-pe"
+version = "0.1.0"
+edition = "2021"
+description = "PE parsing, section operations, import table reconstruction"
+
+[dependencies]
+mida-core = { path = "../core" }
+pelite = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+windows = { workspace = true }
+mida-disasm = { path = "../disasm" }

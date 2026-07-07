@@ -1,0 +1,10 @@
+[package]
+name = "mida-disasm"
+version = "0.1.0"
+edition = "2021"
+description = "iced-x86 wrapper for instruction disassembly and pattern matching"
+
+[dependencies]
+iced-x86 = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
