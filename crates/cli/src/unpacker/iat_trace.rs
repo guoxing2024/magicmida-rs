@@ -200,6 +200,7 @@ fn handle_trace_result(dbg: &mut ProcessSession, trace: &mut IatTraceState) -> R
     if trace.trace_in_vm {
         if !trace.did_set_exit_process {
             trace.did_set_exit_process = true;
+            // SAFETY: kernel32.dll is always loaded; the byte literal is null-terminated and lives for the call duration.
             let real_exit_process = unsafe {
                 use windows::core::PCSTR;
                 use windows::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
@@ -292,6 +293,7 @@ pub(super) fn advance_to_next_slot(dbg: &mut ProcessSession, trace: &mut IatTrac
         if trace.resolved_count > 0 {
             let write_size = trace.total_slots * std::mem::size_of::<usize>();
             let mut old_protect = PAGE_PROTECTION_FLAGS::default();
+            // SAFETY: dbg.process_handle() is a valid process handle; trace.iat_address and write_size are valid IAT bounds; old_protect is a valid out-pointer.
             unsafe {
                 VirtualProtectEx(
                     dbg.process_handle(),
@@ -303,11 +305,13 @@ pub(super) fn advance_to_next_slot(dbg: &mut ProcessSession, trace: &mut IatTrac
             }
             .map_err(|e| anyhow!("VirtualProtectEx failed for IAT: {e}"))?;
 
+            // SAFETY: dbg.process_handle() is a valid process handle; trace.iat_address and write_size are valid IAT bounds; old_protect is a valid out-pointer.
             dbg.write_memory(trace.iat_address, unsafe {
                 std::slice::from_raw_parts(trace.slot_values.as_ptr() as *const u8, write_size)
             })?;
 
             let mut _restored = PAGE_PROTECTION_FLAGS::default();
+            // SAFETY: dbg.process_handle() is a valid process handle; trace.iat_address and write_size are valid IAT bounds; old_protect is a valid out-pointer.
             unsafe {
                 VirtualProtectEx(
                     dbg.process_handle(),

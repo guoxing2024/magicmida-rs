@@ -82,6 +82,7 @@ pub fn install_iat_guard(
         return Err(ThemidaError::Debugger("IAT guard: size cannot be zero".into()));
     }
     let mut old_protect = PAGE_PROTECTION_FLAGS::default();
+    // SAFETY: h_process is a valid process handle; iat_start/text_section_start is a valid virtual address; old_protect is a valid out-pointer.
     unsafe {
         VirtualProtectEx(
             h_process,
@@ -103,6 +104,7 @@ pub fn temporary_un_guard_iat(
     iat_size: usize,
 ) -> Result<PAGE_PROTECTION_FLAGS, ThemidaError> {
     let mut old_protect = PAGE_PROTECTION_FLAGS::default();
+    // SAFETY: h_process is a valid process handle; iat_start/text_section_start is a valid virtual address; old_protect is a valid out-pointer.
     unsafe {
         VirtualProtectEx(
             h_process,
@@ -123,6 +125,7 @@ pub fn re_guard_iat(
     iat_size: usize,
 ) -> Result<(), ThemidaError> {
     let mut old_protect = PAGE_PROTECTION_FLAGS::default();
+    // SAFETY: h_process is a valid process handle; iat_start/text_section_start is a valid virtual address; old_protect is a valid out-pointer.
     unsafe {
         VirtualProtectEx(
             h_process,
@@ -148,6 +151,7 @@ pub fn install_code_section_guard(
         return Err(ThemidaError::Debugger("Code section guard: size cannot be zero".into()));
     }
     let mut old_protect = PAGE_PROTECTION_FLAGS::default();
+    // SAFETY: h_process is a valid process handle; iat_start/text_section_start is a valid virtual address; old_protect is a valid out-pointer.
     unsafe {
         VirtualProtectEx(
             h_process,
@@ -205,6 +209,7 @@ pub fn process_guarded_access(
 
     // Temporarily restore full access so the faulting instruction can complete
     // (matches `VirtualProtectEx(..., PAGE_EXECUTE_READWRITE, ...)` in Pascal).
+    // SAFETY: h_process is a valid process handle; iat_start/text_section_start is a valid virtual address; old_protect is a valid out-pointer.
     unsafe {
         VirtualProtectEx(
             h_process,
@@ -223,6 +228,7 @@ pub fn process_guarded_access(
     if state.ftm_guard {
         state.ftm_guard = false;
         debug!("FTMGuard: re-installing .text guard after TLS execution");
+        // SAFETY: h_process is a valid process handle; iat_start/text_section_start is a valid virtual address; old_protect is a valid out-pointer.
         unsafe {
             VirtualProtectEx(
                 h_process,
@@ -319,6 +325,7 @@ pub fn process_guarded_access(
 
         // Switch guard region; allow read+write but disallow execute so the
         // executing TLS callback can run.
+        // SAFETY: h_process is a valid process handle; iat_start/text_section_start is a valid virtual address; old_protect is a valid out-pointer.
         unsafe {
             VirtualProtectEx(
                 h_process,
@@ -386,6 +393,7 @@ pub fn restore_code_section_guard(
     protection: u32,
 ) -> Result<(), ThemidaError> {
     let mut old_protect = PAGE_PROTECTION_FLAGS::default();
+    // SAFETY: h_process is a valid process handle; iat_start/text_section_start is a valid virtual address; old_protect is a valid out-pointer.
     unsafe {
         VirtualProtectEx(
             h_process,
@@ -407,6 +415,7 @@ pub fn remove_code_section_guard(
     text_section_size: usize,
 ) -> Result<(), ThemidaError> {
     let mut old_protect = PAGE_PROTECTION_FLAGS::default();
+    // SAFETY: h_process is a valid process handle; iat_start/text_section_start is a valid virtual address; old_protect is a valid out-pointer.
     unsafe {
         VirtualProtectEx(
             h_process,

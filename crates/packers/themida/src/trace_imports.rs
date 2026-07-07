@@ -189,6 +189,7 @@ pub fn trace_imports(
     let bytes_read = debugger
         .read_memory(
             iat.address,
+            // SAFETY: iat_data is a Vec<usize>; the aliasing slice covers len * ptr_size bytes and is discarded after read_memory.
             unsafe {
                 std::slice::from_raw_parts_mut(
                     iat_data.as_mut_ptr() as *mut u8,
@@ -376,6 +377,7 @@ pub fn trace_imports(
         let bytes_written = debugger
             .write_memory(
                 iat.address,
+                // SAFETY: iat_data is a Vec<usize>; the aliasing immutable slice covers exactly write_size bytes and is discarded after write_memory.
                 unsafe {
                     std::slice::from_raw_parts(iat_data.as_ptr() as *const u8, write_size)
                 },

@@ -1042,6 +1042,7 @@ fn resolve_get_version_addr(
         GetModuleHandleW(PCWSTR::from_raw(kernel32_name.as_ptr()))
             .map_err(|e| ThemidaError::Debugger(format!("GetModuleHandle(kernel32): {e}")))?
     };
+    // SAFETY: calling a Windows FFI function with validated, properly-lifetime arguments.
     let get_version_host = unsafe {
         let name = std::ffi::CStr::from_bytes_with_nul_unchecked(b"GetVersion\0");
         windows::Win32::System::LibraryLoader::GetProcAddress(k32_handle, name)

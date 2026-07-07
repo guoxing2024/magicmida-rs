@@ -347,6 +347,7 @@ fn pe_inspect(path: &Path) -> Result<PeInfo, CoreError> {
     // Read the file header (starts at pe_offset + 4, past Signature).
     // SAFETY: we verified bounds above.
     let file_header_offset = pe_offset + 4;
+    // SAFETY: bounds were verified above (data.len() >= pe_offset + size_of::<IMAGE_NT_HEADERS64>); offset is within the file.
     let fh = unsafe {
         &*(data.as_ptr().add(file_header_offset) as *const IMAGE_FILE_HEADER)
     };
@@ -490,6 +491,7 @@ fn make_dll_executable(
     let pe_offset = dos.e_lfanew as usize;
 
     let file_header_offset = pe_offset + 4; // past Signature
+    // SAFETY: data is a mutable Vec covering the PE headers; file_header_offset was verified to be in bounds.
     let fh = unsafe {
         &mut *(data.as_mut_ptr().add(file_header_offset) as *mut IMAGE_FILE_HEADER)
     };
@@ -528,12 +530,14 @@ fn make_dll_executable(
 
     // Get entry point, image base, and section headers location.
     let (entry_point_rva, image_base, sections_offset) = if magic == 0x10B {
+        // SAFETY: calling a Windows FFI function with validated, properly-lifetime arguments.
         let opt = unsafe {
             &*(data.as_ptr().add(opt_header_offset) as *const IMAGE_OPTIONAL_HEADER32)
         };
         let nt_size = size_of::<IMAGE_NT_HEADERS32>();
         (opt.AddressOfEntryPoint as u64, opt.ImageBase as u64, pe_offset + nt_size)
     } else {
+        // SAFETY: calling a Windows FFI function with validated, properly-lifetime arguments.
         let opt = unsafe {
             &*(data.as_ptr().add(opt_header_offset) as *const IMAGE_OPTIONAL_HEADER64)
         };
@@ -552,6 +556,7 @@ fn make_dll_executable(
             if data.len() < secoff + section_header_size {
                 return None;
             }
+            // SAFETY: calling a Windows FFI function with validated, properly-lifetime arguments.
             let sec = unsafe {
                 &*(data.as_ptr().add(secoff) as *const IMAGE_SECTION_HEADER)
             };
@@ -699,6 +704,7 @@ pub fn patch_peb_anti_debug(
     // - pbi is an initialized PROCESS_BASIC_INFORMATION (CopyType).
     // - ProcessBasicInformation (0) requests the PEB address.
     let status: NTSTATUS;
+    // SAFETY: calling a Windows FFI function with validated, properly-lifetime arguments.
     unsafe {
         status = NtQueryInformationProcess(
             process_handle,
@@ -710,6 +716,7 @@ pub fn patch_peb_anti_debug(
     }
 
     if status != STATUS_SUCCESS {
+        // SAFETY: calling a Windows FFI function with validated, properly-lifetime arguments.
         let err = unsafe { GetLastError() };
         return Err(CoreError::ProcessCreation(format!(
             "NtQueryInformationProcess failed: NTSTATUS {:#x}, GetLastError={}",

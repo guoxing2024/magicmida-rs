@@ -153,6 +153,7 @@ pub(super) fn get_thread_context_control(
 
     let h = dbg.thread_handle(thread_id).map_err(|e| anyhow!("{e}"))?;
     let mut ctx: windows::Win32::System::Diagnostics::Debug::CONTEXT =
+        // SAFETY: CONTEXT is repr(C); zeroing produces a valid all-zero struct that GetThreadContext will populate.
         unsafe { std::mem::zeroed() };
     #[cfg(target_arch = "x86_64")]
     {
@@ -162,6 +163,7 @@ pub(super) fn get_thread_context_control(
     {
         ctx.ContextFlags = windows::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_X86;
     }
+    // SAFETY: h is a valid thread handle with THREAD_GET_CONTEXT rights; ctx is a writable CONTEXT initialised with the right flags.
     unsafe {
         GetThreadContext(h, &mut ctx)
             .map_err(|e| anyhow!("GetThreadContext failed: {e}"))?;
@@ -178,6 +180,7 @@ pub(super) fn set_thread_context_control(
     use windows::Win32::System::Diagnostics::Debug::SetThreadContext;
 
     let h = dbg.thread_handle(thread_id).map_err(|e| anyhow!("{e}"))?;
+    // SAFETY: h is a valid thread handle with THREAD_SET_CONTEXT rights; ctx is a fully populated CONTEXT.
     unsafe {
         SetThreadContext(h, ctx)
             .map_err(|e| anyhow!("SetThreadContext failed: {e}"))?;

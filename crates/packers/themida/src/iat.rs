@@ -416,6 +416,7 @@ pub fn fixup_api_call_sites(
     let iat_slot_count = iat.size / std::mem::size_of::<usize>();
     let mut iat_data = vec![0usize; iat_slot_count];
     let bytes_read = debugger
+        // SAFETY: iat_data is a Vec<usize> with len * size_of::<usize>() bytes; the aliasing slice is passed to read_memory and discarded before reuse.
         .read_memory(iat.address, unsafe {
             std::slice::from_raw_parts_mut(
                 iat_data.as_mut_ptr() as *mut u8,
@@ -676,6 +677,7 @@ fn find_go_api_call(
                         // Verify by reading the pointer and checking it looks
                         // like an API address.
                         let mut ptr_val: usize = 0;
+                        // SAFETY: iat_data is a Vec<usize> with len * size_of::<usize>() bytes; the aliasing slice is passed to read_memory and discarded before reuse.
                         let buf = unsafe {
                             std::slice::from_raw_parts_mut(
                                 &mut ptr_val as *mut usize as *mut u8,
@@ -706,6 +708,7 @@ fn find_go_api_call(
                         let iat_pointer = insn.memory_displacement64() as usize;
                         if iat_pointer > 0x10000 {
                             let mut ptr_val: usize = 0;
+                            // SAFETY: iat_data is a Vec<usize> with len * size_of::<usize>() bytes; the aliasing slice is passed to read_memory and discarded before reuse.
                             let buf = unsafe {
                                 std::slice::from_raw_parts_mut(
                                     &mut ptr_val as *mut usize as *mut u8,
@@ -887,6 +890,7 @@ fn find_iat_ref_from_address(
             // looks like an API address, not a pointer into .text), then
             // `iat_pointer` is a real IAT slot.
             let mut the_pointer: usize = 0;
+            // SAFETY: iat_data is a Vec<usize> with len * size_of::<usize>() bytes; the aliasing slice is passed to read_memory and discarded before reuse.
             let ptr_buf = unsafe {
                 std::slice::from_raw_parts_mut(
                     &mut the_pointer as *mut usize as *mut u8,
@@ -1217,6 +1221,7 @@ fn scan_iat_boundaries(
     // the pointer at iat_ref.
     let read_start = iat_ref.saturating_sub(MAX_IAT_SIZE.saturating_sub(ptr_size));
     let bytes_read = debugger
+        // SAFETY: iat_data is a Vec<usize> with len * size_of::<usize>() bytes; the aliasing slice is passed to read_memory and discarded before reuse.
         .read_memory(read_start, unsafe {
             std::slice::from_raw_parts_mut(
                 iat_data.as_mut_ptr() as *mut u8,
@@ -1453,6 +1458,7 @@ fn fix_iat_v1(
     let mut iat_data = vec![0usize; slot_count];
 
     let bytes_read = debugger
+        // SAFETY: iat_data is a Vec<usize> with len * size_of::<usize>() bytes; the aliasing slice is passed to read_memory and discarded before reuse.
         .read_memory(iat.address, unsafe {
             std::slice::from_raw_parts_mut(
                 iat_data.as_mut_ptr() as *mut u8,
@@ -1491,6 +1497,7 @@ fn fix_iat_v1(
     if fix_count > 0 {
         let write_size = actual_slots * ptr_size;
         let bytes_written = debugger
+            // SAFETY: iat_data is a Vec<usize>; the aliasing immutable slice covers exactly write_size bytes and is discarded after write_memory returns.
             .write_memory(iat.address, unsafe {
                 std::slice::from_raw_parts(
                     iat_data.as_ptr() as *const u8,
@@ -1540,6 +1547,7 @@ fn resolve_v1_jumper(
         };
         // Read the pointer at the target.
         let mut ptr: usize = 0;
+        // SAFETY: iat_data is a Vec<usize> with len * size_of::<usize>() bytes; the aliasing slice is passed to read_memory and discarded before reuse.
         let buf = unsafe {
             std::slice::from_raw_parts_mut(
                 &mut ptr as *mut usize as *mut u8,
@@ -1604,6 +1612,7 @@ fn fix_iat_v2(
     let mut iat_data = vec![0usize; slot_count.min(MAX_IAT_SIZE / ptr_size)];
 
     let bytes_read = debugger
+        // SAFETY: iat_data is a Vec<usize> with len * size_of::<usize>() bytes; the aliasing slice is passed to read_memory and discarded before reuse.
         .read_memory(iat.address, unsafe {
             std::slice::from_raw_parts_mut(
                 iat_data.as_mut_ptr() as *mut u8,
@@ -1640,6 +1649,7 @@ fn fix_iat_v2(
     if fix_count > 0 {
         let write_size = actual_slots * ptr_size;
         let bytes_written = debugger
+            // SAFETY: iat_data is a Vec<usize>; the aliasing immutable slice covers exactly write_size bytes and is discarded after write_memory returns.
             .write_memory(iat.address, unsafe {
                 std::slice::from_raw_parts(
                     iat_data.as_ptr() as *const u8,
@@ -1700,6 +1710,7 @@ fn resolve_v2_stub(
                             insn.memory_displacement64() as usize
                         };
                         let mut ptr: usize = 0;
+                        // SAFETY: iat_data is a Vec<usize> with len * size_of::<usize>() bytes; the aliasing slice is passed to read_memory and discarded before reuse.
                         let buf = unsafe {
                             std::slice::from_raw_parts_mut(
                                 &mut ptr as *mut usize as *mut u8,
@@ -1841,17 +1852,20 @@ fn resolve_anti_trace_apis(state: &mut ThemidaState) {
 
     let to_pcstr = |s: &str| PCSTR::from_raw(s.as_ptr());
 
+    // SAFETY: calling a Windows FFI function with validated, properly-lifetime arguments.
     let Ok(k32) = (unsafe { GetModuleHandleA(to_pcstr("kernel32.dll\0")) }) else {
         warn!("resolve_anti_trace_apis: GetModuleHandleA(kernel32) failed");
         return;
     };
 
     if state.sleep_api == 0 {
+        // SAFETY: calling a Windows FFI function with validated, properly-lifetime arguments.
         state.sleep_api = unsafe { GetProcAddress(k32, to_pcstr("Sleep\0")) }
             .map(|f| f as usize)
             .unwrap_or(0);
     }
     if state.lstrlen_api == 0 {
+        // SAFETY: calling a Windows FFI function with validated, properly-lifetime arguments.
         state.lstrlen_api = unsafe { GetProcAddress(k32, to_pcstr("lstrlenA\0")) }
             .map(|f| f as usize)
             .unwrap_or(0);

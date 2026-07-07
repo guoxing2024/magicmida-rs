@@ -491,6 +491,7 @@ pub(super) fn handle_access_violation(
         let ptr_size = std::mem::size_of::<usize>();
         let slot_count = iat.size / ptr_size;
         let mut slot_values = vec![0usize; slot_count];
+        // SAFETY: slot_values is a Vec<usize>; the aliasing slice covers len * ptr_size bytes and is discarded after read_memory.
         let bytes_read = dbg.read_memory(iat.address, unsafe {
             std::slice::from_raw_parts_mut(
                 slot_values.as_mut_ptr() as *mut u8,

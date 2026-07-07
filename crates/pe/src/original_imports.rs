@@ -182,6 +182,7 @@ pub fn resolve_imports_via_getprocaddress(
         // Load the DLL from system directory
         let dll_name_cstr = format!("{dll_name}\0");
         debug!("Loading DLL: {dll_name}");
+        // SAFETY: dll_name_cstr is a null-terminated UTF-8 string; LOAD_LIBRARY_SEARCH_SYSTEM32 is a valid flag.
         let h_module = unsafe {
             LoadLibraryExA(
                 PCSTR::from_raw(dll_name_cstr.as_ptr()),
@@ -214,10 +215,12 @@ pub fn resolve_imports_via_getprocaddress(
                 };
                 // MAKEINTRESOURCEA(ordinal) = (LPCSTR)(ULONG_PTR)((WORD)(ordinal))
                 let ordinal_ptr = ordinal as usize as *const u8;
+                // SAFETY: h_module is a valid HMODULE from LoadLibraryExA; ordinal_ptr is a valid MAKEINTRESOURCEA-style pointer.
                 unsafe { GetProcAddress(h_module, PCSTR::from_raw(ordinal_ptr)) }
             } else {
                 let func_name_cstr = format!("{func_name}\0");
                 debug!("Looking up {dll_name}:{func_name}");
+                // SAFETY: h_module is a valid HMODULE; func_name_cstr is a null-terminated UTF-8 string.
                 unsafe { GetProcAddress(h_module, PCSTR::from_raw(func_name_cstr.as_ptr())) }
             };
 

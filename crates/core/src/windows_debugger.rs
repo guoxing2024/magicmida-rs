@@ -352,6 +352,7 @@ impl WindowsDebugger {
         // pre-populated CONTEXT succeeds because the kernel has no need to
         // thread-walk — it only writes the debug registers we have asked it to
         // write.
+        // SAFETY: CONTEXT is repr(C); zeroed() produces a valid all-zero CONTEXT that the Windows APIs accept and overwrite.
         let dr_ctx = unsafe {
             let mut c: CONTEXT = std::mem::zeroed();
             c.ContextFlags = Self::debug_registers_flags();
@@ -361,6 +362,7 @@ impl WindowsDebugger {
 
         // Try every handle we can get a hold of, in order of preference.
         let mut handles: Vec<HANDLE> = Vec::new();
+        // SAFETY: OpenThread returns a fresh valid HANDLE; thread_id comes from a registered debug thread.
         unsafe {
             if let Ok(h) = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, false, thread_id) {
                 handles.push(h);
@@ -373,6 +375,7 @@ impl WindowsDebugger {
         }
 
         for &h in &handles {
+            // SAFETY: h is a valid thread handle with THREAD_SET_CONTEXT rights; dr_ctx is a properly initialised CONTEXT.
             unsafe {
                 if SetThreadContext(h, &dr_ctx).is_ok() {
                     return Ok(());
@@ -596,6 +599,7 @@ impl WindowsDebugger {
     pub fn enable_single_step(&self, thread_id: u32) -> Result<(), CoreError> {
         use windows::Win32::System::Threading::{OpenThread, THREAD_GET_CONTEXT, THREAD_SET_CONTEXT};
 
+        // SAFETY: OpenThread returns a fresh valid HANDLE; thread_id comes from a registered debug thread.
         let h = unsafe {
             OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, false, thread_id)
                 .map_err(|e| CoreError::Windows(e.code().0 as u32))?
@@ -604,6 +608,7 @@ impl WindowsDebugger {
         let mut ctx = CONTEXT::default();
         ctx.ContextFlags = Self::full_context_flags();
 
+        // SAFETY: h is a valid thread handle with THREAD_SET_CONTEXT rights; ctx is a properly initialised CONTEXT.
         unsafe {
             GetThreadContext(h, &mut ctx)
                 .map_err(|e| CoreError::Windows(e.code().0 as u32))?;
@@ -612,6 +617,7 @@ impl WindowsDebugger {
         // Set the trap flag (TF, bit 8 in EFlags).
         ctx.EFlags |= 0x100;
 
+        // SAFETY: h is a valid thread handle with THREAD_SET_CONTEXT rights; ctx is a properly initialised CONTEXT.
         unsafe {
             SetThreadContext(h, &ctx)
                 .map_err(|e| CoreError::Windows(e.code().0 as u32))?;
@@ -857,6 +863,7 @@ impl DebuggerCore for WindowsDebugger {
     fn get_thread_context(&self, thread_id: u32) -> Result<CONTEXT, CoreError> {
         use windows::Win32::System::Threading::{OpenThread, THREAD_GET_CONTEXT};
 
+        // SAFETY: OpenThread returns a valid HANDLE for the given live thread_id.
         let h = unsafe {
             OpenThread(THREAD_GET_CONTEXT, false, thread_id)
                 .map_err(|e| CoreError::Windows(e.code().0 as u32))?
@@ -864,6 +871,7 @@ impl DebuggerCore for WindowsDebugger {
         let mut ctx = CONTEXT::default();
         ctx.ContextFlags = Self::full_context_flags();
 
+        // SAFETY: h is a valid thread handle with THREAD_GET_CONTEXT rights; ctx is a writable CONTEXT.
         unsafe {
             GetThreadContext(h, &mut ctx)
                 .map_err(|e| CoreError::Windows(e.code().0 as u32))?;
@@ -875,6 +883,7 @@ impl DebuggerCore for WindowsDebugger {
     fn get_thread_context_control(&self, thread_id: u32) -> Result<CONTEXT, CoreError> {
         use windows::Win32::System::Threading::{OpenThread, THREAD_GET_CONTEXT};
 
+        // SAFETY: OpenThread returns a valid HANDLE for the given live thread_id.
         let h = unsafe {
             OpenThread(THREAD_GET_CONTEXT, false, thread_id)
                 .map_err(|e| CoreError::Windows(e.code().0 as u32))?
@@ -882,6 +891,7 @@ impl DebuggerCore for WindowsDebugger {
         let mut ctx = CONTEXT::default();
         ctx.ContextFlags = Self::control_context_flags();
 
+        // SAFETY: h is a valid thread handle with THREAD_GET_CONTEXT rights; ctx is a writable CONTEXT.
         unsafe {
             GetThreadContext(h, &mut ctx)
                 .map_err(|e| CoreError::Windows(e.code().0 as u32))?;
@@ -893,6 +903,7 @@ impl DebuggerCore for WindowsDebugger {
     fn get_thread_context_control_integer(&self, thread_id: u32) -> Result<CONTEXT, CoreError> {
         use windows::Win32::System::Threading::{OpenThread, THREAD_GET_CONTEXT};
 
+        // SAFETY: OpenThread returns a valid HANDLE for the given live thread_id.
         let h = unsafe {
             OpenThread(THREAD_GET_CONTEXT, false, thread_id)
                 .map_err(|e| CoreError::Windows(e.code().0 as u32))?
@@ -900,6 +911,7 @@ impl DebuggerCore for WindowsDebugger {
         let mut ctx = CONTEXT::default();
         ctx.ContextFlags = Self::control_integer_context_flags();
 
+        // SAFETY: h is a valid thread handle with THREAD_GET_CONTEXT rights; ctx is a writable CONTEXT.
         unsafe {
             GetThreadContext(h, &mut ctx)
                 .map_err(|e| CoreError::Windows(e.code().0 as u32))?;
@@ -911,11 +923,13 @@ impl DebuggerCore for WindowsDebugger {
     fn set_thread_context(&self, thread_id: u32, ctx: &CONTEXT) -> Result<(), CoreError> {
         use windows::Win32::System::Threading::{OpenThread, THREAD_SET_CONTEXT};
 
+        // SAFETY: OpenThread returns a valid HANDLE for the given live thread_id.
         let h = unsafe {
             OpenThread(THREAD_SET_CONTEXT, false, thread_id)
                 .map_err(|e| CoreError::Windows(e.code().0 as u32))?
         };
 
+        // SAFETY: h is a valid thread handle with THREAD_SET_CONTEXT rights; ctx is a properly initialised CONTEXT.
         unsafe {
             SetThreadContext(h, ctx)
                 .map_err(|e| CoreError::Windows(e.code().0 as u32))?;
@@ -939,12 +953,14 @@ impl WindowsDebugger {
     pub fn get_thread_context_dbg(&self, thread_id: u32) -> Result<CONTEXT, CoreError> {
         use windows::Win32::System::Threading::{OpenThread, THREAD_GET_CONTEXT};
 
+        // SAFETY: OpenThread returns a valid HANDLE for the given live thread_id.
         let h = unsafe {
             OpenThread(THREAD_GET_CONTEXT, false, thread_id)
                 .map_err(|e| CoreError::Windows(e.code().0 as u32))?
         };
         let mut ctx = Box::new(CONTEXT::default());
         ctx.ContextFlags = Self::debug_registers_flags();
+        // SAFETY: h is a valid thread handle with THREAD_GET_CONTEXT rights; ctx is a heap-allocated CONTEXT.
         unsafe {
             GetThreadContext(h, std::ptr::from_mut(&mut *ctx))
                 .map_err(|e| CoreError::Windows(e.code().0 as u32))?;
@@ -958,6 +974,7 @@ impl WindowsDebugger {
         // and is guaranteed valid by the Windows debug API.
         let ev = match raw.dwDebugEventCode {
             EXCEPTION_DEBUG_EVENT => {
+                // SAFETY: DEBUG_EVENT union accessed with matching dwDebugEventCode == EXCEPTION_DEBUG_EVENT.
                 let exc = unsafe { &raw.u.Exception };
                 let addr = exc.ExceptionRecord.ExceptionAddress as u64;
                 match exc.ExceptionRecord.ExceptionCode {
@@ -1004,6 +1021,7 @@ impl WindowsDebugger {
             }
 
             CREATE_THREAD_DEBUG_EVENT => {
+                // SAFETY: DEBUG_EVENT union accessed with matching dwDebugEventCode == CREATE_THREAD_DEBUG_EVENT.
                 let ct = unsafe { &raw.u.CreateThread };
                 DebugEvent::CreateThread {
                     thread_id: raw.dwThreadId,
@@ -1013,6 +1031,7 @@ impl WindowsDebugger {
             }
 
             CREATE_PROCESS_DEBUG_EVENT => {
+                // SAFETY: DEBUG_EVENT union accessed with matching dwDebugEventCode == CREATE_PROCESS_DEBUG_EVENT.
                 let cp = unsafe { &raw.u.CreateProcessInfo };
                 DebugEvent::CreateProcess {
                     process_id: raw.dwProcessId,
@@ -1025,6 +1044,7 @@ impl WindowsDebugger {
             }
 
             EXIT_THREAD_DEBUG_EVENT => {
+                // SAFETY: DEBUG_EVENT union accessed with matching dwDebugEventCode == EXIT_THREAD_DEBUG_EVENT.
                 let et = unsafe { &raw.u.ExitThread };
                 DebugEvent::ExitThread {
                     thread_id: raw.dwThreadId,
@@ -1033,6 +1053,7 @@ impl WindowsDebugger {
             }
 
             EXIT_PROCESS_DEBUG_EVENT => {
+                // SAFETY: DEBUG_EVENT union accessed with matching dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT.
                 let ep = unsafe { &raw.u.ExitProcess };
                 DebugEvent::ExitProcess {
                     exit_code: ep.dwExitCode,
@@ -1040,6 +1061,7 @@ impl WindowsDebugger {
             }
 
             LOAD_DLL_DEBUG_EVENT => {
+                // SAFETY: DEBUG_EVENT union accessed with matching dwDebugEventCode == LOAD_DLL_DEBUG_EVENT.
                 let ld = unsafe { &raw.u.LoadDll };
                 DebugEvent::LoadDll {
                     thread_id: raw.dwThreadId,
@@ -1049,6 +1071,7 @@ impl WindowsDebugger {
             }
 
             UNLOAD_DLL_DEBUG_EVENT => {
+                // SAFETY: DEBUG_EVENT union accessed with matching dwDebugEventCode == UNLOAD_DLL_DEBUG_EVENT.
                 let ud = unsafe { &raw.u.UnloadDll };
                 DebugEvent::UnloadDll {
                     thread_id: raw.dwThreadId,
@@ -1063,6 +1086,7 @@ impl WindowsDebugger {
 
             RIP_EVENT => {
                 warn!("RIP_EVENT received 鈥?system-level debug error");
+                // SAFETY: pid and thread_id come from the RIP_EVENT being handled; DBG_CONTINUE is a valid status.
                 let _ = unsafe {
                     ContinueDebugEvent(
                         raw.dwProcessId,

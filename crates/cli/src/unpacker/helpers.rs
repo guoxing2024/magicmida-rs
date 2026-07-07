@@ -86,14 +86,17 @@ pub(super) fn resolve_api_addrs() -> Result<ResolvedApis, anyhow::Error> {
     // for kernel32.dll / ntdll.dll (always loaded in every process).
     let k32 = unsafe { GetModuleHandleW(windows::core::w!("kernel32.dll")) }
         .map_err(|e| anyhow!("GetModuleHandleW(kernel32.dll) failed: {e}"))?;
+    // SAFETY: ntdll.dll is always loaded in every Windows process; w!() yields a valid null-terminated wide string.
     let ntdll = unsafe { GetModuleHandleW(windows::core::w!("ntdll.dll")) }
         .map_err(|e| anyhow!("GetModuleHandleW(ntdll.dll) failed: {e}"))?;
 
     let resolve = |module: windows::Win32::Foundation::HMODULE, name: PCSTR| -> Result<usize, anyhow::Error> {
+        // SAFETY: module is a valid HMODULE from GetModuleHandleW; name is a valid PCSTR constant from s!().
         let addr = unsafe { GetProcAddress(module, name) };
         match addr {
             Some(ptr) => Ok(ptr as usize),
             None => {
+                // SAFETY: GetLastError is always safe to call — it reads the calling thread's last-error value.
                 let err = unsafe { windows::Win32::Foundation::GetLastError() };
                 Err(anyhow!("GetProcAddress failed: code {}", err.0))
             }
@@ -128,9 +131,11 @@ pub(super) fn resolve_host_api(dll: &str, func: &str) -> usize {
     use windows::core::PCSTR;
     use windows::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
     let to_pcstr = |s: &str| PCSTR::from_raw(s.as_ptr());
+    // SAFETY: dll string is null-terminated UTF-8; GetModuleHandleA accepts a valid PCSTR.
     let Ok(module) = (unsafe { GetModuleHandleA(to_pcstr(&format!("{dll}\0"))) }) else {
         return 0;
     };
+    // SAFETY: module is a valid HMODULE; func name is a null-terminated PCSTR.
     unsafe { GetProcAddress(module, to_pcstr(&format!("{func}\0"))) }
         .map(|f| f as usize)
         .unwrap_or(0)
