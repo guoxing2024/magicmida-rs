@@ -1,8 +1,11 @@
 [package]
 name = "mida-packers-themida"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 description = "Themida unpacker implementation"
+repository.workspace = true
+license.workspace = true
+readme.workspace = true
 
 [dependencies]
 mida-core = { path = "../../core" }

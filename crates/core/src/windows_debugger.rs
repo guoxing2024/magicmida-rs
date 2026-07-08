@@ -45,13 +45,13 @@ use crate::process::{CreateProcessOptions, TargetProcess, create_debug_process, 
 /// launches the target.  Every subsequent operation goes through the
 /// [`DebuggerCore`] trait implementation.
 pub struct WindowsDebugger {
-    /// Target process information (handles, pid, image base, 鈥?.
+    /// Target process information (handles, pid, image base, etc.
     process: TargetProcess,
-    /// Hardware breakpoints (DR0鈥揇R3). `None` means the slot is free.
+    /// Hardware breakpoints (DR0–DR3). `None` means the slot is free.
     hw_breakpoints: [Option<HwBreakpoint>; 4],
-    /// Software breakpoints: address 鈫?original byte.
+    /// Software breakpoints: address → original byte.
     soft_breakpoints: HashMap<usize, u8>,
-    /// Registered threads: thread_id 鈫?thread handle.
+    /// Registered threads: thread_id → thread handle.
     threads: HashMap<u32, HANDLE>,
 }
 
@@ -142,7 +142,7 @@ impl WindowsDebugger {
     #[cfg(target_arch = "x86")]
     fn full_context_flags() -> CONTEXT_FLAGS { CONTEXT_ALL_X86 }
 
-    /// Context flags for reading only debug registers (DR0鈥揇R7).
+    /// Context flags for reading only debug registers (DR0–DR7).
     #[cfg(target_arch = "x86_64")]
     fn debug_registers_flags() -> CONTEXT_FLAGS { CONTEXT_DEBUG_REGISTERS_AMD64 }
     #[cfg(target_arch = "x86")]
@@ -169,7 +169,7 @@ impl WindowsDebugger {
     // Hardware breakpoint management
     // ------------------------------------------------------------------
 
-    /// Set a hardware breakpoint in the given slot (0鈥? 鈫?DR0鈥揇R3).
+    /// Set a hardware breakpoint in the given slot (0–3 → DR0–DR3).
     ///
     /// This method suspends the given thread, reads its debug registers,
     /// installs the breakpoint, writes the registers back, and resumes
@@ -185,7 +185,7 @@ impl WindowsDebugger {
         address: usize,
         bp_type: HwbpType,
     ) -> Result<(), CoreError> {
-        debug_assert!(slot < 4, "slot must be 0鈥?");
+        debug_assert!(slot < 4, "slot must be 0–3");
 
         // Check that the slot is free.
         if self.hw_breakpoints[slot].as_ref().is_some_and(|bp| bp.is_set()) {
@@ -240,7 +240,7 @@ impl WindowsDebugger {
     /// Zeros the corresponding DR register and clears the enable bit in DR7
     /// for all registered threads.
     pub fn clear_hw_breakpoint(&mut self, slot: usize) -> Result<(), CoreError> {
-        debug_assert!(slot < 4, "slot must be 0鈥?");
+        debug_assert!(slot < 4, "slot must be 0–3");
 
         self.hw_breakpoints[slot] = None;
 
@@ -265,19 +265,19 @@ impl WindowsDebugger {
     /// Returns an error if no breakpoint is found at the given slot, or
     /// if the slot is already disabled.
     pub fn disable_hw_breakpoint(&mut self, slot: usize) -> Result<(), CoreError> {
-        debug_assert!(slot < 4, "slot must be 0鈥?");
+        debug_assert!(slot < 4, "slot must be 0–3");
 
         match &mut self.hw_breakpoints[slot] {
             Some(bp) if !bp.disabled => {
                 bp.disabled = true;
             }
             Some(_) => {
-                // Already disabled 鈥?nothing to do.
+                // Already disabled — nothing to do.
                 trace!(slot, "HW breakpoint slot {} already disabled", slot);
                 return Ok(());
             }
             None => {
-                // No breakpoint in this slot 鈥?nothing to disable.
+                // No breakpoint in this slot — nothing to disable.
                 trace!(slot, "HW breakpoint slot {} is empty, nothing to disable", slot);
                 return Ok(());
             }
@@ -334,7 +334,7 @@ impl WindowsDebugger {
     /// Apply the current hardware breakpoint state to the debug registers
     /// of a single thread.
     ///
-    /// Suspend 鈫?get context 鈫?write DR0鈥揇R7 鈫?set context 鈫?resume.
+    /// Suspend → get context → write DR0–DR7 → set context → resume.
     ///
     /// This is the register-level primitive used by the public
     /// `set_hw_breakpoint` / `clear_hw_breakpoint` / `reset_hw_breakpoints`
@@ -388,16 +388,16 @@ impl WindowsDebugger {
 
     /// Write the hardware breakpoint state into the given CONTEXT.
     ///
-    /// This populates DR0鈥揇R3 and DR7 from `self.hw_breakpoints`.
+    /// This populates DR0–DR3 and DR7 from `self.hw_breakpoints`.
     /// DR6 is cleared of the BS (single-step) flag (bit 14) to prevent
     /// the OS from misinterpreting a single-step as a hardware breakpoint.
     fn write_debug_registers(&self, ctx: &mut CONTEXT) {
         // Build the DR7 mask.
         // DR7 bit layout (x86/x64):
-        //   L0鈥揕3  (bits 0,2,4,6):   local enable (set = 1)
-        //   G0鈥揋3  (bits 1,3,5,7):   global enable (unused 鈥?set 0)
-        //   LEN0鈥? (bits 8-15):       length (00=1, 01=2, 11=4 bytes)
-        //   RW0鈥?  (bits 16-23):      type (00=execute, 01=write, 11=access)
+        //   L0–L3  (bits 0,2,4,6):   local enable (set = 1)
+        //   G0–G3  (bits 1,3,5,7):   global enable (unused — set 0)
+        //   LEN0–LEN3 (bits 8-15):       length (00=1, 01=2, 11=4 bytes)
+        //   RW0–RW3  (bits 16-23):      type (00=execute, 01=write, 11=access)
         let mut dr7: u64 = 0;
 
         // Helper: write one slot's data into DR7 and the context DRn register.
@@ -447,7 +447,7 @@ impl WindowsDebugger {
 
     /// Set a software breakpoint (INT3 / 0xCC) at the given address.
     ///
-    /// Reference: `DebuggerCore.pas` 鈫?`SetSoftBP`.
+    /// Reference: `DebuggerCore.pas` → `SetSoftBP`.
     ///
     /// 1. Read the original byte at the target address.
     /// 2. Save it in `soft_breakpoints`.
@@ -472,7 +472,7 @@ impl WindowsDebugger {
             warn!(
                 %address,
                 byte = current[0],
-                "Soft breakpoint inconsistency 鈥?re-installing"
+                "Soft breakpoint inconsistency — re-installing"
             );
             self.soft_breakpoints.remove(&address);
         }
@@ -517,7 +517,7 @@ impl WindowsDebugger {
 
     /// Clear all software breakpoints, restoring every original byte.
     ///
-    /// Reference: `DebuggerCore.pas` 鈫?`SoftBPClear`.
+    /// Reference: `DebuggerCore.pas` → `SoftBPClear`.
     ///
     /// Iterates over `soft_breakpoints`, writes the original byte back to each
     /// address, then flushes the instruction cache and clears the map.
@@ -553,7 +553,7 @@ impl WindowsDebugger {
 
     /// Reset / re-arm a software breakpoint after single-stepping over it.
     ///
-    /// Reference: `DebuggerCore.pas` 鈫?`OnSoftwareBreakpoint` /
+    /// Reference: `DebuggerCore.pas` → `OnSoftwareBreakpoint` /
     /// `SoftBPReenable`.
     ///
     /// When a soft breakpoint fires, the original instruction has already been
@@ -561,7 +561,7 @@ impl WindowsDebugger {
     /// flushes the instruction cache.
     ///
     /// Call this after single-stepping past the breakpoint (via
-    /// `single_step(thread_id)` 鈫?wait for `SingleStep` event 鈫?call this).
+    /// `single_step(thread_id)` → wait for `SingleStep` event → call this).
     pub fn reset_soft_breakpoint(&mut self, address: usize) -> Result<(), CoreError> {
         // Write 0xCC back to the breakpoint address.
         let int3: [u8; 1] = [0xCC];
@@ -628,7 +628,7 @@ impl WindowsDebugger {
 }
 
 // ---------------------------------------------------------------------------
-// Drop 鈥?clean up handles and stub EXE
+// Drop — clean up handles and stub EXE
 // ---------------------------------------------------------------------------
 
 impl Drop for WindowsDebugger {
@@ -940,7 +940,7 @@ impl DebuggerCore for WindowsDebugger {
 }
 
 // ---------------------------------------------------------------------------
-// Internal 鈥?raw DEBUG_EVENT 鈫?DebugEvent decoding
+// Internal — raw DEBUG_EVENT → DebugEvent decoding
 // ---------------------------------------------------------------------------
 
 impl WindowsDebugger {
@@ -1085,7 +1085,7 @@ impl WindowsDebugger {
             }
 
             RIP_EVENT => {
-                warn!("RIP_EVENT received 鈥?system-level debug error");
+                warn!("RIP_EVENT received — system-level debug error");
                 // SAFETY: pid and thread_id come from the RIP_EVENT being handled; DBG_CONTINUE is a valid status.
                 let _ = unsafe {
                     ContinueDebugEvent(

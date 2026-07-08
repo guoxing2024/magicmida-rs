@@ -3,6 +3,8 @@
 //! Corresponds to the `TImportThunk`, `TOriginalImport` types and
 //! related helpers in `Dumper.pas`.
 
+use tracing::debug;
+
 /// A single import thunk (entry in the Import Address Table).
 ///
 /// Each thunk links a slot in the IAT to a specific function (by name or
@@ -153,14 +155,14 @@ impl ImportTableBuilder {
         let mut iat_offset: usize = 0; // byte offset within original IAT
         let mut out_thunks: Vec<u64> = Vec::new();
 
-        eprintln!("DEBUG INTERLEAVED: desc_size={:#x}, total_data_size={:#x}, total_size={:#x}",
+        debug!("desc_size={:#x}, total_data_size={:#x}, total_size={:#x}",
                  desc_size, total_data_size, total_size);
-        eprintln!("DEBUG: section_va={:#x}", section_va);
+        debug!("section_va={:#x}", section_va);
 
         // ---- Pass 2: Write data using INTERLEAVED layout ----
         for (mi, m) in self.modules.iter().enumerate() {
-            eprintln!(
-                "[DEBUG] Module {}: {} ({} thunks) at offset {:#x}",
+            debug!(
+                "Module {}: {} ({} thunks) at offset {:#x}",
                 mi, m.name, m.thunks.len(), data_cursor
             );
 

@@ -41,9 +41,9 @@ target/release/mida-cli.exe /unpack "protected.exe"
 ## Usage
 
 ```
-magicmida /unpack <filename> [options]
-magicmida /dump-process <pid> <unpacked-file>
-magicmida /verify <unpacked-file> <reference-file>
+mida-cli /unpack <filename> [options]
+mida-cli /dump-process <pid> <unpacked-file>
+mida-cli /verify <unpacked-file> <reference-file>
 ```
 
 ### `/unpack` — Unpack a Themida-protected executable
@@ -121,11 +121,30 @@ cargo run -- /unpack <file>  # Build + run in one step
 Newer Themida versions detect hardware breakpoints via `GetThreadContext` checks.
 ScyllaHide hooks these APIs in the target process to hide debugger presence.
 
+**What ScyllaHide does:** It injects a hook DLL (`HookLibraryx64.dll`) into the
+target process using `InjectorCLIx64.exe`. The hook intercepts anti-debugging
+APIs (`IsDebuggerPresent`, `CheckRemoteDebuggerPresent`, `NtQueryInformationProcess`,
+`GetThreadContext`, etc.) and returns spoofed results, making the target believe
+it is running without a debugger.
+
 **Setup:**
 
 1. Download [ScyllaHide](https://github.com/x64dbg/ScyllaHide/releases) (x64 build).
-2. Place `HookLibraryx64.dll` and `InjectorCLIx64.exe` next to `mida-cli.exe`.
-3. Create a `scylla_hide.ini` config (or use the ScyllaHide default) — adjust if needed.
+2. Extract `HookLibraryx64.dll` and `InjectorCLIx64.exe` from the archive.
+3. Place both files in the same directory as `mida-cli.exe` (typically
+   `target/release/`).
+4. Create a `scylla_hide.ini` config file in the same directory. The project
+   ships a default config — adjust profile settings if your target uses
+   non-standard anti-debug checks.
+5. When you run `mida-cli /unpack`, the packer crate automatically:
+   - Verifies the SHA-256 hashes of `InjectorCLIx64.exe` and `HookLibraryx64.dll`
+     against known-good values (see `crates/packers/themida/src/binaries.rs`).
+   - Launches `InjectorCLIx64.exe` to inject the hook DLL into the target.
+   - Waits for injection to complete before setting hardware breakpoints.
+
+**Note:** If the SHA-256 verification fails, the unpacker will refuse to inject
+and report an error. This prevents running tampered hook binaries. To use a
+different version of ScyllaHide, update the hashes in `binaries.rs`.
 
 ScyllaHide binaries are **not** committed to this repository. They are
 user-downloaded and verified at runtime via SHA-256 checksums (see
@@ -145,6 +164,9 @@ user-downloaded and verified at runtime via SHA-256 checksums (see
   static analysis alone cannot resolve (`ThemidaVersion::Unknown`).
 - Import resolution for fully virtualized IAT (v3 VM-strong) may produce
   incomplete results; the original PE's import table is used as a fallback.
+- **DLL (.dll) targets**: not fully supported. The DLL stub calls
+  `ExitProcess` instead of `DllMain`, so the unpacked DLL won't load correctly
+  as a proper DLL. Use the unpacker primarily for `.exe` targets.
 - **Relocation table generation** — scans non-executable sections for absolute
   addresses, builds a complete `.reloc` table, and enables ASLR (`DYNAMIC_BASE`).
   The table is clamped to fit the available VA space between `.reloc` and the

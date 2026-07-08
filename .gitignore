@@ -31,5 +31,5 @@ AUDIT_REPORT.md
 _ran.flag*.log
 build.bat
 .hermes-tmp.*
-*.bat
+CLAUDE.md
 scylla_hide.ini

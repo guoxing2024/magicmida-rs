@@ -792,14 +792,13 @@ pub fn dump_process(
         for module in &builder.modules {
             let mut module_max_iat_rva = original_iat_rva;
 
-            eprintln!("[DEBUG] Writing module '{}' with {} thunks",
-                     module.name, module.thunks.len());
+            debug!("Writing module '{}' with {} thunks", module.name, module.thunks.len());
 
             for (ti, thunk) in module.thunks.iter().enumerate() {
                 let iat_rva = thunk.iat_address;
 
                 if ti < 3 || ti >= module.thunks.len().saturating_sub(3) {
-                    eprintln!("[DEBUG]   Thunk {}: IAT RVA {:#x}", ti, iat_rva);
+                    debug!("Thunk {}: IAT RVA {:#x}", ti, iat_rva);
                 }
 
                 // Track the highest IAT address overall
@@ -845,8 +844,7 @@ pub fn dump_process(
                 let null_rva = module_max_iat_rva + ptr_size as u32;
                 let null_offset = null_rva as usize;
 
-                eprintln!("[DEBUG] Writing null terminator at RVA {:#x} for module '{}'",
-                         null_rva, module.name);
+                debug!("Writing null terminator at RVA {:#x} for module '{}'", null_rva, module.name);
 
                 if null_offset + ptr_size <= dump_buf.len() {
                     if ptr_size == 8 {
@@ -2700,7 +2698,7 @@ impl PeHeader {
 
         if self.is_64bit {
             // PE32+
-            eprintln!("[DEBUG] Writing ImageBase for PE32+: {:#x} at buffer offset 48", oh.image_base);
+            debug!("Writing ImageBase for PE32+: {:#x} at buffer offset 48", oh.image_base);
             out[48..56].copy_from_slice(&oh.image_base.to_le_bytes());
             out[56..60].copy_from_slice(&oh.section_alignment.to_le_bytes());
             out[60..64].copy_from_slice(&oh.file_alignment.to_le_bytes());

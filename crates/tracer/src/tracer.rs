@@ -16,7 +16,7 @@ use crate::LogMsgType;
 /// Maximum instruction count when no explicit limit is given (`limit == 0`).
 ///
 /// Prevents infinite loops in pathological cases.  The Pascal reference
-/// hard-codes 500 000 鈥?we use the same default here.
+/// hard-codes 500 000 — we use the same default here.
 const DEFAULT_TRACE_LIMIT: u64 = 500_000;
 
 // ---------------------------------------------------------------------------
@@ -54,7 +54,7 @@ pub struct TraceResult {
 // Tracer
 // ---------------------------------------------------------------------------
 
-/// Single-step tracer 鈥?corresponds to `TTracer` in the Pascal reference.
+/// Single-step tracer — corresponds to `TTracer` in the Pascal reference.
 ///
 /// The tracer **temporarily takes over the debug event loop** for the
 /// duration of [`trace`](Self::trace).  It sets the CPU trap flag (TF) on
@@ -88,10 +88,10 @@ impl<'a> Tracer<'a> {
     ///
     /// # Parameters
     ///
-    /// * `thread_id` 鈥?the thread to trace (must be registered with the
+    /// * `thread_id` — the thread to trace (must be registered with the
     ///   debugger).
-    /// * `predicate` 鈥?called after every single-step; return `true` to stop.
-    /// * `log` 鈥?log callback matching `Utils.pas` `TLogProc`.
+    /// * `predicate` — called after every single-step; return `true` to stop.
+    /// * `log` — log callback matching `Utils.pas` `TLogProc`.
     pub fn new(
         thread_id: u32,
         predicate: Box<TracePredicate<'a>>,
@@ -110,7 +110,7 @@ impl<'a> Tracer<'a> {
 
     /// Run the single-step trace starting at `address`.
     ///
-    /// This method **takes over the debug event loop** 鈥?it calls
+    /// This method **takes over the debug event loop** — it calls
     /// [`DebuggerCore::wait_event`] and [`DebuggerCore::continue_event`]
     /// directly for the duration of the trace.  Events from threads other
     /// than `self.thread_id` are transparently continued.
@@ -288,7 +288,7 @@ impl<'a> Tracer<'a> {
                             });
                         }
 
-                        // Non-exception events on our thread 鈥?continue.
+                        // Non-exception events on our thread — continue.
                         _ => {
                             debug!(
                                 thread_id = self.thread_id,

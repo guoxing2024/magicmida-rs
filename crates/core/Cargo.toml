@@ -1,8 +1,11 @@
 [package]
 name = "mida-core"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 description = "Debugger core: process creation, breakpoints, debug event loop"
+repository.workspace = true
+license.workspace = true
+readme.workspace = true
 
 [dependencies]
 pelite = { workspace = true }

@@ -1,8 +1,11 @@
 [package]
 name = "mida-tracer"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 description = "Single-step trace engine for following unpacker control flow"
+repository.workspace = true
+license.workspace = true
+readme.workspace = true
 
 [dependencies]
 mida-core = { path = "../core" }

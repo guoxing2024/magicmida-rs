@@ -40,7 +40,7 @@ pub enum CoreError {
     #[error("hardware breakpoint limit exceeded (maximum 4)")]
     HwbpLimitExceeded,
 
-    /// The requested hardware breakpoint slot (DR0鈥揇R3) is already occupied.
+    /// The requested hardware breakpoint slot (DR0–DR3) is already occupied.
     #[error("hardware breakpoint slot {0} is already in use")]
     HwbpSlotInUse(usize),
 
