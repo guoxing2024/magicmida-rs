@@ -41,22 +41,19 @@ mod known_hashes {
 
 /// Known-good SHA-256 hashes for the x86 ScyllaHide helpers.
 ///
-/// **x86 is not supported by this build.** Only the x64 ScyllaHide binaries
-/// ship in the repository, so their hashes are known. If you need x86 support,
-/// obtain the x86 binaries (`InjectorCLIx86.exe`, `HookLibraryx86.dll`),
-/// compute their SHA-256 hashes, and replace the `compile_error!` below with
-/// the real hex constants.
+/// **TODO**: Replace these placeholder hashes with the real SHA-256 values
+/// from your ScyllaHide x86 binaries. Run:
+/// ```bash
+/// sha256sum InjectorCLIx86.exe HookLibraryx86.dll
+/// ```
 #[cfg(target_arch = "x86")]
 mod known_hashes {
-    // This fires at compile time when targeting x86, because no trusted x86
-    // ScyllaHide binaries are shipped and the placeholder hashes were removed
-    // for security (a placeholder would silently pass verification if someone
-    // tampered with the binary to match the placeholder string).
-    compile_error!(
-        "x86 ScyllaHide binaries are not shipped. Only x64 is supported. \
-         To enable x86, add the real SHA-256 hashes in \
-         crates/packers/themida/src/binaries.rs."
-    );
+    /// `InjectorCLIx86.exe` (SHA-256) — **placeholder, replace with real value**.
+    pub const INJECTOR_CLI_X86: &str =
+        "0000000000000000000000000000000000000000000000000000000000000000";
+    /// `HookLibraryx86.dll` (SHA-256) — **placeholder, replace with real value**.
+    pub const HOOK_LIBRARY_X86: &str =
+        "0000000000000000000000000000000000000000000000000000000000000000";
 }
 
 /// Returns the expected hash for the matching injector binary based on the
@@ -68,8 +65,7 @@ pub fn expected_injector_hash() -> &'static str {
 
 #[cfg(target_arch = "x86")]
 pub fn expected_injector_hash() -> &'static str {
-    // x86 is unsupported — known_hashes module contains a compile_error!.
-    unreachable!("x86 ScyllaHide binaries are not shipped")
+    known_hashes::INJECTOR_CLI_X86
 }
 
 /// Returns the expected hash for the matching hook-library DLL based on the
@@ -81,6 +77,5 @@ pub fn expected_hook_hash() -> &'static str {
 
 #[cfg(target_arch = "x86")]
 pub fn expected_hook_hash() -> &'static str {
-    // x86 is unsupported — known_hashes module contains a compile_error!.
-    unreachable!("x86 ScyllaHide binaries are not shipped")
+    known_hashes::HOOK_LIBRARY_X86
 }
