@@ -56,7 +56,8 @@ the import table.
 | `<filename>` | Path to the input executable (`.exe` or `.dll`). |
 | `-o <path>` / `--output <path>` | Output path. Defaults to `<input>U.exe` (the "U" suffix convention from Pascal Magicmida). |
 | `--data-sections` | Restore `.rdata` / `.data` sections from the target process. Needed for MSVC TLS callbacks and initialized global data. |
-| `--shrink` | Remove Themida-specific sections from the output (compression leftovers, stub code). Produces a smaller, cleaner PE. |
+| `--shrink` | Remove Themida-specific sections (`.winlice` / `.boot` / `.themida`), compact VAs, clear dangling data directories, restore standard section names, build relocation table, and enable ASLR. **Enabled by default.** |
+| `--no-shrink` | Disable shrinking. Keeps Themida sections and disables ASLR/relocation. Use for debugging or when shrink causes issues. |
 | `-v` / `--verbose` | Enable debug-level logging. |
 
 **Examples:**
@@ -124,7 +125,7 @@ ScyllaHide hooks these APIs in the target process to hide debugger presence.
 
 1. Download [ScyllaHide](https://github.com/x64dbg/ScyllaHide/releases) (x64 build).
 2. Place `HookLibraryx64.dll` and `InjectorCLIx64.exe` next to `mida-cli.exe`.
-3. The project ships a suitable config at `scylla_hide.ini` — adjust if needed.
+3. Create a `scylla_hide.ini` config (or use the ScyllaHide default) — adjust if needed.
 
 ScyllaHide binaries are **not** committed to this repository. They are
 user-downloaded and verified at runtime via SHA-256 checksums (see
@@ -144,8 +145,16 @@ user-downloaded and verified at runtime via SHA-256 checksums (see
   static analysis alone cannot resolve (`ThemidaVersion::Unknown`).
 - Import resolution for fully virtualized IAT (v3 VM-strong) may produce
   incomplete results; the original PE's import table is used as a fallback.
-- Relocation table generation is currently disabled (the dump writes absolute
-  addresses and clears the `DYNAMIC_BASE` flag as a workaround).
+- **Relocation table generation** — scans non-executable sections for absolute
+  addresses, builds a complete `.reloc` table, and enables ASLR (`DYNAMIC_BASE`).
+  The table is clamped to fit the available VA space between `.reloc` and the
+  next section, preventing VA overlap.
+- **Section shrinking** — removes `.winlice` / `.boot` / `.themida` sections,
+  compacts remaining VAs to eliminate gaps, clears dangling data directories,
+  and restores standard section names (`.text` / `.data` / `.rdata` etc.).
+- **Absolute address fixing** — patches all runtime-hardcoded addresses in
+  non-executable sections from the runtime image base to the original file
+  image base, enabling correct ASLR relocation.
 
 ## Acknowledgements
 
