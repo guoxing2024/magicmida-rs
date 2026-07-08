@@ -317,8 +317,32 @@ pub fn dump_process(
     //     that inflates VSize and causes the Windows loader to map huge
     //     zero-filled regions. Instead, just drop the sections and clean up
     //     any data directory entries that point into removed VA ranges.
+    //
+    //     We also delete the existing .reloc section: its VA is too small to
+    //     hold the full relocation table we generate later, and the post-
+    //     process build_relocation_table previously truncated (clamped) the
+    //     data to fit, producing a corrupt table. We instead create a fresh,
+    //     adequately-sized .reloc section after the dump image is captured.
+    //
+    //     The exception table (RUNTIME_FUNCTION array) lives inside .winlice
+    //     and would be lost when we delete that section. We save the
+    //     exception directory RVA/size here (dump_buf isn't available yet)
+    //     and copy the bytes out of dump_buf later, then create a .pdata
+    //     section to hold them.
+    let mut saved_exception_rva: Option<(u32, u32)> = None;
     if opts.shrink {
-        let themida_names = [".winlice", ".boot", ".themida"];
+        // Capture the exception directory before anything deletes it.
+        const IMAGE_DIRECTORY_ENTRY_EXCEPTION: usize = 3;
+        let exc_dir = pe.nt_headers.optional_header.data_directory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+        if exc_dir.virtual_address != 0 && exc_dir.size != 0 {
+            info!(
+                "Exception dir to preserve: RVA={:#x} Size={:#x}",
+                exc_dir.virtual_address, exc_dir.size
+            );
+            saved_exception_rva = Some((exc_dir.virtual_address, exc_dir.size));
+        }
+
+        let themida_names = [".winlice", ".boot", ".themida", ".reloc"];
         let mut removed = 0usize;
         let mut removed_ranges: Vec<(u32, u32)> = Vec::new();
         let mut i = pe.sections.len();
@@ -333,7 +357,6 @@ pub fn dump_process(
             if should_delete {
                 let removed_va = pe.sections[i].virtual_address;
                 let removed_vs = pe.sections[i].virtual_size;
-                let removed_name = pe.sections[i].name.clone();
                 removed_ranges.push((removed_va, removed_va + removed_vs));
 
                 pe.sections.remove(i);
@@ -505,6 +528,152 @@ pub fn dump_process(
             actual = read,
             "Short read on dump image"
         );
+    }
+
+    // 4b. Create .pdata section (exception table) and .reloc section.
+    //
+    // The exception table (RUNTIME_FUNCTION array) lived inside .winlice,
+    // which we deleted during shrink. We now copy those bytes out of the
+    // captured dump_buf and place them in a fresh .pdata section, updating
+    // DataDirectory[3] (Exception) to point at it.
+    //
+    // We also create a fresh, adequately-sized .reloc section here (before
+    // .import) so that postprocess::build_relocation_table can write the
+    // full relocation table without clamping/truncation. The old .reloc was
+    // deleted during shrink because its VA was too small to hold the full
+    // 5992-byte table the builder generates.
+    //
+    // Ordering: [.pdata][.reloc][.import] — all appended after the surviving
+    // sections, so VAs stay strictly increasing (Windows loader requirement).
+    if opts.shrink {
+        // --- .pdata (exception table) ---
+        if let Some((exc_rva, exc_size)) = saved_exception_rva {
+            let exc_off = exc_rva as usize;
+            let exc_len = exc_size as usize;
+            let file_align = pe.nt_headers.optional_header.file_alignment;
+            let section_align = pe.nt_headers.optional_header.section_alignment;
+
+            // Copy the exception table bytes out of the dump buffer.
+            let mut exc_data: Vec<u8> = Vec::with_capacity(exc_len);
+            if exc_off + exc_len <= dump_buf.len() {
+                exc_data.extend_from_slice(&dump_buf[exc_off..exc_off + exc_len]);
+            } else if exc_off < dump_buf.len() {
+                let avail = dump_buf.len() - exc_off;
+                exc_data.extend_from_slice(&dump_buf[exc_off..exc_off + avail]);
+                exc_data.resize(exc_len, 0);
+            } else {
+                warn!(
+                    exc_rva = format!("{:#x}", exc_rva),
+                    "Exception table RVA is outside dump_buf; zero-filling .pdata"
+                );
+                exc_data.resize(exc_len, 0);
+            }
+
+            // SizeOfRawData must be FileAlignment-aligned.
+            let mut raw_size = exc_len as u32;
+            raw_size = crate::utils::align_up(raw_size, file_align);
+
+            let pdata_idx = pe.create_section_index(".pdata", exc_len as u32);
+
+            // Resize the section to the aligned raw size and stash the bytes.
+            pe.sections[pdata_idx].virtual_size = exc_len as u32;
+            pe.sections[pdata_idx].header.virtual_size = exc_len as u32;
+            pe.sections[pdata_idx].header.size_of_raw_data = raw_size;
+            pe.sections[pdata_idx].raw_size = raw_size;
+            // .pdata must be READ + INITIALIZED_DATA (matches MSVC default).
+            const IMAGE_SCN_MEM_READ_PD: u32 = 0x4000_0000;
+            const IMAGE_SCN_CNT_INITIALIZED_DATA_PD: u32 = 0x0000_0040;
+            pe.sections[pdata_idx].characteristics =
+                IMAGE_SCN_MEM_READ_PD | IMAGE_SCN_CNT_INITIALIZED_DATA_PD;
+            pe.sections[pdata_idx].header.characteristics =
+                pe.sections[pdata_idx].characteristics;
+
+            // Pad raw data to alignment and store as extra_data.
+            let mut padded = exc_data;
+            if (padded.len() as u32) < raw_size {
+                padded.resize(raw_size as usize, 0);
+            }
+            pe.sections[pdata_idx].extra_data = Some(padded);
+
+            // Update SizeOfImage for the new section.
+            let new_end = pe.sections[pdata_idx].header.virtual_address
+                + crate::utils::align_up(exc_len as u32, section_align);
+            if pe.nt_headers.optional_header.size_of_image < new_end {
+                pe.nt_headers.optional_header.size_of_image = new_end;
+            }
+
+            // Point DataDirectory[3] (Exception) at the new .pdata.
+            const IMAGE_DIRECTORY_ENTRY_EXCEPTION_PD: usize = 3;
+            pe.nt_headers.optional_header.data_directory[IMAGE_DIRECTORY_ENTRY_EXCEPTION_PD] =
+                crate::header::ImageDataDirectory {
+                    virtual_address: pe.sections[pdata_idx].virtual_address,
+                    size: exc_len as u32,
+                };
+            info!(
+                "Created .pdata section idx={} VA={:#x} size={:#x} (raw={:#x}); Exception dir restored",
+                pdata_idx,
+                pe.sections[pdata_idx].virtual_address,
+                exc_len,
+                raw_size
+            );
+        }
+
+        // --- .reloc (placeholder; data filled by build_relocation_table) ---
+        // Create an empty .reloc section large enough to hold the full
+        // relocation table. The actual bytes are written later by
+        // postprocess::build_relocation_table, which scans the final
+        // out_data for absolute addresses. We pre-size it generously so
+        // the builder never has to clamp.
+        {
+            let file_align = pe.nt_headers.optional_header.file_alignment;
+            let section_align = pe.nt_headers.optional_header.section_alignment;
+
+            // 0x2000 (8 KiB) virtual size — comfortably larger than the
+            // ~5992-byte table the builder produces, with headroom.
+            let reloc_vsize: u32 = 0x2000;
+            let reloc_raw = crate::utils::align_up(reloc_vsize, file_align);
+
+            let reloc_idx = pe.create_section_index(".reloc", reloc_vsize);
+            pe.sections[reloc_idx].virtual_size = reloc_vsize;
+            pe.sections[reloc_idx].header.virtual_size = reloc_vsize;
+            pe.sections[reloc_idx].header.size_of_raw_data = reloc_raw;
+            pe.sections[reloc_idx].raw_size = reloc_raw;
+            // .reloc: READ + INITIALIZED_DATA + MEM_DISCARDABLE (matches MSVC).
+            const IMAGE_SCN_MEM_READ_R: u32 = 0x4000_0000;
+            const IMAGE_SCN_CNT_INITIALIZED_DATA_R: u32 = 0x0000_0040;
+            const IMAGE_SCN_MEM_DISCARDABLE: u32 = 0x0200_0000;
+            pe.sections[reloc_idx].characteristics =
+                IMAGE_SCN_MEM_READ_R | IMAGE_SCN_CNT_INITIALIZED_DATA_R | IMAGE_SCN_MEM_DISCARDABLE;
+            pe.sections[reloc_idx].header.characteristics =
+                pe.sections[reloc_idx].characteristics;
+
+            // Zero-filled raw data placeholder.
+            pe.sections[reloc_idx].extra_data = Some(vec![0u8; reloc_raw as usize]);
+
+            // Update SizeOfImage.
+            let new_end = pe.sections[reloc_idx].header.virtual_address
+                + crate::utils::align_up(reloc_vsize, section_align);
+            if pe.nt_headers.optional_header.size_of_image < new_end {
+                pe.nt_headers.optional_header.size_of_image = new_end;
+            }
+
+            // Set BaseReloc DataDirectory[5] to the new .reloc VA.
+            // Size will be updated by build_relocation_table once the
+            // real data is generated.
+            const IMAGE_DIRECTORY_ENTRY_BASERELOC: usize = 5;
+            pe.nt_headers.optional_header.data_directory[IMAGE_DIRECTORY_ENTRY_BASERELOC] =
+                crate::header::ImageDataDirectory {
+                    virtual_address: pe.sections[reloc_idx].virtual_address,
+                    size: reloc_vsize, // provisional; refined later
+                };
+            info!(
+                "Created .reloc section idx={} VA={:#x} vsize={:#x} raw={:#x}",
+                reloc_idx,
+                pe.sections[reloc_idx].virtual_address,
+                reloc_vsize,
+                reloc_raw
+            );
+        }
     }
 
     // 5. Build import section if we have a builder.

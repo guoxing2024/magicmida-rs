@@ -476,7 +476,9 @@ pub fn build_relocation_table(
         let sec_hdr_off =
             pe_off + 24 + pe.nt_headers.file_header.size_of_optional_header as usize + (idx * 40);
 
-        // Read existing .reloc RawPtr and VA (don't change them)
+        // Read the .reloc section's VA and RawPtr from the on-disk header.
+        // We created this section in dumper.rs with a generous 0x2000 virtual
+        // size, so the full relocation table fits without clamping.
         let reloc_raw_ptr = u32::from_le_bytes(
             out_data[sec_hdr_off + 20..sec_hdr_off + 24]
                 .try_into()
@@ -487,44 +489,60 @@ pub fn build_relocation_table(
                 .try_into()
                 .unwrap_or([0; 4]),
         );
+        // Also read the section's raw size — the builder must not write past it.
+        let reloc_raw_size = u32::from_le_bytes(
+            out_data[sec_hdr_off + 16..sec_hdr_off + 20]
+                .try_into()
+                .unwrap_or([0; 4]),
+        );
 
-        // Clamp VSize to not overlap with the next section
-        let mut next_va = u32::MAX;
-        for (j, section) in pe.sections.iter().enumerate() {
-            if j != idx && section.virtual_address > reloc_va {
-                next_va = next_va.min(section.virtual_address);
-            }
+        // The relocation table must NOT be truncated. Our .reloc section was
+        // pre-sized to 0x2000 bytes which is large enough for the ~5992-byte
+        // table. If (somehow) the generated data is larger than the section's
+        // raw size, we error out instead of silently clamping — a truncated
+        // reloc table produces a corrupt binary that crashes under ASLR.
+        if (reloc_data.len() as u32) > reloc_raw_size {
+            return Err(PeError::Parse(format!(
+                "Relocation table ({} bytes) exceeds pre-allocated .reloc raw size ({} bytes); \
+                 increase RELOC_SECTION_VSIZE in dumper.rs",
+                reloc_data.len(),
+                reloc_raw_size
+            )));
         }
-        let max_vsize = if next_va > reloc_va { next_va - reloc_va } else { 0x1000 };
-        let clamped_size = (reloc_data.len() as u32).min(max_vsize);
-        let aligned_clamped = crate::utils::align_up(clamped_size, file_align);
 
-        // Write reloc data at existing RawPtr (clamped to avoid overlap)
-        let needed = reloc_raw_ptr as usize + aligned_clamped as usize;
+        let aligned_size = crate::utils::align_up(reloc_data.len() as u32, file_align);
+
+        // Ensure the output buffer is large enough.
+        let needed = reloc_raw_ptr as usize + aligned_size as usize;
         if needed > out_data.len() {
             out_data.resize(needed, 0);
         }
-        let write_size = clamped_size as usize;
-        out_data[reloc_raw_ptr as usize..reloc_raw_ptr as usize + write_size]
-            .copy_from_slice(&reloc_data[..write_size]);
-        for b in &mut out_data[reloc_raw_ptr as usize + write_size..reloc_raw_ptr as usize + aligned_clamped as usize] {
+
+        // Write the full relocation data at the section's RawPtr.
+        out_data[reloc_raw_ptr as usize..reloc_raw_ptr as usize + reloc_data.len()]
+            .copy_from_slice(&reloc_data);
+        // Zero-fill the remainder of the aligned region.
+        for b in &mut out_data
+            [reloc_raw_ptr as usize + reloc_data.len()..reloc_raw_ptr as usize + aligned_size as usize]
+        {
             *b = 0;
         }
 
-        // Update .reloc section header (keep VA, update sizes)
+        // Update .reloc section header: VirtualSize = actual table size,
+        // SizeOfRawData = aligned size. VA stays as created.
         out_data[sec_hdr_off + 8..sec_hdr_off + 12]
-            .copy_from_slice(&clamped_size.to_le_bytes());
+            .copy_from_slice(&(reloc_data.len() as u32).to_le_bytes());
         out_data[sec_hdr_off + 16..sec_hdr_off + 20]
-            .copy_from_slice(&aligned_clamped.to_le_bytes());
+            .copy_from_slice(&aligned_size.to_le_bytes());
 
-        // Update BaseReloc data directory (index 5)
+        // Update BaseReloc data directory (index 5) — VA stays, size = actual.
         let dd_off = pe_off + 24 + if is_64bit { 112 } else { 96 };
         let basereloc_off = dd_off + (5 * 8);
         out_data[basereloc_off..basereloc_off + 4].copy_from_slice(&reloc_va.to_le_bytes());
         out_data[basereloc_off + 4..basereloc_off + 8]
-            .copy_from_slice(&clamped_size.to_le_bytes());
+            .copy_from_slice(&(reloc_data.len() as u32).to_le_bytes());
 
-        // Enable ASLR: set DYNAMIC_BASE flag
+        // Enable ASLR: set DYNAMIC_BASE flag.
         let dll_chars_off = pe_off + 24 + 70;
         let dll_chars = u16::from_le_bytes(
             out_data[dll_chars_off..dll_chars_off + 2]
@@ -536,8 +554,10 @@ pub fn build_relocation_table(
         out_data[dll_chars_off..dll_chars_off + 2].copy_from_slice(&new_chars.to_le_bytes());
 
         info!(
-            "Relocation table: {} entries (clamped to {} bytes), VA={:#x}, ASLR enabled",
-            reloc_count, clamped_size, reloc_va
+            "Relocation table: {} entries ({} bytes, untruncated), VA={:#x}, ASLR enabled",
+            reloc_count,
+            reloc_data.len(),
+            reloc_va
         );
     } else {
         warn!("No .reloc section found");
