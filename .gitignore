@@ -28,4 +28,6 @@ InjectorCLI*.exe
 # Temporary / audit reports
 SESSION_REPORT.txt
 AUDIT_REPORT.md
-_ran.flag
+_ran.flag*.log
+build.bat
+.hermes-tmp.*

@@ -285,21 +285,129 @@ pub fn dump_process(
                     pe.nt_headers.optional_header.subsystem =
                         disk_pe.nt_headers.optional_header.subsystem;
                 }
-                // Keep the runtime ImageBase (Magicmida strategy).
-                // Themida leaves hardcoded runtime addresses in the unpacked code/data.
-                // By keeping the runtime ImageBase and disabling ASLR, we maximize the
-                // chance the program will load at the same address on subsequent runs.
-                // Only clear DYNAMIC_BASE, keep other flags like HIGH_ENTROPY_VA.
+                // ===超越 Pascal: 恢复原始 ImageBase===
+                // Pascal 保留运行时基址 + 禁用 ASLR，导致每次加载都要重定位。
+                // 我们恢复原始磁盘文件的 ImageBase（通常 0x140000000），
+                // 后续 fix_hardcoded_addresses 会自动 patch 所有绝对地址。
+                let original_image_base = disk_pe.nt_headers.optional_header.image_base;
+                let runtime_image_base = pe.nt_headers.optional_header.image_base;
+                
+                if original_image_base != 0 && original_image_base != runtime_image_base {
+                    pe.nt_headers.optional_header.image_base = original_image_base;
+                    info!(
+                        "Restored ImageBase: {:#x} -> {:#x} (will patch absolute addresses)",
+                        runtime_image_base, original_image_base
+                    );
+                }
+                // 禁用 ASLR：程序加载到固定基址，不需要重定位表
                 pe.nt_headers.optional_header.dll_characteristics &=
                     !IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE;
-
-                info!(
-                    "Keeping runtime ImageBase: {:#x} (ASLR disabled)",
-                    pe.nt_headers.optional_header.image_base
-                );
                 info!("validated PE header fields");
             }
         }
+    }
+
+    // 1b. Shrink: remove Themida-specific sections if requested.
+    //     Done after PE header validation but before import table rebuild,
+    //     so that the import section is appended to the correct (shrunken)
+    //     section table.
+    //
+    //     Strategy: simply remove Themida sections (.winlice, .boot, .themida)
+    //     from the section table. Do NOT merge VSize into previous section —
+    //     that inflates VSize and causes the Windows loader to map huge
+    //     zero-filled regions. Instead, just drop the sections and clean up
+    //     any data directory entries that point into removed VA ranges.
+    if opts.shrink {
+        let themida_names = [".winlice", ".boot", ".themida"];
+        let mut removed = 0usize;
+        let mut removed_ranges: Vec<(u32, u32)> = Vec::new();
+        let mut i = pe.sections.len();
+        loop {
+            if i == 0 { break; }
+            i -= 1;
+            let should_delete = {
+                let s = &pe.sections[i];
+                let lower = s.name.to_lowercase();
+                themida_names.iter().any(|t| lower.contains(t))
+            };
+            if should_delete {
+                let removed_va = pe.sections[i].virtual_address;
+                let removed_vs = pe.sections[i].virtual_size;
+                let removed_name = pe.sections[i].name.clone();
+                removed_ranges.push((removed_va, removed_va + removed_vs));
+
+                pe.sections.remove(i);
+                pe.nt_headers.file_header.number_of_sections =
+                    pe.nt_headers.file_header.number_of_sections.saturating_sub(1);
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            // Reassign VAs to eliminate gaps left by removed sections.
+            // After deleting .winlice/.boot, the remaining sections (.rsrc,
+            // .reloc, .import) still have their original high VAs, creating
+            // a huge unmapped VA gap. Windows loader rejects PEs with VA gaps
+            // inside SizeOfImage. We compact all sections to be contiguous.
+            let section_align = pe.nt_headers.optional_header.section_alignment;
+            let mut next_va: u32 = 0x1000; // Start after headers
+
+            for section in &mut pe.sections {
+                        // Skip the first section if it starts at 0x1000 (typical .text)
+                        if section.virtual_address == 0x1000 {
+                            next_va = section.virtual_address + section.virtual_size;
+                            next_va = crate::utils::align_up(next_va, section_align);
+                            continue;
+                        }
+
+                        let old_va = section.virtual_address;
+                        if old_va != next_va {
+                            let delta = next_va as i64 - old_va as i64;
+                            info!(
+                                "Reassigning section {} VA: 0x{:x} -> 0x{:x} (delta={:#x})",
+                                section.name, old_va, next_va, delta
+                            );
+                            section.virtual_address = next_va;
+                            section.header.virtual_address = next_va;
+                        }
+                        next_va = next_va + section.virtual_size;
+                        next_va = crate::utils::align_up(next_va, section_align);
+                    }
+
+                    // Recalculate SizeOfImage based on compacted sections
+                    pe.nt_headers.optional_header.size_of_image = next_va;
+                    let max_end = next_va;
+
+                    // Clear data directory entries that point into removed sections.
+                    // Dangling RVAs cause Windows loader to reject the PE.
+                    for dir_idx in 0..pe.nt_headers.optional_header.data_directory.len() {
+                        let dd = &pe.nt_headers.optional_header.data_directory[dir_idx];
+                        if dd.virtual_address == 0 || dd.size == 0 {
+                            continue;
+                        }
+                        for &(start, end) in &removed_ranges {
+                            if dd.virtual_address >= start && dd.virtual_address < end {
+                                let dir_names = [
+                                    "Export", "Import", "Resource", "Exception", "Certificate",
+                                    "BaseReloc", "Debug", "Arch", "GlobalPtr", "TLS",
+                                    "LoadConfig", "BoundImport", "IAT", "DelayImport", "CLR", "Reserved",
+                                ];
+                                let dir_name = dir_names.get(dir_idx).copied().unwrap_or("Unknown");
+                                info!(
+                                    "Clearing dangling DataDirectory[{}] ({}) RVA={:#x} Size={:#x}",
+                                    dir_idx, dir_name, dd.virtual_address, dd.size
+                                );
+                                pe.nt_headers.optional_header.data_directory[dir_idx].virtual_address = 0;
+                                pe.nt_headers.optional_header.data_directory[dir_idx].size = 0;
+                                break;
+                            }
+                        }
+                    }
+                    info!("Shrink complete: removed {} sections, VAs compacted, SizeOfImage: {:#x}", removed, max_end);
+                }
+
+        // Restore standard section names for unnamed sections
+        pe.rename_unnamed_sections();
+        info!("Restored standard section names");
     }
 
     let is_64bit = pe.is_64bit;
@@ -1122,7 +1230,7 @@ fn write_resolved_addresses_to_iat(
     }
 
     // Fix hardcoded runtime addresses before writing
-    fix_hardcoded_addresses(&mut out_data, opts.image_base, is_64bit)?;
+    crate::postprocess::fix_hardcoded_addresses(&mut out_data, Some(opts.image_base), is_64bit)?;;
 
     // DEBUG: Verify section 1 characteristics after fix_hardcoded_addresses
     if sec1_chars_offset + 4 <= out_data.len() {
@@ -1135,26 +1243,18 @@ fn write_resolved_addresses_to_iat(
         info!("After fix_hardcoded_addresses: Section 1 chars at {:#x} = {:#x}", sec1_chars_offset, chars);
     }
 
-    // CRITICAL: Skip relocation table generation entirely!
-    //
-    // After comparing with Magicmida byte-by-byte, we found:
-    // - Magicmida does NOT generate a complete relocation table
-    // - It keeps the original minimal .reloc (4 entries for TLS)
-    // - It disables DYNAMIC_BASE so the program loads at fixed address
-    // - All absolute addresses remain valid
-    //
-    // Our attempt to generate 4574 relocations was WRONG because:
-    // 1. We can't distinguish which addresses should be relocated
-    // 2. Some "absolute addresses" are actually runtime-generated values
-    // 3. Generating wrong relocations corrupts the program
-    //
-    // Match Pascal Magicmida: do NOT generate a full relocation table.
-    // Pascal keeps the original minimal .reloc (size=0x10, essentially empty).
-    // Our attempt to generate 4574 relocations produced incorrect entries that
-    // caused "not a valid Win32 application" errors.
-    info!("Skipping relocation table generation (matches Pascal behavior)");
-    let _ = opts.image_base; // suppress unused warning
-    let _ = is_64bit;
+    // ===超越 Pascal: 文件布局重排===
+    // 先压缩再生成 reloc，否则 reloc 数据在文件末尾会被截断
+    if opts.shrink {
+        crate::postprocess::pack_section_layout(&mut out_data, &pe)?;
+    }
+
+    // 重定位表生成已禁用。
+    // 原因：build_relocation_table 会把 .reloc VA 移到所有节区之后，
+    // 导致 .reloc VA > .import VA，Windows loader 拒绝加载 (error 193)。
+    // 策略：ASLR OFF + 保留原始最小 .reloc 表（与 Magicmida Pascal 一致）。
+    // fix_hardcoded_addresses 已将运行时绝对地址 patch 为文件基址，
+    // 配合 ASLR OFF 程序加载到固定基址，无需重定位。
 
     std::fs::write(out_path, &out_data)?;
 
@@ -1163,123 +1263,6 @@ fn write_resolved_addresses_to_iat(
         size = out_data.len(),
         sections = pe.sections.len(),
         "Dump written successfully"
-    );
-
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// fix_hardcoded_addresses — convert runtime absolute addresses to RVAs
-// ---------------------------------------------------------------------------
-
-/// Fix hardcoded runtime absolute addresses in the dump.
-///
-/// During unpacking, some data sections may contain absolute addresses that
-/// were valid during the dump (based on the runtime ImageBase), but will be
-/// invalid when the program loads at a different address. This function scans
-/// all writable sections for such addresses and adjusts them.
-fn fix_hardcoded_addresses(
-    out_data: &mut [u8],
-    runtime_image_base: u64,
-    is_64bit: bool,
-) -> Result<(), PeError> {
-    // Parse PE to find the actual ImageBase and sections
-    let pe = PeHeader::from_bytes(out_data)?;
-    let file_image_base = pe.nt_headers.optional_header.image_base;
-
-    let delta = (file_image_base as i64).wrapping_sub(runtime_image_base as i64);
-
-    info!(
-        "Scanning for hardcoded addresses: runtime_base={:#x}, file_base={:#x}, delta={:#x}",
-        runtime_image_base, file_image_base, delta
-    );
-
-    // Scan all writable sections for hardcoded addresses
-    let ptr_size = if is_64bit { 8 } else { 4 };
-    let mut fixed_count = 0;
-    let mut scanned_bytes = 0;
-
-    // Define the valid address range for the runtime image
-    let image_size = pe.nt_headers.optional_header.size_of_image as u64;
-    let runtime_start = runtime_image_base;
-    let runtime_end = runtime_image_base + image_size;
-
-    for section in &pe.sections {
-        // Scan ALL initialized sections:
-        // - Writable data sections (obvious candidates)
-        // - Executable code sections (may contain jump tables, constants)
-        // - READONLY data sections (can contain global pointers that need fixing!)
-        //
-        // The key insight: READONLY doesn't mean "no absolute addresses"!
-        // It just means the OS won't let the program write to it at runtime.
-        // But absolute addresses in readonly data still need to be fixed.
-        let is_writable = (section.characteristics & 0x80000000) != 0; // IMAGE_SCN_MEM_WRITE
-        let is_executable = (section.characteristics & 0x20000000) != 0; // IMAGE_SCN_MEM_EXECUTE
-        let is_initialized = (section.characteristics & 0x00000080) != 0; // IMAGE_SCN_CNT_INITIALIZED_DATA
-
-        // Skip ONLY uninitialized sections (like .bss)
-        if !is_writable && !is_executable && !is_initialized {
-            continue;
-        }
-
-        let section_start = section.raw_offset as usize;
-        let section_size = section.raw_size as usize;
-        let section_end = section_start + section_size;
-
-        if section_end > out_data.len() {
-            warn!(
-                "Section {} extends beyond file size, skipping",
-                section.name
-            );
-            continue;
-        }
-
-        debug!(
-            "Scanning section {} (RVA: {:#x}, size: {:#x}, file offset: {:#x})",
-            section.name,
-            section.virtual_address,
-            section_size,
-            section_start
-        );
-
-        // Scan the section for potential addresses
-        for offset in (section_start..section_end).step_by(ptr_size) {
-            let addr = read_ptr(out_data, offset, is_64bit);
-
-            if addr == 0 {
-                continue;
-            }
-
-            // Check if this looks like a runtime address
-            let is_runtime_addr = if is_64bit {
-                // For 64-bit, check if address falls within the runtime image range
-                addr >= runtime_start && addr < runtime_end
-            } else {
-                // For 32-bit, check if address is within runtime image range
-                addr >= runtime_image_base && addr < runtime_image_base + image_size
-            };
-
-            if is_runtime_addr && delta != 0 {
-                let new_addr = (addr as i64).wrapping_add(delta) as u64;
-
-                if fixed_count < 5 {
-                    debug!(
-                        "Fixing offset {:#x}: old={:#x}, delta={:#x}, new={:#x}",
-                        offset, addr, delta, new_addr
-                    );
-                }
-
-                write_ptr(out_data, offset, new_addr, is_64bit);
-                fixed_count += 1;
-            }
-        }
-
-        scanned_bytes += section_size;
-    }
-
-    info!(
-        "Scanned {} bytes in writable sections, fixed {} hardcoded addresses",
-        scanned_bytes, fixed_count
     );
 
     Ok(())
@@ -2859,164 +2842,4 @@ fn section_rva_to_file_offset(sections: &[crate::PeSection], rva: u32) -> usize 
     }
     rva as usize // fallback
 }
-// ---------------------------------------------------------------------------
-// build_relocation_table — generate complete Base Relocation Table
-// ---------------------------------------------------------------------------
 
-/// Build a complete Base Relocation Table for the dump.
-///
-/// This scans all initialized sections for absolute addresses pointing to the image
-/// and generates relocation entries so the Windows PE Loader can fix them when the
-/// image loads at a different base address (ASLR).
-///
-/// Without this, absolute addresses in readonly data sections will be invalid,
-/// causing the program to crash immediately.
-#[allow(dead_code)]
-fn build_relocation_table(
-    out_data: &mut [u8],
-    _runtime_image_base: u64,
-    is_64bit: bool,
-) -> Result<(), PeError> {
-    use crate::relocation::RelocationTableBuilder;
-
-    // Parse PE to get sections and image info
-    let mut pe = PeHeader::from_bytes(out_data)?;
-    let image_base = pe.nt_headers.optional_header.image_base;
-    let image_size = pe.nt_headers.optional_header.size_of_image;
-
-    info!(
-        "Building Base Relocation Table: image_base={:#x}, image_size={:#x}",
-        image_base, image_size
-    );
-
-    let mut builder = RelocationTableBuilder::new(image_base, image_size);
-
-    // Scan all initialized sections for absolute addresses
-    for section in &pe.sections {
-        let is_writable = (section.characteristics & 0x80000000) != 0;
-        let is_executable = (section.characteristics & 0x20000000) != 0;
-        let is_initialized = (section.characteristics & 0x00000080) != 0;
-        let has_contents = (section.characteristics & 0x00000040) != 0; // IMAGE_SCN_CNT_INITIALIZED_DATA
-
-        // CRITICAL FIX: We must scan READONLY DATA sections!
-        // Example: Section 2-4 with READONLY DATA contain absolute pointers.
-        // Skip ONLY truly uninitialized sections (like .bss without INITIALIZED_DATA flag)
-        //
-        // Scan if ANY of these is true:
-        // - Writable (obvious - data that can change)
-        // - Executable (may contain jump tables, embedded constants)
-        // - Initialized data (includes READONLY data with pointers!)
-        // - Has contents (broader check for any initialized section)
-        if !is_writable && !is_executable && !is_initialized && !has_contents {
-            continue;
-        }
-
-        let section_start = section.raw_offset as usize;
-        let section_size = section.raw_size as usize;
-        let section_end = section_start + section_size;
-
-        if section_end > out_data.len() {
-            warn!(
-                "Section {} extends beyond file size, skipping",
-                section.name
-            );
-            continue;
-        }
-
-        let section_data = &out_data[section_start..section_end];
-
-        info!("Scanning section {} for relocations: raw_offset={:#x}, size={:#x}, characteristics={:#x}",
-              section.name, section.raw_offset, section_size, section.characteristics);
-
-        // CRITICAL FIX: In our dump format, some sections have RVA != file_offset!
-        // We read from file offsets, so we must calculate RVA correctly:
-        // RVA = raw_offset + data_offset (NOT virtual_address + data_offset)
-        // This is because our dump is a FLAT memory dump where RVA == file offset.
-        builder.scan_and_add_relocations(section_data, section.raw_offset, is_64bit);
-
-        debug!(
-            "Scanned section {} (RVA: {:#x}, size: {:#x}) for relocations",
-            section.name, section.virtual_address, section_size
-        );
-    }
-
-    let reloc_count = builder.count();
-    info!("Found {} relocations to add to .reloc", reloc_count);
-
-    if reloc_count == 0 {
-        warn!("No relocations found - this is unusual for a Themida dump");
-        return Ok(());
-    }
-
-    // Build the .reloc section data
-    let reloc_data = builder.build();
-
-    // Find or create .reloc section
-    let reloc_section_idx = pe.sections.iter().position(|s| {
-        let name = s.name.trim_end_matches('\0');
-        name == ".reloc"
-    });
-
-    if let Some(idx) = reloc_section_idx {
-        // Replace existing .reloc section
-        info!("Replacing existing .reloc section (old size: {}, new size: {})",
-              pe.sections[idx].raw_size, reloc_data.len());
-
-        let _old_rva = pe.sections[idx].virtual_address;
-        let _aligned_size = crate::utils::align_up(reloc_data.len() as u32, 0x1000);
-
-        // Update section header in out_data
-        let old_rva = pe.sections[idx].virtual_address;
-        pe.sections[idx].raw_size = reloc_data.len() as u32;
-        pe.sections[idx].virtual_size = reloc_data.len() as u32;
-
-        // CRITICAL: Write the updated section header back to out_data!
-        // Section headers start at: PE_offset + sizeof(FileHeader) + sizeof(OptionalHeader)
-        let section_header_offset = if is_64bit {
-            0x80 + 24 + 240 + (idx * 40) // PE + FileHeader + OptionalHeader64 + section_index * sizeof(SectionHeader)
-        } else {
-            0x80 + 24 + 224 + (idx * 40) // PE + FileHeader + OptionalHeader32 + section_index * sizeof(SectionHeader)
-        };
-
-        // Write VirtualSize (offset +8 in section header)
-        out_data[section_header_offset + 8..section_header_offset + 12]
-            .copy_from_slice(&(reloc_data.len() as u32).to_le_bytes());
-
-        // Write RawSize (offset +16 in section header)
-        out_data[section_header_offset + 16..section_header_offset + 20]
-            .copy_from_slice(&(reloc_data.len() as u32).to_le_bytes());
-
-        info!("Updated .reloc section header at offset {:#x}", section_header_offset);
-
-        // Update Data Directory entry for Base Relocation Table (index 5)
-        const IMAGE_DIRECTORY_ENTRY_BASERELOC: usize = 5;
-        pe.nt_headers.optional_header.data_directory[IMAGE_DIRECTORY_ENTRY_BASERELOC].virtual_address = old_rva;
-        pe.nt_headers.optional_header.data_directory[IMAGE_DIRECTORY_ENTRY_BASERELOC].size = reloc_data.len() as u32;
-
-        // Write Data Directory back to out_data
-        let data_dir_offset = if is_64bit {
-            0x80 + 24 + 112 // PE signature + FileHeader + start of DataDirectory in OptionalHeader64
-        } else {
-            0x80 + 24 + 96  // PE signature + FileHeader + start of DataDirectory in OptionalHeader32
-        };
-        let basereloc_offset = data_dir_offset + (IMAGE_DIRECTORY_ENTRY_BASERELOC * 8);
-        out_data[basereloc_offset..basereloc_offset + 4].copy_from_slice(&old_rva.to_le_bytes());
-        out_data[basereloc_offset + 4..basereloc_offset + 8].copy_from_slice(&(reloc_data.len() as u32).to_le_bytes());
-
-        // Write .reloc section data to file
-        let file_offset = pe.sections[idx].raw_offset as usize;
-        if file_offset + reloc_data.len() <= out_data.len() {
-            out_data[file_offset..file_offset + reloc_data.len()].copy_from_slice(&reloc_data);
-        } else {
-            return Err(PeError::Parse("Reloc section extends beyond file size".into()));
-        }
-
-        info!("Base Relocation Table built successfully: {} relocations, {} bytes",
-              reloc_count, reloc_data.len());
-    } else {
-        warn!("No .reloc section found in dump - cannot add relocations");
-        // TODO: Create new .reloc section if needed
-    }
-
-    Ok(())
-}

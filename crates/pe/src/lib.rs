@@ -27,6 +27,7 @@ pub mod apiset_data;
 pub mod dumper;
 pub mod original_imports;
 pub mod relocation;
+pub mod postprocess;
 
 // Re-export the primary types so callers can do `use mida_pe::PeHeader` etc.
 pub use error::PeError;
@@ -36,4 +37,5 @@ pub use utils::{align_up, has_force_integrity, is_dll};
 pub use import_table::{ImportModule, ImportTableBuilder, ImportThunk};
 pub use apiset::{ApiSetMapping, get_apiset_module_by_api, is_apiset_dll, resolve_apiset};
 pub use dumper::{DumpOptions, dump_process, dump_dotnet, rebuild_import_table, get_original_imports, is_dotnet};
+pub use postprocess::{postprocess_image, PostprocessOptions};
 pub use relocation::RelocationTableBuilder;

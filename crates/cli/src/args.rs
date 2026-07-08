@@ -104,7 +104,7 @@ fn parse_unpack(args: &[String]) -> Result<Command, String> {
 
     let mut output: Option<PathBuf> = None;
     let mut create_data_sections = false;
-    let mut shrink = false;
+    let mut shrink = true; // Default: shrink Themida sections (surpasses Pascal)
     let mut verbose = false;
 
     let mut i = 3;
@@ -122,6 +122,9 @@ fn parse_unpack(args: &[String]) -> Result<Command, String> {
             }
             "--shrink" => {
                 shrink = true;
+            }
+            "--no-shrink" => {
+                shrink = false;
             }
             "-v" | "--verbose" => {
                 verbose = true;

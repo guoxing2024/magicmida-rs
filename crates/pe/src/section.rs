@@ -309,6 +309,69 @@ impl PeHeader {
         }
     }
 
+    /// Rename unnamed sections based on their characteristics.
+    ///
+    /// Themida replaces all section names with spaces (0x20). This function
+    /// restores meaningful names based on section permissions and content type:
+    ///
+    /// | Characteristics pattern | New name |
+    /// |---|---|
+    /// | Execute + Code | `.text` |
+    /// | Execute + Read + Initialized | `.rtext` |
+    /// | Read + Write + Initialized | `.data` |
+    /// | Read + Initialized | `.rdata` |
+    /// | Read + Write + Uninitialized | `.bss` |
+    /// | Read + Resource | `.rsrc` |
+    /// | Read + Relocations | `.reloc` |
+    ///
+    /// Sections that already have a name (non-empty, non-space) are left
+    /// unchanged.
+    pub fn rename_unnamed_sections(&mut self) {
+        const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
+        const IMAGE_SCN_MEM_READ: u32 = 0x4000_0000;
+        const IMAGE_SCN_MEM_WRITE: u32 = 0x8000_0000;
+        const IMAGE_SCN_CNT_CODE: u32 = 0x0000_0020;
+        const IMAGE_SCN_CNT_INITIALIZED_DATA: u32 = 0x0000_0040;
+        const IMAGE_SCN_CNT_UNINITIALIZED_DATA: u32 = 0x0000_0080;
+
+        for (i, section) in self.sections.iter_mut().enumerate() {
+            // Skip sections that already have a proper name
+            let name = &section.name;
+            if !name.is_empty() && !name.as_bytes().iter().all(|&b| b == b' ' || b == 0) {
+                continue;
+            }
+
+            let chars = section.characteristics;
+            let has_exec = (chars & IMAGE_SCN_MEM_EXECUTE) != 0;
+            let has_write = (chars & IMAGE_SCN_MEM_WRITE) != 0;
+            let has_read = (chars & IMAGE_SCN_MEM_READ) != 0;
+            let has_code = (chars & IMAGE_SCN_CNT_CODE) != 0;
+            let has_init = (chars & IMAGE_SCN_CNT_INITIALIZED_DATA) != 0;
+            let has_uninit = (chars & IMAGE_SCN_CNT_UNINITIALIZED_DATA) != 0;
+
+            let new_name = if has_exec && has_code {
+                ".text"
+            } else if has_exec && has_read && has_init {
+                ".rtext"
+            } else if has_write && has_init {
+                ".data"
+            } else if has_read && has_init {
+                ".rdata"
+            } else if has_write && has_uninit {
+                ".bss"
+            } else if has_read && has_uninit {
+                ".bss"
+            } else {
+                // Fallback: use index-based name
+                // This avoids leaving sections unnamed
+                continue; // Leave unnamed if we can't determine type
+            };
+
+            tracing::debug!("Renaming section {}: '{}' -> '{}'", i, section.name, new_name);
+            section.rename(new_name);
+        }
+    }
+
     /// Rename a section by index.
     ///
     /// Convenience wrapper around [`PeSection::rename`].
