@@ -460,87 +460,88 @@ pub fn build_relocation_table(
     let reloc_data = builder.build();
     info!("Relocation table size: {} bytes", reloc_data.len());
 
-    // Write reloc data: append after the last section in the file
-    // This is simpler and safer than trying to fit into the existing .reloc space
     let file_align = pe.nt_headers.optional_header.file_alignment;
-    let aligned_size = crate::utils::align_up(reloc_data.len() as u32, file_align);
 
-    // Find current end of file
-    let mut max_end = 0usize;
+    // Find .reloc section
     let mut reloc_idx = None;
-    let mut max_va_end = 0u32; // max virtual address end
     for (i, section) in pe.sections.iter().enumerate() {
-        let end = section.raw_offset as usize + section.raw_size as usize;
-        if end > max_end { max_end = end; }
-        let va_end = section.virtual_address + section.virtual_size;
-        if va_end > max_va_end { max_va_end = va_end; }
         if section.name.trim_end_matches('\0') == ".reloc" {
             reloc_idx = Some(i);
+            break;
         }
     }
 
-    // Append reloc data at end of file, aligned
-    let new_reloc_offset = crate::utils::align_up(max_end as u32, file_align) as usize;
-    let needed = new_reloc_offset + aligned_size as usize;
-    if needed > out_data.len() {
-        out_data.resize(needed, 0);
-    }
-    out_data[new_reloc_offset..new_reloc_offset + reloc_data.len()].copy_from_slice(&reloc_data);
-    for b in &mut out_data[new_reloc_offset + reloc_data.len()..new_reloc_offset + aligned_size as usize] {
-        *b = 0;
-    }
-
-    // Update .reloc section: move VA to after all other sections to avoid overlap
     if let Some(idx) = reloc_idx {
-        let section_align = pe.nt_headers.optional_header.section_alignment;
-        // New VA: after the last section's virtual end, aligned
-        let new_reloc_va = crate::utils::align_up(max_va_end, section_align);
-
         let pe_off = u32::from_le_bytes(out_data[0x3C..0x40].try_into().unwrap_or([0; 4])) as usize;
-        let sec_hdr_off = pe_off + 24 + pe.nt_headers.file_header.size_of_optional_header as usize + (idx * 40);
+        let sec_hdr_off =
+            pe_off + 24 + pe.nt_headers.file_header.size_of_optional_header as usize + (idx * 40);
 
-        // VirtualSize
-        out_data[sec_hdr_off + 8..sec_hdr_off + 12].copy_from_slice(&(reloc_data.len() as u32).to_le_bytes());
-        // RawSize (aligned)
-        out_data[sec_hdr_off + 16..sec_hdr_off + 20].copy_from_slice(&aligned_size.to_le_bytes());
-        // PointerToRawData
-        out_data[sec_hdr_off + 20..sec_hdr_off + 24].copy_from_slice(&(new_reloc_offset as u32).to_le_bytes());
-        // VirtualAddress (moved to avoid overlap!)
-        out_data[sec_hdr_off + 12..sec_hdr_off + 16].copy_from_slice(&new_reloc_va.to_le_bytes());
+        // Read existing .reloc RawPtr and VA (don't change them)
+        let reloc_raw_ptr = u32::from_le_bytes(
+            out_data[sec_hdr_off + 20..sec_hdr_off + 24]
+                .try_into()
+                .unwrap_or([0; 4]),
+        );
+        let reloc_va = u32::from_le_bytes(
+            out_data[sec_hdr_off + 12..sec_hdr_off + 16]
+                .try_into()
+                .unwrap_or([0; 4]),
+        );
+
+        // Clamp VSize to not overlap with the next section
+        let mut next_va = u32::MAX;
+        for (j, section) in pe.sections.iter().enumerate() {
+            if j != idx && section.virtual_address > reloc_va {
+                next_va = next_va.min(section.virtual_address);
+            }
+        }
+        let max_vsize = if next_va > reloc_va { next_va - reloc_va } else { 0x1000 };
+        let clamped_size = (reloc_data.len() as u32).min(max_vsize);
+        let aligned_clamped = crate::utils::align_up(clamped_size, file_align);
+
+        // Write reloc data at existing RawPtr (clamped to avoid overlap)
+        let needed = reloc_raw_ptr as usize + aligned_clamped as usize;
+        if needed > out_data.len() {
+            out_data.resize(needed, 0);
+        }
+        let write_size = clamped_size as usize;
+        out_data[reloc_raw_ptr as usize..reloc_raw_ptr as usize + write_size]
+            .copy_from_slice(&reloc_data[..write_size]);
+        for b in &mut out_data[reloc_raw_ptr as usize + write_size..reloc_raw_ptr as usize + aligned_clamped as usize] {
+            *b = 0;
+        }
+
+        // Update .reloc section header (keep VA, update sizes)
+        out_data[sec_hdr_off + 8..sec_hdr_off + 12]
+            .copy_from_slice(&clamped_size.to_le_bytes());
+        out_data[sec_hdr_off + 16..sec_hdr_off + 20]
+            .copy_from_slice(&aligned_clamped.to_le_bytes());
 
         // Update BaseReloc data directory (index 5)
         let dd_off = pe_off + 24 + if is_64bit { 112 } else { 96 };
         let basereloc_off = dd_off + (5 * 8);
-        out_data[basereloc_off..basereloc_off + 4].copy_from_slice(&new_reloc_va.to_le_bytes());
-        out_data[basereloc_off + 4..basereloc_off + 8].copy_from_slice(&(reloc_data.len() as u32).to_le_bytes());
-
-        // Update SizeOfImage
-        let new_size_of_image = crate::utils::align_up(new_reloc_va + reloc_data.len() as u32, section_align);
-        let img_size_off = pe_off + 24 + 56; // SizeOfImage in OptionalHeader
-        out_data[img_size_off..img_size_off + 4].copy_from_slice(&new_size_of_image.to_le_bytes());
+        out_data[basereloc_off..basereloc_off + 4].copy_from_slice(&reloc_va.to_le_bytes());
+        out_data[basereloc_off + 4..basereloc_off + 8]
+            .copy_from_slice(&clamped_size.to_le_bytes());
 
         // Enable ASLR: set DYNAMIC_BASE flag
         let dll_chars_off = pe_off + 24 + 70;
-        let dll_chars = u16::from_le_bytes(out_data[dll_chars_off..dll_chars_off + 2].try_into().unwrap_or([0; 2]));
+        let dll_chars = u16::from_le_bytes(
+            out_data[dll_chars_off..dll_chars_off + 2]
+                .try_into()
+                .unwrap_or([0; 2]),
+        );
         const IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE: u16 = 0x0040;
         let new_chars = dll_chars | IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE;
         out_data[dll_chars_off..dll_chars_off + 2].copy_from_slice(&new_chars.to_le_bytes());
 
         info!(
-            "Relocation table: {} entries, {} bytes at VA={:#x} offset={:#x}, ASLR enabled, SizeOfImage={:#x}",
-            reloc_count, reloc_data.len(), new_reloc_va, new_reloc_offset, new_size_of_image
+            "Relocation table: {} entries (clamped to {} bytes), VA={:#x}, ASLR enabled",
+            reloc_count, clamped_size, reloc_va
         );
     } else {
         warn!("No .reloc section found");
     }
 
     Ok(())
-}
-
-// TODO: Implement file-level relocation rebuilding
-// Not done yet due to 0xC0000005 crash in V2
-fn rebuild_file_relocations(
-    pe: &PeHeader,
-) -> Result<Vec<u8>, PeError> {
-    unimplemented!("Rebuild file-level relocations (TODO after V2 is stable)")
 }

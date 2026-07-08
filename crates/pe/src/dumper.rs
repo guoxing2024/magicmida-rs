@@ -1249,12 +1249,13 @@ fn write_resolved_addresses_to_iat(
         crate::postprocess::pack_section_layout(&mut out_data, &pe)?;
     }
 
-    // 重定位表生成已禁用。
-    // 原因：build_relocation_table 会把 .reloc VA 移到所有节区之后，
-    // 导致 .reloc VA > .import VA，Windows loader 拒绝加载 (error 193)。
-    // 策略：ASLR OFF + 保留原始最小 .reloc 表（与 Magicmida Pascal 一致）。
-    // fix_hardcoded_addresses 已将运行时绝对地址 patch 为文件基址，
-    // 配合 ASLR OFF 程序加载到固定基址，无需重定位。
+    // ===超越 Pascal: 生成重定位表 (ASLR 支持)===
+    // Pascal 不生成 .reloc 表，禁用 ASLR，程序只能加载到固定地址。
+    // 我们在 fix_hardcoded_addresses 之后生成 .reloc，启用 ASLR。
+    // 关键：保持 .reloc VA 不变（在 .import 之前），原地更新数据。
+    if opts.shrink {
+        crate::postprocess::build_relocation_table(&mut out_data, None, is_64bit)?;
+    }
 
     std::fs::write(out_path, &out_data)?;
 
