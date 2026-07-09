@@ -74,6 +74,14 @@ struct LoopState {
     guard_installed: bool,
     close_handle_bp_set: bool,
     nt_protect_bp_set: bool,
+    /// .text poll: count of wait_event iterations since guard installed
+    text_poll_count: u32,
+    /// .text poll: previous snapshot for stability check
+    text_prev_sample: [u8; 16],
+    /// .text poll: true when .text content is stable (two consecutive reads match)
+    text_stable: bool,
+    /// .text poll: re-guard done, waiting for AV at OEP
+    text_reguarded: bool,
     oep: Option<usize>,
     oep_found_via_scanning: bool,
     virtualized_oep_retries: u32,
@@ -217,6 +225,10 @@ pub fn unpack(
         guard_installed: false,
         close_handle_bp_set: false,
         nt_protect_bp_set: false,
+        text_poll_count: 0,
+        text_prev_sample: [0u8; 16],
+        text_stable: false,
+        text_reguarded: false,
         oep: None,
         oep_found_via_scanning: false,
         virtualized_oep_retries: 0,
@@ -249,6 +261,58 @@ pub fn unpack(
             e
         })?;
         log::log(LogType::Info, &format!("event received: {event:?}"));
+
+        // ---- .text decryption polling ----
+        // Themida uses NtProtectVirtualMemory to bypass our PAGE_NOACCESS guard,
+        // so AccessViolation won't fire. Instead, poll .text for content.
+        // When .text is stable (two consecutive reads match), re-guard .text
+        // and wait for AV — the faulting instruction is the OEP.
+        if ls.guard_installed && ls.oep.is_none() && ls.iat_trace.is_none() && !ls.text_reguarded {
+            ls.text_poll_count += 1;
+            if ls.text_poll_count % 10 == 0 {
+                let text_sec = &state.pe_info.pe_sections[0];
+                let text_start = image_base_usize + text_sec.virtual_address as usize;
+                let mut sample = [0u8; 16];
+                if dbg.read_memory(text_start, &mut sample).is_ok() {
+                    let non_zero = sample.iter().filter(|&&b| b != 0).count();
+                    if non_zero > 8 {
+                        if sample == ls.text_prev_sample {
+                            // Stable — re-guard and wait for AV
+                            log::log(
+                                LogType::Good,
+                                &format!(
+                                    ".text decrypted and stable (poll #{}, {non_zero}/16 non-zero) — re-guarding",
+                                    ls.text_poll_count
+                                ),
+                            );
+                            ls.text_stable = true;
+                            let text_size = state.pe_info.base_of_data as usize
+                                - text_sec.virtual_address as usize;
+                            match install_code_section_guard(
+                                h_process,
+                                text_start,
+                                text_size,
+                                guard_protection,
+                            ) {
+                                Ok(()) => {
+                                    log::log(LogType::Good, "Re-guarded .text — waiting for OEP fault");
+                                    ls.text_reguarded = true;
+                                }
+                                Err(e) => {
+                                    warn!("Re-guard failed: {e}");
+                                }
+                            }
+                        } else {
+                            log::log(
+                                LogType::Info,
+                                &format!(".text has content but not stable yet (poll #{})", ls.text_poll_count),
+                            );
+                        }
+                    }
+                    ls.text_prev_sample = sample;
+                }
+            }
+        }
 
         match event {
             // ---------------------------------------------------------------
@@ -368,33 +432,10 @@ pub fn unpack(
                         }
                     }
 
-                    // Set HW BP on NtProtectVirtualMemory to intercept
-                    // Themida removing PAGE_NOACCESS from .text before
-                    // writing decrypted code. Slot 1 (slot 0 reserved for
-                    // CloseHandle chain if needed later).
-                    let nt_protect_addr = dbg
-                        .apis
-                        .as_ref()
-                        .map(|a| a.nt_protect_virtual_memory)
-                        .unwrap_or(0);
-                    if nt_protect_addr != 0 {
-                        match dbg.set_hw_breakpoint(
-                            1,
-                            nt_protect_addr,
-                            HwbpType::Execute,
-                        ) {
-                            Ok(()) => {
-                                info!(
-                                    addr = %format!("{nt_protect_addr:#x}"),
-                                    "NtProtectVirtualMemory HW BP set (slot 1) — guard protector"
-                                );
-                                ls.nt_protect_bp_set = true;
-                            }
-                            Err(e) => {
-                                warn!("Cannot set NtProtectVirtualMemory BP: {e}");
-                            }
-                        }
-                    }
+                                        // NtProtectVirtualMemory BP disabled — it fires during Themida
+                    // initialization (ntdll page protection changes) and causes
+                    // an infinite re-fire loop because RF cannot be set in the
+                    // Themida environment (ERROR_PARTIAL_COPY on SetThreadContext).
                 }
 
                 // NOTE: We deliberately do NOT install the CloseHandle HW
@@ -648,6 +689,29 @@ pub fn unpack(
                 target_address,
                 exc_type,
             } => {
+                // If we re-guarded .text and get an AV in .text range, this is OEP
+                if ls.text_reguarded && ls.oep.is_none() {
+                    let text_sec = &state.pe_info.pe_sections[0];
+                    let text_start = image_base_usize + text_sec.virtual_address as usize;
+                    let text_end = image_base_usize + state.pe_info.base_of_data as usize;
+                    let exc = exception_addr as usize;
+                    if exc >= text_start && exc < text_end {
+                        log::log(
+                            LogType::Good,
+                            &format!("OEP captured via re-guard AV: {exception_addr:#x}"),
+                        );
+                        ls.oep = Some(exception_addr as usize);
+                        // Remove guard
+                        let text_size = text_end - text_start;
+                        let _ = mida_packers_themida::remove_code_section_guard(
+                            h_process, text_start, text_size,
+                        );
+                        // Continue to IAT phase — set RIP to OEP and let program run
+                        // for IAT decryption
+                        dbg.continue_event(thread_id, ContinueStatus::Continue)?;
+                        continue;
+                    }
+                }
                 match handle_access_violation(
                     &mut ls, &mut dbg, &mut state, &pe,
                     h_process, guard_protection,
