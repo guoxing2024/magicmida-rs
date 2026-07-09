@@ -45,6 +45,11 @@ pub enum TracerError {
         /// Context for where the error occurred.
         context: &'static str,
     },
+
+    /// Internal invariant violation — a precondition that should be
+    /// guaranteed by the calling contract was not met.
+    #[error("internal error: {0}")]
+    Internal(&'static str),
 }
 
 /// Categorization of the unexpected breakpoint that terminated a trace.

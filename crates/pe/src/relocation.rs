@@ -69,9 +69,9 @@ impl RelocationTableBuilder {
 
         for offset in (0..data.len().saturating_sub(ptr_size - 1)).step_by(ptr_size) {
             let addr = if is_64bit {
-                u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap())
+                u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap_or([0; 8]))
             } else {
-                u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as u64
+                u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap_or([0; 4])) as u64
             };
 
             // Check if this looks like an absolute address pointing to our image

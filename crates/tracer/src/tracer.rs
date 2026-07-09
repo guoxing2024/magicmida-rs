@@ -175,7 +175,9 @@ impl<'a> Tracer<'a> {
         let mut predicate = self
             .predicate
             .take()
-            .expect("predicate must be Some before trace");
+            .ok_or(TracerError::Internal(
+                "predicate must be Some before trace",
+        ))?;
 
         // The closure wraps the loop so we can use `?` inside it while
         // keeping `predicate` on the stack.  After the closure we restore

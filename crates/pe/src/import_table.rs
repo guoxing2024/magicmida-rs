@@ -94,8 +94,9 @@ impl ImportTableBuilder {
             name: name.to_lowercase(),
             thunks: Vec::new(),
         });
-        // SAFETY: We just pushed an element, so last_mut() cannot be None
-        self.modules.last_mut().expect("just pushed a module")
+        // SAFETY: We just pushed an element, so the new last index is valid
+        let idx = self.modules.len() - 1;
+        &mut self.modules[idx]
     }
 
     /// Produce the on-disk `.import` section WITHOUT the embedded IAT, plus
@@ -458,16 +459,16 @@ mod tests {
         assert_eq!(iat_base, expected_iat_base as u32);
 
         // Check descriptor points to DLL name at section_va + strings_base
-        let dll_rva = u32::from_le_bytes(data[12..16].try_into().unwrap());
+        let dll_rva = u32::from_le_bytes(data[12..16].try_into().unwrap_or([0; 4]));
         assert_eq!(dll_rva, section_va + strings_base);
 
         // Check descriptor FirstThunk points to IAT
-        let iat_rva = u32::from_le_bytes(data[16..20].try_into().unwrap());
+        let iat_rva = u32::from_le_bytes(data[16..20].try_into().unwrap_or([0; 4]));
         assert_eq!(iat_rva, section_va + iat_base);
 
         // IAT slot should point to hint/name entry
         let hn_rva =
-            u32::from_le_bytes(data[iat_base as usize..iat_base as usize + 4].try_into().unwrap());
+            u32::from_le_bytes(data[iat_base as usize..iat_base as usize + 4].try_into().unwrap_or([0; 4]));
         let expected_hn_rva = section_va + strings_base + 13; // after DLL name
         assert_eq!(hn_rva, expected_hn_rva);
     }
@@ -487,7 +488,7 @@ mod tests {
 
         let (data, _, iat_base) = builder.build_section_data(0x1000);
         let slot =
-            u64::from_le_bytes(data[iat_base as usize..iat_base as usize + 8].try_into().unwrap());
+            u64::from_le_bytes(data[iat_base as usize..iat_base as usize + 8].try_into().unwrap_or([0; 8]));
         assert_eq!(slot, IMAGE_ORDINAL_FLAG64 | 42);
     }
 

@@ -398,7 +398,7 @@ pub fn fixup_api_call_sites(
     if let Some(&first) = sorted.first() {
         site_set.push(first);
         for &addr in &sorted[1..] {
-            if addr >= *site_set.last().unwrap() + 6 {
+            if addr >= *site_set.last().unwrap_or(&0) + 6 {
                 site_set.push(addr);
             }
         }
