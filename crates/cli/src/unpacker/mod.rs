@@ -73,6 +73,7 @@ pub use dump::dump_process_code;
 struct LoopState {
     guard_installed: bool,
     close_handle_bp_set: bool,
+    nt_protect_bp_set: bool,
     oep: Option<usize>,
     oep_found_via_scanning: bool,
     virtualized_oep_retries: u32,
@@ -215,6 +216,7 @@ pub fn unpack(
     let mut ls = LoopState {
         guard_installed: false,
         close_handle_bp_set: false,
+        nt_protect_bp_set: false,
         oep: None,
         oep_found_via_scanning: false,
         virtualized_oep_retries: 0,
@@ -328,17 +330,20 @@ pub fn unpack(
                 dbg.apis = Some(apis);
 
                 // Pascal Themida64.pas TMInit (lines 305-315):
-                // If section 0 is named ".text" AND has raw data on disk,
-                // the code section is not encrypted/compressed — install
-                // the guard directly (PAGE_NOACCESS) and skip the CloseHandle
-                // BP path. If RawSize=0 the section is empty in the file and
-                // will be filled at runtime by the packer, so we must use the
+                // If section 0 is named ".text", install the code section
+                // guard directly (PAGE_NOACCESS), regardless of RawSize.
+                // - RawSize > 0: code is present but may be overwritten by
+                //   the packer; guard catches the write.
+                // - RawSize = 0: section is empty, Themida fills it at runtime
+                //   via VirtualAlloc + memcpy (NOT via CloseHandle chain);
+                //   guard catches the write just the same.
+                // Only when section 0 is NOT ".text" do we fall back to the
                 // CloseHandle → .text write → VirtualAlloc → guard chain.
                 let text_is_plain = state
                     .pe_info
                     .pe_sections
                     .first()
-                    .is_some_and(|s| s.name == ".text" && s.raw_size > 0);
+                    .is_some_and(|s| s.name == ".text");
 
                 if text_is_plain && !is_dotnet {
                     let text_sec = &state.pe_info.pe_sections[0];
@@ -354,12 +359,40 @@ pub fn unpack(
                         Ok(()) => {
                             log::log(
                                 LogType::Good,
-                                "Text section not encrypted/compressed, installing page guard",
+                                "Text section guard installed (direct mode)",
                             );
                             ls.guard_installed = true;
                         }
                         Err(e) => {
                             warn!("Failed to install code section guard: {e}");
+                        }
+                    }
+
+                    // Set HW BP on NtProtectVirtualMemory to intercept
+                    // Themida removing PAGE_NOACCESS from .text before
+                    // writing decrypted code. Slot 1 (slot 0 reserved for
+                    // CloseHandle chain if needed later).
+                    let nt_protect_addr = dbg
+                        .apis
+                        .as_ref()
+                        .map(|a| a.nt_protect_virtual_memory)
+                        .unwrap_or(0);
+                    if nt_protect_addr != 0 {
+                        match dbg.set_hw_breakpoint(
+                            1,
+                            nt_protect_addr,
+                            HwbpType::Execute,
+                        ) {
+                            Ok(()) => {
+                                info!(
+                                    addr = %format!("{nt_protect_addr:#x}"),
+                                    "NtProtectVirtualMemory HW BP set (slot 1) — guard protector"
+                                );
+                                ls.nt_protect_bp_set = true;
+                            }
+                            Err(e) => {
+                                warn!("Cannot set NtProtectVirtualMemory BP: {e}");
+                            }
                         }
                     }
                 }
@@ -487,6 +520,57 @@ pub fn unpack(
                             )?;
                             dbg.continue_event(thread_id, ContinueStatus::Continue)?;
                             break;
+                        }
+                    }
+                }
+
+                // Check for NtProtectVirtualMemory BP (slot 1) — guard protector.
+                if ls.nt_protect_bp_set {
+                    if let Some(ref apis) = dbg.apis {
+                        if address as usize == apis.nt_protect_virtual_memory {
+                            // NtProtectVirtualMemory(HANDLE, PVOID* base, PSIZE_T size,
+                            //   ULONG newProtect, PULONG oldProtect)
+                            // Win64 ABI: RCX=handle, RDX=base ptr, R8=size ptr,
+                            //   R9=newProtect, [RSP+0x28]=oldProtect ptr
+                            if let Ok(ctx) = dbg.get_thread_context_control(thread_id) {
+                                let base_ptr = ctx.Rdx as usize;
+                                let new_protect = ctx.R9 as u32;
+                                // Read the target base address from *RDX
+                                let mut base_bytes = [0u8; 8];
+                                if dbg.read_memory(base_ptr, &mut base_bytes).is_ok() {
+                                    let target_base = u64::from_le_bytes(base_bytes) as usize;
+                                    let text_sec = &state.pe_info.pe_sections[0];
+                                    let text_start = image_base_usize + text_sec.virtual_address as usize;
+                                    let text_end = image_base_usize + state.pe_info.base_of_data as usize;
+                                    if target_base >= text_start && target_base < text_end {
+                                        // Themida is trying to remove PAGE_NOACCESS from .text.
+                                        // Force newProtect to PAGE_NOACCESS (0x01) to keep guard.
+                                        debug!(
+                                            target = %format!("{target_base:#x}"),
+                                            orig_protect = %format!("{new_protect:#x}"),
+                                            "NtProtectVirtualMemory on .text — forcing PAGE_NOACCESS"
+                                        );
+                                        let mut ctx2 = ctx;
+                                        ctx2.R9 = 0x01; // PAGE_NOACCESS
+                                        ctx2.EFlags |= 0x10000; // RF
+                                        #[cfg(target_arch = "x86_64")]
+                                        {
+                                            ctx2.ContextFlags = windows::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_AMD64;
+                                        }
+                                        dbg.set_thread_context(thread_id, &ctx2)?;
+                                    }
+                                }
+                            }
+                            // Set RF and continue
+                            let mut ctx = dbg.get_thread_context_control(thread_id)?;
+                            ctx.EFlags |= 0x10000; // RF
+                            #[cfg(target_arch = "x86_64")]
+                            {
+                                ctx.ContextFlags = windows::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_AMD64;
+                            }
+                            dbg.set_thread_context(thread_id, &ctx)?;
+                            dbg.continue_event(thread_id, ContinueStatus::Continue)?;
+                            continue;
                         }
                     }
                 }
@@ -625,6 +709,61 @@ pub fn unpack(
                     addr = %format!("{address:#x}"),
                     "SingleStep at known HW-BP address — treating as CloseHandle hit"
                 );
+
+                log::log(LogType::Info, &format!("SINGLE STEP at {address:#x} — checking NtProtectVirtualMemory"));
+
+                // Check for NtProtectVirtualMemory BP (slot 1) — guard protector.
+                // NtProtectVirtualMemory(HANDLE, PVOID* base, PSIZE_T size,
+                //   ULONG newProtect, PULONG oldProtect)
+                // Win64 ABI: RCX=handle, RDX=base ptr, R8=size ptr,
+                //   R9=newProtect, [RSP+0x28]=oldProtect ptr
+                if ls.nt_protect_bp_set {
+                    let nt_protect_addr = dbg
+                        .apis
+                        .as_ref()
+                        .map(|a| a.nt_protect_virtual_memory)
+                        .unwrap_or(0);
+                    if nt_protect_addr != 0 && address as usize == nt_protect_addr {
+                        if let Ok(ctx) = dbg.get_thread_context_control(thread_id) {
+                            let base_ptr = ctx.Rdx as usize;
+                            let new_protect = ctx.R9 as u32;
+                            let mut base_bytes = [0u8; 8];
+                            if dbg.read_memory(base_ptr, &mut base_bytes).is_ok() {
+                                let target_base = u64::from_le_bytes(base_bytes) as usize;
+                                let text_sec = &state.pe_info.pe_sections[0];
+                                let text_start = image_base_usize + text_sec.virtual_address as usize;
+                                let text_end = image_base_usize + state.pe_info.base_of_data as usize;
+                                if target_base >= text_start && target_base < text_end {
+                                    debug!(
+                                        target = %format!("{target_base:#x}"),
+                                        orig_protect = %format!("{new_protect:#x}"),
+                                        "NtProtectVirtualMemory on .text — forcing PAGE_NOACCESS"
+                                    );
+                                    let mut ctx2 = ctx;
+                                    ctx2.R9 = 0x01; // PAGE_NOACCESS
+                                    ctx2.EFlags |= 0x10000; // RF
+                                    #[cfg(target_arch = "x86_64")]
+                                    {
+                                        ctx2.ContextFlags = windows::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_AMD64;
+                                    }
+                                    let _ = dbg.set_thread_context(thread_id, &ctx2);
+                                    dbg.continue_event(thread_id, ContinueStatus::Continue)?;
+                                    continue;
+                                }
+                            }
+                        }
+                        // Not targeting .text — just set RF and continue
+                        let mut ctx = dbg.get_thread_context_control(thread_id)?;
+                        ctx.EFlags |= 0x10000; // RF
+                        #[cfg(target_arch = "x86_64")]
+                        {
+                            ctx.ContextFlags = windows::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_AMD64;
+                        }
+                        dbg.set_thread_context(thread_id, &ctx)?;
+                        dbg.continue_event(thread_id, ContinueStatus::Continue)?;
+                        continue;
+                    }
+                }
 
                 log::log(LogType::Info, &format!("SINGLE STEP at {address:#x} — handle_hw_breakpoint about to be called"));
 

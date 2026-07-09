@@ -31,6 +31,10 @@ pub(super) struct ResolvedApis {
     pub(super) nt_close: usize,
     /// ntdll!NtAllocateVirtualMemory — the syscall stub Themida v3 uses directly
     pub(super) nt_allocate_virtual_memory: usize,
+    /// ntdll!NtProtectVirtualMemory — Themida uses this to remove PAGE_NOACCESS
+    /// from .text before writing decrypted code. We intercept it to keep the
+    /// guard alive.
+    pub(super) nt_protect_virtual_memory: usize,
     /// kernel32!Sleep — anti-trace detection helper
     pub(super) sleep: usize,
     /// kernel32!lstrlen — anti-trace detection helper

@@ -108,6 +108,7 @@ pub(super) fn resolve_api_addrs() -> Result<ResolvedApis, anyhow::Error> {
         virtual_alloc: resolve(k32, s!("VirtualAlloc"))?,
         nt_close: resolve(ntdll, s!("NtClose"))?,
         nt_allocate_virtual_memory: resolve(ntdll, s!("NtAllocateVirtualMemory"))?,
+        nt_protect_virtual_memory: resolve(ntdll, s!("NtProtectVirtualMemory"))?,
         sleep: resolve(k32, s!("Sleep"))?,
         lstrlen: resolve(k32, s!("lstrlen"))?,
     };
@@ -117,6 +118,7 @@ pub(super) fn resolve_api_addrs() -> Result<ResolvedApis, anyhow::Error> {
         virtual_alloc = %format!("{:#x}", apis.virtual_alloc),
         nt_close = %format!("{:#x}", apis.nt_close),
         nt_alloc = %format!("{:#x}", apis.nt_allocate_virtual_memory),
+        nt_protect = %format!("{:#x}", apis.nt_protect_virtual_memory),
         sleep = %format!("{:#x}", apis.sleep),
         lstrlen = %format!("{:#x}", apis.lstrlen),
         "Resolved kernel32 and ntdll API addresses",
