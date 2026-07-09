@@ -47,7 +47,8 @@ use mida_packers_themida::{
     CompilerHint, IatFixStrategy, ScyllaHideConfig, ThemidaState,
     create_data_sections, determine_iat_address, fix_iat,
     fixup_api_call_sites, handle_nt_set_information_thread, init_pe_details,
-    inject_scylla_hide, install_anti_dump_fix, shrink_pe,
+    inject_scylla_hide, install_anti_dump_fix, install_code_section_guard,
+    shrink_pe,
 };
 use crate::log::{self, LogType};
 
@@ -326,6 +327,43 @@ pub fn unpack(
                 // Store resolved APIs for later breakpoint comparisons.
                 dbg.apis = Some(apis);
 
+                // Pascal Themida64.pas TMInit (lines 305-315):
+                // If section 0 is named ".text" AND has raw data on disk,
+                // the code section is not encrypted/compressed — install
+                // the guard directly (PAGE_NOACCESS) and skip the CloseHandle
+                // BP path. If RawSize=0 the section is empty in the file and
+                // will be filled at runtime by the packer, so we must use the
+                // CloseHandle → .text write → VirtualAlloc → guard chain.
+                let text_is_plain = state
+                    .pe_info
+                    .pe_sections
+                    .first()
+                    .is_some_and(|s| s.name == ".text" && s.raw_size > 0);
+
+                if text_is_plain && !is_dotnet {
+                    let text_sec = &state.pe_info.pe_sections[0];
+                    let guard_start = image_base as usize + text_sec.virtual_address as usize;
+                    let guard_size = state.pe_info.base_of_data as usize
+                        - text_sec.virtual_address as usize;
+                    match install_code_section_guard(
+                        evt_h_process,
+                        guard_start,
+                        guard_size,
+                        guard_protection,
+                    ) {
+                        Ok(()) => {
+                            log::log(
+                                LogType::Good,
+                                "Text section not encrypted/compressed, installing page guard",
+                            );
+                            ls.guard_installed = true;
+                        }
+                        Err(e) => {
+                            warn!("Failed to install code section guard: {e}");
+                        }
+                    }
+                }
+
                 // NOTE: We deliberately do NOT install the CloseHandle HW
                 // breakpoint here in the CREATE_PROCESS handler.  Empirically,
                 // calling SetThreadContext on the main thread at this point
@@ -368,7 +406,11 @@ pub fn unpack(
                     let _ = windows::Win32::Foundation::CloseHandle(h_file);
                 }
 
-                if !ls.close_handle_bp_set {
+                // Pascal Themida64.pas TMInit (lines 305-315):
+                // If section 0 is ".text", the guard is installed directly in
+                // CREATE_PROCESS and we do NOT set a CloseHandle breakpoint.
+                // Only set CloseHandle BP if guard is not yet installed.
+                if !ls.close_handle_bp_set && !ls.guard_installed {
                     let close_handle_addr = dbg.apis.as_ref().map(|a| a.close_handle);
                     if let Some(addr) = close_handle_addr {
                         match dbg.set_hw_breakpoint(0, addr, HwbpType::Execute) {
