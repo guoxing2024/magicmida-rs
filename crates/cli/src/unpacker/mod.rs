@@ -563,10 +563,19 @@ pub fn unpack(
                             }
                             // Set RF and continue
                             let mut ctx = dbg.get_thread_context_control(thread_id)?;
+                            if let Ok(dbg_ctx) = dbg.get_thread_context_dbg(thread_id) {
+                                ctx.Dr0 = dbg_ctx.Dr0;
+                                ctx.Dr1 = dbg_ctx.Dr1;
+                                ctx.Dr2 = dbg_ctx.Dr2;
+                                ctx.Dr3 = dbg_ctx.Dr3;
+                                ctx.Dr6 = 0; // clear — prevent re-fire
+                                ctx.Dr7 = dbg_ctx.Dr7;
+                            }
                             ctx.EFlags |= 0x10000; // RF
                             #[cfg(target_arch = "x86_64")]
                             {
-                                ctx.ContextFlags = windows::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_AMD64;
+                                ctx.ContextFlags = windows::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_AMD64
+                                    | windows::Win32::System::Diagnostics::Debug::CONTEXT_DEBUG_REGISTERS_AMD64;
                             }
                             dbg.set_thread_context(thread_id, &ctx)?;
                             dbg.continue_event(thread_id, ContinueStatus::Continue)?;
@@ -741,12 +750,23 @@ pub fn unpack(
                                     );
                                     let mut ctx2 = ctx;
                                     ctx2.R9 = 0x01; // PAGE_NOACCESS
+                                    // Merge debug registers — must propagate errors
+                                    // (if let Ok silently skips DR clearing on ERROR_PARTIAL_COPY,
+                                    // causing the BP to re-fire infinitely)
+                                    let dbg_ctx = dbg.get_thread_context_dbg(thread_id)?;
+                                    ctx2.Dr0 = dbg_ctx.Dr0;
+                                    ctx2.Dr1 = dbg_ctx.Dr1;
+                                    ctx2.Dr2 = dbg_ctx.Dr2;
+                                    ctx2.Dr3 = dbg_ctx.Dr3;
+                                    ctx2.Dr6 = 0; // clear — prevent re-fire
+                                    ctx2.Dr7 = dbg_ctx.Dr7;
                                     ctx2.EFlags |= 0x10000; // RF
                                     #[cfg(target_arch = "x86_64")]
                                     {
-                                        ctx2.ContextFlags = windows::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_AMD64;
+                                        ctx2.ContextFlags = windows::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_AMD64
+                                            | windows::Win32::System::Diagnostics::Debug::CONTEXT_DEBUG_REGISTERS_AMD64;
                                     }
-                                    let _ = dbg.set_thread_context(thread_id, &ctx2);
+                                    dbg.set_thread_context(thread_id, &ctx2)?;
                                     dbg.continue_event(thread_id, ContinueStatus::Continue)?;
                                     continue;
                                 }
@@ -754,10 +774,19 @@ pub fn unpack(
                         }
                         // Not targeting .text — just set RF and continue
                         let mut ctx = dbg.get_thread_context_control(thread_id)?;
+                        if let Ok(dbg_ctx) = dbg.get_thread_context_dbg(thread_id) {
+                            ctx.Dr0 = dbg_ctx.Dr0;
+                            ctx.Dr1 = dbg_ctx.Dr1;
+                            ctx.Dr2 = dbg_ctx.Dr2;
+                            ctx.Dr3 = dbg_ctx.Dr3;
+                            ctx.Dr6 = 0; // clear — prevent re-fire
+                            ctx.Dr7 = dbg_ctx.Dr7;
+                        }
                         ctx.EFlags |= 0x10000; // RF
                         #[cfg(target_arch = "x86_64")]
                         {
-                            ctx.ContextFlags = windows::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_AMD64;
+                            ctx.ContextFlags = windows::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_AMD64
+                                | windows::Win32::System::Diagnostics::Debug::CONTEXT_DEBUG_REGISTERS_AMD64;
                         }
                         dbg.set_thread_context(thread_id, &ctx)?;
                         dbg.continue_event(thread_id, ContinueStatus::Continue)?;
