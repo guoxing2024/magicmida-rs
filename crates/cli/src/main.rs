@@ -3,8 +3,8 @@
 //! ## Usage
 //!
 //! ```text
-//! magicmida /unpack <filename> [--data-sections] [--shrink] [-v]
-//! magicmida /dump-process <pid> <unpacked-file>
+//! mida-cli /unpack <filename> [--data-sections] [--shrink] [-v]
+//! mida-cli /dump-process <pid> <unpacked-file>
 //! ```
 
 mod args;
@@ -19,9 +19,9 @@ fn main() {
             eprintln!("Error: {e}");
             eprintln!();
             eprintln!("Usage:");
-            eprintln!("  magicmida /unpack <filename> [--data-sections] [--shrink] [-v]");
-            eprintln!("  magicmida /dump-process <pid> <unpacked-file>");
-            eprintln!("  magicmida /verify <unpacked-file> <reference-file>");
+            eprintln!("  mida-cli /unpack <filename> [--data-sections] [--shrink] [-v]");
+            eprintln!("  mida-cli /dump-process <pid> <unpacked-file>");
+            eprintln!("  mida-cli /verify <unpacked-file> <reference-file>");
             std::process::exit(1);
         }
     };

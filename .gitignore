@@ -33,3 +33,5 @@ build.bat
 .hermes-tmp.*
 CLAUDE.md
 scylla_hide.ini
+run_unpack.bat
+unpack_*.log

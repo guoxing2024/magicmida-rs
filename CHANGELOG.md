@@ -8,13 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
-- Replaced x86 ScyllaHide SHA-256 placeholder hashes with `compile_error!` to
-  prevent silent acceptance of tampered binaries (P0-3).
+- Replaced x86 ScyllaHide SHA-256 placeholder hashes with all-zero placeholders
+  that will fail verification until real hashes are configured (P0-3).
 - Fixed UTF-8 mojibake (`鈥` → `—`, `鈫` → `→`) in source comments across
   `crates/core/` and `crates/tracer/` (P1-6).
-- Fixed binary name inconsistency in README Usage section (`magicmida` →
-  `mida-cli`) (P2-9).
+- Fixed binary name inconsistency in README and CLI usage text (`magicmida` →
+  `mida-cli`) (P2-9, N3).
 - Narrowed `.gitignore` from overly broad `*.bat` to specific `build.bat` (P1-8).
+- Removed `run_unpack.bat` and `unpack_*.log` from repository (contained
+  hardcoded local paths) (N1).
 
 ### Changed
 - Added `[workspace.package]` metadata (repository, license, readme) to root
