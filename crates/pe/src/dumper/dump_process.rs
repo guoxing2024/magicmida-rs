@@ -335,6 +335,12 @@ pub fn dump_process(
         crate::postprocess::build_relocation_table(&mut out_data, None, is_64bit)?;
     }
 
+    // Pack .reloc/.import tightly after .pdata to eliminate the file gap
+    // left by sanitize() setting ptr=VA for all sections.
+    if opts.shrink {
+        crate::postprocess::pack_tail_sections(&mut out_data, &pe)?;
+    }
+
     std::fs::write(&opts.output_path, &out_data)?;
 
     info!(

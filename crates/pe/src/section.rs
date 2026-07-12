@@ -294,9 +294,14 @@ impl PeHeader {
     ///
     /// Corresponds to `TPEHeader.Sanitize` in `PEInfo.pas`.
     pub fn sanitize(&mut self) {
+        let file_align = {
+            let fa = self.nt_headers.optional_header.file_alignment;
+            if fa.is_power_of_two() && fa >= 0x200 { fa } else { 0x200 }
+        };
         for section in &mut self.sections {
             section.header.pointer_to_raw_data = section.header.virtual_address;
-            section.header.size_of_raw_data = section.header.virtual_size;
+            section.header.size_of_raw_data =
+                crate::utils::align_up(section.header.virtual_size, file_align);
             section.update_from_header();
         }
 

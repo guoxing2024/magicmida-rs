@@ -21,10 +21,12 @@
 
 | 样本 | 模式 | OEP | IAT | Import Table | 可运行 |
 |---|---|---|---|---|---|
-| 启动器.exe (Themida v3 x64, AHK_H) | post-attach | RVA 0x60B7 | 572 slots | 18模块 545 thunk | 待验证 |
-| 时光一键宏.exe (Themida v3 x64) | 传统调试 | RVA 0x13E0 | 305 slots, 148 resolved | 11模块 295 thunk | 待验证 |
 
-两个样本均成功生成脱壳文件，关键指标与上次一致。
+| 启动器.exe (Themida v3 x64, AHK_H) | post-attach | RVA 0x60B7 | 572 slots | 18模块 545 thunk | ✅ 可运行 |
+| 时光一键宏.exe (Themida v3 x64) | 传统调试 | RVA 0x13E0 | 305 slots, 148 resolved | 11模块 295 thunk | ✅ 可运行 |
+
+两个样本均成功生成脱壳文件，脱壳后文件可正常运行（2026-07-12 验证）。
+启动器U.exe (1.5MB) 和 时光一键宏U.exe (1.7MB) 均成功启动并保持运行。
 
 ### 已完成的改动
 

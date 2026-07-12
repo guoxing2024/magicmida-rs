@@ -367,6 +367,106 @@ pub fn pack_section_layout(out_data: &mut Vec<u8>, pe: &PeHeader) -> Result<(), 
     Ok(())
 }
 
+
+/// Pack the .reloc and .import sections tightly after .pdata in the file.
+///
+/// sanitize() sets PointerToRawData = VirtualAddress for all sections,
+/// which leaves a gap between .pdata's file end and .reloc's file offset.
+/// This function moves .reloc and .import data backward to eliminate that
+/// gap, updates their PointerToRawData in the section headers, and
+/// truncates the file.
+///
+/// Must be called AFTER uild_relocation_table (which updates .reloc's
+/// VirtualSize and SizeOfRawData in the on-disk header).
+pub fn pack_tail_sections(out_data: &mut Vec<u8>, pe: &PeHeader) -> Result<(), PeError> {
+    let pe_offset = if out_data.len() >= 0x40 {
+        u32::from_le_bytes([out_data[0x3C], out_data[0x3D], out_data[0x3E], out_data[0x3F]]) as usize
+    } else {
+        return Ok(());
+    };
+
+    let opt_hdr_size = pe.nt_headers.file_header.size_of_optional_header as usize;
+    let section_table_offset = pe_offset + 24 + opt_hdr_size;
+    let file_align = pe.nt_headers.optional_header.file_alignment as usize;
+    let align = |n: usize| -> usize {
+        (n + file_align - 1) & !(file_align - 1)
+    };
+
+    let num_sections = pe.nt_headers.file_header.number_of_sections as usize;
+
+    let mut pdata_end = 0usize;
+    let mut tail_indices: Vec<usize> = Vec::new();
+
+    for i in 0..num_sections {
+        let so = section_table_offset + i * 40;
+        if so + 40 > out_data.len() { break; }
+        let name = &out_data[so..so + 8];
+        let raw_size = u32::from_le_bytes(
+            out_data[so + 16..so + 20].try_into().unwrap_or([0; 4])
+        ) as usize;
+        let raw_ptr = u32::from_le_bytes(
+            out_data[so + 20..so + 24].try_into().unwrap_or([0; 4])
+        ) as usize;
+        let end = raw_ptr + raw_size;
+
+        if name.starts_with(b".pdata") && end > pdata_end {
+            pdata_end = end;
+        }
+        if name.starts_with(b".reloc") || name.starts_with(b".import") {
+            tail_indices.push(i);
+        }
+    }
+
+    if tail_indices.is_empty() || pdata_end == 0 {
+        return Ok(());
+    }
+
+    let mut next_ptr = align(pdata_end);
+    for &idx in &tail_indices {
+        let so = section_table_offset + idx * 40;
+        if so + 40 > out_data.len() { break; }
+
+        let old_ptr = u32::from_le_bytes(
+            out_data[so + 20..so + 24].try_into().unwrap_or([0; 4])
+        ) as usize;
+        let raw_size = u32::from_le_bytes(
+            out_data[so + 16..so + 20].try_into().unwrap_or([0; 4])
+        ) as usize;
+
+        if old_ptr <= next_ptr { continue; }
+
+        let data_len = raw_size.min(out_data.len().saturating_sub(old_ptr));
+        if data_len == 0 { continue; }
+
+        let data_copy: Vec<u8> = out_data[old_ptr..old_ptr + data_len].to_vec();
+        let needed = next_ptr + data_len;
+        if needed > out_data.len() {
+            out_data.resize(needed, 0);
+        }
+        out_data[next_ptr..next_ptr + data_len].copy_from_slice(&data_copy);
+
+        let new_ptr_val = next_ptr as u32;
+        out_data[so + 20..so + 24].copy_from_slice(&new_ptr_val.to_le_bytes());
+
+        info!(
+            "pack_tail: section {} moved ptr {:#x} -> {:#x} ({} bytes)",
+            idx, old_ptr, next_ptr, data_len
+        );
+
+        next_ptr = align(next_ptr + data_len);
+    }
+
+    let new_end = next_ptr;
+    if new_end < out_data.len() {
+        info!(
+            "pack_tail: truncated file {} -> {} bytes (saved {})",
+            out_data.len(), new_end, out_data.len() - new_end
+        );
+        out_data.truncate(new_end);
+    }
+
+    Ok(())
+}
 /// Build Base Relocation Table for ASLR support
 ///
 /// Scans non-executable, initialized sections for absolute addresses pointing
