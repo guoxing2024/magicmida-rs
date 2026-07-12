@@ -291,38 +291,15 @@ pub fn dump_process(
     //     write_iat_to_output writes to thunks' original iat_address.  When
     //     thunks are moved between modules, these don't match.  We fix the
     //     descriptors in the .import section's extra_data.
-    if opts.fix_imports && import_builder.is_some() {
-        let builder = import_builder.as_ref().unwrap();
-        for section in &mut pe.sections {
-            if section.name != ".import" { continue; }
-            let data = match section.extra_data.as_mut() {
-                Some(d) => d,
-                None => break,
-            };
-            let _section_va = section.virtual_address;
-            let mut desc_off = 0usize;
-            for module in &builder.modules {
-                if module.thunks.is_empty() { continue; }
-                if desc_off + 20 > data.len() { break; }
-                // Use the minimum iat_address as FirstThunk — the PE loader
-                // walks from FirstThunk until a null entry.
-                let min_addr = module.thunks.iter()
-                    .map(|t| t.iat_address)
-                    .min().unwrap_or(0);
-                // Update FirstThunk at offset +16 in the descriptor
-                data[desc_off + 16..desc_off + 20]
-                    .copy_from_slice(&min_addr.to_le_bytes());
-                // Set OriginalFirstThunk to 0 (no ILT)
-                data[desc_off..desc_off + 4].copy_from_slice(&0u32.to_le_bytes());
-                info!(
-                    "Fixed descriptor for {}: FirstThunk=0x{:X} (was sequential)",
-                    module.name, min_addr
-                );
-                desc_off += 20;
-            }
-            break;
-        }
-    }
+    //
+    // NOTE: This override was REMOVED.  build_import_section_no_iat already
+    // sets FirstThunk to the correct sequential offset (including null
+    // terminators between modules).  Overriding with min(iat_address)
+    // pointed FirstThunk at the ORIGINAL IAT layout (which has interleaved
+    // module slots without null terminators), causing the PE loader to read
+    // past module boundaries.  write_iat_to_output writes thunks
+    // sequentially (matching the FirstThunk from build_import_section_no_iat),
+    // so the sequential FirstThunk is correct.
 
     // 5d. Trim huge sections
     let mut iat_raw_addr = 0u32;
