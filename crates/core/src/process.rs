@@ -52,6 +52,18 @@ pub struct CreateProcessOptions {
     /// `true` to create the process suspended (typically used so the debugger
     /// can set up breakpoints before the entry point runs).
     pub suspended: bool,
+    /// `true` = post-attach mode: the process is created with
+    /// `CREATE_SUSPENDED` but **without** `DEBUG_ONLY_THIS_PROCESS`, resumed
+    /// immediately, and only later attached to via `DebugActiveProcess` once
+    /// the protector has finished its anti-debug initialization.
+    ///
+    /// This bypasses protectors (e.g. Themida v3) that check `EPROCESS.DebugPort`
+    /// during early startup and exit with `0xDEADC0DE` when a debug port is
+    /// present from `t=0`.
+    ///
+    /// `false` = traditional mode: the process is created with
+    /// `DEBUG_ONLY_THIS_PROCESS` (current behavior).
+    pub post_attach: bool,
 }
 
 /// Handle to a running debuggee process and its main thread.
@@ -199,10 +211,24 @@ pub fn create_debug_process(
     debug!(%cmd_line, "Launching debuggee");
 
     // Step 4: create the process
+    //
+    // post-attach mode: create the process with CREATE_SUSPENDED but WITHOUT
+    // DEBUG_ONLY_THIS_PROCESS.  The caller (WindowsDebugger::post_attach_init)
+    // will ResumeThread, wait for the protector's anti-debug init to finish,
+    // then DebugActiveProcess + patch the PEB.  Creating without a debug port
+    // from t=0 defeats protectors that read EPROCESS.DebugPort during startup.
     let mut flags = CREATE_DEFAULT_ERROR_MODE
         | CREATE_NEW_CONSOLE
-        | NORMAL_PRIORITY_CLASS
-        | DEBUG_ONLY_THIS_PROCESS;
+        | NORMAL_PRIORITY_CLASS;
+
+    if opts.post_attach {
+        // Post-attach: suspended + NO debug flag.  ResumeThread + attach happens
+        // later in WindowsDebugger::post_attach_init.
+        flags |= CREATE_SUSPENDED;
+    } else {
+        // Traditional debug mode: attach from the start.
+        flags |= DEBUG_ONLY_THIS_PROCESS;
+    }
 
     if opts.suspended {
         flags |= CREATE_SUSPENDED;

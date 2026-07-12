@@ -22,9 +22,6 @@ mod slot;
 // Re-export public API items used by external callers (lib.rs re-exports these
 // further).
 pub use decision::{trace_is_at_api, TraceStepDecision};
-// is_real_api_address is only used internally by tests but keep it accessible.
-#[cfg(test)]
-pub(crate) use decision::is_real_api_address;
 
 use mida_core::debugger::{DebugEvent, DebuggerCore};
 use mida_tracer::LogMsgType;

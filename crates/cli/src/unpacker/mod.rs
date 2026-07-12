@@ -1,4 +1,4 @@
-﻿//! Themida unpacker main flow — ties together all modules.
+//! Themida unpacker main flow — ties together all modules.
 //!
 //! ## Reference
 //!
@@ -38,6 +38,7 @@ use std::path::Path;
 use anyhow::{Context, anyhow};
 use tracing::{debug, info, warn};
 use windows::Win32::System::Memory::PAGE_NOACCESS;
+use windows::Win32::System::Threading::{SuspendThread, ResumeThread};
 
 use mida_core::{
     CreateProcessOptions, ContinueStatus, DebugEvent, DebuggerCore, HwbpType,
@@ -47,7 +48,7 @@ use mida_packers_themida::{
     CompilerHint, IatFixStrategy, ScyllaHideConfig, ThemidaState,
     create_data_sections, determine_iat_address, fix_iat,
     fixup_api_call_sites, handle_nt_set_information_thread, init_pe_details,
-    inject_scylla_hide, install_anti_dump_fix, install_code_section_guard,
+    inject_scylla_hide, install_anti_dump_fix,
     shrink_pe,
 };
 use crate::log::{self, LogType};
@@ -74,6 +75,10 @@ struct LoopState {
     guard_installed: bool,
     close_handle_bp_set: bool,
     nt_protect_bp_set: bool,
+    // .text poll: true when CREATE_PROCESS received, actively polling .text
+    text_polling: bool,
+    /// .text poll: Instant when polling started (for 30s timeout)
+    text_poll_start: Option<std::time::Instant>,
     /// .text poll: count of wait_event iterations since guard installed
     text_poll_count: u32,
     /// .text poll: previous snapshot for stability check
@@ -183,18 +188,30 @@ pub fn unpack(
     }
 
     // ---- step 4: create debug process ----
+    // Initialise Themida state first — we need pe_sections to decide
+    // whether to use post-attach mode.
+    let mut state = ThemidaState::new(pe_info, do_data_sections);
+    state.create_data_sections = do_data_sections;
+    // Propagate TLS callback count detected during init_pe_details.
+    state.tls_total = state.pe_info.tls_total;
+
+    // post-attach mode: when section 0 is plain ".text" (not a Themida
+    // virtualized section) and the target isn't .NET, create the process
+    // WITHOUT DEBUG_ONLY_THIS_PROCESS and attach later.  This defeats
+    // protectors that read EPROCESS.DebugPort from t=0 and exit with
+    // 0xDEADC0DE.  See WindowsDebugger::post_attach_init.
+    // post-attach: when section 0 is plain .text (not a Themida
+    // virtualized section) and the target is not .NET, create the
+    // process WITHOUT DEBUG_ONLY_THIS_PROCESS.
+    let text_is_plain_for_attach = state.pe_info.pe_sections.first()
+        .is_some_and(|s| s.name == ".text") && !is_dotnet;
     let opts = CreateProcessOptions {
         executable: input.to_path_buf(),
         command_line: None,
         is_dll: input.extension().map(|e| e.eq_ignore_ascii_case("dll")).unwrap_or(false),
         suspended: false,
+        post_attach: text_is_plain_for_attach,
     };
-
-    // ---- step 5: initialise Themida state ----
-    let mut state = ThemidaState::new(pe_info, do_data_sections);
-    state.create_data_sections = do_data_sections;
-    // Propagate TLS callback count detected during init_pe_details.
-    state.tls_total = state.pe_info.tls_total;
 
     // ---- step 6: debug loop ----
     // The debug loop is the heart of the unpacker. It is implemented inline
@@ -221,10 +238,36 @@ pub fn unpack(
 
     log::log(LogType::Info, &format!("Process created (PID: {})", dbg.pid()));
 
+    // ---- post-attach: ScyllaHide pre-injection ----
+    // In post-attach mode the CREATE_PROCESS_DEBUG_EVENT arrives AFTER
+    // DebugActiveProcess, so we can't inject ScyllaHide from the CREATE_PROCESS
+    // handler in time (Themida's anti-debug init runs during the free-run
+    // window).  Inject here instead — the hooks land in the already-running
+    // process before we enter the debug loop.
+    //
+    // PEB patching in post-attach mode is already done by
+    // WindowsDebugger::post_attach_init (right after DebugActiveProcess froze
+    // the process), so the CREATE_PROCESS handler below skips it.
+    let post_attach_mode = text_is_plain_for_attach;
+    if post_attach_mode {
+        // No ScyllaHide needed — there is no debug port, so Themida's
+        // anti-debug checks (DebugPort, BeingDebugged) never trigger.
+        // The process was frozen by SuspendThread in post_attach_init,
+        // so we go straight to text polling + dump.
+        //
+        // Resolve kernel32 API addresses for later use (breakpoint
+        // comparisons etc.).
+        let apis = resolve_api_addrs()?;
+        dbg.apis = Some(apis);
+        info!("post-attach: no debug port — direct dump mode (SuspendThread + ReadProcessMemory)");
+    }
+
     let mut ls = LoopState {
         guard_installed: false,
         close_handle_bp_set: false,
         nt_protect_bp_set: false,
+        text_polling: post_attach_mode,
+        text_poll_start: None,
         text_poll_count: 0,
         text_prev_sample: [0u8; 16],
         text_stable: false,
@@ -245,6 +288,120 @@ pub fn unpack(
     // helpers that don't go through the `DebuggerCore` trait.
     let h_process = dbg.process_handle();
 
+    // ---- post-attach fast path: no debug port, direct dump ----
+    // In post-attach mode the process is already frozen (SuspendThread in
+    // post_attach_init).  There is no debug port, so we cannot use the
+    // debug event loop.  Instead: poll .text for stability, find OEP by
+    // scanning, then go straight to the dump phase.
+    if post_attach_mode {
+        let image_base_usize = dbg.image_base() as usize;
+        let text_sec = &state.pe_info.pe_sections[0];
+        let text_start = image_base_usize + text_sec.virtual_address as usize;
+        let text_rva = text_sec.virtual_address;
+        let text_vsize = text_sec.virtual_size;
+
+// ---- Poll for IAT resolution ----
+// The process is running free (no debug port).  Poll the first IAT
+// slot at .rdata until it becomes non-zero (resolved API address)
+// or timeout.  The IAT RVA is derived from the .rdata section start.
+let rdata_sec = state.pe_info.pe_sections.iter()
+    .find(|s| s.name == ".rdata")
+    .or_else(|| state.pe_info.pe_sections.get(1));
+let iat_rva = rdata_sec.map(|s| s.virtual_address).unwrap_or(0xFD000);
+let iat_addr = image_base_usize + iat_rva as usize;
+
+log::log(LogType::Info,
+    &format!("post-attach: polling IAT at {iat_addr:#x} (RVA {iat_rva:#x}) for resolution..."));
+
+let poll_start = std::time::Instant::now();
+let max_wait = std::time::Duration::from_secs(60);
+let main_tid = dbg.main_thread_id();
+let h_thread = dbg.thread_handle(main_tid)
+    .map_err(|e| anyhow!("thread_handle for poll: {e}"))?;
+
+loop {
+    if poll_start.elapsed() > max_wait {
+        log::log(LogType::Warn,
+            "post-attach: IAT poll timeout after 60s - proceeding anyway");
+        break;
+    }
+
+    // Check if process is still alive.
+    let mut exit_code: u32 = 0;
+    let alive = unsafe {
+        windows::Win32::System::Threading::GetExitCodeProcess(
+            dbg.process_handle(), &mut exit_code,
+        ).is_ok() && exit_code == 259
+    };
+    if !alive {
+        return Err(anyhow!("Target process exited during IAT poll (exit_code={:#x})", exit_code));
+    }
+
+    // Read first 8 bytes of IAT to check if resolved.
+    let mut iat_val = [0u8; 8];
+    if dbg.read_memory(iat_addr, &mut iat_val).is_ok() {
+        let val = usize::from_le_bytes(iat_val);
+        if val != 0 {
+            log::log(LogType::Good,
+                &format!("post-attach: IAT resolved! first slot = {val:#x} (after {}s)",
+                         poll_start.elapsed().as_secs()));
+            break;
+        }
+    }
+
+    std::thread::sleep(std::time::Duration::from_millis(500));
+}
+
+// SuspendThread to freeze the process.
+let _ = unsafe { SuspendThread(h_thread) };
+log::log(LogType::Info, "post-attach: process frozen via SuspendThread");
+
+// Verify .text is decrypted.
+let mut sample = [0u8; 16];
+if dbg.read_memory(text_start, &mut sample).is_ok() {
+    let non_zero = sample.iter().filter(|&&b| b != 0).count();
+    log::log(LogType::Info,
+        &format!("post-attach: .text sample {non_zero}/16 non-zero"));
+}
+
+        // Find OEP by scanning .text for MSVC CRT startup pattern.
+        let oep_addr = match mida_packers_themida::find_real_oep_by_scanning(
+            &dbg, image_base_usize, text_rva, text_vsize,
+        ) {
+            Ok(Some(addr)) => {
+                log::log(LogType::Good,
+                    &format!("post-attach: OEP found via .text scan: {addr:#x}"));
+                addr
+            }
+            Ok(None) => {
+                let pe_ep = image_base_usize + pe.entry_point as usize;
+                log::log(LogType::Warn,
+                    &format!("post-attach: OEP scan failed — using PE EP: {pe_ep:#x}"));
+                pe_ep
+            }
+            Err(e) => {
+                log::log(LogType::Fatal,
+                    &format!("post-attach: OEP scan error: {e:#}"));
+                return Err(e.into());
+            }
+        };
+
+        log::log(LogType::Info,
+            "post-attach: process frozen — proceeding to IAT repair + dump");
+
+        // Go straight to post-loop phases (IAT repair, dump, postprocess).
+        run_post_loop_phases(
+            &mut dbg, &mut state, &mut pe,
+            Some(oep_addr),
+            is_dotnet, is_64bit, do_data_sections, shrink,
+            true, // post-attach mode
+            input, &output_path,
+        )?;
+
+        log::log(LogType::Good, "Done.");
+        return Ok(());
+    }
+
     // The main debug loop runs until we've found the OEP and finished IAT.
     loop {
         // Re-compute image_base and image_boundary every iteration so they
@@ -256,20 +413,65 @@ pub fn unpack(
         } else {
             pe_image_boundary
         };
-        let event = dbg.wait_event().map_err(|e| {
-            log::log(LogType::Fatal, &format!("wait_event returned error: {e:#}"));
-            e
-        })?;
+        // Use timeout-based wait so .text polling can run every ~100ms
+        // during text_polling phase. After OEP/guard is found, fall back to
+        // blocking wait for efficiency.
+        let event = if ls.text_polling {
+            match dbg.wait_event_timeout(100) {
+                Ok(ev) => ev,
+                Err(mida_core::CoreError::Timeout) => {
+                    // No debug event in 100ms — continue loop for polling
+                    continue;
+                }
+                Err(_e) if post_attach_mode => {
+                    // In post-attach mode there is no debug port, so
+                    // WaitForDebugEvent returns an error (not timeout).
+                    // Treat it as a timeout and continue polling .text.
+                    continue;
+                }
+                Err(e) => {
+                    log::log(LogType::Fatal, &format!("wait_event_timeout returned error: {e:#}"));
+                    return Err(e.into());
+                }
+            }
+        } else {
+            dbg.wait_event().map_err(|e| {
+                log::log(LogType::Fatal, &format!("wait_event returned error: {e:#}"));
+                e
+            })?
+        };
         log::log(LogType::Info, &format!("event received: {event:?}"));
+        // Reset idle timer — we got a real event, Themida is still active
+        if ls.text_polling {
+            ls.text_poll_start = None;
+        }
 
-        // ---- .text decryption polling ----
-        // Themida uses NtProtectVirtualMemory to bypass our PAGE_NOACCESS guard,
-        // so AccessViolation won't fire. Instead, poll .text for content.
-        // When .text is stable (two consecutive reads match), re-guard .text
-        // and wait for AV — the faulting instruction is the OEP.
-        if ls.guard_installed && ls.oep.is_none() && ls.iat_trace.is_none() && !ls.text_reguarded {
+        // ---- .text decryption polling (CREATE_PROCESS → guard delay) ----
+        // Themida checks .text page protection during init — any non-PAGE_EXECUTE_READ
+        // protection is detected. So we do NOT install guard at CREATE_PROCESS.
+        // Instead: let Themida run freely, poll .text via ReadProcessMemory (which
+        // is not affected by page protection), and only install guard after .text
+        // is stable (decryption complete). Then SuspendThread → read RIP → decide:
+        //   RIP in .text → OEP = RIP
+        //   RIP elsewhere → install guard, resume, wait for AV
+        if ls.text_polling && ls.oep.is_none() && ls.iat_trace.is_none() && !ls.text_reguarded {
+            // 30s timeout from LAST debug event (not from CREATE_PROCESS).
+            // Themida's DLL loading can take minutes; only start the timeout
+            // clock when we've stopped receiving debug events.
+            if ls.text_poll_start.is_none() {
+                ls.text_poll_start = Some(std::time::Instant::now());
+            }
+            if let Some(start) = ls.text_poll_start {
+                if start.elapsed() > std::time::Duration::from_secs(30) {
+                    log::log(LogType::Fatal,
+                        &format!(".text poll timeout (30s idle, {} polls) — Themida may not have reached decryption",
+                                 ls.text_poll_count));
+                    ls.text_polling = false;
+                }
+            }
             ls.text_poll_count += 1;
-            if ls.text_poll_count % 10 == 0 {
+            // Poll on every iteration (each ~100ms timeout cycle)
+            {
                 let text_sec = &state.pe_info.pe_sections[0];
                 let text_start = image_base_usize + text_sec.virtual_address as usize;
                 let mut sample = [0u8; 16];
@@ -277,41 +479,88 @@ pub fn unpack(
                     let non_zero = sample.iter().filter(|&&b| b != 0).count();
                     if non_zero > 8 {
                         if sample == ls.text_prev_sample {
-                            // Stable — re-guard and wait for AV
-                            log::log(
-                                LogType::Good,
-                                &format!(
-                                    ".text decrypted and stable (poll #{}, {non_zero}/16 non-zero) — re-guarding",
-                                    ls.text_poll_count
-                                ),
-                            );
+                            // .text stable — decryption complete
+                            log::log(LogType::Good,
+                                &format!(".text decrypted and stable (poll #{}, {non_zero}/16 non-zero)",
+                                         ls.text_poll_count));
                             ls.text_stable = true;
-                            let text_size = state.pe_info.base_of_data as usize
-                                - text_sec.virtual_address as usize;
-                            match install_code_section_guard(
-                                h_process,
-                                text_start,
-                                text_size,
-                                guard_protection,
-                            ) {
-                                Ok(()) => {
-                                    log::log(LogType::Good, "Re-guarded .text — waiting for OEP fault");
-                                    ls.text_reguarded = true;
+                            ls.text_polling = false;
+
+                            // SuspendThread → read RIP → decide OEP vs guard
+                            let main_tid = dbg.main_thread_id();
+                            let h_thread = dbg.thread_handle(main_tid)
+                                .map_err(|e| anyhow!("thread_handle for poll: {e}"))?;
+                            // SAFETY: h_thread is valid THREAD_SUSPEND_RESUME handle
+                            let _ = unsafe { SuspendThread(h_thread) };
+
+                            let ctx = session::get_thread_context_control(&dbg, main_tid)?;
+                            let rip = ctx.Rip as usize;
+                            let text_end = image_base_usize + state.pe_info.base_of_data as usize;
+                            log::log(LogType::Info,
+                                &format!("After .text stable: RIP={:#x} (text={:#x}–{:#x})",
+                                         rip, text_start, text_end));
+
+                            if rip >= text_start && rip < text_end {
+                                // RIP in .text → this is OEP
+                                log::log(LogType::Good,
+                                    &format!("OEP captured via RIP in .text: {:#x}", rip));
+                                ls.oep = Some(rip);
+                                // Resume thread — will be redirected in post-loop
+                                let _ = unsafe { ResumeThread(h_thread) };
+                            } else {
+                                // RIP not in .text — .text already decrypted,
+                                // scan it for the real OEP (MSVC CRT pattern).
+                                // No guard needed — we go straight to dump.
+                                log::log(LogType::Info,
+                                    &format!("RIP not in .text ({:#x}) — scanning .text for OEP", rip));
+                                let text_sec = &state.pe_info.pe_sections[0];
+                                let text_rva = text_sec.virtual_address;
+                                let text_vsize = text_sec.virtual_size;
+                                match mida_packers_themida::find_real_oep_by_scanning(
+                                    &dbg, image_base_usize, text_rva, text_vsize,
+                                ) {
+                                    Ok(Some(real_oep)) => {
+                                        log::log(LogType::Good,
+                                            &format!("OEP found via .text scan: {:#x}", real_oep));
+                                        ls.oep = Some(real_oep);
+                                        ls.oep_found_via_scanning = true;
+                                    }
+                                    Ok(None) => {
+                                        // Scan failed — try PE entry point as fallback
+                                        let pe_ep = image_base_usize + pe.entry_point as usize;
+                                        log::log(LogType::Warn,
+                                            &format!("OEP scan failed — using PE EP: {:#x}", pe_ep));
+                                        ls.oep = Some(pe_ep);
+                                        ls.oep_found_via_scanning = true;
+                                    }
+                                    Err(e) => {
+                                        warn!("OEP scan error: {e}");
+                                    }
                                 }
-                                Err(e) => {
-                                    warn!("Re-guard failed: {e}");
-                                }
+                                // Do NOT ResumeThread — keep process frozen.
+                                // Themida will kill the process on resume (0xDEADC0DE),
+                                // but ReadProcessMemory works on a frozen/suspended
+                                // process. We break out of the debug loop immediately
+                                // and dump from the frozen process's memory.
+                                log::log(LogType::Info,
+                                    "Process kept frozen — will dump IAT + .text from suspended state");
                             }
                         } else {
-                            log::log(
-                                LogType::Info,
-                                &format!(".text has content but not stable yet (poll #{})", ls.text_poll_count),
-                            );
+                            log::log(LogType::Info,
+                                &format!(".text has content but not stable yet (poll #{})",
+                                         ls.text_poll_count));
                         }
                     }
                     ls.text_prev_sample = sample;
                 }
             }
+        }
+
+        // If OEP found during text polling, break immediately to dump
+        // while the process is still frozen (no ResumeThread).
+        if ls.oep.is_some() && ls.oep_found_via_scanning {
+            log::log(LogType::Info, "OEP found via scanning — breaking debug loop for frozen dump");
+            break;
         }
 
         match event {
@@ -331,17 +580,51 @@ pub fn unpack(
                 // Note: `image_base`, `process_id`, and the main-thread handle
                 // are now stored by the core's `wait_event` bookkeeping
                 // automatically — we no longer duplicate that state here.
-                //
-                // Patch PEB (BeingDebugged, pShimData) via the core helper.
-                let peb_base = mida_core::patch_peb_anti_debug(evt_h_process)
-                    .unwrap_or(image_base);
-                debug!(peb_image_base = %format!("{peb_base:#x}"), "PEB patched");
+
+                // In post-attach mode the PEB was already patched by
+                // WindowsDebugger::post_attach_init (right after
+                // DebugActiveProcess froze the process), and ScyllaHide +
+                // API resolution were done in the pre-loop block above.
+                // Skip them here to avoid redundant work / double-inject.
+                if post_attach_mode {
+                    debug!("post-attach: CREATE_PROCESS — PEB/ScyllaHide/APIs already done, skipping");
+                } else {
+                    // Patch PEB (BeingDebugged, pShimData) via the core helper.
+                    let peb_base = mida_core::patch_peb_anti_debug(evt_h_process)
+                        .unwrap_or(image_base);
+                    debug!(peb_image_base = %format!("{peb_base:#x}"), "PEB patched");
+
+                    // Resolve kernel32 API addresses (in the debugger's own
+                    // process — valid in the target on x64).
+                    let apis = resolve_api_addrs()?;
+
+                    // Apply ScyllaHide.  Capture hook_delay_ms BEFORE the move
+                    // into inject_scylla_hide so we can reuse it for the post-
+                    // injection settle sleep below.
+                    let injector_path = scylla_injector_path();
+                    let hook_delay_ms: u64 = 500;
+                    let scylla_config = ScyllaHideConfig {
+                        injector_cli_path: injector_path.display().to_string(),
+                        hook_library_path: scylla_hook_path().display().to_string(),
+                        ini_path: None,
+                        hook_delay_ms,
+                    };
+                    if let Err(e) = inject_scylla_hide(pid, &scylla_config) {
+                        warn!("ScyllaHide injection failed (non-fatal): {e}");
+                    } else {
+                        info!("ScyllaHide injected");
+                    }
+
+                    // Store resolved APIs for later breakpoint comparisons.
+                    dbg.apis = Some(apis);
+                }
 
                 // Fix PE header anti-dump: Themida corrupts the first byte
                 // of section 2's name ('p' → 'i', making .pdata look like
                 // .idata).  Patch it back immediately — the .pdata section
                 // is needed for x64 SEH exception dispatch during the debug
                 // loop.  Mirrors Pascal TMInit lines 296-303.
+                // (Run in both modes — post-attach needs it too.)
                 if state.pe_info.pe_sections.len() > 2 {
                     let name_rva = pe_section_name_remote_rva(
                         evt_h_process,
@@ -369,40 +652,13 @@ pub fn unpack(
                     let _ = windows::Win32::Foundation::CloseHandle(h_file);
                 }
 
-                // Resolve kernel32 API addresses (in the debugger's own
-                // process — valid in the target on x64).
-                let apis = resolve_api_addrs()?;
-
-                // Apply ScyllaHide.  Capture hook_delay_ms BEFORE the move
-                // into inject_scylla_hide so we can reuse it for the post-
-                // injection settle sleep below.
-                let injector_path = scylla_injector_path();
-                let hook_delay_ms: u64 = 500;
-                let scylla_config = ScyllaHideConfig {
-                    injector_cli_path: injector_path.display().to_string(),
-                    hook_library_path: scylla_hook_path().display().to_string(),
-                    ini_path: None,
-                    hook_delay_ms,
-                };
-                if let Err(e) = inject_scylla_hide(pid, &scylla_config) {
-                    warn!("ScyllaHide injection failed (non-fatal): {e}");
-                } else {
-                    info!("ScyllaHide injected");
-                }
-
-                // Store resolved APIs for later breakpoint comparisons.
-                dbg.apis = Some(apis);
-
-                // Pascal Themida64.pas TMInit (lines 305-315):
-                // If section 0 is named ".text", install the code section
-                // guard directly (PAGE_NOACCESS), regardless of RawSize.
-                // - RawSize > 0: code is present but may be overwritten by
-                //   the packer; guard catches the write.
-                // - RawSize = 0: section is empty, Themida fills it at runtime
-                //   via VirtualAlloc + memcpy (NOT via CloseHandle chain);
-                //   guard catches the write just the same.
-                // Only when section 0 is NOT ".text" do we fall back to the
-                // CloseHandle → .text write → VirtualAlloc → guard chain.
+                // CRITICAL: Do NOT install guard at CREATE_PROCESS.
+                // Themida checks .text page protection during init — any non-
+                // PAGE_EXECUTE_READ protection is detected and causes 0xDEADC0DE.
+                // Instead: set text_polling=true and let the polling block above
+                // handle guard installation after .text is stable.
+                // PEB patch + ScyllaHide do NOT change .text protection, so they
+                // are safe to apply here.
                 let text_is_plain = state
                     .pe_info
                     .pe_sections
@@ -410,33 +666,23 @@ pub fn unpack(
                     .is_some_and(|s| s.name == ".text");
 
                 if text_is_plain && !is_dotnet {
-                    let text_sec = &state.pe_info.pe_sections[0];
-                    let guard_start = image_base as usize + text_sec.virtual_address as usize;
-                    let guard_size = state.pe_info.base_of_data as usize
-                        - text_sec.virtual_address as usize;
-                    match install_code_section_guard(
-                        evt_h_process,
-                        guard_start,
-                        guard_size,
-                        guard_protection,
-                    ) {
-                        Ok(()) => {
-                            log::log(
-                                LogType::Good,
-                                "Text section guard installed (direct mode)",
-                            );
-                            ls.guard_installed = true;
-                        }
-                        Err(e) => {
-                            warn!("Failed to install code section guard: {e}");
-                        }
-                    }
-
-                                        // NtProtectVirtualMemory BP disabled — it fires during Themida
-                    // initialization (ntdll page protection changes) and causes
-                    // an infinite re-fire loop because RF cannot be set in the
-                    // Themida environment (ERROR_PARTIAL_COPY on SetThreadContext).
+                    ls.text_polling = true;
+                    // poll_start is set on first timeout, not here —
+                    // LoadDll events can take minutes before Themida
+                    // starts .text decryption
+                    log::log(LogType::Info,
+                        "Section 0 is .text — deferring guard to .text-stable poll (30s timeout after last event)");
+                } else if !is_dotnet {
+                    // Non-.text section 0: fall back to CloseHandle → .text write
+                    // → VirtualAlloc → guard chain (handled by HW BP handler)
+                    log::log(LogType::Info,
+                        "Section 0 is NOT .text — using CloseHandle HW BP chain");
                 }
+
+                // NtProtectVirtualMemory BP disabled — it fires during Themida
+                // initialization (ntdll page protection changes) and causes
+                // an infinite re-fire loop because RF cannot be set in the
+                // Themida environment (ERROR_PARTIAL_COPY on SetThreadContext).
 
                 // NOTE: We deliberately do NOT install the CloseHandle HW
                 // breakpoint here in the CREATE_PROCESS handler.  Empirically,
@@ -480,11 +726,9 @@ pub fn unpack(
                     let _ = windows::Win32::Foundation::CloseHandle(h_file);
                 }
 
-                // Pascal Themida64.pas TMInit (lines 305-315):
-                // If section 0 is ".text", the guard is installed directly in
-                // CREATE_PROCESS and we do NOT set a CloseHandle breakpoint.
-                // Only set CloseHandle BP if guard is not yet installed.
-                if !ls.close_handle_bp_set && !ls.guard_installed {
+                // Only set CloseHandle BP for the non-.text path (CloseHandle chain).
+                // When text_polling is true, we don't need the CloseHandle BP.
+                if !ls.close_handle_bp_set && !ls.guard_installed && !ls.text_polling {
                     let close_handle_addr = dbg.apis.as_ref().map(|a| a.close_handle);
                     if let Some(addr) = close_handle_addr {
                         match dbg.set_hw_breakpoint(0, addr, HwbpType::Execute) {
@@ -885,7 +1129,11 @@ pub fn unpack(
             // EXIT_PROCESS — target exited (unexpected before dump)
             // ---------------------------------------------------------------
             DebugEvent::ExitProcess { exit_code } => {
-                warn!(exit_code, "Target process exited before unpack completed");
+                if ls.oep.is_some() {
+                    info!(exit_code, "Target exited after OEP found — proceeding to dump");
+                } else {
+                    warn!(exit_code, "Target process exited before unpack completed");
+                }
                 break;
             }
 
@@ -917,6 +1165,7 @@ pub fn unpack(
         is_64bit,
         do_data_sections,
         shrink,
+        false, // traditional debug path
         input,
         &output_path,
     )?;
@@ -941,6 +1190,7 @@ fn run_post_loop_phases(
     is_64bit: bool,
     do_data_sections: bool,
     shrink: bool,
+    post_attach: bool,
     input: &Path,
     output_path: &Path,
 ) -> Result<(), anyhow::Error> {
@@ -999,9 +1249,16 @@ fn run_post_loop_phases(
     };
 
     let trace_thread_id = dbg.main_thread_id();
-    fix_iat(dbg, state, &iat, trace_thread_id, strategy)
-        .map_err(|e| anyhow!("IAT fix failed: {e}"))?;
-    log::log(LogType::Info, "IAT fixed");
+    if post_attach {
+        // In post-attach mode, IAT slots already contain resolved API
+        // addresses (no Themida wrappers to trace). dump_process will
+        // rebuild the import table directly from the live IAT.
+        log::log(LogType::Info, "Skipping V3 IAT trace (post-attach: slots already resolved)");
+    } else {
+        fix_iat(dbg, state, &iat, trace_thread_id, strategy)
+            .map_err(|e| anyhow!("IAT fix failed: {e}"))?;
+        log::log(LogType::Info, "IAT fixed");
+    }
 
     let themida_section = state
         .pe_info

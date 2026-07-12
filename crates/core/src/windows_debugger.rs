@@ -1,4 +1,4 @@
-﻿//! Concrete [`DebuggerCore`] implementation backed by the Windows debug API.
+//! Concrete [`DebuggerCore`] implementation backed by the Windows debug API.
 //!
 //! `WindowsDebugger` holds the target process, breakpoint tables, and thread
 //! registrations and translates raw `DEBUG_EVENT` structs into the
@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 use windows::Win32::Foundation::{
     CloseHandle, HANDLE,
     EXCEPTION_ACCESS_VIOLATION, EXCEPTION_BREAKPOINT, EXCEPTION_SINGLE_STEP,
@@ -64,18 +64,94 @@ impl WindowsDebugger {
     ///
     /// This calls [`create_debug_process`] internally, so all PE inspection
     /// and (for DLLs) stub-EXE generation happens here.
+    ///
+    /// When `opts.post_attach` is `true`, the process is created with
+    /// `CREATE_SUSPENDED` but no debug port; immediately after construction
+    /// [`Self::post_attach_init`] resumes the process, lets the protector
+    /// finish its anti-debug initialization without a debug port present,
+    /// then attaches via `DebugActiveProcess` and patches the PEB.  This
+    /// defeats protectors that check `EPROCESS.DebugPort` from `t=0`.
     pub fn new(opts: &CreateProcessOptions) -> Result<Self, CoreError> {
         let process = create_debug_process(opts)?;
 
         let mut threads = HashMap::new();
         threads.insert(process.main_thread_id, process.main_thread_handle);
 
-        Ok(Self {
+        let mut dbg = Self {
             process,
             hw_breakpoints: Default::default(),
             soft_breakpoints: HashMap::new(),
             threads,
-        })
+        };
+
+        if opts.post_attach {
+            dbg.post_attach_init()?;
+        }
+
+        Ok(dbg)
+    }
+
+    /// Post-attach initialization: resume → wait → `DebugActiveProcess` →
+    /// patch PEB.
+    ///
+    /// Called from [`Self::new`] when `post_attach` is set.  The process was
+    /// created with `CREATE_SUSPENDED` and **no** `DEBUG_ONLY_THIS_PROCESS`,
+    /// so at entry to this function the process has no debug port —
+    /// `EPROCESS.DebugPort` is NULL, which defeats Themida's startup
+    /// anti-debug check.
+    ///
+    /// Steps:
+    /// 1. `ResumeThread` — the process starts running freely.
+    /// 2. `sleep(4s)` — give the protector time to finish its anti-debug
+    ///    initialization (Themida's DebugPort check runs early, then it stops
+    ///    checking).
+    /// 3. `DebugActiveProcess` — attach the debugger.  This freezes every
+    ///    thread in kernel space via `DebugSuspendProcess`, so the process
+    ///    is quiescent and the PEB can be patched safely.
+    /// 4. `patch_peb_anti_debug` — clear `BeingDebugged` (which
+    ///    `DebugActiveProcess` has just set) and `pShimData`.
+    ///
+    /// After this returns, `WaitForDebugEvent` in the unpack loop will receive
+    /// a `CREATE_PROCESS_DEBUG_EVENT` synthesised by the attach; the PEB is
+    /// already clean, so the unpacker's `CREATE_PROCESS` handler must NOT
+    /// re-patch it (and must NOT re-inject ScyllaHide) in post-attach mode.
+    fn post_attach_init(&mut self) -> Result<(), CoreError> {
+        use windows::Win32::System::Threading::ResumeThread;
+        use std::thread;
+        use std::time::Duration;
+
+        // 1. Resume the suspended process.  No DEBUG flag -> no DebugPort.
+        let prev_suspend = unsafe { ResumeThread(self.process.main_thread_handle) };
+        info!(
+            prev_suspend_count = ?prev_suspend,
+            "post-attach: ResumeThread - process running free (no debug port)"
+        );
+
+        // 2. Wait briefly for the process to initialize its PEB.
+        //    We only need the PEB to be mapped so we can read the
+        //    image base.  The caller (unpacker) will poll the IAT
+        //    and call SuspendThread when IAT is resolved.
+        thread::sleep(Duration::from_secs(3));
+
+        // 3. Read the image base from the PEB.  We do NOT call
+        //    SuspendThread here — the caller decides when to freeze.
+        match patch_peb_anti_debug(self.process.handle) {
+            Ok(img_base) => {
+                self.process.image_base = img_base;
+                debug!(
+                    image_base = format_args!("{img_base:#x}"),
+                    "post-attach: PEB read (image base acquired)"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "post-attach: PEB read failed (non-fatal)"
+                );
+            }
+        }
+
+        Ok(())
     }
 
     // ------------------------------------------------------------------
@@ -716,8 +792,10 @@ impl DebuggerCore for WindowsDebugger {
                 }
             }
             Err(e) => {
-                // Check if this is a timeout (ERROR_SEM_TIMEOUT = 121)
-                let error_code = e.code().0 as u32;
+                // Check if this is a timeout (ERROR_SEM_TIMEOUT = 121).
+                // WaitForDebugEvent returns an HRESULT whose low 16 bits
+                // contain the Win32 error code (HRESULT_FROM_WIN32 pattern).
+                let error_code = (e.code().0 as u32) & 0xFFFF;
                 if error_code == 121 {
                     Err(CoreError::Timeout)
                 } else {

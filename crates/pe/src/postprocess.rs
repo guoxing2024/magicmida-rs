@@ -92,7 +92,7 @@ impl Default for PostprocessOptions {
 ///
 /// After sanitize(), we restore the original RawSize for merged sections so
 /// the file doesn't contain Themida junk data.
-fn apply_shrink(pe: &mut PeHeader, out_data: &mut Vec<u8>) -> Result<(), PeError> {
+fn apply_shrink(pe: &mut PeHeader, _out_data: &mut Vec<u8>) -> Result<(), PeError> {
     let themida_names = [".winlice", ".boot", ".themida"];
     let mut removed = 0usize;
     let mut merged_sections: Vec<(u32, u32)> = Vec::new(); // (section_va, original_vsize)

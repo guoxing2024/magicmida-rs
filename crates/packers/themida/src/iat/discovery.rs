@@ -581,3 +581,154 @@ pub(super) fn scan_data_for_pointer(
     warn!("Data-scan fallback for pointer {target:#x} — not found in data section");
     Ok(0)
 }
+
+// ===========================================================================
+// Data-section heuristic IAT discovery (unlicense-inspired)
+// ===========================================================================
+
+/// Is `val` a resolved API address (outside the target image)?
+fn is_resolved_api(val: usize, image_base: usize, image_end: usize) -> bool {
+    if val < 0x10000 {
+        return false;
+    }
+    if !(0x7FF0_0000_0000..0x7FFF_FFFF_0000).contains(&val) {
+        return false;
+    }
+    !(val >= image_base && val < image_end)
+}
+
+/// Validate an IAT reference by checking API-address density around it.
+///
+/// Reads 32 slots starting at `iat_ref` and checks that at least 25% are
+/// resolved API addresses.  Catches false positives where a FF15 in .text
+/// references a non-IAT data pointer (vtable, CFG dispatch, etc.).
+pub(super) fn validate_iat_ref(
+    debugger: &dyn DebuggerCore,
+    iat_ref: usize,
+) -> Result<bool, ThemidaError> {
+    let image_base = debugger.image_base() as usize;
+    let image_end = image_base + 0x10000000;
+
+    let ptr_size = 8usize;
+    let check_slots = 32usize;
+    let mut buf = vec![0u8; check_slots * ptr_size];
+    let bytes_read = debugger.read_memory(iat_ref, &mut buf).unwrap_or(0);
+
+    let slots = bytes_read / ptr_size;
+    if slots == 0 {
+        return Ok(false);
+    }
+
+    let mut api_count = 0;
+    let mut non_zero = 0;
+    for i in 0..slots {
+        let off = i * ptr_size;
+        let val = usize::from_le_bytes([
+            buf[off], buf[off + 1], buf[off + 2], buf[off + 3],
+            buf[off + 4], buf[off + 5], buf[off + 6], buf[off + 7],
+        ]);
+        if val != 0 {
+            non_zero += 1;
+        }
+        if is_resolved_api(val, image_base, image_end) {
+            api_count += 1;
+        }
+    }
+
+    let threshold = slots / 4;
+    let valid = api_count >= threshold && non_zero >= threshold;
+    if !valid {
+        info!(
+            iat_ref = format_args!("{iat_ref:#x}"),
+            api_count, non_zero, slots,
+            "IAT ref validation FAILED (low API density)"
+        );
+    }
+    Ok(valid)
+}
+
+/// Data-section heuristic: scan data section for a region of pointers
+/// where the majority are resolved API addresses.
+///
+/// Inspired by unlicense's _find_iat_from_data_sections.  More reliable
+/// than code-section scanning for Themida v3 x64, where .text may contain
+/// FF15 references to non-IAT data pointers in .rdata.
+///
+/// Strategy: slide a 64-slot window across the data section.  A window
+/// is an IAT candidate if >=50% of its non-zero slots are resolved APIs.
+/// Return the start of the highest-scoring candidate.
+pub(super) fn find_iat_via_data_heuristic(
+    debugger: &dyn DebuggerCore,
+    data_section_base: usize,
+    data_section_size: usize,
+) -> Result<usize, ThemidaError> {
+    let image_base = debugger.image_base() as usize;
+    let image_end = image_base + 0x10000000;
+
+    let ptr_size = 8usize;
+    let scan_size = data_section_size.min(MAX_IAT_SIZE * 2);
+    let mut buf = vec![0u8; scan_size];
+    let bytes_read = debugger
+        .read_memory(data_section_base, &mut buf)
+        .map_err(|e| ThemidaError::Debugger(format!("data heuristic read: {e}")))?;
+
+    let slot_count = bytes_read / ptr_size;
+    let window = 64usize;
+    if slot_count < window {
+        return Ok(0);
+    }
+
+    let mut best_start: usize = 0;
+    let mut best_score: usize = 0;
+
+    for start in 0..=slot_count - window {
+        let mut api_count = 0;
+        let mut non_zero = 0;
+
+        for i in 0..window {
+            let off = (start + i) * ptr_size;
+            let val = usize::from_le_bytes([
+                buf[off], buf[off + 1], buf[off + 2], buf[off + 3],
+                buf[off + 4], buf[off + 5], buf[off + 6], buf[off + 7],
+            ]);
+            if val != 0 {
+                non_zero += 1;
+            }
+            if is_resolved_api(val, image_base, image_end) {
+                api_count += 1;
+            }
+        }
+
+        if non_zero >= window / 4 && api_count >= non_zero / 2 {
+            if api_count > best_score {
+                best_score = api_count;
+                // Walk back to find the true start.
+                let mut true_start = start;
+                for back in (0..start).rev() {
+                    let off = back * ptr_size;
+                    let val = usize::from_le_bytes([
+                        buf[off], buf[off + 1], buf[off + 2], buf[off + 3],
+                        buf[off + 4], buf[off + 5], buf[off + 6], buf[off + 7],
+                    ]);
+                    if val != 0 && !is_resolved_api(val, image_base, image_end) {
+                        break;
+                    }
+                    true_start = back;
+                }
+                best_start = data_section_base + true_start * ptr_size;
+            }
+        }
+    }
+
+    if best_start != 0 {
+        info!(
+            start = format_args!("{best_start:#x}"),
+            score = best_score,
+            "Data heuristic found IAT candidate"
+        );
+    } else {
+        info!("Data heuristic: no IAT candidate found");
+    }
+
+    Ok(best_start)
+}

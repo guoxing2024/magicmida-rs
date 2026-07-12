@@ -8,7 +8,7 @@ use tracing::{debug, info};
 
 use crate::header::PeHeader;
 use crate::import_table::{
-    ImportTableBuilder, ImportThunk, IMPORT_DESCRIPTOR_SIZE,
+    ImportTableBuilder, ImportThunk,
     IMAGE_ORDINAL_FLAG32, IMAGE_ORDINAL_FLAG64,
 };
 
@@ -133,7 +133,6 @@ pub(crate) fn create_import_section(
     dump_buf: &mut [u8],
     is_64bit: bool,
 ) -> (Vec<u64>, Option<usize>) {
-    let mut import_thunks: Vec<u64> = Vec::new();
     let section_size_init = 3400u32;
     let section_idx = pe.create_section_index(".import", section_size_init);
 
@@ -150,7 +149,7 @@ pub(crate) fn create_import_section(
 
     let (section_data, thunks) =
         builder.build_import_section_no_iat(section_va, original_iat_rva);
-    import_thunks = thunks;
+    let import_thunks = thunks;
 
     let section_data_len = section_data.len();
     let file_align = {
@@ -167,8 +166,10 @@ pub(crate) fn create_import_section(
     pe.sections[section_idx].header.size_of_raw_data = raw_size;
     let new_section_end = pe.sections[section_idx].header.virtual_address
         + pe.sections[section_idx].header.virtual_size;
+    let section_align = pe.nt_headers.optional_header.section_alignment;
+    let aligned_end = crate::utils::align_up(new_section_end, section_align);
     if pe.nt_headers.optional_header.size_of_image < new_section_end {
-        pe.nt_headers.optional_header.size_of_image = new_section_end;
+        pe.nt_headers.optional_header.size_of_image = aligned_end;
     }
     let mut padded_section_data = section_data;
     if (padded_section_data.len() as u32) < raw_size {
@@ -237,7 +238,7 @@ fn write_iat_lookup_to_dump_buf(
     builder: &ImportTableBuilder,
     import_thunks: &[u64],
     original_iat_rva: u32,
-    is_64bit: bool,
+    _is_64bit: bool,
 ) {
     let ptr_size = std::mem::size_of::<usize>();
     let mut max_iat_rva = original_iat_rva;

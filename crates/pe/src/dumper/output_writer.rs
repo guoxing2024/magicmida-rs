@@ -6,11 +6,11 @@ use tracing::{debug, info, warn};
 
 use crate::error::PeError;
 use crate::header::PeHeader;
-use crate::import_table::{ImportTableBuilder, iat_slot_size};
+use crate::import_table::ImportTableBuilder;
 
 use super::helpers::{
-    create_dos_header, section_rva_to_file_offset, IMAGE_DIRECTORY_ENTRY_IAT,
-    IMAGE_DIRECTORY_ENTRY_IMPORT, IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE,
+    create_dos_header, IMAGE_DIRECTORY_ENTRY_IAT,
+    IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE,
 };
 use super::import_section::{fill_additional_iat_locations, write_iat_to_output};
 use super::types::DumpOptions;
@@ -25,7 +25,7 @@ use super::types::DumpOptions;
 pub(crate) fn write_output_file(
     pe: &mut PeHeader,
     dump_buf: &[u8],
-    import_builder: Option<&ImportTableBuilder>,
+    _import_builder: Option<&ImportTableBuilder>,
     import_thunks: &[u64],
     original_iat_rva: u32,
     is_64bit: bool,

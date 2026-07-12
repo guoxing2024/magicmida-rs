@@ -84,62 +84,85 @@ pub fn read_original_import_table(path: &Path) -> Vec<(String, Vec<String>)> {
             break;
         }
 
-        // Read DLL name
-        let dll_name = if (name_rva as usize) >= sec_va {
-            let name_offset = (name_rva as usize) - sec_va;
-            read_cstring(section_data, name_offset)
-        } else {
-            String::new()
+        // Read DLL name (may be in a different section)
+        let dll_name = {
+            let name_sec = pe.sections.iter().find(|s| {
+                let start = s.virtual_address as usize;
+                let end = start + s.virtual_size as usize;
+                (name_rva as usize) >= start && (name_rva as usize) < end
+            });
+            match name_sec {
+                Some(ns) => {
+                    let off = (name_rva as usize) - ns.virtual_address as usize
+                        + ns.raw_offset as usize;
+                    if off < bytes.len() {
+                        read_cstring(&bytes, off)
+                    } else {
+                        String::new()
+                    }
+                }
+                None => String::new(),
+            }
         };
 
         if dll_name.is_empty() {
             break;
         }
 
-        // Read thunk data to get function names
+        // Read thunk data to get function names.
+        // Thunks may be in a different section than the import descriptors,
+        // so we use RVA-to-offset conversion via the PE section table.
         let mut functions: Vec<String> = Vec::new();
-        if (ft_rva as usize) >= sec_va {
-            let ft_offset = (ft_rva as usize) - sec_va;
-            let mut thunk_offset = ft_offset;
-            while thunk_offset + 8 <= section_data.len() {
-                let thunk = usize::from_le_bytes([
-                    section_data[thunk_offset],
-                    section_data[thunk_offset + 1],
-                    section_data[thunk_offset + 2],
-                    section_data[thunk_offset + 3],
-                    section_data[thunk_offset + 4],
-                    section_data[thunk_offset + 5],
-                    section_data[thunk_offset + 6],
-                    section_data[thunk_offset + 7],
-                ]);
+        let mut thunk_rva = ft_rva as usize;
+        loop {
+            // Find the section containing this RVA
+            let thunk_sec = pe.sections.iter().find(|s| {
+                let start = s.virtual_address as usize;
+                let end = start + s.virtual_size as usize;
+                thunk_rva >= start && thunk_rva < end
+            });
+            let thunk_sec = match thunk_sec {
+                Some(s) => s,
+                None => break,
+            };
+            let thunk_off = thunk_rva - thunk_sec.virtual_address as usize
+                + thunk_sec.raw_offset as usize;
+            if thunk_off + 8 > bytes.len() { break; }
 
-                if thunk == 0 {
-                    break;
-                }
+            let thunk = usize::from_le_bytes([
+                bytes[thunk_off], bytes[thunk_off + 1],
+                bytes[thunk_off + 2], bytes[thunk_off + 3],
+                bytes[thunk_off + 4], bytes[thunk_off + 5],
+                bytes[thunk_off + 6], bytes[thunk_off + 7],
+            ]);
 
-                const IMAGE_ORDINAL_FLAG64: usize = 0x8000_0000_0000_0000;
-                if thunk & IMAGE_ORDINAL_FLAG64 != 0 {
-                    // Import by ordinal
-                    let ordinal = thunk & 0xFFFF;
-                    functions.push(format!("#{ordinal}"));
-                } else {
-                    // Import by name - hint/name at thunk address
-                    let hint_rva = (thunk & 0x7FFFFFFF) as u32;
-                    if (hint_rva as usize) >= sec_va {
-                        let hint_offset = (hint_rva as usize) - sec_va;
-                        if hint_offset + 2 <= section_data.len() {
-                            // Skip 2-byte hint, read name
-                            let name_start = hint_offset + 2;
-                            let func_name = read_cstring(section_data, name_start);
-                            if !func_name.is_empty() {
-                                functions.push(func_name);
-                            }
+            if thunk == 0 { break; }
+
+            const IMAGE_ORDINAL_FLAG64: usize = 0x8000_0000_0000_0000;
+            if thunk & IMAGE_ORDINAL_FLAG64 != 0 {
+                let ordinal = thunk & 0xFFFF;
+                functions.push(format!("#{ordinal}"));
+            } else {
+                // Import by name - hint/name at thunk RVA
+                let hint_rva = (thunk & 0x7FFFFFFF) as usize;
+                let hint_sec = pe.sections.iter().find(|s| {
+                    let start = s.virtual_address as usize;
+                    let end = start + s.virtual_size as usize;
+                    hint_rva >= start && hint_rva < end
+                });
+                if let Some(hs) = hint_sec {
+                    let hint_off = hint_rva - hs.virtual_address as usize
+                        + hs.raw_offset as usize;
+                    if hint_off + 2 < bytes.len() {
+                        let func_name = read_cstring(&bytes, hint_off + 2);
+                        if !func_name.is_empty() {
+                            functions.push(func_name);
                         }
                     }
                 }
-
-                thunk_offset += 8;
             }
+
+            thunk_rva += 8;
         }
 
         if !functions.is_empty() {

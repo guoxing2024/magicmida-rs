@@ -269,7 +269,7 @@ pub fn determine_iat_address(
     // If OEP scan found an IAT ref, try to find an earlier one by scanning
     // the entire .text section.  The earliest IAT ref is closer to the true
     // IAT start, which helps when the IAT spans multiple modules.
-    let iat_ref = if iat_ref == 0 {
+    let mut iat_ref = if iat_ref == 0 {
         info!("No IAT reference found via OEP scan - trying full .text scan");
         let earliest = discovery::find_earliest_iat_ref(
             debugger,
@@ -318,6 +318,32 @@ pub fn determine_iat_address(
     if iat_ref == 0 { return Err(ThemidaError::IatNotFound); }
 
     info!("First IAT reference: {iat_ref:#x}");
+
+    // Validate the IAT reference: if the code scan found a stale FF15
+    // reference to a non-IAT data pointer (common in Themida v3 x64 where
+    // .text has FF15 refs to vtable/CFG dispatch pointers in .rdata),
+    // the API-address density around iat_ref will be low.  Fall back to
+    // the data-section heuristic (unlicense-inspired) which scans .rdata
+    // for regions densely populated with resolved API addresses.
+    if !discovery::validate_iat_ref(debugger, iat_ref)? {
+        info!("Code-scan IAT ref failed validation - trying data heuristic");
+        let heuristic_ref = discovery::find_iat_via_data_heuristic(
+            debugger,
+            data_section_base,
+            data_section_size,
+        )?;
+        if heuristic_ref != 0 {
+            info!(
+                old = format_args!("{iat_ref:#x}"),
+                new = format_args!("{heuristic_ref:#x}"),
+                "Switching to data-heuristic IAT ref"
+            );
+            iat_ref = heuristic_ref;
+        } else {
+            warn!("Data heuristic found nothing - proceeding with code-scan ref");
+        }
+    }
+
 
 
     // Step 2: Walk backwards from `iat_ref` to find the start of the IAT.

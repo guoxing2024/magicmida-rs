@@ -1,4 +1,4 @@
-﻿# Rust build artifacts
+# Rust build artifacts
 /target/
 
 # IDE/editor
@@ -35,3 +35,6 @@ CLAUDE.md
 scylla_hide.ini
 run_unpack.bat
 unpack_*.log
+
+# Reference materials (copyright risk - do not upload)
+reference/

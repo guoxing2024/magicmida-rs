@@ -51,6 +51,7 @@ pub(super) fn discover_iat_blocks(iat_data: &[usize]) -> Vec<IatBlock> {
     let mut blocks: Vec<IatBlock> = Vec::new();
     let mut current_start: Option<usize> = None;
     let mut valid_count: usize = 0;
+    let mut consecutive_zeros: usize = 0;
 
     for (i, &val) in iat_data.iter().enumerate() {
         let is_valid = val == 0
@@ -58,32 +59,67 @@ pub(super) fn discover_iat_blocks(iat_data: &[usize]) -> Vec<IatBlock> {
             || is_within_image(val, 0, iat_data.len());
 
         if is_valid {
-            if current_start.is_none() {
+            if val == 0 {
+                consecutive_zeros += 1;
+                // If we've seen too many consecutive zeros, end the current
+                // block here.  Large runs of zeros before the IAT should not
+                // be included in the IAT span — they are padding between
+                // data-section entries, not IAT slots.
+                if consecutive_zeros > 16 {
+                    if let Some(start) = current_start {
+                        if valid_count > consecutive_zeros {
+                            // Trim the trailing zeros from the block.
+                            blocks.push(IatBlock {
+                                start_slot: start,
+                                slot_count: valid_count - consecutive_zeros,
+                            });
+                        }
+                        current_start = None;
+                        valid_count = 0;
+                    }
+                    consecutive_zeros = 0;
+                    continue;
+                }
+            } else {
+                consecutive_zeros = 0;
+            }
+            // Only start a new block on a non-zero value — leading zeros
+            // are not IAT slots.
+            if current_start.is_none() && val != 0 {
                 current_start = Some(i);
             }
+            if current_start.is_some() {
             valid_count += 1;
+            }
         } else {
             // "Corrupt" slot — end the current block.
             if let Some(start) = current_start {
                 if valid_count >= 1 {
+                    // Trim trailing zeros from the block.
+                    let trimmed = valid_count.saturating_sub(consecutive_zeros);
                     blocks.push(IatBlock {
                         start_slot: start,
-                        slot_count: valid_count,
+                        slot_count: trimmed.max(1),
                     });
                 }
                 current_start = None;
                 valid_count = 0;
+                consecutive_zeros = 0;
             }
         }
     }
 
     // Don't forget the last block.
     if let Some(start) = current_start {
-        if valid_count >= 1 {
+        if valid_count > consecutive_zeros {
+            // Trim trailing zeros.
+            let trimmed = valid_count - consecutive_zeros;
+            if trimmed >= 1 {
             blocks.push(IatBlock {
                 start_slot: start,
-                slot_count: valid_count,
+                slot_count: trimmed,
             });
+            }
         }
     }
 
@@ -156,7 +192,12 @@ pub(super) fn scan_iat_boundaries(
 
     // Read the IAT data centred on `iat_ref` such that iat_data[high] is
     // the pointer at iat_ref.
-    let read_start = iat_ref.saturating_sub(MAX_IAT_SIZE.saturating_sub(ptr_size));
+    // Read starting FROM iat_ref (not centered on it) so the buffer
+    // covers the full IAT forward.  The backward scan is less useful
+    // now that find_earliest_iat_ref already found the correct start,
+    // but we keep a small backward margin (64 slots) for safety.
+    let backward_margin = 64 * ptr_size;
+    let read_start = iat_ref.saturating_sub(backward_margin);
     let bytes_read = debugger
         // SAFETY: iat_data is a Vec<usize> with len * size_of::<usize>() bytes; the aliasing slice is passed to read_memory and discarded before reuse.
         .read_memory(read_start, unsafe {
@@ -195,9 +236,15 @@ pub(super) fn scan_iat_boundaries(
         if val == 0 {
             consecutive_zeros += 1;
             if consecutive_zeros > CONSECUTIVE_ZERO_THRESHOLD {
+                // Note: CONSECUTIVE_ZERO_THRESHOLD (64) is used for the
+                // forward scan's multi-block gap detection.  For the backward
+                // scan, use a smaller threshold (16) to avoid extending the
+                // IAT start too far back into padding zeros before .rdata.
+                if consecutive_zeros > 16 {
                 iat_start = read_start
                     + (seeker + consecutive_zeros + 1).min(actual_slots - 1) * ptr_size;
                 break;
+                }
             }
         } else if is_likely_api_address(val) || is_within_image(val, read_start, actual_slots) {
             iat_start = read_start + seeker * ptr_size;

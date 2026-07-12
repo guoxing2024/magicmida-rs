@@ -5,14 +5,13 @@
 
 use std::path::Path;
 
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::error::PeError;
 use crate::header::PeHeader;
-use crate::import_table::ImportTableBuilder;
 use crate::original_imports::{read_original_import_table, resolve_imports_via_getprocaddress};
 
-use super::header_patch::{shrink_sections, validate_and_patch_pe_header};
+use super::header_patch::{compact_and_shift, shrink_sections, validate_and_patch_pe_header};
 use super::helpers::{
     make_memory_readable, IMAGE_DIRECTORY_ENTRY_IAT,
 };
@@ -97,7 +96,104 @@ pub fn dump_process(
         }
     }
 
-    // 2c. Build function-name → resolved address map
+    // 2c. Fix module attribution using the original PE's import table.
+    //     On Windows 10+, combase.dll forwards some ole32.dll exports,
+    //     causing pass2_vote to attribute ole32 functions to combase.dll.
+    //     We read the original PE's import table to determine the correct
+    //     module for each function, and reassign thunks as needed.
+    if opts.fix_imports && import_builder.is_some() {
+        if let Some(ref ep) = opts.executable_path {
+            let orig_imports = crate::original_imports::read_original_import_table(ep);
+            if !orig_imports.is_empty() {
+                // Build a map: function_name -> original_dll_name
+                let mut func_to_dll: std::collections::HashMap<String, String> =
+                    std::collections::HashMap::new();
+                for (dll, funcs) in &orig_imports {
+                    for func in funcs {
+                        if !func.starts_with('#') {
+                            func_to_dll.entry(func.clone())
+                                .or_insert_with(|| dll.clone());
+                        }
+                    }
+                }
+
+                // Check if any original modules are missing from the rebuilt table
+                let rebuilt_modules: std::collections::HashSet<String> = import_builder
+                    .as_ref()
+                    .unwrap()
+                    .modules
+                    .iter()
+                    .map(|m| m.name.to_lowercase())
+                    .collect();
+                let has_missing = orig_imports.iter().any(|(dll, _)|
+                    !rebuilt_modules.contains(&dll.to_lowercase()) && !dll.is_empty());
+
+                if has_missing {
+                    info!("Fixing module attribution using original PE import table");
+                    let builder = import_builder.as_mut().unwrap();
+
+                    // Collect thunks to move: (module_idx, thunk_idx, correct_dll)
+                    let mut moves: Vec<(usize, usize, String)> = Vec::new();
+                    for (mi, module) in builder.modules.iter().enumerate() {
+                        for (ti, thunk) in module.thunks.iter().enumerate() {
+                            if let Some(ref fname) = thunk.function_name {
+                                if let Some(correct_dll) = func_to_dll.get(fname) {
+                                    if correct_dll.to_lowercase() != module.name.to_lowercase() {
+                                        moves.push((mi, ti, correct_dll.clone()));
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Group moved thunks by correct DLL
+                    let mut new_modules: std::collections::HashMap<String, Vec<crate::import_table::ImportThunk>> =
+                        std::collections::HashMap::new();
+                    for (mi, ti, dll) in &moves {
+                        let thunk = &builder.modules[*mi].thunks[*ti];
+                        new_modules.entry(dll.clone())
+                            .or_default()
+                            .push(thunk.clone());
+                    }
+
+                    // Remove moved thunks from original modules (reverse order)
+                    for (mi, ti, _) in moves.iter().rev() {
+                        builder.modules[*mi].thunks.remove(*ti);
+                    }
+
+                    // Add new modules for moved thunks
+                    for (dll, thunks) in new_modules {
+                        // Check if module already exists
+                        let existing = builder.modules.iter()
+                            .position(|m| m.name.to_lowercase() == dll.to_lowercase());
+                        match existing {
+                            Some(idx) => {
+                                builder.modules[idx].thunks.extend(thunks);
+                            }
+                            None => {
+                                info!("Added missing module '{}' with {} thunks", dll, thunks.len());
+                                builder.modules.push(crate::import_table::ImportModule {
+                                    name: dll,
+                                    thunks,
+                                });
+                            }
+                        }
+                    }
+
+                    // Remove empty modules
+                    builder.modules.retain(|m| !m.thunks.is_empty());
+
+                    info!(
+                        "Module attribution fixed: {} modules, {} thunks",
+                        builder.modules.len(),
+                        builder.thunk_count()
+                    );
+                }
+            }
+        }
+    }
+
+    // 2d. Build function-name → resolved address map
     if import_builder.is_some() {
         if let Some(ref builder) = import_builder {
             if !iat_image.is_empty() && original_iat_rva != 0 {
@@ -155,7 +251,16 @@ pub fn dump_process(
         create_reloc_section(&mut pe);
     }
 
-    // 5. Build import section
+    // 5. Compact section VAs and move data in dump_buf to eliminate
+    //     gaps left by removed Themida sections.  This MUST happen before
+    //     create_import_section so the .import section is created at the
+    //     correct (compacted) VA and IAT Hint/Name RVAs are correct.
+    if opts.shrink {
+        compact_and_shift(&mut pe, &mut dump_buf);
+        pe.sanitize();
+    }
+
+    // 5b. Build import section (uses compacted VAs)
     let mut import_thunks: Vec<u64> = Vec::new();
     if let Some(ref builder) = import_builder {
         let (thunks, _section_idx) = create_import_section(
@@ -164,7 +269,45 @@ pub fn dump_process(
         import_thunks = thunks;
     }
 
-    // 5b. Trim huge sections
+    // 5c. Fix import descriptor FirstThunk to match actual IAT slot addresses.
+    //     create_import_section assigns sequential FirstThunk addresses, but
+    //     write_iat_to_output writes to thunks' original iat_address.  When
+    //     thunks are moved between modules, these don't match.  We fix the
+    //     descriptors in the .import section's extra_data.
+    if opts.fix_imports && import_builder.is_some() {
+        let builder = import_builder.as_ref().unwrap();
+        for section in &mut pe.sections {
+            if section.name != ".import" { continue; }
+            let data = match section.extra_data.as_mut() {
+                Some(d) => d,
+                None => break,
+            };
+            let _section_va = section.virtual_address;
+            let mut desc_off = 0usize;
+            for module in &builder.modules {
+                if module.thunks.is_empty() { continue; }
+                if desc_off + 20 > data.len() { break; }
+                // Use the minimum iat_address as FirstThunk — the PE loader
+                // walks from FirstThunk until a null entry.
+                let min_addr = module.thunks.iter()
+                    .map(|t| t.iat_address)
+                    .min().unwrap_or(0);
+                // Update FirstThunk at offset +16 in the descriptor
+                data[desc_off + 16..desc_off + 20]
+                    .copy_from_slice(&min_addr.to_le_bytes());
+                // Set OriginalFirstThunk to 0 (no ILT)
+                data[desc_off..desc_off + 4].copy_from_slice(&0u32.to_le_bytes());
+                info!(
+                    "Fixed descriptor for {}: FirstThunk=0x{:X} (was sequential)",
+                    module.name, min_addr
+                );
+                desc_off += 20;
+            }
+            break;
+        }
+    }
+
+    // 5d. Trim huge sections
     let mut iat_raw_addr = 0u32;
     let _delta = pe.trim_huge_sections(&dump_buf, &mut iat_raw_addr);
 

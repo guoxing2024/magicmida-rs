@@ -16,7 +16,7 @@ use crate::utils::align_up;
 
 // Section characteristics constants
 const IMAGE_SCN_MEM_READ: u32 = 0x40000000;
-const IMAGE_SCN_MEM_WRITE: u32 = 0x80000000;
+const IMAGE_SCN_MEM_EXECUTE: u32 = 0x20000000;
 const IMAGE_SCN_CNT_INITIALIZED_DATA: u32 = 0x00000040;
 
 // ---------------------------------------------------------------------------
@@ -303,8 +303,9 @@ impl PeHeader {
         if let Some(first) = self.sections.first_mut() {
             self.nt_headers.optional_header.size_of_headers =
                 first.header.pointer_to_raw_data;
-            // Must have write access in code section
-            first.header.characteristics |= IMAGE_SCN_MEM_WRITE;
+            // Do NOT force WRITE on .text — a writable+executable section
+            // is rejected by the Windows loader (CIG/ACG).  The original
+            // .text is EXECUTE | READ only (0x60000020).
             first.update_from_header();
         }
     }
@@ -327,8 +328,6 @@ impl PeHeader {
     /// Sections that already have a name (non-empty, non-space) are left
     /// unchanged.
     pub fn rename_unnamed_sections(&mut self) {
-        const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
-        const IMAGE_SCN_MEM_READ: u32 = 0x4000_0000;
         const IMAGE_SCN_MEM_WRITE: u32 = 0x8000_0000;
         const IMAGE_SCN_CNT_CODE: u32 = 0x0000_0020;
         const IMAGE_SCN_CNT_INITIALIZED_DATA: u32 = 0x0000_0040;
@@ -505,9 +504,11 @@ mod tests {
             assert_eq!(s.header.pointer_to_raw_data, s.header.virtual_address);
             assert_eq!(s.header.size_of_raw_data, s.header.virtual_size);
         }
-        // First section should get write access
+        // First section should NOT have write access (CIG/ACG rejects
+        // writable+executable sections; sanitize leaves .text as
+        // EXECUTE | READ only).
         assert_ne!(
-            pe.sections[0].characteristics & IMAGE_SCN_MEM_WRITE,
+            pe.sections[0].characteristics & IMAGE_SCN_MEM_EXECUTE,
             0
         );
     }

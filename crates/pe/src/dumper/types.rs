@@ -2,6 +2,7 @@
 //!
 //! Extracted from `dumper.rs`.
 
+
 // -----------------------------------------------------------------------
 // DumpOptions
 // -----------------------------------------------------------------------
@@ -24,6 +25,7 @@ pub struct DumpOptions {
     /// If `true`, remove sections that are no longer needed (compression
     /// leftovers, Themida-specific sections).
     pub shrink: bool,
+
 
     /// Path where the dumped executable will be written.
     pub output_path: std::path::PathBuf,
