@@ -11,7 +11,7 @@ use crate::error::PeError;
 use crate::header::PeHeader;
 use crate::original_imports::{read_original_import_table, resolve_imports_via_getprocaddress};
 
-use super::header_patch::{compact_and_shift, shrink_sections, validate_and_patch_pe_header};
+use super::header_patch::{shrink_sections, validate_and_patch_pe_header};
 use super::helpers::{
     make_memory_readable, IMAGE_DIRECTORY_ENTRY_IAT,
 };
@@ -268,14 +268,18 @@ pub fn dump_process(
         create_reloc_section(&mut pe);
     }
 
-    // 5. Compact section VAs and move data in dump_buf to eliminate
-    //     gaps left by removed Themida sections.  This MUST happen before
-    //     create_import_section so the .import section is created at the
-    //     correct (compacted) VA and IAT Hint/Name RVAs are correct.
-    if opts.shrink {
-        compact_and_shift(&mut pe, &mut dump_buf);
-        pe.sanitize();
-    }
+    // 5. VA compaction is DISABLED.  compact_and_shift moves sections
+    //     to fill gaps left by removed Themida sections, but .text
+    //     contains absolute address references (mov rax, 0x1400ec2000)
+    //     that point to the original VAs.  fix_hardcoded_addresses only
+    //     patches runtime ImageBase → file ImageBase, not VA shifts.
+    //     Keeping original VAs avoids this problem — the gaps are
+    //     unused memory and don't affect file size (sanitize sets
+    //     ptr=VA so the file only contains actual section data).
+    // if opts.shrink {
+    //     compact_and_shift(&mut pe, &mut dump_buf);
+    //     pe.sanitize();
+    // }
 
     // 5b. Build import section (uses compacted VAs)
     let mut import_thunks: Vec<u64> = Vec::new();
@@ -331,9 +335,13 @@ pub fn dump_process(
 
     // Pack .reloc/.import tightly after .pdata to eliminate the file gap
     // left by sanitize() setting ptr=VA for all sections.
-    if opts.shrink {
-        crate::postprocess::pack_tail_sections(&mut out_data, &pe)?;
-    }
+    // Disabled: pack_tail_sections uses the pe object's section table,
+    // but out_data's section table may differ after pack_section_layout
+    // moves sections with large gaps.  When compact_and_shift is disabled,
+    // pack_section_layout already handles file layout compression.
+    // if opts.shrink {
+    //     crate::postprocess::pack_tail_sections(&mut out_data, &pe)?;
+    // }
 
     std::fs::write(&opts.output_path, &out_data)?;
 

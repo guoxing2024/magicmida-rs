@@ -216,6 +216,7 @@ fn compact_section_vas(pe: &mut PeHeader, removed_ranges: &[(u32, u32)], removed
 /// This must be called AFTER dump_buf is read from the target process
 /// and AFTER all new sections (.pdata, .reloc, .import) are created,
 /// but BEFORE sanitize() / trim_huge_sections() / write_output_file().
+#[allow(dead_code)]
 pub(crate) fn compact_and_shift(pe: &mut PeHeader, dump_buf: &mut [u8]) {
     let section_align = pe.nt_headers.optional_header.section_alignment;
     let mut next_va: u32 = 0x1000;
