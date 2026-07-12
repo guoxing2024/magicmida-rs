@@ -128,7 +128,24 @@ pub fn dump_process(
                 let has_missing = orig_imports.iter().any(|(dll, _)|
                     !rebuilt_modules.contains(&dll.to_lowercase()) && !dll.is_empty());
 
-                if has_missing {
+                // Also check for misattributed functions: a function may
+                // be in the wrong module because Windows 10+ export
+                // forwarding causes pass2_vote to attribute it to the
+ // forwarding DLL instead of the real one (e.g. EnableWindow
+                // attributed to shlwapi.dll instead of user32.dll).
+                let has_misattributed = import_builder.as_ref().unwrap()
+                    .modules.iter()
+                    .any(|m| {
+                        m.thunks.iter().any(|t| {
+                            t.function_name.as_ref().is_some_and(|fname| {
+                                func_to_dll.get(fname).is_some_and(|correct_dll| {
+                                    correct_dll.to_lowercase() != m.name.to_lowercase()
+                                })
+                            })
+                        })
+                    });
+
+                if has_missing || has_misattributed {
                     info!("Fixing module attribution using original PE import table");
                     let builder = import_builder.as_mut().unwrap();
 
