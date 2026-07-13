@@ -1217,7 +1217,7 @@ fn run_post_loop_phases(
         return Ok(());
     }
 
-    let oep_addr = oep.ok_or_else(|| anyhow!("OEP not found — cannot continue"))?;
+    let mut oep_addr = oep.ok_or_else(|| anyhow!("OEP not found"))?;
     log::log(LogType::Info, &format!("Initial OEP: {:#x}", oep_addr));
     let image_base = dbg.image_base() as usize;
     let text_section = &state.pe_info.pe_sections[0];
@@ -1303,11 +1303,16 @@ fn run_post_loop_phases(
 
     // ---- phase C: post-processing ----
     let image_base_for_scan = dbg.image_base() as usize;
-
-    // Phase C2: scan live memory for the real OEP and log the result.
-    // (We intentionally keep the guard-detected OEP as the entry point
-    //  and install the anti-dump stub at that address — aligning with
-    //  Magicmida's approach.  The live-memory scan is informational.)
+    // Phase C2: scan live memory for the real OEP.
+    // In post-attach mode there is no guard mechanism — the initial OEP
+    // comes from a pattern scan that may match a function body rather than
+    // the true CRT entry.  When the live-memory scan (which uses tighter
+    // heuristics like x64 `sub rsp, imm8`) finds a different candidate,
+    // trust it over the initial scan.
+    //
+    // In traditional debug mode the guard-detected OEP is reliable (it is
+    // the address Themida jumped to), so we keep it and only log the scan
+    // result as informational.
     if let Some(real_oep) = scan_live_memory_for_real_oep(
         dbg,
         image_base_for_scan,
@@ -1316,11 +1321,20 @@ fn run_post_loop_phases(
         state.pe_info.major_linker_version,
     )? {
         if real_oep != oep_addr {
-            info!(
-                guard_oep = %format!("{oep_addr:#x}"),
-                scan_oep = %format!("{real_oep:#x}"),
-                "Live-memory scan found different OEP — using guard-detected OEP"
-            );
+            if post_attach {
+                info!(
+                    guard_oep = %format!("{oep_addr:#x}"),
+                    scan_oep = %format!("{real_oep:#x}"),
+                    "Live-memory scan found different OEP — using scan result (post-attach)"
+                );
+                oep_addr = real_oep;
+            } else {
+                info!(
+                    guard_oep = %format!("{oep_addr:#x}"),
+                    scan_oep = %format!("{real_oep:#x}"),
+                    "Live-memory scan found different OEP — using guard-detected OEP"
+                );
+            }
         }
     }
 

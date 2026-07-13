@@ -32,8 +32,43 @@ pub(crate) fn create_pdata_section(
             exc_rva = format!("{:#x}", exc_rva),
             "Exception table RVA is outside dump_buf; zero-filling .pdata"
         );
-        exc_data.resize(exc_len, 0);
+    exc_data.resize(exc_len, 0);
+   }
+
+    // Filter out RUNTIME_FUNCTION entries that reference deleted Themida
+    // sections. On x64, the Windows loader validates every entry in the
+    // exception directory and rejects the entire image (ERROR_BAD_EXE_FORMAT)
+    // if any Begin/End/Unwind RVA falls outside a valid section.
+    let entry_size = 12; // sizeof(RUNTIME_FUNCTION) = 3 * u32
+    let mut filtered: Vec<u8> = Vec::with_capacity(exc_data.len());
+    let num_entries = exc_data.len() / entry_size;
+    let mut kept = 0usize;
+    let mut dropped = 0usize;
+    for i in 0..num_entries {
+        let off = i * entry_size;
+        let begin_rva = u32::from_le_bytes(exc_data[off..off+4].try_into().unwrap_or([0;4]));
+        let end_rva = u32::from_le_bytes(exc_data[off+4..off+8].try_into().unwrap_or([0;4]));
+        let unwind_rva = u32::from_le_bytes(exc_data[off+8..off+12].try_into().unwrap_or([0;4]));
+        // Keep entry only if all RVAs fall within a known section.
+        let valid = [begin_rva, end_rva, unwind_rva].iter().all(|&rva| {
+            rva == 0 || pe.sections.iter().any(|s| {
+                let va = s.header.virtual_address;
+                let vs = s.header.virtual_size;
+                va != 0 && rva >= va && rva < va + vs
+            })
+        });
+        if valid {
+            filtered.extend_from_slice(&exc_data[off..off+entry_size]);
+            kept += 1;
+        } else {
+            dropped += 1;
+        }
     }
+    if dropped > 0 {
+        info!("Filtered exception table: kept {} entries, dropped {} (referenced deleted sections)", kept, dropped);
+    }
+    let exc_data = filtered;
+    let exc_len = exc_data.len();
 
     // SizeOfRawData must be FileAlignment-aligned.
     let raw_size = crate::utils::align_up(exc_len as u32, file_align);

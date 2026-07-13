@@ -5,6 +5,7 @@
 use tracing::{debug, info};
 
 use crate::error::PeError;
+use crate::utils::align_up;
 use crate::header::PeHeader;
 
 use super::helpers::IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE;
@@ -202,11 +203,53 @@ fn compact_section_vas(pe: &mut PeHeader, removed_ranges: &[(u32, u32)], removed
             }
         }
     }
-    // Do NOT compact section VAs — the dump_buf is read from memory using
-    // the original VAs, and changing them would cause the output writer to
-    // read data from the wrong offset.  Deleted sections leave gaps in the
-    // VA space, which is perfectly valid (zero-filled in the output file).
-    info!("Shrink complete: removed {} sections (VAs preserved)", removed);
+    // Fill VA gaps left by removed Themida sections.
+    //
+    // Windows x64 loader rejects PEs where section VirtualAddresses have
+    // gaps (non-contiguous VA space).  Instead of moving existing sections
+    // (which would break absolute address references in .text), we insert
+    // filler sections with RawSize=0 to make the VA space contiguous.
+    let section_align = pe.nt_headers.optional_header.section_alignment;
+    let mut i = 1;
+    while i < pe.sections.len() {
+        let prev_end = {
+            let prev = &pe.sections[i - 1];
+            let end = prev.virtual_address + prev.virtual_size;
+            align_up(end, section_align)
+        };
+        let cur_va = pe.sections[i].virtual_address;
+        if cur_va > prev_end {
+            let gap_size = cur_va - prev_end;
+            let filler = crate::header::PeSection {
+                header: crate::header::ImageSectionHeader {
+                    name: *b".fill\x00\x00\x00",
+                    virtual_size: gap_size,
+                    virtual_address: prev_end,
+                    size_of_raw_data: 0,
+                    pointer_to_raw_data: 0,
+                    pointer_to_relocations: 0,
+                    pointer_to_linenumbers: 0,
+                    number_of_relocations: 0,
+                    number_of_linenumbers: 0,
+                    // Read + Initialized Data (BSS-like, no raw data)
+                    characteristics: 0x4000_0040,
+                },
+                name: ".fill".to_string(),
+                virtual_address: prev_end,
+                virtual_size: gap_size,
+                raw_offset: 0,
+                raw_size: 0,
+                characteristics: 0x4000_0040,
+                extra_data: None,
+            };
+            pe.sections.insert(i, filler);
+            pe.nt_headers.file_header.number_of_sections =
+                pe.nt_headers.file_header.number_of_sections.saturating_add(1);
+            info!("Filled VA gap: .fill VA=0x{:X} VS=0x{:X}", prev_end, gap_size);
+        }
+        i += 1;
+    }
+    info!("Shrink complete: removed {} sections (gaps filled)", removed);
 }
 
 /// Compact section VAs to eliminate gaps left by removed sections,
