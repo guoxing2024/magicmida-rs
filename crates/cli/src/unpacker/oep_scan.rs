@@ -78,9 +78,41 @@ pub(super) fn scan_live_memory_for_real_oep(
         }
     }
 
-    // Strategy 1.5: MSVC x64 CRT startup — `48 83 EC xx` (sub rsp, imm8)
+    // Strategy 1.5: MSVC x64 CRT startup
+    //
+    // Prefer __scrt_common_main_seh pattern: `sub rsp, imm8` followed by
+    // `mov [rsp+20h], 0fffffffeh` (48 83 EC xx 48 C7 44 24 20 FE FF FF FF).
+    // This is the real CRT entry point ? a bare `sub rsp, 28 / call / ret`
+    // stub (e.g. GetCurrentThreadId wrapper) must not be picked instead.
+    let scan_end = 0x40000.min(effective_len).saturating_sub(13);
+    for i in 0..scan_end {
+        if text_buf[i] == 0x48
+            && text_buf[i + 1] == 0x83
+            && text_buf[i + 2] == 0xEC
+            && text_buf[i + 3] <= 0x80
+            && text_buf[i + 4] == 0x48
+            && text_buf[i + 5] == 0xC7
+            && text_buf[i + 6] == 0x44
+            && text_buf[i + 7] == 0x24
+            && text_buf[i + 8] == 0x20
+            && text_buf[i + 9] == 0xFE
+            && text_buf[i + 10] == 0xFF
+            && text_buf[i + 11] == 0xFF
+            && text_buf[i + 12] == 0xFF
+        {
+            let real_oep = text_base_va + i;
+            info!(
+                real_oep = format_args!("{real_oep:#x}"),
+                "x64 CRT startup (__scrt_common_main_seh) found in live memory"
+            );
+            return Ok(Some(real_oep));
+        }
+    }
+
+    // Fallback: plain `sub rsp, imm8` (48 83 EC xx) without the SEH cookie.
+    // Scan from offset 0 ? the real OEP is often at .text[0].
     let scan_end = 0x40000.min(effective_len).saturating_sub(4);
-    for i in 0x100..scan_end {
+    for i in 0..scan_end {
         if text_buf[i] == 0x48
             && text_buf[i + 1] == 0x83
             && text_buf[i + 2] == 0xEC

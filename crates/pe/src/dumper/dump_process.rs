@@ -272,7 +272,7 @@ pub fn dump_process(
     // 4b. Create .pdata and .reloc sections
     if opts.shrink {
         if let Some((exc_rva, exc_size)) = saved_exception_rva {
-            create_pdata_section(&mut pe, &dump_buf, exc_rva, exc_size);
+            create_pdata_section(&mut pe, &dump_buf, exc_rva, exc_size, opts.executable_path.as_deref());
         }
         create_reloc_section(&mut pe);
     }

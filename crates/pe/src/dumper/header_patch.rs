@@ -232,14 +232,14 @@ fn compact_section_vas(pe: &mut PeHeader, removed_ranges: &[(u32, u32)], removed
                     number_of_relocations: 0,
                     number_of_linenumbers: 0,
                     // Read + Initialized Data (BSS-like, no raw data)
-                    characteristics: 0x4000_0040,
+                    characteristics: 0xc000_0040,  // READ | WRITE | INITIALIZED_DATA
                 },
                 name: ".fill".to_string(),
                 virtual_address: prev_end,
                 virtual_size: gap_size,
                 raw_offset: 0,
                 raw_size: 0,
-                characteristics: 0x4000_0040,
+                characteristics: 0xc000_0040,  // READ | WRITE | INITIALIZED_DATA
                 extra_data: None,
             };
             pe.sections.insert(i, filler);

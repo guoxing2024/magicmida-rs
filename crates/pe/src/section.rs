@@ -297,6 +297,16 @@ impl PeHeader {
             if fa.is_power_of_two() && fa >= 0x200 { fa } else { 0x200 }
         };
         for section in &mut self.sections {
+            // Skip .fill gap-filler sections (created by compact_section_vas).
+            // These have no real data ? inflating RS to VS would write
+            // megabytes of Themida dump data into the output file.
+            // Original sections with RS=0 (Themida-compressed) are NOT
+            // skipped because they DO have data in the memory dump.
+            if section.name == ".fill" {
+                section.header.pointer_to_raw_data = section.header.virtual_address;
+                section.update_from_header();
+                continue;
+            }
             section.header.pointer_to_raw_data = section.header.virtual_address;
             section.header.size_of_raw_data =
                 crate::utils::align_up(section.header.virtual_size, file_align);

@@ -1,4 +1,4 @@
-//! Post-processing for unpacked PE images.
+﻿//! Post-processing for unpacked PE images.
 //!
 //! Includes:
 //! - Themida section shrinking (merge VSize, restore RawSize)
@@ -643,19 +643,16 @@ pub fn build_relocation_table(
         out_data[basereloc_off + 4..basereloc_off + 8]
             .copy_from_slice(&(reloc_data.len() as u32).to_le_bytes());
 
-        // Enable ASLR: set DYNAMIC_BASE flag.
-        let dll_chars_off = pe_off + 24 + 70;
-        let dll_chars = u16::from_le_bytes(
-            out_data[dll_chars_off..dll_chars_off + 2]
-                .try_into()
-                .unwrap_or([0; 2]),
-        );
-        const IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE: u16 = 0x0040;
-        let new_chars = dll_chars | IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE;
-        out_data[dll_chars_off..dll_chars_off + 2].copy_from_slice(&new_chars.to_le_bytes());
+        // Do NOT re-enable DYNAMIC_BASE.  write_output_file already cleared
+        // it, and fix_hardcoded_addresses patched all absolute addresses to
+        // the file ImageBase.  Enabling ASLR would cause the loader to apply
+        // relocations on top of already-correct addresses, corrupting them.
+        // The relocation table is kept for correctness if the image is ever
+        // loaded at a different base by a tool, but ASLR is disabled so the
+        // loader uses the preferred ImageBase.
 
         info!(
-            "Relocation table: {} entries ({} bytes, untruncated), VA={:#x}, ASLR enabled",
+            "Relocation table: {} entries ({} bytes, untruncated), VA={:#x}, ASLR disabled",
             reloc_count,
             reloc_data.len(),
             reloc_va

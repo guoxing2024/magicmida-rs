@@ -13,6 +13,7 @@ pub(crate) fn create_pdata_section(
     dump_buf: &[u8],
     exc_rva: u32,
     exc_size: u32,
+    executable_path: Option<&std::path::Path>,
 ) {
     let exc_off = exc_rva as usize;
     let exc_len = exc_size as usize;
@@ -28,12 +29,44 @@ pub(crate) fn create_pdata_section(
         exc_data.extend_from_slice(&dump_buf[exc_off..exc_off + avail]);
         exc_data.resize(exc_len, 0);
     } else {
-        warn!(
-            exc_rva = format!("{:#x}", exc_rva),
-            "Exception table RVA is outside dump_buf; zero-filling .pdata"
-        );
-    exc_data.resize(exc_len, 0);
-   }
+        exc_data.resize(exc_len, 0);
+    }
+
+    // Themida may have freed/zeroed the memory where the exception table
+    // was stored (typically inside a Themida section like .KI3).  If the
+    // dumped data is all zeros, fall back to reading the exception table
+    // from the original on-disk PE file.
+    let all_zero = exc_data.iter().all(|&b| b == 0);
+    if all_zero {
+        if let Some(ep) = executable_path {
+            if let Ok(orig_bytes) = std::fs::read(ep) {
+                if let Ok(orig_pe) = PeHeader::from_bytes(&orig_bytes) {
+                    if let Some(file_off) = orig_pe.rva_to_offset(exc_rva) {
+                        let fo = file_off as usize;
+                        if fo + exc_len <= orig_bytes.len() {
+                            let fallback = &orig_bytes[fo..fo + exc_len];
+                            let fb_nonzero = fallback.iter().filter(|&&b| b != 0).count();
+                            if fb_nonzero > 0 {
+                                info!(
+                                    exc_rva = format!("{:#x}", exc_rva),
+                                    nonzero = fb_nonzero,
+                                    "Exception table was zeroed in dump; using original file data"
+                                );
+                                exc_data.clear();
+                                exc_data.extend_from_slice(fallback);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if exc_data.iter().all(|&b| b == 0) {
+            warn!(
+                exc_rva = format!("{:#x}", exc_rva),
+                "Exception table is all zeros in both dump and original file"
+            );
+        }
+    }
 
     // Filter out RUNTIME_FUNCTION entries that reference deleted Themida
     // sections. On x64, the Windows loader validates every entry in the
