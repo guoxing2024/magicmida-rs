@@ -193,6 +193,16 @@ fn read_cstring(data: &[u8], offset: usize) -> String {
 /// Resolve API addresses using GetProcAddress for well-known DLLs.
 ///
 /// Returns a map of (DLL name, function name) -> API address.
+///
+/// # DLL handle lifetime
+///
+/// Each `LoadLibraryExA` call increments the per-process DLL reference count.
+/// The loaded module handles are intentionally **not** freed here: `mida-pe`
+/// is consumed by the short-lived `mida-cli` unpacker that exits immediately
+/// after use, so the handles are reclaimed when the process exits. If
+/// `mida-pe` is ever embedded in a long-lived host process, callers should
+/// add `FreeLibrary` calls (or refactor to reuse a single module cache) to
+/// avoid accumulating loaded-DLL references.
 pub fn resolve_imports_via_getprocaddress(
     imports: &[(String, Vec<String>)],
 ) -> std::collections::HashMap<(String, String), usize> {

@@ -484,17 +484,20 @@ pub(super) fn is_likely_api_address(addr: usize) -> bool {
         return false;
     }
 
-    // On 64-bit Windows, user-mode DLLs load in the 0x0000_7FF6_xxxx_xxxx
-    // to 0x0000_7FFF_xxxx_xxxx range (high user space).  API addresses
-    // are typically in this range.  Small values (< 0x7fff_0000_0000)
-    // are likely RVAs or data pointers, not resolved API addresses.
+    // On 64-bit Windows, user-mode virtual addresses span up to
+    // `0x0000_7FFF_FFFF_FFFF` (the 47-bit user-space ceiling). System DLLs
+    // such as ntdll/kernel32 may land very close to that ceiling under some
+    // ASLR layouts, so the upper bound is the exclusive `0x8000_0000_0000`
+    // rather than `0x7FFF_FFFF_0000` (which cut off ~4 GB at the top and could
+    // miss high-address DLLs). The lower bound `0x7ff0_0000_0000` rejects
+    // small RVAs / data pointers that aren't resolved API addresses.
     //
     // This mirrors Pascal's `IsAPIAddress` which checks module export
     // tables — resolved API addresses live inside loaded DLLs, not in
     // the protected image's data sections.
     #[cfg(target_arch = "x86_64")]
     {
-        (0x7ff0_0000_0000..0x0000_7FFF_FFFF_0000).contains(&addr)
+        (0x7ff0_0000_0000..0x0000_8000_0000_0000).contains(&addr)
     }
     #[cfg(target_arch = "x86")]
     {

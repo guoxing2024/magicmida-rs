@@ -178,7 +178,7 @@ pub(super) fn pe_section_name_remote_rva(
 ) -> Option<usize> {
     use mida_core::DebuggerCore;
     let mut buf4 = [0u8; 4];
-    let ro = ReadOnlyProcessDebugger { h_process, image_base: image_base as u64 };
+    let ro = ReadOnlyProcessDebugger::new(h_process, image_base as u64);
     ro.read_memory(image_base + 0x3C, &mut buf4).ok()?;
     let e_lfanew = u32::from_le_bytes(buf4) as usize;
     let nt = image_base + e_lfanew;

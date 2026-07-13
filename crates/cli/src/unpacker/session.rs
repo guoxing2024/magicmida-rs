@@ -7,7 +7,7 @@
 //!   CONTEXT_CONTROL-only context helpers (avoids `ERROR_PARTIAL_COPY`).
 
 use anyhow::anyhow;
-use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
 
 use mida_core::{
     ContinueStatus, CoreError, DebugEvent, DebuggerCore, WindowsDebugger,
@@ -200,9 +200,32 @@ pub(super) fn set_thread_context_control(
 ///
 /// Only [`read_memory`](DebuggerCore::read_memory) is implemented; all other
 /// methods return an error code matching the pattern in `mida_core::CoreError`.
+///
+/// The process handle is owned by this struct and is closed automatically in
+/// [`Drop`] — early-return paths (`?` propagation) no longer leak the handle.
 pub(super) struct ReadOnlyProcessDebugger {
     pub(super) h_process: HANDLE,
     pub(super) image_base: u64,
+}
+
+impl ReadOnlyProcessDebugger {
+    /// Wrap an already-opened process handle.
+    ///
+    /// Ownership of `h_process` transfers to the returned struct; it will be
+    /// closed on drop.
+    pub(super) fn new(h_process: HANDLE, image_base: u64) -> Self {
+        Self { h_process, image_base }
+    }
+}
+
+impl Drop for ReadOnlyProcessDebugger {
+    fn drop(&mut self) {
+        // SAFETY: h_process was obtained from OpenProcess and is valid until
+        // closed here; CloseHandle is safe to call exactly once.
+        if !self.h_process.is_invalid() {
+            unsafe { let _ = CloseHandle(self.h_process); }
+        }
+    }
 }
 
 impl std::fmt::Debug for ReadOnlyProcessDebugger {

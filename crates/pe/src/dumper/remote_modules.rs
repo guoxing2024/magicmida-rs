@@ -84,14 +84,19 @@ pub fn take_module_snapshot(
     is_64bit: bool,
 ) -> Result<Vec<RemoteModule>, PeError> {
     use windows::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, MODULEENTRY32W, TH32CS_SNAPMODULE,
+        CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, MODULEENTRY32W,
+        TH32CS_SNAPMODULE, TH32CS_SNAPMODULE32,
     };
     use windows::Win32::Foundation::CloseHandle;
 
-    // 1. Create the module snapshot
+    // 1. Create the module snapshot.
+    // TH32CS_SNAPMODULE32 lets a 64-bit debugger enumerate a 32-bit (WOW64)
+    // target's modules — without it the snapshot only lists 64-bit modules
+    // and we miss kernel32/user32 etc., breaking `is_api_address` on x86
+    // targets. SNAPSHOTMODULE | SNAPSHOTMODULE32 (8 | 16 = 24) returns both.
     // SAFETY: pid is the target process ID obtained from the debugger.
     let h_snap = unsafe {
-        CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE, pid)
+        CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid)
     }
     .map_err(|e| {
         PeError::Parse(format!(

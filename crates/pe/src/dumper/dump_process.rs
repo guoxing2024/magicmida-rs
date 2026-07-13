@@ -117,94 +117,103 @@ pub fn dump_process(
                     }
                 }
 
-                // Check if any original modules are missing from the rebuilt table
-                let rebuilt_modules: std::collections::HashSet<String> = import_builder
-                    .as_ref()
-                    .unwrap()
-                    .modules
-                    .iter()
-                    .map(|m| m.name.to_lowercase())
-                    .collect();
-                let has_missing = orig_imports.iter().any(|(dll, _)|
-                    !rebuilt_modules.contains(&dll.to_lowercase()) && !dll.is_empty());
+                // Check if any original modules are missing from the rebuilt table.
+                // Guarded by the outer `import_builder.is_some()` check, but use
+                // `if let` so a future refactor of that guard cannot panic here.
+                let has_missing;
+                let has_misattributed;
+                if let Some(builder_ref) = import_builder.as_ref() {
+                    let rebuilt_modules: std::collections::HashSet<String> = builder_ref
+                        .modules
+                        .iter()
+                        .map(|m| m.name.to_lowercase())
+                        .collect();
+                    has_missing = orig_imports.iter().any(|(dll, _)|
+                        !rebuilt_modules.contains(&dll.to_lowercase()) && !dll.is_empty());
 
-                // Also check for misattributed functions: a function may
-                // be in the wrong module because Windows 10+ export
-                // forwarding causes pass2_vote to attribute it to the
- // forwarding DLL instead of the real one (e.g. EnableWindow
-                // attributed to shlwapi.dll instead of user32.dll).
-                let has_misattributed = import_builder.as_ref().unwrap()
-                    .modules.iter()
-                    .any(|m| {
-                        m.thunks.iter().any(|t| {
-                            t.function_name.as_ref().is_some_and(|fname| {
-                                func_to_dll.get(fname).is_some_and(|correct_dll| {
-                                    correct_dll.to_lowercase() != m.name.to_lowercase()
+                    // Also check for misattributed functions: a function may
+                    // be in the wrong module because Windows 10+ export
+                    // forwarding causes pass2_vote to attribute it to the
+                    // forwarding DLL instead of the real one (e.g. EnableWindow
+                    // attributed to shlwapi.dll instead of user32.dll).
+                    has_misattributed = builder_ref
+                        .modules.iter()
+                        .any(|m| {
+                            m.thunks.iter().any(|t| {
+                                t.function_name.as_ref().is_some_and(|fname| {
+                                    func_to_dll.get(fname).is_some_and(|correct_dll| {
+                                        correct_dll.to_lowercase() != m.name.to_lowercase()
+                                    })
                                 })
                             })
-                        })
-                    });
+                        });
 
+                } else {
+                    has_missing = false;
+                    has_misattributed = false;
+                }
                 if has_missing || has_misattributed {
                     info!("Fixing module attribution using original PE import table");
-                    let builder = import_builder.as_mut().unwrap();
-
-                    // Collect thunks to move: (module_idx, thunk_idx, correct_dll)
-                    let mut moves: Vec<(usize, usize, String)> = Vec::new();
-                    for (mi, module) in builder.modules.iter().enumerate() {
-                        for (ti, thunk) in module.thunks.iter().enumerate() {
-                            if let Some(ref fname) = thunk.function_name {
-                                if let Some(correct_dll) = func_to_dll.get(fname) {
-                                    if correct_dll.to_lowercase() != module.name.to_lowercase() {
-                                        moves.push((mi, ti, correct_dll.clone()));
+                    // Guarded by the outer `import_builder.is_some()` check;
+                    // `if let` avoids `unwrap()` panic if that guard changes.
+                    if let Some(builder) = import_builder.as_mut() {
+                        // Collect thunks to move: (module_idx, thunk_idx, correct_dll)
+                        let mut moves: Vec<(usize, usize, String)> = Vec::new();
+                        for (mi, module) in builder.modules.iter().enumerate() {
+                            for (ti, thunk) in module.thunks.iter().enumerate() {
+                                if let Some(ref fname) = thunk.function_name {
+                                    if let Some(correct_dll) = func_to_dll.get(fname) {
+                                        if correct_dll.to_lowercase() != module.name.to_lowercase() {
+                                            moves.push((mi, ti, correct_dll.clone()));
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
 
-                    // Group moved thunks by correct DLL
-                    let mut new_modules: std::collections::HashMap<String, Vec<crate::import_table::ImportThunk>> =
-                        std::collections::HashMap::new();
-                    for (mi, ti, dll) in &moves {
-                        let thunk = &builder.modules[*mi].thunks[*ti];
-                        new_modules.entry(dll.clone())
-                            .or_default()
-                            .push(thunk.clone());
-                    }
+                        // Group moved thunks by correct DLL
+                        let mut new_modules: std::collections::HashMap<String, Vec<crate::import_table::ImportThunk>> =
+                            std::collections::HashMap::new();
+                        for (mi, ti, dll) in &moves {
+                            let thunk = &builder.modules[*mi].thunks[*ti];
+                            new_modules.entry(dll.clone())
+                                .or_default()
+                                .push(thunk.clone());
+                        }
 
-                    // Remove moved thunks from original modules (reverse order)
-                    for (mi, ti, _) in moves.iter().rev() {
-                        builder.modules[*mi].thunks.remove(*ti);
-                    }
+                        // Remove moved thunks from original modules (reverse order)
+                        for (mi, ti, _) in moves.iter().rev() {
+                            builder.modules[*mi].thunks.remove(*ti);
+                        }
 
-                    // Add new modules for moved thunks
-                    for (dll, thunks) in new_modules {
-                        // Check if module already exists
-                        let existing = builder.modules.iter()
-                            .position(|m| m.name.to_lowercase() == dll.to_lowercase());
-                        match existing {
-                            Some(idx) => {
-                                builder.modules[idx].thunks.extend(thunks);
-                            }
-                            None => {
-                                info!("Added missing module '{}' with {} thunks", dll, thunks.len());
-                                builder.modules.push(crate::import_table::ImportModule {
-                                    name: dll,
-                                    thunks,
-                                });
+                        // Add new modules for moved thunks
+                        for (dll, thunks) in new_modules {
+                            // Check if module already exists
+                            let existing = builder.modules.iter()
+                                .position(|m| m.name.to_lowercase() == dll.to_lowercase());
+                            match existing {
+                                Some(idx) => {
+                                    builder.modules[idx].thunks.extend(thunks);
+                                }
+                                None => {
+                                    info!("Added missing module '{}' with {} thunks", dll, thunks.len());
+                                    builder.modules.push(crate::import_table::ImportModule {
+                                        name: dll,
+                                        thunks,
+                                    });
+                                }
                             }
                         }
+
+                        // Remove empty modules
+                        builder.modules.retain(|m| !m.thunks.is_empty());
+
+                        info!(
+                            "Module attribution fixed: {} modules, {} thunks",
+                            builder.modules.len(),
+                            builder.thunk_count()
+                        );
                     }
-
-                    // Remove empty modules
-                    builder.modules.retain(|m| !m.thunks.is_empty());
-
-                    info!(
-                        "Module attribution fixed: {} modules, {} thunks",
-                        builder.modules.len(),
-                        builder.thunk_count()
-                    );
                 }
             }
         }

@@ -3,7 +3,6 @@
 /// This module scans all sections for absolute addresses pointing to the image
 /// and generates a complete .reloc section so the Windows PE Loader can fix
 /// them when the image loads at a different base address.
-
 use std::collections::BTreeMap;
 
 /// A single relocation entry
@@ -59,7 +58,7 @@ impl RelocationTableBuilder {
         section_rva: u32,
         is_64bit: bool,
     ) {
-        use tracing::{debug, info};
+        use tracing::debug;
 
         let ptr_size = if is_64bit { 8 } else { 4 };
         let image_start = self.image_base;
@@ -77,12 +76,6 @@ impl RelocationTableBuilder {
             // Check if this looks like an absolute address pointing to our image
             if addr >= image_start && addr < image_end {
                 let entry_rva = section_rva + offset as u32;
-
-                // Debug log for the critical address
-                if entry_rva == 0x1051e0 || (0x1051d0..=0x1051f0).contains(&entry_rva) {
-                    info!("!!! FOUND critical address: RVA={:#x}, value={:#x}, section_rva={:#x}, offset={:#x}",
-                          entry_rva, addr, section_rva, offset);
-                }
 
                 let reloc_type = if is_64bit {
                     10 // IMAGE_REL_BASED_DIR64

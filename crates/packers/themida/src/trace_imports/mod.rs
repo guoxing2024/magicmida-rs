@@ -268,12 +268,24 @@ pub fn trace_imports(
                     if !did_set_exit_process {
                         did_set_exit_process = true;
                         let real_exit_process = resolve_exit_process();
-                        iat_data[i] = real_exit_process;
-                        resolved_count += 1;
-                        log(
-                            LogMsgType::Info,
-                            &format!("IAT[{i}] {slot_va:#x}: VM entry → ExitProcess ({real_exit_process:#x})"),
-                        );
+                        if real_exit_process != 0 {
+                            iat_data[i] = real_exit_process;
+                            resolved_count += 1;
+                            log(
+                                LogMsgType::Info,
+                                &format!("IAT[{i}] {slot_va:#x}: VM entry → ExitProcess ({real_exit_process:#x})"),
+                            );
+                        } else {
+                            // ExitProcess could not be resolved; leave the slot
+                            // untouched and treat it as a failed VM entry so
+                            // the run continues instead of corrupting the IAT.
+                            failed_count += 1;
+                            failed_slots.push(i);
+                            log(
+                                LogMsgType::Fatal,
+                                &format!("IAT[{i}] {slot_va:#x}: VM entry, but ExitProcess unresolved — leaving slot"),
+                            );
+                        }
                     } else {
                         failed_count += 1;
                         failed_slots.push(i);
@@ -404,6 +416,11 @@ pub(crate) fn get_themida_section_bounds(state: &ThemidaState, actual_image_base
 /// **Note:** this uses `GetProcAddress` in the *debugger* process.  Because
 /// kernel32.dll is a known DLL loaded at the same base across all processes
 /// in a session, the returned address is also valid in the target process.
+///
+/// Returns `0` if the address cannot be resolved (kernel32 not loaded or
+/// `ExitProcess` not exported). The caller treats 0 as "no replacement" rather
+/// than aborting the debug session — a panic here would leave the debuggee
+/// orphaned with the debug port still attached.
 fn resolve_exit_process() -> usize {
     // SAFETY: GetModuleHandleA / GetProcAddress are always available on
     // Windows. The returned address is valid in the target because kernel32
@@ -412,11 +429,20 @@ fn resolve_exit_process() -> usize {
         use windows::core::PCSTR;
         use windows::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
 
-        let kernel32 = GetModuleHandleA(PCSTR::from_raw(b"kernel32.dll\0".as_ptr()))
-            .unwrap_or_else(|_| panic!("resolve_exit_process: kernel32.dll must be loaded"));
-        let addr = GetProcAddress(kernel32, PCSTR::from_raw(b"ExitProcess\0".as_ptr()))
-            .unwrap_or_else(|| panic!("resolve_exit_process: ExitProcess must exist in kernel32"));
-        addr as usize
+        let kernel32 = match GetModuleHandleA(PCSTR::from_raw(b"kernel32.dll\0".as_ptr())) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!("resolve_exit_process: kernel32.dll not loaded: {e}");
+                return 0;
+            }
+        };
+        match GetProcAddress(kernel32, PCSTR::from_raw(b"ExitProcess\0".as_ptr())) {
+            Some(addr) => addr as usize,
+            None => {
+                tracing::warn!("resolve_exit_process: ExitProcess not found in kernel32");
+                0
+            }
+        }
     }
 }
 

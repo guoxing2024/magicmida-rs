@@ -327,11 +327,29 @@ loop {
     }
 
     // Check if process is still alive.
+    // `STILL_ACTIVE` (NTSTATUS 0x103) is the sentinel GetExitCodeProcess
+    // returns for a process that hasn't exited. We compare explicitly rather
+    // than relying on `is_ok()` so a real failure isn't silently treated as
+    // "process dead".
+    use windows::Win32::Foundation::STILL_ACTIVE;
     let mut exit_code: u32 = 0;
-    let alive = unsafe {
+    let alive = match unsafe {
         windows::Win32::System::Threading::GetExitCodeProcess(
             dbg.process_handle(), &mut exit_code,
-        ).is_ok() && exit_code == 259
+        )
+    } {
+        Ok(()) => exit_code == STILL_ACTIVE.0 as u32,
+        Err(e) => {
+            // GetExitCodeProcess can fail with insufficient rights or if the
+            // process handle was never granted PROCESS_QUERY_LIMITED_INFORMATION.
+            // Don't assume the process is dead — log and keep polling; the
+            // outer 60s timeout is the real backstop.
+            log::log(
+                LogType::Warn,
+                &format!("post-attach: GetExitCodeProcess failed: {e} (exit_code={:#x}) — assuming still alive", exit_code),
+            );
+            true
+        }
     };
     if !alive {
         return Err(anyhow!("Target process exited during IAT poll (exit_code={:#x})", exit_code));

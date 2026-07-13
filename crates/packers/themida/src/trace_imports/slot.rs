@@ -229,7 +229,11 @@ pub(crate) fn trace_one_slot(
                                  (target {target_address:#x})"
                             )
                         }
-                        _ => unreachable!(),
+                        // Unreachable: the outer match already constrained
+                        // `ev` to Breakpoint | AccessViolation. Kept as a
+                        // safe fallback so a future refactor cannot panic
+                        // inside the trace loop.
+                        _ => format!("unexpected debug event at {address:#x}"),
                     };
                     log(
                         LogMsgType::Fatal,

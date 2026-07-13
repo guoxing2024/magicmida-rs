@@ -28,7 +28,8 @@ InjectorCLI*.exe
 # Temporary / audit reports
 SESSION_REPORT.txt
 AUDIT_REPORT.md
-_ran.flag*.log
+_ran.flag
+*.log
 build.bat
 .hermes-tmp.*
 CLAUDE.md

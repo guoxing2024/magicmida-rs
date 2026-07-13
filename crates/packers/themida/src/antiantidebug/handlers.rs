@@ -200,7 +200,18 @@ pub fn handle_nt_query_information_process(
         PROCESS_DEBUG_PORT => "ProcessDebugPort",
         PROCESS_DEBUG_OBJECT_HANDLE => "ProcessDebugObjectHandle",
         PROCESS_DEBUG_FLAGS => "ProcessDebugFlags",
-        _ => unreachable!(),
+        // The early-return guard above already filters out non-debug classes,
+        // so this branch is unreachable in the current control flow. Kept as a
+        // safe fallback rather than `unreachable!()` so a future refactor that
+        // loosens the guard cannot panic inside the debug loop.
+        _ => {
+            trace!(
+                thread_id,
+                process_information_class,
+                "NtQueryInformationProcess: unhandled class, ignoring"
+            );
+            return Ok(());
+        }
     };
 
     debug!(thread_id, description, "Faking NtQueryInformationProcess");
@@ -246,7 +257,16 @@ pub fn handle_nt_query_information_process(
         PROCESS_DEBUG_PORT => (0, STATUS_SUCCESS),
         PROCESS_DEBUG_OBJECT_HANDLE => (0, STATUS_PORT_NOT_SET),
         PROCESS_DEBUG_FLAGS => (1, STATUS_SUCCESS),
-        _ => unreachable!(),
+        // Unreachable thanks to the early-return guard above, but fall back to
+        // a no-op success rather than panicking inside the debug loop.
+        _ => {
+            trace!(
+                thread_id,
+                process_information_class,
+                "NtQueryInformationProcess: unhandled class at fake-value stage, skipping"
+            );
+            return Ok(());
+        }
     };
 
     // 5. Write the fake value to the output buffer in the target.

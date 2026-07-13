@@ -203,9 +203,14 @@ pub(super) fn find_go_api_call(
                 && len == 6
             {
                 let after_mov = offset_in_text + (ip - start_addr) + len;
-                if after_mov + 5 <= text.len()
-                    && (text[after_mov] == 0x89 || text[after_mov] == 0x8B)
-                        && (text[after_mov + 1] & 0xF8) == 0x04
+               if after_mov + 5 <= text.len()
+                   && (text[after_mov] == 0x89 || text[after_mov] == 0x8B)
+                        // ModR/M byte: mod=01 (disp8), reg=any, r/m=100 (SIB).
+                        // Mask 0xC7 keeps mod+r/m, strips the reg field so we
+                        // match any register. Value 0x44 = 01_000_100.
+                        // (Previous 0xF8/0x04 was impossible: 0x04 has bit 2
+                        // set, which 0xF8 masks out, so it was always false.)
+                        && (text[after_mov + 1] & 0xC7) == 0x44
                         && (text[after_mov + 2] == 0x24)
                     {
                         let iat_pointer = insn.memory_displacement64() as usize;

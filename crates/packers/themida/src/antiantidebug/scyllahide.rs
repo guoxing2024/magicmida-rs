@@ -197,8 +197,14 @@ pub fn inject_scylla_hide(pid: u32, config: &ScyllaHideConfig) -> Result<(), The
         }
     }
 
-    // Drop the child handle without killing the process.
-    std::mem::forget(child);
+    // Intentionally detach from the injector: the hook DLL keeps running in
+    // the target regardless of what we do with this handle. Dropping `child`
+    // does NOT kill the spawned process — `std::process::Child` only reaps on
+    // `wait()`/`try_wait()`, and we want neither to block nor to kill. Let
+    // `child` drop naturally at end of scope.
+    // (Replaces the previous `std::mem::forget(child)`, which tripped clippy's
+    // `mem_forget` lint and leaked the Child's bookkeeping without benefit.)
+    drop(child);
 
     Ok(())
 }

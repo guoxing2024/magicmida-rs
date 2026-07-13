@@ -8,7 +8,7 @@
 #![cfg(target_arch = "x86")]
 
 use mida_core::DebuggerCore;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::error::ThemidaError;
 
@@ -176,7 +176,13 @@ pub fn handle_kifast_syscall(
                 PROCESS_DEBUG_PORT => "ProcessDebugPort",
                 PROCESS_DEBUG_OBJECT_HANDLE => "ProcessDebugObjectHandle",
                 PROCESS_DEBUG_FLAGS => "ProcessDebugFlags",
-                _ => unreachable!(),
+                // Unreachable due to the enclosing `if` guard, but kept as a
+                // safe fallback rather than `unreachable!()` so a future
+                // refactor cannot panic inside the debug loop.
+                _ => {
+                    trace!(thread_id, info_class, "kifs: unhandled debug class, ignoring");
+                    return Ok(());
+                }
             };
 
             debug!(thread_id, description, "Faking via KiFastSystemCall");
@@ -197,7 +203,10 @@ pub fn handle_kifast_syscall(
                 PROCESS_DEBUG_PORT => (0, STATUS_SUCCESS),
                 PROCESS_DEBUG_OBJECT_HANDLE => (0, STATUS_PORT_NOT_SET),
                 PROCESS_DEBUG_FLAGS => (1, STATUS_SUCCESS),
-                _ => unreachable!(),
+                _ => {
+                    trace!(thread_id, info_class, "kifs: unhandled class at fake-value stage, skipping");
+                    return Ok(());
+                }
             };
 
             // Write the fake value to the output buffer.

@@ -13,7 +13,8 @@ use super::session::ReadOnlyProcessDebugger;
 
 /// Dump the de-virtualised `.text` section from a running (unpacked) process.
 pub fn dump_process_code(pid: u32, unpacked_file: &Path) -> Result<(), anyhow::Error> {
-    // SAFETY: pid is a valid OS process ID; handles are closed before return.
+    // SAFETY: pid is a valid OS process ID; the handle is owned by
+    // ReadOnlyProcessDebugger below and closed automatically on drop.
     let h_process = unsafe {
         OpenProcess(
             PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
@@ -52,10 +53,9 @@ pub fn dump_process_code(pid: u32, unpacked_file: &Path) -> Result<(), anyhow::E
     let is_64bit = pe.is_64bit;
     debug!(?image_path, is_64bit, "Resolved process image");
 
-    let ro_dbg = ReadOnlyProcessDebugger {
-        h_process,
-        image_base: pe.image_base,
-    };
+    // h_process ownership transfers here; it is closed via Drop on any return
+    // path (including the `?` early-return below).
+    let ro_dbg = ReadOnlyProcessDebugger::new(h_process, pe.image_base);
 
     let written = mida_packers_themida::dump_process_code(&ro_dbg, &pe, unpacked_file)
         .map_err(|e| anyhow!("dump_process_code failed: {e}"))?;
@@ -64,11 +64,6 @@ pub fn dump_process_code(pid: u32, unpacked_file: &Path) -> Result<(), anyhow::E
         LogType::Good,
         &format!("Dumped {} bytes to {}", written, unpacked_file.display()),
     );
-
-    // SAFETY: the handle was opened by this function and is no longer needed.
-    unsafe {
-        let _ = windows::Win32::Foundation::CloseHandle(h_process);
-    }
 
     Ok(())
 }

@@ -235,12 +235,13 @@ pub fn fix_hardcoded_addresses(
                     return None;
                 }
 
-                // Check if this looks like a runtime address
-                let is_runtime_addr = if is_64bit {
-                    addr >= runtime_start && addr < runtime_end
-                } else {
-                    addr >= runtime_start && addr < runtime_end
-                };
+                // Check if this looks like a runtime address. The check is
+                // identical for 32- and 64-bit (both compare against the
+                // runtime_start..runtime_end range), so the `is_64bit`
+                // parameter is not used here — kept in the signature for
+                // callers that may differentiate later.
+                let _ = is_64bit;
+                let is_runtime_addr = addr >= runtime_start && addr < runtime_end;
 
                 if is_runtime_addr && delta != 0 {
                     let old_val = u64::from_le_bytes(data[offset..offset+ptr_size].try_into().ok()?);
@@ -376,7 +377,7 @@ pub fn pack_section_layout(out_data: &mut Vec<u8>, pe: &PeHeader) -> Result<(), 
 /// gap, updates their PointerToRawData in the section headers, and
 /// truncates the file.
 ///
-/// Must be called AFTER uild_relocation_table (which updates .reloc's
+/// Must be called AFTER build_relocation_table (which updates .reloc's
 /// VirtualSize and SizeOfRawData in the on-disk header).
 pub fn pack_tail_sections(out_data: &mut Vec<u8>, pe: &PeHeader) -> Result<(), PeError> {
     let pe_offset = if out_data.len() >= 0x40 {

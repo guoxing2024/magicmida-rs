@@ -127,8 +127,6 @@ impl PeHeader {
     }
 
     /// Delete a section at the given index.
-
-    /// Delete a section at the given index.
     ///
     /// Shifts remaining sections' `PointerToRawData` backward by the deleted
     /// section's size, merges the deleted section's `VirtualSize` into the
