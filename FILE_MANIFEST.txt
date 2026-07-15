@@ -1,0 +1,8 @@
+﻿  - crates/pe/src/dumper/global_vars.rs: 153 行
+  - crates/pe/src/dumper/tls_bootstrap.rs: 199 行
+  - crates/pe/src/dumper/container_bootstrap.rs: 461 行
+  - crates/pe/src/dumper/heap_bootstrap.rs: 292 行
+  - SUCCESS_REPORT_2026-07-15.md
+  - PROGRESS_REPORT_2026-07-15.md
+  - QUICK_SUMMARY.md
+  - PROJECT_ARCHIVE_INFO.txt
