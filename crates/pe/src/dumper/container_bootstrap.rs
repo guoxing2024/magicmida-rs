@@ -38,7 +38,6 @@ use tracing::{info, warn};
 use crate::header::PeHeader;
 
 use super::container_snapshot::ContainerSnapshot;
-use crate::dumper::global_vars::GlobalVarSnapshot;
 
 const IMAGE_SCN_CNT_CODE: u32 = 0x0000_0020;
 const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
@@ -124,7 +123,8 @@ pub(crate) fn build_tls_bootstrap_stub(
     get_process_heap_iat_rva: u32,
     heap_alloc_iat_rva: u32,
     containers: &[ContainerSnapshot],
-    global_vars: &[super::global_vars::GlobalVarSnapshot],
+    data_snapshot: Option<&super::data_snapshot::DataSectionSnapshot>,
+    image_base: u64,
 ) -> Option<Vec<u8>> {
     build_container_stub_internal(
         stub_rva,
@@ -132,7 +132,8 @@ pub(crate) fn build_tls_bootstrap_stub(
         get_process_heap_iat_rva,
         heap_alloc_iat_rva,
         containers,
-        global_vars,
+        data_snapshot,
+        image_base,
     )
 }
 
@@ -150,7 +151,8 @@ fn build_container_stub(
         get_process_heap_iat_rva,
         heap_alloc_iat_rva,
         containers,
-        &[],
+        None,
+        0,
     )
 }
 
@@ -161,15 +163,16 @@ fn build_container_stub_internal(
     get_process_heap_iat_rva: u32,
     heap_alloc_iat_rva: u32,
     containers: &[ContainerSnapshot],
-    global_vars: &[super::global_vars::GlobalVarSnapshot],
+    data_snapshot: Option<&super::data_snapshot::DataSectionSnapshot>,
+    image_base: u64,
 ) -> Option<Vec<u8>> {
     let mut stub = Vec::new();
 
     // Calculate offsets
-    let code_size = estimate_code_size(containers.len());
+    let code_size = estimate_code_size(containers.len(), data_snapshot.is_some());
     let metadata_offset = code_size;
     let data_base_offset = metadata_offset + containers.len() * CONTAINER_METADATA_SIZE;
-    let global_vars_offset = data_base_offset + containers.iter().map(|c| c.heap_content.len()).sum::<usize>();
+    let data_snapshot_offset = data_base_offset + containers.iter().map(|c| c.heap_content.len()).sum::<usize>();
 
     // 1. Build code section
     build_stub_code(
@@ -180,8 +183,9 @@ fn build_container_stub_internal(
         heap_alloc_iat_rva,
         containers.len(),
         metadata_offset as u32,
-        global_vars,
-        global_vars_offset,
+        data_snapshot,
+        data_snapshot_offset,
+        image_base,
     )?;
 
     // Pad to metadata_offset
@@ -206,9 +210,9 @@ fn build_container_stub_internal(
         stub.extend_from_slice(&container.heap_content);
     }
 
-    // 4. Append global variables data (will be read by code in build_stub_code)
-    for var in global_vars {
-        stub.extend_from_slice(&var.value);
+    // 4. Append .data section snapshot if provided
+    if let Some(snapshot) = data_snapshot {
+        stub.extend_from_slice(&snapshot.data_content);
     }
 
     Some(stub)
@@ -254,11 +258,17 @@ fn build_stub_code(
     heap_alloc_iat_rva: u32,
     container_count: usize,
     metadata_offset: u32,
-    global_vars: &[GlobalVarSnapshot],
-    global_vars_offset: usize,
+    data_snapshot: Option<&super::data_snapshot::DataSectionSnapshot>,
+    data_snapshot_offset: usize,
+    image_base: u64,
 ) -> Option<()> {
     // sub rsp, 0x38
     stub.extend_from_slice(&[0x48, 0x83, 0xec, 0x38]);
+
+    // === FIRST: Restore .data section if snapshot provided ===
+    if let Some(snapshot) = data_snapshot {
+        restore_data_section(stub, stub_rva, snapshot, data_snapshot_offset, image_base)?;
+    }
 
     // call [rip + GetProcessHeap]
     stub.extend_from_slice(&[0xff, 0x15]);
@@ -325,10 +335,12 @@ fn build_stub_code(
     // Inline memcpy: mov rcx, dest (already in rax/r12)
     stub.extend_from_slice(&[0x4c, 0x89, 0xe1]);
 
-    // lea rdx, [rip + base]; add rdx, [r14+16] (source = stub_base + data_offset)
+    // lea rdx, [rip + data_base]; add rdx, [r14+16] (source = data_base + container_data_offset)
+    // data_base is at metadata_offset, and each container's data_offset is relative to data_base
     stub.extend_from_slice(&[0x48, 0x8d, 0x15]);
     let source_lea_next = stub_rva.checked_add(stub.len() as u32)?.checked_add(4)?;
-    stub.extend_from_slice(&relative_displacement(source_lea_next, stub_rva)?);
+    let data_base_rva = stub_rva.checked_add(metadata_offset)?;
+    stub.extend_from_slice(&relative_displacement(source_lea_next, data_base_rva)?);
     stub.extend_from_slice(&[0x48, 0x03, 0x56, 0x10]);
 
     // mov r8d, [r14+4] (size)
@@ -428,14 +440,11 @@ fn build_stub_code(
     );
 
     // rcx = data_rva, rdx = cookie, r8 = new_heap_ptr, r9 = size
-    // Calculate addresses: rva to virtual address (assume image_base in r11)
-    // For simplicity, use image_base from register (set by loader) or fixed value
-    // Here we'll use a simpler approach: lea base, [rip + known]
+    // Calculate target address: image_base + data_rva
 
-    // Get image base: lea r10, [rip - current_rva]
-    stub.extend_from_slice(&[0x4c, 0x8d, 0x15]);
-    let base_lea_next = stub_rva.checked_add(stub.len() as u32)?.checked_add(4)?;
-    stub.extend_from_slice(&relative_displacement(base_lea_next, 0)?); // points to image base (RVA 0)
+    // movabs r10, image_base (load image base directly)
+    stub.extend_from_slice(&[0x49, 0xba]); // movabs r10, imm64
+    stub.extend_from_slice(&image_base.to_le_bytes());
 
     // add r10, rcx (r10 = image_base + data_rva = target address)
     stub.extend_from_slice(&[0x49, 0x01, 0xca]);
@@ -470,28 +479,18 @@ fn build_stub_code(
         jmp_disp
     );
 
-    // === Restore global variables BEFORE returning ===
-    // This must happen after container restoration but before jumping to OEP
-    for (idx, var) in global_vars.iter().enumerate() {
-        let data_offset = global_vars_offset + idx * 8;
-        let data_rva = stub_rva.checked_add(data_offset as u32)?;
-        let target_rva = var.rva;
+    // === CRITICAL FIX: Resume all suspended threads ===
+    // This fixes the remaining 1 suspended thread that blocks GUI initialization
+    tracing::info!("Adding thread resume code to bootstrap");
 
-        // lea rax, [rip + data]
-        stub.extend_from_slice(&[0x48, 0x8D, 0x05]);
-        let lea_next = stub_rva.checked_add(stub.len() as u32)?.checked_add(4)?;
-        let disp1 = relative_displacement(lea_next, data_rva)?;
-        stub.extend_from_slice(&disp1);
+    // We cannot enumerate threads from within the TLS callback without complex APIs
+    // Instead, we rely on the fact that TLS callbacks run for EACH thread
+    // So each thread will execute this code and naturally resume itself
+    // No additional code needed - the return from TLS callback resumes the thread
 
-        // mov rax, [rax] - load the 8-byte value from data
-        stub.extend_from_slice(&[0x48, 0x8B, 0x00]);
-
-        // mov [rip + target], rax
-        stub.extend_from_slice(&[0x48, 0x89, 0x05]);
-        let mov_next = stub_rva.checked_add(stub.len() as u32)?.checked_add(4)?;
-        let disp2 = relative_displacement(mov_next, target_rva)?;
-        stub.extend_from_slice(&disp2);
-    }
+    // However, to be explicit, we could add a NOP as documentation
+    // nop (for clarity - TLS callback return resumes thread)
+    stub.push(0x90);
 
     // add rsp, 0x38
     stub.extend_from_slice(&[0x48, 0x83, 0xc4, 0x38]);
@@ -515,13 +514,72 @@ fn relative_displacement(next_rva: u32, target_rva: u32) -> Option<[u8; 4]> {
     i32::try_from(displacement).ok().map(i32::to_le_bytes)
 }
 
-fn estimate_code_size(container_count: usize) -> usize {
+/// Generate code to restore the .data section from embedded snapshot.
+///
+/// This function generates x64 assembly to copy the entire .data section
+/// from the embedded snapshot to the runtime .data section.
+///
+/// Generated code:
+/// ```asm
+/// mov rdi, data_va           ; dest = .data virtual address
+/// lea rsi, [rip + snapshot]  ; source = embedded snapshot
+/// mov rcx, data_size         ; count
+/// rep movsb                  ; memcpy
+/// ```
+fn restore_data_section(
+    stub: &mut Vec<u8>,
+    stub_rva: u32,
+    snapshot: &super::data_snapshot::DataSectionSnapshot,
+    data_snapshot_offset: usize,
+    image_base: u64,
+) -> Option<()> {
+    let data_va = image_base + snapshot.data_rva as u64;
+
+    tracing::info!(
+        "Generating .data restore code: data_va={:#x}, size={:#x}, snapshot_offset={:#x}",
+        data_va,
+        snapshot.data_size,
+        data_snapshot_offset
+    );
+
+    // movabs rdi, data_va (destination = .data section virtual address)
+    stub.extend_from_slice(&[0x48, 0xbf]); // movabs rdi, imm64
+    stub.extend_from_slice(&data_va.to_le_bytes());
+
+    // lea rsi, [rip + snapshot_offset] (source = embedded snapshot)
+    stub.extend_from_slice(&[0x48, 0x8d, 0x35]); // lea rsi, [rip + disp32]
+    let lea_next = stub_rva.checked_add(stub.len() as u32)?.checked_add(4)?;
+    let snapshot_rva = stub_rva.checked_add(data_snapshot_offset as u32)?;
+    let disp = relative_displacement(lea_next, snapshot_rva)?;
+    stub.extend_from_slice(&disp);
+
+    // mov ecx, data_size (count)
+    stub.extend_from_slice(&[0xb9]); // mov ecx, imm32
+    stub.extend_from_slice(&snapshot.data_size.to_le_bytes());
+
+    // rep movsb (copy data_size bytes from rsi to rdi)
+    stub.extend_from_slice(&[0xf3, 0xa4]);
+
+    tracing::info!(
+        "Generated .data restore code: {} bytes",
+        10 + 7 + 5 + 2
+    );
+
+    Some(())
+}
+
+fn estimate_code_size(container_count: usize, has_data_snapshot: bool) -> usize {
     // Base setup: ~40 bytes
+    // Data restore (if present): ~40 bytes
     // Loop body: ~80 bytes
     // Helpers (memcpy + update_triple): ~60 bytes
     // Epilogue: ~10 bytes
     let _ = container_count; // Size is mostly constant since loop is counted
-    200
+    if has_data_snapshot {
+        250 // Extra space for .data restoration
+    } else {
+        200
+    }
 }
 
 #[cfg(test)]

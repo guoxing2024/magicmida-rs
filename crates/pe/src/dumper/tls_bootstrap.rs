@@ -86,12 +86,14 @@ pub(crate) fn install_tls_callback_bootstrap(
 
     // Note: We use a dummy OEP for bootstrap since it won't jump anywhere
     // (TLS callbacks just return)
+    // TODO: global_vars are detected but not yet used - need to implement global var restoration
     let boot_stub = match super::container_bootstrap::build_tls_bootstrap_stub(
         boot_rva,
         get_process_heap_iat_rva,
         heap_alloc_iat_rva,
         containers,
-        global_vars,
+        None, // data_snapshot - not using full .data restoration for now
+        image_base,
     ) {
         Some(stub) => stub,
         None => {
