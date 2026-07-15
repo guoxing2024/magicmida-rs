@@ -52,6 +52,12 @@ pub enum Command {
         /// Path to the known-good reference file.
         reference: PathBuf,
     },
+
+    /// Display help information.
+    Help,
+
+    /// Display version information.
+    Version,
 }
 
 // ---------------------------------------------------------------------------
@@ -68,15 +74,23 @@ pub fn parse_args() -> Result<Command, String> {
     let args: Vec<String> = std::env::args().collect();
 
     if args.len() < 2 {
-        return Err("No command specified. Use /unpack or /dump-process.".into());
+        return Ok(Command::Help);
     }
 
     match args[1].as_str() {
+        // Help variants
+        "-h" | "--help" | "/?" | "help" => Ok(Command::Help),
+
+        // Version variants
+        "-V" | "--version" | "version" => Ok(Command::Version),
+
+        // Main commands
         "/unpack" | "--unpack" | "unpack" => parse_unpack(&args),
         "/dump-process" | "--dump-process" | "dump-process" => parse_dump_process(&args),
         "/verify" | "--verify" | "verify" => parse_verify(&args),
+
         other => Err(format!(
-            "Unknown command '{}'. Use /unpack, /dump-process, or /verify.",
+            "Unknown command '{}'. Use --help for usage information.",
             other
         )),
     }

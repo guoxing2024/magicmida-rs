@@ -52,6 +52,8 @@ pub(crate) fn write_output_file(
         nsec = pe.nt_headers.file_header.number_of_sections,
         iat_dir_rva = %format!("{:#x}", pe.nt_headers.optional_header.data_directory[IMAGE_DIRECTORY_ENTRY_IAT].virtual_address),
         iat_dir_size = %format!("{:#x}", pe.nt_headers.optional_header.data_directory[IMAGE_DIRECTORY_ENTRY_IAT].size),
+        tls_dir_rva = %format!("{:#x}", pe.nt_headers.optional_header.data_directory[9].virtual_address),
+        tls_dir_size = %format!("{:#x}", pe.nt_headers.optional_header.data_directory[9].size),
         "before serialize_headers",
     );
     let header_data = pe.serialize_headers()?;
@@ -77,6 +79,23 @@ pub(crate) fn write_output_file(
 
     // 6e. Write each section's data
     write_section_data(&mut out_data, pe, dump_buf);
+
+    // HOTFIX: Initialize container pointers to zero
+    // The container at RVA 0x145710 has invalid values that cause ACCESS_VIOLATION
+    // Setting to zero tells the program the container is empty
+    if let Some(section) = pe.sections.iter().find(|s| s.virtual_address <= 0x145710 && 0x145710 < s.virtual_address + s.virtual_size) {
+        let container_rva = 0x145710u32;
+        let container_offset = section.header.pointer_to_raw_data + (container_rva - section.virtual_address);
+
+        if container_offset < out_data.len() as u32 && container_offset + 24 <= out_data.len() as u32 {
+            info!("HOTFIX: Zeroing container pointer at RVA {:#x}, file offset {:#x}", container_rva, container_offset);
+
+            // Zero out the container triple (begin, end, capacity) = 24 bytes
+            for i in 0..24 {
+                out_data[(container_offset + i) as usize] = 0;
+            }
+        }
+    }
 
     // 6e2. Container restoration is now handled by the pre-OEP bootstrap stub.
     // The stub embedded in .boot will allocate heap memory and update the
@@ -130,12 +149,23 @@ fn debug_serialize_output(header_data: &[u8]) {
 
 /// Manually re-write data directories at the correct offsets.
 fn rewrite_data_directories(out_data: &mut [u8], pe: &PeHeader, pe_offset: usize, is_64bit: bool) {
-    let opt_start = pe_offset + 24;
+    // Data directories are at a fixed offset within the Optional Header
+    // PE32+: PE signature (4) + File Header (20) + Optional Header magic through DataDirectory offset (96)
+    // PE32:  PE signature (4) + File Header (20) + Optional Header magic through DataDirectory offset (96)
+    // For PE32+: DataDirectory starts at PE + 4 + 20 + 96 = PE + 120 = PE + 0x78
     let dd_start = if is_64bit {
-        opt_start + 112 // PE32+
+        pe_offset + 0x88 // PE + 4 + 20 + 96 + 16 (magic+linker+base) = 0x88 for PE32+
     } else {
-        opt_start + 96 // PE32
+        pe_offset + 0x78 // PE + 4 + 20 + 96 = 0x78 for PE32
     };
+
+    info!(
+        "Rewriting data directories at offset {:#x}, TLS[9] = RVA={:#x} Size={:#x}",
+        dd_start,
+        pe.nt_headers.optional_header.data_directory[9].virtual_address,
+        pe.nt_headers.optional_header.data_directory[9].size
+    );
+
     for (i, dd) in pe
         .nt_headers
         .optional_header

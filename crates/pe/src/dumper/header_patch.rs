@@ -229,7 +229,12 @@ fn compact_section_vas(pe: &mut PeHeader, removed_ranges: &[(u32, u32)], removed
         "Reserved",
     ];
     // Clear data directory entries that point into removed sections.
+    // EXCEPT for TLS Directory (index 9) - we will recreate it later if needed.
     for dir_idx in 0..pe.nt_headers.optional_header.data_directory.len() {
+        if dir_idx == 9 {
+            // Skip TLS Directory - will be recreated by install_heap_bootstrap if containers detected
+            continue;
+        }
         let dd_va = pe.nt_headers.optional_header.data_directory[dir_idx].virtual_address;
         let dd_size = pe.nt_headers.optional_header.data_directory[dir_idx].size;
         if dd_va == 0 || dd_size == 0 {

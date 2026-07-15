@@ -29,6 +29,7 @@ mod container_bootstrap;
 mod container_snapshot;
 mod data_reinit;
 mod dump_process;
+mod global_vars;
 mod header_patch;
 mod heap_bootstrap;
 mod helpers;
@@ -41,6 +42,7 @@ mod sections;
 mod serialize;
 #[cfg(test)]
 mod tests;
+mod tls_bootstrap;
 mod types;
 
 // Re-export public API

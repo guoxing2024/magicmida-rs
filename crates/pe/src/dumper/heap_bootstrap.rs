@@ -36,24 +36,52 @@ pub(crate) fn install_heap_bootstrap(
     imports: &ImportTableBuilder,
     original_entry_point: u32,
     containers: &[ContainerSnapshot],
+    debugger: Option<&mut dyn mida_core::DebuggerCore>,
 ) -> Option<u32> {
     if !pe.is_64bit {
         return None;
     }
 
-    let bootstrap = detect_heap_bootstrap(pe, dump_buf, imports)?;
-
-    // If we have containers, use the full container restoration bootstrap
+    // If we have containers, use TLS callback approach (correct timing)
     if !containers.is_empty() {
+        let get_process_heap_iat_rva = find_import_rva(imports, "GetProcessHeap")?;
         let heap_alloc_iat_rva = find_import_rva(imports, "HeapAlloc")?;
-        return super::container_bootstrap::install_container_bootstrap(
+
+        info!(
+            "TLS bootstrap IAT addresses: GetProcessHeap={:#x}, HeapAlloc={:#x}",
+            get_process_heap_iat_rva, heap_alloc_iat_rva
+        );
+
+        // Detect critical global variables from OEP
+        let critical_rvas = super::global_vars::detect_critical_vars_from_oep(
+            pe,
+            dump_buf,
+            original_entry_point,
+            50,
+        );
+
+        info!("Detected {} critical variables from OEP", critical_rvas.len());
+
+        // Capture runtime values if debugger available
+        let global_vars = if let Some(dbg) = debugger {
+            super::global_vars::detect_global_vars(pe, dbg, &critical_rvas, 8)
+        } else {
+            warn!("No debugger provided - cannot capture runtime values for global vars");
+            vec![]
+        };
+
+        return super::tls_bootstrap::install_tls_callback_bootstrap(
             pe,
             containers,
-            bootstrap.get_process_heap_iat_rva,
+            &global_vars,
+            get_process_heap_iat_rva,
             heap_alloc_iat_rva,
             original_entry_point,
         );
     }
+
+    // For non-container cases, try to detect heap bootstrap
+    let bootstrap = detect_heap_bootstrap(pe, dump_buf, imports)?;
 
     // Otherwise use the simple heap bootstrap
     let section_idx = pe.create_section_index(".boot", 0x200);

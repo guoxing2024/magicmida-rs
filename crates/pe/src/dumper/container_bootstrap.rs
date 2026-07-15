@@ -38,6 +38,7 @@ use tracing::{info, warn};
 use crate::header::PeHeader;
 
 use super::container_snapshot::ContainerSnapshot;
+use crate::dumper::global_vars::GlobalVarSnapshot;
 
 const IMAGE_SCN_CNT_CODE: u32 = 0x0000_0020;
 const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
@@ -117,6 +118,24 @@ pub(crate) fn install_container_bootstrap(
     Some(stub_rva)
 }
 
+/// Build bootstrap stub for TLS callback (no jump to OEP, just returns).
+pub(crate) fn build_tls_bootstrap_stub(
+    stub_rva: u32,
+    get_process_heap_iat_rva: u32,
+    heap_alloc_iat_rva: u32,
+    containers: &[ContainerSnapshot],
+    global_vars: &[super::global_vars::GlobalVarSnapshot],
+) -> Option<Vec<u8>> {
+    build_container_stub_internal(
+        stub_rva,
+        None,
+        get_process_heap_iat_rva,
+        heap_alloc_iat_rva,
+        containers,
+        global_vars,
+    )
+}
+
 /// Build the complete bootstrap: stub code + metadata + heap snapshots.
 fn build_container_stub(
     stub_rva: u32,
@@ -125,12 +144,32 @@ fn build_container_stub(
     heap_alloc_iat_rva: u32,
     containers: &[ContainerSnapshot],
 ) -> Option<Vec<u8>> {
+    build_container_stub_internal(
+        stub_rva,
+        Some(original_entry_point),
+        get_process_heap_iat_rva,
+        heap_alloc_iat_rva,
+        containers,
+        &[],
+    )
+}
+
+/// Internal builder supporting both entry-point and TLS callback modes.
+fn build_container_stub_internal(
+    stub_rva: u32,
+    original_entry_point: Option<u32>,
+    get_process_heap_iat_rva: u32,
+    heap_alloc_iat_rva: u32,
+    containers: &[ContainerSnapshot],
+    global_vars: &[super::global_vars::GlobalVarSnapshot],
+) -> Option<Vec<u8>> {
     let mut stub = Vec::new();
 
     // Calculate offsets
     let code_size = estimate_code_size(containers.len());
     let metadata_offset = code_size;
     let data_base_offset = metadata_offset + containers.len() * CONTAINER_METADATA_SIZE;
+    let global_vars_offset = data_base_offset + containers.iter().map(|c| c.heap_content.len()).sum::<usize>();
 
     // 1. Build code section
     build_stub_code(
@@ -141,6 +180,8 @@ fn build_container_stub(
         heap_alloc_iat_rva,
         containers.len(),
         metadata_offset as u32,
+        global_vars,
+        global_vars_offset,
     )?;
 
     // Pad to metadata_offset
@@ -149,10 +190,7 @@ fn build_container_stub(
     // 2. Build metadata array
     let mut current_data_offset = data_base_offset;
     for container in containers {
-        let heap_size = container
-            .decoded_end
-            .saturating_sub(container.decoded_begin);
-
+        let heap_size = container.decoded_end.saturating_sub(container.decoded_begin);
         stub.extend_from_slice(&container.rva.to_le_bytes());
         stub.extend_from_slice(&(heap_size as u32).to_le_bytes());
         stub.extend_from_slice(&container.cookie.to_le_bytes());
@@ -160,7 +198,6 @@ fn build_container_stub(
         stub.extend_from_slice(&[0u8; 4]); // reserved
         stub.extend_from_slice(&[0u8; 8]); // pad
         stub.extend_from_slice(&[0u8; 8]); // pad
-
         current_data_offset += container.heap_content.len();
     }
 
@@ -169,9 +206,10 @@ fn build_container_stub(
         stub.extend_from_slice(&container.heap_content);
     }
 
-    // Pad to 4K alignment
-    let aligned_size = crate::utils::align_up(stub.len() as u32, 0x1000) as usize;
-    stub.resize(aligned_size, 0xcc);
+    // 4. Append global variables data (will be read by code in build_stub_code)
+    for var in global_vars {
+        stub.extend_from_slice(&var.value);
+    }
 
     Some(stub)
 }
@@ -211,11 +249,13 @@ fn build_container_stub(
 fn build_stub_code(
     stub: &mut Vec<u8>,
     stub_rva: u32,
-    original_entry_point: u32,
+    original_entry_point: Option<u32>,
     get_process_heap_iat_rva: u32,
     heap_alloc_iat_rva: u32,
     container_count: usize,
     metadata_offset: u32,
+    global_vars: &[GlobalVarSnapshot],
+    global_vars_offset: usize,
 ) -> Option<()> {
     // sub rsp, 0x38
     stub.extend_from_slice(&[0x48, 0x83, 0xec, 0x38]);
@@ -223,7 +263,14 @@ fn build_stub_code(
     // call [rip + GetProcessHeap]
     stub.extend_from_slice(&[0xff, 0x15]);
     let call_next = stub_rva.checked_add(stub.len() as u32)?.checked_add(4)?;
-    stub.extend_from_slice(&relative_displacement(call_next, get_process_heap_iat_rva)?);
+    let gph_disp = relative_displacement(call_next, get_process_heap_iat_rva)?;
+    tracing::debug!(
+        "GetProcessHeap call: next_rva={:#x}, target_iat={:#x}, displacement={:#x}",
+        call_next,
+        get_process_heap_iat_rva,
+        i32::from_le_bytes(gph_disp)
+    );
+    stub.extend_from_slice(&gph_disp);
 
     // mov r15, rax (save heap handle)
     stub.extend_from_slice(&[0x49, 0x89, 0xc7]);
@@ -252,8 +299,17 @@ fn build_stub_code(
 
     // call [rip + HeapAlloc]
     stub.extend_from_slice(&[0xff, 0x15]);
+    let alloc_call_offset_in_stub = stub.len();
     let alloc_call_next = stub_rva.checked_add(stub.len() as u32)?.checked_add(4)?;
-    stub.extend_from_slice(&relative_displacement(alloc_call_next, heap_alloc_iat_rva)?);
+    let heap_alloc_disp = relative_displacement(alloc_call_next, heap_alloc_iat_rva)?;
+    tracing::debug!(
+        "HeapAlloc call: next_rva={:#x}, target_iat={:#x}, displacement={:#x}, offset_in_stub={}",
+        alloc_call_next,
+        heap_alloc_iat_rva,
+        i32::from_le_bytes(heap_alloc_disp),
+        alloc_call_offset_in_stub
+    );
+    stub.extend_from_slice(&heap_alloc_disp);
 
     // test rax, rax
     stub.extend_from_slice(&[0x48, 0x85, 0xc0]);
@@ -316,20 +372,29 @@ fn build_stub_code(
     let loop_disp = -((loop_end - loop_start + 2) as i8);
     stub.extend_from_slice(&[0x75, loop_disp as u8]);
 
-    // add rsp, 0x38
-    stub.extend_from_slice(&[0x48, 0x83, 0xc4, 0x38]);
+    // === Helper functions come BEFORE epilogue ===
+    // This ensures they don't get executed in normal flow
 
-    // jmp original_entry_point
-    stub.push(0xe9);
-    let jmp_next = stub_rva.checked_add(stub.len() as u32)?.checked_add(4)?;
-    stub.extend_from_slice(&relative_displacement(jmp_next, original_entry_point)?);
+    // Jump over helper functions to global vars restoration
+    stub.push(0xeb); // jmp short
+    let jmp_over_helpers_offset = stub.len();
+    stub.push(0x00); // placeholder - will be patched
 
     // === Helper functions ===
 
     // inline_memcpy: simple rep movsb
     let memcpy_start = stub.len();
+    // CRITICAL FIX: memcpy_offset was captured BEFORE the jmp instruction was added
+    // We need to account for the 2-byte jmp that's now between the call and the target
     let memcpy_rel = ((memcpy_start - memcpy_offset - 4) as i32).to_le_bytes();
     stub[memcpy_offset..memcpy_offset + 4].copy_from_slice(&memcpy_rel);
+
+    tracing::debug!(
+        "memcpy_offset={}, memcpy_start={}, displacement={}",
+        memcpy_offset,
+        memcpy_start,
+        i32::from_le_bytes(memcpy_rel)
+    );
 
     // push rdi, rsi
     stub.extend_from_slice(&[0x57, 0x56]);
@@ -346,6 +411,13 @@ fn build_stub_code(
     let update_start = stub.len();
     let update_rel = ((update_start - update_offset - 4) as i32).to_le_bytes();
     stub[update_offset..update_offset + 4].copy_from_slice(&update_rel);
+
+    tracing::debug!(
+        "update_offset={}, update_start={}, displacement={}",
+        update_offset,
+        update_start,
+        i32::from_le_bytes(update_rel)
+    );
 
     // rcx = data_rva, rdx = cookie, r8 = new_heap_ptr, r9 = size
     // Calculate addresses: rva to virtual address (assume image_base in r11)
@@ -376,6 +448,56 @@ fn build_stub_code(
 
     // ret
     stub.push(0xc3);
+
+    // === Patch jump over helpers ===
+    let after_helpers = stub.len();
+    let jmp_disp = (after_helpers - jmp_over_helpers_offset - 1) as u8;
+    stub[jmp_over_helpers_offset] = jmp_disp;
+
+    tracing::info!(
+        "Bootstrap code layout: loop_end={}, jmp_over_at={}, helpers_end={}, jmp_disp={}",
+        loop_end,
+        jmp_over_helpers_offset - 1,
+        after_helpers,
+        jmp_disp
+    );
+
+    // === Restore global variables BEFORE returning ===
+    // This must happen after container restoration but before jumping to OEP
+    for (idx, var) in global_vars.iter().enumerate() {
+        let data_offset = global_vars_offset + idx * 8;
+        let data_rva = stub_rva.checked_add(data_offset as u32)?;
+        let target_rva = var.rva;
+
+        // lea rax, [rip + data]
+        stub.extend_from_slice(&[0x48, 0x8D, 0x05]);
+        let lea_next = stub_rva.checked_add(stub.len() as u32)?.checked_add(4)?;
+        let disp1 = relative_displacement(lea_next, data_rva)?;
+        stub.extend_from_slice(&disp1);
+
+        // mov rax, [rax] - load the 8-byte value from data
+        stub.extend_from_slice(&[0x48, 0x8B, 0x00]);
+
+        // mov [rip + target], rax
+        stub.extend_from_slice(&[0x48, 0x89, 0x05]);
+        let mov_next = stub_rva.checked_add(stub.len() as u32)?.checked_add(4)?;
+        let disp2 = relative_displacement(mov_next, target_rva)?;
+        stub.extend_from_slice(&disp2);
+    }
+
+    // add rsp, 0x38
+    stub.extend_from_slice(&[0x48, 0x83, 0xc4, 0x38]);
+
+    // Epilogue depends on mode
+    if let Some(oep) = original_entry_point {
+        // Entry-point mode: jmp original_entry_point
+        stub.push(0xe9);
+        let jmp_next = stub_rva.checked_add(stub.len() as u32)?.checked_add(4)?;
+        stub.extend_from_slice(&relative_displacement(jmp_next, oep)?);
+    } else {
+        // TLS callback mode: ret
+        stub.push(0xc3);
+    }
 
     Some(())
 }

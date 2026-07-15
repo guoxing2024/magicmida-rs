@@ -24,5 +24,9 @@ pub fn run_command(cmd: Command) -> Result<(), anyhow::Error> {
             unpacked,
             reference,
         } => crate::unpacker::verify_unpacked(&unpacked, &reference),
+        Command::Help | Command::Version => {
+            // These commands are handled in main.rs before dispatch.
+            unreachable!("Help and Version commands should be handled before run_command")
+        }
     }
 }

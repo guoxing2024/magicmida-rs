@@ -1,0 +1,9 @@
+# Cargo configuration for magicmida-rs
+# Explicitly specify MSVC linker to avoid Git Bash /usr/bin/link.exe conflict
+
+[target.x86_64-pc-windows-msvc]
+linker = "C:\\Program Files\\Microsoft Visual Studio\\2022\\Professional\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\link.exe"
+
+[build]
+# Use all available CPU cores for parallel compilation
+jobs = 8

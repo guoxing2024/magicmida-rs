@@ -363,6 +363,7 @@ pub fn dump_process(
                 builder,
                 opts.entry_point,
                 &containers,
+                Some(debugger),
             )
         })
         .unwrap_or(opts.entry_point);

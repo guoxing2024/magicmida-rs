@@ -40,6 +40,21 @@ pub struct ContainerSnapshot {
     pub heap_content: Vec<u8>,
 }
 
+/// Snapshot of a non-container global variable that needs runtime initialization.
+///
+/// These are regular variables (not SecurityCookie-encoded containers) that are
+/// decrypted/initialized by the unpacker at runtime. Examples include CRT globals,
+/// static initializers, or application state that Themida encrypts in the packed file.
+#[derive(Debug, Clone)]
+pub struct GlobalVarSnapshot {
+    /// RVA in `.data` where the variable is stored.
+    pub rva: u32,
+    /// Size of the variable in bytes.
+    pub size: usize,
+    /// Runtime value from live process.
+    pub value: Vec<u8>,
+}
+
 /// Detect SecurityCookie-encoded containers in zero-raw `.data` sections that
 /// point to live heap memory outside the image. Reads the heap content from
 /// the live process via debugger API.
