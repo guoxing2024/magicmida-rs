@@ -79,26 +79,31 @@ pub(crate) fn create_pdata_section(
     let mut dropped = 0usize;
     for i in 0..num_entries {
         let off = i * entry_size;
-        let begin_rva = u32::from_le_bytes(exc_data[off..off+4].try_into().unwrap_or([0;4]));
-        let end_rva = u32::from_le_bytes(exc_data[off+4..off+8].try_into().unwrap_or([0;4]));
-        let unwind_rva = u32::from_le_bytes(exc_data[off+8..off+12].try_into().unwrap_or([0;4]));
+        let begin_rva = u32::from_le_bytes(exc_data[off..off + 4].try_into().unwrap_or([0; 4]));
+        let end_rva = u32::from_le_bytes(exc_data[off + 4..off + 8].try_into().unwrap_or([0; 4]));
+        let unwind_rva =
+            u32::from_le_bytes(exc_data[off + 8..off + 12].try_into().unwrap_or([0; 4]));
         // Keep entry only if all RVAs fall within a known section.
         let valid = [begin_rva, end_rva, unwind_rva].iter().all(|&rva| {
-            rva == 0 || pe.sections.iter().any(|s| {
-                let va = s.header.virtual_address;
-                let vs = s.header.virtual_size;
-                va != 0 && rva >= va && rva < va + vs
-            })
+            rva == 0
+                || pe.sections.iter().any(|s| {
+                    let va = s.header.virtual_address;
+                    let vs = s.header.virtual_size;
+                    va != 0 && rva >= va && rva < va + vs
+                })
         });
         if valid {
-            filtered.extend_from_slice(&exc_data[off..off+entry_size]);
+            filtered.extend_from_slice(&exc_data[off..off + entry_size]);
             kept += 1;
         } else {
             dropped += 1;
         }
     }
     if dropped > 0 {
-        info!("Filtered exception table: kept {} entries, dropped {} (referenced deleted sections)", kept, dropped);
+        info!(
+            "Filtered exception table: kept {} entries, dropped {} (referenced deleted sections)",
+            kept, dropped
+        );
     }
     let exc_data = filtered;
     let exc_len = exc_data.len();
@@ -117,8 +122,7 @@ pub(crate) fn create_pdata_section(
     const IMAGE_SCN_CNT_INITIALIZED_DATA_PD: u32 = 0x0000_0040;
     pe.sections[pdata_idx].characteristics =
         IMAGE_SCN_MEM_READ_PD | IMAGE_SCN_CNT_INITIALIZED_DATA_PD;
-    pe.sections[pdata_idx].header.characteristics =
-        pe.sections[pdata_idx].characteristics;
+    pe.sections[pdata_idx].header.characteristics = pe.sections[pdata_idx].characteristics;
 
     // Pad raw data to alignment and store as extra_data.
     let mut padded = exc_data;
@@ -143,10 +147,7 @@ pub(crate) fn create_pdata_section(
         };
     info!(
         "Created .pdata section idx={} VA={:#x} size={:#x} (raw={:#x}); Exception dir restored",
-        pdata_idx,
-        pe.sections[pdata_idx].virtual_address,
-        exc_len,
-        raw_size
+        pdata_idx, pe.sections[pdata_idx].virtual_address, exc_len, raw_size
     );
 }
 
@@ -172,8 +173,7 @@ pub(crate) fn create_reloc_section(pe: &mut PeHeader) {
     const IMAGE_SCN_MEM_DISCARDABLE: u32 = 0x0200_0000;
     pe.sections[reloc_idx].characteristics =
         IMAGE_SCN_MEM_READ_R | IMAGE_SCN_CNT_INITIALIZED_DATA_R | IMAGE_SCN_MEM_DISCARDABLE;
-    pe.sections[reloc_idx].header.characteristics =
-        pe.sections[reloc_idx].characteristics;
+    pe.sections[reloc_idx].header.characteristics = pe.sections[reloc_idx].characteristics;
 
     // Zero-filled raw data placeholder.
     pe.sections[reloc_idx].extra_data = Some(vec![0u8; reloc_raw as usize]);
@@ -194,9 +194,6 @@ pub(crate) fn create_reloc_section(pe: &mut PeHeader) {
         };
     info!(
         "Created .reloc section idx={} VA={:#x} vsize={:#x} raw={:#x}",
-        reloc_idx,
-        pe.sections[reloc_idx].virtual_address,
-        reloc_vsize,
-        reloc_raw
+        reloc_idx, pe.sections[reloc_idx].virtual_address, reloc_vsize, reloc_raw
     );
 }

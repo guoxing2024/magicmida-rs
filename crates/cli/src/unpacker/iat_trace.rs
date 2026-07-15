@@ -15,8 +15,8 @@ use windows::Win32::System::Memory::{
 use mida_core::{ContinueStatus, DebuggerCore};
 use mida_packers_themida::{trace_is_at_api, TraceStepDecision};
 
+use super::session::{get_thread_context_control, set_thread_context_control, ProcessSession};
 use crate::log::{self, LogType};
-use super::session::{ProcessSession, get_thread_context_control, set_thread_context_control};
 
 // ---------------------------------------------------------------------------
 // IatTraceState
@@ -117,7 +117,13 @@ pub(super) fn handle_trace_step(
     trace.trace_counter += 1;
 
     if trace.trace_counter > TRACE_LIMIT {
-        log::log(LogType::Info, &format!("Giving up trace slot {} due to instruction limit ({}/{})", trace.current_slot, trace.trace_counter, TRACE_LIMIT));
+        log::log(
+            LogType::Info,
+            &format!(
+                "Giving up trace slot {} due to instruction limit ({}/{})",
+                trace.current_slot, trace.trace_counter, TRACE_LIMIT
+            ),
+        );
         trace.failed_count += 1;
         trace.failed_slots.push(trace.current_slot);
         advance_to_next_slot(dbg, trace)?;
@@ -125,7 +131,10 @@ pub(super) fn handle_trace_step(
     }
 
     if trace.trace_counter.is_multiple_of(5000) {
-        log::log(LogType::Info, &format!("Trace step {} (limit {})", trace.trace_counter, TRACE_LIMIT));
+        log::log(
+            LogType::Info,
+            &format!("Trace step {} (limit {})", trace.trace_counter, TRACE_LIMIT),
+        );
     }
 
     let ctx = get_thread_context_control(dbg, trace.trace_thread_id)?;
@@ -133,11 +142,21 @@ pub(super) fn handle_trace_step(
     let sp = ctx.Rsp as usize;
 
     if trace.trace_counter.is_multiple_of(50000) {
-        log::log(LogType::Info, &format!("Trace step {}: IP={:#x}, SP={:#x}", trace.trace_counter, ip, sp));
+        log::log(
+            LogType::Info,
+            &format!(
+                "Trace step {}: IP={:#x}, SP={:#x}",
+                trace.trace_counter, ip, sp
+            ),
+        );
     }
 
     let is_vm_entry = is_at_themida_vm(dbg as &mut dyn DebuggerCore, ip);
-    let (sleep_api, lstrlen_api) = dbg.apis.as_ref().map(|a| (a.sleep, a.lstrlen)).unwrap_or((0, 0));
+    let (sleep_api, lstrlen_api) = dbg
+        .apis
+        .as_ref()
+        .map(|a| (a.sleep, a.lstrlen))
+        .unwrap_or((0, 0));
 
     let mut ret_addr = 0usize;
     if sp < trace.trace_start_sp {
@@ -167,14 +186,20 @@ pub(super) fn handle_trace_step(
             handle_trace_result(dbg, trace)?;
             Ok(())
         }
-        TraceStepDecision::SkipAntiTraceApi { ip: api_ip, ret_addr: target_ip } => {
+        TraceStepDecision::SkipAntiTraceApi {
+            ip: api_ip,
+            ret_addr: target_ip,
+        } => {
             let mut new_ctx = ctx;
             new_ctx.Rip = target_ip as u64;
             new_ctx.Rsp += 8;
             new_ctx.EFlags |= 0x100;
             set_thread_context_control(dbg, trace.trace_thread_id, &new_ctx)?;
             dbg.continue_event(trace.trace_thread_id, ContinueStatus::Continue)?;
-            log::log(LogType::Info, &format!("Skipping anti-trace API at {api_ip:#x}"));
+            log::log(
+                LogType::Info,
+                &format!("Skipping anti-trace API at {api_ip:#x}"),
+            );
             Ok(())
         }
         TraceStepDecision::FoundApi { ip: api_ip } => {
@@ -196,7 +221,10 @@ pub(super) fn handle_trace_step(
 // handle_trace_result
 // ---------------------------------------------------------------------------
 
-fn handle_trace_result(dbg: &mut ProcessSession, trace: &mut IatTraceState) -> Result<(), anyhow::Error> {
+fn handle_trace_result(
+    dbg: &mut ProcessSession,
+    trace: &mut IatTraceState,
+) -> Result<(), anyhow::Error> {
     if trace.trace_in_vm {
         if !trace.did_set_exit_process {
             trace.did_set_exit_process = true;
@@ -212,7 +240,10 @@ fn handle_trace_result(dbg: &mut ProcessSession, trace: &mut IatTraceState) -> R
             };
             trace.slot_values[trace.current_slot] = real_exit_process;
             trace.resolved_count += 1;
-            log::log(LogType::Good, &format!("IAT[{}] VM → ExitProcess", trace.current_slot));
+            log::log(
+                LogType::Good,
+                &format!("IAT[{}] VM → ExitProcess", trace.current_slot),
+            );
         } else {
             trace.failed_count += 1;
             trace.failed_slots.push(trace.current_slot);
@@ -225,7 +256,10 @@ fn handle_trace_result(dbg: &mut ProcessSession, trace: &mut IatTraceState) -> R
         }
         trace.slot_values[trace.current_slot] = api;
         trace.resolved_count += 1;
-        log::log(LogType::Good, &format!("IAT[{}] → {api:#x}", trace.current_slot));
+        log::log(
+            LogType::Good,
+            &format!("IAT[{}] → {api:#x}", trace.current_slot),
+        );
     } else {
         trace.failed_count += 1;
         trace.failed_slots.push(trace.current_slot);
@@ -240,7 +274,10 @@ fn handle_trace_result(dbg: &mut ProcessSession, trace: &mut IatTraceState) -> R
 
 /// Advance to the next IAT slot that needs tracing, or write the resolved
 /// IAT back to the target if all slots are done.
-pub(super) fn advance_to_next_slot(dbg: &mut ProcessSession, trace: &mut IatTraceState) -> Result<(), anyhow::Error> {
+pub(super) fn advance_to_next_slot(
+    dbg: &mut ProcessSession,
+    trace: &mut IatTraceState,
+) -> Result<(), anyhow::Error> {
     trace.current_slot += 1;
     trace.traced_api = 0;
     trace.trace_in_vm = false;
@@ -249,7 +286,8 @@ pub(super) fn advance_to_next_slot(dbg: &mut ProcessSession, trace: &mut IatTrac
     while trace.current_slot < trace.total_slots {
         let current = trace.slot_values[trace.current_slot];
         let in_themida = current >= trace.themida_start && current < trace.themida_end;
-        let is_real_api = current >= 0x10000 && !in_themida
+        let is_real_api = current >= 0x10000
+            && !in_themida
             && !(current >= trace.image_base && current < trace.image_boundary);
 
         // Skip null terminators - they're normal IAT structure, not trash
@@ -289,7 +327,13 @@ pub(super) fn advance_to_next_slot(dbg: &mut ProcessSession, trace: &mut IatTrac
     }
 
     if trace.current_slot >= trace.total_slots {
-        log::log(LogType::Good, &format!("IAT trace complete: {} resolved, {} failed", trace.resolved_count, trace.failed_count));
+        log::log(
+            LogType::Good,
+            &format!(
+                "IAT trace complete: {} resolved, {} failed",
+                trace.resolved_count, trace.failed_count
+            ),
+        );
         if trace.resolved_count > 0 {
             let write_size = trace.total_slots * std::mem::size_of::<usize>();
             let mut old_protect = PAGE_PROTECTION_FLAGS::default();
@@ -327,27 +371,45 @@ pub(super) fn advance_to_next_slot(dbg: &mut ProcessSession, trace: &mut IatTrac
     }
 
     let current = trace.slot_values[trace.current_slot];
-    log::log(LogType::Info, &format!("Tracing IAT slot {} from {current:#x}", trace.current_slot));
+    log::log(
+        LogType::Info,
+        &format!("Tracing IAT slot {} from {current:#x}", trace.current_slot),
+    );
 
     let mut ctx = match get_thread_context_control(dbg, trace.trace_thread_id) {
         Ok(ctx) => ctx,
         Err(e) => {
-            log::log(LogType::Fatal, &format!("get_thread_context_control failed: {e} - skipping slot"));
+            log::log(
+                LogType::Fatal,
+                &format!("get_thread_context_control failed: {e} - skipping slot"),
+            );
             trace.failed_count += 1;
             trace.failed_slots.push(trace.current_slot);
             trace.current_slot += 1;
             return advance_to_next_slot(dbg, trace);
         }
     };
-    log::log(LogType::Info, &format!("Got thread context (CONTROL), RIP={:#x}", ctx.Rip));
+    log::log(
+        LogType::Info,
+        &format!("Got thread context (CONTROL), RIP={:#x}", ctx.Rip),
+    );
 
     ctx.Rip = current as u64;
     ctx.Rsp = trace.trace_start_sp as u64;
     ctx.EFlags |= 0x100;
 
-    log::log(LogType::Info, &format!("Setting thread context: RIP={current:#x}, RSP={:#x}", ctx.Rsp));
+    log::log(
+        LogType::Info,
+        &format!(
+            "Setting thread context: RIP={current:#x}, RSP={:#x}",
+            ctx.Rsp
+        ),
+    );
     if let Err(e) = set_thread_context_control(dbg, trace.trace_thread_id, &ctx) {
-        log::log(LogType::Fatal, &format!("set_thread_context_control failed: {e} - skipping slot"));
+        log::log(
+            LogType::Fatal,
+            &format!("set_thread_context_control failed: {e} - skipping slot"),
+        );
         trace.failed_count += 1;
         trace.failed_slots.push(trace.current_slot);
         trace.current_slot += 1;
@@ -356,7 +418,10 @@ pub(super) fn advance_to_next_slot(dbg: &mut ProcessSession, trace: &mut IatTrac
     trace.trace_phase = TracePhase::Tracing;
     log::log(LogType::Info, "Thread context set, continuing...");
     if let Err(e) = dbg.continue_event(trace.trace_thread_id, ContinueStatus::Continue) {
-        log::log(LogType::Fatal, &format!("continue_event failed: {e} - aborting tracing"));
+        log::log(
+            LogType::Fatal,
+            &format!("continue_event failed: {e} - aborting tracing"),
+        );
         trace.current_slot = trace.total_slots;
         return Ok(());
     }

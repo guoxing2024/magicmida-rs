@@ -25,19 +25,23 @@
 //! `IMAGE_IMPORT_DESCRIPTOR` entries, the hint/name table, and the resolved IAT.
 
 // Submodules
-mod helpers;
-mod types;
-mod serialize;
-mod remote_modules;
-mod import_rebuild;
-mod header_patch;
-mod sections;
-mod import_section;
-mod output_writer;
+mod container_bootstrap;
+mod container_snapshot;
+mod data_reinit;
 mod dump_process;
+mod header_patch;
+mod heap_bootstrap;
+mod helpers;
+mod import_rebuild;
+mod import_section;
 mod original_imports;
+mod output_writer;
+mod remote_modules;
+mod sections;
+mod serialize;
 #[cfg(test)]
 mod tests;
+mod types;
 
 // Re-export public API
 pub use self::dump_process::{dump_dotnet, dump_process};
@@ -45,4 +49,4 @@ pub use self::helpers::is_dotnet;
 pub use self::import_rebuild::rebuild_import_table;
 pub use self::original_imports::get_original_imports;
 pub use self::remote_modules::take_module_snapshot;
-pub use self::types::{DumpOptions, RemoteModule};
+pub use self::types::{DumpOptions, EarlySectionSnapshot, RemoteModule};

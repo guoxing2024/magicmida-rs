@@ -7,12 +7,11 @@ use std::path::Path;
 use tracing::{debug, info};
 
 use crate::header::PeHeader;
-use crate::import_table::{
-    ImportTableBuilder, ImportThunk,
-    IMAGE_ORDINAL_FLAG32, IMAGE_ORDINAL_FLAG64,
-};
+use crate::import_table::{ImportTableBuilder, ImportThunk};
 
-use super::helpers::{section_rva_to_file_offset, IMAGE_DIRECTORY_ENTRY_IAT, IMAGE_DIRECTORY_ENTRY_IMPORT};
+use super::helpers::{
+    section_rva_to_file_offset, IMAGE_DIRECTORY_ENTRY_IAT, IMAGE_DIRECTORY_ENTRY_IMPORT,
+};
 use super::types::DumpOptions;
 
 /// Build an import table from the original PE file's .idata section.
@@ -94,12 +93,26 @@ pub(crate) fn write_resolved_addresses_to_iat(
     let iat_slots_offset: usize = {
         let desc_count = builder.modules.len() + 1;
         let desc_size: u32 = desc_count as u32 * 20;
-        let dll_names_size: u32 = builder.modules.iter().map(|m| m.name.len() as u32 + 1).sum();
-        let hint_names_size: u32 = builder.modules.iter().map(|m| {
-            m.thunks.iter().map(|t| {
-                t.function_name.as_ref().map(|n| 2 + n.len() as u32 + 1).unwrap_or(0)
-            }).sum::<u32>()
-        }).sum();
+        let dll_names_size: u32 = builder
+            .modules
+            .iter()
+            .map(|m| m.name.len() as u32 + 1)
+            .sum();
+        let hint_names_size: u32 = builder
+            .modules
+            .iter()
+            .map(|m| {
+                m.thunks
+                    .iter()
+                    .map(|t| {
+                        t.function_name
+                            .as_ref()
+                            .map(|n| 2 + n.len() as u32 + 1)
+                            .unwrap_or(0)
+                    })
+                    .sum::<u32>()
+            })
+            .sum();
         (desc_size + dll_names_size + hint_names_size) as usize
     };
 
@@ -147,14 +160,15 @@ pub(crate) fn create_import_section(
     let section_va = pe.sections[section_idx].virtual_address;
     debug!("[import_builder] local section_va={:#x}", section_va);
 
-    let (section_data, thunks) =
-        builder.build_import_section_no_iat(section_va, original_iat_rva);
+    let (section_data, thunks) = builder.build_import_section_no_iat(section_va, original_iat_rva);
     let import_thunks = thunks;
 
     let section_data_len = section_data.len();
     let file_align = {
         let mut fa = pe.nt_headers.optional_header.file_alignment;
-        if !fa.is_power_of_two() || fa < 0x200 { fa = 0x200; }
+        if !fa.is_power_of_two() || fa < 0x200 {
+            fa = 0x200;
+        }
         fa
     };
     let raw_size = std::cmp::max(
@@ -177,15 +191,19 @@ pub(crate) fn create_import_section(
     }
     pe.sections[section_idx].extra_data = Some(padded_section_data);
 
-    let import_dir_size = builder.module_count() * 20;
+    let import_dir_size = builder
+        .emitted_descriptor_count()
+        .saturating_mul(crate::import_table::IMPORT_DESCRIPTOR_SIZE);
     pe.nt_headers.optional_header.data_directory[IMAGE_DIRECTORY_ENTRY_IMPORT] =
         crate::header::ImageDataDirectory {
             virtual_address: section_va,
             size: import_dir_size as u32,
         };
-    debug!("[import_data_dir] post-set IMPORT data_dir: va={:#x} sz={:#x}",
+    debug!(
+        "[import_data_dir] post-set IMPORT data_dir: va={:#x} sz={:#x}",
         pe.nt_headers.optional_header.data_directory[IMAGE_DIRECTORY_ENTRY_IMPORT].virtual_address,
-        pe.nt_headers.optional_header.data_directory[IMAGE_DIRECTORY_ENTRY_IMPORT].size);
+        pe.nt_headers.optional_header.data_directory[IMAGE_DIRECTORY_ENTRY_IMPORT].size
+    );
 
     // Write Import Lookup Table (Hint/Name RVAs) to the original IAT region.
     write_iat_lookup_to_dump_buf(
@@ -235,72 +253,27 @@ pub(crate) fn create_import_section(
 /// Write Hint/Name RVAs into the dump buffer at each thunk's IAT address.
 fn write_iat_lookup_to_dump_buf(
     dump_buf: &mut [u8],
-    builder: &ImportTableBuilder,
+    _builder: &ImportTableBuilder,
     import_thunks: &[u64],
     original_iat_rva: u32,
-    _is_64bit: bool,
+    is_64bit: bool,
 ) {
-    let ptr_size = std::mem::size_of::<usize>();
-    let mut max_iat_rva = original_iat_rva;
-    let mut thunk_idx = 0;
-
-    for module in &builder.modules {
-        let mut module_max_iat_rva = original_iat_rva;
-        debug!("Writing module '{}' with {} thunks", module.name, module.thunks.len());
-
-        for (ti, thunk) in module.thunks.iter().enumerate() {
-            let iat_rva = thunk.iat_address;
-            if ti < 3 || ti >= module.thunks.len().saturating_sub(3) {
-                debug!("Thunk {}: IAT RVA {:#x}", ti, iat_rva);
-            }
-            if iat_rva > max_iat_rva { max_iat_rva = iat_rva; }
-            if iat_rva > module_max_iat_rva { module_max_iat_rva = iat_rva; }
-
-            let offset = iat_rva as usize;
-            if offset + ptr_size <= dump_buf.len() {
-                let value: u64 = if let Some(ord) = thunk.ordinal {
-                    if thunk.is_64bit {
-                        IMAGE_ORDINAL_FLAG64 | (ord as u64)
-                    } else {
-                        (IMAGE_ORDINAL_FLAG32 | (ord as u32)) as u64
-                    }
-                } else if thunk_idx < import_thunks.len() {
-                    import_thunks[thunk_idx]
-                } else {
-                    0
-                };
-
-                if ptr_size == 8 {
-                    let bytes = value.to_le_bytes();
-                    dump_buf[offset..offset + 8].copy_from_slice(&bytes);
-                } else {
-                    let bytes = (value as u32).to_le_bytes();
-                    dump_buf[offset..offset + 4].copy_from_slice(&bytes);
-                }
-                thunk_idx += 1;
-            }
+    let ptr_size = if is_64bit { 8 } else { 4 };
+    for (index, &value) in import_thunks.iter().enumerate() {
+        let offset = original_iat_rva as usize + index * ptr_size;
+        if offset + ptr_size > dump_buf.len() {
+            break;
         }
-
-        // Write null terminator
-        if thunk_idx < import_thunks.len() && import_thunks[thunk_idx] == 0 {
-            let null_rva = module_max_iat_rva + ptr_size as u32;
-            let null_offset = null_rva as usize;
-            debug!("Writing null terminator at RVA {:#x} for module '{}'", null_rva, module.name);
-            if null_offset + ptr_size <= dump_buf.len() {
-                if ptr_size == 8 {
-                    dump_buf[null_offset..null_offset + 8].fill(0);
-                } else {
-                    dump_buf[null_offset..null_offset + 4].fill(0);
-                }
-                if null_rva > max_iat_rva { max_iat_rva = null_rva; }
-            }
-            thunk_idx += 1;
+        if is_64bit {
+            dump_buf[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+        } else {
+            dump_buf[offset..offset + 4].copy_from_slice(&(value as u32).to_le_bytes());
         }
     }
 
     info!(
         iat_rva = format_args!("{original_iat_rva:#x}"),
-        thunks = thunk_idx,
+        thunks = import_thunks.len(),
         "Writing Import Lookup Table to IAT region"
     );
 }
@@ -311,12 +284,18 @@ fn compute_max_iat_rva(builder: &ImportTableBuilder, original_iat_rva: u32, ptr_
     for module in &builder.modules {
         let mut module_max = original_iat_rva;
         for thunk in &module.thunks {
-            if thunk.iat_address > max_iat_rva { max_iat_rva = thunk.iat_address; }
-            if thunk.iat_address > module_max { module_max = thunk.iat_address; }
+            if thunk.iat_address > max_iat_rva {
+                max_iat_rva = thunk.iat_address;
+            }
+            if thunk.iat_address > module_max {
+                module_max = thunk.iat_address;
+            }
         }
         // Account for null terminator
         let null_rva = module_max + ptr_size;
-        if null_rva > max_iat_rva { max_iat_rva = null_rva; }
+        if null_rva > max_iat_rva {
+            max_iat_rva = null_rva;
+        }
     }
     max_iat_rva
 }

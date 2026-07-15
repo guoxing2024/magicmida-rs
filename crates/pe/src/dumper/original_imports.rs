@@ -20,8 +20,7 @@ pub fn get_original_imports(file_path: &Path) -> Result<Vec<String>, PeError> {
     let data = std::fs::read(file_path)?;
     let pe = PeHeader::from_bytes(&data)?;
 
-    let import_dir =
-        pe.nt_headers.optional_header.data_directory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    let import_dir = pe.nt_headers.optional_header.data_directory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     if import_dir.virtual_address == 0 || import_dir.size == 0 {
         return Ok(Vec::new());
     }
@@ -48,10 +47,13 @@ pub fn get_original_imports(file_path: &Path) -> Result<Vec<String>, PeError> {
         }
 
         // Read Name field (offset +12 in descriptor)
-        let name_rva = section_data.get(desc_off + 12..desc_off + 16)
+        let name_rva = section_data
+            .get(desc_off + 12..desc_off + 16)
             .and_then(|s| s.try_into().ok())
             .map(u32::from_le_bytes)
-            .ok_or(PeError::Parse("Failed to read import descriptor name RVA".into()))?;
+            .ok_or(PeError::Parse(
+                "Failed to read import descriptor name RVA".into(),
+            ))?;
 
         if name_rva == 0 {
             break; // End of descriptor array
@@ -69,15 +71,15 @@ pub fn get_original_imports(file_path: &Path) -> Result<Vec<String>, PeError> {
                 .iter()
                 .position(|&b| b == 0)
                 .unwrap_or(256);
-            let dll_name =
-                String::from_utf8_lossy(
-                    &data[name_section_start + name_in_section
-                        ..name_section_start + name_in_section + name_end],
-                )
-                .to_lowercase();
+            let dll_name = String::from_utf8_lossy(
+                &data[name_section_start + name_in_section
+                    ..name_section_start + name_in_section + name_end],
+            )
+            .to_lowercase();
 
             // Read FirstThunk to enumerate functions
-            let first_thunk_rva = section_data.get(desc_off + 16..desc_off + 20)
+            let first_thunk_rva = section_data
+                .get(desc_off + 16..desc_off + 20)
                 .and_then(|s| s.try_into().ok())
                 .map(u32::from_le_bytes)
                 .ok_or(PeError::Parse("Failed to read FirstThunk RVA".into()))?;

@@ -5,8 +5,8 @@
 use tracing::{debug, info};
 
 use crate::error::PeError;
-use crate::utils::align_up;
 use crate::header::PeHeader;
+use crate::utils::align_up;
 
 use super::helpers::IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE;
 use super::types::DumpOptions;
@@ -37,7 +37,8 @@ pub(crate) fn validate_and_patch_pe_header(
         if let Ok(bytes) = std::fs::read(ep) {
             if let Ok(disk_pe) = PeHeader::from_bytes(&bytes) {
                 // Merge disk values where they look valid.
-                if disk_pe.nt_headers.file_header.characteristics & IMAGE_FILE_EXECUTABLE_IMAGE != 0 {
+                if disk_pe.nt_headers.file_header.characteristics & IMAGE_FILE_EXECUTABLE_IMAGE != 0
+                {
                     pe.nt_headers.file_header.characteristics =
                         disk_pe.nt_headers.file_header.characteristics;
                 }
@@ -77,12 +78,33 @@ pub(crate) fn validate_and_patch_pe_header(
 /// their raw_size is zero (Themida compresses disk data).
 fn is_nonstandard_themida_section(s: &crate::header::PeSection) -> bool {
     const STANDARD: &[&str] = &[
-        ".text", ".rdata", ".data", ".pdata", ".rsrc", ".reloc",
-        ".bss", ".tls", ".CRT", ".idata", ".textbss", ".init",
-        ".fini", ".plt", ".got", ".gotplt",
-        ".gfids", ".giats", ".gehcont", ".00cfg",
-        ".volatilemetadata", ".xtbl", "BSS", "CODE", "DATA",
-        ".minicrt", ".msvcinit",
+        ".text",
+        ".rdata",
+        ".data",
+        ".pdata",
+        ".rsrc",
+        ".reloc",
+        ".bss",
+        ".tls",
+        ".CRT",
+        ".idata",
+        ".textbss",
+        ".init",
+        ".fini",
+        ".plt",
+        ".got",
+        ".gotplt",
+        ".gfids",
+        ".giats",
+        ".gehcont",
+        ".00cfg",
+        ".volatilemetadata",
+        ".xtbl",
+        "BSS",
+        "CODE",
+        "DATA",
+        ".minicrt",
+        ".msvcinit",
     ];
     if STANDARD.contains(&s.name.as_str()) {
         return false;
@@ -95,11 +117,17 @@ fn is_nonstandard_themida_section(s: &crate::header::PeSection) -> bool {
     let has_write = s.characteristics & 0x80000000 != 0;
     let large_vsize = s.virtual_size > 0x10000;
     // Themida code sections: executable with large virtual size.
-    if has_execute && large_vsize { return true; }
+    if has_execute && large_vsize {
+        return true;
+    }
     // Themida IAT sections: writable, non-standard name, not .data.
-    if has_write && s.name != ".data" { return true; }
+    if has_write && s.name != ".data" {
+        return true;
+    }
     // Themida memory-only sections: zero raw size with large virtual size.
-    if s.raw_size == 0 && s.virtual_size > 0x10000 { return true; }
+    if s.raw_size == 0 && s.virtual_size > 0x10000 {
+        return true;
+    }
     false
 }
 
@@ -122,7 +150,9 @@ pub(crate) fn shrink_sections(pe: &mut PeHeader) -> Option<(u32, u32)> {
     let mut removed_ranges: Vec<(u32, u32)> = Vec::new();
     let mut i = pe.sections.len();
     loop {
-        if i == 0 { break; }
+        if i == 0 {
+            break;
+        }
         i -= 1;
         let should_delete = {
             let s = &pe.sections[i];
@@ -158,8 +188,11 @@ pub(crate) fn shrink_sections(pe: &mut PeHeader) -> Option<(u32, u32)> {
             removed_ranges.push((removed_va, removed_va + removed_vs));
 
             pe.sections.remove(i);
-            pe.nt_headers.file_header.number_of_sections =
-                pe.nt_headers.file_header.number_of_sections.saturating_sub(1);
+            pe.nt_headers.file_header.number_of_sections = pe
+                .nt_headers
+                .file_header
+                .number_of_sections
+                .saturating_sub(1);
             removed += 1;
         }
     }
@@ -178,9 +211,22 @@ pub(crate) fn shrink_sections(pe: &mut PeHeader) -> Option<(u32, u32)> {
 /// and clear dangling data-directory entries.
 fn compact_section_vas(pe: &mut PeHeader, removed_ranges: &[(u32, u32)], removed: usize) {
     let dir_names = [
-        "Export", "Import", "Resource", "Exception", "Certificate",
-        "BaseReloc", "Debug", "Arch", "GlobalPtr", "TLS",
-        "LoadConfig", "BoundImport", "IAT", "DelayImport", "CLR", "Reserved",
+        "Export",
+        "Import",
+        "Resource",
+        "Exception",
+        "Certificate",
+        "BaseReloc",
+        "Debug",
+        "Arch",
+        "GlobalPtr",
+        "TLS",
+        "LoadConfig",
+        "BoundImport",
+        "IAT",
+        "DelayImport",
+        "CLR",
+        "Reserved",
     ];
     // Clear data directory entries that point into removed sections.
     for dir_idx in 0..pe.nt_headers.optional_header.data_directory.len() {
@@ -232,24 +278,33 @@ fn compact_section_vas(pe: &mut PeHeader, removed_ranges: &[(u32, u32)], removed
                     number_of_relocations: 0,
                     number_of_linenumbers: 0,
                     // Read + Initialized Data (BSS-like, no raw data)
-                    characteristics: 0xc000_0040,  // READ | WRITE | INITIALIZED_DATA
+                    characteristics: 0xc000_0040, // READ | WRITE | INITIALIZED_DATA
                 },
                 name: ".fill".to_string(),
                 virtual_address: prev_end,
                 virtual_size: gap_size,
                 raw_offset: 0,
                 raw_size: 0,
-                characteristics: 0xc000_0040,  // READ | WRITE | INITIALIZED_DATA
+                characteristics: 0xc000_0040, // READ | WRITE | INITIALIZED_DATA
                 extra_data: None,
             };
             pe.sections.insert(i, filler);
-            pe.nt_headers.file_header.number_of_sections =
-                pe.nt_headers.file_header.number_of_sections.saturating_add(1);
-            info!("Filled VA gap: .fill VA=0x{:X} VS=0x{:X}", prev_end, gap_size);
+            pe.nt_headers.file_header.number_of_sections = pe
+                .nt_headers
+                .file_header
+                .number_of_sections
+                .saturating_add(1);
+            info!(
+                "Filled VA gap: .fill VA=0x{:X} VS=0x{:X}",
+                prev_end, gap_size
+            );
         }
         i += 1;
     }
-    info!("Shrink complete: removed {} sections (gaps filled)", removed);
+    info!(
+        "Shrink complete: removed {} sections (gaps filled)",
+        removed
+    );
 }
 
 /// Compact section VAs to eliminate gaps left by removed sections,
@@ -295,9 +350,22 @@ pub(crate) fn compact_and_shift(pe: &mut PeHeader, dump_buf: &mut [u8]) {
 
     // Remap data directory RVAs that point into shifted sections.
     let dir_names = [
-        "Export", "Import", "Resource", "Exception", "Certificate",
-        "BaseReloc", "Debug", "Arch", "GlobalPtr", "TLS",
-        "LoadConfig", "BoundImport", "IAT", "DelayImport", "CLR", "Reserved",
+        "Export",
+        "Import",
+        "Resource",
+        "Exception",
+        "Certificate",
+        "BaseReloc",
+        "Debug",
+        "Arch",
+        "GlobalPtr",
+        "TLS",
+        "LoadConfig",
+        "BoundImport",
+        "IAT",
+        "DelayImport",
+        "CLR",
+        "Reserved",
     ];
     for dir_idx in 0..pe.nt_headers.optional_header.data_directory.len() {
         let dd_va = pe.nt_headers.optional_header.data_directory[dir_idx].virtual_address;
@@ -332,7 +400,10 @@ pub(crate) fn compact_and_shift(pe: &mut PeHeader, dump_buf: &mut [u8]) {
     let rsrc_dir = pe.nt_headers.optional_header.data_directory[IMAGE_DIRECTORY_ENTRY_RESOURCE];
     if rsrc_dir.virtual_address != 0 && rsrc_dir.size != 0 {
         // Find the remap for .rsrc.
-        if let Some(&(_old_rsrc_va, _new_rsrc_va)) = va_remaps.iter().find(|&&(ov, _)| ov == rsrc_dir.virtual_address) {
+        if let Some(&(_old_rsrc_va, _new_rsrc_va)) = va_remaps
+            .iter()
+            .find(|&&(ov, _)| ov == rsrc_dir.virtual_address)
+        {
             // Wait — the data directory was already remapped above, so
             // rsrc_dir.virtual_address is now the NEW va.  We need the OLD va.
             // Use the remap in reverse: find the entry whose new_va == current rsrc VA.
@@ -341,16 +412,21 @@ pub(crate) fn compact_and_shift(pe: &mut PeHeader, dump_buf: &mut [u8]) {
         // any section that was moved and contains resource data.
         for &(old_va, new_va) in &va_remaps {
             let delta = new_va as i64 - old_va as i64;
-            if delta == 0 { continue; }
+            if delta == 0 {
+                continue;
+            }
             let old_end = old_va + rsrc_dir.size; // approximate
-            // Scan dump_buf for 4-byte values in [old_va, old_end) and shift them.
+                                                  // Scan dump_buf for 4-byte values in [old_va, old_end) and shift them.
             let scan_start = new_va as usize;
             let scan_end = (new_va as usize).saturating_add(rsrc_dir.size as usize);
             if scan_end <= dump_buf.len() {
                 let mut fixed = 0u32;
                 for off in (scan_start..scan_end - 3).step_by(4) {
                     let val = u32::from_le_bytes([
-                        dump_buf[off], dump_buf[off + 1], dump_buf[off + 2], dump_buf[off + 3],
+                        dump_buf[off],
+                        dump_buf[off + 1],
+                        dump_buf[off + 2],
+                        dump_buf[off + 3],
                     ]);
                     if val >= old_va && val < old_end {
                         let new_val = (val as i64 + delta) as u32;
@@ -359,7 +435,10 @@ pub(crate) fn compact_and_shift(pe: &mut PeHeader, dump_buf: &mut [u8]) {
                     }
                 }
                 if fixed > 0 {
-                    info!("Fixed {} resource data RVAs in section at {:#x}", fixed, new_va);
+                    info!(
+                        "Fixed {} resource data RVAs in section at {:#x}",
+                        fixed, new_va
+                    );
                 }
             }
             break; // Only process the .rsrc section

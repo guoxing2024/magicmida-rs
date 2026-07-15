@@ -244,7 +244,7 @@ pub fn trace_imports(
         if debugger.get_thread_context(main_thread_id).is_err() {
             log(
                 LogMsgType::Info,
-                &"Debug session ended — skipping remaining IAT slots".to_string(),
+                "Debug session ended — skipping remaining IAT slots",
             );
             break;
         }

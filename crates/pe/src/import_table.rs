@@ -117,35 +117,50 @@ impl ImportTableBuilder {
     ) -> (Vec<u8>, Vec<u64>) {
         let ptr_size = iat_slot_size(self.is_64bit);
 
+        // A PE import descriptor cannot contain a zero gap inside its thunk run:
+        // the loader treats the first zero as the terminator. Split each DLL's
+        // thunks into physically contiguous runs and emit one descriptor per run.
+        let mut runs: Vec<(&ImportModule, Vec<&ImportThunk>)> = Vec::new();
+        for module in &self.modules {
+            let mut current: Vec<&ImportThunk> = Vec::new();
+            for thunk in &module.thunks {
+                let contiguous = current.last().is_none_or(|previous| {
+                    previous.iat_address.saturating_add(ptr_size as u32) == thunk.iat_address
+                });
+                if !contiguous {
+                    runs.push((module, std::mem::take(&mut current)));
+                }
+                current.push(thunk);
+            }
+            if !current.is_empty() {
+                runs.push((module, current));
+            }
+        }
+
         // ---- Pass 1: compute sizes using INTERLEAVED layout ----
         // Layout: [descriptors][DLL0 name][DLL0 hints][DLL1 name][DLL1 hints]...
         // This matches Pascal Magicmida's layout.
-        let desc_count = self.modules.len() + 1; // + null terminator
+        let desc_count = runs.len() + 1; // + null terminator
         let desc_size = desc_count * IMPORT_DESCRIPTOR_SIZE;
 
-        // Collect hint/name entries per module and calculate each module's size.
-        let mut all_name_entries: Vec<Vec<(Option<String>, Option<u16>)>> = Vec::new();
-        let mut module_sizes: Vec<usize> = Vec::new(); // DLL name + hint/names for each module
-
-        for m in &self.modules {
-            let mut entries = Vec::new();
-            for t in &m.thunks {
-                entries.push((t.function_name.clone(), t.ordinal));
-            }
-
-            // Calculate this module's total size: DLL name + hint/names
-            // NOTE: No alignment needed (Pascal doesn't align)
-            let dll_name_size = m.name.len() + 1;
-            let hint_names_size: usize = entries.iter().map(|(name, _)| {
-                name.as_ref().map(|n| 2 + n.len() + 1).unwrap_or(0)
-            }).sum();
-            let module_total = dll_name_size + hint_names_size;
-
-            all_name_entries.push(entries);
-            module_sizes.push(module_total);
+        // Calculate each contiguous run's DLL-name and hint/name storage.
+        let mut run_sizes: Vec<usize> = Vec::new();
+        for (module, thunks) in &runs {
+            let dll_name_size = module.name.len() + 1;
+            let hint_names_size: usize = thunks
+                .iter()
+                .map(|thunk| {
+                    thunk
+                        .function_name
+                        .as_ref()
+                        .map(|name| 2 + name.len() + 1)
+                        .unwrap_or(0)
+                })
+                .sum();
+            run_sizes.push(dll_name_size + hint_names_size);
         }
 
-        let total_data_size: usize = module_sizes.iter().sum();
+        let total_data_size: usize = run_sizes.iter().sum();
         let total_size = desc_size + total_data_size;
         let mut data = vec![0u8; total_size];
 
@@ -153,28 +168,47 @@ impl ImportTableBuilder {
         let mut data_cursor = desc_size;
 
         let mut desc_offset: usize = 0;
-        let mut iat_offset: usize = 0; // byte offset within original IAT
-        let mut out_thunks: Vec<u64> = Vec::new();
+        let max_iat_rva = self
+            .modules
+            .iter()
+            .flat_map(|module| module.thunks.iter())
+            .map(|thunk| thunk.iat_address)
+            .max()
+            .unwrap_or(original_iat_rva);
+        let slot_count = max_iat_rva
+            .saturating_sub(original_iat_rva)
+            .checked_div(ptr_size as u32)
+            .unwrap_or(0) as usize
+            + 2;
+        let mut out_thunks = vec![0u64; slot_count];
 
-        debug!("desc_size={:#x}, total_data_size={:#x}, total_size={:#x}",
-                 desc_size, total_data_size, total_size);
+        debug!(
+            "desc_size={:#x}, total_data_size={:#x}, total_size={:#x}",
+            desc_size, total_data_size, total_size
+        );
         debug!("section_va={:#x}", section_va);
 
         // ---- Pass 2: Write data using INTERLEAVED layout ----
-        for (mi, m) in self.modules.iter().enumerate() {
+        for (run_index, (module, thunks)) in runs.iter().enumerate() {
             debug!(
-                "Module {}: {} ({} thunks) at offset {:#x}",
-                mi, m.name, m.thunks.len(), data_cursor
+                "Run {}: {} ({} thunks) at offset {:#x}",
+                run_index,
+                module.name,
+                thunks.len(),
+                data_cursor
             );
 
             // Write DLL name
             let dll_name_offset_in_section = data_cursor;
-            let name_bytes = m.name.as_bytes();
+            let name_bytes = module.name.as_bytes();
             data[data_cursor..data_cursor + name_bytes.len()].copy_from_slice(name_bytes);
             data_cursor += name_bytes.len() + 1; // +1 for null terminator
 
             let dll_name_rva = section_va + dll_name_offset_in_section as u32;
-            let module_ft_rva = original_iat_rva + iat_offset as u32;
+            let module_ft_rva = thunks
+                .first()
+                .map(|thunk| thunk.iat_address)
+                .unwrap_or(original_iat_rva);
 
             // Write descriptor
             data[desc_offset..desc_offset + 4].copy_from_slice(&0u32.to_le_bytes()); // OFT = 0
@@ -184,8 +218,10 @@ impl ImportTableBuilder {
             data[desc_offset + 16..desc_offset + 20].copy_from_slice(&module_ft_rva.to_le_bytes());
             desc_offset += IMPORT_DESCRIPTOR_SIZE;
 
-            // Write hint/name entries immediately after DLL name (INTERLEAVED!)
-            for (name, ord) in &all_name_entries[mi] {
+            // Write hint/name entries immediately after the DLL name.
+            for thunk in thunks {
+                let name = &thunk.function_name;
+                let ord = thunk.ordinal;
                 let hint_offset_in_section = data_cursor;
                 let slot_val: u64 = if let Some(ref name_str) = name {
                     let hnrva = section_va + hint_offset_in_section as u32;
@@ -200,24 +236,24 @@ impl ImportTableBuilder {
                     hnrva as u64
                 } else if let Some(ord_val) = ord {
                     if self.is_64bit {
-                        IMAGE_ORDINAL_FLAG64 | (*ord_val as u64)
+                        IMAGE_ORDINAL_FLAG64 | (ord_val as u64)
                     } else {
-                        (IMAGE_ORDINAL_FLAG32 | (*ord_val as u32)) as u64
+                        (IMAGE_ORDINAL_FLAG32 | (ord_val as u32)) as u64
                     }
                 } else {
                     0
                 };
-                out_thunks.push(slot_val);
+                let slot_index = thunk
+                    .iat_address
+                    .saturating_sub(original_iat_rva)
+                    .checked_div(ptr_size as u32)
+                    .unwrap_or(0) as usize;
+                if let Some(slot) = out_thunks.get_mut(slot_index) {
+                    *slot = slot_val;
+                }
             }
 
-            // NO null terminator in the hint/name table (Pascal style)
-            // data_cursor += ptr_size;  // <-- REMOVED!
-
-            // Null terminator for this module's IAT
-            out_thunks.push(0);
-            // Advance IAT offset past this module's IAT slots (thunks + null)
-            let iat_slot_count = all_name_entries[mi].len() + 1;
-            iat_offset += iat_slot_count * ptr_size;
+            // The next physical slot is already zero and terminates this module.
         }
 
         (data, out_thunks)
@@ -315,16 +351,17 @@ impl ImportTableBuilder {
 
             // Write DLL name string
             let name_bytes = m.name.as_bytes();
-            data[dll_str_cursor..dll_str_cursor + name_bytes.len()]
-                .copy_from_slice(name_bytes);
+            data[dll_str_cursor..dll_str_cursor + name_bytes.len()].copy_from_slice(name_bytes);
             // Convert section offset to RVA by adding section_va
-            let dll_name_rva = section_va + strings_base + (dll_str_cursor - strings_base as usize) as u32;
+            let dll_name_rva =
+                section_va + strings_base + (dll_str_cursor - strings_base as usize) as u32;
             dll_str_cursor += name_bytes.len() + 1; // + null
 
             // Write descriptor
             // OriginalFirstThunk: we set to 0 (not used by the loader after
             // the PE is loaded — the IAT is authoritative).
-            let original_first_thunk_rva = section_va + ilt_base + (ilt_cursor - ilt_base as usize) as u32;
+            let original_first_thunk_rva =
+                section_va + ilt_base + (ilt_cursor - ilt_base as usize) as u32;
             let first_thunk_rva = section_va + iat_base + (iat_cursor - iat_base as usize) as u32;
 
             // Descriptor fields (20 bytes):
@@ -333,11 +370,11 @@ impl ImportTableBuilder {
             //   +8  ForwarderChain     (u32) — set to 0
             //   +12 Name               (u32) — RVA of DLL name
             //   +16 FirstThunk         (u32) — RVA of IAT for this module
-            data[desc_offset..desc_offset + 4].copy_from_slice(&original_first_thunk_rva.to_le_bytes());
+            data[desc_offset..desc_offset + 4]
+                .copy_from_slice(&original_first_thunk_rva.to_le_bytes());
             data[desc_offset + 4..desc_offset + 8].copy_from_slice(&0u32.to_le_bytes());
             data[desc_offset + 8..desc_offset + 12].copy_from_slice(&0u32.to_le_bytes());
-            data[desc_offset + 12..desc_offset + 16]
-                .copy_from_slice(&dll_name_rva.to_le_bytes());
+            data[desc_offset + 12..desc_offset + 16].copy_from_slice(&dll_name_rva.to_le_bytes());
             data[desc_offset + 16..desc_offset + 20]
                 .copy_from_slice(&first_thunk_rva.to_le_bytes());
 
@@ -347,8 +384,9 @@ impl ImportTableBuilder {
             for t in &m.thunks {
                 let slot_val: u64 = if let Some(ref name) = t.function_name {
                     // Point to hint/name entry
-                    let hnrva =
-                        section_va + strings_base + (hint_name_cursor - strings_base as usize) as u32;
+                    let hnrva = section_va
+                        + strings_base
+                        + (hint_name_cursor - strings_base as usize) as u32;
 
                     // Write hint (2 bytes, zero) then name
                     data[hint_name_cursor..hint_name_cursor + 2]
@@ -397,6 +435,30 @@ impl ImportTableBuilder {
         // Null terminator descriptor (already zero-initialised at desc_offset)
 
         (data, strings_base, iat_base)
+    }
+
+    /// Number of non-null import descriptors emitted by
+    /// [`Self::build_import_section_no_iat`]. A DLL contributes more than one
+    /// descriptor when its physical IAT slots contain gaps.
+    pub fn emitted_descriptor_count(&self) -> usize {
+        let ptr_size = iat_slot_size(self.is_64bit) as u32;
+        self.modules
+            .iter()
+            .map(|module| {
+                module
+                    .thunks
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, thunk)| {
+                        *index == 0
+                            || module.thunks[*index - 1]
+                                .iat_address
+                                .saturating_add(ptr_size)
+                                != thunk.iat_address
+                    })
+                    .count()
+            })
+            .sum()
     }
 
     /// Total number of thunks across all modules.
@@ -452,7 +514,11 @@ mod tests {
         // IAT: 2 pointers (1 thunk + null) * 4 = 8 bytes
         // ILT: 2 pointers (1 thunk + null) * 4 = 8 bytes (Import Lookup Table)
         // Total = 40 + 13 + 14 + 8 + 8 = 83
-        assert_eq!(data.len(), 83, "build_section_data creates full PE format with both IAT and ILT");
+        assert_eq!(
+            data.len(),
+            83,
+            "build_section_data creates full PE format with both IAT and ILT"
+        );
         assert_eq!(strings_base, 40);
 
         let expected_iat_base = 40 + 13 + 14; // 67
@@ -467,10 +533,49 @@ mod tests {
         assert_eq!(iat_rva, section_va + iat_base);
 
         // IAT slot should point to hint/name entry
-        let hn_rva =
-            u32::from_le_bytes(data[iat_base as usize..iat_base as usize + 4].try_into().unwrap_or([0; 4]));
+        let hn_rva = u32::from_le_bytes(
+            data[iat_base as usize..iat_base as usize + 4]
+                .try_into()
+                .unwrap_or([0; 4]),
+        );
         let expected_hn_rva = section_va + strings_base + 13; // after DLL name
         assert_eq!(hn_rva, expected_hn_rva);
+    }
+
+    #[test]
+    fn no_iat_builder_preserves_original_slot_rvas() {
+        let mut builder = ImportTableBuilder::new(true);
+        let first = builder.add_module("first.dll");
+        first.thunks.push(ImportThunk {
+            iat_address: 0x1000,
+            function_name: Some("First".into()),
+            ordinal: None,
+            is_64bit: true,
+        });
+        let second = builder.add_module("second.dll");
+        second.thunks.push(ImportThunk {
+            iat_address: 0x1100,
+            function_name: Some("Second".into()),
+            ordinal: None,
+            is_64bit: true,
+        });
+
+        let (section, thunks) = builder.build_import_section_no_iat(0x5000, 0x1000);
+
+        assert_eq!(builder.emitted_descriptor_count(), 2);
+        assert_eq!(
+            u32::from_le_bytes(section[16..20].try_into().unwrap()),
+            0x1000
+        );
+        assert_eq!(
+            u32::from_le_bytes(section[36..40].try_into().unwrap()),
+            0x1100
+        );
+        assert_eq!(thunks.len(), 34);
+        assert_ne!(thunks[0], 0);
+        assert!(thunks[1..32].iter().all(|&slot| slot == 0));
+        assert_ne!(thunks[32], 0);
+        assert_eq!(thunks[33], 0);
     }
 
     #[test]
@@ -487,8 +592,11 @@ mod tests {
         }
 
         let (data, _, iat_base) = builder.build_section_data(0x1000);
-        let slot =
-            u64::from_le_bytes(data[iat_base as usize..iat_base as usize + 8].try_into().unwrap_or([0; 8]));
+        let slot = u64::from_le_bytes(
+            data[iat_base as usize..iat_base as usize + 8]
+                .try_into()
+                .unwrap_or([0; 8]),
+        );
         assert_eq!(slot, IMAGE_ORDINAL_FLAG64 | 42);
     }
 

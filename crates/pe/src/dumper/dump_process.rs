@@ -12,16 +12,12 @@ use crate::header::PeHeader;
 use crate::original_imports::{read_original_import_table, resolve_imports_via_getprocaddress};
 
 use super::header_patch::{shrink_sections, validate_and_patch_pe_header};
-use super::helpers::{
-    make_memory_readable, IMAGE_DIRECTORY_ENTRY_IAT,
-};
+use super::helpers::{make_memory_readable, IMAGE_DIRECTORY_ENTRY_IAT};
 use super::import_rebuild::rebuild_import_table_complete;
-use super::import_section::{
-    build_import_table_from_original, create_import_section,
-};
+use super::import_section::{build_import_table_from_original, create_import_section};
 use super::output_writer::write_output_file;
 use super::sections::{create_pdata_section, create_reloc_section};
-use super::types::DumpOptions;
+use super::types::{DumpOptions, EarlySectionSnapshot};
 
 /// Dump a PE image from the target process into a file.
 ///
@@ -69,7 +65,13 @@ pub fn dump_process(
 
     // 2. Rebuild import table if requested
     let (iat_image, _iat_image_size, mut import_builder) = if opts.fix_imports {
-        rebuild_import_table_complete(debugger, &mut pe, opts.image_base, is_64bit, opts.iat_location)?
+        rebuild_import_table_complete(
+            debugger,
+            &mut pe,
+            opts.image_base,
+            is_64bit,
+            opts.iat_location,
+        )?
     } else {
         (Vec::new(), 0usize, None)
     };
@@ -82,7 +84,8 @@ pub fn dump_process(
     };
 
     // 2b. Magicmida fallback
-    let mut _resolved_imports: std::collections::HashMap<(String, String), usize> = std::collections::HashMap::new();
+    let mut _resolved_imports: std::collections::HashMap<(String, String), usize> =
+        std::collections::HashMap::new();
     if opts.fix_imports {
         let live_empty = import_builder.as_ref().is_none_or(|b| b.thunk_count() == 0);
         if live_empty {
@@ -111,7 +114,8 @@ pub fn dump_process(
                 for (dll, funcs) in &orig_imports {
                     for func in funcs {
                         if !func.starts_with('#') {
-                            func_to_dll.entry(func.clone())
+                            func_to_dll
+                                .entry(func.clone())
                                 .or_insert_with(|| dll.clone());
                         }
                     }
@@ -128,26 +132,24 @@ pub fn dump_process(
                         .iter()
                         .map(|m| m.name.to_lowercase())
                         .collect();
-                    has_missing = orig_imports.iter().any(|(dll, _)|
-                        !rebuilt_modules.contains(&dll.to_lowercase()) && !dll.is_empty());
+                    has_missing = orig_imports.iter().any(|(dll, _)| {
+                        !rebuilt_modules.contains(&dll.to_lowercase()) && !dll.is_empty()
+                    });
 
                     // Also check for misattributed functions: a function may
                     // be in the wrong module because Windows 10+ export
                     // forwarding causes pass2_vote to attribute it to the
                     // forwarding DLL instead of the real one (e.g. EnableWindow
                     // attributed to shlwapi.dll instead of user32.dll).
-                    has_misattributed = builder_ref
-                        .modules.iter()
-                        .any(|m| {
-                            m.thunks.iter().any(|t| {
-                                t.function_name.as_ref().is_some_and(|fname| {
-                                    func_to_dll.get(fname).is_some_and(|correct_dll| {
-                                        correct_dll.to_lowercase() != m.name.to_lowercase()
-                                    })
+                    has_misattributed = builder_ref.modules.iter().any(|m| {
+                        m.thunks.iter().any(|t| {
+                            t.function_name.as_ref().is_some_and(|fname| {
+                                func_to_dll.get(fname).is_some_and(|correct_dll| {
+                                    correct_dll.to_lowercase() != m.name.to_lowercase()
                                 })
                             })
-                        });
-
+                        })
+                    });
                 } else {
                     has_missing = false;
                     has_misattributed = false;
@@ -163,7 +165,8 @@ pub fn dump_process(
                             for (ti, thunk) in module.thunks.iter().enumerate() {
                                 if let Some(ref fname) = thunk.function_name {
                                     if let Some(correct_dll) = func_to_dll.get(fname) {
-                                        if correct_dll.to_lowercase() != module.name.to_lowercase() {
+                                        if correct_dll.to_lowercase() != module.name.to_lowercase()
+                                        {
                                             moves.push((mi, ti, correct_dll.clone()));
                                         }
                                     }
@@ -172,11 +175,14 @@ pub fn dump_process(
                         }
 
                         // Group moved thunks by correct DLL
-                        let mut new_modules: std::collections::HashMap<String, Vec<crate::import_table::ImportThunk>> =
-                            std::collections::HashMap::new();
+                        let mut new_modules: std::collections::HashMap<
+                            String,
+                            Vec<crate::import_table::ImportThunk>,
+                        > = std::collections::HashMap::new();
                         for (mi, ti, dll) in &moves {
                             let thunk = &builder.modules[*mi].thunks[*ti];
-                            new_modules.entry(dll.clone())
+                            new_modules
+                                .entry(dll.clone())
                                 .or_default()
                                 .push(thunk.clone());
                         }
@@ -189,14 +195,20 @@ pub fn dump_process(
                         // Add new modules for moved thunks
                         for (dll, thunks) in new_modules {
                             // Check if module already exists
-                            let existing = builder.modules.iter()
+                            let existing = builder
+                                .modules
+                                .iter()
                                 .position(|m| m.name.to_lowercase() == dll.to_lowercase());
                             match existing {
                                 Some(idx) => {
                                     builder.modules[idx].thunks.extend(thunks);
                                 }
                                 None => {
-                                    info!("Added missing module '{}' with {} thunks", dll, thunks.len());
+                                    info!(
+                                        "Added missing module '{}' with {} thunks",
+                                        dll,
+                                        thunks.len()
+                                    );
                                     builder.modules.push(crate::import_table::ImportModule {
                                         name: dll,
                                         thunks,
@@ -215,6 +227,13 @@ pub fn dump_process(
                         );
                     }
                 }
+
+                // Do not replace live IAT sequences from the protected file's
+                // import descriptors. Themida can retain bootstrap descriptors
+                // that are not slot-for-slot equivalent to the decrypted IAT;
+                // inserting a missing name shifts every later FirstThunk and
+                // breaks fixed code references. Original imports are used only
+                // for module attribution above.
             }
         }
     }
@@ -227,9 +246,13 @@ pub fn dump_process(
                     for t in &m.thunks {
                         if let Some(ref name) = t.function_name {
                             let slot_offset = (t.iat_address as i64) - (original_iat_rva as i64);
-                            if slot_offset >= 0 && (slot_offset as usize) + std::mem::size_of::<usize>() <= iat_image.len() {
+                            if slot_offset >= 0
+                                && (slot_offset as usize) + std::mem::size_of::<usize>()
+                                    <= iat_image.len()
+                            {
                                 let addr = usize::from_le_bytes(
-                                    iat_image[slot_offset as usize..slot_offset as usize + std::mem::size_of::<usize>()]
+                                    iat_image[slot_offset as usize
+                                        ..slot_offset as usize + std::mem::size_of::<usize>()]
                                         .try_into()
                                         .unwrap_or([0u8; std::mem::size_of::<usize>()]),
                                 );
@@ -240,11 +263,17 @@ pub fn dump_process(
                         }
                     }
                 }
-                info!("Resolved {} API addresses from live IAT image", _resolved_imports.len());
+                info!(
+                    "Resolved {} API addresses from live IAT image",
+                    _resolved_imports.len()
+                );
             } else if let Some(ref ep) = opts.executable_path {
                 let imports = read_original_import_table(ep);
                 _resolved_imports = resolve_imports_via_getprocaddress(&imports);
-                info!("Resolved {} API addresses for IAT slots", _resolved_imports.len());
+                info!(
+                    "Resolved {} API addresses for IAT slots",
+                    _resolved_imports.len()
+                );
             }
         }
     }
@@ -252,10 +281,7 @@ pub fn dump_process(
     // 3. Sanitize PE header
     pe.sanitize();
 
-    info!(
-        size_of_image = pe.size_of_image(),
-        "Dumping process image"
-    );
+    info!(size_of_image = pe.size_of_image(), "Dumping process image");
 
     // 4. Read the full dump image
     let dump_size = pe.size_of_image() as usize;
@@ -266,13 +292,47 @@ pub fn dump_process(
         .read_memory(opts.image_base as usize, &mut dump_buf)
         .map_err(|e| PeError::Parse(format!("Failed to read dump image: {e}")))?;
     if read < dump_size {
-        warn!(expected = dump_size, actual = read, "Short read on dump image");
+        warn!(
+            expected = dump_size,
+            actual = read,
+            "Short read on dump image"
+        );
     }
+
+    let overlay = apply_early_section_overlays(
+        &mut dump_buf,
+        &opts.early_section_snapshots,
+        opts.iat_location,
+        opts.image_base,
+    )?;
+    if overlay.changed_bytes > 0 {
+        info!(
+            snapshots = overlay.applied_snapshots,
+            changed_bytes = overlay.changed_bytes,
+            "Applied early section snapshot overlay"
+        );
+    }
+
+    // A pre-`.text` snapshot can still contain protector-created encoded
+    // containers backed by the unpacking process heap. Detect containers that
+    // reference heap memory BEFORE resetting them, then reset to prevent crashes.
+    let containers = super::container_snapshot::detect_containers(&pe, &dump_buf, debugger);
+    super::data_reinit::reinitialize_zero_filled_data(
+        &pe,
+        &mut dump_buf,
+        opts.executable_path.as_deref(),
+    );
 
     // 4b. Create .pdata and .reloc sections
     if opts.shrink {
         if let Some((exc_rva, exc_size)) = saved_exception_rva {
-            create_pdata_section(&mut pe, &dump_buf, exc_rva, exc_size, opts.executable_path.as_deref());
+            create_pdata_section(
+                &mut pe,
+                &dump_buf,
+                exc_rva,
+                exc_size,
+                opts.executable_path.as_deref(),
+            );
         }
         create_reloc_section(&mut pe);
     }
@@ -290,12 +350,28 @@ pub fn dump_process(
     //     pe.sanitize();
     // }
 
-    // 5b. Build import section (uses compacted VAs)
+    // 5b. Rebuild process-local CRT heap state before creating the import
+    // section. Detection is semantic: the same writable global must feed at
+    // least two distinct Heap* IAT calls, and GetProcessHeap must be imported.
+    // If containers were detected, install a full container restoration bootstrap.
+    let output_entry_point = import_builder
+        .as_ref()
+        .and_then(|builder| {
+            super::heap_bootstrap::install_heap_bootstrap(
+                &mut pe,
+                &dump_buf,
+                builder,
+                opts.entry_point,
+                &containers,
+            )
+        })
+        .unwrap_or(opts.entry_point);
+
+    // 5c. Build import section (uses original virtual addresses)
     let mut import_thunks: Vec<u64> = Vec::new();
     if let Some(ref builder) = import_builder {
-        let (thunks, _section_idx) = create_import_section(
-            &mut pe, builder, original_iat_rva, &mut dump_buf, is_64bit,
-        );
+        let (thunks, _section_idx) =
+            create_import_section(&mut pe, builder, original_iat_rva, &mut dump_buf, is_64bit);
         import_thunks = thunks;
     }
 
@@ -318,10 +394,17 @@ pub fn dump_process(
     let mut iat_raw_addr = 0u32;
     let _delta = pe.trim_huge_sections(&dump_buf, &mut iat_raw_addr);
 
-    // 6. Write output file
+    // 6. Write output file with container restoration
     let mut out_data = write_output_file(
-        &mut pe, &dump_buf, import_builder.as_ref(), &import_thunks,
-        original_iat_rva, is_64bit, opts,
+        &mut pe,
+        &dump_buf,
+        import_builder.as_ref(),
+        &import_thunks,
+        original_iat_rva,
+        is_64bit,
+        opts,
+        output_entry_point,
+        &containers,
     )?;
 
     // DEBUG: Verify section 1 characteristics
@@ -374,7 +457,156 @@ fn debug_section_chars(out_data: &[u8], label: &str) {
             out_data[sec1_chars_offset + 2],
             out_data[sec1_chars_offset + 3],
         ]);
-        info!("{}: Section 1 chars at {:#x} = {:#x}", label, sec1_chars_offset, chars);
+        info!(
+            "{}: Section 1 chars at {:#x} = {:#x}",
+            label, sec1_chars_offset, chars
+        );
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct OverlayStats {
+    applied_snapshots: usize,
+    changed_bytes: usize,
+}
+
+fn apply_early_section_overlays(
+    dump_buf: &mut [u8],
+    snapshots: &[EarlySectionSnapshot],
+    iat_location: Option<(usize, usize)>,
+    image_base: u64,
+) -> Result<OverlayStats, PeError> {
+    let iat_range = iat_location.and_then(|(address, size)| {
+        let image_base = usize::try_from(image_base).ok()?;
+        let start = address.checked_sub(image_base)?;
+        let end = start.checked_add(size)?;
+        Some(start..end)
+    });
+    let mut stats = OverlayStats::default();
+
+    for snapshot in snapshots {
+        if snapshot.section_name != ".data" {
+            warn!(
+                section = %snapshot.section_name,
+                rva = format_args!("{:#x}", snapshot.rva),
+                "Skipping unsupported early snapshot overlay"
+            );
+            continue;
+        }
+
+        let start = snapshot.rva as usize;
+        let end = start.checked_add(snapshot.bytes.len()).ok_or_else(|| {
+            PeError::Parse(format!(
+                "Early snapshot range overflow for {} at RVA {:#x}",
+                snapshot.section_name, snapshot.rva
+            ))
+        })?;
+        if end > dump_buf.len() {
+            return Err(PeError::Parse(format!(
+                "Early snapshot for {} exceeds dump image: {start:#x}..{end:#x} > {:#x}",
+                snapshot.section_name,
+                dump_buf.len()
+            )));
+        }
+        if iat_range
+            .as_ref()
+            .is_some_and(|iat| start < iat.end && iat.start < end)
+        {
+            return Err(PeError::Parse(format!(
+                "Early snapshot for {} overlaps IAT range",
+                snapshot.section_name
+            )));
+        }
+
+        let target = &mut dump_buf[start..end];
+        stats.changed_bytes += target
+            .iter()
+            .zip(&snapshot.bytes)
+            .filter(|(late, early)| late != early)
+            .count();
+        target.copy_from_slice(&snapshot.bytes);
+        stats.applied_snapshots += 1;
+    }
+
+    Ok(stats)
+}
+
+#[cfg(test)]
+mod overlay_tests {
+    use super::*;
+
+    fn snapshot(name: &str, rva: u32, bytes: &[u8]) -> EarlySectionSnapshot {
+        EarlySectionSnapshot {
+            section_name: name.into(),
+            rva,
+            bytes: bytes.to_vec(),
+        }
+    }
+
+    #[test]
+    fn empty_snapshots_leave_dump_unchanged() {
+        let mut dump = vec![0x55; 16];
+        let before = dump.clone();
+        let stats = apply_early_section_overlays(&mut dump, &[], None, 0x1400_0000).unwrap();
+        assert_eq!(dump, before);
+        assert_eq!(stats, OverlayStats::default());
+    }
+
+    #[test]
+    fn overlays_data_and_counts_changes() {
+        let mut dump = vec![0u8; 16];
+        dump[5] = 7;
+        let stats = apply_early_section_overlays(
+            &mut dump,
+            &[snapshot(".data", 4, &[1, 7, 2])],
+            None,
+            0x1400_0000,
+        )
+        .unwrap();
+        assert_eq!(&dump[4..7], &[1, 7, 2]);
+        assert_eq!(stats.changed_bytes, 2);
+        assert_eq!(stats.applied_snapshots, 1);
+    }
+
+    #[test]
+    fn skips_non_data_snapshots() {
+        let mut dump = vec![0u8; 16];
+        let stats = apply_early_section_overlays(
+            &mut dump,
+            &[snapshot(".text", 4, &[1, 2])],
+            None,
+            0x1400_0000,
+        )
+        .unwrap();
+        assert_eq!(&dump[4..6], &[0, 0]);
+        assert_eq!(stats, OverlayStats::default());
+    }
+
+    #[test]
+    fn rejects_out_of_bounds_snapshot() {
+        let mut dump = vec![0u8; 8];
+        let err = apply_early_section_overlays(
+            &mut dump,
+            &[snapshot(".data", 7, &[1, 2])],
+            None,
+            0x1400_0000,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("exceeds dump image"));
+    }
+
+    #[test]
+    fn rejects_iat_overlap() {
+        let base = 0x1400_0000usize;
+        let mut dump = vec![0u8; 32];
+        let err = apply_early_section_overlays(
+            &mut dump,
+            &[snapshot(".data", 8, &[1, 2, 3, 4])],
+            Some((base + 10, 8)),
+            base as u64,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("overlaps IAT"));
     }
 }
 

@@ -7,9 +7,7 @@ use tracing::{debug, info, warn};
 
 use crate::error::PeError;
 use crate::header::PeHeader;
-use crate::import_table::{
-    ImportModule, ImportTableBuilder, ImportThunk, iat_slot_size,
-};
+use crate::import_table::{iat_slot_size, ImportModule, ImportTableBuilder, ImportThunk};
 
 use super::helpers::{
     preference_score, read_ptr, write_ptr, IMAGE_DIRECTORY_ENTRY_IAT, MAX_IAT_SLOTS,
@@ -94,10 +92,7 @@ pub(crate) fn rebuild_import_table_complete(
             is_64bit,
             &iat_data,
         )?;
-        info!(
-            iat_size = format!("{size:#x}"),
-            "Determined IAT size"
-        );
+        info!(iat_size = format!("{size:#x}"), "Determined IAT size");
 
         // Update the PE header's IAT directory
         pe.nt_headers.optional_header.data_directory[IMAGE_DIRECTORY_ENTRY_IAT] =
@@ -114,14 +109,7 @@ pub(crate) fn rebuild_import_table_complete(
         .read_memory(iat_address as usize, &mut iat_data)
         .map_err(|e| PeError::Parse(format!("Failed to read IAT: {e}")))?;
 
-    rebuild_import_table_inner(
-        debugger,
-        iat_address,
-        iat_size,
-        image_base,
-        is_64bit,
-        None,
-    )
+    rebuild_import_table_inner(debugger, iat_address, iat_size, image_base, is_64bit, None)
 }
 
 // -----------------------------------------------------------------------
@@ -156,16 +144,16 @@ fn rebuild_import_table_inner(
         is_64bit,
     )?;
 
-    debug!(
-        module_count = modules.len(),
-        "Module snapshot taken"
-    );
+    debug!(module_count = modules.len(), "Module snapshot taken");
 
     // Build forward maps (see comments in original dumper.rs for details).
-    let mut forward_map: std::collections::HashMap<u64, (usize, String)> = std::collections::HashMap::new();
-    let mut forward_string_map: std::collections::HashMap<u64, (usize, String)> = std::collections::HashMap::new();
+    let mut forward_map: std::collections::HashMap<u64, (usize, String)> =
+        std::collections::HashMap::new();
+    let mut forward_string_map: std::collections::HashMap<u64, (usize, String)> =
+        std::collections::HashMap::new();
 
-    let mut module_priority: std::collections::HashMap<usize, i32> = std::collections::HashMap::new();
+    let mut module_priority: std::collections::HashMap<usize, i32> =
+        std::collections::HashMap::new();
     for (mi, m) in modules.iter().enumerate() {
         let priority = if m.name.to_lowercase() == "kernel32.dll" {
             100
@@ -184,8 +172,11 @@ fn rebuild_import_table_inner(
         &module_priority,
     );
 
-    tracing::debug!("Forward map: {} entries, forward string map: {} entries",
-        forward_map.len(), forward_string_map.len());
+    tracing::debug!(
+        "Forward map: {} entries, forward string map: {} entries",
+        forward_map.len(),
+        forward_string_map.len()
+    );
 
     let slot_count = iat_size / ptr_size;
 
@@ -209,7 +200,13 @@ fn rebuild_import_table_inner(
             continue;
         }
 
-        collect_candidates(&mut slot, slot_val, &modules, &forward_map, &forward_string_map);
+        collect_candidates(
+            &mut slot,
+            slot_val,
+            &modules,
+            &forward_map,
+            &forward_string_map,
+        );
 
         if slot.candidates.is_empty() {
             debug!(
@@ -225,7 +222,17 @@ fn rebuild_import_table_inner(
     // ============================================================
     // PASS 2: Vote on best module per zero-delimited group
     // ============================================================
-    let builder = pass2_vote(&mut slots, &modules, &mut iat_data, iat_address, image_base, is_64bit, ptr_size, slot_count, &forward_map);
+    let builder = pass2_vote(
+        &mut slots,
+        &modules,
+        &mut iat_data,
+        iat_address,
+        image_base,
+        is_64bit,
+        ptr_size,
+        slot_count,
+        &forward_map,
+    );
 
     Ok((iat_data, iat_size, Some(builder)))
 }
@@ -252,23 +259,26 @@ fn build_forward_maps(
 
                 for (tmi, target_module) in modules.iter().enumerate() {
                     let mod_name = target_module.name.to_lowercase();
-                    if mod_name == target_mod_lower ||
-                       mod_name == format!("{}.dll", target_mod_lower) ||
-                       mod_name.starts_with(&target_mod_lower) {
-
+                    if mod_name == target_mod_lower
+                        || mod_name == format!("{}.dll", target_mod_lower)
+                        || mod_name.starts_with(&target_mod_lower)
+                    {
                         for (target_addr, exported_func_name) in &target_module.exports {
                             if exported_func_name == target_func_name {
-                                forward_string_map.insert(*fwd_string_addr, (tmi, target_func_name.to_string()));
+                                forward_string_map
+                                    .insert(*fwd_string_addr, (tmi, target_func_name.to_string()));
 
-                                let should_insert = if let Some((existing_mi, _)) = forward_map.get(target_addr) {
-                                    module_priority.get(&source_mi).unwrap_or(&0) >
-                                    module_priority.get(existing_mi).unwrap_or(&0)
-                                } else {
-                                    true
-                                };
+                                let should_insert =
+                                    if let Some((existing_mi, _)) = forward_map.get(target_addr) {
+                                        module_priority.get(&source_mi).unwrap_or(&0)
+                                            > module_priority.get(existing_mi).unwrap_or(&0)
+                                    } else {
+                                        true
+                                    };
 
                                 if should_insert {
-                                    forward_map.insert(*target_addr, (source_mi, source_name.clone()));
+                                    forward_map
+                                        .insert(*target_addr, (source_mi, source_name.clone()));
                                 }
                                 break;
                             }
@@ -307,15 +317,22 @@ fn collect_candidates(
 
     // Variant B: forward map lookup
     if let Some((source_mi, _source_name)) = forward_map.get(&slot_val) {
-        slot.candidates.insert(0, ResolutionCandidate {
-            address: slot_val,
-            module_index: *source_mi,
-        });
+        slot.candidates.insert(
+            0,
+            ResolutionCandidate {
+                address: slot_val,
+                module_index: *source_mi,
+            },
+        );
     }
 
     // Variant C: forward_string_map lookup
     if let Some((target_mi, target_func_name)) = forward_string_map.get(&slot_val) {
-        if let Some((real_addr, _)) = modules[*target_mi].exports.iter().find(|(_, name)| name.as_str() == target_func_name.as_str()) {
+        if let Some((real_addr, _)) = modules[*target_mi]
+            .exports
+            .iter()
+            .find(|(_, name)| name.as_str() == target_func_name.as_str())
+        {
             slot.candidates.push(ResolutionCandidate {
                 address: *real_addr,
                 module_index: *target_mi,
@@ -355,7 +372,8 @@ fn pass2_vote(
         }
 
         // Vote
-        let mut module_votes: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        let mut module_votes: std::collections::HashMap<usize, usize> =
+            std::collections::HashMap::new();
         for j in group_start..=group_end {
             for c in &slots[j].candidates {
                 *module_votes.entry(c.module_index).or_insert(0) += 1;
@@ -380,7 +398,10 @@ fn pass2_vote(
         let winner_mi = match winner_idx {
             Some(mi) => mi,
             None => {
-                debug!(group_start, group_end, "IAT group has no valid candidates, skipping");
+                debug!(
+                    group_start,
+                    group_end, "IAT group has no valid candidates, skipping"
+                );
                 i = group_end + 1;
                 continue;
             }
@@ -422,13 +443,17 @@ fn pass2_vote(
                 .exports
                 .get(&chosen.address)
                 .cloned()
-                .or_else(|| forward_map.get(&chosen.address).map(|(_, name)| name.clone()));
+                .or_else(|| {
+                    forward_map
+                        .get(&chosen.address)
+                        .map(|(_, name)| name.clone())
+                });
 
             write_ptr(iat_data, j * ptr_size, chosen.address, is_64bit);
 
             let (function_name, ordinal) = if let Some(ref name) = func_name {
-                if name.starts_with('#') {
-                    let ord: u16 = name[1..].parse().unwrap_or(0);
+                if let Some(ordinal_str) = name.strip_prefix('#') {
+                    let ord: u16 = ordinal_str.parse().unwrap_or(0);
                     (None, Some(ord))
                 } else {
                     (Some(name.clone()), None)
@@ -437,7 +462,9 @@ fn pass2_vote(
                 let placeholder = format!("_unknown_{:#x}", chosen.address);
                 tracing::warn!(
                     "IAT slot {} at {:#x}: unresolved, using placeholder '{}'",
-                    j, iat_address + (j * ptr_size) as u64, placeholder
+                    j,
+                    iat_address + (j * ptr_size) as u64,
+                    placeholder
                 );
                 (Some(placeholder), None)
             };
@@ -451,7 +478,10 @@ fn pass2_vote(
         }
 
         if !thunks.is_empty() {
-            builder.modules.push(ImportModule { name: module_name, thunks });
+            builder.modules.push(ImportModule {
+                name: module_name,
+                thunks,
+            });
         }
 
         i = group_end + 1;

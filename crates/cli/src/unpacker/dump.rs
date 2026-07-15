@@ -1,28 +1,22 @@
 //! Dump the `.text` section from a running process.
 
-use std::path::Path;
+use super::session::ReadOnlyProcessDebugger;
+use crate::log::{self, LogType};
 use anyhow::anyhow;
+use mida_pe::PeHeader;
+use std::path::Path;
 use tracing::{debug, warn};
 use windows::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
-    PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
+    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT, PROCESS_QUERY_INFORMATION,
+    PROCESS_VM_READ,
 };
-use mida_pe::PeHeader;
-use crate::log::{self, LogType};
-use super::session::ReadOnlyProcessDebugger;
 
 /// Dump the de-virtualised `.text` section from a running (unpacked) process.
 pub fn dump_process_code(pid: u32, unpacked_file: &Path) -> Result<(), anyhow::Error> {
     // SAFETY: pid is a valid OS process ID; the handle is owned by
     // ReadOnlyProcessDebugger below and closed automatically on drop.
-    let h_process = unsafe {
-        OpenProcess(
-            PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
-            false,
-            pid,
-        )
-    }
-    .map_err(|e| anyhow!("Cannot open process {}: {e}", pid))?;
+    let h_process = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid) }
+        .map_err(|e| anyhow!("Cannot open process {}: {e}", pid))?;
 
     let mut path_buf: Vec<u16> = vec![0u16; 260];
     let mut len = path_buf.len() as u32;

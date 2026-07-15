@@ -4,11 +4,11 @@
 //! target process.  This module reads `.text` from live memory and searches
 //! for MSVC CRT startup patterns to locate the real entry point.
 
-use tracing::{debug, info, warn};
-use mida_core::DebuggerCore;
-use mida_pe::PeSection;
-use mida_packers_themida::find_real_oep_in_bytes;
 use super::session::ProcessSession;
+use mida_core::DebuggerCore;
+use mida_packers_themida::find_real_oep_in_bytes;
+use mida_pe::PeSection;
+use tracing::{debug, info, warn};
 
 /// Scan decrypted .text in live memory for the MSVC CRT startup address.
 ///
@@ -21,9 +21,10 @@ pub(super) fn scan_live_memory_for_real_oep(
     base_of_data: u64,
     major_linker_version: u8,
 ) -> Result<Option<usize>, anyhow::Error> {
-    let Some(text_sec) = sections.iter().find(|sec| {
-        sec.virtual_size > 0x1000 && (sec.characteristics & 0x20000000 != 0)
-    }) else {
+    let Some(text_sec) = sections
+        .iter()
+        .find(|sec| sec.virtual_size > 0x1000 && (sec.characteristics & 0x20000000 != 0))
+    else {
         return Ok(None);
     };
     let text_base_va = image_base + text_sec.virtual_address as usize;
@@ -49,9 +50,7 @@ pub(super) fn scan_live_memory_for_real_oep(
     }
 
     // Strategy 1: MSVC CRT startup pattern (E8 .. E9)
-    if [6u8, 7, 8, 9, 10, 11, 12, 14].contains(&major_linker_version)
-        || major_linker_version == 0
-    {
+    if [6u8, 7, 8, 9, 10, 11, 12, 14].contains(&major_linker_version) || major_linker_version == 0 {
         if let Some(offset) = find_real_oep_in_bytes(&text_buf[..effective_len], 0) {
             let real_oep = text_base_va + offset as usize;
             info!(
@@ -63,7 +62,9 @@ pub(super) fn scan_live_memory_for_real_oep(
         }
 
         for entry_offset_guess in [0u32, 0x100, 0x200, 0x400, 0x800] {
-            if let Some(offset) = find_real_oep_in_bytes(&text_buf[..effective_len], entry_offset_guess) {
+            if let Some(offset) =
+                find_real_oep_in_bytes(&text_buf[..effective_len], entry_offset_guess)
+            {
                 let target_va_in_text = entry_offset_guess as usize;
                 let real_oep = text_base_va + offset as usize;
                 if offset as usize > target_va_in_text && offset < 0x10000 {
@@ -135,16 +136,32 @@ pub(super) fn scan_live_memory_for_real_oep(
                 let mut func_start = i;
                 for j in (i.saturating_sub(32)..i).rev() {
                     match text_buf[j] {
-                        0x50..=0x57 => { func_start = j; break; }
-                        0x6A => { func_start = j; break; }
-                        0x68 => { func_start = j; break; }
-                        0x8B => if text_buf[j + 1] == 0xEC { func_start = j; break; }
+                        0x50..=0x57 => {
+                            func_start = j;
+                            break;
+                        }
+                        0x6A => {
+                            func_start = j;
+                            break;
+                        }
+                        0x68 => {
+                            func_start = j;
+                            break;
+                        }
+                        0x8B => {
+                            if text_buf[j + 1] == 0xEC {
+                                func_start = j;
+                                break;
+                            }
+                        }
                         _ => continue,
                     }
                 }
                 let mut adjusted_start = func_start;
                 for adj in 1..=10u32 {
-                    if adj > func_start as u32 { break; }
+                    if adj > func_start as u32 {
+                        break;
+                    }
                     let idx = func_start - adj as usize;
                     match text_buf[idx] {
                         0x50..=0x57 | 0x68 | 0x6A | 0xB9 | 0xB8 => {
@@ -167,9 +184,18 @@ pub(super) fn scan_live_memory_for_real_oep(
                 let mut func_start = i;
                 for j in (i.saturating_sub(32)..i).rev() {
                     match text_buf[j] {
-                        0x50..=0x57 => { func_start = j; break; }
-                        0x6A => { func_start = j; break; }
-                        0x68 => { func_start = j; break; }
+                        0x50..=0x57 => {
+                            func_start = j;
+                            break;
+                        }
+                        0x6A => {
+                            func_start = j;
+                            break;
+                        }
+                        0x68 => {
+                            func_start = j;
+                            break;
+                        }
                         _ => continue,
                     }
                 }

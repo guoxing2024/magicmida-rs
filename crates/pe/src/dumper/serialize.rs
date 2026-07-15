@@ -51,7 +51,10 @@ impl PeHeader {
 
         if self.is_64bit {
             // PE32+
-            debug!("Writing ImageBase for PE32+: {:#x} at buffer offset 48", oh.image_base);
+            debug!(
+                "Writing ImageBase for PE32+: {:#x} at buffer offset 48",
+                oh.image_base
+            );
             out[48..56].copy_from_slice(&oh.image_base.to_le_bytes());
             out[56..60].copy_from_slice(&oh.section_alignment.to_le_bytes());
             out[60..64].copy_from_slice(&oh.file_alignment.to_le_bytes());
@@ -99,8 +102,7 @@ impl PeHeader {
                 }
 
                 out[off..off + 8].copy_from_slice(&section.header.name);
-                out[off + 8..off + 12]
-                    .copy_from_slice(&section.header.virtual_size.to_le_bytes());
+                out[off + 8..off + 12].copy_from_slice(&section.header.virtual_size.to_le_bytes());
                 out[off + 12..off + 16]
                     .copy_from_slice(&section.header.virtual_address.to_le_bytes());
                 out[off + 16..off + 20]
@@ -120,17 +122,22 @@ impl PeHeader {
 
                 // DEBUG: Verify what we actually wrote
                 if i == 1 {
-                    let written_chars = u32::from_le_bytes([out[off + 36], out[off + 37], out[off + 38], out[off + 39]]);
-                    tracing::info!("Section 1: wrote characteristics {:#x} at offset {:#x}", written_chars, off + 36);
+                    let written_chars = u32::from_le_bytes([
+                        out[off + 36],
+                        out[off + 37],
+                        out[off + 38],
+                        out[off + 39],
+                    ]);
+                    tracing::info!(
+                        "Section 1: wrote characteristics {:#x} at offset {:#x}",
+                        written_chars,
+                        off + 36
+                    );
                 }
             }
         } else {
             // PE32
-            out[48..52].copy_from_slice(
-                &oh.base_of_data
-                    .unwrap_or(0)
-                    .to_le_bytes(),
-            );
+            out[48..52].copy_from_slice(&oh.base_of_data.unwrap_or(0).to_le_bytes());
             out[52..56].copy_from_slice(&(oh.image_base as u32).to_le_bytes());
             out[56..60].copy_from_slice(&oh.section_alignment.to_le_bytes());
             out[60..64].copy_from_slice(&oh.file_alignment.to_le_bytes());
@@ -166,8 +173,7 @@ impl PeHeader {
             for (i, section) in self.sections.iter().enumerate() {
                 let off = sh_off + i * 40;
                 out[off..off + 8].copy_from_slice(&section.header.name);
-                out[off + 8..off + 12]
-                    .copy_from_slice(&section.header.virtual_size.to_le_bytes());
+                out[off + 8..off + 12].copy_from_slice(&section.header.virtual_size.to_le_bytes());
                 out[off + 12..off + 16]
                     .copy_from_slice(&section.header.virtual_address.to_le_bytes());
                 out[off + 16..off + 20]

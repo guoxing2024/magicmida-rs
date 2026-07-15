@@ -1,4 +1,4 @@
-﻿//! Post-processing for unpacked PE images.
+//! Post-processing for unpacked PE images.
 //!
 //! Includes:
 //! - Themida section shrinking (merge VSize, restore RawSize)
@@ -6,10 +6,10 @@
 //! - File layout packing
 //! - Relocation table building (v2)
 
-use crate::PeHeader;
-use crate::PeError;
 use crate::relocation::RelocationTableBuilder;
-use tracing::{info, debug, warn};
+use crate::PeError;
+use crate::PeHeader;
+use tracing::{debug, info, warn};
 
 /// Apply post-processing to an unpacked PE image.
 ///
@@ -29,7 +29,10 @@ use tracing::{info, debug, warn};
 /// postprocess_image(&mut image, true)?; // Enable shrink
 /// std::fs::write("output.exe", image)?;
 /// ```
-pub fn postprocess_image(out_data: &mut Vec<u8>, options: PostprocessOptions) -> Result<(), PeError> {
+pub fn postprocess_image(
+    out_data: &mut Vec<u8>,
+    options: PostprocessOptions,
+) -> Result<(), PeError> {
     // Parse PE to get structure
     let mut pe = PeHeader::from_bytes(out_data)?;
 
@@ -99,7 +102,9 @@ fn apply_shrink(pe: &mut PeHeader, _out_data: &mut Vec<u8>) -> Result<(), PeErro
 
     let mut i = pe.sections.len();
     loop {
-        if i == 0 { break; }
+        if i == 0 {
+            break;
+        }
         i -= 1;
 
         let should_delete = {
@@ -132,8 +137,11 @@ fn apply_shrink(pe: &mut PeHeader, _out_data: &mut Vec<u8>) -> Result<(), PeErro
             }
 
             pe.sections.remove(i);
-            pe.nt_headers.file_header.number_of_sections =
-                pe.nt_headers.file_header.number_of_sections.saturating_sub(1);
+            pe.nt_headers.file_header.number_of_sections = pe
+                .nt_headers
+                .file_header
+                .number_of_sections
+                .saturating_sub(1);
             removed += 1;
             info!("Removed Themida section: {}", removed_name);
         }
@@ -144,11 +152,17 @@ fn apply_shrink(pe: &mut PeHeader, _out_data: &mut Vec<u8>) -> Result<(), PeErro
         let mut max_end = 0u32;
         for s in &pe.sections {
             let end = s.virtual_address + s.virtual_size;
-            let aligned = crate::utils::align_up(end, pe.nt_headers.optional_header.section_alignment);
-            if aligned > max_end { max_end = aligned; }
+            let aligned =
+                crate::utils::align_up(end, pe.nt_headers.optional_header.section_alignment);
+            if aligned > max_end {
+                max_end = aligned;
+            }
         }
         pe.nt_headers.optional_header.size_of_image = max_end;
-        debug!("Shrink complete: removed {} sections, SizeOfImage={:#x}", removed, max_end);
+        debug!(
+            "Shrink complete: removed {} sections, SizeOfImage={:#x}",
+            removed, max_end
+        );
 
         // Restore original RawSize for merged sections
         // sanitize() set RawSize=VSize, but merged sections have large VSize
@@ -215,7 +229,10 @@ pub fn fix_hardcoded_addresses(
         let section_end = section_start + section_size;
 
         if section_end > out_data.len() {
-            warn!("Section {} extends beyond file size, skipping", section.name);
+            warn!(
+                "Section {} extends beyond file size, skipping",
+                section.name
+            );
             continue;
         }
 
@@ -228,9 +245,17 @@ pub fn fix_hardcoded_addresses(
         for offset in (section_start..section_end).step_by(ptr_size) {
             // Use @inline(never) to avoid inlining from caller's debug! formatting
             #[inline(never)]
-            fn try_fix_address(data: &[u8], offset: usize, delta: i64, ptr_size: usize, runtime_start: u64, runtime_end: u64, is_64bit: bool) -> Option<u64> {
-                let addr = u64::from_le_bytes(data[offset..offset+ptr_size].try_into().ok()?);
-                
+            fn try_fix_address(
+                data: &[u8],
+                offset: usize,
+                delta: i64,
+                ptr_size: usize,
+                runtime_start: u64,
+                runtime_end: u64,
+                is_64bit: bool,
+            ) -> Option<u64> {
+                let addr = u64::from_le_bytes(data[offset..offset + ptr_size].try_into().ok()?);
+
                 if addr == 0 {
                     return None;
                 }
@@ -244,7 +269,8 @@ pub fn fix_hardcoded_addresses(
                 let is_runtime_addr = addr >= runtime_start && addr < runtime_end;
 
                 if is_runtime_addr && delta != 0 {
-                    let old_val = u64::from_le_bytes(data[offset..offset+ptr_size].try_into().ok()?);
+                    let old_val =
+                        u64::from_le_bytes(data[offset..offset + ptr_size].try_into().ok()?);
                     let new_val = (old_val as i64).wrapping_add(delta) as u64;
                     Some(new_val)
                 } else {
@@ -252,7 +278,15 @@ pub fn fix_hardcoded_addresses(
                 }
             }
 
-            if let Some(new_addr) = try_fix_address(out_data, offset, delta, ptr_size, runtime_start, runtime_end, is_64bit) {
+            if let Some(new_addr) = try_fix_address(
+                out_data,
+                offset,
+                delta,
+                ptr_size,
+                runtime_start,
+                runtime_end,
+                is_64bit,
+            ) {
                 if ptr_size == 8 {
                     out_data[offset..offset + 8].copy_from_slice(&new_addr.to_le_bytes());
                 } else {
@@ -263,7 +297,10 @@ pub fn fix_hardcoded_addresses(
         }
 
         if section_fixed > 0 {
-            debug!("Fixed {} hardcoded addresses in section {}", section_fixed, section.name);
+            debug!(
+                "Fixed {} hardcoded addresses in section {}",
+                section_fixed, section.name
+            );
         }
         fixed_count += section_fixed;
         scanned_bytes += section_size;
@@ -283,15 +320,18 @@ pub fn fix_hardcoded_addresses(
 /// This preserves PE header integrity by operating in-place.
 pub fn pack_section_layout(out_data: &mut Vec<u8>, pe: &PeHeader) -> Result<(), PeError> {
     let pe_offset = if out_data.len() >= 0x40 {
-        u32::from_le_bytes([out_data[0x3C], out_data[0x3D], out_data[0x3E], out_data[0x3F]]) as usize
+        u32::from_le_bytes([
+            out_data[0x3C],
+            out_data[0x3D],
+            out_data[0x3E],
+            out_data[0x3F],
+        ]) as usize
     } else {
         return Err(PeError::InvalidPeSignature);
     };
 
     let file_alignment = pe.nt_headers.optional_header.file_alignment as usize;
-    let align = |n: usize| -> usize {
-        (n + file_alignment - 1) & !(file_alignment - 1)
-    };
+    let align = |n: usize| -> usize { (n + file_alignment - 1) & !(file_alignment - 1) };
 
     let section_table_offset =
         pe_offset + 24 + pe.nt_headers.file_header.size_of_optional_header as usize;
@@ -348,13 +388,16 @@ pub fn pack_section_layout(out_data: &mut Vec<u8>, pe: &PeHeader) -> Result<(), 
     // Truncate file
     let mut max_end = 0usize;
     for (i, section) in pe.sections.iter().enumerate() {
-        let ptr = if let Some(&(_, _, _, new_ptr)) = moves.iter().find(|&&(idx, _, _, _)| idx == i) {
+        let ptr = if let Some(&(_, _, _, new_ptr)) = moves.iter().find(|&&(idx, _, _, _)| idx == i)
+        {
             new_ptr
         } else {
             section.header.pointer_to_raw_data as usize
         };
         let end = ptr + section.header.size_of_raw_data as usize;
-        if end > max_end { max_end = end; }
+        if end > max_end {
+            max_end = end;
+        }
     }
 
     let old_size = out_data.len();
@@ -362,12 +405,13 @@ pub fn pack_section_layout(out_data: &mut Vec<u8>, pe: &PeHeader) -> Result<(), 
 
     info!(
         "Packed section layout: {} bytes -> {} bytes (saved {} bytes)",
-        old_size, max_end, old_size - max_end
+        old_size,
+        max_end,
+        old_size - max_end
     );
 
     Ok(())
 }
-
 
 /// Pack the .reloc and .import sections tightly after .pdata in the file.
 ///
@@ -381,7 +425,12 @@ pub fn pack_section_layout(out_data: &mut Vec<u8>, pe: &PeHeader) -> Result<(), 
 /// VirtualSize and SizeOfRawData in the on-disk header).
 pub fn pack_tail_sections(out_data: &mut Vec<u8>, pe: &PeHeader) -> Result<(), PeError> {
     let pe_offset = if out_data.len() >= 0x40 {
-        u32::from_le_bytes([out_data[0x3C], out_data[0x3D], out_data[0x3E], out_data[0x3F]]) as usize
+        u32::from_le_bytes([
+            out_data[0x3C],
+            out_data[0x3D],
+            out_data[0x3E],
+            out_data[0x3F],
+        ]) as usize
     } else {
         return Ok(());
     };
@@ -389,9 +438,7 @@ pub fn pack_tail_sections(out_data: &mut Vec<u8>, pe: &PeHeader) -> Result<(), P
     let opt_hdr_size = pe.nt_headers.file_header.size_of_optional_header as usize;
     let section_table_offset = pe_offset + 24 + opt_hdr_size;
     let file_align = pe.nt_headers.optional_header.file_alignment as usize;
-    let align = |n: usize| -> usize {
-        (n + file_align - 1) & !(file_align - 1)
-    };
+    let align = |n: usize| -> usize { (n + file_align - 1) & !(file_align - 1) };
 
     let num_sections = pe.nt_headers.file_header.number_of_sections as usize;
 
@@ -400,14 +447,14 @@ pub fn pack_tail_sections(out_data: &mut Vec<u8>, pe: &PeHeader) -> Result<(), P
 
     for i in 0..num_sections {
         let so = section_table_offset + i * 40;
-        if so + 40 > out_data.len() { break; }
+        if so + 40 > out_data.len() {
+            break;
+        }
         let name = &out_data[so..so + 8];
-        let raw_size = u32::from_le_bytes(
-            out_data[so + 16..so + 20].try_into().unwrap_or([0; 4])
-        ) as usize;
-        let raw_ptr = u32::from_le_bytes(
-            out_data[so + 20..so + 24].try_into().unwrap_or([0; 4])
-        ) as usize;
+        let raw_size =
+            u32::from_le_bytes(out_data[so + 16..so + 20].try_into().unwrap_or([0; 4])) as usize;
+        let raw_ptr =
+            u32::from_le_bytes(out_data[so + 20..so + 24].try_into().unwrap_or([0; 4])) as usize;
         let end = raw_ptr + raw_size;
 
         if name.starts_with(b".pdata") && end > pdata_end {
@@ -425,19 +472,23 @@ pub fn pack_tail_sections(out_data: &mut Vec<u8>, pe: &PeHeader) -> Result<(), P
     let mut next_ptr = align(pdata_end);
     for &idx in &tail_indices {
         let so = section_table_offset + idx * 40;
-        if so + 40 > out_data.len() { break; }
+        if so + 40 > out_data.len() {
+            break;
+        }
 
-        let old_ptr = u32::from_le_bytes(
-            out_data[so + 20..so + 24].try_into().unwrap_or([0; 4])
-        ) as usize;
-        let raw_size = u32::from_le_bytes(
-            out_data[so + 16..so + 20].try_into().unwrap_or([0; 4])
-        ) as usize;
+        let old_ptr =
+            u32::from_le_bytes(out_data[so + 20..so + 24].try_into().unwrap_or([0; 4])) as usize;
+        let raw_size =
+            u32::from_le_bytes(out_data[so + 16..so + 20].try_into().unwrap_or([0; 4])) as usize;
 
-        if old_ptr <= next_ptr { continue; }
+        if old_ptr <= next_ptr {
+            continue;
+        }
 
         let data_len = raw_size.min(out_data.len().saturating_sub(old_ptr));
-        if data_len == 0 { continue; }
+        if data_len == 0 {
+            continue;
+        }
 
         let data_copy: Vec<u8> = out_data[old_ptr..old_ptr + data_len].to_vec();
         let needed = next_ptr + data_len;
@@ -461,7 +512,9 @@ pub fn pack_tail_sections(out_data: &mut Vec<u8>, pe: &PeHeader) -> Result<(), P
     if new_end < out_data.len() {
         info!(
             "pack_tail: truncated file {} -> {} bytes (saved {})",
-            out_data.len(), new_end, out_data.len() - new_end
+            out_data.len(),
+            new_end,
+            out_data.len() - new_end
         );
         out_data.truncate(new_end);
     }
@@ -501,7 +554,10 @@ pub fn build_relocation_table(
     for section in &pe.sections {
         let is_executable = (section.characteristics & 0x20000000) != 0;
         if is_executable {
-            debug!("Skipping executable section {} for relocations", section.name);
+            debug!(
+                "Skipping executable section {} for relocations",
+                section.name
+            );
             continue;
         }
 
@@ -531,9 +587,17 @@ pub fn build_relocation_table(
         for offset in (0..section_size.saturating_sub(ptr_size - 1)).step_by(ptr_size) {
             let file_off = section_start + offset;
             let addr = if is_64bit {
-                u64::from_le_bytes(out_data[file_off..file_off + 8].try_into().unwrap_or([0; 8]))
+                u64::from_le_bytes(
+                    out_data[file_off..file_off + 8]
+                        .try_into()
+                        .unwrap_or([0; 8]),
+                )
             } else {
-                u32::from_le_bytes(out_data[file_off..file_off + 4].try_into().unwrap_or([0; 4])) as u64
+                u32::from_le_bytes(
+                    out_data[file_off..file_off + 4]
+                        .try_into()
+                        .unwrap_or([0; 4]),
+                ) as u64
             };
 
             if addr >= image_base && addr < image_end {
@@ -612,9 +676,14 @@ pub fn build_relocation_table(
         }
 
         let aligned_size = crate::utils::align_up(reloc_data.len() as u32, file_align);
+        // Do not shrink the declared relocation span. With sparse, high-RVA
+        // layouts Windows rejects some images as ERROR_BAD_EXE_FORMAT when a
+        // regenerated table makes the section shorter than its prior valid
+        // extent. Keep the existing capacity and zero-fill unused bytes.
+        let declared_raw_size = reloc_raw_size.max(aligned_size);
 
         // Ensure the output buffer is large enough.
-        let needed = reloc_raw_ptr as usize + aligned_size as usize;
+        let needed = reloc_raw_ptr as usize + declared_raw_size as usize;
         if needed > out_data.len() {
             out_data.resize(needed, 0);
         }
@@ -623,18 +692,16 @@ pub fn build_relocation_table(
         out_data[reloc_raw_ptr as usize..reloc_raw_ptr as usize + reloc_data.len()]
             .copy_from_slice(&reloc_data);
         // Zero-fill the remainder of the aligned region.
-        for b in &mut out_data
-            [reloc_raw_ptr as usize + reloc_data.len()..reloc_raw_ptr as usize + aligned_size as usize]
+        for b in &mut out_data[reloc_raw_ptr as usize + reloc_data.len()
+            ..reloc_raw_ptr as usize + declared_raw_size as usize]
         {
             *b = 0;
         }
 
-        // Update .reloc section header: VirtualSize = actual table size,
-        // SizeOfRawData = aligned size. VA stays as created.
-        out_data[sec_hdr_off + 8..sec_hdr_off + 12]
-            .copy_from_slice(&(reloc_data.len() as u32).to_le_bytes());
+        // Keep the section's declared capacity; only the directory reports
+        // the valid table length.
         out_data[sec_hdr_off + 16..sec_hdr_off + 20]
-            .copy_from_slice(&aligned_size.to_le_bytes());
+            .copy_from_slice(&declared_raw_size.to_le_bytes());
 
         // Update BaseReloc data directory (index 5) — VA stays, size = actual.
         let dd_off = pe_off + 24 + if is_64bit { 112 } else { 96 };

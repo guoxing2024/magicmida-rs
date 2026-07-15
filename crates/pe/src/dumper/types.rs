@@ -2,6 +2,20 @@
 //!
 //! Extracted from `dumper.rs`.
 
+// -----------------------------------------------------------------------
+// EarlySectionSnapshot
+// -----------------------------------------------------------------------
+
+/// Loader-initialized section bytes captured before application code runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EarlySectionSnapshot {
+    /// Original PE section name.
+    pub section_name: String,
+    /// Section-relative virtual address in the image.
+    pub rva: u32,
+    /// Exact bytes read from the suspended target.
+    pub bytes: Vec<u8>,
+}
 
 // -----------------------------------------------------------------------
 // DumpOptions
@@ -26,7 +40,6 @@ pub struct DumpOptions {
     /// leftovers, Themida-specific sections).
     pub shrink: bool,
 
-
     /// Path where the dumped executable will be written.
     pub output_path: std::path::PathBuf,
 
@@ -47,6 +60,10 @@ pub struct DumpOptions {
     /// (FileHeader.Characteristics, Subsystem, etc.).  Falls back to the
     /// in-memory header if the file is missing or unparseable.
     pub executable_path: Option<std::path::PathBuf>,
+
+    /// Loader-initialized section baselines captured before the target's main
+    /// thread was resumed. Empty for traditional debugging and other samples.
+    pub early_section_snapshots: Vec<EarlySectionSnapshot>,
 }
 
 // -----------------------------------------------------------------------

@@ -704,8 +704,8 @@ pub(super) fn find_iat_via_data_heuristic(
             }
         }
 
-        if non_zero >= window / 4 && api_count >= non_zero / 2 {
-            if api_count > best_score {
+        if non_zero >= window / 4 && api_count >= non_zero / 2
+            && api_count > best_score {
                 best_score = api_count;
                 // Walk back to find the true start.
                 let mut true_start = start;
@@ -722,7 +722,6 @@ pub(super) fn find_iat_via_data_heuristic(
                 }
                 best_start = data_section_base + true_start * ptr_size;
             }
-        }
     }
 
     if best_start != 0 {

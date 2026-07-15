@@ -85,12 +85,18 @@ mida-cli.exe /dump-process 12345 unpacked_text.bin
 
 ### `/verify` — Compare against a reference
 
-Compares PE structure (sections, imports, entry point) of an unpacked file
-against a known-good reference to validate correctness.
+Compares loader-critical PE structure (architecture, executable entry point,
+section layout, Import/IAT directories, and the ordered import module/function
+list) against a known-good reference. Loader-critical mismatches return a
+non-zero exit code; benign rebuilt-section layout differences are reported as
+warnings.
 
 ```bash
 mida-cli.exe /verify unpacked.exe reference_clean.exe
 ```
+
+Use an unpacked/clean reference, not the protected input: a protector normally
+changes the entry point, section table, and bootstrap imports by design.
 
 ## Architecture
 

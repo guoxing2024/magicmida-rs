@@ -1,19 +1,18 @@
+use super::helpers::compute_data_section_bounds;
+use super::iat_trace::{advance_to_next_slot, IatTraceState};
+use super::session::ProcessSession;
+use super::LoopState;
+use crate::log::{self, LogType};
 use anyhow::anyhow;
+use mida_core::{ContinueStatus, DebugEvent, DebuggerCore};
+use mida_packers_themida::{
+    determine_iat_address, find_real_oep_by_scanning, handle_tls_callbacks,
+    install_code_section_guard, install_iat_guard, is_oep_virtualized, process_guarded_access,
+    remove_code_section_guard, try_find_correct_oep, GuardAccessResult, ThemidaState,
+};
+use mida_pe::PeHeader;
 use tracing::{debug, info, warn};
 use windows::Win32::Foundation::HANDLE;
-use mida_core::{ContinueStatus, DebugEvent, DebuggerCore};
-use mida_pe::PeHeader;
-use mida_packers_themida::{
-    GuardAccessResult, ThemidaState,
-    find_real_oep_by_scanning, install_code_section_guard, install_iat_guard,
-    is_oep_virtualized, process_guarded_access, remove_code_section_guard,
-    try_find_correct_oep, handle_tls_callbacks, determine_iat_address,
-};
-use crate::log::{self, LogType};
-use super::session::ProcessSession;
-use super::iat_trace::{IatTraceState, advance_to_next_slot};
-use super::helpers::compute_data_section_bounds;
-use super::LoopState;
 
 /// What the debug loop should do after handling an AccessViolation.
 pub(super) enum AvAction {
@@ -68,28 +67,33 @@ pub(super) fn handle_access_violation(
         text_end,
         exc_type,
     )? {
-        GuardAccessResult::Handled { address: _, thread_id: tid } => {
+        GuardAccessResult::Handled {
+            address: _,
+            thread_id: tid,
+        } => {
             debug!(tid, "Guarded access handled — continuing");
             dbg.continue_event(tid, ContinueStatus::Continue)?;
         }
         GuardAccessResult::TlsCallback { address } => {
             log::log(
                 LogType::Info,
-                &format!("TLS callback detected at {:#x} — guard switched to Themida section", address),
+                &format!(
+                    "TLS callback detected at {:#x} — guard switched to Themida section",
+                    address
+                ),
             );
             dbg.continue_event(thread_id, ContinueStatus::Continue)?;
         }
         GuardAccessResult::MsvcTraceComplete { address } => {
             ls.oep = Some(address);
-            remove_code_section_guard(
-                h_process,
-                text_start,
-                text_end.saturating_sub(text_start),
-            )?;
-            log::log(LogType::Info, &format!(
-                "MSVC OEP synthesized and written at {:#x} — breaking debug loop",
-                address,
-            ));
+            remove_code_section_guard(h_process, text_start, text_end.saturating_sub(text_start))?;
+            log::log(
+                LogType::Info,
+                &format!(
+                    "MSVC OEP synthesized and written at {:#x} — breaking debug loop",
+                    address,
+                ),
+            );
             dbg.continue_event(thread_id, ContinueStatus::Continue)?;
             return Ok(AvAction::Break);
         }
@@ -97,20 +101,16 @@ pub(super) fn handle_access_violation(
             log::log(LogType::Info, &format!("Possible OEP at {:#x}", address));
 
             let tls_total = state.pe_info.tls_total;
-            let tls_result = handle_tls_callbacks(
-                dbg,
-                address,
-                8u32,
-                tls_total,
-                &mut state.tls_counter,
-            )?;
+            let tls_result =
+                handle_tls_callbacks(dbg, address, 8u32, tls_total, &mut state.tls_counter)?;
 
             if tls_result.oep_found {
                 ls.oep = tls_result.oep_address;
             } else {
                 let mut ret_addr: usize = 0;
                 let mut ret_bytes = [0u8; 8];
-                let ctx = dbg.get_thread_context_control(thread_id)
+                let ctx = dbg
+                    .get_thread_context_control(thread_id)
                     .map_err(|e| anyhow!("get_thread_context_control: {e}"))?;
                 if dbg.read_memory(ctx.Rsp as usize, &mut ret_bytes).is_ok() {
                     ret_addr = u64::from_le_bytes(ret_bytes) as usize;
@@ -133,8 +133,10 @@ pub(super) fn handle_access_violation(
                 if ret_in_themida {
                     let pe_entry_point = dbg.image_base() as usize + pe.entry_point as usize;
                     let text_sec = &state.pe_info.pe_sections[0];
-                    let text_base_va = dbg.image_base() as usize + text_sec.virtual_address as usize;
-                    let text_end_va = dbg.image_base() as usize + state.pe_info.base_of_data as usize;
+                    let text_base_va =
+                        dbg.image_base() as usize + text_sec.virtual_address as usize;
+                    let text_end_va =
+                        dbg.image_base() as usize + state.pe_info.base_of_data as usize;
                     let text_len_va = text_end_va.saturating_sub(text_base_va);
 
                     let found_via_pattern_first = if state.pe_info.major_linker_version == 0
@@ -176,29 +178,35 @@ pub(super) fn handle_access_violation(
                     );
 
                     if ls.virtualized_oep_retries >= 1000 {
-                        warn!("Too many virtualized OEP retries ({}) — using last Possible OEP", ls.virtualized_oep_retries);
+                        warn!(
+                            "Too many virtualized OEP retries ({}) — using last Possible OEP",
+                            ls.virtualized_oep_retries
+                        );
                         let text_sec = &state.pe_info.pe_sections[0];
-                        let text_base = dbg.image_base() as usize + text_sec.virtual_address as usize;
-                        let text_end = dbg.image_base() as usize + state.pe_info.base_of_data as usize;
+                        let text_base =
+                            dbg.image_base() as usize + text_sec.virtual_address as usize;
+                        let text_end =
+                            dbg.image_base() as usize + state.pe_info.base_of_data as usize;
                         let text_len = text_end.saturating_sub(text_base);
 
-                        let found_via_pattern: Option<usize> = if state.pe_info.major_linker_version == 2 {
-                            None
-                        } else if state.pe_info.major_linker_version == 0
-                            || [6u8, 7, 8, 9, 10, 11, 12, 14]
-                                .contains(&state.pe_info.major_linker_version)
-                        {
-                            try_find_correct_oep(
-                                dbg,
-                                address,
-                                text_base,
-                                text_len,
-                                state.pe_info.major_linker_version,
-                            )
-                            .unwrap_or(None)
-                        } else {
-                            None
-                        };
+                        let found_via_pattern: Option<usize> =
+                            if state.pe_info.major_linker_version == 2 {
+                                None
+                            } else if state.pe_info.major_linker_version == 0
+                                || [6u8, 7, 8, 9, 10, 11, 12, 14]
+                                    .contains(&state.pe_info.major_linker_version)
+                            {
+                                try_find_correct_oep(
+                                    dbg,
+                                    address,
+                                    text_base,
+                                    text_len,
+                                    state.pe_info.major_linker_version,
+                                )
+                                .unwrap_or(None)
+                            } else {
+                                None
+                            };
 
                         let real_oep = if let Some(oep) = found_via_pattern {
                             info!(
@@ -230,10 +238,14 @@ pub(super) fn handle_access_violation(
                             text_start,
                             text_end.saturating_sub(text_start),
                         )?;
-                        let oep_str = ls.oep.map(|a| format!("{a:#x}")).unwrap_or_else(|| "unknown".into());
+                        let oep_str = ls
+                            .oep
+                            .map(|a| format!("{a:#x}"))
+                            .unwrap_or_else(|| "unknown".into());
                         info!(oep = %oep_str, "OEP found — removing guard");
                     } else {
-                        let mut ctx = dbg.get_thread_context_control(thread_id)
+                        let mut ctx = dbg
+                            .get_thread_context_control(thread_id)
                             .map_err(|e| anyhow!("get_thread_context_control: {e}"))?;
                         ctx.Rip = ret_addr as u64;
                         ctx.Rsp += 8;
@@ -241,7 +253,8 @@ pub(super) fn handle_access_violation(
 
                         let ts_start = (dbg.image_base() as usize)
                             .wrapping_add(state.pe_info.pe_sections[0].virtual_address as usize);
-                        let text_end = dbg.image_base() as usize + state.pe_info.base_of_data as usize;
+                        let text_end =
+                            dbg.image_base() as usize + state.pe_info.base_of_data as usize;
                         install_code_section_guard(
                             h_process,
                             ts_start,
@@ -257,8 +270,8 @@ pub(super) fn handle_access_violation(
                 ls.last_possible_oep = Some(address);
 
                 let text_section = &state.pe_info.pe_sections[0];
-                let text_base = (dbg.image_base() as usize)
-                    .wrapping_add(text_section.virtual_address as usize);
+                let text_base =
+                    (dbg.image_base() as usize).wrapping_add(text_section.virtual_address as usize);
                 let text_len = state
                     .pe_info
                     .base_of_data
@@ -298,7 +311,8 @@ pub(super) fn handle_access_violation(
                     state.msvc_oep = prev_addr;
                     state.trace_msvc_oep = true;
                     ls.oep = Some(prev_addr);
-                    let ctx = dbg.get_thread_context_control(thread_id)
+                    let ctx = dbg
+                        .get_thread_context_control(thread_id)
                         .map_err(|e| anyhow!("get_thread_context_control: {e}"))?;
                     let mut ret_bytes = [0u8; 8];
                     let mut ret_addr = 0usize;
@@ -306,7 +320,8 @@ pub(super) fn handle_access_violation(
                         ret_addr = u64::from_le_bytes(ret_bytes) as usize;
                     }
                     if ret_addr != 0 {
-                        let mut new_ctx = dbg.get_thread_context_control(thread_id)
+                        let mut new_ctx = dbg
+                            .get_thread_context_control(thread_id)
                             .map_err(|e| anyhow!("get_thread_context_control: {e}"))?;
                         new_ctx.Rip = ret_addr as u64;
                         new_ctx.Rsp += 8;
@@ -368,8 +383,10 @@ pub(super) fn handle_access_violation(
                     if let Some(oep_addr) = ls.oep {
                         let mut oep_bytes = [0u8; 4];
                         if dbg.read_memory(oep_addr, &mut oep_bytes).is_ok() {
-                            let looks_valid = matches!(oep_bytes[0], 0x48 | 0x55 | 0x53 | 0x56 | 0x57)
-                                || (oep_bytes[0] == 0x41 && matches!(oep_bytes[1], 0x54..=0x57));
+                            let looks_valid =
+                                matches!(oep_bytes[0], 0x48 | 0x55 | 0x53 | 0x56 | 0x57)
+                                    || (oep_bytes[0] == 0x41
+                                        && matches!(oep_bytes[1], 0x54..=0x57));
                             if looks_valid {
                                 info!(oep = %format!("{oep_addr:#x}"), "OEP looks like valid x64 code — using as-is for non-MSVC compiler");
                                 ls.oep = Some(oep_addr);
@@ -390,10 +407,13 @@ pub(super) fn handle_access_violation(
 
     // After OEP is found, set up IAT decryption monitoring.
     if ls.oep.is_some() && ls.iat_trace.is_none() {
-        let oep_addr = ls.oep.ok_or_else(|| anyhow!("OEP not found: cannot start IAT decryption wait"))?;
+        let oep_addr = ls
+            .oep
+            .ok_or_else(|| anyhow!("OEP not found: cannot start IAT decryption wait"))?;
         info!(oep = %format!("{oep_addr:#x}"), "OEP found — letting program execute for .text + IAT decryption");
 
-        let mut ctx = dbg.get_thread_context_control(thread_id)
+        let mut ctx = dbg
+            .get_thread_context_control(thread_id)
             .map_err(|e| anyhow!("get_thread_context_control: {e}"))?;
         ctx.Rip = oep_addr as u64;
         ctx.EFlags &= !0x100;
@@ -446,28 +466,37 @@ pub(super) fn handle_access_violation(
 
         loop {
             if start_time.elapsed() > timeout {
-                info!("IAT monitoring timeout reached ({} violations)", iat_violations);
+                info!(
+                    "IAT monitoring timeout reached ({} violations)",
+                    iat_violations
+                );
                 break;
             }
 
             let continue_result = dbg.continue_event(thread_id, ContinueStatus::Continue);
-            if continue_result.is_err() {
-                warn!("ContinueEvent failed: {}", continue_result.unwrap_err());
+            if let Err(err) = continue_result {
+                warn!("ContinueEvent failed: {}", err);
                 break;
             }
 
             match dbg.wait_event_timeout(100) {
                 Ok(event) => {
                     match event {
-                        DebugEvent::AccessViolation { address, target_address, .. } => {
+                        DebugEvent::AccessViolation {
+                            address,
+                            target_address,
+                            ..
+                        } => {
                             if target_address >= iat.address as u64
                                 && target_address < (iat.address + iat.size) as u64
                             {
                                 iat_violations += 1;
                                 // Record the faulting instruction address for later fixup
                                 state.guard_addrs.push(address as usize);
-                                debug!("IAT access #{} at target={:#x} from={:#x}",
-                                       iat_violations, target_address, address);
+                                debug!(
+                                    "IAT access #{} at target={:#x} from={:#x}",
+                                    iat_violations, target_address, address
+                                );
                             }
                         }
                         DebugEvent::ExitProcess { .. } => {
@@ -492,19 +521,26 @@ pub(super) fn handle_access_violation(
         let slot_count = iat.size / ptr_size;
         let mut slot_values = vec![0usize; slot_count];
         // SAFETY: slot_values is a Vec<usize>; the aliasing slice covers len * ptr_size bytes and is discarded after read_memory.
-        let bytes_read = dbg.read_memory(iat.address, unsafe {
-            std::slice::from_raw_parts_mut(
-                slot_values.as_mut_ptr() as *mut u8,
-                slot_values.len() * ptr_size,
-            )
-        }).unwrap_or(0);
+        let bytes_read = dbg
+            .read_memory(iat.address, unsafe {
+                std::slice::from_raw_parts_mut(
+                    slot_values.as_mut_ptr() as *mut u8,
+                    slot_values.len() * ptr_size,
+                )
+            })
+            .unwrap_or(0);
         let actual_slots = bytes_read / ptr_size;
         slot_values.truncate(actual_slots);
 
-        let api_like_count = slot_values.iter()
+        let api_like_count = slot_values
+            .iter()
             .filter(|&&v| v > 0x10000 && v < 0x7FFF_FFFF_FFFF)
             .count();
-        info!(api_like = api_like_count, total = actual_slots, "IAT analysis after execution");
+        info!(
+            api_like = api_like_count,
+            total = actual_slots,
+            "IAT analysis after execution"
+        );
 
         let mut tm_start = usize::MAX;
         let mut tm_end = 0;
@@ -524,7 +560,8 @@ pub(super) fn handle_access_violation(
         }
 
         let trace_thread_id = thread_id;
-        let trace_ctx = dbg.get_thread_context_control(trace_thread_id)
+        let trace_ctx = dbg
+            .get_thread_context_control(trace_thread_id)
             .map_err(|e| anyhow!("get_thread_context_control for trace_start_sp: {e}"))?;
         let trace_start_sp = trace_ctx.Rsp as usize;
 
@@ -539,7 +576,10 @@ pub(super) fn handle_access_violation(
             trace_thread_id,
             trace_start_sp,
         );
-        log::log(LogType::Info, &format!("IAT trace state created: {} slots", trace.total_slots));
+        log::log(
+            LogType::Info,
+            &format!("IAT trace state created: {} slots", trace.total_slots),
+        );
 
         advance_to_next_slot(dbg, &mut trace)?;
         ls.iat_trace = Some(trace);

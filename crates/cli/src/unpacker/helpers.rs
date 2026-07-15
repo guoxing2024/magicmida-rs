@@ -1,14 +1,14 @@
 //! Path, address, and API resolution helpers for the unpacker.
 
-use std::path::{Path, PathBuf};
+use super::session::{ProcessSession, ReadOnlyProcessDebugger, ResolvedApis};
 use anyhow::anyhow;
+use mida_core::DebuggerCore;
+use mida_packers_themida::{install_code_section_guard, ThemidaState};
+use std::path::{Path, PathBuf};
 use tracing::{debug, info};
 use windows::core::s;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
-use mida_core::DebuggerCore;
-use mida_packers_themida::{install_code_section_guard, ThemidaState};
-use super::session::{ResolvedApis, ProcessSession, ReadOnlyProcessDebugger};
 
 // ---------------------------------------------------------------------------
 // ScyllaHide paths
@@ -66,10 +66,7 @@ pub(super) fn resolve_output_path(input: &Path, output: Option<&Path>) -> PathBu
     name.push('.');
     name.push_str(ext);
 
-    input
-        .parent()
-        .unwrap_or(Path::new("."))
-        .join(&name)
+    input.parent().unwrap_or(Path::new(".")).join(&name)
 }
 
 // ---------------------------------------------------------------------------
@@ -90,7 +87,9 @@ pub(super) fn resolve_api_addrs() -> Result<ResolvedApis, anyhow::Error> {
     let ntdll = unsafe { GetModuleHandleW(windows::core::w!("ntdll.dll")) }
         .map_err(|e| anyhow!("GetModuleHandleW(ntdll.dll) failed: {e}"))?;
 
-    let resolve = |module: windows::Win32::Foundation::HMODULE, name: PCSTR| -> Result<usize, anyhow::Error> {
+    let resolve = |module: windows::Win32::Foundation::HMODULE,
+                   name: PCSTR|
+     -> Result<usize, anyhow::Error> {
         // SAFETY: module is a valid HMODULE from GetModuleHandleW; name is a valid PCSTR constant from s!().
         let addr = unsafe { GetProcAddress(module, name) };
         match addr {
@@ -238,8 +237,7 @@ pub(super) fn handle_hw_breakpoint(
     let rip = address as usize;
 
     let text_write_bp_addr = (image_base_usize + 0x1000) as u64;
-    let slot0_is_text_write = dbg
-        .hw_breakpoint_addr(0) == Some(text_write_bp_addr);
+    let slot0_is_text_write = dbg.hw_breakpoint_addr(0) == Some(text_write_bp_addr);
 
     if let Some(ref apis) = dbg.apis {
         let at_close = rip == apis.close_handle || rip == apis.nt_close;
@@ -252,11 +250,7 @@ pub(super) fn handle_hw_breakpoint(
                 "CloseHandle/NtClose hit — switching to .text write BP",
             );
             dbg.clear_hw_breakpoint(0)?;
-            dbg.set_hw_breakpoint(
-                0,
-                image_base_usize + 0x1000,
-                mida_core::HwbpType::Write,
-            )?;
+            dbg.set_hw_breakpoint(0, image_base_usize + 0x1000, mida_core::HwbpType::Write)?;
         } else if at_virtual_alloc {
             info!(
                 rip = %format_args!("{rip:#x}"),
@@ -267,7 +261,8 @@ pub(super) fn handle_hw_breakpoint(
             install_code_section_guard(
                 h_process,
                 image_base_usize + state.pe_info.pe_sections[0].virtual_address as usize,
-                state.pe_info.base_of_data as usize - state.pe_info.pe_sections[0].virtual_address as usize,
+                state.pe_info.base_of_data as usize
+                    - state.pe_info.pe_sections[0].virtual_address as usize,
                 guard_protection,
             )?;
             *guard_installed = true;

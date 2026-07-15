@@ -9,9 +9,7 @@
 use anyhow::anyhow;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 
-use mida_core::{
-    ContinueStatus, CoreError, DebugEvent, DebuggerCore, WindowsDebugger,
-};
+use mida_core::{ContinueStatus, CoreError, DebugEvent, DebuggerCore, WindowsDebugger};
 
 // ---------------------------------------------------------------------------
 // ResolvedApis
@@ -153,7 +151,7 @@ pub(super) fn get_thread_context_control(
     dbg: &ProcessSession,
     thread_id: u32,
 ) -> Result<windows::Win32::System::Diagnostics::Debug::CONTEXT, anyhow::Error> {
-    use windows::Win32::System::Diagnostics::Debug::{CONTEXT_CONTROL_AMD64, GetThreadContext};
+    use windows::Win32::System::Diagnostics::Debug::{GetThreadContext, CONTEXT_CONTROL_AMD64};
 
     let h = dbg.thread_handle(thread_id).map_err(|e| anyhow!("{e}"))?;
     let mut ctx: windows::Win32::System::Diagnostics::Debug::CONTEXT =
@@ -169,8 +167,7 @@ pub(super) fn get_thread_context_control(
     }
     // SAFETY: h is a valid thread handle with THREAD_GET_CONTEXT rights; ctx is a writable CONTEXT initialised with the right flags.
     unsafe {
-        GetThreadContext(h, &mut ctx)
-            .map_err(|e| anyhow!("GetThreadContext failed: {e}"))?;
+        GetThreadContext(h, &mut ctx).map_err(|e| anyhow!("GetThreadContext failed: {e}"))?;
     }
     Ok(ctx)
 }
@@ -186,8 +183,7 @@ pub(super) fn set_thread_context_control(
     let h = dbg.thread_handle(thread_id).map_err(|e| anyhow!("{e}"))?;
     // SAFETY: h is a valid thread handle with THREAD_SET_CONTEXT rights; ctx is a fully populated CONTEXT.
     unsafe {
-        SetThreadContext(h, ctx)
-            .map_err(|e| anyhow!("SetThreadContext failed: {e}"))?;
+        SetThreadContext(h, ctx).map_err(|e| anyhow!("SetThreadContext failed: {e}"))?;
     }
     Ok(())
 }
@@ -214,7 +210,10 @@ impl ReadOnlyProcessDebugger {
     /// Ownership of `h_process` transfers to the returned struct; it will be
     /// closed on drop.
     pub(super) fn new(h_process: HANDLE, image_base: u64) -> Self {
-        Self { h_process, image_base }
+        Self {
+            h_process,
+            image_base,
+        }
     }
 }
 
@@ -223,7 +222,9 @@ impl Drop for ReadOnlyProcessDebugger {
         // SAFETY: h_process was obtained from OpenProcess and is valid until
         // closed here; CloseHandle is safe to call exactly once.
         if !self.h_process.is_invalid() {
-            unsafe { let _ = CloseHandle(self.h_process); }
+            unsafe {
+                let _ = CloseHandle(self.h_process);
+            }
         }
     }
 }
@@ -289,11 +290,7 @@ impl DebuggerCore for ReadOnlyProcessDebugger {
         Ok(bytes_read)
     }
 
-    fn write_memory(
-        &mut self,
-        _address: usize,
-        _data: &[u8],
-    ) -> Result<usize, CoreError> {
+    fn write_memory(&mut self, _address: usize, _data: &[u8]) -> Result<usize, CoreError> {
         Err(CoreError::MemoryWrite {
             address: _address as u64,
             requested: _data.len(),

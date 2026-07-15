@@ -9,8 +9,8 @@
 
 use std::path::Path;
 
-use tracing::{debug, info, warn};
 use crate::header::PeHeader;
+use tracing::{debug, info, warn};
 
 /// Read the import table from the original PE file on disk.
 ///
@@ -77,8 +77,9 @@ pub fn read_original_import_table(path: &Path) -> Vec<(String, Vec<String>)> {
     while desc_offset + desc_size <= section_data.len() {
         let desc = &section_data[desc_offset..desc_offset + desc_size];
 
+        let original_first_thunk = u32::from_le_bytes([desc[0], desc[1], desc[2], desc[3]]);
         let name_rva = u32::from_le_bytes([desc[12], desc[13], desc[14], desc[15]]);
-        let ft_rva = u32::from_le_bytes([desc[16], desc[17], desc[18], desc[19]]);
+        let first_thunk = u32::from_le_bytes([desc[16], desc[17], desc[18], desc[19]]);
 
         if name_rva == 0 {
             break;
@@ -93,8 +94,8 @@ pub fn read_original_import_table(path: &Path) -> Vec<(String, Vec<String>)> {
             });
             match name_sec {
                 Some(ns) => {
-                    let off = (name_rva as usize) - ns.virtual_address as usize
-                        + ns.raw_offset as usize;
+                    let off =
+                        (name_rva as usize) - ns.virtual_address as usize + ns.raw_offset as usize;
                     if off < bytes.len() {
                         read_cstring(&bytes, off)
                     } else {
@@ -113,7 +114,21 @@ pub fn read_original_import_table(path: &Path) -> Vec<(String, Vec<String>)> {
         // Thunks may be in a different section than the import descriptors,
         // so we use RVA-to-offset conversion via the PE section table.
         let mut functions: Vec<String> = Vec::new();
-        let mut thunk_rva = ft_rva as usize;
+        // Prefer OriginalFirstThunk: after the loader resolves imports,
+        // FirstThunk contains process addresses rather than hint/name RVAs.
+        // Some rebuilt files intentionally set OFT to zero, so fall back to
+        // FirstThunk for those Pascal-compatible tables.
+        let mut thunk_rva = if original_first_thunk != 0 {
+            original_first_thunk
+        } else {
+            first_thunk
+        } as usize;
+        let thunk_size = if pe.is_64bit { 8 } else { 4 };
+        let ordinal_flag = if pe.is_64bit {
+            0x8000_0000_0000_0000
+        } else {
+            0x8000_0000
+        };
         loop {
             // Find the section containing this RVA
             let thunk_sec = pe.sections.iter().find(|s| {
@@ -125,34 +140,43 @@ pub fn read_original_import_table(path: &Path) -> Vec<(String, Vec<String>)> {
                 Some(s) => s,
                 None => break,
             };
-            let thunk_off = thunk_rva - thunk_sec.virtual_address as usize
-                + thunk_sec.raw_offset as usize;
-            if thunk_off + 8 > bytes.len() { break; }
+            let thunk_off =
+                thunk_rva - thunk_sec.virtual_address as usize + thunk_sec.raw_offset as usize;
+            if thunk_off + thunk_size > bytes.len() {
+                break;
+            }
 
-            let thunk = usize::from_le_bytes([
-                bytes[thunk_off], bytes[thunk_off + 1],
-                bytes[thunk_off + 2], bytes[thunk_off + 3],
-                bytes[thunk_off + 4], bytes[thunk_off + 5],
-                bytes[thunk_off + 6], bytes[thunk_off + 7],
-            ]);
+            let thunk = if pe.is_64bit {
+                u64::from_le_bytes(
+                    bytes[thunk_off..thunk_off + 8]
+                        .try_into()
+                        .unwrap_or_default(),
+                )
+            } else {
+                u32::from_le_bytes(
+                    bytes[thunk_off..thunk_off + 4]
+                        .try_into()
+                        .unwrap_or_default(),
+                ) as u64
+            };
 
-            if thunk == 0 { break; }
+            if thunk == 0 {
+                break;
+            }
 
-            const IMAGE_ORDINAL_FLAG64: usize = 0x8000_0000_0000_0000;
-            if thunk & IMAGE_ORDINAL_FLAG64 != 0 {
+            if thunk & ordinal_flag != 0 {
                 let ordinal = thunk & 0xFFFF;
                 functions.push(format!("#{ordinal}"));
             } else {
                 // Import by name - hint/name at thunk RVA
-                let hint_rva = (thunk & 0x7FFFFFFF) as usize;
+                let hint_rva = (thunk & 0x7fff_ffff) as usize;
                 let hint_sec = pe.sections.iter().find(|s| {
                     let start = s.virtual_address as usize;
                     let end = start + s.virtual_size as usize;
                     hint_rva >= start && hint_rva < end
                 });
                 if let Some(hs) = hint_sec {
-                    let hint_off = hint_rva - hs.virtual_address as usize
-                        + hs.raw_offset as usize;
+                    let hint_off = hint_rva - hs.virtual_address as usize + hs.raw_offset as usize;
                     if hint_off + 2 < bytes.len() {
                         let func_name = read_cstring(&bytes, hint_off + 2);
                         if !func_name.is_empty() {
@@ -162,7 +186,7 @@ pub fn read_original_import_table(path: &Path) -> Vec<(String, Vec<String>)> {
                 }
             }
 
-            thunk_rva += 8;
+            thunk_rva += thunk_size;
         }
 
         if !functions.is_empty() {
@@ -207,7 +231,9 @@ pub fn resolve_imports_via_getprocaddress(
     imports: &[(String, Vec<String>)],
 ) -> std::collections::HashMap<(String, String), usize> {
     use windows::core::PCSTR;
-    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExA, LOAD_LIBRARY_SEARCH_SYSTEM32};
+    use windows::Win32::System::LibraryLoader::{
+        GetProcAddress, LoadLibraryExA, LOAD_LIBRARY_SEARCH_SYSTEM32,
+    };
 
     let mut resolved = std::collections::HashMap::new();
 
@@ -220,7 +246,7 @@ pub fn resolve_imports_via_getprocaddress(
             LoadLibraryExA(
                 PCSTR::from_raw(dll_name_cstr.as_ptr()),
                 None,
-                LOAD_LIBRARY_SEARCH_SYSTEM32
+                LOAD_LIBRARY_SEARCH_SYSTEM32,
             )
         };
 
@@ -237,9 +263,9 @@ pub fn resolve_imports_via_getprocaddress(
 
         for func_name in functions {
             debug!("Resolving {dll_name}:{func_name}");
-            let addr = if func_name.starts_with('#') {
+            let addr = if let Some(ordinal_str) = func_name.strip_prefix('#') {
                 // Import by ordinal: use MAKEINTRESOURCEA(ordinal)
-                let ordinal: u16 = match func_name[1..].parse() {
+                let ordinal: u16 = match ordinal_str.parse() {
                     Ok(o) => o,
                     Err(_) => {
                         warn!("Invalid ordinal format: {func_name}");

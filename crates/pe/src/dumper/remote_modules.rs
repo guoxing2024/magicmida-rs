@@ -83,11 +83,11 @@ pub fn take_module_snapshot(
     image_base: u64,
     is_64bit: bool,
 ) -> Result<Vec<RemoteModule>, PeError> {
-    use windows::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, MODULEENTRY32W,
-        TH32CS_SNAPMODULE, TH32CS_SNAPMODULE32,
-    };
     use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, MODULEENTRY32W, TH32CS_SNAPMODULE,
+        TH32CS_SNAPMODULE32,
+    };
 
     // 1. Create the module snapshot.
     // TH32CS_SNAPMODULE32 lets a 64-bit debugger enumerate a 32-bit (WOW64)
@@ -95,15 +95,13 @@ pub fn take_module_snapshot(
     // and we miss kernel32/user32 etc., breaking `is_api_address` on x86
     // targets. SNAPSHOTMODULE | SNAPSHOTMODULE32 (8 | 16 = 24) returns both.
     // SAFETY: pid is the target process ID obtained from the debugger.
-    let h_snap = unsafe {
-        CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid)
-    }
-    .map_err(|e| {
-        PeError::Parse(format!(
-            "CreateToolhelp32Snapshot failed: {:#x}",
-            e.code().0
-        ))
-    })?;
+    let h_snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid) }
+        .map_err(|e| {
+            PeError::Parse(format!(
+                "CreateToolhelp32Snapshot failed: {:#x}",
+                e.code().0
+            ))
+        })?;
 
     let mut modules: Vec<RemoteModule> = Vec::new();
 
@@ -132,11 +130,7 @@ pub fn take_module_snapshot(
                     "Enumerating module"
                 );
 
-                match gather_module_exports_from_remote(
-                    process_handle,
-                    base,
-                    is_64bit,
-                ) {
+                match gather_module_exports_from_remote(process_handle, base, is_64bit) {
                     Ok((exports, forwards)) => {
                         modules.push(RemoteModule {
                             base,
@@ -167,12 +161,11 @@ pub fn take_module_snapshot(
 
     // 3. Clean up
     // SAFETY: h_snap is a valid snapshot handle.
-    unsafe { let _ = CloseHandle(h_snap); }
+    unsafe {
+        let _ = CloseHandle(h_snap);
+    }
 
-    debug!(
-        module_count = modules.len(),
-        "Module snapshot complete"
-    );
+    debug!(module_count = modules.len(), "Module snapshot complete");
 
     Ok(modules)
 }
@@ -193,13 +186,7 @@ pub(crate) fn gather_module_exports_from_remote(
     process_handle: HANDLE,
     module_base: u64,
     _is_64bit: bool,
-) -> Result<
-    (
-        std::collections::HashMap<u64, String>,
-        Vec<(String, u64)>,
-    ),
-    PeError,
-> {
+) -> Result<(std::collections::HashMap<u64, String>, Vec<(String, u64)>), PeError> {
     // Helper: read memory from the target process.
     fn read_remote(handle: HANDLE, addr: u64, buf: &mut [u8]) -> Result<usize, PeError> {
         let mut bytes: usize = 0;
@@ -229,14 +216,20 @@ pub(crate) fn gather_module_exports_from_remote(
         buf.get(offset..offset + 4)
             .and_then(|s| s.try_into().ok())
             .map(u32::from_le_bytes)
-            .ok_or(PeError::Parse(format!("Failed to read u32 at offset {}", offset)))
+            .ok_or(PeError::Parse(format!(
+                "Failed to read u32 at offset {}",
+                offset
+            )))
     };
 
     let read_u16_le = |buf: &[u8], offset: usize| -> Result<u16, PeError> {
         buf.get(offset..offset + 2)
             .and_then(|s| s.try_into().ok())
             .map(u16::from_le_bytes)
-            .ok_or(PeError::Parse(format!("Failed to read u16 at offset {}", offset)))
+            .ok_or(PeError::Parse(format!(
+                "Failed to read u16 at offset {}",
+                offset
+            )))
     };
 
     // 1. Read DOS header (first 64 bytes for the e_lfanew field).
@@ -281,11 +274,7 @@ pub(crate) fn gather_module_exports_from_remote(
 
     // 3. Read the export directory.
     let mut exp_buf = vec![0u8; exp_size as usize];
-    read_remote(
-        process_handle,
-        module_base + exp_va as u64,
-        &mut exp_buf,
-    )?;
+    read_remote(process_handle, module_base + exp_va as u64, &mut exp_buf)?;
 
     // IMAGE_EXPORT_DIRECTORY layout:
     //   +0  Characteristics     (u32)
@@ -302,17 +291,25 @@ pub(crate) fn gather_module_exports_from_remote(
 
     // Helper for export buffer reads
     let read_exp_u32 = |offset: usize| -> Result<u32, PeError> {
-        exp_buf.get(offset..offset + 4)
+        exp_buf
+            .get(offset..offset + 4)
             .and_then(|s| s.try_into().ok())
             .map(u32::from_le_bytes)
-            .ok_or(PeError::Parse(format!("Failed to read u32 from export at offset {}", offset)))
+            .ok_or(PeError::Parse(format!(
+                "Failed to read u32 from export at offset {}",
+                offset
+            )))
     };
 
     let read_exp_u16 = |offset: usize| -> Result<u16, PeError> {
-        exp_buf.get(offset..offset + 2)
+        exp_buf
+            .get(offset..offset + 2)
             .and_then(|s| s.try_into().ok())
             .map(u16::from_le_bytes)
-            .ok_or(PeError::Parse(format!("Failed to read u16 from export at offset {}", offset)))
+            .ok_or(PeError::Parse(format!(
+                "Failed to read u16 from export at offset {}",
+                offset
+            )))
     };
 
     let num_functions = read_exp_u32(20)? as usize;
@@ -331,8 +328,7 @@ pub(crate) fn gather_module_exports_from_remote(
         }
     };
 
-    let mut exports: std::collections::HashMap<u64, String> =
-        std::collections::HashMap::new();
+    let mut exports: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
     let mut forwards: Vec<(String, u64)> = Vec::new();
 
     // Track which function indices have names assigned.
@@ -374,8 +370,7 @@ pub(crate) fn gather_module_exports_from_remote(
                     .iter()
                     .position(|&b| b == 0)
                     .unwrap_or(exp_buf.len() - ns_off);
-                let name =
-                    String::from_utf8_lossy(&exp_buf[ns_off..ns_off + end]).into_owned();
+                let name = String::from_utf8_lossy(&exp_buf[ns_off..ns_off + end]).into_owned();
 
                 let addr = module_base + func_rva as u64;
                 exports.insert(addr, name);
@@ -393,10 +388,8 @@ pub(crate) fn gather_module_exports_from_remote(
                             .iter()
                             .position(|&b| b == 0)
                             .unwrap_or(exp_buf.len() - fwd_off);
-                        let fwd_str = String::from_utf8_lossy(
-                            &exp_buf[fwd_off..fwd_off + fwd_end],
-                        )
-                        .into_owned();
+                        let fwd_str = String::from_utf8_lossy(&exp_buf[fwd_off..fwd_off + fwd_end])
+                            .into_owned();
                         // Skip private forwards containing ".#"
                         if !fwd_str.contains(".#") {
                             forwards.push((fwd_str, addr));

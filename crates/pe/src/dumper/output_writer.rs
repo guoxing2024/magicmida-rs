@@ -9,11 +9,12 @@ use crate::header::PeHeader;
 use crate::import_table::ImportTableBuilder;
 
 use super::helpers::{
-    create_dos_header, IMAGE_DIRECTORY_ENTRY_IAT,
-    IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE,
+    create_dos_header, IMAGE_DIRECTORY_ENTRY_IAT, IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE,
 };
 use super::import_section::{fill_additional_iat_locations, write_iat_to_output};
 use super::types::DumpOptions;
+
+use super::container_snapshot::ContainerSnapshot;
 
 /// Write the dumped PE to the output file.
 ///
@@ -30,6 +31,8 @@ pub(crate) fn write_output_file(
     original_iat_rva: u32,
     is_64bit: bool,
     opts: &DumpOptions,
+    output_entry_point: u32,
+    _containers: &[ContainerSnapshot],
 ) -> Result<Vec<u8>, PeError> {
     let pe_offset = 0x80usize;
     let mut out_data = Vec::new();
@@ -39,7 +42,7 @@ pub(crate) fn write_output_file(
 
     // 6b. Update header fields
     pe.nt_headers.file_header.number_of_sections = pe.sections.len() as u16;
-    pe.nt_headers.optional_header.address_of_entry_point = opts.entry_point;
+    pe.nt_headers.optional_header.address_of_entry_point = output_entry_point;
     pe.nt_headers.optional_header.dll_characteristics &= !IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE;
 
     // 6c. Serialize NT headers + section table
@@ -75,6 +78,10 @@ pub(crate) fn write_output_file(
     // 6e. Write each section's data
     write_section_data(&mut out_data, pe, dump_buf);
 
+    // 6e2. Container restoration is now handled by the pre-OEP bootstrap stub.
+    // The stub embedded in .boot will allocate heap memory and update the
+    // encoded pointers at runtime. No static restoration needed here.
+
     // 6f. Write Hint/Name RVAs to the IAT location
     write_iat_to_output(&mut out_data, pe, import_thunks, original_iat_rva, is_64bit);
 
@@ -102,7 +109,10 @@ fn debug_serialize_output(header_data: &[u8]) {
             header_data[chars_offset_in_header + 2],
             header_data[chars_offset_in_header + 3],
         ]);
-        info!("serialize_headers buffer: Section 1 chars at {:#x} = {:#x}", chars_offset_in_header, chars);
+        info!(
+            "serialize_headers buffer: Section 1 chars at {:#x} = {:#x}",
+            chars_offset_in_header, chars
+        );
     }
 
     debug!(
@@ -119,19 +129,20 @@ fn debug_serialize_output(header_data: &[u8]) {
 }
 
 /// Manually re-write data directories at the correct offsets.
-fn rewrite_data_directories(
-    out_data: &mut [u8],
-    pe: &PeHeader,
-    pe_offset: usize,
-    is_64bit: bool,
-) {
+fn rewrite_data_directories(out_data: &mut [u8], pe: &PeHeader, pe_offset: usize, is_64bit: bool) {
     let opt_start = pe_offset + 24;
     let dd_start = if is_64bit {
         opt_start + 112 // PE32+
     } else {
-        opt_start + 96  // PE32
+        opt_start + 96 // PE32
     };
-    for (i, dd) in pe.nt_headers.optional_header.data_directory.iter().enumerate() {
+    for (i, dd) in pe
+        .nt_headers
+        .optional_header
+        .data_directory
+        .iter()
+        .enumerate()
+    {
         let off = dd_start + i * 8;
         if off + 8 <= out_data.len() {
             out_data[off..off + 4].copy_from_slice(&dd.virtual_address.to_le_bytes());
@@ -144,7 +155,10 @@ fn rewrite_data_directories(
     if dd15_offset + 8 <= out_data.len() {
         out_data[dd15_offset..dd15_offset + 4].fill(0);
         out_data[dd15_offset + 4..dd15_offset + 8].fill(0);
-        info!("CRITICAL FIX: Cleared Data Directory[15] at offset {:#x}", dd15_offset);
+        info!(
+            "CRITICAL FIX: Cleared Data Directory[15] at offset {:#x}",
+            dd15_offset
+        );
     }
 
     debug!(
@@ -162,11 +176,7 @@ fn rewrite_data_directories(
 }
 
 /// Write section data at each section's PointerToRawData offset.
-fn write_section_data(
-    out_data: &mut Vec<u8>,
-    pe: &PeHeader,
-    dump_buf: &[u8],
-) {
+fn write_section_data(out_data: &mut Vec<u8>, pe: &PeHeader, dump_buf: &[u8]) {
     let dump_size = pe.size_of_image() as usize;
     let delta = 0u32; // pe.trim_huge_sections result, not used here for simplicity
 

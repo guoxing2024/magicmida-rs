@@ -24,48 +24,44 @@
 //!  dump to file ─▶ postprocess (data sections / shrink) ─▶ cleanup
 //! ```
 
-mod session;
-mod iat_trace;
-mod oep_scan;
-mod verify;
+mod av_handler;
 mod dump;
 mod helpers;
-mod av_handler;
+mod iat_trace;
+mod oep_scan;
+mod session;
+mod verify;
 
 use std::fs;
 use std::path::Path;
 
-use anyhow::{Context, anyhow};
+use anyhow::{anyhow, Context};
 use tracing::{debug, info, warn};
 use windows::Win32::System::Memory::PAGE_NOACCESS;
-use windows::Win32::System::Threading::{SuspendThread, ResumeThread};
+use windows::Win32::System::Threading::{ResumeThread, SuspendThread};
 
-use mida_core::{
-    CreateProcessOptions, ContinueStatus, DebugEvent, DebuggerCore, HwbpType,
-};
-use mida_pe::{DumpOptions, PeHeader};
-use mida_packers_themida::{
-    CompilerHint, IatFixStrategy, ScyllaHideConfig, ThemidaState,
-    create_data_sections, determine_iat_address, fix_iat,
-    fixup_api_call_sites, handle_nt_set_information_thread, init_pe_details,
-    inject_scylla_hide, install_anti_dump_fix,
-    shrink_pe,
-};
 use crate::log::{self, LogType};
-
-use session::ProcessSession;
-use iat_trace::{IatTraceState, TracePhase, handle_trace_step};
-use oep_scan::scan_live_memory_for_real_oep;
-use helpers::{
-    scylla_injector_path, scylla_hook_path, resolve_output_path, resolve_api_addrs,
-    resolve_host_api, compute_data_section_bounds, pe_section_name_remote_rva,
-    dotnet_dump_and_dump_output, handle_hw_breakpoint,
+use mida_core::{ContinueStatus, CreateProcessOptions, DebugEvent, DebuggerCore, HwbpType};
+use mida_packers_themida::{
+    create_data_sections, determine_iat_address, fix_iat, fixup_api_call_sites,
+    handle_nt_set_information_thread, init_pe_details, inject_scylla_hide, install_anti_dump_fix,
+    shrink_pe, CompilerHint, IatFixStrategy, ScyllaHideConfig, ThemidaState,
 };
-use av_handler::{AvAction, handle_access_violation};
+use mida_pe::{DumpOptions, EarlySectionSnapshot, PeHeader};
+
+use av_handler::{handle_access_violation, AvAction};
+use helpers::{
+    compute_data_section_bounds, dotnet_dump_and_dump_output, handle_hw_breakpoint,
+    pe_section_name_remote_rva, resolve_api_addrs, resolve_host_api, resolve_output_path,
+    scylla_hook_path, scylla_injector_path,
+};
+use iat_trace::{handle_trace_step, IatTraceState, TracePhase};
+use oep_scan::scan_live_memory_for_real_oep;
+use session::ProcessSession;
 
 // Re-export public functions for commands.rs
-pub use verify::verify_unpacked;
 pub use dump::dump_process_code;
+pub use verify::verify_unpacked;
 
 // ---------------------------------------------------------------------------
 // LoopState — mutable tracking variables for the debug loop
@@ -127,8 +123,8 @@ pub fn unpack(
     // ---- step 2: parse PE header ----
     log::log(LogType::Info, &format!("Loading: {}", input.display()));
 
-    let mut pe = PeHeader::from_file(input)
-        .map_err(|e| anyhow!("Failed to parse PE header: {e}"))?;
+    let mut pe =
+        PeHeader::from_file(input).map_err(|e| anyhow!("Failed to parse PE header: {e}"))?;
 
     let is_64bit = pe.is_64bit;
     debug!(is_64bit, "PE architecture");
@@ -136,12 +132,10 @@ pub fn unpack(
     // ---- step 3: detect Themida ----
     // Read entry-point bytes for virtualised OEP detection.
     let ep_offset_val = pe.rva_to_offset(pe.entry_point).unwrap_or(0) as usize;
-    let entry_bytes = fs::read(input)
-        .ok()
-        .and_then(|data| {
-            data.get(ep_offset_val..ep_offset_val.saturating_add(8))
-                .map(|b| b.to_vec())
-        });
+    let entry_bytes = fs::read(input).ok().and_then(|data| {
+        data.get(ep_offset_val..ep_offset_val.saturating_add(8))
+            .map(|b| b.to_vec())
+    });
     if let Some(ref bytes) = entry_bytes {
         log::log(
             LogType::Info,
@@ -170,9 +164,13 @@ pub fn unpack(
     const IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR: usize = 14;
     let is_dotnet = pe.nt_headers.optional_header.data_directory
         [IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR]
-        .virtual_address != 0;
+        .virtual_address
+        != 0;
     if is_dotnet {
-        log::log(LogType::Info, ".NET target detected — will dump via _CorExeMain breakpoint");
+        log::log(
+            LogType::Info,
+            ".NET target detected — will dump via _CorExeMain breakpoint",
+        );
     }
 
     // ---- step 3c: for .NET targets, pre-resolve _CorExeMain from host mscoree ----
@@ -197,18 +195,26 @@ pub fn unpack(
 
     // post-attach mode: when section 0 is plain ".text" (not a Themida
     // virtualized section) and the target isn't .NET, create the process
-    // WITHOUT DEBUG_ONLY_THIS_PROCESS and attach later.  This defeats
+    // without DEBUG_ONLY_THIS_PROCESS and explicitly resume it after the early
+    // loader-initialized section snapshot has been captured.
     // protectors that read EPROCESS.DebugPort from t=0 and exit with
     // 0xDEADC0DE.  See WindowsDebugger::post_attach_init.
     // post-attach: when section 0 is plain .text (not a Themida
     // virtualized section) and the target is not .NET, create the
     // process WITHOUT DEBUG_ONLY_THIS_PROCESS.
-    let text_is_plain_for_attach = state.pe_info.pe_sections.first()
-        .is_some_and(|s| s.name == ".text") && !is_dotnet;
+    let text_is_plain_for_attach = state
+        .pe_info
+        .pe_sections
+        .first()
+        .is_some_and(|s| s.name == ".text")
+        && !is_dotnet;
     let opts = CreateProcessOptions {
         executable: input.to_path_buf(),
         command_line: None,
-        is_dll: input.extension().map(|e| e.eq_ignore_ascii_case("dll")).unwrap_or(false),
+        is_dll: input
+            .extension()
+            .map(|e| e.eq_ignore_ascii_case("dll"))
+            .unwrap_or(false),
         suspended: false,
         post_attach: text_is_plain_for_attach,
     };
@@ -232,11 +238,27 @@ pub fn unpack(
     // out of scope.  `ProcessSession` is a thin RAII wrapper: no handle of
     // its own, the only addition is the per-session `ResolvedApis` cache.
     let mut dbg = ProcessSession::new(
-        mida_core::WindowsDebugger::new(&opts)
-            .context("Failed to create debuggee process")?,
+        mida_core::WindowsDebugger::new(&opts).context("Failed to create debuggee process")?,
     );
 
-    log::log(LogType::Info, &format!("Process created (PID: {})", dbg.pid()));
+    log::log(
+        LogType::Info,
+        &format!("Process created (PID: {})", dbg.pid()),
+    );
+
+    // Capture loader-initialized zero-raw data before the post-attach main
+    // thread can execute CRT or application initializers. Start with the
+    // minimal `.data` policy; later phases preserve decrypted code and IAT.
+    let mut early_section_snapshots = if text_is_plain_for_attach {
+        capture_early_section_snapshots(&dbg, &pe, &[".data"])?
+    } else {
+        Vec::new()
+    };
+
+    if text_is_plain_for_attach {
+        dbg.resume_post_attach_main_thread()
+            .context("Failed to resume post-attach main thread")?;
+    }
 
     // ---- post-attach: ScyllaHide pre-injection ----
     // In post-attach mode the CREATE_PROCESS_DEBUG_EVENT arrives AFTER
@@ -245,15 +267,14 @@ pub fn unpack(
     // window).  Inject here instead — the hooks land in the already-running
     // process before we enter the debug loop.
     //
-    // PEB patching in post-attach mode is already done by
-    // WindowsDebugger::post_attach_init (right after DebugActiveProcess froze
-    // the process), so the CREATE_PROCESS handler below skips it.
+    // PEB patching in post-attach mode is already done by WindowsDebugger while
+    // the process is suspended, so no CREATE_PROCESS handler is involved.
     let post_attach_mode = text_is_plain_for_attach;
     if post_attach_mode {
         // No ScyllaHide needed — there is no debug port, so Themida's
         // anti-debug checks (DebugPort, BeingDebugged) never trigger.
-        // The process was frozen by SuspendThread in post_attach_init,
-        // so we go straight to text polling + dump.
+        // The process started only after the early snapshot was captured, so we
+        // go straight to text polling + dump without a debug port.
         //
         // Resolve kernel32 API addresses for later use (breakpoint
         // comparisons etc.).
@@ -289,10 +310,8 @@ pub fn unpack(
     let h_process = dbg.process_handle();
 
     // ---- post-attach fast path: no debug port, direct dump ----
-    // In post-attach mode the process is already frozen (SuspendThread in
-    // post_attach_init).  There is no debug port, so we cannot use the
-    // debug event loop.  Instead: poll .text for stability, find OEP by
-    // scanning, then go straight to the dump phase.
+    // Observe the freely running primary thread, freeze it on its first
+    // transfer into decrypted .text, then go straight to the dump phase.
     if post_attach_mode {
         let image_base_usize = dbg.image_base() as usize;
         let text_sec = &state.pe_info.pe_sections[0];
@@ -300,120 +319,221 @@ pub fn unpack(
         let text_rva = text_sec.virtual_address;
         let text_vsize = text_sec.virtual_size;
 
-// ---- Poll for IAT resolution ----
-// The process is running free (no debug port).  Poll the first IAT
-// slot at .rdata until it becomes non-zero (resolved API address)
-// or timeout.  The IAT RVA is derived from the .rdata section start.
-let rdata_sec = state.pe_info.pe_sections.iter()
-    .find(|s| s.name == ".rdata")
-    .or_else(|| state.pe_info.pe_sections.get(1));
-let iat_rva = rdata_sec.map(|s| s.virtual_address).unwrap_or(0xFD000);
-let iat_addr = image_base_usize + iat_rva as usize;
+        // Observe startup without a debug port and freeze the primary thread
+        // on its first transfer into decrypted .text. Sampling starts as soon
+        // as CreateProcess resumes the thread; waiting for a resolved IAT first
+        // lets CRT/application initialization persist heap state into `.data`.
+        let rdata_sec = state
+            .pe_info
+            .pe_sections
+            .iter()
+            .find(|s| s.name == ".rdata")
+            .or_else(|| state.pe_info.pe_sections.get(1));
+        let iat_rva = rdata_sec.map(|s| s.virtual_address).unwrap_or(0xFD000);
+        let iat_addr = image_base_usize + iat_rva as usize;
 
-log::log(LogType::Info,
-    &format!("post-attach: polling IAT at {iat_addr:#x} (RVA {iat_rva:#x}) for resolution..."));
+        log::log(
+            LogType::Info,
+            &format!(
+                "post-attach: polling IAT at {iat_addr:#x} (RVA {iat_rva:#x}) for resolution..."
+            ),
+        );
 
-let poll_start = std::time::Instant::now();
-let max_wait = std::time::Duration::from_secs(60);
-let main_tid = dbg.main_thread_id();
-let h_thread = dbg.thread_handle(main_tid)
-    .map_err(|e| anyhow!("thread_handle for poll: {e}"))?;
+        let poll_start = std::time::Instant::now();
+        let max_wait = std::time::Duration::from_secs(60);
+        let main_tid = dbg.main_thread_id();
+        let h_thread = dbg
+            .thread_handle(main_tid)
+            .map_err(|e| anyhow!("thread_handle for poll: {e}"))?;
+        let text_end = text_start.saturating_add(text_vsize as usize);
+        let mut frozen_rip: Option<usize> = None;
+        let mut iat_resolved_logged = false;
 
-loop {
-    if poll_start.elapsed() > max_wait {
-        log::log(LogType::Warn,
-            "post-attach: IAT poll timeout after 60s - proceeding anyway");
-        break;
-    }
+        loop {
+            if poll_start.elapsed() > max_wait {
+                log::log(
+                    LogType::Warn,
+                    "post-attach: OEP observation timeout after 60s - proceeding with scan",
+                );
+                break;
+            }
 
-    // Check if process is still alive.
-    // `STILL_ACTIVE` (NTSTATUS 0x103) is the sentinel GetExitCodeProcess
-    // returns for a process that hasn't exited. We compare explicitly rather
-    // than relying on `is_ok()` so a real failure isn't silently treated as
-    // "process dead".
-    use windows::Win32::Foundation::STILL_ACTIVE;
-    let mut exit_code: u32 = 0;
-    let alive = match unsafe {
-        windows::Win32::System::Threading::GetExitCodeProcess(
-            dbg.process_handle(), &mut exit_code,
-        )
-    } {
-        Ok(()) => exit_code == STILL_ACTIVE.0 as u32,
-        Err(e) => {
-            // GetExitCodeProcess can fail with insufficient rights or if the
-            // process handle was never granted PROCESS_QUERY_LIMITED_INFORMATION.
-            // Don't assume the process is dead — log and keep polling; the
-            // outer 60s timeout is the real backstop.
-            log::log(
+            // Check if process is still alive.
+            // `STILL_ACTIVE` (NTSTATUS 0x103) is the sentinel GetExitCodeProcess
+            // returns for a process that hasn't exited. We compare explicitly rather
+            // than relying on `is_ok()` so a real failure isn't silently treated as
+            // "process dead".
+            use windows::Win32::Foundation::STILL_ACTIVE;
+            let mut exit_code: u32 = 0;
+            let alive = match unsafe {
+                windows::Win32::System::Threading::GetExitCodeProcess(
+                    dbg.process_handle(),
+                    &mut exit_code,
+                )
+            } {
+                Ok(()) => exit_code == STILL_ACTIVE.0 as u32,
+                Err(e) => {
+                    // GetExitCodeProcess can fail with insufficient rights or if the
+                    // process handle was never granted PROCESS_QUERY_LIMITED_INFORMATION.
+                    // Don't assume the process is dead — log and keep polling; the
+                    // outer 60s timeout is the real backstop.
+                    log::log(
                 LogType::Warn,
                 &format!("post-attach: GetExitCodeProcess failed: {e} (exit_code={:#x}) — assuming still alive", exit_code),
             );
-            true
-        }
-    };
-    if !alive {
-        return Err(anyhow!("Target process exited during IAT poll (exit_code={:#x})", exit_code));
-    }
-
-    // Read first 8 bytes of IAT to check if resolved.
-    let mut iat_val = [0u8; 8];
-    if dbg.read_memory(iat_addr, &mut iat_val).is_ok() {
-        let val = usize::from_le_bytes(iat_val);
-        if val != 0 {
-            log::log(LogType::Good,
-                &format!("post-attach: IAT resolved! first slot = {val:#x} (after {}s)",
-                         poll_start.elapsed().as_secs()));
-            break;
-        }
-    }
-
-    std::thread::sleep(std::time::Duration::from_millis(500));
-}
-
-// SuspendThread to freeze the process.
-let _ = unsafe { SuspendThread(h_thread) };
-log::log(LogType::Info, "post-attach: process frozen via SuspendThread");
-
-// Verify .text is decrypted.
-let mut sample = [0u8; 16];
-if dbg.read_memory(text_start, &mut sample).is_ok() {
-    let non_zero = sample.iter().filter(|&&b| b != 0).count();
-    log::log(LogType::Info,
-        &format!("post-attach: .text sample {non_zero}/16 non-zero"));
-}
-
-        // Find OEP by scanning .text for MSVC CRT startup pattern.
-        let oep_addr = match mida_packers_themida::find_real_oep_by_scanning(
-            &dbg, image_base_usize, text_rva, text_vsize,
-        ) {
-            Ok(Some(addr)) => {
-                log::log(LogType::Good,
-                    &format!("post-attach: OEP found via .text scan: {addr:#x}"));
-                addr
+                    true
+                }
+            };
+            if !alive {
+                return Err(anyhow!(
+                    "Target process exited during OEP observation (exit_code={:#x})",
+                    exit_code
+                ));
             }
-            Ok(None) => {
-                let pe_ep = image_base_usize + pe.entry_point as usize;
-                log::log(LogType::Warn,
-                    &format!("post-attach: OEP scan failed — using PE EP: {pe_ep:#x}"));
-                pe_ep
+
+            if !iat_resolved_logged {
+                let mut iat_val = [0u8; 8];
+                if dbg.read_memory(iat_addr, &mut iat_val).is_ok() {
+                    let val = usize::from_le_bytes(iat_val);
+                    if val != 0 {
+                        iat_resolved_logged = true;
+                        log::log(
+                            LogType::Good,
+                            &format!(
+                                "post-attach: IAT resolved, first slot = {val:#x} (after {} ms)",
+                                poll_start.elapsed().as_millis()
+                            ),
+                        );
+                    }
+                }
             }
-            Err(e) => {
-                log::log(LogType::Fatal,
-                    &format!("post-attach: OEP scan error: {e:#}"));
-                return Err(e.into());
+
+            let previous = unsafe { SuspendThread(h_thread) };
+            if previous != u32::MAX {
+                if let Ok(ctx) = dbg.get_thread_context_control(main_tid) {
+                    let rip = ctx.Rip as usize;
+                    if rip >= text_start && rip < text_end {
+                        let mut code = [0u8; 16];
+                        let decrypted = dbg
+                            .read_memory(rip, &mut code)
+                            .is_ok_and(|read| read >= 8 && code.iter().any(|&byte| byte != 0));
+                        if decrypted {
+                            frozen_rip = Some(rip);
+                            log::log(
+                                LogType::Good,
+                                &format!(
+                                    "post-attach: first decrypted .text execution captured at {rip:#x} after {} ms",
+                                    poll_start.elapsed().as_millis()
+                                ),
+                            );
+                            break;
+                        }
+                    } else {
+                        update_pre_text_snapshots(&dbg, &mut early_section_snapshots, rip)?;
+                    }
+                }
+                let _ = unsafe { ResumeThread(h_thread) };
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        // If observation timed out, freeze the thread before scanning/dumping.
+        if frozen_rip.is_none() {
+            let previous = unsafe { SuspendThread(h_thread) };
+            if previous == u32::MAX {
+                return Err(anyhow!("post-attach: failed to freeze primary thread"));
+            }
+        }
+
+        log::log(
+            LogType::Info,
+            &format!(
+                "post-attach: process frozen, main RIP={}",
+                frozen_rip
+                    .map(|rip| format!("{rip:#x}"))
+                    .unwrap_or_else(|| "outside .text".to_string())
+            ),
+        );
+
+        refresh_early_snapshots_after_loader(&dbg, &mut early_section_snapshots)?;
+        merge_reinitializable_data_state(
+            &dbg,
+            &mut early_section_snapshots,
+            pe.size_of_image() as usize,
+        )?;
+        log_snapshot_summary(&early_section_snapshots, "selected pre-.text baseline");
+
+        // Verify .text is decrypted.
+        let mut sample = [0u8; 16];
+        if dbg.read_memory(text_start, &mut sample).is_ok() {
+            let non_zero = sample.iter().filter(|&&b| b != 0).count();
+            log::log(
+                LogType::Info,
+                &format!("post-attach: .text sample {non_zero}/16 non-zero"),
+            );
+        }
+
+        // Prefer the actual frozen instruction pointer. Static scanning is a
+        // fallback for targets whose main thread never enters the first code
+        // section during the observation window.
+        let oep_addr = if let Some(rip) = frozen_rip {
+            log::log(
+                LogType::Good,
+                &format!("post-attach: OEP captured from RIP: {rip:#x}"),
+            );
+            rip
+        } else {
+            match mida_packers_themida::find_real_oep_by_scanning(
+                &dbg,
+                image_base_usize,
+                text_rva,
+                text_vsize,
+            ) {
+                Ok(Some(addr)) => {
+                    log::log(
+                        LogType::Good,
+                        &format!("post-attach: OEP found via .text scan: {addr:#x}"),
+                    );
+                    addr
+                }
+                Ok(None) => {
+                    let pe_ep = image_base_usize + pe.entry_point as usize;
+                    log::log(
+                        LogType::Warn,
+                        &format!("post-attach: OEP scan failed — using PE EP: {pe_ep:#x}"),
+                    );
+                    pe_ep
+                }
+                Err(e) => {
+                    log::log(
+                        LogType::Fatal,
+                        &format!("post-attach: OEP scan error: {e:#}"),
+                    );
+                    return Err(e.into());
+                }
             }
         };
 
-        log::log(LogType::Info,
-            "post-attach: process frozen — proceeding to IAT repair + dump");
+        log::log(
+            LogType::Info,
+            "post-attach: process frozen — proceeding to IAT repair + dump",
+        );
 
         // Go straight to post-loop phases (IAT repair, dump, postprocess).
         run_post_loop_phases(
-            &mut dbg, &mut state, &mut pe,
+            &mut dbg,
+            &mut state,
+            &mut pe,
             Some(oep_addr),
-            is_dotnet, is_64bit, do_data_sections, shrink,
+            is_dotnet,
+            is_64bit,
+            do_data_sections,
+            shrink,
             true, // post-attach mode
-            input, &output_path,
+            &early_section_snapshots,
+            input,
+            &output_path,
         )?;
 
         log::log(LogType::Good, "Done.");
@@ -448,7 +568,10 @@ if dbg.read_memory(text_start, &mut sample).is_ok() {
                     continue;
                 }
                 Err(e) => {
-                    log::log(LogType::Fatal, &format!("wait_event_timeout returned error: {e:#}"));
+                    log::log(
+                        LogType::Fatal,
+                        &format!("wait_event_timeout returned error: {e:#}"),
+                    );
                     return Err(e.into());
                 }
             }
@@ -498,15 +621,20 @@ if dbg.read_memory(text_start, &mut sample).is_ok() {
                     if non_zero > 8 {
                         if sample == ls.text_prev_sample {
                             // .text stable — decryption complete
-                            log::log(LogType::Good,
-                                &format!(".text decrypted and stable (poll #{}, {non_zero}/16 non-zero)",
-                                         ls.text_poll_count));
+                            log::log(
+                                LogType::Good,
+                                &format!(
+                                    ".text decrypted and stable (poll #{}, {non_zero}/16 non-zero)",
+                                    ls.text_poll_count
+                                ),
+                            );
                             ls.text_stable = true;
                             ls.text_polling = false;
 
                             // SuspendThread → read RIP → decide OEP vs guard
                             let main_tid = dbg.main_thread_id();
-                            let h_thread = dbg.thread_handle(main_tid)
+                            let h_thread = dbg
+                                .thread_handle(main_tid)
                                 .map_err(|e| anyhow!("thread_handle for poll: {e}"))?;
                             // SAFETY: h_thread is valid THREAD_SUSPEND_RESUME handle
                             let _ = unsafe { SuspendThread(h_thread) };
@@ -514,14 +642,20 @@ if dbg.read_memory(text_start, &mut sample).is_ok() {
                             let ctx = session::get_thread_context_control(&dbg, main_tid)?;
                             let rip = ctx.Rip as usize;
                             let text_end = image_base_usize + state.pe_info.base_of_data as usize;
-                            log::log(LogType::Info,
-                                &format!("After .text stable: RIP={:#x} (text={:#x}–{:#x})",
-                                         rip, text_start, text_end));
+                            log::log(
+                                LogType::Info,
+                                &format!(
+                                    "After .text stable: RIP={:#x} (text={:#x}–{:#x})",
+                                    rip, text_start, text_end
+                                ),
+                            );
 
                             if rip >= text_start && rip < text_end {
                                 // RIP in .text → this is OEP
-                                log::log(LogType::Good,
-                                    &format!("OEP captured via RIP in .text: {:#x}", rip));
+                                log::log(
+                                    LogType::Good,
+                                    &format!("OEP captured via RIP in .text: {:#x}", rip),
+                                );
                                 ls.oep = Some(rip);
                                 // Resume thread — will be redirected in post-loop
                                 let _ = unsafe { ResumeThread(h_thread) };
@@ -529,25 +663,37 @@ if dbg.read_memory(text_start, &mut sample).is_ok() {
                                 // RIP not in .text — .text already decrypted,
                                 // scan it for the real OEP (MSVC CRT pattern).
                                 // No guard needed — we go straight to dump.
-                                log::log(LogType::Info,
-                                    &format!("RIP not in .text ({:#x}) — scanning .text for OEP", rip));
+                                log::log(
+                                    LogType::Info,
+                                    &format!(
+                                        "RIP not in .text ({:#x}) — scanning .text for OEP",
+                                        rip
+                                    ),
+                                );
                                 let text_sec = &state.pe_info.pe_sections[0];
                                 let text_rva = text_sec.virtual_address;
                                 let text_vsize = text_sec.virtual_size;
                                 match mida_packers_themida::find_real_oep_by_scanning(
-                                    &dbg, image_base_usize, text_rva, text_vsize,
+                                    &dbg,
+                                    image_base_usize,
+                                    text_rva,
+                                    text_vsize,
                                 ) {
                                     Ok(Some(real_oep)) => {
-                                        log::log(LogType::Good,
-                                            &format!("OEP found via .text scan: {:#x}", real_oep));
+                                        log::log(
+                                            LogType::Good,
+                                            &format!("OEP found via .text scan: {:#x}", real_oep),
+                                        );
                                         ls.oep = Some(real_oep);
                                         ls.oep_found_via_scanning = true;
                                     }
                                     Ok(None) => {
                                         // Scan failed — try PE entry point as fallback
                                         let pe_ep = image_base_usize + pe.entry_point as usize;
-                                        log::log(LogType::Warn,
-                                            &format!("OEP scan failed — using PE EP: {:#x}", pe_ep));
+                                        log::log(
+                                            LogType::Warn,
+                                            &format!("OEP scan failed — using PE EP: {:#x}", pe_ep),
+                                        );
                                         ls.oep = Some(pe_ep);
                                         ls.oep_found_via_scanning = true;
                                     }
@@ -564,9 +710,13 @@ if dbg.read_memory(text_start, &mut sample).is_ok() {
                                     "Process kept frozen — will dump IAT + .text from suspended state");
                             }
                         } else {
-                            log::log(LogType::Info,
-                                &format!(".text has content but not stable yet (poll #{})",
-                                         ls.text_poll_count));
+                            log::log(
+                                LogType::Info,
+                                &format!(
+                                    ".text has content but not stable yet (poll #{})",
+                                    ls.text_poll_count
+                                ),
+                            );
                         }
                     }
                     ls.text_prev_sample = sample;
@@ -577,7 +727,10 @@ if dbg.read_memory(text_start, &mut sample).is_ok() {
         // If OEP found during text polling, break immediately to dump
         // while the process is still frozen (no ResumeThread).
         if ls.oep.is_some() && ls.oep_found_via_scanning {
-            log::log(LogType::Info, "OEP found via scanning — breaking debug loop for frozen dump");
+            log::log(
+                LogType::Info,
+                "OEP found via scanning — breaking debug loop for frozen dump",
+            );
             break;
         }
 
@@ -605,11 +758,13 @@ if dbg.read_memory(text_start, &mut sample).is_ok() {
                 // API resolution were done in the pre-loop block above.
                 // Skip them here to avoid redundant work / double-inject.
                 if post_attach_mode {
-                    debug!("post-attach: CREATE_PROCESS — PEB/ScyllaHide/APIs already done, skipping");
+                    debug!(
+                        "post-attach: CREATE_PROCESS — PEB/ScyllaHide/APIs already done, skipping"
+                    );
                 } else {
                     // Patch PEB (BeingDebugged, pShimData) via the core helper.
-                    let peb_base = mida_core::patch_peb_anti_debug(evt_h_process)
-                        .unwrap_or(image_base);
+                    let peb_base =
+                        mida_core::patch_peb_anti_debug(evt_h_process).unwrap_or(image_base);
                     debug!(peb_image_base = %format!("{peb_base:#x}"), "PEB patched");
 
                     // Resolve kernel32 API addresses (in the debugger's own
@@ -644,15 +799,14 @@ if dbg.read_memory(text_start, &mut sample).is_ok() {
                 // loop.  Mirrors Pascal TMInit lines 296-303.
                 // (Run in both modes — post-attach needs it too.)
                 if state.pe_info.pe_sections.len() > 2 {
-                    let name_rva = pe_section_name_remote_rva(
-                        evt_h_process,
-                        image_base as usize,
-                        2,
-                    );
+                    let name_rva =
+                        pe_section_name_remote_rva(evt_h_process, image_base as usize, 2);
                     if let Some(rva) = name_rva {
                         let remote_addr = image_base as usize + rva;
                         let mut name_byte = [0u8; 1];
-                        if dbg.read_memory(remote_addr, &mut name_byte).is_ok() && name_byte[0] == b'i' {
+                        if dbg.read_memory(remote_addr, &mut name_byte).is_ok()
+                            && name_byte[0] == b'i'
+                        {
                             let patch = [b'p'];
                             if dbg.write_memory(remote_addr, &patch).is_ok() {
                                 info!(
@@ -693,8 +847,10 @@ if dbg.read_memory(text_start, &mut sample).is_ok() {
                 } else if !is_dotnet {
                     // Non-.text section 0: fall back to CloseHandle → .text write
                     // → VirtualAlloc → guard chain (handled by HW BP handler)
-                    log::log(LogType::Info,
-                        "Section 0 is NOT .text — using CloseHandle HW BP chain");
+                    log::log(
+                        LogType::Info,
+                        "Section 0 is NOT .text — using CloseHandle HW BP chain",
+                    );
                 }
 
                 // NtProtectVirtualMemory BP disabled — it fires during Themida
@@ -717,7 +873,9 @@ if dbg.read_memory(text_start, &mut sample).is_ok() {
                 if is_dotnet {
                     if let Some(cmain) = cor_exe_main_addr {
                         match dbg.set_hw_breakpoint(3, cmain, HwbpType::Execute) {
-                            Ok(()) => info!(addr = %format!("{cmain:#x}"), "_CorExeMain HW BP set (slot 3) for .NET dump"),
+                            Ok(()) => {
+                                info!(addr = %format!("{cmain:#x}"), "_CorExeMain HW BP set (slot 3) for .NET dump")
+                            }
                             Err(e) => warn!("Cannot set _CorExeMain BP for .NET: {e}"),
                         }
                     }
@@ -816,11 +974,7 @@ if dbg.read_memory(text_start, &mut sample).is_ok() {
                         if bp_addr == address {
                             info!(addr = %format!("{address:#x}"), ".NET _CorExeMain hit — dumping process memory");
                             dbg.clear_hw_breakpoint(3)?;
-                            dotnet_dump_and_dump_output(
-                                &mut dbg,
-                                image_base_usize,
-                                &output_path,
-                            )?;
+                            dotnet_dump_and_dump_output(&mut dbg, image_base_usize, &output_path)?;
                             dbg.continue_event(thread_id, ContinueStatus::Continue)?;
                             break;
                         }
@@ -843,8 +997,10 @@ if dbg.read_memory(text_start, &mut sample).is_ok() {
                                 if dbg.read_memory(base_ptr, &mut base_bytes).is_ok() {
                                     let target_base = u64::from_le_bytes(base_bytes) as usize;
                                     let text_sec = &state.pe_info.pe_sections[0];
-                                    let text_start = image_base_usize + text_sec.virtual_address as usize;
-                                    let text_end = image_base_usize + state.pe_info.base_of_data as usize;
+                                    let text_start =
+                                        image_base_usize + text_sec.virtual_address as usize;
+                                    let text_end =
+                                        image_base_usize + state.pe_info.base_of_data as usize;
                                     if target_base >= text_start && target_base < text_end {
                                         // Themida is trying to remove PAGE_NOACCESS from .text.
                                         // Force newProtect to PAGE_NOACCESS (0x01) to keep guard.
@@ -925,7 +1081,7 @@ if dbg.read_memory(text_start, &mut sample).is_ok() {
                 ctx.Dr6 = 0; // clear — prevent re-fire
                 ctx.Dr7 = dbg_ctx.Dr7;
                 ctx.EFlags |= 0x10000; // RF (Resume Flag)
-                // Tell the kernel to write both groups.
+                                       // Tell the kernel to write both groups.
                 #[cfg(target_arch = "x86_64")]
                 {
                     ctx.ContextFlags = windows::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_AMD64
@@ -975,10 +1131,18 @@ if dbg.read_memory(text_start, &mut sample).is_ok() {
                     }
                 }
                 match handle_access_violation(
-                    &mut ls, &mut dbg, &mut state, &pe,
-                    h_process, guard_protection,
-                    image_base_usize, image_boundary,
-                    thread_id, exception_addr, target_address, exc_type,
+                    &mut ls,
+                    &mut dbg,
+                    &mut state,
+                    &pe,
+                    h_process,
+                    guard_protection,
+                    image_base_usize,
+                    image_boundary,
+                    thread_id,
+                    exception_addr,
+                    target_address,
+                    exc_type,
                 )? {
                     AvAction::Continue => {}
                     AvAction::Break => break,
@@ -997,7 +1161,13 @@ if dbg.read_memory(text_start, &mut sample).is_ok() {
                 if is_tracing {
                     // Handle IAT trace step.
                     if let Some(ref mut trace) = ls.iat_trace {
-                        handle_trace_step(&mut dbg, trace, address, image_base_usize, image_boundary)?;
+                        handle_trace_step(
+                            &mut dbg,
+                            trace,
+                            address,
+                            image_base_usize,
+                            image_boundary,
+                        )?;
                     }
 
                     // After handling the trace step, check if tracing is complete.
@@ -1018,13 +1188,15 @@ if dbg.read_memory(text_start, &mut sample).is_ok() {
                 // After the single-step completes, we must restore PAGE_NOACCESS.
                 if state.guard_stepping {
                     let text_sec = &state.pe_info.pe_sections[0];
-                    let text_base = dbg.image_base() as usize
-                        + text_sec.virtual_address as usize;
+                    let text_base = dbg.image_base() as usize + text_sec.virtual_address as usize;
                     // Pascal: FGuardEnd - FGuardStart = BaseOfData - PESections[0].VirtualAddress
-                    let text_size = state.pe_info.base_of_data as usize
-                        - text_sec.virtual_address as usize;
+                    let text_size =
+                        state.pe_info.base_of_data as usize - text_sec.virtual_address as usize;
                     mida_packers_themida::restore_code_section_guard(
-                        h_process, text_base, text_size, guard_protection,
+                        h_process,
+                        text_base,
+                        text_size,
+                        guard_protection,
                     )?;
                     state.guard_stepping = false;
                     dbg.continue_event(thread_id, ContinueStatus::Continue)?;
@@ -1045,7 +1217,10 @@ if dbg.read_memory(text_start, &mut sample).is_ok() {
                     "SingleStep at known HW-BP address — treating as CloseHandle hit"
                 );
 
-                log::log(LogType::Info, &format!("SINGLE STEP at {address:#x} — checking NtProtectVirtualMemory"));
+                log::log(
+                    LogType::Info,
+                    &format!("SINGLE STEP at {address:#x} — checking NtProtectVirtualMemory"),
+                );
 
                 // Check for NtProtectVirtualMemory BP (slot 1) — guard protector.
                 // NtProtectVirtualMemory(HANDLE, PVOID* base, PSIZE_T size,
@@ -1066,8 +1241,10 @@ if dbg.read_memory(text_start, &mut sample).is_ok() {
                             if dbg.read_memory(base_ptr, &mut base_bytes).is_ok() {
                                 let target_base = u64::from_le_bytes(base_bytes) as usize;
                                 let text_sec = &state.pe_info.pe_sections[0];
-                                let text_start = image_base_usize + text_sec.virtual_address as usize;
-                                let text_end = image_base_usize + state.pe_info.base_of_data as usize;
+                                let text_start =
+                                    image_base_usize + text_sec.virtual_address as usize;
+                                let text_end =
+                                    image_base_usize + state.pe_info.base_of_data as usize;
                                 if target_base >= text_start && target_base < text_end {
                                     debug!(
                                         target = %format!("{target_base:#x}"),
@@ -1076,9 +1253,9 @@ if dbg.read_memory(text_start, &mut sample).is_ok() {
                                     );
                                     let mut ctx2 = ctx;
                                     ctx2.R9 = 0x01; // PAGE_NOACCESS
-                                    // Merge debug registers — must propagate errors
-                                    // (if let Ok silently skips DR clearing on ERROR_PARTIAL_COPY,
-                                    // causing the BP to re-fire infinitely)
+                                                    // Merge debug registers — must propagate errors
+                                                    // (if let Ok silently skips DR clearing on ERROR_PARTIAL_COPY,
+                                                    // causing the BP to re-fire infinitely)
                                     let dbg_ctx = dbg.get_thread_context_dbg(thread_id)?;
                                     ctx2.Dr0 = dbg_ctx.Dr0;
                                     ctx2.Dr1 = dbg_ctx.Dr1;
@@ -1120,7 +1297,12 @@ if dbg.read_memory(text_start, &mut sample).is_ok() {
                     }
                 }
 
-                log::log(LogType::Info, &format!("SINGLE STEP at {address:#x} — handle_hw_breakpoint about to be called"));
+                log::log(
+                    LogType::Info,
+                    &format!(
+                        "SINGLE STEP at {address:#x} — handle_hw_breakpoint about to be called"
+                    ),
+                );
 
                 // Delegate to the shared HW breakpoint handler.
                 if let Err(e) = handle_hw_breakpoint(
@@ -1134,11 +1316,17 @@ if dbg.read_memory(text_start, &mut sample).is_ok() {
                     h_process,
                     guard_protection,
                 ) {
-                    log::log(LogType::Fatal, &format!("handle_hw_breakpoint FAILED: {e:#}"));
+                    log::log(
+                        LogType::Fatal,
+                        &format!("handle_hw_breakpoint FAILED: {e:#}"),
+                    );
                     return Err(e);
                 }
 
-                log::log(LogType::Info, "handle_hw_breakpoint returned OK — about to continue_event");
+                log::log(
+                    LogType::Info,
+                    "handle_hw_breakpoint returned OK — about to continue_event",
+                );
                 dbg.continue_event(thread_id, ContinueStatus::Continue)?;
                 log::log(LogType::Info, "continue_event returned OK");
             }
@@ -1148,7 +1336,10 @@ if dbg.read_memory(text_start, &mut sample).is_ok() {
             // ---------------------------------------------------------------
             DebugEvent::ExitProcess { exit_code } => {
                 if ls.oep.is_some() {
-                    info!(exit_code, "Target exited after OEP found — proceeding to dump");
+                    info!(
+                        exit_code,
+                        "Target exited after OEP found — proceeding to dump"
+                    );
                 } else {
                     warn!(exit_code, "Target process exited before unpack completed");
                 }
@@ -1172,7 +1363,6 @@ if dbg.read_memory(text_start, &mut sample).is_ok() {
         }
     }
 
-
     // ---- phases B/C/D: IAT repair, post-processing, dump ----
     run_post_loop_phases(
         &mut dbg,
@@ -1184,12 +1374,221 @@ if dbg.read_memory(text_start, &mut sample).is_ok() {
         do_data_sections,
         shrink,
         false, // traditional debug path
+        &early_section_snapshots,
         input,
         &output_path,
     )?;
 
     log::log(LogType::Good, "Done.");
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Early post-attach snapshots
+// ---------------------------------------------------------------------------
+
+fn capture_early_section_snapshots(
+    dbg: &ProcessSession,
+    pe: &PeHeader,
+    selected_names: &[&str],
+) -> Result<Vec<EarlySectionSnapshot>, anyhow::Error> {
+    let image_base = dbg.image_base() as usize;
+    let mut snapshots = Vec::new();
+
+    for section in &pe.sections {
+        if section.raw_size != 0 || !selected_names.contains(&section.name.as_str()) {
+            continue;
+        }
+
+        let size = section.virtual_size as usize;
+        if size == 0 {
+            continue;
+        }
+        let address = image_base
+            .checked_add(section.virtual_address as usize)
+            .ok_or_else(|| anyhow!("early snapshot address overflow for {}", section.name))?;
+        let mut bytes = vec![0u8; size];
+        let read = dbg
+            .read_memory(address, &mut bytes)
+            .map_err(|e| anyhow!("failed to capture early {} snapshot: {e}", section.name))?;
+        if read != size {
+            return Err(anyhow!(
+                "short early {} snapshot read: got {read} bytes, expected {size}",
+                section.name
+            ));
+        }
+
+        let non_zero = bytes.iter().filter(|&&byte| byte != 0).count();
+        let hash = fnv1a64(&bytes);
+        log::log(
+            LogType::Info,
+            &format!(
+                "early snapshot: {} RVA {:#x}, size {:#x}, non-zero {}, fnv1a64 {:#018x} (main thread suspended)",
+                section.name, section.virtual_address, size, non_zero, hash
+            ),
+        );
+        snapshots.push(EarlySectionSnapshot {
+            section_name: section.name.clone(),
+            rva: section.virtual_address,
+            bytes,
+        });
+    }
+
+    Ok(snapshots)
+}
+
+fn update_pre_text_snapshots(
+    dbg: &ProcessSession,
+    snapshots: &mut [EarlySectionSnapshot],
+    rip: usize,
+) -> Result<(), anyhow::Error> {
+    let image_base = dbg.image_base() as usize;
+    for snapshot in snapshots {
+        let address = image_base
+            .checked_add(snapshot.rva as usize)
+            .ok_or_else(|| anyhow!("pre-text snapshot address overflow for {}", snapshot.section_name))?;
+        let mut candidate = vec![0u8; snapshot.bytes.len()];
+        let read = dbg
+            .read_memory(address, &mut candidate)
+            .map_err(|e| anyhow!("failed to sample pre-text {} snapshot: {e}", snapshot.section_name))?;
+        if read != candidate.len() {
+            return Err(anyhow!(
+                "short pre-text {} snapshot read: got {read} bytes, expected {}",
+                snapshot.section_name,
+                candidate.len()
+            ));
+        }
+        if candidate != snapshot.bytes {
+            let previous_non_zero = snapshot.bytes.iter().filter(|&&byte| byte != 0).count();
+            let non_zero = candidate.iter().filter(|&&byte| byte != 0).count();
+            *snapshot = EarlySectionSnapshot {
+                section_name: snapshot.section_name.clone(),
+                rva: snapshot.rva,
+                bytes: candidate,
+            };
+            debug!(
+                section = %snapshot.section_name,
+                rip = format_args!("{rip:#x}"),
+                previous_non_zero,
+                non_zero,
+                "updated latest pre-.text loader snapshot"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn refresh_early_snapshots_after_loader(
+    dbg: &ProcessSession,
+    snapshots: &mut [EarlySectionSnapshot],
+) -> Result<(), anyhow::Error> {
+    let image_base = dbg.image_base() as usize;
+    for snapshot in snapshots {
+        if snapshot.bytes.iter().any(|&byte| byte != 0) {
+            continue;
+        }
+
+        let address = image_base
+            .checked_add(snapshot.rva as usize)
+            .ok_or_else(|| anyhow!("loader snapshot address overflow for {}", snapshot.section_name))?;
+        let read = dbg
+            .read_memory(address, &mut snapshot.bytes)
+            .map_err(|e| anyhow!("failed to refresh {} loader snapshot: {e}", snapshot.section_name))?;
+        if read != snapshot.bytes.len() {
+            return Err(anyhow!(
+                "short {} loader snapshot read: got {read} bytes, expected {}",
+                snapshot.section_name,
+                snapshot.bytes.len()
+            ));
+        }
+
+        let non_zero = snapshot.bytes.iter().filter(|&&byte| byte != 0).count();
+        let hash = fnv1a64(&snapshot.bytes);
+        log::log(
+            LogType::Info,
+            &format!(
+                "loader snapshot refresh: {} RVA {:#x}, size {:#x}, non-zero {}, fnv1a64 {:#018x} (main thread frozen at first .text execution)",
+                snapshot.section_name,
+                snapshot.rva,
+                snapshot.bytes.len(),
+                non_zero,
+                hash
+            ),
+        );
+    }
+    Ok(())
+}
+
+fn merge_reinitializable_data_state(
+    dbg: &ProcessSession,
+    snapshots: &mut [EarlySectionSnapshot],
+    image_size: usize,
+) -> Result<(), anyhow::Error> {
+    let image_base = dbg.image_base() as usize;
+    let image_end = image_base.saturating_add(image_size);
+    for snapshot in snapshots {
+        let address = image_base
+            .checked_add(snapshot.rva as usize)
+            .ok_or_else(|| anyhow!("late data snapshot address overflow for {}", snapshot.section_name))?;
+        let mut late = vec![0u8; snapshot.bytes.len()];
+        let read = dbg
+            .read_memory(address, &mut late)
+            .map_err(|e| anyhow!("failed to read late {} snapshot: {e}", snapshot.section_name))?;
+        if read != late.len() {
+            return Err(anyhow!(
+                "short late {} snapshot read: got {read} bytes, expected {}",
+                snapshot.section_name,
+                late.len()
+            ));
+        }
+
+        let mut merged = 0usize;
+        for (early_chunk, late_chunk) in snapshot
+            .bytes
+            .chunks_exact_mut(8)
+            .zip(late.chunks_exact(8))
+        {
+            let early = u64::from_le_bytes(early_chunk.try_into().unwrap_or_default());
+            let late = u64::from_le_bytes(late_chunk.try_into().unwrap_or_default());
+            let late_address = late as usize;
+            if early == 0 && (image_base..image_end).contains(&late_address) {
+                early_chunk.copy_from_slice(late_chunk);
+                merged += 1;
+            }
+        }
+        debug!(
+            section = %snapshot.section_name,
+            merged,
+            "merged reinitializable image-relative data globals"
+        );
+    }
+    Ok(())
+}
+
+fn log_snapshot_summary(snapshots: &[EarlySectionSnapshot], stage: &str) {
+    for snapshot in snapshots {
+        let non_zero = snapshot.bytes.iter().filter(|&&byte| byte != 0).count();
+        log::log(
+            LogType::Info,
+            &format!(
+                "{stage}: {} RVA {:#x}, size {:#x}, non-zero {}, fnv1a64 {:#018x}",
+                snapshot.section_name,
+                snapshot.rva,
+                snapshot.bytes.len(),
+                non_zero,
+                fnv1a64(&snapshot.bytes)
+            ),
+        );
+    }
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 // ---------------------------------------------------------------------------
@@ -1209,11 +1608,15 @@ fn run_post_loop_phases(
     do_data_sections: bool,
     shrink: bool,
     post_attach: bool,
+    early_section_snapshots: &[EarlySectionSnapshot],
     input: &Path,
     output_path: &Path,
 ) -> Result<(), anyhow::Error> {
     if is_dotnet {
-        log::log(LogType::Good, ".NET dump completed via _CorExeMain breakpoint");
+        log::log(
+            LogType::Good,
+            ".NET dump completed via _CorExeMain breakpoint",
+        );
         return Ok(());
     }
 
@@ -1271,7 +1674,10 @@ fn run_post_loop_phases(
         // In post-attach mode, IAT slots already contain resolved API
         // addresses (no Themida wrappers to trace). dump_process will
         // rebuild the import table directly from the live IAT.
-        log::log(LogType::Info, "Skipping V3 IAT trace (post-attach: slots already resolved)");
+        log::log(
+            LogType::Info,
+            "Skipping V3 IAT trace (post-attach: slots already resolved)",
+        );
     } else {
         fix_iat(dbg, state, &iat, trace_thread_id, strategy)
             .map_err(|e| anyhow!("IAT fix failed: {e}"))?;
@@ -1292,27 +1698,31 @@ fn run_post_loop_phases(
             let ts_start = image_base.wrapping_add(ts.virtual_address as usize);
             let ts_end = ts_start.wrapping_add(ts.virtual_size as usize);
 
-            let fixed = fixup_api_call_sites(dbg, text_start, text_size, &iat, ts_start, ts_end, &state.guard_addrs)
-                .map_err(|e| anyhow!("API call site fixup failed: {e}"))?;
+            let fixed = fixup_api_call_sites(
+                dbg,
+                text_start,
+                text_size,
+                &iat,
+                ts_start,
+                ts_end,
+                &state.guard_addrs,
+            )
+            .map_err(|e| anyhow!("API call site fixup failed: {e}"))?;
 
             log::log(LogType::Info, &format!("Fixed {} API call sites", fixed));
         }
     } else {
-        log::log(LogType::Info, "Skipping API call site fixup on x64 (matches Pascal Themida64)");
+        log::log(
+            LogType::Info,
+            "Skipping API call site fixup on x64 (matches Pascal Themida64)",
+        );
     }
 
     // ---- phase C: post-processing ----
     let image_base_for_scan = dbg.image_base() as usize;
-    // Phase C2: scan live memory for the real OEP.
-    // In post-attach mode there is no guard mechanism — the initial OEP
-    // comes from a pattern scan that may match a function body rather than
-    // the true CRT entry.  When the live-memory scan (which uses tighter
-    // heuristics like x64 `sub rsp, imm8`) finds a different candidate,
-    // trust it over the initial scan.
-    //
-    // In traditional debug mode the guard-detected OEP is reliable (it is
-    // the address Themida jumped to), so we keep it and only log the scan
-    // result as informational.
+    // Phase C2: compare live memory with the captured OEP. A post-attach
+    // capture is only a snapshot of the suspended primary thread; if the CRT
+    // scanner finds a different executable startup candidate, prefer it.
     if let Some(real_oep) = scan_live_memory_for_real_oep(
         dbg,
         image_base_for_scan,
@@ -1323,16 +1733,16 @@ fn run_post_loop_phases(
         if real_oep != oep_addr {
             if post_attach {
                 info!(
-                    guard_oep = %format!("{oep_addr:#x}"),
+                    captured_oep = %format!("{oep_addr:#x}"),
                     scan_oep = %format!("{real_oep:#x}"),
-                    "Live-memory scan found different OEP — using scan result (post-attach)"
+                    "Replacing post-attach RIP snapshot with scanned OEP"
                 );
                 oep_addr = real_oep;
             } else {
                 info!(
-                    guard_oep = %format!("{oep_addr:#x}"),
+                    captured_oep = %format!("{oep_addr:#x}"),
                     scan_oep = %format!("{real_oep:#x}"),
-                    "Live-memory scan found different OEP — using guard-detected OEP"
+                    "Live-memory scan found a different candidate — keeping runtime OEP"
                 );
             }
         }
@@ -1342,7 +1752,10 @@ fn run_post_loop_phases(
 
     if shrink {
         match shrink_pe(pe) {
-            Ok(removed) => log::log(LogType::Info, &format!("Removed {removed} Themida sections")),
+            Ok(removed) => log::log(
+                LogType::Info,
+                &format!("Removed {removed} Themida sections"),
+            ),
             Err(e) => warn!("shrink_pe failed (non-fatal): {e}"),
         }
     }
@@ -1361,16 +1774,22 @@ fn run_post_loop_phases(
         match create_data_sections(pe, &text_buf, text_rva, CompilerHint::Msvc) {
             Ok(result) => {
                 if result.rdata_created {
-                    log::log(LogType::Info, &format!(
-                        "Created .rdata section at {:#x} ({} bytes)",
-                        result.rdata_rva, result.rdata_size,
-                    ));
+                    log::log(
+                        LogType::Info,
+                        &format!(
+                            "Created .rdata section at {:#x} ({} bytes)",
+                            result.rdata_rva, result.rdata_size,
+                        ),
+                    );
                 }
                 if result.data_created {
-                    log::log(LogType::Info, &format!(
-                        "Created .data section at {:#x} ({} bytes)",
-                        result.data_rva, result.data_size,
-                    ));
+                    log::log(
+                        LogType::Info,
+                        &format!(
+                            "Created .data section at {:#x} ({} bytes)",
+                            result.data_rva, result.data_size,
+                        ),
+                    );
                 }
             }
             Err(e) => warn!("create_data_sections failed (non-fatal): {e}"),
@@ -1386,20 +1805,33 @@ fn run_post_loop_phases(
     if !is_64bit {
         let virtual_protect_addr = resolve_host_api("kernel32.dll", "VirtualProtect");
         if virtual_protect_addr != 0 {
-            match install_anti_dump_fix(dbg, oep_addr, image_base, virtual_protect_addr, oep_addr, is_64bit) {
+            match install_anti_dump_fix(
+                dbg,
+                oep_addr,
+                image_base,
+                virtual_protect_addr,
+                oep_addr,
+                is_64bit,
+            ) {
                 Ok(()) => log::log(LogType::Info, "Installed anti-dump fix at OEP"),
                 Err(e) => warn!("install_anti_dump_fix failed (non-fatal): {e}"),
             }
         }
     } else {
-        log::log(LogType::Info, "Skipping anti-dump fix on x64 (matches Pascal Themida64.pas)");
+        log::log(
+            LogType::Info,
+            "Skipping anti-dump fix on x64 (matches Pascal Themida64.pas)",
+        );
     }
 
     // ---- phase D: dump to file ----
-    log::log(LogType::Info, &format!("Dumping to: {}", output_path.display()));
+    log::log(
+        LogType::Info,
+        &format!("Dumping to: {}", output_path.display()),
+    );
 
-    let entry_point_u32 = u32::try_from(oep_addr.wrapping_sub(image_base))
-        .context("OEP RVA exceeds u32 range")?;
+    let entry_point_u32 =
+        u32::try_from(oep_addr.wrapping_sub(image_base)).context("OEP RVA exceeds u32 range")?;
 
     // Use the IAT detected by determine_iat_address (don't override with code scanning)
     let dump_opts = DumpOptions {
@@ -1412,11 +1844,14 @@ fn run_post_loop_phases(
         executable_path: Some(input.to_path_buf()),
         iat_location: Some((iat.address, iat.size)),
         additional_iat_locations: Vec::new(),
+        early_section_snapshots: early_section_snapshots.to_vec(),
     };
 
-    mida_pe::dump_process(dbg, &dump_opts)
-        .map_err(|e| anyhow!("Dump failed: {e}"))?;
+    mida_pe::dump_process(dbg, &dump_opts).map_err(|e| anyhow!("Dump failed: {e}"))?;
 
-    log::log(LogType::Good, &format!("Unpacked: {}", output_path.display()));
+    log::log(
+        LogType::Good,
+        &format!("Unpacked: {}", output_path.display()),
+    );
     Ok(())
 }

@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use tracing::{debug, info, trace, warn};
 use windows::Win32::Foundation::{
-    CloseHandle, HANDLE,
+    CloseHandle, GetLastError, HANDLE,
     EXCEPTION_ACCESS_VIOLATION, EXCEPTION_BREAKPOINT, EXCEPTION_SINGLE_STEP,
     DBG_CONTINUE,
 };
@@ -53,6 +53,10 @@ pub struct WindowsDebugger {
     soft_breakpoints: HashMap<usize, u8>,
     /// Registered threads: thread_id → thread handle.
     threads: HashMap<u32, HANDLE>,
+    /// Whether this debugger was created in post-attach mode.
+    post_attach: bool,
+    /// Tracks the explicit one-time resume required by post-attach mode.
+    post_attach_resumed: bool,
 }
 
 impl WindowsDebugger {
@@ -66,11 +70,10 @@ impl WindowsDebugger {
     /// and (for DLLs) stub-EXE generation happens here.
     ///
     /// When `opts.post_attach` is `true`, the process is created with
-    /// `CREATE_SUSPENDED` but no debug port; immediately after construction
-    /// [`Self::post_attach_init`] resumes the process, lets the protector
-    /// finish its anti-debug initialization without a debug port present,
-    /// then attaches via `DebugActiveProcess` and patches the PEB.  This
-    /// defeats protectors that check `EPROCESS.DebugPort` from `t=0`.
+    /// `CREATE_SUSPENDED` but no debug port. Construction reads and patches the
+    /// PEB while the main thread remains suspended. The caller must invoke
+    /// [`Self::resume_post_attach_main_thread`] after capturing any early state.
+    /// This defeats protectors that check `EPROCESS.DebugPort` from `t=0`.
     pub fn new(opts: &CreateProcessOptions) -> Result<Self, CoreError> {
         let process = create_debug_process(opts)?;
 
@@ -82,75 +85,65 @@ impl WindowsDebugger {
             hw_breakpoints: Default::default(),
             soft_breakpoints: HashMap::new(),
             threads,
+            post_attach: opts.post_attach,
+            post_attach_resumed: false,
         };
 
         if opts.post_attach {
-            dbg.post_attach_init()?;
+            dbg.prepare_post_attach()?;
         }
 
         Ok(dbg)
     }
 
-    /// Post-attach initialization: resume → wait → `DebugActiveProcess` →
-    /// patch PEB.
-    ///
-    /// Called from [`Self::new`] when `post_attach` is set.  The process was
-    /// created with `CREATE_SUSPENDED` and **no** `DEBUG_ONLY_THIS_PROCESS`,
-    /// so at entry to this function the process has no debug port —
-    /// `EPROCESS.DebugPort` is NULL, which defeats Themida's startup
-    /// anti-debug check.
-    ///
-    /// Steps:
-    /// 1. `ResumeThread` — the process starts running freely.
-    /// 2. `sleep(4s)` — give the protector time to finish its anti-debug
-    ///    initialization (Themida's DebugPort check runs early, then it stops
-    ///    checking).
-    /// 3. `DebugActiveProcess` — attach the debugger.  This freezes every
-    ///    thread in kernel space via `DebugSuspendProcess`, so the process
-    ///    is quiescent and the PEB can be patched safely.
-    /// 4. `patch_peb_anti_debug` — clear `BeingDebugged` (which
-    ///    `DebugActiveProcess` has just set) and `pShimData`.
-    ///
-    /// After this returns, `WaitForDebugEvent` in the unpack loop will receive
-    /// a `CREATE_PROCESS_DEBUG_EVENT` synthesised by the attach; the PEB is
-    /// already clean, so the unpacker's `CREATE_PROCESS` handler must NOT
-    /// re-patch it (and must NOT re-inject ScyllaHide) in post-attach mode.
-    fn post_attach_init(&mut self) -> Result<(), CoreError> {
-        use windows::Win32::System::Threading::ResumeThread;
-        use std::thread;
-        use std::time::Duration;
-
-        // 1. Resume the suspended process.  No DEBUG flag -> no DebugPort.
-        let prev_suspend = unsafe { ResumeThread(self.process.main_thread_handle) };
-        info!(
-            prev_suspend_count = ?prev_suspend,
-            "post-attach: ResumeThread - process running free (no debug port)"
+    /// Prepare post-attach observation while leaving the main thread suspended.
+    fn prepare_post_attach(&mut self) -> Result<(), CoreError> {
+        let img_base = patch_peb_anti_debug(self.process.handle)?;
+        self.process.image_base = img_base;
+        debug!(
+            image_base = format_args!("{img_base:#x}"),
+            "post-attach: PEB patched; main thread remains suspended"
         );
+        Ok(())
+    }
 
-        // 2. Wait briefly for the process to initialize its PEB.
-        //    We only need the PEB to be mapped so we can read the
-        //    image base.  The caller (unpacker) will poll the IAT
-        //    and call SuspendThread when IAT is resolved.
-        thread::sleep(Duration::from_secs(3));
+    /// Resume the suspended main thread in post-attach mode exactly once.
+    ///
+    /// Call this only after capturing any loader-initialized baseline state that
+    /// must precede application or CRT execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::ProcessCreation`] when called outside post-attach
+    /// mode, called more than once, or when `ResumeThread` fails.
+    pub fn resume_post_attach_main_thread(&mut self) -> Result<(), CoreError> {
+        use windows::Win32::System::Threading::ResumeThread;
 
-        // 3. Read the image base from the PEB.  We do NOT call
-        //    SuspendThread here — the caller decides when to freeze.
-        match patch_peb_anti_debug(self.process.handle) {
-            Ok(img_base) => {
-                self.process.image_base = img_base;
-                debug!(
-                    image_base = format_args!("{img_base:#x}"),
-                    "post-attach: PEB read (image base acquired)"
-                );
-            }
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    "post-attach: PEB read failed (non-fatal)"
-                );
-            }
+        if !self.post_attach {
+            return Err(CoreError::ProcessCreation(
+                "cannot resume post-attach thread outside post-attach mode".into(),
+            ));
+        }
+        if self.post_attach_resumed {
+            return Err(CoreError::ProcessCreation(
+                "post-attach main thread has already been resumed".into(),
+            ));
         }
 
+        // SAFETY: the handle is the live main-thread handle returned by
+        // CreateProcessW with CREATE_SUSPENDED and is owned by this debugger.
+        let previous = unsafe { ResumeThread(self.process.main_thread_handle) };
+        if previous == u32::MAX {
+            // SAFETY: GetLastError reads the calling thread's last-error value.
+            let error = unsafe { GetLastError() };
+            return Err(CoreError::Windows(error.0));
+        }
+
+        self.post_attach_resumed = true;
+        info!(
+            previous_suspend_count = previous,
+            "post-attach: main thread resumed without a debug port"
+        );
         Ok(())
     }
 
@@ -681,8 +674,10 @@ impl WindowsDebugger {
                 .map_err(|e| CoreError::Windows(e.code().0 as u32))?
         };
 
-        let mut ctx = CONTEXT::default();
-        ctx.ContextFlags = Self::full_context_flags();
+        let mut ctx = CONTEXT {
+            ContextFlags: Self::full_context_flags(),
+            ..Default::default()
+        };
 
         // SAFETY: h is a valid thread handle with THREAD_SET_CONTEXT rights; ctx is a properly initialised CONTEXT.
         unsafe {
@@ -812,8 +807,7 @@ impl DebuggerCore for WindowsDebugger {
             // SAFETY: WaitForDebugEvent with INFINITE timeout is the
             // canonical debug-loop pattern.  raw is a valid out-pointer.
             let wait_result = unsafe { WaitForDebugEvent(&mut raw, INFINITE) };
-            if wait_result.is_err() {
-                let err = wait_result.unwrap_err();
+            if let Err(err) = wait_result {
                 let code = err.code().0 as u32;
                 debug!(error_code = code, "WaitForDebugEvent failed");
                 return Err(CoreError::Windows(code));
@@ -946,8 +940,10 @@ impl DebuggerCore for WindowsDebugger {
             OpenThread(THREAD_GET_CONTEXT, false, thread_id)
                 .map_err(|e| CoreError::Windows(e.code().0 as u32))?
         };
-        let mut ctx = CONTEXT::default();
-        ctx.ContextFlags = Self::full_context_flags();
+        let mut ctx = CONTEXT {
+            ContextFlags: Self::full_context_flags(),
+            ..Default::default()
+        };
 
         // SAFETY: h is a valid thread handle with THREAD_GET_CONTEXT rights; ctx is a writable CONTEXT.
         unsafe {
@@ -966,8 +962,10 @@ impl DebuggerCore for WindowsDebugger {
             OpenThread(THREAD_GET_CONTEXT, false, thread_id)
                 .map_err(|e| CoreError::Windows(e.code().0 as u32))?
         };
-        let mut ctx = CONTEXT::default();
-        ctx.ContextFlags = Self::control_context_flags();
+        let mut ctx = CONTEXT {
+            ContextFlags: Self::control_context_flags(),
+            ..Default::default()
+        };
 
         // SAFETY: h is a valid thread handle with THREAD_GET_CONTEXT rights; ctx is a writable CONTEXT.
         unsafe {
@@ -986,8 +984,10 @@ impl DebuggerCore for WindowsDebugger {
             OpenThread(THREAD_GET_CONTEXT, false, thread_id)
                 .map_err(|e| CoreError::Windows(e.code().0 as u32))?
         };
-        let mut ctx = CONTEXT::default();
-        ctx.ContextFlags = Self::control_integer_context_flags();
+        let mut ctx = CONTEXT {
+            ContextFlags: Self::control_integer_context_flags(),
+            ..Default::default()
+        };
 
         // SAFETY: h is a valid thread handle with THREAD_GET_CONTEXT rights; ctx is a writable CONTEXT.
         unsafe {
@@ -1104,7 +1104,7 @@ impl WindowsDebugger {
                 DebugEvent::CreateThread {
                     thread_id: raw.dwThreadId,
                     h_thread: ct.hThread,
-                    start_address: ct.lpStartAddress.map_or(0, |f| f as u64),
+                    start_address: ct.lpStartAddress.map_or(0, |f| f as usize as u64),
                 }
             }
 

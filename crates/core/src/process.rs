@@ -53,9 +53,11 @@ pub struct CreateProcessOptions {
     /// can set up breakpoints before the entry point runs).
     pub suspended: bool,
     /// `true` = post-attach mode: the process is created with
-    /// `CREATE_SUSPENDED` but **without** `DEBUG_ONLY_THIS_PROCESS`, resumed
-    /// immediately, and only later attached to via `DebugActiveProcess` once
-    /// the protector has finished its anti-debug initialization.
+    /// `CREATE_SUSPENDED` but **without** `DEBUG_ONLY_THIS_PROCESS`. The caller
+    /// may inspect loader-initialized memory while the main thread remains
+    /// suspended, then must explicitly call
+    /// `WindowsDebugger::resume_post_attach_main_thread` to start execution
+    /// without a debug port.
     ///
     /// This bypasses protectors (e.g. Themida v3) that check `EPROCESS.DebugPort`
     /// during early startup and exit with `0xDEADC0DE` when a debug port is
@@ -213,17 +215,17 @@ pub fn create_debug_process(
     // Step 4: create the process
     //
     // post-attach mode: create the process with CREATE_SUSPENDED but WITHOUT
-    // DEBUG_ONLY_THIS_PROCESS.  The caller (WindowsDebugger::post_attach_init)
-    // will ResumeThread, wait for the protector's anti-debug init to finish,
-    // then DebugActiveProcess + patch the PEB.  Creating without a debug port
-    // from t=0 defeats protectors that read EPROCESS.DebugPort during startup.
+    // DEBUG_ONLY_THIS_PROCESS. WindowsDebugger patches the PEB while suspended;
+    // the caller explicitly resumes after capturing any early memory baseline.
+    // Creating without a debug port from t=0 defeats protectors that read
+    // EPROCESS.DebugPort during startup.
     let mut flags = CREATE_DEFAULT_ERROR_MODE
         | CREATE_NEW_CONSOLE
         | NORMAL_PRIORITY_CLASS;
 
     if opts.post_attach {
-        // Post-attach: suspended + NO debug flag.  ResumeThread + attach happens
-        // later in WindowsDebugger::post_attach_init.
+        // Post-attach: suspended + no debug flag. The caller explicitly resumes
+        // after any early snapshot has been captured.
         flags |= CREATE_SUSPENDED;
     } else {
         // Traditional debug mode: attach from the start.
@@ -234,12 +236,12 @@ pub fn create_debug_process(
         flags |= CREATE_SUSPENDED;
     }
 
-    let mut si = STARTUPINFOW::default();
-    // SAFETY: STARTUPINFOW is repr(C) and the zeroed default is valid.
-    // cb must be set to the struct size per Windows API contract.
-    si.cb = size_of::<STARTUPINFOW>() as u32;
-    si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_SHOW.0 as u16;
+    let si = STARTUPINFOW {
+        cb: size_of::<STARTUPINFOW>() as u32,
+        dwFlags: STARTF_USESHOWWINDOW,
+        wShowWindow: SW_SHOW.0 as u16,
+        ..Default::default()
+    };
 
     let mut pi = PROCESS_INFORMATION::default();
 

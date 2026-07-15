@@ -4,11 +4,11 @@
 
 #[cfg(test)]
 mod tests {
-    use super::super::helpers::{preference_score, read_ptr, write_ptr, MAX_GAP_SLOTS};
     use super::super::helpers::is_dotnet;
+    use super::super::helpers::{preference_score, read_ptr, write_ptr, MAX_GAP_SLOTS};
     use super::super::original_imports::get_original_imports;
-    use super::super::types::RemoteModule;
     use super::super::types::is_api_address;
+    use super::super::types::RemoteModule;
     use crate::header::PeHeader;
     use crate::import_table::iat_slot_size;
 
@@ -63,9 +63,7 @@ mod tests {
 
     #[test]
     fn read_ptr_64bit() {
-        let data = [
-            0xEF, 0xCD, 0xAB, 0x90, 0x78, 0x56, 0x34, 0x12,
-        ];
+        let data = [0xEF, 0xCD, 0xAB, 0x90, 0x78, 0x56, 0x34, 0x12];
         assert_eq!(read_ptr(&data, 0, true), 0x1234567890ABCDEF);
     }
 
@@ -83,7 +81,7 @@ mod tests {
     fn determine_iat_size_empty_modules() {
         let is_64bit = true;
         let iat_data = vec![0u8; 64]; // all zeros — no valid API addresses
-        // With no modules, all addresses are invalid, so result = sizeof(pointer)
+                                      // With no modules, all addresses are invalid, so result = sizeof(pointer)
         let size = determine_iat_size_internal(&iat_data, &[], is_64bit);
         assert_eq!(size, 8); // just the base pointer size
     }

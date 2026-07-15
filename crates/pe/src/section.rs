@@ -369,9 +369,7 @@ impl PeHeader {
                 ".data"
             } else if has_read && has_init {
                 ".rdata"
-            } else if has_write && has_uninit {
-                ".bss"
-            } else if has_read && has_uninit {
+            } else if (has_write || has_read) && has_uninit {
                 ".bss"
             } else {
                 // Fallback: use index-based name
