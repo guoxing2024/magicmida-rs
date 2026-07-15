@@ -356,10 +356,18 @@ fn build_stub_code(
     let update_offset = stub.len();
     stub.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // placeholder
 
-    // .skip:
+    // .skip: This is where we jump to if HeapAlloc fails
+    // It must be AFTER all the container restoration code
     let skip_target = stub.len();
     let skip_displacement = (skip_target - skip_jz_offset - 1) as u8;
     stub[skip_jz_offset] = skip_displacement;
+
+    tracing::debug!(
+        "skip label: jz_offset={}, skip_target={}, displacement={}",
+        skip_jz_offset - 1,
+        skip_target,
+        skip_displacement
+    );
 
     // add r14, 40 (next metadata entry)
     stub.extend_from_slice(&[0x49, 0x83, 0xc6, 0x28]);
