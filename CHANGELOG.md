@@ -20,8 +20,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `CreateProcessOptions::post_attach` flag to select the creation path.
 - `find_real_oep_by_scanning` entry point for OEP discovery without debug
   events (used by the post-attach fast path).
+- Comprehensive verification tool (`verify_unpack.py`) for validating unpacked
+  executables with import table analysis and PE structure checks.
+- Project summary documentation (`PROJECT_SUMMARY.md`) with complete statistics:
+  29,368 lines, 155 tests, 6 crates.
+- Tool tasks execution report documenting verification results.
 
 ### Fixed
+- **Critical: Complete import table reconstruction from original PE** (commit 24f6bf9)
+  - Fixed run splitting logic: don't split modules into per-function descriptors
+    when thunks have no IAT addresses (all addresses = 0)
+  - Fixed FirstThunk assignment: use sequential IAT allocation starting from
+    original_iat_rva instead of using thunk.iat_address (which is 0)
+  - Fixed IAT slot count calculation: use total thunk count when addresses are
+    unset, instead of max_address - min_address (which gives 0)
+  - Fixed IAT slot writing: use sequential addresses for slot indexing instead
+    of thunk.iat_address
+  - **Result**: 100% accuracy (21/21 descriptors, 660/660 functions, 42/42 ordinals)
+    when using original PE import table as fallback
+- TLS bootstrap critical bugs (commit 6029b3f) — fixed three critical bugs in
+  TLS callback bootstrap
+- Unit test compilation error in `container_bootstrap.rs` — added missing
+  `has_data_snapshot` parameter to `estimate_code_size(3, false)` call
 - Eliminated all 13 compiler warnings (unused imports, unused variables,
   dead constants, redundant reassignment).
 - Fixed `test_sanitize` test to match the CIG/ACG-safe behavior: `sanitize()`
@@ -35,6 +55,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `.text` (raw_size=0) and blank-named sections from being misclassified.
 
 ### Changed
+- Ran `cargo fmt` on entire codebase (51 files, 6692 insertions, 4401 deletions)
+- Updated `.gitignore` to exclude test unpacked executables (`*_unpacked.exe`,
+  `verified*.exe`, `test_*.exe`, `launcher_*.exe`)
 - `DumpOptions` gains `section_filter: Option<fn(&PeSection) -> bool>` for
   flexible section selection during dump.
 - `.reloc` section always deleted during `shrink_sections` (rebuilt from
