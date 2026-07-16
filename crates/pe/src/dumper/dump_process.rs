@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::error::PeError;
 use crate::header::PeHeader;
@@ -88,7 +88,33 @@ pub fn dump_process(
         std::collections::HashMap::new();
     if opts.fix_imports {
         let live_empty = import_builder.as_ref().is_none_or(|b| b.thunk_count() == 0);
-        if live_empty {
+
+        // NEW: Also use original imports if IAT rebuild is significantly incomplete
+        let use_original = if live_empty {
+            true
+        } else if let Some(ref ep) = opts.executable_path {
+            // Read original import count for comparison
+            let orig_imports = crate::original_imports::read_original_import_table(ep);
+            let orig_count: usize = orig_imports.iter().map(|(_, funcs)| funcs.len()).sum();
+            let rebuilt_count = import_builder.as_ref().map(|b| b.thunk_count()).unwrap_or(0);
+
+            // If we're missing more than 10% of functions, use original
+            let threshold = (orig_count as f64 * 0.9) as usize;
+            if rebuilt_count < threshold {
+                warn!(
+                    "IAT rebuild incomplete: {}/{} functions ({}% coverage) - using original import table",
+                    rebuilt_count, orig_count,
+                    (rebuilt_count as f64 / orig_count as f64 * 100.0) as u32
+                );
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if use_original {
             if let Some(ref ep) = opts.executable_path {
                 if let Some(fallback_builder) = build_import_table_from_original(&pe, ep) {
                     info!("Using original PE import table (Magicmida approach): {} modules, {} thunks",
@@ -225,6 +251,113 @@ pub fn dump_process(
                             builder.modules.len(),
                             builder.thunk_count()
                         );
+
+                        // CRITICAL FIX: Restore ordinal imports from original PE
+                        // IAT rebuild converts all imports to name imports because it resolves
+                        // addresses from memory and looks up names in exports.
+                        // But some DLLs (WSOCK32.dll, OLEAUT32.dll) use ordinal imports,
+                        // and converting them to names can cause "Cannot locate ordinal N" errors.
+                        //
+                        // Strategy:
+                        // 1. Find which DLLs use ordinal imports in original PE
+                        // 2. Load those DLLs and read their export tables
+                        // 3. Build function_name -> ordinal mapping
+                        // 4. Convert rebuilt thunks from name to ordinal
+
+                        // Step 1: Collect ordinal imports from original PE
+                        let mut ordinal_imports: std::collections::HashMap<String, Vec<u16>> =
+                            std::collections::HashMap::new();
+
+                        for (orig_dll, orig_funcs) in &orig_imports {
+                            for orig_func in orig_funcs {
+                                if let Some(ordinal_str) = orig_func.strip_prefix('#') {
+                                    if let Ok(ordinal) = ordinal_str.parse::<u16>() {
+                                        ordinal_imports
+                                            .entry(orig_dll.to_lowercase())
+                                            .or_insert_with(Vec::new)
+                                            .push(ordinal);
+                                    }
+                                }
+                            }
+                        }
+
+                        if !ordinal_imports.is_empty() {
+                            info!(
+                                "Found {} DLLs with ordinal imports in original PE",
+                                ordinal_imports.len()
+                            );
+
+                            // Step 2 & 3: Load DLLs and build name -> ordinal maps
+                            let mut dll_exports: std::collections::HashMap<String, std::collections::HashMap<u16, String>> =
+                                std::collections::HashMap::new();
+
+                            debug!("Starting to load DLL exports for ordinal restoration");
+
+                            for dll_name in ordinal_imports.keys() {
+                                debug!("Loading exports for {}", dll_name);
+                                if let Some(dll_path) = crate::dll_exports::find_system_dll(dll_name) {
+                                    let exports = crate::dll_exports::read_dll_exports(&dll_path);
+                                    debug!("Loaded {} exports from {}", exports.len(), dll_name);
+                                    if !exports.is_empty() {
+                                        dll_exports.insert(dll_name.clone(), exports);
+                                    }
+                                } else {
+                                    warn!("Could not find system DLL: {}", dll_name);
+                                }
+                            }
+
+                            debug!("Finished loading DLL exports, starting conversion");
+
+                            // Step 4: Convert thunks from name to ordinal
+                            let mut converted_count = 0;
+
+                            for module in &mut builder.modules {
+                                let module_name_lower = module.name.to_lowercase();
+
+                                // Check if this DLL uses ordinals in original PE
+                                if let Some(ordinals_for_dll) = ordinal_imports.get(&module_name_lower) {
+                                    // Get export map for this DLL
+                                    if let Some(exports) = dll_exports.get(&module_name_lower) {
+                                        // Build reverse map: function_name -> ordinal
+                                        let name_to_ordinal: std::collections::HashMap<String, u16> =
+                                            exports.iter().map(|(ord, name)| (name.to_lowercase(), *ord)).collect();
+
+                                        // Convert thunks
+                                        for thunk in &mut module.thunks {
+                                            if let Some(ref func_name) = thunk.function_name {
+                                                let func_name_lower = func_name.to_lowercase();
+
+                                                // Check if original PE imported this function by ordinal
+                                                if let Some(&ordinal) = name_to_ordinal.get(&func_name_lower) {
+                                                    if ordinals_for_dll.contains(&ordinal) {
+                                                        // Convert to ordinal import
+                                                        debug!(
+                                                            "Converting {}.{} to ordinal #{}",
+                                                            module.name, func_name, ordinal
+                                                        );
+                                                        thunk.function_name = None;
+                                                        thunk.ordinal = Some(ordinal);
+                                                        converted_count += 1;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        warn!(
+                                            "Could not load exports for {}, ordinals will not be restored",
+                                            module.name
+                                        );
+                                    }
+                                }
+                            }
+
+                            if converted_count > 0 {
+                                info!(
+                                    "Converted {} name imports to ordinal imports (matching original PE)",
+                                    converted_count
+                                );
+                            }
+                        }
                     }
                 }
 
@@ -371,9 +504,14 @@ pub fn dump_process(
     // 5c. Build import section (uses original virtual addresses)
     let mut import_thunks: Vec<u64> = Vec::new();
     if let Some(ref builder) = import_builder {
+        info!("Creating import section with {} modules, {} thunks",
+            builder.modules.len(), builder.thunk_count());
         let (thunks, _section_idx) =
             create_import_section(&mut pe, builder, original_iat_rva, &mut dump_buf, is_64bit);
+        info!("Import section created successfully, {} thunk addresses returned", thunks.len());
         import_thunks = thunks;
+    } else {
+        warn!("No import_builder - skipping import section creation");
     }
 
     // 5c. Fix import descriptor FirstThunk to match actual IAT slot addresses.

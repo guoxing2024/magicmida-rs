@@ -80,6 +80,21 @@ pub(crate) fn install_tls_callback_bootstrap(
 
     let image_base = pe.nt_headers.optional_header.image_base;
 
+    // Find .data section RVA for SecurityCookie reading
+    let data_section_rva = pe
+        .sections
+        .iter()
+        .find(|s| {
+            let name = std::str::from_utf8(&s.header.name)
+                .ok()
+                .and_then(|n| n.split('\0').next());
+            name == Some(".data")
+        })
+        .map(|s| s.virtual_address)
+        .unwrap_or(0);
+
+    tracing::debug!("Found .data section at RVA: {:#x}", data_section_rva);
+
     // 1. Create .boot section with bootstrap code
     let boot_section_idx = pe.create_section_index(".boot", 0x1000);
     let boot_rva = pe.sections[boot_section_idx].virtual_address;
@@ -94,6 +109,7 @@ pub(crate) fn install_tls_callback_bootstrap(
         containers,
         None, // data_snapshot - not using full .data restoration for now
         image_base,
+        data_section_rva,
     ) {
         Some(stub) => stub,
         None => {

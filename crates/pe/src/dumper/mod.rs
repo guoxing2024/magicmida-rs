@@ -28,6 +28,7 @@
 mod container_bootstrap;
 mod container_snapshot;
 mod data_reinit;
+mod data_snapshot;
 mod dump_process;
 mod global_vars;
 mod header_patch;

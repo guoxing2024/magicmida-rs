@@ -125,6 +125,7 @@ pub(crate) fn build_tls_bootstrap_stub(
     containers: &[ContainerSnapshot],
     data_snapshot: Option<&super::data_snapshot::DataSectionSnapshot>,
     image_base: u64,
+    data_section_rva: u32,
 ) -> Option<Vec<u8>> {
     build_container_stub_internal(
         stub_rva,
@@ -134,6 +135,7 @@ pub(crate) fn build_tls_bootstrap_stub(
         containers,
         data_snapshot,
         image_base,
+        data_section_rva,
     )
 }
 
@@ -153,6 +155,7 @@ fn build_container_stub(
         containers,
         None,
         0,
+        0, // data_section_rva - not needed for entry point mode
     )
 }
 
@@ -165,6 +168,7 @@ fn build_container_stub_internal(
     containers: &[ContainerSnapshot],
     data_snapshot: Option<&super::data_snapshot::DataSectionSnapshot>,
     image_base: u64,
+    data_section_rva: u32,
 ) -> Option<Vec<u8>> {
     let mut stub = Vec::new();
 
@@ -186,6 +190,7 @@ fn build_container_stub_internal(
         data_snapshot,
         data_snapshot_offset,
         image_base,
+        data_section_rva,
     )?;
 
     // Pad to metadata_offset
@@ -261,9 +266,30 @@ fn build_stub_code(
     data_snapshot: Option<&super::data_snapshot::DataSectionSnapshot>,
     data_snapshot_offset: usize,
     image_base: u64,
+    data_section_rva: u32,
 ) -> Option<()> {
     // sub rsp, 0x38
     stub.extend_from_slice(&[0x48, 0x83, 0xec, 0x38]);
+
+    // === TLS Callback: Only execute once using RDX (Reason parameter) ===
+    // TLS callback signature: void NTAPI TlsCallback(PVOID DllHandle, DWORD Reason, PVOID Reserved)
+    // RCX = DllHandle, RDX = Reason, R8 = Reserved
+    // DLL_PROCESS_ATTACH = 1
+    // Only execute bootstrap on DLL_PROCESS_ATTACH
+
+    if original_entry_point.is_none() {
+        // This is TLS callback mode - check Reason parameter
+        // cmp edx, 1 (check if Reason == DLL_PROCESS_ATTACH)
+        stub.extend_from_slice(&[0x83, 0xfa, 0x01]);
+        // je continue_bootstrap
+        stub.extend_from_slice(&[0x74, 0x04]); // je +4 (skip the early return)
+        // Early return if not DLL_PROCESS_ATTACH:
+        // add rsp, 0x38
+        stub.extend_from_slice(&[0x48, 0x83, 0xc4, 0x38]);
+        // ret
+        stub.push(0xc3);
+        // continue_bootstrap:
+    }
 
     // === FIRST: Restore .data section if snapshot provided ===
     if let Some(snapshot) = data_snapshot {
@@ -284,6 +310,25 @@ fn build_stub_code(
 
     // mov r15, rax (save heap handle)
     stub.extend_from_slice(&[0x49, 0x89, 0xc7]);
+
+    // === Read runtime SecurityCookie from .data section ===
+    // Load image base into R11
+    stub.extend_from_slice(&[0x49, 0xbb]); // movabs r11, imm64
+    stub.extend_from_slice(&image_base.to_le_bytes());
+
+    // Add data_section_rva to get .data VA
+    // mov ecx, data_section_rva
+    stub.extend_from_slice(&[0xb9]); // mov ecx, imm32
+    stub.extend_from_slice(&data_section_rva.to_le_bytes());
+
+    // add r11, rcx -> r11 = .data section VA
+    stub.extend_from_slice(&[0x49, 0x01, 0xcb]); // add r11, rcx
+
+    // Load SecurityCookie from .data start (assume it's at offset 0)
+    // mov rbx, [r11]
+    stub.extend_from_slice(&[0x49, 0x8b, 0x1b]); // mov rbx, [r11]
+
+    // Now RBX contains the runtime SecurityCookie
 
     // lea r14, [rip + metadata_offset]
     let metadata_rva = stub_rva.checked_add(metadata_offset)?;
@@ -335,12 +380,19 @@ fn build_stub_code(
     // Inline memcpy: mov rcx, dest (already in rax/r12)
     stub.extend_from_slice(&[0x4c, 0x89, 0xe1]);
 
-    // lea rdx, [rip + data_base]; add rdx, [r14+16] (source = data_base + container_data_offset)
-    // data_base is at metadata_offset, and each container's data_offset is relative to data_base
-    stub.extend_from_slice(&[0x48, 0x8d, 0x15]);
-    let source_lea_next = stub_rva.checked_add(stub.len() as u32)?.checked_add(4)?;
-    let data_base_rva = stub_rva.checked_add(metadata_offset)?;
-    stub.extend_from_slice(&relative_displacement(source_lea_next, data_base_rva)?);
+    // Get .boot section VA: lea rdx, [rip]; sub rdx, (current_offset_in_boot)
+    // This calculates the VA of boot section start at runtime
+    stub.extend_from_slice(&[0x48, 0x8d, 0x15, 0x00, 0x00, 0x00, 0x00]); // lea rdx, [rip+0]
+    // RIP after lea instruction points to the next instruction
+    let rip_after_lea = stub.len() as u32;
+    // sub rdx, rip_after_lea to get boot section VA
+    if rip_after_lea <= 127 {
+        stub.extend_from_slice(&[0x48, 0x83, 0xea, rip_after_lea as u8]); // sub rdx, imm8
+    } else {
+        stub.extend_from_slice(&[0x48, 0x81, 0xea]); // sub rdx, imm32
+        stub.extend_from_slice(&rip_after_lea.to_le_bytes());
+    }
+    // add rdx, [r14+16] to get final source address
     stub.extend_from_slice(&[0x48, 0x03, 0x56, 0x10]);
 
     // mov r8d, [r14+4] (size)
@@ -354,8 +406,8 @@ fn build_stub_code(
     // Update encoded triple: mov ecx, [r14] (data_rva)
     stub.extend_from_slice(&[0x41, 0x8b, 0x0e]);
 
-    // mov rdx, [r14+8] (cookie)
-    stub.extend_from_slice(&[0x49, 0x8b, 0x56, 0x08]);
+    // mov rdx, rbx (use runtime SecurityCookie from RBX instead of metadata)
+    stub.extend_from_slice(&[0x48, 0x89, 0xda]); // mov rdx, rbx
 
     // mov r8, r12 (new heap ptr)
     stub.extend_from_slice(&[0x4d, 0x89, 0xe0]);

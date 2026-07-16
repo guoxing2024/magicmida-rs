@@ -117,8 +117,13 @@ pub fn unpack(
     do_data_sections: bool,
     shrink: bool,
 ) -> Result<(), anyhow::Error> {
+    use tracing::info;
+    info!("=== UNPACK START ===");
+    info!("Input: {}", input.display());
+
     // ---- step 1: resolve output path ----
     let output_path = resolve_output_path(input, output);
+    info!("Output: {}", output_path.display());
 
     // ---- step 2: parse PE header ----
     log::log(LogType::Info, &format!("Loading: {}", input.display()));
@@ -349,7 +354,14 @@ pub fn unpack(
         let mut frozen_rip: Option<usize> = None;
         let mut iat_resolved_logged = false;
 
+        let mut loop_count = 0;
+
         loop {
+            loop_count += 1;
+            if loop_count % 10 == 0 {
+                eprintln!("[TRACE] OEP observation loop iteration {}", loop_count);
+            }
+
             if poll_start.elapsed() > max_wait {
                 log::log(
                     LogType::Warn,
@@ -392,6 +404,9 @@ pub fn unpack(
             }
 
             if !iat_resolved_logged {
+                if loop_count == 1 {
+                    eprintln!("[TRACE] Checking IAT resolution");
+                }
                 let mut iat_val = [0u8; 8];
                 if dbg.read_memory(iat_addr, &mut iat_val).is_ok() {
                     let val = usize::from_le_bytes(iat_val);
@@ -409,9 +424,19 @@ pub fn unpack(
             }
 
             let previous = unsafe { SuspendThread(h_thread) };
+            if loop_count <= 3 {
+                eprintln!("[TRACE] SuspendThread returned: {}", previous);
+            }
+
             if previous != u32::MAX {
                 if let Ok(ctx) = dbg.get_thread_context_control(main_tid) {
                     let rip = ctx.Rip as usize;
+
+                    if loop_count <= 3 {
+                        eprintln!("[TRACE] RIP=0x{:X}, text_start=0x{:X}, text_end=0x{:X}, in_range={}",
+                            rip, text_start, text_end, rip >= text_start && rip < text_end);
+                    }
+
                     if rip >= text_start && rip < text_end {
                         let mut code = [0u8; 16];
                         let decrypted = dbg
@@ -426,6 +451,15 @@ pub fn unpack(
                                     poll_start.elapsed().as_millis()
                                 ),
                             );
+
+                            // FINAL PUSH: Try 750ms (between 500ms and 1000ms)
+                            log::log(
+                                LogType::Info,
+                                "FINAL PUSH: Waiting 1000ms...",
+                            );
+                            let _ = unsafe { ResumeThread(h_thread) };
+                            std::thread::sleep(std::time::Duration::from_millis(1000));
+
                             break;
                         }
                     } else {
@@ -435,7 +469,7 @@ pub fn unpack(
                 let _ = unsafe { ResumeThread(h_thread) };
             }
 
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            std::thread::sleep(std::time::Duration::from_millis(1000));
         }
 
         // If observation timed out, freeze the thread before scanning/dumping.

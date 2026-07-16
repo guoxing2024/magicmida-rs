@@ -1,0 +1,129 @@
+[TRACE] main() called
+[TRACE] args parsed
+[TRACE] Initializing logging, verbose=false
+[TRACE] Logging initialized
+[TRACE] Dispatching command
+[2026-07-16T05:31:23.545458Z] [INFO] === UNPACK START ===
+[2026-07-16T05:31:23.545482Z] [INFO] Input: D:/Tools/RE/dumps/runtime/启动器.exe
+[2026-07-16T05:31:23.545492Z] [INFO] Output: test_complete.exe
+[2026-07-16T05:31:23.545497Z] [INFO] Loading: D:/Tools/RE/dumps/runtime/启动器.exe
+[2026-07-16T05:31:23.554178Z] [INFO] Entry point RVA: 0xbd5807, EP offset: 0x53a607, EP bytes: [E8, A5, 55, 14, 00, 00, 00, 54]
+[2026-07-16T05:31:23.557521Z] [INFO] Themida version: V3
+[2026-07-16T05:31:23.591322Z] [INFO] Debuggee process created [3mpid[0m[2m=[0m1328 [3mtid[0m[2m=[0m24856
+[2026-07-16T05:31:23.591352Z] [INFO] Cleared PEB.pShimData to prevent apphelp hooks
+[2026-07-16T05:31:23.591356Z] [INFO] Process created (PID: 1328)
+[2026-07-16T05:31:23.591456Z] [INFO] early snapshot: .data RVA 0x141000, size 0xba74, non-zero 0, fnv1a64 0xafcf0d2f092260b5 (main thread suspended)
+[2026-07-16T05:31:23.591468Z] [INFO] post-attach: main thread resumed without a debug port [3mprevious_suspend_count[0m[2m=[0m1
+[2026-07-16T05:31:23.591488Z] [INFO] post-attach: no debug port — direct dump mode (SuspendThread + ReadProcessMemory)
+[2026-07-16T05:31:23.591491Z] [INFO] post-attach: polling IAT at 0x1400fd000 (RVA 0xfd000) for resolution...
+[TRACE] Checking IAT resolution
+[TRACE] SuspendThread returned: 0
+[TRACE] RIP=0x7FFAF94CAD40, text_start=0x140001000, text_end=0x1400FC658, in_range=false
+[2026-07-16T05:31:24.591976Z] [32m[GOOD][0m post-attach: IAT resolved, first slot = 0x7ffaf8fd0530 (after 1000 ms)
+[TRACE] SuspendThread returned: 0
+[TRACE] RIP=0x7FFAF9580344, text_start=0x140001000, text_end=0x1400FC658, in_range=false
+[TRACE] SuspendThread returned: 0
+[TRACE] RIP=0x7FFAF6641344, text_start=0x140001000, text_end=0x1400FC658, in_range=false
+[TRACE] OEP observation loop iteration 10
+[TRACE] OEP observation loop iteration 20
+[TRACE] OEP observation loop iteration 30
+[TRACE] OEP observation loop iteration 40
+[TRACE] OEP observation loop iteration 50
+[TRACE] OEP observation loop iteration 60
+[2026-07-16T05:32:23.622962Z] [33m[WARN][0m post-attach: OEP observation timeout after 60s - proceeding with scan
+[2026-07-16T05:32:23.623010Z] [INFO] post-attach: process frozen, main RIP=outside .text
+[2026-07-16T05:32:23.623154Z] [INFO] selected pre-.text baseline: .data RVA 0x141000, size 0xba74, non-zero 12146, fnv1a64 0xe54c8dfe53919ae7
+[2026-07-16T05:32:23.623161Z] [INFO] post-attach: .text sample 15/16 non-zero
+[2026-07-16T05:32:23.624875Z] [INFO] Found MSVC pattern (sub esp, imm32; xor ecx, ecx) — using as OEP [3maddr[0m[2m=[0m0x1400070b7 [3mrva[0m[2m=[0m0x60b7
+[2026-07-16T05:32:23.624947Z] [32m[GOOD][0m post-attach: OEP found via .text scan: 0x1400070b7
+[2026-07-16T05:32:23.624965Z] [INFO] post-attach: process frozen — proceeding to IAT repair + dump
+[2026-07-16T05:32:23.625008Z] [INFO] Initial OEP: 0x1400070b7
+[2026-07-16T05:32:23.625026Z] [INFO] Text base: 0x140001000, code size: 0xfb658, data section: 0x1400fc800 (0x4414e bytes), VM OEP: false
+[2026-07-16T05:32:23.629221Z] [INFO] IAT reference found at 0x1400fddd0 (indirect call at 0x1400070ea)
+[2026-07-16T05:32:23.636875Z] [INFO] Found earlier IAT ref via full .text scan [3moep_ref[0m[2m=[0m0x1400fddd0 [3mearliest[0m[2m=[0m0x1400fd000
+[2026-07-16T05:32:23.636888Z] [INFO] First IAT reference: 0x1400fd000
+[2026-07-16T05:32:23.636987Z] [INFO] IAT multi-block: primary block at slot 64 (120 slots), combined span: slot 64 (572 slots), total blocks: 5
+[2026-07-16T05:32:23.636998Z] [INFO] IAT boundaries: start=0x1400fd000, end=0x1400fe1e0, size=4576 (572 slots), blocks=5
+[2026-07-16T05:32:23.637008Z] [INFO] IAT at 0x1400fd000, size 0x11e0
+[2026-07-16T05:32:23.637012Z] [INFO] Skipping V3 IAT trace (post-attach: slots already resolved)
+[2026-07-16T05:32:23.637018Z] [INFO] Skipping API call site fixup on x64 (matches Pascal Themida64)
+[2026-07-16T05:32:23.645713Z] [INFO] x64 CRT startup (__scrt_common_main_seh) found in live memory [3mreal_oep[0m[2m=[0m0x140001000
+[2026-07-16T05:32:23.645738Z] [INFO] Replacing post-attach RIP snapshot with scanned OEP [3mcaptured_oep[0m[2m=[0m0x1400070b7 [3mscan_oep[0m[2m=[0m0x140001000
+[2026-07-16T05:32:23.645760Z] [INFO] Final OEP: 0x140001000
+[2026-07-16T05:32:23.645770Z] [INFO] Shrink complete [3mremoved[0m[2m=[0m1
+[2026-07-16T05:32:23.645774Z] [INFO] Removed 1 Themida sections
+[2026-07-16T05:32:23.645777Z] [INFO] Skipping anti-dump fix on x64 (matches Pascal Themida64.pas)
+[2026-07-16T05:32:23.645781Z] [INFO] Dumping to: test_complete.exe
+[2026-07-16T05:32:23.649293Z] [INFO] validated PE header fields
+[2026-07-16T05:32:23.649601Z] [INFO] Exception dir to preserve: RVA=0xeb6570 Size=0xb124
+[2026-07-16T05:32:23.649611Z] [INFO] Clearing dangling DataDirectory[0] (Export) RVA=0xc13dd0 Size=0x141a
+[2026-07-16T05:32:23.649614Z] [INFO] Clearing dangling DataDirectory[1] (Import) RVA=0xd59db0 Size=0x1b8
+[2026-07-16T05:32:23.649616Z] [INFO] Clearing dangling DataDirectory[3] (Exception) RVA=0xeb6570 Size=0xb124
+[2026-07-16T05:32:23.649618Z] [INFO] Clearing dangling DataDirectory[10] (LoadConfig) RVA=0xeb6470 Size=0x100
+[2026-07-16T05:32:23.649619Z] [INFO] Clearing dangling DataDirectory[12] (IAT) RVA=0x69b000 Size=0x1548
+[2026-07-16T05:32:23.649621Z] [INFO] Filled VA gap: .fill VA=0x156000 VS=0xD6C000
+[2026-07-16T05:32:23.649623Z] [INFO] Shrink complete: removed 3 sections (gaps filled)
+[2026-07-16T05:32:23.649627Z] [INFO] Restored standard section names
+[2026-07-16T05:32:23.649635Z] [INFO] Using override IAT location: 0x1400fd000, size 0x11e0
+[2026-07-16T05:32:23.668039Z] [33m[WARN][0m IAT slot has no candidate for winning module, skipping [3miat_va[0m[2m=[0m"0x1400fd3c0"
+[2026-07-16T05:32:23.668068Z] [33m[WARN][0m IAT slot has no candidate for winning module, skipping [3miat_va[0m[2m=[0m"0x1400fd718"
+[2026-07-16T05:32:23.668072Z] [33m[WARN][0m IAT slot has no candidate for winning module, skipping [3miat_va[0m[2m=[0m"0x1400fd748"
+[2026-07-16T05:32:23.668145Z] [INFO] Import table reconstructed [3mmodule_count[0m[2m=[0m18 [3mthunk_count[0m[2m=[0m545
+[2026-07-16T05:32:23.672040Z] [INFO] Read 21 import modules with 660 total functions from original PE
+[2026-07-16T05:32:23.672330Z] [33m[WARN][0m IAT rebuild incomplete: 545/660 functions (82% coverage) - using original import table
+[2026-07-16T05:32:23.676940Z] [INFO] Read 21 import modules with 660 total functions from original PE
+[2026-07-16T05:32:23.686996Z] [INFO] Resolved 574 of 660 imports via GetProcAddress
+[2026-07-16T05:32:23.687166Z] [INFO] Using original PE import table (Magicmida approach): 21 modules, 660 thunks
+[2026-07-16T05:32:23.691078Z] [INFO] Read 21 import modules with 660 total functions from original PE
+[2026-07-16T05:32:23.692134Z] [INFO] Resolved 0 API addresses from live IAT image
+[2026-07-16T05:32:23.692155Z] [INFO] Dumping process image [3msize_of_image[0m[2m=[0m15515648
+[2026-07-16T05:32:23.697662Z] [INFO] Detected heap-referenced containers requiring snapshot [3mcount[0m[2m=[0m1
+[2026-07-16T05:32:23.701095Z] [INFO] Reset stale SecurityCookie-encoded .data containers [3mcookie[0m[2m=[0m0x8b8c8c8db89 [3mcontainers[0m[2m=[0m1 [3mrvas[0m[2m=[0m0x145710
+[2026-07-16T05:32:23.701167Z] [INFO] Created .pdata section idx=6 VA=0xecc000 size=0xb124 (raw=0xb200); Exception dir restored
+[2026-07-16T05:32:23.701174Z] [INFO] Created .reloc section idx=7 VA=0xed8000 vsize=0x2000 raw=0x2000
+[2026-07-16T05:32:23.701181Z] [INFO] TLS bootstrap IAT addresses: GetProcessHeap=0x0, HeapAlloc=0x0
+[2026-07-16T05:32:23.701188Z] [INFO] Detected critical global variables from OEP analysis [3mcount[0m[2m=[0m11
+[2026-07-16T05:32:23.701191Z] [INFO] Detected 11 critical variables from OEP
+[2026-07-16T05:32:23.701199Z] [INFO] Captured global variable runtime value [3mrva[0m[2m=[0m0x144350 [3msize[0m[2m=[0m8
+[2026-07-16T05:32:23.701203Z] [INFO] Captured global variable runtime value [3mrva[0m[2m=[0m0x144358 [3msize[0m[2m=[0m8
+[2026-07-16T05:32:23.701206Z] [INFO] Captured global variable runtime value [3mrva[0m[2m=[0m0x144368 [3msize[0m[2m=[0m8
+[2026-07-16T05:32:23.701209Z] [INFO] Captured global variable runtime value [3mrva[0m[2m=[0m0x144360 [3msize[0m[2m=[0m8
+[2026-07-16T05:32:23.701212Z] [INFO] Captured global variable runtime value [3mrva[0m[2m=[0m0x14436c [3msize[0m[2m=[0m8
+[2026-07-16T05:32:23.701216Z] [INFO] Captured global variable runtime value [3mrva[0m[2m=[0m0x144390 [3msize[0m[2m=[0m8
+[2026-07-16T05:32:23.701219Z] [INFO] Captured global variable runtime value [3mrva[0m[2m=[0m0x1443b0 [3msize[0m[2m=[0m8
+[2026-07-16T05:32:23.701223Z] [INFO] Captured global variable runtime value [3mrva[0m[2m=[0m0x1443c0 [3msize[0m[2m=[0m8
+[2026-07-16T05:32:23.701226Z] [INFO] Captured global variable runtime value [3mrva[0m[2m=[0m0x1443d0 [3msize[0m[2m=[0m8
+[2026-07-16T05:32:23.701230Z] [INFO] Captured global variable runtime value [3mrva[0m[2m=[0m0x1443d8 [3msize[0m[2m=[0m8
+[2026-07-16T05:32:23.701233Z] [INFO] Captured global variable runtime value [3mrva[0m[2m=[0m0x149d30 [3msize[0m[2m=[0m8
+[2026-07-16T05:32:23.701235Z] [INFO] Captured global variables requiring runtime values [3mcount[0m[2m=[0m11
+[2026-07-16T05:32:23.701248Z] [INFO] Bootstrap code layout: loop_end=132, jmp_over_at=134, helpers_end=193, jmp_disp=57
+[2026-07-16T05:32:23.701250Z] [INFO] Adding thread resume code to bootstrap
+[2026-07-16T05:32:23.701255Z] [INFO] Installed TLS callback container restoration bootstrap [3mtls_rva[0m[2m=[0m0xedb000 [3mboot_rva[0m[2m=[0m0xeda000 [3mcontainers[0m[2m=[0m1 [3moriginal_entry_point[0m[2m=[0m0x1000
+[2026-07-16T05:32:23.701258Z] [INFO] Creating import section with 21 modules, 660 thunks
+[2026-07-16T05:32:23.701342Z] [INFO] Writing Import Lookup Table to IAT region [3miat_rva[0m[2m=[0m0xfd000 [3mthunks[0m[2m=[0m2
+[2026-07-16T05:32:23.701346Z] [INFO] Set IAT Directory to: RVA=0xfd000 size=0x10
+[2026-07-16T05:32:23.701348Z] [INFO] Created .import section [3msection_va[0m[2m=[0m0xedc000 [3msection_data_len[0m[2m=[0m32537 [3mmodules[0m[2m=[0m21 [3mthunks[0m[2m=[0m660
+[2026-07-16T05:32:23.701351Z] [INFO] Import section created successfully, 2 thunk addresses returned
+[2026-07-16T05:32:23.701361Z] [INFO] Section 0: name=".text\0\0\0", VA=0x1000, chars=0x60000020
+[2026-07-16T05:32:23.701364Z] [INFO] Section 1: name=".rdata\0\0", VA=0xfd000, chars=0x40000040
+[2026-07-16T05:32:23.701366Z] [INFO] Section 1: wrote characteristics 0x40000040 at offset 0x154
+[2026-07-16T05:32:23.701368Z] [INFO] Section 2: name=".data\0\0\0", VA=0x141000, chars=0xc0000040
+[2026-07-16T05:32:23.701375Z] [INFO] serialize_headers buffer: Section 1 chars at 0x154 = 0x40000040
+[2026-07-16T05:32:23.701380Z] [INFO] CRITICAL FIX: Rewriting data directories at offset 0x108, TLS[9] = RVA=0xedb000 Size=0x28
+[2026-07-16T05:32:23.701382Z] [INFO] CRITICAL FIX: Wrote TLS Directory[9] at file offset 0x150: RVA=0xedb000, Size=0x28
+[2026-07-16T05:32:23.701384Z] [INFO] CRITICAL FIX: Verified TLS in buffer: RVA=0xedb000, Size=0x28
+[2026-07-16T05:32:23.701386Z] [INFO] CRITICAL FIX: Cleared Data Directory[15] at offset 0x180
+[2026-07-16T05:32:23.709891Z] [INFO] HOTFIX: Zeroing container pointer at RVA 0x145710, file offset 0x145710
+[2026-07-16T05:32:23.709911Z] [INFO] Wrote Hint/Name RVAs to IAT (FirstThunk) for loader resolution [3mrva[0m[2m=[0m0xfd000 [3mfile_off[0m[2m=[0m0xfd000 [3mcount[0m[2m=[0m2
+[2026-07-16T05:32:23.709923Z] [INFO] Before fix_hardcoded_addresses: Section 1 chars at 0x1d4 = 0x40000040
+[2026-07-16T05:32:23.709950Z] [INFO] Scanning for hardcoded addresses: runtime_base=0x140000000, file_base=0x140000000, delta=0x0
+[2026-07-16T05:32:23.710515Z] [INFO] Scanned 484352 bytes in writable sections, fixed 0 hardcoded addresses
+[2026-07-16T05:32:23.710524Z] [INFO] After fix_hardcoded_addresses: Section 1 chars at 0x1d4 = 0x40000040
+[2026-07-16T05:32:23.710771Z] [INFO] Packed section layout: 15603712 bytes -> 1529856 bytes (saved 14073856 bytes)
+[2026-07-16T05:32:23.710779Z] [INFO] Building relocation table: image_base=0x140000000, image_size=0xee4000
+[2026-07-16T05:32:23.710930Z] [INFO] Generated 1978 relocation entries
+[2026-07-16T05:32:23.711203Z] [INFO] Relocation table size: 4216 bytes
+[2026-07-16T05:32:23.711208Z] [INFO] Relocation table: 1978 entries (4216 bytes, untruncated), VA=0xed8000, ASLR disabled
+[2026-07-16T05:32:23.712739Z] [INFO] Dump written successfully [3mpath[0m[2m=[0mtest_complete.exe [3msize[0m[2m=[0m1529856 [3msections[0m[2m=[0m11
+[2026-07-16T05:32:23.713865Z] [32m[GOOD][0m Unpacked: test_complete.exe
+[2026-07-16T05:32:23.713873Z] [32m[GOOD][0m Done.

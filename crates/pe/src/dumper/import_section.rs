@@ -23,12 +23,18 @@ pub(crate) fn build_import_table_from_original(
     _pe: &PeHeader,
     original_path: &Path,
 ) -> Option<ImportTableBuilder> {
+    use tracing::debug;
+
+    debug!("build_import_table_from_original: START");
+
+    // Read import table structure (we don't need RVAs - output PE will have different layout)
     let imports = crate::original_imports::read_original_import_table(original_path);
+
+    debug!("build_import_table_from_original: Got {} DLLs", imports.len());
+
     if imports.is_empty() {
         return None;
     }
-
-    let resolved = crate::original_imports::resolve_imports_via_getprocaddress(&imports);
 
     let mut builder = ImportTableBuilder::new(true); // 64-bit
 
@@ -36,23 +42,20 @@ pub(crate) fn build_import_table_from_original(
         let mut thunks: Vec<ImportThunk> = Vec::new();
 
         for func_name in functions {
-            let key = (dll_name.clone(), func_name.clone());
-            if resolved.contains_key(&key) {
-                thunks.push(ImportThunk {
-                    iat_address: 0, // will be set by builder
-                    function_name: Some(func_name.clone()),
-                    ordinal: None,
-                    is_64bit: true,
-                });
+            // Parse ordinal imports (#22 format)
+            let (function_name, ordinal) = if let Some(ordinal_str) = func_name.strip_prefix('#') {
+                (None, ordinal_str.parse::<u16>().ok())
             } else {
-                // Couldn't resolve - still add it so the loader can try
-                thunks.push(ImportThunk {
-                    iat_address: 0,
-                    function_name: Some(func_name.clone()),
-                    ordinal: None,
-                    is_64bit: true,
-                });
-            }
+                (Some(func_name.clone()), None)
+            };
+
+            // Set iat_address to 0 - build_import_section_no_iat will assign sequential addresses
+            thunks.push(ImportThunk {
+                iat_address: 0,
+                function_name,
+                ordinal,
+                is_64bit: true,
+            });
         }
 
         if !thunks.is_empty() {
@@ -63,17 +66,10 @@ pub(crate) fn build_import_table_from_original(
         }
     }
 
-    if builder.modules.is_empty() {
-        None
-    } else {
-        info!(
-            modules = builder.modules.len(),
-            thunks = builder.thunk_count(),
-            resolved = resolved.len(),
-            "Built import table from original PE (Magicmida approach)"
-        );
-        Some(builder)
-    }
+    debug!("build_import_table_from_original: Built table with {} modules, {} thunks",
+        builder.modules.len(), builder.thunk_count());
+
+    Some(builder)
 }
 
 /// Write resolved API addresses into the IAT slots of the .import section.

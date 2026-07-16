@@ -41,8 +41,13 @@ fn print_version() {
 }
 
 fn main() {
+    eprintln!("[TRACE] main() called");
+
     let cmd = match args::parse_args() {
-        Ok(cmd) => cmd,
+        Ok(cmd) => {
+            eprintln!("[TRACE] args parsed");
+            cmd
+        }
         Err(e) => {
             eprintln!("Error: {}", e);
             eprintln!();
@@ -66,9 +71,12 @@ fn main() {
 
     // Initialise logging — verbose mode enables debug-level output.
     let verbose = matches!(cmd, args::Command::Unpack { verbose: true, .. });
+    eprintln!("[TRACE] Initializing logging, verbose={}", verbose);
     log::init_logging(verbose);
+    eprintln!("[TRACE] Logging initialized");
 
     // Dispatch.
+    eprintln!("[TRACE] Dispatching command");
     if let Err(e) = commands::run_command(cmd) {
         log::log(log::LogType::Fatal, &format!("Fatal error: {:#}", e));
         std::process::exit(1);

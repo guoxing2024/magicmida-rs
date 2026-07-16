@@ -303,3 +303,235 @@ pub fn resolve_imports_via_getprocaddress(
 
     resolved
 }
+
+/// Read import table with FirstThunk RVAs for proper IAT address assignment.
+///
+/// Returns: Vec<(dll_name, first_thunk_rva, functions)>
+///
+/// This is used by build_import_table_from_original to preserve the original
+/// IAT layout when using original PE imports instead of rebuilt imports.
+pub fn read_original_import_table_with_rvas(path: &Path) -> Vec<(String, u32, Vec<String>)> {
+    debug!("read_original_import_table_with_rvas: START");
+
+    let bytes = match std::fs::read(path) {
+        Ok(b) => {
+            debug!("read_original_import_table_with_rvas: Read {} bytes", b.len());
+            b
+        }
+        Err(e) => {
+            warn!("Cannot read original PE: {e}");
+            return Vec::new();
+        }
+    };
+
+    let pe = match PeHeader::from_bytes(&bytes) {
+        Ok(p) => {
+            debug!("read_original_import_table_with_rvas: Parsed PE header");
+            p
+        }
+        Err(e) => {
+            warn!("Cannot parse original PE: {e}");
+            return Vec::new();
+        }
+    };
+
+    let import_dir = pe.nt_headers.optional_header.data_directory[1];
+    debug!("read_original_import_table_with_rvas: Import dir RVA=0x{:X}, size={}",
+        import_dir.virtual_address, import_dir.size);
+
+    if import_dir.virtual_address == 0 || import_dir.size == 0 {
+        debug!("No import directory in original PE");
+        return Vec::new();
+    }
+
+    let import_rva = import_dir.virtual_address as usize;
+    let section = pe.sections.iter().find(|s| {
+        let sec_start = s.virtual_address as usize;
+        let sec_end = sec_start + s.virtual_size as usize;
+        import_rva >= sec_start && import_rva < sec_end
+    });
+
+    let section = match section {
+        Some(s) => {
+            debug!("read_original_import_table_with_rvas: Found import section");
+            s
+        }
+        None => {
+            warn!("Import directory RVA {import_rva:#x} not found in any section");
+            return Vec::new();
+        }
+    };
+
+    let mut result: Vec<(String, u32, Vec<String>)> = Vec::new();
+
+    let sec_va = section.virtual_address as usize;
+    let sec_raw_offset = section.raw_offset as usize;
+    let sec_raw_size = section.raw_size as usize;
+
+    if sec_raw_offset + sec_raw_size > bytes.len() {
+        warn!("Section raw data extends past end of file");
+        return Vec::new();
+    }
+
+    let section_data = &bytes[sec_raw_offset..sec_raw_offset + sec_raw_size];
+
+    let import_offset = import_rva - sec_va;
+    let desc_size = 20;
+
+    debug!("read_original_import_table_with_rvas: Starting descriptor loop");
+
+    let mut desc_offset = import_offset;
+    let mut desc_count = 0;
+    while desc_offset + desc_size <= section_data.len() {
+        let desc = &section_data[desc_offset..desc_offset + desc_size];
+
+        let original_first_thunk = u32::from_le_bytes([desc[0], desc[1], desc[2], desc[3]]);
+        let name_rva = u32::from_le_bytes([desc[12], desc[13], desc[14], desc[15]]);
+        let first_thunk = u32::from_le_bytes([desc[16], desc[17], desc[18], desc[19]]);
+
+        if name_rva == 0 {
+            debug!("read_original_import_table_with_rvas: Found terminator descriptor");
+            break;
+        }
+
+        desc_count += 1;
+        if desc_count > 100 {
+            warn!("read_original_import_table_with_rvas: Too many descriptors ({}), breaking", desc_count);
+            break;
+        }
+
+        debug!("read_original_import_table_with_rvas: Processing descriptor #{}, name_rva=0x{:X}",
+            desc_count, name_rva);
+
+        let dll_name = {
+            let name_sec = pe.sections.iter().find(|s| {
+                let start = s.virtual_address as usize;
+                let end = start + s.virtual_size as usize;
+                (name_rva as usize) >= start && (name_rva as usize) < end
+            });
+            match name_sec {
+                Some(ns) => {
+                    let off = (name_rva as usize) - ns.virtual_address as usize + ns.raw_offset as usize;
+                    if off < bytes.len() {
+                        read_cstring(&bytes, off)
+                    } else {
+                        String::new()
+                    }
+                }
+                None => String::new(),
+            }
+        };
+
+        if dll_name.is_empty() {
+            debug!("read_original_import_table_with_rvas: Empty DLL name, breaking");
+            break;
+        }
+
+        debug!("read_original_import_table_with_rvas: DLL={}, reading thunks", dll_name);
+
+        let mut functions: Vec<String> = Vec::new();
+        let thunk_rva = if original_first_thunk != 0 {
+            original_first_thunk as usize
+        } else {
+            first_thunk as usize
+        };
+
+        debug!("read_original_import_table_with_rvas: Thunk RVA=0x{:X}", thunk_rva);
+
+        let thunk_size = if pe.is_64bit { 8 } else { 4 };
+        let ordinal_flag = if pe.is_64bit {
+            0x8000_0000_0000_0000
+        } else {
+            0x8000_0000
+        };
+
+        let mut thunk_rva_cur = thunk_rva;
+        let mut thunk_count = 0;
+        loop {
+            thunk_count += 1;
+            if thunk_count > 500 {
+                warn!("read_original_import_table_with_rvas: Too many thunks for {} ({}), breaking",
+                    dll_name, thunk_count);
+                break;
+            }
+
+            if thunk_count % 50 == 0 {
+                debug!("read_original_import_table_with_rvas: Processing thunk #{} for {}",
+                    thunk_count, dll_name);
+            }
+            let thunk_sec = pe.sections.iter().find(|s| {
+                let start = s.virtual_address as usize;
+                let end = start + s.virtual_size as usize;
+                thunk_rva_cur >= start && thunk_rva_cur < end
+            });
+            let thunk_sec = match thunk_sec {
+                Some(s) => s,
+                None => break,
+            };
+            let thunk_off = thunk_rva_cur - thunk_sec.virtual_address as usize + thunk_sec.raw_offset as usize;
+            if thunk_off + thunk_size > bytes.len() {
+                break;
+            }
+
+            let thunk = if pe.is_64bit {
+                u64::from_le_bytes(
+                    bytes[thunk_off..thunk_off + 8]
+                        .try_into()
+                        .unwrap_or([0u8; 8]),
+                )
+            } else {
+                u32::from_le_bytes(
+                    bytes[thunk_off..thunk_off + 4]
+                        .try_into()
+                        .unwrap_or([0u8; 4]),
+                ) as u64
+            };
+
+            if thunk == 0 {
+                break;
+            }
+
+            if (thunk & ordinal_flag) != 0 {
+                let ordinal = (thunk & 0xFFFF) as u16;
+                functions.push(format!("#{ordinal}"));
+            } else {
+                let hint_name_rva = thunk as usize;
+                let hn_sec = pe.sections.iter().find(|s| {
+                    let start = s.virtual_address as usize;
+                    let end = start + s.virtual_size as usize;
+                    hint_name_rva >= start && hint_name_rva < end
+                });
+                let func_name = match hn_sec {
+                    Some(hs) => {
+                        let off = hint_name_rva - hs.virtual_address as usize + hs.raw_offset as usize + 2;
+                        if off < bytes.len() {
+                            read_cstring(&bytes, off)
+                        } else {
+                            String::new()
+                        }
+                    }
+                    None => String::new(),
+                };
+                if !func_name.is_empty() {
+                    functions.push(func_name);
+                }
+            }
+
+            thunk_rva_cur += thunk_size;
+        }
+
+        if !functions.is_empty() {
+            result.push((dll_name, first_thunk, functions));
+        }
+
+        desc_offset += desc_size;
+    }
+
+    info!(
+        "Read {} import descriptors with {} total functions from original PE (with RVAs)",
+        result.len(),
+        result.iter().map(|(_, _, f)| f.len()).sum::<usize>()
+    );
+
+    result
+}

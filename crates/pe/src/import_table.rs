@@ -122,18 +122,29 @@ impl ImportTableBuilder {
         // thunks into physically contiguous runs and emit one descriptor per run.
         let mut runs: Vec<(&ImportModule, Vec<&ImportThunk>)> = Vec::new();
         for module in &self.modules {
-            let mut current: Vec<&ImportThunk> = Vec::new();
-            for thunk in &module.thunks {
-                let contiguous = current.last().is_none_or(|previous| {
-                    previous.iat_address.saturating_add(ptr_size as u32) == thunk.iat_address
-                });
-                if !contiguous {
-                    runs.push((module, std::mem::take(&mut current)));
+            // Check if thunks have valid addresses
+            let has_addresses = module.thunks.iter().any(|t| t.iat_address != 0);
+
+            if !has_addresses {
+                // No addresses - treat entire module as one run
+                if !module.thunks.is_empty() {
+                    runs.push((module, module.thunks.iter().collect()));
                 }
-                current.push(thunk);
-            }
-            if !current.is_empty() {
-                runs.push((module, current));
+            } else {
+                // Has addresses - split into contiguous runs
+                let mut current: Vec<&ImportThunk> = Vec::new();
+                for thunk in &module.thunks {
+                    let contiguous = current.last().is_none_or(|previous| {
+                        previous.iat_address.saturating_add(ptr_size as u32) == thunk.iat_address
+                    });
+                    if !contiguous {
+                        runs.push((module, std::mem::take(&mut current)));
+                    }
+                    current.push(thunk);
+                }
+                if !current.is_empty() {
+                    runs.push((module, current));
+                }
             }
         }
 
@@ -168,6 +179,9 @@ impl ImportTableBuilder {
         let mut data_cursor = desc_size;
 
         let mut desc_offset: usize = 0;
+
+        // Calculate IAT slot count
+        // If thunks have iat_address set, use max address; otherwise use total thunk count
         let max_iat_rva = self
             .modules
             .iter()
@@ -175,11 +189,24 @@ impl ImportTableBuilder {
             .map(|thunk| thunk.iat_address)
             .max()
             .unwrap_or(original_iat_rva);
-        let slot_count = max_iat_rva
-            .saturating_sub(original_iat_rva)
-            .checked_div(ptr_size as u32)
-            .unwrap_or(0) as usize
-            + 2;
+
+        let slot_count = if max_iat_rva > original_iat_rva {
+            // Thunks have addresses - use address range
+            max_iat_rva
+                .saturating_sub(original_iat_rva)
+                .checked_div(ptr_size as u32)
+                .unwrap_or(0) as usize
+                + 2
+        } else {
+            // Thunks have no addresses (all 0) - use sequential count
+            let total_thunks: usize = self
+                .modules
+                .iter()
+                .map(|m| m.thunks.len())
+                .sum();
+            total_thunks + self.modules.len() + 2 // +1 null per module, +2 padding
+        };
+
         let mut out_thunks = vec![0u64; slot_count];
 
         debug!(
@@ -189,6 +216,9 @@ impl ImportTableBuilder {
         debug!("section_va={:#x}", section_va);
 
         // ---- Pass 2: Write data using INTERLEAVED layout ----
+        let mut current_iat_rva = original_iat_rva;
+        let ptr_size = iat_slot_size(self.is_64bit) as u32;
+
         for (run_index, (module, thunks)) in runs.iter().enumerate() {
             debug!(
                 "Run {}: {} ({} thunks) at offset {:#x}",
@@ -205,20 +235,30 @@ impl ImportTableBuilder {
             data_cursor += name_bytes.len() + 1; // +1 for null terminator
 
             let dll_name_rva = section_va + dll_name_offset_in_section as u32;
-            let module_ft_rva = thunks
-                .first()
-                .map(|thunk| thunk.iat_address)
-                .unwrap_or(original_iat_rva);
+
+            // Use thunk's iat_address if non-zero, otherwise allocate sequentially
+            let module_ft_rva = if let Some(first_thunk) = thunks.first() {
+                if first_thunk.iat_address != 0 {
+                    first_thunk.iat_address
+                } else {
+                    current_iat_rva
+                }
+            } else {
+                current_iat_rva
+            };
 
             // Write descriptor
-            data[desc_offset..desc_offset + 4].copy_from_slice(&0u32.to_le_bytes()); // OFT = 0
+            // CRITICAL FIX: OriginalFirstThunk must point to ILT for Windows loader
+            // Since we write Hint/Name RVAs to the IAT location, we use the same address
+            data[desc_offset..desc_offset + 4].copy_from_slice(&module_ft_rva.to_le_bytes()); // OFT = IAT (both point to Hint/Name table)
             data[desc_offset + 4..desc_offset + 8].copy_from_slice(&0u32.to_le_bytes());
             data[desc_offset + 8..desc_offset + 12].copy_from_slice(&0u32.to_le_bytes());
             data[desc_offset + 12..desc_offset + 16].copy_from_slice(&dll_name_rva.to_le_bytes());
             data[desc_offset + 16..desc_offset + 20].copy_from_slice(&module_ft_rva.to_le_bytes());
             desc_offset += IMPORT_DESCRIPTOR_SIZE;
 
-            // Write hint/name entries immediately after the DLL name.
+            // Write hint/name entries and collect IAT slot values
+            let mut thunk_iat_rva = module_ft_rva;
             for thunk in thunks {
                 let name = &thunk.function_name;
                 let ord = thunk.ordinal;
@@ -243,15 +283,22 @@ impl ImportTableBuilder {
                 } else {
                     0
                 };
-                let slot_index = thunk
-                    .iat_address
+
+                // Use sequential IAT address instead of thunk.iat_address
+                let slot_index = thunk_iat_rva
                     .saturating_sub(original_iat_rva)
-                    .checked_div(ptr_size as u32)
+                    .checked_div(ptr_size)
                     .unwrap_or(0) as usize;
+
                 if let Some(slot) = out_thunks.get_mut(slot_index) {
                     *slot = slot_val;
                 }
+
+                thunk_iat_rva += ptr_size;
             }
+
+            // Advance IAT address for next module (thunks + null terminator)
+            current_iat_rva += ((thunks.len() + 1) * ptr_size as usize) as u32;
 
             // The next physical slot is already zero and terminates this module.
         }

@@ -11,7 +11,7 @@ export LIB="C:\\Program Files\\Microsoft Visual Studio\\2022\\Professional\\VC\\
 export LIBPATH="C:\\Program Files\\Microsoft Visual Studio\\2022\\Professional\\VC\\Tools\\MSVC\\14.44.35207\\lib\\x64"
 
 echo "Building magicmida-rs..."
-cd /d/magicmida-rs
+cd "/d/Claude project/magicmida-rs"
 cargo build --release --bin mida-cli
 
 echo ""

@@ -45,6 +45,9 @@ pub(crate) fn write_output_file(
     pe.nt_headers.optional_header.address_of_entry_point = output_entry_point;
     pe.nt_headers.optional_header.dll_characteristics &= !IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE;
 
+    // NOTE: Don't convert .data to BSS - some programs need initialized data
+    // Instead, we'll selectively zero problematic regions in write_section_data
+
     // 6c. Serialize NT headers + section table
     debug!(
         file_chars = %format!("{:#06x}", pe.nt_headers.file_header.characteristics),
@@ -149,23 +152,28 @@ fn debug_serialize_output(header_data: &[u8]) {
 
 /// Manually re-write data directories at the correct offsets.
 fn rewrite_data_directories(out_data: &mut [u8], pe: &PeHeader, pe_offset: usize, is_64bit: bool) {
-    // Data directories are at a fixed offset within the Optional Header
-    // PE32+: PE signature (4) + File Header (20) + Optional Header magic through DataDirectory offset (96)
-    // PE32:  PE signature (4) + File Header (20) + Optional Header magic through DataDirectory offset (96)
-    // For PE32+: DataDirectory starts at PE + 4 + 20 + 96 = PE + 120 = PE + 0x78
+    // CRITICAL FIX: Correct calculation for PE32+ Data Directory offset
+    // PE Header structure:
+    // - PE signature: 4 bytes
+    // - COFF header: 20 bytes
+    // - Optional Header starts at PE + 24
+    //   - For PE32+: Data Directory starts at Optional Header + 112
+
+    let opt_header_offset = pe_offset + 24;
     let dd_start = if is_64bit {
-        pe_offset + 0x88 // PE + 4 + 20 + 96 + 16 (magic+linker+base) = 0x88 for PE32+
+        opt_header_offset + 112  // PE32+: magic(2) + versions(2) + sizes(20) + addresses(24) + sizes(16) + magic(8) + subsystem(2) + dll(2) + sizes(40) = 112
     } else {
-        pe_offset + 0x78 // PE + 4 + 20 + 96 = 0x78 for PE32
+        opt_header_offset + 96   // PE32
     };
 
     info!(
-        "Rewriting data directories at offset {:#x}, TLS[9] = RVA={:#x} Size={:#x}",
+        "CRITICAL FIX: Rewriting data directories at offset {:#x}, TLS[9] = RVA={:#x} Size={:#x}",
         dd_start,
         pe.nt_headers.optional_header.data_directory[9].virtual_address,
         pe.nt_headers.optional_header.data_directory[9].size
     );
 
+    // Write all 16 data directories
     for (i, dd) in pe
         .nt_headers
         .optional_header
@@ -177,6 +185,34 @@ fn rewrite_data_directories(out_data: &mut [u8], pe: &PeHeader, pe_offset: usize
         if off + 8 <= out_data.len() {
             out_data[off..off + 4].copy_from_slice(&dd.virtual_address.to_le_bytes());
             out_data[off + 4..off + 8].copy_from_slice(&dd.size.to_le_bytes());
+
+            // Debug log for TLS and IMPORT
+            if i == 9 && dd.virtual_address != 0 {
+                info!(
+                    "CRITICAL FIX: Wrote TLS Directory[9] at file offset {:#x}: RVA={:#x}, Size={:#x}",
+                    off, dd.virtual_address, dd.size
+                );
+
+                // Verify the write
+                let verify_rva = u32::from_le_bytes([out_data[off], out_data[off+1], out_data[off+2], out_data[off+3]]);
+                let verify_size = u32::from_le_bytes([out_data[off+4], out_data[off+5], out_data[off+6], out_data[off+7]]);
+                info!(
+                    "CRITICAL FIX: Verified TLS in buffer: RVA={:#x}, Size={:#x}",
+                    verify_rva, verify_size
+                );
+            }
+
+            if i == 1 {
+                info!(
+                    "Writing IMPORT Directory[1] at file offset {:#x}: RVA={:#x}, Size={:#x}",
+                    off, dd.virtual_address, dd.size
+                );
+            }
+        } else {
+            warn!(
+                "CRITICAL FIX: Cannot write directory[{}] at offset {:#x}, buffer size={}",
+                i, off, out_data.len()
+            );
         }
     }
 
@@ -218,6 +254,7 @@ fn write_section_data(out_data: &mut Vec<u8>, pe: &PeHeader, dump_buf: &[u8]) {
         if raw_offset == 0 || section.header.size_of_raw_data == 0 {
             continue;
         }
+
         let raw_size = section.header.size_of_raw_data as usize;
         let data = if let Some(ref extra) = section.extra_data {
             if raw_offset + extra.len() > out_data.len() {

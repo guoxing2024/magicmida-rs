@@ -28,6 +28,7 @@ pub mod dumper;
 pub mod original_imports;
 pub mod relocation;
 pub mod postprocess;
+pub mod dll_exports;
 
 // Re-export the primary types so callers can do `use mida_pe::PeHeader` etc.
 pub use error::PeError;
