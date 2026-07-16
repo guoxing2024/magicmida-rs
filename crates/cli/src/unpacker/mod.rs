@@ -1778,9 +1778,13 @@ fn run_post_loop_phases(
 
     // ---- phase C: post-processing ----
     let image_base_for_scan = dbg.image_base() as usize;
-    // Phase C2: compare live memory with the captured OEP. A post-attach
-    // capture is only a snapshot of the suspended primary thread; if the CRT
-    // scanner finds a different executable startup candidate, prefer it.
+    // Phase C2: compare live memory with the captured OEP.
+    //
+    // IMPORTANT: For post_attach mode, the captured RIP is the real application
+    // entry point (e.g. 0x70b7), NOT the CRT startup (e.g. 0x1000). The CRT
+    // scanner often finds the CRT entry, but that's wrong for the final PE -
+    // we want the application's actual entry point. So in post_attach mode,
+    // KEEP the captured OEP and ignore the scan result.
     if let Some(real_oep) = scan_live_memory_for_real_oep(
         dbg,
         image_base_for_scan,
@@ -1793,9 +1797,9 @@ fn run_post_loop_phases(
                 info!(
                     captured_oep = %format!("{oep_addr:#x}"),
                     scan_oep = %format!("{real_oep:#x}"),
-                    "Replacing post-attach RIP snapshot with scanned OEP"
+                    "post_attach: Keeping captured OEP (application entry), ignoring scan (CRT entry)"
                 );
-                oep_addr = real_oep;
+                // Don't replace - captured OEP is correct
             } else {
                 info!(
                     captured_oep = %format!("{oep_addr:#x}"),

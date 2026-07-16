@@ -111,8 +111,10 @@ pub(super) fn scan_live_memory_for_real_oep(
     }
 
     // Fallback: plain `sub rsp, imm8` (48 83 EC xx) without the SEH cookie.
-    // Scan from offset 0 ? the real OEP is often at .text[0].
-    let scan_end = 0x40000.min(effective_len).saturating_sub(4);
+    // IMPORTANT: Only scan the first 0x1000 bytes - scanning the entire .text
+    // will incorrectly match random functions. The real CRT entry is typically
+    // within the first 4KB.
+    let scan_end = 0x1000.min(effective_len).saturating_sub(4);
     for i in 0..scan_end {
         if text_buf[i] == 0x48
             && text_buf[i + 1] == 0x83
