@@ -645,7 +645,7 @@ mod tests {
 
     #[test]
     fn estimate_reasonable() {
-        let size = estimate_code_size(3);
+        let size = estimate_code_size(3, false);
         assert!(size >= 150 && size <= 256);
     }
 }
