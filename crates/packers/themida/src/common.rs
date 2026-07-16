@@ -1,7 +1,7 @@
-﻿//! Common state carried through the Themida unpacking process.
+//! Common state carried through the Themida unpacking process.
 
-use std::collections::HashSet;
 use crate::init::ThemidaPeInfo;
+use std::collections::HashSet;
 
 /// Mutable state shared across the Themida unpacking pipeline.
 #[derive(Debug, Clone)]

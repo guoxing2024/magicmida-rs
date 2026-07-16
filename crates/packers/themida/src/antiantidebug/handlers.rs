@@ -7,9 +7,8 @@ use tracing::{debug, info, trace, warn};
 use crate::error::ThemidaError;
 
 use super::{
-    ctx_arch, ptr_from_bytes, PROCESS_DEBUG_FLAGS, PROCESS_DEBUG_OBJECT_HANDLE,
-    PROCESS_DEBUG_PORT, PTR_SIZE, STATUS_PORT_NOT_SET, STATUS_SUCCESS,
-    THREAD_HIDE_FROM_DEBUGGER,
+    ctx_arch, ptr_from_bytes, PROCESS_DEBUG_FLAGS, PROCESS_DEBUG_OBJECT_HANDLE, PROCESS_DEBUG_PORT,
+    PTR_SIZE, STATUS_PORT_NOT_SET, STATUS_SUCCESS, THREAD_HIDE_FROM_DEBUGGER,
 };
 
 // ---------------------------------------------------------------------------
@@ -99,7 +98,8 @@ pub fn handle_nt_set_information_thread(
         warn!(thread_id, "Short read of ThreadInformationClass");
         return Ok(false);
     }
-    let info_class = info_class_bytes.get(..4)
+    let info_class = info_class_bytes
+        .get(..4)
         .and_then(|s| s.try_into().ok())
         .map(u32::from_le_bytes)
         .ok_or_else(|| ThemidaError::Debugger("Failed to parse info_class".into()))?;
@@ -302,8 +302,7 @@ pub fn handle_nt_query_information_process(
 
     info!(
         thread_id,
-        description,
-        "Faked NtQueryInformationProcess({description})"
+        description, "Faked NtQueryInformationProcess({description})"
     );
     Ok(())
 }

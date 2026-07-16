@@ -120,8 +120,8 @@ pub fn init_pe_details(
     let themida_section = locate_themida_section(pe);
 
     // Step 6: Check virtualised OEP.
-    let is_vm_oep = entry_point_bytes
-        .is_some_and(|bytes| version::check_virtualized_oep(pe, bytes));
+    let is_vm_oep =
+        entry_point_bytes.is_some_and(|bytes| version::check_virtualized_oep(pe, bytes));
 
     let pe_sections = pe.sections.clone();
 
@@ -208,8 +208,8 @@ fn resolve_tls_callback_count(
     let Some(cb_section) = pe.get_section_by_rva(cb_rva) else {
         return 0;
     };
-    let cb_file_offset = cb_section.raw_offset as usize
-        + (cb_rva - cb_section.virtual_address) as usize;
+    let cb_file_offset =
+        cb_section.raw_offset as usize + (cb_rva - cb_section.virtual_address) as usize;
 
     let ptr_size = if is_64bit { 8usize } else { 4usize };
     let Ok(file_data) = std::fs::read(path) else {
@@ -223,7 +223,8 @@ fn resolve_tls_callback_count(
     let callbacks_va = if is_64bit {
         u64::from_le_bytes(cb_bytes)
     } else {
-        cb_bytes.get(..4)
+        cb_bytes
+            .get(..4)
             .and_then(|s| s.try_into().ok())
             .map(u32::from_le_bytes)
             .map(u64::from)

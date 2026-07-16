@@ -86,7 +86,9 @@ pub(super) fn install_anti_dump_fix_x86(
     // push 0x400                      ; PAGE_READWRITE
     // push 0x400                      ; size
     // push ImageBase                  ; address
-    stub.extend_from_slice(&[0x6A, 0x00, 0x54, 0x6A, 0x04, 0x68, 0x00, 0x04, 0x00, 0x00, 0x68]);
+    stub.extend_from_slice(&[
+        0x6A, 0x00, 0x54, 0x6A, 0x04, 0x68, 0x00, 0x04, 0x00, 0x00, 0x68,
+    ]);
     stub.extend_from_slice(&(image_base as u32).to_le_bytes());
 
     // call dword ptr [VirtualProtect_addr]  ; FF 15 ...
@@ -102,7 +104,9 @@ pub(super) fn install_anti_dump_fix_x86(
     // push dword ptr [esp+4]          ; OldProtect value
     // push 0x400                      ; size
     // push ImageBase                  ; address
-    stub.extend_from_slice(&[0x54, 0xFF, 0x74, 0x24, 0x04, 0x68, 0x00, 0x04, 0x00, 0x00, 0x68]);
+    stub.extend_from_slice(&[
+        0x54, 0xFF, 0x74, 0x24, 0x04, 0x68, 0x00, 0x04, 0x00, 0x00, 0x68,
+    ]);
     stub.extend_from_slice(&(image_base as u32).to_le_bytes());
 
     // call dword ptr [VirtualProtect_addr]  ; FF 15 ...

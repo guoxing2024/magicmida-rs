@@ -176,7 +176,11 @@ fn build_container_stub_internal(
     let code_size = estimate_code_size(containers.len(), data_snapshot.is_some());
     let metadata_offset = code_size;
     let data_base_offset = metadata_offset + containers.len() * CONTAINER_METADATA_SIZE;
-    let data_snapshot_offset = data_base_offset + containers.iter().map(|c| c.heap_content.len()).sum::<usize>();
+    let data_snapshot_offset = data_base_offset
+        + containers
+            .iter()
+            .map(|c| c.heap_content.len())
+            .sum::<usize>();
 
     // 1. Build code section
     build_stub_code(
@@ -199,7 +203,9 @@ fn build_container_stub_internal(
     // 2. Build metadata array
     let mut current_data_offset = data_base_offset;
     for container in containers {
-        let heap_size = container.decoded_end.saturating_sub(container.decoded_begin);
+        let heap_size = container
+            .decoded_end
+            .saturating_sub(container.decoded_begin);
         stub.extend_from_slice(&container.rva.to_le_bytes());
         stub.extend_from_slice(&(heap_size as u32).to_le_bytes());
         stub.extend_from_slice(&container.cookie.to_le_bytes());
@@ -283,8 +289,8 @@ fn build_stub_code(
         stub.extend_from_slice(&[0x83, 0xfa, 0x01]);
         // je continue_bootstrap
         stub.extend_from_slice(&[0x74, 0x04]); // je +4 (skip the early return)
-        // Early return if not DLL_PROCESS_ATTACH:
-        // add rsp, 0x38
+                                               // Early return if not DLL_PROCESS_ATTACH:
+                                               // add rsp, 0x38
         stub.extend_from_slice(&[0x48, 0x83, 0xc4, 0x38]);
         // ret
         stub.push(0xc3);
@@ -383,7 +389,7 @@ fn build_stub_code(
     // Get .boot section VA: lea rdx, [rip]; sub rdx, (current_offset_in_boot)
     // This calculates the VA of boot section start at runtime
     stub.extend_from_slice(&[0x48, 0x8d, 0x15, 0x00, 0x00, 0x00, 0x00]); // lea rdx, [rip+0]
-    // RIP after lea instruction points to the next instruction
+                                                                         // RIP after lea instruction points to the next instruction
     let rip_after_lea = stub.len() as u32;
     // sub rdx, rip_after_lea to get boot section VA
     if rip_after_lea <= 127 {
@@ -612,10 +618,7 @@ fn restore_data_section(
     // rep movsb (copy data_size bytes from rsi to rdi)
     stub.extend_from_slice(&[0xf3, 0xa4]);
 
-    tracing::info!(
-        "Generated .data restore code: {} bytes",
-        10 + 7 + 5 + 2
-    );
+    tracing::info!("Generated .data restore code: {} bytes", 10 + 7 + 5 + 2);
 
     Some(())
 }

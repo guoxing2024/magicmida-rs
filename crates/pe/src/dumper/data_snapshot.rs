@@ -170,7 +170,10 @@ pub fn build_data_restore_code(
     // lea rsi, [rip + snapshot_offset]
     // The snapshot will be embedded after the code
     code.extend_from_slice(&[0x48, 0x8d, 0x35]); // lea rsi, [rip + disp32]
-    let _lea_next2 = stub_rva.checked_add(current_offset as u32)?.checked_add(code.len() as u32)?.checked_add(4)?;
+    let _lea_next2 = stub_rva
+        .checked_add(current_offset as u32)?
+        .checked_add(code.len() as u32)?
+        .checked_add(4)?;
 
     // The snapshot will be placed right after build_data_restore_code returns
     // We need to return info about where to place it
@@ -194,7 +197,10 @@ mod tests {
     #[test]
     fn skip_region_size_correct() {
         // Container metadata should be 24 bytes (3x u64)
-        let skip = SkipRegion { offset: 0, size: 24 };
+        let skip = SkipRegion {
+            offset: 0,
+            size: 24,
+        };
         assert_eq!(skip.size, 24);
     }
 }

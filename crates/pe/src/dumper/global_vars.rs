@@ -69,18 +69,18 @@ pub fn detect_critical_vars_from_oep(
                 // ModR/M format: [mod:2][reg:3][r/m:3]
                 // RIP-relative: mod=00 (0b00), r/m=101 (0b101)
                 // This gives us x05, x0D, x15, x1D, x25, x2D, x35, x3D
-                if (modrm & 0xC7) == 0x05 || (modrm & 0xC7) == 0x0D ||
-                   (modrm & 0xC7) == 0x15 || (modrm & 0xC7) == 0x1D ||
-                   (modrm & 0xC7) == 0x25 || (modrm & 0xC7) == 0x2D ||
-                   (modrm & 0xC7) == 0x35 || (modrm & 0xC7) == 0x3D {
-
+                if (modrm & 0xC7) == 0x05
+                    || (modrm & 0xC7) == 0x0D
+                    || (modrm & 0xC7) == 0x15
+                    || (modrm & 0xC7) == 0x1D
+                    || (modrm & 0xC7) == 0x25
+                    || (modrm & 0xC7) == 0x2D
+                    || (modrm & 0xC7) == 0x35
+                    || (modrm & 0xC7) == 0x3D
+                {
                     // Read 32-bit displacement
-                    let disp = i32::from_le_bytes([
-                        code[i + 3],
-                        code[i + 4],
-                        code[i + 5],
-                        code[i + 6],
-                    ]);
+                    let disp =
+                        i32::from_le_bytes([code[i + 3], code[i + 4], code[i + 5], code[i + 6]]);
 
                     // Calculate target RVA: next_instruction_rva + displacement
                     let instr_len = 7; // REX + opcode + ModR/M + disp32

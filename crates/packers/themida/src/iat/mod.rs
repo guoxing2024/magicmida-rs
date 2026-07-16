@@ -271,12 +271,8 @@ pub fn determine_iat_address(
     // IAT start, which helps when the IAT spans multiple modules.
     let mut iat_ref = if iat_ref == 0 {
         info!("No IAT reference found via OEP scan - trying full .text scan");
-        let earliest = discovery::find_earliest_iat_ref(
-            debugger,
-            text_section,
-            text_base,
-            code_size,
-        )?;
+        let earliest =
+            discovery::find_earliest_iat_ref(debugger, text_section, text_base, code_size)?;
         if earliest != 0 {
             earliest
         } else if !guard_addrs.is_empty() {
@@ -297,12 +293,8 @@ pub fn determine_iat_address(
         }
     } else {
         // Found via OEP scan, but try to find an earlier ref
-        let earliest = discovery::find_earliest_iat_ref(
-            debugger,
-            text_section,
-            text_base,
-            code_size,
-        )?;
+        let earliest =
+            discovery::find_earliest_iat_ref(debugger, text_section, text_base, code_size)?;
         if earliest != 0 && earliest < iat_ref {
             info!(
                 oep_ref = format_args!("{iat_ref:#x}"),
@@ -315,7 +307,9 @@ pub fn determine_iat_address(
         }
     };
 
-    if iat_ref == 0 { return Err(ThemidaError::IatNotFound); }
+    if iat_ref == 0 {
+        return Err(ThemidaError::IatNotFound);
+    }
 
     info!("First IAT reference: {iat_ref:#x}");
 
@@ -327,11 +321,8 @@ pub fn determine_iat_address(
     // for regions densely populated with resolved API addresses.
     if !discovery::validate_iat_ref(debugger, iat_ref)? {
         info!("Code-scan IAT ref failed validation - trying data heuristic");
-        let heuristic_ref = discovery::find_iat_via_data_heuristic(
-            debugger,
-            data_section_base,
-            data_section_size,
-        )?;
+        let heuristic_ref =
+            discovery::find_iat_via_data_heuristic(debugger, data_section_base, data_section_size)?;
         if heuristic_ref != 0 {
             info!(
                 old = format_args!("{iat_ref:#x}"),
@@ -343,8 +334,6 @@ pub fn determine_iat_address(
             warn!("Data heuristic found nothing - proceeding with code-scan ref");
         }
     }
-
-
 
     // Step 2: Walk backwards from `iat_ref` to find the start of the IAT.
     // The IAT is a contiguous array of pointers, preceded by a region of
@@ -484,8 +473,14 @@ pub fn fixup_api_call_sites(
         if insn[0] == 0x48 && insn[1] == 0x8B {
             let modrm = insn[2];
             info!("Found mov instruction, ModR/M={:#04x}", modrm);
-            if modrm == 0x05 || modrm == 0x0D || modrm == 0x15 || modrm == 0x1D
-                || modrm == 0x25 || modrm == 0x2D || modrm == 0x35 || modrm == 0x3D
+            if modrm == 0x05
+                || modrm == 0x0D
+                || modrm == 0x15
+                || modrm == 0x1D
+                || modrm == 0x25
+                || modrm == 0x2D
+                || modrm == 0x35
+                || modrm == 0x3D
             {
                 let old_disp = i32::from_le_bytes([insn[3], insn[4], insn[5], insn[6]]);
                 let old_target = (site_addr as i64 + 7 + old_disp as i64) as usize;
@@ -512,7 +507,11 @@ pub fn fixup_api_call_sites(
                         fixup_count += 1;
                     }
                 } else {
-                    tracing::debug!("mov at {:#x} target {:#x} not in IAT", site_addr, old_target);
+                    tracing::debug!(
+                        "mov at {:#x} target {:#x} not in IAT",
+                        site_addr,
+                        old_target
+                    );
                 }
             }
         }

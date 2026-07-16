@@ -282,8 +282,7 @@ pub fn is_themida_section(section: &PeSection) -> bool {
     let has_write = section.characteristics & IMAGE_SCN_MEM_WRITE != 0;
 
     // Signal 2: unnamed/empty section with execute + write permissions.
-    let is_empty_name = section.name.is_empty()
-        || section.name.as_bytes().iter().all(|&b| b == 0);
+    let is_empty_name = section.name.is_empty() || section.name.as_bytes().iter().all(|&b| b == 0);
     if is_empty_name && has_execute && has_write {
         return true;
     }
@@ -299,12 +298,11 @@ pub fn is_themida_section(section: &PeSection) -> bool {
         return true;
     }
 
-   // Signal 4: zero raw size with large virtual size and execute permission.
-   // Themida stores its code in memory-only sections (e.g. .winlice).
-   if section.raw_size == 0 && section.virtual_size > 0x10000 && has_execute
-   {
-       return true;
-   }
+    // Signal 4: zero raw size with large virtual size and execute permission.
+    // Themida stores its code in memory-only sections (e.g. .winlice).
+    if section.raw_size == 0 && section.virtual_size > 0x10000 && has_execute {
+        return true;
+    }
 
     // Signal 5: executable section with a non-standard name and large virtual
     // size.  Themida v3 uses randomized section names like ".,\W", ".KI3",
@@ -313,20 +311,14 @@ pub fn is_themida_section(section: &PeSection) -> bool {
     // use only lowercase letters, digits, and dots.  A large (>64KB)
     // executable section with a non-standard name is almost certainly a
     // Themida code section.
-    if has_execute
-        && section.virtual_size > 0x10000
-        && !is_standard_section_name(&section.name)
-    {
+    if has_execute && section.virtual_size > 0x10000 && !is_standard_section_name(&section.name) {
         return true;
     }
 
     // Signal 6: writable section with a non-standard name.
     // Themida's IAT section (e.g. ".|lT") is small, writable, and has a
     // randomized name.  Exclude .data which is the standard writable section.
-    if has_write
-        && !is_standard_section_name(&section.name)
-        && section.name != ".data"
-    {
+    if has_write && !is_standard_section_name(&section.name) && section.name != ".data" {
         return true;
     }
 
@@ -340,12 +332,35 @@ pub fn is_themida_section(section: &PeSection) -> bool {
 /// mixed case, e.g. ".,\W", ".KI3", ".|lT".
 fn is_standard_section_name(name: &str) -> bool {
     const STANDARD: &[&str] = &[
-        ".text", ".rdata", ".data", ".pdata", ".rsrc", ".reloc",
-        ".bss", ".tls", ".CRT", ".idata", ".textbss", ".init",
-        ".fini", ".plt", ".got", ".gotplt", ".debug_*",
-        ".gfids", ".giats", ".gehcont", ".00cfg", ".chargpr",
-        ".volatilemetadata", ".xtbl", "BSS", "CODE", "DATA",
-        ".minicrt", ".msvcinit",
+        ".text",
+        ".rdata",
+        ".data",
+        ".pdata",
+        ".rsrc",
+        ".reloc",
+        ".bss",
+        ".tls",
+        ".CRT",
+        ".idata",
+        ".textbss",
+        ".init",
+        ".fini",
+        ".plt",
+        ".got",
+        ".gotplt",
+        ".debug_*",
+        ".gfids",
+        ".giats",
+        ".gehcont",
+        ".00cfg",
+        ".chargpr",
+        ".volatilemetadata",
+        ".xtbl",
+        "BSS",
+        "CODE",
+        "DATA",
+        ".minicrt",
+        ".msvcinit",
     ];
     if STANDARD.contains(&name) {
         return true;

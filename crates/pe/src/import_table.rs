@@ -199,11 +199,7 @@ impl ImportTableBuilder {
                 + 2
         } else {
             // Thunks have no addresses (all 0) - use sequential count
-            let total_thunks: usize = self
-                .modules
-                .iter()
-                .map(|m| m.thunks.len())
-                .sum();
+            let total_thunks: usize = self.modules.iter().map(|m| m.thunks.len()).sum();
             total_thunks + self.modules.len() + 2 // +1 null per module, +2 padding
         };
 

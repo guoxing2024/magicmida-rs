@@ -13,8 +13,8 @@ use tracing::{debug, info, trace, warn};
 use crate::error::ThemidaError;
 
 use super::{
-    PROCESS_DEBUG_FLAGS, PROCESS_DEBUG_OBJECT_HANDLE, PROCESS_DEBUG_PORT,
-    NtQIP_SYSCALL_NUMBER, STATUS_PORT_NOT_SET, STATUS_SUCCESS,
+    NtQIP_SYSCALL_NUMBER, PROCESS_DEBUG_FLAGS, PROCESS_DEBUG_OBJECT_HANDLE, PROCESS_DEBUG_PORT,
+    STATUS_PORT_NOT_SET, STATUS_SUCCESS,
 };
 
 /// Install a `KiFastSystemCall` hook for x86 targets.
@@ -151,7 +151,10 @@ pub fn handle_kifast_syscall(
             .read_memory(user_sp, &mut ret_addr_bytes)
             .map_err(|e| ThemidaError::Debugger(format!("kifs: read ret addr: {e}")))?;
         if read != 4 {
-            warn!(thread_id, "Short read of return address in KiFastSystemCall");
+            warn!(
+                thread_id,
+                "Short read of return address in KiFastSystemCall"
+            );
             return Ok(());
         }
         let ret_addr = u32::from_le_bytes(ret_addr_bytes) as usize;
@@ -162,7 +165,10 @@ pub fn handle_kifast_syscall(
             .read_memory(user_sp + 8, &mut info_class_bytes)
             .map_err(|e| ThemidaError::Debugger(format!("kifs: read info class: {e}")))?;
         if read != 4 {
-            warn!(thread_id, "Short read of ProcessInformationClass in KiFastSystemCall");
+            warn!(
+                thread_id,
+                "Short read of ProcessInformationClass in KiFastSystemCall"
+            );
             return Ok(());
         }
         let info_class = u32::from_le_bytes(info_class_bytes);
@@ -180,7 +186,11 @@ pub fn handle_kifast_syscall(
                 // safe fallback rather than `unreachable!()` so a future
                 // refactor cannot panic inside the debug loop.
                 _ => {
-                    trace!(thread_id, info_class, "kifs: unhandled debug class, ignoring");
+                    trace!(
+                        thread_id,
+                        info_class,
+                        "kifs: unhandled debug class, ignoring"
+                    );
                     return Ok(());
                 }
             };
@@ -193,7 +203,10 @@ pub fn handle_kifast_syscall(
                 .read_memory(user_sp + 12, &mut out_buf_bytes)
                 .map_err(|e| ThemidaError::Debugger(format!("kifs: read out buf: {e}")))?;
             if read != 4 {
-                warn!(thread_id, "Short read of output buf ptr in KiFastSystemCall");
+                warn!(
+                    thread_id,
+                    "Short read of output buf ptr in KiFastSystemCall"
+                );
                 return Ok(());
             }
             let out_buf_addr = u32::from_le_bytes(out_buf_bytes) as usize;
@@ -204,7 +217,11 @@ pub fn handle_kifast_syscall(
                 PROCESS_DEBUG_OBJECT_HANDLE => (0, STATUS_PORT_NOT_SET),
                 PROCESS_DEBUG_FLAGS => (1, STATUS_SUCCESS),
                 _ => {
-                    trace!(thread_id, info_class, "kifs: unhandled class at fake-value stage, skipping");
+                    trace!(
+                        thread_id,
+                        info_class,
+                        "kifs: unhandled class at fake-value stage, skipping"
+                    );
                     return Ok(());
                 }
             };
@@ -225,7 +242,10 @@ pub fn handle_kifast_syscall(
                 .set_thread_context(thread_id, &ctx)
                 .map_err(|e| ThemidaError::Debugger(format!("kifs: set_thread_context: {e}")))?;
 
-            info!(thread_id, description, "Faked NtQueryInformationProcess({description}) via KiFastSystemCall");
+            info!(
+                thread_id,
+                description, "Faked NtQueryInformationProcess({description}) via KiFastSystemCall"
+            );
         } else {
             // Not a debug class — execute normally.
             // Restore EDX to point to the user stack (required by
@@ -235,9 +255,9 @@ pub fn handle_kifast_syscall(
             ctx.Edx = ctx.Esp;
             ctx.Eip = (kifast_syscall_addr + 2) as u32;
 
-            debugger
-                .set_thread_context(thread_id, &ctx)
-                .map_err(|e| ThemidaError::Debugger(format!("kifs: set_thread_context (normal): {e}")))?;
+            debugger.set_thread_context(thread_id, &ctx).map_err(|e| {
+                ThemidaError::Debugger(format!("kifs: set_thread_context (normal): {e}"))
+            })?;
         }
     } else {
         // Not NtQueryInformationProcess — let it execute normally.

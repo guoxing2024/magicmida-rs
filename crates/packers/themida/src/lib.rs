@@ -34,28 +34,26 @@ pub mod trace_imports;
 pub mod version;
 
 // Re-export the primary types so callers can do `use mida_packers_themida::…`
-pub use antiantidebug::{
-    handle_nt_query_information_process,
-    handle_nt_set_information_thread, inject_scylla_hide,
-    ScyllaHideConfig,
-};
 #[cfg(target_arch = "x86")]
 pub use antiantidebug::{
-    handle_kifast_syscall, install_kifast_syscall_hook,
-    get_nt_qip_syscall_number,
+    get_nt_qip_syscall_number, handle_kifast_syscall, install_kifast_syscall_hook,
+};
+pub use antiantidebug::{
+    handle_nt_query_information_process, handle_nt_set_information_thread, inject_scylla_hide,
+    ScyllaHideConfig,
 };
 pub use binaries::{expected_hook_hash, expected_injector_hash, verify_sha256};
 pub use common::ThemidaState;
 pub use error::ThemidaError;
 pub use guard::{
-    install_code_section_guard, install_iat_guard, is_guarded_address,
-    process_guarded_access, process_iat_monitoring_access,
-    remove_code_section_guard, re_guard_iat, restore_code_section_guard,
-    switch_to_iat_monitoring, temporary_un_guard_iat, GuardAccessResult,
+    install_code_section_guard, install_iat_guard, is_guarded_address, process_guarded_access,
+    process_iat_monitoring_access, re_guard_iat, remove_code_section_guard,
+    restore_code_section_guard, switch_to_iat_monitoring, temporary_un_guard_iat,
+    GuardAccessResult,
 };
 pub use iat::{
-    detect_compiler, determine_iat_address, fix_iat, fixup_api_call_sites,
-    CompilerHint, IatFixStrategy, IatLocation,
+    detect_compiler, determine_iat_address, fix_iat, fixup_api_call_sites, CompilerHint,
+    IatFixStrategy, IatLocation,
 };
 pub use init::{init_pe_details, locate_themida_section, ThemidaPeInfo};
 pub use oep::{
@@ -64,20 +62,22 @@ pub use oep::{
     try_find_correct_oep_by_range, write_msvc_oep_x64, TlsCallbackResult,
 };
 pub use postprocess::{
-    create_data_sections, dump_process_code, install_anti_dump_fix,
-    shrink_pe, DataSectionResult,
+    create_data_sections, dump_process_code, install_anti_dump_fix, shrink_pe, DataSectionResult,
 };
 pub use text_tracer::{
-    decide_text_trace_step, is_valid_x64_prologue_at, trace_until_real_oep, TextTraceDecision, is_oep_already_decrypted,
+    decide_text_trace_step, is_oep_already_decrypted, is_valid_x64_prologue_at,
+    trace_until_real_oep, TextTraceDecision,
 };
 pub use trace_imports::{
-    is_at_themida_vm, trace_imports, trace_is_at_api, TraceImportResult, TraceStepDecision,
+    is_at_themida_vm,
+    trace_imports,
+    trace_is_at_api,
+    TraceImportResult,
+    TraceStepDecision,
     // Instruction limit per trace step (used by text decrypt walk + IAT trace).
     TRACE_LIMIT,
 };
-pub use version::{
-    check_virtualized_oep, detect_version, is_themida_section, ThemidaVersion,
-};
+pub use version::{check_virtualized_oep, detect_version, is_themida_section, ThemidaVersion};
 
 // ---------------------------------------------------------------------------
 // Inline helpers shared across the crate

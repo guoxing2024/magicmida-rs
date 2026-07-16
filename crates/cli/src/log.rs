@@ -1,4 +1,4 @@
-﻿//! Log output — colourful, tracing-backed console logging.
+//! Log output — colourful, tracing-backed console logging.
 //!
 //! Corresponds to `TLogMsgType` in `Utils.pas` and the `ConsoleLog` procedure
 //! in `Magicmida.dpr`.
@@ -123,10 +123,7 @@ where
                 // matching the Pascal reference's `MessageBeep`.
                 #[cfg(windows)]
                 {
-                    let _ = std::io::Write::write_all(
-                        &mut io::stdout(),
-                        &[0x07u8],
-                    );
+                    let _ = std::io::Write::write_all(&mut io::stdout(), &[0x07u8]);
                 }
             }
             (_, true) => {

@@ -71,7 +71,10 @@ pub fn trace_is_at_api(
     // 2. Anti-trace API skipping.  sp < trace_start_sp means we're in a
     //    nested call; if the target is Sleep or lstrlenA/W, pop return addr.
     if sp < trace_start_sp && (ip == sleep_api || ip == lstrlen_api) {
-        return TraceStepDecision::SkipAntiTraceApi { ip, ret_addr: return_addr };
+        return TraceStepDecision::SkipAntiTraceApi {
+            ip,
+            ret_addr: return_addr,
+        };
     }
 
     // 3. Section exit check — did we leave the Themida section?
@@ -154,33 +157,21 @@ mod tests {
     #[test]
     fn zero_is_not_real_api() {
         assert!(!is_real_api_address(
-            0,
-            0x400000,
-            0x500000,
-            0x410000,
-            0x420000
+            0, 0x400000, 0x500000, 0x410000, 0x420000
         ));
     }
 
     #[test]
     fn in_themida_section_needs_tracing() {
         assert!(!is_real_api_address(
-            0x411000,
-            0x400000,
-            0x500000,
-            0x410000,
-            0x420000
+            0x411000, 0x400000, 0x500000, 0x410000, 0x420000
         ));
     }
 
     #[test]
     fn in_image_but_not_themida_needs_tracing() {
         assert!(!is_real_api_address(
-            0x405000,
-            0x400000,
-            0x500000,
-            0x410000,
-            0x420000
+            0x405000, 0x400000, 0x500000, 0x410000, 0x420000
         ));
     }
 
@@ -198,11 +189,7 @@ mod tests {
     #[test]
     fn low_address_is_not_real_api() {
         assert!(!is_real_api_address(
-            0x5000,
-            0x400000,
-            0x500000,
-            0x410000,
-            0x420000
+            0x5000, 0x400000, 0x500000, 0x410000, 0x420000
         ));
     }
 
@@ -210,9 +197,8 @@ mod tests {
     fn trace_is_at_api_continue_inside_themida() {
         assert_eq!(
             trace_is_at_api(
-                0x410500, 0x10000, 0x10000, 50,
-                0x410000, 0x420000, 0x400000, 0x500000,
-                0x7FFE0000, 0x7FFE1000, false, 0,
+                0x410500, 0x10000, 0x10000, 50, 0x410000, 0x420000, 0x400000, 0x500000, 0x7FFE0000,
+                0x7FFE1000, false, 0,
             ),
             TraceStepDecision::Continue,
         );
@@ -222,8 +208,7 @@ mod tests {
     fn trace_is_at_api_hit_vm_within_counter_range() {
         assert_eq!(
             trace_is_at_api(
-                0x410500, 0x10000, 0x10000, 200,
-                0x410000, 0x420000, 0x400000, 0x500000,
+                0x410500, 0x10000, 0x10000, 200, 0x410000, 0x420000, 0x400000, 0x500000,
                 0x7FFE0000, 0x7FFE1000, true, 0,
             ),
             TraceStepDecision::HitVm { ip: 0x410500 },
@@ -234,9 +219,8 @@ mod tests {
     fn trace_is_at_api_ignore_vm_below_counter_threshold() {
         assert_eq!(
             trace_is_at_api(
-                0x410500, 0x10000, 0x10000, 50,
-                0x410000, 0x420000, 0x400000, 0x500000,
-                0x7FFE0000, 0x7FFE1000, true, 0,
+                0x410500, 0x10000, 0x10000, 50, 0x410000, 0x420000, 0x400000, 0x500000, 0x7FFE0000,
+                0x7FFE1000, true, 0,
             ),
             TraceStepDecision::Continue,
         );
@@ -246,8 +230,7 @@ mod tests {
     fn trace_is_at_api_ignore_vm_above_counter_threshold() {
         assert_eq!(
             trace_is_at_api(
-                0x410500, 0x10000, 0x10000, 5001,
-                0x410000, 0x420000, 0x400000, 0x500000,
+                0x410500, 0x10000, 0x10000, 5001, 0x410000, 0x420000, 0x400000, 0x500000,
                 0x7FFE0000, 0x7FFE1000, true, 0,
             ),
             TraceStepDecision::Continue,
@@ -258,9 +241,18 @@ mod tests {
     fn trace_is_at_api_found_api_outside_image() {
         assert_eq!(
             trace_is_at_api(
-                0x7FFE12340000, 0x10000, 0x10000, 50,
-                0x410000, 0x420000, 0x400000, 0x500000,
-                0x7FFE0000, 0x7FFE1000, false, 0,
+                0x7FFE12340000,
+                0x10000,
+                0x10000,
+                50,
+                0x410000,
+                0x420000,
+                0x400000,
+                0x500000,
+                0x7FFE0000,
+                0x7FFE1000,
+                false,
+                0,
             ),
             TraceStepDecision::FoundApi { ip: 0x7FFE12340000 },
         );
@@ -270,9 +262,8 @@ mod tests {
     fn trace_is_at_api_continue_on_internal_function() {
         assert_eq!(
             trace_is_at_api(
-                0x405000, 0x10000, 0x10000, 50,
-                0x410000, 0x420000, 0x400000, 0x500000,
-                0x7FFE0000, 0x7FFE1000, false, 0,
+                0x405000, 0x10000, 0x10000, 50, 0x410000, 0x420000, 0x400000, 0x500000, 0x7FFE0000,
+                0x7FFE1000, false, 0,
             ),
             TraceStepDecision::Continue,
         );
@@ -282,8 +273,7 @@ mod tests {
     fn trace_is_at_api_skip_anti_trace_sleep() {
         assert_eq!(
             trace_is_at_api(
-                0x7FFE0000, 0x0FF00, 0x10000, 50,
-                0x410000, 0x420000, 0x400000, 0x500000,
+                0x7FFE0000, 0x0FF00, 0x10000, 50, 0x410000, 0x420000, 0x400000, 0x500000,
                 0x7FFE0000, 0x7FFE1000, false, 0xDEAD0000,
             ),
             TraceStepDecision::SkipAntiTraceApi {
@@ -297,8 +287,7 @@ mod tests {
     fn trace_is_at_api_skip_anti_trace_lstrlen() {
         assert_eq!(
             trace_is_at_api(
-                0x7FFE1000, 0x0FF00, 0x10000, 50,
-                0x410000, 0x420000, 0x400000, 0x500000,
+                0x7FFE1000, 0x0FF00, 0x10000, 50, 0x410000, 0x420000, 0x400000, 0x500000,
                 0x7FFE0000, 0x7FFE1000, false, 0xDEAD0001,
             ),
             TraceStepDecision::SkipAntiTraceApi {
@@ -312,8 +301,7 @@ mod tests {
     fn trace_is_at_api_no_skip_when_sp_at_start() {
         assert_eq!(
             trace_is_at_api(
-                0x7FFE0000, 0x10000, 0x10000, 50,
-                0x410000, 0x420000, 0x400000, 0x500000,
+                0x7FFE0000, 0x10000, 0x10000, 50, 0x410000, 0x420000, 0x400000, 0x500000,
                 0x7FFE0000, 0x7FFE1000, false, 0,
             ),
             TraceStepDecision::FoundApi { ip: 0x7FFE0000 },
@@ -324,9 +312,8 @@ mod tests {
     fn trace_is_at_api_continue_when_outside_themida_but_nested() {
         assert_eq!(
             trace_is_at_api(
-                0x505000, 0x0FF00, 0x10000, 50,
-                0x410000, 0x420000, 0x400000, 0x500000,
-                0x7FFE0000, 0x7FFE1000, false, 0,
+                0x505000, 0x0FF00, 0x10000, 50, 0x410000, 0x420000, 0x400000, 0x500000, 0x7FFE0000,
+                0x7FFE1000, false, 0,
             ),
             TraceStepDecision::Continue,
         );

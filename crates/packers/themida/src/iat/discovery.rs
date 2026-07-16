@@ -9,9 +9,9 @@ use tracing::{debug, info, warn};
 use mida_core::DebuggerCore;
 use mida_disasm::Disassembler;
 
-use crate::error::ThemidaError;
 use super::fix::is_likely_api_address;
 use super::{MAX_IAT_SCAN_INSTR, MAX_IAT_SIZE};
+use crate::error::ThemidaError;
 
 // ===========================================================================
 // Compiler detection
@@ -40,12 +40,7 @@ use super::{MAX_IAT_SCAN_INSTR, MAX_IAT_SIZE};
 pub(super) fn detect_compiler_from_text(text: &[u8]) -> super::CompilerHint {
     use super::CompilerHint;
     // Go: .text starts with FF 20 47 6F ("  Go" — "Go build ID" header).
-    if text.len() >= 4
-        && text[0] == 0xFF
-        && text[1] == 0x20
-        && text[2] == 0x47
-        && text[3] == 0x6F
-    {
+    if text.len() >= 4 && text[0] == 0xFF && text[1] == 0x20 && text[2] == 0x47 && text[3] == 0x6F {
         return CompilerHint::Go;
     }
 
@@ -174,8 +169,7 @@ pub(super) fn find_go_api_call(
                     {
                         // The IAT pointer is the memory displacement from the
                         // first mov. It's RIP-relative on x64.
-                        let iat_pointer =
-                            ip + 7 + insn.memory_displacement64() as usize;
+                        let iat_pointer = ip + 7 + insn.memory_displacement64() as usize;
 
                         // Verify by reading the pointer and checking it looks
                         // like an API address.
@@ -188,9 +182,10 @@ pub(super) fn find_go_api_call(
                             )
                         };
                         if debugger.read_memory(iat_pointer, buf).is_ok()
-                            && is_likely_api_address(ptr_val) {
-                                return Ok(iat_pointer);
-                            }
+                            && is_likely_api_address(ptr_val)
+                        {
+                            return Ok(iat_pointer);
+                        }
                     }
                 }
             }
@@ -203,7 +198,7 @@ pub(super) fn find_go_api_call(
                 && len == 6
             {
                 let after_mov = offset_in_text + (ip - start_addr) + len;
-               if after_mov + 5 <= text.len()
+                if after_mov + 5 <= text.len()
                    && (text[after_mov] == 0x89 || text[after_mov] == 0x8B)
                         // ModR/M byte: mod=01 (disp8), reg=any, r/m=100 (SIB).
                         // Mask 0xC7 keeps mod+r/m, strips the reg field so we
@@ -212,30 +207,39 @@ pub(super) fn find_go_api_call(
                         // set, which 0xF8 masks out, so it was always false.)
                         && (text[after_mov + 1] & 0xC7) == 0x44
                         && (text[after_mov + 2] == 0x24)
-                    {
-                        let iat_pointer = insn.memory_displacement64() as usize;
-                        if iat_pointer > 0x10000 {
-                            let mut ptr_val: usize = 0;
-                            // SAFETY: iat_data is a Vec<usize> with len * size_of::<usize>() bytes; the aliasing slice is passed to read_memory and discarded before reuse.
-                            let buf = unsafe {
-                                std::slice::from_raw_parts_mut(
-                                    &mut ptr_val as *mut usize as *mut u8,
-                                    std::mem::size_of::<usize>(),
-                                )
-                            };
-                            if debugger.read_memory(iat_pointer, buf).is_ok()
-                                && is_likely_api_address(ptr_val) {
-                                    return Ok(iat_pointer);
-                                }
+                {
+                    let iat_pointer = insn.memory_displacement64() as usize;
+                    if iat_pointer > 0x10000 {
+                        let mut ptr_val: usize = 0;
+                        // SAFETY: iat_data is a Vec<usize> with len * size_of::<usize>() bytes; the aliasing slice is passed to read_memory and discarded before reuse.
+                        let buf = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                &mut ptr_val as *mut usize as *mut u8,
+                                std::mem::size_of::<usize>(),
+                            )
+                        };
+                        if debugger.read_memory(iat_pointer, buf).is_ok()
+                            && is_likely_api_address(ptr_val)
+                        {
+                            return Ok(iat_pointer);
                         }
                     }
+                }
             }
         }
     }
 
     // Fall back to MSVC-style scan.
     warn!("Go API call pattern not found — falling back to MSVC strategy");
-    find_iat_ref_from_address(debugger, text, text_base, start_addr, text.len(), true, MAX_IAT_SCAN_INSTR)
+    find_iat_ref_from_address(
+        debugger,
+        text,
+        text_base,
+        start_addr,
+        text.len(),
+        true,
+        MAX_IAT_SCAN_INSTR,
+    )
 }
 
 // ===========================================================================
@@ -261,12 +265,7 @@ pub(super) fn find_earliest_iat_ref(
     for i in 0..text.len().saturating_sub(6) {
         if text[i] == 0xFF && (text[i + 1] == 0x15 || text[i + 1] == 0x25) {
             let ip = text_base + i;
-            let disp32 = i32::from_le_bytes([
-                text[i + 2],
-                text[i + 3],
-                text[i + 4],
-                text[i + 5],
-            ]);
+            let disp32 = i32::from_le_bytes([text[i + 2], text[i + 3], text[i + 4], text[i + 5]]);
             let iat_pointer = (ip as i64 + 6 + disp32 as i64) as usize;
 
             // Validate: pointer should be outside .text
@@ -323,8 +322,7 @@ pub(super) fn find_iat_ref_from_address(
     let mut num_insn: usize = 0;
 
     for insn in disasm.decode_all(slice) {
-        if num_insn >= max_instructions
-            && !(ignore_boundary && start_addr < text_base + code_size)
+        if num_insn >= max_instructions && !(ignore_boundary && start_addr < text_base + code_size)
         {
             debug!(
                 "Scanning stopped: num_insn={num_insn}, max_instructions={max_instructions}, \
@@ -423,16 +421,9 @@ pub(super) fn find_iat_ref_from_address(
 
         // Follow internal `call rel32` (E8) — if the target is inside
         // the code section, recursively search there.
-        if !ignore_boundary
-            && insn_bytes.len() >= 5
-            && insn_bytes[0] == 0xE8
-        {
-            let rel32 = i32::from_le_bytes([
-                insn_bytes[1],
-                insn_bytes[2],
-                insn_bytes[3],
-                insn_bytes[4],
-            ]);
+        if !ignore_boundary && insn_bytes.len() >= 5 && insn_bytes[0] == 0xE8 {
+            let rel32 =
+                i32::from_le_bytes([insn_bytes[1], insn_bytes[2], insn_bytes[3], insn_bytes[4]]);
             let target = (ip as i64 + 5 + rel32 as i64) as usize;
 
             if target >= text_base && target < text_base + code_size {
@@ -462,10 +453,12 @@ pub(super) fn find_iat_ref_from_address(
         }
 
         // Stop at `ret` / `ret imm16` unless we're ignoring method boundaries.
-        if !ignore_boundary && !insn_bytes.is_empty()
-            && (insn_bytes[0] == 0xC3 || insn_bytes[0] == 0xC2) {
-                return Ok(0);
-            }
+        if !ignore_boundary
+            && !insn_bytes.is_empty()
+            && (insn_bytes[0] == 0xC3 || insn_bytes[0] == 0xC2)
+        {
+            return Ok(0);
+        }
 
         num_insn += 1;
     }
@@ -521,7 +514,8 @@ pub(super) fn iat_ref_from_guard_addrs(
         warn!(
             "First guard address {:#x} is not a call/jmp — \
              bytes: {:02X?}",
-            guard_addrs[0], &site[..]
+            guard_addrs[0],
+            &site[..]
         );
         return Ok(0);
     };
@@ -629,8 +623,14 @@ pub(super) fn validate_iat_ref(
     for i in 0..slots {
         let off = i * ptr_size;
         let val = usize::from_le_bytes([
-            buf[off], buf[off + 1], buf[off + 2], buf[off + 3],
-            buf[off + 4], buf[off + 5], buf[off + 6], buf[off + 7],
+            buf[off],
+            buf[off + 1],
+            buf[off + 2],
+            buf[off + 3],
+            buf[off + 4],
+            buf[off + 5],
+            buf[off + 6],
+            buf[off + 7],
         ]);
         if val != 0 {
             non_zero += 1;
@@ -645,8 +645,7 @@ pub(super) fn validate_iat_ref(
     if !valid {
         info!(
             iat_ref = format_args!("{iat_ref:#x}"),
-            api_count, non_zero, slots,
-            "IAT ref validation FAILED (low API density)"
+            api_count, non_zero, slots, "IAT ref validation FAILED (low API density)"
         );
     }
     Ok(valid)
@@ -693,8 +692,14 @@ pub(super) fn find_iat_via_data_heuristic(
         for i in 0..window {
             let off = (start + i) * ptr_size;
             let val = usize::from_le_bytes([
-                buf[off], buf[off + 1], buf[off + 2], buf[off + 3],
-                buf[off + 4], buf[off + 5], buf[off + 6], buf[off + 7],
+                buf[off],
+                buf[off + 1],
+                buf[off + 2],
+                buf[off + 3],
+                buf[off + 4],
+                buf[off + 5],
+                buf[off + 6],
+                buf[off + 7],
             ]);
             if val != 0 {
                 non_zero += 1;
@@ -704,24 +709,29 @@ pub(super) fn find_iat_via_data_heuristic(
             }
         }
 
-        if non_zero >= window / 4 && api_count >= non_zero / 2
-            && api_count > best_score {
-                best_score = api_count;
-                // Walk back to find the true start.
-                let mut true_start = start;
-                for back in (0..start).rev() {
-                    let off = back * ptr_size;
-                    let val = usize::from_le_bytes([
-                        buf[off], buf[off + 1], buf[off + 2], buf[off + 3],
-                        buf[off + 4], buf[off + 5], buf[off + 6], buf[off + 7],
-                    ]);
-                    if val != 0 && !is_resolved_api(val, image_base, image_end) {
-                        break;
-                    }
-                    true_start = back;
+        if non_zero >= window / 4 && api_count >= non_zero / 2 && api_count > best_score {
+            best_score = api_count;
+            // Walk back to find the true start.
+            let mut true_start = start;
+            for back in (0..start).rev() {
+                let off = back * ptr_size;
+                let val = usize::from_le_bytes([
+                    buf[off],
+                    buf[off + 1],
+                    buf[off + 2],
+                    buf[off + 3],
+                    buf[off + 4],
+                    buf[off + 5],
+                    buf[off + 6],
+                    buf[off + 7],
+                ]);
+                if val != 0 && !is_resolved_api(val, image_base, image_end) {
+                    break;
                 }
-                best_start = data_section_base + true_start * ptr_size;
+                true_start = back;
             }
+            best_start = data_section_base + true_start * ptr_size;
+        }
     }
 
     if best_start != 0 {

@@ -16,10 +16,9 @@ pub fn run_command(cmd: Command) -> Result<(), anyhow::Error> {
             shrink,
             verbose: _,
         } => crate::unpacker::unpack(&input, output.as_deref(), create_data_sections, shrink),
-        Command::DumpProcess {
-            pid,
-            unpacked_file,
-        } => crate::unpacker::dump_process_code(pid, &unpacked_file),
+        Command::DumpProcess { pid, unpacked_file } => {
+            crate::unpacker::dump_process_code(pid, &unpacked_file)
+        }
         Command::Verify {
             unpacked,
             reference,

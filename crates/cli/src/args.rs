@@ -169,9 +169,7 @@ fn parse_unpack(args: &[String]) -> Result<Command, String> {
 
 fn parse_dump_process(args: &[String]) -> Result<Command, String> {
     if args.len() < 4 {
-        return Err(
-            "Usage: magicmida /dump-process <pid> <unpacked-file>".into(),
-        );
+        return Err("Usage: magicmida /dump-process <pid> <unpacked-file>".into());
     }
 
     let pid: u32 = args[2]
@@ -180,17 +178,12 @@ fn parse_dump_process(args: &[String]) -> Result<Command, String> {
 
     let unpacked_file = PathBuf::from(&args[3]);
 
-    Ok(Command::DumpProcess {
-        pid,
-        unpacked_file,
-    })
+    Ok(Command::DumpProcess { pid, unpacked_file })
 }
 
 fn parse_verify(args: &[String]) -> Result<Command, String> {
     if args.len() < 4 {
-        return Err(
-            "Usage: magicmida /verify <unpacked-file> <reference-file>".into(),
-        );
+        return Err("Usage: magicmida /verify <unpacked-file> <reference-file>".into());
     }
 
     let unpacked = PathBuf::from(&args[2]);
@@ -224,10 +217,7 @@ mod tests {
     fn unpack_minimal() {
         // We can't easily test file existence from a unit test, so test the
         // argument-count branch first.
-        let args = vec![
-            "prog".into(),
-            "/unpack".into(),
-        ];
+        let args = vec!["prog".into(), "/unpack".into()];
         let err = parse_unpack(&args).unwrap_err();
         assert!(err.contains("Usage"), "expected usage hint, got: {err}");
     }
@@ -332,10 +322,7 @@ mod tests {
 
     #[test]
     fn verify_minimal() {
-        let args = vec![
-            "prog".into(),
-            "/verify".into(),
-        ];
+        let args = vec!["prog".into(), "/verify".into()];
         let err = parse_verify(&args).unwrap_err();
         assert!(err.contains("Usage"), "expected usage hint, got: {err}");
     }
@@ -345,8 +332,11 @@ mod tests {
     #[test]
     fn is_dll_by_extension() {
         // Helper that mimics the logic in unpack().
-        let is_dll =
-            |path: &std::path::Path| path.extension().map(|e| e.eq_ignore_ascii_case("dll")).unwrap_or(false);
+        let is_dll = |path: &std::path::Path| {
+            path.extension()
+                .map(|e| e.eq_ignore_ascii_case("dll"))
+                .unwrap_or(false)
+        };
         assert!(is_dll(std::path::Path::new("test.dll")));
         assert!(is_dll(std::path::Path::new("test.DLL")));
         assert!(is_dll(std::path::Path::new("test.Dll")));

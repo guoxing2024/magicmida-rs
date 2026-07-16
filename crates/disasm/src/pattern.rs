@@ -37,8 +37,8 @@ impl BytePattern {
             if token.eq_ignore_ascii_case("??") || token.eq_ignore_ascii_case("?") {
                 bytes.push(None);
             } else if token.len() == 2 {
-                let byte =
-                    u8::from_str_radix(token, 16).map_err(|_| DisasmError::InvalidHex(token.to_string()))?;
+                let byte = u8::from_str_radix(token, 16)
+                    .map_err(|_| DisasmError::InvalidHex(token.to_string()))?;
                 bytes.push(Some(byte));
             } else {
                 return Err(DisasmError::InvalidPattern(format!(

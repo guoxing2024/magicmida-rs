@@ -47,8 +47,8 @@ use windows::Win32::System::Diagnostics::Debug::CONTEXT;
 use mida_tracer::LogMsgType;
 
 use crate::error::ThemidaError;
-use crate::trace_imports::{is_at_themida_vm, set_trap_flag, TRACE_LIMIT};
 use crate::trace_imports::{instr_ptr, set_instr_ptr, set_stack_ptr, stack_ptr, PTR_SIZE};
+use crate::trace_imports::{is_at_themida_vm, set_trap_flag, TRACE_LIMIT};
 
 /// Thin wrapper around [`is_valid_x64_prologue_at`] used by the unpacker's
 /// phase-A3 heuristic to decide whether `ip` already looks like real x86-64
@@ -103,7 +103,10 @@ pub fn decide_text_trace_step(
 ) -> TextTraceDecision {
     // 1. Anti-trace fake Sleep / lstrlen call when inside a nested frame.
     if sp < trace_start_sp && (ip == sleep_api || ip == lstrlen_api) {
-        return TextTraceDecision::SkipAntiTraceApi { ip, ret_addr: return_addr };
+        return TextTraceDecision::SkipAntiTraceApi {
+            ip,
+            ret_addr: return_addr,
+        };
     }
 
     let in_themida = ip >= themida_start && ip < themida_end;
@@ -143,10 +146,7 @@ pub fn decide_text_trace_step(
 ///
 /// We additionally decode with `iced-x86` to sanity-check that the bytes form
 /// one or two consecutive valid instructions (not a giant "unknown" blob).
-pub fn is_valid_x64_prologue_at(
-    debugger: &dyn DebuggerCore,
-    ip: usize,
-) -> bool {
+pub fn is_valid_x64_prologue_at(debugger: &dyn DebuggerCore, ip: usize) -> bool {
     let mut buf = [0u8; 16];
     let n = match debugger.read_memory(ip, &mut buf) {
         Ok(n) if n >= 2 => n,
@@ -156,16 +156,14 @@ pub fn is_valid_x64_prologue_at(
     // ---- byte-level prologue patterns (matches find_real_oep_by_scanning) ----
     let b = &buf[..n];
     let prologue_byte = match b[0] {
-        0x55 => true,                       // push rbp
-        0x53 => true,                       // push rbx
-        0x56 => true,                       // push rsi
-        0x57 => true,                       // push rdi
-        0x41 => matches!(b.get(1), Some(&(0x54..=0x57))), // push r12-r15
+        0x55 => true,                                                    // push rbp
+        0x53 => true,                                                    // push rbx
+        0x56 => true,                                                    // push rsi
+        0x57 => true,                                                    // push rdi
+        0x41 => matches!(b.get(1), Some(&(0x54..=0x57))),                // push r12-r15
         0x48 => matches!(b.get(1), Some(&0x8B | &0x83 | &0x81 | &0x89)), // mov rbp,rsp / sub rsp
         // endbr64 — modern MSVC / GCC pointer-auth prologue
-        0xF3 => b.get(1) == Some(&0x0F)
-            && b.get(2) == Some(&0x1E)
-            && b.get(3) == Some(&0xFA),
+        0xF3 => b.get(1) == Some(&0x0F) && b.get(2) == Some(&0x1E) && b.get(3) == Some(&0xFA),
         _ => false,
     };
 
@@ -326,11 +324,9 @@ pub fn trace_until_real_oep(
                     return Ok(last_plausible_oep);
                 }
 
-                ctx = debugger
-                    .get_thread_context(thread_id)
-                    .map_err(|e| {
-                        ThemidaError::Debugger(format!("text_trace context@{address:#x}: {e}"))
-                    })?;
+                ctx = debugger.get_thread_context(thread_id).map_err(|e| {
+                    ThemidaError::Debugger(format!("text_trace context@{address:#x}: {e}"))
+                })?;
 
                 let ip = instr_ptr(&ctx);
                 let sp = stack_ptr(&ctx);
@@ -369,14 +365,22 @@ pub fn trace_until_real_oep(
                         // Record the candidate but keep walking so the VM
                         // decrypts more of `.text` through CRT startup.
                         if is_valid_x64_prologue_at(debugger, candidate_ip) {
-                            log(LogMsgType::Info,
-                                &format!("text-trace: recording plausible OEP \
-                                          {candidate_ip:#x} at step {counter}"));
+                            log(
+                                LogMsgType::Info,
+                                &format!(
+                                    "text-trace: recording plausible OEP \
+                                          {candidate_ip:#x} at step {counter}"
+                                ),
+                            );
                             last_plausible_oep = Some(candidate_ip);
                         } else {
-                            log(LogMsgType::Info,
-                                &format!("text-trace: rejecting false-positive \
-                                          candidate {candidate_ip:#x}"));
+                            log(
+                                LogMsgType::Info,
+                                &format!(
+                                    "text-trace: rejecting false-positive \
+                                          candidate {candidate_ip:#x}"
+                                ),
+                            );
                         }
                         advance(debugger, thread_id, &ctx, &mut counter, log)?;
                     }
@@ -392,11 +396,9 @@ pub fn trace_until_real_oep(
                         set_stack_ptr(&mut ctx, sp + PTR_SIZE);
                         set_instr_ptr(&mut ctx, target_ip);
                         ctx.EFlags |= 0x100;
-                        debugger
-                            .set_thread_context(thread_id, &ctx)
-                            .map_err(|e| {
-                                ThemidaError::Debugger(format!("text_trace set_ctx_skip: {e}"))
-                            })?;
+                        debugger.set_thread_context(thread_id, &ctx).map_err(|e| {
+                            ThemidaError::Debugger(format!("text_trace set_ctx_skip: {e}"))
+                        })?;
                         debugger
                             .continue_event(thread_id, ContinueStatus::Continue)
                             .map_err(|e| {
@@ -429,7 +431,6 @@ pub fn trace_until_real_oep(
                         ThemidaError::Debugger(format!("text_trace forward_other: {e}"))
                     })?;
             }
-
         }
     })();
 

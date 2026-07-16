@@ -10,9 +10,9 @@ use tracing::{debug, error, info, warn};
 use mida_core::DebuggerCore;
 use mida_disasm::Disassembler;
 
+use super::{IatLocation, MAX_IAT_SIZE};
 use crate::common::ThemidaState;
 use crate::error::ThemidaError;
-use super::{IatLocation, MAX_IAT_SIZE};
 
 // ===========================================================================
 // IAT repair — V1
@@ -61,9 +61,7 @@ pub(super) fn fix_iat_v1(
         //   jmp [real_api]   or   mov eax, real_api; jmp eax
         // We read 8 bytes from the current value and try to resolve the
         // real API.
-        if let Some(real_api) =
-            resolve_v1_jumper(debugger, current)?
-        {
+        if let Some(real_api) = resolve_v1_jumper(debugger, current)? {
             if real_api != current && real_api != 0 {
                 iat_data[i] = real_api;
                 fix_count += 1;
@@ -78,17 +76,12 @@ pub(super) fn fix_iat_v1(
         let bytes_written = debugger
             // SAFETY: iat_data is a Vec<usize>; the aliasing immutable slice covers exactly write_size bytes and is discarded after write_memory returns.
             .write_memory(iat.address, unsafe {
-                std::slice::from_raw_parts(
-                    iat_data.as_ptr() as *const u8,
-                    write_size,
-                )
+                std::slice::from_raw_parts(iat_data.as_ptr() as *const u8, write_size)
             })
             .map_err(|e| ThemidaError::Debugger(format!("fix_iat_v1 write: {e}")))?;
 
         if bytes_written < write_size {
-            warn!(
-                "fix_iat_v1: short write ({bytes_written} of {write_size} bytes)"
-            );
+            warn!("fix_iat_v1: short write ({bytes_written} of {write_size} bytes)");
         }
     }
 
@@ -149,9 +142,7 @@ pub(super) fn resolve_v1_jumper(
 
     // Pattern 3: mov eax, imm32; jmp eax — B8 xx xx xx xx FF E0
     if code[0] == 0xB8 && n >= 7 && code[5] == 0xFF && code[6] == 0xE0 {
-        let imm = usize::from_le_bytes([
-            code[1], code[2], code[3], code[4], 0, 0, 0, 0,
-        ]);
+        let imm = usize::from_le_bytes([code[1], code[2], code[3], code[4], 0, 0, 0, 0]);
         if is_likely_api_address(imm) {
             return Ok(Some(imm));
         }
@@ -214,7 +205,12 @@ pub(super) fn fix_iat_v2(
         // If the slot points into the Themida section, try to follow the
         // jump chain.
         if current >= themida_section_start && current < themida_section_end {
-            if let Some(real_api) = resolve_v2_stub(debugger, current, themida_section_start, themida_section_end)? {
+            if let Some(real_api) = resolve_v2_stub(
+                debugger,
+                current,
+                themida_section_start,
+                themida_section_end,
+            )? {
                 if real_api != current && real_api != 0 {
                     iat_data[i] = real_api;
                     fix_count += 1;
@@ -230,10 +226,7 @@ pub(super) fn fix_iat_v2(
         let bytes_written = debugger
             // SAFETY: iat_data is a Vec<usize>; the aliasing immutable slice covers exactly write_size bytes and is discarded after write_memory returns.
             .write_memory(iat.address, unsafe {
-                std::slice::from_raw_parts(
-                    iat_data.as_ptr() as *const u8,
-                    write_size,
-                )
+                std::slice::from_raw_parts(iat_data.as_ptr() as *const u8, write_size)
             })
             .map_err(|e| ThemidaError::Debugger(format!("fix_iat_v2 write: {e}")))?;
 
@@ -319,9 +312,7 @@ pub(super) fn resolve_v2_stub(
                     let imm = insn.immediate64() as usize;
                     // Check if the next instruction is jmp reg.
                     let next_offset = (ip - stub_addr) + insn.len();
-                    if next_offset + 2 <= n
-                        && code[next_offset] == 0xFF
-                    {
+                    if next_offset + 2 <= n && code[next_offset] == 0xFF {
                         // It's a jmp reg (FF Ex). The immediate is likely the API.
                         if is_likely_api_address(imm) {
                             return Ok(Some(imm));
@@ -395,12 +386,10 @@ pub fn fix_iat_v3(
         return Ok(());
     }
 
-    let log = |msg_type: LogMsgType, msg: &str| {
-        match msg_type {
-            LogMsgType::Info => info!("[v3-trace] {msg}"),
-            LogMsgType::Good => info!("[v3-trace] OK {msg}"),
-            LogMsgType::Fatal => error!("[v3-trace] {msg}"),
-        }
+    let log = |msg_type: LogMsgType, msg: &str| match msg_type {
+        LogMsgType::Info => info!("[v3-trace] {msg}"),
+        LogMsgType::Good => info!("[v3-trace] OK {msg}"),
+        LogMsgType::Fatal => error!("[v3-trace] {msg}"),
     };
 
     let result = trace_imports(debugger, state, iat, main_thread_id, &log)?;

@@ -102,7 +102,9 @@ mod tests {
     #[test]
     fn test_has_force_integrity() {
         const IMAGE_DLLCHARACTERISTICS_FORCE_INTEGRITY: u16 = 0x0080;
-        assert!(has_force_integrity(IMAGE_DLLCHARACTERISTICS_FORCE_INTEGRITY));
+        assert!(has_force_integrity(
+            IMAGE_DLLCHARACTERISTICS_FORCE_INTEGRITY
+        ));
         assert!(!has_force_integrity(0));
     }
 }

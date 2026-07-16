@@ -45,19 +45,17 @@ impl RelocationTableBuilder {
     /// Add a relocation entry
     pub fn add_relocation(&mut self, rva: u32, typ: u16) {
         let page_rva = rva & !0xFFF; // Align to 4KB page
-        self.blocks.entry(page_rva).or_default().push(RelocationEntry { rva, typ });
+        self.blocks
+            .entry(page_rva)
+            .or_default()
+            .push(RelocationEntry { rva, typ });
     }
 
     /// Scan data for absolute addresses and add relocations
     ///
     /// This scans a section for pointers that point to the image itself.
     /// Such pointers need to be relocated when the image loads at a different base.
-    pub fn scan_and_add_relocations(
-        &mut self,
-        data: &[u8],
-        section_rva: u32,
-        is_64bit: bool,
-    ) {
+    pub fn scan_and_add_relocations(&mut self, data: &[u8], section_rva: u32, is_64bit: bool) {
         use tracing::debug;
 
         let ptr_size = if is_64bit { 8 } else { 4 };
@@ -88,7 +86,10 @@ impl RelocationTableBuilder {
         }
 
         if found_count > 0 {
-            debug!("Section at RVA {:#x}: found {} relocations", section_rva, found_count);
+            debug!(
+                "Section at RVA {:#x}: found {} relocations",
+                section_rva, found_count
+            );
         }
     }
 
@@ -113,7 +114,10 @@ impl RelocationTableBuilder {
 
             // If odd number of entries, add a padding entry (type 0 = ABSOLUTE, no-op)
             if entries.len() % 2 != 0 {
-                entries.push(RelocationEntry { rva: page_rva, typ: 0 });
+                entries.push(RelocationEntry {
+                    rva: page_rva,
+                    typ: 0,
+                });
             }
 
             // Block header: VirtualAddress + SizeOfBlock

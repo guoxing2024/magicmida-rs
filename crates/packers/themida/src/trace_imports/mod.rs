@@ -62,21 +62,33 @@ pub(crate) fn stack_ptr(ctx: &windows::Win32::System::Diagnostics::Debug::CONTEX
 
 /// Set the instruction pointer in a `CONTEXT`.
 #[cfg(target_arch = "x86")]
-pub(crate) fn set_instr_ptr(ctx: &mut windows::Win32::System::Diagnostics::Debug::CONTEXT, val: usize) {
+pub(crate) fn set_instr_ptr(
+    ctx: &mut windows::Win32::System::Diagnostics::Debug::CONTEXT,
+    val: usize,
+) {
     ctx.Eip = val as u32;
 }
 #[cfg(target_arch = "x86_64")]
-pub(crate) fn set_instr_ptr(ctx: &mut windows::Win32::System::Diagnostics::Debug::CONTEXT, val: usize) {
+pub(crate) fn set_instr_ptr(
+    ctx: &mut windows::Win32::System::Diagnostics::Debug::CONTEXT,
+    val: usize,
+) {
     ctx.Rip = val as u64;
 }
 
 /// Set the stack pointer in a `CONTEXT`.
 #[cfg(target_arch = "x86")]
-pub(crate) fn set_stack_ptr(ctx: &mut windows::Win32::System::Diagnostics::Debug::CONTEXT, val: usize) {
+pub(crate) fn set_stack_ptr(
+    ctx: &mut windows::Win32::System::Diagnostics::Debug::CONTEXT,
+    val: usize,
+) {
     ctx.Esp = val as u32;
 }
 #[cfg(target_arch = "x86_64")]
-pub(crate) fn set_stack_ptr(ctx: &mut windows::Win32::System::Diagnostics::Debug::CONTEXT, val: usize) {
+pub(crate) fn set_stack_ptr(
+    ctx: &mut windows::Win32::System::Diagnostics::Debug::CONTEXT,
+    val: usize,
+) {
     ctx.Rsp = val as u64;
 }
 
@@ -341,9 +353,7 @@ pub fn trace_imports(
             .write_memory(
                 iat.address,
                 // SAFETY: iat_data is a Vec<usize>; the aliasing immutable slice covers exactly write_size bytes and is discarded after write_memory.
-                unsafe {
-                    std::slice::from_raw_parts(iat_data.as_ptr() as *const u8, write_size)
-                },
+                unsafe { std::slice::from_raw_parts(iat_data.as_ptr() as *const u8, write_size) },
             )
             .map_err(|e| ThemidaError::Debugger(format!("trace_imports write IAT: {e}")))?;
 
@@ -381,7 +391,10 @@ pub fn trace_imports(
 /// `actual_image_base` is the ASLR-reloaded image base (from the
 /// CREATE_PROCESS debug event), which may differ from the PE header's
 /// `ImageBase` field.
-pub(crate) fn get_themida_section_bounds(state: &ThemidaState, actual_image_base: usize) -> (usize, usize) {
+pub(crate) fn get_themida_section_bounds(
+    state: &ThemidaState,
+    actual_image_base: usize,
+) -> (usize, usize) {
     let pe_image_base = state.pe_info.image_base as usize;
     let image_delta = actual_image_base.wrapping_sub(pe_image_base);
 
@@ -402,7 +415,10 @@ pub(crate) fn get_themida_section_bounds(state: &ThemidaState, actual_image_base
     if found {
         (min_start, max_end)
     } else {
-        (actual_image_base, state.pe_info.image_boundary as usize + image_delta)
+        (
+            actual_image_base,
+            state.pe_info.image_boundary as usize + image_delta,
+        )
     }
 }
 

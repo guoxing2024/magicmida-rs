@@ -41,7 +41,6 @@ impl PeSectionData {
     }
 }
 
-
 impl PeSection {
     /// Rename this section.
     ///
@@ -116,8 +115,10 @@ impl PeHeader {
             extra_data: None,
         };
 
-        self.nt_headers.optional_header.size_of_image +=
-            align_up(virtual_size, self.nt_headers.optional_header.section_alignment);
+        self.nt_headers.optional_header.size_of_image += align_up(
+            virtual_size,
+            self.nt_headers.optional_header.section_alignment,
+        );
         self.sections.push(new_section);
 
         let idx = self.sections.len() - 1;
@@ -162,8 +163,7 @@ impl PeHeader {
         }
 
         // Merge VirtualSize into the preceding section (Pascal: Idx - 1)
-        self.sections[index - 1].header.virtual_size +=
-            self.sections[index].header.virtual_size;
+        self.sections[index - 1].header.virtual_size += self.sections[index].header.virtual_size;
         let mut merged_vs = self.sections[index - 1].header.virtual_size;
         self.section_align(&mut merged_vs);
         self.sections[index - 1].header.virtual_size = merged_vs;
@@ -171,8 +171,11 @@ impl PeHeader {
 
         // Remove from vec
         self.sections.remove(index);
-        self.nt_headers.file_header.number_of_sections =
-            self.nt_headers.file_header.number_of_sections.saturating_sub(1);
+        self.nt_headers.file_header.number_of_sections = self
+            .nt_headers
+            .file_header
+            .number_of_sections
+            .saturating_sub(1);
     }
 
     /// Trim oversized sections whose raw data is padded with trailing zeros.
@@ -257,8 +260,11 @@ impl PeHeader {
                         - old_size as usize;
 
                     // In-place shift via copy_within — only safe if we're within buf bounds
-                    let buf_len = buf.len().min(self.nt_headers.optional_header.size_of_image as usize);
-                    if (src_start as usize) < buf_len && (dest_start as usize + move_len) <= buf_len {
+                    let buf_len = buf
+                        .len()
+                        .min(self.nt_headers.optional_header.size_of_image as usize);
+                    if (src_start as usize) < buf_len && (dest_start as usize + move_len) <= buf_len
+                    {
                         // We copy from a separate allocation to avoid overlap issues;
                         // in practice the caller owns `buf` and we only mutate
                         // section headers here — the caller does the actual buffer
@@ -294,7 +300,11 @@ impl PeHeader {
     pub fn sanitize(&mut self) {
         let file_align = {
             let fa = self.nt_headers.optional_header.file_alignment;
-            if fa.is_power_of_two() && fa >= 0x200 { fa } else { 0x200 }
+            if fa.is_power_of_two() && fa >= 0x200 {
+                fa
+            } else {
+                0x200
+            }
         };
         for section in &mut self.sections {
             // Skip .fill gap-filler sections (created by compact_section_vas).
@@ -314,8 +324,7 @@ impl PeHeader {
         }
 
         if let Some(first) = self.sections.first_mut() {
-            self.nt_headers.optional_header.size_of_headers =
-                first.header.pointer_to_raw_data;
+            self.nt_headers.optional_header.size_of_headers = first.header.pointer_to_raw_data;
             // Do NOT force WRITE on .text — a writable+executable section
             // is rejected by the Windows loader (CIG/ACG).  The original
             // .text is EXECUTE | READ only (0x60000020).
@@ -377,7 +386,12 @@ impl PeHeader {
                 continue; // Leave unnamed if we can't determine type
             };
 
-            tracing::debug!("Renaming section {}: '{}' -> '{}'", i, section.name, new_name);
+            tracing::debug!(
+                "Renaming section {}: '{}' -> '{}'",
+                i,
+                section.name,
+                new_name
+            );
             section.rename(new_name);
         }
     }
@@ -425,39 +439,62 @@ mod tests {
         let mut buf = vec![0u8; 512];
 
         // DOS header
-        buf[0] = 0x4D; buf[1] = 0x5A;
-        buf[60] = 0x40; buf[61] = 0x00; buf[62] = 0x00; buf[63] = 0x00;
+        buf[0] = 0x4D;
+        buf[1] = 0x5A;
+        buf[60] = 0x40;
+        buf[61] = 0x00;
+        buf[62] = 0x00;
+        buf[63] = 0x00;
         let nt_base = 0x40;
 
         // PE signature
-        buf[nt_base] = 0x50; buf[nt_base + 1] = 0x45;
-        buf[nt_base + 2] = 0x00; buf[nt_base + 3] = 0x00;
+        buf[nt_base] = 0x50;
+        buf[nt_base + 1] = 0x45;
+        buf[nt_base + 2] = 0x00;
+        buf[nt_base + 3] = 0x00;
 
         // COFF file header
         let fh = nt_base + 4;
-        buf[fh] = 0x64; buf[fh + 1] = 0x86; // AMD64
-        buf[fh + 2] = 1; buf[fh + 3] = 0; // 1 section
+        buf[fh] = 0x64;
+        buf[fh + 1] = 0x86; // AMD64
+        buf[fh + 2] = 1;
+        buf[fh + 3] = 0; // 1 section
         buf[fh + 16] = 0xF0; // SizeOfOptionalHeader = 240
         buf[fh + 18] = 0x22; // Characteristics
 
         // Optional header (PE32+)
         let oh = nt_base + 24;
-        buf[oh] = 0x0B; buf[oh + 1] = 0x02; // Magic = 0x20B
-        buf[oh + 16] = 0x00; buf[oh + 17] = 0x10; // EntryPoint = 0x1000
-        buf[oh + 27] = 0x40; buf[oh + 28] = 0x01; // ImageBase hi
-        buf[oh + 32] = 0x00; buf[oh + 33] = 0x10; // SectionAlignment = 0x1000
-        buf[oh + 36] = 0x00; buf[oh + 37] = 0x02; // FileAlignment = 0x200
-        buf[oh + 56] = 0x00; buf[oh + 57] = 0x20; // SizeOfImage = 0x2000
-        buf[oh + 60] = 0x00; buf[oh + 61] = 0x02; // SizeOfHeaders = 0x200
+        buf[oh] = 0x0B;
+        buf[oh + 1] = 0x02; // Magic = 0x20B
+        buf[oh + 16] = 0x00;
+        buf[oh + 17] = 0x10; // EntryPoint = 0x1000
+        buf[oh + 27] = 0x40;
+        buf[oh + 28] = 0x01; // ImageBase hi
+        buf[oh + 32] = 0x00;
+        buf[oh + 33] = 0x10; // SectionAlignment = 0x1000
+        buf[oh + 36] = 0x00;
+        buf[oh + 37] = 0x02; // FileAlignment = 0x200
+        buf[oh + 56] = 0x00;
+        buf[oh + 57] = 0x20; // SizeOfImage = 0x2000
+        buf[oh + 60] = 0x00;
+        buf[oh + 61] = 0x02; // SizeOfHeaders = 0x200
         buf[oh + 108] = 0x10; // NumberOfRvaAndSizes = 16
 
         // Section header: ".text"
         let sh = nt_base + 24 + 240;
-        buf[sh] = b'.'; buf[sh + 1] = b't'; buf[sh + 2] = b'e'; buf[sh + 3] = b'x'; buf[sh + 4] = b't';
-        buf[sh + 8] = 0x00; buf[sh + 9] = 0x10; // VirtualSize = 0x1000
-        buf[sh + 12] = 0x00; buf[sh + 13] = 0x10; // VirtualAddress = 0x1000
-        buf[sh + 16] = 0x00; buf[sh + 17] = 0x02; // SizeOfRawData = 0x200
-        buf[sh + 20] = 0x00; buf[sh + 21] = 0x02; // PointerToRawData = 0x200
+        buf[sh] = b'.';
+        buf[sh + 1] = b't';
+        buf[sh + 2] = b'e';
+        buf[sh + 3] = b'x';
+        buf[sh + 4] = b't';
+        buf[sh + 8] = 0x00;
+        buf[sh + 9] = 0x10; // VirtualSize = 0x1000
+        buf[sh + 12] = 0x00;
+        buf[sh + 13] = 0x10; // VirtualAddress = 0x1000
+        buf[sh + 16] = 0x00;
+        buf[sh + 17] = 0x02; // SizeOfRawData = 0x200
+        buf[sh + 20] = 0x00;
+        buf[sh + 21] = 0x02; // PointerToRawData = 0x200
         buf[sh + 36] = 0x20; // Characteristics
         buf[sh + 39] = 0x60;
 
@@ -518,10 +555,7 @@ mod tests {
         // First section should NOT have write access (CIG/ACG rejects
         // writable+executable sections; sanitize leaves .text as
         // EXECUTE | READ only).
-        assert_ne!(
-            pe.sections[0].characteristics & IMAGE_SCN_MEM_EXECUTE,
-            0
-        );
+        assert_ne!(pe.sections[0].characteristics & IMAGE_SCN_MEM_EXECUTE, 0);
     }
 
     #[test]

@@ -315,7 +315,10 @@ pub fn read_original_import_table_with_rvas(path: &Path) -> Vec<(String, u32, Ve
 
     let bytes = match std::fs::read(path) {
         Ok(b) => {
-            debug!("read_original_import_table_with_rvas: Read {} bytes", b.len());
+            debug!(
+                "read_original_import_table_with_rvas: Read {} bytes",
+                b.len()
+            );
             b
         }
         Err(e) => {
@@ -336,8 +339,10 @@ pub fn read_original_import_table_with_rvas(path: &Path) -> Vec<(String, u32, Ve
     };
 
     let import_dir = pe.nt_headers.optional_header.data_directory[1];
-    debug!("read_original_import_table_with_rvas: Import dir RVA=0x{:X}, size={}",
-        import_dir.virtual_address, import_dir.size);
+    debug!(
+        "read_original_import_table_with_rvas: Import dir RVA=0x{:X}, size={}",
+        import_dir.virtual_address, import_dir.size
+    );
 
     if import_dir.virtual_address == 0 || import_dir.size == 0 {
         debug!("No import directory in original PE");
@@ -396,12 +401,17 @@ pub fn read_original_import_table_with_rvas(path: &Path) -> Vec<(String, u32, Ve
 
         desc_count += 1;
         if desc_count > 100 {
-            warn!("read_original_import_table_with_rvas: Too many descriptors ({}), breaking", desc_count);
+            warn!(
+                "read_original_import_table_with_rvas: Too many descriptors ({}), breaking",
+                desc_count
+            );
             break;
         }
 
-        debug!("read_original_import_table_with_rvas: Processing descriptor #{}, name_rva=0x{:X}",
-            desc_count, name_rva);
+        debug!(
+            "read_original_import_table_with_rvas: Processing descriptor #{}, name_rva=0x{:X}",
+            desc_count, name_rva
+        );
 
         let dll_name = {
             let name_sec = pe.sections.iter().find(|s| {
@@ -411,7 +421,8 @@ pub fn read_original_import_table_with_rvas(path: &Path) -> Vec<(String, u32, Ve
             });
             match name_sec {
                 Some(ns) => {
-                    let off = (name_rva as usize) - ns.virtual_address as usize + ns.raw_offset as usize;
+                    let off =
+                        (name_rva as usize) - ns.virtual_address as usize + ns.raw_offset as usize;
                     if off < bytes.len() {
                         read_cstring(&bytes, off)
                     } else {
@@ -427,7 +438,10 @@ pub fn read_original_import_table_with_rvas(path: &Path) -> Vec<(String, u32, Ve
             break;
         }
 
-        debug!("read_original_import_table_with_rvas: DLL={}, reading thunks", dll_name);
+        debug!(
+            "read_original_import_table_with_rvas: DLL={}, reading thunks",
+            dll_name
+        );
 
         let mut functions: Vec<String> = Vec::new();
         let thunk_rva = if original_first_thunk != 0 {
@@ -436,7 +450,10 @@ pub fn read_original_import_table_with_rvas(path: &Path) -> Vec<(String, u32, Ve
             first_thunk as usize
         };
 
-        debug!("read_original_import_table_with_rvas: Thunk RVA=0x{:X}", thunk_rva);
+        debug!(
+            "read_original_import_table_with_rvas: Thunk RVA=0x{:X}",
+            thunk_rva
+        );
 
         let thunk_size = if pe.is_64bit { 8 } else { 4 };
         let ordinal_flag = if pe.is_64bit {
@@ -450,14 +467,18 @@ pub fn read_original_import_table_with_rvas(path: &Path) -> Vec<(String, u32, Ve
         loop {
             thunk_count += 1;
             if thunk_count > 500 {
-                warn!("read_original_import_table_with_rvas: Too many thunks for {} ({}), breaking",
-                    dll_name, thunk_count);
+                warn!(
+                    "read_original_import_table_with_rvas: Too many thunks for {} ({}), breaking",
+                    dll_name, thunk_count
+                );
                 break;
             }
 
             if thunk_count % 50 == 0 {
-                debug!("read_original_import_table_with_rvas: Processing thunk #{} for {}",
-                    thunk_count, dll_name);
+                debug!(
+                    "read_original_import_table_with_rvas: Processing thunk #{} for {}",
+                    thunk_count, dll_name
+                );
             }
             let thunk_sec = pe.sections.iter().find(|s| {
                 let start = s.virtual_address as usize;
@@ -468,7 +489,8 @@ pub fn read_original_import_table_with_rvas(path: &Path) -> Vec<(String, u32, Ve
                 Some(s) => s,
                 None => break,
             };
-            let thunk_off = thunk_rva_cur - thunk_sec.virtual_address as usize + thunk_sec.raw_offset as usize;
+            let thunk_off =
+                thunk_rva_cur - thunk_sec.virtual_address as usize + thunk_sec.raw_offset as usize;
             if thunk_off + thunk_size > bytes.len() {
                 break;
             }
@@ -503,7 +525,9 @@ pub fn read_original_import_table_with_rvas(path: &Path) -> Vec<(String, u32, Ve
                 });
                 let func_name = match hn_sec {
                     Some(hs) => {
-                        let off = hint_name_rva - hs.virtual_address as usize + hs.raw_offset as usize + 2;
+                        let off = hint_name_rva - hs.virtual_address as usize
+                            + hs.raw_offset as usize
+                            + 2;
                         if off < bytes.len() {
                             read_cstring(&bytes, off)
                         } else {

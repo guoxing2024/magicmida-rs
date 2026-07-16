@@ -85,7 +85,6 @@ fn build_apiset_lookup() -> HashMap<&'static str, &'static str> {
 // The data table (same 3003 entries as OneCoreUAP.pas)
 // ---------------------------------------------------------------------------
 
-
 // ---------------------------------------------------------------------------
 // Runtime ApiSet schema parsing (stub)
 // ---------------------------------------------------------------------------
@@ -122,10 +121,7 @@ pub fn parse_apiset_schema(
 /// `kernelbase.dll` or `kernel32.dll`.
 ///
 /// Returns `None` if the name does not appear to be an api-set.
-pub fn resolve_apiset(
-    api_set_name: &str,
-    _mappings: &[ApiSetMapping],
-) -> Option<String> {
+pub fn resolve_apiset(api_set_name: &str, _mappings: &[ApiSetMapping]) -> Option<String> {
     if !is_apiset_dll(api_set_name) {
         return None;
     }

@@ -96,7 +96,10 @@ pub fn dump_process(
             // Read original import count for comparison
             let orig_imports = crate::original_imports::read_original_import_table(ep);
             let orig_count: usize = orig_imports.iter().map(|(_, funcs)| funcs.len()).sum();
-            let rebuilt_count = import_builder.as_ref().map(|b| b.thunk_count()).unwrap_or(0);
+            let rebuilt_count = import_builder
+                .as_ref()
+                .map(|b| b.thunk_count())
+                .unwrap_or(0);
 
             // If we're missing more than 10% of functions, use original
             let threshold = (orig_count as f64 * 0.9) as usize;
@@ -288,14 +291,18 @@ pub fn dump_process(
                             );
 
                             // Step 2 & 3: Load DLLs and build name -> ordinal maps
-                            let mut dll_exports: std::collections::HashMap<String, std::collections::HashMap<u16, String>> =
-                                std::collections::HashMap::new();
+                            let mut dll_exports: std::collections::HashMap<
+                                String,
+                                std::collections::HashMap<u16, String>,
+                            > = std::collections::HashMap::new();
 
                             debug!("Starting to load DLL exports for ordinal restoration");
 
                             for dll_name in ordinal_imports.keys() {
                                 debug!("Loading exports for {}", dll_name);
-                                if let Some(dll_path) = crate::dll_exports::find_system_dll(dll_name) {
+                                if let Some(dll_path) =
+                                    crate::dll_exports::find_system_dll(dll_name)
+                                {
                                     let exports = crate::dll_exports::read_dll_exports(&dll_path);
                                     debug!("Loaded {} exports from {}", exports.len(), dll_name);
                                     if !exports.is_empty() {
@@ -315,12 +322,19 @@ pub fn dump_process(
                                 let module_name_lower = module.name.to_lowercase();
 
                                 // Check if this DLL uses ordinals in original PE
-                                if let Some(ordinals_for_dll) = ordinal_imports.get(&module_name_lower) {
+                                if let Some(ordinals_for_dll) =
+                                    ordinal_imports.get(&module_name_lower)
+                                {
                                     // Get export map for this DLL
                                     if let Some(exports) = dll_exports.get(&module_name_lower) {
                                         // Build reverse map: function_name -> ordinal
-                                        let name_to_ordinal: std::collections::HashMap<String, u16> =
-                                            exports.iter().map(|(ord, name)| (name.to_lowercase(), *ord)).collect();
+                                        let name_to_ordinal: std::collections::HashMap<
+                                            String,
+                                            u16,
+                                        > = exports
+                                            .iter()
+                                            .map(|(ord, name)| (name.to_lowercase(), *ord))
+                                            .collect();
 
                                         // Convert thunks
                                         for thunk in &mut module.thunks {
@@ -328,7 +342,9 @@ pub fn dump_process(
                                                 let func_name_lower = func_name.to_lowercase();
 
                                                 // Check if original PE imported this function by ordinal
-                                                if let Some(&ordinal) = name_to_ordinal.get(&func_name_lower) {
+                                                if let Some(&ordinal) =
+                                                    name_to_ordinal.get(&func_name_lower)
+                                                {
                                                     if ordinals_for_dll.contains(&ordinal) {
                                                         // Convert to ordinal import
                                                         debug!(
@@ -504,11 +520,17 @@ pub fn dump_process(
     // 5c. Build import section (uses original virtual addresses)
     let mut import_thunks: Vec<u64> = Vec::new();
     if let Some(ref builder) = import_builder {
-        info!("Creating import section with {} modules, {} thunks",
-            builder.modules.len(), builder.thunk_count());
+        info!(
+            "Creating import section with {} modules, {} thunks",
+            builder.modules.len(),
+            builder.thunk_count()
+        );
         let (thunks, _section_idx) =
             create_import_section(&mut pe, builder, original_iat_rva, &mut dump_buf, is_64bit);
-        info!("Import section created successfully, {} thunk addresses returned", thunks.len());
+        info!(
+            "Import section created successfully, {} thunk addresses returned",
+            thunks.len()
+        );
         import_thunks = thunks;
     } else {
         warn!("No import_builder - skipping import section creation");

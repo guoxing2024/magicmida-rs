@@ -286,11 +286,7 @@ pub trait DebuggerCore {
     /// `thread_id` comes from the current [`DebugEvent`] variant.  `status`
     /// controls whether execution continues normally or the session is
     /// terminated.
-    fn continue_event(
-        &mut self,
-        thread_id: u32,
-        status: ContinueStatus,
-    ) -> Result<(), CoreError>;
+    fn continue_event(&mut self, thread_id: u32, status: ContinueStatus) -> Result<(), CoreError>;
 
     /// Read `buf.len()` bytes from the target's virtual address space starting
     /// at `address`.

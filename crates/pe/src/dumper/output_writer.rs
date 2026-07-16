@@ -86,12 +86,22 @@ pub(crate) fn write_output_file(
     // HOTFIX: Initialize container pointers to zero
     // The container at RVA 0x145710 has invalid values that cause ACCESS_VIOLATION
     // Setting to zero tells the program the container is empty
-    if let Some(section) = pe.sections.iter().find(|s| s.virtual_address <= 0x145710 && 0x145710 < s.virtual_address + s.virtual_size) {
+    if let Some(section) = pe
+        .sections
+        .iter()
+        .find(|s| s.virtual_address <= 0x145710 && 0x145710 < s.virtual_address + s.virtual_size)
+    {
         let container_rva = 0x145710u32;
-        let container_offset = section.header.pointer_to_raw_data + (container_rva - section.virtual_address);
+        let container_offset =
+            section.header.pointer_to_raw_data + (container_rva - section.virtual_address);
 
-        if container_offset < out_data.len() as u32 && container_offset + 24 <= out_data.len() as u32 {
-            info!("HOTFIX: Zeroing container pointer at RVA {:#x}, file offset {:#x}", container_rva, container_offset);
+        if container_offset < out_data.len() as u32
+            && container_offset + 24 <= out_data.len() as u32
+        {
+            info!(
+                "HOTFIX: Zeroing container pointer at RVA {:#x}, file offset {:#x}",
+                container_rva, container_offset
+            );
 
             // Zero out the container triple (begin, end, capacity) = 24 bytes
             for i in 0..24 {
@@ -161,9 +171,9 @@ fn rewrite_data_directories(out_data: &mut [u8], pe: &PeHeader, pe_offset: usize
 
     let opt_header_offset = pe_offset + 24;
     let dd_start = if is_64bit {
-        opt_header_offset + 112  // PE32+: magic(2) + versions(2) + sizes(20) + addresses(24) + sizes(16) + magic(8) + subsystem(2) + dll(2) + sizes(40) = 112
+        opt_header_offset + 112 // PE32+: magic(2) + versions(2) + sizes(20) + addresses(24) + sizes(16) + magic(8) + subsystem(2) + dll(2) + sizes(40) = 112
     } else {
-        opt_header_offset + 96   // PE32
+        opt_header_offset + 96 // PE32
     };
 
     info!(
@@ -194,8 +204,18 @@ fn rewrite_data_directories(out_data: &mut [u8], pe: &PeHeader, pe_offset: usize
                 );
 
                 // Verify the write
-                let verify_rva = u32::from_le_bytes([out_data[off], out_data[off+1], out_data[off+2], out_data[off+3]]);
-                let verify_size = u32::from_le_bytes([out_data[off+4], out_data[off+5], out_data[off+6], out_data[off+7]]);
+                let verify_rva = u32::from_le_bytes([
+                    out_data[off],
+                    out_data[off + 1],
+                    out_data[off + 2],
+                    out_data[off + 3],
+                ]);
+                let verify_size = u32::from_le_bytes([
+                    out_data[off + 4],
+                    out_data[off + 5],
+                    out_data[off + 6],
+                    out_data[off + 7],
+                ]);
                 info!(
                     "CRITICAL FIX: Verified TLS in buffer: RVA={:#x}, Size={:#x}",
                     verify_rva, verify_size
@@ -211,7 +231,9 @@ fn rewrite_data_directories(out_data: &mut [u8], pe: &PeHeader, pe_offset: usize
         } else {
             warn!(
                 "CRITICAL FIX: Cannot write directory[{}] at offset {:#x}, buffer size={}",
-                i, off, out_data.len()
+                i,
+                off,
+                out_data.len()
             );
         }
     }

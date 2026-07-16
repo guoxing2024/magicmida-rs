@@ -25,7 +25,8 @@ pub fn read_dll_exports(dll_path: &Path) -> HashMap<u16, String> {
         return result;
     }
 
-    let pe_offset = u32::from_le_bytes([bytes[0x3C], bytes[0x3D], bytes[0x3E], bytes[0x3F]]) as usize;
+    let pe_offset =
+        u32::from_le_bytes([bytes[0x3C], bytes[0x3D], bytes[0x3E], bytes[0x3F]]) as usize;
 
     if pe_offset + 0x200 > bytes.len() {
         return result;
@@ -67,7 +68,8 @@ pub fn read_dll_exports(dll_path: &Path) -> HashMap<u16, String> {
 
     // Find section containing export directory
     let num_sections_offset = pe_offset + 6;
-    let num_sections = u16::from_le_bytes([bytes[num_sections_offset], bytes[num_sections_offset + 1]]) as usize;
+    let num_sections =
+        u16::from_le_bytes([bytes[num_sections_offset], bytes[num_sections_offset + 1]]) as usize;
 
     let opt_header_size_offset = pe_offset + 20;
     let opt_header_size = u16::from_le_bytes([
@@ -197,10 +199,8 @@ pub fn read_dll_exports(dll_path: &Path) -> HashMap<u16, String> {
             bytes[name_ptr_offset + 3],
         ]) as usize;
 
-        let ordinal = u16::from_le_bytes([
-            bytes[ordinal_idx_offset],
-            bytes[ordinal_idx_offset + 1],
-        ]);
+        let ordinal =
+            u16::from_le_bytes([bytes[ordinal_idx_offset], bytes[ordinal_idx_offset + 1]]);
 
         let name_offset = match rva_to_offset(name_rva) {
             Some(o) => o,
@@ -225,7 +225,11 @@ pub fn read_dll_exports(dll_path: &Path) -> HashMap<u16, String> {
         }
     }
 
-    debug!("Loaded {} exports from {}", result.len(), dll_path.display());
+    debug!(
+        "Loaded {} exports from {}",
+        result.len(),
+        dll_path.display()
+    );
     result
 }
 

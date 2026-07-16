@@ -215,10 +215,7 @@ pub fn dump_process_code(
     let base_of_data = if pe.is_64bit {
         pe.sections[0].virtual_address + pe.nt_headers.optional_header.size_of_code
     } else {
-        pe.nt_headers
-            .optional_header
-            .base_of_data
-            .unwrap_or(0)
+        pe.nt_headers.optional_header.base_of_data.unwrap_or(0)
     };
     let text_end = image_base + base_of_data as usize;
 
@@ -229,9 +226,7 @@ pub fn dump_process_code(
         ));
     }
 
-    info!(
-        "Dumping .text: {text_start:#x} .. {text_end:#x}  ({dump_size:#x} bytes)"
-    );
+    info!("Dumping .text: {text_start:#x} .. {text_end:#x}  ({dump_size:#x} bytes)");
 
     let mut buf = vec![0u8; dump_size];
     let bytes_read = debugger
@@ -291,8 +286,20 @@ pub fn install_anti_dump_fix(
     is_64bit: bool,
 ) -> Result<(), ThemidaError> {
     if is_64bit {
-        anti_dump::install_anti_dump_fix_x64(debugger, oep, image_base, virtual_protect_addr, vm_entry)
+        anti_dump::install_anti_dump_fix_x64(
+            debugger,
+            oep,
+            image_base,
+            virtual_protect_addr,
+            vm_entry,
+        )
     } else {
-        anti_dump::install_anti_dump_fix_x86(debugger, oep, image_base, virtual_protect_addr, vm_entry)
+        anti_dump::install_anti_dump_fix_x86(
+            debugger,
+            oep,
+            image_base,
+            virtual_protect_addr,
+            vm_entry,
+        )
     }
 }

@@ -433,8 +433,13 @@ pub fn unpack(
                     let rip = ctx.Rip as usize;
 
                     if loop_count <= 3 {
-                        eprintln!("[TRACE] RIP=0x{:X}, text_start=0x{:X}, text_end=0x{:X}, in_range={}",
-                            rip, text_start, text_end, rip >= text_start && rip < text_end);
+                        eprintln!(
+                            "[TRACE] RIP=0x{:X}, text_start=0x{:X}, text_end=0x{:X}, in_range={}",
+                            rip,
+                            text_start,
+                            text_end,
+                            rip >= text_start && rip < text_end
+                        );
                     }
 
                     if rip >= text_start && rip < text_end {
@@ -453,10 +458,7 @@ pub fn unpack(
                             );
 
                             // FINAL PUSH: Try 750ms (between 500ms and 1000ms)
-                            log::log(
-                                LogType::Info,
-                                "FINAL PUSH: Waiting 1000ms...",
-                            );
+                            log::log(LogType::Info, "FINAL PUSH: Waiting 1000ms...");
                             let _ = unsafe { ResumeThread(h_thread) };
                             std::thread::sleep(std::time::Duration::from_millis(1000));
 
@@ -1480,11 +1482,19 @@ fn update_pre_text_snapshots(
     for snapshot in snapshots {
         let address = image_base
             .checked_add(snapshot.rva as usize)
-            .ok_or_else(|| anyhow!("pre-text snapshot address overflow for {}", snapshot.section_name))?;
+            .ok_or_else(|| {
+                anyhow!(
+                    "pre-text snapshot address overflow for {}",
+                    snapshot.section_name
+                )
+            })?;
         let mut candidate = vec![0u8; snapshot.bytes.len()];
-        let read = dbg
-            .read_memory(address, &mut candidate)
-            .map_err(|e| anyhow!("failed to sample pre-text {} snapshot: {e}", snapshot.section_name))?;
+        let read = dbg.read_memory(address, &mut candidate).map_err(|e| {
+            anyhow!(
+                "failed to sample pre-text {} snapshot: {e}",
+                snapshot.section_name
+            )
+        })?;
         if read != candidate.len() {
             return Err(anyhow!(
                 "short pre-text {} snapshot read: got {read} bytes, expected {}",
@@ -1524,10 +1534,18 @@ fn refresh_early_snapshots_after_loader(
 
         let address = image_base
             .checked_add(snapshot.rva as usize)
-            .ok_or_else(|| anyhow!("loader snapshot address overflow for {}", snapshot.section_name))?;
-        let read = dbg
-            .read_memory(address, &mut snapshot.bytes)
-            .map_err(|e| anyhow!("failed to refresh {} loader snapshot: {e}", snapshot.section_name))?;
+            .ok_or_else(|| {
+                anyhow!(
+                    "loader snapshot address overflow for {}",
+                    snapshot.section_name
+                )
+            })?;
+        let read = dbg.read_memory(address, &mut snapshot.bytes).map_err(|e| {
+            anyhow!(
+                "failed to refresh {} loader snapshot: {e}",
+                snapshot.section_name
+            )
+        })?;
         if read != snapshot.bytes.len() {
             return Err(anyhow!(
                 "short {} loader snapshot read: got {read} bytes, expected {}",
@@ -1563,11 +1581,19 @@ fn merge_reinitializable_data_state(
     for snapshot in snapshots {
         let address = image_base
             .checked_add(snapshot.rva as usize)
-            .ok_or_else(|| anyhow!("late data snapshot address overflow for {}", snapshot.section_name))?;
+            .ok_or_else(|| {
+                anyhow!(
+                    "late data snapshot address overflow for {}",
+                    snapshot.section_name
+                )
+            })?;
         let mut late = vec![0u8; snapshot.bytes.len()];
-        let read = dbg
-            .read_memory(address, &mut late)
-            .map_err(|e| anyhow!("failed to read late {} snapshot: {e}", snapshot.section_name))?;
+        let read = dbg.read_memory(address, &mut late).map_err(|e| {
+            anyhow!(
+                "failed to read late {} snapshot: {e}",
+                snapshot.section_name
+            )
+        })?;
         if read != late.len() {
             return Err(anyhow!(
                 "short late {} snapshot read: got {read} bytes, expected {}",
@@ -1577,10 +1603,8 @@ fn merge_reinitializable_data_state(
         }
 
         let mut merged = 0usize;
-        for (early_chunk, late_chunk) in snapshot
-            .bytes
-            .chunks_exact_mut(8)
-            .zip(late.chunks_exact(8))
+        for (early_chunk, late_chunk) in
+            snapshot.bytes.chunks_exact_mut(8).zip(late.chunks_exact(8))
         {
             let early = u64::from_le_bytes(early_chunk.try_into().unwrap_or_default());
             let late = u64::from_le_bytes(late_chunk.try_into().unwrap_or_default());

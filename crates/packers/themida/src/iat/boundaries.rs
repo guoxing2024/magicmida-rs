@@ -8,12 +8,9 @@ use tracing::{info, warn};
 
 use mida_core::DebuggerCore;
 
-use crate::error::ThemidaError;
 use super::fix::{is_likely_api_address, is_within_image};
-use super::{
-    IatLocation, CONSECUTIVE_ZERO_THRESHOLD,
-    MAX_IAT_SIZE, MAX_TRASH_SLOTS,
-};
+use super::{IatLocation, CONSECUTIVE_ZERO_THRESHOLD, MAX_IAT_SIZE, MAX_TRASH_SLOTS};
+use crate::error::ThemidaError;
 
 // ===========================================================================
 // Internal — Multi-block IAT discovery
@@ -54,9 +51,8 @@ pub(super) fn discover_iat_blocks(iat_data: &[usize]) -> Vec<IatBlock> {
     let mut consecutive_zeros: usize = 0;
 
     for (i, &val) in iat_data.iter().enumerate() {
-        let is_valid = val == 0
-            || is_likely_api_address(val)
-            || is_within_image(val, 0, iat_data.len());
+        let is_valid =
+            val == 0 || is_likely_api_address(val) || is_within_image(val, 0, iat_data.len());
 
         if is_valid {
             if val == 0 {
@@ -89,7 +85,7 @@ pub(super) fn discover_iat_blocks(iat_data: &[usize]) -> Vec<IatBlock> {
                 current_start = Some(i);
             }
             if current_start.is_some() {
-            valid_count += 1;
+                valid_count += 1;
             }
         } else {
             // "Corrupt" slot — end the current block.
@@ -115,10 +111,10 @@ pub(super) fn discover_iat_blocks(iat_data: &[usize]) -> Vec<IatBlock> {
             // Trim trailing zeros.
             let trimmed = valid_count - consecutive_zeros;
             if trimmed >= 1 {
-            blocks.push(IatBlock {
-                start_slot: start,
-                slot_count: trimmed,
-            });
+                blocks.push(IatBlock {
+                    start_slot: start,
+                    slot_count: trimmed,
+                });
             }
         }
     }
@@ -241,25 +237,32 @@ pub(super) fn scan_iat_boundaries(
                 // scan, use a smaller threshold (16) to avoid extending the
                 // IAT start too far back into padding zeros before .rdata.
                 if consecutive_zeros > 16 {
-                iat_start = read_start
-                    + (seeker + consecutive_zeros + 1).min(actual_slots - 1) * ptr_size;
-                break;
+                    iat_start = read_start
+                        + (seeker + consecutive_zeros + 1).min(actual_slots - 1) * ptr_size;
+                    break;
                 }
             }
         } else if is_likely_api_address(val) || is_within_image(val, read_start, actual_slots) {
             iat_start = read_start + seeker * ptr_size;
             consecutive_zeros = 0;
         } else {
-            info!("Ending IAT start search at {:#x} because pointer is {val:#x}", read_start + seeker * ptr_size);
+            info!(
+                "Ending IAT start search at {:#x} because pointer is {val:#x}",
+                read_start + seeker * ptr_size
+            );
             iat_start = read_start + (seeker + 1) * ptr_size;
             break;
         }
 
         slots_scanned += 1;
-        if slots_scanned > MAX_IAT_SLOTS_BACKWARD { break; }
+        if slots_scanned > MAX_IAT_SLOTS_BACKWARD {
+            break;
+        }
 
         if seeker == 0 {
-            if iat_start == 0 { return Err(ThemidaError::IatNotFound); }
+            if iat_start == 0 {
+                return Err(ThemidaError::IatNotFound);
+            }
             break;
         }
         seeker -= 1;
@@ -342,8 +345,7 @@ pub(super) fn scan_iat_boundaries(
                 if val == 0 || !is_likely_api_address(val) {
                     trash_counter += 1;
                     if trash_counter > MAX_TRASH_SLOTS {
-                        iat_end = read_start
-                            + i.saturating_sub(trash_counter) * ptr_size;
+                        iat_end = read_start + i.saturating_sub(trash_counter) * ptr_size;
                         break;
                     }
                 } else {
@@ -369,7 +371,7 @@ pub(super) fn scan_iat_boundaries(
             return Ok(IatLocation {
                 address: iat_start,
                 size,
-                requires_writable_section: false,  // TODO: detect from PE header
+                requires_writable_section: false, // TODO: detect from PE header
             });
         }
     };
@@ -414,6 +416,6 @@ pub(super) fn scan_iat_boundaries(
     Ok(IatLocation {
         address: iat_start_final,
         size,
-        requires_writable_section: false,  // TODO: detect from PE header
+        requires_writable_section: false, // TODO: detect from PE header
     })
 }

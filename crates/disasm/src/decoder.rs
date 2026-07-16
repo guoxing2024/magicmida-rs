@@ -33,11 +33,9 @@ impl Disassembler {
     /// Decode every instruction in `code`, returning a lazy iterator.
     ///
     /// Instructions are decoded sequentially starting from `base_address`.
-    pub fn decode_all<'a>(
-        &'a self,
-        code: &'a [u8],
-    ) -> impl Iterator<Item = Instruction> + 'a {
-        let mut decoder = Decoder::with_ip(self.bitness, code, self.base_address, DecoderOptions::NONE);
+    pub fn decode_all<'a>(&'a self, code: &'a [u8]) -> impl Iterator<Item = Instruction> + 'a {
+        let mut decoder =
+            Decoder::with_ip(self.bitness, code, self.base_address, DecoderOptions::NONE);
         std::iter::from_fn(move || {
             if decoder.can_decode() {
                 Some(decoder.decode())

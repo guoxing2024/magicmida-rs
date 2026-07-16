@@ -1,4 +1,4 @@
-﻿//! Single-step tracer that drives a thread instruction-by-instruction through
+//! Single-step tracer that drives a thread instruction-by-instruction through
 //! the packer's obfuscated code, using a caller-supplied predicate to decide
 //! when to stop.
 //!
@@ -10,7 +10,7 @@ use mida_core::debugger::{ContinueStatus, DebugEvent, DebuggerCore};
 use tracing::debug;
 use windows::Win32::System::Diagnostics::Debug::CONTEXT;
 
-use crate::error::{TracerError, TraceBreakKind};
+use crate::error::{TraceBreakKind, TracerError};
 use crate::LogMsgType;
 
 /// Maximum instruction count when no explicit limit is given (`limit == 0`).
@@ -133,15 +133,23 @@ impl<'a> Tracer<'a> {
         // ---- initialise state ------------------------------------------------
 
         self.counter = 0;
-        self.limit = if limit == 0 { DEFAULT_TRACE_LIMIT } else { limit };
+        self.limit = if limit == 0 {
+            DEFAULT_TRACE_LIMIT
+        } else {
+            limit
+        };
         self.limit_reached = false;
         self.start_address = address;
 
         // ---- point thread to start address and set TF -----------------------
 
-        let mut ctx = debugger
-            .get_thread_context(self.thread_id)
-            .map_err(|e| TracerError::Debugger { source: Box::new(std::io::Error::other(e.to_string())), context: "tracer" })?;
+        let mut ctx =
+            debugger
+                .get_thread_context(self.thread_id)
+                .map_err(|e| TracerError::Debugger {
+                    source: Box::new(std::io::Error::other(e.to_string())),
+                    context: "tracer",
+                })?;
 
         // Set instruction pointer (architecture-dependent field name).
         #[cfg(target_arch = "x86_64")]
@@ -158,13 +166,19 @@ impl<'a> Tracer<'a> {
 
         debugger
             .set_thread_context(self.thread_id, &ctx)
-            .map_err(|e| TracerError::Debugger { source: Box::new(std::io::Error::other(e.to_string())), context: "tracer" })?;
+            .map_err(|e| TracerError::Debugger {
+                source: Box::new(std::io::Error::other(e.to_string())),
+                context: "tracer",
+            })?;
 
         // Resume from the event that brought us here.  The thread will
         // execute one instruction and then fire a SingleStep exception.
         debugger
             .continue_event(self.thread_id, ContinueStatus::Continue)
-            .map_err(|e| TracerError::Debugger { source: Box::new(std::io::Error::other(e.to_string())), context: "tracer" })?;
+            .map_err(|e| TracerError::Debugger {
+                source: Box::new(std::io::Error::other(e.to_string())),
+                context: "tracer",
+            })?;
 
         // ---- trace loop -----------------------------------------------------
         //
@@ -175,24 +189,25 @@ impl<'a> Tracer<'a> {
         let mut predicate = self
             .predicate
             .take()
-            .ok_or(TracerError::Internal(
-                "predicate must be Some before trace",
-        ))?;
+            .ok_or(TracerError::Internal("predicate must be Some before trace"))?;
 
         // The closure wraps the loop so we can use `?` inside it while
         // keeping `predicate` on the stack.  After the closure we restore
         // `predicate` into self.
         let closure_result = (|| {
             loop {
-                let ev = debugger
-                    .wait_event()
-                    .map_err(|e| TracerError::Debugger { source: Box::new(std::io::Error::other(e.to_string())), context: "tracer" })?;
+                let ev = debugger.wait_event().map_err(|e| TracerError::Debugger {
+                    source: Box::new(std::io::Error::other(e.to_string())),
+                    context: "tracer",
+                })?;
 
                 let event_thread_id = thread_id_of(&ev);
 
                 // ExitProcess is a session-ending event.
                 if let DebugEvent::ExitProcess { exit_code } = &ev {
-                    return Err(TracerError::ProcessExited { exit_code: *exit_code });
+                    return Err(TracerError::ProcessExited {
+                        exit_code: *exit_code,
+                    });
                 }
 
                 // ---- events on the traced thread ----------------------------
@@ -219,9 +234,13 @@ impl<'a> Tracer<'a> {
 
                             // Fetch context so the predicate can inspect
                             // (and optionally modify) registers.
-                            let mut ctx = debugger
-                                .get_thread_context(self.thread_id)
-                                .map_err(|e| TracerError::Debugger { source: Box::new(std::io::Error::other(e.to_string())), context: "tracer" })?;
+                            let mut ctx =
+                                debugger.get_thread_context(self.thread_id).map_err(|e| {
+                                    TracerError::Debugger {
+                                        source: Box::new(std::io::Error::other(e.to_string())),
+                                        context: "tracer",
+                                    }
+                                })?;
 
                             // Ask the predicate whether to stop.
                             // `predicate` is a local variable, not a self
@@ -239,18 +258,18 @@ impl<'a> Tracer<'a> {
                             // also single-steps.
                             ctx.EFlags |= 0x100;
                             debugger
-                                .set_thread_context(
-                                    self.thread_id,
-                                    &ctx,
-                                )
-                                .map_err(|e| TracerError::Debugger { source: Box::new(std::io::Error::other(e.to_string())), context: "tracer" })?;
+                                .set_thread_context(self.thread_id, &ctx)
+                                .map_err(|e| TracerError::Debugger {
+                                    source: Box::new(std::io::Error::other(e.to_string())),
+                                    context: "tracer",
+                                })?;
 
                             debugger
-                                .continue_event(
-                                    self.thread_id,
-                                    ContinueStatus::Continue,
-                                )
-                                .map_err(|e| TracerError::Debugger { source: Box::new(std::io::Error::other(e.to_string())), context: "tracer" })?;
+                                .continue_event(self.thread_id, ContinueStatus::Continue)
+                                .map_err(|e| TracerError::Debugger {
+                                    source: Box::new(std::io::Error::other(e.to_string())),
+                                    context: "tracer",
+                                })?;
                         }
 
                         // Unexpected exceptions on the traced thread are
@@ -298,11 +317,11 @@ impl<'a> Tracer<'a> {
                                  on trace thread"
                             );
                             debugger
-                                .continue_event(
-                                    self.thread_id,
-                                    ContinueStatus::Continue,
-                                )
-                                .map_err(|e| TracerError::Debugger { source: Box::new(std::io::Error::other(e.to_string())), context: "tracer" })?;
+                                .continue_event(self.thread_id, ContinueStatus::Continue)
+                                .map_err(|e| TracerError::Debugger {
+                                    source: Box::new(std::io::Error::other(e.to_string())),
+                                    context: "tracer",
+                                })?;
                         }
                     }
                 } else {
@@ -310,16 +329,14 @@ impl<'a> Tracer<'a> {
 
                     (self.log)(
                         LogMsgType::Info,
-                        &format!(
-                            "Suspending spurious thread {event_thread_id}"
-                        ),
+                        &format!("Suspending spurious thread {event_thread_id}"),
                     );
                     debugger
-                        .continue_event(
-                            event_thread_id,
-                            ContinueStatus::Continue,
-                        )
-                        .map_err(|e| TracerError::Debugger { source: Box::new(std::io::Error::other(e.to_string())), context: "tracer" })?;
+                        .continue_event(event_thread_id, ContinueStatus::Continue)
+                        .map_err(|e| TracerError::Debugger {
+                            source: Box::new(std::io::Error::other(e.to_string())),
+                            context: "tracer",
+                        })?;
                 }
             }
         })();
@@ -399,7 +416,10 @@ mod tests {
 
     #[test]
     fn thread_id_of_breakpoint_returns_thread_id() {
-        let ev = DebugEvent::Breakpoint { thread_id: 42, address: 0x1000 };
+        let ev = DebugEvent::Breakpoint {
+            thread_id: 42,
+            address: 0x1000,
+        };
         assert_eq!(thread_id_of(&ev), 42);
     }
 

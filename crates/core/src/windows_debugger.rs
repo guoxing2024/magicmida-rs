@@ -8,32 +8,30 @@ use std::collections::HashMap;
 
 use tracing::{debug, info, trace, warn};
 use windows::Win32::Foundation::{
-    CloseHandle, GetLastError, HANDLE,
-    EXCEPTION_ACCESS_VIOLATION, EXCEPTION_BREAKPOINT, EXCEPTION_SINGLE_STEP,
-    DBG_CONTINUE,
+    CloseHandle, GetLastError, DBG_CONTINUE, EXCEPTION_ACCESS_VIOLATION, EXCEPTION_BREAKPOINT,
+    EXCEPTION_SINGLE_STEP, HANDLE,
 };
 use windows::Win32::System::Diagnostics::Debug::{
-    ContinueDebugEvent, FlushInstructionCache, GetThreadContext, SetThreadContext,
-    ReadProcessMemory, WriteProcessMemory, WaitForDebugEvent,
-    CONTEXT, CONTEXT_ALL_AMD64, CONTEXT_FLAGS,
-    CONTEXT_DEBUG_REGISTERS_AMD64, CONTEXT_CONTROL_AMD64, CONTEXT_INTEGER_AMD64,
-    CREATE_PROCESS_DEBUG_EVENT, CREATE_THREAD_DEBUG_EVENT,
-    DEBUG_EVENT as RAW_DEBUG_EVENT, EXCEPTION_DEBUG_EVENT,
-    EXIT_PROCESS_DEBUG_EVENT, EXIT_THREAD_DEBUG_EVENT,
-    LOAD_DLL_DEBUG_EVENT, UNLOAD_DLL_DEBUG_EVENT,
-    OUTPUT_DEBUG_STRING_EVENT, RIP_EVENT,
+    ContinueDebugEvent, FlushInstructionCache, GetThreadContext, ReadProcessMemory,
+    SetThreadContext, WaitForDebugEvent, WriteProcessMemory, CONTEXT, CONTEXT_ALL_AMD64,
+    CONTEXT_CONTROL_AMD64, CONTEXT_DEBUG_REGISTERS_AMD64, CONTEXT_FLAGS, CONTEXT_INTEGER_AMD64,
+    CREATE_PROCESS_DEBUG_EVENT, CREATE_THREAD_DEBUG_EVENT, DEBUG_EVENT as RAW_DEBUG_EVENT,
+    EXCEPTION_DEBUG_EVENT, EXIT_PROCESS_DEBUG_EVENT, EXIT_THREAD_DEBUG_EVENT, LOAD_DLL_DEBUG_EVENT,
+    OUTPUT_DEBUG_STRING_EVENT, RIP_EVENT, UNLOAD_DLL_DEBUG_EVENT,
 };
 #[cfg(target_arch = "x86")]
 use windows::Win32::System::Diagnostics::Debug::{
-    CONTEXT_ALL_X86, CONTEXT_DEBUG_REGISTERS_X86, CONTEXT_CONTROL_X86,
-    CONTEXT_INTEGER_X86,
+    CONTEXT_ALL_X86, CONTEXT_CONTROL_X86, CONTEXT_DEBUG_REGISTERS_X86, CONTEXT_INTEGER_X86,
 };
 use windows::Win32::System::Threading::INFINITE;
 
 use crate::breakpoint::{HwBreakpoint, HwbpType};
 use crate::debugger::{ContinueStatus, DebugEvent, DebuggerCore};
 use crate::error::CoreError;
-use crate::process::{CreateProcessOptions, TargetProcess, create_debug_process, patch_peb_anti_debug, cleanup_stub_exe, close_process_handles};
+use crate::process::{
+    cleanup_stub_exe, close_process_handles, create_debug_process, patch_peb_anti_debug,
+    CreateProcessOptions, TargetProcess,
+};
 
 // ---------------------------------------------------------------------------
 // WindowsDebugger
@@ -183,7 +181,10 @@ impl WindowsDebugger {
     /// write access to the breakpoint table.
     pub fn hw_breakpoint_addr(&self, slot: usize) -> Option<u64> {
         debug_assert!(slot < 4, "slot must be 0–3");
-        self.hw_breakpoints.get(slot).and_then(|opt| opt.as_ref()).map(|bp| bp.address)
+        self.hw_breakpoints
+            .get(slot)
+            .and_then(|opt| opt.as_ref())
+            .map(|bp| bp.address)
     }
 
     /// Return `true` if there is any enabled hardware breakpoint — used by the
@@ -194,7 +195,9 @@ impl WindowsDebugger {
     /// debugger lacks `THREAD_SUSPEND_RESUME` rights for just emits noisy
     /// `ERROR_PARTIAL_COPY` warnings.
     pub fn has_any_hw_breakpoint(&self) -> bool {
-        self.hw_breakpoints.iter().any(|slot| slot.as_ref().is_some_and(|bp| bp.is_set()))
+        self.hw_breakpoints
+            .iter()
+            .any(|slot| slot.as_ref().is_some_and(|bp| bp.is_set()))
     }
 
     /// Look up a thread handle by ID.
@@ -207,22 +210,34 @@ impl WindowsDebugger {
 
     /// Context flags for reading full register state.
     #[cfg(target_arch = "x86_64")]
-    fn full_context_flags() -> CONTEXT_FLAGS { CONTEXT_ALL_AMD64 }
+    fn full_context_flags() -> CONTEXT_FLAGS {
+        CONTEXT_ALL_AMD64
+    }
     #[cfg(target_arch = "x86")]
-    fn full_context_flags() -> CONTEXT_FLAGS { CONTEXT_ALL_X86 }
+    fn full_context_flags() -> CONTEXT_FLAGS {
+        CONTEXT_ALL_X86
+    }
 
     /// Context flags for reading only debug registers (DR0–DR7).
     #[cfg(target_arch = "x86_64")]
-    fn debug_registers_flags() -> CONTEXT_FLAGS { CONTEXT_DEBUG_REGISTERS_AMD64 }
+    fn debug_registers_flags() -> CONTEXT_FLAGS {
+        CONTEXT_DEBUG_REGISTERS_AMD64
+    }
     #[cfg(target_arch = "x86")]
-    fn debug_registers_flags() -> CONTEXT_FLAGS { CONTEXT_DEBUG_REGISTERS_X86 }
+    fn debug_registers_flags() -> CONTEXT_FLAGS {
+        CONTEXT_DEBUG_REGISTERS_X86
+    }
 
     /// Context flags for reading only control registers (Rip, Rsp, EFlags,
     /// SegCs, SegSs).
     #[cfg(target_arch = "x86_64")]
-    fn control_context_flags() -> CONTEXT_FLAGS { CONTEXT_CONTROL_AMD64 }
+    fn control_context_flags() -> CONTEXT_FLAGS {
+        CONTEXT_CONTROL_AMD64
+    }
     #[cfg(target_arch = "x86")]
-    fn control_context_flags() -> CONTEXT_FLAGS { CONTEXT_CONTROL_X86 }
+    fn control_context_flags() -> CONTEXT_FLAGS {
+        CONTEXT_CONTROL_X86
+    }
 
     /// Context flags for reading control and integer registers.
     #[cfg(target_arch = "x86_64")]
@@ -257,8 +272,14 @@ impl WindowsDebugger {
         debug_assert!(slot < 4, "slot must be 0–3");
 
         // Check that the slot is free.
-        if self.hw_breakpoints[slot].as_ref().is_some_and(|bp| bp.is_set()) {
-            trace!(slot, "set_hw_breakpoint: slot already has an active BP, refusing to overwrite");
+        if self.hw_breakpoints[slot]
+            .as_ref()
+            .is_some_and(|bp| bp.is_set())
+        {
+            trace!(
+                slot,
+                "set_hw_breakpoint: slot already has an active BP, refusing to overwrite"
+            );
             return Err(CoreError::HwbpSlotInUse(slot));
         }
 
@@ -347,7 +368,11 @@ impl WindowsDebugger {
             }
             None => {
                 // No breakpoint in this slot — nothing to disable.
-                trace!(slot, "HW breakpoint slot {} is empty, nothing to disable", slot);
+                trace!(
+                    slot,
+                    "HW breakpoint slot {} is empty, nothing to disable",
+                    slot
+                );
                 return Ok(());
             }
         }
@@ -412,7 +437,9 @@ impl WindowsDebugger {
     /// band (for example, via a `CREATE_THREAD_DEBUG_EVENT`) can bring that
     /// thread up to date with the current breakpoint configuration.
     pub fn apply_debug_registers_thread(&self, thread_id: u32) -> Result<(), CoreError> {
-        use windows::Win32::System::Threading::{OpenThread, THREAD_GET_CONTEXT, THREAD_SET_CONTEXT};
+        use windows::Win32::System::Threading::{
+            OpenThread, THREAD_GET_CONTEXT, THREAD_SET_CONTEXT,
+        };
 
         // Build a CONTEXT populated with ONLY debug registers.  We deliberately
         // skip GetThreadContext: on modern Windows (10/11) GetThreadContext
@@ -471,8 +498,8 @@ impl WindowsDebugger {
 
         // Helper: write one slot's data into DR7 and the context DRn register.
         fn apply_slot(ctx: &mut CONTEXT, bp: Option<&HwBreakpoint>, slot: usize, dr7: &mut u64) {
-            let dr_shift = slot * 4;       // RW field: bits 16 + 4*slot
-            let le_shift = slot * 2;        // L enable: bits 0,2,4,6
+            let dr_shift = slot * 4; // RW field: bits 16 + 4*slot
+            let le_shift = slot * 2; // L enable: bits 0,2,4,6
             match bp {
                 Some(b) if b.is_set() => {
                     match slot {
@@ -666,7 +693,9 @@ impl WindowsDebugger {
     /// This is a low-level helper needed for both hardware and software
     /// breakpoint single-stepping.
     pub fn enable_single_step(&self, thread_id: u32) -> Result<(), CoreError> {
-        use windows::Win32::System::Threading::{OpenThread, THREAD_GET_CONTEXT, THREAD_SET_CONTEXT};
+        use windows::Win32::System::Threading::{
+            OpenThread, THREAD_GET_CONTEXT, THREAD_SET_CONTEXT,
+        };
 
         // SAFETY: OpenThread returns a fresh valid HANDLE; thread_id comes from a registered debug thread.
         let h = unsafe {
@@ -681,8 +710,7 @@ impl WindowsDebugger {
 
         // SAFETY: h is a valid thread handle with THREAD_SET_CONTEXT rights; ctx is a properly initialised CONTEXT.
         unsafe {
-            GetThreadContext(h, &mut ctx)
-                .map_err(|e| CoreError::Windows(e.code().0 as u32))?;
+            GetThreadContext(h, &mut ctx).map_err(|e| CoreError::Windows(e.code().0 as u32))?;
         }
 
         // Set the trap flag (TF, bit 8 in EFlags).
@@ -690,8 +718,7 @@ impl WindowsDebugger {
 
         // SAFETY: h is a valid thread handle with THREAD_SET_CONTEXT rights; ctx is a properly initialised CONTEXT.
         unsafe {
-            SetThreadContext(h, &ctx)
-                .map_err(|e| CoreError::Windows(e.code().0 as u32))?;
+            SetThreadContext(h, &ctx).map_err(|e| CoreError::Windows(e.code().0 as u32))?;
         }
 
         Ok(())
@@ -757,7 +784,11 @@ impl DebuggerCore for WindowsDebugger {
                     Ok(event) => {
                         // Bookkeeping.
                         match &event {
-                            DebugEvent::CreateThread { thread_id, h_thread, .. } => {
+                            DebugEvent::CreateThread {
+                                thread_id,
+                                h_thread,
+                                ..
+                            } => {
                                 self.threads.insert(*thread_id, *h_thread);
                                 // Sync DR state only when we have a HW BP to
                                 // propagate — avoids `ERROR_PARTIAL_COPY`
@@ -815,10 +846,10 @@ impl DebuggerCore for WindowsDebugger {
 
             let _event_code = raw.dwDebugEventCode;
             let ev = match Self::decode_event(&raw) {
-                        Ok(event) => event,
-                        Err(CoreError::Handled) => continue,
-                        Err(e) => return Err(e),
-                    };
+                Ok(event) => event,
+                Err(CoreError::Handled) => continue,
+                Err(e) => return Err(e),
+            };
             let _is_create_process = matches!(ev, DebugEvent::CreateProcess { .. });
 
             // Bookkeeping before returning the event.
@@ -840,7 +871,9 @@ impl DebuggerCore for WindowsDebugger {
                     if let Some(h) = h {
                         if !h.is_invalid() {
                             // SAFETY: handle is valid and belongs to us.
-                            unsafe { let _ = CloseHandle(h); }
+                            unsafe {
+                                let _ = CloseHandle(h);
+                            }
                         }
                     }
                 }
@@ -870,11 +903,7 @@ impl DebuggerCore for WindowsDebugger {
         }
     }
 
-    fn continue_event(
-        &mut self,
-        thread_id: u32,
-        status: ContinueStatus,
-    ) -> Result<(), CoreError> {
+    fn continue_event(&mut self, thread_id: u32, status: ContinueStatus) -> Result<(), CoreError> {
         let nt_status = match status {
             ContinueStatus::Continue => DBG_CONTINUE,
             ContinueStatus::ContinueNoStep => DBG_CONTINUE,
@@ -947,8 +976,7 @@ impl DebuggerCore for WindowsDebugger {
 
         // SAFETY: h is a valid thread handle with THREAD_GET_CONTEXT rights; ctx is a writable CONTEXT.
         unsafe {
-            GetThreadContext(h, &mut ctx)
-                .map_err(|e| CoreError::Windows(e.code().0 as u32))?;
+            GetThreadContext(h, &mut ctx).map_err(|e| CoreError::Windows(e.code().0 as u32))?;
         }
 
         Ok(ctx)
@@ -969,8 +997,7 @@ impl DebuggerCore for WindowsDebugger {
 
         // SAFETY: h is a valid thread handle with THREAD_GET_CONTEXT rights; ctx is a writable CONTEXT.
         unsafe {
-            GetThreadContext(h, &mut ctx)
-                .map_err(|e| CoreError::Windows(e.code().0 as u32))?;
+            GetThreadContext(h, &mut ctx).map_err(|e| CoreError::Windows(e.code().0 as u32))?;
         }
 
         Ok(ctx)
@@ -991,8 +1018,7 @@ impl DebuggerCore for WindowsDebugger {
 
         // SAFETY: h is a valid thread handle with THREAD_GET_CONTEXT rights; ctx is a writable CONTEXT.
         unsafe {
-            GetThreadContext(h, &mut ctx)
-                .map_err(|e| CoreError::Windows(e.code().0 as u32))?;
+            GetThreadContext(h, &mut ctx).map_err(|e| CoreError::Windows(e.code().0 as u32))?;
         }
 
         Ok(ctx)
@@ -1009,8 +1035,7 @@ impl DebuggerCore for WindowsDebugger {
 
         // SAFETY: h is a valid thread handle with THREAD_SET_CONTEXT rights; ctx is a properly initialised CONTEXT.
         unsafe {
-            SetThreadContext(h, ctx)
-                .map_err(|e| CoreError::Windows(e.code().0 as u32))?;
+            SetThreadContext(h, ctx).map_err(|e| CoreError::Windows(e.code().0 as u32))?;
         }
 
         Ok(())
@@ -1065,9 +1090,8 @@ impl WindowsDebugger {
                         address: addr,
                     },
                     code if code == EXCEPTION_ACCESS_VIOLATION => {
-                        let is_write =
-                            exc.ExceptionRecord.NumberParameters > 0
-                                && exc.ExceptionRecord.ExceptionInformation[0] == 1;
+                        let is_write = exc.ExceptionRecord.NumberParameters > 0
+                            && exc.ExceptionRecord.ExceptionInformation[0] == 1;
                         let target = if exc.ExceptionRecord.NumberParameters > 1 {
                             exc.ExceptionRecord.ExceptionInformation[1] as u64
                         } else {
@@ -1165,21 +1189,13 @@ impl WindowsDebugger {
             RIP_EVENT => {
                 warn!("RIP_EVENT received — system-level debug error");
                 // SAFETY: pid and thread_id come from the RIP_EVENT being handled; DBG_CONTINUE is a valid status.
-                let _ = unsafe {
-                    ContinueDebugEvent(
-                        raw.dwProcessId,
-                        raw.dwThreadId,
-                        DBG_CONTINUE,
-                    )
-                };
+                let _ =
+                    unsafe { ContinueDebugEvent(raw.dwProcessId, raw.dwThreadId, DBG_CONTINUE) };
                 return Err(CoreError::Windows(0));
             }
 
             _ => {
-                debug!(
-                    code = raw.dwDebugEventCode.0,
-                    "Unknown debug event code"
-                );
+                debug!(code = raw.dwDebugEventCode.0, "Unknown debug event code");
                 return Err(CoreError::Handled);
             }
         };

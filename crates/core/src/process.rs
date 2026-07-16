@@ -8,31 +8,24 @@ use std::path::{Path, PathBuf};
 
 use tracing::{debug, info, warn};
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{
-    BOOL, GetLastError, HANDLE, NTSTATUS, STATUS_SUCCESS,
-};
+use windows::Wdk::System::Threading::{NtQueryInformationProcess, PROCESSINFOCLASS};
+use windows::Win32::Foundation::{GetLastError, BOOL, HANDLE, NTSTATUS, STATUS_SUCCESS};
 use windows::Win32::Storage::FileSystem::CopyFileW;
 use windows::Win32::System::Diagnostics::Debug::{
-    ReadProcessMemory, WriteProcessMemory,
-    IMAGE_DLLCHARACTERISTICS_FORCE_INTEGRITY, IMAGE_FILE_CHARACTERISTICS,
-    IMAGE_FILE_DLL, IMAGE_FILE_HEADER, IMAGE_NT_HEADERS32,
-    IMAGE_NT_HEADERS64, IMAGE_OPTIONAL_HEADER32, IMAGE_OPTIONAL_HEADER64,
-    IMAGE_SECTION_HEADER,
+    ReadProcessMemory, WriteProcessMemory, IMAGE_DLLCHARACTERISTICS_FORCE_INTEGRITY,
+    IMAGE_FILE_CHARACTERISTICS, IMAGE_FILE_DLL, IMAGE_FILE_HEADER, IMAGE_NT_HEADERS32,
+    IMAGE_NT_HEADERS64, IMAGE_OPTIONAL_HEADER32, IMAGE_OPTIONAL_HEADER64, IMAGE_SECTION_HEADER,
 };
 use windows::Win32::System::SystemInformation::IMAGE_FILE_MACHINE_AMD64;
 #[cfg(target_arch = "x86")]
 use windows::Win32::System::SystemInformation::IMAGE_FILE_MACHINE_I386;
 use windows::Win32::System::SystemServices::IMAGE_DOS_HEADER;
 use windows::Win32::System::Threading::{
-    CreateProcessW, PROCESS_BASIC_INFORMATION, PROCESS_INFORMATION,
-    STARTUPINFOW, STARTF_USESHOWWINDOW, CREATE_SUSPENDED,
-    DEBUG_ONLY_THIS_PROCESS, CREATE_NEW_CONSOLE,
-    CREATE_DEFAULT_ERROR_MODE, NORMAL_PRIORITY_CLASS,
+    CreateProcessW, CREATE_DEFAULT_ERROR_MODE, CREATE_NEW_CONSOLE, CREATE_SUSPENDED,
+    DEBUG_ONLY_THIS_PROCESS, NORMAL_PRIORITY_CLASS, PROCESS_BASIC_INFORMATION, PROCESS_INFORMATION,
+    STARTF_USESHOWWINDOW, STARTUPINFOW,
 };
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOW;
-use windows::Wdk::System::Threading::{
-    NtQueryInformationProcess, PROCESSINFOCLASS,
-};
 
 use crate::error::CoreError;
 
@@ -126,14 +119,14 @@ const IMAGE_NT_SIGNATURE: u32 = 0x0000_4550;
 
 #[cfg(target_arch = "x86")]
 const STUB_X86: [u8; 23] = [
-    0x55,                                     // push ebp
-    0x89, 0xE5,                               // mov  ebp, esp
-    0x6A, 0x00,                               // push 0
-    0x6A, 0x01,                               // push 1
-    0x68, 0x00, 0x00, 0x00, 0x00,            // push <ImageBase> (patched)
-    0xE8, 0x00, 0x00, 0x00, 0x00,            // call <DllMain>    (patched)
-    0x50,                                     // push eax
-    0xE8, 0x00, 0x00, 0x00, 0x00,            // call <ExitProcess> (patched)
+    0x55, // push ebp
+    0x89, 0xE5, // mov  ebp, esp
+    0x6A, 0x00, // push 0
+    0x6A, 0x01, // push 1
+    0x68, 0x00, 0x00, 0x00, 0x00, // push <ImageBase> (patched)
+    0xE8, 0x00, 0x00, 0x00, 0x00, // call <DllMain>    (patched)
+    0x50, // push eax
+    0xE8, 0x00, 0x00, 0x00, 0x00, // call <ExitProcess> (patched)
 ];
 #[cfg(target_arch = "x86")]
 const X86_PUSH_IMM_OFFSET: usize = 6;
@@ -146,13 +139,13 @@ const X86_CALL_EXITPROC_OFFSET: usize = 18;
 /// `ExitProcess(return_value)`.
 #[cfg(target_arch = "x86_64")]
 const STUB_X64: [u8; 34] = [
-    0x48, 0x83, 0xEC, 0x28,                                     // sub  rsp, 28h
+    0x48, 0x83, 0xEC, 0x28, // sub  rsp, 28h
     0x48, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // mov  rcx, <ImageBase>
-    0xBA, 0x01, 0x00, 0x00, 0x00,                               // mov  edx, 1
-    0x45, 0x31, 0xC0,                                           // xor  r8d, r8d
-    0xE8, 0x00, 0x00, 0x00, 0x00,                               // call <DllMain>
-    0x89, 0xC1,                                                 // mov  ecx, eax
-    0xE8, 0x00, 0x00, 0x00, 0x00,                               // call <ExitProcess>
+    0xBA, 0x01, 0x00, 0x00, 0x00, // mov  edx, 1
+    0x45, 0x31, 0xC0, // xor  r8d, r8d
+    0xE8, 0x00, 0x00, 0x00, 0x00, // call <DllMain>
+    0x89, 0xC1, // mov  ecx, eax
+    0xE8, 0x00, 0x00, 0x00, 0x00, // call <ExitProcess>
 ];
 #[cfg(target_arch = "x86_64")]
 const X64_MOV_RCX_IMM_OFFSET: usize = 6;
@@ -185,9 +178,7 @@ const STUB_EXE_SUFFIX: &str = "MM.exe";
 /// Returns [`CoreError::ProcessCreation`] when the PE header is malformed,
 /// the file is for the wrong architecture, `CopyFileW` fails, a memory
 /// read/write fails, or `CreateProcessW` itself fails.
-pub fn create_debug_process(
-    opts: &CreateProcessOptions,
-) -> Result<TargetProcess, CoreError> {
+pub fn create_debug_process(opts: &CreateProcessOptions) -> Result<TargetProcess, CoreError> {
     // Step 1: inspect the PE file (determines DLL flag, verifies arch)
     let pe_info = pe_inspect(&opts.executable)?;
 
@@ -219,9 +210,7 @@ pub fn create_debug_process(
     // the caller explicitly resumes after capturing any early memory baseline.
     // Creating without a debug port from t=0 defeats protectors that read
     // EPROCESS.DebugPort during startup.
-    let mut flags = CREATE_DEFAULT_ERROR_MODE
-        | CREATE_NEW_CONSOLE
-        | NORMAL_PRIORITY_CLASS;
+    let mut flags = CREATE_DEFAULT_ERROR_MODE | CREATE_NEW_CONSOLE | NORMAL_PRIORITY_CLASS;
 
     if opts.post_attach {
         // Post-attach: suspended + no debug flag. The caller explicitly resumes
@@ -247,10 +236,7 @@ pub fn create_debug_process(
 
     // CreateProcessW may modify the command-line buffer, so allocate mutable
     // wide string.
-    let mut cmd_line_wide: Vec<u16> = cmd_line
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
+    let mut cmd_line_wide: Vec<u16> = cmd_line.encode_utf16().chain(std::iter::once(0)).collect();
 
     // Use the directory containing the executable as the working directory.
     let current_dir_str = executable_path
@@ -268,14 +254,14 @@ pub fn create_debug_process(
     // - STARTUPINFOW::cb is set to the correct size.
     unsafe {
         CreateProcessW(
-            None,                                           // lpApplicationName
+            None,                                                       // lpApplicationName
             windows::core::PWSTR::from_raw(cmd_line_wide.as_mut_ptr()), // lpCommandLine
-            None,                                           // lpProcessAttributes
-            None,                                           // lpThreadAttributes
-            BOOL::from(false),                              // bInheritHandles
+            None,                                                       // lpProcessAttributes
+            None,                                                       // lpThreadAttributes
+            BOOL::from(false),                                          // bInheritHandles
             flags,
-            None,                                           // lpEnvironment
-            PCWSTR::from_raw(current_dir_wide.as_ptr()),     // lpCurrentDirectory
+            None,                                        // lpEnvironment
+            PCWSTR::from_raw(current_dir_wide.as_ptr()), // lpCurrentDirectory
             &si,
             &mut pi,
         )
@@ -357,11 +343,12 @@ fn pe_inspect(path: &Path) -> Result<PeInfo, CoreError> {
 
     // Read the NT headers signature (first 4 bytes at pe_offset).
     let signature = {
-        let bytes = data.get(pe_offset..pe_offset + 4)
+        let bytes = data
+            .get(pe_offset..pe_offset + 4)
             .and_then(|s| s.try_into().ok())
-            .ok_or_else(|| CoreError::ProcessCreation(
-                "Failed to read PE signature bytes".into()
-            ))?;
+            .ok_or_else(|| {
+                CoreError::ProcessCreation("Failed to read PE signature bytes".into())
+            })?;
         u32::from_le_bytes(bytes)
     };
 
@@ -376,9 +363,7 @@ fn pe_inspect(path: &Path) -> Result<PeInfo, CoreError> {
     // SAFETY: we verified bounds above.
     let file_header_offset = pe_offset + 4;
     // SAFETY: bounds were verified above (data.len() >= pe_offset + size_of::<IMAGE_NT_HEADERS64>); offset is within the file.
-    let fh = unsafe {
-        &*(data.as_ptr().add(file_header_offset) as *const IMAGE_FILE_HEADER)
-    };
+    let fh = unsafe { &*(data.as_ptr().add(file_header_offset) as *const IMAGE_FILE_HEADER) };
 
     let is_dll = (fh.Characteristics.0 & IMAGE_FILE_DLL.0) != 0;
 
@@ -389,8 +374,16 @@ fn pe_inspect(path: &Path) -> Result<PeInfo, CoreError> {
     let expected_machine = IMAGE_FILE_MACHINE_AMD64;
 
     if fh.Machine != expected_machine {
-        let expected_name = if cfg!(target_arch = "x86") { "32-bit" } else { "64-bit" };
-        let actual_name = if cfg!(target_arch = "x86") { "64-bit" } else { "32-bit" };
+        let expected_name = if cfg!(target_arch = "x86") {
+            "32-bit"
+        } else {
+            "64-bit"
+        };
+        let actual_name = if cfg!(target_arch = "x86") {
+            "64-bit"
+        } else {
+            "32-bit"
+        };
         return Err(CoreError::ProcessCreation(format!(
             "File is for the wrong architecture (Machine={machine:?}): \
              expected {expected_name}, please use the {actual_name} version of Magicmida.",
@@ -402,7 +395,8 @@ fn pe_inspect(path: &Path) -> Result<PeInfo, CoreError> {
     // DllCharacteristics for FORCE_INTEGRITY.
     let opt_header_offset = file_header_offset + size_of::<IMAGE_FILE_HEADER>();
     let has_force_integrity = if data.len() >= opt_header_offset + 2 {
-        let magic_bytes = data.get(opt_header_offset..opt_header_offset + 2)
+        let magic_bytes = data
+            .get(opt_header_offset..opt_header_offset + 2)
             .and_then(|s| s.try_into().ok());
 
         if let Some(bytes) = magic_bytes {
@@ -415,8 +409,10 @@ fn pe_inspect(path: &Path) -> Result<PeInfo, CoreError> {
             };
 
             if dll_char_off > 0 && data.len() >= dll_char_off + 2 {
-                if let Some(bytes) = data.get(dll_char_off..dll_char_off + 2)
-                    .and_then(|s| s.try_into().ok()) {
+                if let Some(bytes) = data
+                    .get(dll_char_off..dll_char_off + 2)
+                    .and_then(|s| s.try_into().ok())
+                {
                     let dll_chars = u16::from_le_bytes(bytes);
                     (dll_chars & IMAGE_DLLCHARACTERISTICS_FORCE_INTEGRITY.0) != 0
                 } else {
@@ -462,12 +458,9 @@ fn make_dll_executable(
 ) -> Result<PathBuf, CoreError> {
     // Build the stub EXE path:  "<original>MM.exe"
     let stub_exe_path = {
-        let name = original_path
-            .as_os_str()
-            .to_str()
-            .ok_or_else(|| CoreError::ProcessCreation(
-                "DLL path contains non-UTF-8 characters".into(),
-            ))?;
+        let name = original_path.as_os_str().to_str().ok_or_else(|| {
+            CoreError::ProcessCreation("DLL path contains non-UTF-8 characters".into())
+        })?;
         let mut new_name = name.to_owned();
         new_name.push_str(STUB_EXE_SUFFIX);
         PathBuf::from(new_name)
@@ -519,21 +512,20 @@ fn make_dll_executable(
     let pe_offset = dos.e_lfanew as usize;
 
     let file_header_offset = pe_offset + 4; // past Signature
-    // SAFETY: data is a mutable Vec covering the PE headers; file_header_offset was verified to be in bounds.
-    let fh = unsafe {
-        &mut *(data.as_mut_ptr().add(file_header_offset) as *mut IMAGE_FILE_HEADER)
-    };
+                                            // SAFETY: data is a mutable Vec covering the PE headers; file_header_offset was verified to be in bounds.
+    let fh = unsafe { &mut *(data.as_mut_ptr().add(file_header_offset) as *mut IMAGE_FILE_HEADER) };
 
     // Step 2: clear IMAGE_FILE_DLL
     fh.Characteristics = IMAGE_FILE_CHARACTERISTICS(fh.Characteristics.0 & !IMAGE_FILE_DLL.0);
 
     let opt_header_offset = file_header_offset + size_of::<IMAGE_FILE_HEADER>();
     let magic = {
-        let bytes = data.get(opt_header_offset..opt_header_offset + 2)
+        let bytes = data
+            .get(opt_header_offset..opt_header_offset + 2)
             .and_then(|s| s.try_into().ok())
-            .ok_or_else(|| CoreError::ProcessCreation(
-                "Failed to read PE magic bytes from stub".into()
-            ))?;
+            .ok_or_else(|| {
+                CoreError::ProcessCreation("Failed to read PE magic bytes from stub".into())
+            })?;
         u16::from_le_bytes(bytes)
     };
 
@@ -559,19 +551,25 @@ fn make_dll_executable(
     // Get entry point, image base, and section headers location.
     let (entry_point_rva, image_base, sections_offset) = if magic == 0x10B {
         // SAFETY: calling a Windows FFI function with validated, properly-lifetime arguments.
-        let opt = unsafe {
-            &*(data.as_ptr().add(opt_header_offset) as *const IMAGE_OPTIONAL_HEADER32)
-        };
+        let opt =
+            unsafe { &*(data.as_ptr().add(opt_header_offset) as *const IMAGE_OPTIONAL_HEADER32) };
         let nt_size = size_of::<IMAGE_NT_HEADERS32>();
-        (opt.AddressOfEntryPoint as u64, opt.ImageBase as u64, pe_offset + nt_size)
+        (
+            opt.AddressOfEntryPoint as u64,
+            opt.ImageBase as u64,
+            pe_offset + nt_size,
+        )
     } else {
         // SAFETY: calling a Windows FFI function with validated, properly-lifetime arguments.
-        let opt = unsafe {
-            &*(data.as_ptr().add(opt_header_offset) as *const IMAGE_OPTIONAL_HEADER64)
-        };
+        let opt =
+            unsafe { &*(data.as_ptr().add(opt_header_offset) as *const IMAGE_OPTIONAL_HEADER64) };
         // Signature(4) + FileHeader(20) + sizeof(OptHeader64)
         let nt_size = 4 + 20 + size_of::<IMAGE_OPTIONAL_HEADER64>();
-        (opt.AddressOfEntryPoint as u64, opt.ImageBase, pe_offset + nt_size)
+        (
+            opt.AddressOfEntryPoint as u64,
+            opt.ImageBase,
+            pe_offset + nt_size,
+        )
     };
 
     // Find the section that contains the entry point.
@@ -585,9 +583,7 @@ fn make_dll_executable(
                 return None;
             }
             // SAFETY: calling a Windows FFI function with validated, properly-lifetime arguments.
-            let sec = unsafe {
-                &*(data.as_ptr().add(secoff) as *const IMAGE_SECTION_HEADER)
-            };
+            let sec = unsafe { &*(data.as_ptr().add(secoff) as *const IMAGE_SECTION_HEADER) };
             let va_start = sec.VirtualAddress as u64;
             let va_end = va_start + sec.SizeOfRawData as u64;
             if entry_point_rva >= va_start && entry_point_rva < va_end {
@@ -597,9 +593,7 @@ fn make_dll_executable(
             }
         })
         .ok_or_else(|| {
-            CoreError::ProcessCreation(
-                "Cannot find the section containing the entry point".into(),
-            )
+            CoreError::ProcessCreation("Cannot find the section containing the entry point".into())
         })?;
 
     // Select stub based on architecture.
@@ -643,13 +637,11 @@ fn make_dll_executable(
     // Patch the image base immediate.
     #[cfg(target_arch = "x86")]
     {
-        stub_bytes[imm_offset..imm_offset + 4]
-            .copy_from_slice(&(image_base as u32).to_le_bytes());
+        stub_bytes[imm_offset..imm_offset + 4].copy_from_slice(&(image_base as u32).to_le_bytes());
     }
     #[cfg(target_arch = "x86_64")]
     {
-        stub_bytes[imm_offset..imm_offset + 8]
-            .copy_from_slice(&image_base.to_le_bytes());
+        stub_bytes[imm_offset..imm_offset + 8].copy_from_slice(&image_base.to_le_bytes());
     }
 
     // The new entry-point RVA:
@@ -661,8 +653,7 @@ fn make_dll_executable(
     let dllmain_disp: i32 = (entry_point_rva as i64)
         .wrapping_sub((new_ep_rva + call_main_offset as u64 + 4) as i64)
         as i32;
-    stub_bytes[call_main_offset..call_main_offset + 4]
-        .copy_from_slice(&dllmain_disp.to_le_bytes());
+    stub_bytes[call_main_offset..call_main_offset + 4].copy_from_slice(&dllmain_disp.to_le_bytes());
 
     // Patch `call <ExitProcess>` displacement.
     // For ExitProcess, we also point to the original entry point (DllMain).
@@ -677,17 +668,14 @@ fn make_dll_executable(
     let exit_disp: i32 = (entry_point_rva as i64)
         .wrapping_sub((new_ep_rva + call_exit_offset as u64 + 4) as i64)
         as i32;
-    stub_bytes[call_exit_offset..call_exit_offset + 4]
-        .copy_from_slice(&exit_disp.to_le_bytes());
+    stub_bytes[call_exit_offset..call_exit_offset + 4].copy_from_slice(&exit_disp.to_le_bytes());
 
     // Write the stub into the file buffer.
-    data[stub_file_offset..stub_file_offset + stub_bytes.len()]
-        .copy_from_slice(&stub_bytes);
+    data[stub_file_offset..stub_file_offset + stub_bytes.len()].copy_from_slice(&stub_bytes);
 
     // Update the entry point field in the optional header.
     let ep_field_off = opt_header_offset + 16; // offset of AddressOfEntryPoint in both PE32 and PE32+
-    data[ep_field_off..ep_field_off + 4]
-        .copy_from_slice(&(new_ep_rva as u32).to_le_bytes());
+    data[ep_field_off..ep_field_off + 4].copy_from_slice(&(new_ep_rva as u32).to_le_bytes());
 
     // Write the modified file back.
     std::fs::write(&stub_exe_path, &data).map_err(|e| {
@@ -720,9 +708,7 @@ fn make_dll_executable(
 ///
 /// Reference: `TDebuggerCore.OnCreateProcessDebugEvent` in `DebuggerCore.pas`
 /// (lines 296–349).
-pub fn patch_peb_anti_debug(
-    process_handle: HANDLE,
-) -> Result<u64, CoreError> {
+pub fn patch_peb_anti_debug(process_handle: HANDLE) -> Result<u64, CoreError> {
     // Step 1: query PEB address via NtQueryInformationProcess.
     let mut pbi = PROCESS_BASIC_INFORMATION::default();
     let mut return_length: u32 = 0;
@@ -772,7 +758,8 @@ pub fn patch_peb_anti_debug(
             (&mut debugged_byte as *mut u8) as *mut std::ffi::c_void,
             1,
             None,
-        ).map(|()| {
+        )
+        .map(|()| {
             if debugged_byte != 0 {
                 debug!("Patching PEB.BeingDebugged (was {})", debugged_byte);
                 let zero: u8 = 0;
@@ -789,7 +776,11 @@ pub fn patch_peb_anti_debug(
 
     // Step 3: read the image base from PEB.
     let image_base_addr = peb_addr + PEB_IMAGE_BASE_OFFSET;
-    let ptr_size = if cfg!(target_arch = "x86") { 4usize } else { 8usize };
+    let ptr_size = if cfg!(target_arch = "x86") {
+        4usize
+    } else {
+        8usize
+    };
     let mut image_base: u64 = 0;
     let mut bytes_read: usize = 0;
 
@@ -803,9 +794,7 @@ pub fn patch_peb_anti_debug(
             Some(&mut bytes_read),
         )
         .map_err(|_| {
-            CoreError::ProcessCreation(
-                "Reading process image base from PEB failed".into(),
-            )
+            CoreError::ProcessCreation("Reading process image base from PEB failed".into())
         })?;
 
         if bytes_read != ptr_size {
@@ -829,7 +818,8 @@ pub fn patch_peb_anti_debug(
             (&mut shim_val as *mut u64) as *mut std::ffi::c_void,
             ptr_size,
             None,
-        ).map(|()| {
+        )
+        .map(|()| {
             if shim_val != 0 {
                 let zero: u64 = 0;
                 let _ = WriteProcessMemory(
@@ -856,10 +846,7 @@ pub fn patch_peb_anti_debug(
 /// Call this after the debug session ends.
 pub fn cleanup_stub_exe(path: &Path) {
     if let Err(e) = std::fs::remove_file(path) {
-        warn!(
-            "Failed to delete stub EXE '{}': {e}",
-            path.display()
-        );
+        warn!("Failed to delete stub EXE '{}': {e}", path.display());
     } else {
         debug!("Deleted stub EXE: {}", path.display());
     }

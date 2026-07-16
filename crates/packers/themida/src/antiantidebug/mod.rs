@@ -83,24 +83,40 @@ pub(crate) const PTR_SIZE: usize = 8;
 pub(crate) mod ctx_arch {
     use windows::Win32::System::Diagnostics::Debug::CONTEXT;
 
-    pub fn stack_ptr(ctx: &CONTEXT) -> usize { ctx.Esp as usize }
-    pub fn set_stack_ptr(ctx: &mut CONTEXT, val: usize) { ctx.Esp = val as u32; }
+    pub fn stack_ptr(ctx: &CONTEXT) -> usize {
+        ctx.Esp as usize
+    }
+    pub fn set_stack_ptr(ctx: &mut CONTEXT, val: usize) {
+        ctx.Esp = val as u32;
+    }
 
-    pub fn set_instr_ptr(ctx: &mut CONTEXT, val: usize) { ctx.Eip = val as u32; }
+    pub fn set_instr_ptr(ctx: &mut CONTEXT, val: usize) {
+        ctx.Eip = val as u32;
+    }
 
-    pub fn set_ret_val(ctx: &mut CONTEXT, val: u32) { ctx.Eax = val; }
+    pub fn set_ret_val(ctx: &mut CONTEXT, val: u32) {
+        ctx.Eax = val;
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod ctx_arch {
     use windows::Win32::System::Diagnostics::Debug::CONTEXT;
 
-    pub fn stack_ptr(ctx: &CONTEXT) -> usize { ctx.Rsp as usize }
-    pub fn set_stack_ptr(ctx: &mut CONTEXT, val: usize) { ctx.Rsp = val as u64; }
+    pub fn stack_ptr(ctx: &CONTEXT) -> usize {
+        ctx.Rsp as usize
+    }
+    pub fn set_stack_ptr(ctx: &mut CONTEXT, val: usize) {
+        ctx.Rsp = val as u64;
+    }
 
-    pub fn set_instr_ptr(ctx: &mut CONTEXT, val: usize) { ctx.Rip = val as u64; }
+    pub fn set_instr_ptr(ctx: &mut CONTEXT, val: usize) {
+        ctx.Rip = val as u64;
+    }
 
-    pub fn set_ret_val(ctx: &mut CONTEXT, val: u32) { ctx.Rax = val as u64; }
+    pub fn set_ret_val(ctx: &mut CONTEXT, val: u32) {
+        ctx.Rax = val as u64;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -113,12 +129,14 @@ pub(crate) mod ctx_arch {
 /// `usize`.
 pub(crate) fn ptr_from_bytes(bytes: &[u8]) -> usize {
     if bytes.len() >= 8 {
-        bytes.get(..8)
+        bytes
+            .get(..8)
             .and_then(|s| s.try_into().ok())
             .map(u64::from_le_bytes)
             .unwrap_or(0) as usize
     } else {
-        bytes.get(..4)
+        bytes
+            .get(..4)
             .and_then(|s| s.try_into().ok())
             .map(u32::from_le_bytes)
             .unwrap_or(0) as usize

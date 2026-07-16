@@ -44,17 +44,17 @@ pub fn restore_stolen_oep_msvc6(
     info!("Stolen MSVC6 OEP detected at {oep:#x}");
 
     let mut restore: [u8; 46] = [
-        0x55, 0x8B, 0xEC, 0x6A, 0xFF,
-        0x68, 0x00, 0x00, 0x00, 0x00, // [5..9]  exception_struct
+        0x55, 0x8B, 0xEC, 0x6A, 0xFF, 0x68, 0x00, 0x00, 0x00,
+        0x00, // [5..9]  exception_struct
         0x68, 0x00, 0x00, 0x00, 0x00, // [10..14] handler
         0x64, 0xA1, 0x00, 0x00, 0x00, 0x00, // [15..20] mov eax, fs:[0]
-        0x50,                               // [21]     push eax
+        0x50, // [21]     push eax
         0x64, 0x89, 0x25, 0x00, 0x00, 0x00, 0x00, // [22..28] mov fs:[0], esp
-        0x83, 0xEC, 0x58,                         // [29..31] sub esp, 58h
-        0x53, 0x56, 0x57,                         // [32..34] push ebx, esi, edi
-        0x89, 0x65, 0xE8,                         // [35..37] mov [ebp-18h], esp
-        0xFF, 0x15, 0x00, 0x00, 0x00, 0x00,       // [38..43] call ds:GetVersion
-        0x33, 0xD2,                               // [44..45] xor edx, edx
+        0x83, 0xEC, 0x58, // [29..31] sub esp, 58h
+        0x53, 0x56, 0x57, // [32..34] push ebx, esi, edi
+        0x89, 0x65, 0xE8, // [35..37] mov [ebp-18h], esp
+        0xFF, 0x15, 0x00, 0x00, 0x00, 0x00, // [38..43] call ds:GetVersion
+        0x33, 0xD2, // [44..45] xor edx, edx
     ];
 
     // 2. Verify that there's a valid return instruction before the stolen OEP gap.
@@ -142,11 +142,11 @@ pub fn restore_stolen_oep_msvc9_dll(
 
     // 3. Write the restore data.
     const RESTORE: [u8; 11] = [
-        0x8B, 0xFF,                         // mov edi, edi
-        0x55,                               // push ebp
-        0x8B, 0xEC,                         // mov ebp, esp
-        0x83, 0x7D, 0x0C, 0x01,            // cmp dword ptr [ebp+0Ch], 1
-        0x75, 0x05,                         // jnz +5
+        0x8B, 0xFF, // mov edi, edi
+        0x55, // push ebp
+        0x8B, 0xEC, // mov ebp, esp
+        0x83, 0x7D, 0x0C, 0x01, // cmp dword ptr [ebp+0Ch], 1
+        0x75, 0x05, // jnz +5
     ];
 
     let stub_addr = oep.wrapping_sub(RESTORE.len());
@@ -188,18 +188,16 @@ pub fn write_msvc_oep_x64(
     };
 
     let mut stub: Vec<u8> = vec![
-        0x48, 0x83, 0xEC, 0x28,       // sub rsp, 28h
+        0x48, 0x83, 0xEC, 0x28, // sub rsp, 28h
         0xE8, 0x00, 0x00, 0x00, 0x00, // call rel32 (placeholder)
-        0x48, 0x83, 0xC4, 0x28,       // add rsp, 28h
+        0x48, 0x83, 0xC4, 0x28, // add rsp, 28h
         0xE9, 0x00, 0x00, 0x00, 0x00, // jmp rel32 (placeholder)
     ];
 
-    let call_disp: i32 = (security_init_cookie_addr as i64)
-        .wrapping_sub((oep + 9) as i64) as i32;
+    let call_disp: i32 = (security_init_cookie_addr as i64).wrapping_sub((oep + 9) as i64) as i32;
     stub[5..9].copy_from_slice(&call_disp.to_le_bytes());
 
-    let jmp_disp: i32 = (scrt_common_main_seh_addr as i64)
-        .wrapping_sub((oep + 18) as i64) as i32;
+    let jmp_disp: i32 = (scrt_common_main_seh_addr as i64).wrapping_sub((oep + 18) as i64) as i32;
     stub[14..18].copy_from_slice(&jmp_disp.to_le_bytes());
 
     let mut old_protect = PAGE_PROTECTION_FLAGS::default();
@@ -251,8 +249,8 @@ fn resolve_get_version_addr(
     image_base: usize,
     base_of_data: usize,
 ) -> Result<usize, ThemidaError> {
-    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::core::PCWSTR;
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 
     let kernel32_name: Vec<u16> = "kernel32.dll\0".encode_utf16().collect();
     // SAFETY: kernel32.dll is always loaded.

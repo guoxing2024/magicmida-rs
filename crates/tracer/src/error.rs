@@ -1,4 +1,4 @@
-﻿//! Error types for the single-step tracer.
+//! Error types for the single-step tracer.
 //!
 //! All errors are expressed as typed enum variants — no stringly-typed
 //! errors. This gives callers a clear, matchable picture of what can go
@@ -70,7 +70,10 @@ impl std::fmt::Display for TraceBreakKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnexpectedBreakpoint => write!(f, "unexpected breakpoint"),
-            Self::AccessViolation { target_address, is_write } => {
+            Self::AccessViolation {
+                target_address,
+                is_write,
+            } => {
                 let rw = if *is_write { "write" } else { "read" };
                 write!(f, "access violation ({rw} at {target_address:#x})")
             }

@@ -146,9 +146,7 @@ pub(crate) fn install_tls_callback_bootstrap(
     let tls_rva = pe.sections[tls_section_idx].virtual_address;
 
     let tls_data = build_tls_directory(
-        image_base,
-        tls_rva,
-        boot_rva, // bootstrap is the TLS callback
+        image_base, tls_rva, boot_rva, // bootstrap is the TLS callback
     );
 
     let tls_section = &mut pe.sections[tls_section_idx];
@@ -246,7 +244,9 @@ mod tests {
         // Check callback entry
         let callback_offset = TLS_DIRECTORY_SIZE + 8;
         let callback_va = u64::from_le_bytes(
-            data[callback_offset..callback_offset + 8].try_into().unwrap()
+            data[callback_offset..callback_offset + 8]
+                .try_into()
+                .unwrap(),
         );
         assert_eq!(callback_va, 0x140002000); // image_base + bootstrap_rva
     }

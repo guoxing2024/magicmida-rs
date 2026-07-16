@@ -1,4 +1,4 @@
-﻿//! Code section guard for Themida unpacking.
+//! Code section guard for Themida unpacking.
 //!
 //! Sets `.text` to `PAGE_NOACCESS` so writes/executes from the packer
 //! trigger access violations that the debugger intercepts.
@@ -16,8 +16,8 @@
 use tracing::{debug, info, trace};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Memory::{
-    VirtualProtectEx, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
-    PAGE_NOACCESS, PAGE_PROTECTION_FLAGS,
+    VirtualProtectEx, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_NOACCESS,
+    PAGE_PROTECTION_FLAGS,
 };
 
 use mida_core::DebuggerCore;
@@ -79,7 +79,9 @@ pub fn install_iat_guard(
     iat_size: usize,
 ) -> Result<(), ThemidaError> {
     if iat_size == 0 {
-        return Err(ThemidaError::Debugger("IAT guard: size cannot be zero".into()));
+        return Err(ThemidaError::Debugger(
+            "IAT guard: size cannot be zero".into(),
+        ));
     }
     let mut old_protect = PAGE_PROTECTION_FLAGS::default();
     // SAFETY: h_process is a valid process handle; iat_start/text_section_start is a valid virtual address; old_protect is a valid out-pointer.
@@ -92,8 +94,16 @@ pub fn install_iat_guard(
             &mut old_protect,
         )
     }
-    .map_err(|e| ThemidaError::Debugger(format!("VirtualProtectEx failed for IAT guard at {iat_start:#x}: {e}")))?;
-    debug!("IAT guard installed: {:#x} – {:#x} (PAGE_NOACCESS)", iat_start, iat_start + iat_size);
+    .map_err(|e| {
+        ThemidaError::Debugger(format!(
+            "VirtualProtectEx failed for IAT guard at {iat_start:#x}: {e}"
+        ))
+    })?;
+    debug!(
+        "IAT guard installed: {:#x} – {:#x} (PAGE_NOACCESS)",
+        iat_start,
+        iat_start + iat_size
+    );
     Ok(())
 }
 
@@ -136,7 +146,11 @@ pub fn re_guard_iat(
         )
     }
     .map_err(|e| ThemidaError::Debugger(format!("VirtualProtectEx re-guard IAT: {e}")))?;
-    debug!("IAT guard re-installed: {:#x} – {:#x}", iat_start, iat_start + iat_size);
+    debug!(
+        "IAT guard re-installed: {:#x} – {:#x}",
+        iat_start,
+        iat_start + iat_size
+    );
     Ok(())
 }
 
@@ -148,7 +162,9 @@ pub fn install_code_section_guard(
     protection: u32,
 ) -> Result<(), ThemidaError> {
     if text_section_size == 0 {
-        return Err(ThemidaError::Debugger("Code section guard: size cannot be zero".into()));
+        return Err(ThemidaError::Debugger(
+            "Code section guard: size cannot be zero".into(),
+        ));
     }
     let mut old_protect = PAGE_PROTECTION_FLAGS::default();
     // SAFETY: h_process is a valid process handle; iat_start/text_section_start is a valid virtual address; old_protect is a valid out-pointer.
@@ -161,8 +177,17 @@ pub fn install_code_section_guard(
             &mut old_protect,
         )
     }
-    .map_err(|e| ThemidaError::Debugger(format!("VirtualProtectEx failed for code section guard at {text_section_start:#x}: {e}")))?;
-    debug!("Code section guard installed: {:#x} – {:#x} (protection: {:#x})", text_section_start, text_section_start + text_section_size, protection);
+    .map_err(|e| {
+        ThemidaError::Debugger(format!(
+            "VirtualProtectEx failed for code section guard at {text_section_start:#x}: {e}"
+        ))
+    })?;
+    debug!(
+        "Code section guard installed: {:#x} – {:#x} (protection: {:#x})",
+        text_section_start,
+        text_section_start + text_section_size,
+        protection
+    );
     Ok(())
 }
 
@@ -404,7 +429,10 @@ pub fn restore_code_section_guard(
         )
     }
     .map_err(|e| ThemidaError::Debugger(format!("VirtualProtectEx in restore guard: {e}")))?;
-    trace!("Code section guard restored (protection: {:#x})", protection);
+    trace!(
+        "Code section guard restored (protection: {:#x})",
+        protection
+    );
     Ok(())
 }
 
@@ -456,7 +484,9 @@ pub fn switch_to_iat_monitoring(
     let iat_size = state.guard_end - state.guard_start;
 
     if iat_size == 0 {
-        return Err(ThemidaError::Debugger("IAT monitoring: IAT size is zero".into()));
+        return Err(ThemidaError::Debugger(
+            "IAT monitoring: IAT size is zero".into(),
+        ));
     }
 
     // Install the IAT guard.
@@ -467,7 +497,9 @@ pub fn switch_to_iat_monitoring(
 
     info!(
         "IAT monitoring enabled: guard {:#x}–{:#x} ({} bytes)",
-        iat_addr, iat_addr + iat_size, iat_size
+        iat_addr,
+        iat_addr + iat_size,
+        iat_size
     );
 
     Ok((iat_addr, iat_size))
@@ -565,7 +597,8 @@ fn enable_trap_flag(debugger: &dyn DebuggerCore, thread_id: u32) -> Result<(), T
     // Use CONTEXT_CONTROL-only read to avoid ERROR_PARTIAL_COPY on
     // Themida-protected targets.  Only EFlags is modified; debug registers
     // are preserved by scoping ContextFlags to CONTEXT_CONTROL on write.
-    let mut ctx = debugger.get_thread_context_control(thread_id)
+    let mut ctx = debugger
+        .get_thread_context_control(thread_id)
         .map_err(|e| ThemidaError::Debugger(format!("get_thread_context_control for TF: {e}")))?;
     ctx.EFlags |= 0x100;
     // Re-scope ContextFlags to CONTROL only so SetThreadContext does not
@@ -578,7 +611,8 @@ fn enable_trap_flag(debugger: &dyn DebuggerCore, thread_id: u32) -> Result<(), T
     {
         ctx.ContextFlags = windows::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_X86;
     }
-    debugger.set_thread_context(thread_id, &ctx)
+    debugger
+        .set_thread_context(thread_id, &ctx)
         .map_err(|e| ThemidaError::Debugger(format!("set_thread_context for TF: {e}")))?;
     trace!(thread_id, "Trap flag (TF) set for single-step");
     Ok(())

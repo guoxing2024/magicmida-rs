@@ -9,10 +9,7 @@
 /// mov rax, [rip+0x1038f5]  ; Load API address from IAT
 /// call rax                 ; Call it
 /// ```
-pub fn find_all_iat_references(
-    text: &[u8],
-    text_base: usize,
-) -> Vec<usize> {
+pub fn find_all_iat_references(text: &[u8], text_base: usize) -> Vec<usize> {
     use std::collections::HashSet;
     let mut iat_refs = HashSet::new();
 
@@ -32,12 +29,8 @@ pub fn find_all_iat_references(
                 // Check if it's [rip+disp32] addressing (ModR/M = 0x05, 0x0D, 0x15, 0x1D, 0x25, 0x2D, 0x35, 0x3D)
                 if (modrm & 0xC7) == 0x05 {
                     let ip = text_base + i;
-                    let disp32 = i32::from_le_bytes([
-                        text[i + 3],
-                        text[i + 4],
-                        text[i + 5],
-                        text[i + 6],
-                    ]);
+                    let disp32 =
+                        i32::from_le_bytes([text[i + 3], text[i + 4], text[i + 5], text[i + 6]]);
                     // Calculate effective address: RIP after instruction + displacement
                     let iat_addr = (ip as i64 + 7 + disp32 as i64) as usize;
 
@@ -54,12 +47,7 @@ pub fn find_all_iat_references(
     for i in 0..text.len().saturating_sub(6) {
         if text[i] == 0xFF && (text[i + 1] == 0x15 || text[i + 1] == 0x25) {
             let ip = text_base + i;
-            let disp32 = i32::from_le_bytes([
-                text[i + 2],
-                text[i + 3],
-                text[i + 4],
-                text[i + 5],
-            ]);
+            let disp32 = i32::from_le_bytes([text[i + 2], text[i + 3], text[i + 4], text[i + 5]]);
             let iat_addr = (ip as i64 + 6 + disp32 as i64) as usize;
 
             if iat_addr < text_base || iat_addr >= text_base + text.len() {

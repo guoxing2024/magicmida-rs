@@ -60,7 +60,10 @@ pub(crate) fn install_heap_bootstrap(
             50,
         );
 
-        info!("Detected {} critical variables from OEP", critical_rvas.len());
+        info!(
+            "Detected {} critical variables from OEP",
+            critical_rvas.len()
+        );
 
         // Capture runtime values if debugger available
         let global_vars = if let Some(dbg) = debugger {

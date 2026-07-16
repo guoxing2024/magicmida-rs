@@ -14,9 +14,7 @@
 mod restore;
 
 // Re-export the restoration functions from the `restore` submodule.
-pub use restore::{
-    restore_stolen_oep_msvc6, restore_stolen_oep_msvc9_dll, write_msvc_oep_x64,
-};
+pub use restore::{restore_stolen_oep_msvc6, restore_stolen_oep_msvc9_dll, write_msvc_oep_x64};
 
 use tracing::{debug, info, warn};
 
@@ -291,7 +289,10 @@ pub fn try_find_correct_oep_by_range(
     let scan_size = scan_end.saturating_sub(scan_start);
 
     if scan_size < 10 {
-        warn!(oep = format_args!("{oep:#x}"), "OEP search window too small");
+        warn!(
+            oep = format_args!("{oep:#x}"),
+            "OEP search window too small"
+        );
         return Ok(None);
     }
 
@@ -401,15 +402,18 @@ pub fn handle_tls_callbacks(
             });
         }
 
-        let arg0 = args_bytes.get(0..4)
+        let arg0 = args_bytes
+            .get(0..4)
             .and_then(|s| s.try_into().ok())
             .map(u32::from_le_bytes)
             .unwrap_or(0);
-        let arg1 = args_bytes.get(4..8)
+        let arg1 = args_bytes
+            .get(4..8)
             .and_then(|s| s.try_into().ok())
             .map(u32::from_le_bytes)
             .unwrap_or(0);
-        let _arg2 = args_bytes.get(8..12)
+        let _arg2 = args_bytes
+            .get(8..12)
             .and_then(|s| s.try_into().ok())
             .map(u32::from_le_bytes)
             .unwrap_or(0);
@@ -421,16 +425,16 @@ pub fn handle_tls_callbacks(
                 *tls_counter, tls_total,
             );
 
-            let mut ctx = debugger
-                .get_thread_context(thread_id)
-                .map_err(|e| ThemidaError::Debugger(format!("get_thread_context for TLS skip: {e}")))?;
+            let mut ctx = debugger.get_thread_context(thread_id).map_err(|e| {
+                ThemidaError::Debugger(format!("get_thread_context for TLS skip: {e}"))
+            })?;
 
             ctx.Eip = ret_addr as u32;
             ctx.Esp = (sp + 4 + 12) as u32;
 
-            debugger
-                .set_thread_context(thread_id, &ctx)
-                .map_err(|e| ThemidaError::Debugger(format!("set_thread_context for TLS skip: {e}")))?;
+            debugger.set_thread_context(thread_id, &ctx).map_err(|e| {
+                ThemidaError::Debugger(format!("set_thread_context for TLS skip: {e}"))
+            })?;
 
             return Ok(TlsCallbackResult {
                 oep_found: false,

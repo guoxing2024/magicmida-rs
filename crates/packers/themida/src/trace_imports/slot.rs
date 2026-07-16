@@ -11,11 +11,11 @@ use mida_tracer::LogMsgType;
 use crate::common::ThemidaState;
 use crate::error::ThemidaError;
 
-use super::{
-    TRACE_LIMIT, is_at_themida_vm, instr_ptr, set_instr_ptr, set_stack_ptr, set_trap_flag,
-    stack_ptr, thread_id_of, PTR_SIZE,
-};
 use super::decision::{trace_is_at_api, TraceStepDecision};
+use super::{
+    instr_ptr, is_at_themida_vm, set_instr_ptr, set_stack_ptr, set_trap_flag, stack_ptr,
+    thread_id_of, PTR_SIZE, TRACE_LIMIT,
+};
 
 /// Run the single-step trace for one IAT slot.
 ///
@@ -88,21 +88,16 @@ pub(crate) fn trace_one_slot(
 
                     // Check instruction limit.
                     if counter > limit {
-                        log(
-                            LogMsgType::Info,
-                            "Giving up trace due to instruction limit",
-                        );
+                        log(LogMsgType::Info, "Giving up trace due to instruction limit");
                         return Ok(());
                     }
 
                     // Fetch latest context.
-                    ctx = debugger
-                        .get_thread_context(thread_id)
-                        .map_err(|e| {
-                            ThemidaError::Debugger(format!(
-                                "trace_one_slot context at {address:#x}: {e}"
-                            ))
-                        })?;
+                    ctx = debugger.get_thread_context(thread_id).map_err(|e| {
+                        ThemidaError::Debugger(format!(
+                            "trace_one_slot context at {address:#x}: {e}"
+                        ))
+                    })?;
 
                     let ip = instr_ptr(&ctx);
                     let sp = stack_ptr(&ctx);
@@ -141,9 +136,10 @@ pub(crate) fn trace_one_slot(
                             );
                             return Ok(());
                         }
-                        TraceStepDecision::SkipAntiTraceApi { ip: _, ret_addr: target_ip }
-                            if target_ip != 0 =>
-                        {
+                        TraceStepDecision::SkipAntiTraceApi {
+                            ip: _,
+                            ret_addr: target_ip,
+                        } if target_ip != 0 => {
                             log(
                                 LogMsgType::Info,
                                 &format!("Skipping anti-trace API at {ip:#x}"),
@@ -159,13 +155,11 @@ pub(crate) fn trace_one_slot(
                             }
                             set_instr_ptr(&mut ctx, target_ip);
                             ctx.EFlags |= 0x100;
-                            debugger
-                                .set_thread_context(thread_id, &ctx)
-                                .map_err(|e| {
-                                    ThemidaError::Debugger(format!(
-                                        "skip_anti_trace_api set_context: {e}"
-                                    ))
-                                })?;
+                            debugger.set_thread_context(thread_id, &ctx).map_err(|e| {
+                                ThemidaError::Debugger(format!(
+                                    "skip_anti_trace_api set_context: {e}"
+                                ))
+                            })?;
                             debugger
                                 .continue_event(thread_id, ContinueStatus::Continue)
                                 .map_err(|e| {
@@ -190,20 +184,14 @@ pub(crate) fn trace_one_slot(
 
                     // Re-set TF so the next instruction also single-steps.
                     ctx.EFlags |= 0x100;
-                    debugger
-                        .set_thread_context(thread_id, &ctx)
-                        .map_err(|e| {
-                            ThemidaError::Debugger(format!(
-                                "trace_one_slot set_tf: {e}"
-                            ))
-                        })?;
+                    debugger.set_thread_context(thread_id, &ctx).map_err(|e| {
+                        ThemidaError::Debugger(format!("trace_one_slot set_tf: {e}"))
+                    })?;
 
                     debugger
                         .continue_event(thread_id, ContinueStatus::Continue)
                         .map_err(|e| {
-                            ThemidaError::Debugger(format!(
-                                "trace_one_slot continue: {e}"
-                            ))
+                            ThemidaError::Debugger(format!("trace_one_slot continue: {e}"))
                         })?;
                 }
 
@@ -221,9 +209,7 @@ pub(crate) fn trace_one_slot(
                         DebugEvent::Breakpoint { .. } => {
                             format!("unexpected breakpoint at {address:#x}")
                         }
-                        DebugEvent::AccessViolation {
-                            target_address, ..
-                        } => {
+                        DebugEvent::AccessViolation { target_address, .. } => {
                             format!(
                                 "access violation at {address:#x} \
                                  (target {target_address:#x})"
@@ -247,16 +233,11 @@ pub(crate) fn trace_one_slot(
 
                 // Non-exception events on our thread — continue.
                 _ => {
-                    debug!(
-                        thread_id,
-                        "trace_one_slot continuing non-exception event"
-                    );
+                    debug!(thread_id, "trace_one_slot continuing non-exception event");
                     debugger
                         .continue_event(thread_id, ContinueStatus::Continue)
                         .map_err(|e| {
-                            ThemidaError::Debugger(format!(
-                                "trace_one_slot continue non-exc: {e}"
-                            ))
+                            ThemidaError::Debugger(format!("trace_one_slot continue non-exc: {e}"))
                         })?;
                 }
             }
@@ -270,9 +251,7 @@ pub(crate) fn trace_one_slot(
             debugger
                 .continue_event(event_thread_id, ContinueStatus::Continue)
                 .map_err(|e| {
-                    ThemidaError::Debugger(format!(
-                        "trace_one_slot continue other thread: {e}"
-                    ))
+                    ThemidaError::Debugger(format!("trace_one_slot continue other thread: {e}"))
                 })?;
         }
     }

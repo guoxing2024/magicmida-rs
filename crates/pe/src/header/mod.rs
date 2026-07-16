@@ -264,17 +264,15 @@ impl PeHeader {
         let nt_offset = e_lfanew as usize;
         let min_nt_size = SIGNATURE_SIZE + FILE_HEADER_SIZE;
         if data.len() < nt_offset + min_nt_size {
-            return Err(PeError::BufferTooSmall(
-                nt_offset + min_nt_size,
-                data.len(),
-            ));
+            return Err(PeError::BufferTooSmall(nt_offset + min_nt_size, data.len()));
         }
 
         let nt_slice = &data[nt_offset..];
 
         // 3. Signature
         let sig_bytes = &nt_slice[0..4];
-        let signature = u32::from_le_bytes([sig_bytes[0], sig_bytes[1], sig_bytes[2], sig_bytes[3]]);
+        let signature =
+            u32::from_le_bytes([sig_bytes[0], sig_bytes[1], sig_bytes[2], sig_bytes[3]]);
         if signature != PE_SIGNATURE {
             return Err(PeError::InvalidPeSignature);
         }
@@ -628,7 +626,7 @@ pub(crate) fn make_minimal_pe64() -> Vec<u8> {
     // DOS header
     buf[0] = 0x4D; // 'M'
     buf[1] = 0x5A; // 'Z'
-    // e_lfanew at offset 60 → point to 0x40 (64)
+                   // e_lfanew at offset 60 → point to 0x40 (64)
     buf[60] = 0x40;
     buf[61] = 0x00;
     buf[62] = 0x00;

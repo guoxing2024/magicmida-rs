@@ -48,10 +48,7 @@ pub(super) fn create_data_sections_msvc(
     let base_of_data: u32 = if pe.is_64bit {
         pe.sections[0].virtual_address + pe.nt_headers.optional_header.size_of_code
     } else {
-        pe.nt_headers
-            .optional_header
-            .base_of_data
-            .unwrap_or(0)
+        pe.nt_headers.optional_header.base_of_data.unwrap_or(0)
     };
 
     // Verify that code and data are actually merged into the first section.
@@ -74,8 +71,12 @@ pub(super) fn create_data_sections_msvc(
     }
 
     // Locate the dyn_tls_init_callback variable to find the .data boundary.
-    let dyn_tls_rva =
-        find_dyn_tls_msvc14(text_section_data, text_section_rva, pe.is_64bit, pe.image_base);
+    let dyn_tls_rva = find_dyn_tls_msvc14(
+        text_section_data,
+        text_section_rva,
+        pe.is_64bit,
+        pe.image_base,
+    );
 
     // Compute the start of .data.
     // If we found the TLS callback, round its address up to the next page so
@@ -150,10 +151,14 @@ pub(super) fn create_data_sections_msvc(
 
     // --- Shrink .text (section 0) ---
     let total_split = rdata_size + data_size;
-    pe.sections[0].header.virtual_size =
-        pe.sections[0].header.virtual_size.saturating_sub(total_split);
-    pe.sections[0].header.size_of_raw_data =
-        pe.sections[0].header.size_of_raw_data.saturating_sub(total_split);
+    pe.sections[0].header.virtual_size = pe.sections[0]
+        .header
+        .virtual_size
+        .saturating_sub(total_split);
+    pe.sections[0].header.size_of_raw_data = pe.sections[0]
+        .header
+        .size_of_raw_data
+        .saturating_sub(total_split);
     update_section_from_header(&mut pe.sections[0]);
 
     // --- Rename .text and drop WRITE ---
@@ -162,8 +167,11 @@ pub(super) fn create_data_sections_msvc(
     update_section_from_header(&mut pe.sections[0]);
 
     // Update section count and size-of-image.
-    pe.nt_headers.file_header.number_of_sections =
-        pe.nt_headers.file_header.number_of_sections.saturating_add(2);
+    pe.nt_headers.file_header.number_of_sections = pe
+        .nt_headers
+        .file_header
+        .number_of_sections
+        .saturating_add(2);
     recalc_size_of_image(pe);
 
     info!(
@@ -255,9 +263,7 @@ fn find_dyn_tls_x64(text_section_data: &[u8], text_section_rva: u32) -> Option<u
         // We accept it if it's beyond the scanned range (which is .text).
         let text_end = text_section_rva + text_section_data.len() as u32;
         if target_rva > text_end || target_rva < text_section_rva {
-            debug!(
-                "Found lea rcx, [rip+disp] at RVA {instr_rva:#x} → target {target_rva:#x}"
-            );
+            debug!("Found lea rcx, [rip+disp] at RVA {instr_rva:#x} → target {target_rva:#x}");
             return Some(target_rva);
         }
     }

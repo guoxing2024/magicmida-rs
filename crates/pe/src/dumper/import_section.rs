@@ -30,7 +30,10 @@ pub(crate) fn build_import_table_from_original(
     // Read import table structure (we don't need RVAs - output PE will have different layout)
     let imports = crate::original_imports::read_original_import_table(original_path);
 
-    debug!("build_import_table_from_original: Got {} DLLs", imports.len());
+    debug!(
+        "build_import_table_from_original: Got {} DLLs",
+        imports.len()
+    );
 
     if imports.is_empty() {
         return None;
@@ -66,8 +69,11 @@ pub(crate) fn build_import_table_from_original(
         }
     }
 
-    debug!("build_import_table_from_original: Built table with {} modules, {} thunks",
-        builder.modules.len(), builder.thunk_count());
+    debug!(
+        "build_import_table_from_original: Built table with {} modules, {} thunks",
+        builder.modules.len(),
+        builder.thunk_count()
+    );
 
     Some(builder)
 }

@@ -182,10 +182,7 @@ pub fn inject_scylla_hide(pid: u32, config: &ScyllaHideConfig) -> Result<(), The
             if status.success() {
                 info!("ScyllaHide injection completed successfully");
             } else {
-                warn!(
-                    ?status,
-                    "ScyllaHide injector exited with non-zero status"
-                );
+                warn!(?status, "ScyllaHide injector exited with non-zero status");
             }
         }
         Ok(None) => {
