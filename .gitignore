@@ -37,5 +37,11 @@ scylla_hide.ini
 run_unpack.bat
 unpack_*.log
 
+# Test unpacked executables
+*_unpacked.exe
+verified*.exe
+test_*.exe
+launcher_*.exe
+
 # Reference materials (copyright risk - do not upload)
 reference/
