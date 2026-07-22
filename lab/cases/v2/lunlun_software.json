@@ -1,0 +1,61 @@
+{
+  "$schema": "./case-manifest.schema.json",
+  "schema_version": "mida.case-manifest/v2",
+  "manifest_revision": 1,
+  "case_id": "lunlun_software",
+  "display_name": "Lunlun software sample",
+  "primary_artifact_sha256": "8a0118d04e03752728999c845536c29215d2a626ac65845c22e3f1149de0db07",
+  "artifacts": [
+    {
+      "sha256": "8a0118d04e03752728999c845536c29215d2a626ac65845c22e3f1149de0db07",
+      "size_bytes": 4976144,
+      "role": "protected_input"
+    }
+  ],
+  "capability_cell": {
+    "platform": "windows",
+    "binary_format": "pe",
+    "architecture": "x86_64",
+    "execution_model": "native",
+    "protection_family": "oreans_candidate",
+    "engine_route": "mida_plugin_oreans",
+    "corpus_role": "development"
+  },
+  "static_fingerprint": {
+    "artifact_sha256": "8a0118d04e03752728999c845536c29215d2a626ac65845c22e3f1149de0db07",
+    "evidence_basis": "retained_static_report",
+    "pe_kind": "PE32+",
+    "coff_machine": "0x8664",
+    "image_base": "0x140000000",
+    "entry_rva": "0x885058",
+    "entry_section": ".boot",
+    "section_count": 13,
+    "import_descriptor_count": 17,
+    "has_tls": true,
+    "has_relocations": true,
+    "observed_markers": [
+      "section:.boot",
+      "section:.themida"
+    ]
+  },
+  "execution_policy": {
+    "dynamic": {
+      "mode": "explicit_authorization_required",
+      "fixed_sha256": "8a0118d04e03752728999c845536c29215d2a626ac65845c22e3f1149de0db07",
+      "timeout_seconds": 120,
+      "process_tree_accounting_required": true
+    },
+    "network": {
+      "mode": "deny_all",
+      "network_actions_allowed": false,
+      "isolation_evidence_required": true
+    }
+  },
+  "oracle": {
+    "oracle_id": null,
+    "kind": "none",
+    "artifact_sha256": null,
+    "authority": "none",
+    "use": "none"
+  }
+}

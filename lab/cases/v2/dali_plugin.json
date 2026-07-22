@@ -1,0 +1,62 @@
+{
+  "$schema": "./case-manifest.schema.json",
+  "schema_version": "mida.case-manifest/v2",
+  "manifest_revision": 1,
+  "case_id": "dali_plugin",
+  "display_name": "Dali plugin sample",
+  "primary_artifact_sha256": "e4f48d5a13589bd7232268d4836f1b7581983536f3310cc066f04d463873165d",
+  "artifacts": [
+    {
+      "sha256": "e4f48d5a13589bd7232268d4836f1b7581983536f3310cc066f04d463873165d",
+      "size_bytes": 6129664,
+      "role": "protected_input"
+    }
+  ],
+  "capability_cell": {
+    "platform": "windows",
+    "binary_format": "pe",
+    "architecture": "x86",
+    "execution_model": "managed_host_candidate",
+    "protection_family": "packed_managed_candidate",
+    "engine_route": "out_of_scope",
+    "corpus_role": "research"
+  },
+  "static_fingerprint": {
+    "artifact_sha256": "e4f48d5a13589bd7232268d4836f1b7581983536f3310cc066f04d463873165d",
+    "evidence_basis": "retained_static_report",
+    "pe_kind": "PE32",
+    "coff_machine": "0x014c",
+    "image_base": "0x400000",
+    "entry_rva": "0x48b6cc",
+    "entry_section": ".?)<",
+    "section_count": 6,
+    "import_descriptor_count": 1,
+    "has_tls": false,
+    "has_relocations": true,
+    "observed_markers": [
+      "directory:clr",
+      "import:mscoree.dll",
+      "raw0_exec_sections"
+    ]
+  },
+  "execution_policy": {
+    "dynamic": {
+      "mode": "explicit_authorization_required",
+      "fixed_sha256": "e4f48d5a13589bd7232268d4836f1b7581983536f3310cc066f04d463873165d",
+      "timeout_seconds": 120,
+      "process_tree_accounting_required": true
+    },
+    "network": {
+      "mode": "deny_all",
+      "network_actions_allowed": false,
+      "isolation_evidence_required": true
+    }
+  },
+  "oracle": {
+    "oracle_id": null,
+    "kind": "none",
+    "artifact_sha256": null,
+    "authority": "none",
+    "use": "none"
+  }
+}

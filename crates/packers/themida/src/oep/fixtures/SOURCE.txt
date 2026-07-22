@@ -1,20 +1,62 @@
 {
-  "fixture_id": "b6_real_crt_windows",
-  "source_pe": "cases/lunlun_software/runs/s3_10_10_b6_20260720_234544/lunlun_s3_10_10_b6_no_shrink_oep_crt_unpacked.exe",
-  "source_pe_note": "Original filename uses CJK product prefix; ASCII alias used here for stable UTF-8 provenance parsing.",
+  "schema": "mida.fixture-provenance/v1",
+  "fixture_set": "b6_real_crt_windows",
   "source_sha256": "2DDDAF17AD25D370DDA9C0FBEB8A17C1E6A491DB1222F279D70F8420AB5D2871",
   "source_size": 12980224,
-  "cookie_rva": "0x1F6F80",
-  "complement_rva": "0x1F6FC0",
+  "extracted": "offline",
   "cookie_storage_section": {
-    "name": "",
     "rva": "0x1F3000",
     "virtual_size": "0xA5CC",
-    "characteristics": "0xC0000040",
-    "readable": true,
-    "writable": true,
-    "executable": false
+    "characteristics": "0xC0000040"
   },
-  "extracted": "offline",
-  "purpose": "B7.1/B7.2 unit fixtures — no live unpack"
+  "source_artifact": {
+    "sha256": "2DDDAF17AD25D370DDA9C0FBEB8A17C1E6A491DB1222F279D70F8420AB5D2871",
+    "size_bytes": 12980224,
+    "vault_role": "lunlun_b6_failure_representative",
+    "legacy_name": "lunlun_s3_10_10_b6_no_shrink_oep_crt_unpacked.exe"
+  },
+  "extraction_mode": "offline",
+  "purpose": "Minimal deterministic unit fixtures; no live unpacking required.",
+  "fixtures": [
+    {
+      "name": "common_main_165df8.bin",
+      "size_bytes": 64,
+      "sha256": "ed7aaf098ebaf405c5b59d940751234f00cd25150887c28a5a760d9243a2d96d"
+    },
+    {
+      "name": "complement_1f6fc0.bin",
+      "size_bytes": 8,
+      "sha256": "d28c90c6e32a19038eb35ef9fe40c18972e4280ae91df70df6ac1421955572c8"
+    },
+    {
+      "name": "cookie_1f6f80.bin",
+      "size_bytes": 8,
+      "sha256": "8b6c58e749b9dc0ee6ec7b4b027fb1c3c486b484e1f0c143369fab5b454074d4"
+    },
+    {
+      "name": "cookie_init_1661f0.bin",
+      "size_bytes": 176,
+      "sha256": "18f9c0b69c9ab813b32f8ed3dc51710975dfed4003037f15a4e18b00361cc468"
+    },
+    {
+      "name": "data_1f6f00_1f7000.bin",
+      "size_bytes": 256,
+      "sha256": "3dfff45fff7f8ce356a052eea2277587156e41143f3028ea2a244a9470fc41ef"
+    },
+    {
+      "name": "text_crt_165000_166300.bin",
+      "size_bytes": 4864,
+      "sha256": "c38d4f9f6b6441e865cff63733df732ed3751bd0321d293e7ceb3291805e26ad"
+    },
+    {
+      "name": "tls_helper_165290.bin",
+      "size_bytes": 48,
+      "sha256": "b8ce8898ac4788fb71d476abdad69cb0b33dc570373f960537fae9f01ae7c55a"
+    },
+    {
+      "name": "wrapper_wrong_165f6c.bin",
+      "size_bytes": 18,
+      "sha256": "1907798146936c28f95d8a2b43c3e7b4d582c08049b7c183645d3b15dd83eef3"
+    }
+  ]
 }

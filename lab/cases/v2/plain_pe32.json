@@ -1,0 +1,60 @@
+{
+  "$schema": "./case-manifest.schema.json",
+  "schema_version": "mida.case-manifest/v2",
+  "manifest_revision": 1,
+  "case_id": "plain_pe32",
+  "display_name": "Minimal plain PE32 control",
+  "primary_artifact_sha256": "5ae16f20b1131e0e030a5f364340fe20d5425be4684bb1b2514ed4ebbb137df3",
+  "artifacts": [
+    {
+      "sha256": "5ae16f20b1131e0e030a5f364340fe20d5425be4684bb1b2514ed4ebbb137df3",
+      "size_bytes": 1024,
+      "role": "synthetic_control"
+    }
+  ],
+  "capability_cell": {
+    "platform": "windows",
+    "binary_format": "pe",
+    "architecture": "x86",
+    "execution_model": "synthetic",
+    "protection_family": "unprotected_fixture",
+    "engine_route": "generic_static_control",
+    "corpus_role": "negative_control"
+  },
+  "static_fingerprint": {
+    "artifact_sha256": "5ae16f20b1131e0e030a5f364340fe20d5425be4684bb1b2514ed4ebbb137df3",
+    "evidence_basis": "direct_header_parse",
+    "pe_kind": "PE32",
+    "coff_machine": "0x014c",
+    "image_base": "0x400000",
+    "entry_rva": "0x1000",
+    "entry_section": ".text",
+    "section_count": 1,
+    "import_descriptor_count": 0,
+    "has_tls": false,
+    "has_relocations": false,
+    "observed_markers": [
+      "synthetic_minimal_pe"
+    ]
+  },
+  "execution_policy": {
+    "dynamic": {
+      "mode": "forbidden",
+      "fixed_sha256": null,
+      "timeout_seconds": null,
+      "process_tree_accounting_required": true
+    },
+    "network": {
+      "mode": "deny_all",
+      "network_actions_allowed": false,
+      "isolation_evidence_required": false
+    }
+  },
+  "oracle": {
+    "oracle_id": "plain_pe32.static_fixture.5ae16f20.v1",
+    "kind": "static_fixture_definition",
+    "artifact_sha256": "5ae16f20b1131e0e030a5f364340fe20d5425be4684bb1b2514ed4ebbb137df3",
+    "authority": "fixture_contract",
+    "use": "router_negative_control"
+  }
+}

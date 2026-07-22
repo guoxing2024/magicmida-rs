@@ -1,0 +1,66 @@
+{
+  "$schema": "./case-manifest.schema.json",
+  "schema_version": "mida.case-manifest/v2",
+  "manifest_revision": 1,
+  "case_id": "origin_macro",
+  "display_name": "Origin macro sample",
+  "primary_artifact_sha256": "1af62999cf5be0b2f21abc39034c122a42aa46cfbfdb546faa184de37ac09ac7",
+  "artifacts": [
+    {
+      "sha256": "1af62999cf5be0b2f21abc39034c122a42aa46cfbfdb546faa184de37ac09ac7",
+      "size_bytes": 5232656,
+      "role": "protected_input"
+    },
+    {
+      "sha256": "fe92f992bcf07e630c82ff3a1cfc138a8c2463e3e03f862da171e8781119268f",
+      "size_bytes": 1696768,
+      "role": "legacy_oracle_candidate"
+    }
+  ],
+  "capability_cell": {
+    "platform": "windows",
+    "binary_format": "pe",
+    "architecture": "x86_64",
+    "execution_model": "native",
+    "protection_family": "oreans_candidate",
+    "engine_route": "mida_plugin_oreans",
+    "corpus_role": "regression"
+  },
+  "static_fingerprint": {
+    "artifact_sha256": "1af62999cf5be0b2f21abc39034c122a42aa46cfbfdb546faa184de37ac09ac7",
+    "evidence_basis": "retained_static_report",
+    "pe_kind": "PE32+",
+    "coff_machine": "0x8664",
+    "image_base": "0x140000000",
+    "entry_rva": "0x8c8058",
+    "entry_section": ".boot",
+    "section_count": 16,
+    "import_descriptor_count": 11,
+    "has_tls": true,
+    "has_relocations": true,
+    "observed_markers": [
+      "section:.boot",
+      "section:.winlice"
+    ]
+  },
+  "execution_policy": {
+    "dynamic": {
+      "mode": "explicit_authorization_required",
+      "fixed_sha256": "1af62999cf5be0b2f21abc39034c122a42aa46cfbfdb546faa184de37ac09ac7",
+      "timeout_seconds": 120,
+      "process_tree_accounting_required": true
+    },
+    "network": {
+      "mode": "deny_all",
+      "network_actions_allowed": false,
+      "isolation_evidence_required": true
+    }
+  },
+  "oracle": {
+    "oracle_id": "origin_macro.legacy_oracle.fe92f992.v1",
+    "kind": "legacy_oracle_candidate",
+    "artifact_sha256": "fe92f992bcf07e630c82ff3a1cfc138a8c2463e3e03f862da171e8781119268f",
+    "authority": "historical_operator_report",
+    "use": "regression_comparison_only"
+  }
+}

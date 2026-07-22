@@ -1,0 +1,444 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:magicmida:schema:case-manifest:v2",
+  "title": "MagicMida case manifest v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schema_version",
+    "manifest_revision",
+    "case_id",
+    "display_name",
+    "primary_artifact_sha256",
+    "artifacts",
+    "capability_cell",
+    "static_fingerprint",
+    "execution_policy",
+    "oracle"
+  ],
+  "properties": {
+    "$schema": {
+      "const": "./case-manifest.schema.json"
+    },
+    "schema_version": {
+      "const": "mida.case-manifest/v2"
+    },
+    "manifest_revision": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "case_id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*$"
+    },
+    "display_name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "primary_artifact_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "artifacts": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/artifact"
+      }
+    },
+    "capability_cell": {
+      "$ref": "#/$defs/capabilityCell"
+    },
+    "static_fingerprint": {
+      "$ref": "#/$defs/staticFingerprint"
+    },
+    "execution_policy": {
+      "$ref": "#/$defs/executionPolicy"
+    },
+    "oracle": {
+      "$ref": "#/$defs/oracle"
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sha256",
+        "size_bytes",
+        "role"
+      ],
+      "properties": {
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "role": {
+          "enum": [
+            "protected_input",
+            "synthetic_control",
+            "legacy_oracle_candidate",
+            "analysis_reference"
+          ]
+        }
+      }
+    },
+    "capabilityCell": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "platform",
+        "binary_format",
+        "architecture",
+        "execution_model",
+        "protection_family",
+        "engine_route",
+        "corpus_role"
+      ],
+      "properties": {
+        "platform": {
+          "const": "windows"
+        },
+        "binary_format": {
+          "const": "pe"
+        },
+        "architecture": {
+          "enum": [
+            "x86",
+            "x86_64"
+          ]
+        },
+        "execution_model": {
+          "enum": [
+            "native",
+            "managed_host_candidate",
+            "synthetic"
+          ]
+        },
+        "protection_family": {
+          "enum": [
+            "oreans_candidate",
+            "ahk_gto_candidate",
+            "packed_managed_candidate",
+            "unprotected_fixture",
+            "unknown"
+          ]
+        },
+        "engine_route": {
+          "enum": [
+            "mida_plugin_oreans",
+            "future_plugin_ahk_gto",
+            "generic_static_control",
+            "out_of_scope"
+          ]
+        },
+        "corpus_role": {
+          "enum": [
+            "development",
+            "regression",
+            "research",
+            "negative_control"
+          ]
+        }
+      }
+    },
+    "staticFingerprint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifact_sha256",
+        "evidence_basis",
+        "pe_kind",
+        "coff_machine",
+        "image_base",
+        "entry_rva",
+        "entry_section",
+        "section_count",
+        "import_descriptor_count",
+        "has_tls",
+        "has_relocations",
+        "observed_markers"
+      ],
+      "properties": {
+        "artifact_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "evidence_basis": {
+          "enum": [
+            "retained_static_report",
+            "direct_header_parse"
+          ]
+        },
+        "pe_kind": {
+          "enum": [
+            "PE32",
+            "PE32+"
+          ]
+        },
+        "coff_machine": {
+          "enum": [
+            "0x014c",
+            "0x8664"
+          ]
+        },
+        "image_base": {
+          "type": "string",
+          "pattern": "^0x[0-9a-f]+$"
+        },
+        "entry_rva": {
+          "type": "string",
+          "pattern": "^0x[0-9a-f]+$"
+        },
+        "entry_section": {
+          "type": "string"
+        },
+        "section_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "import_descriptor_count": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "has_tls": {
+          "type": "boolean"
+        },
+        "has_relocations": {
+          "type": "boolean"
+        },
+        "observed_markers": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "executionPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "dynamic",
+        "network"
+      ],
+      "properties": {
+        "dynamic": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "mode",
+            "fixed_sha256",
+            "timeout_seconds",
+            "process_tree_accounting_required"
+          ],
+          "properties": {
+            "mode": {
+              "enum": [
+                "explicit_authorization_required",
+                "forbidden"
+              ]
+            },
+            "fixed_sha256": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/sha256"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "timeout_seconds": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 1
+            },
+            "process_tree_accounting_required": {
+              "type": "boolean"
+            }
+          }
+        },
+        "network": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "mode",
+            "network_actions_allowed",
+            "isolation_evidence_required"
+          ],
+          "properties": {
+            "mode": {
+              "const": "deny_all"
+            },
+            "network_actions_allowed": {
+              "const": false
+            },
+            "isolation_evidence_required": {
+              "type": "boolean"
+            }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "dynamic": {
+                "properties": {
+                  "mode": {
+                    "const": "explicit_authorization_required"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "dynamic": {
+                "properties": {
+                  "fixed_sha256": {
+                    "$ref": "#/$defs/sha256"
+                  },
+                  "timeout_seconds": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "process_tree_accounting_required": {
+                    "const": true
+                  }
+                }
+              },
+              "network": {
+                "properties": {
+                  "isolation_evidence_required": {
+                    "const": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "dynamic": {
+                "properties": {
+                  "mode": {
+                    "const": "forbidden"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "dynamic": {
+                "properties": {
+                  "fixed_sha256": {
+                    "type": "null"
+                  },
+                  "timeout_seconds": {
+                    "type": "null"
+                  },
+                  "process_tree_accounting_required": {
+                    "const": true
+                  }
+                }
+              },
+              "network": {
+                "properties": {
+                  "isolation_evidence_required": {
+                    "const": false
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "oracle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "oracle_id",
+        "kind",
+        "artifact_sha256",
+        "authority",
+        "use"
+      ],
+      "properties": {
+        "oracle_id": {},
+        "kind": {},
+        "artifact_sha256": {},
+        "authority": {},
+        "use": {}
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "oracle_id": {
+              "type": "null"
+            },
+            "kind": {
+              "const": "none"
+            },
+            "artifact_sha256": {
+              "type": "null"
+            },
+            "authority": {
+              "const": "none"
+            },
+            "use": {
+              "const": "none"
+            }
+          }
+        },
+        {
+          "properties": {
+            "oracle_id": {
+              "type": "string",
+              "pattern": "^[a-z0-9][a-z0-9._-]*$"
+            },
+            "kind": {
+              "enum": [
+                "legacy_oracle_candidate",
+                "analysis_reference",
+                "static_fixture_definition"
+              ]
+            },
+            "artifact_sha256": {
+              "$ref": "#/$defs/sha256"
+            },
+            "authority": {
+              "enum": [
+                "historical_operator_report",
+                "historical_tool_output",
+                "fixture_contract"
+              ]
+            },
+            "use": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
+      ]
+    }
+  }
+}

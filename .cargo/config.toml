@@ -1,7 +1,0 @@
-# Cargo configuration for magicmida-rs
-# MSVC toolchain is selected exclusively by build.bat (vcvars64 + MSVC PATH)
-# No linker override here to avoid double-handling conflicts.
-
-[build]
-# Use all available CPU cores for parallel compilation
-jobs = 8

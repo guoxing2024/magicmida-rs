@@ -1,204 +1,82 @@
-﻿> **2026-07-18 update:** For non-Themida / AHK launcher samples use `/generic-unpack` or `../tools/generic_unpack.py` (no shrink). See [GENERIC_PIPELINE.md](GENERIC_PIPELINE.md) and [STATUS.md](STATUS.md). Legacy reports under `archive/docs_legacy/`. Python path is primary until MSVC `link.exe` is available for `cargo build`.
+# MagicMida vNext
 
-# Magicmida-RS
+MagicMida vNext is a Windows PE unpacking research platform. Its long-term goal is
+reliable, family-extensible unpacking with explicit evidence for every claim.
 
-Themida automatic unpacker + **generic full-dump** path, Rust reimplementation.
+This repository is a canonical recovery baseline, not a general-purpose 1.0
+release. The legacy Themida/Oreans implementation is retained so it can be split
+behind stable interfaces and tested against an independent acceptance kernel. A
+historical output, including the Origin macro oracle candidate, is regression
+input only and is never proof that a new output is correct.
 
-Based on the reverse engineering of [Hendi48/Magicmida](https://github.com/Hendi48/Magicmida) (Pascal),
-the entire unpacking pipeline is rewritten in Rust for safer memory management,
-better error handling, and a modular architecture.
+## Repository scope
 
-## Features
+The active repository contains only:
 
-- **Themida v1/v2/v3** detection and unpacking (x86 & x64)
-- **Runtime IAT reconstruction** — resolves imports via live memory tracing
-- **OEP discovery** — MSVC CRT startup pattern matching, Go/Delphi heuristics
-- **ScyllaHide integration** — bypasses anti-debugging on newer Themida builds
-- **PE rebuild** — import table, section table, data directory repair
-- **Verify mode** — diff unpacked output against a known-good reference
+- Rust source and deterministic unit-test fixtures;
+- v2 case manifests that refer to external artifacts by SHA-256;
+- manifest and workspace-policy verifiers; and
+- current architecture and artifact-policy documentation.
 
-## Prerequisites
+Samples, unpacked outputs, crash dumps, third-party tools, runtime logs, and build
+output belong outside Git in a content-addressed vault. See
+[ARTIFACT_POLICY.md](ARTIFACT_POLICY.md).
 
-| Requirement | Notes |
-|---|---|
-| **Windows 10/11** | x64 host. The debugger core uses Win32 Debug API; not cross-platform. |
-| **Rust toolchain** | stable MSVC target (`x86_64-pc-windows-msvc`). Install via [rustup](https://rustup.rs). |
-| **ScyllaHide** (optional) | Required for Themida v3 targets with hardware-breakpoint detection. Download from [ScyllaHide Releases](https://github.com/x64dbg/ScyllaHide/releases). |
+## Layout
 
-## Quick Start
-
-```bash
-# 1. Build
-cargo build --release
-
-# 2. (Optional) Place ScyllaHide binaries next to the executable
-#    The project ships a default config at scylla_hide.ini
-cp HookLibraryx64.dll InjectorCLIx64.exe target/release/
-
-# 3. Unpack
-target/release/mida-cli.exe /unpack "protected.exe"
-# → writes protectedU.exe
-```
-
-## Usage
-
-```
-mida-cli /unpack <filename> [options]
-mida-cli /dump-process <pid> <unpacked-file>
-mida-cli /verify <unpacked-file> <reference-file>
-```
-
-### `/unpack` — Unpack a Themida-protected executable
-
-Launches the target under a debugger, waits for OEP, dumps memory, and rebuilds
-the import table.
-
-| Option | Description |
-|---|---|
-| `<filename>` | Path to the input executable (`.exe` or `.dll`). |
-| `-o <path>` / `--output <path>` | Output path. Defaults to `<input>U.exe` (the "U" suffix convention from Pascal Magicmida). |
-| `--data-sections` | Restore `.rdata` / `.data` sections from the target process. Needed for MSVC TLS callbacks and initialized global data. |
-| `--shrink` | Remove Themida-specific sections (`.winlice` / `.boot` / `.themida`), compact VAs, clear dangling data directories, restore standard section names, and build a relocation table. **Enabled by default.** Note: the output is fixed-base — `DYNAMIC_BASE` is cleared by the dump pipeline. The relocation table may be rebuilt but ASLR is not re-enabled. |
-| `--no-shrink` | Disable shrinking. Keeps Themida sections. No relocation table. Use for debugging or when shrink causes issues. |
-| `-v` / `--verbose` | Enable debug-level logging. |
-
-**Examples:**
-
-```bash
-# Basic unpack — output written to targetU.exe
-mida-cli.exe /unpack target.exe
-
-# Full rebuild with data sections and stub removal
-mida-cli.exe /unpack target.exe --data-sections --shrink
-
-# Specify output path, verbose logging
-mida-cli.exe /unpack target.exe -o clean.exe -v
-```
-
-### `/dump-process` — Dump `.text` from a running process
-
-For targets that have already been unpacked in memory (manually or by another
-tool). Reads the decrypted `.text` section from the live process and writes it
-to a file.
-
-```bash
-mida-cli.exe /dump-process 12345 unpacked_text.bin
-```
-
-### `/verify` — Compare against a reference
-
-Compares loader-critical PE structure (architecture, executable entry point,
-section layout, Import/IAT directories, and the ordered import module/function
-list) against a known-good reference. Loader-critical mismatches return a
-non-zero exit code; benign rebuilt-section layout differences are reported as
-warnings.
-
-```bash
-mida-cli.exe /verify unpacked.exe reference_clean.exe
-```
-
-Use an unpacked/clean reference, not the protected input: a protector normally
-changes the entry point, section table, and bootstrap imports by design.
-
-## Architecture
-
-```
+```text
 crates/
-  core/              Debugger core: process creation, breakpoints, debug event loop
-  pe/                PE parsing, section operations, import table reconstruction
-  disasm/            iced-x86 wrapper, disassembly and pattern matching
-  tracer/            Single-step trace engine
-  packers/themida/   Themida unpacker implementation
-  cli/               Command-line entry point
+  core/              legacy debugger/process primitives
+  pe/                PE parsing and rebuild code
+  disasm/            instruction decoding and scan helpers
+  tracer/            trace primitives
+  packers/themida/   legacy Oreans/Themida implementation
+  cli/               command-line adapter
+lab/cases/v2/        case contracts; artifact references are SHA-256 only
+tools/               repository hygiene verification
+docs/                vNext architecture contracts
 ```
 
-Each crate is an independent module with a clear boundary. The debugger core
-(`mida-core`) owns all process/handle state; packers and CLI interact with it
-exclusively through the `DebuggerCore` trait.
+The target boundaries for the rebuild are defined in
+[docs/VNEXT_ARCHITECTURE.md](docs/VNEXT_ARCHITECTURE.md). Existing crate names do
+not imply that those boundaries have already been achieved.
 
-## Build
+## Build and test
 
-```bash
-cargo build --release      # Optimized binary at target/release/mida-cli.exe
-cargo test --workspace     # Run all tests (must use --workspace for cross-crate coverage)
-cargo run -- /unpack <file>  # Build + run in one step
+Use a Visual Studio developer shell, or another shell initialized with
+`vcvars64.bat`, and keep Cargo output outside the repository:
+
+```powershell
+$env:CARGO_TARGET_DIR = '<vault>\scratch\cargo-target'
+cargo fmt --all -- --check
+cargo check --workspace --tests --offline
+cargo test --workspace --offline
 ```
 
-## ScyllaHide Integration
+No sample is required for these commands. Tests that need binary fragments use
+small, source-controlled fixtures governed by the artifact policy.
 
-Newer Themida versions detect hardware breakpoints via `GetThreadContext` checks.
-ScyllaHide hooks these APIs in the target process to hide debugger presence.
+## Case manifests
 
-**What ScyllaHide does:** It injects a hook DLL (`HookLibraryx64.dll`) into the
-target process using `InjectorCLIx64.exe`. The hook intercepts anti-debugging
-APIs (`IsDebuggerPresent`, `CheckRemoteDebuggerPresent`, `NtQueryInformationProcess`,
-`GetThreadContext`, etc.) and returns spoofed results, making the target believe
-it is running without a debugger.
+Validate the v2 contracts against a populated SHA-256 object store:
 
-**Setup:**
+```powershell
+python -B lab\cases\verify_manifests.py --objects-root '<vault>\objects\sha256'
+python -B -m unittest lab\cases\test_verify_manifests.py -v
+```
 
-1. Download [ScyllaHide](https://github.com/x64dbg/ScyllaHide/releases) (x64 build).
-2. Extract `HookLibraryx64.dll` and `InjectorCLIx64.exe` from the archive.
-3. Place both files in the same directory as `mida-cli.exe` (typically
-   `target/release/`).
-4. Create a `scylla_hide.ini` config file in the same directory. The project
-   ships a default config — adjust profile settings if your target uses
-   non-standard anti-debug checks.
-5. When you run `mida-cli /unpack`, the packer crate automatically:
-   - Verifies the SHA-256 hashes of `InjectorCLIx64.exe` and `HookLibraryx64.dll`
-     against known-good values (see `crates/packers/themida/src/binaries.rs`).
-   - Launches `InjectorCLIx64.exe` to inject the hook DLL into the target.
-   - Waits for injection to complete before setting hardware breakpoints.
+The verifier checks schema semantics, object size/hash, forbidden legacy path
+references, and self-certifying language. Dynamic execution remains forbidden
+unless a case explicitly authorizes a fixed digest under an isolated runner.
 
-**Note:** If the SHA-256 verification fails, the unpacker will refuse to inject
-and report an error. This prevents running tampered hook binaries. To use a
-different version of ScyllaHide, update the hashes in `binaries.rs`.
+## Release rule
 
-ScyllaHide binaries are **not** committed to this repository. They are
-user-downloaded and verified at runtime via SHA-256 checksums (see
-`crates/packers/themida/src/binaries.rs`).
-
-## Supported Targets
-
-| Themida Version | x86 | x64 | Notes |
-|---|---|---|---|
-| **V1** (Ancient) | ✅ | — | Legacy Themida. |
-| **V2** | ✅ | — | Detected by dual `0x1000`-sized stub sections. |
-| **V3** | ✅ | ✅ | Current generation. x64 is always V3. Requires ScyllaHide. |
-
-**Known limitations:**
-
-- Themida v3 x86 with heavy VM obfuscation may require runtime heuristics that
-  static analysis alone cannot resolve (`ThemidaVersion::Unknown`).
-- Import resolution for fully virtualized IAT (v3 VM-strong) may produce
-  incomplete results; the original PE's import table is used as a fallback.
-- **DLL (.dll) targets**: not fully supported. The DLL stub calls
-  `ExitProcess` instead of `DllMain`, so the unpacked DLL won't load correctly
-  as a proper DLL. Use the unpacker primarily for `.exe` targets.
-- **Relocation table generation** — scans non-executable sections for absolute
-  addresses and builds a complete `.reloc` table. However, the output PE remains
-  fixed-base: `IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE` is cleared by the dump
-  pipeline. The relocation table is generated for structural completeness but
-  ASLR is not re-enabled on the output.
-- **Section shrinking** — removes `.winlice` / `.boot` / `.themida` sections,
-  compacts remaining VAs to eliminate gaps, clears dangling data directories,
-  and restores standard section names (`.text` / `.data` / `.rdata` etc.).
-- **Absolute address fixing** — patches all runtime-hardcoded addresses in
-  non-executable sections from the runtime image base to the original file
-  image base. This realigns the dumped image to its fixed (preferred) base
-  so the output is internally consistent at that base. It does **not** enable
-  ASLR: `IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE` is cleared by the dump
-  pipeline and the output remains fixed-base (see the relocation-table note
-  above).
-
-## Acknowledgements
-
-This project is a Rust reimplementation based on the reverse engineering work of
-[Hendi48/Magicmida](https://github.com/Hendi48/Magicmida) (original Pascal source).
-The entire unpacking pipeline logic is studied from Magicmida and rewritten in Rust
-for safer memory management, better error handling, and a modular architecture.
+"Universal" and "perfect" are goals, not status labels. A production release
+requires an independent acceptance kernel, deterministic replay evidence,
+holdout cases, and at least two production-quality packer-family plugins. The
+Oreans suite must pass ten consecutive isolated runs before it can satisfy its
+family gate.
 
 ## License
 
-GPLv3
-
+GPL-3.0. See [LICENSE](LICENSE).
