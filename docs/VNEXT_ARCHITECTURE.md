@@ -66,3 +66,12 @@ The canonical recovery commit preserves the previous implementation for
 traceability. Its current coupling, heuristics, and historical tests are inputs
 to refactoring; they are not the vNext architecture and do not establish product
 acceptance.
+
+### R1 progress
+
+- **R1-A:** pure PE API sketch and module inventory
+  ([VNEXT_R1_PE_API.md](VNEXT_R1_PE_API.md)); purity source scan on
+  `mida-pe` pure-listed modules. Crate-level `windows` / `mida-core` remain for
+  dump adapters.
+- **R1-B+:** pure parse/serialize extraction and production migration still open
+  ([VNEXT_R1_ROADMAP.md](VNEXT_R1_ROADMAP.md)).

@@ -55,7 +55,16 @@ cargo run -p mida-acceptance --offline -- check-static <candidate> `
   --expected-sha256 <hex> --expected-size <bytes> --report <report.json>
 ```
 
-R1 pure PE extraction plan: [docs/VNEXT_R1_ROADMAP.md](docs/VNEXT_R1_ROADMAP.md).
+### Pure PE model (R1)
+
+R1-A landed: pure vs adapter inventory and source purity lock for `mida-pe`.
+API sketch: [docs/VNEXT_R1_PE_API.md](docs/VNEXT_R1_PE_API.md). Remaining R1
+slices (parse/serialize extraction, production migration):
+[docs/VNEXT_R1_ROADMAP.md](docs/VNEXT_R1_ROADMAP.md).
+
+```powershell
+cargo test -p mida-pe --test purity_boundary --offline
+```
 
 ## Build and test
 

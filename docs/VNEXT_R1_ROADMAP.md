@@ -1,8 +1,12 @@
 # VNEXT-R1 Roadmap — Pure PE Model and Rebuild Pipeline
 
-Status: **open after R0B close-out**. R0B (`mida-acceptance`) owns independent
-static structural judgment. R1 extracts a pure PE model so production rebuild
-code no longer mixes live process / Win32 policy with byte-level PE work.
+Status: **R1-A landed (inventory + purity lock)**; R1-B+ open. R0B
+(`mida-acceptance`) owns independent static structural judgment. R1 extracts a
+pure PE model so production rebuild code no longer mixes live process / Win32
+policy with byte-level PE work.
+
+R1-A artifacts: [VNEXT_R1_PE_API.md](VNEXT_R1_PE_API.md),
+`crates/pe/tests/purity_boundary.rs`.
 
 ## Goal
 
@@ -58,6 +62,11 @@ Exact module splits may change; the contract is purity of the model API surface.
 
 **Exit criteria:** written API sketch in-repo; no production unpacker behavior change required.
 
+**Status (done):** API + module inventory in `docs/VNEXT_R1_PE_API.md`; source
+purity scan on pure-listed modules via `cargo test -p mida-pe --test purity_boundary`
+(writes local `pe_purity_boundary.json`). Typed address wrappers deferred to R1-B
+if still needed; crate still links `windows`/`mida-core` for adapters.
+
 ### R1-B — Pure parse + serialize core
 
 1. Extract or harden parse of DOS/NT/optional headers, section table, data
@@ -108,8 +117,7 @@ production PE code.
       (`dependency_boundary` style check remains green).
 - [ ] README / architecture docs list R1 status honestly (not product 1.0).
 
-## Suggested first commit after R0B
+## Suggested next commit after R1-A
 
-Focus on **R1-A + inventory**: dependency map of `mida-pe`, mark pure vs adapter
-modules, and add failing/placeholder tests that lock the purity boundary before
-large moves.
+Focus on **R1-B**: buffer parse/serialize round-trips with source-controlled
+fixtures; keep purity scan green; do not pull live dump modules into pure paths.

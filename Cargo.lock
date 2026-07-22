@@ -203,6 +203,7 @@ dependencies = [
  "mida-core",
  "mida-disasm",
  "pelite",
+ "serde_json",
  "thiserror",
  "tracing",
  "windows",
