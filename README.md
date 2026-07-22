@@ -48,10 +48,14 @@ do not imply that those boundaries have already been achieved.
 
 `mida-acceptance` is an independent crate: it must not depend on production
 unpacker crates. Static structural evaluation only; R0B never emits `Accepted`.
+Report paths must not overwrite the candidate or oracle.
 
 ```powershell
-cargo run -p mida-acceptance --offline -- check-static <candidate> --expected-sha256 <hex>
+cargo run -p mida-acceptance --offline -- check-static <candidate> `
+  --expected-sha256 <hex> --expected-size <bytes> --report <report.json>
 ```
+
+R1 pure PE extraction plan: [docs/VNEXT_R1_ROADMAP.md](docs/VNEXT_R1_ROADMAP.md).
 
 ## Build and test
 

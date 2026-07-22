@@ -124,10 +124,31 @@ fn report_schema_fields_present() {
     }
     assert_eq!(v["schema_version"], "mida.acceptance-report/v1");
     assert_eq!(v["verdict"], "StructuralPassBehaviorPending");
+    // R0B independent parser: residual_risks must stay empty.
+    let residual = v["residual_risks"]
+        .as_array()
+        .expect("residual_risks array");
+    assert!(
+        residual.is_empty(),
+        "R0B residual_risks must be empty under independent parser: {residual:?}"
+    );
+    assert!(report.residual_risks.is_empty());
     let gates = v["gates"].as_array().unwrap();
     assert!(!gates.is_empty());
     // ordered: first structural gate after optional identity is headers or identity
     let ids: Vec<&str> = gates.iter().map(|g| g["id"].as_str().unwrap()).collect();
     assert!(ids.contains(&"headers_bounds"));
     assert!(ids.contains(&"entry_point"));
+}
+
+#[test]
+fn residual_risks_empty_on_reject_and_pass() {
+    let pe = build_pe(&PeBuildOptions::pe32_plus());
+    let pass = check_static(&pe, &opts());
+    assert!(pass.residual_risks.is_empty());
+    assert_eq!(pass.verdict, Verdict::StructuralPassBehaviorPending);
+
+    let reject = check_static(b"not-a-pe", &opts());
+    assert!(reject.residual_risks.is_empty());
+    assert_eq!(reject.verdict, Verdict::Rejected);
 }

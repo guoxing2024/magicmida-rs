@@ -103,6 +103,7 @@ Legacy oracles are never authorities for acceptance.
 
 ```text
 mida-acceptance check-static <candidate> [--expected-sha256 <hex>]
+                                         [--expected-size <bytes>]
                                          [--role <role>]
                                          [--oracle <path>]
                                          [--report <path>]
@@ -117,14 +118,20 @@ Exit codes:
 | `1` | I/O, configuration, or internal error (no PE verdict) |
 
 The CLI is read-only with respect to the candidate and oracle files.
+`--report` must not alias the candidate or oracle path (including hard links).
+If a report path aliases an input, the CLI exits with code `1` and leaves the
+input bytes unchanged.
 
 ## Residual risks
 
 Any residual coupling (for example a shared third-party PE parser crate also
-used by production code) must appear in the report `residual_risks` array. R0B
-implements an independent byte-level parser and does not depend on `pelite` or
-`mida-pe`; residual risks remain empty unless a future change introduces shared
-components.
+used by production code) must appear in the report `residual_risks` array.
+
+**R0B rule:** the kernel implements an independent byte-level PE parser and
+must not depend on `pelite`, `mida-pe`, or other production unpacker crates.
+Under that independent-parser posture, `residual_risks` is **always empty**
+(`[]`). Introducing a shared parser or production dependency is a contract
+change that must repopulate this array and update this document.
 
 ## Non-goals (R0B)
 
