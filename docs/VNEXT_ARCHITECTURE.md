@@ -49,7 +49,8 @@ claims.
 
 ## Delivery sequence
 
-1. `VNEXT-R0B`: build the independent acceptance kernel.
+1. `VNEXT-R0B`: build the independent acceptance kernel
+   ([ACCEPTANCE_CONTRACT.md](ACCEPTANCE_CONTRACT.md); crate `mida-acceptance`).
 2. `VNEXT-R1`: extract a pure PE model and rebuild pipeline.
 3. `VNEXT-R2`: establish the single runtime/event engine and replay backend.
 4. `VNEXT-R3`: implement the Oreans plugin and pass Origin, Lunlun, and a blind

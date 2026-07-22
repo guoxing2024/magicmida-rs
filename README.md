@@ -26,6 +26,7 @@ output belong outside Git in a content-addressed vault. See
 
 ```text
 crates/
+  acceptance/        independent acceptance kernel (static structural gates)
   core/              legacy debugger/process primitives
   pe/                PE parsing and rebuild code
   disasm/            instruction decoding and scan helpers
@@ -34,12 +35,23 @@ crates/
   cli/               command-line adapter
 lab/cases/v2/        case contracts; artifact references are SHA-256 only
 tools/               repository hygiene verification
-docs/                vNext architecture contracts
+docs/                vNext architecture and acceptance contracts
 ```
 
 The target boundaries for the rebuild are defined in
-[docs/VNEXT_ARCHITECTURE.md](docs/VNEXT_ARCHITECTURE.md). Existing crate names do
-not imply that those boundaries have already been achieved.
+[docs/VNEXT_ARCHITECTURE.md](docs/VNEXT_ARCHITECTURE.md). The R0B acceptance
+verdict contract is defined in
+[docs/ACCEPTANCE_CONTRACT.md](docs/ACCEPTANCE_CONTRACT.md). Existing crate names
+do not imply that those boundaries have already been achieved.
+
+### Acceptance kernel (R0B)
+
+`mida-acceptance` is an independent crate: it must not depend on production
+unpacker crates. Static structural evaluation only; R0B never emits `Accepted`.
+
+```powershell
+cargo run -p mida-acceptance --offline -- check-static <candidate> --expected-sha256 <hex>
+```
 
 ## Build and test
 

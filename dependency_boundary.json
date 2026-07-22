@@ -1,0 +1,39 @@
+{
+  "forbidden": [
+    "mida-core",
+    "mida-pe",
+    "mida-tracer",
+    "mida-cli",
+    "mida-packers-themida",
+    "mida-disasm"
+  ],
+  "package": "mida-acceptance",
+  "pass": true,
+  "resolved_dependency_names": [
+    "block-buffer",
+    "cfg-if",
+    "cpufeatures",
+    "crypto-common",
+    "digest",
+    "generic-array",
+    "itoa",
+    "libc",
+    "memchr",
+    "proc-macro2",
+    "quote",
+    "serde",
+    "serde_core",
+    "serde_derive",
+    "serde_json",
+    "sha2",
+    "syn",
+    "thiserror",
+    "thiserror-impl",
+    "typenum",
+    "unicode-ident",
+    "version_check",
+    "zmij"
+  ],
+  "schema_version": "mida.dependency-boundary/v1",
+  "violations": []
+}

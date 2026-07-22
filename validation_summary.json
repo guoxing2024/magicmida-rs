@@ -1,0 +1,30 @@
+{
+  "schema_version": "mida.validation-summary/v1",
+  "task": "VNEXT-R0B-1",
+  "title": "Independent Acceptance Kernel MVP",
+  "package": "mida-acceptance",
+  "verdict_contract": "docs/ACCEPTANCE_CONTRACT.md",
+  "checks": {
+    "cargo_fmt_check": "pass",
+    "cargo_check_workspace_tests_offline": "pass",
+    "cargo_test_workspace_offline": "pass",
+    "workspace_hygiene": "pass_after_commit",
+    "v2_manifest_verifier_unit_tests": "pass",
+    "v2_manifest_verifier_vault": "pass",
+    "git_fsck": "pass",
+    "dependency_boundary": "pass",
+    "target_process_starts": 0,
+    "network_actions": 0
+  },
+  "notes": [
+    "R0B never returns Accepted; only Rejected or StructuralPassBehaviorPending.",
+    "mida-acceptance uses an independent byte-level PE parser (no pelite, no production crate deps).",
+    "Fixtures are runtime-synthesized; no EXE/DLL/DMP committed.",
+    "Legacy oracle produces comparison observations only."
+  ],
+  "artifacts": [
+    "cargo_test.txt",
+    "dependency_boundary.json",
+    "WORKER_HANDOFF.md"
+  ]
+}

@@ -6,6 +6,7 @@ members = [
     "crates/tracer",
     "crates/packers/themida",
     "crates/cli",
+    "crates/acceptance",
 ]
 resolver = "2"
 
