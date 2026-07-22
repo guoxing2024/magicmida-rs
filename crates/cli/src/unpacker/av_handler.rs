@@ -69,12 +69,34 @@ pub(super) fn handle_access_violation(
     )? {
         GuardAccessResult::Handled {
             address: _,
-            thread_id: tid,
+            thread_id: returned_tid,
         } => {
-            debug!(tid, "Guarded access handled — continuing");
-            dbg.continue_event(tid, ContinueStatus::Continue)?;
+            // No continue here — fall through to the shared epilogue once.
+            if returned_tid != thread_id {
+                debug!(
+                    event_tid = thread_id,
+                    returned_tid, "Handled returned_tid differs from event thread_id (log only)"
+                );
+            }
+            debug!(
+                branch = "guard_handled",
+                event_tid = thread_id,
+                returned_tid,
+                exception = %format!("{exception_addr:#x}"),
+                fault = %format!("{target_address:#x}"),
+                exc_type,
+                "Guarded access handled"
+            );
+            log::log(
+                LogType::Info,
+                &format!(
+                    "guard_handled: event_tid={thread_id} returned_tid={returned_tid} \
+                     exception={exception_addr:#x} fault={target_address:#x} exc_type={exc_type}"
+                ),
+            );
         }
         GuardAccessResult::TlsCallback { address } => {
+            // No continue here — fall through to the shared epilogue once.
             log::log(
                 LogType::Info,
                 &format!(
@@ -82,7 +104,6 @@ pub(super) fn handle_access_violation(
                     address
                 ),
             );
-            dbg.continue_event(thread_id, ContinueStatus::Continue)?;
         }
         GuardAccessResult::MsvcTraceComplete { address } => {
             ls.oep = Some(address);
@@ -94,7 +115,8 @@ pub(super) fn handle_access_violation(
                     address,
                 ),
             );
-            dbg.continue_event(thread_id, ContinueStatus::Continue)?;
+            // Break deliberately leaves the current AV pending so synchronous
+            // post-loop IAT tracing can set context and consume it.
             return Ok(AvAction::Break);
         }
         GuardAccessResult::PossibleOEP { address } => {
@@ -307,9 +329,17 @@ pub(super) fn handle_access_violation(
                         oep = %format!("{address:#x}"),
                         "Virtual OEP detected — entering FTraceMSVCOEP mode (MSVC VM at OEP)"
                     );
-                    state.msvc_init_cookie = address;
-                    state.msvc_oep = prev_addr;
-                    state.trace_msvc_oep = true;
+                    // B7.1: preserve current address as common-main candidate.
+                    // Never store it as msvc_init_cookie; cookie is resolved offline later.
+                    // The next arbitrary .text hit must NOT replace msvc_common_main_seh.
+                    mida_packers_themida::ftrace_enter_preserve_common_main(
+                        &mut state.msvc_common_main_seh,
+                        &mut state.msvc_init_cookie,
+                        &mut state.msvc_oep,
+                        &mut state.trace_msvc_oep,
+                        address,
+                        prev_addr,
+                    );
                     ls.oep = Some(prev_addr);
                     let ctx = dbg
                         .get_thread_context_control(thread_id)
@@ -338,10 +368,15 @@ pub(super) fn handle_access_violation(
                         text_end.saturating_sub(text_start),
                         guard_protection,
                     )?;
-                    log::log(LogType::Info, &format!(
-                        "FTraceMSVCOEP: waiting for CRT Startup hit after VM (init_cookie={:#x}, oep_stub={:#x})",
-                        state.msvc_init_cookie, state.msvc_oep,
-                    ));
+                    log::log(
+                        LogType::Info,
+                        &format!(
+                            "FTraceMSVCOEP: waiting after VM \
+                         (preserved common_main={:#x}; cookie unresolved offline; oep_stub={:#x}; \
+                          next .text hit will NOT replace common_main)",
+                            state.msvc_common_main_seh, state.msvc_oep,
+                        ),
+                    );
                     dbg.continue_event(thread_id, ContinueStatus::Continue)?;
                     return Ok(AvAction::Continue);
                 }
@@ -593,6 +628,7 @@ pub(super) fn handle_access_violation(
         return Ok(AvAction::Continue);
     }
 
+    // Fall-through continue for paths that did not continue above (Handled / TlsCallback).
     dbg.continue_event(thread_id, ContinueStatus::Continue)?;
     Ok(AvAction::Continue)
 }

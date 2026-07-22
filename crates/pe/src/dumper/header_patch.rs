@@ -229,10 +229,15 @@ fn compact_section_vas(pe: &mut PeHeader, removed_ranges: &[(u32, u32)], removed
         "Reserved",
     ];
     // Clear data directory entries that point into removed sections.
-    // EXCEPT for TLS Directory (index 9) - we will recreate it later if needed.
+    // EXCEPT for Export Directory (index 0) — relocated later for AHK.
+    // TLS Directory (index 9) MUST be cleared when it lands in a removed
+    // Themida section: a dangling TLS RVA (e.g. 0xc77d68) makes the Windows
+    // loader AV inside LdrpAllocateTlsEntry (write to AddressOfIndex=NULL).
+    // A valid TLS directory is only reinstalled by install_tls_callback_bootstrap.
     for dir_idx in 0..pe.nt_headers.optional_header.data_directory.len() {
-        if dir_idx == 9 {
-            // Skip TLS Directory - will be recreated by install_heap_bootstrap if containers detected
+        if dir_idx == 0 {
+            // Skip Export Directory - will be preserved for AutoHotkey and other DLLs
+            // The export table will be relocated to .rdata in dump_process.rs
             continue;
         }
         let dd_va = pe.nt_headers.optional_header.data_directory[dir_idx].virtual_address;

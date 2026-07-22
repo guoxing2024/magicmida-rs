@@ -1,6 +1,8 @@
-﻿# Magicmida-RS
+﻿> **2026-07-18 update:** For non-Themida / AHK launcher samples use `/generic-unpack` or `../tools/generic_unpack.py` (no shrink). See [GENERIC_PIPELINE.md](GENERIC_PIPELINE.md) and [STATUS.md](STATUS.md). Legacy reports under `archive/docs_legacy/`. Python path is primary until MSVC `link.exe` is available for `cargo build`.
 
-Themida automatic unpacker, Rust reimplementation.
+# Magicmida-RS
+
+Themida automatic unpacker + **generic full-dump** path, Rust reimplementation.
 
 Based on the reverse engineering of [Hendi48/Magicmida](https://github.com/Hendi48/Magicmida) (Pascal),
 the entire unpacking pipeline is rewritten in Rust for safer memory management,
@@ -56,8 +58,8 @@ the import table.
 | `<filename>` | Path to the input executable (`.exe` or `.dll`). |
 | `-o <path>` / `--output <path>` | Output path. Defaults to `<input>U.exe` (the "U" suffix convention from Pascal Magicmida). |
 | `--data-sections` | Restore `.rdata` / `.data` sections from the target process. Needed for MSVC TLS callbacks and initialized global data. |
-| `--shrink` | Remove Themida-specific sections (`.winlice` / `.boot` / `.themida`), compact VAs, clear dangling data directories, restore standard section names, build relocation table, and enable ASLR. **Enabled by default.** |
-| `--no-shrink` | Disable shrinking. Keeps Themida sections and disables ASLR/relocation. Use for debugging or when shrink causes issues. |
+| `--shrink` | Remove Themida-specific sections (`.winlice` / `.boot` / `.themida`), compact VAs, clear dangling data directories, restore standard section names, and build a relocation table. **Enabled by default.** Note: the output is fixed-base — `DYNAMIC_BASE` is cleared by the dump pipeline. The relocation table may be rebuilt but ASLR is not re-enabled. |
+| `--no-shrink` | Disable shrinking. Keeps Themida sections. No relocation table. Use for debugging or when shrink causes issues. |
 | `-v` / `--verbose` | Enable debug-level logging. |
 
 **Examples:**
@@ -174,15 +176,20 @@ user-downloaded and verified at runtime via SHA-256 checksums (see
   `ExitProcess` instead of `DllMain`, so the unpacked DLL won't load correctly
   as a proper DLL. Use the unpacker primarily for `.exe` targets.
 - **Relocation table generation** — scans non-executable sections for absolute
-  addresses, builds a complete `.reloc` table, and enables ASLR (`DYNAMIC_BASE`).
-  The table is clamped to fit the available VA space between `.reloc` and the
-  next section, preventing VA overlap.
+  addresses and builds a complete `.reloc` table. However, the output PE remains
+  fixed-base: `IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE` is cleared by the dump
+  pipeline. The relocation table is generated for structural completeness but
+  ASLR is not re-enabled on the output.
 - **Section shrinking** — removes `.winlice` / `.boot` / `.themida` sections,
   compacts remaining VAs to eliminate gaps, clears dangling data directories,
   and restores standard section names (`.text` / `.data` / `.rdata` etc.).
 - **Absolute address fixing** — patches all runtime-hardcoded addresses in
   non-executable sections from the runtime image base to the original file
-  image base, enabling correct ASLR relocation.
+  image base. This realigns the dumped image to its fixed (preferred) base
+  so the output is internally consistent at that base. It does **not** enable
+  ASLR: `IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE` is cleared by the dump
+  pipeline and the output remains fixed-base (see the relocation-table note
+  above).
 
 ## Acknowledgements
 
@@ -194,3 +201,4 @@ for safer memory management, better error handling, and a modular architecture.
 ## License
 
 GPLv3
+

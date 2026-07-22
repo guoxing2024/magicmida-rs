@@ -33,8 +33,9 @@ pub mod utils;
 // Re-export the primary types so callers can do `use mida_pe::PeHeader` etc.
 pub use apiset::{get_apiset_module_by_api, is_apiset_dll, resolve_apiset, ApiSetMapping};
 pub use dumper::{
-    dump_dotnet, dump_process, get_original_imports, is_dotnet, rebuild_import_table, DumpOptions,
-    EarlySectionSnapshot,
+    dump_dotnet, dump_process, get_original_imports, is_dotnet, rebuild_import_table,
+    ContainerRestoreMode, DumpOptions, DumpProfile, DumpProfileCapabilities, EarlySectionSnapshot,
+    ExperimentalStagePlan, OepPolicy,
 };
 pub use error::PeError;
 pub use header::{

@@ -1,0 +1,20 @@
+{
+  "fixture_id": "b6_real_crt_windows",
+  "source_pe": "cases/lunlun_software/runs/s3_10_10_b6_20260720_234544/lunlun_s3_10_10_b6_no_shrink_oep_crt_unpacked.exe",
+  "source_pe_note": "Original filename uses CJK product prefix; ASCII alias used here for stable UTF-8 provenance parsing.",
+  "source_sha256": "2DDDAF17AD25D370DDA9C0FBEB8A17C1E6A491DB1222F279D70F8420AB5D2871",
+  "source_size": 12980224,
+  "cookie_rva": "0x1F6F80",
+  "complement_rva": "0x1F6FC0",
+  "cookie_storage_section": {
+    "name": "",
+    "rva": "0x1F3000",
+    "virtual_size": "0xA5CC",
+    "characteristics": "0xC0000040",
+    "readable": true,
+    "writable": true,
+    "executable": false
+  },
+  "extracted": "offline",
+  "purpose": "B7.1/B7.2 unit fixtures — no live unpack"
+}

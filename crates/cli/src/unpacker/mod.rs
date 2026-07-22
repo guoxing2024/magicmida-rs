@@ -26,6 +26,8 @@
 
 mod av_handler;
 mod dump;
+mod generic;
+mod generic_gate;
 mod helpers;
 mod iat_trace;
 mod oep_scan;
@@ -47,7 +49,9 @@ use mida_packers_themida::{
     handle_nt_set_information_thread, init_pe_details, inject_scylla_hide, install_anti_dump_fix,
     shrink_pe, CompilerHint, IatFixStrategy, ScyllaHideConfig, ThemidaState,
 };
-use mida_pe::{DumpOptions, EarlySectionSnapshot, PeHeader};
+use mida_pe::{
+    ContainerRestoreMode, DumpOptions, DumpProfile, EarlySectionSnapshot, OepPolicy, PeHeader,
+};
 
 use av_handler::{handle_access_violation, AvAction};
 use helpers::{
@@ -56,11 +60,16 @@ use helpers::{
     scylla_hook_path, scylla_injector_path,
 };
 use iat_trace::{handle_trace_step, IatTraceState, TracePhase};
-use oep_scan::scan_live_memory_for_real_oep;
+use oep_scan::{resolve_oep_va, scan_live_memory_for_real_oep};
 use session::ProcessSession;
 
 // Re-export public functions for commands.rs
 pub use dump::dump_process_code;
+pub use generic::generic_unpack;
+pub use generic_gate::{
+    gate_inputs_from_pe, is_ahk_export_name, validate_generic_dump, GenericGateFailure,
+    GenericGateInputs, GenericGateProfile, GenericGateResult, AHK_EXPORT_NAMES,
+};
 pub use verify::verify_unpacked;
 
 // ---------------------------------------------------------------------------
@@ -107,6 +116,9 @@ struct LoopState {
 ///   suffix convention from the Pascal reference).
 /// - `create_data_sections` — restore `.rdata`/`.data` sections (`--data-sections`).
 /// - `shrink` — remove Themida-specific sections from the output (`--shrink`).
+/// - `oep_policy` — how to choose the final PE entry point.
+/// - `container_restore` — SecurityCookie heap container restore mode.
+/// - `profile` — dump behaviour profile (default OreansClassic; GTO is opt-in).
 ///
 /// # Errors
 ///
@@ -116,10 +128,14 @@ pub fn unpack(
     output: Option<&Path>,
     do_data_sections: bool,
     shrink: bool,
+    oep_policy: OepPolicy,
+    container_restore: ContainerRestoreMode,
+    profile: DumpProfile,
 ) -> Result<(), anyhow::Error> {
     use tracing::info;
     info!("=== UNPACK START ===");
     info!("Input: {}", input.display());
+    info!(?oep_policy, ?container_restore, ?profile, "Unpack policy");
 
     // ---- step 1: resolve output path ----
     let output_path = resolve_output_path(input, output);
@@ -567,6 +583,9 @@ pub fn unpack(
             do_data_sections,
             shrink,
             true, // post-attach mode
+            oep_policy,
+            container_restore,
+            profile,
             &early_section_snapshots,
             input,
             &output_path,
@@ -1410,6 +1429,9 @@ pub fn unpack(
         do_data_sections,
         shrink,
         false, // traditional debug path
+        oep_policy,
+        container_restore,
+        profile,
         &early_section_snapshots,
         input,
         &output_path,
@@ -1440,10 +1462,27 @@ fn capture_early_section_snapshots(
         if size == 0 {
             continue;
         }
+        // Cap VirtualSize-driven allocations (H-1: hostile PE DoS).
+        const MAX_EARLY_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
+        if size > MAX_EARLY_SNAPSHOT_BYTES {
+            return Err(anyhow!(
+                "early snapshot for {} rejected: VirtualSize {:#x} exceeds cap {:#x}",
+                section.name,
+                size,
+                MAX_EARLY_SNAPSHOT_BYTES
+            ));
+        }
         let address = image_base
             .checked_add(section.virtual_address as usize)
             .ok_or_else(|| anyhow!("early snapshot address overflow for {}", section.name))?;
-        let mut bytes = vec![0u8; size];
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(size).map_err(|_| {
+            anyhow!(
+                "early snapshot for {}: failed to reserve {size} bytes",
+                section.name
+            )
+        })?;
+        bytes.resize(size, 0);
         let read = dbg
             .read_memory(address, &mut bytes)
             .map_err(|e| anyhow!("failed to capture early {} snapshot: {e}", section.name))?;
@@ -1478,47 +1517,17 @@ fn update_pre_text_snapshots(
     snapshots: &mut [EarlySectionSnapshot],
     rip: usize,
 ) -> Result<(), anyhow::Error> {
-    let image_base = dbg.image_base() as usize;
-    for snapshot in snapshots {
-        let address = image_base
-            .checked_add(snapshot.rva as usize)
-            .ok_or_else(|| {
-                anyhow!(
-                    "pre-text snapshot address overflow for {}",
-                    snapshot.section_name
-                )
-            })?;
-        let mut candidate = vec![0u8; snapshot.bytes.len()];
-        let read = dbg.read_memory(address, &mut candidate).map_err(|e| {
-            anyhow!(
-                "failed to sample pre-text {} snapshot: {e}",
-                snapshot.section_name
-            )
-        })?;
-        if read != candidate.len() {
-            return Err(anyhow!(
-                "short pre-text {} snapshot read: got {read} bytes, expected {}",
-                snapshot.section_name,
-                candidate.len()
-            ));
-        }
-        if candidate != snapshot.bytes {
-            let previous_non_zero = snapshot.bytes.iter().filter(|&&byte| byte != 0).count();
-            let non_zero = candidate.iter().filter(|&&byte| byte != 0).count();
-            *snapshot = EarlySectionSnapshot {
-                section_name: snapshot.section_name.clone(),
-                rva: snapshot.rva,
-                bytes: candidate,
-            };
-            debug!(
-                section = %snapshot.section_name,
-                rip = format_args!("{rip:#x}"),
-                previous_non_zero,
-                non_zero,
-                "updated latest pre-.text loader snapshot"
-            );
-        }
-    }
+    // For zero-raw `.data`, the FIRST capture (main thread still suspended,
+    // post-loader) is the only safe CRT baseline: all zeros / pure BSS.
+    //
+    // During free-run observation the CRT and app fill `.data` with process-
+    // local heap handles (`_pioinfo`, GetProcessHeap cache, stdio tables).
+    // Absorbing that state into the dump makes the independent PE re-enter
+    // CRT with half-initialized globals and AV at `_pioinfo[i]->_ptr`.
+    //
+    // Keep the initial clean snapshot; image-relative late values are merged
+    // later by `merge_reinitializable_data_state`.
+    let _ = (dbg, snapshots, rip);
     Ok(())
 }
 
@@ -1526,6 +1535,9 @@ fn refresh_early_snapshots_after_loader(
     dbg: &ProcessSession,
     snapshots: &mut [EarlySectionSnapshot],
 ) -> Result<(), anyhow::Error> {
+    // Only refresh snapshots that are STILL all-zero. A non-zero early capture
+    // (e.g. packer-written constants before main-thread resume) is already a
+    // valid baseline. Never replace a clean BSS baseline with live CRT state.
     let image_base = dbg.image_base() as usize;
     for snapshot in snapshots {
         if snapshot.bytes.iter().any(|&byte| byte != 0) {
@@ -1540,13 +1552,14 @@ fn refresh_early_snapshots_after_loader(
                     snapshot.section_name
                 )
             })?;
-        let read = dbg.read_memory(address, &mut snapshot.bytes).map_err(|e| {
+        let mut candidate = vec![0u8; snapshot.bytes.len()];
+        let read = dbg.read_memory(address, &mut candidate).map_err(|e| {
             anyhow!(
                 "failed to refresh {} loader snapshot: {e}",
                 snapshot.section_name
             )
         })?;
-        if read != snapshot.bytes.len() {
+        if read != candidate.len() {
             return Err(anyhow!(
                 "short {} loader snapshot read: got {read} bytes, expected {}",
                 snapshot.section_name,
@@ -1554,6 +1567,25 @@ fn refresh_early_snapshots_after_loader(
             ));
         }
 
+        // If the live section now contains process-local absolute pointers
+        // (low 4GB, 8-byte aligned), the CRT has already run and this is no
+        // longer a safe BSS baseline — keep zeros.
+        let polluted = candidate.chunks_exact(8).any(|chunk| {
+            let v = u64::from_le_bytes(chunk.try_into().unwrap_or_default());
+            v >= 0x1_0000 && v <= 0xffff_ffff && (v & 7) == 0
+        });
+        if polluted {
+            log::log(
+                LogType::Info,
+                &format!(
+                    "loader snapshot refresh skipped for {} (live CRT pollution detected; keeping clean BSS zeros)",
+                    snapshot.section_name
+                ),
+            );
+            continue;
+        }
+
+        snapshot.bytes = candidate;
         let non_zero = snapshot.bytes.iter().filter(|&&byte| byte != 0).count();
         let hash = fnv1a64(&snapshot.bytes);
         log::log(
@@ -1666,6 +1698,9 @@ fn run_post_loop_phases(
     do_data_sections: bool,
     shrink: bool,
     post_attach: bool,
+    oep_policy: OepPolicy,
+    container_restore: ContainerRestoreMode,
+    profile: DumpProfile,
     early_section_snapshots: &[EarlySectionSnapshot],
     input: &Path,
     output_path: &Path,
@@ -1778,37 +1813,32 @@ fn run_post_loop_phases(
 
     // ---- phase C: post-processing ----
     let image_base_for_scan = dbg.image_base() as usize;
-    // Phase C2: compare live memory with the captured OEP.
-    //
-    // IMPORTANT: For post_attach mode, the captured RIP is the real application
-    // entry point (e.g. 0x70b7), NOT the CRT startup (e.g. 0x1000). The CRT
-    // scanner often finds the CRT entry, but that's wrong for the final PE -
-    // we want the application's actual entry point. So in post_attach mode,
-    // KEEP the captured OEP and ignore the scan result.
-    if let Some(real_oep) = scan_live_memory_for_real_oep(
+    let captured_oep = oep_addr;
+    let scanned_oep = scan_live_memory_for_real_oep(
         dbg,
         image_base_for_scan,
         &state.pe_info.pe_sections,
         state.pe_info.base_of_data,
         state.pe_info.major_linker_version,
-    )? {
-        if real_oep != oep_addr {
-            if post_attach {
-                info!(
-                    captured_oep = %format!("{oep_addr:#x}"),
-                    scan_oep = %format!("{real_oep:#x}"),
-                    "post_attach: Keeping captured OEP (application entry), ignoring scan (CRT entry)"
-                );
-                // Don't replace - captured OEP is correct
-            } else {
-                info!(
-                    captured_oep = %format!("{oep_addr:#x}"),
-                    scan_oep = %format!("{real_oep:#x}"),
-                    "Live-memory scan found a different candidate — keeping runtime OEP"
-                );
-            }
-        }
-    }
+        Some(captured_oep),
+    )?;
+
+    // OEP policy (CLI --oep=...):
+    // - captured (default): keep frozen first decrypted .text RIP; scanner ignored
+    // - crt: unique strong MSVC PE-entry wrapper only (fail-closed; no unwrap_or)
+    // - fixed RVA: force PE entry
+    oep_addr = resolve_oep_va(oep_policy, image_base_for_scan, captured_oep, scanned_oep)?;
+
+    info!(
+        policy = ?oep_policy,
+        captured = %format!("{captured_oep:#x}"),
+        scanned = scanned_oep
+            .map(|a| format!("{a:#x}"))
+            .unwrap_or_else(|| "none".into()),
+        final_ep = %format!("{oep_addr:#x}"),
+        post_attach,
+        "Resolved PE entry point"
+    );
 
     log::log(LogType::Info, &format!("Final OEP: {:#x}", oep_addr));
 
@@ -1907,9 +1937,49 @@ fn run_post_loop_phases(
         iat_location: Some((iat.address, iat.size)),
         additional_iat_locations: Vec::new(),
         early_section_snapshots: early_section_snapshots.to_vec(),
+        container_restore,
+        profile,
+        // B7.2: authoritative cookie site from offline CRT resolve — no dump rescan.
+        security_cookie_rva: if state.msvc_cookie_rva != 0 {
+            Some(state.msvc_cookie_rva)
+        } else {
+            None
+        },
+        security_cookie_complement_rva: if state.msvc_cookie_complement_rva != 0 {
+            Some(state.msvc_cookie_complement_rva)
+        } else {
+            None
+        },
     };
 
     mida_pe::dump_process(dbg, &dump_opts).map_err(|e| anyhow!("Dump failed: {e}"))?;
+
+    // Lightweight structural gate (non-fatal warnings).
+    if let Ok(out_pe) = PeHeader::from_file(output_path) {
+        let ep = out_pe.entry_point;
+        let tls = out_pe.nt_headers.optional_header.data_directory[9];
+        let ep_in_exec = out_pe.sections.iter().any(|s| {
+            (s.characteristics & 0x2000_0000) != 0
+                && ep >= s.virtual_address
+                && ep < s.virtual_address.saturating_add(s.virtual_size)
+        });
+        if !ep_in_exec {
+            warn!(
+                ep = format_args!("{ep:#x}"),
+                "Output EP not in an executable section"
+            );
+        }
+        if tls.virtual_address == 0 {
+            info!("Output TLS directory empty (expected under clean CRT + post-crt restore)");
+        }
+        log::log(
+            LogType::Info,
+            &format!(
+                "Structure gate: EP={ep:#x} exec_ok={ep_in_exec} TLS={:#x}/{:#x}",
+                tls.virtual_address, tls.size
+            ),
+        );
+    }
 
     log::log(
         LogType::Good,

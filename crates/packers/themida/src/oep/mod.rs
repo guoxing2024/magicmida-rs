@@ -11,9 +11,23 @@
 //! - [`restore`] — stolen OEP byte restoration (MSVC6, MSVC9 DLL) and
 //!   x64 MSVC OEP synthesis.
 
+mod msvc_crt;
 mod restore;
 
 // Re-export the restoration functions from the `restore` submodule.
+pub use msvc_crt::{
+    cookie_complement_from_security_init_xrefs, decode_msvc_oep_wrapper, encode_msvc_oep_wrapper,
+    find_cookie_complement_site, ftrace_common_main_hint, ftrace_enter_preserve_common_main,
+    is_scrt_common_main_seh_bytes, is_tls_or_dynamic_init_helper_bytes,
+    reject_if_tls_helper_as_common_main, require_full_section_read,
+    resolve_cookie_site_via_security_init_xrefs, resolve_msvc_crt_targets,
+    resolve_msvc_crt_targets_from_process, resolve_msvc_crt_targets_with_sections,
+    resolve_security_init_cookie, rva_range_in_section, select_cookie_storage_section,
+    validate_scrt_common_main_seh, validate_wrapper_targets,
+    window_contains_security_cookie_sentinel, write_msvc_oep_x64_validated, CookieComplementSite,
+    ExecRange, MsvcCrtResolveError, MsvcCrtTargets, PeSectionView, DEFAULT_SECURITY_COOKIE,
+    MSVC_OEP_WRAPPER_LEN,
+};
 pub use restore::{restore_stolen_oep_msvc6, restore_stolen_oep_msvc9_dll, write_msvc_oep_x64};
 
 use tracing::{debug, info, warn};
@@ -98,12 +112,29 @@ pub fn find_real_oep_by_scanning(
             && text_buf.get(i + 6) == Some(&0x33)
             && text_buf.get(i + 7) == Some(&0xC9)
         {
-            let func_addr = text_base + i;
+            // In PE32+ `81 EC` alone decodes as `sub esp, imm32`, which
+            // zero-extends RSP.  It is the tail of an x64 `48 81 EC`
+            // instruction, never a valid function boundary.  Recover the
+            // containing MSVC function prologue instead of entering at the
+            // second byte and corrupting the stack.
+            let start = if i >= 7
+                && text_buf.get(i - 7..i) == Some(&[0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48])
+            {
+                i - 7
+            } else if i >= 2
+                && text_buf.get(i - 2) == Some(&0x57)
+                && text_buf.get(i - 1) == Some(&0x48)
+            {
+                i - 2
+            } else {
+                continue;
+            };
+            let func_addr = text_base + start;
             if i > 0x100 {
                 info!(
                     addr = format_args!("{func_addr:#x}"),
-                    rva = format_args!("{:#x}", i),
-                    "Found MSVC pattern (sub esp, imm32; xor ecx, ecx) — using as OEP"
+                    rva = format_args!("{:#x}", start),
+                    "Found x64 MSVC function containing sub rsp, imm32"
                 );
                 return Ok(Some(func_addr));
             }

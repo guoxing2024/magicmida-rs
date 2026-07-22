@@ -176,6 +176,10 @@ pub fn restore_stolen_oep_msvc9_dll(
 ///
 /// When the OEP is virtualised on x64, we synthesise a minimal OEP that
 /// calls `__security_init_cookie` and then jumps to `__scrt_common_main_seh`.
+///
+/// Fail-closed: rel32 overflow and partial write are hard errors (no silent OK).
+/// Prefer [`crate::oep::write_msvc_oep_x64_validated`] when executable ranges
+/// and image base are available for full semantic checks.
 pub fn write_msvc_oep_x64(
     debugger: &mut dyn DebuggerCore,
     h_process: windows::Win32::Foundation::HANDLE,
@@ -187,17 +191,32 @@ pub fn write_msvc_oep_x64(
         VirtualProtectEx, PAGE_EXECUTE_READWRITE, PAGE_PROTECTION_FLAGS,
     };
 
+    // Encode via checked rel32 (fail-closed on overflow). Use VA-space distances
+    // with oep as base; encode_msvc_oep_wrapper works in RVA space — compute
+    // displacements directly here with checked i32 conversion.
+    let call_disp_i64 = (security_init_cookie_addr as i64).wrapping_sub((oep + 9) as i64);
+    let jmp_disp_i64 = (scrt_common_main_seh_addr as i64).wrapping_sub((oep + 18) as i64);
+    if call_disp_i64 < i64::from(i32::MIN) || call_disp_i64 > i64::from(i32::MAX) {
+        return Err(ThemidaError::OepDetectionFailed(format!(
+            "MSVC OEP call rel32 overflow: oep={oep:#x} cookie={security_init_cookie_addr:#x}"
+        )));
+    }
+    if jmp_disp_i64 < i64::from(i32::MIN) || jmp_disp_i64 > i64::from(i32::MAX) {
+        return Err(ThemidaError::OepDetectionFailed(format!(
+            "MSVC OEP jmp rel32 overflow: oep={oep:#x} common_main={scrt_common_main_seh_addr:#x}"
+        )));
+    }
+    let call_disp = call_disp_i64 as i32;
+    let jmp_disp = jmp_disp_i64 as i32;
+
+    // Win64 stack-alignment contract: sub/add rsp, 28h only (no ±8 workaround).
     let mut stub: Vec<u8> = vec![
         0x48, 0x83, 0xEC, 0x28, // sub rsp, 28h
-        0xE8, 0x00, 0x00, 0x00, 0x00, // call rel32 (placeholder)
+        0xE8, 0x00, 0x00, 0x00, 0x00, // call rel32
         0x48, 0x83, 0xC4, 0x28, // add rsp, 28h
-        0xE9, 0x00, 0x00, 0x00, 0x00, // jmp rel32 (placeholder)
+        0xE9, 0x00, 0x00, 0x00, 0x00, // jmp rel32
     ];
-
-    let call_disp: i32 = (security_init_cookie_addr as i64).wrapping_sub((oep + 9) as i64) as i32;
     stub[5..9].copy_from_slice(&call_disp.to_le_bytes());
-
-    let jmp_disp: i32 = (scrt_common_main_seh_addr as i64).wrapping_sub((oep + 18) as i64) as i32;
     stub[14..18].copy_from_slice(&jmp_disp.to_le_bytes());
 
     let mut old_protect = PAGE_PROTECTION_FLAGS::default();
@@ -227,8 +246,12 @@ pub fn write_msvc_oep_x64(
         warn!(
             expected = stub.len(),
             actual = written,
-            "Partial write of MSVC x64 OEP stub"
+            "Partial write of MSVC x64 OEP stub — fail-closed"
         );
+        return Err(ThemidaError::OepDetectionFailed(format!(
+            "partial write of MSVC x64 OEP stub ({written}/{})",
+            stub.len()
+        )));
     }
 
     debug!(

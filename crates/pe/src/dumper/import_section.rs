@@ -19,11 +19,18 @@ use super::types::DumpOptions;
 /// This is the Magicmida fallback: when the runtime IAT is encrypted,
 /// read DLL and function names from the original file and resolve them
 /// using GetProcAddress in the debugger process.
+///
+/// **CRITICAL FIX**: Assigns sequential IAT addresses starting from
+/// `original_iat_rva` and **stops at the runtime IAT boundary** to avoid
+/// overflowing into adjacent sections. Themida removes unused imports at
+/// runtime, so the original PE's import table may be larger than the
+/// runtime IAT.
 pub(crate) fn build_import_table_from_original(
-    _pe: &PeHeader,
+    pe: &PeHeader,
     original_path: &Path,
+    original_iat_rva: u32,
 ) -> Option<ImportTableBuilder> {
-    use tracing::debug;
+    use tracing::{debug, warn};
 
     debug!("build_import_table_from_original: START");
 
@@ -39,12 +46,37 @@ pub(crate) fn build_import_table_from_original(
         return None;
     }
 
+    // Determine runtime IAT size from PE header (set by the unpacker)
+    let iat_dir =
+        pe.nt_headers.optional_header.data_directory[super::helpers::IMAGE_DIRECTORY_ENTRY_IAT];
+    let max_iat_rva = if iat_dir.virtual_address != 0 && iat_dir.size > 0 {
+        iat_dir.virtual_address + iat_dir.size
+    } else {
+        // Fallback: no IAT directory set, use unlimited (old behavior)
+        u32::MAX
+    };
+
+    debug!(
+        "build_import_table_from_original: Runtime IAT boundary at {:#x} (size {:#x})",
+        max_iat_rva, iat_dir.size
+    );
+
     let mut builder = ImportTableBuilder::new(true); // 64-bit
+    let ptr_size = crate::import_table::iat_slot_size(true) as u32; // 64-bit = 8 bytes
+    let mut current_iat_rva = original_iat_rva;
+    let mut total_funcs = 0;
+    let mut skipped_funcs = 0;
 
     for (dll_name, functions) in &imports {
         let mut thunks: Vec<ImportThunk> = Vec::new();
 
         for func_name in functions {
+            // Check if we've reached the IAT boundary
+            if current_iat_rva >= max_iat_rva {
+                skipped_funcs += 1;
+                continue;
+            }
+
             // Parse ordinal imports (#22 format)
             let (function_name, ordinal) = if let Some(ordinal_str) = func_name.strip_prefix('#') {
                 (None, ordinal_str.parse::<u16>().ok())
@@ -52,13 +84,15 @@ pub(crate) fn build_import_table_from_original(
                 (Some(func_name.clone()), None)
             };
 
-            // Set iat_address to 0 - build_import_section_no_iat will assign sequential addresses
+            // CRITICAL FIX: Assign sequential IAT address matching runtime location
             thunks.push(ImportThunk {
-                iat_address: 0,
+                iat_address: current_iat_rva,
                 function_name,
                 ordinal,
                 is_64bit: true,
             });
+            current_iat_rva += ptr_size;
+            total_funcs += 1;
         }
 
         if !thunks.is_empty() {
@@ -66,13 +100,27 @@ pub(crate) fn build_import_table_from_original(
             for t in thunks {
                 module.thunks.push(t);
             }
+            // Advance past the null terminator for this module
+            if current_iat_rva + ptr_size <= max_iat_rva {
+                current_iat_rva += ptr_size;
+            }
         }
     }
 
+    if skipped_funcs > 0 {
+        warn!(
+            "build_import_table_from_original: Skipped {} functions beyond IAT boundary ({:#x})",
+            skipped_funcs, max_iat_rva
+        );
+    }
+
     debug!(
-        "build_import_table_from_original: Built table with {} modules, {} thunks",
+        "build_import_table_from_original: Built table with {} modules, {} thunks (skipped {}), IAT range {:#x}..{:#x}",
         builder.modules.len(),
-        builder.thunk_count()
+        builder.thunk_count(),
+        skipped_funcs,
+        original_iat_rva,
+        current_iat_rva
     );
 
     Some(builder)
@@ -253,6 +301,10 @@ pub(crate) fn create_import_section(
 }
 
 /// Write Hint/Name RVAs into the dump buffer at each thunk's IAT address.
+///
+/// Zero entries are significant module/run terminators and must overwrite
+/// any process-local value captured from the live IAT. Leaving a live pointer
+/// in the lookup run makes the Windows loader interpret it as a name RVA.
 fn write_iat_lookup_to_dump_buf(
     dump_buf: &mut [u8],
     _builder: &ImportTableBuilder,
@@ -261,22 +313,27 @@ fn write_iat_lookup_to_dump_buf(
     is_64bit: bool,
 ) {
     let ptr_size = if is_64bit { 8 } else { 4 };
+    let mut written = 0;
+
     for (index, &value) in import_thunks.iter().enumerate() {
         let offset = original_iat_rva as usize + index * ptr_size;
         if offset + ptr_size > dump_buf.len() {
             break;
         }
+
         if is_64bit {
             dump_buf[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
         } else {
             dump_buf[offset..offset + 4].copy_from_slice(&(value as u32).to_le_bytes());
         }
+        written += 1;
     }
 
     info!(
         iat_rva = format_args!("{original_iat_rva:#x}"),
-        thunks = import_thunks.len(),
-        "Writing Import Lookup Table to IAT region"
+        written,
+        total = import_thunks.len(),
+        "Wrote Import Lookup Table to IAT region"
     );
 }
 
@@ -303,6 +360,9 @@ fn compute_max_iat_rva(builder: &ImportTableBuilder, original_iat_rva: u32, ptr_
 }
 
 /// Write Hint/Name RVAs to the FirstThunk (IAT) location in the output file.
+///
+/// Zero entries are written as terminators so no process-local address can be
+/// consumed by the loader as an import lookup RVA.
 pub(crate) fn write_iat_to_output(
     out_data: &mut Vec<u8>,
     pe: &PeHeader,
@@ -322,6 +382,7 @@ pub(crate) fn write_iat_to_output(
         out_data.resize(end, 0);
     }
 
+    let mut written = 0usize;
     for (i, &thunk_rva) in import_thunks.iter().enumerate() {
         let off = iat_file_off + i * ptr_size;
         if ptr_size == 8 {
@@ -329,11 +390,13 @@ pub(crate) fn write_iat_to_output(
         } else {
             out_data[off..off + 4].copy_from_slice(&(thunk_rva as u32).to_le_bytes());
         }
+        written += 1;
     }
 
     info!(
         rva = format_args!("{original_iat_rva:#x}"),
         file_off = format_args!("{iat_file_off:#x}"),
+        written,
         count = import_thunks.len(),
         "Wrote Hint/Name RVAs to IAT (FirstThunk) for loader resolution"
     );
@@ -378,6 +441,59 @@ pub(crate) fn fill_additional_iat_locations(
         info!(
             "Filled {} additional IAT locations with Hint/Name RVAs (dual IAT fix)",
             filled_count
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::header::PeHeader;
+
+    /// Zero terminator slots in `import_thunks` must overwrite stale live pointers.
+    #[test]
+    fn write_iat_lookup_overwrites_stale_nonzero_with_zero() {
+        let mut dump_buf = vec![0u8; 0x40];
+        // Pre-seed a live/process-local pointer where the terminator lands.
+        let stale: u64 = 0x0000_7FF8_1234_5678;
+        dump_buf[0x10..0x18].copy_from_slice(&0x5000u64.to_le_bytes());
+        dump_buf[0x18..0x20].copy_from_slice(&stale.to_le_bytes());
+
+        // Slot0 = hint/name RVA, slot1 = terminator 0 (must clear stale).
+        let import_thunks = [0x5000u64, 0u64];
+        let builder = ImportTableBuilder::new(true);
+        write_iat_lookup_to_dump_buf(&mut dump_buf, &builder, &import_thunks, 0x10, true);
+
+        let slot0 = u64::from_le_bytes(dump_buf[0x10..0x18].try_into().unwrap());
+        let slot1 = u64::from_le_bytes(dump_buf[0x18..0x20].try_into().unwrap());
+        assert_eq!(slot0, 0x5000);
+        assert_eq!(slot1, 0, "terminator zero must overwrite live pointer");
+    }
+
+    #[test]
+    fn write_iat_to_output_overwrites_stale_terminator_slots() {
+        // Minimal PE: .text at RVA 0x1000, raw file offset 0x200.
+        let mut pe_bytes = crate::header::make_minimal_pe64();
+        pe_bytes.resize(0x400, 0);
+        let pe = PeHeader::from_bytes(&pe_bytes).expect("minimal pe");
+
+        let mut out_data = pe_bytes;
+        // IAT at RVA 0x1010 → file offset 0x210.
+        let iat_rva = 0x1010u32;
+        let iat_off = 0x210usize;
+        let stale = 0x0000_7FFA_DEAD_BEEFu64;
+        out_data[iat_off..iat_off + 8].copy_from_slice(&0x6000u64.to_le_bytes());
+        out_data[iat_off + 8..iat_off + 16].copy_from_slice(&stale.to_le_bytes());
+
+        let import_thunks = [0x6000u64, 0u64];
+        write_iat_to_output(&mut out_data, &pe, &import_thunks, iat_rva, true);
+
+        let slot0 = u64::from_le_bytes(out_data[iat_off..iat_off + 8].try_into().unwrap());
+        let slot1 = u64::from_le_bytes(out_data[iat_off + 8..iat_off + 16].try_into().unwrap());
+        assert_eq!(slot0, 0x6000);
+        assert_eq!(
+            slot1, 0,
+            "zero terminator must overwrite stale live pointer"
         );
     }
 }

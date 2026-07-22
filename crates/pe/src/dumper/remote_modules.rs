@@ -272,8 +272,14 @@ pub(crate) fn gather_module_exports_from_remote(
         return Ok((std::collections::HashMap::new(), Vec::new()));
     }
 
-    // 3. Read the export directory.
-    let mut exp_buf = vec![0u8; exp_size as usize];
+    // 3. Read the export directory (capped — size is attacker-controlled in
+    // the remote PE header).
+    let exp_size_usize = exp_size as usize;
+    let mut exp_buf = super::helpers::alloc_capped(
+        exp_size_usize,
+        super::helpers::MAX_EXPORT_DIRECTORY_BYTES,
+        "remote module export directory",
+    )?;
     read_remote(process_handle, module_base + exp_va as u64, &mut exp_buf)?;
 
     // IMAGE_EXPORT_DIRECTORY layout:

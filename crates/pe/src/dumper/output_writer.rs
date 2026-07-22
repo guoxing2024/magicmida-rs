@@ -83,36 +83,35 @@ pub(crate) fn write_output_file(
     // 6e. Write each section's data
     write_section_data(&mut out_data, pe, dump_buf);
 
-    // HOTFIX: Initialize container pointers to zero
-    // The container at RVA 0x145710 has invalid values that cause ACCESS_VIOLATION
-    // Setting to zero tells the program the container is empty
-    if let Some(section) = pe
-        .sections
-        .iter()
-        .find(|s| s.virtual_address <= 0x145710 && 0x145710 < s.virtual_address + s.virtual_size)
-    {
-        let container_rva = 0x145710u32;
-        let container_offset =
-            section.header.pointer_to_raw_data + (container_rva - section.virtual_address);
-
-        if container_offset < out_data.len() as u32
-            && container_offset + 24 <= out_data.len() as u32
-        {
-            info!(
-                "HOTFIX: Zeroing container pointer at RVA {:#x}, file offset {:#x}",
-                container_rva, container_offset
-            );
-
-            // Zero out the container triple (begin, end, capacity) = 24 bytes
-            for i in 0..24 {
-                out_data[(container_offset + i) as usize] = 0;
-            }
+    // Zero detected SecurityCookie container triples in the on-disk image.
+    // Stale live-process heap pointers cause AV; the post-CRT .boot stub
+    // re-allocates and re-encodes them at runtime. Generic over all detections
+    // (replaces the old hard-coded 0x145710 hotfix).
+    let mut zeroed = 0usize;
+    for container in _containers {
+        let Some(section) = pe.sections.iter().find(|s| {
+            s.virtual_address <= container.rva
+                && container.rva < s.virtual_address.saturating_add(s.virtual_size)
+        }) else {
+            continue;
+        };
+        if section.header.pointer_to_raw_data == 0 || section.header.size_of_raw_data == 0 {
+            continue;
         }
+        let file_off = section.header.pointer_to_raw_data as usize
+            + (container.rva - section.virtual_address) as usize;
+        if file_off + 24 > out_data.len() {
+            continue;
+        }
+        out_data[file_off..file_off + 24].fill(0);
+        zeroed += 1;
     }
-
-    // 6e2. Container restoration is now handled by the pre-OEP bootstrap stub.
-    // The stub embedded in .boot will allocate heap memory and update the
-    // encoded pointers at runtime. No static restoration needed here.
+    if zeroed > 0 {
+        info!(
+            containers = zeroed,
+            "Zeroed detected container triples (runtime restore via .boot if installed)"
+        );
+    }
 
     // 6f. Write Hint/Name RVAs to the IAT location
     write_iat_to_output(&mut out_data, pe, import_thunks, original_iat_rva, is_64bit);
@@ -270,23 +269,60 @@ fn write_section_data(out_data: &mut Vec<u8>, pe: &PeHeader, dump_buf: &[u8]) {
 
     let trimmed_total = delta as usize;
     let dump_buf_effective_len = dump_size.saturating_sub(trimmed_total);
+    let file_align = {
+        let fa = pe.nt_headers.optional_header.file_alignment as usize;
+        if fa.is_power_of_two() && fa >= 0x200 {
+            fa
+        } else {
+            0x200
+        }
+    };
 
     for section in &pe.sections {
-        let raw_offset = section.header.pointer_to_raw_data as usize;
-        if raw_offset == 0 || section.header.size_of_raw_data == 0 {
+        let raw_size = section.header.size_of_raw_data as usize;
+
+        // Prefer extra_data (import/reloc/wfix/bootstrap). Must not require
+        // size_of_raw_data > 0 — large .boot stubs can race with layout so
+        // RawSize is zeroed while extra_data still holds the payload.
+        if let Some(ref extra) = section.extra_data {
+            if extra.is_empty() {
+                continue;
+            }
+            let mut raw_offset = section.header.pointer_to_raw_data as usize;
+            if raw_offset == 0 {
+                raw_offset = (out_data.len() + file_align - 1) & !(file_align - 1);
+                warn!(
+                    section = %section.name,
+                    assigned_ptr = format_args!("{raw_offset:#x}"),
+                    "Section has extra_data but PointerToRawData=0; appending at file end"
+                );
+            }
+            let end = raw_offset + extra.len();
+            if end > out_data.len() {
+                out_data.resize(end, 0);
+            }
+            out_data[raw_offset..raw_offset + extra.len()].copy_from_slice(extra);
+            info!(
+                section = %section.name,
+                raw_offset = format_args!("{raw_offset:#x}"),
+                len = extra.len(),
+                "section written (extra_data)",
+            );
             continue;
         }
 
-        let raw_size = section.header.size_of_raw_data as usize;
-        let data = if let Some(ref extra) = section.extra_data {
-            if raw_offset + extra.len() > out_data.len() {
-                out_data.resize(raw_offset + extra.len(), 0);
-            }
-            out_data[raw_offset..raw_offset + extra.len()].copy_from_slice(extra);
+        if raw_size == 0 {
             continue;
-        } else if section.virtual_address as usize + raw_size <= dump_buf_effective_len {
+        }
+
+        let raw_offset = section.header.pointer_to_raw_data as usize;
+        if raw_offset == 0 {
+            continue;
+        }
+
+        let data = if section.virtual_address as usize + raw_size <= dump_buf_effective_len {
             &dump_buf[section.virtual_address as usize..section.virtual_address as usize + raw_size]
-        } else if raw_size <= dump_buf.len() {
+        } else if section.virtual_address as usize + raw_size <= dump_buf.len() {
             &dump_buf[section.virtual_address as usize..section.virtual_address as usize + raw_size]
         } else {
             warn!(

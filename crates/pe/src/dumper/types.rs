@@ -18,6 +18,160 @@ pub struct EarlySectionSnapshot {
 }
 
 // -----------------------------------------------------------------------
+// OEP / container restore policy
+// -----------------------------------------------------------------------
+
+/// How the final PE entry point is chosen after OEP observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OepPolicy {
+    /// Prefer live MSVC CRT startup (cookie wrapper / `__scrt_common_main`).
+    /// Explicit opt-in because signature scanning can match an earlier helper.
+    Crt,
+    /// Keep the frozen first decrypted `.text` RIP from post-attach observation.
+    #[default]
+    Captured,
+    /// Force a specific image RVA as the PE entry point.
+    Fixed(u32),
+}
+
+/// How SecurityCookie-encoded heap containers are restored in the dump.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ContainerRestoreMode {
+    /// Detect containers, zero triples, do not install any restore stub.
+    Off,
+    /// After `__security_init_cookie` (patch CRT jmp) restore heaps then continue.
+    /// Default: safe for MSVC CRT re-entry (启动器-class).
+    #[default]
+    PostCrt,
+    /// Pre-EP / TLS-style restore (breaks MSVC `_ioinit` on this sample).
+    /// Experimental only.
+    PreCrt,
+}
+
+// -----------------------------------------------------------------------
+// Dump profile (GTO/AHK experimental isolation)
+// -----------------------------------------------------------------------
+
+/// High-level dump behaviour profile.
+///
+/// Default is the conservative Oreans/Themida path. GTO/AHK heap-graph,
+/// container restore, and wrapper materialization are **never** auto-selected
+/// by filename, SHA, or section names — they require an explicit CLI opt-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DumpProfile {
+    /// Conservative Oreans/Themida dump: PE image + OEP + import rebuild only.
+    #[default]
+    OreansClassic,
+    /// Explicit GTO/AHK experimental path (heap graph, containers, wrappers).
+    AhkGtoExperimental,
+}
+
+/// Capability flags derived from a [`DumpProfile`].
+///
+/// Pure data — no process I/O. Callers pass these (or the profile) through
+/// [`DumpOptions`]; the dumper must not re-guess the profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DumpProfileCapabilities {
+    pub capture_containers: bool,
+    pub capture_heap_graph: bool,
+    pub install_heap_bootstrap: bool,
+    pub materialize_wrappers: bool,
+    pub patch_wrapper_calls: bool,
+    pub default_container_restore: ContainerRestoreMode,
+}
+
+/// Which of the seven high-risk experimental stages are enabled.
+///
+/// Pure stage plan for gating and synthetic tests — no process dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExperimentalStagePlan {
+    pub detect_containers: bool,
+    pub detect_heap_globals: bool,
+    pub scrub_uncaptured_heap_pointers: bool,
+    pub install_heap_bootstrap: bool,
+    pub materialize_image_iat_wrappers: bool,
+    pub materialize_fill_code_refs: bool,
+    pub patch_wrapper_iat_call_sites: bool,
+}
+
+impl DumpProfile {
+    /// Resolve profile capabilities (pure function).
+    pub fn capabilities(self) -> DumpProfileCapabilities {
+        match self {
+            DumpProfile::OreansClassic => DumpProfileCapabilities {
+                capture_containers: false,
+                capture_heap_graph: false,
+                install_heap_bootstrap: false,
+                materialize_wrappers: false,
+                patch_wrapper_calls: false,
+                default_container_restore: ContainerRestoreMode::Off,
+            },
+            DumpProfile::AhkGtoExperimental => DumpProfileCapabilities {
+                capture_containers: true,
+                capture_heap_graph: true,
+                install_heap_bootstrap: true,
+                materialize_wrappers: true,
+                patch_wrapper_calls: true,
+                default_container_restore: ContainerRestoreMode::PostCrt,
+            },
+        }
+    }
+
+    /// Stage plan used by `dump_process` to gate experimental work.
+    pub fn stage_plan(self) -> ExperimentalStagePlan {
+        self.capabilities().stage_plan()
+    }
+}
+
+impl DumpProfileCapabilities {
+    /// Map capabilities onto the seven gated experimental call sites.
+    pub fn stage_plan(self) -> ExperimentalStagePlan {
+        ExperimentalStagePlan {
+            detect_containers: self.capture_containers,
+            detect_heap_globals: self.capture_heap_graph,
+            scrub_uncaptured_heap_pointers: self.capture_heap_graph || self.capture_containers,
+            install_heap_bootstrap: self.install_heap_bootstrap,
+            materialize_image_iat_wrappers: self.materialize_wrappers,
+            materialize_fill_code_refs: self.materialize_wrappers,
+            patch_wrapper_iat_call_sites: self.patch_wrapper_calls,
+        }
+    }
+
+    /// True when any GTO/AHK experimental capability is enabled.
+    pub fn any_experimental(self) -> bool {
+        self.capture_containers
+            || self.capture_heap_graph
+            || self.install_heap_bootstrap
+            || self.materialize_wrappers
+            || self.patch_wrapper_calls
+    }
+}
+
+impl ExperimentalStagePlan {
+    /// True when every high-risk stage is disabled (OreansClassic).
+    pub fn all_disabled(self) -> bool {
+        !self.detect_containers
+            && !self.detect_heap_globals
+            && !self.scrub_uncaptured_heap_pointers
+            && !self.install_heap_bootstrap
+            && !self.materialize_image_iat_wrappers
+            && !self.materialize_fill_code_refs
+            && !self.patch_wrapper_iat_call_sites
+    }
+
+    /// True when every high-risk stage is enabled (AhkGtoExperimental).
+    pub fn all_enabled(self) -> bool {
+        self.detect_containers
+            && self.detect_heap_globals
+            && self.scrub_uncaptured_heap_pointers
+            && self.install_heap_bootstrap
+            && self.materialize_image_iat_wrappers
+            && self.materialize_fill_code_refs
+            && self.patch_wrapper_iat_call_sites
+    }
+}
+
+// -----------------------------------------------------------------------
 // DumpOptions
 // -----------------------------------------------------------------------
 
@@ -64,6 +218,87 @@ pub struct DumpOptions {
     /// Loader-initialized section baselines captured before the target's main
     /// thread was resumed. Empty for traditional debugging and other samples.
     pub early_section_snapshots: Vec<EarlySectionSnapshot>,
+
+    /// Container restore policy (see [`ContainerRestoreMode`]).
+    /// When the user does not pass `--container-restore`, CLI sets this from
+    /// [`DumpProfileCapabilities::default_container_restore`].
+    pub container_restore: ContainerRestoreMode,
+
+    /// Dump behaviour profile. Default [`DumpProfile::OreansClassic`].
+    /// Must be passed explicitly from CLI / callers — never re-guessed here.
+    pub profile: DumpProfile,
+
+    /// Authoritative MSVC SecurityCookie RVA from offline CRT resolve.
+    /// When set with [`Self::security_cookie_complement_rva`], the dumper plants
+    /// this site and must not re-scan for cookie/complement pairs.
+    pub security_cookie_rva: Option<u32>,
+
+    /// Authoritative MSVC SecurityCookie complement RVA (paired with
+    /// [`Self::security_cookie_rva`]).
+    pub security_cookie_complement_rva: Option<u32>,
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+
+    #[test]
+    fn default_profile_is_oreans_classic() {
+        assert_eq!(DumpProfile::default(), DumpProfile::OreansClassic);
+    }
+
+    #[test]
+    fn oreans_classic_disables_all_gto_capabilities() {
+        let caps = DumpProfile::OreansClassic.capabilities();
+        assert!(!caps.capture_containers);
+        assert!(!caps.capture_heap_graph);
+        assert!(!caps.install_heap_bootstrap);
+        assert!(!caps.materialize_wrappers);
+        assert!(!caps.patch_wrapper_calls);
+        assert!(!caps.any_experimental());
+        assert_eq!(caps.default_container_restore, ContainerRestoreMode::Off);
+    }
+
+    #[test]
+    fn ahk_gto_experimental_enables_capabilities() {
+        let caps = DumpProfile::AhkGtoExperimental.capabilities();
+        assert!(caps.capture_containers);
+        assert!(caps.capture_heap_graph);
+        assert!(caps.install_heap_bootstrap);
+        assert!(caps.materialize_wrappers);
+        assert!(caps.patch_wrapper_calls);
+        assert!(caps.any_experimental());
+        assert_eq!(
+            caps.default_container_restore,
+            ContainerRestoreMode::PostCrt
+        );
+    }
+
+    #[test]
+    fn oreans_classic_stage_plan_disables_all_seven() {
+        let plan = DumpProfile::OreansClassic.stage_plan();
+        assert!(plan.all_disabled());
+        assert!(!plan.detect_containers);
+        assert!(!plan.detect_heap_globals);
+        assert!(!plan.scrub_uncaptured_heap_pointers);
+        assert!(!plan.install_heap_bootstrap);
+        assert!(!plan.materialize_image_iat_wrappers);
+        assert!(!plan.materialize_fill_code_refs);
+        assert!(!plan.patch_wrapper_iat_call_sites);
+    }
+
+    #[test]
+    fn ahk_gto_stage_plan_enables_all_seven() {
+        let plan = DumpProfile::AhkGtoExperimental.stage_plan();
+        assert!(plan.all_enabled());
+        assert!(plan.detect_containers);
+        assert!(plan.detect_heap_globals);
+        assert!(plan.scrub_uncaptured_heap_pointers);
+        assert!(plan.install_heap_bootstrap);
+        assert!(plan.materialize_image_iat_wrappers);
+        assert!(plan.materialize_fill_code_refs);
+        assert!(plan.patch_wrapper_iat_call_sites);
+    }
 }
 
 // -----------------------------------------------------------------------

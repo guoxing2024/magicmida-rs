@@ -20,7 +20,7 @@ use windows::Win32::System::Memory::{
     PAGE_PROTECTION_FLAGS,
 };
 
-use mida_core::DebuggerCore;
+use mida_core::{classify_av_exc_type, DebuggerCore};
 
 use crate::common::ThemidaState;
 use crate::error::ThemidaError;
@@ -296,15 +296,17 @@ pub fn process_guarded_access(
 
     // -- Branch 3: Exception past guard end -------------------------------------
     // The faulting instruction is past the text-section end (still inside the
-    // image) — typically the Themida VM dispatcher writing call/jmp targets
-    // into .text.  Same handling as branch 2: record + single-step.
+    // image) — typically Themida-side access (read/write/execute) against the
+    // guarded .text region.  Same handling as branch 2: record + single-step.
     //
     // **Pascal ordering**: same as branch 2 — checked before TLS.
     if exception_address >= text_section_end {
         state.guard_addrs.push(fault_address);
         state.guard_stepping = true;
+        let access_class = classify_av_exc_type(exc_type);
         debug!(
-            "Themida write to .text: target={:#x} from={:#x} (count: {})",
+            "Themida-side access to guarded .text: target={:#x} from={:#x} \
+             exc_type={exc_type} access={access_class} (count: {})",
             fault_address,
             exception_address,
             state.guard_addrs.len()
@@ -374,21 +376,75 @@ pub fn process_guarded_access(
     }
 
     // -- Branch 5: FTraceMSVCOEP -------------------------------------------------
-    // In the MSVC VM OEP tracing mode: the next .text hit IS the
-    // CRTStartup address.  Synthesize the OEP stub and finish unpacking.
+    // B7.1: next arbitrary .text hit is NEVER the common-main hint. Use the
+    // candidate preserved at FTrace enter (`msvc_common_main_seh`). Cookie is
+    // resolved offline via unique-candidate fail-closed resolver.
     if state.trace_msvc_oep {
         info!(
             exception_addr = format_args!("{exception_address:#x}"),
-            init_cookie = format_args!("{:#x}", state.msvc_init_cookie),
+            preserved_common_main = format_args!("{:#x}", state.msvc_common_main_seh),
             oep = format_args!("{:#x}", state.msvc_oep),
-            "FTraceMSVCOEP: reached __scrt_common_main_seh — writing MSVC OEP stub"
+            "FTraceMSVCOEP: resolving CRT targets offline (fail-closed)"
         );
-        crate::oep::write_msvc_oep_x64(
+
+        let text_rva = text_section_start.saturating_sub(image_base) as u32;
+        let text_size = text_section_end.saturating_sub(text_section_start) as u32;
+        let exec_ranges = [crate::oep::ExecRange {
+            rva_start: text_rva,
+            rva_end: text_rva.saturating_add(text_size),
+        }];
+
+        // B7.2: section-name-independent cookie storage — pass all PE sections;
+        // resolver xrefs cookie/complement then selects R+W non-X section.
+        let sections: Vec<crate::oep::PeSectionView> = state
+            .pe_info
+            .pe_sections
+            .iter()
+            .map(|s| crate::oep::PeSectionView {
+                virtual_address: s.virtual_address,
+                virtual_size: s.virtual_size,
+                characteristics: s.characteristics,
+            })
+            .collect();
+
+        // B7.1: preserved common-main only — never exception_address as hint.
+        let hint_va =
+            crate::oep::ftrace_common_main_hint(state.msvc_common_main_seh, exception_address);
+        let targets = crate::oep::resolve_msvc_crt_targets_from_process(
+            debugger,
+            image_base,
+            text_rva,
+            text_size,
+            &sections,
+            &exec_ranges,
+            hint_va,
+        )?;
+
+        let cookie_va = image_base.wrapping_add(targets.security_init_cookie_rva as usize);
+        let main_va = image_base.wrapping_add(targets.scrt_common_main_seh_rva as usize);
+        // Only now record cookie VA — never store the common-main hit as msvc_init_cookie.
+        state.msvc_init_cookie = cookie_va;
+        // Keep preserved candidate consistent with resolved common-main.
+        state.msvc_common_main_seh = main_va;
+        // Authoritative cookie/complement RVAs for dump plant (no fuzzy rescan).
+        state.msvc_cookie_rva = targets.cookie_site.cookie_rva;
+        state.msvc_cookie_complement_rva = targets.cookie_site.complement_rva;
+
+        info!(
+            init_cookie = format_args!("{cookie_va:#x}"),
+            common_main = format_args!("{main_va:#x}"),
+            oep = format_args!("{:#x}", state.msvc_oep),
+            "FTraceMSVCOEP: offline CRT resolve OK — writing MSVC OEP stub"
+        );
+
+        crate::oep::write_msvc_oep_x64_validated(
             debugger,
             h_process,
             state.msvc_oep,
-            state.msvc_init_cookie,
-            exception_address,
+            cookie_va,
+            main_va,
+            image_base,
+            &exec_ranges,
         )?;
         // Signal that the MSVC OEP has been synthesized.  The caller should
         // exit the debug loop and proceed to IAT/shrink phases.

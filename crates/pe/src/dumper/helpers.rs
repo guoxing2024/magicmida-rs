@@ -9,11 +9,84 @@ use windows::Win32::System::Memory::{
     PAGE_PROTECTION_FLAGS, PAGE_READONLY,
 };
 
+use crate::error::PeError;
 use crate::header::PeHeader;
 
 /// Maximum number of IAT slots to scan when determining IAT size.
 /// Corresponds to `MAX_IAT_SIZE` in `Dumper.pas` (5120 * SizeOf(Pointer)).
 pub(crate) const MAX_IAT_SLOTS: usize = 5120;
+
+/// Cap for PE / remote export-directory allocations (`export_dir.size`).
+/// Real export tables are tiny; multi-MiB values are treated as hostile input.
+pub(crate) const MAX_EXPORT_DIRECTORY_BYTES: usize = 16 * 1024 * 1024;
+
+/// Cap for section snapshot / `VirtualSize`-driven process memory reads.
+pub(crate) const MAX_SECTION_READ_BYTES: usize = 64 * 1024 * 1024;
+
+/// Cap for heap-container content copied from the debuggee.
+pub(crate) const MAX_HEAP_CONTAINER_BYTES: usize = 16 * 1024 * 1024;
+
+/// Cap for full process-image dumps (`SizeOfImage` / last-section span).
+pub(crate) const MAX_IMAGE_DUMP_BYTES: usize = 512 * 1024 * 1024;
+
+/// Cap for IAT buffer reads (slots × pointer size upper bound).
+pub(crate) const MAX_IAT_READ_BYTES: usize = MAX_IAT_SLOTS * 8;
+
+/// Allocate a zeroed buffer only when `size` is within `max`.
+///
+/// Uses `try_reserve_exact` so an OOM from a just-under-cap size fails as
+/// [`PeError::SizeLimit`] instead of aborting the process.
+pub(crate) fn alloc_capped(size: usize, max: usize, what: &str) -> Result<Vec<u8>, PeError> {
+    if size == 0 {
+        return Ok(Vec::new());
+    }
+    if size > max {
+        return Err(PeError::SizeLimit {
+            what: what.to_string(),
+            size,
+            max,
+        });
+    }
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(size)
+        .map_err(|_| PeError::SizeLimit {
+            what: format!("{what} (allocation failed)"),
+            size,
+            max,
+        })?;
+    buf.resize(size, 0);
+    Ok(buf)
+}
+
+#[cfg(test)]
+mod alloc_capped_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_oversize() {
+        let err = alloc_capped(100, 50, "test").unwrap_err();
+        match err {
+            PeError::SizeLimit { size, max, .. } => {
+                assert_eq!(size, 100);
+                assert_eq!(max, 50);
+            }
+            other => panic!("expected SizeLimit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_within_cap() {
+        let buf = alloc_capped(32, 64, "test").unwrap();
+        assert_eq!(buf.len(), 32);
+        assert!(buf.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn zero_size_is_empty() {
+        let buf = alloc_capped(0, 64, "test").unwrap();
+        assert!(buf.is_empty());
+    }
+}
 
 /// Maximum gap (in slots) between valid API addresses before we consider the
 /// IAT to have ended.  Corresponds to the `$100` byte-gap in the Pascal code.

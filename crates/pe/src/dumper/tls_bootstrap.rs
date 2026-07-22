@@ -67,6 +67,7 @@ pub(crate) fn install_tls_callback_bootstrap(
     global_vars: &[super::global_vars::GlobalVarSnapshot],
     get_process_heap_iat_rva: u32,
     heap_alloc_iat_rva: u32,
+    heap_global_rva: Option<u32>,
     original_entry_point: u32,
 ) -> Option<u32> {
     if !pe.is_64bit {
@@ -110,6 +111,8 @@ pub(crate) fn install_tls_callback_bootstrap(
         None, // data_snapshot - not using full .data restoration for now
         image_base,
         data_section_rva,
+        heap_global_rva,
+        None, // cookie_rva: TLS path uses metadata cookie fallback
     ) {
         Some(stub) => stub,
         None => {

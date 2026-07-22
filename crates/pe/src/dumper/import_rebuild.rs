@@ -104,7 +104,8 @@ pub(crate) fn rebuild_import_table_complete(
     };
 
     // Read the IAT data at the determined location.
-    let mut iat_data = vec![0u8; iat_size];
+    let mut iat_data =
+        super::helpers::alloc_capped(iat_size, super::helpers::MAX_IAT_READ_BYTES, "IAT read")?;
     let _read = debugger
         .read_memory(iat_address as usize, &mut iat_data)
         .map_err(|e| PeError::Parse(format!("Failed to read IAT: {e}")))?;
@@ -128,7 +129,8 @@ fn rebuild_import_table_inner(
     let ptr_size = iat_slot_size(is_64bit);
 
     // Read the IAT
-    let mut iat_data = vec![0u8; iat_size];
+    let mut iat_data =
+        super::helpers::alloc_capped(iat_size, super::helpers::MAX_IAT_READ_BYTES, "IAT rebuild")?;
     let _read = debugger
         .read_memory(iat_address as usize, &mut iat_data)
         .map_err(|e| PeError::Parse(format!("Failed to read IAT: {e}")))?;

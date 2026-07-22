@@ -131,11 +131,29 @@ pub fn detect_global_vars(
     let mut vars = Vec::new();
     let image_base = pe.nt_headers.optional_header.image_base;
 
+    // Cap per-variable read; critical_rvas come from analysis of untrusted PE.
+    const MAX_GLOBAL_VAR_BYTES: usize = 64 * 1024;
+    if var_size == 0 || var_size > MAX_GLOBAL_VAR_BYTES {
+        warn!(
+            var_size,
+            max = MAX_GLOBAL_VAR_BYTES,
+            "Global variable size rejected"
+        );
+        return vars;
+    }
+
     for &rva in critical_rvas {
         let va = (image_base + rva as u64) as usize;
 
         // Read runtime value
-        let mut buffer = vec![0u8; var_size];
+        let mut buffer =
+            match super::helpers::alloc_capped(var_size, MAX_GLOBAL_VAR_BYTES, "global variable") {
+                Ok(buf) => buf,
+                Err(e) => {
+                    warn!(error = %e, rva = format_args!("{rva:#x}"), "Skipped global var alloc");
+                    continue;
+                }
+            };
         match debugger.read_memory(va, &mut buffer) {
             Ok(_bytes_read) => {
                 info!(

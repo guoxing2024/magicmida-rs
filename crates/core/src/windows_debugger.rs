@@ -26,12 +26,68 @@ use windows::Win32::System::Diagnostics::Debug::{
 use windows::Win32::System::Threading::INFINITE;
 
 use crate::breakpoint::{HwBreakpoint, HwbpType};
+use crate::cleanup::{cleanup_action, CleanupAction, CleanupReport, ProcessOwnership, WaitOutcome};
+use crate::debug_event_lifecycle::{ContinuePlan, DebugEventLifecycle, DecodeDisposition};
 use crate::debugger::{ContinueStatus, DebugEvent, DebuggerCore};
 use crate::error::CoreError;
 use crate::process::{
     cleanup_stub_exe, close_process_handles, create_debug_process, patch_peb_anti_debug,
     CreateProcessOptions, TargetProcess,
 };
+
+// ---------------------------------------------------------------------------
+// ScopedThreadHandle — RAII guard for OpenThread-returned handles
+// ---------------------------------------------------------------------------
+
+/// RAII guard around a thread `HANDLE` returned by `OpenThread`.
+///
+/// `OpenThread` always produces a fresh handle owned by the caller that must
+/// be released with `CloseHandle`.  Holding the handle inside this guard
+/// guarantees release on any early-return path, even when a subsequent
+/// `GetThreadContext` / `SetThreadContext` call fails.
+///
+/// **Do not** wrap handles that come from `CREATE_THREAD_DEBUG_EVENT` or
+/// `CreateProcessW` — those are owned by [`WindowsDebugger::threads`] and
+/// [`WindowsDebugger::process`] respectively and are closed by their owners.
+/// Use [`ScopedThreadHandle::new`] exclusively for handles you opened
+/// yourself with `OpenThread`.
+pub(crate) struct ScopedThreadHandle {
+    handle: HANDLE,
+}
+
+impl ScopedThreadHandle {
+    /// Wrap a fresh `OpenThread` handle.
+    ///
+    /// Callers must ensure `handle` was returned by a successful `OpenThread`
+    /// call (and is therefore owned by the caller), not borrowed from a debug
+    /// event or the process/thread table.
+    pub(crate) fn new(handle: HANDLE) -> Self {
+        Self { handle }
+    }
+
+    /// Borrow the underlying `HANDLE` for a Windows API call.
+    ///
+    /// The returned `HANDLE` is only valid for the lifetime of this guard —
+    /// callers must not store it beyond the guard's drop.
+    pub(crate) fn as_raw(&self) -> HANDLE {
+        self.handle
+    }
+}
+
+impl Drop for ScopedThreadHandle {
+    fn drop(&mut self) {
+        // SAFETY: by construction, the handle was opened by OpenThread and is
+        // owned by this guard.  CloseHandle releases it exactly once.  Invalid
+        // handles (e.g. from OpenThread returning a sentinel on failure) are
+        // skipped because CloseHandle against an invalid handle is a no-op
+        // that still sets ERROR_INVALID_HANDLE — we avoid the noise.
+        if !self.handle.is_invalid() {
+            unsafe {
+                let _ = CloseHandle(self.handle);
+            }
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // WindowsDebugger
@@ -51,10 +107,16 @@ pub struct WindowsDebugger {
     soft_breakpoints: HashMap<usize, u8>,
     /// Registered threads: thread_id → thread handle.
     threads: HashMap<u32, HANDLE>,
-    /// Whether this debugger was created in post-attach mode.
-    post_attach: bool,
-    /// Tracks the explicit one-time resume required by post-attach mode.
+    /// How the target came under the debugger's control — the single source
+    /// of truth for `Drop` cleanup.  Separates process **ownership** (did we
+    /// `CreateProcessW` it?) from debug-port presence, so an owned
+    /// post-attach launch is terminated (not detached) on `Drop`.
+    ownership: ProcessOwnership,
+    /// Tracks the explicit one-time resume required by post-attach launch
+    /// mode (owned, no debug port from `t=0`).
     post_attach_resumed: bool,
+    /// Exactly-once pending debug-event identity (Wait → Continue contract).
+    lifecycle: DebugEventLifecycle,
 }
 
 impl WindowsDebugger {
@@ -78,13 +140,23 @@ impl WindowsDebugger {
         let mut threads = HashMap::new();
         threads.insert(process.main_thread_id, process.main_thread_handle);
 
+        let root_pid = process.pid;
+        // Ownership is assigned BEFORE prepare_post_attach so that a failure
+        // partway through construction still drops an owned process (killed)
+        // rather than detaching a process we actually created.
+        let ownership = if opts.post_attach {
+            ProcessOwnership::OwnedPostAttach
+        } else {
+            ProcessOwnership::OwnedLaunch
+        };
         let mut dbg = Self {
             process,
             hw_breakpoints: Default::default(),
             soft_breakpoints: HashMap::new(),
             threads,
-            post_attach: opts.post_attach,
+            ownership,
             post_attach_resumed: false,
+            lifecycle: DebugEventLifecycle::new(root_pid),
         };
 
         if opts.post_attach {
@@ -112,14 +184,15 @@ impl WindowsDebugger {
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError::ProcessCreation`] when called outside post-attach
-    /// mode, called more than once, or when `ResumeThread` fails.
+    /// Returns [`CoreError::ProcessCreation`] when called outside
+    /// [`ProcessOwnership::OwnedPostAttach`] mode, called more than once, or
+    /// when `ResumeThread` fails.
     pub fn resume_post_attach_main_thread(&mut self) -> Result<(), CoreError> {
         use windows::Win32::System::Threading::ResumeThread;
 
-        if !self.post_attach {
+        if !matches!(self.ownership, ProcessOwnership::OwnedPostAttach) {
             return Err(CoreError::ProcessCreation(
-                "cannot resume post-attach thread outside post-attach mode".into(),
+                "cannot resume post-attach thread outside owned post-attach launch mode".into(),
             ));
         }
         if self.post_attach_resumed {
@@ -167,6 +240,12 @@ impl WindowsDebugger {
     /// Return the image base discovered during `CREATE_PROCESS_DEBUG_EVENT`.
     pub fn image_base(&self) -> u64 {
         self.process.image_base
+    }
+
+    /// Return how the target came under the debugger's control — the single
+    /// source of truth for `Drop` cleanup.
+    pub fn ownership(&self) -> ProcessOwnership {
+        self.ownership
     }
 
     // ------------------------------------------------------------------
@@ -456,22 +535,36 @@ impl WindowsDebugger {
             c
         };
 
-        // Try every handle we can get a hold of, in order of preference.
-        let mut handles: Vec<HANDLE> = Vec::new();
+        // Try a fresh OpenThread handle first.  This handle is owned by us
+        // and MUST be closed; wrap it in ScopedThreadHandle so it is released
+        // on any early return.  The thread-table handle (if any) is borrowed
+        // from self.threads and must NOT be closed here — its lifetime is
+        // managed by WindowsDebugger::drop / ExitThread bookkeeping.
         // SAFETY: OpenThread returns a fresh valid HANDLE; thread_id comes from a registered debug thread.
-        unsafe {
-            if let Ok(h) = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, false, thread_id) {
-                handles.push(h);
-            }
-            if let Ok(h) = self.thread_handle(thread_id) {
-                if !handles.contains(&h) {
-                    handles.push(h);
+        let open_thread_handle =
+            unsafe { OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, false, thread_id).ok() };
+        let scoped = open_thread_handle.map(ScopedThreadHandle::new);
+
+        // Borrowed handle from the thread table — do NOT close this one.
+        let borrowed_handle = self.thread_handle(thread_id).ok();
+
+        // Try the OpenThread handle first (if we got one) — it typically has
+        // THREAD_SET_CONTEXT rights whereas the CREATE_THREAD_DEBUG_EVENT
+        // handle sometimes does not.
+        if let Some(ref g) = scoped {
+            // SAFETY: g wraps a fresh OpenThread handle with THREAD_SET_CONTEXT rights; dr_ctx is a properly initialised CONTEXT.
+            unsafe {
+                if SetThreadContext(g.as_raw(), &dr_ctx).is_ok() {
+                    return Ok(());
                 }
             }
         }
 
-        for &h in &handles {
-            // SAFETY: h is a valid thread handle with THREAD_SET_CONTEXT rights; dr_ctx is a properly initialised CONTEXT.
+        // Fall back to the borrowed table handle.  We pass the raw value to
+        // SetThreadContext but do NOT close it here — it remains owned by
+        // self.threads.
+        if let Some(h) = borrowed_handle {
+            // SAFETY: h is a valid thread handle from CREATE_THREAD_DEBUG_EVENT; dr_ctx is a properly initialised CONTEXT.  We do not close h.
             unsafe {
                 if SetThreadContext(h, &dr_ctx).is_ok() {
                     return Ok(());
@@ -698,9 +791,11 @@ impl WindowsDebugger {
         };
 
         // SAFETY: OpenThread returns a fresh valid HANDLE; thread_id comes from a registered debug thread.
+        // The handle is wrapped in ScopedThreadHandle so CloseHandle runs on every return path.
         let h = unsafe {
-            OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, false, thread_id)
-                .map_err(|e| CoreError::Windows(e.code().0 as u32))?
+            let raw = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, false, thread_id)
+                .map_err(|e| CoreError::Windows(e.code().0 as u32))?;
+            ScopedThreadHandle::new(raw)
         };
 
         let mut ctx = CONTEXT {
@@ -708,17 +803,19 @@ impl WindowsDebugger {
             ..Default::default()
         };
 
-        // SAFETY: h is a valid thread handle with THREAD_SET_CONTEXT rights; ctx is a properly initialised CONTEXT.
+        // SAFETY: h.as_raw() is a valid thread handle with THREAD_SET_CONTEXT rights; ctx is a properly initialised CONTEXT.
         unsafe {
-            GetThreadContext(h, &mut ctx).map_err(|e| CoreError::Windows(e.code().0 as u32))?;
+            GetThreadContext(h.as_raw(), &mut ctx)
+                .map_err(|e| CoreError::Windows(e.code().0 as u32))?;
         }
 
         // Set the trap flag (TF, bit 8 in EFlags).
         ctx.EFlags |= 0x100;
 
-        // SAFETY: h is a valid thread handle with THREAD_SET_CONTEXT rights; ctx is a properly initialised CONTEXT.
+        // SAFETY: h.as_raw() is a valid thread handle with THREAD_SET_CONTEXT rights; ctx is a properly initialised CONTEXT.
         unsafe {
-            SetThreadContext(h, &ctx).map_err(|e| CoreError::Windows(e.code().0 as u32))?;
+            SetThreadContext(h.as_raw(), &ctx)
+                .map_err(|e| CoreError::Windows(e.code().0 as u32))?;
         }
 
         Ok(())
@@ -726,11 +823,84 @@ impl WindowsDebugger {
 }
 
 // ---------------------------------------------------------------------------
-// Drop — clean up handles and stub EXE
+// Drop — clean up handles, terminate target, and delete stub EXE
 // ---------------------------------------------------------------------------
+
+/// Maximum time (ms) to wait for the target to exit after TerminateProcess.
+const DROP_TERMINATE_TIMEOUT_MS: u32 = 5000;
 
 impl Drop for WindowsDebugger {
     fn drop(&mut self) {
+        use windows::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
+
+        // --- Lifecycle: decide cleanup from ownership, not debug-port state ---
+        //
+        // Ownership (not `post_attach`) drives cleanup.  Every ownership
+        // variant here is *owned* (we created the process via CreateProcessW),
+        // so `Drop` always performs `TerminateProcess` + bounded wait.  The
+        // borrowed-attach / `DebugActiveProcessStop` detach path was removed:
+        // it had no real caller and was dead code.
+        let report = match cleanup_action(self.ownership) {
+            CleanupAction::TerminateAndWait => {
+                if self.process.handle.is_invalid() {
+                    // Construction-midway-failure shape: handle not usable.
+                    let r = CleanupReport::for_construction_failure(self.ownership);
+                    warn!(
+                        pid = self.process.pid,
+                        summary = r.summary(),
+                        "Drop: process handle invalid — cannot terminate owned target"
+                    );
+                    CleanupReport::for_terminate(
+                        self.ownership,
+                        false,
+                        None,
+                        WaitOutcome::Failed(6), // ERROR_INVALID_HANDLE
+                    )
+                } else {
+                    // SAFETY: TerminateProcess on a valid owned handle.
+                    let tp = unsafe { TerminateProcess(self.process.handle, 1) };
+                    let terminate_ok = tp.is_ok();
+                    let term_win32 = tp.err().map(|e| e.code().0 as u32);
+                    // SAFETY: bounded wait on the owned process handle.
+                    let wait_result = unsafe {
+                        WaitForSingleObject(self.process.handle, DROP_TERMINATE_TIMEOUT_MS)
+                    };
+                    let wait = match wait_result.0 {
+                        0 => WaitOutcome::Signaled,
+                        0x102 => WaitOutcome::Timeout, // WAIT_TIMEOUT
+                        _ => {
+                            // SAFETY: GetLastError for the failed wait.
+                            let code = unsafe { GetLastError() }.0;
+                            WaitOutcome::Failed(code)
+                        }
+                    };
+                    let report = CleanupReport::for_terminate(
+                        self.ownership,
+                        terminate_ok,
+                        term_win32,
+                        wait,
+                    );
+                    // Surface failures at warn! so they are not lost in a
+                    // debug!-only report.  Only full success uses debug!.
+                    if report.is_clean() {
+                        debug!(
+                            pid = self.process.pid,
+                            summary = report.summary(),
+                            "Drop: terminated owned target + bounded wait (clean)"
+                        );
+                    } else {
+                        warn!(
+                            pid = self.process.pid,
+                            summary = report.summary(),
+                            "Drop: cleanup issue (terminate failed, wait timeout, or wait failed)"
+                        );
+                    }
+                    report
+                }
+            }
+        };
+        let _ = report; // diagnostics already emitted above.
+
         // Close every registered thread handle EXCEPT the main thread.
         // The main-thread handle is owned by `self.process` and will be closed
         // together with the process handle by `close_process_handles` below —
@@ -773,148 +943,26 @@ impl DebuggerCore for WindowsDebugger {
     }
 
     fn wait_event_timeout(&mut self, timeout_ms: u32) -> Result<DebugEvent, CoreError> {
-        let mut raw: RAW_DEBUG_EVENT = RAW_DEBUG_EVENT::default();
-
-        // SAFETY: WaitForDebugEvent with a custom timeout.
-        let wait_result = unsafe { WaitForDebugEvent(&mut raw, timeout_ms) };
-
-        match wait_result {
-            Ok(()) => {
-                match Self::decode_event(&raw) {
-                    Ok(event) => {
-                        // Bookkeeping.
-                        match &event {
-                            DebugEvent::CreateThread {
-                                thread_id,
-                                h_thread,
-                                ..
-                            } => {
-                                self.threads.insert(*thread_id, *h_thread);
-                                // Sync DR state only when we have a HW BP to
-                                // propagate — avoids `ERROR_PARTIAL_COPY`
-                                // spam against threads we can't suspend.
-                                if self.has_any_hw_breakpoint() {
-                                    if let Err(e) = self.apply_debug_registers_thread(*thread_id) {
-                                        warn!(thread_id, error = %e, "failed to propagate DR state to new thread");
-                                    }
-                                }
-                            }
-                            DebugEvent::ExitThread { thread_id, .. } => {
-                                self.threads.remove(thread_id);
-                            }
-                            DebugEvent::CreateProcess { image_base, .. } => {
-                                self.process.image_base = *image_base;
-                            }
-                            _ => {}
-                        }
-                        Ok(event)
-                    }
-                    Err(CoreError::Handled) => {
-                        // Event was handled internally - return a dummy event
-                        // that the caller can detect and handle.
-                        Err(CoreError::Timeout)
-                    }
-                    Err(e) => Err(e),
-                }
-            }
-            Err(e) => {
-                // Check if this is a timeout (ERROR_SEM_TIMEOUT = 121).
-                // WaitForDebugEvent returns an HRESULT whose low 16 bits
-                // contain the Win32 error code (HRESULT_FROM_WIN32 pattern).
-                let error_code = (e.code().0 as u32) & 0xFFFF;
-                if error_code == 121 {
-                    Err(CoreError::Timeout)
-                } else {
-                    Err(CoreError::Windows(error_code))
-                }
-            }
-        }
+        // Exactly one outer wait attempt with the caller's timeout. Internally
+        // ignored events are continued and the next wait uses a zero remaining
+        // budget so we do not silently extend the caller's timeout.
+        self.wait_next_event(timeout_ms)
     }
 
     fn wait_event(&mut self) -> Result<DebugEvent, CoreError> {
         loop {
-            let mut raw: RAW_DEBUG_EVENT = RAW_DEBUG_EVENT::default();
-
-            // SAFETY: WaitForDebugEvent with INFINITE timeout is the
-            // canonical debug-loop pattern.  raw is a valid out-pointer.
-            let wait_result = unsafe { WaitForDebugEvent(&mut raw, INFINITE) };
-            if let Err(err) = wait_result {
-                let code = err.code().0 as u32;
-                debug!(error_code = code, "WaitForDebugEvent failed");
-                return Err(CoreError::Windows(code));
-            }
-
-            let _event_code = raw.dwDebugEventCode;
-            let ev = match Self::decode_event(&raw) {
-                Ok(event) => event,
-                Err(CoreError::Handled) => continue,
+            match self.wait_next_event(INFINITE) {
+                Ok(ev) => return Ok(ev),
+                // Should not surface from wait_next_event with INFINITE, but
+                // keep the loop defensive.
+                Err(CoreError::Timeout) => continue,
                 Err(e) => return Err(e),
-            };
-            let _is_create_process = matches!(ev, DebugEvent::CreateProcess { .. });
-
-            // Bookkeeping before returning the event.
-            match &ev {
-                DebugEvent::CreateThread {
-                    thread_id,
-                    h_thread,
-                    ..
-                } => {
-                    self.threads.insert(*thread_id, *h_thread);
-                    if self.has_any_hw_breakpoint() {
-                        if let Err(e) = self.apply_debug_registers_thread(*thread_id) {
-                            warn!(thread_id, error = %e, "failed to propagate DR state to new thread");
-                        }
-                    }
-                }
-                DebugEvent::ExitThread { thread_id, .. } => {
-                    let h = self.threads.remove(thread_id);
-                    if let Some(h) = h {
-                        if !h.is_invalid() {
-                            // SAFETY: handle is valid and belongs to us.
-                            unsafe {
-                                let _ = CloseHandle(h);
-                            }
-                        }
-                    }
-                }
-                DebugEvent::ExitProcess { .. } => {
-                    // The debuggee is gone; the call site will break out of
-                    // the loop after processing this event.
-                }
-                _ => {}
             }
-
-            // On CREATE_PROCESS, do PEB patching and store image base.
-            if let DebugEvent::CreateProcess {
-                h_process,
-                h_thread,
-                ..
-            } = &ev
-            {
-                // SAFETY: h_process and h_thread are valid handles from the
-                // debug event; we patch anti-debug flags before the target
-                // runs any code.
-                let image_base = patch_peb_anti_debug(*h_process)?;
-                self.process.image_base = image_base;
-                self.threads.insert(self.process.main_thread_id, *h_thread);
-            }
-
-            return Ok(ev);
         }
     }
 
     fn continue_event(&mut self, thread_id: u32, status: ContinueStatus) -> Result<(), CoreError> {
-        let nt_status = match status {
-            ContinueStatus::Continue => DBG_CONTINUE,
-            ContinueStatus::ContinueNoStep => DBG_CONTINUE,
-        };
-
-        // SAFETY: pid and tid come from the current debug event.
-        unsafe {
-            ContinueDebugEvent(self.process.pid, thread_id, nt_status)
-                .map_err(|e| CoreError::Windows(e.code().0 as u32))?;
-        }
-        Ok(())
+        self.continue_pending(thread_id, status)
     }
 
     fn read_memory(&self, address: usize, buf: &mut [u8]) -> Result<usize, CoreError> {
@@ -965,18 +1013,21 @@ impl DebuggerCore for WindowsDebugger {
         use windows::Win32::System::Threading::{OpenThread, THREAD_GET_CONTEXT};
 
         // SAFETY: OpenThread returns a valid HANDLE for the given live thread_id.
+        // Wrapped in ScopedThreadHandle so CloseHandle runs on every return path.
         let h = unsafe {
-            OpenThread(THREAD_GET_CONTEXT, false, thread_id)
-                .map_err(|e| CoreError::Windows(e.code().0 as u32))?
+            let raw = OpenThread(THREAD_GET_CONTEXT, false, thread_id)
+                .map_err(|e| CoreError::Windows(e.code().0 as u32))?;
+            ScopedThreadHandle::new(raw)
         };
         let mut ctx = CONTEXT {
             ContextFlags: Self::full_context_flags(),
             ..Default::default()
         };
 
-        // SAFETY: h is a valid thread handle with THREAD_GET_CONTEXT rights; ctx is a writable CONTEXT.
+        // SAFETY: h.as_raw() is a valid thread handle with THREAD_GET_CONTEXT rights; ctx is a writable CONTEXT.
         unsafe {
-            GetThreadContext(h, &mut ctx).map_err(|e| CoreError::Windows(e.code().0 as u32))?;
+            GetThreadContext(h.as_raw(), &mut ctx)
+                .map_err(|e| CoreError::Windows(e.code().0 as u32))?;
         }
 
         Ok(ctx)
@@ -986,18 +1037,21 @@ impl DebuggerCore for WindowsDebugger {
         use windows::Win32::System::Threading::{OpenThread, THREAD_GET_CONTEXT};
 
         // SAFETY: OpenThread returns a valid HANDLE for the given live thread_id.
+        // Wrapped in ScopedThreadHandle so CloseHandle runs on every return path.
         let h = unsafe {
-            OpenThread(THREAD_GET_CONTEXT, false, thread_id)
-                .map_err(|e| CoreError::Windows(e.code().0 as u32))?
+            let raw = OpenThread(THREAD_GET_CONTEXT, false, thread_id)
+                .map_err(|e| CoreError::Windows(e.code().0 as u32))?;
+            ScopedThreadHandle::new(raw)
         };
         let mut ctx = CONTEXT {
             ContextFlags: Self::control_context_flags(),
             ..Default::default()
         };
 
-        // SAFETY: h is a valid thread handle with THREAD_GET_CONTEXT rights; ctx is a writable CONTEXT.
+        // SAFETY: h.as_raw() is a valid thread handle with THREAD_GET_CONTEXT rights; ctx is a writable CONTEXT.
         unsafe {
-            GetThreadContext(h, &mut ctx).map_err(|e| CoreError::Windows(e.code().0 as u32))?;
+            GetThreadContext(h.as_raw(), &mut ctx)
+                .map_err(|e| CoreError::Windows(e.code().0 as u32))?;
         }
 
         Ok(ctx)
@@ -1007,18 +1061,21 @@ impl DebuggerCore for WindowsDebugger {
         use windows::Win32::System::Threading::{OpenThread, THREAD_GET_CONTEXT};
 
         // SAFETY: OpenThread returns a valid HANDLE for the given live thread_id.
+        // Wrapped in ScopedThreadHandle so CloseHandle runs on every return path.
         let h = unsafe {
-            OpenThread(THREAD_GET_CONTEXT, false, thread_id)
-                .map_err(|e| CoreError::Windows(e.code().0 as u32))?
+            let raw = OpenThread(THREAD_GET_CONTEXT, false, thread_id)
+                .map_err(|e| CoreError::Windows(e.code().0 as u32))?;
+            ScopedThreadHandle::new(raw)
         };
         let mut ctx = CONTEXT {
             ContextFlags: Self::control_integer_context_flags(),
             ..Default::default()
         };
 
-        // SAFETY: h is a valid thread handle with THREAD_GET_CONTEXT rights; ctx is a writable CONTEXT.
+        // SAFETY: h.as_raw() is a valid thread handle with THREAD_GET_CONTEXT rights; ctx is a writable CONTEXT.
         unsafe {
-            GetThreadContext(h, &mut ctx).map_err(|e| CoreError::Windows(e.code().0 as u32))?;
+            GetThreadContext(h.as_raw(), &mut ctx)
+                .map_err(|e| CoreError::Windows(e.code().0 as u32))?;
         }
 
         Ok(ctx)
@@ -1028,14 +1085,16 @@ impl DebuggerCore for WindowsDebugger {
         use windows::Win32::System::Threading::{OpenThread, THREAD_SET_CONTEXT};
 
         // SAFETY: OpenThread returns a valid HANDLE for the given live thread_id.
+        // Wrapped in ScopedThreadHandle so CloseHandle runs on every return path.
         let h = unsafe {
-            OpenThread(THREAD_SET_CONTEXT, false, thread_id)
-                .map_err(|e| CoreError::Windows(e.code().0 as u32))?
+            let raw = OpenThread(THREAD_SET_CONTEXT, false, thread_id)
+                .map_err(|e| CoreError::Windows(e.code().0 as u32))?;
+            ScopedThreadHandle::new(raw)
         };
 
-        // SAFETY: h is a valid thread handle with THREAD_SET_CONTEXT rights; ctx is a properly initialised CONTEXT.
+        // SAFETY: h.as_raw() is a valid thread handle with THREAD_SET_CONTEXT rights; ctx is a properly initialised CONTEXT.
         unsafe {
-            SetThreadContext(h, ctx).map_err(|e| CoreError::Windows(e.code().0 as u32))?;
+            SetThreadContext(h.as_raw(), ctx).map_err(|e| CoreError::Windows(e.code().0 as u32))?;
         }
 
         Ok(())
@@ -1043,10 +1102,176 @@ impl DebuggerCore for WindowsDebugger {
 }
 
 // ---------------------------------------------------------------------------
-// Internal — raw DEBUG_EVENT → DebugEvent decoding
+// Internal — pending-event lifecycle + raw DEBUG_EVENT decode
 // ---------------------------------------------------------------------------
 
 impl WindowsDebugger {
+    /// Wait for the next *delivered* debug event under the exactly-once contract.
+    ///
+    /// On success the returned event is pending and the caller must
+    /// [`continue_event`](DebuggerCore::continue_event) exactly once.
+    /// Internally ignored events (`OUTPUT_DEBUG_STRING`, unknown codes) are
+    /// continued with `DBG_CONTINUE` before the next wait so decode never
+    /// returns `Handled` without a matching continue.
+    fn wait_next_event(&mut self, timeout_ms: u32) -> Result<DebugEvent, CoreError> {
+        // With a finite timeout we only perform one WaitForDebugEvent at the
+        // caller's budget. After an internal continue, further waits use 0 ms
+        // so we never extend the original deadline.
+        let mut first = true;
+        loop {
+            self.lifecycle.ensure_can_wait()?;
+
+            let mut raw: RAW_DEBUG_EVENT = RAW_DEBUG_EVENT::default();
+            let wait_timeout = if first {
+                first = false;
+                timeout_ms
+            } else if timeout_ms == INFINITE {
+                INFINITE
+            } else {
+                0
+            };
+
+            // SAFETY: WaitForDebugEvent; raw is a valid out-pointer.
+            let wait_result = unsafe { WaitForDebugEvent(&mut raw, wait_timeout) };
+            if let Err(e) = wait_result {
+                // ERROR_SEM_TIMEOUT = 121 (HRESULT low word).
+                let error_code = (e.code().0 as u32) & 0xFFFF;
+                if error_code == 121 {
+                    return Err(CoreError::Timeout);
+                }
+                debug!(error_code, "WaitForDebugEvent failed");
+                return Err(CoreError::Windows(error_code));
+            }
+
+            let process_id = raw.dwProcessId;
+            let thread_id = raw.dwThreadId;
+            let event_code = raw.dwDebugEventCode.0;
+            self.lifecycle
+                .record_wait_success(process_id, thread_id, event_code)?;
+
+            match DebugEventLifecycle::disposition_for_event_code(event_code) {
+                DecodeDisposition::IgnoreAndContinue => {
+                    if event_code == OUTPUT_DEBUG_STRING_EVENT.0 {
+                        trace!("Ignoring OUTPUT_DEBUG_STRING_EVENT (exactly-once continue)");
+                    } else {
+                        debug!(
+                            code = event_code,
+                            "Unknown debug event code — exactly-once continue"
+                        );
+                    }
+                    // Must continue the *pending* identity before next wait.
+                    self.continue_pending(thread_id, ContinueStatus::Continue)?;
+                    // Loop for another wait: INFINITE keeps blocking; finite
+                    // budgets use 0 ms so we never extend the caller's deadline
+                    // beyond the first WaitForDebugEvent.
+                    continue;
+                }
+                DecodeDisposition::RipError => {
+                    warn!("RIP_EVENT received — system-level debug error");
+                    // Unified lifecycle: continue once on pending identity, then
+                    // surface an error (do not continue inside decode).
+                    let cont = self.continue_pending(thread_id, ContinueStatus::Continue);
+                    if let Err(e) = cont {
+                        return Err(e);
+                    }
+                    return Err(CoreError::Windows(0));
+                }
+                DecodeDisposition::Deliver => {}
+            }
+
+            let ev = match Self::decode_event(&raw) {
+                Ok(event) => event,
+                // Unhandled exception codes still leave the event pending for
+                // the outer loop / continue path; surface the error as-is.
+                Err(e) => return Err(e),
+            };
+
+            self.apply_event_bookkeeping(&ev)?;
+            return Ok(ev);
+        }
+    }
+
+    /// Continue the current pending event under the lifecycle contract.
+    fn continue_pending(
+        &mut self,
+        provided_tid: u32,
+        status: ContinueStatus,
+    ) -> Result<(), CoreError> {
+        let nt_status = match status {
+            ContinueStatus::Continue => DBG_CONTINUE,
+            ContinueStatus::ContinueNoStep => DBG_CONTINUE,
+        };
+
+        match self.lifecycle.plan_continue(provided_tid) {
+            ContinuePlan::Reject(e) => Err(e),
+            ContinuePlan::Proceed {
+                process_id,
+                thread_id,
+            } => {
+                // SAFETY: process_id/thread_id are the pending WaitForDebugEvent
+                // identity; nt_status is DBG_CONTINUE.
+                let result = unsafe { ContinueDebugEvent(process_id, thread_id, nt_status) };
+                match result {
+                    Ok(()) => {
+                        self.lifecycle.clear_pending_after_continue_ok();
+                        Ok(())
+                    }
+                    Err(e) => {
+                        let hresult = e.code().0 as u32;
+                        // Retain pending for diagnosis; never swallow INVALID_PARAMETER.
+                        Err(self.lifecycle.continue_failed_error(hresult, provided_tid))
+                    }
+                }
+            }
+        }
+    }
+
+    /// Thread table / image-base bookkeeping for a delivered event.
+    fn apply_event_bookkeeping(&mut self, ev: &DebugEvent) -> Result<(), CoreError> {
+        match ev {
+            DebugEvent::CreateThread {
+                thread_id,
+                h_thread,
+                ..
+            } => {
+                self.threads.insert(*thread_id, *h_thread);
+                if self.has_any_hw_breakpoint() {
+                    if let Err(e) = self.apply_debug_registers_thread(*thread_id) {
+                        warn!(thread_id, error = %e, "failed to propagate DR state to new thread");
+                    }
+                }
+            }
+            DebugEvent::ExitThread { thread_id, .. } => {
+                let h = self.threads.remove(thread_id);
+                if let Some(h) = h {
+                    if !h.is_invalid() {
+                        // SAFETY: handle is valid and belongs to us.
+                        unsafe {
+                            let _ = CloseHandle(h);
+                        }
+                    }
+                }
+            }
+            DebugEvent::CreateProcess {
+                image_base,
+                h_process,
+                h_thread,
+                ..
+            } => {
+                // SAFETY: handles from CREATE_PROCESS_DEBUG_EVENT.
+                let img = patch_peb_anti_debug(*h_process)?;
+                // Prefer PEB-derived base; fall back to event base.
+                self.process.image_base = if img != 0 { img } else { *image_base };
+                self.threads.insert(self.process.main_thread_id, *h_thread);
+            }
+            DebugEvent::ExitProcess { .. } => {
+                // Caller breaks out of the debug loop after this event.
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     /// Read only the debug-register portion of the given thread's context.
     /// This works where [`DebuggerCore::get_thread_context`] cannot: the
     /// full CONTEXT request trips ERROR_PARTIAL_COPY on threads belonging
@@ -1057,15 +1282,17 @@ impl WindowsDebugger {
         use windows::Win32::System::Threading::{OpenThread, THREAD_GET_CONTEXT};
 
         // SAFETY: OpenThread returns a valid HANDLE for the given live thread_id.
+        // Wrapped in ScopedThreadHandle so CloseHandle runs on every return path.
         let h = unsafe {
-            OpenThread(THREAD_GET_CONTEXT, false, thread_id)
-                .map_err(|e| CoreError::Windows(e.code().0 as u32))?
+            let raw = OpenThread(THREAD_GET_CONTEXT, false, thread_id)
+                .map_err(|e| CoreError::Windows(e.code().0 as u32))?;
+            ScopedThreadHandle::new(raw)
         };
         let mut ctx = Box::new(CONTEXT::default());
         ctx.ContextFlags = Self::debug_registers_flags();
-        // SAFETY: h is a valid thread handle with THREAD_GET_CONTEXT rights; ctx is a heap-allocated CONTEXT.
+        // SAFETY: h.as_raw() is a valid thread handle with THREAD_GET_CONTEXT rights; ctx is a heap-allocated CONTEXT.
         unsafe {
-            GetThreadContext(h, std::ptr::from_mut(&mut *ctx))
+            GetThreadContext(h.as_raw(), std::ptr::from_mut(&mut *ctx))
                 .map_err(|e| CoreError::Windows(e.code().0 as u32))?;
         }
         Ok(*ctx)
@@ -1181,25 +1408,110 @@ impl WindowsDebugger {
                 }
             }
 
+            // OUTPUT_DEBUG_STRING_EVENT, RIP_EVENT, and unknown codes are
+            // handled by `DebugEventLifecycle::disposition_for_event_code`
+            // before decode: they receive exactly-one ContinueDebugEvent on
+            // the pending identity and never reach this function.
             OUTPUT_DEBUG_STRING_EVENT => {
-                trace!("Ignoring OUTPUT_DEBUG_STRING_EVENT");
-                return Err(CoreError::Handled);
+                // Defensive: should not be reached.
+                return Err(CoreError::DebugState(
+                    "OUTPUT_DEBUG_STRING_EVENT reached decode_event; expected lifecycle disposition"
+                        .into(),
+                ));
             }
 
             RIP_EVENT => {
-                warn!("RIP_EVENT received — system-level debug error");
-                // SAFETY: pid and thread_id come from the RIP_EVENT being handled; DBG_CONTINUE is a valid status.
-                let _ =
-                    unsafe { ContinueDebugEvent(raw.dwProcessId, raw.dwThreadId, DBG_CONTINUE) };
-                return Err(CoreError::Windows(0));
+                return Err(CoreError::DebugState(
+                    "RIP_EVENT reached decode_event; expected lifecycle disposition".into(),
+                ));
             }
 
-            _ => {
-                debug!(code = raw.dwDebugEventCode.0, "Unknown debug event code");
-                return Err(CoreError::Handled);
+            other => {
+                return Err(CoreError::DebugState(format!(
+                    "unknown debug event code {} reached decode_event; expected lifecycle disposition",
+                    other.0
+                )));
             }
         };
 
         Ok(ev)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests — ScopedThreadHandle Drop semantics
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `ScopedThreadHandle` wrapping a real OpenThread handle on the *current*
+    /// thread must not panic on Drop, and must release the handle exactly once.
+    ///
+    /// This exercises the Drop path with a genuine kernel handle.  We open the
+    /// current thread with `THREAD_QUERY_INFORMATION` (a benign right) and let
+    /// the guard close it.
+    #[test]
+    fn scoped_thread_handle_drops_real_handle() {
+        use windows::Win32::System::Threading::{
+            GetCurrentThreadId, OpenThread, THREAD_QUERY_INFORMATION,
+        };
+
+        let tid = unsafe { GetCurrentThreadId() };
+        // SAFETY: OpenThread against the current thread is always valid.
+        let raw = unsafe {
+            OpenThread(THREAD_QUERY_INFORMATION, false, tid)
+                .expect("OpenThread on current thread must succeed")
+        };
+        assert!(!raw.is_invalid(), "freshly opened handle must be valid");
+
+        // Wrap it — Drop should CloseHandle.
+        {
+            let _g = ScopedThreadHandle::new(raw);
+        }
+
+        // CloseHandle on the now-released handle should fail with
+        // ERROR_INVALID_HANDLE (6).  This proves Drop already closed it.
+        // SAFETY: we are testing the post-drop state of a handle we own.
+        let close_result = unsafe { CloseHandle(raw) };
+        assert!(
+            close_result.is_err(),
+            "CloseHandle after ScopedThreadHandle drop must fail (handle already closed); got Ok"
+        );
+    }
+
+    /// `ScopedThreadHandle::as_raw` returns the same handle value that was
+    /// passed in.  This is the contract that the leaking call sites rely on
+    /// when they hand the raw value to `GetThreadContext` / `SetThreadContext`.
+    #[test]
+    fn scoped_thread_handle_as_raw_roundtrips() {
+        // Use a pseudo-handle sentinel that CloseHandle will reject — we never
+        // actually drop the guard in this test, so no kernel handle is
+        // released.  This isolates the as_raw behaviour from the Drop path.
+        let sentinel = HANDLE(-1 as isize as *mut std::ffi::c_void);
+        let g = ScopedThreadHandle::new(sentinel);
+        assert_eq!(
+            g.as_raw(),
+            sentinel,
+            "as_raw must return the wrapped handle"
+        );
+    }
+
+    /// Dropping a `ScopedThreadHandle` wrapping an invalid handle must not
+    /// panic and must not call `CloseHandle` on the sentinel value.  The
+    /// `is_invalid()` check inside Drop is the guard against this.
+    #[test]
+    fn scoped_thread_handle_drop_invalid_handle_is_noop() {
+        // HANDLE(null) is the conventional invalid handle on Windows.
+        let invalid = HANDLE(std::ptr::null_mut());
+        // If Drop called CloseHandle(null) it would set ERROR_INVALID_HANDLE
+        // and return Err — but we swallow the result inside Drop, so the only
+        // way this test can fail is by panicking, which it must not.
+        {
+            let _g = ScopedThreadHandle::new(invalid);
+        }
+        // Reaching here means Drop ran without panicking — the regression is
+        // satisfied.
     }
 }

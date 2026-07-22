@@ -17,10 +17,13 @@ use crate::header::PeHeader;
 
 use super::data_reinit::{decode_pointer, encode_pointer, find_security_cookie_in_data};
 
+use super::helpers::{alloc_capped, MAX_HEAP_CONTAINER_BYTES};
+
 const POINTER_TRIPLE_SIZE: usize = 24;
 const MIN_USER_POINTER: u64 = 0x1_0000;
 const MAX_USER_POINTER: u64 = 0x0000_7fff_ffff_ffff;
-const MAX_CONTAINER_SPAN: u64 = 0x1000_0000;
+/// Maximum capacity−begin span accepted as a heap container candidate.
+const MAX_CONTAINER_SPAN: u64 = MAX_HEAP_CONTAINER_BYTES as u64;
 
 /// Metadata for a heap-referenced encoded container detected in `.data`.
 #[derive(Debug, Clone)]
@@ -109,8 +112,21 @@ pub fn detect_containers(
         let rva = (start + offset) as u32;
         let size = (decoded[1] - decoded[0]) as usize;
 
-        // Read heap content from live process
-        let mut heap_content = vec![0u8; size];
+        // Cap heap copy size — decoded pointers come from untrusted live data.
+        let mut heap_content = match alloc_capped(size, MAX_HEAP_CONTAINER_BYTES, "heap container")
+        {
+            Ok(buf) => buf,
+            Err(e) => {
+                warn!(
+                    rva = format_args!("{rva:#x}"),
+                    heap_addr = format_args!("{:#x}", decoded[0]),
+                    size,
+                    error = %e,
+                    "Skipping container: heap size rejected"
+                );
+                continue;
+            }
+        };
         let read_result = debugger.read_memory(decoded[0] as usize, &mut heap_content);
 
         if read_result.is_err() {
@@ -168,13 +184,20 @@ fn is_heap_container(decoded: &[u64; 3], image_base: u64, image_end: u64) -> boo
     if (image_base..image_end).contains(&begin) {
         return false;
     }
-
-    if begin > end || end > capacity {
+    // Empty [begin,end) triples are extremely common false positives and
+    // rewriting them corrupts real .data values during TLS bootstrap.
+    if begin >= end || end > capacity {
         return false;
     }
 
     let span = capacity.saturating_sub(begin);
-    if span > MAX_CONTAINER_SPAN {
+    if span == 0 || span > MAX_CONTAINER_SPAN {
+        return false;
+    }
+
+    // Real CRT/STL heap buffers are at least one pointer wide in practice.
+    let used = end - begin;
+    if used < 8 || used > MAX_HEAP_CONTAINER_BYTES as u64 {
         return false;
     }
 
@@ -215,9 +238,12 @@ pub fn restore_containers(
         let size = container
             .decoded_end
             .saturating_sub(container.decoded_begin);
+        let capacity_size = container
+            .decoded_capacity
+            .saturating_sub(container.decoded_begin);
         let new_begin = new_heap_base;
         let new_end = new_begin.saturating_add(size);
-        let new_capacity = new_end;
+        let new_capacity = new_begin.saturating_add(capacity_size);
 
         let encoded = [
             encode_pointer(new_begin, container.cookie),
@@ -257,6 +283,23 @@ mod tests {
     }
 
     #[test]
+    fn rejects_empty_begin_end_triples() {
+        let image_base = 0x140000000;
+        let image_end = image_base + 0x100000;
+        // begin == end was previously accepted and rewrote thousands of .data slots.
+        assert!(!is_heap_container(
+            &[0x500000, 0x500000, 0x500100],
+            image_base,
+            image_end
+        ));
+        assert!(is_heap_container(
+            &[0x500000, 0x500100, 0x500200],
+            image_base,
+            image_end
+        ));
+    }
+
+    #[test]
     fn restores_single_container() {
         let cookie = 0x3497_64dd_2eee;
         let mut buf = vec![0u8; 0x1000];
@@ -281,6 +324,6 @@ mod tests {
 
         assert_eq!(decode_pointer(restored[0], cookie), new_heap);
         assert_eq!(decode_pointer(restored[1], cookie), new_heap + 0x100);
-        assert_eq!(decode_pointer(restored[2], cookie), new_heap + 0x100);
+        assert_eq!(decode_pointer(restored[2], cookie), new_heap + 0x200);
     }
 }

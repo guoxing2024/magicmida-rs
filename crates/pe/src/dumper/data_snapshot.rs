@@ -23,6 +23,8 @@ use tracing::{debug, info, warn};
 
 use crate::header::PeHeader;
 
+use super::helpers::{alloc_capped, MAX_SECTION_READ_BYTES};
+
 /// Snapshot of the complete .data section from the live process.
 #[derive(Debug, Clone)]
 pub struct DataSectionSnapshot {
@@ -61,7 +63,7 @@ pub fn capture_data_section(
     let data_rva = data_section.virtual_address;
     let data_size = data_section.virtual_size;
 
-    if data_size == 0 || data_size > 0x10_0000 {
+    if data_size == 0 || data_size as usize > MAX_SECTION_READ_BYTES {
         warn!(
             data_rva = format_args!("{:#x}", data_rva),
             data_size = format_args!("{:#x}", data_size),
@@ -74,7 +76,14 @@ pub fn capture_data_section(
     let image_base = pe.nt_headers.optional_header.image_base;
     let data_va = image_base + data_rva as u64;
 
-    let mut data_content = vec![0u8; data_size as usize];
+    let mut data_content =
+        match alloc_capped(data_size as usize, MAX_SECTION_READ_BYTES, ".data section") {
+            Ok(buf) => buf,
+            Err(e) => {
+                warn!(error = %e, "Rejected .data section allocation");
+                return None;
+            }
+        };
     match debugger.read_memory(data_va as usize, &mut data_content) {
         Ok(bytes_read) => {
             if bytes_read < data_size as usize {

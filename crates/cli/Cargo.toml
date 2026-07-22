@@ -14,6 +14,11 @@ mida-disasm = { path = "../disasm" }
 mida-tracer = { path = "../tracer" }
 mida-packers-themida = { path = "../packers/themida" }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 windows = { workspace = true }
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

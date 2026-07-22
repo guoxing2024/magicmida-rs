@@ -57,9 +57,19 @@ pub use iat::{
 };
 pub use init::{init_pe_details, locate_themida_section, ThemidaPeInfo};
 pub use oep::{
-    find_real_oep_by_scanning, find_real_oep_in_bytes, handle_tls_callbacks, is_oep_virtualized,
-    restore_stolen_oep_msvc6, restore_stolen_oep_msvc9_dll, try_find_correct_oep,
-    try_find_correct_oep_by_range, write_msvc_oep_x64, TlsCallbackResult,
+    cookie_complement_from_security_init_xrefs, decode_msvc_oep_wrapper, encode_msvc_oep_wrapper,
+    find_cookie_complement_site, find_real_oep_by_scanning, find_real_oep_in_bytes,
+    ftrace_common_main_hint, ftrace_enter_preserve_common_main, handle_tls_callbacks,
+    is_oep_virtualized, is_scrt_common_main_seh_bytes, is_tls_or_dynamic_init_helper_bytes,
+    reject_if_tls_helper_as_common_main, require_full_section_read,
+    resolve_cookie_site_via_security_init_xrefs, resolve_msvc_crt_targets,
+    resolve_msvc_crt_targets_from_process, resolve_msvc_crt_targets_with_sections,
+    resolve_security_init_cookie, restore_stolen_oep_msvc6, restore_stolen_oep_msvc9_dll,
+    rva_range_in_section, select_cookie_storage_section, try_find_correct_oep,
+    try_find_correct_oep_by_range, validate_scrt_common_main_seh, validate_wrapper_targets,
+    window_contains_security_cookie_sentinel, write_msvc_oep_x64, write_msvc_oep_x64_validated,
+    CookieComplementSite, ExecRange, MsvcCrtResolveError, MsvcCrtTargets, PeSectionView,
+    TlsCallbackResult, DEFAULT_SECURITY_COOKIE, MSVC_OEP_WRAPPER_LEN,
 };
 pub use postprocess::{
     create_data_sections, dump_process_code, install_anti_dump_fix, shrink_pe, DataSectionResult,

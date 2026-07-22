@@ -1,0 +1,66 @@
+[
+  {
+    "name": "agnostic_text_only_pass",
+    "inputs": {"text_present": true, "text_has_raw": true, "text_looks_code": true, "large_rx_present": false, "large_rx_has_raw": true, "has_ahk_export": false},
+    "profile": "packer-agnostic",
+    "expected_pass": true,
+    "expected_failures": [],
+    "expected_warnings": []
+  },
+  {
+    "name": "agnostic_missing_text_fail",
+    "inputs": {"text_present": false, "text_has_raw": false, "text_looks_code": false, "large_rx_present": false, "large_rx_has_raw": true, "has_ahk_export": false},
+    "profile": "packer-agnostic",
+    "expected_pass": false,
+    "expected_failures": [".text section missing", ".text section has no raw data"],
+    "expected_warnings": [".text section does not look like code (warning)"]
+  },
+  {
+    "name": "agnostic_text_no_raw_fail",
+    "inputs": {"text_present": true, "text_has_raw": false, "text_looks_code": true, "large_rx_present": false, "large_rx_has_raw": true, "has_ahk_export": false},
+    "profile": "packer-agnostic",
+    "expected_pass": false,
+    "expected_failures": [".text section has no raw data"],
+    "expected_warnings": []
+  },
+  {
+    "name": "text_looks_code_is_warning_only",
+    "inputs": {"text_present": true, "text_has_raw": true, "text_looks_code": false, "large_rx_present": false, "large_rx_has_raw": true, "has_ahk_export": false},
+    "profile": "packer-agnostic",
+    "expected_pass": true,
+    "expected_failures": [],
+    "expected_warnings": [".text section does not look like code (warning)"]
+  },
+  {
+    "name": "ahk_launcher_large_rx_raw_pass",
+    "inputs": {"text_present": true, "text_has_raw": true, "text_looks_code": true, "large_rx_present": true, "large_rx_has_raw": true, "has_ahk_export": false},
+    "profile": "ahk-launcher",
+    "expected_pass": true,
+    "expected_failures": [],
+    "expected_warnings": []
+  },
+  {
+    "name": "ahk_launcher_export_only_pass",
+    "inputs": {"text_present": true, "text_has_raw": true, "text_looks_code": true, "large_rx_present": false, "large_rx_has_raw": true, "has_ahk_export": true},
+    "profile": "ahk-launcher",
+    "expected_pass": true,
+    "expected_failures": [],
+    "expected_warnings": []
+  },
+  {
+    "name": "ahk_launcher_no_large_rx_no_export_fail",
+    "inputs": {"text_present": true, "text_has_raw": true, "text_looks_code": true, "large_rx_present": false, "large_rx_has_raw": true, "has_ahk_export": false},
+    "profile": "ahk-launcher",
+    "expected_pass": false,
+    "expected_failures": ["no large RX section (>=0x100000) and no AhkExec export"],
+    "expected_warnings": []
+  },
+  {
+    "name": "ahk_launcher_large_rx_no_raw_fail",
+    "inputs": {"text_present": true, "text_has_raw": true, "text_looks_code": true, "large_rx_present": true, "large_rx_has_raw": false, "has_ahk_export": false},
+    "profile": "ahk-launcher",
+    "expected_pass": false,
+    "expected_failures": ["large RX section present without raw data"],
+    "expected_warnings": []
+  }
+]

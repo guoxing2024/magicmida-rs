@@ -376,15 +376,14 @@ pub fn fix_iat_v3(
                 }
             }
             Err(e) => {
-                warn!("fix_iat_v3: cannot get thread context: {e}");
+                return Err(ThemidaError::Debugger(format!(
+                    "fix_iat_v3: cannot get thread context for trace_start_sp: {e}"
+                )));
             }
         }
     }
 
-    if state.trace_start_sp == 0 {
-        warn!("fix_iat_v3: trace_start_sp is 0 - cannot trace");
-        return Ok(());
-    }
+    require_trace_start_sp(state.trace_start_sp)?;
 
     let log = |msg_type: LogMsgType, msg: &str| match msg_type {
         LogMsgType::Info => info!("[v3-trace] {msg}"),
@@ -408,7 +407,77 @@ pub fn fix_iat_v3(
         );
     }
 
+    // Fail-closed: incomplete IAT must not report success (caller skips dump).
+    gate_v3_trace_result(result.resolved_count, result.failed_count)
+}
+
+/// Production result gate for V3 IAT tracing (used by [`fix_iat_v3`]).
+///
+/// - `failed > 0` → incomplete tracing → `Err` (no "IAT fixed" / no dump).
+/// - `failed == 0` → success, including the empty case (no wrapper slots).
+pub(crate) fn gate_v3_trace_result(resolved: usize, failed: usize) -> Result<(), ThemidaError> {
+    if failed > 0 {
+        return Err(ThemidaError::Debugger(format!(
+            "IAT v3 trace incomplete: {resolved} resolved, {failed} failed — refusing dump"
+        )));
+    }
+    let _ = resolved; // success when failed==0 regardless of resolved
     Ok(())
+}
+
+/// Production pre-condition for V3 IAT tracing (used by [`fix_iat_v3`]).
+pub(crate) fn require_trace_start_sp(sp: usize) -> Result<(), ThemidaError> {
+    if sp == 0 {
+        return Err(ThemidaError::Debugger(
+            "fix_iat_v3: trace_start_sp is 0 — cannot start V3 IAT tracing".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{gate_v3_trace_result, require_trace_start_sp};
+
+    #[test]
+    fn gate_zero_resolved_many_failed_is_err() {
+        let err = gate_v3_trace_result(0, 295).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("incomplete"));
+        assert!(msg.contains("0 resolved"));
+        assert!(msg.contains("295 failed"));
+    }
+
+    #[test]
+    fn gate_one_resolved_zero_failed_is_ok() {
+        assert!(gate_v3_trace_result(1, 0).is_ok());
+    }
+
+    #[test]
+    fn gate_zero_resolved_zero_failed_is_ok() {
+        // No Themida wrappers left to resolve — complete empty success.
+        assert!(gate_v3_trace_result(0, 0).is_ok());
+    }
+
+    #[test]
+    fn gate_any_failed_count_rejects_even_with_partial_resolve() {
+        // Any failed_count > 0 refuses dump (including 1 resolved + 1 failed).
+        let err = gate_v3_trace_result(1, 1).unwrap_err();
+        assert!(err.to_string().contains("incomplete"));
+        assert!(err.to_string().contains("1 resolved"));
+        assert!(err.to_string().contains("1 failed"));
+    }
+
+    #[test]
+    fn require_trace_start_sp_zero_is_err() {
+        let err = require_trace_start_sp(0).unwrap_err();
+        assert!(err.to_string().contains("trace_start_sp is 0"));
+    }
+
+    #[test]
+    fn require_trace_start_sp_nonzero_is_ok() {
+        assert!(require_trace_start_sp(0x15ff00).is_ok());
+    }
 }
 
 /// Resolve the host-process addresses of the anti-trace APIs (Sleep and

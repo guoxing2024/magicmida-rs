@@ -9,11 +9,21 @@ use crate::header::PeHeader;
 const POINTER_TRIPLE_SIZE: usize = 24;
 const MIN_USER_POINTER: u64 = 0x1_0000;
 const MAX_USER_POINTER: u64 = 0x0000_7fff_ffff_ffff;
+/// Absolute CRT/heap pointers observed in dumped Themida images land in the
+/// low 4GB of the process (e.g. `0x8d3e40`, `0x8a0000`). SecurityCookie and
+/// other high-entropy constants sit well above that range and must stay.
+const MAX_PROCESS_LOCAL_HEAP_POINTER: u64 = 0x0000_0000_ffff_ffff;
 const MAX_CONTAINER_SPAN: u64 = 0x1000_0000;
+const IMAGE_SCN_MEM_WRITE: u32 = 0x8000_0000;
+const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 
 /// Reset SecurityCookie-encoded `{begin, end, capacity}` triples whose decoded
-/// pointers refer to process-local heap memory. Other `.data` bytes, including
-/// CRT heap handles, configuration, and critical sections, are preserved.
+/// pointers refer to process-local heap memory, and clear raw process-local
+/// absolute pointers (CRT heap handles, `_pioinfo`, stdio tables, etc.).
+///
+/// Keeping those live-process addresses in an independent dump makes the CRT
+/// re-entry path (e.g. `__scrt_common_main_seh`) dereference freed heap and
+/// AV at `_pioinfo[i]->_ptr` / similar globals.
 pub(crate) fn reinitialize_zero_filled_data(
     pe: &PeHeader,
     dump_buf: &mut [u8],
@@ -23,18 +33,31 @@ pub(crate) fn reinitialize_zero_filled_data(
         return 0;
     }
 
+    let image_base = pe.nt_headers.optional_header.image_base;
+    let image_size = pe.size_of_image();
+
+    // Always scrub raw process-local absolute pointers from writable image
+    // data. Encoded cookie triples are not raw heap addresses and survive.
+    let cleared_ptrs = clear_process_local_absolute_pointers(pe, dump_buf, image_base, image_size);
+    if cleared_ptrs > 0 {
+        info!(
+            cleared = cleared_ptrs,
+            "Cleared process-local absolute pointers from writable sections"
+        );
+    }
+
     let Some(path) = executable_path else {
-        return 0;
+        return cleared_ptrs;
     };
     let Ok(original_pe) = PeHeader::from_file(path) else {
         warn!(path = %path.display(), "Cannot inspect original PE for .data reinitialization");
-        return 0;
+        return cleared_ptrs;
     };
     let Some(original_data) = original_pe.sections.iter().find(|s| s.name == ".data") else {
-        return 0;
+        return cleared_ptrs;
     };
     if original_data.header.size_of_raw_data != 0 {
-        return 0;
+        return cleared_ptrs;
     }
 
     let Some(data) = pe
@@ -42,7 +65,7 @@ pub(crate) fn reinitialize_zero_filled_data(
         .iter()
         .find(|s| s.name == ".data" && s.virtual_address == original_data.virtual_address)
     else {
-        return 0;
+        return cleared_ptrs;
     };
 
     let start = data.virtual_address as usize;
@@ -50,7 +73,7 @@ pub(crate) fn reinitialize_zero_filled_data(
         .saturating_add(data.virtual_size as usize)
         .min(dump_buf.len());
     if end.saturating_sub(start) < POINTER_TRIPLE_SIZE {
-        return 0;
+        return cleared_ptrs;
     }
 
     let Some(cookie) = find_security_cookie(&dump_buf[start..end]) else {
@@ -58,15 +81,11 @@ pub(crate) fn reinitialize_zero_filled_data(
             data_rva = format_args!("{:#x}", data.virtual_address),
             "SecurityCookie not found in .data"
         );
-        return 0;
+        return cleared_ptrs;
     };
 
-    let offsets = reset_stale_encoded_containers(
-        &mut dump_buf[start..end],
-        cookie,
-        pe.nt_headers.optional_header.image_base,
-        pe.size_of_image(),
-    );
+    let offsets =
+        reset_stale_encoded_containers(&mut dump_buf[start..end], cookie, image_base, image_size);
     let rvas: Vec<String> = offsets
         .iter()
         .map(|offset| format!("{:#x}", data.virtual_address as usize + offset))
@@ -77,7 +96,66 @@ pub(crate) fn reinitialize_zero_filled_data(
         rvas = %rvas.join(", "),
         "Reset stale SecurityCookie-encoded .data containers"
     );
-    offsets.len()
+    cleared_ptrs.saturating_add(offsets.len())
+}
+
+/// Zero 8-byte absolute pointers that point into process-local user address
+/// space outside the image. Image-relative pointers and non-pointer scalars
+/// are preserved so CRT can reinitialize heap/stdio from a clean BSS-like
+/// baseline on the next process start.
+fn clear_process_local_absolute_pointers(
+    pe: &PeHeader,
+    dump_buf: &mut [u8],
+    image_base: u64,
+    image_size: u32,
+) -> usize {
+    let image_end = image_base.saturating_add(image_size as u64);
+    let mut cleared = 0usize;
+
+    // Restrict to classic MSVC `.data` only.
+    //
+    // Themida keeps decrypted code in zero-raw `.fill` gaps (W, non-X) until
+    // materialize promotes them to `.wfix`. Scrubbing those pages treats
+    // instruction bytes as heap pointers — e.g. `btr …; movabs rsi,0` encodes
+    // `A0 48 BE 00 00 00 00 00` = 0xBE48A0 and becomes eleven `00`s, then AV on
+    // `add [rax],al`. `.wfix` (RWX) is excluded the same way.
+    for section in pe.sections.iter().filter(|s| {
+        s.characteristics & IMAGE_SCN_MEM_WRITE != 0
+            && s.characteristics & IMAGE_SCN_MEM_EXECUTE == 0
+            && (s.name == ".data" || s.name.starts_with(".data"))
+    }) {
+        let start = section.virtual_address as usize;
+        let end = start
+            .saturating_add(section.virtual_size as usize)
+            .min(dump_buf.len());
+        if end.saturating_sub(start) < 8 {
+            continue;
+        }
+
+        let aligned_start = (start + 7) & !7;
+        for offset in (aligned_start..end.saturating_sub(7)).step_by(8) {
+            let value =
+                u64::from_le_bytes(dump_buf[offset..offset + 8].try_into().unwrap_or_default());
+            if is_process_local_absolute_pointer(value, image_base, image_end) {
+                dump_buf[offset..offset + 8].fill(0);
+                cleared += 1;
+            }
+        }
+    }
+
+    cleared
+}
+
+fn is_process_local_absolute_pointer(value: u64, image_base: u64, image_end: u64) -> bool {
+    if value < MIN_USER_POINTER || value > MAX_PROCESS_LOCAL_HEAP_POINTER {
+        return false;
+    }
+    // Prefer 8-byte aligned heap-like pointers; unaligned values are more often
+    // packed constants / cookie fragments than CRT table entries.
+    if value & 7 != 0 {
+        return false;
+    }
+    !(image_base..image_end).contains(&value)
 }
 
 fn find_security_cookie(data: &[u8]) -> Option<u64> {

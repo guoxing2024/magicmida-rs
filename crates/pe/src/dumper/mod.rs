@@ -33,6 +33,7 @@ mod dump_process;
 mod global_vars;
 mod header_patch;
 mod heap_bootstrap;
+mod heap_global_snapshot;
 mod helpers;
 mod import_rebuild;
 mod import_section;
@@ -45,6 +46,8 @@ mod serialize;
 mod tests;
 mod tls_bootstrap;
 mod types;
+mod wrapper_call_patch;
+mod wrapper_materialize;
 
 // Re-export public API
 pub use self::dump_process::{dump_dotnet, dump_process};
@@ -52,4 +55,7 @@ pub use self::helpers::is_dotnet;
 pub use self::import_rebuild::rebuild_import_table;
 pub use self::original_imports::get_original_imports;
 pub use self::remote_modules::take_module_snapshot;
-pub use self::types::{DumpOptions, EarlySectionSnapshot, RemoteModule};
+pub use self::types::{
+    ContainerRestoreMode, DumpOptions, DumpProfile, DumpProfileCapabilities, EarlySectionSnapshot,
+    ExperimentalStagePlan, OepPolicy, RemoteModule,
+};

@@ -105,8 +105,8 @@ impl ImportTableBuilder {
     ///
     /// Returns `(section_data, thunks)` where:
     /// - `section_data` is the `.import` section content (descriptors followed
-    ///   by hint/name strings; the descriptor's FirstThunks are set to 0 and
-    ///   must be patched in by the caller via `original_iat_rva`).
+    ///   by hint/name strings). `OriginalFirstThunk` is zero because this
+    ///   layout intentionally uses the original IAT as the lookup table.
     /// - `thunks` is a flat vector of slot values (one u64 per name-hinted
     ///   import, plus a null terminator per module) to be written at
     ///   `original_iat_rva` so the PE loader resolves them at load time.
@@ -243,10 +243,11 @@ impl ImportTableBuilder {
                 current_iat_rva
             };
 
-            // Write descriptor
-            // CRITICAL FIX: OriginalFirstThunk must point to ILT for Windows loader
-            // Since we write Hint/Name RVAs to the IAT location, we use the same address
-            data[desc_offset..desc_offset + 4].copy_from_slice(&module_ft_rva.to_le_bytes()); // OFT = IAT (both point to Hint/Name table)
+            // No separate ILT is emitted by this layout. OFT=0 tells the
+            // Windows loader to use FirstThunk as the lookup table. Pointing
+            // OFT at the live IAT is unsafe when that range contains any
+            // process-local value: the loader interprets it as an RVA.
+            data[desc_offset..desc_offset + 4].copy_from_slice(&0u32.to_le_bytes());
             data[desc_offset + 4..desc_offset + 8].copy_from_slice(&0u32.to_le_bytes());
             data[desc_offset + 8..desc_offset + 12].copy_from_slice(&0u32.to_le_bytes());
             data[desc_offset + 12..desc_offset + 16].copy_from_slice(&dll_name_rva.to_le_bytes());
@@ -607,8 +608,18 @@ mod tests {
 
         assert_eq!(builder.emitted_descriptor_count(), 2);
         assert_eq!(
+            u32::from_le_bytes(section[0..4].try_into().unwrap()),
+            0,
+            "no separate ILT: OriginalFirstThunk must remain zero"
+        );
+        assert_eq!(
             u32::from_le_bytes(section[16..20].try_into().unwrap()),
             0x1000
+        );
+        assert_eq!(
+            u32::from_le_bytes(section[20..24].try_into().unwrap()),
+            0,
+            "every split descriptor must keep OriginalFirstThunk zero"
         );
         assert_eq!(
             u32::from_le_bytes(section[36..40].try_into().unwrap()),
@@ -619,6 +630,100 @@ mod tests {
         assert!(thunks[1..32].iter().all(|&slot| slot == 0));
         assert_ne!(thunks[32], 0);
         assert_eq!(thunks[33], 0);
+    }
+
+    /// Every non-null descriptor from `build_import_section_no_iat` must keep
+    /// `OriginalFirstThunk == 0` and a non-zero `FirstThunk` (loader uses FT as ILT).
+    #[test]
+    fn no_iat_every_descriptor_oft_zero_firstthunk_nonzero() {
+        let mut builder = ImportTableBuilder::new(true);
+        let mod_a = builder.add_module("kernel32.dll");
+        mod_a.thunks.push(ImportThunk {
+            iat_address: 0x2000,
+            function_name: Some("CreateFileW".into()),
+            ordinal: None,
+            is_64bit: true,
+        });
+        mod_a.thunks.push(ImportThunk {
+            iat_address: 0x2008,
+            function_name: Some("ReadFile".into()),
+            ordinal: None,
+            is_64bit: true,
+        });
+        // Gap forces a split descriptor for the same DLL.
+        mod_a.thunks.push(ImportThunk {
+            iat_address: 0x2020,
+            function_name: Some("CloseHandle".into()),
+            ordinal: None,
+            is_64bit: true,
+        });
+        let mod_b = builder.add_module("ntdll.dll");
+        mod_b.thunks.push(ImportThunk {
+            iat_address: 0x2100,
+            function_name: None,
+            ordinal: Some(42),
+            is_64bit: true,
+        });
+
+        let (section, thunks) = builder.build_import_section_no_iat(0x6000, 0x2000);
+        let desc_count = builder.emitted_descriptor_count();
+        assert!(desc_count >= 2, "expected split + ordinal descriptors");
+
+        for i in 0..desc_count {
+            let base = i * IMPORT_DESCRIPTOR_SIZE;
+            let oft = u32::from_le_bytes(section[base..base + 4].try_into().unwrap());
+            let name = u32::from_le_bytes(section[base + 12..base + 16].try_into().unwrap());
+            let ft = u32::from_le_bytes(section[base + 16..base + 20].try_into().unwrap());
+            assert_ne!(name, 0, "descriptor {i} must be non-null");
+            assert_eq!(oft, 0, "descriptor {i}: OriginalFirstThunk must be 0");
+            assert_ne!(ft, 0, "descriptor {i}: FirstThunk must be non-zero");
+        }
+
+        // Null terminator descriptor
+        let term = desc_count * IMPORT_DESCRIPTOR_SIZE;
+        assert_eq!(
+            u32::from_le_bytes(section[term + 12..term + 16].try_into().unwrap()),
+            0
+        );
+
+        // Ordinal slot carries the high-bit flag; name slots are non-zero RVAs;
+        // zeros between runs are module/run terminators.
+        assert!(thunks.iter().any(|&s| s == (IMAGE_ORDINAL_FLAG64 | 42)));
+        assert!(thunks
+            .iter()
+            .any(|&s| s != 0 && s & IMAGE_ORDINAL_FLAG64 == 0));
+        assert!(thunks.iter().any(|&s| s == 0));
+    }
+
+    #[test]
+    fn no_iat_ordinal_and_hint_name_slots() {
+        let mut builder = ImportTableBuilder::new(true);
+        let m = builder.add_module("mixed.dll");
+        m.thunks.push(ImportThunk {
+            iat_address: 0x3000,
+            function_name: Some("ByName".into()),
+            ordinal: None,
+            is_64bit: true,
+        });
+        m.thunks.push(ImportThunk {
+            iat_address: 0x3008,
+            function_name: None,
+            ordinal: Some(7),
+            is_64bit: true,
+        });
+
+        let (section, thunks) = builder.build_import_section_no_iat(0x7000, 0x3000);
+        assert_eq!(u32::from_le_bytes(section[0..4].try_into().unwrap()), 0);
+        assert_ne!(u32::from_le_bytes(section[16..20].try_into().unwrap()), 0);
+
+        assert_ne!(thunks[0], 0);
+        assert_eq!(
+            thunks[0] & IMAGE_ORDINAL_FLAG64,
+            0,
+            "hint/name is not ordinal"
+        );
+        assert_eq!(thunks[1], IMAGE_ORDINAL_FLAG64 | 7);
+        assert_eq!(thunks[2], 0, "module terminator");
     }
 
     #[test]

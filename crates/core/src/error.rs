@@ -56,4 +56,61 @@ pub enum CoreError {
     /// Debug event wait timed out.
     #[error("debug event wait timed out")]
     Timeout,
+
+    /// Debug-event lifecycle state machine violation (no Win32 call made, or
+    /// ContinueDebugEvent failed with full diagnostic context).
+    ///
+    /// Prefer this over bare [`CoreError::Windows`] when the failure involves
+    /// pending-event identity, double-continue, TID mismatch, or
+    /// `ContinueDebugEvent` parameter errors such as `ERROR_INVALID_PARAMETER`.
+    #[error("{0}")]
+    DebugState(String),
+}
+
+/// Format a `ContinueDebugEvent` failure with HRESULT, Win32 low-word, and
+/// pending-event identity. Used so `ERROR_INVALID_PARAMETER` is never shown
+/// only as the decimal HRESULT `2147942487`.
+pub fn format_continue_debug_event_error(
+    hresult: u32,
+    pending_pid: u32,
+    pending_tid: u32,
+    pending_code: u32,
+    provided_tid: u32,
+    root_pid: u32,
+    pending_still_set: bool,
+) -> String {
+    let win32 = hresult & 0xFFFF;
+    format!(
+        "ContinueDebugEvent failed: HRESULT=0x{hresult:08X} Win32={win32} \
+         (ERROR_INVALID_PARAMETER=87 when Win32=87); \
+         pending_pid={pending_pid} pending_tid={pending_tid} pending_code={pending_code} \
+         provided_tid={provided_tid} root_pid={root_pid} pending_still_set={pending_still_set}"
+    )
+}
+
+/// Extract the Win32 low-word error code from an HRESULT (HRESULT_FROM_WIN32).
+#[inline]
+pub fn win32_from_hresult(hresult: u32) -> u32 {
+    hresult & 0xFFFF
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hresult_0x80070057_parses_win32_87() {
+        let hr = 0x8007_0057u32;
+        assert_eq!(win32_from_hresult(hr), 87);
+        // Same bit pattern as S3's decimal HRESULT display (2147942487).
+        assert_eq!(win32_from_hresult(2_147_942_487), 87);
+        let msg = format_continue_debug_event_error(hr, 17532, 12748, 1, 12748, 17532, true);
+        assert!(msg.contains("HRESULT=0x80070057"));
+        assert!(msg.contains("Win32=87"));
+        assert!(msg.contains("pending_pid=17532"));
+        assert!(msg.contains("pending_tid=12748"));
+        assert!(msg.contains("provided_tid=12748"));
+        assert!(msg.contains("root_pid=17532"));
+        assert!(msg.contains("pending_still_set=true"));
+    }
 }

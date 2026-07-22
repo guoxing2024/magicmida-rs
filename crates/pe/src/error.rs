@@ -44,4 +44,16 @@ pub enum PeError {
     /// The data buffer is too small to contain valid PE headers.
     #[error("Buffer too small: need at least {0} bytes, got {1}")]
     BufferTooSmall(usize, usize),
+
+    /// A size field from PE headers or live process memory exceeds the
+    /// allowed allocation cap (malformed / hostile input DoS guard).
+    #[error("Size limit exceeded for {what}: requested {size} bytes (max {max})")]
+    SizeLimit {
+        /// Human-readable description of the allocation site.
+        what: String,
+        /// Requested size in bytes.
+        size: usize,
+        /// Configured maximum in bytes.
+        max: usize,
+    },
 }

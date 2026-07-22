@@ -25,6 +25,7 @@ pub use decision::{trace_is_at_api, TraceStepDecision};
 
 use mida_core::debugger::{DebugEvent, DebuggerCore};
 use mida_tracer::LogMsgType;
+use windows::Win32::System::Memory::{VirtualProtectEx, PAGE_PROTECTION_FLAGS, PAGE_READWRITE};
 
 use crate::common::ThemidaState;
 use crate::error::ThemidaError;
@@ -253,13 +254,8 @@ pub fn trace_imports(
         );
         trash_counter = 0;
 
-        if debugger.get_thread_context(main_thread_id).is_err() {
-            log(
-                LogMsgType::Info,
-                "Debug session ended — skipping remaining IAT slots",
-            );
-            break;
-        }
+        // Context / session errors: let trace_one_slot return Err and fail-fast
+        // (no pre-check break that could yield a false 0/0 success).
 
         state.traced_api = 0;
         state.trace_in_vm = false;
@@ -336,37 +332,80 @@ pub fn trace_imports(
                 }
             }
             Err(e) => {
-                failed_count += 1;
-                failed_slots.push(i);
+                // Fail-fast on debugger/lifecycle errors — do not count and
+                // continue other slots (avoids N identical "no pending" fatals).
                 log(
                     LogMsgType::Fatal,
-                    &format!("IAT[{i}] {slot_va:#x}: tracer error: {e}"),
+                    &format!("IAT[{i}] {slot_va:#x}: tracer error (fail-fast): {e}"),
                 );
+                return Err(e);
             }
         }
     }
 
     // Write the repaired IAT back to the target.
+    // IAT often lives in a READONLY data section (name may be empty / not
+    // ".rdata"); temporarily PAGE_READWRITE the exact range before write, then
+    // restore the previous protection. Single old_protect is enough for the
+    // current lunlun range (one 4K page); not a multi-page protect framework.
     if resolved_count > 0 {
         let write_size = actual_slots * ptr_size;
-        let bytes_written = debugger
-            .write_memory(
-                iat.address,
-                // SAFETY: iat_data is a Vec<usize>; the aliasing immutable slice covers exactly write_size bytes and is discarded after write_memory.
-                unsafe { std::slice::from_raw_parts(iat_data.as_ptr() as *const u8, write_size) },
-            )
-            .map_err(|e| ThemidaError::Debugger(format!("trace_imports write IAT: {e}")))?;
+        // SAFETY: iat_data is a Vec<usize>; the aliasing immutable slice covers
+        // exactly write_size bytes and is discarded after write_memory.
+        let iat_bytes =
+            unsafe { std::slice::from_raw_parts(iat_data.as_ptr() as *const u8, write_size) };
 
-        if bytes_written < write_size {
-            log(
-                LogMsgType::Info,
-                &format!("trace_imports: short write ({bytes_written} of {write_size} bytes)"),
-            );
+        let mut old_protect = PAGE_PROTECTION_FLAGS::default();
+        // SAFETY: process_handle is the live debuggee; iat.address/write_size
+        // are the exact IAT buffer bounds; old_protect is a valid out-pointer.
+        unsafe {
+            VirtualProtectEx(
+                debugger.process_handle(),
+                iat.address as *const std::ffi::c_void,
+                write_size,
+                PAGE_READWRITE,
+                &mut old_protect,
+            )
+        }
+        .map_err(|e| {
+            ThemidaError::Debugger(format!(
+                "trace_imports write IAT: VirtualProtectEx PAGE_READWRITE failed \
+                 at {:#x} size={write_size} (VPE stage=unprotect): {e}",
+                iat.address
+            ))
+        })?;
+
+        // Do not `?` the write: restore must always run after a successful unprotect.
+        let write_outcome = debugger.write_memory(iat.address, iat_bytes);
+
+        let mut restore_tmp = PAGE_PROTECTION_FLAGS::default();
+        // SAFETY: same handle/range as unprotect; restore saved old_protect.
+        let restore_outcome = unsafe {
+            VirtualProtectEx(
+                debugger.process_handle(),
+                iat.address as *const std::ffi::c_void,
+                write_size,
+                old_protect,
+                &mut restore_tmp,
+            )
+        };
+
+        let write_for_merge: Result<usize, String> = write_outcome.map_err(|e| e.to_string());
+        let restore_for_merge: Result<(), String> = restore_outcome.map_err(|e| e.to_string());
+        if let Err(msg) =
+            combine_bulk_iat_write_restore(write_for_merge, write_size, restore_for_merge)
+        {
+            return Err(ThemidaError::Debugger(msg));
         }
     }
 
+    let complete_level = if failed_count == 0 {
+        LogMsgType::Good
+    } else {
+        LogMsgType::Fatal
+    };
     log(
-        LogMsgType::Good,
+        complete_level,
         &format!(
             "IAT trace complete: {} resolved, {} failed",
             resolved_count, failed_count
@@ -383,6 +422,36 @@ pub fn trace_imports(
 // ===========================================================================
 // Helpers
 // ===========================================================================
+
+/// Merge bulk IAT `write_memory` + protection-restore outcomes.
+///
+/// Always prefers retaining the write failure (including short write) when
+/// restore also fails — restore must not overwrite the original write reason.
+pub(crate) fn combine_bulk_iat_write_restore(
+    write: Result<usize, String>,
+    write_size: usize,
+    restore: Result<(), String>,
+) -> Result<(), String> {
+    match (write, restore) {
+        (Ok(n), Ok(())) if n == write_size => Ok(()),
+        (Ok(n), Ok(())) => Err(format!(
+            "trace_imports: short write IAT (actual={n} expected={write_size})"
+        )),
+        (Ok(n), Err(re)) if n == write_size => Err(format!(
+            "trace_imports write IAT: restore VirtualProtectEx failed \
+             (VPE stage=restore): {re}"
+        )),
+        (Ok(n), Err(re)) => Err(format!(
+            "trace_imports: short write IAT (actual={n} expected={write_size}); \
+             restore VirtualProtectEx also failed (VPE stage=restore): {re}"
+        )),
+        (Err(we), Ok(())) => Err(format!("trace_imports write IAT: {we}")),
+        (Err(we), Err(re)) => Err(format!(
+            "trace_imports write IAT: {we}; restore VirtualProtectEx also failed \
+             (VPE stage=restore): {re}"
+        )),
+    }
+}
 
 /// Extract the Themida section bounds from the PE info in `state`.
 ///
@@ -501,6 +570,68 @@ mod tests {
         assert!(dbg.contains("42"));
         assert!(dbg.contains("3"));
         assert!(dbg.contains("5"));
+    }
+
+    // -- combine_bulk_iat_write_restore
+
+    #[test]
+    fn bulk_write_full_and_restore_ok() {
+        assert!(combine_bulk_iat_write_restore(Ok(2816), 2816, Ok(())).is_ok());
+    }
+
+    #[test]
+    fn bulk_write_short_write_err() {
+        let e = combine_bulk_iat_write_restore(Ok(100), 2816, Ok(())).unwrap_err();
+        assert!(e.contains("short write"));
+        assert!(e.contains("actual=100"));
+        assert!(e.contains("expected=2816"));
+        assert!(!e.contains("restore"));
+    }
+
+    #[test]
+    fn bulk_write_error_only() {
+        let e = combine_bulk_iat_write_restore(
+            Err("failed to write memory at 0x1401a5000".into()),
+            2816,
+            Ok(()),
+        )
+        .unwrap_err();
+        assert!(e.contains("trace_imports write IAT:"));
+        assert!(e.contains("0x1401a5000"));
+        assert!(!e.contains("also failed"));
+    }
+
+    #[test]
+    fn bulk_write_restore_error_only() {
+        let e = combine_bulk_iat_write_restore(Ok(2816), 2816, Err("access denied".into()))
+            .unwrap_err();
+        assert!(e.contains("restore VirtualProtectEx failed"));
+        assert!(e.contains("VPE stage=restore"));
+        assert!(e.contains("access denied"));
+        assert!(!e.contains("short write"));
+    }
+
+    #[test]
+    fn bulk_write_and_restore_dual_error() {
+        let e = combine_bulk_iat_write_restore(
+            Err("failed to write memory at 0x1401a5000".into()),
+            2816,
+            Err("restore boom".into()),
+        )
+        .unwrap_err();
+        assert!(e.contains("failed to write memory at 0x1401a5000"));
+        assert!(e.contains("restore VirtualProtectEx also failed"));
+        assert!(e.contains("restore boom"));
+    }
+
+    #[test]
+    fn bulk_short_write_and_restore_dual_error() {
+        let e =
+            combine_bulk_iat_write_restore(Ok(8), 2816, Err("restore boom".into())).unwrap_err();
+        assert!(e.contains("short write"));
+        assert!(e.contains("actual=8"));
+        assert!(e.contains("restore VirtualProtectEx also failed"));
+        assert!(e.contains("restore boom"));
     }
 
     // -- VM pattern constants

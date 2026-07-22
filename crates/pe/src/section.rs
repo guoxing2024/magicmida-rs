@@ -198,10 +198,33 @@ impl PeHeader {
         let num_sections = self.sections.len();
 
         for i in 0..num_sections {
+            // Payload sections store raw in `extra_data` at a synthetic file
+            // offset that is NOT an RVA into `buf`. Scanning `buf` at that
+            // pointer treats the whole section as zeros and zeros SizeOfRawData
+            // (observed: multi-MB .wfix → RSz=0 → BSS map → call into null page).
+            if self.sections[i].extra_data.is_some() {
+                continue;
+            }
+            let name = self.sections[i].name.as_str();
+            if name.starts_with(".wfix")
+                || name.starts_with(".boot")
+                || name.starts_with(".import")
+                || name.starts_with(".reloc")
+                || name == ".fill"
+            {
+                continue;
+            }
+
             let section_start = self.sections[i].header.pointer_to_raw_data;
             let section_size = self.sections[i].header.size_of_raw_data;
 
             if section_size == 0 {
+                continue;
+            }
+            // File-layout pointers after sanitize often equal RVA; if the
+            // entire range is outside the dump buffer, skip rather than
+            // treating every dword as zero (which collapses SizeOfRawData).
+            if section_start as usize >= buf.len() {
                 continue;
             }
 
@@ -306,14 +329,64 @@ impl PeHeader {
                 0x200
             }
         };
+
+        // Precompute max raw end so we can assign file offsets to payload
+        // sections without borrowing `self.sections` mutably and immutably.
+        let mut max_raw_end = 0u32;
+        for s in &self.sections {
+            if s.header.size_of_raw_data == 0 {
+                continue;
+            }
+            let end = s
+                .header
+                .pointer_to_raw_data
+                .saturating_add(s.header.size_of_raw_data);
+            if end > max_raw_end {
+                max_raw_end = end;
+            }
+        }
+
         for section in &mut self.sections {
             // Skip .fill gap-filler sections (created by compact_section_vas).
-            // These have no real data ? inflating RS to VS would write
+            // These have no real data — inflating RS to VS would write
             // megabytes of Themida dump data into the output file.
             // Original sections with RS=0 (Themida-compressed) are NOT
             // skipped because they DO have data in the memory dump.
             if section.name == ".fill" {
-                section.header.pointer_to_raw_data = section.header.virtual_address;
+                // Keep RawSize=0 for empty fillers. Do not force PointerToRawData
+                // to VA either — a non-zero RawSize with a sparse VA offset
+                // confuses pack_section_layout.
+                section.header.pointer_to_raw_data = 0;
+                section.header.size_of_raw_data = 0;
+                section.update_from_header();
+                continue;
+            }
+            // Sections that carry dump-time payload (import/reloc/wfix/boot)
+            // already have a real file offset + raw size. Preserve them so
+            // write_section_data can emit extra_data; only assign VA=file for
+            // ordinary dump-backed sections that still need layout.
+            if section.extra_data.is_some() {
+                if section.header.pointer_to_raw_data == 0 {
+                    section.header.pointer_to_raw_data =
+                        crate::utils::align_up(max_raw_end, file_align);
+                    max_raw_end = section.header.pointer_to_raw_data.saturating_add(
+                        section.header.size_of_raw_data.max(
+                            section
+                                .extra_data
+                                .as_ref()
+                                .map(|b| b.len() as u32)
+                                .unwrap_or(0),
+                        ),
+                    );
+                }
+                if section.header.size_of_raw_data == 0 {
+                    let need = section
+                        .extra_data
+                        .as_ref()
+                        .map(|b| b.len() as u32)
+                        .unwrap_or(0);
+                    section.header.size_of_raw_data = crate::utils::align_up(need, file_align);
+                }
                 section.update_from_header();
                 continue;
             }

@@ -18,6 +18,13 @@ pub struct ThemidaState {
     pub ftm_guard: bool,
     pub trace_msvc_oep: bool,
     pub msvc_init_cookie: usize,
+    /// Preserved `__scrt_common_main_seh` candidate captured when entering FTraceMSVCOEP.
+    /// Never overwritten by the next arbitrary `.text` hit.
+    pub msvc_common_main_seh: usize,
+    /// Authoritative SecurityCookie RVA from offline CRT resolve (0 = unknown).
+    pub msvc_cookie_rva: u32,
+    /// Authoritative cookie complement RVA from offline CRT resolve (0 = unknown).
+    pub msvc_cookie_complement_rva: u32,
     pub msvc_oep: usize,
     pub guard_protection: u32,
     pub guard_start: usize,
@@ -69,6 +76,9 @@ impl ThemidaState {
             ftm_guard: false,
             trace_msvc_oep: false,
             msvc_init_cookie: 0,
+            msvc_common_main_seh: 0,
+            msvc_cookie_rva: 0,
+            msvc_cookie_complement_rva: 0,
             msvc_oep: 0,
             guard_protection: 0x01,
             guard_start: 0,
