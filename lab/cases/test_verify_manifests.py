@@ -123,6 +123,13 @@ class ManifestVerifierTests(unittest.TestCase):
         report, exit_code = self.run_manifest(self.manifest)
         self.assertEqual(exit_code, 0, report)
 
+    def test_holdout_corpus_role_allowed(self) -> None:
+        """R3-path-B: corpus_role=holdout is a valid schema enum value."""
+        manifest = copy.deepcopy(self.manifest)
+        manifest["capability_cell"]["corpus_role"] = "holdout"
+        report, exit_code = self.run_manifest(manifest)
+        self.assertEqual(exit_code, 0, report)
+
     def test_explicit_policy_variants_fail_closed(self) -> None:
         variants = []
 

@@ -205,7 +205,7 @@ pub(super) fn handle_access_violation(
                         "Return address points into Themida section — OEP is virtualized"
                     );
 
-                    if ls.virtualized_oep_retries >= 1000 {
+                    if ls.virtualized_oep_retries >= ls.virtualized_oep_max_retries {
                         warn!(
                             "Too many virtualized OEP retries ({}) — using last Possible OEP",
                             ls.virtualized_oep_retries
@@ -471,8 +471,9 @@ pub(super) fn handle_access_violation(
             // by accepting the last PossibleOEP and proceeding to IAT/dump —
             // same recovery idea as SetThreadContext soft-fail on Origin.
             ls.unrelated_av_streak = ls.unrelated_av_streak.saturating_add(1);
-            let storm = ls.unrelated_av_streak >= 32
-                || (target_address == 0 && ls.unrelated_av_streak >= 8);
+            let storm = ls.unrelated_av_streak >= ls.unrelated_av_storm_threshold
+                || (target_address == 0
+                    && ls.unrelated_av_streak >= ls.unrelated_av_null_storm_threshold);
             if storm
                 && (ls.virtualized_oep_retries > 0 || ls.last_possible_oep.is_some())
                 && ls.oep.is_none()
@@ -489,12 +490,22 @@ pub(super) fn handle_access_violation(
                 );
                 ls.oep = fallback;
                 ls.oep_found_via_scanning = true;
+                ls.storm_escape_freeze = true;
                 let _ = remove_code_section_guard(
                     h_process,
                     text_start,
                     text_end.saturating_sub(text_start),
                 );
-                // Fall through to post-OEP IAT setup below.
+                // Lunlun quality path: do NOT fall through to post-OEP IAT monitor
+                // with Rip=PossibleOEP. That resume hits ExitProcess in ~1ms
+                // (violations=0), skip_v3, and residual Themida stubs (~11% rebuild).
+                // Freeze here (process still alive) and let post-loop v3-trace
+                // resolve wrapper slots — same Break pattern as MSVC OEP path.
+                info!(
+                    oep = %format!("{:#x}", fallback.unwrap_or(0)),
+                    "Storm escape freeze — skip deadly OEP resume; post-loop IAT v3 on live process"
+                );
+                return Ok(AvAction::Break);
             } else {
                 if ls.unrelated_av_streak <= 8 || ls.unrelated_av_streak.is_power_of_two() {
                     debug!(
@@ -574,10 +585,11 @@ pub(super) fn handle_access_violation(
         state.guard_end = iat.address + iat.size;
         install_iat_guard(h_process, iat.address, iat.size)?;
 
-        info!("Letting program execute for 5 seconds to decrypt IAT...");
+        let iat_secs = ls.iat_monitor_timeout_secs.max(1);
+        info!("Letting program execute for {iat_secs} seconds to decrypt IAT...");
 
         let start_time = std::time::Instant::now();
-        let timeout = std::time::Duration::from_secs(5);
+        let timeout = std::time::Duration::from_secs(iat_secs);
         let mut iat_violations = 0;
         let mut process_exited = false;
 
@@ -663,6 +675,7 @@ pub(super) fn handle_access_violation(
         // Lunlun: after virtualized-OEP storm escape, resuming at PossibleOEP can
         // ExitProcess immediately. v3 per-slot SingleStep then hangs forever on a
         // dead debuggee. Skip trace and dump with whatever slots we already read.
+        // (PackerPlugin skip_v3_iat_trace is mirrored via process_exited / leave flags.)
         if process_exited {
             ls.process_exited = true;
             warn!(

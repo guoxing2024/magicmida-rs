@@ -1,0 +1,34 @@
+{
+  "schema_version": "mida.validation-summary/v1",
+  "task": "VNEXT-R1-E",
+  "title": "Pure PE model R1-A..E closed (synthetic structural corpus)",
+  "package": "mida-pe",
+  "verdict_contract": "docs/ACCEPTANCE_CONTRACT.md",
+  "roadmap": "docs/VNEXT_R1_ROADMAP.md",
+  "checks": {
+    "cargo_test_workspace_offline_msvc": "pass",
+    "cargo_test_mida_acceptance_offline": "pass",
+    "cargo_test_mida_pe_offline": "pass",
+    "dependency_boundary": "pass",
+    "pe_purity_boundary": "pass",
+    "target_process_starts": 0,
+    "network_actions": 0,
+    "production_default_pure_rebuild": false
+  },
+  "notes": [
+    "R1-A..E closed on synthetic/structural corpus under Windows MSVC 14.44 (2026-07-23).",
+    "Workspace offline tests: 412 passed, 0 failed (CARGO_TARGET_DIR=D:\\MidaVault\\scratch\\cargo-target).",
+    "Pure path remains opt-in (--pure-rebuild); production dump defaults to legacy.",
+    "R0B never returns Accepted; only Rejected or StructuralPassBehaviorPending.",
+    "Live pure-vs-legacy vault sample smoke and typed import rebuild remain open follow-ups.",
+    "mida-acceptance stays independent (no production crate deps); pe uses acceptance only as dev-dependency for dual-path corpus."
+  ],
+  "artifacts": [
+    "docs/VNEXT_R1_ROADMAP.md",
+    "docs/VNEXT_R1_PE_API.md",
+    "docs/PROJECT_AUDIT_AND_ROADMAP.md",
+    "pe_purity_boundary.json",
+    "dependency_boundary.json",
+    "WORKER_HANDOFF.md"
+  ]
+}

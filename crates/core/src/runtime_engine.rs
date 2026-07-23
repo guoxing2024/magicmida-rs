@@ -1,13 +1,11 @@
-//! Runtime event engine surface (R2-Slice2 / 2b).
+//! Runtime event engine surface (R2-Slice2 / 2b / Slice4).
 //!
 //! The long-term owner of wait/continue is a [`RuntimeEngine`], not packer CLI
 //! loops. This module provides:
-//! - pure [`ReplayRuntimeEngine`] for offline tests
-//! - [`DebuggerCoreEngine`] adapter over any [`DebuggerCore`] (live path ready;
-//!   CLI not switched yet)
+//! - pure [`ReplayRuntimeEngine`] for offline tests (+ Slice4 scripted memory)
+//! - [`DebuggerCoreEngine`] adapter over any [`DebuggerCore`] (live path ready)
 //!
-//! Live unpacker still calls [`DebuggerCore`] directly until a behavior-
-//! preserving CLI pump migration.
+//! Live unpacker uses the engine pump; Win32 bodies remain in `cli/unpacker`.
 
 use crate::addr::RuntimeBase;
 use crate::debugger::{ContinueStatus, DebugEvent, DebuggerCore};
@@ -45,10 +43,123 @@ pub trait RuntimeEngine {
     fn process_exited(&self) -> bool;
 }
 
-/// Scripted pure backend: delivers a fixed list of [`DebugEvent`]s.
+/// Sparse scripted process memory for offline replay (Slice 4).
 ///
-/// Used for offline engine-contract tests and (later) synthetic guard→OEP
-/// skeletons. No Win32. Continue is a no-op that only validates pending state.
+/// Maps absolute VAs to byte vectors. Unmapped reads fail with
+/// [`CoreError::MemoryRead`] (no silent zero-fill) so tests must be explicit.
+#[derive(Debug, Default, Clone)]
+pub struct ReplayMemory {
+    /// Regions as `(start_va, bytes)`. Overlaps are allowed; first match wins.
+    regions: Vec<(u64, Vec<u8>)>,
+}
+
+impl ReplayMemory {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Map `data` starting at absolute `address` (overwrites prior maps at same start).
+    pub fn map(&mut self, address: u64, data: impl Into<Vec<u8>>) -> &mut Self {
+        let data = data.into();
+        if let Some((_, slot)) = self.regions.iter_mut().find(|(a, _)| *a == address) {
+            *slot = data;
+        } else {
+            self.regions.push((address, data));
+        }
+        self
+    }
+
+    /// Number of mapped regions.
+    #[must_use]
+    pub fn region_count(&self) -> usize {
+        self.regions.len()
+    }
+
+    /// Read up to `buf.len()` bytes starting at `address` from a single region.
+    pub fn read(&self, address: u64, buf: &mut [u8]) -> Result<usize, CoreError> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        for (start, data) in &self.regions {
+            let end = start.saturating_add(data.len() as u64);
+            if address >= *start && address < end {
+                let off = (address - start) as usize;
+                let n = buf.len().min(data.len().saturating_sub(off));
+                buf[..n].copy_from_slice(&data[off..off + n]);
+                return Ok(n);
+            }
+        }
+        Err(CoreError::MemoryRead {
+            address,
+            requested: buf.len(),
+        })
+    }
+
+    /// Write into an existing region, or create a new region for the full buffer.
+    pub fn write(&mut self, address: u64, data: &[u8]) -> Result<usize, CoreError> {
+        if data.is_empty() {
+            return Ok(0);
+        }
+        for (start, region) in &mut self.regions {
+            let end = start.saturating_add(region.len() as u64);
+            if address >= *start && address < end {
+                let off = (address - *start) as usize;
+                let n = data.len().min(region.len().saturating_sub(off));
+                if n == 0 {
+                    break;
+                }
+                region[off..off + n].copy_from_slice(&data[..n]);
+                return Ok(n);
+            }
+        }
+        // No covering region — map as a new sparse block.
+        self.regions.push((address, data.to_vec()));
+        Ok(data.len())
+    }
+}
+
+/// Classic Oreans-style event skeleton (no Win32): create → guard AV → OEP BP → exit.
+///
+/// Used by Slice 4 tests; addresses are absolute VAs (`base + rva`).
+#[must_use]
+pub fn guard_oep_event_script(base: u64, oep_rva: u32, main_tid: u32) -> Vec<DebugEvent> {
+    let oep_va = base.wrapping_add(u64::from(oep_rva));
+    let text_va = base.wrapping_add(0x1000);
+    vec![
+        DebugEvent::CreateProcess {
+            process_id: 1,
+            thread_id: main_tid,
+            image_base: base,
+            h_thread: windows::Win32::Foundation::HANDLE::default(),
+            h_process: windows::Win32::Foundation::HANDLE::default(),
+            h_file: windows::Win32::Foundation::HANDLE::default(),
+        },
+        DebugEvent::LoadDll {
+            thread_id: main_tid,
+            base_address: 0x7ffe_0000,
+            h_file: windows::Win32::Foundation::HANDLE::default(),
+        },
+        DebugEvent::AccessViolation {
+            thread_id: main_tid,
+            address: text_va,
+            is_write: false,
+            target_address: text_va,
+            exc_type: 8, // execute AV (guard)
+        },
+        DebugEvent::Breakpoint {
+            thread_id: main_tid,
+            address: oep_va,
+        },
+        DebugEvent::ExitProcess { exit_code: 0 },
+    ]
+}
+
+/// Scripted pure backend: fixed [`DebugEvent`] stream + optional [`ReplayMemory`].
+///
+/// No Win32. Continue only validates pending state. Exhausted stream:
+/// - `timeout_ms = Some(_)` → [`CoreError::Timeout`] (short-wait simulation)
+/// - `timeout_ms = None` → [`CoreError::DebugState`] exhausted
 #[derive(Debug)]
 pub struct ReplayRuntimeEngine {
     events: Vec<DebugEvent>,
@@ -57,12 +168,19 @@ pub struct ReplayRuntimeEngine {
     pending: bool,
     runtime_base: Option<RuntimeBase>,
     process_exited: bool,
+    memory: ReplayMemory,
 }
 
 impl ReplayRuntimeEngine {
-    /// Build a replay engine from an ordered event list.
+    /// Build a replay engine from an ordered event list (empty memory).
     #[must_use]
     pub fn new(events: Vec<DebugEvent>) -> Self {
+        Self::with_memory(events, ReplayMemory::new())
+    }
+
+    /// Build a replay engine with a pre-seeded memory script.
+    #[must_use]
+    pub fn with_memory(events: Vec<DebugEvent>, memory: ReplayMemory) -> Self {
         let runtime_base = events.iter().find_map(|e| match e {
             DebugEvent::CreateProcess { image_base, .. } => Some(RuntimeBase(*image_base)),
             _ => None,
@@ -74,6 +192,7 @@ impl ReplayRuntimeEngine {
             pending: false,
             runtime_base,
             process_exited: false,
+            memory,
         }
     }
 
@@ -82,21 +201,51 @@ impl ReplayRuntimeEngine {
     pub fn remaining(&self) -> usize {
         self.events.len().saturating_sub(self.index)
     }
+
+    /// `true` when a wait delivered an event that has not been continued.
+    #[must_use]
+    pub fn has_pending(&self) -> bool {
+        self.pending
+    }
+
+    /// Borrow scripted memory.
+    #[must_use]
+    pub fn memory(&self) -> &ReplayMemory {
+        &self.memory
+    }
+
+    /// Mutably borrow scripted memory (map more pages mid-replay).
+    pub fn memory_mut(&mut self) -> &mut ReplayMemory {
+        &mut self.memory
+    }
+
+    /// Read process memory from the script (absolute VA as `usize`).
+    pub fn read_memory(&self, address: usize, buf: &mut [u8]) -> Result<usize, CoreError> {
+        self.memory.read(address as u64, buf)
+    }
+
+    /// Write process memory into the script.
+    pub fn write_memory(&mut self, address: usize, data: &[u8]) -> Result<usize, CoreError> {
+        self.memory.write(address as u64, data)
+    }
 }
 
 impl RuntimeEngine for ReplayRuntimeEngine {
     type Error = CoreError;
 
-    fn wait(&mut self, _timeout_ms: Option<u32>) -> Result<EngineEvent, Self::Error> {
+    fn wait(&mut self, timeout_ms: Option<u32>) -> Result<EngineEvent, Self::Error> {
         if self.pending {
             return Err(CoreError::DebugState(
                 "ReplayRuntimeEngine::wait refused: previous event not continued".into(),
             ));
         }
         if self.index >= self.events.len() {
-            return Err(CoreError::DebugState(
-                "ReplayRuntimeEngine::wait: event stream exhausted".into(),
-            ));
+            return match timeout_ms {
+                Some(_) => Err(CoreError::Timeout),
+                None => Err(CoreError::DebugState(
+                    "ReplayRuntimeEngine::wait: event stream exhausted".into(),
+                )),
+            };
         }
         // Move event out; leave a placeholder Other for Debug-only holes is
         // unnecessary — we own the vec and can swap with a dummy.
@@ -343,8 +492,7 @@ mod tests {
 
     #[test]
     fn synthetic_guard_oep_skeleton_events() {
-        // Minimal ordered skeleton: create → AV (guard) → BP (OEP-ish) → exit.
-        // Not a full unpack; locks the event set for future Slice4 growth.
+        // Slice2 skeleton retained; Slice4 expands with LoadDll + memory script.
         let base = 0x7ff6_c050_0000u64;
         let mut eng = ReplayRuntimeEngine::new(vec![
             create_process(base),
@@ -376,6 +524,144 @@ mod tests {
         }
         assert_eq!(phases, ["create", "guard_av", "oep_bp", "exit"]);
         assert_eq!(eng.runtime_base(), Some(RuntimeBase(base)));
+    }
+
+    #[test]
+    fn slice4_replay_memory_read_write() {
+        let mut mem = ReplayMemory::new();
+        mem.map(0x14000_1000, vec![0x48, 0x89, 0xe5, 0x90]); // prologue-ish
+        let mut buf = [0u8; 4];
+        assert_eq!(mem.read(0x14000_1000, &mut buf).unwrap(), 4);
+        assert_eq!(buf, [0x48, 0x89, 0xe5, 0x90]);
+        // Partial read from offset
+        let mut half = [0u8; 2];
+        assert_eq!(mem.read(0x14000_1002, &mut half).unwrap(), 2);
+        assert_eq!(half, [0xe5, 0x90]);
+        // Unmapped fails (no silent zeros)
+        assert!(matches!(
+            mem.read(0xdead_0000, &mut buf),
+            Err(CoreError::MemoryRead { address: 0xdead_0000, .. })
+        ));
+        // Write into region
+        assert_eq!(mem.write(0x14000_1001, &[0x11, 0x22]).unwrap(), 2);
+        assert_eq!(mem.read(0x14000_1000, &mut buf).unwrap(), 4);
+        assert_eq!(buf, [0x48, 0x11, 0x22, 0x90]);
+    }
+
+    #[test]
+    fn slice4_wait_timeout_on_exhausted_stream() {
+        let mut eng = ReplayRuntimeEngine::new(vec![DebugEvent::Other { thread_id: 1 }]);
+        eng.wait(None).unwrap();
+        eng.continue_event(ContinueStatus::Continue).unwrap();
+        // Blocking wait → exhausted DebugState
+        assert!(matches!(
+            eng.wait(None),
+            Err(CoreError::DebugState(_))
+        ));
+        // Finite wait → Timeout (text-poll short-wait simulation)
+        assert!(matches!(eng.wait(Some(100)), Err(CoreError::Timeout)));
+    }
+
+    #[test]
+    fn slice4_guard_oep_with_memory_and_plugin_milestones() {
+        use crate::plugin::{
+            HostLoopFacts, NullPackerPlugin, PackerPlugin, PluginAdvice, PluginCtx, UnpackPhase,
+        };
+        use crate::addr::{PreferredBase, Rva};
+
+        let base = 0x7ff6_c050_0000u64;
+        let oep_rva = 0x13e0u32;
+        let mut mem = ReplayMemory::new();
+        // Seed .text sample at section RVA 0x1000 (guard fault site).
+        mem.map(base + 0x1000, vec![0xcc; 16]);
+        // Seed OEP bytes (fake x64 prologue).
+        mem.map(
+            base + u64::from(oep_rva),
+            vec![0x48, 0x83, 0xec, 0x28, 0x48, 0x8b, 0x05, 0x00],
+        );
+
+        let mut eng =
+            ReplayRuntimeEngine::with_memory(guard_oep_event_script(base, oep_rva, 2), mem);
+        let mut packer = NullPackerPlugin;
+        let mut ctx = PluginCtx {
+            preferred_base: Some(PreferredBase(0x14000_0000)),
+            section0_is_plain_text: false,
+            ..Default::default()
+        };
+
+        let mut phases = Vec::new();
+        while eng.remaining() > 0 {
+            let ev = eng.wait(None).unwrap();
+            match &ev.event {
+                DebugEvent::CreateProcess { image_base, .. } => {
+                    phases.push("create");
+                    ctx.ensure_runtime_base(*image_base);
+                    ctx.request_close_handle_chain = true;
+                    ctx.phase = UnpackPhase::GuardActive;
+                }
+                DebugEvent::LoadDll { .. } => {
+                    phases.push("load_dll");
+                    packer.refresh_loop_policy(
+                        &mut ctx,
+                        &HostLoopFacts {
+                            text_polling: false,
+                            guard_installed: false,
+                            ..Default::default()
+                        },
+                    );
+                    assert!(ctx.allow_close_handle_bp);
+                }
+                DebugEvent::AccessViolation {
+                    address,
+                    exc_type: 8,
+                    ..
+                } => {
+                    phases.push("guard_av");
+                    let mut sample = [0u8; 4];
+                    eng.read_memory(*address as usize, &mut sample).unwrap();
+                    assert_eq!(sample, [0xcc, 0xcc, 0xcc, 0xcc]);
+                    packer.note_guard_installed(&mut ctx);
+                    assert!(ctx.guard_installed);
+                }
+                DebugEvent::Breakpoint { address, .. } => {
+                    phases.push("oep_bp");
+                    let mut oep_bytes = [0u8; 4];
+                    eng.read_memory(*address as usize, &mut oep_bytes).unwrap();
+                    assert_eq!(oep_bytes[0], 0x48);
+                    let advice = packer.note_oep_accepted(&mut ctx, *address, false);
+                    assert_eq!(
+                        advice,
+                        PluginAdvice::Transition(UnpackPhase::OepCandidate)
+                    );
+                    assert_eq!(ctx.oep_rva, Some(Rva(oep_rva)));
+                    assert_eq!(ctx.oep_va_to_rva(*address), Some(Rva(oep_rva)));
+                }
+                DebugEvent::ExitProcess { .. } => {
+                    phases.push("exit");
+                    packer.refresh_loop_policy(
+                        &mut ctx,
+                        &HostLoopFacts {
+                            oep_known: true,
+                            process_exited: true,
+                            ..Default::default()
+                        },
+                    );
+                    assert!(ctx.skip_v3_iat_trace);
+                    assert!(ctx.request_leave_debug_loop);
+                }
+                _ => phases.push("other"),
+            }
+            eng.continue_event(ContinueStatus::Continue).unwrap();
+        }
+
+        assert_eq!(
+            phases,
+            ["create", "load_dll", "guard_av", "oep_bp", "exit"]
+        );
+        assert_eq!(eng.runtime_base(), Some(RuntimeBase(base)));
+        assert_eq!(ctx.phase, UnpackPhase::OepCandidate);
+        assert!(eng.process_exited());
+        assert!(!eng.has_pending());
     }
 
     /// Minimal `DebuggerCore` that only implements wait/continue for engine tests.

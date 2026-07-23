@@ -115,9 +115,60 @@ pub fn is_at_themida_vm(debugger: &dyn DebuggerCore, ip: usize) -> bool {
     }
 }
 
-/// Maximum number of consecutive invalid/zero IAT slots before we give up
-/// and assume we've reached the end of the table.
+/// Maximum consecutive *unknown/invalid* IAT slot values before we stop.
+///
+/// Must NOT count null terminators, already-resolved system APIs, or
+/// in-image non-Themida pointers — those are normal multi-module IAT
+/// structure (see CLI `advance_to_next_slot`).  Counting them as trash
+/// caused holdout `xiongxiong_duokai` to stop mid-table after ~64 resolved
+/// gaps and leave later Themida wrappers untraced (~79% rebuild).
 const TRASH_THRESHOLD: usize = 64;
+
+/// How a live IAT slot is handled by the v3 tracer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IatSlotClass {
+    /// Pointer into the Themida section — single-step deobfuscation needed.
+    Trace,
+    /// Null, already-resolved system API, or in-image non-import — skip.
+    Skip,
+    /// Outside known ranges and not a plausible API — count toward trash.
+    Trash,
+}
+
+/// Classify one IAT slot value for v3 tracing.
+///
+/// Matches CLI `advance_to_next_slot` semantics so multi-block IATs with
+/// large already-resolved gaps still reach later Themida wrappers.
+pub(crate) fn classify_iat_slot_for_trace(
+    current: usize,
+    themida_start: usize,
+    themida_end: usize,
+    image_base: usize,
+    image_boundary: usize,
+) -> IatSlotClass {
+    if current == 0 {
+        return IatSlotClass::Skip;
+    }
+
+    let in_themida = current >= themida_start && current < themida_end;
+    if in_themida {
+        return IatSlotClass::Trace;
+    }
+
+    // Outside image (and above low-address floor) → already a real API.
+    let in_image = current >= image_base && current < image_boundary;
+    if current >= 0x10000 && !in_image {
+        return IatSlotClass::Skip;
+    }
+
+    // Program-internal address (not an import wrapper) — skip, not trash.
+    if in_image {
+        return IatSlotClass::Skip;
+    }
+
+    // Low / unknown pointer.
+    IatSlotClass::Trash
+}
 
 /// Default single-step limit per IAT slot.  The Pascal reference uses 500 000.
 /// We use a much smaller limit to avoid hanging on difficult slots.
@@ -234,25 +285,34 @@ pub fn trace_imports(
             );
         }
 
-        let in_themida = current >= tm_start && current < tm_end;
-
-        if !in_themida || current == 0 {
-            trash_counter += 1;
-            if trash_counter > TRASH_THRESHOLD {
-                log(
-                    LogMsgType::Info,
-                    &format!("Trash threshold ({TRASH_THRESHOLD}) exceeded at slot {i} — stopping IAT trace"),
-                );
-                break;
+        match classify_iat_slot_for_trace(current, tm_start, tm_end, image_base, image_boundary) {
+            IatSlotClass::Skip => {
+                // Null / resolved API / in-image non-wrapper: normal IAT layout.
+                trash_counter = 0;
+                continue;
             }
-            continue;
+            IatSlotClass::Trash => {
+                trash_counter += 1;
+                if trash_counter > TRASH_THRESHOLD {
+                    log(
+                        LogMsgType::Info,
+                        &format!(
+                            "Trash threshold ({TRASH_THRESHOLD}) exceeded at slot {i} — stopping IAT trace"
+                        ),
+                    );
+                    break;
+                }
+                continue;
+            }
+            IatSlotClass::Trace => {
+                trash_counter = 0;
+            }
         }
 
         log(
             LogMsgType::Info,
             &format!("Tracing IAT slot {i} ({slot_va:#x}) from {current:#x}"),
         );
-        trash_counter = 0;
 
         // Context / session errors: let trace_one_slot return Err and fail-fast
         // (no pre-check break that could yield a false 0/0 success).
@@ -556,6 +616,76 @@ pub(crate) fn thread_id_of(ev: &DebugEvent) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- classify_iat_slot_for_trace (holdout multi-gap regression)
+
+    const TM0: usize = 0x7ff7_236e_1000;
+    const TM1: usize = 0x7ff7_24cf_8200;
+    const IMG0: usize = 0x7ff7_236e_0000;
+    const IMG1: usize = 0x7ff7_24cf_a000;
+
+    #[test]
+    fn classify_zero_is_skip_not_trash() {
+        assert_eq!(
+            classify_iat_slot_for_trace(0, TM0, TM1, IMG0, IMG1),
+            IatSlotClass::Skip
+        );
+    }
+
+    #[test]
+    fn classify_themida_wrapper_is_trace() {
+        assert_eq!(
+            classify_iat_slot_for_trace(0x7ff7_2451_9a5e, TM0, TM1, IMG0, IMG1),
+            IatSlotClass::Trace
+        );
+    }
+
+    #[test]
+    fn classify_resolved_system_api_is_skip_not_trash() {
+        // kernel32-style VA outside image — must not accumulate trash or
+        // early-stop past large already-resolved gaps (holdout 64+ gap).
+        assert_eq!(
+            classify_iat_slot_for_trace(0x7ff9_9726_f970, TM0, TM1, IMG0, IMG1),
+            IatSlotClass::Skip
+        );
+    }
+
+    #[test]
+    fn classify_in_image_non_themida_is_skip() {
+        // PE header / early image before .themida start.
+        assert_eq!(
+            classify_iat_slot_for_trace(IMG0 + 0x100, TM0, TM1, IMG0, IMG1),
+            IatSlotClass::Skip
+        );
+    }
+
+    #[test]
+    fn classify_low_unknown_is_trash() {
+        // Below 0x10000 floor — not a plausible system API.
+        assert_eq!(
+            classify_iat_slot_for_trace(0x5000, TM0, TM1, IMG0, IMG1),
+            IatSlotClass::Trash
+        );
+    }
+
+    #[test]
+    fn classify_long_resolved_gap_never_trips_trash() {
+        // Simulate 100 consecutive already-resolved API slots: none trash.
+        let mut trash = 0usize;
+        for _ in 0..100 {
+            match classify_iat_slot_for_trace(0x7ff9_9726_f970, TM0, TM1, IMG0, IMG1) {
+                IatSlotClass::Skip => trash = 0,
+                IatSlotClass::Trash => trash += 1,
+                IatSlotClass::Trace => trash = 0,
+            }
+        }
+        assert_eq!(trash, 0, "resolved APIs must not accumulate trash");
+        // Later Themida wrapper still classifies as Trace after the gap.
+        assert_eq!(
+            classify_iat_slot_for_trace(0x7ff7_2470_a128, TM0, TM1, IMG0, IMG1),
+            IatSlotClass::Trace
+        );
+    }
 
     // -- TraceImportResult
 

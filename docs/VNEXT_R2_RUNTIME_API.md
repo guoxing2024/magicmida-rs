@@ -1,9 +1,10 @@
 # VNEXT-R2 Runtime / Event Engine
 
-Status: **Slice 2 + CLI pump** (2026-07-23) — address newtypes, `RuntimeEngine`,
-`ReplayRuntimeEngine`, `DebuggerCoreEngine`, and `ProcessSession` wait/continue
-via the engine. Origin legacy smoke: StructuralPass.
-Prerequisites: R0B + R1 closed; Phase2 pure opt-in with flip=**No**.
+Status: **Slice 4 + 3b-6 closed; R3-path-A open** (2026-07-23) — address
+newtypes, `RuntimeEngine`, `ReplayRuntimeEngine` + `ReplayMemory`,
+`DebuggerCoreEngine`, CLI pump, `PackerPlugin` 3b-1..6, offline guard→OEP +
+skip_v3 skeleton. Pure flip=**No**. R3 10× gate not claimed.
+Prerequisites: R0B + R1 closed; Phase2 pure opt-in.
 
 ## Goals
 
@@ -88,6 +89,9 @@ Implemented in `mida_core::runtime_engine`:
 | `RuntimeEngine` trait | ✅ `wait` / `continue_event` / `runtime_base` / `process_exited` |
 | `EngineEvent { sequence, event }` | ✅ |
 | `ReplayRuntimeEngine` | ✅ pure scripted events; unit tests |
+| `ReplayMemory` + `with_memory` | ✅ Slice 4 sparse VA maps; unmapped = `MemoryRead` |
+| `guard_oep_event_script` | ✅ create → LoadDll → guard AV → OEP BP → exit |
+| Exhausted finite wait | ✅ `CoreError::Timeout` (short-wait sim) |
 | `DebuggerCoreEngine<D>` | ✅ live adapter; pending wait/continue; `backend_mut` |
 | CLI `ProcessSession` pump | ✅ wait/timeout/continue via engine; Origin smoke OK |
 
@@ -127,17 +131,27 @@ pub trait DebugBackend {
 
 ---
 
-## PackerPlugin (Slice 3 stub — landed)
+## PackerPlugin (Slice 3 stub + 3b-1 policy consult)
 
 | Item | Location | Status |
 |------|----------|--------|
 | `PackerPlugin` + `IdentifyInput` / `PluginCtx` / advice types | `mida_core::plugin` | ✅ |
 | `NullPackerPlugin` | `mida_core` | ✅ |
-| `ThemidaPlugin` identify + stub `on_event` | `mida_packers_themida::plugin` | ✅ |
-| CLI driven by plugin | — | ❌ not wired (live loop still `cli/unpacker`) |
+| `ThemidaPlugin` identify + `on_event` policy | `mida_packers_themida::plugin` | ✅ |
+| CLI consults plugin after each wait | `cli/unpacker` + `ProcessSession::wait_engine` | ✅ 3b-1 |
+| Full handler bodies in plugin | ScyllaHide / guard / AV / IAT / dump | ❌ still host |
 
 Identify uses **host-prepared** `IdentifyInput` (section names, EP, arch) so
 `mida-core` does not depend on `mida-pe`.
+
+### PluginCtx session hints vs policy outputs (3b-1)
+
+| Field | Direction | Role |
+|-------|-----------|------|
+| `is_dotnet`, `section0_is_plain_text` | host → plugin | Session config before loop |
+| `preferred_base` | host → plugin | PE preferred ImageBase |
+| `request_text_poll`, `request_close_handle_chain` | plugin → host | CreateProcess guard-path |
+| `process_exited`, `phase`, `runtime_base`, `oep_rva` | plugin → host | Lifecycle / dump hints |
 
 ### What plugins must not do
 
@@ -148,11 +162,12 @@ Identify uses **host-prepared** `IdentifyInput` (section names, EP, arch) so
 
 ### Themida today → plugin tomorrow
 
-| Today | Tomorrow |
-|-------|----------|
-| `cli/unpacker` installs ScyllaHide, guard, OEP, IAT | `OreansPlugin` / `ThemidaPlugin` methods |
-| `LoopState` flags | plugin-local state |
-| `generic_unpack` / profiles | second plugin or profile adapter |
+| Today (3b-1) | Tomorrow |
+|--------------|----------|
+| CreateProcess **path** (text-poll vs CloseHandle) | ✅ in `ThemidaPlugin::on_event` |
+| ExitProcess → Done | ✅ plugin + host break |
+| ScyllaHide, guard, OEP AV, IAT, dump | still `cli/unpacker` handlers |
+| `LoopState` operational flags | gradual merge into plugin-local state |
 | CLI | thin: args → engine + plugin select → dump path |
 
 ---
@@ -166,8 +181,14 @@ Identify uses **host-prepared** `IdentifyInput` (section names, EP, arch) so
 | **Slice 2** | `RuntimeEngine` + `ReplayRuntimeEngine`; CLI still on `DebuggerCore` | No live |
 | **Slice 2b** | Live adapter; optional CLI pump switch (behavior-preserving) | No if careful |
 | **Slice 3** | `PackerPlugin` trait + Themida identify stub (no live drive) | No |
-| **Slice 3b** | Migrate unpacker policy into plugin `on_event` | Careful + smoke |
-| **Slice 4** | Expand replay skeleton (mem script / guard→OEP) | Test-only |
+| **Slice 3b-1** | Wire `on_event` consult; CreateProcess path policy in plugin | Careful (same paths) |
+| **Slice 3b-2** | OEP/IAT/dump milestones → `PluginCtx` (handlers still host) | Careful + smoke |
+| **Slice 3b-3** | Loop decision flags (leave / short-wait / CloseHandle / timeouts) | Careful + smoke |
+| **Slice 3b-4** | AV/text thresholds + dump-boundary `Va→Rva` / `skip_v3` | Careful + smoke |
+| **Slice 3b-5** | `note_iat_trace_skipped` + extract `plugin_host` | Careful + smoke |
+| **Slice 3b-6** | Unify IAT-complete + dump-enter + leave helper | Careful + smoke |
+| **Slice 3b+** | Further policy if needed; keep handler bodies host | Careful + smoke |
+| **Slice 4** | Expand replay skeleton (mem script / guard→OEP) | Test-only ✅ |
 
 **Slice 0 exit criteria:**
 
@@ -195,6 +216,93 @@ Identify uses **host-prepared** `IdentifyInput` (section names, EP, arch) so
 - [x] `PackerPlugin` in `mida-core` (object-safe, no pe/acceptance deps)
 - [x] `ThemidaPlugin` identify heuristics + unit tests
 - [x] Explicit: CLI **not** controlled by plugin yet
+
+**Slice 3b-1 exit criteria:**
+
+- [x] `PluginCtx` session hints + policy flags (`request_text_poll`, …)
+- [x] `ThemidaPlugin::on_event` owns CreateProcess path + ExitProcess Done
+- [x] CLI `wait_engine` + post-wait `on_event` consult; Abort honored
+- [x] CreateProcess host arm applies plugin flags (not local section-name branch)
+- [x] Origin legacy smoke after 3b (`live_20260723-183940`, StructuralPass)
+- [ ] Further handlers (OEP/IAT) still host-owned until later 3b slices
+
+**Slice 3b-2 exit criteria:**
+
+- [x] Milestone helpers on `PackerPlugin`: guard / OEP / IAT / dump
+- [x] `PluginCtx.oep_rva` filled from host OEP VA via runtime/preferred base
+- [x] CLI `sync_plugin_milestones` after each loop iter + post-loop
+- [x] `dump_advice` logged at dump enter (pure still opt-in / prefer false)
+- [x] post-attach path records OEP + dump phase
+- [x] Origin smoke: identify Match, CloseHandle path, OEP RVA 0x13e0, dump_advice
+- [x] R0B `StructuralPassBehaviorPending` on `live_20260723-183940`
+- [ ] AV/IAT **handler bodies** remain host-owned (not moved)
+
+**Slice 3b-3 exit criteria:**
+
+- [x] `HostLoopFacts` + `PackerPlugin::refresh_loop_policy`
+- [x] Decision flags: `prefer_short_wait`, `allow_close_handle_bp`,
+      `request_leave_debug_loop`, `skip_v3_iat_trace`, timeout fields
+- [x] CLI wait / leave / CloseHandle BP / text-poll idle / IAT monitor secs from plugin
+- [x] `note_iat_trace_complete` + sticky leave reasons
+- [x] Origin smoke `live_20260723-185129` StructuralPassBehaviorPending
+      (identify 83, CloseHandle path, OEP RVA 0x13e0, pure=false)
+- [ ] AV/IAT **bodies** still host-owned (deferred to 3b+ / later)
+
+**Slice 3b-4 exit criteria:**
+
+- [x] `PluginCtx` AV/text thresholds (retries / storm / min_nonzero)
+- [x] `ThemidaPlugin::apply_session_defaults` writes historical constants
+- [x] CLI `LoopState` + `av_handler` + text-poll use plugin thresholds
+- [x] Dump entry via `RuntimeBase` + `Va::to_rva` (no raw `wrapping_sub`)
+- [x] Post-loop skip V3 when `process_exited || skip_v3_iat_trace`
+- [x] Origin smoke `live_20260723-185936` (EP 0x13e0, exit 0)
+- [x] Lunlun smoke `live_20260723-190051_3b4` (EP 0x1656f4, exit 0)
+- [ ] AV/IAT **bodies** still host-owned
+
+**Slice 3b-5 exit criteria:**
+
+- [x] `PackerPlugin::note_iat_trace_skipped` (vs complete) + unit tests
+- [x] `ThemidaPlugin` override records phase on skip
+- [x] `cli/unpacker/plugin_host.rs`: facts / refresh / sync / av_break
+- [x] `AvAction::Break` → complete if IAT done else skip with reason
+- [x] Origin smoke `live_20260723-194036` (EP 0x13e0, exit 0, full IAT path)
+- [x] Lunlun smoke `live_20260723-194142_3b5` (EP 0x1656f4;
+      `IAT v3 skipped reason=process_exited_skip_v3`)
+- [ ] AV/IAT **bodies** still host-owned
+
+**Slice 3b-6 exit criteria:**
+
+- [x] `plugin_host::note_plugin_iat_complete` (SingleStep full-trace)
+- [x] `plugin_host::enter_dump_phase` (post-attach + post-loop)
+- [x] `plugin_host::plugin_leave_reason` (shared sticky leave)
+- [x] Origin smoke `live_20260723-200918` (EP 0x13e0, exit 0)
+- [x] Lunlun smoke `live_20260723-200918_3b6` (EP 0x1656f4, skip_v3)
+- [ ] AV/IAT **bodies** still host-owned
+
+**Slice 4 exit criteria:**
+
+- [x] `ReplayMemory` sparse map + read/write on `ReplayRuntimeEngine`
+- [x] `guard_oep_event_script` (create / LoadDll / guard AV / OEP BP / exit)
+- [x] Finite wait on exhausted stream → `CoreError::Timeout`
+- [x] Offline test: mem script + plugin milestones (guard / OEP / leave / skip_v3)
+- [x] No live / CLI behavior change (test-only)
+
+**R3-prep / R3-path-A (not R3 gate):**
+
+- [x] `ThemidaPlugin` offline replay against `ReplayRuntimeEngine` + mem
+- [x] `identify_record` + CLI uses it
+- [x] `tools/_oreans_repeat_smoke.py` multi-run engineering harness
+      (`r3_gate: false`; refuses `--claim-r3`)
+- [x] Offline skip_v3 + dump after scanned OEP (Lunlun-shaped)
+- [x] Harness EP/`--expect-ep` + R0B rollup from evidence logs
+- [x] Engineering batch Origin+Lunlun ×3 `batch_20260723-201638_r3a`
+- [x] R3-path-C Lunlun IAT: storm freeze + post-loop v3 → **336/352 (95%)**
+      (`live_20260723-203635_lun_iat_v3defer`; Origin reg OK)
+- [x] R3-path-D stability ×3 Origin+Lunlun (`batch_20260723-204853_r3d`;
+      IAT 96%/95%; harness coverage rollup)
+- [x] R3 close: Origin + Lunlun + **holdout** continuous **10×** +
+      `validation_summary` task VNEXT-R3 (`batch_20260723-214718_r3c_gate`)
+- See [VNEXT_R3_OREANS_PATH.md](VNEXT_R3_OREANS_PATH.md)
 
 ---
 

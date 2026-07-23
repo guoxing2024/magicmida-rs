@@ -57,7 +57,8 @@ claims.
    ([VNEXT_R2_RUNTIME_API.md](VNEXT_R2_RUNTIME_API.md) — Slice 0 docs sketch landed).
 4. `VNEXT-R3`: implement the Oreans plugin and pass Origin, Lunlun, and a blind
    holdout ten consecutive times.
-5. `VNEXT-R4`: add a second independent protection-family plugin.
+5. `VNEXT-R4`: add a second independent protection-family plugin
+   ([VNEXT_R4_AHK_GTO_PATH.md](VNEXT_R4_AHK_GTO_PATH.md) — R4-A0 scaffold done).
 
 General 1.0 eligibility begins only after steps 1-5 pass their recorded gates.
 
@@ -78,7 +79,13 @@ acceptance.
 - **R1-C..E:** pure `RebuildPlan` rebuild pipeline + production opt-in pure emit
   ([VNEXT_R1_ROADMAP.md](VNEXT_R1_ROADMAP.md)). Phase2 live pure structural_equal
   on Origin/Lunlun; default dump remains legacy (flip=No).
-- **R2-Slice0..3 stub:** addr + RuntimeEngine + CLI pump + `PackerPlugin` /
-  `ThemidaPlugin` identify
-  ([VNEXT_R2_RUNTIME_API.md](VNEXT_R2_RUNTIME_API.md)); live policy still in
-  `cli/unpacker` (not plugin-driven yet).
+- **R2-Slice0..4 + 3b-5/6:** addr + RuntimeEngine + CLI pump + `PackerPlugin` /
+  `ThemidaPlugin` policy surface (3b-1..6: milestones, loop flags, thresholds,
+  IAT skip vs complete, dump-enter host helpers, `plugin_host` extract) +
+  Slice4 `ReplayMemory` / guard→OEP offline skeleton (handler bodies still in
+  `cli/unpacker`) ([VNEXT_R2_RUNTIME_API.md](VNEXT_R2_RUNTIME_API.md)).
+- **R3-path-A/B (not gate):** Oreans path contract, offline skip_v3 replay, multi-run
+  EP/R0B harness; holdout schema slot + preflight (`holdout_status=empty` until a
+  third vault Oreans sample is registered)
+  ([VNEXT_R3_OREANS_PATH.md](VNEXT_R3_OREANS_PATH.md)). R3 structural 10× **closed**
+  (2026-07-23); pure flip still No; Behavioral Accepted not claimed.

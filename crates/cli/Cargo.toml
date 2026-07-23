@@ -13,6 +13,7 @@ mida-pe = { path = "../pe" }
 mida-disasm = { path = "../disasm" }
 mida-tracer = { path = "../tracer" }
 mida-packers-themida = { path = "../packers/themida" }
+mida-packers-ahk-gto = { path = "../packers/ahk_gto" }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

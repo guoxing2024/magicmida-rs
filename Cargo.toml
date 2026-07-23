@@ -5,6 +5,7 @@ members = [
     "crates/disasm",
     "crates/tracer",
     "crates/packers/themida",
+    "crates/packers/ahk_gto",
     "crates/cli",
     "crates/acceptance",
 ]

@@ -1,0 +1,49 @@
+{
+  "schema_version": "mida.validation-summary/v1",
+  "task": "VNEXT-R3",
+  "title": "Oreans family plugin structural gate (Origin+Lunlun+holdout 10x)",
+  "package": "mida-cli / mida-packers-themida / mida-acceptance",
+  "verdict_contract": "docs/ACCEPTANCE_CONTRACT.md",
+  "roadmap": "docs/VNEXT_R3_OREANS_PATH.md",
+  "checks": {
+    "r3_continuous_10x": "pass",
+    "cases": [
+      "origin_macro",
+      "lunlun_software",
+      "xiongxiong_duokai"
+    ],
+    "structure_gate_ep_stable": "pass",
+    "r0b_floor": "StructuralPassBehaviorPending",
+    "holdout_corpus_role": "holdout",
+    "pure_rebuild_default": false,
+    "behavioral_accepted": false,
+    "target_process_starts": 30,
+    "network_actions": 0
+  },
+  "notes": [
+    "VNEXT-R3 closed on continuous 10x live unpack + structure gate + R0B StructuralPassBehaviorPending for Origin, Lunlun, and holdout xiongxiong_duokai (20260723-215642).",
+    "Evidence: vault lab/evidence/_repeat batch + r3_gate_envelope.json.",
+    "Pure rebuild remains opt-in; production dump defaults to legacy.",
+    "R0B never returns Behavioral Accepted at this gate.",
+    "At R3 close holdout IAT rebuild avg was ~77% (non-blocking). Post-gate fix: classify_iat_slot_for_trace (zeros/resolved APIs not trash); holdout_iat2 277/277 (100%); Origin 100%; Lunlun 99%.",
+    "origin_macro: ok=10/10 ep=['0x13e0'] r0b=['StructuralPassBehaviorPending'] iat_avg=96.0 (gate); post-fix smoke 100%",
+    "lunlun_software: ok=10/10 ep=['0x1656f4'] r0b=['StructuralPassBehaviorPending'] iat_avg=95.0 (gate); post-fix smoke 99%",
+    "xiongxiong_duokai: ok=10/10 ep=['0x35000'] r0b=['StructuralPassBehaviorPending'] iat_avg=77.0 (gate); post-fix smoke 100%"
+  ],
+  "artifacts": [
+    "docs/VNEXT_R3_OREANS_PATH.md",
+    "docs/PROJECT_AUDIT_AND_ROADMAP.md",
+    "WORKER_HANDOFF.md",
+    "tools/_r3_gate_run.py",
+    "tools/_oreans_repeat_smoke.py",
+    "lab/cases/v2/xiongxiong_duokai.json",
+    "D:\\MidaVault\\lab\\evidence\\_repeat\\batch_20260723-214718_r3c_gate",
+    "D:\\MidaVault\\lab\\evidence\\_repeat\\batch_20260723-214718_r3c_gate"
+  ],
+  "gate_envelope": {
+    "r3_gate": true,
+    "batch_dir": "D:\\MidaVault\\lab\\evidence\\_repeat\\batch_20260723-214718_r3c_gate",
+    "elapsed_sec": 563.24,
+    "finished_utc": "2026-07-23T13:56:42.001646+00:00"
+  }
+}

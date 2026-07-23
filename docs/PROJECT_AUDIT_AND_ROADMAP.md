@@ -3,7 +3,7 @@
 **审计日期:** 2026-07-23（Windows 复审 + Phase 0 绿测 + Origin/Lunlun live StructuralPass）  
 **基线分支:** `baseline/legacy-recovery-20260722`  
 **HEAD:** `52c4eee` + 工作区：CONTROL|INTEGER context + Lunlun null-storm/exit 硬化（未提交）  
-**工作区:** R1-A..E 已提交；**Origin + Lunlun live unpack + R0B StructuralPass 已固化**；GTO live 仍开放  
+**工作区:** R1–R4 结构门已关（R3 Oreans 10× + R4 AHK/GTO VNEXT-R4）；pure 默认仍 No；Behavioral Accepted 未声明  
 **主机:** Windows 11；仓库 `D:\Claude project\magicmida-rs`；vault `D:\MidaVault`  
 **环境事实:** VS 2022 Professional MSVC 14.44；`tools/_rebuild_cli.cmd`；
 `CARGO_TARGET_DIR=D:\MidaVault\scratch\cargo-target`；
@@ -53,9 +53,9 @@ R0B  独立 acceptance 静态内核          ✅ 已落地（提交 + 本机测�
 R1   纯 PE 模型 + rebuild 管线         ✅ R1-A..E 合成 corpus 关闭（MSVC workspace 绿）
      R1-E 合成 structural corpus      ✅ closed；live smoke 仍开放
      生产 dump 默认 pure              ⬜ 仍 legacy；`--pure-rebuild` opt-in
-R2   统一 runtime/event + replay       ⬜ 未开始（debug 仍在 cli/unpacker）
-R3   Oreans 插件 + Origin/Lunlun/盲样  ⬜ 遗留逻辑在 cli + packers/themida
-R4   第二个独立保护族插件              ⬜ AHK/GTO 仅 experimental profile
+R2   统一 runtime/event + replay       ✅ Slice0–4 落地（handler 体仍在 cli）
+R3   Oreans 插件 + Origin/Lunlun/盲样  ✅ 结构门关闭 (10× + holdout); IAT holdout 100%
+R4   第二个独立保护族插件              ✅ 结构门关闭 (VNEXT-R4; GTO experimental + Oreans reg)
 1.0  满足 release rule 后才谈          ⬜
 ```
 
@@ -287,8 +287,9 @@ mida-acceptance check-static <scratch>\origin_u.exe --report <scratch>\origin_r0
 | 失败模式 B | OEP fallback 后 ExitProcess，仍进 IAT v3-trace → 挂死 |
 | 修复 | guard 域外 NotGuarded；null-storm≥8 接受 last PossibleOEP；`process_exited` 跳过 v3-trace |
 | 成功阶段 | storm escape → forced OEP `0x1401656f4` → skip v3 → dump 14 sec → R0B StructuralPass |
-| 质量 residual | IAT rebuild **41/352**；无 v3-trace；虚拟化 OEP；**非** Origin 级恢复 |
-| 非目标达成 | **非** Behavioral `Accepted`；**非** 完整 IAT 解密 |
+| 质量 residual（旧） | IAT rebuild **41/352**；无 v3-trace；虚拟化 OEP |
+| **R3-path-C（2026-07-23）** | storm freeze → post-loop v3：**295 traced / 336/352 (95%)**；`live_20260723-203635_lun_iat_v3defer` + R0B `…-203747_lun_iat_r0b` |
+| 非目标达成 | **非** Behavioral `Accepted`；OEP 仍为 PossibleOEP/虚拟化路径；**非** R3 10× |
 
 #### GTO experimental 基线（vault；非 Oreans 生产）
 
@@ -415,9 +416,10 @@ mida-acceptance check-static <scratch>\origin_u.exe --report <scratch>\origin_r0
 
 ### Phase 6 — R4 第二族 + 1.0
 
-1. AHK/GTO → `mida_plugin_ahk_gto`（默认仍 opt-in）。  
+1. AHK/GTO → `mida_plugin_ahk_gto`（默认仍 opt-in）。**R4 structural CLOSED (VNEXT-R4):** real plugin + dual select; GTO live needs `--profile=ahk-gto-experimental`; Oreans Origin+Lunlun+holdout reg green.  
 2. Dali 保持 OOS / 未来 managed 独立线。  
-3. 1.0：R0B–R4 门全绿 + 双插件 + holdout + 10× Oreans。
+3. 1.0：R0B–R4 结构门已绿；仍差独立行为 Accepted + release rule 评审。  
+4. R4 契约：[docs/VNEXT_R4_AHK_GTO_PATH.md](VNEXT_R4_AHK_GTO_PATH.md)。
 
 ### 并行工程债
 
@@ -468,7 +470,7 @@ M6  R4 第二族插件 + 1.0 评审
 - [x] 同样品 `--pure-rebuild` 对照；Phase2 结构对齐（`live_20260723-173403_p2align2_pure` **structural_equal**；**不 flip 默认**）  
 - [x] 确认 ScyllaHide x64 哈希与现场二进制一致（`hygiene/scyllahide_hash_20260723`；x64 MATCH；x86 仍占位）  
 - [x] 提交 storm/exit + guard 硬化（`eaf8468`；Origin ×3 无回归已验证）  
-- [ ] Lunlun OEP/IAT 质量提升后再 smoke（非阻塞结构门；需独立切片+复验）  
+- [x] Lunlun IAT 质量（R3-path-C）：storm freeze + post-loop v3 → 95% rebuild；Origin 无回归  
 
 
 ### Week 2
@@ -482,7 +484,21 @@ M6  R4 第二族插件 + 1.0 评审
 - [x] R2 切片 2b：`DebuggerCoreEngine` live 适配器  
 - [x] R2 CLI pump：`ProcessSession` → engine；Origin smoke `live_20260723-181813_r2cli`  
 - [x] R2 Slice3 stub：`PackerPlugin` + `ThemidaPlugin` identify（CLI 未接控制流）  
-- [ ] R2 后续：plugin 驱动 unpack 迁移 / addr 在 dump 边界采用  
+- [x] R2 Slice 3b-1：`on_event` 咨询 + CreateProcess 路径策略进 plugin（handler 仍在 CLI）  
+- [x] R2 Slice 3b-2：OEP/IAT/dump milestone → PluginCtx（AV/IAT 体仍在 CLI）  
+- [x] Origin 3b-2 live smoke `live_20260723-183940` StructuralPassBehaviorPending  
+- [x] R2 Slice 3b-3：`refresh_loop_policy` leave/short-wait/CloseHandle/timeouts  
+- [x] Origin 3b-3 live smoke `live_20260723-185129` StructuralPassBehaviorPending  
+- [x] R2 Slice 3b-4：AV/text 阈值 + dump 边界 `Va→Rva` + `skip_v3`  
+- [x] Origin 3b-4 live smoke `live_20260723-185936`  
+- [x] Lunlun 3b-4 live smoke `live_20260723-190051_3b4`  
+- [x] R2 Slice 4：`ReplayMemory` + `guard_oep_event_script` + offline plugin 骨架测  
+- [x] R3-prep：`ThemidaPlugin` offline replay + `identify_record` + `tools/_oreans_repeat_smoke.py`（非 10× 门）  
+- [x] R2 Slice 3b-5：`note_iat_trace_skipped` + `plugin_host` 抽出；Origin `live_20260723-194036`；Lunlun `live_20260723-194142_3b5`（skip_v3）  
+- [x] R2 Slice 3b-6：IAT complete + dump-enter + leave helper 统一；Origin `live_20260723-200918`；Lunlun `live_20260723-200918_3b6`  
+- [x] R3-path-A：契约 `VNEXT_R3_OREANS_PATH.md` + offline skip 回放 + harness EP/R0B；批 `batch_20260723-201638_r3a`（Origin+Lunlun×3，**非** 10× 门）  
+- [x] R3-path-B：`corpus_role=holdout` + `HOLDOUT_SLOT.md` + preflight/harness 槽（**holdout 仍 empty**，无第三 Oreans PE）  
+- [x] R3 门：Origin+Lunlun+holdout 连续 10× + validation_summary（`batch_20260723-214718_r3c_gate`，task VNEXT-R3）  
 
 ---
 

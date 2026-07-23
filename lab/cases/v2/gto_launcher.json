@@ -23,7 +23,7 @@
     "architecture": "x86_64",
     "execution_model": "native",
     "protection_family": "ahk_gto_candidate",
-    "engine_route": "future_plugin_ahk_gto",
+    "engine_route": "mida_plugin_ahk_gto",
     "corpus_role": "research"
   },
   "static_fingerprint": {

@@ -95,6 +95,10 @@ pub(crate) fn install_container_bootstrap(
 ///
 /// Returns `Some(original_entry_point)` so the PE EP is **not** redirected to
 /// `.boot` (CRT must run `__security_init_cookie` first).
+///
+/// **R4-A3:** When `crt_entry_rva` is not an MSVC CRT wrapper (common on GTO
+/// post-attach freeze at application OEP), skip the failed patch attempt and
+/// install pre-OEP bootstrap directly — same outcome, clearer log path.
 pub(crate) fn install_post_crt_container_restore(
     pe: &mut PeHeader,
     dump_buf: &mut [u8],
@@ -111,6 +115,30 @@ pub(crate) fn install_post_crt_container_restore(
     }
 
     let image_base = pe.nt_headers.optional_header.image_base;
+
+    // Application OEP (or non-CRT PE EP): PostCrt patch cannot apply — use
+    // pre-OEP bootstrap without treating it as a failed CRT decode.
+    if !looks_like_crt_entry_wrapper(dump_buf, crt_entry_rva) {
+        info!(
+            entry = format_args!("{crt_entry_rva:#x}"),
+            containers = containers.len(),
+            heap_globals = heap_globals.len(),
+            "PostCrt: entry is not MSVC CRT wrapper (frozen app OEP or non-CRT) — \
+             pre-OEP container bootstrap"
+        );
+        return install_container_bootstrap(
+            pe,
+            containers,
+            heap_globals,
+            get_process_heap_iat_rva,
+            heap_alloc_iat_rva,
+            crt_entry_rva,
+            image_base,
+            cookie_rva,
+            heap_global_rva,
+        );
+    }
+
     let continue_rva = match patch_crt_wrapper_jmp_to_stub(dump_buf, crt_entry_rva, 0) {
         // First pass: decode original jmp target (without patching yet).
         Ok(cont) => cont,
@@ -170,6 +198,18 @@ pub(crate) fn install_post_crt_container_restore(
 
     // PE entry point must remain the CRT wrapper.
     Some(crt_entry_rva)
+}
+
+/// MSVC x64 PE entry probe: `sub rsp,28h; call; add rsp,28h; jmp`.
+fn looks_like_crt_entry_wrapper(dump_buf: &[u8], ep_rva: u32) -> bool {
+    let off = ep_rva as usize;
+    let Some(bytes) = dump_buf.get(off..off.saturating_add(14)) else {
+        return false;
+    };
+    bytes[0..4] == [0x48, 0x83, 0xec, 0x28]
+        && bytes[4] == 0xe8
+        && bytes[9..13] == [0x48, 0x83, 0xc4, 0x28]
+        && bytes[13] == 0xe9
 }
 
 /// Decode MSVC x64 CRT PE entry and optionally rewrite the trailing `jmp`.

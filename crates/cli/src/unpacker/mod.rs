@@ -31,6 +31,7 @@ mod generic_gate;
 mod helpers;
 mod iat_trace;
 mod oep_scan;
+mod plugin_host;
 mod session;
 mod verify;
 
@@ -43,17 +44,25 @@ use windows::Win32::System::Memory::PAGE_NOACCESS;
 use windows::Win32::System::Threading::{ResumeThread, SuspendThread};
 
 use crate::log::{self, LogType};
-use mida_core::{ContinueStatus, CreateProcessOptions, DebugEvent, DebuggerCore, HwbpType};
+use mida_core::{
+    ContinueStatus, CreateProcessOptions, DebugEvent, DebuggerCore, HwbpType, IdentifyInput,
+    PackerPlugin, PluginAdvice, PluginCtx, PreferredBase, RuntimeBase, Rva, UnpackPhase, Va,
+};
+use mida_packers_ahk_gto::AhkGtoPlugin;
 use mida_packers_themida::{
     create_data_sections, determine_iat_address, fix_iat, fixup_api_call_sites,
     handle_nt_set_information_thread, init_pe_details, inject_scylla_hide, install_anti_dump_fix,
-    shrink_pe, CompilerHint, IatFixStrategy, ScyllaHideConfig, ThemidaState,
+    shrink_pe, CompilerHint, IatFixStrategy, ScyllaHideConfig, ThemidaPlugin, ThemidaState,
 };
 use mida_pe::{
     ContainerRestoreMode, DumpOptions, DumpProfile, EarlySectionSnapshot, OepPolicy, PeHeader,
 };
 
 use av_handler::{handle_access_violation, AvAction};
+use plugin_host::{
+    enter_dump_phase, note_plugin_av_break, note_plugin_iat_complete, plugin_leave_reason,
+    refresh_plugin_loop_policy, sync_plugin_milestones, SelectedPacker,
+};
 use helpers::{
     compute_data_section_bounds, dotnet_dump_and_dump_output, handle_hw_breakpoint,
     pe_section_name_remote_rva, resolve_api_addrs, resolve_host_api, resolve_output_path,
@@ -76,7 +85,7 @@ pub use verify::verify_unpacked;
 // LoopState — mutable tracking variables for the debug loop
 // ---------------------------------------------------------------------------
 
-struct LoopState {
+pub(super) struct LoopState {
     guard_installed: bool,
     close_handle_bp_set: bool,
     nt_protect_bp_set: bool,
@@ -102,7 +111,20 @@ struct LoopState {
     /// Debuggee delivered ExitProcess (or is otherwise untraceable). Skip
     /// V3 single-step IAT tracing and dump with whatever IAT memory remains.
     process_exited: bool,
+    /// Lunlun: null-AV storm after virtualized OEP accepted PossibleOEP and
+    /// left the debug loop without Resuming at OEP (that resume ExitProcess).
+    /// Process is still alive — post-loop should run V3 IAT trace, not skip.
+    storm_escape_freeze: bool,
     iat_trace: Option<IatTraceState>,
+    /// Copied from PackerPlugin session defaults (Slice 3b-3).
+    text_poll_idle_timeout_secs: u64,
+    /// IAT PAGE_NOACCESS monitor window after OEP (seconds).
+    iat_monitor_timeout_secs: u64,
+    /// Slice 3b-4: AV / text-poll thresholds from PackerPlugin.
+    virtualized_oep_max_retries: u32,
+    unrelated_av_storm_threshold: u32,
+    unrelated_av_null_storm_threshold: u32,
+    text_poll_min_nonzero: u8,
 }
 
 // ---------------------------------------------------------------------------
@@ -311,6 +333,84 @@ pub fn unpack(
         info!("post-attach: no debug port — direct dump mode (SuspendThread + ReadProcessMemory)");
     }
 
+    // ---- R2 Slice 3b + R4-A1: dual identify → SelectedPacker for milestones ----
+    let section0_is_plain_text = state
+        .pe_info
+        .pe_sections
+        .first()
+        .is_some_and(|s| s.name == ".text");
+    let mut oreans_probe = ThemidaPlugin::new();
+    let mut gto_probe = AhkGtoPlugin::new();
+    let identify_input = IdentifyInput {
+        is_64bit,
+        entry_point_rva: pe.entry_point,
+        size_of_image: pe.size_of_image(),
+        section_names: pe.sections.iter().map(|s| s.name.clone()).collect(),
+    };
+    let oreans_id = oreans_probe.identify_record(&identify_input);
+    let gto_id = gto_probe.identify_record(&identify_input);
+    let selected_family = select_packer_family(&oreans_id, &gto_id);
+    let mut packer = match selected_family {
+        "ahk_gto" => SelectedPacker::AhkGto(gto_probe),
+        _ => SelectedPacker::Oreans(oreans_probe),
+    };
+    info!(
+        selected = packer.family_id(),
+        oreans = ?oreans_id,
+        ahk_gto = ?gto_id,
+        conf = packer.last_identify_confidence(),
+        "PackerPlugin identify: dual-family select (R4-A1)"
+    );
+    match selected_family {
+        "oreans_themida" => match &oreans_id {
+            mida_core::IdentifyResult::Match { confidence } => {
+                info!(
+                    family = packer.family_id(),
+                    confidence,
+                    "PackerPlugin identify: Match"
+                );
+            }
+            mida_core::IdentifyResult::Ambiguous => {
+                info!(
+                    family = packer.family_id(),
+                    "PackerPlugin identify: Ambiguous"
+                );
+            }
+            mida_core::IdentifyResult::NoMatch => {
+                warn!(
+                    family = packer.family_id(),
+                    "PackerPlugin identify: NoMatch (continuing Oreans host path)"
+                );
+            }
+        },
+        "ahk_gto" => {
+            info!(
+                family = packer.family_id(),
+                confidence = packer.last_identify_confidence(),
+                "PackerPlugin identify: Match"
+            );
+            if !matches!(profile, DumpProfile::AhkGtoExperimental) {
+                warn!(
+                    "AHK/GTO family identified but dump profile is not ahk-gto-experimental — \
+                     heap/container stages stay disabled (pass --profile=ahk-gto-experimental)"
+                );
+            }
+        }
+        other => {
+            warn!(
+                family = other,
+                "PackerPlugin identify: no strong family match (default Oreans host path)"
+            );
+        }
+    }
+    let mut plugin_ctx = PluginCtx {
+        preferred_base: Some(PreferredBase(pe.image_base)),
+        is_dotnet,
+        section0_is_plain_text,
+        ..PluginCtx::default()
+    };
+    packer.apply_session_defaults(&mut plugin_ctx);
+
     let mut ls = LoopState {
         guard_installed: false,
         close_handle_bp_set: false,
@@ -327,8 +427,16 @@ pub fn unpack(
         last_possible_oep: None,
         unrelated_av_streak: 0,
         process_exited: false,
+        storm_escape_freeze: false,
         iat_trace: None,
+        text_poll_idle_timeout_secs: plugin_ctx.text_poll_idle_timeout_secs,
+        iat_monitor_timeout_secs: plugin_ctx.iat_monitor_timeout_secs,
+        virtualized_oep_max_retries: plugin_ctx.virtualized_oep_max_retries,
+        unrelated_av_storm_threshold: plugin_ctx.unrelated_av_storm_threshold,
+        unrelated_av_null_storm_threshold: plugin_ctx.unrelated_av_null_storm_threshold,
+        text_poll_min_nonzero: plugin_ctx.text_poll_min_nonzero,
     };
+
     let guard_protection = PAGE_NOACCESS.0;
     // Image boundary from PE header (pre-ASLR value). Will be rebased after
     // CreateProcess event provides the real image_base.
@@ -581,6 +689,16 @@ pub fn unpack(
             "post-attach: process frozen — proceeding to IAT repair + dump",
         );
 
+        // Slice 3b-2/3b-6: OEP + dump phase via plugin_host (no Win32).
+        plugin_ctx.ensure_runtime_base(image_base_usize as u64);
+        packer.note_oep_accepted(
+            &mut plugin_ctx,
+            oep_addr as u64,
+            frozen_rip.is_none(), // scan / PE-EP when RIP was outside .text
+        );
+        let post_attach_advice =
+            enter_dump_phase(&mut packer, &mut plugin_ctx, "PackerPlugin dump_advice (post-attach)");
+
         // Go straight to post-loop phases (IAT repair, dump, postprocess).
         run_post_loop_phases(
             &mut dbg,
@@ -600,6 +718,8 @@ pub fn unpack(
             &early_section_snapshots,
             input,
             &output_path,
+            plugin_ctx.oep_rva,
+            post_attach_advice,
         )?;
 
         log::log(LogType::Good, "Done.");
@@ -617,14 +737,25 @@ pub fn unpack(
         } else {
             pe_image_boundary
         };
-        // Use timeout-based wait so .text polling can run every ~100ms
-        // during text_polling phase. After OEP/guard is found, fall back to
-        // blocking wait for efficiency.
-        let event = if ls.text_polling {
-            match dbg.wait_event_timeout(100) {
+
+        // Slice 3b-3/3b-6: recompute flags; leave via shared helper.
+        refresh_plugin_loop_policy(&mut packer, &mut plugin_ctx, &ls);
+        if let Some(reason) = plugin_leave_reason(&plugin_ctx) {
+            log::log(
+                LogType::Info,
+                &format!("PackerPlugin leave_debug_loop before wait ({reason})"),
+            );
+            break;
+        }
+
+        // Prefer finite wait while plugin says so (text-poll); else blocking.
+        // R2: wait via engine so we retain EngineEvent.sequence for PackerPlugin.
+        let engine_event = if plugin_ctx.prefer_short_wait {
+            let wait_ms = plugin_ctx.short_wait_ms;
+            match dbg.wait_engine(Some(wait_ms)) {
                 Ok(ev) => ev,
                 Err(mida_core::CoreError::Timeout) => {
-                    // No debug event in 100ms — continue loop for polling
+                    // No debug event — continue loop for polling
                     continue;
                 }
                 Err(_e) if post_attach_mode => {
@@ -642,12 +773,42 @@ pub fn unpack(
                 }
             }
         } else {
-            dbg.wait_event().map_err(|e| {
+            dbg.wait_engine(None).map_err(|e| {
                 log::log(LogType::Fatal, &format!("wait_event returned error: {e:#}"));
                 e
             })?
         };
-        log::log(LogType::Info, &format!("event received: {event:?}"));
+        log::log(
+            LogType::Info,
+            &format!(
+                "event received (seq={}): {:?}",
+                engine_event.sequence, engine_event.event
+            ),
+        );
+
+        // PackerPlugin consult (Slice 3b): policy flags + Abort/Done only.
+        // Handler bodies still run below; plugin does not own Win32.
+        let plugin_advice = packer.on_event(&mut plugin_ctx, &engine_event);
+        match &plugin_advice {
+            PluginAdvice::Abort { message } => {
+                log::log(
+                    LogType::Fatal,
+                    &format!("PackerPlugin abort: {message}"),
+                );
+                return Err(anyhow!("PackerPlugin abort: {message}"));
+            }
+            PluginAdvice::Transition(UnpackPhase::Done) => {
+                ls.process_exited = plugin_ctx.process_exited || ls.process_exited;
+                // Host ExitProcess arm still breaks; keep flag consistent.
+            }
+            PluginAdvice::Transition(phase) => {
+                debug!(?phase, "PackerPlugin phase transition (host may act later)");
+            }
+            PluginAdvice::Continue(_) => {}
+        }
+        // Move event after consult (DebugEvent is not Clone — HANDLE fields).
+        let event = engine_event.event;
+
         // Reset idle timer — we got a real event, Themida is still active
         if ls.text_polling {
             ls.text_poll_start = None;
@@ -669,9 +830,10 @@ pub fn unpack(
                 ls.text_poll_start = Some(std::time::Instant::now());
             }
             if let Some(start) = ls.text_poll_start {
-                if start.elapsed() > std::time::Duration::from_secs(30) {
+                let idle_secs = ls.text_poll_idle_timeout_secs;
+                if start.elapsed() > std::time::Duration::from_secs(idle_secs) {
                     log::log(LogType::Fatal,
-                        &format!(".text poll timeout (30s idle, {} polls) — Themida may not have reached decryption",
+                        &format!(".text poll timeout ({idle_secs}s idle, {} polls) — Themida may not have reached decryption",
                                  ls.text_poll_count));
                     ls.text_polling = false;
                 }
@@ -684,7 +846,8 @@ pub fn unpack(
                 let mut sample = [0u8; 16];
                 if dbg.read_memory(text_start, &mut sample).is_ok() {
                     let non_zero = sample.iter().filter(|&&b| b != 0).count();
-                    if non_zero > 8 {
+                    let min_nz = ls.text_poll_min_nonzero as usize;
+                    if non_zero > min_nz {
                         if sample == ls.text_prev_sample {
                             // .text stable — decryption complete
                             log::log(
@@ -790,12 +953,12 @@ pub fn unpack(
             }
         }
 
-        // If OEP found during text polling, break immediately to dump
-        // while the process is still frozen (no ResumeThread).
-        if ls.oep.is_some() && ls.oep_found_via_scanning {
+        // Frozen-dump / leave decisions from plugin (e.g. OEP via scan).
+        refresh_plugin_loop_policy(&mut packer, &mut plugin_ctx, &ls);
+        if let Some(reason) = plugin_leave_reason(&plugin_ctx) {
             log::log(
                 LogType::Info,
-                "OEP found via scanning — breaking debug loop for frozen dump",
+                &format!("PackerPlugin leave_debug_loop ({reason})"),
             );
             break;
         }
@@ -893,29 +1056,25 @@ pub fn unpack(
                 // CRITICAL: Do NOT install guard at CREATE_PROCESS.
                 // Themida checks .text page protection during init — any non-
                 // PAGE_EXECUTE_READ protection is detected and causes 0xDEADC0DE.
-                // Instead: set text_polling=true and let the polling block above
-                // handle guard installation after .text is stable.
-                // PEB patch + ScyllaHide do NOT change .text protection, so they
-                // are safe to apply here.
-                let text_is_plain = state
-                    .pe_info
-                    .pe_sections
-                    .first()
-                    .is_some_and(|s| s.name == ".text");
-
-                if text_is_plain && !is_dotnet {
+                // Guard-path policy comes from SelectedPacker::on_event (Slice 3b / R4-A1):
+                // request_text_poll vs request_close_handle_chain. Host still
+                // owns PEB/ScyllaHide/HW BP install; PEB + ScyllaHide do NOT
+                // change .text protection so they remain safe here.
+                if plugin_ctx.request_text_poll {
                     ls.text_polling = true;
                     // poll_start is set on first timeout, not here —
                     // LoadDll events can take minutes before Themida
                     // starts .text decryption
-                    log::log(LogType::Info,
-                        "Section 0 is .text — deferring guard to .text-stable poll (30s timeout after last event)");
-                } else if !is_dotnet {
-                    // Non-.text section 0: fall back to CloseHandle → .text write
-                    // → VirtualAlloc → guard chain (handled by HW BP handler)
                     log::log(
                         LogType::Info,
-                        "Section 0 is NOT .text — using CloseHandle HW BP chain",
+                        "PackerPlugin: text-poll path — deferring guard to .text-stable poll (30s idle timeout)",
+                    );
+                } else if plugin_ctx.request_close_handle_chain {
+                    // Non-.text section 0: CloseHandle → .text write →
+                    // VirtualAlloc → guard chain (handled by HW BP handler)
+                    log::log(
+                        LogType::Info,
+                        "PackerPlugin: CloseHandle HW BP chain path",
                     );
                 }
 
@@ -968,17 +1127,19 @@ pub fn unpack(
                     let _ = windows::Win32::Foundation::CloseHandle(h_file);
                 }
 
-                // Only set CloseHandle BP for the non-.text path (CloseHandle chain).
-                // When text_polling is true, we don't need the CloseHandle BP.
-                if !ls.close_handle_bp_set && !ls.guard_installed && !ls.text_polling {
+                // CloseHandle BP only when plugin allows (CloseHandle chain path).
+                // refresh_loop_policy sets allow_close_handle_bp; do not install
+                // during text-poll or after guard/OEP.
+                refresh_plugin_loop_policy(&mut packer, &mut plugin_ctx, &ls);
+                if plugin_ctx.allow_close_handle_bp && !ls.close_handle_bp_set {
                     let close_handle_addr = dbg.apis.as_ref().map(|a| a.close_handle);
                     if let Some(addr) = close_handle_addr {
                         match dbg.set_hw_breakpoint(0, addr, HwbpType::Execute) {
                             Ok(()) => {
-                                debug!("CloseHandle HW breakpoint set (slot 0) [fallback]");
+                                debug!("CloseHandle HW breakpoint set (slot 0) [plugin path]");
                                 info!(
                                     close_handle = %format!("{:#x}", addr),
-                                    "CloseHandle HW breakpoint set (slot 0) [fallback]",
+                                    "CloseHandle HW breakpoint set (slot 0) [plugin path]",
                                 );
                                 ls.close_handle_bp_set = true;
                                 debug!("BP install done, about to continue_event");
@@ -1211,7 +1372,16 @@ pub fn unpack(
                     exc_type,
                 )? {
                     AvAction::Continue => {}
-                    AvAction::Break => break,
+                    AvAction::Break => {
+                        // 3b-5: complete vs skip IAT milestone, then leave.
+                        note_plugin_av_break(
+                            &mut packer,
+                            &mut plugin_ctx,
+                            &ls,
+                            dbg.image_base(),
+                        );
+                        break;
+                    }
                 }
             }
             // ---------------------------------------------------------------
@@ -1240,6 +1410,8 @@ pub fn unpack(
                     // If so, break immediately to avoid the target process exiting.
                     if let Some(ref t) = ls.iat_trace {
                         if t.current_slot >= t.total_slots {
+                            // 3b-6: same complete milestone as av-break success path.
+                            note_plugin_iat_complete(&mut packer, &mut plugin_ctx);
                             info!("IAT tracing complete — exiting debug loop");
                             break;
                         }
@@ -1401,7 +1573,10 @@ pub fn unpack(
             // EXIT_PROCESS — target exited (unexpected before dump)
             // ---------------------------------------------------------------
             DebugEvent::ExitProcess { exit_code } => {
+                // Plugin consult already set process_exited + phase Done.
                 ls.process_exited = true;
+                debug_assert!(plugin_ctx.process_exited);
+                debug_assert_eq!(plugin_ctx.phase, UnpackPhase::Done);
                 if ls.oep.is_some() {
                     info!(
                         exit_code,
@@ -1428,7 +1603,30 @@ pub fn unpack(
                 dbg.continue_event(thread_id, ContinueStatus::Continue)?;
             }
         }
+
+        // Slice 3b-2: after handlers, sync guard/OEP/IAT milestones into plugin.
+        // Skipped when a match arm `break`s; post-loop sync covers that case.
+        sync_plugin_milestones(
+            &mut packer,
+            &mut plugin_ctx,
+            &ls,
+            dbg.image_base(),
+        );
     }
+
+    // Final milestone sync (covers break paths that skipped end-of-iteration).
+    sync_plugin_milestones(
+        &mut packer,
+        &mut plugin_ctx,
+        &ls,
+        dbg.image_base(),
+    );
+    // 3b-6: dump-enter via shared helper (also used by post-attach).
+    let post_loop_advice = if ls.oep.is_some() || plugin_ctx.oep_rva.is_some() {
+        enter_dump_phase(&mut packer, &mut plugin_ctx, "PackerPlugin dump_advice")
+    } else {
+        packer.dump_advice(&plugin_ctx)
+    };
 
     // ---- phases B/C/D: IAT repair, post-processing, dump ----
     // If process already exited during AV-handler IAT wait, still dump.
@@ -1450,7 +1648,7 @@ pub fn unpack(
         do_data_sections,
         shrink,
         false, // traditional debug path
-        ls.process_exited,
+        ls.process_exited || plugin_ctx.skip_v3_iat_trace,
         oep_policy,
         container_restore,
         profile,
@@ -1458,6 +1656,8 @@ pub fn unpack(
         &early_section_snapshots,
         input,
         &output_path,
+        plugin_ctx.oep_rva,
+        post_loop_advice,
     )?;
 
     log::log(LogType::Good, "Done.");
@@ -1704,6 +1904,8 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     hash
 }
 
+// PackerPlugin host helpers live in `plugin_host` (Slice 3b-5/3b-6 extraction).
+
 // ---------------------------------------------------------------------------
 // Post-loop phases (B/C/D) — extracted from unpack()
 // ---------------------------------------------------------------------------
@@ -1721,7 +1923,8 @@ fn run_post_loop_phases(
     do_data_sections: bool,
     shrink: bool,
     post_attach: bool,
-    process_exited: bool,
+    // True when host saw ExitProcess or plugin set skip_v3_iat_trace.
+    skip_v3_iat_trace: bool,
     oep_policy: OepPolicy,
     container_restore: ContainerRestoreMode,
     profile: DumpProfile,
@@ -1729,6 +1932,9 @@ fn run_post_loop_phases(
     early_section_snapshots: &[EarlySectionSnapshot],
     input: &Path,
     output_path: &Path,
+    // Loop-captured OEP RVA from PackerPlugin (diagnostic / dump-boundary).
+    plugin_oep_rva: Option<Rva>,
+    dump_advice: Option<mida_core::DumpAdvice>,
 ) -> Result<(), anyhow::Error> {
     if is_dotnet {
         log::log(
@@ -1796,13 +2002,12 @@ fn run_post_loop_phases(
             LogType::Info,
             "Skipping V3 IAT trace (post-attach: slots already resolved)",
         );
-    } else if process_exited {
-        // Lunlun: virtualized-OEP storm escape can leave a dead debuggee
-        // whose IAT still has many API-like slots. V3 single-step would hang.
-        // Dump with live memory (fix_iat_v2-style resolve best-effort skipped).
+    } else if skip_v3_iat_trace {
+        // Plugin / host: process dead or policy skip (Lunlun storm escape, etc.).
+        // V3 single-step would hang; dump with residual IAT slots.
         log::log(
             LogType::Warn,
-            "Skipping V3 IAT trace (process already exited) — dump with raw IAT slots",
+            "Skipping V3 IAT trace (plugin/host skip_v3) — dump with raw IAT slots",
         );
     } else {
         match fix_iat(dbg, state, &iat, trace_thread_id, strategy) {
@@ -1882,6 +2087,30 @@ fn run_post_loop_phases(
     );
 
     log::log(LogType::Info, &format!("Final OEP: {:#x}", oep_addr));
+
+    // Slice 3b-4: dump-boundary diagnostics via addr types + plugin advice.
+    let runtime_base = RuntimeBase(dbg.image_base());
+    if let Some(plugin_rva) = plugin_oep_rva {
+        if let Some(final_rva) = Va(oep_addr as u64).to_rva(runtime_base) {
+            if final_rva != plugin_rva {
+                info!(
+                    plugin = %format!("{:#x}", plugin_rva.get()),
+                    final_ep = %format!("{:#x}", final_rva.get()),
+                    "PackerPlugin OEP RVA differs from post-loop resolved EP (oep_policy may have retargeted)"
+                );
+            }
+        }
+    }
+    if let Some(ref advice) = dump_advice {
+        info!(
+            advice_ep = ?advice.entry_point_rva,
+            prefer_pure = advice.prefer_pure_rebuild,
+            note = advice.note,
+            "PackerPlugin dump_advice at dump boundary"
+        );
+        // prefer_pure_rebuild is advisory only; CLI `--pure-rebuild` still owns emit.
+        let _ = advice.prefer_pure_rebuild;
+    }
 
     if shrink {
         match shrink_pe(pe) {
@@ -1963,8 +2192,11 @@ fn run_post_loop_phases(
         &format!("Dumping to: {}", output_path.display()),
     );
 
-    let entry_point_u32 =
-        u32::try_from(oep_addr.wrapping_sub(image_base)).context("OEP RVA exceeds u32 range")?;
+    // Slice 3b-4: dump entry via RuntimeBase + Va → Rva (no raw wrapping_sub).
+    let entry_rva = Va(oep_addr as u64)
+        .to_rva(runtime_base)
+        .context("OEP not in runtime image (Va→Rva failed)")?;
+    let entry_point_u32 = entry_rva.get();
 
     // Use the IAT detected by determine_iat_address (don't override with code scanning)
     let dump_opts = DumpOptions {
@@ -2028,4 +2260,67 @@ fn run_post_loop_phases(
         &format!("Unpacked: {}", output_path.display()),
     );
     Ok(())
+}
+
+/// Pick family id from dual identify results (R4-A0).
+///
+/// Prefer Oreans on a clear Match; otherwise AHK/GTO Match; else default
+/// Oreans host path (`oreans_themida`). Identify never enables GTO dump stages.
+fn select_packer_family(
+    oreans: &mida_core::IdentifyResult,
+    gto: &mida_core::IdentifyResult,
+) -> &'static str {
+    let oreans_conf = match oreans {
+        mida_core::IdentifyResult::Match { confidence } => *confidence,
+        mida_core::IdentifyResult::Ambiguous => 1,
+        mida_core::IdentifyResult::NoMatch => 0,
+    };
+    let gto_conf = match gto {
+        mida_core::IdentifyResult::Match { confidence } => *confidence,
+        mida_core::IdentifyResult::Ambiguous => 1,
+        mida_core::IdentifyResult::NoMatch => 0,
+    };
+    if oreans_conf >= 40 && oreans_conf >= gto_conf {
+        "oreans_themida"
+    } else if gto_conf >= 40 {
+        "ahk_gto"
+    } else {
+        "oreans_themida"
+    }
+}
+
+#[cfg(test)]
+mod r4_select_tests {
+    use super::select_packer_family;
+    use mida_core::IdentifyResult;
+
+    #[test]
+    fn prefers_oreans_when_both_match_higher() {
+        assert_eq!(
+            select_packer_family(
+                &IdentifyResult::Match { confidence: 80 },
+                &IdentifyResult::Match { confidence: 50 },
+            ),
+            "oreans_themida"
+        );
+    }
+
+    #[test]
+    fn selects_gto_when_only_gto_matches() {
+        assert_eq!(
+            select_packer_family(
+                &IdentifyResult::NoMatch,
+                &IdentifyResult::Match { confidence: 80 },
+            ),
+            "ahk_gto"
+        );
+    }
+
+    #[test]
+    fn defaults_oreans_when_neither_matches() {
+        assert_eq!(
+            select_packer_family(&IdentifyResult::NoMatch, &IdentifyResult::NoMatch),
+            "oreans_themida"
+        );
+    }
 }

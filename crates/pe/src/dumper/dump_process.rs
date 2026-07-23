@@ -285,13 +285,45 @@ pub fn dump_process(
     // 1a. Validate and patch PE header fields
     validate_and_patch_pe_header(&mut pe, opts)?;
 
-    // 1b. Shrink: remove Themida-specific sections if requested.
-    let mut saved_exception_rva: Option<(u32, u32)> = None;
+    // 1b. Always capture Exception DD — needed for shrink restore *and* for
+    // no-shrink dumps where the table lives in a zero-raw Themida section
+    // (R0B: exception_no_raw / directory_start_unmapped).
+    const IMAGE_DIRECTORY_ENTRY_EXCEPTION: usize = 3;
+    let exc_dir0 = pe.nt_headers.optional_header.data_directory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+    let mut saved_exception_rva: Option<(u32, u32)> =
+        if exc_dir0.virtual_address != 0 && exc_dir0.size != 0 {
+            Some((exc_dir0.virtual_address, exc_dir0.size))
+        } else {
+            None
+        };
+
+    // 1c. Shrink: remove Themida-specific sections if requested.
     if opts.shrink {
-        saved_exception_rva = shrink_sections(&mut pe);
+        if let Some(exc) = shrink_sections(&mut pe) {
+            saved_exception_rva = Some(exc);
+        }
     }
 
-    // 1c. Preserve export table for AutoHotkey and other DLLs
+    // 1c2. Snapshot Exception raw-backing *before* sanitize().
+    // sanitize() sets SizeOfRawData = VirtualSize for every dump-backed
+    // section (including zero-raw .themida), which would make a post-sanitize
+    // lacks-raw check falsely report coverage. Holdout Oreans needs this
+    // pre-sanitize signal to force .pdata materialization after trim.
+    let force_pdata_no_shrink = !opts.shrink
+        && saved_exception_rva
+            .map(|(r, s)| exception_directory_lacks_raw(&pe, r, s))
+            .unwrap_or(false);
+    if force_pdata_no_shrink {
+        if let Some((exc_rva, exc_size)) = saved_exception_rva {
+            info!(
+                exc_rva = format!("{exc_rva:#x}"),
+                exc_size = format!("{exc_size:#x}"),
+                "Exception directory lacks raw backing in process PE (will create .pdata after trim)"
+            );
+        }
+    }
+
+    // 1d. Preserve export table for AutoHotkey and other DLLs
     // If export directory points to a removed section, save it now
     const IMAGE_DIRECTORY_ENTRY_EXPORT: usize = 0;
     let export_dir = pe.nt_headers.optional_header.data_directory[IMAGE_DIRECTORY_ENTRY_EXPORT];
@@ -358,18 +390,21 @@ pub fn dump_process(
         pe.nt_headers.optional_header.data_directory[IMAGE_DIRECTORY_ENTRY_IAT].virtual_address
     };
 
-    // 2b. Magicmida fallback
+    // 2b. Choose live rebuild vs original-PE import fallback.
+    //
+    // Holdout Oreans (stub on-disk imports, fat runtime IAT):
+    // - Live rebuild may report "77%" against *all* slots including zeros, then
+    //   wrongly fall back to original PE which only has ~10 thunks — far worse.
+    // Rules:
+    // 1. Denominator = non-zero live IAT slots (zeros are module delimiters).
+    // 2. Fall back to original only when it has *more* thunks than rebuild
+    //    (never replace a richer rebuild with a Themida-stub import table).
     let mut _resolved_imports: std::collections::HashMap<(String, String), usize> =
         std::collections::HashMap::new();
     if opts.fix_imports {
         let live_empty = import_builder.as_ref().is_none_or(|b| b.thunk_count() == 0);
+        let ptr_size = if is_64bit { 8usize } else { 4usize };
 
-        // NEW: Also use original imports if IAT rebuild is significantly incomplete
-        //
-        // CRITICAL FIX: Compare against runtime IAT size, not original PE import count.
-        // Themida removes unused imports at runtime, so the original PE may list 660
-        // functions while the runtime IAT only has 572 slots. The 82% "coverage" is
-        // actually 545/572 = 95% of the runtime IAT, which is sufficient.
         let use_original = if live_empty {
             true
         } else if let Some(ref ep) = opts.executable_path {
@@ -378,35 +413,66 @@ pub fn dump_process(
                 .map(|b| b.thunk_count())
                 .unwrap_or(0);
 
-            // Determine runtime IAT slot count from PE header
-            let runtime_iat_slots = if let Some((iat_va, iat_size)) = opts.iat_location {
-                iat_size / 8 // 64-bit = 8 bytes per slot
+            let runtime_iat_slots = if let Some((_iat_va, iat_size)) = opts.iat_location {
+                iat_size / ptr_size
             } else {
                 let iat_dir =
                     pe.nt_headers.optional_header.data_directory[IMAGE_DIRECTORY_ENTRY_IAT];
                 if iat_dir.size > 0 {
-                    (iat_dir.size / 8) as usize
+                    (iat_dir.size as usize) / ptr_size
                 } else {
-                    // Fallback: use original import count (old behavior)
                     let orig_imports = crate::original_imports::read_original_import_table(ep);
                     orig_imports.iter().map(|(_, funcs)| funcs.len()).sum()
                 }
             };
 
-            // If we're missing more than 10% of runtime IAT slots, use original
-            let threshold = (runtime_iat_slots as f64 * 0.9) as usize;
-            if rebuilt_count < threshold {
+            // Non-zero live slots from the captured IAT image (best denominator).
+            let nonzero_slots = if !iat_image.is_empty() && ptr_size > 0 {
+                iat_image
+                    .chunks_exact(ptr_size)
+                    .filter(|c| c.iter().any(|&b| b != 0))
+                    .count()
+                    .max(1)
+            } else {
+                runtime_iat_slots.max(1)
+            };
+            // Report both spans; gate coverage on non-zero slots.
+            let denom = nonzero_slots;
+            let threshold = (denom as f64 * 0.9) as usize;
+            let pct = ((rebuilt_count as f64 / denom as f64) * 100.0) as u32;
+
+            let orig_imports = crate::original_imports::read_original_import_table(ep);
+            let original_count: usize = orig_imports.iter().map(|(_, funcs)| funcs.len()).sum();
+
+            if rebuilt_count >= threshold {
+                info!(
+                    rebuilt = rebuilt_count,
+                    nonzero_slots = denom,
+                    total_slots = runtime_iat_slots,
+                    pct,
+                    "IAT rebuild sufficient: {}/{} non-zero slots ({}% coverage; total_slots={}) - using rebuilt table",
+                    rebuilt_count, denom, pct, runtime_iat_slots
+                );
+                false
+            } else if original_count > rebuilt_count {
                 warn!(
-                    "IAT rebuild incomplete: {}/{} runtime slots ({}% coverage) - using original import table",
-                    rebuilt_count, runtime_iat_slots,
-                    (rebuilt_count as f64 / runtime_iat_slots as f64 * 100.0) as u32
+                    rebuilt = rebuilt_count,
+                    original = original_count,
+                    nonzero_slots = denom,
+                    pct,
+                    "IAT rebuild incomplete: {}/{} non-zero ({}%); original has more thunks ({}) - using original import table",
+                    rebuilt_count, denom, pct, original_count
                 );
                 true
             } else {
-                info!(
-                    "IAT rebuild sufficient: {}/{} runtime slots ({}% coverage) - using rebuilt table",
-                    rebuilt_count, runtime_iat_slots,
-                    (rebuilt_count as f64 / runtime_iat_slots as f64 * 100.0) as u32
+                warn!(
+                    rebuilt = rebuilt_count,
+                    original = original_count,
+                    nonzero_slots = denom,
+                    total_slots = runtime_iat_slots,
+                    pct,
+                    "IAT rebuild incomplete vs non-zero slots ({}/{} = {}%), but original is not richer ({} thunks) - keeping rebuilt table",
+                    rebuilt_count, denom, pct, original_count
                 );
                 false
             }
@@ -419,8 +485,11 @@ pub fn dump_process(
                 if let Some(fallback_builder) =
                     build_import_table_from_original(&pe, ep, original_iat_rva)
                 {
-                    info!("Using original PE import table (Magicmida approach): {} modules, {} thunks",
-                        fallback_builder.modules.len(), fallback_builder.thunk_count());
+                    info!(
+                        "Using original PE import table (Magicmida approach): {} modules, {} thunks",
+                        fallback_builder.modules.len(),
+                        fallback_builder.thunk_count()
+                    );
                     import_builder = Some(fallback_builder);
                 }
             }
@@ -792,12 +861,21 @@ pub fn dump_process(
     // Cookie + complement RVAs must be captured before early overlay zeros storage.
     // Prefer authoritative site from offline CRT resolve; never fuzzy-rescan when set.
     // B7.2.1: authority resolve/validation failure is a hard dump error (no structural success).
-    let cookie_site = super::heap_bootstrap::resolve_security_cookie_site(
+    let mut cookie_site = super::heap_bootstrap::resolve_security_cookie_site(
         &pe,
         &dump_buf,
         opts.security_cookie_rva,
         opts.security_cookie_complement_rva,
     )?;
+    // R4-A3: when RW scan is ambiguous (common on GTO heap-rich dumps), recover
+    // a unique site from the cookie value already proven by container detect.
+    // Never invent a site without a unique live cookie value.
+    if cookie_site.is_none() && stage_plan.detect_containers {
+        if let Some(cookie) = super::heap_bootstrap::unique_container_cookie(&containers) {
+            cookie_site =
+                super::heap_bootstrap::find_security_cookie_site_for_value(&pe, &dump_buf, cookie);
+        }
+    }
     let had_authority =
         opts.security_cookie_rva.is_some() || opts.security_cookie_complement_rva.is_some();
     let cookie_rva = cookie_site.map(|s| s.cookie_rva);
@@ -847,7 +925,12 @@ pub fn dump_process(
         warn!("Could not plant default SecurityCookie — CRT may skip cookie init");
     }
 
-    // 4b. Create .pdata and .reloc sections
+    // 4b. Shrink path: Themida sections deleted — restore Exception + reloc
+    // placeholders before import/bootstrap layout. No-shrink .pdata is deferred
+    // until after trim_huge_sections (see 5d/5d2): sanitize() temporarily sets
+    // SizeOfRawData = VirtualSize on zero-raw .themida, which would make an
+    // early lacks-raw check false; trim then collapses that raw back to ~0,
+    // leaving Exception DD unmapped (R0B exception_no_raw).
     if opts.shrink {
         if let Some((exc_rva, exc_size)) = saved_exception_rva {
             create_pdata_section(
@@ -985,6 +1068,32 @@ pub fn dump_process(
     let mut iat_raw_addr = 0u32;
     let _delta = pe.trim_huge_sections(&dump_buf, &mut iat_raw_addr);
 
+    // 5d2. No-shrink: materialize .pdata when Exception DD lacks raw backing.
+    // Prefer the pre-sanitize snapshot (force_pdata_no_shrink); also re-check
+    // post-trim in case layout mutation cleared coverage that sanitize
+    // temporarily invented. Must run after trim and before write_output_file.
+    if !opts.shrink {
+        if let Some((exc_rva, exc_size)) = saved_exception_rva {
+            let still_lacks = exception_directory_lacks_raw(&pe, exc_rva, exc_size);
+            if force_pdata_no_shrink || still_lacks {
+                info!(
+                    exc_rva = format!("{exc_rva:#x}"),
+                    exc_size = format!("{exc_size:#x}"),
+                    force_pre_sanitize = force_pdata_no_shrink,
+                    still_lacks_after_trim = still_lacks,
+                    "Creating .pdata for no-shrink Exception DD raw-backing"
+                );
+                create_pdata_section(
+                    &mut pe,
+                    &dump_buf,
+                    exc_rva,
+                    exc_size,
+                    opts.executable_path.as_deref(),
+                );
+            }
+        }
+    }
+
     // 5e. Rebuild .edata section for AutoHotkey and other DLLs.
     //
     // CRITICAL: This must run BEFORE write_output_file so the section goes
@@ -1090,6 +1199,32 @@ pub fn dump_process(
     );
 
     Ok(())
+}
+
+/// True when Exception DD [rva, rva+size) is not fully covered by any section's
+/// raw file range (PointerToRawData != 0 and SizeOfRawData covers the span).
+fn exception_directory_lacks_raw(pe: &PeHeader, rva: u32, size: u32) -> bool {
+    if rva == 0 || size == 0 {
+        return false;
+    }
+    let Some(end) = rva.checked_add(size) else {
+        return true;
+    };
+    for s in &pe.sections {
+        let raw = s.header.size_of_raw_data;
+        let ptr = s.header.pointer_to_raw_data;
+        if raw == 0 || ptr == 0 {
+            continue;
+        }
+        let va = s.header.virtual_address;
+        let Some(raw_end) = va.checked_add(raw) else {
+            continue;
+        };
+        if rva >= va && end <= raw_end {
+            return false;
+        }
+    }
+    true
 }
 
 /// Create a `.edata` section holding a relocated export directory.

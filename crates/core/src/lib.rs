@@ -30,14 +30,15 @@ pub use debug_event_lifecycle::{
 pub use debugger::{ContinueStatus, DebugEvent, DebuggerCore};
 pub use error::{format_continue_debug_event_error, win32_from_hresult, CoreError};
 pub use plugin::{
-    DumpAdvice, IdentifyInput, IdentifyResult, NullPackerPlugin, PackerPlugin, PluginAdvice,
-    PluginCtx, UnpackPhase,
+    DumpAdvice, HostLoopFacts, IdentifyInput, IdentifyResult, NullPackerPlugin, PackerPlugin,
+    PluginAdvice, PluginCtx, UnpackPhase,
 };
 pub use process::{
     cleanup_stub_exe, close_process_handles, create_debug_process, patch_peb_anti_debug,
     CreateProcessOptions, TargetProcess,
 };
 pub use runtime_engine::{
-    DebuggerCoreEngine, EngineEvent, ReplayRuntimeEngine, RuntimeEngine,
+    guard_oep_event_script, DebuggerCoreEngine, EngineEvent, ReplayMemory, ReplayRuntimeEngine,
+    RuntimeEngine,
 };
 pub use windows_debugger::WindowsDebugger;

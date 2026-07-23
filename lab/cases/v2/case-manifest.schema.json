@@ -135,6 +135,7 @@
         "engine_route": {
           "enum": [
             "mida_plugin_oreans",
+            "mida_plugin_ahk_gto",
             "future_plugin_ahk_gto",
             "generic_static_control",
             "out_of_scope"
@@ -145,7 +146,8 @@
             "development",
             "regression",
             "research",
-            "negative_control"
+            "negative_control",
+            "holdout"
           ]
         }
       }

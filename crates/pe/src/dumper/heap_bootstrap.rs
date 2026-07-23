@@ -313,6 +313,139 @@ fn find_security_cookie_rva(pe: &PeHeader, dump_buf: &[u8]) -> Option<u32> {
     find_security_cookie_site(pe, dump_buf).map(|s| s.cookie_rva)
 }
 
+/// R4-A3: when full RW scan is ambiguous, recover a unique site from a known
+/// live cookie **value** (e.g. from detected SecurityCookie-encoded containers).
+///
+/// Strategy (fail-closed):
+/// 1. Prefer **adjacent** cookie/complement pairs in `.data` / `.data*` only
+///    (MSVC storage layout). Unique adjacent pair wins.
+/// 2. Else unique cookie RVA in `.data` with any complement in that section.
+/// 3. Else refuse (heap-rich dumps often copy the cookie value widely).
+pub(crate) fn find_security_cookie_site_for_value(
+    pe: &PeHeader,
+    dump_buf: &[u8],
+    cookie: u64,
+) -> Option<SecurityCookieSite> {
+    if !is_plausible_cookie(cookie) {
+        return None;
+    }
+    let want = !cookie;
+    let mut adjacent: Vec<SecurityCookieSite> = Vec::new();
+    let mut data_cookie_hits: Vec<u32> = Vec::new();
+    let mut data_complement_hits: Vec<u32> = Vec::new();
+
+    for section in pe.sections.iter().filter(|s| {
+        let chars = s.characteristics;
+        chars & IMAGE_SCN_MEM_READ != 0
+            && chars & IMAGE_SCN_MEM_WRITE != 0
+            && chars & IMAGE_SCN_MEM_EXECUTE == 0
+            && (s.name == ".data" || s.name.starts_with(".data"))
+    }) {
+        let start = section.virtual_address as usize;
+        let Some(end) = start.checked_add(section.virtual_size as usize) else {
+            continue;
+        };
+        let Some(slice) = dump_buf.get(start..end) else {
+            continue;
+        };
+        if slice.len() < 8 {
+            continue;
+        }
+        for offset in (0..=slice.len().saturating_sub(8)).step_by(8) {
+            let v = u64::from_le_bytes(slice[offset..offset + 8].try_into().ok()?);
+            let rva = section.virtual_address + offset as u32;
+            if v == cookie {
+                data_cookie_hits.push(rva);
+                // Adjacent complement at +8 or -8 (MSVC typical).
+                if offset + 16 <= slice.len() {
+                    let next =
+                        u64::from_le_bytes(slice[offset + 8..offset + 16].try_into().ok()?);
+                    if next == want {
+                        adjacent.push(SecurityCookieSite {
+                            cookie_rva: rva,
+                            complement_rva: rva + 8,
+                        });
+                    }
+                }
+                if offset >= 8 {
+                    let prev =
+                        u64::from_le_bytes(slice[offset - 8..offset].try_into().ok()?);
+                    if prev == want {
+                        adjacent.push(SecurityCookieSite {
+                            cookie_rva: rva,
+                            complement_rva: rva - 8,
+                        });
+                    }
+                }
+            } else if v == want {
+                data_complement_hits.push(rva);
+            }
+        }
+    }
+
+    // Dedup adjacent by cookie_rva.
+    if !adjacent.is_empty() {
+        adjacent.sort_by_key(|s| s.cookie_rva);
+        adjacent.dedup_by_key(|s| s.cookie_rva);
+        if adjacent.len() == 1 {
+            let site = adjacent[0];
+            info!(
+                cookie_rva = format_args!("{:#x}", site.cookie_rva),
+                complement_rva = format_args!("{:#x}", site.complement_rva),
+                cookie = format_args!("{cookie:#x}"),
+                "Recovered SecurityCookie site from adjacent .data pair (container cookie)"
+            );
+            return Some(site);
+        }
+        warn!(
+            cookie = format_args!("{cookie:#x}"),
+            adjacent_pairs = adjacent.len(),
+            "SecurityCookie value recovery fail-closed (multiple adjacent .data pairs)"
+        );
+        return None;
+    }
+
+    if data_cookie_hits.len() == 1 && !data_complement_hits.is_empty() {
+        let cookie_rva = data_cookie_hits[0];
+        let mut comps = data_complement_hits.clone();
+        comps.sort_by_key(|r| r.abs_diff(cookie_rva));
+        let complement_rva = comps[0];
+        if complement_rva != cookie_rva {
+            info!(
+                cookie_rva = format_args!("{cookie_rva:#x}"),
+                complement_rva = format_args!("{complement_rva:#x}"),
+                cookie = format_args!("{cookie:#x}"),
+                "Recovered SecurityCookie site from unique .data cookie value"
+            );
+            return Some(SecurityCookieSite {
+                cookie_rva,
+                complement_rva,
+            });
+        }
+    }
+
+    warn!(
+        cookie = format_args!("{cookie:#x}"),
+        data_cookie_rvas = data_cookie_hits.len(),
+        data_complement_rvas = data_complement_hits.len(),
+        adjacent_pairs = 0,
+        "SecurityCookie value recovery fail-closed (no unique .data pair)"
+    );
+    None
+}
+
+/// Unique cookie value across container snapshots, if any.
+pub(crate) fn unique_container_cookie(containers: &[ContainerSnapshot]) -> Option<u64> {
+    let mut values: Vec<u64> = containers.iter().map(|c| c.cookie).collect();
+    values.sort_unstable();
+    values.dedup();
+    if values.len() == 1 && is_plausible_cookie(values[0]) {
+        Some(values[0])
+    } else {
+        None
+    }
+}
+
 /// Fallback: scan all readable+writable non-executable sections for a unique
 /// cookie/complement pair. Section names are ignored (B6 has blank-name RW).
 ///
@@ -426,6 +559,51 @@ mod cookie_tests {
     use super::*;
 
     #[test]
+    fn recovers_site_from_known_cookie_value_in_data() {
+        // Adjacent cookie+complement in .data; extra cookie copies elsewhere ignored.
+        let mut buf = vec![0u8; 0x200];
+        let cookie: u64 = 0x0000_1234_5678_9abc;
+        // Stray cookie value at 0x20 without adjacent complement (must not match alone).
+        buf[0x20..0x28].copy_from_slice(&cookie.to_le_bytes());
+        // Real adjacent pair at 0x100 / 0x108.
+        buf[0x100..0x108].copy_from_slice(&cookie.to_le_bytes());
+        buf[0x108..0x110].copy_from_slice(&(!cookie).to_le_bytes());
+
+        let pe = pe_with_named_rw_section(".data", 0, 0x200, 0xC000_0040);
+        let site = find_security_cookie_site_for_value(&pe, &buf, cookie).expect("recover");
+        assert_eq!(site.cookie_rva, 0x100);
+        assert_eq!(site.complement_rva, 0x108);
+    }
+
+    #[test]
+    fn recovery_ignores_cookie_copies_outside_data() {
+        let mut buf = vec![0u8; 0x300];
+        let cookie: u64 = 0x0000_aaaa_bbbb_cccc;
+        // .data-only pe: adjacent pair unique.
+        buf[0x40..0x48].copy_from_slice(&cookie.to_le_bytes());
+        buf[0x48..0x50].copy_from_slice(&(!cookie).to_le_bytes());
+        let pe = pe_with_named_rw_section(".data", 0, 0x100, 0xC000_0040);
+        let site = find_security_cookie_site_for_value(&pe, &buf, cookie).expect("adjacent");
+        assert_eq!(site.cookie_rva, 0x40);
+    }
+
+    #[test]
+    fn unique_container_cookie_requires_single_value() {
+        let a = ContainerSnapshot {
+            rva: 0x10,
+            decoded_begin: 0x10000,
+            decoded_end: 0x10100,
+            decoded_capacity: 0x10200,
+            cookie: 0xabc,
+            heap_content: vec![0; 4],
+        };
+        let mut b = a.clone();
+        b.cookie = 0xdef;
+        assert_eq!(unique_container_cookie(&[a.clone()]), Some(0xabc));
+        assert_eq!(unique_container_cookie(&[a, b]), None);
+    }
+
+    #[test]
     fn plants_default_cookie_at_captured_site() {
         let cookie: u64 = 0x3497_64dd_2eee;
         let mut buf = vec![0u8; 0x40];
@@ -475,6 +653,12 @@ mod cookie_tests {
             return false;
         }
         write_u64_at_rva(dump_buf, site.complement_rva, !DEFAULT_SECURITY_COOKIE)
+    }
+
+    fn pe_with_named_rw_section(name: &str, va: u32, vsize: u32, chars: u32) -> PeHeader {
+        let mut pe = pe_with_rw_section(va, vsize, chars);
+        pe.sections[0].name = name.to_string();
+        pe
     }
 
     /// Minimal PE with blank-name R+W section (B6-like) for cookie scan tests.

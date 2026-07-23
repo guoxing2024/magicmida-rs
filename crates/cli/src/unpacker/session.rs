@@ -11,8 +11,8 @@ use anyhow::anyhow;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 
 use mida_core::{
-    ContinueStatus, CoreError, DebugEvent, DebuggerCore, DebuggerCoreEngine, RuntimeEngine,
-    WindowsDebugger,
+    ContinueStatus, CoreError, DebugEvent, DebuggerCore, DebuggerCoreEngine, EngineEvent,
+    RuntimeEngine, WindowsDebugger,
 };
 
 // ---------------------------------------------------------------------------
@@ -79,6 +79,18 @@ impl ProcessSession {
     #[allow(dead_code)]
     pub(super) fn engine_has_pending(&self) -> bool {
         self.eng.has_pending()
+    }
+
+    /// Wait for the next debug event via the R2 engine (keeps sequence stamp).
+    ///
+    /// Prefer this when the host must consult [`mida_core::PackerPlugin::on_event`]
+    /// with a full [`EngineEvent`]. Call sites that only need [`DebugEvent`] can
+    /// keep using [`DebuggerCore::wait_event`].
+    pub(super) fn wait_engine(
+        &mut self,
+        timeout_ms: Option<u32>,
+    ) -> Result<EngineEvent, CoreError> {
+        self.eng.wait(timeout_ms)
     }
 }
 
