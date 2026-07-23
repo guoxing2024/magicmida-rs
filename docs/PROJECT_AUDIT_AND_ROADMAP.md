@@ -262,7 +262,7 @@ mida-acceptance check-static <scratch>\origin_u.exe --report <scratch>\origin_r0
 | **Lunlun R0B candidate** | **`StructuralPassBehaviorPending`，failures=[]**（无 oracle；degraded OEP/IAT） |
 | **GTO experimental** | **`live_20260723-164707_p1exp` exit 0；size 16445952；sha256 `2bdd7cb2…a6fe`** |
 | **GTO R0B candidate** | **`StructuralPassBehaviorPending`，failures=[]**（experimental；cookie/CRT residual） |
-| pure-rebuild live compare | **未执行** |
+| pure-rebuild live compare | **已执行** `live_20260723-165826_p1pure_pure`：R0B 过；file-level vs p1smoke **structural_mismatch**（保留 pure opt-in） |
 
 #### Origin 首通关键路径（vault）
 
@@ -310,11 +310,11 @@ mida-acceptance check-static <scratch>\origin_u.exe --report <scratch>\origin_r0
 | 纯 PE 方向 | 4 | R1 实现深，未提交/未默认切换；pe 测本 shell 未链 |
 | 运行时抽象 | 2 | 仍是 Win32 调试器直连 + cli 大循环；context 标志已硬化 |
 | 插件化 | 2 | themida crate 存在，非 R3 插件契约 |
-| 样品工程 | **5** | v2 + vault 绿；**Origin+Lunlun live 证据包已固化** |
-| 过程/仓库卫生 | 4 | 策略好；context/storm 修复待提交；临时 tools 不入库 |
-| 距“完美脱壳” | 2 | Origin/Lunlun 结构候选通过；Lunlun 质量 residual；行为与多族未闭环 |
+| 样品工程 | **5** | v2 + vault 绿；Origin/Lunlun/GTO(exp) live 证据 + pure 对照已记 |
+| 过程/仓库卫生 | 4 | 硬化已提交；临时 tools 不入库；vault 与 git 分离 |
+| 距“完美脱壳” | 2 | 多样品结构候选通过；pure≠legacy；行为与多族未闭环 |
 
-**综合：** 方向正确、R0B/R1 地基扎实；**Origin + Lunlun 已结构门通过**（Lunlun 为 degraded）。主阻塞：**(1) Lunlun OEP/IAT 质量 + GTO** → **(2) 提交 debugger/storm 修复 + 稳定性** → **(3) R2 事件引擎** → **(4) R3 Oreans 10× 闭环** → **(5) 独立行为验收**。
+**综合：** 方向正确、R0B/R1 地基扎实；**Origin + Lunlun + GTO(exp) 结构门已过**；pure live R0B 过但 **file-level 与 legacy 不对齐**。主阻塞：**(1) Phase1 收尾卫生（Dali/ScyllaHide）** → **(2) Phase2 pure 对齐（再谈默认 flip）** → **(3) R2 事件引擎** → **(4) R3 Oreans 10×** → **(5) 独立行为验收**。
 
 ---
 
@@ -344,7 +344,7 @@ mida-acceptance check-static <scratch>\origin_u.exe --report <scratch>\origin_r0
 | 样品 | 动作 | 状态 | 归档（vault only） |
 |------|------|------|--------------------|
 | Origin | legacy unpack；R0B；oracle 观察 | **✅ `live_20260723-132326` StructuralPass** | candidate SHA、r0b、notes、unpack log |
-| Origin pure | 同 capture 或同输入 `--pure-rebuild` 对照 | ⬜ 未做 | structural diff vs legacy |
+| Origin pure | 同输入 `--pure-rebuild` 对照 | **✅ R0B 过；file structural_mismatch vs p1smoke** | `live_20260723-165826_p1pure_pure` + compare JSON |
 | Lunlun | unpack + R0B（无 oracle） | **✅ `live_20260723-163436_p1fix3` StructuralPass（degraded）** | 同上 + residual 质量说明 |
 | GTO | `--profile=ahk-gto-experimental` | **✅ `live_20260723-164707_p1exp` StructuralPass（experimental residual）** | 阶段矩阵 + WARN 点（notes） |
 | Dali | static + OOS 笔记 | ⬜ 低优先级 | 一页研究笔记 |
@@ -454,15 +454,15 @@ M6  R4 第二族插件 + 1.0 评审
 
 ### Week 1
 
-- [ ] 固定 VS/vcvars 开发入口；`cargo test --workspace --offline` 绿  
-- [ ] Commit R1-B..E；统一 README / R1 roadmap / handoff 状态句  
-- [ ] `validation_summary.json` → `VNEXT-R1-E`  
+- [x] 固定 VS/vcvars 开发入口；`cargo test --workspace --offline` 绿（2026-07-23 复验 412/0）  
+- [x] Commit R1-B..E；统一 README / R1 roadmap / handoff 状态句  
+- [x] `validation_summary.json` → `VNEXT-R1-E`  
 - [x] vault 物化 Origin + Lunlun；live unpack + R0B 证据进 vault（Origin 全路径；Lunlun degraded）  
 - [x] Origin ×3 稳定性抽检（`STABILITY_20260723_p1smoke.md`；3/3 StructuralPass）  
-- [ ] 同样品 `--pure-rebuild` 对照；记 structural mismatches  
+- [x] 同样品 `--pure-rebuild` 对照；记 structural mismatches（`live_20260723-165826_p1pure_pure`；**不 flip 默认**）  
 - [ ] 确认 ScyllaHide x64 哈希与现场二进制一致  
 - [x] 提交 storm/exit + guard 硬化（`eaf8468`；Origin ×3 无回归已验证）  
-- [ ] Lunlun OEP/IAT 质量提升后再 smoke（非阻塞结构门）  
+- [ ] Lunlun OEP/IAT 质量提升后再 smoke（非阻塞结构门；需独立切片+复验）  
 
 
 ### Week 2
@@ -478,9 +478,9 @@ M6  R4 第二族插件 + 1.0 评审
 
 1. **最终目的**是可证据化的“完美脱壳”（loader-valid + 行为等价 + 可复现 + 多族），不是单一启发式 dump。  
 2. **当前最强资产：** 独立 acceptance（R0B，本机已复验）+ 纯 PE rebuild（R1）+ vault 合约 + **Origin/Lunlun live StructuralPass 证据包**。  
-3. **当前最强负债：** 未提交的 debugger/storm 修复；Lunlun degraded IAT/OEP；无 GTO live；无行为/replay；单体调试循环。  
+3. **当前最强负债：** Lunlun degraded IAT/OEP；pure≠legacy file layout（image_base/winlice）；无行为/replay；单体调试循环。  
 4. **四个样品职责：** Origin/Lunlun 扛 Oreans 主线；GTO 未来第二族；Dali 明确范围外。  
-5. **下一步唯一正确顺序：** **提交硬化 + Lunlun 质量 / Origin 稳定性** → GTO 基线 → R2 引擎 → R3 Oreans 门禁 → 行为 Accepted → R4。  
+5. **下一步唯一正确顺序（验证驱动）：** Phase1 收尾（Dali OOS / ScyllaHide 卫生）→ **有计划的 pure 对齐（Phase2）** → R2 引擎 → R3 Oreans 门禁 → 行为 Accepted → R4。禁止跳过门禁默认 flip pure。  
 6. Windows 主机消除了“无法物化样品”的环境借口；**完美脱壳仍取决于证据阶梯，不取决于换了 OS。**
 
 ---

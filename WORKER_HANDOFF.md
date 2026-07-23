@@ -133,6 +133,14 @@ mida dump-process <sample> --pure-rebuild
 - `dependency_boundary` + `pe_purity_boundary`: pass
 - `validation_summary.json` task: **VNEXT-R1-E**
 
+### Phase 0 re-verify (post hardening)
+
+- **When:** 2026-07-23 after `eaf8468`
+- **Command:** MSVC env via `tools/_enter_msvc_env.ps1`; `CARGO_TARGET_DIR=D:\MidaVault\scratch\cargo-target`; `cargo test --workspace --offline`
+- **Result:** **412 passed / 0 failed** (exit 0)
+- **Log:** `D:\MidaVault\scratch\phase0_workspace_test.log`
+- **Stamp:** `D:\MidaVault\lab\evidence\PHASE0_REVERIFY_20260723.md`
+
 ### Origin live unpack (Phase 1 — first structural pass)
 
 - **Evidence:** `D:\MidaVault\lab\evidence\origin_macro\live_20260723-132326\`
@@ -140,7 +148,7 @@ mida dump-process <sample> --pure-rebuild
 - **Candidate:** size `13746176`, sha256 `0c0923e34cb8571f09d954047880c75388ed062157ea384c6613f0c93a58efbb`
 - **R0B:** `StructuralPassBehaviorPending`, failures `[]` (oracle observation only)
 - **Path:** OEP found → IAT multi-block **305 slots** traced → dump 17 sections → structure gate ok
-- **Unblock fix (worktree, not yet committed):**
+- **Unblock fix (committed `876bc0e`):**
   - `crates/core/src/windows_debugger.rs` — prefer `CONTEXT_CONTROL|INTEGER` over `CONTEXT_ALL`/XSAVE for Get/SetThreadContext; SuspendThread retry; OpenThread GET|SET|SUSPEND
   - Win11 failure mode was `SetThreadContext` → `ERROR_NOACCESS` (0x800703E6) during virtualized OEP and IAT v3-trace
 
@@ -151,7 +159,7 @@ mida dump-process <sample> --pure-rebuild
 - **Candidate:** size `12980224`, sha256 `dd44d9ca607aa15bf650900f51ad2dc22918665bd560b25b68aa9a52ac14c380`
 - **R0B:** `StructuralPassBehaviorPending`, failures `[]` (no oracle)
 - **Path (degraded):** virtualized OEP → null-AV storm escape → forced OEP `0x1401656f4` → process ExitProcess during IAT wait → **skip v3-trace** → dump 14 sections; IAT rebuild **41/352** → original import table
-- **Unblock fixes (worktree, not yet committed):**
+- **Unblock fixes (committed `eaf8468`):**
   - `crates/packers/themida/src/guard.rs` — early NotGuarded if fault outside `.text`
   - `crates/cli/src/unpacker/av_handler.rs` — null-storm (≥8) accept last PossibleOEP; skip in-loop v3-trace when process exited
   - `crates/cli/src/unpacker/mod.rs` — `process_exited` / `unrelated_av_streak`; post-loop skip V3 IAT trace when exited
@@ -174,11 +182,24 @@ mida dump-process <sample> --pure-rebuild
 - **Path:** post-attach IAT OK → OEP observe **timeout 60s** → .text scan OEP `0x1400070b0` → IAT rebuild **545/572** → container/bootstrap `.boot` EP `0xecc000` → dump 11 sections
 - **Not production:** experimental profile only; SecurityCookie fail-closed; CRT wrapper not patchable
 
-## Suggested next slices
+### Origin pure-rebuild live compare (Phase 1 / Phase 2 gate input)
 
-1. ~~**Commit** hardening~~ → `eaf8468` (cli storm/exit + themida guard + docs).
-2. ~~**GTO experimental baseline**~~ → `live_20260723-164707_p1exp` (StructuralPass; residual cookie/CRT/OEP-timeout).
-3. **Optional Phase 1 polish:** Dali OOS one-pager; Lunlun OEP/IAT quality; `--pure-rebuild` structural compare on Origin.
-4. **R1-F (optional):** host-resolved IAT → pure import builder.
-5. **R2:** runtime event / replay skeleton (blocker for clean R3 plugin).
-6. Flip default pure only after live pure ≥ legacy structural quality on Origin+Lunlun; **never** default `ahk-gto-experimental`.
+- **Evidence:** `D:\MidaVault\lab\evidence\origin_macro\live_20260723-165826_p1pure_pure\`
+- **CLI:** same + `--pure-rebuild` → exit 0; size `6188032`; sha256 `a96e3fe423cddf1d43a1eda27f416c7e76bd773cd0d6ad8733d3151532ab774c`
+- **R0B pure:** `StructuralPassBehaviorPending` failures `[]`
+- **vs legacy smoke** `live_20260723-164243_p1smoke`: file-level `structural_mismatch` (see `structural_compare_vs_p1smoke.json`)
+  - **Match:** entry `0x13e0`, nsections 17, import/IAT/TLS DDs identical
+  - **Mismatch:** image_base (runtime ASLR retained), size_of_image, exception/reloc placement, `.winlice` layout / trailing section order; raw file size 6.2MB vs 13.7MB
+- **Gate decision:** **keep pure opt-in**; **do not** flip production default
+
+## Suggested next slices (strict order)
+
+1. ~~Phase 0 re-verify~~ → 412/0 after `eaf8468`.
+2. ~~Origin pure-rebuild live compare~~ → R0B pass both; file structural_mismatch recorded.
+3. **Phase 1 remaining (optional polish, still evidence-first):**
+   - Dali OOS one-pager
+   - ScyllaHide x64 hash vs on-disk binary (hygiene)
+   - Lunlun OEP/IAT quality only as a **scoped** slice with re-smoke (not silent drive-by)
+4. **Phase 2 / R1-F only after** deliberate pure parity plan (image_base preferred, section content parity) — not yet.
+5. **R2** only after Phase 1 board consciously closed or deferred in handoff.
+6. Flip default pure **only if** live pure ≥ legacy structural quality on Origin+Lunlun; **never** default `ahk-gto-experimental`.
