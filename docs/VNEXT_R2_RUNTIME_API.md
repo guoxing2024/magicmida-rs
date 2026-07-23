@@ -87,8 +87,8 @@ Implemented in `mida_core::runtime_engine`:
 | `RuntimeEngine` trait | ✅ `wait` / `continue_event` / `runtime_base` / `process_exited` |
 | `EngineEvent { sequence, event }` | ✅ |
 | `ReplayRuntimeEngine` | ✅ pure scripted events; unit tests |
-| Live adapter over `WindowsDebugger` | ⏳ later (wire CLI without behavior change) |
-| `backend_mut()` on trait | deferred (replay has no mem/BP surface yet) |
+| `DebuggerCoreEngine<D>` | ✅ live adapter; pending wait/continue; `backend_mut` |
+| CLI pump switch | ⏳ later (behavior-preserving) |
 
 ### Engine event vs debug event
 
@@ -204,7 +204,8 @@ pub enum UnpackPhase {
 - [x] `RuntimeEngine` + `EngineEvent` in `mida-core`
 - [x] `ReplayRuntimeEngine` + order/pending/continue unit tests
 - [x] Synthetic create→guard_av→oep_bp→exit skeleton test
-- [ ] Live `DebuggerCore` adapter / CLI pump migration
+- [x] Live `DebuggerCoreEngine` adapter + unit tests
+- [ ] CLI pump migration onto `DebuggerCoreEngine`
 
 ---
 

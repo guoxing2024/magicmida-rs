@@ -1,4 +1,4 @@
-# WORKER_HANDOFF - R2-Slice2 RuntimeEngine + Replay
+# WORKER_HANDOFF - R2-Slice2b DebuggerCoreEngine
 
 ## Summary
 
@@ -7,11 +7,12 @@ Phase2 closed (flip=No). R2 progress:
 | Slice | Deliverable |
 |-------|-------------|
 | 1 | `mida_core::addr` newtypes |
-| 2 | `RuntimeEngine` + pure `ReplayRuntimeEngine` + skeleton test |
+| 2 | `RuntimeEngine` + `ReplayRuntimeEngine` |
+| 2b | `DebuggerCoreEngine<D>` live adapter (CLI not switched) |
 
 Docs: [VNEXT_R2_RUNTIME_API.md](docs/VNEXT_R2_RUNTIME_API.md).
-**Live CLI still uses `DebuggerCore`.** Next: Slice 2b live adapter, or Slice 3
-plugin boundary docs→code, without changing unpack success rates.
+**Next careful step:** optional CLI pump migration, or PackerPlugin trait
+stub — prefer zero live behavior change + Origin smoke if CLI is touched.
 
 ## R1-E deliverables (this slice)
 

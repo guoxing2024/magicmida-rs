@@ -32,5 +32,7 @@ pub use process::{
     cleanup_stub_exe, close_process_handles, create_debug_process, patch_peb_anti_debug,
     CreateProcessOptions, TargetProcess,
 };
-pub use runtime_engine::{EngineEvent, ReplayRuntimeEngine, RuntimeEngine};
+pub use runtime_engine::{
+    DebuggerCoreEngine, EngineEvent, ReplayRuntimeEngine, RuntimeEngine,
+};
 pub use windows_debugger::WindowsDebugger;

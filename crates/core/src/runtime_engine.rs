@@ -1,14 +1,16 @@
-//! Runtime event engine surface (R2-Slice2).
+//! Runtime event engine surface (R2-Slice2 / 2b).
 //!
 //! The long-term owner of wait/continue is a [`RuntimeEngine`], not packer CLI
-//! loops. This module lands the trait + a pure [`ReplayRuntimeEngine`] so
-//! offline tests can drive the same contract without Win32.
+//! loops. This module provides:
+//! - pure [`ReplayRuntimeEngine`] for offline tests
+//! - [`DebuggerCoreEngine`] adapter over any [`DebuggerCore`] (live path ready;
+//!   CLI not switched yet)
 //!
-//! Live unpacker still uses [`crate::DebuggerCore`] directly until a later
-//! slice adapts `cli/unpacker` (behavior-preserving).
+//! Live unpacker still calls [`DebuggerCore`] directly until a behavior-
+//! preserving CLI pump migration.
 
 use crate::addr::RuntimeBase;
-use crate::debugger::{ContinueStatus, DebugEvent};
+use crate::debugger::{ContinueStatus, DebugEvent, DebuggerCore};
 use crate::error::CoreError;
 
 /// Decoded event plus engine sequence (monotonic per engine instance).
@@ -134,10 +136,116 @@ impl RuntimeEngine for ReplayRuntimeEngine {
     }
 }
 
+/// Live-path adapter: [`RuntimeEngine`] over an existing [`DebuggerCore`].
+///
+/// Tracks pending continue identity (thread id) and stamps sequences. Does not
+/// replace backend lifecycle internals; it enforces the engine-level
+/// wait→continue pairing that plugins/CLI should use.
+///
+/// CLI migration is a separate, behavior-preserving change.
+pub struct DebuggerCoreEngine<D: DebuggerCore> {
+    inner: D,
+    next_sequence: u64,
+    pending_thread: Option<u32>,
+    process_exited: bool,
+}
+
+impl<D: DebuggerCore> DebuggerCoreEngine<D> {
+    /// Wrap a debugger backend.
+    #[must_use]
+    pub fn new(inner: D) -> Self {
+        Self {
+            inner,
+            next_sequence: 1,
+            pending_thread: None,
+            process_exited: false,
+        }
+    }
+
+    /// Borrow the underlying backend (memory / BP / context).
+    #[must_use]
+    pub fn backend(&self) -> &D {
+        &self.inner
+    }
+
+    /// Mutably borrow the underlying backend.
+    #[must_use]
+    pub fn backend_mut(&mut self) -> &mut D {
+        &mut self.inner
+    }
+
+    /// Consume the engine and return the backend.
+    #[must_use]
+    pub fn into_inner(self) -> D {
+        self.inner
+    }
+}
+
+fn thread_id_of(event: &DebugEvent) -> u32 {
+    match event {
+        DebugEvent::Breakpoint { thread_id, .. }
+        | DebugEvent::SingleStep { thread_id, .. }
+        | DebugEvent::AccessViolation { thread_id, .. }
+        | DebugEvent::CreateThread { thread_id, .. }
+        | DebugEvent::ExitThread { thread_id, .. }
+        | DebugEvent::LoadDll { thread_id, .. }
+        | DebugEvent::UnloadDll { thread_id, .. }
+        | DebugEvent::CreateProcess { thread_id, .. }
+        | DebugEvent::Other { thread_id } => *thread_id,
+        DebugEvent::ExitProcess { .. } => 0,
+    }
+}
+
+impl<D: DebuggerCore> RuntimeEngine for DebuggerCoreEngine<D> {
+    type Error = CoreError;
+
+    fn wait(&mut self, timeout_ms: Option<u32>) -> Result<EngineEvent, Self::Error> {
+        if self.pending_thread.is_some() {
+            return Err(CoreError::DebugState(
+                "DebuggerCoreEngine::wait refused: previous event not continued".into(),
+            ));
+        }
+        let event = match timeout_ms {
+            None => self.inner.wait_event()?,
+            Some(ms) => self.inner.wait_event_timeout(ms)?,
+        };
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        self.pending_thread = Some(thread_id_of(&event));
+        if matches!(event, DebugEvent::ExitProcess { .. }) {
+            self.process_exited = true;
+        }
+        Ok(EngineEvent { sequence, event })
+    }
+
+    fn continue_event(&mut self, status: ContinueStatus) -> Result<(), Self::Error> {
+        let Some(thread_id) = self.pending_thread.take() else {
+            return Err(CoreError::DebugState(
+                "DebuggerCoreEngine::continue_event: no pending event".into(),
+            ));
+        };
+        self.inner.continue_event(thread_id, status)
+    }
+
+    fn runtime_base(&self) -> Option<RuntimeBase> {
+        let base = self.inner.image_base();
+        if base == 0 {
+            None
+        } else {
+            Some(RuntimeBase(base))
+        }
+    }
+
+    fn process_exited(&self) -> bool {
+        self.process_exited
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Diagnostics::Debug::CONTEXT;
 
     fn create_process(image_base: u64) -> DebugEvent {
         DebugEvent::CreateProcess {
@@ -235,5 +343,113 @@ mod tests {
         }
         assert_eq!(phases, ["create", "guard_av", "oep_bp", "exit"]);
         assert_eq!(eng.runtime_base(), Some(RuntimeBase(base)));
+    }
+
+    /// Minimal `DebuggerCore` that only implements wait/continue for engine tests.
+    struct ScriptedDebugger {
+        events: Vec<DebugEvent>,
+        index: usize,
+        image_base: u64,
+        continues: Vec<(u32, ContinueStatus)>,
+    }
+
+    impl ScriptedDebugger {
+        fn new(events: Vec<DebugEvent>, image_base: u64) -> Self {
+            Self {
+                events,
+                index: 0,
+                image_base,
+                continues: Vec::new(),
+            }
+        }
+    }
+
+    impl DebuggerCore for ScriptedDebugger {
+        fn process_handle(&self) -> HANDLE {
+            HANDLE::default()
+        }
+        fn pid(&self) -> u32 {
+            1
+        }
+        fn image_base(&self) -> u64 {
+            self.image_base
+        }
+        fn wait_event(&mut self) -> Result<DebugEvent, CoreError> {
+            if self.index >= self.events.len() {
+                return Err(CoreError::DebugState("script exhausted".into()));
+            }
+            let ev = std::mem::replace(
+                &mut self.events[self.index],
+                DebugEvent::Other { thread_id: 0 },
+            );
+            self.index += 1;
+            Ok(ev)
+        }
+        fn continue_event(
+            &mut self,
+            thread_id: u32,
+            status: ContinueStatus,
+        ) -> Result<(), CoreError> {
+            self.continues.push((thread_id, status));
+            Ok(())
+        }
+        fn read_memory(&self, _address: usize, _buf: &mut [u8]) -> Result<usize, CoreError> {
+            Ok(0)
+        }
+        fn write_memory(&mut self, _address: usize, data: &[u8]) -> Result<usize, CoreError> {
+            Ok(data.len())
+        }
+        fn get_thread_context(&self, _thread_id: u32) -> Result<CONTEXT, CoreError> {
+            Err(CoreError::DebugState("not implemented".into()))
+        }
+        fn set_thread_context(&self, _thread_id: u32, _ctx: &CONTEXT) -> Result<(), CoreError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn debugger_core_engine_pairs_wait_continue() {
+        let dbg = ScriptedDebugger::new(
+            vec![
+                create_process(0x140000000),
+                DebugEvent::Breakpoint {
+                    thread_id: 9,
+                    address: 0x140001000,
+                },
+                DebugEvent::ExitProcess { exit_code: 0 },
+            ],
+            0x140000000,
+        );
+        let mut eng = DebuggerCoreEngine::new(dbg);
+        assert_eq!(eng.runtime_base(), Some(RuntimeBase(0x140000000)));
+
+        let e1 = eng.wait(None).unwrap();
+        assert_eq!(e1.sequence, 1);
+        eng.continue_event(ContinueStatus::Continue).unwrap();
+
+        let e2 = eng.wait(None).unwrap();
+        assert!(matches!(
+            e2.event,
+            DebugEvent::Breakpoint { thread_id: 9, .. }
+        ));
+        eng.continue_event(ContinueStatus::Continue).unwrap();
+
+        let e3 = eng.wait(None).unwrap();
+        assert!(matches!(e3.event, DebugEvent::ExitProcess { .. }));
+        assert!(eng.process_exited());
+        eng.continue_event(ContinueStatus::Continue).unwrap();
+
+        let continues = eng.backend().continues.clone();
+        assert_eq!(continues.len(), 3);
+        assert_eq!(continues[1].0, 9); // BP thread id forwarded
+        assert_eq!(continues[2].0, 0); // ExitProcess uses 0
+    }
+
+    #[test]
+    fn debugger_core_engine_rejects_wait_while_pending() {
+        let dbg = ScriptedDebugger::new(vec![DebugEvent::Other { thread_id: 1 }], 0);
+        let mut eng = DebuggerCoreEngine::new(dbg);
+        eng.wait(None).unwrap();
+        assert!(eng.wait(None).is_err());
     }
 }
