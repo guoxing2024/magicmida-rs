@@ -18,7 +18,7 @@ use mida_core::{
 use mida_packers_ahk_gto::AhkGtoPlugin;
 use mida_packers_themida::ThemidaPlugin;
 
-use super::LoopState;
+use super::loop_state::LoopState;
 
 /// Active family plugin for one unpack session (R4-A1).
 ///

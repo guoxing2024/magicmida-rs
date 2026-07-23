@@ -8,8 +8,10 @@
 | P1 dual identify + Oreans IAT family gate | **DONE** (`2ba1ab0`) |
 | P1 post_loop extract | **DONE** (`cdb0adb`) |
 | P1 early_snapshots extract | **DONE** (`4ac8edd`) |
-| **U1 post_attach extract** | **DONE** (this handoff) |
+| **U1 post_attach extract** | **DONE** (`e99cda6`) |
+| **U1 loop_state extract** | **DONE** (this handoff) |
 | Shared `ThemidaState` / main debug loop body | **still** (honest debt) |
+| Audit package | [docs/AUDIT_PACKAGE_20260724.md](docs/AUDIT_PACKAGE_20260724.md) |
 | B-A2 + B-A3 | **DONE** (`8995f46`) |
 | Pure default / VNEXT-BEH | **not** opened |
 | Long-horizon plan | [docs/UNATTENDED_EXECUTION_PLAN.md](docs/UNATTENDED_EXECUTION_PLAN.md) |

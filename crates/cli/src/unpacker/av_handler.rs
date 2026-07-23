@@ -1,7 +1,7 @@
 use super::helpers::compute_data_section_bounds;
 use super::iat_trace::{advance_to_next_slot, IatTraceState};
 use super::session::ProcessSession;
-use super::LoopState;
+use super::loop_state::LoopState;
 use crate::log::{self, LogType};
 use anyhow::anyhow;
 use mida_core::{ContinueStatus, DebugEvent, DebuggerCore};

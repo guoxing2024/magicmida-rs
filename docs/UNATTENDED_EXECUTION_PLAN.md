@@ -181,4 +181,5 @@ Behavioral Accepted, **not** pure default.
 | UTC date | HEAD (short) | Slice | Result |
 |----------|--------------|-------|--------|
 | 2026-07-24 | 4ac8edd | Plan open; prior post_loop+early_snapshots | baseline |
-| 2026-07-24 | (post_attach) | U1 post_attach extract + dual_select green | Origin batch `…011521` EP 0x13e0; GTO batch `…011543` EP 0xecc000 R0B Pending; acceptance offline green |
+| 2026-07-24 | e99cda6 | U1 post_attach extract + dual_select green | Origin `…011521`; GTO `…011543`; Lunlun `…011721`; holdout `…011818`; B-A3 `…011835` |
+| 2026-07-24 | (loop_state) | U1 LoopState module + Scylla x86 residual note + audit package | engineering smokes re-run after extract |

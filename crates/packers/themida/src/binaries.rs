@@ -43,17 +43,19 @@ mod known_hashes {
 
 /// Known-good SHA-256 hashes for the x86 ScyllaHide helpers.
 ///
-/// **TODO**: Replace these placeholder hashes with the real SHA-256 values
-/// from your ScyllaHide x86 binaries. Run:
-/// ```bash
-/// sha256sum InjectorCLIx86.exe HookLibraryx86.dll
-/// ```
+/// **Residual (2026-07-24):** no trusted `InjectorCLIx86.exe` /
+/// `HookLibraryx86.dll` were present on the audit host
+/// (`D:\magicmida-rs-build` ships x64 only). Placeholders remain so an
+/// accidental x86 build fails closed on inject rather than silently
+/// trusting unknown bits. When trusted x86 helpers land, replace both
+/// hex digests and record vault hygiene under
+/// `D:\MidaVault\lab\evidence\hygiene\`.
 #[cfg(target_arch = "x86")]
 mod known_hashes {
-    /// `InjectorCLIx86.exe` (SHA-256) — **placeholder, replace with real value**.
+    /// `InjectorCLIx86.exe` (SHA-256) — placeholder; fail-closed until filled.
     pub const INJECTOR_CLI_X86: &str =
         "0000000000000000000000000000000000000000000000000000000000000000";
-    /// `HookLibraryx86.dll` (SHA-256) — **placeholder, replace with real value**.
+    /// `HookLibraryx86.dll` (SHA-256) — placeholder; fail-closed until filled.
     pub const HOOK_LIBRARY_X86: &str =
         "0000000000000000000000000000000000000000000000000000000000000000";
 }

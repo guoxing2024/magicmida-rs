@@ -31,6 +31,7 @@ mod generic;
 mod generic_gate;
 mod helpers;
 mod iat_trace;
+mod loop_state;
 mod oep_scan;
 mod plugin_host;
 mod post_loop;
@@ -63,7 +64,8 @@ use helpers::{
     dotnet_dump_and_dump_output, handle_hw_breakpoint, pe_section_name_remote_rva,
     resolve_api_addrs, resolve_host_api, resolve_output_path, scylla_hook_path, scylla_injector_path,
 };
-use iat_trace::{handle_trace_step, IatTraceState, TracePhase};
+use iat_trace::{handle_trace_step, TracePhase};
+use loop_state::LoopState;
 use plugin_host::{
     dual_select_packer, enter_dump_phase, note_plugin_av_break, note_plugin_iat_complete,
     plugin_leave_reason, refresh_plugin_loop_policy, sync_plugin_milestones,
@@ -80,52 +82,6 @@ pub use generic_gate::{
     GenericGateInputs, GenericGateProfile, GenericGateResult, AHK_EXPORT_NAMES,
 };
 pub use verify::verify_unpacked;
-
-// ---------------------------------------------------------------------------
-// LoopState — mutable tracking variables for the debug loop
-// ---------------------------------------------------------------------------
-
-pub(super) struct LoopState {
-    guard_installed: bool,
-    close_handle_bp_set: bool,
-    nt_protect_bp_set: bool,
-    // .text poll: true when CREATE_PROCESS received, actively polling .text
-    text_polling: bool,
-    /// .text poll: Instant when polling started (for 30s timeout)
-    text_poll_start: Option<std::time::Instant>,
-    /// .text poll: count of wait_event iterations since guard installed
-    text_poll_count: u32,
-    /// .text poll: previous snapshot for stability check
-    text_prev_sample: [u8; 16],
-    /// .text poll: true when .text content is stable (two consecutive reads match)
-    text_stable: bool,
-    /// .text poll: re-guard done, waiting for AV at OEP
-    text_reguarded: bool,
-    oep: Option<usize>,
-    oep_found_via_scanning: bool,
-    virtualized_oep_retries: u32,
-    last_possible_oep: Option<usize>,
-    /// Consecutive AVs that were not true code-section guard hits (null deref,
-    /// heap probes).  Used to escape virtualized-OEP null storms (Lunlun).
-    unrelated_av_streak: u32,
-    /// Debuggee delivered ExitProcess (or is otherwise untraceable). Skip
-    /// V3 single-step IAT tracing and dump with whatever IAT memory remains.
-    process_exited: bool,
-    /// Lunlun: null-AV storm after virtualized OEP accepted PossibleOEP and
-    /// left the debug loop without Resuming at OEP (that resume ExitProcess).
-    /// Process is still alive — post-loop should run V3 IAT trace, not skip.
-    storm_escape_freeze: bool,
-    iat_trace: Option<IatTraceState>,
-    /// Copied from PackerPlugin session defaults (Slice 3b-3).
-    text_poll_idle_timeout_secs: u64,
-    /// IAT PAGE_NOACCESS monitor window after OEP (seconds).
-    iat_monitor_timeout_secs: u64,
-    /// Slice 3b-4: AV / text-poll thresholds from PackerPlugin.
-    virtualized_oep_max_retries: u32,
-    unrelated_av_storm_threshold: u32,
-    unrelated_av_null_storm_threshold: u32,
-    text_poll_min_nonzero: u8,
-}
 
 // ---------------------------------------------------------------------------
 // Unpack
