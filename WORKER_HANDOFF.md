@@ -1,13 +1,17 @@
-# WORKER_HANDOFF - R2-Slice1 address newtypes
+# WORKER_HANDOFF - R2-Slice2 RuntimeEngine + Replay
 
 ## Summary
 
-R0B remains the independent static structural judge. Phase2 closed (flip=No).
-**R2-Slice1:** pure address newtypes in `mida_core::addr`
-(`PreferredBase`, `RuntimeBase`, `Rva`, `Va`, `FileOffset`) with conversion
-helpers and unit tests. Docs: [VNEXT_R2_RUNTIME_API.md](docs/VNEXT_R2_RUNTIME_API.md).
-**No live unpacker/dumper migration yet.** Next: Slice 2 engine adapter or
-incremental typed adopt at dump ImageBase boundary.
+Phase2 closed (flip=No). R2 progress:
+
+| Slice | Deliverable |
+|-------|-------------|
+| 1 | `mida_core::addr` newtypes |
+| 2 | `RuntimeEngine` + pure `ReplayRuntimeEngine` + skeleton test |
+
+Docs: [VNEXT_R2_RUNTIME_API.md](docs/VNEXT_R2_RUNTIME_API.md).
+**Live CLI still uses `DebuggerCore`.** Next: Slice 2b live adapter, or Slice 3
+plugin boundary docs→code, without changing unpack success rates.
 
 ## R1-E deliverables (this slice)
 

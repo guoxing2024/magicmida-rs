@@ -78,5 +78,6 @@ acceptance.
 - **R1-C..E:** pure `RebuildPlan` rebuild pipeline + production opt-in pure emit
   ([VNEXT_R1_ROADMAP.md](VNEXT_R1_ROADMAP.md)). Phase2 live pure structural_equal
   on Origin/Lunlun; default dump remains legacy (flip=No).
-- **R2-Slice0..1:** runtime/plugin API sketch + `mida_core::addr` newtypes
-  ([VNEXT_R2_RUNTIME_API.md](VNEXT_R2_RUNTIME_API.md)); no live path migration yet.
+- **R2-Slice0..2:** API sketch + `mida_core::addr` + `RuntimeEngine` /
+  `ReplayRuntimeEngine` ([VNEXT_R2_RUNTIME_API.md](VNEXT_R2_RUNTIME_API.md));
+  live CLI still on `DebuggerCore`.

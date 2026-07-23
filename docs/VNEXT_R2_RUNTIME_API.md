@@ -1,8 +1,7 @@
 # VNEXT-R2 Runtime / Event Engine
 
-Status: **Slice 1 landed** (2026-07-23) — address newtypes in `mida-core::addr`.
-Slice 0 was docs-only; production unpacker/dumper still use raw bases until
-later slices adopt types incrementally.
+Status: **Slice 2 partial** (2026-07-23) — address newtypes + `RuntimeEngine`
+trait + pure `ReplayRuntimeEngine`. Live CLI still uses `DebuggerCore` directly.
 Prerequisites: R0B + R1 closed; Phase2 pure opt-in with flip=**No**.
 
 ## Goals
@@ -79,34 +78,22 @@ backend implementing the same wait/continue contract without Win32.
 
 ---
 
-## Runtime engine trait (sketch)
+## Runtime engine (Slice 2)
 
-```rust
-/// Owns the event pump. Packer plugins and CLI do not call Wait/Continue directly
-/// after migration.
-pub trait RuntimeEngine {
-    type Error;
+Implemented in `mida_core::runtime_engine`:
 
-    /// Block until next decoded event (or timeout).
-    fn wait(&mut self, timeout_ms: Option<u32>) -> Result<EngineEvent, Self::Error>;
-
-    /// Resume the pending event (exactly once; lifecycle-enforced).
-    fn continue_event(&mut self, status: ContinueStatus) -> Result<(), Self::Error>;
-
-    /// Breakpoint / memory / thread operations delegated to backend.
-    fn backend_mut(&mut self) -> &mut dyn DebuggerCore; // interim; later Backend trait
-
-    fn process_exited(&self) -> bool;
-}
-```
+| Item | Status |
+|------|--------|
+| `RuntimeEngine` trait | ✅ `wait` / `continue_event` / `runtime_base` / `process_exited` |
+| `EngineEvent { sequence, event }` | ✅ |
+| `ReplayRuntimeEngine` | ✅ pure scripted events; unit tests |
+| Live adapter over `WindowsDebugger` | ⏳ later (wire CLI without behavior change) |
+| `backend_mut()` on trait | deferred (replay has no mem/BP surface yet) |
 
 ### Engine event vs debug event
 
-`EngineEvent` may start as a thin alias of `DebugEvent`, then add:
-
-- sequence id (from lifecycle)
-- optional `RuntimeBase` snapshot
-- plugin-visible classification hooks (later)
+`EngineEvent` wraps `DebugEvent` with a monotonic `sequence`. Replay sets
+`runtime_base` from `CreateProcess.image_base`.
 
 ### Ownership rules
 
@@ -194,9 +181,10 @@ pub enum UnpackPhase {
 |-------|------|------------------|
 | **Slice 0** | API doc + handoff/roadmap pointers | No |
 | **Slice 1** | Address newtypes in `mida-core::addr` + unit tests | No live |
-| **Slice 2** | `RuntimeEngine` wraps existing unpacker loop (adapter); CLI calls engine | No if careful |
+| **Slice 2** | `RuntimeEngine` + `ReplayRuntimeEngine`; CLI still on `DebuggerCore` | No live |
+| **Slice 2b** | Live adapter; optional CLI pump switch (behavior-preserving) | No if careful |
 | **Slice 3** | Extract Themida policy behind `PackerPlugin` | No if careful |
-| **Slice 4** | Replay backend + synthetic guard→OEP skeleton test | Test-only |
+| **Slice 4** | Expand replay skeleton (mem script / guard→OEP) | Test-only |
 
 **Slice 0 exit criteria:**
 
@@ -210,6 +198,13 @@ pub enum UnpackPhase {
 - [x] `mida_core::{PreferredBase, RuntimeBase, Rva, Va, FileOffset}`
 - [x] Conversion helpers + unit tests (including preferred≠runtime)
 - [x] Docs updated; **no** required call-site migration yet
+
+**Slice 2 exit criteria (partial):**
+
+- [x] `RuntimeEngine` + `EngineEvent` in `mida-core`
+- [x] `ReplayRuntimeEngine` + order/pending/continue unit tests
+- [x] Synthetic create→guard_av→oep_bp→exit skeleton test
+- [ ] Live `DebuggerCore` adapter / CLI pump migration
 
 ---
 
