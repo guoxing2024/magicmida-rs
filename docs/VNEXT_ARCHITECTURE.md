@@ -53,7 +53,8 @@ claims.
    ([ACCEPTANCE_CONTRACT.md](ACCEPTANCE_CONTRACT.md); crate `mida-acceptance`).
 2. `VNEXT-R1`: extract a pure PE model and rebuild pipeline
    ([VNEXT_R1_ROADMAP.md](VNEXT_R1_ROADMAP.md)).
-3. `VNEXT-R2`: establish the single runtime/event engine and replay backend.
+3. `VNEXT-R2`: establish the single runtime/event engine and replay backend
+   ([VNEXT_R2_RUNTIME_API.md](VNEXT_R2_RUNTIME_API.md) — Slice 0 docs sketch landed).
 4. `VNEXT-R3`: implement the Oreans plugin and pass Origin, Lunlun, and a blind
    holdout ten consecutive times.
 5. `VNEXT-R4`: add a second independent protection-family plugin.
@@ -74,6 +75,8 @@ acceptance.
   `mida-pe` pure-listed modules. Crate-level `windows` / `mida-core` remain for
   dump adapters.
 - **R1-B:** pure parse/serialize and overflow-safe RVA/offset offline tests.
-- **R1-C:** pure `RebuildPlan` rebuild pipeline (import/export/exception/TLS/reloc)
-  plus pure byte-map adapters (`plan_from_memory_image`). Production dump/CLI
-  migration remains **R1-D** ([VNEXT_R1_ROADMAP.md](VNEXT_R1_ROADMAP.md)).
+- **R1-C..E:** pure `RebuildPlan` rebuild pipeline + production opt-in pure emit
+  ([VNEXT_R1_ROADMAP.md](VNEXT_R1_ROADMAP.md)). Phase2 live pure structural_equal
+  on Origin/Lunlun; default dump remains legacy (flip=No).
+- **R2-Slice0:** runtime/plugin API sketch only
+  ([VNEXT_R2_RUNTIME_API.md](VNEXT_R2_RUNTIME_API.md)); no live behavior change yet.

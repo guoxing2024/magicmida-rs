@@ -1,12 +1,14 @@
-# WORKER_HANDOFF - Phase2 closed (flip=No) -> R2-Slice0
+# WORKER_HANDOFF - R2-Slice0 docs sketch (after Phase2 close)
 
 ## Summary
 
 R0B (`mida-acceptance`) remains the independent static structural judge.
-**R1-A..E** closed on synthetic corpus; pure dump remains **opt-in**.
-**Phase 2 closed (2026-07-23):** Origin + Lunlun live pure vs legacy are
-**structural_equal**. Default dump remains **legacy** (`PHASE2_CLOSE_20260723.md`:
-flip=**No**; R1-F defer). **Next:** R2-Slice0 interface/state-machine sketch.
+**Phase 2 closed:** Origin + Lunlun pure structural_equal; flip=**No**
+(`PHASE2_CLOSE_20260723.md`; commits `3652412` / `3858896`).
+**R2-Slice0 landed (docs):** [docs/VNEXT_R2_RUNTIME_API.md](docs/VNEXT_R2_RUNTIME_API.md)
+— address types, `RuntimeEngine` / backend / `PackerPlugin` sketches, map from
+existing `DebuggerCore` + `DebugEventLifecycle` + `cli/unpacker`. **No live
+behavior change.** Next code slice: address newtypes or engine adapter (Slice 1/2).
 
 ## R1-E deliverables (this slice)
 

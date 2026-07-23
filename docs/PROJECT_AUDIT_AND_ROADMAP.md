@@ -475,9 +475,9 @@ M6  R4 第二族插件 + 1.0 评审
 
 - [x] GTO experimental 一次受控跑；只记录不修花（`live_20260723-164707_p1exp`）  
 - [x] Dali 一页 OOS 说明（`lab/evidence/dali_plugin/OOS_20260723.md`）  
-- [x] Phase2 收口：Lunlun pure smoke + flip=No（`PHASE2_CLOSE_20260723.md`；git `3652412`）  
-- [ ] 起草 `PackerPlugin` + Runtime 接口草图（docs PR）— **R2-Slice0 下一步**  
-- [ ] R2 切片 0：从 `unpacker` 抽出 event loop 状态机接口（行为不变）  
+- [x] Phase2 收口：Lunlun pure smoke + flip=No（`PHASE2_CLOSE_20260723.md`；git `3652412`/`3858896`）  
+- [x] 起草 `PackerPlugin` + Runtime 接口草图（`docs/VNEXT_R2_RUNTIME_API.md` R2-Slice0）  
+- [ ] R2 切片 1+：地址 newtype / engine 适配器 / replay 骨架（行为不变优先）  
 
 ---
 
