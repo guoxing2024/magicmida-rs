@@ -236,6 +236,13 @@ pub struct DumpOptions {
     /// Authoritative MSVC SecurityCookie complement RVA (paired with
     /// [`Self::security_cookie_rva`]).
     pub security_cookie_complement_rva: Option<u32>,
+
+    /// R1-D/E: emit final PE via pure rebuild (`plan_from_host_dump` /
+    /// `rebuild_pe_image`) instead of legacy `write_output_file`.
+    /// Default false keeps production dump behaviour unchanged.
+    /// R1-E preserves host section VAs and carries host data directories
+    /// (import/IAT/TLS content). Typed import rebind is still not in this path.
+    pub pure_rebuild: bool,
 }
 
 #[cfg(test)]

@@ -19,7 +19,12 @@ const PURE_MODULES: &[&str] = &[
     "src/header/tests.rs",
     "src/section.rs",
     "src/import_table.rs",
+    "src/export_table.rs",
+    "src/exception_table.rs",
+    "src/tls.rs",
     "src/relocation.rs",
+    "src/rebuild.rs",
+    "src/byte_map.rs",
     "src/postprocess.rs",
     "src/apiset_data.rs",
 ];

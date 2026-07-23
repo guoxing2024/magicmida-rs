@@ -1009,18 +1009,39 @@ pub fn dump_process(
         )?;
     }
 
-    // 6. Write output file with container restoration
-    let mut out_data = write_output_file(
-        &mut pe,
-        &dump_buf,
-        import_builder.as_ref(),
-        &import_thunks,
-        original_iat_rva,
-        is_64bit,
-        opts,
-        output_entry_point,
-        &containers,
-    )?;
+    // 6. Write output file
+    // R1-D/E: optional pure rebuild emit path. Host still owns live capture,
+    // overlays, import section construction (as extra_data), and profile
+    // stages; pure modules plan + rebuild PE bytes. R1-E preserves host
+    // section VAs and carries host data directories for content import/IAT.
+    let mut out_data = if opts.pure_rebuild {
+        info!("R1-E pure rebuild emit path enabled");
+        let pure_opts = super::pure_rebuild_adapter::PureRebuildEmitOptions {
+            image_base: opts.image_base,
+            entry_point_rva: output_entry_point,
+            // Prefer content sections for exception/reloc when host already
+            // built shells; typed rebind still helps empty cover sections.
+            rebind_exceptions: true,
+            rebind_relocations: true,
+            prefer_aslr_when_relocs: true,
+            preserve_section_vas: true,
+            carry_host_data_directories: true,
+            max_slice_bytes: super::helpers::MAX_IMAGE_DUMP_BYTES,
+        };
+        super::pure_rebuild_adapter::emit_pure_rebuild(&pe, &dump_buf, &pure_opts)?
+    } else {
+        write_output_file(
+            &mut pe,
+            &dump_buf,
+            import_builder.as_ref(),
+            &import_thunks,
+            original_iat_rva,
+            is_64bit,
+            opts,
+            output_entry_point,
+            &containers,
+        )?
+    };
 
     // DEBUG: Verify section 1 characteristics
     debug_section_chars(&out_data, "Before fix_hardcoded_addresses");
@@ -1793,6 +1814,7 @@ mod edata_relocation_tests {
             profile: crate::DumpProfile::OreansClassic,
             security_cookie_rva: None,
             security_cookie_complement_rva: None,
+            pure_rebuild: false,
         };
         let out_data = write_output_file(
             &mut pe,

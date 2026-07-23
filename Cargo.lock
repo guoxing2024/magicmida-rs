@@ -200,6 +200,7 @@ dependencies = [
 name = "mida-pe"
 version = "0.1.0"
 dependencies = [
+ "mida-acceptance",
  "mida-core",
  "mida-disasm",
  "pelite",

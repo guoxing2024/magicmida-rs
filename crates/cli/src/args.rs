@@ -21,6 +21,8 @@ pub enum Command {
         container_restore: ContainerRestoreMode,
         /// Dump behaviour profile (default OreansClassic).
         profile: DumpProfile,
+        /// R1-D/E: emit via pure rebuild boundary (opt-in; preserves host VAs/DDs).
+        pure_rebuild: bool,
         verbose: bool,
     },
     /// Packer-agnostic full dump (no Themida shrink).
@@ -71,7 +73,7 @@ fn parse_unpack(args: &[String]) -> Result<Command, String> {
         return Err(
             "Usage: mida-cli /unpack <filename> [--data-sections] [--shrink|--no-shrink] \
              [--oep=crt|captured|rva=N] [--profile=oreans-classic|ahk-gto-experimental] \
-             [--container-restore=off|post-crt|tls-pre] [-v]"
+             [--container-restore=off|post-crt|tls-pre] [--pure-rebuild] [-v]"
                 .into(),
         );
     }
@@ -94,6 +96,7 @@ fn parse_unpack(args: &[String]) -> Result<Command, String> {
     // None = user did not pass --container-restore; use profile default.
     let mut container_restore_explicit: Option<ContainerRestoreMode> = None;
     let mut verbose = false;
+    let mut pure_rebuild = false;
 
     let mut i = 3;
     while i < args.len() {
@@ -109,6 +112,7 @@ fn parse_unpack(args: &[String]) -> Result<Command, String> {
             "--shrink" => shrink = true,
             "--no-shrink" => shrink = false,
             "-v" | "--verbose" => verbose = true,
+            "--pure-rebuild" => pure_rebuild = true,
             other if other.starts_with("--oep=") => {
                 oep_policy = parse_oep_policy(&other["--oep=".len()..])?;
             }
@@ -168,6 +172,7 @@ fn parse_unpack(args: &[String]) -> Result<Command, String> {
         oep_policy,
         container_restore,
         profile,
+        pure_rebuild,
         verbose,
     })
 }

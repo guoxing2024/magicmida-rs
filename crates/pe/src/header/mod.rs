@@ -374,9 +374,11 @@ impl PeHeader {
     /// last section.
     #[must_use]
     pub fn get_section_by_rva(&self, rva: u32) -> Option<&PeSection> {
-        self.sections
-            .iter()
-            .find(|s| s.virtual_address + s.virtual_size > rva)
+        self.sections.iter().find(|s| {
+            s.virtual_address
+                .checked_add(s.virtual_size)
+                .is_some_and(|end| end > rva)
+        })
     }
 
     // ------------------------------------------------------------------
@@ -389,12 +391,18 @@ impl PeHeader {
     ///
     /// Walks the section table and returns the RVA corresponding to `offset`
     /// by looking for a section whose raw data range contains it.
+    ///
+    /// Uses checked arithmetic so hostile `raw_offset + raw_size` values do not
+    /// wrap and spuriously match.
     #[must_use]
     pub fn offset_to_rva(&self, offset: u32) -> Option<u32> {
         for section in &self.sections {
-            let raw_end = section.raw_offset + section.raw_size;
+            let Some(raw_end) = section.raw_offset.checked_add(section.raw_size) else {
+                continue;
+            };
             if section.raw_offset <= offset && raw_end > offset {
-                return Some((offset - section.raw_offset) + section.virtual_address);
+                let delta = offset - section.raw_offset;
+                return section.virtual_address.checked_add(delta);
             }
         }
         None
@@ -404,13 +412,17 @@ impl PeHeader {
     ///
     /// This is the inverse of [`offset_to_rva`] — looks up the section that contains
     /// `rva` and computes `rva - VirtualAddress + PointerToRawData`.
+    ///
+    /// Uses checked arithmetic so hostile virtual ranges do not wrap.
     #[must_use]
     pub fn rva_to_offset(&self, rva: u32) -> Option<u32> {
         for section in &self.sections {
-            if section.virtual_address <= rva
-                && (section.virtual_address + section.virtual_size) > rva
-            {
-                return Some(rva - section.virtual_address + section.raw_offset);
+            let Some(virt_end) = section.virtual_address.checked_add(section.virtual_size) else {
+                continue;
+            };
+            if section.virtual_address <= rva && virt_end > rva {
+                let delta = rva - section.virtual_address;
+                return section.raw_offset.checked_add(delta);
             }
         }
         None
@@ -437,6 +449,152 @@ impl PeHeader {
     #[must_use]
     pub fn size_of_image(&self) -> u32 {
         self.nt_headers.optional_header.size_of_image
+    }
+
+    // ------------------------------------------------------------------
+    // Serialize (pure buffer emit)
+    // ------------------------------------------------------------------
+
+    /// Serialise the NT headers and section table to a byte vector.
+    ///
+    /// Corresponds to `TPEHeader.SaveToStream` in `PEInfo.pas`. Output is the
+    /// PE signature + COFF + optional header + section table, followed by
+    /// `0x200` zero padding (legacy dump layout). Callers that rebuild a full
+    /// image splice this block at `e_lfanew`.
+    ///
+    /// Pure: buffer math only; no Win32 / process I/O.
+    pub fn serialize_headers(&self) -> Result<Vec<u8>, PeError> {
+        // Calculate total size: NT headers + section table + 0x200 padding zeros
+        let nt_size: usize = if self.is_64bit {
+            4 + 20 + 112 + 16 * 8 // sig + file + optional64 + data_dirs
+        } else {
+            4 + 20 + 96 + 16 * 8 // sig + file + optional32 + data_dirs
+        };
+        let section_table_size = self
+            .sections
+            .len()
+            .checked_mul(40)
+            .ok_or_else(|| PeError::Parse("section table size overflow".into()))?;
+        let total = nt_size
+            .checked_add(section_table_size)
+            .and_then(|n| n.checked_add(0x200))
+            .ok_or_else(|| PeError::Parse("serialize_headers size overflow".into()))?;
+        let mut out = vec![0u8; total];
+
+        // Write NT signature
+        out[0..4].copy_from_slice(&self.nt_headers.signature.to_le_bytes());
+
+        // Write file header (section count mirrors the live table)
+        let fh = &self.nt_headers.file_header;
+        let section_count = u16::try_from(self.sections.len())
+            .map_err(|_| PeError::InvalidSectionCount(self.sections.len() as u32))?;
+        out[4..6].copy_from_slice(&fh.machine.to_le_bytes());
+        out[6..8].copy_from_slice(&section_count.to_le_bytes());
+        out[8..12].copy_from_slice(&fh.time_date_stamp.to_le_bytes());
+        // +12: PointerToSymbolTable (u32) — 0
+        // +16: NumberOfSymbols (u32) — 0
+        out[20..22].copy_from_slice(&fh.size_of_optional_header.to_le_bytes());
+        out[22..24].copy_from_slice(&fh.characteristics.to_le_bytes());
+
+        // Write optional header
+        let oh = &self.nt_headers.optional_header;
+        out[24..26].copy_from_slice(&oh.magic.to_le_bytes());
+        out[26] = oh.major_linker_version;
+        out[27] = oh.minor_linker_version;
+        out[28..32].copy_from_slice(&oh.size_of_code.to_le_bytes());
+        out[32..36].copy_from_slice(&oh.size_of_initialized_data.to_le_bytes());
+        out[36..40].copy_from_slice(&oh.size_of_uninitialized_data.to_le_bytes());
+        out[40..44].copy_from_slice(&oh.address_of_entry_point.to_le_bytes());
+        out[44..48].copy_from_slice(&oh.base_of_code.to_le_bytes());
+
+        if self.is_64bit {
+            out[48..56].copy_from_slice(&oh.image_base.to_le_bytes());
+            out[56..60].copy_from_slice(&oh.section_alignment.to_le_bytes());
+            out[60..64].copy_from_slice(&oh.file_alignment.to_le_bytes());
+            out[64..66].copy_from_slice(&oh.major_operating_system_version.to_le_bytes());
+            out[66..68].copy_from_slice(&oh.minor_operating_system_version.to_le_bytes());
+            out[68..70].copy_from_slice(&oh.major_image_version.to_le_bytes());
+            out[70..72].copy_from_slice(&oh.minor_image_version.to_le_bytes());
+            out[72..74].copy_from_slice(&oh.major_subsystem_version.to_le_bytes());
+            out[74..76].copy_from_slice(&oh.minor_subsystem_version.to_le_bytes());
+            out[76..80].copy_from_slice(&oh.win32_version_value.to_le_bytes());
+            out[80..84].copy_from_slice(&oh.size_of_image.to_le_bytes());
+            out[84..88].copy_from_slice(&oh.size_of_headers.to_le_bytes());
+            out[88..92].copy_from_slice(&oh.check_sum.to_le_bytes());
+            out[92..94].copy_from_slice(&oh.subsystem.to_le_bytes());
+            out[94..96].copy_from_slice(&oh.dll_characteristics.to_le_bytes());
+            out[96..104].copy_from_slice(&oh.size_of_stack_reserve.to_le_bytes());
+            out[104..112].copy_from_slice(&oh.size_of_stack_commit.to_le_bytes());
+            out[112..120].copy_from_slice(&oh.size_of_heap_reserve.to_le_bytes());
+            out[120..128].copy_from_slice(&oh.size_of_heap_commit.to_le_bytes());
+            out[128..132].copy_from_slice(&oh.loader_flags.to_le_bytes());
+            out[132..136].copy_from_slice(&oh.number_of_rva_and_sizes.to_le_bytes());
+
+            let dd_off = 136;
+            for (i, dd) in oh.data_directory.iter().enumerate() {
+                let off = dd_off + i * 8;
+                out[off..off + 4].copy_from_slice(&dd.virtual_address.to_le_bytes());
+                out[off + 4..off + 8].copy_from_slice(&dd.size.to_le_bytes());
+            }
+
+            let sh_off = 24 + 112 + 16 * 8; // 264
+            write_section_headers(&mut out, sh_off, &self.sections);
+        } else {
+            out[48..52].copy_from_slice(&oh.base_of_data.unwrap_or(0).to_le_bytes());
+            out[52..56].copy_from_slice(&(oh.image_base as u32).to_le_bytes());
+            out[56..60].copy_from_slice(&oh.section_alignment.to_le_bytes());
+            out[60..64].copy_from_slice(&oh.file_alignment.to_le_bytes());
+            out[64..66].copy_from_slice(&oh.major_operating_system_version.to_le_bytes());
+            out[66..68].copy_from_slice(&oh.minor_operating_system_version.to_le_bytes());
+            out[68..70].copy_from_slice(&oh.major_image_version.to_le_bytes());
+            out[70..72].copy_from_slice(&oh.minor_image_version.to_le_bytes());
+            out[72..74].copy_from_slice(&oh.major_subsystem_version.to_le_bytes());
+            out[74..76].copy_from_slice(&oh.minor_subsystem_version.to_le_bytes());
+            out[76..80].copy_from_slice(&oh.win32_version_value.to_le_bytes());
+            out[80..84].copy_from_slice(&oh.size_of_image.to_le_bytes());
+            out[84..88].copy_from_slice(&oh.size_of_headers.to_le_bytes());
+            out[88..92].copy_from_slice(&oh.check_sum.to_le_bytes());
+            out[92..94].copy_from_slice(&oh.subsystem.to_le_bytes());
+            out[94..96].copy_from_slice(&oh.dll_characteristics.to_le_bytes());
+            out[96..100].copy_from_slice(&(oh.size_of_stack_reserve as u32).to_le_bytes());
+            out[100..104].copy_from_slice(&(oh.size_of_stack_commit as u32).to_le_bytes());
+            out[104..108].copy_from_slice(&(oh.size_of_heap_reserve as u32).to_le_bytes());
+            out[108..112].copy_from_slice(&(oh.size_of_heap_commit as u32).to_le_bytes());
+            out[112..116].copy_from_slice(&oh.loader_flags.to_le_bytes());
+            out[116..120].copy_from_slice(&oh.number_of_rva_and_sizes.to_le_bytes());
+
+            let dd_off = 120;
+            for (i, dd) in oh.data_directory.iter().enumerate() {
+                let off = dd_off + i * 8;
+                out[off..off + 4].copy_from_slice(&dd.virtual_address.to_le_bytes());
+                out[off + 4..off + 8].copy_from_slice(&dd.size.to_le_bytes());
+            }
+
+            let sh_off = 24 + 96 + 16 * 8; // 248
+            write_section_headers(&mut out, sh_off, &self.sections);
+        }
+
+        Ok(out)
+    }
+}
+
+fn write_section_headers(out: &mut [u8], sh_off: usize, sections: &[PeSection]) {
+    for (i, section) in sections.iter().enumerate() {
+        let off = sh_off + i * 40;
+        out[off..off + 8].copy_from_slice(&section.header.name);
+        out[off + 8..off + 12].copy_from_slice(&section.header.virtual_size.to_le_bytes());
+        out[off + 12..off + 16].copy_from_slice(&section.header.virtual_address.to_le_bytes());
+        out[off + 16..off + 20].copy_from_slice(&section.header.size_of_raw_data.to_le_bytes());
+        out[off + 20..off + 24].copy_from_slice(&section.header.pointer_to_raw_data.to_le_bytes());
+        out[off + 24..off + 28]
+            .copy_from_slice(&section.header.pointer_to_relocations.to_le_bytes());
+        out[off + 28..off + 32]
+            .copy_from_slice(&section.header.pointer_to_linenumbers.to_le_bytes());
+        out[off + 32..off + 34]
+            .copy_from_slice(&section.header.number_of_relocations.to_le_bytes());
+        out[off + 34..off + 36]
+            .copy_from_slice(&section.header.number_of_linenumbers.to_le_bytes());
+        out[off + 36..off + 40].copy_from_slice(&section.header.characteristics.to_le_bytes());
     }
 }
 

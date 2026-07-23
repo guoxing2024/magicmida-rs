@@ -131,6 +131,7 @@ pub fn unpack(
     oep_policy: OepPolicy,
     container_restore: ContainerRestoreMode,
     profile: DumpProfile,
+    pure_rebuild: bool,
 ) -> Result<(), anyhow::Error> {
     use tracing::info;
     info!("=== UNPACK START ===");
@@ -586,6 +587,7 @@ pub fn unpack(
             oep_policy,
             container_restore,
             profile,
+            pure_rebuild,
             &early_section_snapshots,
             input,
             &output_path,
@@ -1432,6 +1434,7 @@ pub fn unpack(
         oep_policy,
         container_restore,
         profile,
+        pure_rebuild,
         &early_section_snapshots,
         input,
         &output_path,
@@ -1701,6 +1704,7 @@ fn run_post_loop_phases(
     oep_policy: OepPolicy,
     container_restore: ContainerRestoreMode,
     profile: DumpProfile,
+    pure_rebuild: bool,
     early_section_snapshots: &[EarlySectionSnapshot],
     input: &Path,
     output_path: &Path,
@@ -1950,6 +1954,7 @@ fn run_post_loop_phases(
         } else {
             None
         },
+        pure_rebuild,
     };
 
     mida_pe::dump_process(dbg, &dump_opts).map_err(|e| anyhow!("Dump failed: {e}"))?;

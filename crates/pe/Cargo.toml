@@ -17,3 +17,6 @@ mida-disasm = { path = "../disasm" }
 
 [dev-dependencies]
 serde_json = "1"
+# R1-E dual-path corpus only: pure emit candidates judged by independent R0B gates.
+# Production `mida-pe` must not depend on `mida-acceptance` (boundary is one-way).
+mida-acceptance = { path = "../acceptance" }

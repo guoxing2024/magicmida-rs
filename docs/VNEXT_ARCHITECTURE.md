@@ -73,5 +73,7 @@ acceptance.
   ([VNEXT_R1_PE_API.md](VNEXT_R1_PE_API.md)); purity source scan on
   `mida-pe` pure-listed modules. Crate-level `windows` / `mida-core` remain for
   dump adapters.
-- **R1-B+:** pure parse/serialize extraction and production migration still open
-  ([VNEXT_R1_ROADMAP.md](VNEXT_R1_ROADMAP.md)).
+- **R1-B:** pure parse/serialize and overflow-safe RVA/offset offline tests.
+- **R1-C:** pure `RebuildPlan` rebuild pipeline (import/export/exception/TLS/reloc)
+  plus pure byte-map adapters (`plan_from_memory_image`). Production dump/CLI
+  migration remains **R1-D** ([VNEXT_R1_ROADMAP.md](VNEXT_R1_ROADMAP.md)).

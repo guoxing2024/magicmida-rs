@@ -57,13 +57,24 @@ cargo run -p mida-acceptance --offline -- check-static <candidate> `
 
 ### Pure PE model (R1)
 
-R1-A landed: pure vs adapter inventory and source purity lock for `mida-pe`.
-API sketch: [docs/VNEXT_R1_PE_API.md](docs/VNEXT_R1_PE_API.md). Remaining R1
-slices (parse/serialize extraction, production migration):
-[docs/VNEXT_R1_ROADMAP.md](docs/VNEXT_R1_ROADMAP.md).
+**R1-A..E closed** on synthetic/structural corpus (pure inventory + purity lock,
+parse/serialize, `RebuildPlan` rebuild, byte-map adapters, opt-in production
+emit via `--pure-rebuild`, pure/legacy parity snapshots). Production dump still
+defaults to **legacy**; pure remains opt-in. Offline synthetic tests only (no
+PE-image fixture binaries). API: [docs/VNEXT_R1_PE_API.md](docs/VNEXT_R1_PE_API.md).
+Roadmap / next live smoke: [docs/VNEXT_R1_ROADMAP.md](docs/VNEXT_R1_ROADMAP.md).
+Full audit: [docs/PROJECT_AUDIT_AND_ROADMAP.md](docs/PROJECT_AUDIT_AND_ROADMAP.md).
 
 ```powershell
 cargo test -p mida-pe --test purity_boundary --offline
+cargo test -p mida-pe --test pure_parse_serialize --offline
+cargo test -p mida-pe --lib rebuild --offline
+cargo test -p mida-pe --lib byte_map --offline
+cargo test -p mida-pe --lib export_table --offline
+cargo test -p mida-pe --lib exception_table --offline
+cargo test -p mida-pe --lib tls --offline
+cargo test -p mida-pe pure_rebuild --offline
+cargo test -p mida-pe r1e_dual_path --offline
 ```
 
 ## Build and test
@@ -72,6 +83,7 @@ Use a Visual Studio developer shell, or another shell initialized with
 `vcvars64.bat`, and keep Cargo output outside the repository:
 
 ```powershell
+# VS Developer / vcvars, or: . .\tools\_enter_msvc_env.ps1
 $env:CARGO_TARGET_DIR = '<vault>\scratch\cargo-target'
 cargo fmt --all -- --check
 cargo check --workspace --tests --offline

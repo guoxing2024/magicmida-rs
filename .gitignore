@@ -1,5 +1,10 @@
 # Rust build artifacts (at any workspace depth)
 target/
+.cargo-target/
+
+# Local agent / session noise (never product)
+bash_events/
+conversations/
 
 # IDE/editor
 .idea/

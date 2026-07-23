@@ -39,6 +39,7 @@ mod import_rebuild;
 mod import_section;
 mod original_imports;
 mod output_writer;
+mod pure_rebuild_adapter;
 mod remote_modules;
 mod sections;
 mod serialize;
@@ -54,6 +55,10 @@ pub use self::dump_process::{dump_dotnet, dump_process};
 pub use self::helpers::is_dotnet;
 pub use self::import_rebuild::rebuild_import_table;
 pub use self::original_imports::get_original_imports;
+pub use self::pure_rebuild_adapter::{
+    emit_pure_rebuild, emit_pure_rebuild_with_parity, plan_from_host_dump,
+    PureRebuildEmitOptions, PureRebuildParitySnapshot,
+};
 pub use self::remote_modules::take_module_snapshot;
 pub use self::types::{
     ContainerRestoreMode, DumpOptions, DumpProfile, DumpProfileCapabilities, EarlySectionSnapshot,
