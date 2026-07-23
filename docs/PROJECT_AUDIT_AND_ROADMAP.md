@@ -1,9 +1,10 @@
 # MagicMida vNext — 项目审计与后续规划（Windows 复审）
 
-**审计日期:** 2026-07-23（Windows 复审 + Phase 0 绿测 + Origin/Lunlun live StructuralPass）  
+**审计日期:** 2026-07-24（无人值守计划 + host thin-split 续）  
 **基线分支:** `baseline/legacy-recovery-20260722`  
-**HEAD:** `52c4eee` + 工作区：CONTROL|INTEGER context + Lunlun null-storm/exit 硬化（未提交）  
-**工作区:** R1–R4 **窄**结构门已关（R3 10× + R4 VNEXT-R4）；R4 **非**独立族宿主完成；pure 仍 No；Accepted 未开；2026-07-24 审计 P0：process 对齐安全 + CLI candidate 语义  
+**HEAD:** 见 `git log -1`；计划 [UNATTENDED_EXECUTION_PLAN.md](UNATTENDED_EXECUTION_PLAN.md)  
+**工作区:** R1–R4 **窄**结构门已关（R3 10× + R4 VNEXT-R4）；B-A0..B-A3 合成路径完成；pure 仍 No；Accepted/VNEXT-BEH **未开**；host 已抽 post_loop/early_snapshots/post_attach；共享 ThemidaState 仍在  
+
 **主机:** Windows 11；仓库 `D:\Claude project\magicmida-rs`；vault `D:\MidaVault`  
 **环境事实:** VS 2022 Professional MSVC 14.44；`tools/_rebuild_cli.cmd`；
 `CARGO_TARGET_DIR=D:\MidaVault\scratch\cargo-target`；
@@ -56,7 +57,7 @@ R1   纯 PE 模型 + rebuild 管线         ✅ R1-A..E 合成 corpus 关闭（M
 R2   统一 runtime/event + replay       ✅ Slice0–4 落地（handler 体仍在 cli）
 R3   Oreans 插件 + Origin/Lunlun/盲样  ✅ 结构门关闭 (10× + holdout); IAT holdout 100%
 R4   第二个独立保护族插件              ✅ 结构门关闭 (VNEXT-R4; GTO experimental + Oreans reg)
-BEH  独立行为验收                      🟡 B-A1 harness (synthetic probe); Accepted 未开
+BEH  独立行为验收                      🟡 B-A0..B-A3 合成 compose 完成；B-B/VNEXT-BEH 未开
 1.0  满足 release rule 后才谈          ⬜
 ```
 
