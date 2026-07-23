@@ -1,13 +1,12 @@
-# WORKER_HANDOFF - Phase2 pure live structural parity (Origin) -> R2
+# WORKER_HANDOFF - Phase2 closed (flip=No) -> R2-Slice0
 
 ## Summary
 
 R0B (`mida-acceptance`) remains the independent static structural judge.
 **R1-A..E** closed on synthetic corpus; pure dump remains **opt-in**.
-**Phase 2 (2026-07-23):** Origin live `--pure-rebuild` vs same-day legacy
-smoke is **structural_equal** (image_base, section table, exception/reloc DDs,
-import/iat/tls). Default dump path remains **legacy** (raw size residual;
-no multi-case flip board yet).
+**Phase 2 closed (2026-07-23):** Origin + Lunlun live pure vs legacy are
+**structural_equal**. Default dump remains **legacy** (`PHASE2_CLOSE_20260723.md`:
+flip=**No**; R1-F defer). **Next:** R2-Slice0 interface/state-machine sketch.
 
 ## R1-E deliverables (this slice)
 

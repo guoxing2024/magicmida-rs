@@ -65,11 +65,9 @@ directories that point into content sections.
 DD, adapter parity on synthetic host dump with `.import` extra_data; docs list
 pure vs legacy paths and parity criteria; purity scan still green. **Met** (synthetic).
 
-**Phase-2 live parity (Origin, 2026-07-23):** pure emit keeps preferred
-ImageBase, host cover sections (`.winlice`), and host exception/reloc DDs when
-rebind is off → structural compare vs legacy p1smoke **equal**. Residual: raw
-file size packing difference. **Still open:** Lunlun pure smoke; typed import
-rebuild (R1-F); deliberate default flip board decision.
+**Phase-2 closed (2026-07-23):** Origin + Lunlun pure vs legacy **structural_equal**
+(vault evidence + `PHASE2_CLOSE_20260723.md`). Residual: raw packing size only.
+**Decisions:** default pure **flip=No**; R1-F typed import **deferred**. Next: R2.
 
 ## Acceptance relationship
 

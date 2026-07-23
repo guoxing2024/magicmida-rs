@@ -363,8 +363,11 @@ mida-acceptance check-static <scratch>\origin_u.exe --report <scratch>\origin_r0
    - 修复：preferred ImageBase（非 ASLR）；`pe.image_base` 与 optional_header 同步；live pure 关闭 exception/reloc typed rebind（保留 `.winlice` 等 cover）。  
    - residual：raw file size pure 13719040 vs legacy 13746176（packing，非结构门）。  
 2. **Import typed rebuild（R1-F）：** host 解析 IAT → pure `ImportTableBuilder`（纯侧仍无 Win32）— **未做**。  
-3. **默认 flip：** 仍 **不** 默认 `--pure-rebuild`；需 Lunlun pure smoke + 显式产品决策。  
-4. 清理 dumper 内可下沉 pure 的重复序列化 — **未做**。
+3. **默认 flip：** **No**（2026-07-23 决策包 `PHASE2_CLOSE_20260723.md`）。Origin + Lunlun pure 均 structural_equal；packing residual 接受；无产品 flip 批准。  
+4. **Lunlun pure smoke：** ✅ `live_20260723-180057_p2close_pure` R0B StructuralPass + structural_equal vs p1fix3。  
+5. 清理 dumper 内可下沉 pure 的重复序列化 — **未做**（非 flip 阻塞）。
+
+**Phase2 出口（更新）：** 结构对齐 + 决策记档完成；**不 flip**；下一主线 **R2-Slice0**。
 
 **非目标：** 行为 Accepted；删 legacy。
 
@@ -472,7 +475,8 @@ M6  R4 第二族插件 + 1.0 评审
 
 - [x] GTO experimental 一次受控跑；只记录不修花（`live_20260723-164707_p1exp`）  
 - [x] Dali 一页 OOS 说明（`lab/evidence/dali_plugin/OOS_20260723.md`）  
-- [ ] 起草 `PackerPlugin` + Runtime 接口草图（docs PR）  
+- [x] Phase2 收口：Lunlun pure smoke + flip=No（`PHASE2_CLOSE_20260723.md`；git `3652412`）  
+- [ ] 起草 `PackerPlugin` + Runtime 接口草图（docs PR）— **R2-Slice0 下一步**  
 - [ ] R2 切片 0：从 `unpacker` 抽出 event loop 状态机接口（行为不变）  
 
 ---
