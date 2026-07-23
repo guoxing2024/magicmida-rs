@@ -135,7 +135,7 @@ CLI 表面：
 | **Themida 非 R3 插件契约** | 族策略与引擎未分离；第二族难插 | **高** |
 | **默认 dump 仍 legacy**；pure 仅 opt-in | 双路径分叉；维护成本 | **中** |
 | **typed import 从 live IAT → pure builder** 未做 | pure 依赖 host extra_data 携带 | **中**（R1-F） |
-| **ScyllaHide x86 哈希占位** | x86 注入完整性无效 | **中**（x86 样品） |
+| **ScyllaHide x86 哈希占位** | x86 注入完整性无效 | **中**（x86 样品；**x64 已核对 MATCH**） |
 | **TLS global_vars 未用于恢复** | 复杂 TLS 样本风险 | **中** |
 | **R1-B..E 未提交 / 文档漂移** | ~~已关闭~~（`52c4eee` + 文档对齐） | **已处理** |
 | **本机 shell 无 vcvars** | ~~已关闭~~（`tools/_enter_msvc_env.ps1`） | **已处理** |
@@ -460,7 +460,7 @@ M6  R4 第二族插件 + 1.0 评审
 - [x] vault 物化 Origin + Lunlun；live unpack + R0B 证据进 vault（Origin 全路径；Lunlun degraded）  
 - [x] Origin ×3 稳定性抽检（`STABILITY_20260723_p1smoke.md`；3/3 StructuralPass）  
 - [x] 同样品 `--pure-rebuild` 对照；记 structural mismatches（`live_20260723-165826_p1pure_pure`；**不 flip 默认**）  
-- [ ] 确认 ScyllaHide x64 哈希与现场二进制一致  
+- [x] 确认 ScyllaHide x64 哈希与现场二进制一致（`hygiene/scyllahide_hash_20260723`；x64 MATCH；x86 仍占位）  
 - [x] 提交 storm/exit + guard 硬化（`eaf8468`；Origin ×3 无回归已验证）  
 - [ ] Lunlun OEP/IAT 质量提升后再 smoke（非阻塞结构门；需独立切片+复验）  
 

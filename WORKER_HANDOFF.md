@@ -192,14 +192,26 @@ mida dump-process <sample> --pure-rebuild
   - **Mismatch:** image_base (runtime ASLR retained), size_of_image, exception/reloc placement, `.winlice` layout / trailing section order; raw file size 6.2MB vs 13.7MB
 - **Gate decision:** **keep pure opt-in**; **do not** flip production default
 
+### ScyllaHide x64 hash hygiene (Phase 1 — verified)
+
+- **Evidence:** `D:\MidaVault\lab\evidence\hygiene\scyllahide_hash_20260723\`
+- **Expected (source):** `crates/packers/themida/src/binaries.rs` x64
+  - InjectorCLIx64: `211f7b804f1db43abddbb3dbdf41162d6cee76ae84e0bb38818cdbf4d07cf630`
+  - HookLibraryx64: `d4b20eed23caebad7efa53e5f2f3c86d445864c2d3e43b343e01c8a9785e800e`
+- **On-disk (live next to CLI + staging `D:\magicmida-rs-build\`):** **both MATCH**; live≡staging
+- **Path:** `helpers.rs` → `current_exe().parent()` + name; integrity gate in `inject_scylla_hide` before spawn
+- **Runtime corroboration:** Origin p1smoke + Lunlun p1fix3 logs show `ScyllaHide injection completed successfully` (implies hash gate passed)
+- **x86 residual:** placeholders (all-zero) remain; no x86 helpers on host; not required for current x64 corpus
+- **Code change:** none required for x64
+
 ## Suggested next slices (strict order)
 
 1. ~~Phase 0 re-verify~~ → 412/0 after `eaf8468`.
 2. ~~Origin pure-rebuild live compare~~ → R0B pass both; file structural_mismatch recorded.
-3. **Phase 1 remaining (optional polish, still evidence-first):**
+3. ~~ScyllaHide x64 hash hygiene~~ → match (evidence above); x86 still open.
+4. **Phase 1 remaining (optional polish, still evidence-first):**
    - Dali OOS one-pager
-   - ScyllaHide x64 hash vs on-disk binary (hygiene)
    - Lunlun OEP/IAT quality only as a **scoped** slice with re-smoke (not silent drive-by)
-4. **Phase 2 / R1-F only after** deliberate pure parity plan (image_base preferred, section content parity) — not yet.
-5. **R2** only after Phase 1 board consciously closed or deferred in handoff.
-6. Flip default pure **only if** live pure ≥ legacy structural quality on Origin+Lunlun; **never** default `ahk-gto-experimental`.
+5. **Phase 2 / R1-F only after** deliberate pure parity plan (image_base preferred, section content parity) — not yet.
+6. **R2** only after Phase 1 board consciously closed or deferred in handoff.
+7. Flip default pure **only if** live pure ≥ legacy structural quality on Origin+Lunlun; **never** default `ahk-gto-experimental`.
