@@ -209,9 +209,20 @@ mida dump-process <sample> --pure-rebuild
 1. ~~Phase 0 re-verify~~ → 412/0 after `eaf8468`.
 2. ~~Origin pure-rebuild live compare~~ → R0B pass both; file structural_mismatch recorded.
 3. ~~ScyllaHide x64 hash hygiene~~ → match (evidence above); x86 still open.
-4. **Phase 1 remaining (optional polish, still evidence-first):**
-   - Dali OOS one-pager
-   - Lunlun OEP/IAT quality only as a **scoped** slice with re-smoke (not silent drive-by)
-5. **Phase 2 / R1-F only after** deliberate pure parity plan (image_base preferred, section content parity) — not yet.
-6. **R2** only after Phase 1 board consciously closed or deferred in handoff.
-7. Flip default pure **only if** live pure ≥ legacy structural quality on Origin+Lunlun; **never** default `ahk-gto-experimental`.
+### Dali OOS one-pager (Phase 1 — complete)
+
+- **Evidence:** `D:\MidaVault\lab\evidence\dali_plugin\OOS_20260723.md`
+- **Contract:** `engine_route: out_of_scope`; managed_host_candidate / PE32 / CLR + `mscoree.dll`
+- **Static re-verify:** sha256 `e4f48d5a…165d`, CLR dir present, import-only mscoree; R0B on packed PE is structure-only (`20260723-124049`)
+- **Live unpack:** not planned; must not score as Oreans/R3 signal
+
+## Suggested next slices (strict order)
+
+1. ~~Phase 0 re-verify~~ → 412/0 after `eaf8468`.
+2. ~~Origin pure-rebuild live compare~~ → R0B pass both; file structural_mismatch recorded.
+3. ~~ScyllaHide x64 hash hygiene~~ → match; x86 still open.
+4. ~~Dali OOS one-pager~~ → `OOS_20260723.md`.
+5. **Optional still open (not blocking Phase 1 close):** Lunlun OEP/IAT quality only as a **scoped** slice with re-smoke.
+6. **Phase 2 / R1-F only after** deliberate pure parity plan (image_base preferred, section content parity) — not yet.
+7. **R2** only after Phase 1 board consciously closed or deferred in handoff.
+8. Flip default pure **only if** live pure ≥ legacy structural quality on Origin+Lunlun; **never** default `ahk-gto-experimental`.

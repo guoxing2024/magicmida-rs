@@ -207,7 +207,8 @@ CLI 表面：
 #### D. Dali Plugin（托管/CLR）
 
 - **目标：** **范围外**；最多 static + 可选 .NET dump 笔记。  
-- **规划：** 保持 `out_of_scope`，不阻塞 native 1.0。
+- **规划：** 保持 `out_of_scope`，不阻塞 native 1.0。  
+- **Phase 1 笔记（2026-07-23）：** `D:\MidaVault\lab\evidence\dali_plugin\OOS_20260723.md` — PE32/CLR/`mscoree` 已 static 复验；**不做** live unpack；不计入 Oreans 门禁。
 
 ### 4.3 验证协议（Windows + vault；live 需 VS 环境）
 
@@ -347,14 +348,14 @@ mida-acceptance check-static <scratch>\origin_u.exe --report <scratch>\origin_r0
 | Origin pure | 同输入 `--pure-rebuild` 对照 | **✅ R0B 过；file structural_mismatch vs p1smoke** | `live_20260723-165826_p1pure_pure` + compare JSON |
 | Lunlun | unpack + R0B（无 oracle） | **✅ `live_20260723-163436_p1fix3` StructuralPass（degraded）** | 同上 + residual 质量说明 |
 | GTO | `--profile=ahk-gto-experimental` | **✅ `live_20260723-164707_p1exp` StructuralPass（experimental residual）** | 阶段矩阵 + WARN 点（notes） |
-| Dali | static + OOS 笔记 | ⬜ 低优先级 | 一页研究笔记 |
+| Dali | static + OOS 笔记 | **✅ `OOS_20260723.md`（无 live unpack）** | vault evidence + 边界说明 |
 
 交付模板：`D:\MidaVault\lab\evidence\<case_id>\<run_id>\`
 
 - `candidate.sha256`, `r0b_candidate.json`, `unpack.stdout.txt`, `notes.md`, `run_meta.json`  
 - **禁止** exe 进 Git  
 
-**出口（更新）：** Origin + Lunlun + GTO(experimental) 均已 ≥1 次 StructuralPass；Origin ×3 无回归已做。完整质量出口仍可选：Lunlun IAT/OEP 提升、pure-rebuild 对照、Dali OOS 笔记。
+**出口（更新）：** Origin + Lunlun + GTO(experimental) 均已 ≥1 次 StructuralPass；Origin ×3 无回归；pure 对照已记（不 flip）；ScyllaHide x64 哈希 MATCH；Dali OOS 一页完成。可选质量债：Lunlun OEP/IAT。
 
 ### Phase 2 — R1 收口（可选 R1-F，1–2 周）
 
@@ -468,7 +469,7 @@ M6  R4 第二族插件 + 1.0 评审
 ### Week 2
 
 - [x] GTO experimental 一次受控跑；只记录不修花（`live_20260723-164707_p1exp`）  
-- [ ] Dali 一页 OOS 说明  
+- [x] Dali 一页 OOS 说明（`lab/evidence/dali_plugin/OOS_20260723.md`）  
 - [ ] 起草 `PackerPlugin` + Runtime 接口草图（docs PR）  
 - [ ] R2 切片 0：从 `unpacker` 抽出 event loop 状态机接口（行为不变）  
 
@@ -480,7 +481,7 @@ M6  R4 第二族插件 + 1.0 评审
 2. **当前最强资产：** 独立 acceptance（R0B，本机已复验）+ 纯 PE rebuild（R1）+ vault 合约 + **Origin/Lunlun live StructuralPass 证据包**。  
 3. **当前最强负债：** Lunlun degraded IAT/OEP；pure≠legacy file layout（image_base/winlice）；无行为/replay；单体调试循环。  
 4. **四个样品职责：** Origin/Lunlun 扛 Oreans 主线；GTO 未来第二族；Dali 明确范围外。  
-5. **下一步唯一正确顺序（验证驱动）：** Phase1 收尾（Dali OOS / ScyllaHide 卫生）→ **有计划的 pure 对齐（Phase2）** → R2 引擎 → R3 Oreans 门禁 → 行为 Accepted → R4。禁止跳过门禁默认 flip pure。  
+5. **下一步唯一正确顺序（验证驱动）：** Phase1 收尾已基本齐（ScyllaHide x64 / Dali OOS 完成）→ **有计划的 pure 对齐（Phase2）** → R2 引擎 → R3 Oreans 门禁 → 行为 Accepted → R4。禁止跳过门禁默认 flip pure。  
 6. Windows 主机消除了“无法物化样品”的环境借口；**完美脱壳仍取决于证据阶梯，不取决于换了 OS。**
 
 ---
