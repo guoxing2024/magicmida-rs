@@ -18,14 +18,16 @@ pub enum Verdict {
 impl Verdict {
     /// Process exit code for a completed PE evaluation.
     ///
-    /// - `0` — structural pass, behavior pending
+    /// - `0` — `StructuralPassBehaviorPending` **or** `Accepted` (CLI prints verdict)
     /// - `2` — rejected
-    /// - `Accepted` is not reachable in R0B; mapped to `1` as internal error
+    ///
+    /// R0B `check-static` never emits `Accepted`. Behavioral
+    /// `check-with-behavior` may emit `Accepted` with exit `0`.
     pub fn exit_code(self) -> i32 {
         match self {
             Verdict::StructuralPassBehaviorPending => 0,
             Verdict::Rejected => 2,
-            Verdict::Accepted => 1,
+            Verdict::Accepted => 0,
         }
     }
 

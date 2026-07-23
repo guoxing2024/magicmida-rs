@@ -1,40 +1,49 @@
-# WORKER_HANDOFF - Audit P1 thin slice (family before host)
+# WORKER_HANDOFF - B-A3 synthetic wire + B-A2 compose
 
 ## Status
 
 | Item | Status |
 |------|--------|
-| P0 unaligned PE + candidate semantics + cargo_test hygiene | **DONE** (`9d496a3`) |
-| **P1 dual identify pre-process** | **DONE** |
-| **P1 Oreans IAT gated by family** | **DONE** |
+| P0 unaligned PE + candidate semantics | **DONE** (`9d496a3`) |
+| P1 dual identify pre-process + Oreans IAT family gate | **DONE** (`2ba1ab0`) |
 | Shared `ThemidaState` host | **still** (honest debt) |
-| Pure default / Accepted / B-A2 | unchanged |
-| Giant `unpacker/mod.rs` | still large; not fully split |
+| **B-A2** load/bind/compose + `check-with-behavior` | **DONE** (code; may be uncommitted) |
+| **B-A3** synthetic structural → probe → compose smoke | **DONE** |
+| Pure default / VNEXT-BEH scheduled gate | **not** opened |
+| Live smoke Origin 1× + GTO experimental 1× after P1 | **DONE** (engineering) |
 
-## What changed (P1)
+## What changed (B-A3)
 
-1. `dual_select_packer` in `plugin_host` runs **before** `init_pe_details` / process create.
-2. `run_post_loop_phases` takes `uses_oreans_iat_trace` + `family_id`:
-   - Oreans: existing V3 / skip_v3 / post-attach rules
-   - AHK/GTO: skip Oreans V3 trace + skip Oreans API call-site fixup
-3. Tests: dual_select GTO vs Oreans, select preference, `uses_oreans_iat_trace`.
+1. `tools/_behavior_ba3_smoke.py` — end-to-end lab wire:
+   - `mida-acceptance check-static` on synthetic `marker_exit`
+   - probe → `mida.behavior-evidence/v0`
+   - `mida-acceptance check-with-behavior` compose
+2. Cases: Pass→Accepted, Fail→Rejected, hang→Pending, identity mismatch→Rejected,
+   `check-static` still never Accepted.
+3. Docs: `VNEXT_BEHAVIORAL_PATH.md` B-A3 **done** (synthetic), lab README, roadmap note.
+
+### Validate batch
+
+`lab/behavior/evidence/batch_20260724-003808_ba3` — `all_ok: true`
 
 ## Honesty
 
-This is a **thin** host improvement, not independent GTO pipeline. Layout probe
-is still `ThemidaPeInfo` for both families.
+- Synthetic only; Origin/vault malware **not** required for B-A3.
+- Engineering `Accepted` via compose ≠ product pure flip ≠ VNEXT-BEH.
+- Kernel still does not run probes; harness is outside `mida-acceptance`.
+- Host remains shared Themida-shaped for GTO.
 
 ## Next
 
-1. Optional live smoke: Origin 1× + GTO experimental 1× after rebuild
-2. Further P1: extract more of post-loop / loop from `mod.rs`
-3. Or B-A2: acceptance evidence composition
-4. fmt/clippy debt still open
+1. Optional: commit B-A2 + B-A3 as one or two commits.
+2. Optional further P1 host split (`ThemidaState` / post-loop).
+3. Do **not** schedule VNEXT-BEH without deliberate open.
+4. Origin behavioral wire remains optional post-B-A3, not a gate.
 
 ## Validate
 
 ```text
-cargo test -p mida-cli --lib --offline dual_select
-cargo test -p mida-cli --lib --offline selected_
-cargo test -p mida-cli --lib --offline select_
+cargo test -p mida-acceptance --offline
+python tools\_behavior_ba3_smoke.py
+# expect summary all_ok true
 ```

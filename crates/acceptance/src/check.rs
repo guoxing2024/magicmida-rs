@@ -1,5 +1,6 @@
-//! Top-level static acceptance evaluation.
+//! Top-level static acceptance evaluation (+ optional behavioral compose, B-A2).
 
+use crate::behavior::{compose_with_behavior, BehaviorEvidence};
 use crate::gates;
 use crate::identity::{ArtifactIdentity, IdentityError, ROLE_CANDIDATE};
 use crate::oracle::{observe_oracle, OracleObservation};
@@ -57,7 +58,7 @@ pub fn check_static(bytes: &[u8], opts: &CheckStaticOptions) -> AcceptanceReport
     }
 
     report.finalize_r0b();
-    // Contract hard-stop: never Accepted in R0B.
+    // Contract hard-stop: never Accepted in R0B static path.
     if report.verdict == Verdict::Accepted {
         report.verdict = Verdict::Rejected;
         report.failures.push(FailureRecord {
@@ -67,6 +68,19 @@ pub fn check_static(bytes: &[u8], opts: &CheckStaticOptions) -> AcceptanceReport
         });
     }
     report
+}
+
+/// Static gates plus **pre-recorded** behavioral evidence (B-A2).
+///
+/// This is the only library path that may return [`Verdict::Accepted`].
+/// `check_static` remains R0B-only (Accepted forbidden).
+pub fn check_with_behavior(
+    bytes: &[u8],
+    opts: &CheckStaticOptions,
+    evidence: &BehaviorEvidence,
+) -> AcceptanceReport {
+    let structural = check_static(bytes, opts);
+    compose_with_behavior(structural, evidence, bytes)
 }
 
 fn report_identity_failure(

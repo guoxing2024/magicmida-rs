@@ -1,15 +1,13 @@
 //! Read-only CLI for the independent acceptance kernel.
 //!
 //! ```text
-//! mida-acceptance check-static <candidate> [--expected-sha256 HEX]
-//!                                          [--expected-size N]
-//!                                          [--role ROLE]
-//!                                          [--oracle PATH]
-//!                                          [--report PATH]
+//! mida-acceptance check-static <candidate> [options]
+//! mida-acceptance check-with-behavior <candidate> --behavior-evidence <json> [options]
 //! ```
 //!
-//! Exit codes: 0 = StructuralPassBehaviorPending, 2 = Rejected, 1 = I/O or config error.
-//! Report writes never alias candidate or oracle inputs.
+//! Exit codes: 0 = StructuralPassBehaviorPending or Accepted,
+//! 2 = Rejected, 1 = I/O or config error.
+//! Report writes never alias candidate, oracle, or evidence inputs.
 
 use std::env;
 use std::fs::{File, Metadata, OpenOptions};
@@ -17,7 +15,9 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 
-use mida_acceptance::{check_static, CheckStaticOptions, Verdict};
+use mida_acceptance::{
+    check_static, check_with_behavior, BehaviorEvidence, CheckStaticOptions, Verdict,
+};
 
 fn main() {
     let code = match run() {
@@ -49,8 +49,12 @@ fn run() -> Result<i32, String> {
             args.remove(0);
             cmd_check_static(&args)
         }
+        "check-with-behavior" => {
+            args.remove(0);
+            cmd_check_with_behavior(&args)
+        }
         other => Err(format!(
-            "unknown command '{other}'. Use: mida-acceptance check-static <candidate>"
+            "unknown command '{other}'. Use: check-static | check-with-behavior"
         )),
     }
 }
@@ -58,25 +62,31 @@ fn run() -> Result<i32, String> {
 fn print_help() {
     println!(
         "\
-mida-acceptance - independent static PE acceptance kernel (R0B)
+mida-acceptance - independent PE acceptance kernel (R0B + B-A2 compose)
 
 Usage:
   mida-acceptance check-static <candidate> [options]
+  mida-acceptance check-with-behavior <candidate> --behavior-evidence <path> [options]
 
 Options:
   --expected-sha256 <hex>  Fail-closed if file digest does not match
   --expected-size <bytes>  Fail-closed if file length does not match
   --role <role>            Artifact role label (default: candidate)
   --oracle <path>          Legacy oracle file (comparison observation only)
+  --behavior-evidence <p>  Pre-recorded mida.behavior-evidence/v0 JSON (compose only)
   --report <path>          Write deterministic JSON report to path
-                           (must not alias candidate or oracle)
+                           (must not alias candidate, oracle, or evidence)
   -h, --help               Show help
   -V, --version            Show version
 
 Exit codes:
-  0  StructuralPassBehaviorPending
+  0  StructuralPassBehaviorPending or Accepted (check-with-behavior only for Accepted)
   2  Rejected
   1  I/O, configuration, or internal error
+
+Notes:
+  check-static never returns Accepted (R0B).
+  check-with-behavior may return Accepted when structure passes and evidence Pass binds.
 "
     );
 }
@@ -205,11 +215,152 @@ fn cmd_check_static(args: &[String]) -> Result<i32, String> {
         Verdict::StructuralPassBehaviorPending => Ok(0),
         Verdict::Rejected => Ok(2),
         Verdict::Accepted => {
-            // Contract violation if ever reached.
-            eprintln!("error: internal contract violation: Accepted verdict in R0B");
+            // Contract violation if ever reached on static path.
+            eprintln!("error: internal contract violation: Accepted verdict in check-static");
             Ok(1)
         }
     }
+}
+
+fn cmd_check_with_behavior(args: &[String]) -> Result<i32, String> {
+    if args.is_empty() {
+        return Err(
+            "Usage: mida-acceptance check-with-behavior <candidate> --behavior-evidence <path>"
+                .into(),
+        );
+    }
+    let mut candidate: Option<PathBuf> = None;
+    let mut expected_sha256: Option<String> = None;
+    let mut expected_size: Option<u64> = None;
+    let mut role: Option<String> = None;
+    let mut oracle: Option<PathBuf> = None;
+    let mut report_path: Option<PathBuf> = None;
+    let mut evidence_path: Option<PathBuf> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--expected-sha256" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("missing value after --expected-sha256".into());
+                }
+                expected_sha256 = Some(args[i].clone());
+            }
+            flag if flag.starts_with("--expected-sha256=") => {
+                expected_sha256 = Some(flag["--expected-sha256=".len()..].to_string());
+            }
+            "--expected-size" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("missing value after --expected-size".into());
+                }
+                expected_size = Some(parse_expected_size(&args[i])?);
+            }
+            flag if flag.starts_with("--expected-size=") => {
+                expected_size = Some(parse_expected_size(&flag["--expected-size=".len()..])?);
+            }
+            "--role" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("missing value after --role".into());
+                }
+                role = Some(args[i].clone());
+            }
+            flag if flag.starts_with("--role=") => {
+                role = Some(flag["--role=".len()..].to_string());
+            }
+            "--oracle" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("missing value after --oracle".into());
+                }
+                oracle = Some(PathBuf::from(&args[i]));
+            }
+            flag if flag.starts_with("--oracle=") => {
+                oracle = Some(PathBuf::from(&flag["--oracle=".len()..]));
+            }
+            "--behavior-evidence" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("missing value after --behavior-evidence".into());
+                }
+                evidence_path = Some(PathBuf::from(&args[i]));
+            }
+            flag if flag.starts_with("--behavior-evidence=") => {
+                evidence_path = Some(PathBuf::from(&flag["--behavior-evidence=".len()..]));
+            }
+            "--report" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("missing value after --report".into());
+                }
+                report_path = Some(PathBuf::from(&args[i]));
+            }
+            flag if flag.starts_with("--report=") => {
+                report_path = Some(PathBuf::from(&flag["--report=".len()..]));
+            }
+            "-h" | "--help" => {
+                print_help();
+                return Ok(0);
+            }
+            other if other.starts_with('-') => {
+                return Err(format!("unknown option '{other}'"));
+            }
+            other => {
+                if candidate.is_some() {
+                    return Err(format!("unexpected argument '{other}'"));
+                }
+                candidate = Some(PathBuf::from(other));
+            }
+        }
+        i += 1;
+    }
+
+    let candidate = candidate.ok_or_else(|| "missing <candidate> path".to_string())?;
+    let evidence_path =
+        evidence_path.ok_or_else(|| "missing --behavior-evidence <path>".to_string())?;
+
+    let (bytes, candidate_file) = read_input(&candidate, "candidate")?;
+    let (ev_bytes, evidence_file) = read_input(&evidence_path, "behavior-evidence")?;
+    let evidence = BehaviorEvidence::parse_json(&ev_bytes)
+        .map_err(|e| format!("invalid behavior evidence: {e}"))?;
+
+    let (oracle_bytes, oracle_file) = match oracle.as_deref() {
+        None => (None, None),
+        Some(path) => {
+            let (b, file) = read_input(path, "oracle")?;
+            (Some(b), Some(file))
+        }
+    };
+
+    let opts = CheckStaticOptions {
+        role,
+        expected_sha256,
+        expected_size,
+        oracle_bytes,
+    };
+
+    let report = check_with_behavior(&bytes, &opts, &evidence);
+    let json = report
+        .to_json()
+        .map_err(|e| format!("failed to serialize report: {e}"))?;
+
+    println!("{json}");
+    if let Some(path) = report_path {
+        let mut file_body = json.clone();
+        file_body.push('\n');
+        // Also refuse aliasing the evidence path.
+        write_report_with_extra(
+            &path,
+            file_body.as_bytes(),
+            (&candidate, &candidate_file),
+            oracle.as_deref().zip(oracle_file.as_ref()),
+            Some((evidence_path.as_path(), &evidence_file)),
+        )?;
+    }
+
+    Ok(report.verdict.exit_code())
 }
 
 fn parse_expected_size(raw: &str) -> Result<u64, String> {
@@ -235,6 +386,18 @@ fn write_report(
     body: &[u8],
     candidate: (&Path, &File),
     oracle: Option<(&Path, &File)>,
+) -> Result<(), String> {
+    write_report_with_extra(report_path, body, candidate, oracle, None)
+}
+
+/// Write report after rejecting alias against candidate, optional oracle, and
+/// optional behavior-evidence inputs (B-A2).
+fn write_report_with_extra(
+    report_path: &Path,
+    body: &[u8],
+    candidate: (&Path, &File),
+    oracle: Option<(&Path, &File)>,
+    evidence: Option<(&Path, &File)>,
 ) -> Result<(), String> {
     // Open without truncate so alias checks cannot damage an input file.
     let mut report_file = OpenOptions::new()
@@ -263,6 +426,16 @@ fn write_report(
             "oracle",
             oracle_path,
             oracle_file,
+        )?;
+    }
+    if let Some((evidence_path, evidence_file)) = evidence {
+        reject_input_alias(
+            report_path,
+            &report_file,
+            &report_metadata,
+            "behavior-evidence",
+            evidence_path,
+            evidence_file,
         )?;
     }
 

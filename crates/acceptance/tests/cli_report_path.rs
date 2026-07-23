@@ -135,3 +135,90 @@ fn expected_size_mismatch_rejects_without_touching_candidate() {
         "{stdout}"
     );
 }
+
+fn run_behavior(args: &[&Path]) -> Output {
+    let bin = env!("CARGO_BIN_EXE_mida-acceptance");
+    let mut command = Command::new(bin);
+    command.arg("check-with-behavior");
+    for arg in args {
+        command.arg(arg);
+    }
+    command
+        .output()
+        .unwrap_or_else(|e| panic!("failed to spawn {bin}: {e}"))
+}
+
+fn write_minimal_evidence(path: &Path, sha: &str, size: u64, verdict: &str, status: &str) {
+    let body = format!(
+        r#"{{
+  "schema_version": "mida.behavior-evidence/v0",
+  "candidate": {{
+    "sha256": "{sha}",
+    "size_bytes": {size},
+    "role": "candidate"
+  }},
+  "reference": {{ "kind": "none", "sha256": null, "notes": null }},
+  "probe": {{
+    "id": "exit_code_marker_v0",
+    "policy": {{ "network": "deny", "max_wall_ms": 5000, "max_output_bytes": 65536 }},
+    "result": {{
+      "status": "{status}",
+      "exit_code": 0,
+      "markers_found": ["MIDA_BEH_MARKER=1"],
+      "error_class": null
+    }}
+  }},
+  "verdict": "{verdict}",
+  "residual_risks": [],
+  "producer": {{ "name": "cli-test", "version": "0" }}
+}}"#
+    );
+    fs::write(path, body).expect("write evidence");
+}
+
+#[test]
+fn check_with_behavior_report_cannot_overwrite_evidence() {
+    let dir = TestDir::new();
+    let candidate = dir.path().join("candidate.bin");
+    let evidence = dir.path().join("evidence.json");
+    fs::write(&candidate, b"not a pe").expect("write candidate");
+    let sha = format!("{:0>64}", "aa");
+    write_minimal_evidence(&evidence, &sha, 8, "Pass", "pass");
+    let evidence_bytes = fs::read(&evidence).expect("read evidence");
+
+    let output = run_behavior(&[
+        &candidate,
+        Path::new("--behavior-evidence"),
+        &evidence,
+        Path::new("--report"),
+        &evidence,
+    ]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("aliases"), "stderr: {stderr}");
+    assert_eq!(fs::read(&evidence).expect("preserved"), evidence_bytes);
+}
+
+#[test]
+fn check_with_behavior_identity_mismatch_exit_2() {
+    let dir = TestDir::new();
+    let candidate = dir.path().join("candidate.bin");
+    let evidence = dir.path().join("evidence.json");
+    let original = b"not-a-pe-bytes";
+    fs::write(&candidate, original).expect("write candidate");
+    write_minimal_evidence(&evidence, &"bb".repeat(32), 9999, "Pass", "pass");
+
+    let output = run_behavior(&[
+        &candidate,
+        Path::new("--behavior-evidence"),
+        &evidence,
+    ]);
+
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert_eq!(fs::read(&candidate).expect("read candidate"), original);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Rejected") || stdout.contains("evidence_identity_mismatch"),
+        "{stdout}"
+    );
+}

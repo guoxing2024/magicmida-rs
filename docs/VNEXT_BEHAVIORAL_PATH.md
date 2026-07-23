@@ -97,26 +97,31 @@ else:
     final = StructuralPassBehaviorPending
 ```
 
-**B-A0 decision:** until implementation lands, `check-static` and library
-`evaluate_*` paths stay R0B-only (`Accepted` = contract violation).
+**B-A0 / B-A2 decision:** `check-static` and library `check_static` stay
+R0B-only (`Accepted` = contract violation). Only the explicit
+`check-with-behavior` path may return `Accepted` when structure passes and
+pre-recorded evidence binds with verdict `Pass`.
 
-CLI sketch (not shipped):
+CLI (shipped, B-A2):
 
 ```text
 mida-acceptance check-static <candidate> --report r.json
 mida-acceptance check-with-behavior <candidate> --behavior-evidence e.json [--report r.json]
 ```
 
-Exit codes (planned):
+Exit codes:
 
 | Code | Meaning |
 |------|---------|
-| `0` | `Accepted` **or** `StructuralPassBehaviorPending` (document which mode) |
+| `0` | `Accepted` **or** `StructuralPassBehaviorPending` |
 | `2` | `Rejected` |
-| `1` | I/O / config / contract violation |
+| `1` | I/O / config / invalid evidence / contract violation |
 
 Prefer **distinct** exit for Pending vs Accepted in a later CLI revision if
 scripts need it; do not break R0B `0` = Pending without a version bump note.
+
+Library: `check_with_behavior(bytes, opts, &evidence)` → compose only; kernel
+does **not** run probes or call Win32.
 
 ---
 
@@ -182,8 +187,8 @@ not match. Tampered or stale evidence → fail closed.
 |----|------|--------|
 | **B-A0** | This contract: scope, non-claims, evidence schema, composition rules | **done** |
 | **B-A1** | Synthetic PE fixture + offline probe harness (no vault malware); emit evidence JSON | **done** |
-| B-A2 | `mida-acceptance` load/validate evidence; composition path behind explicit CLI; unit tests; still default Pending | pending |
-| B-A3 | Wire lab smoke: structural dump → probe → evidence (Origin **optional**, synthetic required first) | pending |
+| **B-A2** | `mida-acceptance` load/validate evidence; composition path behind explicit CLI; unit tests; still default Pending | **done** |
+| **B-A3** | Wire lab smoke: structural → probe → evidence compose (Origin **optional**, synthetic required first) | **done** (synthetic) |
 | B-B | Scheduled behavioral gate + `validation_summary` **VNEXT-BEH** (only when deliberately opened) | not open |
 | B-C | Multi-probe scoring / API-trace (post-MVP) | deferred |
 
@@ -213,7 +218,7 @@ Rules:
 
 **B-A1 smoke (2026-07-23):** `batch_20260723-232146_ba1` — pass/fail_exit/no_marker/hang all_ok.
 
-Do **not** start protected samples until B-A2 composition is green.
+Protected samples remain out of scope for B-A2 (synthetic + composition only).
 
 ## Validate (B-A1)
 
@@ -221,7 +226,38 @@ Do **not** start protected samples until B-A2 composition is green.
 python tools\_behavior_ba1_smoke.py
 # expect summary all_ok true; verdicts Pass/Fail/Fail/Inconclusive
 # validation_summary task remains VNEXT-R4 (not VNEXT-BEH)
-# mida-acceptance still never returns Accepted
+```
+
+## Validate (B-A2)
+
+```text
+cargo test -p mida-acceptance --offline
+# check-static still never Accepted
+# check_with_behavior: Pass→Accepted, Fail→Rejected, Inconclusive→Pending,
+#   identity mismatch→Rejected, structural reject not upgraded
+mida-acceptance check-with-behavior <pe> --behavior-evidence e.json
+# not a scheduled VNEXT-BEH gate
+```
+
+## B-A3 wire (synthetic)
+
+End-to-end lab smoke (no vault malware):
+
+1. `mida-acceptance check-static` on synthetic `marker_exit` → `StructuralPassBehaviorPending`
+2. `tools/_behavior_probe.py` → `mida.behavior-evidence/v0`
+3. `mida-acceptance check-with-behavior` → compose (`Accepted` / `Rejected` / Pending)
+
+Harness: `tools/_behavior_ba3_smoke.py`. Origin/protected samples remain optional
+and are **not** required for B-A3 close.
+
+### Validate (B-A3)
+
+```text
+python tools\_behavior_ba3_smoke.py
+# expect summary all_ok true
+# pass → Accepted; fail_exit → Rejected; hang → Pending; mismatch → Rejected
+# check-static still never Accepted
+# validation_summary task remains VNEXT-R4 (not VNEXT-BEH)
 ```
 
 ---

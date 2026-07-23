@@ -31,12 +31,14 @@ product acceptance.
 
 ### `Accepted`
 
-Reserved for a future phase that combines structural gates with independent
-behavioral evidence under the acceptance kernel (see
-[VNEXT_ARCHITECTURE.md](VNEXT_ARCHITECTURE.md)).
+Structural gates pass **and** pre-recorded behavioral evidence binds to the
+candidate with verdict `Pass`, composed only on the explicit
+`check-with-behavior` path (see
+[VNEXT_BEHAVIORAL_PATH.md](VNEXT_BEHAVIORAL_PATH.md) B-A2).
 
-**R0B rule:** no code path in this phase may return `Accepted` for any input.
-Returning `Accepted` is a contract violation.
+**R0B rule:** `check-static` / library `check_static` must never return
+`Accepted` for any input. Returning `Accepted` on that path is a contract
+violation.
 
 ## Artifact identity
 
@@ -107,20 +109,30 @@ mida-acceptance check-static <candidate> [--expected-sha256 <hex>]
                                          [--role <role>]
                                          [--oracle <path>]
                                          [--report <path>]
+
+mida-acceptance check-with-behavior <candidate> --behavior-evidence <json>
+                                         [--expected-sha256 <hex>]
+                                         [--expected-size <bytes>]
+                                         [--role <role>]
+                                         [--oracle <path>]
+                                         [--report <path>]
 ```
 
 Exit codes:
 
 | Code | Meaning |
 |------|---------|
-| `0` | Verdict is `StructuralPassBehaviorPending` |
+| `0` | `StructuralPassBehaviorPending` or `Accepted` (`Accepted` only via check-with-behavior) |
 | `2` | Verdict is `Rejected` |
-| `1` | I/O, configuration, or internal error (no PE verdict) |
+| `1` | I/O, configuration, invalid evidence, or internal error (no PE verdict) |
 
-The CLI is read-only with respect to the candidate and oracle files.
-`--report` must not alias the candidate or oracle path (including hard links).
+The CLI is read-only with respect to the candidate, oracle, and behavior-evidence
+files. `--report` must not alias any of those paths (including hard links).
 If a report path aliases an input, the CLI exits with code `1` and leaves the
 input bytes unchanged.
+
+`check-static` never returns `Accepted`. `check-with-behavior` loads
+pre-recorded `mida.behavior-evidence/v0` JSON only; it does not run probes.
 
 ## Residual risks
 
@@ -142,17 +154,19 @@ change that must repopulate this array and update this document.
 - Behavioral equivalence scoring
 - Production release gates beyond structural MVP
 
-## Behavioral path (post-R0B; not active in R0B)
+## Behavioral path (B-A2 compose; no VNEXT-BEH gate)
 
-Structural gates remain as specified above. A future phase may compose
-**pre-recorded** behavioral evidence with a structural pass to allow
-`Accepted`. That work is tracked in
-[VNEXT_BEHAVIORAL_PATH.md](VNEXT_BEHAVIORAL_PATH.md) (B-A0 contract).
+Structural gates remain as specified above. **B-A2** composes **pre-recorded**
+behavioral evidence with a structural pass to allow `Accepted` on the explicit
+path only. Details:
+[VNEXT_BEHAVIORAL_PATH.md](VNEXT_BEHAVIORAL_PATH.md).
 
-Until a scheduled behavioral gate closes and this document is revised:
+Until a scheduled **VNEXT-BEH** gate closes:
 
-1. No library or CLI path may return `Accepted`.
+1. `check-static` / `check_static` must never return `Accepted`.
 2. Evidence files alone do not change `check-static` results.
 3. Probes run **outside** the acceptance crate; the kernel only validates
-   evidence identity binding and composition rules when that CLI mode ships.
+   evidence identity binding and composition on `check-with-behavior`.
+4. Default product path remains structural Pending; pure default flip is
+   independent of this compose path.
 

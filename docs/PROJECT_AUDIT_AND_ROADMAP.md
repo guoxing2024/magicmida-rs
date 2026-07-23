@@ -417,7 +417,8 @@ mida-acceptance check-static <scratch>\origin_u.exe --report <scratch>\origin_r0
 
 1. **B-A0 done:** 范围/非声明/证据 schema/组合规则 — [docs/VNEXT_BEHAVIORAL_PATH.md](VNEXT_BEHAVIORAL_PATH.md)。  
 2. **B-A1 done:** 合成 `marker_exit` + `tools/_behavior_probe.py` + smoke 四用例（Pass/Fail/Fail/Inconclusive）。  
-3. **B-A2 next:** `mida-acceptance` 加载/绑定 identity + 组合路径（显式 CLI；默认仍 Pending）。  
+3. **B-A2 done:** `mida-acceptance` 加载/绑定 identity + `check-with-behavior` 组合路径（显式 CLI；`check-static` 仍永不 Accepted；默认 Pending）。  
+4. **B-A3 done (synthetic):** lab 串联 `check-static` → probe → `check-with-behavior`（`tools/_behavior_ba3_smoke.py`）；vault/Origin 仍可选、未当关门条件。  
 4. **B-B:** 刻意排期后才写 `validation_summary` **VNEXT-BEH** 并允许 `Accepted`。  
 5. R0B 静态仍 fail-closed；插件不得自证 Accepted。
 
