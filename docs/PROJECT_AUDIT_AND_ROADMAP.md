@@ -3,7 +3,7 @@
 **审计日期:** 2026-07-23（Windows 复审 + Phase 0 绿测 + Origin/Lunlun live StructuralPass）  
 **基线分支:** `baseline/legacy-recovery-20260722`  
 **HEAD:** `52c4eee` + 工作区：CONTROL|INTEGER context + Lunlun null-storm/exit 硬化（未提交）  
-**工作区:** R1–R4 结构门已关（R3 Oreans 10× + R4 AHK/GTO VNEXT-R4）；pure 默认仍 No；Behavioral Accepted 未声明  
+**工作区:** R1–R4 **窄**结构门已关（R3 10× + R4 VNEXT-R4）；R4 **非**独立族宿主完成；pure 仍 No；Accepted 未开；2026-07-24 审计 P0：process 对齐安全 + CLI candidate 语义  
 **主机:** Windows 11；仓库 `D:\Claude project\magicmida-rs`；vault `D:\MidaVault`  
 **环境事实:** VS 2022 Professional MSVC 14.44；`tools/_rebuild_cli.cmd`；
 `CARGO_TARGET_DIR=D:\MidaVault\scratch\cargo-target`；

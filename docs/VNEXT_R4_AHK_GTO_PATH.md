@@ -1,9 +1,18 @@
 # VNEXT-R4 AHK/GTO Path
 
-Status: **R4 structural gate CLOSED** (2026-07-23, R4-C).
-`validation_summary` task **VNEXT-R4**. Default dump profile remains
-**OreansClassic**. Pure flip still **No**. Behavioral Accepted **not** claimed.
-GTO dump stages still require explicit `--profile=ahk-gto-experimental`.
+Status: **R4 structural gate CLOSED** (2026-07-23, R4-C) under the
+**narrow** close criteria in this file (identify plugin + experimental live
+R0B + Oreans regression + no auto GTO stages + `validation_summary` VNEXT-R4).
+
+**Architecture honesty (post-audit 2026-07-24):** R4 is **not** a fully
+independent protection-family pipeline. The CLI host still builds
+`ThemidaState` first, runs Themida-shaped IAT strategies, and treats GTO as
+identify + session defaults + dump-profile stages on that host. Do not read
+"R4 CLOSED" as "second family is architecturally complete."
+
+Default dump profile remains **OreansClassic**. Pure flip still **No**.
+Behavioral Accepted **not** claimed. GTO dump stages still require explicit
+`--profile=ahk-gto-experimental`.
 
 Prerequisites: R0B + R1 + R2 Slice 0–4 + PackerPlugin 3b + **R3 structural gate closed**.
 

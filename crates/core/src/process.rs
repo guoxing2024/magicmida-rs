@@ -30,6 +30,46 @@ use windows::Win32::UI::WindowsAndMessaging::SW_SHOW;
 use crate::error::CoreError;
 
 // ---------------------------------------------------------------------------
+// Unaligned PE header reads (file buffers are not guaranteed aligned)
+// ---------------------------------------------------------------------------
+
+/// Copy a POD `T` from `data[offset..]` without requiring pointer alignment.
+///
+/// `Vec<u8>` / file mappings are only byte-aligned. Casting to
+/// `IMAGE_*` references is undefined behaviour when the offset is not
+/// aligned for `T` (malicious or nonstandard `e_lfanew` can force this).
+/// Always use this helper (or field-wise LE loads) instead of
+/// `&*(ptr as *const T)`.
+fn pe_read_unaligned<T: Copy>(data: &[u8], offset: usize) -> Result<T, CoreError> {
+    let need = size_of::<T>();
+    if data.len() < offset.saturating_add(need) {
+        return Err(CoreError::ProcessCreation(format!(
+            "PE structure extends past end of file (need {need} bytes at offset {offset:#x}, file len {})",
+            data.len()
+        )));
+    }
+    // SAFETY: bounds checked; `T` is Copy; `read_unaligned` does not require
+    // the source address to be aligned for `T`.
+    Ok(unsafe { std::ptr::read_unaligned(data.as_ptr().add(offset) as *const T) })
+}
+
+/// Write a POD `T` into `data[offset..]` without requiring pointer alignment.
+fn pe_write_unaligned<T: Copy>(data: &mut [u8], offset: usize, value: T) -> Result<(), CoreError> {
+    let need = size_of::<T>();
+    if data.len() < offset.saturating_add(need) {
+        return Err(CoreError::ProcessCreation(format!(
+            "PE structure write past end of file (need {need} bytes at offset {offset:#x}, file len {})",
+            data.len()
+        )));
+    }
+    // SAFETY: bounds checked; `write_unaligned` does not require alignment.
+    unsafe {
+        std::ptr::write_unaligned(data.as_mut_ptr().add(offset) as *mut T, value);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Re-exported types (imported in lib.rs)
 // ---------------------------------------------------------------------------
 
@@ -322,10 +362,9 @@ fn pe_inspect(path: &Path) -> Result<PeInfo, CoreError> {
         ));
     }
 
-    // SAFETY: data is at least IMAGE_DOS_HEADER bytes. We're reading a POD
-    // struct from well-aligned bytes — IMAGE_DOS_HEADER is repr(C) and its
-    // fields all have natural alignment.
-    let dos = unsafe { &*(data.as_ptr() as *const IMAGE_DOS_HEADER) };
+    // Unaligned-safe: file buffer is not guaranteed to satisfy IMAGE_DOS_HEADER
+    // alignment (and e_lfanew targets need not be aligned either).
+    let dos: IMAGE_DOS_HEADER = pe_read_unaligned(&data, 0)?;
 
     // The Pascal reference checks: `if e_lfanew > $F00 then fail`
     if dos.e_lfanew as u32 > 0xF00 {
@@ -359,11 +398,9 @@ fn pe_inspect(path: &Path) -> Result<PeInfo, CoreError> {
         )));
     }
 
-    // Read the file header (starts at pe_offset + 4, past Signature).
-    // SAFETY: we verified bounds above.
+    // File header starts at pe_offset + 4 (past Signature). Unaligned-safe.
     let file_header_offset = pe_offset + 4;
-    // SAFETY: bounds were verified above (data.len() >= pe_offset + size_of::<IMAGE_NT_HEADERS64>); offset is within the file.
-    let fh = unsafe { &*(data.as_ptr().add(file_header_offset) as *const IMAGE_FILE_HEADER) };
+    let fh: IMAGE_FILE_HEADER = pe_read_unaligned(&data, file_header_offset)?;
 
     let is_dll = (fh.Characteristics.0 & IMAGE_FILE_DLL.0) != 0;
 
@@ -505,18 +542,16 @@ fn make_dll_executable(
         ))
     })?;
 
-    // Parse headers.
-    // SAFETY: data is a valid byte slice covering the PE headers
-    // (verified by pe_inspect above).
-    let dos = unsafe { &*(data.as_ptr() as *const IMAGE_DOS_HEADER) };
+    // Parse headers with unaligned-safe POD copies (same policy as pe_inspect).
+    let dos: IMAGE_DOS_HEADER = pe_read_unaligned(&data, 0)?;
     let pe_offset = dos.e_lfanew as usize;
 
     let file_header_offset = pe_offset + 4; // past Signature
-                                            // SAFETY: data is a mutable Vec covering the PE headers; file_header_offset was verified to be in bounds.
-    let fh = unsafe { &mut *(data.as_mut_ptr().add(file_header_offset) as *mut IMAGE_FILE_HEADER) };
+    let mut fh: IMAGE_FILE_HEADER = pe_read_unaligned(&data, file_header_offset)?;
 
     // Step 2: clear IMAGE_FILE_DLL
     fh.Characteristics = IMAGE_FILE_CHARACTERISTICS(fh.Characteristics.0 & !IMAGE_FILE_DLL.0);
+    pe_write_unaligned(&mut data, file_header_offset, fh)?;
 
     let opt_header_offset = file_header_offset + size_of::<IMAGE_FILE_HEADER>();
     let magic = {
@@ -550,9 +585,7 @@ fn make_dll_executable(
 
     // Get entry point, image base, and section headers location.
     let (entry_point_rva, image_base, sections_offset) = if magic == 0x10B {
-        // SAFETY: calling a Windows FFI function with validated, properly-lifetime arguments.
-        let opt =
-            unsafe { &*(data.as_ptr().add(opt_header_offset) as *const IMAGE_OPTIONAL_HEADER32) };
+        let opt: IMAGE_OPTIONAL_HEADER32 = pe_read_unaligned(&data, opt_header_offset)?;
         let nt_size = size_of::<IMAGE_NT_HEADERS32>();
         (
             opt.AddressOfEntryPoint as u64,
@@ -560,9 +593,7 @@ fn make_dll_executable(
             pe_offset + nt_size,
         )
     } else {
-        // SAFETY: calling a Windows FFI function with validated, properly-lifetime arguments.
-        let opt =
-            unsafe { &*(data.as_ptr().add(opt_header_offset) as *const IMAGE_OPTIONAL_HEADER64) };
+        let opt: IMAGE_OPTIONAL_HEADER64 = pe_read_unaligned(&data, opt_header_offset)?;
         // Signature(4) + FileHeader(20) + sizeof(OptHeader64)
         let nt_size = 4 + 20 + size_of::<IMAGE_OPTIONAL_HEADER64>();
         (
@@ -579,15 +610,11 @@ fn make_dll_executable(
     let ep_section = (0..num_sections)
         .find_map(|i| {
             let secoff = sections_offset + i * section_header_size;
-            if data.len() < secoff + section_header_size {
-                return None;
-            }
-            // SAFETY: calling a Windows FFI function with validated, properly-lifetime arguments.
-            let sec = unsafe { &*(data.as_ptr().add(secoff) as *const IMAGE_SECTION_HEADER) };
+            let sec: IMAGE_SECTION_HEADER = pe_read_unaligned(&data, secoff).ok()?;
             let va_start = sec.VirtualAddress as u64;
             let va_end = va_start + sec.SizeOfRawData as u64;
             if entry_point_rva >= va_start && entry_point_rva < va_end {
-                Some((secoff, *sec))
+                Some((secoff, sec))
             } else {
                 None
             }
@@ -890,5 +917,30 @@ mod tests {
             matches!(err, CoreError::ProcessCreation(_)),
             "expected ProcessCreation, got {err:?}",
         );
+    }
+
+    /// Unaligned offsets must not require natural alignment for POD reads.
+    #[test]
+    fn pe_read_unaligned_accepts_odd_offset() {
+        let mut buf = vec![0u8; 16];
+        // Store u32 0x11223344 little-endian at offset 1 (unaligned).
+        buf[1..5].copy_from_slice(&0x1122_3344u32.to_le_bytes());
+        let v: u32 = pe_read_unaligned(&buf, 1).expect("unaligned u32");
+        assert_eq!(v, 0x1122_3344);
+    }
+
+    #[test]
+    fn pe_write_unaligned_roundtrip() {
+        let mut buf = vec![0u8; 16];
+        pe_write_unaligned(&mut buf, 3, 0xAABBu16).expect("write");
+        let v: u16 = pe_read_unaligned(&buf, 3).expect("read");
+        assert_eq!(v, 0xAABB);
+    }
+
+    #[test]
+    fn pe_read_unaligned_bounds() {
+        let buf = [0u8; 3];
+        let err = pe_read_unaligned::<u32>(&buf, 0).unwrap_err();
+        assert!(matches!(err, CoreError::ProcessCreation(_)));
     }
 }

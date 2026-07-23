@@ -2228,7 +2228,11 @@ fn run_post_loop_phases(
 
     mida_pe::dump_process(dbg, &dump_opts).map_err(|e| anyhow!("Dump failed: {e}"))?;
 
-    // Lightweight structural gate (non-fatal warnings).
+    // Lightweight structural hints only — non-fatal. Exit Ok means a candidate
+    // PE was written, not that mida-acceptance (R0B) or behavioral gates passed.
+    // Lab harnesses must run `mida-acceptance check-static` (and future behavior
+    // evidence) separately; this CLI path does not depend on mida-acceptance.
+    let mut structure_ep_ok = false;
     if let Ok(out_pe) = PeHeader::from_file(output_path) {
         let ep = out_pe.entry_point;
         let tls = out_pe.nt_headers.optional_header.data_directory[9];
@@ -2237,27 +2241,40 @@ fn run_post_loop_phases(
                 && ep >= s.virtual_address
                 && ep < s.virtual_address.saturating_add(s.virtual_size)
         });
+        structure_ep_ok = ep_in_exec;
         if !ep_in_exec {
             warn!(
                 ep = format_args!("{ep:#x}"),
-                "Output EP not in an executable section"
+                "Output EP not in an executable section (candidate still written)"
             );
         }
         if tls.virtual_address == 0 {
             info!("Output TLS directory empty (expected under clean CRT + post-crt restore)");
         }
+        // Keep "Structure gate:" prefix — lab smoke parsers match this line.
+        // Semantics remain non-authoritative (not mida-acceptance R0B).
         log::log(
             LogType::Info,
             &format!(
-                "Structure gate: EP={ep:#x} exec_ok={ep_in_exec} TLS={:#x}/{:#x}",
+                "Structure gate: EP={ep:#x} exec_ok={ep_in_exec} TLS={:#x}/{:#x} (hint only; not R0B)",
                 tls.virtual_address, tls.size
             ),
         );
+    } else {
+        warn!("Could not re-parse output PE for structure hint (candidate still written)");
     }
 
     log::log(
         LogType::Good,
-        &format!("Unpacked: {}", output_path.display()),
+        &format!(
+            "Candidate written: {} (not acceptance-verified; R0B/behavior are external gates; structure_ep_ok={structure_ep_ok})",
+            output_path.display()
+        ),
+    );
+    // Keep a secondary line that older lab parsers grep for "Unpacked:".
+    log::log(
+        LogType::Info,
+        &format!("Unpacked: {} (candidate; acceptance external)", output_path.display()),
     );
     Ok(())
 }

@@ -1,51 +1,45 @@
-# WORKER_HANDOFF - Behavioral B-A1 done
+# WORKER_HANDOFF - Audit P0 (alignment + CLI semantics + hygiene)
 
 ## Status
 
 | Item | Status |
 |------|--------|
-| R3 / R4 structural | **CLOSED** (VNEXT-R3 / VNEXT-R4) |
+| R3 / R4 structural (narrow gate) | **CLOSED** in validation_summary; host still Themida-centric (see R4 honesty note) |
 | Pure default | **still No** |
-| Behavioral Accepted | **not claimed** / **not enabled** |
-| **B-A0** contract | **DONE** |
-| **B-A1** synthetic probe harness | **DONE** (2026-07-23 smoke all_ok) |
-| **B-A2** acceptance evidence load + compose CLI | **next** |
-| Default dump profile | **OreansClassic** |
+| Behavioral Accepted | **not enabled** |
+| B-A0 / B-A1 | **DONE** |
+| B-A2 | deferred until P0 audit debt cooled |
+| **P0 alignment** (`process.rs` unaligned PE reads) | **DONE** |
+| **P0 CLI success semantics** | **DONE** (candidate written ≠ acceptance) |
+| **P0 hygiene** | **DONE** (`cargo_test.txt` untracked/removed) |
 
-## B-A1 evidence
+## Audit alignment (2026-07-24)
 
-Smoke: `lab/behavior/evidence/batch_*_ba1/summary.json` (local; gitignored bodies)
+Self-check agreed with external audit:
 
-| Case | Verdict |
-|------|---------|
-| `pass` | Pass |
-| `fail_exit` | Fail |
-| `no_marker` | Fail |
-| `hang` (800ms wall) | Inconclusive |
+1. **High — unaligned PE POD refs in `mida-core` process.rs** → fixed via `pe_read_unaligned` / `pe_write_unaligned`.
+2. **High — R4 not independent plugin pipeline** → documented honesty on VNEXT_R4 path; no false “architecture complete”.
+3. **High — unpack Ok ≠ R0B** → CLI logs `Candidate written` + keeps greppable `Unpacked:` / `Structure gate:` for lab tools; states acceptance is external.
+4. **Hygiene** — removed tracked `cargo_test.txt` (was policy violation).
 
-Artifacts:
+Still open (not this turn):
 
-- Fixture: `lab/behavior/synthetic/marker_exit/`
-- Harness: `tools/_behavior_probe.py`
-- Smoke: `tools/_behavior_ba1_smoke.py`
-- Schema: `lab/behavior/schema/behavior-evidence.v0.schema.json`
-- Path: `docs/VNEXT_BEHAVIORAL_PATH.md`
+- Giant `unpacker/mod.rs` / Themida host lock-in (P1)
+- Plugin forwarding duplication (P1)
+- x86 ScyllaHide zero hashes / kifast placeholder (P2 / OOS)
+- fmt/clippy workspace green (P0 remaining if CI cares)
+- `target/` / `.cargo-target/` local dirs (gitignore; do not commit)
+- B-A2 acceptance composition CLI
 
-**Explicit non-claims:** not VNEXT-BEH; not `Accepted`; not vault samples; pure still No.
+## Next recommended
 
-## Next (B-A2)
-
-1. In `mida-acceptance`: parse/validate `mida.behavior-evidence/v0` JSON.
-2. Bind evidence.candidate sha256/size to on-disk PE (fail closed on mismatch).
-3. Explicit CLI mode e.g. `check-with-behavior` (name TBD) — **default**
-   `check-static` unchanged (Pending only; never Accepted without flag).
-4. Unit tests: Pass+structure→Accepted **only** when mode on; mismatch→Rejected;
-   missing evidence→Pending; Inconclusive never upgrades to Accepted.
-5. Do **not** open B-B / write validation_summary VNEXT-BEH without schedule.
+1. Optional: `cargo fmt` / clippy debt sweep on touched crates
+2. P1 thin slice: identify-before-ThemidaState or extract IAT strategy behind selected family (do not grow mod.rs with GTO specials)
+3. Then B-A2 evidence load in `mida-acceptance`
 
 ## Tools
 
 ```text
+cargo test -p mida-core --lib process::tests --offline
 python tools\_behavior_ba1_smoke.py
-python tools\_behavior_probe.py --use-fixture --mode pass --expect-verdict Pass
 ```
