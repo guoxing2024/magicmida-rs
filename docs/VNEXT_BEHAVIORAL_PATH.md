@@ -1,6 +1,7 @@
 # VNEXT Behavioral Acceptance Path
 
-Status: **B-A0 DONE** (2026-07-23) — contract + scope + evidence schema only.
+Status: **B-A1 DONE** (2026-07-23) — synthetic fixture + offline probe harness
+emit `mida.behavior-evidence/v0`. B-A0 contract remains binding.
 No code path may return `Accepted` until a later scheduled behavioral gate
 writes `validation_summary` task **VNEXT-BEH** (name reserved; not open).
 
@@ -180,7 +181,7 @@ not match. Tampered or stale evidence → fail closed.
 | ID | Work | Status |
 |----|------|--------|
 | **B-A0** | This contract: scope, non-claims, evidence schema, composition rules | **done** |
-| B-A1 | Synthetic PE fixture + offline probe harness (no vault malware); emit evidence JSON | pending |
+| **B-A1** | Synthetic PE fixture + offline probe harness (no vault malware); emit evidence JSON | **done** |
 | B-A2 | `mida-acceptance` load/validate evidence; composition path behind explicit CLI; unit tests; still default Pending | pending |
 | B-A3 | Wire lab smoke: structural dump → probe → evidence (Origin **optional**, synthetic required first) | pending |
 | B-B | Scheduled behavioral gate + `validation_summary` **VNEXT-BEH** (only when deliberately opened) | not open |
@@ -190,18 +191,38 @@ Anything short of a scheduled **B-B** is engineering, not “behavioral closed�
 
 ---
 
-## First probe design (B-A1 target)
+## First probe design (B-A1 — landed)
 
-**`exit_code_v0` (synthetic only):**
+**`exit_code_marker_v0` (synthetic only):**
 
-1. Build or store a tiny console PE that exits with code `0` and writes one
-   marker line to a temp file under scratch.
-2. Run under job object: no child network, wall clock ≤ 5s.
-3. Evidence `Pass` iff exit 0 and marker present.
-4. Negative tests: wrong exit, missing marker, timeout → `Fail` / `Inconclusive`.
+| Piece | Location |
+|-------|----------|
+| Fixture crate | `lab/behavior/synthetic/marker_exit/` (standalone; modes `pass` / `fail_exit` / `no_marker` / `hang`) |
+| Probe harness | `tools/_behavior_probe.py` |
+| Smoke | `tools/_behavior_ba1_smoke.py` |
+| Schema file | `lab/behavior/schema/behavior-evidence.v0.schema.json` |
+| Evidence out | `lab/behavior/evidence/` (gitignored bodies) |
 
-Do **not** start with protected samples. Protected→unpacked behavioral comes
-only after synthetic composition is green.
+Rules:
+
+1. Fixture writes `MIDA_BEH_MARKER=1` to `MIDA_BEH_MARKER_PATH` on `pass`.
+2. Wall clock capped (`--max-wall-ms`, default 5000; hang smoke uses 800).
+3. Evidence `Pass` iff exit 0 **and** marker present (when `--require-marker`).
+4. Negatives: `fail_exit` → Fail; `no_marker` → Fail; `hang` → Inconclusive (timeout).
+5. Policy records `network=deny` (process-level kernel filter still residual risk).
+
+**B-A1 smoke (2026-07-23):** `batch_20260723-232146_ba1` — pass/fail_exit/no_marker/hang all_ok.
+
+Do **not** start protected samples until B-A2 composition is green.
+
+## Validate (B-A1)
+
+```text
+python tools\_behavior_ba1_smoke.py
+# expect summary all_ok true; verdicts Pass/Fail/Fail/Inconclusive
+# validation_summary task remains VNEXT-R4 (not VNEXT-BEH)
+# mida-acceptance still never returns Accepted
+```
 
 ---
 
@@ -215,15 +236,6 @@ only after synthetic composition is green.
 - Operators may pressure for early `Accepted` on StructuralPass — refuse without evidence.
 
 ---
-
-## Validate (B-A0 only)
-
-```text
-# Docs only — no behavioral gate, no Accepted:
-# - docs/VNEXT_BEHAVIORAL_PATH.md exists
-# - ACCEPTANCE_CONTRACT.md still forbids Accepted in R0B
-# - validation_summary task remains VNEXT-R4 (not VNEXT-BEH)
-```
 
 ## Command hygiene
 

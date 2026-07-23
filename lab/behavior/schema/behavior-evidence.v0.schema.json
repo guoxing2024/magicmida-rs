@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "mida.behavior-evidence/v0",
+  "title": "MagicMida behavioral evidence v0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "candidate",
+    "reference",
+    "probe",
+    "verdict",
+    "residual_risks",
+    "producer"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "mida.behavior-evidence/v0"
+    },
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha256", "size_bytes", "role"],
+      "properties": {
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "size_bytes": { "type": "integer", "minimum": 0 },
+        "role": { "type": "string" }
+      }
+    },
+    "reference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["none", "synthetic_pair", "oracle_observation"]
+        },
+        "sha256": { "type": ["string", "null"] },
+        "notes": { "type": ["string", "null"] }
+      }
+    },
+    "probe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "policy", "result"],
+      "properties": {
+        "id": { "type": "string" },
+        "policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["network", "max_wall_ms", "max_output_bytes"],
+          "properties": {
+            "network": { "const": "deny" },
+            "max_wall_ms": { "type": "integer", "minimum": 1 },
+            "max_output_bytes": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "result": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "exit_code", "markers_found", "error_class"],
+          "properties": {
+            "status": {
+              "type": "string",
+              "enum": ["pass", "fail", "error", "timeout"]
+            },
+            "exit_code": { "type": ["integer", "null"] },
+            "markers_found": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "error_class": { "type": ["string", "null"] }
+          }
+        }
+      }
+    },
+    "verdict": {
+      "type": "string",
+      "enum": ["Pass", "Fail", "Inconclusive"]
+    },
+    "residual_risks": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "producer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version"],
+      "properties": {
+        "name": { "type": "string" },
+        "version": { "type": "string" }
+      }
+    }
+  }
+}

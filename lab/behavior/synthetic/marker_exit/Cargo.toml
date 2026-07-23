@@ -1,0 +1,14 @@
+# Standalone package (not a workspace member). Empty workspace table
+# keeps cargo from treating this as part of the repo root workspace.
+[workspace]
+
+[package]
+name = "mida-beh-marker-exit"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Synthetic PE for behavioral probe B-A1 (lab only; not vault malware)"
+
+[[bin]]
+name = "marker_exit"
+path = "src/main.rs"

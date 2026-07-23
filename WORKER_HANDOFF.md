@@ -1,48 +1,51 @@
-# WORKER_HANDOFF - Behavioral B-A0 (post R4 structural)
+# WORKER_HANDOFF - Behavioral B-A1 done
 
 ## Status
 
 | Item | Status |
 |------|--------|
-| R3 structural gate | **CLOSED** (VNEXT-R3; commit `f621451` lineage) |
-| R4 structural gate | **CLOSED** (VNEXT-R4) |
+| R3 / R4 structural | **CLOSED** (VNEXT-R3 / VNEXT-R4) |
 | Pure default | **still No** |
 | Behavioral Accepted | **not claimed** / **not enabled** |
-| **B-A0** behavioral contract | **DONE** — [docs/VNEXT_BEHAVIORAL_PATH.md](docs/VNEXT_BEHAVIORAL_PATH.md) |
-| **B-A1** synthetic probe harness | **next** |
-| Default dump profile | **OreansClassic** (GTO stages explicit only) |
+| **B-A0** contract | **DONE** |
+| **B-A1** synthetic probe harness | **DONE** (2026-07-23 smoke all_ok) |
+| **B-A2** acceptance evidence load + compose CLI | **next** |
+| Default dump profile | **OreansClassic** |
 
-## Just committed
+## B-A1 evidence
 
-`feat(vnext): close R3 Oreans + R4 AHK/GTO structural gates` — dual plugin,
-holdout, smoke harnesses, validation_summary VNEXT-R4 (prior R3 archived).
+Smoke: `lab/behavior/evidence/batch_*_ba1/summary.json` (local; gitignored bodies)
 
-## B-A0 deliverable (this turn)
+| Case | Verdict |
+|------|---------|
+| `pass` | Pass |
+| `fail_exit` | Fail |
+| `no_marker` | Fail |
+| `hang` (800ms wall) | Inconclusive |
 
-- Contract path: scope, non-claims, evidence schema `mida.behavior-evidence/v0`,
-  verdict composition rules, milestones B-A1…B-B.
-- Pointers from `ACCEPTANCE_CONTRACT.md`, `VNEXT_ARCHITECTURE.md`,
-  `PROJECT_AUDIT_AND_ROADMAP.md`.
-- **No** `Accepted` code path; `validation_summary` remains **VNEXT-R4**.
+Artifacts:
 
-## Next (B-A1 only when continuing)
+- Fixture: `lab/behavior/synthetic/marker_exit/`
+- Harness: `tools/_behavior_probe.py`
+- Smoke: `tools/_behavior_ba1_smoke.py`
+- Schema: `lab/behavior/schema/behavior-evidence.v0.schema.json`
+- Path: `docs/VNEXT_BEHAVIORAL_PATH.md`
 
-1. Synthetic console PE fixture (in-repo or lab synthetic; not vault malware).
-2. Offline probe harness: job-bounded, network deny, wall-clock cap; emit
-   evidence JSON matching the schema in VNEXT_BEHAVIORAL_PATH.
-3. Positive + negative tests (exit 0 + marker; wrong exit; timeout).
-4. Do **not** open B-B / write VNEXT-BEH / return `Accepted` without a scheduled gate.
+**Explicit non-claims:** not VNEXT-BEH; not `Accepted`; not vault samples; pure still No.
 
-## Explicit non-claims
+## Next (B-A2)
 
-- Structure green ≠ behavioral pass.
-- B-A0 docs ≠ Accepted enabled.
-- Pure flip still separate (still No).
-- Dali OOS.
+1. In `mida-acceptance`: parse/validate `mida.behavior-evidence/v0` JSON.
+2. Bind evidence.candidate sha256/size to on-disk PE (fail closed on mismatch).
+3. Explicit CLI mode e.g. `check-with-behavior` (name TBD) — **default**
+   `check-static` unchanged (Pending only; never Accepted without flag).
+4. Unit tests: Pass+structure→Accepted **only** when mode on; mismatch→Rejected;
+   missing evidence→Pending; Inconclusive never upgrades to Accepted.
+5. Do **not** open B-B / write validation_summary VNEXT-BEH without schedule.
 
-## Tools (structural; unchanged)
+## Tools
 
 ```text
-python tools\_gto_live_smoke.py --cases gto_launcher --tag <tag> --require-r0b
-python tools\_oreans_repeat_smoke.py --cases origin_macro,lunlun_software,xiongxiong_duokai --count 1 --tag <tag> --require-r0b --require-holdout --expect-ep origin_macro=0x13e0,lunlun_software=0x1656f4,xiongxiong_duokai=0x35000
+python tools\_behavior_ba1_smoke.py
+python tools\_behavior_probe.py --use-fixture --mode pass --expect-verdict Pass
 ```

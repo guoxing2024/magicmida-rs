@@ -56,7 +56,7 @@ R1   纯 PE 模型 + rebuild 管线         ✅ R1-A..E 合成 corpus 关闭（M
 R2   统一 runtime/event + replay       ✅ Slice0–4 落地（handler 体仍在 cli）
 R3   Oreans 插件 + Origin/Lunlun/盲样  ✅ 结构门关闭 (10× + holdout); IAT holdout 100%
 R4   第二个独立保护族插件              ✅ 结构门关闭 (VNEXT-R4; GTO experimental + Oreans reg)
-BEH  独立行为验收                      🟡 B-A0 契约 (docs/VNEXT_BEHAVIORAL_PATH.md); Accepted 未开
+BEH  独立行为验收                      🟡 B-A1 harness (synthetic probe); Accepted 未开
 1.0  满足 release rule 后才谈          ⬜
 ```
 
@@ -416,8 +416,8 @@ mida-acceptance check-static <scratch>\origin_u.exe --report <scratch>\origin_r0
 ### Phase 6 — Behavioral Acceptance（1.0 真阻塞）
 
 1. **B-A0 done:** 范围/非声明/证据 schema/组合规则 — [docs/VNEXT_BEHAVIORAL_PATH.md](VNEXT_BEHAVIORAL_PATH.md)。  
-2. **B-A1 next:** 合成 PE + 离线 probe harness → evidence JSON（禁网、有界、vault 外写证据）。  
-3. **B-A2:** `mida-acceptance` 加载/绑定 identity + 组合路径（显式 CLI；默认仍 Pending）。  
+2. **B-A1 done:** 合成 `marker_exit` + `tools/_behavior_probe.py` + smoke 四用例（Pass/Fail/Fail/Inconclusive）。  
+3. **B-A2 next:** `mida-acceptance` 加载/绑定 identity + 组合路径（显式 CLI；默认仍 Pending）。  
 4. **B-B:** 刻意排期后才写 `validation_summary` **VNEXT-BEH** 并允许 `Accepted`。  
 5. R0B 静态仍 fail-closed；插件不得自证 Accepted。
 
