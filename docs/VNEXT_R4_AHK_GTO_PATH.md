@@ -12,9 +12,9 @@ R0B + Oreans regression + no auto GTO stages + `validation_summary` VNEXT-R4).
   `SelectedPacker::uses_oreans_iat_trace()` (AHK/GTO skips them).
 
 Still shared host debt: `ThemidaState` / `init_pe_details` / debug loop body
-remain Oreans-shaped. P1 thin split (2026-07-24): post-loop B/C/D moved to
-`crates/cli/src/unpacker/post_loop.rs` (behavior unchanged). Do not read
-"R4 CLOSED" as "second family pipeline complete."
+remain Oreans-shaped. P1 thin splits (2026-07-24): post-loop B/C/D →
+`post_loop.rs`; early `.data` snapshots → `early_snapshots.rs` (behavior
+unchanged). Do not read "R4 CLOSED" as "second family pipeline complete."
 
 Default dump profile remains **OreansClassic**. Pure flip still **No**.
 Behavioral Accepted **not** claimed. GTO dump stages still require explicit
