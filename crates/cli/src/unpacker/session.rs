@@ -1,7 +1,8 @@
 //! Process session wrappers — RAII handles for the debuggee.
 //!
 //! - [`ResolvedApis`] — kernel32/ntdll addresses resolved in the debugger.
-//! - [`ProcessSession`] — thin RAII wrapper around [`WindowsDebugger`].
+//! - [`ProcessSession`] — unpack session: wait/continue via [`DebuggerCoreEngine`]
+//!   (R2 pump), other ops via [`WindowsDebugger`] Deref.
 //! - [`ReadOnlyProcessDebugger`] — read-only wrapper for `/dump-process`.
 //! - [`get_thread_context_control`] / [`set_thread_context_control`] — fast
 //!   CONTEXT_CONTROL-only context helpers (avoids `ERROR_PARTIAL_COPY`).
@@ -9,7 +10,10 @@
 use anyhow::anyhow;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 
-use mida_core::{ContinueStatus, CoreError, DebugEvent, DebuggerCore, WindowsDebugger};
+use mida_core::{
+    ContinueStatus, CoreError, DebugEvent, DebuggerCore, DebuggerCoreEngine, RuntimeEngine,
+    WindowsDebugger,
+};
 
 // ---------------------------------------------------------------------------
 // ResolvedApis
@@ -45,12 +49,13 @@ pub(super) struct ResolvedApis {
 
 /// Owns the core [`WindowsDebugger`] for the lifetime of an unpack session.
 ///
-/// All debug operations are delegated to the inner `WindowsDebugger` via
-/// [`Deref`] / [`DerefMut`] — callers use standard `dbg.read_memory(...)`,
+/// Wait/continue go through [`DebuggerCoreEngine`] (R2 pump). All other debug
+/// operations are delegated to the inner `WindowsDebugger` via [`Deref`] /
+/// [`DerefMut`] — callers use standard `dbg.read_memory(...)`,
 /// `dbg.set_hw_breakpoint(...)`, `dbg.wait_event()`, etc. without seeing the
 /// wrapper.
 pub struct ProcessSession {
-    pub(super) dbg: WindowsDebugger,
+    eng: DebuggerCoreEngine<WindowsDebugger>,
     /// Resolved kernel32 / ntdll API addresses for the current session.
     pub(super) apis: Option<ResolvedApis>,
 }
@@ -58,7 +63,22 @@ pub struct ProcessSession {
 impl ProcessSession {
     /// Create a new session from an existing `WindowsDebugger`.
     pub(super) fn new(dbg: WindowsDebugger) -> Self {
-        Self { dbg, apis: None }
+        Self {
+            eng: DebuggerCoreEngine::new(dbg),
+            apis: None,
+        }
+    }
+
+    /// R2 engine sequence of the last delivered event (0 if none).
+    #[allow(dead_code)]
+    pub(super) fn engine_sequence(&self) -> u64 {
+        self.eng.last_sequence()
+    }
+
+    /// Whether the engine still holds a pending (waited, not continued) event.
+    #[allow(dead_code)]
+    pub(super) fn engine_has_pending(&self) -> bool {
+        self.eng.has_pending()
     }
 }
 
@@ -66,13 +86,13 @@ impl std::ops::Deref for ProcessSession {
     type Target = WindowsDebugger;
 
     fn deref(&self) -> &Self::Target {
-        &self.dbg
+        self.eng.backend()
     }
 }
 
 impl std::ops::DerefMut for ProcessSession {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.dbg
+        self.eng.backend_mut()
     }
 }
 
@@ -82,59 +102,64 @@ impl std::fmt::Debug for ProcessSession {
         f.debug_struct("ProcessSession")
             .field("image_base", &format_args!("{:#x}", self.image_base()))
             .field("pid", &self.pid())
+            .field("engine_seq", &self.eng.last_sequence())
             .finish()
     }
 }
 
 impl DebuggerCore for ProcessSession {
     fn process_handle(&self) -> HANDLE {
-        self.dbg.process_handle()
+        self.eng.backend().process_handle()
     }
     fn pid(&self) -> u32 {
-        self.dbg.pid()
+        self.eng.backend().pid()
     }
     fn image_base(&self) -> u64 {
-        self.dbg.image_base()
+        self.eng.backend().image_base()
     }
     fn wait_event(&mut self) -> Result<DebugEvent, CoreError> {
-        self.dbg.wait_event()
+        // R2 pump: sequence stamp + pending pairing; drop stamp for call-site API.
+        Ok(self.eng.wait(None)?.event)
     }
     fn wait_event_timeout(&mut self, timeout_ms: u32) -> Result<DebugEvent, CoreError> {
-        self.dbg.wait_event_timeout(timeout_ms)
+        Ok(self.eng.wait(Some(timeout_ms))?.event)
     }
     fn continue_event(&mut self, thread_id: u32, status: ContinueStatus) -> Result<(), CoreError> {
-        self.dbg.continue_event(thread_id, status)
+        // Forward caller's tid so Windows lifecycle validation stays identical.
+        self.eng.continue_with_thread(thread_id, status)
     }
     fn read_memory(&self, address: usize, buf: &mut [u8]) -> Result<usize, CoreError> {
-        self.dbg.read_memory(address, buf)
+        self.eng.backend().read_memory(address, buf)
     }
     fn write_memory(&mut self, address: usize, data: &[u8]) -> Result<usize, CoreError> {
-        self.dbg.write_memory(address, data)
+        self.eng.backend_mut().write_memory(address, data)
     }
     fn get_thread_context(
         &self,
         thread_id: u32,
     ) -> Result<windows::Win32::System::Diagnostics::Debug::CONTEXT, CoreError> {
-        self.dbg.get_thread_context(thread_id)
+        self.eng.backend().get_thread_context(thread_id)
     }
     fn get_thread_context_control(
         &self,
         thread_id: u32,
     ) -> Result<windows::Win32::System::Diagnostics::Debug::CONTEXT, CoreError> {
-        self.dbg.get_thread_context_control(thread_id)
+        self.eng.backend().get_thread_context_control(thread_id)
     }
     fn get_thread_context_control_integer(
         &self,
         thread_id: u32,
     ) -> Result<windows::Win32::System::Diagnostics::Debug::CONTEXT, CoreError> {
-        self.dbg.get_thread_context_control_integer(thread_id)
+        self.eng
+            .backend()
+            .get_thread_context_control_integer(thread_id)
     }
     fn set_thread_context(
         &self,
         thread_id: u32,
         ctx: &windows::Win32::System::Diagnostics::Debug::CONTEXT,
     ) -> Result<(), CoreError> {
-        self.dbg.set_thread_context(thread_id, ctx)
+        self.eng.backend().set_thread_context(thread_id, ctx)
     }
 }
 

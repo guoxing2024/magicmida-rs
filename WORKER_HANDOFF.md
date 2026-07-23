@@ -1,4 +1,4 @@
-# WORKER_HANDOFF - R2-Slice2b DebuggerCoreEngine
+# WORKER_HANDOFF - R2 CLI pump on DebuggerCoreEngine
 
 ## Summary
 
@@ -8,11 +8,12 @@ Phase2 closed (flip=No). R2 progress:
 |-------|-------------|
 | 1 | `mida_core::addr` newtypes |
 | 2 | `RuntimeEngine` + `ReplayRuntimeEngine` |
-| 2b | `DebuggerCoreEngine<D>` live adapter (CLI not switched) |
+| 2b | `DebuggerCoreEngine<D>` |
+| **CLI** | `ProcessSession` wait/continue via engine; Origin smoke OK |
 
 Docs: [VNEXT_R2_RUNTIME_API.md](docs/VNEXT_R2_RUNTIME_API.md).
-**Next careful step:** optional CLI pump migration, or PackerPlugin trait
-stub — prefer zero live behavior change + Origin smoke if CLI is touched.
+Evidence: `origin_macro/live_20260723-181813_r2cli` StructuralPass (legacy dump).
+**Next:** PackerPlugin trait stub, or incremental `addr` adopt at dump ImageBase.
 
 ## R1-E deliverables (this slice)
 

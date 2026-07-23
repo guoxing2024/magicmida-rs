@@ -1,7 +1,8 @@
 # VNEXT-R2 Runtime / Event Engine
 
-Status: **Slice 2 partial** (2026-07-23) — address newtypes + `RuntimeEngine`
-trait + pure `ReplayRuntimeEngine`. Live CLI still uses `DebuggerCore` directly.
+Status: **Slice 2 + CLI pump** (2026-07-23) — address newtypes, `RuntimeEngine`,
+`ReplayRuntimeEngine`, `DebuggerCoreEngine`, and `ProcessSession` wait/continue
+via the engine. Origin legacy smoke: StructuralPass.
 Prerequisites: R0B + R1 closed; Phase2 pure opt-in with flip=**No**.
 
 ## Goals
@@ -88,7 +89,7 @@ Implemented in `mida_core::runtime_engine`:
 | `EngineEvent { sequence, event }` | ✅ |
 | `ReplayRuntimeEngine` | ✅ pure scripted events; unit tests |
 | `DebuggerCoreEngine<D>` | ✅ live adapter; pending wait/continue; `backend_mut` |
-| CLI pump switch | ⏳ later (behavior-preserving) |
+| CLI `ProcessSession` pump | ✅ wait/timeout/continue via engine; Origin smoke OK |
 
 ### Engine event vs debug event
 
@@ -205,7 +206,7 @@ pub enum UnpackPhase {
 - [x] `ReplayRuntimeEngine` + order/pending/continue unit tests
 - [x] Synthetic create→guard_av→oep_bp→exit skeleton test
 - [x] Live `DebuggerCoreEngine` adapter + unit tests
-- [ ] CLI pump migration onto `DebuggerCoreEngine`
+- [x] CLI `ProcessSession` pump migration + Origin legacy StructuralPass smoke
 
 ---
 

@@ -123,6 +123,7 @@ impl RuntimeEngine for ReplayRuntimeEngine {
                 "ReplayRuntimeEngine::continue_event: no pending event".into(),
             ));
         }
+        // Replay has no fallible continue; clear only after accept.
         self.pending = false;
         Ok(())
     }
@@ -179,6 +180,38 @@ impl<D: DebuggerCore> DebuggerCoreEngine<D> {
     pub fn into_inner(self) -> D {
         self.inner
     }
+
+    /// `true` when a wait delivered an event that has not been continued.
+    #[must_use]
+    pub fn has_pending(&self) -> bool {
+        self.pending_thread.is_some()
+    }
+
+    /// Last wait sequence number (0 if none delivered yet).
+    #[must_use]
+    pub fn last_sequence(&self) -> u64 {
+        self.next_sequence.saturating_sub(1)
+    }
+
+    /// Continue with an explicit thread id (matches [`DebuggerCore::continue_event`]).
+    ///
+    /// Backend lifecycle validates `thread_id` against the pending Windows event.
+    /// Engine pending is cleared **only** on success so a failed continue leaves
+    /// both layers consistent.
+    pub fn continue_with_thread(
+        &mut self,
+        thread_id: u32,
+        status: ContinueStatus,
+    ) -> Result<(), CoreError> {
+        if self.pending_thread.is_none() {
+            return Err(CoreError::DebugState(
+                "DebuggerCoreEngine::continue_with_thread: no pending event".into(),
+            ));
+        }
+        self.inner.continue_event(thread_id, status)?;
+        self.pending_thread = None;
+        Ok(())
+    }
 }
 
 fn thread_id_of(event: &DebugEvent) -> u32 {
@@ -219,12 +252,12 @@ impl<D: DebuggerCore> RuntimeEngine for DebuggerCoreEngine<D> {
     }
 
     fn continue_event(&mut self, status: ContinueStatus) -> Result<(), Self::Error> {
-        let Some(thread_id) = self.pending_thread.take() else {
-            return Err(CoreError::DebugState(
+        let thread_id = self.pending_thread.ok_or_else(|| {
+            CoreError::DebugState(
                 "DebuggerCoreEngine::continue_event: no pending event".into(),
-            ));
-        };
-        self.inner.continue_event(thread_id, status)
+            )
+        })?;
+        self.continue_with_thread(thread_id, status)
     }
 
     fn runtime_base(&self) -> Option<RuntimeBase> {
@@ -450,6 +483,54 @@ mod tests {
         let dbg = ScriptedDebugger::new(vec![DebugEvent::Other { thread_id: 1 }], 0);
         let mut eng = DebuggerCoreEngine::new(dbg);
         eng.wait(None).unwrap();
+        assert!(eng.wait(None).is_err());
+    }
+
+    #[test]
+    fn continue_failure_retains_engine_pending() {
+        struct FailContinue {
+            base: ScriptedDebugger,
+        }
+        impl DebuggerCore for FailContinue {
+            fn process_handle(&self) -> HANDLE {
+                self.base.process_handle()
+            }
+            fn pid(&self) -> u32 {
+                self.base.pid()
+            }
+            fn image_base(&self) -> u64 {
+                self.base.image_base()
+            }
+            fn wait_event(&mut self) -> Result<DebugEvent, CoreError> {
+                self.base.wait_event()
+            }
+            fn continue_event(
+                &mut self,
+                _thread_id: u32,
+                _status: ContinueStatus,
+            ) -> Result<(), CoreError> {
+                Err(CoreError::DebugState("inject continue fail".into()))
+            }
+            fn read_memory(&self, a: usize, b: &mut [u8]) -> Result<usize, CoreError> {
+                self.base.read_memory(a, b)
+            }
+            fn write_memory(&mut self, a: usize, d: &[u8]) -> Result<usize, CoreError> {
+                self.base.write_memory(a, d)
+            }
+            fn get_thread_context(&self, t: u32) -> Result<CONTEXT, CoreError> {
+                self.base.get_thread_context(t)
+            }
+            fn set_thread_context(&self, t: u32, c: &CONTEXT) -> Result<(), CoreError> {
+                self.base.set_thread_context(t, c)
+            }
+        }
+        let mut eng = DebuggerCoreEngine::new(FailContinue {
+            base: ScriptedDebugger::new(vec![DebugEvent::Other { thread_id: 3 }], 0),
+        });
+        eng.wait(None).unwrap();
+        assert!(eng.has_pending());
+        assert!(eng.continue_event(ContinueStatus::Continue).is_err());
+        assert!(eng.has_pending(), "failed continue must keep pending");
         assert!(eng.wait(None).is_err());
     }
 }

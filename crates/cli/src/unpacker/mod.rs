@@ -263,8 +263,8 @@ pub fn unpack(
 
     // Build the core debugger — it owns the process, main-thread handle,
     // and stub EXE, and will clean them up via `Drop` when this struct goes
-    // out of scope.  `ProcessSession` is a thin RAII wrapper: no handle of
-    // its own, the only addition is the per-session `ResolvedApis` cache.
+    // out of scope.  `ProcessSession` wraps it in `DebuggerCoreEngine` (R2
+    // wait/continue pump) and caches per-session `ResolvedApis`.
     let mut dbg = ProcessSession::new(
         mida_core::WindowsDebugger::new(&opts).context("Failed to create debuggee process")?,
     );

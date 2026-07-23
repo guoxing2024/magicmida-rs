@@ -479,8 +479,9 @@ M6  R4 第二族插件 + 1.0 评审
 - [x] 起草 `PackerPlugin` + Runtime 接口草图（`docs/VNEXT_R2_RUNTIME_API.md` R2-Slice0）  
 - [x] R2 切片 1：`mida_core::addr` 地址 newtype + 单测  
 - [x] R2 切片 2：`RuntimeEngine` + `ReplayRuntimeEngine` + 合成 guard→OEP 骨架测  
-- [x] R2 切片 2b：`DebuggerCoreEngine` live 适配器（CLI 未切）  
-- [ ] R2 后续：CLI pump 切换 / PackerPlugin stub（行为不变 + smoke）  
+- [x] R2 切片 2b：`DebuggerCoreEngine` live 适配器  
+- [x] R2 CLI pump：`ProcessSession` → engine；Origin smoke `live_20260723-181813_r2cli`  
+- [ ] R2 后续：PackerPlugin stub / addr 在 dump 边界逐步采用  
 
 ---
 
