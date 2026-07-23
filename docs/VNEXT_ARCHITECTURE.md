@@ -56,11 +56,16 @@ claims.
 3. `VNEXT-R2`: establish the single runtime/event engine and replay backend
    ([VNEXT_R2_RUNTIME_API.md](VNEXT_R2_RUNTIME_API.md) — Slice 0 docs sketch landed).
 4. `VNEXT-R3`: implement the Oreans plugin and pass Origin, Lunlun, and a blind
-   holdout ten consecutive times.
+   holdout ten consecutive times — **structural gate closed** (VNEXT-R3).
 5. `VNEXT-R4`: add a second independent protection-family plugin
-   ([VNEXT_R4_AHK_GTO_PATH.md](VNEXT_R4_AHK_GTO_PATH.md) — R4-A0 scaffold done).
+   ([VNEXT_R4_AHK_GTO_PATH.md](VNEXT_R4_AHK_GTO_PATH.md) — **structural gate closed**, VNEXT-R4).
+6. `VNEXT-BEH`: independent behavioral acceptance
+   ([VNEXT_BEHAVIORAL_PATH.md](VNEXT_BEHAVIORAL_PATH.md) — B-A0 contract only;
+   `Accepted` still forbidden until a scheduled B-B gate).
 
-General 1.0 eligibility begins only after steps 1-5 pass their recorded gates.
+General 1.0 eligibility begins only after steps 1-5 **and** a recorded
+behavioral gate (step 6) pass their release rules. Structural R3/R4 alone is
+not product acceptance.
 
 ## Current baseline
 
@@ -88,4 +93,6 @@ acceptance.
   EP/R0B harness; holdout schema slot + preflight (`holdout_status=empty` until a
   third vault Oreans sample is registered)
   ([VNEXT_R3_OREANS_PATH.md](VNEXT_R3_OREANS_PATH.md)). R3 structural 10× **closed**
-  (2026-07-23); pure flip still No; Behavioral Accepted not claimed.
+  (2026-07-23); R4 structural **closed** (VNEXT-R4); pure flip still No;
+  Behavioral Accepted not claimed. Behavioral path B-A0:
+  [VNEXT_BEHAVIORAL_PATH.md](VNEXT_BEHAVIORAL_PATH.md).

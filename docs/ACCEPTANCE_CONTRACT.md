@@ -141,3 +141,18 @@ change that must repopulate this array and update this document.
 - Vault / quarantine mutation
 - Behavioral equivalence scoring
 - Production release gates beyond structural MVP
+
+## Behavioral path (post-R0B; not active in R0B)
+
+Structural gates remain as specified above. A future phase may compose
+**pre-recorded** behavioral evidence with a structural pass to allow
+`Accepted`. That work is tracked in
+[VNEXT_BEHAVIORAL_PATH.md](VNEXT_BEHAVIORAL_PATH.md) (B-A0 contract).
+
+Until a scheduled behavioral gate closes and this document is revised:
+
+1. No library or CLI path may return `Accepted`.
+2. Evidence files alone do not change `check-static` results.
+3. Probes run **outside** the acceptance crate; the kernel only validates
+   evidence identity binding and composition rules when that CLI mode ships.
+

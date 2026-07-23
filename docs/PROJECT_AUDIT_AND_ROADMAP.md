@@ -56,6 +56,7 @@ R1   纯 PE 模型 + rebuild 管线         ✅ R1-A..E 合成 corpus 关闭（M
 R2   统一 runtime/event + replay       ✅ Slice0–4 落地（handler 体仍在 cli）
 R3   Oreans 插件 + Origin/Lunlun/盲样  ✅ 结构门关闭 (10× + holdout); IAT holdout 100%
 R4   第二个独立保护族插件              ✅ 结构门关闭 (VNEXT-R4; GTO experimental + Oreans reg)
+BEH  独立行为验收                      🟡 B-A0 契约 (docs/VNEXT_BEHAVIORAL_PATH.md); Accepted 未开
 1.0  满足 release rule 后才谈          ⬜
 ```
 
@@ -406,20 +407,21 @@ mida-acceptance check-static <scratch>\origin_u.exe --report <scratch>\origin_r0
 
 **出口：** R3 记入 validation_summary；oracle 仍非权威。
 
-### Phase 5 — Behavioral Acceptance
+### Phase 5 — R4 第二族（结构）
 
-1. 行为证据：受控 loader 探测、API 轨迹摘要、确定性 I/O、禁网。  
-2. acceptance **扩展** behavioral 模块，仍禁止依赖 packers。  
-3. 契约升版；R0B 静态仍 fail-closed。
-
-**出口：** 证据充分时可 `Accepted`；否则保持 Pending。
-
-### Phase 6 — R4 第二族 + 1.0
-
-1. AHK/GTO → `mida_plugin_ahk_gto`（默认仍 opt-in）。**R4 structural CLOSED (VNEXT-R4):** real plugin + dual select; GTO live needs `--profile=ahk-gto-experimental`; Oreans Origin+Lunlun+holdout reg green.  
+1. AHK/GTO → `mida_plugin_ahk_gto`（默认仍 opt-in）。**R4 structural CLOSED (VNEXT-R4).**  
 2. Dali 保持 OOS / 未来 managed 独立线。  
-3. 1.0：R0B–R4 结构门已绿；仍差独立行为 Accepted + release rule 评审。  
-4. R4 契约：[docs/VNEXT_R4_AHK_GTO_PATH.md](VNEXT_R4_AHK_GTO_PATH.md)。
+3. 契约：[docs/VNEXT_R4_AHK_GTO_PATH.md](VNEXT_R4_AHK_GTO_PATH.md)。
+
+### Phase 6 — Behavioral Acceptance（1.0 真阻塞）
+
+1. **B-A0 done:** 范围/非声明/证据 schema/组合规则 — [docs/VNEXT_BEHAVIORAL_PATH.md](VNEXT_BEHAVIORAL_PATH.md)。  
+2. **B-A1 next:** 合成 PE + 离线 probe harness → evidence JSON（禁网、有界、vault 外写证据）。  
+3. **B-A2:** `mida-acceptance` 加载/绑定 identity + 组合路径（显式 CLI；默认仍 Pending）。  
+4. **B-B:** 刻意排期后才写 `validation_summary` **VNEXT-BEH** 并允许 `Accepted`。  
+5. R0B 静态仍 fail-closed；插件不得自证 Accepted。
+
+**出口：** 证据充分且门禁通过时可 `Accepted`；否则保持 `StructuralPassBehaviorPending`。
 
 ### 并行工程债
 

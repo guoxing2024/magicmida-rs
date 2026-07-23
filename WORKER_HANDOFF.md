@@ -1,46 +1,48 @@
-# WORKER_HANDOFF - R4-C structural gate CLOSED
+# WORKER_HANDOFF - Behavioral B-A0 (post R4 structural)
 
 ## Status
 
 | Item | Status |
 |------|--------|
-| R3 structural gate | **CLOSED** (prior; not re-opened as 10x) |
-| Holdout IAT quality | **DONE** (100% non-zero rebuild) |
-| **R4-A0…A3** AHK/GTO path engineering | **DONE** |
-| **R4-B** Oreans Origin+Lunlun+holdout after dual-plugin | **DONE** |
-| **R4-C** scheduled structural gate + `validation_summary` VNEXT-R4 | **CLOSED** (2026-07-23) |
+| R3 structural gate | **CLOSED** (VNEXT-R3; commit `f621451` lineage) |
+| R4 structural gate | **CLOSED** (VNEXT-R4) |
 | Pure default | **still No** |
-| Behavioral Accepted | **not claimed** |
-| Default dump profile | **OreansClassic** (never auto GTO stages) |
+| Behavioral Accepted | **not claimed** / **not enabled** |
+| **B-A0** behavioral contract | **DONE** — [docs/VNEXT_BEHAVIORAL_PATH.md](docs/VNEXT_BEHAVIORAL_PATH.md) |
+| **B-A1** synthetic probe harness | **next** |
+| Default dump profile | **OreansClassic** (GTO stages explicit only) |
 
-## R4-C gate evidence
+## Just committed
 
-| Leg | Batch | Result |
-|-----|-------|--------|
-| GTO experimental | `batch_20260723-225951_r4c_gto` | `gto_launcher` family=ahk_gto conf=80 EP `0xecc000` R0B StructuralPass* |
-| Oreans regression | `batch_20260723-230053_r4c_oreans_reg` | Origin `0x13e0` IAT 100%; Lunlun `0x1656f4` IAT 99%; holdout `0x35000` IAT 100%; all oreans_themida + R0B StructuralPass* |
+`feat(vnext): close R3 Oreans + R4 AHK/GTO structural gates` — dual plugin,
+holdout, smoke harnesses, validation_summary VNEXT-R4 (prior R3 archived).
 
-Envelope: `D:\MidaVault\lab\evidence\_r4_gate\r4_gate_envelope.json`  
-Repo summary: `validation_summary.json` task **VNEXT-R4** (prior R3 archived as `validation_summary.prev_20260723-230214.json`).
+## B-A0 deliverable (this turn)
 
-**Explicit non-claims:** not Behavioral Accepted; pure still No; GTO stages still require `--profile=ahk-gto-experimental`; not R3 10x re-gate; Dali OOS.
+- Contract path: scope, non-claims, evidence schema `mida.behavior-evidence/v0`,
+  verdict composition rules, milestones B-A1…B-B.
+- Pointers from `ACCEPTANCE_CONTRACT.md`, `VNEXT_ARCHITECTURE.md`,
+  `PROJECT_AUDIT_AND_ROADMAP.md`.
+- **No** `Accepted` code path; `validation_summary` remains **VNEXT-R4**.
 
-## Next (post-R4 structural)
+## Next (B-A1 only when continuing)
 
-Suggested order (verification-first; do not invent gates):
+1. Synthetic console PE fixture (in-repo or lab synthetic; not vault malware).
+2. Offline probe harness: job-bounded, network deny, wall-clock cap; emit
+   evidence JSON matching the schema in VNEXT_BEHAVIORAL_PATH.
+3. Positive + negative tests (exit 0 + marker; wrong exit; timeout).
+4. Do **not** open B-B / write VNEXT-BEH / return `Accepted` without a scheduled gate.
 
-1. Optional: Phase2 pure flip decision / Lunlun pure smoke (still opt-in only unless scheduled)
-2. Behavioral acceptance path (R0B Behavioral Accepted — separate contract)
-3. 1.0 release rule review once behavioral + dual-plugin + Oreans holdout history stay green
-4. Dali remains OOS / managed line — not R4
+## Explicit non-claims
 
-## Tools
+- Structure green ≠ behavioral pass.
+- B-A0 docs ≠ Accepted enabled.
+- Pure flip still separate (still No).
+- Dali OOS.
+
+## Tools (structural; unchanged)
 
 ```text
-# GTO (always explicit profile):
 python tools\_gto_live_smoke.py --cases gto_launcher --tag <tag> --require-r0b
-# Oreans broader reg:
 python tools\_oreans_repeat_smoke.py --cases origin_macro,lunlun_software,xiongxiong_duokai --count 1 --tag <tag> --require-r0b --require-holdout --expect-ep origin_macro=0x13e0,lunlun_software=0x1656f4,xiongxiong_duokai=0x35000
-# R3 formal 10x (only if deliberately re-scheduled):
-python tools\_r3_gate_run.py
 ```
