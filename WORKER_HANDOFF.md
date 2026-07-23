@@ -165,11 +165,20 @@ mida dump-process <sample> --pure-rebuild
 - **Path:** still OEP found → IAT **305** slots traced → dump 17 sections (not degraded Lunlun path)
 - Candidate SHA varies with ASLR (expected); structural gates stable
 
+### GTO experimental baseline (Phase 1 — record only)
+
+- **Evidence:** `D:\MidaVault\lab\evidence\gto_launcher\live_20260723-164707_p1exp\`
+- **CLI:** `/unpack … --profile=ahk-gto-experimental --data-sections --no-shrink -v` → **exit 0**, ~67s
+- **Candidate:** size `16445952`, sha256 `2bdd7cb29a4793079f9f209ec3f6ebf78520caac995d41d61d909743e652a6fe`
+- **R0B:** `StructuralPassBehaviorPending`, failures `[]` (analysis_reference observation only)
+- **Path:** post-attach IAT OK → OEP observe **timeout 60s** → .text scan OEP `0x1400070b0` → IAT rebuild **545/572** → container/bootstrap `.boot` EP `0xecc000` → dump 11 sections
+- **Not production:** experimental profile only; SecurityCookie fail-closed; CRT wrapper not patchable
+
 ## Suggested next slices
 
-1. **Commit** hardening (cli storm/exit + themida guard + docs); exclude vault PE and temp `tools/_*.py`.
-2. **Phase 1 remainder:** GTO experimental baseline; optional Lunlun OEP/IAT quality; optional `--pure-rebuild` structural compare.
-3. **Dali** OOS notes (low priority).
+1. ~~**Commit** hardening~~ → `eaf8468` (cli storm/exit + themida guard + docs).
+2. ~~**GTO experimental baseline**~~ → `live_20260723-164707_p1exp` (StructuralPass; residual cookie/CRT/OEP-timeout).
+3. **Optional Phase 1 polish:** Dali OOS one-pager; Lunlun OEP/IAT quality; `--pure-rebuild` structural compare on Origin.
 4. **R1-F (optional):** host-resolved IAT → pure import builder.
 5. **R2:** runtime event / replay skeleton (blocker for clean R3 plugin).
-6. Flip default pure only after live pure ≥ legacy structural quality on Origin+Lunlun.
+6. Flip default pure only after live pure ≥ legacy structural quality on Origin+Lunlun; **never** default `ahk-gto-experimental`.

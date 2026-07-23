@@ -139,7 +139,7 @@ CLI 表面：
 | **TLS global_vars 未用于恢复** | 复杂 TLS 样本风险 | **中** |
 | **R1-B..E 未提交 / 文档漂移** | ~~已关闭~~（`52c4eee` + 文档对齐） | **已处理** |
 | **本机 shell 无 vcvars** | ~~已关闭~~（`tools/_enter_msvc_env.ps1`） | **已处理** |
-| **四样品 live 证据包未固化** | Origin+Lunlun 已固化；**GTO 仍缺**；Lunlun 质量 residual 高 | **中（P1 进行中）** |
+| **四样品 live 证据包未固化** | Origin+Lunlun+GTO(exp) 已固化；Dali OOS；Lunlun/GTO residual 高 | **低（P1 证据主线基本齐）** |
 | **CONTEXT_ALL SetThreadContext** | ~~已关闭~~（core CONTROL\|INTEGER） | **已处理（Origin 首通依赖）** |
 | **Dali 明确 out_of_scope** | 四样品中一枚不做完美承诺 | **范围** |
 
@@ -260,7 +260,8 @@ mida-acceptance check-static <scratch>\origin_u.exe --report <scratch>\origin_r0
 | **Origin R0B candidate** | **`StructuralPassBehaviorPending`，failures=[]**（oracle 仅观察） |
 | **Lunlun live unpack** | **`live_20260723-163436_p1fix3` exit 0；size 12980224；sha256 `dd44d9ca…c380`** |
 | **Lunlun R0B candidate** | **`StructuralPassBehaviorPending`，failures=[]**（无 oracle；degraded OEP/IAT） |
-| GTO live | **未执行（P1 下一步）** |
+| **GTO experimental** | **`live_20260723-164707_p1exp` exit 0；size 16445952；sha256 `2bdd7cb2…a6fe`** |
+| **GTO R0B candidate** | **`StructuralPassBehaviorPending`，failures=[]**（experimental；cookie/CRT residual） |
 | pure-rebuild live compare | **未执行** |
 
 #### Origin 首通关键路径（vault）
@@ -287,6 +288,16 @@ mida-acceptance check-static <scratch>\origin_u.exe --report <scratch>\origin_r0
 | 成功阶段 | storm escape → forced OEP `0x1401656f4` → skip v3 → dump 14 sec → R0B StructuralPass |
 | 质量 residual | IAT rebuild **41/352**；无 v3-trace；虚拟化 OEP；**非** Origin 级恢复 |
 | 非目标达成 | **非** Behavioral `Accepted`；**非** 完整 IAT 解密 |
+
+#### GTO experimental 基线（vault；非 Oreans 生产）
+
+| 项 | 值 |
+|----|-----|
+| 证据目录 | `D:\MidaVault\lab\evidence\gto_launcher\live_20260723-164707_p1exp\` |
+| 命令 | `--profile=ahk-gto-experimental --data-sections --no-shrink -v` |
+| 成功阶段 | post-attach IAT → OEP 60s timeout → scan OEP → IAT 545/572 → bootstrap `.boot` → R0B StructuralPass |
+| WARN residual | SecurityCookie fail-closed；CRT wrapper not patchable；OEP observation timeout |
+| 非目标达成 | **非** 默认 profile；**非** R3 Oreans 门；**非** Behavioral `Accepted` |
 
 ---
 
@@ -335,7 +346,7 @@ mida-acceptance check-static <scratch>\origin_u.exe --report <scratch>\origin_r0
 | Origin | legacy unpack；R0B；oracle 观察 | **✅ `live_20260723-132326` StructuralPass** | candidate SHA、r0b、notes、unpack log |
 | Origin pure | 同 capture 或同输入 `--pure-rebuild` 对照 | ⬜ 未做 | structural diff vs legacy |
 | Lunlun | unpack + R0B（无 oracle） | **✅ `live_20260723-163436_p1fix3` StructuralPass（degraded）** | 同上 + residual 质量说明 |
-| GTO | `--profile=ahk-gto-experimental` | ⬜ **下一步** | 阶段矩阵 + 失败点 |
+| GTO | `--profile=ahk-gto-experimental` | **✅ `live_20260723-164707_p1exp` StructuralPass（experimental residual）** | 阶段矩阵 + WARN 点（notes） |
 | Dali | static + OOS 笔记 | ⬜ 低优先级 | 一页研究笔记 |
 
 交付模板：`D:\MidaVault\lab\evidence\<case_id>\<run_id>\`
@@ -343,7 +354,7 @@ mida-acceptance check-static <scratch>\origin_u.exe --report <scratch>\origin_r0
 - `candidate.sha256`, `r0b_candidate.json`, `unpack.stdout.txt`, `notes.md`, `run_meta.json`  
 - **禁止** exe 进 Git  
 
-**出口（更新）：** Origin + Lunlun 均已 ≥1 次 StructuralPass；完整出口仍需 Lunlun IAT/OEP 质量提升 + Origin 稳定性抽检（建议 ≥3 次）+ GTO 基线。
+**出口（更新）：** Origin + Lunlun + GTO(experimental) 均已 ≥1 次 StructuralPass；Origin ×3 无回归已做。完整质量出口仍可选：Lunlun IAT/OEP 提升、pure-rebuild 对照、Dali OOS 笔记。
 
 ### Phase 2 — R1 收口（可选 R1-F，1–2 周）
 
@@ -450,13 +461,13 @@ M6  R4 第二族插件 + 1.0 评审
 - [x] Origin ×3 稳定性抽检（`STABILITY_20260723_p1smoke.md`；3/3 StructuralPass）  
 - [ ] 同样品 `--pure-rebuild` 对照；记 structural mismatches  
 - [ ] 确认 ScyllaHide x64 哈希与现场二进制一致  
-- [ ] 提交 storm/exit + guard 硬化（工作区仍脏；Origin 无回归已验证）  
+- [x] 提交 storm/exit + guard 硬化（`eaf8468`；Origin ×3 无回归已验证）  
 - [ ] Lunlun OEP/IAT 质量提升后再 smoke（非阻塞结构门）  
 
 
 ### Week 2
 
-- [ ] GTO experimental 一次受控跑；只记录不修花  
+- [x] GTO experimental 一次受控跑；只记录不修花（`live_20260723-164707_p1exp`）  
 - [ ] Dali 一页 OOS 说明  
 - [ ] 起草 `PackerPlugin` + Runtime 接口草图（docs PR）  
 - [ ] R2 切片 0：从 `unpacker` 抽出 event loop 状态机接口（行为不变）  
