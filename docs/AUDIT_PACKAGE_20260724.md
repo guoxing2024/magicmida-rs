@@ -2,7 +2,7 @@
 
 **Audience:** human auditor / acceptance only (no operator required for re-run).  
 **Branch:** `baseline/legacy-recovery-20260722`  
-**HEAD at package open:** `e99cda6` (post_attach extract + unattended plan)  
+**HEAD at package freeze:** `f66e157` (LoopState extract + this package)  
 **Validation summary task:** still **VNEXT-R4** (not VNEXT-BEH)
 
 Plan source: [UNATTENDED_EXECUTION_PLAN.md](UNATTENDED_EXECUTION_PLAN.md)  
@@ -45,6 +45,8 @@ Handoff: [WORKER_HANDOFF.md](../WORKER_HANDOFF.md)
 | lunlun_software 1× | `batch_20260724-011721_u1_lunlun_reg` | EP `0x1656f4`, R0B Pending |
 | gto_launcher 1× | `batch_20260724-011543_u1_post_attach_gto` | family=ahk_gto conf=80 EP `0xecc000`, R0B Pending |
 | xiongxiong_duokai 1× | `batch_20260724-011818_u1_holdout_reg` | EP `0x35000`, R0B Pending |
+| origin after loop_state | `batch_20260724-012108_u1_loop_state_origin` | EP `0x13e0`, IAT 295/295, R0B Pending |
+| gto after loop_state | `batch_20260724-012147_u1_loop_state_gto` | EP `0xecc000`, family=ahk_gto, R0B Pending |
 | B-A3 synthetic | `lab/behavior/evidence/batch_20260724-011835_ba3` | all_ok; check-static never Accepted |
 
 Non-claims: not R3 10×, not R4 re-gate, not Behavioral Accepted, not pure default.
@@ -86,6 +88,7 @@ Expect: tests green; Origin+GTO engineering smokes exit 0; `validation_summary.j
 | Module | Role |
 |--------|------|
 | `mod.rs` | debug loop + unpack orchestration (~1.3k lines) |
+| `loop_state.rs` | debug-loop mutable tracking fields |
 | `post_attach.rs` | no-debug-port observe/freeze/dump |
 | `post_loop.rs` | IAT / post-process / dump |
 | `early_snapshots.rs` | zero-raw `.data` baseline |
@@ -103,3 +106,25 @@ Expect: tests green; Origin+GTO engineering smokes exit 0; `validation_summary.j
 5. Explicit multi-family load/behavior criteria beyond R0B structural.
 
 Until then, the correct public status remains: **vNext research baseline with closed structural gates R0B–R4 and open behavioral product gate.**
+
+---
+
+## 8. Unattended freeze decision (2026-07-24)
+
+Safe engineering slices that reduce perfect-unpack distance **without** false
+pure/VNEXT-BEH claims are exhausted for this pass:
+
+- Host thin-split: post_loop, early_snapshots, post_attach, loop_state — done.
+- Oreans Origin + Lunlun + holdout 1× engineering + GTO experimental 1× — green.
+- B-A3 synthetic compose — green; `validation_summary` intentionally still VNEXT-R4.
+- ScyllaHide x86 — blocked on missing trusted binaries (documented residual).
+
+**Next human decision points (not auto-executed):**
+
+1. Approve vault-bound behavioral probe design for real candidates → schedule B-B.  
+2. Approve pure default flip (currently explicit No).  
+3. Supply trusted ScyllaHide x86 helpers → fill hashes.  
+4. Fund independent GTO host (beyond shared ThemidaState).
+
+Auditor may accept this package as **structural multi-family research baseline complete**;  
+do **not** accept as product 1.0 / perfect unpack.

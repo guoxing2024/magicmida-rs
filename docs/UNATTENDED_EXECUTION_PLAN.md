@@ -182,4 +182,4 @@ Behavioral Accepted, **not** pure default.
 |----------|--------------|-------|--------|
 | 2026-07-24 | 4ac8edd | Plan open; prior post_loop+early_snapshots | baseline |
 | 2026-07-24 | e99cda6 | U1 post_attach extract + dual_select green | Origin `…011521`; GTO `…011543`; Lunlun `…011721`; holdout `…011818`; B-A3 `…011835` |
-| 2026-07-24 | (loop_state) | U1 LoopState module + Scylla x86 residual note + audit package | engineering smokes re-run after extract |
+| 2026-07-24 | f66e157 | U1 LoopState + Scylla x86 residual note + audit package | Origin `…012108`; GTO `…012147`; freeze for human audit (R-BEH blocks 1.0) |
