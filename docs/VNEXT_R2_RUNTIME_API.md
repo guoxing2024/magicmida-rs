@@ -1,6 +1,8 @@
-# VNEXT-R2 Runtime / Event Engine — API Sketch (Slice 0)
+# VNEXT-R2 Runtime / Event Engine
 
-Status: **docs-only Slice 0** (2026-07-23). No production path change.
+Status: **Slice 1 landed** (2026-07-23) — address newtypes in `mida-core::addr`.
+Slice 0 was docs-only; production unpacker/dumper still use raw bases until
+later slices adopt types incrementally.
 Prerequisites: R0B + R1 closed; Phase2 pure opt-in with flip=**No**.
 
 ## Goals
@@ -40,31 +42,23 @@ Va  = RuntimeBase + Rva          // live map
 // (Phase2 bug class; fixed by host-patched preferred base)
 ```
 
-Suggested Rust shape (future `mida-core` or small `mida-addr` module):
+### Implementation (Slice 1)
 
-```rust
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PreferredBase(pub u64);
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RuntimeBase(pub u64);
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Rva(pub u32);
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Va(pub u64);
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FileOffset(pub u32);
+Module: `mida_core::addr` (re-exported at crate root).
 
-impl Va {
-    pub fn from_runtime(base: RuntimeBase, rva: Rva) -> Self {
-        Self(base.0.wrapping_add(rva.0 as u64))
-    }
-    pub fn to_rva(self, base: RuntimeBase) -> Option<Rva> {
-        self.0.checked_sub(base.0).and_then(|d| u32::try_from(d).ok()).map(Rva)
-    }
-}
-```
+| Type | Notes |
+|------|--------|
+| `PreferredBase` | PE ImageBase preferred; dump emit |
+| `RuntimeBase` | Live ASLR / CreateProcess base |
+| `Rva` / `Va` / `FileOffset` | as sketched |
+| `Va::from_runtime` / `to_rva` | live map |
+| `Va::from_preferred` / `to_rva_preferred` | preferred layout |
+| `Va::rebase_to_preferred` | hardcoded-address fix formula |
 
-Slice 0 does **not** implement these types in product crates yet.
+Unit tests cover live/preferred round-trips, below-base / u32 overflow rejection,
+and the Phase2 “must not treat runtime as preferred” distinction.
+
+**Not yet:** unpacker/dumper call sites still pass raw `u64` (incremental adopt).
 
 ---
 
@@ -198,18 +192,24 @@ pub enum UnpackPhase {
 
 | Stage | Work | Behavior change? |
 |-------|------|------------------|
-| **Slice 0** | This doc + handoff/roadmap pointers | No |
-| **Slice 1** | Address newtypes module + unit tests; docs freeze conversions | No live |
+| **Slice 0** | API doc + handoff/roadmap pointers | No |
+| **Slice 1** | Address newtypes in `mida-core::addr` + unit tests | No live |
 | **Slice 2** | `RuntimeEngine` wraps existing unpacker loop (adapter); CLI calls engine | No if careful |
 | **Slice 3** | Extract Themida policy behind `PackerPlugin` | No if careful |
 | **Slice 4** | Replay backend + synthetic guard→OEP skeleton test | Test-only |
 
-**Slice 0 exit criteria (this doc):**
+**Slice 0 exit criteria:**
 
 - [x] Address type names and conversion rules written
 - [x] Map current `DebuggerCore` / lifecycle / unpacker ownership
 - [x] Sketch `RuntimeEngine`, backend, `PackerPlugin`
 - [x] Explicit non-goals and migration stages
+
+**Slice 1 exit criteria:**
+
+- [x] `mida_core::{PreferredBase, RuntimeBase, Rva, Va, FileOffset}`
+- [x] Conversion helpers + unit tests (including preferred≠runtime)
+- [x] Docs updated; **no** required call-site migration yet
 
 ---
 

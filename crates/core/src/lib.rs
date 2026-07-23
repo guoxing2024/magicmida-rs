@@ -5,7 +5,11 @@
 //! This crate provides the foundational types and traits for the Themida
 //! unpacker. It contains no packer-specific logic — it is the generic
 //! debugging layer that the `packers` crate builds on top of.
+//!
+//! R2 adds pure address newtypes ([`addr`]) so preferred ImageBase and ASLR
+//! runtime base are not mixed as raw `u64`.
 
+pub mod addr;
 pub mod breakpoint;
 pub mod cleanup;
 pub mod debug_event_lifecycle;
@@ -15,6 +19,7 @@ pub mod process;
 pub mod windows_debugger;
 
 // Re-export commonly used types.
+pub use addr::{FileOffset, PreferredBase, RuntimeBase, Rva, Va};
 pub use breakpoint::{HwBreakpoint, HwbpType, SoftBpAction};
 pub use cleanup::{cleanup_action, CleanupAction, CleanupReport, ProcessOwnership, WaitOutcome};
 pub use debug_event_lifecycle::{

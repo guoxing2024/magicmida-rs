@@ -477,7 +477,8 @@ M6  R4 第二族插件 + 1.0 评审
 - [x] Dali 一页 OOS 说明（`lab/evidence/dali_plugin/OOS_20260723.md`）  
 - [x] Phase2 收口：Lunlun pure smoke + flip=No（`PHASE2_CLOSE_20260723.md`；git `3652412`/`3858896`）  
 - [x] 起草 `PackerPlugin` + Runtime 接口草图（`docs/VNEXT_R2_RUNTIME_API.md` R2-Slice0）  
-- [ ] R2 切片 1+：地址 newtype / engine 适配器 / replay 骨架（行为不变优先）  
+- [x] R2 切片 1：`mida_core::addr` 地址 newtype + 单测（行为不变）  
+- [ ] R2 切片 2+：engine 适配器 / replay 骨架（行为不变优先）  
 
 ---
 
