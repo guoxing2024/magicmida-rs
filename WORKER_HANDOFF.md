@@ -1,4 +1,4 @@
-# WORKER_HANDOFF - R2 CLI pump on DebuggerCoreEngine
+# WORKER_HANDOFF - R2 Slice3 PackerPlugin stub
 
 ## Summary
 
@@ -6,14 +6,13 @@ Phase2 closed (flip=No). R2 progress:
 
 | Slice | Deliverable |
 |-------|-------------|
-| 1 | `mida_core::addr` newtypes |
-| 2 | `RuntimeEngine` + `ReplayRuntimeEngine` |
-| 2b | `DebuggerCoreEngine<D>` |
-| **CLI** | `ProcessSession` wait/continue via engine; Origin smoke OK |
+| 1–2b | addr + RuntimeEngine + DebuggerCoreEngine |
+| CLI pump | ProcessSession → engine; Origin smoke OK |
+| **3 stub** | `mida_core::PackerPlugin` + `ThemidaPlugin` identify |
 
 Docs: [VNEXT_R2_RUNTIME_API.md](docs/VNEXT_R2_RUNTIME_API.md).
-Evidence: `origin_macro/live_20260723-181813_r2cli` StructuralPass (legacy dump).
-**Next:** PackerPlugin trait stub, or incremental `addr` adopt at dump ImageBase.
+**Not done:** plugin-driven live unpack (cli/unpacker still owns policy).
+**Next:** Slice 3b migrate policy carefully, or `IdentifyInput` from PeHeader helper.
 
 ## R1-E deliverables (this slice)
 

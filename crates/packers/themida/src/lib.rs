@@ -28,6 +28,7 @@ pub mod guard;
 pub mod iat;
 pub mod init;
 pub mod oep;
+pub mod plugin;
 pub mod postprocess;
 pub mod text_tracer;
 pub mod trace_imports;
@@ -56,6 +57,7 @@ pub use iat::{
     IatFixStrategy, IatLocation,
 };
 pub use init::{init_pe_details, locate_themida_section, ThemidaPeInfo};
+pub use plugin::ThemidaPlugin;
 pub use oep::{
     cookie_complement_from_security_init_xrefs, decode_msvc_oep_wrapper, encode_msvc_oep_wrapper,
     find_cookie_complement_site, find_real_oep_by_scanning, find_real_oep_in_bytes,

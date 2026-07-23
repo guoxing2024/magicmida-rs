@@ -127,36 +127,17 @@ pub trait DebugBackend {
 
 ---
 
-## PackerPlugin trait (sketch)
+## PackerPlugin (Slice 3 stub — landed)
 
-```rust
-pub trait PackerPlugin {
-    fn family_id(&self) -> &'static str;
-    fn identify(&self, pe: &PeView) -> IdentifyResult;
+| Item | Location | Status |
+|------|----------|--------|
+| `PackerPlugin` + `IdentifyInput` / `PluginCtx` / advice types | `mida_core::plugin` | ✅ |
+| `NullPackerPlugin` | `mida_core` | ✅ |
+| `ThemidaPlugin` identify + stub `on_event` | `mida_packers_themida::plugin` | ✅ |
+| CLI driven by plugin | — | ❌ not wired (live loop still `cli/unpacker`) |
 
-    /// Called after CreateProcess / module loads; may install BPs / guards.
-    fn on_event(&mut self, ctx: &mut PluginCtx, ev: &EngineEvent) -> PluginAdvice;
-
-    /// Advise when to dump and with which host dump options.
-    fn dump_advice(&self, ctx: &PluginCtx) -> Option<DumpAdvice>;
-}
-
-pub enum PluginAdvice {
-    Continue(ContinueStatus),
-    /// Request engine to stop pump for IAT/dump phase (OEP found, etc.)
-    Transition(UnpackPhase),
-    Abort(PluginError),
-}
-
-pub enum UnpackPhase {
-    Observe,
-    GuardActive,
-    OepCandidate,
-    IatTrace,
-    Dump,
-    Done,
-}
-```
+Identify uses **host-prepared** `IdentifyInput` (section names, EP, arch) so
+`mida-core` does not depend on `mida-pe`.
 
 ### What plugins must not do
 
@@ -184,7 +165,8 @@ pub enum UnpackPhase {
 | **Slice 1** | Address newtypes in `mida-core::addr` + unit tests | No live |
 | **Slice 2** | `RuntimeEngine` + `ReplayRuntimeEngine`; CLI still on `DebuggerCore` | No live |
 | **Slice 2b** | Live adapter; optional CLI pump switch (behavior-preserving) | No if careful |
-| **Slice 3** | Extract Themida policy behind `PackerPlugin` | No if careful |
+| **Slice 3** | `PackerPlugin` trait + Themida identify stub (no live drive) | No |
+| **Slice 3b** | Migrate unpacker policy into plugin `on_event` | Careful + smoke |
 | **Slice 4** | Expand replay skeleton (mem script / guard→OEP) | Test-only |
 
 **Slice 0 exit criteria:**
@@ -207,6 +189,12 @@ pub enum UnpackPhase {
 - [x] Synthetic create→guard_av→oep_bp→exit skeleton test
 - [x] Live `DebuggerCoreEngine` adapter + unit tests
 - [x] CLI `ProcessSession` pump migration + Origin legacy StructuralPass smoke
+
+**Slice 3 stub exit criteria:**
+
+- [x] `PackerPlugin` in `mida-core` (object-safe, no pe/acceptance deps)
+- [x] `ThemidaPlugin` identify heuristics + unit tests
+- [x] Explicit: CLI **not** controlled by plugin yet
 
 ---
 

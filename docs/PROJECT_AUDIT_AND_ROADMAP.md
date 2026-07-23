@@ -481,7 +481,8 @@ M6  R4 第二族插件 + 1.0 评审
 - [x] R2 切片 2：`RuntimeEngine` + `ReplayRuntimeEngine` + 合成 guard→OEP 骨架测  
 - [x] R2 切片 2b：`DebuggerCoreEngine` live 适配器  
 - [x] R2 CLI pump：`ProcessSession` → engine；Origin smoke `live_20260723-181813_r2cli`  
-- [ ] R2 后续：PackerPlugin stub / addr 在 dump 边界逐步采用  
+- [x] R2 Slice3 stub：`PackerPlugin` + `ThemidaPlugin` identify（CLI 未接控制流）  
+- [ ] R2 后续：plugin 驱动 unpack 迁移 / addr 在 dump 边界采用  
 
 ---
 
