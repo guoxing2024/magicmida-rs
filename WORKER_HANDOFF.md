@@ -144,11 +144,32 @@ mida dump-process <sample> --pure-rebuild
   - `crates/core/src/windows_debugger.rs` — prefer `CONTEXT_CONTROL|INTEGER` over `CONTEXT_ALL`/XSAVE for Get/SetThreadContext; SuspendThread retry; OpenThread GET|SET|SUSPEND
   - Win11 failure mode was `SetThreadContext` → `ERROR_NOACCESS` (0x800703E6) during virtualized OEP and IAT v3-trace
 
+### Lunlun live unpack (Phase 1 — second structural pass, degraded path)
+
+- **Evidence:** `D:\MidaVault\lab\evidence\lunlun_software\live_20260723-163436_p1fix3\`
+- **CLI:** same flags → **exit 0**, ~6.45s
+- **Candidate:** size `12980224`, sha256 `dd44d9ca607aa15bf650900f51ad2dc22918665bd560b25b68aa9a52ac14c380`
+- **R0B:** `StructuralPassBehaviorPending`, failures `[]` (no oracle)
+- **Path (degraded):** virtualized OEP → null-AV storm escape → forced OEP `0x1401656f4` → process ExitProcess during IAT wait → **skip v3-trace** → dump 14 sections; IAT rebuild **41/352** → original import table
+- **Unblock fixes (worktree, not yet committed):**
+  - `crates/packers/themida/src/guard.rs` — early NotGuarded if fault outside `.text`
+  - `crates/cli/src/unpacker/av_handler.rs` — null-storm (≥8) accept last PossibleOEP; skip in-loop v3-trace when process exited
+  - `crates/cli/src/unpacker/mod.rs` — `process_exited` / `unrelated_av_streak`; post-loop skip V3 IAT trace when exited
+- **Quality residual:** not Origin-class IAT recovery; structural pass only
+
+### Origin stability ×3 (post-Lunlun hardening — no regression)
+
+- **Index:** `D:\MidaVault\lab\evidence\origin_macro\STABILITY_20260723_p1smoke.md`
+- **Runs:** `live_20260723-164243_p1smoke`, `…-164314_p1smoke2`, `…-164339_p1smoke3`
+- **Result:** **3/3** exit 0, size `13746176`, R0B `StructuralPassBehaviorPending` failures `[]`
+- **Path:** still OEP found → IAT **305** slots traced → dump 17 sections (not degraded Lunlun path)
+- Candidate SHA varies with ASLR (expected); structural gates stable
+
 ## Suggested next slices
 
-1. **Commit debugger context hardening** after quick regression (core tests / Origin re-smoke).
-2. **Phase 1 continue:** Lunlun live unpack + R0B; Origin ×3 stability; optional `--pure-rebuild` structural compare.
-3. **GTO** experimental profile only; **Dali** OOS notes.
+1. **Commit** hardening (cli storm/exit + themida guard + docs); exclude vault PE and temp `tools/_*.py`.
+2. **Phase 1 remainder:** GTO experimental baseline; optional Lunlun OEP/IAT quality; optional `--pure-rebuild` structural compare.
+3. **Dali** OOS notes (low priority).
 4. **R1-F (optional):** host-resolved IAT → pure import builder.
 5. **R2:** runtime event / replay skeleton (blocker for clean R3 plugin).
 6. Flip default pure only after live pure ≥ legacy structural quality on Origin+Lunlun.

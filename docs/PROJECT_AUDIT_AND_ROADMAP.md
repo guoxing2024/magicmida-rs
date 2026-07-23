@@ -1,9 +1,9 @@
 # MagicMida vNext — 项目审计与后续规划（Windows 复审）
 
-**审计日期:** 2026-07-23（Windows 复审 + Phase 0 绿测 + Origin live 首通）  
+**审计日期:** 2026-07-23（Windows 复审 + Phase 0 绿测 + Origin/Lunlun live StructuralPass）  
 **基线分支:** `baseline/legacy-recovery-20260722`  
-**HEAD:** `52c4eee` + 工作区：`WindowsDebugger` CONTROL|INTEGER context 硬化（未提交）  
-**工作区:** R1-A..E 已提交；**Origin live unpack + R0B StructuralPass 已固化**；Lunlun/GTO live 仍开放  
+**HEAD:** `52c4eee` + 工作区：CONTROL|INTEGER context + Lunlun null-storm/exit 硬化（未提交）  
+**工作区:** R1-A..E 已提交；**Origin + Lunlun live unpack + R0B StructuralPass 已固化**；GTO live 仍开放  
 **主机:** Windows 11；仓库 `D:\Claude project\magicmida-rs`；vault `D:\MidaVault`  
 **环境事实:** VS 2022 Professional MSVC 14.44；`tools/_rebuild_cli.cmd`；
 `CARGO_TARGET_DIR=D:\MidaVault\scratch\cargo-target`；
@@ -20,7 +20,7 @@ P0 workspace 绿测已固化。样品在 vault，v2 verify 绿。
 | v2 合约 | 文档层 | `verify_manifests.py` → `overall_ok: true`（5 manifests / 7 objects） |
 | R0B 测试 | 历史记录 | **本机 `cargo test -p mida-acceptance --offline` 全绿** |
 | R1 pe 测试 | 未在本机 | **MSVC 14.44 下 workspace 412 全绿** |
-| live unpack | 跳过 | **Origin live 首通**（`live_20260723-132326`，exit 0，R0B StructuralPass） |
+| live unpack | 跳过 | **Origin + Lunlun** live StructuralPass（Lunlun 为 degraded path） |
 | R1-E 状态 | handoff “closed” vs roadmap “in progress” | **已对齐：合成 corpus closed；live + default flip 开放** |
 | SetThreadContext | 未记录 | **根因：CONTEXT_ALL/XSAVE → Win11 ERROR_NOACCESS；改为 CONTROL\|INTEGER + Suspend 重试** |
 
@@ -139,7 +139,7 @@ CLI 表面：
 | **TLS global_vars 未用于恢复** | 复杂 TLS 样本风险 | **中** |
 | **R1-B..E 未提交 / 文档漂移** | ~~已关闭~~（`52c4eee` + 文档对齐） | **已处理** |
 | **本机 shell 无 vcvars** | ~~已关闭~~（`tools/_enter_msvc_env.ps1`） | **已处理** |
-| **四样品 live 证据包未固化** | Origin 已固化；**Lunlun/GTO 仍缺** | **高（P1 进行中）** |
+| **四样品 live 证据包未固化** | Origin+Lunlun 已固化；**GTO 仍缺**；Lunlun 质量 residual 高 | **中（P1 进行中）** |
 | **CONTEXT_ALL SetThreadContext** | ~~已关闭~~（core CONTROL\|INTEGER） | **已处理（Origin 首通依赖）** |
 | **Dali 明确 out_of_scope** | 四样品中一枚不做完美承诺 | **范围** |
 
@@ -195,7 +195,8 @@ CLI 表面：
 #### B. Lunlun Software（Oreans 开发样品）
 
 - **目标：** 无 oracle 下的独立结构 +（未来）行为门；防 Origin 过拟合。  
-- **风险：** 节/版本启发式差异；IAT 边界；shrink 误删。
+- **风险：** 节/版本启发式差异；IAT 边界；shrink 误删。  
+- **基线（2026-07-23）：** `live_20260723-163436_p1fix3` → R0B StructuralPass（**degraded**：forced OEP + IAT 41/352 + 无 v3-trace）。
 
 #### C. GTO Launcher（AHK/GTO 研究）
 
@@ -257,7 +258,9 @@ mida-acceptance check-static <scratch>\origin_u.exe --report <scratch>\origin_r0
 | `cargo test --workspace`（P0） | **412 passed**（MSVC 环境） |
 | **Origin live unpack** | **`live_20260723-132326` exit 0；size 13746176；sha256 `0c0923e3…a58efbb`** |
 | **Origin R0B candidate** | **`StructuralPassBehaviorPending`，failures=[]**（oracle 仅观察） |
-| Lunlun / GTO live | **未执行（P1 下一步）** |
+| **Lunlun live unpack** | **`live_20260723-163436_p1fix3` exit 0；size 12980224；sha256 `dd44d9ca…c380`** |
+| **Lunlun R0B candidate** | **`StructuralPassBehaviorPending`，failures=[]**（无 oracle；degraded OEP/IAT） |
+| GTO live | **未执行（P1 下一步）** |
 | pure-rebuild live compare | **未执行** |
 
 #### Origin 首通关键路径（vault）
@@ -272,6 +275,19 @@ mida-acceptance check-static <scratch>\origin_u.exe --report <scratch>\origin_r0
 | 成功阶段 | OEP found → IAT 305 slots traced → dump 17 sections → R0B StructuralPass |
 | 非目标达成 | **非** Behavioral `Accepted`；**非** 与 oracle 字节一致 |
 
+#### Lunlun StructuralPass 关键路径（vault）
+
+| 项 | 值 |
+|----|-----|
+| 证据目录 | `D:\MidaVault\lab\evidence\lunlun_software\live_20260723-163436_p1fix3\` |
+| 失败/挂死 run | `live_…-161107_p1`（null storm）；`…-162228_p1fix` / `…-162742_p1fix2`（exit 后 v3-trace 挂） |
+| 失败模式 A | null-AV `fault=0x0` 被误判 guard hit → 风暴 |
+| 失败模式 B | OEP fallback 后 ExitProcess，仍进 IAT v3-trace → 挂死 |
+| 修复 | guard 域外 NotGuarded；null-storm≥8 接受 last PossibleOEP；`process_exited` 跳过 v3-trace |
+| 成功阶段 | storm escape → forced OEP `0x1401656f4` → skip v3 → dump 14 sec → R0B StructuralPass |
+| 质量 residual | IAT rebuild **41/352**；无 v3-trace；虚拟化 OEP；**非** Origin 级恢复 |
+| 非目标达成 | **非** Behavioral `Accepted`；**非** 完整 IAT 解密 |
+
 ---
 
 ## 5. 架构健康度评分（主观但可辩护）
@@ -283,11 +299,11 @@ mida-acceptance check-static <scratch>\origin_u.exe --report <scratch>\origin_r0
 | 纯 PE 方向 | 4 | R1 实现深，未提交/未默认切换；pe 测本 shell 未链 |
 | 运行时抽象 | 2 | 仍是 Win32 调试器直连 + cli 大循环；context 标志已硬化 |
 | 插件化 | 2 | themida crate 存在，非 R3 插件契约 |
-| 样品工程 | **5** | v2 + vault 绿；**Origin live 证据包已固化** |
-| 过程/仓库卫生 | 4 | 策略好；context 修复待提交；临时 tools 不入库 |
-| 距“完美脱壳” | 2 | Origin 结构候选通过；行为与多族未闭环 |
+| 样品工程 | **5** | v2 + vault 绿；**Origin+Lunlun live 证据包已固化** |
+| 过程/仓库卫生 | 4 | 策略好；context/storm 修复待提交；临时 tools 不入库 |
+| 距“完美脱壳” | 2 | Origin/Lunlun 结构候选通过；Lunlun 质量 residual；行为与多族未闭环 |
 
-**综合：** 方向正确、R0B/R1 地基扎实；**Origin 已从 “live 失败” 升到 “结构门通过”**。主阻塞：**(1) P1 剩余样品 live 证据** → **(2) 提交 debugger context 修复 + 稳定性** → **(3) R2 事件引擎** → **(4) R3 Oreans 10× 闭环** → **(5) 独立行为验收**。
+**综合：** 方向正确、R0B/R1 地基扎实；**Origin + Lunlun 已结构门通过**（Lunlun 为 degraded）。主阻塞：**(1) Lunlun OEP/IAT 质量 + GTO** → **(2) 提交 debugger/storm 修复 + 稳定性** → **(3) R2 事件引擎** → **(4) R3 Oreans 10× 闭环** → **(5) 独立行为验收**。
 
 ---
 
@@ -318,8 +334,8 @@ mida-acceptance check-static <scratch>\origin_u.exe --report <scratch>\origin_r0
 |------|------|------|--------------------|
 | Origin | legacy unpack；R0B；oracle 观察 | **✅ `live_20260723-132326` StructuralPass** | candidate SHA、r0b、notes、unpack log |
 | Origin pure | 同 capture 或同输入 `--pure-rebuild` 对照 | ⬜ 未做 | structural diff vs legacy |
-| Lunlun | unpack + R0B（无 oracle） | ⬜ **下一步** | 同上模板 |
-| GTO | `--profile=ahk-gto-experimental` | ⬜ | 阶段矩阵 + 失败点 |
+| Lunlun | unpack + R0B（无 oracle） | **✅ `live_20260723-163436_p1fix3` StructuralPass（degraded）** | 同上 + residual 质量说明 |
+| GTO | `--profile=ahk-gto-experimental` | ⬜ **下一步** | 阶段矩阵 + 失败点 |
 | Dali | static + OOS 笔记 | ⬜ 低优先级 | 一页研究笔记 |
 
 交付模板：`D:\MidaVault\lab\evidence\<case_id>\<run_id>\`
@@ -327,7 +343,7 @@ mida-acceptance check-static <scratch>\origin_u.exe --report <scratch>\origin_r0
 - `candidate.sha256`, `r0b_candidate.json`, `unpack.stdout.txt`, `notes.md`, `run_meta.json`  
 - **禁止** exe 进 Git  
 
-**出口（更新）：** Origin 已满足 ≥1 次可复现 StructuralPass；完整出口仍需 Lunlun 量化 + Origin 稳定性抽检（建议 ≥3 次）。
+**出口（更新）：** Origin + Lunlun 均已 ≥1 次 StructuralPass；完整出口仍需 Lunlun IAT/OEP 质量提升 + Origin 稳定性抽检（建议 ≥3 次）+ GTO 基线。
 
 ### Phase 2 — R1 收口（可选 R1-F，1–2 周）
 
@@ -430,9 +446,13 @@ M6  R4 第二族插件 + 1.0 评审
 - [ ] 固定 VS/vcvars 开发入口；`cargo test --workspace --offline` 绿  
 - [ ] Commit R1-B..E；统一 README / R1 roadmap / handoff 状态句  
 - [ ] `validation_summary.json` → `VNEXT-R1-E`  
-- [ ] vault 物化 Origin + Lunlun；legacy unpack ×3；R0B 报告进 vault evidence  
+- [x] vault 物化 Origin + Lunlun；live unpack + R0B 证据进 vault（Origin 全路径；Lunlun degraded）  
+- [x] Origin ×3 稳定性抽检（`STABILITY_20260723_p1smoke.md`；3/3 StructuralPass）  
 - [ ] 同样品 `--pure-rebuild` 对照；记 structural mismatches  
 - [ ] 确认 ScyllaHide x64 哈希与现场二进制一致  
+- [ ] 提交 storm/exit + guard 硬化（工作区仍脏；Origin 无回归已验证）  
+- [ ] Lunlun OEP/IAT 质量提升后再 smoke（非阻塞结构门）  
+
 
 ### Week 2
 
@@ -446,10 +466,10 @@ M6  R4 第二族插件 + 1.0 评审
 ## 9. 结论
 
 1. **最终目的**是可证据化的“完美脱壳”（loader-valid + 行为等价 + 可复现 + 多族），不是单一启发式 dump。  
-2. **当前最强资产：** 独立 acceptance（R0B，本机已复验）+ 正在成型的纯 PE rebuild（R1）+ **完整 vault 四样品合约**。  
-3. **当前最强负债：** R1 未提交与文档漂移；单体调试循环；**尚无四样品 live 证据包**；无行为/replay；本机默认 shell 缺 MSVC 链接器。  
+2. **当前最强资产：** 独立 acceptance（R0B，本机已复验）+ 纯 PE rebuild（R1）+ vault 合约 + **Origin/Lunlun live StructuralPass 证据包**。  
+3. **当前最强负债：** 未提交的 debugger/storm 修复；Lunlun degraded IAT/OEP；无 GTO live；无行为/replay；单体调试循环。  
 4. **四个样品职责：** Origin/Lunlun 扛 Oreans 主线；GTO 未来第二族；Dali 明确范围外。  
-5. **下一步唯一正确顺序：** **vcvars + 固化 R1** → **真机证据包** → R2 引擎 → R3 Oreans 门禁 → 行为 Accepted → R4。  
+5. **下一步唯一正确顺序：** **提交硬化 + Lunlun 质量 / Origin 稳定性** → GTO 基线 → R2 引擎 → R3 Oreans 门禁 → 行为 Accepted → R4。  
 6. Windows 主机消除了“无法物化样品”的环境借口；**完美脱壳仍取决于证据阶梯，不取决于换了 OS。**
 
 ---

@@ -232,6 +232,25 @@ pub fn process_guarded_access(
     let text_size = text_section_end.saturating_sub(text_section_start);
     let mut old_protect = PAGE_PROTECTION_FLAGS::default();
 
+    // Early reject: unrelated AVs (null deref, heap probes, etc.) must not
+    // enter the guard VirtualProtectEx / single-step thrash.  Execute faults
+    // inside `.text` report fault_address == exception_address (or a code
+    // address in range); Themida-side probes report fault_address in `.text`.
+    // A fault outside the guarded range is not a guard hit.
+    let fault_in_text =
+        is_guarded_address(fault_address, text_section_start, text_section_end);
+    let exc_in_text =
+        is_guarded_address(exception_address, text_section_start, text_section_end);
+    if !state.ftm_guard && !fault_in_text && !(exc_type == 8 && exc_in_text) {
+        debug!(
+            fault = %format!("{fault_address:#x}"),
+            exception = %format!("{exception_address:#x}"),
+            exc_type,
+            "Ignoring non-guard AV (fault outside guarded .text)"
+        );
+        return Ok(GuardAccessResult::NotGuarded);
+    }
+
     // Temporarily restore full access so the faulting instruction can complete
     // (matches `VirtualProtectEx(..., PAGE_EXECUTE_READWRITE, ...)` in Pascal).
     // SAFETY: h_process is a valid process handle; iat_start/text_section_start is a valid virtual address; old_protect is a valid out-pointer.
@@ -300,17 +319,40 @@ pub fn process_guarded_access(
     // guarded .text region.  Same handling as branch 2: record + single-step.
     //
     // **Pascal ordering**: same as branch 2 — checked before TLS.
+    // Require the *fault* address to land in the guarded range; null / other
+    // non-text faults from Themida code are unrelated AVs (Lunlun storm).
     if exception_address >= text_section_end {
+        if !is_guarded_address(fault_address, text_section_start, text_section_end) {
+            debug!(
+                fault = %format!("{fault_address:#x}"),
+                exception = %format!("{exception_address:#x}"),
+                "Themida-side AV but fault outside .text — not a guard hit"
+            );
+            // Undo the temporary RWX so PAGE_NOACCESS stays consistent for true hits.
+            // SAFETY: same process/region as the unprotect above.
+            let _ = unsafe {
+                VirtualProtectEx(
+                    h_process,
+                    text_section_start as *const std::ffi::c_void,
+                    text_size,
+                    PAGE_NOACCESS,
+                    &mut old_protect,
+                )
+            };
+            return Ok(GuardAccessResult::NotGuarded);
+        }
         state.guard_addrs.push(fault_address);
         state.guard_stepping = true;
         let access_class = classify_av_exc_type(exc_type);
-        debug!(
-            "Themida-side access to guarded .text: target={:#x} from={:#x} \
-             exc_type={exc_type} access={access_class} (count: {})",
-            fault_address,
-            exception_address,
-            state.guard_addrs.len()
-        );
+        // Sample-log: full INFO per hit creates multi-GB logs on null storms.
+        let n = state.guard_addrs.len();
+        if n <= 8 || n.is_power_of_two() {
+            debug!(
+                "Themida-side access to guarded .text: target={:#x} from={:#x} \
+                 exc_type={exc_type} access={access_class} (count: {})",
+                fault_address, exception_address, n
+            );
+        }
         enable_trap_flag(debugger, thread_id)?;
         return Ok(GuardAccessResult::Handled {
             address: fault_address,

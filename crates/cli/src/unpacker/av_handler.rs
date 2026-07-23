@@ -43,7 +43,15 @@ pub(super) fn handle_access_violation(
         target = %format!("{target_address:#x}"),
         "Access violation"
     );
-    log::log(LogType::Info, &format!("Access violation: exc={exception_addr:#x}, target={target_address:#x}, thread={thread_id}"));
+    // Sample noisy AVs: full INFO per hit produced multi-GB logs on Lunlun.
+    if ls.unrelated_av_streak <= 4 || ls.unrelated_av_streak.is_power_of_two() {
+        log::log(
+            LogType::Info,
+            &format!(
+                "Access violation: exc={exception_addr:#x}, target={target_address:#x}, thread={thread_id}"
+            ),
+        );
+    }
 
     if !ls.guard_installed {
         dbg.continue_event(thread_id, ContinueStatus::Continue)?;
@@ -71,6 +79,7 @@ pub(super) fn handle_access_violation(
             address: _,
             thread_id: returned_tid,
         } => {
+            ls.unrelated_av_streak = 0;
             // No continue here — fall through to the shared epilogue once.
             if returned_tid != thread_id {
                 debug!(
@@ -86,13 +95,6 @@ pub(super) fn handle_access_violation(
                 fault = %format!("{target_address:#x}"),
                 exc_type,
                 "Guarded access handled"
-            );
-            log::log(
-                LogType::Info,
-                &format!(
-                    "guard_handled: event_tid={thread_id} returned_tid={returned_tid} \
-                     exception={exception_addr:#x} fault={target_address:#x} exc_type={exc_type}"
-                ),
             );
         }
         GuardAccessResult::TlsCallback { address } => {
@@ -120,6 +122,7 @@ pub(super) fn handle_access_violation(
             return Ok(AvAction::Break);
         }
         GuardAccessResult::PossibleOEP { address } => {
+            ls.unrelated_av_streak = 0;
             log::log(LogType::Info, &format!("Possible OEP at {:#x}", address));
 
             let tls_total = state.pe_info.tls_total;
@@ -193,6 +196,9 @@ pub(super) fn handle_access_violation(
                     }
 
                     ls.virtualized_oep_retries += 1;
+                    // Preserve candidate before redirect so null-AV storm escape
+                    // (Lunlun) can fall back without depending on soft-fail path.
+                    ls.last_possible_oep = Some(address);
                     info!(
                         ret_addr = %format!("{ret_addr:#x}"),
                         retry = ls.virtualized_oep_retries,
@@ -460,8 +466,47 @@ pub(super) fn handle_access_violation(
             }
         }
         GuardAccessResult::NotGuarded => {
-            dbg.continue_event(thread_id, ContinueStatus::Continue)?;
-            return Ok(AvAction::Continue);
+            // Null / non-text AVs after virtualized-OEP redirects thrash forever
+            // if we DBG_CONTINUE (instruction restarts at the same RIP). Escape
+            // by accepting the last PossibleOEP and proceeding to IAT/dump —
+            // same recovery idea as SetThreadContext soft-fail on Origin.
+            ls.unrelated_av_streak = ls.unrelated_av_streak.saturating_add(1);
+            let storm = ls.unrelated_av_streak >= 32
+                || (target_address == 0 && ls.unrelated_av_streak >= 8);
+            if storm
+                && (ls.virtualized_oep_retries > 0 || ls.last_possible_oep.is_some())
+                && ls.oep.is_none()
+            {
+                let fallback = ls
+                    .last_possible_oep
+                    .or(Some(exception_addr as usize));
+                warn!(
+                    streak = ls.unrelated_av_streak,
+                    fault = %format!("{target_address:#x}"),
+                    exception = %format!("{exception_addr:#x}"),
+                    fallback = ?fallback.map(|a| format!("{a:#x}")),
+                    "Non-guard AV storm after virtualized OEP — accepting last PossibleOEP"
+                );
+                ls.oep = fallback;
+                ls.oep_found_via_scanning = true;
+                let _ = remove_code_section_guard(
+                    h_process,
+                    text_start,
+                    text_end.saturating_sub(text_start),
+                );
+                // Fall through to post-OEP IAT setup below.
+            } else {
+                if ls.unrelated_av_streak <= 8 || ls.unrelated_av_streak.is_power_of_two() {
+                    debug!(
+                        streak = ls.unrelated_av_streak,
+                        fault = %format!("{target_address:#x}"),
+                        exception = %format!("{exception_addr:#x}"),
+                        "NotGuarded AV — continue"
+                    );
+                }
+                dbg.continue_event(thread_id, ContinueStatus::Continue)?;
+                return Ok(AvAction::Continue);
+            }
         }
         GuardAccessResult::IatReady { address } => {
             info!(address = %format!("{address:#x}"), "IAT monitoring complete — IAT ready for tracing");
@@ -534,6 +579,7 @@ pub(super) fn handle_access_violation(
         let start_time = std::time::Instant::now();
         let timeout = std::time::Duration::from_secs(5);
         let mut iat_violations = 0;
+        let mut process_exited = false;
 
         loop {
             if start_time.elapsed() > timeout {
@@ -572,6 +618,7 @@ pub(super) fn handle_access_violation(
                         }
                         DebugEvent::ExitProcess { .. } => {
                             info!("Process exited during IAT monitoring");
+                            process_exited = true;
                             break;
                         }
                         _ => {}
@@ -613,6 +660,19 @@ pub(super) fn handle_access_violation(
             "IAT analysis after execution"
         );
 
+        // Lunlun: after virtualized-OEP storm escape, resuming at PossibleOEP can
+        // ExitProcess immediately. v3 per-slot SingleStep then hangs forever on a
+        // dead debuggee. Skip trace and dump with whatever slots we already read.
+        if process_exited {
+            ls.process_exited = true;
+            warn!(
+                api_like = api_like_count,
+                total = actual_slots,
+                "Skipping IAT v3-trace — process already exited; proceed to dump"
+            );
+            return Ok(AvAction::Break);
+        }
+
         let mut tm_start = usize::MAX;
         let mut tm_end = 0;
         let mut found_themida = false;
@@ -631,9 +691,16 @@ pub(super) fn handle_access_violation(
         }
 
         let trace_thread_id = thread_id;
-        let trace_ctx = dbg
-            .get_thread_context_control(trace_thread_id)
-            .map_err(|e| anyhow!("get_thread_context_control for trace_start_sp: {e}"))?;
+        let trace_ctx = match dbg.get_thread_context_control(trace_thread_id) {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "get_thread_context_control for IAT trace failed — dump without v3-trace"
+                );
+                return Ok(AvAction::Break);
+            }
+        };
         let trace_start_sp = trace_ctx.Rsp as usize;
 
         let mut trace = IatTraceState::new(
@@ -652,7 +719,16 @@ pub(super) fn handle_access_violation(
             &format!("IAT trace state created: {} slots", trace.total_slots),
         );
 
-        advance_to_next_slot(dbg, &mut trace)?;
+        match advance_to_next_slot(dbg, &mut trace) {
+            Ok(()) => {}
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "advance_to_next_slot failed — dump without further IAT trace"
+                );
+                return Ok(AvAction::Break);
+            }
+        }
         ls.iat_trace = Some(trace);
 
         if let Some(ref t) = ls.iat_trace {

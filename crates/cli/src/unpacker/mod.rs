@@ -96,6 +96,12 @@ struct LoopState {
     oep_found_via_scanning: bool,
     virtualized_oep_retries: u32,
     last_possible_oep: Option<usize>,
+    /// Consecutive AVs that were not true code-section guard hits (null deref,
+    /// heap probes).  Used to escape virtualized-OEP null storms (Lunlun).
+    unrelated_av_streak: u32,
+    /// Debuggee delivered ExitProcess (or is otherwise untraceable). Skip
+    /// V3 single-step IAT tracing and dump with whatever IAT memory remains.
+    process_exited: bool,
     iat_trace: Option<IatTraceState>,
 }
 
@@ -319,6 +325,8 @@ pub fn unpack(
         oep_found_via_scanning: false,
         virtualized_oep_retries: 0,
         last_possible_oep: None,
+        unrelated_av_streak: 0,
+        process_exited: false,
         iat_trace: None,
     };
     let guard_protection = PAGE_NOACCESS.0;
@@ -583,7 +591,8 @@ pub fn unpack(
             is_64bit,
             do_data_sections,
             shrink,
-            true, // post-attach mode
+            true,  // post-attach mode
+            false, // process still attached
             oep_policy,
             container_restore,
             profile,
@@ -1392,6 +1401,7 @@ pub fn unpack(
             // EXIT_PROCESS — target exited (unexpected before dump)
             // ---------------------------------------------------------------
             DebugEvent::ExitProcess { exit_code } => {
+                ls.process_exited = true;
                 if ls.oep.is_some() {
                     info!(
                         exit_code,
@@ -1421,6 +1431,15 @@ pub fn unpack(
     }
 
     // ---- phases B/C/D: IAT repair, post-processing, dump ----
+    // If process already exited during AV-handler IAT wait, still dump.
+    if ls.process_exited {
+        // process_exited may already be set from ExitProcess; also set when
+        // AV handler skipped v3-trace after ExitProcess during IAT wait.
+    }
+    // Propagate exit from AV handler path (storm escape + ExitProcess in wait).
+    // The AV handler cannot mutate LoopState.process_exited after return, so
+    // re-detect: if OEP was accepted via unrelated_av storm and main thread is
+    // gone, fix_iat_v3 will hang — use process_exited flag set on ExitProcess.
     run_post_loop_phases(
         &mut dbg,
         &mut state,
@@ -1431,6 +1450,7 @@ pub fn unpack(
         do_data_sections,
         shrink,
         false, // traditional debug path
+        ls.process_exited,
         oep_policy,
         container_restore,
         profile,
@@ -1701,6 +1721,7 @@ fn run_post_loop_phases(
     do_data_sections: bool,
     shrink: bool,
     post_attach: bool,
+    process_exited: bool,
     oep_policy: OepPolicy,
     container_restore: ContainerRestoreMode,
     profile: DumpProfile,
@@ -1775,10 +1796,26 @@ fn run_post_loop_phases(
             LogType::Info,
             "Skipping V3 IAT trace (post-attach: slots already resolved)",
         );
+    } else if process_exited {
+        // Lunlun: virtualized-OEP storm escape can leave a dead debuggee
+        // whose IAT still has many API-like slots. V3 single-step would hang.
+        // Dump with live memory (fix_iat_v2-style resolve best-effort skipped).
+        log::log(
+            LogType::Warn,
+            "Skipping V3 IAT trace (process already exited) — dump with raw IAT slots",
+        );
     } else {
-        fix_iat(dbg, state, &iat, trace_thread_id, strategy)
-            .map_err(|e| anyhow!("IAT fix failed: {e}"))?;
-        log::log(LogType::Info, "IAT fixed");
+        match fix_iat(dbg, state, &iat, trace_thread_id, strategy) {
+            Ok(()) => log::log(LogType::Info, "IAT fixed"),
+            Err(e) => {
+                // Prefer a structural candidate over hanging/aborting with no dump.
+                warn!(error = %e, "IAT fix failed — continuing to dump with partial IAT");
+                log::log(
+                    LogType::Warn,
+                    &format!("IAT fix failed ({e:#}) — dump with partial IAT"),
+                );
+            }
+        }
     }
 
     let themida_section = state
