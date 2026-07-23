@@ -798,12 +798,13 @@ impl WindowsDebugger {
             ScopedThreadHandle::new(raw)
         };
 
+        // CONTROL is enough for EFlags (TF); avoid CONTEXT_ALL / XSAVE on Win11.
         let mut ctx = CONTEXT {
-            ContextFlags: Self::full_context_flags(),
+            ContextFlags: Self::control_context_flags(),
             ..Default::default()
         };
 
-        // SAFETY: h.as_raw() is a valid thread handle with THREAD_SET_CONTEXT rights; ctx is a properly initialised CONTEXT.
+        // SAFETY: h.as_raw() is a valid thread handle with THREAD_GET_CONTEXT rights.
         unsafe {
             GetThreadContext(h.as_raw(), &mut ctx)
                 .map_err(|e| CoreError::Windows(e.code().0 as u32))?;
@@ -811,8 +812,9 @@ impl WindowsDebugger {
 
         // Set the trap flag (TF, bit 8 in EFlags).
         ctx.EFlags |= 0x100;
+        ctx.ContextFlags = Self::control_context_flags();
 
-        // SAFETY: h.as_raw() is a valid thread handle with THREAD_SET_CONTEXT rights; ctx is a properly initialised CONTEXT.
+        // SAFETY: h.as_raw() is a valid thread handle with THREAD_SET_CONTEXT rights.
         unsafe {
             SetThreadContext(h.as_raw(), &ctx)
                 .map_err(|e| CoreError::Windows(e.code().0 as u32))?;
@@ -1019,12 +1021,25 @@ impl DebuggerCore for WindowsDebugger {
                 .map_err(|e| CoreError::Windows(e.code().0 as u32))?;
             ScopedThreadHandle::new(raw)
         };
+        // Prefer CONTROL|INTEGER first: CONTEXT_ALL frequently hits
+        // ERROR_PARTIAL_COPY / incomplete XSAVE under Themida on Win11, and
+        // callers (IAT TF, OEP Rip) only need GPRs + control registers.
         let mut ctx = CONTEXT {
-            ContextFlags: Self::full_context_flags(),
+            ContextFlags: Self::control_integer_context_flags(),
             ..Default::default()
         };
 
         // SAFETY: h.as_raw() is a valid thread handle with THREAD_GET_CONTEXT rights; ctx is a writable CONTEXT.
+        let first = unsafe { GetThreadContext(h.as_raw(), &mut ctx) };
+        if first.is_ok() {
+            return Ok(ctx);
+        }
+
+        // Fallback: full context for rare callers that need more state.
+        ctx = CONTEXT {
+            ContextFlags: Self::full_context_flags(),
+            ..Default::default()
+        };
         unsafe {
             GetThreadContext(h.as_raw(), &mut ctx)
                 .map_err(|e| CoreError::Windows(e.code().0 as u32))?;
@@ -1082,22 +1097,69 @@ impl DebuggerCore for WindowsDebugger {
     }
 
     fn set_thread_context(&self, thread_id: u32, ctx: &CONTEXT) -> Result<(), CoreError> {
-        use windows::Win32::System::Threading::{OpenThread, THREAD_SET_CONTEXT};
-
-        // SAFETY: OpenThread returns a valid HANDLE for the given live thread_id.
-        // Wrapped in ScopedThreadHandle so CloseHandle runs on every return path.
-        let h = unsafe {
-            let raw = OpenThread(THREAD_SET_CONTEXT, false, thread_id)
-                .map_err(|e| CoreError::Windows(e.code().0 as u32))?;
-            ScopedThreadHandle::new(raw)
+        use windows::Win32::System::Threading::{
+            OpenThread, ResumeThread, SuspendThread, THREAD_GET_CONTEXT, THREAD_SET_CONTEXT,
+            THREAD_SUSPEND_RESUME,
         };
 
-        // SAFETY: h.as_raw() is a valid thread handle with THREAD_SET_CONTEXT rights; ctx is a properly initialised CONTEXT.
-        unsafe {
-            SetThreadContext(h.as_raw(), ctx).map_err(|e| CoreError::Windows(e.code().0 as u32))?;
+        // Win11 + Themida often rejects SetThreadContext of CONTEXT_ALL (XSAVE /
+        // floating-point areas) with ERROR_NOACCESS (0x800703E6).  Strip to
+        // CONTROL|INTEGER — enough for RIP/RSP/EFlags (TF) and GPRs used by
+        // IAT single-step tracing and OEP recovery.
+        let mut local = *ctx;
+        local.ContextFlags = Self::control_integer_context_flags();
+
+        // Prefer a fresh OpenThread handle with suspend+set rights.
+        // SAFETY: OpenThread returns a valid HANDLE for the given live thread_id.
+        let open = unsafe {
+            OpenThread(
+                THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME,
+                false,
+                thread_id,
+            )
+            .ok()
+        };
+        let scoped = open.map(ScopedThreadHandle::new);
+        let borrowed = self.thread_handle(thread_id).ok();
+
+        let try_set = |h: HANDLE| -> Result<(), CoreError> {
+            // SAFETY: h is a valid thread handle; local is CONTROL|INTEGER CONTEXT.
+            unsafe {
+                SetThreadContext(h, &local).map_err(|e| CoreError::Windows(e.code().0 as u32))
+            }
+        };
+
+        if let Some(ref g) = scoped {
+            if try_set(g.as_raw()).is_ok() {
+                return Ok(());
+            }
+            // Suspend + retry once (thread may briefly be non-stoppable after injector).
+            let suspended = unsafe { SuspendThread(g.as_raw()) };
+            let second = try_set(g.as_raw());
+            if suspended != u32::MAX {
+                let _ = unsafe { ResumeThread(g.as_raw()) };
+            }
+            if second.is_ok() {
+                return Ok(());
+            }
         }
 
-        Ok(())
+        if let Some(h) = borrowed {
+            if try_set(h).is_ok() {
+                return Ok(());
+            }
+            let suspended = unsafe { SuspendThread(h) };
+            let second = try_set(h);
+            if suspended != u32::MAX {
+                let _ = unsafe { ResumeThread(h) };
+            }
+            if second.is_ok() {
+                return Ok(());
+            }
+            return second;
+        }
+
+        Err(CoreError::Windows(0x3E6)) // ERROR_NOACCESS
     }
 }
 

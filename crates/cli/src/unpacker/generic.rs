@@ -102,11 +102,30 @@ pub fn generic_unpack(
         ),
     );
 
+    // Oreans/Themida often wipe section names (spaces). Prefer ".text*", else
+    // first executable image section, else section 0 — same convention as the
+    // Oreans unpack path which uses pe_sections[0] as code.
     let text = pe
         .sections
         .iter()
         .find(|s| s.name.starts_with(".text"))
-        .ok_or_else(|| anyhow!("no .text section"))?;
+        .or_else(|| {
+            pe.sections.iter().find(|s| {
+                const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
+                const IMAGE_SCN_CNT_CODE: u32 = 0x0000_0020;
+                (s.characteristics & (IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_CNT_CODE)) != 0
+                    && s.virtual_size > 0
+            })
+        })
+        .or_else(|| pe.sections.first())
+        .ok_or_else(|| anyhow!("no .text section (and no executable/section-0 fallback)"))?;
+    log::log(
+        LogType::Info,
+        &format!(
+            "generic: poll section name={:?} va={:#x} vsize={:#x}",
+            text.name, text.virtual_address, text.virtual_size
+        ),
+    );
     let text_va = text.virtual_address as usize;
     let text_size = (text.virtual_size as usize).min(0x20000);
 

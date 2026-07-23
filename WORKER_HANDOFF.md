@@ -133,10 +133,22 @@ mida dump-process <sample> --pure-rebuild
 - `dependency_boundary` + `pe_purity_boundary`: pass
 - `validation_summary.json` task: **VNEXT-R1-E**
 
+### Origin live unpack (Phase 1 — first structural pass)
+
+- **Evidence:** `D:\MidaVault\lab\evidence\origin_macro\live_20260723-132326\`
+- **CLI:** `mida-cli /unpack … --data-sections --no-shrink -v` → **exit 0**, ~12.6s
+- **Candidate:** size `13746176`, sha256 `0c0923e34cb8571f09d954047880c75388ed062157ea384c6613f0c93a58efbb`
+- **R0B:** `StructuralPassBehaviorPending`, failures `[]` (oracle observation only)
+- **Path:** OEP found → IAT multi-block **305 slots** traced → dump 17 sections → structure gate ok
+- **Unblock fix (worktree, not yet committed):**
+  - `crates/core/src/windows_debugger.rs` — prefer `CONTEXT_CONTROL|INTEGER` over `CONTEXT_ALL`/XSAVE for Get/SetThreadContext; SuspendThread retry; OpenThread GET|SET|SUSPEND
+  - Win11 failure mode was `SetThreadContext` → `ERROR_NOACCESS` (0x800703E6) during virtualized OEP and IAT v3-trace
+
 ## Suggested next slices
 
-- **Live smoke**: vault Origin / Lunlun pure vs legacy dump → scratch + acceptance.
-- **GTO** controlled run (if authorized); **Dali** remains OOS until policy says otherwise.
-- **Import typed rebuild** (optional / R1-F?): host-resolved IAT → pure import builder.
-- **R2**: runtime event / behavioral acceptance engine skeleton.
-- Flip default only after live + acceptance corpus shows pure ≥ legacy structural quality.
+1. **Commit debugger context hardening** after quick regression (core tests / Origin re-smoke).
+2. **Phase 1 continue:** Lunlun live unpack + R0B; Origin ×3 stability; optional `--pure-rebuild` structural compare.
+3. **GTO** experimental profile only; **Dali** OOS notes.
+4. **R1-F (optional):** host-resolved IAT → pure import builder.
+5. **R2:** runtime event / replay skeleton (blocker for clean R3 plugin).
+6. Flip default pure only after live pure ≥ legacy structural quality on Origin+Lunlun.

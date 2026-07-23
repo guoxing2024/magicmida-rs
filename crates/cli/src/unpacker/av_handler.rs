@@ -266,26 +266,46 @@ pub(super) fn handle_access_violation(
                             .unwrap_or_else(|| "unknown".into());
                         info!(oep = %oep_str, "OEP found — removing guard");
                     } else {
+                        // Virtualized OEP: try to return into the Themida
+                        // section so the next guard hit can capture a better
+                        // OEP.  On Win11, SetThreadContext may fail with
+                        // ERROR_NOACCESS (0x800703E6) even with CONTEXT_CONTROL
+                        // only — soft-fail instead of killing the whole unpack.
                         let mut ctx = dbg
                             .get_thread_context_control(thread_id)
                             .map_err(|e| anyhow!("get_thread_context_control: {e}"))?;
                         ctx.Rip = ret_addr as u64;
                         ctx.Rsp += 8;
-                        super::session::set_thread_context_control(dbg, thread_id, &ctx)?;
+                        match super::session::set_thread_context_control(dbg, thread_id, &ctx) {
+                            Ok(()) => {
+                                let ts_start = (dbg.image_base() as usize).wrapping_add(
+                                    state.pe_info.pe_sections[0].virtual_address as usize,
+                                );
+                                let text_end =
+                                    dbg.image_base() as usize + state.pe_info.base_of_data as usize;
+                                install_code_section_guard(
+                                    h_process,
+                                    ts_start,
+                                    text_end.saturating_sub(ts_start),
+                                    guard_protection,
+                                )?;
 
-                        let ts_start = (dbg.image_base() as usize)
-                            .wrapping_add(state.pe_info.pe_sections[0].virtual_address as usize);
-                        let text_end =
-                            dbg.image_base() as usize + state.pe_info.base_of_data as usize;
-                        install_code_section_guard(
-                            h_process,
-                            ts_start,
-                            text_end.saturating_sub(ts_start),
-                            guard_protection,
-                        )?;
-
-                        dbg.continue_event(thread_id, ContinueStatus::Continue)?;
-                        return Ok(AvAction::Continue);
+                                dbg.continue_event(thread_id, ContinueStatus::Continue)?;
+                                return Ok(AvAction::Continue);
+                            }
+                            Err(e) => {
+                                warn!(
+                                    ret_addr = %format!("{ret_addr:#x}"),
+                                    retry = ls.virtualized_oep_retries,
+                                    error = %e,
+                                    "virtualized OEP SetThreadContext soft-fail — fall through with last Possible OEP"
+                                );
+                                ls.last_possible_oep = Some(address);
+                                // Fall through: treat this AV as a usable OEP
+                                // candidate and continue the non-virtualized
+                                // epilogue below (pattern scan / dump).
+                            }
+                        }
                     }
                 }
 
@@ -355,7 +375,15 @@ pub(super) fn handle_access_violation(
                             .map_err(|e| anyhow!("get_thread_context_control: {e}"))?;
                         new_ctx.Rip = ret_addr as u64;
                         new_ctx.Rsp += 8;
-                        super::session::set_thread_context_control(dbg, thread_id, &new_ctx)?;
+                        if let Err(e) =
+                            super::session::set_thread_context_control(dbg, thread_id, &new_ctx)
+                        {
+                            warn!(
+                                ret_addr = %format!("{ret_addr:#x}"),
+                                error = %e,
+                                "FTraceMSVCOEP SetThreadContext soft-fail — continue without redirect"
+                            );
+                        }
                     }
                     remove_code_section_guard(
                         h_process,
@@ -452,7 +480,15 @@ pub(super) fn handle_access_violation(
             .map_err(|e| anyhow!("get_thread_context_control: {e}"))?;
         ctx.Rip = oep_addr as u64;
         ctx.EFlags &= !0x100;
-        super::session::set_thread_context_control(dbg, thread_id, &ctx)?;
+        if let Err(e) = super::session::set_thread_context_control(dbg, thread_id, &ctx) {
+            // Without Rip redirect, .text/IAT may still decrypt if the thread
+            // already sits at/near OEP. Soft-fail so we can still attempt dump.
+            warn!(
+                oep = %format!("{oep_addr:#x}"),
+                error = %e,
+                "post-OEP SetThreadContext soft-fail — continue without Rip redirect"
+            );
+        }
 
         let text_section = &state.pe_info.pe_sections[0];
         let text_start_addr = image_base_usize.wrapping_add(text_section.virtual_address as usize);

@@ -1,13 +1,13 @@
 # MagicMida vNext — 项目审计与后续规划（Windows 复审）
 
-**审计日期:** 2026-07-23（Windows 复审 + Phase 0 绿测固化）  
+**审计日期:** 2026-07-23（Windows 复审 + Phase 0 绿测 + Origin live 首通）  
 **基线分支:** `baseline/legacy-recovery-20260722`  
-**HEAD:** 见 git log（R1-A 起；R1-B..E 应已提交）  
-**工作区:** R1-A..E 合成 corpus 关闭；live 证据包仍开放  
+**HEAD:** `52c4eee` + 工作区：`WindowsDebugger` CONTROL|INTEGER context 硬化（未提交）  
+**工作区:** R1-A..E 已提交；**Origin live unpack + R0B StructuralPass 已固化**；Lunlun/GTO live 仍开放  
 **主机:** Windows 11；仓库 `D:\Claude project\magicmida-rs`；vault `D:\MidaVault`  
-**环境事实:** VS 2022 Professional MSVC 14.44；`tools/_enter_msvc_env.ps1`；
+**环境事实:** VS 2022 Professional MSVC 14.44；`tools/_rebuild_cli.cmd`；
 `CARGO_TARGET_DIR=D:\MidaVault\scratch\cargo-target`；
-`cargo test --workspace --offline` **412 passed / 0 failed**。样品在 vault，v2 verify 绿。
+P0 workspace 绿测已固化。样品在 vault，v2 verify 绿。
 
 ---
 
@@ -19,9 +19,10 @@
 | 四样品 | “未物化” | **7/7 对象 PRESENT，size 全 match** |
 | v2 合约 | 文档层 | `verify_manifests.py` → `overall_ok: true`（5 manifests / 7 objects） |
 | R0B 测试 | 历史记录 | **本机 `cargo test -p mida-acceptance --offline` 全绿** |
-| R1 pe 测试 | 未在本机 | **本 shell 缺 `link.exe`，pe 测试未链上**；源码与 purity JSON 在树 |
-| live unpack | 跳过 | **仍未跑**（需 vcvars + 显式授权动态执行） |
-| R1-E 状态 | handoff “closed” vs roadmap “in progress” | **维持：合成 structural corpus 关闭；生产 default flip 开放** |
+| R1 pe 测试 | 未在本机 | **MSVC 14.44 下 workspace 412 全绿** |
+| live unpack | 跳过 | **Origin live 首通**（`live_20260723-132326`，exit 0，R0B StructuralPass） |
+| R1-E 状态 | handoff “closed” vs roadmap “in progress” | **已对齐：合成 corpus closed；live + default flip 开放** |
+| SetThreadContext | 未记录 | **根因：CONTEXT_ALL/XSAVE → Win11 ERROR_NOACCESS；改为 CONTROL\|INTEGER + Suspend 重试** |
 
 ---
 
@@ -100,7 +101,7 @@ tools/            工作区卫生 / 临时探针（勿把探针脚本当产品�
 | 独立静态验收 R0B | `crates/acceptance/*`, `docs/ACCEPTANCE_CONTRACT.md` | **高** — 本机测试全绿；永不 `Accepted` |
 | 依赖边界锁 | `dependency_boundary.json` + acceptance 测试 | **高** |
 | 纯 PE 模块清单与纯度扫描 | `pe_purity_boundary.json`, `purity_boundary` 测试源 | **高（契约）**；本 shell 未能重链 pe 测 |
-| 纯 rebuild / byte-map / pure 适配器 | `rebuild.rs`, `byte_map.rs`, `pure_rebuild_adapter.rs`（部分未跟踪） | **中高**（合成语料；live 默认仍 legacy） |
+| 纯 rebuild / byte-map / pure 适配器 | `rebuild.rs`, `byte_map.rs`, `pure_rebuild_adapter.rs`（`52c4eee`） | **中高**（合成语料；live 默认仍 legacy） |
 | Themida 检测、guard、OEP、IAT、trace | `packers/themida`, `cli/unpacker` | **中**（遗留单体；Pascal 对标） |
 | 进程 dump + import 重建 + 实验 profile | `pe/dumper/*` | **中**（OreansClassic 默认；AHK/GTO opt-in） |
 | Generic dump 门 | `generic_gate` + `gate_vectors.json` | **中**（结构启发式，非 acceptance） |
@@ -136,37 +137,21 @@ CLI 表面：
 | **typed import 从 live IAT → pure builder** 未做 | pure 依赖 host extra_data 携带 | **中**（R1-F） |
 | **ScyllaHide x86 哈希占位** | x86 注入完整性无效 | **中**（x86 样品） |
 | **TLS global_vars 未用于恢复** | 复杂 TLS 样本风险 | **中** |
-| **R1-B..E 未提交 / 文档漂移** | 协作与“closed”语义风险 | **过程** |
-| **本机 shell 无 vcvars** | pe/cli 无法在当前 session 链测 / 无法 live | **环境** |
-| **四样品 live 证据包未固化** | 无 vault 内可复现 run 档案 | **高（下一步）** |
+| **R1-B..E 未提交 / 文档漂移** | ~~已关闭~~（`52c4eee` + 文档对齐） | **已处理** |
+| **本机 shell 无 vcvars** | ~~已关闭~~（`tools/_enter_msvc_env.ps1`） | **已处理** |
+| **四样品 live 证据包未固化** | Origin 已固化；**Lunlun/GTO 仍缺** | **高（P1 进行中）** |
+| **CONTEXT_ALL SetThreadContext** | ~~已关闭~~（core CONTROL\|INTEGER） | **已处理（Origin 首通依赖）** |
 | **Dali 明确 out_of_scope** | 四样品中一枚不做完美承诺 | **范围** |
 
 ### 3.4 工作区卫生与提交状态（复审）
 
-**已提交：** R0B acceptance、卫生策略、v2 cases、R1-A 纯度边界等。
-
-**工作树已改未提交（摘录）：**  
-`crates/cli` args/commands/unpacker、`crates/pe` dumper/header/lib/Cargo.toml、README、WORKER_HANDOFF、R1 文档等。
-
-**未跟踪但应入库的 R1 核心：**
-
-- `crates/pe/src/rebuild.rs`
-- `crates/pe/src/byte_map.rs`
-- `crates/pe/src/exception_table.rs` / `export_table.rs` / `tls.rs`
-- `crates/pe/src/dumper/pure_rebuild_adapter.rs`
-- `crates/pe/tests/pure_parse_serialize.rs`
-- `docs/PROJECT_AUDIT_AND_ROADMAP.md`（本文件）
+**已提交：** R0B acceptance、卫生策略、v2 cases、R1-A..E pure rebuild（`52c4eee`）、审计文档。
 
 **不应入库：** `.cargo-target/`、`bash_events/`、`conversations/`、临时 `tools/_*.py`、任何 PE 二进制。
 
-**文档漂移（仍存在）：**
+**文档真相句（2026-07-23）：**
 
-| 文档 | 声称 | 建议单一真相句 |
-|------|------|----------------|
-| `WORKER_HANDOFF.md` | R1-E closed → R2 | `R1-E structural corpus closed; pure dump opt-in; default flip open.` |
-| `docs/VNEXT_R1_ROADMAP.md` | R1-E in progress | 更新为与 handoff 一致 + 列出 live 对照为 open |
-| `README.md` | 仍写 Next: R1-D | 应写 R1-D/E 已接线；下一步 R1 固化 + 证据包 + R2 |
-| `validation_summary.json` | 仍 `VNEXT-R0B-1` | 固化后升 `VNEXT-R1-E` |
+`R1-E structural corpus closed; pure dump opt-in; default flip open; live smoke next.`
 
 ### 3.5 代码规模与耦合（粗量）
 
@@ -269,8 +254,23 @@ mida-acceptance check-static <scratch>\origin_u.exe --report <scratch>\origin_r0
 | `verify_manifests.py` | **overall_ok** |
 | `unittest lab.cases.test_verify_manifests` | **8 passed** |
 | `cargo test -p mida-acceptance --offline` | **全绿**（含 dependency/oracle/static_checks） |
-| `cargo test -p mida-pe …` | **失败：link.exe not found**（环境，非必然代码回归） |
-| live unpack / dump | **未执行** |
+| `cargo test --workspace`（P0） | **412 passed**（MSVC 环境） |
+| **Origin live unpack** | **`live_20260723-132326` exit 0；size 13746176；sha256 `0c0923e3…a58efbb`** |
+| **Origin R0B candidate** | **`StructuralPassBehaviorPending`，failures=[]**（oracle 仅观察） |
+| Lunlun / GTO live | **未执行（P1 下一步）** |
+| pure-rebuild live compare | **未执行** |
+
+#### Origin 首通关键路径（vault）
+
+| 项 | 值 |
+|----|-----|
+| 证据目录 | `D:\MidaVault\lab\evidence\origin_macro\live_20260723-132326\` |
+| 诊断（pre-fix） | `phase1_diag_20260723-132013`；失败 run `live_…-130856` / `…-132013` |
+| 失败模式 A | virtualized OEP：`SetThreadContext` `ERROR_NOACCESS` |
+| 失败模式 B | IAT `trace_one_slot set_thread_context` 同错误（越过 OEP 后） |
+| 修复 | `windows_debugger::{get,set}_thread_context` → CONTROL\|INTEGER + Suspend 重试 |
+| 成功阶段 | OEP found → IAT 305 slots traced → dump 17 sections → R0B StructuralPass |
+| 非目标达成 | **非** Behavioral `Accepted`；**非** 与 oracle 字节一致 |
 
 ---
 
@@ -281,13 +281,13 @@ mida-acceptance check-static <scratch>\origin_u.exe --report <scratch>\origin_r0
 | 目标清晰度 | 5 | 架构文档与 release rule 明确 |
 | 验收独立性 | 5 | R0B 边界与测试强；本机复验绿 |
 | 纯 PE 方向 | 4 | R1 实现深，未提交/未默认切换；pe 测本 shell 未链 |
-| 运行时抽象 | 2 | 仍是 Win32 调试器直连 + cli 大循环 |
+| 运行时抽象 | 2 | 仍是 Win32 调试器直连 + cli 大循环；context 标志已硬化 |
 | 插件化 | 2 | themida crate 存在，非 R3 插件契约 |
-| 样品工程 | **5** | v2 + vault **本机 verifier 全绿**；live 证据仍缺 |
-| 过程/仓库卫生 | 3 | 策略好；R1 未提交与文档漂移 |
-| 距“完美脱壳” | 2 | 结构候选阶段；行为与多族未闭环 |
+| 样品工程 | **5** | v2 + vault 绿；**Origin live 证据包已固化** |
+| 过程/仓库卫生 | 4 | 策略好；context 修复待提交；临时 tools 不入库 |
+| 距“完美脱壳” | 2 | Origin 结构候选通过；行为与多族未闭环 |
 
-**综合：** 方向正确、R0B/R1 地基扎实；**生产级完美脱壳仍远**。主阻塞：**(1) R1 固化 + 四样品 live 证据包** → **(2) R2 事件引擎** → **(3) R3 Oreans 证据闭环** → **(4) 独立行为验收**。
+**综合：** 方向正确、R0B/R1 地基扎实；**Origin 已从 “live 失败” 升到 “结构门通过”**。主阻塞：**(1) P1 剩余样品 live 证据** → **(2) 提交 debugger context 修复 + 稳定性** → **(3) R2 事件引擎** → **(4) R3 Oreans 10× 闭环** → **(5) 独立行为验收**。
 
 ---
 
@@ -314,19 +314,20 @@ mida-acceptance check-static <scratch>\origin_u.exe --report <scratch>\origin_r0
 
 **目标：** 可复现失败/成功档案，而非“感觉能脱”。
 
-| 样品 | 动作 | 归档（vault only） |
-|------|------|--------------------|
-| Origin | legacy unpack ± pure-rebuild；R0B；oracle 观察 | candidate SHA、r0b.json、diff 摘要、notes |
-| Lunlun | 同上（无 oracle） | 同上 |
-| GTO | experimental profile；对照 analysis_reference | 阶段开关矩阵 + 崩溃/门失败点 |
-| Dali | static + 可选 .NET dump；标记 OOS | 一页研究笔记 |
+| 样品 | 动作 | 状态 | 归档（vault only） |
+|------|------|------|--------------------|
+| Origin | legacy unpack；R0B；oracle 观察 | **✅ `live_20260723-132326` StructuralPass** | candidate SHA、r0b、notes、unpack log |
+| Origin pure | 同 capture 或同输入 `--pure-rebuild` 对照 | ⬜ 未做 | structural diff vs legacy |
+| Lunlun | unpack + R0B（无 oracle） | ⬜ **下一步** | 同上模板 |
+| GTO | `--profile=ahk-gto-experimental` | ⬜ | 阶段矩阵 + 失败点 |
+| Dali | static + OOS 笔记 | ⬜ 低优先级 | 一页研究笔记 |
 
 交付模板：`D:\MidaVault\lab\evidence\<case_id>\<run_id>\`
 
-- `candidate.sha256`, `r0b.json`, `cli.log`（脱敏）, `notes.md`  
+- `candidate.sha256`, `r0b_candidate.json`, `unpack.stdout.txt`, `notes.md`, `run_meta.json`  
 - **禁止** exe 进 Git  
 
-**出口：** 每个 in-scope 样品 ≥1 次可复现记录；Origin/Lunlun 结构门现状量化。
+**出口（更新）：** Origin 已满足 ≥1 次可复现 StructuralPass；完整出口仍需 Lunlun 量化 + Origin 稳定性抽检（建议 ≥3 次）。
 
 ### Phase 2 — R1 收口（可选 R1-F，1–2 周）
 

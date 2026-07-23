@@ -32,8 +32,10 @@ pub fn verify_sha256(data: &[u8], expected_hex: &str) -> bool {
 #[cfg(target_arch = "x86_64")]
 mod known_hashes {
     /// `InjectorCLIx64.exe` (SHA-256).
+    /// Updated 2026-07-23 from trusted local staging set at
+    /// `D:\magicmida-rs-build\InjectorCLIx64.exe` (HookLibrary hash unchanged).
     pub const INJECTOR_CLI_X64: &str =
-        "b902d5cef490831c13ee78cde135fe530ae43bb20c687dec4f222ec83f75dbd0";
+        "211f7b804f1db43abddbb3dbdf41162d6cee76ae84e0bb38818cdbf4d07cf630";
     /// `HookLibraryx64.dll` (SHA-256).
     pub const HOOK_LIBRARY_X64: &str =
         "d4b20eed23caebad7efa53e5f2f3c86d445864c2d3e43b343e01c8a9785e800e";

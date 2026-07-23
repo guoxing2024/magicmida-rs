@@ -172,20 +172,66 @@ pub(super) fn get_thread_context_control(
     Ok(ctx)
 }
 
-/// Fast `SetThreadContext` with pre-filled `CONTEXT_CONTROL` flags.
+/// Fast `SetThreadContext` with forced `CONTEXT_CONTROL` flags.
+///
+/// Themida/Win11 paths sometimes fail `SetThreadContext` with
+/// `ERROR_NOACCESS` (0x800703E6) when ContextFlags are incomplete or when the
+/// thread briefly leaves a stoppable state after ScyllaHide injection.  We:
+/// 1. force CONTROL flags on a local copy,
+/// 2. try once,
+/// 3. on failure SuspendThread + retry once,
+/// 4. surface a structured error for callers that can soft-fail.
 pub(super) fn set_thread_context_control(
     dbg: &ProcessSession,
     thread_id: u32,
     ctx: &windows::Win32::System::Diagnostics::Debug::CONTEXT,
 ) -> Result<(), anyhow::Error> {
-    use windows::Win32::System::Diagnostics::Debug::SetThreadContext;
+    use windows::Win32::System::Diagnostics::Debug::{
+        SetThreadContext, CONTEXT_CONTROL_AMD64,
+    };
+    use windows::Win32::System::Threading::{ResumeThread, SuspendThread};
 
     let h = dbg.thread_handle(thread_id).map_err(|e| anyhow!("{e}"))?;
-    // SAFETY: h is a valid thread handle with THREAD_SET_CONTEXT rights; ctx is a fully populated CONTEXT.
-    unsafe {
-        SetThreadContext(h, ctx).map_err(|e| anyhow!("SetThreadContext failed: {e}"))?;
+    let mut local = *ctx;
+    #[cfg(target_arch = "x86_64")]
+    {
+        local.ContextFlags = CONTEXT_CONTROL_AMD64;
     }
-    Ok(())
+    #[cfg(target_arch = "x86")]
+    {
+        local.ContextFlags = windows::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_X86;
+    }
+
+    // SAFETY: h is a valid thread handle with THREAD_SET_CONTEXT rights; local
+    // is a fully populated CONTEXT with CONTROL flags forced.
+    let first = unsafe { SetThreadContext(h, &local) };
+    if first.is_ok() {
+        return Ok(());
+    }
+    let first_err = first.err().map(|e| e.to_string()).unwrap_or_default();
+
+    // Soft retry: suspend, set again, resume.  Debugged threads are usually
+    // already stopped; Suspend is best-effort for races with injector/remote
+    // threads that briefly run between AV dispatch and our Set.
+    let suspended = unsafe { SuspendThread(h) };
+    let second = unsafe { SetThreadContext(h, &local) };
+    if suspended != u32::MAX {
+        let _ = unsafe { ResumeThread(h) };
+    }
+
+    match second {
+        Ok(()) => {
+            tracing::warn!(
+                thread_id,
+                first_err = %first_err,
+                "SetThreadContext CONTROL succeeded after SuspendThread retry"
+            );
+            Ok(())
+        }
+        Err(e) => Err(anyhow!(
+            "SetThreadContext failed: {e} (first_attempt={first_err}; suspend={suspended})"
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------
