@@ -39,6 +39,14 @@ impl SelectedPacker {
         }
     }
 
+    /// Whether this session should run Oreans V3-style IAT single-step fix.
+    ///
+    /// AHK/GTO uses live IAT rebuild at dump time (no Themida wrapper trace).
+    #[must_use]
+    pub(super) fn uses_oreans_iat_trace(&self) -> bool {
+        matches!(self, Self::Oreans(_))
+    }
+
     /// Apply family-specific session timeouts / thresholds.
     pub(super) fn apply_session_defaults(&self, ctx: &mut PluginCtx) {
         match self {
@@ -54,6 +62,66 @@ impl SelectedPacker {
             Self::Oreans(p) => p.last_identify_confidence,
             Self::AhkGto(p) => p.last_identify_confidence,
         }
+    }
+}
+
+/// Dual-identify Oreans vs AHK/GTO and build the session packer (R4-A1 / P1).
+///
+/// Call **before** process create so family selection is not after-the-fact.
+/// Prefer Oreans on a clear Match; otherwise AHK/GTO Match; else default
+/// Oreans host path. Identify never enables GTO dump stages by itself.
+#[must_use]
+pub(super) fn dual_select_packer(
+    is_64bit: bool,
+    entry_point_rva: u32,
+    size_of_image: u32,
+    section_names: Vec<String>,
+) -> (
+    SelectedPacker,
+    mida_core::IdentifyResult,
+    mida_core::IdentifyResult,
+    &'static str,
+) {
+    let mut oreans_probe = ThemidaPlugin::new();
+    let mut gto_probe = AhkGtoPlugin::new();
+    let identify_input = mida_core::IdentifyInput {
+        is_64bit,
+        entry_point_rva,
+        size_of_image,
+        section_names,
+    };
+    let oreans_id = oreans_probe.identify_record(&identify_input);
+    let gto_id = gto_probe.identify_record(&identify_input);
+    let family = select_packer_family(&oreans_id, &gto_id);
+    let packer = match family {
+        "ahk_gto" => SelectedPacker::AhkGto(gto_probe),
+        _ => SelectedPacker::Oreans(oreans_probe),
+    };
+    (packer, oreans_id, gto_id, family)
+}
+
+/// Pick family id from dual identify results.
+#[must_use]
+pub(super) fn select_packer_family(
+    oreans: &mida_core::IdentifyResult,
+    gto: &mida_core::IdentifyResult,
+) -> &'static str {
+    let oreans_conf = match oreans {
+        mida_core::IdentifyResult::Match { confidence } => *confidence,
+        mida_core::IdentifyResult::Ambiguous => 1,
+        mida_core::IdentifyResult::NoMatch => 0,
+    };
+    let gto_conf = match gto {
+        mida_core::IdentifyResult::Match { confidence } => *confidence,
+        mida_core::IdentifyResult::Ambiguous => 1,
+        mida_core::IdentifyResult::NoMatch => 0,
+    };
+    if oreans_conf >= 40 && oreans_conf >= gto_conf {
+        "oreans_themida"
+    } else if gto_conf >= 40 {
+        "ahk_gto"
+    } else {
+        "oreans_themida"
     }
 }
 
@@ -384,5 +452,60 @@ mod tests {
             section_names: vec![".KI3".into()],
         });
         assert!(matches!(r, IdentifyResult::Match { confidence } if confidence >= 40));
+    }
+
+    #[test]
+    fn dual_select_gto_from_ki3_sections() {
+        let (packer, _o, g, fam) = dual_select_packer(
+            true,
+            0x1000,
+            0x200_0000,
+            vec![
+                ".text".into(),
+                ".KI3".into(),
+                ".,\\W".into(),
+                ".|lT".into(),
+            ],
+        );
+        assert_eq!(fam, "ahk_gto");
+        assert_eq!(packer.family_id(), "ahk_gto");
+        assert!(!packer.uses_oreans_iat_trace());
+        assert!(matches!(g, IdentifyResult::Match { confidence } if confidence >= 40));
+    }
+
+    #[test]
+    fn dual_select_oreans_from_themida_marker() {
+        let (packer, o, _g, fam) = dual_select_packer(
+            true,
+            0x1000,
+            0x100_0000,
+            vec![".text".into(), ".themida".into(), ".boot".into()],
+        );
+        assert_eq!(fam, "oreans_themida");
+        assert_eq!(packer.family_id(), "oreans_themida");
+        assert!(packer.uses_oreans_iat_trace());
+        assert!(matches!(o, IdentifyResult::Match { confidence } if confidence >= 40));
+    }
+
+    #[test]
+    fn select_prefers_oreans_when_both_match_higher() {
+        assert_eq!(
+            select_packer_family(
+                &IdentifyResult::Match { confidence: 80 },
+                &IdentifyResult::Match { confidence: 50 },
+            ),
+            "oreans_themida"
+        );
+    }
+
+    #[test]
+    fn select_gto_when_only_gto_matches() {
+        assert_eq!(
+            select_packer_family(
+                &IdentifyResult::NoMatch,
+                &IdentifyResult::Match { confidence: 80 },
+            ),
+            "ahk_gto"
+        );
     }
 }

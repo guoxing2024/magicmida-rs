@@ -1,45 +1,40 @@
-# WORKER_HANDOFF - Audit P0 (alignment + CLI semantics + hygiene)
+# WORKER_HANDOFF - Audit P1 thin slice (family before host)
 
 ## Status
 
 | Item | Status |
 |------|--------|
-| R3 / R4 structural (narrow gate) | **CLOSED** in validation_summary; host still Themida-centric (see R4 honesty note) |
-| Pure default | **still No** |
-| Behavioral Accepted | **not enabled** |
-| B-A0 / B-A1 | **DONE** |
-| B-A2 | deferred until P0 audit debt cooled |
-| **P0 alignment** (`process.rs` unaligned PE reads) | **DONE** |
-| **P0 CLI success semantics** | **DONE** (candidate written ≠ acceptance) |
-| **P0 hygiene** | **DONE** (`cargo_test.txt` untracked/removed) |
+| P0 unaligned PE + candidate semantics + cargo_test hygiene | **DONE** (`9d496a3`) |
+| **P1 dual identify pre-process** | **DONE** |
+| **P1 Oreans IAT gated by family** | **DONE** |
+| Shared `ThemidaState` host | **still** (honest debt) |
+| Pure default / Accepted / B-A2 | unchanged |
+| Giant `unpacker/mod.rs` | still large; not fully split |
 
-## Audit alignment (2026-07-24)
+## What changed (P1)
 
-Self-check agreed with external audit:
+1. `dual_select_packer` in `plugin_host` runs **before** `init_pe_details` / process create.
+2. `run_post_loop_phases` takes `uses_oreans_iat_trace` + `family_id`:
+   - Oreans: existing V3 / skip_v3 / post-attach rules
+   - AHK/GTO: skip Oreans V3 trace + skip Oreans API call-site fixup
+3. Tests: dual_select GTO vs Oreans, select preference, `uses_oreans_iat_trace`.
 
-1. **High — unaligned PE POD refs in `mida-core` process.rs** → fixed via `pe_read_unaligned` / `pe_write_unaligned`.
-2. **High — R4 not independent plugin pipeline** → documented honesty on VNEXT_R4 path; no false “architecture complete”.
-3. **High — unpack Ok ≠ R0B** → CLI logs `Candidate written` + keeps greppable `Unpacked:` / `Structure gate:` for lab tools; states acceptance is external.
-4. **Hygiene** — removed tracked `cargo_test.txt` (was policy violation).
+## Honesty
 
-Still open (not this turn):
+This is a **thin** host improvement, not independent GTO pipeline. Layout probe
+is still `ThemidaPeInfo` for both families.
 
-- Giant `unpacker/mod.rs` / Themida host lock-in (P1)
-- Plugin forwarding duplication (P1)
-- x86 ScyllaHide zero hashes / kifast placeholder (P2 / OOS)
-- fmt/clippy workspace green (P0 remaining if CI cares)
-- `target/` / `.cargo-target/` local dirs (gitignore; do not commit)
-- B-A2 acceptance composition CLI
+## Next
 
-## Next recommended
+1. Optional live smoke: Origin 1× + GTO experimental 1× after rebuild
+2. Further P1: extract more of post-loop / loop from `mod.rs`
+3. Or B-A2: acceptance evidence composition
+4. fmt/clippy debt still open
 
-1. Optional: `cargo fmt` / clippy debt sweep on touched crates
-2. P1 thin slice: identify-before-ThemidaState or extract IAT strategy behind selected family (do not grow mod.rs with GTO specials)
-3. Then B-A2 evidence load in `mida-acceptance`
-
-## Tools
+## Validate
 
 ```text
-cargo test -p mida-core --lib process::tests --offline
-python tools\_behavior_ba1_smoke.py
+cargo test -p mida-cli --lib --offline dual_select
+cargo test -p mida-cli --lib --offline selected_
+cargo test -p mida-cli --lib --offline select_
 ```

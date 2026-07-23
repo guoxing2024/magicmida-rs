@@ -10,7 +10,7 @@
 //! ## Architecture
 //!
 //! ```text
-//! parse PE ─▶ detect Themida ─▶ create process ─▶ init state ─▶ ScyllaHide
+//! parse PE ─▶ dual identify ─▶ host layout (ThemidaPeInfo) ─▶ create process ─▶ ScyllaHide
 //!                                                                    │
 //!    ┌───────────────────────────────────────────────────────────────┘
 //!    ▼
@@ -45,14 +45,13 @@ use windows::Win32::System::Threading::{ResumeThread, SuspendThread};
 
 use crate::log::{self, LogType};
 use mida_core::{
-    ContinueStatus, CreateProcessOptions, DebugEvent, DebuggerCore, HwbpType, IdentifyInput,
-    PackerPlugin, PluginAdvice, PluginCtx, PreferredBase, RuntimeBase, Rva, UnpackPhase, Va,
+    ContinueStatus, CreateProcessOptions, DebugEvent, DebuggerCore, HwbpType, PackerPlugin,
+    PluginAdvice, PluginCtx, PreferredBase, RuntimeBase, Rva, UnpackPhase, Va,
 };
-use mida_packers_ahk_gto::AhkGtoPlugin;
 use mida_packers_themida::{
     create_data_sections, determine_iat_address, fix_iat, fixup_api_call_sites,
     handle_nt_set_information_thread, init_pe_details, inject_scylla_hide, install_anti_dump_fix,
-    shrink_pe, CompilerHint, IatFixStrategy, ScyllaHideConfig, ThemidaPlugin, ThemidaState,
+    shrink_pe, CompilerHint, IatFixStrategy, ScyllaHideConfig, ThemidaState,
 };
 use mida_pe::{
     ContainerRestoreMode, DumpOptions, DumpProfile, EarlySectionSnapshot, OepPolicy, PeHeader,
@@ -60,8 +59,8 @@ use mida_pe::{
 
 use av_handler::{handle_access_violation, AvAction};
 use plugin_host::{
-    enter_dump_phase, note_plugin_av_break, note_plugin_iat_complete, plugin_leave_reason,
-    refresh_plugin_loop_policy, sync_plugin_milestones, SelectedPacker,
+    dual_select_packer, enter_dump_phase, note_plugin_av_break, note_plugin_iat_complete,
+    plugin_leave_reason, refresh_plugin_loop_policy, sync_plugin_milestones,
 };
 use helpers::{
     compute_data_section_bounds, dotnet_dump_and_dump_output, handle_hw_breakpoint,
@@ -179,7 +178,68 @@ pub fn unpack(
     let is_64bit = pe.is_64bit;
     debug!(is_64bit, "PE architecture");
 
-    // ---- step 3: detect Themida ----
+    // ---- step 2b: dual identify BEFORE host state / process create (P1) ----
+    // Family selection is independent of ThemidaState. Dump stages for GTO
+    // still require explicit --profile=ahk-gto-experimental.
+    let (mut packer, oreans_id, gto_id, selected_family) = dual_select_packer(
+        is_64bit,
+        pe.entry_point,
+        pe.size_of_image(),
+        pe.sections.iter().map(|s| s.name.clone()).collect(),
+    );
+    info!(
+        selected = packer.family_id(),
+        oreans = ?oreans_id,
+        ahk_gto = ?gto_id,
+        conf = packer.last_identify_confidence(),
+        "PackerPlugin identify: dual-family select (pre-process)"
+    );
+    match selected_family {
+        "oreans_themida" => match &oreans_id {
+            mida_core::IdentifyResult::Match { confidence } => {
+                info!(
+                    family = packer.family_id(),
+                    confidence,
+                    "PackerPlugin identify: Match"
+                );
+            }
+            mida_core::IdentifyResult::Ambiguous => {
+                info!(
+                    family = packer.family_id(),
+                    "PackerPlugin identify: Ambiguous"
+                );
+            }
+            mida_core::IdentifyResult::NoMatch => {
+                warn!(
+                    family = packer.family_id(),
+                    "PackerPlugin identify: NoMatch (continuing Oreans host path)"
+                );
+            }
+        },
+        "ahk_gto" => {
+            info!(
+                family = packer.family_id(),
+                confidence = packer.last_identify_confidence(),
+                "PackerPlugin identify: Match"
+            );
+            if !matches!(profile, DumpProfile::AhkGtoExperimental) {
+                warn!(
+                    "AHK/GTO family identified but dump profile is not ahk-gto-experimental — \
+                     heap/container stages stay disabled (pass --profile=ahk-gto-experimental)"
+                );
+            }
+        }
+        other => {
+            warn!(
+                family = other,
+                "PackerPlugin identify: no strong family match (default Oreans host path)"
+            );
+        }
+    }
+
+    // ---- step 3: host PE layout probe (shared ThemidaPeInfo host state) ----
+    // Still Oreans-shaped layout extraction for both families — not a claim
+    // that GTO has an independent host pipeline (see VNEXT_R4 honesty note).
     // Read entry-point bytes for virtualised OEP detection.
     let ep_offset_val = pe.rva_to_offset(pe.entry_point).unwrap_or(0) as usize;
     let entry_bytes = fs::read(input).ok().and_then(|data| {
@@ -197,12 +257,16 @@ pub fn unpack(
     }
     let entry_bytes_ref = entry_bytes.as_deref();
 
-    let pe_info = init_pe_details(&pe, is_64bit, entry_bytes_ref, Some(input))
-        .map_err(|e| anyhow!("Themida detection failed: {e}"))?;
+    let pe_info = init_pe_details(&pe, is_64bit, entry_bytes_ref, Some(input)).map_err(|e| {
+        anyhow!("Host PE layout probe failed (family={selected_family}): {e}")
+    })?;
 
     log::log(
         LogType::Info,
-        &format!("Themida version: {:?}", pe_info.themida_version),
+        &format!(
+            "Host layout: family={selected_family} themida_version={:?} (shared host state)",
+            pe_info.themida_version
+        ),
     );
 
     // ---- step 3b: detect .NET target early ----
@@ -236,8 +300,8 @@ pub fn unpack(
     }
 
     // ---- step 4: create debug process ----
-    // Initialise Themida state first — we need pe_sections to decide
-    // whether to use post-attach mode.
+    // Host still uses ThemidaState for sections / guards / IAT helpers even
+    // when family=ahk_gto (shared host; not independent GTO pipeline).
     let mut state = ThemidaState::new(pe_info, do_data_sections);
     state.create_data_sections = do_data_sections;
     // Propagate TLS callback count detected during init_pe_details.
@@ -333,76 +397,12 @@ pub fn unpack(
         info!("post-attach: no debug port — direct dump mode (SuspendThread + ReadProcessMemory)");
     }
 
-    // ---- R2 Slice 3b + R4-A1: dual identify → SelectedPacker for milestones ----
+    // ---- plugin session context (packer already selected pre-process) ----
     let section0_is_plain_text = state
         .pe_info
         .pe_sections
         .first()
         .is_some_and(|s| s.name == ".text");
-    let mut oreans_probe = ThemidaPlugin::new();
-    let mut gto_probe = AhkGtoPlugin::new();
-    let identify_input = IdentifyInput {
-        is_64bit,
-        entry_point_rva: pe.entry_point,
-        size_of_image: pe.size_of_image(),
-        section_names: pe.sections.iter().map(|s| s.name.clone()).collect(),
-    };
-    let oreans_id = oreans_probe.identify_record(&identify_input);
-    let gto_id = gto_probe.identify_record(&identify_input);
-    let selected_family = select_packer_family(&oreans_id, &gto_id);
-    let mut packer = match selected_family {
-        "ahk_gto" => SelectedPacker::AhkGto(gto_probe),
-        _ => SelectedPacker::Oreans(oreans_probe),
-    };
-    info!(
-        selected = packer.family_id(),
-        oreans = ?oreans_id,
-        ahk_gto = ?gto_id,
-        conf = packer.last_identify_confidence(),
-        "PackerPlugin identify: dual-family select (R4-A1)"
-    );
-    match selected_family {
-        "oreans_themida" => match &oreans_id {
-            mida_core::IdentifyResult::Match { confidence } => {
-                info!(
-                    family = packer.family_id(),
-                    confidence,
-                    "PackerPlugin identify: Match"
-                );
-            }
-            mida_core::IdentifyResult::Ambiguous => {
-                info!(
-                    family = packer.family_id(),
-                    "PackerPlugin identify: Ambiguous"
-                );
-            }
-            mida_core::IdentifyResult::NoMatch => {
-                warn!(
-                    family = packer.family_id(),
-                    "PackerPlugin identify: NoMatch (continuing Oreans host path)"
-                );
-            }
-        },
-        "ahk_gto" => {
-            info!(
-                family = packer.family_id(),
-                confidence = packer.last_identify_confidence(),
-                "PackerPlugin identify: Match"
-            );
-            if !matches!(profile, DumpProfile::AhkGtoExperimental) {
-                warn!(
-                    "AHK/GTO family identified but dump profile is not ahk-gto-experimental — \
-                     heap/container stages stay disabled (pass --profile=ahk-gto-experimental)"
-                );
-            }
-        }
-        other => {
-            warn!(
-                family = other,
-                "PackerPlugin identify: no strong family match (default Oreans host path)"
-            );
-        }
-    }
     let mut plugin_ctx = PluginCtx {
         preferred_base: Some(PreferredBase(pe.image_base)),
         is_dotnet,
@@ -711,6 +711,8 @@ pub fn unpack(
             shrink,
             true,  // post-attach mode
             false, // process still attached
+            packer.uses_oreans_iat_trace(),
+            packer.family_id(),
             oep_policy,
             container_restore,
             profile,
@@ -1649,6 +1651,8 @@ pub fn unpack(
         shrink,
         false, // traditional debug path
         ls.process_exited || plugin_ctx.skip_v3_iat_trace,
+        packer.uses_oreans_iat_trace(),
+        packer.family_id(),
         oep_policy,
         container_restore,
         profile,
@@ -1913,6 +1917,9 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 /// Phases B (IAT repair), C (post-processing), and D (dump to file).
 ///
 /// Runs after the debug loop has found the OEP and completed IAT tracing.
+///
+/// `uses_oreans_iat_trace` / `family_id` gate Oreans V3 wrapper tracing so
+/// AHK/GTO does not unconditionally inherit Themida IAT strategy.
 fn run_post_loop_phases(
     dbg: &mut ProcessSession,
     state: &mut ThemidaState,
@@ -1925,6 +1932,8 @@ fn run_post_loop_phases(
     post_attach: bool,
     // True when host saw ExitProcess or plugin set skip_v3_iat_trace.
     skip_v3_iat_trace: bool,
+    uses_oreans_iat_trace: bool,
+    family_id: &str,
     oep_policy: OepPolicy,
     container_restore: ContainerRestoreMode,
     profile: DumpProfile,
@@ -1994,7 +2003,16 @@ fn run_post_loop_phases(
     };
 
     let trace_thread_id = dbg.main_thread_id();
-    if post_attach {
+    if !uses_oreans_iat_trace {
+        // Non-Oreans family (e.g. ahk_gto): do not run Themida V3 wrapper
+        // single-step. Dump rebuilds imports from live / residual IAT slots.
+        log::log(
+            LogType::Info,
+            &format!(
+                "Skipping Oreans V3 IAT trace (family={family_id}; live IAT rebuild at dump)"
+            ),
+        );
+    } else if post_attach {
         // In post-attach mode, IAT slots already contain resolved API
         // addresses (no Themida wrappers to trace). dump_process will
         // rebuild the import table directly from the live IAT.
@@ -2028,11 +2046,9 @@ fn run_post_loop_phases(
         .themida_section
         .map(|idx| &state.pe_info.pe_sections[idx]);
 
+    // Oreans x86 only: FixupAPICallSites. GTO and x64 skip.
     // Pascal Themida64.pas FinishUnpacking does NOT call FixupAPICallSites on x64.
-    // Themida V3 x64 uses `mov reg,[rip+disp]; call reg` instead of replacing API calls
-    // with rel32 call/jmp (which is an x86-only behavior).  Calling fixup on x64 would
-    // never match anything useful and wastes time.
-    if !is_64bit {
+    if uses_oreans_iat_trace && !is_64bit {
         if let Some(ts) = themida_section {
             let ts_start = image_base.wrapping_add(ts.virtual_address as usize);
             let ts_end = ts_start.wrapping_add(ts.virtual_size as usize);
@@ -2050,6 +2066,11 @@ fn run_post_loop_phases(
 
             log::log(LogType::Info, &format!("Fixed {} API call sites", fixed));
         }
+    } else if !uses_oreans_iat_trace {
+        log::log(
+            LogType::Info,
+            &format!("Skipping Oreans API call site fixup (family={family_id})"),
+        );
     } else {
         log::log(
             LogType::Info,
@@ -2279,65 +2300,4 @@ fn run_post_loop_phases(
     Ok(())
 }
 
-/// Pick family id from dual identify results (R4-A0).
-///
-/// Prefer Oreans on a clear Match; otherwise AHK/GTO Match; else default
-/// Oreans host path (`oreans_themida`). Identify never enables GTO dump stages.
-fn select_packer_family(
-    oreans: &mida_core::IdentifyResult,
-    gto: &mida_core::IdentifyResult,
-) -> &'static str {
-    let oreans_conf = match oreans {
-        mida_core::IdentifyResult::Match { confidence } => *confidence,
-        mida_core::IdentifyResult::Ambiguous => 1,
-        mida_core::IdentifyResult::NoMatch => 0,
-    };
-    let gto_conf = match gto {
-        mida_core::IdentifyResult::Match { confidence } => *confidence,
-        mida_core::IdentifyResult::Ambiguous => 1,
-        mida_core::IdentifyResult::NoMatch => 0,
-    };
-    if oreans_conf >= 40 && oreans_conf >= gto_conf {
-        "oreans_themida"
-    } else if gto_conf >= 40 {
-        "ahk_gto"
-    } else {
-        "oreans_themida"
-    }
-}
-
-#[cfg(test)]
-mod r4_select_tests {
-    use super::select_packer_family;
-    use mida_core::IdentifyResult;
-
-    #[test]
-    fn prefers_oreans_when_both_match_higher() {
-        assert_eq!(
-            select_packer_family(
-                &IdentifyResult::Match { confidence: 80 },
-                &IdentifyResult::Match { confidence: 50 },
-            ),
-            "oreans_themida"
-        );
-    }
-
-    #[test]
-    fn selects_gto_when_only_gto_matches() {
-        assert_eq!(
-            select_packer_family(
-                &IdentifyResult::NoMatch,
-                &IdentifyResult::Match { confidence: 80 },
-            ),
-            "ahk_gto"
-        );
-    }
-
-    #[test]
-    fn defaults_oreans_when_neither_matches() {
-        assert_eq!(
-            select_packer_family(&IdentifyResult::NoMatch, &IdentifyResult::NoMatch),
-            "oreans_themida"
-        );
-    }
-}
+// Family select lives in `plugin_host` (`dual_select_packer` / `select_packer_family`).

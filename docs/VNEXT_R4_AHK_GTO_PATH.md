@@ -4,11 +4,16 @@ Status: **R4 structural gate CLOSED** (2026-07-23, R4-C) under the
 **narrow** close criteria in this file (identify plugin + experimental live
 R0B + Oreans regression + no auto GTO stages + `validation_summary` VNEXT-R4).
 
-**Architecture honesty (post-audit 2026-07-24):** R4 is **not** a fully
-independent protection-family pipeline. The CLI host still builds
-`ThemidaState` first, runs Themida-shaped IAT strategies, and treats GTO as
-identify + session defaults + dump-profile stages on that host. Do not read
-"R4 CLOSED" as "second family is architecturally complete."
+**Architecture honesty (post-audit 2026-07-24; P1 slice 2026-07-24):** R4 is
+**not** a fully independent protection-family pipeline. Progress since audit:
+
+- Dual identify runs **before** process create / `ThemidaState`.
+- Oreans V3 IAT single-step and x86 call-site fixup are **gated** by
+  `SelectedPacker::uses_oreans_iat_trace()` (AHK/GTO skips them).
+
+Still shared host debt: `ThemidaState` / `init_pe_details` / debug loop body
+remain Oreans-shaped. Do not read "R4 CLOSED" as "second family pipeline
+complete."
 
 Default dump profile remains **OreansClassic**. Pure flip still **No**.
 Behavioral Accepted **not** claimed. GTO dump stages still require explicit
