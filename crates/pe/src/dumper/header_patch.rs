@@ -52,6 +52,9 @@ pub(crate) fn validate_and_patch_pe_header(
 
                 if original_image_base != 0 && original_image_base != runtime_image_base {
                     pe.nt_headers.optional_header.image_base = original_image_base;
+                    // Keep top-level cache in sync; pure rebuild and other
+                    // paths read pe.image_base (not only optional_header).
+                    pe.image_base = original_image_base;
                     info!(
                         "Restored ImageBase: {:#x} -> {:#x} (will patch absolute addresses)",
                         runtime_image_base, original_image_base

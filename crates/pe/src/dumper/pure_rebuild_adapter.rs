@@ -179,6 +179,8 @@ pub fn plan_from_host_dump(
         RebuildPlan::pe32()
     };
 
+    // Prefer explicit emit option when non-zero. Live dump path should pass the
+    // host-patched preferred ImageBase (not runtime ASLR) for legacy parity.
     plan.image_base = if opts.image_base != 0 {
         opts.image_base
     } else {
@@ -871,5 +873,143 @@ mod tests {
             "VA-mapped oracle pure candidate: {:?}",
             report.failures
         );
+    }
+
+    /// Phase-2 live parity: when exception/reloc rebind is off, host content
+    /// sections that *contain* those directories (e.g. Themida `.winlice`) must
+    /// stay in the plan. Rebind-on would skip the cover section and emit a
+    /// trailing typed `.pdata` instead.
+    #[test]
+    fn content_cover_sections_kept_when_rebind_off() {
+        let (mut pe, mut dump_buf) = synthetic_va_image();
+        let sa = pe.section_alignment.max(0x1000);
+        // Place a large cover section after .text that owns a synthetic exception DD.
+        let cover_rva = pe.sections[0].virtual_address + sa * 2;
+        let cover_vsize = 0x1000u32;
+        let exc_rva = cover_rva + 0x40;
+        let exc_size = 0x30u32;
+        pe.sections.push(crate::header::PeSection {
+            header: crate::header::ImageSectionHeader {
+                // PE section name is 8 bytes; ".winlice" fills the field (no NUL).
+                name: *b".winlice",
+                virtual_size: cover_vsize,
+                virtual_address: cover_rva,
+                size_of_raw_data: cover_vsize,
+                pointer_to_raw_data: 0,
+                pointer_to_relocations: 0,
+                pointer_to_linenumbers: 0,
+                number_of_relocations: 0,
+                number_of_linenumbers: 0,
+                characteristics: 0x6000_0020,
+            },
+            name: ".winlice".into(),
+            virtual_address: cover_rva,
+            virtual_size: cover_vsize,
+            raw_offset: 0,
+            raw_size: cover_vsize,
+            characteristics: 0x6000_0020,
+            extra_data: None,
+        });
+        pe.nt_headers.optional_header.data_directory[DIR_EXCEPTION] = ImageDataDirectory {
+            virtual_address: exc_rva,
+            size: exc_size,
+        };
+        let need = (cover_rva + cover_vsize) as usize;
+        if dump_buf.len() < need {
+            dump_buf.resize(need, 0xCC);
+        }
+        pe.nt_headers.optional_header.size_of_image =
+            align_up(need as u32, pe.section_alignment.max(0x1000));
+        pe.nt_headers.file_header.number_of_sections = pe.sections.len() as u16;
+
+        // Preferred base (not a runtime ASLR value).
+        pe.nt_headers.optional_header.image_base = 0x0000_0140_0000_0000;
+        pe.image_base = 0x0000_0140_0000_0000;
+
+        let mut opts = base_opts(&pe);
+        opts.rebind_exceptions = false;
+        opts.rebind_relocations = false;
+        opts.image_base = pe.image_base;
+
+        let plan = plan_from_host_dump(&pe, &dump_buf, &opts).expect("plan");
+        assert!(
+            plan.sections.iter().any(|s| s.name == ".winlice"),
+            "rebind-off must keep exception cover section; got {:?}",
+            plan.sections.iter().map(|s| s.name.as_str()).collect::<Vec<_>>()
+        );
+        assert_eq!(plan.image_base, 0x0000_0140_0000_0000);
+
+        let out = emit_pure_rebuild(&pe, &dump_buf, &opts).expect("emit");
+        let re = PeHeader::from_bytes(&out).expect("reparse");
+        assert_eq!(re.image_base, 0x0000_0140_0000_0000);
+        assert!(
+            re.sections.iter().any(|s| s.name.starts_with(".winlice")),
+            "emit must retain .winlice name"
+        );
+        // Exception DD carried via host fallback when rebind is off.
+        assert_eq!(
+            re.nt_headers.optional_header.data_directory[DIR_EXCEPTION].virtual_address,
+            exc_rva
+        );
+    }
+
+    /// Rebind-on skips cover sections (documents the Phase-1 live pure bug class).
+    #[test]
+    fn exception_rebind_skips_cover_section() {
+        let (mut pe, mut dump_buf) = synthetic_va_image();
+        let sa = pe.section_alignment.max(0x1000);
+        let cover_rva = pe.sections[0].virtual_address + sa * 2;
+        let cover_vsize = 0x1000u32;
+        let exc_rva = cover_rva + 0x40;
+        // Minimal RUNTIME_FUNCTION-like bytes so builder can parse something;
+        // even empty builder path: section_covers skip only needs non-empty exceptions.
+        pe.sections.push(crate::header::PeSection {
+            header: crate::header::ImageSectionHeader {
+                name: *b".winlice",
+                virtual_size: cover_vsize,
+                virtual_address: cover_rva,
+                size_of_raw_data: cover_vsize,
+                pointer_to_raw_data: 0,
+                pointer_to_relocations: 0,
+                pointer_to_linenumbers: 0,
+                number_of_relocations: 0,
+                number_of_linenumbers: 0,
+                characteristics: 0x6000_0020,
+            },
+            name: ".winlice".into(),
+            virtual_address: cover_rva,
+            virtual_size: cover_vsize,
+            raw_offset: 0,
+            raw_size: cover_vsize,
+            characteristics: 0x6000_0020,
+            extra_data: None,
+        });
+        pe.nt_headers.optional_header.data_directory[DIR_EXCEPTION] = ImageDataDirectory {
+            virtual_address: exc_rva,
+            size: 12,
+        };
+        let need = (cover_rva + cover_vsize) as usize;
+        if dump_buf.len() < need {
+            dump_buf.resize(need, 0);
+        }
+        // One RUNTIME_FUNCTION: BeginAddress, EndAddress, UnwindInfoAddress (3 x u32)
+        let off = exc_rva as usize;
+        dump_buf[off..off + 4].copy_from_slice(&0x1000u32.to_le_bytes());
+        dump_buf[off + 4..off + 8].copy_from_slice(&0x1010u32.to_le_bytes());
+        dump_buf[off + 8..off + 12].copy_from_slice(&0x2000u32.to_le_bytes());
+        pe.nt_headers.optional_header.size_of_image =
+            align_up(need as u32, pe.section_alignment.max(0x1000));
+        pe.nt_headers.file_header.number_of_sections = pe.sections.len() as u16;
+
+        let mut opts = base_opts(&pe);
+        opts.rebind_exceptions = true;
+        let plan = plan_from_host_dump(&pe, &dump_buf, &opts).expect("plan");
+        // If rebind produced entries, cover section is skipped.
+        if plan.exceptions.as_ref().map(|b| b.function_count()).unwrap_or(0) > 0 {
+            assert!(
+                !plan.sections.iter().any(|s| s.name == ".winlice"),
+                "rebind-on should skip exception cover section"
+            );
+        }
     }
 }

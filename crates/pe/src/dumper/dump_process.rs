@@ -1016,14 +1016,33 @@ pub fn dump_process(
     // section VAs and carries host data directories for content import/IAT.
     let mut out_data = if opts.pure_rebuild {
         info!("R1-E pure rebuild emit path enabled");
+        // Phase-2 live parity with legacy write_output_file:
+        // - Use host-patched ImageBase (preferred base from on-disk PE), not
+        //   the runtime ASLR base in DumpOptions.image_base.
+        // - Keep host exception/reloc *content sections* (e.g. .winlice may
+        //   contain the exception directory). Typed rebind would skip those
+        //   cover sections and re-emit trailing .pdata/.reloc, diverging from
+        //   legacy layout on Oreans samples.
+        // - Do not force DYNAMIC_BASE; header_patch already cleared it for fixed base.
+        // Prefer optional_header (authoritative after header_patch) then
+        // pe.image_base cache. Never fall back to DumpOptions.image_base
+        // (runtime ASLR) for emit.
+        let preferred_base = {
+            let oh = pe.nt_headers.optional_header.image_base;
+            if oh != 0 {
+                oh
+            } else if pe.image_base != 0 {
+                pe.image_base
+            } else {
+                0
+            }
+        };
         let pure_opts = super::pure_rebuild_adapter::PureRebuildEmitOptions {
-            image_base: opts.image_base,
+            image_base: preferred_base,
             entry_point_rva: output_entry_point,
-            // Prefer content sections for exception/reloc when host already
-            // built shells; typed rebind still helps empty cover sections.
-            rebind_exceptions: true,
-            rebind_relocations: true,
-            prefer_aslr_when_relocs: true,
+            rebind_exceptions: false,
+            rebind_relocations: false,
+            prefer_aslr_when_relocs: false,
             preserve_section_vas: true,
             carry_host_data_directories: true,
             max_slice_bytes: super::helpers::MAX_IMAGE_DUMP_BYTES,

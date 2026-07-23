@@ -1,7 +1,8 @@
 # VNEXT-R1 Roadmap - Pure PE Model and Rebuild Pipeline
 
-Status: **R1-A..E closed on synthetic/structural corpus** (2026-07-23 Windows
-validation: workspace offline tests green under MSVC). Pure path remains opt-in
+Status: **R1-A..E closed** on synthetic corpus; **Phase-2 Origin live pure vs
+legacy structural_equal** (2026-07-23 vault evidence
+`live_20260723-173403_p2align2_pure`). Pure path remains opt-in
 (`--pure-rebuild`); production dump still defaults to legacy.
 R0B (`mida-acceptance`) owns independent static structural judgment. R1 extracts a
 pure PE model so production rebuild code no longer mixes live process / Win32
@@ -64,8 +65,11 @@ directories that point into content sections.
 DD, adapter parity on synthetic host dump with `.import` extra_data; docs list
 pure vs legacy paths and parity criteria; purity scan still green. **Met** (synthetic).
 
-**Still open (not R1-E blockers):** live pure-vs-legacy smoke on vault samples;
-typed import rebuild from host-resolved IAT; default flip to pure.
+**Phase-2 live parity (Origin, 2026-07-23):** pure emit keeps preferred
+ImageBase, host cover sections (`.winlice`), and host exception/reloc DDs when
+rebind is off → structural compare vs legacy p1smoke **equal**. Residual: raw
+file size packing difference. **Still open:** Lunlun pure smoke; typed import
+rebuild (R1-F); deliberate default flip board decision.
 
 ## Acceptance relationship
 

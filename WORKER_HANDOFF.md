@@ -1,15 +1,13 @@
-# WORKER_HANDOFF - VNEXT-R1-E closed (pure/legacy structural corpus) -> R2
+# WORKER_HANDOFF - Phase2 pure live structural parity (Origin) -> R2
 
 ## Summary
 
 R0B (`mida-acceptance`) remains the independent static structural judge.
-**R1-A..C** established pure PE APIs, buffer safety, offline rebuild, and
-`plan_from_memory_image` byte-map adapters.
-**R1-D** wired pure rebuild into the **production dump path** as an **opt-in**
-emit path (`DumpOptions.pure_rebuild` / CLI `--pure-rebuild`).
-**R1-E** closed: host-built import/IAT directories and section VAs survive pure
-emit, with offline dual-path structural corpus + independent R0B gates on pure
-(and fair legacy) candidates. Default dump path remains legacy.
+**R1-A..E** closed on synthetic corpus; pure dump remains **opt-in**.
+**Phase 2 (2026-07-23):** Origin live `--pure-rebuild` vs same-day legacy
+smoke is **structural_equal** (image_base, section table, exception/reloc DDs,
+import/iat/tls). Default dump path remains **legacy** (raw size residual;
+no multi-case flip board yet).
 
 ## R1-E deliverables (this slice)
 
@@ -41,8 +39,28 @@ dump_process(...)
           serialize_headers + section raw write + IAT patches
 ```
 
-Default remains **legacy** (`pure_rebuild: false`). Flip only after parity
-corpus shows pure >= legacy structural quality.
+Default remains **legacy** (`pure_rebuild: false`). Origin live structural
+parity is met (Phase 2); flip still requires explicit multi-case decision +
+optional Lunlun pure smoke.
+
+### Phase-2 live pure alignment (2026-07-23)
+
+| Change | Why |
+|--------|-----|
+| pure emit `image_base` = preferred (host-patched), not `DumpOptions` ASLR | closed pure `0x7ff…` vs legacy `0x140000000` |
+| `header_patch` also sets `pe.image_base` | top-level cache was stale after optional_header restore |
+| live pure: `rebind_exceptions/relocations=false`, `prefer_aslr_when_relocs=false` | keep `.winlice` cover sections; avoid trailing typed `.pdata`/`.reloc` |
+
+Evidence (vault only):
+
+- `D:\MidaVault\lab\evidence\origin_macro\live_20260723-173403_p2align2_pure\`
+- R0B `StructuralPassBehaviorPending`, failures `[]`
+- `structural_compare_vs_p1smoke.json` → **verdict: structural_equal**
+- Intermediate: `…-173130_p2align_pure` (winlice fixed; image_base still ASLR)
+- Prior mismatch baseline: `…-165826_p1pure_pure` (9 mismatches)
+
+Unit tests: `content_cover_sections_kept_when_rebind_off`,
+`exception_rebind_skips_cover_section` (+ existing pure_rebuild suite **9/9**).
 
 ### Parity evidence criteria (pure vs legacy emit)
 
