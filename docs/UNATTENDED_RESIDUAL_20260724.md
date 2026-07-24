@@ -36,6 +36,18 @@
 - Older structural dump `live_20260723-225951_r4c_gto` probe-pass + compose Accepted in winning batch.
 - Residual: newest GTO unpack path not load-stable; gate walk to last-known-good is intentional residual.
 
+### GTO independent-host progress (2026-07-24 afternoon)
+
+| Fix | Effect |
+|-----|--------|
+| External-only IAT resolve (reject image-local / hint RVAs) | Stops false “IAT resolved” at 80ms mid-`.KI3` |
+| Never freeze on packer/EP sections; observe then `.text` scan | OEP aligns with r4c (`0x70b0` + `.boot` continue) |
+| Live IAT span capped to `0x11e0` (572 slots) | Rebuild **98%** sufficient (was 14–32% with `0x8000` → original ILT fallback) |
+| Min observation **60s** after attach | Matches r4c settle; `wrapper_call_patch` 0/0 |
+| Smoke CLI path | Always `D:\MidaVault\scratch\cargo-target\debug\mida-cli.exe` (not repo `target/release`) |
+
+**Still Fail `load_no_crash`:** latest `u_gto_host_scan60` is StructuralPass + IAT-green logs but probe AV. Section hashes still differ from r4c (`.boot` stub_size ~793k vs ~822k; packer `.,\\W` / `.|lT` live content). Pin remains `r4c_gto`.
+
 ## Engineering landed (this close)
 
 1. `tools/_behavior_probe.py` — plain createflags default, basename-preserving isolate copy, stale kill, longer backoff, attempts default 12.  
@@ -56,7 +68,7 @@
 | ID | Item | Blocks 1.0? |
 |----|------|-------------|
 | R-LOAD-FLAKE | Origin/GTO intermittent 0xC0000005 without retries | Quality / stability |
-| R-GTO-LATEST | Newest GTO dumps often Fail probe; pin older green | Quality |
+| R-GTO-LATEST | Newest independent-host dumps StructuralPass + IAT 98% but still Fail probe; pin `r4c_gto` | Quality |
 | R-PURE-LOGIC | Pure dump not proven equivalent to protected product logic | Yes for product 1.0 |
 | R-X86 | ScyllaHide x86 residual | x86 only |
 

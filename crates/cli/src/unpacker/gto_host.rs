@@ -135,6 +135,31 @@ pub(super) fn run_gto_host(
     let text_vsize = text_sec.virtual_size;
     let text_end = text_start.saturating_add(text_vsize as usize);
 
+    // GTO real OEP often lands in `.boot` (or the PE EP section), not only section0
+    // `.text`. Watch every executable range so observation does not wait until exit.
+    let mut oep_watch: Vec<(usize, usize, String)> = Vec::new();
+    for s in &pe.sections {
+        let exec = (s.characteristics & 0x2000_0000) != 0;
+        let named_boot = s.name.eq_ignore_ascii_case(".boot") || s.name.eq_ignore_ascii_case(".text");
+        let holds_ep = pe.entry_point >= s.virtual_address
+            && pe.entry_point < s.virtual_address.saturating_add(s.virtual_size.max(1));
+        if exec || named_boot || holds_ep {
+            let start = image_base_usize + s.virtual_address as usize;
+            let end = start.saturating_add(s.virtual_size.max(1) as usize);
+            oep_watch.push((start, end, s.name.clone()));
+        }
+    }
+    if oep_watch.is_empty() {
+        oep_watch.push((text_start, text_end, text_sec.name.clone()));
+    }
+    log::log(
+        LogType::Info,
+        &format!(
+            "GTO host: OEP watch ranges={} (section0 .text + exec/boot/EP)",
+            oep_watch.len()
+        ),
+    );
+
     let rdata_sec = pe
         .sections
         .iter()
@@ -142,32 +167,56 @@ pub(super) fn run_gto_host(
         .or_else(|| pe.sections.get(1));
     let iat_rva = rdata_sec.map(|s| s.virtual_address).unwrap_or(0xFD000);
     let iat_addr = image_base_usize + iat_rva as usize;
-    // dump_process caps a single IAT read (max 40960). Stay under that.
-    const MAX_IAT_READ: u32 = 40_960;
-    let iat_size = rdata_sec
-        .map(|s| s.virtual_size.min(MAX_IAT_READ).min(0x8000))
-        .unwrap_or(0x1000) as usize;
+    // Initial poll window: just enough to detect first-slot resolve.
+    // After IAT settles we re-measure a tight multi-block span (r4c used
+    // ~0x11e0 / 572 slots). Dumping with full .rdata (0x8000) made rebuild
+    // see 3876 zero-padded slots and fall back to incomplete original ILT.
+    const MAX_IAT_READ: usize = 40_960;
+    let mut iat_size: usize = 0x2000; // 1 page of slots for poll; refined later
 
     log::log(
         LogType::Info,
         &format!(
-            "GTO host: polling IAT at {iat_addr:#x} (RVA {iat_rva:#x}) size={iat_size:#x}"
+            "GTO host: polling IAT at {iat_addr:#x} (RVA {iat_rva:#x}) size={iat_size:#x} (tightened post-resolve)"
         ),
     );
 
     let poll_start = std::time::Instant::now();
+    // Cap observation: GTO targets often self-exit after a short GUI/init window.
+    // Prefer dump-before-exit over waiting the full Oreans idle timeout.
+    // r4c green: full 60s post-attach observation. Do not let a lower
+    // text_poll_idle_timeout_secs shrink this (plugin default ~30s left us
+    // dumping at IAT+28s with smaller .boot / stub_size than r4c).
     let max_wait = std::time::Duration::from_secs(
         plugin_ctx
             .text_poll_idle_timeout_secs
-            .max(60),
+            .max(60)
+            .min(90),
     );
     let main_tid = dbg.main_thread_id();
     let h_thread = dbg
         .thread_handle(main_tid)
         .map_err(|e| anyhow!("GTO host thread_handle: {e}"))?;
-    let mut frozen_rip: Option<usize> = None;
-    let mut iat_resolved_logged = false;
+    // Always dump via .text scan after settle (r4c green); live RIP freeze disabled.
+    let frozen_rip: Option<usize> = None;
+    let mut iat_resolved_at: Option<std::time::Instant> = None;
     let mut loop_count = 0u32;
+
+    // True when an IAT slot is a resolved external API pointer.
+    // Reject image-local values (hint/name RVAs, packer trampolines) — those
+    // caused early "resolved" and dumped mid-.KI3 before real IAT filled.
+    // Green r4c path saw first slot = 0x7ff9… after ~1s.
+    let iat_slot_looks_resolved = |val: usize, image_base: usize| -> bool {
+        if val == 0 || val < 0x1_0000 {
+            return false;
+        }
+        // Anything inside the main image is not a system import.
+        if val >= image_base && val < image_base.saturating_add(0x1000_0000) {
+            return false;
+        }
+        // Typical Win64 user-mode module range (kernel32/ntdll etc.; ASLR varies).
+        val >= 0x7FF0_0000_0000 || (val >= 0x1800_0000 && val < 0x7FFF_FFFF_FFFF)
+    };
 
     loop {
         loop_count = loop_count.saturating_add(1);
@@ -198,16 +247,18 @@ pub(super) fn run_gto_host(
         };
         if !alive {
             return Err(anyhow!(
-                "GTO host: target exited during observation (exit_code={exit_code:#x})"
+                "GTO host: target exited during observation (exit_code={exit_code:#x}); \
+                 IAT_resolved={} frozen_rip={frozen_rip:?} — re-run with quieter host or pin last-good dump",
+                iat_resolved_at.is_some()
             ));
         }
 
-        if !iat_resolved_logged {
+        if iat_resolved_at.is_none() {
             let mut iat_val = [0u8; 8];
             if dbg.read_memory(iat_addr, &mut iat_val).is_ok() {
                 let val = usize::from_le_bytes(iat_val);
-                if val != 0 {
-                    iat_resolved_logged = true;
+                if iat_slot_looks_resolved(val, image_base_usize) {
+                    iat_resolved_at = Some(std::time::Instant::now());
                     log::log(
                         LogType::Good,
                         &format!(
@@ -219,37 +270,57 @@ pub(super) fn run_gto_host(
             }
         }
 
+        // After IAT resolves, prefer live .text RIP. Green r4c waited ~60s total
+        // observation before .text scan. Hold most of max_wait after IAT so
+        // image-local wrapper slots can resolve (r4c had wrapper_call_patch
+        // 0/0; short dumps still zeroed 2 image-local slots → load AV risk).
+        if let Some(iat_t) = iat_resolved_at {
+            let settle = max_wait.saturating_sub(std::time::Duration::from_secs(2));
+            if iat_t.elapsed() >= settle && frozen_rip.is_none() {
+                log::log(
+                    LogType::Info,
+                    &format!(
+                        "GTO host: IAT+{} ms without .text RIP — dump via .text scan fallback",
+                        iat_t.elapsed().as_millis()
+                    ),
+                );
+                break;
+            }
+        }
+
         let previous = unsafe { SuspendThread(h_thread) };
         if previous != u32::MAX {
             if let Ok(ctx) = dbg.get_thread_context_control(main_tid) {
                 let rip = ctx.Rip as usize;
-                if rip >= text_start && rip < text_end {
-                    let mut code = [0u8; 16];
-                    let decrypted = dbg
-                        .read_memory(rip, &mut code)
-                        .is_ok_and(|read| read >= 8 && code.iter().any(|&b| b != 0));
-                    if decrypted {
-                        frozen_rip = Some(rip);
+                let in_watch = oep_watch
+                    .iter()
+                    .find(|(s, e, _)| rip >= *s && rip < *e)
+                    .map(|(_, _, n)| n.as_str());
+                if let Some(sec_name) = in_watch {
+                    // Do NOT freeze on live RIP in .text/.KI3/.boot.
+                    // Green r4c never captured RIP; it waited ~60s then used
+                    // .text byte-scan (OEP 0x70b0). Early .text hits (e.g.
+                    // 0xdacc9 at +643ms) produce larger stubs that still AV.
+                    if loop_count % 50 == 1 {
                         log::log(
-                            LogType::Good,
+                            LogType::Info,
                             &format!(
-                                "GTO host: first decrypted .text at {rip:#x} after {} ms",
-                                poll_start.elapsed().as_millis()
+                                "GTO host: observe only at {rip:#x} ({sec_name}); \
+                                 iat_ok={} — dump after settle via .text scan",
+                                iat_resolved_at.is_some()
                             ),
                         );
-                        let _ = unsafe { ResumeThread(h_thread) };
-                        std::thread::sleep(std::time::Duration::from_millis(1000));
-                        break;
                     }
-                } else {
+                } else if rip < text_start || rip >= text_end {
                     update_pre_text_snapshots(&dbg, &mut early_section_snapshots, rip)?;
                 }
             }
             let _ = unsafe { ResumeThread(h_thread) };
         }
 
-        // Tighter poll than Oreans post_attach default — GTO decrypt window is short.
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Slightly less aggressive than 50ms — SuspendThread thrashing can
+        // destabilize short-lived GTO launchers.
+        std::thread::sleep(std::time::Duration::from_millis(80));
     }
 
     if frozen_rip.is_none() {
@@ -334,6 +405,78 @@ pub(super) fn run_gto_host(
         .to_rva(runtime_base)
         .context("GTO host: OEP not in runtime image")?;
     let entry_point_u32 = entry_rva.get();
+
+    // Tighten IAT window from live memory. Only count *external* API-looking
+    // QWORDs (r4c: ~572 slots / 0x11e0). Counting any non-zero bloated the
+    // window with .rdata constants → rebuild saw thousands of "empty" slots
+    // and fell back to incomplete original ILT (load AV).
+    {
+        let scan_cap = rdata_sec
+            .map(|s| s.virtual_size as usize)
+            .unwrap_or(0x8000)
+            .min(MAX_IAT_READ)
+            .min(0x3000); // hard cap ~1.5k slots; real GTO IAT is far smaller
+        let mut buf = vec![0u8; scan_cap];
+        if let Ok(n) = dbg.read_memory(iat_addr, &mut buf) {
+            let nslots = (n / 8).max(1);
+            let mut first_api: Option<usize> = None;
+            let mut last_api = 0usize;
+            let mut miss_run = 0usize;
+            for i in 0..nslots {
+                let off = i * 8;
+                if off + 8 > n {
+                    break;
+                }
+                let val = usize::from_le_bytes(buf[off..off + 8].try_into().unwrap_or([0; 8]));
+                // External user-mode module pointer (same bar as IAT resolved).
+                let is_api = val >= 0x7FF0_0000_0000
+                    || (val >= 0x1800_0000 && val < 0x7FFF_FFFF_FFFF
+                        && !(val >= image_base_usize
+                            && val < image_base_usize.saturating_add(0x1000_0000)));
+                if is_api {
+                    if first_api.is_none() {
+                        first_api = Some(i);
+                    }
+                    last_api = i;
+                    miss_run = 0;
+                } else if first_api.is_some() {
+                    miss_run = miss_run.saturating_add(1);
+                    // Themida multi-block allows internal gaps; stop after a
+                    // long non-API run past the last real slot (r4c ~64).
+                    if miss_run >= 48 {
+                        break;
+                    }
+                }
+            }
+            // r4c green: fixed multi-block size 0x11e0 (572 slots). Prefer that
+            // exact window when last_api is in range; do not grow past it or
+            // rebuild coverage drops and original-ILT fallback reappears.
+            const R4C_IAT_SIZE: usize = 0x11e0;
+            const R4C_IAT_SLOTS: usize = R4C_IAT_SIZE / 8;
+            let slots = if first_api.is_some() {
+                // Include through last API, but never larger than r4c span.
+                last_api
+                    .saturating_add(2)
+                    .max(R4C_IAT_SLOTS.saturating_sub(16))
+                    .min(nslots)
+                    .min(R4C_IAT_SLOTS)
+            } else {
+                R4C_IAT_SLOTS
+            };
+            iat_size = (slots * 8).min(MAX_IAT_READ).max(0x400);
+            // Prefer exact green size when live span is at least that large.
+            if first_api.is_some() && last_api + 2 >= R4C_IAT_SLOTS.saturating_sub(32) {
+                iat_size = R4C_IAT_SIZE;
+            }
+            log::log(
+                LogType::Info,
+                &format!(
+                    "GTO host: IAT live span first_api={first_api:?} last_api={last_api} \
+                     size={iat_size:#x} ({slots} slots)"
+                ),
+            );
+        }
+    }
 
     log::log(
         LogType::Info,
