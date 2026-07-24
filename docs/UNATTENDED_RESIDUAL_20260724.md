@@ -161,8 +161,9 @@ Gate pin order residual: prefer **`r4c_gto` first** for multi-case reliability; 
 - Pure default remains **Origin-only**, not global.  
 - GTO still needs `--profile=ahk-gto-experimental` for experimental dump stages.  
 - **Origin** quiet single-shot load flake is **closed at metric** (W1 scrub_v2, N=20 attempt=1 → 1.0).  
-- **GTO** independent-host quiet single-shot load flake is **closed at metric** (W2 clear-regs, 3× N=10 → 1.0); does **not** equal product 1.0 or UI/script parity.  
-- B-B `Accepted` remains **load survival** only; W3+ needs a real behavior oracle.
+- **GTO** independent-host quiet single-shot load flake is **closed at metric** (W2 clear-regs, 3× N=10 → 1.0).  
+- **W3 oracles** prove signal beyond load survival (Origin window class; GTO export surface) and can compose Accepted; they are **still not** product 1.0 / business-logic equivalence.  
+- Default multi-case BB gate may still use `load_no_crash_v0` unless operators switch probe deliberately.
 
 ## W1 — Origin single-shot load (R-LOAD-FLAKE Origin side) — **metric exit**
 
@@ -268,7 +269,51 @@ First-pin style: clearregs1 `--attempts 3` early-exit → **Pass** on attempt 1 
 | R-GTO-BOOT may stay open | **Held** (not a W2 gate) |
 | No 1.0 claim | **Held** |
 
-## Residual after VNEXT-BEH (+ W1 + W2)
+## W3 — Behavior probe beyond load survival — **metric exit**
+
+**Work order:** [COURSE_CORRECTION_WORK_ORDER.md](COURSE_CORRECTION_WORK_ORDER.md) W3  
+**Date:** 2026-07-24  
+**Claim:** At least one Oreans case + one GTO case have a **new** probe (not `load_no_crash_v0`) that is fail-closed, schema-compatible, and compose-Accepted on vault candidates. **Not** product 1.0 / not full logic equivalence.
+
+### Oracles chosen (one each; minimal + automatable)
+
+| Case | Probe id | What it measures | What it does **not** measure |
+|------|----------|------------------|------------------------------|
+| Origin (`w1_scrub_v2`) | `gui_window_class_v0` | Process creates Win32 top-level window class **`PigToGoLicenseDialog`** within wall-clock (observed title「授权验证」recorded in markers, not required for Pass) | License validity, login success, business macros, UI automation parity |
+| GTO (`w2_clearregs1`) | `pe_export_names_v0` | Static PE export name table contains required AHK surface symbols (`AhkAssign`, `AddScript`, `ahkExec`, `MinHookEnable`; case-insensitive fallback) | Script engine execution, GUI login (`NewClassName` only seen on **protected** input today), AHK FileAppend side effects |
+
+**Why not GTO window?** Unpacked GTO currently exits quickly with **no** top-level product window (protected input still shows `NewClassName` / login title). Work-order allows export surface as GTO oracle; runtime GUI for GTO remains residual research.
+
+### Harness
+
+- [`tools/_behavior_probe.py`](../tools/_behavior_probe.py) v`0.2.0-w3`  
+  - `--probe-kind window_class --expect-window-class …`  
+  - `--probe-kind export_names --require-export …`  
+- Evidence still `mida.behavior-evidence/v0`; extra blocks `window_quality` / `export_quality` are non-kernel sidecar fields (acceptance ignores unknown extras via serde default on known structs — kernel only reads core fields).  
+- Compose: `mida-acceptance check-with-behavior` unchanged (Pass + structural → Accepted; Fail → Rejected; Inconclusive not upgraded).
+
+### Evidence (vault)
+
+| Path | Verdict | Compose |
+|------|---------|---------|
+| `D:\MidaVault\lab\evidence\_beh_gate\w3_oracle\origin_window_class.json` | Pass (`gui_window_class_v0`) | **Accepted** (`origin_compose.json`) |
+| `D:\MidaVault\lab\evidence\_beh_gate\w3_oracle\gto_export_names.json` | Pass (`pe_export_names_v0`) | **Accepted** (`gto_compose.json`) |
+| `…\origin_window_neg.json` | Fail (bogus class) | — |
+| `…\gto_export_neg.json` | Fail (missing export) | — |
+
+### W3 exit checklist
+
+| Criterion | Status |
+|-----------|--------|
+| ≥1 Oreans + ≥1 GTO new-probe Pass | **Pass** |
+| Docs: measures / non-measures | **This section** |
+| Fail-closed negatives | **Pass** |
+| No product 1.0 claim | **Held** |
+| BB default still may use load_no_crash | **Held** (W3 does not silently rewrite VNEXT-BEH bar) |
+
+**Residual after W3:** R-PURE-LOGIC **narrowed** (real signal exists) but **not closed** — license/script/business path still unproven. GTO runtime GUI oracle still open.
+
+## Residual after VNEXT-BEH (+ W1 + W2 + W3)
 
 | ID | Item | Blocks 1.0? | Status |
 |----|------|-------------|--------|
@@ -276,7 +321,8 @@ First-pin style: clearregs1 `--attempts 3` early-exit → **Pass** on attempt 1 
 | R-LOAD-FLAKE (GTO quiet / fresh host) | attempt=1 load survival on independent-host dumps | Quality | **W2 metric exit** (clear-regs 3× 10/10) |
 | R-GTO-LATEST | Fresh dump load without `r4c_gto` walk | Quality | **W2 metric exit** (preferred pins = clearregs) |
 | R-GTO-BOOT | `.boot` heap_global payload size variance under 320-slot cap | Quality | Open (honesty; not load AV root) |
-| R-PURE-LOGIC | Pure/unpacked not proven product-logic equivalent | **Yes** for product 1.0 | Open → W3+ |
+| R-PURE-LOGIC | Product-logic / business path equivalence | **Yes** for product 1.0 | **Partial:** W3 oracles give real signal; full logic still open → W4 review only |
+| R-GTO-UI | Unpacked GTO no product window yet (protected does) | Quality | Open research |
 | R-X86 | ScyllaHide x86 residual | x86 only | Open |
 
 ## Re-run

@@ -34,10 +34,12 @@ REPO = Path(__file__).resolve().parents[1]
 FIXTURE_MANIFEST = REPO / "lab" / "behavior" / "synthetic" / "marker_exit" / "Cargo.toml"
 SCHEMA_VERSION = "mida.behavior-evidence/v0"
 PRODUCER_NAME = "tools/_behavior_probe.py"
-PRODUCER_VERSION = "0.1.1-m1"
+PRODUCER_VERSION = "0.2.0-w3"
 MARKER_NEEDLE = "MIDA_BEH_MARKER=1"
 PROBE_ID_MARKER = "exit_code_marker_v0"
 PROBE_ID_LOAD = "load_no_crash_v0"
+PROBE_ID_WINDOW = "gui_window_class_v0"
+PROBE_ID_EXPORTS = "pe_export_names_v0"
 
 # Job-object network isolation is deferred; residual risk is always listed.
 RESIDUAL_RISKS_MARKER = [
@@ -58,6 +60,21 @@ RESIDUAL_RISKS_LOAD = [
     "load_no_crash_uses_plain_createflags_by_default",
     "origin_like_gui_may_av_intermittently_on_bad_heap_paths",
     "load_pass_rate_is_quality_metric_not_r0b_accepted",
+]
+RESIDUAL_RISKS_WINDOW = [
+    "network_deny_is_policy_not_kernel_filter",
+    "window_class_is_not_full_product_logic",
+    "window_class_does_not_prove_license_or_business_path",
+    "gui_title_text_is_not_scored_unless_require_title",
+    "ime_helper_windows_ignored_for_class_match",
+    "window_probe_uses_plain_createflags_by_default",
+    "window_probe_runs_isolated_copy_per_attempt",
+]
+RESIDUAL_RISKS_EXPORTS = [
+    "export_names_are_static_surface_not_runtime_behavior",
+    "export_names_do_not_prove_script_engine_runs",
+    "export_parse_is_pe_only_no_dll_load",
+    "missing_exports_fail_closed",
 ]
 
 
@@ -319,6 +336,198 @@ def _attempt_is_load_pass(
     return status in ("pass", "timeout") or exit_code is not None
 
 
+def pe_export_names(path: Path) -> list[str]:
+    """Parse PE export name table (static; no image load). Empty if none/invalid."""
+    import struct
+
+    data = path.read_bytes()
+    if len(data) < 0x40 or data[:2] != b"MZ":
+        return []
+    e_lfanew = struct.unpack_from("<I", data, 0x3C)[0]
+    if e_lfanew + 24 > len(data) or data[e_lfanew : e_lfanew + 4] != b"PE\0\0":
+        return []
+    coff = e_lfanew + 4
+    nsec = struct.unpack_from("<H", data, coff + 2)[0]
+    opt_size = struct.unpack_from("<H", data, coff + 16)[0]
+    opt = coff + 20
+    if opt + 2 > len(data):
+        return []
+    magic = struct.unpack_from("<H", data, opt)[0]
+    if magic == 0x20B:
+        dd = opt + 112
+    elif magic == 0x10B:
+        dd = opt + 96
+    else:
+        return []
+    if dd + 8 > len(data):
+        return []
+    exp_rva, _exp_sz = struct.unpack_from("<II", data, dd)
+    if exp_rva == 0:
+        return []
+    sec_off = opt + opt_size
+    sections: list[tuple[int, int, int, int]] = []
+    for i in range(nsec):
+        o = sec_off + i * 40
+        if o + 40 > len(data):
+            break
+        vsz, va, rsz, raw = struct.unpack_from("<IIII", data, o + 8)
+        sections.append((va, vsz, raw, rsz))
+
+    def rva_to_off(rva: int) -> int | None:
+        for va, vsz, raw, rsz in sections:
+            span = max(vsz, rsz)
+            if va <= rva < va + span and raw:
+                return raw + (rva - va)
+        return None
+
+    exp_off = rva_to_off(exp_rva)
+    if exp_off is None or exp_off + 40 > len(data):
+        return []
+    n_names = struct.unpack_from("<I", data, exp_off + 24)[0]
+    names_rva = struct.unpack_from("<I", data, exp_off + 32)[0]
+    names_off = rva_to_off(names_rva)
+    if names_off is None or n_names == 0 or n_names > 10_000:
+        return []
+    out: list[str] = []
+    for i in range(n_names):
+        slot = names_off + i * 4
+        if slot + 4 > len(data):
+            break
+        nrva = struct.unpack_from("<I", data, slot)[0]
+        noff = rva_to_off(nrva)
+        if noff is None or noff >= len(data):
+            continue
+        end = data.find(b"\0", noff, min(noff + 256, len(data)))
+        if end < 0:
+            continue
+        try:
+            name = data[noff:end].decode("ascii")
+        except UnicodeDecodeError:
+            continue
+        if name:
+            out.append(name)
+    return out
+
+
+def _enum_windows_for_pid(pid: int) -> list[tuple[str, str, bool]]:
+    """Return (class_name, title, visible) for top-level windows owned by pid."""
+    if os.name != "nt":
+        return []
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    GetClassNameW = user32.GetClassNameW
+    GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    GetClassNameW.restype = ctypes.c_int
+    GetWindowTextW = user32.GetWindowTextW
+    GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    GetWindowThreadProcessId = user32.GetWindowThreadProcessId
+    GetWindowThreadProcessId.argtypes = [
+        wintypes.HWND,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    GetWindowThreadProcessId.restype = wintypes.DWORD
+    IsWindowVisible = user32.IsWindowVisible
+    EnumWindows = user32.EnumWindows
+
+    found: list[tuple[str, str, bool]] = []
+
+    @WNDENUMPROC
+    def _cb(hwnd: int, _lparam: int) -> bool:
+        p = wintypes.DWORD()
+        GetWindowThreadProcessId(hwnd, ctypes.byref(p))
+        if int(p.value) != int(pid):
+            return True
+        cn = ctypes.create_unicode_buffer(256)
+        GetClassNameW(hwnd, cn, 256)
+        tt = ctypes.create_unicode_buffer(512)
+        GetWindowTextW(hwnd, tt, 512)
+        found.append((cn.value, tt.value, bool(IsWindowVisible(hwnd))))
+        return True
+
+    EnumWindows(_cb, 0)
+    return found
+
+
+def _run_window_class_probe(
+    launch_path: Path,
+    *,
+    max_wall_ms: int,
+    expect_classes: list[str],
+    require_title_substr: str | None,
+    env: dict[str, str],
+    run_cwd: str,
+) -> tuple[str, int | None, str | None, list[str], list[str]]:
+    """Launch PE; Pass when an expected window class appears (no NT AV).
+
+    Returns status, exit_code, error_class, markers_found, classes_seen.
+    """
+    expect_set = {c for c in expect_classes if c}
+    if not expect_set:
+        return "error", None, "no_expect_window_class", [], []
+
+    creationflags = _load_createflags() if os.name == "nt" else 0
+    status = "error"
+    exit_code: int | None = None
+    error_class: str | None = None
+    markers: list[str] = []
+    classes_seen: list[str] = []
+    proc: subprocess.Popen[Any] | None = None
+    try:
+        proc = subprocess.Popen(
+            [str(launch_path)],
+            cwd=run_cwd,
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=creationflags,
+        )
+        deadline = time.perf_counter() + max(0.2, max_wall_ms / 1000.0)
+        matched_class: str | None = None
+        matched_title: str | None = None
+        while time.perf_counter() < deadline:
+            for cn, title, _vis in _enum_windows_for_pid(proc.pid):
+                if cn and cn not in classes_seen:
+                    classes_seen.append(cn)
+                if cn in expect_set:
+                    if require_title_substr and require_title_substr not in title:
+                        continue
+                    matched_class = cn
+                    matched_title = title
+                    break
+            if matched_class is not None:
+                break
+            if proc.poll() is not None:
+                break
+            time.sleep(0.12)
+
+        exit_code = proc.poll()
+        if matched_class is not None:
+            markers.append(f"window_class:{matched_class}")
+            if matched_title:
+                markers.append(f"window_title_seen:{matched_title[:80]}")
+            status = "pass"
+            error_class = "window_class_matched"
+        elif exit_code is not None and _is_nt_exception_exit(exit_code):
+            status = "fail"
+            error_class = f"nt_exception_exit:{exit_code & 0xFFFFFFFF:#x}"
+        elif exit_code is not None:
+            status = "fail"
+            error_class = "process_exited_without_expected_window"
+        else:
+            status = "fail"
+            error_class = "window_class_not_seen_within_wall"
+    except OSError as e:
+        status = "error"
+        error_class = f"os_error:{e.__class__.__name__}"
+    finally:
+        if proc is not None:
+            _terminate_proc(proc)
+    return status, exit_code, error_class, markers, classes_seen
+
+
 def run_probe(
     candidate: Path,
     *,
@@ -331,6 +540,9 @@ def run_probe(
     probe_kind: str = "marker",
     attempts: int = 1,
     rate_samples: int = 0,
+    expect_window_classes: list[str] | None = None,
+    require_title_substr: str | None = None,
+    require_exports: list[str] | None = None,
 ) -> dict[str, Any]:
     candidate = candidate.resolve()
     if not candidate.is_file():
@@ -346,12 +558,12 @@ def run_probe(
     if mode:
         env["MIDA_BEH_MODE"] = mode
 
-    # load_no_crash: each attempt runs an isolated copy under scratch so single-instance
-    # mutex / leftover file locks from prior launches do not poison the gate.
+    # Process-launch probes: isolated copy per attempt (mutex / file locks).
     # marker synthetic fixtures stay in scratch so marker file stays isolated.
-    if probe_kind == "load_no_crash":
+    process_probe = probe_kind in ("load_no_crash", "window_class")
+    if process_probe:
         attempts = max(1, attempts)
-        rate_samples = max(0, int(rate_samples))
+        rate_samples = max(0, int(rate_samples)) if probe_kind == "load_no_crash" else 0
     else:
         attempts = 1
         rate_samples = 0
@@ -365,6 +577,8 @@ def run_probe(
     stderr_tail = ""
     survived_timeout = False
     attempt_notes: list[str] = []
+    classes_seen: list[str] = []
+    exports_found: list[str] = []
     # Gate path: early-exit on first Pass (attempts). Quality path: fixed samples.
     measure_rate = rate_samples > 0
     loop_n = rate_samples if measure_rate else attempts
@@ -372,8 +586,92 @@ def run_probe(
     fail_count = 0
     error_count = 0
 
+    # --- static export_names probe (no process launch) ---
+    if probe_kind == "export_names":
+        req = [x for x in (require_exports or []) if x]
+        if not req:
+            status = "error"
+            error_class = "no_require_exports"
+            result_status = "error"
+            verdict = "Inconclusive"
+            probe_id = PROBE_ID_EXPORTS
+            residuals = list(RESIDUAL_RISKS_EXPORTS)
+        else:
+            exports_found = pe_export_names(candidate)
+            # Case-sensitive PE names; also accept case-insensitive hit for AHK surface.
+            lower_map = {n.lower(): n for n in exports_found}
+            missing: list[str] = []
+            matched: list[str] = []
+            for want in req:
+                if want in exports_found:
+                    matched.append(want)
+                elif want.lower() in lower_map:
+                    matched.append(lower_map[want.lower()])
+                else:
+                    missing.append(want)
+            markers_found = [f"export:{m}" for m in matched]
+            if missing:
+                status = "fail"
+                result_status = "fail"
+                error_class = "missing_exports:" + ",".join(missing)
+                verdict = "Fail"
+            else:
+                status = "pass"
+                result_status = "pass"
+                error_class = f"exports_matched:{len(matched)}"
+                verdict = "Pass"
+            probe_id = PROBE_ID_EXPORTS
+            residuals = list(RESIDUAL_RISKS_EXPORTS)
+        elapsed_ms = int((time.perf_counter() - t0) * 1000)
+        evidence = {
+            "schema_version": SCHEMA_VERSION,
+            "candidate": {
+                "sha256": digest,
+                "size_bytes": size,
+                "role": "candidate",
+            },
+            "reference": {
+                "kind": "none",
+                "sha256": None,
+                "notes": f"probe_kind=export_names require={req}",
+            },
+            "probe": {
+                "id": probe_id,
+                "policy": {
+                    "network": "deny",
+                    "max_wall_ms": max_wall_ms,
+                    "max_output_bytes": max_output_bytes,
+                },
+                "result": {
+                    "status": result_status,
+                    "exit_code": None,
+                    "markers_found": markers_found,
+                    "error_class": error_class,
+                },
+            },
+            "verdict": verdict,
+            "residual_risks": residuals,
+            "producer": {
+                "name": PRODUCER_NAME,
+                "version": PRODUCER_VERSION,
+            },
+            "export_quality": {
+                "required": req,
+                "matched": [m.replace("export:", "") for m in markers_found],
+                "export_count": len(exports_found),
+            },
+        }
+        meta = {
+            "elapsed_ms": elapsed_ms,
+            "scratch": str(scratch),
+            "candidate_path": str(candidate),
+            "probe_kind": probe_kind,
+            "exports_found_sample": exports_found[:40],
+        }
+        return {"evidence": evidence, "meta": meta}
+
     for attempt in range(1, loop_n + 1):
-        if probe_kind == "load_no_crash":
+        if process_probe:
             attempt_dir = scratch / f"run_{attempt}"
             attempt_dir.mkdir(parents=True, exist_ok=True)
             # Keep original basename: some GUI apps key single-instance / paths on name.
@@ -397,6 +695,40 @@ def run_probe(
         else:
             launch_path = candidate
             run_cwd = str(scratch)
+
+        if probe_kind == "window_class":
+            status, exit_code, error_class, win_markers, classes_seen = (
+                _run_window_class_probe(
+                    launch_path,
+                    max_wall_ms=max_wall_ms,
+                    expect_classes=list(expect_window_classes or []),
+                    require_title_substr=require_title_substr,
+                    env=env,
+                    run_cwd=run_cwd,
+                )
+            )
+            markers_found = list(win_markers)
+            survived_timeout = False
+            stdout_tail = ""
+            stderr_tail = ""
+            ok = status == "pass"
+            if ok:
+                pass_count += 1
+            elif status == "error":
+                error_count += 1
+            else:
+                fail_count += 1
+            attempt_notes.append(
+                f"a{attempt}:status={status}:exit={exit_code}:classes={classes_seen}:ok={ok}"
+            )
+            _kill_stale_by_stem(Path(launch_path).stem)
+            _kill_stale_by_stem(candidate.stem)
+            if ok:
+                break
+            if attempt < attempts:
+                time.sleep(0.5 * attempt + 0.3)
+                continue
+            break
 
         status, exit_code, error_class, survived_timeout, stdout_tail, stderr_tail = (
             _run_one_process(
@@ -443,7 +775,11 @@ def run_probe(
         break
 
     elapsed_ms = int((time.perf_counter() - t0) * 1000)
-    samples_run = pass_count + fail_count + error_count if probe_kind == "load_no_crash" else 0
+    samples_run = (
+        pass_count + fail_count + error_count
+        if probe_kind in ("load_no_crash", "window_class")
+        else 0
+    )
 
     if marker_path.is_file():
         try:
@@ -492,6 +828,18 @@ def run_probe(
                 result_status = "pass"
                 error_class = error_class or f"nonzero_non_nt_exit:{exit_code & 0xFFFFFFFF:#x}"
                 verdict = "Pass"
+    elif probe_kind == "window_class":
+        probe_id = PROBE_ID_WINDOW
+        residuals = list(RESIDUAL_RISKS_WINDOW)
+        if status == "pass":
+            result_status = "pass"
+            verdict = "Pass"
+        elif status == "error":
+            result_status = "error"
+            verdict = "Inconclusive"
+        else:
+            result_status = "fail"
+            verdict = "Fail"
     else:
         probe_id = PROBE_ID_MARKER
         residuals = list(RESIDUAL_RISKS_MARKER)
@@ -510,6 +858,13 @@ def run_probe(
         else:
             verdict = "Fail"
 
+    ref_notes = f"mode={mode}" if mode else f"probe_kind={probe_kind}"
+    if probe_kind == "window_class":
+        ref_notes = (
+            f"probe_kind=window_class expect_classes="
+            f"{','.join(expect_window_classes or [])}"
+        )
+
     evidence: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "candidate": {
@@ -520,7 +875,7 @@ def run_probe(
         "reference": {
             "kind": "synthetic_pair" if mode else "none",
             "sha256": None,
-            "notes": f"mode={mode}" if mode else f"probe_kind={probe_kind}",
+            "notes": ref_notes,
         },
         "probe": {
             "id": probe_id,
@@ -553,6 +908,14 @@ def run_probe(
             "pass_rate": round(pass_count / samples_run, 4) if samples_run else 0.0,
             "mode": "fixed_samples" if measure_rate else "gate_early_exit",
         }
+    if probe_kind == "window_class":
+        evidence["window_quality"] = {
+            "expect_classes": list(expect_window_classes or []),
+            "classes_seen": classes_seen,
+            "attempts": attempts,
+            "pass_count": pass_count,
+            "fail_count": fail_count,
+        }
     # Non-compared debug (not part of schema; strip before schema validate)
     meta = {
         "elapsed_ms": elapsed_ms,
@@ -569,6 +932,7 @@ def run_probe(
         "pass_count": pass_count,
         "fail_count": fail_count,
         "error_count": error_count,
+        "classes_seen": classes_seen,
     }
     return {"evidence": evidence, "meta": meta}
 
@@ -642,15 +1006,18 @@ def main() -> int:
     )
     ap.add_argument(
         "--probe-kind",
-        choices=["marker", "load_no_crash"],
+        choices=["marker", "load_no_crash", "window_class", "export_names"],
         default="marker",
-        help="marker=exit_code_marker_v0 (default); load_no_crash=vault PE load survival",
+        help=(
+            "marker=exit_code_marker_v0 (default); load_no_crash=load survival; "
+            "window_class=gui class oracle (W3); export_names=static PE exports (W3)"
+        ),
     )
     ap.add_argument(
         "--attempts",
         type=int,
         default=12,
-        help="load_no_crash only: retry launches on NT exception (default 12)",
+        help="load_no_crash/window_class: retry launches (default 12)",
     )
     ap.add_argument(
         "--rate-samples",
@@ -660,6 +1027,23 @@ def main() -> int:
             "load_no_crash only: run N fixed serial samples for pass-rate quality "
             "(no early exit). When >0, overrides gate early-exit attempts path."
         ),
+    )
+    ap.add_argument(
+        "--expect-window-class",
+        action="append",
+        default=[],
+        help="window_class: expected Win32 class name (repeatable)",
+    )
+    ap.add_argument(
+        "--require-title-substr",
+        default=None,
+        help="window_class: optional title substring (UTF-8/unicode)",
+    )
+    ap.add_argument(
+        "--require-export",
+        action="append",
+        default=[],
+        help="export_names: required export symbol (repeatable; case-insensitive fallback)",
     )
     args = ap.parse_args()
 
@@ -689,8 +1073,12 @@ def main() -> int:
         require_marker = True
         expect_exit = 0
 
-    if args.probe_kind == "load_no_crash":
+    if args.probe_kind in ("load_no_crash", "window_class", "export_names"):
         require_marker = False
+    if args.probe_kind == "window_class" and not args.expect_window_class:
+        ap.error("window_class requires --expect-window-class")
+    if args.probe_kind == "export_names" and not args.require_export:
+        ap.error("export_names requires --require-export")
     packed = run_probe(
         candidate,
         mode=args.mode,
@@ -700,8 +1088,15 @@ def main() -> int:
         require_marker=require_marker,
         work_dir=args.work_dir,
         probe_kind=args.probe_kind,
-        attempts=args.attempts if args.probe_kind == "load_no_crash" else 1,
+        attempts=(
+            args.attempts
+            if args.probe_kind in ("load_no_crash", "window_class")
+            else 1
+        ),
         rate_samples=args.rate_samples if args.probe_kind == "load_no_crash" else 0,
+        expect_window_classes=list(args.expect_window_class or []),
+        require_title_substr=args.require_title_substr,
+        require_exports=list(args.require_export or []),
     )
     evidence = packed["evidence"]
     shape_errs = validate_evidence_shape(evidence)
