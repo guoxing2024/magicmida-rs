@@ -456,7 +456,44 @@ Evidence: `D:\MidaVault\lab\evidence\_beh_gate\r_gto_ui_r2\` (`gto_unpacked_wind
 
 **Stop rule:** Q2 two-round cap reached. Residual stays open; further UI work needs new plan (fuller script graph / AHK exec path), not a third blind dump tweak.
 
-## Residual after VNEXT-BEH (+ W1–W4 + P1 + P2 + R-GTO-UI×2)
+## R-GTO-UI step-1 read-only root-cause diagnosis (2026-07-24, post 4-case fresh reverify)
+
+**Status:** Read-only cdb diagnosis on the fresh `verify_live_gto.exe` candidate (`sha256 6c4bc6e47c14…`, from `live_20260724-172740` fresh unpack, R0B StructuralPassBehaviorPending). **No repo code changed; no fix round opened.** Marked **needs operator authorization for a 3rd round** per Q2 cap.
+
+**Binding work order:** [COURSE_CORRECTION_WORK_ORDER.md](COURSE_CORRECTION_WORK_ORDER.md) W3/P2 + R-GTO-UI residual. This subsection is the step-1 deliverable from the 4-case fresh-reverify follow-up.
+
+**Candidate control-flow (cdb, evidence-level):**
+
+1. `AddressOfEntryPoint = 0xecc000` (confirmed from OptionalHeader). The dump EP is the **unpacker-emitted transfer stub**, not the real AHK OEP.
+2. `0x140ecc000..0x140ecc23b` runs the restored `g_script` table: `GetProcessHeap` (`[0x1400fd480]`) → `RtlAllocateHeap` (`[0x1400fd8b0]`) → memcpy (`0x140ecc164`, `rep movsb`) + hash-scramble (`0x140ecc174`, `rol;xor;store`) over a 320-entry + 321-entry init table. **Allocations succeed** (process-heap is valid in any process); heap-snapshot completeness is **not** the blocker of this path.
+3. `0x140ecc21a` epilogue: `add rsp,38h; pop r15..rbx; xor eax,ecx,edx,r8,r9,r10,r11` (W2 `emit_clear_volatile_regs`) then `jmp 0x1400070b0`.
+4. `0x1400070b0` (the documented captured "OEP") is reached. With **all argument registers zeroed** by step 3:
+   - `test r8,r8; je 0x1400070cc` → **taken** (r8=0)
+   - `lea eax,[rdx-0xC000]; cmp eax,3FFFh; ja 0x1400071ab` → **taken** (rdx=0 → eax=`0xFFFF4000` > `0x3FFF`)
+   - error path `0x1400071ab`: `mov word [rsp+20h],cx; mov ecx,edi; call [0x1400fddc8]; …; ret` at `0x1400071c8`
+5. The transfer stub used `jmp` (not `call`), so the `ret` at `0x1400071c8` returns to the **OS thread-start address** (`KERNEL32!BaseThreadInitThunk+0x20` → `ntdll!RtlExitUserThread+0x40` → `ntdll!NtTerminateProcess(handle=-1)`). Termination stack at exit has **no application frame** (only 4 OS frames). `rcx=-1` at the syscall. **No `ExitProcess` public call, no `RegisterClassExW`, no `CreateWindowExW` ever hit** (both API bps set successfully, neither fired).
+
+**Root-cause cluster (NEW; not identified by R1/R2):**
+
+- **`0x1400070b0` is not the program entry.** Its argument contract is `(rcx=handle, rdx∈[0xC000,0xFFFF]=WM_USER-range message id, r8=wparam, r9=lparam)` — i.e. it is an **AHK WindowProc / message-dispatch function**, not `mainCRTStartup`/`WinMain`. The unpacker's OEP-observation for the GTO/AHK family captured a WindowProc address as "OEP".
+- The W2 `emit_clear_volatile_regs` fix (which closed R-LOAD-FLAKE / `mov [r8],ecx` AV with r8=`0x8000` size leftover) **zeroes rcx/rdx/r8/r9**, which are exactly the WindowProc/WinMain argument registers. With msg=0/wparam=0 the function takes its default/error path and `ret`s. Because the stub `jmp`s (not `call`s), that `ret` lands on the OS thread-start return address → thread exit → process exit 0, **no window created**.
+- **Coupling:** W2 (load-AV fix) and R-GTO-UI (no window) are not independent. The same `emit_clear_volatile_regs` that fixed the AV also clobbers the entry-function argument registers. R1/R2 heap-snapshot tweaks (title-root plant, gscript cap 8→32 KiB) could not fix this — the entry is wrong, not the heap.
+
+**Why load_no_crash is green while UI is Fail:** the WindowProc error path `ret`s cleanly to BaseThreadInitThunk → clean thread exit code 0. No NT exception, no AV. So `load_no_crash_v0` and R0B structural both pass; the behavioral gap only shows under the window oracle.
+
+**Honest confidence:** evidence-level, not 100% proven without AHK private symbols. The causal chain (stub disasm + arg-zero + branch trace + clean-exit stack with zero app frames + no window API hit) is internally consistent and reproducible on the fresh candidate. Counter-hypothesis to rule out in an authorized round: `0x70b0` *is* `WinMain` (not a WindowProc) and the real fix is to set up WinMain args (hInstance from `GetModuleHandleW(NULL)`, lpCmdLine from `GetCommandLineW`, nShowCmd from `GetStartupInfo`) before `jmp`, instead of clearing them — OR to capture the true CRT `mainCRTStartup` as OEP.
+
+**Candidate fix directions for an authorized round 3 (NOT started; awaiting operator):**
+
+1. **OEP re-capture:** find the true AHK program entry (CRT `mainCRTStartup` / AHK `main`) that the packer's `.boot` actually jumped to; set dump `AddressOfEntryPoint` to it. Most robust; addresses the wrong-entry root cause directly.
+2. **Arg-setup stub:** keep `0x70b0` as EP but have the transfer stub call `GetModuleHandleW`/`GetCommandLineW`/`GetStartupInfo` into rcx/rdx/r8/r9 before `jmp` (mirroring CRT pre-WinMain setup). Risk: depends on `0x70b0` actually being `WinMain`.
+3. **Narrow clear-regs:** clear only the specific register that held the bad size leftover (r8 per W2 cdb) instead of all volatiles; leaves WinMain/WindowProc args intact. Lowest-effort but assumes the protected `.boot` left valid args in rcx/rdx/r9 (unverified for the dump path).
+
+**Non-claim:** this diagnosis does not close R-GTO-UI, does not enable a 1.0 sentence, and does not start a code change. It only upgrades R-GTO-UI from "2 blind rounds exhausted" to "root cause identified; awaits operator authorization per Q2 cap."
+
+**Artifacts (vault, not in git):** `D:\MidaVault\scratch\gto_diag_step1*.log`, `gto_diag_oep.log`, `gto_postloop.log`, `gto_iat.log`, `gto_main.log`, `gto_71a0.log`, `verify_live_gto.exe` + `*.dump_snapshot.json`.
+
+## Residual after VNEXT-BEH (+ W1–W4 + P1 + P2 + R-GTO-UI×2 + step-1 dx)
 
 | ID | Item | Blocks 1.0? | Status |
 |----|------|-------------|--------|
@@ -465,7 +502,7 @@ Evidence: `D:\MidaVault\lab\evidence\_beh_gate\r_gto_ui_r2\` (`gto_unpacked_wind
 | R-GTO-LATEST | Fresh dump load without `r4c_gto` walk | Quality | **W2 metric exit** |
 | R-GTO-BOOT | `.boot` heap_global payload size variance under 320-slot cap | Quality | Open (honesty; not load AV root) |
 | R-PURE-LOGIC | Product-logic / business path equivalence | **Yes** for product 1.0 | **Advanced:** controls + pe_string + exit/title/exports; **still blocks 1.0** |
-| R-GTO-UI | Unpacked GTO no product window; protected does | Quality / **1.0-relevant for GTO** | **Open + advanced** (2 rounds; still Fail window; load 1.0) |
+| R-GTO-UI | Unpacked GTO no product window; protected does | Quality / **1.0-relevant for GTO** | **Open + root-caused (step-1 dx):** captured OEP `0x70b0` is a WindowProc, not program entry; W2 clear-regs zeroes its arg regs → default-path `ret` to OS thread-start → exit 0, no window. **Awaiting operator auth for round 3** |
 | R-4CASE-FRESH | Full 4-case attempt=1 on best pins | Claim hygiene | **P1-A closed** (N=10 × 4 = 1.0) |
 | R-X86 | ScyllaHide x86 residual | x86 only | Open |
 | **product 1.0 claim** | Operator + Q7 | Governance | **Still NO** |
