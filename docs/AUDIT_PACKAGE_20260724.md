@@ -67,7 +67,7 @@
 | R-GTO-LATEST | Fresh GTO without r4c walk | Quality | **Metric-closed** (W2) |
 | R-GTO-BOOT | Independent-host `.boot` heap snapshot variance | Quality | Open (honesty) |
 | R-PURE-LOGIC | load / window / title / controls / exit / exports / pe_string ≠ business equivalence | **Yes** | Advanced (W3 + P1 + P2 controls/pe_string); **still blocks 1.0** |
-| R-GTO-UI | Unpacked GTO no product window; protected has NewClassName login | Quality / GTO 1.0 | **Open + evidenced** (p2_logic) |
+| R-GTO-UI | Unpacked GTO no product window; protected has NewClassName login | Quality / GTO 1.0 | **Open + advanced** (2-round fix: title root plant + gscript 32KiB + UI-early dump; cold still ExitProcess(0); p2 + r_gto_ui_r2) |
 | R-4CASE-FRESH | Full 4-case attempt=1 on best pins | Claim hygiene | **P1-A closed** (4× N=10 = 1.0) |
 | R-X86 | ScyllaHide x86 residual | x86 only | Open |
 

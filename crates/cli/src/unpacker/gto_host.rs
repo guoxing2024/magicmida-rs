@@ -13,7 +13,11 @@ use std::path::Path;
 
 use anyhow::{anyhow, Context};
 use tracing::{info, warn};
+use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
 use windows::Win32::System::Threading::{ResumeThread, SuspendThread};
+use windows::Win32::UI::WindowsAndMessaging::{
+    EnumWindows, GetClassNameW, GetWindowThreadProcessId,
+};
 
 use crate::log::{self, LogType};
 use mida_core::{
@@ -30,6 +34,52 @@ use super::early_snapshots::{
 use super::helpers::{resolve_api_addrs, resolve_output_path};
 use super::plugin_host::{enter_dump_phase, SelectedPacker};
 use super::session::ProcessSession;
+
+/// Product login window class for this GTO research sample (protected baseline).
+const GTO_UI_WINDOW_CLASS: &str = "NewClassName";
+/// After the product window appears, wait this long so IAT wrappers / script
+/// settle, then dump (R-GTO-UI). Protected shows the window ~1s after start.
+const GTO_UI_POST_WINDOW_SETTLE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// True when `pid` owns a top-level window with the given class name.
+fn process_has_window_class(pid: u32, class_name: &str) -> bool {
+    struct EnumState {
+        pid: u32,
+        want: Vec<u16>,
+        found: bool,
+    }
+    let mut want: Vec<u16> = class_name.encode_utf16().collect();
+    want.push(0);
+    let mut state = EnumState {
+        pid,
+        want,
+        found: false,
+    };
+    unsafe extern "system" fn enum_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let state = &mut *(lparam.0 as *mut EnumState);
+        if state.found {
+            return BOOL(0);
+        }
+        let mut win_pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut win_pid));
+        if win_pid != state.pid {
+            return BOOL(1);
+        }
+        let mut buf = [0u16; 256];
+        let n = GetClassNameW(hwnd, &mut buf);
+        if n > 0 {
+            let got = &buf[..n as usize];
+            let want = &state.want[..state.want.len().saturating_sub(1)];
+            if got == want {
+                state.found = true;
+                return BOOL(0);
+            }
+        }
+        BOOL(1)
+    }
+    let _ = unsafe { EnumWindows(Some(enum_cb), LPARAM(&mut state as *mut _ as isize)) };
+    state.found
+}
 
 /// Run the AHK/GTO-only unpack host (no `ThemidaState`).
 pub(super) fn run_gto_host(
@@ -209,7 +259,9 @@ pub(super) fn run_gto_host(
     // Always dump via .text scan after settle (r4c green); live RIP freeze disabled.
     let frozen_rip: Option<usize> = None;
     let mut iat_resolved_at: Option<std::time::Instant> = None;
+    let mut ui_seen_at: Option<std::time::Instant> = None;
     let mut loop_count = 0u32;
+    let target_pid = dbg.pid();
 
     // True when an IAT slot is a resolved external API pointer.
     // Reject image-local values (hint/name RVAs, packer trampolines) — those
@@ -279,21 +331,51 @@ pub(super) fn run_gto_host(
             }
         }
 
+        // R-GTO-UI: dump shortly after product login window appears so heap
+        // capture includes post-GUI gscript / title roots (not only IAT+60s).
+        if iat_resolved_at.is_some() && ui_seen_at.is_none() {
+            if process_has_window_class(target_pid, GTO_UI_WINDOW_CLASS) {
+                ui_seen_at = Some(std::time::Instant::now());
+                log::log(
+                    LogType::Good,
+                    &format!(
+                        "GTO host: product window class {GTO_UI_WINDOW_CLASS} seen (after {} ms) — short settle then dump",
+                        poll_start.elapsed().as_millis()
+                    ),
+                );
+            }
+        }
+        if let Some(ui_t) = ui_seen_at {
+            if ui_t.elapsed() >= GTO_UI_POST_WINDOW_SETTLE {
+                log::log(
+                    LogType::Info,
+                    &format!(
+                        "GTO host: UI settle {} ms complete — dump via .text scan",
+                        ui_t.elapsed().as_millis()
+                    ),
+                );
+                break;
+            }
+        }
+
         // After IAT resolves, prefer live .text RIP. Green r4c waited ~60s total
         // observation before .text scan. Hold most of max_wait after IAT so
         // image-local wrapper slots can resolve (r4c had wrapper_call_patch
         // 0/0; short dumps still zeroed 2 image-local slots → load AV risk).
-        if let Some(iat_t) = iat_resolved_at {
-            let settle = max_wait.saturating_sub(std::time::Duration::from_secs(2));
-            if iat_t.elapsed() >= settle && frozen_rip.is_none() {
-                log::log(
-                    LogType::Info,
-                    &format!(
-                        "GTO host: IAT+{} ms without .text RIP — dump via .text scan fallback",
-                        iat_t.elapsed().as_millis()
-                    ),
-                );
-                break;
+        // Skip the long settle when product UI already drove an early dump path.
+        if ui_seen_at.is_none() {
+            if let Some(iat_t) = iat_resolved_at {
+                let settle = max_wait.saturating_sub(std::time::Duration::from_secs(2));
+                if iat_t.elapsed() >= settle && frozen_rip.is_none() {
+                    log::log(
+                        LogType::Info,
+                        &format!(
+                            "GTO host: IAT+{} ms without .text RIP — dump via .text scan fallback",
+                            iat_t.elapsed().as_millis()
+                        ),
+                    );
+                    break;
+                }
             }
         }
 

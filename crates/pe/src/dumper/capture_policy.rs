@@ -62,7 +62,11 @@ impl DumpCapturePolicy {
             ],
             large_table_rvas: vec![0x149d50, 0x141bf0, 0x148bf8, 0x148c00, 0x148c98],
             gscript_root_rva: Some(0x149d50),
-            gscript_root_content_cap: 0x2000,
+            // R-GTO-UI: 0x2000 truncated the live script object while GUI was up
+            // (readable ≥0x20000). Cold restart then ExitProcess(0) without
+            // NewClassName. 0x10000 keeps first-hop + more body; still under
+            // MAX_HEAP_GLOBAL_BYTES (32 KiB) free-list swallow ceiling.
+            gscript_root_content_cap: 0x10000,
             gscript_first_hop_span: 0x200,
             gscript_first_hop_probe: 0x800,
             hot_expand_seed_rvas: vec![0x149d50, 0x18a898, 0x148cb8, 0x148cc0],

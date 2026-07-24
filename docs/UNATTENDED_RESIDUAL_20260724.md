@@ -355,7 +355,7 @@ What **still blocks** calling this perfect-unpack **1.0**:
 | Gap | Why it blocks |
 |-----|----------------|
 | **R-PURE-LOGIC** | No license/script/business-path equivalence; W3 is real signal, not product parity |
-| **R-GTO-UI** | Unpacked GTO has no product window; protected input still does |
+| **R-GTO-UI** | Unpacked GTO still no product window after 2 fix rounds (title root + gscript 32KiB + UI-early dump); cold ExitProcess(0); protected still Pass |
 | **R-GTO-BOOT** | `.boot` heap snapshot variance honesty residual (not load AV root) |
 | **4-case freshness** | W4 did not re-prove lunlun + holdout on post-W1/W2 dumps under attempt=1 |
 | **D3 / experimental** | pure not global; GTO dump stages still experimental flag |
@@ -442,7 +442,21 @@ Fail-closed negatives: `origin_title_neg`, `lunlun_exit_neg`, `holdout_exit_neg`
 
 **R-GTO-UI status:** now **evidence-backed open** (protected Pass vs unpacked Fail on same window oracle). Fix path is dump/runtime completeness (heap/script resume), not probe plumbing.
 
-## Residual after VNEXT-BEH (+ W1–W4 + P1 + P2)
+## R-GTO-UI fix rounds (Q2 cap = 2) — **UI still Fail; load green**
+
+**Date:** 2026-07-24  
+**Code:** [`heap_global_snapshot.rs`](../crates/pe/src/dumper/heap_global_snapshot.rs) (policy hot roots outside fill/.data + plant WRITE), [`capture_policy.rs`](../crates/pe/src/dumper/capture_policy.rs) (gscript cap 0x10000), [`gto_host.rs`](../crates/cli/src/unpacker/gto_host.rs) (NewClassName early dump), [`dump_process.rs`](../crates/pe/src/dumper/dump_process.rs).
+
+| Round | Live | Engineering outcome | window_class `NewClassName` |
+|-------|------|---------------------|----------------------------|
+| R1 | `live_20260724-170104_r_gto_ui_r1` | Capture `0x18a898` size=4096; section `.,\\W` → `MEM_WRITE` | **Fail** exit 0 |
+| R2 | `live_20260724-170937_r_gto_ui_r2` | UI seen ~1046 ms → dump +3s; gscript **32768**; load N=5 **1.0** | **Fail** exit 0 |
+
+Evidence: `D:\MidaVault\lab\evidence\_beh_gate\r_gto_ui_r2\` (`gto_unpacked_window.json` Fail; `gto_load_rate5.json` Pass 5/5).
+
+**Stop rule:** Q2 two-round cap reached. Residual stays open; further UI work needs new plan (fuller script graph / AHK exec path), not a third blind dump tweak.
+
+## Residual after VNEXT-BEH (+ W1–W4 + P1 + P2 + R-GTO-UI×2)
 
 | ID | Item | Blocks 1.0? | Status |
 |----|------|-------------|--------|
@@ -451,7 +465,7 @@ Fail-closed negatives: `origin_title_neg`, `lunlun_exit_neg`, `holdout_exit_neg`
 | R-GTO-LATEST | Fresh dump load without `r4c_gto` walk | Quality | **W2 metric exit** |
 | R-GTO-BOOT | `.boot` heap_global payload size variance under 320-slot cap | Quality | Open (honesty; not load AV root) |
 | R-PURE-LOGIC | Product-logic / business path equivalence | **Yes** for product 1.0 | **Advanced:** controls + pe_string + exit/title/exports; **still blocks 1.0** |
-| R-GTO-UI | Unpacked GTO no product window; protected does | Quality / **1.0-relevant for GTO** | **Open + evidenced** (p2 protected Pass / unpacked Fail) |
+| R-GTO-UI | Unpacked GTO no product window; protected does | Quality / **1.0-relevant for GTO** | **Open + advanced** (2 rounds; still Fail window; load 1.0) |
 | R-4CASE-FRESH | Full 4-case attempt=1 on best pins | Claim hygiene | **P1-A closed** (N=10 × 4 = 1.0) |
 | R-X86 | ScyllaHide x86 residual | x86 only | Open |
 | **product 1.0 claim** | Operator + Q7 | Governance | **Still NO** |

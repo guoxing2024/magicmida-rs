@@ -26,7 +26,10 @@ const MIN_USER_POINTER: u64 = 0x1_0000;
 /// modern heaps routinely live above `0x1_0000_0000`.
 const MAX_USER_POINTER: u64 = 0x0000_7fff_ffff_ffff;
 /// Hard ceiling per object (explicit size field or very hot xref only).
-const MAX_HEAP_GLOBAL_BYTES: usize = 32 * 1024;
+/// R-GTO-UI: gscript root is readable ≥128 KiB while login UI is up; allow
+/// one large root so cold restart keeps more script body (still budget-capped
+/// by MAX_HEAP_GLOBAL_TOTAL_BYTES / slot cap).
+const MAX_HEAP_GLOBAL_BYTES: usize = 64 * 1024;
 /// Default probe ceiling — committed heap regions are multi-page; reading until
 /// RPM fails captures neighbour chunks and burns the aggregate budget.
 const DEFAULT_SIZE_PROBE_CAP: usize = 0x2000;
@@ -107,6 +110,43 @@ pub struct HeapGlobalSnapshot {
     pub content: Vec<u8>,
     /// Slot holds a heap handle, not a data blob.
     pub is_heap_handle: bool,
+}
+
+/// Ensure image sections that receive heap-global plant writes are MEM_WRITE.
+///
+/// Policy hot roots can sit in Themida RX pages (e.g. GTO `0x18a898` in
+/// `.,\\W`). Bootstrap does `mov [image_base+rva], new_ptr` at runtime; without
+/// WRITE that store AVs and the title path stays NULL (R-GTO-UI).
+pub fn ensure_plant_target_sections_writable(
+    pe: &mut PeHeader,
+    heap_globals: &[HeapGlobalSnapshot],
+) -> usize {
+    let mut marked = 0usize;
+    for g in heap_globals {
+        if g.rva == 0 {
+            continue;
+        }
+        let rva = g.rva;
+        let Some(section) = pe.sections.iter_mut().find(|s| {
+            rva >= s.virtual_address
+                && rva < s.virtual_address.saturating_add(s.virtual_size.max(1))
+        }) else {
+            continue;
+        };
+        if section.characteristics & IMAGE_SCN_MEM_WRITE != 0 {
+            continue;
+        }
+        section.characteristics |= IMAGE_SCN_MEM_WRITE;
+        section.header.characteristics = section.characteristics;
+        marked = marked.saturating_add(1);
+        info!(
+            rva = format_args!("{rva:#x}"),
+            section = %section.name,
+            chars = format_args!("{:#x}", section.characteristics),
+            "Marked heap-global plant target section MEM_WRITE"
+        );
+    }
+    marked
 }
 
 /// Detect plain heap-pointer slots referenced by code into zero-raw writable
@@ -241,11 +281,17 @@ pub fn detect_heap_globals(
     // Force-seed known critical AHK slots. RIP scan can miss a site for one
     // dump (p20: 0x148cb8 present live, captured in p19c, absent as candidate)
     // while a sibling gate (0x148cc0) still captures — half-planted pair AVs.
+    //
+    // R-GTO-UI (2026-07-24): policy hot roots are authoritative even when the
+    // slot sits outside fill/.data. GTO title path `0x18a898` lives in a
+    // Themida exec-named section (`.,\\W`, RX) — the old capture_ranges gate
+    // dropped it, cold restart left the plant NULL, login GUI never appeared.
     let mut forced = 0usize;
+    let mut forced_outside_fill_data = 0usize;
     for &rva in &policy.hot_root_rvas {
         let in_capture = capture_ranges.iter().any(|&(lo, hi)| rva >= lo && rva < hi);
         if !in_capture {
-            continue;
+            forced_outside_fill_data = forced_outside_fill_data.saturating_add(1);
         }
         let entry = candidate_scores.entry(rva).or_insert(0);
         if *entry < 64 {
@@ -256,6 +302,7 @@ pub fn detect_heap_globals(
     if forced > 0 {
         info!(
             forced_hot_slots = forced,
+            forced_outside_fill_data,
             total_candidates = candidate_scores.len(),
             "Force-seeded known AHK hot-root RVAs into heap-global candidates"
         );
@@ -317,9 +364,11 @@ pub fn detect_heap_globals(
 
         let in_preferred = preferred.iter().any(|&(lo, hi)| rva >= lo && rva < hi);
         let in_data = data_sec.iter().any(|&(lo, hi)| rva >= lo && rva < hi);
+        let is_policy_hot = policy.is_hot_root(rva);
         // Fill/zero-raw always eligible (subject to xref/size filters).
         // .data only via code xref — early overlay zeros heap roots there.
-        if !in_preferred && !in_data {
+        // Policy hot roots may sit in Themida code-named RX pages (R-GTO-UI).
+        if !in_preferred && !in_data && !is_policy_hot {
             rejected_data += 1;
             continue;
         }
@@ -334,7 +383,8 @@ pub fn detect_heap_globals(
 
         let xref = candidate_scores.get(&rva).copied().unwrap_or(0);
         // .data: require at least one code xref (no linear fill-scan of BSS).
-        if in_data && !in_preferred && xref == 0 {
+        // Policy hot roots are force-scored above; skip the xref gate for them.
+        if in_data && !in_preferred && xref == 0 && !is_policy_hot {
             rejected_data += 1;
             continue;
         }
@@ -386,7 +436,13 @@ pub fn detect_heap_globals(
             continue;
         }
 
-        let probe_cap = if policy.is_large_table(rva)
+        let probe_cap = if policy.gscript_root() == Some(rva) {
+            // Match content cap so R-GTO-UI larger gscript snapshots are reachable.
+            policy
+                .gscript_content_cap()
+                .max(HOT_XREF_SIZE_PROBE_CAP)
+                .min(MAX_HEAP_GLOBAL_BYTES)
+        } else if policy.is_large_table(rva)
             || (xref >= HOT_XREF_THRESHOLD && !policy.is_hot_root(rva))
         {
             HOT_XREF_SIZE_PROBE_CAP.min(MAX_HEAP_GLOBAL_BYTES)
@@ -678,12 +734,14 @@ fn ensure_hot_root_slots(
         }
         let in_preferred = preferred.iter().any(|&(lo, hi)| rva >= lo && rva < hi);
         let in_data = data_sec.iter().any(|&(lo, hi)| rva >= lo && rva < hi);
+        // R-GTO-UI: do not skip policy hot roots that live outside fill/.data.
+        // Example: GTO title object at 0x18a898 in Themida section `.,\\W` (RX).
+        // Capture + plant still work; section WRITE is applied separately.
         if !in_preferred && !in_data {
-            warn!(
+            info!(
                 rva = format_args!("{rva:#x}"),
-                "Hot-root ensure skipped: RVA outside fill/.data"
+                "Hot-root ensure: RVA outside fill/.data — capturing by policy"
             );
-            continue;
         }
         if cookie_blocklist
             .iter()
@@ -2679,5 +2737,13 @@ mod tests {
     #[test]
     fn rejects_unaligned() {
         assert!(!is_heap_pointer(0x31a0_b31, 0x1400_0000_0, 0x1401_0000_0));
+    }
+
+    #[test]
+    fn policy_hot_root_outside_fill_data_is_still_hot() {
+        // Mirrors GTO 0x18a898: listed in ahk_gto defaults, not in .data/.fill.
+        let p = DumpCapturePolicy::ahk_gto_default();
+        assert!(p.is_hot_root(0x18a898));
+        assert!(p.hot_root_rvas.contains(&0x18a898));
     }
 }

@@ -969,6 +969,19 @@ pub fn dump_process(
     // 5b. Heap / container bootstrap (AhkGtoExperimental only).
     // Dump buffer must be mutable so post-CRT can rewrite the CRT wrapper jmp.
     // OreansClassic: never install heap/container bootstrap.
+    // R-GTO-UI: plant targets outside classic .data (Themida RX) need WRITE.
+    if stage_plan.install_heap_bootstrap || stage_plan.detect_heap_globals {
+        let n = super::heap_global_snapshot::ensure_plant_target_sections_writable(
+            &mut pe,
+            &heap_globals,
+        );
+        if n > 0 {
+            info!(
+                sections_marked = n,
+                "Heap-global plant targets marked MEM_WRITE"
+            );
+        }
+    }
     let output_entry_point = if stage_plan.install_heap_bootstrap {
         import_builder
             .as_ref()

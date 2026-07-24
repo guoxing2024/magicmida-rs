@@ -271,6 +271,22 @@ W0 文档对齐（半日级）                    ✅ 2026-07-24
 
 **诚实边界：** Origin 无稳定 registry/file 侧效应可门禁；GTO 运行时 GUI 仍 open（R-GTO-UI）。下一工程刀若冲 GTO 产品行为：查脚本/heap 恢复使 unpacked 到达 `NewClassName`，而非再加静态探针。
 
+#### R-GTO-UI 修复（2026-07-24）— Q2 两轮封顶；**仍非** 1.0
+
+| 轮 | 改动 | 验证 | 结果 |
+|----|------|------|------|
+| R1 | 强制 capture policy hot root `0x18a898`（Themida `.,\\W` RX 页）；plant 目标节标 `MEM_WRITE` | live `r_gto_ui_r1`：slot 已 capture + section WRITE；window_class `NewClassName` | **Fail**（exit 0 无窗）；load 未回归测本轮 |
+| R2 | gscript cap `0x2000→0x10000` + probe 对齐；观察环在 `NewClassName` 出现后 +3s dump | live `r_gto_ui_r2`：UI 于 ~1s 见窗后 dump；gscript size **32768**；load N=5 attempt=1 **1.0** | window_class **仍 Fail**（exit 0） |
+
+**根因进度（证据级，非关闭）：**
+
+1. 旧 dump 丢 title root：`Hot-root ensure skipped: RVA outside fill/.data` @ `0x18a898` — R1 已修。  
+2. 冷启动 plant 在 OEP 前生效（cdb：`0x18a898` / `0x149d50` / `0x141bf0` 非零后 `ExitProcess(0)`）。  
+3. 脚本对象 live 可读 ≥`0x20000`，旧 cap 8 KiB — R2 抬到 32 KiB 仍不足完整脚本图。  
+4. 冷启动仍在 OEP 后立即干净退出，无 `NewClassName` — 更深 AHK 运行时/脚本执行路径，**超出本战场 2 轮**。
+
+**产品 1.0：** **仍 NO**。R-GTO-UI **open**（advanced）。下一刀须新 residual/操作员授权，禁止第 3 轮盲改。
+
 ---
 
 
