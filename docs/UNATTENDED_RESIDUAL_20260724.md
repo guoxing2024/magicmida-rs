@@ -96,7 +96,17 @@ Research tools:
 | Gate optional rate | `tools/_behavior_bb_gate.py --rate-samples N` records `load_quality` on Pass paths |
 | Explicit non-claim | Manifest + pass-rate do **not** upgrade product 1.0 or VNEXT-BEH semantics |
 
-Hot-root / probe policy remains in `heap_global_snapshot.rs` (M2: externalize).
+### M2 capture policy externalization (generic landing, 2026-07-24)
+
+| Piece | Status |
+|-------|--------|
+| `DumpCapturePolicy` | [`crates/pe/src/dumper/capture_policy.rs`](../crates/pe/src/dumper/capture_policy.rs) — hot roots, large tables, gscript root/caps, expand seeds |
+| `DumpOptions.capture_policy` | Empty + `AhkGtoExperimental` → `ahk_gto_default()`; `OreansClassic` stays empty |
+| `detect_heap_globals` | Takes `&DumpCapturePolicy`; helpers (`ensure_hot_root_slots`, first-hop, multi-hop, expand, dangling) all policy-threaded |
+| Live sidecar | `live_20260724-140153_m2_policy_gtoexp` → real `gto_unpacked.dump_snapshot.json` (`mida.dump-snapshot-manifest/v0`, heap_globals=320, containers=1, R0B StructuralPassBehaviorPending) |
+| Rate baseline (N=6, quiet serial) | evidence `_gto_smoke/m2_rate_20260724-140458` — **r4c** 4/6 (0.67); **scan60** 2/6 (0.33). Confirms R-LOAD-FLAKE + prefer r4c pin |
+
+**Explicit non-claim:** policy externalization is product-shape plumbing for case-manifest/plugin fill later; it does **not** change the claim bar or fix load flake. Sample-private RVAs remain only as built-in AHK/GTO defaults inside the policy type.
 
 ### B-B reconfirm (scan60 pin era)
 
@@ -112,7 +122,9 @@ Gate pin order residual: prefer **`r4c_gto` first** for multi-case reliability; 
 1. `tools/_behavior_probe.py` — plain createflags default, basename-preserving isolate copy, stale kill, longer backoff, attempts default 12.  
 2. `tools/_behavior_bb_gate.py` — preferred live tags, max-candidates, case cooldown, attempts 12.  
 3. `crates/pe/src/dumper/header_patch.rs` — clear `IMAGE_FILE_RELOCS_STRIPPED` when dump rebuilds `.reloc`.  
-4. **VNEXT-BEH** — `validation_summary.json` task VNEXT-BEH, batch `bb_gate_pin`.
+4. **VNEXT-BEH** — `validation_summary.json` task VNEXT-BEH, batch `bb_gate_pin`.  
+5. **M1** — `snapshot_manifest` sidecar + probe `--rate-samples`.  
+6. **M2** — `DumpCapturePolicy` + dump-path wiring; live real sidecar; pin rate baseline.
 
 ## Explicit non-claims
 

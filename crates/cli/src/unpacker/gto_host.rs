@@ -502,6 +502,8 @@ pub(super) fn run_gto_host(
         security_cookie_rva: None,
         security_cookie_complement_rva: None,
         pure_rebuild,
+        // Empty → AhkGtoExperimental resolves built-in AHK/GTO hot roots.
+        capture_policy: mida_pe::DumpCapturePolicy::default(),
     };
 
     mida_pe::dump_process(&mut dbg, &dump_opts).map_err(|e| anyhow!("GTO host dump failed: {e}"))?;

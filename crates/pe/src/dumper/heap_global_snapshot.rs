@@ -16,6 +16,7 @@ use tracing::{debug, info, warn};
 
 use crate::header::PeHeader;
 
+use super::capture_policy::DumpCapturePolicy;
 use super::helpers::{alloc_capped, MAX_HEAP_CONTAINER_BYTES};
 
 const IMAGE_SCN_MEM_WRITE: u32 = 0x8000_0000;
@@ -72,41 +73,9 @@ const MIN_HEAP_POINTER: u64 = 0x10_0000;
 /// burn the entire slot budget (0x121xxx/0x122xxx series in p18b). Real AHK
 /// script objects for this sample live well above a few MiB.
 const MIN_GRAPH_CHILD_POINTER: u64 = 0x40_0000;
-/// Known AHK hot roots for this sample family — expand their children first so
-/// high-VA free-list arenas (0x82xxxxxx series in p19c) cannot starve gscript.
-/// Includes string-table pair 0x148cb8/0x148cc0: planting only 0x148cc0 makes
-/// AHK skip init then `mov rdx,[0x148cb8]; cmp rbx,[rdx+10h]` AVs (p20).
-const HOT_GSCRIPT_RVAS: &[u32] = &[
-    0x149d50, // gscript / main script object
-    0x18a898, // hot fill root (title path)
-    0x141bf0, // AHK global object
-    0x148bf8, // large table
-    0x148cb8, // string capacity object (must pair with 0x148cc0)
-    0x148cc0, // string table base (lazy-init gate)
-    0x148cb0, // related string machinery
-    0x148ca8, 0x148c98, 0x148c00,
-];
-/// Large table roots — allow hot size probe. Everything else in HOT_GSCRIPT_RVAS
-/// is a compact object; force-seed xref=64 used to trigger 32 KiB probes that
-/// swallowed free-list neighbours and scrubbed real string edges (p20c).
-///
-/// p21d: keep `0x149d50` as a large-table root (p20f planted it only with the
-/// 32 KiB probe; capping to 4 KiB left `0x149d50=0` at runtime). First-hop
-/// edges are force-admitted as exact children so scrub/multi_fixup no longer
-/// depends on the oversize blob covering them as interiors alone.
-const HOT_LARGE_TABLE_RVAS: &[u32] = &[0x149d50, 0x141bf0, 0x148bf8, 0x148c00, 0x148c98];
-/// gscript / main script object (HOT_GSCRIPT_RVAS[0]).
-const GSCRIPT_ROOT_RVA: u32 = 0x149d50;
-/// Soft cap after capture: keep the dense AHK field table (~0xef0 packed) plus
-/// a little headroom. Still allow HOT probe for readability; trim free-list
-/// tail so expand does not walk 32 KiB of noise.
-const GSCRIPT_ROOT_CONTENT_CAP: usize = 0x2000;
-/// Force-admit every heap pointer in this prefix of gscript before ranked
-/// expand. Packed has 32 live edges in the first 0x100; 0x200 covers the
-/// second half of the object table without free-list flood.
-const GSCRIPT_FIRST_HOP_SPAN: usize = 0x200;
-/// Modest probe for gscript first-hop children (AHK sub-objects ~0x40–0x400).
-const GSCRIPT_FIRST_HOP_PROBE: usize = 0x800;
+// Hot RVAs / gscript knobs: see [`DumpCapturePolicy`] (built-in AHK/GTO defaults
+// via `DumpCapturePolicy::ahk_gto_default`). Do not re-introduce sample-private
+// const tables here — pass policy from DumpOptions instead.
 /// System DLL / wow64 region on x64 Windows (kernel32 etc. live at `0x7ff…`).
 /// Private heaps and user allocations sit well below this.
 const MIN_MODULE_REGION: u64 = 0x0000_7ff0_0000_0000;
@@ -151,6 +120,7 @@ pub fn detect_heap_globals(
     pe: &PeHeader,
     dump_buf: &[u8],
     debugger: &mut dyn mida_core::DebuggerCore,
+    policy: &DumpCapturePolicy,
 ) -> Vec<HeapGlobalSnapshot> {
     if !pe.is_64bit {
         return Vec::new();
@@ -272,7 +242,7 @@ pub fn detect_heap_globals(
     // dump (p20: 0x148cb8 present live, captured in p19c, absent as candidate)
     // while a sibling gate (0x148cc0) still captures — half-planted pair AVs.
     let mut forced = 0usize;
-    for &rva in HOT_GSCRIPT_RVAS {
+    for &rva in &policy.hot_root_rvas {
         let in_capture = capture_ranges.iter().any(|&(lo, hi)| rva >= lo && rva < hi);
         if !in_capture {
             continue;
@@ -416,11 +386,11 @@ pub fn detect_heap_globals(
             continue;
         }
 
-        let probe_cap = if HOT_LARGE_TABLE_RVAS.contains(&rva)
-            || (xref >= HOT_XREF_THRESHOLD && !HOT_GSCRIPT_RVAS.contains(&rva))
+        let probe_cap = if policy.is_large_table(rva)
+            || (xref >= HOT_XREF_THRESHOLD && !policy.is_hot_root(rva))
         {
             HOT_XREF_SIZE_PROBE_CAP.min(MAX_HEAP_GLOBAL_BYTES)
-        } else if HOT_GSCRIPT_RVAS.contains(&rva) {
+        } else if policy.is_hot_root(rva) {
             // Compact string / path objects — never 32 KiB free-list swallow.
             DEFAULT_SIZE_PROBE_CAP.min(MAX_HEAP_GLOBAL_BYTES)
         } else if xref >= HOT_XREF_THRESHOLD {
@@ -502,11 +472,11 @@ pub fn detect_heap_globals(
         content = truncate_to_avoid_overlap(&out, value, content);
         // p21: gscript must stay compact. HOT_LARGE_TABLE used to allow 32 KiB
         // and free-list neighbours polluted first-hop expand + scrub.
-        if rva == GSCRIPT_ROOT_RVA && content.len() > GSCRIPT_ROOT_CONTENT_CAP {
-            content.truncate(GSCRIPT_ROOT_CONTENT_CAP);
+        if policy.gscript_root() == Some(rva) && content.len() > policy.gscript_content_cap() {
+            content.truncate(policy.gscript_content_cap());
             info!(
                 rva = format_args!("{rva:#x}"),
-                cap = GSCRIPT_ROOT_CONTENT_CAP,
+                cap = policy.gscript_content_cap(),
                 "Capped gscript root snapshot to avoid free-list swallow"
             );
         }
@@ -562,6 +532,7 @@ pub fn detect_heap_globals(
         &preferred,
         &data_sec,
         &cookie_blocklist,
+        policy,
     );
 
     // p21: force-admit *every* heap pointer in gscript's first-hop span before
@@ -575,6 +546,7 @@ pub fn detect_heap_globals(
         image_end,
         dump_buf,
         debugger,
+        policy,
     );
 
     // Then: multi-hop from hot gscript roots (bounded) so title / string-table
@@ -587,6 +559,7 @@ pub fn detect_heap_globals(
         image_end,
         dump_buf,
         debugger,
+        policy,
     );
 
     // Pull in sibling objects referenced from captured blobs so multi-range
@@ -599,6 +572,7 @@ pub fn detect_heap_globals(
         image_end,
         dump_buf,
         debugger,
+        policy,
     );
 
     // Oversized RPM probes often swallow neighbouring heap chunks. multi_fixup
@@ -625,6 +599,7 @@ pub fn detect_heap_globals(
         image_end,
         dump_buf,
         debugger,
+        policy,
     );
 
     // Last-chance: any still-external heap edge that is readable live is
@@ -639,6 +614,7 @@ pub fn detect_heap_globals(
         image_end,
         dump_buf,
         debugger,
+        policy,
     );
 
     // multi_fixup first-match: prefer smaller/exact ranges over large parents.
@@ -682,7 +658,7 @@ pub fn detect_heap_globals(
     out
 }
 
-/// Second-chance capture for `HOT_GSCRIPT_RVAS` missing after the main pass.
+/// Second-chance capture for policy hot roots missing after the main pass.
 fn ensure_hot_root_slots(
     out: &mut Vec<HeapGlobalSnapshot>,
     total_bytes: &mut usize,
@@ -694,8 +670,9 @@ fn ensure_hot_root_slots(
     preferred: &[(u32, u32)],
     data_sec: &[(u32, u32)],
     cookie_blocklist: &[(u32, u32)],
+    policy: &DumpCapturePolicy,
 ) {
-    for &rva in HOT_GSCRIPT_RVAS {
+    for &rva in policy.hot_root_rvas.iter() {
         if out.iter().any(|g| g.rva == rva) {
             continue;
         }
@@ -765,7 +742,7 @@ fn ensure_hot_root_slots(
             continue;
         }
 
-        let ensure_probe = if HOT_LARGE_TABLE_RVAS.contains(&rva) {
+        let ensure_probe = if policy.is_large_table(rva) {
             HOT_XREF_SIZE_PROBE_CAP.min(MAX_HEAP_GLOBAL_BYTES)
         } else {
             DEFAULT_SIZE_PROBE_CAP.min(MAX_HEAP_GLOBAL_BYTES)
@@ -860,8 +837,8 @@ fn ensure_hot_root_slots(
         }
         content = trim_trailing_zero_pages(content);
         content = truncate_to_avoid_overlap(out, value, content);
-        if rva == GSCRIPT_ROOT_RVA && content.len() > GSCRIPT_ROOT_CONTENT_CAP {
-            content.truncate(GSCRIPT_ROOT_CONTENT_CAP);
+        if policy.gscript_root() == Some(rva) && content.len() > policy.gscript_content_cap() {
+            content.truncate(policy.gscript_content_cap());
         }
         if content.len() < 8 {
             continue;
@@ -898,7 +875,7 @@ fn process_heaps_or_handle(debugger: &mut dyn mida_core::DebuggerCore, value: u6
     looks_like_heap_handle(debugger, value)
 }
 
-/// Force-admit every heap pointer in the first `GSCRIPT_FIRST_HOP_SPAN` of the
+/// Force-admit every heap pointer in the first `policy.first_hop_span()` of the
 /// gscript root blob, in offset order (no rank-by-VA). p20f scored
 /// `heap_ptrs=2` at runtime on `0x149d50` vs packed `32` — ranked expand
 /// burned the slot budget on free-list neighbours while scrub zeroed the
@@ -916,19 +893,25 @@ fn exhaust_gscript_first_hop(
     image_end: u64,
     dump_buf: &[u8],
     debugger: &mut dyn mida_core::DebuggerCore,
+    policy: &DumpCapturePolicy,
 ) {
     // Reserve room for later expand/dangling; still admit up to ~64 first-hops.
     let slot_cap = MAX_HEAP_GLOBAL_SLOTS.saturating_sub(HEAP_DANGLING_SLOT_RESERVE / 2);
-    let Some(gscript_idx) = out
-        .iter()
-        .position(|g| g.rva == GSCRIPT_ROOT_RVA && !g.is_heap_handle && g.content.len() >= 8)
-    else {
-        warn!("gscript first-hop exhaust skipped: 0x149d50 not captured");
+    let Some(gscript_rva) = policy.gscript_root() else {
+        return;
+    };
+    let Some(gscript_idx) = out.iter().position(|g| {
+        g.rva == gscript_rva && !g.is_heap_handle && g.content.len() >= 8
+    }) else {
+        warn!(
+            rva = format_args!("{gscript_rva:#x}"),
+            "gscript first-hop exhaust skipped: root not captured"
+        );
         return;
     };
 
     // Collect first-hop targets (including interiors of other captures).
-    let span = GSCRIPT_FIRST_HOP_SPAN.min(out[gscript_idx].content.len());
+    let span = policy.first_hop_span().min(out[gscript_idx].content.len());
     let mut targets: Vec<(usize, u64)> = Vec::new();
     let content = &out[gscript_idx].content[..span];
     let mut off = 0usize;
@@ -984,7 +967,7 @@ fn exhaust_gscript_first_hop(
             usize::MAX,
             value,
             debugger,
-            GSCRIPT_FIRST_HOP_PROBE.min(MAX_HEAP_GLOBAL_BYTES),
+            policy.first_hop_probe().min(MAX_HEAP_GLOBAL_BYTES),
         );
         if size < 8 {
             seen_heaps.remove(&value);
@@ -1006,7 +989,7 @@ fn exhaust_gscript_first_hop(
         }
         let mut child = match alloc_capped(
             size,
-            GSCRIPT_FIRST_HOP_PROBE.min(MAX_HEAP_CONTAINER_BYTES),
+            policy.first_hop_probe().min(MAX_HEAP_CONTAINER_BYTES),
             "gscript first-hop child",
         ) {
             Ok(buf) => buf,
@@ -1106,6 +1089,7 @@ fn expand_hot_root_children(
     image_end: u64,
     dump_buf: &[u8],
     debugger: &mut dyn mida_core::DebuggerCore,
+    policy: &DumpCapturePolicy,
 ) {
     const MAX_HOT_TOTAL: usize = 200;
     const MAX_HOT_ROUNDS: usize = 5;
@@ -1117,44 +1101,45 @@ fn expand_hot_root_children(
         return;
     }
 
-    // Seed ONLY the critical script/title roots. Expanding every HOT_GSCRIPT_RVAS
-    // table (0x148c00/0x148c98…) floods the budget with free-list neighbours
-    // while 0x149d50 keeps ~2 live heap_ptrs at runtime (packed has ~32).
+    // Seed ONLY the critical script/title roots. Expanding every hot table
+    // (0x148c00/0x148c98…) floods the budget with free-list neighbours
+    // while gscript keeps ~2 live heap_ptrs at runtime (packed has ~32).
     // p21: gscript first-hop already exhaust-admitted; also seed multi-hop from
     // those exact children (matched by live_ptr in gscript first-hop span).
-    const HOT_EXPAND_SEED_RVAS: &[u32] = &[0x149d50, 0x18a898, 0x148cb8, 0x148cc0];
     let mut frontier: Vec<usize> = out
         .iter()
         .enumerate()
         .filter(|(_, g)| {
-            HOT_EXPAND_SEED_RVAS.contains(&g.rva) && !g.is_heap_handle && g.content.len() >= 8
+            policy.hot_expand_seed_rvas.contains(&g.rva) && !g.is_heap_handle && g.content.len() >= 8
         })
         .map(|(i, _)| i)
         .collect();
     // Collect first-hop heap targets from gscript blob, then map to admitted
     // child indices so hop-2 BFS walks real AHK objects not free-list noise.
-    if let Some(g_idx) = out
-        .iter()
-        .position(|g| g.rva == GSCRIPT_ROOT_RVA && !g.is_heap_handle)
-    {
-        let span = GSCRIPT_FIRST_HOP_SPAN.min(out[g_idx].content.len());
-        let mut first_hop_ptrs: BTreeSet<u64> = BTreeSet::new();
-        let mut off = 0usize;
-        while off + 8 <= span {
-            let v = u64::from_le_bytes(
-                out[g_idx].content[off..off + 8]
-                    .try_into()
-                    .unwrap_or_default(),
-            );
-            off += 8;
-            if is_heap_pointer(v, image_base, image_end) && v >= MIN_GRAPH_CHILD_POINTER {
-                first_hop_ptrs.insert(v);
+    if let Some(gscript_rva) = policy.gscript_root() {
+        if let Some(g_idx) = out
+            .iter()
+            .position(|g| g.rva == gscript_rva && !g.is_heap_handle)
+        {
+            let span = policy.first_hop_span().min(out[g_idx].content.len());
+            let mut first_hop_ptrs: BTreeSet<u64> = BTreeSet::new();
+            let mut off = 0usize;
+            while off + 8 <= span {
+                let v = u64::from_le_bytes(
+                    out[g_idx].content[off..off + 8]
+                        .try_into()
+                        .unwrap_or_default(),
+                );
+                off += 8;
+                if is_heap_pointer(v, image_base, image_end) && v >= MIN_GRAPH_CHILD_POINTER {
+                    first_hop_ptrs.insert(v);
+                }
             }
-        }
-        for (i, g) in out.iter().enumerate() {
-            if g.rva == 0 && !g.is_heap_handle && first_hop_ptrs.contains(&g.live_ptr) {
-                if !frontier.contains(&i) {
-                    frontier.push(i);
+            for (i, g) in out.iter().enumerate() {
+                if g.rva == 0 && !g.is_heap_handle && first_hop_ptrs.contains(&g.live_ptr) {
+                    if !frontier.contains(&i) {
+                        frontier.push(i);
+                    }
                 }
             }
         }
@@ -1173,8 +1158,8 @@ fn expand_hot_root_children(
             let content = &out[idx].content;
             // For the gscript root itself, only walk first-hop span (rest is
             // free-list noise after oversize probes / dense tables).
-            let walk_len = if out[idx].rva == GSCRIPT_ROOT_RVA {
-                GSCRIPT_FIRST_HOP_SPAN.min(content.len())
+            let walk_len = if policy.gscript_root() == Some(out[idx].rva) {
+                policy.first_hop_span().min(content.len())
             } else {
                 content.len()
             };
@@ -1316,11 +1301,11 @@ fn expand_hot_root_children(
 
 /// Priority of a capture as an expand *source*. Hot gscript image roots must
 /// win over cold large tables that point into high-VA free-list arenas.
-fn expand_source_priority(g: &HeapGlobalSnapshot) -> u32 {
+fn expand_source_priority(g: &HeapGlobalSnapshot, policy: &DumpCapturePolicy) -> u32 {
     if g.is_heap_handle || g.content.len() < 8 {
         return 0;
     }
-    if HOT_GSCRIPT_RVAS.contains(&g.rva) {
+    if policy.is_hot_root(g.rva) {
         return 1000;
     }
     if g.rva != 0 {
@@ -1361,6 +1346,7 @@ fn expand_heap_graph(
     image_end: u64,
     dump_buf: &[u8],
     debugger: &mut dyn mida_core::DebuggerCore,
+    policy: &DumpCapturePolicy,
 ) {
     if out.is_empty() {
         return;
@@ -1375,7 +1361,10 @@ fn expand_heap_graph(
     let expand_slot_cap = MAX_HEAP_GLOBAL_SLOTS.saturating_sub(HEAP_DANGLING_SLOT_RESERVE);
     // Inherit parent priority into newly admitted nodes so multi-hop stays
     // biased toward gscript even after the first hop leaves image RVAs.
-    let mut node_priority: Vec<u32> = out.iter().map(expand_source_priority).collect();
+    let mut node_priority: Vec<u32> = out
+        .iter()
+        .map(|g| expand_source_priority(g, policy))
+        .collect();
     for round in 0..MAX_GRAPH_EXPAND_ROUNDS {
         if out.len() >= expand_slot_cap || *total_bytes >= MAX_HEAP_GLOBAL_TOTAL_BYTES {
             break;
@@ -1383,7 +1372,7 @@ fn expand_heap_graph(
         // Keep priority vector aligned (split may have grown `out` between calls).
         while node_priority.len() < out.len() {
             let idx = node_priority.len();
-            node_priority.push(expand_source_priority(&out[idx]));
+            node_priority.push(expand_source_priority(&out[idx], policy));
         }
 
         // (value, best_parent_priority)
@@ -1948,6 +1937,7 @@ fn capture_dangling_edges(
     image_end: u64,
     dump_buf: &[u8],
     debugger: &mut dyn mida_core::DebuggerCore,
+    policy: &DumpCapturePolicy,
 ) {
     const MAX_DANGLING_ADMIT: usize = 96;
     const DANGLING_PROBE_CAP: usize = 0x1000;
@@ -1963,7 +1953,7 @@ fn capture_dangling_edges(
         if g.is_heap_handle || g.content.len() < 8 {
             continue;
         }
-        let weight: u32 = if HOT_GSCRIPT_RVAS.contains(&g.rva) {
+        let weight: u32 = if policy.is_hot_root(g.rva) {
             64
         } else if g.rva != 0 {
             8

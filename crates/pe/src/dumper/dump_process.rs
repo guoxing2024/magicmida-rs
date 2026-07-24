@@ -842,8 +842,17 @@ pub fn dump_process(
     // Zero-raw .fill heap slots must be snapshotted from the LIVE late image
     // before pointer scrub zeros process-local addresses.
     // OreansClassic: leave heap_globals empty (no HOT_GSCRIPT_RVAs path).
+    let capture_policy = opts
+        .capture_policy
+        .clone()
+        .resolve_for_profile(opts.profile);
     let mut heap_globals = if stage_plan.detect_heap_globals {
-        super::heap_global_snapshot::detect_heap_globals(&pe, &dump_buf, debugger)
+        super::heap_global_snapshot::detect_heap_globals(
+            &pe,
+            &dump_buf,
+            debugger,
+            &capture_policy,
+        )
     } else {
         Vec::new()
     };
@@ -1979,6 +1988,7 @@ mod edata_relocation_tests {
             security_cookie_rva: None,
             security_cookie_complement_rva: None,
             pure_rebuild: false,
+            capture_policy: crate::DumpCapturePolicy::default(),
         };
         let out_data = write_output_file(
             &mut pe,

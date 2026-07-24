@@ -243,6 +243,11 @@ pub struct DumpOptions {
     /// R1-E preserves host section VAs and carries host data directories
     /// (import/IAT/TLS content). Typed import rebind is still not in this path.
     pub pure_rebuild: bool,
+
+    /// Heap-global / hot-root capture policy. Empty + [`DumpProfile::AhkGtoExperimental`]
+    /// resolves to built-in AHK/GTO defaults; OreansClassic leaves capture empty
+    /// (stages still gated by profile). Future: case manifest / plugin fill this.
+    pub capture_policy: super::capture_policy::DumpCapturePolicy,
 }
 
 #[cfg(test)]

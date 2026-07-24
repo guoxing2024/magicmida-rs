@@ -358,6 +358,7 @@ pub(super) fn run_post_loop_phases(
             None
         },
         pure_rebuild,
+        capture_policy: mida_pe::DumpCapturePolicy::default(),
     };
 
     mida_pe::dump_process(dbg, &dump_opts).map_err(|e| anyhow!("Dump failed: {e}"))?;

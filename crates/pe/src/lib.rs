@@ -45,8 +45,9 @@ pub use byte_map::{
 pub use dumper::{
     dump_dotnet, dump_process, emit_pure_rebuild, emit_pure_rebuild_with_parity,
     get_original_imports, is_dotnet, plan_from_host_dump, rebuild_import_table,
-    ContainerRestoreMode, DumpOptions, DumpProfile, DumpProfileCapabilities, EarlySectionSnapshot,
-    ExperimentalStagePlan, OepPolicy, PureRebuildEmitOptions, PureRebuildParitySnapshot,
+    ContainerRestoreMode, DumpCapturePolicy, DumpOptions, DumpProfile, DumpProfileCapabilities,
+    EarlySectionSnapshot, ExperimentalStagePlan, OepPolicy, PureRebuildEmitOptions,
+    PureRebuildParitySnapshot,
 };
 pub use error::PeError;
 pub use exception_table::{

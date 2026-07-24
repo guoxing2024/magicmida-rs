@@ -718,6 +718,7 @@ mod tests {
             security_cookie_rva: None,
             security_cookie_complement_rva: None,
             pure_rebuild: false,
+            capture_policy: crate::DumpCapturePolicy::default(),
         };
         let mut pe_legacy = pe.clone();
         let legacy_bytes = write_output_file(

@@ -192,6 +192,7 @@ pub fn generic_unpack(
         security_cookie_rva: None,
         security_cookie_complement_rva: None,
         pure_rebuild: false,
+        capture_policy: mida_pe::DumpCapturePolicy::default(),
     };
 
     mida_pe::dump_process(&mut dbg, &dump_opts).map_err(|e| anyhow!("dump failed: {e}"))?;
