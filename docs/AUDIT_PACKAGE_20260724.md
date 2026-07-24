@@ -61,7 +61,8 @@
 
 | ID | Item | Blocks 1.0? |
 |----|------|-------------|
-| R-LOAD-FLAKE | Origin/GTO intermittent 0xC0000005 without probe retries | Stability |
+| R-LOAD-FLAKE | Origin/GTO intermittent 0xC0000005; multi-case gate worsens GTO independent-host | Stability |
+| R-GTO-BOOT | Independent-host `.boot` ~28 KiB smaller than r4c (per-run heap snapshot) | Quality |
 | R-GTO-LATEST | Newest GTO dumps often Fail; older pin Accepted | Quality |
 | R-PURE-LOGIC | load_no_crash ≠ full product equivalence | **Yes** |
 | R-X86 | ScyllaHide x86 residual | x86 only |

@@ -46,7 +46,18 @@
 | Min observation **60s** after attach | Matches r4c settle; `wrapper_call_patch` 0/0 |
 | Smoke CLI path | Always `D:\MidaVault\scratch\cargo-target\debug\mida-cli.exe` (not repo `target/release`) |
 
-**Load status (revised):** `u_gto_host_scan60` is StructuralPass + IAT-green (98%, OEP `0x70b0`). Quiet single-shot / simple Rate() can be 6/6 Survive; serial `load_no_crash` (attempts=3) saw **Fail then Pass×2** — same class as Origin **R-LOAD-FLAKE**. Gate pins `scan60` first (retries), then `r4c_gto`.
+**Load status (revised):** `u_gto_host_scan60` is StructuralPass + IAT-green (98%, OEP `0x70b0`, `wrapper_call_patch` 0/0). Quiet probe can Pass; serial often Fail then Pass×2 — **R-LOAD-FLAKE**. Under multi-case BB gate pressure, scan60 has been **12/12 Fail** while `r4c_gto` Passes on the same machine.
+
+**`.boot` delta vs r4c (not claim of missing stages):** independent-host stub_size **793016** (`.boot` `0xc2000`) vs r4c **821920** (`.boot` `0xc9000`, +28 KiB). Shared prologue ~568 B then cookie/heap addresses diverge — runtime heap snapshot difference, not IAT/OEP misalignment.
+
+### B-B reconfirm (scan60 pin era)
+
+| Batch | all_ok | GTO winner | Notes |
+|-------|--------|------------|-------|
+| `batch_20260724-125450_bb_gate_reconfirm_scan60` | **true** | `r4c_gto` | scan60 probe Fail (12 attempts); walk to r4c → Accepted. Origin/lunlun/holdout first-pin Accepted |
+| Quiet scan60 alone (post-cooldown, attempts=6) | — | — | **Pass** (`survived_wall_clock_then_killed`) |
+
+Gate pin order residual: prefer **`r4c_gto` first** for multi-case reliability; keep `scan60` as secondary independent-host research pin.
 
 ## Engineering landed (this close)
 
@@ -67,8 +78,9 @@
 
 | ID | Item | Blocks 1.0? |
 |----|------|-------------|
-| R-LOAD-FLAKE | Origin/GTO intermittent 0xC0000005 without retries | Quality / stability |
-| R-GTO-LATEST | Newest independent-host dumps StructuralPass + IAT 98% but still Fail probe; pin `r4c_gto` | Quality |
+| R-LOAD-FLAKE | Origin/GTO intermittent 0xC0000005; worse under multi-case gate pressure | Quality / stability |
+| R-GTO-LATEST | Independent-host (`scan60`) StructuralPass + IAT 98% + quiet Pass, but batch probe often Fail; gate walks to `r4c_gto` | Quality |
+| R-GTO-BOOT | Independent-host `.boot` stub ~28 KiB smaller than r4c (heap cookie/ranges differ per run) | Quality; not proven root of flake alone |
 | R-PURE-LOGIC | Pure dump not proven equivalent to protected product logic | Yes for product 1.0 |
 | R-X86 | ScyllaHide x86 residual | x86 only |
 
