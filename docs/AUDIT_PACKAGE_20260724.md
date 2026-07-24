@@ -59,17 +59,21 @@
 
 ## 4. Residual (still blocks product 1.0)
 
-| ID | Item | Blocks 1.0? |
-|----|------|-------------|
-| R-LOAD-FLAKE | Origin/GTO intermittent 0xC0000005; multi-case gate worsens GTO independent-host | Stability |
-| R-GTO-BOOT | Independent-host `.boot` ~28 KiB smaller than r4c (per-run heap snapshot) | Quality |
-| R-GTO-LATEST | Newest GTO dumps often Fail; older pin Accepted | Quality |
-| R-PURE-LOGIC | load_no_crash ≠ full product equivalence | **Yes** |
-| R-X86 | ScyllaHide x86 residual | x86 only |
+**W4 claim-bar (2026-07-24):** product **1.0 = NO**. Course-correction W0–W4 closed at metric/governance; see [UNATTENDED_RESIDUAL_20260724.md](UNATTENDED_RESIDUAL_20260724.md) W4 + [COURSE_CORRECTION_WORK_ORDER.md](COURSE_CORRECTION_WORK_ORDER.md).
 
-### Origin crash note (engineering)
+| ID | Item | Blocks 1.0? | Status after W1–W4 |
+|----|------|-------------|-------------------|
+| R-LOAD-FLAKE | Origin/GTO quiet attempt=1 load | Stability | **Metric-closed** (W1 Origin scrub_v2; W2 GTO clear-regs); W4 reconfirm Origin+GTO N=5 = 1.0 |
+| R-GTO-LATEST | Fresh GTO without r4c walk | Quality | **Metric-closed** (W2) |
+| R-GTO-BOOT | Independent-host `.boot` heap snapshot variance | Quality | Open (honesty) |
+| R-PURE-LOGIC | load survival / window / exports ≠ business equivalence | **Yes** | Partial (W3 oracles); **still blocks 1.0** |
+| R-GTO-UI | Unpacked GTO no product window | Quality | Open |
+| R-4CASE-FRESH | Full 4-case post-W1/W2 fresh attempt=1 | Claim hygiene | Open (W4 only winners) |
+| R-X86 | ScyllaHide x86 residual | x86 only | Open |
 
-cdb: `o+0x39e5c` `xchg [r10]` with bad `r10`; IAT neighborhood includes **GetCurrentThreadId**. Structural IAT intact; failure is runtime/intermittent.
+### Origin crash note (engineering, historical)
+
+Pre-W1 cdb: `o+0x39e5c` `xchg [r10]` with bad `r10` (kernel-canonical object head `0xfc388`). Fixed at metric by W1 scrub_v2; retained as root-cause archive.
 
 ---
 

@@ -63,7 +63,7 @@ W0 文档对齐（半日级）                    ✅ 2026-07-24
  → W1 Origin 单发加载稳定                 ✅ metric exit（scrub_v2 20/20）
  → W2 GTO 最新 dump 不 pin 过门           ✅ metric exit（clear-regs 3× live 10/10）
  → W3 行为探针升级（有意义的 oracle）     ✅ metric exit（window_class + export_names）
- → W4 宣称门槛复审（仅当 W1–W3 证据齐）   ⬜ next（默认不宣称 1.0）
+ → W4 宣称门槛复审                        ✅ 2026-07-24 — **产品 1.0 = NO**（默认；无操作员授权）
 ```
 
 **W1 关闭摘要（2026-07-24）：** 根因 = kernel-canonical object head `0xfc388` + cookie complement 误植 + 过宽 scrub；fix = `data_reinit` kernel/low-4GB + `heap_bootstrap` 邻接 plant。证据：`origin_w1_scrub_v2_rate_20260724-151615`（pass_rate=1.0）。**非 1.0。** 详见 residual W1 节。
@@ -234,7 +234,24 @@ W0 文档对齐（半日级）                    ✅ 2026-07-24
 
 **本战场默认产物：** 更新 audit package「距 1.0 清单」——不是发版说明。
 
+#### W4 关闭摘要（2026-07-24）— **产品 1.0 = NO**
+
+| 问题 | 结论 | 证据 |
+|------|------|------|
+| W1–W3 仍成立？ | **是** | vault `D:\MidaVault\lab\evidence\_beh_gate\w4_review\` |
+| Origin load N=5 attempt=1 | **1.0** | `origin_load_rate5.json`（candidate `w1_scrub_v2`） |
+| GTO load N=5 attempt=1 | **1.0** | `gto_load_rate5.json`（candidate `w2_clearregs1`） |
+| 行为超出 load survival？ | **是** | Origin `gui_window_class_v0` Pass + compose Accepted；GTO `pe_export_names_v0` Pass + compose Accepted |
+| 4 案新鲜路径全量单发？ | **本轮未全量重跑** | 仅 Origin+GTO 胜者 pin；lunlun / holdout 仍依 B-B 历史批次，**不**当作 W4 新证 |
+| pure / GTO 策略 | **不变** | D3 pure=Origin-only；GTO 仍 `ahk-gto-experimental` |
+| **产品 1.0 宣称** | **否** | 无操作员显式授权；R-PURE-LOGIC 未关；无 Q7 四案全量重跑 |
+
+**纠偏阶段状态：** W0–W4 串行关闭。下一阶段 **不是** 自动 1.0，而是：  
+- 若冲 1.0：先补 4 案新鲜单发 + 更深 R-PURE-LOGIC，再要操作员授权 + Q7；  
+- 若转平台：操作员须显式改目标（§8），禁止借用 1.0 措辞。
+
 ---
+
 
 ## 4. 每战场通用军规
 

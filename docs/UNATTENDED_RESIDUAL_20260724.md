@@ -313,20 +313,86 @@ First-pin style: clearregs1 `--attempts 3` early-exit → **Pass** on attempt 1 
 
 **Residual after W3:** R-PURE-LOGIC **narrowed** (real signal exists) but **not closed** — license/script/business path still unproven. GTO runtime GUI oracle still open.
 
-## Residual after VNEXT-BEH (+ W1 + W2 + W3)
+## W4 — Claim-bar review (audit only) — **product 1.0 = NO**
+
+**Work order:** [COURSE_CORRECTION_WORK_ORDER.md](COURSE_CORRECTION_WORK_ORDER.md) W4  
+**Date:** 2026-07-24  
+**Nature:** Written distance-to-1.0 audit + W1–W3 evidence reconfirm. **Not** a release note. **Not** an automatic claim upgrade.
+
+### Reconfirm protocol (winning candidates only)
+
+| Check | Candidate | Result | Evidence |
+|-------|-----------|--------|----------|
+| Origin load N=5 attempt=1 | `live_20260724-151549_w1_scrub_v2` | **pass_rate=1.0** | `D:\MidaVault\lab\evidence\_beh_gate\w4_review\origin_load_rate5.json` |
+| GTO load N=5 attempt=1 | `live_20260724-155543_w2_clearregs1_gtoexp` | **pass_rate=1.0** | `…\w4_review\gto_load_rate5.json` |
+| Origin window oracle | same Origin | **Pass** `gui_window_class_v0` (`PigToGoLicenseDialog`; title marker 授权验证) | `…\origin_window.json` |
+| GTO export oracle | same GTO | **Pass** `pe_export_names_v0` (AhkAssign/AddScript/ahkExec/MinHookEnable) | `…\gto_exports.json` |
+| Origin compose | window evidence | **Accepted** | `…\origin_compose.json` |
+| GTO compose | export evidence | **Accepted** | `…\gto_compose.json` |
+
+SHA256 (unchanged vs W1/W2 winners): Origin `4ede58a5…b7cb`; GTO `2043df64…9126`.
+
+### Claim questions (W4 table)
+
+| Question | Answer | Notes |
+|----------|--------|-------|
+| Behavior beyond load survival? | **YES** | W3 oracles reconfirmed Pass + compose Accepted on both sides |
+| 4-case fresh single-shot load still green? | **NOT fully re-run this turn** | Only Origin+GTO winners; lunlun / xiongxiong_duokai still rest on historical B-B pin batch — **do not** treat as fresh W4 proof |
+| pure / GTO product policy? | **Unchanged** | D3 pure Origin-only; GTO remains `ahk-gto-experimental` |
+| Write product **1.0**? | **NO** | Default W4 outcome; no operator authorization; no Q7 full 4-case re-run |
+
+### Distance to product 1.0 (honest gap list)
+
+What is **closed** (engineering / metric, not product):
+
+1. R0B structural gate + VNEXT-BEH historical B-B (`load_no_crash_v0` + pin/retry era).  
+2. Origin quiet attempt=1 load (W1 scrub_v2, N=20).  
+3. GTO independent-host quiet attempt=1 load without r4c walk (W2 clear-regs).  
+4. Minimal non-survival oracles: Origin window class; GTO PE export surface (W3).
+
+What **still blocks** calling this perfect-unpack **1.0**:
+
+| Gap | Why it blocks |
+|-----|----------------|
+| **R-PURE-LOGIC** | No license/script/business-path equivalence; W3 is real signal, not product parity |
+| **R-GTO-UI** | Unpacked GTO has no product window; protected input still does |
+| **R-GTO-BOOT** | `.boot` heap snapshot variance honesty residual (not load AV root) |
+| **4-case freshness** | W4 did not re-prove lunlun + holdout on post-W1/W2 dumps under attempt=1 |
+| **D3 / experimental** | pure not global; GTO dump stages still experimental flag |
+| **Governance** | Q7 + operator explicit auth required before any 1.0 sentence |
+
+### W4 decision (binding until operator overrides)
+
+```text
+product_1.0_claim = NO
+vnext_beh_status  = closed (historical; load_survival era)
+course_correction = W0–W4 complete
+next_default      = residual-driven work only; no silent claim upgrade
+```
+
+**Allowed next moves without 1.0 language:** deepen R-PURE-LOGIC oracles; optional 4-case fresh rate on post-W1/W2 paths; GTO UI research.  
+**Forbidden:** marketing 1.0, equating W4 reconfirm with product release, expanding pure beyond Origin without D3 change.
+
+## Residual after VNEXT-BEH (+ W1 + W2 + W3 + W4)
 
 | ID | Item | Blocks 1.0? | Status |
 |----|------|-------------|--------|
-| R-LOAD-FLAKE (Origin quiet) | attempt=1 N≥20 load survival | Quality | **W1 metric exit** (scrub_v2 20/20) |
-| R-LOAD-FLAKE (GTO quiet / fresh host) | attempt=1 load survival on independent-host dumps | Quality | **W2 metric exit** (clear-regs 3× 10/10) |
+| R-LOAD-FLAKE (Origin quiet) | attempt=1 N≥20 load survival | Quality | **W1 metric exit** (scrub_v2 20/20); W4 reconfirm N=5 still 1.0 |
+| R-LOAD-FLAKE (GTO quiet / fresh host) | attempt=1 load survival on independent-host dumps | Quality | **W2 metric exit** (clear-regs 3× 10/10); W4 reconfirm N=5 still 1.0 |
 | R-GTO-LATEST | Fresh dump load without `r4c_gto` walk | Quality | **W2 metric exit** (preferred pins = clearregs) |
 | R-GTO-BOOT | `.boot` heap_global payload size variance under 320-slot cap | Quality | Open (honesty; not load AV root) |
-| R-PURE-LOGIC | Product-logic / business path equivalence | **Yes** for product 1.0 | **Partial:** W3 oracles give real signal; full logic still open → W4 review only |
+| R-PURE-LOGIC | Product-logic / business path equivalence | **Yes** for product 1.0 | **Partial:** W3/W4 oracles real; full logic open → **blocks 1.0** |
 | R-GTO-UI | Unpacked GTO no product window yet (protected does) | Quality | Open research |
+| R-4CASE-FRESH | Full 4-case post-W1/W2 attempt=1 on fresh paths | Claim hygiene | Open (W4 only reconfirmed Origin+GTO winners) |
 | R-X86 | ScyllaHide x86 residual | x86 only | Open |
+| **product 1.0 claim** | Operator + Q7 | Governance | **W4 = NO** |
 
 ## Re-run
 
 ```powershell
+# W4-style winning-candidate reconfirm (not full 4-case):
+# vault: D:\MidaVault\lab\evidence\_beh_gate\w4_review\
+
 python tools/_behavior_bb_gate.py --cases origin_macro,lunlun_software,xiongxiong_duokai,gto_launcher --write-summary --tag bb_gate_pin --max-wall-ms 8000 --attempts 12 --max-candidates 3
 ```
+
