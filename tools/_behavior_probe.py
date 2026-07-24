@@ -54,6 +54,9 @@ RESIDUAL_RISKS_LOAD = [
     "non_nt_nonzero_exit_treated_as_Pass_for_load_no_crash_v0",
     "cwd_is_candidate_parent_for_load_probe",
     "load_no_crash_retries_on_nt_exception",
+    "load_no_crash_runs_isolated_copy_per_attempt",
+    "load_no_crash_uses_plain_createflags_by_default",
+    "origin_like_gui_may_av_intermittently_on_bad_heap_paths",
 ]
 
 
@@ -173,6 +176,67 @@ def _is_nt_exception_exit(code: int | None) -> bool:
     return u >= 0xC0000000
 
 
+def _terminate_proc(proc: subprocess.Popen[Any]) -> None:
+    """Best-effort kill of launched process (and Windows child tree via taskkill)."""
+    try:
+        if proc.poll() is not None:
+            return
+    except Exception:
+        return
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+        except Exception:
+            pass
+    try:
+        proc.kill()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=3.0)
+    except Exception:
+        pass
+
+
+def _kill_stale_by_stem(stem: str) -> None:
+    """Kill leftover probe children by image stem (Windows). Best-effort."""
+    if os.name != "nt" or not stem:
+        return
+    # taskkill image name must include .exe on Windows.
+    names = {f"{stem}.exe", stem}
+    for name in names:
+        try:
+            subprocess.run(
+                ["taskkill", "/IM", name, "/T", "/F"],
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+        except Exception:
+            pass
+
+
+def _load_createflags() -> int:
+    """Windows creation flags for load_no_crash launches.
+
+    Default is plain (0): Origin/GTO flaky AVs were *worse* under
+    CREATE_NO_WINDOW in A/B sampling. Override with MIDA_BEH_CREATEFLAGS
+    (hex or decimal int), e.g. 0x08000200 for NEW_PROCESS_GROUP|CREATE_NO_WINDOW.
+    """
+    raw = (os.environ.get("MIDA_BEH_CREATEFLAGS") or "").strip()
+    if not raw:
+        return 0
+    try:
+        return int(raw, 0)
+    except ValueError:
+        return 0
+
+
 def _run_one_process(
     candidate: Path,
     *,
@@ -196,9 +260,9 @@ def _run_one_process(
     survived_timeout = False
     creationflags = 0
     if os.name == "nt" and probe_kind == "load_no_crash":
-        # Avoid inheriting a pipe-backed console that some GUI unpacks mishandle.
-        creationflags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
+        creationflags = _load_createflags()
 
+    proc: subprocess.Popen[Any] | None = None
     try:
         proc = subprocess.Popen(
             cmd,
@@ -218,15 +282,13 @@ def _run_one_process(
             status = "pass"
         except subprocess.TimeoutExpired:
             survived_timeout = True
-            proc.kill()
-            try:
-                if probe_kind == "load_no_crash":
-                    proc.wait(timeout=2.0)
+            _terminate_proc(proc)
+            out_b, err_b = b"", b""
+            if probe_kind != "load_no_crash":
+                try:
+                    out_b, err_b = proc.communicate(timeout=1.0)
+                except Exception:
                     out_b, err_b = b"", b""
-                else:
-                    out_b, err_b = proc.communicate(timeout=2.0)
-            except Exception:
-                out_b, err_b = b"", b""
             status = "timeout"
             error_class = "wall_clock_timeout"
             exit_code = None
@@ -237,6 +299,8 @@ def _run_one_process(
     except OSError as e:
         status = "error"
         error_class = f"os_error:{e.__class__.__name__}"
+        if proc is not None:
+            _terminate_proc(proc)
     return status, exit_code, error_class, survived_timeout, stdout_tail, stderr_tail
 
 
@@ -266,13 +330,12 @@ def run_probe(
     if mode:
         env["MIDA_BEH_MODE"] = mode
 
-    # load_no_crash: run from candidate parent so relative DLL/sidecar paths resolve;
+    # load_no_crash: each attempt runs an isolated copy under scratch so single-instance
+    # mutex / leftover file locks from prior launches do not poison the gate.
     # marker synthetic fixtures stay in scratch so marker file stays isolated.
     if probe_kind == "load_no_crash":
-        run_cwd = str(candidate.parent)
         attempts = max(1, attempts)
     else:
-        run_cwd = str(scratch)
         attempts = 1
 
     t0 = time.perf_counter()
@@ -286,9 +349,30 @@ def run_probe(
     attempt_notes: list[str] = []
 
     for attempt in range(1, attempts + 1):
+        if probe_kind == "load_no_crash":
+            attempt_dir = scratch / f"run_{attempt}"
+            attempt_dir.mkdir(parents=True, exist_ok=True)
+            # Keep original basename: some GUI apps key single-instance / paths on name.
+            run_exe = attempt_dir / candidate.name
+            try:
+                shutil.copy2(candidate, run_exe)
+            except OSError as e:
+                status = "error"
+                error_class = f"copy_error:{e.__class__.__name__}"
+                attempt_notes.append(f"a{attempt}:copy_fail:{e}")
+                if attempt < attempts:
+                    time.sleep(0.6 * attempt + 0.4)
+                    continue
+                break
+            launch_path = run_exe
+            run_cwd = str(attempt_dir)
+        else:
+            launch_path = candidate
+            run_cwd = str(scratch)
+
         status, exit_code, error_class, survived_timeout, stdout_tail, stderr_tail = (
             _run_one_process(
-                candidate,
+                launch_path,
                 mode=mode,
                 max_wall_ms=max_wall_ms,
                 max_output_bytes=max_output_bytes,
@@ -306,8 +390,12 @@ def run_probe(
             # Accept first non-error non-NT attempt (timeout survival or any exit).
             if status != "error" and not nt_fail:
                 break
+            # Clean stragglers before retry (mutex / zombie GUI).
+            _kill_stale_by_stem(Path(launch_path).stem)
+            _kill_stale_by_stem(candidate.stem)
             if attempt < attempts and (nt_fail or status == "error"):
-                time.sleep(0.15)
+                # Backoff: Origin pure shows ~40-80% survival; need space between AVs.
+                time.sleep(0.6 * attempt + 0.5)
                 continue
             break
         break
@@ -489,8 +577,8 @@ def main() -> int:
     ap.add_argument(
         "--attempts",
         type=int,
-        default=5,
-        help="load_no_crash only: retry launches on NT exception (default 5)",
+        default=12,
+        help="load_no_crash only: retry launches on NT exception (default 12)",
     )
     args = ap.parse_args()
 

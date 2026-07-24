@@ -23,6 +23,8 @@ pub(crate) fn validate_and_patch_pe_header(
     opts: &DumpOptions,
 ) -> Result<(), PeError> {
     const IMAGE_FILE_EXECUTABLE_IMAGE: u16 = 0x0002;
+    /// Protected inputs often set this; dumps rebuild `.reloc` and must not keep it.
+    const IMAGE_FILE_RELOCS_STRIPPED: u16 = 0x0001;
     let valid_subsystems: [u16; 5] = [2, 3, 7, 9, 10];
     if pe.nt_headers.file_header.characteristics & IMAGE_FILE_EXECUTABLE_IMAGE == 0 {
         pe.nt_headers.file_header.characteristics |= IMAGE_FILE_EXECUTABLE_IMAGE;
@@ -66,6 +68,13 @@ pub(crate) fn validate_and_patch_pe_header(
                 info!("validated PE header fields");
             }
         }
+    }
+    // Dump path rebuilds base relocations (`.reloc`). Carrying
+    // IMAGE_FILE_RELOCS_STRIPPED from the protected disk PE makes R0B
+    // aslr_reloc_consistency fail with relocs_stripped_but_present.
+    if pe.nt_headers.file_header.characteristics & IMAGE_FILE_RELOCS_STRIPPED != 0 {
+        pe.nt_headers.file_header.characteristics &= !IMAGE_FILE_RELOCS_STRIPPED;
+        debug!("cleared FileHeader.IMAGE_FILE_RELOCS_STRIPPED for dump emit");
     }
     Ok(())
 }

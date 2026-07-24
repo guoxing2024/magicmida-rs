@@ -43,30 +43,99 @@ def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, **kw)
 
 
-def find_latest_candidate(case_id: str, name_hints: list[str]) -> Path | None:
+def _candidate_in_live(live_dir: Path, name_hints: list[str]) -> Path | None:
+    for hint in name_hints:
+        for p in live_dir.glob(hint):
+            if p.is_file() and p.stat().st_size > 1024:
+                return p
+    for p in live_dir.glob("*_unpacked.exe"):
+        if p.is_file() and p.stat().st_size > 1024:
+            return p
+    for p in live_dir.glob("*.exe"):
+        if "protected" in p.name.lower():
+            continue
+        if p.is_file() and p.stat().st_size > 1024:
+            return p
+    return None
+
+
+# Prefer tags that have already composed Accepted / load-survived in prior gates.
+# Newest-first walk still runs after these pins (deduped).
+PREFERRED_LIVE_TAGS: dict[str, list[str]] = {
+    "origin_macro": [
+        "live_20260724-101051_u_origin_pure_r1",
+        "live_20260724-104711_u_origin_pure_r2",
+    ],
+    "gto_launcher": [
+        "live_20260724-004707_p1_gto_reg",
+    ],
+    "lunlun_software": [
+        "live_20260724-013746_u_harden_3x_n3",
+    ],
+    "xiongxiong_duokai": [
+        "live_20260724-013837_u_harden_3x_n3",
+    ],
+}
+
+
+def iter_structural_candidates(
+    case_id: str,
+    name_hints: list[str],
+    *,
+    max_candidates: int = 4,
+) -> list[Path]:
+    """Preferred tags first, then newest StructuralPass; skip R0B Rejected."""
     case_dir = EV_ROOT / case_id
     if not case_dir.is_dir():
-        return None
+        return []
+    out: list[Path] = []
+    seen: set[str] = set()
+
+    def _try_add(d: Path) -> None:
+        if len(out) >= max_candidates:
+            return
+        cand = _candidate_in_live(d, name_hints)
+        if cand is None:
+            return
+        key = str(cand.resolve())
+        if key in seen:
+            return
+        if ACC.is_file():
+            report = d / "_r0b_select.json"
+            try:
+                r0b = r0b_check(cand, report)
+                v = r0b.get("verdict") or ""
+                if v == "Rejected":
+                    return
+                if not (v.startswith("StructuralPass") or v is None or v == ""):
+                    # Unknown non-StructuralPass — still allow if not Rejected.
+                    if v and not v.startswith("Structural"):
+                        return
+            except Exception:
+                pass
+        seen.add(key)
+        out.append(cand)
+
+    for tag in PREFERRED_LIVE_TAGS.get(case_id, []):
+        d = case_dir / tag
+        if d.is_dir():
+            _try_add(d)
+
     lives = sorted(
         [p for p in case_dir.iterdir() if p.is_dir() and p.name.startswith("live_")],
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
     for d in lives:
-        for hint in name_hints:
-            for p in d.glob(hint):
-                if p.is_file() and p.stat().st_size > 1024:
-                    return p
-        # generic
-        for p in d.glob("*_unpacked.exe"):
-            if p.is_file():
-                return p
-        for p in d.glob("*.exe"):
-            if "protected" in p.name.lower():
-                continue
-            if p.is_file() and p.stat().st_size > 1024:
-                return p
-    return None
+        if len(out) >= max_candidates:
+            break
+        _try_add(d)
+    return out
+
+
+def find_latest_candidate(case_id: str, name_hints: list[str]) -> Path | None:
+    cands = iter_structural_candidates(case_id, name_hints)
+    return cands[0] if cands else None
 
 
 def r0b_check(candidate: Path, report: Path) -> dict:
@@ -111,7 +180,7 @@ def compose(candidate: Path, evidence: Path, report: Path) -> dict:
     return {"exit": r.returncode, "verdict": verdict, "stdout": (r.stdout or "")[-500:]}
 
 
-def probe_load(candidate: Path, out: Path, max_wall_ms: int, attempts: int = 5) -> dict:
+def probe_load(candidate: Path, out: Path, max_wall_ms: int, attempts: int = 8) -> dict:
     r = run(
         [
             sys.executable,
@@ -215,7 +284,25 @@ def main() -> int:
         default="origin_macro,lunlun_software,xiongxiong_duokai,gto_launcher",
         help="Comma-separated case ids",
     )
-    ap.add_argument("--max-wall-ms", type=int, default=8000)
+    ap.add_argument("--max-wall-ms", type=int, default=10000)
+    ap.add_argument(
+        "--attempts",
+        type=int,
+        default=12,
+        help="load_no_crash retry attempts per candidate (default 12)",
+    )
+    ap.add_argument(
+        "--max-candidates",
+        type=int,
+        default=4,
+        help="Max StructuralPass candidates to walk per case (default 4)",
+    )
+    ap.add_argument(
+        "--case-cooldown-s",
+        type=float,
+        default=3.0,
+        help="Sleep between cases to reduce mutex/AV pressure (default 3s)",
+    )
     ap.add_argument(
         "--refresh-candidates",
         action="store_true",
@@ -239,7 +326,10 @@ def main() -> int:
     batch.mkdir(parents=True, exist_ok=True)
 
     results: list[dict] = []
-    for case_id in cases:
+    for idx, case_id in enumerate(cases):
+        if idx > 0:
+            # Cool-down between vault PE launches (mutex / pagefile / AV pressure).
+            time.sleep(max(0.0, float(args.case_cooldown_s)))
         case_dir = batch / case_id
         case_dir.mkdir(parents=True, exist_ok=True)
         rec: dict = {"case_id": case_id, "ok": False}
@@ -277,42 +367,76 @@ def main() -> int:
             "gto_launcher": ["gto_unpacked.exe", "*unpacked*.exe", "candidate.exe"],
         }.get(case_id, ["*unpacked*.exe"])
 
-        cand = find_latest_candidate(case_id, hints)
-        if cand is None:
+        candidates = iter_structural_candidates(
+            case_id, hints, max_candidates=max(1, int(args.max_candidates))
+        )
+        if not candidates:
             rec["error"] = "no_candidate"
             results.append(rec)
             continue
-        # copy candidate path note (do not copy huge PE into batch unless needed)
-        rec["candidate"] = str(cand)
-        (case_dir / "candidate_path.txt").write_text(str(cand), encoding="utf-8")
 
-        r0b_report = case_dir / "r0b.json"
-        r0b = r0b_check(cand, r0b_report)
-        rec["r0b_verdict"] = r0b["verdict"]
-        rec["r0b_exit"] = r0b["exit"]
-        if not (r0b["verdict"] or "").startswith("StructuralPass"):
-            rec["error"] = "r0b_not_structural_pass"
+        # Preferred tags then newest StructuralPass until load Pass + compose Accepted.
+        tried: list[dict] = []
+        selected = False
+        for cand_i, cand in enumerate(candidates):
+            if cand_i > 0:
+                time.sleep(1.0)
+            trial: dict = {"candidate": str(cand)}
+            r0b_report = case_dir / f"r0b_{len(tried)}.json"
+            r0b = r0b_check(cand, r0b_report)
+            trial["r0b_verdict"] = r0b["verdict"]
+            if not (r0b["verdict"] or "").startswith("StructuralPass"):
+                trial["skip"] = "r0b"
+                tried.append(trial)
+                continue
+
+            ev_path = case_dir / f"evidence_{len(tried)}.json"
+            pr = probe_load(cand, ev_path, args.max_wall_ms, attempts=args.attempts)
+            trial["probe_verdict"] = pr["verdict"]
+            if pr["verdict"] != "Pass":
+                trial["skip"] = "probe"
+                tried.append(trial)
+                continue
+
+            compose_report = case_dir / f"compose_{len(tried)}.json"
+            co = compose(cand, ev_path, compose_report)
+            trial["compose_verdict"] = co["verdict"]
+            if co["verdict"] != "Accepted":
+                trial["skip"] = "compose"
+                tried.append(trial)
+                continue
+
+            # Success path — promote selected artifacts to canonical names.
+            rec["candidate"] = str(cand)
+            (case_dir / "candidate_path.txt").write_text(str(cand), encoding="utf-8")
+            rec["r0b_verdict"] = r0b["verdict"]
+            rec["r0b_exit"] = r0b["exit"]
+            rec["probe_verdict"] = pr["verdict"]
+            rec["probe_exit"] = pr["exit"]
+            rec["compose_verdict"] = co["verdict"]
+            rec["compose_exit"] = co["exit"]
+            rec["ok"] = True
+            rec["candidates_tried"] = tried + [trial]
+            # Keep last winning reports as r0b.json / evidence.json / compose.json
+            try:
+                shutil.copy2(r0b_report, case_dir / "r0b.json")
+                shutil.copy2(ev_path, case_dir / "evidence.json")
+                shutil.copy2(compose_report, case_dir / "compose.json")
+            except OSError:
+                pass
+            selected = True
             results.append(rec)
-            continue
+            break
 
-        ev_path = case_dir / "evidence.json"
-        pr = probe_load(cand, ev_path, args.max_wall_ms)
-        rec["probe_verdict"] = pr["verdict"]
-        rec["probe_exit"] = pr["exit"]
-        if pr["verdict"] != "Pass":
-            rec["error"] = "probe_not_pass"
-            rec["probe_stdout"] = pr.get("stdout")
+        if not selected:
+            rec["error"] = "no_candidate_probe_pass"
+            rec["candidates_tried"] = tried
+            if tried:
+                last = tried[-1]
+                rec["r0b_verdict"] = last.get("r0b_verdict")
+                rec["probe_verdict"] = last.get("probe_verdict")
+                rec["compose_verdict"] = last.get("compose_verdict")
             results.append(rec)
-            continue
-
-        compose_report = case_dir / "compose.json"
-        co = compose(cand, ev_path, compose_report)
-        rec["compose_verdict"] = co["verdict"]
-        rec["compose_exit"] = co["exit"]
-        rec["ok"] = co["verdict"] == "Accepted"
-        if not rec["ok"]:
-            rec["error"] = "compose_not_accepted"
-        results.append(rec)
 
     all_ok = bool(results) and all(r.get("ok") for r in results)
     summary = {

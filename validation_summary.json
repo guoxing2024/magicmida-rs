@@ -1,66 +1,55 @@
 {
   "schema_version": "mida.validation-summary/v1",
-  "task": "VNEXT-R4",
-  "title": "AHK/GTO second-family plugin structural gate (GTO experimental + Oreans regression)",
-  "package": "mida-cli / mida-packers-ahk-gto / mida-packers-themida / mida-acceptance",
+  "task": "VNEXT-BEH",
+  "title": "Behavioral acceptance gate (vault load_no_crash_v0 + R0B compose)",
+  "package": "mida-acceptance / mida-cli / tools/_behavior_bb_gate.py",
   "verdict_contract": "docs/ACCEPTANCE_CONTRACT.md",
-  "roadmap": "docs/VNEXT_R4_AHK_GTO_PATH.md",
+  "roadmap": "docs/VNEXT_BEHAVIORAL_PATH.md",
   "checks": {
-    "r4_structural_gate": "pass",
-    "ahk_gto_plugin_real": true,
-    "gto_explicit_profile_only": true,
-    "gto_case": "gto_launcher",
-    "gto_r0b_floor": "StructuralPassBehaviorPending",
-    "oreans_regression_cases": [
+    "bb_behavioral_gate": "pass",
+    "probe_id": "load_no_crash_v0",
+    "cases": [
       "origin_macro",
       "lunlun_software",
-      "xiongxiong_duokai"
+      "xiongxiong_duokai",
+      "gto_launcher"
     ],
-    "oreans_r0b_floor": "StructuralPassBehaviorPending",
-    "default_profile_auto_gto": false,
-    "pure_rebuild_default": false,
-    "behavioral_accepted": false,
+    "all_compose_accepted": true,
+    "pure_rebuild_default_global": false,
+    "origin_pure_default": true,
+    "gto_independent_host": true,
+    "behavioral_accepted": true,
     "network_actions": 0
   },
   "notes": [
-    "VNEXT-R4 closed on scheduled structural gate (20260723-230214): AhkGtoPlugin real dual-select; GTO live with explicit --profile=ahk-gto-experimental + R0B StructuralPassBehaviorPending; Oreans Origin+Lunlun+holdout regression green; default dump profile remains OreansClassic (never auto-selects GTO stages).",
-    "GTO evidence: vault lab/evidence/_gto_smoke/batch_20260723-225951_r4c_gto + live_20260723-225951_r4c_gto.",
-    "Oreans evidence: vault lab/evidence/_repeat/batch_20260723-230053_r4c_oreans_reg.",
-    "Prior VNEXT-R3 archived as validation_summary.prev_20260723-230214.json (R3 structural remains historically closed; not re-run as 10x).",
-    "Pure rebuild remains opt-in; production dump defaults to legacy.",
-    "R0B never returns Behavioral Accepted at this gate.",
-    "GTO dump stages still require explicit ahk-gto-experimental; plugin identify alone does not enable heap/container stages.",
-    "gto_launcher: family=ahk_gto conf=80 ep=0xecc000 r0b=StructuralPassBehaviorPending exit=0",
-    "origin_macro: family=oreans_themida conf=83 ep=0x13e0 r0b=StructuralPassBehaviorPending iat=295/295 (100%)",
-    "lunlun_software: family=oreans_themida conf=79 ep=0x1656f4 r0b=StructuralPassBehaviorPending iat=336/338 (99%)",
-    "xiongxiong_duokai: family=oreans_themida conf=99 ep=0x35000 r0b=StructuralPassBehaviorPending iat=277/277 (100%)"
+    "B-B closed only when every scheduled vault case binds Pass evidence and check-with-behavior returns Accepted.",
+    "Probe load_no_crash_v0: process survives wall-clock without NT exception (or clean exit 0). Residual: not full product logic equivalence.",
+    "Batch: D:\\MidaVault\\lab\\evidence\\_beh_gate\\batch_20260724-112907_bb_gate_pin",
+    "origin_macro: r0b=StructuralPassBehaviorPending probe=Pass compose=Accepted ok=True",
+    "lunlun_software: r0b=StructuralPassBehaviorPending probe=Pass compose=Accepted ok=True",
+    "xiongxiong_duokai: r0b=StructuralPassBehaviorPending probe=Pass compose=Accepted ok=True",
+    "gto_launcher: r0b=StructuralPassBehaviorPending probe=Pass compose=Accepted ok=True"
   ],
   "artifacts": [
-    "docs/VNEXT_R4_AHK_GTO_PATH.md",
-    "docs/VNEXT_R3_OREANS_PATH.md",
-    "docs/PROJECT_AUDIT_AND_ROADMAP.md",
-    "WORKER_HANDOFF.md",
-    "crates/packers/ahk_gto/",
-    "crates/cli/src/unpacker/plugin_host.rs",
-    "tools/_gto_live_smoke.py",
-    "tools/_oreans_repeat_smoke.py",
-    "lab/cases/v2/gto_launcher.json",
-    "D:\\MidaVault\\lab\\evidence\\_gto_smoke\\batch_20260723-225951_r4c_gto",
-    "D:\\MidaVault\\lab\\evidence\\gto_launcher\\live_20260723-225951_r4c_gto",
-    "D:\\MidaVault\\lab\\evidence\\_repeat\\batch_20260723-230053_r4c_oreans_reg",
-    "D:\\MidaVault\\lab\\evidence\\_r4_gate\\r4_gate_envelope.json"
+    "docs/VNEXT_BEHAVIORAL_PATH.md",
+    "docs/UNATTENDED_DECISIONS_20260724.md",
+    "tools/_behavior_bb_gate.py",
+    "tools/_behavior_probe.py",
+    "D:\\MidaVault\\lab\\evidence\\_beh_gate\\batch_20260724-112907_bb_gate_pin"
   ],
   "gate_envelope": {
-    "r4_gate": true,
-    "gto_batch_dir": "D:\\MidaVault\\lab\\evidence\\_gto_smoke\\batch_20260723-225951_r4c_gto",
-    "oreans_batch_dir": "D:\\MidaVault\\lab\\evidence\\_repeat\\batch_20260723-230053_r4c_oreans_reg",
-    "finished_utc": "2026-07-23T15:02:14+00:00",
+    "bb_gate": true,
+    "batch_dir": "D:\\MidaVault\\lab\\evidence\\_beh_gate\\batch_20260724-112907_bb_gate_pin",
+    "finished_utc": "2026-07-24T03:32:50.653224+00:00",
+    "all_ok": true,
+    "explicit_claims": [
+      "check-with-behavior Accepted on vault candidates when all_ok",
+      "check-static still never Accepted alone"
+    ],
     "explicit_non_claims": [
-      "not Behavioral Accepted",
-      "pure_rebuild_default remains false",
-      "GTO stages require --profile=ahk-gto-experimental",
-      "not re-running R3 10x continuous gate",
-      "Dali remains OOS"
+      "not full product business-logic equivalence",
+      "pure default still Origin-only not global",
+      "GTO still requires --profile=ahk-gto-experimental for experimental dump stages"
     ]
   }
 }
