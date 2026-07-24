@@ -521,7 +521,42 @@ Evidence: `D:\MidaVault\lab\evidence\_beh_gate\r_gto_ui_r2\` (`gto_unpacked_wind
 
 **Artifacts (vault, not in git):** `D:\MidaVault\scratch\verify_live_gto_d1*.exe`, `gto_d1d_av.log`, `gto_avsite*.log`, `gto_diag_oep.log`.
 
-## Residual after VNEXT-BEH (+ W1–W4 + P1 + P2 + R-GTO-UI×2 + step-1 dx + round-3 neg)
+## R-GTO-UI round 4 (direction 1b — stub replay + post-_initterm WinMain EP) — **NEGATIVE; AV; no code shipped**
+
+**Date:** 2026-07-24 (operator authorized direction 1b: keep stub heap replay, set EP to post-`_initterm` WinMain call site).
+**Hypothesis:** the stub replays the captured `g_script` heap (replacing the ctors); jumping to the post-`_initterm` WinMain call site (instead of `mainCRTStartup`) avoids re-running `_initterm` on top of the replay, so WinMain registers the class + creates the window using the replayed `g_script`.
+
+**Static target found (read-only, candidate `.text`):**
+- `__scrt_common_main_seh` @ RVA `0xd9160` inlines `__scrt_common_main`. The two `_initterm` calls are at `0xd91b6` and `0xd91d7`. The post-init sequence is:
+  - `0xd9245` `call 0xd9768` → `ax` (nShowCmd source) — start of WinMain arg setup
+  - `0xd924d` `call 0xeae60` → `rax` (lpCmdLine)
+  - `0xd925a` `lea rcx,[hInstance global]`
+  - `0xd9268` `call 0xd97ac` — **the WinMain call** (`rcx`=hInstance, `rdx`=hPrev=0, `r8`=lpCmdLine, `r9`=nShowCmd). `0xd97ac` is WinMain.
+
+**Method:** no code change — used the existing `--oep=rva=N` CLI flag (`OepPolicy::Fixed`) so the existing transfer stub (heap replay + clear regs + `jmp OEP`) lands at the chosen RVA. Tested two EPs.
+
+**Result: REGRESSION (AV) at both EPs — same root class (heap-replay incompleteness).**
+
+| EP | AV site | Root cause |
+|----|---------|------------|
+| `0xd9245` (WinMain arg setup) | `KERNELBASE!GetModuleHandleA+0x9b` ← `ntdll!RtlDosApplyFileIsolationRedirection_Ustr` (bad string ptr); caller `0x140005a47` ← `0x1400d9266` | `0xd9768` (CRT post-init helper) calls `GetModuleHandleA(<string>)`; the module-name string global is NULL/bad in the replayed heap — the stub replays `g_script` (320 slots + 1 container) but NOT the string globals the CRT helpers reference |
+| `0xd9268` (direct `call WinMain`) | `ntdll!RtlpWaitOnCriticalSection` / `RtlEnterCriticalSection` deadlock/AV; caller `0x1400e71ac` ← `0x1400d92c8` (WinMain body) | WinMain enters a `CRITICAL_SECTION` whose `OwningThread`/lock-count is stale from the dumped process; the replayed heap copies the CS object bytes but the synchronization state is invalid in the new process |
+
+**Root-cause synthesis (direction 1 + 1b combined):** the transfer stub's heap replay captures a **subset** of runtime state (g_script table + a few hot roots). Post-ctor code — whether `_initterm` (direction 1, null fn-ptr call), CRT post-init helpers (direction 1b @ 0xd9245, bad string ptr), or WinMain itself (direction 1b @ 0xd9268, stale critical section) — references globals/sync objects NOT in that subset. **Changing the OEP cannot fix this; the blocker is heap/global replay completeness, not entry-point selection.**
+
+**Stop rule (Q2):** round 3 (direction 1) + round 4 (direction 1b, 2 EPs) all AV. The shared root cause is heap-replay completeness — the same territory R-GTO-UI R1/R2 (title-root plant, gscript 8→32 KiB) worked in, now confirmed as the true blocker rather than OEP. A round 5 would need to expand the stub's capture to include (a) the CRT helper string globals and (b) critical-section re-initialization (re-init CS state on replay, not just copy bytes) — a substantial heap-capture/runtime redesign that overlaps the exhausted R1/R2 line and is beyond the "stub redesign + EP" scope authorized here. **No code shipped** (only `--oep=rva=N` CLI experiments; repo remains at HEAD `cfaede5`, no tracked changes). Rebuilt CLI unchanged from the reverted round-3 state; GTO default path still `entry_rva=0x70b0`, clean exit 0, `load_no_crash` Pass — 4-case fresh-reverify baseline intact.
+
+**What was learned (positive knowledge):**
+1. The post-`_initterm` WinMain call site is `0xd9268` (WinMain = `0xd97ac`); the arg-setup starts at `0xd9245`. Confirmed statically.
+2. **Direction 1b is also blocked by heap-replay completeness**, not by OEP. Both `mainCRTStartup` (round 3) and post-_initterm (round 4) fail on missing/stale replayed state.
+3. The stub's heap replay must additionally cover: CRT helper string globals (e.g. the `GetModuleHandleA` module-name) AND critical-section re-initialization (zero `OwningThread`/lock-count on replay, or `InitializeCriticalSection` fresh). Without these, no post-ctor EP can run.
+4. R-GTO-UI is now precisely scoped: it is a **heap-capture/replay completeness problem** (capture more globals + re-init sync objects), not an OEP problem. The OEP pieces (direction 1 helper + the post-_initterm site) are known and reusable once the heap replay is complete.
+
+**Non-claim:** round 4 does not close R-GTO-UI; no 1.0 sentence; no code shipped. R-GTO-UI remains open. Any further work needs a new operator authorization scoped to heap-capture completeness (capture more globals + CS re-init), which is a different and larger change than "OEP re-capture" or "stub EP selection".
+
+**Artifacts (vault, not in git):** `D:\MidaVault\scratch\verify_live_gto_d1b_9245.exe`, `verify_live_gto_d1b_9268.exe`, `d1b_av.log`, `d1b_9268_av.log`, `s1.log`, `s2.log`.
+
+## Residual after VNEXT-BEH (+ W1–W4 + P1 + P2 + R-GTO-UI×2 + step-1 dx + round-3 neg + round-4 neg)
 
 | ID | Item | Blocks 1.0? | Status |
 |----|------|-------------|--------|
@@ -530,7 +565,7 @@ Evidence: `D:\MidaVault\lab\evidence\_beh_gate\r_gto_ui_r2\` (`gto_unpacked_wind
 | R-GTO-LATEST | Fresh dump load without `r4c_gto` walk | Quality | **W2 metric exit** |
 | R-GTO-BOOT | `.boot` heap_global payload size variance under 320-slot cap | Quality | Open (honesty; not load AV root) |
 | R-PURE-LOGIC | Product-logic / business path equivalence | **Yes** for product 1.0 | **Advanced:** controls + pe_string + exit/title/exports; **still blocks 1.0** |
-| R-GTO-UI | Unpacked GTO no product window; protected does | Quality / **1.0-relevant for GTO** | **Open; root-caused + round-3 neg:** true OEP is `mainCRTStartup`@`0xd92d4` (WindowProc `0x70b0` mis-captured); but OEP=mainCRTStartup alone AVs (stub heap-replay vs fresh `_initterm` conflict). Needs stub redesign, not OEP-only fix. **Awaiting operator auth (beyond direction 1)** |
+| R-GTO-UI | Unpacked GTO no product window; protected does | Quality / **1.0-relevant for GTO** | **Open; root-caused (rounds 3+4 neg):** true OEP `mainCRTStartup`@`0xd92d4`; post-_initterm WinMain call site `0xd9268` (WinMain=`0xd97ac`). Both EPs AV — blocker is **heap-replay completeness** (missing CRT string globals + stale critical-section state), not OEP. Needs heap-capture redesign (more globals + CS re-init). **Awaiting operator auth (beyond OEP/stub-EP scope)** |
 | R-4CASE-FRESH | Full 4-case attempt=1 on best pins | Claim hygiene | **P1-A closed** (N=10 × 4 = 1.0) |
 | R-X86 | ScyllaHide x86 residual | x86 only | Open |
 | **product 1.0 claim** | Operator + Q7 | Governance | **Still NO** |
