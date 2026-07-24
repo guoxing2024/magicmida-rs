@@ -582,7 +582,46 @@ Evidence: `D:\MidaVault\lab\evidence\_beh_gate\r_gto_ui_r2\` (`gto_unpacked_wind
 
 **Artifacts (vault, not in git):** `D:\MidaVault\scratch\verify_live_gto_d1b_9268_csfix.exe`, `csfix_av.log`, `diag3.log`, `diag4.log`.
 
-## Residual after VNEXT-BEH (+ W1–W4 + P1 + P2 + R-GTO-UI×2 + step-1 dx + round-3/4/5 neg)
+## R-GTO-UI round 6 (AHK anti-tamper RE — feasibility) — **NO CRYPTO WALL; reclassified to runtime-state-capture; no code shipped**
+
+**Date:** 2026-07-24 (operator authorized read-only AHK anti-tamper RE: cookie source, decrypt algorithm, recoverability).
+**Method:** static disasm of candidate + live cdb on protected input (read-only; no repo code change).
+
+### Findings
+
+**A. The cookie/decrypt code exists but is DORMANT.**
+- Cookie store sites: `.data` @ RVA `0x1454b8`. Two setters found: `0xe7410` (`mov [0x1454b8],rcx; ret`) and `0xe7444` (computes cookie).
+- `0xe7444` algorithm (fully RE'd): `r8 = [0x141020]` (= `0x00002b992ddfa232` = **MSVC `DEFAULT_SECURITY_COOKIE`**, a compile-time constant in `.data`); `cl = 0x40 - (r8_low & 0x3f) = 0x40 - 0x32 = 0x0e`; `cookie = ror(rcx, 0x0e) ^ r8`; store to `0x1454b8`. Input `rcx = *(&obj@0x14ca60)` (first qword of a runtime object whose address is returned by `0xd9948: lea rax,[0x14ca60]; ret`).
+- The decrypt at `0xe721c` (`xor rax,rcx; ror rax,cl`) is gated by `0xe7217 cmp rcx,rdx; je 0xe7232` (skip decrypt when cookie == rdx).
+- **Live measurement (protected GTO at `CreateWindowExW`, after full AHK init):** cookie @ `0x1454b8` = **`0`**, object @ `0x14ca60` = **`0`**. The cookie is NEVER set in the running protected process. → The xor/ror decrypt path is **never taken**; pointers are used RAW.
+
+**B. Therefore the round-5 "anti-tamper" blocker was mis-classified.**
+- The garbage `rax = 0xd25a180000e54155` (round-5 AV at `0x1400fb8f0: jmp rax`) is NOT an encrypted pointer that failed to decrypt. It is loaded RAW via `mov rax,[rcx]` (object dereference) in the `0xe71c8` path — a runtime object field.
+- In the live protected process the same code path works (no AV) → the live process has a **valid** value at that object field; the **dumped candidate has garbage/zero** there.
+- Conclusion: the blocker is **runtime-state capture completeness** (the dump does not preserve the live object/heap/`.data` state WinMain dereferences), NOT anti-tamper cryptography. Same class as the round-5 L2 heap-replay problem, now confirmed to extend beyond the 320-slot `g_script` table to additional runtime objects (e.g. the object reached via the `0xe71c8` call chain).
+
+### Feasibility verdict
+
+| Question | Answer |
+|----------|--------|
+| Is there a crypto/anti-tamper wall? | **No.** The xor/ror code is dormant (cookie=0 live). |
+| Is the cookie recoverable from the dump? | **Moot** — the cookie is 0 live; it is not the mechanism. |
+| What is the real blocker? | Runtime-state capture completeness: live object/heap/`.data` fields that WinMain dereferences are not preserved in the dump. |
+| Is it tractable? | **Yes, no crypto.** But iterative — each missing runtime object is a new capture target ("peeling the onion"). |
+| Within 2 rounds? | **Unlikely.** The `0xe71c8`-chain object is one target; fixing it will likely reveal the next missing object. |
+| Recommended next step (if authorized) | A bounded iterative capture effort: (1) CS re-init at `.data@0x145db0` (round-5 technique, validated); (2) capture the specific live object/field reached via the `0xe71c8` chain (identify its RVA/heap root, add to `DumpCapturePolicy` hot roots); (3) repeat for each newly-revealed missing object. Each round is low-risk (add capture target + re-init) but N is unknown. |
+
+### What was learned (positive)
+1. Cookie algorithm fully RE'd: `cookie = ror(rcx, 0x0e) ^ DEFAULT_SECURITY_COOKIE`, `rcx = *(obj@0x14ca60)`, seed = `0x00002b992ddfa232` @ `.data:0x141020`. **But the cookie is 0 live → irrelevant to the blocker.**
+2. The xor/ror decrypt is dormant code (gated by cookie≠0, which never holds). R-GTO-UI has **no anti-tamper wall**.
+3. R-GTO-UI reclassified: it is **runtime-state-capture completeness** (same L2 class as heap-replay), extending beyond `g_script` to additional runtime objects. Tractable engineering, not research.
+4. The stub-replay approach is NOT fundamentally in tension with anti-tamper (there is none active); it is in tension with **state completeness** — the stub replays a subset, and WinMain dereferences objects outside that subset.
+
+**Non-claim:** round 6 does not close R-GTO-UI; no 1.0 sentence; no code shipped. R-GTO-UI remains open. The RE downgraded the problem from "needs AHK anti-tamper RE" to "needs iterative runtime-state capture" — tractable but multi-round. A future authorization should frame it as iterative capture (CS re-init + per-object hot-root addition), not as a 2-round fix.
+
+**Artifacts (vault, not in git):** `D:\MidaVault\scratch\re_live.log`, `re_heap.log`, `re_heap2.log`, `re1.log`, `re2.log`, `re3.log`.
+
+## Residual after VNEXT-BEH (+ W1–W4 + P1 + P2 + R-GTO-UI×2 + step-1 dx + round-3/4/5/6)
 
 | ID | Item | Blocks 1.0? | Status |
 |----|------|-------------|--------|
@@ -591,7 +630,7 @@ Evidence: `D:\MidaVault\lab\evidence\_beh_gate\r_gto_ui_r2\` (`gto_unpacked_wind
 | R-GTO-LATEST | Fresh dump load without `r4c_gto` walk | Quality | **W2 metric exit** |
 | R-GTO-BOOT | `.boot` heap_global payload size variance under 320-slot cap | Quality | Open (honesty; not load AV root) |
 | R-PURE-LOGIC | Product-logic / business path equivalence | **Yes** for product 1.0 | **Advanced:** controls + pe_string + exit/title/exports; **still blocks 1.0** |
-| R-GTO-UI | Unpacked GTO no product window; protected does | Quality / **1.0-relevant for GTO** | **Open; layered:** L1 OEP solved (`mainCRTStartup`@`0xd92d4`); L2 heap-replay: CS re-init (`LockCount=-1` @ `.data` RVA `0x145db0`) validated (clears CS AV); L3 **anti-tamper** (`xor/ror` ptr decrypt, cookie @ `0x1454b8`=0 in dump) — **open, needs AHK RE**, not a 2-round fix. Stub-replay fundamentally in tension w/ anti-tamper. **Awaiting AHK-RE authorization** |
+| R-GTO-UI | Unpacked GTO no product window; protected does | Quality / **1.0-relevant for GTO** | **Open; reclassified (round-6 RE):** NO anti-tamper wall (cookie=0 live; xor/ror decrypt dormant). Real blocker = **runtime-state-capture completeness** (live object/heap/`.data` fields WinMain dereferences not preserved in dump; extends beyond 320-slot `g_script`). Tractable iterative capture, not crypto RE. CS re-init + per-object hot-root addition; N rounds unknown. **Awaiting iterative-capture authorization** |
 | R-4CASE-FRESH | Full 4-case attempt=1 on best pins | Claim hygiene | **P1-A closed** (N=10 × 4 = 1.0) |
 | R-X86 | ScyllaHide x86 residual | x86 only | Open |
 | **product 1.0 claim** | Operator + Q7 | Governance | **Still NO** |
