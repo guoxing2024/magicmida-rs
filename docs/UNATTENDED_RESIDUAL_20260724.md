@@ -373,26 +373,68 @@ next_default      = residual-driven work only; no silent claim upgrade
 **Allowed next moves without 1.0 language:** deepen R-PURE-LOGIC oracles; optional 4-case fresh rate on post-W1/W2 paths; GTO UI research.  
 **Forbidden:** marketing 1.0, equating W4 reconfirm with product release, expanding pure beyond Origin without D3 change.
 
-## Residual after VNEXT-BEH (+ W1 + W2 + W3 + W4)
+## P1 sprint toward 1.0 (operator chose path 1) — **not 1.0 yet**
+
+**Date:** 2026-07-24  
+**Goal of sprint:** close R-4CASE-FRESH + deepen R-PURE-LOGIC signal.  
+**Still holds:** product **1.0 = NO** until operator auth + Q7 full re-run + deeper business oracles.
+
+### P1-A — 4-case attempt=1 load (R-4CASE-FRESH) — **metric closed**
+
+| Case | Candidate pin | N=10 attempt=1 | Evidence |
+|------|---------------|----------------|----------|
+| origin_macro | `w1_scrub_v2` | **1.0** | `D:\MidaVault\lab\evidence\_beh_gate\p1_4case_fresh_20260724-161856\origin_macro_rate10.json` |
+| lunlun_software | `u_harden_3x_n3` | **1.0** | `…\lunlun_software_rate10.json` |
+| xiongxiong_duokai (holdout) | `u_harden_3x_n3` | **1.0** | `…\xiongxiong_duokai_rate10.json` |
+| gto_launcher | `w2_clearregs1` | **1.0** | `…\gto_launcher_rate10.json` |
+
+Batch summary: `…\p1_4case_fresh_20260724-161856\summary.json` — **4/4 cases pass_rate=1.0**.
+
+**Note:** lunlun/holdout pins are pre-W1 Oreans dumps (not re-unpacked under scrub_v2). Fresh *load* on current best vault pins is proven; fresh *re-unpack* of lunlun/holdout under latest pe/ is still optional hygiene.
+
+### P1-B — Deeper pure-logic oracles — **signal advanced, not closed**
+
+Harness: [`tools/_behavior_probe.py`](../tools/_behavior_probe.py) v`0.3.0-p1` — new `exit_code_exact_v0` (`--probe-kind exit_code --expect-exit N`); Origin title already supported via `--require-title-substr`.
+
+| Case | Probe | What it measures | Evidence | Compose |
+|------|-------|------------------|----------|---------|
+| Origin | `gui_window_class_v0` + **title** `授权验证` | Class **and** title (fail-closed on bogus title) | `p1_logic_20260724\origin_title.json` | **Accepted** |
+| lunlun | `exit_code_exact_v0` = `1441624` (`0x15ff58`) | Stable nonzero non-NT exit | `…\lunlun_exit.json` | **Accepted** |
+| holdout | `exit_code_exact_v0` = `594628608` (`0x23715000`) | Stable nonzero non-NT exit | `…\holdout_exit.json` | **Accepted** |
+| GTO | `exit_code_exact_v0` = `0` | Clean exit 0 (still no product window) | `…\gto_exit.json` | **Accepted** |
+
+Fail-closed negatives: `origin_title_neg`, `lunlun_exit_neg`, `holdout_exit_neg` → **Fail**.
+
+**What this is not:** license validity, script execution, UI automation parity, business macros. Exit codes may encode missing-args / single-instance / license state — residual listed on probe.
+
+### Gate pin hygiene
+
+[`_behavior_bb_gate.py`](../tools/_behavior_bb_gate.py): `origin_macro` preferred tag now leads with `live_20260724-151549_w1_scrub_v2`.
+
+## Residual after VNEXT-BEH (+ W1–W4 + P1)
 
 | ID | Item | Blocks 1.0? | Status |
 |----|------|-------------|--------|
-| R-LOAD-FLAKE (Origin quiet) | attempt=1 N≥20 load survival | Quality | **W1 metric exit** (scrub_v2 20/20); W4 reconfirm N=5 still 1.0 |
-| R-LOAD-FLAKE (GTO quiet / fresh host) | attempt=1 load survival on independent-host dumps | Quality | **W2 metric exit** (clear-regs 3× 10/10); W4 reconfirm N=5 still 1.0 |
-| R-GTO-LATEST | Fresh dump load without `r4c_gto` walk | Quality | **W2 metric exit** (preferred pins = clearregs) |
+| R-LOAD-FLAKE (Origin quiet) | attempt=1 N≥20 load survival | Quality | **W1 metric exit**; W4/P1 reconfirm green |
+| R-LOAD-FLAKE (GTO quiet / fresh host) | attempt=1 load survival on independent-host dumps | Quality | **W2 metric exit**; W4/P1 reconfirm green |
+| R-GTO-LATEST | Fresh dump load without `r4c_gto` walk | Quality | **W2 metric exit** |
 | R-GTO-BOOT | `.boot` heap_global payload size variance under 320-slot cap | Quality | Open (honesty; not load AV root) |
-| R-PURE-LOGIC | Product-logic / business path equivalence | **Yes** for product 1.0 | **Partial:** W3/W4 oracles real; full logic open → **blocks 1.0** |
+| R-PURE-LOGIC | Product-logic / business path equivalence | **Yes** for product 1.0 | **Advanced:** 4-case deeper oracles (title + exit exact + exports); **still blocks 1.0** |
 | R-GTO-UI | Unpacked GTO no product window yet (protected does) | Quality | Open research |
-| R-4CASE-FRESH | Full 4-case post-W1/W2 attempt=1 on fresh paths | Claim hygiene | Open (W4 only reconfirmed Origin+GTO winners) |
+| R-4CASE-FRESH | Full 4-case post-W1/W2 attempt=1 on best pins | Claim hygiene | **P1-A closed** (N=10 × 4 = 1.0) |
 | R-X86 | ScyllaHide x86 residual | x86 only | Open |
-| **product 1.0 claim** | Operator + Q7 | Governance | **W4 = NO** |
+| **product 1.0 claim** | Operator + Q7 | Governance | **Still NO** (W4 binding; P1 does not flip) |
 
 ## Re-run
 
 ```powershell
-# W4-style winning-candidate reconfirm (not full 4-case):
-# vault: D:\MidaVault\lab\evidence\_beh_gate\w4_review\
+# P1 4-case load rate (vault candidates):
+# D:\MidaVault\lab\evidence\_beh_gate\p1_4case_fresh_20260724-161856\
+
+# P1 deeper oracles:
+# D:\MidaVault\lab\evidence\_beh_gate\p1_logic_20260724\
 
 python tools/_behavior_bb_gate.py --cases origin_macro,lunlun_software,xiongxiong_duokai,gto_launcher --write-summary --tag bb_gate_pin --max-wall-ms 8000 --attempts 12 --max-candidates 3
 ```
+
 

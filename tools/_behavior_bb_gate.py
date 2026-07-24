@@ -63,6 +63,8 @@ def _candidate_in_live(live_dir: Path, name_hints: list[str]) -> Path | None:
 # Newest-first walk still runs after these pins (deduped).
 PREFERRED_LIVE_TAGS: dict[str, list[str]] = {
     "origin_macro": [
+        # W1 scrub_v2: quiet attempt=1 load-stable pure dump.
+        "live_20260724-151549_w1_scrub_v2",
         "live_20260724-101051_u_origin_pure_r1",
         "live_20260724-104711_u_origin_pure_r2",
     ],

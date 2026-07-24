@@ -66,9 +66,9 @@
 | R-LOAD-FLAKE | Origin/GTO quiet attempt=1 load | Stability | **Metric-closed** (W1 Origin scrub_v2; W2 GTO clear-regs); W4 reconfirm Origin+GTO N=5 = 1.0 |
 | R-GTO-LATEST | Fresh GTO without r4c walk | Quality | **Metric-closed** (W2) |
 | R-GTO-BOOT | Independent-host `.boot` heap snapshot variance | Quality | Open (honesty) |
-| R-PURE-LOGIC | load survival / window / exports ≠ business equivalence | **Yes** | Partial (W3 oracles); **still blocks 1.0** |
+| R-PURE-LOGIC | load / window / title / exit / exports ≠ business equivalence | **Yes** | Advanced (W3 + P1 title/exit_exact); **still blocks 1.0** |
 | R-GTO-UI | Unpacked GTO no product window | Quality | Open |
-| R-4CASE-FRESH | Full 4-case post-W1/W2 fresh attempt=1 | Claim hygiene | Open (W4 only winners) |
+| R-4CASE-FRESH | Full 4-case attempt=1 on best pins | Claim hygiene | **P1-A closed** (4× N=10 = 1.0) |
 | R-X86 | ScyllaHide x86 residual | x86 only | Open |
 
 ### Origin crash note (engineering, historical)

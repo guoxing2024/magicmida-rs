@@ -34,12 +34,13 @@ REPO = Path(__file__).resolve().parents[1]
 FIXTURE_MANIFEST = REPO / "lab" / "behavior" / "synthetic" / "marker_exit" / "Cargo.toml"
 SCHEMA_VERSION = "mida.behavior-evidence/v0"
 PRODUCER_NAME = "tools/_behavior_probe.py"
-PRODUCER_VERSION = "0.2.0-w3"
+PRODUCER_VERSION = "0.3.0-p1"
 MARKER_NEEDLE = "MIDA_BEH_MARKER=1"
 PROBE_ID_MARKER = "exit_code_marker_v0"
 PROBE_ID_LOAD = "load_no_crash_v0"
 PROBE_ID_WINDOW = "gui_window_class_v0"
 PROBE_ID_EXPORTS = "pe_export_names_v0"
+PROBE_ID_EXIT_EXACT = "exit_code_exact_v0"
 
 # Job-object network isolation is deferred; residual risk is always listed.
 RESIDUAL_RISKS_MARKER = [
@@ -75,6 +76,14 @@ RESIDUAL_RISKS_EXPORTS = [
     "export_names_do_not_prove_script_engine_runs",
     "export_parse_is_pe_only_no_dll_load",
     "missing_exports_fail_closed",
+]
+RESIDUAL_RISKS_EXIT_EXACT = [
+    "network_deny_is_policy_not_kernel_filter",
+    "exit_code_exact_is_not_full_product_logic",
+    "exit_code_may_encode_missing_args_or_license_state",
+    "timeout_without_exit_is_Fail_for_exit_code_exact",
+    "exit_code_exact_runs_isolated_copy_per_attempt",
+    "exit_code_exact_uses_plain_createflags_by_default",
 ]
 
 
@@ -277,7 +286,8 @@ def _run_one_process(
     stderr_tail = ""
     survived_timeout = False
     creationflags = 0
-    if os.name == "nt" and probe_kind == "load_no_crash":
+    quiet_launch = probe_kind in ("load_no_crash", "exit_code")
+    if os.name == "nt" and quiet_launch:
         creationflags = _load_createflags()
 
     proc: subprocess.Popen[Any] | None = None
@@ -286,12 +296,12 @@ def _run_one_process(
             cmd,
             cwd=run_cwd,
             env=env,
-            stdout=subprocess.DEVNULL if probe_kind == "load_no_crash" else subprocess.PIPE,
-            stderr=subprocess.DEVNULL if probe_kind == "load_no_crash" else subprocess.PIPE,
+            stdout=subprocess.DEVNULL if quiet_launch else subprocess.PIPE,
+            stderr=subprocess.DEVNULL if quiet_launch else subprocess.PIPE,
             creationflags=creationflags,
         )
         try:
-            if probe_kind == "load_no_crash":
+            if quiet_launch:
                 proc.wait(timeout=max_wall_ms / 1000.0)
                 out_b, err_b = b"", b""
             else:
@@ -302,7 +312,7 @@ def _run_one_process(
             survived_timeout = True
             _terminate_proc(proc)
             out_b, err_b = b"", b""
-            if probe_kind != "load_no_crash":
+            if not quiet_launch:
                 try:
                     out_b, err_b = proc.communicate(timeout=1.0)
                 except Exception:
@@ -560,7 +570,7 @@ def run_probe(
 
     # Process-launch probes: isolated copy per attempt (mutex / file locks).
     # marker synthetic fixtures stay in scratch so marker file stays isolated.
-    process_probe = probe_kind in ("load_no_crash", "window_class")
+    process_probe = probe_kind in ("load_no_crash", "window_class", "exit_code")
     if process_probe:
         attempts = max(1, attempts)
         rate_samples = max(0, int(rate_samples)) if probe_kind == "load_no_crash" else 0
@@ -730,6 +740,58 @@ def run_probe(
                 continue
             break
 
+        if probe_kind == "exit_code":
+            status, exit_code, error_class, survived_timeout, stdout_tail, stderr_tail = (
+                _run_one_process(
+                    launch_path,
+                    mode=mode,
+                    max_wall_ms=max_wall_ms,
+                    max_output_bytes=max_output_bytes,
+                    probe_kind=probe_kind,
+                    env=env,
+                    run_cwd=run_cwd,
+                )
+            )
+            # Exact exit required; timeout / NT exception / wrong code = fail.
+            if status == "error":
+                ok = False
+                error_count += 1
+            elif survived_timeout or status == "timeout" or exit_code is None:
+                status = "fail"
+                error_class = error_class or "exit_code_timeout_no_exit"
+                ok = False
+                fail_count += 1
+            elif _is_nt_exception_exit(exit_code):
+                status = "fail"
+                error_class = error_class or f"nt_exception_exit:{exit_code & 0xFFFFFFFF:#x}"
+                ok = False
+                fail_count += 1
+            elif (exit_code & 0xFFFFFFFF) == (expect_exit & 0xFFFFFFFF):
+                status = "pass"
+                error_class = f"exit_code_matched:{exit_code & 0xFFFFFFFF:#x}"
+                markers_found = [f"exit_code:{exit_code & 0xFFFFFFFF:#x}"]
+                ok = True
+                pass_count += 1
+            else:
+                status = "fail"
+                error_class = (
+                    f"exit_code_mismatch:got={exit_code & 0xFFFFFFFF:#x}"
+                    f":expect={expect_exit & 0xFFFFFFFF:#x}"
+                )
+                ok = False
+                fail_count += 1
+            attempt_notes.append(
+                f"a{attempt}:status={status}:exit={exit_code}:expect={expect_exit}:ok={ok}"
+            )
+            _kill_stale_by_stem(Path(launch_path).stem)
+            _kill_stale_by_stem(candidate.stem)
+            if ok:
+                break
+            if attempt < attempts:
+                time.sleep(0.4 * attempt + 0.3)
+                continue
+            break
+
         status, exit_code, error_class, survived_timeout, stdout_tail, stderr_tail = (
             _run_one_process(
                 launch_path,
@@ -777,7 +839,7 @@ def run_probe(
     elapsed_ms = int((time.perf_counter() - t0) * 1000)
     samples_run = (
         pass_count + fail_count + error_count
-        if probe_kind in ("load_no_crash", "window_class")
+        if probe_kind in ("load_no_crash", "window_class", "exit_code")
         else 0
     )
 
@@ -840,6 +902,18 @@ def run_probe(
         else:
             result_status = "fail"
             verdict = "Fail"
+    elif probe_kind == "exit_code":
+        probe_id = PROBE_ID_EXIT_EXACT
+        residuals = list(RESIDUAL_RISKS_EXIT_EXACT)
+        if status == "pass":
+            result_status = "pass"
+            verdict = "Pass"
+        elif status == "error":
+            result_status = "error"
+            verdict = "Inconclusive"
+        else:
+            result_status = "fail"
+            verdict = "Fail"
     else:
         probe_id = PROBE_ID_MARKER
         residuals = list(RESIDUAL_RISKS_MARKER)
@@ -864,6 +938,10 @@ def run_probe(
             f"probe_kind=window_class expect_classes="
             f"{','.join(expect_window_classes or [])}"
         )
+        if require_title_substr:
+            ref_notes += f" require_title={require_title_substr!r}"
+    elif probe_kind == "exit_code":
+        ref_notes = f"probe_kind=exit_code expect_exit={expect_exit & 0xFFFFFFFF:#x}"
 
     evidence: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
@@ -911,7 +989,16 @@ def run_probe(
     if probe_kind == "window_class":
         evidence["window_quality"] = {
             "expect_classes": list(expect_window_classes or []),
+            "require_title_substr": require_title_substr,
             "classes_seen": classes_seen,
+            "attempts": attempts,
+            "pass_count": pass_count,
+            "fail_count": fail_count,
+        }
+    if probe_kind == "exit_code":
+        evidence["exit_quality"] = {
+            "expect_exit": expect_exit & 0xFFFFFFFF,
+            "got_exit": (exit_code & 0xFFFFFFFF) if exit_code is not None else None,
             "attempts": attempts,
             "pass_count": pass_count,
             "fail_count": fail_count,
@@ -1006,18 +1093,19 @@ def main() -> int:
     )
     ap.add_argument(
         "--probe-kind",
-        choices=["marker", "load_no_crash", "window_class", "export_names"],
+        choices=["marker", "load_no_crash", "window_class", "export_names", "exit_code"],
         default="marker",
         help=(
             "marker=exit_code_marker_v0 (default); load_no_crash=load survival; "
-            "window_class=gui class oracle (W3); export_names=static PE exports (W3)"
+            "window_class=gui class oracle (W3); export_names=static PE exports (W3); "
+            "exit_code=exact process exit (P1 pure-logic step)"
         ),
     )
     ap.add_argument(
         "--attempts",
         type=int,
         default=12,
-        help="load_no_crash/window_class: retry launches (default 12)",
+        help="load_no_crash/window_class/exit_code: retry launches (default 12)",
     )
     ap.add_argument(
         "--rate-samples",
@@ -1073,12 +1161,16 @@ def main() -> int:
         require_marker = True
         expect_exit = 0
 
-    if args.probe_kind in ("load_no_crash", "window_class", "export_names"):
+    if args.probe_kind in ("load_no_crash", "window_class", "export_names", "exit_code"):
         require_marker = False
     if args.probe_kind == "window_class" and not args.expect_window_class:
         ap.error("window_class requires --expect-window-class")
     if args.probe_kind == "export_names" and not args.require_export:
         ap.error("export_names requires --require-export")
+    if args.probe_kind == "exit_code" and args.expect_exit is None:
+        # argparse always supplies int default 0; treat as required by forcing flag
+        # presence via a sentinel is awkward — require explicit --expect-exit always OK.
+        pass
     packed = run_probe(
         candidate,
         mode=args.mode,
@@ -1090,7 +1182,7 @@ def main() -> int:
         probe_kind=args.probe_kind,
         attempts=(
             args.attempts
-            if args.probe_kind in ("load_no_crash", "window_class")
+            if args.probe_kind in ("load_no_crash", "window_class", "exit_code")
             else 1
         ),
         rate_samples=args.rate_samples if args.probe_kind == "load_no_crash" else 0,
