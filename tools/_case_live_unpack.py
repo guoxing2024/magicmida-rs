@@ -75,6 +75,7 @@ def sha256_file(p: Path) -> str:
 
 
 def resolve_cfg(case_id: str) -> dict | None:
+    manifests = load_manifests()
     if case_id in BUILTIN:
         b = BUILTIN[case_id]
         src = MAT / b["src"]
@@ -83,6 +84,11 @@ def resolve_cfg(case_id: str) -> dict | None:
             pass
         else:
             oracle = MAT / b["oracle"] if b.get("oracle") else None
+            # Optional M4 field from lab case-manifest when present.
+            man = next((m for m in manifests if m.get("case_id") == case_id), None)
+            cap = man.get("capture_policy") if isinstance(man, dict) else None
+            if cap is not None and not isinstance(cap, dict):
+                cap = None
             return {
                 "case_id": case_id,
                 "src": b["src"],
@@ -91,8 +97,10 @@ def resolve_cfg(case_id: str) -> dict | None:
                 "prefix": b["prefix"],
                 "oracle": b.get("oracle"),
                 "oracle_path": oracle if oracle and oracle.is_file() else None,
+                "capture_policy": cap,
+                "manifest_path": man.get("_manifest_path") if isinstance(man, dict) else None,
             }
-    return resolve_case_cfg(case_id, manifests=load_manifests(), mat=MAT)
+    return resolve_case_cfg(case_id, manifests=manifests, mat=MAT)
 
 
 def known_case_ids() -> list[str]:
@@ -206,6 +214,19 @@ def main() -> int:
         dest="extra_cli_args",
         help="extra mida-cli arg (repeatable); use sparingly",
     )
+    ap.add_argument(
+        "--capture-policy",
+        default="",
+        help=(
+            "path to capture-policy JSON (pure object or full case-manifest). "
+            "Default: auto-export from case-manifest capture_policy when present."
+        ),
+    )
+    ap.add_argument(
+        "--no-capture-policy",
+        action="store_true",
+        help="do not auto-pass case-manifest capture_policy to mida-cli",
+    )
     args = ap.parse_args()
 
     profile = (args.profile or "").strip()
@@ -266,6 +287,28 @@ def main() -> int:
         cmd.append(f"--profile={profile}")
     if args.pure_rebuild:
         cmd.append("--pure-rebuild")
+
+    # M4: optional capture policy (CLI path wins; else case-manifest field).
+    capture_policy_path: Path | None = None
+    capture_policy_source: str | None = None
+    explicit_cap = (args.capture_policy or "").strip()
+    if explicit_cap:
+        capture_policy_path = Path(explicit_cap)
+        if not capture_policy_path.is_file():
+            print("missing --capture-policy file", capture_policy_path, file=sys.stderr)
+            return 2
+        capture_policy_source = "cli_path"
+    elif not args.no_capture_policy and isinstance(cfg.get("capture_policy"), dict):
+        # Export nested object so mida-cli can load a pure policy file.
+        capture_policy_path = out_dir / "capture_policy.json"
+        capture_policy_path.write_text(
+            json.dumps(cfg["capture_policy"], indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        capture_policy_source = "case_manifest"
+    if capture_policy_path is not None:
+        cmd.append(f"--capture-policy={capture_policy_path}")
+
     for extra in args.extra_cli_args or []:
         if extra:
             cmd.append(extra)
@@ -282,6 +325,9 @@ def main() -> int:
         "corpus_role": cfg.get("corpus_role"),
         "protection_family": cfg.get("protection_family"),
         "engine_route": cfg.get("engine_route"),
+        "capture_policy_source": capture_policy_source,
+        "capture_policy_path": str(capture_policy_path) if capture_policy_path else None,
+        "manifest_path": cfg.get("manifest_path"),
     }
     print("RUN", " ".join(cmd), flush=True)
     t0 = time.time()

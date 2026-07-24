@@ -117,11 +117,19 @@ pub fn unpack(
     container_restore: ContainerRestoreMode,
     profile: DumpProfile,
     pure_rebuild: bool,
+    capture_policy: mida_pe::DumpCapturePolicy,
 ) -> Result<(), anyhow::Error> {
     use tracing::info;
     info!("=== UNPACK START ===");
     info!("Input: {}", input.display());
-    info!(?oep_policy, ?container_restore, ?profile, "Unpack policy");
+    info!(
+        ?oep_policy,
+        ?container_restore,
+        ?profile,
+        capture_source = capture_policy.source_label(),
+        hot_roots = capture_policy.hot_root_rvas.len(),
+        "Unpack policy"
+    );
 
     // ---- step 1: resolve output path ----
     let output_path = resolve_output_path(input, output);
@@ -210,6 +218,7 @@ pub fn unpack(
             container_restore,
             profile,
             pure_rebuild,
+            capture_policy,
             packer,
         );
     }
@@ -442,6 +451,7 @@ pub fn unpack(
             container_restore,
             profile,
             pure_rebuild,
+            capture_policy,
             input,
             &output_path,
         );
@@ -1377,6 +1387,7 @@ pub fn unpack(
         container_restore,
         profile,
         pure_rebuild,
+        capture_policy,
         &early_section_snapshots,
         input,
         &output_path,

@@ -41,11 +41,20 @@ pub(super) fn run_gto_host(
     container_restore: ContainerRestoreMode,
     profile: DumpProfile,
     pure_rebuild: bool,
+    // CLI / case-manifest capture policy (may be empty → plugin defaults).
+    cli_capture_policy: mida_pe::DumpCapturePolicy,
     mut packer: SelectedPacker,
 ) -> Result<(), anyhow::Error> {
     info!("=== GTO HOST START (independent; no ThemidaState) ===");
     info!("Input: {}", input.display());
-    info!(?oep_policy, ?container_restore, ?profile, pure_rebuild, "GTO host policy");
+    info!(
+        ?oep_policy,
+        ?container_restore,
+        ?profile,
+        pure_rebuild,
+        capture_source = cli_capture_policy.source_label(),
+        "GTO host policy"
+    );
 
     if !matches!(profile, DumpProfile::AhkGtoExperimental) {
         warn!(
@@ -400,10 +409,10 @@ pub(super) fn run_gto_host(
             "GTO host dump_advice"
         );
     }
-    // Plugin hint → DumpCapturePolicy (AHK preset or explicit RVAs). Profile
-    // still gates experimental stages; Oreans profile would keep capture empty.
+    // Merge: CLI/case-manifest roots win; else plugin hint; then profile.
+    // Experimental stages still gated by DumpProfile.
     let capture_policy = mida_pe::DumpCapturePolicy::resolve_with_plugin_hint(
-        mida_pe::DumpCapturePolicy::default(),
+        cli_capture_policy,
         dump_advice
             .as_ref()
             .and_then(|a| a.capture_policy.as_ref()),

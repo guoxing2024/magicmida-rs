@@ -118,7 +118,20 @@ Research tools:
 | Sidecar | `capture_policy` block in `*.dump_snapshot.json` (`source`, hot roots, gscript knobs) |
 | Live | `live_20260724-141353_m3_plugin_gtoexp` — `source=ahk_gto_defaults`, hot_roots=10, R0B StructuralPassBehaviorPending, PE retained |
 
-**Explicit non-claim:** plugin owns the *request* for AHK capture defaults; host still requires `--profile=ahk-gto-experimental` for experimental dump stages. Case-manifest schema fill remains future work (M4). Not 1.0 / not load-flake fix.
+**Explicit non-claim:** plugin owns the *request* for AHK capture defaults; host still requires `--profile=ahk-gto-experimental` for experimental dump stages. Case-manifest fill is M4. Not 1.0 / not load-flake fix.
+
+### M4 case-manifest + CLI capture policy (generic landing, 2026-07-24)
+
+| Piece | Status |
+|-------|--------|
+| Schema | Optional `capture_policy` on case-manifest v2 (`lab/cases/v2/case-manifest.schema.json`) |
+| Sample | `gto_launcher.json` → `{"preset":"ahk_gto_defaults"}` |
+| CLI | `--capture-policy=PATH` — pure policy object **or** full case-manifest JSON |
+| Loader | [`crates/cli/src/capture_policy_file.rs`](../crates/cli/src/capture_policy_file.rs) |
+| Merge | CLI/manifest roots > plugin `CapturePolicyHint` > profile empty→defaults |
+| Harness | `_case_live_unpack.py` auto-exports manifest field to temp JSON + passes flag (opt-out `--no-capture-policy`) |
+
+**Explicit non-claim:** wiring only — does not enable experimental dump stages without `--profile=ahk-gto-experimental`, does not fix R-LOAD-FLAKE / R-GTO-BOOT, not product 1.0.
 
 ### B-B reconfirm (scan60 pin era)
 
@@ -137,7 +150,8 @@ Gate pin order residual: prefer **`r4c_gto` first** for multi-case reliability; 
 4. **VNEXT-BEH** — `validation_summary.json` task VNEXT-BEH, batch `bb_gate_pin`.  
 5. **M1** — `snapshot_manifest` sidecar + probe `--rate-samples`.  
 6. **M2** — `DumpCapturePolicy` + dump-path wiring; live real sidecar; pin rate baseline.  
-7. **M3** — plugin `CapturePolicyHint` → host `DumpCapturePolicy`; sidecar records resolved policy.
+7. **M3** — plugin `CapturePolicyHint` → host `DumpCapturePolicy`; sidecar records resolved policy.  
+8. **M4** — case-manifest `capture_policy` + `--capture-policy` CLI + harness auto-pass.
 
 ## Explicit non-claims
 

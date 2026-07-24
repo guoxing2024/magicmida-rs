@@ -61,5 +61,8 @@
     "artifact_sha256": "dcc411afaafed6bf3fbc52c0c72eddf79f56fc9aea1516b911d49f59c94af379",
     "authority": "historical_tool_output",
     "use": "analysis_comparison_only"
+  },
+  "capture_policy": {
+    "preset": "ahk_gto_defaults"
   }
 }

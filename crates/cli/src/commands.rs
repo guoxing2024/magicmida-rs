@@ -13,6 +13,7 @@ pub fn run_command(cmd: Command) -> Result<(), anyhow::Error> {
             container_restore,
             profile,
             pure_rebuild,
+            capture_policy,
             verbose: _,
         } => crate::unpacker::unpack(
             &input,
@@ -23,6 +24,7 @@ pub fn run_command(cmd: Command) -> Result<(), anyhow::Error> {
             container_restore,
             profile,
             pure_rebuild,
+            capture_policy,
         ),
         Command::GenericUnpack {
             input,

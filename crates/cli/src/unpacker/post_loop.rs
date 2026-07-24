@@ -20,7 +20,8 @@ use mida_packers_themida::{
     install_anti_dump_fix, shrink_pe, CompilerHint, IatFixStrategy, ThemidaState,
 };
 use mida_pe::{
-    ContainerRestoreMode, DumpOptions, DumpProfile, EarlySectionSnapshot, OepPolicy, PeHeader,
+    ContainerRestoreMode, DumpCapturePolicy, DumpOptions, DumpProfile, EarlySectionSnapshot,
+    OepPolicy, PeHeader,
 };
 
 use super::helpers::{compute_data_section_bounds, resolve_host_api};
@@ -51,6 +52,8 @@ pub(super) fn run_post_loop_phases(
     container_restore: ContainerRestoreMode,
     profile: DumpProfile,
     pure_rebuild: bool,
+    // CLI / case-manifest capture policy (may be empty).
+    cli_capture_policy: DumpCapturePolicy,
     early_section_snapshots: &[EarlySectionSnapshot],
     input: &Path,
     output_path: &Path,
@@ -246,13 +249,18 @@ pub(super) fn run_post_loop_phases(
         // prefer_pure_rebuild is advisory only; CLI `--pure-rebuild` still owns emit.
         let _ = advice.prefer_pure_rebuild;
     }
-    // Plugin capture hint (AHK) or empty (Themida) → resolve with dump profile.
-    let capture_policy = mida_pe::DumpCapturePolicy::resolve_with_plugin_hint(
-        mida_pe::DumpCapturePolicy::default(),
+    // Merge order: CLI/case-manifest roots win over plugin preset; then profile.
+    let capture_policy = DumpCapturePolicy::resolve_with_plugin_hint(
+        cli_capture_policy,
         dump_advice
             .as_ref()
             .and_then(|a| a.capture_policy.as_ref()),
         profile,
+    );
+    info!(
+        capture_source = capture_policy.source_label(),
+        hot_roots = capture_policy.hot_root_rvas.len(),
+        "post_loop resolved capture_policy"
     );
 
     if shrink {

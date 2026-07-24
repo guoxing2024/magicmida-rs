@@ -58,9 +58,73 @@
     },
     "oracle": {
       "$ref": "#/$defs/oracle"
+    },
+    "capture_policy": {
+      "$ref": "#/$defs/capturePolicy",
+      "description": "Optional dump heap/hot-root capture knobs (M4). Research-only; does not enable experimental dump stages without --profile=ahk-gto-experimental."
     }
   },
   "$defs": {
+    "hexRva": {
+      "type": "string",
+      "pattern": "^0x[0-9a-fA-F]+$"
+    },
+    "capturePolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "preset": {
+          "description": "Named built-in preset. Expanded by host when hot_root_rvas is empty.",
+          "enum": [
+            "ahk_gto_defaults",
+            "empty"
+          ]
+        },
+        "hot_root_rvas": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/hexRva"
+          },
+          "uniqueItems": true
+        },
+        "large_table_rvas": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/hexRva"
+          },
+          "uniqueItems": true
+        },
+        "gscript_root_rva": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/hexRva"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "gscript_root_content_cap": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "gscript_first_hop_span": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "gscript_first_hop_probe": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "hot_expand_seed_rvas": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/hexRva"
+          },
+          "uniqueItems": true
+        }
+      }
+    },
     "sha256": {
       "type": "string",
       "pattern": "^[0-9a-f]{64}$"

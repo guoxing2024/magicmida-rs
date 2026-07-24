@@ -44,6 +44,7 @@ pub(super) fn run_post_attach_path(
     container_restore: ContainerRestoreMode,
     profile: DumpProfile,
     pure_rebuild: bool,
+    capture_policy: mida_pe::DumpCapturePolicy,
     input: &Path,
     output_path: &Path,
 ) -> Result<(), anyhow::Error> {
@@ -313,6 +314,7 @@ pub(super) fn run_post_attach_path(
         container_restore,
         profile,
         pure_rebuild,
+        capture_policy,
         &early_section_snapshots,
         input,
         &output_path,

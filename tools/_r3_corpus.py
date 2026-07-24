@@ -137,6 +137,11 @@ def resolve_case_cfg(
         prefix = "origin"
     elif case_id == "lunlun_software":
         prefix = "lunlun"
+    # Optional M4 capture_policy object from case-manifest (research knobs).
+    cap = man.get("capture_policy")
+    if cap is not None and not isinstance(cap, dict):
+        cap = None
+
     return {
         "case_id": case_id,
         "src": src_path.name,
@@ -151,6 +156,7 @@ def resolve_case_cfg(
         "engine_route": engine_route(man),
         "is_oreans": is_oreans_candidate(man),
         "manifest_path": man.get("_manifest_path"),
+        "capture_policy": cap,
     }
 
 

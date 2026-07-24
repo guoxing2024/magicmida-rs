@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use mida_pe::{ContainerRestoreMode, DumpProfile, OepPolicy};
+use mida_pe::{ContainerRestoreMode, DumpCapturePolicy, DumpProfile, OepPolicy};
 
 use crate::unpacker::GenericGateProfile;
 
@@ -23,6 +23,9 @@ pub enum Command {
         profile: DumpProfile,
         /// R1-D/E: emit via pure rebuild boundary (opt-in; preserves host VAs/DDs).
         pure_rebuild: bool,
+        /// Optional capture policy from `--capture-policy=PATH` (case-manifest shape).
+        /// Empty = plugin/profile defaults only.
+        capture_policy: DumpCapturePolicy,
         verbose: bool,
     },
     /// Packer-agnostic full dump (no Themida shrink).
@@ -73,7 +76,8 @@ fn parse_unpack(args: &[String]) -> Result<Command, String> {
         return Err(
             "Usage: mida-cli /unpack <filename> [--data-sections] [--shrink|--no-shrink] \
              [--oep=crt|captured|rva=N] [--profile=oreans-classic|ahk-gto-experimental] \
-             [--container-restore=off|post-crt|tls-pre] [--pure-rebuild|--no-pure-rebuild] [-v]"
+             [--container-restore=off|post-crt|tls-pre] [--pure-rebuild|--no-pure-rebuild] \
+             [--capture-policy=PATH] [-v]"
                 .into(),
         );
     }
@@ -98,6 +102,8 @@ fn parse_unpack(args: &[String]) -> Result<Command, String> {
     let mut verbose = false;
     let mut cli_pure_rebuild = false;
     let mut cli_no_pure_rebuild = false;
+    let mut capture_policy = DumpCapturePolicy::default();
+    let mut capture_policy_path: Option<PathBuf> = None;
 
     let mut i = 3;
     while i < args.len() {
@@ -152,6 +158,16 @@ fn parse_unpack(args: &[String]) -> Result<Command, String> {
                 }
                 container_restore_explicit = Some(parse_container_restore(&args[i])?);
             }
+            other if other.starts_with("--capture-policy=") => {
+                capture_policy_path = Some(PathBuf::from(&other["--capture-policy=".len()..]));
+            }
+            "--capture-policy" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("Missing path after --capture-policy.".into());
+                }
+                capture_policy_path = Some(PathBuf::from(&args[i]));
+            }
             other if other.starts_with('-') => return Err(format!("Unknown option: {}", other)),
             other => {
                 if output.is_none() {
@@ -162,6 +178,13 @@ fn parse_unpack(args: &[String]) -> Result<Command, String> {
             }
         }
         i += 1;
+    }
+
+    if let Some(path) = capture_policy_path {
+        if !path.is_file() {
+            return Err(format!("capture policy file not found: {}", path.display()));
+        }
+        capture_policy = crate::capture_policy_file::load_capture_policy_file(&path)?;
     }
 
     let container_restore = resolve_container_restore(profile, container_restore_explicit);
@@ -190,6 +213,7 @@ fn parse_unpack(args: &[String]) -> Result<Command, String> {
         container_restore,
         profile,
         pure_rebuild,
+        capture_policy,
         verbose,
     })
 }
