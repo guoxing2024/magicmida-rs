@@ -1208,6 +1208,7 @@ pub fn dump_process(
     );
 
     // Observable capture contract (best-effort sidecar). Never fails the dump.
+    // `capture_policy` is the resolved policy used for heap capture above.
     super::snapshot_manifest::write_dump_snapshot_manifest(
         &opts.output_path,
         opts.profile,
@@ -1215,6 +1216,7 @@ pub fn dump_process(
         output_entry_point,
         &containers,
         &heap_globals,
+        &capture_policy,
     );
 
     Ok(())

@@ -194,6 +194,31 @@ pub enum PluginAdvice {
     Abort { message: String },
 }
 
+/// Optional heap-capture knobs from a plugin (host maps into dump options).
+///
+/// Keeps sample-private RVAs out of `mida-core`: plugins either request the
+/// built-in AHK/GTO preset (`prefer_ahk_gto_defaults`) or pass explicit RVAs.
+/// Host still owns profile gating (`AhkGtoExperimental` vs `OreansClassic`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CapturePolicyHint {
+    /// Prefer host-side built-in AHK/GTO hot-root defaults when roots are empty.
+    pub prefer_ahk_gto_defaults: bool,
+    /// Explicit hot-root image RVAs (empty → leave for preset / profile resolve).
+    pub hot_root_rvas: Vec<u32>,
+    /// Subset allowed large size probes (empty → host default intersection).
+    pub large_table_rvas: Vec<u32>,
+    /// Primary script object root (None → host default when preset applies).
+    pub gscript_root_rva: Option<u32>,
+    /// Soft cap on gscript root content (0 → host default).
+    pub gscript_root_content_cap: usize,
+    /// Bytes of gscript blob scanned for first-hop edges (0 → host default).
+    pub gscript_first_hop_span: usize,
+    /// Size probe for first-hop children (0 → host default).
+    pub gscript_first_hop_probe: usize,
+    /// Multi-hop expand seed RVAs (empty → host default).
+    pub hot_expand_seed_rvas: Vec<u32>,
+}
+
 /// Optional dump-time hints from the plugin (host still owns dump options).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DumpAdvice {
@@ -201,6 +226,8 @@ pub struct DumpAdvice {
     /// Host may ignore; default dump path remains legacy unless CLI opts in.
     pub prefer_pure_rebuild: bool,
     pub note: &'static str,
+    /// Heap/hot-root capture hint. `None` = host profile defaults only.
+    pub capture_policy: Option<CapturePolicyHint>,
 }
 
 /// Family strategy surface for the runtime engine / thin CLI.

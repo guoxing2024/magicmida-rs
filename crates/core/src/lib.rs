@@ -30,8 +30,8 @@ pub use debug_event_lifecycle::{
 pub use debugger::{ContinueStatus, DebugEvent, DebuggerCore};
 pub use error::{format_continue_debug_event_error, win32_from_hresult, CoreError};
 pub use plugin::{
-    DumpAdvice, HostLoopFacts, IdentifyInput, IdentifyResult, NullPackerPlugin, PackerPlugin,
-    PluginAdvice, PluginCtx, UnpackPhase,
+    CapturePolicyHint, DumpAdvice, HostLoopFacts, IdentifyInput, IdentifyResult, NullPackerPlugin,
+    PackerPlugin, PluginAdvice, PluginCtx, UnpackPhase,
 };
 pub use process::{
     cleanup_stub_exe, close_process_handles, create_debug_process, patch_peb_anti_debug,

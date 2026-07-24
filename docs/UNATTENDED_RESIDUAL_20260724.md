@@ -108,6 +108,18 @@ Research tools:
 
 **Explicit non-claim:** policy externalization is product-shape plumbing for case-manifest/plugin fill later; it does **not** change the claim bar or fix load flake. Sample-private RVAs remain only as built-in AHK/GTO defaults inside the policy type.
 
+### M3 plugin → capture policy (generic landing, 2026-07-24)
+
+| Piece | Status |
+|-------|--------|
+| `CapturePolicyHint` on `DumpAdvice` | [`crates/core/src/plugin.rs`](../crates/core/src/plugin.rs) — plugin-owned, no sample RVAs in core |
+| `AhkGtoPlugin` | Emits `prefer_ahk_gto_defaults=true`; Themida leaves `capture_policy: None` |
+| Host merge | `DumpCapturePolicy::resolve_with_plugin_hint` in GTO host + post_loop |
+| Sidecar | `capture_policy` block in `*.dump_snapshot.json` (`source`, hot roots, gscript knobs) |
+| Live | `live_20260724-141353_m3_plugin_gtoexp` — `source=ahk_gto_defaults`, hot_roots=10, R0B StructuralPassBehaviorPending, PE retained |
+
+**Explicit non-claim:** plugin owns the *request* for AHK capture defaults; host still requires `--profile=ahk-gto-experimental` for experimental dump stages. Case-manifest schema fill remains future work (M4). Not 1.0 / not load-flake fix.
+
 ### B-B reconfirm (scan60 pin era)
 
 | Batch | all_ok | GTO winner | Notes |
@@ -124,7 +136,8 @@ Gate pin order residual: prefer **`r4c_gto` first** for multi-case reliability; 
 3. `crates/pe/src/dumper/header_patch.rs` — clear `IMAGE_FILE_RELOCS_STRIPPED` when dump rebuilds `.reloc`.  
 4. **VNEXT-BEH** — `validation_summary.json` task VNEXT-BEH, batch `bb_gate_pin`.  
 5. **M1** — `snapshot_manifest` sidecar + probe `--rate-samples`.  
-6. **M2** — `DumpCapturePolicy` + dump-path wiring; live real sidecar; pin rate baseline.
+6. **M2** — `DumpCapturePolicy` + dump-path wiring; live real sidecar; pin rate baseline.  
+7. **M3** — plugin `CapturePolicyHint` → host `DumpCapturePolicy`; sidecar records resolved policy.
 
 ## Explicit non-claims
 

@@ -2,9 +2,12 @@
 //!
 //! Hot RVAs and probe knobs used to be module-private constants. They remain
 //! available as [`DumpCapturePolicy::ahk_gto_default`], but callers can pass a
-//! custom policy via [`super::types::DumpOptions::capture_policy`] (future:
-//! case manifest / plugin). Empty policy + AhkGtoExperimental still resolves
-//! to the built-in AHK/GTO defaults so behaviour stays stable.
+//! custom policy via [`super::types::DumpOptions::capture_policy`] or map a
+//! plugin [`mida_core::CapturePolicyHint`] with [`Self::from_plugin_hint`].
+//! Empty policy + AhkGtoExperimental still resolves to the built-in AHK/GTO
+//! defaults so behaviour stays stable.
+
+use mida_core::CapturePolicyHint;
 
 use super::types::DumpProfile;
 
@@ -63,6 +66,91 @@ impl DumpCapturePolicy {
             gscript_first_hop_span: 0x200,
             gscript_first_hop_probe: 0x800,
             hot_expand_seed_rvas: vec![0x149d50, 0x18a898, 0x148cb8, 0x148cc0],
+        }
+    }
+
+    /// Map a plugin [`CapturePolicyHint`] into a dump policy (pre-profile resolve).
+    ///
+    /// - Explicit RVAs always win.
+    /// - `prefer_ahk_gto_defaults` with empty hot roots → full built-in preset.
+    /// - Otherwise knobs copy through for later [`Self::resolve_for_profile`].
+    pub fn from_plugin_hint(hint: &CapturePolicyHint) -> Self {
+        if !hint.hot_root_rvas.is_empty() {
+            return Self {
+                hot_root_rvas: hint.hot_root_rvas.clone(),
+                large_table_rvas: hint.large_table_rvas.clone(),
+                gscript_root_rva: hint.gscript_root_rva,
+                gscript_root_content_cap: hint.gscript_root_content_cap,
+                gscript_first_hop_span: hint.gscript_first_hop_span,
+                gscript_first_hop_probe: hint.gscript_first_hop_probe,
+                hot_expand_seed_rvas: hint.hot_expand_seed_rvas.clone(),
+            };
+        }
+        if hint.prefer_ahk_gto_defaults {
+            let mut p = Self::ahk_gto_default();
+            // Optional knob overrides on top of the preset.
+            if hint.gscript_root_rva.is_some() {
+                p.gscript_root_rva = hint.gscript_root_rva;
+            }
+            if hint.gscript_root_content_cap != 0 {
+                p.gscript_root_content_cap = hint.gscript_root_content_cap;
+            }
+            if hint.gscript_first_hop_span != 0 {
+                p.gscript_first_hop_span = hint.gscript_first_hop_span;
+            }
+            if hint.gscript_first_hop_probe != 0 {
+                p.gscript_first_hop_probe = hint.gscript_first_hop_probe;
+            }
+            if !hint.large_table_rvas.is_empty() {
+                p.large_table_rvas = hint.large_table_rvas.clone();
+            }
+            if !hint.hot_expand_seed_rvas.is_empty() {
+                p.hot_expand_seed_rvas = hint.hot_expand_seed_rvas.clone();
+            }
+            return p;
+        }
+        Self {
+            hot_root_rvas: Vec::new(),
+            large_table_rvas: hint.large_table_rvas.clone(),
+            gscript_root_rva: hint.gscript_root_rva,
+            gscript_root_content_cap: hint.gscript_root_content_cap,
+            gscript_first_hop_span: hint.gscript_first_hop_span,
+            gscript_first_hop_probe: hint.gscript_first_hop_probe,
+            hot_expand_seed_rvas: hint.hot_expand_seed_rvas.clone(),
+        }
+    }
+
+    /// Host convenience: optional plugin hint + profile resolve.
+    ///
+    /// When `hint` is `None`, behaves like empty policy + profile (M2 path).
+    /// When present, maps via [`Self::from_plugin_hint`] then resolves.
+    pub fn resolve_with_plugin_hint(
+        base: Self,
+        hint: Option<&CapturePolicyHint>,
+        profile: DumpProfile,
+    ) -> Self {
+        let policy = match hint {
+            Some(h) => {
+                // Explicit caller roots on DumpOptions win over plugin preset.
+                if !base.hot_root_rvas.is_empty() {
+                    base
+                } else {
+                    Self::from_plugin_hint(h)
+                }
+            }
+            None => base,
+        };
+        policy.resolve_for_profile(profile)
+    }
+
+    /// Short label for snapshot sidecar / logs.
+    pub fn source_label(&self) -> &'static str {
+        if self.hot_root_rvas.is_empty() {
+            "empty"
+        } else if self == &Self::ahk_gto_default() {
+            "ahk_gto_defaults"
+        } else {
+            "custom"
         }
     }
 
@@ -169,5 +257,59 @@ mod tests {
         .resolve_for_profile(DumpProfile::AhkGtoExperimental);
         assert_eq!(p.hot_root_rvas, vec![0x1000]);
         assert_eq!(p.gscript_root(), Some(0x149d50)); // filled from defaults
+    }
+
+    #[test]
+    fn plugin_hint_prefer_defaults_maps_preset() {
+        let hint = CapturePolicyHint {
+            prefer_ahk_gto_defaults: true,
+            ..Default::default()
+        };
+        let p = DumpCapturePolicy::from_plugin_hint(&hint);
+        assert_eq!(p, DumpCapturePolicy::ahk_gto_default());
+        assert_eq!(p.source_label(), "ahk_gto_defaults");
+    }
+
+    #[test]
+    fn plugin_hint_explicit_roots_win() {
+        let hint = CapturePolicyHint {
+            prefer_ahk_gto_defaults: true,
+            hot_root_rvas: vec![0x2000, 0x3000],
+            gscript_root_rva: Some(0x2000),
+            ..Default::default()
+        };
+        let p = DumpCapturePolicy::from_plugin_hint(&hint)
+            .resolve_for_profile(DumpProfile::AhkGtoExperimental);
+        assert_eq!(p.hot_root_rvas, vec![0x2000, 0x3000]);
+        assert_eq!(p.gscript_root(), Some(0x2000));
+        assert_eq!(p.source_label(), "custom");
+    }
+
+    #[test]
+    fn resolve_with_plugin_hint_none_matches_profile() {
+        let p = DumpCapturePolicy::resolve_with_plugin_hint(
+            DumpCapturePolicy::default(),
+            None,
+            DumpProfile::AhkGtoExperimental,
+        );
+        assert_eq!(p, DumpCapturePolicy::ahk_gto_default());
+    }
+
+    #[test]
+    fn base_roots_override_plugin_preset() {
+        let hint = CapturePolicyHint {
+            prefer_ahk_gto_defaults: true,
+            ..Default::default()
+        };
+        let base = DumpCapturePolicy {
+            hot_root_rvas: vec![0x42],
+            ..Default::default()
+        };
+        let p = DumpCapturePolicy::resolve_with_plugin_hint(
+            base,
+            Some(&hint),
+            DumpProfile::AhkGtoExperimental,
+        );
+        assert_eq!(p.hot_root_rvas, vec![0x42]);
     }
 }

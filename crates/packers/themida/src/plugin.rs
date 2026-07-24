@@ -144,6 +144,7 @@ impl PackerPlugin for ThemidaPlugin {
                 entry_point_rva: ctx.oep_rva,
                 prefer_pure_rebuild: false,
                 note: "themida: host owns dump options; pure remains opt-in",
+                capture_policy: None,
             })
         } else {
             None

@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use tracing::{info, warn};
 
+use super::capture_policy::DumpCapturePolicy;
 use super::container_snapshot::ContainerSnapshot;
 use super::heap_global_snapshot::HeapGlobalSnapshot;
 use super::types::DumpProfile;
@@ -34,6 +35,7 @@ pub(crate) fn write_dump_snapshot_manifest(
     entry_point_rva: u32,
     containers: &[ContainerSnapshot],
     heap_globals: &[HeapGlobalSnapshot],
+    capture_policy: &DumpCapturePolicy,
 ) {
     let path = manifest_path_for_output(output_path);
     match render_manifest_json(
@@ -43,6 +45,7 @@ pub(crate) fn write_dump_snapshot_manifest(
         entry_point_rva,
         containers,
         heap_globals,
+        capture_policy,
     ) {
         Ok(json) => match fs::File::create(&path).and_then(|mut f| f.write_all(json.as_bytes())) {
             Ok(()) => {
@@ -109,6 +112,7 @@ pub(crate) fn render_manifest_json(
     entry_point_rva: u32,
     containers: &[ContainerSnapshot],
     heap_globals: &[HeapGlobalSnapshot],
+    capture_policy: &DumpCapturePolicy,
 ) -> Result<String, String> {
     let container_payload: u64 = containers
         .iter()
@@ -148,6 +152,45 @@ pub(crate) fn render_manifest_json(
         "  \"entry_point_rva\": \"{}\",\n",
         hex_u32(entry_point_rva)
     ));
+
+    // Resolved capture policy (post plugin-hint + profile). Observable only.
+    buf.push_str("  \"capture_policy\": {\n");
+    buf.push_str(&format!(
+        "    \"source\": \"{}\",\n",
+        capture_policy.source_label()
+    ));
+    buf.push_str(&format!(
+        "    \"hot_root_count\": {},\n",
+        capture_policy.hot_root_rvas.len()
+    ));
+    buf.push_str("    \"hot_root_rvas\": [");
+    for (i, rva) in capture_policy.hot_root_rvas.iter().enumerate() {
+        if i > 0 {
+            buf.push_str(", ");
+        }
+        buf.push_str(&format!("\"{}\"", hex_u32(*rva)));
+    }
+    buf.push_str("],\n");
+    buf.push_str(&format!(
+        "    \"gscript_root_rva\": {},\n",
+        match capture_policy.gscript_root() {
+            Some(r) => format!("\"{}\"", hex_u32(r)),
+            None => "null".to_string(),
+        }
+    ));
+    buf.push_str(&format!(
+        "    \"gscript_content_cap\": {},\n",
+        capture_policy.gscript_content_cap()
+    ));
+    buf.push_str(&format!(
+        "    \"first_hop_span\": {},\n",
+        capture_policy.first_hop_span()
+    ));
+    buf.push_str(&format!(
+        "    \"expand_seed_count\": {}\n",
+        capture_policy.hot_expand_seed_rvas.len()
+    ));
+    buf.push_str("  },\n");
 
     buf.push_str("  \"containers\": [\n");
     for (i, c) in containers.iter().enumerate() {
@@ -244,12 +287,15 @@ mod tests {
             0x1000,
             &[],
             &[],
+            &DumpCapturePolicy::default(),
         )
         .unwrap();
         assert!(json.contains(SCHEMA_VERSION));
         assert!(json.contains("\"container_count\": 0"));
         assert!(json.contains("\"heap_global_count\": 0"));
         assert!(json.contains("OreansClassic"));
+        assert!(json.contains("\"source\": \"empty\""));
+        assert!(json.contains("\"hot_root_count\": 0"));
     }
 
     #[test]
@@ -276,6 +322,7 @@ mod tests {
                 is_heap_handle: false,
             },
         ];
+        let policy = DumpCapturePolicy::ahk_gto_default();
         let json = render_manifest_json(
             Path::new("cand.exe"),
             DumpProfile::AhkGtoExperimental,
@@ -283,6 +330,7 @@ mod tests {
             0x70b0,
             &containers,
             &heap_globals,
+            &policy,
         )
         .unwrap();
         assert!(json.contains("0x145710"));
@@ -292,5 +340,7 @@ mod tests {
         assert!(json.contains("\"image_roots\": 1"));
         assert!(json.contains("\"heap_global_payload_bytes\": 16448"));
         assert!(json.contains("\"container_payload_bytes\": 72"));
+        assert!(json.contains("\"source\": \"ahk_gto_defaults\""));
+        assert!(json.contains("\"0x149d50\""));
     }
 }

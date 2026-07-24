@@ -240,11 +240,20 @@ pub(super) fn run_post_loop_phases(
             advice_ep = ?advice.entry_point_rva,
             prefer_pure = advice.prefer_pure_rebuild,
             note = advice.note,
+            has_capture_hint = advice.capture_policy.is_some(),
             "PackerPlugin dump_advice at dump boundary"
         );
         // prefer_pure_rebuild is advisory only; CLI `--pure-rebuild` still owns emit.
         let _ = advice.prefer_pure_rebuild;
     }
+    // Plugin capture hint (AHK) or empty (Themida) → resolve with dump profile.
+    let capture_policy = mida_pe::DumpCapturePolicy::resolve_with_plugin_hint(
+        mida_pe::DumpCapturePolicy::default(),
+        dump_advice
+            .as_ref()
+            .and_then(|a| a.capture_policy.as_ref()),
+        profile,
+    );
 
     if shrink {
         match shrink_pe(pe) {
@@ -358,7 +367,7 @@ pub(super) fn run_post_loop_phases(
             None
         },
         pure_rebuild,
-        capture_policy: mida_pe::DumpCapturePolicy::default(),
+        capture_policy,
     };
 
     mida_pe::dump_process(dbg, &dump_opts).map_err(|e| anyhow!("Dump failed: {e}"))?;

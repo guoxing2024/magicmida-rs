@@ -178,6 +178,12 @@ impl PackerPlugin for AhkGtoPlugin {
                 entry_point_rva: ctx.oep_rva,
                 prefer_pure_rebuild: false,
                 note: "ahk_gto: host must pass --profile=ahk-gto-experimental for heap/container stages",
+                // Plugin owns the request for AHK capture defaults; host still
+                // gates experimental stages on DumpProfile.
+                capture_policy: Some(mida_core::CapturePolicyHint {
+                    prefer_ahk_gto_defaults: true,
+                    ..Default::default()
+                }),
             })
         } else {
             None
@@ -346,6 +352,9 @@ mod tests {
         let a = p.dump_advice(&ctx).expect("advice");
         assert!(a.note.contains("ahk-gto-experimental"));
         assert!(!a.prefer_pure_rebuild);
+        let cap = a.capture_policy.expect("ahk capture hint");
+        assert!(cap.prefer_ahk_gto_defaults);
+        assert!(cap.hot_root_rvas.is_empty()); // host maps preset → built-in RVAs
     }
 
     #[test]

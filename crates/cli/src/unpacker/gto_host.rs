@@ -396,9 +396,25 @@ pub(super) fn run_gto_host(
         info!(
             prefer_pure = advice.prefer_pure_rebuild,
             note = advice.note,
+            has_capture_hint = advice.capture_policy.is_some(),
             "GTO host dump_advice"
         );
     }
+    // Plugin hint → DumpCapturePolicy (AHK preset or explicit RVAs). Profile
+    // still gates experimental stages; Oreans profile would keep capture empty.
+    let capture_policy = mida_pe::DumpCapturePolicy::resolve_with_plugin_hint(
+        mida_pe::DumpCapturePolicy::default(),
+        dump_advice
+            .as_ref()
+            .and_then(|a| a.capture_policy.as_ref()),
+        profile,
+    );
+    info!(
+        capture_source = capture_policy.source_label(),
+        hot_roots = capture_policy.hot_root_rvas.len(),
+        gscript = ?capture_policy.gscript_root().map(|r| format!("{r:#x}")),
+        "GTO host resolved capture_policy"
+    );
 
     let runtime_base = mida_core::RuntimeBase(dbg.image_base());
     let entry_rva = mida_core::Va(oep_addr as u64)
@@ -502,8 +518,8 @@ pub(super) fn run_gto_host(
         security_cookie_rva: None,
         security_cookie_complement_rva: None,
         pure_rebuild,
-        // Empty → AhkGtoExperimental resolves built-in AHK/GTO hot roots.
-        capture_policy: mida_pe::DumpCapturePolicy::default(),
+        // From DumpAdvice.capture_policy (plugin) + profile resolve.
+        capture_policy,
     };
 
     mida_pe::dump_process(&mut dbg, &dump_opts).map_err(|e| anyhow!("GTO host dump failed: {e}"))?;
