@@ -33,6 +33,49 @@ const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 /// Keeping those live-process addresses in an independent dump makes the CRT
 /// re-entry path (e.g. `__scrt_common_main_seh`) dereference freed heap and
 /// AV at `_pioinfo[i]->_ptr` / similar globals.
+/// Re-initialize `RTL_CRITICAL_SECTION` objects at the given `.data` RVAs.
+///
+/// A captured CS carries stale/zero lock state from the dumped process:
+/// `LockCount = 0` (not `-1`) makes `RtlEnterCriticalSection` treat the
+/// section as contended and wait on a NULL `LockSemaphore`, AV-ing. We reset
+/// to the unlocked state a fresh `InitializeCriticalSection` would produce:
+/// `LockCount = -1`, `RecursionCount = 0`, `OwningThread = 0`,
+/// `LockSemaphore = 0`, `SpinCount = 0` (leaving `DebugInfo` as-is; the
+/// loader tolerates a zeroed CS without a live DebugInfo on re-entry).
+///
+/// R-GTO-UI round 5: validated by byte-patch (LockCount=-1 clears the
+/// `RtlEnterCriticalSection` AV in the GTO WinMain path).
+pub(crate) fn reinit_critical_sections(dump_buf: &mut [u8], cs_rvas: &[u32]) -> usize {
+    let mut reinit = 0usize;
+    for &rva in cs_rvas {
+        let off = rva as usize;
+        // RTL_CRITICAL_SECTION is 40 bytes on x64.
+        if off.saturating_add(40) > dump_buf.len() {
+            warn!(
+                cs_rva = format_args!("{rva:#x}"),
+                "CS re-init out of bounds"
+            );
+            continue;
+        }
+        // LockCount at +8 (i32), RecursionCount +12, OwningThread +16,
+        // LockSemaphore +24, SpinCount +32.
+        dump_buf[off + 8..off + 12].copy_from_slice(&(-1i32).to_le_bytes());
+        dump_buf[off + 12..off + 16].copy_from_slice(&0i32.to_le_bytes());
+        dump_buf[off + 16..off + 20].copy_from_slice(&0u32.to_le_bytes());
+        dump_buf[off + 24..off + 28].copy_from_slice(&0u32.to_le_bytes());
+        dump_buf[off + 32..off + 40].copy_from_slice(&0u64.to_le_bytes());
+        reinit += 1;
+    }
+    if reinit > 0 {
+        info!(
+            reinit,
+            count = cs_rvas.len(),
+            "Re-initialized RTL_CRITICAL_SECTION objects to unlocked state"
+        );
+    }
+    reinit
+}
+
 pub(crate) fn reinitialize_zero_filled_data(
     pe: &PeHeader,
     dump_buf: &mut [u8],
@@ -342,11 +385,19 @@ mod tests {
         // Sentinel next door stays.
         assert!(!is_stale_absolute_pointer(u64::MAX, image_base, image_end));
         // Image VA stays (observed neighbor at 0xfc388+0x28).
-        assert!(!is_stale_absolute_pointer(0x1401_0a690, image_base, image_end));
+        assert!(!is_stale_absolute_pointer(
+            0x1401_0a690,
+            image_base,
+            image_end
+        ));
         // Low user heap (aligned) still cleared.
         assert!(is_stale_absolute_pointer(0x8d3e40, image_base, image_end));
         // High ASLR image VA must NOT be cleared (CRT fn table before rebase).
-        assert!(!is_stale_absolute_pointer(0x0000_7ff7_2537_1200, image_base, image_end));
+        assert!(!is_stale_absolute_pointer(
+            0x0000_7ff7_2537_1200,
+            image_base,
+            image_end
+        ));
         // Unaligned low-user constant left alone.
         assert!(!is_stale_absolute_pointer(0x8d3e41, image_base, image_end));
     }

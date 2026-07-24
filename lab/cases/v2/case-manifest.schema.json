@@ -122,6 +122,14 @@
             "$ref": "#/$defs/hexRva"
           },
           "uniqueItems": true
+        },
+        "cs_reinit_rvas": {
+          "description": "RTL_CRITICAL_SECTION .data RVAs to re-init to unlocked state in the dump.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/hexRva"
+          },
+          "uniqueItems": true
         }
       }
     },

@@ -30,7 +30,8 @@ pub fn load_capture_policy_file(path: &Path) -> Result<DumpCapturePolicy, String
 ///
 /// Full manifests without `capture_policy` yield an empty policy (not an error).
 pub fn parse_capture_policy_json(text: &str) -> Result<DumpCapturePolicy, String> {
-    let v: Value = serde_json::from_str(text).map_err(|e| format!("invalid capture policy JSON: {e}"))?;
+    let v: Value =
+        serde_json::from_str(text).map_err(|e| format!("invalid capture policy JSON: {e}"))?;
     parse_capture_policy_document(&v)
 }
 
@@ -76,18 +77,20 @@ fn parse_capture_policy_value(v: &Value) -> Result<DumpCapturePolicy, String> {
     let large_table_rvas = parse_hex_rva_list(obj.get("large_table_rvas"), "large_table_rvas")?;
     let hot_expand_seed_rvas =
         parse_hex_rva_list(obj.get("hot_expand_seed_rvas"), "hot_expand_seed_rvas")?;
+    let cs_reinit_rvas = parse_hex_rva_list(obj.get("cs_reinit_rvas"), "cs_reinit_rvas")?;
     let gscript_root_rva = parse_optional_hex_rva(obj.get("gscript_root_rva"), "gscript_root_rva")?;
-    let gscript_root_content_cap =
-        parse_usize_knob(obj.get("gscript_root_content_cap"), "gscript_root_content_cap")?;
+    let gscript_root_content_cap = parse_usize_knob(
+        obj.get("gscript_root_content_cap"),
+        "gscript_root_content_cap",
+    )?;
     let gscript_first_hop_span =
         parse_usize_knob(obj.get("gscript_first_hop_span"), "gscript_first_hop_span")?;
-    let gscript_first_hop_probe =
-        parse_usize_knob(obj.get("gscript_first_hop_probe"), "gscript_first_hop_probe")?;
+    let gscript_first_hop_probe = parse_usize_knob(
+        obj.get("gscript_first_hop_probe"),
+        "gscript_first_hop_probe",
+    )?;
 
-    let preset = obj
-        .get("preset")
-        .and_then(|p| p.as_str())
-        .unwrap_or("");
+    let preset = obj.get("preset").and_then(|p| p.as_str()).unwrap_or("");
 
     let mut policy = if !hot_root_rvas.is_empty() {
         DumpCapturePolicy {
@@ -98,6 +101,7 @@ fn parse_capture_policy_value(v: &Value) -> Result<DumpCapturePolicy, String> {
             gscript_first_hop_span,
             gscript_first_hop_probe,
             hot_expand_seed_rvas: hot_expand_seed_rvas.clone(),
+            cs_reinit_rvas: cs_reinit_rvas.clone(),
         }
     } else {
         match preset {
@@ -112,6 +116,9 @@ fn parse_capture_policy_value(v: &Value) -> Result<DumpCapturePolicy, String> {
     };
 
     // Knobs override preset defaults when explicitly set in the file.
+    if !cs_reinit_rvas.is_empty() {
+        policy.cs_reinit_rvas = cs_reinit_rvas;
+    }
     if gscript_root_rva.is_some() {
         policy.gscript_root_rva = gscript_root_rva;
     }

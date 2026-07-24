@@ -919,6 +919,15 @@ pub fn dump_process(
         opts.executable_path.as_deref(),
     );
 
+    // R-GTO-UI round 5/7: re-init CRITICAL_SECTION objects in `.data` whose
+    // captured lock state (zeroed/stale) would AV/deadlock
+    // `RtlEnterCriticalSection` when WinMain re-enters them. Driven by
+    // `DumpCapturePolicy::cs_reinit_rvas`.
+    super::data_reinit::reinit_critical_sections(
+        &mut dump_buf,
+        &capture_policy.cs_reinit_rvas,
+    );
+
     // Early overlay zeros the live cookie. MSVC `__security_init_cookie` only
     // regenerates when storage still holds the default sentinel; plant it so
     // CRT re-entry produces a real cookie before post-CRT container encode.

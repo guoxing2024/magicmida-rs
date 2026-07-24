@@ -28,6 +28,11 @@ pub struct DumpCapturePolicy {
     pub gscript_first_hop_probe: usize,
     /// Image roots used as multi-hop expand seeds (empty → gscript + hot pair defaults).
     pub hot_expand_seed_rvas: Vec<u32>,
+    /// `.data` RVAs of `RTL_CRITICAL_SECTION` objects to re-initialize in the
+    /// dumped image (set `LockCount = -1`, zero `OwningThread`/`RecursionCount`/
+    /// `LockSemaphore`). Captured CS bytes carry stale/zero lock state from the
+    /// dumped process; a fresh loader enter would AV/deadlock. R-GTO-UI round 5.
+    pub cs_reinit_rvas: Vec<u32>,
 }
 
 impl Default for DumpCapturePolicy {
@@ -40,6 +45,7 @@ impl Default for DumpCapturePolicy {
             gscript_first_hop_span: 0,
             gscript_first_hop_probe: 0,
             hot_expand_seed_rvas: Vec::new(),
+            cs_reinit_rvas: Vec::new(),
         }
     }
 }
@@ -55,10 +61,7 @@ impl DumpCapturePolicy {
                 0x148bf8, // large table
                 0x148cb8, // string capacity (pair with 0x148cc0)
                 0x148cc0, // string table base
-                0x148cb0,
-                0x148ca8,
-                0x148c98,
-                0x148c00,
+                0x148cb0, 0x148ca8, 0x148c98, 0x148c00,
             ],
             large_table_rvas: vec![0x149d50, 0x141bf0, 0x148bf8, 0x148c00, 0x148c98],
             gscript_root_rva: Some(0x149d50),
@@ -66,10 +69,15 @@ impl DumpCapturePolicy {
             // (readable ≥0x20000). Cold restart then ExitProcess(0) without
             // NewClassName. 0x10000 keeps first-hop + more body; still under
             // MAX_HEAP_GLOBAL_BYTES (32 KiB) free-list swallow ceiling.
-            gscript_root_content_cap: 0x10000,
+            gscript_root_content_cap: 0x20000,
             gscript_first_hop_span: 0x200,
             gscript_first_hop_probe: 0x800,
             hot_expand_seed_rvas: vec![0x149d50, 0x18a898, 0x148cb8, 0x148cc0],
+            // R-GTO-UI round 5/7: WinMain enters a CRITICAL_SECTION at
+            // `.data` RVA 0x145db0 that is zeroed in the dump; LockCount=0
+            // (not -1) makes RtlEnterCriticalSection treat it as contended
+            // and wait on a NULL LockSemaphore -> AV. Re-init to unlocked.
+            cs_reinit_rvas: vec![0x145db0],
         }
     }
 
@@ -88,6 +96,7 @@ impl DumpCapturePolicy {
                 gscript_first_hop_span: hint.gscript_first_hop_span,
                 gscript_first_hop_probe: hint.gscript_first_hop_probe,
                 hot_expand_seed_rvas: hint.hot_expand_seed_rvas.clone(),
+                cs_reinit_rvas: Vec::new(),
             };
         }
         if hint.prefer_ahk_gto_defaults {
@@ -121,6 +130,7 @@ impl DumpCapturePolicy {
             gscript_first_hop_span: hint.gscript_first_hop_span,
             gscript_first_hop_probe: hint.gscript_first_hop_probe,
             hot_expand_seed_rvas: hint.hot_expand_seed_rvas.clone(),
+            cs_reinit_rvas: Vec::new(),
         }
     }
 
