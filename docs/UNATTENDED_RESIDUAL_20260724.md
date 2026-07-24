@@ -493,7 +493,35 @@ Evidence: `D:\MidaVault\lab\evidence\_beh_gate\r_gto_ui_r2\` (`gto_unpacked_wind
 
 **Artifacts (vault, not in git):** `D:\MidaVault\scratch\gto_diag_step1*.log`, `gto_diag_oep.log`, `gto_postloop.log`, `gto_iat.log`, `gto_main.log`, `gto_71a0.log`, `verify_live_gto.exe` + `*.dump_snapshot.json`.
 
-## Residual after VNEXT-BEH (+ W1–W4 + P1 + P2 + R-GTO-UI×2 + step-1 dx)
+## R-GTO-UI round 3 (direction 1 — OEP re-capture) — **NEGATIVE; AV; reverted**
+
+**Date:** 2026-07-24 (operator authorized direction 1, round 3 of Q2 cap).
+**Hypothesis:** the captured OEP `0x70b0` is a WindowProc, not the program entry; setting dump `AddressOfEntryPoint` to the true MSVC `mainCRTStartup` should let the CRT init -> `_initterm` -> `WinMain` run and create `NewClassName`.
+
+**Static target found (read-only, candidate `.text`):**
+- `__scrt_common_main_seh` at RVA `0xd9160` (MSVC14 sig `48 89 5C 24 08 57 48 83 EC xx B9 01 00 00 00 E8`, unique match in `.text`).
+- Its tail-jmp caller at RVA `0xd92e1` (`E9` -> `0xd9160`) sits in a tiny function at RVA **`0xd92d4`**: `48 83 EC 28` (`sub rsp,0x28`) `E8 …` (`call __scrt_initialize @ 0xd9848`) `48 83 C4 28` `E9 …` (`jmp __scrt_common_main_seh`). This is `mainCRTStartup`.
+
+**Implementation (committed code, then reverted):** added pure helper `find_msvc_maincrt_startup(text, text_rva)` in `crates/packers/themida/src/oep/mod.rs` (strict MSVC14 sig -> E8/E9 caller -> walk back to `48 83 EC 28`), wired into `gto_host.rs` to prefer its result over the generic `.text` prologue scan. 3 synthetic unit tests green. Live unpack logged `OEP via mainCRTStartup 0x1400d92d4 (rva 0xd92d4); scanned fallback was 0x1400070b0` — the override fired correctly.
+
+**Result: REGRESSION (AV), not a fix.**
+- New candidate (`verify_live_gto_d1d.exe`, R0B StructuralPassBehaviorPending 12/12) **crashes** on load: exit `3221225477` = `0xC0000005` (access violation), `window_class NewClassName` oracle = **Fail** (no window).
+- cdb: AV with `rip=0` (call to null); call site `0x1400d9266` is inside `__scrt_common_main_seh`'s init path (between `0xd9160` scrt and `0xd92d4` mainCRTStartup). A CRT-init function pointer is null at the point `_initterm`/`__scrt_initialize` runs.
+- **Root cause of the AV (fundamental, not 1-line):** the unpacker's transfer stub at `0xecc000` REPLAYS the captured `g_script` heap table (`GetProcessHeap`+`RtlAllocateHeap`+`rep movsb`+hash over 320+321 entries) before `jmp` OEP. When OEP = `mainCRTStartup`, the real `_initterm` re-runs the C++ static ctors ON TOP of the stub's replayed heap state -> the replayed pointers (live-runtime-relative, only partially fixed up) are dereferenced by the real ctors -> null call -> AV. The stub's heap replay and a fresh `mainCRTStartup` init do **not** compose.
+
+**Stop rule (Q2):** round 3 produced an AV regression (load_no_crash would go from 1.0 clean-exit-0 to AV crash). Round 4 "skip the stub heap replay" or "set EP to post-`_initterm` WinMain-call site" are significant speculative changes without a strong success guarantee; grinding into them blindly violates the Q2 discipline. **Reverted** all code changes (`gto_host.rs`, `oep/mod.rs`, `lib.rs` restored to HEAD; helper + tests removed). Rebuilt CLI; re-verified GTO returns to `entry_rva=0x70b0`, clean exit 0, `load_no_crash` Pass — the 4-case fresh-reverify baseline is intact, no regression shipped.
+
+**What was learned (positive knowledge, no code shipped):**
+1. The true MSVC program entry for GTO is `mainCRTStartup` @ RVA `0xd92d4` (caller of `__scrt_common_main_seh` @ `0xd9160`). Confirmed statically + live override fired.
+2. The captured `0x70b0` is confirmed NOT the program entry; it is a WindowProc/message-dispatch function.
+3. **Direction 1 alone is insufficient.** The transfer stub's heap-replay semantics conflict with a fresh `mainCRTStartup` init. Any future fix that re-points EP to `mainCRTStartup` MUST also redesign the stub: either (a) skip heap replay and rely on real ctors + fully-fixed-up `.data`/`.rdata`, or (b) replay heap AND set EP to the post-`_initterm` point (the `call WinMain` site inside `__scrt_common_main`), not `mainCRTStartup`.
+4. This narrows R-GTO-UI from "wrong OEP" to **"OEP + stub-replay composition"** — a stub/runtime-architecture problem, not an OEP-detection problem. The OEP-detection piece (direction 1's helper) is sound and reusable if a future round redesigns the stub.
+
+**Non-claim:** round 3 does not close R-GTO-UI; does not enable a 1.0 sentence; ships no code change. R-GTO-UI remains open. Further work needs a new operator authorization (stub redesign is beyond "OEP re-capture").
+
+**Artifacts (vault, not in git):** `D:\MidaVault\scratch\verify_live_gto_d1*.exe`, `gto_d1d_av.log`, `gto_avsite*.log`, `gto_diag_oep.log`.
+
+## Residual after VNEXT-BEH (+ W1–W4 + P1 + P2 + R-GTO-UI×2 + step-1 dx + round-3 neg)
 
 | ID | Item | Blocks 1.0? | Status |
 |----|------|-------------|--------|
@@ -502,7 +530,7 @@ Evidence: `D:\MidaVault\lab\evidence\_beh_gate\r_gto_ui_r2\` (`gto_unpacked_wind
 | R-GTO-LATEST | Fresh dump load without `r4c_gto` walk | Quality | **W2 metric exit** |
 | R-GTO-BOOT | `.boot` heap_global payload size variance under 320-slot cap | Quality | Open (honesty; not load AV root) |
 | R-PURE-LOGIC | Product-logic / business path equivalence | **Yes** for product 1.0 | **Advanced:** controls + pe_string + exit/title/exports; **still blocks 1.0** |
-| R-GTO-UI | Unpacked GTO no product window; protected does | Quality / **1.0-relevant for GTO** | **Open + root-caused (step-1 dx):** captured OEP `0x70b0` is a WindowProc, not program entry; W2 clear-regs zeroes its arg regs → default-path `ret` to OS thread-start → exit 0, no window. **Awaiting operator auth for round 3** |
+| R-GTO-UI | Unpacked GTO no product window; protected does | Quality / **1.0-relevant for GTO** | **Open; root-caused + round-3 neg:** true OEP is `mainCRTStartup`@`0xd92d4` (WindowProc `0x70b0` mis-captured); but OEP=mainCRTStartup alone AVs (stub heap-replay vs fresh `_initterm` conflict). Needs stub redesign, not OEP-only fix. **Awaiting operator auth (beyond direction 1)** |
 | R-4CASE-FRESH | Full 4-case attempt=1 on best pins | Claim hygiene | **P1-A closed** (N=10 × 4 = 1.0) |
 | R-X86 | ScyllaHide x86 residual | x86 only | Open |
 | **product 1.0 claim** | Operator + Q7 | Governance | **Still NO** |
