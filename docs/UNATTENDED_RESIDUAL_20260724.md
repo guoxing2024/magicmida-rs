@@ -8,7 +8,8 @@
 
 | Batch | Tag | all_ok | Notes |
 |-------|-----|--------|-------|
-| `D:\MidaVault\lab\evidence\_beh_gate\batch_20260724-112907_bb_gate_pin` | bb_gate_pin | **true** | Preferred pins + probe retries; VNEXT-BEH written |
+| `D:\MidaVault\lab\evidence\_beh_gate\batch_20260724-112907_bb_gate_pin` | bb_gate_pin | **true** | Preferred pins + probe retries; VNEXT-BEH written (dir has per-case compose + `summary.json`) |
+| `...\batch_20260724-125450_bb_gate_reconfirm_scan60` | reconfirm | **true** | 4× compose Accepted; GTO winner still r4c walk residual |
 | `...\batch_20260724-105209_bb_gate_walk` | walk | false | Origin 8× probe Fail (over-walk + short backoff) |
 | `...\batch_20260724-102551_bb_gate_iso` | iso | false | Origin Accepted once; GTO Fail |
 | earlier r2/r2b/q_all_a | — | false | pre-pin / pre-retry harden |
@@ -159,17 +160,72 @@ Gate pin order residual: prefer **`r4c_gto` first** for multi-case reliability; 
 - `load_no_crash_v0` is **load survival**, not UI/business parity.  
 - Pure default remains **Origin-only**, not global.  
 - GTO still needs `--profile=ahk-gto-experimental` for experimental dump stages.  
-- Origin/GTO **single-shot** load may still AV; Accepted rests on **retry + pin** policy residual.
+- **Origin** quiet single-shot load flake is **closed at metric** (W1 scrub_v2, N=20 attempt=1 → 1.0); GTO single-shot and multi-case gate pressure remain residual.  
+- B-B `Accepted` still rests on pin/retry for GTO; does **not** equal product 1.0.
 
-## Residual after VNEXT-BEH
+## W1 — Origin single-shot load (R-LOAD-FLAKE Origin side) — **metric exit**
 
-| ID | Item | Blocks 1.0? |
-|----|------|-------------|
-| R-LOAD-FLAKE | Origin/GTO intermittent 0xC0000005; worse under multi-case gate pressure | Quality / stability |
-| R-GTO-LATEST | Independent-host (`scan60`) StructuralPass + IAT 98% + quiet Pass, but batch probe often Fail; gate walks to `r4c_gto` | Quality |
-| R-GTO-BOOT | `.boot` ~28 KiB = heap_global payload under 320-slot cap; dominant `0x141bf0` 16 KiB RPM size estimate + graph children — same detector both hosts | Quality; not missing stage; not proven sole flake root |
-| R-PURE-LOGIC | Pure dump not proven equivalent to protected product logic | Yes for product 1.0 |
-| R-X86 | ScyllaHide x86 residual | x86 only |
+**Work order:** [COURSE_CORRECTION_WORK_ORDER.md](COURSE_CORRECTION_WORK_ORDER.md) W1  
+**Date:** 2026-07-24  
+**Claim:** Origin quiet `load_no_crash_v0` attempt=1 rate ≥0.90 on fresh pure dump. **Not** product 1.0 / not business logic.
+
+### Baselines (attempt=1, N=20 quiet serial, isolate basename)
+
+| Candidate / build | pass_rate | Evidence |
+|-------------------|-----------|----------|
+| pure_r1 pin (pre-fix) | ~0.10 (2/20) | `origin_w1_rate_20260724-144207` |
+| same PE, `--no-pure-rebuild` legacy | 0.25 (5/20) | `origin_w1_legacy_rate_20260724-144503` |
+| offline zero RVA `0xfc388` only | **1.0** (20/20) | `origin_w1_patch_fc388` (proves object-head path) |
+| live after plant-only fix (wrong) | fail class #2 | plant rewrote `0xfc388` as `!cookie` |
+| live after broad scrub (wrong) | AV `call rdx` null | cleared ASLR CRT fn table `0xfc320` |
+| **live scrub_v2 (winning)** | **1.0** (20/20) | `D:\MidaVault\lab\evidence\_beh_gate\origin_w1_scrub_v2_rate_20260724-151615\evidence_rate20.json` |
+
+**Winning live tag:** `live_20260724-151549_w1_scrub_v2`  
+**SHA256 (candidate):** `4ede58a5f2d52d43602a35c99eda21249ef0789825d04b6c63dd82882c33b7cb`
+
+### Root causes (two cooperating bugs, not “random flake”)
+
+1. **Kernel-canonical garbage object head**  
+   - Live pure dump kept QWORD at RVA **`0xfc388` = `0xffffd466d2205dcd`** (kernel-half, unaligned).  
+   - cdb: second-chance AV `rip=o+0x39e5c` `xchg ecx,dword ptr [r10]` with `r10` = that value.  
+   - Same bit pattern equals `!DEFAULT_SECURITY_COOKIE` → cookie **complement scanner** also treated `0xfc388` as complement while cookie sits at **`0xfc050`** (distant, not MSVC ±8).  
+   - Planting default cookie then **rewrote app data** at `0xfc388` to `!cookie`, reintroducing the bad object head after scrub.
+
+2. **Over-broad process-local scrub (round-1 trap)**  
+   - Scrubbing full canonical user range cleared **ASLR image VAs** (`0x7ff…`) still present in late CRT function tables before `fix_hardcoded_addresses`.  
+   - Symptom: `call [fn_table]` → null RIP (second crash class).  
+   - Fix: keep scrub to **low-4GB aligned heap-like** + **kernel-canonical garbage**; do **not** clear high user/ASLR image pointers.
+
+### Code fix (2 rounds, whitelist)
+
+| Module | Change |
+|--------|--------|
+| [`data_reinit.rs`](../crates/pe/src/dumper/data_reinit.rs) | `is_stale_absolute_pointer`: kernel-canonical clear (unaligned OK); low-4GB aligned heap only; blank-name RW `.data` for pure rebuild; unit test `clears_origin_kernel_garbage_object_head` |
+| [`heap_bootstrap.rs`](../crates/pe/src/dumper/heap_bootstrap.rs) | Prefer adjacent (±8) complement when scanning; `normalize_cookie_site_for_plant` forces plant at `cookie_rva+8` if distant `!cookie` collision |
+
+**Live post-fix (scrub_v2):** `cleared≈7` (was 52 with over-scrub); `0xfc320` keeps image/ASLR fn ptr; `0xfc388=0`.
+
+### W1 exit checklist
+
+| Criterion | Status |
+|-----------|--------|
+| Quiet N≥20 attempt=1 ≥0.90 | **Pass** (20/20 = 1.0) |
+| Failures ≤2 root-cause clusters, documented | **Pass** (kernel object-head + plant mis-ID; over-scrub as failed round) |
+| No 1.0 claim | **Held** |
+| Residual updated + local commit | this section + course-correction commit |
+
+**Residual after W1:** Origin quiet single-shot R-LOAD-FLAKE **metric-closed**. Cold-start / multi-case gate pressure not re-measured as W1 exit. GTO R-LOAD-FLAKE and R-GTO-LATEST **unchanged**. Site scan may still *report* distant complement_rva pre-plant; plant path normalizes.
+
+## Residual after VNEXT-BEH (+ W1)
+
+| ID | Item | Blocks 1.0? | Status |
+|----|------|-------------|--------|
+| R-LOAD-FLAKE (Origin quiet) | attempt=1 N≥20 load survival | Quality | **W1 metric exit** (scrub_v2 20/20) |
+| R-LOAD-FLAKE (GTO / gate pressure) | intermittent 0xC0000005 under multi-case / serial GTO | Quality | Open → W2 |
+| R-GTO-LATEST | Independent-host (`scan60`) not batch-stable without `r4c_gto` pin | Quality | Open → W2 |
+| R-GTO-BOOT | `.boot` ~28 KiB heap_global under 320-slot cap | Quality | Open (honesty; not sole flake proof) |
+| R-PURE-LOGIC | Pure dump not proven equivalent to protected product logic | **Yes** for product 1.0 | Open → W3+ |
+| R-X86 | ScyllaHide x86 residual | x86 only | Open |
 
 ## Re-run
 

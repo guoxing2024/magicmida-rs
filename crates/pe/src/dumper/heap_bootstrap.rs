@@ -284,6 +284,13 @@ fn rva_range_in_section(rva: u32, len: u32, section_rva: u32, section_size: u32)
 ///
 /// When `site` is `Some`, plant **only** that site (no rescan). When `None`,
 /// fall back to the unique-scan locator. Returns `false` if plant fails.
+///
+/// **Complement plant rule (Origin W1 / R-LOAD-FLAKE):** MSVC stores
+/// `__security_cookie_complement` adjacent to the cookie (±8). A distant QWORD
+/// that happens to equal `!cookie` (Origin: RVA `0xfc388` == `!DEFAULT` while
+/// cookie is at `0xfc050`) is application data — planting there reintroduces
+/// the AV object-head (`xchg [r10]` at o+0x39e5c). Non-adjacent complements are
+/// rewritten to `cookie_rva + 8` before plant.
 pub(crate) fn plant_default_security_cookie(
     pe: &PeHeader,
     dump_buf: &mut [u8],
@@ -294,6 +301,7 @@ pub(crate) fn plant_default_security_cookie(
         // Overlay may have wiped the live pair; try default layout scan fails.
         return false;
     };
+    let site = normalize_cookie_site_for_plant(site);
     if !write_u64_at_rva(dump_buf, site.cookie_rva, DEFAULT_SECURITY_COOKIE) {
         return false;
     }
@@ -307,6 +315,26 @@ pub(crate) fn plant_default_security_cookie(
         "Planted MSVC default SecurityCookie for CRT re-init"
     );
     true
+}
+
+/// Force MSVC-adjacent complement for plant when the resolved site is distant.
+fn normalize_cookie_site_for_plant(site: SecurityCookieSite) -> SecurityCookieSite {
+    let dist = site.cookie_rva.abs_diff(site.complement_rva);
+    if dist == 8 {
+        return site;
+    }
+    let fixed = SecurityCookieSite {
+        cookie_rva: site.cookie_rva,
+        complement_rva: site.cookie_rva.saturating_add(8),
+    };
+    warn!(
+        cookie_rva = format_args!("{:#x}", site.cookie_rva),
+        rejected_complement_rva = format_args!("{:#x}", site.complement_rva),
+        plant_complement_rva = format_args!("{:#x}", fixed.complement_rva),
+        dist,
+        "SecurityCookie complement not adjacent (±8); planting at cookie+8 (MSVC layout)"
+    );
+    fixed
 }
 
 fn find_security_cookie_rva(pe: &PeHeader, dump_buf: &[u8]) -> Option<u32> {
@@ -536,6 +564,17 @@ fn find_security_cookie_site(pe: &PeHeader, dump_buf: &[u8]) -> Option<SecurityC
         .into_iter()
         .filter(|p| p.cookie_rva == cookie_rva)
         .collect();
+    // Prefer true MSVC adjacent complement (±8) over distant !cookie collisions
+    // (Origin app object head at 0xfc388 equals !DEFAULT while cookie is 0xfc050).
+    let mut adjacent: Vec<_> = same
+        .iter()
+        .copied()
+        .filter(|p| p.complement_rva.abs_diff(p.cookie_rva) == 8)
+        .collect();
+    if !adjacent.is_empty() {
+        adjacent.sort_by_key(|p| p.complement_rva);
+        return Some(adjacent[0]);
+    }
     same.sort_by_key(|p| p.complement_rva.abs_diff(p.cookie_rva));
     Some(same[0])
 }

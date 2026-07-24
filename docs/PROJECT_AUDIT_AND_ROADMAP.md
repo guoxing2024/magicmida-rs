@@ -1,9 +1,17 @@
 # MagicMida vNext — 项目审计与后续规划（Windows 复审）
 
-**审计日期:** 2026-07-24（无人值守计划 + host thin-split 续）  
+> **状态（2026-07-24 纠偏）：** 本文保留 **R0B–R4 结构史 / 仓库地图** 价值。  
+> **B-B / VNEXT-BEH / 距 1.0 / 下一步** 以以下文档为准（本文 §1.3 BEH 行已过时）：  
+> - [UNATTENDED_DECISIONS_20260724.md](UNATTENDED_DECISIONS_20260724.md)  
+> - [UNATTENDED_RESIDUAL_20260724.md](UNATTENDED_RESIDUAL_20260724.md)  
+> - [AUDIT_PACKAGE_20260724.md](AUDIT_PACKAGE_20260724.md)  
+> - [COURSE_CORRECTION_WORK_ORDER.md](COURSE_CORRECTION_WORK_ORDER.md) ← **B-B 之后执行序**  
+> 快照：B-B 四案 `compose=Accepted`（`load_no_crash_v0`）→ **VNEXT-BEH 已写**；**产品 1.0 未宣称**。
+
+**审计日期:** 2026-07-24（无人值守计划 + host thin-split 续；文首状态已纠偏）  
 **基线分支:** `baseline/legacy-recovery-20260722`  
-**HEAD:** 见 `git log -1`；计划 [UNATTENDED_EXECUTION_PLAN.md](UNATTENDED_EXECUTION_PLAN.md)  
-**工作区:** R1–R4 **窄**结构门已关（R3 10× + R4 VNEXT-R4）；B-A0..B-A3 合成路径完成；pure 仍 No；Accepted/VNEXT-BEH **未开**；host 已抽 post_loop/early_snapshots/post_attach；共享 ThemidaState 仍在  
+**HEAD:** 见 `git log -1`；纠偏序 [COURSE_CORRECTION_WORK_ORDER.md](COURSE_CORRECTION_WORK_ORDER.md)  
+**工作区:** R1–R4 **窄**结构门已关；B-A0..B-A3 合成完成；**B-B/VNEXT-BEH 已关（vault）**；产品 1.0 未关；Origin pure 默认；GTO 独立 host；M1–M4 capture plumbing 已落  
 
 **主机:** Windows 11；仓库 `D:\Claude project\magicmida-rs`；vault `D:\MidaVault`  
 **环境事实:** VS 2022 Professional MSVC 14.44；`tools/_rebuild_cli.cmd`；
@@ -53,12 +61,12 @@ P0 workspace 绿测已固化。样品在 vault，v2 verify 绿。
 R0B  独立 acceptance 静态内核          ✅ 已落地（提交 + 本机测试绿）
 R1   纯 PE 模型 + rebuild 管线         ✅ R1-A..E 合成 corpus 关闭（MSVC workspace 绿）
      R1-E 合成 structural corpus      ✅ closed；live smoke 仍开放
-     生产 dump 默认 pure              ⬜ 仍 legacy；`--pure-rebuild` opt-in
+     生产 dump 默认 pure              🟡 Origin-only 默认 pure（D3）；其它仍 legacy
 R2   统一 runtime/event + replay       ✅ Slice0–4 落地（handler 体仍在 cli）
 R3   Oreans 插件 + Origin/Lunlun/盲样  ✅ 结构门关闭 (10× + holdout); IAT holdout 100%
 R4   第二个独立保护族插件              ✅ 结构门关闭 (VNEXT-R4; GTO experimental + Oreans reg)
-BEH  独立行为验收                      🟡 B-A0..B-A3 合成 compose 完成；B-B/VNEXT-BEH 未开
-1.0  满足 release rule 后才谈          ⬜
+BEH  独立行为验收                      🟡 B-B 四案 Accepted（load survival）→ VNEXT-BEH 已写；≠ 产品 1.0
+1.0  完美脱壳                          ⬜ 被 R-LOAD-FLAKE / R-PURE-LOGIC 等阻塞 → 见纠偏工作序
 ```
 
 ---

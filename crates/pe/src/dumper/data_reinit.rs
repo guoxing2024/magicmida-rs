@@ -12,7 +12,16 @@ const MAX_USER_POINTER: u64 = 0x0000_7fff_ffff_ffff;
 /// Absolute CRT/heap pointers observed in dumped Themida images land in the
 /// low 4GB of the process (e.g. `0x8d3e40`, `0x8a0000`). SecurityCookie and
 /// other high-entropy constants sit well above that range and must stay.
+///
+/// Do **not** scrub the full canonical user range: late dumps still hold
+/// ASLR image VAs (`0x7ff7…`) for CRT function tables until
+/// `fix_hardcoded_addresses` rebases them; clearing those zeros
+/// `call [fn_table]` (Origin W1 live regression).
 const MAX_PROCESS_LOCAL_HEAP_POINTER: u64 = 0x0000_0000_ffff_ffff;
+/// Kernel-half addresses (`>= 0xffff_8000_0000_0000`) seen in Origin dumps
+/// (e.g. `.data+0xfc388 = 0xffffd466…` == `!DEFAULT_COOKIE` collision) are
+/// never valid as re-entry object heads and must be cleared even when unaligned.
+const KERNEL_CANONICAL_MIN: u64 = 0xffff_8000_0000_0000;
 const MAX_CONTAINER_SPAN: u64 = 0x1000_0000;
 const IMAGE_SCN_MEM_WRITE: u32 = 0x8000_0000;
 const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
@@ -112,7 +121,8 @@ fn clear_process_local_absolute_pointers(
     let image_end = image_base.saturating_add(image_size as u64);
     let mut cleared = 0usize;
 
-    // Restrict to classic MSVC `.data` only.
+    // Restrict to classic MSVC `.data` / blank-name RW data (pure rebuild may
+    // space-pad names). Exclude executable and RWX (`.wfix` / `.fill` code).
     //
     // Themida keeps decrypted code in zero-raw `.fill` gaps (W, non-X) until
     // materialize promotes them to `.wfix`. Scrubbing those pages treats
@@ -122,7 +132,7 @@ fn clear_process_local_absolute_pointers(
     for section in pe.sections.iter().filter(|s| {
         s.characteristics & IMAGE_SCN_MEM_WRITE != 0
             && s.characteristics & IMAGE_SCN_MEM_EXECUTE == 0
-            && (s.name == ".data" || s.name.starts_with(".data"))
+            && is_data_like_section_name(&s.name)
     }) {
         let start = section.virtual_address as usize;
         let end = start
@@ -136,7 +146,7 @@ fn clear_process_local_absolute_pointers(
         for offset in (aligned_start..end.saturating_sub(7)).step_by(8) {
             let value =
                 u64::from_le_bytes(dump_buf[offset..offset + 8].try_into().unwrap_or_default());
-            if is_process_local_absolute_pointer(value, image_base, image_end) {
+            if is_stale_absolute_pointer(value, image_base, image_end) {
                 dump_buf[offset..offset + 8].fill(0);
                 cleared += 1;
             }
@@ -146,16 +156,48 @@ fn clear_process_local_absolute_pointers(
     cleared
 }
 
-fn is_process_local_absolute_pointer(value: u64, image_base: u64, image_end: u64) -> bool {
+/// True when a QWORD in dumped `.data` is a process-local absolute pointer that
+/// must not survive into an independent PE image.
+///
+/// Two classes (Origin W1 / R-LOAD-FLAKE):
+/// 1. **Low 4GB heap-like** — aligned, `MIN_USER_POINTER..=MAX_PROCESS_LOCAL_HEAP_POINTER`,
+///    outside the image (classic CRT/heap tables).
+/// 2. **Kernel-canonical garbage** — `>= KERNEL_CANONICAL_MIN` and not `!0`
+///    (sentinel). Observed as object-head slots (e.g. RVA `0xfc388`) that AV at
+///    `xchg [r10]`. Alignment is **not** required: the Origin crash pointer
+///    ends in `…dcd`.
+fn is_stale_absolute_pointer(value: u64, image_base: u64, image_end: u64) -> bool {
+    if (image_base..image_end).contains(&value) {
+        return false;
+    }
+    if is_kernel_canonical_garbage(value) {
+        return true;
+    }
     if value < MIN_USER_POINTER || value > MAX_PROCESS_LOCAL_HEAP_POINTER {
         return false;
     }
     // Prefer 8-byte aligned heap-like pointers; unaligned values are more often
     // packed constants / cookie fragments than CRT table entries.
-    if value & 7 != 0 {
-        return false;
+    value & 7 == 0
+}
+
+fn is_kernel_canonical_garbage(value: u64) -> bool {
+    // Keep all-ones sentinel triples used next to some Origin globals.
+    value >= KERNEL_CANONICAL_MIN && value != u64::MAX
+}
+
+fn is_data_like_section_name(name: &str) -> bool {
+    if name == ".data" || name.starts_with(".data") {
+        return true;
     }
-    !(image_base..image_end).contains(&value)
+    // Pure-rebuild / some dumps pad names with spaces → empty after trim.
+    let t = name.trim();
+    t.is_empty() || t == ".data" || t.starts_with(".data")
+}
+
+#[cfg(test)]
+fn is_process_local_absolute_pointer(value: u64, image_base: u64, image_end: u64) -> bool {
+    is_stale_absolute_pointer(value, image_base, image_end)
 }
 
 fn find_security_cookie(data: &[u8]) -> Option<u64> {
@@ -286,5 +328,26 @@ mod tests {
             reset_stale_encoded_containers(&mut data, cookie, 0x140000000, 0x200000).is_empty()
         );
         assert_eq!(data, original);
+    }
+
+    #[test]
+    fn clears_origin_kernel_garbage_object_head() {
+        // Live Origin pure dump: RVA 0xfc388 held 0xffffd466d2205dcd → AV at
+        // o+0x39e5c (xchg [r10]). Must clear even when unaligned.
+        let image_base = 0x140000000u64;
+        let image_end = image_base + 0x19f000;
+        let bad = 0xffff_d466_d220_5dcd;
+        assert!(is_stale_absolute_pointer(bad, image_base, image_end));
+        assert!(is_kernel_canonical_garbage(bad));
+        // Sentinel next door stays.
+        assert!(!is_stale_absolute_pointer(u64::MAX, image_base, image_end));
+        // Image VA stays (observed neighbor at 0xfc388+0x28).
+        assert!(!is_stale_absolute_pointer(0x1401_0a690, image_base, image_end));
+        // Low user heap (aligned) still cleared.
+        assert!(is_stale_absolute_pointer(0x8d3e40, image_base, image_end));
+        // High ASLR image VA must NOT be cleared (CRT fn table before rebase).
+        assert!(!is_stale_absolute_pointer(0x0000_7ff7_2537_1200, image_base, image_end));
+        // Unaligned low-user constant left alone.
+        assert!(!is_stale_absolute_pointer(0x8d3e41, image_base, image_end));
     }
 }
