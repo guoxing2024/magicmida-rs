@@ -46,7 +46,7 @@
 | Min observation **60s** after attach | Matches r4c settle; `wrapper_call_patch` 0/0 |
 | Smoke CLI path | Always `D:\MidaVault\scratch\cargo-target\debug\mida-cli.exe` (not repo `target/release`) |
 
-**Still Fail `load_no_crash`:** latest `u_gto_host_scan60` is StructuralPass + IAT-green logs but probe AV. Section hashes still differ from r4c (`.boot` stub_size ~793k vs ~822k; packer `.,\\W` / `.|lT` live content). Pin remains `r4c_gto`.
+**Load status (revised):** `u_gto_host_scan60` is StructuralPass + IAT-green (98%, OEP `0x70b0`). Quiet single-shot / simple Rate() can be 6/6 Survive; serial `load_no_crash` (attempts=3) saw **Fail then Pass×2** — same class as Origin **R-LOAD-FLAKE**. Gate pins `scan60` first (retries), then `r4c_gto`.
 
 ## Engineering landed (this close)
 

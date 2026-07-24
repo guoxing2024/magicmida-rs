@@ -67,8 +67,9 @@ PREFERRED_LIVE_TAGS: dict[str, list[str]] = {
         "live_20260724-104711_u_origin_pure_r2",
     ],
     "gto_launcher": [
-        # Prefer load-surviving historical dumps; newest independent-host
-        # candidates still often AV (R-GTO-LATEST residual).
+        # Independent host after IAT/OEP harden (e212e0e); clean-machine Pass.
+        # Still flaky under heavy parallel probes (R-LOAD-FLAKE); keep r4c pin.
+        "live_20260724-124524_u_gto_host_scan60",
         "live_20260723-225951_r4c_gto",
         "live_20260724-004707_p1_gto_reg",
     ],
