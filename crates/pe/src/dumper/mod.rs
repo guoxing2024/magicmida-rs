@@ -43,6 +43,7 @@ mod pure_rebuild_adapter;
 mod remote_modules;
 mod sections;
 mod serialize;
+mod snapshot_manifest;
 #[cfg(test)]
 mod tests;
 mod tls_bootstrap;
@@ -60,6 +61,7 @@ pub use self::pure_rebuild_adapter::{
     PureRebuildEmitOptions, PureRebuildParitySnapshot,
 };
 pub use self::remote_modules::take_module_snapshot;
+pub use self::snapshot_manifest::manifest_path_for_output;
 pub use self::types::{
     ContainerRestoreMode, DumpOptions, DumpProfile, DumpProfileCapabilities, EarlySectionSnapshot,
     ExperimentalStagePlan, OepPolicy, RemoteModule,

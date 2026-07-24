@@ -82,7 +82,21 @@ Code path: [`heap_global_snapshot.rs`](../crates/pe/src/dumper/heap_global_snaps
 
 **Does this alone explain R-LOAD-FLAKE?** Unproven. Both dumps hit 320 slots and pass R0B; quiet load can Pass on the smaller stub. Flake remains quality residual; `.boot` delta is honesty about non-reproducible heap snapshot bytes, not a proven missing-stage bug.
 
-Research tool: `tools/_diff_boot_heap.py` (parses `.boot` meta/payloads).
+Research tools:
+- `tools/_diff_boot_heap.py` — parse `.boot` meta/payloads (legacy)
+- `tools/_diff_dump_snapshot.py` — diff `*.dump_snapshot.json` sidecars
+
+### M1 capture observability (generic landing, 2026-07-24)
+
+| Piece | Status |
+|-------|--------|
+| `mida.dump-snapshot-manifest/v0` sidecar | Written by `dump_process` as `{stem}.dump_snapshot.json` (best-effort; never fails dump) |
+| Module | `crates/pe/src/dumper/snapshot_manifest.rs` |
+| Load pass-rate quality | `tools/_behavior_probe.py --rate-samples N` → `evidence.load_quality` (not R0B Accepted) |
+| Gate optional rate | `tools/_behavior_bb_gate.py --rate-samples N` records `load_quality` on Pass paths |
+| Explicit non-claim | Manifest + pass-rate do **not** upgrade product 1.0 or VNEXT-BEH semantics |
+
+Hot-root / probe policy remains in `heap_global_snapshot.rs` (M2: externalize).
 
 ### B-B reconfirm (scan60 pin era)
 

@@ -184,37 +184,51 @@ def compose(candidate: Path, evidence: Path, report: Path) -> dict:
     return {"exit": r.returncode, "verdict": verdict, "stdout": (r.stdout or "")[-500:]}
 
 
-def probe_load(candidate: Path, out: Path, max_wall_ms: int, attempts: int = 8) -> dict:
+def probe_load(
+    candidate: Path,
+    out: Path,
+    max_wall_ms: int,
+    attempts: int = 8,
+    *,
+    rate_samples: int = 0,
+) -> dict:
+    cmd = [
+        sys.executable,
+        str(PROBE),
+        "--candidate",
+        str(candidate),
+        "--probe-kind",
+        "load_no_crash",
+        "--max-wall-ms",
+        str(max_wall_ms),
+        "--attempts",
+        str(attempts),
+        "--no-require-marker",
+        "--out",
+        str(out),
+    ]
+    if rate_samples > 0:
+        cmd.extend(["--rate-samples", str(rate_samples)])
     r = run(
-        [
-            sys.executable,
-            str(PROBE),
-            "--candidate",
-            str(candidate),
-            "--probe-kind",
-            "load_no_crash",
-            "--max-wall-ms",
-            str(max_wall_ms),
-            "--attempts",
-            str(attempts),
-            "--no-require-marker",
-            "--out",
-            str(out),
-        ],
+        cmd,
         capture_output=True,
         text=True,
         encoding="utf-8",
         errors="replace",
     )
     verdict = None
+    load_quality = None
     if out.is_file():
         try:
-            verdict = json.loads(out.read_text(encoding="utf-8")).get("verdict")
+            body = json.loads(out.read_text(encoding="utf-8"))
+            verdict = body.get("verdict")
+            load_quality = body.get("load_quality")
         except json.JSONDecodeError:
             pass
     return {
         "exit": r.returncode,
         "verdict": verdict,
+        "load_quality": load_quality,
         "stdout": (r.stdout or "")[-400:],
         "stderr": (r.stderr or "")[-400:],
     }
@@ -251,7 +265,15 @@ def write_validation_summary(batch_dir: Path, results: list[dict], all_ok: bool)
             f"Batch: {batch_dir}",
         ]
         + [
-            f"{r['case_id']}: r0b={r.get('r0b_verdict')} probe={r.get('probe_verdict')} compose={r.get('compose_verdict')} ok={r.get('ok')}"
+            (
+                f"{r['case_id']}: r0b={r.get('r0b_verdict')} probe={r.get('probe_verdict')} "
+                f"compose={r.get('compose_verdict')} ok={r.get('ok')}"
+                + (
+                    f" pass_rate={r['load_quality'].get('pass')}/{r['load_quality'].get('samples')}"
+                    if r.get("load_quality")
+                    else ""
+                )
+            )
             for r in results
         ],
         "artifacts": [
@@ -306,6 +328,15 @@ def main() -> int:
         type=float,
         default=3.0,
         help="Sleep between cases to reduce mutex/AV pressure (default 3s)",
+    )
+    ap.add_argument(
+        "--rate-samples",
+        type=int,
+        default=0,
+        help=(
+            "If >0, measure fixed-sample load pass-rate (quality metric) instead of "
+            "early-exit attempts. Does not change Accepted composition rules."
+        ),
     )
     ap.add_argument(
         "--refresh-candidates",
@@ -395,8 +426,16 @@ def main() -> int:
                 continue
 
             ev_path = case_dir / f"evidence_{len(tried)}.json"
-            pr = probe_load(cand, ev_path, args.max_wall_ms, attempts=args.attempts)
+            pr = probe_load(
+                cand,
+                ev_path,
+                args.max_wall_ms,
+                attempts=args.attempts,
+                rate_samples=max(0, int(args.rate_samples)),
+            )
             trial["probe_verdict"] = pr["verdict"]
+            if pr.get("load_quality"):
+                trial["load_quality"] = pr["load_quality"]
             if pr["verdict"] != "Pass":
                 trial["skip"] = "probe"
                 tried.append(trial)
@@ -417,6 +456,8 @@ def main() -> int:
             rec["r0b_exit"] = r0b["exit"]
             rec["probe_verdict"] = pr["verdict"]
             rec["probe_exit"] = pr["exit"]
+            if pr.get("load_quality"):
+                rec["load_quality"] = pr["load_quality"]
             rec["compose_verdict"] = co["verdict"]
             rec["compose_exit"] = co["exit"]
             rec["ok"] = True

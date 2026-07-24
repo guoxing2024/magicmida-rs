@@ -1198,6 +1198,16 @@ pub fn dump_process(
         "Dump written successfully"
     );
 
+    // Observable capture contract (best-effort sidecar). Never fails the dump.
+    super::snapshot_manifest::write_dump_snapshot_manifest(
+        &opts.output_path,
+        opts.profile,
+        opts.image_base,
+        output_entry_point,
+        &containers,
+        &heap_globals,
+    );
+
     Ok(())
 }
 

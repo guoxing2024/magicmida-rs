@@ -34,7 +34,7 @@ REPO = Path(__file__).resolve().parents[1]
 FIXTURE_MANIFEST = REPO / "lab" / "behavior" / "synthetic" / "marker_exit" / "Cargo.toml"
 SCHEMA_VERSION = "mida.behavior-evidence/v0"
 PRODUCER_NAME = "tools/_behavior_probe.py"
-PRODUCER_VERSION = "0.1.0-ba1"
+PRODUCER_VERSION = "0.1.1-m1"
 MARKER_NEEDLE = "MIDA_BEH_MARKER=1"
 PROBE_ID_MARKER = "exit_code_marker_v0"
 PROBE_ID_LOAD = "load_no_crash_v0"
@@ -57,6 +57,7 @@ RESIDUAL_RISKS_LOAD = [
     "load_no_crash_runs_isolated_copy_per_attempt",
     "load_no_crash_uses_plain_createflags_by_default",
     "origin_like_gui_may_av_intermittently_on_bad_heap_paths",
+    "load_pass_rate_is_quality_metric_not_r0b_accepted",
 ]
 
 
@@ -304,6 +305,20 @@ def _run_one_process(
     return status, exit_code, error_class, survived_timeout, stdout_tail, stderr_tail
 
 
+def _attempt_is_load_pass(
+    status: str, exit_code: int | None, survived_timeout: bool
+) -> bool:
+    """Single-launch survival for quality accounting (matches Pass composition)."""
+    if status == "error":
+        return False
+    if _is_nt_exception_exit(exit_code):
+        return False
+    if survived_timeout or status == "timeout":
+        return True
+    # exit 0 or non-NT nonzero: loaded without AV
+    return status in ("pass", "timeout") or exit_code is not None
+
+
 def run_probe(
     candidate: Path,
     *,
@@ -315,6 +330,7 @@ def run_probe(
     work_dir: Path | None,
     probe_kind: str = "marker",
     attempts: int = 1,
+    rate_samples: int = 0,
 ) -> dict[str, Any]:
     candidate = candidate.resolve()
     if not candidate.is_file():
@@ -335,8 +351,10 @@ def run_probe(
     # marker synthetic fixtures stay in scratch so marker file stays isolated.
     if probe_kind == "load_no_crash":
         attempts = max(1, attempts)
+        rate_samples = max(0, int(rate_samples))
     else:
         attempts = 1
+        rate_samples = 0
 
     t0 = time.perf_counter()
     status = "error"
@@ -347,8 +365,14 @@ def run_probe(
     stderr_tail = ""
     survived_timeout = False
     attempt_notes: list[str] = []
+    # Gate path: early-exit on first Pass (attempts). Quality path: fixed samples.
+    measure_rate = rate_samples > 0
+    loop_n = rate_samples if measure_rate else attempts
+    pass_count = 0
+    fail_count = 0
+    error_count = 0
 
-    for attempt in range(1, attempts + 1):
+    for attempt in range(1, loop_n + 1):
         if probe_kind == "load_no_crash":
             attempt_dir = scratch / f"run_{attempt}"
             attempt_dir.mkdir(parents=True, exist_ok=True)
@@ -360,6 +384,10 @@ def run_probe(
                 status = "error"
                 error_class = f"copy_error:{e.__class__.__name__}"
                 attempt_notes.append(f"a{attempt}:copy_fail:{e}")
+                error_count += 1
+                if measure_rate:
+                    time.sleep(0.4)
+                    continue
                 if attempt < attempts:
                     time.sleep(0.6 * attempt + 0.4)
                     continue
@@ -384,10 +412,24 @@ def run_probe(
         # Early stop when this attempt is already a load survival candidate.
         if probe_kind == "load_no_crash":
             nt_fail = _is_nt_exception_exit(exit_code)
+            ok = _attempt_is_load_pass(status, exit_code, survived_timeout)
+            if ok:
+                pass_count += 1
+            elif status == "error":
+                error_count += 1
+            else:
+                fail_count += 1
             attempt_notes.append(
-                f"a{attempt}:status={status}:exit={exit_code}:survived={survived_timeout}"
+                f"a{attempt}:status={status}:exit={exit_code}:survived={survived_timeout}:ok={ok}"
             )
-            # Accept first non-error non-NT attempt (timeout survival or any exit).
+            if measure_rate:
+                # Fixed sample budget for pass-rate; always backoff between launches.
+                _kill_stale_by_stem(Path(launch_path).stem)
+                _kill_stale_by_stem(candidate.stem)
+                if attempt < loop_n:
+                    time.sleep(0.5)
+                continue
+            # Gate path: accept first non-error non-NT attempt.
             if status != "error" and not nt_fail:
                 break
             # Clean stragglers before retry (mutex / zombie GUI).
@@ -401,6 +443,7 @@ def run_probe(
         break
 
     elapsed_ms = int((time.perf_counter() - t0) * 1000)
+    samples_run = pass_count + fail_count + error_count if probe_kind == "load_no_crash" else 0
 
     if marker_path.is_file():
         try:
@@ -413,27 +456,42 @@ def run_probe(
     if probe_kind == "load_no_crash":
         probe_id = PROBE_ID_LOAD
         residuals = list(RESIDUAL_RISKS_LOAD)
-        # Survive window without NT exception => Pass.
-        # Non-zero non-NT exits (missing args / single-instance / GUI early return)
-        # still prove the image loaded and ran user code without AV — Pass with residual.
-        if status == "error":
-            result_status = "error"
-            verdict = "Inconclusive"
-        elif _is_nt_exception_exit(exit_code):
-            result_status = "fail"
-            error_class = error_class or f"nt_exception_exit:{exit_code & 0xFFFFFFFF:#x}"
-            verdict = "Fail"
-        elif survived_timeout or status == "timeout":
-            result_status = "pass"
-            error_class = "survived_wall_clock_then_killed"
-            verdict = "Pass"
-        elif exit_code == 0:
-            result_status = "pass"
-            verdict = "Pass"
+        if measure_rate:
+            # Quality metric path: verdict from pass_count (not first-success gate).
+            if samples_run == 0:
+                result_status = "error"
+                verdict = "Inconclusive"
+            elif pass_count == 0:
+                result_status = "fail"
+                error_class = error_class or "load_pass_rate_zero"
+                verdict = "Fail"
+            else:
+                # Any survival in the sample set → Pass for gate compose; rate is separate.
+                result_status = "pass"
+                error_class = f"pass_rate:{pass_count}/{samples_run}"
+                verdict = "Pass"
         else:
-            result_status = "pass"
-            error_class = error_class or f"nonzero_non_nt_exit:{exit_code & 0xFFFFFFFF:#x}"
-            verdict = "Pass"
+            # Survive window without NT exception => Pass.
+            # Non-zero non-NT exits (missing args / single-instance / GUI early return)
+            # still prove the image loaded and ran user code without AV — Pass with residual.
+            if status == "error":
+                result_status = "error"
+                verdict = "Inconclusive"
+            elif _is_nt_exception_exit(exit_code):
+                result_status = "fail"
+                error_class = error_class or f"nt_exception_exit:{exit_code & 0xFFFFFFFF:#x}"
+                verdict = "Fail"
+            elif survived_timeout or status == "timeout":
+                result_status = "pass"
+                error_class = "survived_wall_clock_then_killed"
+                verdict = "Pass"
+            elif exit_code == 0:
+                result_status = "pass"
+                verdict = "Pass"
+            else:
+                result_status = "pass"
+                error_class = error_class or f"nonzero_non_nt_exit:{exit_code & 0xFFFFFFFF:#x}"
+                verdict = "Pass"
     else:
         probe_id = PROBE_ID_MARKER
         residuals = list(RESIDUAL_RISKS_MARKER)
@@ -485,6 +543,16 @@ def run_probe(
             "version": PRODUCER_VERSION,
         },
     }
+    if probe_kind == "load_no_crash" and samples_run > 0:
+        # Quality metric (does not change R0B Accepted rules).
+        evidence["load_quality"] = {
+            "samples": samples_run,
+            "pass": pass_count,
+            "fail": fail_count,
+            "error": error_count,
+            "pass_rate": round(pass_count / samples_run, 4) if samples_run else 0.0,
+            "mode": "fixed_samples" if measure_rate else "gate_early_exit",
+        }
     # Non-compared debug (not part of schema; strip before schema validate)
     meta = {
         "elapsed_ms": elapsed_ms,
@@ -496,7 +564,11 @@ def run_probe(
         "expect_exit": expect_exit,
         "require_marker": require_marker,
         "attempts": attempts,
+        "rate_samples": rate_samples,
         "attempt_notes": attempt_notes,
+        "pass_count": pass_count,
+        "fail_count": fail_count,
+        "error_count": error_count,
     }
     return {"evidence": evidence, "meta": meta}
 
@@ -580,6 +652,15 @@ def main() -> int:
         default=12,
         help="load_no_crash only: retry launches on NT exception (default 12)",
     )
+    ap.add_argument(
+        "--rate-samples",
+        type=int,
+        default=0,
+        help=(
+            "load_no_crash only: run N fixed serial samples for pass-rate quality "
+            "(no early exit). When >0, overrides gate early-exit attempts path."
+        ),
+    )
     args = ap.parse_args()
 
     if args.build_fixture:
@@ -620,6 +701,7 @@ def main() -> int:
         work_dir=args.work_dir,
         probe_kind=args.probe_kind,
         attempts=args.attempts if args.probe_kind == "load_no_crash" else 1,
+        rate_samples=args.rate_samples if args.probe_kind == "load_no_crash" else 0,
     )
     evidence = packed["evidence"]
     shape_errs = validate_evidence_shape(evidence)
@@ -640,10 +722,25 @@ def main() -> int:
     text = json.dumps(evidence, indent=2, ensure_ascii=False) + "\n"
     out.write_text(text, encoding="utf-8")
 
+    # Optional companion for rate runs (full meta including attempt_notes).
+    if packed["meta"].get("rate_samples"):
+        meta_path = out.with_suffix(".meta.json")
+        meta_path.write_text(
+            json.dumps(packed["meta"], indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+
+    lq = evidence.get("load_quality") or {}
+    rate_s = ""
+    if lq:
+        rate_s = (
+            f" pass_rate={lq.get('pass')}/{lq.get('samples')}"
+            f"({lq.get('pass_rate')})"
+        )
     print(
         f"verdict={evidence['verdict']} status={evidence['probe']['result']['status']} "
         f"exit={evidence['probe']['result']['exit_code']} "
-        f"markers={evidence['probe']['result']['markers_found']} out={out}",
+        f"markers={evidence['probe']['result']['markers_found']}{rate_s} out={out}",
         flush=True,
     )
 
