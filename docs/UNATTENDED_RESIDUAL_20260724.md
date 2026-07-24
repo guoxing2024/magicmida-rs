@@ -411,7 +411,38 @@ Fail-closed negatives: `origin_title_neg`, `lunlun_exit_neg`, `holdout_exit_neg`
 
 [`_behavior_bb_gate.py`](../tools/_behavior_bb_gate.py): `origin_macro` preferred tag now leads with `live_20260724-151549_w1_scrub_v2`.
 
-## Residual after VNEXT-BEH (+ W1–W4 + P1)
+## P2 sprint — control-text + pe_string + R-GTO-UI evidence — **not 1.0**
+
+**Date:** 2026-07-24  
+**Harness:** [`tools/_behavior_probe.py`](../tools/_behavior_probe.py) v`0.4.0-p2`  
+- `window_class` gains `--require-control-text` (child GetWindowText substrings)  
+- new `pe_string_v0` (`--probe-kind pe_string --require-string …`) static ASCII/UTF-16LE scan  
+
+### Exploration findings
+
+| Surface | Result |
+|---------|--------|
+| Origin unpacked | License dialog children: Static「授权码：」、Button「确定」、welcome Edit — **no** registry/file side-effect under short probe |
+| lunlun / holdout | Still exit-only (no window); exit_exact remains best runtime oracle |
+| GTO **protected** | `NewClassName` + title「猪猪WLK 一键宏 - 登录/注册」+ login controls (账号/密码/登录) — **reference** behavior of packer input |
+| GTO **unpacked** | Process exits 0 quickly; **no** top-level product window; static PE **does** contain UTF-16 `NewClassName` + `AutoHotkey` — script UI not reached at runtime |
+
+### Evidence (`D:\MidaVault\lab\evidence\_beh_gate\p2_logic_20260724\`)
+
+| Artifact | Verdict | Notes |
+|----------|---------|-------|
+| `origin_controls.json` | **Pass** | class + title + control「授权码」「确定」 → compose **Accepted** |
+| `origin_controls_neg.json` | **Fail** | bogus control text |
+| `gto_pe_string.json` | **Pass** | `AutoHotkey` + `NewClassName` → compose **Accepted** |
+| `gto_pe_string_neg.json` | **Fail** | missing string fail-closed |
+| `gto_protected_window.json` | **Pass** | protected reference only (not product dump claim) |
+| `gto_unpacked_window_fail.json` | **Fail** | documents **R-GTO-UI** on winning clearregs dump |
+
+**What this is not:** license accept, account login, AHK script execution, FileAppend side effects, business macros.
+
+**R-GTO-UI status:** now **evidence-backed open** (protected Pass vs unpacked Fail on same window oracle). Fix path is dump/runtime completeness (heap/script resume), not probe plumbing.
+
+## Residual after VNEXT-BEH (+ W1–W4 + P1 + P2)
 
 | ID | Item | Blocks 1.0? | Status |
 |----|------|-------------|--------|
@@ -419,22 +450,26 @@ Fail-closed negatives: `origin_title_neg`, `lunlun_exit_neg`, `holdout_exit_neg`
 | R-LOAD-FLAKE (GTO quiet / fresh host) | attempt=1 load survival on independent-host dumps | Quality | **W2 metric exit**; W4/P1 reconfirm green |
 | R-GTO-LATEST | Fresh dump load without `r4c_gto` walk | Quality | **W2 metric exit** |
 | R-GTO-BOOT | `.boot` heap_global payload size variance under 320-slot cap | Quality | Open (honesty; not load AV root) |
-| R-PURE-LOGIC | Product-logic / business path equivalence | **Yes** for product 1.0 | **Advanced:** 4-case deeper oracles (title + exit exact + exports); **still blocks 1.0** |
-| R-GTO-UI | Unpacked GTO no product window yet (protected does) | Quality | Open research |
-| R-4CASE-FRESH | Full 4-case post-W1/W2 attempt=1 on best pins | Claim hygiene | **P1-A closed** (N=10 × 4 = 1.0) |
+| R-PURE-LOGIC | Product-logic / business path equivalence | **Yes** for product 1.0 | **Advanced:** controls + pe_string + exit/title/exports; **still blocks 1.0** |
+| R-GTO-UI | Unpacked GTO no product window; protected does | Quality / **1.0-relevant for GTO** | **Open + evidenced** (p2 protected Pass / unpacked Fail) |
+| R-4CASE-FRESH | Full 4-case attempt=1 on best pins | Claim hygiene | **P1-A closed** (N=10 × 4 = 1.0) |
 | R-X86 | ScyllaHide x86 residual | x86 only | Open |
-| **product 1.0 claim** | Operator + Q7 | Governance | **Still NO** (W4 binding; P1 does not flip) |
+| **product 1.0 claim** | Operator + Q7 | Governance | **Still NO** |
 
 ## Re-run
 
 ```powershell
-# P1 4-case load rate (vault candidates):
+# P1 4-case load rate:
 # D:\MidaVault\lab\evidence\_beh_gate\p1_4case_fresh_20260724-161856\
 
 # P1 deeper oracles:
 # D:\MidaVault\lab\evidence\_beh_gate\p1_logic_20260724\
 
+# P2 controls / pe_string / R-GTO-UI:
+# D:\MidaVault\lab\evidence\_beh_gate\p2_logic_20260724\
+
 python tools/_behavior_bb_gate.py --cases origin_macro,lunlun_software,xiongxiong_duokai,gto_launcher --write-summary --tag bb_gate_pin --max-wall-ms 8000 --attempts 12 --max-candidates 3
 ```
+
 
 

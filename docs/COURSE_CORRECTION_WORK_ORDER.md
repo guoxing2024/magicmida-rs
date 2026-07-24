@@ -260,7 +260,19 @@ W0 文档对齐（半日级）                    ✅ 2026-07-24
 
 **下一刀（若继续冲 1.0）：** 业务侧效应（文件/脚本/授权路径）或 GTO 运行时 GUI；然后操作员授权 + Q7 重跑才可讨论 1.0 句子。
 
+#### P2 冲刺（2026-07-24）— 仍 **非** 1.0
+
+| 步 | 结果 |
+|----|------|
+| Origin 控件文本 | class+title+「授权码」/「确定」Pass + compose Accepted；假控件 Fail |
+| GTO 静态字符串 | `pe_string_v0` AutoHotkey+NewClassName Pass + compose Accepted |
+| R-GTO-UI 对照 | **protected** NewClassName 登录窗 Pass；**unpacked** 同 oracle Fail（exit 0 无窗） |
+| 产品 1.0 | **仍 NO** |
+
+**诚实边界：** Origin 无稳定 registry/file 侧效应可门禁；GTO 运行时 GUI 仍 open（R-GTO-UI）。下一工程刀若冲 GTO 产品行为：查脚本/heap 恢复使 unpacked 到达 `NewClassName`，而非再加静态探针。
+
 ---
+
 
 
 

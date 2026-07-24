@@ -34,13 +34,14 @@ REPO = Path(__file__).resolve().parents[1]
 FIXTURE_MANIFEST = REPO / "lab" / "behavior" / "synthetic" / "marker_exit" / "Cargo.toml"
 SCHEMA_VERSION = "mida.behavior-evidence/v0"
 PRODUCER_NAME = "tools/_behavior_probe.py"
-PRODUCER_VERSION = "0.3.0-p1"
+PRODUCER_VERSION = "0.4.0-p2"
 MARKER_NEEDLE = "MIDA_BEH_MARKER=1"
 PROBE_ID_MARKER = "exit_code_marker_v0"
 PROBE_ID_LOAD = "load_no_crash_v0"
 PROBE_ID_WINDOW = "gui_window_class_v0"
 PROBE_ID_EXPORTS = "pe_export_names_v0"
 PROBE_ID_EXIT_EXACT = "exit_code_exact_v0"
+PROBE_ID_PE_STRING = "pe_string_v0"
 
 # Job-object network isolation is deferred; residual risk is always listed.
 RESIDUAL_RISKS_MARKER = [
@@ -84,6 +85,18 @@ RESIDUAL_RISKS_EXIT_EXACT = [
     "timeout_without_exit_is_Fail_for_exit_code_exact",
     "exit_code_exact_runs_isolated_copy_per_attempt",
     "exit_code_exact_uses_plain_createflags_by_default",
+]
+RESIDUAL_RISKS_PE_STRING = [
+    "pe_string_is_static_surface_not_runtime_behavior",
+    "pe_string_does_not_prove_script_engine_or_ui_runs",
+    "utf16_and_ascii_searches_only_no_decompress",
+    "missing_strings_fail_closed",
+]
+# Extend window residual when control texts are required.
+RESIDUAL_RISKS_WINDOW_CONTROLS = [
+    "control_text_is_not_license_validity_or_login_success",
+    "control_text_match_is_substring_on_child_window_text",
+    "hidden_children_are_included_in_control_text_scan",
 ]
 
 
@@ -461,29 +474,113 @@ def _enum_windows_for_pid(pid: int) -> list[tuple[str, str, bool]]:
     return found
 
 
+def _enum_child_texts(hwnd: int) -> list[str]:
+    """Collect GetWindowTextW from all child windows of hwnd (incl. hidden)."""
+    if os.name != "nt":
+        return []
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    GetWindowTextW = user32.GetWindowTextW
+    GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    EnumChildWindows = user32.EnumChildWindows
+    texts: list[str] = []
+
+    @WNDENUMPROC
+    def _cb(ch: int, _lparam: int) -> bool:
+        tt = ctypes.create_unicode_buffer(512)
+        GetWindowTextW(ch, tt, 512)
+        if tt.value:
+            texts.append(tt.value)
+        return True
+
+    EnumChildWindows(hwnd, _cb, 0)
+    return texts
+
+
+def _enum_top_hwnds_for_pid(pid: int) -> list[tuple[int, str, str]]:
+    """Return (hwnd, class_name, title) for top-level windows owned by pid."""
+    if os.name != "nt":
+        return []
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    GetClassNameW = user32.GetClassNameW
+    GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    GetWindowTextW = user32.GetWindowTextW
+    GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    GetWindowThreadProcessId = user32.GetWindowThreadProcessId
+    GetWindowThreadProcessId.argtypes = [
+        wintypes.HWND,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    EnumWindows = user32.EnumWindows
+    found: list[tuple[int, str, str]] = []
+
+    @WNDENUMPROC
+    def _cb(hwnd: int, _lparam: int) -> bool:
+        p = wintypes.DWORD()
+        GetWindowThreadProcessId(hwnd, ctypes.byref(p))
+        if int(p.value) != int(pid):
+            return True
+        cn = ctypes.create_unicode_buffer(256)
+        GetClassNameW(hwnd, cn, 256)
+        tt = ctypes.create_unicode_buffer(512)
+        GetWindowTextW(hwnd, tt, 512)
+        found.append((hwnd, cn.value, tt.value))
+        return True
+
+    EnumWindows(_cb, 0)
+    return found
+
+
+def pe_contains_string(path: Path, needle: str) -> tuple[bool, str]:
+    """Static scan: ASCII/UTF-8 and UTF-16LE encodings of needle."""
+    if not needle:
+        return False, "empty_needle"
+    data = path.read_bytes()
+    a = needle.encode("utf-8", errors="ignore")
+    if a and a in data:
+        return True, "ascii_or_utf8"
+    try:
+        u = needle.encode("utf-16-le")
+    except UnicodeEncodeError:
+        u = b""
+    if u and u in data:
+        return True, "utf16-le"
+    return False, "not_found"
+
+
 def _run_window_class_probe(
     launch_path: Path,
     *,
     max_wall_ms: int,
     expect_classes: list[str],
     require_title_substr: str | None,
+    require_control_texts: list[str] | None,
     env: dict[str, str],
     run_cwd: str,
-) -> tuple[str, int | None, str | None, list[str], list[str]]:
-    """Launch PE; Pass when an expected window class appears (no NT AV).
+) -> tuple[str, int | None, str | None, list[str], list[str], list[str]]:
+    """Launch PE; Pass when expected window class (+ optional title/controls).
 
-    Returns status, exit_code, error_class, markers_found, classes_seen.
+    Returns status, exit_code, error_class, markers, classes_seen, controls_seen.
     """
     expect_set = {c for c in expect_classes if c}
     if not expect_set:
-        return "error", None, "no_expect_window_class", [], []
+        return "error", None, "no_expect_window_class", [], [], []
 
+    need_controls = [t for t in (require_control_texts or []) if t]
     creationflags = _load_createflags() if os.name == "nt" else 0
     status = "error"
     exit_code: int | None = None
     error_class: str | None = None
     markers: list[str] = []
     classes_seen: list[str] = []
+    controls_seen: list[str] = []
     proc: subprocess.Popen[Any] | None = None
     try:
         proc = subprocess.Popen(
@@ -497,16 +594,30 @@ def _run_window_class_probe(
         deadline = time.perf_counter() + max(0.2, max_wall_ms / 1000.0)
         matched_class: str | None = None
         matched_title: str | None = None
+        missing_controls: list[str] = []
         while time.perf_counter() < deadline:
-            for cn, title, _vis in _enum_windows_for_pid(proc.pid):
+            for hwnd, cn, title in _enum_top_hwnds_for_pid(proc.pid):
                 if cn and cn not in classes_seen:
                     classes_seen.append(cn)
-                if cn in expect_set:
-                    if require_title_substr and require_title_substr not in title:
+                if cn not in expect_set:
+                    continue
+                if require_title_substr and require_title_substr not in title:
+                    continue
+                if need_controls:
+                    child_texts = _enum_child_texts(hwnd)
+                    for t in child_texts:
+                        if t and t not in controls_seen:
+                            controls_seen.append(t[:120])
+                    missing_controls = [
+                        want
+                        for want in need_controls
+                        if not any(want in t for t in child_texts)
+                    ]
+                    if missing_controls:
                         continue
-                    matched_class = cn
-                    matched_title = title
-                    break
+                matched_class = cn
+                matched_title = title
+                break
             if matched_class is not None:
                 break
             if proc.poll() is not None:
@@ -518,11 +629,22 @@ def _run_window_class_probe(
             markers.append(f"window_class:{matched_class}")
             if matched_title:
                 markers.append(f"window_title_seen:{matched_title[:80]}")
+            for want in need_controls:
+                markers.append(f"control_text:{want[:60]}")
             status = "pass"
-            error_class = "window_class_matched"
+            error_class = (
+                "window_class_and_controls_matched"
+                if need_controls
+                else "window_class_matched"
+            )
         elif exit_code is not None and _is_nt_exception_exit(exit_code):
             status = "fail"
             error_class = f"nt_exception_exit:{exit_code & 0xFFFFFFFF:#x}"
+        elif need_controls and any(c in expect_set for c in classes_seen):
+            status = "fail"
+            error_class = "missing_control_text:" + ",".join(
+                missing_controls or need_controls
+            )
         elif exit_code is not None:
             status = "fail"
             error_class = "process_exited_without_expected_window"
@@ -535,7 +657,7 @@ def _run_window_class_probe(
     finally:
         if proc is not None:
             _terminate_proc(proc)
-    return status, exit_code, error_class, markers, classes_seen
+    return status, exit_code, error_class, markers, classes_seen, controls_seen
 
 
 def run_probe(
@@ -552,7 +674,9 @@ def run_probe(
     rate_samples: int = 0,
     expect_window_classes: list[str] | None = None,
     require_title_substr: str | None = None,
+    require_control_texts: list[str] | None = None,
     require_exports: list[str] | None = None,
+    require_strings: list[str] | None = None,
 ) -> dict[str, Any]:
     candidate = candidate.resolve()
     if not candidate.is_file():
@@ -680,6 +804,92 @@ def run_probe(
         }
         return {"evidence": evidence, "meta": meta}
 
+    # --- static pe_string probe (no process launch) ---
+    if probe_kind == "pe_string":
+        req = [x for x in (require_strings or []) if x]
+        if not req:
+            status = "error"
+            error_class = "no_require_strings"
+            result_status = "error"
+            verdict = "Inconclusive"
+            probe_id = PROBE_ID_PE_STRING
+            residuals = list(RESIDUAL_RISKS_PE_STRING)
+            matched: list[str] = []
+            missing: list[str] = req
+            how_map: dict[str, str] = {}
+        else:
+            matched = []
+            missing = []
+            how_map = {}
+            for want in req:
+                hit, how = pe_contains_string(candidate, want)
+                if hit:
+                    matched.append(want)
+                    how_map[want] = how
+                else:
+                    missing.append(want)
+            markers_found = [f"pe_string:{m}" for m in matched]
+            if missing:
+                status = "fail"
+                result_status = "fail"
+                error_class = "missing_strings:" + ",".join(missing)
+                verdict = "Fail"
+            else:
+                status = "pass"
+                result_status = "pass"
+                error_class = f"strings_matched:{len(matched)}"
+                verdict = "Pass"
+            probe_id = PROBE_ID_PE_STRING
+            residuals = list(RESIDUAL_RISKS_PE_STRING)
+        elapsed_ms = int((time.perf_counter() - t0) * 1000)
+        evidence = {
+            "schema_version": SCHEMA_VERSION,
+            "candidate": {
+                "sha256": digest,
+                "size_bytes": size,
+                "role": "candidate",
+            },
+            "reference": {
+                "kind": "none",
+                "sha256": None,
+                "notes": f"probe_kind=pe_string require={req}",
+            },
+            "probe": {
+                "id": probe_id,
+                "policy": {
+                    "network": "deny",
+                    "max_wall_ms": max_wall_ms,
+                    "max_output_bytes": max_output_bytes,
+                },
+                "result": {
+                    "status": result_status,
+                    "exit_code": None,
+                    "markers_found": markers_found,
+                    "error_class": error_class,
+                },
+            },
+            "verdict": verdict,
+            "residual_risks": residuals,
+            "producer": {
+                "name": PRODUCER_NAME,
+                "version": PRODUCER_VERSION,
+            },
+            "string_quality": {
+                "require": req,
+                "matched": matched,
+                "missing": missing,
+                "how": how_map,
+            },
+        }
+        meta = {
+            "elapsed_ms": elapsed_ms,
+            "scratch": str(scratch),
+            "candidate_path": str(candidate),
+            "probe_kind": probe_kind,
+        }
+        return {"evidence": evidence, "meta": meta}
+
+    controls_seen: list[str] = []
     for attempt in range(1, loop_n + 1):
         if process_probe:
             attempt_dir = scratch / f"run_{attempt}"
@@ -707,15 +917,21 @@ def run_probe(
             run_cwd = str(scratch)
 
         if probe_kind == "window_class":
-            status, exit_code, error_class, win_markers, classes_seen = (
-                _run_window_class_probe(
-                    launch_path,
-                    max_wall_ms=max_wall_ms,
-                    expect_classes=list(expect_window_classes or []),
-                    require_title_substr=require_title_substr,
-                    env=env,
-                    run_cwd=run_cwd,
-                )
+            (
+                status,
+                exit_code,
+                error_class,
+                win_markers,
+                classes_seen,
+                controls_seen,
+            ) = _run_window_class_probe(
+                launch_path,
+                max_wall_ms=max_wall_ms,
+                expect_classes=list(expect_window_classes or []),
+                require_title_substr=require_title_substr,
+                require_control_texts=list(require_control_texts or []),
+                env=env,
+                run_cwd=run_cwd,
             )
             markers_found = list(win_markers)
             survived_timeout = False
@@ -893,6 +1109,8 @@ def run_probe(
     elif probe_kind == "window_class":
         probe_id = PROBE_ID_WINDOW
         residuals = list(RESIDUAL_RISKS_WINDOW)
+        if require_control_texts:
+            residuals = residuals + list(RESIDUAL_RISKS_WINDOW_CONTROLS)
         if status == "pass":
             result_status = "pass"
             verdict = "Pass"
@@ -940,6 +1158,8 @@ def run_probe(
         )
         if require_title_substr:
             ref_notes += f" require_title={require_title_substr!r}"
+        if require_control_texts:
+            ref_notes += f" require_controls={list(require_control_texts)}"
     elif probe_kind == "exit_code":
         ref_notes = f"probe_kind=exit_code expect_exit={expect_exit & 0xFFFFFFFF:#x}"
 
@@ -990,7 +1210,9 @@ def run_probe(
         evidence["window_quality"] = {
             "expect_classes": list(expect_window_classes or []),
             "require_title_substr": require_title_substr,
+            "require_control_texts": list(require_control_texts or []),
             "classes_seen": classes_seen,
+            "controls_seen": controls_seen[:40],
             "attempts": attempts,
             "pass_count": pass_count,
             "fail_count": fail_count,
@@ -1093,12 +1315,19 @@ def main() -> int:
     )
     ap.add_argument(
         "--probe-kind",
-        choices=["marker", "load_no_crash", "window_class", "export_names", "exit_code"],
+        choices=[
+            "marker",
+            "load_no_crash",
+            "window_class",
+            "export_names",
+            "exit_code",
+            "pe_string",
+        ],
         default="marker",
         help=(
             "marker=exit_code_marker_v0 (default); load_no_crash=load survival; "
-            "window_class=gui class oracle (W3); export_names=static PE exports (W3); "
-            "exit_code=exact process exit (P1 pure-logic step)"
+            "window_class=gui class oracle (W3+P2 controls); export_names=static PE exports; "
+            "exit_code=exact process exit (P1); pe_string=static PE string surface (P2)"
         ),
     )
     ap.add_argument(
@@ -1128,10 +1357,22 @@ def main() -> int:
         help="window_class: optional title substring (UTF-8/unicode)",
     )
     ap.add_argument(
+        "--require-control-text",
+        action="append",
+        default=[],
+        help="window_class: required child control text substring (repeatable)",
+    )
+    ap.add_argument(
         "--require-export",
         action="append",
         default=[],
         help="export_names: required export symbol (repeatable; case-insensitive fallback)",
+    )
+    ap.add_argument(
+        "--require-string",
+        action="append",
+        default=[],
+        help="pe_string: required static string (ASCII/UTF-8 or UTF-16LE; repeatable)",
     )
     args = ap.parse_args()
 
@@ -1161,12 +1402,20 @@ def main() -> int:
         require_marker = True
         expect_exit = 0
 
-    if args.probe_kind in ("load_no_crash", "window_class", "export_names", "exit_code"):
+    if args.probe_kind in (
+        "load_no_crash",
+        "window_class",
+        "export_names",
+        "exit_code",
+        "pe_string",
+    ):
         require_marker = False
     if args.probe_kind == "window_class" and not args.expect_window_class:
         ap.error("window_class requires --expect-window-class")
     if args.probe_kind == "export_names" and not args.require_export:
         ap.error("export_names requires --require-export")
+    if args.probe_kind == "pe_string" and not args.require_string:
+        ap.error("pe_string requires --require-string")
     if args.probe_kind == "exit_code" and args.expect_exit is None:
         # argparse always supplies int default 0; treat as required by forcing flag
         # presence via a sentinel is awkward — require explicit --expect-exit always OK.
@@ -1188,7 +1437,9 @@ def main() -> int:
         rate_samples=args.rate_samples if args.probe_kind == "load_no_crash" else 0,
         expect_window_classes=list(args.expect_window_class or []),
         require_title_substr=args.require_title_substr,
+        require_control_texts=list(args.require_control_text or []),
         require_exports=list(args.require_export or []),
+        require_strings=list(args.require_string or []),
     )
     evidence = packed["evidence"]
     shape_errs = validate_evidence_shape(evidence)
