@@ -47,7 +47,7 @@
 | Min observation **60s** after attach | Matches r4c settle; `wrapper_call_patch` 0/0 |
 | Smoke CLI path | Always `D:\MidaVault\scratch\cargo-target\debug\mida-cli.exe` (not repo `target/release`) |
 
-**Load status (revised):** `u_gto_host_scan60` is StructuralPass + IAT-green (98%, OEP `0x70b0`, `wrapper_call_patch` 0/0). Quiet probe can Pass; serial often Fail then Pass×2 — **R-LOAD-FLAKE**. Under multi-case BB gate pressure, scan60 has been **12/12 Fail** while `r4c_gto` Passes on the same machine.
+**Load status (revised 2026-07-24 W2):** Pre-W2 independent-host dumps (scan60/m3/fresh) quiet attempt=1 rates were 0.1–0.2 with cdb AV `mov [r8],ecx` r8=`0x8000` at OEP `0x70c9`. **W2 clear-regs** on `.boot`→OEP transfer fixes that class; post-fix lives `w2_clearregs{1,2,3}` are **10/10** attempt=1. Prefer those pins over `r4c_gto` (see W2 section).
 
 **`.boot` delta vs r4c — deep dive (2026-07-24):**
 
@@ -160,8 +160,9 @@ Gate pin order residual: prefer **`r4c_gto` first** for multi-case reliability; 
 - `load_no_crash_v0` is **load survival**, not UI/business parity.  
 - Pure default remains **Origin-only**, not global.  
 - GTO still needs `--profile=ahk-gto-experimental` for experimental dump stages.  
-- **Origin** quiet single-shot load flake is **closed at metric** (W1 scrub_v2, N=20 attempt=1 → 1.0); GTO single-shot and multi-case gate pressure remain residual.  
-- B-B `Accepted` still rests on pin/retry for GTO; does **not** equal product 1.0.
+- **Origin** quiet single-shot load flake is **closed at metric** (W1 scrub_v2, N=20 attempt=1 → 1.0).  
+- **GTO** independent-host quiet single-shot load flake is **closed at metric** (W2 clear-regs, 3× N=10 → 1.0); does **not** equal product 1.0 or UI/script parity.  
+- B-B `Accepted` remains **load survival** only; W3+ needs a real behavior oracle.
 
 ## W1 — Origin single-shot load (R-LOAD-FLAKE Origin side) — **metric exit**
 
@@ -214,17 +215,68 @@ Gate pin order residual: prefer **`r4c_gto` first** for multi-case reliability; 
 | No 1.0 claim | **Held** |
 | Residual updated + local commit | this section + course-correction commit |
 
-**Residual after W1:** Origin quiet single-shot R-LOAD-FLAKE **metric-closed**. Cold-start / multi-case gate pressure not re-measured as W1 exit. GTO R-LOAD-FLAKE and R-GTO-LATEST **unchanged**. Site scan may still *report* distant complement_rva pre-plant; plant path normalizes.
+**Residual after W1:** Origin quiet single-shot R-LOAD-FLAKE **metric-closed**. Cold-start / multi-case gate pressure not re-measured as W1 exit. Site scan may still *report* distant complement_rva pre-plant; plant path normalizes.
 
-## Residual after VNEXT-BEH (+ W1)
+## W2 — GTO independent-host load without r4c pin — **metric exit**
+
+**Work order:** [COURSE_CORRECTION_WORK_ORDER.md](COURSE_CORRECTION_WORK_ORDER.md) W2  
+**Date:** 2026-07-24  
+**Claim:** Fresh independent-host GTO dumps (`ahk-gto-experimental`) can load-survive attempt=1 at ≥0.70 (achieved 1.0) without walking to `r4c_gto`. **Not** product 1.0 / not business logic.
+
+### Baselines (pre-fix, attempt=1, N=10 quiet)
+
+| Candidate | pass_rate | Evidence |
+|-----------|-----------|----------|
+| `u_gto_host_scan60` | **0.2** (2/10) | `gto_w2_scan60_rate` |
+| `r4c_gto` (control, same day machine) | **0.0** (0/10) | `gto_w2_r4c_rate` — even pin dump flaked hard |
+| `m3_plugin_gtoexp` | **0.1** (1/10) | `gto_w2_m3_rate` |
+| `w2_fresh1` (pre-fix rebuild) | **0.1** (1/10) | `gto_w2_fresh1_rate` |
+
+### cdb root cause (deterministic, not “random flake”)
+
+- **Fault:** `rip=0x1400070c9` `mov dword ptr [r8],ecx` with **`r8=0x8000`**, `rbx=0x8000`, `rdx/rdi` = restored heap base (e.g. `0x3364a20` = last HOT table live ptr).  
+- **OEP:** `0x70b0` — `mov rbx,r8; test r8,r8; je skip; mov [r8],ecx` (optional out-param path).  
+- **Why r8=0x8000:** `.boot` phase-2 multi_fixup ends with last range **size** in `r8d` (HOT_LARGE / large tables use `0x8000`). Stub then `pop` nonvolatiles and **`jmp OEP` without clearing volatiles**. CRT’s original `jmp OEP` never left size leftovers.  
+- **Stack clue:** `@rsp+8 = 0x140ece040` points into `.boot` fixup meta (last entry size field).  
+- **Not:** missing heap snapshot stage alone; R-GTO-BOOT byte delta is orthogonal honesty.
+
+### Code fix (1 round)
+
+| Module | Change |
+|--------|--------|
+| [`container_bootstrap.rs`](../crates/pe/src/dumper/container_bootstrap.rs) | Before `jmp OEP`, `emit_clear_volatile_regs` (xor rax/rcx/rdx/r8–r11). Unit: `oep_transfer_clears_volatile_regs_before_jmp` |
+| [`_behavior_bb_gate.py`](../tools/_behavior_bb_gate.py) | Prefer `w2_clearregs{1,2,3}` over `r4c_gto` for `gto_launcher` pins |
+
+### Post-fix lives (3 independent run_ids, attempt=1 N=10 each)
+
+| Live tag | R0B | pass_rate | Evidence |
+|----------|-----|-----------|----------|
+| `live_20260724-155543_w2_clearregs1_gtoexp` | StructuralPassBehaviorPending | **1.0** (10/10) | `gto_w2_clearregs1_rate` |
+| `live_20260724-155723_w2_clearregs2_gtoexp` | StructuralPassBehaviorPending | **1.0** (10/10) | `gto_w2_clearregs2_rate` |
+| `live_20260724-155835_w2_clearregs3_gtoexp` | StructuralPassBehaviorPending | **1.0** (10/10) | `gto_w2_clearregs3_rate` |
+
+First-pin style: clearregs1 `--attempts 3` early-exit → **Pass** on attempt 1 (`gto_w2_clearregs1_pin_attempts3`).
+
+### W2 exit checklist
+
+| Criterion | Status |
+|-----------|--------|
+| ≥3 independent fresh lives R0B + load | **Pass** |
+| Quiet N≥10 attempt=1 ≥0.70 | **Pass** (3× 1.0) |
+| Not using r4c as success condition | **Pass** (clearregs only) |
+| Gate pin order prefers fresh path | **Pass** (preferred tags updated) |
+| R-GTO-BOOT may stay open | **Held** (not a W2 gate) |
+| No 1.0 claim | **Held** |
+
+## Residual after VNEXT-BEH (+ W1 + W2)
 
 | ID | Item | Blocks 1.0? | Status |
 |----|------|-------------|--------|
 | R-LOAD-FLAKE (Origin quiet) | attempt=1 N≥20 load survival | Quality | **W1 metric exit** (scrub_v2 20/20) |
-| R-LOAD-FLAKE (GTO / gate pressure) | intermittent 0xC0000005 under multi-case / serial GTO | Quality | Open → W2 |
-| R-GTO-LATEST | Independent-host (`scan60`) not batch-stable without `r4c_gto` pin | Quality | Open → W2 |
-| R-GTO-BOOT | `.boot` ~28 KiB heap_global under 320-slot cap | Quality | Open (honesty; not sole flake proof) |
-| R-PURE-LOGIC | Pure dump not proven equivalent to protected product logic | **Yes** for product 1.0 | Open → W3+ |
+| R-LOAD-FLAKE (GTO quiet / fresh host) | attempt=1 load survival on independent-host dumps | Quality | **W2 metric exit** (clear-regs 3× 10/10) |
+| R-GTO-LATEST | Fresh dump load without `r4c_gto` walk | Quality | **W2 metric exit** (preferred pins = clearregs) |
+| R-GTO-BOOT | `.boot` heap_global payload size variance under 320-slot cap | Quality | Open (honesty; not load AV root) |
+| R-PURE-LOGIC | Pure/unpacked not proven product-logic equivalent | **Yes** for product 1.0 | Open → W3+ |
 | R-X86 | ScyllaHide x86 residual | x86 only | Open |
 
 ## Re-run

@@ -1059,6 +1059,12 @@ fn build_stub_code(
     emit_nonvolatile_pops(stub);
 
     if let Some(oep) = original_entry_point {
+        // Phase-2 multi_fixup leaves Win64 volatiles dirty: last call uses
+        // r8d = range size (often 0x8000 for HOT_LARGE_TABLE). AHK OEP at
+        // 0x70b0 does `mov rbx,r8; test r8,r8; mov dword [r8],ecx` — a non-null
+        // garbage r8 AVs at 0x8000 (W2 / R-GTO-LATEST). CRT's original
+        // `jmp OEP` did not pass size leftovers; clear volatiles before transfer.
+        emit_clear_volatile_regs(stub);
         stub.push(0xe9);
         let jmp_next = stub_rva.checked_add(stub.len() as u32)?.checked_add(4)?;
         stub.extend_from_slice(&relative_displacement(jmp_next, oep)?);
@@ -1067,6 +1073,19 @@ fn build_stub_code(
     }
 
     Some(())
+}
+
+/// Zero rax/rcx/rdx/r8–r11 before transferring control to application OEP.
+fn emit_clear_volatile_regs(stub: &mut Vec<u8>) {
+    stub.extend_from_slice(&[
+        0x33, 0xc0, // xor eax, eax
+        0x33, 0xc9, // xor ecx, ecx
+        0x33, 0xd2, // xor edx, edx
+        0x4d, 0x33, 0xc0, // xor r8, r8
+        0x4d, 0x33, 0xc9, // xor r9, r9
+        0x4d, 0x33, 0xd2, // xor r10, r10
+        0x4d, 0x33, 0xdb, // xor r11, r11
+    ]);
 }
 
 fn emit_nonvolatile_pops(stub: &mut Vec<u8>) {
@@ -1143,6 +1162,49 @@ mod tests {
     #[test]
     fn metadata_size_is_40_bytes() {
         assert_eq!(CONTAINER_METADATA_SIZE, 40);
+    }
+
+    #[test]
+    fn oep_transfer_clears_volatile_regs_before_jmp() {
+        // GTO W2: multi_fixup leaves r8=size; OEP treats r8 as optional ptr.
+        let container = ContainerSnapshot {
+            rva: 0x145710,
+            decoded_begin: 0x10000,
+            decoded_end: 0x10048,
+            decoded_capacity: 0x100,
+            cookie: 0x1111_2222_3333_4444,
+            heap_content: vec![0u8; 0x48],
+        };
+        let oep = 0x70b0u32;
+        // Place stub and dummy IAT close so RIP-relative calls encode.
+        let stub_rva = 0x2000u32;
+        let stub = build_container_stub_internal(
+            stub_rva,
+            Some(oep),
+            0x2100, // GetProcessHeap IAT
+            0x2108, // HeapAlloc IAT
+            &[container],
+            &[],
+            None,
+            0x140000000,
+            0x141000,
+            None,
+            None,
+        )
+        .expect("container stub with OEP transfer");
+        let clear = [
+            0x33, 0xc0, 0x33, 0xc9, 0x33, 0xd2, 0x4d, 0x33, 0xc0, 0x4d, 0x33, 0xc9, 0x4d, 0x33,
+            0xd2, 0x4d, 0x33, 0xdb,
+        ];
+        let pos = stub
+            .windows(clear.len())
+            .position(|w| w == clear)
+            .expect("clear volatile regs before OEP");
+        assert_eq!(stub[pos + clear.len()], 0xe9, "clear must precede near jmp");
+        let rel =
+            i32::from_le_bytes(stub[pos + clear.len() + 1..pos + clear.len() + 5].try_into().unwrap());
+        let next = stub_rva + (pos + clear.len() + 5) as u32;
+        assert_eq!((next as i64 + i64::from(rel)) as u32, oep);
     }
 
     #[test]

@@ -61,12 +61,14 @@ Fix 轮次沿用 Q2：**每战场最多 2 轮**「改代码 → rebuild → 复�
 ```text
 W0 文档对齐（半日级）                    ✅ 2026-07-24
  → W1 Origin 单发加载稳定                 ✅ metric exit（scrub_v2 20/20）
- → W2 GTO 最新 dump 不 pin 过门           ⬜ next
- → W3 行为探针升级（有意义的 oracle）     ⬜
+ → W2 GTO 最新 dump 不 pin 过门           ✅ metric exit（clear-regs 3× live 10/10）
+ → W3 行为探针升级（有意义的 oracle）     ⬜ next
  → W4 宣称门槛复审（仅当 W1–W3 证据齐）   ⬜
 ```
 
 **W1 关闭摘要（2026-07-24）：** 根因 = kernel-canonical object head `0xfc388` + cookie complement 误植 + 过宽 scrub；fix = `data_reinit` kernel/low-4GB + `heap_bootstrap` 邻接 plant。证据：`origin_w1_scrub_v2_rate_20260724-151615`（pass_rate=1.0）。**非 1.0。** 详见 residual W1 节。
+
+**W2 关闭摘要（2026-07-24）：** 根因 = `.boot` multi_fixup 结束后 `r8` 残留 range size（常 `0x8000`），AHK OEP `0x70b0` 把 `r8` 当可选指针 `mov [r8],ecx` → AV@`0x8000`。fix = OEP 跳转前清零易失寄存器。3× 独立 live `w2_clearregs{1,2,3}` 各 N=10 attempt=1 → **1.0**；gate pin 优先序改为 clearregs（不再以 `r4c_gto` 为成功条件）。R-GTO-BOOT 仍 open。**非 1.0。**
 
 ---
 

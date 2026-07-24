@@ -67,11 +67,13 @@ PREFERRED_LIVE_TAGS: dict[str, list[str]] = {
         "live_20260724-104711_u_origin_pure_r2",
     ],
     "gto_launcher": [
-        # Gate multi-case pressure: r4c first (reliable Pass). Independent-host
-        # scan60 is StructuralPass + IAT/OEP aligned but R-LOAD-FLAKE under batch.
+        # W2 clear-regs: independent-host fresh dumps load-stable (no r4c pin).
+        # Pre-fix r4c/scan60 kept only as fallback research pins.
+        "live_20260724-155543_w2_clearregs1_gtoexp",
+        "live_20260724-155723_w2_clearregs2_gtoexp",
+        "live_20260724-155835_w2_clearregs3_gtoexp",
         "live_20260723-225951_r4c_gto",
         "live_20260724-124524_u_gto_host_scan60",
-        "live_20260724-004707_p1_gto_reg",
     ],
     "lunlun_software": [
         "live_20260724-013746_u_harden_3x_n3",
