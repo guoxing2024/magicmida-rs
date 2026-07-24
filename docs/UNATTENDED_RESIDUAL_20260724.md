@@ -556,7 +556,33 @@ Evidence: `D:\MidaVault\lab\evidence\_beh_gate\r_gto_ui_r2\` (`gto_unpacked_wind
 
 **Artifacts (vault, not in git):** `D:\MidaVault\scratch\verify_live_gto_d1b_9245.exe`, `verify_live_gto_d1b_9268.exe`, `d1b_av.log`, `d1b_9268_av.log`, `s1.log`, `s2.log`.
 
-## Residual after VNEXT-BEH (+ W1–W4 + P1 + P2 + R-GTO-UI×2 + step-1 dx + round-3 neg + round-4 neg)
+## R-GTO-UI round 5 (CS re-init + anti-tamper probe) — **PARTIAL PROGRESS; new blocker = anti-tamper; no code shipped**
+
+**Date:** 2026-07-24 (operator authorized heap-replay completeness: CS re-init + capture CRT string globals).
+**Method:** read-only cdb + byte-patch experiments on vault candidates (no repo code change).
+
+**CS root cause located:** the `RtlEnterCriticalSection` AV (round 4, EP=0xd9268) uses CS @ RVA `0x145db0` (a `.data` global). In the dumped candidate that CS is **all-zero** (not stale — zeroed/uninitialized). `LockCount=0` (not `-1`) makes `RtlEnterCriticalSection` treat it as contended → `RtlpWaitOnCriticalSection` on `LockSemaphore=0` (NULL) → AV.
+
+**CS re-init experiment (byte-patch, vault only):** set `LockCount` (offset +8, 4 bytes) = `-1` on the dumped CS, leaving the rest zero. Result: **the CS AV is resolved** — execution advances past `EnterCriticalSection`. This confirms the CS-reinit direction is valid; a proper fix would call `InitializeCriticalSection` (or zero+set `LockCount=-1`) on known CS globals in the stub/dumper post-process.
+
+**New blocker revealed (anti-tamper, deeper than authorized scope):** after the CS AV clears, the next AV is at `0x1400fb8f0: jmp rax` with `rax = 0xd25a180000e54155` (garbage). Caller chain `0x400e7232 ← 0x400e71b5 ← 0x400d92c8` (WinMain path). The surrounding code at `0x400e721c` is `xor rax,rcx; ror rax,cl` — **AHK anti-tamper pointer decryption**, cookie loaded from `.data` global `0x1454b8`.
+- The cookie at `0x1454b8` is **zero** in the dumped candidate (and in the prior W2 dump too — because the AHK init that sets it never ran in the EP=0x70b0 early-exit path).
+- Brute-force scan: **no** 64-bit value in the dumped `.data` decrypts `0xd25a180000e54155` to a valid image VA under `xor-then-ror` — so the bad `rax` is either (a) encrypted with a cookie not present in `.data` (heap/per-process), or (b) a genuinely scrubbed/garbage global, not an encrypted pointer.
+- Either way this is **AHK's anti-tamper pointer-obfuscation layer**, not "capture CRT string globals". Defeating it requires reverse-engineering AHK's pointer encryption/decryption and either preserving the live cookie or re-deriving it — a substantial RE effort distinct from heap-capture completeness.
+
+**Stop rule (Q2):** round 5 made real progress (CS re-init technique validated) but revealed that R-GTO-UI has a deeper layer (AHK anti-tamper) beyond the authorized scope ("CS re-init + CRT string globals"). The CS re-init alone does **not** change the R-GTO-UI verdict (still Fail — the candidate AVs at the anti-tamper layer instead), so shipping it now would add code surface without shortening the distance to 1.0. **No code shipped** (vault byte-patch experiments only; repo at HEAD `a08c548`, zero tracked changes). 4-case fresh-reverify baseline intact.
+
+**What was learned (positive knowledge):**
+1. The CS at `.data` RVA `0x145db0` is the one WinMain enters; it is zeroed in the dump; `LockCount=-1` re-init resolves the CS AV. CS-reinit is a confirmed-valid technique for a future combined fix.
+2. The next blocker is AHK anti-tamper (`xor/ror` pointer decryption with a `.data` cookie @ `0x1454b8` that is zero in the dump). This is a distinct RE problem, not heap-capture completeness.
+3. R-GTO-UI is now a **layered** problem: (L1) OEP [solved: `mainCRTStartup`@`0xd92d4`], (L2) heap-replay completeness [partially: CS re-init works], (L3) anti-tamper pointer decryption [open — needs AHK RE]. No single 2-round authorization can close it.
+4. The stub-replay approach is fundamentally in tension with AHK anti-tamper: the anti-tamper pointers are decrypted per-call using a cookie that AHK init sets; skipping init (stub replay) leaves the cookie unset → decryption yields garbage. Running init (mainCRTStartup) re-randomizes the cookie → also breaks decryption. Either path needs the anti-tamper RE'd first.
+
+**Non-claim:** round 5 does not close R-GTO-UI; no 1.0 sentence; no code shipped. R-GTO-UI remains open. Further work needs a new operator authorization scoped to **AHK anti-tamper reverse-engineering** (a research task, not a 2-round engineering fix) — which is beyond heap-replay completeness and beyond what the project's evidence-first discipline can close quickly.
+
+**Artifacts (vault, not in git):** `D:\MidaVault\scratch\verify_live_gto_d1b_9268_csfix.exe`, `csfix_av.log`, `diag3.log`, `diag4.log`.
+
+## Residual after VNEXT-BEH (+ W1–W4 + P1 + P2 + R-GTO-UI×2 + step-1 dx + round-3/4/5 neg)
 
 | ID | Item | Blocks 1.0? | Status |
 |----|------|-------------|--------|
@@ -565,7 +591,7 @@ Evidence: `D:\MidaVault\lab\evidence\_beh_gate\r_gto_ui_r2\` (`gto_unpacked_wind
 | R-GTO-LATEST | Fresh dump load without `r4c_gto` walk | Quality | **W2 metric exit** |
 | R-GTO-BOOT | `.boot` heap_global payload size variance under 320-slot cap | Quality | Open (honesty; not load AV root) |
 | R-PURE-LOGIC | Product-logic / business path equivalence | **Yes** for product 1.0 | **Advanced:** controls + pe_string + exit/title/exports; **still blocks 1.0** |
-| R-GTO-UI | Unpacked GTO no product window; protected does | Quality / **1.0-relevant for GTO** | **Open; root-caused (rounds 3+4 neg):** true OEP `mainCRTStartup`@`0xd92d4`; post-_initterm WinMain call site `0xd9268` (WinMain=`0xd97ac`). Both EPs AV — blocker is **heap-replay completeness** (missing CRT string globals + stale critical-section state), not OEP. Needs heap-capture redesign (more globals + CS re-init). **Awaiting operator auth (beyond OEP/stub-EP scope)** |
+| R-GTO-UI | Unpacked GTO no product window; protected does | Quality / **1.0-relevant for GTO** | **Open; layered:** L1 OEP solved (`mainCRTStartup`@`0xd92d4`); L2 heap-replay: CS re-init (`LockCount=-1` @ `.data` RVA `0x145db0`) validated (clears CS AV); L3 **anti-tamper** (`xor/ror` ptr decrypt, cookie @ `0x1454b8`=0 in dump) — **open, needs AHK RE**, not a 2-round fix. Stub-replay fundamentally in tension w/ anti-tamper. **Awaiting AHK-RE authorization** |
 | R-4CASE-FRESH | Full 4-case attempt=1 on best pins | Claim hygiene | **P1-A closed** (N=10 × 4 = 1.0) |
 | R-X86 | ScyllaHide x86 residual | x86 only | Open |
 | **product 1.0 claim** | Operator + Q7 | Governance | **Still NO** |
