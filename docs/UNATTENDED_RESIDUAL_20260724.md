@@ -651,7 +651,63 @@ Evidence: `D:\MidaVault\lab\evidence\_beh_gate\r_gto_ui_r2\` (`gto_unpacked_wind
 
 **Artifacts (vault, not in git):** `D:\MidaVault\scratch\r7_gto.exe`, `r7_gto_default.exe`, `r7av.log`, `d8.log`, `d9.log`, `da.log`.
 
-## Residual after VNEXT-BEH (+ W1–W4 + P1 + P2 + R-GTO-UI×2 + step-1 dx + round-3/4/5/6 + round-7 progress)
+## R-GTO-UI round 8 (call-obfuscation trampoline RE) — **DEADLOCK; cookie undeterminable; corrects round-6; no code shipped**
+
+**Date:** 2026-07-24 (bounded iterative capture, soft cap 4; round 8 = trace the `0xe71c8`-chain AV source).
+**Method:** read-only cdb on the **unpacked** `r7_gto.exe` (no anti-debug; reliable) + static disasm. **No live cdb on protected input** (operator flagged anti-debug detection — round-6 live cookie measurement is unreliable).
+
+### Findings
+
+**A. The `0xfb8f0` AV is an AHK call-obfuscation trampoline, NOT a C++ exception handler (corrects round-7 RE).**
+- `0x400fb8f0: jmp rax` is an IAT thunk (`call [0xfe1f0]` → `jmp rax`). `rax` is produced by the `xor rax,rcx; ror rax,cl` sequence at `0xe721c` inside the `0xe71c8` call chain. This is AHK's **per-call pointer obfuscation**: each indirect call is routed through a trampoline that decrypts the target with a cookie.
+- first-chance AV (cdb on unpacked): `rip=0x1400fb8f0`, `rax=garbage` (e.g. `0x14318000541bf7c3`), every run different (ASLR). The decrypted `rax` is not a valid VA → `jmp rax` AV.
+
+**B. The decrypt is ACTIVE, not dormant (corrects round-6).**
+- Round-6 concluded the `xor/ror` decrypt was dormant because live cookie @ `0x1454b8` measured `0`. **That measurement was taken under cdb attach on protected input, which the operator confirmed triggers anti-debug** — the `0` is an anti-debug-polluted value, not trustworthy.
+- On the **unpacked** candidate (no anti-debug) the decrypt **does execute**: at `0xe721a` (`je`), `rcx=cookie=0` but `rdx=传入指针≠0`, so `cmp rcx,rdx; je` is **not taken** → `xor rax,0; ror rax,cl` runs → `rax` corrupted → AV. The decrypt path is active whenever `cookie != rdx` (i.e. whenever a real pointer is passed), regardless of cookie being 0.
+
+**C. Cookie algorithm (confirmed from `0xe7444`, fully RE'd round-6):** `cookie = ror(rcx, 0x0e) ^ DEFAULT_SECURITY_COOKIE`, where `rcx = *(.data@0x14ca60)` (first qword of a runtime object). `0xe7444` only sets the cookie when `cookie == DEFAULT_SECURITY_COOKIE` (initial sentinel) — i.e. exactly once at first init.
+
+**D. Cookie is undeterminable (deadlock).**
+- Dumped `*(0x14ca60) = 0` (the object is not populated in the dump) and dumped `cookie = 0` (not even the `DEFAULT_SECURITY_COOKIE` sentinel — it was scrubbed/zeroed).
+- Experiment: planted `cookie = DEFAULT_SECURITY_COOKIE` (`0x2b992ddfa232`, the `rcx=0` case) into the dump → **same AV**, `rax` still garbage. So `rcx ≠ 0`; the real cookie requires the real `rcx`.
+- `rcx = *(0x14ca60)` cannot be obtained: (1) it is `0` in the dump (the setter is in init code that EP=`0xd9268` skips); (2) live cdb on protected input is unreliable (anti-debug); (3) running full init (EP=`mainCRTStartup`) to populate it AVs at `_initterm` (round-3 heap-replay conflict). 
+- No static rip-relative store to `0x14ca60` exists (it is written indirectly via a register-held pointer), so the live value cannot be statically derived.
+
+### Deadlock synthesis
+
+R-GTO-UI now has a **circular dependency** that no single-round fix breaks:
+
+```text
+WinMain runs (needs EP=0xd9268 + CS re-init [round 7])
+  → AHK call-obfuscation decrypts call targets with cookie @0x1454b8
+  → cookie needs 0xe7444 to have run (sets cookie = ror(rcx,0x0e)^seed)
+  → 0xe7444 needs *(0x14ca60) != 0 (its input rcx)
+  → *(0x14ca60) needs init code that EP=0xd9268 skips
+  → running that init (EP=mainCRTStartup) AVs at _initterm (heap-replay conflict, round 3)
+  → heap-replay completeness is the original L2 blocker (round 5/6)
+```
+
+The call-obfuscation layer is not an independent blocker — it is a **manifestation** of the heap/runtime-state capture incompleteness (the cookie and `0x14ca60` object are part of the uncaptured runtime state). Peeling it (round 8) just re-exposes the same L2 root.
+
+### Round 8 verdict
+
+- **No code shipped** (vault byte-patch experiments only; repo at HEAD `0cfc105`, zero tracked changes). Round-7 CS re-init + cap raise remain shipped and valid.
+- **Round-6 "dormant decrypt" conclusion retracted** (it was based on anti-debug-polluted live data). The decrypt is active; cookie=0 corrupts pointers.
+- **Soft cap:** 2 rounds left (9/10). No clear breakthrough path — the cookie deadlock circles back to heap-replay completeness, the same L2 root that rounds 5-7 have been peeling. Continuing would repeat the same root under a different AV site.
+- **Recommendation:** stop at the soft cap (or now). R-GTO-UI is a heap/runtime-state capture completeness problem with a circular dependency through AHK's call-obfuscation cookie; closing it needs either (a) a way to obtain `*(0x14ca60)` live without anti-debug interference (e.g. dump earlier/later, or ScyllaHide hardening for the cookie path), or (b) a stub that replays the cookie-setup sequence (`0xe7444`) with a captured `rcx` before jumping to WinMain — both are larger than 2 rounds.
+
+**What was learned (positive):**
+1. AHK call-obfuscation trampoline fully RE'd: `0xe721c xor rax,cookie; ror rax,cl` → `0xfb8f0 jmp rax`; cookie from `0x1454b8`; algorithm `ror(rcx,0x0e)^DEFAULT_SECURITY_COOKIE`, `rcx=*(0x14ca60)`.
+2. Round-6 "dormant" conclusion was wrong (anti-debug-polluted measurement). Decrypt is active; cookie=0 corrupts.
+3. Cookie is undeterminable from the dump alone (needs live `rcx` blocked by anti-debug / init-AV deadlock).
+4. R-GTO-UI is a circular dependency through the cookie back to heap-replay completeness — not a linear "peeling" problem.
+
+**Non-claim:** round 8 does not close R-GTO-UI; no 1.0 sentence; no code shipped. R-GTO-UI remains open. Recommend stopping at the soft cap; further work needs a fundamentally different approach (anti-debug-safe live capture of `0x14ca60`, or a cookie-setup replay stub), not more peeling.
+
+**Artifacts (vault, not in git):** `D:\MidaVault\scratch\r8_gto_seedcookie.exe`, `r8_unpack_je.log`, `r8_av.log`, `r8d.log`.
+
+## Residual after VNEXT-BEH (+ W1–W4 + P1 + P2 + R-GTO-UI×2 + step-1 dx + round-3/4/5/6/7/8)
 
 | ID | Item | Blocks 1.0? | Status |
 |----|------|-------------|--------|
@@ -660,7 +716,7 @@ Evidence: `D:\MidaVault\lab\evidence\_beh_gate\r_gto_ui_r2\` (`gto_unpacked_wind
 | R-GTO-LATEST | Fresh dump load without `r4c_gto` walk | Quality | **W2 metric exit** |
 | R-GTO-BOOT | `.boot` heap_global payload size variance under 320-slot cap | Quality | Open (honesty; not load AV root) |
 | R-PURE-LOGIC | Product-logic / business path equivalence | **Yes** for product 1.0 | **Advanced:** controls + pe_string + exit/title/exports; **still blocks 1.0** |
-| R-GTO-UI | Unpacked GTO no product window; protected does | Quality / **1.0-relevant for GTO** | **Open; round-7 progress (CS AV cleared, code shipped):** CS re-init @`0x145db0` + gscript cap 0x20000 shipped; `--oep=rva=0xd9268` now clears the CS AV (round-4/5 AV gone), next AV = exception-handler Variant (WinMain throws C++ exception from incomplete g_script). Default path no regression. 3 rounds left (soft cap). Next: trace exception-object g_script source |
+| R-GTO-UI | Unpacked GTO no product window; protected does | Quality / **1.0-relevant for GTO** | **Open; round-8 deadlock (circular dep):** call-obfuscation trampoline `0xe721c xor/ror` + `0xfb8f0 jmp rax` is ACTIVE (round-6 "dormant" retracted — anti-debug-polluted measurement). cookie @`0x1454b8`=0 in dump; cookie=`ror(rcx,0x0e)^DEFAULT_SECURITY_COOKIE`, `rcx=*(0x14ca60)`; `*(0x14ca60)` undeterminable (dump=0; live cdb blocked by anti-debug; init AVs at heap-replay). Circular dep back to L2 heap-replay completeness. **Recommend stop at soft cap; needs anti-debug-safe live capture or cookie-replay stub** |
 | R-4CASE-FRESH | Full 4-case attempt=1 on best pins | Claim hygiene | **P1-A closed** (N=10 × 4 = 1.0) |
 | R-X86 | ScyllaHide x86 residual | x86 only | Open |
 | **product 1.0 claim** | Operator + Q7 | Governance | **Still NO** |
