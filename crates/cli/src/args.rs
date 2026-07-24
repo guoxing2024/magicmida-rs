@@ -73,7 +73,7 @@ fn parse_unpack(args: &[String]) -> Result<Command, String> {
         return Err(
             "Usage: mida-cli /unpack <filename> [--data-sections] [--shrink|--no-shrink] \
              [--oep=crt|captured|rva=N] [--profile=oreans-classic|ahk-gto-experimental] \
-             [--container-restore=off|post-crt|tls-pre] [--pure-rebuild] [-v]"
+             [--container-restore=off|post-crt|tls-pre] [--pure-rebuild|--no-pure-rebuild] [-v]"
                 .into(),
         );
     }
@@ -96,7 +96,8 @@ fn parse_unpack(args: &[String]) -> Result<Command, String> {
     // None = user did not pass --container-restore; use profile default.
     let mut container_restore_explicit: Option<ContainerRestoreMode> = None;
     let mut verbose = false;
-    let mut pure_rebuild = false;
+    let mut cli_pure_rebuild = false;
+    let mut cli_no_pure_rebuild = false;
 
     let mut i = 3;
     while i < args.len() {
@@ -112,7 +113,8 @@ fn parse_unpack(args: &[String]) -> Result<Command, String> {
             "--shrink" => shrink = true,
             "--no-shrink" => shrink = false,
             "-v" | "--verbose" => verbose = true,
-            "--pure-rebuild" => pure_rebuild = true,
+            "--pure-rebuild" => cli_pure_rebuild = true,
+            "--no-pure-rebuild" => cli_no_pure_rebuild = true,
             other if other.starts_with("--oep=") => {
                 oep_policy = parse_oep_policy(&other["--oep=".len()..])?;
             }
@@ -163,6 +165,21 @@ fn parse_unpack(args: &[String]) -> Result<Command, String> {
     }
 
     let container_restore = resolve_container_restore(profile, container_restore_explicit);
+
+    // D3: Origin Macro protected input defaults pure; others legacy.
+    let (pure_rebuild, pure_reason) =
+        crate::origin_pure::resolve_pure_rebuild(&input, cli_pure_rebuild, cli_no_pure_rebuild);
+    if pure_rebuild || cli_no_pure_rebuild || cli_pure_rebuild {
+        // Always log when operator touched pure flags or Origin default engaged.
+        let _ = pure_reason;
+    }
+    // Surface reason via stderr only when Origin default or explicit flags change
+    // behavior relative to historical global legacy default.
+    if pure_rebuild && !cli_pure_rebuild {
+        eprintln!(
+            "mida-cli: pure-rebuild enabled by default for Origin Macro protected input ({pure_reason}); pass --no-pure-rebuild to force legacy"
+        );
+    }
 
     Ok(Command::Unpack {
         input,

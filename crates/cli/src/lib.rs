@@ -7,6 +7,7 @@
 pub mod args;
 pub mod commands;
 pub mod log;
+pub mod origin_pure;
 pub mod unpacker;
 
 use std::error::Error;

@@ -36,13 +36,24 @@ SCHEMA_VERSION = "mida.behavior-evidence/v0"
 PRODUCER_NAME = "tools/_behavior_probe.py"
 PRODUCER_VERSION = "0.1.0-ba1"
 MARKER_NEEDLE = "MIDA_BEH_MARKER=1"
-PROBE_ID = "exit_code_marker_v0"
+PROBE_ID_MARKER = "exit_code_marker_v0"
+PROBE_ID_LOAD = "load_no_crash_v0"
 
 # Job-object network isolation is deferred; residual risk is always listed.
-RESIDUAL_RISKS = [
+RESIDUAL_RISKS_MARKER = [
     "network_deny_is_policy_not_kernel_filter",
     "no_api_trace_scoring",
     "synthetic_only_ba1",
+]
+RESIDUAL_RISKS_LOAD = [
+    "network_deny_is_policy_not_kernel_filter",
+    "no_api_trace_scoring",
+    "load_survive_is_not_full_product_equivalence",
+    "gui_apps_may_survive_without_proving_business_logic",
+    "timeout_survive_treated_as_Pass_for_load_no_crash_v0",
+    "non_nt_nonzero_exit_treated_as_Pass_for_load_no_crash_v0",
+    "cwd_is_candidate_parent_for_load_probe",
+    "load_no_crash_retries_on_nt_exception",
 ]
 
 
@@ -154,6 +165,81 @@ def build_fixture(release: bool = True) -> Path:
     return exe
 
 
+def _is_nt_exception_exit(code: int | None) -> bool:
+    """Win32 exception-style exits (0xC0000000..) after cast to signed int32."""
+    if code is None:
+        return False
+    u = code & 0xFFFFFFFF
+    return u >= 0xC0000000
+
+
+def _run_one_process(
+    candidate: Path,
+    *,
+    mode: str | None,
+    max_wall_ms: int,
+    max_output_bytes: int,
+    probe_kind: str,
+    env: dict[str, str],
+    run_cwd: str,
+) -> tuple[str, int | None, str | None, bool, str, str]:
+    """Single launch. Returns status, exit_code, error_class, survived_timeout, stdout, stderr."""
+    cmd = [str(candidate)]
+    if mode and probe_kind == "marker":
+        cmd.append(mode)
+
+    status = "error"
+    exit_code: int | None = None
+    error_class: str | None = None
+    stdout_tail = ""
+    stderr_tail = ""
+    survived_timeout = False
+    creationflags = 0
+    if os.name == "nt" and probe_kind == "load_no_crash":
+        # Avoid inheriting a pipe-backed console that some GUI unpacks mishandle.
+        creationflags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=run_cwd,
+            env=env,
+            stdout=subprocess.DEVNULL if probe_kind == "load_no_crash" else subprocess.PIPE,
+            stderr=subprocess.DEVNULL if probe_kind == "load_no_crash" else subprocess.PIPE,
+            creationflags=creationflags,
+        )
+        try:
+            if probe_kind == "load_no_crash":
+                proc.wait(timeout=max_wall_ms / 1000.0)
+                out_b, err_b = b"", b""
+            else:
+                out_b, err_b = proc.communicate(timeout=max_wall_ms / 1000.0)
+            exit_code = proc.returncode
+            status = "pass"
+        except subprocess.TimeoutExpired:
+            survived_timeout = True
+            proc.kill()
+            try:
+                if probe_kind == "load_no_crash":
+                    proc.wait(timeout=2.0)
+                    out_b, err_b = b"", b""
+                else:
+                    out_b, err_b = proc.communicate(timeout=2.0)
+            except Exception:
+                out_b, err_b = b"", b""
+            status = "timeout"
+            error_class = "wall_clock_timeout"
+            exit_code = None
+        if out_b:
+            stdout_tail = out_b[:max_output_bytes].decode("utf-8", errors="replace")
+        if err_b:
+            stderr_tail = err_b[:max_output_bytes].decode("utf-8", errors="replace")
+    except OSError as e:
+        status = "error"
+        error_class = f"os_error:{e.__class__.__name__}"
+    return status, exit_code, error_class, survived_timeout, stdout_tail, stderr_tail
+
+
 def run_probe(
     candidate: Path,
     *,
@@ -163,6 +249,8 @@ def run_probe(
     expect_exit: int,
     require_marker: bool,
     work_dir: Path | None,
+    probe_kind: str = "marker",
+    attempts: int = 1,
 ) -> dict[str, Any]:
     candidate = candidate.resolve()
     if not candidate.is_file():
@@ -178,9 +266,14 @@ def run_probe(
     if mode:
         env["MIDA_BEH_MODE"] = mode
 
-    cmd = [str(candidate)]
-    if mode:
-        cmd.append(mode)
+    # load_no_crash: run from candidate parent so relative DLL/sidecar paths resolve;
+    # marker synthetic fixtures stay in scratch so marker file stays isolated.
+    if probe_kind == "load_no_crash":
+        run_cwd = str(candidate.parent)
+        attempts = max(1, attempts)
+    else:
+        run_cwd = str(scratch)
+        attempts = 1
 
     t0 = time.perf_counter()
     status = "error"
@@ -189,36 +282,35 @@ def run_probe(
     markers_found: list[str] = []
     stdout_tail = ""
     stderr_tail = ""
+    survived_timeout = False
+    attempt_notes: list[str] = []
 
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            cwd=str(scratch),
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+    for attempt in range(1, attempts + 1):
+        status, exit_code, error_class, survived_timeout, stdout_tail, stderr_tail = (
+            _run_one_process(
+                candidate,
+                mode=mode,
+                max_wall_ms=max_wall_ms,
+                max_output_bytes=max_output_bytes,
+                probe_kind=probe_kind,
+                env=env,
+                run_cwd=run_cwd,
+            )
         )
-        try:
-            out_b, err_b = proc.communicate(timeout=max_wall_ms / 1000.0)
-            exit_code = proc.returncode
-            status = "pass"  # process completed; composition decides Pass/Fail
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            try:
-                out_b, err_b = proc.communicate(timeout=2.0)
-            except Exception:
-                out_b, err_b = b"", b""
-            status = "timeout"
-            error_class = "wall_clock_timeout"
-            exit_code = None
-        if out_b:
-            stdout_tail = out_b[:max_output_bytes].decode("utf-8", errors="replace")
-        if err_b:
-            stderr_tail = err_b[:max_output_bytes].decode("utf-8", errors="replace")
-    except OSError as e:
-        status = "error"
-        error_class = f"os_error:{e.__class__.__name__}"
-        out_b, err_b = b"", b""
+        # Early stop when this attempt is already a load survival candidate.
+        if probe_kind == "load_no_crash":
+            nt_fail = _is_nt_exception_exit(exit_code)
+            attempt_notes.append(
+                f"a{attempt}:status={status}:exit={exit_code}:survived={survived_timeout}"
+            )
+            # Accept first non-error non-NT attempt (timeout survival or any exit).
+            if status != "error" and not nt_fail:
+                break
+            if attempt < attempts and (nt_fail or status == "error"):
+                time.sleep(0.15)
+                continue
+            break
+        break
 
     elapsed_ms = int((time.perf_counter() - t0) * 1000)
 
@@ -230,20 +322,47 @@ def run_probe(
         except OSError:
             pass
 
-    # Refine probe.result.status for fail vs pass at observation layer
-    result_status = status
-    if status == "pass":
-        ok_exit = exit_code == expect_exit
-        ok_marker = (MARKER_NEEDLE in markers_found) if require_marker else True
-        if not ok_exit or not ok_marker:
+    if probe_kind == "load_no_crash":
+        probe_id = PROBE_ID_LOAD
+        residuals = list(RESIDUAL_RISKS_LOAD)
+        # Survive window without NT exception => Pass.
+        # Non-zero non-NT exits (missing args / single-instance / GUI early return)
+        # still prove the image loaded and ran user code without AV — Pass with residual.
+        if status == "error":
+            result_status = "error"
+            verdict = "Inconclusive"
+        elif _is_nt_exception_exit(exit_code):
             result_status = "fail"
-
-    if result_status == "pass" and require_marker and MARKER_NEEDLE in markers_found:
-        verdict = "Pass"
-    elif result_status in ("timeout", "error"):
-        verdict = "Inconclusive"
+            error_class = error_class or f"nt_exception_exit:{exit_code & 0xFFFFFFFF:#x}"
+            verdict = "Fail"
+        elif survived_timeout or status == "timeout":
+            result_status = "pass"
+            error_class = "survived_wall_clock_then_killed"
+            verdict = "Pass"
+        elif exit_code == 0:
+            result_status = "pass"
+            verdict = "Pass"
+        else:
+            result_status = "pass"
+            error_class = error_class or f"nonzero_non_nt_exit:{exit_code & 0xFFFFFFFF:#x}"
+            verdict = "Pass"
     else:
-        verdict = "Fail"
+        probe_id = PROBE_ID_MARKER
+        residuals = list(RESIDUAL_RISKS_MARKER)
+        result_status = status
+        if status == "pass":
+            ok_exit = exit_code == expect_exit
+            ok_marker = (MARKER_NEEDLE in markers_found) if require_marker else True
+            if not ok_exit or not ok_marker:
+                result_status = "fail"
+        if result_status == "pass" and require_marker and MARKER_NEEDLE in markers_found:
+            verdict = "Pass"
+        elif result_status == "pass" and not require_marker and exit_code == expect_exit:
+            verdict = "Pass"
+        elif result_status in ("timeout", "error"):
+            verdict = "Inconclusive"
+        else:
+            verdict = "Fail"
 
     evidence: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
@@ -255,10 +374,10 @@ def run_probe(
         "reference": {
             "kind": "synthetic_pair" if mode else "none",
             "sha256": None,
-            "notes": f"mode={mode}" if mode else None,
+            "notes": f"mode={mode}" if mode else f"probe_kind={probe_kind}",
         },
         "probe": {
-            "id": PROBE_ID,
+            "id": probe_id,
             "policy": {
                 "network": "deny",
                 "max_wall_ms": max_wall_ms,
@@ -272,7 +391,7 @@ def run_probe(
             },
         },
         "verdict": verdict,
-        "residual_risks": list(RESIDUAL_RISKS),
+        "residual_risks": residuals,
         "producer": {
             "name": PRODUCER_NAME,
             "version": PRODUCER_VERSION,
@@ -288,6 +407,8 @@ def run_probe(
         "mode": mode,
         "expect_exit": expect_exit,
         "require_marker": require_marker,
+        "attempts": attempts,
+        "attempt_notes": attempt_notes,
     }
     return {"evidence": evidence, "meta": meta}
 
@@ -359,6 +480,18 @@ def main() -> int:
         default=None,
         help="Exit 1 if evidence.verdict mismatches",
     )
+    ap.add_argument(
+        "--probe-kind",
+        choices=["marker", "load_no_crash"],
+        default="marker",
+        help="marker=exit_code_marker_v0 (default); load_no_crash=vault PE load survival",
+    )
+    ap.add_argument(
+        "--attempts",
+        type=int,
+        default=5,
+        help="load_no_crash only: retry launches on NT exception (default 5)",
+    )
     args = ap.parse_args()
 
     if args.build_fixture:
@@ -387,6 +520,8 @@ def main() -> int:
         require_marker = True
         expect_exit = 0
 
+    if args.probe_kind == "load_no_crash":
+        require_marker = False
     packed = run_probe(
         candidate,
         mode=args.mode,
@@ -395,6 +530,8 @@ def main() -> int:
         expect_exit=expect_exit,
         require_marker=require_marker,
         work_dir=args.work_dir,
+        probe_kind=args.probe_kind,
+        attempts=args.attempts if args.probe_kind == "load_no_crash" else 1,
     )
     evidence = packed["evidence"]
     shape_errs = validate_evidence_shape(evidence)

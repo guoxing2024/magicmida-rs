@@ -1,12 +1,10 @@
-# Audit Package — Unattended baseline (2026-07-24)
+# Audit Package — Unattended baseline (2026-07-24, residual close)
 
-**Audience:** human auditor / acceptance only (no operator required for re-run).  
+**Audience:** human auditor / acceptance only.  
 **Branch:** `baseline/legacy-recovery-20260722`  
-**HEAD at package freeze:** `f66e157` (LoopState extract + this package)  
+**Decisions:** [UNATTENDED_DECISIONS_20260724.md](UNATTENDED_DECISIONS_20260724.md) (D1–D8 + Q1–Q7 all A)  
+**Residual detail:** [UNATTENDED_RESIDUAL_20260724.md](UNATTENDED_RESIDUAL_20260724.md)  
 **Validation summary task:** still **VNEXT-R4** (not VNEXT-BEH)
-
-Plan source: [UNATTENDED_EXECUTION_PLAN.md](UNATTENDED_EXECUTION_PLAN.md)  
-Handoff: [WORKER_HANDOFF.md](../WORKER_HANDOFF.md)
 
 ---
 
@@ -14,117 +12,80 @@ Handoff: [WORKER_HANDOFF.md](../WORKER_HANDOFF.md)
 
 | Claim | Status |
 |-------|--------|
-| Independent structural acceptance (R0B) | **Yes** — never `Accepted` on `check-static` |
-| Pure PE rebuild path (opt-in) | **Yes** (synthetic + Origin/Lunlun structural_equal history); **default still legacy** |
-| Oreans structural multi-case (R3 gate historically closed) | **Yes** (historical 10×); engineering 1× regressions green on 2026-07-24 |
-| Second family AHK/GTO structural (R4) | **Yes** (historical); experimental profile only |
-| Behavioral `Accepted` / VNEXT-BEH | **No** — B-A0..B-A3 synthetic only |
-| Perfect unpack (structure+load+behavior+repro+multi-family product) | **Not claimed** |
+| Independent structural acceptance (R0B) | **Yes** — `check-static` never `Accepted` |
+| Origin-only pure default (D3) | **Yes** (code + live pure dump); pure not global |
+| Oreans 3× engineering harden (D6) | **Yes** — vault batch `u_harden_3x` all_ok |
+| Independent GTO host (D4) | **Yes** (code path + structural smoke) |
+| Vault B-B / VNEXT-BEH (D2/D7/Q7) | **No** — 4-case all_ok failed; write refused |
+| Perfect unpack 1.0 | **Not claimed** |
 
-**Auditor bottom line:** Research baseline is **audit-ready for structural multi-family work** and **not** ready to claim product 1.0 or Behavioral Accepted.
-
----
-
-## 2. Closed gates (do not re-open as new claims)
-
-| Gate | Evidence anchor |
-|------|-----------------|
-| R0B | `crates/acceptance`, `docs/ACCEPTANCE_CONTRACT.md`, offline tests |
-| R1-E synthetic pure | pe purity/rebuild tests; pure default flip **No** |
-| R3 Oreans structural | `validation_summary.prev_20260723-230214.json` + vault R3 batches |
-| R4 AHK/GTO structural | `validation_summary.json` task VNEXT-R4 |
-| B-A0..B-A3 | `docs/VNEXT_BEHAVIORAL_PATH.md`; compose CLI `check-with-behavior` |
+**Auditor bottom line:** Engineering progress on pure/GTO/probe/3× is **commit-ready**; product **1.0** and **VNEXT-BEH** remain **blocked** on Origin+GTO load_no_crash stability (see residual).
 
 ---
 
-## 3. Engineering smokes (2026-07-24 post_attach) — not gates
+## 2. Closed / not closed
 
-| Case | Tag / batch | Result |
-|------|-------------|--------|
-| origin_macro 1× | `batch_20260724-011521_u1_post_attach_origin` | EP `0x13e0`, R0B StructuralPassBehaviorPending |
-| lunlun_software 1× | `batch_20260724-011721_u1_lunlun_reg` | EP `0x1656f4`, R0B Pending |
-| gto_launcher 1× | `batch_20260724-011543_u1_post_attach_gto` | family=ahk_gto conf=80 EP `0xecc000`, R0B Pending |
-| xiongxiong_duokai 1× | `batch_20260724-011818_u1_holdout_reg` | EP `0x35000`, R0B Pending |
-| origin after loop_state | `batch_20260724-012108_u1_loop_state_origin` | EP `0x13e0`, IAT 295/295, R0B Pending |
-| gto after loop_state | `batch_20260724-012147_u1_loop_state_gto` | EP `0xecc000`, family=ahk_gto, R0B Pending |
-| B-A3 synthetic | `lab/behavior/evidence/batch_20260724-011835_ba3` | all_ok; check-static never Accepted |
+| Gate | Status | Anchor |
+|------|--------|--------|
+| R0B structural | closed historically + still green on candidates | acceptance crate |
+| R3 structural history | closed | validation_summary.prev_* |
+| R4 structural | closed | validation_summary.json VNEXT-R4 |
+| B-A0..B-A3 synthetic | closed | VNEXT_BEHAVIORAL_PATH |
+| Oreans 3× harden | engineering green | `lab/evidence/_repeat/batch_20260724-013625_u_harden_3x` |
+| B-B vault 4-case | **open / fail** | `lab/evidence/_beh_gate/batch_20260724-101505_bb_gate_r2b` |
+| VNEXT-BEH | **not written** | gate refused `not all_ok` |
 
-Non-claims: not R3 10×, not R4 re-gate, not Behavioral Accepted, not pure default.
+### B-B partial (honest)
 
----
-
-## 4. Residual list (blocks / non-blocks)
-
-| ID | Item | Blocks 1.0? | Notes |
-|----|------|-------------|-------|
-| R-BEH | No scheduled VNEXT-BEH | **Yes** | Synthetic compose only; no vault behavioral Pass bound as product gate |
-| R-HOST | Shared ThemidaState + large debug loop | Arch debt | Thin-split in progress; not independent GTO host |
-| R-PURE | pure default = false | Product choice | Explicit No; residual packing size on pure |
-| R-GTO | Experimental profile + CRT/cookie residual | Quality | Explicit profile required |
-| R-X86 | ScyllaHide x86 hash placeholders | x86 samples | No trusted x86 helpers on host at audit time |
-| R-TLS | global_vars unused in restore | Risk on complex TLS | Deferred |
-| R-DALI | Managed out_of_scope | Scope | Correct non-goal |
+| Case | Compose |
+|------|---------|
+| lunlun_software | **Accepted** |
+| xiongxiong_duokai | **Accepted** |
+| origin_macro | probe Fail (AV / flaky) |
+| gto_launcher | probe Fail (AV) |
 
 ---
 
-## 5. Re-run matrix (auditor)
+## 3. Code surfaces (this run)
+
+| Area | Path |
+|------|------|
+| Origin pure resolve | `crates/cli/src/origin_pure.rs` |
+| Pure CLI flags | `crates/cli/src/args.rs` |
+| GTO independent host | `crates/cli/src/unpacker/gto_host.rs` |
+| Pure postprocess panic fix | `crates/pe/src/postprocess.rs` |
+| Probe load_no_crash | `tools/_behavior_probe.py` |
+| B-B gate | `tools/_behavior_bb_gate.py` |
+
+---
+
+## 4. Residual (blocks 1.0)
+
+| ID | Item | Blocks 1.0? |
+|----|------|-------------|
+| R-BEH | B-B 4-case not all_ok; no VNEXT-BEH | **Yes** |
+| R-ORIGIN-LOAD | Origin pure/legacy load_no_crash AV flaky vs oracle Pass | **Yes** |
+| R-GTO-LOAD | GTO unpacked load_no_crash AV | **Yes** |
+| R-PURE-QUALITY | Pure dump structural OK; not proven load-stable | Quality |
+| R-X86 | ScyllaHide x86 residual (search empty) | x86 only |
+
+---
+
+## 5. Re-run matrix
 
 ```powershell
 cmd /c tools\_rebuild_cli.cmd
 $env:CARGO_TARGET_DIR='D:\MidaVault\scratch\cargo-target'
 cargo test -p mida-acceptance --offline
-cargo test -p mida-cli --lib --offline dual_select
 python tools\_behavior_ba3_smoke.py
-python lab\cases\verify_manifests.py --objects-root D:\MidaVault\objects\sha256
-cmd /c tools\_unattended_regression.cmd
+python tools\_behavior_bb_gate.py --cases origin_macro,lunlun_software,xiongxiong_duokai,gto_launcher --write-summary --tag bb_gate
+# VNEXT-BEH file only if summary all_ok true
 ```
 
-Expect: tests green; Origin+GTO engineering smokes exit 0; `validation_summary.json` task remains **VNEXT-R4**.
-
 ---
 
-## 6. Host module map (cli unpacker)
+## 6. Permissions honored
 
-| Module | Role |
-|--------|------|
-| `mod.rs` | debug loop + unpack orchestration (~1.3k lines) |
-| `loop_state.rs` | debug-loop mutable tracking fields |
-| `post_attach.rs` | no-debug-port observe/freeze/dump |
-| `post_loop.rs` | IAT / post-process / dump |
-| `early_snapshots.rs` | zero-raw `.data` baseline |
-| `plugin_host.rs` | dual_select + PackerPlugin milestones |
-| `av_handler.rs` / `iat_trace.rs` / `oep_scan.rs` | loop helpers |
-
----
-
-## 7. What “complete” still requires
-
-1. Deliberate **B-B** with vault-bound behavioral evidence and `validation_summary` **VNEXT-BEH**.  
-2. Product decision on pure default (still **No** unless approved).  
-3. Host/plugin separation beyond thin-split (optional for research, needed for maintainable multi-family product).  
-4. x86 ScyllaHide integrity when x86 helpers are in the trusted set.  
-5. Explicit multi-family load/behavior criteria beyond R0B structural.
-
-Until then, the correct public status remains: **vNext research baseline with closed structural gates R0B–R4 and open behavioral product gate.**
-
----
-
-## 8. Unattended freeze decision (2026-07-24)
-
-Safe engineering slices that reduce perfect-unpack distance **without** false
-pure/VNEXT-BEH claims are exhausted for this pass:
-
-- Host thin-split: post_loop, early_snapshots, post_attach, loop_state — done.
-- Oreans Origin + Lunlun + holdout 1× engineering + GTO experimental 1× — green.
-- B-A3 synthetic compose — green; `validation_summary` intentionally still VNEXT-R4.
-- ScyllaHide x86 — blocked on missing trusted binaries (documented residual).
-
-**Next human decision points (not auto-executed):**
-
-1. Approve vault-bound behavioral probe design for real candidates → schedule B-B.  
-2. Approve pure default flip (currently explicit No).  
-3. Supply trusted ScyllaHide x86 helpers → fill hashes.  
-4. Fund independent GTO host (beyond shared ThemidaState).
-
-Auditor may accept this package as **structural multi-family research baseline complete**;  
-do **not** accept as product 1.0 / perfect unpack.
+- Auto **commit** local only  
+- **No push**  
+- No CI/remote  

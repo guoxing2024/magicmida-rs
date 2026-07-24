@@ -401,13 +401,25 @@ pub fn pack_section_layout(out_data: &mut Vec<u8>, pe: &PeHeader) -> Result<(), 
     }
 
     let old_size = out_data.len();
-    out_data.truncate(max_end);
+    // Pure-rebuild / compact layouts can report section ends past the buffer
+    // (PointerToRawData still virtualized) or leave max_end below the buffer.
+    // Never panic on arithmetic; only shrink when safe.
+    if max_end > 0 && max_end < old_size {
+        out_data.truncate(max_end);
+    } else if max_end > old_size {
+        tracing::warn!(
+            max_end,
+            old_size,
+            "pack_section_layout: max_end exceeds buffer; skipping truncate"
+        );
+    }
 
+    let new_size = out_data.len();
     info!(
         "Packed section layout: {} bytes -> {} bytes (saved {} bytes)",
         old_size,
-        max_end,
-        old_size - max_end
+        new_size,
+        old_size.saturating_sub(new_size)
     );
 
     Ok(())

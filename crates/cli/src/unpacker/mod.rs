@@ -29,6 +29,7 @@ mod dump;
 mod early_snapshots;
 mod generic;
 mod generic_gate;
+mod gto_host;
 mod helpers;
 mod iat_trace;
 mod loop_state;
@@ -194,10 +195,27 @@ pub fn unpack(
         }
     }
 
-    // ---- step 3: host PE layout probe (shared ThemidaPeInfo host state) ----
-    // Still Oreans-shaped layout extraction for both families — not a claim
-    // that GTO has an independent host pipeline (see VNEXT_R4 honesty note).
-    // Read entry-point bytes for virtualised OEP detection.
+    // ---- D4: independent GTO host (no ThemidaState) ----
+    if selected_family == "ahk_gto" {
+        log::log(
+            LogType::Info,
+            "Routing to independent GTO host (no ThemidaState / init_pe_details)",
+        );
+        return gto_host::run_gto_host(
+            input,
+            output,
+            do_data_sections,
+            shrink,
+            oep_policy,
+            container_restore,
+            profile,
+            pure_rebuild,
+            packer,
+        );
+    }
+
+    // ---- step 3: host PE layout probe (Oreans ThemidaPeInfo host state) ----
+    // Oreans path only from here. Read entry-point bytes for virtualised OEP.
     let ep_offset_val = pe.rva_to_offset(pe.entry_point).unwrap_or(0) as usize;
     let entry_bytes = fs::read(input).ok().and_then(|data| {
         data.get(ep_offset_val..ep_offset_val.saturating_add(8))

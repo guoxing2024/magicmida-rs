@@ -19,6 +19,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 windows = { workspace = true }
+sha2 = "0.10"
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }
