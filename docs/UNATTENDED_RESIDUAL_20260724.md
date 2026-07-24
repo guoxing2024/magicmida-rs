@@ -48,7 +48,41 @@
 
 **Load status (revised):** `u_gto_host_scan60` is StructuralPass + IAT-green (98%, OEP `0x70b0`, `wrapper_call_patch` 0/0). Quiet probe can Pass; serial often Fail then Pass×2 — **R-LOAD-FLAKE**. Under multi-case BB gate pressure, scan60 has been **12/12 Fail** while `r4c_gto` Passes on the same machine.
 
-**`.boot` delta vs r4c (not claim of missing stages):** independent-host stub_size **793016** (`.boot` `0xc2000`) vs r4c **821920** (`.boot` `0xc9000`, +28 KiB). Shared prologue ~568 B then cookie/heap addresses diverge — runtime heap snapshot difference, not IAT/OEP misalignment.
+**`.boot` delta vs r4c — deep dive (2026-07-24):**
+
+| Metric | scan60 (independent host) | r4c (Themida post-attach path) |
+|--------|---------------------------|--------------------------------|
+| stub_size / `.boot` raw | 793016 / `0xc2000` | 821920 / `0xc9000` |
+| containers | 1 × 72 B (same RVA `0x145710`) | 1 × 72 B |
+| heap_globals slots | **320** (cap) | **320** (cap) |
+| heap_globals `total_bytes` | **776960** | **805864** (**+28904 ≈ 28.2 KiB**) |
+| graph children (rva=0) | 287 / 426472 B | 288 / 461144 B (**+34672**) |
+| image roots (rva≠0) | 33 / 350488 B | 32 / 344720 B |
+| first-hop exhaust | added=64 interior=40 total=97 | added=64 interior=45 total=96 |
+| dangling pass | added=80 → total=320 | added=78 → total=320 |
+| profile / restore | AhkGtoExperimental + PostCrt pre-OEP | same |
+| IAT / OEP | 98% / `0x70b0` | 98% / `0x70b0` |
+
+**What the ~28 KiB is (not):** missing dump stage, different container detect, different IAT window, or independent host skipping `detect_heap_globals`. Both paths enter the same `dump_process` experimental stages; logs show identical xref surface (`xref_sites=7843 unique_slots=420`) and the same 320-slot hard cap.
+
+**What it is:** payload of `HeapGlobalSnapshot.content` assembled by `estimate_object_size` (RPM ladder `SIZE_PROBES` up to probe_cap) + multi-hop / dangling fills under `MAX_HEAP_GLOBAL_SLOTS=320`. Live heap bases differ every run (ASLR); readable committed span at each base differs → different admitted sizes → different expand frontier under the same slot budget.
+
+Largest single root delta:
+
+| RVA | Role | scan60 size | r4c size | Δ |
+|-----|------|-------------|----------|---|
+| `0x141bf0` | HOT_LARGE_TABLE (AHK global) | **0x4000** @ `0x3971ff0` | **0x8000** @ `0x94eb00` | **+16 KiB** on r4c |
+| `0x145480` | root | 0x180 | 0x2000 | +7.6 KiB r4c |
+| `0x148ca8` | HOT string machinery | 0xc0 | 0x1940 | +6.1 KiB r4c |
+| `0x1467b8` / `0x145700` / … | roots | larger on scan60 | smaller | partial offset |
+
+Code path: [`heap_global_snapshot.rs`](../crates/pe/src/dumper/heap_global_snapshot.rs) `estimate_object_size` / `can_read` — success of full-size `read_memory` decides size; no VirtualQuery region-size authority. Stub layout in [`container_bootstrap.rs`](../crates/pe/src/dumper/container_bootstrap.rs): code + meta + fixup + **payloads** (payload dominates).
+
+**Systematic?** Same *algorithm* and *caps* on both hosts; volume difference is **run-time heap layout + probe**, not a separate independent-host capture plan. Independent-host SuspendThread poll may bias timing of allocations slightly, but the measured gap is explained by root size estimates + graph-child multiset under the shared 320 cap — re-run of either host can move the same way.
+
+**Does this alone explain R-LOAD-FLAKE?** Unproven. Both dumps hit 320 slots and pass R0B; quiet load can Pass on the smaller stub. Flake remains quality residual; `.boot` delta is honesty about non-reproducible heap snapshot bytes, not a proven missing-stage bug.
+
+Research tool: `tools/_diff_boot_heap.py` (parses `.boot` meta/payloads).
 
 ### B-B reconfirm (scan60 pin era)
 
@@ -80,7 +114,7 @@ Gate pin order residual: prefer **`r4c_gto` first** for multi-case reliability; 
 |----|------|-------------|
 | R-LOAD-FLAKE | Origin/GTO intermittent 0xC0000005; worse under multi-case gate pressure | Quality / stability |
 | R-GTO-LATEST | Independent-host (`scan60`) StructuralPass + IAT 98% + quiet Pass, but batch probe often Fail; gate walks to `r4c_gto` | Quality |
-| R-GTO-BOOT | Independent-host `.boot` stub ~28 KiB smaller than r4c (heap cookie/ranges differ per run) | Quality; not proven root of flake alone |
+| R-GTO-BOOT | `.boot` ~28 KiB = heap_global payload under 320-slot cap; dominant `0x141bf0` 16 KiB RPM size estimate + graph children — same detector both hosts | Quality; not missing stage; not proven sole flake root |
 | R-PURE-LOGIC | Pure dump not proven equivalent to protected product logic | Yes for product 1.0 |
 | R-X86 | ScyllaHide x86 residual | x86 only |
 
