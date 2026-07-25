@@ -1509,6 +1509,30 @@ Bootstrap `+0xbd8` correct at WinMain; after `0x63f9` overwritten to `0x106644`.
   - `r26b_window_n3.json`, `r26b_load_final.json`
   - `unpack.stdout.txt`
 
+## Battlefield GTO-perfect-unpack Round 4 (2026-07-25) — root cause: wrong OEP (Themida virtualization)
+
+**Finding:** Protected 启动器.exe does NOT hit `0x5a10` or `0x70b0` (cdb confirmed — no breakpoint hits). The candidate stub jumps to `0x5a10` as "WinMain continue_ep", but the protected input's real startup path is in Themida's virtualization layer — `0x5a10` is an AHK internal function (likely the registration-prompt function that shows the machine-ID MessageBox).
+
+**Evidence:**
+- Protected input (clean run, no cdb): shows NewClassName login window directly, NO MessageBox.
+- Candidate (no-bypass + slab): hits `0x5a10` → straight-line to `0x5c5d` MessageBox (machine-ID). No conditional branch between them — `0x5c5d` is a fixed call in `0x5a10`'s body.
+- Protected input does NOT pass through `0x5a10` or `0x70b0` at all.
+
+**Meaning:** The "auth-state MessageBox" was a misdiagnosis. The real issue is that the dump's OEP scan found the wrong entry — `0x70b0` is a WindowProc (round-3 diagnosis), `0x5a10` is a registration-prompt function, not the real WinMain. The real WinMain is virtualized by Themida and not present as static code in the dump.
+
+**This is the fundamental Themida-virtualization wall:** static byte dump cannot recover a virtualized OEP. The candidate runs real AHK code (no bypass patches, no crash), but it runs the WRONG function (`0x5a10` = registration prompt) instead of the real WinMain.
+
+**Implication for perfect unpack:** gto_launcher perfect-unpack requires either (a) recovering the virtualized real OEP from Themida's VM (research-level reverse engineering, not a dump-completeness fix), or (b) a different dump strategy that captures the post-VM-decryption transfer point. Neither is a 2-round engineering fix.
+
+| layer | status |
+|-------|--------|
+| heap rebasing | **broken** (VirtualAlloc original-address remap works) |
+| stub runs, no crash | **yes** (round 3) |
+| real WinMain reached | **NO** — wrong OEP (0x5a10 is registration prompt, not WinMain) |
+| Themida virtualization | **unrecovered** — real OEP is in VM, not in static dump |
+
+**Non-claim:** gto_launcher perfect-unpack NOT achieved. Root cause is now precisely Themida OEP virtualization, not heap state or auth-state. The slab/VirtualAlloc mechanism is validated and reusable; the remaining wall is OEP recovery from the VM.
+
 ## Battlefield GTO-perfect-unpack Round 3 (2026-07-25) — stub runs, WinMain reached, product MessageBox shown
 
 **Fix:** Removed residual phase-2.5b Themida-section-scan code (was causing measurement/final stub layout mismatch → stub install failed → PE entry stayed at 0xfb800 → stub never ran → exit 0). After removal, stub installs correctly (stub_rva=0xecf000, "Installed pre-OEP container restoration bootstrap" logged).
@@ -1530,7 +1554,8 @@ Bootstrap `+0xbd8` correct at WinMain; after `0x63f9` overwritten to `0x106644`.
 
 **Non-claim:** gto_launcher perfect-unpack NOT achieved. But the stub + VirtualAlloc remap mechanism works; product code runs to WinMain without bypass patches. Remaining = auth-state completeness.
 
-**Evidence:** `D:\MidaVault\lab\evidence\gto_launcher27_slab_round1_20260725\`
+**Evidence:** `D:\MidaVault\lab\evidence\gto_launcher
+27_slab_round1_20260725\`
 
 ## Battlefield GTO-perfect-unpack Round 1 (2026-07-25) — slab rebase moves crash; layer 2 = Themida section pointers
 
