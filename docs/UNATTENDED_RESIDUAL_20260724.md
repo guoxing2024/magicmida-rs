@@ -1535,7 +1535,8 @@ Bootstrap `+0xbd8` correct at WinMain; after `0x63f9` overwritten to `0x106644`.
 
 **Non-claim:** gto_launcher perfect-unpack NOT achieved. Slab is real progress (moved crash, proved the rebase mechanism works). Layer 2 (Themida section scan) is the next step.
 
-**Evidence:** `D:\MidaVault\lab\evidence\gto_launcher27_slab_round1_20260725\` (gto_unpacked.exe, unpack.stdout.txt, slab_cdb2.log)
+**Evidence:** `D:\MidaVault\lab\evidence\gto_launcher
+27_slab_round1_20260725\` (gto_unpacked.exe, unpack.stdout.txt, slab_cdb2.log)
 
 ## Battlefield GTO-perfect-unpack Round 0 (2026-07-25) — root cause: heap rebasing wall
 
