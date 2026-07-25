@@ -1059,30 +1059,17 @@ pub fn dump_process(
         (Some(src), Some(dst)) if src != 0 && dst != 0 && src != dst => Some((src, dst)),
         _ => None,
     };
-    let output_entry_point = if stage_plan.install_heap_bootstrap {
-        import_builder
-            .as_ref()
-            .and_then(|builder| {
-                super::heap_bootstrap::install_heap_bootstrap(
-                    &mut pe,
-                    &mut dump_buf,
-                    builder,
-                    opts.entry_point,
-                    &containers,
-                    &heap_globals,
-                    heap_slab.as_ref(),
-                    opts.container_restore,
-                    cookie_rva,
-                    cookie_mirror,
-                    Some(debugger),
-                )
-            })
-            .unwrap_or(opts.entry_point)
-    } else {
-        opts.entry_point
-    };
+    // 5b2. Build import section BEFORE heap bootstrap so the stub can resolve
+    // helper imports (VirtualAlloc for heap-slab remap) from the built IAT.
+    // Both create_section_index calls append sections; order is safe.
+    // r27: ensure VirtualAlloc is imported BEFORE building the import section
+    // so the thunk gets an IAT slot assigned during section build.
+    if stage_plan.install_heap_bootstrap {
+        if let Some(builder) = import_builder.as_mut() {
+            builder.ensure_function("kernel32.dll", "VirtualAlloc");
+        }
+    }
 
-    // 5c. Build import section (uses original virtual addresses)
     let mut import_thunks: Vec<u64> = Vec::new();
     if let Some(ref builder) = import_builder {
         info!(
@@ -1098,6 +1085,39 @@ pub fn dump_process(
         );
         import_thunks = thunks;
     } else {
+        warn!("No import_builder - skipping import section creation");
+    }
+
+    let output_entry_point = if stage_plan.install_heap_bootstrap {
+        // Resolve VirtualAlloc IAT slot AFTER section build assigned addresses.
+        let virtual_alloc_iat = import_builder
+            .as_ref()
+            .and_then(|b| b.find_function_iat("VirtualAlloc"));
+        import_builder
+            .as_ref()
+            .and_then(|builder| {
+                super::heap_bootstrap::install_heap_bootstrap(
+                    &mut pe,
+                    &mut dump_buf,
+                    builder,
+                    opts.entry_point,
+                    &containers,
+                    &heap_globals,
+                    heap_slab.as_ref(),
+                    virtual_alloc_iat,
+                    opts.container_restore,
+                    cookie_rva,
+                    cookie_mirror,
+                    Some(debugger),
+                )
+            })
+            .unwrap_or(opts.entry_point)
+    } else {
+        opts.entry_point
+    };
+
+    // 5c. Import section already built in 5b2 (before heap bootstrap).
+    if import_builder.is_none() {
         warn!("No import_builder - skipping import section creation");
     }
 

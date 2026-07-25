@@ -99,6 +99,16 @@ impl ImportTableBuilder {
         &mut self.modules[idx]
     }
 
+    /// Find the IAT slot RVA for a function already in the table (read-only).
+    /// Used after `build_import_section_no_iat` assigned IAT addresses.
+    pub fn find_function_iat(&self, func: &str) -> Option<u32> {
+        self.modules
+            .iter()
+            .flat_map(|m| m.thunks.iter())
+            .find(|t| t.function_name.as_deref() == Some(func))
+            .map(|t| t.iat_address)
+    }
+
     /// Ensure a function exists in the import table under the given DLL.
     /// Returns the IAT slot RVA for the function (creating module + thunk
     /// if absent). Used by the heap-bootstrap stub to guarantee helper
@@ -141,8 +151,8 @@ impl ImportTableBuilder {
             self.modules[mi].thunks.push(crate::import_table::ImportThunk {
                 iat_address: iat,
                 function_name: Some(func.to_string()),
-                hint: 0,
                 ordinal: None,
+                is_64bit: self.is_64bit,
             });
             // Return 0 if we couldn't compute a real IAT (builder will reassign)
             if iat > 0 { Some(iat) } else { None }

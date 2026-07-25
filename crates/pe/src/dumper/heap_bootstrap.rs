@@ -38,6 +38,7 @@ pub(crate) fn install_heap_bootstrap(
     containers: &[ContainerSnapshot],
     heap_globals: &[HeapGlobalSnapshot],
     heap_slab: Option<&super::heap_global_snapshot::HeapSlab>,
+    virtual_alloc_iat_rva: Option<u32>,
     restore_mode: ContainerRestoreMode,
     // Cookie storage RVA captured from the late dump (before early overlay).
     cookie_rva: Option<u32>,
@@ -51,6 +52,10 @@ pub(crate) fn install_heap_bootstrap(
 
     let get_process_heap = find_import_rva(imports, "GetProcessHeap");
     let heap_alloc = find_import_rva(imports, "HeapAlloc");
+    // r27: ensure VirtualAlloc is imported (heap-slab original-address remap).
+    // The stub uses it to reserve the slab at its dump-time address so all
+    // intra-heap pointers are correct without rebase (zero false-positives).
+    let virtual_alloc = find_import_rva(imports, "VirtualAlloc");
     let heap_bootstrap = detect_heap_bootstrap(pe, dump_buf, imports);
     // Prefer pre-overlay cookie RVA; fall back to scanning current buffer.
     let cookie_rva = cookie_rva.or_else(|| find_security_cookie_rva(pe, dump_buf));
@@ -78,6 +83,7 @@ pub(crate) fn install_heap_bootstrap(
                     containers,
                     heap_globals,
                     heap_slab,
+                    virtual_alloc_iat_rva,
                     gph,
                     ha,
                     original_entry_point,
@@ -100,6 +106,7 @@ pub(crate) fn install_heap_bootstrap(
                     containers,
                     heap_globals,
                     heap_slab,
+                    virtual_alloc_iat_rva,
                     gph,
                     ha,
                     original_entry_point,

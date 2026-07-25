@@ -71,6 +71,7 @@ pub(crate) fn install_container_bootstrap(
     containers: &[ContainerSnapshot],
     heap_globals: &[HeapGlobalSnapshot],
     heap_slab: Option<&HeapSlab>,
+    virtual_alloc_iat_rva: Option<u32>,
     get_process_heap_iat_rva: u32,
     heap_alloc_iat_rva: u32,
     original_entry_point: u32,
@@ -84,6 +85,7 @@ pub(crate) fn install_container_bootstrap(
         containers,
         heap_globals,
         heap_slab,
+        virtual_alloc_iat_rva,
         get_process_heap_iat_rva,
         heap_alloc_iat_rva,
         Some(original_entry_point),
@@ -110,6 +112,7 @@ pub(crate) fn install_post_crt_container_restore(
     containers: &[ContainerSnapshot],
     heap_globals: &[HeapGlobalSnapshot],
     heap_slab: Option<&HeapSlab>,
+    virtual_alloc_iat_rva: Option<u32>,
     get_process_heap_iat_rva: u32,
     heap_alloc_iat_rva: u32,
     crt_entry_rva: u32,
@@ -145,6 +148,7 @@ pub(crate) fn install_post_crt_container_restore(
             containers,
             heap_globals,
             heap_slab,
+            virtual_alloc_iat_rva,
             get_process_heap_iat_rva,
             heap_alloc_iat_rva,
             continue_ep,
@@ -169,6 +173,7 @@ pub(crate) fn install_post_crt_container_restore(
                 containers,
                 heap_globals,
                 heap_slab,
+                virtual_alloc_iat_rva,
                 get_process_heap_iat_rva,
                 heap_alloc_iat_rva,
                 crt_entry_rva,
@@ -185,6 +190,7 @@ pub(crate) fn install_post_crt_container_restore(
         containers,
         heap_globals,
         heap_slab,
+        virtual_alloc_iat_rva,
         get_process_heap_iat_rva,
         heap_alloc_iat_rva,
         Some(continue_rva),
@@ -284,6 +290,7 @@ fn install_container_section(
     containers: &[ContainerSnapshot],
     heap_globals: &[HeapGlobalSnapshot],
     heap_slab: Option<&HeapSlab>,
+    virtual_alloc_iat_rva: Option<u32>,
     get_process_heap_iat_rva: u32,
     heap_alloc_iat_rva: u32,
     continue_entry_point: Option<u32>,
@@ -353,6 +360,7 @@ fn install_container_section(
         containers,
         heap_globals,
         heap_slab,
+        virtual_alloc_iat_rva,
         &scan_sections,
         None,
         image_base,
@@ -453,6 +461,7 @@ pub(crate) fn build_tls_bootstrap_stub(
         containers,
         &[],
         None, // heap_slab (TLS path not used for GTO)
+        None, // virtual_alloc (TLS path)
         &[], // scan_sections (TLS path)
         data_snapshot,
         image_base,
@@ -472,6 +481,7 @@ fn build_container_stub_internal(
     containers: &[ContainerSnapshot],
     heap_globals: &[HeapGlobalSnapshot],
     heap_slab: Option<&HeapSlab>,
+    virtual_alloc_iat_rva: Option<u32>,
     scan_sections: &[(u32, u32)],
     data_snapshot: Option<&super::data_snapshot::DataSectionSnapshot>,
     image_base: u64,
@@ -510,6 +520,7 @@ fn build_container_stub_internal(
         0, // fixup map offset (placeholder)
         range_count,
         slab_fixup_index,
+        virtual_alloc_iat_rva,
         slab_old_base,
         0, // slab_data_offset placeholder (measurement pass)
         0, // scan_sections_offset placeholder
@@ -562,6 +573,7 @@ fn build_container_stub_internal(
         fixup_map_offset as u32,
         range_count,
         slab_fixup_index,
+        virtual_alloc_iat_rva,
         slab_old_base,
         slab_data_offset,
         scan_sections_offset as u32,
@@ -707,6 +719,7 @@ fn build_stub_code(
     fixup_map_offset: u32,
     range_count: usize,
     slab_fixup_index: usize,
+    virtual_alloc_iat_rva: Option<u32>,
     slab_old_base: u64,
     slab_data_offset: usize,
     scan_sections_offset: u32,
@@ -1010,30 +1023,84 @@ fn build_stub_code(
         stub.extend_from_slice(&loop_disp.to_le_bytes());
     }
 
-    // ========== Phase 1c: Heap slab alloc + memcpy (interior rebase target) ==========
-    // The slab is the last fixup-map entry; rbx already points to it after 1b.
+    // ========== Phase 1c: Heap slab original-address remap (VirtualAlloc) ==========
+    // Reserve the slab at its dump-time address (old_base) so all intra-heap
+    // pointers are correct WITHOUT rebase (zero false-positives). If the
+    // address is unavailable, fall back to HeapAlloc (then phase-2.5 rebase
+    // handles interior pointers, but that path has false-positive risk).
+    // rbx points to the slab fixup-map entry (last entry) after phase 1b.
     if slab_old_base != 0 {
-        // rcx = heap (r15), rdx = 0 (flags), r8 = slab_size from [rbx+8]
-        stub.extend_from_slice(&[0x4c, 0x89, 0xf9]); // mov rcx, r15
-        stub.extend_from_slice(&[0x33, 0xd2]); // xor edx, edx
-        stub.extend_from_slice(&[0x44, 0x8b, 0x43, 0x08]); // mov r8d, [rbx+8] size
-        stub.extend_from_slice(&[0xff, 0x15]); // call [rip+heap_alloc_iat]
-        let call_next = stub_rva.checked_add(stub.len() as u32)?.checked_add(4)?;
-        stub.extend_from_slice(&relative_displacement(call_next, heap_alloc_iat_rva)?);
-        stub.extend_from_slice(&[0x49, 0x89, 0xc4]); // mov r12, rax (new slab base)
-        // Store new_begin in fixup map entry: mov [rbx+0x10], rax
-        stub.extend_from_slice(&[0x48, 0x89, 0x43, 0x10]); // mov [rbx+0x10], rax
-        // memcpy(new_base, stub+slab_data_offset, slab_size)
-        // rcx = rax (dst), rdx = src (lea rip), r8 = size
-        stub.extend_from_slice(&[0x48, 0x89, 0xc1]); // mov rcx, rax
-        stub.extend_from_slice(&[0x48, 0x8d, 0x15]); // lea rdx, [rip+disp]
-        let lea_next = stub_rva.checked_add(stub.len() as u32)?.checked_add(4)?;
-        let slab_src_rva = stub_rva.checked_add(slab_data_offset as u32)?;
-        stub.extend_from_slice(&relative_displacement(lea_next, slab_src_rva)?);
-        stub.extend_from_slice(&[0x44, 0x8b, 0x43, 0x08]); // mov r8d, [rbx+8] size
-        stub.push(0xe8);
-        memcpy_sites.push(stub.len());
-        stub.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        if let Some(va_iat) = virtual_alloc_iat_rva {
+            // VirtualAlloc(old_base, size, MEM_COMMIT|MEM_RESERVE=0x3000, PAGE_READWRITE=0x04)
+            // rcx = old_base (from [rbx]), rdx = size (from [rbx+8]), r8 = 0x3000, r9 = 0x04
+            stub.extend_from_slice(&[0x48, 0x8b, 0x0b]); // mov rcx, [rbx] (old_base)
+            stub.extend_from_slice(&[0x48, 0x8b, 0x53, 0x08]); // mov rdx, [rbx+8] (size)
+            stub.extend_from_slice(&[0x41, 0xb8, 0x00, 0x30, 0x00, 0x00]); // mov r8d, 0x3000
+            stub.extend_from_slice(&[0x41, 0xb9, 0x04, 0x00, 0x00, 0x00]); // mov r9d, 0x04
+            stub.extend_from_slice(&[0xff, 0x15]); // call [rip+virtual_alloc_iat]
+            let call_next = stub_rva.checked_add(stub.len() as u32)?.checked_add(4)?;
+            stub.extend_from_slice(&relative_displacement(call_next, va_iat)?);
+            // rax = new slab base (== old_base if reserve succeeded, else NULL)
+            stub.extend_from_slice(&[0x48, 0x85, 0xc0]); // test rax, rax
+            stub.push(0x74); // jz .fallback_heap_alloc
+            let jz_fallback = stub.len();
+            stub.push(0x00);
+            // Success: store new_begin, memcpy slab content
+            stub.extend_from_slice(&[0x48, 0x89, 0x43, 0x10]); // mov [rbx+0x10], rax
+            // memcpy(rax, stub+slab_data_offset, size): rcx=rax, rdx=src, r8=size
+            stub.extend_from_slice(&[0x48, 0x89, 0xc1]); // mov rcx, rax
+            stub.extend_from_slice(&[0x48, 0x8d, 0x15]); // lea rdx, [rip+disp]
+            let lea_next = stub_rva.checked_add(stub.len() as u32)?.checked_add(4)?;
+            let slab_src_rva = stub_rva.checked_add(slab_data_offset as u32)?;
+            stub.extend_from_slice(&relative_displacement(lea_next, slab_src_rva)?);
+            stub.extend_from_slice(&[0x44, 0x8b, 0x43, 0x08]); // mov r8d, [rbx+8] size
+            stub.push(0xe8);
+            memcpy_sites.push(stub.len());
+            stub.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+            // jmp .slab_done
+            stub.push(0xeb);
+            let jmp_done = stub.len();
+            stub.push(0x00);
+            // .fallback_heap_alloc: HeapAlloc(heap, 0, size)
+            let fallback = stub.len();
+            stub[jz_fallback] = u8::try_from(fallback.checked_sub(jz_fallback + 1)?).ok()?;
+            stub.extend_from_slice(&[0x4c, 0x89, 0xf9]); // mov rcx, r15 (heap)
+            stub.extend_from_slice(&[0x33, 0xd2]); // xor edx, edx
+            stub.extend_from_slice(&[0x44, 0x8b, 0x43, 0x08]); // mov r8d, [rbx+8] size
+            stub.extend_from_slice(&[0xff, 0x15]); // call [rip+heap_alloc_iat]
+            let call2_next = stub_rva.checked_add(stub.len() as u32)?.checked_add(4)?;
+            stub.extend_from_slice(&relative_displacement(call2_next, heap_alloc_iat_rva)?);
+            stub.extend_from_slice(&[0x48, 0x89, 0x43, 0x10]); // mov [rbx+0x10], rax
+            // memcpy(rax, stub+slab_data_offset, size)
+            stub.extend_from_slice(&[0x48, 0x89, 0xc1]); // mov rcx, rax
+            stub.extend_from_slice(&[0x48, 0x8d, 0x15]); // lea rdx, [rip+disp]
+            let lea2_next = stub_rva.checked_add(stub.len() as u32)?.checked_add(4)?;
+            stub.extend_from_slice(&relative_displacement(lea2_next, slab_src_rva)?);
+            stub.extend_from_slice(&[0x44, 0x8b, 0x43, 0x08]); // mov r8d, [rbx+8] size
+            stub.push(0xe8);
+            memcpy_sites.push(stub.len());
+            stub.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+            let slab_done = stub.len();
+            stub[jmp_done] = u8::try_from(slab_done.checked_sub(jmp_done + 1)?).ok()?;
+        } else {
+            // No VirtualAlloc import: fall back to HeapAlloc (rebase path).
+            stub.extend_from_slice(&[0x4c, 0x89, 0xf9]); // mov rcx, r15
+            stub.extend_from_slice(&[0x33, 0xd2]); // xor edx, edx
+            stub.extend_from_slice(&[0x44, 0x8b, 0x43, 0x08]); // mov r8d, [rbx+8] size
+            stub.extend_from_slice(&[0xff, 0x15]); // call [rip+heap_alloc_iat]
+            let call_next = stub_rva.checked_add(stub.len() as u32)?.checked_add(4)?;
+            stub.extend_from_slice(&relative_displacement(call_next, heap_alloc_iat_rva)?);
+            stub.extend_from_slice(&[0x48, 0x89, 0x43, 0x10]); // mov [rbx+0x10], rax
+            stub.extend_from_slice(&[0x48, 0x89, 0xc1]); // mov rcx, rax
+            stub.extend_from_slice(&[0x48, 0x8d, 0x15]); // lea rdx, [rip+disp]
+            let lea_next = stub_rva.checked_add(stub.len() as u32)?.checked_add(4)?;
+            let slab_src_rva = stub_rva.checked_add(slab_data_offset as u32)?;
+            stub.extend_from_slice(&relative_displacement(lea_next, slab_src_rva)?);
+            stub.extend_from_slice(&[0x44, 0x8b, 0x43, 0x08]); // mov r8d, [rbx+8] size
+            stub.push(0xe8);
+            memcpy_sites.push(stub.len());
+            stub.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        }
         // Advance rbx past the slab entry
         stub.extend_from_slice(&[0x48, 0x83, 0xc3, 0x18]); // add rbx, 24
     }
@@ -1080,68 +1147,14 @@ fn build_stub_code(
         stub.extend_from_slice(&[0x75, p2_back as u8]); // jnz .p2
     }
 
-    // ========== Phase 2.5: slab interior-pointer delta rebase ==========
-    // For every restored block, scan qwords; if slab_old < V < slab_end,
-    // replace V with V + (slab_new - slab_old). Strict-interior excludes
-    // V == slab_old (heap handle reference, already planted as GetProcessHeap).
-    if slab_old_base != 0 {
-        let map_rva = stub_rva.checked_add(fixup_map_offset)?;
-        let slab_entry_rva = map_rva.checked_add((slab_fixup_index * 24) as u32)?;
-        // r14 -> slab fixup map entry
-        stub.extend_from_slice(&[0x4c, 0x8d, 0x35]); // lea r14, [rip+disp]
-        let lea_next = stub_rva.checked_add(stub.len() as u32)?.checked_add(4)?;
-        stub.extend_from_slice(&relative_displacement(lea_next, slab_entry_rva)?);
-        // rbx = slab_old_base = [r14]
-        stub.extend_from_slice(&[0x49, 0x8b, 0x1e]); // mov rbx, [r14]
-        // r12d = slab_size = [r14+8]; r12 = old + size = slab_end
-        stub.extend_from_slice(&[0x45, 0x8b, 0x66, 0x08]); // mov r12d, [r14+8]
-        stub.extend_from_slice(&[0x49, 0x01, 0xdc]); // add r12, rbx
-        // rsi = slab_new = [r14+0x10]; delta = new - old
-        stub.extend_from_slice(&[0x49, 0x8b, 0x76, 0x10]); // mov rsi, [r14+0x10]
-        stub.extend_from_slice(&[0x48, 0x29, 0xde]); // sub rsi, rbx
-        // Re-init r14 = map base, r13d = range_count for block iteration
-        stub.extend_from_slice(&[0x4c, 0x8d, 0x35]); // lea r14, [rip+disp] (map base)
-        let lea3 = stub_rva.checked_add(stub.len() as u32)?.checked_add(4)?;
-        stub.extend_from_slice(&relative_displacement(lea3, map_rva)?);
-        stub.extend_from_slice(&[0x41, 0xbd]); // mov r13d, imm32
-        stub.extend_from_slice(&u32::try_from(range_count).ok()?.to_le_bytes());
+    // ========== Phase 2.5 + 2.5b DISABLED ==========
+    // Original-address VirtualAlloc remap maps the slab at its dump-time
+    // address, so all intra-heap pointers are already correct — no rebase
+    // needed. Phase-2.5 (captured-block interior rebase) and 2.5b (Themida
+    // section scan) were harmful: 2.5 had false-positives on non-pointer
+    // qwords; 2.5b rebased TLS directory data → exit 0. Both removed.
 
-        let p25_loop = stub.len();
-        stub.extend_from_slice(&[0x49, 0x8b, 0x4e, 0x10]); // mov rcx, [r14+0x10] new_begin
-        stub.extend_from_slice(&[0x48, 0x85, 0xc9]); // test rcx, rcx
-        stub.push(0x74); let p25_jz_null = stub.len(); stub.push(0x00);
-        stub.extend_from_slice(&[0x45, 0x8b, 0x46, 0x08]); // mov r8d, [r14+8] size
-        stub.extend_from_slice(&[0x45, 0x85, 0xc0]); // test r8d, r8d
-        stub.push(0x74); let p25_jz_size = stub.len(); stub.push(0x00);
-        stub.extend_from_slice(&[0x49, 0x01, 0xc8]); // add r8, rcx (r8 = block end)
-        let p25_scan = stub.len();
-        stub.extend_from_slice(&[0x49, 0x39, 0xc8]); // cmp r8, rcx
-        stub.extend_from_slice(&[0x76]); let p25_jbe = stub.len(); stub.push(0x00);
-        stub.extend_from_slice(&[0x48, 0x8b, 0x01]); // mov rax, [rcx] V
-        stub.extend_from_slice(&[0x48, 0x39, 0xd8]); // cmp rax, rbx (slab_old)
-        stub.extend_from_slice(&[0x76]); let p25_jbe2 = stub.len(); stub.push(0x00);
-        stub.extend_from_slice(&[0x4c, 0x39, 0xe0]); // cmp rax, r12 (slab_end)
-        stub.extend_from_slice(&[0x73]); let p25_jae = stub.len(); stub.push(0x00);
-        stub.extend_from_slice(&[0x48, 0x01, 0xf0]); // add rax, rsi (delta)
-        stub.extend_from_slice(&[0x48, 0x89, 0x01]); // mov [rcx], rax
-        let p25_adv = stub.len();
-        stub[p25_jbe2] = u8::try_from(p25_adv.checked_sub(p25_jbe2 + 1)?).ok()?;
-        stub[p25_jae] = u8::try_from(p25_adv.checked_sub(p25_jae + 1)?).ok()?;
-        stub.extend_from_slice(&[0x48, 0x83, 0xc1, 0x08]); // add rcx, 8
-        let p25_scan_back = i8::try_from(p25_scan as isize - (stub.len() as isize + 2)).ok()?;
-        stub.extend_from_slice(&[0xeb, p25_scan_back as u8]); // jmp .p25_scan
-        let p25_next = stub.len();
-        stub[p25_jz_null] = u8::try_from(p25_next.checked_sub(p25_jz_null + 1)?).ok()?;
-        stub[p25_jz_size] = u8::try_from(p25_next.checked_sub(p25_jz_size + 1)?).ok()?;
-        stub[p25_jbe] = u8::try_from(p25_next.checked_sub(p25_jbe + 1)?).ok()?;
-        stub.extend_from_slice(&[0x49, 0x83, 0xc6, 0x18]); // add r14, 24
-        stub.extend_from_slice(&[0x41, 0xff, 0xcd]); // dec r13d
-        let p25_end = stub.len();
-        let p25_back = i8::try_from(p25_loop as isize - (p25_end as isize + 2)).ok()?;
-        stub.extend_from_slice(&[0x75, p25_back as u8]); // jnz .p25_loop
-    }
-
-    // ========== Phase 2.5b: scan image sections for interior heap pointers ==========
+    // ========== Phase 2.5b: DISABLED (was harmful — rebased non-pointer data like TLS dir) ==========
     // Same delta rebase as 2.5 but scans Themida RW/RWX sections (.,\W etc.)
     // that are not captured heap blocks. rbx=slab_old, r12=slab_end, rsi=delta
     // are still set from phase-2.5 (only if slab_old_base != 0).
@@ -1568,6 +1581,7 @@ mod tests {
             &[container],
             &[],
             None,
+            None,
             &[],
             None,
             0x140000000,
@@ -1628,6 +1642,7 @@ mod tests {
             0x2108, // HeapAlloc IAT
             &[container],
             &[],
+            None,
             None,
             &[],
             None,
