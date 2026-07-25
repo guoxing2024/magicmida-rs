@@ -1147,69 +1147,6 @@ fn build_stub_code(
         stub.extend_from_slice(&[0x75, p2_back as u8]); // jnz .p2
     }
 
-    // ========== Phase 2.5 + 2.5b DISABLED ==========
-    // Original-address VirtualAlloc remap maps the slab at its dump-time
-    // address, so all intra-heap pointers are already correct — no rebase
-    // needed. Phase-2.5 (captured-block interior rebase) and 2.5b (Themida
-    // section scan) were harmful: 2.5 had false-positives on non-pointer
-    // qwords; 2.5b rebased TLS directory data → exit 0. Both removed.
-
-    // ========== Phase 2.5b: DISABLED (was harmful — rebased non-pointer data like TLS dir) ==========
-    // Same delta rebase as 2.5 but scans Themida RW/RWX sections (.,\W etc.)
-    // that are not captured heap blocks. rbx=slab_old, r12=slab_end, rsi=delta
-    // are still set from phase-2.5 (only if slab_old_base != 0).
-    if slab_old_base != 0 && scan_sections_count > 0 {
-        // r14 -> scan_sections table
-        let ss_rva = stub_rva.checked_add(scan_sections_offset)?;
-        stub.extend_from_slice(&[0x4c, 0x8d, 0x35]); // lea r14, [rip+disp]
-        let lea_next = stub_rva.checked_add(stub.len() as u32)?.checked_add(4)?;
-        stub.extend_from_slice(&relative_displacement(lea_next, ss_rva)?);
-        stub.extend_from_slice(&[0x41, 0xbd]); // mov r13d, scan_sections_count
-        stub.extend_from_slice(&scan_sections_count.to_le_bytes());
-
-        let p25b_loop = stub.len();
-        // eax = section rva (u32)
-        stub.extend_from_slice(&[0x41, 0x8b, 0x06]); // mov eax, [r14]
-        stub.extend_from_slice(&[0x85, 0xc0]); // test eax, eax
-        stub.push(0x74); let p25b_jz = stub.len(); stub.push(0x00);
-        // r8d = section size
-        stub.extend_from_slice(&[0x45, 0x8b, 0x46, 0x04]); // mov r8d, [r14+4]
-        stub.extend_from_slice(&[0x45, 0x85, 0xc0]); // test r8d, r8d
-        stub.push(0x74); let p25b_jz2 = stub.len(); stub.push(0x00);
-        // rcx = image_base + rva
-        stub.extend_from_slice(&[0x89, 0xc1]); // mov ecx, eax (zero-extend rva into rcx)
-        stub.extend_from_slice(&[0x48, 0xb8]); // mov rax, imm64 (image_base)
-        stub.extend_from_slice(&image_base.to_le_bytes());
-        stub.extend_from_slice(&[0x48, 0x01, 0xc1]); // add rcx, rax (rcx = image_base + rva)
-        // r8 = rcx + r8 (section end)
-        stub.extend_from_slice(&[0x49, 0x01, 0xc8]); // add r8, rcx
-        let p25b_scan = stub.len();
-        stub.extend_from_slice(&[0x49, 0x39, 0xc8]); // cmp r8, rcx
-        stub.extend_from_slice(&[0x76]); let p25b_jbe = stub.len(); stub.push(0x00);
-        stub.extend_from_slice(&[0x48, 0x8b, 0x01]); // mov rax, [rcx] V
-        stub.extend_from_slice(&[0x48, 0x39, 0xd8]); // cmp rax, rbx (slab_old)
-        stub.extend_from_slice(&[0x76]); let p25b_jbe2 = stub.len(); stub.push(0x00);
-        stub.extend_from_slice(&[0x4c, 0x39, 0xe0]); // cmp rax, r12 (slab_end)
-        stub.extend_from_slice(&[0x73]); let p25b_jae = stub.len(); stub.push(0x00);
-        stub.extend_from_slice(&[0x48, 0x01, 0xf0]); // add rax, rsi (delta)
-        stub.extend_from_slice(&[0x48, 0x89, 0x01]); // mov [rcx], rax
-        let p25b_adv = stub.len();
-        stub[p25b_jbe2] = u8::try_from(p25b_adv.checked_sub(p25b_jbe2 + 1)?).ok()?;
-        stub[p25b_jae] = u8::try_from(p25b_adv.checked_sub(p25b_jae + 1)?).ok()?;
-        stub.extend_from_slice(&[0x48, 0x83, 0xc1, 0x08]); // add rcx, 8
-        let p25b_back = i8::try_from(p25b_scan as isize - (stub.len() as isize + 2)).ok()?;
-        stub.extend_from_slice(&[0xeb, p25b_back as u8]); // jmp .p25b_scan
-        let p25b_next = stub.len();
-        stub[p25b_jz] = u8::try_from(p25b_next.checked_sub(p25b_jz + 1)?).ok()?;
-        stub[p25b_jz2] = u8::try_from(p25b_next.checked_sub(p25b_jz2 + 1)?).ok()?;
-        stub[p25b_jbe] = u8::try_from(p25b_next.checked_sub(p25b_jbe + 1)?).ok()?;
-        stub.extend_from_slice(&[0x49, 0x83, 0xc6, 0x08]); // add r14, 8
-        stub.extend_from_slice(&[0x41, 0xff, 0xcd]); // dec r13d
-        let p25b_end = stub.len();
-        let p25b_loop_back = i8::try_from(p25b_loop as isize - (p25b_end as isize + 2)).ok()?;
-        stub.extend_from_slice(&[0x75, p25b_loop_back as u8]); // jnz .p25b_loop
-    }
-
     // Jump over helpers to epilogue (near jmp — helpers exceed short-jmp range).
     stub.push(0xe9);
     let jmp_over_helpers_offset = stub.len();

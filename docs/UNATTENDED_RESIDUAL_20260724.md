@@ -1509,6 +1509,29 @@ Bootstrap `+0xbd8` correct at WinMain; after `0x63f9` overwritten to `0x106644`.
   - `r26b_window_n3.json`, `r26b_load_final.json`
   - `unpack.stdout.txt`
 
+## Battlefield GTO-perfect-unpack Round 3 (2026-07-25) — stub runs, WinMain reached, product MessageBox shown
+
+**Fix:** Removed residual phase-2.5b Themida-section-scan code (was causing measurement/final stub layout mismatch → stub install failed → PE entry stayed at 0xfb800 → stub never ran → exit 0). After removal, stub installs correctly (stub_rva=0xecf000, "Installed pre-OEP container restoration bootstrap" logged).
+
+**Result (no-bypass + slab + VirtualAlloc original-address remap):**
+- cdb breakpoints: **STUB_HIT (0xecf000) → WINMAIN (0x5a10) → MSGBOX (0x5c5d)** all hit.
+- Process **alive**, shows `#32770` MessageBox (dismissed).
+- **No crash** (heap-rebase wall broken via VirtualAlloc original-address remap).
+
+**Meaning:** The stub now runs, restores heap globals + slab at original address, transfers to WinMain. The product reaches its authorization MessageBox (machine-ID `E4847ED0...`). This is the **real product code path** running — NOT bypass patches (all 5 disabled). The MessageBox is a product authorization gate, not a crash.
+
+**Remaining gap vs protected input:** Protected 启动器.exe skips the MessageBox and goes straight to NewClassName login window. The no-bypass candidate hits the authorization gate instead. This suggests the heap/script state is still slightly incomplete — the product's auth check fails where the protected input's auth state (already initialized) passes. This is a runtime-state completeness layer beyond heap rebasing.
+
+| phase | stub runs? | WinMain? | result |
+|-------|-----------|----------|--------|
+| Round 0 (no slab) | yes | no | crash 0x846898 |
+| Round 1-2 (slab, bad layout) | **no** (layout mismatch) | no | exit 0 |
+| Round 3 (slab, fixed) | **yes** | **yes** | MessageBox (auth gate), alive |
+
+**Non-claim:** gto_launcher perfect-unpack NOT achieved. But the stub + VirtualAlloc remap mechanism works; product code runs to WinMain without bypass patches. Remaining = auth-state completeness.
+
+**Evidence:** `D:\MidaVault\lab\evidence\gto_launcher27_slab_round1_20260725\`
+
 ## Battlefield GTO-perfect-unpack Round 1 (2026-07-25) — slab rebase moves crash; layer 2 = Themida section pointers
 
 **Change:** Implemented heap slab capture (`capture_heap_slab`) + stub phase-1c (HeapAlloc slab + memcpy) + phase-2.5 (range-interior delta rebase over ALL captured blocks). Strict-interior rule: `old < V < old+N` (excludes heap handle). Env `MIDA_GTO_NO_BYPASS=1` still disables all 5 bypass patches.
