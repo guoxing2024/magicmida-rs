@@ -1509,6 +1509,35 @@ Bootstrap `+0xbd8` correct at WinMain; after `0x63f9` overwritten to `0x106644`.
   - `r26b_window_n3.json`, `r26b_load_final.json`
   - `unpack.stdout.txt`
 
+## Battlefield GTO-perfect-unpack Round 5 (2026-07-25) — Themida VM owns execution; .text is data
+
+**Experiments:**
+1. Protected input `.text@0x5a10` bytes: `4986494d84a0...` (encrypted). Candidate `.text@0x5a10`: `48895c2410...` (decrypted plaintext — correct WinMain prologue). **Dump correctly decrypted .text.**
+2. `0x5a10` is the real WinMain — only caller is `0xd9261` (CRT `_initterm` call site). Confirmed by call-graph scan.
+3. `0x5a10` → `0x5c5d` (MessageBox) is straight-line (zero conditional branches) — MessageBox is WinMain's fixed behavior.
+4. cdb breakpoints on `0x5a10`, `0xd9261`, `0x65d1`, `0x5c5d` on protected input: **NONE hit**. Protected input never executes these .text addresses.
+5. Protected input PE entry `0xfb800`: `adc [rsp+0x38],ecx; movsd...` — Themida VM bytecode, not real x64 code.
+
+**Conclusion:** Themida VM at `0xfb800` owns execution. It decrypts `.text` (so the dump captures plaintext), but **never transfers control to .text**. The real product logic runs inside the Themida VM interpreter (in `.boot`/`.KI3`), not in the decrypted `.text`. The plaintext `.text` is effectively **data** (decrypted but not executed) from the VM's perspective.
+
+**This is the fundamental Themida-virtualization wall:**
+- `.text` is correctly decrypted in the dump (plaintext, correct code).
+- But the protected product never executes `.text` — it runs in the VM.
+- The candidate stub jumps to `.text@0x5a10` (WinMain), which runs the **real plaintext code** — but that code expects VM-managed state (initialized by the VM's own init sequence) that the dump didn't capture.
+- Result: candidate runs real WinMain code → hits MessageBox (machine-ID) → because the VM's auth/license init never ran.
+
+**Why protected input shows NewClassName (no MessageBox):** The VM runs its own init sequence (auth check, script load, window creation) before/instead of jumping to `.text`. The dump captured the `.text` plaintext but not the VM's runtime state.
+
+**Implication:** Perfect unpack of 启动器 requires either:
+- (a) Devirtualizing the Themida VM to recover the real init sequence (research-level; the VM bytecode at `.boot`/`.KI3` must be reverse-engineered).
+- (b) A different dump strategy that runs the VM to completion then captures the post-VM state (but the VM never exits to .text, so there's no "post-VM" point).
+
+Neither is achievable via static byte dump + stub restore. The slab/VirtualAlloc heap-rebase mechanism is validated and reusable, but the wall is now **OEP virtualization**, not heap state.
+
+**Final honest status:**
+- 时光一键宏.exe: ✅ perfect unpack achieved.
+- 启动器.exe: ❌ blocked by Themida VM virtualization. `.text` is plaintext but never executed by the protected product; the candidate runs `.text` but lacks VM-managed runtime state.
+
 ## Battlefield GTO-perfect-unpack Round 4 (2026-07-25) — root cause: wrong OEP (Themida virtualization)
 
 **Finding:** Protected 启动器.exe does NOT hit `0x5a10` or `0x70b0` (cdb confirmed — no breakpoint hits). The candidate stub jumps to `0x5a10` as "WinMain continue_ep", but the protected input's real startup path is in Themida's virtualization layer — `0x5a10` is an AHK internal function (likely the registration-prompt function that shows the machine-ID MessageBox).

@@ -258,6 +258,7 @@ pub(super) fn run_gto_host(
         .map_err(|e| anyhow!("GTO host thread_handle: {e}"))?;
     // Always dump via .text scan after settle (r4c green); live RIP freeze disabled.
     let frozen_rip: Option<usize> = None;
+    let mut observed_text_rips: Vec<usize> = Vec::new();
     let mut iat_resolved_at: Option<std::time::Instant> = None;
     let mut ui_seen_at: Option<std::time::Instant> = None;
     let mut loop_count = 0u32;
@@ -388,10 +389,26 @@ pub(super) fn run_gto_host(
                     .find(|(s, e, _)| rip >= *s && rip < *e)
                     .map(|(_, _, n)| n.as_str());
                 if let Some(sec_name) = in_watch {
-                    // Do NOT freeze on live RIP in .text/.KI3/.boot.
-                    // Green r4c never captured RIP; it waited ~60s then used
-                    // .text byte-scan (OEP 0x70b0). Early .text hits (e.g.
-                    // 0xdacc9 at +643ms) produce larger stubs that still AV.
+                    // r27 round 5: record .text RIPs to find the real OEP.
+                    // The .text byte-scan finds WindowProc (0x70b0), not WinMain.
+                    // Capture every distinct .text RIP so we can pick the real
+                    // WinMain (the one that calls RegisterClass/CreateWindow).
+                    if sec_name == ".text" {
+                        let rva = rip - image_base_usize;
+                        if !observed_text_rips.contains(&rva) {
+                            observed_text_rips.push(rva);
+                            if observed_text_rips.len() <= 40 {
+                                log::log(
+                                    LogType::Info,
+                                    &format!(
+                                        "GTO host: .text RIP #{n} at {rip:#x} (rva {rva:#x}); iat_ok={}",
+                                        n = observed_text_rips.len(),
+                                        iat_resolved_at.is_some()
+                                    ),
+                                );
+                            }
+                        }
+                    }
                     if loop_count % 50 == 1 {
                         log::log(
                             LogType::Info,
