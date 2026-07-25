@@ -102,6 +102,8 @@ fn parse_capture_policy_value(v: &Value) -> Result<DumpCapturePolicy, String> {
             gscript_first_hop_probe,
             hot_expand_seed_rvas: hot_expand_seed_rvas.clone(),
             cs_reinit_rvas: cs_reinit_rvas.clone(),
+            cookie_mirror_src_rva: None,
+            cookie_mirror_dst_rva: None,
         }
     } else {
         match preset {

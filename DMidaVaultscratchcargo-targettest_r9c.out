@@ -1,0 +1,610 @@
+=== capture_policy ===
+warning: unused import: `super::*`
+   --> crates\pe\src\dumper\global_vars.rs:192:9
+    |
+192 |     use super::*;
+    |         ^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> crates\pe\src\byte_map.rs:311:9
+    |
+311 |     let mut relocs = if opts.rebind_relocations {
+    |         ----^^^^^^
+    |         |
+    |         help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `functions_rva_offset`
+   --> crates\pe\src\dll_exports.rs:134:9
+    |
+134 |     let functions_rva_offset = export_file_offset + 28;
+    |         ^^^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_functions_rva_offset`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable `total_funcs` is assigned to, but never used
+  --> crates\pe\src\dumper\import_section.rs:67:9
+   |
+67 |     let mut total_funcs = 0;
+   |         ^^^^^^^^^^^^^^^
+   |
+   = note: consider using `_total_funcs` instead
+
+warning: value assigned to `total_funcs` is never read
+  --> crates\pe\src\dumper\import_section.rs:95:13
+   |
+95 |             total_funcs += 1;
+   |             ^^^^^^^^^^^^^^^^
+   |
+   = help: maybe it is overwritten before being read?
+   = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `global_vars`
+  --> crates\pe\src\dumper\tls_bootstrap.rs:67:5
+   |
+67 |     global_vars: &[super::global_vars::GlobalVarSnapshot],
+   |     ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_global_vars`
+
+warning: struct `GlobalVarSnapshot` is never constructed
+  --> crates\pe\src\dumper\container_snapshot.rs:52:12
+   |
+52 | pub struct GlobalVarSnapshot {
+   |            ^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `is_process_local_absolute_pointer` is never used
+   --> crates\pe\src\dumper\data_reinit.rs:242:4
+    |
+242 | fn is_process_local_absolute_pointer(value: u64, image_base: u64, image_end: u64) -> bool {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `skip_regions` is never read
+  --> crates\pe\src\dumper\data_snapshot.rs:38:9
+   |
+30 | pub struct DataSectionSnapshot {
+   |            ------------------- field in this struct
+...
+38 |     pub skip_regions: Vec<SkipRegion>,
+   |         ^^^^^^^^^^^^
+   |
+   = note: `DataSectionSnapshot` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: field `offset` is never read
+  --> crates\pe\src\dumper\data_snapshot.rs:45:9
+   |
+43 | pub struct SkipRegion {
+   |            ---------- field in this struct
+44 |     /// Offset from .data section start
+45 |     pub offset: u32,
+   |         ^^^^^^
+   |
+   = note: `SkipRegion` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: function `capture_data_section` is never used
+  --> crates\pe\src\dumper\data_snapshot.rs:55:8
+   |
+55 | pub fn capture_data_section(
+   |        ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `build_data_restore_code` is never used
+   --> crates\pe\src\dumper\data_snapshot.rs:158:8
+    |
+158 | pub fn build_data_restore_code(
+    |        ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `GlobalVarSnapshot` is never constructed
+  --> crates\pe\src\dumper\global_vars.rs:15:12
+   |
+15 | pub struct GlobalVarSnapshot {
+   |            ^^^^^^^^^^^^^^^^^
+
+warning: function `detect_critical_vars_from_oep` is never used
+  --> crates\pe\src\dumper\global_vars.rs:29:8
+   |
+29 | pub fn detect_critical_vars_from_oep(
+   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `detect_global_vars` is never used
+   --> crates\pe\src\dumper\global_vars.rs:125:8
+    |
+125 | pub fn detect_global_vars(
+    |        ^^^^^^^^^^^^^^^^^^
+
+warning: function `find_security_cookie_rva_public` is never used
+   --> crates\pe\src\dumper\heap_bootstrap.rs:179:15
+    |
+179 | pub(crate) fn find_security_cookie_rva_public(pe: &PeHeader, dump_buf: &[u8]) -> Option<u32> {
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `find_security_cookie_site_public` is never used
+   --> crates\pe\src\dumper\heap_bootstrap.rs:186:15
+    |
+186 | pub(crate) fn find_security_cookie_site_public(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `sanitize_refcounted_string_shell` is never used
+    --> crates\pe\src\dumper\heap_global_snapshot.rs:1650:4
+     |
+1650 | fn sanitize_refcounted_string_shell(content: &mut Vec<u8>) -> bool {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `MAX_SECTION_READ_BYTES` is never used
+  --> crates\pe\src\dumper\helpers.rs:24:18
+   |
+24 | pub(crate) const MAX_SECTION_READ_BYTES: usize = 64 * 1024 * 1024;
+   |                  ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `IMAGE_SCN_CNT_INITIALIZED_DATA` is never used
+  --> crates\pe\src\dumper\tls_bootstrap.rs:46:7
+   |
+46 | const IMAGE_SCN_CNT_INITIALIZED_DATA: u32 = 0x0000_0040;
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `IMAGE_SCN_MEM_READ` is never used
+  --> crates\pe\src\dumper\tls_bootstrap.rs:47:7
+   |
+47 | const IMAGE_SCN_MEM_READ: u32 = 0x4000_0000;
+   |       ^^^^^^^^^^^^^^^^^^
+
+warning: constant `IMAGE_SCN_MEM_WRITE` is never used
+  --> crates\pe\src\dumper\tls_bootstrap.rs:48:7
+   |
+48 | const IMAGE_SCN_MEM_WRITE: u32 = 0x8000_0000;
+   |       ^^^^^^^^^^^^^^^^^^^
+
+warning: constant `IMAGE_SCN_CNT_CODE` is never used
+  --> crates\pe\src\dumper\tls_bootstrap.rs:50:7
+   |
+50 | const IMAGE_SCN_CNT_CODE: u32 = 0x0000_0020;
+   |       ^^^^^^^^^^^^^^^^^^
+
+warning: constant `IMAGE_SCN_MEM_EXECUTE` is never used
+  --> crates\pe\src\dumper\tls_bootstrap.rs:51:7
+   |
+51 | const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
+   |       ^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `TLS_INDEX_SIZE` is never used
+  --> crates\pe\src\dumper\tls_bootstrap.rs:54:7
+   |
+54 | const TLS_INDEX_SIZE: usize = 4;
+   |       ^^^^^^^^^^^^^^
+
+warning: constant `TLS_CALLBACK_ARRAY_SIZE` is never used
+  --> crates\pe\src\dumper\tls_bootstrap.rs:55:7
+   |
+55 | const TLS_CALLBACK_ARRAY_SIZE: usize = 16; // 1 callback + NULL terminator
+   |       ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `install_tls_callback_bootstrap` is never used
+  --> crates\pe\src\dumper\tls_bootstrap.rs:64:15
+   |
+64 | pub(crate) fn install_tls_callback_bootstrap(
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `mida-pe` (lib test) generated 27 warnings (run `cargo fix --lib -p mida-pe --tests` to apply 4 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.08s
+     Running unittests src\lib.rs (D:\MidaVault\scratch\cargo-target\debug\deps\mida_pe-92e974bffc160edf.exe)
+
+running 8 tests
+test dumper::capture_policy::tests::base_roots_override_plugin_preset ... ok
+test dumper::capture_policy::tests::empty_plus_ahk_profile_resolves_defaults ... ok
+test dumper::capture_policy::tests::custom_hot_roots_preserved ... ok
+test dumper::capture_policy::tests::empty_plus_oreans_stays_empty ... ok
+test dumper::capture_policy::tests::partial_ahk_hot_roots_fill_cookie_mirror ... ok
+test dumper::capture_policy::tests::plugin_hint_explicit_roots_win ... ok
+test dumper::capture_policy::tests::plugin_hint_prefer_defaults_maps_preset ... ok
+test dumper::capture_policy::tests::resolve_with_plugin_hint_none_matches_profile ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 165 filtered out; finished in 0.00s
+
+=== iat_gap ===
+warning: unused import: `super::*`
+   --> crates\pe\src\dumper\global_vars.rs:192:9
+    |
+192 |     use super::*;
+    |         ^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> crates\pe\src\byte_map.rs:311:9
+    |
+311 |     let mut relocs = if opts.rebind_relocations {
+    |         ----^^^^^^
+    |         |
+    |         help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `functions_rva_offset`
+   --> crates\pe\src\dll_exports.rs:134:9
+    |
+134 |     let functions_rva_offset = export_file_offset + 28;
+    |         ^^^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_functions_rva_offset`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable `total_funcs` is assigned to, but never used
+  --> crates\pe\src\dumper\import_section.rs:67:9
+   |
+67 |     let mut total_funcs = 0;
+   |         ^^^^^^^^^^^^^^^
+   |
+   = note: consider using `_total_funcs` instead
+
+warning: value assigned to `total_funcs` is never read
+  --> crates\pe\src\dumper\import_section.rs:95:13
+   |
+95 |             total_funcs += 1;
+   |             ^^^^^^^^^^^^^^^^
+   |
+   = help: maybe it is overwritten before being read?
+   = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `global_vars`
+  --> crates\pe\src\dumper\tls_bootstrap.rs:67:5
+   |
+67 |     global_vars: &[super::global_vars::GlobalVarSnapshot],
+   |     ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_global_vars`
+
+warning: struct `GlobalVarSnapshot` is never constructed
+  --> crates\pe\src\dumper\container_snapshot.rs:52:12
+   |
+52 | pub struct GlobalVarSnapshot {
+   |            ^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `is_process_local_absolute_pointer` is never used
+   --> crates\pe\src\dumper\data_reinit.rs:242:4
+    |
+242 | fn is_process_local_absolute_pointer(value: u64, image_base: u64, image_end: u64) -> bool {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `skip_regions` is never read
+  --> crates\pe\src\dumper\data_snapshot.rs:38:9
+   |
+30 | pub struct DataSectionSnapshot {
+   |            ------------------- field in this struct
+...
+38 |     pub skip_regions: Vec<SkipRegion>,
+   |         ^^^^^^^^^^^^
+   |
+   = note: `DataSectionSnapshot` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: field `offset` is never read
+  --> crates\pe\src\dumper\data_snapshot.rs:45:9
+   |
+43 | pub struct SkipRegion {
+   |            ---------- field in this struct
+44 |     /// Offset from .data section start
+45 |     pub offset: u32,
+   |         ^^^^^^
+   |
+   = note: `SkipRegion` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: function `capture_data_section` is never used
+  --> crates\pe\src\dumper\data_snapshot.rs:55:8
+   |
+55 | pub fn capture_data_section(
+   |        ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `build_data_restore_code` is never used
+   --> crates\pe\src\dumper\data_snapshot.rs:158:8
+    |
+158 | pub fn build_data_restore_code(
+    |        ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `GlobalVarSnapshot` is never constructed
+  --> crates\pe\src\dumper\global_vars.rs:15:12
+   |
+15 | pub struct GlobalVarSnapshot {
+   |            ^^^^^^^^^^^^^^^^^
+
+warning: function `detect_critical_vars_from_oep` is never used
+  --> crates\pe\src\dumper\global_vars.rs:29:8
+   |
+29 | pub fn detect_critical_vars_from_oep(
+   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `detect_global_vars` is never used
+   --> crates\pe\src\dumper\global_vars.rs:125:8
+    |
+125 | pub fn detect_global_vars(
+    |        ^^^^^^^^^^^^^^^^^^
+
+warning: function `find_security_cookie_rva_public` is never used
+   --> crates\pe\src\dumper\heap_bootstrap.rs:179:15
+    |
+179 | pub(crate) fn find_security_cookie_rva_public(pe: &PeHeader, dump_buf: &[u8]) -> Option<u32> {
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `find_security_cookie_site_public` is never used
+   --> crates\pe\src\dumper\heap_bootstrap.rs:186:15
+    |
+186 | pub(crate) fn find_security_cookie_site_public(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `sanitize_refcounted_string_shell` is never used
+    --> crates\pe\src\dumper\heap_global_snapshot.rs:1650:4
+     |
+1650 | fn sanitize_refcounted_string_shell(content: &mut Vec<u8>) -> bool {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `MAX_SECTION_READ_BYTES` is never used
+  --> crates\pe\src\dumper\helpers.rs:24:18
+   |
+24 | pub(crate) const MAX_SECTION_READ_BYTES: usize = 64 * 1024 * 1024;
+   |                  ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `IMAGE_SCN_CNT_INITIALIZED_DATA` is never used
+  --> crates\pe\src\dumper\tls_bootstrap.rs:46:7
+   |
+46 | const IMAGE_SCN_CNT_INITIALIZED_DATA: u32 = 0x0000_0040;
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `IMAGE_SCN_MEM_READ` is never used
+  --> crates\pe\src\dumper\tls_bootstrap.rs:47:7
+   |
+47 | const IMAGE_SCN_MEM_READ: u32 = 0x4000_0000;
+   |       ^^^^^^^^^^^^^^^^^^
+
+warning: constant `IMAGE_SCN_MEM_WRITE` is never used
+  --> crates\pe\src\dumper\tls_bootstrap.rs:48:7
+   |
+48 | const IMAGE_SCN_MEM_WRITE: u32 = 0x8000_0000;
+   |       ^^^^^^^^^^^^^^^^^^^
+
+warning: constant `IMAGE_SCN_CNT_CODE` is never used
+  --> crates\pe\src\dumper\tls_bootstrap.rs:50:7
+   |
+50 | const IMAGE_SCN_CNT_CODE: u32 = 0x0000_0020;
+   |       ^^^^^^^^^^^^^^^^^^
+
+warning: constant `IMAGE_SCN_MEM_EXECUTE` is never used
+  --> crates\pe\src\dumper\tls_bootstrap.rs:51:7
+   |
+51 | const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
+   |       ^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `TLS_INDEX_SIZE` is never used
+  --> crates\pe\src\dumper\tls_bootstrap.rs:54:7
+   |
+54 | const TLS_INDEX_SIZE: usize = 4;
+   |       ^^^^^^^^^^^^^^
+
+warning: constant `TLS_CALLBACK_ARRAY_SIZE` is never used
+  --> crates\pe\src\dumper\tls_bootstrap.rs:55:7
+   |
+55 | const TLS_CALLBACK_ARRAY_SIZE: usize = 16; // 1 callback + NULL terminator
+   |       ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `install_tls_callback_bootstrap` is never used
+  --> crates\pe\src\dumper\tls_bootstrap.rs:64:15
+   |
+64 | pub(crate) fn install_tls_callback_bootstrap(
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `mida-pe` (lib test) generated 27 warnings (run `cargo fix --lib -p mida-pe --tests` to apply 4 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.07s
+     Running unittests src\lib.rs (D:\MidaVault\scratch\cargo-target\debug\deps\mida_pe-92e974bffc160edf.exe)
+
+running 6 tests
+test dumper::iat_gap_retarget::tests::localfree_shape ... ok
+test dumper::iat_gap_retarget::tests::msgbox_utype_imm_detected ... ok
+test dumper::iat_gap_retarget::tests::msgbox_utype_lea_r14 ... ok
+test dumper::iat_gap_retarget::tests::classify_prefers_msgbox_over_gap ... ok
+test dumper::iat_gap_retarget::tests::retarget_patches_msgbox_call_site ... ok
+test dumper::iat_gap_retarget::tests::sendmessage_wm_gettextlength ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 167 filtered out; finished in 0.00s
+
+=== container_bootstrap ===
+warning: unused import: `super::*`
+   --> crates\pe\src\dumper\global_vars.rs:192:9
+    |
+192 |     use super::*;
+    |         ^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> crates\pe\src\byte_map.rs:311:9
+    |
+311 |     let mut relocs = if opts.rebind_relocations {
+    |         ----^^^^^^
+    |         |
+    |         help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `functions_rva_offset`
+   --> crates\pe\src\dll_exports.rs:134:9
+    |
+134 |     let functions_rva_offset = export_file_offset + 28;
+    |         ^^^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_functions_rva_offset`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable `total_funcs` is assigned to, but never used
+  --> crates\pe\src\dumper\import_section.rs:67:9
+   |
+67 |     let mut total_funcs = 0;
+   |         ^^^^^^^^^^^^^^^
+   |
+   = note: consider using `_total_funcs` instead
+
+warning: value assigned to `total_funcs` is never read
+  --> crates\pe\src\dumper\import_section.rs:95:13
+   |
+95 |             total_funcs += 1;
+   |             ^^^^^^^^^^^^^^^^
+   |
+   = help: maybe it is overwritten before being read?
+   = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `global_vars`
+  --> crates\pe\src\dumper\tls_bootstrap.rs:67:5
+   |
+67 |     global_vars: &[super::global_vars::GlobalVarSnapshot],
+   |     ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_global_vars`
+
+warning: struct `GlobalVarSnapshot` is never constructed
+  --> crates\pe\src\dumper\container_snapshot.rs:52:12
+   |
+52 | pub struct GlobalVarSnapshot {
+   |            ^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `is_process_local_absolute_pointer` is never used
+   --> crates\pe\src\dumper\data_reinit.rs:242:4
+    |
+242 | fn is_process_local_absolute_pointer(value: u64, image_base: u64, image_end: u64) -> bool {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `skip_regions` is never read
+  --> crates\pe\src\dumper\data_snapshot.rs:38:9
+   |
+30 | pub struct DataSectionSnapshot {
+   |            ------------------- field in this struct
+...
+38 |     pub skip_regions: Vec<SkipRegion>,
+   |         ^^^^^^^^^^^^
+   |
+   = note: `DataSectionSnapshot` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: field `offset` is never read
+  --> crates\pe\src\dumper\data_snapshot.rs:45:9
+   |
+43 | pub struct SkipRegion {
+   |            ---------- field in this struct
+44 |     /// Offset from .data section start
+45 |     pub offset: u32,
+   |         ^^^^^^
+   |
+   = note: `SkipRegion` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: function `capture_data_section` is never used
+  --> crates\pe\src\dumper\data_snapshot.rs:55:8
+   |
+55 | pub fn capture_data_section(
+   |        ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `build_data_restore_code` is never used
+   --> crates\pe\src\dumper\data_snapshot.rs:158:8
+    |
+158 | pub fn build_data_restore_code(
+    |        ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `GlobalVarSnapshot` is never constructed
+  --> crates\pe\src\dumper\global_vars.rs:15:12
+   |
+15 | pub struct GlobalVarSnapshot {
+   |            ^^^^^^^^^^^^^^^^^
+
+warning: function `detect_critical_vars_from_oep` is never used
+  --> crates\pe\src\dumper\global_vars.rs:29:8
+   |
+29 | pub fn detect_critical_vars_from_oep(
+   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `detect_global_vars` is never used
+   --> crates\pe\src\dumper\global_vars.rs:125:8
+    |
+125 | pub fn detect_global_vars(
+    |        ^^^^^^^^^^^^^^^^^^
+
+warning: function `find_security_cookie_rva_public` is never used
+   --> crates\pe\src\dumper\heap_bootstrap.rs:179:15
+    |
+179 | pub(crate) fn find_security_cookie_rva_public(pe: &PeHeader, dump_buf: &[u8]) -> Option<u32> {
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `find_security_cookie_site_public` is never used
+   --> crates\pe\src\dumper\heap_bootstrap.rs:186:15
+    |
+186 | pub(crate) fn find_security_cookie_site_public(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `sanitize_refcounted_string_shell` is never used
+    --> crates\pe\src\dumper\heap_global_snapshot.rs:1650:4
+     |
+1650 | fn sanitize_refcounted_string_shell(content: &mut Vec<u8>) -> bool {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `MAX_SECTION_READ_BYTES` is never used
+  --> crates\pe\src\dumper\helpers.rs:24:18
+   |
+24 | pub(crate) const MAX_SECTION_READ_BYTES: usize = 64 * 1024 * 1024;
+   |                  ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `IMAGE_SCN_CNT_INITIALIZED_DATA` is never used
+  --> crates\pe\src\dumper\tls_bootstrap.rs:46:7
+   |
+46 | const IMAGE_SCN_CNT_INITIALIZED_DATA: u32 = 0x0000_0040;
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `IMAGE_SCN_MEM_READ` is never used
+  --> crates\pe\src\dumper\tls_bootstrap.rs:47:7
+   |
+47 | const IMAGE_SCN_MEM_READ: u32 = 0x4000_0000;
+   |       ^^^^^^^^^^^^^^^^^^
+
+warning: constant `IMAGE_SCN_MEM_WRITE` is never used
+  --> crates\pe\src\dumper\tls_bootstrap.rs:48:7
+   |
+48 | const IMAGE_SCN_MEM_WRITE: u32 = 0x8000_0000;
+   |       ^^^^^^^^^^^^^^^^^^^
+
+warning: constant `IMAGE_SCN_CNT_CODE` is never used
+  --> crates\pe\src\dumper\tls_bootstrap.rs:50:7
+   |
+50 | const IMAGE_SCN_CNT_CODE: u32 = 0x0000_0020;
+   |       ^^^^^^^^^^^^^^^^^^
+
+warning: constant `IMAGE_SCN_MEM_EXECUTE` is never used
+  --> crates\pe\src\dumper\tls_bootstrap.rs:51:7
+   |
+51 | const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
+   |       ^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `TLS_INDEX_SIZE` is never used
+  --> crates\pe\src\dumper\tls_bootstrap.rs:54:7
+   |
+54 | const TLS_INDEX_SIZE: usize = 4;
+   |       ^^^^^^^^^^^^^^
+
+warning: constant `TLS_CALLBACK_ARRAY_SIZE` is never used
+  --> crates\pe\src\dumper\tls_bootstrap.rs:55:7
+   |
+55 | const TLS_CALLBACK_ARRAY_SIZE: usize = 16; // 1 callback + NULL terminator
+   |       ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `install_tls_callback_bootstrap` is never used
+  --> crates\pe\src\dumper\tls_bootstrap.rs:64:15
+   |
+64 | pub(crate) fn install_tls_callback_bootstrap(
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `mida-pe` (lib test) generated 27 warnings (run `cargo fix --lib -p mida-pe --tests` to apply 4 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.07s
+     Running unittests src\lib.rs (D:\MidaVault\scratch\cargo-target\debug\deps\mida_pe-92e974bffc160edf.exe)
+
+running 7 tests
+test dumper::container_bootstrap::tests::metadata_size_is_40_bytes ... ok
+test dumper::container_bootstrap::tests::data_offset_uses_dword_add_not_qword ... ok
+test dumper::container_bootstrap::tests::oep_transfer_clears_volatile_regs_before_jmp ... ok
+test dumper::container_bootstrap::tests::metadata_starts_after_complete_tls_epilogue ... ok
+test dumper::container_bootstrap::tests::patches_crt_wrapper_jmp_and_keeps_original_target ... ok
+test dumper::container_bootstrap::tests::oep_transfer_emits_cookie_mirror_before_clear_and_jmp ... ok
+test dumper::container_bootstrap::tests::tls_process_attach_skips_complete_early_return ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 166 filtered out; finished in 0.00s
+
+ALL_OK

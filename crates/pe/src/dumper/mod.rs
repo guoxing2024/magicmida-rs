@@ -38,6 +38,7 @@ mod heap_global_snapshot;
 mod helpers;
 mod import_rebuild;
 mod import_section;
+mod iat_gap_retarget;
 mod original_imports;
 mod output_writer;
 mod pure_rebuild_adapter;

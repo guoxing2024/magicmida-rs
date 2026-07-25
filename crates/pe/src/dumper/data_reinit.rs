@@ -57,13 +57,15 @@ pub(crate) fn reinit_critical_sections(dump_buf: &mut [u8], cs_rvas: &[u32]) -> 
             );
             continue;
         }
-        // LockCount at +8 (i32), RecursionCount +12, OwningThread +16,
-        // LockSemaphore +24, SpinCount +32.
+        // x64 RTL_CRITICAL_SECTION layout:
+        // +0 DebugInfo, +8 LockCount (i32), +12 RecursionCount (i32),
+        // +16 OwningThread (HANDLE/ptr), +24 LockSemaphore (HANDLE/ptr),
+        // +32 SpinCount (usize).
         dump_buf[off + 8..off + 12].copy_from_slice(&(-1i32).to_le_bytes());
         dump_buf[off + 12..off + 16].copy_from_slice(&0i32.to_le_bytes());
-        dump_buf[off + 16..off + 20].copy_from_slice(&0u32.to_le_bytes());
-        dump_buf[off + 24..off + 28].copy_from_slice(&0u32.to_le_bytes());
-        dump_buf[off + 32..off + 40].copy_from_slice(&0u64.to_le_bytes());
+        dump_buf[off + 16..off + 24].copy_from_slice(&0u64.to_le_bytes()); // OwningThread
+        dump_buf[off + 24..off + 32].copy_from_slice(&0u64.to_le_bytes()); // LockSemaphore
+        dump_buf[off + 32..off + 40].copy_from_slice(&0u64.to_le_bytes()); // SpinCount
         reinit += 1;
     }
     if reinit > 0 {

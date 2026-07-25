@@ -33,6 +33,13 @@ pub struct DumpCapturePolicy {
     /// `LockSemaphore`). Captured CS bytes carry stale/zero lock state from the
     /// dumped process; a fresh loader enter would AV/deadlock. R-GTO-UI round 5.
     pub cs_reinit_rvas: Vec<u32>,
+    /// Optional runtime cookie mirror: before OEP transfer, copy QWORD at
+    /// `cookie_mirror_src_rva` → `cookie_mirror_dst_rva` (both image RVAs).
+    /// R-GTO-UI round 9: AHK call-obfuscation cookie @0x1454b8 must match the
+    /// live MSVC `__security_cookie` (LOAD_CONFIG randomizes 0x141020 before
+    /// any code runs). Dump plant of DEFAULT is not enough.
+    pub cookie_mirror_src_rva: Option<u32>,
+    pub cookie_mirror_dst_rva: Option<u32>,
 }
 
 impl Default for DumpCapturePolicy {
@@ -46,6 +53,8 @@ impl Default for DumpCapturePolicy {
             gscript_first_hop_probe: 0,
             hot_expand_seed_rvas: Vec::new(),
             cs_reinit_rvas: Vec::new(),
+            cookie_mirror_src_rva: None,
+            cookie_mirror_dst_rva: None,
         }
     }
 }
@@ -59,11 +68,17 @@ impl DumpCapturePolicy {
                 0x18a898, // hot fill root (title path)
                 0x141bf0, // AHK global object
                 0x148bf8, // large table
-                0x148cb8, // string capacity (pair with 0x148cc0)
-                0x148cc0, // string table base
-                0x148cb0, 0x148ca8, 0x148c98, 0x148c00,
+                // R-GTO-UI r19: DO NOT hot-capture 0x148cb0/cb8/cc0 — those are
+                // AHK SimpleHeap bump-allocator control slots (0xb9410). Dump-time
+                // exhausted arenas make WinMain path copy (0xb9360) fail → error
+                // reporter AV. Leave NULL so cold start runs 0xb94a0 init.
+                0x148ca8, 0x148c98, 0x148c00,
+                // R-GTO-UI r12: WinMain cmd/dispatch pointer table (store @0x36d0a).
+                // Null → AV at 0x5747a `mov rcx,[rax+rcx*8]` after MessageBox path.
+                0x147868,
             ],
-            large_table_rvas: vec![0x149d50, 0x141bf0, 0x148bf8, 0x148c00, 0x148c98],
+            // 0x147868: cmd/dispatch table (count @0x147888); needs large probe.
+            large_table_rvas: vec![0x149d50, 0x141bf0, 0x148bf8, 0x148c00, 0x148c98, 0x147868],
             gscript_root_rva: Some(0x149d50),
             // R-GTO-UI: 0x2000 truncated the live script object while GUI was up
             // (readable ≥0x20000). Cold restart then ExitProcess(0) without
@@ -72,12 +87,20 @@ impl DumpCapturePolicy {
             gscript_root_content_cap: 0x20000,
             gscript_first_hop_span: 0x200,
             gscript_first_hop_probe: 0x800,
-            hot_expand_seed_rvas: vec![0x149d50, 0x18a898, 0x148cb8, 0x148cc0],
+            hot_expand_seed_rvas: vec![0x149d50, 0x18a898],
             // R-GTO-UI round 5/7: WinMain enters a CRITICAL_SECTION at
             // `.data` RVA 0x145db0 that is zeroed in the dump; LockCount=0
             // (not -1) makes RtlEnterCriticalSection treat it as contended
             // and wait on a NULL LockSemaphore -> AV. Re-init to unlocked.
-            cs_reinit_rvas: vec![0x145db0],
+            // R-GTO-UI r24: after RegisterClass, CreateWindow path takes
+            // MSVC locale/MT lock via 0xe1e18 table @0x141040 (stride 0x58,
+            // CS at +0x30). Slot1 CS @0x1410c8 had LockCount=0 → RtlEnter CS AV.
+            // Keep 0x145db0 (WinMain) and re-init locale table locks.
+            cs_reinit_rvas: vec![0x145db0, 0x141070, 0x1410c8, 0x141120, 0x141178, 0x1411d0, 0x141228, 0x141280, 0x1412d8, 0x141330, 0x141388, 0x1413e0, 0x141438, 0x141490, 0x1414e8, 0x141540, 0x141598, 0x1415f0, 0x141648, 0x1416a0, 0x1416f8, 0x141750, 0x1417a8, 0x141800, 0x141858, 0x1418b0, 0x141908, 0x141960, 0x1419b8, 0x141a10, 0x141a68, 0x141ac0, 0x141b18],
+            // R-GTO-UI round 9: mirror live MSVC security cookie → AHK
+            // call-obfuscation cookie so the decrypt skip path is taken.
+            cookie_mirror_src_rva: Some(0x141020),
+            cookie_mirror_dst_rva: Some(0x1454b8),
         }
     }
 
@@ -97,6 +120,8 @@ impl DumpCapturePolicy {
                 gscript_first_hop_probe: hint.gscript_first_hop_probe,
                 hot_expand_seed_rvas: hint.hot_expand_seed_rvas.clone(),
                 cs_reinit_rvas: Vec::new(),
+                cookie_mirror_src_rva: None,
+                cookie_mirror_dst_rva: None,
             };
         }
         if hint.prefer_ahk_gto_defaults {
@@ -131,6 +156,8 @@ impl DumpCapturePolicy {
             gscript_first_hop_probe: hint.gscript_first_hop_probe,
             hot_expand_seed_rvas: hint.hot_expand_seed_rvas.clone(),
             cs_reinit_rvas: Vec::new(),
+            cookie_mirror_src_rva: None,
+            cookie_mirror_dst_rva: None,
         }
     }
 
@@ -204,6 +231,16 @@ impl DumpCapturePolicy {
                 .filter(|r| self.hot_root_rvas.contains(r))
                 .collect();
         }
+        // Cookie mirror is AHK/GTO-only. Fill when both slots are unset so a
+        // partial custom policy still gets the call-obfuscation fix; callers
+        // who set either slot keep full control.
+        if matches!(profile, DumpProfile::AhkGtoExperimental)
+            && self.cookie_mirror_src_rva.is_none()
+            && self.cookie_mirror_dst_rva.is_none()
+        {
+            self.cookie_mirror_src_rva = def.cookie_mirror_src_rva;
+            self.cookie_mirror_dst_rva = def.cookie_mirror_dst_rva;
+        }
         self
     }
 
@@ -254,6 +291,19 @@ mod tests {
         assert!(p.is_hot_root(0x149d50));
         assert!(p.is_large_table(0x141bf0));
         assert_eq!(p.gscript_root(), Some(0x149d50));
+        assert_eq!(p.cookie_mirror_src_rva, Some(0x141020));
+        assert_eq!(p.cookie_mirror_dst_rva, Some(0x1454b8));
+    }
+
+    #[test]
+    fn partial_ahk_hot_roots_fill_cookie_mirror() {
+        let p = DumpCapturePolicy {
+            hot_root_rvas: vec![0x149d50],
+            ..Default::default()
+        }
+        .resolve_for_profile(DumpProfile::AhkGtoExperimental);
+        assert_eq!(p.cookie_mirror_src_rva, Some(0x141020));
+        assert_eq!(p.cookie_mirror_dst_rva, Some(0x1454b8));
     }
 
     #[test]

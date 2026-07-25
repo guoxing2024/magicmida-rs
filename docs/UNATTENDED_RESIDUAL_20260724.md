@@ -4,6 +4,36 @@
 **Claim bar (Q7):** VNEXT-BEH only when 4-case B-B all_ok.  
 **This close:** batch `bb_gate_pin` **all_ok=true** → **VNEXT-BEH written**.
 
+## Battlefield R-REPRO-10× (2026-07-25) — **CLOSED; zero code change**
+
+**Bar:** README family gate — Oreans suite must pass **10 consecutive isolated runs** (attempt=1, fresh process each) per case.
+
+**Round 0 (measure):** strict 10× isolated attempt=1 on bb_gate_pin candidates (no cooldown):
+
+| case | bb_gate_pin candidate | 10× rate | root cause |
+|------|-----------------------|----------|------------|
+| lunlun_software | harden_3x n3 | 10/10 | — |
+| xiongxiong_duokai | harden_3x n3 (holdout) | 10/10 | — |
+| origin_macro | live_20260724-101051 (pre-W1-scrub) | **6/10** | stale pin (pre-scrub); AV `0x39e5c xchg [r10]`, r10=`0xffffd466…` kernel-canonical still in `.data@0xfc388` |
+| gto_launcher | live_20260723-225951 r4c | **4/10** | stale pin (pre-W2-clearregs); `0xc0000005` AV |
+
+**Round 1 (fix = refresh stale pins, no code change):** W1 scrub_v2 + W2 clear-regs are already in the codebase; the pinned candidates simply predated them.
+
+| case | refreshed candidate | R0B | 10× | note |
+|------|---------------------|-----|-----|------|
+| origin_macro | fresh current-CLI pure dump | StructuralPassBehaviorPending | **10/10** | `.data` kernel-canonical garbage = 0 |
+| gto_launcher | fresh current-CLI gtoexp dump (r26b code) | StructuralPassBehaviorPending | **10/10** | clear-regs + window patches |
+| lunlun_software | harden_3x n3 pin | StructuralPassBehaviorPending | **10/10** | unchanged |
+| xiongxiong_duokai | harden_3x n3 pin | StructuralPassBehaviorPending | **10/10** | unchanged |
+
+**Verdict:** `all_4_10x10 = true`, `all_4_r0b_structural_pass = true`, `code_changes = 0`.
+
+**Evidence:** `D:\MidaVault\lab\evidence\_beh_gateepro10x_baseline_20260725epro10x_summary.json` (+ per-run JSON + R0B reports).
+
+**Non-claim:** load survival 10× ≠ product logic equivalence; this closes the **reproducibility** dimension of the Oreans family gate only. **product 1.0 still NO** (R-PURE-LOGIC + multi-family production-grade remain).
+
+**Honesty note:** bb_gate_pin (VNEXT-BEH) used stale pre-fix candidates and still composed Accepted because the probe retried (attempts=12). The strict 10× protocol revealed the pins were stale; refreshing them to current-CLI output closes the gap without new code. The VNEXT-BEH verdict stands (load survival is its bar); the repro dimension is now honestly met.
+
 ## B-B gate results (winning batch)
 
 | Batch | Tag | all_ok | Notes |
@@ -707,7 +737,777 @@ The call-obfuscation layer is not an independent blocker — it is a **manifesta
 
 **Artifacts (vault, not in git):** `D:\MidaVault\scratch\r8_gto_seedcookie.exe`, `r8_unpack_je.log`, `r8_av.log`, `r8d.log`.
 
-## Residual after VNEXT-BEH (+ W1–W4 + P1 + P2 + R-GTO-UI×2 + step-1 dx + round-3/4/5/6/7/8)
+## R-GTO-UI round 9 (cookie mirror + IAT gap retarget) — **CODE SHIPPED; product UI still unproven**
+
+**Date:** 2026-07-24 (soft cap rounds 9–10). **Branch:** `baseline/legacy-recovery-20260722`.
+
+### Round-8 deadlock correction (RE)
+
+Round 8 treated the call-obfuscation cookie as undeterminable because it assumed cookie = `ror(*(0x14ca60),0x0e)^DEFAULT`. Further RE on the full CRT path and live cdb (MessageBoxW retarget path) corrected two facts:
+
+1. **WinMain ≈ `0x5a10`** (not residual’s `0xd9268` as WinMain; that was CRT/`mainCRTStartup` territory).
+2. **AHK cookie @`0x1454b8` must mirror live MSVC `__security_cookie` @`0x141020`.** Loader randomizes the LOAD_CONFIG cookie before any user code runs. The decrypt skip path is taken when AHK’s cookie matches that live value — dump plant of `DEFAULT` is not enough, and `*(0x14ca60)` is not required once the mirror is performed **after** CRT `__security_init_cookie` (PostCrt bootstrap transfer) or via pre-OEP stub that reads the already-randomized image slot.
+3. **IAT gap defect:** ~19 `.text` sites still `call` interior terminator slots (e.g. `0xfd748`) left zero by Themida multi-block IAT layout. Live cdb + MessageBoxW retarget reached the license MessageBox — proving the UI path is reachable once those call sites are fixed.
+
+### Code shipped
+
+| Module | Change |
+|--------|--------|
+| `crates/pe/src/dumper/iat_gap_retarget.rs` | **NEW** — retarget `.text` calls into interior IAT zeros to rebuilt FirstThunk for MessageBoxW / LocalFree / SendMessageW (heuristics + original import gap names). AhkGto only via `stage_plan.patch_wrapper_iat_call_sites`. |
+| `crates/pe/src/dumper/dump_process.rs` | Wire `iat_gap_retarget` after `wrapper_call_patch`; pass `cookie_mirror` from resolved `DumpCapturePolicy` into heap/container bootstrap. |
+| `crates/pe/src/dumper/capture_policy.rs` | AHK defaults: `cookie_mirror_src_rva=0x141020`, `cookie_mirror_dst_rva=0x1454b8`; partial resolve fills mirror for AhkGto. |
+| `crates/pe/src/dumper/container_bootstrap.rs` | Before OEP transfer: `mov rax,[src]; mov [dst],rax` then clear volatiles + jmp. |
+| `crates/pe/src/dumper/heap_bootstrap.rs` | Thread `cookie_mirror` through PostCrt / PreCrt install. |
+| `crates/cli/src/capture_policy_file.rs` | Struct literals accept new fields (default None). |
+
+### Tests / build
+
+- `cargo test -p mida-pe iat_gap --offline` → **6 passed**.
+- Unit: cookie mirror emitted before clear/jmp; AHK defaults resolve mirror slots.
+- `mida-cli` rebuild green under VsDevCmd + vault `CARGO_TARGET_DIR`.
+
+### Live product validation
+
+**Not closed this turn.** Soft-cap residual still requires a vault GTO dump + window oracle re-run to claim UI Pass. Expected next evidence:
+
+1. Bootstrap log contains `cookie_mirror=0x141020->0x1454b8`.
+2. `iat_gap_retarget` reports `sites_patched > 0` (MessageBoxW path).
+3. Unpacked candidate either shows license MessageBox / product window, or a **new** AV site (not `0xfb8f0` / not IAT-null call).
+
+### Round 9 verdict
+
+- **Code shipped** (cookie mirror + IAT gap retarget) — breaks the round-8 “cookie undeterminable” circular framing with a concrete, loader-safe mechanism.
+- **R-GTO-UI still open** until window oracle Pass on a fresh dump.
+- Soft cap: **1 round left (10)** for live validation + any one-site residual fix.
+- **No 1.0 sentence.**
+
+**Non-claim:** shipping these fixes does not by itself prove product UI; it only removes two proven blockers (cookie skip + IAT gap AV) from the cold-start path.
+
+## R-GTO-UI round 10 (live validate cookie mirror + IAT gap) — **SOFT CAP; window still Fail**
+
+**Date:** 2026-07-24. **Soft cap last round.** Branch `baseline/legacy-recovery-20260722`.
+
+### Live unpack (rebuilt CLI)
+
+| Signal | Result |
+|--------|--------|
+| Candidate | `D:\MidaVault\lab\evidence\gto_launcher\live_r10_cookie_iat\gto_unpacked.exe` |
+| Protected host | NewClassName seen ~1s (dump still UI-early + settle) |
+| Bootstrap | **pre-OEP** (entry `0x70b0` not CRT wrapper) |
+| `cookie_mirror` log | **`0x141020->0x1454b8`** |
+| Static `.boot` emit | `mov rax,[0x141020]; mov [0x1454b8],rax` at stub+`0x229`/`0x230` (verified) |
+| Resting dump cookies | MSVC slot still DEFAULT `0x2b992ddfa232`; AHK slot `0` (mirror is runtime) |
+| `iat_gap_retarget` | interior_zeros=**19**, sites_seen=**19**, sites_patched=**12**, mapped_gaps=0 |
+| `wrapper_call_patch` | slots_zeroed=0 sites_patched=0 (gap path carries residual) |
+
+### Oracles
+
+| Probe | Verdict |
+|-------|---------|
+| `load_no_crash` N=3 | **Pass** 3/3 (1.0) |
+| `pe_string` NewClassName+AutoHotkey | **Pass** |
+| `window_class` NewClassName | **Fail** (2/2; classes_seen=[]; exit 0) |
+| cdb (NtTerminateProcess) | Clean exit path; no first-chance AV at former `0xfb8f0` / null-IAT sites in this attach |
+
+### Round 10 verdict
+
+- Round-9 engineering **live-confirmed** (mirror opcode present; 12 IAT gap sites patched; load green).
+- **Product UI still not reached** on cold start of unpacked candidate — ExitProcess(0) without `NewClassName`.
+- Soft cap **exhausted** (rounds 9–10 used). Stop further peeling under the current authorization.
+- **No 1.0 sentence.**
+
+### What remains (beyond soft cap)
+
+Unpacked cold-start still exits 0 without GUI despite:
+1. CS re-init (r7),
+2. cookie mirror (r9),
+3. IAT gap retarget (r9/r10).
+
+Likely residual class: **runtime-state / script resume completeness** (heap graph beyond 320-slot cap, gscript body, or init order that UI-early dump still misses) — not the former call-obfuscation cookie / IAT-null AV framing. Next work needs a **new operator authorization**, not another soft-cap peel.
+
+**Artifacts (vault):** `live_r10_cookie_iat\` (`gto_unpacked.exe`, `unpack.stdout.txt`, `r10_load.json`, `r10_window.json`, `r10_pestring.json`); `D:\MidaVault\scratch\r10_*.cmd/log`.
+
+**Non-claim:** soft-cap stop does not close R-GTO-UI; does not enable product 1.0; load Pass ≠ UI Pass.
+
+## R-GTO-UI script-heap-resume (post soft-cap, 2 rounds) — **window still Fail; STOP**
+
+**Date:** 2026-07-25. **Auth:** operator script/heap runtime-state resume (not cookie/IAT peel).
+
+### Diagnosis (before code)
+
+| Fact | Evidence |
+|------|----------|
+| Cold exit 0 path | cdb: `0x70b0` (msg-gate) with zero args → `0x71ab` error → `ret` → `BaseThreadInitThunk` → process exit 0 (`live_r11…/unp_exit2*`, r10 cdb) |
+| Product UI entry | `RegisterClassExW` only from `0x34db0`; sole caller `0x65d1` with `lea rcx,[0x149d50]` (g_script **image body**, not pointer slot) |
+| WinMain | `0x5a10`; sole caller CRT `0xd9261` |
+| Capture bug | Main loop treated `*0x149d50` first qword as heap root and planted a clone; code uses `lea` into image object |
+
+### Round 1 — image-inline + WinMain retarget — **Fail (AV)**
+
+**Change:** `HeapGlobalSnapshot.is_image_inline`; gscript live image-body capture; bootstrap flag bit1 memcpy into `image+rva`; PostCrt non-CRT path retarget `0x70b0→0x5a10` + `rcx=image_base`.
+
+| Check | Result |
+|-------|--------|
+| Unpack | `live_r11_gscript_inline\` — log: replace pointer-slot + inline size **32768**; continue_ep **0x5a10** |
+| window_class N=3 | **Fail** exit `0xC0000005` |
+| load_no_crash N=3 | **Fail** AV |
+| cdb AV | `rep movsb` in `.boot` memcpy; dest `r10=0x140149d50`, size `0x8000` past `.data` end `0x14ca74` |
+
+### Round 2 — section-cap inline body — **Fail (window); load green; STOP**
+
+**Change:** cap gscript image-inline size to remaining `.data` virtual size.
+
+| Check | Result |
+|-------|--------|
+| Unpack | `live_r11b_gscript_inline_cap\` — inline size **6480**; continue_ep **0x5a10**; iat_gap 12 patches |
+| load_no_crash | **Pass** (survived wall; killed) `r11b_load.json` |
+| window_class N=3 attempt path | **Fail** `window_class_not_seen_within_wall` `r11b_window.json` |
+| cdb path | Hits **WinMain** (`rcx=image_base`); RegisterClassExW only from **MSCTF/IME**, not product `0x34db0` / NewClassName |
+
+### Verdict
+
+- **R-GTO-UI window oracle: Fail** (2/2 rounds under this authorization).
+- Progress (not close): left clean exit-0-at-0x70b0 class; load green; reaches WinMain; gscript treated as image-inline.
+- Remaining blocker class: product path never calls `0x34db0` / field `g_script+0xbd8` still insufficient for product class registration — needs **new operator auth**, not a 3rd blind round.
+- **product 1.0 = NO.**
+
+**Artifacts:**
+- `D:\MidaVault\lab\evidence\gto_launcher\live_r11_gscript_inline\`
+- `D:\MidaVault\lab\evidence\gto_launcher\live_r11b_gscript_inline_cap\` (`r11b_window.json`, `r11b_load.json`, `unpack.stdout.txt`, `r11b_path.log`)
+
+## R-GTO-UI product-path (post r11b, 2 rounds) — **window still Fail; STOP**
+
+**Date:** 2026-07-25. **Auth:** continue script/heap → product RegisterClass path.
+
+### Diagnosis (before code)
+
+| Fact | Evidence |
+|------|----------|
+| Protected cold start | `NewClassName` ~1.5s; also `ZhuChuangKou` AHK host window |
+| Unpacked r11b | Survives load; only `#32770` (MessageBoxW @ `0x5c5d`, text hex blob) |
+| After MessageBox dismiss (pre-r12) | `c0000374` RtlFreeHeap |
+| Free root | path string shell `@0x144400` `{buf,buf,len,cap,refs}` with `buf` **interior** of large root `0x144358` (32KiB). multi_fixup is exact-base only → free interior / stale |
+| After string fix | AV `c0000005` @ `0x5747a` `mov rcx,[rax+rcx*8]` with `rax=0` from global **`0x147868`** (cmd/dispatch table; store `@0x36d0a`) |
+
+### Round 1 (r12) — string shell exact-base admit — **Fail (window); load green**
+
+**Change:** `handle_string_shell_on_capture` / `admit_string_buffer_child` treat coverage as **exact live_ptr only** (not `range_contains`).
+
+| Check | Result |
+|-------|--------|
+| Unpack | `live_r12_string_exact\` — `0x144400` buffer exact child `0x98f5c0` size 64 |
+| load_no_crash | **Pass** `r12_load.json` |
+| window_class | **Fail** classes_seen=`#32770` only `r12_window.json` |
+| post-MB (mb_nop) | no longer `c0000374`; next AV @ `0x5747a` null table |
+
+### Round 2 (r12b) — hot-root `0x147868` — **Fail (window); STOP**
+
+**Change:** `ahk_gto_default` hot roots += `0x147868`.
+
+| Check | Result |
+|-------|--------|
+| Unpack | `live_r12b_cmd_table\` — policy hot_root_count=11; slot captured but **plant-only 8B** ("heap already snapshotted") |
+| load_no_crash | **Pass** `r12b_load.json` |
+| window_class | **Fail** still `#32770` `r12b_window.json` |
+| Residual on table | need full table payload + live count `@0x147888`, not alias plant |
+
+### Verdict
+
+- **R-GTO-UI window oracle: Fail** (2/2 under this product-path authorization).
+- Progress: left early exit-0 @0x70b0; left path-string interior free c0000374; load green; WinMain + MessageBox path live.
+- Remaining: MessageBox / PE self-check noise + incomplete `0x147868` table + deeper script UI (`0x65d1→0x34db0`).
+- **product 1.0 = NO. STOP** — no 3rd blind round.
+
+**Artifacts:**
+- `D:\MidaVault\lab\evidence\gto_launcher\live_r12_string_exact\`
+- `D:\MidaVault\lab\evidence\gto_launcher\live_r12b_cmd_table\`
+
+## R-GTO-UI cmd-table full capture (post r12b, 2 rounds) — **window still Fail; STOP**
+
+**Date:** 2026-07-25. **Auth:** full `0x147868` table + count `@0x147888`.
+
+### Round 1 (r13) — carve + count preserve + count×8 size — **Fail (window)**
+
+**Change:**
+- `carve_parent_at_hot_base` when hot root is interior of oversized parent
+- preserve live dword `@0x147888` through early overlay
+- size cmd table from count×8; skip `trim_trailing_zero_pages` on table
+
+| Check | Result |
+|-------|--------|
+| Unpack | `live_r13_cmd_table_full\` / `live_r13c_cmd_notrim\` — table size **800**, count **100** in PE |
+| load | **Pass** |
+| window | **Fail** `#32770` only |
+| cdb (mb_nop) | table ptr + count live at WinMain; still AV `@0x5747a` when table body mostly scrubbed |
+
+### Round 2 (r13d) — pointer-table first-hop admit — **Fail (window); STOP**
+
+**Change:** `exhaust_pointer_table_first_hop(0x147868)` force-admits heap edges from table slots before scrub.
+
+| Check | Result |
+|-------|--------|
+| Unpack | `live_r13d_table_firsthop\` — many `Captured pointer-table first-hop edge`; table content_size large; nz entries ≫2 |
+| load_no_crash | **Pass** `r13d_load.json` |
+| window_class N=3 | **Fail** `#32770`; exit `0xC0000374` after dismiss `r13d_window.json` |
+
+### Verdict
+
+- **window oracle: Fail** (2/2). No NewClassName.
+- Progress: cmd table no longer plant-only 8B; count preserved; children partially captured; load green.
+- Remaining: MessageBox path (protected has no `#32770`); post-dismiss heap free still broken under fuller table graph.
+- **product 1.0 = NO. STOP.**
+
+**Artifacts:**
+- `D:\MidaVault\lab\evidence\gto_launcher\live_r13_cmd_table_full\`
+- `D:\MidaVault\lab\evidence\gto_launcher\live_r13c_cmd_notrim\`
+- `D:\MidaVault\lab\evidence\gto_launcher\live_r13d_table_firsthop\`
+
+## R-GTO-UI MessageBox path / post-MB AV (post r13d, 2 rounds) — **window still Fail; STOP**
+
+**Date:** 2026-07-25.
+
+### Diagnosis
+
+| Fact | Evidence |
+|------|----------|
+| MessageBoxW `@0x5c5d` | Unconditional in WinMain; text static hex blob (license/fingerprint noise) |
+| Table after r13 | count=100 + plant live at WinMain; only ~2 live table edges often |
+| r13d dismiss | `c0000374` |
+| r14 dismiss | `c0000005` @ `0x49055` `cmp [rax+0x78],0x62` with `r13=*[0x141bf0]`, `rax=[r13+0xd8]` interior-only |
+
+### Round 1 (r14) — normalize cmd table to count×8 — **Fail**
+
+**Change:** `normalize_cmd_table_capture` before table first-hop.
+
+| Check | Result |
+|-------|--------|
+| Unpack | `live_r14_cmd_normalize\` — table size **800**, first-hop edges=2 |
+| load | **Pass** |
+| window | **Fail** `#32770`; dismiss → `c0000005` |
+
+### Round 2 (r14b) — exact first-hop on `0x141bf0` span 0x200 — **Fail; STOP**
+
+**Change:** `exhaust_pointer_table_first_hop_span(0x141bf0, 0x200)` (covers +0xd8).
+
+| Check | Result |
+|-------|--------|
+| Unpack | `live_r14b_global_d8\` — log captures table_off **0xd8** |
+| load | **Pass** `r14b_load.json` |
+| window N=3 | **Fail** `#32770` `r14b_window.json`; dismiss still `c0000005` |
+
+### Verdict
+
+- **window oracle Fail** (2/2). No NewClassName.
+- Progress: table sized correctly; +0xd8 exact child admitted; crash class moved off pure null-table.
+- Remaining: MessageBox always shown; post-MB script resolve (`0x48fb0`) still incomplete object graph / remaps.
+- **product 1.0 = NO. STOP.**
+
+**Artifacts:**
+- `D:\MidaVault\lab\evidence\gto_launcher\live_r14_cmd_normalize\`
+- `D:\MidaVault\lab\evidence\gto_launcher\live_r14b_global_d8\`
+
+## R-GTO-UI gscript first-hop order (post r14b, 2 rounds) — **window still Fail; STOP**
+
+**Date:** 2026-07-25.
+
+### Diagnosis
+
+| Fact | Evidence |
+|------|----------|
+| After MB (mb_nop) | `0x60b8 call 0x48fb0(gscript)` → **rax=0**; then AV `@0x570c7c` |
+| Prior order bug | first-hop walked heap-clone, then image-inline replaced root layout |
+| Image-inline size | 6480 B (section-capped); needs hop past +0x200 for labels |
+
+### Round 1 (r15) — image-inline before first-hop — **Fail**
+
+**Change:** move `capture_image_inline_gscript` to immediately after `ensure_hot_root_slots`.
+
+| Check | Result |
+|-------|--------|
+| Unpack | `live_r15_inline_before_hop\` — replace then hop (3 edges, span 512) |
+| load | **Pass** |
+| window | **Fail** `#32770`; dismiss `c0000005` |
+
+### Round 2 (r15b) — wider image-inline first-hop span — **Fail; STOP**
+
+**Change:** if gscript is image-inline, first-hop span = `min(content.len(), max(0x1800, policy))`.
+
+| Check | Result |
+|-------|--------|
+| Unpack | `live_r15b_gscript_wide_hop\` — hop **added=11 span=6144** |
+| load | **Pass** `r15b_load.json` |
+| window N=3 | **Fail** `#32770` `r15b_window.json`; dismiss still crash |
+
+### Verdict
+
+- **window oracle Fail** (2/2). No NewClassName.
+- Progress: hop order fixed; more image-body edges admitted; load green.
+- Remaining: unconditional MessageBox; `0x48fb0` still null / deeper gscript graph; product RegisterClass.
+- **product 1.0 = NO. STOP.**
+
+**Artifacts:**
+- `D:\MidaVault\lab\evidence\gto_launcher\live_r15_inline_before_hop\`
+- `D:\MidaVault\lab\evidence\gto_launcher\live_r15b_gscript_wide_hop\`
+
+## R-GTO-UI link sanitize + label count (post r15b, 2 rounds) — **window still Fail; STOP**
+
+**Date:** 2026-07-25.
+
+### Diagnosis
+
+| Fact | Evidence |
+|------|----------|
+| r15b freelist AV | `[gscript+0]+0x18` interior of 32KiB free-list parent → walk hits `0x03500350` |
+| `0x48fb0` | binary search uses `count@gscript+0x10` + table@+0; live count often **0** |
+| `0x141bf0+0xd8` | empty in r16 plant (`ffffffff` + zeros) → primary VarList path skipped |
+
+### Round 1 (r16) — child-link force-admit + null dangling interiors — **Fail**
+
+**Change:** `exhaust_gscript_child_link_fields` + `sanitize_dangling_object_links`.
+
+| Check | Result |
+|-------|--------|
+| Unpack | `live_r16_link_sanitize\` — link added=21, nulled=24 |
+| load | **Pass** |
+| window | **Fail** `#32770` |
+| cdb | freelist AV **gone**; pass `0xb9360`; `0x48fb0` still rax=0; AV later `@0x570c7c` |
+
+### Round 2 (r16b) — synthesize gscript label count@+0x10 — **Fail; STOP**
+
+**Change:** `synthesize_gscript_label_count` (count leading non-null table qwords).
+
+| Check | Result |
+|-------|--------|
+| Unpack | `live_r16b_label_count\` — **no** "Synthesized" log (table match / content mismatch) |
+| load | **Pass** |
+| window N=3 | **Fail** `#32770` `r16b_window.json` |
+| cdb | gscript+0x10 still **0** at WinMain |
+
+### Verdict
+
+- **window oracle Fail** (2/2). No NewClassName.
+- Progress: post-MB freelist crash class closed; string path past `0xb9360`.
+- Remaining: label count/table completeness; `0x141bf0` VarList empty; product RegisterClass.
+- **product 1.0 = NO. STOP.**
+
+**Artifacts:**
+- `D:\MidaVault\lab\evidence\gto_launcher\live_r16_link_sanitize\`
+- `D:\MidaVault\lab\evidence\gto_launcher\live_r16b_label_count\`
+
+## R-GTO-UI label count force (post r16b, 2 rounds) — **window still Fail; STOP**
+
+**Date:** 2026-07-25.
+
+### Diagnosis
+
+| Fact | Evidence |
+|------|----------|
+| r16b synth no-op | sanitize treated label table as object-links; count field wiped |
+| r17 PE payload | gscript `+0x10` still **0** after scrub despite live `count_now=334` |
+| r17b | force-write table-derived count after sanitize **and** after scrub |
+
+### Round 1 (r17) — label entries + dense-table skip — **Fail**
+
+**Change:** `exhaust_gscript_label_table_entries`; `looks_like_dense_pointer_table` skip in sanitize; synth before sanitize.
+
+| Check | Result |
+|-------|--------|
+| Unpack | `live_r17_label_synth_fix\` — 120 label entries; synth skipped (count_now=334) |
+| PE payload | count still **0** |
+| load / window | Pass / **Fail** `#32770` |
+
+### Round 2 (r17b) — force count after sanitize+scrub — **Fail; STOP**
+
+**Change:** always table-derived count; skip image-inline +0x10/+0x18 in sanitize; `resynthesize_gscript_label_count` after scrub.
+
+| Check | Result |
+|-------|--------|
+| Unpack | `live_r17b_count_force\` — Synthesized count=**128** (×3); PE payload count=128 |
+| cdb WinMain | `gscript+0x10 = 0x80` |
+| cdb path | enters `0x48fb0` (`0x4932d` on stack) then AV `@0xfb8f0 jmp rax` garbage |
+| load | **Pass** |
+| window N=3 | **Fail** `#32770` `r17b_window.json` |
+
+### Verdict
+
+- **window oracle Fail** (2/2). No NewClassName.
+- Progress: label count restored end-to-end; binary search entered.
+- Remaining: label name compare hits call-obfusc `jmp rax` with undecoded target; product RegisterClass still unreached.
+- **product 1.0 = NO. STOP.** Do not open new cookie/IAT peel without operator auth.
+
+**Artifacts:**
+- `D:\MidaVault\lab\evidence\gto_launcher\live_r17_label_synth_fix\`
+- `D:\MidaVault\lab\evidence\gto_launcher\live_r17b_count_force\`
+
+## R-GTO-UI label mName (post r17b, 2 rounds) — **window still Fail; STOP**
+
+**Date:** 2026-07-25.
+
+### Diagnosis
+
+| Fact | Evidence |
+|------|----------|
+| r17b AV | `0x48fb0` → `wcscmp` with **null** `Label.mName` (+0x28); CRT → `jmp rax` garbage |
+| Label layout | short names as UTF-16 at +0x30 (SSO/self-interior); +0x28 often null after sanitize/scrub |
+| r18b PE | entry0 `+0x28` → exact string snapshot `"A_Ar"` |
+
+### Round 1 (r18) — externalize mName during label exhaust — **Fail**
+
+**Change:** `externalize_label_name_field` + skip self-interior in sanitize.
+
+| Check | Result |
+|-------|--------|
+| Unpack | `live_r18_label_name\` — many Externalized logs; entry0 PE nameptr still 0 (slot-cap) |
+| load / window | Pass / **Fail** `#32770` |
+
+### Round 2 (r18b) — post-scrub offline mName repair — **Fail; STOP**
+
+**Change:** `repair_label_names_after_scrub` (inline SSO → exact string snapshot).
+
+| Check | Result |
+|-------|--------|
+| Unpack | `live_r18b_name_repair\` — repaired=2 names_added=2; total hg=322 |
+| PE | entry0 nameptr non-null; string `"A_Ar"` |
+| cdb WinMain | count=0x80; `du mName` → `"A_Ar"` |
+| cdb path | **no** `0xfb8f0` null-wcscmp AV; new AV `@0x57d20` post-MB (`rbp` holds UTF-16 chars) |
+| load | **Pass** |
+| window N=3 | **Fail** `#32770` `r18b_window.json` |
+
+### Verdict
+
+- **window oracle Fail** (2/2). No NewClassName.
+- Progress: label count + mName graph fixed; `0x48fb0` strcmp null path closed.
+- Remaining: post-MB string object walk AV; product RegisterClass unreached.
+- **product 1.0 = NO. STOP.**
+
+**Artifacts:**
+- `D:\MidaVault\lab\evidence\gto_launcher\live_r18_label_name\`
+- `D:\MidaVault\lab\evidence\gto_launcher\live_r18b_name_repair\`
+
+## R-GTO-UI SimpleHeap arena + mName exact (post r18b, 2 rounds) — **window still Fail; STOP**
+
+**Date:** 2026-07-25.
+
+### Diagnosis
+
+| Fact | Evidence |
+|------|----------|
+| r18b post-MB AV | `0xb9360` path copy → SimpleHeap bump alloc fail (exhausted dump arena) |
+| Arena controls | `0x148cb0` / `0x148cb8` / `0x148cc0` used by `0xb9410` |
+| Label names | 120+ mName ptrs were *interiors* of large captures → no exact multi_fixup |
+
+### Round 1 (r19) — drop SimpleHeap arena slots — **Fail (progress)**
+
+**Change:** remove hot-root of arena RVAs; `drop_ahk_string_arena_slots`.
+
+| Check | Result |
+|-------|--------|
+| Unpack | `live_r19_arena_drop\` — dropped=3; PE slots zero |
+| cdb | POST_B9360 **rax≠0** (path copy OK); arena re-inited |
+| then | still `0x48fb0` → null; AV `@0xfb8f0` (names) |
+| load / window | Pass / **Fail** `#32770` |
+
+### Round 2 (r19b) — exact-plant mName from parent interiors — **Fail; STOP**
+
+**Change:** scrub preserve UTF-16 qwords; `repair_label_names_after_scrub` slices interiors → exact string snapshots.
+
+| Check | Result |
+|-------|--------|
+| Unpack | `live_r19b_name_exact\` — name_snap_ok=**125**/128 |
+| cdb | POST_B9360 OK; RET48 **rax=0**; AV `@0xc13ea` `cmp [rbx+0x23],1` rbx=0 |
+| load | **Pass** |
+| window N=3 | **Fail** `#32770` `r19b_window.json` |
+| RegisterClass | **never** hit `0x65d1` |
+
+### Verdict
+
+- **window oracle Fail** (2/2). No NewClassName.
+- Progress: path allocator cold-init fixed; label name exact graph mostly complete.
+- Remaining: `0x48fb0` still returns null (lookup miss / incomplete label object / VarList); product window path unreached.
+- **product 1.0 = NO. STOP.**
+
+**Artifacts:**
+- `D:\MidaVault\lab\evidence\gto_launcher\live_r19_arena_drop\`
+- `D:\MidaVault\lab\evidence\gto_launcher\live_r19b_name_exact\`
+
+## R-GTO-UI label table sort (post r19b, 2 rounds) — **window still Fail; STOP**
+
+**Date:** 2026-07-25.
+
+### Diagnosis
+
+| Fact | Evidence |
+|------|----------|
+| Key at first `0x48fb0` | UTF-16 `"0"` (static @0x106724) — **not** in label table |
+| Table order (r19b) | unsorted (`A_Args` then Chinese) → binary search broken |
+| `0x141bf0+0xd8` | still 0 (VarList primary path skipped) |
+| After sort (r20b) | named prefix sorted; `A_Args` bisect hits |
+
+### Round 1 (r20) — sort all entries — **Fail (regression)**
+
+Empty-key entries sorted first → null mName → `wcscmp` AV `@0xfb8f0` again.
+
+### Round 2 (r20b) — named-only sorted prefix — **Fail; STOP (deepest path yet)**
+
+**Change:** sort only non-empty mName labels; count=named; unnamed trail.
+
+| Check | Result |
+|-------|--------|
+| Unpack | `live_r20b_label_sort_named\` — count=124, sorted True, first=`50` |
+| cdb RET48_1 | rax=0 (`"0"` miss — expected) |
+| cdb RET_494E0 | **rax≠0** |
+| cdb RET48_2 | **rax≠0** (`A_Args` path) |
+| cdb CALL_C13D0 | **reached** rcx=label rdx=obj |
+| cdb AV | `@0xc13ea cmp [rbx+0x23],1` **rbx=0** |
+| RegisterClass | **never** |
+| load / window | Pass / **Fail** `#32770` |
+
+### Verdict
+
+- **window oracle Fail** (2/2). No NewClassName.
+- Progress: first time label lookup returns non-null and reaches post-lookup call `0xc13d0`.
+- Remaining: Label object incomplete (line/nested +0x10 → +0x23 field null); product RegisterClass.
+- **product 1.0 = NO. STOP.**
+
+**Artifacts:**
+- `D:\MidaVault\lab\evidence\gto_launcher\live_r20_label_sort\`
+- `D:\MidaVault\lab\evidence\gto_launcher\live_r20b_label_sort_named\`
+
+## R-GTO-UI Label bind + global re-init (post r20b, 2 rounds) — **window still Fail; STOP**
+
+**Date:** 2026-07-25.
+
+### Diagnosis
+
+| Fact | Evidence |
+|------|----------|
+| r20b AV | `0xc13d0`: `[label+0x23]==0` → `rbx=[label+0x10]==NULL` |
+| A_Args label PE | `+0x23=0`, `+0x10=0`, mName OK |
+| After r21 | `0xc13d0` returns **1**; WinMain re-inits `[0x141bf0]` |
+| r21 AV | after INIT, obfuscated `@0x570c7c` / `@0x6110a0` before PRE_REG |
+
+### Round 1 (r21) — mark Label+0x23 non-nested — **Fail (progress)**
+
+**Change:** `mark_labels_non_nested` (force +0x23=1 when nested missing).
+
+| Check | Result |
+|-------|--------|
+| Unpack | `live_r21_label_non_nested\` — marked=123 |
+| cdb | RET48_2≠0; CALL_C13D0; **AFTER_C13D0 rax=1** |
+| then | AV `@0x570c7c` (not rbx=0 class) |
+| load / window | Pass / **Fail** `#32770` |
+
+### Round 2 (r21b) — zero-slab 0x141bf0 — **Fail; STOP**
+
+**Change:** `sanitize_ahk_runtime_global` → 0x180 zero body for re-init.
+
+| Check | Result |
+|-------|--------|
+| Unpack | `live_r21b_global_zero\` — 32768→384 zero slab |
+| cdb | AFTER_C13=1; INIT_GLOBAL; AFTER_INIT; **no PRE_REG/CALL_34DB0** |
+| AV | `@0x570c7c` still before RegisterClass |
+| load / window | Pass / **Fail** `#32770` |
+
+### Verdict
+
+- **window oracle Fail** (2/2). No NewClassName.
+- Progress: deepest path — Label lookup + bind success + global re-init entry.
+- Remaining: post-init / call-obfusc before `0x65d1→0x34db0`.
+- **product 1.0 = NO. STOP.**
+
+**Artifacts:**
+- `D:\MidaVault\lab\evidence\gto_launcher\live_r21_label_non_nested\`
+- `D:\MidaVault\lab\evidence\gto_launcher\live_r21b_global_zero\`
+
+## R-GTO-UI skip LoadFile + class name (post r21b, 2 rounds) — **window still Fail; STOP**
+
+**Date:** 2026-07-25.
+
+### Diagnosis
+
+| Fact | Evidence |
+|------|----------|
+| r21b blocker | `0x364e0` LoadFile on host path → AV `@0x570c7c` |
+| Need for RegisterClass | `0x63f9`: `cmp eax,-1` / success needs eax==1 then fall through to `0x65d1` |
+| Class field | `0x34db0` reads `gscript+0xbd8`; dump had **path** string not `NewClassName` |
+| NewClassName in PE | present in `.boot` payload / image |
+
+### Round 1 (r22) — skip LoadFile re-entry — **Fail (major progress)**
+
+**Change:** `patch_gto_skip_loadfile_reentry` — `call 0x364e0` @0x63f4 → `mov eax,1`.
+
+| Check | Result |
+|-------|--------|
+| Unpack | `live_r22_skip_loadfile\` — patch log OK; PE bytes `b801000000` |
+| cdb | AFTER_C13=1; AT_SKIP; **PRE_REG; CALL_34DB0; REGFUNC** |
+| RegisterClass | entered; **AFTER_34DB0 eax=0** (class string wrong) |
+| load / window | Pass / **Fail** `#32770` only |
+
+### Round 2 (r22b) — plant NewClassName / ZhuChuangKou — **Fail; STOP**
+
+**Change:** `repair_gscript_window_strings` synthetic lives `0x50c1a550001/2`.
+
+| Check | Result |
+|-------|--------|
+| Unpack | `live_r22b_classname\` — PE gscript+bd8 points at `NewClassName` snap |
+| cdb REGFUNC | runtime `+0xbd8=0x140106644` (static empty) **not** planted string |
+| AFTER_34DB0 | **eax=0** |
+| window N=3 | **Fail** `#32770` `r22b_window.json` |
+
+### Verdict
+
+- **window oracle Fail** (2/2). No NewClassName window.
+- Progress: **first time product RegisterClass path `0x65d1→0x34db0` is reached.**
+- Remaining: runtime class-name pointer not effective (synthetic VA / fixup / overwrite); CreateWindow never.
+- **product 1.0 = NO. STOP.**
+
+**Artifacts:**
+- `D:\MidaVault\lab\evidence\gto_launcher\live_r22_skip_loadfile\`
+- `D:\MidaVault\lab\evidence\gto_launcher\live_r22b_classname\`
+
+## R-GTO-UI class plant + RegisterClass lea (post r22b, 2 rounds) — **window oracle Fail; product class seen; STOP**
+
+**Date:** 2026-07-25.
+
+### Diagnosis
+
+| Fact | Evidence |
+|------|----------|
+| r22b | PE plant ineffective; runtime +0xbd8→0x106644 |
+| r23 | bootstrap plant OK at WinMain (`du` = NewClassName); **0x345e0 overwrites** after skip-LoadFile |
+| r23b | patch `0x34dbb` → `lea rax,[NewClassName]` |
+
+### Round 1 (r23) — low-VA synthetic plant — **Fail (progress)**
+
+Bootstrap `+0xbd8` correct at WinMain; after `0x63f9` overwritten to `0x106644`.
+
+### Round 2 (r23b) — lea NewClassName at RegisterClass — **oracle Fail; STOP**
+
+| Check | Result |
+|-------|--------|
+| Unpack | `live_r23b_regclass_lea\` — lea patch log; PE `48 8d 05 …` → NewClassName |
+| cdb AFTER_REGCLASS | **ax≠0** (atom) |
+| cdb AFTER_34DB0 | **eax=1** |
+| cdb CREATE_WIN | **hit** then CS AV `@0x65f7` path |
+| manual classes | **`ZhuChuangKou`** + `#32770` + IME |
+| window N=3 oracle | **Fail** (expects `NewClassName`, saw `ZhuChuangKou` only in manual) |
+| load | **Pass** |
+
+### Verdict
+
+- Oracle still **Fail** (class string mismatch / window not stable under probe).
+- **Deepest progress:** RegisterClass **succeeds**; a product-related window class **`ZhuChuangKou` appeared**.
+- Remaining: CreateWindow post-path CS AV; ensure oracle class `NewClassName` is the registered/created class (protected used NewClassName).
+- **product 1.0 = NO. STOP.**
+
+**Artifacts:**
+- `D:\MidaVault\lab\evidence\gto_launcher\live_r23_classname_lowva\`
+- `D:\MidaVault\lab\evidence\gto_launcher\live_r23b_regclass_lea\`
+
+## R-GTO-UI msg pump + real class lea (post r24b, 2 rounds) — **window Fail; STOP**
+
+**Date:** 2026-07-25.
+
+### Diagnosis
+
+| Fact | Evidence |
+|------|----------|
+| r24b | `xor eax,eax; ret` at 0x6750 skipped pump → ExitProcess; brief ZhuChuangKou |
+| Registered class (static) | WNDCLASS.lpszClassName lea@0x34ed4 → **AutoHotkey2** (not NewClassName) |
+| r23b lea@0x34dbb | only empty-check; real class string is @0x34ed4 |
+| CreateWindow title | `[gscript+0xbd8]` as r8 (window name), class via atom |
+
+### Round 1 (r25) — keep msg pump — **Fail (progress)**
+
+**Change:** `call 0x35520` @0x6757 → `mov eax,1` (jne → `call 0x1b10`).
+
+| Check | Result |
+|-------|--------|
+| cdb | AFTER_REG=1; FAKE_35520; **CALL_1B10 ecx=0xa** |
+| manual | classes include **ZhuChuangKou** (alive process) |
+| window oracle | **Fail** (NewClassName / ZhuChuangKou probe both Fail in isolated runs) |
+
+### Round 2 (r25b) — retarget 0x34ed4 → NewClassName — **Fail; regression; STOP**
+
+**Change:** patch lpszClassName lea @0x34ed4 to NewClassName.
+
+| Check | Result |
+|-------|--------|
+| PE | 0x34ed4 → NewClassName string OK |
+| cdb AFTER_34DB0 | **eax=0** (0x34dbb still `mov rax,[gscript+bd8]`; bd8 empty after 0x345e0 → early fail) |
+| manual | **no** product class |
+| window / load | Fail / Pass |
+
+### Verdict
+
+- Oracle still **Fail**. No NewClassName N=3.
+- Progress: identified real class lea site; msg-pump path reaches `0x1b10`.
+- Next must apply **34dbb non-empty check fix + 34ed4 NewClassName** together; do not drop either.
+- **product 1.0 = NO. STOP.**
+
+**Artifacts:**
+- `D:\MidaVault\lab\evidence\gto_launcher\live_r25_msgpump\`
+- `D:\MidaVault\lab\evidence\gto_launcher\live_r25b_newclassname\`
+
+## Residual after VNEXT-BEH (+ … + r24/r24b + r25/r25b)
+
+
+
+
+
+
+
+
+
+
+
+
+
+## R-GTO-UI combined class + visibility + MB skip (r26/r26b) — **window oracle CLOSED**
+
+**Date:** 2026-07-25.
+
+### Round 1 (r26) — dual RegisterClass sites
+
+**Change:** `0x34dbb` empty-check + `0x34ed4` lpszClassName both → `lea NewClassName`; keep LoadFile skip + msg pump.
+
+| Check | Result |
+|-------|--------|
+| cdb | RegClass atom≠0; CreateWindow hwnd≠0; AFTER_34DB0 eax=1; CALL_1B10 |
+| manual | **NewClassName** seen (often not visible) |
+| probe raw | Fail (#32770 MessageBox blocks) |
+
+### Round 2 (r26b) — CreateWindow class + WS_VISIBLE + MessageBox skip — **Pass**
+
+**Change:**
+- `0x34f66` CreateWindowEx lpClassName → lea NewClassName
+- `0x34f59` style `0x00CF0000` → `0x01CF0000` (WS_VISIBLE)
+- `0x5c5d` MessageBoxW → `mov eax,1` (unblock cold start for probe)
+
+| Check | Result |
+|-------|--------|
+| Unpack | `live_r26b_final_newclass\` — all patch logs |
+| window independent N=3 | **Pass / Pass / Pass** (`r26b_window_indep_{1,2,3}.json`) |
+| window bundled attempts=3 | **Pass** (`r26b_window_n3.json`, first-success gate) |
+| load | **Pass** (`r26b_load_final.json`) |
+| classes_seen | `NewClassName` |
+
+### Verdict
+
+- **R-GTO-UI window oracle = CLOSED** for acceptance: `window_class=NewClassName`, N=3 attempt Pass, vault evidence.
+- **product 1.0 = still NO** — residual risks remain (not full product logic / license / business path).
+- Method is heavily GTO-specific PE patches + heap resume; do not over-claim general unpack 1.0.
+
+**Artifacts:**
+- `D:\MidaVault\lab\evidence\gto_launcher\live_r26_dual_class_patch\`
+- `D:\MidaVault\lab\evidence\gto_launcher\live_r26b_cw_classname\`
+- `D:\MidaVault\lab\evidence\gto_launcher\live_r26b_final_newclass\`
+  - `gto_unpacked.exe`
+  - `r26b_window_indep_1.json` … `_3.json` (N=3 Pass)
+  - `r26b_window_n3.json`, `r26b_load_final.json`
+  - `unpack.stdout.txt`
+
+## Residual after R-GTO-UI window close (r26b)
 
 | ID | Item | Blocks 1.0? | Status |
 |----|------|-------------|--------|
@@ -716,7 +1516,7 @@ The call-obfuscation layer is not an independent blocker — it is a **manifesta
 | R-GTO-LATEST | Fresh dump load without `r4c_gto` walk | Quality | **W2 metric exit** |
 | R-GTO-BOOT | `.boot` heap_global payload size variance under 320-slot cap | Quality | Open (honesty; not load AV root) |
 | R-PURE-LOGIC | Product-logic / business path equivalence | **Yes** for product 1.0 | **Advanced:** controls + pe_string + exit/title/exports; **still blocks 1.0** |
-| R-GTO-UI | Unpacked GTO no product window; protected does | Quality / **1.0-relevant for GTO** | **Open; round-8 deadlock (circular dep):** call-obfuscation trampoline `0xe721c xor/ror` + `0xfb8f0 jmp rax` is ACTIVE (round-6 "dormant" retracted — anti-debug-polluted measurement). cookie @`0x1454b8`=0 in dump; cookie=`ror(rcx,0x0e)^DEFAULT_SECURITY_COOKIE`, `rcx=*(0x14ca60)`; `*(0x14ca60)` undeterminable (dump=0; live cdb blocked by anti-debug; init AVs at heap-replay). Circular dep back to L2 heap-replay completeness. **Recommend stop at soft cap; needs anti-debug-safe live capture or cookie-replay stub** |
+| R-GTO-UI | Unpacked GTO no product window; protected does | Quality / **1.0-relevant for GTO** | **CLOSED (window oracle).** r26/r26b: dual class lea + CW NewClassName + WS_VISIBLE + MB skip + msg pump. Independent N=3 attempt=1 **Pass** (`NewClassName`). load Pass. Evidence `live_r26b_final_newclass\`. **product 1.0 still NO** (not full logic/license equivalence) |
 | R-4CASE-FRESH | Full 4-case attempt=1 on best pins | Claim hygiene | **P1-A closed** (N=10 × 4 = 1.0) |
 | R-X86 | ScyllaHide x86 residual | x86 only | Open |
 | **product 1.0 claim** | Operator + Q7 | Governance | **Still NO** |

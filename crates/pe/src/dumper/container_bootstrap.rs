@@ -47,11 +47,12 @@ const CONTAINER_METADATA_SIZE: usize = 40;
 /// +0x00: u32  slot_rva
 /// +0x04: u32  content_size  — 0 means heap-handle plant (GetProcessHeap)
 /// +0x08: u32  data_offset   — offset in .boot to snapshot bytes
-/// +0x0c: u32  flags         — bit0 = is_heap_handle
+/// +0x0c: u32  flags         — bit0 = is_heap_handle, bit1 = is_image_inline
 /// +0x10: u64  live_ptr      — old heap base (for multi-range fixup map)
 /// ```
 const HEAP_GLOBAL_METADATA_SIZE: usize = 24;
 const HEAP_GLOBAL_FLAG_HANDLE: u32 = 1;
+const HEAP_GLOBAL_FLAG_IMAGE_INLINE: u32 = 2;
 /// Runtime fixup-map entry (containers + heap-globals, phase-2 multi remap).
 ///
 /// ```text
@@ -75,6 +76,7 @@ pub(crate) fn install_container_bootstrap(
     image_base: u64,
     cookie_rva: Option<u32>,
     heap_global_rva: Option<u32>,
+    cookie_mirror: Option<(u32, u32)>,
 ) -> Option<u32> {
     install_container_section(
         pe,
@@ -86,6 +88,7 @@ pub(crate) fn install_container_bootstrap(
         image_base,
         cookie_rva,
         heap_global_rva,
+        cookie_mirror,
         "Installed pre-OEP container restoration bootstrap",
     )
 }
@@ -109,6 +112,7 @@ pub(crate) fn install_post_crt_container_restore(
     crt_entry_rva: u32,
     cookie_rva: Option<u32>,
     heap_global_rva: Option<u32>,
+    cookie_mirror: Option<(u32, u32)>,
 ) -> Option<u32> {
     if !pe.is_64bit || (containers.is_empty() && heap_globals.is_empty()) {
         return None;
@@ -119,8 +123,15 @@ pub(crate) fn install_post_crt_container_restore(
     // Application OEP (or non-CRT PE EP): PostCrt patch cannot apply — use
     // pre-OEP bootstrap without treating it as a failed CRT decode.
     if !looks_like_crt_entry_wrapper(dump_buf, crt_entry_rva) {
+        // R-GTO-UI script-heap-resume: GTO .text scan freezes on AHK
+        // message-dispatch `0x70b0` (WM_APP gate). Cold start with that
+        // continue target always takes the error path and exits 0 without
+        // RegisterClass. Prefer AHK WinMain `0x5a10` (sole caller from CRT
+        // post-_initterm at `0xd9261`) when the scanned entry is that handler.
+        let continue_ep = retarget_gto_resume_entry(dump_buf, crt_entry_rva);
         info!(
             entry = format_args!("{crt_entry_rva:#x}"),
+            continue_ep = format_args!("{continue_ep:#x}"),
             containers = containers.len(),
             heap_globals = heap_globals.len(),
             "PostCrt: entry is not MSVC CRT wrapper (frozen app OEP or non-CRT) — \
@@ -132,10 +143,11 @@ pub(crate) fn install_post_crt_container_restore(
             heap_globals,
             get_process_heap_iat_rva,
             heap_alloc_iat_rva,
-            crt_entry_rva,
+            continue_ep,
             image_base,
             cookie_rva,
             heap_global_rva,
+            cookie_mirror,
         );
     }
 
@@ -158,6 +170,7 @@ pub(crate) fn install_post_crt_container_restore(
                 image_base,
                 cookie_rva,
                 heap_global_rva,
+                cookie_mirror,
             );
         }
     };
@@ -172,6 +185,7 @@ pub(crate) fn install_post_crt_container_restore(
         image_base,
         cookie_rva,
         heap_global_rva,
+        cookie_mirror,
         "Installed post-CRT container restoration bootstrap",
     )?;
 
@@ -269,6 +283,7 @@ fn install_container_section(
     image_base: u64,
     cookie_rva: Option<u32>,
     heap_global_rva: Option<u32>,
+    cookie_mirror: Option<(u32, u32)>,
     log_msg: &str,
 ) -> Option<u32> {
     if !pe.is_64bit {
@@ -317,6 +332,7 @@ fn install_container_section(
         0,
         heap_global_rva,
         cookie_rva,
+        cookie_mirror,
     );
 
     let stub = match stub_result {
@@ -381,6 +397,9 @@ fn install_container_section(
             .map(|e| format!("{e:#x}"))
             .unwrap_or_else(|| "ret".into()),
         image_base = format_args!("{image_base:#x}"),
+        cookie_mirror = cookie_mirror
+            .map(|(s, d)| format!("{s:#x}->{d:#x}"))
+            .unwrap_or_else(|| "off".into()),
         "{log_msg}"
     );
 
@@ -411,6 +430,7 @@ pub(crate) fn build_tls_bootstrap_stub(
         data_section_rva,
         heap_global_rva,
         cookie_rva,
+        None, // TLS path: no OEP cookie mirror
     )
 }
 
@@ -427,6 +447,7 @@ fn build_container_stub_internal(
     data_section_rva: u32,
     heap_global_rva: Option<u32>,
     cookie_rva: Option<u32>,
+    cookie_mirror: Option<(u32, u32)>,
 ) -> Option<Vec<u8>> {
     // Layout:
     //   [code]
@@ -456,6 +477,7 @@ fn build_container_stub_internal(
         data_section_rva,
         heap_global_rva,
         cookie_rva,
+        cookie_mirror,
     )?;
     let metadata_offset = measured_code.len().checked_add(15)? & !15;
     let container_meta_size = containers.len().checked_mul(CONTAINER_METADATA_SIZE)?;
@@ -494,6 +516,7 @@ fn build_container_stub_internal(
         data_section_rva,
         heap_global_rva,
         cookie_rva,
+        cookie_mirror,
     )?;
 
     if stub.len() > metadata_offset {
@@ -532,11 +555,13 @@ fn build_container_stub_internal(
         stub.resize(heap_global_meta_offset, 0xcc);
     }
     for g in heap_globals {
-        let flags = if g.is_heap_handle {
-            HEAP_GLOBAL_FLAG_HANDLE
-        } else {
-            0u32
-        };
+        let mut flags = 0u32;
+        if g.is_heap_handle {
+            flags |= HEAP_GLOBAL_FLAG_HANDLE;
+        }
+        if g.is_image_inline {
+            flags |= HEAP_GLOBAL_FLAG_IMAGE_INLINE;
+        }
         // Heap handles: content_size=0, no payload; plant GetProcessHeap at runtime.
         let content_len = if g.is_heap_handle { 0 } else { g.content.len() };
         stub.extend_from_slice(&g.rva.to_le_bytes());
@@ -609,6 +634,7 @@ fn build_stub_code(
     _data_section_rva: u32,
     heap_global_rva: Option<u32>,
     cookie_rva: Option<u32>,
+    cookie_mirror: Option<(u32, u32)>,
 ) -> Option<()> {
     // Preserve non-volatile registers (six pushes keep x64 alignment).
     // rbx = fixup-map cursor during phase 1
@@ -757,6 +783,13 @@ fn build_stub_code(
         let jz_handle_off = stub.len();
         stub.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
 
+        // flags bit1 → image-inline body restore (no HeapAlloc; dest = image+rva)
+        stub.extend_from_slice(&[0x41, 0xf6, 0x46, 0x0c, 0x02]); // test byte [r14+0xc], 2
+        stub.push(0x0f);
+        stub.push(0x85); // jnz rel32 .inline_path
+        let jnz_inline_off = stub.len();
+        stub.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+
         // ---- data object: HeapAlloc + memcpy + plant ----
         stub.extend_from_slice(&[0x4c, 0x89, 0xf9]); // mov rcx, r15
         stub.extend_from_slice(&[0x31, 0xd2]); // xor edx, edx
@@ -809,6 +842,47 @@ fn build_stub_code(
         let jmp_after_data_off = stub.len();
         stub.push(0x00);
 
+        // ---- image-inline path: memcpy into image+rva; map new_begin = dest ----
+        // R-GTO-UI: g_script body is addressed by lea, not via a pointer slot.
+        let inline_path = stub.len();
+        let jnz_inline_rel =
+            i32::try_from(inline_path as isize - (jnz_inline_off as isize + 4)).ok()?;
+        stub[jnz_inline_off..jnz_inline_off + 4].copy_from_slice(&jnz_inline_rel.to_le_bytes());
+
+        stub.extend_from_slice(&[0x41, 0x8b, 0x06]); // mov eax, [r14] ; rva
+        stub.extend_from_slice(&[0x85, 0xc0]); // test eax, eax
+        stub.push(0x0f);
+        stub.push(0x84); // jz rel32 .hg_advance
+        let jz_inline_norva_off = stub.len();
+        stub.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        stub.extend_from_slice(&[0x49, 0xba]); // movabs r10, image_base
+        stub.extend_from_slice(&image_base.to_le_bytes());
+        stub.extend_from_slice(&[0x49, 0x01, 0xc2]); // add r10, rax  ; dest
+        stub.extend_from_slice(&[0x4d, 0x89, 0xd4]); // mov r12, r10  ; new base = image body
+
+        // memcpy(dest, boot+data_off, size)
+        stub.extend_from_slice(&[0x4c, 0x89, 0xe1]); // mov rcx, r12
+        stub.extend_from_slice(&[0x48, 0x8d, 0x15, 0x00, 0x00, 0x00, 0x00]);
+        let rip_after_lea_i = stub.len() as u32;
+        if rip_after_lea_i <= 127 {
+            stub.extend_from_slice(&[0x48, 0x83, 0xea, rip_after_lea_i as u8]);
+        } else {
+            stub.extend_from_slice(&[0x48, 0x81, 0xea]);
+            stub.extend_from_slice(&rip_after_lea_i.to_le_bytes());
+        }
+        stub.extend_from_slice(&[0x41, 0x8b, 0x46, 0x08]); // mov eax, [r14+8] data_offset
+        stub.extend_from_slice(&[0x48, 0x01, 0xc2]); // add rdx, rax
+        stub.extend_from_slice(&[0x45, 0x8b, 0x46, 0x04]); // mov r8d, [r14+4]
+        stub.push(0xe8);
+        memcpy_sites.push(stub.len());
+        stub.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+
+        // map[i].new_begin = image body VA
+        stub.extend_from_slice(&[0x4c, 0x89, 0x63, 0x10]); // mov [rbx+0x10], r12
+        stub.push(0xeb); // jmp .hg_advance
+        let jmp_after_inline_off = stub.len();
+        stub.push(0x00);
+
         // ---- heap-handle path: plant GetProcessHeap, no map range ----
         let handle_path = stub.len();
         let jz_handle_rel =
@@ -834,8 +908,14 @@ fn build_stub_code(
             i32::try_from(hg_advance as isize - (jz_alloc_fail_off as isize + 4)).ok()?;
         stub[jz_alloc_fail_off..jz_alloc_fail_off + 4]
             .copy_from_slice(&jz_alloc_fail_rel.to_le_bytes());
+        let jz_inline_norva_rel =
+            i32::try_from(hg_advance as isize - (jz_inline_norva_off as isize + 4)).ok()?;
+        stub[jz_inline_norva_off..jz_inline_norva_off + 4]
+            .copy_from_slice(&jz_inline_norva_rel.to_le_bytes());
         stub[jmp_after_data_off] =
             u8::try_from(hg_advance.checked_sub(jmp_after_data_off + 1)?).ok()?;
+        stub[jmp_after_inline_off] =
+            u8::try_from(hg_advance.checked_sub(jmp_after_inline_off + 1)?).ok()?;
 
         stub.extend_from_slice(&[0x48, 0x83, 0xc3, 0x18]); // add rbx, 24
         stub.extend_from_slice(&[0x49, 0x83, 0xc6, 0x18]); // add r14, 24
@@ -1059,12 +1139,27 @@ fn build_stub_code(
     emit_nonvolatile_pops(stub);
 
     if let Some(oep) = original_entry_point {
+        // R-GTO-UI round 9: mirror live MSVC __security_cookie → AHK
+        // call-obfuscation cookie before OEP. Loader randomizes LOAD_CONFIG
+        // cookie before any code runs; dump plant of DEFAULT is insufficient.
+        // Uses rax only — clear_volatile_regs zeros it next.
+        if let Some((src_rva, dst_rva)) = cookie_mirror {
+            emit_cookie_mirror(stub, stub_rva, image_base, src_rva, dst_rva)?;
+        }
         // Phase-2 multi_fixup leaves Win64 volatiles dirty: last call uses
         // r8d = range size (often 0x8000 for HOT_LARGE_TABLE). AHK OEP at
         // 0x70b0 does `mov rbx,r8; test r8,r8; mov dword [r8],ecx` — a non-null
         // garbage r8 AVs at 0x8000 (W2 / R-GTO-LATEST). CRT's original
         // `jmp OEP` did not pass size leftovers; clear volatiles before transfer.
         emit_clear_volatile_regs(stub);
+        // WinMain (0x5a10) needs hInstance in rcx (CRT lea rcx,[__ImageBase]).
+        // Fixed-base dumps load at image_base; use that as module handle.
+        if oep == 0x5a10 {
+            stub.extend_from_slice(&[0x48, 0xb9]); // movabs rcx, imm64
+            stub.extend_from_slice(&image_base.to_le_bytes());
+            // rdx=0 (hPrev), r8=0 (lpCmdLine ok for AHK self-read), r9=10 SW_SHOWDEFAULT
+            stub.extend_from_slice(&[0x41, 0xb9, 0x0a, 0x00, 0x00, 0x00]); // mov r9d, 10
+        }
         stub.push(0xe9);
         let jmp_next = stub_rva.checked_add(stub.len() as u32)?.checked_add(4)?;
         stub.extend_from_slice(&relative_displacement(jmp_next, oep)?);
@@ -1072,6 +1167,64 @@ fn build_stub_code(
         stub.push(0xc3);
     }
 
+    Some(())
+}
+
+/// GTO host freezes on AHK WindowProc/message gate `0x70b0`. Resume must enter
+/// WinMain `0x5a10` (static sole caller from CRT). Verified by prologue match
+/// before retarget so unrelated samples are untouched.
+fn retarget_gto_resume_entry(dump_buf: &[u8], scanned_entry: u32) -> u32 {
+    const MSG_GATE: u32 = 0x70b0;
+    const WINMAIN: u32 = 0x5a10;
+    if scanned_entry != MSG_GATE {
+        return scanned_entry;
+    }
+    // 0x70b0 prologue: mov [rsp+8],rbx; push rdi; sub rsp,230h
+    let gate = MSG_GATE as usize;
+    let win = WINMAIN as usize;
+    if dump_buf.len() < win + 16 || dump_buf.len() < gate + 16 {
+        return scanned_entry;
+    }
+    let gate_ok = &dump_buf[gate..gate + 13]
+        == [
+            0x48, 0x89, 0x5c, 0x24, 0x08, // mov [rsp+8], rbx
+            0x57, // push rdi
+            0x48, 0x81, 0xec, 0x30, 0x02, 0x00, 0x00, // sub rsp, 230h
+        ];
+    // 0x5a10 prologue: mov [rsp+10h],rbx ; mov [rsp+18h],rsi
+    let win_ok = &dump_buf[win..win + 10]
+        == [
+            0x48, 0x89, 0x5c, 0x24, 0x10, // mov [rsp+10h], rbx
+            0x48, 0x89, 0x74, 0x24, 0x18, // mov [rsp+18h], rsi
+        ];
+    if gate_ok && win_ok {
+        tracing::info!(
+            from = format_args!("{MSG_GATE:#x}"),
+            to = format_args!("{WINMAIN:#x}"),
+            "R-GTO-UI: retarget resume entry msg-gate → WinMain"
+        );
+        WINMAIN
+    } else {
+        scanned_entry
+    }
+}
+
+/// `mov rax, [rip+src]; mov [rip+dst], rax` for image-relative cookie slots.
+fn emit_cookie_mirror(
+    stub: &mut Vec<u8>,
+    stub_rva: u32,
+    _image_base: u64,
+    src_rva: u32,
+    dst_rva: u32,
+) -> Option<()> {
+    // mov rax, qword ptr [rip + disp32]  48 8B 05 xx xx xx xx
+    stub.extend_from_slice(&[0x48, 0x8B, 0x05]);
+    let load_next = stub_rva.checked_add(stub.len() as u32)?.checked_add(4)?;
+    stub.extend_from_slice(&relative_displacement(load_next, src_rva)?);
+    // mov qword ptr [rip + disp32], rax  48 89 05 xx xx xx xx
+    stub.extend_from_slice(&[0x48, 0x89, 0x05]);
+    let store_next = stub_rva.checked_add(stub.len() as u32)?.checked_add(4)?;
+    stub.extend_from_slice(&relative_displacement(store_next, dst_rva)?);
     Some(())
 }
 
@@ -1165,6 +1318,66 @@ mod tests {
     }
 
     #[test]
+    fn oep_transfer_emits_cookie_mirror_before_clear_and_jmp() {
+        // R-GTO-UI round 9: mov rax,[src]; mov [dst],rax before clear/jmp.
+        let container = ContainerSnapshot {
+            rva: 0x145710,
+            decoded_begin: 0x10000,
+            decoded_end: 0x10048,
+            decoded_capacity: 0x100,
+            cookie: 0x1111_2222_3333_4444,
+            heap_content: vec![0u8; 0x48],
+        };
+        let oep = 0x70b0u32;
+        let stub_rva = 0x2000u32;
+        let src = 0x141020u32;
+        let dst = 0x1454b8u32;
+        let stub = build_container_stub_internal(
+            stub_rva,
+            Some(oep),
+            0x2100,
+            0x2108,
+            &[container],
+            &[],
+            None,
+            0x140000000,
+            0x141000,
+            None,
+            None,
+            Some((src, dst)),
+        )
+        .expect("stub with cookie mirror");
+
+        // Find `mov rax, [rip+disp]` then `mov [rip+disp], rax` near the end.
+        let load = stub
+            .windows(3)
+            .rposition(|b| b == [0x48, 0x8B, 0x05])
+            .expect("cookie load");
+        let store = stub
+            .windows(3)
+            .rposition(|b| b == [0x48, 0x89, 0x05])
+            .expect("cookie store");
+        assert!(store > load, "store must follow load");
+        let load_next = stub_rva as i64 + load as i64 + 7;
+        let load_disp = i32::from_le_bytes(stub[load + 3..load + 7].try_into().unwrap());
+        assert_eq!((load_next + i64::from(load_disp)) as u32, src);
+        let store_next = stub_rva as i64 + store as i64 + 7;
+        let store_disp = i32::from_le_bytes(stub[store + 3..store + 7].try_into().unwrap());
+        assert_eq!((store_next + i64::from(store_disp)) as u32, dst);
+
+        let clear = [
+            0x33, 0xc0, 0x33, 0xc9, 0x33, 0xd2, 0x4d, 0x33, 0xc0, 0x4d, 0x33, 0xc9, 0x4d, 0x33,
+            0xd2, 0x4d, 0x33, 0xdb,
+        ];
+        let pos = stub
+            .windows(clear.len())
+            .position(|w| w == clear)
+            .expect("clear after mirror");
+        assert!(pos > store, "clear must follow cookie store");
+        assert_eq!(stub[pos + clear.len()], 0xe9, "clear precedes near jmp");
+    }
+
+    #[test]
     fn oep_transfer_clears_volatile_regs_before_jmp() {
         // GTO W2: multi_fixup leaves r8=size; OEP treats r8 as optional ptr.
         let container = ContainerSnapshot {
@@ -1190,6 +1403,7 @@ mod tests {
             0x141000,
             None,
             None,
+            None, // cookie_mirror
         )
         .expect("container stub with OEP transfer");
         let clear = [
@@ -1344,6 +1558,7 @@ mod tests {
             0,
             None,
             None, // cookie_rva: metadata fallback
+            None, // cookie_mirror
         )
         .expect("TLS stub should build");
 
@@ -1380,6 +1595,7 @@ mod tests {
             0,
             None,
             None, // cookie_rva: metadata fallback
+            None, // cookie_mirror
         )
         .expect("TLS stub should build");
 

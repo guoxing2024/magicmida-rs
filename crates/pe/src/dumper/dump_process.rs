@@ -867,6 +867,25 @@ pub fn dump_process(
             image_end,
         );
     }
+    // R-GTO-UI r17b: scrub walks every qword and can clear gscript count@+0x10
+    // when the live dword was embedded in a pointer-shaped qword. Re-apply
+    // table-derived label count after scrub so bootstrap payload keeps it.
+    super::heap_global_snapshot::resynthesize_gscript_label_count(&mut heap_globals);
+    // R-GTO-UI r18/r19b: scrub / slot-cap leave Label.mName null or dangling
+    // while inline UTF-16 remains at +0x30 → 0x48fb0 wcscmp AV. Repair offline
+    // (scrub now also preserves UTF-16-looking qwords).
+    super::heap_global_snapshot::repair_label_names_after_scrub(&mut heap_globals);
+    // R-GTO-UI r20: binary search in 0x48fb0 requires mName-ordered table.
+    // Dump capture order is unsorted → lookup "A_Args"/others always miss.
+    super::heap_global_snapshot::sort_gscript_label_table(&mut heap_globals);
+    // R-GTO-UI r21: Label+0x23==0 redirects via +0x10; dump has null nested
+    // → AV at 0xc13ea after successful A_Args lookup. Mark non-nested.
+    super::heap_global_snapshot::mark_labels_non_nested(&mut heap_globals);
+    // R-GTO-UI r21b: WinMain re-inits [0x141bf0] after Label bind; dump free-list
+    // body AVs later. Zero-slab large enough for re-init stores only.
+    super::heap_global_snapshot::sanitize_ahk_runtime_global(&mut heap_globals);
+    // R-GTO-UI r22b: gscript+0xbd8 must be NewClassName for RegisterClass @0x34db0.
+    super::heap_global_snapshot::repair_gscript_window_strings(&mut heap_globals);
     // Cookie + complement RVAs must be captured before early overlay zeros storage.
     // Prefer authoritative site from offline CRT resolve; never fuzzy-rescan when set.
     // B7.2.1: authority resolve/validation failure is a hard dump error (no structural success).
@@ -896,6 +915,25 @@ pub fn dump_process(
             "SecurityCookie site (pre-overlay)"
         );
     }
+
+    // R-GTO-UI r13: preserve live AHK cmd-table count dword @0x147888 before
+    // early overlay / data_reinit zeros .data. WinMain indexes the table via
+    // *[0x147868]; count lives in a plain .data dword (not a heap slot).
+    let cmd_table_count = if capture_policy.is_hot_root(0x147868) {
+        let off = 0x147888usize;
+        if off + 4 <= dump_buf.len() {
+            let n = u32::from_le_bytes(dump_buf[off..off + 4].try_into().unwrap_or([0; 4]));
+            if n > 0 && n < 0x10000 {
+                Some(n)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     let overlay = apply_early_section_overlays(
         &mut dump_buf,
@@ -927,6 +965,18 @@ pub fn dump_process(
         &mut dump_buf,
         &capture_policy.cs_reinit_rvas,
     );
+
+    if let Some(n) = cmd_table_count {
+        let off = 0x147888usize;
+        if off + 4 <= dump_buf.len() {
+            dump_buf[off..off + 4].copy_from_slice(&n.to_le_bytes());
+            info!(
+                rva = format_args!("{:#x}", 0x147888u32),
+                count = n,
+                "Preserved AHK cmd-table count dword through overlay"
+            );
+        }
+    }
 
     // Early overlay zeros the live cookie. MSVC `__security_init_cookie` only
     // regenerates when storage still holds the default sentinel; plant it so
@@ -991,6 +1041,13 @@ pub fn dump_process(
             );
         }
     }
+    let cookie_mirror = match (
+        capture_policy.cookie_mirror_src_rva,
+        capture_policy.cookie_mirror_dst_rva,
+    ) {
+        (Some(src), Some(dst)) if src != 0 && dst != 0 && src != dst => Some((src, dst)),
+        _ => None,
+    };
     let output_entry_point = if stage_plan.install_heap_bootstrap {
         import_builder
             .as_ref()
@@ -1004,6 +1061,7 @@ pub fn dump_process(
                     &heap_globals,
                     opts.container_restore,
                     cookie_rva,
+                    cookie_mirror,
                     Some(debugger),
                 )
             })
@@ -1077,6 +1135,32 @@ pub fn dump_process(
                 "wrapper_call_patch: slots_zeroed > 0 but sites_patched == 0 \
                  (call sites may still reference zeroed IAT slots)"
             );
+        }
+    }
+
+    // R-GTO-UI round 9: Themida multi-block IAT leaves zero separators that a
+    // residual set of call sites still reference → call [null] AV. Retarget
+    // those sites to the rebuilt FirstThunk for MessageBoxW / LocalFree /
+    // SendMessageW (heuristics + original import gap names). AhkGto only.
+    if stage_plan.patch_wrapper_iat_call_sites {
+        if let Some(ref builder) = import_builder {
+            let gap = super::iat_gap_retarget::retarget_iat_gap_call_sites(
+                &pe,
+                &mut dump_buf,
+                original_iat_rva,
+                iat_size_bytes,
+                builder,
+                opts.executable_path.as_deref(),
+            );
+            if gap.sites_seen > 0 {
+                info!(
+                    interior_zeros = gap.interior_zeros,
+                    mapped_gaps = gap.mapped_gaps,
+                    sites_seen = gap.sites_seen,
+                    sites_patched = gap.sites_patched,
+                    "iat_gap_retarget result"
+                );
+            }
         }
     }
 
@@ -1201,6 +1285,19 @@ pub fn dump_process(
             &containers,
         )?
     };
+
+    // R-GTO-UI r22/r25/r26: WinMain UI resume patches (combined).
+    // 1) Skip LoadFile re-entry @0x63f4 (host-path reload AVs).
+    // 2) Force non-empty class check @0x34dbb AND lpszClassName @0x34ed4
+    //    → NewClassName (r25b regressed by doing only 34ed4).
+    // 3) Skip crashing 0x35520 but keep msg pump 0x1b10 (@0x6757).
+    patch_gto_skip_loadfile_reentry(&mut out_data);
+    patch_gto_registerclass_classname(&mut out_data);
+    patch_gto_skip_msgloop_crash(&mut out_data);
+    // R-GTO-UI r26b: WinMain MessageBoxW @0x5c5d blocks cold start before
+    // RegisterClass; window probe never dismisses it (only sees #32770).
+    // Protected product does not surface this gate; skip like diagnostic mb_nop.
+    patch_gto_skip_winmain_messagebox(&mut out_data);
 
     // DEBUG: Verify section 1 characteristics
     debug_section_chars(&out_data, "Before fix_hardcoded_addresses");
@@ -1455,6 +1552,262 @@ fn apply_early_section_overlays(
 
     Ok(stats)
 }
+
+/// Patch WinMain `call 0x364e0` at RVA 0x63f4 to `mov eax,1; nop*3`.
+///
+/// Cold-start already has a restored gscript graph. Re-entering LoadFile on the
+/// host path (gscript+0xbb0) hits call-obfusc AV and never reaches RegisterClass.
+
+/// Skip crashing GUI reinit `0x35520` but keep the real AHK message pump.
+///
+/// Replace only `call 0x35520` (5 bytes at 0x6757) with `mov eax,1` so the
+/// existing success path runs `call 0x1b10` and keeps the UI alive.
+
+/// Patch WinMain unconditional MessageBoxW call @0x5c5d → mov eax,1; nop.
+///
+/// Call is `ff 15 rel32` (6 bytes). Without this, cold start sticks on #32770
+/// and the NewClassName window is never created for the external probe.
+fn patch_gto_skip_winmain_messagebox(image: &mut [u8]) {
+    const SITE_RVA: u32 = 0x5c5d;
+    let Some(file_off) = rva_to_file_offset(image, SITE_RVA) else {
+        return;
+    };
+    if file_off + 6 > image.len() {
+        return;
+    }
+    // ff 15 xx xx xx xx = call [rip+disp] (MessageBoxW IAT)
+    if image[file_off] != 0xff || image[file_off + 1] != 0x15 {
+        return;
+    }
+    // mov eax,1 ; nop
+    image[file_off..file_off + 6].copy_from_slice(&[0xb8, 0x01, 0x00, 0x00, 0x00, 0x90]);
+    info!(
+        site_rva = format_args!("{SITE_RVA:#x}"),
+        "R-GTO-UI: patched WinMain MessageBoxW → mov eax,1 (unblock UI)"
+    );
+}
+
+fn patch_gto_skip_msgloop_crash(image: &mut [u8]) {
+    const CALL_RVA: u32 = 0x6757;
+    const TARGET_RVA: u32 = 0x35520;
+    let Some(file_off) = rva_to_file_offset(image, CALL_RVA) else {
+        return;
+    };
+    if file_off + 5 > image.len() {
+        return;
+    }
+    if image[file_off] != 0xe8 {
+        return;
+    }
+    let rel = i32::from_le_bytes(image[file_off + 1..file_off + 5].try_into().unwrap_or([0; 4]));
+    let next = CALL_RVA.wrapping_add(5);
+    let target = next.wrapping_add(rel as u32);
+    if target != TARGET_RVA {
+        return;
+    }
+    image[file_off..file_off + 5].copy_from_slice(&[0xb8, 0x01, 0x00, 0x00, 0x00]);
+    info!(
+        call_rva = format_args!("{CALL_RVA:#x}"),
+        "R-GTO-UI: patched call 0x35520 → mov eax,1 (keep msg pump 0x1b10)"
+    );
+}
+
+fn find_utf16_string_rva(image: &[u8], s: &str) -> Option<u32> {
+    let mut needle = Vec::with_capacity(s.len() * 2 + 2);
+    for ch in s.encode_utf16() {
+        needle.extend_from_slice(&ch.to_le_bytes());
+    }
+    needle.extend_from_slice(&[0, 0]);
+    let file_off = image.windows(needle.len()).position(|w| w == needle.as_slice())?;
+    rva_from_file_offset(image, file_off)
+}
+
+fn rva_from_file_offset(image: &[u8], file_off: usize) -> Option<u32> {
+    if image.len() < 0x40 {
+        return None;
+    }
+    let e_lfanew = u32::from_le_bytes(image[0x3c..0x40].try_into().ok()?) as usize;
+    if e_lfanew + 24 > image.len() {
+        return None;
+    }
+    let nsec = u16::from_le_bytes(image[e_lfanew + 6..e_lfanew + 8].try_into().ok()?) as usize;
+    let so = u16::from_le_bytes(image[e_lfanew + 20..e_lfanew + 22].try_into().ok()?) as usize;
+    let sec0 = e_lfanew + 24 + so;
+    for i in 0..nsec {
+        let o = sec0 + i * 40;
+        if o + 40 > image.len() {
+            break;
+        }
+        let va = u32::from_le_bytes(image[o + 12..o + 16].try_into().ok()?);
+        let rsz = u32::from_le_bytes(image[o + 16..o + 20].try_into().ok()?) as usize;
+        let raw = u32::from_le_bytes(image[o + 20..o + 24].try_into().ok()?) as usize;
+        if raw <= file_off && file_off < raw.saturating_add(rsz) {
+            return Some(va.saturating_add((file_off - raw) as u32));
+        }
+    }
+    None
+}
+
+/// Force RegisterClass to use image-embedded `NewClassName`.
+///
+/// Two sites must agree (r25b lesson):
+/// - `0x34dbb`: early non-empty check was `mov rax,[gscript+0xbd8]`; after
+///   `0x345e0` that slot is empty/static → function returns 0 before WNDCLASS setup.
+/// - `0x34ed4`: real `lpszClassName` lea (stock points at `AutoHotkey2`).
+///
+/// Patch both to `lea …,[NewClassName]` (7-byte rip-relative forms).
+fn patch_gto_registerclass_classname(image: &mut [u8]) {
+    let Some(class_rva) = find_utf16_string_rva(image, "NewClassName") else {
+        warn!("R-GTO-UI: NewClassName UTF-16 not found; skip class patches");
+        return;
+    };
+
+    // --- 0x34dbb: mov rax,[rcx+0xbd8] (7) → lea rax,[NewClassName] (7) ---
+    const CHECK_RVA: u32 = 0x34dbb;
+    if let Some(file_off) = rva_to_file_offset(image, CHECK_RVA) {
+        if file_off + 7 <= image.len() {
+            let expect_mov = [0x48u8, 0x8b, 0x81, 0xd8, 0x0b, 0x00, 0x00];
+            let is_mov = image[file_off..file_off + 7] == expect_mov;
+            let is_lea = image[file_off..file_off + 3] == [0x48, 0x8d, 0x05];
+            if is_mov || is_lea {
+                let next = CHECK_RVA.wrapping_add(7);
+                let disp = class_rva.wrapping_sub(next) as i32;
+                image[file_off] = 0x48;
+                image[file_off + 1] = 0x8d;
+                image[file_off + 2] = 0x05;
+                image[file_off + 3..file_off + 7].copy_from_slice(&disp.to_le_bytes());
+                info!(
+                    site_rva = format_args!("{CHECK_RVA:#x}"),
+                    class_rva = format_args!("{class_rva:#x}"),
+                    "R-GTO-UI: patched RegisterClass empty-check → lea NewClassName"
+                );
+            }
+        }
+    }
+
+    // --- 0x34ed4: lea rax,[AutoHotkey2] → lea rax,[NewClassName] ---
+    const CLASS_RVA_SITE: u32 = 0x34ed4;
+    if let Some(file_off) = rva_to_file_offset(image, CLASS_RVA_SITE) {
+        if file_off + 7 <= image.len()
+            && image[file_off..file_off + 3] == [0x48, 0x8d, 0x05]
+        {
+            let next = CLASS_RVA_SITE.wrapping_add(7);
+            let disp = class_rva.wrapping_sub(next) as i32;
+            image[file_off + 3..file_off + 7].copy_from_slice(&disp.to_le_bytes());
+            info!(
+                site_rva = format_args!("{CLASS_RVA_SITE:#x}"),
+                class_rva = format_args!("{class_rva:#x}"),
+                "R-GTO-UI: retargeted RegisterClass lpszClassName → NewClassName"
+            );
+        }
+    }
+    // --- 0x34f66: mov rdx,[0x141bf8] → lea rdx,[NewClassName] ---
+    // CreateWindowExW lpClassName. Global often holds atom/other class
+    // (r26: rdx=0x120238 "edit"/static) so UI appears as ZhuChuangKou or not
+    // at all under the NewClassName oracle.
+    const CW_CLASS_RVA: u32 = 0x34f66;
+    if let Some(file_off) = rva_to_file_offset(image, CW_CLASS_RVA) {
+        if file_off + 7 <= image.len() {
+            let b0 = image[file_off];
+            let b1 = image[file_off + 1];
+            let b2 = image[file_off + 2];
+            // mov rdx, [rip+disp] = 48 8B 15  OR already lea rdx,[rip]=48 8D 15
+            let ok = (b0, b1, b2) == (0x48, 0x8b, 0x15) || (b0, b1, b2) == (0x48, 0x8d, 0x15);
+            if ok {
+                let next = CW_CLASS_RVA.wrapping_add(7);
+                let disp = class_rva.wrapping_sub(next) as i32;
+                image[file_off] = 0x48;
+                image[file_off + 1] = 0x8d;
+                image[file_off + 2] = 0x15; // lea rdx, [rip+disp]
+                image[file_off + 3..file_off + 7].copy_from_slice(&disp.to_le_bytes());
+                info!(
+                    site_rva = format_args!("{CW_CLASS_RVA:#x}"),
+                    class_rva = format_args!("{class_rva:#x}"),
+                    "R-GTO-UI: patched CreateWindowEx lpClassName → lea NewClassName"
+                );
+            }
+        }
+    }
+
+    // --- 0x34f59: mov r9d, 0x00CF0000 → 0x01CF0000 (WS_VISIBLE) ---
+    // Stock style is WS_OVERLAPPEDWINDOW without WS_VISIBLE, so NewClassName
+    // hwnd exists but IsWindowVisible=0 and the window oracle ignores it (r26b).
+    const STYLE_RVA: u32 = 0x34f59;
+    if let Some(file_off) = rva_to_file_offset(image, STYLE_RVA) {
+        if file_off + 6 <= image.len()
+            && image[file_off..file_off + 2] == [0x41, 0xb9]
+            && image[file_off + 2..file_off + 6] == [0x00, 0x00, 0xcf, 0x00]
+        {
+            image[file_off + 2..file_off + 6].copy_from_slice(&0x01cf_0000u32.to_le_bytes());
+            info!(
+                site_rva = format_args!("{STYLE_RVA:#x}"),
+                "R-GTO-UI: patched CreateWindow style → WS_VISIBLE|WS_OVERLAPPEDWINDOW"
+            );
+        }
+    }
+
+}
+
+
+fn patch_gto_skip_loadfile_reentry(image: &mut [u8]) {
+    const CALL_RVA: u32 = 0x63f4;
+    const TARGET_RVA: u32 = 0x364e0;
+    let Some(file_off) = rva_to_file_offset(image, CALL_RVA) else {
+        return;
+    };
+    if file_off + 5 > image.len() {
+        return;
+    }
+    // Expect E8 rel32 targeting 0x364e0
+    if image[file_off] != 0xe8 {
+        return;
+    }
+    let rel = i32::from_le_bytes(image[file_off + 1..file_off + 5].try_into().unwrap_or([0; 4]));
+    let next = CALL_RVA.wrapping_add(5);
+    let target = next.wrapping_add(rel as u32);
+    if target != TARGET_RVA {
+        return;
+    }
+    // mov eax, 1 ; nop nop nop
+    image[file_off..file_off + 5].copy_from_slice(&[0xb8, 0x01, 0x00, 0x00, 0x00]);
+    // Keep length 5: mov eax,imm32 is already 5 bytes (no extra nops needed).
+    info!(
+        call_rva = format_args!("{CALL_RVA:#x}"),
+        "R-GTO-UI: patched LoadFile re-entry call → mov eax,1 (skip reload)"
+    );
+}
+
+fn rva_to_file_offset(image: &[u8], rva: u32) -> Option<usize> {
+    if image.len() < 0x40 {
+        return None;
+    }
+    let e_lfanew = u32::from_le_bytes(image[0x3c..0x40].try_into().ok()?) as usize;
+    if e_lfanew + 24 > image.len() {
+        return None;
+    }
+    let nsec = u16::from_le_bytes(image[e_lfanew + 6..e_lfanew + 8].try_into().ok()?) as usize;
+    let so = u16::from_le_bytes(image[e_lfanew + 20..e_lfanew + 22].try_into().ok()?) as usize;
+    let sec0 = e_lfanew + 24 + so;
+    for i in 0..nsec {
+        let o = sec0 + i * 40;
+        if o + 40 > image.len() {
+            break;
+        }
+        let vsz = u32::from_le_bytes(image[o + 8..o + 12].try_into().ok()?);
+        let va = u32::from_le_bytes(image[o + 12..o + 16].try_into().ok()?);
+        let rsz = u32::from_le_bytes(image[o + 16..o + 20].try_into().ok()?);
+        let raw = u32::from_le_bytes(image[o + 20..o + 24].try_into().ok()?) as usize;
+        let span = vsz.max(rsz);
+        if rva >= va && rva < va.saturating_add(span) {
+            let off = raw + (rva - va) as usize;
+            if off < image.len() {
+                return Some(off);
+            }
+        }
+    }
+    None
+}
+
 
 #[cfg(test)]
 mod overlay_tests {

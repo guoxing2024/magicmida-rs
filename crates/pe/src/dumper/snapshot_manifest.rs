@@ -233,6 +233,10 @@ pub(crate) fn render_manifest_json(
             if g.is_heap_handle { "true" } else { "false" }
         ));
         buf.push_str(&format!(
+            "      \"is_image_inline\": {},\n",
+            if g.is_image_inline { "true" } else { "false" }
+        ));
+        buf.push_str(&format!(
             "      \"is_graph_child\": {}\n",
             if g.rva == 0 { "true" } else { "false" }
         ));
@@ -314,12 +318,14 @@ mod tests {
                 live_ptr: 0x3971ff0,
                 content: vec![0u8; 0x4000],
                 is_heap_handle: false,
+            is_image_inline: false,
             },
             HeapGlobalSnapshot {
                 rva: 0,
                 live_ptr: 0x10000,
                 content: vec![0u8; 64],
                 is_heap_handle: false,
+            is_image_inline: false,
             },
         ];
         let policy = DumpCapturePolicy::ahk_gto_default();

@@ -1,41 +1,32 @@
-# WORKER_HANDOFF — Unattended freeze (audit-ready)
+# WORKER_HANDOFF — R-REPRO-10× CLOSED (battlefield 1 toward 1.0)
 
-## Status
+## 1.0 distance (after battlefield 1)
 
-| Item | Status |
-|------|--------|
-| P0 / P1 dual_select / post_loop / early_snapshots | **DONE** |
-| U1 post_attach | **DONE** (`e99cda6`) |
-| U1 loop_state | **DONE** (`f66e157`) |
-| Shared `ThemidaState` / main debug loop body | **residual** (honest) |
-| B-A0..B-A3 synthetic | **DONE** |
-| Pure default / VNEXT-BEH | **not** opened |
-| Unattended plan | [docs/UNATTENDED_EXECUTION_PLAN.md](docs/UNATTENDED_EXECUTION_PLAN.md) |
-| **Audit package (accept here)** | [docs/AUDIT_PACKAGE_20260724.md](docs/AUDIT_PACKAGE_20260724.md) |
+| Dimension | Bar | Status |
+|-----------|-----|--------|
+| Structure (R0B) | independent static gate | **Pass** (4/4 StructuralPassBehaviorPending) |
+| Load | loader-valid | **Pass** (4/4) |
+| Reproducibility | Oreans 10× consecutive isolated | **Pass** (4/4 × 10/10) ← closed this battlefield |
+| Behavioral equivalence | product logic parity | **NOT MET** (R-PURE-LOGIC) |
+| Multi-family production | ≥2 production-grade plugins | **NOT MET** (GTO still experimental opt-in) |
+| product 1.0 | all dimensions | **Still NO** |
 
-## HEAD
+## Battlefield 1 — R-REPRO-10× (CLOSED, zero code change)
 
-`f66e157` on `baseline/legacy-recovery-20260722`
+- Strict 10× isolated attempt=1 revealed bb_gate_pin used **stale pre-W1/W2 candidates**.
+- Origin pin (pre-scrub) = 6/10; GTO r4c pin (pre-clearregs) = 4/10.
+- Refreshed to current-CLI dumps: Origin fresh pure = 10/10; GTO fresh gtoexp (r26b) = 10/10.
+- All 4 R0B StructuralPassBehaviorPending.
+- Evidence: `D:\MidaVault\lab\evidence\_beh_gateepro10x_baseline_20260725epro10x_summary.json`
+- Code changes: 0.
 
-## Engineering smokes (not gates)
+## Next battlefields (toward 1.0)
 
-| Case | Batch | OK |
-|------|-------|----|
-| Origin | `…012108_u1_loop_state_origin` | EP 0x13e0 R0B Pending IAT 295/295 |
-| Lunlun | `…011721_u1_lunlun_reg` | EP 0x1656f4 R0B Pending |
-| Holdout | `…011818_u1_holdout_reg` | EP 0x35000 R0B Pending |
-| GTO | `…012147_u1_loop_state_gto` | EP 0xecc000 ahk_gto R0B Pending |
-| B-A3 | `batch_20260724-011835_ba3` | all_ok; check-static never Accepted |
+1. **R-PURE-LOGIC** — behavioral equivalence (the real 1.0 wall). Needs a stronger oracle than load survival. Research-level; no clean 2-round path yet.
+2. **Multi-family production** — promote GTO from experimental opt-in to production default. Risks sample-specific patch surface.
 
-## Freeze reason
+Per Q2: each battlefield max 2 rounds code→rebuild→live, then residual stop.
 
-No further **safe** unattended slice closes perfect-unpack without deliberately
-opening B-B (VNEXT-BEH) or pure default. Human decisions listed in audit package §8.
+## Freeze
 
-## Re-run
-
-```text
-cmd /c tools\_unattended_regression.cmd
-cargo test -p mida-acceptance --offline
-python tools\_behavior_ba3_smoke.py
-```
+product 1.0 = NO. Reproducibility dimension now honestly met. Stop unless next battlefield authorized.

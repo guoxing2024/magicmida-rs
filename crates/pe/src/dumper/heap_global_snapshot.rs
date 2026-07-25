@@ -100,16 +100,28 @@ const MIN_FILL_ONLY_CAPTURE_BYTES: usize = MAX_HEAP_GLOBAL_BYTES + 1;
 /// bootstrap must plant `GetProcessHeap()` into the slot — never memcpy the
 /// HEAP structure (that yields RtlpWaitOnCriticalSection AVs on the next
 /// `HeapAlloc`).
+///
+/// When `is_image_inline` is set, `rva` is the **object body** in the image
+/// (e.g. AHK `g_script` at `0x149d50`, used as `lea rcx,[g_script]`), not an
+/// 8-byte pointer slot. Capture reads live image bytes at `image_base+rva`;
+/// bootstrap memcpys into that image address and records fixup
+/// `old=live_ptr(=image_base+rva) → new=image_base+rva` so child edges that
+/// still hold the live image base remap correctly. Planting a heap clone at
+/// `*[rva]` is wrong for this class (R-GTO-UI script-heap-resume).
 #[derive(Debug, Clone)]
 pub struct HeapGlobalSnapshot {
     /// Image RVA of the 8-byte slot that holds the heap pointer (`0` = no plant).
+    /// For `is_image_inline`, RVA of the in-image object body.
     pub rva: u32,
     /// Live heap address (for fixup math at runtime).
+    /// For `is_image_inline`, live image VA of the object (`image_base+rva`).
     pub live_ptr: u64,
     /// Bytes captured from the live heap object (empty when `is_heap_handle`).
     pub content: Vec<u8>,
     /// Slot holds a heap handle, not a data blob.
     pub is_heap_handle: bool,
+    /// Object body lives in the image at `rva` (not a pointer slot).
+    pub is_image_inline: bool,
 }
 
 /// Ensure image sections that receive heap-global plant writes are MEM_WRITE.
@@ -432,6 +444,7 @@ pub fn detect_heap_globals(
                 live_ptr: value,
                 content: Vec::new(),
                 is_heap_handle: true,
+            is_image_inline: false,
             });
             continue;
         }
@@ -571,6 +584,7 @@ pub fn detect_heap_globals(
             live_ptr: value,
             content,
             is_heap_handle: false,
+        is_image_inline: false,
         });
     }
 
@@ -591,6 +605,19 @@ pub fn detect_heap_globals(
         policy,
     );
 
+    // R-GTO-UI r15: image-inline gscript MUST precede first-hop/expand.
+    // Otherwise first-hop walks the mistaken heap clone (32KiB free-list),
+    // then image-inline replaces the root with a different pointer layout;
+    // WinMain `0x48fb0` label lookup on image gscript returns null (r14b).
+    capture_image_inline_gscript(
+        &mut out,
+        &mut total_bytes,
+        image_base,
+        dump_buf,
+        debugger,
+        policy,
+    );
+
     // p21: force-admit *every* heap pointer in gscript's first-hop span before
     // ranked expand. Ranked multi-hop was filling 160 slots with free-list
     // noise while scrub zeroed +0x10..+0xf8 (packed has 32 live edges).
@@ -603,6 +630,87 @@ pub fn detect_heap_globals(
         dump_buf,
         debugger,
         policy,
+    );
+
+    // R-GTO-UI r16: gscript+0 object +0x18 next-link was interior of a 32KiB
+    // free-list parent (0x148c00). exact-base multi_fixup left stale VA →
+    // WinMain post-MB string walk hits process freelist (0x03500350 pattern)
+    // at 0x57d01. Force-admit exact bases for AHK link fields on first-hop kids.
+    exhaust_gscript_child_link_fields(
+        &mut out,
+        &mut total_bytes,
+        &mut seen_heaps,
+        image_base,
+        image_end,
+        dump_buf,
+        debugger,
+        policy,
+    );
+
+    // R-GTO-UI r17: synthesize label count *before* sanitize. sanitize used to
+    // walk the gscript+0 pointer table as "object links" and null interior
+    // label entries → count saw leading zeros and no-op'd (r16b).
+    synthesize_gscript_label_count(&mut out);
+
+    // Also force-admit every entry in the label pointer table so multi_fixup
+    // can exact-base remap and sanitize will not null them as interiors.
+    exhaust_gscript_label_table_entries(
+        &mut out,
+        &mut total_bytes,
+        &mut seen_heaps,
+        image_base,
+        image_end,
+        dump_buf,
+        debugger,
+        policy,
+    );
+
+    // After link force-admit: null remaining uncaptured link targets that are
+    // only interiors of oversized free-list parents (cannot exact-remap).
+    // Skips dense pointer tables (label/cmd arrays).
+    sanitize_dangling_object_links(&mut out, image_base, image_end);
+
+    // R-GTO-UI r17b: re-synthesize AFTER sanitize. Live image body may hold a
+    // heap pointer whose low dword looks like count (e.g. 334) at +0x10; sanitize
+    // then zeros the whole qword → PE payload count=0 (r17). Force count from
+    // the exact-captured label table after all nulling.
+    synthesize_gscript_label_count(&mut out);
+
+    // R-GTO-UI r14: main loop often RPM-probes 0x147868 to 32KiB (free-list
+    // swallow). Resize to live count@0x147888 * 8 *before* first-hop so we do
+    // not admit garbage edges past the real table → post-MB c0000374.
+    normalize_cmd_table_capture(&mut out, &mut total_bytes, dump_buf, debugger);
+
+    // R-GTO-UI r13: cmd/dispatch table @0x147868 is a pointer array. Without
+    // exact children, scrub zeros almost all entries → WinMain AV @0x5747a
+    // even when the table slot + count are restored.
+    exhaust_pointer_table_first_hop(
+        &mut out,
+        &mut total_bytes,
+        &mut seen_heaps,
+        image_base,
+        image_end,
+        dump_buf,
+        debugger,
+        0x147868,
+        policy.first_hop_probe(),
+    );
+
+    // R-GTO-UI r14: AHK global @0x141bf0 field +0xd8 held interior of a
+    // 1KiB child (not exact base) → multi_fixup left stale VA → AV @0x49055
+    // `cmp byte [rax+0x78],0x62` after MessageBox path (r13=[0x141bf0]).
+    // Span capped: full 13KiB root is not a dense pointer table.
+    exhaust_pointer_table_first_hop_span(
+        &mut out,
+        &mut total_bytes,
+        &mut seen_heaps,
+        image_base,
+        image_end,
+        dump_buf,
+        debugger,
+        0x141bf0,
+        0x200, // cover +0xd8 and nearby fields only
+        policy.first_hop_probe(),
     );
 
     // Then: multi-hop from hot gscript roots (bounded) so title / string-table
@@ -673,6 +781,11 @@ pub fn detect_heap_globals(
         policy,
     );
 
+    // R-GTO-UI r19: drop AHK SimpleHeap bump-allocator control slots so cold
+    // start re-inits a fresh 64KiB arena (0xb94a0) instead of replaying an
+    // exhausted dump-time block (WinMain 0xb9360 alloc fail → AV).
+    drop_ahk_string_arena_slots(&mut out, &mut total_bytes);
+
     // multi_fixup first-match: prefer smaller/exact ranges over large parents.
     out.sort_by(|a, b| {
         a.content
@@ -712,6 +825,182 @@ pub fn detect_heap_globals(
         );
     }
     out
+}
+
+/// Capture AHK `g_script` as an in-image object body.
+///
+/// Live dump often has a heap pointer in the first qword of `.data@gscript`,
+/// so the main loop classifies it as a pointer slot and plants a heap clone.
+/// Product code uses `lea rcx,[gscript]` and reads fields at `+0xbd8` etc.
+/// from the **image** object — the heap clone never receives those stores.
+fn capture_image_inline_gscript(
+    out: &mut Vec<HeapGlobalSnapshot>,
+    total_bytes: &mut usize,
+    image_base: u64,
+    dump_buf: &[u8],
+    debugger: &mut dyn mida_core::DebuggerCore,
+    policy: &DumpCapturePolicy,
+) {
+    let Some(gscript_rva) = policy.gscript_root() else {
+        return;
+    };
+    if gscript_rva == 0 {
+        return;
+    }
+
+    // Drop the mistaken pointer-slot capture of the same RVA (if any).
+    if let Some(idx) = out
+        .iter()
+        .position(|g| g.rva == gscript_rva && !g.is_image_inline)
+    {
+        let removed = out.remove(idx);
+        *total_bytes = total_bytes.saturating_sub(removed.content.len());
+        info!(
+            rva = format_args!("{gscript_rva:#x}"),
+            old_live = format_args!("{:#x}", removed.live_ptr),
+            old_size = removed.content.len(),
+            "Replacing gscript pointer-slot capture with image-inline body"
+        );
+    } else if out.iter().any(|g| g.rva == gscript_rva && g.is_image_inline) {
+        return;
+    }
+
+    let live_va = image_base.saturating_add(gscript_rva as u64);
+    // Need at least through the title/class field used by RegisterClass path
+    // (`[g_script+0xbd8]`). Cap by policy + remaining image dump bytes.
+    // Hard-cap to the host section's virtual size so image-inline memcpy never
+    // walks past `.data` (r11 AV: 0x149d50+0x8000 > .data end 0x14ca74).
+    let section_remain = {
+        let mut rem = 0usize;
+        // walk dump_buf PE sections via simple PE parse of dump_buf itself
+        if dump_buf.len() > 0x40 {
+            let e_lfanew =
+                u32::from_le_bytes(dump_buf[0x3c..0x40].try_into().unwrap_or_default()) as usize;
+            if e_lfanew + 24 < dump_buf.len() {
+                let nsec = u16::from_le_bytes(
+                    dump_buf[e_lfanew + 6..e_lfanew + 8]
+                        .try_into()
+                        .unwrap_or_default(),
+                ) as usize;
+                let so = u16::from_le_bytes(
+                    dump_buf[e_lfanew + 20..e_lfanew + 22]
+                        .try_into()
+                        .unwrap_or_default(),
+                ) as usize;
+                let sec0 = e_lfanew + 24 + so;
+                for i in 0..nsec {
+                    let o = sec0 + i * 40;
+                    if o + 40 > dump_buf.len() {
+                        break;
+                    }
+                    let va = u32::from_le_bytes(
+                        dump_buf[o + 12..o + 16].try_into().unwrap_or_default(),
+                    );
+                    let vsz = u32::from_le_bytes(
+                        dump_buf[o + 8..o + 12].try_into().unwrap_or_default(),
+                    );
+                    if gscript_rva >= va && gscript_rva < va.saturating_add(vsz.max(1)) {
+                        rem = va
+                            .saturating_add(vsz)
+                            .saturating_sub(gscript_rva) as usize;
+                        break;
+                    }
+                }
+            }
+        }
+        rem
+    };
+    let min_need = 0xC00usize;
+    let mut cap = policy.gscript_content_cap().max(min_need).min(MAX_HEAP_GLOBAL_BYTES);
+    if section_remain > 0 {
+        cap = cap.min(section_remain);
+    }
+    let mut size = 0usize;
+    for &probe in &SIZE_PROBES {
+        if probe > cap {
+            break;
+        }
+        if can_read(debugger, live_va, probe, cap) {
+            size = probe;
+        } else {
+            break;
+        }
+    }
+    if size < min_need {
+        // Fall back to dump_buf image bytes if live RPM is short.
+        let off = gscript_rva as usize;
+        if off < dump_buf.len() {
+            let avail = dump_buf.len().saturating_sub(off).min(cap);
+            if avail >= min_need {
+                size = avail;
+            }
+        }
+    }
+    if size < min_need {
+        warn!(
+            rva = format_args!("{gscript_rva:#x}"),
+            size,
+            "gscript image-inline capture too small; leaving without inline body"
+        );
+        return;
+    }
+
+    let mut content = match alloc_capped(size, cap, "gscript image-inline") {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    let mut got = 0usize;
+    match debugger.read_memory(live_va as usize, &mut content) {
+        Ok(n) => got = n,
+        Err(e) => {
+            warn!(
+                rva = format_args!("{gscript_rva:#x}"),
+                err = %e,
+                "gscript image-inline live read failed; trying dump_buf"
+            );
+        }
+    }
+    if got < min_need {
+        let off = gscript_rva as usize;
+        if off + min_need <= dump_buf.len() {
+            let n = size.min(dump_buf.len() - off);
+            content[..n].copy_from_slice(&dump_buf[off..off + n]);
+            got = n;
+        }
+    }
+    if got < min_need {
+        warn!(
+            rva = format_args!("{gscript_rva:#x}"),
+            got,
+            "gscript image-inline capture failed"
+        );
+        return;
+    }
+    content.truncate(got);
+    // Drop only trailing zero runs beyond min_need (object has sparse fields).
+    while content.len() > min_need {
+        let new_len = content.len() - 16;
+        if content[new_len..].iter().all(|&b| b == 0) {
+            content.truncate(new_len);
+        } else {
+            break;
+        }
+    }
+
+    *total_bytes = total_bytes.saturating_add(content.len());
+    info!(
+        rva = format_args!("{gscript_rva:#x}"),
+        live = format_args!("{live_va:#x}"),
+        size = content.len(),
+        "Captured gscript image-inline object body"
+    );
+    out.push(HeapGlobalSnapshot {
+        rva: gscript_rva,
+        live_ptr: live_va,
+        content,
+        is_heap_handle: false,
+        is_image_inline: true,
+    });
 }
 
 /// Second-chance capture for policy hot roots missing after the main pass.
@@ -773,6 +1062,7 @@ fn ensure_hot_root_slots(
                     live_ptr: value,
                     content: Vec::new(),
                     is_heap_handle: true,
+                is_image_inline: false,
                 });
                 continue;
             }
@@ -796,6 +1086,7 @@ fn ensure_hot_root_slots(
                 live_ptr: value,
                 content: Vec::new(),
                 is_heap_handle: true,
+            is_image_inline: false,
             });
             continue;
         }
@@ -806,6 +1097,31 @@ fn ensure_hot_root_slots(
             DEFAULT_SIZE_PROBE_CAP.min(MAX_HEAP_GLOBAL_BYTES)
         };
         let mut size = estimate_object_size(dump_buf, rva as usize, value, debugger, ensure_probe);
+        // R-GTO-UI r13: AHK cmd table at 0x147868 has live count dword at
+        // 0x147888 (entries). Prefer count*8 over RPM ladder (ladder swallows
+        // free-list → unreadable first qword after plant / AV @0x5747a).
+        if rva == 0x147868 {
+            let count_off = 0x147888usize;
+            if count_off + 4 <= dump_buf.len() {
+                let n = u32::from_le_bytes(
+                    dump_buf[count_off..count_off + 4]
+                        .try_into()
+                        .unwrap_or([0; 4]),
+                );
+                if (1..0x10000).contains(&n) {
+                    let want = (n as usize).saturating_mul(8).max(8);
+                    if can_read(debugger, value, want, HOT_XREF_SIZE_PROBE_CAP) {
+                        info!(
+                            rva = format_args!("{rva:#x}"),
+                            count = n,
+                            size = want,
+                            "Hot-root ensure: cmd table sized from live count"
+                        );
+                        size = want;
+                    }
+                }
+            }
+        }
         if size < 8 {
             // Fall back to a small fixed probe — string capacity objects are
             // often 0x20–0x40; size field heuristics can miss them.
@@ -824,11 +1140,57 @@ fn ensure_hot_root_slots(
         }
         size = shrink_to_avoid_overlap(out, value, size);
         if size < 8 {
-            // Overlap with an existing capture: multi_fixup already covers the
-            // bytes; we still need the *slot* planted. Clone a plant-only
-            // snapshot that reuses the live_ptr with a tiny header so bootstrap
-            // writes the slot (content can be empty only for handles — so read
-            // 8 bytes at base for a non-empty body).
+            // R-GTO-UI r13: interior of an oversized parent (e.g. cmd table
+            // 0x147868 @ 0x92ecb0 inside gscript heap 32KiB). multi_fixup is
+            // exact-base only, so plant-only 8B leaves the table unrebased and
+            // WinMain AVs. Carve the parent to end at this base, then capture
+            // the full exclusive object below.
+            if carve_parent_at_hot_base(out, value) {
+                size = estimate_object_size(
+                    dump_buf,
+                    rva as usize,
+                    value,
+                    debugger,
+                    ensure_probe,
+                );
+                if rva == 0x147868 {
+                    let count_off = 0x147888usize;
+                    if count_off + 4 <= dump_buf.len() {
+                        let n = u32::from_le_bytes(
+                            dump_buf[count_off..count_off + 4]
+                                .try_into()
+                                .unwrap_or([0; 4]),
+                        );
+                        if (1..0x10000).contains(&n) {
+                            let want = (n as usize).saturating_mul(8).max(8);
+                            if can_read(debugger, value, want, HOT_XREF_SIZE_PROBE_CAP) {
+                                size = want;
+                            }
+                        }
+                    }
+                }
+                if size < 8 {
+                    size = if can_read(debugger, value, 0x1000, HOT_XREF_SIZE_PROBE_CAP) {
+                        0x1000
+                    } else if can_read(debugger, value, 0x100, 0x1000) {
+                        0x100
+                    } else if can_read(debugger, value, 0x40, 0x1000) {
+                        0x40
+                    } else {
+                        0
+                    };
+                }
+                size = shrink_to_avoid_overlap(out, value, size);
+                info!(
+                    rva = format_args!("{rva:#x}"),
+                    heap = format_args!("{value:#x}"),
+                    size,
+                    "Hot-root ensure: carved parent — exclusive capture"
+                );
+            }
+        }
+        if size < 8 {
+            // Still overlapping (exact-base sibling): plant-only 8B last resort.
             let mut tiny = vec![0u8; 8];
             if debugger
                 .read_memory(value as usize, &mut tiny)
@@ -843,12 +1205,6 @@ fn ensure_hot_root_slots(
                 );
                 continue;
             }
-            // Do not register a second multi_fixup range for the same base —
-            // mark as plant-only by using is_heap_handle=false with content
-            // that multi_fixup will treat as a 8-byte range (same begin).
-            // Prefer skipping duplicate range: plant via zero-length is not
-            // supported. Instead attach as a root with content=[live 8B] and
-            // live_ptr; multi_fixup first-match may use the larger sibling.
             seen_heaps.insert(value);
             info!(
                 rva = format_args!("{rva:#x}"),
@@ -860,6 +1216,7 @@ fn ensure_hot_root_slots(
                 live_ptr: value,
                 content: tiny,
                 is_heap_handle: false,
+                is_image_inline: false,
             });
             continue;
         }
@@ -893,7 +1250,11 @@ fn ensure_hot_root_slots(
                 continue;
             }
         }
-        content = trim_trailing_zero_pages(content);
+        // Cmd/dispatch table is a dense pointer array sized by count*8; trailing
+        // zero slots are valid empty entries, not free-list padding to trim.
+        if rva != 0x147868 {
+            content = trim_trailing_zero_pages(content);
+        }
         content = truncate_to_avoid_overlap(out, value, content);
         if policy.gscript_root() == Some(rva) && content.len() > policy.gscript_content_cap() {
             content.truncate(policy.gscript_content_cap());
@@ -901,17 +1262,19 @@ fn ensure_hot_root_slots(
         if content.len() < 8 {
             continue;
         }
-        handle_string_shell_on_capture(
-            &mut content,
-            out,
-            total_bytes,
-            seen_heaps,
-            image_base,
-            image_end,
-            dump_buf,
-            debugger,
-            MAX_HEAP_GLOBAL_SLOTS,
-        );
+        if rva != 0x147868 {
+            handle_string_shell_on_capture(
+                &mut content,
+                out,
+                total_bytes,
+                seen_heaps,
+                image_base,
+                image_end,
+                dump_buf,
+                debugger,
+                MAX_HEAP_GLOBAL_SLOTS,
+            );
+        }
         seen_heaps.insert(value);
         *total_bytes = total_bytes.saturating_add(content.len());
         info!(
@@ -925,6 +1288,7 @@ fn ensure_hot_root_slots(
             live_ptr: value,
             content,
             is_heap_handle: false,
+        is_image_inline: false,
         });
     }
 }
@@ -959,7 +1323,9 @@ fn exhaust_gscript_first_hop(
         return;
     };
     let Some(gscript_idx) = out.iter().position(|g| {
-        g.rva == gscript_rva && !g.is_heap_handle && g.content.len() >= 8
+        g.rva == gscript_rva
+            && !g.is_heap_handle
+            && g.content.len() >= 8
     }) else {
         warn!(
             rva = format_args!("{gscript_rva:#x}"),
@@ -969,7 +1335,18 @@ fn exhaust_gscript_first_hop(
     };
 
     // Collect first-hop targets (including interiors of other captures).
-    let span = policy.first_hop_span().min(out[gscript_idx].content.len());
+    // R-GTO-UI r15: image-inline g_script body needs a wider hop than the
+    // heap-clone default (0x200). Label/var tables sit past +0x200; short span
+    // → WinMain 0x48fb0 lookup returns null after MessageBox.
+    let default_span = policy.first_hop_span();
+    let span = if out[gscript_idx].is_image_inline {
+        out[gscript_idx]
+            .content
+            .len()
+            .min(0x1800.max(default_span))
+    } else {
+        default_span.min(out[gscript_idx].content.len())
+    };
     let mut targets: Vec<(usize, u64)> = Vec::new();
     let content = &out[gscript_idx].content[..span];
     let mut off = 0usize;
@@ -1107,6 +1484,7 @@ fn exhaust_gscript_first_hop(
             live_ptr: value,
             content: child,
             is_heap_handle: false,
+        is_image_inline: false,
         });
         added += 1;
     }
@@ -1118,6 +1496,1610 @@ fn exhaust_gscript_first_hop(
         span,
         total = out.len(),
         "gscript first-hop exhaust complete"
+    );
+}
+
+/// Force-admit AHK object link fields on already-captured gscript first-hop kids.
+///
+/// Live dump (r15b): `[gscript+0] + 0x18` pointed at `0x971948`, an *interior*
+/// of oversized root `0x148c00` (`live=0x970640`, size 32KiB free-list). Exact-
+/// base multi_fixup never remapped that link → WinMain string walk crashed on
+/// freelist poison after MessageBox. Capture exact bases for common link
+/// offsets so remap lands on freeable snapshots.
+fn exhaust_gscript_child_link_fields(
+    out: &mut Vec<HeapGlobalSnapshot>,
+    total_bytes: &mut usize,
+    seen_heaps: &mut BTreeSet<u64>,
+    image_base: u64,
+    image_end: u64,
+    dump_buf: &[u8],
+    debugger: &mut dyn mida_core::DebuggerCore,
+    policy: &DumpCapturePolicy,
+) {
+    // AHK object common link/pointer fields (next, prev, parent, first-child…).
+    const LINK_OFFS: &[usize] = &[0x00, 0x08, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38];
+    let slot_cap = MAX_HEAP_GLOBAL_SLOTS.saturating_sub(HEAP_DANGLING_SLOT_RESERVE / 4);
+    // Snapshot indices of current graph children (rva==0) before we mutate.
+    let seeds: Vec<usize> = out
+        .iter()
+        .enumerate()
+        .filter(|(_, g)| g.rva == 0 && !g.is_heap_handle && g.content.len() >= 0x20)
+        .map(|(i, _)| i)
+        .collect();
+    if seeds.is_empty() {
+        return;
+    }
+
+    let mut added = 0usize;
+    let mut skipped = 0usize;
+    let mut interiors = 0usize;
+    let seed_count = seeds.len();
+    for seed_i in seeds {
+        // Re-read content each time — previous admits may not change this seed.
+        let content = out[seed_i].content.clone();
+        let parent_live = out[seed_i].live_ptr;
+        for &loff in LINK_OFFS {
+            if loff + 8 > content.len() {
+                continue;
+            }
+            if out.len() >= slot_cap || *total_bytes >= MAX_HEAP_GLOBAL_TOTAL_BYTES {
+                skipped += 1;
+                continue;
+            }
+            let value =
+                u64::from_le_bytes(content[loff..loff + 8].try_into().unwrap_or_default());
+            if !is_heap_pointer(value, image_base, image_end) || value < MIN_HEAP_POINTER {
+                continue;
+            }
+            if value >= 0x1_0000_0000 {
+                continue;
+            }
+            // Skip self / already exact.
+            if value == parent_live || is_exact_live_ptr(out, value) || seen_heaps.contains(&value)
+            {
+                skipped += 1;
+                continue;
+            }
+            if looks_like_heap_handle(debugger, value) {
+                skipped += 1;
+                continue;
+            }
+            let was_interior = range_contains(out, value);
+            seen_heaps.insert(value);
+            let mut size = estimate_object_size(
+                dump_buf,
+                usize::MAX,
+                value,
+                debugger,
+                policy.first_hop_probe().min(MAX_HEAP_GLOBAL_BYTES),
+            );
+            if size < 8 {
+                seen_heaps.remove(&value);
+                skipped += 1;
+                continue;
+            }
+            size = cap_size_before_next_base(out, value, size);
+            if size < 8 {
+                seen_heaps.remove(&value);
+                skipped += 1;
+                continue;
+            }
+            if total_bytes.saturating_add(size) > MAX_HEAP_GLOBAL_TOTAL_BYTES {
+                seen_heaps.remove(&value);
+                skipped += 1;
+                break;
+            }
+            let mut child = match alloc_capped(
+                size,
+                policy.first_hop_probe().min(MAX_HEAP_CONTAINER_BYTES),
+                "gscript child link",
+            ) {
+                Ok(buf) => buf,
+                Err(_) => {
+                    seen_heaps.remove(&value);
+                    skipped += 1;
+                    continue;
+                }
+            };
+            match debugger.read_memory(value as usize, &mut child) {
+                Ok(n) if n >= 8 => {
+                    if n < child.len() {
+                        child.truncate(n);
+                    }
+                }
+                _ => {
+                    seen_heaps.remove(&value);
+                    skipped += 1;
+                    continue;
+                }
+            }
+            child = trim_trailing_zero_pages(child);
+            let cap = cap_size_before_next_base(out, value, child.len());
+            if cap < child.len() {
+                child.truncate(cap);
+            }
+            if child.len() < 8 {
+                seen_heaps.remove(&value);
+                skipped += 1;
+                continue;
+            }
+            // Reject freelist-looking blobs (repeating 0x0350 / 0x28 patterns)
+            // so we do not plant free-list as "object".
+            if looks_like_heap_freelist(&child) {
+                seen_heaps.remove(&value);
+                skipped += 1;
+                continue;
+            }
+            handle_string_shell_on_capture(
+                &mut child,
+                out,
+                total_bytes,
+                seen_heaps,
+                image_base,
+                image_end,
+                dump_buf,
+                debugger,
+                slot_cap,
+            );
+            if was_interior {
+                interiors += 1;
+            }
+            info!(
+                heap = format_args!("{value:#x}"),
+                size = child.len(),
+                parent = format_args!("{parent_live:#x}"),
+                link_off = format_args!("{loff:#x}"),
+                interior = was_interior,
+                "Captured gscript child link field (force-admit)"
+            );
+            *total_bytes = total_bytes.saturating_add(child.len());
+            out.push(HeapGlobalSnapshot {
+                rva: 0,
+                live_ptr: value,
+                content: child,
+                is_heap_handle: false,
+                is_image_inline: false,
+            });
+            added += 1;
+        }
+    }
+
+    info!(
+        added,
+        skipped,
+        interiors,
+        seeds = seed_count,
+        total = out.len(),
+        "gscript child-link exhaust complete"
+    );
+}
+
+/// If image-inline gscript has a label pointer table at +0 but count@+0x10==0,
+/// set count to the number of leading non-null qwords in the captured table.
+///
+/// `0x48fb0` fallback (`mov edi,[gscript+0x10]; mov r14,[gscript]`) skips the
+/// entire binary search when count is 0 → WinMain never reaches RegisterClass.
+/// AHK SimpleHeap control RVAs used by `0xb9410` bump allocator.
+///
+/// Must stay NULL/uninitialized on cold start so `0xb94a0` creates a fresh
+/// 64KiB arena. Replaying dump-time exhausted arenas makes path-string copy
+/// in WinMain (`0xb9360`) fail and fall into the error reporter AV path.
+const AHK_STRING_ARENA_CONTROL_RVAS: &[u32] = &[0x148cb0, 0x148cb8, 0x148cc0];
+
+fn drop_ahk_string_arena_slots(out: &mut Vec<HeapGlobalSnapshot>, total_bytes: &mut usize) {
+    let before = out.len();
+    out.retain(|g| {
+        if g.is_heap_handle || g.is_image_inline {
+            return true;
+        }
+        if AHK_STRING_ARENA_CONTROL_RVAS.contains(&g.rva) {
+            return false;
+        }
+        true
+    });
+    // Recompute total_bytes from survivors (retain doesn't know sizes).
+    *total_bytes = out.iter().map(|g| g.content.len()).sum();
+    let dropped = before.saturating_sub(out.len());
+    if dropped > 0 {
+        info!(
+            dropped,
+            remaining = out.len(),
+            "Dropped AHK SimpleHeap arena control slots (cold-init required)"
+        );
+    }
+}
+
+/// Public so dump_process can re-apply after scrub_uncaptured zeros fields.
+pub fn resynthesize_gscript_label_count(heap_globals: &mut [HeapGlobalSnapshot]) {
+    synthesize_gscript_label_count(heap_globals);
+}
+
+/// Normalize AHK runtime global object @0x141bf0 for WinMain cold re-init.
+///
+/// After Label bind (`0xc13d0`), WinMain does `mov rcx,[0x141bf0]` and writes a
+/// full defaults block through ~+0x148 (r21). Dump often captures a 12–32KiB
+/// free-list-polluted blob; leaving that body in place causes later obfuscated
+/// walks to AV (r21 `@0x6110a0`). Replace with a zeroed slab large enough for
+/// the re-init stores — WinMain fills the fields itself.
+pub fn sanitize_ahk_runtime_global(heap_globals: &mut [HeapGlobalSnapshot]) {
+    const RVA: u32 = 0x141bf0;
+    // WinMain writes through +0x148; keep a little headroom.
+    const NEED: usize = 0x180;
+    let Some(g) = heap_globals
+        .iter_mut()
+        .find(|g| g.rva == RVA && !g.is_heap_handle)
+    else {
+        return;
+    };
+    let old = g.content.len();
+    if old == NEED && g.content.iter().all(|&b| b == 0) {
+        return;
+    }
+    g.content = vec![0u8; NEED];
+    // Preserve live_ptr so multi_fixup / plant still targets the slot.
+    info!(
+        rva = format_args!("{RVA:#x}"),
+        old_size = old,
+        new_size = NEED,
+        "Sanitized AHK runtime global 0x141bf0 to zeroed re-init slab"
+    );
+}
+
+/// Ensure Label objects used by WinMain are not treated as nested redirects.
+///
+/// `0xc13d0`: if `[label+0x23]==0` then `rbx = [label+0x10]` (nested line).
+/// Dump-time labels often have +0x23=0 and +0x10=NULL → AV at `cmp [rbx+0x23],1`
+/// (r20b). Force +0x23=1 so the non-nested success path is taken. Does not
+/// invent nested line objects; only flips the redirect flag.
+
+/// Force gscript window class/title strings for RegisterClass / CreateWindow.
+///
+/// R-GTO-UI r22b: after skip-LoadFile, WinMain reaches `0x34db0` but
+/// `gscript+0xbd8` held a dump **path** string (not `NewClassName`) →
+/// RegisterClass path returned 0 and WinMain exited without a product window.
+/// Plant exact wide-string snapshots and repoint +0xbd8 (+0xbd0 title).
+pub fn repair_gscript_window_strings(heap_globals: &mut Vec<HeapGlobalSnapshot>) {
+    const CLASS_NAME: &str = "NewClassName";
+    const TITLE_NAME: &str = "ZhuChuangKou";
+    const OFF_TITLE: usize = 0xbd0;
+    const OFF_CLASS: usize = 0xbd8;
+
+    let Some(gscript_idx) = heap_globals
+        .iter()
+        .position(|g| g.is_image_inline && g.content.len() > OFF_CLASS + 8)
+    else {
+        return;
+    };
+
+    // Low user-space synthetic lives (must be plantable HeapAlloc targets and
+    // within multi_fixup / is_heap_pointer acceptance). High VAs like
+    // 0x50c1a550001 failed at runtime (r22b: +0xbd8 fell back to 0x106644).
+    const CLASS_LIVE: u64 = 0x0020_0000;
+    const TITLE_LIVE: u64 = 0x0020_1000;
+
+    let mut added = 0usize;
+    for (live, text) in [(CLASS_LIVE, CLASS_NAME), (TITLE_LIVE, TITLE_NAME)] {
+        if heap_globals.iter().any(|g| g.live_ptr == live) {
+            continue;
+        }
+        let mut body = Vec::with_capacity(text.len() * 2 + 2);
+        for ch in text.encode_utf16() {
+            body.extend_from_slice(&ch.to_le_bytes());
+        }
+        body.extend_from_slice(&[0, 0]);
+        heap_globals.push(HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: live,
+            content: body,
+            is_heap_handle: false,
+            is_image_inline: false,
+        });
+        added += 1;
+    }
+
+    let g = &mut heap_globals[gscript_idx];
+    let old_class = u64::from_le_bytes(g.content[OFF_CLASS..OFF_CLASS + 8].try_into().unwrap_or([0; 8]));
+    let old_title = u64::from_le_bytes(g.content[OFF_TITLE..OFF_TITLE + 8].try_into().unwrap_or([0; 8]));
+    g.content[OFF_CLASS..OFF_CLASS + 8].copy_from_slice(&CLASS_LIVE.to_le_bytes());
+    g.content[OFF_TITLE..OFF_TITLE + 8].copy_from_slice(&TITLE_LIVE.to_le_bytes());
+    info!(
+        added,
+        old_class = format_args!("{old_class:#x}"),
+        old_title = format_args!("{old_title:#x}"),
+        class_live = format_args!("{CLASS_LIVE:#x}"),
+        title_live = format_args!("{TITLE_LIVE:#x}"),
+        "Repaired gscript window class/title strings (NewClassName / ZhuChuangKou)"
+    );
+}
+
+pub fn mark_labels_non_nested(heap_globals: &mut [HeapGlobalSnapshot]) {
+    let Some(gscript) = heap_globals
+        .iter()
+        .find(|g| g.is_image_inline && g.content.len() >= 8)
+    else {
+        return;
+    };
+    let table_ptr = u64::from_le_bytes(gscript.content[0..8].try_into().unwrap_or_default());
+    if table_ptr == 0 {
+        return;
+    }
+    let count = u32::from_le_bytes(
+        gscript.content[0x10..0x14].try_into().unwrap_or_default(),
+    ) as usize;
+    let Some(table) = heap_globals
+        .iter()
+        .find(|g| g.live_ptr == table_ptr && g.content.len() >= 8)
+    else {
+        return;
+    };
+    let n = count.min(table.content.len() / 8);
+    let entries: Vec<u64> = (0..n)
+        .map(|i| {
+            u64::from_le_bytes(
+                table.content[i * 8..i * 8 + 8]
+                    .try_into()
+                    .unwrap_or_default(),
+            )
+        })
+        .filter(|&p| p != 0)
+        .collect();
+    // Snapshot exact lives before mut borrow.
+    let exact: BTreeSet<u64> = heap_globals
+        .iter()
+        .filter(|g| !g.is_heap_handle && g.content.len() >= 8)
+        .map(|g| g.live_ptr)
+        .collect();
+    let mut marked = 0usize;
+    let mut skipped = 0usize;
+    for live in entries {
+        let Some(g) = heap_globals
+            .iter_mut()
+            .find(|g| g.live_ptr == live && g.content.len() > 0x23)
+        else {
+            skipped += 1;
+            continue;
+        };
+        // Already non-nested.
+        if g.content[0x23] != 0 {
+            continue;
+        }
+        // Only flip when nested ptr is null/missing — if +0x10 is a real
+        // exact-captured object, leave redirect semantics alone.
+        let nested = if g.content.len() >= 0x18 {
+            u64::from_le_bytes(g.content[0x10..0x18].try_into().unwrap_or_default())
+        } else {
+            0
+        };
+        if nested != 0 && exact.contains(&nested) {
+            skipped += 1;
+            continue;
+        }
+        g.content[0x23] = 1;
+        marked += 1;
+    }
+    if marked > 0 || skipped > 0 {
+        info!(
+            marked,
+            skipped,
+            total = n,
+            "Marked Label+0x23 non-nested for cold-start 0xc13d0 path"
+        );
+    }
+}
+
+/// Sort gscript label pointer table by mName so `0x48fb0` binary search works.
+///
+/// Live dumps often capture the table in insertion/hash order (r19b: `A_Args`
+/// then Chinese labels). WinMain looks up `"0"` / `"A_Args"` via binary
+/// search; unsorted tables always miss → rax=0 → product window path dead.
+pub fn sort_gscript_label_table(heap_globals: &mut [HeapGlobalSnapshot]) {
+    let Some(gscript_idx) = heap_globals
+        .iter()
+        .position(|g| g.is_image_inline && g.content.len() >= 0x18)
+    else {
+        return;
+    };
+    let table_ptr = u64::from_le_bytes(
+        heap_globals[gscript_idx].content[0..8]
+            .try_into()
+            .unwrap_or_default(),
+    );
+    if table_ptr == 0 {
+        return;
+    }
+    let count = u32::from_le_bytes(
+        heap_globals[gscript_idx].content[0x10..0x14]
+            .try_into()
+            .unwrap_or_default(),
+    ) as usize;
+    if count < 2 {
+        return;
+    }
+    let Some(table_idx) = heap_globals
+        .iter()
+        .position(|g| g.live_ptr == table_ptr && g.content.len() >= 16)
+    else {
+        return;
+    };
+    let n = count.min(heap_globals[table_idx].content.len() / 8);
+    if n < 2 {
+        return;
+    }
+
+    // Resolve each entry's sort key from exact mName snapshot or inline +0x30.
+    // R-GTO-UI r20b: empty-key entries must NOT sort first — binary search would
+    // hit null mName and wcscmp → call-obfusc AV (r20 regression).
+    let mut named: Vec<(u64, String)> = Vec::with_capacity(n);
+    let mut unnamed: Vec<u64> = Vec::new();
+    for i in 0..n {
+        let off = i * 8;
+        let live = u64::from_le_bytes(
+            heap_globals[table_idx].content[off..off + 8]
+                .try_into()
+                .unwrap_or_default(),
+        );
+        if live == 0 {
+            break;
+        }
+        match resolve_label_sort_key(heap_globals, live) {
+            Some(key) if !key.is_empty() => named.push((live, key)),
+            _ => unnamed.push(live),
+        }
+    }
+    if named.len() < 2 {
+        info!(
+            named = named.len(),
+            unnamed = unnamed.len(),
+            "gscript label sort skipped: too few named entries"
+        );
+        return;
+    }
+    let before_named: Vec<u64> = named.iter().map(|(p, _)| *p).collect();
+    named.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    let after_named: Vec<u64> = named.iter().map(|(p, _)| *p).collect();
+    // Searchable prefix = named only (sorted). Unnamed trail after count.
+    let mut out_ptrs: Vec<u64> = after_named.clone();
+    out_ptrs.extend(unnamed.iter().copied());
+    let new_count = named.len() as u32;
+    let changed = before_named != after_named || (count as u32) != new_count;
+    if !changed {
+        info!(count = new_count, "gscript label table already sorted by mName");
+        return;
+    }
+    for (i, live) in out_ptrs.iter().enumerate() {
+        let off = i * 8;
+        if off + 8 > heap_globals[table_idx].content.len() {
+            break;
+        }
+        heap_globals[table_idx].content[off..off + 8].copy_from_slice(&live.to_le_bytes());
+    }
+    heap_globals[gscript_idx].content[0x10..0x14].copy_from_slice(&new_count.to_le_bytes());
+    if heap_globals[gscript_idx].content.len() >= 0x18 {
+        heap_globals[gscript_idx].content[0x14..0x18].fill(0);
+    }
+    info!(
+        count = new_count,
+        unnamed = unnamed.len(),
+        first = %named.first().map(|e| e.1.as_str()).unwrap_or(""),
+        last = %named.last().map(|e| e.1.as_str()).unwrap_or(""),
+        "Sorted gscript label table by mName (named-only prefix)"
+    );
+}
+
+fn resolve_label_sort_key(heap_globals: &[HeapGlobalSnapshot], label_live: u64) -> Option<String> {
+    let label = heap_globals
+        .iter()
+        .find(|g| g.live_ptr == label_live && g.content.len() >= LABEL_INLINE_NAME_OFF + 2)?;
+    let name_ptr = u64::from_le_bytes(
+        label.content[LABEL_NAME_OFF..LABEL_NAME_OFF + 8]
+            .try_into()
+            .ok()?,
+    );
+    if name_ptr != 0 {
+        if let Some(s) = heap_globals.iter().find(|g| g.live_ptr == name_ptr) {
+            if let Some(k) = wide_bytes_to_sort_key(&s.content) {
+                return Some(k);
+            }
+        }
+    }
+    // Inline residual at +0x30.
+    if label.content.len() >= LABEL_INLINE_NAME_OFF + 4 {
+        if let Some(b) = extract_inline_wide_name(&label.content) {
+            return wide_bytes_to_sort_key(&b);
+        }
+    }
+    None
+}
+
+fn wide_bytes_to_sort_key(bytes: &[u8]) -> Option<String> {
+    if bytes.len() < 2 {
+        return None;
+    }
+    let mut u16s = Vec::new();
+    let mut i = 0usize;
+    while i + 2 <= bytes.len() {
+        let ch = u16::from_le_bytes(bytes[i..i + 2].try_into().ok()?);
+        i += 2;
+        if ch == 0 {
+            break;
+        }
+        u16s.push(ch);
+    }
+    if u16s.is_empty() {
+        return None;
+    }
+    Some(String::from_utf16_lossy(&u16s))
+}
+
+/// After scrub, repair Label.mName from inline UTF-16 at +0x30 when +0x28 is null.
+///
+/// Slot-cap during capture often skips name externalization; scrub then leaves
+/// mName=0 → WinMain `0x48fb0` calls wcscmp(NULL) → call-obfusc AV (r17b/r18).
+/// Pure offline repair: no live process needed.
+pub fn repair_label_names_after_scrub(heap_globals: &mut Vec<HeapGlobalSnapshot>) {
+    let Some(gscript) = heap_globals
+        .iter()
+        .find(|g| g.is_image_inline && g.content.len() >= 8)
+    else {
+        return;
+    };
+    let table_ptr = u64::from_le_bytes(gscript.content[0..8].try_into().unwrap_or_default());
+    if table_ptr == 0 {
+        return;
+    }
+    let Some(table) = heap_globals
+        .iter()
+        .find(|g| g.live_ptr == table_ptr && g.content.len() >= 8)
+    else {
+        return;
+    };
+    let count = {
+        let c = u32::from_le_bytes(gscript.content[0x10..0x14].try_into().unwrap_or_default());
+        if c > 0 {
+            c as usize
+        } else {
+            table.content.len() / 8
+        }
+    };
+    let table_content = table.content.clone();
+    let mut repaired = 0usize;
+    let mut names_added = 0usize;
+    for i in 0..count.min(table_content.len() / 8).min(512) {
+        let label_live =
+            u64::from_le_bytes(table_content[i * 8..i * 8 + 8].try_into().unwrap_or_default());
+        if label_live == 0 {
+            break;
+        }
+        let Some(idx) = heap_globals
+            .iter()
+            .position(|g| g.live_ptr == label_live && g.content.len() >= LABEL_INLINE_NAME_OFF + 4)
+        else {
+            continue;
+        };
+        let name_ptr = u64::from_le_bytes(
+            heap_globals[idx].content[LABEL_NAME_OFF..LABEL_NAME_OFF + 8]
+                .try_into()
+                .unwrap_or_default(),
+        );
+        // Keep only if mName already points at an exact freeable snapshot.
+        if name_ptr != 0 && heap_globals.iter().any(|g| g.live_ptr == name_ptr) {
+            continue;
+        }
+
+        // R-GTO-UI r19b: most label names are *interiors* of a large capture
+        // (scrub keeps the ptr, multi_fixup exact-base does not remap). Slice
+        // the wide string out of the parent and plant an exact snapshot.
+        let mut str_live = 0u64;
+        let mut bytes: Option<Vec<u8>> = None;
+        if name_ptr != 0 {
+            if let Some((parent_live, parent_content)) = heap_globals.iter().find_map(|g| {
+                if g.is_heap_handle || g.content.len() < 4 {
+                    return None;
+                }
+                let end = g.live_ptr.saturating_add(g.content.len() as u64);
+                if name_ptr > g.live_ptr && name_ptr < end {
+                    Some((g.live_ptr, g.content.clone()))
+                } else {
+                    None
+                }
+            }) {
+                let off = (name_ptr - parent_live) as usize;
+                if let Some(b) = extract_wide_string_from_bytes(&parent_content[off..]) {
+                    str_live = name_ptr;
+                    bytes = Some(b);
+                    let _ = parent_live;
+                }
+            }
+        }
+        if bytes.is_none() {
+            // Prefer inline +0x30 (SSO / residual after scrub).
+            if let Some(b) = extract_inline_wide_name(&heap_globals[idx].content) {
+                str_live = label_live.saturating_add(LABEL_INLINE_NAME_OFF as u64);
+                bytes = Some(b);
+            }
+        }
+        let Some(mut body) = bytes else {
+            // Uncaptured external mName with no recoverable bytes: null to
+            // avoid wcscmp(stale) / call-obfusc AV.
+            if name_ptr != 0 {
+                heap_globals[idx].content[LABEL_NAME_OFF..LABEL_NAME_OFF + 8].fill(0);
+            }
+            continue;
+        };
+        if body.len() < 2 || body[body.len() - 2..] != [0, 0] {
+            body.extend_from_slice(&[0, 0]);
+        }
+        // Ensure string snapshot exists (may exceed soft cap — still required).
+        if !heap_globals.iter().any(|g| g.live_ptr == str_live) {
+            if heap_globals.len() >= MAX_HEAP_GLOBAL_SLOTS + 256 {
+                continue;
+            }
+            heap_globals.push(HeapGlobalSnapshot {
+                rva: 0,
+                live_ptr: str_live,
+                content: body,
+                is_heap_handle: false,
+                is_image_inline: false,
+            });
+            names_added += 1;
+        }
+        heap_globals[idx].content[LABEL_NAME_OFF..LABEL_NAME_OFF + 8]
+            .copy_from_slice(&str_live.to_le_bytes());
+        repaired += 1;
+    }
+    if repaired > 0 || names_added > 0 {
+        info!(
+            repaired,
+            names_added,
+            total = heap_globals.len(),
+            "Repaired label mName after scrub (inline SSO → exact string)"
+        );
+    }
+}
+
+fn synthesize_gscript_label_count(out: &mut [HeapGlobalSnapshot]) {
+    let Some(gscript_idx) = out
+        .iter()
+        .position(|g| g.is_image_inline && g.content.len() >= 0x18)
+    else {
+        info!("gscript label-count synth skipped: no image-inline gscript");
+        return;
+    };
+    let table_ptr = u64::from_le_bytes(
+        out[gscript_idx].content[0..8]
+            .try_into()
+            .unwrap_or_default(),
+    );
+    if table_ptr == 0 {
+        info!("gscript label-count synth skipped: table ptr null");
+        return;
+    }
+    let Some(table_idx) = out
+        .iter()
+        .position(|g| g.live_ptr == table_ptr && g.content.len() >= 8)
+    else {
+        info!(
+            table = format_args!("{table_ptr:#x}"),
+            "gscript label-count synth skipped: table not exact-captured"
+        );
+        return;
+    };
+    let n = count_leading_heap_ptrs(&out[table_idx].content);
+    if n == 0 {
+        info!(
+            table = format_args!("{table_ptr:#x}"),
+            size = out[table_idx].content.len(),
+            "gscript label-count synth skipped: zero leading entries"
+        );
+        return;
+    }
+    let count_now = u32::from_le_bytes(
+        out[gscript_idx].content[0x10..0x14]
+            .try_into()
+            .unwrap_or_default(),
+    );
+    // Always write table-derived count. Live image body often has a stale
+    // non-zero dword at +0x10 (pointer low half / partial init) that is not a
+    // real label count; trusting it left PE with 0 after scrub (r17).
+    out[gscript_idx].content[0x10..0x14].copy_from_slice(&n.to_le_bytes());
+    // Clear high dword of the count qword so multi_fixup never sees a fake ptr.
+    if out[gscript_idx].content.len() >= 0x18 {
+        out[gscript_idx].content[0x14..0x18].fill(0);
+    }
+    info!(
+        table = format_args!("{table_ptr:#x}"),
+        count = n,
+        previous = count_now,
+        "Synthesized gscript label-table count at +0x10"
+    );
+}
+
+fn count_leading_heap_ptrs(content: &[u8]) -> u32 {
+    let mut n = 0u32;
+    let mut off = 0usize;
+    while off + 8 <= content.len() {
+        let v = u64::from_le_bytes(content[off..off + 8].try_into().unwrap_or_default());
+        if v == 0 {
+            break;
+        }
+        if v == 0x0350_0350_0350_0350 || v == 0x2828_2828_2828_2828 {
+            break;
+        }
+        // Reject obvious non-pointers (small integers, high kernel).
+        if v < 0x1_0000 || v >= 0x1_0000_0000 {
+            break;
+        }
+        n = n.saturating_add(1);
+        off += 8;
+        if n >= 4096 {
+            break;
+        }
+    }
+    n
+}
+
+/// Force-admit every non-null entry in gscript's label pointer table (+0).
+fn exhaust_gscript_label_table_entries(
+    out: &mut Vec<HeapGlobalSnapshot>,
+    total_bytes: &mut usize,
+    seen_heaps: &mut BTreeSet<u64>,
+    image_base: u64,
+    image_end: u64,
+    dump_buf: &[u8],
+    debugger: &mut dyn mida_core::DebuggerCore,
+    policy: &DumpCapturePolicy,
+) {
+    let Some(gscript) = out.iter().find(|g| g.is_image_inline && g.content.len() >= 8) else {
+        return;
+    };
+    let table_ptr = u64::from_le_bytes(gscript.content[0..8].try_into().unwrap_or_default());
+    if table_ptr == 0 {
+        return;
+    }
+    let Some(table_idx) = out
+        .iter()
+        .position(|g| g.live_ptr == table_ptr && g.content.len() >= 8)
+    else {
+        return;
+    };
+    // Bound by synthesized count if present, else full table content.
+    let count = {
+        let g = out.iter().find(|g| g.is_image_inline).unwrap();
+        let c = u32::from_le_bytes(g.content[0x10..0x14].try_into().unwrap_or_default());
+        if c > 0 {
+            c as usize
+        } else {
+            out[table_idx].content.len() / 8
+        }
+    };
+    let slot_cap = MAX_HEAP_GLOBAL_SLOTS.saturating_sub(HEAP_DANGLING_SLOT_RESERVE / 4);
+    let table_content = out[table_idx].content.clone();
+    let mut added = 0usize;
+    let mut skipped = 0usize;
+    for i in 0..count.min(table_content.len() / 8).min(512) {
+        let off = i * 8;
+        let value =
+            u64::from_le_bytes(table_content[off..off + 8].try_into().unwrap_or_default());
+        if value == 0 {
+            break;
+        }
+        if out.len() >= slot_cap || *total_bytes >= MAX_HEAP_GLOBAL_TOTAL_BYTES {
+            skipped += 1;
+            break;
+        }
+        if !is_heap_pointer(value, image_base, image_end) || value < MIN_HEAP_POINTER {
+            skipped += 1;
+            continue;
+        }
+        if value >= 0x1_0000_0000 {
+            skipped += 1;
+            continue;
+        }
+        if is_exact_live_ptr(out, value) || seen_heaps.contains(&value) {
+            skipped += 1;
+            continue;
+        }
+        if looks_like_heap_handle(debugger, value) {
+            skipped += 1;
+            continue;
+        }
+        seen_heaps.insert(value);
+        let mut size = estimate_object_size(
+            dump_buf,
+            usize::MAX,
+            value,
+            debugger,
+            policy.first_hop_probe().min(MAX_HEAP_GLOBAL_BYTES),
+        );
+        if size < 8 {
+            seen_heaps.remove(&value);
+            skipped += 1;
+            continue;
+        }
+        size = cap_size_before_next_base(out, value, size);
+        if size < 8 {
+            seen_heaps.remove(&value);
+            skipped += 1;
+            continue;
+        }
+        if total_bytes.saturating_add(size) > MAX_HEAP_GLOBAL_TOTAL_BYTES {
+            seen_heaps.remove(&value);
+            skipped += 1;
+            break;
+        }
+        let mut child = match alloc_capped(
+            size,
+            policy.first_hop_probe().min(MAX_HEAP_CONTAINER_BYTES),
+            "gscript label entry",
+        ) {
+            Ok(buf) => buf,
+            Err(_) => {
+                seen_heaps.remove(&value);
+                skipped += 1;
+                continue;
+            }
+        };
+        match debugger.read_memory(value as usize, &mut child) {
+            Ok(n) if n >= 8 => {
+                if n < child.len() {
+                    child.truncate(n);
+                }
+            }
+            _ => {
+                seen_heaps.remove(&value);
+                skipped += 1;
+                continue;
+            }
+        }
+        child = trim_trailing_zero_pages(child);
+        let cap = cap_size_before_next_base(out, value, child.len());
+        if cap < child.len() {
+            child.truncate(cap);
+        }
+        if child.len() < 8 || looks_like_heap_freelist(&child) {
+            seen_heaps.remove(&value);
+            skipped += 1;
+            continue;
+        }
+        handle_string_shell_on_capture(
+            &mut child,
+            out,
+            total_bytes,
+            seen_heaps,
+            image_base,
+            image_end,
+            dump_buf,
+            debugger,
+            slot_cap,
+        );
+        // R-GTO-UI r18: Label::mName at +0x28. Short names often live as
+        // self-interior UTF-16 at +0x30; sanitize used to null that link and
+        // 0x48fb0 → wcscmp(NULL) → call-obfusc AV @0xfb8f0.
+        externalize_label_name_field(
+            &mut child,
+            value,
+            out,
+            total_bytes,
+            seen_heaps,
+            image_base,
+            image_end,
+            dump_buf,
+            debugger,
+            slot_cap,
+        );
+        info!(
+            heap = format_args!("{value:#x}"),
+            size = child.len(),
+            table_off = format_args!("{off:#x}"),
+            name_ptr = format_args!("{:#x}", u64::from_le_bytes(
+                child.get(0x28..0x30).and_then(|b| b.try_into().ok()).unwrap_or([0; 8])
+            )),
+            "Captured gscript label-table entry"
+        );
+        *total_bytes = total_bytes.saturating_add(child.len());
+        out.push(HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: value,
+            content: child,
+            is_heap_handle: false,
+            is_image_inline: false,
+        });
+        added += 1;
+    }
+    // Second pass: labels already exact-captured before this exhaust still need
+    // mName externalized (first-hop / expand may have admitted them earlier).
+    externalize_all_label_names_from_table(
+        out,
+        total_bytes,
+        seen_heaps,
+        image_base,
+        image_end,
+        dump_buf,
+        debugger,
+        policy,
+    );
+    info!(
+        added,
+        skipped,
+        count,
+        table = format_args!("{table_ptr:#x}"),
+        total = out.len(),
+        "gscript label-table entry exhaust complete"
+    );
+}
+
+const LABEL_NAME_OFF: usize = 0x28;
+const LABEL_INLINE_NAME_OFF: usize = 0x30;
+
+/// Ensure Label.mName (+0x28) is an exact freeable wide-string snapshot.
+fn externalize_label_name_field(
+    label: &mut Vec<u8>,
+    label_live: u64,
+    out: &mut Vec<HeapGlobalSnapshot>,
+    total_bytes: &mut usize,
+    seen_heaps: &mut BTreeSet<u64>,
+    image_base: u64,
+    image_end: u64,
+    dump_buf: &[u8],
+    debugger: &mut dyn mida_core::DebuggerCore,
+    slot_cap: usize,
+) {
+    if label.len() < LABEL_INLINE_NAME_OFF + 4 {
+        return;
+    }
+    let name_ptr = u64::from_le_bytes(
+        label[LABEL_NAME_OFF..LABEL_NAME_OFF + 8]
+            .try_into()
+            .unwrap_or_default(),
+    );
+    let label_end = label_live.saturating_add(label.len() as u64);
+    let self_interior = name_ptr > label_live && name_ptr < label_end;
+
+    // Already an exact freeable string snapshot — keep pointer for multi_fixup.
+    if name_ptr != 0 && is_exact_live_ptr(out, name_ptr) && !self_interior {
+        return;
+    }
+
+    // Resolve wide string bytes: prefer live name_ptr, else inline +0x30.
+    let (str_live, bytes) = if name_ptr != 0
+        && !self_interior
+        && is_heap_pointer(name_ptr, image_base, image_end)
+        && name_ptr >= MIN_HEAP_POINTER
+    {
+        if let Some(b) = read_wide_string_bytes(debugger, name_ptr, 0x200) {
+            (name_ptr, b)
+        } else if let Some(b) = extract_inline_wide_name(label) {
+            // Fall back to inline copy with a stable synthetic live key.
+            (label_live.saturating_add(LABEL_INLINE_NAME_OFF as u64), b)
+        } else {
+            return;
+        }
+    } else if let Some(b) = extract_inline_wide_name(label) {
+        let live = if self_interior {
+            name_ptr
+        } else {
+            label_live.saturating_add(LABEL_INLINE_NAME_OFF as u64)
+        };
+        (live, b)
+    } else if self_interior {
+        if let Some(b) = read_wide_string_bytes(debugger, name_ptr, 0x200) {
+            (name_ptr, b)
+        } else {
+            return;
+        }
+    } else {
+        return;
+    };
+
+    if bytes.len() < 4 {
+        return;
+    }
+
+    // Capture exact string base if missing.
+    if !is_exact_live_ptr(out, str_live) && !seen_heaps.contains(&str_live) {
+        if out.len() >= slot_cap || *total_bytes >= MAX_HEAP_GLOBAL_TOTAL_BYTES {
+            return;
+        }
+        // Avoid colliding with the label object base.
+        if str_live == label_live {
+            return;
+        }
+        seen_heaps.insert(str_live);
+        let mut body = bytes;
+        // Ensure NUL terminator for wcscmp.
+        if body.len() < 2 || body[body.len() - 2..body.len()] != [0, 0] {
+            body.extend_from_slice(&[0, 0]);
+        }
+        if total_bytes.saturating_add(body.len()) > MAX_HEAP_GLOBAL_TOTAL_BYTES {
+            seen_heaps.remove(&str_live);
+            return;
+        }
+        info!(
+            heap = format_args!("{str_live:#x}"),
+            size = body.len(),
+            label = format_args!("{label_live:#x}"),
+            "Externalized label mName wide string"
+        );
+        *total_bytes = total_bytes.saturating_add(body.len());
+        out.push(HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: str_live,
+            content: body,
+            is_heap_handle: false,
+            is_image_inline: false,
+        });
+    }
+
+    // Point mName at the exact string base so multi_fixup remaps it.
+    label[LABEL_NAME_OFF..LABEL_NAME_OFF + 8].copy_from_slice(&str_live.to_le_bytes());
+}
+
+fn extract_wide_string_from_bytes(slice: &[u8]) -> Option<Vec<u8>> {
+    if slice.len() < 4 {
+        return None;
+    }
+    let c0 = u16::from_le_bytes(slice[0..2].try_into().ok()?);
+    if c0 == 0 {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i + 2 <= slice.len() && i < 0x400 {
+        let ch = u16::from_le_bytes(slice[i..i + 2].try_into().ok()?);
+        out.extend_from_slice(&ch.to_le_bytes());
+        i += 2;
+        if ch == 0 {
+            return if out.len() >= 4 { Some(out) } else { None };
+        }
+    }
+    if out.len() >= 2 {
+        out.extend_from_slice(&[0, 0]);
+        Some(out)
+    } else {
+        None
+    }
+}
+
+fn extract_inline_wide_name(label: &[u8]) -> Option<Vec<u8>> {
+    if label.len() < LABEL_INLINE_NAME_OFF + 4 {
+        return None;
+    }
+    let slice = &label[LABEL_INLINE_NAME_OFF..];
+    let c0 = u16::from_le_bytes(slice[0..2].try_into().ok()?);
+    if c0 == 0 {
+        return None;
+    }
+    // Prefer identifier-like first char (AHK labels / hotkeys).
+    let ok_first = c0 == b'_' as u16
+        || c0 == b'$' as u16
+        || c0 == b'@' as u16
+        || (b'A' as u16..=b'Z' as u16).contains(&c0)
+        || (b'a' as u16..=b'z' as u16).contains(&c0)
+        || (b'0' as u16..=b'9' as u16).contains(&c0)
+        || c0 > 0x7f; // non-ASCII wide labels
+    if !ok_first {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i + 2 <= slice.len() && i < 0x100 {
+        let ch = u16::from_le_bytes(slice[i..i + 2].try_into().ok()?);
+        out.extend_from_slice(&ch.to_le_bytes());
+        i += 2;
+        if ch == 0 {
+            return if out.len() >= 4 { Some(out) } else { None };
+        }
+    }
+    if out.len() >= 2 {
+        out.extend_from_slice(&[0, 0]);
+        Some(out)
+    } else {
+        None
+    }
+}
+
+fn read_wide_string_bytes(
+    debugger: &mut dyn mida_core::DebuggerCore,
+    ptr: u64,
+    max_bytes: usize,
+) -> Option<Vec<u8>> {
+    let max_bytes = max_bytes.max(4).min(0x400);
+    let mut buf = alloc_capped(max_bytes, max_bytes, "label name").ok()?;
+    let n = debugger.read_memory(ptr as usize, &mut buf).ok()?;
+    if n < 4 {
+        return None;
+    }
+    buf.truncate(n);
+    // Truncate at first UTF-16 NUL.
+    let mut end = 0usize;
+    while end + 2 <= buf.len() {
+        let ch = u16::from_le_bytes(buf[end..end + 2].try_into().ok()?);
+        end += 2;
+        if ch == 0 {
+            buf.truncate(end);
+            return Some(buf);
+        }
+    }
+    if buf.len() >= 2 {
+        buf.extend_from_slice(&[0, 0]);
+        Some(buf)
+    } else {
+        None
+    }
+}
+
+fn externalize_all_label_names_from_table(
+    out: &mut Vec<HeapGlobalSnapshot>,
+    total_bytes: &mut usize,
+    seen_heaps: &mut BTreeSet<u64>,
+    image_base: u64,
+    image_end: u64,
+    dump_buf: &[u8],
+    debugger: &mut dyn mida_core::DebuggerCore,
+    policy: &DumpCapturePolicy,
+) {
+    let Some(gscript) = out.iter().find(|g| g.is_image_inline && g.content.len() >= 8) else {
+        return;
+    };
+    let table_ptr = u64::from_le_bytes(gscript.content[0..8].try_into().unwrap_or_default());
+    if table_ptr == 0 {
+        return;
+    }
+    let Some(table) = out
+        .iter()
+        .find(|g| g.live_ptr == table_ptr && g.content.len() >= 8)
+    else {
+        return;
+    };
+    let count = {
+        let g = out.iter().find(|g| g.is_image_inline).unwrap();
+        let c = u32::from_le_bytes(g.content[0x10..0x14].try_into().unwrap_or_default());
+        if c > 0 {
+            c as usize
+        } else {
+            table.content.len() / 8
+        }
+    };
+    let table_content = table.content.clone();
+    let slot_cap = MAX_HEAP_GLOBAL_SLOTS.saturating_sub(HEAP_DANGLING_SLOT_RESERVE / 8);
+    let mut fixed = 0usize;
+    for i in 0..count.min(table_content.len() / 8).min(512) {
+        let value =
+            u64::from_le_bytes(table_content[i * 8..i * 8 + 8].try_into().unwrap_or_default());
+        if value == 0 {
+            break;
+        }
+        let Some(idx) = out.iter().position(|g| g.live_ptr == value && g.content.len() >= 0x30)
+        else {
+            continue;
+        };
+        // Move content out to satisfy borrow checker.
+        let mut content = std::mem::take(&mut out[idx].content);
+        let live = out[idx].live_ptr;
+        externalize_label_name_field(
+            &mut content,
+            live,
+            out,
+            total_bytes,
+            seen_heaps,
+            image_base,
+            image_end,
+            dump_buf,
+            debugger,
+            slot_cap,
+        );
+        // Re-find idx — out may have grown.
+        if let Some(idx2) = out.iter().position(|g| g.live_ptr == live) {
+            let old_len = out[idx2].content.len();
+            *total_bytes = total_bytes
+                .saturating_sub(old_len)
+                .saturating_add(content.len());
+            out[idx2].content = content;
+            fixed += 1;
+        } else {
+            // Should not happen; drop content bytes accounting.
+            *total_bytes = total_bytes.saturating_add(content.len());
+            out.push(HeapGlobalSnapshot {
+                rva: 0,
+                live_ptr: live,
+                content,
+                is_heap_handle: false,
+                is_image_inline: false,
+            });
+            fixed += 1;
+        }
+        let _ = (dump_buf, policy); // silence if unused in some builds
+    }
+    if fixed > 0 {
+        info!(fixed, "Externalized mName on existing label-table objects");
+    }
+}
+
+/// Null object link fields that still point at uncaptured heap interiors.
+///
+/// exact-base multi_fixup cannot rewrite interior VAs; leaving them plants
+/// dump-time freelist addresses into cold start (r15b AV @0x57d01).
+fn sanitize_dangling_object_links(
+    out: &mut [HeapGlobalSnapshot],
+    image_base: u64,
+    image_end: u64,
+) {
+    const LINK_OFFS: &[usize] = &[0x00, 0x08, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38];
+    let exact: BTreeSet<u64> = out
+        .iter()
+        .filter(|g| !g.is_heap_handle && g.content.len() >= 8)
+        .map(|g| g.live_ptr)
+        .collect();
+    // (base, end) ranges for interior tests — clone before mut borrow.
+    let ranges: Vec<(u64, u64)> = out
+        .iter()
+        .filter(|g| !g.is_heap_handle && g.content.len() >= 8)
+        .map(|g| (g.live_ptr, g.live_ptr.saturating_add(g.content.len() as u64)))
+        .collect();
+    let mut nulled = 0usize;
+    for g in out.iter_mut() {
+        if g.is_heap_handle || g.content.len() < 0x20 {
+            continue;
+        }
+        // Prefer graph children + image-inline gscript body (link fields live there).
+        if g.rva != 0 && !g.is_image_inline {
+            continue;
+        }
+        // Dense pointer tables (label arrays, cmd tables) are not object-link
+        // chains — nulling entries as "dangling interiors" kills lookup.
+        if looks_like_dense_pointer_table(&g.content) {
+            continue;
+        }
+        for &loff in LINK_OFFS {
+            if loff + 8 > g.content.len() {
+                continue;
+            }
+            // Image-inline g_script: +0x10 / +0x18 are label/func *counts*
+            // (dwords). Never treat them as object-link pointers — zeroing the
+            // full qword wipes a real count that multi_fixup cannot restore.
+            if g.is_image_inline && (loff == 0x10 || loff == 0x18) {
+                continue;
+            }
+            let value =
+                u64::from_le_bytes(g.content[loff..loff + 8].try_into().unwrap_or_default());
+            if value == 0 || exact.contains(&value) {
+                continue;
+            }
+            if !is_heap_pointer(value, image_base, image_end) || value < MIN_HEAP_POINTER {
+                continue;
+            }
+            // Only null when the target is an *interior* of some *other* capture.
+            // Self-interior (e.g. Label SSO name at this+0x30) is handled by
+            // externalize_label_name_field — do not wipe it here.
+            let self_lo = g.live_ptr;
+            let self_hi = g.live_ptr.saturating_add(g.content.len() as u64);
+            if value > self_lo && value < self_hi {
+                continue;
+            }
+            let interior = ranges.iter().any(|&(b, e)| value > b && value < e);
+            if !interior {
+                continue;
+            }
+            g.content[loff..loff + 8].fill(0);
+            nulled += 1;
+        }
+    }
+    if nulled > 0 {
+        info!(nulled, "Nulled dangling object-link interiors (exact-base safe)");
+    }
+}
+
+/// True when the first ~64 bytes look like a dense heap-pointer array.
+fn looks_like_dense_pointer_table(content: &[u8]) -> bool {
+    let n = (content.len() / 8).min(8);
+    if n < 4 {
+        return false;
+    }
+    let mut ptrs = 0u32;
+    for i in 0..n {
+        let v = u64::from_le_bytes(content[i * 8..i * 8 + 8].try_into().unwrap_or_default());
+        if v >= 0x1_0000 && v < 0x1_0000_0000 {
+            ptrs += 1;
+        }
+    }
+    // ≥ half of first slots are user-heap shaped → treat as table, not object.
+    ptrs * 2 >= n as u32
+}
+
+/// Heuristic: MSVC heap freelist / lookaside fills (repeating low patterns).
+fn looks_like_heap_freelist(content: &[u8]) -> bool {
+    if content.len() < 0x20 {
+        return false;
+    }
+    // Count how many of the first 8 qwords share the same high 32 bits or
+    // match freelist fill patterns seen live (0x03500350, 0x28282828…).
+    let mut same_hi = 0u32;
+    let mut fillish = 0u32;
+    let mut prev_hi: Option<u32> = None;
+    let n = (content.len() / 8).min(8);
+    for i in 0..n {
+        let v = u64::from_le_bytes(content[i * 8..i * 8 + 8].try_into().unwrap_or_default());
+        let hi = (v >> 32) as u32;
+        let lo = v as u32;
+        if let Some(p) = prev_hi {
+            if p == hi && hi != 0 {
+                same_hi += 1;
+            }
+        }
+        prev_hi = Some(hi);
+        // byte-fill or low freelist tag patterns
+        let b0 = (lo & 0xff) as u8;
+        if (lo == 0x03500350 || lo == 0x28282828 || lo == 0x27272727)
+            || (b0 != 0 && lo == u32::from_le_bytes([b0, b0, b0, b0]))
+        {
+            fillish += 1;
+        }
+        if hi == lo && hi != 0 && (hi == 0x03500350 || (hi & 0xff) * 0x01010101 == hi) {
+            fillish += 1;
+        }
+    }
+    fillish >= 2 || same_hi >= 4
+}
+
+/// Resize AHK cmd table root @0x147868 to live `count@0x147888 * 8`.
+///
+/// Main-loop large probe often admits 32KiB free-list tail; first-hop then
+/// walks garbage pointers and plants freeable junk → HeapFree c0000374 after
+/// MessageBox. Prefer the live count dword (preserved through overlay).
+fn normalize_cmd_table_capture(
+    out: &mut Vec<HeapGlobalSnapshot>,
+    total_bytes: &mut usize,
+    dump_buf: &[u8],
+    debugger: &mut dyn mida_core::DebuggerCore,
+) {
+    const TABLE_RVA: u32 = 0x147868;
+    const COUNT_RVA: u32 = 0x147888;
+    let Some(idx) = out
+        .iter()
+        .position(|g| g.rva == TABLE_RVA && !g.is_heap_handle && g.content.len() >= 8)
+    else {
+        return;
+    };
+    let count_off = COUNT_RVA as usize;
+    if count_off + 4 > dump_buf.len() {
+        return;
+    }
+    let n = u32::from_le_bytes(
+        dump_buf[count_off..count_off + 4]
+            .try_into()
+            .unwrap_or([0; 4]),
+    );
+    if !(1..0x10000).contains(&n) {
+        return;
+    }
+    let want = (n as usize).saturating_mul(8).max(8);
+    let g = &mut out[idx];
+    let old = g.content.len();
+    if old == want {
+        return;
+    }
+    if old > want {
+        g.content.truncate(want);
+        *total_bytes = total_bytes.saturating_sub(old - want);
+        info!(
+            rva = format_args!("{TABLE_RVA:#x}"),
+            count = n,
+            old_size = old,
+            new_size = want,
+            "Normalized cmd table capture to live count*8 (truncated)"
+        );
+        return;
+    }
+    // old < want: re-read exclusive range from live heap
+    let live = g.live_ptr;
+    if !can_read(debugger, live, want, HOT_XREF_SIZE_PROBE_CAP) {
+        return;
+    }
+    let mut buf = match alloc_capped(want, HOT_XREF_SIZE_PROBE_CAP, "cmd table normalize") {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    match debugger.read_memory(live as usize, &mut buf) {
+        Ok(got) if got >= 8 => {
+            if got < buf.len() {
+                buf.truncate(got);
+            }
+        }
+        _ => return,
+    }
+    *total_bytes = total_bytes
+        .saturating_sub(old)
+        .saturating_add(buf.len());
+    g.content = buf;
+    info!(
+        rva = format_args!("{TABLE_RVA:#x}"),
+        count = n,
+        old_size = old,
+        new_size = g.content.len(),
+        "Normalized cmd table capture to live count*8 (re-read)"
+    );
+}
+
+/// Force-admit every heap pointer in a captured pointer-table root (full content).
+///
+/// Used for AHK cmd/dispatch table @0x147868: entries are heap object pointers.
+/// Scrub zeros uncaptured entries → null table → AV at `mov rcx,[rax+rcx*8]`.
+fn exhaust_pointer_table_first_hop(
+    out: &mut Vec<HeapGlobalSnapshot>,
+    total_bytes: &mut usize,
+    seen_heaps: &mut BTreeSet<u64>,
+    image_base: u64,
+    image_end: u64,
+    dump_buf: &[u8],
+    debugger: &mut dyn mida_core::DebuggerCore,
+    table_rva: u32,
+    probe: usize,
+) {
+    exhaust_pointer_table_first_hop_span(
+        out,
+        total_bytes,
+        seen_heaps,
+        image_base,
+        image_end,
+        dump_buf,
+        debugger,
+        table_rva,
+        usize::MAX,
+        probe,
+    );
+}
+
+fn exhaust_pointer_table_first_hop_span(
+    out: &mut Vec<HeapGlobalSnapshot>,
+    total_bytes: &mut usize,
+    seen_heaps: &mut BTreeSet<u64>,
+    image_base: u64,
+    image_end: u64,
+    dump_buf: &[u8],
+    debugger: &mut dyn mida_core::DebuggerCore,
+    table_rva: u32,
+    max_span: usize,
+    probe: usize,
+) {
+    let slot_cap = MAX_HEAP_GLOBAL_SLOTS.saturating_sub(HEAP_DANGLING_SLOT_RESERVE / 2);
+    let Some(table_idx) = out.iter().position(|g| {
+        g.rva == table_rva && !g.is_heap_handle && g.content.len() >= 8
+    }) else {
+        return;
+    };
+
+    let full = out[table_idx].content.clone();
+    let span = full.len().min(max_span);
+    let content = full[..span].to_vec();
+    let mut targets: Vec<(usize, u64)> = Vec::new();
+    let mut off = 0usize;
+    while off + 8 <= content.len() {
+        let v = u64::from_le_bytes(content[off..off + 8].try_into().unwrap_or_default());
+        off += 8;
+        if v == 0 {
+            continue;
+        }
+        if !is_heap_pointer(v, image_base, image_end) || v < MIN_HEAP_POINTER {
+            continue;
+        }
+        if v >= 0x1_0000_0000 {
+            continue;
+        }
+        if is_exact_live_ptr(out, v) {
+            continue;
+        }
+        targets.push((off - 8, v));
+    }
+    if targets.is_empty() {
+        info!(
+            rva = format_args!("{table_rva:#x}"),
+            slots = content.len() / 8,
+            "pointer-table first-hop: no external heap edges"
+        );
+        return;
+    }
+
+    let mut added = 0usize;
+    let mut skipped = 0usize;
+    let edge_count = targets.len();
+    let probe = probe.min(MAX_HEAP_GLOBAL_BYTES).max(0x40);
+    for (edge_off, value) in targets {
+        if out.len() >= slot_cap || *total_bytes >= MAX_HEAP_GLOBAL_TOTAL_BYTES {
+            skipped += 1;
+            continue;
+        }
+        if is_exact_live_ptr(out, value) || seen_heaps.contains(&value) {
+            skipped += 1;
+            continue;
+        }
+        if looks_like_heap_handle(debugger, value) {
+            skipped += 1;
+            continue;
+        }
+        seen_heaps.insert(value);
+        let mut size = estimate_object_size(dump_buf, usize::MAX, value, debugger, probe);
+        if size < 8 {
+            size = if can_read(debugger, value, 0x40, probe) {
+                0x40
+            } else if can_read(debugger, value, 0x20, probe) {
+                0x20
+            } else {
+                skipped += 1;
+                continue;
+            };
+        }
+        size = cap_size_before_next_base(out, value, size);
+        if size < 8 {
+            skipped += 1;
+            continue;
+        }
+        let mut child = match alloc_capped(
+            size,
+            probe.min(MAX_HEAP_CONTAINER_BYTES),
+            "pointer-table first-hop child",
+        ) {
+            Ok(b) => b,
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
+        };
+        match debugger.read_memory(value as usize, &mut child) {
+            Ok(n) if n >= 8 => {
+                if n < child.len() {
+                    child.truncate(n);
+                }
+            }
+            _ => {
+                skipped += 1;
+                continue;
+            }
+        }
+        child = trim_trailing_zero_pages(child);
+        if child.len() < 8 {
+            skipped += 1;
+            continue;
+        }
+        handle_string_shell_on_capture(
+            &mut child,
+            out,
+            total_bytes,
+            seen_heaps,
+            image_base,
+            image_end,
+            dump_buf,
+            debugger,
+            slot_cap,
+        );
+        if child.len() < 8 {
+            skipped += 1;
+            continue;
+        }
+        info!(
+            table_rva = format_args!("{table_rva:#x}"),
+            heap = format_args!("{value:#x}"),
+            size = child.len(),
+            table_off = format_args!("{edge_off:#x}"),
+            "Captured pointer-table first-hop edge"
+        );
+        *total_bytes = total_bytes.saturating_add(child.len());
+        out.push(HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: value,
+            content: child,
+            is_heap_handle: false,
+            is_image_inline: false,
+        });
+        added += 1;
+    }
+
+    info!(
+        table_rva = format_args!("{table_rva:#x}"),
+        added,
+        skipped,
+        edges = edge_count,
+        total = out.len(),
+        "pointer-table first-hop exhaust complete"
     );
 }
 
@@ -1338,6 +3320,7 @@ fn expand_hot_root_children(
                 live_ptr: value,
                 content,
                 is_heap_handle: false,
+            is_image_inline: false,
             });
             added += 1;
             total_added += 1;
@@ -1576,6 +3559,7 @@ fn expand_heap_graph(
                 live_ptr: value,
                 content,
                 is_heap_handle: false,
+            is_image_inline: false,
             });
             node_priority.push(child_pri);
             added += 1;
@@ -1679,7 +3663,13 @@ fn handle_string_shell_on_capture(
     let Some((buf, _)) = parse_refcounted_string_shell(content) else {
         return;
     };
-    let covered = range_contains(out, buf) || seen_heaps.contains(&buf);
+    // R-GTO-UI r12: only an *exact* live_ptr match means the buffer is a
+    // freeable standalone snapshot. `range_contains` is wrong here — a large
+    // parent (e.g. 0x144358 @ 32KiB) can swallow path/title buffers as
+    // interior addresses; multi_fixup is exact-base only so those pointers
+    // stay stale OR get remapped to parent interiors, then HeapFree →
+    // c0000374 (WinMain path string release after MessageBox).
+    let covered = is_exact_live_ptr(out, buf) || seen_heaps.contains(&buf);
     let admitted = covered
         || admit_string_buffer_child(
             content,
@@ -1724,7 +3714,9 @@ fn admit_string_buffer_child(
     if !is_heap_pointer(buf, image_base, image_end) || buf < MIN_GRAPH_CHILD_POINTER {
         return false;
     }
-    if seen_heaps.contains(&buf) || range_contains(out, buf) {
+    // Exact base only (see handle_string_shell_on_capture). Interior coverage
+    // of a large parent is NOT free-safe for AHK string dtors.
+    if seen_heaps.contains(&buf) || is_exact_live_ptr(out, buf) {
         return true; // already covered — keep shell pointers for remap
     }
     if out.len() >= slot_cap || *total_bytes >= MAX_HEAP_GLOBAL_TOTAL_BYTES {
@@ -1789,6 +3781,7 @@ fn admit_string_buffer_child(
         live_ptr: buf,
         content: body,
         is_heap_handle: false,
+    is_image_inline: false,
     });
     true
 }
@@ -1968,6 +3961,7 @@ fn split_swallowed_siblings(
                 live_ptr: value,
                 content,
                 is_heap_handle: false,
+            is_image_inline: false,
             });
             added += 1;
         }
@@ -2134,6 +4128,7 @@ fn capture_dangling_edges(
             live_ptr: value,
             content,
             is_heap_handle: false,
+        is_image_inline: false,
         });
         added += 1;
     }
@@ -2145,6 +4140,39 @@ fn capture_dangling_edges(
             "Dangling-edge capture pass complete"
         );
     }
+}
+
+/// Truncate any existing capture whose range strictly contains `base` so that
+/// the parent ends at `base`. Returns true if at least one parent was carved.
+///
+/// Used by hot-root ensure when a critical table (cmd dispatch @0x147868) sits
+/// *inside* an oversized gscript/heap probe. Without carving, ensure falls back
+/// to plant-only 8B and multi_fixup never remaps the real table body.
+fn carve_parent_at_hot_base(out: &mut [HeapGlobalSnapshot], base: u64) -> bool {
+    let mut carved = false;
+    for o in out.iter_mut() {
+        if o.is_heap_handle || o.content.is_empty() {
+            continue;
+        }
+        let o_end = o.live_ptr.saturating_add(o.content.len() as u64);
+        // Strict interior: parent starts before base and ends after base.
+        if base > o.live_ptr && base < o_end {
+            let new_len = (base - o.live_ptr) as usize;
+            if new_len >= 8 && new_len < o.content.len() {
+                info!(
+                    parent_live = format_args!("{:#x}", o.live_ptr),
+                    parent_rva = format_args!("{:#x}", o.rva),
+                    old_size = o.content.len(),
+                    new_size = new_len,
+                    hot_base = format_args!("{base:#x}"),
+                    "Carved oversized parent to free exclusive hot-root range"
+                );
+                o.content.truncate(new_len);
+                carved = true;
+            }
+        }
+    }
+    carved
 }
 
 /// Cap `size` so `[base, base+size)` does not overlap any existing capture.
@@ -2297,6 +4325,14 @@ fn scrub_buffer_external_ptrs(
     let mut off = 0usize;
     while off + 8 <= buf.len() {
         let v = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap_or_default());
+        // R-GTO-UI r19b: short AHK label names live as inline UTF-16 at +0x30
+        // (e.g. "A_Ar" = 0x00720041005f0041). That bit pattern is also a
+        // plausible user VA; scrubbing it destroys mName repair material and
+        // leaves binary-search labels with null names → wcscmp AV.
+        if looks_like_inline_utf16_qword(v) {
+            off += 8;
+            continue;
+        }
         if is_external_dangling_ptr(v, ranges, image_base, image_end) {
             buf[off..off + 8].fill(0);
             n += 1;
@@ -2304,6 +4340,31 @@ fn scrub_buffer_external_ptrs(
         off += 8;
     }
     n
+}
+
+/// True when both u16 lanes look like ASCII identifier text / UTF-16 label chars.
+fn looks_like_inline_utf16_qword(v: u64) -> bool {
+    let lo = (v & 0xffff) as u16;
+    let hi = ((v >> 16) & 0xffff) as u16;
+    let lo2 = ((v >> 32) & 0xffff) as u16;
+    let hi2 = ((v >> 48) & 0xffff) as u16;
+    fn ok_u16(c: u16) -> bool {
+        c == 0
+            || c == b'_' as u16
+            || c == b'$' as u16
+            || c == b'@' as u16
+            || c == b'#' as u16
+            || c == b'-' as u16
+            || c == b'.' as u16
+            || (b'0' as u16..=b'9' as u16).contains(&c)
+            || (b'A' as u16..=b'Z' as u16).contains(&c)
+            || (b'a' as u16..=b'z' as u16).contains(&c)
+            || (0x80..=0xff).contains(&c) // latin-1 label chars
+    }
+    // At least two non-zero ASCII-ish units; reject pure zeros.
+    let units = [lo, hi, lo2, hi2];
+    let nonzero = units.iter().filter(|&&c| c != 0).count();
+    nonzero >= 2 && units.iter().all(|&c| ok_u16(c))
 }
 
 fn is_external_dangling_ptr(

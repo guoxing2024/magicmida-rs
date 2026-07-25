@@ -40,6 +40,8 @@ pub(crate) fn install_heap_bootstrap(
     restore_mode: ContainerRestoreMode,
     // Cookie storage RVA captured from the late dump (before early overlay).
     cookie_rva: Option<u32>,
+    // Optional AHK call-obfuscation cookie mirror (src,dst) image RVAs.
+    cookie_mirror: Option<(u32, u32)>,
     _debugger: Option<&mut dyn mida_core::DebuggerCore>,
 ) -> Option<u32> {
     if !pe.is_64bit {
@@ -79,6 +81,7 @@ pub(crate) fn install_heap_bootstrap(
                     original_entry_point,
                     cookie_rva,
                     None, // do not refresh CRT heap global pre-stdio
+                    cookie_mirror,
                 );
             }
             ContainerRestoreMode::PreCrt => {
@@ -101,6 +104,7 @@ pub(crate) fn install_heap_bootstrap(
                     cookie_rva,
                     // Pre-CRT: still avoid writing CRT heap global.
                     None,
+                    cookie_mirror,
                 );
             }
         }
