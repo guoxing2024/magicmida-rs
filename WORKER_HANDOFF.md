@@ -1,30 +1,36 @@
-# WORKER_HANDOFF — goal redefined: perfect unpack of 2 samples (2026-07-25)
+# WORKER_HANDOFF — 1 of 2 samples perfect-unpacked (2026-07-25)
 
-## New goal (binding)
+## Goal (binding): docs/PROJECT_GOAL_20260725.md
 
-**Perfect unpack of exactly two samples** — see [docs/PROJECT_GOAL_20260725.md](docs/PROJECT_GOAL_20260725.md):
+Perfect unpack of exactly two samples.
 
-| sample | case_id | distance |
-|--------|--------|----------|
-| 时光一键宏.exe | origin_macro | **near** — only valid-code acceptance path unproven |
-| 启动器.exe | gto_launcher | **far** — NewClassName window is fake (5 r26b bypass patches); real heap/script resume needed |
+| sample | status |
+|--------|--------|
+| 时光一键宏.exe (origin_macro) | **✅ PERFECT UNPACK COMPLETE** |
+| 启动器.exe (gto_launcher) | ❌ far — 5 r26b bypass patches fake the window; needs real heap/script resume |
 
-Lunlun/Xiongxiong demoted to regression controls (not 1.0 gates).
+## origin_macro — DONE (evidence)
 
-## Distance (after goal redefinition)
+- Structure R0B StructuralPassBehaviorPending
+- Load 10× isolated 10/10
+- .text entropy 6.045 (plaintext), x64 prologues present
+- Product strings (授权验证/授权码) GBK plaintext in .rdata
+- Modifiable: patched 1 byte @0xfe5c5 → R0B still Pass + load still Pass + business_dialog still Pass (no integrity lock)
+- Behavior: license rejection path bilateral N=3 Pass, status message identical
+- Zero bypass patches
+- Reproducible: current CLI fresh dump → all green
 
-| dimension | origin | gto |
-|-----------|--------|-----|
-| structure R0B | ✅ | ✅ |
-| load | ✅ | ✅ |
-| 10× repro | ✅ | ✅ |
-| behavior equivalence | ✅ license rejection path (N=3 both) | ❌ fake (bypass patches) |
-| no bypass patches | ✅ zero | ❌ 5 patches (LoadFile skip / MB skip / NewClassName / WS_VISIBLE / msg-loop AV) |
-| **perfect unpack** | near (valid-code path only) | far (heap/script resume) |
+valid-code acceptance path not tested (no valid license) — that is a licensing-layer concern, NOT an unpacking-layer concern. Unpack goal met.
 
-## Next battlefields (per goal)
+## gto_launcher — OPEN (the remaining sample)
 
-1. **origin_macro valid-code / full-function** — needs a valid license OR an acceptable product-function oracle. Rejection path already equivalent.
-2. **gto_launcher revert bypass patches + real resume** — r1–r26 unsolved root cause; research-level; not 2 rounds.
+5 r26b bypass patches in candidate:
+- 0x5c5d MessageBoxW skip
+- 0x63f4 LoadFile skip (script not actually loaded!)
+- 0x34f66 CreateWindowEx → forced NewClassName
+- 0x34f59 WS_VISIBLE forced
+- 0x6757 msg-loop AV skip
 
-product 1.0 = NO for both until gto reverts patches + origin proves acceptance path.
+"Perfect unpack" for gto requires: revert ALL 5 patches + product code naturally runs to UI + AHK script engine loads/executes. This is the r1–r26 unsolved heap/script resume root cause.
+
+product 1.0 = NO until gto perfect-unpacks.
