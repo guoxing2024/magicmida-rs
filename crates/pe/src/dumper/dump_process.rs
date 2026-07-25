@@ -886,8 +886,13 @@ pub fn dump_process(
     super::heap_global_snapshot::sanitize_ahk_runtime_global(&mut heap_globals);
     // R-GTO-UI r22b: gscript+0xbd8 must be NewClassName for RegisterClass @0x34db0.
     super::heap_global_snapshot::repair_gscript_window_strings(&mut heap_globals);
+    // r27: no_bypass flag also gates slab capture (avoid rebase regression).
+    let no_bypass = std::env::var("MIDA_GTO_NO_BYPASS").ok().as_deref() == Some("1");
     // r27: capture heap slab for interior-pointer rebase (heap rebasing wall).
-    let heap_slab = if stage_plan.detect_heap_globals {
+    // Only when MIDA_GTO_NO_BYPASS=1 (root-cause measurement). Default (bypass)
+    // path skips slab to avoid rebase false-positives regressing the working
+    // r26b NewClassName path.
+    let heap_slab = if no_bypass && stage_plan.detect_heap_globals {
         super::heap_global_snapshot::capture_heap_slab(&heap_globals, debugger)
     } else {
         None
@@ -1301,7 +1306,6 @@ pub fn dump_process(
     // R-GTO-UI r26b/r27: MIDA_GTO_NO_BYPASS=1 disables ALL 5 bypass patches
     // to measure the real heap/script-resume crash point (perfect-unpack
     // root-cause diagnosis; candidate will NOT show NewClassName).
-    let no_bypass = std::env::var("MIDA_GTO_NO_BYPASS").ok().as_deref() == Some("1");
     if !no_bypass {
         patch_gto_skip_loadfile_reentry(&mut out_data);
         patch_gto_registerclass_classname(&mut out_data);

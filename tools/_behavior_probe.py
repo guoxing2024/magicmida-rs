@@ -1332,6 +1332,18 @@ def run_probe(
                 verdict = "Pass"
     elif probe_kind == "window_class":
         probe_id = PROBE_ID_WINDOW
+        residuals = list(RESIDUAL_RISKS_WINDOW)
+        if require_control_texts:
+            residuals = residuals + list(RESIDUAL_RISKS_WINDOW_CONTROLS)
+        if status == "pass":
+            result_status = "pass"
+            verdict = "Pass"
+        elif status == "error":
+            result_status = "error"
+            verdict = "Inconclusive"
+        else:
+            result_status = "fail"
+            verdict = "Fail"
     elif probe_kind == "business_dialog":
         probe_id = PROBE_ID_BUSINESS_DIALOG
         residuals = list(RESIDUAL_RISKS_WINDOW)

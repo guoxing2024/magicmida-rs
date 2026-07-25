@@ -99,6 +99,56 @@ impl ImportTableBuilder {
         &mut self.modules[idx]
     }
 
+    /// Ensure a function exists in the import table under the given DLL.
+    /// Returns the IAT slot RVA for the function (creating module + thunk
+    /// if absent). Used by the heap-bootstrap stub to guarantee helper
+    /// imports (e.g. `VirtualAlloc`) are available even when the original
+    /// sample did not import them.
+    pub fn ensure_function(&mut self, dll: &str, func: &str) -> Option<u32> {
+        let dll_lower = dll.to_lowercase();
+        let idx = self.modules.iter().position(|m| m.name == dll_lower);
+        let mi = match idx {
+            Some(i) => i,
+            None => {
+                self.add_module(dll);
+                self.modules.len() - 1
+            }
+        };
+        let exists = self.modules[mi]
+            .thunks
+            .iter()
+            .any(|t| t.function_name.as_deref() == Some(func));
+        if exists {
+            self.modules[mi]
+                .thunks
+                .iter()
+                .find(|t| t.function_name.as_deref() == Some(func))
+                .map(|t| t.iat_address)
+        } else {
+            // Compute IAT address: after all existing thunks across modules.
+            // The import section builder assigns IAT addresses in build order;
+            // we use a placeholder that gets resolved during section build.
+            // Actually the builder uses existing iat_address on thunks. We need
+            // to assign one. Use the max existing + 8.
+            let max_iat = self
+                .modules
+                .iter()
+                .flat_map(|m| m.thunks.iter())
+                .map(|t| t.iat_address)
+                .max()
+                .unwrap_or(0);
+            let iat = if max_iat > 0 { max_iat + 8 } else { 0 };
+            self.modules[mi].thunks.push(crate::import_table::ImportThunk {
+                iat_address: iat,
+                function_name: Some(func.to_string()),
+                hint: 0,
+                ordinal: None,
+            });
+            // Return 0 if we couldn't compute a real IAT (builder will reassign)
+            if iat > 0 { Some(iat) } else { None }
+        }
+    }
+
     /// Produce the on-disk `.import` section WITHOUT the embedded IAT, plus
     /// an ordered list of thunk slot values (hint/name RVAs) to write into
     /// the original IAT the protector filled at runtime.
