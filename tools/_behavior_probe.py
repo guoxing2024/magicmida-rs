@@ -42,6 +42,7 @@ PROBE_ID_WINDOW = "gui_window_class_v0"
 PROBE_ID_EXPORTS = "pe_export_names_v0"
 PROBE_ID_EXIT_EXACT = "exit_code_exact_v0"
 PROBE_ID_PE_STRING = "pe_string_v0"
+PROBE_ID_BUSINESS_DIALOG = "gui_business_dialog_v0"
 
 # Job-object network isolation is deferred; residual risk is always listed.
 RESIDUAL_RISKS_MARKER = [
@@ -660,6 +661,185 @@ def _run_window_class_probe(
     return status, exit_code, error_class, markers, classes_seen, controls_seen
 
 
+def _run_business_dialog_probe(
+    launch_path: Path,
+    *,
+    max_wall_ms: int,
+    expect_classes: list[str],
+    business_input: str | None,
+    business_button_text: str | None,
+    business_expect_status: str | None,
+    env: dict[str, str],
+    run_cwd: str,
+) -> tuple[str, int | None, str | None, list[str], list[str], list[str]]:
+    """Drive a license/product dialog: type a code, click a button, read status.
+
+    Pass when: expected window class appears, input is set, button is clicked,
+    and (if required) the status-label text after click contains the expected
+    substring. Fail-closed otherwise. This is a real business-behavior oracle
+    (not just load survival or static UI presence).
+    """
+    expect_set = {c for c in expect_classes if c}
+    if not expect_set:
+        return "error", None, "no_expect_window_class", [], [], []
+    if os.name != "nt":
+        return "error", None, "non_windows", [], [], []
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    GetClassNameW = user32.GetClassNameW
+    GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    GetWindowTextW = user32.GetWindowTextW
+    GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    GetWindowTextLengthW = user32.GetWindowTextLengthW
+    GetWindowThreadProcessId = user32.GetWindowThreadProcessId
+    GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    SetWindowTextW = user32.SetWindowTextW
+    SetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPCWSTR]
+    PostMessageW = user32.PostMessageW
+    PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    EnumChildWindows = user32.EnumChildWindows
+    IsWindowVisible = user32.IsWindowVisible
+    BM_CLICK = 0x00F5
+
+    def _gettext(hwnd: int) -> str:
+        n = GetWindowTextLengthW(hwnd) + 2
+        b = ctypes.create_unicode_buffer(n)
+        GetWindowTextW(hwnd, b, n)
+        return b.value
+
+    creationflags = _load_createflags() if os.name == "nt" else 0
+    status = "error"
+    exit_code: int | None = None
+    error_class: str | None = None
+    markers: list[str] = []
+    classes_seen: list[str] = []
+    controls_seen: list[str] = []
+    proc: subprocess.Popen[Any] | None = None
+    try:
+        proc = subprocess.Popen(
+            [str(launch_path)],
+            cwd=run_cwd,
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=creationflags,
+        )
+        deadline = time.perf_counter() + max(0.5, max_wall_ms / 1000.0)
+        dlg_hwnd: int | None = None
+        while time.perf_counter() < deadline:
+            found_dlg: int | None = None
+
+            @WNDENUMPROC
+            def _find(hwnd: int, _lp: int) -> bool:
+                nonlocal found_dlg, classes_seen
+                p = wintypes.DWORD()
+                GetWindowThreadProcessId(hwnd, ctypes.byref(p))
+                if int(p.value) != int(proc.pid):
+                    return True
+                cn = ctypes.create_unicode_buffer(256)
+                GetClassNameW(hwnd, cn, 256)
+                if cn.value and cn.value not in classes_seen:
+                    classes_seen.append(cn.value)
+                if cn.value in expect_set and IsWindowVisible(hwnd):
+                    found_dlg = hwnd
+                    return False
+                return True
+
+            user32.EnumWindows(_find, 0)
+            if found_dlg is not None:
+                dlg_hwnd = found_dlg
+                break
+            if proc.poll() is not None:
+                break
+            time.sleep(0.15)
+
+        if dlg_hwnd is None:
+            exit_code = proc.poll()
+            status = "fail"
+            error_class = (
+                f"nt_exception_exit:{exit_code & 0xFFFFFFFF:#x}"
+                if exit_code is not None and _is_nt_exception_exit(exit_code)
+                else "dialog_not_seen"
+            )
+        else:
+            markers.append(f"dialog:{next(iter(expect_set))}")
+            edit_hwnd: int | None = None
+            btn_hwnd: int | None = None
+            status_hwnd: int | None = None
+            empty_statics: list[int] = []
+
+            @WNDENUMPROC
+            def _kids(c: int, _lp: int) -> bool:
+                nonlocal edit_hwnd, btn_hwnd
+                bb = ctypes.create_unicode_buffer(64)
+                GetClassNameW(c, bb, 64)
+                tt = _gettext(c)
+                controls_seen.append(f"{bb.value}|{tt[:60]}")
+                if bb.value == "Edit" and edit_hwnd is None and tt == "":
+                    edit_hwnd = c
+                elif bb.value == "Button" and btn_hwnd is None:
+                    if business_button_text is None or business_button_text in tt:
+                        btn_hwnd = c
+                elif bb.value == "Static" and tt == "":
+                    empty_statics.append(c)
+                return True
+
+            EnumChildWindows(dlg_hwnd, _kids, 0)
+            if len(empty_statics) >= 2:
+                status_hwnd = empty_statics[1]
+            elif empty_statics:
+                status_hwnd = empty_statics[0]
+
+            if edit_hwnd is None or btn_hwnd is None:
+                status = "fail"
+                error_class = "dialog_controls_not_found"
+            else:
+                if business_input is not None:
+                    SetWindowTextW(edit_hwnd, business_input)
+                    time.sleep(0.3)
+                readback = _gettext(edit_hwnd)
+                if business_input is not None and readback != business_input:
+                    status = "fail"
+                    error_class = "input_not_set"
+                else:
+                    PostMessageW(btn_hwnd, BM_CLICK, 0, 0)
+                    status_msg = ""
+                    for _ in range(max(1, int(6.0 / 0.15))):
+                        time.sleep(0.15)
+                        if status_hwnd is not None:
+                            status_msg = _gettext(status_hwnd)
+                            if status_msg:
+                                break
+                        if proc.poll() is not None:
+                            break
+                    markers.append(f"status_after_click:{status_msg[:80]}")
+                    if business_expect_status is not None:
+                        if business_expect_status in status_msg:
+                            status = "pass"
+                            error_class = "business_status_matched"
+                        else:
+                            status = "fail"
+                            error_class = "business_status_mismatch"
+                    else:
+                        if status_msg:
+                            status = "pass"
+                            error_class = "business_status_observed"
+                        else:
+                            status = "fail"
+                            error_class = "no_status_after_click"
+            exit_code = proc.poll()
+    except OSError as e:
+        status = "error"
+        error_class = f"os_error:{e.__class__.__name__}"
+    finally:
+        if proc is not None:
+            _terminate_proc(proc)
+    return status, exit_code, error_class, markers, classes_seen, controls_seen
+
+
 def run_probe(
     candidate: Path,
     *,
@@ -677,6 +857,9 @@ def run_probe(
     require_control_texts: list[str] | None = None,
     require_exports: list[str] | None = None,
     require_strings: list[str] | None = None,
+    business_input: str | None = None,
+    business_button_text: str | None = None,
+    business_expect_status: str | None = None,
 ) -> dict[str, Any]:
     candidate = candidate.resolve()
     if not candidate.is_file():
@@ -694,7 +877,7 @@ def run_probe(
 
     # Process-launch probes: isolated copy per attempt (mutex / file locks).
     # marker synthetic fixtures stay in scratch so marker file stays isolated.
-    process_probe = probe_kind in ("load_no_crash", "window_class", "exit_code")
+    process_probe = probe_kind in ("load_no_crash", "window_class", "exit_code", "business_dialog")
     if process_probe:
         attempts = max(1, attempts)
         rate_samples = max(0, int(rate_samples)) if probe_kind == "load_no_crash" else 0
@@ -956,6 +1139,47 @@ def run_probe(
                 continue
             break
 
+        if probe_kind == "business_dialog":
+            (
+                status,
+                exit_code,
+                error_class,
+                biz_markers,
+                classes_seen,
+                controls_seen,
+            ) = _run_business_dialog_probe(
+                launch_path,
+                max_wall_ms=max_wall_ms,
+                expect_classes=list(expect_window_classes or []),
+                business_input=business_input,
+                business_button_text=business_button_text,
+                business_expect_status=business_expect_status,
+                env=env,
+                run_cwd=run_cwd,
+            )
+            markers_found = list(biz_markers)
+            survived_timeout = False
+            stdout_tail = ""
+            stderr_tail = ""
+            ok = status == "pass"
+            if ok:
+                pass_count += 1
+            elif status == "error":
+                error_count += 1
+            else:
+                fail_count += 1
+            attempt_notes.append(
+                f"a{attempt}:status={status}:exit={exit_code}:err={error_class}:ok={ok}"
+            )
+            _kill_stale_by_stem(Path(launch_path).stem)
+            _kill_stale_by_stem(candidate.stem)
+            if ok:
+                break
+            if attempt < attempts:
+                time.sleep(0.5 * attempt + 0.3)
+                continue
+            break
+
         if probe_kind == "exit_code":
             status, exit_code, error_class, survived_timeout, stdout_tail, stderr_tail = (
                 _run_one_process(
@@ -1108,6 +1332,8 @@ def run_probe(
                 verdict = "Pass"
     elif probe_kind == "window_class":
         probe_id = PROBE_ID_WINDOW
+    elif probe_kind == "business_dialog":
+        probe_id = PROBE_ID_BUSINESS_DIALOG
         residuals = list(RESIDUAL_RISKS_WINDOW)
         if require_control_texts:
             residuals = residuals + list(RESIDUAL_RISKS_WINDOW_CONTROLS)
@@ -1322,6 +1548,7 @@ def main() -> int:
             "export_names",
             "exit_code",
             "pe_string",
+            "business_dialog",
         ],
         default="marker",
         help=(
@@ -1373,6 +1600,21 @@ def main() -> int:
         action="append",
         default=[],
         help="pe_string: required static string (ASCII/UTF-8 or UTF-16LE; repeatable)",
+    )
+    ap.add_argument(
+        "--business-input",
+        default=None,
+        help="business_dialog: text to type into the dialog input Edit before clicking",
+    )
+    ap.add_argument(
+        "--business-button-text",
+        default=None,
+        help="business_dialog: button caption substring to click (default: first Button)",
+    )
+    ap.add_argument(
+        "--business-expect-status",
+        default=None,
+        help="business_dialog: required status-label text substring after click",
     )
     args = ap.parse_args()
 
@@ -1431,7 +1673,8 @@ def main() -> int:
         probe_kind=args.probe_kind,
         attempts=(
             args.attempts
-            if args.probe_kind in ("load_no_crash", "window_class", "exit_code")
+            if args.probe_kind
+            in ("load_no_crash", "window_class", "exit_code", "business_dialog")
             else 1
         ),
         rate_samples=args.rate_samples if args.probe_kind == "load_no_crash" else 0,
@@ -1440,6 +1683,9 @@ def main() -> int:
         require_control_texts=list(args.require_control_text or []),
         require_exports=list(args.require_export or []),
         require_strings=list(args.require_string or []),
+        business_input=args.business_input,
+        business_button_text=args.business_button_text,
+        business_expect_status=args.business_expect_status,
     )
     evidence = packed["evidence"]
     shape_errs = validate_evidence_shape(evidence)

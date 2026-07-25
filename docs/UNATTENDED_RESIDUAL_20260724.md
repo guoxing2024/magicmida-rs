@@ -28,7 +28,9 @@
 
 **Verdict:** `all_4_10x10 = true`, `all_4_r0b_structural_pass = true`, `code_changes = 0`.
 
-**Evidence:** `D:\MidaVault\lab\evidence\_beh_gateepro10x_baseline_20260725epro10x_summary.json` (+ per-run JSON + R0B reports).
+**Evidence:** `D:\MidaVault\lab\evidence\_beh_gate
+epro10x_baseline_20260725
+epro10x_summary.json` (+ per-run JSON + R0B reports).
 
 **Non-claim:** load survival 10× ≠ product logic equivalence; this closes the **reproducibility** dimension of the Oreans family gate only. **product 1.0 still NO** (R-PURE-LOGIC + multi-family production-grade remain).
 
@@ -1507,6 +1509,30 @@ Bootstrap `+0xbd8` correct at WinMain; after `0x63f9` overwritten to `0x106644`.
   - `r26b_window_n3.json`, `r26b_load_final.json`
   - `unpack.stdout.txt`
 
+## Battlefield R-PURE-LOGIC Round 1 (2026-07-25) — Origin business-dialog oracle
+
+**Bar:** behavioral equivalence beyond load survival — drive the product license dialog and compare response to protected input.
+
+**New probe:** `tools/_behavior_probe.py --probe-kind business_dialog` (`gui_business_dialog_v0`). Drives dialog: find expected window class → set input Edit text → click Button → read status Static label → Pass if status contains expected substring. Fail-closed.
+
+**Oracle (origin_macro):** drive `PigToGoLicenseDialog`, input `1234-5678-9012`, click `确定`, expect status `请输入授权码`.
+
+| side | N=3 | verdict | status message |
+|------|-----|---------|----------------|
+| protected input (reference) | 3/3 Pass | business_status_matched | `请输入授权码` |
+| unpacked candidate (fresh pure dump) | 3/3 Pass | business_status_matched | `请输入授权码` |
+| **equivalence** | — | **status_message_equal = true** | identical |
+
+**Meaning:** the license-validation code path runs identically on the unpacked candidate vs the protected input. Invalid code → same rejection message. This is real business-behavior equivalence (not load survival, not static UI presence, not sample-specific patch — Origin has zero bypass patches).
+
+**Evidence:** `D:\MidaVault\lab\evidence\_beh_gate_pure_logic_round0_20260725\origin_biz_prot_{1,2,3}.json` + `origin_biz_cand_{1,2,3}.json` + `origin_business_dialog_summary.json`.
+
+**Non-claim:** rejection-path equivalence on invalid code only. Does NOT prove: valid-code acceptance, license persistence (registry/file), full product functionality, or business-path equivalence for the other 3 cases. **product 1.0 still NO.**
+
+**Honesty on the other 3 cases:**
+- **Lunlun / Xiongxiong:** exit-only (no product window); exit-code oracle `0x15ff58` is a stack-address-like value, likely a dump-stub artifact, not real product exit. Weakest behavioral signal. NOT business-equivalent.
+- **GTO:** window appears only via r26b bypass patches (LoadFile skip, MessageBox skip, forced NewClassName). NOT business-equivalent.
+
 ## Residual after R-GTO-UI window close (r26b)
 
 | ID | Item | Blocks 1.0? | Status |
@@ -1515,7 +1541,7 @@ Bootstrap `+0xbd8` correct at WinMain; after `0x63f9` overwritten to `0x106644`.
 | R-LOAD-FLAKE (GTO quiet / fresh host) | attempt=1 load survival on independent-host dumps | Quality | **W2 metric exit**; W4/P1 reconfirm green |
 | R-GTO-LATEST | Fresh dump load without `r4c_gto` walk | Quality | **W2 metric exit** |
 | R-GTO-BOOT | `.boot` heap_global payload size variance under 320-slot cap | Quality | Open (honesty; not load AV root) |
-| R-PURE-LOGIC | Product-logic / business path equivalence | **Yes** for product 1.0 | **Advanced:** controls + pe_string + exit/title/exports; **still blocks 1.0** |
+| R-PURE-LOGIC | Product-logic / business path equivalence | **Yes** for product 1.0 | **Advanced (Origin):** business-dialog oracle (`gui_business_dialog_v0`) — invalid-code rejection path identical to protected input (N=3 both). Lunlun/Xiong exit-only (weak); GTO bypass-patched (fake). **Still blocks 1.0** (valid-code path + multi-case not proven) |
 | R-GTO-UI | Unpacked GTO no product window; protected does | Quality / **1.0-relevant for GTO** | **CLOSED (window oracle).** r26/r26b: dual class lea + CW NewClassName + WS_VISIBLE + MB skip + msg pump. Independent N=3 attempt=1 **Pass** (`NewClassName`). load Pass. Evidence `live_r26b_final_newclass\`. **product 1.0 still NO** (not full logic/license equivalence) |
 | R-4CASE-FRESH | Full 4-case attempt=1 on best pins | Claim hygiene | **P1-A closed** (N=10 × 4 = 1.0) |
 | R-X86 | ScyllaHide x86 residual | x86 only | Open |
