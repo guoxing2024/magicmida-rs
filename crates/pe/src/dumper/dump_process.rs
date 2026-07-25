@@ -1291,13 +1291,21 @@ pub fn dump_process(
     // 2) Force non-empty class check @0x34dbb AND lpszClassName @0x34ed4
     //    → NewClassName (r25b regressed by doing only 34ed4).
     // 3) Skip crashing 0x35520 but keep msg pump 0x1b10 (@0x6757).
-    patch_gto_skip_loadfile_reentry(&mut out_data);
-    patch_gto_registerclass_classname(&mut out_data);
-    patch_gto_skip_msgloop_crash(&mut out_data);
-    // R-GTO-UI r26b: WinMain MessageBoxW @0x5c5d blocks cold start before
-    // RegisterClass; window probe never dismisses it (only sees #32770).
-    // Protected product does not surface this gate; skip like diagnostic mb_nop.
-    patch_gto_skip_winmain_messagebox(&mut out_data);
+    // R-GTO-UI r26b/r27: MIDA_GTO_NO_BYPASS=1 disables ALL 5 bypass patches
+    // to measure the real heap/script-resume crash point (perfect-unpack
+    // root-cause diagnosis; candidate will NOT show NewClassName).
+    let no_bypass = std::env::var("MIDA_GTO_NO_BYPASS").ok().as_deref() == Some("1");
+    if !no_bypass {
+        patch_gto_skip_loadfile_reentry(&mut out_data);
+        patch_gto_registerclass_classname(&mut out_data);
+        patch_gto_skip_msgloop_crash(&mut out_data);
+        // R-GTO-UI r26b: WinMain MessageBoxW @0x5c5d blocks cold start before
+        // RegisterClass; window probe never dismisses it (only sees #32770).
+        // Protected product does not surface this gate; skip like diagnostic mb_nop.
+        patch_gto_skip_winmain_messagebox(&mut out_data);
+    } else {
+        info!("R-GTO-UI r27: MIDA_GTO_NO_BYPASS=1 — all 5 bypass patches DISABLED (root-cause measurement)");
+    }
 
     // DEBUG: Verify section 1 characteristics
     debug_section_chars(&out_data, "Before fix_hardcoded_addresses");

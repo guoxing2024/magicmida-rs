@@ -1509,6 +1509,37 @@ Bootstrap `+0xbd8` correct at WinMain; after `0x63f9` overwritten to `0x106644`.
   - `r26b_window_n3.json`, `r26b_load_final.json`
   - `unpack.stdout.txt`
 
+## Battlefield GTO-perfect-unpack Round 0 (2026-07-25) — root cause: heap rebasing wall
+
+**Goal:** perfect unpack of 启动器.exe (gto_launcher) with NO bypass patches (revert all 5 r26b patches). New env switch `MIDA_GTO_NO_BYPASS=1` disables the 5 patches for root-cause measurement.
+
+**Candidate:** `live_r27_nobypass_round0_20260725\gto_unpacked.exe` (5 patches reverted to original bytes, verified).
+
+**Protected reference behavior:** 启动器.exe naturally shows `NewClassName` window titled "力WLK 一键宏 - 登录/注册" + `ZhuChuangKou`; NO MessageBox; no crash.
+
+**No-bypass candidate behavior:** shows `#32770` MessageBox with machine-ID `E4847ED08866458F8DD35F94B37001C0` (authorization gate), then after dismiss → AV `0xc0000005`.
+
+**Crash point (cdb second-chance):**
+- rip = `0x1406110a0` (section `.,\W` = `2e2c5c57`, Themida packer residue, RWX; NOT real .text which ends at 0xfc658)
+- instruction: `mov edi, dword ptr [rax]`
+- `rax = 0x846898` (stale low heap address, unmapped in new process)
+- rax loaded from `[rbx]` — a captured object holds a stale pointer
+
+**Heap analysis:**
+- Heap handle captured at live_ptr `0x830000` (slot 0, rva 0x145d50, content_size=0).
+- `0x846898 = 0x830000 + 0x16898` — an offset into the captured heap region.
+- Nearest captured object: idx=295 live_ptr `0x846bb0` (size 6704) — `0x846898` is 0x318 bytes BEFORE it, in an **uncaptured gap**.
+- `0x846898` has **0 hits** as qword/dword in the entire static image → it is computed at runtime from the stale heap base `0x830000`, not stored statically.
+
+**Root cause class:** heap rebasing / capture completeness. The captured heap objects reference original-process heap addresses (e.g. `0x830000+0x16898`); the new process heap is at a different ASLR base, so intra-heap pointers are stale. This is the **same wall r1–r26 iteratively peeled** (each round: find next stale pointer → add hot root → next AV). 26 rounds did not close it.
+
+**Verdict:** Round 0 root cause identified. Round 1 (capture the 0x846898 gap) would likely just move the crash to the next stale heap pointer — the same iterative loop. This is beyond a 2-round engineering fix; it needs heap-rebasing research (rebase all intra-heap pointers to new heap base, or capture the full heap region as one slab), not another single-hot-root peel.
+
+**Non-claim:** gto_launcher perfect-unpack NOT achieved. The 5 r26b bypass patches remain the only way to show NewClassName (fake). Real unpack needs the heap-rebase research.
+
+**Evidence:**
+- `D:\MidaVault\lab\evidence\gto_launcher27_nobypass_round0_20260725\` (gto_unpacked.exe, unpack.stdout.txt, r27_nobypass_cdb_av2.log, r27_nobypass_cdb_stack.log)
+
 ## Battlefield R-PURE-LOGIC Round 1 (2026-07-25) — Origin business-dialog oracle
 
 **Bar:** behavioral equivalence beyond load survival — drive the product license dialog and compare response to protected input.
@@ -1525,7 +1556,8 @@ Bootstrap `+0xbd8` correct at WinMain; after `0x63f9` overwritten to `0x106644`.
 
 **Meaning:** the license-validation code path runs identically on the unpacked candidate vs the protected input. Invalid code → same rejection message. This is real business-behavior equivalence (not load survival, not static UI presence, not sample-specific patch — Origin has zero bypass patches).
 
-**Evidence:** `D:\MidaVault\lab\evidence\_beh_gate_pure_logic_round0_20260725\origin_biz_prot_{1,2,3}.json` + `origin_biz_cand_{1,2,3}.json` + `origin_business_dialog_summary.json`.
+**Evidence:** `D:\MidaVault\lab\evidence\_beh_gate
+_pure_logic_round0_20260725\origin_biz_prot_{1,2,3}.json` + `origin_biz_cand_{1,2,3}.json` + `origin_business_dialog_summary.json`.
 
 **Non-claim:** rejection-path equivalence on invalid code only. Does NOT prove: valid-code acceptance, license persistence (registry/file), full product functionality, or business-path equivalence for the other 3 cases. **product 1.0 still NO.**
 
