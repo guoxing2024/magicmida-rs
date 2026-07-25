@@ -31,7 +31,7 @@ use tracing::{info, warn};
 use crate::header::PeHeader;
 
 use super::container_snapshot::ContainerSnapshot;
-use super::heap_global_snapshot::HeapGlobalSnapshot;
+use super::heap_global_snapshot::{HeapGlobalSnapshot, HeapSlab};
 
 const IMAGE_SCN_CNT_CODE: u32 = 0x0000_0020;
 const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
@@ -70,6 +70,7 @@ pub(crate) fn install_container_bootstrap(
     pe: &mut PeHeader,
     containers: &[ContainerSnapshot],
     heap_globals: &[HeapGlobalSnapshot],
+    heap_slab: Option<&HeapSlab>,
     get_process_heap_iat_rva: u32,
     heap_alloc_iat_rva: u32,
     original_entry_point: u32,
@@ -82,6 +83,7 @@ pub(crate) fn install_container_bootstrap(
         pe,
         containers,
         heap_globals,
+        heap_slab,
         get_process_heap_iat_rva,
         heap_alloc_iat_rva,
         Some(original_entry_point),
@@ -107,6 +109,7 @@ pub(crate) fn install_post_crt_container_restore(
     dump_buf: &mut [u8],
     containers: &[ContainerSnapshot],
     heap_globals: &[HeapGlobalSnapshot],
+    heap_slab: Option<&HeapSlab>,
     get_process_heap_iat_rva: u32,
     heap_alloc_iat_rva: u32,
     crt_entry_rva: u32,
@@ -141,6 +144,7 @@ pub(crate) fn install_post_crt_container_restore(
             pe,
             containers,
             heap_globals,
+            heap_slab,
             get_process_heap_iat_rva,
             heap_alloc_iat_rva,
             continue_ep,
@@ -164,6 +168,7 @@ pub(crate) fn install_post_crt_container_restore(
                 pe,
                 containers,
                 heap_globals,
+                heap_slab,
                 get_process_heap_iat_rva,
                 heap_alloc_iat_rva,
                 crt_entry_rva,
@@ -179,6 +184,7 @@ pub(crate) fn install_post_crt_container_restore(
         pe,
         containers,
         heap_globals,
+        heap_slab,
         get_process_heap_iat_rva,
         heap_alloc_iat_rva,
         Some(continue_rva),
@@ -277,6 +283,7 @@ fn install_container_section(
     pe: &mut PeHeader,
     containers: &[ContainerSnapshot],
     heap_globals: &[HeapGlobalSnapshot],
+    heap_slab: Option<&HeapSlab>,
     get_process_heap_iat_rva: u32,
     heap_alloc_iat_rva: u32,
     continue_entry_point: Option<u32>,
@@ -314,7 +321,8 @@ fn install_container_section(
                 .iter()
                 .map(|g| g.content.len() as u32)
                 .fold(0u32, u32::saturating_add),
-        );
+        )
+        .saturating_add(heap_slab.map(|s| s.content.len() as u32).unwrap_or(0));
     let reserve = crate::utils::align_up(approx_payload.max(0x1000), 0x1000);
 
     let section_idx = pe.create_section_index(".boot", reserve);
@@ -327,6 +335,7 @@ fn install_container_section(
         heap_alloc_iat_rva,
         containers,
         heap_globals,
+        heap_slab,
         None,
         image_base,
         0,
@@ -425,6 +434,7 @@ pub(crate) fn build_tls_bootstrap_stub(
         heap_alloc_iat_rva,
         containers,
         &[],
+        None, // heap_slab (TLS path not used for GTO)
         data_snapshot,
         image_base,
         data_section_rva,
@@ -442,6 +452,7 @@ fn build_container_stub_internal(
     heap_alloc_iat_rva: u32,
     containers: &[ContainerSnapshot],
     heap_globals: &[HeapGlobalSnapshot],
+    heap_slab: Option<&HeapSlab>,
     data_snapshot: Option<&super::data_snapshot::DataSectionSnapshot>,
     image_base: u64,
     data_section_rva: u32,
@@ -457,7 +468,14 @@ fn build_container_stub_internal(
     //   [container heap payloads]
     //   [heap-global payloads]
     //   [optional .data snapshot]
-    let range_count = containers.len().checked_add(heap_globals.len())?;
+    let slab_present = heap_slab.is_some();
+    let range_count = containers
+        .len()
+        .checked_add(heap_globals.len())?
+        .checked_add(if slab_present { 1 } else { 0 })?;
+    let slab_fixup_index = if slab_present { range_count.checked_sub(1)? } else { 0 };
+    let slab_old_base = heap_slab.map(|s| s.old_base).unwrap_or(0);
+    let slab_len = heap_slab.map(|s| s.content.len()).unwrap_or(0);
     let mut measured_code = Vec::new();
     build_stub_code(
         &mut measured_code,
@@ -471,6 +489,9 @@ fn build_container_stub_internal(
         0, // heap-global metadata offset (placeholder)
         0, // fixup map offset (placeholder)
         range_count,
+        slab_fixup_index,
+        slab_old_base,
+        0, // slab_data_offset placeholder (measurement pass)
         data_snapshot,
         0,
         image_base,
@@ -478,7 +499,7 @@ fn build_container_stub_internal(
         heap_global_rva,
         cookie_rva,
         cookie_mirror,
-    )?;
+    )?;;
     let metadata_offset = measured_code.len().checked_add(15)? & !15;
     let container_meta_size = containers.len().checked_mul(CONTAINER_METADATA_SIZE)?;
     let heap_global_meta_size = heap_globals.len().checked_mul(HEAP_GLOBAL_METADATA_SIZE)?;
@@ -496,8 +517,12 @@ fn build_container_stub_internal(
             .iter()
             .try_fold(0usize, |total, g| total.checked_add(g.content.len()))?,
     )?;
+    let slab_data_offset = data_snapshot_offset.checked_add(
+        data_snapshot.map(|s| s.data_content.len()).unwrap_or(0),
+    )?;
+    let slab_data_end = slab_data_offset.checked_add(slab_len)?;
 
-    let mut stub = Vec::with_capacity(data_snapshot_offset);
+    let mut stub = Vec::with_capacity(slab_data_end);
     build_stub_code(
         &mut stub,
         stub_rva,
@@ -510,6 +535,9 @@ fn build_container_stub_internal(
         heap_global_meta_offset as u32,
         fixup_map_offset as u32,
         range_count,
+        slab_fixup_index,
+        slab_old_base,
+        slab_data_offset,
         data_snapshot,
         data_snapshot_offset,
         image_base,
@@ -517,7 +545,7 @@ fn build_container_stub_internal(
         heap_global_rva,
         cookie_rva,
         cookie_mirror,
-    )?;
+    )?;;
 
     if stub.len() > metadata_offset {
         warn!(
@@ -593,6 +621,13 @@ fn build_container_stub_internal(
         stub.extend_from_slice(&0u32.to_le_bytes());
         stub.extend_from_slice(&0u64.to_le_bytes()); // new_begin
     }
+    // Slab fixup map entry (last): old=slab.old_base, size=slab_len, new=0.
+    if slab_present {
+        stub.extend_from_slice(&slab_old_base.to_le_bytes());
+        stub.extend_from_slice(&u32::try_from(slab_len).ok()?.to_le_bytes());
+        stub.extend_from_slice(&0u32.to_le_bytes());
+        stub.extend_from_slice(&0u64.to_le_bytes()); // new_begin filled at runtime
+    }
 
     for container in containers {
         stub.extend_from_slice(&container.heap_content);
@@ -605,6 +640,13 @@ fn build_container_stub_internal(
 
     if let Some(snapshot) = data_snapshot {
         stub.extend_from_slice(&snapshot.data_content);
+    }
+
+    // Slab content payload (placed last in .boot data).
+    if slab_present {
+        if let Some(slab) = heap_slab {
+            stub.extend_from_slice(&slab.content);
+        }
     }
 
     Some(stub)
@@ -628,6 +670,9 @@ fn build_stub_code(
     heap_global_meta_offset: u32,
     fixup_map_offset: u32,
     range_count: usize,
+    slab_fixup_index: usize,
+    slab_old_base: u64,
+    slab_data_offset: usize,
     data_snapshot: Option<&super::data_snapshot::DataSectionSnapshot>,
     data_snapshot_offset: usize,
     image_base: u64,
@@ -927,6 +972,34 @@ fn build_stub_code(
         stub.extend_from_slice(&loop_disp.to_le_bytes());
     }
 
+    // ========== Phase 1c: Heap slab alloc + memcpy (interior rebase target) ==========
+    // The slab is the last fixup-map entry; rbx already points to it after 1b.
+    if slab_old_base != 0 {
+        // rcx = heap (r15), rdx = 0 (flags), r8 = slab_size from [rbx+8]
+        stub.extend_from_slice(&[0x4c, 0x89, 0xf9]); // mov rcx, r15
+        stub.extend_from_slice(&[0x33, 0xd2]); // xor edx, edx
+        stub.extend_from_slice(&[0x44, 0x8b, 0x43, 0x08]); // mov r8d, [rbx+8] size
+        stub.extend_from_slice(&[0xff, 0x15]); // call [rip+heap_alloc_iat]
+        let call_next = stub_rva.checked_add(stub.len() as u32)?.checked_add(4)?;
+        stub.extend_from_slice(&relative_displacement(call_next, heap_alloc_iat_rva)?);
+        stub.extend_from_slice(&[0x49, 0x89, 0xc4]); // mov r12, rax (new slab base)
+        // Store new_begin in fixup map entry: mov [rbx+0x10], rax
+        stub.extend_from_slice(&[0x48, 0x89, 0x43, 0x10]); // mov [rbx+0x10], rax
+        // memcpy(new_base, stub+slab_data_offset, slab_size)
+        // rcx = rax (dst), rdx = src (lea rip), r8 = size
+        stub.extend_from_slice(&[0x48, 0x89, 0xc1]); // mov rcx, rax
+        stub.extend_from_slice(&[0x48, 0x8d, 0x15]); // lea rdx, [rip+disp]
+        let lea_next = stub_rva.checked_add(stub.len() as u32)?.checked_add(4)?;
+        let slab_src_rva = stub_rva.checked_add(slab_data_offset as u32)?;
+        stub.extend_from_slice(&relative_displacement(lea_next, slab_src_rva)?);
+        stub.extend_from_slice(&[0x44, 0x8b, 0x43, 0x08]); // mov r8d, [rbx+8] size
+        stub.push(0xe8);
+        memcpy_sites.push(stub.len());
+        stub.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        // Advance rbx past the slab entry
+        stub.extend_from_slice(&[0x48, 0x83, 0xc3, 0x18]); // add rbx, 24
+    }
+
     // ========== Phase 2: multi-range fixup over every restored block ==========
     if range_count > 0 {
         let map_rva = stub_rva.checked_add(fixup_map_offset)?;
@@ -967,6 +1040,67 @@ fn build_stub_code(
         let p2_end = stub.len();
         let p2_back = i8::try_from(p2_start as isize - (p2_end as isize + 2)).ok()?;
         stub.extend_from_slice(&[0x75, p2_back as u8]); // jnz .p2
+    }
+
+    // ========== Phase 2.5: slab interior-pointer delta rebase ==========
+    // For every restored block, scan qwords; if slab_old < V < slab_end,
+    // replace V with V + (slab_new - slab_old). Strict-interior excludes
+    // V == slab_old (heap handle reference, already planted as GetProcessHeap).
+    if slab_old_base != 0 {
+        let map_rva = stub_rva.checked_add(fixup_map_offset)?;
+        let slab_entry_rva = map_rva.checked_add((slab_fixup_index * 24) as u32)?;
+        // r14 -> slab fixup map entry
+        stub.extend_from_slice(&[0x4c, 0x8d, 0x35]); // lea r14, [rip+disp]
+        let lea_next = stub_rva.checked_add(stub.len() as u32)?.checked_add(4)?;
+        stub.extend_from_slice(&relative_displacement(lea_next, slab_entry_rva)?);
+        // rbx = slab_old_base = [r14]
+        stub.extend_from_slice(&[0x49, 0x8b, 0x1e]); // mov rbx, [r14]
+        // r12d = slab_size = [r14+8]; r12 = old + size = slab_end
+        stub.extend_from_slice(&[0x45, 0x8b, 0x66, 0x08]); // mov r12d, [r14+8]
+        stub.extend_from_slice(&[0x49, 0x01, 0xdc]); // add r12, rbx
+        // rsi = slab_new = [r14+0x10]; delta = new - old
+        stub.extend_from_slice(&[0x49, 0x8b, 0x76, 0x10]); // mov rsi, [r14+0x10]
+        stub.extend_from_slice(&[0x48, 0x29, 0xde]); // sub rsi, rbx
+        // Re-init r14 = map base, r13d = range_count for block iteration
+        stub.extend_from_slice(&[0x4c, 0x8d, 0x35]); // lea r14, [rip+disp] (map base)
+        let lea3 = stub_rva.checked_add(stub.len() as u32)?.checked_add(4)?;
+        stub.extend_from_slice(&relative_displacement(lea3, map_rva)?);
+        stub.extend_from_slice(&[0x41, 0xbd]); // mov r13d, imm32
+        stub.extend_from_slice(&u32::try_from(range_count).ok()?.to_le_bytes());
+
+        let p25_loop = stub.len();
+        stub.extend_from_slice(&[0x49, 0x8b, 0x4e, 0x10]); // mov rcx, [r14+0x10] new_begin
+        stub.extend_from_slice(&[0x48, 0x85, 0xc9]); // test rcx, rcx
+        stub.push(0x74); let p25_jz_null = stub.len(); stub.push(0x00);
+        stub.extend_from_slice(&[0x45, 0x8b, 0x46, 0x08]); // mov r8d, [r14+8] size
+        stub.extend_from_slice(&[0x45, 0x85, 0xc0]); // test r8d, r8d
+        stub.push(0x74); let p25_jz_size = stub.len(); stub.push(0x00);
+        stub.extend_from_slice(&[0x4c, 0x01, 0xc8]); // add r8, rcx (r8 = block end)
+        let p25_scan = stub.len();
+        stub.extend_from_slice(&[0x49, 0x39, 0xc8]); // cmp r8, rcx
+        stub.extend_from_slice(&[0x76]); let p25_jbe = stub.len(); stub.push(0x00);
+        stub.extend_from_slice(&[0x48, 0x8b, 0x01]); // mov rax, [rcx] V
+        stub.extend_from_slice(&[0x48, 0x39, 0xd8]); // cmp rax, rbx (slab_old)
+        stub.extend_from_slice(&[0x76]); let p25_jbe2 = stub.len(); stub.push(0x00);
+        stub.extend_from_slice(&[0x4c, 0x39, 0xd0]); // cmp rax, r12 (slab_end)
+        stub.extend_from_slice(&[0x73]); let p25_jae = stub.len(); stub.push(0x00);
+        stub.extend_from_slice(&[0x48, 0x01, 0xf0]); // add rax, rsi (delta)
+        stub.extend_from_slice(&[0x48, 0x89, 0x01]); // mov [rcx], rax
+        let p25_adv = stub.len();
+        stub[p25_jbe2] = u8::try_from(p25_adv.checked_sub(p25_jbe2 + 1)?).ok()?;
+        stub[p25_jae] = u8::try_from(p25_adv.checked_sub(p25_jae + 1)?).ok()?;
+        stub.extend_from_slice(&[0x48, 0x83, 0xc1, 0x08]); // add rcx, 8
+        let p25_scan_back = i8::try_from(p25_scan as isize - (stub.len() as isize + 2)).ok()?;
+        stub.extend_from_slice(&[0xeb, p25_scan_back as u8]); // jmp .p25_scan
+        let p25_next = stub.len();
+        stub[p25_jz_null] = u8::try_from(p25_next.checked_sub(p25_jz_null + 1)?).ok()?;
+        stub[p25_jz_size] = u8::try_from(p25_next.checked_sub(p25_jz_size + 1)?).ok()?;
+        stub[p25_jbe] = u8::try_from(p25_next.checked_sub(p25_jbe + 1)?).ok()?;
+        stub.extend_from_slice(&[0x49, 0x83, 0xc6, 0x18]); // add r14, 24
+        stub.extend_from_slice(&[0x41, 0xff, 0xcd]); // dec r13d
+        let p25_end = stub.len();
+        let p25_back = i8::try_from(p25_loop as isize - (p25_end as isize + 2)).ok()?;
+        stub.extend_from_slice(&[0x75, p25_back as u8]); // jnz .p25_loop
     }
 
     // Jump over helpers to epilogue (near jmp — helpers exceed short-jmp range).
@@ -1340,6 +1474,7 @@ mod tests {
             &[container],
             &[],
             None,
+            None,
             0x140000000,
             0x141000,
             None,
@@ -1398,6 +1533,7 @@ mod tests {
             0x2108, // HeapAlloc IAT
             &[container],
             &[],
+            None,
             None,
             0x140000000,
             0x141000,

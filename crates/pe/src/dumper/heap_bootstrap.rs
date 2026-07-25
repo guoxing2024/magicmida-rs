@@ -37,6 +37,7 @@ pub(crate) fn install_heap_bootstrap(
     original_entry_point: u32,
     containers: &[ContainerSnapshot],
     heap_globals: &[HeapGlobalSnapshot],
+    heap_slab: Option<&super::heap_global_snapshot::HeapSlab>,
     restore_mode: ContainerRestoreMode,
     // Cookie storage RVA captured from the late dump (before early overlay).
     cookie_rva: Option<u32>,
@@ -76,6 +77,7 @@ pub(crate) fn install_heap_bootstrap(
                     dump_buf,
                     containers,
                     heap_globals,
+                    heap_slab,
                     gph,
                     ha,
                     original_entry_point,
@@ -97,6 +99,7 @@ pub(crate) fn install_heap_bootstrap(
                     pe,
                     containers,
                     heap_globals,
+                    heap_slab,
                     gph,
                     ha,
                     original_entry_point,

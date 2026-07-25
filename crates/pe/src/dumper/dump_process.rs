@@ -886,6 +886,12 @@ pub fn dump_process(
     super::heap_global_snapshot::sanitize_ahk_runtime_global(&mut heap_globals);
     // R-GTO-UI r22b: gscript+0xbd8 must be NewClassName for RegisterClass @0x34db0.
     super::heap_global_snapshot::repair_gscript_window_strings(&mut heap_globals);
+    // r27: capture heap slab for interior-pointer rebase (heap rebasing wall).
+    let heap_slab = if stage_plan.detect_heap_globals {
+        super::heap_global_snapshot::capture_heap_slab(&heap_globals, debugger)
+    } else {
+        None
+    };
     // Cookie + complement RVAs must be captured before early overlay zeros storage.
     // Prefer authoritative site from offline CRT resolve; never fuzzy-rescan when set.
     // B7.2.1: authority resolve/validation failure is a hard dump error (no structural success).
@@ -1059,6 +1065,7 @@ pub fn dump_process(
                     opts.entry_point,
                     &containers,
                     &heap_globals,
+                    heap_slab.as_ref(),
                     opts.container_restore,
                     cookie_rva,
                     cookie_mirror,

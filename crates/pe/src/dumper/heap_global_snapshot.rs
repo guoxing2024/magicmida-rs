@@ -124,11 +124,91 @@ pub struct HeapGlobalSnapshot {
     pub is_image_inline: bool,
 }
 
+/// A captured heap slab: one contiguous blob covering the span of all
+/// non-handle heap-global live_ptrs. At runtime the stub HeapAllocs this
+/// blob and rebases every interior pointer `[old_base, old_base+len)` by
+/// `delta = new_base - old_base`. This fixes intra-heap cross-references
+/// that exact-base multi_fixup misses (e.g. `0x846898` in a gap before the
+/// nearest captured object `0x846bb0`).
+///
+/// Strict-interior rule: `old_base < V < old_base+len` (excludes `V ==
+/// old_base` so heap-handle references are not rebased to the slab).
+#[derive(Debug, Clone, Default)]
+pub struct HeapSlab {
+    /// Original heap base (min live_ptr of non-handle globals).
+    pub old_base: u64,
+    /// Captured blob (best-effort RPM; gaps zero-filled).
+    pub content: Vec<u8>,
+}
+
 /// Ensure image sections that receive heap-global plant writes are MEM_WRITE.
 ///
 /// Policy hot roots can sit in Themida RX pages (e.g. GTO `0x18a898` in
 /// `.,\\W`). Bootstrap does `mov [image_base+rva], new_ptr` at runtime; without
 /// WRITE that store AVs and the title path stays NULL (R-GTO-UI).
+/// Capture the heap span covered by all non-handle, non-inline heap globals
+/// as one contiguous blob. Best-effort RPM: pages that cannot be read are
+/// zero-filled so the span stays contiguous. Returns `None` when there are
+/// fewer than 2 data globals or the span exceeds 64 MiB.
+///
+/// The slab lets the runtime stub rebase **interior** heap pointers
+/// (`old_base < V < old_base+len`) that exact-base multi_fixup misses
+/// (r27 root cause: `0x846898` in a 0x318-byte gap before `0x846bb0`).
+pub fn capture_heap_slab(
+    heap_globals: &[HeapGlobalSnapshot],
+    debugger: &mut dyn mida_core::DebuggerCore,
+) -> Option<HeapSlab> {
+    // Collect non-handle, non-inline live_ptrs with non-empty content.
+    let mut min_ptr: u64 = u64::MAX;
+    let mut max_end: u64 = 0;
+    let mut count = 0usize;
+    for g in heap_globals {
+        if g.is_heap_handle || g.is_image_inline || g.content.is_empty() {
+            continue;
+        }
+        count += 1;
+        if g.live_ptr < min_ptr {
+            min_ptr = g.live_ptr;
+        }
+        let end = g.live_ptr.saturating_add(g.content.len() as u64);
+        if end > max_end {
+            max_end = end;
+        }
+    }
+    if count < 2 || min_ptr >= max_end {
+        return None;
+    }
+    let span = max_end.saturating_sub(min_ptr);
+    const MAX_SLAB: usize = 64 * 1024 * 1024;
+    if span == 0 || span as usize > MAX_SLAB {
+        return None;
+    }
+    let mut blob = vec![0u8; span as usize];
+    // Best-effort RPM in page-sized chunks; zero-fill unreadable gaps.
+    const CHUNK: usize = 0x1000;
+    let mut offset = 0usize;
+    while offset < span as usize {
+        let remaining = (span as usize) - offset;
+        let take = remaining.min(CHUNK);
+        let addr = (min_ptr as usize).saturating_add(offset);
+        let mut buf = vec![0u8; take];
+        if debugger.read_memory(addr, &mut buf).is_ok() {
+            blob[offset..offset + take].copy_from_slice(&buf);
+        }
+        offset += take;
+    }
+    info!(
+        old_base = format_args!("{min_ptr:#x}"),
+        span = format_args!("{span:#x}"),
+        globals = count,
+        "Captured heap slab for interior-pointer rebase"
+    );
+    Some(HeapSlab {
+        old_base: min_ptr,
+        content: blob,
+    })
+}
+
 pub fn ensure_plant_target_sections_writable(
     pe: &mut PeHeader,
     heap_globals: &[HeapGlobalSnapshot],

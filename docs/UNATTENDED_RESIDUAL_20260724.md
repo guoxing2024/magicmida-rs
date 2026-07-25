@@ -1509,6 +1509,34 @@ Bootstrap `+0xbd8` correct at WinMain; after `0x63f9` overwritten to `0x106644`.
   - `r26b_window_n3.json`, `r26b_load_final.json`
   - `unpack.stdout.txt`
 
+## Battlefield GTO-perfect-unpack Round 1 (2026-07-25) — slab rebase moves crash; layer 2 = Themida section pointers
+
+**Change:** Implemented heap slab capture (`capture_heap_slab`) + stub phase-1c (HeapAlloc slab + memcpy) + phase-2.5 (range-interior delta rebase over ALL captured blocks). Strict-interior rule: `old < V < old+N` (excludes heap handle). Env `MIDA_GTO_NO_BYPASS=1` still disables all 5 bypass patches.
+
+**Candidate:** `r27_slab_round1_20260725\gto_unpacked.exe` (no bypass patches + slab).
+
+**Round 0 crash:** rip=`0x6110a0`, rax=`0x846898` (stale heap ptr in gap before captured object `0x846bb0`).
+
+**Round 1 crash (AFTER slab):** rip=`0x570c7c` (DIFFERENT site), rax=`0x9cf000` (DIFFERENT stale ptr).
+
+| metric | Round 0 | Round 1 |
+|--------|---------|---------|
+| crash rip | `0x6110a0` | `0x570c7c` |
+| stale rax | `0x846898` | `0x9cf000` |
+| 0x846898 rebased? | N/A | **YES** (crash moved) |
+| in slab range? | yes | yes (offset 0x7cf000) |
+| static hits | 0 | 0 |
+
+**Meaning:** The slab + phase-2.5 successfully rebased `0x846898` and all other interior pointers in captured heap blocks. The crash moved to a NEW stale pointer `0x9cf000` that is NOT in any captured block — it lives in Themida obfuscated section `.,\W` data, which phase-2.5 does not scan (it only scans captured heap globals/containers/slab).
+
+**Layer 2 root cause:** Themida `.,\W` / `.KI3` sections contain data (mixed with obfuscated code) that holds stale heap pointers. Neither the scrub (`clear_process_local_absolute_pointers` — only `.data`-like) nor phase-2.5 (only captured blocks) covers these sections.
+
+**Round 2 option:** Extend phase-2.5 (or scrub) to also scan Themida RW/RWX sections for interior heap pointers and rebase them. Risk: Themida sections mix code+data; scanning for qword values might corrupt code bytes that happen to look like heap addresses.
+
+**Non-claim:** gto_launcher perfect-unpack NOT achieved. Slab is real progress (moved crash, proved the rebase mechanism works). Layer 2 (Themida section scan) is the next step.
+
+**Evidence:** `D:\MidaVault\lab\evidence\gto_launcher27_slab_round1_20260725\` (gto_unpacked.exe, unpack.stdout.txt, slab_cdb2.log)
+
 ## Battlefield GTO-perfect-unpack Round 0 (2026-07-25) — root cause: heap rebasing wall
 
 **Goal:** perfect unpack of 启动器.exe (gto_launcher) with NO bypass patches (revert all 5 r26b patches). New env switch `MIDA_GTO_NO_BYPASS=1` disables the 5 patches for root-cause measurement.
@@ -1538,7 +1566,8 @@ Bootstrap `+0xbd8` correct at WinMain; after `0x63f9` overwritten to `0x106644`.
 **Non-claim:** gto_launcher perfect-unpack NOT achieved. The 5 r26b bypass patches remain the only way to show NewClassName (fake). Real unpack needs the heap-rebase research.
 
 **Evidence:**
-- `D:\MidaVault\lab\evidence\gto_launcher27_nobypass_round0_20260725\` (gto_unpacked.exe, unpack.stdout.txt, r27_nobypass_cdb_av2.log, r27_nobypass_cdb_stack.log)
+- `D:\MidaVault\lab\evidence\gto_launcher
+27_nobypass_round0_20260725\` (gto_unpacked.exe, unpack.stdout.txt, r27_nobypass_cdb_av2.log, r27_nobypass_cdb_stack.log)
 
 ## Battlefield R-PURE-LOGIC Round 1 (2026-07-25) — Origin business-dialog oracle
 
