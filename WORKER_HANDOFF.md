@@ -1,32 +1,30 @@
-# WORKER_HANDOFF — R-REPRO-10× CLOSED (battlefield 1 toward 1.0)
+# WORKER_HANDOFF — goal redefined: perfect unpack of 2 samples (2026-07-25)
 
-## 1.0 distance (after battlefield 1)
+## New goal (binding)
 
-| Dimension | Bar | Status |
-|-----------|-----|--------|
-| Structure (R0B) | independent static gate | **Pass** (4/4 StructuralPassBehaviorPending) |
-| Load | loader-valid | **Pass** (4/4) |
-| Reproducibility | Oreans 10× consecutive isolated | **Pass** (4/4 × 10/10) ← closed this battlefield |
-| Behavioral equivalence | product logic parity | **NOT MET** (R-PURE-LOGIC) |
-| Multi-family production | ≥2 production-grade plugins | **NOT MET** (GTO still experimental opt-in) |
-| product 1.0 | all dimensions | **Still NO** |
+**Perfect unpack of exactly two samples** — see [docs/PROJECT_GOAL_20260725.md](docs/PROJECT_GOAL_20260725.md):
 
-## Battlefield 1 — R-REPRO-10× (CLOSED, zero code change)
+| sample | case_id | distance |
+|--------|--------|----------|
+| 时光一键宏.exe | origin_macro | **near** — only valid-code acceptance path unproven |
+| 启动器.exe | gto_launcher | **far** — NewClassName window is fake (5 r26b bypass patches); real heap/script resume needed |
 
-- Strict 10× isolated attempt=1 revealed bb_gate_pin used **stale pre-W1/W2 candidates**.
-- Origin pin (pre-scrub) = 6/10; GTO r4c pin (pre-clearregs) = 4/10.
-- Refreshed to current-CLI dumps: Origin fresh pure = 10/10; GTO fresh gtoexp (r26b) = 10/10.
-- All 4 R0B StructuralPassBehaviorPending.
-- Evidence: `D:\MidaVault\lab\evidence\_beh_gateepro10x_baseline_20260725epro10x_summary.json`
-- Code changes: 0.
+Lunlun/Xiongxiong demoted to regression controls (not 1.0 gates).
 
-## Next battlefields (toward 1.0)
+## Distance (after goal redefinition)
 
-1. **R-PURE-LOGIC** — behavioral equivalence (the real 1.0 wall). Needs a stronger oracle than load survival. Research-level; no clean 2-round path yet.
-2. **Multi-family production** — promote GTO from experimental opt-in to production default. Risks sample-specific patch surface.
+| dimension | origin | gto |
+|-----------|--------|-----|
+| structure R0B | ✅ | ✅ |
+| load | ✅ | ✅ |
+| 10× repro | ✅ | ✅ |
+| behavior equivalence | ✅ license rejection path (N=3 both) | ❌ fake (bypass patches) |
+| no bypass patches | ✅ zero | ❌ 5 patches (LoadFile skip / MB skip / NewClassName / WS_VISIBLE / msg-loop AV) |
+| **perfect unpack** | near (valid-code path only) | far (heap/script resume) |
 
-Per Q2: each battlefield max 2 rounds code→rebuild→live, then residual stop.
+## Next battlefields (per goal)
 
-## Freeze
+1. **origin_macro valid-code / full-function** — needs a valid license OR an acceptable product-function oracle. Rejection path already equivalent.
+2. **gto_launcher revert bypass patches + real resume** — r1–r26 unsolved root cause; research-level; not 2 rounds.
 
-product 1.0 = NO. Reproducibility dimension now honestly met. Stop unless next battlefield authorized.
+product 1.0 = NO for both until gto reverts patches + origin proves acceptance path.
