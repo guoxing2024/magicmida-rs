@@ -797,6 +797,11 @@ pub fn dump_process(
 
     // 3. Sanitize PE header
     pe.sanitize();
+    for s in &pe.sections {
+        if s.virtual_size > 0x100000 {
+            info!("POST-SANITIZE: {} va={:#x} vsz={:#x} raw={:#x} ptr={:#x}", s.name, s.virtual_address, s.virtual_size, s.header.size_of_raw_data, s.header.pointer_to_raw_data);
+        }
+    }
 
     info!(size_of_image = pe.size_of_image(), "Dumping process image");
 
@@ -1214,6 +1219,11 @@ pub fn dump_process(
     // 5d. Trim huge sections
     let mut iat_raw_addr = 0u32;
     let _delta = pe.trim_huge_sections(&dump_buf, &mut iat_raw_addr);
+    for s in &pe.sections {
+        if s.virtual_size > 0x100000 {
+            info!("POST-TRIM: {} va={:#x} vsz={:#x} raw={:#x} ptr={:#x}", s.name, s.virtual_address, s.virtual_size, s.header.size_of_raw_data, s.header.pointer_to_raw_data);
+        }
+    }
 
     // 5d2. No-shrink: materialize .pdata when Exception DD lacks raw backing.
     // Prefer the pre-sanitize snapshot (force_pdata_no_shrink); also re-check

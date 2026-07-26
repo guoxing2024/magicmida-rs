@@ -211,6 +211,8 @@ impl PeHeader {
                 || name.starts_with(".import")
                 || name.starts_with(".reloc")
                 || name == ".fill"
+                || name == ".themida"
+                || name == ".winlice"
             {
                 continue;
             }

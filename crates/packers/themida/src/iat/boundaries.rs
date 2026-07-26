@@ -395,7 +395,14 @@ pub(super) fn scan_iat_boundaries(
     } else {
         iat_start_final
     };
-    let size = final_slot_count * ptr_size;
+    // Add a small forward margin (8 slots) to catch trailing unresolved
+    // slots that the V3 trace will resolve. The multi-block scan trims
+    // trailing zeros, but Themida V3 may leave the last few IAT slots
+    // as zero (unresolved) at dump time — the V3 trace resolves them
+    // by single-stepping the Themida wrapper. Without this margin, we
+    // miss the last import (e.g. InternetSetOptionW from wininet.dll).
+    const IAT_FORWARD_MARGIN_SLOTS: usize = 8;
+    let size = (final_slot_count + IAT_FORWARD_MARGIN_SLOTS) * ptr_size;
 
     if size == 0 || size > MAX_IAT_SIZE {
         warn!("IAT size {size} is zero or exceeds MAX_IAT_SIZE");

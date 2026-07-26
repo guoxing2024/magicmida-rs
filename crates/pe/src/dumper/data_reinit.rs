@@ -17,7 +17,7 @@ const MAX_USER_POINTER: u64 = 0x0000_7fff_ffff_ffff;
 /// ASLR image VAs (`0x7ff7…`) for CRT function tables until
 /// `fix_hardcoded_addresses` rebases them; clearing those zeros
 /// `call [fn_table]` (Origin W1 live regression).
-const MAX_PROCESS_LOCAL_HEAP_POINTER: u64 = 0x0000_0000_ffff_ffff;
+const MAX_PROCESS_LOCAL_HEAP_POINTER: u64 = 0x0000_7fff_ffff_fffe;
 /// Kernel-half addresses (`>= 0xffff_8000_0000_0000`) seen in Origin dumps
 /// (e.g. `.data+0xfc388 = 0xffffd466…` == `!DEFAULT_COOKIE` collision) are
 /// never valid as re-entry object heads and must be cleared even when unaligned.
@@ -221,9 +221,12 @@ fn is_stale_absolute_pointer(value: u64, image_base: u64, image_end: u64) -> boo
     if value < MIN_USER_POINTER || value > MAX_PROCESS_LOCAL_HEAP_POINTER {
         return false;
     }
-    // Prefer 8-byte aligned heap-like pointers; unaligned values are more often
-    // packed constants / cookie fragments than CRT table entries.
-    value & 7 == 0
+    // Clear all non-image-range user-mode addresses, not just aligned ones.
+    // Unaligned stale heap pointers (e.g. 0x2b992ddfa232) appear in Themida
+    // dumps and cause exit-0 when the program follows them. The previous
+    // 8-byte alignment requirement skipped these, leaving stale pointers in
+    // .data that magicmida's scrub catches.
+    true
 }
 
 fn is_kernel_canonical_garbage(value: u64) -> bool {

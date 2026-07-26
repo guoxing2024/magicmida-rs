@@ -263,88 +263,88 @@ fn rewrite_data_directories(out_data: &mut [u8], pe: &PeHeader, pe_offset: usize
 }
 
 /// Write section data at each section's PointerToRawData offset.
-fn write_section_data(out_data: &mut Vec<u8>, pe: &PeHeader, dump_buf: &[u8]) {
+fn write_section_data(out_data: &mut Vec<u8>, pe: &mut PeHeader, dump_buf: &[u8]) {
     let dump_size = pe.size_of_image() as usize;
-    let delta = 0u32; // pe.trim_huge_sections result, not used here for simplicity
-
-    let trimmed_total = delta as usize;
-    let dump_buf_effective_len = dump_size.saturating_sub(trimmed_total);
     let file_align = {
         let fa = pe.nt_headers.optional_header.file_alignment as usize;
-        if fa.is_power_of_two() && fa >= 0x200 {
-            fa
-        } else {
-            0x200
-        }
+        if fa.is_power_of_two() && fa >= 0x200 { fa } else { 0x200 }
     };
 
-    for section in &pe.sections {
-        let raw_size = section.header.size_of_raw_data as usize;
+    let n = pe.sections.len();
+    for idx in 0..n {
+        // Read fields without holding a borrow (we need to mutate later).
+        let raw_size = pe.sections[idx].header.size_of_raw_data as usize;
+        let has_extra = pe.sections[idx].extra_data.is_some();
+        let va = pe.sections[idx].virtual_address as usize;
+        let vsz = pe.sections[idx].virtual_size as usize;
+        let name = pe.sections[idx].name.clone();
 
-        // Prefer extra_data (import/reloc/wfix/bootstrap). Must not require
-        // size_of_raw_data > 0 — large .boot stubs can race with layout so
-        // RawSize is zeroed while extra_data still holds the payload.
-        if let Some(ref extra) = section.extra_data {
-            if extra.is_empty() {
-                continue;
-            }
-            let mut raw_offset = section.header.pointer_to_raw_data as usize;
+        // 1. extra_data path (import/reloc/wfix/bootstrap stubs)
+        if has_extra {
+            let extra = pe.sections[idx].extra_data.clone().unwrap_or_default();
+            if extra.is_empty() { continue; }
+            let mut raw_offset = pe.sections[idx].header.pointer_to_raw_data as usize;
             if raw_offset == 0 {
                 raw_offset = (out_data.len() + file_align - 1) & !(file_align - 1);
-                warn!(
-                    section = %section.name,
-                    assigned_ptr = format_args!("{raw_offset:#x}"),
-                    "Section has extra_data but PointerToRawData=0; appending at file end"
-                );
+                warn!(section = %name, assigned_ptr = format_args!("{raw_offset:#x}"),
+                      "Section has extra_data but PointerToRawData=0; appending at file end");
             }
             let end = raw_offset + extra.len();
-            if end > out_data.len() {
-                out_data.resize(end, 0);
-            }
-            out_data[raw_offset..raw_offset + extra.len()].copy_from_slice(extra);
-            info!(
-                section = %section.name,
-                raw_offset = format_args!("{raw_offset:#x}"),
-                len = extra.len(),
-                "section written (extra_data)",
-            );
+            if end > out_data.len() { out_data.resize(end, 0); }
+            out_data[raw_offset..raw_offset + extra.len()].copy_from_slice(&extra);
+            info!(section = %name, raw_offset = format_args!("{raw_offset:#x}"), len = extra.len(),
+                  "section written (extra_data)");
             continue;
         }
 
-        if raw_size == 0 {
+        // 2. Normal path: raw_size > 0
+        if raw_size > 0 {
+            let raw_offset = pe.sections[idx].header.pointer_to_raw_data as usize;
+            if raw_offset == 0 { continue; }
+            let data = if va + raw_size <= dump_buf.len() {
+                &dump_buf[va..va + raw_size]
+            } else {
+                warn!(section = %name, "Section data outside dump; skipping"); continue;
+            };
+            let out_end = raw_offset + data.len();
+            if out_end > out_data.len() { out_data.resize(out_end, 0); }
+            out_data[raw_offset..raw_offset + data.len()].copy_from_slice(data);
+            debug!(section = %name, raw_offset = format_args!("{raw_offset:#x}"), len = data.len(),
+                  "section written");
             continue;
         }
 
-        let raw_offset = section.header.pointer_to_raw_data as usize;
-        if raw_offset == 0 {
-            continue;
-        }
-
-        let data = if section.virtual_address as usize + raw_size <= dump_buf_effective_len {
-            &dump_buf[section.virtual_address as usize..section.virtual_address as usize + raw_size]
-        } else if section.virtual_address as usize + raw_size <= dump_buf.len() {
-            &dump_buf[section.virtual_address as usize..section.virtual_address as usize + raw_size]
+        // 3. Zero-raw path: Themida sections (.themida, .winlice, etc.) often
+        // have raw_size=0 on disk (compressed). The dump_buf captured their
+        // runtime-decompressed content. Materialize it so the unpacked PE can
+        // run without the Themida decompressor. This matches the original
+        // Magicmida behavior (keeps .themida raw = virtual_size).
+        if vsz == 0 { continue; }
+        let available = if va + vsz <= dump_buf.len() {
+            vsz
+        } else if va < dump_buf.len() {
+            dump_buf.len() - va
         } else {
-            warn!(
-                section = %section.name,
-                va = format_args!("{:#x}", section.virtual_address),
-                raw_offset = format_args!("{raw_offset:#x}"),
-                raw_size = format_args!("{raw_size:#x}"),
-                "Section data falls outside captured dump; skipping"
-            );
             continue;
         };
+        if available == 0 { continue; }
+        // Check the data is non-zero (avoid materializing empty/BSS sections)
+        let sample = &dump_buf[va..va + available.min(64)];
+        if sample.iter().all(|&b| b == 0) { continue; }
 
-        let out_end = raw_offset + data.len();
-        if out_end > out_data.len() {
-            out_data.resize(out_end, 0);
+        let raw_offset = (out_data.len() + file_align - 1) & !(file_align - 1);
+        let aligned_raw = (available + file_align - 1) & !(file_align - 1);
+        if raw_offset + aligned_raw > out_data.len() {
+            out_data.resize(raw_offset + aligned_raw, 0);
         }
-        out_data[raw_offset..raw_offset + data.len()].copy_from_slice(data);
-        debug!(
-            section = %section.name,
-            raw_offset = format_args!("{raw_offset:#x}"),
-            len = data.len(),
-            "section written",
-        );
+        out_data[raw_offset..raw_offset + available].copy_from_slice(&dump_buf[va..va + available]);
+        // Mutate the section header so the PE loader maps the data.
+        pe.sections[idx].header.pointer_to_raw_data = raw_offset as u32;
+        pe.sections[idx].header.size_of_raw_data = aligned_raw as u32;
+        pe.sections[idx].raw_offset = raw_offset as u32;
+        pe.sections[idx].raw_size = aligned_raw as u32;
+        info!(section = %name, va = format_args!("{va:#x}"), raw_offset = format_args!("{raw_offset:#x}"),
+              raw_size = format_args!("{available:#x}"),
+              "Materialized zero-raw section from dump buffer (Themida runtime data)");
     }
 }

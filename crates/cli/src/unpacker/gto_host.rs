@@ -401,8 +401,10 @@ pub(super) fn run_gto_host(
                                 log::log(
                                     LogType::Info,
                                     &format!(
-                                        "GTO host: .text RIP #{n} at {rip:#x} (rva {rva:#x}); iat_ok={}",
-                                        n = observed_text_rips.len(),
+                                        "GTO host: .text RIP #{} at {:#x} (rva {:#x}); iat_ok={}",
+                                        observed_text_rips.len(),
+                                        rip,
+                                        rva,
                                         iat_resolved_at.is_some()
                                     ),
                                 );
