@@ -44,7 +44,12 @@ pub(super) struct IatTraceState {
     did_set_exit_process: bool,
     pub(super) resolved_count: usize,
     pub(super) failed_count: usize,
+    /// Slots intentionally not traced (null padding / already real API / in-image data).
+    pub(super) skip_count: usize,
     pub(super) failed_slots: Vec<usize>,
+    /// Early abort (trash storm / bad result) — must not report product-complete.
+    pub(super) aborted: bool,
+    pub(super) abort_reason: Option<String>,
     pub(super) trace_thread_id: u32,
     trace_start_sp: usize,
     pub(super) trace_phase: TracePhase,
@@ -86,7 +91,10 @@ impl IatTraceState {
             did_set_exit_process: false,
             resolved_count: 0,
             failed_count: 0,
+            skip_count: 0,
             failed_slots: Vec::new(),
+            aborted: false,
+            abort_reason: None,
             trace_thread_id,
             trace_start_sp,
             trace_phase: TracePhase::Idle,
@@ -94,6 +102,31 @@ impl IatTraceState {
             traced_api: 0,
             trace_in_vm: false,
         }
+    }
+
+    /// Accounting invariant: every slot is resolved, failed, or validated-skip.
+    pub(super) fn slots_accounted(&self) -> usize {
+        self.resolved_count
+            .saturating_add(self.failed_count)
+            .saturating_add(self.skip_count)
+    }
+
+    /// Product-complete only when the walk finished without abort, every slot
+    /// is accounted for, and no slot failed. Walking to `current_slot == total`
+    /// alone is **not** success (audit residual P1).
+    /// Empty table (`total_slots == 0`) is complete iff !aborted (no work).
+    pub(super) fn product_complete(&self) -> bool {
+        !self.aborted
+            && self.current_slot >= self.total_slots
+            && self.failed_count == 0
+            && self.slots_accounted() == self.total_slots
+    }
+
+    fn mark_aborted(&mut self, reason: impl Into<String>) {
+        self.aborted = true;
+        self.abort_reason = Some(reason.into());
+        self.current_slot = self.total_slots;
+        self.trace_phase = TracePhase::Idle;
     }
 }
 
@@ -251,15 +284,25 @@ fn handle_trace_result(
     } else if trace.traced_api != 0 {
         let api = trace.traced_api;
         if api < 0x10000 || (api >= trace.image_base && api < trace.image_boundary) {
-            trace.current_slot = trace.total_slots;
-            return Ok(());
+            // Bad resolve: count failure and continue — never jump current_slot
+            // to total (that previously marked "complete" with missing slots).
+            trace.failed_count += 1;
+            trace.failed_slots.push(trace.current_slot);
+            log::log(
+                LogType::Fatal,
+                &format!(
+                    "IAT[{}] discarding result {api:#x} (in image or too low) — slot failed",
+                    trace.current_slot
+                ),
+            );
+        } else {
+            trace.slot_values[trace.current_slot] = api;
+            trace.resolved_count += 1;
+            log::log(
+                LogType::Good,
+                &format!("IAT[{}] → {api:#x}", trace.current_slot),
+            );
         }
-        trace.slot_values[trace.current_slot] = api;
-        trace.resolved_count += 1;
-        log::log(
-            LogType::Good,
-            &format!("IAT[{}] → {api:#x}", trace.current_slot),
-        );
     } else {
         trace.failed_count += 1;
         trace.failed_slots.push(trace.current_slot);
@@ -292,6 +335,7 @@ pub(super) fn advance_to_next_slot(
 
         // Skip null terminators - they're normal IAT structure, not trash
         if current == 0 {
+            trace.skip_count += 1;
             trace.current_slot += 1;
             continue;
         }
@@ -299,6 +343,8 @@ pub(super) fn advance_to_next_slot(
         // Skip already-resolved APIs (real API addresses in system DLLs)
         if is_real_api {
             trace.trash_counter = 0;
+            // Already a real API in the captured table — validated skip (not a resolve).
+            trace.skip_count += 1;
             trace.current_slot += 1;
             continue;
         }
@@ -313,28 +359,57 @@ pub(super) fn advance_to_next_slot(
         let in_image = current >= trace.image_base && current < trace.image_boundary;
         if in_image {
             trace.trash_counter = 0;
+            trace.skip_count += 1;
             trace.current_slot += 1;
             continue;
         }
 
-        // Unknown/invalid value - count as trash
+        // Unknown/invalid value - count as trash / failed slot, keep walking.
         trace.trash_counter += 1;
+        trace.failed_count += 1;
+        trace.failed_slots.push(trace.current_slot);
         if trace.trash_counter > 64 {
-            trace.current_slot = trace.total_slots;
+            trace.mark_aborted(format!(
+                "trash storm after slot {} (>64 consecutive invalid)",
+                trace.current_slot
+            ));
+            log::log(
+                LogType::Fatal,
+                &format!(
+                    "IAT trace ABORTED: {} — resolved={} failed={} skipped={}",
+                    trace.abort_reason.as_deref().unwrap_or("?"),
+                    trace.resolved_count,
+                    trace.failed_count,
+                    trace.skip_count
+                ),
+            );
             return Ok(());
         }
         trace.current_slot += 1;
     }
 
     if trace.current_slot >= trace.total_slots {
+        let accounted = trace.slots_accounted();
+        let product_ok = trace.product_complete();
         log::log(
-            LogType::Good,
+            if product_ok {
+                LogType::Good
+            } else {
+                LogType::Fatal
+            },
             &format!(
-                "IAT trace complete: {} resolved, {} failed",
-                trace.resolved_count, trace.failed_count
+                "IAT trace finished: resolved={} failed={} skipped={} accounted={}/{} aborted={} product_complete={}",
+                trace.resolved_count,
+                trace.failed_count,
+                trace.skip_count,
+                accounted,
+                trace.total_slots,
+                trace.aborted,
+                product_ok
             ),
         );
-        if trace.resolved_count > 0 {
+        // Only write back when we resolved something and did not abort mid-table.
+        if trace.resolved_count > 0 && !trace.aborted {
             let write_size = trace.total_slots * std::mem::size_of::<usize>();
             let mut old_protect = PAGE_PROTECTION_FLAGS::default();
             // SAFETY: dbg.process_handle() is a valid process handle; trace.iat_address and write_size are valid IAT bounds; old_protect is a valid out-pointer.
@@ -422,7 +497,7 @@ pub(super) fn advance_to_next_slot(
             LogType::Fatal,
             &format!("continue_event failed: {e} - aborting tracing"),
         );
-        trace.current_slot = trace.total_slots;
+        trace.mark_aborted(format!("continue_event failed: {e}"));
         return Ok(());
     }
     log::log(LogType::Info, "Thread continued, waiting for SingleStep");

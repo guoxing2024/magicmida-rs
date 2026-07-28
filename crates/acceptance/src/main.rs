@@ -16,7 +16,10 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 use mida_acceptance::{
-    check_static, check_with_behavior, BehaviorEvidence, CheckStaticOptions, Verdict,
+    check_static, check_with_behavior, check_with_behavior_managed,
+    check_with_behavior_managed_lab, check_with_behavior_signed, BehaviorEvidence,
+    CheckStaticOptions, EnvelopePolicy, HmacSha256Verifier, SignatureEnvelope,
+    VerifiedManagedCandidate, Verdict,
 };
 
 fn main() {
@@ -75,7 +78,18 @@ Options:
   --oracle <path>          Legacy oracle file (comparison observation only)
   --behavior-evidence <p>  Pre-recorded mida.behavior-evidence/v0 JSON (compose only)
   --report <path>          Write deterministic JSON report to path
-                           (must not alias candidate, oracle, or evidence)
+                           (must not alias candidate/oracle/evidence/manifest/envelope)
+  --allow-unmanaged-candidate
+                           check-with-behavior only: allow missing sibling
+                           *.transform_manifest.json (experimental / lab)
+  --signature-envelope <p> CI signature envelope JSON (mida.signature-envelope/v0)
+                           sibling <stem>.signature_envelope.json is also tried
+  --allow-hmac-lab         Lab only: permit caller-supplied HMAC trust root
+                           (requires --envelope-key-id + --envelope-hmac-key-hex).
+                           Product path rejects HMAC without this flag (audit P0).
+  --envelope-key-id <id>   Lab HMAC key id (or env MIDA_ENVELOPE_KEY_ID)
+  --envelope-hmac-key-hex  Lab HMAC key material hex (or env MIDA_ENVELOPE_HMAC_KEY_HEX)
+  --allow-unsigned-managed Lab only: permit managed Accepted without verified envelope
   -h, --help               Show help
   -V, --version            Show version
 
@@ -86,7 +100,10 @@ Exit codes:
 
 Notes:
   check-static never returns Accepted (R0B).
-  check-with-behavior may return Accepted when structure passes and evidence Pass binds.
+  Product Accepted requires managed manifest + verified signature envelope with a
+  non-caller-controlled trust root (Ed25519 reserved; HMAC is lab-only).
+  Without envelope, managed compose is capped at StructuralPassBehaviorPending
+  unless --allow-unsigned-managed (lab).
 "
     );
 }
@@ -236,10 +253,56 @@ fn cmd_check_with_behavior(args: &[String]) -> Result<i32, String> {
     let mut oracle: Option<PathBuf> = None;
     let mut report_path: Option<PathBuf> = None;
     let mut evidence_path: Option<PathBuf> = None;
+    let mut allow_unmanaged = false;
+    let mut allow_unsigned_managed = false;
+    let mut allow_hmac_lab = false;
+    let mut envelope_path: Option<PathBuf> = None;
+    let mut envelope_key_id: Option<String> = None;
+    let mut envelope_hmac_key_hex: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--allow-unmanaged-candidate" => {
+                allow_unmanaged = true;
+            }
+            "--allow-unsigned-managed" => {
+                allow_unsigned_managed = true;
+            }
+            "--allow-hmac-lab" => {
+                allow_hmac_lab = true;
+            }
+            "--signature-envelope" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("missing value after --signature-envelope".into());
+                }
+                envelope_path = Some(PathBuf::from(&args[i]));
+            }
+            flag if flag.starts_with("--signature-envelope=") => {
+                envelope_path = Some(PathBuf::from(&flag["--signature-envelope=".len()..]));
+            }
+            "--envelope-key-id" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("missing value after --envelope-key-id".into());
+                }
+                envelope_key_id = Some(args[i].clone());
+            }
+            flag if flag.starts_with("--envelope-key-id=") => {
+                envelope_key_id = Some(flag["--envelope-key-id=".len()..].to_string());
+            }
+            "--envelope-hmac-key-hex" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("missing value after --envelope-hmac-key-hex".into());
+                }
+                envelope_hmac_key_hex = Some(args[i].clone());
+            }
+            flag if flag.starts_with("--envelope-hmac-key-hex=") => {
+                envelope_hmac_key_hex =
+                    Some(flag["--envelope-hmac-key-hex=".len()..].to_string());
+            }
             "--expected-sha256" => {
                 i += 1;
                 if i >= args.len() {
@@ -326,6 +389,37 @@ fn cmd_check_with_behavior(args: &[String]) -> Result<i32, String> {
     let evidence = BehaviorEvidence::parse_json(&ev_bytes)
         .map_err(|e| format!("invalid behavior evidence: {e}"))?;
 
+    // Fail-closed: sibling *.transform_manifest.json is required by default
+    // (every dump should emit one, including empty ledger). Lab-only escape:
+    // --allow-unmanaged-candidate.
+    let manifest_path = {
+        let mut p = candidate.clone();
+        p.set_extension("transform_manifest.json");
+        p
+    };
+    // Keep File handles for report alias protection (audit P1).
+    let (manifest_bytes, manifest_file, managed) = if manifest_path.is_file() {
+        let (mbytes, mfile) = read_input(&manifest_path, "transform_manifest")?;
+        let managed = VerifiedManagedCandidate::verify(&bytes, &mbytes)
+            .map_err(|e| format!("invalid/unbound transform_manifest: {e}"))?;
+        (Some(mbytes), Some(mfile), Some(managed))
+    } else if !allow_unmanaged {
+        return Err(format!(
+            "missing required sibling transform_manifest at '{}' \
+             (dumps always emit one; pass --allow-unmanaged-candidate for lab inputs)",
+            manifest_path.display()
+        ));
+    } else {
+        (None, None, None)
+    };
+
+    // Signature envelope: explicit path, else sibling <stem>.signature_envelope.json.
+    let resolved_envelope = envelope_path.or_else(|| {
+        let mut p = candidate.clone();
+        p.set_extension("signature_envelope.json");
+        p.is_file().then_some(p)
+    });
+
     let (oracle_bytes, oracle_file) = match oracle.as_deref() {
         None => (None, None),
         Some(path) => {
@@ -341,7 +435,79 @@ fn cmd_check_with_behavior(args: &[String]) -> Result<i32, String> {
         oracle_bytes,
     };
 
-    let report = check_with_behavior(&bytes, &opts, &evidence);
+    // Product path:
+    //   managed + verified envelope (non-caller trust root) → may Accept
+    //   managed + HMAC envelope only with --allow-hmac-lab (lab; not product)
+    //   managed without envelope → cap Pending unless --allow-unsigned-managed
+    //   unmanaged → never Accept
+    //
+    // Note: `evidence` from CLI parse is used for *unsigned* paths only.
+    // Signed path seals evidence from hashed JSON inside verify_bundle (audit P0).
+    let mut envelope_file: Option<File> = None;
+    let mut report = if let (Some(ref env_path), Some(ref man_bytes), Some(_)) =
+        (resolved_envelope.as_ref(), manifest_bytes.as_ref(), managed.as_ref())
+    {
+        let (env_bytes, env_file) = read_input(env_path, "signature-envelope")?;
+        envelope_file = Some(env_file);
+        let envelope = SignatureEnvelope::parse_json(&env_bytes)
+            .map_err(|e| format!("invalid signature envelope: {e}"))?;
+
+        // Product trust root is not implemented yet (Ed25519 reserved).
+        // Caller-supplied HMAC is lab-only and requires an explicit flag so it
+        // cannot be mistaken for product authenticity (audit P0).
+        if !allow_hmac_lab {
+            return Err(
+                "signature envelope present, but product trust root is not configured. \
+                 Ed25519 CI allowlist is not implemented yet. For lab HMAC only, pass \
+                 --allow-hmac-lab with --envelope-key-id and --envelope-hmac-key-hex \
+                 (or MIDA_ENVELOPE_KEY_ID / MIDA_ENVELOPE_HMAC_KEY_HEX). \
+                 Without a trusted envelope, omit the envelope file and use \
+                 --allow-unsigned-managed for lab Accepted."
+                    .into(),
+            );
+        }
+
+        let key_id = envelope_key_id
+            .or_else(|| env::var("MIDA_ENVELOPE_KEY_ID").ok())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                "--allow-hmac-lab requires --envelope-key-id / MIDA_ENVELOPE_KEY_ID".to_string()
+            })?;
+        let hmac_hex = envelope_hmac_key_hex
+            .or_else(|| env::var("MIDA_ENVELOPE_HMAC_KEY_HEX").ok())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                "--allow-hmac-lab requires --envelope-hmac-key-hex / MIDA_ENVELOPE_HMAC_KEY_HEX"
+                    .to_string()
+            })?;
+        let key = hex_decode_key(&hmac_hex)?;
+        let policy = EnvelopePolicy::hmac_lab_key(key_id.clone());
+        let verifier = HmacSha256Verifier { key_id, key };
+        let signed = envelope
+            .verify_bundle(&bytes, man_bytes, &ev_bytes, &policy, &verifier)
+            .map_err(|e| format!("signature envelope verification failed: {e}"))?;
+        // Sealed evidence only — no external evidence parameter (audit P0).
+        check_with_behavior_signed(&bytes, &opts, &signed)
+    } else if let Some(ref managed) = managed {
+        // Library managed is already Pending-capped; lab flag uses explicit lab API.
+        if allow_unsigned_managed {
+            check_with_behavior_managed_lab(&bytes, &opts, &evidence, managed)
+        } else {
+            check_with_behavior_managed(&bytes, &opts, &evidence, managed)
+        }
+    } else {
+        check_with_behavior(&bytes, &opts, &evidence)
+    };
+
+    if report.verdict == Verdict::Accepted && allow_hmac_lab {
+        report.warnings.push(mida_acceptance::WarningRecord {
+            code: "hmac_lab_not_product_trust".to_string(),
+            message: "Accepted via --allow-hmac-lab uses a caller-supplied HMAC trust root; \
+                 this is lab diagnostic only, not product authenticity"
+                .to_string(),
+        });
+    }
+
     let json = report
         .to_json()
         .map_err(|e| format!("failed to serialize report: {e}"))?;
@@ -350,17 +516,50 @@ fn cmd_check_with_behavior(args: &[String]) -> Result<i32, String> {
     if let Some(path) = report_path {
         let mut file_body = json.clone();
         file_body.push('\n');
-        // Also refuse aliasing the evidence path.
         write_report_with_extra(
             &path,
             file_body.as_bytes(),
             (&candidate, &candidate_file),
             oracle.as_deref().zip(oracle_file.as_ref()),
             Some((evidence_path.as_path(), &evidence_file)),
+            manifest_file
+                .as_ref()
+                .map(|f| (manifest_path.as_path(), f)),
+            envelope_file.as_ref().and_then(|f| {
+                resolved_envelope
+                    .as_ref()
+                    .map(|p| (p.as_path(), f))
+            }),
         )?;
     }
 
     Ok(report.verdict.exit_code())
+}
+
+fn hex_decode_key(s: &str) -> Result<Vec<u8>, String> {
+    let t = s.trim();
+    if t.is_empty() || t.len() % 2 != 0 || !t.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("envelope HMAC key must be non-empty even-length hex".into());
+    }
+    let mut out = Vec::with_capacity(t.len() / 2);
+    let b = t.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        let hi = hex_nibble(b[i])?;
+        let lo = hex_nibble(b[i + 1])?;
+        out.push((hi << 4) | lo);
+        i += 2;
+    }
+    Ok(out)
+}
+
+fn hex_nibble(b: u8) -> Result<u8, String> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        _ => Err("invalid hex in envelope key".into()),
+    }
 }
 
 fn parse_expected_size(raw: &str) -> Result<u64, String> {
@@ -387,17 +586,19 @@ fn write_report(
     candidate: (&Path, &File),
     oracle: Option<(&Path, &File)>,
 ) -> Result<(), String> {
-    write_report_with_extra(report_path, body, candidate, oracle, None)
+    write_report_with_extra(report_path, body, candidate, oracle, None, None, None)
 }
 
-/// Write report after rejecting alias against candidate, optional oracle, and
-/// optional behavior-evidence inputs (B-A2).
+/// Write report after rejecting alias against candidate, optional oracle,
+/// behavior-evidence, transform_manifest, and signature envelope (audit P1).
 fn write_report_with_extra(
     report_path: &Path,
     body: &[u8],
     candidate: (&Path, &File),
     oracle: Option<(&Path, &File)>,
     evidence: Option<(&Path, &File)>,
+    manifest: Option<(&Path, &File)>,
+    envelope: Option<(&Path, &File)>,
 ) -> Result<(), String> {
     // Open without truncate so alias checks cannot damage an input file.
     let mut report_file = OpenOptions::new()
@@ -436,6 +637,26 @@ fn write_report_with_extra(
             "behavior-evidence",
             evidence_path,
             evidence_file,
+        )?;
+    }
+    if let Some((manifest_path, manifest_file)) = manifest {
+        reject_input_alias(
+            report_path,
+            &report_file,
+            &report_metadata,
+            "transform_manifest",
+            manifest_path,
+            manifest_file,
+        )?;
+    }
+    if let Some((envelope_path, envelope_file)) = envelope {
+        reject_input_alias(
+            report_path,
+            &report_file,
+            &report_metadata,
+            "signature-envelope",
+            envelope_path,
+            envelope_file,
         )?;
     }
 

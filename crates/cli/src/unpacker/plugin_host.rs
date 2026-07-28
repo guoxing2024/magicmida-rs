@@ -215,10 +215,12 @@ const _: ContinueStatus = ContinueStatus::Continue;
 
 /// Build [`HostLoopFacts`] from current host loop state.
 pub(super) fn host_loop_facts(ls: &LoopState) -> HostLoopFacts {
+    // Product-complete only (resolved+failed+skipped==total, no abort, no fails).
+    // Walking current_slot to total alone is NOT complete (audit residual P1).
     let iat_trace_complete = ls
         .iat_trace
         .as_ref()
-        .is_some_and(|t| t.total_slots > 0 && t.current_slot >= t.total_slots);
+        .is_some_and(|t| t.product_complete());
     HostLoopFacts {
         text_polling: ls.text_polling,
         guard_installed: ls.guard_installed,
@@ -320,14 +322,14 @@ pub(super) fn note_plugin_av_break(
     let iat_done = ls
         .iat_trace
         .as_ref()
-        .is_some_and(|t| t.total_slots > 0 && t.current_slot >= t.total_slots);
+        .is_some_and(|t| t.product_complete());
 
     if iat_done {
         let advice = packer.note_iat_trace_complete(plugin_ctx);
         debug!(
             ?advice,
             family = packer.family_id(),
-            "PackerPlugin: IAT trace complete (av break)"
+            "PackerPlugin: IAT product-complete (av break)"
         );
     } else if ls.oep.is_some() && ls.storm_escape_freeze && !ls.process_exited {
         // Process still alive after null-AV storm freeze: do not set

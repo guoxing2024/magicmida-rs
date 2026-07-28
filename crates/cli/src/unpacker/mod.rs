@@ -933,7 +933,12 @@ pub fn unpack(
                         if bp_addr == address {
                             info!(addr = %format!("{address:#x}"), ".NET _CorExeMain hit — dumping process memory");
                             dbg.clear_hw_breakpoint(3)?;
-                            dotnet_dump_and_dump_output(&mut dbg, image_base_usize, &output_path)?;
+                            dotnet_dump_and_dump_output(
+                                &mut dbg,
+                                image_base_usize,
+                                &output_path,
+                                input,
+                            )?;
                             dbg.continue_event(thread_id, ContinueStatus::Continue)?;
                             break;
                         }
@@ -1138,13 +1143,25 @@ pub fn unpack(
                         )?;
                     }
 
-                    // After handling the trace step, check if tracing is complete.
-                    // If so, break immediately to avoid the target process exiting.
+                    // After handling the trace step, check if the slot walk finished.
+                    // Product-complete is stricter than current_slot>=total (audit P1).
                     if let Some(ref t) = ls.iat_trace {
                         if t.current_slot >= t.total_slots {
-                            // 3b-6: same complete milestone as av-break success path.
-                            note_plugin_iat_complete(&mut packer, &mut plugin_ctx);
-                            info!("IAT tracing complete — exiting debug loop");
+                            if t.product_complete() {
+                                note_plugin_iat_complete(&mut packer, &mut plugin_ctx);
+                                info!(
+                                    "IAT tracing product-complete — exiting debug loop (resolved={})",
+                                    t.resolved_count
+                                );
+                            } else {
+                                info!(
+                                    "IAT tracing finished WITHOUT product-complete (resolved={} failed={} skipped={} aborted={:?}) — exiting loop, not marking complete",
+                                    t.resolved_count,
+                                    t.failed_count,
+                                    t.skip_count,
+                                    t.abort_reason
+                                );
+                            }
                             break;
                         }
                     }

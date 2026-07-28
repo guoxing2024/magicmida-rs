@@ -10,14 +10,22 @@ const POINTER_TRIPLE_SIZE: usize = 24;
 const MIN_USER_POINTER: u64 = 0x1_0000;
 const MAX_USER_POINTER: u64 = 0x0000_7fff_ffff_ffff;
 /// Absolute CRT/heap pointers observed in dumped Themida images land in the
-/// low 4GB of the process (e.g. `0x8d3e40`, `0x8a0000`). SecurityCookie and
-/// other high-entropy constants sit well above that range and must stay.
+/// low 4GB of the process (e.g. `0x8d3e40`, `0x8a0000`). In that band, only
+/// 8-byte-aligned values are scrubbed so packed constants / cookie fragments
+/// are not zeroed.
+const MAX_LOW_HEAP_POINTER: u64 = 0x0000_0000_ffff_ffff;
+/// Upper bound for process-local user pointers considered for scrubbing.
+/// Mid-user heap slots above 4GB (e.g. Themida `0x2b99…`) are cleared even
+/// when unaligned.
 ///
-/// Do **not** scrub the full canonical user range: late dumps still hold
-/// ASLR image VAs (`0x7ff7…`) for CRT function tables until
-/// `fix_hardcoded_addresses` rebases them; clearing those zeros
+/// Do **not** scrub the high ASLR module band (`>= HIGH_ASLR_MODULE_MIN`):
+/// late dumps still hold ASLR image VAs (`0x7ff7…`) for CRT function tables
+/// until `fix_hardcoded_addresses` rebases them; clearing those zeros
 /// `call [fn_table]` (Origin W1 live regression).
 const MAX_PROCESS_LOCAL_HEAP_POINTER: u64 = 0x0000_7fff_ffff_fffe;
+/// Typical x64 module / system image ASLR floor. Pointers in this band are
+/// treated as rebase candidates, not process-local heap garbage.
+const HIGH_ASLR_MODULE_MIN: u64 = 0x0000_7ff0_0000_0000;
 /// Kernel-half addresses (`>= 0xffff_8000_0000_0000`) seen in Origin dumps
 /// (e.g. `.data+0xfc388 = 0xffffd466…` == `!DEFAULT_COOKIE` collision) are
 /// never valid as re-entry object heads and must be cleared even when unaligned.
@@ -221,11 +229,17 @@ fn is_stale_absolute_pointer(value: u64, image_base: u64, image_end: u64) -> boo
     if value < MIN_USER_POINTER || value > MAX_PROCESS_LOCAL_HEAP_POINTER {
         return false;
     }
-    // Clear all non-image-range user-mode addresses, not just aligned ones.
-    // Unaligned stale heap pointers (e.g. 0x2b992ddfa232) appear in Themida
-    // dumps and cause exit-0 when the program follows them. The previous
-    // 8-byte alignment requirement skipped these, leaving stale pointers in
-    // .data that magicmida's scrub catches.
+    // High ASLR module VAs must survive until rebase (Origin W1).
+    if value >= HIGH_ASLR_MODULE_MIN {
+        return false;
+    }
+    // Low 4GB: prefer 8-byte aligned heap-like pointers; unaligned values are
+    // more often packed constants / cookie fragments than CRT table entries.
+    if value <= MAX_LOW_HEAP_POINTER {
+        return value & 7 == 0;
+    }
+    // Mid-user (above 4GB, below high-module band): clear all non-image
+    // addresses, including unaligned Themida heap slots (e.g. 0x2b992ddfa232).
     true
 }
 
@@ -405,5 +419,11 @@ mod tests {
         ));
         // Unaligned low-user constant left alone.
         assert!(!is_stale_absolute_pointer(0x8d3e41, image_base, image_end));
+        // Mid-user unaligned Themida heap slot is cleared (6211e6c intent).
+        assert!(is_stale_absolute_pointer(
+            0x0000_2b99_2ddf_a232,
+            image_base,
+            image_end
+        ));
     }
 }

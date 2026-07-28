@@ -8,7 +8,7 @@ use tracing::{info, warn};
 
 use mida_core::DebuggerCore;
 
-use super::fix::{is_likely_api_address, is_within_image};
+use super::fix::{is_likely_api_address, is_within_image_bounds};
 use super::{IatLocation, CONSECUTIVE_ZERO_THRESHOLD, MAX_IAT_SIZE, MAX_TRASH_SLOTS};
 use crate::error::ThemidaError;
 
@@ -45,14 +45,25 @@ pub(super) struct IatBlock {
 ///
 /// The returned blocks are sorted by slot index (ascending).
 pub(super) fn discover_iat_blocks(iat_data: &[usize]) -> Vec<IatBlock> {
+    discover_iat_blocks_with_image(iat_data, 0, 0)
+}
+
+/// Like [`discover_iat_blocks`], but treats pointers in
+/// `[image_base, image_boundary)` as valid (Themida stub / image-local).
+pub(super) fn discover_iat_blocks_with_image(
+    iat_data: &[usize],
+    image_base: usize,
+    image_boundary: usize,
+) -> Vec<IatBlock> {
     let mut blocks: Vec<IatBlock> = Vec::new();
     let mut current_start: Option<usize> = None;
     let mut valid_count: usize = 0;
     let mut consecutive_zeros: usize = 0;
 
     for (i, &val) in iat_data.iter().enumerate() {
-        let is_valid =
-            val == 0 || is_likely_api_address(val) || is_within_image(val, 0, iat_data.len());
+        let is_valid = val == 0
+            || is_likely_api_address(val)
+            || is_within_image_bounds(val, image_base, image_boundary);
 
         if is_valid {
             if val == 0 {
@@ -181,6 +192,8 @@ pub(super) fn scan_iat_boundaries(
     iat_ref: usize,
 ) -> Result<IatLocation, ThemidaError> {
     let ptr_size = std::mem::size_of::<usize>();
+    let image_base = debugger.image_base() as usize;
+    let image_boundary = read_image_boundary(debugger, image_base).unwrap_or(0);
 
     // Allocate a buffer large enough to hold the maximum IAT.
     let max_slots = MAX_IAT_SIZE / ptr_size;
@@ -242,7 +255,9 @@ pub(super) fn scan_iat_boundaries(
                     break;
                 }
             }
-        } else if is_likely_api_address(val) || is_within_image(val, read_start, actual_slots) {
+        } else if is_likely_api_address(val)
+            || is_within_image_bounds(val, image_base, image_boundary)
+        {
             iat_start = read_start + seeker * ptr_size;
             consecutive_zeros = 0;
         } else {
@@ -276,8 +291,8 @@ pub(super) fn scan_iat_boundaries(
     // Use multi-block discovery to handle fragmented V3 IATs.
     let start_index = (iat_start.saturating_sub(read_start)) / ptr_size;
 
-    // Discover all valid IAT blocks in the buffer.
-    let blocks = discover_iat_blocks(&iat_data);
+    // Discover all valid IAT blocks in the buffer (API + in-image stubs).
+    let blocks = discover_iat_blocks_with_image(&iat_data, image_base, image_boundary);
 
     // Find the block that contains our start_index.
     let primary_idx = select_primary_block(&blocks, start_index);
@@ -425,4 +440,33 @@ pub(super) fn scan_iat_boundaries(
         size,
         requires_writable_section: false, // TODO: detect from PE header
     })
+}
+
+/// Read `ImageBase + SizeOfImage` from the live process PE headers.
+///
+/// Returns `None` if headers cannot be read; callers then treat image-local
+/// stubs as non-valid (API-only scan).
+fn read_image_boundary(debugger: &dyn DebuggerCore, image_base: usize) -> Option<usize> {
+    if image_base == 0 {
+        return None;
+    }
+    let mut dos = [0u8; 0x40];
+    debugger.read_memory(image_base, &mut dos).ok()?;
+    if dos[0] != b'M' || dos[1] != b'Z' {
+        return None;
+    }
+    let e_lfanew = u32::from_le_bytes(dos[0x3c..0x40].try_into().ok()?) as usize;
+    let mut nt = [0u8; 0x58]; // enough for OptionalHeader.SizeOfImage at +56
+    debugger
+        .read_memory(image_base.checked_add(e_lfanew)?, &mut nt)
+        .ok()?;
+    if &nt[0..4] != b"PE\0\0" {
+        return None;
+    }
+    // OptionalHeader starts at NT+24; SizeOfImage at optional+56 for PE32/PE32+.
+    let size_of_image = u32::from_le_bytes(nt[24 + 56..24 + 60].try_into().ok()?) as usize;
+    if size_of_image == 0 {
+        return None;
+    }
+    Some(image_base.saturating_add(size_of_image))
 }

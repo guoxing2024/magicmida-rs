@@ -241,6 +241,10 @@ pub fn process_guarded_access(
         is_guarded_address(fault_address, text_section_start, text_section_end);
     let exc_in_text =
         is_guarded_address(exception_address, text_section_start, text_section_end);
+    let fault_in_active_guard = state.ftm_guard
+        && is_guarded_address(fault_address, state.guard_start, state.guard_end);
+    let exc_in_active_guard = state.ftm_guard
+        && is_guarded_address(exception_address, state.guard_start, state.guard_end);
     if !state.ftm_guard && !fault_in_text && !(exc_type == 8 && exc_in_text) {
         debug!(
             fault = %format!("{fault_address:#x}"),
@@ -250,15 +254,37 @@ pub fn process_guarded_access(
         );
         return Ok(GuardAccessResult::NotGuarded);
     }
+    // FTMGuard: only handle faults in the active (Themida) guard region or .text.
+    if state.ftm_guard && !fault_in_active_guard && !exc_in_active_guard && !fault_in_text && !exc_in_text
+    {
+        debug!(
+            fault = %format!("{fault_address:#x}"),
+            exception = %format!("{exception_address:#x}"),
+            guard_start = %format!("{:#x}", state.guard_start),
+            guard_end = %format!("{:#x}", state.guard_end),
+            "Ignoring non-guard AV (FTMGuard active; fault outside Themida guard)"
+        );
+        return Ok(GuardAccessResult::NotGuarded);
+    }
 
-    // Temporarily restore full access so the faulting instruction can complete
-    // (matches `VirtualProtectEx(..., PAGE_EXECUTE_READWRITE, ...)` in Pascal).
-    // SAFETY: h_process is a valid process handle; iat_start/text_section_start is a valid virtual address; old_protect is a valid out-pointer.
+    // Temporarily restore full access on the *active* guard region so the
+    // faulting instruction can complete. Under FTMGuard that is the Themida
+    // section (PAGE_READWRITE / NX), not .text — restoring only .text left
+    // Themida NX and caused sticky execute AVs (audit P1).
+    let (restore_base, restore_size) = if state.ftm_guard && state.guard_start != 0 {
+        (
+            state.guard_start,
+            state.guard_end.saturating_sub(state.guard_start),
+        )
+    } else {
+        (text_section_start, text_size)
+    };
+    // SAFETY: h_process is a valid process handle; restore_base is a valid VA.
     unsafe {
         VirtualProtectEx(
             h_process,
-            text_section_start as *const std::ffi::c_void,
-            text_size,
+            restore_base as *const std::ffi::c_void,
+            restore_size,
             PAGE_EXECUTE_READWRITE,
             &mut old_protect,
         )
@@ -266,13 +292,19 @@ pub fn process_guarded_access(
     .map_err(|e| ThemidaError::Debugger(format!("VirtualProtectEx in guarded access: {e}")))?;
 
     // -- Branch 1: FTMGuard mode ------------------------------------------------
-    // The previous access was a TLS callback execution that switched the guard
-    // region to the Themida section. We just hit the new region — re-install the
-    // code-section guard and continue the debug loop normally.
+    // Previous TLS path switched the active guard to the Themida section
+    // (read+write, no execute). We just hit that region — leave Themida
+    // executable (already RWX above) and re-arm .text as PAGE_NOACCESS.
     if state.ftm_guard {
         state.ftm_guard = false;
-        debug!("FTMGuard: re-installing .text guard after TLS execution");
-        // SAFETY: h_process is a valid process handle; iat_start/text_section_start is a valid virtual address; old_protect is a valid out-pointer.
+        // Active guard returns to .text for subsequent OEP hunting.
+        state.guard_start = text_section_start;
+        state.guard_end = text_section_end;
+        debug!(
+            themida = %format!("{restore_base:#x}+{restore_size:#x}"),
+            "FTMGuard: restored Themida execute, re-installing .text guard"
+        );
+        // SAFETY: re-arm .text NOACCESS after TLS Themida touch.
         unsafe {
             VirtualProtectEx(
                 h_process,

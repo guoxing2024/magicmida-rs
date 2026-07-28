@@ -179,14 +179,42 @@ pub const TRACE_LIMIT: u64 = 500_000;
 // ---------------------------------------------------------------------------
 
 /// Result of a v3 IAT trace pass.
+///
+/// Callers **must** gate on [`Self::is_product_complete()`], not on
+/// `failed_count == 0` alone (abort / partial account can still yield
+/// failed==0 in edge paths — audit residual).
+///
+/// Completeness is **computed**, never a free-standing bool field that can
+/// drift from the counters (audit residual P2).
 #[derive(Debug)]
 pub struct TraceImportResult {
-    /// Number of IAT slots that were successfully resolved.
+    /// Total slots examined in this pass.
+    pub total_slots: usize,
+    /// Number of IAT slots that were successfully resolved this pass.
     pub resolved_count: usize,
     /// Number of IAT slots that could not be resolved.
     pub failed_count: usize,
+    /// Validated skips (null / already-real API / in-image non-wrapper).
+    pub skip_count: usize,
     /// Zero-based indices of the slots that failed.
     pub failed_slots: Vec<usize>,
+    /// Early abort (trash storm, etc.).
+    pub aborted: bool,
+    pub abort_reason: Option<String>,
+}
+
+impl TraceImportResult {
+    /// `!aborted && failed==0 && resolved+failed+skipped==total`.
+    /// Empty table (`total_slots==0`) is complete iff !aborted.
+    pub fn is_product_complete(&self) -> bool {
+        !self.aborted
+            && self.failed_count == 0
+            && self
+                .resolved_count
+                .saturating_add(self.failed_count)
+                .saturating_add(self.skip_count)
+                == self.total_slots
+    }
 }
 
 // ===========================================================================
@@ -258,9 +286,12 @@ pub fn trace_imports(
 
     let mut resolved_count: usize = 0;
     let mut failed_count: usize = 0;
+    let mut skip_count: usize = 0;
     let mut failed_slots: Vec<usize> = Vec::new();
     let mut trash_counter: usize = 0;
     let mut did_set_exit_process: bool = false;
+    let mut aborted = false;
+    let mut abort_reason: Option<String> = None;
 
     log(
         LogMsgType::Info,
@@ -287,17 +318,24 @@ pub fn trace_imports(
 
         match classify_iat_slot_for_trace(current, tm_start, tm_end, image_base, image_boundary) {
             IatSlotClass::Skip => {
-                // Null / resolved API / in-image non-wrapper: normal IAT layout.
+                // Null / resolved API / in-image non-wrapper: validated skip.
                 trash_counter = 0;
+                skip_count += 1;
                 continue;
             }
             IatSlotClass::Trash => {
                 trash_counter += 1;
+                failed_count += 1;
+                failed_slots.push(i);
                 if trash_counter > TRASH_THRESHOLD {
+                    aborted = true;
+                    abort_reason = Some(format!(
+                        "trash threshold ({TRASH_THRESHOLD}) exceeded at slot {i}"
+                    ));
                     log(
-                        LogMsgType::Info,
+                        LogMsgType::Fatal,
                         &format!(
-                            "Trash threshold ({TRASH_THRESHOLD}) exceeded at slot {i} — stopping IAT trace"
+                            "Trash threshold ({TRASH_THRESHOLD}) exceeded at slot {i} — aborting IAT trace (not product-complete)"
                         ),
                     );
                     break;
@@ -366,14 +404,18 @@ pub fn trace_imports(
                     let api = state.traced_api;
 
                     if api < 0x10000 || (api >= image_base && api < image_boundary) {
+                        // Count failure and continue — never silent break that
+                        // leaves remaining slots unaccounted (audit residual P1).
+                        failed_count += 1;
+                        failed_slots.push(i);
                         log(
-                            LogMsgType::Info,
+                            LogMsgType::Fatal,
                             &format!(
                                 "IAT[{i}] {slot_va:#x}: discarding result {api:#x} \
-                                 (in image range or too low), aborting IAT tracing"
+                                 (in image range or too low) — slot failed"
                             ),
                         );
-                        break;
+                        continue;
                     }
 
                     iat_data[i] = api;
@@ -459,7 +501,23 @@ pub fn trace_imports(
         }
     }
 
-    let complete_level = if failed_count == 0 {
+    let accounted = resolved_count
+        .saturating_add(failed_count)
+        .saturating_add(skip_count);
+    // Product-complete requires full account + no fails + no abort.
+    // actual_slots==0 (no wrappers) is a valid empty success when !aborted.
+    // Early break / trash abort previously still logged "complete".
+    let result = TraceImportResult {
+        total_slots: actual_slots,
+        resolved_count,
+        failed_count,
+        skip_count,
+        failed_slots,
+        aborted,
+        abort_reason,
+    };
+    let product_complete = result.is_product_complete();
+    let complete_level = if product_complete {
         LogMsgType::Good
     } else {
         LogMsgType::Fatal
@@ -467,16 +525,19 @@ pub fn trace_imports(
     log(
         complete_level,
         &format!(
-            "IAT trace complete: {} resolved, {} failed",
-            resolved_count, failed_count
+            "IAT trace finished: resolved={} failed={} skipped={} accounted={}/{} aborted={} reason={:?} product_complete={}",
+            result.resolved_count,
+            result.failed_count,
+            result.skip_count,
+            accounted,
+            result.total_slots,
+            result.aborted,
+            result.abort_reason,
+            product_complete
         ),
     );
 
-    Ok(TraceImportResult {
-        resolved_count,
-        failed_count,
-        failed_slots,
-    })
+    Ok(result)
 }
 
 // ===========================================================================
@@ -692,14 +753,29 @@ mod tests {
     #[test]
     fn trace_import_result_debug() {
         let r = TraceImportResult {
+            total_slots: 50,
             resolved_count: 42,
             failed_count: 3,
+            skip_count: 5,
             failed_slots: vec![5, 10, 15],
+            aborted: false,
+            abort_reason: None,
         };
         let dbg = format!("{r:?}");
         assert!(dbg.contains("42"));
         assert!(dbg.contains("3"));
         assert!(dbg.contains("5"));
+        assert!(!r.is_product_complete());
+        let ok = TraceImportResult {
+            total_slots: 10,
+            resolved_count: 7,
+            failed_count: 0,
+            skip_count: 3,
+            failed_slots: vec![],
+            aborted: false,
+            abort_reason: None,
+        };
+        assert!(ok.is_product_complete());
     }
 
     // -- combine_bulk_iat_write_restore

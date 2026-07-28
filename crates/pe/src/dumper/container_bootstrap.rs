@@ -532,7 +532,7 @@ fn build_container_stub_internal(
         heap_global_rva,
         cookie_rva,
         cookie_mirror,
-    )?;;
+    )?;
     let metadata_offset = measured_code.len().checked_add(15)? & !15;
     let container_meta_size = containers.len().checked_mul(CONTAINER_METADATA_SIZE)?;
     let heap_global_meta_size = heap_globals.len().checked_mul(HEAP_GLOBAL_METADATA_SIZE)?;
@@ -585,7 +585,7 @@ fn build_container_stub_internal(
         heap_global_rva,
         cookie_rva,
         cookie_mirror,
-    )?;;
+    )?;
 
     if stub.len() > metadata_offset {
         warn!(
@@ -1354,6 +1354,38 @@ fn build_stub_code(
 fn retarget_gto_resume_entry(dump_buf: &[u8], scanned_entry: u32) -> u32 {
     const MSG_GATE: u32 = 0x70b0;
     const WINMAIN: u32 = 0x5a10;
+    // r27 round 6: when MIDA_GTO_NO_BYPASS=1, let the stub restore heap
+    // then jump to the Themida VM entry (PE original EP) instead of WinMain.
+    // The VM re-executes with heap state available, creating the window itself.
+    let no_bypass = std::env::var("MIDA_GTO_NO_BYPASS").ok().as_deref() == Some("1");
+    if no_bypass {
+        // Use the PE's original entry point (Themida VM entry) as continue_ep.
+        // The stub restores heap globals + slab, then jumps to the VM entry.
+        // The VM re-executes: decrypts .text (already plaintext), runs init,
+        // creates NewClassName window — all without bypass patches.
+        let pe_ep = {
+            let e_off = u32::from_le_bytes(
+                dump_buf.get(0x3c..0x40)
+                    .map(|s| s.try_into().unwrap_or([0; 4]))
+                    .unwrap_or([0; 4]),
+            ) as usize;
+            // Optional header starts at e_off + 4 (PE sig) + 20 (COFF header) = e_off + 24
+            let ao = e_off + 24;
+            u32::from_le_bytes(
+                dump_buf.get(ao + 16..ao + 20)
+                    .map(|s| s.try_into().unwrap_or([0; 4]))
+                    .unwrap_or([0; 4]),
+            )
+        };
+        if pe_ep != 0 {
+            tracing::info!(
+                from = format_args!("{MSG_GATE:#x}"),
+                to = format_args!("{pe_ep:#x}"),
+                "R-GTO-UI r27: retarget resume entry → Themida VM entry (NO_BYPASS mode)"
+            );
+            return pe_ep;
+        }
+    }
     if scanned_entry != MSG_GATE {
         return scanned_entry;
     }
@@ -1724,25 +1756,32 @@ mod tests {
     #[test]
     fn tls_process_attach_skips_complete_early_return() {
         let mut stub = Vec::new();
+        // Arg order must match build_stub_code (24 params after stub buffer).
         build_stub_code(
             &mut stub,
-            0x1000,
-            None,
-            0x2000,
-            0x2010,
-            0, // container_count
-            0, // heap_global_count
-            0, // metadata_offset
-            0, // heap_global_meta_offset
-            0, // fixup_map_offset
-            0, // range_count
-            None,
-            0,
-            0x140000000,
-            0,
-            None,
-            None, // cookie_rva: metadata fallback
-            None, // cookie_mirror
+            0x1000,            // stub_rva
+            None,              // original_entry_point (TLS mode)
+            0x2000,            // get_process_heap_iat_rva
+            0x2010,            // heap_alloc_iat_rva
+            0,                 // container_count
+            0,                 // heap_global_count
+            0,                 // metadata_offset
+            0,                 // heap_global_meta_offset
+            0,                 // fixup_map_offset
+            0,                 // range_count
+            0,                 // slab_fixup_index
+            None,              // virtual_alloc_iat_rva
+            0,                 // slab_old_base
+            0,                 // slab_data_offset
+            0,                 // scan_sections_offset
+            0,                 // scan_sections_count
+            None,              // data_snapshot
+            0,                 // data_snapshot_offset
+            0x140000000,       // image_base
+            0,                 // data_section_rva
+            None,              // heap_global_rva
+            None,              // cookie_rva
+            None,              // cookie_mirror
         )
         .expect("TLS stub should build");
 
@@ -1773,12 +1812,18 @@ mod tests {
             0,     // heap_global_meta_offset
             0,     // fixup_map_offset
             0,     // range_count
-            None,
-            0,
+            0,     // slab_fixup_index
+            None,  // virtual_alloc_iat_rva
+            0,     // slab_old_base
+            0,     // slab_data_offset
+            0,     // scan_sections_offset
+            0,     // scan_sections_count
+            None,  // data_snapshot
+            0,     // data_snapshot_offset
             0x140000000,
             0,
             None,
-            None, // cookie_rva: metadata fallback
+            None, // cookie_rva
             None, // cookie_mirror
         )
         .expect("TLS stub should build");

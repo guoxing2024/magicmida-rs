@@ -140,6 +140,8 @@ fn run_behavior(args: &[&Path]) -> Output {
     let bin = env!("CARGO_BIN_EXE_mida-acceptance");
     let mut command = Command::new(bin);
     command.arg("check-with-behavior");
+    // Lab fixtures are not dump products — no sibling transform_manifest.
+    command.arg("--allow-unmanaged-candidate");
     for arg in args {
         command.arg(arg);
     }
@@ -149,6 +151,12 @@ fn run_behavior(args: &[&Path]) -> Output {
 }
 
 fn write_minimal_evidence(path: &Path, sha: &str, size: u64, verdict: &str, status: &str) {
+    // Product Pass requires bilateral reference + registered probe (audit residual).
+    let reference = if verdict == "Pass" {
+        r#"{ "kind": "bilateral", "sha256": "ff00000000000000000000000000000000000000000000000000000000000000", "notes": "cli-test" }"#
+    } else {
+        r#"{ "kind": "none", "sha256": null, "notes": null }"#
+    };
     let body = format!(
         r#"{{
   "schema_version": "mida.behavior-evidence/v0",
@@ -157,7 +165,7 @@ fn write_minimal_evidence(path: &Path, sha: &str, size: u64, verdict: &str, stat
     "size_bytes": {size},
     "role": "candidate"
   }},
-  "reference": {{ "kind": "none", "sha256": null, "notes": null }},
+  "reference": {reference},
   "probe": {{
     "id": "exit_code_marker_v0",
     "policy": {{ "network": "deny", "max_wall_ms": 5000, "max_output_bytes": 65536 }},
@@ -170,7 +178,8 @@ fn write_minimal_evidence(path: &Path, sha: &str, size: u64, verdict: &str, stat
   }},
   "verdict": "{verdict}",
   "residual_risks": [],
-  "producer": {{ "name": "cli-test", "version": "0" }}
+  "producer": {{ "name": "cli-test", "version": "0" }},
+  "transform_ledger": []
 }}"#
     );
     fs::write(path, body).expect("write evidence");
@@ -221,4 +230,193 @@ fn check_with_behavior_identity_mismatch_exit_2() {
         stdout.contains("Rejected") || stdout.contains("evidence_identity_mismatch"),
         "{stdout}"
     );
+}
+
+#[allow(dead_code)]
+mod synth {
+    include!("../src/test_support/pe_builder.rs");
+}
+
+fn write_empty_manifest(path: &Path, pe: &[u8]) {
+    let dig = mida_acceptance::sha256_hex(pe);
+    let body = format!(
+        r#"{{"schema_version":"mida.transform-manifest/v0","taxonomy_version":"mida.transform-taxonomy/v1","candidate_sha256":"{dig}","candidate_size_bytes":{},"entries":[],"note":"cli-unsigned-test"}}"#,
+        pe.len()
+    );
+    fs::write(path, body).expect("write manifest");
+}
+
+fn run_behavior_raw(args: &[&str]) -> Output {
+    let bin = env!("CARGO_BIN_EXE_mida-acceptance");
+    Command::new(bin)
+        .args(args)
+        .output()
+        .unwrap_or_else(|e| panic!("failed to spawn {bin}: {e}"))
+}
+
+/// CLI product posture: managed without signature envelope cannot Accept.
+#[test]
+fn unsigned_managed_capped_at_pending() {
+    use synth::{build_pe, PeBuildOptions};
+    let dir = TestDir::new();
+    let pe = build_pe(&PeBuildOptions::pe32_plus());
+    let candidate = dir.path().join("cand.exe");
+    let evidence = dir.path().join("evidence.json");
+    let manifest = dir.path().join("cand.transform_manifest.json");
+    fs::write(&candidate, &pe).expect("write pe");
+    write_empty_manifest(&manifest, &pe);
+    let dig = mida_acceptance::sha256_hex(&pe);
+    write_minimal_evidence(&evidence, &dig, pe.len() as u64, "Pass", "pass");
+
+    let output = run_behavior_raw(&[
+        "check-with-behavior",
+        candidate.to_str().unwrap(),
+        "--behavior-evidence",
+        evidence.to_str().unwrap(),
+    ]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("StructuralPassBehaviorPending"),
+        "expected Pending cap without envelope, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("\"verdict\":\"Accepted\""),
+        "unsigned managed must not Accept: {stdout}"
+    );
+    assert!(
+        stdout.contains("unsigned_managed_no_accepted")
+            || String::from_utf8_lossy(&output.stderr).contains("unsigned"),
+        "expected unsigned warning in report, got: {stdout}"
+    );
+}
+
+/// Lab escape restores managed Accept without envelope.
+#[test]
+fn allow_unsigned_managed_can_accept() {
+    use synth::{build_pe, PeBuildOptions};
+    let dir = TestDir::new();
+    let pe = build_pe(&PeBuildOptions::pe32_plus());
+    let candidate = dir.path().join("cand.exe");
+    let evidence = dir.path().join("evidence.json");
+    let manifest = dir.path().join("cand.transform_manifest.json");
+    fs::write(&candidate, &pe).expect("write pe");
+    write_empty_manifest(&manifest, &pe);
+    let dig = mida_acceptance::sha256_hex(&pe);
+    write_minimal_evidence(&evidence, &dig, pe.len() as u64, "Pass", "pass");
+
+    let output = run_behavior_raw(&[
+        "check-with-behavior",
+        candidate.to_str().unwrap(),
+        "--behavior-evidence",
+        evidence.to_str().unwrap(),
+        "--allow-unsigned-managed",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("\"verdict\":\"Accepted\""),
+        "lab flag should allow Accepted, got: {stdout}"
+    );
+}
+
+#[test]
+fn report_cannot_overwrite_transform_manifest() {
+    use synth::{build_pe, PeBuildOptions};
+    let dir = TestDir::new();
+    let pe = build_pe(&PeBuildOptions::pe32_plus());
+    let candidate = dir.path().join("cand.exe");
+    let evidence = dir.path().join("evidence.json");
+    let manifest = dir.path().join("cand.transform_manifest.json");
+    fs::write(&candidate, &pe).expect("write pe");
+    write_empty_manifest(&manifest, &pe);
+    let original = fs::read(&manifest).expect("read manifest");
+    let dig = mida_acceptance::sha256_hex(&pe);
+    write_minimal_evidence(&evidence, &dig, pe.len() as u64, "Pass", "pass");
+
+    let output = run_behavior_raw(&[
+        "check-with-behavior",
+        candidate.to_str().unwrap(),
+        "--behavior-evidence",
+        evidence.to_str().unwrap(),
+        "--allow-unsigned-managed",
+        "--report",
+        manifest.to_str().unwrap(),
+    ]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("aliases") && stderr.contains("transform_manifest"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(fs::read(&manifest).expect("preserved"), original);
+}
+
+#[test]
+fn report_cannot_overwrite_transform_manifest_through_hard_link() {
+    use synth::{build_pe, PeBuildOptions};
+    let dir = TestDir::new();
+    let pe = build_pe(&PeBuildOptions::pe32_plus());
+    let candidate = dir.path().join("cand.exe");
+    let evidence = dir.path().join("evidence.json");
+    let manifest = dir.path().join("cand.transform_manifest.json");
+    let report_alias = dir.path().join("manifest-report.json");
+    fs::write(&candidate, &pe).expect("write pe");
+    write_empty_manifest(&manifest, &pe);
+    let original = fs::read(&manifest).expect("read manifest");
+    fs::hard_link(&manifest, &report_alias).expect("hard link manifest");
+    let dig = mida_acceptance::sha256_hex(&pe);
+    write_minimal_evidence(&evidence, &dig, pe.len() as u64, "Pass", "pass");
+
+    let output = run_behavior_raw(&[
+        "check-with-behavior",
+        candidate.to_str().unwrap(),
+        "--behavior-evidence",
+        evidence.to_str().unwrap(),
+        "--allow-unsigned-managed",
+        "--report",
+        report_alias.to_str().unwrap(),
+    ]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("aliases"), "stderr: {stderr}");
+    assert_eq!(fs::read(&manifest).expect("preserved"), original);
+}
+
+/// Even when envelope verification fails before report write, the envelope path
+/// used as `--report` must not be truncated (open-without-truncate + early exit,
+/// or alias reject if write is reached).
+#[test]
+fn report_cannot_clobber_signature_envelope_on_failed_verify() {
+    use synth::{build_pe, PeBuildOptions};
+    let dir = TestDir::new();
+    let pe = build_pe(&PeBuildOptions::pe32_plus());
+    let candidate = dir.path().join("cand.exe");
+    let evidence = dir.path().join("evidence.json");
+    let manifest = dir.path().join("cand.transform_manifest.json");
+    let envelope = dir.path().join("cand.signature_envelope.json");
+    fs::write(&candidate, &pe).expect("write pe");
+    write_empty_manifest(&manifest, &pe);
+    fs::write(&envelope, b"ENVELOPE_MUST_NOT_BE_TRUNCATED").expect("write envelope");
+    let original = fs::read(&envelope).expect("read envelope");
+    let dig = mida_acceptance::sha256_hex(&pe);
+    write_minimal_evidence(&evidence, &dig, pe.len() as u64, "Pass", "pass");
+
+    let output = run_behavior_raw(&[
+        "check-with-behavior",
+        candidate.to_str().unwrap(),
+        "--behavior-evidence",
+        evidence.to_str().unwrap(),
+        "--signature-envelope",
+        envelope.to_str().unwrap(),
+        "--allow-hmac-lab",
+        "--envelope-key-id",
+        "lab",
+        "--envelope-hmac-key-hex",
+        "00",
+        "--report",
+        envelope.to_str().unwrap(),
+    ]);
+    assert_ne!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(fs::read(&envelope).expect("preserved"), original);
 }

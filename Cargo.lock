@@ -215,6 +215,7 @@ dependencies = [
  "mida-disasm",
  "pelite",
  "serde_json",
+ "sha2",
  "thiserror",
  "tracing",
  "windows",

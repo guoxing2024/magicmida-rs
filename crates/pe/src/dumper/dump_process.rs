@@ -817,12 +817,12 @@ pub fn dump_process(
     let read = debugger
         .read_memory(opts.image_base as usize, &mut dump_buf)
         .map_err(|e| PeError::Parse(format!("Failed to read dump image: {e}")))?;
+    // Fail-closed: incomplete image must not become a managed candidate
+    // (zero-filled holes previously continued to emit + bound manifest).
     if read < dump_size {
-        warn!(
-            expected = dump_size,
-            actual = read,
-            "Short read on dump image"
-        );
+        return Err(PeError::Parse(format!(
+            "Short read on dump image: got {read:#x} bytes, need {dump_size:#x}"
+        )));
     }
 
     // GTO/AHK experimental stages are gated by DumpProfile (default OreansClassic).
@@ -897,11 +897,17 @@ pub fn dump_process(
     // Only when MIDA_GTO_NO_BYPASS=1 (root-cause measurement). Default (bypass)
     // path skips slab to avoid rebase false-positives regressing the working
     // r26b NewClassName path.
+    // Capture-class transforms (taxonomy v1 §4.3) — recorded for bound manifest.
+    let mut capture_transforms: Vec<(&'static str, &'static str)> = Vec::new();
+
     let heap_slab = if no_bypass && stage_plan.detect_heap_globals {
         super::heap_global_snapshot::capture_heap_slab(&heap_globals, debugger)
     } else {
         None
     };
+    if heap_slab.is_some() {
+        capture_transforms.push(("heap_slab_restore", "capture"));
+    }
     // Cookie + complement RVAs must be captured before early overlay zeros storage.
     // Prefer authoritative site from offline CRT resolve; never fuzzy-rescan when set.
     // B7.2.1: authority resolve/validation failure is a hard dump error (no structural success).
@@ -963,24 +969,36 @@ pub fn dump_process(
             changed_bytes = overlay.changed_bytes,
             "Applied early section snapshot overlay"
         );
+        capture_transforms.push(("early_section_overlay", "capture"));
     }
 
     // Scrub any remaining process-local absolute pointers and encoded
     // container triples that survived the early overlay (polluted baseline).
-    super::data_reinit::reinitialize_zero_filled_data(
-        &pe,
-        &mut dump_buf,
-        opts.executable_path.as_deref(),
-    );
+    // r27 round 6: when MIDA_GTO_NO_BYPASS=1 (VM re-executes), skip .data scrub.
+    // The VM initializes .data itself; scrubbing zeros values the VM needs.
+    let no_bypass = std::env::var("MIDA_GTO_NO_BYPASS").ok().as_deref() == Some("1");
+    if !no_bypass {
+        super::data_reinit::reinitialize_zero_filled_data(
+            &pe,
+            &mut dump_buf,
+            opts.executable_path.as_deref(),
+        );
+    } else {
+        info!("R-GTO-UI r27: skipping .data scrub (NO_BYPASS — VM re-executes, initializes .data itself)");
+    }
 
     // R-GTO-UI round 5/7: re-init CRITICAL_SECTION objects in `.data` whose
     // captured lock state (zeroed/stale) would AV/deadlock
     // `RtlEnterCriticalSection` when WinMain re-enters them. Driven by
     // `DumpCapturePolicy::cs_reinit_rvas`.
-    super::data_reinit::reinit_critical_sections(
-        &mut dump_buf,
-        &capture_policy.cs_reinit_rvas,
-    );
+    if !capture_policy.cs_reinit_rvas.is_empty() {
+        super::data_reinit::reinit_critical_sections(
+            &mut dump_buf,
+            &capture_policy.cs_reinit_rvas,
+        );
+        // Sample-policy CS list → disclose (taxonomy: pe_repair / cs_reinit).
+        capture_transforms.push(("cs_reinit", "pe_repair"));
+    }
 
     if let Some(n) = cmd_table_count {
         let off = 0x147888usize;
@@ -1098,25 +1116,30 @@ pub fn dump_process(
         let virtual_alloc_iat = import_builder
             .as_ref()
             .and_then(|b| b.find_function_iat("VirtualAlloc"));
-        import_builder
-            .as_ref()
-            .and_then(|builder| {
-                super::heap_bootstrap::install_heap_bootstrap(
-                    &mut pe,
-                    &mut dump_buf,
-                    builder,
-                    opts.entry_point,
-                    &containers,
-                    &heap_globals,
-                    heap_slab.as_ref(),
-                    virtual_alloc_iat,
-                    opts.container_restore,
-                    cookie_rva,
-                    cookie_mirror,
-                    Some(debugger),
-                )
-            })
-            .unwrap_or(opts.entry_point)
+        match import_builder.as_ref().and_then(|builder| {
+            super::heap_bootstrap::install_heap_bootstrap(
+                &mut pe,
+                &mut dump_buf,
+                builder,
+                opts.entry_point,
+                &containers,
+                &heap_globals,
+                heap_slab.as_ref(),
+                virtual_alloc_iat,
+                opts.container_restore,
+                cookie_rva,
+                cookie_mirror,
+                Some(debugger),
+            )
+        }) {
+            Some(ep) => {
+                // Bootstrap may run without a heap slab; disclose separately from
+                // `heap_slab_restore` (taxonomy capture class; audit P1).
+                capture_transforms.push(("heap_bootstrap", "capture"));
+                ep
+            }
+            None => opts.entry_point,
+        }
     } else {
         opts.entry_point
     };
@@ -1328,24 +1351,44 @@ pub fn dump_process(
         )?
     };
 
-    // R-GTO-UI r22/r25/r26: WinMain UI resume patches (combined).
-    // 1) Skip LoadFile re-entry @0x63f4 (host-path reload AVs).
-    // 2) Force non-empty class check @0x34dbb AND lpszClassName @0x34ed4
-    //    → NewClassName (r25b regressed by doing only 34ed4).
-    // 3) Skip crashing 0x35520 but keep msg pump 0x1b10 (@0x6757).
-    // R-GTO-UI r26b/r27: MIDA_GTO_NO_BYPASS=1 disables ALL 5 bypass patches
-    // to measure the real heap/script-resume crash point (perfect-unpack
-    // root-cause diagnosis; candidate will NOT show NewClassName).
-    if !no_bypass {
+    // Verify AddressOfEntryPoint only (OptionalHeader + 16). Never use
+    // e_lfanew+24+SizeOfOptionalHeader — that lands on the section table and
+    // writing there corrupts the first section's SizeOfRawData (audit P0).
+    if output_entry_point != 0 {
+        if let Some(file_ep) = read_address_of_entry_point(&out_data) {
+            if file_ep != output_entry_point {
+                warn!(
+                    file_ep = format_args!("{file_ep:#x}"),
+                    expected = format_args!("{output_entry_point:#x}"),
+                    "AddressOfEntryPoint mismatch after serialize — correcting"
+                );
+                patch_address_of_entry_point(&mut out_data, output_entry_point);
+            }
+        }
+    }
+
+    // GTO sample-specific diagnostic bypasses. HARD GATED:
+    // - only DumpProfile::AhkGtoExperimental (never OreansClassic / generic)
+    // - only when MIDA_GTO_BYPASS=1 (opt-in; default OFF)
+    // Products with these patches are diagnostic-only and must not be Accepted
+    // as behavior-equivalent (see PROJECT_GOAL / audit P1).
+    let gto_bypass = matches!(opts.profile, crate::DumpProfile::AhkGtoExperimental)
+        && std::env::var("MIDA_GTO_BYPASS").ok().as_deref() == Some("1");
+    // In-memory transform list for post-write fail-closed artifact manifest.
+    // Start from capture-class rows recorded earlier (taxonomy v1 §4.3).
+    let mut applied_transforms: Vec<(&'static str, &'static str)> = capture_transforms;
+    if gto_bypass {
+        warn!("R-GTO-UI: MIDA_GTO_BYPASS=1 — applying diagnostic sample patches (NOT product-Accepted)");
         patch_gto_skip_loadfile_reentry(&mut out_data);
         patch_gto_registerclass_classname(&mut out_data);
         patch_gto_skip_msgloop_crash(&mut out_data);
-        // R-GTO-UI r26b: WinMain MessageBoxW @0x5c5d blocks cold start before
-        // RegisterClass; window probe never dismisses it (only sees #32770).
-        // Protected product does not surface this gate; skip like diagnostic mb_nop.
         patch_gto_skip_winmain_messagebox(&mut out_data);
-    } else {
-        info!("R-GTO-UI r27: MIDA_GTO_NO_BYPASS=1 — all 5 bypass patches DISABLED (root-cause measurement)");
+        applied_transforms.extend_from_slice(&[
+            ("gto_bypass_loadfile", "sample_bypass"),
+            ("gto_bypass_registerclass", "sample_bypass"),
+            ("gto_bypass_msgloop", "sample_bypass"),
+            ("gto_bypass_messagebox", "sample_bypass"),
+        ]);
     }
 
     // DEBUG: Verify section 1 characteristics
@@ -1366,7 +1409,45 @@ pub fn dump_process(
         crate::postprocess::build_relocation_table(&mut out_data, None, is_64bit)?;
     }
 
-    std::fs::write(&opts.output_path, &out_data)?;
+    // Refuse to clobber the protected input when output path aliases it (audit P1).
+    if let Some(src) = opts.executable_path.as_deref() {
+        if output_aliases_input(src, &opts.output_path) {
+            return Err(PeError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "refusing to overwrite input '{}' with dump output",
+                    src.display()
+                ),
+            )));
+        }
+    }
+
+    // Atomic-ish emit: write exclusive temp beside target, re-check alias on
+    // the temp identity path, then rename. Narrows check→write TOCTOU where
+    // a hard link can be planted after the alias probe (audit residual).
+    write_output_atomic(&opts.output_path, &out_data, opts.executable_path.as_deref())?;
+
+    // Always emit a bound transform manifest (empty ledger for clean dumps) so
+    // stale sibling manifests from prior bypass runs cannot poison clean re-runs,
+    // and acceptance can require the file by default (audit residual).
+    if let Err(e) = write_bound_transform_manifest(
+        &opts.output_path,
+        &out_data,
+        &applied_transforms,
+        opts.executable_path.as_deref(),
+    ) {
+        // Fail-closed cleanup must not be best-effort: report residual paths.
+        let cleanup = remove_dump_and_manifest(&opts.output_path);
+        return Err(match cleanup {
+            Ok(()) => e,
+            Err(ce) => PeError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!(
+                    "transform_manifest failed ({e}); also failed to remove residual dump/manifest: {ce}"
+                ),
+            )),
+        });
+    }
 
     info!(
         path = %opts.output_path.display(),
@@ -1857,6 +1938,332 @@ fn rva_to_file_offset(image: &[u8], rva: u32) -> Option<usize> {
     None
 }
 
+/// File offset of OptionalHeader.AddressOfEntryPoint (PE32/PE32+ both at +16).
+fn address_of_entry_point_file_offset(image: &[u8]) -> Option<usize> {
+    if image.len() < 0x40 {
+        return None;
+    }
+    let e_lfanew = u32::from_le_bytes(image.get(0x3c..0x40)?.try_into().ok()?) as usize;
+    // COFF starts at e_lfanew+4; OptionalHeader at e_lfanew+24; AddressOfEntryPoint at +16.
+    let off = e_lfanew.checked_add(24 + 16)?;
+    if off + 4 > image.len() {
+        return None;
+    }
+    // Sanity: SizeOfOptionalHeader must cover AddressOfEntryPoint.
+    let soh = u16::from_le_bytes(image.get(e_lfanew + 20..e_lfanew + 22)?.try_into().ok()?) as usize;
+    if soh < 20 {
+        return None;
+    }
+    Some(off)
+}
+
+fn read_address_of_entry_point(image: &[u8]) -> Option<u32> {
+    let off = address_of_entry_point_file_offset(image)?;
+    Some(u32::from_le_bytes(image.get(off..off + 4)?.try_into().ok()?))
+}
+
+fn patch_address_of_entry_point(image: &mut [u8], ep: u32) -> bool {
+    let Some(off) = address_of_entry_point_file_offset(image) else {
+        return false;
+    };
+    image[off..off + 4].copy_from_slice(&ep.to_le_bytes());
+    true
+}
+
+/// True when dump output would clobber the protected source image.
+/// Uses path, canonical path, and Windows volume+file-index identity (hard links).
+fn output_aliases_input(input: &Path, output: &Path) -> bool {
+    if input == output {
+        return true;
+    }
+    let a = std::fs::canonicalize(input).ok();
+    let b = std::fs::canonicalize(output).ok();
+    if let (Some(ref ac), Some(ref bc)) = (a, b) {
+        if ac == bc
+            || ac
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&bc.to_string_lossy())
+        {
+            return true;
+        }
+    }
+    if let (Ok(ia), Ok(ib)) = (file_identity(input), file_identity(output)) {
+        if ia == ib {
+            return true;
+        }
+    }
+    input
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&output.to_string_lossy())
+}
+
+#[cfg(windows)]
+fn file_identity(path: &Path) -> std::io::Result<(u32, u64)> {
+    use std::fs::OpenOptions;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    let file = OpenOptions::new()
+        .read(true)
+        .share_mode(0x7)
+        .open(path)?;
+    #[repr(C)]
+    #[derive(Default)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+    #[repr(C)]
+    #[derive(Default)]
+    struct ByHandleFileInformation {
+        file_attributes: u32,
+        creation_time: FileTime,
+        last_access_time: FileTime,
+        last_write_time: FileTime,
+        volume_serial_number: u32,
+        file_size_high: u32,
+        file_size_low: u32,
+        number_of_links: u32,
+        file_index_high: u32,
+        file_index_low: u32,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFileInformationByHandle(
+            file: *mut std::ffi::c_void,
+            information: *mut ByHandleFileInformation,
+        ) -> i32;
+    }
+    let mut info = ByHandleFileInformation::default();
+    // SAFETY: handle owned by file; info is valid out-buffer.
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let index = (u64::from(info.file_index_high) << 32) | u64::from(info.file_index_low);
+    Ok((info.volume_serial_number, index))
+}
+
+#[cfg(not(windows))]
+fn file_identity(_path: &Path) -> std::io::Result<(u32, u64)> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "file identity only on Windows",
+    ))
+}
+
+fn candidate_sha256_hex(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let dig = Sha256::digest(data);
+    let mut s = String::with_capacity(64);
+    for b in dig {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+fn transform_manifest_path(output: &Path) -> std::path::PathBuf {
+    output.with_extension("transform_manifest.json")
+}
+
+/// Remove dump + sibling manifest; surface any residual paths (not best-effort).
+fn remove_dump_and_manifest(output: &Path) -> Result<(), String> {
+    let mut residuals = Vec::new();
+    if output.exists() {
+        if let Err(e) = std::fs::remove_file(output) {
+            residuals.push(format!("{} ({e})", output.display()));
+        }
+    }
+    let m = transform_manifest_path(output);
+    if m.exists() {
+        if let Err(e) = std::fs::remove_file(&m) {
+            residuals.push(format!("{} ({e})", m.display()));
+        }
+    }
+    if residuals.is_empty() {
+        Ok(())
+    } else {
+        Err(residuals.join("; "))
+    }
+}
+
+/// Bound artifact manifest: candidate digest + transforms.
+/// Always written (empty entries for clean dumps). Fail-closed.
+fn write_bound_transform_manifest(
+    output: &Path,
+    candidate_bytes: &[u8],
+    transforms: &[(&str, &str)],
+    input: Option<&Path>,
+) -> Result<(), PeError> {
+    // Taxonomy: docs/TRANSFORM_TAXONOMY_V1.md — empty entries = standard
+    // reconstruction only; sample_bypass ids must appear when GTO bypass runs.
+    const TAXONOMY: &str = "mida.transform-taxonomy/v1";
+    let sha = candidate_sha256_hex(candidate_bytes);
+    let path = transform_manifest_path(output);
+    if let Some(src) = input {
+        if output_aliases_input(src, &path) {
+            return Err(PeError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "refusing to write transform_manifest over input alias '{}'",
+                    src.display()
+                ),
+            )));
+        }
+    }
+    let mut entries = String::new();
+    for (i, (id, kind)) in transforms.iter().enumerate() {
+        if i > 0 {
+            entries.push(',');
+        }
+        entries.push_str(&format!(
+            r#"{{"id":"{id}","kind":"{kind}","equivalence_rule":null}}"#
+        ));
+    }
+    let note = if transforms.is_empty() {
+        "clean dump — empty ledger (standard reconstruction only per taxonomy v1)"
+    } else {
+        "diagnostic transforms — blocks product Accepted unless registered rule"
+    };
+    let body = format!(
+        concat!(
+            "{{\n",
+            "  \"schema_version\": \"mida.transform-manifest/v0\",\n",
+            "  \"taxonomy_version\": \"{taxonomy}\",\n",
+            "  \"candidate_sha256\": \"{sha}\",\n",
+            "  \"candidate_size_bytes\": {size},\n",
+            "  \"entries\": [{entries}],\n",
+            "  \"note\": \"{note}\"\n",
+            "}}\n"
+        ),
+        taxonomy = TAXONOMY,
+        sha = sha,
+        size = candidate_bytes.len(),
+        entries = entries,
+        note = note
+    );
+    replace_file_atomic(&path, body.as_bytes(), input)?;
+    info!(
+        path = %path.display(),
+        sha256 = %sha,
+        transforms = transforms.len(),
+        "wrote bound transform_manifest"
+    );
+    Ok(())
+}
+
+fn write_output_atomic(
+    output: &Path,
+    data: &[u8],
+    input: Option<&Path>,
+) -> Result<(), PeError> {
+    replace_file_atomic(output, data, input)
+}
+
+/// Exclusive temp + replace destination without delete-then-rename gap.
+/// Windows: `MoveFileExW(REPLACE_EXISTING | WRITE_THROUGH)`. Elsewhere: rename
+/// onto non-existing path only (no silent copy).
+fn replace_file_atomic(
+    output: &Path,
+    data: &[u8],
+    input: Option<&Path>,
+) -> Result<(), PeError> {
+    if let Some(src) = input {
+        if output_aliases_input(src, output) {
+            return Err(PeError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "refusing to overwrite input '{}' with output",
+                    src.display()
+                ),
+            )));
+        }
+    }
+
+    let parent = output.parent().unwrap_or_else(|| Path::new("."));
+    let stem = output
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("out.bin");
+    let tmp_name = format!(
+        ".{stem}.mida.tmp.{}.{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let tmp_path = parent.join(tmp_name);
+
+    {
+        use std::io::Write;
+        let write_tmp = (|| -> Result<(), PeError> {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)
+                .map_err(PeError::Io)?;
+            f.write_all(data).map_err(PeError::Io)?;
+            f.sync_all().map_err(PeError::Io)?;
+            Ok(())
+        })();
+        if let Err(e) = write_tmp {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e);
+        }
+    }
+
+    // Re-check alias after temp is fully written.
+    if let Some(src) = input {
+        if output_aliases_input(src, output) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(PeError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "output aliases input before replace",
+            )));
+        }
+    }
+
+    let replace_result = replace_via_os(&tmp_path, output);
+    if replace_result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    replace_result
+}
+
+#[cfg(windows)]
+fn replace_via_os(tmp: &Path, output: &Path) -> Result<(), PeError> {
+    use std::os::windows::ffi::OsStrExt;
+    // MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH | MOVEFILE_COPY_ALLOWED=0
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
+    }
+    let existing: Vec<u16> = tmp.as_os_str().encode_wide().chain(Some(0)).collect();
+    let new_name: Vec<u16> = output.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: null-terminated wide paths; kernel32 MoveFileExW.
+    let ok = unsafe {
+        MoveFileExW(
+            existing.as_ptr(),
+            new_name.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if ok == 0 {
+        return Err(PeError::Io(std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_via_os(tmp: &Path, output: &Path) -> Result<(), PeError> {
+    if output.exists() {
+        std::fs::remove_file(output).map_err(PeError::Io)?;
+    }
+    std::fs::rename(tmp, output).map_err(PeError::Io)
+}
+
 
 #[cfg(test)]
 mod overlay_tests {
@@ -1943,16 +2350,19 @@ mod overlay_tests {
 
 /// Dump a .NET assembly from the target process.
 ///
-/// .NET assemblies don't need import table reconstruction — the CLR handles
-/// method resolution at runtime.  This simply reads the dump image, trims
-/// oversized sections, and writes the output.
+/// Dump a .NET assembly with **required** protected-input path for alias checks.
 ///
-/// Corresponds to `TDumperDotnet.DumpToFile` in `Dumper.pas`.
-pub fn dump_dotnet(
+/// `entry_point_rva` is written directly to `AddressOfEntryPoint` (it is already
+/// an RVA — do **not** subtract `image_base` again; audit residual P1).
+///
+/// Production callers must pass the protected source path. There is no
+/// source-less public wrapper (audit residual P2).
+pub fn dump_dotnet_with_source(
     debugger: &mut dyn mida_core::DebuggerCore,
     image_base: u64,
-    entry_point: u32,
+    entry_point_rva: u32,
     output_path: &Path,
+    source_path: &Path,
 ) -> Result<(), PeError> {
     // Read PE headers
     let mut header = vec![0u8; 0x1000];
@@ -1992,17 +2402,21 @@ pub fn dump_dotnet(
     let read = debugger
         .read_memory(image_base as usize, &mut buf)
         .map_err(|e| PeError::Parse(format!("Failed to read .NET image: {e}")))?;
+    // Fail-closed: truncated image must not become a managed candidate.
+    if read < dump_size_usize {
+        return Err(PeError::Parse(format!(
+            "Short read on .NET image: got {read:#x} bytes, need {dump_size_usize:#x}"
+        )));
+    }
 
-    // Sanitize and write
     pe.sanitize();
 
-    // Rename first section to .text
     if !pe.sections.is_empty() {
         pe.rename_section(0, ".text");
     }
 
     let mut out_data = Vec::new();
-    out_data.extend_from_slice(&buf[..dump_size_usize.min(read)]);
+    out_data.extend_from_slice(&buf[..dump_size_usize]);
 
     // Pad to file alignment if needed
     let mut physical_size = dump_size;
@@ -2011,20 +2425,47 @@ pub fn dump_dotnet(
         out_data.resize(physical_size as usize, 0);
     }
 
-    // Update size of image
     let mut image_size = physical_size;
     pe.section_align(&mut image_size);
     pe.nt_headers.optional_header.size_of_image = image_size;
 
-    // Update entry point
-    let ep_rva = entry_point - image_base as u32;
-    pe.nt_headers.optional_header.address_of_entry_point = ep_rva;
+    // entry_point_rva is already RVA (PeHeader::entry_point) — write as-is.
+    pe.nt_headers.optional_header.address_of_entry_point = entry_point_rva;
 
-    // Write headers
+    // Headers must overwrite file offset 0 — never append (audit residual).
     let header_data = pe.serialize_headers()?;
-    out_data.extend_from_slice(&header_data);
+    if header_data.len() > out_data.len() {
+        out_data.resize(header_data.len(), 0);
+    }
+    out_data[..header_data.len()].copy_from_slice(&header_data);
 
-    std::fs::write(output_path, &out_data)?;
+    if output_aliases_input(source_path, output_path) {
+        return Err(PeError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to overwrite input '{}' with .NET dump",
+                source_path.display()
+            ),
+        )));
+    }
+
+    write_output_atomic(output_path, &out_data, Some(source_path))?;
+
+    // Always emit bound manifest (empty ledger) — same contract as native dump.
+    if let Err(e) =
+        write_bound_transform_manifest(output_path, &out_data, &[], Some(source_path))
+    {
+        let cleanup = remove_dump_and_manifest(output_path);
+        return Err(match cleanup {
+            Ok(()) => e,
+            Err(ce) => PeError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!(
+                    ".NET transform_manifest failed ({e}); residual cleanup failed: {ce}"
+                ),
+            )),
+        });
+    }
 
     info!(
         path = %output_path.display(),
@@ -2508,6 +2949,60 @@ mod edata_relocation_tests {
         let err2 = relocate_export_table_rvas(&mut buf2, ORIGINAL_EXPORT_RVA, 32, 0)
             .expect_err("export_size < 40 must be rejected at delta=0 too");
         assert!(format!("{err2}").contains("declared export_size (32)"));
+    }
+
+    /// Callers must pass `PeHeader::entry_point` (RVA). Subtracting ImageBase
+    /// as u32 saturates typical PE32+ bases to 0 (audit residual P1).
+    #[test]
+    fn dotnet_entry_point_rva_must_not_subtract_image_base() {
+        let rva = 0x1000u32;
+        let image_base = 0x1400_0000_0u64;
+        let wrong = rva.saturating_sub(image_base as u32);
+        assert_eq!(wrong, 0, "VA-style subtract corrupts OEP to 0");
+        // Production writes entry_point_rva into optional_header then serialize_headers.
+        // serialize_headers emits NT headers starting at offset 0 (no DOS stub).
+        let mut pe = pe_with_text_section(0x1000, 0x200);
+        pe.nt_headers.optional_header.address_of_entry_point = rva;
+        pe.entry_point = rva;
+        let nt = pe.serialize_headers().expect("serialize");
+        // NT layout: sig@0, COFF@4, OptionalHeader@24, AddressOfEntryPoint@40.
+        let written = u32::from_le_bytes(nt[40..44].try_into().unwrap());
+        assert_eq!(written, 0x1000, "serialized OEP must be the RVA, not 0");
+    }
+
+    /// AddressOfEntryPoint lives at OptionalHeader+16 — NEVER at
+    /// e_lfanew+24+SizeOfOptionalHeader (that is the first section header).
+    #[test]
+    fn address_of_entry_point_offset_is_not_section_table() {
+        // Minimal PE32+ headers: DOS + PE sig + COFF + optional (0xF0) + 1 section.
+        let e_lfanew = 0x80usize;
+        let soh = 0xF0usize;
+        let mut image = vec![0u8; e_lfanew + 24 + soh + 40];
+        image[0] = b'M';
+        image[1] = b'Z';
+        image[0x3c..0x40].copy_from_slice(&(e_lfanew as u32).to_le_bytes());
+        image[e_lfanew..e_lfanew + 4].copy_from_slice(&0x0000_4550u32.to_le_bytes()); // PE\0\0
+        image[e_lfanew + 6..e_lfanew + 8].copy_from_slice(&1u16.to_le_bytes()); // NumberOfSections
+        image[e_lfanew + 20..e_lfanew + 22].copy_from_slice(&(soh as u16).to_le_bytes());
+        // OptionalHeader magic PE32+
+        image[e_lfanew + 24..e_lfanew + 26].copy_from_slice(&0x20Bu16.to_le_bytes());
+        let expected_ep = 0x00ABu32;
+        image[e_lfanew + 24 + 16..e_lfanew + 24 + 20].copy_from_slice(&expected_ep.to_le_bytes());
+        // Poison first section SizeOfRawData so a wrong offset would read it.
+        let sect0 = e_lfanew + 24 + soh;
+        let poison_raw = 0xDEAD_BEEFu32;
+        image[sect0 + 16..sect0 + 20].copy_from_slice(&poison_raw.to_le_bytes());
+
+        let off = super::address_of_entry_point_file_offset(&image).expect("ep off");
+        assert_eq!(off, e_lfanew + 24 + 16);
+        assert_ne!(off, sect0 + 16, "must not land on section SizeOfRawData");
+        assert_eq!(super::read_address_of_entry_point(&image), Some(expected_ep));
+
+        assert!(super::patch_address_of_entry_point(&mut image, 0x1234_5678));
+        assert_eq!(super::read_address_of_entry_point(&image), Some(0x1234_5678));
+        // Section SizeOfRawData must be untouched.
+        let raw_after = u32::from_le_bytes(image[sect0 + 16..sect0 + 20].try_into().unwrap());
+        assert_eq!(raw_after, poison_raw);
     }
 
     /// Production path: `create_edata_section` must propagate the short-

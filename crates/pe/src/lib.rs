@@ -43,7 +43,7 @@ pub use byte_map::{
     MapDirectoryHints,
 };
 pub use dumper::{
-    dump_dotnet, dump_process, emit_pure_rebuild, emit_pure_rebuild_with_parity,
+    dump_dotnet_with_source, dump_process, emit_pure_rebuild, emit_pure_rebuild_with_parity,
     get_original_imports, is_dotnet, plan_from_host_dump, rebuild_import_table,
     ContainerRestoreMode, DumpCapturePolicy, DumpOptions, DumpProfile, DumpProfileCapabilities,
     EarlySectionSnapshot, ExperimentalStagePlan, OepPolicy, PureRebuildEmitOptions,

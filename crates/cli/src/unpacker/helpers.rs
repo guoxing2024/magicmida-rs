@@ -49,11 +49,26 @@ fn exe_dir() -> PathBuf {
 /// Compute the output path, using the Pascal "U" suffix convention.
 ///
 /// Example: `test.exe` → `testU.exe`, `lib.dll` → `libU.dll`.
+///
+/// If `output` is provided and resolves to the same path as `input`
+/// (same file / hard-link alias where detectable), fall back to the
+/// `U` suffix so dump never clobbers the protected original (audit P1).
 pub(super) fn resolve_output_path(input: &Path, output: Option<&Path>) -> PathBuf {
     if let Some(out) = output {
+        if paths_alias_same_file(input, out) {
+            tracing::warn!(
+                input = %input.display(),
+                output = %out.display(),
+                "--output aliases input; refusing overwrite — using U-suffix path"
+            );
+            return default_u_suffix_path(input);
+        }
         return out.to_path_buf();
     }
+    default_u_suffix_path(input)
+}
 
+fn default_u_suffix_path(input: &Path) -> PathBuf {
     let stem = input
         .file_stem()
         .and_then(|s| s.to_str())
@@ -67,6 +82,90 @@ pub(super) fn resolve_output_path(input: &Path, output: Option<&Path>) -> PathBu
     name.push_str(ext);
 
     input.parent().unwrap_or(Path::new(".")).join(&name)
+}
+
+/// Best-effort same-file check: path, canonical path, and Windows file identity
+/// (volume serial + file index) so NTFS hard links are detected (audit residual).
+fn paths_alias_same_file(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    let a_c = std::fs::canonicalize(a).ok();
+    let b_c = std::fs::canonicalize(b).ok();
+    if let (Some(ref ac), Some(ref bc)) = (a_c.as_ref(), b_c.as_ref()) {
+        if ac == bc {
+            return true;
+        }
+        let as_ = ac.to_string_lossy().to_ascii_lowercase();
+        let bs = bc.to_string_lossy().to_ascii_lowercase();
+        if as_ == bs {
+            return true;
+        }
+    }
+    if let (Ok(ia), Ok(ib)) = (windows_file_identity(a), windows_file_identity(b)) {
+        if ia == ib {
+            return true;
+        }
+    }
+    let as_ = a.to_string_lossy().to_ascii_lowercase();
+    let bs = b.to_string_lossy().to_ascii_lowercase();
+    as_ == bs
+}
+
+#[cfg(windows)]
+fn windows_file_identity(path: &Path) -> std::io::Result<(u32, u64)> {
+    use std::fs::OpenOptions;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    // FILE_SHARE_READ|WRITE|DELETE so we don't block other openers.
+    let file = OpenOptions::new()
+        .read(true)
+        .share_mode(0x7)
+        .open(path)?;
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+    #[repr(C)]
+    #[derive(Default)]
+    struct ByHandleFileInformation {
+        file_attributes: u32,
+        creation_time: FileTime,
+        last_access_time: FileTime,
+        last_write_time: FileTime,
+        volume_serial_number: u32,
+        file_size_high: u32,
+        file_size_low: u32,
+        number_of_links: u32,
+        file_index_high: u32,
+        file_index_low: u32,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFileInformationByHandle(
+            file: *mut std::ffi::c_void,
+            information: *mut ByHandleFileInformation,
+        ) -> i32;
+    }
+    let mut info = ByHandleFileInformation::default();
+    // SAFETY: handle owned by `file`; info is valid out-buffer.
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let index = (u64::from(info.file_index_high) << 32) | u64::from(info.file_index_low);
+    Ok((info.volume_serial_number, index))
+}
+
+#[cfg(not(windows))]
+fn windows_file_identity(_path: &Path) -> std::io::Result<(u32, u64)> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "file identity only on Windows",
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -198,10 +297,13 @@ pub(super) fn pe_section_name_remote_rva(
 
 /// Dump a .NET + Themida binary via raw memory dump at the _CorExeMain
 /// breakpoint.
+///
+/// `input` is the protected source path used for alias / TOCTOU checks on emit.
 pub(super) fn dotnet_dump_and_dump_output(
     dbg: &mut ProcessSession,
     image_base: usize,
     output_path: &Path,
+    input: &Path,
 ) -> Result<(), anyhow::Error> {
     let mut header_buf = vec![0u8; 0x1000];
     let read = dbg
@@ -212,10 +314,17 @@ pub(super) fn dotnet_dump_and_dump_output(
     }
 
     let live_pe = mida_pe::PeHeader::from_bytes(&header_buf)?;
-    let entry_point = live_pe.entry_point;
+    // PeHeader::entry_point is already an RVA — pass through unchanged.
+    let entry_point_rva = live_pe.entry_point;
 
-    mida_pe::dump_dotnet(dbg, image_base as u64, entry_point, output_path)
-        .map_err(|e| anyhow!(".NET dump failed: {e}"))
+    mida_pe::dump_dotnet_with_source(
+        dbg,
+        image_base as u64,
+        entry_point_rva,
+        output_path,
+        input,
+    )
+    .map_err(|e| anyhow!(".NET dump failed: {e}"))
 }
 
 // ---------------------------------------------------------------------------

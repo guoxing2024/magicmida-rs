@@ -154,19 +154,51 @@ change that must repopulate this array and update this document.
 - Behavioral equivalence scoring
 - Production release gates beyond structural MVP
 
-## Behavioral path (B-A2 compose; no VNEXT-BEH gate)
+## Behavioral path (B-A2 compose; managed candidate)
 
 Structural gates remain as specified above. **B-A2** composes **pre-recorded**
 behavioral evidence with a structural pass to allow `Accepted` on the explicit
 path only. Details:
 [VNEXT_BEHAVIORAL_PATH.md](VNEXT_BEHAVIORAL_PATH.md).
 
-Until a scheduled **VNEXT-BEH** gate closes:
+### Managed vs unmanaged
+
+| Path | API / CLI | Max verdict |
+|------|-----------|-------------|
+| Unmanaged | `check_with_behavior` / `--allow-unmanaged-candidate` | `StructuralPassBehaviorPending` |
+| Managed | sibling `*.transform_manifest.json` + `VerifiedManagedCandidate::verify` + `check_with_behavior_managed` | `Accepted` possible |
+
+Product `Accepted` additionally requires:
+
+1. Registered product probe id (not `load_no_crash_v0`).
+2. Bilateral / protected reference with digest.
+3. Transform ledger consistent with dump-side manifest (manifest is authoritative).
+4. Transform entries either empty (clean standard reconstruction) or covered by
+   registered `(id, kind, rule)` triples — see
+   [TRANSFORM_TAXONOMY_V1.md](TRANSFORM_TAXONOMY_V1.md).
+5. **Authenticity (CLI default):** product `Accepted` on
+   `check-with-behavior` requires a verified `SignatureEnvelope` with a
+   **non-caller-controlled** trust root via `check_with_behavior_signed`
+   (evidence sealed inside the bundle from hashed JSON). Missing envelope →
+   managed compose is **capped** at `StructuralPassBehaviorPending` unless
+   `--allow-unsigned-managed` (lab only). Caller-supplied HMAC requires
+   `--allow-hmac-lab` and is **not** product authenticity. Ed25519 fixed
+   allowlist is reserved / not yet shipped. Dumper never self-signs.
+
+`sample_bypass` transforms (e.g. GTO fixed-RVA patches) **block** product Accept.
+Capture-class ledger rows without registered rules also **block** Accept.
+
+Library note: `check_with_behavior_managed` may still return `Accepted` without
+an envelope (unit tests / internal). **CLI product posture** is the signed path.
+
+Until a scheduled **VNEXT-BEH** gate closes **and** Ed25519 CI keys ship:
 
 1. `check-static` / `check_static` must never return `Accepted`.
 2. Evidence files alone do not change `check-static` results.
 3. Probes run **outside** the acceptance crate; the kernel only validates
-   evidence identity binding and composition on `check-with-behavior`.
+   evidence identity binding and composition on `check-with-behavior*`.
 4. Default product path remains structural Pending; pure default flip is
    independent of this compose path.
+5. Lab scripts may use `--allow-unsigned-managed` or `--allow-hmac-lab`; those
+   flags are **not** product release claims.
 

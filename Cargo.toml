@@ -9,6 +9,19 @@ members = [
     "crates/cli",
     "crates/acceptance",
 ]
+# Research-only; own Cargo.toml pins (no workspace inherit). Build with a
+# separate research workspace or after moving out of tree — not via root members.
+exclude = ["crates/bwhook"]
+default-members = [
+    "crates/core",
+    "crates/pe",
+    "crates/disasm",
+    "crates/tracer",
+    "crates/packers/themida",
+    "crates/packers/ahk_gto",
+    "crates/cli",
+    "crates/acceptance",
+]
 resolver = "2"
 
 [workspace.package]

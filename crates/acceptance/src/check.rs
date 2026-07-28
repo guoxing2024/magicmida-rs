@@ -1,10 +1,11 @@
 //! Top-level static acceptance evaluation (+ optional behavioral compose, B-A2).
 
-use crate::behavior::{compose_with_behavior, BehaviorEvidence};
+use crate::behavior::{compose_with_behavior, BehaviorEvidence, VerifiedManagedCandidate};
+use crate::envelope::VerifiedSignedBundle;
 use crate::gates;
 use crate::identity::{ArtifactIdentity, IdentityError, ROLE_CANDIDATE};
 use crate::oracle::{observe_oracle, OracleObservation};
-use crate::report::{AcceptanceReport, FailureRecord, GateResult, GateStatus};
+use crate::report::{AcceptanceReport, FailureRecord, GateResult, GateStatus, WarningRecord};
 use crate::verdict::Verdict;
 use thiserror::Error;
 
@@ -72,15 +73,129 @@ pub fn check_static(bytes: &[u8], opts: &CheckStaticOptions) -> AcceptanceReport
 
 /// Static gates plus **pre-recorded** behavioral evidence (B-A2).
 ///
-/// This is the only library path that may return [`Verdict::Accepted`].
-/// `check_static` remains R0B-only (Accepted forbidden).
+/// **Unmanaged path** (no [`TransformManifest`]): may compose, but **never**
+/// upgrades to [`Verdict::Accepted`] — max
+/// [`Verdict::StructuralPassBehaviorPending`] (audit residual: library API
+/// must not bypass CLI manifest enforcement).
+///
+/// Prefer [`check_with_behavior_signed`] for product Accepted, or
+/// [`check_with_behavior_managed_lab`] for unsigned lab diagnostics.
 pub fn check_with_behavior(
     bytes: &[u8],
     opts: &CheckStaticOptions,
     evidence: &BehaviorEvidence,
 ) -> AcceptanceReport {
     let structural = check_static(bytes, opts);
-    compose_with_behavior(structural, evidence, bytes)
+    let mut report = compose_with_behavior(structural, evidence, bytes);
+    if report.verdict == Verdict::Accepted {
+        report.verdict = Verdict::StructuralPassBehaviorPending;
+        report.warnings.push(WarningRecord {
+            code: "unmanaged_candidate_no_accepted".to_string(),
+            message: "Accepted requires VerifiedSignedBundle (or explicit lab managed); \
+                 unmanaged library path capped at StructuralPassBehaviorPending"
+                .to_string(),
+        });
+    }
+    report
+}
+
+/// Managed compose **without** signature envelope.
+///
+/// Product posture: never returns [`Verdict::Accepted`] — capped at
+/// [`Verdict::StructuralPassBehaviorPending`]. Use
+/// [`check_with_behavior_signed`] for product Accept, or
+/// [`check_with_behavior_managed_lab`] for explicit unsigned lab Accept.
+pub fn check_with_behavior_managed(
+    bytes: &[u8],
+    opts: &CheckStaticOptions,
+    evidence: &BehaviorEvidence,
+    managed: &VerifiedManagedCandidate,
+) -> AcceptanceReport {
+    let mut report = compose_managed_uncapped(bytes, opts, evidence, managed);
+    if report.verdict == Verdict::Accepted {
+        report.verdict = Verdict::StructuralPassBehaviorPending;
+        report.warnings.push(WarningRecord {
+            code: "unsigned_managed_no_accepted".to_string(),
+            message: "Accepted requires VerifiedSignedBundle; unsigned managed library \
+                 path capped at StructuralPassBehaviorPending (use \
+                 check_with_behavior_managed_lab for lab-only Accept)"
+                .to_string(),
+        });
+    }
+    report
+}
+
+/// Lab-only: managed compose may return [`Verdict::Accepted`] without a
+/// signature envelope. **Not** product authenticity.
+pub fn check_with_behavior_managed_lab(
+    bytes: &[u8],
+    opts: &CheckStaticOptions,
+    evidence: &BehaviorEvidence,
+    managed: &VerifiedManagedCandidate,
+) -> AcceptanceReport {
+    let mut report = compose_managed_uncapped(bytes, opts, evidence, managed);
+    if report.verdict == Verdict::Accepted {
+        report.warnings.push(WarningRecord {
+            code: "unsigned_managed_lab_accept".to_string(),
+            message: "Accepted via check_with_behavior_managed_lab — lab diagnostic only, \
+                 not product authenticity"
+                .to_string(),
+        });
+    }
+    report
+}
+
+fn compose_managed_uncapped(
+    bytes: &[u8],
+    opts: &CheckStaticOptions,
+    evidence: &BehaviorEvidence,
+    managed: &VerifiedManagedCandidate,
+) -> AcceptanceReport {
+    // Defense: re-bind in case caller mismatched bytes vs verified handle.
+    if managed.candidate_sha256() != crate::identity::sha256_hex(bytes)
+        || managed.candidate_size_bytes() != bytes.len() as u64
+    {
+        let structural = check_static(bytes, opts);
+        let mut report = structural;
+        report.verdict = Verdict::Rejected;
+        report.failures.push(FailureRecord {
+            gate_id: "transform_manifest".to_string(),
+            code: "managed_candidate_bytes_mismatch".to_string(),
+            message: "VerifiedManagedCandidate does not match provided candidate bytes"
+                .to_string(),
+        });
+        return report;
+    }
+    let mut ev = evidence.clone();
+    if let Err(e) = managed.manifest().enforce_into_evidence(&mut ev, bytes) {
+        let structural = check_static(bytes, opts);
+        let mut report = structural;
+        report.verdict = Verdict::Rejected;
+        report.failures.push(FailureRecord {
+            gate_id: "transform_manifest".to_string(),
+            code: "manifest_enforce_failed".to_string(),
+            message: e.to_string(),
+        });
+        return report;
+    }
+    let structural = check_static(bytes, opts);
+    compose_with_behavior(structural, &ev, bytes)
+}
+
+/// Authenticated product path: requires a pre-verified [`VerifiedSignedBundle`]
+/// (envelope + managed manifest + **sealed** evidence). Dumper must never
+/// produce the signature; CI signs offline.
+///
+/// Evidence comes **only** from the bundle (parsed from hashed JSON at verify).
+/// Callers cannot inject a replacement evidence document (audit P0).
+///
+/// This is the **only** non-lab library path that may return [`Verdict::Accepted`].
+pub fn check_with_behavior_signed(
+    bytes: &[u8],
+    opts: &CheckStaticOptions,
+    signed: &VerifiedSignedBundle,
+) -> AcceptanceReport {
+    compose_managed_uncapped(bytes, opts, signed.evidence(), signed.managed())
 }
 
 fn report_identity_failure(

@@ -746,7 +746,20 @@ pub(super) fn handle_access_violation(
 
         if let Some(ref t) = ls.iat_trace {
             if t.current_slot >= t.total_slots {
-                info!("IAT tracing complete — exiting debug loop immediately");
+                if t.product_complete() {
+                    info!(
+                        "IAT tracing product-complete immediately (resolved={})",
+                        t.resolved_count
+                    );
+                } else {
+                    info!(
+                        "IAT walk finished immediately WITHOUT product-complete (resolved={} failed={} skipped={} aborted={:?})",
+                        t.resolved_count,
+                        t.failed_count,
+                        t.skip_count,
+                        t.abort_reason
+                    );
+                }
                 return Ok(AvAction::Break);
             }
         }

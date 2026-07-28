@@ -394,10 +394,13 @@ pub fn fix_iat_v3(
     let result = trace_imports(debugger, state, iat, main_thread_id, &log)?;
 
     info!(
-        "fix_iat_v3: {} resolved, {} failed ({} slots total)",
+        "fix_iat_v3: resolved={} failed={} skipped={} total={} aborted={} product_complete={}",
         result.resolved_count,
         result.failed_count,
-        iat.size / std::mem::size_of::<usize>(),
+        result.skip_count,
+        result.total_slots,
+        result.aborted,
+        result.is_product_complete(),
     );
 
     if !result.failed_slots.is_empty() {
@@ -407,22 +410,28 @@ pub fn fix_iat_v3(
         );
     }
 
-    // Fail-closed: incomplete IAT must not report success (caller skips dump).
-    gate_v3_trace_result(result.resolved_count, result.failed_count)
+    // Fail-closed: only product_complete may report success (audit residual).
+    gate_v3_trace_result(&result)
 }
 
 /// Production result gate for V3 IAT tracing (used by [`fix_iat_v3`]).
 ///
-/// - `failed > 0` → incomplete tracing → `Err` (no "IAT fixed" / no dump).
-/// - `failed == 0` → success, including the empty case (no wrapper slots).
-pub(crate) fn gate_v3_trace_result(resolved: usize, failed: usize) -> Result<(), ThemidaError> {
-    if failed > 0 {
-        return Err(ThemidaError::Debugger(format!(
-            "IAT v3 trace incomplete: {resolved} resolved, {failed} failed — refusing dump"
-        )));
+/// Sole success condition: [`TraceImportResult::is_product_complete`].
+pub(crate) fn gate_v3_trace_result(
+    result: &crate::trace_imports::TraceImportResult,
+) -> Result<(), ThemidaError> {
+    if result.is_product_complete() {
+        return Ok(());
     }
-    let _ = resolved; // success when failed==0 regardless of resolved
-    Ok(())
+    Err(ThemidaError::Debugger(format!(
+        "IAT v3 trace not product-complete: resolved={} failed={} skipped={} total={} aborted={} reason={:?} — refusing dump",
+        result.resolved_count,
+        result.failed_count,
+        result.skip_count,
+        result.total_slots,
+        result.aborted,
+        result.abort_reason,
+    )))
 }
 
 /// Production pre-condition for V3 IAT tracing (used by [`fix_iat_v3`]).
@@ -438,34 +447,60 @@ pub(crate) fn require_trace_start_sp(sp: usize) -> Result<(), ThemidaError> {
 #[cfg(test)]
 mod tests {
     use super::{gate_v3_trace_result, require_trace_start_sp};
+    use crate::trace_imports::TraceImportResult;
+
+    fn sample_incomplete_failed(failed: usize) -> TraceImportResult {
+        TraceImportResult {
+            total_slots: failed.max(1),
+            resolved_count: 0,
+            failed_count: failed,
+            skip_count: 0,
+            failed_slots: if failed > 0 { vec![0] } else { vec![] },
+            aborted: false,
+            abort_reason: None,
+        }
+    }
+
+    fn sample_complete(resolved: usize, skipped: usize) -> TraceImportResult {
+        TraceImportResult {
+            total_slots: resolved + skipped,
+            resolved_count: resolved,
+            failed_count: 0,
+            skip_count: skipped,
+            failed_slots: vec![],
+            aborted: false,
+            abort_reason: None,
+        }
+    }
 
     #[test]
-    fn gate_zero_resolved_many_failed_is_err() {
-        let err = gate_v3_trace_result(0, 295).unwrap_err();
+    fn gate_not_product_complete_is_err() {
+        let err = gate_v3_trace_result(&sample_incomplete_failed(295)).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("incomplete"));
-        assert!(msg.contains("0 resolved"));
-        assert!(msg.contains("295 failed"));
+        assert!(msg.contains("not product-complete"), "{msg}");
+        assert!(msg.contains("failed=295"), "{msg}");
     }
 
     #[test]
-    fn gate_one_resolved_zero_failed_is_ok() {
-        assert!(gate_v3_trace_result(1, 0).is_ok());
+    fn gate_product_complete_is_ok() {
+        assert!(gate_v3_trace_result(&sample_complete(1, 0)).is_ok());
+        assert!(sample_complete(1, 0).is_product_complete());
     }
 
     #[test]
-    fn gate_zero_resolved_zero_failed_is_ok() {
-        // No Themida wrappers left to resolve — complete empty success.
-        assert!(gate_v3_trace_result(0, 0).is_ok());
-    }
-
-    #[test]
-    fn gate_any_failed_count_rejects_even_with_partial_resolve() {
-        // Any failed_count > 0 refuses dump (including 1 resolved + 1 failed).
-        let err = gate_v3_trace_result(1, 1).unwrap_err();
-        assert!(err.to_string().contains("incomplete"));
-        assert!(err.to_string().contains("1 resolved"));
-        assert!(err.to_string().contains("1 failed"));
+    fn gate_failed_zero_but_not_complete_still_rejects() {
+        let r = TraceImportResult {
+            total_slots: 100,
+            resolved_count: 5,
+            failed_count: 0,
+            skip_count: 0, // under-accounted
+            failed_slots: vec![],
+            aborted: true,
+            abort_reason: Some("trash".into()),
+        };
+        assert!(!r.is_product_complete());
+        let err = gate_v3_trace_result(&r).unwrap_err();
+        assert!(err.to_string().contains("not product-complete"));
     }
 
     #[test]
@@ -564,23 +599,51 @@ pub(super) fn is_likely_api_address(addr: usize) -> bool {
     }
 }
 
-/// Heuristic: is `addr` within the image being unpacked?
+/// Heuristic: is `addr` a plausible image-local / Themida-stub pointer?
 ///
-/// Used during IAT boundary scanning to identify Themida-stub pointers
-/// (resolved API addresses that land inside the protector's VM section).
-/// We only accept addresses that look like user-mode VAs above 0x10000;
-/// small RVAs (like `0x1383bc`) are rejected because they are data
-/// pointers, not resolved API addresses.
+/// Historical signature took `(addr, iat_base, slot_count)` but **ignored**
+/// the bounds and instead checked the high DLL range — same as
+/// [`is_likely_api_address`]. That made boundary scan double-count APIs and
+/// never detect true in-image stubs (audit residual P1).
+///
+/// Callers that only have an IAT buffer (no process image base) should use
+/// [`is_likely_api_address`] alone. Prefer [`is_within_image_bounds`] when
+/// `image_base` / `image_boundary` are known.
 pub(super) fn is_within_image(addr: usize, _iat_base: usize, _slot_count: usize) -> bool {
-    // Resolved API addresses and Themida-stub pointers are always above
-    // 0x7ff0_0000_0000 on x64.  Small values (< 0x7fff_0000_0000) are
-    // RVAs or data pointers, not API addresses.
-    #[cfg(target_arch = "x86_64")]
-    {
-        (0x7ff0_0000_0000..0x0000_7FFF_FFFF_0000).contains(&addr)
+    // Backward-compatible shim: without real image bounds we cannot claim
+    // "in image". Return false so callers fall through to API / trash logic.
+    // (Previously returned high-DLL true — silently wrong.)
+    let _ = addr;
+    false
+}
+
+/// True when `addr` lies in `[image_base, image_boundary)`.
+pub(super) fn is_within_image_bounds(
+    addr: usize,
+    image_base: usize,
+    image_boundary: usize,
+) -> bool {
+    image_base != 0 && image_boundary > image_base && addr >= image_base && addr < image_boundary
+}
+
+#[cfg(test)]
+mod image_bounds_tests {
+    use super::*;
+
+    #[test]
+    fn within_image_shim_is_not_high_dll_range() {
+        // Old bug: 0x7ff0_... returned true as "within image".
+        assert!(!is_within_image(0x7ff0_1234_5678, 0, 0));
+        assert!(!is_within_image(0x140001000, 0, 0));
     }
-    #[cfg(target_arch = "x86")]
-    {
-        addr >= 0x6000_0000 && addr < 0x7FFF_0000
+
+    #[test]
+    fn within_image_bounds_uses_caller_range() {
+        let base = 0x140000000usize;
+        let end = 0x141000000usize;
+        assert!(is_within_image_bounds(0x1405b8653, base, end));
+        assert!(!is_within_image_bounds(0x7ff0_1234_5678, base, end));
+        assert!(!is_within_image_bounds(0x1000, base, end));
+        assert!(!is_within_image_bounds(base, 0, 0));
     }
 }

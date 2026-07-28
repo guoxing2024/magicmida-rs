@@ -493,14 +493,24 @@ fn make_dll_executable(
     original_path: &Path,
     has_force_integrity: bool,
 ) -> Result<PathBuf, CoreError> {
-    // Build the stub EXE path:  "<original>MM.exe"
+    // Always use a unique temp path for the stub EXE (audit residual P1):
+    // never "exists? then overwrite" — that TOCTOU window could clobber a
+    // pre-existing user file named *MM.exe. CopyFileW still uses
+    // bFailIfExists=true below.
     let stub_exe_path = {
-        let name = original_path.as_os_str().to_str().ok_or_else(|| {
-            CoreError::ProcessCreation("DLL path contains non-UTF-8 characters".into())
-        })?;
-        let mut new_name = name.to_owned();
-        new_name.push_str(STUB_EXE_SUFFIX);
-        PathBuf::from(new_name)
+        let stem = original_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("dll");
+        let unique = format!(
+            "mida_{stem}_{}_{}{STUB_EXE_SUFFIX}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        std::env::temp_dir().join(unique)
     };
 
     // Step 1: copy the file (CopyFileW)
@@ -524,7 +534,7 @@ fn make_dll_executable(
         CopyFileW(
             PCWSTR::from_raw(orig_wide.as_ptr()),
             PCWSTR::from_raw(stub_wide.as_ptr()),
-            BOOL::from(false), // bFailIfExists = false
+            BOOL::from(true), // bFailIfExists — unique temp path must not exist
         )
         .map_err(|e| {
             CoreError::ProcessCreation(format!(
