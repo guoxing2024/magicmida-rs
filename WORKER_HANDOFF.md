@@ -1,4 +1,4 @@
-# WORKER_HANDOFF — 1 of 2 samples perfect-unpacked (2026-07-25)
+# WORKER_HANDOFF — operational takeover 2026-07-28 (1 of 2 samples)
 
 ## Goal (binding): docs/PROJECT_GOAL_20260725.md
 
@@ -6,8 +6,31 @@ Perfect unpack of exactly two samples.
 
 | sample | status |
 |--------|--------|
-| 时光一键宏.exe (origin_macro) | **✅ PERFECT UNPACK COMPLETE** |
-| 启动器.exe (gto_launcher) | ❌ far — 5 r26b bypass patches fake the window; needs real heap/script resume |
+| 时光一键宏.exe (origin_macro) | **✅ PERFECT UNPACK COMPLETE** (protected; Phase C reconfirmed 2026-07-28) |
+| 启动器.exe (gto_launcher) | ❌ far / **Blocked** — Themida VM owns execution (r27 r5); not residual polish |
+
+## Takeover status (2026-07-28)
+
+| Phase | Status | Evidence |
+|-------|--------|----------|
+| **B** Set A P0 ship | **Done** | commit `7c86595` on `baseline/legacy-recovery-20260722` |
+| **C** Origin non-regression | **Done** | live unpack EP=`0x13e0`; R0B `StructuralPassBehaviorPending`; 1× smoke `all_ok` |
+| **D** Park Set B | **Done** | branch `research/gto-bootwatch-20260728` @ `41ff5d4` (BootWatch/softbp/bwhook/KI3) |
+| **E** GTO research | **Closed by default** | open only with explicit expert charter |
+| Product 1.0 | **NO** | gto perfect unpack not achieved |
+
+### Phase C evidence pointers
+
+- Fresh dump: `D:\MidaVault\lab\evidence\origin_macro\live_20260728-153937\origin_unpacked.exe`
+- Bound manifest written (0 transforms)
+- Smoke batch: `D:\MidaVault\lab\evidence\_repeat\batch_20260728-153953_phase_c_origin_reg\summary.json`
+- Offline gates log: `D:\MidaVault\scratch\phase_b_summary.txt`
+
+### Baseline vs research
+
+- **baseline** = P0 fail-closed + origin-safe path only (no BootWatch mega-diff in tree)
+- **research/gto-bootwatch-20260728** = GTO host residual; `crates/bwhook` remains workspace-`exclude`
+- Set C still dirty on baseline if present: `validation_summary.json` (superseded), BA3/BB tool churn — do not treat as product certificate
 
 ## origin_macro — DONE (evidence)
 
