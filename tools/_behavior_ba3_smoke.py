@@ -11,6 +11,7 @@ Origin/protected samples are out of scope for this smoke.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -154,6 +155,23 @@ def main() -> int:
         print("fixture missing:", fixture, file=sys.stderr)
         return 1
 
+    # Bound empty transform_manifest for managed Accepted path (audit residual).
+    raw = fixture.read_bytes()
+    dig = hashlib.sha256(raw).hexdigest()
+    # Match Path.set_extension("transform_manifest.json") / with_extension semantics.
+    manifest_path = fixture.with_name(fixture.stem + ".transform_manifest.json")
+    write_json(
+        manifest_path,
+        {
+            "schema_version": "mida.transform-manifest/v0",
+            "taxonomy_version": "mida.transform-taxonomy/v1",
+            "candidate_sha256": dig,
+            "candidate_size_bytes": len(raw),
+            "entries": [],
+            "note": "ba3 synthetic empty ledger",
+        },
+    )
+
     # 2) Structural only: must be Pending, never Accepted
     r_static = run([str(acc), "check-static", str(fixture), "--report", str(batch / "structural.json")])
     print(r_static.stdout, end="")
@@ -237,6 +255,8 @@ def main() -> int:
                 "verdict"
             )
 
+        # Sibling transform_manifest enables managed path. Lab BA3 has no CI
+        # signature envelope — use --allow-unsigned-managed (not product posture).
         cr = run(
             [
                 str(acc),
@@ -244,6 +264,7 @@ def main() -> int:
                 str(fixture),
                 "--behavior-evidence",
                 str(evidence_path),
+                "--allow-unsigned-managed",
                 "--report",
                 str(compose_report),
             ]
@@ -305,6 +326,7 @@ def main() -> int:
                 str(fixture),
                 "--behavior-evidence",
                 str(bad_ev),
+                "--allow-unmanaged-candidate",
                 "--report",
                 str(mismatch_dir / "compose.json"),
             ]

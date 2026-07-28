@@ -16,7 +16,8 @@ Perfect unpack of exactly two samples.
 | **B** Set A P0 ship | **Done** | commit `7c86595` on `baseline/legacy-recovery-20260722` |
 | **C** Origin non-regression | **Done** | live unpack EP=`0x13e0`; R0B `StructuralPassBehaviorPending`; 1× smoke `all_ok` |
 | **D** Park Set B | **Done** | branch `research/gto-bootwatch-20260728` @ `41ff5d4` (BootWatch/softbp/bwhook/KI3) |
-| **E** GTO research | **Closed by default** | open only with explicit expert charter |
+| **Set C** lab honesty | **Done** | superseded `validation_summary` + BA3/BB contract adaptation |
+| **E** GTO research | **Charter open** | `docs/GTO_RESEARCH_CHARTER_20260728.md` — Round 0 not auto-started |
 | Product 1.0 | **NO** | gto perfect unpack not achieved |
 
 ### Phase C evidence pointers
@@ -30,7 +31,8 @@ Perfect unpack of exactly two samples.
 
 - **baseline** = P0 fail-closed + origin-safe path only (no BootWatch mega-diff in tree)
 - **research/gto-bootwatch-20260728** = GTO host residual; `crates/bwhook` remains workspace-`exclude`
-- Set C still dirty on baseline if present: `validation_summary.json` (superseded), BA3/BB tool churn — do not treat as product certificate
+- Set C committed: `validation_summary.json` status=superseded; BB writer no longer re-certifies product Accepted via load_no_crash
+- GTO charter: `docs/GTO_RESEARCH_CHARTER_20260728.md` (battlefield `GTO-POINTEE-EPOCH` on research branch; execute Round 0 only on operator command)
 
 ## origin_macro — DONE (evidence)
 

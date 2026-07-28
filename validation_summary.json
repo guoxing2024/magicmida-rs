@@ -1,55 +1,36 @@
 {
   "schema_version": "mida.validation-summary/v1",
   "task": "VNEXT-BEH",
-  "title": "Behavioral acceptance gate (vault load_no_crash_v0 + R0B compose)",
+  "status": "superseded",
+  "title": "Behavioral acceptance gate — SUPERSEDED (contract drift)",
   "package": "mida-acceptance / mida-cli / tools/_behavior_bb_gate.py",
   "verdict_contract": "docs/ACCEPTANCE_CONTRACT.md",
   "roadmap": "docs/VNEXT_BEHAVIORAL_PATH.md",
   "checks": {
-    "bb_behavioral_gate": "pass",
+    "bb_behavioral_gate": "superseded",
     "probe_id": "load_no_crash_v0",
-    "cases": [
-      "origin_macro",
-      "lunlun_software",
-      "xiongxiong_duokai",
-      "gto_launcher"
-    ],
-    "all_compose_accepted": true,
-    "pure_rebuild_default_global": false,
-    "origin_pure_default": true,
-    "gto_independent_host": true,
-    "behavioral_accepted": true,
-    "network_actions": 0
+    "historical_all_compose_accepted": true,
+    "reproducible_under_current_contract": false
   },
   "notes": [
-    "B-B closed only when every scheduled vault case binds Pass evidence and check-with-behavior returns Accepted.",
-    "Probe load_no_crash_v0: process survives wall-clock without NT exception (or clean exit 0). Residual: not full product logic equivalence.",
-    "Batch: D:\\MidaVault\\lab\\evidence\\_beh_gate\\batch_20260724-112907_bb_gate_pin",
-    "origin_macro: r0b=StructuralPassBehaviorPending probe=Pass compose=Accepted ok=True",
-    "lunlun_software: r0b=StructuralPassBehaviorPending probe=Pass compose=Accepted ok=True",
-    "xiongxiong_duokai: r0b=StructuralPassBehaviorPending probe=Pass compose=Accepted ok=True",
-    "gto_launcher: r0b=StructuralPassBehaviorPending probe=Pass compose=Accepted ok=True"
+    "SUPERSEDED 2026-07-27 audit residual: historical B-B batch claimed Accepted via load_no_crash_v0.",
+    "Current acceptance: load_no_crash_v0 is NOT a product probe; unmanaged library path cannot Accept; dumps require sibling transform_manifest.",
+    "Do not treat this file as a live green gate. Re-run tools/_behavior_bb_gate.py after managed dumps + registered bilateral probes.",
+    "Historical batch (archival only): D:\\MidaVault\\lab\\evidence\\_beh_gate\\batch_20260724-112907_bb_gate_pin"
   ],
   "artifacts": [
+    "docs/AUDIT_SELF_CORRECTION_20260727.md",
     "docs/VNEXT_BEHAVIORAL_PATH.md",
-    "docs/UNATTENDED_DECISIONS_20260724.md",
-    "tools/_behavior_bb_gate.py",
-    "tools/_behavior_probe.py",
-    "D:\\MidaVault\\lab\\evidence\\_beh_gate\\batch_20260724-112907_bb_gate_pin"
+    "tools/_behavior_bb_gate.py"
   ],
   "gate_envelope": {
-    "bb_gate": true,
-    "batch_dir": "D:\\MidaVault\\lab\\evidence\\_beh_gate\\batch_20260724-112907_bb_gate_pin",
-    "finished_utc": "2026-07-24T03:32:50.653224+00:00",
-    "all_ok": true,
-    "explicit_claims": [
-      "check-with-behavior Accepted on vault candidates when all_ok",
-      "check-static still never Accepted alone"
-    ],
+    "bb_gate": false,
+    "superseded": true,
+    "superseded_utc": "2026-07-27T00:00:00+00:00",
     "explicit_non_claims": [
+      "historical Accepted under load_no_crash_v0 is not current-contract Accepted",
       "not full product business-logic equivalence",
-      "pure default still Origin-only not global",
-      "GTO still requires --profile=ahk-gto-experimental for experimental dump stages"
+      "GTO still requires experimental profile; bypass dumps are diagnostic-only"
     ]
   }
 }

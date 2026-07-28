@@ -3,8 +3,12 @@
 
 Pipeline per case (vault candidates from live unpack evidence):
   1) R0B check-static → StructuralPassBehaviorPending required
-  2) load_no_crash_v0 probe → evidence Pass required for Accepted
-  3) mida-acceptance check-with-behavior → Accepted required
+  2) load_no_crash_v0 probe → loader survival only (NOT a product Accept probe)
+  3) mida-acceptance check-with-behavior → managed manifest required for Accept;
+     load_no_crash evidence cannot product-Accept (unregistered probe / Pending cap)
+
+SUPERSEDED historical claim: validation_summary all_compose_accepted with
+load_no_crash_v0 (2026-07-24). Current contract rejects that path.
 
 Writes vault evidence under D:\\MidaVault\\lab\\evidence\\_beh_gate\\
 and optionally updates repo validation_summary.json task VNEXT-BEH.
@@ -164,16 +168,26 @@ def r0b_check(candidate: Path, report: Path) -> dict:
 
 
 def compose(candidate: Path, evidence: Path, report: Path) -> dict:
+    # Prefer sibling dump transform_manifest (managed). If missing, lab escape
+    # only — unmanaged path cannot product-Accept (capped at Pending).
+    # Product Accepted also requires a verified signature envelope; vault lab
+    # cases use --allow-unsigned-managed until CI signs dumps.
+    manifest = candidate.with_name(candidate.stem + ".transform_manifest.json")
+    envelope = candidate.with_name(candidate.stem + ".signature_envelope.json")
+    cmd = [
+        str(ACC),
+        "check-with-behavior",
+        str(candidate),
+        "--behavior-evidence",
+        str(evidence),
+    ]
+    if not manifest.is_file():
+        cmd.append("--allow-unmanaged-candidate")
+    if not envelope.is_file():
+        cmd.append("--allow-unsigned-managed")
+    cmd.extend(["--report", str(report)])
     r = run(
-        [
-            str(ACC),
-            "check-with-behavior",
-            str(candidate),
-            "--behavior-evidence",
-            str(evidence),
-            "--report",
-            str(report),
-        ],
+        cmd,
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -239,33 +253,49 @@ def probe_load(
 
 
 def write_validation_summary(batch_dir: Path, results: list[dict], all_ok: bool) -> Path:
+    """Write an honest lab-status summary — never re-certify product Accepted.
+
+    load_no_crash_v0 is a loader-survival probe only. Under the current
+    acceptance contract it is not a registered product probe; historical
+    all_compose_accepted claims are superseded. This writer records lab
+    batch outcomes without setting product green flags.
+    """
     path = REPO / "validation_summary.json"
     # archive previous
     if path.is_file():
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         prev = REPO / f"validation_summary.prev_{stamp}.json"
         shutil.copy2(path, prev)
+    compose_verdicts = [r.get("compose_verdict") for r in results]
+    any_product_accepted = any(v == "Accepted" for v in compose_verdicts)
     body = {
         "schema_version": "mida.validation-summary/v1",
         "task": "VNEXT-BEH",
-        "title": "Behavioral acceptance gate (vault load_no_crash_v0 + R0B compose)",
+        "status": "lab_batch",
+        "title": "Behavioral lab gate — load survival / R0B (NOT product certificate)",
         "package": "mida-acceptance / mida-cli / tools/_behavior_bb_gate.py",
         "verdict_contract": "docs/ACCEPTANCE_CONTRACT.md",
         "roadmap": "docs/VNEXT_BEHAVIORAL_PATH.md",
         "checks": {
-            "bb_behavioral_gate": "pass" if all_ok else "fail",
+            "bb_behavioral_gate": "lab_pass" if all_ok else "lab_fail",
             "probe_id": "load_no_crash_v0",
+            "product_probe": False,
             "cases": [r["case_id"] for r in results],
-            "all_compose_accepted": all_ok,
+            "lab_batch_all_ok": all_ok,
+            # Never claim product Accepted via this harness.
+            "product_compose_accepted": False,
+            "historical_load_no_crash_accepted_superseded": True,
+            "any_compose_accepted_observed": any_product_accepted,
             "pure_rebuild_default_global": False,
             "origin_pure_default": True,
             "gto_independent_host": True,
-            "behavioral_accepted": all_ok,
             "network_actions": 0,
         },
         "notes": [
-            "B-B closed only when every scheduled vault case binds Pass evidence and check-with-behavior returns Accepted.",
-            "Probe load_no_crash_v0: process survives wall-clock without NT exception (or clean exit 0). Residual: not full product logic equivalence.",
+            "LAB ONLY: this summary is not a product certificate.",
+            "Probe load_no_crash_v0 = loader survival; not registered for product Accepted.",
+            "Managed compose may return Pending under current contract even when load survives.",
+            "Historical 2026-07-24 all_compose_accepted under load_no_crash is SUPERSEDED.",
             f"Batch: {batch_dir}",
         ]
         + [
@@ -282,24 +312,28 @@ def write_validation_summary(batch_dir: Path, results: list[dict], all_ok: bool)
         ],
         "artifacts": [
             "docs/VNEXT_BEHAVIORAL_PATH.md",
-            "docs/UNATTENDED_DECISIONS_20260724.md",
+            "docs/ACCEPTANCE_CONTRACT.md",
+            "docs/AUDIT_SELF_CORRECTION_20260727.md",
             "tools/_behavior_bb_gate.py",
             "tools/_behavior_probe.py",
             str(batch_dir),
         ],
         "gate_envelope": {
-            "bb_gate": True,
+            "bb_gate": False,
+            "lab_batch": True,
             "batch_dir": str(batch_dir),
             "finished_utc": datetime.now(timezone.utc).isoformat(),
-            "all_ok": all_ok,
+            "lab_all_ok": all_ok,
             "explicit_claims": [
-                "check-with-behavior Accepted on vault candidates when all_ok",
+                "lab batch recorded R0B + load_no_crash outcomes only",
                 "check-static still never Accepted alone",
             ],
             "explicit_non_claims": [
+                "not product Accepted under current contract",
+                "load_no_crash_v0 is not a product probe",
                 "not full product business-logic equivalence",
                 "pure default still Origin-only not global",
-                "GTO still requires --profile=ahk-gto-experimental for experimental dump stages",
+                "GTO still requires experimental profile; bypass dumps are diagnostic-only",
             ],
         },
     }
@@ -414,7 +448,10 @@ def main() -> int:
             results.append(rec)
             continue
 
-        # Preferred tags then newest StructuralPass until load Pass + compose Accepted.
+        # Preferred tags then newest StructuralPass until load Pass + non-Rejected compose.
+        # LAB bar: R0B StructuralPass* + load_no_crash Pass + compose not Rejected.
+        # Pending is expected under current contract (load_no_crash is not a product
+        # probe; unsigned managed caps Accept). Do NOT require product Accepted.
         tried: list[dict] = []
         selected = False
         for cand_i, cand in enumerate(candidates):
@@ -448,12 +485,14 @@ def main() -> int:
             compose_report = case_dir / f"compose_{len(tried)}.json"
             co = compose(cand, ev_path, compose_report)
             trial["compose_verdict"] = co["verdict"]
-            if co["verdict"] != "Accepted":
+            compose_v = co["verdict"] or ""
+            # Lab success: anything except Rejected / missing. Pending is normal.
+            if compose_v == "Rejected" or not compose_v:
                 trial["skip"] = "compose"
                 tried.append(trial)
                 continue
 
-            # Success path — promote selected artifacts to canonical names.
+            # Lab success path — promote selected artifacts to canonical names.
             rec["candidate"] = str(cand)
             (case_dir / "candidate_path.txt").write_text(str(cand), encoding="utf-8")
             rec["r0b_verdict"] = r0b["verdict"]
@@ -464,7 +503,9 @@ def main() -> int:
                 rec["load_quality"] = pr["load_quality"]
             rec["compose_verdict"] = co["verdict"]
             rec["compose_exit"] = co["exit"]
-            rec["ok"] = True
+            rec["lab_ok"] = True
+            rec["product_accepted"] = compose_v == "Accepted"
+            rec["ok"] = True  # lab batch ok (not product certificate)
             rec["candidates_tried"] = tried + [trial]
             # Keep last winning reports as r0b.json / evidence.json / compose.json
             try:
