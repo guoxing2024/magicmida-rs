@@ -1,40 +1,28 @@
-"""GTO-PRODUCT-RECOVERY Route A R1 orchestrator (2026-07-29).
+"""GTO-PRODUCT-RECOVERY Route A orchestrator (R1/R2).
 
 Launches the external observer binary ``mida_gto_product_recovery_observer``
-N times (default N=3) against a single canonical protected binary in the vault.
+N times against a single canonical protected binary in the vault.
 Each run writes a JSON sidecar under the run directory. After all N runs, the
 aggregator ``_mtr_acq_route_a_aggregate.py`` is invoked.
 
-Per docs/GTO_PRODUCT_RECOVERY_ROUTE_A_R1_PLAN_20260729.md:
-- This script is OBSERVATION-ONLY. It does NOT touch the target binary, does
-  NOT install any hook, does NOT use DRx/VEH/in-process instrumentation.
-- It is a READ-ONLY process launcher + log aggregator.
-- It does NOT import ``tools/_r1b_transient_epoch_trap.py`` (forbidden per
-  authorization).
-- It does NOT set ``MIDA_GTO_BYPASS`` or ``MIDA_GTO_SEMANTIC_REPAIR``.
-- It DOES set ``MIDA_GTO_NO_BYPASS=1`` (default deny-bypass) for the spawned
-  protected process so the target runs without the ``sample_bypass`` patches.
-- It performs N independent fresh-spawn runs (no shared observer state across
-  runs).
+Per docs/GTO_PRODUCT_RECOVERY_ROUTE_A_R1_PLAN_20260729.md and R2 authorization
+2026-07-30:
+- OBSERVATION-ONLY. Does NOT touch the target binary, does NOT install any hook,
+  does NOT use DRx/VEH/in-process instrumentation.
+- Does NOT import ``tools/_r1b_transient_epoch_trap.py``.
+- Does NOT set ``MIDA_GTO_BYPASS`` or ``MIDA_GTO_SEMANTIC_REPAIR``.
+- DOES set ``MIDA_GTO_NO_BYPASS=1``.
+- N independent fresh-spawn runs (no shared observer state across runs).
 
-CLI args:
-    --target-path PATH    Canonical ``gto_protected.exe`` to spawn (default:
-                          ``D:\\MidaVault\\lab\\evidence\\gto_launcher\\
-                          r27_nobypass_round0_20260725\\gto_protected.exe``).
-    --observer-bin PATH   Observer binary to run (default: ``target\\debug\\
-                          mida_gto_product_recovery_observer.exe`` resolved
-                          relative to repo root).
-    --repo-root PATH      Magicmida-RS repo root (default: two levels up from
-                          this script).
-    --out-root PATH       Output root. The N run dirs and the aggregate live
-                          under here (default:
-                          ``D:\\MidaVault\\scratch\\
-                          product_recovery_route_a_r1_n3_<ts>``).
-    --n N                 Number of independent runs (default 3).
-    --observation-window-ms U32  Default 30000 (30 s — short enough to keep
-                                the vault footprint small, long enough to
-                                catch the ``.boot`` first-commit window).
-    --poll-period-ms U32  Default 15.
+CLI:
+    --target-path PATH
+    --observer-bin PATH
+    --repo-root PATH
+    --out-root PATH
+    --n N                 (R2 default 5; R1 used 3)
+    --round R1|R2         (default R2)
+    --observation-window-ms U32
+    --poll-period-ms U32
 """
 
 from __future__ import annotations
@@ -43,11 +31,9 @@ import argparse
 import datetime as _dt
 import json
 import os
-import shutil
 import subprocess
 import sys
 import time
-import uuid
 from pathlib import Path
 
 
@@ -62,11 +48,11 @@ DEFAULT_OBSERVER = REPO_ROOT_DEFAULT / "target" / "debug" / (
 
 
 def _now_iso() -> str:
-    return _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _ts_dir() -> str:
-    return _dt.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%d-%H%M%S")
 
 
 def _sha256_file(p: Path) -> str:
@@ -84,15 +70,10 @@ def _run_one(
     run_dir: Path,
     observation_window_ms: int,
     poll_period_ms: int,
+    round_name: str,
 ) -> dict:
-    """Launch the observer binary once. Returns a small record dict.
-
-    The observer writes ``outcomes.json`` itself; we just capture stdout/stderr
-    for diagnostics and the sidecar hash.
-    """
     run_dir.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
-    # Default-deny: do NOT pass MIDA_GTO_BYPASS or MIDA_GTO_SEMANTIC_REPAIR.
     env.pop("MIDA_GTO_BYPASS", None)
     env.pop("MIDA_GTO_SEMANTIC_REPAIR", None)
     env["MIDA_GTO_NO_BYPASS"] = "1"
@@ -103,6 +84,7 @@ def _run_one(
         "--observation-window-ms", str(observation_window_ms),
         "--poll-period-ms", str(poll_period_ms),
         "--out-dir", str(run_dir),
+        "--round", round_name,
     ]
 
     log_path = run_dir / "observer.stdout.log"
@@ -146,14 +128,14 @@ def main(argv: list[str]) -> int:
     p.add_argument("--observer-bin", default=str(DEFAULT_OBSERVER))
     p.add_argument("--repo-root", default=str(REPO_ROOT_DEFAULT))
     p.add_argument("--out-root", default=None)
-    p.add_argument("--n", type=int, default=3)
+    p.add_argument("--n", type=int, default=5)
+    p.add_argument("--round", default="R2")
     p.add_argument("--observation-window-ms", type=int, default=30000)
-    p.add_argument("--poll-period-ms", type=int, default=15)
+    p.add_argument("--poll-period-ms", type=int, default=50)
     args = p.parse_args(argv)
 
     target = Path(args.target_path)
     observer_bin = Path(args.observer_bin)
-    repo_root = Path(args.repo_root)
 
     if not target.is_file():
         print(f"FATAL: target not found: {target}", file=sys.stderr)
@@ -168,10 +150,14 @@ def main(argv: list[str]) -> int:
     out_root = (
         Path(args.out_root)
         if args.out_root
-        else Path(rf"D:\MidaVault\scratch\product_recovery_route_a_r1_n{args.n}_{_ts_dir()}")
+        else Path(
+            rf"D:\MidaVault\scratch\product_recovery_route_a_"
+            rf"{args.round.lower()}_n{args.n}_{_ts_dir()}"
+        )
     )
     out_root.mkdir(parents=True, exist_ok=True)
 
+    print(f"[orchestrator] round         = {args.round}")
     print(f"[orchestrator] target        = {target}")
     print(f"[orchestrator] target_sha256 = {target_sha}")
     print(f"[orchestrator] observer_bin  = {observer_bin}")
@@ -192,6 +178,7 @@ def main(argv: list[str]) -> int:
             run_dir=run_dir,
             observation_window_ms=args.observation_window_ms,
             poll_period_ms=args.poll_period_ms,
+            round_name=args.round,
         )
         run_records.append(rec)
         print(
@@ -203,6 +190,7 @@ def main(argv: list[str]) -> int:
 
     summary = {
         "route": "GTO-PRODUCT-RECOVERY/RouteA",
+        "round": args.round,
         "method_class": "memory-state-epoch external observer",
         "orchestrator": Path(__file__).name,
         "started_at": _now_iso(),
@@ -225,21 +213,24 @@ def main(argv: list[str]) -> int:
     summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"[orchestrator] wrote summary -> {summary_path}")
 
-    # Invoke aggregator.
     aggregator = Path(__file__).resolve().parent / "_mtr_acq_route_a_aggregate.py"
     if aggregator.is_file():
         print(f"[orchestrator] invoking aggregator {aggregator.name}")
         agg_proc = subprocess.run(
-            [sys.executable, str(aggregator), "--out-root", str(out_root), "--n", str(args.n)],
+            [
+                sys.executable, str(aggregator),
+                "--out-root", str(out_root),
+                "--n", str(args.n),
+                "--round", args.round,
+            ],
             capture_output=True, text=True,
         )
         print(agg_proc.stdout)
         if agg_proc.stderr:
             print(agg_proc.stderr, file=sys.stderr)
         return agg_proc.returncode
-    else:
-        print(f"[orchestrator] WARN: aggregator not found at {aggregator}", file=sys.stderr)
-        return 0
+    print(f"[orchestrator] WARN: aggregator not found at {aggregator}", file=sys.stderr)
+    return 0
 
 
 if __name__ == "__main__":
