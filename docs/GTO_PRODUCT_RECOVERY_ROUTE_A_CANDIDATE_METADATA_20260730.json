@@ -1,0 +1,129 @@
+{
+  "expert_acceptance": {
+    "accepted_on": "2026-07-30",
+    "aggregate_not_rewritten": true,
+    "machine_item_8_report_remains_false": true,
+    "r2_accepted": true
+  },
+  "non_claims": {
+    "boot_module_visible": false,
+    "bypass": false,
+    "drx": false,
+    "e2": false,
+    "expansion_proven": false,
+    "gto_perfect_unpack": false,
+    "injection": false,
+    "necessarily_rwx": false,
+    "product_1_0": false,
+    "r1b_reentry": false,
+    "veh": false
+  },
+  "observer": {
+    "method_class": "memory-state-epoch external observer",
+    "observation_window_ms": 30000,
+    "poll_period_ms": 50,
+    "sha256": "1217a5913d5ddde6a1ae1d23c3a0ec0a1be0b5e765581f473f080f94ba014a6d"
+  },
+  "report_commit": "2c8ebeabbcd6da55ec2359300241d5aff3c461b8",
+  "schema": "mida.gto_product_recovery.route_a.candidate_metadata/v1",
+  "selected_candidate_family": {
+    "family_key": "sz0x120000|fp1891a1ae5a1e8f8f",
+    "fingerprints": {
+      "checksum_4k": "a4ac6465eca1bd16bad4cf377dfcb07b",
+      "checksum_multi_page": "1891a1ae5a1e8f8ff65fe85c15d986f2ecb5b5897b655432ff3627f10b25cef8"
+    },
+    "identity_dimensions": {
+      "allocation_neighborhood": true,
+      "checksum_similarity": true,
+      "independent_count": 5,
+      "lifetime_tick_pattern": true,
+      "protection_evolution": true,
+      "size_stability": true
+    },
+    "memory_properties": {
+      "executable_private": true,
+      "image_backed": false,
+      "protect": 32,
+      "protect_name": "PAGE_EXECUTE_READ",
+      "size": 1208320,
+      "size_hex": "0x127000",
+      "state": 4096,
+      "state_name": "MEM_COMMIT",
+      "type": 131072,
+      "type_name": "MEM_PRIVATE"
+    },
+    "per_run": [
+      {
+        "base": "0x3621000",
+        "base_note": "ASLR-only; not identity",
+        "first_seen_tick": 12,
+        "last_seen_tick": 301,
+        "run": 1,
+        "tick_count_seen": 290
+      },
+      {
+        "base": "0x3471000",
+        "base_note": "ASLR-only; not identity",
+        "first_seen_tick": 11,
+        "last_seen_tick": 330,
+        "run": 2,
+        "tick_count_seen": 320
+      },
+      {
+        "base": "0x3471000",
+        "base_note": "ASLR-only; not identity",
+        "first_seen_tick": 11,
+        "last_seen_tick": 273,
+        "run": 3,
+        "tick_count_seen": 263
+      },
+      {
+        "base": "0x35e1000",
+        "base_note": "ASLR-only; not identity",
+        "first_seen_tick": 11,
+        "last_seen_tick": 302,
+        "run": 4,
+        "tick_count_seen": 292
+      },
+      {
+        "base": "0x34f1000",
+        "base_note": "ASLR-only; not identity",
+        "first_seen_tick": 11,
+        "last_seen_tick": 288,
+        "run": 5,
+        "tick_count_seen": 278
+      }
+    ],
+    "reproduction": {
+      "count": 5,
+      "requested": 5,
+      "runs_observing": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ]
+    },
+    "role": "route_a_r2_primary_anchor_candidate"
+  },
+  "source_evidence": {
+    "aggregate_sha256": "d85d0cdedea4801ee5aacd671adf7c17d24929ea1dd96a25c34f02659609ed74",
+    "evidence_set_id": "product_recovery_route_a_r2_n5_20260730-012013",
+    "orchestrator_summary_sha256": "9add48ab46560d57308f8b75602f1b78f1350198e52498949582c75eb8fc2880",
+    "sidecar_sha256": {
+      "run_1": "6cd24fbffb2df539afd8bd487547476f59a402e0454082830848e3d330562f58",
+      "run_2": "d10d513cb7e659d6b92ad1089a3f53900ce4a4655e82a841683b3350807a0924",
+      "run_3": "1f80479f08cac71508238fae2f31760240ebac6b177707b6cefb009fccc40d4b",
+      "run_4": "546abbe86c215bcb2cce8f7684528a3a9a347b2bf32ec2b0e3312eaeafdb45ab",
+      "run_5": "e06c176c50d6385d9363adef85c14ea49b743db4013b321f0d592c17b2b97a29"
+    }
+  },
+  "source_r2_report": "docs/GTO_PRODUCT_RECOVERY_ROUTE_A_R2_20260730.md",
+  "status": "metadata_only",
+  "target": {
+    "sample": "gto_launcher",
+    "sha256": "4d5770afdd2f6d9553fef66826c5a55211b80d8d174360a115f247efafb037c8"
+  },
+  "task": "GTO-PRODUCT-RECOVERY Route A Candidate Metadata Pack M0"
+}

@@ -177,6 +177,25 @@ Perfect unpack of exactly two samples.
 - Cap exhausted (remaining=0): **No R3.** Optional next step only via **new governance** (e.g. candidate dump **metadata** only — not restore/E2/R1B/UI/bypass).
 - **`GTO-POINTEE-EPOCH` remains FROZEN.** Non-claims retained (not product 1.0; not gto perfect unpack; not R1B; not E2; not DRx; not bypass; expand not proven; not necessarily RWX).
 
+## GTO-PRODUCT-RECOVERY Route A Candidate Metadata Pack M0 — COMMITTED
+
+- Based on R2 accepted commit: `2c8ebeabbcd6da55ec2359300241d5aff3c461b8`
+- Branch: `codex/gto-route-a-candidate-metadata`
+- Class: metadata-only evidence packaging
+- Fix rounds consumed: **0**
+- Live measurement: **none**
+- Target execution: **none**
+- Route A R3: **not opened**
+- Selected family: `sz0x120000|fp1891a1ae5a1e8f8f` (size `0x127000`, protect=32 `PAGE_EXECUTE_READ`, 5/5, identity dims=5)
+- Vault input (READ-ONLY): evidence set id `product_recovery_route_a_r2_n5_20260730-012013` (no vault rewrite; aggregate `item_8_report=false` retained)
+- Output:
+  - `docs/GTO_PRODUCT_RECOVERY_ROUTE_A_CANDIDATE_METADATA_20260730.json`
+  - `docs/GTO_PRODUCT_RECOVERY_ROUTE_A_CANDIDATE_METADATA_20260730.md`
+  - `tools/_mtr_route_a_candidate_metadata.py`
+- Non-claims retained (not product 1.0; not gto perfect unpack; not R1B; not E2; not DRx/VEH/injection; not bypass; expand not proven; not necessarily RWX; no `.boot` module-visible binding).
+- Next-governance recommendation: accept M0 as deterministic R2 primary-anchor descriptor; any successor is a **separate** route-selection ruling (e.g. Route B); **do not reopen Route A R3**.
+- Local commit on branch `codex/gto-route-a-candidate-metadata` (parent `2c8ebeabbcd6da55ec2359300241d5aff3c461b8`; subject `gto: add route a candidate metadata pack`; four allowed files only). Record tip via `git rev-parse codex/gto-route-a-candidate-metadata`. **No push.**
+
 ## origin_macro — DONE (evidence)
 
 - Structure R0B StructuralPassBehaviorPending
