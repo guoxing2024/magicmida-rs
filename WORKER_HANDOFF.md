@@ -52,6 +52,36 @@ Perfect unpack of exactly two samples.
 - Race note observed earlier in this session: `SuspendThread(prev=0)` showed up while BootWatch had already frozen the RIP — handled by host's `if frozen_rip.is_none() && bootwatch_vm_enter_rip.is_none()` gate, but worth a hygiene pass if R1B is reopened.
 - **R1B trench remains FROZEN** per expert 2026-07-29 ruling (third pass, 2026-07-29); re-entry bar = charter §4.4 + §4.5 dormant (third-pass 2026-07-29) + immutable seal `4c2b545:docs/GTO_R1A_RESIDUAL_STOP_SEAL_20260728.md` §4. Per-round fix budget = ≤2 (per `docs/COURSE_CORRECTION_WORK_ORDER.md` §3 — workspace-auditable). **Budget exhausted, ledger 2026-07-29:** R1A = 1 round consumed (host instrument, closed 2026-07-28, see `4c2b545:docs/GTO_POINTEE_EPOCH_R1A_20260728.md` §1); **R1B = 1 round already consumed** (commit `4be4ee5` on `research/gto-bootwatch-20260728` — bwhook + gto_host + runner +1342 lines + 4× live smoke at `D:\MidaVault\lab\evidence\_r1b_transient_epoch_trap\`); E2 = **0 remaining**, **forbidden** under current charter. **used=2 / cap=2 / remaining=0.** The earlier "operator pre-declaration" policy was withdrawn on third-pass: declaration expresses intent only; the ledger is determined by actual Rust/Python diff + clean tree + rebuild + re-measure. **Only separate governance** (charter amendment or new expert ruling recorded here) can re-open budget — `R1B re-entry` / `E2 implementation` instructions do **not** themselves expand budget.
 
+## GTO-PRODUCT-RECOVERY proposal filed (2026-07-29) — NOT a re-entry authorization
+
+**Proposal artifact:** [`docs/GTO_PRODUCT_RECOVERY_CHARTER_20260729.md`](docs/GTO_PRODUCT_RECOVERY_CHARTER_20260729.md) (new file on this baseline; both files resolve from repo root).
+
+**Status (proposal only, no action authorized):**
+
+- This is a **read-only governance proposal** — a docs-only artifact that **proposes** opening a **new** battlefield `GTO-PRODUCT-RECOVERY` with a **proposed** ledger namespace. It does **not** open the battlefield; it does **not** allocate budget; it does **not** authorize any code change.
+- The use of a separate ID is for bookkeeping clarity; it does **not** bypass, weaken, or reopen `docs/GTO_RESEARCH_CHARTER_20260728.md` §4.4 or §4.5. The §4.4 re-entry bar still applies to anything that names `R1B re-entry` literally; §4.5 (E2) remains dormant.
+- **Phase 0 of the proposal consumed 0 fix rounds** (docs-only; not a budget round per `docs/GTO_RESEARCH_CHARTER_20260728.md` §4.4 budget-burn rule).
+- **`GTO-POINTEE-EPOCH` ledger is UNCHANGED** (used=2 / cap=2 / remaining=0). The proposal explicitly does **not** request expansion of that ledger, does **not** re-open parked R1B (`4be4ee5`), does **not** activate dormant E2 (§4.5).
+- **`R-GTO-UI` peel-series ledger is UNCHANGED** (closed r1 → r25b; deepest progress r23b `ZhuChuangKou` class).
+- **No code change.** No live runs. No push.
+
+**Next action requires (separately from this filing):**
+
+1. Operator names `GTO-PRODUCT-RECOVERY Phase 1 on Route X` literally (per the proposal's §3.3 + §8.6 authorization bar). Bare "continue" / "proceed" / handoff-passing-C-1 do **not** satisfy this.
+2. **New expert ruling OR charter amendment** recorded in this handoff that **explicitly allocates** rounds in the `GTO-PRODUCT-RECOVERY` ledger namespace (the allocation is **not** inherited from the proposal; only separate governance can grant it).
+3. The expert ruling must **explicitly state** the chosen Route X and its evidence bar (charter §6.4 / §6.1 / §6.2 / §6.3 as appropriate).
+
+**Non-automatic fallback note (third-pass 2026-07-29):** the proposal's §6.5 step 3 ("if Route A residual-stops → Route B") is **not** an automatic fallback. After any Route A residual-stop, the worker must **stop and write residual** per the analog of `docs/GTO_RESEARCH_CHARTER_20260728.md` §4.3. Route B requires its **own** governance ruling (operator-named, with explicit round allocation) and does **not** auto-start from the proposal's recommendation alone.
+
+**What this entry is NOT:** this is a "proposal filed" record, **not** an authorization to act. No code change, no live GTO unpack / R1B / E2 / restore, no `sample_bypass`, no push. `WORKER_HANDOFF.md` is not the governance artifact for Phase 1 of this proposal; the new expert ruling or charter amendment (recorded in `WORKER_HANDOFF.md` when it lands) would be.
+
+**Anti-revival cross-check (2026-07-29):**
+
+- `crates/bwhook/**` — **unchanged** by this filing.
+- `crates/cli/src/unpacker/gto_host.rs` (research branch) — **unchanged** by this filing.
+- `tools/_r1b_transient_epoch_trap.py` — **unchanged** by this filing.
+- Vault evidence under `D:\MidaVault\lab\evidence\_r1b_transient_epoch_trap\` and `D:\MidaVault\scratch\bootwatch\r1a_n10_20260728-192757\` — **unrestored**; cited as evidence inputs only.
+
 ## origin_macro — DONE (evidence)
 
 - Structure R0B StructuralPassBehaviorPending
