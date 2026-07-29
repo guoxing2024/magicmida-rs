@@ -115,6 +115,53 @@ Perfect unpack of exactly two samples.
 - Operator names `GTO-PRODUCT-RECOVERY Phase 1 on Route X` literally (per `docs/GTO_PRODUCT_RECOVERY_CHARTER_20260729.md` §3.3 + §8.6) **and** a new expert ruling OR charter amendment recorded in this handoff that explicitly allocates rounds in the `GTO-PRODUCT-RECOVERY` ledger namespace. **This Phase 0.5 audit does not allocate any rounds; it only informs method-class choice.**
 - If DRx is to be used at all: a separate governance proposal (e.g. `docs/GTO_PRODUCT_RECOVERY_LOCAL_HARNESS_20260729.md`) for a non-GTO local flag-acceptance harness is required first; **out of scope for this audit**.
 
+## GTO-PRODUCT-RECOVERY Phase 1 Route A R1 — IMPLEMENTED + MEASURED (2026-07-29)
+
+**Status (per `docs/GTO_PRODUCT_RECOVERY_ROUTE_A_R1_20260729.md`, expert-audit wording corrected):**
+
+- **R1 evidence filed — expert pre-review pending / conditional technical pass candidate.** Final R1 pass can only be written as **expert acceptance after report review** (not machine self-declaration).
+- Machine pre-report `aggregate.json`: `stability_score=1.0`; items 1–7 true; **`item_8_report=false` by design**; **`evidence_bar_pass=false`** (do not restate as true).
+- **Ledger burn:** `GTO-PRODUCT-RECOVERY Route A` — R1 = **1 round consumed**; R2 = 0; cap = 2; **remaining = 1**.
+- **`GTO-POINTEE-EPOCH` ledger is UNCHANGED** (still frozen at used=2/cap=2/remaining=0).
+- **R1B trench is FROZEN** (unchanged); **E2 remains dormant** (per charter §4.5).
+
+**R1 round artifacts (UNCOMMITTED working tree on `codex/gto-product-recovery-route-a` from `baseline/legacy-recovery-20260722 @ 1ca2fde`; HEAD still `1ca2fde`; no R1 commit; no push):**
+
+- New (untracked): `crates/cli/src/bin/mida_gto_product_recovery_observer.rs` (~600 lines, observation-only; uses `ReadProcessMemory` + `VirtualQueryEx`; no DRx, no VEH, no in-process hook).
+- New (untracked): `tools/_mtr_acq_route_a_observer.py` (N=3 orchestrator; launches observer × N; sha256-tags sidecars).
+- New (untracked): `tools/_mtr_acq_route_a_aggregate.py` (aggregator; computes `stability_score` and 8-item evidence-bar checklist; item_8 starts false).
+- Modified (tracked, unstaged): `crates/cli/Cargo.toml` (+1 [[bin]] entry; +1 `[dependencies]` line for `serde`).
+- Docs (untracked): `docs/GTO_PRODUCT_RECOVERY_ROUTE_A_R1_PLAN_20260729.md` (filed earlier this round, 0 budget).
+- Docs (untracked): `docs/GTO_PRODUCT_RECOVERY_ROUTE_A_R1_20260729.md` (R1 evidence report — this filing; expert-audit wording corrected).
+- Modified (tracked, unstaged): `WORKER_HANDOFF.md` (this section).
+
+**R1 evidence (vault only, READ-ONLY input; not rewritten):**
+
+- Out root: `D:\MidaVault\scratch\product_recovery_route_a_r1_n3_20260729-155500\`
+- 3 × `outcomes.json` sidecars + 1 × `aggregate.json` (`stability_score=1.0`, **`evidence_bar_pass=false`**, item_8 false by design) + 1 × `orchestrator_summary.json`.
+- Target: `D:\MidaVault\lab\evidence\gto_launcher\r27_nobypass_round0_20260725\gto_protected.exe` sha256 `4d5770afdd2f6d9553fef66826c5a55211b80d8d174360a115f247efafb037c8` (same canonical binary across all 3 runs).
+
+**Named epochs (3/3 runs each) — strength-corrected:**
+
+- `vm_codegen_region_expand` — **JSON name retained**; code did **not** track per-base growth. Evidence supports a **stable MEM_PRIVATE executable private region >1 MiB (RX/RWX-class)** candidate, **not** proven expansion and **not necessarily RWX**. Run samples show `protect=32` = `PAGE_EXECUTE_READ` (not RWX). Sample base 0x3521000–0x3601000, size 0x127000 (1.2 MiB). **Primary conditional pass anchor candidate** (subject to expert acceptance of the downgrade). Sidecar string still says “MEM_PRIVATE RWX…” as historical machine output — overclaimed; report layer corrects interpretation; vault left unmodified.
+- `vm_protection_transition` — **supporting weak observation only; not R1 primary pass anchor**. Transition struct lacks state/type/size, so **MEM_PRIVATE committed binding is not proven**. 11–13 transitions per run; presence only.
+
+**Anti-revival cross-check (2026-07-29):**
+
+- `crates/bwhook/**` — unchanged.
+- `crates/cli/src/unpacker/gto_host.rs` (research-branch version) — unchanged. New observer is under `crates/cli/src/bin/`, not under `crates/cli/src/unpacker/`.
+- `tools/_r1b_transient_epoch_trap.py` — unchanged.
+- `docs/GTO_R1A_RESIDUAL_STOP_SEAL_20260728.md` — unchanged.
+- Vault evidence under `D:\MidaVault\lab\evidence\` — unmodified.
+- No `MIDA_GTO_BYPASS=1` or `MIDA_GTO_SEMANTIC_REPAIR` ever set.
+- No push. No commit of R1 artifacts.
+
+**Next action requires (separately from this filing):**
+
+- **Expert pre-review of R1 report** per plan §九 + authorization §九. Per the discipline, **no commit until expert passes**. **Current actual state: uncommitted working tree awaiting expert review** (2 modified tracked + 5 untracked paths; HEAD=`1ca2fde`). Earlier draft language claiming “committed locally” / “workspace staged” was **incorrect** and is withdrawn.
+- **No R2 implementation.** R2 requires its own expert ruling OR charter amendment that explicitly allocates R2 rounds in `GTO-PRODUCT-RECOVERY Route A` (per charter §3.3 + §6.5 third-pass 2026-07-29); R2 does not auto-start from a conditional technical pass candidate.
+- **`GTO-POINTEE-EPOCH` remains FROZEN.** No R1B re-entry, no E2 activation.
+
 ## origin_macro — DONE (evidence)
 
 - Structure R0B StructuralPassBehaviorPending

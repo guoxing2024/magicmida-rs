@@ -21,6 +21,15 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 windows = { workspace = true }
 sha2 = "0.10"
 serde_json = "1"
+serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }
+
+# NOTE: a new binary was added for `GTO-PRODUCT-RECOVERY Route A R1` (2026-07-29).
+# This binary is OBSERVATION-ONLY: external ReadProcessMemory + VirtualQueryEx polling,
+# no DRx, no VEH, no in-process hook.  See `docs/GTO_PRODUCT_RECOVERY_ROUTE_A_R1_PLAN_20260729.md`
+# before modifying this entry.
+[[bin]]
+name = "mida_gto_product_recovery_observer"
+path = "src/bin/mida_gto_product_recovery_observer.rs"
