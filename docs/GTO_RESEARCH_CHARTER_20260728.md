@@ -1,7 +1,7 @@
 # GTO Research Charter — GTO-POINTEE-EPOCH
 
-> **Status:** **Residual-stop after R1A** — re-entry only per §4 (incl. §4.4 amendment 2026-07-29).  
-> **Source of truth for status:** `docs/GTO_R1A_RESIDUAL_STOP_SEAL_20260728.md` §0. Earlier "Open" header is superseded by R1A seal; this charter's §10 is the live status reference but does not overrule R1A seal when in conflict.  
+> **Status:** **Residual-stop after R1A** — re-entry only per §4.4 (amended 2026-07-29, second-pass 2026-07-29).  
+> **Source of truth for status (immutable):** `4c2b545:docs/GTO_R1A_RESIDUAL_STOP_SEAL_20260728.md` §0. Baseline HEAD does not contain the seal file (it lives on `research/gto-bootwatch-20260728`); the `4c2b545:...` form is the only path resolvable from baseline. Earlier "Open" header is superseded by R1A seal; this charter's §10 is the live status reference but does not overrule R1A seal when in conflict.  
 > **Branch:** `research/gto-bootwatch-20260728` (default worktree for code)  
 > **Binding goal:** `docs/PROJECT_GOAL_20260725.md` — `gto_launcher` perfect unpack  
 > **Product 1.0:** still **NO** until this charter's product exit is met **without** `sample_bypass`  
@@ -130,30 +130,50 @@ After 2 fix rounds without E1/E2 measurable advance:
 
 ---
 
-### 4.4 Re-entry process tightening (2026-07-29 amendment)
+### 4.4 R1B re-entry procedure (2026-07-29 amendment)
 
-When §4.1–§4.3 re-entry bar is satisfied (including the ≥3 independent
-`same_epoch=true && committed+readable` runs), **proposal of E2 (minimal
-restore) is itself gated** on first completing a full **N=10 capture pass**
-under the same method on the same target. Specifically:
+> ⚠️ **Logical correction (2026-07-29):** earlier draft made §4.4 contingent on
+> §4.1–§4.3 being satisfied. That is **wrong** — §4.1 is the *research exit*
+> (charter complete), §4.3 is the *failure stop* (residual without path). Neither
+> is a prerequisite for re-entering R1B capture; neither alone proves R1B has a
+> route forward. Re-entry is a **separate, operator-named** process. The correct
+> sequence is:
 
-1. **N=10 first, propose second.** E2 is **not** proposed until an N=10 run
-   with the chosen method has been observed. **N<10 ⇒ E2 not proposed.**
-2. **N=10 must be evaluated under the same env contract** as the ≥3 runs:
-   `MIDA_GTO_NO_BYPASS=1`, `MIDA_GTO_BYPASS` / `MIDA_GTO_SEMANTIC_REPAIR`
-   absent, BootWatch / softbp env as documented in §7.
-3. **No "one-line fix" without empirical root cause.** Any candidate patch
-   that claims to fix a captured failure mode (e.g. a `CONTEXT_FLAGS` value)
-   must first reproduce the failure under controlled flags and show the
-   actual `ERROR_*` Windows returned. Hypothesized no-op patches (OR-ing a
-   bit the value already contains) are **not** counted against the §6.3
-   per-battlefield ≤2 fix budget until root cause is empirically confirmed.
-4. **Operator-explicit R1B re-entry.** "Re-enter R1B" / "resume R1B capture"
-   must be a named operator instruction; it is **not** inferred from a
-   generic "continue" or from passing §6 C-1 in the plan handoff.
-5. Round 0/1/2 budget under §6 (plan `nifty-popping-patterson.md`) remains
-   ≤2 fix rounds per battlefield. R1B is **not** auto-allocated a fresh
-   round — the budget inherited from R1A is the binding one.
+**Sequence (mandatory, in order):**
+
+1. **Operator names `R1B re-entry`.** A bare "continue" / "proceed" / handoff
+   passing C-1 / "execute charter Round 0" does **not** satisfy this step.
+   "R1B re-entry" must appear literally in the operator instruction, and must
+   name the **method class** (e.g. "DR0 short-window capture at 0x1405febb8",
+   "soft-BP VIP linear", "BootWatch earlier VM ENTER", etc.).
+2. **Expert grants explicit authorization** for that method class with the
+   evidence requirements named in step 3. The 2026-07-28 charter "open" is not
+   such an authorization for R1B — R1A seal §0 froze the battlefield before any
+   R1B method was reviewed. Expert may delegate review to a named reviewer,
+   but the delegation must be recorded in `WORKER_HANDOFF.md` for audit.
+3. **Capture under authorized method produces N=10 outcomes**, all under the
+   same env contract (`MIDA_GTO_NO_BYPASS=1`, `MIDA_GTO_BYPASS` /
+   `MIDA_GTO_SEMANTIC_REPAIR` absent, BootWatch / softbp env per §7). Each
+   outcome's JSON sidecar must carry `same_epoch`, `committed_readable`,
+   `at_fetch` / `near_fetch` / equivalent timing, and `rsp_source`. Aggregate
+   written under `D:\MidaVault\scratch\r1b_n10_<ts>\r1b_n10_aggregate.json`
+   plus pointer `D:\MidaVault\scratch\r1b_n10_latest.json`.
+4. **≥3 of 10 with `same_epoch=true && committed_readable=true`.** If fewer than
+   3 — **stop**, write residual per §4.3, do **not** propose E2. The fix budget
+   inherited from R1A is ≤2 rounds per `docs/COURSE_CORRECTION_WORK_ORDER.md`;
+   running a third round to chase ≥3 is **not** automatic.
+5. **Only after ≥3**, an E2 (minimal restore) **proposal** may be written and
+   submitted for explicit expert sign-off. The proposal is **not** auto-
+   implemented and **does not** itself satisfy the bar — E2 still requires its
+   own operator-named instruction and its own evidence gate (per §4.2).
+
+**No one-line fix without empirical root cause.** Any candidate patch that
+claims to fix a captured failure mode (e.g. a `CONTEXT_FLAGS` value) must first
+reproduce the failure under controlled flags and show the actual `ERROR_*`
+Windows returned, plus the flag value Windows actually accepted. Hypothesized
+no-op patches (OR-ing a bit the value already contains) are **not** counted
+against the per-battlefield ≤2 fix budget until root cause is empirically
+confirmed.
 
 ## 5. Method constraints (recommended approach)
 
@@ -237,10 +257,10 @@ python tools\_origin_live_unpack.py
 | Item | Value |
 |------|-------|
 | Opened | 2026-07-28 (operator request: process Set C + open GTO research charter) |
-| Frozen | 2026-07-28 — R1A residual-stop (`docs/GTO_R1A_RESIDUAL_STOP_SEAL_20260728.md` §0) |
-| Re-entry barrier | §4 / §4.4 (amended 2026-07-29) |
+| Frozen | 2026-07-28 — R1A residual-stop (`4c2b545:docs/GTO_R1A_RESIDUAL_STOP_SEAL_20260728.md` §0) |
+| Re-entry barrier | §4.4 (amended 2026-07-29, second-pass 2026-07-29) — operator must **name `R1B re-entry`**; **"execute charter Round 0" alone is not admissible** under Residual-stop; the per-battlefield ≤2 fix budget lives at `docs/COURSE_CORRECTION_WORK_ORDER.md`, **not** in any external plan file. |
 | Battlefield ID | `GTO-POINTEE-EPOCH` |
-| Auto-start grind | **No** — charter opens the battlefield; Round 0 measure starts only with explicit operator "execute charter Round 0" **and** satisfaction of §4.1–§4.4. Charter **status was downgraded to Residual-stop on 2026-07-28 by R1A seal**, not by this document. |
+| Auto-start grind | **No** — and **never auto**, even post-authorization: any R1B capture or charter Round 0 requires §4.4 step 1 (operator names R1B re-entry) **and** step 2 (expert grants authorization). Charter **status was downgraded to Residual-stop on 2026-07-28 by R1A seal**, not by this document. |
 | Closes | Research exit §4.1 / product exit §4.2 / residual-stop §4.3 / expert revoke |
 
 ---

@@ -17,7 +17,7 @@ Perfect unpack of exactly two samples.
 | **C** Origin non-regression | **Done (2026-07-29 re-run)** | live unpack EP=`0x13e0`; R0B `StructuralPassBehaviorPending`; 1× smoke `all_ok`; artifact-bound manifest sha256 `ae1e6344…` |
 | **D** Park Set B | **Done** | branch `research/gto-bootwatch-20260728` @ `4be4ee5` (BootWatch/R1B bwhook/KI3) |
 | **Set C** lab honesty | **Done** | superseded `validation_summary` + BA3/BB contract adaptation |
-| **E** GTO research | **Trigger report filed — awaiting expert charter** | R1B capture harness parked on research branch; **battlefield not opened** without expert ack |
+| **E** GTO research | **REJECTED 2026-07-29** — §6 E **not opened**; R1B trench **FROZEN** | `4c2b545:docs/GTO_R1A_RESIDUAL_STOP_SEAL_20260728.md` §0 (status); charter `§4.4` (2026-07-29 amendment) defines the only admissible re-entry path; **operator must name `R1B re-entry`** — "continue" / "proceed" / passing C-1 do **not** satisfy §4.4 |
 | Product 1.0 | **NO** | gto perfect unpack not achieved; **§0.1 binding unchanged** |
 
 ### Phase C re-run (2026-07-29) evidence pointers
@@ -36,21 +36,21 @@ Perfect unpack of exactly two samples.
 
 ### Expert ruling on §6 E battlefield (2026-07-29)
 
-**§6 E field = REJECTED / NOT OPENED.** Expert returned C-1 (operational takeover) as passing, but refused to open §6 E. R1B capture trench remains FROZEN. Re-entry bar = `docs/GTO_RESEARCH_CHARTER_20260728.md` §4 (as amended 2026-07-29) + `docs/GTO_R1A_RESIDUAL_STOP_SEAL_20260728.md` §4. No code change to bwhook / gto_host / `_r1b_transient_epoch_trap.py` authorized by this handoff.
+**§6 E field = REJECTED / NOT OPENED** (expert ruling 2026-07-29, second pass). C-1 (operational takeover) accepted; E battlefield not opened; R1B capture trench remains FROZEN. Re-entry bar = `docs/GTO_RESEARCH_CHARTER_20260728.md` §4.4 (2026-07-29 amendment) + immutable seal at `4c2b545:docs/GTO_R1A_RESIDUAL_STOP_SEAL_20260728.md` §4. No code change to bwhook / gto_host / `_r1b_transient_epoch_trap.py` authorized by this handoff. **Operator must name `R1B re-entry`; "continue" / "proceed" do not satisfy §4.4.**
 
 ### Baseline vs research
 
 - **baseline** = P0 fail-closed + origin-safe path only (no BootWatch mega-diff in tree)
 - **research/gto-bootwatch-20260728** = GTO host residual + R1B capture harness (`crates/bwhook` + `tools/_r1b_transient_epoch_trap.py`); `crates/bwhook` remains workspace-`exclude`
 - Set C committed: `validation_summary.json` status=superseded; BB writer no longer re-certifies product Accepted via load_no_crash
-- GTO charter: `docs/GTO_RESEARCH_CHARTER_20260728.md` (battlefield `GTO-POINTEE-EPOCH` on research branch; execute Round 0 only on operator command)
+- GTO charter: `docs/GTO_RESEARCH_CHARTER_20260728.md` — current status **Residual-stop after R1A** (per §0); re-entry only per charter §4.4 / seal `4c2b545:docs/GTO_R1A_RESIDUAL_STOP_SEAL_20260728.md` §4. **"execute charter Round 0" alone is not admissible** under Residual-stop — operator must name **R1B re-entry** and produce evidence per §4.4.
 
 ### Open discipline notes (2026-07-29 — corrected 2026-07-29 per expert review)
 
 - **WITHDRAWN — prior claim about CONTEXT_FLAGS fix was wrong.** Earlier draft described "OR in `CONTEXT_AMD64`" as a one-line fix for `GetThreadContext` returning `ERROR_INVALID_PARAMETER`. That claim is **incorrect**: `0x100013` already encodes the architecture bit (the high `0x100000` is set inside both `CONTEXT_DEBUG_REGISTERS_AMD64 (0x100010)` and `CONTEXT_CONTROL_INTEGER_AMD64 (0x100003)`). OR-ing `CONTEXT_AMD64` again is a no-op and does not fix anything. The actual root cause of the `GetThreadContext` Err in the R1B smoke is **not established** — candidates remain: (i) non-standard flag combination behavior on this Win10/11 build; (ii) suspend-count / handle race (earlier session observed `SuspendThread(prev=0)` while host had skipped its own suspend); (iii) thread-state precondition not actually met at the moment of DLL arming. **No "one-line fix" is to be trusted or committed without empirical `ERROR_INVALID_PARAMETER` reproduction under controlled flags, and without showing the flag value Windows actually accepted.**
 - bwhook diagnostic log path: `D:\MidaVault\scratch\r1b_smoke_log\` (vault only, not committed)
 - Race note observed earlier in this session: `SuspendThread(prev=0)` showed up while BootWatch had already frozen the RIP — handled by host's `if frozen_rip.is_none() && bootwatch_vm_enter_rip.is_none()` gate, but worth a hygiene pass if R1B is reopened.
-- **R1B trench remains FROZEN** per expert 2026-07-29 ruling; re-entry bar = `docs/GTO_RESEARCH_CHARTER_20260728.md` §4 (as amended 2026-07-29) + `docs/GTO_R1A_RESIDUAL_STOP_SEAL_20260728.md` §4.
+- **R1B trench remains FROZEN** per expert 2026-07-29 ruling (twice); re-entry bar = charter §4.4 + immutable seal `4c2b545:docs/GTO_R1A_RESIDUAL_STOP_SEAL_20260728.md` §4. Per-round fix budget = ≤2 (per `docs/COURSE_CORRECTION_WORK_ORDER.md` — workspace-auditable), inherited from R1A — R1B does not get a fresh budget by default.
 
 ## origin_macro — DONE (evidence)
 
