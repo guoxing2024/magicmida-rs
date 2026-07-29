@@ -82,6 +82,39 @@ Perfect unpack of exactly two samples.
 - `tools/_r1b_transient_epoch_trap.py` — **unchanged** by this filing.
 - Vault evidence under `D:\MidaVault\lab\evidence\_r1b_transient_epoch_trap\` and `D:\MidaVault\scratch\bootwatch\r1a_n10_20260728-192757\` — **unrestored**; cited as evidence inputs only.
 
+## Phase 0.5 Route D audit filed (2026-07-29) — read-only, no budget consumed
+
+**Audit artifact:** `docs/GTO_PRODUCT_RECOVERY_ROUTE_D_AUDIT_20260729.md` (new docs-only audit file; filed for expert review).
+
+**Status (read-only audit only, no action authorized):**
+
+- This is a **Phase 0.5 read-only debug-context audit** under `docs/GTO_PRODUCT_RECOVERY_CHARTER_20260729.md` §6.4 Route D. **Not** Phase 1. **Not** R1B re-entry. **Not** E2 activation. **Not** a live run. **Not** a source-code edit. **Not** push.
+- **Budget consumed = 0** (docs-only; no Rust/Python diff, no rebuild, no re-measure; per `docs/GTO_RESEARCH_CHARTER_20260728.md` §4.4 step 4 budget-burn rule, **investigation that does not produce Rust/Python diff + rebuild + re-measure is not a budget round**).
+- **`GTO-POINTEE-EPOCH` ledger is UNCHANGED** (used=2 / cap=2 / remaining=0).
+- **`GTO-PRODUCT-RECOVERY` ledger namespace is UNCHANGED** (Phase 0.5 = 0 rounds; Phase 1 still requires separate governance per charter §3.3 + §6.5 third-pass 2026-07-29).
+- **No code change.** No live runs. No push. No vault writes.
+
+**Audit verdict (read-only finding only):**
+
+- R1B `GetThreadContext(flags=0x100013) -> ok=false` is **not** evidence the target pointee at `0x1405febb8` does not exist; it is host-state-machine failure (3 of 4 runs: `capture_reason=dr0_fail`; 1 of 4 runs: `arm_timeout`).
+- `0x100013` already encodes `CONTEXT_AMD64=0x100000`; OR-ing `CONTEXT_AMD64` is a no-op. **The "one-line fix" withdrawal from earlier this session is reaffirmed — do not re-introduce.**
+- R1A `same_epoch_committed=0` and R1B `same_epoch_hits=0` reach the **same gate** via **different mechanisms** — both describe the host's inability to hold the target thread at the same suspended RIP as the VIP fetch epoch.
+- **Route A should not default to VEH+DR0 short-window.** Recommended Route A method-class order (if separately approved by Phase 1 governance): memory-state epoch capture → VM-ownership-aware non-DRx → DRx as secondary + gated by a separate local-harness proposal.
+
+**Anti-revival cross-check (2026-07-29):**
+
+- `crates/bwhook/**` — **unchanged** by this filing.
+- `crates/cli/src/unpacker/gto_host.rs` (research branch) — **unchanged** by this filing.
+- `tools/_r1b_transient_epoch_trap.py` — **unchanged** by this filing.
+- Vault evidence under `D:\MidaVault\lab\evidence\_r1b_transient_epoch_trap\` and `D:\MidaVault\scratch\bootwatch\r1a_n10_20260728-192757\` — **unmodified** (only SHA-256 hashes recorded for audit).
+- No new untracked vault evidence written.
+
+**Next action requires (separately from this filing):**
+
+- Expert review of the audit document.
+- Operator names `GTO-PRODUCT-RECOVERY Phase 1 on Route X` literally (per `docs/GTO_PRODUCT_RECOVERY_CHARTER_20260729.md` §3.3 + §8.6) **and** a new expert ruling OR charter amendment recorded in this handoff that explicitly allocates rounds in the `GTO-PRODUCT-RECOVERY` ledger namespace. **This Phase 0.5 audit does not allocate any rounds; it only informs method-class choice.**
+- If DRx is to be used at all: a separate governance proposal (e.g. `docs/GTO_PRODUCT_RECOVERY_LOCAL_HARNESS_20260729.md`) for a non-GTO local flag-acceptance harness is required first; **out of scope for this audit**.
+
 ## origin_macro — DONE (evidence)
 
 - Structure R0B StructuralPassBehaviorPending
