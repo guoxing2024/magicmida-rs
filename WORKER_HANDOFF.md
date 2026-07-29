@@ -22,10 +22,11 @@ Perfect unpack of exactly two samples.
 
 ### Phase C re-run (2026-07-29) evidence pointers
 
-- Live dump: `D:\MidaVault\lab\evidence\origin_macro\live_20260729-165727\origin_unpacked.exe` (18 sections, 13,769,216 bytes)
-- Bound manifest written (0 transforms): sha256 `ae1e6344683dfc193932faf96b06b3bba45a59af6ee8f8d403928eeef09cc7cc`
-- Smoke batch: `D:\MidaVault\lab\evidence\_repeat\batch_20260729-165829_phase_c_origin_reg\summary.json` — `all_ok=True`
-- R0B report: `D:\MidaVault\scratch\phase_c_origin_r0b.json` — 12 gates pass, 0 failures, 0 warnings
+- Live dump: `D:\MidaVault\lab\evidence\origin_macro\live_20260729-165727\origin_unpacked.exe` (18 sections, 13,769,216 bytes, sha256 `ae1e6344…`)
+- Bound manifest written (0 transforms): sha256 `ae1e6344683dfc193932faf96b06b3bba45a59af6ee8f8d403928eeef09cc7cc`  (== live dump sha256)
+- Smoke batch: `D:\MidaVault\lab\evidence\_repeat\batch_20260729-165829_phase_c_origin_reg\summary.json` — `all_ok=True` (artifact sha256 `aa99fa05…`)
+- R0B report: `D:\MidaVault\scratch\phase_c_origin_r0b.json` — 12 gates pass, 0 failures, 0 warnings (artifact sha256 `ae1e6344…`)
+- **Distinction (corrected 2026-07-29 per expert review):** the smoke artifact (`aa99fa05…`) and the R0B/manifest-bound artifact (`ae1e6344…`) are **two independent runs** of the unpacker, not one artifact running through a unified "all-gates" pipeline. Each individually satisfies its own contract; "Origin non-regression" is the conjunction of these two independent observations, **not** "the same artifact is green across both pipelines." Future evidence descriptions must keep them separate.
 - Offline gates re-verified on `baseline/legacy-recovery-20260722` (after Set B park):
   - `cargo test -p mida-pe --lib` → **175/175 ok**
   - `cargo test -p mida-packers-themida --lib` → **121/121 ok**
@@ -33,17 +34,9 @@ Perfect unpack of exactly two samples.
   - `cargo check -p mida-cli` → **ok** (1 warning: `mut` unused in `gto_host.rs:120`)
   - `cargo build -p mida-cli` → **ok** (CLI matches current baseline source)
 
-### §6 trigger report (filed 2026-07-29)
+### Expert ruling on §6 E battlefield (2026-07-29)
 
-Condition **C-1** (operational takeover per plan §12.1 — three-piece suite green) reached:
-
-- [x] Phase B Set A landed (`7c86595`)
-- [x] Phase C Origin non-regression reconfirmed (`ae1e6344…`)
-- [x] Phase D Set B parked on research branch (`4be4ee5`)
-
-Conditions C-2 / C-3 (R1B capture hits / independent-PE evidence) = **0/1** — R1B capture harness parked per operator instruction; battlefield **not auto-opened**.
-
-**Status language held honest:** product 1.0 = NO (gto second vote still blocked). §6 E field must wait for explicit expert charter per plan §6.3.
+**§6 E field = REJECTED / NOT OPENED.** Expert returned C-1 (operational takeover) as passing, but refused to open §6 E. R1B capture trench remains FROZEN. Re-entry bar = `docs/GTO_RESEARCH_CHARTER_20260728.md` §4 (as amended 2026-07-29) + `docs/GTO_R1A_RESIDUAL_STOP_SEAL_20260728.md` §4. No code change to bwhook / gto_host / `_r1b_transient_epoch_trap.py` authorized by this handoff.
 
 ### Baseline vs research
 
@@ -52,11 +45,12 @@ Conditions C-2 / C-3 (R1B capture hits / independent-PE evidence) = **0/1** — 
 - Set C committed: `validation_summary.json` status=superseded; BB writer no longer re-certifies product Accepted via load_no_crash
 - GTO charter: `docs/GTO_RESEARCH_CHARTER_20260728.md` (battlefield `GTO-POINTEE-EPOCH` on research branch; execute Round 0 only on operator command)
 
-### Open discipline notes (2026-07-29)
+### Open discipline notes (2026-07-29 — corrected 2026-07-29 per expert review)
 
-- R1B DR0 arming is currently blocked on a single `CONTEXT_FLAGS` field: `CONTEXT_DEBUG_REGISTERS_AMD64 | CONTEXT_CONTROL_INTEGER_AMD64` = `0x100013` does **not** include `CONTEXT_AMD64 (0x100000)` architecture bit. Windows `GetThreadContext` rejects with `ERROR_INVALID_PARAMETER`. Fix: OR in `CONTEXT_AMD64`. This is **fix round #1 of #2 budget** in the R1B trench if/when reopened on research branch — **not in scope of plan §6 default**.
+- **WITHDRAWN — prior claim about CONTEXT_FLAGS fix was wrong.** Earlier draft described "OR in `CONTEXT_AMD64`" as a one-line fix for `GetThreadContext` returning `ERROR_INVALID_PARAMETER`. That claim is **incorrect**: `0x100013` already encodes the architecture bit (the high `0x100000` is set inside both `CONTEXT_DEBUG_REGISTERS_AMD64 (0x100010)` and `CONTEXT_CONTROL_INTEGER_AMD64 (0x100003)`). OR-ing `CONTEXT_AMD64` again is a no-op and does not fix anything. The actual root cause of the `GetThreadContext` Err in the R1B smoke is **not established** — candidates remain: (i) non-standard flag combination behavior on this Win10/11 build; (ii) suspend-count / handle race (earlier session observed `SuspendThread(prev=0)` while host had skipped its own suspend); (iii) thread-state precondition not actually met at the moment of DLL arming. **No "one-line fix" is to be trusted or committed without empirical `ERROR_INVALID_PARAMETER` reproduction under controlled flags, and without showing the flag value Windows actually accepted.**
 - bwhook diagnostic log path: `D:\MidaVault\scratch\r1b_smoke_log\` (vault only, not committed)
 - Race note observed earlier in this session: `SuspendThread(prev=0)` showed up while BootWatch had already frozen the RIP — handled by host's `if frozen_rip.is_none() && bootwatch_vm_enter_rip.is_none()` gate, but worth a hygiene pass if R1B is reopened.
+- **R1B trench remains FROZEN** per expert 2026-07-29 ruling; re-entry bar = `docs/GTO_RESEARCH_CHARTER_20260728.md` §4 (as amended 2026-07-29) + `docs/GTO_R1A_RESIDUAL_STOP_SEAL_20260728.md` §4.
 
 ## origin_macro — DONE (evidence)
 
