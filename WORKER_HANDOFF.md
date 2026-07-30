@@ -623,3 +623,23 @@ used=2 / cap=2 / remaining=0 (final Route C round; no R3)
 ### Non-claims
 - Not product 1.0
 - No live/vault/push; no bypass; no gto_host/bwhook/DRx/VEH/injection/R1B/E2
+
+## GTO-PRODUCT-RECOVERY Route F R2 — RESIDUAL-STOP (2026-07-30)
+
+**Branch:** `codex/gto-route-f-r1`
+**Base:** `18d1a13`
+**Ledger:** used=2 / cap=2 / remaining=0 (final Route F round; **no R3**)
+
+### Result
+- Live no-bypass remeasure **failed before dump**:
+  - env: `MIDA_GTO_NO_BYPASS=1`; bypass/semantic-repair absent
+  - FATAL: target exited during observation (`IAT_resolved=true`, `frozen_rip=None`)
+  - no new no-bypass candidate produced; slab prefix **not live-remeasured**
+- Harness (Route E clean-bytes + evidence): `overall_status=FAIL`, `product_1_0=false`
+- Report: `docs/GTO_PRODUCT_RECOVERY_ROUTE_F_R2_20260730.md`
+- Status: **RESIDUAL-STOP** — product 1.0 / perfect unpack **not achieved**
+- Residual blocker: no-bypass dump observation exit before freeze/dump (cannot prove F R1 on live); UI/script gates unproven
+
+### Non-claims
+- Not product 1.0
+- No gto_host fix; no bypass; no R3; no push
