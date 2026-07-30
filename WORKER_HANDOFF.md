@@ -683,3 +683,30 @@ used=2 / cap=2 / remaining=0 (final Route C round; no R3)
 ### Non-claims
 - Not product 1.0
 - No bypass; no R3; no push
+
+## GTO-PRODUCT-RECOVERY Route H P0 Proposal (2026-07-30)
+
+**Proposal artifact:** `docs/GTO_PRODUCT_RECOVERY_ROUTE_H_P0_20260730.md`
+**Base:** `f756950` on `codex/gto-route-g-r1`
+**Status:** proposal only — **0 rounds consumed**; implementation **not started**
+**Route G:** used=2/cap=2 **closed**; **no R3**
+
+### Carried blockers (exact)
+- UI path AV `0xc0000005` (NewClassName not seen)
+- script engine runtime proof **absent**
+- natural load only **1/3**
+- `product_1_0=false`; perfect unpack **not achieved**
+- Audit defect: Route G evidence JSON stale route label `"Route E"` (metadata only)
+
+### Proposed Route H
+- Narrow H1: no-bypass early dump (IAT+10s, no UI) freezes incomplete runtime/heap graph → cold UI AV before NewClassName / no script execution
+- Fresh ledger: `GTO-PRODUCT-RECOVERY Route H` used=0 / cap=2 / remaining=2
+- R1 PASS table: no-bypass env; clean-byte PASS; load pass_rate≥2/3; NewClassName Pass; runtime script Pass; harness `product_1_0=true` only if all hold
+
+### Forbidden
+- bypass/semantic repair; DRx/VEH/injection; R1B/E2; bwhook; Route A observer/scripts; inventing Pass
+
+### Next action requires
+1. Operator names `GTO-PRODUCT-RECOVERY Phase 1 on Route H` literally.
+2. Separate expert ruling allocating Route H rounds.
+3. Bare "continue" / "proceed" does **not** open Route H R1.
