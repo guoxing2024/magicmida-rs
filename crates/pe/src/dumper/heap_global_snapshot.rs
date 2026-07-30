@@ -125,31 +125,87 @@ pub struct HeapGlobalSnapshot {
 }
 
 /// A captured heap slab: one contiguous blob covering the span of all
-/// non-handle heap-global live_ptrs. At runtime the stub HeapAllocs this
-/// blob and rebases every interior pointer `[old_base, old_base+len)` by
-/// `delta = new_base - old_base`. This fixes intra-heap cross-references
-/// that exact-base multi_fixup misses (e.g. `0x846898` in a gap before the
-/// nearest captured object `0x846bb0`).
+/// non-handle heap-global live_ptrs **plus a prefix pad** before the first
+/// object. At runtime the stub reserves/copies this blob and rebases every
+/// interior pointer `old_base < V < old_base+len` by `delta = new_base -
+/// old_base`.
+///
+/// Route F / r27: exact-base multi_fixup misses **pre-object gaps**. Example:
+/// computed ptr `0x846898` (= heap_handle `0x830000` + `0x16898`) sits in a
+/// `0x318`-byte hole **before** the nearest captured object `0x846bb0`. A
+/// slab that starts at min(object live_ptrs) leaves that hole outside the
+/// rebase window. Prefix pad pulls `old_base` down so the hole is interior.
 ///
 /// Strict-interior rule: `old_base < V < old_base+len` (excludes `V ==
 /// old_base` so heap-handle references are not rebased to the slab).
 #[derive(Debug, Clone, Default)]
 pub struct HeapSlab {
-    /// Original heap base (min live_ptr of non-handle globals).
+    /// Original heap base (min live_ptr of non-handle globals, minus prefix).
     pub old_base: u64,
     /// Captured blob (best-effort RPM; gaps zero-filled).
     pub content: Vec<u8>,
 }
 
-/// Ensure image sections that receive heap-global plant writes are MEM_WRITE.
+/// Bytes reserved **before** each captured object live_ptr when forming the
+/// slab span. Covers the r27 `0x318` pre-object hole class with page headroom.
+pub const HEAP_SLAB_PREFIX_PAD: u64 = 0x1000;
+
+/// Hard ceiling for one slab capture (64 MiB).
+const MAX_HEAP_SLAB_BYTES: usize = 64 * 1024 * 1024;
+
+/// Compute `[old_base, end)` for a heap slab from non-handle data globals.
 ///
-/// Policy hot roots can sit in Themida RX pages (e.g. GTO `0x18a898` in
-/// `.,\\W`). Bootstrap does `mov [image_base+rva], new_ptr` at runtime; without
-/// WRITE that store AVs and the title path stays NULL (R-GTO-UI).
+/// Returns `None` when fewer than two data objects exist or the span is empty
+/// / over budget. `old_base` is page-aligned down after applying
+/// [`HEAP_SLAB_PREFIX_PAD`] before the minimum object live_ptr.
+#[must_use]
+pub fn compute_heap_slab_span(heap_globals: &[HeapGlobalSnapshot]) -> Option<(u64, u64)> {
+    let mut min_obj: u64 = u64::MAX;
+    let mut max_end: u64 = 0;
+    let mut count = 0usize;
+    for g in heap_globals {
+        if g.is_heap_handle || g.is_image_inline || g.content.is_empty() {
+            continue;
+        }
+        if g.live_ptr < MIN_USER_POINTER || g.live_ptr > MAX_USER_POINTER {
+            continue;
+        }
+        count += 1;
+        if g.live_ptr < min_obj {
+            min_obj = g.live_ptr;
+        }
+        let end = g.live_ptr.saturating_add(g.content.len() as u64);
+        if end > max_end {
+            max_end = end;
+        }
+    }
+    if count < 2 || min_obj == u64::MAX || min_obj >= max_end {
+        return None;
+    }
+    // Pull base down to cover pre-object holes (r27 0x846898 class), page-align.
+    let padded = min_obj.saturating_sub(HEAP_SLAB_PREFIX_PAD);
+    let old_base = padded & !0xfffu64;
+    if old_base >= max_end {
+        return None;
+    }
+    let span = max_end.saturating_sub(old_base);
+    if span == 0 || span as usize > MAX_HEAP_SLAB_BYTES {
+        return None;
+    }
+    Some((old_base, max_end))
+}
+
+/// True if `va` is a strict-interior address of slab `[old_base, old_base+len)`.
+#[must_use]
+pub fn heap_slab_covers_interior(old_base: u64, len: u64, va: u64) -> bool {
+    va > old_base && va < old_base.saturating_add(len)
+}
+
 /// Capture the heap span covered by all non-handle, non-inline heap globals
-/// as one contiguous blob. Best-effort RPM: pages that cannot be read are
-/// zero-filled so the span stays contiguous. Returns `None` when there are
-/// fewer than 2 data globals or the span exceeds 64 MiB.
+/// as one contiguous blob (with [`HEAP_SLAB_PREFIX_PAD`]). Best-effort RPM:
+/// pages that cannot be read are zero-filled so the span stays contiguous.
+/// Returns `None` when there are fewer than 2 data globals or the span
+/// exceeds 64 MiB.
 ///
 /// The slab lets the runtime stub rebase **interior** heap pointers
 /// (`old_base < V < old_base+len`) that exact-base multi_fixup misses
@@ -158,31 +214,12 @@ pub fn capture_heap_slab(
     heap_globals: &[HeapGlobalSnapshot],
     debugger: &mut dyn mida_core::DebuggerCore,
 ) -> Option<HeapSlab> {
-    // Collect non-handle, non-inline live_ptrs with non-empty content.
-    let mut min_ptr: u64 = u64::MAX;
-    let mut max_end: u64 = 0;
-    let mut count = 0usize;
-    for g in heap_globals {
-        if g.is_heap_handle || g.is_image_inline || g.content.is_empty() {
-            continue;
-        }
-        count += 1;
-        if g.live_ptr < min_ptr {
-            min_ptr = g.live_ptr;
-        }
-        let end = g.live_ptr.saturating_add(g.content.len() as u64);
-        if end > max_end {
-            max_end = end;
-        }
-    }
-    if count < 2 || min_ptr >= max_end {
-        return None;
-    }
+    let (min_ptr, max_end) = compute_heap_slab_span(heap_globals)?;
     let span = max_end.saturating_sub(min_ptr);
-    const MAX_SLAB: usize = 64 * 1024 * 1024;
-    if span == 0 || span as usize > MAX_SLAB {
-        return None;
-    }
+    let data_globals = heap_globals
+        .iter()
+        .filter(|g| !g.is_heap_handle && !g.is_image_inline && !g.content.is_empty())
+        .count();
     let mut blob = vec![0u8; span as usize];
     // Best-effort RPM in page-sized chunks; zero-fill unreadable gaps.
     const CHUNK: usize = 0x1000;
@@ -200,8 +237,9 @@ pub fn capture_heap_slab(
     info!(
         old_base = format_args!("{min_ptr:#x}"),
         span = format_args!("{span:#x}"),
-        globals = count,
-        "Captured heap slab for interior-pointer rebase"
+        prefix_pad = format_args!("{HEAP_SLAB_PREFIX_PAD:#x}"),
+        globals = data_globals,
+        "Captured heap slab for interior-pointer rebase (Route F prefix pad)"
     );
     Some(HeapSlab {
         old_base: min_ptr,
@@ -4910,5 +4948,65 @@ mod tests {
         let ahk_g = globals.iter().find(|g| g.rva == 0x141bf0).unwrap();
         assert_eq!(ahk_g.content.len(), 0x180);
         assert!(ahk_g.content.iter().all(|&b| b == 0));
+    }
+
+    /// Route F / r27: pre-object gap `0x846898` must fall interior to the slab
+    /// when the nearest captured object is at `0x846bb0` (0x318-byte hole).
+    #[test]
+    fn heap_slab_span_covers_r27_pre_object_gap() {
+        // Historical r27 layout (simplified): object at 0x846bb0; computed
+        // stale ptr 0x846898 = 0x830000 + 0x16898 sits 0x318 bytes before it.
+        let globals = vec![
+            HeapGlobalSnapshot {
+                rva: 0x1000,
+                live_ptr: 0x846bb0,
+                content: vec![0u8; 0x40],
+                is_heap_handle: false,
+                is_image_inline: false,
+            },
+            HeapGlobalSnapshot {
+                rva: 0x2000,
+                live_ptr: 0x847000,
+                content: vec![0u8; 0x20],
+                is_heap_handle: false,
+                is_image_inline: false,
+            },
+            // Heap handle must not set min_obj by itself.
+            HeapGlobalSnapshot {
+                rva: 0x3000,
+                live_ptr: 0x830000,
+                content: vec![0u8; 8],
+                is_heap_handle: true,
+                is_image_inline: false,
+            },
+        ];
+        let (old_base, end) = compute_heap_slab_span(&globals).expect("span");
+        let len = end - old_base;
+        // Without prefix pad, old_base would be 0x846bb0 and 0x846898 is outside.
+        assert!(
+            old_base < 0x846898,
+            "old_base={old_base:#x} must be below gap ptr 0x846898"
+        );
+        assert!(
+            heap_slab_covers_interior(old_base, len, 0x846898),
+            "slab [{old_base:#x},{end:#x}) must cover 0x846898"
+        );
+        assert!(heap_slab_covers_interior(old_base, len, 0x846bb0));
+        // Strict interior: old_base itself is not rebased.
+        assert!(!heap_slab_covers_interior(old_base, len, old_base));
+        // Prefix is at least HEAP_SLAB_PREFIX_PAD below min object (page aligned).
+        assert!(0x846bb0 - old_base >= HEAP_SLAB_PREFIX_PAD);
+    }
+
+    #[test]
+    fn heap_slab_span_none_for_single_object() {
+        let globals = vec![HeapGlobalSnapshot {
+            rva: 0x1000,
+            live_ptr: 0x846bb0,
+            content: vec![0u8; 0x40],
+            is_heap_handle: false,
+            is_image_inline: false,
+        }];
+        assert!(compute_heap_slab_span(&globals).is_none());
     }
 }

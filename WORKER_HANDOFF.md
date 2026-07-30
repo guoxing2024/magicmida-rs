@@ -603,3 +603,23 @@ used=2 / cap=2 / remaining=0 (final Route C round; no R3)
 - No vault write / push / inventing evidence
 - No Route E R3; no R1B/E2/DRx/VEH/injection/bypass
 - No new product-recovery round in this closeout
+
+## GTO-PRODUCT-RECOVERY Route F R1 — HEAP SLAB PREFIX (2026-07-30)
+
+**Branch:** `codex/gto-route-f-r1`
+**Base:** `26248f4`
+**Expert ruling:** Route F opened (heap-rebasing wall)
+**Ledger:** used=1 / cap=2 / remaining=1
+
+### Result
+- Production fix in `crates/pe/src/dumper/heap_global_snapshot.rs`:
+  - `HEAP_SLAB_PREFIX_PAD=0x1000` + `compute_heap_slab_span`
+  - covers r27 pre-object gap class (`0x846898` before `0x846bb0`)
+- Unit tests: `heap_slab_span_covers_r27_pre_object_gap` PASS
+- Route E harness self-test + clean-byte/evidence run: still `product_1_0=false`
+- Report: `docs/GTO_PRODUCT_RECOVERY_ROUTE_F_R1_20260730.md`
+- Status: **INCONCLUSIVE** (fix landed; no live no-bypass product 1.0 proof this round)
+
+### Non-claims
+- Not product 1.0
+- No live/vault/push; no bypass; no gto_host/bwhook/DRx/VEH/injection/R1B/E2
