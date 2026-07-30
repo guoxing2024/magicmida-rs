@@ -2,15 +2,16 @@
   "schema_version": "mida.gto.r26b-clean-bytes/v0",
   "route": "GTO-PRODUCT-RECOVERY Route E",
   "round": "R2",
-  "description": "Clean/original bytes sealed from authorized r27 no-bypass unpacked candidate (READ-ONLY vault). Compared against r26b bypass dump: all five sites DIFF.",
+  "description": "Clean/original bytes sealed from authorized r27 no-bypass unpacked candidate (READ-ONLY vault evidence set). Compared against r26b bypass dump: all five sites DIFF. Absolute host paths scrubbed; identity is sha256 + evidence_set_id.",
   "addressing": "rva_as_file_offset_for_file_mapped_dump",
   "default_span": 8,
   "clean_byte_source": {
-    "path": "D:\\MidaVault\\lab\\evidence\\gto_launcher\\r27_nobypass_round0_20260725\\gto_unpacked.exe",
-    "role": "r27_nobypass_unpacked_candidate",
+    "evidence_set_id": "gto_launcher/r27_nobypass_round0_20260725",
+    "artifact_role": "r27_nobypass_unpacked_candidate",
+    "artifact_name": "gto_unpacked.exe",
     "sha256": "88a726e30397782834a77eaffd23304f9886db717854a79f23bff3fd77d70422",
     "size_bytes": 16052736,
-    "authorization": "existing vault artifact r27_nobypass_round0_20260725; MIDA_GTO_NO_BYPASS path; read-only"
+    "provenance": "existing vault lab evidence; MIDA_GTO_NO_BYPASS path; read-only extract for Route E R2 seal"
   },
   "sites": [
     {
@@ -72,6 +73,7 @@
   "non_claims": [
     "sealing clean bytes does not claim product 1.0",
     "r27 candidate still AVs on cold start (heap rebasing) per cdb logs",
-    "does not authorize bypass"
+    "does not authorize bypass",
+    "no absolute vault paths in this manifest"
   ]
 }

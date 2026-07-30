@@ -2,15 +2,18 @@
   "schema_version": "mida.gto.route-e-evidence/v0",
   "route": "GTO-PRODUCT-RECOVERY Route E",
   "round": "R2",
-  "description": "Route E R2 evidence package. Clean-byte source sealed from r27 no-bypass vault candidate. Live/UI/script product evidence for no-bypass path is NOT claimed true.",
+  "description": "Route E R2 evidence package. Clean-byte source sealed from r27 no-bypass vault candidate. Live/UI/script product evidence for no-bypass path is NOT claimed true. Absolute host paths scrubbed.",
   "clean_byte_source": {
-    "path": "D:\\MidaVault\\lab\\evidence\\gto_launcher\\r27_nobypass_round0_20260725\\gto_unpacked.exe",
-    "role": "r27_nobypass_unpacked_candidate",
+    "evidence_set_id": "gto_launcher/r27_nobypass_round0_20260725",
+    "artifact_role": "r27_nobypass_unpacked_candidate",
+    "artifact_name": "gto_unpacked.exe",
     "sha256": "88a726e30397782834a77eaffd23304f9886db717854a79f23bff3fd77d70422",
     "size_bytes": 16052736,
-    "authorization": "existing vault artifact; read-only; no vault write this round",
+    "provenance": "existing vault lab evidence; read-only; no vault write this round",
     "contrast_bypass_candidate": {
-      "path": "D:\\MidaVault\\lab\\evidence\\gto_launcher\\live_r26b_final_newclass\\gto_unpacked.exe",
+      "evidence_set_id": "gto_launcher/live_r26b_final_newclass",
+      "artifact_role": "r26b_bypassed_unpacked_candidate",
+      "artifact_name": "gto_unpacked.exe",
       "sha256": "4d722619ecae4d49197f61379045eb074d1fdb9c4d9a0156df01a806b1e7af28",
       "note": "all five r26b sites DIFF vs r27 clean bytes (bypass patches present on r26b)"
     }
@@ -70,9 +73,12 @@
   "natural_execution_evidence": {
     "true": false,
     "present": false,
-    "source": "D:\\MidaVault\\lab\\evidence\\gto_launcher\\r27_nobypass_round0_20260725\\r27_nobypass_cdb_av.log",
+    "source": null,
     "hash": null,
     "timestamp": null,
+    "evidence_set_id": "gto_launcher/r27_nobypass_round0_20260725",
+    "artifact_role": "r27_nobypass_cdb_av_log",
+    "artifact_name": "r27_nobypass_cdb_av.log",
     "reason": "r27 no-bypass candidate AVs on cold start (heap rebasing wall); cdb logs record AV; not natural product execution Pass"
   },
   "ui_script_path_evidence": {
@@ -81,7 +87,8 @@
     "source": null,
     "hash": null,
     "timestamp": null,
-    "reason": "NewClassName UI evidence exists only on r26b bypassed candidates (e.g. live_r26b_final_newclass); no authorized no-bypass UI Pass artifact"
+    "evidence_set_id": "gto_launcher/live_r26b_final_newclass",
+    "reason": "NewClassName UI evidence exists only on r26b bypassed candidates; no authorized no-bypass UI Pass artifact"
   },
   "script_engine_execution_evidence": {
     "true": false,
@@ -95,6 +102,7 @@
     "not product 1.0",
     "not gto perfect unpack",
     "r26b UI Pass is bypass-path and cannot satisfy product-perfect natural execution",
-    "clean-byte seal alone is not product 1.0"
+    "clean-byte seal alone is not product 1.0",
+    "no absolute vault paths in this package"
   ]
 }
