@@ -313,6 +313,12 @@ def main() -> int:
         if extra:
             cmd.append(extra)
 
+    import os
+
+    # Route G / product-perfect: record no-bypass env; do not invent bypass.
+    no_bypass = os.environ.get("MIDA_GTO_NO_BYPASS") == "1"
+    bypass_set = bool(os.environ.get("MIDA_GTO_BYPASS"))
+    semantic_set = bool(os.environ.get("MIDA_GTO_SEMANTIC_REPAIR"))
     meta = {
         "run_id": run_id,
         "case_id": args.case_id,
@@ -328,19 +334,53 @@ def main() -> int:
         "capture_policy_source": capture_policy_source,
         "capture_policy_path": str(capture_policy_path) if capture_policy_path else None,
         "manifest_path": cfg.get("manifest_path"),
+        "env": {
+            "MIDA_GTO_NO_BYPASS": "1" if no_bypass else "absent_or_other",
+            "MIDA_GTO_BYPASS": "set" if bypass_set else "absent",
+            "MIDA_GTO_SEMANTIC_REPAIR": "set" if semantic_set else "absent",
+        },
     }
     print("RUN", " ".join(cmd), flush=True)
-    t0 = time.time()
-    p = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        cwd=str(CLI.parent),
-    )
-    elapsed = time.time() - t0
-    log = (p.stdout or "") + "\n---STDERR---\n" + (p.stderr or "")
+    if no_bypass:
+        print(
+            "ENV MIDA_GTO_NO_BYPASS=1 bypass=%s semantic=%s"
+            % (
+                "set" if bypass_set else "absent",
+                "set" if semantic_set else "absent",
+            ),
+            flush=True,
+        )
+
+    def _run_once() -> tuple[subprocess.CompletedProcess[str], str, float]:
+        t0 = time.time()
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=str(CLI.parent),
+            env=os.environ.copy(),
+        )
+        elapsed_s = time.time() - t0
+        log_s = (proc.stdout or "") + "\n---STDERR---\n" + (proc.stderr or "")
+        return proc, log_s, elapsed_s
+
+    # Route G: one retry when host still hard-fails observation-exit (pre-fix
+    # CLI) or flaky dump-before-exit leaves no PE.
+    p, log, elapsed = _run_once()
+    attempts = 1
+    obs_exit = "target exited during observation" in log or "dump-before-exit" in log
+    if p.returncode != 0 and not out_pe.is_file() and obs_exit:
+        print("RETRY after GTO observation/exit acquisition failure", flush=True)
+        if out_pe.is_file():
+            try:
+                out_pe.unlink()
+            except OSError:
+                pass
+        p, log, elapsed2 = _run_once()
+        elapsed += elapsed2
+        attempts = 2
     log_path.write_text(log, encoding="utf-8")
     signals = parse_unpack_signals(log)
     meta.update(
@@ -352,6 +392,7 @@ def main() -> int:
             "out_pe_size": out_pe.stat().st_size if out_pe.is_file() else None,
             "log": str(log_path),
             "signals": signals,
+            "acquisition_attempts": attempts,
         }
     )
     print(

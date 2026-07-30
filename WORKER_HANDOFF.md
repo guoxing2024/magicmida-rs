@@ -643,3 +643,24 @@ used=2 / cap=2 / remaining=0 (final Route C round; no R3)
 ### Non-claims
 - Not product 1.0
 - No gto_host fix; no bypass; no R3; no push
+
+## GTO-PRODUCT-RECOVERY Route G R1 — ACQUISITION RELIABILITY (2026-07-30)
+
+**Branch:** `codex/gto-route-g-r1`
+**Base:** `485f584`
+**Ledger:** used=1 / cap=2 / remaining=1
+
+### Result
+- Fix in `gto_host.rs`: dump-before-exit after IAT; no-bypass early dump at IAT+10s without UI
+- `tools/_case_live_unpack.py`: env record + one acquisition retry
+- Live no-bypass acquisition **succeeded** (candidate produced):
+  - evidence_set `gto_launcher/live_20260730-224305_route_g_r1b_nobypass_gtoexp`
+  - size 71803392; sha256 `fde04b4321a73aedd8dec58e68a5ded1e9fbe873e389270c6c565596f23dd29f`
+  - R0B StructuralPassBehaviorPending; clean-byte sites 5/5 PASS
+- Harness: `product_1_0=false` (live/UI/script evidence still FAIL)
+- Report: `docs/GTO_PRODUCT_RECOVERY_ROUTE_G_R1_20260730.md`
+- Status: acquisition reliability **improved**; **not** product 1.0
+
+### Non-claims
+- Not product 1.0
+- No bypass; no DRx/VEH/injection/R1B/E2; no push

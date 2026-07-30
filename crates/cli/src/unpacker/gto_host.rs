@@ -262,6 +262,9 @@ pub(super) fn run_gto_host(
     let mut iat_resolved_at: Option<std::time::Instant> = None;
     let mut ui_seen_at: Option<std::time::Instant> = None;
     let mut loop_count = 0u32;
+    // Route G: process may self-exit after IAT (exit 0) before UI/settle.
+    // Prefer dump-before-exit over hard FATAL when IAT already resolved.
+    let mut exited_after_iat = false;
     let target_pid = dbg.pid();
 
     // True when an IAT slot is a resolved external API pointer.
@@ -308,10 +311,26 @@ pub(super) fn run_gto_host(
             }
         };
         if !alive {
+            if iat_resolved_at.is_some() {
+                // Route G R1: acquisition reliability — dump while the process
+                // handle still allows VM reads instead of aborting with no PE.
+                exited_after_iat = true;
+                log::log(
+                    LogType::Warn,
+                    &format!(
+                        "GTO host: target exited after IAT resolve (exit_code={exit_code:#x}, \
+                         ui_seen={}, after {} ms) — dump-before-exit via .text scan \
+                         (Route G acquisition reliability)",
+                        ui_seen_at.is_some(),
+                        poll_start.elapsed().as_millis()
+                    ),
+                );
+                break;
+            }
             return Err(anyhow!(
-                "GTO host: target exited during observation (exit_code={exit_code:#x}); \
-                 IAT_resolved={} frozen_rip={frozen_rip:?} — re-run with quieter host or pin last-good dump",
-                iat_resolved_at.is_some()
+                "GTO host: target exited during observation before IAT resolve \
+                 (exit_code={exit_code:#x}); frozen_rip={frozen_rip:?} — \
+                 re-run with quieter host or pin last-good dump"
             ));
         }
 
@@ -364,15 +383,28 @@ pub(super) fn run_gto_host(
         // image-local wrapper slots can resolve (r4c had wrapper_call_patch
         // 0/0; short dumps still zeroed 2 image-local slots → load AV risk).
         // Skip the long settle when product UI already drove an early dump path.
+        //
+        // Route G / no-bypass: targets often self-exit ~10–15s after IAT with
+        // exit 0 and no UI on flaky hosts. Waiting ~58s then hits a dead process
+        // (ReadProcessMemory fails). Dump earlier while still alive.
         if ui_seen_at.is_none() {
             if let Some(iat_t) = iat_resolved_at {
-                let settle = max_wait.saturating_sub(std::time::Duration::from_secs(2));
+                let no_bypass =
+                    std::env::var("MIDA_GTO_NO_BYPASS").ok().as_deref() == Some("1");
+                let settle = if no_bypass {
+                    std::time::Duration::from_secs(10)
+                } else {
+                    max_wait.saturating_sub(std::time::Duration::from_secs(2))
+                };
                 if iat_t.elapsed() >= settle && frozen_rip.is_none() {
                     log::log(
                         LogType::Info,
                         &format!(
-                            "GTO host: IAT+{} ms without .text RIP — dump via .text scan fallback",
-                            iat_t.elapsed().as_millis()
+                            "GTO host: IAT+{} ms without UI/.text freeze — dump via .text scan \
+                             (no_bypass_early={} settle_ms={})",
+                            iat_t.elapsed().as_millis(),
+                            no_bypass,
+                            settle.as_millis()
                         ),
                     );
                     break;
@@ -436,7 +468,17 @@ pub(super) fn run_gto_host(
     if frozen_rip.is_none() {
         let previous = unsafe { SuspendThread(h_thread) };
         if previous == u32::MAX {
-            return Err(anyhow!("GTO host: failed to freeze primary thread"));
+            if exited_after_iat {
+                // Process already gone; keep going — CreateProcess handle often
+                // still permits ReadProcessMemory until we drop the session.
+                log::log(
+                    LogType::Warn,
+                    "GTO host: primary thread freeze failed after post-IAT exit — \
+                     continuing dump while process handle remains open",
+                );
+            } else {
+                return Err(anyhow!("GTO host: failed to freeze primary thread"));
+            }
         }
     }
 
