@@ -382,6 +382,10 @@ No implementation rounds allocated.
 
 - Not R1B / E2 / DRx / VEH / injection / bypass / sample_bypass.
 - No Route A/B R3.
+
+## A1 archive manifest completeness patch
+
+A1 only completes archive index; no new governance or implementation.
 - Not gto perfect unpack.
 - Not R1B / E2 / DRx / VEH / injection / bypass / sample_bypass.
 - Route B complete; no further Route B rounds authorized.
