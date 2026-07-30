@@ -383,6 +383,10 @@ No implementation rounds allocated.
 - Not R1B / E2 / DRx / VEH / injection / bypass / sample_bypass.
 - No Route A/B R3.
 
+## P0 reopen product-perfect route proposal
+
+P0 proposes a new Route C for gto_launcher perfect unpack / product 1.0. No implementation rounds consumed yet.
+
 ## A1 archive manifest completeness patch
 
 A1 only completes archive index; no new governance or implementation.
