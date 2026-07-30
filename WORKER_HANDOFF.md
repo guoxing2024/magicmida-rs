@@ -496,3 +496,29 @@ used=2 / cap=2 / remaining=0 (final Route C round; no R3)
 - No cargo / live / vault write / push
 - No Route A/B/C reopen; no R1B/E2/DRx/VEH/injection/bypass
 - No R2/R3 in this commit
+
+## GTO-PRODUCT-RECOVERY Route D R2 — HARNESS HARDENED / RESIDUAL (2026-07-30)
+
+**Branch:** `codex/gto-route-d-r1`
+**Base:** `0dd5607`
+**Ledger:** used=2 / cap=2 / remaining=0 (final Route D round; **no R3**)
+
+### R1 audit
+- R1 harness accepted as baseline but **INCONCLUSIVE**
+- Defect: bypass gate only scanned forbidden env strings; did not verify 5 r26b patch sites
+
+### R2 result
+- Hardened `tools/_mtr_gto_product_perfect_validate.py`:
+  - explicit r26b sites: `0x5c5d`, `0x63f4`, `0x34f66`, `0x34f59`, `0x6757`
+  - missing candidate → INCONCLUSIVE; too small → FAIL; unsealed clean bytes → INCONCLUSIVE per site (never invent PASS)
+  - `--evidence-json` for natural/UI/script evidence (explicit true + source/hash/timestamp)
+  - `product_1_0` only if all required gates PASS
+- Report: `docs/GTO_PRODUCT_RECOVERY_ROUTE_D_R2_20260730.md`
+- Validation: `--help` + `--self-test` OK
+- Status: **INCONCLUSIVE / residual** (no sealed clean bytes + no real live evidence → not product 1.0)
+
+### Non-claims
+- Not product 1.0 / not gto perfect unpack
+- No cargo / live / vault write / push
+- No Route A/B/C; no R1B/E2/DRx/VEH/injection/bypass
+- No Route D R3
