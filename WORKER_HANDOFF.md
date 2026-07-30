@@ -710,3 +710,31 @@ used=2 / cap=2 / remaining=0 (final Route C round; no R3)
 1. Operator names `GTO-PRODUCT-RECOVERY Phase 1 on Route H` literally.
 2. Separate expert ruling allocating Route H rounds.
 3. Bare "continue" / "proceed" does **not** open Route H R1.
+
+## GTO-PRODUCT-RECOVERY Route H R1 — NEW SAMPLE + H1 TIMING (2026-07-31)
+
+**Branch:** `codex/gto-route-h-r1`
+**Base:** `7ab296a`
+**Ledger:** used=1 / cap=2 / remaining=1
+
+### Protected input (updated)
+- New `启动器.exe` sha256 **`46539ea7b1bf1f43…`** size 14300672
+- Supersedes **`4d5770af…`** (old vault/case dumps non-authoritative for product)
+
+### Code
+- `ahk_gto` identify: Match on numbered `.dataN` (no `.KI3`)
+- `gto_host`: Route H UI-prefer timing + last-resort alive dump; G dump-before-exit retained
+- Route G evidence JSON route label hygiene (`Route G`)
+
+### Live result
+- GTO host Match conf=75; candidate sha256 `4f2f9a4462cd5e03…` size 26525240
+- Dump: **ui_seen=false**, last_resort IAT+9s
+- load/UI probes: **WinError 193** (invalid PE); clean-byte vs old seals **FAIL**
+- `product_1_0=false` — **not** product PASS
+- Report: `docs/GTO_PRODUCT_RECOVERY_ROUTE_H_R1_20260730.md`
+- Evidence: `docs/GTO_PRODUCT_RECOVERY_ROUTE_H_EVIDENCE_20260730.json`
+- Residual: new-layout dump not loader-valid; clean-byte must re-seal for 46539ea7; UI never seen live
+
+### Non-claims
+- Not product 1.0
+- No bypass; no inventing Pass; R2 available

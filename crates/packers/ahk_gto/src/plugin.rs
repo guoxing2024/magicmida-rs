@@ -52,17 +52,28 @@ impl AhkGtoPlugin {
     fn score_sections(names: &[String]) -> u8 {
         let mut score = 0u8;
         let mut scrambled = 0u8;
+        // Newer GTO packs (2026+) may drop `.KI3` and use numbered `.dataN` blobs.
+        let mut numbered_data = 0u8;
         for n in names {
             let lower = n.to_ascii_lowercase();
             let trimmed = lower.trim();
             if trimmed == ".ki3" || trimmed.starts_with(".ki3") {
                 score = score.saturating_add(50);
+            } else if is_gto_numbered_data_section(trimmed) {
+                numbered_data = numbered_data.saturating_add(1);
+                // Still count as scrambled for the multi-scrambled bonus path.
+                scrambled = scrambled.saturating_add(1);
             } else if is_scrambled_section_name(trimmed) {
                 scrambled = scrambled.saturating_add(1);
             } else if is_oreans_marker(trimmed) {
                 // Strong Oreans signal → push away from AHK/GTO match.
                 return 0;
             }
+        }
+        // Two+ `.data0`/`.data1`/… sections are a strong AHK/GTO family marker
+        // on samples without `.KI3` (Route H new protected input layout).
+        if numbered_data >= 2 {
+            score = score.saturating_add(45);
         }
         if scrambled >= 2 {
             score = score.saturating_add(30);
@@ -102,6 +113,16 @@ fn is_oreans_marker(name: &str) -> bool {
         || name == ".boot"
         || name == ".winlice"
         || name.starts_with(".winlic")
+}
+
+/// GTO numbered data payload sections (e.g. `.data0`, `.data1`, `.data2`).
+fn is_gto_numbered_data_section(name: &str) -> bool {
+    let n = name.trim();
+    if !n.starts_with(".data") || n == ".data" {
+        return false;
+    }
+    // `.data0`, `.data1`, … (digit suffix after ".data")
+    n.as_bytes().get(5).is_some_and(|c| c.is_ascii_digit())
 }
 
 /// Non-standard PE section names (scrambled / placeholder).
@@ -333,6 +354,18 @@ mod tests {
     fn plain_pe_is_no_match() {
         let r = AhkGtoPlugin::new().identify(&input(&[".text", ".rdata", ".data", ".rsrc"]));
         assert_eq!(r, IdentifyResult::NoMatch);
+    }
+
+    #[test]
+    fn numbered_data_sections_match_without_ki3() {
+        // 2026-07-30 updated 启动器.exe layout (sha256 46539ea7…): no .KI3.
+        let r = AhkGtoPlugin::new().identify(&input(&[
+            ".text", ".rdata", ".data", ".pdata", "_RDATA", ".data0", ".data1", ".data2", ".rsrc",
+        ]));
+        match r {
+            IdentifyResult::Match { confidence } => assert!(confidence >= 40, "conf={confidence}"),
+            other => panic!("expected Match, got {other:?}"),
+        }
     }
 
     #[test]

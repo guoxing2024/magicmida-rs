@@ -1,0 +1,60 @@
+{
+  "schema_version": "mida.gto.route-h-evidence/v0",
+  "route": "GTO-PRODUCT-RECOVERY Route H",
+  "round": "R1",
+  "description": "Route H R1 evidence for updated protected input. product_1_0 not claimed.",
+  "protected_input": {
+    "artifact_role": "gto_launcher_protected_updated",
+    "sha256": "46539ea7b1bf1f43cf2ed09fc0642d84b10a274939efb7c08f87b1869d738aa8",
+    "size_bytes": 14300672,
+    "supersedes_sha256": "4d5770afdd2f6d9553fef66826c5a55211b80d8d174360a115f247efafb037c8",
+    "note": "Operator-updated 启动器.exe; old dumps/candidates tied to 4d5770af are non-authoritative"
+  },
+  "candidate": {
+    "evidence_set_id": "scratch/product_recovery_route_h_r1_newsample_b_20260731",
+    "artifact_role": "route_h_r1_nobypass_unpacked_candidate",
+    "sha256": "4f2f9a4462cd5e03ef92205251897abb0454e55cd31b407790069b60bd30118d",
+    "size_bytes": 26525240,
+    "dump_note": "ahk_gto Match; Route H timing; ui_seen=false; last_resort_alive IAT+9s"
+  },
+  "env": {
+    "MIDA_GTO_NO_BYPASS": "1",
+    "MIDA_GTO_BYPASS": "absent",
+    "MIDA_GTO_SEMANTIC_REPAIR": "absent"
+  },
+  "natural_execution_evidence": {
+    "true": false,
+    "present": false,
+    "source": "scratch/product_recovery_route_h_r1_probes_20260731/load_no_crash.json",
+    "hash": null,
+    "timestamp": "2026-07-31T00:30:00Z",
+    "reason": "load_no_crash Fail 0/3; WinError 193 invalid Win32 application"
+  },
+  "ui_script_path_evidence": {
+    "true": false,
+    "present": false,
+    "source": "scratch/product_recovery_route_h_r1_probes_20260731/window_class.json",
+    "hash": null,
+    "timestamp": "2026-07-31T00:30:00Z",
+    "reason": "window_class error OSError; cannot launch candidate; NewClassName not observed"
+  },
+  "script_engine_execution_evidence": {
+    "true": false,
+    "present": false,
+    "source": null,
+    "hash": null,
+    "timestamp": null,
+    "reason": "no runtime script-engine proof; candidate not loader-valid"
+  },
+  "clean_byte_gate": {
+    "route_e_seals_apply": false,
+    "result": "FAIL",
+    "reason": "Route E seals bound to old 4d5770af layout; all five r26b sites mismatch on new candidate"
+  },
+  "product_1_0": false,
+  "non_claims": [
+    "not product 1.0",
+    "not perfect unpack",
+    "old 4d5770af dumps not authority for new sample"
+  ]
+}

@@ -40,6 +40,10 @@ const GTO_UI_WINDOW_CLASS: &str = "NewClassName";
 /// After the product window appears, wait this long so IAT wrappers / script
 /// settle, then dump (R-GTO-UI). Protected shows the window ~1s after start.
 const GTO_UI_POST_WINDOW_SETTLE: std::time::Duration = std::time::Duration::from_secs(3);
+/// Route H / no-bypass: extra settle after NewClassName so gscript/heap roots
+/// include post-GUI state (H1: early dump incomplete for cold UI).
+const GTO_NO_BYPASS_UI_POST_WINDOW_SETTLE: std::time::Duration =
+    std::time::Duration::from_secs(5);
 
 /// True when `pid` owns a top-level window with the given class name.
 fn process_has_window_class(pid: u32, class_name: &str) -> bool {
@@ -246,12 +250,26 @@ pub(super) fn run_gto_host(
     // r4c green: full 60s post-attach observation. Do not let a lower
     // text_poll_idle_timeout_secs shrink this (plugin default ~30s left us
     // dumping at IAT+28s with smaller .boot / stub_size than r4c).
-    let max_wait = std::time::Duration::from_secs(
-        plugin_ctx
-            .text_poll_idle_timeout_secs
-            .max(60)
-            .min(90),
-    );
+    // Route H / no-bypass: hold the full upper cap so UI-seen has room before
+    // any no-UI fallback (H1 rejects pure IAT+10s early dump).
+    let no_bypass = std::env::var("MIDA_GTO_NO_BYPASS").ok().as_deref() == Some("1");
+    let max_wait = if no_bypass {
+        std::time::Duration::from_secs(90)
+    } else {
+        std::time::Duration::from_secs(
+            plugin_ctx
+                .text_poll_idle_timeout_secs
+                .max(60)
+                .min(90),
+        )
+    };
+    if no_bypass {
+        log::log(
+            LogType::Info,
+            "GTO host: Route H no-bypass timing — prefer UI-seen settle; \
+             no IAT+10s early dump; dump-before-exit only if process dies after IAT",
+        );
+    }
     let main_tid = dbg.main_thread_id();
     let h_thread = dbg
         .thread_handle(main_tid)
@@ -366,33 +384,36 @@ pub(super) fn run_gto_host(
             }
         }
         if let Some(ui_t) = ui_seen_at {
-            if ui_t.elapsed() >= GTO_UI_POST_WINDOW_SETTLE {
+            let ui_settle = if no_bypass {
+                GTO_NO_BYPASS_UI_POST_WINDOW_SETTLE
+            } else {
+                GTO_UI_POST_WINDOW_SETTLE
+            };
+            if ui_t.elapsed() >= ui_settle {
                 log::log(
                     LogType::Info,
                     &format!(
-                        "GTO host: UI settle {} ms complete — dump via .text scan",
-                        ui_t.elapsed().as_millis()
+                        "GTO host: UI settle {} ms complete (need {} ms, no_bypass={}) — dump via .text scan",
+                        ui_t.elapsed().as_millis(),
+                        ui_settle.as_millis(),
+                        no_bypass
                     ),
                 );
                 break;
             }
         }
 
-        // After IAT resolves, prefer live .text RIP. Green r4c waited ~60s total
-        // observation before .text scan. Hold most of max_wait after IAT so
-        // image-local wrapper slots can resolve (r4c had wrapper_call_patch
-        // 0/0; short dumps still zeroed 2 image-local slots → load AV risk).
-        // Skip the long settle when product UI already drove an early dump path.
-        //
-        // Route G / no-bypass: targets often self-exit ~10–15s after IAT with
-        // exit 0 and no UI on flaky hosts. Waiting ~58s then hits a dead process
-        // (ReadProcessMemory fails). Dump earlier while still alive.
+        // After IAT resolves without UI:
+        // - Default/bypass: hold most of max_wait (r4c wrapper quality).
+        // - Route H / no-bypass: prefer UI for full max_wait, but take a
+        //   **last-resort alive dump at IAT+9s** if UI never appears — hosts
+        //   often self-exit ~12s post-IAT; dump-after-exit cannot RPM.
+        //   Prefer UI when it appears before that deadline.
         if ui_seen_at.is_none() {
             if let Some(iat_t) = iat_resolved_at {
-                let no_bypass =
-                    std::env::var("MIDA_GTO_NO_BYPASS").ok().as_deref() == Some("1");
                 let settle = if no_bypass {
-                    std::time::Duration::from_secs(10)
+                    // Last-resort alive window (before typical ~12s exit).
+                    std::time::Duration::from_secs(9)
                 } else {
                     max_wait.saturating_sub(std::time::Duration::from_secs(2))
                 };
@@ -401,10 +422,12 @@ pub(super) fn run_gto_host(
                         LogType::Info,
                         &format!(
                             "GTO host: IAT+{} ms without UI/.text freeze — dump via .text scan \
-                             (no_bypass_early={} settle_ms={})",
+                             (no_bypass={} settle_ms={} route_h_ui_prefer={} last_resort_alive={})",
                             iat_t.elapsed().as_millis(),
                             no_bypass,
-                            settle.as_millis()
+                            settle.as_millis(),
+                            no_bypass,
+                            no_bypass
                         ),
                     );
                     break;
@@ -412,8 +435,19 @@ pub(super) fn run_gto_host(
             }
         }
 
-        let previous = unsafe { SuspendThread(h_thread) };
-        if previous != u32::MAX {
+        // Route H / no-bypass: suspend less often so the UI thread can paint
+        // NewClassName before we freeze/dump (H1: thrashing may hide UI).
+        let do_suspend = if no_bypass && iat_resolved_at.is_some() && ui_seen_at.is_none() {
+            loop_count % 4 == 0
+        } else {
+            true
+        };
+        let previous = if do_suspend {
+            unsafe { SuspendThread(h_thread) }
+        } else {
+            u32::MAX - 1 // skip suspend this tick; treat as "not suspended"
+        };
+        if do_suspend && previous != u32::MAX {
             if let Ok(ctx) = dbg.get_thread_context_control(main_tid) {
                 let rip = ctx.Rip as usize;
                 let in_watch = oep_watch
@@ -461,8 +495,10 @@ pub(super) fn run_gto_host(
         }
 
         // Slightly less aggressive than 50ms — SuspendThread thrashing can
-        // destabilize short-lived GTO launchers.
-        std::thread::sleep(std::time::Duration::from_millis(80));
+        // destabilize short-lived GTO launchers. Route H no-bypass: longer
+        // tick when not suspending so UI can appear.
+        let tick_ms = if no_bypass && !do_suspend { 120 } else { 80 };
+        std::thread::sleep(std::time::Duration::from_millis(tick_ms));
     }
 
     if frozen_rip.is_none() {

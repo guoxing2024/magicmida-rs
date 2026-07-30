@@ -1,8 +1,8 @@
 {
   "schema_version": "mida.gto.route-g-evidence/v0",
-  "route": "GTO-PRODUCT-RECOVERY Route E",
+  "route": "GTO-PRODUCT-RECOVERY Route G",
   "round": "R2",
-  "description": "Route G R2 product evidence for no-bypass candidate from Route G R1 acquisition. Absolute host paths scrubbed; identity via evidence_set_id + sha256.",
+  "description": "Route G R2 product evidence for no-bypass candidate from Route G R1 acquisition. Absolute host paths scrubbed; identity via evidence_set_id + sha256. (Hygiene: top-level route label corrected from stale Route E — audit metadata only.)",
   "candidate": {
     "evidence_set_id": "gto_launcher/live_20260730-224305_route_g_r1b_nobypass_gtoexp",
     "artifact_role": "route_g_r1_nobypass_unpacked_candidate",
