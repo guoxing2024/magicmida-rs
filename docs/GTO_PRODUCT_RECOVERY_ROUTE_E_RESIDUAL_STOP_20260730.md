@@ -36,7 +36,7 @@ No-bypass cold-start / heap-rebasing wall: r27 candidate AVs and does not natura
 
 ## Hygiene
 
-Committed Route E manifests/reports use logical ids (`evidence_set_id`, `artifact_role`, `sha256`, `size_bytes`, `provenance`) — **no** source-controlled absolute `D:\MidaVault\...` paths. Site clean hex values retained.
+Committed Route E manifests/reports use logical ids (`evidence_set_id`, `artifact_role`, `sha256`, `size_bytes`, `provenance`) — **no** source-controlled absolute host vault paths. Site clean hex values retained.
 
 ---
 

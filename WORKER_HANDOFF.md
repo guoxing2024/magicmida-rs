@@ -596,6 +596,7 @@ used=2 / cap=2 / remaining=0 (final Route C round; no R3)
 - Absolute vault paths scrubbed from Route E committed manifests/reports
 - Logical ids only: evidence_set_id / artifact_role / sha256 / size_bytes / provenance
 - Clean-byte site hex values retained
+- Route E final path scrub completed
 
 ### Non-claims
 - Not product 1.0 / not gto perfect unpack
