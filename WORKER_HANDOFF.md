@@ -571,3 +571,26 @@ used=2 / cap=2 / remaining=0 (final Route C round; no R3)
 - No live/cargo/vault/push
 - No inventing clean bytes
 - No Route A/B/C/D R3; no R1B/E2/DRx/VEH/injection/bypass
+
+## GTO-PRODUCT-RECOVERY Route E R2 — RESIDUAL-STOP (2026-07-30)
+
+**Branch:** `codex/gto-route-e-r1`
+**Base:** `7981e31`
+**Ledger:** used=2 / cap=2 / remaining=0 (final Route E round; **no R3**)
+
+### Result
+- Clean bytes **sealed** from vault r27 no-bypass unpacked:
+  `D:\MidaVault\lab\evidence\gto_launcher\r27_nobypass_round0_20260725\gto_unpacked.exe`
+  sha256 `88a726e30397782834a77eaffd23304f9886db717854a79f23bff3fd77d70422`
+- All 5 r26b sites sealed; DIFF vs r26b bypass dump confirmed
+- Manifest: `docs/GTO_PRODUCT_RECOVERY_ROUTE_E_CLEAN_BYTES_20260730.json`
+- Evidence: `docs/GTO_PRODUCT_RECOVERY_ROUTE_E_EVIDENCE_20260730.json`
+- Live/UI/script: **not PASS** (r27 AV; UI Pass only on bypass path; no no-bypass script Pass)
+- Harness: `product_1_0=false` → **RESIDUAL-STOP**
+- Report: `docs/GTO_PRODUCT_RECOVERY_ROUTE_E_R2_20260730.md`
+- Residual blocker: no-bypass cold-start / heap-rebasing wall (not bypass-site unknown bytes)
+
+### Non-claims
+- Not product 1.0 / not gto perfect unpack
+- No vault write / push / inventing evidence
+- No Route E R3; no R1B/E2/DRx/VEH/injection/bypass

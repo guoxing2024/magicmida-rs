@@ -450,7 +450,7 @@ def evaluate(
     return {
         "schema_version": SCHEMA,
         "route": "GTO-PRODUCT-RECOVERY Route E",
-        "round": "R1-clean-bytes",
+        "round": "R2-evidence",
         "overall_status": overall,
         "product_1_0": bool(product_1_0),
         "gates": gates,
@@ -587,14 +587,17 @@ def run_self_test() -> int:
     finally:
         u_path.unlink(missing_ok=True)
 
-    # load real production manifest (all unsealed) via loader
+    # load production clean-bytes manifest via loader (R2 may seal all five)
     repo = Path(__file__).resolve().parents[1]
     prod = repo / "docs" / "GTO_PRODUCT_RECOVERY_ROUTE_E_CLEAN_BYTES_20260730.json"
     if prod.is_file():
         sites_p, meta_p = load_clean_bytes_manifest(prod)
-        assert meta_p["sealed_count"] == 0
-        assert meta_p["unsealed_count"] >= 5
-        assert all(not s.sealed for s in sites_p)
+        assert meta_p["site_count"] >= 5
+        assert meta_p["sealed_count"] + meta_p["unsealed_count"] == meta_p["site_count"]
+        # If sealed, hex length must match span*2
+        for s in sites_p:
+            if s.sealed:
+                assert s.expected_clean_hex and len(s.expected_clean_hex) == s.span * 2
 
     # sealed + evidence still needs candidate match for product_1_0; with match
     # + full evidence => product_1_0 true (synthetic only)

@@ -1,61 +1,77 @@
 {
   "schema_version": "mida.gto.r26b-clean-bytes/v0",
   "route": "GTO-PRODUCT-RECOVERY Route E",
-  "round": "R1",
-  "description": "Clean/original byte seal attempt for five r26b bypass patch sites. Production sites are UNSEALED: no authorized protected PE extract or oracle clean dump was available offline in this round; bytes are NOT invented.",
+  "round": "R2",
+  "description": "Clean/original bytes sealed from authorized r27 no-bypass unpacked candidate (READ-ONLY vault). Compared against r26b bypass dump: all five sites DIFF.",
   "addressing": "rva_as_file_offset_for_file_mapped_dump",
   "default_span": 8,
+  "clean_byte_source": {
+    "path": "D:\\MidaVault\\lab\\evidence\\gto_launcher\\r27_nobypass_round0_20260725\\gto_unpacked.exe",
+    "role": "r27_nobypass_unpacked_candidate",
+    "sha256": "88a726e30397782834a77eaffd23304f9886db717854a79f23bff3fd77d70422",
+    "size_bytes": 16052736,
+    "authorization": "existing vault artifact r27_nobypass_round0_20260725; MIDA_GTO_NO_BYPASS path; read-only"
+  },
   "sites": [
     {
       "rva": "0x5c5d",
       "site_id": "r26b_0x5c5d",
       "description": "MessageBoxW skip",
       "span": 8,
-      "sealed": false,
-      "expected_clean_hex": null,
-      "unsealed_reason": "no authorized offline source for clean/original bytes at this RVA; inventing hex is forbidden"
+      "sealed": true,
+      "expected_clean_hex": "ff1555810f00488d",
+      "unsealed_reason": null,
+      "source_file_offset": "0x5c5d",
+      "source_note": "PE .text rawptr==va; rva==file_offset for these sites"
     },
     {
       "rva": "0x63f4",
       "site_id": "r26b_0x63f4",
       "description": "LoadFile skip",
       "span": 8,
-      "sealed": false,
-      "expected_clean_hex": null,
-      "unsealed_reason": "no authorized offline source for clean/original bytes at this RVA; inventing hex is forbidden"
+      "sealed": true,
+      "expected_clean_hex": "e8e700030083f8ff",
+      "unsealed_reason": null,
+      "source_file_offset": "0x63f4",
+      "source_note": "PE .text rawptr==va; rva==file_offset for these sites"
     },
     {
       "rva": "0x34f66",
       "site_id": "r26b_0x34f66",
       "description": "CreateWindowEx forced NewClassName",
       "span": 8,
-      "sealed": false,
-      "expected_clean_hex": null,
-      "unsealed_reason": "no authorized offline source for clean/original bytes at this RVA; inventing hex is forbidden"
+      "sealed": true,
+      "expected_clean_hex": "488b158bcc10004c",
+      "unsealed_reason": null,
+      "source_file_offset": "0x34f66",
+      "source_note": "PE .text rawptr==va; rva==file_offset for these sites"
     },
     {
       "rva": "0x34f59",
       "site_id": "r26b_0x34f59",
       "description": "WS_VISIBLE forced",
       "span": 8,
-      "sealed": false,
-      "expected_clean_hex": null,
-      "unsealed_reason": "no authorized offline source for clean/original bytes at this RVA; inventing hex is forbidden"
+      "sealed": true,
+      "expected_clean_hex": "41b90000cf004c8b",
+      "unsealed_reason": null,
+      "source_file_offset": "0x34f59",
+      "source_note": "PE .text rawptr==va; rva==file_offset for these sites"
     },
     {
       "rva": "0x6757",
       "site_id": "r26b_0x6757",
       "description": "msg-loop AV skip",
       "span": 8,
-      "sealed": false,
-      "expected_clean_hex": null,
-      "unsealed_reason": "no authorized offline source for clean/original bytes at this RVA; inventing hex is forbidden"
+      "sealed": true,
+      "expected_clean_hex": "e8c4ed020085c075",
+      "unsealed_reason": null,
+      "source_file_offset": "0x6757",
+      "source_note": "PE .text rawptr==va; rva==file_offset for these sites"
     }
   ],
   "non_claims": [
-    "does not invent clean bytes",
-    "does not claim product 1.0",
-    "does not claim no_bypass_patches PASS",
-    "self-test synthetic seals are not production seals"
+    "sealing clean bytes does not claim product 1.0",
+    "r27 candidate still AVs on cold start (heap rebasing) per cdb logs",
+    "does not authorize bypass"
   ]
 }

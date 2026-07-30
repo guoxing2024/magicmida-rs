@@ -1,0 +1,100 @@
+{
+  "schema_version": "mida.gto.route-e-evidence/v0",
+  "route": "GTO-PRODUCT-RECOVERY Route E",
+  "round": "R2",
+  "description": "Route E R2 evidence package. Clean-byte source sealed from r27 no-bypass vault candidate. Live/UI/script product evidence for no-bypass path is NOT claimed true.",
+  "clean_byte_source": {
+    "path": "D:\\MidaVault\\lab\\evidence\\gto_launcher\\r27_nobypass_round0_20260725\\gto_unpacked.exe",
+    "role": "r27_nobypass_unpacked_candidate",
+    "sha256": "88a726e30397782834a77eaffd23304f9886db717854a79f23bff3fd77d70422",
+    "size_bytes": 16052736,
+    "authorization": "existing vault artifact; read-only; no vault write this round",
+    "contrast_bypass_candidate": {
+      "path": "D:\\MidaVault\\lab\\evidence\\gto_launcher\\live_r26b_final_newclass\\gto_unpacked.exe",
+      "sha256": "4d722619ecae4d49197f61379045eb074d1fdb9c4d9a0156df01a806b1e7af28",
+      "note": "all five r26b sites DIFF vs r27 clean bytes (bypass patches present on r26b)"
+    }
+  },
+  "site_table": [
+    {
+      "rva": "0x5c5d",
+      "site_id": "r26b_0x5c5d",
+      "description": "MessageBoxW skip",
+      "sealed": true,
+      "expected_clean_hex": "ff1555810f00488d",
+      "r27_hex": "ff1555810f00488d",
+      "r26b_hex": "b80100000090488d",
+      "diff_vs_r26b": true
+    },
+    {
+      "rva": "0x63f4",
+      "site_id": "r26b_0x63f4",
+      "description": "LoadFile skip",
+      "sealed": true,
+      "expected_clean_hex": "e8e700030083f8ff",
+      "r27_hex": "e8e700030083f8ff",
+      "r26b_hex": "b80100000083f8ff",
+      "diff_vs_r26b": true
+    },
+    {
+      "rva": "0x34f66",
+      "site_id": "r26b_0x34f66",
+      "description": "CreateWindowEx forced NewClassName",
+      "sealed": true,
+      "expected_clean_hex": "488b158bcc10004c",
+      "r27_hex": "488b158bcc10004c",
+      "r26b_hex": "488d153dc2ed004c",
+      "diff_vs_r26b": true
+    },
+    {
+      "rva": "0x34f59",
+      "site_id": "r26b_0x34f59",
+      "description": "WS_VISIBLE forced",
+      "sealed": true,
+      "expected_clean_hex": "41b90000cf004c8b",
+      "r27_hex": "41b90000cf004c8b",
+      "r26b_hex": "41b90000cf014c8b",
+      "diff_vs_r26b": true
+    },
+    {
+      "rva": "0x6757",
+      "site_id": "r26b_0x6757",
+      "description": "msg-loop AV skip",
+      "sealed": true,
+      "expected_clean_hex": "e8c4ed020085c075",
+      "r27_hex": "e8c4ed020085c075",
+      "r26b_hex": "b80100000085c075",
+      "diff_vs_r26b": true
+    }
+  ],
+  "natural_execution_evidence": {
+    "true": false,
+    "present": false,
+    "source": "D:\\MidaVault\\lab\\evidence\\gto_launcher\\r27_nobypass_round0_20260725\\r27_nobypass_cdb_av.log",
+    "hash": null,
+    "timestamp": null,
+    "reason": "r27 no-bypass candidate AVs on cold start (heap rebasing wall); cdb logs record AV; not natural product execution Pass"
+  },
+  "ui_script_path_evidence": {
+    "true": false,
+    "present": false,
+    "source": null,
+    "hash": null,
+    "timestamp": null,
+    "reason": "NewClassName UI evidence exists only on r26b bypassed candidates (e.g. live_r26b_final_newclass); no authorized no-bypass UI Pass artifact"
+  },
+  "script_engine_execution_evidence": {
+    "true": false,
+    "present": false,
+    "source": null,
+    "hash": null,
+    "timestamp": null,
+    "reason": "no authorized no-bypass AHK script-engine execution Pass artifact in vault for this round"
+  },
+  "non_claims": [
+    "not product 1.0",
+    "not gto perfect unpack",
+    "r26b UI Pass is bypass-path and cannot satisfy product-perfect natural execution",
+    "clean-byte seal alone is not product 1.0"
+  ]
+}
