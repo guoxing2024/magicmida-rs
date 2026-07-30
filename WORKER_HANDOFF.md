@@ -522,3 +522,30 @@ used=2 / cap=2 / remaining=0 (final Route C round; no R3)
 - No cargo / live / vault write / push
 - No Route A/B/C; no R1B/E2/DRx/VEH/injection/bypass
 - No Route D R3
+
+## GTO-PRODUCT-RECOVERY Route E P0 Proposal (2026-07-30)
+
+**Proposal artifact:** `docs/GTO_PRODUCT_RECOVERY_ROUTE_E_P0_20260730.md`
+**Base:** `9686221` on `codex/gto-route-d-r1`
+**Status:** proposal only — **0 rounds consumed**; implementation **not started**
+
+### Context
+- Routes A/B/C/D exhausted (each used=2/cap=2/remaining=0; no R3).
+- Route D harness accepted but **INCONCLUSIVE**.
+- Blockers: (1) clean/original bytes for 5 r26b sites unsealed; (2) live/UI/script evidence absent.
+- Product 1.0 / perfect unpack for `gto_launcher` still required.
+
+### Proposed Route E
+- clean-byte sealing + live-evidence acquisition
+- Fresh ledger: `GTO-PRODUCT-RECOVERY Route E` used=0 / cap=2 / remaining=2
+- R1: seal clean bytes + deterministic manifest (+ harness integration contract)
+- R2: authorized live/UI/script evidence + run Route D harness for `product_1_0`
+- Evidence bar: no sealed bytes ⇒ no PASS; no live/UI/script evidence ⇒ no PASS; product 1.0 only if harness PASS
+
+### Forbidden
+- bypass/semantic repair; DRx/VEH/injection; R1B/E2; Route A observer/scripts; `gto_host.rs`; `crates/bwhook/**`
+
+### Next action requires
+1. Operator names `GTO-PRODUCT-RECOVERY Phase 1 on Route E` literally.
+2. Separate expert ruling allocating Route E rounds (not inherited from this P0).
+3. Bare "continue" / "proceed" does **not** open Route E R1.
