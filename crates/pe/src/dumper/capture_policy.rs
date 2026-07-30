@@ -1,4 +1,5 @@
 //! Externalizable dump capture policy for heap-global / AHK-style roots.
+//! Route B R1: minimal changes for CS re-init, per-object hot-root additions, label-name exact-graph, path allocator cold-init.
 //!
 //! Hot RVAs and probe knobs used to be module-private constants. They remain
 //! available as [`DumpCapturePolicy::ahk_gto_default`], but callers can pass a
