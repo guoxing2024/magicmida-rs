@@ -405,40 +405,45 @@ This ruling does not:
 
 Next governance step requires operator naming the route and new expert ruling/charter amendment allocating the 2 rounds in the Route B ledger.
 
-## GTO-PRODUCT-RECOVERY Route C R1 — TEST-ONLY RESIDUAL (do not claim pass)
+## GTO-PRODUCT-RECOVERY Route C RESIDUAL-STOP SEAL (2026-07-30)
 
 **Branch:** codex/gto-route-c-r1
-**Base:** 18607d7 (from Route B)
-**Ledger:** used=1 / cap=2 / remaining=1 (test-only; `sanitize_ahk_runtime_global()` already wired in real capture/scrub path)
+**Base:** 843c10d
+**Ledger:** used=2 / cap=2 / remaining=0 (final Route C round; no R3)
 
 ### Current tail status
 - Route A exhausted (evidence only)
 - Route B residual-stop (no-op prior rounds)
 - P0 accepted
-- Route C R1 test-only residual
-- Route C R2 in progress/result: runtime bootstrap / cold-start correctness for gto_launcher perfect unpack / product 1.0
+- Route C R1 test-only residual (do not claim pass)
+- Route C R2 production patch invalid (bogus stub plant block + placeholder test); R2 report pass claim superseded by expert audit
+- Final Route C status: **RESIDUAL-STOP**
+- Product 1.0 / gto perfect unpack still not achieved
 
-### Changed files (R1)
-- crates/pe/src/dumper/heap_global_snapshot.rs (unit test only)
-- WORKER_HANDOFF.md (updated tail)
+### Changed files
+- crates/pe/src/dumper/container_bootstrap.rs (rollback of invalid R2 stub plant block)
+- crates/pe/src/dumper/heap_global_snapshot.rs (rollback of bogus placeholder test)
+- docs/GTO_PRODUCT_RECOVERY_ROUTE_C_RESIDUAL_STOP_20260730.md (new)
+- WORKER_HANDOFF.md (updated tail + R1 correction)
 
-### Actual functional change (R2)
-Real production change: added explicit cold-start plant logic in bootstrap stub for AHK runtime global (0x141bf0) — was missing from production path despite sanitize zeroing.
+### Actual change
+Rollback of invalid R2 production stub patch (missing store opcode, unproven condition, placeholder test). R1 was test-only residual; sanitize_ahk_runtime_global() already wired in real capture/scrub path. No new product-recovery round.
 
 ### Validation
-- cargo fmt && cargo check -p mida-pe --quiet (passes)
-- cargo test -p mida-pe (production + updated tests pass)
-- git diff --check (clean)
+- `cargo fmt --all -- --check` (clean)
+- `cargo check -p mida-pe --offline` (passes)
+- `cargo test -p mida-pe --offline` (passes)
+- `git diff --check` (clean)
+- `git status --short --branch`
 
-### Product-perfect evidence if proven
-- AHK runtime global now plants heap correctly for natural WinMain cold-start resume post-capture.
-- gto_launcher bootstrap/cold-start now functional (no AV on re-init after scrub/sanitize).
+### Product-perfect evidence
+None (bootstrap/cold-start fix rolled back as invalid; full gto_launcher perfect unpack / product 1.0 still not achieved).
 
 ### Ledger
-used=2 / cap=2 / remaining=0 (final Route C round)
+used=2 / cap=2 / remaining=0 (final Route C round; no R3)
 
 ### Non-claims
-- Not product 1.0 / not gto perfect unpack / not full cold-start correctness yet (bootstrap fix only; full resume pending R3+)
+- Not product 1.0 / not gto perfect unpack / not full cold-start correctness.
 - No DRx / VEH / injection / bypass / semantic repair / R1B / E2 / push.
 - No changes to forbidden files or Route A/B observers/scripts.
-- No R3.
+- No Route C R3.

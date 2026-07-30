@@ -769,18 +769,6 @@ fn build_stub_code(
         stub.extend_from_slice(&relative_displacement(store_next, heap_global_rva)?);
     }
 
-    // Production cold-start fix (R2): explicit plant for AHK runtime global @0x141bf0
-    // (sanitize_ahk_runtime_global zeros the body; this ensures GetProcessHeap is planted for natural WinMain resume)
-    if let Some(hr) = heap_global_rva {
-        if hr == 0x141bf0 {
-            stub.extend_from_slice(&[0x48, 0x8B, 0x05]); // mov rax, [rip + GetProcessHeap IAT]
-            let plant_next = stub_rva.checked_add(stub.len() as u32)?.checked_add(4)?;
-            stub.extend_from_slice(&relative_displacement(plant_next, get_process_heap_iat_rva)?);
-            let store_next = stub_rva.checked_add(stub.len() as u32)?.checked_add(4)?;
-            stub.extend_from_slice(&relative_displacement(store_next, 0x141bf0)?);
-        }
-    }
-
     // Call-site placeholders patched after helpers are emitted.
     let mut memcpy_sites: Vec<usize> = Vec::new();
     let mut update_sites: Vec<usize> = Vec::new();
