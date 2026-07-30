@@ -472,3 +472,27 @@ used=2 / cap=2 / remaining=0 (final Route C round; no R3)
 - `tools/_r1b_transient_epoch_trap.py` — **unchanged**.
 - Vault evidence under previous routes — **unmodified**.
 - No new untracked vault evidence written.
+
+## GTO-PRODUCT-RECOVERY Route D R1 — HARNESS COMMITTED (2026-07-30)
+
+**Branch:** `codex/gto-route-d-r1`
+**Base:** `57b536d`
+**Ledger:** used=1 / cap=2 / remaining=1
+
+### Status
+- Deterministic harness: `tools/_mtr_gto_product_perfect_validate.py`
+- Flags: `--help`, `--self-test`, optional `--candidate`, optional `--output`
+- Env gate: `MIDA_GTO_BYPASS` / `MIDA_GTO_SEMANTIC_REPAIR` must be absent
+- Candidate (if supplied): sha256 + size in deterministic JSON
+- **Hard rule:** no live/UI/script evidence → overall **INCONCLUSIVE** (never invent PASS / product_1_0)
+- Report: `docs/GTO_PRODUCT_RECOVERY_ROUTE_D_R1_20260730.md`
+
+### Validation
+- `python tools/_mtr_gto_product_perfect_validate.py --help`
+- `python tools/_mtr_gto_product_perfect_validate.py --self-test`
+
+### Non-claims
+- Not product 1.0 / not gto perfect unpack
+- No cargo / live / vault write / push
+- No Route A/B/C reopen; no R1B/E2/DRx/VEH/injection/bypass
+- No R2/R3 in this commit
