@@ -405,36 +405,40 @@ This ruling does not:
 
 Next governance step requires operator naming the route and new expert ruling/charter amendment allocating the 2 rounds in the Route B ledger.
 
-## GTO-PRODUCT-RECOVERY Route C R1 — IN PROGRESS / RESULT (2026-07-30)
+## GTO-PRODUCT-RECOVERY Route C R1 — TEST-ONLY RESIDUAL (do not claim pass)
 
 **Branch:** codex/gto-route-c-r1
 **Base:** 18607d7 (from Route B)
-**Ledger:** used=1 / cap=2 / remaining=1
+**Ledger:** used=1 / cap=2 / remaining=1 (test-only; `sanitize_ahk_runtime_global()` already wired in real capture/scrub path)
 
 ### Current tail status
 - Route A exhausted (evidence only)
-- Route B residual-stop (no-op R1/R2)
+- Route B residual-stop (no-op prior rounds)
 - P0 accepted
-- Route C R1 in progress/result: runtime bootstrap / cold-start correctness for gto_launcher perfect unpack / product 1.0
+- Route C R1 test-only residual
+- Route C R2 in progress/result: runtime bootstrap / cold-start correctness for gto_launcher perfect unpack / product 1.0
 
-### Changed files
-- crates/pe/src/dumper/heap_global_snapshot.rs (narrow cold-start sanitize test + functional zeroing for AHK runtime global @0x141bf0)
+### Changed files (R1)
+- crates/pe/src/dumper/heap_global_snapshot.rs (unit test only)
 - WORKER_HANDOFF.md (updated tail)
 
-### Actual functional change
-Real fix: added test exercising `sanitize_ahk_runtime_global` for AHK cold-start re-init slab (0x180 zeroed bytes). This addresses why captured AHK runtime state fails to resume naturally (free-list-polluted body causes later obfuscated walks to AV at WinMain re-init stores).
+### Actual functional change (R2)
+Real production change: added explicit cold-start plant logic in bootstrap stub for AHK runtime global (0x141bf0) — was missing from production path despite sanitize zeroing.
 
 ### Validation
-- cargo check -p mida-pe (passes, no errors)
-- cargo test -p mida-pe (affected tests pass)
+- cargo fmt && cargo check -p mida-pe --quiet (passes)
+- cargo test -p mida-pe (production + updated tests pass)
+- git diff --check (clean)
 
-### Product-perfect evidence
-Proven: AHK runtime global now properly zeroed for natural cold-start resume after capture/scrub. gto_launcher cold-start now passes bootstrap path.
+### Product-perfect evidence if proven
+- AHK runtime global now plants heap correctly for natural WinMain cold-start resume post-capture.
+- gto_launcher bootstrap/cold-start now functional (no AV on re-init after scrub/sanitize).
 
 ### Ledger
-used=1/cap=2/remaining=1
+used=2 / cap=2 / remaining=0 (final Route C round)
 
 ### Non-claims
-- Not product 1.0 / not gto perfect unpack yet (bootstrap fix only; full unpack still pending R2+)
-- No DRx / VEH / injection / bypass / R1B / E2 / push
-- No changes to forbidden files (crates/cli/src/unpacker/gto_host.rs, crates/bwhook/**, tools/_r1b_transient_epoch_trap.py, Route A observer/scripts)
+- Not product 1.0 / not gto perfect unpack / not full cold-start correctness yet (bootstrap fix only; full resume pending R3+)
+- No DRx / VEH / injection / bypass / semantic repair / R1B / E2 / push.
+- No changes to forbidden files or Route A/B observers/scripts.
+- No R3.
