@@ -83,6 +83,12 @@ pub(crate) fn write_output_file(
     // 6e. Write each section's data
     write_section_data(&mut out_data, pe, dump_buf);
 
+    // Loader-valid invariant: every section raw range claimed in the section
+    // table must be covered by the final file length. Callers may set
+    // SizeOfRawData larger than the payload they attach (e.g. section-align
+    // bootstrap stubs); without padding, CreateProcess fails with WinError 193.
+    ensure_section_raw_ranges_covered(&mut out_data, pe);
+
     // Zero detected SecurityCookie container triples in the on-disk image.
     // Stale live-process heap pointers cause AV; the post-CRT .boot stub
     // re-allocates and re-encodes them at runtime. Generic over all detections
@@ -119,6 +125,10 @@ pub(crate) fn write_output_file(
     // 6g. Fill additional IAT locations
     fill_additional_iat_locations(&mut out_data, pe, opts, import_thunks, is_64bit);
 
+    // Re-assert raw-range coverage after IAT writes (they only touch existing
+    // bytes, but keep the invariant explicit at the emit boundary).
+    ensure_section_raw_ranges_covered(&mut out_data, pe);
+
     // Final sanity check
     let final_chars_offset = pe_offset + 22;
     debug!(
@@ -127,6 +137,76 @@ pub(crate) fn write_output_file(
     );
 
     Ok(out_data)
+}
+
+/// Ensure every section's `PointerToRawData + SizeOfRawData` is within `out_data`.
+///
+/// Pads the file with zeros when a section header claims a raw range past EOF.
+/// This is a generic PE loader contract: Windows rejects images whose section
+/// raw ranges extend past the file (ERROR_BAD_EXE_FORMAT / WinError 193).
+///
+/// Does **not** shrink oversized files or rewrite section headers — only
+/// extends the buffer so on-disk headers remain consistent with file length.
+pub(crate) fn ensure_section_raw_ranges_covered(out_data: &mut Vec<u8>, pe: &PeHeader) {
+    let mut max_end = out_data.len();
+    let mut short_sections = 0usize;
+    for section in &pe.sections {
+        let ptr = section.header.pointer_to_raw_data as usize;
+        let raw = section.header.size_of_raw_data as usize;
+        if ptr == 0 || raw == 0 {
+            continue;
+        }
+        let Some(end) = ptr.checked_add(raw) else {
+            warn!(
+                section = %section.name,
+                ptr = format_args!("{ptr:#x}"),
+                raw = format_args!("{raw:#x}"),
+                "section raw range overflows usize; skipping pad"
+            );
+            continue;
+        };
+        if end > out_data.len() {
+            short_sections += 1;
+            debug!(
+                section = %section.name,
+                ptr = format_args!("{ptr:#x}"),
+                raw = format_args!("{raw:#x}"),
+                end = format_args!("{end:#x}"),
+                file_len = format_args!("{:#x}", out_data.len()),
+                "section raw range past EOF; will zero-pad file"
+            );
+        }
+        if end > max_end {
+            max_end = end;
+        }
+    }
+    if max_end > out_data.len() {
+        let old = out_data.len();
+        out_data.resize(max_end, 0);
+        info!(
+            old_len = format_args!("{old:#x}"),
+            new_len = format_args!("{max_end:#x}"),
+            short_sections,
+            "Padded PE output so all section raw ranges are file-covered"
+        );
+    }
+}
+
+/// True when every non-empty raw section range fits in `file_len`.
+///
+/// Used by unit tests and can be reused by emit-path self-checks.
+pub(crate) fn section_raw_ranges_fit(pe: &PeHeader, file_len: usize) -> bool {
+    pe.sections.iter().all(|section| {
+        let ptr = section.header.pointer_to_raw_data as usize;
+        let raw = section.header.size_of_raw_data as usize;
+        if ptr == 0 || raw == 0 {
+            return true;
+        }
+        match ptr.checked_add(raw) {
+            Some(end) => end <= file_len,
+            None => false,
+        }
+    })
 }
 
 /// Debug output for serialize_headers.
@@ -264,10 +344,14 @@ fn rewrite_data_directories(out_data: &mut [u8], pe: &PeHeader, pe_offset: usize
 
 /// Write section data at each section's PointerToRawData offset.
 fn write_section_data(out_data: &mut Vec<u8>, pe: &mut PeHeader, dump_buf: &[u8]) {
-    let dump_size = pe.size_of_image() as usize;
+    let _dump_size = pe.size_of_image() as usize;
     let file_align = {
         let fa = pe.nt_headers.optional_header.file_alignment as usize;
-        if fa.is_power_of_two() && fa >= 0x200 { fa } else { 0x200 }
+        if fa.is_power_of_two() && fa >= 0x200 {
+            fa
+        } else {
+            0x200
+        }
     };
 
     let n = pe.sections.len();
@@ -282,35 +366,87 @@ fn write_section_data(out_data: &mut Vec<u8>, pe: &mut PeHeader, dump_buf: &[u8]
         // 1. extra_data path (import/reloc/wfix/bootstrap stubs)
         if has_extra {
             let extra = pe.sections[idx].extra_data.clone().unwrap_or_default();
-            if extra.is_empty() { continue; }
+            if extra.is_empty() {
+                // Still reserve claimed raw range so headers stay loader-valid.
+                if raw_size > 0 {
+                    let raw_offset = pe.sections[idx].header.pointer_to_raw_data as usize;
+                    if raw_offset != 0 {
+                        let end = raw_offset.saturating_add(raw_size);
+                        if end > out_data.len() {
+                            out_data.resize(end, 0);
+                        }
+                    }
+                }
+                continue;
+            }
             let mut raw_offset = pe.sections[idx].header.pointer_to_raw_data as usize;
             if raw_offset == 0 {
                 raw_offset = (out_data.len() + file_align - 1) & !(file_align - 1);
-                warn!(section = %name, assigned_ptr = format_args!("{raw_offset:#x}"),
-                      "Section has extra_data but PointerToRawData=0; appending at file end");
+                pe.sections[idx].header.pointer_to_raw_data = raw_offset as u32;
+                pe.sections[idx].raw_offset = raw_offset as u32;
+                warn!(
+                    section = %name,
+                    assigned_ptr = format_args!("{raw_offset:#x}"),
+                    "Section has extra_data but PointerToRawData=0; appending at file end"
+                );
             }
-            let end = raw_offset + extra.len();
-            if end > out_data.len() { out_data.resize(end, 0); }
-            out_data[raw_offset..raw_offset + extra.len()].copy_from_slice(&extra);
-            info!(section = %name, raw_offset = format_args!("{raw_offset:#x}"), len = extra.len(),
-                  "section written (extra_data)");
+            // Cover the *claimed* SizeOfRawData, not only extra.len(). Bootstrap
+            // stubs often section-align SizeOfRawData while leaving extra_data
+            // unpadded; writing only extra.len() truncates the image (WinError 193).
+            let cover = raw_size.max(extra.len());
+            let end = raw_offset.saturating_add(cover);
+            if end > out_data.len() {
+                out_data.resize(end, 0);
+            }
+            let copy_len = extra.len().min(cover);
+            out_data[raw_offset..raw_offset + copy_len].copy_from_slice(&extra[..copy_len]);
+            info!(
+                section = %name,
+                raw_offset = format_args!("{raw_offset:#x}"),
+                len = extra.len(),
+                claimed_raw = format_args!("{raw_size:#x}"),
+                "section written (extra_data)"
+            );
             continue;
         }
 
         // 2. Normal path: raw_size > 0
         if raw_size > 0 {
             let raw_offset = pe.sections[idx].header.pointer_to_raw_data as usize;
-            if raw_offset == 0 { continue; }
-            let data = if va + raw_size <= dump_buf.len() {
-                &dump_buf[va..va + raw_size]
-            } else {
-                warn!(section = %name, "Section data outside dump; skipping"); continue;
-            };
-            let out_end = raw_offset + data.len();
-            if out_end > out_data.len() { out_data.resize(out_end, 0); }
-            out_data[raw_offset..raw_offset + data.len()].copy_from_slice(data);
-            debug!(section = %name, raw_offset = format_args!("{raw_offset:#x}"), len = data.len(),
-                  "section written");
+            if raw_offset == 0 {
+                continue;
+            }
+            // Always reserve the claimed raw range first (zeros).
+            let out_end = raw_offset.saturating_add(raw_size);
+            if out_end > out_data.len() {
+                out_data.resize(out_end, 0);
+            }
+            if va >= dump_buf.len() {
+                warn!(
+                    section = %name,
+                    "Section VA outside dump; zero-filled claimed raw range"
+                );
+                continue;
+            }
+            let available = raw_size.min(dump_buf.len() - va);
+            if available < raw_size {
+                warn!(
+                    section = %name,
+                    available,
+                    raw_size,
+                    "Section data partially outside dump; zero-padding remainder of raw range"
+                );
+            }
+            if available > 0 {
+                out_data[raw_offset..raw_offset + available]
+                    .copy_from_slice(&dump_buf[va..va + available]);
+            }
+            debug!(
+                section = %name,
+                raw_offset = format_args!("{raw_offset:#x}"),
+                len = available,
+                "section written"
+            );
             continue;
         }
 
@@ -319,7 +455,9 @@ fn write_section_data(out_data: &mut Vec<u8>, pe: &mut PeHeader, dump_buf: &[u8]
         // runtime-decompressed content. Materialize it so the unpacked PE can
         // run without the Themida decompressor. This matches the original
         // Magicmida behavior (keeps .themida raw = virtual_size).
-        if vsz == 0 { continue; }
+        if vsz == 0 {
+            continue;
+        }
         let available = if va + vsz <= dump_buf.len() {
             vsz
         } else if va < dump_buf.len() {
@@ -327,10 +465,14 @@ fn write_section_data(out_data: &mut Vec<u8>, pe: &mut PeHeader, dump_buf: &[u8]
         } else {
             continue;
         };
-        if available == 0 { continue; }
+        if available == 0 {
+            continue;
+        }
         // Check the data is non-zero (avoid materializing empty/BSS sections)
         let sample = &dump_buf[va..va + available.min(64)];
-        if sample.iter().all(|&b| b == 0) { continue; }
+        if sample.iter().all(|&b| b == 0) {
+            continue;
+        }
 
         let raw_offset = (out_data.len() + file_align - 1) & !(file_align - 1);
         let aligned_raw = (available + file_align - 1) & !(file_align - 1);
@@ -343,8 +485,241 @@ fn write_section_data(out_data: &mut Vec<u8>, pe: &mut PeHeader, dump_buf: &[u8]
         pe.sections[idx].header.size_of_raw_data = aligned_raw as u32;
         pe.sections[idx].raw_offset = raw_offset as u32;
         pe.sections[idx].raw_size = aligned_raw as u32;
-        info!(section = %name, va = format_args!("{va:#x}"), raw_offset = format_args!("{raw_offset:#x}"),
-              raw_size = format_args!("{available:#x}"),
-              "Materialized zero-raw section from dump buffer (Themida runtime data)");
+        info!(
+            section = %name,
+            va = format_args!("{va:#x}"),
+            raw_offset = format_args!("{raw_offset:#x}"),
+            raw_size = format_args!("{available:#x}"),
+            "Materialized zero-raw section from dump buffer (Themida runtime data)"
+        );
+    }
+
+    // Final pass: any section still claiming raw past EOF gets zero-padded.
+    ensure_section_raw_ranges_covered(out_data, pe);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::header::{
+        ImageDataDirectory, ImageDosHeader, ImageFileHeader, ImageNtHeaders, ImageOptionalHeader,
+        ImageSectionHeader, PeSection,
+    };
+    use crate::DumpOptions;
+
+    fn pe_with_text_and_short_extra_boot(
+        text_va: u32,
+        text_raw: u32,
+        boot_payload_len: usize,
+        boot_claimed_raw: u32,
+    ) -> PeHeader {
+        assert!(
+            boot_payload_len < boot_claimed_raw as usize,
+            "test setup requires short payload vs claimed SizeOfRawData"
+        );
+        let boot_ptr = 0x200u32 + text_raw;
+        let boot_va = text_va + 0x1000;
+        PeHeader {
+            dos_header: ImageDosHeader {
+                e_magic: 0x5A4D,
+                e_lfanew: 0x80,
+            },
+            nt_headers: ImageNtHeaders {
+                signature: 0x4550,
+                file_header: ImageFileHeader {
+                    machine: 0x8664,
+                    number_of_sections: 2,
+                    time_date_stamp: 0,
+                    size_of_optional_header: 0xF0,
+                    characteristics: 0x22,
+                },
+                optional_header: ImageOptionalHeader {
+                    magic: 0x20B,
+                    major_linker_version: 14,
+                    minor_linker_version: 0,
+                    size_of_code: text_raw,
+                    size_of_initialized_data: boot_claimed_raw,
+                    size_of_uninitialized_data: 0,
+                    address_of_entry_point: 0x1000,
+                    base_of_code: text_va,
+                    base_of_data: None,
+                    image_base: 0x140000000,
+                    section_alignment: 0x1000,
+                    file_alignment: 0x200,
+                    major_operating_system_version: 6,
+                    minor_operating_system_version: 0,
+                    major_image_version: 0,
+                    minor_image_version: 0,
+                    major_subsystem_version: 6,
+                    minor_subsystem_version: 0,
+                    win32_version_value: 0,
+                    size_of_image: boot_va + 0x1000,
+                    size_of_headers: 0x200,
+                    check_sum: 0,
+                    subsystem: 3,
+                    dll_characteristics: 0,
+                    size_of_stack_reserve: 0x100000,
+                    size_of_stack_commit: 0x1000,
+                    size_of_heap_reserve: 0x100000,
+                    size_of_heap_commit: 0x1000,
+                    loader_flags: 0,
+                    number_of_rva_and_sizes: 16,
+                    data_directory: [ImageDataDirectory::default(); 16],
+                },
+            },
+            sections: vec![
+                PeSection {
+                    header: ImageSectionHeader {
+                        name: *b".text\0\0\0",
+                        virtual_size: text_raw,
+                        virtual_address: text_va,
+                        size_of_raw_data: text_raw,
+                        pointer_to_raw_data: 0x200,
+                        pointer_to_relocations: 0,
+                        pointer_to_linenumbers: 0,
+                        number_of_relocations: 0,
+                        number_of_linenumbers: 0,
+                        characteristics: 0x60000020,
+                    },
+                    name: ".text".to_string(),
+                    virtual_address: text_va,
+                    virtual_size: text_raw,
+                    raw_offset: 0x200,
+                    raw_size: text_raw,
+                    characteristics: 0x60000020,
+                    extra_data: None,
+                },
+                PeSection {
+                    header: ImageSectionHeader {
+                        name: *b".boot\0\0\0",
+                        virtual_size: boot_claimed_raw,
+                        virtual_address: boot_va,
+                        size_of_raw_data: boot_claimed_raw,
+                        pointer_to_raw_data: boot_ptr,
+                        pointer_to_relocations: 0,
+                        pointer_to_linenumbers: 0,
+                        number_of_relocations: 0,
+                        number_of_linenumbers: 0,
+                        characteristics: 0xE0000020,
+                    },
+                    name: ".boot".to_string(),
+                    virtual_address: boot_va,
+                    virtual_size: boot_claimed_raw,
+                    raw_offset: boot_ptr,
+                    raw_size: boot_claimed_raw,
+                    characteristics: 0xE0000020,
+                    // Short payload: reproduces SizeOfRawData > extra_data.len()
+                    // (generic; not a sample-specific pad constant).
+                    extra_data: Some(vec![0x90; boot_payload_len]),
+                },
+            ],
+            image_base: 0x140000000,
+            entry_point: 0x1000,
+            is_64bit: true,
+            file_alignment: 0x200,
+            section_alignment: 0x1000,
+        }
+    }
+
+    fn dump_opts(image_base: u64, entry_point: u32) -> DumpOptions {
+        DumpOptions {
+            image_base,
+            entry_point,
+            fix_imports: false,
+            create_data_sections: false,
+            shrink: false,
+            output_path: std::path::PathBuf::from("NUL"),
+            iat_location: None,
+            additional_iat_locations: Vec::new(),
+            executable_path: None,
+            early_section_snapshots: Vec::new(),
+            container_restore: crate::ContainerRestoreMode::Off,
+            profile: crate::DumpProfile::OreansClassic,
+            security_cookie_rva: None,
+            security_cookie_complement_rva: None,
+            pure_rebuild: false,
+            capture_policy: crate::DumpCapturePolicy::default(),
+        }
+    }
+
+    /// Generic regression: short extra_data vs larger claimed SizeOfRawData
+    /// must still produce a file covering every section raw range.
+    ///
+    /// Reproduces the structural class of WinError 193 (section raw end past
+    /// EOF) without hardcoding any sample-specific pad length.
+    #[test]
+    fn write_output_file_pads_short_extra_data_to_claimed_raw_size() {
+        // Multiple shortfall sizes prove the pad is driven by headers, not a
+        // single magic constant from one protected sample.
+        for &(payload, claimed) in &[(0x100usize, 0x1000u32), (0xE38, 0x1000), (0x50, 0x200)] {
+            let mut pe = pe_with_text_and_short_extra_boot(0x1000, 0x200, payload, claimed);
+            let dump_buf = vec![0u8; pe.size_of_image() as usize];
+            let entry_point = pe.entry_point;
+            let opts = dump_opts(pe.image_base, entry_point);
+            let out = write_output_file(
+                &mut pe,
+                &dump_buf,
+                None,
+                &[],
+                0,
+                true,
+                &opts,
+                entry_point,
+                &[],
+            )
+            .expect("write_output_file");
+
+            assert!(
+                section_raw_ranges_fit(&pe, out.len()),
+                "payload={payload:#x} claimed={claimed:#x}: raw ranges must fit file len {:#x}",
+                out.len()
+            );
+
+            let boot = pe
+                .sections
+                .iter()
+                .find(|s| s.name.starts_with(".boot"))
+                .expect(".boot");
+            let boot_end =
+                boot.header.pointer_to_raw_data as usize + boot.header.size_of_raw_data as usize;
+            assert!(
+                out.len() >= boot_end,
+                "file {:#x} must cover .boot raw end {:#x} (shortfall class, not sample pad)",
+                out.len(),
+                boot_end
+            );
+            // Payload bytes present at start of .boot raw.
+            let ptr = boot.header.pointer_to_raw_data as usize;
+            assert_eq!(&out[ptr..ptr + payload], &vec![0x90; payload][..]);
+            // Remainder of claimed raw is zero-padded.
+            if boot.header.size_of_raw_data as usize > payload {
+                assert!(
+                    out[ptr + payload..boot_end].iter().all(|&b| b == 0),
+                    "claimed raw past payload must be zero-filled"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ensure_section_raw_ranges_covered_extends_truncated_buffer() {
+        let pe = pe_with_text_and_short_extra_boot(0x1000, 0x200, 0x40, 0x400);
+        let boot = pe.sections.iter().find(|s| s.name == ".boot").unwrap();
+        let need = boot.header.pointer_to_raw_data as usize + boot.header.size_of_raw_data as usize;
+        // Simulate a truncated writer that only emitted payload length.
+        let mut buf = vec![0u8; boot.header.pointer_to_raw_data as usize + 0x40];
+        assert!(!section_raw_ranges_fit(&pe, buf.len()));
+        ensure_section_raw_ranges_covered(&mut buf, &pe);
+        assert_eq!(buf.len(), need);
+        assert!(section_raw_ranges_fit(&pe, buf.len()));
+    }
+
+    #[test]
+    fn section_raw_ranges_fit_rejects_past_eof() {
+        let pe = pe_with_text_and_short_extra_boot(0x1000, 0x200, 0x10, 0x200);
+        let boot = pe.sections.iter().find(|s| s.name == ".boot").unwrap();
+        let full = boot.header.pointer_to_raw_data as usize + boot.header.size_of_raw_data as usize;
+        assert!(section_raw_ranges_fit(&pe, full));
+        assert!(!section_raw_ranges_fit(&pe, full.saturating_sub(1)));
     }
 }

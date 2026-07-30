@@ -142,6 +142,12 @@ pub(crate) fn install_tls_callback_bootstrap(
     boot_section.virtual_size = boot_aligned_size;
     boot_section.header.size_of_raw_data = boot_aligned_size;
     boot_section.raw_size = boot_aligned_size;
+    // Pad to claimed SizeOfRawData (section-aligned). Output writer also
+    // enforces raw-range ≤ file length independently.
+    let mut boot_stub = boot_stub;
+    if (boot_stub.len() as u32) < boot_aligned_size {
+        boot_stub.resize(boot_aligned_size as usize, 0);
+    }
     boot_section.extra_data = Some(boot_stub);
 
     // 2. Create .tls section with TLS Directory

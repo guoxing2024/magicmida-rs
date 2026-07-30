@@ -738,3 +738,35 @@ used=2 / cap=2 / remaining=0 (final Route C round; no R3)
 ### Non-claims
 - Not product 1.0
 - No bypass; no inventing Pass; R2 available
+
+## GTO-PRODUCT-RECOVERY Route H R2 — LOADER-VALID + RESIDUAL-STOP (2026-07-31)
+
+**Branch:** `codex/gto-route-h-r1`
+**Base:** `e4b1cfc`
+**Ledger:** used=2 / cap=2 / remaining=0 — **No H R3**
+**Status:** **RESIDUAL-STOP** (`product_1_0=false`)
+
+### Code (generic PE emit)
+- `output_writer`: enforce all section `PointerToRawData + SizeOfRawData <= file length` (zero-pad)
+- Bootstrap paths pad `.boot` extra_data to claimed raw; `pack_section_layout` pads short buffers
+- Regression tests: multiple shortfall sizes (no sample `0x1c8` hardcode)
+
+### Live remeasure (no-bypass)
+- Candidate `scratch/product_recovery_route_h_r2_20260731/gto_unpacked.exe`
+  - size `26378240`, sha256 `49258efbbb4bbf61…`
+  - raw-range violations **0**; CreateProcess **no longer WinError 193** (R1 control still 193)
+- load fixed N=3: **2/3** Pass
+- NewClassName: **Fail** 0/3 — `0xc0000005` AV; classes_seen=[]
+- script engine: **not obtained**
+- clean-byte: **UNSEALED fail-closed** (no independent authority; no self-seal)
+
+### First real failure after loader fix
+**UI path AV `0xc0000005` before NewClassName** (product UI / script blocked).
+
+### Docs
+- Report: `docs/GTO_PRODUCT_RECOVERY_ROUTE_H_R2_20260731.md`
+- Evidence: `docs/GTO_PRODUCT_RECOVERY_ROUTE_H_EVIDENCE_20260730.json` (round=R2, real timestamps)
+
+### Non-claims
+- Not product 1.0 / not perfect unpack
+- No bypass / no inventing Pass / no H R3 / no push

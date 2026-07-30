@@ -1,8 +1,14 @@
 {
   "schema_version": "mida.gto.route-h-evidence/v0",
   "route": "GTO-PRODUCT-RECOVERY Route H",
-  "round": "R1",
-  "description": "Route H R1 evidence for updated protected input. product_1_0 not claimed.",
+  "round": "R2",
+  "description": "Route H R2 final: loader-valid PE raw-range fix + remeasure. product_1_0 not claimed. residual-stop after R2.",
+  "ledger": {
+    "used": 2,
+    "cap": 2,
+    "remaining": 0,
+    "note": "No H R3 under current authorization"
+  },
   "protected_input": {
     "artifact_role": "gto_launcher_protected_updated",
     "sha256": "46539ea7b1bf1f43cf2ed09fc0642d84b10a274939efb7c08f87b1869d738aa8",
@@ -11,32 +17,49 @@
     "note": "Operator-updated 启动器.exe; old dumps/candidates tied to 4d5770af are non-authoritative"
   },
   "candidate": {
+    "evidence_set_id": "scratch/product_recovery_route_h_r2_20260731",
+    "artifact_role": "route_h_r2_nobypass_unpacked_candidate",
+    "sha256": "49258efbbb4bbf61fd500c034fa46d247e0317416bd6e7a67b133c94cf1133ce",
+    "size_bytes": 26378240,
+    "dump_note": "ahk_gto Match; no-bypass; loader raw-range complete after output_writer pad invariant"
+  },
+  "prior_r1_candidate_control": {
     "evidence_set_id": "scratch/product_recovery_route_h_r1_newsample_b_20260731",
-    "artifact_role": "route_h_r1_nobypass_unpacked_candidate",
     "sha256": "4f2f9a4462cd5e03ef92205251897abb0454e55cd31b407790069b60bd30118d",
     "size_bytes": 26525240,
-    "dump_note": "ahk_gto Match; Route H timing; ui_seen=false; last_resort_alive IAT+9s"
+    "createprocess": "WinError 193 (still)",
+    "note": "control only; demonstrates pre-fix truncation class"
   },
   "env": {
     "MIDA_GTO_NO_BYPASS": "1",
     "MIDA_GTO_BYPASS": "absent",
     "MIDA_GTO_SEMANTIC_REPAIR": "absent"
   },
+  "loader_valid": {
+    "true": true,
+    "pe_raw_range_violations": 0,
+    "createprocess_winerror_193": false,
+    "createprocess_starts": true,
+    "timestamp": "2026-07-30T17:20:30Z",
+    "note": "all section PointerToRawData+SizeOfRawData <= file length; R1 was 193"
+  },
   "natural_execution_evidence": {
-    "true": false,
-    "present": false,
-    "source": "scratch/product_recovery_route_h_r1_probes_20260731/load_no_crash.json",
+    "true": true,
+    "present": true,
+    "source": "scratch/product_recovery_route_h_r2_probes_20260731/load_no_crash.json",
     "hash": null,
-    "timestamp": "2026-07-31T00:30:00Z",
-    "reason": "load_no_crash Fail 0/3; WinError 193 invalid Win32 application"
+    "timestamp": "2026-07-30T17:21:00Z",
+    "pass_rate": "2/3",
+    "pass_rate_float": 0.6667,
+    "reason": "load_no_crash fixed N=3 pass_rate 2/3; verdict Pass; not product equivalence"
   },
   "ui_script_path_evidence": {
     "true": false,
-    "present": false,
-    "source": "scratch/product_recovery_route_h_r1_probes_20260731/window_class.json",
+    "present": true,
+    "source": "scratch/product_recovery_route_h_r2_probes_20260731/window_class.json",
     "hash": null,
-    "timestamp": "2026-07-31T00:30:00Z",
-    "reason": "window_class error OSError; cannot launch candidate; NewClassName not observed"
+    "timestamp": "2026-07-30T17:21:40Z",
+    "reason": "NewClassName Fail 0/3; nt_exception_exit 0xc0000005; classes_seen empty"
   },
   "script_engine_execution_evidence": {
     "true": false,
@@ -44,17 +67,27 @@
     "source": null,
     "hash": null,
     "timestamp": null,
-    "reason": "no runtime script-engine proof; candidate not loader-valid"
+    "reason": "no runtime script-engine proof; UI path AV blocks product UI"
   },
   "clean_byte_gate": {
     "route_e_seals_apply": false,
-    "result": "FAIL",
-    "reason": "Route E seals bound to old 4d5770af layout; all five r26b sites mismatch on new candidate"
+    "independent_authority": false,
+    "self_seal_forbidden": true,
+    "result": "UNSEALED_FAIL_CLOSED",
+    "reason": "No independent clean-byte authority for 46539ea7 layout; candidate must not seal itself; old 4d5770af Route E seals do not transfer"
+  },
+  "first_real_failure_after_loader_fix": {
+    "class": "ui_path_av",
+    "detail": "STATUS_ACCESS_VIOLATION 0xc0000005 before NewClassName; load can survive short windows 2/3"
   },
   "product_1_0": false,
+  "overall_status": "RESIDUAL_STOP",
   "non_claims": [
     "not product 1.0",
     "not perfect unpack",
-    "old 4d5770af dumps not authority for new sample"
-  ]
+    "not inventing clean-byte seals",
+    "old 4d5770af dumps not authority for new sample",
+    "no H R3 under current ledger"
+  ],
+  "report": "docs/GTO_PRODUCT_RECOVERY_ROUTE_H_R2_20260731.md"
 }

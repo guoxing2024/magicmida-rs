@@ -403,15 +403,17 @@ pub fn pack_section_layout(out_data: &mut Vec<u8>, pe: &PeHeader) -> Result<(), 
     let old_size = out_data.len();
     // Pure-rebuild / compact layouts can report section ends past the buffer
     // (PointerToRawData still virtualized) or leave max_end below the buffer.
-    // Never panic on arithmetic; only shrink when safe.
+    // Never panic on arithmetic. Prefer pad over leaving raw ranges past EOF
+    // (loader rejects truncated images — WinError 193 / ERROR_BAD_EXE_FORMAT).
     if max_end > 0 && max_end < old_size {
         out_data.truncate(max_end);
     } else if max_end > old_size {
         tracing::warn!(
             max_end,
             old_size,
-            "pack_section_layout: max_end exceeds buffer; skipping truncate"
+            "pack_section_layout: max_end exceeds buffer; zero-padding to cover section raw ranges"
         );
+        out_data.resize(max_end, 0);
     }
 
     let new_size = out_data.len();
