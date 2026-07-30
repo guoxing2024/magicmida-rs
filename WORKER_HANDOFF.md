@@ -447,3 +447,28 @@ used=2 / cap=2 / remaining=0 (final Route C round; no R3)
 - No DRx / VEH / injection / bypass / semantic repair / R1B / E2 / push.
 - No changes to forbidden files or Route A/B observers/scripts.
 - No Route C R3.
+
+## GTO-PRODUCT-RECOVERY Route D P0 Proposal (2026-07-30)
+
+**Proposal artifact:** `docs/GTO_PRODUCT_RECOVERY_ROUTE_D_P0_20260730.md` (new file on this baseline).
+
+**Status (proposal only, no action authorized):**
+- This is a **read-only governance proposal** — a docs-only artifact that **proposes** opening a **new** battlefield `GTO-PRODUCT-RECOVERY Route D` with a **proposed** ledger namespace. It does **not** open the battlefield; it does **not** allocate budget; it does **not** authorize any code change.
+- The use of a separate ID is for bookkeeping clarity; it does **not** bypass, weaken, or reopen previous Route C ledger.
+- **Phase 0 of the proposal consumed 0 fix rounds** (docs-only; not a budget round per `docs/GTO_RESEARCH_CHARTER_20260728.md` §4.4 budget-burn rule).
+- **`GTO-POINTEE-EPOCH` UNCHANGED** (used=2/cap=2/remaining=0, FROZEN). **R1B FROZEN. E2 dormant. Route C exhausted.**
+- **`R-GTO-UI` peel-series ledger is UNCHANGED** (closed r1 → r25b; deepest progress r23b `ZhuChuangKou` class).
+- **No code change.** No live runs. No push.
+
+**Next action requires (separately from this filing):**
+
+1. Operator names `GTO-PRODUCT-RECOVERY Phase 1 on Route D` literally (per the proposal's §3.3 + §8.6 authorization bar). Bare "continue" / "proceed" / handoff-passing-C-1 do **not** satisfy this.
+2. **New expert ruling OR charter amendment** recorded in this handoff that **explicitly allocates** rounds in the `GTO-PRODUCT-RECOVERY Route D` ledger namespace (the allocation is **not** inherited from the proposal; only separate governance can grant it).
+3. The expert ruling must **explicitly state** the chosen Route D and its evidence bar (charter §6.4 / §6.1 / §6.2 / §6.3 as appropriate).
+
+**Anti-revival cross-check (2026-07-30):**
+- `crates/bwhook/**` — **unchanged**.
+- `crates/cli/src/unpacker/gto_host.rs` — **unchanged**.
+- `tools/_r1b_transient_epoch_trap.py` — **unchanged**.
+- Vault evidence under previous routes — **unmodified**.
+- No new untracked vault evidence written.
