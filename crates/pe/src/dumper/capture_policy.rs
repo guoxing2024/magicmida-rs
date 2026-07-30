@@ -74,9 +74,10 @@ impl DumpCapturePolicy {
                 // exhausted arenas make WinMain path copy (0xb9360) fail → error
                 // reporter AV. Leave NULL so cold start runs 0xb94a0 init.
                 0x148ca8, 0x148c98, 0x148c00,
+                // Route B R2: per-object hot-root addition for cmd/dispatch table (label-name exact-graph completion)
+                0x147868,
                 // R-GTO-UI r12: WinMain cmd/dispatch pointer table (store @0x36d0a).
                 // Null → AV at 0x5747a `mov rcx,[rax+rcx*8]` after MessageBox path.
-                0x147868,
             ],
             // 0x147868: cmd/dispatch table (count @0x147888); needs large probe.
             large_table_rvas: vec![0x149d50, 0x141bf0, 0x148bf8, 0x148c00, 0x148c98, 0x147868],
