@@ -4887,4 +4887,28 @@ mod tests {
         assert!(p.is_hot_root(0x18a898));
         assert!(p.hot_root_rvas.contains(&0x18a898));
     }
+
+    #[test]
+    fn sanitize_ahk_runtime_global_zeros_for_cold_start() {
+        let mut globals = vec![
+            HeapGlobalSnapshot {
+                rva: 0x141bf0,
+                live_ptr: 0x12345678,
+                content: vec![0x1; 0x100],
+                is_heap_handle: false,
+                is_image_inline: false,
+            },
+            HeapGlobalSnapshot {
+                rva: 0x149d50,
+                live_ptr: 0x87654321,
+                content: vec![0x2; 0x200],
+                is_heap_handle: false,
+                is_image_inline: false,
+            },
+        ];
+        sanitize_ahk_runtime_global(&mut globals);
+        let ahk_g = globals.iter().find(|g| g.rva == 0x141bf0).unwrap();
+        assert_eq!(ahk_g.content.len(), 0x180);
+        assert!(ahk_g.content.iter().all(|&b| b == 0));
+    }
 }

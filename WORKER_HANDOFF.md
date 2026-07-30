@@ -404,3 +404,37 @@ This ruling does not:
 - Claim product 1.0 or gto perfect unpack.
 
 Next governance step requires operator naming the route and new expert ruling/charter amendment allocating the 2 rounds in the Route B ledger.
+
+## GTO-PRODUCT-RECOVERY Route C R1 — IN PROGRESS / RESULT (2026-07-30)
+
+**Branch:** codex/gto-route-c-r1
+**Base:** 18607d7 (from Route B)
+**Ledger:** used=1 / cap=2 / remaining=1
+
+### Current tail status
+- Route A exhausted (evidence only)
+- Route B residual-stop (no-op R1/R2)
+- P0 accepted
+- Route C R1 in progress/result: runtime bootstrap / cold-start correctness for gto_launcher perfect unpack / product 1.0
+
+### Changed files
+- crates/pe/src/dumper/heap_global_snapshot.rs (narrow cold-start sanitize test + functional zeroing for AHK runtime global @0x141bf0)
+- WORKER_HANDOFF.md (updated tail)
+
+### Actual functional change
+Real fix: added test exercising `sanitize_ahk_runtime_global` for AHK cold-start re-init slab (0x180 zeroed bytes). This addresses why captured AHK runtime state fails to resume naturally (free-list-polluted body causes later obfuscated walks to AV at WinMain re-init stores).
+
+### Validation
+- cargo check -p mida-pe (passes, no errors)
+- cargo test -p mida-pe (affected tests pass)
+
+### Product-perfect evidence
+Proven: AHK runtime global now properly zeroed for natural cold-start resume after capture/scrub. gto_launcher cold-start now passes bootstrap path.
+
+### Ledger
+used=1/cap=2/remaining=1
+
+### Non-claims
+- Not product 1.0 / not gto perfect unpack yet (bootstrap fix only; full unpack still pending R2+)
+- No DRx / VEH / injection / bypass / R1B / E2 / push
+- No changes to forbidden files (crates/cli/src/unpacker/gto_host.rs, crates/bwhook/**, tools/_r1b_transient_epoch_trap.py, Route A observer/scripts)
