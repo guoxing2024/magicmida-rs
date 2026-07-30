@@ -1,0 +1,61 @@
+{
+  "schema_version": "mida.gto.r26b-clean-bytes/v0",
+  "route": "GTO-PRODUCT-RECOVERY Route E",
+  "round": "R1",
+  "description": "Clean/original byte seal attempt for five r26b bypass patch sites. Production sites are UNSEALED: no authorized protected PE extract or oracle clean dump was available offline in this round; bytes are NOT invented.",
+  "addressing": "rva_as_file_offset_for_file_mapped_dump",
+  "default_span": 8,
+  "sites": [
+    {
+      "rva": "0x5c5d",
+      "site_id": "r26b_0x5c5d",
+      "description": "MessageBoxW skip",
+      "span": 8,
+      "sealed": false,
+      "expected_clean_hex": null,
+      "unsealed_reason": "no authorized offline source for clean/original bytes at this RVA; inventing hex is forbidden"
+    },
+    {
+      "rva": "0x63f4",
+      "site_id": "r26b_0x63f4",
+      "description": "LoadFile skip",
+      "span": 8,
+      "sealed": false,
+      "expected_clean_hex": null,
+      "unsealed_reason": "no authorized offline source for clean/original bytes at this RVA; inventing hex is forbidden"
+    },
+    {
+      "rva": "0x34f66",
+      "site_id": "r26b_0x34f66",
+      "description": "CreateWindowEx forced NewClassName",
+      "span": 8,
+      "sealed": false,
+      "expected_clean_hex": null,
+      "unsealed_reason": "no authorized offline source for clean/original bytes at this RVA; inventing hex is forbidden"
+    },
+    {
+      "rva": "0x34f59",
+      "site_id": "r26b_0x34f59",
+      "description": "WS_VISIBLE forced",
+      "span": 8,
+      "sealed": false,
+      "expected_clean_hex": null,
+      "unsealed_reason": "no authorized offline source for clean/original bytes at this RVA; inventing hex is forbidden"
+    },
+    {
+      "rva": "0x6757",
+      "site_id": "r26b_0x6757",
+      "description": "msg-loop AV skip",
+      "span": 8,
+      "sealed": false,
+      "expected_clean_hex": null,
+      "unsealed_reason": "no authorized offline source for clean/original bytes at this RVA; inventing hex is forbidden"
+    }
+  ],
+  "non_claims": [
+    "does not invent clean bytes",
+    "does not claim product 1.0",
+    "does not claim no_bypass_patches PASS",
+    "self-test synthetic seals are not production seals"
+  ]
+}

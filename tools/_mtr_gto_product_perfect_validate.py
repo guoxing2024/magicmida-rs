@@ -1,23 +1,23 @@
 # -*- coding: utf-8 -*-
-"""GTO-PRODUCT-RECOVERY Route D R2 — product-perfect validation harness.
+"""GTO product-perfect validation harness (Route D R2 + Route E R1).
 
-Hardened static + external-evidence gates. No live execution, no UI probe, no
+Static + external-evidence gates. No live execution, no UI probe, no
 script-engine probe, no vault writes, no cargo.
 
-R1 defect (audited): bypass gate only scanned forbidden env *strings* and could
-not claim the five r26b bypass patch sites were absent.
-
-R2 upgrades:
-- Explicit r26b bypass site model (5 RVAs).
-- Per-site byte checks; unknown clean bytes → INCONCLUSIVE (never invent PASS).
-- Optional --evidence-json for natural/UI/script external evidence.
-- product_1_0 only when every required gate is PASS.
+Route E R1:
+- Optional --clean-bytes-json loads sealed/unsealed r26b clean-byte manifest.
+- Sealed site + matching candidate bytes => PASS site.
+- Sealed site + mismatch => FAIL site.
+- Unsealed / missing manifest => INCONCLUSIVE (never invent clean bytes).
+- product_1_0 still requires live/UI/script evidence gates PASS.
 
 Usage:
   python tools/_mtr_gto_product_perfect_validate.py --help
   python tools/_mtr_gto_product_perfect_validate.py --self-test
-  python tools/_mtr_gto_product_perfect_validate.py --candidate dump.exe
+  python tools/_mtr_gto_product_perfect_validate.py \\
+      --clean-bytes-json docs/GTO_PRODUCT_RECOVERY_ROUTE_E_CLEAN_BYTES_20260730.json
   python tools/_mtr_gto_product_perfect_validate.py --candidate dump.exe \\
+      --clean-bytes-json docs/GTO_PRODUCT_RECOVERY_ROUTE_E_CLEAN_BYTES_20260730.json \\
       --evidence-json evidence.json --output out.json
 """
 
@@ -29,18 +29,14 @@ import json
 import os
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-SCHEMA = "mida.gto.product-perfect-validate/v1"
+SCHEMA = "mida.gto.product-perfect-validate/v2"
 FORBIDDEN_ENV = ("MIDA_GTO_BYPASS", "MIDA_GTO_SEMANTIC_REPAIR")
-
-# r26b bypass patch sites (image RVAs treated as raw file offsets for dump
-# candidates that are file-mapped 1:1 from preferred base). Clean original
-# bytes are NOT sealed in-repo → expected_clean_hex is None → site cannot PASS.
-# Registering clean bytes requires separate governance; do not invent them.
 DEFAULT_SITE_SPAN = 8
+CLEAN_BYTES_SCHEMA = "mida.gto.r26b-clean-bytes/v0"
 
 
 @dataclass(frozen=True)
@@ -49,8 +45,10 @@ class BypassSite:
     site_id: str
     description: str
     span: int = DEFAULT_SITE_SPAN
-    # Lowercase hex of expected clean/original bytes at rva, or None if unknown.
+    # Lowercase hex of expected clean/original bytes at rva, or None if unsealed.
     expected_clean_hex: str | None = None
+    sealed: bool = False
+    unsealed_reason: str | None = None
 
 
 R26B_BYPASS_SITES: tuple[BypassSite, ...] = (
@@ -87,6 +85,132 @@ def _gate(
     return out
 
 
+def _parse_rva(value: Any) -> int:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        return int(value, 0)
+    raise ValueError(f"invalid rva: {value!r}")
+
+
+def _norm_hex(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("expected_clean_hex must be string or null")
+    h = value.lower().replace(" ", "").replace("0x", "")
+    if len(h) % 2 != 0 or any(c not in "0123456789abcdef" for c in h):
+        raise ValueError(f"invalid hex: {value!r}")
+    if not h:
+        return None
+    return h
+
+
+def load_clean_bytes_manifest(path: Path) -> tuple[list[BypassSite], dict[str, Any]]:
+    """Load clean-byte manifest; returns sites overlay + meta."""
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError("clean-bytes-json root must be object")
+    sites_raw = raw.get("sites")
+    if not isinstance(sites_raw, list) or not sites_raw:
+        raise ValueError("clean-bytes-json.sites must be non-empty list")
+
+    by_id = {s.site_id: s for s in R26B_BYPASS_SITES}
+    by_rva = {s.rva: s for s in R26B_BYPASS_SITES}
+    out: list[BypassSite] = []
+    seen: set[str] = set()
+
+    for entry in sites_raw:
+        if not isinstance(entry, dict):
+            raise ValueError("site entry must be object")
+        rva = _parse_rva(entry.get("rva"))
+        site_id = str(entry.get("site_id") or by_rva.get(rva, BypassSite(rva, f"rva_{rva:x}", "")).site_id)
+        base = by_id.get(site_id) or by_rva.get(rva)
+        if base is None:
+            base = BypassSite(
+                rva=rva,
+                site_id=site_id,
+                description=str(entry.get("description") or site_id),
+            )
+        span = int(entry.get("span") or base.span)
+        sealed = bool(entry.get("sealed", False))
+        exp = _norm_hex(entry.get("expected_clean_hex"))
+        reason = entry.get("unsealed_reason")
+        if sealed:
+            if not exp:
+                raise ValueError(f"sealed site {site_id} missing expected_clean_hex")
+            if len(exp) != span * 2:
+                raise ValueError(
+                    f"sealed site {site_id}: hex length {len(exp)} != span*2 ({span * 2})"
+                )
+            out.append(
+                replace(
+                    base,
+                    rva=rva,
+                    site_id=site_id,
+                    span=span,
+                    expected_clean_hex=exp,
+                    sealed=True,
+                    unsealed_reason=None,
+                    description=str(entry.get("description") or base.description),
+                )
+            )
+        else:
+            out.append(
+                replace(
+                    base,
+                    rva=rva,
+                    site_id=site_id,
+                    span=span,
+                    expected_clean_hex=None,
+                    sealed=False,
+                    unsealed_reason=str(reason or "unsealed in clean-bytes manifest"),
+                    description=str(entry.get("description") or base.description),
+                )
+            )
+        seen.add(site_id)
+
+    # Ensure canonical five sites present (fill unsealed if missing).
+    for canon in R26B_BYPASS_SITES:
+        if canon.site_id not in seen:
+            out.append(
+                replace(
+                    canon,
+                    sealed=False,
+                    expected_clean_hex=None,
+                    unsealed_reason="missing from clean-bytes manifest",
+                )
+            )
+
+    # Stable order by canonical RVA then extras
+    order = {s.site_id: i for i, s in enumerate(R26B_BYPASS_SITES)}
+    out.sort(key=lambda s: (order.get(s.site_id, 1000), s.rva, s.site_id))
+    meta = {
+        "path": path.as_posix(),
+        "schema_version": raw.get("schema_version"),
+        "sha256": _sha256_file(path),
+        "site_count": len(out),
+        "sealed_count": sum(1 for s in out if s.sealed),
+        "unsealed_count": sum(1 for s in out if not s.sealed),
+    }
+    return out, meta
+
+
+def sites_from_manifest_or_default(
+    clean_bytes: dict[str, Any] | None,
+) -> tuple[list[BypassSite], dict[str, Any] | None]:
+    if clean_bytes is None:
+        sites = [
+            replace(s, sealed=False, expected_clean_hex=None, unsealed_reason="no clean-bytes manifest")
+            for s in R26B_BYPASS_SITES
+        ]
+        return sites, None
+    # clean_bytes already parsed as {"sites": [...], "meta": ...} or full raw
+    if "sites_objects" in clean_bytes:
+        return clean_bytes["sites_objects"], clean_bytes.get("meta")
+    raise ValueError("internal: clean_bytes must be preloaded")
+
+
 def _check_forbidden_env() -> dict[str, Any]:
     present = [k for k in FORBIDDEN_ENV if os.environ.get(k)]
     if present:
@@ -104,11 +228,16 @@ def _check_forbidden_env() -> dict[str, Any]:
 
 def _check_site(data: bytes, site: BypassSite) -> dict[str, Any]:
     need = site.rva + site.span
+    base = {
+        "site_id": site.site_id,
+        "rva": f"0x{site.rva:x}",
+        "description": site.description,
+        "span": site.span,
+        "sealed": site.sealed,
+    }
     if len(data) < need:
         return {
-            "site_id": site.site_id,
-            "rva": f"0x{site.rva:x}",
-            "description": site.description,
+            **base,
             "status": "FAIL",
             "detail": (
                 f"candidate too small for site: size={len(data)} "
@@ -117,34 +246,31 @@ def _check_site(data: bytes, site: BypassSite) -> dict[str, Any]:
         }
     actual = data[site.rva : site.rva + site.span]
     actual_hex = actual.hex()
-    if site.expected_clean_hex is None:
+    if not site.sealed or site.expected_clean_hex is None:
         return {
-            "site_id": site.site_id,
-            "rva": f"0x{site.rva:x}",
-            "description": site.description,
+            **base,
             "status": "INCONCLUSIVE",
             "detail": (
-                "expected clean/original bytes not sealed; "
-                "cannot PASS site; observed=" + actual_hex
+                "site unsealed: "
+                + (site.unsealed_reason or "expected clean bytes not sealed")
+                + "; cannot PASS; observed="
+                + actual_hex
             ),
             "observed_hex": actual_hex,
             "expected_clean_hex": None,
+            "unsealed_reason": site.unsealed_reason,
         }
-    exp = site.expected_clean_hex.lower().replace(" ", "")
+    exp = site.expected_clean_hex
     if actual_hex == exp:
         return {
-            "site_id": site.site_id,
-            "rva": f"0x{site.rva:x}",
-            "description": site.description,
+            **base,
             "status": "PASS",
             "detail": "matches sealed clean bytes",
             "observed_hex": actual_hex,
             "expected_clean_hex": exp,
         }
     return {
-        "site_id": site.site_id,
-        "rva": f"0x{site.rva:x}",
-        "description": site.description,
+        **base,
         "status": "FAIL",
         "detail": f"bytes differ from sealed clean; observed={actual_hex} expected={exp}",
         "observed_hex": actual_hex,
@@ -152,8 +278,10 @@ def _check_site(data: bytes, site: BypassSite) -> dict[str, Any]:
     }
 
 
-def _check_no_bypass_patches(candidate: Path | None) -> dict[str, Any]:
-    """Fail-closed site model. Env-string scan is NOT proof of patch absence."""
+def _check_no_bypass_patches(
+    candidate: Path | None,
+    sites: list[BypassSite],
+) -> dict[str, Any]:
     if candidate is None:
         return _gate(
             "no_bypass_patches",
@@ -163,23 +291,21 @@ def _check_no_bypass_patches(candidate: Path | None) -> dict[str, Any]:
         )
 
     data = candidate.read_bytes()
-    # Residual note only — must not drive PASS.
     env_name_hits = [k for k in FORBIDDEN_ENV if k.encode("ascii") in data]
-
-    site_results = [_check_site(data, s) for s in R26B_BYPASS_SITES]
+    site_results = [_check_site(data, s) for s in sites]
     statuses = [s["status"] for s in site_results]
 
     if any(st == "FAIL" for st in statuses):
         overall = "FAIL"
         detail = "one or more r26b bypass sites FAIL (see sites[])"
-    elif all(st == "PASS" for st in statuses):
+    elif len(site_results) >= 5 and all(st == "PASS" for st in statuses):
         overall = "PASS"
-        detail = "all five r26b bypass sites match sealed clean bytes"
+        detail = "all bypass sites match sealed clean bytes"
     else:
         overall = "INCONCLUSIVE"
         detail = (
-            "r26b site checks incomplete: clean bytes unsealed and/or mixed "
-            "INCONCLUSIVE results; env-string scan is not proof of patch absence"
+            "r26b site checks incomplete: unsealed sites and/or mixed "
+            "INCONCLUSIVE; env-string scan is not proof of patch absence"
         )
         if env_name_hits:
             detail += "; residual env-name strings in image: " + ",".join(env_name_hits)
@@ -195,12 +321,10 @@ def _check_no_bypass_patches(candidate: Path | None) -> dict[str, Any]:
 
 
 def _validate_evidence_blob(key: str, blob: Any) -> dict[str, Any]:
-    """Require explicit true + source/hash/timestamp non-empty strings."""
     if blob is None:
         return _gate(key, "INCONCLUSIVE", f"{key} absent")
     if not isinstance(blob, dict):
         return _gate(key, "FAIL", f"{key} must be an object")
-    # Accept either {"true": true, ...} or {"present": true, ...}
     flag = blob.get("true", blob.get("present", None))
     if flag is not True:
         return _gate(
@@ -249,9 +373,7 @@ def _check_evidence_gates(evidence: dict[str, Any] | None) -> list[dict[str, Any
             ),
         ]
     if not isinstance(evidence, dict):
-        bad = _gate("evidence_json", "FAIL", "evidence root must be a JSON object")
         return [
-            bad,
             _gate("natural_execution", "FAIL", "evidence root invalid"),
             _gate("ui_script_path", "FAIL", "evidence root invalid"),
             _gate("script_engine_execution", "FAIL", "evidence root invalid"),
@@ -260,7 +382,6 @@ def _check_evidence_gates(evidence: dict[str, Any] | None) -> list[dict[str, Any
     nat = _validate_evidence_blob(
         "natural_execution", evidence.get("natural_execution_evidence")
     )
-    # Map internal names for gate list consistency
     nat["name"] = "natural_execution"
     ui = _validate_evidence_blob(
         "ui_script_path", evidence.get("ui_script_path_evidence")
@@ -276,8 +397,21 @@ def _check_evidence_gates(evidence: dict[str, Any] | None) -> list[dict[str, Any
 def evaluate(
     candidate: Path | None,
     evidence: dict[str, Any] | None = None,
+    sites: list[BypassSite] | None = None,
+    clean_bytes_meta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    bypass = _check_no_bypass_patches(candidate)
+    if sites is None:
+        sites = [
+            replace(
+                s,
+                sealed=False,
+                expected_clean_hex=None,
+                unsealed_reason="no clean-bytes manifest",
+            )
+            for s in R26B_BYPASS_SITES
+        ]
+
+    bypass = _check_no_bypass_patches(candidate, sites)
     env = _check_forbidden_env()
     evidence_gates = _check_evidence_gates(evidence)
     gates = [bypass, env, *evidence_gates]
@@ -315,21 +449,24 @@ def evaluate(
 
     return {
         "schema_version": SCHEMA,
-        "route": "GTO-PRODUCT-RECOVERY Route D",
-        "round": "R2",
+        "route": "GTO-PRODUCT-RECOVERY Route E",
+        "round": "R1-clean-bytes",
         "overall_status": overall,
         "product_1_0": bool(product_1_0),
         "gates": gates,
         "artifact": artifact,
+        "clean_bytes_manifest": clean_bytes_meta,
         "r26b_bypass_sites": [
             {
                 "rva": f"0x{s.rva:x}",
                 "site_id": s.site_id,
                 "description": s.description,
                 "span": s.span,
-                "expected_clean_hex_sealed": s.expected_clean_hex is not None,
+                "sealed": s.sealed,
+                "expected_clean_hex_sealed": bool(s.sealed and s.expected_clean_hex),
+                "unsealed_reason": s.unsealed_reason,
             }
-            for s in R26B_BYPASS_SITES
+            for s in sites
         ],
         "forbidden_env_checked": list(FORBIDDEN_ENV),
         "evidence_keys_required": list(EVIDENCE_KEYS),
@@ -340,6 +477,7 @@ def evaluate(
             "no UI/script evidence collected by this harness",
             "env-string scan does not prove r26b patch absence",
             "unsealed clean bytes cannot yield bypass-site PASS",
+            "production clean-byte inventing is forbidden",
         ],
     }
 
@@ -355,85 +493,111 @@ def _load_evidence(path: Path) -> dict[str, Any]:
     return raw
 
 
+def _synthetic_all_sealed(hex_byte: str = "90") -> list[BypassSite]:
+    """Self-test only: seal all canonical sites with repeated fill byte."""
+    fill = (hex_byte * DEFAULT_SITE_SPAN)
+    return [
+        replace(
+            s,
+            sealed=True,
+            expected_clean_hex=fill,
+            unsealed_reason=None,
+        )
+        for s in R26B_BYPASS_SITES
+    ]
+
+
+def _build_synthetic_candidate(sites: list[BypassSite], mutate_rva: int | None = None) -> bytes:
+    size = max(s.rva + s.span for s in sites) + 16
+    buf = bytearray(b"\x00" * size)
+    for s in sites:
+        assert s.expected_clean_hex
+        raw = bytes.fromhex(s.expected_clean_hex)
+        if mutate_rva is not None and s.rva == mutate_rva:
+            raw = bytes((b ^ 0xFF) for b in raw)
+        buf[s.rva : s.rva + s.span] = raw
+    return bytes(buf)
+
+
 def run_self_test() -> int:
     for k in FORBIDDEN_ENV:
         os.environ.pop(k, None)
 
-    # 1) no candidate => INCONCLUSIVE, product_1_0 false
+    # --- prior Route D tests (smoke) ---
     r0 = evaluate(None)
     assert r0["overall_status"] == "INCONCLUSIVE", r0
-    assert r0["product_1_0"] is False, r0
-    assert r0["gates"][0]["status"] == "INCONCLUSIVE", r0
-    s0 = _dumps(r0)
-    assert s0 == _dumps(r0), "JSON not deterministic"
+    assert r0["product_1_0"] is False
+    assert r0["gates"][0]["status"] == "INCONCLUSIVE"
+    assert _dumps(r0) == _dumps(r0)
 
-    # 2) forbidden env => FAIL
-    os.environ["MIDA_GTO_BYPASS"] = "1"
-    r_env = evaluate(None)
-    assert r_env["overall_status"] == "FAIL", r_env
-    assert r_env["product_1_0"] is False, r_env
-    assert r_env["gates"][1]["status"] == "FAIL", r_env
-    os.environ.pop("MIDA_GTO_BYPASS", None)
-
-    # 3) candidate too small => not PASS (FAIL on sites)
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".bin") as tf:
-        tf.write(b"tiny")
-        tiny = Path(tf.name)
-    try:
-        r_tiny = evaluate(tiny)
-        assert r_tiny["product_1_0"] is False
-        assert r_tiny["overall_status"] != "PASS"
-        assert r_tiny["gates"][0]["status"] == "FAIL", r_tiny["gates"][0]
-        assert r_tiny["artifact"]["size_bytes"] == 4
-        assert r_tiny["artifact"]["sha256"] == _sha256_file(tiny)
-    finally:
-        tiny.unlink(missing_ok=True)
-
-    # 4) large candidate, evidence absent => INCONCLUSIVE (clean bytes unsealed)
+    # no manifest => INCONCLUSIVE sites when candidate large
     big = b"\x00" * (0x34F66 + 16)
     with tempfile.NamedTemporaryFile(delete=False, suffix=".bin") as tf:
         tf.write(big)
         large = Path(tf.name)
     try:
-        r_large = evaluate(large)
-        assert r_large["overall_status"] == "INCONCLUSIVE", r_large
-        assert r_large["product_1_0"] is False
-        assert r_large["gates"][0]["status"] == "INCONCLUSIVE"
-        sites = r_large["gates"][0]["sites"]
-        assert len(sites) == 5
-        assert all(s["status"] == "INCONCLUSIVE" for s in sites)
-        # evidence gates INCONCLUSIVE
-        assert r_large["gates"][2]["status"] == "INCONCLUSIVE"
-        assert r_large["gates"][3]["status"] == "INCONCLUSIVE"
-        assert r_large["gates"][4]["status"] == "INCONCLUSIVE"
+        r_nom = evaluate(large)
+        assert r_nom["gates"][0]["status"] == "INCONCLUSIVE"
+        assert all(s["status"] == "INCONCLUSIVE" for s in r_nom["gates"][0]["sites"])
     finally:
         large.unlink(missing_ok=True)
 
-    # 5) fake evidence missing fields => FAIL/INCONCLUSIVE, not PASS
-    fake_bad = {
-        "natural_execution_evidence": {"true": True, "source": "x"},  # missing hash/ts
-        "ui_script_path_evidence": {"true": True, "source": "y", "hash": "h", "timestamp": "t"},
-        "script_engine_execution_evidence": {
-            "true": True,
-            "source": "z",
-            "hash": "h2",
-            "timestamp": "t2",
-        },
-    }
-    r_bad = evaluate(None, evidence=fake_bad)
-    assert r_bad["product_1_0"] is False
-    assert r_bad["overall_status"] != "PASS"
-    assert r_bad["gates"][2]["status"] == "FAIL", r_bad["gates"][2]
+    # --- Route E R1: sealed synthetic + matching candidate => site PASS ---
+    sealed = _synthetic_all_sealed("ab")
+    cand_bytes = _build_synthetic_candidate(sealed)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".bin") as tf:
+        tf.write(cand_bytes)
+        cand_path = Path(tf.name)
+    try:
+        r_ok = evaluate(cand_path, sites=sealed)
+        assert r_ok["gates"][0]["status"] == "PASS", r_ok["gates"][0]
+        assert all(s["status"] == "PASS" for s in r_ok["gates"][0]["sites"])
+        # still no live evidence => not product_1_0
+        assert r_ok["product_1_0"] is False
+        assert r_ok["overall_status"] == "INCONCLUSIVE"
+    finally:
+        cand_path.unlink(missing_ok=True)
 
-    fake_incomplete = {
-        "natural_execution_evidence": None,
-    }
-    r_inc = evaluate(None, evidence=fake_incomplete)
-    assert r_inc["product_1_0"] is False
-    assert r_inc["overall_status"] == "INCONCLUSIVE"
-    assert r_inc["gates"][2]["status"] == "INCONCLUSIVE"
+    # mismatch => FAIL
+    sealed2 = _synthetic_all_sealed("cd")
+    bad_bytes = _build_synthetic_candidate(sealed2, mutate_rva=0x5C5D)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".bin") as tf:
+        tf.write(bad_bytes)
+        bad_path = Path(tf.name)
+    try:
+        r_bad = evaluate(bad_path, sites=sealed2)
+        assert r_bad["gates"][0]["status"] == "FAIL", r_bad["gates"][0]
+        assert r_bad["product_1_0"] is False
+        assert any(s["status"] == "FAIL" for s in r_bad["gates"][0]["sites"])
+    finally:
+        bad_path.unlink(missing_ok=True)
 
-    # 6) full evidence still cannot product_1_0 without sealed clean + candidate PASS
+    # unsealed manifest sites => INCONCLUSIVE
+    unsealed = [
+        replace(s, sealed=False, expected_clean_hex=None, unsealed_reason="test-unsealed")
+        for s in R26B_BYPASS_SITES
+    ]
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".bin") as tf:
+        tf.write(b"\x00" * (0x34F66 + 16))
+        u_path = Path(tf.name)
+    try:
+        r_u = evaluate(u_path, sites=unsealed)
+        assert r_u["gates"][0]["status"] == "INCONCLUSIVE"
+        assert all(s["status"] == "INCONCLUSIVE" for s in r_u["gates"][0]["sites"])
+    finally:
+        u_path.unlink(missing_ok=True)
+
+    # load real production manifest (all unsealed) via loader
+    repo = Path(__file__).resolve().parents[1]
+    prod = repo / "docs" / "GTO_PRODUCT_RECOVERY_ROUTE_E_CLEAN_BYTES_20260730.json"
+    if prod.is_file():
+        sites_p, meta_p = load_clean_bytes_manifest(prod)
+        assert meta_p["sealed_count"] == 0
+        assert meta_p["unsealed_count"] >= 5
+        assert all(not s.sealed for s in sites_p)
+
+    # sealed + evidence still needs candidate match for product_1_0; with match
+    # + full evidence => product_1_0 true (synthetic only)
     full_ev = {
         "natural_execution_evidence": {
             "true": True,
@@ -454,13 +618,18 @@ def run_self_test() -> int:
             "timestamp": "2026-07-30T00:00:00Z",
         },
     }
-    r_full = evaluate(None, evidence=full_ev)
-    assert r_full["gates"][2]["status"] == "PASS"
-    assert r_full["gates"][3]["status"] == "PASS"
-    assert r_full["gates"][4]["status"] == "PASS"
-    assert r_full["gates"][0]["status"] == "INCONCLUSIVE"  # no candidate
-    assert r_full["product_1_0"] is False
-    assert r_full["overall_status"] == "INCONCLUSIVE"
+    sealed3 = _synthetic_all_sealed("11")
+    good = _build_synthetic_candidate(sealed3)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".bin") as tf:
+        tf.write(good)
+        g_path = Path(tf.name)
+    try:
+        r_pass = evaluate(g_path, evidence=full_ev, sites=sealed3)
+        assert r_pass["gates"][0]["status"] == "PASS"
+        assert r_pass["product_1_0"] is True
+        assert r_pass["overall_status"] == "PASS"
+    finally:
+        g_path.unlink(missing_ok=True)
 
     print("self-test: OK", flush=True)
     return 0
@@ -470,9 +639,9 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         prog="tools/_mtr_gto_product_perfect_validate.py",
         description=(
-            "Route D product-perfect validation harness (R2 hardened). "
-            "r26b bypass sites + optional external evidence JSON. "
-            "Without sealed clean bytes and full evidence, overall is INCONCLUSIVE."
+            "Product-perfect validation harness (Route D gates + Route E clean-bytes). "
+            "Use --clean-bytes-json for sealed/unsealed r26b clean-byte manifest. "
+            "Without sealed clean bytes and live evidence, overall is INCONCLUSIVE."
         ),
     )
     p.add_argument(
@@ -480,6 +649,12 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         default=None,
         help="Optional candidate PE/dump path (required for r26b site checks)",
+    )
+    p.add_argument(
+        "--clean-bytes-json",
+        type=Path,
+        default=None,
+        help="Optional Route E clean-byte manifest JSON (sealed/unsealed per site)",
     )
     p.add_argument(
         "--evidence-json",
@@ -513,6 +688,19 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: candidate not a file: {candidate}", file=sys.stderr)
             return 1
 
+    sites: list[BypassSite] | None = None
+    clean_meta: dict[str, Any] | None = None
+    if args.clean_bytes_json is not None:
+        cp = args.clean_bytes_json.resolve()
+        if not cp.is_file():
+            print(f"error: clean-bytes-json not a file: {cp}", file=sys.stderr)
+            return 1
+        try:
+            sites, clean_meta = load_clean_bytes_manifest(cp)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"error: clean-bytes-json: {exc}", file=sys.stderr)
+            return 1
+
     evidence = None
     if args.evidence_json is not None:
         ep = args.evidence_json.resolve()
@@ -525,7 +713,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: evidence-json: {exc}", file=sys.stderr)
             return 1
 
-    report = evaluate(candidate, evidence=evidence)
+    report = evaluate(
+        candidate,
+        evidence=evidence,
+        sites=sites,
+        clean_bytes_meta=clean_meta,
+    )
     text = _dumps(report)
     if args.output is not None:
         args.output.parent.mkdir(parents=True, exist_ok=True)

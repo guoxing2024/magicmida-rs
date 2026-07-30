@@ -549,3 +549,25 @@ used=2 / cap=2 / remaining=0 (final Route C round; no R3)
 1. Operator names `GTO-PRODUCT-RECOVERY Phase 1 on Route E` literally.
 2. Separate expert ruling allocating Route E rounds (not inherited from this P0).
 3. Bare "continue" / "proceed" does **not** open Route E R1.
+
+## GTO-PRODUCT-RECOVERY Route E R1 — CLEAN-BYTE GATES (2026-07-30)
+
+**Branch:** `codex/gto-route-e-r1`
+**Base:** `249a96c`
+**Expert ruling:** Phase 1 on Route E opened
+**Ledger:** used=1 / cap=2 / remaining=1
+
+### Result
+- Manifest: `docs/GTO_PRODUCT_RECOVERY_ROUTE_E_CLEAN_BYTES_20260730.json`
+- All five r26b sites **UNSEALED** (no authorized offline clean-byte source; bytes not invented)
+- Harness: `--clean-bytes-json` integrated in `tools/_mtr_gto_product_perfect_validate.py`
+- sealed+match → PASS; sealed+mismatch → FAIL; unsealed → INCONCLUSIVE
+- Self-test OK (synthetic seals only)
+- Production status: **INCONCLUSIVE** (no product_1_0; live/UI/script evidence still required for R2)
+- Report: `docs/GTO_PRODUCT_RECOVERY_ROUTE_E_R1_20260730.md`
+
+### Non-claims
+- Not product 1.0
+- No live/cargo/vault/push
+- No inventing clean bytes
+- No Route A/B/C/D R3; no R1B/E2/DRx/VEH/injection/bypass
