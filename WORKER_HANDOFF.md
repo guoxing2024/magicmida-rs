@@ -664,3 +664,22 @@ used=2 / cap=2 / remaining=0 (final Route C round; no R3)
 ### Non-claims
 - Not product 1.0
 - No bypass; no DRx/VEH/injection/R1B/E2; no push
+
+## GTO-PRODUCT-RECOVERY Route G R2 — RESIDUAL-STOP (2026-07-30)
+
+**Branch:** `codex/gto-route-g-r1`
+**Base:** `b702571`
+**Ledger:** used=2 / cap=2 / remaining=0 (final Route G round; **no R3**)
+
+### Result
+- Candidate: sha256 `fde04b4321a73aedd8dec58e68a5ded1e9fbe873e389270c6c565596f23dd29f` size 71803392
+- Probes (NO_BYPASS=1): load_no_crash **Pass** (1/3); window NewClassName **Fail** AV `0xc0000005`; script engine execution **Fail**
+- Harness: clean-byte **PASS**; `product_1_0=false`; overall **FAIL**
+- Evidence: `docs/GTO_PRODUCT_RECOVERY_ROUTE_G_EVIDENCE_20260730.json`
+- Report: `docs/GTO_PRODUCT_RECOVERY_ROUTE_G_R2_20260730.md`
+- Status: **RESIDUAL-STOP** — product 1.0 / perfect unpack **not achieved**
+- Residual blocker: no-bypass UI path AV + no script-engine runtime proof
+
+### Non-claims
+- Not product 1.0
+- No bypass; no R3; no push

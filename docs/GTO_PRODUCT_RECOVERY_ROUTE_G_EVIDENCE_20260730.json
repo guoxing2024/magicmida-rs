@@ -1,0 +1,56 @@
+{
+  "schema_version": "mida.gto.route-g-evidence/v0",
+  "route": "GTO-PRODUCT-RECOVERY Route E",
+  "round": "R2",
+  "description": "Route G R2 product evidence for no-bypass candidate from Route G R1 acquisition. Absolute host paths scrubbed; identity via evidence_set_id + sha256.",
+  "candidate": {
+    "evidence_set_id": "gto_launcher/live_20260730-224305_route_g_r1b_nobypass_gtoexp",
+    "artifact_role": "route_g_r1_nobypass_unpacked_candidate",
+    "artifact_name": "gto_unpacked.exe",
+    "sha256": "fde04b4321a73aedd8dec58e68a5ded1e9fbe873e389270c6c565596f23dd29f",
+    "size_bytes": 71803392,
+    "provenance": "Route G R1 no-bypass acquisition; MIDA_GTO_NO_BYPASS=1; bypass/semantic-repair absent"
+  },
+  "env": {
+    "MIDA_GTO_NO_BYPASS": "1",
+    "MIDA_GTO_BYPASS": "absent",
+    "MIDA_GTO_SEMANTIC_REPAIR": "absent"
+  },
+  "probe_scratch_evidence_set_id": "scratch/product_recovery_route_g_r2_n1_20260730",
+  "natural_execution_evidence": {
+    "true": true,
+    "present": true,
+    "source": "scratch/product_recovery_route_g_r2_n1_20260730/load_no_crash.json",
+    "hash": "cbc93d0852ad128a664c12cd55c0c68c744db091e0c44ad4c89688db0a373b67",
+    "timestamp": "2026-07-30T14:50:00Z",
+    "probe_id": "load_no_crash_v0",
+    "verdict": "Pass",
+    "notes": "load_no_crash Pass with gate_early_exit; load_quality samples=3 pass=1 fail=2 pass_rate=0.3333; residual: load survive is not full product UI/script equivalence"
+  },
+  "ui_script_path_evidence": {
+    "true": false,
+    "present": false,
+    "source": "scratch/product_recovery_route_g_r2_n1_20260730/window_class.json",
+    "hash": "5bb1c0e300303ba577416ba492214d1323aa6b2657e17d429108cff68075ee4e",
+    "timestamp": "2026-07-30T14:50:00Z",
+    "probe_id": "gui_window_class_v0",
+    "verdict": "Fail",
+    "reason": "NewClassName not seen; 3/3 attempts nt_exception_exit:0xc0000005 (ACCESS_VIOLATION); classes_seen=[]"
+  },
+  "script_engine_execution_evidence": {
+    "true": false,
+    "present": false,
+    "source": "scratch/product_recovery_route_g_r2_n1_20260730/pe_string.json",
+    "hash": "17d415af3599d2f177e9f6ea9a0d8e30e5f925381b8aad94c86e1755a458189f",
+    "timestamp": "2026-07-30T14:50:00Z",
+    "probe_id": "pe_string_v0",
+    "verdict": "Fail",
+    "reason": "no runtime script-engine execution probe Pass; static pe_string found NewClassName+AutoHotkey but missing g_script; static strings do not prove script engine runs"
+  },
+  "non_claims": [
+    "not product 1.0",
+    "load_no_crash Pass is not product UI/script Pass",
+    "no bypass path used for evidence",
+    "no absolute host vault paths as authority"
+  ]
+}
