@@ -1,14 +1,14 @@
+use super::av_query::AvQueryCtx;
 use super::helpers::compute_data_section_bounds;
 use super::iat_trace::{advance_to_next_slot, IatTraceState};
 use super::loop_state::LoopState;
 use super::session::ProcessSession;
 use crate::log::{self, LogType};
 use anyhow::anyhow;
-use mida_core::{ContinueStatus, DebugEvent, DebuggerCore, OepProvenance};
+use mida_core::{ContinueStatus, DebugEvent, DebuggerCore};
 use mida_packers_themida::{
-    determine_iat_address, find_real_oep_by_scanning, handle_tls_callbacks,
-    install_code_section_guard, install_iat_guard, is_oep_virtualized, process_guarded_access,
-    remove_code_section_guard, try_find_correct_oep, GuardAccessResult, ThemidaState,
+    decide_av_oep, determine_iat_address, install_iat_guard, remove_code_section_guard,
+    AvOepAction, AvOepInput, AvOepState, ThemidaState,
 };
 use mida_pe::PeHeader;
 use tracing::{debug, info, warn};
@@ -22,8 +22,11 @@ pub(super) enum AvAction {
 
 /// Handle an AccessViolation event in the debug loop.
 ///
-/// Returns `AvAction::Break` when the debug loop should exit (OEP found and
-/// IAT ready), or `AvAction::Continue` otherwise.
+/// P3-D: the AV/OEP decision body lives in
+/// `mida_packers_themida::runtime::av_oep_handler`; this function is the
+/// thin host: it maps loop state to the decision, executes the returned
+/// action (exactly-once continue / context redirect / break), and keeps the
+/// shared post-OEP IAT phase.
 pub(super) fn handle_access_violation(
     ls: &mut LoopState,
     dbg: &mut ProcessSession,
@@ -53,547 +56,79 @@ pub(super) fn handle_access_violation(
         );
     }
 
-    if !ls.guard_installed {
-        dbg.continue_event(thread_id, ContinueStatus::Continue)?;
-        return Ok(AvAction::Continue);
-    }
-
     let text_start = (dbg.image_base() as usize)
         .wrapping_add(state.pe_info.pe_sections[0].virtual_address as usize);
     let text_end = dbg.image_base() as usize + state.pe_info.base_of_data as usize;
 
-    match process_guarded_access(
+    let mut av = AvOepState {
+        guard_installed: ls.guard_installed,
+        oep: ls.oep,
+        provenance: ls.oep_provenance.clone(),
+        oep_found_via_scanning: ls.oep_found_via_scanning,
+        unrelated_av_streak: ls.unrelated_av_streak,
+        virtualized_oep_retries: ls.virtualized_oep_retries,
+        last_possible_oep: ls.last_possible_oep,
+        storm_escape_freeze: false,
+    };
+    let input = AvOepInput {
+        event_thread_id: thread_id,
+        exception_addr,
+        target_address,
+        exc_type,
+        entry_point_rva: pe.entry_point,
+        virtualized_oep_max_retries: ls.virtualized_oep_max_retries,
+        unrelated_av_storm_threshold: ls.unrelated_av_storm_threshold,
+        unrelated_av_null_storm_threshold: ls.unrelated_av_null_storm_threshold,
+    };
+    let mut query = AvQueryCtx {
         dbg,
         h_process,
-        state,
-        target_address as usize,
-        exception_addr as usize,
-        thread_id,
+        guard_protection,
         image_base_usize,
         image_boundary,
         text_start,
         text_end,
-        exc_type,
-    )? {
-        GuardAccessResult::Handled {
-            address: _,
-            thread_id: returned_tid,
-        } => {
-            ls.unrelated_av_streak = 0;
-            // No continue here — fall through to the shared epilogue once.
-            if returned_tid != thread_id {
-                debug!(
-                    event_tid = thread_id,
-                    returned_tid, "Handled returned_tid differs from event thread_id (log only)"
-                );
-            }
-            debug!(
-                branch = "guard_handled",
-                event_tid = thread_id,
-                returned_tid,
-                exception = %format!("{exception_addr:#x}"),
-                fault = %format!("{target_address:#x}"),
-                exc_type,
-                "Guarded access handled"
-            );
-        }
-        GuardAccessResult::TlsCallback { address } => {
-            // No continue here — fall through to the shared epilogue once.
-            log::log(
-                LogType::Info,
-                &format!(
-                    "TLS callback detected at {:#x} — guard switched to Themida section",
-                    address
-                ),
-            );
-        }
-        GuardAccessResult::MsvcTraceComplete { address } => {
-            ls.oep = Some(address);
-            ls.oep_provenance = OepProvenance::trace(
-                address as u64,
-                format!("GuardAccessResult::MsvcTraceComplete resolved OEP: {address:#x}"),
-            );
-            ls.oep_found_via_scanning = false;
-            remove_code_section_guard(h_process, text_start, text_end.saturating_sub(text_start))?;
-            log::log(
-                LogType::Info,
-                &format!(
-                    "MSVC OEP synthesized and written at {:#x} — breaking debug loop",
-                    address,
-                ),
-            );
-            // Break deliberately leaves the current AV pending so synchronous
-            // post-loop IAT tracing can set context and consume it.
-            return Ok(AvAction::Break);
-        }
-        GuardAccessResult::PossibleOEP { address } => {
-            ls.unrelated_av_streak = 0;
-            log::log(LogType::Info, &format!("Possible OEP at {:#x}", address));
+    };
+    let outcome = decide_av_oep(&mut query, state, &mut av, &input).map_err(anyhow::Error::msg)?;
 
-            let tls_total = state.pe_info.tls_total;
-            let tls_result =
-                handle_tls_callbacks(dbg, address, 8u32, tls_total, &mut state.tls_counter)?;
+    // Write decision state back to the loop state.
+    ls.guard_installed = outcome.state.guard_installed;
+    ls.oep = outcome.state.oep;
+    ls.oep_provenance = outcome.state.provenance;
+    ls.oep_found_via_scanning = outcome.state.oep_found_via_scanning;
+    ls.unrelated_av_streak = outcome.state.unrelated_av_streak;
+    ls.virtualized_oep_retries = outcome.state.virtualized_oep_retries;
+    ls.last_possible_oep = outcome.state.last_possible_oep;
+    if outcome.state.storm_escape_freeze {
+        ls.storm_escape_freeze = true;
+    }
 
-            if tls_result.oep_found {
-                ls.oep = tls_result.oep_address;
-                if let Some(oep) = tls_result.oep_address {
-                    ls.oep_provenance = OepProvenance::trace(
-                        oep as u64,
-                        format!("TLS callback/OEP trace resolved application OEP: {oep:#x}"),
-                    );
-                    ls.oep_found_via_scanning = false;
-                }
-            } else {
-                let mut ret_addr: usize = 0;
-                let mut ret_bytes = [0u8; 8];
-                let ctx = dbg
-                    .get_thread_context_control(thread_id)
-                    .map_err(|e| anyhow!("get_thread_context_control: {e}"))?;
-                if dbg.read_memory(ctx.Rsp as usize, &mut ret_bytes).is_ok() {
-                    ret_addr = u64::from_le_bytes(ret_bytes) as usize;
-                    info!(
-                        rsp = %format!("{:#x}", ctx.Rsp as usize),
-                        ret_addr = %format!("{ret_addr:#x}"),
-                        "Read return address from stack at PossibleOEP"
-                    );
-                }
-
-                let ret_in_themida = state.pe_info.pe_sections.iter().any(|sec| {
-                    if !mida_packers_themida::is_themida_section(sec) {
-                        return false;
-                    }
-                    let sec_start = dbg.image_base() as usize + sec.virtual_address as usize;
-                    let sec_end = sec_start + sec.virtual_size as usize;
-                    ret_addr >= sec_start && ret_addr < sec_end
-                });
-
-                if ret_in_themida {
-                    let pe_entry_point = dbg.image_base() as usize + pe.entry_point as usize;
-                    let text_sec = &state.pe_info.pe_sections[0];
-                    let text_base_va =
-                        dbg.image_base() as usize + text_sec.virtual_address as usize;
-                    let text_end_va =
-                        dbg.image_base() as usize + state.pe_info.base_of_data as usize;
-                    let text_len_va = text_end_va.saturating_sub(text_base_va);
-
-                    let found_via_pattern_first = if state.pe_info.major_linker_version == 0
-                        || [2u8, 6, 7, 8, 9, 10, 11, 12, 14]
-                            .contains(&state.pe_info.major_linker_version)
-                    {
-                        try_find_correct_oep(
-                            dbg,
-                            pe_entry_point,
-                            text_base_va,
-                            text_len_va,
-                            state.pe_info.major_linker_version,
-                        )
-                        .unwrap_or(None)
-                    } else {
-                        None
-                    };
-
-                    if let Some(real_oep) = found_via_pattern_first {
-                        info!(
-                            pe_entry = %format!("{pe_entry_point:#x}"),
-                            real_oep = %format!("{real_oep:#x}"),
-                            "Found MSVC OEP via pattern match on PE entry point"
-                        );
-                        ls.oep = Some(real_oep);
-                        ls.oep_provenance = OepProvenance::trace(
-                            real_oep as u64,
-                            format!("TryFindCorrectOEP runtime trace resolved application OEP: {real_oep:#x}"),
-                        );
-                        ls.oep_found_via_scanning = false;
-                        remove_code_section_guard(
-                            h_process,
-                            text_start,
-                            text_end.saturating_sub(text_start),
-                        )?;
-                        return Ok(AvAction::Break);
-                    }
-
-                    ls.virtualized_oep_retries += 1;
-                    // Preserve candidate before redirect so null-AV storm escape
-                    // (Lunlun) can fall back without depending on soft-fail path.
-                    ls.last_possible_oep = Some(address);
-                    info!(
-                        ret_addr = %format!("{ret_addr:#x}"),
-                        retry = ls.virtualized_oep_retries,
-                        "Return address points into Themida section — OEP is virtualized"
-                    );
-
-                    if ls.virtualized_oep_retries >= ls.virtualized_oep_max_retries {
-                        warn!(
-                            "Too many virtualized OEP retries ({}) — using last Possible OEP",
-                            ls.virtualized_oep_retries
-                        );
-                        let text_sec = &state.pe_info.pe_sections[0];
-                        let text_base =
-                            dbg.image_base() as usize + text_sec.virtual_address as usize;
-                        let text_end =
-                            dbg.image_base() as usize + state.pe_info.base_of_data as usize;
-                        let text_len = text_end.saturating_sub(text_base);
-
-                        let found_via_pattern: Option<usize> =
-                            if state.pe_info.major_linker_version == 2 {
-                                None
-                            } else if state.pe_info.major_linker_version == 0
-                                || [6u8, 7, 8, 9, 10, 11, 12, 14]
-                                    .contains(&state.pe_info.major_linker_version)
-                            {
-                                try_find_correct_oep(
-                                    dbg,
-                                    address,
-                                    text_base,
-                                    text_len,
-                                    state.pe_info.major_linker_version,
-                                )
-                                .unwrap_or(None)
-                            } else {
-                                None
-                            };
-
-                        let (real_oep, real_oep_provenance) = if let Some(oep) = found_via_pattern {
-                            info!(
-                                old = %format!("{address:#x}"),
-                                new = %format!("{oep:#x}"),
-                                "Replaced virtualized OEP via TryFindCorrectOEP"
-                            );
-                            (
-                                Some(oep),
-                                OepProvenance::trace(
-                                    oep as u64,
-                                    format!(
-                                        "virtualized-OEP retry TryFindCorrectOEP trace: {oep:#x}"
-                                    ),
-                                ),
-                            )
-                        } else if let Some(oep) = find_real_oep_by_scanning(
-                            dbg,
-                            dbg.image_base() as usize,
-                            text_sec.virtual_address,
-                            text_sec.virtual_size,
-                        )? {
-                            info!(
-                                old = %format!("{address:#x}"),
-                                new = %format!("{oep:#x}"),
-                                "Replaced virtualized OEP with scanned OEP"
-                            );
-                            (
-                                Some(oep),
-                                OepProvenance::scan_fallback(
-                                    oep as u64,
-                                    format!(
-                                        "virtualized-OEP retry live scan selected OEP: {oep:#x}"
-                                    ),
-                                ),
-                            )
-                        } else {
-                            let fallback = ls.last_possible_oep.or(Some(address));
-                            (
-                                fallback,
-                                OepProvenance::unknown(
-                                    "virtualized-OEP retry exhausted; only PossibleOEP candidate remains",
-                                ),
-                            )
-                        };
-
-                        ls.oep = real_oep;
-                        ls.oep_provenance = real_oep_provenance;
-                        ls.oep_found_via_scanning =
-                            matches!(ls.oep_provenance.source, mida_core::OepSource::ScanFallback);
-                        remove_code_section_guard(
-                            h_process,
-                            text_start,
-                            text_end.saturating_sub(text_start),
-                        )?;
-                        let oep_str = ls
-                            .oep
-                            .map(|a| format!("{a:#x}"))
-                            .unwrap_or_else(|| "unknown".into());
-                        info!(oep = %oep_str, "OEP found — removing guard");
-                    } else {
-                        // Virtualized OEP: try to return into the Themida
-                        // section so the next guard hit can capture a better
-                        // OEP.  On Win11, SetThreadContext may fail with
-                        // ERROR_NOACCESS (0x800703E6) even with CONTEXT_CONTROL
-                        // only — soft-fail instead of killing the whole unpack.
-                        let mut ctx = dbg
-                            .get_thread_context_control(thread_id)
-                            .map_err(|e| anyhow!("get_thread_context_control: {e}"))?;
-                        ctx.Rip = ret_addr as u64;
-                        ctx.Rsp += 8;
-                        match super::session::set_thread_context_control(dbg, thread_id, &ctx) {
-                            Ok(()) => {
-                                let ts_start = (dbg.image_base() as usize).wrapping_add(
-                                    state.pe_info.pe_sections[0].virtual_address as usize,
-                                );
-                                let text_end =
-                                    dbg.image_base() as usize + state.pe_info.base_of_data as usize;
-                                install_code_section_guard(
-                                    h_process,
-                                    ts_start,
-                                    text_end.saturating_sub(ts_start),
-                                    guard_protection,
-                                )?;
-
-                                dbg.continue_event(thread_id, ContinueStatus::Continue)?;
-                                return Ok(AvAction::Continue);
-                            }
-                            Err(e) => {
-                                warn!(
-                                    ret_addr = %format!("{ret_addr:#x}"),
-                                    retry = ls.virtualized_oep_retries,
-                                    error = %e,
-                                    "virtualized OEP SetThreadContext soft-fail — fall through with last Possible OEP"
-                                );
-                                ls.last_possible_oep = Some(address);
-                                // Fall through: treat this AV as a usable OEP
-                                // candidate and continue the non-virtualized
-                                // epilogue below (pattern scan / dump).
-                            }
-                        }
-                    }
-                }
-
-                ls.last_possible_oep = Some(address);
-
-                let text_section = &state.pe_info.pe_sections[0];
-                let text_base =
-                    (dbg.image_base() as usize).wrapping_add(text_section.virtual_address as usize);
-                let text_len = state
-                    .pe_info
-                    .base_of_data
-                    .wrapping_sub(u64::from(text_section.virtual_address))
-                    as usize;
-
-                let found_oep = if text_len >= 10 {
-                    try_find_correct_oep(
-                        dbg,
-                        address,
-                        text_base,
-                        text_len,
-                        state.pe_info.major_linker_version,
-                    )?
-                } else {
-                    None
-                };
-
-                if !ls.oep_found_via_scanning {
-                    if let Some(found) = found_oep {
-                        ls.oep = Some(found);
-                        ls.oep_provenance = OepProvenance::trace(
-                            found as u64,
-                            format!("PossibleOEP runtime pattern trace resolved OEP: {found:#x}"),
-                        );
-                    } else {
-                        ls.oep = Some(address);
-                        ls.oep_provenance = OepProvenance::unknown(format!(
-                            "PossibleOEP without confirming trace: {address:#x}"
-                        ));
-                    }
-                }
-
-                if found_oep.is_none()
-                    && state.pe_info.major_linker_version != 0
-                    && [9u8, 10, 11, 12, 14].contains(&state.pe_info.major_linker_version)
-                    && state.guard_addrs.len() >= 2
-                {
-                    let last_addr = state.guard_addrs[state.guard_addrs.len() - 1];
-                    let prev_addr = state.guard_addrs[state.guard_addrs.len() - 2];
-                    info!(
-                        prev = %format!("{prev_addr:#x}"),
-                        last = %format!("{last_addr:#x}"),
-                        oep = %format!("{address:#x}"),
-                        "Virtual OEP detected — entering FTraceMSVCOEP mode (MSVC VM at OEP)"
-                    );
-                    // B7.1: preserve current address as common-main candidate.
-                    // Never store it as msvc_init_cookie; cookie is resolved offline later.
-                    // The next arbitrary .text hit must NOT replace msvc_common_main_seh.
-                    mida_packers_themida::ftrace_enter_preserve_common_main(
-                        &mut state.msvc_common_main_seh,
-                        &mut state.msvc_init_cookie,
-                        &mut state.msvc_oep,
-                        &mut state.trace_msvc_oep,
-                        address,
-                        prev_addr,
-                    );
-                    ls.oep = Some(prev_addr);
-                    ls.oep_provenance = OepProvenance::unknown(format!(
-                        "FTraceMSVCOEP preserved common-main/bootstrap candidate: {prev_addr:#x}"
-                    ));
-                    ls.oep_found_via_scanning = false;
-                    let ctx = dbg
-                        .get_thread_context_control(thread_id)
-                        .map_err(|e| anyhow!("get_thread_context_control: {e}"))?;
-                    let mut ret_bytes = [0u8; 8];
-                    let mut ret_addr = 0usize;
-                    if dbg.read_memory(ctx.Rsp as usize, &mut ret_bytes).is_ok() {
-                        ret_addr = u64::from_le_bytes(ret_bytes) as usize;
-                    }
-                    if ret_addr != 0 {
-                        let mut new_ctx = dbg
-                            .get_thread_context_control(thread_id)
-                            .map_err(|e| anyhow!("get_thread_context_control: {e}"))?;
-                        new_ctx.Rip = ret_addr as u64;
-                        new_ctx.Rsp += 8;
-                        if let Err(e) =
-                            super::session::set_thread_context_control(dbg, thread_id, &new_ctx)
-                        {
-                            warn!(
-                                ret_addr = %format!("{ret_addr:#x}"),
-                                error = %e,
-                                "FTraceMSVCOEP SetThreadContext soft-fail — continue without redirect"
-                            );
-                        }
-                    }
-                    remove_code_section_guard(
-                        h_process,
-                        text_start,
-                        text_end.saturating_sub(text_start),
-                    )?;
-                    install_code_section_guard(
-                        h_process,
-                        text_start,
-                        text_end.saturating_sub(text_start),
-                        guard_protection,
-                    )?;
-                    log::log(
-                        LogType::Info,
-                        &format!(
-                            "FTraceMSVCOEP: waiting after VM \
-                         (preserved common_main={:#x}; cookie unresolved offline; oep_stub={:#x}; \
-                          next .text hit will NOT replace common_main)",
-                            state.msvc_common_main_seh, state.msvc_oep,
-                        ),
-                    );
-                    dbg.continue_event(thread_id, ContinueStatus::Continue)?;
-                    return Ok(AvAction::Continue);
-                }
-
-                if let Some(oep_addr) = ls.oep {
-                    let mut tm_start = usize::MAX;
-                    let mut tm_end = 0;
-                    for sec in &state.pe_info.pe_sections {
-                        if mida_packers_themida::is_themida_section(sec) {
-                            let s = dbg.image_base() as usize + sec.virtual_address as usize;
-                            let e = s + sec.virtual_size as usize;
-                            tm_start = tm_start.min(s);
-                            tm_end = tm_end.max(e);
-                        }
-                    }
-
-                    if tm_start < tm_end && is_oep_virtualized(dbg, oep_addr, tm_start) {
-                        info!(oep = %format!("{oep_addr:#x}"), "OEP is virtualized — scanning .text for real OEP");
-                        let text_sec = &state.pe_info.pe_sections[0];
-                        let text_rva = text_sec.virtual_address;
-                        let text_size = text_sec.virtual_size;
-                        if let Some(real_oep) = find_real_oep_by_scanning(
-                            dbg,
-                            dbg.image_base() as usize,
-                            text_rva,
-                            text_size,
-                        )? {
-                            info!(
-                                old = %format!("{oep_addr:#x}"),
-                                new = %format!("{real_oep:#x}"),
-                                "Replaced virtualized OEP with scanned OEP"
-                            );
-                            ls.oep = Some(real_oep);
-                            ls.oep_provenance = OepProvenance::scan_fallback(
-                                real_oep as u64,
-                                format!(
-                                    "virtualized OEP replaced by live .text scan: {real_oep:#x}"
-                                ),
-                            );
-                            ls.oep_found_via_scanning = true;
-                        }
-                    }
-                }
-
-                if found_oep.is_none() {
-                    if let Some(oep_addr) = ls.oep {
-                        let mut oep_bytes = [0u8; 4];
-                        if dbg.read_memory(oep_addr, &mut oep_bytes).is_ok() {
-                            let looks_valid =
-                                matches!(oep_bytes[0], 0x48 | 0x55 | 0x53 | 0x56 | 0x57)
-                                    || (oep_bytes[0] == 0x41
-                                        && matches!(oep_bytes[1], 0x54..=0x57));
-                            if looks_valid {
-                                info!(oep = %format!("{oep_addr:#x}"), "OEP looks like valid x64 code — using as-is for non-MSVC compiler");
-                                ls.oep = Some(oep_addr);
-                                ls.oep_provenance = OepProvenance::unknown(format!(
-                                    "PossibleOEP byte-shape heuristic only: {oep_addr:#x}"
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        GuardAccessResult::NotGuarded => {
-            // Null / non-text AVs after virtualized-OEP redirects thrash forever
-            // if we DBG_CONTINUE (instruction restarts at the same RIP). Escape
-            // by accepting the last PossibleOEP and proceeding to IAT/dump —
-            // same recovery idea as SetThreadContext soft-fail on Origin.
-            ls.unrelated_av_streak = ls.unrelated_av_streak.saturating_add(1);
-            let storm = ls.unrelated_av_streak >= ls.unrelated_av_storm_threshold
-                || (target_address == 0
-                    && ls.unrelated_av_streak >= ls.unrelated_av_null_storm_threshold);
-            if storm
-                && (ls.virtualized_oep_retries > 0 || ls.last_possible_oep.is_some())
-                && ls.oep.is_none()
-            {
-                let fallback = ls.last_possible_oep.or(Some(exception_addr as usize));
-                warn!(
-                    streak = ls.unrelated_av_streak,
-                    fault = %format!("{target_address:#x}"),
-                    exception = %format!("{exception_addr:#x}"),
-                    fallback = ?fallback.map(|a| format!("{a:#x}")),
-                    "Non-guard AV storm after virtualized OEP — accepting last PossibleOEP"
-                );
-                ls.oep = fallback;
-                ls.oep_provenance = fallback
-                    .map(|va| {
-                        OepProvenance::unknown(format!(
-                            "non-guard AV storm accepted PossibleOEP fallback: {va:#x}"
-                        ))
-                    })
-                    .unwrap_or_else(|| {
-                        OepProvenance::unknown("non-guard AV storm produced no OEP address")
-                    });
-                ls.oep_found_via_scanning = false;
-                ls.storm_escape_freeze = true;
-                let _ = remove_code_section_guard(
-                    h_process,
-                    text_start,
-                    text_end.saturating_sub(text_start),
-                );
-                // Lunlun quality path: do NOT fall through to post-OEP IAT monitor
-                // with Rip=PossibleOEP. That resume hits ExitProcess in ~1ms
-                // (violations=0), skip_v3, and residual Themida stubs (~11% rebuild).
-                // Freeze here (process still alive) and let post-loop v3-trace
-                // resolve wrapper slots — same Break pattern as MSVC OEP path.
-                info!(
-                    oep = %format!("{:#x}", fallback.unwrap_or(0)),
-                    "Storm escape freeze — skip deadly OEP resume; post-loop IAT v3 on live process"
-                );
-                return Ok(AvAction::Break);
-            } else {
-                if ls.unrelated_av_streak <= 8 || ls.unrelated_av_streak.is_power_of_two() {
-                    debug!(
-                        streak = ls.unrelated_av_streak,
-                        fault = %format!("{target_address:#x}"),
-                        exception = %format!("{exception_addr:#x}"),
-                        "NotGuarded AV — continue"
-                    );
-                }
+    match outcome.action {
+        AvOepAction::Continue => {
+            if !outcome.epilogue {
+                // No shared epilogue (no guard installed / unrelated AV):
+                // resume the pending event exactly once.
                 dbg.continue_event(thread_id, ContinueStatus::Continue)?;
                 return Ok(AvAction::Continue);
             }
+            // Fall through to the shared post-OEP epilogue below.
         }
-        GuardAccessResult::IatReady { address } => {
-            info!(address = %format!("{address:#x}"), "IAT monitoring complete — IAT ready for tracing");
+        AvOepAction::Break { .. } => {
+            // Break deliberately leaves the current AV pending so the
+            // post-loop IAT phase can consume it.
+            return Ok(AvAction::Break);
+        }
+        AvOepAction::RedirectAndContinue { rip, rsp_delta, .. } => {
+            // Redirect RIP/RSP (matching the legacy virtualized-OEP / FTrace
+            // redirect: no trap-flag change) then resume exactly once.
+            let mut ctx = dbg
+                .get_thread_context_control(thread_id)
+                .map_err(|e| anyhow!("get_thread_context_control: {e}"))?;
+            ctx.Rip = rip;
+            ctx.Rsp = ctx.Rsp.wrapping_add(rsp_delta);
+            super::session::set_thread_context_control(dbg, thread_id, &ctx)?;
+            dbg.continue_event(thread_id, ContinueStatus::Continue)?;
+            return Ok(AvAction::Continue);
         }
     }
 

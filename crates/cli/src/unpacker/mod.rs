@@ -20,6 +20,7 @@
 //! ```
 
 mod av_handler;
+mod av_query;
 pub mod bundle_assembler;
 mod dump;
 mod early_snapshots;

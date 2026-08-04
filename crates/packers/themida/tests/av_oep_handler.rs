@@ -98,6 +98,7 @@ impl AvOepQuery for ScriptedQuery {
     }
     fn process_guarded_access(
         &mut self,
+        _themida: &mut ThemidaState,
         _target: usize,
         _exc: usize,
         _thread: u32,
@@ -120,7 +121,11 @@ impl AvOepQuery for ScriptedQuery {
             .clone()
             .ok_or_else(|| "no scripted tls result".to_string())
     }
-    fn try_find_correct_oep(&mut self, _pe_entry_point: usize) -> Option<usize> {
+    fn try_find_correct_oep(
+        &mut self,
+        _themida: &mut ThemidaState,
+        _pe_entry_point: usize,
+    ) -> Option<usize> {
         self.pattern_oep
     }
     fn scan_for_oep(&mut self, _text_rva: u32, _text_size: u32) -> Option<usize> {

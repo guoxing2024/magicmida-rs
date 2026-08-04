@@ -78,9 +78,11 @@ pub trait AvOepQuery {
 
     fn image_base(&self) -> u64;
 
-    /// Evaluate the guarded-access result for this fault.
+    /// Evaluate the guarded-access result for this fault. `themida` state is
+    /// passed per call so the host adapter does not need to alias it.
     fn process_guarded_access(
         &mut self,
+        themida: &mut ThemidaState,
         target_address: usize,
         exception_addr: usize,
         thread_id: u32,
@@ -100,7 +102,11 @@ pub trait AvOepQuery {
 
     /// Pattern-scan the CRT for the real OEP starting at `pe_entry_point`
     /// (linker-version gating and scan bounds stay decision-side/host state).
-    fn try_find_correct_oep(&mut self, pe_entry_point: usize) -> Option<usize>;
+    fn try_find_correct_oep(
+        &mut self,
+        themida: &mut ThemidaState,
+        pe_entry_point: usize,
+    ) -> Option<usize>;
 
     /// Scan `.text` for the real OEP.
     fn scan_for_oep(&mut self, text_rva: u32, text_size: u32) -> Option<usize>;
@@ -135,6 +141,11 @@ pub enum LogLevel {
 pub struct AvOepOutcome {
     pub action: AvOepAction,
     pub state: AvOepState,
+    /// For `Continue` actions: `true` when the host should also run the
+    /// shared post-OEP epilogue (Handled / TLS callback / IAT-ready /
+    /// PossibleOEP fall-through), `false` when the host should just resume
+    /// the pending event (no guard installed / unrelated AV).
+    pub epilogue: bool,
 }
 
 /// Decide what to do with one AccessViolation event.
@@ -152,10 +163,12 @@ pub fn decide_av_oep(
         return Ok(AvOepOutcome {
             action: AvOepAction::Continue,
             state: state.clone(),
+            epilogue: false,
         });
     }
 
     let result = query.process_guarded_access(
+        themida,
         input.target_address as usize,
         input.exception_addr as usize,
         input.event_thread_id,
@@ -200,6 +213,7 @@ pub fn decide_av_oep(
                     remove_guard: false,
                 },
                 state: state.clone(),
+                epilogue: false,
             });
         }
         GuardAccessResult::PossibleOEP { address } => {
@@ -209,6 +223,7 @@ pub fn decide_av_oep(
                 return Ok(AvOepOutcome {
                     action,
                     state: state.clone(),
+                    epilogue: false,
                 });
             }
             // Shared epilogue (host-side IAT phase) otherwise.
@@ -251,6 +266,7 @@ pub fn decide_av_oep(
                         remove_guard: false,
                     },
                     state: state.clone(),
+                    epilogue: false,
                 });
             } else if state.unrelated_av_streak <= 8 || state.unrelated_av_streak.is_power_of_two()
             {
@@ -274,6 +290,9 @@ pub fn decide_av_oep(
     Ok(AvOepOutcome {
         action: AvOepAction::Continue,
         state: state.clone(),
+        // Handled / TLS callback / IAT-ready / PossibleOEP fall-through:
+        // the host runs the shared post-OEP epilogue before resuming.
+        epilogue: !matches!(result, GuardAccessResult::NotGuarded),
     })
 }
 
@@ -322,7 +341,7 @@ fn decide_possible_oep(
         let found_via_pattern_first = if themida.pe_info.major_linker_version == 0
             || [2u8, 6, 7, 8, 9, 10, 11, 12, 14].contains(&themida.pe_info.major_linker_version)
         {
-            query.try_find_correct_oep(pe_entry_point)
+            query.try_find_correct_oep(themida, pe_entry_point)
         } else {
             None
         };
@@ -366,14 +385,17 @@ fn decide_possible_oep(
                     state.virtualized_oep_retries
                 ),
             );
-            let text_sec = &themida.pe_info.pe_sections[0];
+            let (text_rva, text_size) = {
+                let sec = &themida.pe_info.pe_sections[0];
+                (sec.virtual_address, sec.virtual_size)
+            };
 
             let found_via_pattern: Option<usize> = if themida.pe_info.major_linker_version == 2 {
                 None
             } else if themida.pe_info.major_linker_version == 0
                 || [6u8, 7, 8, 9, 10, 11, 12, 14].contains(&themida.pe_info.major_linker_version)
             {
-                query.try_find_correct_oep(address)
+                query.try_find_correct_oep(themida, address)
             } else {
                 None
             };
@@ -390,9 +412,7 @@ fn decide_possible_oep(
                         format!("virtualized-OEP retry TryFindCorrectOEP trace: {oep:#x}"),
                     ),
                 )
-            } else if let Some(oep) =
-                query.scan_for_oep(text_sec.virtual_address, text_sec.virtual_size)
-            {
+            } else if let Some(oep) = query.scan_for_oep(text_rva, text_size) {
                 query.log(
                     LogLevel::Info,
                     &format!("Replaced virtualized OEP with scanned OEP: {oep:#x}"),
@@ -453,14 +473,14 @@ fn decide_possible_oep(
 
     state.last_possible_oep = Some(address);
 
-    let text_section = &themida.pe_info.pe_sections[0];
     let text_len = themida
         .pe_info
         .base_of_data
-        .wrapping_sub(u64::from(text_section.virtual_address)) as usize;
+        .wrapping_sub(u64::from(themida.pe_info.pe_sections[0].virtual_address))
+        as usize;
 
     let found_oep = if text_len >= 10 {
-        query.try_find_correct_oep(address)
+        query.try_find_correct_oep(themida, address)
     } else {
         None
     };
@@ -544,10 +564,11 @@ fn decide_possible_oep(
                 LogLevel::Info,
                 &format!("OEP is virtualized — scanning .text for real OEP ({oep_addr:#x})"),
             );
-            let text_sec = &themida.pe_info.pe_sections[0];
-            if let Some(real_oep) =
-                query.scan_for_oep(text_sec.virtual_address, text_sec.virtual_size)
-            {
+            let (text_rva, text_size) = {
+                let sec = &themida.pe_info.pe_sections[0];
+                (sec.virtual_address, sec.virtual_size)
+            };
+            if let Some(real_oep) = query.scan_for_oep(text_rva, text_size) {
                 query.log(
                     LogLevel::Info,
                     &format!("Replaced virtualized OEP with scanned OEP: {real_oep:#x}"),
