@@ -31,3 +31,7 @@ serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }
+# Black-box bundle consumption only: the assembler output is validated by the
+# independent consumer in tests. Production `mida-cli` must not depend on
+# `mida-acceptance` (boundary is one-way).
+mida-acceptance = { path = "../acceptance" }

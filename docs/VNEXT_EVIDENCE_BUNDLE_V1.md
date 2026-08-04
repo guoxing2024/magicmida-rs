@@ -143,23 +143,33 @@ hashes invalidates the bundle.
 not import producer types from `mida-cli`/`mida-pe`. Schema drift is caught by
 the offline tests:
 
-- `crates/acceptance/src/evidence_bundle.rs` — unit tests (18)
+- `crates/acceptance/src/evidence_bundle.rs` — consumer unit tests (22)
 - `crates/acceptance/tests/evidence_bundle.rs` — synthetic
   producer->bundle->consumer black-box tests (6), including an
   attacker-style test that swaps a normal sidecar's candidate identity and
   recomputes every hash, which must still fail.
+- `crates/cli/src/unpacker/bundle_assembler.rs` — atomic producer:
+  re-reads protected input and candidate, re-checks every member's schema
+  and embedded identities, rejects duplicate/aliased member paths, and
+  writes the manifest via temp-file + fsync + atomic rename.
+- `crates/cli/tests/bundle_assembler.rs` — producer tests (9) that feed the
+  assembler output to the independent consumer: missing members, duplicate
+  names, aliased paths, stale embedded identities, schema drift, malformed
+  fields, and restart recovery over a corrupt destination all fail closed,
+  and a leftover `.tmp-*` file is never a valid bundle.
 
 Run:
 
 ```powershell
 cargo test -p mida-acceptance --offline
+cargo test -p mida-cli --test bundle_assembler --offline
 ```
 
 ## 7. Not yet done (next steps)
 
-- The CLI/runner does not yet emit the bundle manifest; a `bundle-assembler`
-  step (Lab agent) must aggregate the existing sidecars, compute both
-  canonical hashes, and write the manifest atomically next to the candidate.
+- The CLI unpack command does not yet invoke the assembler automatically; the
+  post-loop must aggregate the emitted sidecars into a bundle per run (P5
+  wiring, `assemble_evidence_bundle` is ready to be called).
 - The v8 gate should consume the bundle inventory as its input envelope so
   "which files belong to this run" stops being implicit.
 - The `runner_config_digest` value must come from the frozen runner policy

@@ -425,7 +425,7 @@ fn ensure_sidecar_is_safe(
     Ok(())
 }
 
-fn same_file(left: &Path, right: &Path) -> anyhow::Result<bool> {
+pub(crate) fn same_file(left: &Path, right: &Path) -> anyhow::Result<bool> {
     if fs::canonicalize(left).ok() == fs::canonicalize(right).ok() {
         return Ok(true);
     }

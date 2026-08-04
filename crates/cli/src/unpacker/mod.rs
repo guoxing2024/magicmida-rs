@@ -20,6 +20,7 @@
 //! ```
 
 mod av_handler;
+pub mod bundle_assembler;
 mod dump;
 mod early_snapshots;
 mod generic;
@@ -37,6 +38,7 @@ mod post_loop;
 mod relocation_evidence;
 mod section_rebuild_evidence;
 mod session;
+pub(crate) mod sidecar_io;
 mod tls_evidence;
 mod verify;
 
