@@ -1,0 +1,646 @@
+//! OEP provenance sidecar binding for native candidate dumps.
+//!
+//! The sidecar is written only after the candidate has been successfully
+//! serialized. It binds the exact protected input and final candidate bytes to
+//! the provenance that reached the dump boundary.
+
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use anyhow::{anyhow, Context};
+use mida_core::{OepProvenance, OepSource};
+use mida_pe::PeHeader;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+const SCHEMA_VERSION: &str = "mida.oreans-oep-evidence/v1";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ArtifactIdentity {
+    path: String,
+    sha256: String,
+    size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct OepEvidenceSidecar {
+    schema_version: String,
+    protected_input: ArtifactIdentity,
+    candidate: ArtifactIdentity,
+    source: String,
+    va: Option<u64>,
+    rva: Option<u32>,
+    final_entry_rva: u32,
+    evidence: String,
+    application_oep: bool,
+    bootstrap_or_ambiguous: bool,
+    entry_rva_matches_provenance: bool,
+    prerequisite_passes: bool,
+    blocker: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    #[cfg(windows)]
+    volume_serial: u32,
+    #[cfg(windows)]
+    file_index: u64,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+/// Write the OEP sidecar for a successfully dumped native PE candidate.
+///
+/// The final entry RVA is parsed from the bytes currently on disk. The
+/// candidate digest and size are computed over those same bytes, so the
+/// sidecar cannot self-certify a dump-time `PeHeader` value or an in-memory
+/// image. The sidecar is committed through a same-directory temporary file and
+/// atomic replacement after all input/alias checks have completed.
+pub(super) fn write_oep_evidence(
+    protected_input: &Path,
+    candidate: &Path,
+    provenance: &OepProvenance,
+) -> anyhow::Result<PathBuf> {
+    let (_, protected_identity) = read_artifact(protected_input).with_context(|| {
+        format!(
+            "read protected input for OEP evidence: {}",
+            protected_input.display()
+        )
+    })?;
+    let (candidate_bytes, candidate_identity) = read_artifact(candidate)
+        .with_context(|| format!("read candidate for OEP evidence: {}", candidate.display()))?;
+    let final_entry_rva = PeHeader::from_bytes(&candidate_bytes)
+        .map_err(|error| anyhow!("parse final candidate PE: {error}"))?
+        .entry_point;
+    let sidecar = sidecar_path(candidate)?;
+
+    // This check happens before creating/opening any output path. Existing
+    // sidecars may be replaced, but never when they alias either input.
+    ensure_sidecar_is_safe(&sidecar, protected_input, candidate)?;
+
+    let entry_rva_matches_provenance = provenance.rva == Some(final_entry_rva);
+    let core_passes = provenance.application_oep_prerequisite_passes();
+    let prerequisite_passes = core_passes && entry_rva_matches_provenance;
+    let blocker = stable_blocker(
+        provenance,
+        final_entry_rva,
+        entry_rva_matches_provenance,
+        prerequisite_passes,
+    );
+
+    let sidecar_value = OepEvidenceSidecar {
+        schema_version: SCHEMA_VERSION.to_string(),
+        protected_input: protected_identity,
+        candidate: candidate_identity,
+        source: source_name(provenance.source).to_string(),
+        va: provenance.va,
+        rva: provenance.rva,
+        final_entry_rva,
+        evidence: provenance.evidence.clone(),
+        application_oep: provenance.application_oep,
+        bootstrap_or_ambiguous: provenance.bootstrap_or_ambiguous,
+        entry_rva_matches_provenance,
+        prerequisite_passes,
+        blocker,
+    };
+    let mut json =
+        serde_json::to_vec_pretty(&sidecar_value).context("serialize OEP evidence sidecar")?;
+    json.push(b'\n');
+
+    atomic_write(&sidecar, &json)?;
+    Ok(sidecar)
+}
+
+fn sidecar_path(candidate: &Path) -> anyhow::Result<PathBuf> {
+    let file_name = candidate
+        .file_name()
+        .ok_or_else(|| anyhow!("candidate path has no file name"))?;
+    let mut sidecar_name = file_name.to_os_string();
+    sidecar_name.push(".oep_evidence.json");
+    Ok(candidate.with_file_name(sidecar_name))
+}
+fn stable_blocker(
+    provenance: &OepProvenance,
+    final_entry_rva: u32,
+    entry_rva_matches_provenance: bool,
+    prerequisite_passes: bool,
+) -> Option<String> {
+    if prerequisite_passes {
+        return None;
+    }
+
+    let mut reasons = Vec::new();
+    if let Some(reason) = provenance.application_oep_blocker() {
+        reasons.push(reason.to_string());
+    }
+    if !entry_rva_matches_provenance {
+        reasons.push(match provenance.rva {
+            Some(rva) => format!(
+                "final candidate entry RVA {final_entry_rva:#x} does not match provenance RVA {rva:#x}"
+            ),
+            None => "provenance RVA is missing; final candidate entry cannot be bound".to_string(),
+        });
+    }
+    if reasons.is_empty() {
+        reasons.push("OEP provenance prerequisite failed".to_string());
+    }
+    Some(reasons.join("; "))
+}
+
+fn source_name(source: OepSource) -> &'static str {
+    match source {
+        OepSource::RuntimeRip => "runtime_rip",
+        OepSource::Trace => "trace",
+        OepSource::ScanFallback => "scan_fallback",
+        OepSource::Unknown => "unknown",
+    }
+}
+
+fn read_artifact(path: &Path) -> anyhow::Result<(Vec<u8>, ArtifactIdentity)> {
+    let bytes = fs::read(path).with_context(|| format!("read artifact: {}", path.display()))?;
+    let digest = Sha256::digest(&bytes);
+    let size_bytes = bytes.len() as u64;
+    Ok((
+        bytes,
+        ArtifactIdentity {
+            path: path.to_string_lossy().into_owned(),
+            sha256: format!("{digest:x}"),
+            size_bytes,
+        },
+    ))
+}
+
+fn ensure_sidecar_is_safe(
+    sidecar: &Path,
+    protected_input: &Path,
+    candidate: &Path,
+) -> anyhow::Result<()> {
+    if paths_alias(sidecar, protected_input)? {
+        return Err(anyhow!(
+            "refusing OEP sidecar: sidecar aliases protected input"
+        ));
+    }
+    if paths_alias(sidecar, candidate)? {
+        return Err(anyhow!("refusing OEP sidecar: sidecar aliases candidate"));
+    }
+    Ok(())
+}
+
+fn paths_alias(left: &Path, right: &Path) -> io::Result<bool> {
+    if normalized_path(left)? == normalized_path(right)? {
+        return Ok(true);
+    }
+    match (file_identity(left)?, file_identity(right)?) {
+        (Some(left), Some(right)) => Ok(left == right),
+        _ => Ok(false),
+    }
+}
+
+fn normalized_path(path: &Path) -> io::Result<PathBuf> {
+    if path.exists() {
+        return fs::canonicalize(path);
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let parent = absolute.parent().unwrap_or_else(|| Path::new("."));
+    let parent = fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+    Ok(parent.join(absolute.file_name().unwrap_or_default()))
+}
+
+fn file_identity(path: &Path) -> io::Result<Option<FileIdentity>> {
+    let _metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    #[cfg(windows)]
+    {
+        use std::fs::File;
+        use std::os::windows::io::AsRawHandle;
+
+        #[repr(C)]
+        #[derive(Default)]
+        struct FileTime {
+            low: u32,
+            high: u32,
+        }
+        #[repr(C)]
+        #[derive(Default)]
+        struct ByHandleFileInformation {
+            file_attributes: u32,
+            creation_time: FileTime,
+            last_access_time: FileTime,
+            last_write_time: FileTime,
+            volume_serial_number: u32,
+            file_size_high: u32,
+            file_size_low: u32,
+            number_of_links: u32,
+            file_index_high: u32,
+            file_index_low: u32,
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetFileInformationByHandle(
+                file: *mut std::ffi::c_void,
+                information: *mut ByHandleFileInformation,
+            ) -> i32;
+        }
+
+        let file = File::open(path)?;
+        let mut info = ByHandleFileInformation::default();
+        // SAFETY: the handle is owned by `file`; `info` is a valid output buffer.
+        let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let file_index = (u64::from(info.file_index_high) << 32) | u64::from(info.file_index_low);
+        return Ok(Some(FileIdentity {
+            volume_serial: info.volume_serial_number,
+            file_index,
+        }));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        return Ok(Some(FileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }));
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = metadata;
+        Ok(None)
+    }
+}
+
+fn atomic_write(destination: &Path, contents: &[u8]) -> anyhow::Result<()> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| anyhow!("sidecar has no parent directory"))?;
+    let temp = create_temp_file(
+        parent,
+        destination.file_name().unwrap_or_default(),
+        contents,
+    )?;
+
+    if let Err(error) = atomic_replace(&temp, destination) {
+        let _ = fs::remove_file(&temp);
+        return Err(error).with_context(|| {
+            format!(
+                "atomically replace OEP evidence sidecar {}",
+                destination.display()
+            )
+        });
+    }
+    Ok(())
+}
+
+fn create_temp_file(
+    parent: &Path,
+    destination_name: &std::ffi::OsStr,
+    contents: &[u8],
+) -> anyhow::Result<PathBuf> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    for attempt in 0..32u32 {
+        let name = format!(
+            ".{}.tmp-{}-{}",
+            destination_name.to_string_lossy(),
+            std::process::id(),
+            now.saturating_add(u128::from(attempt))
+        );
+        let path = parent.join(name);
+        let mut file = match OpenOptions::new().create_new(true).write(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("create temporary sidecar {}", path.display()))
+            }
+        };
+        let result = file
+            .write_all(contents)
+            .and_then(|_| file.flush())
+            .and_then(|_| file.sync_all());
+        drop(file);
+        if let Err(error) = result {
+            let _ = fs::remove_file(&path);
+            return Err(error)
+                .with_context(|| format!("sync temporary sidecar {}", path.display()));
+        }
+        return Ok(path);
+    }
+    Err(anyhow!("unable to allocate unique temporary sidecar"))
+}
+
+#[cfg(unix)]
+fn atomic_replace(temp: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(temp, destination)
+}
+
+#[cfg(windows)]
+fn atomic_replace(temp: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let temp_w: Vec<u16> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination_w: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
+    }
+    // Same-directory temp plus MOVEFILE_REPLACE_EXISTING gives an atomic
+    // rename/replace on the target volume and WRITE_THROUGH requests durable
+    // metadata propagation before returning.
+    let ok = unsafe {
+        MoveFileExW(
+            temp_w.as_ptr(),
+            destination_w.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn atomic_replace(temp: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(temp, destination)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("mida-oep-{label}-{}-{nonce}", std::process::id()));
+        fs::create_dir_all(&path).expect("temp dir");
+        path
+    }
+
+    fn minimal_pe64(entry_rva: u32) -> Vec<u8> {
+        let mut buf = vec![0u8; 512];
+        buf[0..2].copy_from_slice(b"MZ");
+        buf[60..64].copy_from_slice(&0x40u32.to_le_bytes());
+        let nt = 0x40usize;
+        buf[nt..nt + 4].copy_from_slice(b"PE\0\0");
+        let fh = nt + 4;
+        buf[fh..fh + 2].copy_from_slice(&0x8664u16.to_le_bytes());
+        buf[fh + 2..fh + 4].copy_from_slice(&1u16.to_le_bytes());
+        buf[fh + 16..fh + 18].copy_from_slice(&0xF0u16.to_le_bytes());
+        buf[fh + 18..fh + 20].copy_from_slice(&0x22u16.to_le_bytes());
+        let oh = nt + 24;
+        buf[oh..oh + 2].copy_from_slice(&0x20Bu16.to_le_bytes());
+        buf[oh + 16..oh + 20].copy_from_slice(&entry_rva.to_le_bytes());
+        buf[oh + 24..oh + 32].copy_from_slice(&0x1400_00000u64.to_le_bytes());
+        buf[oh + 32..oh + 36].copy_from_slice(&0x1000u32.to_le_bytes());
+        buf[oh + 36..oh + 40].copy_from_slice(&0x200u32.to_le_bytes());
+        buf[oh + 56..oh + 60].copy_from_slice(&0x2000u32.to_le_bytes());
+        buf[oh + 60..oh + 64].copy_from_slice(&0x200u32.to_le_bytes());
+        buf[oh + 108..oh + 112].copy_from_slice(&16u32.to_le_bytes());
+        let sh = nt + 24 + 0xF0;
+        buf[sh..sh + 5].copy_from_slice(b".text");
+        buf[sh + 8..sh + 12].copy_from_slice(&0x1000u32.to_le_bytes());
+        buf[sh + 12..sh + 16].copy_from_slice(&0x1000u32.to_le_bytes());
+        buf[sh + 16..sh + 20].copy_from_slice(&0x200u32.to_le_bytes());
+        buf[sh + 20..sh + 24].copy_from_slice(&0x200u32.to_le_bytes());
+        buf[sh + 36..sh + 40].copy_from_slice(&0x6000_0020u32.to_le_bytes());
+        buf
+    }
+
+    fn write_fixture(dir: &Path, entry_rva: u32) -> (PathBuf, PathBuf) {
+        let input = dir.join("protected.exe");
+        let candidate = dir.join("candidate.exe");
+        fs::write(&input, b"protected bytes\0\x90").expect("input");
+        fs::write(&candidate, minimal_pe64(entry_rva)).expect("candidate");
+        (input, candidate)
+    }
+
+    fn pass_provenance(rva: u32) -> OepProvenance {
+        OepProvenance::runtime_rip(0x1400_1234, "runtime RIP entered decrypted text")
+            .with_rva(Some(rva))
+    }
+
+    fn read_sidecar(path: &Path) -> serde_json::Value {
+        serde_json::from_slice(&fs::read(path).expect("sidecar bytes")).expect("parse sidecar")
+    }
+
+    fn cleanup(dir: PathBuf) {
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn runtime_rip_matching_rva_passes_and_binds_exact_digest_size() {
+        let dir = temp_dir("runtime-pass");
+        let (input, candidate) = write_fixture(&dir, 0x1234);
+        let sidecar =
+            write_oep_evidence(&input, &candidate, &pass_provenance(0x1234)).expect("write");
+        let value = read_sidecar(&sidecar);
+        assert_eq!(value["schema_version"], SCHEMA_VERSION);
+        assert_eq!(value["source"], "runtime_rip");
+        assert_eq!(value["rva"], 0x1234);
+        assert_eq!(value["final_entry_rva"], 0x1234);
+        assert_eq!(value["entry_rva_matches_provenance"], true);
+        assert_eq!(value["prerequisite_passes"], true);
+        assert_eq!(value["blocker"], serde_json::Value::Null);
+        assert!(value.get("schema").is_none());
+        assert!(value.get("entry_matches_provenance_rva").is_none());
+        let input_bytes = fs::read(&input).expect("input bytes");
+        let candidate_bytes = fs::read(&candidate).expect("candidate bytes");
+        assert_eq!(value["protected_input"]["size_bytes"], input_bytes.len());
+        assert_eq!(value["candidate"]["size_bytes"], candidate_bytes.len());
+        assert_eq!(
+            value["protected_input"]["sha256"],
+            format!("{:x}", Sha256::digest(&input_bytes))
+        );
+        assert_eq!(
+            value["candidate"]["sha256"],
+            format!("{:x}", Sha256::digest(&candidate_bytes))
+        );
+        cleanup(dir);
+    }
+
+    #[test]
+    fn trace_passes() {
+        let dir = temp_dir("trace-pass");
+        let (input, candidate) = write_fixture(&dir, 0x1234);
+        let provenance = OepProvenance::trace(0x1400_1234, "trace resolved application OEP")
+            .with_rva(Some(0x1234));
+        let value =
+            read_sidecar(&write_oep_evidence(&input, &candidate, &provenance).expect("write"));
+        assert_eq!(value["source"], "trace");
+        assert_eq!(value["prerequisite_passes"], true);
+        cleanup(dir);
+    }
+
+    #[test]
+    fn scan_fallback_fails_closed() {
+        let dir = temp_dir("scan-fail");
+        let (input, candidate) = write_fixture(&dir, 0x1234);
+        let provenance =
+            OepProvenance::scan_fallback(0x1400_1234, "scan fallback").with_rva(Some(0x1234));
+        let value =
+            read_sidecar(&write_oep_evidence(&input, &candidate, &provenance).expect("write"));
+        assert_eq!(value["source"], "scan_fallback");
+        assert_eq!(value["prerequisite_passes"], false);
+        assert!(value["blocker"]
+            .as_str()
+            .expect("blocker")
+            .contains("scan fallback"));
+        cleanup(dir);
+    }
+
+    #[test]
+    fn unknown_and_missing_addresses_fail_closed() {
+        let dir = temp_dir("unknown-fail");
+        let (input, candidate) = write_fixture(&dir, 0x1234);
+        let unknown = OepProvenance::unknown("no trustworthy OEP");
+        let value = read_sidecar(&write_oep_evidence(&input, &candidate, &unknown).expect("write"));
+        assert_eq!(value["source"], "unknown");
+        assert_eq!(value["prerequisite_passes"], false);
+        assert!(value["blocker"]
+            .as_str()
+            .expect("blocker")
+            .contains("unknown"));
+
+        let missing = OepProvenance::runtime_rip(0x1400_1234, "address incomplete");
+        let value = read_sidecar(&write_oep_evidence(&input, &candidate, &missing).expect("write"));
+        assert_eq!(value["prerequisite_passes"], false);
+        assert!(value["blocker"].as_str().expect("blocker").contains("RVA"));
+        cleanup(dir);
+    }
+
+    #[test]
+    fn bootstrap_ambiguous_fails_closed() {
+        let dir = temp_dir("bootstrap-fail");
+        let (input, candidate) = write_fixture(&dir, 0x1234);
+        let provenance = OepProvenance::new(
+            OepSource::RuntimeRip,
+            0x1400_1234,
+            "bootstrap RIP",
+            true,
+            true,
+        )
+        .with_rva(Some(0x1234));
+        let value =
+            read_sidecar(&write_oep_evidence(&input, &candidate, &provenance).expect("write"));
+        assert_eq!(value["prerequisite_passes"], false);
+        assert!(value["blocker"]
+            .as_str()
+            .expect("blocker")
+            .contains("bootstrap"));
+        cleanup(dir);
+    }
+
+    #[test]
+    fn final_candidate_entry_is_authoritative_and_mismatch_fails_closed() {
+        let dir = temp_dir("mismatch-fail");
+        let (input, candidate) = write_fixture(&dir, 0x1234);
+        let value = read_sidecar(
+            &write_oep_evidence(&input, &candidate, &pass_provenance(0x5678)).expect("write"),
+        );
+        assert_eq!(value["final_entry_rva"], 0x1234);
+        assert_eq!(value["entry_rva_matches_provenance"], false);
+        assert_eq!(value["prerequisite_passes"], false);
+        assert!(value["blocker"]
+            .as_str()
+            .expect("blocker")
+            .contains("does not match"));
+        cleanup(dir);
+    }
+
+    #[test]
+    fn rewrite_is_deterministic_and_parseable() {
+        let dir = temp_dir("deterministic");
+        let (input, candidate) = write_fixture(&dir, 0x1234);
+        let sidecar =
+            write_oep_evidence(&input, &candidate, &pass_provenance(0x1234)).expect("write");
+        let first = fs::read(&sidecar).expect("first bytes");
+        assert_eq!(
+            sidecar.file_name().and_then(|name| name.to_str()),
+            Some("candidate.exe.oep_evidence.json")
+        );
+        let second_path =
+            write_oep_evidence(&input, &candidate, &pass_provenance(0x1234)).expect("rewrite");
+        let second = fs::read(second_path).expect("second bytes");
+        assert_eq!(first, second);
+        let _: OepEvidenceSidecar = serde_json::from_slice(&first).expect("typed parse");
+        assert!(first.ends_with(b"\n"));
+        assert!(!dir.join(".candidate.exe.oep_evidence.json.tmp").exists());
+        cleanup(dir);
+    }
+
+    #[test]
+    fn same_path_alias_is_rejected_before_replacement_and_original_is_unchanged() {
+        let dir = temp_dir("same-path");
+        let candidate = dir.join("candidate.exe");
+        let input = sidecar_path(&candidate).expect("sidecar path");
+        fs::write(&input, b"protected-original").expect("input");
+        fs::write(&candidate, minimal_pe64(0x1234)).expect("candidate");
+        let original = fs::read(&input).expect("original");
+        let result = write_oep_evidence(&input, &candidate, &pass_provenance(0x1234));
+        assert!(result.is_err());
+        assert_eq!(fs::read(&input).expect("input after"), original);
+        cleanup(dir);
+    }
+
+    #[test]
+    fn hard_link_aliases_are_rejected_without_changing_originals() {
+        let dir = temp_dir("hard-link");
+        let (input, candidate) = write_fixture(&dir, 0x1234);
+        let sidecar = sidecar_path(&candidate).expect("sidecar path");
+        fs::hard_link(&input, &sidecar).expect("hard link input");
+        let input_before = fs::read(&input).expect("input before");
+        let candidate_before = fs::read(&candidate).expect("candidate before");
+        assert!(write_oep_evidence(&input, &candidate, &pass_provenance(0x1234)).is_err());
+        assert_eq!(fs::read(&input).expect("input after"), input_before);
+        assert_eq!(
+            fs::read(&candidate).expect("candidate after"),
+            candidate_before
+        );
+        fs::remove_file(&sidecar).expect("remove input link");
+        fs::hard_link(&candidate, &sidecar).expect("hard link candidate");
+        assert!(write_oep_evidence(&input, &candidate, &pass_provenance(0x1234)).is_err());
+        assert_eq!(fs::read(&input).expect("input final"), input_before);
+        assert_eq!(
+            fs::read(&candidate).expect("candidate final"),
+            candidate_before
+        );
+        cleanup(dir);
+    }
+
+    #[test]
+    fn invalid_final_candidate_writes_no_sidecar() {
+        let dir = temp_dir("invalid-candidate");
+        let (input, candidate) = write_fixture(&dir, 0x1234);
+        fs::write(&candidate, b"not a PE").expect("invalid candidate");
+        let sidecar = sidecar_path(&candidate).expect("sidecar path");
+        assert!(write_oep_evidence(&input, &candidate, &pass_provenance(0x1234)).is_err());
+        assert!(!sidecar.exists());
+        cleanup(dir);
+    }
+}

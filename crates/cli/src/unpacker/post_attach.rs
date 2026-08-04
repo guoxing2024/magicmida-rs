@@ -1,7 +1,7 @@
 //! Post-attach fast path (no debug port): observe .text, freeze, dump.
 //!
 //! Extracted from `mod.rs` (P1 host thin split / unattended engineering).
-//! Used when section 0 is plain `.text` and the target is not .NET — create
+//! Used when section 0 is plain `.text` and the target is not .NET 鈥?create
 //! without DEBUG_ONLY_THIS_PROCESS, capture early snapshots, poll until
 //! decrypted .text execution, then hand off to [`run_post_loop_phases`].
 //!
@@ -13,7 +13,7 @@ use anyhow::anyhow;
 use windows::Win32::System::Threading::{ResumeThread, SuspendThread};
 
 use crate::log::{self, LogType};
-use mida_core::{DebuggerCore, PackerPlugin, PluginCtx};
+use mida_core::{DebuggerCore, OepProvenance, PackerPlugin, PluginCtx};
 use mida_packers_themida::ThemidaState;
 use mida_pe::{ContainerRestoreMode, DumpProfile, EarlySectionSnapshot, OepPolicy, PeHeader};
 
@@ -69,9 +69,7 @@ pub(super) fn run_post_attach_path(
 
     log::log(
         LogType::Info,
-        &format!(
-            "post-attach: polling IAT at {iat_addr:#x} (RVA {iat_rva:#x}) for resolution..."
-        ),
+        &format!("post-attach: polling IAT at {iat_addr:#x} (RVA {iat_rva:#x}) for resolution..."),
     );
 
     let poll_start = std::time::Instant::now();
@@ -117,11 +115,11 @@ pub(super) fn run_post_attach_path(
             Err(e) => {
                 // GetExitCodeProcess can fail with insufficient rights or if the
                 // process handle was never granted PROCESS_QUERY_LIMITED_INFORMATION.
-                // Don't assume the process is dead — log and keep polling; the
+                // Don't assume the process is dead 鈥?log and keep polling; the
                 // outer 60s timeout is the real backstop.
                 log::log(
             LogType::Warn,
-            &format!("post-attach: GetExitCodeProcess failed: {e} (exit_code={:#x}) — assuming still alive", exit_code),
+            &format!("post-attach: GetExitCodeProcess failed: {e} (exit_code={:#x}) 鈥?assuming still alive", exit_code),
         );
                 true
             }
@@ -243,12 +241,12 @@ pub(super) fn run_post_attach_path(
     // Prefer the actual frozen instruction pointer. Static scanning is a
     // fallback for targets whose main thread never enters the first code
     // section during the observation window.
-    let oep_addr = if let Some(rip) = frozen_rip {
+    let (oep_addr, fallback_evidence) = if let Some(rip) = frozen_rip {
         log::log(
             LogType::Good,
             &format!("post-attach: OEP captured from RIP: {rip:#x}"),
         );
-        rip
+        (rip, None)
     } else {
         match mida_packers_themida::find_real_oep_by_scanning(
             dbg as &dyn DebuggerCore,
@@ -261,15 +259,23 @@ pub(super) fn run_post_attach_path(
                     LogType::Good,
                     &format!("post-attach: OEP found via .text scan: {addr:#x}"),
                 );
-                addr
+                (
+                    addr,
+                    Some(format!("post-attach .text scan selected OEP VA {addr:#x}")),
+                )
             }
             Ok(None) => {
                 let pe_ep = image_base_usize + pe.entry_point as usize;
                 log::log(
                     LogType::Warn,
-                    &format!("post-attach: OEP scan failed — using PE EP: {pe_ep:#x}"),
+                    &format!("post-attach: OEP scan failed 鈥?using PE EP: {pe_ep:#x}"),
                 );
-                pe_ep
+                (
+                    pe_ep,
+                    Some(format!(
+                        "post-attach PE AddressOfEntryPoint fallback selected OEP VA {pe_ep:#x}"
+                    )),
+                )
             }
             Err(e) => {
                 log::log(
@@ -283,18 +289,32 @@ pub(super) fn run_post_attach_path(
 
     log::log(
         LogType::Info,
-        "post-attach: process frozen — proceeding to IAT repair + dump",
+        "post-attach: process frozen 鈥?proceeding to IAT repair + dump",
     );
 
     // Slice 3b-2/3b-6: OEP + dump phase via plugin_host (no Win32).
     plugin_ctx.ensure_runtime_base(image_base_usize as u64);
+    let provenance = post_attach_oep_provenance(frozen_rip, oep_addr, fallback_evidence);
     packer.note_oep_accepted(
         &mut plugin_ctx,
         oep_addr as u64,
         frozen_rip.is_none(), // scan / PE-EP when RIP was outside .text
     );
-    let post_attach_advice =
-        enter_dump_phase(&mut packer, &mut plugin_ctx, "PackerPlugin dump_advice (post-attach)");
+    // note_oep_accepted is a compatibility hook and does not carry the
+    // provenance contract. Record the complete source/VA/RVA decision before
+    // entering the dump phase so the sidecar receives real post-attach
+    // evidence rather than the default unknown value.
+    plugin_ctx.record_oep_provenance(provenance);
+    debug_assert_eq!(plugin_ctx.oep_provenance.va, Some(oep_addr as u64));
+    debug_assert_eq!(
+        plugin_ctx.oep_provenance.rva,
+        plugin_ctx.oep_rva.map(|rva| rva.get()),
+    );
+    let post_attach_advice = enter_dump_phase(
+        &mut packer,
+        &mut plugin_ctx,
+        "PackerPlugin dump_advice (post-attach)",
+    );
 
     // Go straight to post-loop phases (IAT repair, dump, postprocess).
     run_post_loop_phases(
@@ -319,9 +339,59 @@ pub(super) fn run_post_attach_path(
         input,
         &output_path,
         plugin_ctx.oep_rva,
+        &plugin_ctx.oep_provenance,
         post_attach_advice,
     )?;
 
     log::log(LogType::Good, "Done.");
     return Ok(());
+}
+
+fn post_attach_oep_provenance(
+    frozen_rip: Option<usize>,
+    oep_addr: usize,
+    fallback_evidence: Option<String>,
+) -> OepProvenance {
+    match frozen_rip {
+        Some(rip) => OepProvenance::runtime_rip(
+            rip as u64,
+            format!("post-attach frozen RIP captured application OEP VA {rip:#x}"),
+        ),
+        None => OepProvenance::scan_fallback(
+            oep_addr as u64,
+            fallback_evidence.unwrap_or_else(|| {
+                format!("post-attach scan/PE-EP fallback selected OEP VA {oep_addr:#x}")
+            }),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mida_core::OepSource;
+
+    #[test]
+    fn frozen_rip_creates_runtime_provenance() {
+        let provenance = post_attach_oep_provenance(Some(0x1400_1234), 0x1400_1234, None);
+        assert_eq!(provenance.source, OepSource::RuntimeRip);
+        assert_eq!(provenance.va, Some(0x1400_1234));
+        assert!(provenance.application_oep);
+        assert!(!provenance.bootstrap_or_ambiguous);
+        assert!(provenance.evidence.contains("frozen RIP"));
+    }
+
+    #[test]
+    fn fallback_creates_scan_provenance_and_fails_closed() {
+        let provenance = post_attach_oep_provenance(
+            None,
+            0x1400_1234,
+            Some("post-attach .text scan selected OEP VA 0x14001234".to_string()),
+        );
+        assert_eq!(provenance.source, OepSource::ScanFallback);
+        assert_eq!(provenance.va, Some(0x1400_1234));
+        assert!(!provenance.application_oep);
+        assert!(provenance.bootstrap_or_ambiguous);
+        assert!(!provenance.application_oep_prerequisite_passes());
+    }
 }

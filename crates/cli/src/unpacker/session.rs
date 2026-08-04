@@ -92,6 +92,16 @@ impl ProcessSession {
     ) -> Result<EngineEvent, CoreError> {
         self.eng.wait(timeout_ms)
     }
+
+    /// Continue the event currently owned by the engine using its recorded
+    /// raw thread identity. This is required for abstract ExitProcess events,
+    /// which intentionally do not carry a TID.
+    pub(super) fn continue_pending_event(
+        &mut self,
+        status: ContinueStatus,
+    ) -> Result<(), CoreError> {
+        self.eng.continue_event(status)
+    }
 }
 
 impl std::ops::Deref for ProcessSession {
@@ -128,6 +138,9 @@ impl DebuggerCore for ProcessSession {
     }
     fn image_base(&self) -> u64 {
         self.eng.backend().image_base()
+    }
+    fn pending_event_thread_id(&self) -> Option<u32> {
+        self.eng.backend().pending_event_thread_id()
     }
     fn wait_event(&mut self) -> Result<DebugEvent, CoreError> {
         // R2 pump: sequence stamp + pending pairing; drop stamp for call-site API.
@@ -223,9 +236,7 @@ pub(super) fn set_thread_context_control(
     thread_id: u32,
     ctx: &windows::Win32::System::Diagnostics::Debug::CONTEXT,
 ) -> Result<(), anyhow::Error> {
-    use windows::Win32::System::Diagnostics::Debug::{
-        SetThreadContext, CONTEXT_CONTROL_AMD64,
-    };
+    use windows::Win32::System::Diagnostics::Debug::{SetThreadContext, CONTEXT_CONTROL_AMD64};
     use windows::Win32::System::Threading::{ResumeThread, SuspendThread};
 
     let h = dbg.thread_handle(thread_id).map_err(|e| anyhow!("{e}"))?;

@@ -1,9 +1,9 @@
 //! Post-loop phases B/C/D (IAT repair, post-process, dump).
 //!
 //! Extracted from `mod.rs` (P1 host thin split). Host still uses
-//! [`ThemidaState`] for both Oreans and AHK/GTO — not an independent GTO
+//! [`ThemidaState`] for both Oreans and AHK/GTO —not an independent GTO
 //! pipeline. Family gates:
-//! - `uses_oreans_iat_trace` — skip Oreans V3 wrapper single-step for AHK/GTO
+//! - `uses_oreans_iat_trace` —skip Oreans V3 wrapper single-step for AHK/GTO
 //! - x86-only API call-site fixup under Oreans
 //!
 //! Exit Ok means a candidate PE was written, not R0B/behavioral acceptance.
@@ -14,7 +14,7 @@ use anyhow::{anyhow, Context};
 use tracing::{info, warn};
 
 use crate::log::{self, LogType};
-use mida_core::{DebuggerCore, RuntimeBase, Rva, Va};
+use mida_core::{DebuggerCore, OepProvenance, RuntimeBase, Rva, Va};
 use mida_packers_themida::{
     create_data_sections, determine_iat_address, fix_iat, fixup_api_call_sites,
     install_anti_dump_fix, shrink_pe, CompilerHint, IatFixStrategy, ThemidaState,
@@ -25,8 +25,13 @@ use mida_pe::{
 };
 
 use super::helpers::{compute_data_section_bounds, resolve_host_api};
+use super::iat_evidence::write_iat_evidence;
+use super::oep_evidence::write_oep_evidence;
 use super::oep_scan::{resolve_oep_va, scan_live_memory_for_real_oep};
+use super::relocation_evidence::write_relocation_evidence;
+use super::section_rebuild_evidence::write_section_rebuild_evidence;
 use super::session::ProcessSession;
+use super::tls_evidence::write_tls_evidence;
 
 /// Phases B (IAT repair), C (post-processing), and D (dump to file).
 ///
@@ -59,6 +64,7 @@ pub(super) fn run_post_loop_phases(
     output_path: &Path,
     // Loop-captured OEP RVA from PackerPlugin (diagnostic / dump-boundary).
     plugin_oep_rva: Option<Rva>,
+    oep_provenance: &OepProvenance,
     dump_advice: Option<mida_core::DumpAdvice>,
 ) -> Result<(), anyhow::Error> {
     if is_dotnet {
@@ -124,9 +130,7 @@ pub(super) fn run_post_loop_phases(
         // single-step. Dump rebuilds imports from live / residual IAT slots.
         log::log(
             LogType::Info,
-            &format!(
-                "Skipping Oreans V3 IAT trace (family={family_id}; live IAT rebuild at dump)"
-            ),
+            &format!("Skipping Oreans V3 IAT trace (family={family_id}; live IAT rebuild at dump)"),
         );
     } else if post_attach {
         // In post-attach mode, IAT slots already contain resolved API
@@ -141,17 +145,17 @@ pub(super) fn run_post_loop_phases(
         // V3 single-step would hang; dump with residual IAT slots.
         log::log(
             LogType::Warn,
-            "Skipping V3 IAT trace (plugin/host skip_v3) — dump with raw IAT slots",
+            "Skipping V3 IAT trace (plugin/host skip_v3) —dump with raw IAT slots",
         );
     } else {
         match fix_iat(dbg, state, &iat, trace_thread_id, strategy) {
             Ok(()) => log::log(LogType::Info, "IAT fixed"),
             Err(e) => {
                 // Prefer a structural candidate over hanging/aborting with no dump.
-                warn!(error = %e, "IAT fix failed — continuing to dump with partial IAT");
+                warn!(error = %e, "IAT fix failed —continuing to dump with partial IAT");
                 log::log(
                     LogType::Warn,
-                    &format!("IAT fix failed ({e:#}) — dump with partial IAT"),
+                    &format!("IAT fix failed ({e:#}) —dump with partial IAT"),
                 );
             }
         }
@@ -252,9 +256,7 @@ pub(super) fn run_post_loop_phases(
     // Merge order: CLI/case-manifest roots win over plugin preset; then profile.
     let capture_policy = DumpCapturePolicy::resolve_with_plugin_hint(
         cli_capture_policy,
-        dump_advice
-            .as_ref()
-            .and_then(|a| a.capture_policy.as_ref()),
+        dump_advice.as_ref().and_then(|a| a.capture_policy.as_ref()),
         profile,
     );
     info!(
@@ -310,7 +312,7 @@ pub(super) fn run_post_loop_phases(
     }
 
     // Install anti-dump fix at OEP (x86 only).
-    // Pascal Themida64.pas does NOT install this stub on x64 — it leaves the
+    // Pascal Themida64.pas does NOT install this stub on x64 —it leaves the
     // OEP code intact.  Installing the stub on x64 overwrites the real OEP
     // with a VirtualProtect-based fixup that assumes the OEP starts with
     // `jmp rel32`, which is not true for x64 Themida targets.  The result is
@@ -343,7 +345,7 @@ pub(super) fn run_post_loop_phases(
         &format!("Dumping to: {}", output_path.display()),
     );
 
-    // Slice 3b-4: dump entry via RuntimeBase + Va → Rva (no raw wrapping_sub).
+    // Slice 3b-4: dump entry via RuntimeBase + Va →Rva (no raw wrapping_sub).
     let entry_rva = Va(oep_addr as u64)
         .to_rva(runtime_base)
         .context("OEP not in runtime image (Va→Rva failed)")?;
@@ -363,7 +365,7 @@ pub(super) fn run_post_loop_phases(
         early_section_snapshots: early_section_snapshots.to_vec(),
         container_restore,
         profile,
-        // B7.2: authoritative cookie site from offline CRT resolve — no dump rescan.
+        // B7.2: authoritative cookie site from offline CRT resolve —no dump rescan.
         security_cookie_rva: if state.msvc_cookie_rva != 0 {
             Some(state.msvc_cookie_rva)
         } else {
@@ -378,9 +380,57 @@ pub(super) fn run_post_loop_phases(
         capture_policy,
     };
 
-    mida_pe::dump_process(dbg, &dump_opts).map_err(|e| anyhow!("Dump failed: {e}"))?;
+    let dump_report = mida_pe::dump_process_with_report(dbg, &dump_opts)
+        .map_err(|e| anyhow!("Dump failed: {e}"))?;
 
-    // Lightweight structural hints only — non-fatal. Exit Ok means a candidate
+    let iat_sidecar_path = write_iat_evidence(input, output_path, &dump_report)
+        .context("write candidate-bound IAT evidence sidecar")?;
+    log::log(
+        LogType::Info,
+        &format!(
+            "IAT evidence sidecar written: {}",
+            iat_sidecar_path.display()
+        ),
+    );
+
+    let tls_sidecar_path = write_tls_evidence(input, output_path, &dump_report)
+        .context("write candidate-bound TLS evidence sidecar")?;
+    log::log(
+        LogType::Info,
+        &format!(
+            "TLS evidence sidecar written: {}",
+            tls_sidecar_path.display()
+        ),
+    );
+
+    let relocation_sidecar_path = write_relocation_evidence(input, output_path, &dump_report)
+        .context("write candidate-bound relocation evidence sidecar")?;
+    log::log(
+        LogType::Info,
+        &format!(
+            "Relocation evidence sidecar written: {}",
+            relocation_sidecar_path.display()
+        ),
+    );
+
+    let section_rebuild_sidecar_path = write_section_rebuild_evidence(input, output_path)
+        .context("write candidate-bound section rebuild evidence sidecar")?;
+    log::log(
+        LogType::Info,
+        &format!(
+            "Section rebuild evidence sidecar written: {}",
+            section_rebuild_sidecar_path.display()
+        ),
+    );
+
+    let sidecar_path = write_oep_evidence(input, output_path, oep_provenance)
+        .context("write native OEP provenance sidecar")?;
+    log::log(
+        LogType::Info,
+        &format!("OEP evidence sidecar written: {}", sidecar_path.display()),
+    );
+
+    // Lightweight structural hints only —non-fatal. Exit Ok means a candidate
     // PE was written, not that mida-acceptance (R0B) or behavioral gates passed.
     // Lab harnesses must run `mida-acceptance check-static` (and future behavior
     // evidence) separately; this CLI path does not depend on mida-acceptance.
@@ -403,7 +453,7 @@ pub(super) fn run_post_loop_phases(
         if tls.virtual_address == 0 {
             info!("Output TLS directory empty (expected under clean CRT + post-crt restore)");
         }
-        // Keep "Structure gate:" prefix — lab smoke parsers match this line.
+        // Keep "Structure gate:" prefix —lab smoke parsers match this line.
         // Semantics remain non-authoritative (not mida-acceptance R0B).
         log::log(
             LogType::Info,

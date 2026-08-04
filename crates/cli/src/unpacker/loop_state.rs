@@ -5,6 +5,7 @@
 //! without changing behavior.
 
 use super::iat_trace::IatTraceState;
+use mida_core::OepProvenance;
 
 // LoopState — mutable tracking variables for the debug loop
 // ---------------------------------------------------------------------------
@@ -26,6 +27,8 @@ pub(super) struct LoopState {
     /// .text poll: re-guard done, waiting for AV at OEP
     pub(super) text_reguarded: bool,
     pub(super) oep: Option<usize>,
+    /// Full OEP provenance; scan/PE-EP fallbacks remain non-application evidence.
+    pub(super) oep_provenance: OepProvenance,
     pub(super) oep_found_via_scanning: bool,
     pub(super) virtualized_oep_retries: u32,
     pub(super) last_possible_oep: Option<usize>,

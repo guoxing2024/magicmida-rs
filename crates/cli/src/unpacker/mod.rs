@@ -1,27 +1,22 @@
-//! Themida unpacker main flow — ties together all modules.
+//! Themida unpacker main flow ??ties together all modules.
 //!
 //! ## Reference
 //!
 //! This module corresponds to the combined logic of:
-//! - `Themida.pas` / `Themida64.pas` — the full unpacking pipeline.
-//! - `Magicmida.dpr` → `CheckCommandlineInvocation` — CLI dispatch.
-//! - `Unit2.pas` → `btnUnpackClick` — per-file unpack entry point.
+//! - `Themida.pas` / `Themida64.pas` ??the full unpacking pipeline.
+//! - `Magicmida.dpr` ??`CheckCommandlineInvocation` ??CLI dispatch.
+//! - `Unit2.pas` ??`btnUnpackClick` ??per-file unpack entry point.
 //!
 //! ## Architecture
 //!
 //! ```text
-//! parse PE ─▶ dual identify ─▶ host layout (ThemidaPeInfo) ─▶ create process ─▶ ScyllaHide
-//!                                                                    │
-//!    ┌───────────────────────────────────────────────────────────────┘
-//!    ▼
-//!  debug loop (simplified):
-//!    · wait_event → handle anti-debug → CloseHandle bp → install guard
-//!    · ACCESS_VIOLATION → process_guarded_access → detect OEP
-//!    · OEP found → remove guard → IAT phase
-//!    ▼
-//!  determine IAT ─▶ fix IAT ─▶ [trace imports (v3)] ─▶ fix call sites
-//!    ▼
-//!  dump to file ─▶ postprocess (data sections / shrink) ─▶ cleanup
+//! parse PE ─??dual identify ─??host layout (ThemidaPeInfo) ─??create process ─??ScyllaHide
+//!                                                                    ??//!    ┌───────────────────────────────────────────────────────────────??//!    ??//!  debug loop (simplified):
+//!    · wait_event ??handle anti-debug ??CloseHandle bp ??install guard
+//!    · ACCESS_VIOLATION ??process_guarded_access ??detect OEP
+//!    · OEP found ??remove guard ??IAT phase
+//!    ??//!  determine IAT ─??fix IAT ─??[trace imports (v3)] ─??fix call sites
+//!    ??//!  dump to file ─??postprocess (data sections / shrink) ─??cleanup
 //! ```
 
 mod av_handler;
@@ -31,13 +26,18 @@ mod generic;
 mod generic_gate;
 mod gto_host;
 mod helpers;
+mod iat_evidence;
 mod iat_trace;
 mod loop_state;
+mod oep_evidence;
 mod oep_scan;
 mod plugin_host;
-mod post_loop;
 mod post_attach;
+mod post_loop;
+mod relocation_evidence;
+mod section_rebuild_evidence;
 mod session;
+mod tls_evidence;
 mod verify;
 
 use std::fs;
@@ -50,8 +50,8 @@ use windows::Win32::System::Threading::{ResumeThread, SuspendThread};
 
 use crate::log::{self, LogType};
 use mida_core::{
-    ContinueStatus, CreateProcessOptions, DebugEvent, DebuggerCore, HwbpType, PackerPlugin,
-    PluginAdvice, PluginCtx, PreferredBase, UnpackPhase,
+    ContinueStatus, CreateProcessOptions, DebugEvent, DebuggerCore, HwbpType, OepProvenance,
+    PackerPlugin, PluginAdvice, PluginCtx, PreferredBase, UnpackPhase,
 };
 use mida_packers_themida::{
     handle_nt_set_information_thread, init_pe_details, inject_scylla_hide, ScyllaHideConfig,
@@ -63,7 +63,8 @@ use av_handler::{handle_access_violation, AvAction};
 use early_snapshots::capture_early_section_snapshots;
 use helpers::{
     dotnet_dump_and_dump_output, handle_hw_breakpoint, pe_section_name_remote_rva,
-    resolve_api_addrs, resolve_host_api, resolve_output_path, scylla_hook_path, scylla_injector_path,
+    resolve_api_addrs, resolve_host_api, resolve_output_path, scylla_hook_path,
+    scylla_injector_path,
 };
 use iat_trace::{handle_trace_step, TracePhase};
 use loop_state::LoopState;
@@ -96,14 +97,14 @@ pub use verify::verify_unpacked;
 ///
 /// # Arguments
 ///
-/// - `input` — path to the protected executable.
-/// - `output` — optional output path; defaults to `<input_stem>U<ext>` (the "U"
+/// - `input` ??path to the protected executable.
+/// - `output` ??optional output path; defaults to `<input_stem>U<ext>` (the "U"
 ///   suffix convention from the Pascal reference).
-/// - `create_data_sections` — restore `.rdata`/`.data` sections (`--data-sections`).
-/// - `shrink` — remove Themida-specific sections from the output (`--shrink`).
-/// - `oep_policy` — how to choose the final PE entry point.
-/// - `container_restore` — SecurityCookie heap container restore mode.
-/// - `profile` — dump behaviour profile (default OreansClassic; GTO is opt-in).
+/// - `create_data_sections` ??restore `.rdata`/`.data` sections (`--data-sections`).
+/// - `shrink` ??remove Themida-specific sections from the output (`--shrink`).
+/// - `oep_policy` ??how to choose the final PE entry point.
+/// - `container_restore` ??SecurityCookie heap container restore mode.
+/// - `profile` ??dump behaviour profile (default OreansClassic; GTO is opt-in).
 ///
 /// # Errors
 ///
@@ -165,8 +166,7 @@ pub fn unpack(
             mida_core::IdentifyResult::Match { confidence } => {
                 info!(
                     family = packer.family_id(),
-                    confidence,
-                    "PackerPlugin identify: Match"
+                    confidence, "PackerPlugin identify: Match"
                 );
             }
             mida_core::IdentifyResult::Ambiguous => {
@@ -190,7 +190,7 @@ pub fn unpack(
             );
             if !matches!(profile, DumpProfile::AhkGtoExperimental) {
                 warn!(
-                    "AHK/GTO family identified but dump profile is not ahk-gto-experimental — \
+                    "AHK/GTO family identified but dump profile is not ahk-gto-experimental ??\
                      heap/container stages stay disabled (pass --profile=ahk-gto-experimental)"
                 );
             }
@@ -241,9 +241,8 @@ pub fn unpack(
     }
     let entry_bytes_ref = entry_bytes.as_deref();
 
-    let pe_info = init_pe_details(&pe, is_64bit, entry_bytes_ref, Some(input)).map_err(|e| {
-        anyhow!("Host PE layout probe failed (family={selected_family}): {e}")
-    })?;
+    let pe_info = init_pe_details(&pe, is_64bit, entry_bytes_ref, Some(input))
+        .map_err(|e| anyhow!("Host PE layout probe failed (family={selected_family}): {e}"))?;
 
     log::log(
         LogType::Info,
@@ -267,7 +266,7 @@ pub fn unpack(
     if is_dotnet {
         log::log(
             LogType::Info,
-            ".NET target detected — will dump via _CorExeMain breakpoint",
+            ".NET target detected ??will dump via _CorExeMain breakpoint",
         );
     }
 
@@ -278,7 +277,7 @@ pub fn unpack(
     if is_dotnet {
         cor_exe_main_addr = Some(resolve_host_api("mscoree.dll", "_CorExeMain"));
         if cor_exe_main_addr == Some(0) {
-            warn!("_CorExeMain not found — .NET dump may fail");
+            warn!("_CorExeMain not found ??.NET dump may fail");
             cor_exe_main_addr = None;
         }
     }
@@ -323,15 +322,15 @@ pub fn unpack(
     // ThemidaState.
     //
     // We keep a simplified version that handles the key events:
-    // - CreateProcess → patch PEB, resolve APIs, apply ScyllaHide
-    // - LoadDll → close file handle
-    // - Breakpoint (CloseHandle) → install code section guard
-    // - AccessViolation → process_guarded_access
-    // - SingleStep → restore_code_section_guard
+    // - CreateProcess ??patch PEB, resolve APIs, apply ScyllaHide
+    // - LoadDll ??close file handle
+    // - Breakpoint (CloseHandle) ??install code section guard
+    // - AccessViolation ??process_guarded_access
+    // - SingleStep ??restore_code_section_guard
     //
     // The full IAT repair and dump happen *after* the guard loop detects OEP.
 
-    // Build the core debugger — it owns the process, main-thread handle,
+    // Build the core debugger ??it owns the process, main-thread handle,
     // and stub EXE, and will clean them up via `Drop` when this struct goes
     // out of scope.  `ProcessSession` wraps it in `DebuggerCoreEngine` (R2
     // wait/continue pump) and caches per-session `ResolvedApis`.
@@ -362,14 +361,14 @@ pub fn unpack(
     // In post-attach mode the CREATE_PROCESS_DEBUG_EVENT arrives AFTER
     // DebugActiveProcess, so we can't inject ScyllaHide from the CREATE_PROCESS
     // handler in time (Themida's anti-debug init runs during the free-run
-    // window).  Inject here instead — the hooks land in the already-running
+    // window).  Inject here instead ??the hooks land in the already-running
     // process before we enter the debug loop.
     //
     // PEB patching in post-attach mode is already done by WindowsDebugger while
     // the process is suspended, so no CREATE_PROCESS handler is involved.
     let post_attach_mode = text_is_plain_for_attach;
     if post_attach_mode {
-        // No ScyllaHide needed — there is no debug port, so Themida's
+        // No ScyllaHide needed ??there is no debug port, so Themida's
         // anti-debug checks (DebugPort, BeingDebugged) never trigger.
         // The process started only after the early snapshot was captured, so we
         // go straight to text polling + dump without a debug port.
@@ -378,7 +377,7 @@ pub fn unpack(
         // comparisons etc.).
         let apis = resolve_api_addrs()?;
         dbg.apis = Some(apis);
-        info!("post-attach: no debug port — direct dump mode (SuspendThread + ReadProcessMemory)");
+        info!("post-attach: no debug port ??direct dump mode (SuspendThread + ReadProcessMemory)");
     }
 
     // ---- plugin session context (packer already selected pre-process) ----
@@ -406,6 +405,7 @@ pub fn unpack(
         text_stable: false,
         text_reguarded: false,
         oep: None,
+        oep_provenance: OepProvenance::default(),
         oep_found_via_scanning: false,
         virtualized_oep_retries: 0,
         last_possible_oep: None,
@@ -427,7 +427,7 @@ pub fn unpack(
     let pe_image_boundary = state.pe_info.image_boundary as usize;
     let pe_image_base = state.pe_info.image_base as usize;
 
-    // Snapshot the process handle once — the process loop passes it to packer
+    // Snapshot the process handle once ??the process loop passes it to packer
     // helpers that don't go through the `DebuggerCore` trait.
     let h_process = dbg.process_handle();
 
@@ -456,7 +456,6 @@ pub fn unpack(
             &output_path,
         );
     }
-
 
     // The main debug loop runs until we've found the OEP and finished IAT.
     loop {
@@ -487,7 +486,7 @@ pub fn unpack(
             match dbg.wait_engine(Some(wait_ms)) {
                 Ok(ev) => ev,
                 Err(mida_core::CoreError::Timeout) => {
-                    // No debug event — continue loop for polling
+                    // No debug event ??continue loop for polling
                     continue;
                 }
                 Err(_e) if post_attach_mode => {
@@ -523,10 +522,12 @@ pub fn unpack(
         let plugin_advice = packer.on_event(&mut plugin_ctx, &engine_event);
         match &plugin_advice {
             PluginAdvice::Abort { message } => {
-                log::log(
-                    LogType::Fatal,
-                    &format!("PackerPlugin abort: {message}"),
-                );
+                log::log(LogType::Fatal, &format!("PackerPlugin abort: {message}"));
+                if let Err(continue_error) = dbg.continue_pending_event(ContinueStatus::Continue) {
+                    return Err(anyhow!(
+                        "PackerPlugin abort: {message}; pending event continue failed: {continue_error}"
+                    ));
+                }
                 return Err(anyhow!("PackerPlugin abort: {message}"));
             }
             PluginAdvice::Transition(UnpackPhase::Done) => {
@@ -538,22 +539,22 @@ pub fn unpack(
             }
             PluginAdvice::Continue(_) => {}
         }
-        // Move event after consult (DebugEvent is not Clone — HANDLE fields).
+        // Move event after consult (DebugEvent is not Clone ??HANDLE fields).
         let event = engine_event.event;
 
-        // Reset idle timer — we got a real event, Themida is still active
+        // Reset idle timer ??we got a real event, Themida is still active
         if ls.text_polling {
             ls.text_poll_start = None;
         }
 
-        // ---- .text decryption polling (CREATE_PROCESS → guard delay) ----
-        // Themida checks .text page protection during init — any non-PAGE_EXECUTE_READ
+        // ---- .text decryption polling (CREATE_PROCESS ??guard delay) ----
+        // Themida checks .text page protection during init ??any non-PAGE_EXECUTE_READ
         // protection is detected. So we do NOT install guard at CREATE_PROCESS.
         // Instead: let Themida run freely, poll .text via ReadProcessMemory (which
         // is not affected by page protection), and only install guard after .text
-        // is stable (decryption complete). Then SuspendThread → read RIP → decide:
-        //   RIP in .text → OEP = RIP
-        //   RIP elsewhere → install guard, resume, wait for AV
+        // is stable (decryption complete). Then SuspendThread ??read RIP ??decide:
+        //   RIP in .text ??OEP = RIP
+        //   RIP elsewhere ??install guard, resume, wait for AV
         if ls.text_polling && ls.oep.is_none() && ls.iat_trace.is_none() && !ls.text_reguarded {
             // 30s timeout from LAST debug event (not from CREATE_PROCESS).
             // Themida's DLL loading can take minutes; only start the timeout
@@ -565,7 +566,7 @@ pub fn unpack(
                 let idle_secs = ls.text_poll_idle_timeout_secs;
                 if start.elapsed() > std::time::Duration::from_secs(idle_secs) {
                     log::log(LogType::Fatal,
-                        &format!(".text poll timeout ({idle_secs}s idle, {} polls) — Themida may not have reached decryption",
+                        &format!(".text poll timeout ({idle_secs}s idle, {} polls) ??Themida may not have reached decryption",
                                  ls.text_poll_count));
                     ls.text_polling = false;
                 }
@@ -581,7 +582,7 @@ pub fn unpack(
                     let min_nz = ls.text_poll_min_nonzero as usize;
                     if non_zero > min_nz {
                         if sample == ls.text_prev_sample {
-                            // .text stable — decryption complete
+                            // .text stable ??decryption complete
                             log::log(
                                 LogType::Good,
                                 &format!(
@@ -592,7 +593,7 @@ pub fn unpack(
                             ls.text_stable = true;
                             ls.text_polling = false;
 
-                            // SuspendThread → read RIP → decide OEP vs guard
+                            // SuspendThread ??read RIP ??decide OEP vs guard
                             let main_tid = dbg.main_thread_id();
                             let h_thread = dbg
                                 .thread_handle(main_tid)
@@ -612,22 +613,29 @@ pub fn unpack(
                             );
 
                             if rip >= text_start && rip < text_end {
-                                // RIP in .text → this is OEP
+                                // RIP in .text ??this is OEP
                                 log::log(
                                     LogType::Good,
                                     &format!("OEP captured via RIP in .text: {:#x}", rip),
                                 );
                                 ls.oep = Some(rip);
-                                // Resume thread — will be redirected in post-loop
+                                ls.oep_provenance = OepProvenance::runtime_rip(
+                                    rip as u64,
+                                    format!(
+                                        "debug-loop text-poll RIP inside decrypted .text: {rip:#x}"
+                                    ),
+                                );
+                                ls.oep_found_via_scanning = false;
+                                // Resume thread ??will be redirected in post-loop
                                 let _ = unsafe { ResumeThread(h_thread) };
                             } else {
-                                // RIP not in .text — .text already decrypted,
+                                // RIP not in .text ??.text already decrypted,
                                 // scan it for the real OEP (MSVC CRT pattern).
-                                // No guard needed — we go straight to dump.
+                                // No guard needed ??we go straight to dump.
                                 log::log(
                                     LogType::Info,
                                     &format!(
-                                        "RIP not in .text ({:#x}) — scanning .text for OEP",
+                                        "RIP not in .text ({:#x}) ??scanning .text for OEP",
                                         rip
                                     ),
                                 );
@@ -646,29 +654,37 @@ pub fn unpack(
                                             &format!("OEP found via .text scan: {:#x}", real_oep),
                                         );
                                         ls.oep = Some(real_oep);
+                                        ls.oep_provenance = OepProvenance::scan_fallback(
+                                            real_oep as u64,
+                                            format!("live .text scan selected OEP: {real_oep:#x}"),
+                                        );
                                         ls.oep_found_via_scanning = true;
                                     }
                                     Ok(None) => {
-                                        // Scan failed — try PE entry point as fallback
+                                        // Scan failed ??try PE entry point as fallback
                                         let pe_ep = image_base_usize + pe.entry_point as usize;
                                         log::log(
                                             LogType::Warn,
-                                            &format!("OEP scan failed — using PE EP: {:#x}", pe_ep),
+                                            &format!("OEP scan failed ??using PE EP: {:#x}", pe_ep),
                                         );
                                         ls.oep = Some(pe_ep);
+                                        ls.oep_provenance = OepProvenance::scan_fallback(
+                                            pe_ep as u64,
+                                            format!("live OEP scan failed; PE entry-point fallback: {pe_ep:#x}"),
+                                        );
                                         ls.oep_found_via_scanning = true;
                                     }
                                     Err(e) => {
                                         warn!("OEP scan error: {e}");
                                     }
                                 }
-                                // Do NOT ResumeThread — keep process frozen.
+                                // Do NOT ResumeThread ??keep process frozen.
                                 // Themida will kill the process on resume (0xDEADC0DE),
                                 // but ReadProcessMemory works on a frozen/suspended
                                 // process. We break out of the debug loop immediately
                                 // and dump from the frozen process's memory.
                                 log::log(LogType::Info,
-                                    "Process kept frozen — will dump IAT + .text from suspended state");
+                                    "Process kept frozen ??will dump IAT + .text from suspended state");
                             }
                         } else {
                             log::log(
@@ -697,7 +713,7 @@ pub fn unpack(
 
         match event {
             // ---------------------------------------------------------------
-            // CREATE_PROCESS — patch PEB, store image base, resolve APIs
+            // CREATE_PROCESS ??patch PEB, store image base, resolve APIs
             // ---------------------------------------------------------------
             DebugEvent::CreateProcess {
                 process_id: pid,
@@ -711,7 +727,7 @@ pub fn unpack(
 
                 // Note: `image_base`, `process_id`, and the main-thread handle
                 // are now stored by the core's `wait_event` bookkeeping
-                // automatically — we no longer duplicate that state here.
+                // automatically ??we no longer duplicate that state here.
 
                 // In post-attach mode the PEB was already patched by
                 // WindowsDebugger::post_attach_init (right after
@@ -720,7 +736,7 @@ pub fn unpack(
                 // Skip them here to avoid redundant work / double-inject.
                 if post_attach_mode {
                     debug!(
-                        "post-attach: CREATE_PROCESS — PEB/ScyllaHide/APIs already done, skipping"
+                        "post-attach: CREATE_PROCESS ??PEB/ScyllaHide/APIs already done, skipping"
                     );
                 } else {
                     // Patch PEB (BeingDebugged, pShimData) via the core helper.
@@ -729,7 +745,7 @@ pub fn unpack(
                     debug!(peb_image_base = %format!("{peb_base:#x}"), "PEB patched");
 
                     // Resolve kernel32 API addresses (in the debugger's own
-                    // process — valid in the target on x64).
+                    // process ??valid in the target on x64).
                     let apis = resolve_api_addrs()?;
 
                     // Apply ScyllaHide.  Capture hook_delay_ms BEFORE the move
@@ -754,11 +770,11 @@ pub fn unpack(
                 }
 
                 // Fix PE header anti-dump: Themida corrupts the first byte
-                // of section 2's name ('p' → 'i', making .pdata look like
-                // .idata).  Patch it back immediately — the .pdata section
+                // of section 2's name ('p' ??'i', making .pdata look like
+                // .idata).  Patch it back immediately ??the .pdata section
                 // is needed for x64 SEH exception dispatch during the debug
                 // loop.  Mirrors Pascal TMInit lines 296-303.
-                // (Run in both modes — post-attach needs it too.)
+                // (Run in both modes ??post-attach needs it too.)
                 if state.pe_info.pe_sections.len() > 2 {
                     let name_rva =
                         pe_section_name_remote_rva(evt_h_process, image_base as usize, 2);
@@ -772,7 +788,7 @@ pub fn unpack(
                             if dbg.write_memory(remote_addr, &patch).is_ok() {
                                 info!(
                                     addr = format_args!("{remote_addr:#x}"),
-                                    "PE header anti-dump fix applied: section 2 name byte 'i' → 'p'"
+                                    "PE header anti-dump fix applied: section 2 name byte 'i' ??'p'"
                                 );
                             }
                         }
@@ -786,7 +802,7 @@ pub fn unpack(
                 }
 
                 // CRITICAL: Do NOT install guard at CREATE_PROCESS.
-                // Themida checks .text page protection during init — any non-
+                // Themida checks .text page protection during init ??any non-
                 // PAGE_EXECUTE_READ protection is detected and causes 0xDEADC0DE.
                 // Guard-path policy comes from SelectedPacker::on_event (Slice 3b / R4-A1):
                 // request_text_poll vs request_close_handle_chain. Host still
@@ -794,23 +810,18 @@ pub fn unpack(
                 // change .text protection so they remain safe here.
                 if plugin_ctx.request_text_poll {
                     ls.text_polling = true;
-                    // poll_start is set on first timeout, not here —
-                    // LoadDll events can take minutes before Themida
+                    // poll_start is set on first timeout, not here ??                    // LoadDll events can take minutes before Themida
                     // starts .text decryption
                     log::log(
                         LogType::Info,
-                        "PackerPlugin: text-poll path — deferring guard to .text-stable poll (30s idle timeout)",
+                        "PackerPlugin: text-poll path ??deferring guard to .text-stable poll (30s idle timeout)",
                     );
                 } else if plugin_ctx.request_close_handle_chain {
-                    // Non-.text section 0: CloseHandle → .text write →
-                    // VirtualAlloc → guard chain (handled by HW BP handler)
-                    log::log(
-                        LogType::Info,
-                        "PackerPlugin: CloseHandle HW BP chain path",
-                    );
+                    // Non-.text section 0: CloseHandle ??.text write ??                    // VirtualAlloc ??guard chain (handled by HW BP handler)
+                    log::log(LogType::Info, "PackerPlugin: CloseHandle HW BP chain path");
                 }
 
-                // NtProtectVirtualMemory BP disabled — it fires during Themida
+                // NtProtectVirtualMemory BP disabled ??it fires during Themida
                 // initialization (ntdll page protection changes) and causes
                 // an infinite re-fire loop because RF cannot be set in the
                 // Themida environment (ERROR_PARTIAL_COPY on SetThreadContext).
@@ -842,7 +853,7 @@ pub fn unpack(
             }
 
             // ---------------------------------------------------------------
-            // LOAD_DLL — close file handle
+            // LOAD_DLL ??close file handle
             // ---------------------------------------------------------------
             // CloseHandle HW breakpoint is already installed in the
             // CREATE_PROCESS handler (see above).  This path remains here
@@ -889,7 +900,7 @@ pub fn unpack(
             }
 
             // ---------------------------------------------------------------
-            // CREATE_THREAD — store handle
+            // CREATE_THREAD ??store handle
             // ---------------------------------------------------------------
             DebugEvent::CreateThread {
                 thread_id,
@@ -908,7 +919,7 @@ pub fn unpack(
             }
 
             // ---------------------------------------------------------------
-            // EXIT_THREAD — remove handle
+            // EXIT_THREAD ??remove handle
             // ---------------------------------------------------------------
             DebugEvent::ExitThread {
                 thread_id,
@@ -921,7 +932,7 @@ pub fn unpack(
             }
 
             // ---------------------------------------------------------------
-            // BREAKPOINT — CloseHandle / VirtualAlloc / .text+0x1000
+            // BREAKPOINT ??CloseHandle / VirtualAlloc / .text+0x1000
             // ---------------------------------------------------------------
             DebugEvent::Breakpoint { thread_id, address } => {
                 debug!(addr = %format!("{address:#x}"), "Breakpoint hit");
@@ -931,7 +942,7 @@ pub fn unpack(
                 if is_dotnet {
                     if let Some(bp_addr) = dbg.hw_breakpoint_addr(3) {
                         if bp_addr == address {
-                            info!(addr = %format!("{address:#x}"), ".NET _CorExeMain hit — dumping process memory");
+                            info!(addr = %format!("{address:#x}"), ".NET _CorExeMain hit ??dumping process memory");
                             dbg.clear_hw_breakpoint(3)?;
                             dotnet_dump_and_dump_output(
                                 &mut dbg,
@@ -945,7 +956,7 @@ pub fn unpack(
                     }
                 }
 
-                // Check for NtProtectVirtualMemory BP (slot 1) — guard protector.
+                // Check for NtProtectVirtualMemory BP (slot 1) ??guard protector.
                 if ls.nt_protect_bp_set {
                     if let Some(ref apis) = dbg.apis {
                         if address as usize == apis.nt_protect_virtual_memory {
@@ -971,7 +982,7 @@ pub fn unpack(
                                         debug!(
                                             target = %format!("{target_base:#x}"),
                                             orig_protect = %format!("{new_protect:#x}"),
-                                            "NtProtectVirtualMemory on .text — forcing PAGE_NOACCESS"
+                                            "NtProtectVirtualMemory on .text ??forcing PAGE_NOACCESS"
                                         );
                                         let mut ctx2 = ctx;
                                         ctx2.R9 = 0x01; // PAGE_NOACCESS
@@ -991,7 +1002,7 @@ pub fn unpack(
                                 ctx.Dr1 = dbg_ctx.Dr1;
                                 ctx.Dr2 = dbg_ctx.Dr2;
                                 ctx.Dr3 = dbg_ctx.Dr3;
-                                ctx.Dr6 = 0; // clear — prevent re-fire
+                                ctx.Dr6 = 0; // clear ??prevent re-fire
                                 ctx.Dr7 = dbg_ctx.Dr7;
                             }
                             ctx.EFlags |= 0x10000; // RF
@@ -1042,7 +1053,7 @@ pub fn unpack(
                 ctx.Dr1 = dbg_ctx.Dr1;
                 ctx.Dr2 = dbg_ctx.Dr2;
                 ctx.Dr3 = dbg_ctx.Dr3;
-                ctx.Dr6 = 0; // clear — prevent re-fire
+                ctx.Dr6 = 0; // clear ??prevent re-fire
                 ctx.Dr7 = dbg_ctx.Dr7;
                 ctx.EFlags |= 0x10000; // RF (Resume Flag)
                                        // Tell the kernel to write both groups.
@@ -1062,7 +1073,7 @@ pub fn unpack(
             }
 
             // ---------------------------------------------------------------
-            // ACCESS_VIOLATION — process_guarded_access
+            // ACCESS_VIOLATION ??process_guarded_access
             // ---------------------------------------------------------------
             DebugEvent::AccessViolation {
                 thread_id,
@@ -1083,12 +1094,17 @@ pub fn unpack(
                             &format!("OEP captured via re-guard AV: {exception_addr:#x}"),
                         );
                         ls.oep = Some(exception_addr as usize);
+                        ls.oep_provenance = OepProvenance::runtime_rip(
+                            exception_addr,
+                            format!("re-guard AV captured runtime OEP RIP: {exception_addr:#x}"),
+                        );
+                        ls.oep_found_via_scanning = false;
                         // Remove guard
                         let text_size = text_end - text_start;
                         let _ = mida_packers_themida::remove_code_section_guard(
                             h_process, text_start, text_size,
                         );
-                        // Continue to IAT phase — set RIP to OEP and let program run
+                        // Continue to IAT phase ??set RIP to OEP and let program run
                         // for IAT decryption
                         dbg.continue_event(thread_id, ContinueStatus::Continue)?;
                         continue;
@@ -1111,18 +1127,13 @@ pub fn unpack(
                     AvAction::Continue => {}
                     AvAction::Break => {
                         // 3b-5: complete vs skip IAT milestone, then leave.
-                        note_plugin_av_break(
-                            &mut packer,
-                            &mut plugin_ctx,
-                            &ls,
-                            dbg.image_base(),
-                        );
+                        note_plugin_av_break(&mut packer, &mut plugin_ctx, &ls, dbg.image_base());
                         break;
                     }
                 }
             }
             // ---------------------------------------------------------------
-            // SINGLE_STEP — may be real single-step or hardware breakpoint
+            // SINGLE_STEP ??may be real single-step or hardware breakpoint
             // Also handles IAT tracing for v3 targets.
             // ---------------------------------------------------------------
             DebugEvent::SingleStep { thread_id, address } => {
@@ -1150,12 +1161,12 @@ pub fn unpack(
                             if t.product_complete() {
                                 note_plugin_iat_complete(&mut packer, &mut plugin_ctx);
                                 info!(
-                                    "IAT tracing product-complete — exiting debug loop (resolved={})",
+                                    "IAT tracing product-complete ??exiting debug loop (resolved={})",
                                     t.resolved_count
                                 );
                             } else {
                                 info!(
-                                    "IAT tracing finished WITHOUT product-complete (resolved={} failed={} skipped={} aborted={:?}) — exiting loop, not marking complete",
+                                    "IAT tracing finished WITHOUT product-complete (resolved={} failed={} skipped={} aborted={:?}) ??exiting loop, not marking complete",
                                     t.resolved_count,
                                     t.failed_count,
                                     t.skip_count,
@@ -1201,15 +1212,15 @@ pub fn unpack(
                 // require prior GetThreadContext).
                 debug!(
                     addr = %format!("{address:#x}"),
-                    "SingleStep at known HW-BP address — treating as CloseHandle hit"
+                    "SingleStep at known HW-BP address ??treating as CloseHandle hit"
                 );
 
                 log::log(
                     LogType::Info,
-                    &format!("SINGLE STEP at {address:#x} — checking NtProtectVirtualMemory"),
+                    &format!("SINGLE STEP at {address:#x} ??checking NtProtectVirtualMemory"),
                 );
 
-                // Check for NtProtectVirtualMemory BP (slot 1) — guard protector.
+                // Check for NtProtectVirtualMemory BP (slot 1) ??guard protector.
                 // NtProtectVirtualMemory(HANDLE, PVOID* base, PSIZE_T size,
                 //   ULONG newProtect, PULONG oldProtect)
                 // Win64 ABI: RCX=handle, RDX=base ptr, R8=size ptr,
@@ -1236,11 +1247,11 @@ pub fn unpack(
                                     debug!(
                                         target = %format!("{target_base:#x}"),
                                         orig_protect = %format!("{new_protect:#x}"),
-                                        "NtProtectVirtualMemory on .text — forcing PAGE_NOACCESS"
+                                        "NtProtectVirtualMemory on .text ??forcing PAGE_NOACCESS"
                                     );
                                     let mut ctx2 = ctx;
                                     ctx2.R9 = 0x01; // PAGE_NOACCESS
-                                                    // Merge debug registers — must propagate errors
+                                                    // Merge debug registers ??must propagate errors
                                                     // (if let Ok silently skips DR clearing on ERROR_PARTIAL_COPY,
                                                     // causing the BP to re-fire infinitely)
                                     let dbg_ctx = dbg.get_thread_context_dbg(thread_id)?;
@@ -1248,7 +1259,7 @@ pub fn unpack(
                                     ctx2.Dr1 = dbg_ctx.Dr1;
                                     ctx2.Dr2 = dbg_ctx.Dr2;
                                     ctx2.Dr3 = dbg_ctx.Dr3;
-                                    ctx2.Dr6 = 0; // clear — prevent re-fire
+                                    ctx2.Dr6 = 0; // clear ??prevent re-fire
                                     ctx2.Dr7 = dbg_ctx.Dr7;
                                     ctx2.EFlags |= 0x10000; // RF
                                     #[cfg(target_arch = "x86_64")]
@@ -1262,14 +1273,14 @@ pub fn unpack(
                                 }
                             }
                         }
-                        // Not targeting .text — just set RF and continue
+                        // Not targeting .text ??just set RF and continue
                         let mut ctx = dbg.get_thread_context_control(thread_id)?;
                         if let Ok(dbg_ctx) = dbg.get_thread_context_dbg(thread_id) {
                             ctx.Dr0 = dbg_ctx.Dr0;
                             ctx.Dr1 = dbg_ctx.Dr1;
                             ctx.Dr2 = dbg_ctx.Dr2;
                             ctx.Dr3 = dbg_ctx.Dr3;
-                            ctx.Dr6 = 0; // clear — prevent re-fire
+                            ctx.Dr6 = 0; // clear ??prevent re-fire
                             ctx.Dr7 = dbg_ctx.Dr7;
                         }
                         ctx.EFlags |= 0x10000; // RF
@@ -1287,7 +1298,7 @@ pub fn unpack(
                 log::log(
                     LogType::Info,
                     &format!(
-                        "SINGLE STEP at {address:#x} — handle_hw_breakpoint about to be called"
+                        "SINGLE STEP at {address:#x} ??handle_hw_breakpoint about to be called"
                     ),
                 );
 
@@ -1312,14 +1323,14 @@ pub fn unpack(
 
                 log::log(
                     LogType::Info,
-                    "handle_hw_breakpoint returned OK — about to continue_event",
+                    "handle_hw_breakpoint returned OK ??about to continue_event",
                 );
                 dbg.continue_event(thread_id, ContinueStatus::Continue)?;
                 log::log(LogType::Info, "continue_event returned OK");
             }
 
             // ---------------------------------------------------------------
-            // EXIT_PROCESS — target exited (unexpected before dump)
+            // EXIT_PROCESS ??target exited (unexpected before dump)
             // ---------------------------------------------------------------
             DebugEvent::ExitProcess { exit_code } => {
                 // Plugin consult already set process_exited + phase Done.
@@ -1329,16 +1340,19 @@ pub fn unpack(
                 if ls.oep.is_some() {
                     info!(
                         exit_code,
-                        "Target exited after OEP found — proceeding to dump"
+                        "Target exited after OEP found ??proceeding to dump"
                     );
                 } else {
                     warn!(exit_code, "Target process exited before unpack completed");
                 }
+                // ExitProcess is abstracted without a TID; the engine retains
+                // the raw pending identity for ContinueDebugEvent.
+                dbg.continue_pending_event(ContinueStatus::Continue)?;
                 break;
             }
 
             // ---------------------------------------------------------------
-            // Other events — continue
+            // Other events ??continue
             // ---------------------------------------------------------------
             DebugEvent::UnloadDll {
                 thread_id,
@@ -1348,28 +1362,18 @@ pub fn unpack(
             }
 
             DebugEvent::Other { thread_id } => {
-                debug!(thread_id, "Other debug event — continuing");
+                debug!(thread_id, "Other debug event ??continuing");
                 dbg.continue_event(thread_id, ContinueStatus::Continue)?;
             }
         }
 
         // Slice 3b-2: after handlers, sync guard/OEP/IAT milestones into plugin.
         // Skipped when a match arm `break`s; post-loop sync covers that case.
-        sync_plugin_milestones(
-            &mut packer,
-            &mut plugin_ctx,
-            &ls,
-            dbg.image_base(),
-        );
+        sync_plugin_milestones(&mut packer, &mut plugin_ctx, &ls, dbg.image_base());
     }
 
     // Final milestone sync (covers break paths that skipped end-of-iteration).
-    sync_plugin_milestones(
-        &mut packer,
-        &mut plugin_ctx,
-        &ls,
-        dbg.image_base(),
-    );
+    sync_plugin_milestones(&mut packer, &mut plugin_ctx, &ls, dbg.image_base());
     // 3b-6: dump-enter via shared helper (also used by post-attach).
     let post_loop_advice = if ls.oep.is_some() || plugin_ctx.oep_rva.is_some() {
         enter_dump_phase(&mut packer, &mut plugin_ctx, "PackerPlugin dump_advice")
@@ -1386,7 +1390,7 @@ pub fn unpack(
     // Propagate exit from AV handler path (storm escape + ExitProcess in wait).
     // The AV handler cannot mutate LoopState.process_exited after return, so
     // re-detect: if OEP was accepted via unrelated_av storm and main thread is
-    // gone, fix_iat_v3 will hang — use process_exited flag set on ExitProcess.
+    // gone, fix_iat_v3 will hang ??use process_exited flag set on ExitProcess.
     run_post_loop_phases(
         &mut dbg,
         &mut state,
@@ -1409,6 +1413,7 @@ pub fn unpack(
         input,
         &output_path,
         plugin_ctx.oep_rva,
+        &plugin_ctx.oep_provenance,
         post_loop_advice,
     )?;
 

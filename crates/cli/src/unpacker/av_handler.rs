@@ -1,10 +1,10 @@
 use super::helpers::compute_data_section_bounds;
 use super::iat_trace::{advance_to_next_slot, IatTraceState};
-use super::session::ProcessSession;
 use super::loop_state::LoopState;
+use super::session::ProcessSession;
 use crate::log::{self, LogType};
 use anyhow::anyhow;
-use mida_core::{ContinueStatus, DebugEvent, DebuggerCore};
+use mida_core::{ContinueStatus, DebugEvent, DebuggerCore, OepProvenance};
 use mida_packers_themida::{
     determine_iat_address, find_real_oep_by_scanning, handle_tls_callbacks,
     install_code_section_guard, install_iat_guard, is_oep_virtualized, process_guarded_access,
@@ -109,6 +109,11 @@ pub(super) fn handle_access_violation(
         }
         GuardAccessResult::MsvcTraceComplete { address } => {
             ls.oep = Some(address);
+            ls.oep_provenance = OepProvenance::trace(
+                address as u64,
+                format!("GuardAccessResult::MsvcTraceComplete resolved OEP: {address:#x}"),
+            );
+            ls.oep_found_via_scanning = false;
             remove_code_section_guard(h_process, text_start, text_end.saturating_sub(text_start))?;
             log::log(
                 LogType::Info,
@@ -131,6 +136,13 @@ pub(super) fn handle_access_violation(
 
             if tls_result.oep_found {
                 ls.oep = tls_result.oep_address;
+                if let Some(oep) = tls_result.oep_address {
+                    ls.oep_provenance = OepProvenance::trace(
+                        oep as u64,
+                        format!("TLS callback/OEP trace resolved application OEP: {oep:#x}"),
+                    );
+                    ls.oep_found_via_scanning = false;
+                }
             } else {
                 let mut ret_addr: usize = 0;
                 let mut ret_bytes = [0u8; 8];
@@ -187,6 +199,11 @@ pub(super) fn handle_access_violation(
                             "Found MSVC OEP via pattern match on PE entry point"
                         );
                         ls.oep = Some(real_oep);
+                        ls.oep_provenance = OepProvenance::trace(
+                            real_oep as u64,
+                            format!("TryFindCorrectOEP runtime trace resolved application OEP: {real_oep:#x}"),
+                        );
+                        ls.oep_found_via_scanning = false;
                         remove_code_section_guard(
                             h_process,
                             text_start,
@@ -236,13 +253,21 @@ pub(super) fn handle_access_violation(
                                 None
                             };
 
-                        let real_oep = if let Some(oep) = found_via_pattern {
+                        let (real_oep, real_oep_provenance) = if let Some(oep) = found_via_pattern {
                             info!(
                                 old = %format!("{address:#x}"),
                                 new = %format!("{oep:#x}"),
                                 "Replaced virtualized OEP via TryFindCorrectOEP"
                             );
-                            Some(oep)
+                            (
+                                Some(oep),
+                                OepProvenance::trace(
+                                    oep as u64,
+                                    format!(
+                                        "virtualized-OEP retry TryFindCorrectOEP trace: {oep:#x}"
+                                    ),
+                                ),
+                            )
                         } else if let Some(oep) = find_real_oep_by_scanning(
                             dbg,
                             dbg.image_base() as usize,
@@ -254,13 +279,29 @@ pub(super) fn handle_access_violation(
                                 new = %format!("{oep:#x}"),
                                 "Replaced virtualized OEP with scanned OEP"
                             );
-                            Some(oep)
+                            (
+                                Some(oep),
+                                OepProvenance::scan_fallback(
+                                    oep as u64,
+                                    format!(
+                                        "virtualized-OEP retry live scan selected OEP: {oep:#x}"
+                                    ),
+                                ),
+                            )
                         } else {
-                            None
+                            let fallback = ls.last_possible_oep.or(Some(address));
+                            (
+                                fallback,
+                                OepProvenance::unknown(
+                                    "virtualized-OEP retry exhausted; only PossibleOEP candidate remains",
+                                ),
+                            )
                         };
 
-                        ls.oep = real_oep.or_else(|| ls.last_possible_oep.or(Some(address)));
-                        ls.oep_found_via_scanning = true;
+                        ls.oep = real_oep;
+                        ls.oep_provenance = real_oep_provenance;
+                        ls.oep_found_via_scanning =
+                            matches!(ls.oep_provenance.source, mida_core::OepSource::ScanFallback);
                         remove_code_section_guard(
                             h_process,
                             text_start,
@@ -339,7 +380,18 @@ pub(super) fn handle_access_violation(
                 };
 
                 if !ls.oep_found_via_scanning {
-                    ls.oep = found_oep.or(Some(address));
+                    if let Some(found) = found_oep {
+                        ls.oep = Some(found);
+                        ls.oep_provenance = OepProvenance::trace(
+                            found as u64,
+                            format!("PossibleOEP runtime pattern trace resolved OEP: {found:#x}"),
+                        );
+                    } else {
+                        ls.oep = Some(address);
+                        ls.oep_provenance = OepProvenance::unknown(format!(
+                            "PossibleOEP without confirming trace: {address:#x}"
+                        ));
+                    }
                 }
 
                 if found_oep.is_none()
@@ -367,6 +419,10 @@ pub(super) fn handle_access_violation(
                         prev_addr,
                     );
                     ls.oep = Some(prev_addr);
+                    ls.oep_provenance = OepProvenance::unknown(format!(
+                        "FTraceMSVCOEP preserved common-main/bootstrap candidate: {prev_addr:#x}"
+                    ));
+                    ls.oep_found_via_scanning = false;
                     let ctx = dbg
                         .get_thread_context_control(thread_id)
                         .map_err(|e| anyhow!("get_thread_context_control: {e}"))?;
@@ -444,6 +500,13 @@ pub(super) fn handle_access_violation(
                                 "Replaced virtualized OEP with scanned OEP"
                             );
                             ls.oep = Some(real_oep);
+                            ls.oep_provenance = OepProvenance::scan_fallback(
+                                real_oep as u64,
+                                format!(
+                                    "virtualized OEP replaced by live .text scan: {real_oep:#x}"
+                                ),
+                            );
+                            ls.oep_found_via_scanning = true;
                         }
                     }
                 }
@@ -459,6 +522,9 @@ pub(super) fn handle_access_violation(
                             if looks_valid {
                                 info!(oep = %format!("{oep_addr:#x}"), "OEP looks like valid x64 code — using as-is for non-MSVC compiler");
                                 ls.oep = Some(oep_addr);
+                                ls.oep_provenance = OepProvenance::unknown(format!(
+                                    "PossibleOEP byte-shape heuristic only: {oep_addr:#x}"
+                                ));
                             }
                         }
                     }
@@ -478,9 +544,7 @@ pub(super) fn handle_access_violation(
                 && (ls.virtualized_oep_retries > 0 || ls.last_possible_oep.is_some())
                 && ls.oep.is_none()
             {
-                let fallback = ls
-                    .last_possible_oep
-                    .or(Some(exception_addr as usize));
+                let fallback = ls.last_possible_oep.or(Some(exception_addr as usize));
                 warn!(
                     streak = ls.unrelated_av_streak,
                     fault = %format!("{target_address:#x}"),
@@ -489,7 +553,16 @@ pub(super) fn handle_access_violation(
                     "Non-guard AV storm after virtualized OEP — accepting last PossibleOEP"
                 );
                 ls.oep = fallback;
-                ls.oep_found_via_scanning = true;
+                ls.oep_provenance = fallback
+                    .map(|va| {
+                        OepProvenance::unknown(format!(
+                            "non-guard AV storm accepted PossibleOEP fallback: {va:#x}"
+                        ))
+                    })
+                    .unwrap_or_else(|| {
+                        OepProvenance::unknown("non-guard AV storm produced no OEP address")
+                    });
+                ls.oep_found_via_scanning = false;
                 ls.storm_escape_freeze = true;
                 let _ = remove_code_section_guard(
                     h_process,
@@ -631,6 +704,15 @@ pub(super) fn handle_access_violation(
                         DebugEvent::ExitProcess { .. } => {
                             info!("Process exited during IAT monitoring");
                             process_exited = true;
+                            // ContinueDebugEvent still requires the raw TID
+                            // even though the public event omits it.
+                            if let Err(error) = dbg.continue_pending_event(ContinueStatus::Continue)
+                            {
+                                warn!(
+                                    error = %error,
+                                    "failed to continue ExitProcess event during IAT monitoring"
+                                );
+                            }
                             break;
                         }
                         _ => {}
@@ -649,18 +731,48 @@ pub(super) fn handle_access_violation(
 
         let ptr_size = std::mem::size_of::<usize>();
         let slot_count = iat.size / ptr_size;
+        let requested_bytes = slot_count * ptr_size;
         let mut slot_values = vec![0usize; slot_count];
-        // SAFETY: slot_values is a Vec<usize>; the aliasing slice covers len * ptr_size bytes and is discarded after read_memory.
-        let bytes_read = dbg
-            .read_memory(iat.address, unsafe {
-                std::slice::from_raw_parts_mut(
-                    slot_values.as_mut_ptr() as *mut u8,
-                    slot_values.len() * ptr_size,
-                )
-            })
-            .unwrap_or(0);
+        // SAFETY: slot_values is a Vec<usize>; the aliasing slice covers
+        // exactly the requested IAT bytes and is discarded after read_memory.
+        let read_result = dbg.read_memory(iat.address, unsafe {
+            std::slice::from_raw_parts_mut(slot_values.as_mut_ptr() as *mut u8, requested_bytes)
+        });
+        let bytes_read = match read_result {
+            Ok(bytes_read) if bytes_read == requested_bytes => bytes_read,
+            Ok(bytes_read) => {
+                let detail = format!(
+                    "IAT read incomplete at {:#x}: requested {} bytes, got {}",
+                    iat.address, requested_bytes, bytes_read
+                );
+                let continue_result = if dbg.pending_event_thread_id().is_some() {
+                    dbg.continue_pending_event(ContinueStatus::Continue).err()
+                } else {
+                    None
+                };
+                return Err(match continue_result {
+                    Some(error) => anyhow!("{detail}; pending event continue failed: {error}"),
+                    None => anyhow!(detail),
+                });
+            }
+            Err(error) => {
+                let detail = format!(
+                    "IAT read failed at {:#x} for {} bytes: {error}",
+                    iat.address, requested_bytes
+                );
+                let continue_result = if dbg.pending_event_thread_id().is_some() {
+                    dbg.continue_pending_event(ContinueStatus::Continue).err()
+                } else {
+                    None
+                };
+                return Err(match continue_result {
+                    Some(error) => anyhow!("{detail}; pending event continue failed: {error}"),
+                    None => anyhow!(detail),
+                });
+            }
+        };
         let actual_slots = bytes_read / ptr_size;
-        slot_values.truncate(actual_slots);
+        debug_assert_eq!(actual_slots, slot_count);
 
         let api_like_count = slot_values
             .iter()

@@ -34,11 +34,15 @@ pub fn is_origin_macro_protected_input(path: &Path) -> bool {
 
 /// Resolve pure-rebuild for unpack after CLI flags are parsed.
 ///
-/// - `cli_pure`: `--pure-rebuild` was set  
-/// - `cli_no_pure`: `--no-pure-rebuild` was set (wins over Origin default)  
+/// - `cli_pure`: `--pure-rebuild` was set
+/// - `cli_no_pure`: `--no-pure-rebuild` was set (wins over Origin default)
 /// - Origin protected input → default true unless `cli_no_pure`
 #[must_use]
-pub fn resolve_pure_rebuild(input: &Path, cli_pure: bool, cli_no_pure: bool) -> (bool, &'static str) {
+pub fn resolve_pure_rebuild(
+    input: &Path,
+    cli_pure: bool,
+    cli_no_pure: bool,
+) -> (bool, &'static str) {
     if cli_no_pure {
         return (false, "cli --no-pure-rebuild");
     }

@@ -12,9 +12,10 @@
 use tracing::{debug, info};
 
 use mida_core::{
-    ContinueStatus, DumpAdvice, EngineEvent, HostLoopFacts, PackerPlugin, PluginAdvice, PluginCtx,
-    UnpackPhase,
+    ContinueStatus, DumpAdvice, EngineEvent, HostLoopFacts, OepSource, PackerPlugin, PluginAdvice,
+    PluginCtx, UnpackPhase,
 };
+#[cfg(feature = "gto-product-recovery")]
 use mida_packers_ahk_gto::AhkGtoPlugin;
 use mida_packers_themida::ThemidaPlugin;
 
@@ -27,6 +28,7 @@ use super::loop_state::LoopState;
 #[derive(Debug, Clone)]
 pub(super) enum SelectedPacker {
     Oreans(ThemidaPlugin),
+    #[cfg(feature = "gto-product-recovery")]
     AhkGto(AhkGtoPlugin),
 }
 
@@ -35,6 +37,7 @@ impl SelectedPacker {
     pub(super) fn family_id(&self) -> &'static str {
         match self {
             Self::Oreans(p) => p.family_id(),
+            #[cfg(feature = "gto-product-recovery")]
             Self::AhkGto(p) => p.family_id(),
         }
     }
@@ -51,6 +54,7 @@ impl SelectedPacker {
     pub(super) fn apply_session_defaults(&self, ctx: &mut PluginCtx) {
         match self {
             Self::Oreans(p) => p.apply_session_defaults(ctx),
+            #[cfg(feature = "gto-product-recovery")]
             Self::AhkGto(p) => p.apply_session_defaults(ctx),
         }
     }
@@ -60,6 +64,7 @@ impl SelectedPacker {
     pub(super) fn last_identify_confidence(&self) -> u8 {
         match self {
             Self::Oreans(p) => p.last_identify_confidence,
+            #[cfg(feature = "gto-product-recovery")]
             Self::AhkGto(p) => p.last_identify_confidence,
         }
     }
@@ -83,6 +88,7 @@ pub(super) fn dual_select_packer(
     &'static str,
 ) {
     let mut oreans_probe = ThemidaPlugin::new();
+    #[cfg(feature = "gto-product-recovery")]
     let mut gto_probe = AhkGtoPlugin::new();
     let identify_input = mida_core::IdentifyInput {
         is_64bit,
@@ -91,9 +97,19 @@ pub(super) fn dual_select_packer(
         section_names,
     };
     let oreans_id = oreans_probe.identify_record(&identify_input);
-    let gto_id = gto_probe.identify_record(&identify_input);
+    let gto_id = {
+        #[cfg(feature = "gto-product-recovery")]
+        {
+            gto_probe.identify_record(&identify_input)
+        }
+        #[cfg(not(feature = "gto-product-recovery"))]
+        {
+            mida_core::IdentifyResult::NoMatch
+        }
+    };
     let family = select_packer_family(&oreans_id, &gto_id);
     let packer = match family {
+        #[cfg(feature = "gto-product-recovery")]
         "ahk_gto" => SelectedPacker::AhkGto(gto_probe),
         _ => SelectedPacker::Oreans(oreans_probe),
     };
@@ -117,12 +133,13 @@ pub(super) fn select_packer_family(
         mida_core::IdentifyResult::NoMatch => 0,
     };
     if oreans_conf >= 40 && oreans_conf >= gto_conf {
-        "oreans_themida"
-    } else if gto_conf >= 40 {
-        "ahk_gto"
-    } else {
-        "oreans_themida"
+        return "oreans_themida";
     }
+    #[cfg(feature = "gto-product-recovery")]
+    if gto_conf >= 40 {
+        return "ahk_gto";
+    }
+    "oreans_themida"
 }
 
 impl PackerPlugin for SelectedPacker {
@@ -133,6 +150,7 @@ impl PackerPlugin for SelectedPacker {
     fn identify(&self, input: &mida_core::IdentifyInput) -> mida_core::IdentifyResult {
         match self {
             Self::Oreans(p) => p.identify(input),
+            #[cfg(feature = "gto-product-recovery")]
             Self::AhkGto(p) => p.identify(input),
         }
     }
@@ -140,6 +158,7 @@ impl PackerPlugin for SelectedPacker {
     fn on_event(&mut self, ctx: &mut PluginCtx, event: &EngineEvent) -> PluginAdvice {
         match self {
             Self::Oreans(p) => p.on_event(ctx, event),
+            #[cfg(feature = "gto-product-recovery")]
             Self::AhkGto(p) => p.on_event(ctx, event),
         }
     }
@@ -147,6 +166,7 @@ impl PackerPlugin for SelectedPacker {
     fn dump_advice(&self, ctx: &PluginCtx) -> Option<DumpAdvice> {
         match self {
             Self::Oreans(p) => p.dump_advice(ctx),
+            #[cfg(feature = "gto-product-recovery")]
             Self::AhkGto(p) => p.dump_advice(ctx),
         }
     }
@@ -154,6 +174,7 @@ impl PackerPlugin for SelectedPacker {
     fn refresh_loop_policy(&mut self, ctx: &mut PluginCtx, facts: &HostLoopFacts) {
         match self {
             Self::Oreans(p) => p.refresh_loop_policy(ctx, facts),
+            #[cfg(feature = "gto-product-recovery")]
             Self::AhkGto(p) => p.refresh_loop_policy(ctx, facts),
         }
     }
@@ -161,6 +182,7 @@ impl PackerPlugin for SelectedPacker {
     fn note_guard_installed(&mut self, ctx: &mut PluginCtx) {
         match self {
             Self::Oreans(p) => p.note_guard_installed(ctx),
+            #[cfg(feature = "gto-product-recovery")]
             Self::AhkGto(p) => p.note_guard_installed(ctx),
         }
     }
@@ -173,6 +195,7 @@ impl PackerPlugin for SelectedPacker {
     ) -> PluginAdvice {
         match self {
             Self::Oreans(p) => p.note_oep_accepted(ctx, oep_va, via_scanning),
+            #[cfg(feature = "gto-product-recovery")]
             Self::AhkGto(p) => p.note_oep_accepted(ctx, oep_va, via_scanning),
         }
     }
@@ -180,6 +203,7 @@ impl PackerPlugin for SelectedPacker {
     fn note_iat_trace_enter(&mut self, ctx: &mut PluginCtx) -> PluginAdvice {
         match self {
             Self::Oreans(p) => p.note_iat_trace_enter(ctx),
+            #[cfg(feature = "gto-product-recovery")]
             Self::AhkGto(p) => p.note_iat_trace_enter(ctx),
         }
     }
@@ -187,6 +211,7 @@ impl PackerPlugin for SelectedPacker {
     fn note_iat_trace_complete(&mut self, ctx: &mut PluginCtx) -> PluginAdvice {
         match self {
             Self::Oreans(p) => p.note_iat_trace_complete(ctx),
+            #[cfg(feature = "gto-product-recovery")]
             Self::AhkGto(p) => p.note_iat_trace_complete(ctx),
         }
     }
@@ -198,6 +223,7 @@ impl PackerPlugin for SelectedPacker {
     ) -> PluginAdvice {
         match self {
             Self::Oreans(p) => p.note_iat_trace_skipped(ctx, reason),
+            #[cfg(feature = "gto-product-recovery")]
             Self::AhkGto(p) => p.note_iat_trace_skipped(ctx, reason),
         }
     }
@@ -205,6 +231,7 @@ impl PackerPlugin for SelectedPacker {
     fn note_dump_enter(&mut self, ctx: &mut PluginCtx) -> PluginAdvice {
         match self {
             Self::Oreans(p) => p.note_dump_enter(ctx),
+            #[cfg(feature = "gto-product-recovery")]
             Self::AhkGto(p) => p.note_dump_enter(ctx),
         }
     }
@@ -217,15 +244,12 @@ const _: ContinueStatus = ContinueStatus::Continue;
 pub(super) fn host_loop_facts(ls: &LoopState) -> HostLoopFacts {
     // Product-complete only (resolved+failed+skipped==total, no abort, no fails).
     // Walking current_slot to total alone is NOT complete (audit residual P1).
-    let iat_trace_complete = ls
-        .iat_trace
-        .as_ref()
-        .is_some_and(|t| t.product_complete());
+    let iat_trace_complete = ls.iat_trace.as_ref().is_some_and(|t| t.product_complete());
     HostLoopFacts {
         text_polling: ls.text_polling,
         guard_installed: ls.guard_installed,
         oep_known: ls.oep.is_some(),
-        oep_via_scanning: ls.oep_found_via_scanning,
+        oep_via_scanning: matches!(ls.oep_provenance.source, OepSource::ScanFallback),
         iat_trace_active: ls.iat_trace.is_some(),
         iat_trace_complete,
         process_exited: ls.process_exited,
@@ -266,10 +290,14 @@ pub(super) fn sync_plugin_milestones(
             || matches!(
                 plugin_ctx.phase,
                 UnpackPhase::Observe | UnpackPhase::GuardActive
-            );
+            )
+            || plugin_ctx.oep_provenance != ls.oep_provenance;
         if need_oep {
             let advice =
                 packer.note_oep_accepted(plugin_ctx, oep_va as u64, ls.oep_found_via_scanning);
+            // The packer hook remains backward-compatible; the provenance contract
+            // is host-owned and must be recorded independently of that hook.
+            plugin_ctx.record_oep_provenance(ls.oep_provenance.clone());
             debug!(
                 ?advice,
                 oep_rva = ?plugin_ctx.oep_rva,
@@ -277,8 +305,8 @@ pub(super) fn sync_plugin_milestones(
                 family = packer.family_id(),
                 "PackerPlugin: OEP accepted"
             );
-        } else if ls.oep_found_via_scanning && !plugin_ctx.oep_found_via_scanning {
-            plugin_ctx.oep_found_via_scanning = true;
+        } else if plugin_ctx.oep_provenance != ls.oep_provenance {
+            plugin_ctx.record_oep_provenance(ls.oep_provenance.clone());
         }
     }
 
@@ -319,10 +347,7 @@ pub(super) fn note_plugin_av_break(
 ) {
     sync_plugin_milestones(packer, plugin_ctx, ls, image_base);
 
-    let iat_done = ls
-        .iat_trace
-        .as_ref()
-        .is_some_and(|t| t.product_complete());
+    let iat_done = ls.iat_trace.as_ref().is_some_and(|t| t.product_complete());
 
     if iat_done {
         let advice = packer.note_iat_trace_complete(plugin_ctx);
@@ -367,10 +392,7 @@ pub(super) fn note_plugin_av_break(
 /// Host finished v3 IAT single-step (all slots done). Sticky leave via complete.
 ///
 /// Call from SingleStep path when `current_slot >= total_slots`. Does not Win32.
-pub(super) fn note_plugin_iat_complete(
-    packer: &mut SelectedPacker,
-    plugin_ctx: &mut PluginCtx,
-) {
+pub(super) fn note_plugin_iat_complete(packer: &mut SelectedPacker, plugin_ctx: &mut PluginCtx) {
     let advice = packer.note_iat_trace_complete(plugin_ctx);
     debug!(
         ?advice,
@@ -421,7 +443,7 @@ pub(super) fn plugin_leave_reason(plugin_ctx: &PluginCtx) -> Option<&'static str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mida_core::{IdentifyInput, IdentifyResult};
+    use mida_core::IdentifyResult;
 
     #[test]
     fn selected_oreans_family_id() {
@@ -429,12 +451,14 @@ mod tests {
         assert_eq!(p.family_id(), "oreans_themida");
     }
 
+    #[cfg(feature = "gto-product-recovery")]
     #[test]
     fn selected_gto_family_id() {
         let p = SelectedPacker::AhkGto(AhkGtoPlugin::new());
         assert_eq!(p.family_id(), "ahk_gto");
     }
 
+    #[cfg(feature = "gto-product-recovery")]
     #[test]
     fn selected_gto_dump_advice_notes_profile() {
         let p = SelectedPacker::AhkGto(AhkGtoPlugin::new());
@@ -444,10 +468,11 @@ mod tests {
         assert!(a.note.contains("ahk-gto-experimental"));
     }
 
+    #[cfg(feature = "gto-product-recovery")]
     #[test]
     fn selected_dispatches_identify() {
         let p = SelectedPacker::AhkGto(AhkGtoPlugin::new());
-        let r = p.identify(&IdentifyInput {
+        let r = p.identify(&mida_core::IdentifyInput {
             is_64bit: true,
             entry_point_rva: 0x1,
             size_of_image: 0x1000,
@@ -456,23 +481,48 @@ mod tests {
         assert!(matches!(r, IdentifyResult::Match { confidence } if confidence >= 40));
     }
 
+    #[cfg(feature = "gto-product-recovery")]
     #[test]
     fn dual_select_gto_from_ki3_sections() {
         let (packer, _o, g, fam) = dual_select_packer(
             true,
             0x1000,
             0x200_0000,
-            vec![
-                ".text".into(),
-                ".KI3".into(),
-                ".,\\W".into(),
-                ".|lT".into(),
-            ],
+            vec![".text".into(), ".KI3".into(), ".,\\W".into(), ".|lT".into()],
         );
         assert_eq!(fam, "ahk_gto");
         assert_eq!(packer.family_id(), "ahk_gto");
         assert!(!packer.uses_oreans_iat_trace());
         assert!(matches!(g, IdentifyResult::Match { confidence } if confidence >= 40));
+    }
+
+    #[cfg(not(feature = "gto-product-recovery"))]
+    #[test]
+    fn selected_gto_identify_is_disabled_by_default() {
+        let (packer, _o, g, fam) = dual_select_packer(
+            true,
+            0x1000,
+            0x200_0000,
+            vec![".text".into(), ".KI3".into(), ".,\\W".into(), ".|lT".into()],
+        );
+        assert_eq!(fam, "oreans_themida");
+        assert_eq!(packer.family_id(), "oreans_themida");
+        assert_eq!(g, IdentifyResult::NoMatch);
+    }
+
+    #[cfg(not(feature = "gto-product-recovery"))]
+    #[test]
+    fn dual_select_ki3_defaults_to_oreans_when_gto_disabled() {
+        let (packer, _o, g, fam) = dual_select_packer(
+            true,
+            0x1000,
+            0x200_0000,
+            vec![".text".into(), ".KI3".into(), ".,\\W".into(), ".|lT".into()],
+        );
+        assert_eq!(fam, "oreans_themida");
+        assert_eq!(packer.family_id(), "oreans_themida");
+        assert!(packer.uses_oreans_iat_trace());
+        assert_eq!(g, IdentifyResult::NoMatch);
     }
 
     #[test]
@@ -500,6 +550,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "gto-product-recovery")]
     #[test]
     fn select_gto_when_only_gto_matches() {
         assert_eq!(

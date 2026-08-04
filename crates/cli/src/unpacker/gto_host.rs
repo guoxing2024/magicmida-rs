@@ -20,12 +20,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::log::{self, LogType};
-use mida_core::{
-    CreateProcessOptions, DebuggerCore, PackerPlugin, PluginCtx, PreferredBase,
-};
-use mida_pe::{
-    ContainerRestoreMode, DumpOptions, DumpProfile, OepPolicy, PeHeader,
-};
+use mida_core::{CreateProcessOptions, DebuggerCore, PackerPlugin, PluginCtx, PreferredBase};
+use mida_pe::{ContainerRestoreMode, DumpOptions, DumpProfile, OepPolicy, PeHeader};
 
 use super::early_snapshots::{
     capture_early_section_snapshots, log_snapshot_summary, merge_reinitializable_data_state,
@@ -42,8 +38,7 @@ const GTO_UI_WINDOW_CLASS: &str = "NewClassName";
 const GTO_UI_POST_WINDOW_SETTLE: std::time::Duration = std::time::Duration::from_secs(3);
 /// Route H / no-bypass: extra settle after NewClassName so gscript/heap roots
 /// include post-GUI state (H1: early dump incomplete for cold UI).
-const GTO_NO_BYPASS_UI_POST_WINDOW_SETTLE: std::time::Duration =
-    std::time::Duration::from_secs(5);
+const GTO_NO_BYPASS_UI_POST_WINDOW_SETTLE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// True when `pid` owns a top-level window with the given class name.
 fn process_has_window_class(pid: u32, class_name: &str) -> bool {
@@ -99,6 +94,26 @@ pub(super) fn run_gto_host(
     cli_capture_policy: mida_pe::DumpCapturePolicy,
     mut packer: SelectedPacker,
 ) -> Result<(), anyhow::Error> {
+    #[cfg(not(feature = "gto-product-recovery"))]
+    {
+        let _ = (
+            input,
+            output,
+            do_data_sections,
+            shrink,
+            oep_policy,
+            container_restore,
+            profile,
+            pure_rebuild,
+            cli_capture_policy,
+            packer,
+        );
+        return Err(anyhow!(
+            "GTO product-recovery route is disabled in the default build; \
+             rebuild mida-cli with --features gto-product-recovery to opt in"
+        ));
+    }
+
     info!("=== GTO HOST START (independent; no ThemidaState) ===");
     info!("Input: {}", input.display());
     info!(
@@ -120,7 +135,10 @@ pub(super) fn run_gto_host(
     let output_path = resolve_output_path(input, output);
     info!("Output: {}", output_path.display());
 
-    log::log(LogType::Info, &format!("GTO host loading: {}", input.display()));
+    log::log(
+        LogType::Info,
+        &format!("GTO host loading: {}", input.display()),
+    );
     let mut pe =
         PeHeader::from_file(input).map_err(|e| anyhow!("GTO host PE parse failed: {e}"))?;
     let is_64bit = pe.is_64bit;
@@ -142,10 +160,7 @@ pub(super) fn run_gto_host(
         ));
     }
 
-    let section0_is_plain_text = pe
-        .sections
-        .first()
-        .is_some_and(|s| s.name == ".text");
+    let section0_is_plain_text = pe.sections.first().is_some_and(|s| s.name == ".text");
     if !section0_is_plain_text {
         return Err(anyhow!(
             "GTO independent host requires section 0 named .text (post-attach path); got {:?}",
@@ -203,7 +218,8 @@ pub(super) fn run_gto_host(
     let mut oep_watch: Vec<(usize, usize, String)> = Vec::new();
     for s in &pe.sections {
         let exec = (s.characteristics & 0x2000_0000) != 0;
-        let named_boot = s.name.eq_ignore_ascii_case(".boot") || s.name.eq_ignore_ascii_case(".text");
+        let named_boot =
+            s.name.eq_ignore_ascii_case(".boot") || s.name.eq_ignore_ascii_case(".text");
         let holds_ep = pe.entry_point >= s.virtual_address
             && pe.entry_point < s.virtual_address.saturating_add(s.virtual_size.max(1));
         if exec || named_boot || holds_ep {
@@ -256,12 +272,7 @@ pub(super) fn run_gto_host(
     let max_wait = if no_bypass {
         std::time::Duration::from_secs(90)
     } else {
-        std::time::Duration::from_secs(
-            plugin_ctx
-                .text_poll_idle_timeout_secs
-                .max(60)
-                .min(90),
-        )
+        std::time::Duration::from_secs(plugin_ctx.text_poll_idle_timeout_secs.max(60).min(90))
     };
     if no_bypass {
         log::log(
@@ -527,10 +538,7 @@ pub(super) fn run_gto_host(
     log_snapshot_summary(&early_section_snapshots, "GTO host pre-.text baseline");
 
     let oep_addr = if let Some(rip) = frozen_rip {
-        log::log(
-            LogType::Good,
-            &format!("GTO host: OEP from RIP {rip:#x}"),
-        );
+        log::log(LogType::Good, &format!("GTO host: OEP from RIP {rip:#x}"));
         rip
     } else {
         // Byte-pattern OEP scan on live .text (shared utility; not ThemidaState).
@@ -578,8 +586,11 @@ pub(super) fn run_gto_host(
 
     plugin_ctx.ensure_runtime_base(image_base_usize as u64);
     packer.note_oep_accepted(&mut plugin_ctx, oep_addr as u64, frozen_rip.is_none());
-    let dump_advice =
-        enter_dump_phase(&mut packer, &mut plugin_ctx, "PackerPlugin dump_advice (GTO host)");
+    let dump_advice = enter_dump_phase(
+        &mut packer,
+        &mut plugin_ctx,
+        "PackerPlugin dump_advice (GTO host)",
+    );
     if let Some(ref advice) = dump_advice {
         info!(
             prefer_pure = advice.prefer_pure_rebuild,
@@ -592,9 +603,7 @@ pub(super) fn run_gto_host(
     // Experimental stages still gated by DumpProfile.
     let capture_policy = mida_pe::DumpCapturePolicy::resolve_with_plugin_hint(
         cli_capture_policy,
-        dump_advice
-            .as_ref()
-            .and_then(|a| a.capture_policy.as_ref()),
+        dump_advice.as_ref().and_then(|a| a.capture_policy.as_ref()),
         profile,
     );
     info!(
@@ -634,7 +643,8 @@ pub(super) fn run_gto_host(
                 let val = usize::from_le_bytes(buf[off..off + 8].try_into().unwrap_or([0; 8]));
                 // External user-mode module pointer (same bar as IAT resolved).
                 let is_api = val >= 0x7FF0_0000_0000
-                    || (val >= 0x1800_0000 && val < 0x7FFF_FFFF_FFFF
+                    || (val >= 0x1800_0000
+                        && val < 0x7FFF_FFFF_FFFF
                         && !(val >= image_base_usize
                             && val < image_base_usize.saturating_add(0x1000_0000)));
                 if is_api {
@@ -710,7 +720,8 @@ pub(super) fn run_gto_host(
         capture_policy,
     };
 
-    mida_pe::dump_process(&mut dbg, &dump_opts).map_err(|e| anyhow!("GTO host dump failed: {e}"))?;
+    mida_pe::dump_process(&mut dbg, &dump_opts)
+        .map_err(|e| anyhow!("GTO host dump failed: {e}"))?;
 
     let mut structure_ep_ok = false;
     if let Ok(out_pe) = PeHeader::from_file(&output_path) {

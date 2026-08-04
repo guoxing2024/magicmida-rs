@@ -118,10 +118,7 @@ fn windows_file_identity(path: &Path) -> std::io::Result<(u32, u64)> {
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
     // FILE_SHARE_READ|WRITE|DELETE so we don't block other openers.
-    let file = OpenOptions::new()
-        .read(true)
-        .share_mode(0x7)
-        .open(path)?;
+    let file = OpenOptions::new().read(true).share_mode(0x7).open(path)?;
 
     #[repr(C)]
     #[derive(Default)]
@@ -317,14 +314,8 @@ pub(super) fn dotnet_dump_and_dump_output(
     // PeHeader::entry_point is already an RVA — pass through unchanged.
     let entry_point_rva = live_pe.entry_point;
 
-    mida_pe::dump_dotnet_with_source(
-        dbg,
-        image_base as u64,
-        entry_point_rva,
-        output_path,
-        input,
-    )
-    .map_err(|e| anyhow!(".NET dump failed: {e}"))
+    mida_pe::dump_dotnet_with_source(dbg, image_base as u64, entry_point_rva, output_path, input)
+        .map_err(|e| anyhow!(".NET dump failed: {e}"))
 }
 
 // ---------------------------------------------------------------------------

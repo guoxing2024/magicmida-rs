@@ -117,9 +117,10 @@ pub fn print_help() {
     println!("  --shrink                     Remove Themida-specific sections (default)");
     println!("  --no-shrink                  Keep all sections");
     println!("  --oep=crt|captured|rva=N     PE entry policy (default: captured)");
-    println!("  --profile=PROFILE            oreans-classic (default) | ahk-gto-experimental");
+    println!("  --profile=oreans-classic      Oreans mainline profile (default)");
+    println!("  AHK/GTO product-recovery route is off-mainline and disabled by default.");
     println!("  --container-restore=MODE     off | post-crt | tls-pre");
-    println!("                               (default from profile: classic=off, gto=post-crt)");
+    println!("                               (default from profile: oreans-classic=off)");
     println!("  --capture-policy=PATH        dump capture policy JSON (pure object or");
     println!("                               full case-manifest with capture_policy field)");
     println!("                               Merge: CLI/manifest > plugin hint > profile");
@@ -127,7 +128,7 @@ pub fn print_help() {
     println!("EXAMPLES:");
     println!("  {NAME} /generic-unpack launcher.exe -o launcher_genericU.exe -v");
     println!("  {NAME} /unpack protected.exe --data-sections --no-shrink");
-    println!("  {NAME} /unpack gto.exe --profile=ahk-gto-experimental --capture-policy=policy.json");
+    println!("  {NAME} /unpack protected.exe --profile=oreans-classic");
     println!("  {NAME} /verify unpacked.exe reference.exe");
 }
 
