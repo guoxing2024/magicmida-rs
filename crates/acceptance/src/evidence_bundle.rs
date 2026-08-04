@@ -19,7 +19,13 @@
 //!   are re-parsed and cross-checked against the bundle identities, so
 //!   tampering a sidecar's identity and recomputing all hashes still fails;
 //! - `relative_path` is validated: relative only, no `..`/`.` components, no
-//!   drive letters or `:`, and unique across members.
+//!   drive letters or `:`, and unique across members;
+//! - every free-text field rejects control characters (including CR/LF/NUL)
+//!   and the canonical-hash separators `|`, `=`; identifiers
+//!   (`case_id`, `tool_revision`, member names, `relative_path`) additionally
+//!   reject `:` so the canonical lines cannot be forged or re-parsed
+//!   ambiguously (timestamps/reasons may contain `:` — their lines split at
+//!   the first separator).
 //!
 //! Fail-closed rules enforced here:
 //! - the manifest schema version is exactly `mida.oreans-evidence-bundle/v2`;
@@ -240,14 +246,51 @@ fn is_64_hex(value: &str) -> bool {
     value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+/// Reject characters that would break the canonical line-based manifest hash:
+/// control characters (including CR/LF/NUL) and the separators `|`, `=`.
+/// `:` is additionally rejected for identifiers; it is permitted for
+/// timestamp/reason fields whose canonical line is split at the first
+/// separator and therefore stays unambiguous.
+fn validate_plain_field(value: &str, field: &str, allow_colon: bool, reasons: &mut Vec<String>) {
+    for c in value.chars() {
+        if c == '|' || c == '=' {
+            reasons.push(format!(
+                "{field} must not contain the canonical-hash separator {c:?}"
+            ));
+            return;
+        }
+        if !allow_colon && c == ':' {
+            reasons.push(format!(
+                "{field} must not contain the canonical-hash separator ':'"
+            ));
+            return;
+        }
+        if c.is_control() {
+            reasons.push(format!("{field} must not contain control character {c:?}"));
+            return;
+        }
+    }
+}
+
 /// Validate one `relative_path`: relative only, no `.`/`..`, no drive
-/// letters or `:`. Returns the normalized (`\` -> `/`) path on success.
+/// letters, no `:`/`|`/`=` or control characters. Returns the normalized
+/// (`\` -> `/`) path on success.
 fn normalize_relative_path(path: &str) -> Result<String, String> {
     if path.trim().is_empty() {
         return Err("relative_path must be non-empty".to_string());
     }
     if path.contains(':') {
         return Err(format!("relative_path {path:?} must not contain ':'"));
+    }
+    if path.contains('|') || path.contains('=') {
+        return Err(format!(
+            "relative_path {path:?} must not contain canonical-hash separators"
+        ));
+    }
+    if path.chars().any(char::is_control) {
+        return Err(format!(
+            "relative_path {path:?} must not contain control characters"
+        ));
     }
     let normalized = path.replace('\\', "/");
     if normalized.starts_with('/') {
@@ -350,12 +393,24 @@ pub fn validate_evidence_bundle(
     }
     if bundle.case_id.trim().is_empty() {
         reasons.push("case_id must be non-empty".to_string());
+    } else {
+        validate_plain_field(&bundle.case_id, "case_id", false, &mut reasons);
     }
     if bundle.tool_revision.trim().is_empty() {
         reasons.push("tool_revision must be non-empty".to_string());
+    } else {
+        validate_plain_field(&bundle.tool_revision, "tool_revision", false, &mut reasons);
     }
     if bundle.emitted_at.trim().is_empty() {
         reasons.push("emitted_at must be non-empty".to_string());
+    } else {
+        validate_plain_field(&bundle.emitted_at, "emitted_at", true, &mut reasons);
+    }
+    match &bundle.completion_marker {
+        BundleCompletionMarker::Partial { reason } => {
+            validate_plain_field(reason, "completion_marker.reason", true, &mut reasons);
+        }
+        BundleCompletionMarker::Complete => {}
     }
     if !is_64_hex(&bundle.protected_input.sha256) || bundle.protected_input.size_bytes == 0 {
         reasons.push("protected_input identity must be a 64-hex SHA-256 with size > 0".to_string());
@@ -377,6 +432,7 @@ pub fn validate_evidence_bundle(
         if !seen_names.insert(member.name.clone()) {
             reasons.push(format!("duplicate member name {}", member.name));
         }
+        validate_plain_field(&member.name, "member name", false, &mut reasons);
         if !is_64_hex(&member.sha256) {
             reasons.push(format!("member {} has non-64-hex sha256", member.name));
         }
@@ -874,5 +930,56 @@ mod tests {
             "deny_unknown_fields must reject extra fields"
         );
         let _ = value;
+    }
+
+    #[test]
+    fn newline_in_completion_reason_fails_closed() {
+        let (mut bundle, files) = synthetic_bundle();
+        bundle.completion_marker = BundleCompletionMarker::Partial {
+            reason: "dump aborted\ninjected line".to_string(),
+        };
+        bundle.manifest_sha256 = canonical_manifest_hash(&bundle);
+        let verdict = validate_evidence_bundle(&bundle, &files);
+        assert!(!verdict.valid);
+        assert!(verdict
+            .reasons
+            .iter()
+            .any(|r| r.contains("completion_marker.reason")));
+    }
+
+    #[test]
+    fn separator_in_tool_revision_fails_closed() {
+        let (mut bundle, files) = synthetic_bundle();
+        bundle.tool_revision = "oreans/two-sample-mainline@abc|def".to_string();
+        bundle.manifest_sha256 = canonical_manifest_hash(&bundle);
+        let verdict = validate_evidence_bundle(&bundle, &files);
+        assert!(!verdict.valid);
+        assert!(verdict.reasons.iter().any(|r| r.contains("tool_revision")));
+    }
+
+    #[test]
+    fn nul_in_case_id_fails_closed() {
+        let (mut bundle, files) = synthetic_bundle();
+        bundle.case_id = "origin_macro\u{0}extra".to_string();
+        bundle.manifest_sha256 = canonical_manifest_hash(&bundle);
+        let verdict = validate_evidence_bundle(&bundle, &files);
+        assert!(!verdict.valid);
+        assert!(verdict.reasons.iter().any(|r| r.contains("case_id")));
+    }
+
+    #[test]
+    fn separator_in_relative_path_fails_closed() {
+        let (mut bundle, files) = synthetic_bundle();
+        for member in &mut bundle.members {
+            if member.name == "iat_evidence" {
+                member.relative_path = "evidence/iat|swapped.json".to_string();
+            }
+        }
+        let verdict = validate_evidence_bundle(&bundle, &files);
+        assert!(!verdict.valid);
+        assert!(verdict
+            .reasons
+            .iter()
+            .any(|r| r.contains("canonical-hash separators")));
     }
 }

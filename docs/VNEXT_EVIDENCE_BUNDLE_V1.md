@@ -65,6 +65,12 @@ manifest and every nested object; an unknown field makes the bundle invalid.
 `relative_path` must be relative (no leading `/` or `\`, no drive letter), free
 of `.`/`..` components and `:`, and unique across members.
 
+Free-text fields reject control characters (including CR/LF/NUL) and the
+canonical-hash separators `|` and `=`. Identifiers (`case_id`,
+`tool_revision`, member names, `relative_path`) additionally reject `:`;
+timestamps (`emitted_at`) and the completion reason may contain `:` because
+their canonical lines split at the first separator and stay unambiguous.
+
 ## 3. Required members
 
 Every member file's JSON top-level `schema_version` must be exactly:
@@ -91,7 +97,8 @@ cannot launder the bundle.
 3. Identities are 64-hex SHA-256 with size > 0; `case_id`, `tool_revision`,
    and `emitted_at` are non-empty.
 4. Member names and `relative_path` values are unique; paths are relative,
-   without `.`/`..`/`:`.
+   without `.`/`..`/`:`; free-text fields are free of control characters and
+   the canonical separators `|`/`=` (identifiers also free of `:`).
 5. Every member file is present and its bytes match the declared SHA-256 and
    size exactly.
 6. `members_sha256` matches the canonical member-set hash and

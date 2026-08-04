@@ -1,0 +1,16 @@
+# Line-ending and whitespace policy
+#
+# Text files use LF. Cargo fmt, rustfmt, and this repo's git whitespace check
+# (`git diff --check`) assume LF; the small set of legacy CRLF files is being
+# normalized as they are touched (see crates/*/Cargo.toml 2026-08-04).
+#
+# Windows batch files keep CRLF: cmd.exe continuation/`goto` parsing is
+# safest with CRLF line endings.
+#
+# Raw binary fixtures are byte-exact and must never be normalized or
+# re-encoded; their provenance is pinned by `mida.fixture-provenance/v1`.
+
+* text=auto eol=lf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.bin binary
