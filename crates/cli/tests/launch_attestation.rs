@@ -196,6 +196,27 @@ fn cli_with_verifier(dir: &Path, verifier: &Path) -> PathBuf {
     copy
 }
 
+/// Write a file, retrying briefly when a just-exited subprocess still holds
+/// the destination (Windows error 32).
+fn write_with_retry(path: &Path, bytes: &[u8]) {
+    let mut last = None;
+    for attempt in 0..50 {
+        match fs::write(path, bytes) {
+            Ok(()) => return,
+            Err(e) => {
+                let code = e.raw_os_error();
+                last = Some(e);
+                if code == Some(32) && attempt < 49 {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    continue;
+                }
+                break;
+            }
+        }
+    }
+    panic!("write {}: {:?}", path.display(), last)
+}
+
 fn fake_binary(dir: &Path, name: &str, payload: &[u8]) -> PathBuf {
     let path = dir.join(name);
     fs::write(&path, payload).unwrap();
@@ -765,7 +786,7 @@ fn binary_swap_rejected() {
     let cli_copy = dir.join("mida-cli.exe");
     let mut bytes = fs::read(&cli_copy).unwrap();
     bytes.extend_from_slice(b"BINARY-B-MARKER");
-    fs::write(&cli_copy, &bytes).unwrap();
+    write_with_retry(&cli_copy, &bytes);
 
     let candidate = dir.join("origin_candidate.exe");
     let output = launch_unpack_with_verifier(
