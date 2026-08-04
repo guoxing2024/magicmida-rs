@@ -711,9 +711,12 @@ pub fn attest_ready_before_launch(
         );
     }
 
-    // The current output canonical path must equal the preflight candidate.
+    // The current output canonical path must equal the candidate output
+    // recorded at PREFLIGHT time (the staged candidate). The fresh report
+    // always records the current output by construction, so the staged
+    // candidate is the authority.
     let current_output = canonicalize_loose(ctx.output);
-    let preflight_candidate = PathBuf::from(&fresh_target.candidate_output);
+    let preflight_candidate = PathBuf::from(&matches[0].candidate_output);
     if current_output != preflight_candidate {
         bail!(
             "current output {} does not match the preflight candidate {}",

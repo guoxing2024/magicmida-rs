@@ -1,0 +1,126 @@
+# P6.3 Launch Attestation Closure
+
+Status: implemented (five commits on `oreans/two-sample-mainline`).
+
+Scope: offline engineering hardening only. No real sample was opened or
+started; `validation_summary.json` remains `open`.
+
+## Problem
+
+P6.2's launch boundary trusted a `ready` status in `preflight.json` plus
+digest equality. The P6.3 review showed four closure gaps:
+
+1. **Detached config identity** — the envelope was built from a frozen
+   policy, not the configuration the run would actually apply; in
+   particular the Origin Macro pure-rebuild default (operator decision D3)
+   was outside the config identity, so an envelope staged as
+   `pure_rebuild=false` could silently authorize a run that resolved to
+   `true`.
+2. **Hand-written authorization** — a fabricated `{"status":"ready"}`
+   report with a matching digest chain passed the gate; input/output/CLI/
+   config identities were never re-checked at launch.
+3. **Envelope overwrite** — an existing stale/tampered envelope was
+   silently replaced by the next staging run.
+4. **No production evidence chain** — `assemble_evidence_bundle` accepted a
+   caller-supplied digest and had no production call site.
+
+## Design
+
+### P6.3-A actual run config binding (`crates/cli/src/run_spec.rs`)
+
+`runner_config_from_unpack_args` builds the canonical runner config from the
+parsed `/unpack` arguments: profile (features entry), OEP policy, container
+restore, shrink, data sections, the RESOLVED pure-rebuild value (Origin D3
+default included), capture-policy digest (SHA-256 of the policy file bytes),
+debugger backend, timeout/isolation, tool revision and CLI binary SHA-256.
+`frozen_run_policy(input)` is the P7 fixed-mode expectation with the Origin
+default resolved per input; `policy_matches` fails closed on any divergence.
+
+### P6.3-B launch attestation (`crates/cli/src/runner_preflight.rs`)
+
+`attest_ready_before_launch` re-verifies the FULL run context before any
+sample process can be created:
+
+- envelope `$schema` + `schema_version` strictly validated;
+- actual run-config digest == envelope digest;
+- current CLI binary SHA-256 == envelope pinned identity;
+- current input identity matches EXACTLY ONE preflight case identity
+  (cross-case / third-input reuse refused);
+- the independent acceptance verifier is RE-RUN against the recorded
+  runner context with the current input/output for the target case — a
+  hand-written `ready` JSON is not an authorization credential;
+- the fresh report must be ready with exactly {origin_macro,
+  lunlun_software}, every case identity_ok;
+- target-case input identity unchanged since the staged report;
+- current output canonical path == staged candidate (hard links and
+  canonical aliases are refused);
+- the output must not alias the protected input.
+
+On success it returns the single-use `RunEvidenceContext` (case id, tool
+revision, envelope digest, canonical input/output, CLI identity).
+
+### P6.3-C envelope fail-closed reuse
+
+`envelope_reuse_policy` allows first creation only when the file is absent;
+an existing envelope must parse strictly and match the would-be envelope
+field-by-field (`$schema`, schema version, full config JSON, digest, CLI
+identity, tool revision). Any failure is a hard error and the original
+bytes are preserved — there is no `Err(_) => write(...)` fallback.
+
+### P6.3-D production evidence chain
+
+```text
+launch attestation -> RunEvidenceContext -> sidecar producers
+-> atomic bundle assembler -> v8 gate consumer
+```
+
+`assemble_evidence_bundle` derives `case_id`, `tool_revision` and
+`runner_config_digest` exclusively from the attested context and CONSUMES
+it (one-time authorization). `complete_run_evidence` is the production
+driver: it collects the seven members exactly as the producers name them
+(five structured sidecars + dumper transform manifest + PE evidence via the
+acceptance binary), fails closed on any missing member, and writes the
+bundle atomically. The unpack pipeline calls it after a successful gated
+run, so the bundle digest always equals the launch attestation digest.
+
+## Attack tests (`crates/cli/tests/launch_attestation.rs`, 15 tests)
+
+1. hand-written `ready` is never an authorization (verifier re-run
+   NotReady blocks);
+2. a Ready report staged for one input cannot launch a different input
+   (cross-case reuse refused);
+3. a Ready report cannot launch a garbage/third input;
+4. an input modified after preflight is refused;
+5. an output path changed after preflight is refused;
+6. outputs aliasing the protected input (same canonical path, hard link)
+   are refused;
+7. `--no-shrink` divergence is refused;
+8. every other policy divergence (`--data-sections`, `--oep`,
+   `--container-restore`, `--profile`, `--pure-rebuild`,
+   `--capture-policy`) is refused item by item;
+9. a binary A preflight cannot authorize a binary B launch;
+10. a malformed existing envelope is never overwritten (bytes preserved);
+11. a stale/different envelope is never reused (bytes preserved);
+12. `$schema` drift is rejected by both the runner and the acceptance
+    verifier;
+13. the production bundle digest equals the launch attestation digest;
+14. a consumed authorization cannot be consumed a second time;
+15. positive control: a genuinely re-verified Ready report passes the
+    attestation and the pipeline continues past it.
+
+Negative tests use the real `mida-acceptance` binary; the pass-path and
+chain tests use the deterministic `mida-verifier-stub`
+(`crates/cli/tests/bin/verifier_stub.rs`, a test-support bin that mirrors
+the acceptance CLI surface).
+
+## Remaining boundaries
+
+- The attestation re-runs the verifier process; the report file is trusted
+  only as the verifier's output (locally recomputed identities and the
+  digest chain are the authority).
+- The `v8` two-sample gate consumer (observations from live runs) is
+  outside this change: the bundle digest equality with the attestation is
+  enforced, but a live P7 smoke is still gated by operator authorization.
+- The AHK/GTO product-recovery route does not participate in the Oreans
+  evidence-bundle chain (its attested context stays unused).
+- No claim of live, perfect, universal, or 10/10 behavior is made.
