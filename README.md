@@ -44,6 +44,19 @@ verdict contract is defined in
 [docs/ACCEPTANCE_CONTRACT.md](docs/ACCEPTANCE_CONTRACT.md). Existing crate names
 do not imply that those boundaries have already been achieved.
 
+### Current Oreans two-sample mainline
+
+The current focused product goal is **perfect unpacking of exactly**
+`origin_macro` + `lunlun_software`, not `gto_launcher` and not a generic or
+universal claim. The fixed identities and fail-closed gates are documented in
+[docs/OREANS_TWO_SAMPLE_PERFECT_UNPACK_PLAN.md](docs/OREANS_TWO_SAMPLE_PERFECT_UNPACK_PLAN.md).
+A structural `Accepted`, historical oracle match, Shiguang server/icon patch,
+GTO holdout result, or retry-selected replay is not proof of perfect unpacking.
+The gate remains open until both samples pass OEP, complete IAT, TLS,
+relocations, section rebuild, behavior equivalence, and 10 consecutive isolated
+runs. **Current status: not closed; this README makes no claim of perfect or
+universal Oreans unpacking.**
+
 ### Acceptance kernel (R0B)
 
 `mida-acceptance` is an independent crate: it must not depend on production

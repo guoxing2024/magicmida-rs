@@ -7,13 +7,18 @@ repository.workspace = true
 license.workspace = true
 readme.workspace = true
 
+[features]
+default = []
+# Deliberately off-mainline: enables the isolated AHK/GTO product-recovery route.
+gto-product-recovery = ["dep:mida-packers-ahk-gto", "mida-packers-ahk-gto/gto-product-recovery"]
+
 [dependencies]
 mida-core = { path = "../core" }
 mida-pe = { path = "../pe" }
 mida-disasm = { path = "../disasm" }
 mida-tracer = { path = "../tracer" }
 mida-packers-themida = { path = "../packers/themida" }
-mida-packers-ahk-gto = { path = "../packers/ahk_gto" }
+mida-packers-ahk-gto = { path = "../packers/ahk_gto", default-features = false, optional = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
@@ -25,11 +30,3 @@ serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }
-
-# NOTE: a new binary was added for `GTO-PRODUCT-RECOVERY Route A R1` (2026-07-29).
-# This binary is OBSERVATION-ONLY: external ReadProcessMemory + VirtualQueryEx polling,
-# no DRx, no VEH, no in-process hook.  See `docs/GTO_PRODUCT_RECOVERY_ROUTE_A_R1_PLAN_20260729.md`
-# before modifying this entry.
-[[bin]]
-name = "mida_gto_product_recovery_observer"
-path = "src/bin/mida_gto_product_recovery_observer.rs"

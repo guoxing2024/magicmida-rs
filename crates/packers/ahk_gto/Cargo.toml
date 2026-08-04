@@ -1,12 +1,17 @@
 [package]
 name = "mida-packers-ahk-gto"
-version.workspace = true
-edition.workspace = true
+version = "0.1.0"
+edition = "2021"
 description = "AHK/GTO protection-family PackerPlugin (R4)"
-repository.workspace = true
-license.workspace = true
-readme.workspace = true
+repository = "https://github.com/guoxing2024/magicmida-rs"
+license = "GPL-3.0"
+readme = "../../../README.md"
+
+[features]
+default = []
+# This research route is intentionally unavailable unless explicitly opted in.
+gto-product-recovery = []
 
 [dependencies]
 mida-core = { path = "../../core" }
-tracing = { workspace = true }
+tracing = "0.1"

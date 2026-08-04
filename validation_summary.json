@@ -1,36 +1,435 @@
 {
-  "schema_version": "mida.validation-summary/v1",
-  "task": "VNEXT-BEH",
-  "status": "superseded",
-  "title": "Behavioral acceptance gate — SUPERSEDED (contract drift)",
-  "package": "mida-acceptance / mida-cli / tools/_behavior_bb_gate.py",
-  "verdict_contract": "docs/ACCEPTANCE_CONTRACT.md",
-  "roadmap": "docs/VNEXT_BEHAVIORAL_PATH.md",
-  "checks": {
-    "bb_behavioral_gate": "superseded",
-    "probe_id": "load_no_crash_v0",
-    "historical_all_compose_accepted": true,
-    "reproducible_under_current_contract": false
+  "schema_version": "mida.validation-summary/v2",
+  "as_of": "2026-08-01",
+  "task": "OREANS-TWO-SAMPLE-PERFECT-UNPACK",
+  "status": "open",
+  "title": "Oreans two-sample perfect-unpack acceptance gate",
+  "package": "mida-acceptance",
+  "gate_id": "oreans_two_sample_perfect_unpack",
+  "gate_schema_version": "mida.oreans-two-sample-gate/v8",
+  "observations_schema_version": "mida.oreans-two-sample-observations/v6",
+  "section_rebuild_evidence_schema_version": "mida.oreans-section-rebuild-evidence/v1",
+  "oep_evidence_schema_version": "mida.oreans-oep-evidence/v1",
+  "tls_evidence_schema_version": "mida.oreans-tls-evidence/v1",
+  "relocation_evidence_schema_version": "mida.oreans-relocation-evidence/v1",
+  "gate_status": "open",
+  "perfect_unpack_status": "not_completed",
+  "universal_unpack_status": "not_completed",
+  "offline_audit": {
+    "samples_executed": false,
+    "sample_binaries_opened": false,
+    "acceptance_tests_are_synthetic": true,
+    "live_unpack_executed": false
+  },
+  "required_samples": [
+    {
+      "case_id": "origin_macro",
+      "manifest": "lab/cases/v2/origin_macro.json",
+      "protected_input_sha256": "1af62999cf5be0b2f21abc39034c122a42aa46cfbfdb546faa184de37ac09ac7",
+      "protected_input_size_bytes": 5232656
+    },
+    {
+      "case_id": "lunlun_software",
+      "manifest": "lab/cases/v2/lunlun_software.json",
+      "protected_input_sha256": "8a0118d04e03752728999c845536c29215d2a626ac65845c22e3f1149de0db07",
+      "protected_input_size_bytes": 4976144
+    }
+  ],
+  "excluded_cases": [
+    "gto_launcher",
+    "xiongxiong_duokai",
+    "shiguang"
+  ],
+  "behavior_oracle_contract": {
+    "schema_version": "mida.oreans-behavior-oracle/v1",
+    "required_fields": [
+      "stimuli",
+      "observables",
+      "candidate_identity",
+      "protected_identity",
+      "verdict",
+      "reason"
+    ],
+    "pass_rules": [
+      "candidate_identity must equal the emitted candidate digest/size",
+      "protected_identity must equal the locked protected input digest/size",
+      "stimuli and observables must be non-empty",
+      "every observable verdict must be pass",
+      "verdict must be pass and reason must be non-empty"
+    ]
+  },
+  "isolated_replay_contract": {
+    "schema_version": "mida.oreans-isolated-replay/v1",
+    "attempt_count": 10,
+    "attempt_index": "exactly continuous 1..10 in record order",
+    "runner_config_digest_contract": {
+      "shape": "exactly 64 hexadecimal characters (SHA-256-shaped)",
+      "per_sample_invariant": "for each case_id, runner_config_digest must be present on all ten attempts and all ten values must be exactly identical",
+      "failure_mode": "missing, malformed, or non-uniform values fail closed; a different valid SHA-256-shaped digest on any attempt also fails closed"
+    },
+    "required_attempt_fields": [
+      "attempt_index",
+      "candidate_sha256",
+      "exit_code",
+      "signal",
+      "observable_verdict",
+      "timestamp",
+      "runner_config_digest",
+      "retry_picked"
+    ],
+    "pass_rules": [
+      "all ten records are present; missing records open the gate",
+      "candidate_sha256 matches the candidate on every attempt",
+      "exit_code is 0, signal is absent, and observable_verdict is pass",
+      "timestamp is present on every attempt",
+      "runner_config_digest is present on every attempt, is exactly 64 hexadecimal characters, and is identical across all ten attempts for the same case_id",
+      "missing, malformed, or non-uniform runner_config_digest fails closed, including a different valid SHA-256-shaped digest on any attempt",
+      "retry_picked is false; a selected retry cannot replace a failed attempt"
+    ]
+  },
+  "prerequisite_evidence_contract": {
+    "schema_version": "mida.oreans-prerequisite-evidence/v1",
+    "required_fields": [
+      "schema_version",
+      "producer",
+      "artifact_sha256",
+      "summary"
+    ],
+    "required_refs": [
+      "survival_evidence",
+      "structural_evidence",
+      "survival_evidence",
+      "structural_evidence"
+    ],
+    "pass_rules": [
+      "all non-OEP prerequisite bools must be true",
+      "every generic survival/structural evidence ref must have non-empty schema_version, producer, and summary",
+      "every generic evidence ref schema_version must exactly equal mida.oreans-prerequisite-evidence/v1",
+      "every generic evidence ref artifact_sha256 must be lowercase 64-hex SHA-256-shaped",
+      "every generic evidence ref artifact_sha256 must exactly equal the emitted candidate sha256",
+      "a caller-supplied survival/structural prerequisite bool cannot pass without its valid candidate-bound evidence ref",
+      "structured IAT evidence is validated separately and cannot be replaced by iat_complete or a generic iat_evidence ref",
+      "structured OEP evidence is validated separately and cannot be replaced by oep_recovered or a generic oep_evidence ref"
+    ],
+    "failure_mode": "missing, malformed, schema-mismatched, candidate-unbound, or legacy OEP self-certification fails closed and keeps the gate open",
+    "rejected_legacy_fields": [
+      "iat_complete",
+      "iat_evidence",
+      "oep_recovered",
+      "generic oep_evidence ref",
+      "section_rebuild_coherent",
+      "section_rebuild_evidence"
+    ]
+  },
+  "structured_oep_evidence_contract": {
+    "schema_version": "mida.oreans-oep-evidence/v1",
+    "required_per_sample": true,
+    "required_fields": [
+      "schema_version",
+      "protected_input",
+      "candidate",
+      "source",
+      "va",
+      "rva",
+      "final_entry_rva",
+      "evidence",
+      "application_oep",
+      "bootstrap_or_ambiguous",
+      "entry_rva_matches_provenance",
+      "prerequisite_passes",
+      "blocker"
+    ],
+    "allowed_source": [
+      "runtime_rip",
+      "trace"
+    ],
+    "binding_rules": [
+      "protected_input sha256 and size_bytes must match the locked manifest identity",
+      "candidate sha256 and size_bytes must match the final serialized candidate observation",
+      "rva and final_entry_rva must match the structured PE AddressOfEntryPoint",
+      "application_oep must be true, bootstrap_or_ambiguous must be false, and blocker must be null",
+      "the acceptance gate recomputes these conditions; sidecar prerequisite_passes is not trusted by itself"
+    ],
+    "rejected_legacy_fields": [
+      "oep_recovered",
+      "generic oep_evidence ref"
+    ],
+    "status": "implemented and gate-integrated; real sample evidence not produced"
+  },
+  "structured_pe_evidence_contract": {
+    "schema_version": "mida.oreans-pe-evidence/v1",
+    "api": "build_oreans_pe_evidence(candidate_bytes)",
+    "source_of_truth": "final serialized candidate PE bytes; SHA-256 and size are computed inside the acceptance kernel",
+    "covered": [
+      "PE32/PE32+ identity and header fields",
+      "section table and raw/virtual mapping",
+      "TLS/BASERELOC/EXCEPTION directory coverage",
+      "TLS callback VA-to-RVA conversion and null termination",
+      "architecture-specific relocation types and in-image targets",
+      "x64 RUNTIME_FUNCTION ranges and unwind raw backing"
+    ],
+    "required_input": "structured PE evidence is mandatory for every OreansSampleObservation; missing or invalid evidence fails closed",
+    "pass_rules": [
+      "candidate digest and byte size must be computed from the final serialized candidate bytes and exactly match the observation identity",
+      "the candidate must be a valid AMD64 PE32+ image",
+      "TLS and base-relocation directories must be present for these samples and their structured detail must be valid",
+      "section mappings, directory coverage, and internal PE consistency checks must all pass",
+      "when exception data is present, its structured detail must be internally consistent and raw-backed",
+      "legacy prerequisite bools and evidence refs cannot substitute for structured PE evidence"
+    ],
+    "failure_mode": "integer overflow, directory/raw-backing gap, unterminated callbacks, invalid relocation, or invalid/unmapped exception record fails closed",
+    "serialization": "serde Serialize/Deserialize with deny_unknown_fields",
+    "runtime_scope": "static bytes only; no sample EXE/live unpack execution",
+    "sample_evidence_status": "origin_macro and lunlun_software candidate evidence not yet produced",
+    "gate_status": "open"
+  },
+  "verdict_contract": {
+    "prerequisites": [
+      "survival",
+      "structural",
+      "structured_oep_evidence",
+      "structured_iat_evidence",
+      "structured_section_rebuild_evidence",
+      "structured_pe_evidence",
+      "structured_relocation_evidence",
+      "isolated_replay_10_of_10"
+    ],
+    "prerequisite_evidence_refs": [
+      "survival_evidence",
+      "structural_evidence",
+      "survival_evidence",
+      "structural_evidence"
+    ],
+    "isolated_replay_10_of_10_source": "ten validated continuous attempt records, not a caller-supplied boolean",
+    "final_behavior_verdict": "separate from prerequisites; must be pass",
+    "close_condition": "both origin_macro and lunlun_software observations must independently pass structured PE evidence, every other prerequisite, all ten replay attempts, and final behavior evidence",
+    "legacy_oep_self_certification": "rejected: oep_recovered and generic oep_evidence refs are not accepted as structured OEP evidence",
+    "structured_oep_evidence": "required per sample under mida.oreans-oep-evidence/v1 and independently recomputed by the gate",
+    "structured_iat_evidence": "required per sample under mida.oreans-iat-evidence/v1 and independently recomputed by the gate",
+    "structured_tls_evidence": "required per sample under mida.oreans-tls-evidence/v1 and independently recomputed by the gate",
+      "structured_relocation_evidence": "required per sample under mida.oreans-relocation-evidence/v1 and independently recomputed by the gate",
+      "structured_section_rebuild_evidence": "required per sample under mida.oreans-section-rebuild-evidence/v1; final-disk section/header/raw layout is recomputed and cross-checked by the gate"
+  },
+  "iat_implementation_status": {
+    "immutable_observed_rebuilt_report": true,
+    "dump_process_report_return_chain": true,
+    "candidate_bound_sidecar": true,
+    "gate_integration": true,
+    "status": "Candidate-bound IAT sidecar and structured gate integration are implemented and offline-accepted; real sample evidence has not been produced",
+    "scope": "observed runtime thunk values are frozen before PASS2 rewrites; rebuilt values are recorded separately; DumpProcessReport returns the report only after the final candidate and manifest are written"
   },
   "notes": [
-    "SUPERSEDED 2026-07-27 audit residual: historical B-B batch claimed Accepted via load_no_crash_v0.",
-    "Current acceptance: load_no_crash_v0 is NOT a product probe; unmanaged library path cannot Accept; dumps require sibling transform_manifest.",
-    "Do not treat this file as a live green gate. Re-run tools/_behavior_bb_gate.py after managed dumps + registered bilateral probes.",
-    "Historical batch (archival only): D:\\MidaVault\\lab\\evidence\\_beh_gate\\batch_20260724-112907_bb_gate_pin"
+    "This is a gate contract/audit result, not a claim that either sample currently passes.",
+    "A structural pass or process survival is only a prerequisite and cannot be reported as final behavior equivalence.",
+    "The gate requires exactly origin_macro and lunlun_software; excluded cases cannot fill a missing slot.",
+    "The acceptance tests are offline and synthetic; runtime/CLI must produce the behavior and replay records without the acceptance crate executing samples.",
+    "The IAT sidecar and structured IAT gate are implemented and offline-accepted, but no real candidate has been generated or accepted for either fixed sample."
   ],
-  "artifacts": [
-    "docs/AUDIT_SELF_CORRECTION_20260727.md",
-    "docs/VNEXT_BEHAVIORAL_PATH.md",
-    "tools/_behavior_bb_gate.py"
+  "iat_evidence_schema_version": "mida.oreans-iat-evidence/v1",
+  "structured_iat_evidence_contract": {
+    "schema_version": "mida.oreans-iat-evidence/v1",
+    "required_per_sample": true,
+    "required_fields": [
+      "schema_version",
+      "protected_input",
+      "candidate",
+      "fix_imports_requested",
+      "iat_evidence_present",
+      "iat_evidence_complete",
+      "iat_report",
+      "final_imports",
+      "prerequisite_passes",
+      "blocker"
+    ],
+    "report_fields": [
+      "requested_bytes",
+      "bytes_read",
+      "slot_size",
+      "slots"
+    ],
+    "slot_fields": [
+      "slot_index",
+      "slot_address",
+      "slot_rva",
+      "observed_value",
+      "rebuilt_value",
+      "slot_value",
+      "status",
+      "module_name",
+      "function_name",
+      "ordinal"
+    ],
+    "final_import_fields": [
+      "slot_rva",
+      "module_name",
+      "function_name",
+      "ordinal"
+    ],
+    "recomputed_fail_closed_rules": [
+      "protected input and final serialized candidate path, SHA-256, and size must match their bound artifacts",
+      "fix_imports_requested must be true",
+      "iat_evidence_present must equal report presence and iat_evidence_complete must equal structured report completeness",
+      "pointer size must match the structured PE PE32+ architecture",
+      "each slot must have an exact requested-byte read and requested_bytes must align to slot_size",
+      "slot coverage must be complete with continuous, unique slot_index, slot_address, and slot_rva values",
+      "slot_value must equal observed_value; stale, unresolved, short-read, and invalid-module statuses fail",
+      "resolved slots must carry valid module/function-or-ordinal metadata and at least one resolved slot is required",
+      "final imports must be non-empty, slot-unique, ASCII-lowercase by module, and function/ordinal exactly-one",
+      "resolved slots and final imports must map one-to-one; module matching is case-insensitive, function matching is exact-case, and ordinals match exactly including 0",
+      "diagnostic booleans and blocker fields must agree with the recomputed structured report and cannot self-certify a pass"
+    ],
+    "rejected_legacy_fields": [
+      "iat_complete",
+      "generic iat_evidence ref"
+    ],
+    "acceptance_tests": [
+      "oreans_two_sample_gate: 38 passed",
+      "oreans_two_sample_gate_cli: 9 passed",
+      "cargo test -p mida-acceptance --offline: all green"
+    ],
+    "status": "implemented and offline-accepted; real sample evidence not produced"
+  },
+  "structured_tls_evidence_contract": {
+    "schema_version": "mida.oreans-tls-evidence/v1",
+    "required_per_sample": true,
+    "required_fields": [
+      "schema_version",
+      "protected_input",
+      "candidate",
+      "runtime",
+      "final_candidate",
+      "preservation",
+      "reported_tls_evidence_present",
+      "reported_tls_evidence_complete",
+      "runtime_evidence_present",
+      "runtime_evidence_complete",
+      "prerequisite_passes",
+      "blockers"
+    ],
+    "recomputed_fail_closed_rules": [
+      "protected_input and candidate SHA-256/size must match their bound observation identities; path fields are diagnostic only",
+      "runtime and final pointer size must be exactly 4 or 8 and agree with PE32/PE32+",
+      "reported/runtime presence and completeness diagnostics must equal runtime directory_present and blockers.empty",
+      "runtime callback slots must be continuous with only Resolved or ZeroTerminator statuses, one final NULL terminator, and no runtime blockers",
+      "final TLS directory, raw-data range, index storage, callback list, NULL terminator, zero-fill, and characteristics must be valid and cross-matched with structured PE TLS evidence",
+      "final raw-data ranges must be raw-backed by structured PE sections; zero-size ranges are explicitly checked for image bounds",
+      "preservation individual fields, all_preserved, and blockers are recomputed from runtime/final values",
+      "all blocker vectors must be non-blank, strictly sorted, and deduplicated",
+      "sidecar prerequisite_passes and blocker empty/non-empty state must match the final recomputed TLS result"
+    ],
+    "rejected_legacy_fields": [
+      "prerequisites.tls_relocations_valid",
+      "prerequisites.tls_relocation_evidence"
+    ],
+    "acceptance_tests": [
+      "oreans_two_sample_gate: 38 passed",
+      "oreans_two_sample_gate_cli: 9 passed",
+      "cargo test -p mida-acceptance --offline: all green"
+    ],
+    "status": "implemented and offline-accepted; real sample evidence not produced"
+  },
+  "structured_relocation_evidence_contract": {
+    "schema_version": "mida.oreans-relocation-evidence/v1",
+    "required_per_sample": true,
+    "required_fields": [
+      "schema_version",
+      "protected_input",
+      "candidate",
+      "runtime",
+      "final_candidate",
+      "preservation",
+      "simulation",
+      "reported_relocation_evidence_present",
+      "reported_relocation_evidence_complete",
+      "runtime_evidence_present",
+      "runtime_evidence_complete",
+      "prerequisite_passes",
+      "blockers"
+    ],
+    "recomputed_fail_closed_rules": [
+      "protected input and candidate are re-read from disk and bound by SHA-256 and size",
+      "same-path and hard-link aliases are rejected and the sidecar is atomically replaced",
+      "runtime relocation observations are frozen before header patch, shrink, or relocation-section creation",
+      "runtime relocation values are normalized/de-relocated from the runtime image base",
+      "final relocation blocks, entries, types, targets, directory raw backing, DYNAMIC_BASE, and RELOCS_STRIPPED are independently checked",
+      "every non-ABS relocation target must be individually raw-backed, not merely inside SizeOfImage",
+      "ASLR simulation uses normalized values and pure delta arithmetic with distinct positive and negative bases",
+      "final fields are cross-checked against OreansPeEvidence.relocation_detail and diagnostic/pass fields are recomputed"
+    ],
+    "rejected_legacy_fields": [
+      "prerequisites.tls_relocations_valid",
+      "prerequisites.tls_relocation_evidence"
+    ],
+    "acceptance_tests": [
+      "oreans_two_sample_gate: 38 passed",
+      "oreans_two_sample_gate_cli: 9 passed",
+      "cargo test --workspace --offline: all green"
+    ],
+    "status": "implemented and offline-accepted; real sample evidence not produced"
+  },
+  "structured_section_rebuild_evidence_contract": {
+    "schema_version": "mida.oreans-section-rebuild-evidence/v1",
+    "filename": "<candidate>.section_rebuild_evidence.json",
+    "required_per_sample": true,
+    "required_fields": [
+      "schema_version",
+      "protected_input",
+      "candidate",
+      "machine",
+      "pe32_plus",
+      "file_alignment",
+      "section_alignment",
+      "size_of_headers",
+      "size_of_image",
+      "section_table_offset",
+      "section_table_size",
+      "entry_rva",
+      "entry_section",
+      "executable_sections",
+      "sections",
+      "directories",
+      "overlay_offset",
+      "overlay_size",
+      "section_rebuild_evidence_pass",
+      "blockers"
+    ],
+    "recomputed_fail_closed_rules": [
+      "protected input and final candidate are re-read from disk and bound by SHA-256 and size",
+      "same-path and hard-link aliases are rejected and the sidecar is atomically replaced",
+      "unknown sidecar fields are rejected",
+      "section table/header coverage, raw and virtual ranges, overlap, EOF, ordering, pointer/size alignment, SizeOfHeaders, SizeOfImage, entry section, executable/raw-backed entry, and overlay extent are independently recomputed",
+      "all PE directory coverage is checked, including the security file-offset form, and IAT/TLS/base-relocation/exception ranges are cross-checked against independent evidence",
+      "sidecar section_rebuild_evidence_pass is diagnostic only; generic section rebuild bools or refs cannot satisfy the gate"
+    ],
+    "rejected_legacy_fields": [
+      "prerequisites.section_rebuild_coherent",
+      "prerequisites.section_rebuild_evidence",
+      "gate v7",
+      "observations v5"
+    ],
+    "acceptance_tests": [
+      "oreans_two_sample_gate: 38 passed",
+      "oreans_two_sample_gate_cli: 9 passed",
+      "cargo test --workspace --offline: all green"
+    ],
+    "status": "implemented and offline-accepted; real sample evidence not produced"
+  },
+  "completed": [
+    "Structured PE evidence and OEP evidence contracts remain gate-integrated without claiming real sample success",
+    "Candidate-bound IAT sidecar mida.oreans-iat-evidence/v1 is implemented",
+    "Structured IAT and TLS evidence remain first-class in gate schema v8 / observations v6; generic self-certification is rejected",
+    "Structured relocation/ASLR evidence is first-class in gate schema v8 / observations v6; legacy gate v7/observations v5 are rejected",
+    "Structured section rebuild evidence is first-class in gate schema v8 / observations v6; generic section rebuild bool/ref self-certification is rejected",
+    "Acceptance gate independently recomputes IAT identity, fix_imports, present/report consistency, pointer size, exact reads, alignment, slot coverage/continuity/uniqueness, observed alias, status metadata, resolved>=1, final import identity/one-to-one mapping, and diagnostic consistency",
+    "Offline acceptance coverage: oreans_two_sample_gate 38 passed, CLI 9 passed, and full workspace offline tests green"
   ],
-  "gate_envelope": {
-    "bb_gate": false,
-    "superseded": true,
-    "superseded_utc": "2026-07-27T00:00:00+00:00",
-    "explicit_non_claims": [
-      "historical Accepted under load_no_crash_v0 is not current-contract Accepted",
-      "not full product business-logic equivalence",
-      "GTO still requires experimental profile; bypass dumps are diagnostic-only"
-    ]
-  }
+  "remaining_blockers": [
+    "Real candidate-bound OEP evidence for origin_macro and lunlun_software under a separately authorized future run",
+    "Real candidate-bound TLS evidence and loader behavior proof for both fixed samples",
+    "Real candidate-bound relocation/ASLR evidence and loader correctness proof for both fixed samples",
+    "Real candidate-bound structured section rebuild evidence and loader-coherent emitted bytes",
+    "Protected-vs-unpacked behavior oracle for both fixed samples",
+    "Fixed runner configuration with 10/10 isolated replay for each sample, without retry-picked results",
+    "Final user authorization is required before any real sample execution or live unpack"
+  ]
 }
