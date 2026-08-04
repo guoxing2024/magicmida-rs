@@ -5,3 +5,4 @@
 //! business decisions live here as pure functions.
 
 pub mod av_oep_handler;
+pub mod iat_trace_handler;

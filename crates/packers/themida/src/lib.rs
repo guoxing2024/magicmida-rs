@@ -80,6 +80,10 @@ pub use postprocess::{
 pub use runtime::av_oep_handler::{
     decide_av_oep, AvOepAction, AvOepInput, AvOepOutcome, AvOepQuery, AvOepState, LogLevel,
 };
+pub use runtime::iat_trace_handler::{
+    advance_to_next_slot, handle_trace_step, IatTraceAction, IatTraceQuery, IatTraceState,
+    TracePhase,
+};
 pub use text_tracer::{
     decide_text_trace_step, is_oep_already_decrypted, is_valid_x64_prologue_at,
     trace_until_real_oep, TextTraceDecision,
