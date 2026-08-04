@@ -19,6 +19,7 @@ use mida_acceptance::{
     validate_evidence_bundle, BundleCompletionMarker, OreansEvidenceBundle,
     OREANS_EVIDENCE_BUNDLE_SCHEMA_VERSION,
 };
+use mida_cli::runner_preflight::RunEvidenceContext;
 use mida_cli::unpacker::bundle_assembler::{
     assemble_evidence_bundle, AssembleRequest, EXPECTED_MEMBER_SCHEMAS,
     TRANSFORM_MANIFEST_SCHEMA_VERSION,
@@ -136,11 +137,22 @@ fn build_run_dir(tag: &str) -> RunDir {
     }
 }
 
+/// The attested evidence context the assembler draws case id, tool revision
+/// and the runner-config digest from (never caller-supplied, single-use).
+fn context(run: &RunDir) -> RunEvidenceContext {
+    RunEvidenceContext::new(
+        "origin_macro".to_string(),
+        "oreans/two-sample-mainline@test".to_string(),
+        "ab12".repeat(16),
+        run.protected.clone(),
+        run.candidate.clone(),
+        "cd34".repeat(16),
+    )
+    .expect("build evidence context")
+}
+
 fn request(run: &RunDir, output: &Path) -> AssembleRequest {
     AssembleRequest {
-        case_id: "origin_macro".to_string(),
-        tool_revision: "oreans/two-sample-mainline@test".to_string(),
-        runner_config_digest: "ab12".repeat(16),
         emitted_at: "2026-08-04T12:00:00Z".to_string(),
         protected_input: run.protected.clone(),
         candidate: run.candidate.clone(),
@@ -166,7 +178,8 @@ fn files_map(run: &RunDir) -> BTreeMap<String, Vec<u8>> {
 fn assembled_bundle_is_accepted_by_independent_validator() {
     let run = build_run_dir("happy");
     let output = run.root.join("evidence.bundle.json");
-    let written = assemble_evidence_bundle(&request(&run, &output)).expect("assemble");
+    let written =
+        assemble_evidence_bundle(&request(&run, &output), &mut context(&run)).expect("assemble");
     assert_eq!(written, output);
     assert!(output.is_file());
 
@@ -194,7 +207,8 @@ fn missing_member_fails_closed_and_writes_nothing() {
     let output = run.root.join("evidence.bundle.json");
     let mut req = request(&run, &output);
     req.members.retain(|(name, _)| name != "tls_evidence");
-    let err = assemble_evidence_bundle(&req).expect_err("missing member must fail");
+    let err =
+        assemble_evidence_bundle(&req, &mut context(&run)).expect_err("missing member must fail");
     assert!(err.to_string().contains("member set mismatch"));
     assert!(!output.exists(), "no bundle may be written on failure");
 }
@@ -206,7 +220,8 @@ fn duplicate_member_path_fails_closed() {
     let mut req = request(&run, &output);
     req.members
         .push(("oep_evidence".to_string(), run.members[0].1.clone()));
-    let err = assemble_evidence_bundle(&req).expect_err("duplicate name must fail");
+    let err =
+        assemble_evidence_bundle(&req, &mut context(&run)).expect_err("duplicate name must fail");
     assert!(err.to_string().contains("duplicate member name"));
 }
 
@@ -224,7 +239,8 @@ fn alias_member_path_fails_closed() {
             *path = alias.clone();
         }
     }
-    let err = assemble_evidence_bundle(&req).expect_err("alias member path must fail");
+    let err = assemble_evidence_bundle(&req, &mut context(&run))
+        .expect_err("alias member path must fail");
     assert!(err.to_string().contains("same file"));
 }
 
@@ -242,7 +258,7 @@ fn stale_embedded_candidate_identity_fails_closed() {
         fs::metadata(&run.candidate).unwrap().len(),
     );
     fs::write(path, stale).expect("rewrite sidecar");
-    let err = assemble_evidence_bundle(&request(&run, &output))
+    let err = assemble_evidence_bundle(&request(&run, &output), &mut context(&run))
         .expect_err("stale candidate identity must fail");
     assert!(err.to_string().contains("embeds candidate"));
     assert!(!output.exists());
@@ -261,7 +277,7 @@ fn stale_embedded_protected_identity_fails_closed() {
         fs::metadata(&run.candidate).unwrap().len(),
     );
     fs::write(path, stale).expect("rewrite sidecar");
-    let err = assemble_evidence_bundle(&request(&run, &output))
+    let err = assemble_evidence_bundle(&request(&run, &output), &mut context(&run))
         .expect_err("stale protected identity must fail");
     assert!(err.to_string().contains("embeds protected_input"));
     assert!(!output.exists());
@@ -280,8 +296,8 @@ fn schema_drift_in_member_fails_closed() {
         fs::metadata(&run.candidate).unwrap().len(),
     );
     fs::write(path, drifted).expect("rewrite sidecar");
-    let err =
-        assemble_evidence_bundle(&request(&run, &output)).expect_err("schema drift must fail");
+    let err = assemble_evidence_bundle(&request(&run, &output), &mut context(&run))
+        .expect_err("schema drift must fail");
     assert!(err.to_string().contains("schema_version"));
     assert!(!output.exists());
 }
@@ -290,19 +306,71 @@ fn schema_drift_in_member_fails_closed() {
 fn malformed_runner_digest_and_fields_fail_closed() {
     let run = build_run_dir("bad_fields");
     let output = run.root.join("evidence.bundle.json");
-    let mut req = request(&run, &output);
-    req.runner_config_digest = "not-hex".to_string();
-    let err = assemble_evidence_bundle(&req).expect_err("bad digest must fail");
-    assert!(err.to_string().contains("runner_config_digest"));
-
-    let mut req = request(&run, &output);
-    req.case_id = "origin_macro|evil".to_string();
-    let err = assemble_evidence_bundle(&req).expect_err("separator must fail");
+    // The digest is never caller-supplied: a malformed digest is rejected at
+    // RunEvidenceContext construction (the only path into the assembler).
+    assert!(
+        RunEvidenceContext::new(
+            "origin_macro".to_string(),
+            "rev".to_string(),
+            "not-hex".to_string(),
+            run.protected.clone(),
+            run.candidate.clone(),
+            "cd34".repeat(16),
+        )
+        .is_err(),
+        "malformed digest must be rejected at context construction"
+    );
+    // A case id with a canonical-hash separator is rejected by the assembler.
+    let mut bad = context(&run);
+    bad.case_id = "origin_macro|evil".to_string();
+    let err = assemble_evidence_bundle(&request(&run, &output), &mut bad)
+        .expect_err("separator must fail");
     assert!(
         err.to_string().contains("case_id"),
         "unexpected error: {err:?}"
     );
     assert!(!output.exists());
+}
+
+/// P6.3-D (#13): the bundle's runner-config digest must equal the attested
+/// launch-attestation digest carried by the single-use evidence context.
+#[test]
+fn bundle_digest_equals_attested_context_digest() {
+    let run = build_run_dir("digest_chain");
+    let output = run.root.join("evidence.bundle.json");
+    let mut ctx = context(&run);
+    let expected_digest = ctx.digest().to_string();
+    let written = assemble_evidence_bundle(&request(&run, &output), &mut ctx).expect("assemble");
+    let bundle = read_bundle(&written);
+    assert_eq!(
+        bundle.runner_config_digest, expected_digest,
+        "bundle digest must equal the launch attestation digest"
+    );
+    assert_eq!(bundle.case_id, "origin_macro");
+    assert_eq!(bundle.tool_revision, "oreans/two-sample-mainline@test");
+    let verdict = validate_evidence_bundle(&bundle, &files_map(&run));
+    assert!(verdict.valid, "reasons: {:?}", verdict.reasons);
+}
+
+/// P6.3-D (#14): the attested context is a one-time authorization — a
+/// second assemble with the same context must fail closed.
+#[test]
+fn attested_context_is_single_use() {
+    let run = build_run_dir("single_use");
+    let output = run.root.join("evidence.bundle.json");
+    let mut ctx = context(&run);
+    assemble_evidence_bundle(&request(&run, &output), &mut ctx).expect("first assemble");
+    let second = run.root.join("evidence.bundle.again.json");
+    let err = assemble_evidence_bundle(&request(&run, &second), &mut ctx)
+        .expect_err("second assemble must be refused");
+    assert!(
+        err.to_string().contains("already consumed"),
+        "unexpected error: {err:?}"
+    );
+    assert!(
+        !second.exists(),
+        "a consumed authorization must not produce a second bundle"
+    );
 }
 
 #[test]
@@ -320,7 +388,8 @@ fn restart_recovers_over_corrupt_destination_and_stale_temp() {
     assert!(parsed.is_err(), "leftover temp is never a valid bundle");
 
     // The next assemble replaces the corrupt destination atomically.
-    assemble_evidence_bundle(&request(&run, &output)).expect("restart assemble");
+    assemble_evidence_bundle(&request(&run, &output), &mut context(&run))
+        .expect("restart assemble");
     let bundle = read_bundle(&output);
     let verdict = validate_evidence_bundle(&bundle, &files_map(&run));
     assert!(verdict.valid, "reasons: {:?}", verdict.reasons);

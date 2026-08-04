@@ -29,6 +29,17 @@
 //!
 //! A partial bundle is never produced: missing members abort the assemble
 //! with an error instead of emitting a `partial` marker.
+//!
+//! P6.3-D: the manifest's `runner_config_digest`, `case_id` and
+//! `tool_revision` are never caller-supplied — they come exclusively from
+//! the attested single-use [`crate::runner_preflight::RunEvidenceContext`]
+//! produced by the launch attestation, and the assemble consumes it
+//! (one-time authorization). The production chain is:
+//!
+//! ```text
+//! launch attestation -> RunEvidenceContext -> sidecar producers
+//! -> atomic bundle assembler -> v8 gate consumer
+//! ```
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -104,11 +115,13 @@ pub struct OreansEvidenceBundleManifest {
 }
 
 /// Inputs for one bundle assemble.
+///
+/// P6.3-D: `case_id`, `tool_revision` and `runner_config_digest` are NOT
+/// caller-supplied — they come exclusively from the attested
+/// [`crate::runner_preflight::RunEvidenceContext`] passed alongside the
+/// request, which is single-use (consumed by the assemble).
 #[derive(Debug, Clone)]
 pub struct AssembleRequest {
-    pub case_id: String,
-    pub tool_revision: String,
-    pub runner_config_digest: String,
     pub emitted_at: String,
     pub protected_input: PathBuf,
     pub candidate: PathBuf,
@@ -298,25 +311,40 @@ fn check_embedded_identity(
 
 /// Assemble the bundle manifest for one run and write it atomically.
 ///
+/// P6.3-D: the runner-config digest, case id and tool revision come
+/// exclusively from `context` (the attested single-use evidence context);
+/// no caller-supplied digest is accepted. The context is consumed by the
+/// assemble — any second use fails closed (one-time authorization).
+///
 /// Returns the output path on success. On any failure nothing is written to
 /// the output path (a leftover `.tmp-*` file may exist and is harmless).
-pub fn assemble_evidence_bundle(request: &AssembleRequest) -> anyhow::Result<PathBuf> {
-    validate_plain_field(&request.case_id, "case_id", false)?;
-    validate_plain_field(&request.tool_revision, "tool_revision", false)?;
+pub fn assemble_evidence_bundle(
+    request: &AssembleRequest,
+    context: &mut crate::runner_preflight::RunEvidenceContext,
+) -> anyhow::Result<PathBuf> {
+    // One-time authorization: the attested context can back exactly one
+    // bundle. A second assemble (or any use after the first) fails closed.
+    context.consume()?;
+
+    let case_id = context.case_id.clone();
+    let tool_revision = context.tool_revision.clone();
+    let runner_config_digest = context.runner_config_digest.clone();
+    validate_plain_field(&case_id, "case_id", false)?;
+    validate_plain_field(&tool_revision, "tool_revision", false)?;
     validate_plain_field(&request.emitted_at, "emitted_at", true)?;
-    if request.case_id.trim().is_empty() {
+    if case_id.trim().is_empty() {
         bail!("case_id must be non-empty");
     }
-    if request.tool_revision.trim().is_empty() {
+    if tool_revision.trim().is_empty() {
         bail!("tool_revision must be non-empty");
     }
     if request.emitted_at.trim().is_empty() {
         bail!("emitted_at must be non-empty");
     }
-    if !is_64_hex(&request.runner_config_digest) {
+    if !is_64_hex(&runner_config_digest) {
         bail!(
             "runner_config_digest must be exactly 64 hex chars, got {:?}",
-            request.runner_config_digest
+            runner_config_digest
         );
     }
 
@@ -401,9 +429,9 @@ pub fn assemble_evidence_bundle(request: &AssembleRequest) -> anyhow::Result<Pat
     let members_sha256 = canonical_members_hash(&members);
     let mut manifest = OreansEvidenceBundleManifest {
         schema_version: BUNDLE_SCHEMA_VERSION.to_string(),
-        case_id: request.case_id.clone(),
-        tool_revision: request.tool_revision.clone(),
-        runner_config_digest: request.runner_config_digest.clone(),
+        case_id,
+        tool_revision,
+        runner_config_digest,
         emitted_at: request.emitted_at.clone(),
         completion_marker: BundleCompletionMarker::Complete,
         protected_input: BundleArtifactIdentity {

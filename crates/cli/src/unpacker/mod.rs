@@ -152,10 +152,9 @@ pub fn unpack(
     // fixed-mode policy for this input. A hand-written `ready` JSON is
     // never an authorization credential. Runs without --preflight-dir keep
     // legacy behaviour.
-    // P6.3-D will consume the attested evidence context for sidecar and
-    // bundle production; until then it is intentionally retained (and
-    // consumed) only after a successful gated run.
-    let _evidence_ctx: Option<crate::runner_preflight::RunEvidenceContext> = None;
+    // P6.3-D: the attested evidence context flows into sidecar and bundle
+    // production after a successful gated run.
+    let mut evidence_ctx: Option<crate::runner_preflight::RunEvidenceContext> = None;
     if let Some(preflight_dir) = preflight_dir {
         let envelope = crate::runner_preflight::RunnerConfigEnvelope::read(preflight_dir)
             .map_err(|e| anyhow!("launch blocked: runner-config envelope unavailable: {e:#}"))?;
@@ -201,8 +200,8 @@ pub fn unpack(
             "Launch attestation: Ready — case {} bound to envelope digest {}",
             context.case_id, context.runner_config_digest
         );
+        evidence_ctx = Some(context);
     }
-
     // ---- step 2: parse PE header ----
     log::log(LogType::Info, &format!("Loading: {}", input.display()));
 
@@ -271,6 +270,9 @@ pub fn unpack(
     }
 
     // ---- D4: independent GTO host (no ThemidaState) ----
+    // (The Oreans evidence-bundle chain does not apply to the AHK/GTO
+    // product-recovery route; a gated GTO run keeps its attested context
+    // unused.)
     if selected_family == "ahk_gto" {
         log::log(
             LogType::Info,
@@ -503,7 +505,7 @@ pub fn unpack(
     // transfer into decrypted .text, then go straight to the dump phase.
     // Body: `post_attach::run_post_attach_path`.
     if post_attach_mode {
-        return run_post_attach_path(
+        run_post_attach_path(
             &mut dbg,
             &mut state,
             &mut pe,
@@ -521,7 +523,14 @@ pub fn unpack(
             capture_policy,
             input,
             &output_path,
-        );
+        )?;
+        // P6.3-D: after a successful gated run, produce the evidence bundle
+        // from the attested single-use context.
+        if let Some(ref mut ctx) = evidence_ctx {
+            crate::runner_preflight::complete_run_evidence(ctx, None, &output_path)
+                .map_err(|e| anyhow!("evidence bundle assembly failed after a gated run: {e:#}"))?;
+        }
+        return Ok(());
     }
 
     // The main debug loop runs until we've found the OEP and finished IAT.
@@ -1483,6 +1492,13 @@ pub fn unpack(
         &plugin_ctx.oep_provenance,
         post_loop_advice,
     )?;
+
+    // P6.3-D: after a successful gated run, produce the evidence bundle
+    // from the attested single-use context (seven members, atomic).
+    if let Some(ref mut ctx) = evidence_ctx {
+        crate::runner_preflight::complete_run_evidence(ctx, None, &output_path)
+            .map_err(|e| anyhow!("evidence bundle assembly failed after a gated run: {e:#}"))?;
+    }
 
     log::log(LogType::Good, "Done.");
     Ok(())

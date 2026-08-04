@@ -807,6 +807,132 @@ pub fn envelope_runner_config_digest(output_dir: &Path) -> anyhow::Result<String
     Ok(envelope.runner_config_digest.to_lowercase())
 }
 
+// ---------------------------------------------------------------------------
+// P6.3-D: production evidence/bundle data flow
+// ---------------------------------------------------------------------------
+
+/// Evidence sidecar file name appended to the candidate file name
+/// (must match the producers in `unpacker/{oep,iat,tls,relocation,
+/// section_rebuild}_evidence.rs`).
+fn sidecar_path(candidate: &Path, suffix: &str) -> anyhow::Result<PathBuf> {
+    let file_name = candidate
+        .file_name()
+        .ok_or_else(|| anyhow!("candidate path has no file name"))?;
+    let mut name = file_name.to_os_string();
+    name.push(suffix);
+    Ok(candidate.with_file_name(name))
+}
+
+/// The seven bundle members for a completed gated run, named exactly as the
+/// sidecar producers and the dumper write them:
+///
+/// - the five structured evidence sidecars (`<candidate>.<kind>_evidence.json`)
+/// - the bound transform manifest (`<candidate>.transform_manifest.json`,
+///   written by the dumper)
+/// - the PE evidence (`<candidate>.pe_evidence.json`, produced through the
+///   independent acceptance binary)
+fn evidence_members(candidate: &Path) -> anyhow::Result<Vec<(String, PathBuf)>> {
+    let mut members = Vec::with_capacity(7);
+    for (name, suffix) in [
+        ("oep_evidence", ".oep_evidence.json"),
+        ("iat_evidence", ".iat_evidence.json"),
+        ("tls_evidence", ".tls_evidence.json"),
+        ("relocation_evidence", ".relocation_evidence.json"),
+        ("section_rebuild_evidence", ".section_rebuild_evidence.json"),
+    ] {
+        members.push((name.to_string(), sidecar_path(candidate, suffix)?));
+    }
+    members.push((
+        "transform_manifest".to_string(),
+        candidate.with_extension("transform_manifest.json"),
+    ));
+    members.push((
+        "pe_evidence".to_string(),
+        candidate.with_extension("pe_evidence.json"),
+    ));
+    Ok(members)
+}
+
+/// Emit the PE evidence sidecar through the independent acceptance binary
+/// (`mida-acceptance oreans-pe-evidence <candidate> --report <dest>`).
+/// Exit 0/2 are verifiable outcomes; anything else fails closed.
+fn emit_pe_evidence(
+    candidate: &Path,
+    destination: &Path,
+    acceptance_bin: Option<&Path>,
+) -> anyhow::Result<()> {
+    let verifier = acceptance_bin
+        .map(Path::to_path_buf)
+        .unwrap_or_else(resolve_acceptance_bin);
+    let status = Command::new(&verifier)
+        .arg("oreans-pe-evidence")
+        .arg(candidate)
+        .arg("--report")
+        .arg(destination)
+        .status()
+        .with_context(|| format!("spawn acceptance binary {verifier:?} for PE evidence"))?;
+    match status.code() {
+        Some(0) => Ok(()),
+        Some(2) => bail!(
+            "PE evidence for {} was rejected by the acceptance binary (exit 2); \
+             no bundle can be assembled around it",
+            candidate.display()
+        ),
+        other => bail!(
+            "acceptance binary {verifier:?} terminated abnormally ({other:?}) while \
+             producing PE evidence for {}",
+            candidate.display()
+        ),
+    }
+}
+
+/// P6.3-D production chain driver: after a successful gated run, collect
+/// the seven evidence members (five sidecar producers + transform manifest
+/// + PE evidence via the acceptance binary), verify they are all present
+/// and bound, and assemble the atomic bundle from the single-use attested
+/// context. The bundle's runner-config digest always equals the launch
+/// attestation digest.
+///
+/// `candidate` is the actual run output path (member files live next to
+/// it); the bundle identity (protected input / candidate) comes from the
+/// attestation context. Returns the bundle manifest path.
+pub fn complete_run_evidence(
+    context: &mut RunEvidenceContext,
+    acceptance_bin: Option<&Path>,
+    candidate: &Path,
+) -> anyhow::Result<PathBuf> {
+    let members = evidence_members(candidate)?;
+    let pe_evidence_path = candidate.with_extension("pe_evidence.json");
+    emit_pe_evidence(candidate, &pe_evidence_path, acceptance_bin)?;
+    for (name, path) in &members {
+        if !path.is_file() {
+            bail!(
+                "evidence member {name} is missing at {}; refusing to assemble a \
+                 Complete bundle",
+                path.display()
+            );
+        }
+    }
+    let bundle_output = candidate.with_extension("bundle.json");
+    let emitted_at = {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        format!("{secs}")
+    };
+    let request = crate::unpacker::bundle_assembler::AssembleRequest {
+        emitted_at,
+        protected_input: context.protected_input.clone(),
+        candidate: context.candidate.clone(),
+        members,
+        output: bundle_output.clone(),
+    };
+    crate::unpacker::bundle_assembler::assemble_evidence_bundle(&request, context)?;
+    Ok(bundle_output)
+}
+
 /// SHA-256 (lowercase hex) of `path` — the CLI binary identity.
 pub fn sha256_file(path: &Path) -> anyhow::Result<String> {
     use sha2::{Digest, Sha256};
