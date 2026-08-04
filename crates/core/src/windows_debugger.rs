@@ -36,7 +36,7 @@ use crate::process::{
 };
 
 // ---------------------------------------------------------------------------
-// ScopedThreadHandle — RAII guard for OpenThread-returned handles
+// ScopedThreadHandle 闁?RAII guard for OpenThread-returned handles
 // ---------------------------------------------------------------------------
 
 /// RAII guard around a thread `HANDLE` returned by `OpenThread`.
@@ -47,7 +47,7 @@ use crate::process::{
 /// `GetThreadContext` / `SetThreadContext` call fails.
 ///
 /// **Do not** wrap handles that come from `CREATE_THREAD_DEBUG_EVENT` or
-/// `CreateProcessW` — those are owned by [`WindowsDebugger::threads`] and
+/// `CreateProcessW` 闁?those are owned by [`WindowsDebugger::threads`] and
 /// [`WindowsDebugger::process`] respectively and are closed by their owners.
 /// Use [`ScopedThreadHandle::new`] exclusively for handles you opened
 /// yourself with `OpenThread`.
@@ -67,7 +67,7 @@ impl ScopedThreadHandle {
 
     /// Borrow the underlying `HANDLE` for a Windows API call.
     ///
-    /// The returned `HANDLE` is only valid for the lifetime of this guard —
+    /// The returned `HANDLE` is only valid for the lifetime of this guard 闁?
     /// callers must not store it beyond the guard's drop.
     pub(crate) fn as_raw(&self) -> HANDLE {
         self.handle
@@ -80,7 +80,7 @@ impl Drop for ScopedThreadHandle {
         // owned by this guard.  CloseHandle releases it exactly once.  Invalid
         // handles (e.g. from OpenThread returning a sentinel on failure) are
         // skipped because CloseHandle against an invalid handle is a no-op
-        // that still sets ERROR_INVALID_HANDLE — we avoid the noise.
+        // that still sets ERROR_INVALID_HANDLE 闁?we avoid the noise.
         if !self.handle.is_invalid() {
             unsafe {
                 let _ = CloseHandle(self.handle);
@@ -101,13 +101,13 @@ impl Drop for ScopedThreadHandle {
 pub struct WindowsDebugger {
     /// Target process information (handles, pid, image base, etc.
     process: TargetProcess,
-    /// Hardware breakpoints (DR0–DR3). `None` means the slot is free.
+    /// Hardware breakpoints (DR0闁炽儲寮碦3). `None` means the slot is free.
     hw_breakpoints: [Option<HwBreakpoint>; 4],
-    /// Software breakpoints: address → original byte.
+    /// Software breakpoints: address 闁?original byte.
     soft_breakpoints: HashMap<usize, u8>,
-    /// Registered threads: thread_id → thread handle.
+    /// Registered threads: thread_id 闁?thread handle.
     threads: HashMap<u32, HANDLE>,
-    /// How the target came under the debugger's control — the single source
+    /// How the target came under the debugger's control 闁?the single source
     /// of truth for `Drop` cleanup.  Separates process **ownership** (did we
     /// `CreateProcessW` it?) from debug-port presence, so an owned
     /// post-attach launch is terminated (not detached) on `Drop`.
@@ -115,7 +115,7 @@ pub struct WindowsDebugger {
     /// Tracks the explicit one-time resume required by post-attach launch
     /// mode (owned, no debug port from `t=0`).
     post_attach_resumed: bool,
-    /// Exactly-once pending debug-event identity (Wait → Continue contract).
+    /// Exactly-once pending debug-event identity (Wait 闁?Continue contract).
     lifecycle: DebugEventLifecycle,
 }
 
@@ -242,7 +242,7 @@ impl WindowsDebugger {
         self.process.image_base
     }
 
-    /// Return how the target came under the debugger's control — the single
+    /// Return how the target came under the debugger's control 闁?the single
     /// source of truth for `Drop` cleanup.
     pub fn ownership(&self) -> ProcessOwnership {
         self.ownership
@@ -253,20 +253,20 @@ impl WindowsDebugger {
     // ------------------------------------------------------------------
 
     /// Return the address of the hardware breakpoint in the given slot
-    /// (0–3 → DR0–DR3), or `None` if the slot is empty.
+    /// (0闁? 闁?DR0闁炽儲寮碦3), or `None` if the slot is empty.
     ///
     /// Used by the unpack loop to compare an incoming exception address
     /// against the installed CloseHandle / CorExeMain BP without needing
     /// write access to the breakpoint table.
     pub fn hw_breakpoint_addr(&self, slot: usize) -> Option<u64> {
-        debug_assert!(slot < 4, "slot must be 0–3");
+        debug_assert!(slot < 4, "slot must be 0闁?");
         self.hw_breakpoints
             .get(slot)
             .and_then(|opt| opt.as_ref())
             .map(|bp| bp.address)
     }
 
-    /// Return `true` if there is any enabled hardware breakpoint — used by the
+    /// Return `true` if there is any enabled hardware breakpoint 闁?used by the
     /// CreateThread handler to decide whether it's worth trying to propagate
     /// DR state to the new thread.  Spawning threads in a target that holds no
     /// hardware breakpoint is the common case (e.g. every CRT worker thread
@@ -297,7 +297,7 @@ impl WindowsDebugger {
         CONTEXT_ALL_X86
     }
 
-    /// Context flags for reading only debug registers (DR0–DR7).
+    /// Context flags for reading only debug registers (DR0闁炽儲寮碦7).
     #[cfg(target_arch = "x86_64")]
     fn debug_registers_flags() -> CONTEXT_FLAGS {
         CONTEXT_DEBUG_REGISTERS_AMD64
@@ -332,7 +332,7 @@ impl WindowsDebugger {
     // Hardware breakpoint management
     // ------------------------------------------------------------------
 
-    /// Set a hardware breakpoint in the given slot (0–3 → DR0–DR3).
+    /// Set a hardware breakpoint in the given slot (0闁? 闁?DR0闁炽儲寮碦3).
     ///
     /// This method suspends the given thread, reads its debug registers,
     /// installs the breakpoint, writes the registers back, and resumes
@@ -348,245 +348,199 @@ impl WindowsDebugger {
         address: usize,
         bp_type: HwbpType,
     ) -> Result<(), CoreError> {
-        debug_assert!(slot < 4, "slot must be 0–3");
+        debug_assert!(slot < 4, "slot must be 0?3");
 
-        // Check that the slot is free.
         if self.hw_breakpoints[slot]
             .as_ref()
             .is_some_and(|bp| bp.is_set())
         {
-            trace!(
-                slot,
-                "set_hw_breakpoint: slot already has an active BP, refusing to overwrite"
-            );
             return Err(CoreError::HwbpSlotInUse(slot));
         }
 
-        // Install the breakpoint structure in the given slot.
-        self.hw_breakpoints[slot] = Some(HwBreakpoint {
+        let previous = self.hw_breakpoints.clone();
+        let mut desired = previous.clone();
+        desired[slot] = Some(HwBreakpoint {
             address: address as u64,
             bp_type,
             disabled: false,
         });
+        self.apply_debug_registers_all(&desired, &previous)?;
+        self.hw_breakpoints = desired;
 
-        // Update debug registers on every registered thread.  We attempt this
-        // for ALL threads but tolerate per-thread failures: a thread the
-        // debugger lacks THREAD_SUSPEND_RESUME / THREAD_GET_CONTEXT rights
-        // for (common with worker threads spawned by protectors such as
-        // Themida) is logged and the remaining threads are still updated.
-        // The breakpoint stays installed on the slot either way.
-        //
-        // Only apply to the main thread on the very first HW-BP install.
-        // The rest of the threads get synced on subsequent install/clear
-        // operations.  This matches Pascal's flow: during CREATE_PROCESS
-        // there is only FThreads[main_thread_id], and the kernel has the
-        // main thread suspended on the initial breakpoint so we can
-        // write DR0 without disturbing a different running thread.
-        // Only apply to the main thread on the very first HW-BP install.
-        // Subsequent install/clear/reset calls hit this path only after
-        // worker threads have already failed to resolve their DR once, so
-        // we keep the original all-threads behaviour for non-initial calls.
-        for &thread_id in self.threads.keys() {
-            let is_initial = self.hw_breakpoints.iter().filter(|s| s.is_some()).count() <= 1;
-            if is_initial && thread_id != self.process.main_thread_id {
-                continue;
-            }
-            if let Err(e) = self.apply_debug_registers_thread(thread_id) {
-                warn!(thread_id, error = %e, "failed to apply DR state to thread on HW-BP set");
-            }
-        }
-
-        debug!(
-            slot, %address, ?bp_type,
-            "Hardware breakpoint set (slot {})",
-            slot
-        );
+        debug!(slot, %address, ?bp_type, "Hardware breakpoint set");
         Ok(())
     }
 
     /// Clear (remove) a hardware breakpoint from the given slot.
-    ///
-    /// Zeros the corresponding DR register and clears the enable bit in DR7
-    /// for all registered threads.
     pub fn clear_hw_breakpoint(&mut self, slot: usize) -> Result<(), CoreError> {
-        debug_assert!(slot < 4, "slot must be 0–3");
+        debug_assert!(slot < 4, "slot must be 0?3");
 
-        self.hw_breakpoints[slot] = None;
-
-        // Update debug registers on every registered thread — tolerate the
-        // same per-thread partial-failure pattern as `set_hw_breakpoint`.
-        for &thread_id in self.threads.keys() {
-            if let Err(e) = self.apply_debug_registers_thread(thread_id) {
-                warn!(thread_id, error = %e, "failed to apply DR state to thread on HW-BP clear");
-            }
+        let previous = self.hw_breakpoints.clone();
+        if previous[slot].is_none() {
+            return Ok(());
         }
+        let mut desired = previous.clone();
+        desired[slot] = None;
+        self.apply_debug_registers_all(&desired, &previous)?;
+        self.hw_breakpoints = desired;
 
-        debug!(slot, "Hardware breakpoint cleared (slot {})", slot);
+        debug!(slot, "Hardware breakpoint cleared");
         Ok(())
     }
 
     /// Disable a hardware breakpoint without removing its configuration.
-    ///
-    /// Sets `disabled = true` on the matching slot and clears only the
-    /// enable bit in DR7.  The DR address register is preserved so the
-    /// breakpoint can be re-enabled later via [`reset_hw_breakpoints`].
-    ///
-    /// Returns an error if no breakpoint is found at the given slot, or
-    /// if the slot is already disabled.
     pub fn disable_hw_breakpoint(&mut self, slot: usize) -> Result<(), CoreError> {
-        debug_assert!(slot < 4, "slot must be 0–3");
+        debug_assert!(slot < 4, "slot must be 0?3");
 
-        match &mut self.hw_breakpoints[slot] {
-            Some(bp) if !bp.disabled => {
-                bp.disabled = true;
-            }
-            Some(_) => {
-                // Already disabled — nothing to do.
-                trace!(slot, "HW breakpoint slot {} already disabled", slot);
-                return Ok(());
-            }
-            None => {
-                // No breakpoint in this slot — nothing to disable.
-                trace!(
-                    slot,
-                    "HW breakpoint slot {} is empty, nothing to disable",
-                    slot
-                );
-                return Ok(());
-            }
+        let previous = self.hw_breakpoints.clone();
+        let Some(bp) = previous[slot].as_ref() else {
+            return Ok(());
+        };
+        if bp.disabled {
+            return Ok(());
         }
-
-        // Update debug registers on every registered thread — tolerate the
-        // same per-thread partial-failure pattern as `set_hw_breakpoint`.
-        for &thread_id in self.threads.keys() {
-            if let Err(e) = self.apply_debug_registers_thread(thread_id) {
-                warn!(thread_id, error = %e, "failed to apply DR state to thread on HW-BP disable");
-            }
+        let mut desired = previous.clone();
+        if let Some(bp) = desired[slot].as_mut() {
+            bp.disabled = true;
         }
+        self.apply_debug_registers_all(&desired, &previous)?;
+        self.hw_breakpoints = desired;
 
-        debug!(slot, "Hardware breakpoint disabled (slot {})", slot);
+        debug!(slot, "Hardware breakpoint disabled");
         Ok(())
     }
 
     /// Re-enable all previously disabled hardware breakpoints.
-    ///
-    /// Corresponds to `EnableBreakpoints` / `ResetHWBP` in the reference
-    /// Pascal implementation.  Called after a single-step completes when
-    /// the debugger has temporarily stepped over an execute-type hardware
-    /// breakpoint.
-    ///
-    /// If no breakpoints are disabled this is a no-op.
     pub fn reset_hw_breakpoints(&mut self) -> Result<(), CoreError> {
-        let any_disabled = self
-            .hw_breakpoints
-            .iter()
-            .any(|bp| bp.as_ref().is_some_and(|b| b.disabled));
-
-        if !any_disabled {
-            trace!("No disabled HW breakpoints to reset");
+        let previous = self.hw_breakpoints.clone();
+        let mut desired = previous.clone();
+        let mut changed = false;
+        for bp in desired.iter_mut().flatten() {
+            if bp.disabled {
+                bp.disabled = false;
+                changed = true;
+            }
+        }
+        if !changed {
             return Ok(());
         }
 
-        // Re-enable all disabled slots.
-        for ref mut b in self.hw_breakpoints.iter_mut().flatten() {
-            b.disabled = false;
-        }
-
-        // Update debug registers on every registered thread — tolerate the
-        // same per-thread partial-failure pattern as `set_hw_breakpoint`.
-        for &thread_id in self.threads.keys() {
-            if let Err(e) = self.apply_debug_registers_thread(thread_id) {
-                warn!(thread_id, error = %e, "failed to apply DR state to thread on HW-BP reset");
-            }
-        }
-
+        self.apply_debug_registers_all(&desired, &previous)?;
+        self.hw_breakpoints = desired;
         debug!("All disabled hardware breakpoints reset");
         Ok(())
     }
 
-    /// Apply the current hardware breakpoint state to the debug registers
-    /// of a single thread.
+    /// Apply a desired DR state to every registered thread transactionally.
     ///
-    /// Suspend → get context → write DR0–DR7 → set context → resume.
-    ///
-    /// This is the register-level primitive used by the public
-    /// `set_hw_breakpoint` / `clear_hw_breakpoint` / `reset_hw_breakpoints`
-    /// methods (which iterate over every registered thread internally).
-    /// It is exposed publicly so that callers who learn of a thread out of
-    /// band (for example, via a `CREATE_THREAD_DEBUG_EVENT`) can bring that
-    /// thread up to date with the current breakpoint configuration.
+    /// The software table is committed by the caller only after every thread
+    /// succeeds. Already-updated threads are rolled back to `rollback` when a
+    /// later thread fails; rollback failure is included in the returned error.
+    fn apply_debug_registers_all(
+        &self,
+        desired: &[Option<HwBreakpoint>; 4],
+        rollback: &[Option<HwBreakpoint>; 4],
+    ) -> Result<(), CoreError> {
+        let thread_ids: Vec<u32> = self.threads.keys().copied().collect();
+        let mut applied = Vec::with_capacity(thread_ids.len());
+        for thread_id in thread_ids {
+            if let Err(apply_error) =
+                self.apply_debug_registers_thread_for_state(thread_id, desired)
+            {
+                let mut rollback_errors = Vec::new();
+                for applied_tid in applied.into_iter().rev() {
+                    if let Err(error) =
+                        self.apply_debug_registers_thread_for_state(applied_tid, rollback)
+                    {
+                        rollback_errors.push(format!("tid={applied_tid}: {error}"));
+                    }
+                }
+                if rollback_errors.is_empty() {
+                    return Err(apply_error);
+                }
+                return Err(CoreError::DebugState(format!(
+                    "hardware breakpoint transaction failed: {apply_error}; rollback failed for {}",
+                    rollback_errors.join(", ")
+                )));
+            }
+            applied.push(thread_id);
+        }
+        Ok(())
+    }
+
+    /// Apply the current hardware breakpoint state to one thread.
     pub fn apply_debug_registers_thread(&self, thread_id: u32) -> Result<(), CoreError> {
+        self.apply_debug_registers_thread_for_state(thread_id, &self.hw_breakpoints)
+    }
+
+    /// Perform one complete Suspend/Get/Set/Resume transaction for a thread.
+    fn apply_debug_registers_thread_for_state(
+        &self,
+        thread_id: u32,
+        state: &[Option<HwBreakpoint>; 4],
+    ) -> Result<(), CoreError> {
         use windows::Win32::System::Threading::{
-            OpenThread, THREAD_GET_CONTEXT, THREAD_SET_CONTEXT,
+            OpenThread, ResumeThread, SuspendThread, THREAD_GET_CONTEXT, THREAD_SET_CONTEXT,
+            THREAD_SUSPEND_RESUME,
         };
 
-        // Build a CONTEXT populated with ONLY debug registers.  We deliberately
-        // skip GetThreadContext: on modern Windows (10/11) GetThreadContext
-        // against a thread whose protector is still mutating the TEB / PEB-Ldr
-        // trips ERROR_PARTIAL_COPY (0x80070256).  SetThreadContext with a
-        // pre-populated CONTEXT succeeds because the kernel has no need to
-        // thread-walk — it only writes the debug registers we have asked it to
-        // write.
-        // SAFETY: CONTEXT is repr(C); zeroed() produces a valid all-zero CONTEXT that the Windows APIs accept and overwrite.
-        let dr_ctx = unsafe {
-            let mut c: CONTEXT = std::mem::zeroed();
-            c.ContextFlags = Self::debug_registers_flags();
-            self.write_debug_registers(&mut c);
-            c
+        let raw = unsafe {
+            OpenThread(
+                THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME,
+                false,
+                thread_id,
+            )
+            .map_err(|e| CoreError::Windows(e.code().0 as u32))?
         };
-
-        // Try a fresh OpenThread handle first.  This handle is owned by us
-        // and MUST be closed; wrap it in ScopedThreadHandle so it is released
-        // on any early return.  The thread-table handle (if any) is borrowed
-        // from self.threads and must NOT be closed here — its lifetime is
-        // managed by WindowsDebugger::drop / ExitThread bookkeeping.
-        // SAFETY: OpenThread returns a fresh valid HANDLE; thread_id comes from a registered debug thread.
-        let open_thread_handle =
-            unsafe { OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, false, thread_id).ok() };
-        let scoped = open_thread_handle.map(ScopedThreadHandle::new);
-
-        // Borrowed handle from the thread table — do NOT close this one.
-        let borrowed_handle = self.thread_handle(thread_id).ok();
-
-        // Try the OpenThread handle first (if we got one) — it typically has
-        // THREAD_SET_CONTEXT rights whereas the CREATE_THREAD_DEBUG_EVENT
-        // handle sometimes does not.
-        if let Some(ref g) = scoped {
-            // SAFETY: g wraps a fresh OpenThread handle with THREAD_SET_CONTEXT rights; dr_ctx is a properly initialised CONTEXT.
-            unsafe {
-                if SetThreadContext(g.as_raw(), &dr_ctx).is_ok() {
-                    return Ok(());
-                }
-            }
+        let handle = ScopedThreadHandle::new(raw);
+        let suspended = unsafe { SuspendThread(handle.as_raw()) };
+        if suspended == u32::MAX {
+            return Err(CoreError::Windows(unsafe { GetLastError() }.0));
         }
 
-        // Fall back to the borrowed table handle.  We pass the raw value to
-        // SetThreadContext but do NOT close it here — it remains owned by
-        // self.threads.
-        if let Some(h) = borrowed_handle {
-            // SAFETY: h is a valid thread handle from CREATE_THREAD_DEBUG_EVENT; dr_ctx is a properly initialised CONTEXT.  We do not close h.
+        let operation = (|| {
+            let mut ctx: CONTEXT = unsafe { std::mem::zeroed() };
+            ctx.ContextFlags = Self::debug_registers_flags();
             unsafe {
-                if SetThreadContext(h, &dr_ctx).is_ok() {
-                    return Ok(());
-                }
+                GetThreadContext(handle.as_raw(), &mut ctx)
+                    .map_err(|e| CoreError::Windows(e.code().0 as u32))?;
             }
-        }
+            Self::write_debug_registers_for_state(&mut ctx, state);
+            unsafe {
+                SetThreadContext(handle.as_raw(), &ctx)
+                    .map_err(|e| CoreError::Windows(e.code().0 as u32))?;
+            }
+            Ok::<(), CoreError>(())
+        })();
 
-        Err(CoreError::Windows(0x256))
+        let resumed = unsafe { ResumeThread(handle.as_raw()) };
+        if resumed == u32::MAX {
+            let resume_error = CoreError::Windows(unsafe { GetLastError() }.0);
+            return match operation {
+                Ok(()) => Err(resume_error),
+                Err(operation_error) => Err(CoreError::DebugState(format!(
+                    "hardware breakpoint update failed ({operation_error}) and ResumeThread failed ({resume_error})"
+                ))),
+            };
+        }
+        operation
     }
 
     /// Write the hardware breakpoint state into the given CONTEXT.
     ///
-    /// This populates DR0–DR3 and DR7 from `self.hw_breakpoints`.
+    /// This populates DR0闁炽儲寮碦3 and DR7 from `self.hw_breakpoints`.
     /// DR6 is cleared of the BS (single-step) flag (bit 14) to prevent
     /// the OS from misinterpreting a single-step as a hardware breakpoint.
-    fn write_debug_registers(&self, ctx: &mut CONTEXT) {
+    fn write_debug_registers_for_state(
+        ctx: &mut CONTEXT,
+        hw_breakpoints: &[Option<HwBreakpoint>; 4],
+    ) {
         // Build the DR7 mask.
         // DR7 bit layout (x86/x64):
-        //   L0–L3  (bits 0,2,4,6):   local enable (set = 1)
-        //   G0–G3  (bits 1,3,5,7):   global enable (unused — set 0)
-        //   LEN0–LEN3 (bits 8-15):       length (00=1, 01=2, 11=4 bytes)
-        //   RW0–RW3  (bits 16-23):      type (00=execute, 01=write, 11=access)
+        //   L0闁炽儲褰?  (bits 0,2,4,6):   local enable (set = 1)
+        //   G0闁炽儲寮?  (bits 1,3,5,7):   global enable (unused 闁?set 0)
+        //   LEN0闁炽儲褰咵N3 (bits 8-15):       length (00=1, 01=2, 11=4 bytes)
+        //   RW0闁炽儲褰峎3  (bits 16-23):      type (00=execute, 01=write, 11=access)
         let mut dr7: u64 = 0;
 
         // Helper: write one slot's data into DR7 and the context DRn register.
@@ -618,10 +572,10 @@ impl WindowsDebugger {
             }
         }
 
-        apply_slot(ctx, self.hw_breakpoints[0].as_ref(), 0, &mut dr7);
-        apply_slot(ctx, self.hw_breakpoints[1].as_ref(), 1, &mut dr7);
-        apply_slot(ctx, self.hw_breakpoints[2].as_ref(), 2, &mut dr7);
-        apply_slot(ctx, self.hw_breakpoints[3].as_ref(), 3, &mut dr7);
+        apply_slot(ctx, hw_breakpoints[0].as_ref(), 0, &mut dr7);
+        apply_slot(ctx, hw_breakpoints[1].as_ref(), 1, &mut dr7);
+        apply_slot(ctx, hw_breakpoints[2].as_ref(), 2, &mut dr7);
+        apply_slot(ctx, hw_breakpoints[3].as_ref(), 3, &mut dr7);
 
         // Clear the BS (single-step) flag in DR6 (bit 14) so the OS
         // doesn't conflate a single-step with a hardware breakpoint.
@@ -636,7 +590,7 @@ impl WindowsDebugger {
 
     /// Set a software breakpoint (INT3 / 0xCC) at the given address.
     ///
-    /// Reference: `DebuggerCore.pas` → `SetSoftBP`.
+    /// Reference: `DebuggerCore.pas` 闁?`SetSoftBP`.
     ///
     /// 1. Read the original byte at the target address.
     /// 2. Save it in `soft_breakpoints`.
@@ -653,17 +607,24 @@ impl WindowsDebugger {
             // Verify the byte at that address is actually 0xCC (consistency check).
             let mut current: [u8; 1] = [0];
             let read = self.read_memory(address, &mut current)?;
-            if read == 1 && current[0] == 0xCC {
+            if soft_breakpoint_state_is_consistent(read, current[0]) {
                 trace!(%address, "Soft breakpoint already set at address");
                 return Ok(());
             }
-            // If the byte isn't 0xCC, something is inconsistent; fall through to overwrite.
+            // The map stores the original byte needed for rollback.  Do not
+            // delete it when the target byte is no longer 0xCC: dropping the
+            // entry would lose the only restoration record while leaving the
+            // target and software state inconsistent.
             warn!(
                 %address,
+                bytes_read = read,
                 byte = current[0],
-                "Soft breakpoint inconsistency — re-installing"
+                "Soft breakpoint state inconsistency 閳?refusing to overwrite"
             );
-            self.soft_breakpoints.remove(&address);
+            return Err(CoreError::DebugState(format!(
+                "soft breakpoint state mismatch at {address:#x}: expected 0xCC, read={read} byte={:#04x}; original-byte map entry retained",
+                current[0]
+            )));
         }
 
         // 1. Read the original byte.
@@ -706,34 +667,37 @@ impl WindowsDebugger {
 
     /// Clear all software breakpoints, restoring every original byte.
     ///
-    /// Reference: `DebuggerCore.pas` → `SoftBPClear`.
+    /// Reference: `DebuggerCore.pas` 闁?`SoftBPClear`.
     ///
     /// Iterates over `soft_breakpoints`, writes the original byte back to each
     /// address, then flushes the instruction cache and clears the map.
     pub fn clear_all_soft_breakpoints(&mut self) -> Result<(), CoreError> {
-        // Collect entries into a temporary vec to release the immutable borrow
-        // before calling `write_memory` (which takes `&mut self`).
-        let entries: Vec<(usize, u8)> = self.soft_breakpoints.drain().collect();
+        // Work from a snapshot, but remove each entry only after its byte and
+        // instruction-cache flush both succeed. A failed restore therefore
+        // leaves the map as an actionable rollback record.
+        let entries: Vec<(usize, u8)> = self
+            .soft_breakpoints
+            .iter()
+            .map(|(&address, &original)| (address, original))
+            .collect();
 
-        for (address, original) in &entries {
-            let bytes_written = self.write_memory(*address, &[*original])?;
+        for (address, original) in entries {
+            let bytes_written = self.write_memory(address, &[original])?;
             if bytes_written != 1 {
-                warn!(
-                    %address,
-                    expected = 1,
-                    actual = bytes_written,
-                    "Partial write while clearing soft breakpoint"
-                );
+                return Err(CoreError::MemoryWrite {
+                    address: address as u64,
+                    requested: 1,
+                });
             }
-            // Flush instruction cache for each restored address.
-            // SAFETY: hProcess is a valid handle; address and size are within bounds.
             unsafe {
-                let _ = FlushInstructionCache(
+                FlushInstructionCache(
                     self.process.handle,
-                    Some(*address as *const std::ffi::c_void),
+                    Some(address as *const std::ffi::c_void),
                     1,
-                );
+                )
+                .map_err(|e| CoreError::Windows(e.code().0 as u32))?;
             }
+            self.soft_breakpoints.remove(&address);
         }
 
         debug!("All soft breakpoints cleared");
@@ -742,7 +706,7 @@ impl WindowsDebugger {
 
     /// Reset / re-arm a software breakpoint after single-stepping over it.
     ///
-    /// Reference: `DebuggerCore.pas` → `OnSoftwareBreakpoint` /
+    /// Reference: `DebuggerCore.pas` 闁?`OnSoftwareBreakpoint` /
     /// `SoftBPReenable`.
     ///
     /// When a soft breakpoint fires, the original instruction has already been
@@ -750,7 +714,7 @@ impl WindowsDebugger {
     /// flushes the instruction cache.
     ///
     /// Call this after single-stepping past the breakpoint (via
-    /// `single_step(thread_id)` → wait for `SingleStep` event → call this).
+    /// `single_step(thread_id)` 闁?wait for `SingleStep` event 闁?call this).
     pub fn reset_soft_breakpoint(&mut self, address: usize) -> Result<(), CoreError> {
         // Write 0xCC back to the breakpoint address.
         let int3: [u8; 1] = [0xCC];
@@ -825,7 +789,7 @@ impl WindowsDebugger {
 }
 
 // ---------------------------------------------------------------------------
-// Drop — clean up handles, terminate target, and delete stub EXE
+// Drop 闁?clean up handles, terminate target, and delete stub EXE
 // ---------------------------------------------------------------------------
 
 /// Maximum time (ms) to wait for the target to exit after TerminateProcess.
@@ -834,6 +798,20 @@ const DROP_TERMINATE_TIMEOUT_MS: u32 = 5000;
 impl Drop for WindowsDebugger {
     fn drop(&mut self) {
         use windows::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
+
+        // A delivered debug event blocks the debuggee until ContinueDebugEvent.
+        // Resolve it before termination so Drop never silently abandons a raw
+        // pending event (especially ExitProcess, whose public enum omits TID).
+        if let Some(pending) = self.lifecycle.pending().copied() {
+            if let Err(error) = self.continue_pending(pending.thread_id, ContinueStatus::Continue) {
+                warn!(
+                    pid = pending.process_id,
+                    tid = pending.thread_id,
+                    error = %error,
+                    "Drop: failed to continue pending debug event; cleanup may leave debug port state"
+                );
+            }
+        }
 
         // --- Lifecycle: decide cleanup from ownership, not debug-port state ---
         //
@@ -850,7 +828,7 @@ impl Drop for WindowsDebugger {
                     warn!(
                         pid = self.process.pid,
                         summary = r.summary(),
-                        "Drop: process handle invalid — cannot terminate owned target"
+                        "Drop: process handle invalid 闁?cannot terminate owned target"
                     );
                     CleanupReport::for_terminate(
                         self.ownership,
@@ -894,7 +872,7 @@ impl Drop for WindowsDebugger {
                         warn!(
                             pid = self.process.pid,
                             summary = report.summary(),
-                            "Drop: cleanup issue (terminate failed, wait timeout, or wait failed)"
+                            "Drop: cleanup issue (terminate failed, wait timeout, or wait failed; on timeout the owned process may still be alive)"
                         );
                     }
                     report
@@ -905,7 +883,7 @@ impl Drop for WindowsDebugger {
 
         // Close every registered thread handle EXCEPT the main thread.
         // The main-thread handle is owned by `self.process` and will be closed
-        // together with the process handle by `close_process_handles` below —
+        // together with the process handle by `close_process_handles` below 闁?
         // closing it twice risks closing a recycled HANDLE value on Windows.
         for (&tid, &h) in self.threads.iter() {
             if tid == self.process.main_thread_id {
@@ -927,6 +905,12 @@ impl Drop for WindowsDebugger {
     }
 }
 
+/// Return whether an existing software-breakpoint map entry still matches the
+/// target byte. A mismatch is handled by `set_soft_breakpoint` as an error;
+/// the map entry must remain available for rollback.
+fn soft_breakpoint_state_is_consistent(bytes_read: usize, current_byte: u8) -> bool {
+    bytes_read == 1 && current_byte == 0xCC
+}
 // ---------------------------------------------------------------------------
 // DebuggerCore implementation
 // ---------------------------------------------------------------------------
@@ -942,6 +926,10 @@ impl DebuggerCore for WindowsDebugger {
 
     fn image_base(&self) -> u64 {
         self.process.image_base
+    }
+
+    fn pending_event_thread_id(&self) -> Option<u32> {
+        self.lifecycle.pending().map(|event| event.thread_id)
     }
 
     fn wait_event_timeout(&mut self, timeout_ms: u32) -> Result<DebugEvent, CoreError> {
@@ -1104,7 +1092,7 @@ impl DebuggerCore for WindowsDebugger {
 
         // Win11 + Themida often rejects SetThreadContext of CONTEXT_ALL (XSAVE /
         // floating-point areas) with ERROR_NOACCESS (0x800703E6).  Strip to
-        // CONTROL|INTEGER — enough for RIP/RSP/EFlags (TF) and GPRs used by
+        // CONTROL|INTEGER 闁?enough for RIP/RSP/EFlags (TF) and GPRs used by
         // IAT single-step tracing and OEP recovery.
         let mut local = *ctx;
         local.ContextFlags = Self::control_integer_context_flags();
@@ -1164,7 +1152,7 @@ impl DebuggerCore for WindowsDebugger {
 }
 
 // ---------------------------------------------------------------------------
-// Internal — pending-event lifecycle + raw DEBUG_EVENT decode
+// Internal 闁?pending-event lifecycle + raw DEBUG_EVENT decode
 // ---------------------------------------------------------------------------
 
 impl WindowsDebugger {
@@ -1218,7 +1206,7 @@ impl WindowsDebugger {
                     } else {
                         debug!(
                             code = event_code,
-                            "Unknown debug event code — exactly-once continue"
+                            "Unknown debug event code 闁?exactly-once continue"
                         );
                     }
                     // Must continue the *pending* identity before next wait.
@@ -1229,7 +1217,7 @@ impl WindowsDebugger {
                     continue;
                 }
                 DecodeDisposition::RipError => {
-                    warn!("RIP_EVENT received — system-level debug error");
+                    warn!("RIP_EVENT received 闁?system-level debug error");
                     // Unified lifecycle: continue once on pending identity, then
                     // surface an error (do not continue inside decode).
                     let cont = self.continue_pending(thread_id, ContinueStatus::Continue);
@@ -1338,7 +1326,7 @@ impl WindowsDebugger {
     /// This works where [`DebuggerCore::get_thread_context`] cannot: the
     /// full CONTEXT request trips ERROR_PARTIAL_COPY on threads belonging
     /// to targets whose protector mutates the thread's TEB / PEB-Ldr during
-    /// early ntdll init.  Scope the request down to DR0–DR7 so the kernel
+    /// early ntdll init.  Scope the request down to DR0闁炽儲寮碦7 so the kernel
     /// does not attempt to walk those guarded structures.
     pub fn get_thread_context_dbg(&self, thread_id: u32) -> Result<CONTEXT, CoreError> {
         use windows::Win32::System::Threading::{OpenThread, THREAD_GET_CONTEXT};
@@ -1389,7 +1377,7 @@ impl WindowsDebugger {
                         // ExceptionInformation[0] is the access type:
                         //   0 = read, 1 = write, 8 = execute (inside .text).
                         // Themida uses execute-inside-.text faults to identify TLS
-                        // callbacks that we must let run — matching the Pascal
+                        // callbacks that we must let run 闁?matching the Pascal
                         // `ExcRecord.ExceptionInformation[0] = 8` check.
                         let exc_type = if exc.ExceptionRecord.NumberParameters > 0 {
                             exc.ExceptionRecord.ExceptionInformation[0] as u8
@@ -1501,7 +1489,7 @@ impl WindowsDebugger {
 }
 
 // ---------------------------------------------------------------------------
-// Tests — ScopedThreadHandle Drop semantics
+// Tests 闁?ScopedThreadHandle Drop semantics
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -1514,6 +1502,13 @@ mod tests {
     /// This exercises the Drop path with a genuine kernel handle.  We open the
     /// current thread with `THREAD_QUERY_INFORMATION` (a benign right) and let
     /// the guard close it.
+    #[test]
+    fn existing_soft_breakpoint_mismatch_is_not_considered_installed() {
+        assert!(soft_breakpoint_state_is_consistent(1, 0xCC));
+        assert!(!soft_breakpoint_state_is_consistent(1, 0x90));
+        assert!(!soft_breakpoint_state_is_consistent(0, 0xCC));
+        assert!(!soft_breakpoint_state_is_consistent(2, 0xCC));
+    }
     #[test]
     fn scoped_thread_handle_drops_real_handle() {
         use windows::Win32::System::Threading::{
@@ -1528,7 +1523,7 @@ mod tests {
         };
         assert!(!raw.is_invalid(), "freshly opened handle must be valid");
 
-        // Wrap it — Drop should CloseHandle.
+        // Wrap it 闁?Drop should CloseHandle.
         {
             let _g = ScopedThreadHandle::new(raw);
         }
@@ -1548,7 +1543,7 @@ mod tests {
     /// when they hand the raw value to `GetThreadContext` / `SetThreadContext`.
     #[test]
     fn scoped_thread_handle_as_raw_roundtrips() {
-        // Use a pseudo-handle sentinel that CloseHandle will reject — we never
+        // Use a pseudo-handle sentinel that CloseHandle will reject 闁?we never
         // actually drop the guard in this test, so no kernel handle is
         // released.  This isolates the as_raw behaviour from the Drop path.
         let sentinel = HANDLE(-1 as isize as *mut std::ffi::c_void);
@@ -1568,12 +1563,12 @@ mod tests {
         // HANDLE(null) is the conventional invalid handle on Windows.
         let invalid = HANDLE(std::ptr::null_mut());
         // If Drop called CloseHandle(null) it would set ERROR_INVALID_HANDLE
-        // and return Err — but we swallow the result inside Drop, so the only
+        // and return Err 闁?but we swallow the result inside Drop, so the only
         // way this test can fail is by panicking, which it must not.
         {
             let _g = ScopedThreadHandle::new(invalid);
         }
-        // Reaching here means Drop ran without panicking — the regression is
+        // Reaching here means Drop ran without panicking 闁?the regression is
         // satisfied.
     }
 }

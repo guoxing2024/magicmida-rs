@@ -57,7 +57,6 @@ pub use iat::{
     IatFixStrategy, IatLocation,
 };
 pub use init::{init_pe_details, locate_themida_section, ThemidaPeInfo};
-pub use plugin::ThemidaPlugin;
 pub use oep::{
     cookie_complement_from_security_init_xrefs, decode_msvc_oep_wrapper, encode_msvc_oep_wrapper,
     find_cookie_complement_site, find_real_oep_by_scanning, find_real_oep_in_bytes,
@@ -73,6 +72,7 @@ pub use oep::{
     CookieComplementSite, ExecRange, MsvcCrtResolveError, MsvcCrtTargets, PeSectionView,
     TlsCallbackResult, DEFAULT_SECURITY_COOKIE, MSVC_OEP_WRAPPER_LEN,
 };
+pub use plugin::ThemidaPlugin;
 pub use postprocess::{
     create_data_sections, dump_process_code, install_anti_dump_fix, shrink_pe, DataSectionResult,
 };

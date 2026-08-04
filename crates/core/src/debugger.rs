@@ -270,6 +270,16 @@ pub trait DebuggerCore {
     /// [`CoreError::Windows`].
     fn wait_event(&mut self) -> Result<DebugEvent, CoreError>;
 
+    /// Return the thread ID belonging to the raw event currently waiting for
+    /// `ContinueDebugEvent`, when the backend exposes that identity.
+    ///
+    /// `ExitProcess` is the one abstract event that does not carry a thread ID,
+    /// but Windows still requires the real `dwThreadId` for ContinueDebugEvent.
+    /// Backends without a raw pending-event model may return `None`.
+    fn pending_event_thread_id(&self) -> Option<u32> {
+        None
+    }
+
     /// Wait for the next debug event with a timeout.
     ///
     /// Returns `Ok(event)` if an event arrived within the timeout.

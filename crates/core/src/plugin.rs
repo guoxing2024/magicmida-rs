@@ -47,6 +47,158 @@ pub enum UnpackPhase {
     Done,
 }
 
+/// Provenance for the OEP candidate observed by the runtime/CLI host.
+///
+/// This is deliberately stricter than the historical `oep_found_via_scanning`
+/// boolean. A scan result or a virtualized/bootstrap candidate is useful for
+/// diagnostics and frozen dumps, but it is never sufficient evidence for a
+/// perfect/two-sample application-OEP prerequisite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OepSource {
+    /// The suspended/running thread RIP was observed inside decrypted `.text`.
+    RuntimeRip,
+    /// A runtime trace (for example MSVC/TLS/OEP trace) resolved the application entry.
+    Trace,
+    /// The live scan or PE entry-point fallback supplied the candidate.
+    ScanFallback,
+    /// No trustworthy provenance was established.
+    Unknown,
+}
+
+impl OepSource {
+    /// Stable report spelling used by the CLI/runtime report.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RuntimeRip => "runtime RIP",
+            Self::Trace => "trace",
+            Self::ScanFallback => "scan fallback",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Auditable OEP provenance carried from runtime capture to the dump boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OepProvenance {
+    /// How the candidate was obtained.
+    pub source: OepSource,
+    /// Runtime virtual address, when one was observed.
+    pub va: Option<u64>,
+    /// Image-relative RVA, when the runtime base conversion succeeded.
+    pub rva: Option<u32>,
+    /// Human-readable evidence for the source decision.
+    pub evidence: String,
+    /// Whether the evidence identifies the application OEP rather than startup/bootstrap code.
+    pub application_oep: bool,
+    /// True for scan-only, bootstrap, virtualized, or otherwise ambiguous candidates.
+    pub bootstrap_or_ambiguous: bool,
+}
+
+impl Default for OepProvenance {
+    fn default() -> Self {
+        Self::unknown("no OEP evidence recorded")
+    }
+}
+
+impl OepProvenance {
+    #[must_use]
+    pub fn runtime_rip(va: u64, evidence: impl Into<String>) -> Self {
+        Self::new(OepSource::RuntimeRip, va, evidence, true, false)
+    }
+
+    #[must_use]
+    pub fn trace(va: u64, evidence: impl Into<String>) -> Self {
+        Self::new(OepSource::Trace, va, evidence, true, false)
+    }
+
+    #[must_use]
+    pub fn scan_fallback(va: u64, evidence: impl Into<String>) -> Self {
+        Self::new(OepSource::ScanFallback, va, evidence, false, true)
+    }
+
+    #[must_use]
+    pub fn unknown(evidence: impl Into<String>) -> Self {
+        Self {
+            source: OepSource::Unknown,
+            va: None,
+            rva: None,
+            evidence: evidence.into(),
+            application_oep: false,
+            bootstrap_or_ambiguous: true,
+        }
+    }
+
+    #[must_use]
+    pub fn new(
+        source: OepSource,
+        va: u64,
+        evidence: impl Into<String>,
+        application_oep: bool,
+        bootstrap_or_ambiguous: bool,
+    ) -> Self {
+        Self {
+            source,
+            va: Some(va),
+            rva: None,
+            evidence: evidence.into(),
+            application_oep,
+            bootstrap_or_ambiguous,
+        }
+    }
+
+    /// Attach the image-relative RVA without changing the provenance decision.
+    #[must_use]
+    pub fn with_rva(mut self, rva: Option<u32>) -> Self {
+        self.rva = rva;
+        self
+    }
+
+    /// Replace only the final address after an OEP policy resolves the dump EP.
+    #[must_use]
+    pub fn with_location(mut self, va: u64, rva: Option<u32>) -> Self {
+        self.va = Some(va);
+        self.rva = rva;
+        self
+    }
+
+    /// Strict prerequisite used by perfect/two-sample gates.
+    #[must_use]
+    pub fn application_oep_prerequisite_passes(&self) -> bool {
+        matches!(self.source, OepSource::RuntimeRip | OepSource::Trace)
+            && self.va.is_some()
+            && self.rva.is_some()
+            && !self.evidence.trim().is_empty()
+            && self.application_oep
+            && !self.bootstrap_or_ambiguous
+    }
+
+    /// Stable fail-closed blocker for reports and gate diagnostics.
+    #[must_use]
+    pub fn application_oep_blocker(&self) -> Option<&'static str> {
+        if self.application_oep_prerequisite_passes() {
+            return None;
+        }
+        Some(match self.source {
+            OepSource::ScanFallback => {
+                "OEP provenance is scan fallback, not runtime/trace evidence"
+            }
+            OepSource::Unknown => "OEP provenance is unknown",
+            OepSource::RuntimeRip | OepSource::Trace if self.bootstrap_or_ambiguous => {
+                "OEP is bootstrap or ambiguous"
+            }
+            OepSource::RuntimeRip | OepSource::Trace if !self.application_oep => {
+                "OEP is not marked as the application OEP"
+            }
+            OepSource::RuntimeRip | OepSource::Trace if self.va.is_none() => {
+                "OEP runtime VA is missing"
+            }
+            OepSource::RuntimeRip | OepSource::Trace if self.rva.is_none() => "OEP RVA is missing",
+            OepSource::RuntimeRip | OepSource::Trace => "OEP evidence is incomplete",
+        })
+    }
+}
+
 /// Host-observed loop facts for policy refresh (no Win32, no PE).
 ///
 /// Filled each iteration by CLI from [`LoopState`]-equivalent state; plugin
@@ -75,6 +227,8 @@ pub struct PluginCtx {
     pub preferred_base: Option<PreferredBase>,
     pub phase: UnpackPhase,
     pub oep_rva: Option<Rva>,
+    /// Full OEP provenance contract for runtime/CLI reports and acceptance prerequisites.
+    pub oep_provenance: OepProvenance,
     // --- session hints (host → plugin) ---
     /// Target is a .NET assembly (COM descriptor present).
     pub is_dotnet: bool,
@@ -127,6 +281,7 @@ impl Default for PluginCtx {
             preferred_base: None,
             phase: UnpackPhase::Observe,
             oep_rva: None,
+            oep_provenance: OepProvenance::default(),
             is_dotnet: false,
             section0_is_plain_text: false,
             request_text_poll: false,
@@ -171,6 +326,22 @@ impl PluginCtx {
             return va.to_rva_preferred(pref);
         }
         None
+    }
+
+    /// Record the complete OEP provenance and derive its RVA from the runtime base.
+    ///
+    /// The old boolean is retained for compatibility, but all gate decisions must
+    /// use [`OepProvenance::application_oep_prerequisite_passes`].
+    pub fn record_oep_provenance(&mut self, mut provenance: OepProvenance) {
+        if provenance.rva.is_none() {
+            provenance.rva = provenance
+                .va
+                .and_then(|va| self.oep_va_to_rva(va))
+                .map(|rva| rva.get());
+        }
+        self.oep_rva = provenance.rva.map(Rva);
+        self.oep_found_via_scanning = matches!(provenance.source, OepSource::ScanFallback);
+        self.oep_provenance = provenance;
     }
 
     /// Sticky leave request with a static reason string.
@@ -256,8 +427,7 @@ pub trait PackerPlugin {
     /// Default: short-wait while text-polling; leave on scanned OEP / IAT done /
     /// process exit; CloseHandle BP when close-handle path and not text-polling.
     fn refresh_loop_policy(&mut self, ctx: &mut PluginCtx, facts: &HostLoopFacts) {
-        ctx.prefer_short_wait =
-            facts.text_polling && !facts.oep_known && !facts.iat_trace_active;
+        ctx.prefer_short_wait = facts.text_polling && !facts.oep_known && !facts.iat_trace_active;
 
         ctx.allow_close_handle_bp = ctx.request_close_handle_chain
             && !facts.guard_installed
@@ -335,8 +505,10 @@ pub trait PackerPlugin {
     ) -> PluginAdvice {
         ctx.skip_v3_iat_trace = true;
         ctx.request_leave(reason);
-        if !matches!(ctx.phase, UnpackPhase::Dump | UnpackPhase::Done | UnpackPhase::IatTrace)
-        {
+        if !matches!(
+            ctx.phase,
+            UnpackPhase::Dump | UnpackPhase::Done | UnpackPhase::IatTrace
+        ) {
             ctx.phase = UnpackPhase::IatTrace;
         }
         PluginAdvice::Transition(UnpackPhase::IatTrace)
@@ -547,9 +719,6 @@ mod tests {
             preferred_base: Some(PreferredBase(0x14000_0000)),
             ..Default::default()
         };
-        assert_eq!(
-            ctx.oep_va_to_rva(0x7ff6_c050_13e0),
-            Some(Rva(0x13e0))
-        );
+        assert_eq!(ctx.oep_va_to_rva(0x7ff6_c050_13e0), Some(Rva(0x13e0)));
     }
 }

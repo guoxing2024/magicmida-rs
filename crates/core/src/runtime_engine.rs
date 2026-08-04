@@ -393,7 +393,11 @@ impl<D: DebuggerCore> RuntimeEngine for DebuggerCoreEngine<D> {
         };
         let sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.saturating_add(1);
-        self.pending_thread = Some(thread_id_of(&event));
+        let pending_thread = self
+            .inner
+            .pending_event_thread_id()
+            .unwrap_or_else(|| thread_id_of(&event));
+        self.pending_thread = Some(pending_thread);
         if matches!(event, DebugEvent::ExitProcess { .. }) {
             self.process_exited = true;
         }
@@ -402,9 +406,7 @@ impl<D: DebuggerCore> RuntimeEngine for DebuggerCoreEngine<D> {
 
     fn continue_event(&mut self, status: ContinueStatus) -> Result<(), Self::Error> {
         let thread_id = self.pending_thread.ok_or_else(|| {
-            CoreError::DebugState(
-                "DebuggerCoreEngine::continue_event: no pending event".into(),
-            )
+            CoreError::DebugState("DebuggerCoreEngine::continue_event: no pending event".into())
         })?;
         self.continue_with_thread(thread_id, status)
     }
@@ -463,7 +465,13 @@ mod tests {
 
         let e2 = eng.wait(None).expect("bp");
         assert_eq!(e2.sequence, 2);
-        assert!(matches!(e2.event, DebugEvent::Breakpoint { address: 0x140001000, .. }));
+        assert!(matches!(
+            e2.event,
+            DebugEvent::Breakpoint {
+                address: 0x140001000,
+                ..
+            }
+        ));
         eng.continue_event(ContinueStatus::Continue).unwrap();
 
         let e3 = eng.wait(None).expect("exit");
@@ -540,7 +548,10 @@ mod tests {
         // Unmapped fails (no silent zeros)
         assert!(matches!(
             mem.read(0xdead_0000, &mut buf),
-            Err(CoreError::MemoryRead { address: 0xdead_0000, .. })
+            Err(CoreError::MemoryRead {
+                address: 0xdead_0000,
+                ..
+            })
         ));
         // Write into region
         assert_eq!(mem.write(0x14000_1001, &[0x11, 0x22]).unwrap(), 2);
@@ -554,20 +565,17 @@ mod tests {
         eng.wait(None).unwrap();
         eng.continue_event(ContinueStatus::Continue).unwrap();
         // Blocking wait → exhausted DebugState
-        assert!(matches!(
-            eng.wait(None),
-            Err(CoreError::DebugState(_))
-        ));
+        assert!(matches!(eng.wait(None), Err(CoreError::DebugState(_))));
         // Finite wait → Timeout (text-poll short-wait simulation)
         assert!(matches!(eng.wait(Some(100)), Err(CoreError::Timeout)));
     }
 
     #[test]
     fn slice4_guard_oep_with_memory_and_plugin_milestones() {
+        use crate::addr::{PreferredBase, Rva};
         use crate::plugin::{
             HostLoopFacts, NullPackerPlugin, PackerPlugin, PluginAdvice, PluginCtx, UnpackPhase,
         };
-        use crate::addr::{PreferredBase, Rva};
 
         let base = 0x7ff6_c050_0000u64;
         let oep_rva = 0x13e0u32;
@@ -629,10 +637,7 @@ mod tests {
                     eng.read_memory(*address as usize, &mut oep_bytes).unwrap();
                     assert_eq!(oep_bytes[0], 0x48);
                     let advice = packer.note_oep_accepted(&mut ctx, *address, false);
-                    assert_eq!(
-                        advice,
-                        PluginAdvice::Transition(UnpackPhase::OepCandidate)
-                    );
+                    assert_eq!(advice, PluginAdvice::Transition(UnpackPhase::OepCandidate));
                     assert_eq!(ctx.oep_rva, Some(Rva(oep_rva)));
                     assert_eq!(ctx.oep_va_to_rva(*address), Some(Rva(oep_rva)));
                 }
@@ -654,10 +659,7 @@ mod tests {
             eng.continue_event(ContinueStatus::Continue).unwrap();
         }
 
-        assert_eq!(
-            phases,
-            ["create", "load_dll", "guard_av", "oep_bp", "exit"]
-        );
+        assert_eq!(phases, ["create", "load_dll", "guard_av", "oep_bp", "exit"]);
         assert_eq!(eng.runtime_base(), Some(RuntimeBase(base)));
         assert_eq!(ctx.phase, UnpackPhase::OepCandidate);
         assert!(eng.process_exited());
@@ -670,6 +672,7 @@ mod tests {
         index: usize,
         image_base: u64,
         continues: Vec<(u32, ContinueStatus)>,
+        pending_thread_id: Option<u32>,
     }
 
     impl ScriptedDebugger {
@@ -679,6 +682,7 @@ mod tests {
                 index: 0,
                 image_base,
                 continues: Vec::new(),
+                pending_thread_id: None,
             }
         }
     }
@@ -702,7 +706,14 @@ mod tests {
                 DebugEvent::Other { thread_id: 0 },
             );
             self.index += 1;
+            self.pending_thread_id = Some(match &ev {
+                DebugEvent::ExitProcess { .. } => 77,
+                _ => thread_id_of(&ev),
+            });
             Ok(ev)
+        }
+        fn pending_event_thread_id(&self) -> Option<u32> {
+            self.pending_thread_id
         }
         fn continue_event(
             &mut self,
@@ -710,6 +721,7 @@ mod tests {
             status: ContinueStatus,
         ) -> Result<(), CoreError> {
             self.continues.push((thread_id, status));
+            self.pending_thread_id = None;
             Ok(())
         }
         fn read_memory(&self, _address: usize, _buf: &mut [u8]) -> Result<usize, CoreError> {
@@ -761,7 +773,7 @@ mod tests {
         let continues = eng.backend().continues.clone();
         assert_eq!(continues.len(), 3);
         assert_eq!(continues[1].0, 9); // BP thread id forwarded
-        assert_eq!(continues[2].0, 0); // ExitProcess uses 0
+        assert_eq!(continues[2].0, 77); // ExitProcess uses backend pending identity
     }
 
     #[test]

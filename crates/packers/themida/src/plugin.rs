@@ -154,8 +154,7 @@ impl PackerPlugin for ThemidaPlugin {
     fn refresh_loop_policy(&mut self, ctx: &mut PluginCtx, facts: &HostLoopFacts) {
         // Shared default policy, then Themida-specific tweaks.
         // (Call default body inline — traits cannot easily super-call.)
-        ctx.prefer_short_wait =
-            facts.text_polling && !facts.oep_known && !facts.iat_trace_active;
+        ctx.prefer_short_wait = facts.text_polling && !facts.oep_known && !facts.iat_trace_active;
 
         ctx.allow_close_handle_bp = ctx.request_close_handle_chain
             && !facts.guard_installed
@@ -631,10 +630,7 @@ mod tests {
                 DebugEvent::Breakpoint { address, .. } => {
                     phases.push("oep_bp");
                     let advice = packer.note_oep_accepted(&mut ctx, *address, false);
-                    assert_eq!(
-                        advice,
-                        PluginAdvice::Transition(UnpackPhase::OepCandidate)
-                    );
+                    assert_eq!(advice, PluginAdvice::Transition(UnpackPhase::OepCandidate));
                     assert_eq!(ctx.oep_rva, Some(Rva(oep_rva)));
                     let d = packer.dump_advice(&ctx).expect("dump advice after OEP");
                     assert_eq!(d.entry_point_rva, Some(Rva(oep_rva)));
@@ -642,10 +638,7 @@ mod tests {
                 }
                 DebugEvent::ExitProcess { .. } => {
                     phases.push("exit");
-                    assert_eq!(
-                        advice,
-                        PluginAdvice::Transition(UnpackPhase::Done)
-                    );
+                    assert_eq!(advice, PluginAdvice::Transition(UnpackPhase::Done));
                     assert!(ctx.skip_v3_iat_trace);
                     assert!(ctx.request_leave_debug_loop);
                     assert_eq!(ctx.leave_reason, Some("exit_process"));
@@ -655,10 +648,7 @@ mod tests {
             eng.continue_event(ContinueStatus::Continue).unwrap();
         }
 
-        assert_eq!(
-            phases,
-            ["create", "load_dll", "guard_av", "oep_bp", "exit"]
-        );
+        assert_eq!(phases, ["create", "load_dll", "guard_av", "oep_bp", "exit"]);
         assert_eq!(packer.last_phase, Some(UnpackPhase::Done));
         assert!(eng.process_exited());
     }
@@ -712,10 +702,7 @@ mod tests {
                 }
                 DebugEvent::Breakpoint { address, .. } => {
                     let advice = packer.note_oep_accepted(&mut ctx, *address, true);
-                    assert_eq!(
-                        advice,
-                        PluginAdvice::Transition(UnpackPhase::OepCandidate)
-                    );
+                    assert_eq!(advice, PluginAdvice::Transition(UnpackPhase::OepCandidate));
                     assert!(ctx.oep_found_via_scanning);
                     assert_eq!(ctx.oep_rva, Some(Rva(oep_rva)));
                 }

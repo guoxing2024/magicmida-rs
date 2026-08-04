@@ -237,12 +237,10 @@ pub fn process_guarded_access(
     // inside `.text` report fault_address == exception_address (or a code
     // address in range); Themida-side probes report fault_address in `.text`.
     // A fault outside the guarded range is not a guard hit.
-    let fault_in_text =
-        is_guarded_address(fault_address, text_section_start, text_section_end);
-    let exc_in_text =
-        is_guarded_address(exception_address, text_section_start, text_section_end);
-    let fault_in_active_guard = state.ftm_guard
-        && is_guarded_address(fault_address, state.guard_start, state.guard_end);
+    let fault_in_text = is_guarded_address(fault_address, text_section_start, text_section_end);
+    let exc_in_text = is_guarded_address(exception_address, text_section_start, text_section_end);
+    let fault_in_active_guard =
+        state.ftm_guard && is_guarded_address(fault_address, state.guard_start, state.guard_end);
     let exc_in_active_guard = state.ftm_guard
         && is_guarded_address(exception_address, state.guard_start, state.guard_end);
     if !state.ftm_guard && !fault_in_text && !(exc_type == 8 && exc_in_text) {
@@ -255,7 +253,11 @@ pub fn process_guarded_access(
         return Ok(GuardAccessResult::NotGuarded);
     }
     // FTMGuard: only handle faults in the active (Themida) guard region or .text.
-    if state.ftm_guard && !fault_in_active_guard && !exc_in_active_guard && !fault_in_text && !exc_in_text
+    if state.ftm_guard
+        && !fault_in_active_guard
+        && !exc_in_active_guard
+        && !fault_in_text
+        && !exc_in_text
     {
         debug!(
             fault = %format!("{fault_address:#x}"),

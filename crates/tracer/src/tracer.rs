@@ -51,6 +51,70 @@ pub struct TraceResult {
 }
 
 // ---------------------------------------------------------------------------
+// Pending debug-event guard
+// ---------------------------------------------------------------------------
+
+/// Best-effort RAII handoff for a raw event delivered by `wait_event`.
+///
+/// A public `ExitProcess` value has no TID, so the guard records the backend's
+/// pending raw identity before any handler can return early.  It deliberately
+/// retries only on Drop when the explicit continue path failed; failure is
+/// logged and never panics from cleanup.
+struct PendingEventGuard<'a> {
+    debugger: *mut (dyn DebuggerCore + 'a),
+    pending_thread_id: Option<u32>,
+}
+
+impl<'a> PendingEventGuard<'a> {
+    fn new(debugger: *mut (dyn DebuggerCore + 'a), pending_thread_id: Option<u32>) -> Self {
+        Self {
+            debugger,
+            pending_thread_id,
+        }
+    }
+
+    fn arm_for_event(&mut self, fallback_thread_id: u32) -> u32 {
+        let thread_id =
+            unsafe { (&*self.debugger).pending_event_thread_id() }.unwrap_or(fallback_thread_id);
+        self.pending_thread_id = Some(thread_id);
+        thread_id
+    }
+
+    fn continue_event(&mut self, fallback_thread_id: u32) -> Result<(), TracerError> {
+        let thread_id = self.pending_thread_id.unwrap_or(fallback_thread_id);
+        let result =
+            unsafe { (&mut *self.debugger).continue_event(thread_id, ContinueStatus::Continue) };
+        match result {
+            Ok(()) => {
+                self.pending_thread_id = None;
+                Ok(())
+            }
+            Err(error) => Err(TracerError::Debugger {
+                source: Box::new(std::io::Error::other(error.to_string())),
+                context: "tracer",
+            }),
+        }
+    }
+}
+
+impl Drop for PendingEventGuard<'_> {
+    fn drop(&mut self) {
+        let Some(thread_id) = self.pending_thread_id else {
+            return;
+        };
+        let result =
+            unsafe { (&mut *self.debugger).continue_event(thread_id, ContinueStatus::Continue) };
+        if let Err(error) = result {
+            tracing::warn!(
+                thread_id,
+                error = %error,
+                "tracer dropped with a pending debug event; best-effort continue failed"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tracer
 // ---------------------------------------------------------------------------
 
@@ -141,6 +205,10 @@ impl<'a> Tracer<'a> {
         self.limit_reached = false;
         self.start_address = address;
 
+        let initial_pending = debugger.pending_event_thread_id();
+        let debugger_ptr: *mut dyn DebuggerCore = debugger;
+        let mut pending_guard = PendingEventGuard::new(debugger_ptr, initial_pending);
+
         // ---- point thread to start address and set TF -----------------------
 
         let mut ctx =
@@ -173,12 +241,7 @@ impl<'a> Tracer<'a> {
 
         // Resume from the event that brought us here.  The thread will
         // execute one instruction and then fire a SingleStep exception.
-        debugger
-            .continue_event(self.thread_id, ContinueStatus::Continue)
-            .map_err(|e| TracerError::Debugger {
-                source: Box::new(std::io::Error::other(e.to_string())),
-                context: "tracer",
-            })?;
+        pending_guard.continue_event(self.thread_id)?;
 
         // ---- trace loop -----------------------------------------------------
         //
@@ -201,7 +264,7 @@ impl<'a> Tracer<'a> {
                     context: "tracer",
                 })?;
 
-                let event_thread_id = thread_id_of(&ev);
+                let event_thread_id = pending_guard.arm_for_event(thread_id_of(&ev));
 
                 // ExitProcess is a session-ending event.
                 if let DebugEvent::ExitProcess { exit_code } = &ev {
@@ -264,12 +327,7 @@ impl<'a> Tracer<'a> {
                                     context: "tracer",
                                 })?;
 
-                            debugger
-                                .continue_event(self.thread_id, ContinueStatus::Continue)
-                                .map_err(|e| TracerError::Debugger {
-                                    source: Box::new(std::io::Error::other(e.to_string())),
-                                    context: "tracer",
-                                })?;
+                            pending_guard.continue_event(self.thread_id)?;
                         }
 
                         // Unexpected exceptions on the traced thread are
@@ -316,12 +374,7 @@ impl<'a> Tracer<'a> {
                                 "Tracer continuing non-exception event \
                                  on trace thread"
                             );
-                            debugger
-                                .continue_event(self.thread_id, ContinueStatus::Continue)
-                                .map_err(|e| TracerError::Debugger {
-                                    source: Box::new(std::io::Error::other(e.to_string())),
-                                    context: "tracer",
-                                })?;
+                            pending_guard.continue_event(self.thread_id)?;
                         }
                     }
                 } else {
@@ -331,12 +384,7 @@ impl<'a> Tracer<'a> {
                         LogMsgType::Info,
                         &format!("Suspending spurious thread {event_thread_id}"),
                     );
-                    debugger
-                        .continue_event(event_thread_id, ContinueStatus::Continue)
-                        .map_err(|e| TracerError::Debugger {
-                            source: Box::new(std::io::Error::other(e.to_string())),
-                            context: "tracer",
-                        })?;
+                    pending_guard.continue_event(event_thread_id)?;
                 }
             }
         })();
@@ -409,7 +457,7 @@ mod tests {
     }
 
     #[test]
-    fn thread_id_of_exit_process_returns_zero() {
+    fn thread_id_of_exit_process_uses_fallback_zero_without_backend_identity() {
         let ev = DebugEvent::ExitProcess { exit_code: 0 };
         assert_eq!(thread_id_of(&ev), 0);
     }
