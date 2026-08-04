@@ -623,7 +623,7 @@ mod tests {
                 } => {
                     phases.push("guard_av");
                     let mut sample = [0u8; 4];
-                    eng.read_memory(*address as usize, &mut sample).unwrap();
+                    eng.read_memory(*address, &mut sample).unwrap();
                     assert_eq!(sample, [0xcc; 4]);
                     packer.note_guard_installed(&mut ctx);
                 }

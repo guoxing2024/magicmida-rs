@@ -38,7 +38,7 @@ pub use process::{
     CreateProcessOptions, TargetProcess,
 };
 pub use runtime_engine::{
-    guard_oep_event_script, DebuggerCoreEngine, EngineEvent, ReplayMemory, ReplayRuntimeEngine,
-    RuntimeEngine,
+    guard_oep_event_script, CapabilityOp, CapabilityRecord, DebuggerCoreEngine, EngineEvent,
+    ReplayMemory, ReplayRuntimeEngine, RuntimeEngine, ThreadContextSnapshot,
 };
 pub use windows_debugger::WindowsDebugger;

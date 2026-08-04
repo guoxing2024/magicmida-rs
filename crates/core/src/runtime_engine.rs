@@ -1,13 +1,28 @@
-//! Runtime event engine surface (R2-Slice2 / 2b / Slice4).
+//! Runtime event engine surface (R2-Slice2 / 2b / Slice4, P3-A capability
+//! contract).
 //!
-//! The long-term owner of wait/continue is a [`RuntimeEngine`], not packer CLI
-//! loops. This module provides:
-//! - pure [`ReplayRuntimeEngine`] for offline tests (+ Slice4 scripted memory)
-//! - [`DebuggerCoreEngine`] adapter over any [`DebuggerCore`] (live path ready)
+//! The long-term owner of wait/continue and of every target capability
+//! (memory, thread context, hardware breakpoints) is a [`RuntimeEngine`], not
+//! packer CLI loops. This module provides:
+//! - pure [`ReplayRuntimeEngine`] for offline tests (+ scripted memory,
+//!   scripted contexts, breakpoint slots);
+//! - [`DebuggerCoreEngine`] adapter over any [`DebuggerCore`] (live path);
+//! - a portable capability surface that never exposes Win32 types
+//!   ([`ThreadContextSnapshot`], [`HwbpType`], [`ContinueStatus`] only);
+//! - a [`CapabilityRecord`] log so every capability operation is auditable
+//!   with its engine sequence and thread id, and replay/live parity can be
+//!   asserted offline.
 //!
-//! Live unpacker uses the engine pump; Win32 bodies remain in `cli/unpacker`.
+//! Contract:
+//! - unmapped memory reads fail closed (no silent zero-fill);
+//! - a delivered event may be continued exactly once, and only with the
+//!   pending thread identity (`continue_thread` rejects mismatches);
+//! - capability ops are recorded in execution order with sequence + thread.
+
+use std::collections::BTreeMap;
 
 use crate::addr::RuntimeBase;
+use crate::breakpoint::HwbpType;
 use crate::debugger::{ContinueStatus, DebugEvent, DebuggerCore};
 use crate::error::CoreError;
 
@@ -20,12 +35,90 @@ pub struct EngineEvent {
     pub event: DebugEvent,
 }
 
-/// Owns the event pump: wait / continue / exit observation.
+/// Portable x64 thread-context snapshot.
 ///
-/// Packer plugins and CLI should eventually call this instead of raw
-/// `WaitForDebugEvent` / backend wait. Backends remain pluggable.
+/// Deliberately small: only the fields the runtime handlers actually
+/// read/write (Rip/Rsp/Rbp/Rax/EFlags). No Win32 `CONTEXT` on the public
+/// surface; the live adapter converts to/from the backend's native context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThreadContextSnapshot {
+    pub rip: u64,
+    pub rsp: u64,
+    pub rbp: u64,
+    pub rax: u64,
+    pub eflags: u32,
+}
+
+impl ThreadContextSnapshot {
+    /// Blank snapshot (used by tests and by handlers before first read).
+    #[must_use]
+    pub const fn blank() -> Self {
+        Self {
+            rip: 0,
+            rsp: 0,
+            rbp: 0,
+            rax: 0,
+            eflags: 0,
+        }
+    }
+}
+
+/// One recorded capability operation.
+///
+/// `result` is stored as a string so the log stays `PartialEq`-comparable
+/// across replay/live parity assertions without leaking error types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityRecord {
+    /// Monotonic capability-op sequence (per engine instance, 1-based).
+    pub sequence: u64,
+    /// Thread id the operation targeted.
+    pub thread_id: u32,
+    /// The operation and its outcome.
+    pub op: CapabilityOp,
+}
+
+/// The operation recorded in a [`CapabilityRecord`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CapabilityOp {
+    ReadMemory {
+        address: u64,
+        len: usize,
+        result: Result<usize, String>,
+    },
+    WriteMemory {
+        address: u64,
+        len: usize,
+        result: Result<usize, String>,
+    },
+    GetThreadContext {
+        result: Result<(), String>,
+    },
+    SetThreadContext {
+        result: Result<(), String>,
+    },
+    SetHardwareBreakpoint {
+        slot: u8,
+        address: u64,
+        kind: HwbpType,
+        result: Result<(), String>,
+    },
+    ClearHardwareBreakpoint {
+        slot: u8,
+        result: Result<(), String>,
+    },
+    Continue {
+        status: ContinueStatus,
+        result: Result<(), String>,
+    },
+}
+
+/// Owns the event pump and every target capability.
+///
+/// Packer plugins and CLI call this instead of raw `WaitForDebugEvent` /
+/// backend calls. Backends remain pluggable; the capability surface is
+/// portable (no Win32 types).
 pub trait RuntimeEngine {
-    /// Error type for wait/continue failures.
+    /// Error type for wait/continue/capability failures.
     type Error;
 
     /// Block until the next event (or timeout if backend supports it).
@@ -33,7 +126,8 @@ pub trait RuntimeEngine {
     /// `timeout_ms = None` means block indefinitely when the backend allows.
     fn wait(&mut self, timeout_ms: Option<u32>) -> Result<EngineEvent, Self::Error>;
 
-    /// Resume the pending event exactly once.
+    /// Resume the pending event exactly once, using the engine-resolved
+    /// pending thread identity.
     fn continue_event(&mut self, status: ContinueStatus) -> Result<(), Self::Error>;
 
     /// Runtime (ASLR) image base known to the engine, if any.
@@ -41,6 +135,56 @@ pub trait RuntimeEngine {
 
     /// `true` after an `ExitProcess` event was delivered.
     fn process_exited(&self) -> bool;
+
+    /// The thread identity that the pending (not yet continued) event
+    /// belongs to, if any.
+    fn pending_thread_id(&self) -> Option<u32>;
+
+    /// Fail-closed memory read. Unmapped addresses are an error; a short
+    /// read is reported by the returned length, never as silent zeros.
+    fn read_memory(&mut self, address: u64, buf: &mut [u8]) -> Result<usize, Self::Error>;
+
+    /// Write target memory. Returns bytes written.
+    fn write_memory(&mut self, address: u64, data: &[u8]) -> Result<usize, Self::Error>;
+
+    /// Read the portable context snapshot of `thread_id`.
+    fn get_thread_context(&mut self, thread_id: u32) -> Result<ThreadContextSnapshot, Self::Error>;
+
+    /// Write back a portable context snapshot (read-modify-write on the
+    /// live backend so untouched registers are preserved).
+    fn set_thread_context(
+        &mut self,
+        thread_id: u32,
+        context: &ThreadContextSnapshot,
+    ) -> Result<(), Self::Error>;
+
+    /// Arm one of the four hardware breakpoint slots (DR0..DR3).
+    ///
+    /// `slot` must be `0..4` and must not already be armed for this thread.
+    fn set_hardware_breakpoint(
+        &mut self,
+        thread_id: u32,
+        slot: u8,
+        address: u64,
+        kind: HwbpType,
+    ) -> Result<(), Self::Error>;
+
+    /// Disarm a hardware breakpoint slot. Clearing an unarmed slot fails
+    /// closed.
+    fn clear_hardware_breakpoint(&mut self, thread_id: u32, slot: u8) -> Result<(), Self::Error>;
+
+    /// Exactly-once continue with an explicit thread identity.
+    ///
+    /// `thread_id` must equal the pending event's thread; a mismatch fails
+    /// closed and leaves the event pending. Records a [`CapabilityOp::Continue`].
+    fn continue_thread(
+        &mut self,
+        thread_id: u32,
+        status: ContinueStatus,
+    ) -> Result<(), Self::Error>;
+
+    /// Capability operations executed so far, in execution order.
+    fn capability_log(&self) -> &[CapabilityRecord];
 }
 
 /// Sparse scripted process memory for offline replay (Slice 4).
@@ -166,9 +310,14 @@ pub struct ReplayRuntimeEngine {
     index: usize,
     next_sequence: u64,
     pending: bool,
+    pending_thread: Option<u32>,
     runtime_base: Option<RuntimeBase>,
     process_exited: bool,
     memory: ReplayMemory,
+    contexts: BTreeMap<u32, ThreadContextSnapshot>,
+    breakpoints: BTreeMap<(u32, u8), (u64, HwbpType)>,
+    cap_records: Vec<CapabilityRecord>,
+    cap_seq: u64,
 }
 
 impl ReplayRuntimeEngine {
@@ -190,10 +339,22 @@ impl ReplayRuntimeEngine {
             index: 0,
             next_sequence: 1,
             pending: false,
+            pending_thread: None,
             runtime_base,
             process_exited: false,
             memory,
+            contexts: BTreeMap::new(),
+            breakpoints: BTreeMap::new(),
+            cap_records: Vec::new(),
+            cap_seq: 0,
         }
+    }
+
+    /// Seed a scripted thread context (fail-closed reads for unseeded
+    /// threads).
+    pub fn seed_context(&mut self, thread_id: u32, context: ThreadContextSnapshot) -> &mut Self {
+        self.contexts.insert(thread_id, context);
+        self
     }
 
     /// Events remaining to deliver.
@@ -219,14 +380,13 @@ impl ReplayRuntimeEngine {
         &mut self.memory
     }
 
-    /// Read process memory from the script (absolute VA as `usize`).
-    pub fn read_memory(&self, address: usize, buf: &mut [u8]) -> Result<usize, CoreError> {
-        self.memory.read(address as u64, buf)
-    }
-
-    /// Write process memory into the script.
-    pub fn write_memory(&mut self, address: usize, data: &[u8]) -> Result<usize, CoreError> {
-        self.memory.write(address as u64, data)
+    fn record(&mut self, thread_id: u32, op: CapabilityOp) {
+        self.cap_seq = self.cap_seq.saturating_add(1);
+        self.cap_records.push(CapabilityRecord {
+            sequence: self.cap_seq,
+            thread_id,
+            op,
+        });
     }
 }
 
@@ -257,6 +417,7 @@ impl RuntimeEngine for ReplayRuntimeEngine {
         let sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.saturating_add(1);
         self.pending = true;
+        self.pending_thread = Some(thread_id_of(&event));
         if matches!(event, DebugEvent::ExitProcess { .. }) {
             self.process_exited = true;
         }
@@ -274,6 +435,7 @@ impl RuntimeEngine for ReplayRuntimeEngine {
         }
         // Replay has no fallible continue; clear only after accept.
         self.pending = false;
+        self.pending_thread = None;
         Ok(())
     }
 
@@ -283,6 +445,139 @@ impl RuntimeEngine for ReplayRuntimeEngine {
 
     fn process_exited(&self) -> bool {
         self.process_exited
+    }
+
+    fn pending_thread_id(&self) -> Option<u32> {
+        self.pending_thread
+    }
+
+    fn read_memory(&mut self, address: u64, buf: &mut [u8]) -> Result<usize, Self::Error> {
+        let thread_id = self.pending_thread.unwrap_or(0);
+        let result = self.memory.read(address, buf);
+        let record = result.as_ref().copied().map_err(|e| e.to_string());
+        self.record(
+            thread_id,
+            CapabilityOp::ReadMemory {
+                address,
+                len: buf.len(),
+                result: record,
+            },
+        );
+        result
+    }
+
+    fn write_memory(&mut self, address: u64, data: &[u8]) -> Result<usize, Self::Error> {
+        let thread_id = self.pending_thread.unwrap_or(0);
+        let result = self.memory.write(address, data);
+        let record = result.as_ref().copied().map_err(|e| e.to_string());
+        self.record(
+            thread_id,
+            CapabilityOp::WriteMemory {
+                address,
+                len: data.len(),
+                result: record,
+            },
+        );
+        result
+    }
+
+    fn get_thread_context(&mut self, thread_id: u32) -> Result<ThreadContextSnapshot, Self::Error> {
+        let result = self.contexts.get(&thread_id).copied().ok_or_else(|| {
+            CoreError::DebugState(format!(
+                "ReplayRuntimeEngine::get_thread_context: no scripted context for thread {thread_id}"
+            ))
+        });
+        self.record(
+            thread_id,
+            CapabilityOp::GetThreadContext {
+                result: result.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+            },
+        );
+        result
+    }
+
+    fn set_thread_context(
+        &mut self,
+        thread_id: u32,
+        context: &ThreadContextSnapshot,
+    ) -> Result<(), Self::Error> {
+        let result = self.contexts.insert(thread_id, *context).map(|_| ()).ok_or_else(|| {
+            CoreError::DebugState(format!(
+                "ReplayRuntimeEngine::set_thread_context: no scripted context for thread {thread_id}"
+            ))
+        });
+        let record = result.as_ref().map(|_| ()).map_err(|e| e.to_string());
+        self.record(thread_id, CapabilityOp::SetThreadContext { result: record });
+        result
+    }
+
+    fn set_hardware_breakpoint(
+        &mut self,
+        thread_id: u32,
+        slot: u8,
+        address: u64,
+        kind: HwbpType,
+    ) -> Result<(), Self::Error> {
+        let result = set_breakpoint_slot(&mut self.breakpoints, thread_id, slot, address, kind);
+        let record = result.as_ref().map(|_| ()).map_err(|e| e.to_string());
+        self.record(
+            thread_id,
+            CapabilityOp::SetHardwareBreakpoint {
+                slot,
+                address,
+                kind,
+                result: record,
+            },
+        );
+        result
+    }
+
+    fn clear_hardware_breakpoint(&mut self, thread_id: u32, slot: u8) -> Result<(), Self::Error> {
+        let result = clear_breakpoint_slot(&mut self.breakpoints, thread_id, slot);
+        let record = result.as_ref().map(|_| ()).map_err(|e| e.to_string());
+        self.record(
+            thread_id,
+            CapabilityOp::ClearHardwareBreakpoint {
+                slot,
+                result: record,
+            },
+        );
+        result
+    }
+
+    fn continue_thread(
+        &mut self,
+        thread_id: u32,
+        status: ContinueStatus,
+    ) -> Result<(), Self::Error> {
+        let result = (|| -> Result<(), CoreError> {
+            let pending = self.pending_thread.ok_or_else(|| {
+                CoreError::DebugState(
+                    "ReplayRuntimeEngine::continue_thread: no pending event".into(),
+                )
+            })?;
+            if pending != thread_id {
+                return Err(CoreError::DebugState(format!(
+                    "ReplayRuntimeEngine::continue_thread: thread id mismatch (pending {pending}, got {thread_id})"
+                )));
+            }
+            self.pending = false;
+            self.pending_thread = None;
+            Ok(())
+        })();
+        let record = result.as_ref().map(|_| ()).map_err(|e| e.to_string());
+        self.record(
+            thread_id,
+            CapabilityOp::Continue {
+                status,
+                result: record,
+            },
+        );
+        result
+    }
+
+    fn capability_log(&self) -> &[CapabilityRecord] {
+        &self.cap_records
     }
 }
 
@@ -298,6 +593,8 @@ pub struct DebuggerCoreEngine<D: DebuggerCore> {
     next_sequence: u64,
     pending_thread: Option<u32>,
     process_exited: bool,
+    cap_records: Vec<CapabilityRecord>,
+    cap_seq: u64,
 }
 
 impl<D: DebuggerCore> DebuggerCoreEngine<D> {
@@ -309,7 +606,18 @@ impl<D: DebuggerCore> DebuggerCoreEngine<D> {
             next_sequence: 1,
             pending_thread: None,
             process_exited: false,
+            cap_records: Vec::new(),
+            cap_seq: 0,
         }
+    }
+
+    fn record(&mut self, thread_id: u32, op: CapabilityOp) {
+        self.cap_seq = self.cap_seq.saturating_add(1);
+        self.cap_records.push(CapabilityRecord {
+            sequence: self.cap_seq,
+            thread_id,
+            op,
+        });
     }
 
     /// Borrow the underlying backend (memory / BP / context).
@@ -378,6 +686,66 @@ fn thread_id_of(event: &DebugEvent) -> u32 {
     }
 }
 
+/// Arm one hardware breakpoint slot with fail-closed validation.
+fn set_breakpoint_slot(
+    breakpoints: &mut BTreeMap<(u32, u8), (u64, HwbpType)>,
+    thread_id: u32,
+    slot: u8,
+    address: u64,
+    kind: HwbpType,
+) -> Result<(), CoreError> {
+    if slot >= 4 {
+        return Err(CoreError::DebugState(format!(
+            "hardware breakpoint slot {slot} out of range (DR0..DR3)"
+        )));
+    }
+    if address == 0 {
+        return Err(CoreError::DebugState(
+            "hardware breakpoint address must be non-zero".into(),
+        ));
+    }
+    let key = (thread_id, slot);
+    if breakpoints.contains_key(&key) {
+        return Err(CoreError::DebugState(format!(
+            "hardware breakpoint slot {slot} already armed for thread {thread_id}"
+        )));
+    }
+    breakpoints.insert(key, (address, kind));
+    Ok(())
+}
+
+/// Disarm one hardware breakpoint slot; clearing an unarmed slot fails.
+fn clear_breakpoint_slot(
+    breakpoints: &mut BTreeMap<(u32, u8), (u64, HwbpType)>,
+    thread_id: u32,
+    slot: u8,
+) -> Result<(), CoreError> {
+    if breakpoints.remove(&(thread_id, slot)).is_none() {
+        return Err(CoreError::DebugState(format!(
+            "hardware breakpoint slot {slot} not armed for thread {thread_id}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn context_to_snapshot(
+    ctx: &windows::Win32::System::Diagnostics::Debug::CONTEXT,
+) -> ThreadContextSnapshot {
+    ThreadContextSnapshot {
+        rip: ctx.Rip,
+        rsp: ctx.Rsp,
+        rbp: ctx.Rbp,
+        rax: ctx.Rax,
+        eflags: ctx.EFlags,
+    }
+}
+
+#[cfg(not(windows))]
+fn context_to_snapshot(_ctx: &()) -> ThreadContextSnapshot {
+    ThreadContextSnapshot::blank()
+}
+
 impl<D: DebuggerCore> RuntimeEngine for DebuggerCoreEngine<D> {
     type Error = CoreError;
 
@@ -422,6 +790,166 @@ impl<D: DebuggerCore> RuntimeEngine for DebuggerCoreEngine<D> {
 
     fn process_exited(&self) -> bool {
         self.process_exited
+    }
+
+    fn pending_thread_id(&self) -> Option<u32> {
+        self.pending_thread
+    }
+
+    fn read_memory(&mut self, address: u64, buf: &mut [u8]) -> Result<usize, Self::Error> {
+        let thread_id = self.pending_thread.unwrap_or(0);
+        let result = self.inner.read_memory(address as usize, buf);
+        let record = result.as_ref().copied().map_err(|e| e.to_string());
+        self.record(
+            thread_id,
+            CapabilityOp::ReadMemory {
+                address,
+                len: buf.len(),
+                result: record,
+            },
+        );
+        result
+    }
+
+    fn write_memory(&mut self, address: u64, data: &[u8]) -> Result<usize, Self::Error> {
+        let thread_id = self.pending_thread.unwrap_or(0);
+        let result = self.inner.write_memory(address as usize, data);
+        let record = result.as_ref().copied().map_err(|e| e.to_string());
+        self.record(
+            thread_id,
+            CapabilityOp::WriteMemory {
+                address,
+                len: data.len(),
+                result: record,
+            },
+        );
+        result
+    }
+
+    fn get_thread_context(&mut self, thread_id: u32) -> Result<ThreadContextSnapshot, Self::Error> {
+        let result = self
+            .inner
+            .get_thread_context(thread_id)
+            .map(|ctx| context_to_snapshot(&ctx));
+        self.record(
+            thread_id,
+            CapabilityOp::GetThreadContext {
+                result: result.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+            },
+        );
+        result
+    }
+
+    fn set_thread_context(
+        &mut self,
+        thread_id: u32,
+        context: &ThreadContextSnapshot,
+    ) -> Result<(), Self::Error> {
+        // Read-modify-write: pull the live context so untouched registers
+        // (including debug registers) are preserved.
+        let result = (|| -> Result<(), CoreError> {
+            let mut ctx = self.inner.get_thread_context(thread_id)?;
+            ctx.Rip = context.rip;
+            ctx.Rsp = context.rsp;
+            ctx.Rbp = context.rbp;
+            ctx.Rax = context.rax;
+            ctx.EFlags = context.eflags;
+            self.inner.set_thread_context(thread_id, &ctx)
+        })();
+        let record = result.as_ref().map(|_| ()).map_err(|e| e.to_string());
+        self.record(thread_id, CapabilityOp::SetThreadContext { result: record });
+        result
+    }
+
+    fn set_hardware_breakpoint(
+        &mut self,
+        thread_id: u32,
+        slot: u8,
+        address: u64,
+        kind: HwbpType,
+    ) -> Result<(), Self::Error> {
+        let result = (|| -> Result<(), CoreError> {
+            // Validate against the engine slot table first (fail-closed),
+            // then arm the debug register via a context read-modify-write.
+            let mut slots = BTreeMap::new();
+            set_breakpoint_slot(&mut slots, thread_id, slot, address, kind)?;
+            let mut ctx = self.inner.get_thread_context(thread_id)?;
+            match slot {
+                0 => ctx.Dr0 = address,
+                1 => ctx.Dr1 = address,
+                2 => ctx.Dr2 = address,
+                _ => ctx.Dr3 = address,
+            }
+            self.inner.set_thread_context(thread_id, &ctx)
+        })();
+        let record = result.as_ref().map(|_| ()).map_err(|e| e.to_string());
+        self.record(
+            thread_id,
+            CapabilityOp::SetHardwareBreakpoint {
+                slot,
+                address,
+                kind,
+                result: record,
+            },
+        );
+        result
+    }
+
+    fn clear_hardware_breakpoint(&mut self, thread_id: u32, slot: u8) -> Result<(), Self::Error> {
+        let result = (|| -> Result<(), CoreError> {
+            let mut ctx = self.inner.get_thread_context(thread_id)?;
+            match slot {
+                0 => ctx.Dr0 = 0,
+                1 => ctx.Dr1 = 0,
+                2 => ctx.Dr2 = 0,
+                _ => ctx.Dr3 = 0,
+            }
+            self.inner.set_thread_context(thread_id, &ctx)
+        })();
+        let record = result.as_ref().map(|_| ()).map_err(|e| e.to_string());
+        self.record(
+            thread_id,
+            CapabilityOp::ClearHardwareBreakpoint {
+                slot,
+                result: record,
+            },
+        );
+        result
+    }
+
+    fn continue_thread(
+        &mut self,
+        thread_id: u32,
+        status: ContinueStatus,
+    ) -> Result<(), Self::Error> {
+        let result = (|| -> Result<(), CoreError> {
+            let pending = self.pending_thread.ok_or_else(|| {
+                CoreError::DebugState(
+                    "DebuggerCoreEngine::continue_thread: no pending event".into(),
+                )
+            })?;
+            if pending != thread_id {
+                return Err(CoreError::DebugState(format!(
+                    "DebuggerCoreEngine::continue_thread: thread id mismatch (pending {pending}, got {thread_id})"
+                )));
+            }
+            self.inner.continue_event(thread_id, status)?;
+            self.pending_thread = None;
+            Ok(())
+        })();
+        let record = result.as_ref().map(|_| ()).map_err(|e| e.to_string());
+        self.record(
+            thread_id,
+            CapabilityOp::Continue {
+                status,
+                result: record,
+            },
+        );
+        result
+    }
+
+    fn capability_log(&self) -> &[CapabilityRecord] {
+        &self.cap_records
     }
 }
 
@@ -626,7 +1154,7 @@ mod tests {
                 } => {
                     phases.push("guard_av");
                     let mut sample = [0u8; 4];
-                    eng.read_memory(*address as usize, &mut sample).unwrap();
+                    eng.read_memory(*address, &mut sample).unwrap();
                     assert_eq!(sample, [0xcc, 0xcc, 0xcc, 0xcc]);
                     packer.note_guard_installed(&mut ctx);
                     assert!(ctx.guard_installed);
@@ -634,7 +1162,7 @@ mod tests {
                 DebugEvent::Breakpoint { address, .. } => {
                     phases.push("oep_bp");
                     let mut oep_bytes = [0u8; 4];
-                    eng.read_memory(*address as usize, &mut oep_bytes).unwrap();
+                    eng.read_memory(*address, &mut oep_bytes).unwrap();
                     assert_eq!(oep_bytes[0], 0x48);
                     let advice = packer.note_oep_accepted(&mut ctx, *address, false);
                     assert_eq!(advice, PluginAdvice::Transition(UnpackPhase::OepCandidate));
@@ -673,6 +1201,12 @@ mod tests {
         image_base: u64,
         continues: Vec<(u32, ContinueStatus)>,
         pending_thread_id: Option<u32>,
+        /// Scripted thread contexts; unknown threads fail (like the live path).
+        /// `DebuggerCore::set_thread_context` takes `&self`, so the map is
+        /// interior-mutable.
+        contexts: std::cell::RefCell<BTreeMap<u32, ThreadContextSnapshot>>,
+        /// Scripted memory (used for capability read/write parity).
+        memory: BTreeMap<u64, Vec<u8>>,
     }
 
     impl ScriptedDebugger {
@@ -683,7 +1217,23 @@ mod tests {
                 image_base,
                 continues: Vec::new(),
                 pending_thread_id: None,
+                contexts: std::cell::RefCell::new(BTreeMap::new()),
+                memory: BTreeMap::new(),
             }
+        }
+
+        fn with_contexts(
+            events: Vec<DebugEvent>,
+            image_base: u64,
+            contexts: BTreeMap<u32, ThreadContextSnapshot>,
+        ) -> Self {
+            let this = Self::new(events, image_base);
+            *this.contexts.borrow_mut() = contexts;
+            this
+        }
+
+        fn map_memory(&mut self, address: u64, data: Vec<u8>) {
+            self.memory.insert(address, data);
         }
     }
 
@@ -724,16 +1274,72 @@ mod tests {
             self.pending_thread_id = None;
             Ok(())
         }
-        fn read_memory(&self, _address: usize, _buf: &mut [u8]) -> Result<usize, CoreError> {
-            Ok(0)
+        fn read_memory(&self, address: usize, buf: &mut [u8]) -> Result<usize, CoreError> {
+            let address = address as u64;
+            let (region_start, region) = self
+                .memory
+                .iter()
+                .find(|(start, data)| address >= **start && address < **start + data.len() as u64)
+                .ok_or_else(|| CoreError::MemoryRead {
+                    address,
+                    requested: buf.len(),
+                })?;
+            let offset = (address - region_start) as usize;
+            let available = region.len().saturating_sub(offset);
+            let n = available.min(buf.len());
+            buf[..n].copy_from_slice(&region[offset..offset + n]);
+            Ok(n)
         }
-        fn write_memory(&mut self, _address: usize, data: &[u8]) -> Result<usize, CoreError> {
-            Ok(data.len())
+        fn write_memory(&mut self, address: usize, data: &[u8]) -> Result<usize, CoreError> {
+            let address = address as u64;
+            let mut updated = None;
+            for (start, region) in &mut self.memory {
+                let region_start = *start;
+                if address >= region_start && address < region_start + region.len() as u64 {
+                    let offset = (address - region_start) as usize;
+                    let n = data.len().min(region.len() - offset);
+                    region[offset..offset + n].copy_from_slice(&data[..n]);
+                    updated = Some(n);
+                    break;
+                }
+            }
+            updated.ok_or(CoreError::DebugState(
+                "ScriptedDebugger write outside scripted region".into(),
+            ))
         }
-        fn get_thread_context(&self, _thread_id: u32) -> Result<CONTEXT, CoreError> {
-            Err(CoreError::DebugState("not implemented".into()))
+        fn get_thread_context(&self, thread_id: u32) -> Result<CONTEXT, CoreError> {
+            // Convert the scripted snapshot into a native CONTEXT so the
+            // engine's conversion path is exercised end to end.
+            let snap = self
+                .contexts
+                .borrow()
+                .get(&thread_id)
+                .copied()
+                .ok_or_else(|| {
+                    CoreError::DebugState(format!(
+                        "ScriptedDebugger: no context for thread {thread_id}"
+                    ))
+                })?;
+            let mut ctx = CONTEXT::default();
+            ctx.Rip = snap.rip;
+            ctx.Rsp = snap.rsp;
+            ctx.Rbp = snap.rbp;
+            ctx.Rax = snap.rax;
+            ctx.EFlags = snap.eflags;
+            Ok(ctx)
         }
-        fn set_thread_context(&self, _thread_id: u32, _ctx: &CONTEXT) -> Result<(), CoreError> {
+        fn set_thread_context(&self, thread_id: u32, ctx: &CONTEXT) -> Result<(), CoreError> {
+            let mut contexts = self.contexts.borrow_mut();
+            let snap = contexts.get_mut(&thread_id).ok_or_else(|| {
+                CoreError::DebugState(format!(
+                    "ScriptedDebugger: no context for thread {thread_id}"
+                ))
+            })?;
+            snap.rip = ctx.Rip;
+            snap.rsp = ctx.Rsp;
+            snap.rbp = ctx.Rbp;
+            snap.rax = ctx.Rax;
+            snap.eflags = ctx.EFlags;
             Ok(())
         }
     }
@@ -920,5 +1526,257 @@ mod tests {
         assert!(eng.continue_event(ContinueStatus::Continue).is_err());
         assert!(eng.has_pending(), "failed continue must keep pending");
         assert!(eng.wait(None).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // P3-A capability contract tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn replay_capability_log_records_sequence_and_thread() {
+        let mut eng = ReplayRuntimeEngine::new(vec![
+            create_process(0x140000000),
+            DebugEvent::ExitProcess { exit_code: 0 },
+        ]);
+        eng.wait(None).unwrap();
+        // Seed a context so set/get both succeed.
+        eng.seed_context(
+            2,
+            ThreadContextSnapshot {
+                rip: 0x140001000,
+                ..ThreadContextSnapshot::blank()
+            },
+        );
+        let mut buf = [0u8; 4];
+        eng.read_memory(0x140001000, &mut buf).unwrap_err(); // unmapped -> fail closed
+        eng.set_hardware_breakpoint(2, 0, 0x140001234, HwbpType::Execute)
+            .unwrap();
+        eng.clear_hardware_breakpoint(2, 0).unwrap();
+        let ctx = eng.get_thread_context(2).unwrap();
+        assert_eq!(ctx.rip, 0x140001000);
+
+        let log = eng.capability_log();
+        assert_eq!(log.len(), 4);
+        // Sequence is per-op monotonic.
+        let seqs: Vec<u64> = log.iter().map(|r| r.sequence).collect();
+        assert_eq!(seqs, vec![1, 2, 3, 4]);
+        // Thread ids recorded per operation.
+        assert_eq!(log[0].thread_id, 2);
+        assert!(matches!(
+            log[0].op,
+            CapabilityOp::ReadMemory { result: Err(_), .. }
+        ));
+        assert!(matches!(
+            log[1].op,
+            CapabilityOp::SetHardwareBreakpoint { slot: 0, .. }
+        ));
+        assert!(matches!(
+            log[2].op,
+            CapabilityOp::ClearHardwareBreakpoint { slot: 0, .. }
+        ));
+        assert!(matches!(
+            log[3].op,
+            CapabilityOp::GetThreadContext { result: Ok(()) }
+        ));
+    }
+
+    #[test]
+    fn replay_unmapped_read_fails_closed_and_is_recorded() {
+        let mut eng = ReplayRuntimeEngine::new(vec![DebugEvent::Other { thread_id: 7 }]);
+        eng.wait(None).unwrap();
+        let mut buf = [0u8; 8];
+        let err = eng.read_memory(0xdead_beef, &mut buf).unwrap_err();
+        assert!(matches!(err, CoreError::MemoryRead { .. }));
+        assert!(matches!(
+            &eng.capability_log()[0].op,
+            CapabilityOp::ReadMemory { result: Err(_), .. }
+        ));
+    }
+
+    #[test]
+    fn replay_context_fail_closed_for_unseeded_thread() {
+        let mut eng = ReplayRuntimeEngine::new(vec![DebugEvent::Other { thread_id: 3 }]);
+        eng.wait(None).unwrap();
+        assert!(eng.get_thread_context(3).is_err());
+        // Set without a scripted context also fails (mirrors live RMW which
+        // must read first).
+        let snap = ThreadContextSnapshot::blank();
+        assert!(eng.set_thread_context(3, &snap).is_err());
+    }
+
+    #[test]
+    fn replay_breakpoint_slot_validation_fails_closed() {
+        let mut eng = ReplayRuntimeEngine::new(vec![DebugEvent::Other { thread_id: 3 }]);
+        eng.wait(None).unwrap();
+        // Slot out of range.
+        assert!(eng
+            .set_hardware_breakpoint(3, 4, 0x1000, HwbpType::Execute)
+            .is_err());
+        // Zero address.
+        assert!(eng
+            .set_hardware_breakpoint(3, 0, 0, HwbpType::Execute)
+            .is_err());
+        // Duplicate slot.
+        eng.set_hardware_breakpoint(3, 1, 0x1234, HwbpType::Write)
+            .unwrap();
+        assert!(eng
+            .set_hardware_breakpoint(3, 1, 0x5678, HwbpType::Write)
+            .is_err());
+        // Clear an unarmed slot.
+        assert!(eng.clear_hardware_breakpoint(3, 2).is_err());
+        // Clear the armed one.
+        eng.clear_hardware_breakpoint(3, 1).unwrap();
+    }
+
+    #[test]
+    fn continue_thread_rejects_thread_id_mismatch_and_keeps_pending() {
+        let mut replay = ReplayRuntimeEngine::new(vec![
+            DebugEvent::Other { thread_id: 5 },
+            DebugEvent::ExitProcess { exit_code: 0 },
+        ]);
+        replay.wait(None).unwrap();
+        assert_eq!(replay.pending_thread_id(), Some(5));
+        let err = replay
+            .continue_thread(9, ContinueStatus::Continue)
+            .unwrap_err();
+        assert!(format!("{err}").contains("thread id mismatch"));
+        assert!(replay.has_pending(), "mismatch must keep the event pending");
+        assert_eq!(replay.pending_thread_id(), Some(5));
+        replay.continue_thread(5, ContinueStatus::Continue).unwrap();
+        assert!(!replay.has_pending());
+
+        let mut live = DebuggerCoreEngine::new(ScriptedDebugger::new(
+            vec![DebugEvent::Other { thread_id: 5 }],
+            0,
+        ));
+        live.wait(None).unwrap();
+        let err = live
+            .continue_thread(9, ContinueStatus::Continue)
+            .unwrap_err();
+        assert!(format!("{err}").contains("thread id mismatch"));
+        assert!(live.has_pending());
+        live.continue_thread(5, ContinueStatus::Continue).unwrap();
+    }
+
+    #[test]
+    fn live_context_rmw_preserves_untouched_registers() {
+        let seed = ThreadContextSnapshot {
+            rip: 0x140001000,
+            rsp: 0x140001f00,
+            rbp: 0x140001e00,
+            rax: 0xaa,
+            eflags: 0x202,
+        };
+        let dbg = ScriptedDebugger::with_contexts(
+            vec![DebugEvent::Other { thread_id: 11 }],
+            0x140000000,
+            BTreeMap::from([(11, seed)]),
+        );
+        let mut eng = DebuggerCoreEngine::new(dbg);
+        eng.wait(None).unwrap();
+        let got = eng.get_thread_context(11).unwrap();
+        assert_eq!(got, seed);
+        let mut adjusted = got;
+        adjusted.rip = 0x140001234;
+        adjusted.rax = 0;
+        eng.set_thread_context(11, &adjusted).unwrap();
+        let after = eng.get_thread_context(11).unwrap();
+        assert_eq!(after.rip, 0x140001234);
+        assert_eq!(after.rax, 0);
+        // Untouched registers survive the read-modify-write.
+        assert_eq!(after.rsp, seed.rsp);
+        assert_eq!(after.rbp, seed.rbp);
+        assert_eq!(after.eflags, seed.eflags);
+        // Live capability log parity shape: get, set, get.
+        let log = eng.capability_log();
+        assert_eq!(log.len(), 3);
+        assert!(matches!(
+            log[1].op,
+            CapabilityOp::SetThreadContext { result: Ok(()) }
+        ));
+    }
+
+    #[test]
+    fn capability_parity_replay_vs_live_adapter() {
+        let base = 0x7ff6_c050_0000u64;
+        let seed = ThreadContextSnapshot {
+            rip: base + 0x1000,
+            rsp: base + 0x1f00,
+            rbp: base + 0x1e00,
+            rax: 0x10,
+            eflags: 0x202,
+        };
+        let build_events = || {
+            vec![
+                create_process(base),
+                DebugEvent::AccessViolation {
+                    thread_id: 2,
+                    address: base + 0x1000,
+                    is_write: false,
+                    target_address: base + 0x1000,
+                    exc_type: 8,
+                },
+                DebugEvent::ExitProcess { exit_code: 0 },
+            ]
+        };
+
+        // Drive both engines through the identical capability sequence.
+        let mut replay = ReplayRuntimeEngine::with_memory(build_events(), {
+            let mut mem = ReplayMemory::new();
+            mem.map(base + 0x1000, vec![0xcc; 16]);
+            mem
+        });
+        replay.seed_context(2, seed);
+        replay.wait(None).unwrap();
+        let mut buf = [0u8; 4];
+        replay.read_memory(base + 0x1000, &mut buf).unwrap();
+        let mut adjusted = replay.get_thread_context(2).unwrap();
+        adjusted.rip += 0x10;
+        replay.set_thread_context(2, &adjusted).unwrap();
+        replay
+            .set_hardware_breakpoint(2, 0, base + 0x2000, HwbpType::Execute)
+            .unwrap();
+        replay.continue_thread(2, ContinueStatus::Continue).unwrap();
+        replay.wait(None).unwrap();
+
+        let mut live_dbg =
+            ScriptedDebugger::with_contexts(build_events(), base, BTreeMap::from([(2, seed)]));
+        live_dbg.map_memory(base + 0x1000, vec![0xcc; 16]);
+        let mut live = DebuggerCoreEngine::new(live_dbg);
+        live.wait(None).unwrap();
+        let mut buf = [0u8; 4];
+        live.read_memory(base + 0x1000, &mut buf).unwrap();
+        let mut adjusted = live.get_thread_context(2).unwrap();
+        adjusted.rip += 0x10;
+        live.set_thread_context(2, &adjusted).unwrap();
+        live.set_hardware_breakpoint(2, 0, base + 0x2000, HwbpType::Execute)
+            .unwrap();
+        live.continue_thread(2, ContinueStatus::Continue).unwrap();
+        live.wait(None).unwrap();
+
+        // Capability logs must be identical op-for-op through the AV event.
+        assert_eq!(live.capability_log(), replay.capability_log());
+
+        // Continue the AV event with the engine-resolved pending thread, then
+        // deliver and continue the ExitProcess (replay pending: abstract 0;
+        // live: backend-reported real thread). Both must succeed exactly once.
+        let replay_tid = replay.pending_thread_id().expect("replay AV pending");
+        let live_tid = live.pending_thread_id().expect("live AV pending");
+        replay
+            .continue_thread(replay_tid, ContinueStatus::Continue)
+            .unwrap();
+        live.continue_thread(live_tid, ContinueStatus::Continue)
+            .unwrap();
+        replay.wait(None).unwrap();
+        live.wait(None).unwrap();
+        let replay_tid = replay.pending_thread_id().expect("replay exit pending");
+        let live_tid = live.pending_thread_id().expect("live exit pending");
+        replay
+            .continue_thread(replay_tid, ContinueStatus::Continue)
+            .unwrap();
+        live.continue_thread(live_tid, ContinueStatus::Continue)
+            .unwrap();
+        assert!(replay.process_exited());
+        assert!(live.process_exited());
     }
 }
