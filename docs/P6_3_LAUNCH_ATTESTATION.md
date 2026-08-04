@@ -1,6 +1,6 @@
 # P6.3 Launch Attestation Closure
 
-Status: implemented (five commits on `oreans/two-sample-mainline`).
+Status: implemented (P6.3 + P6.3.1 on `oreans/two-sample-mainline`).
 
 Scope: offline engineering hardening only. No real sample was opened or
 started; `validation_summary.json` remains `open`.
@@ -75,15 +75,37 @@ launch attestation -> RunEvidenceContext -> sidecar producers
 ```
 
 `assemble_evidence_bundle` derives `case_id`, `tool_revision` and
-`runner_config_digest` exclusively from the attested context and CONSUMES
-it (one-time authorization). `complete_run_evidence` is the production
-driver: it collects the seven members exactly as the producers name them
-(five structured sidecars + dumper transform manifest + PE evidence via the
-acceptance binary), fails closed on any missing member, and writes the
-bundle atomically. The unpack pipeline calls it after a successful gated
-run, so the bundle digest always equals the launch attestation digest.
+`runner_config_digest` exclusively from the attested context. `complete_run_evidence`
+is the production driver: it collects the seven members exactly as the
+producers name them (five structured sidecars + dumper transform manifest +
+PE evidence via the acceptance binary), fails closed on any missing member,
+and writes the bundle atomically. The unpack pipeline calls it after a
+successful gated run, so the bundle digest always equals the launch
+attestation digest.
 
-## Attack tests (`crates/cli/tests/launch_attestation.rs`, 15 tests)
+### P6.3.1 seal + verifier binding
+
+- `RunEvidenceContext` is sealed: not `Clone`, every field private (getters
+  only), no public constructor (crate-private `new`, reachable only from
+  the attestation and crate unit tests). `complete_run_evidence` and
+  `assemble_evidence_bundle` take it BY VALUE, so one attestation
+  authorizes exactly one bundle — a second use is a compile error.
+- The envelope is `mida.runner-config-envelope/v2` and binds the verifier
+  binary identity (`verifier_sha256`, pinned at staging). The launch
+  attestation and the PE-evidence path recompute the verifier they would
+  use and fail closed on any replacement / path drift / hash drift.
+- Production verifier resolution never consults the environment
+  (`MIDA_ACCEPTANCE_BIN` removed); tests inject the verifier explicitly via
+  `--acceptance-bin` (both `/offline-preflight` and `/unpack`) or the
+  attestation/bundle parameters.
+- The launch attestation emits a stable, filter-independent gate line
+  (`launch attestation: Ready (...)`), so the positive control does not
+  depend on the log filter.
+- Tests fail closed on a stale sibling `mida-acceptance` binary (it must be
+  newer than the acceptance sources); the `cargo test --workspace` gate
+  rebuilds it fresh (hermetic).
+
+## Attack tests (`crates/cli/tests/launch_attestation.rs`, 16 tests)
 
 1. hand-written `ready` is never an authorization (verifier re-run
    NotReady blocks);
@@ -104,14 +126,19 @@ run, so the bundle digest always equals the launch attestation digest.
 12. `$schema` drift is rejected by both the runner and the acceptance
     verifier;
 13. the production bundle digest equals the launch attestation digest;
-14. a consumed authorization cannot be consumed a second time;
-15. positive control: a genuinely re-verified Ready report passes the
+14. an attested authorization is one-time by ownership (P6.3.1 seal: the
+    context is moved into the assembler; no Clone, no public constructor);
+15. a verifier different from the envelope-pinned identity is refused at
+    launch;
+16. positive control: a genuinely re-verified Ready report passes the
     attestation and the pipeline continues past it.
 
 Negative tests use the real `mida-acceptance` binary; the pass-path and
 chain tests use the deterministic `mida-verifier-stub`
 (`crates/cli/tests/bin/verifier_stub.rs`, a test-support bin that mirrors
-the acceptance CLI surface).
+the acceptance CLI surface). The assembler unit tests
+(`bundle_assembler::tests`) now live in the crate so they can construct a
+sealed `RunEvidenceContext` and exercise the by-value ownership consume.
 
 ## Remaining boundaries
 
