@@ -6,9 +6,9 @@
 //! - **Producer (this module, `mida-cli` production)**: builds
 //!   [`mida_core::runner_config::RunnerConfig`] from the actual run policy,
 //!   computes the digest with `mida_core::runner_config::runner_config_digest`,
-//!   and atomically emits the `mida.runner-config-envelope/v1` envelope
+//!   and atomically emits the `mida.runner-config-envelope/v2` envelope
 //!   (full config JSON + producer digest + CLI binary SHA-256 + tool
-//!   revision).
+//!   revision + verifier SHA-256 identity).
 //! - **Verifier (`mida-acceptance` binary)**: reparses the envelope JSON
 //!   with its own dependency-free `RunnerConfig`, recomputes the digest with
 //!   its own canonical implementation, and produces `preflight.json`.
@@ -42,7 +42,11 @@ use serde::{Deserialize, Serialize};
 use crate::unpacker::sidecar_io::atomic_write;
 
 /// Schema id of the runner-config envelope.
-pub const RUNNER_CONFIG_ENVELOPE_SCHEMA_VERSION: &str = "mida.runner-config-envelope/v1";
+///
+/// v2 (P6.3.1): binds the verifier binary identity (`verifier_sha256`) so
+/// the production launch and PE-evidence paths never trust an unbound
+/// verifier. v1 envelopes no longer parse (no persisted v1 envelopes exist).
+pub const RUNNER_CONFIG_ENVELOPE_SCHEMA_VERSION: &str = "mida.runner-config-envelope/v2";
 /// Filename of the envelope inside the preflight output dir.
 pub const RUNNER_CONFIG_ENVELOPE_FILENAME: &str = "runner-config-envelope.json";
 /// Filename of the preflight report inside the preflight output dir.
@@ -81,7 +85,7 @@ pub fn bind_actual_config_to_envelope(
     Ok(())
 }
 
-/// The `mida.runner-config-envelope/v1` emitted by the runner side.
+/// The `mida.runner-config-envelope/v2` emitted by the runner side.
 ///
 /// `deny_unknown_fields` + required fields: a tampered envelope (unknown
 /// field, missing field) fails closed at deserialization.
@@ -99,6 +103,10 @@ pub struct RunnerConfigEnvelope {
     pub cli_binary_sha256: String,
     /// Tool revision (git HEAD) the run is pinned to.
     pub tool_revision: String,
+    /// SHA-256 of the independent acceptance verifier binary pinned at
+    /// staging (P6.3.1): the launch and PE-evidence paths fail closed unless
+    /// the verifier they resolve hashes to exactly this.
+    pub verifier_sha256: String,
 }
 
 impl RunnerConfigEnvelope {
@@ -107,6 +115,7 @@ impl RunnerConfigEnvelope {
         runner_config: &mida_core::runner_config::RunnerConfig,
         cli_binary_sha256: &str,
         tool_revision: &str,
+        verifier_sha256: &str,
     ) -> RunnerConfigEnvelope {
         let digest = mida_core::runner_config::runner_config_digest(runner_config);
         RunnerConfigEnvelope {
@@ -116,6 +125,7 @@ impl RunnerConfigEnvelope {
             runner_config_digest: digest,
             cli_binary_sha256: cli_binary_sha256.to_lowercase(),
             tool_revision: tool_revision.to_string(),
+            verifier_sha256: verifier_sha256.to_lowercase(),
         }
     }
 
@@ -192,15 +202,15 @@ pub struct PreflightCaseGate {
     pub candidate_output: String,
 }
 
-/// Resolve the `mida-acceptance` verifier binary: `MIDA_ACCEPTANCE_BIN`
-/// overrides, then a sibling `mida-acceptance(.exe)` next to the CLI binary,
-/// then PATH.
+/// Resolve the `mida-acceptance` verifier binary.
+///
+/// P6.3.1: the production resolution NEVER consults `MIDA_ACCEPTANCE_BIN`
+/// (a caller-controllable environment override would let an untrusted
+/// verifier substitute itself for the independent one). Production uses a
+/// sibling `mida-acceptance(.exe)` next to the CLI binary, then PATH. Tests
+/// inject the verifier explicitly through `--acceptance-bin` or the
+/// attestation/bundle parameters — never through the environment.
 pub fn resolve_acceptance_bin() -> PathBuf {
-    if let Ok(explicit) = std::env::var("MIDA_ACCEPTANCE_BIN") {
-        if !explicit.trim().is_empty() {
-            return PathBuf::from(explicit);
-        }
-    }
     if let Ok(current_exe) = std::env::current_exe() {
         if let Some(parent) = current_exe.parent() {
             let sibling = parent.join("mida-acceptance.exe");
@@ -267,6 +277,9 @@ pub fn envelope_reuse_policy(
             .cli_binary_sha256
             .eq_ignore_ascii_case(&candidate.cli_binary_sha256)
         || existing.tool_revision != candidate.tool_revision
+        || !existing
+            .verifier_sha256
+            .eq_ignore_ascii_case(&candidate.verifier_sha256)
     {
         bail!(
             "existing runner-config envelope {} differs from the would-be envelope \
@@ -459,25 +472,33 @@ pub struct LaunchAttestationContext<'a> {
 /// The unique evidence context produced by a successful launch attestation
 /// (P6.3-B/D). All subsequent sidecar and bundle producers consume it; the
 /// bundle assembler draws the runner-config digest from it, so the digest
-/// can never be caller-supplied. Single-use: [`RunEvidenceContext::consume`]
-/// turns a consumed context into an error on any further use.
-#[derive(Debug, Clone)]
+/// can never be caller-supplied.
+///
+/// P6.3.1 seal: the type is NOT `Clone`, every field is private (read-only
+/// getters only), and there is no public constructor — a value can only be
+/// obtained from [`attest_ready_before_launch`]. The bundle assembler and
+/// [`complete_run_evidence`] take it BY VALUE, so a single attestation can
+/// authorize exactly one bundle: a second use is a compile error (there is
+/// no way to duplicate or reconstruct the value).
+#[derive(Debug)]
 pub struct RunEvidenceContext {
-    pub case_id: String,
-    pub tool_revision: String,
-    pub runner_config_digest: String,
-    pub protected_input: PathBuf,
-    pub candidate: PathBuf,
-    pub cli_binary_sha256: String,
-    consumed: bool,
+    case_id: String,
+    tool_revision: String,
+    runner_config_digest: String,
+    verifier_sha256: String,
+    protected_input: PathBuf,
+    candidate: PathBuf,
+    cli_binary_sha256: String,
 }
 
 impl RunEvidenceContext {
-    /// Construct with validation (digest must be 64 hex, case id non-empty).
-    pub fn new(
+    /// Internal constructor — reachable only from crate-internal code (the
+    /// attestation) and crate unit tests. Never a public forgery entry.
+    pub(crate) fn new(
         case_id: String,
         tool_revision: String,
         runner_config_digest: String,
+        verifier_sha256: String,
         protected_input: PathBuf,
         candidate: PathBuf,
         cli_binary_sha256: String,
@@ -494,34 +515,54 @@ impl RunEvidenceContext {
         if !is_64_hex(&cli_binary_sha256) {
             bail!("RunEvidenceContext cli_binary_sha256 must be exactly 64 hex chars");
         }
+        if !is_64_hex(&verifier_sha256) {
+            bail!("RunEvidenceContext verifier_sha256 must be exactly 64 hex chars");
+        }
         Ok(RunEvidenceContext {
             case_id,
             tool_revision,
             runner_config_digest: runner_config_digest.to_lowercase(),
+            verifier_sha256: verifier_sha256.to_lowercase(),
             protected_input,
             candidate,
             cli_binary_sha256: cli_binary_sha256.to_lowercase(),
-            consumed: false,
         })
+    }
+
+    /// The attested case id.
+    pub fn case_id(&self) -> &str {
+        &self.case_id
+    }
+
+    /// The tool revision the run is pinned to.
+    pub fn tool_revision(&self) -> &str {
+        &self.tool_revision
     }
 
     /// The attestation-bound runner-config digest (the only digest source
     /// for sidecar/bundle producers).
-    pub fn digest(&self) -> &str {
+    pub fn runner_config_digest(&self) -> &str {
         &self.runner_config_digest
     }
 
-    /// Consume the one-time authorization. Any second consume (or any use
-    /// after the first) fails closed.
-    pub fn consume(&mut self) -> anyhow::Result<()> {
-        if self.consumed {
-            bail!(
-                "run evidence context for case {case_id} is already consumed (one-time authorization)",
-                case_id = self.case_id
-            );
-        }
-        self.consumed = true;
-        Ok(())
+    /// The verifier binary identity the attestation bound.
+    pub fn verifier_sha256(&self) -> &str {
+        &self.verifier_sha256
+    }
+
+    /// Canonical protected input path (read-only).
+    pub fn protected_input(&self) -> &Path {
+        &self.protected_input
+    }
+
+    /// Canonical candidate output path (read-only).
+    pub fn candidate(&self) -> &Path {
+        &self.candidate
+    }
+
+    /// The current CLI binary identity (read-only).
+    pub fn cli_binary_sha256(&self) -> &str {
+        &self.cli_binary_sha256
     }
 }
 
@@ -653,6 +694,11 @@ pub fn attest_ready_before_launch(
         );
     }
 
+    // P6.3.1: the verifier identity is bound by the envelope. Resolve the
+    // verifier this launch would use and fail closed unless it hashes to the
+    // pinned identity (verifier replacement / path drift / hash drift).
+    let verifier_sha = verify_verifier_identity(ctx, &envelope)?;
+
     // Re-run the independent verifier with the recorded context. A
     // hand-written `ready` report is not an authorization credential.
     rerun_verifier(output_dir, &pre_report, &target_case_id, ctx)?;
@@ -737,11 +783,39 @@ pub fn attest_ready_before_launch(
         target_case_id,
         envelope.tool_revision.clone(),
         digest,
+        verifier_sha,
         canonicalize_loose(ctx.input),
         current_output,
         current_cli_sha,
     )?;
     Ok(context)
+}
+
+/// Resolve the verifier this run would use, compute its SHA-256, and fail
+/// closed unless it matches the envelope-pinned verifier identity (P6.3.1).
+fn verify_verifier_identity(
+    ctx: &LaunchAttestationContext<'_>,
+    envelope: &RunnerConfigEnvelope,
+) -> anyhow::Result<String> {
+    let verifier = ctx
+        .acceptance_bin
+        .map(Path::to_path_buf)
+        .unwrap_or_else(resolve_acceptance_bin);
+    let sha = sha256_file(&verifier).with_context(|| {
+        format!(
+            "cannot digest the acceptance verifier {}",
+            verifier.display()
+        )
+    })?;
+    if !sha.eq_ignore_ascii_case(&envelope.verifier_sha256) {
+        bail!(
+            "acceptance verifier {} (sha {sha}) does not match the envelope-pinned \
+             verifier {}; verifier replacement, path drift or hash drift is refused",
+            verifier.display(),
+            envelope.verifier_sha256
+        );
+    }
+    Ok(sha)
 }
 
 /// Spawn the independent acceptance verifier with the recorded runner
@@ -896,14 +970,20 @@ fn emit_pe_evidence(
 /// context. The bundle's runner-config digest always equals the launch
 /// attestation digest.
 ///
+/// `context` is consumed BY VALUE (P6.3.1): the type is not `Clone` and has
+/// no public constructor, so one attestation authorizes exactly one bundle.
 /// `candidate` is the actual run output path (member files live next to
 /// it); the bundle identity (protected input / candidate) comes from the
 /// attestation context. Returns the bundle manifest path.
 pub fn complete_run_evidence(
-    context: &mut RunEvidenceContext,
+    context: RunEvidenceContext,
     acceptance_bin: Option<&Path>,
     candidate: &Path,
 ) -> anyhow::Result<PathBuf> {
+    // P6.3.1: the PE-evidence verifier must be the envelope-pinned identity
+    // (no unbound environment override).
+    verify_bundle_verifier_identity(&context, acceptance_bin)?;
+
     let members = evidence_members(candidate)?;
     let pe_evidence_path = candidate.with_extension("pe_evidence.json");
     emit_pe_evidence(candidate, &pe_evidence_path, acceptance_bin)?;
@@ -927,13 +1007,39 @@ pub fn complete_run_evidence(
     };
     let request = crate::unpacker::bundle_assembler::AssembleRequest {
         emitted_at,
-        protected_input: context.protected_input.clone(),
-        candidate: context.candidate.clone(),
+        protected_input: context.protected_input().to_path_buf(),
+        candidate: context.candidate().to_path_buf(),
         members,
         output: bundle_output.clone(),
     };
     crate::unpacker::bundle_assembler::assemble_evidence_bundle(&request, context)?;
     Ok(bundle_output)
+}
+
+/// Fail closed unless the verifier this bundle run would use hashes to the
+/// context's attested verifier identity (P6.3.1).
+fn verify_bundle_verifier_identity(
+    context: &RunEvidenceContext,
+    acceptance_bin: Option<&Path>,
+) -> anyhow::Result<()> {
+    let verifier = acceptance_bin
+        .map(Path::to_path_buf)
+        .unwrap_or_else(resolve_acceptance_bin);
+    let sha = sha256_file(&verifier).with_context(|| {
+        format!(
+            "cannot digest the acceptance verifier {}",
+            verifier.display()
+        )
+    })?;
+    if !sha.eq_ignore_ascii_case(context.verifier_sha256()) {
+        bail!(
+            "acceptance verifier {} (sha {sha}) does not match the attested verifier {}; \
+             verifier replacement, path drift or hash drift is refused",
+            verifier.display(),
+            context.verifier_sha256()
+        );
+    }
+    Ok(())
 }
 
 /// SHA-256 (lowercase hex) of `path` — the CLI binary identity.

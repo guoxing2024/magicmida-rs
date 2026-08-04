@@ -124,6 +124,7 @@ pub fn unpack(
     capture_policy: mida_pe::DumpCapturePolicy,
     capture_policy_digest: &str,
     preflight_dir: Option<&Path>,
+    acceptance_bin: Option<&Path>,
 ) -> Result<(), anyhow::Error> {
     use tracing::info;
     info!("=== UNPACK START ===");
@@ -187,7 +188,7 @@ pub fn unpack(
             output: &output_path,
             cli_binary: &cli_binary,
             runner_config: &actual_config,
-            acceptance_bin: None,
+            acceptance_bin,
         };
         let context = crate::runner_preflight::attest_ready_before_launch(
             preflight_dir,
@@ -196,9 +197,18 @@ pub fn unpack(
         .map_err(|e| {
             anyhow!("launch blocked by preflight attestation before any process creation: {e:#}")
         })?;
+        // P6.3.1: the attestation outcome is a hard gate event — emit a
+        // stable, filter-independent line (the `info!` below is for verbose
+        // logging only and must not be the sole signal tests rely on).
+        eprintln!(
+            "launch attestation: Ready (case {}; runner-config digest {})",
+            context.case_id(),
+            context.runner_config_digest()
+        );
         info!(
             "Launch attestation: Ready — case {} bound to envelope digest {}",
-            context.case_id, context.runner_config_digest
+            context.case_id(),
+            context.runner_config_digest()
         );
         evidence_ctx = Some(context);
     }
@@ -525,9 +535,9 @@ pub fn unpack(
             &output_path,
         )?;
         // P6.3-D: after a successful gated run, produce the evidence bundle
-        // from the attested single-use context.
-        if let Some(ref mut ctx) = evidence_ctx {
-            crate::runner_preflight::complete_run_evidence(ctx, None, &output_path)
+        // from the attested single-use context (consumed by value).
+        if let Some(ctx) = evidence_ctx.take() {
+            crate::runner_preflight::complete_run_evidence(ctx, acceptance_bin, &output_path)
                 .map_err(|e| anyhow!("evidence bundle assembly failed after a gated run: {e:#}"))?;
         }
         return Ok(());
@@ -1495,8 +1505,8 @@ pub fn unpack(
 
     // P6.3-D: after a successful gated run, produce the evidence bundle
     // from the attested single-use context (seven members, atomic).
-    if let Some(ref mut ctx) = evidence_ctx {
-        crate::runner_preflight::complete_run_evidence(ctx, None, &output_path)
+    if let Some(ctx) = evidence_ctx.take() {
+        crate::runner_preflight::complete_run_evidence(ctx, acceptance_bin, &output_path)
             .map_err(|e| anyhow!("evidence bundle assembly failed after a gated run: {e:#}"))?;
     }
 

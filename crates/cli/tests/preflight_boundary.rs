@@ -3,8 +3,9 @@
 //!
 //! Proven end-to-end:
 //!
-//! - the runner emits `mida.runner-config-envelope/v1` (full config JSON +
-//!   producer digest + CLI binary SHA-256 + tool revision);
+//! - the runner emits `mida.runner-config-envelope/v2` (full config JSON +
+//!   producer digest + CLI binary SHA-256 + tool revision + verifier
+//!   identity);
 //! - the acceptance verifier reparses the envelope with its own types and
 //!   recomputes the digest;
 //! - runner-emitted digest == acceptance-recomputed digest ==
@@ -52,7 +53,57 @@ fn acceptance_bin() -> PathBuf {
         "acceptance binary missing: {}",
         sibling.display()
     );
+    assert_acceptance_fresh(&sibling);
     sibling
+}
+
+/// Fail closed on a stale sibling acceptance binary (P6.3.1 hermetic tests):
+/// the binary must be newer than every acceptance source file, otherwise the
+/// test would silently run against a verifier that does not match the
+/// current build. The `cargo test --workspace` gate rebuilds it fresh.
+fn assert_acceptance_fresh(sibling: &Path) {
+    let acc_root = workspace_root().join("crates/acceptance");
+    let binary_mtime = fs::metadata(sibling)
+        .and_then(|m| m.modified())
+        .expect("acceptance binary mtime");
+    let mut stale = false;
+    for path in source_files(&acc_root) {
+        let mtime = match fs::metadata(&path).and_then(|m| m.modified()) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if mtime > binary_mtime {
+            stale = true;
+            break;
+        }
+    }
+    assert!(
+        !stale,
+        "stale acceptance binary {} (newer than acceptance source); \
+         run `cargo test --workspace` to rebuild it before testing",
+        sibling.display()
+    );
+}
+
+/// Recursively collect the `.rs` sources (plus Cargo.toml) of a crate.
+fn source_files(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if let Ok(entries) = fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().map(|e| e == "rs").unwrap_or(false)
+                    || p.file_name().map(|n| n == "Cargo.toml").unwrap_or(false)
+                {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    out
 }
 
 fn run_cli(args: &[&str], env: &[(&str, String)]) -> Output {
@@ -122,6 +173,9 @@ fn preflight_args_with_cli(dir: &Path, repo_root: &Path, cli_binary: &Path) -> V
             workspace_root().join("rust-toolchain.toml").display()
         ),
         "--expected-toolchain=1.97.1".to_string(),
+        // P6.3.1: the verifier is injected explicitly (never the
+        // environment). Staging with the real acceptance binary.
+        format!("--acceptance-bin={}", acceptance_bin().display()),
         "--case".to_string(),
         real_manifest("origin_macro").display().to_string(),
         missing_input(dir).display().to_string(),
@@ -136,13 +190,7 @@ fn preflight_args_with_cli(dir: &Path, repo_root: &Path, cli_binary: &Path) -> V
 fn run_preflight(dir: &Path, repo_root: &Path) -> Output {
     let args = preflight_args(dir, repo_root);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_cli(
-        &arg_refs,
-        &[(
-            "MIDA_ACCEPTANCE_BIN",
-            acceptance_bin().display().to_string(),
-        )],
-    )
+    run_cli(&arg_refs, &[])
 }
 
 /// Baseline: two real locked manifests, missing samples, pinned CLI. The
@@ -218,13 +266,18 @@ fn offline_preflight_rejects_without_samples_and_chain_is_consistent() {
     );
     assert_eq!(envelope_digest.len(), 64);
 
-    // The envelope carries the full contract fields.
+    // The envelope carries the full contract fields (v2, with the pinned
+    // verifier identity).
     assert_eq!(
         envelope["schema_version"].as_str(),
-        Some("mida.runner-config-envelope/v1")
+        Some("mida.runner-config-envelope/v2")
     );
     assert!(!envelope["cli_binary_sha256"].as_str().unwrap().is_empty());
     assert!(!envelope["tool_revision"].as_str().unwrap().is_empty());
+    assert!(
+        envelope["verifier_sha256"].as_str().unwrap().len() == 64,
+        "envelope must pin the verifier identity"
+    );
 
     let _ = fs::remove_dir_all(&dir);
 }
@@ -237,10 +290,7 @@ fn offline_preflight_rejects_without_samples_and_chain_is_consistent() {
 fn tampered_digest_rejected() {
     let dir = temp_dir("tamper_digest");
     let repo_root = scratch_repo(&dir);
-    let env = &[(
-        "MIDA_ACCEPTANCE_BIN",
-        acceptance_bin().display().to_string(),
-    )];
+    let env: &[(&str, String)] = &[];
     let args = preflight_args(&dir, &repo_root);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let baseline = run_cli(&arg_refs, env);
@@ -291,10 +341,7 @@ fn tampered_digest_rejected() {
 fn tampered_unknown_field_rejected() {
     let dir = temp_dir("tamper_unknown");
     let repo_root = scratch_repo(&dir);
-    let env = &[(
-        "MIDA_ACCEPTANCE_BIN",
-        acceptance_bin().display().to_string(),
-    )];
+    let env: &[(&str, String)] = &[];
     let args = preflight_args(&dir, &repo_root);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let baseline = run_cli(&arg_refs, env);
@@ -327,10 +374,7 @@ fn tampered_unknown_field_rejected() {
 fn tampered_cli_hash_rejected() {
     let dir = temp_dir("tamper_cli");
     let repo_root = scratch_repo(&dir);
-    let env = &[(
-        "MIDA_ACCEPTANCE_BIN",
-        acceptance_bin().display().to_string(),
-    )];
+    let env: &[(&str, String)] = &[];
     let args = preflight_args(&dir, &repo_root);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let baseline = run_cli(&arg_refs, env);
@@ -365,10 +409,7 @@ fn tampered_cli_hash_rejected() {
 fn tampered_tool_revision_rejected() {
     let dir = temp_dir("tamper_revision");
     let repo_root = scratch_repo(&dir);
-    let env = &[(
-        "MIDA_ACCEPTANCE_BIN",
-        acceptance_bin().display().to_string(),
-    )];
+    let env: &[(&str, String)] = &[];
     let args = preflight_args(&dir, &repo_root);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let baseline = run_cli(&arg_refs, env);
@@ -437,10 +478,7 @@ fn launch_gate_blocks_before_process_creation() {
     // A gated run with a NotReady report must be blocked before PE parsing.
     let dir = temp_dir("launch_not_ready");
     let repo_root = scratch_repo(&dir);
-    let env = &[(
-        "MIDA_ACCEPTANCE_BIN",
-        acceptance_bin().display().to_string(),
-    )];
+    let env: &[(&str, String)] = &[];
     // Stage for the REAL mida-cli binary so the launch-side config digest
     // check passes and the report gate is the deciding check.
     let real_cli = PathBuf::from(env!("CARGO_BIN_EXE_mida-cli"));
@@ -484,10 +522,7 @@ fn launch_gate_blocks_before_process_creation() {
 fn launch_gate_rejects_digest_drift() {
     let dir = temp_dir("launch_drift");
     let repo_root = scratch_repo(&dir);
-    let env = &[(
-        "MIDA_ACCEPTANCE_BIN",
-        acceptance_bin().display().to_string(),
-    )];
+    let env: &[(&str, String)] = &[];
     let real_cli = PathBuf::from(env!("CARGO_BIN_EXE_mida-cli"));
     let args = preflight_args_with_cli(&dir, &repo_root, &real_cli);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -577,10 +612,7 @@ fn launch_gate_rejects_digest_drift() {
 fn launch_gate_blocks_hand_written_ready_after_verifier_rerun() {
     let dir = temp_dir("launch_fake_ready");
     let repo_root = scratch_repo(&dir);
-    let env = &[(
-        "MIDA_ACCEPTANCE_BIN",
-        acceptance_bin().display().to_string(),
-    )];
+    let env: &[(&str, String)] = &[];
     // Stage the envelope for the REAL mida-cli binary so the actual
     // run-config digest matches at launch; the real preflight is NotReady
     // (missing samples).

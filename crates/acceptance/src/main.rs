@@ -1051,12 +1051,12 @@ fn same_file(
     Ok(false)
 }
 
-/// Verifier-side copy of the `mida.runner-config-envelope/v1` emitted by the
+/// Verifier-side copy of the `mida.runner-config-envelope/v2` emitted by the
 /// runner (`mida-cli`). Deny-unknown-fields: any tampered or drifted field
 /// fails closed. The acceptance crate stays dependency-free of production.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RunnerConfigEnvelopeV1 {
+struct RunnerConfigEnvelopeV2 {
     #[serde(rename = "$schema")]
     #[allow(dead_code)]
     schema: String,
@@ -1065,6 +1065,7 @@ struct RunnerConfigEnvelopeV1 {
     runner_config_digest: String,
     cli_binary_sha256: String,
     tool_revision: String,
+    verifier_sha256: String,
 }
 
 /// Worktree probe host: runs `git` in the repository root. Any probe failure
@@ -1164,16 +1165,16 @@ fn cmd_preflight(args: &[String]) -> Result<i32, String> {
 
     let envelope_bytes = fs::read(&envelope_path)
         .map_err(|e| format!("cannot read envelope {}: {e}", envelope_path.display()))?;
-    let envelope: RunnerConfigEnvelopeV1 =
+    let envelope: RunnerConfigEnvelopeV2 =
         serde_json::from_slice(&envelope_bytes).map_err(|e| {
             format!(
                 "envelope {} rejected (unknown/malformed fields): {e}",
                 envelope_path.display()
             )
         })?;
-    if envelope.schema_version != "mida.runner-config-envelope/v1" {
+    if envelope.schema_version != "mida.runner-config-envelope/v2" {
         return Err(format!(
-            "envelope schema_version {:?} != mida.runner-config-envelope/v1",
+            "envelope schema_version {:?} != mida.runner-config-envelope/v2",
             envelope.schema_version
         ));
     }
@@ -1185,6 +1186,14 @@ fn cmd_preflight(args: &[String]) -> Result<i32, String> {
             "envelope $schema {:?} != ./runner-config-envelope.schema.json",
             envelope.schema
         ));
+    }
+    if envelope.verifier_sha256.len() != 64
+        || !envelope
+            .verifier_sha256
+            .chars()
+            .all(|c| c.is_ascii_hexdigit())
+    {
+        return Err("envelope verifier_sha256 must be exactly 64 hex chars".to_string());
     }
 
     // Independent reparse + recompute with the acceptance implementation.

@@ -39,7 +39,7 @@ mida-acceptance = { path = "../acceptance" }
 # Test-support verifier stub: a deterministic stand-in for the
 # `mida-acceptance` binary used by the launch-attestation attack tests
 # (P6.3-QA). Not part of the production toolchain; only the attestation
-# pass-path tests point MIDA_ACCEPTANCE_BIN at it.
+# pass-path tests inject it via --acceptance-bin.
 [[bin]]
 name = "mida-verifier-stub"
 path = "tests/bin/verifier_stub.rs"

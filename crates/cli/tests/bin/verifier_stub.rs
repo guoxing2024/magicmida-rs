@@ -3,7 +3,8 @@
 //! A deterministic stand-in for the `mida-acceptance` binary used ONLY by
 //! the launch-attestation pass-path tests (positive control, bundle digest
 //! chain, output-path and input-identity checks that must not depend on the
-//! real locked samples). Tests point `MIDA_ACCEPTANCE_BIN` at this binary.
+//! real locked samples). Tests inject it explicitly via `--acceptance-bin`
+//! (P6.3.1) — never through the environment.
 //!
 //! Supported subcommands (mirroring the acceptance CLI surface the runner
 //! spawns):

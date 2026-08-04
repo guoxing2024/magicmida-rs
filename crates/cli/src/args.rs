@@ -33,6 +33,10 @@ pub enum Command {
         /// preflight report from this directory before any sample process
         /// is created.
         preflight_dir: Option<PathBuf>,
+        /// P6.3.1: explicit acceptance-verifier binary for the launch
+        /// attestation / PE evidence (test injection seam). `None` resolves
+        /// the sibling `mida-acceptance`; the environment is never trusted.
+        acceptance_bin: Option<PathBuf>,
         verbose: bool,
     },
     /// Packer-agnostic full dump (no Themida shrink).
@@ -127,6 +131,7 @@ fn parse_unpack(args: &[String]) -> Result<Command, String> {
     let mut capture_policy = DumpCapturePolicy::default();
     let mut capture_policy_path: Option<PathBuf> = None;
     let mut preflight_dir: Option<PathBuf> = None;
+    let mut acceptance_bin: Option<PathBuf> = None;
 
     let mut i = 3;
     while i < args.len() {
@@ -144,6 +149,13 @@ fn parse_unpack(args: &[String]) -> Result<Command, String> {
                     return Err("Missing directory after --preflight-dir.".into());
                 }
                 preflight_dir = Some(PathBuf::from(&args[i]));
+            }
+            "--acceptance-bin" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("Missing path after --acceptance-bin.".into());
+                }
+                acceptance_bin = Some(PathBuf::from(&args[i]));
             }
             "--data-sections" | "--create-data-sections" => create_data_sections = true,
             "--shrink" => shrink = true,
@@ -251,6 +263,7 @@ fn parse_unpack(args: &[String]) -> Result<Command, String> {
         capture_policy,
         capture_policy_digest,
         preflight_dir,
+        acceptance_bin,
         verbose,
     })
 }

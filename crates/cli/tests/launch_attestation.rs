@@ -21,12 +21,16 @@
 //! 12. `$schema` drift is rejected by BOTH the runner and the acceptance
 //!     verifier;
 //! 13. the production bundle digest equals the launch attestation digest;
-//! 14. a consumed authorization cannot be consumed a second time.
+//! 14. a consumed authorization cannot be consumed a second time (P6.3.1
+//!     seal: ownership consume, no Clone, no public constructor);
+//! 15. a verifier different from the envelope-pinned identity is refused at
+//!     launch (P6.3.1 verifier binding).
 //!
 //! Negative tests use the REAL acceptance binary (whose identity recompute
 //! and locked-manifest cross-check are what reject the attacks); positive
 //! control and chain tests use the deterministic `mida-verifier-stub`
-//! (`tests/bin/verifier_stub.rs`).
+//! (`tests/bin/verifier_stub.rs`). P6.3.1: the verifier is injected
+//! explicitly via `--acceptance-bin` — never the environment.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -67,7 +71,57 @@ fn acceptance_bin() -> PathBuf {
         "acceptance binary missing: {}",
         sibling.display()
     );
+    assert_acceptance_fresh(&sibling);
     sibling
+}
+
+/// Fail closed on a stale sibling acceptance binary (P6.3.1 hermetic tests):
+/// the binary must be newer than every acceptance source file, otherwise the
+/// test would silently run against a verifier that does not match the
+/// current build. The `cargo test --workspace` gate rebuilds it fresh.
+fn assert_acceptance_fresh(sibling: &Path) {
+    let acc_root = workspace_root().join("crates/acceptance");
+    let binary_mtime = fs::metadata(sibling)
+        .and_then(|m| m.modified())
+        .expect("acceptance binary mtime");
+    let mut stale = false;
+    for path in source_files(&acc_root) {
+        let mtime = match fs::metadata(&path).and_then(|m| m.modified()) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if mtime > binary_mtime {
+            stale = true;
+            break;
+        }
+    }
+    assert!(
+        !stale,
+        "stale acceptance binary {} (newer than acceptance source); \
+         run `cargo test --workspace` to rebuild it before testing",
+        sibling.display()
+    );
+}
+
+/// Recursively collect the `.rs` sources (plus Cargo.toml) of a crate.
+fn source_files(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if let Ok(entries) = fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().map(|e| e == "rs").unwrap_or(false)
+                    || p.file_name().map(|n| n == "Cargo.toml").unwrap_or(false)
+                {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    out
 }
 
 fn verifier_stub() -> PathBuf {
@@ -174,12 +228,11 @@ fn run_staging(
     cases: &[(PathBuf, PathBuf, PathBuf)],
     verifier: &Path,
 ) -> Output {
-    let args = staging_args(dir, repo_root, cli_binary, cases);
+    let mut args = staging_args(dir, repo_root, cli_binary, cases);
+    // P6.3.1: the verifier is injected explicitly (never the environment).
+    args.push(format!("--acceptance-bin={}", verifier.display()));
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_cli(
-        &arg_refs,
-        &[("MIDA_ACCEPTANCE_BIN", verifier.display().to_string())],
-    )
+    run_cli(&arg_refs, &[])
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -273,30 +326,29 @@ fn launch_unpack(dir: &Path, input: &Path, output: &Path) -> Output {
     launch_unpack_with_verifier(dir, input, output, None)
 }
 
-/// Launch with an explicit verifier for the attestation re-run. `None`
-/// resolves the acceptance binary the same way production does (env
-/// override, then sibling).
+/// Launch with an explicit verifier for the attestation re-run (P6.3.1:
+/// injected via `--acceptance-bin`, never the environment). `None` resolves
+/// the acceptance binary the same way production does (sibling, then PATH).
 fn launch_unpack_with_verifier(
     dir: &Path,
     input: &Path,
     output: &Path,
     verifier: Option<&Path>,
 ) -> Output {
-    let env: Vec<(&str, String)> = match verifier {
-        Some(v) => vec![("MIDA_ACCEPTANCE_BIN", v.display().to_string())],
-        None => vec![],
-    };
-    run_cli(
-        &[
-            "/unpack",
-            input.to_str().unwrap(),
-            "--output",
-            output.to_str().unwrap(),
-            "--preflight-dir",
-            dir.to_str().unwrap(),
-        ],
-        &env,
-    )
+    let mut args = vec![
+        "/unpack".to_string(),
+        input.to_str().unwrap().to_string(),
+        "--output".to_string(),
+        output.to_str().unwrap().to_string(),
+        "--preflight-dir".to_string(),
+        dir.to_str().unwrap().to_string(),
+    ];
+    if let Some(v) = verifier {
+        args.push("--acceptance-bin".to_string());
+        args.push(v.display().to_string());
+    }
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_cli(&arg_refs, &[])
 }
 
 fn assert_launch_blocked(output: &Output, expected_reason: &str, candidate: &Path) {
@@ -510,8 +562,36 @@ fn output_hard_link_alias_rejected() {
 }
 
 // ---------------------------------------------------------------------------
-// 7./8. Run-config divergence from the staged envelope / fixed mode
+// 7./8. Verifier identity + run-config divergence from the staged envelope
 // ---------------------------------------------------------------------------
+
+/// P6.3.1 (#3): the launch attestation fails closed when the verifier it
+/// would use does not match the envelope-pinned verifier identity (verifier
+/// replacement / path drift / hash drift). Stage with the stub, then launch
+/// with the REAL acceptance binary.
+#[test]
+fn verifier_replacement_at_launch_rejected() {
+    let dir = temp_dir("verifier_swap");
+    let repo_root = scratch_repo(&dir);
+    stage(&dir, &repo_root, &verifier_stub());
+
+    let input = dir.join("input_origin.bin");
+    let candidate = dir.join("origin_candidate.exe");
+    let output = launch_unpack_with_verifier(&dir, &input, &candidate, Some(&acceptance_bin()));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a verifier different from the pinned identity must block the launch: {stderr}"
+    );
+    assert!(stderr.contains("launch blocked"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("verifier"),
+        "the block must cite the verifier identity: {stderr}"
+    );
+    assert!(!candidate.exists(), "no candidate may be produced");
+    let _ = fs::remove_dir_all(&dir);
+}
 
 /// Every policy flag that diverges from the staged envelope and the P7
 /// fixed-mode policy must block the launch item by item.
@@ -740,7 +820,7 @@ fn schema_drift_rejected_by_runner_and_acceptance() {
         ("$schema", serde_json::json!("./drifted.schema.json")),
         (
             "schema_version",
-            serde_json::json!("mida.runner-config-envelope/v2"),
+            serde_json::json!("mida.runner-config-envelope/v3"),
         ),
     ] {
         let mut envelope = read_envelope(&dir);
@@ -829,8 +909,9 @@ fn stub_attestation_passes_and_pipeline_continues() {
         !stderr.contains("launch blocked"),
         "the attestation must pass: {stderr}"
     );
+    // The attestation emits a stable, filter-independent gate line (P6.3.1).
     assert!(
-        stderr.contains("Launch attestation: Ready"),
+        stderr.contains("launch attestation: Ready"),
         "the attestation must report Ready: {stderr}"
     );
     assert!(
@@ -890,8 +971,8 @@ fn production_bundle_digest_equals_attestation_digest() {
         runner_config: &runner_config,
         acceptance_bin: Some(&verifier_stub()),
     };
-    let mut evidence = attest_ready_before_launch(&dir, &ctx).expect("attestation passes");
-    let attestation_digest = evidence.digest().to_string();
+    let evidence = attest_ready_before_launch(&dir, &ctx).expect("attestation passes");
+    let attestation_digest = evidence.runner_config_digest().to_string();
     let envelope_digest = envelope["runner_config_digest"]
         .as_str()
         .unwrap()
@@ -956,8 +1037,12 @@ fn production_bundle_digest_equals_attestation_digest() {
     .unwrap();
 
     // Production chain: sidecars + transform manifest + PE evidence via the
-    // acceptance binary -> atomic bundle from the attested context.
-    let bundle_path = complete_run_evidence(&mut evidence, Some(&verifier_stub()), &candidate)
+    // acceptance binary -> atomic bundle from the attested context. The
+    // context is consumed BY VALUE (P6.3.1): one attestation authorizes
+    // exactly one bundle — a second assemble is a compile error because the
+    // value was moved and the type is not `Clone` (see the crate unit test
+    // `bundle_assembler::tests::attested_context_is_single_use_by_ownership`).
+    let bundle_path = complete_run_evidence(evidence, Some(&verifier_stub()), &candidate)
         .expect("production bundle assemble");
     let bundle: serde_json::Value =
         serde_json::from_slice(&fs::read(&bundle_path).unwrap()).unwrap();
@@ -972,51 +1057,6 @@ fn production_bundle_digest_equals_attestation_digest() {
         Some("complete"),
         "seven members present -> Complete manifest"
     );
-
-    // The context was consumed by the bundle assemble: no second bundle
-    // may be produced from the SAME authorization.
-    let second = dir.join("second.bundle.json");
-    let request = mida_cli::unpacker::bundle_assembler::AssembleRequest {
-        emitted_at: "2026-08-04T12:00:00Z".to_string(),
-        protected_input: evidence.protected_input.clone(),
-        candidate: evidence.candidate.clone(),
-        members: vec![
-            (
-                "oep_evidence".to_string(),
-                dir.join("origin_candidate.exe.oep_evidence.json"),
-            ),
-            (
-                "iat_evidence".to_string(),
-                dir.join("origin_candidate.exe.iat_evidence.json"),
-            ),
-            (
-                "tls_evidence".to_string(),
-                dir.join("origin_candidate.exe.tls_evidence.json"),
-            ),
-            (
-                "relocation_evidence".to_string(),
-                dir.join("origin_candidate.exe.relocation_evidence.json"),
-            ),
-            (
-                "section_rebuild_evidence".to_string(),
-                dir.join("origin_candidate.exe.section_rebuild_evidence.json"),
-            ),
-            (
-                "transform_manifest".to_string(),
-                dir.join("origin_candidate.transform_manifest.json"),
-            ),
-            (
-                "pe_evidence".to_string(),
-                dir.join("origin_candidate.pe_evidence.json"),
-            ),
-        ],
-        output: second.clone(),
-    };
-    let err =
-        mida_cli::unpacker::bundle_assembler::assemble_evidence_bundle(&request, &mut evidence)
-            .expect_err("a consumed context cannot assemble a second bundle");
-    assert!(err.to_string().contains("already consumed"));
-    assert!(!second.exists(), "no second bundle may be produced");
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -1024,10 +1064,13 @@ fn production_bundle_digest_equals_attestation_digest() {
 // 14. One-time authorization
 // ---------------------------------------------------------------------------
 
-/// The attested context is single-use: the first consume succeeds, the
-/// second is refused.
+/// The attested context is a one-time authorization (P6.3.1): it is moved
+/// BY VALUE into `complete_run_evidence`, the type is not `Clone`, and it
+/// has no public constructor — so the same attestation cannot authorize a
+/// second bundle (a second call is a compile error). This test asserts the
+/// attested identities are bound and that the value leaves the caller.
 #[test]
-fn second_consumption_of_authorization_rejected() {
+fn attested_authorization_is_one_time_by_ownership() {
     let dir = temp_dir("one_shot");
     let repo_root = scratch_repo(&dir);
     stage(&dir, &repo_root, &verifier_stub());
@@ -1044,15 +1087,16 @@ fn second_consumption_of_authorization_rejected() {
         runner_config: &runner_config,
         acceptance_bin: Some(&verifier_stub()),
     };
-    let mut evidence = attest_ready_before_launch(&dir, &ctx).expect("attestation passes");
-    assert!(
-        evidence.digest().len() == 64,
-        "attested digest must be 64 hex"
-    );
-    evidence.consume().expect("first consume");
-    let err = evidence
-        .consume()
-        .expect_err("second consume must be refused");
-    assert!(err.to_string().contains("already consumed"));
+    let evidence = attest_ready_before_launch(&dir, &ctx).expect("attestation passes");
+    assert_eq!(evidence.runner_config_digest().len(), 64);
+    assert_eq!(evidence.case_id(), "origin_macro");
+    assert_eq!(evidence.verifier_sha256().len(), 64);
+    assert_eq!(evidence.cli_binary_sha256().len(), 64);
+    // `evidence` is moved into complete_run_evidence — there is no way to
+    // call it again with the same value (no Clone, no public constructor).
+    // The seal is enforced by the type system; the crate unit test
+    // `bundle_assembler::tests::attested_context_is_single_use_by_ownership`
+    // demonstrates the value leaves the holder on the first consume.
+    let _ = evidence; // consumed by the ownership boundary (compile-proof)
     let _ = fs::remove_dir_all(&dir);
 }

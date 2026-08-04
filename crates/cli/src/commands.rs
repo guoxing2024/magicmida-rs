@@ -18,6 +18,7 @@ pub fn run_command(cmd: Command) -> Result<(), anyhow::Error> {
             capture_policy,
             capture_policy_digest,
             preflight_dir,
+            acceptance_bin,
             verbose: _,
         } => crate::unpacker::unpack(
             &input,
@@ -31,6 +32,7 @@ pub fn run_command(cmd: Command) -> Result<(), anyhow::Error> {
             capture_policy,
             &capture_policy_digest,
             preflight_dir.as_deref(),
+            acceptance_bin.as_deref(),
         ),
         Command::GenericUnpack {
             input,
@@ -95,10 +97,18 @@ pub fn run_offline_preflight_command(
     let cli_binary_sha256 = crate::runner_preflight::sha256_file(cli_binary)?;
     runner_config.tool_revision = tool_revision.clone();
     runner_config.cli_binary_sha256 = cli_binary_sha256.clone();
+    // P6.3.1: pin the verifier identity into the envelope at staging. The
+    // environment is never trusted; the verifier is the explicit
+    // --acceptance-bin or the sibling next to the CLI binary.
+    let verifier_path = acceptance_bin
+        .map(Path::to_path_buf)
+        .unwrap_or_else(crate::runner_preflight::resolve_acceptance_bin);
+    let verifier_sha256 = crate::runner_preflight::sha256_file(&verifier_path)?;
     let envelope = crate::runner_preflight::RunnerConfigEnvelope::build(
         &runner_config,
         &cli_binary_sha256,
         &tool_revision,
+        &verifier_sha256,
     );
     let borrowed: Vec<(&Path, &Path, &Path)> = cases
         .iter()
