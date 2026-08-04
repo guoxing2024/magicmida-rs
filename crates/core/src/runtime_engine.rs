@@ -784,6 +784,96 @@ mod tests {
         assert!(eng.wait(None).is_err());
     }
 
+    /// Drive a `RuntimeEngine` to completion and record
+    /// `(sequence, event kind, thread id)` tuples.
+    fn collect_sequence(
+        engine: &mut dyn RuntimeEngine<Error = CoreError>,
+    ) -> Vec<(u64, &'static str, u32)> {
+        let mut out = Vec::new();
+        while !engine.process_exited() {
+            let ev = engine.wait(None).unwrap();
+            let kind = match &ev.event {
+                DebugEvent::CreateProcess { .. } => "create",
+                DebugEvent::LoadDll { .. } => "load_dll",
+                DebugEvent::AccessViolation { .. } => "av",
+                DebugEvent::Breakpoint { .. } => "bp",
+                DebugEvent::ExitProcess { .. } => "exit",
+                _ => "other",
+            };
+            let thread = match &ev.event {
+                DebugEvent::ExitProcess { .. } => 0, // not carried by the abstract event
+                other => thread_id_of(other),
+            };
+            out.push((ev.sequence, kind, thread));
+            engine.continue_event(ContinueStatus::Continue).unwrap();
+        }
+        out
+    }
+
+    /// The live adapter must deliver exactly the same event sequence as the
+    /// pure replay engine for the same scripted stream (P3 parity contract).
+    #[test]
+    fn live_adapter_and_replay_deliver_identical_sequences() {
+        let base = 0x7ff6_c050_0000u64;
+        let build_events = || {
+            vec![
+                create_process(base),
+                DebugEvent::LoadDll {
+                    thread_id: 2,
+                    base_address: base + 0x10000,
+                    h_file: HANDLE::default(),
+                },
+                DebugEvent::AccessViolation {
+                    thread_id: 2,
+                    address: base + 0x1000,
+                    is_write: false,
+                    target_address: base + 0x1000,
+                    exc_type: 8,
+                },
+                DebugEvent::Breakpoint {
+                    thread_id: 2,
+                    address: base + 0x13e0,
+                },
+                DebugEvent::ExitProcess { exit_code: 0 },
+            ]
+        };
+
+        let mut replay = ReplayRuntimeEngine::new(build_events());
+        let replay_seq = collect_sequence(&mut replay);
+
+        let mut live = DebuggerCoreEngine::new(ScriptedDebugger::new(build_events(), base));
+        let live_seq = collect_sequence(&mut live);
+
+        assert_eq!(
+            live_seq, replay_seq,
+            "live adapter sequence must match replay"
+        );
+        assert_eq!(
+            replay_seq.iter().map(|(s, _, _)| *s).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5]
+        );
+    }
+
+    /// Same parity check on the guard->OEP skeleton script (phases + memory).
+    #[test]
+    fn live_adapter_matches_replay_guard_oep_phases() {
+        let base = 0x7ff6_c050_0000u64;
+        let oep_rva = 0x13e0u32;
+
+        let mut replay = ReplayRuntimeEngine::new(guard_oep_event_script(base, oep_rva, 2));
+        let replay_seq = collect_sequence(&mut replay);
+
+        let mut live = DebuggerCoreEngine::new(ScriptedDebugger::new(
+            guard_oep_event_script(base, oep_rva, 2),
+            base,
+        ));
+        let live_seq = collect_sequence(&mut live);
+
+        assert_eq!(live_seq, replay_seq);
+        let kinds: Vec<&str> = replay_seq.iter().map(|(_, k, _)| *k).collect();
+        assert_eq!(kinds, ["create", "load_dll", "av", "bp", "exit"]);
+    }
+
     #[test]
     fn continue_failure_retains_engine_pending() {
         struct FailContinue {
