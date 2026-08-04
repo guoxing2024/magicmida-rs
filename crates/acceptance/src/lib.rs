@@ -13,6 +13,7 @@
 pub mod behavior;
 pub mod check;
 pub mod envelope;
+pub mod evidence_bundle;
 pub mod gates;
 pub mod identity;
 pub mod oracle;
@@ -49,6 +50,12 @@ pub use verdict::Verdict;
 pub mod oreans_gate;
 pub mod oreans_pe_evidence;
 
+pub use evidence_bundle::{
+    canonical_bundle_hash, validate_evidence_bundle, BundleArtifactIdentity,
+    BundleCompletionMarker, BundleMemberRef, BundleVerdict, OreansEvidenceBundle,
+    OREANS_EVIDENCE_BUNDLE_SCHEMA_VERSION, REQUIRED_BUNDLE_MEMBERS,
+    TRANSFORM_MANIFEST_SCHEMA_VERSION,
+};
 pub use oreans_gate::{
     evaluate_oreans_two_sample_gate, locked_manifest, OreansArtifactIdentity,
     OreansAslrSimulationCase, OreansAslrSimulationEvidence, OreansBehaviorEvidence,

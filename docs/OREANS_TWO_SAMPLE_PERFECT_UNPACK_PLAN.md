@@ -314,6 +314,12 @@ Completed in the current offline audit:
    and strict v8/v6 gate integration are implemented; real sample evidence is absent.
 7. Offline acceptance: gate 38 passed, CLI 9 passed, plus the complete
    `cargo test -p mida-acceptance --offline` suite is green.
+8. Evidence bundle v1 contract (`mida.oreans-evidence-bundle/v1`) defined and
+   offline-tested: unified run inventory binding the candidate, protected
+   input, tool revision, runner config digest, transform manifest, PE
+   evidence, and the five sidecars with a canonical bundle hash. Partial
+   bundles are never valid runs. See
+   [docs/VNEXT_EVIDENCE_BUNDLE_V1.md](VNEXT_EVIDENCE_BUNDLE_V1.md).
 
 Remaining blockers, in order:
 

@@ -54,7 +54,9 @@ A structural `Accepted`, historical oracle match, Shiguang server/icon patch,
 GTO holdout result, or retry-selected replay is not proof of perfect unpacking.
 The gate remains open until both samples pass OEP, complete IAT, TLS,
 relocations, section rebuild, behavior equivalence, and 10 consecutive isolated
-runs. **Current status: not closed; this README makes no claim of perfect or
+runs. The evidence-bundle inventory contract that makes a run record auditable
+is defined in [docs/VNEXT_EVIDENCE_BUNDLE_V1.md](docs/VNEXT_EVIDENCE_BUNDLE_V1.md).
+**Current status: not closed; this README makes no claim of perfect or
 universal Oreans unpacking.**
 
 ### Acceptance kernel (R0B)
