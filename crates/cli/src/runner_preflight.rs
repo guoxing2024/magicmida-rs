@@ -216,12 +216,73 @@ pub fn resolve_acceptance_bin() -> PathBuf {
     PathBuf::from("mida-acceptance")
 }
 
+/// Outcome of the envelope reuse policy (P6.3-C): the envelope file is
+/// either absent (first creation allowed) or present AND field-identical to
+/// the would-be envelope. Everything else is an error and the existing
+/// bytes are never touched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvelopeReuse {
+    /// No envelope exists yet — first creation is allowed.
+    Missing,
+    /// The existing envelope parses strictly and matches the would-be
+    /// envelope field-by-field — reuse it as-is (bytes untouched).
+    ExistingMatches,
+}
+
+/// P6.3-C fail-closed envelope reuse policy:
+///
+/// - file absent → [`EnvelopeReuse::Missing`] (first creation allowed);
+/// - malformed, unknown-field, truncated or unreadable → hard error;
+/// - present and valid → must match the would-be envelope field-by-field
+///   (`$schema`, `schema_version`, full config JSON, digest, CLI identity,
+///   tool revision); a stale or different envelope is rejected;
+/// - any failure leaves the original envelope bytes untouched.
+///
+/// The caller must never fall back to `Err(_) => write(...)`.
+pub fn envelope_reuse_policy(
+    output_dir: &Path,
+    candidate: &RunnerConfigEnvelope,
+) -> anyhow::Result<EnvelopeReuse> {
+    let path = output_dir.join(RUNNER_CONFIG_ENVELOPE_FILENAME);
+    if !path.exists() {
+        return Ok(EnvelopeReuse::Missing);
+    }
+    let existing = match RunnerConfigEnvelope::read(output_dir) {
+        Ok(existing) => existing,
+        Err(e) => {
+            bail!(
+                "existing runner-config envelope {} cannot be reused (malformed, unknown \
+                 field, or unreadable — refusing to overwrite): {e:#}",
+                path.display()
+            );
+        }
+    };
+    if existing.schema != candidate.schema
+        || existing.schema_version != candidate.schema_version
+        || existing.runner_config != candidate.runner_config
+        || !existing
+            .runner_config_digest
+            .eq_ignore_ascii_case(&candidate.runner_config_digest)
+        || !existing
+            .cli_binary_sha256
+            .eq_ignore_ascii_case(&candidate.cli_binary_sha256)
+        || existing.tool_revision != candidate.tool_revision
+    {
+        bail!(
+            "existing runner-config envelope {} differs from the would-be envelope \
+             (stale or tampered); refusing to overwrite the original bytes",
+            path.display()
+        );
+    }
+    Ok(EnvelopeReuse::ExistingMatches)
+}
+
 /// The runner-side offline-preflight driver (production).
 ///
-/// Emits the envelope (or reuses an existing one — re-runs are idempotent;
-/// an existing envelope is still fully validated by the verifier, which
-/// reparses its config and recomputes the digest, so a stale or tampered
-/// envelope is rejected), drives the independent verifier binary
+/// Emits the envelope (or reuses an existing one under the P6.3-C
+/// fail-closed policy: an existing envelope must parse strictly and match
+/// the would-be envelope field-by-field, otherwise the run fails and the
+/// original bytes are preserved), drives the independent verifier binary
 /// (`mida-acceptance preflight ...`), consumes `preflight.json`, and
 /// re-verifies the chain: report digest == envelope digest, status ready,
 /// CLI identity matched. Returns `Ok(true)` when Ready.
@@ -242,16 +303,20 @@ pub fn run_offline_preflight(
     let verifier = acceptance_bin
         .map(Path::to_path_buf)
         .unwrap_or_else(resolve_acceptance_bin);
-    let envelope_path = match RunnerConfigEnvelope::read(output_dir) {
-        Ok(existing) => {
+    // P6.3-C: fail-closed reuse — first creation only when the file is
+    // absent; an existing envelope must parse strictly and match the
+    // would-be envelope field-by-field. Any failure preserves the original
+    // bytes (no `Err(_) => write` fallback).
+    let envelope_path = match envelope_reuse_policy(output_dir, envelope)? {
+        EnvelopeReuse::Missing => envelope.write(output_dir)?,
+        EnvelopeReuse::ExistingMatches => {
             eprintln!(
                 "reusing existing runner-config envelope (digest {}); the verifier \
                  independently recomputes and cross-checks it",
-                existing.runner_config_digest
+                envelope.runner_config_digest
             );
             output_dir.join(RUNNER_CONFIG_ENVELOPE_FILENAME)
         }
-        Err(_) => envelope.write(output_dir)?,
     };
 
     let mut cmd = Command::new(&verifier);

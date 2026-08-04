@@ -229,7 +229,10 @@ fn offline_preflight_rejects_without_samples_and_chain_is_consistent() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// Tampering the producer digest must be rejected with a drift reason.
+/// Tampering the producer digest must be a hard, fail-closed error: the
+/// existing envelope no longer matches the would-be envelope, so the
+/// staging run refuses to overwrite it and the original bytes are
+/// preserved (P6.3-C).
 #[test]
 fn tampered_digest_rejected() {
     let dir = temp_dir("tamper_digest");
@@ -245,8 +248,8 @@ fn tampered_digest_rejected() {
 
     // Flip one hex char of the producer digest.
     let envelope_path = dir.join("runner-config-envelope.json");
-    let mut envelope: serde_json::Value =
-        serde_json::from_slice(&fs::read(&envelope_path).unwrap()).unwrap();
+    let original_bytes = fs::read(&envelope_path).unwrap();
+    let mut envelope: serde_json::Value = serde_json::from_slice(&original_bytes).unwrap();
     let digest = envelope["runner_config_digest"]
         .as_str()
         .unwrap()
@@ -262,37 +265,28 @@ fn tampered_digest_rejected() {
         &digest[1..]
     );
     envelope["runner_config_digest"] = serde_json::json!(flipped);
-    fs::write(
-        &envelope_path,
-        serde_json::to_vec_pretty(&envelope).unwrap(),
-    )
-    .unwrap();
+    let tampered_bytes = serde_json::to_vec_pretty(&envelope).unwrap();
+    fs::write(&envelope_path, &tampered_bytes).unwrap();
 
     let tampered = run_cli(&arg_refs, env);
     assert_eq!(
         tampered.status.code(),
-        Some(2),
-        "tampered digest must be rejected"
+        Some(1),
+        "tampered digest must be a hard config error"
     );
-    let report: serde_json::Value =
-        serde_json::from_slice(&fs::read(dir.join("preflight.json")).unwrap()).unwrap();
-    let reasons: Vec<&str> = report["reasons"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|r| r.as_str().unwrap())
-        .collect();
-    assert!(
-        reasons
-            .iter()
-            .any(|r| r.contains("runner-config-envelope digest drift")),
-        "reasons: {reasons:?}"
+    let stderr = String::from_utf8_lossy(&tampered.stderr);
+    assert!(stderr.contains("refusing to overwrite"), "stderr: {stderr}");
+    // The tampered bytes must be preserved exactly (no overwrite).
+    assert_eq!(
+        fs::read(&envelope_path).unwrap(),
+        tampered_bytes,
+        "the original envelope bytes must remain untouched"
     );
-
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// Unknown fields in the envelope must fail closed (no report, hard reject).
+/// Unknown fields in the envelope must fail closed with the original bytes
+/// preserved (P6.3-C).
 #[test]
 fn tampered_unknown_field_rejected() {
     let dir = temp_dir("tamper_unknown");
@@ -310,23 +304,25 @@ fn tampered_unknown_field_rejected() {
     let mut envelope: serde_json::Value =
         serde_json::from_slice(&fs::read(&envelope_path).unwrap()).unwrap();
     envelope["sneaky_extra"] = serde_json::json!(1);
-    fs::write(
-        &envelope_path,
-        serde_json::to_vec_pretty(&envelope).unwrap(),
-    )
-    .unwrap();
+    let tampered_bytes = serde_json::to_vec_pretty(&envelope).unwrap();
+    fs::write(&envelope_path, &tampered_bytes).unwrap();
 
     let tampered = run_cli(&arg_refs, env);
-    assert!(
-        tampered.status.code() != Some(0),
-        "unknown envelope field must be rejected: {}",
-        String::from_utf8_lossy(&tampered.stderr)
+    assert_eq!(
+        tampered.status.code(),
+        Some(1),
+        "unknown envelope field must be a hard config error"
     );
-
+    assert_eq!(
+        fs::read(&envelope_path).unwrap(),
+        tampered_bytes,
+        "the tampered envelope bytes must remain untouched"
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// Tampering the CLI binary identity in the envelope must be rejected.
+/// Tampering the CLI binary identity in the envelope must be a hard,
+/// fail-closed error with the original bytes preserved (P6.3-C).
 #[test]
 fn tampered_cli_hash_rejected() {
     let dir = temp_dir("tamper_cli");
@@ -344,38 +340,27 @@ fn tampered_cli_hash_rejected() {
     let mut envelope: serde_json::Value =
         serde_json::from_slice(&fs::read(&envelope_path).unwrap()).unwrap();
     envelope["cli_binary_sha256"] = serde_json::json!("f".repeat(64));
-    fs::write(
-        &envelope_path,
-        serde_json::to_vec_pretty(&envelope).unwrap(),
-    )
-    .unwrap();
+    let tampered_bytes = serde_json::to_vec_pretty(&envelope).unwrap();
+    fs::write(&envelope_path, &tampered_bytes).unwrap();
 
     let tampered = run_cli(&arg_refs, env);
     assert_eq!(
         tampered.status.code(),
-        Some(2),
-        "tampered CLI hash must be rejected"
+        Some(1),
+        "tampered CLI hash must be a hard config error"
     );
-    let report: serde_json::Value =
-        serde_json::from_slice(&fs::read(dir.join("preflight.json")).unwrap()).unwrap();
-    let reasons: Vec<&str> = report["reasons"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|r| r.as_str().unwrap())
-        .collect();
-    assert!(
-        reasons
-            .iter()
-            .any(|r| r.contains("does not match expected")),
-        "reasons: {reasons:?}"
+    let stderr = String::from_utf8_lossy(&tampered.stderr);
+    assert!(stderr.contains("refusing to overwrite"), "stderr: {stderr}");
+    assert_eq!(
+        fs::read(&envelope_path).unwrap(),
+        tampered_bytes,
+        "the tampered envelope bytes must remain untouched"
     );
-
     let _ = fs::remove_dir_all(&dir);
 }
 
 /// Tampering the tool revision (in the config inside the envelope) must be
-/// rejected: the acceptance git probe sees the real HEAD and reports drift.
+/// a hard, fail-closed error with the original bytes preserved (P6.3-C).
 #[test]
 fn tampered_tool_revision_rejected() {
     let dir = temp_dir("tamper_revision");
@@ -394,33 +379,22 @@ fn tampered_tool_revision_rejected() {
         serde_json::from_slice(&fs::read(&envelope_path).unwrap()).unwrap();
     envelope["runner_config"]["tool_revision"] =
         serde_json::json!("deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
-    fs::write(
-        &envelope_path,
-        serde_json::to_vec_pretty(&envelope).unwrap(),
-    )
-    .unwrap();
+    let tampered_bytes = serde_json::to_vec_pretty(&envelope).unwrap();
+    fs::write(&envelope_path, &tampered_bytes).unwrap();
 
     let tampered = run_cli(&arg_refs, env);
     assert_eq!(
         tampered.status.code(),
-        Some(2),
-        "tampered revision must be rejected"
+        Some(1),
+        "tampered revision must be a hard config error"
     );
-    let report: serde_json::Value =
-        serde_json::from_slice(&fs::read(dir.join("preflight.json")).unwrap()).unwrap();
-    let reasons: Vec<&str> = report["reasons"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|r| r.as_str().unwrap())
-        .collect();
-    assert!(
-        reasons
-            .iter()
-            .any(|r| r.contains("tool revision drift") || r.contains("digest drift")),
-        "reasons: {reasons:?}"
+    let stderr = String::from_utf8_lossy(&tampered.stderr);
+    assert!(stderr.contains("refusing to overwrite"), "stderr: {stderr}");
+    assert_eq!(
+        fs::read(&envelope_path).unwrap(),
+        tampered_bytes,
+        "the tampered envelope bytes must remain untouched"
     );
-
     let _ = fs::remove_dir_all(&dir);
 }
 
