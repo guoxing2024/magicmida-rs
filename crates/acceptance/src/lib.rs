@@ -51,9 +51,9 @@ pub mod oreans_gate;
 pub mod oreans_pe_evidence;
 
 pub use evidence_bundle::{
-    canonical_bundle_hash, validate_evidence_bundle, BundleArtifactIdentity,
-    BundleCompletionMarker, BundleMemberRef, BundleVerdict, OreansEvidenceBundle,
-    OREANS_EVIDENCE_BUNDLE_SCHEMA_VERSION, REQUIRED_BUNDLE_MEMBERS,
+    canonical_manifest_hash, canonical_members_hash, validate_evidence_bundle,
+    BundleArtifactIdentity, BundleCompletionMarker, BundleMemberRef, BundleVerdict,
+    OreansEvidenceBundle, OREANS_EVIDENCE_BUNDLE_SCHEMA_VERSION, REQUIRED_BUNDLE_MEMBERS,
     TRANSFORM_MANIFEST_SCHEMA_VERSION,
 };
 pub use oreans_gate::{

@@ -26,8 +26,11 @@ resolver = "2"
 version = "0.1.0"
 edition = "2021"
 repository = "https://github.com/guoxing2024/magicmida-rs"
-license = "GPL-3.0"
+license = "GPL-3.0-only"
 readme = "README.md"
+# Internal research workspace: no crate is published to crates.io, so
+# path-only dependencies are legitimate (cargo-deny wildcard exemption).
+publish = false
 
 [workspace.dependencies]
 iced-x86 = "1.21"

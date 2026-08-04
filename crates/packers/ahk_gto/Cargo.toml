@@ -4,8 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "AHK/GTO protection-family PackerPlugin (R4)"
 repository = "https://github.com/guoxing2024/magicmida-rs"
-license = "GPL-3.0"
+license = "GPL-3.0-only"
 readme = "../../../README.md"
+# Internal research crate; never published (path-only dependencies).
+publish = false
 
 [features]
 default = []

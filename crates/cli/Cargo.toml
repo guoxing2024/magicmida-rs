@@ -6,6 +6,7 @@ description = "Command-line interface for Magicmida-RS"
 repository.workspace = true
 license.workspace = true
 readme.workspace = true
+publish.workspace = true
 
 [features]
 default = []

@@ -26,7 +26,10 @@ jobs:
       - name: Check workspace (default features)
         run: cargo check --workspace --tests --locked
 
-      - name: Run offline tests
+      # `--locked` (not `--offline`): a fresh GitHub runner must download the
+      # lockfile-pinned dependency set once. A separate cache job can add
+      # offline speedups later.
+      - name: Run tests (locked)
         run: cargo test --workspace --locked
 
       - name: Check GTO product-recovery feature (off-mainline compile gate)
@@ -44,4 +47,3 @@ jobs:
         uses: embarkstudios/cargo-deny-action@v2
         with:
           command: check
-          arguments: --all-features

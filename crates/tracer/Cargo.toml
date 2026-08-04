@@ -6,6 +6,7 @@ description = "Single-step trace engine for following unpacker control flow"
 repository.workspace = true
 license.workspace = true
 readme.workspace = true
+publish.workspace = true
 
 [dependencies]
 mida-core = { path = "../core" }

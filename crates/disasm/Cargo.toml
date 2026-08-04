@@ -6,6 +6,7 @@ description = "iced-x86 wrapper for instruction disassembly and pattern matching
 repository.workspace = true
 license.workspace = true
 readme.workspace = true
+publish.workspace = true
 
 [dependencies]
 iced-x86 = { workspace = true }

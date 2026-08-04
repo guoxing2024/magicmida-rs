@@ -6,6 +6,7 @@ description = "Independent acceptance kernel: static PE structural gates and det
 repository.workspace = true
 license.workspace = true
 readme.workspace = true
+publish.workspace = true
 
 [[bin]]
 name = "mida-acceptance"

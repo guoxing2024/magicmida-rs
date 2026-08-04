@@ -6,6 +6,7 @@ description = "Themida unpacker implementation"
 repository.workspace = true
 license.workspace = true
 readme.workspace = true
+publish.workspace = true
 
 [dependencies]
 mida-core = { path = "../../core" }

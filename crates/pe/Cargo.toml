@@ -6,6 +6,7 @@ description = "PE parsing, section operations, import table reconstruction"
 repository.workspace = true
 license.workspace = true
 readme.workspace = true
+publish.workspace = true
 
 [dependencies]
 mida-core = { path = "../core" }

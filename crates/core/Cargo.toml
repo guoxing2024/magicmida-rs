@@ -6,6 +6,7 @@ description = "Debugger core: process creation, breakpoints, debug event loop"
 repository.workspace = true
 license.workspace = true
 readme.workspace = true
+publish.workspace = true
 
 [dependencies]
 pelite = { workspace = true }
