@@ -1,0 +1,651 @@
+//! P6.2 production-closure black-box tests: the REAL `mida-cli` binary's
+//! offline-preflight path and the launch-boundary gate.
+//!
+//! Proven end-to-end:
+//!
+//! - the runner emits `mida.runner-config-envelope/v1` (full config JSON +
+//!   producer digest + CLI binary SHA-256 + tool revision);
+//! - the acceptance verifier reparses the envelope with its own types and
+//!   recomputes the digest;
+//! - runner-emitted digest == acceptance-recomputed digest ==
+//!   report.runner_config_digest == envelope_runner_config_digest();
+//! - tampering the config, digest, CLI hash, or tool revision is rejected;
+//! - the unpack launch boundary consumes the Ready report BEFORE any
+//!   process creation (a garbage input never even reaches PE parsing).
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+fn temp_dir(tag: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "mida_cli_preflight_{tag}_{}_{}",
+        std::process::id(),
+        nanos
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+fn real_manifest(case_id: &str) -> PathBuf {
+    workspace_root()
+        .join("lab/cases/v2")
+        .join(format!("{case_id}.json"))
+}
+
+fn acceptance_bin() -> PathBuf {
+    let cli_bin = PathBuf::from(env!("CARGO_BIN_EXE_mida-cli"));
+    let sibling = cli_bin
+        .parent()
+        .expect("cli binary has a parent")
+        .join("mida-acceptance.exe");
+    assert!(
+        sibling.exists(),
+        "acceptance binary missing: {}",
+        sibling.display()
+    );
+    sibling
+}
+
+fn run_cli(args: &[&str], env: &[(&str, String)]) -> Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_mida-cli"));
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    cmd.args(args).output().expect("spawn mida-cli")
+}
+
+fn fake_binary(dir: &Path, name: &str) -> PathBuf {
+    let path = dir.join(name);
+    fs::write(&path, b"FAKE-CLI-BINARY-PAYLOAD").unwrap();
+    path
+}
+
+fn missing_input(dir: &Path) -> PathBuf {
+    let p = dir.join("protected_input.bin");
+    let _ = fs::remove_file(&p);
+    p
+}
+
+/// Deterministic scratch git repo: the worktree probe sees a clean tree
+/// with a stable HEAD regardless of the state of the real repository the
+/// tests run from (the probe must not depend on uncommitted changes).
+fn scratch_repo(parent: &Path) -> PathBuf {
+    let repo = parent.join("scratch-repo");
+    fs::create_dir_all(&repo).unwrap();
+    let run = |args: &[&str]| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .output()
+            .expect("spawn git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    run(&["init", "-q", "-b", "main"]);
+    run(&["config", "user.email", "test@mida.local"]);
+    run(&["config", "user.name", "mida test"]);
+    fs::write(repo.join("probe.txt"), "probe").unwrap();
+    run(&["add", "probe.txt"]);
+    run(&["commit", "-q", "-m", "seed"]);
+    repo
+}
+
+/// Full offline-preflight argument vector for the two fixed cases.
+fn preflight_args(dir: &Path, repo_root: &Path) -> Vec<String> {
+    let cli_binary = fake_binary(dir, "mida_cli.exe");
+    vec![
+        "/offline-preflight".to_string(),
+        dir.display().to_string(),
+        format!("--cli-binary={}", cli_binary.display()),
+        format!("--repo-root={}", repo_root.display()),
+        format!(
+            "--toolchain-pin={}",
+            workspace_root().join("rust-toolchain.toml").display()
+        ),
+        "--expected-toolchain=1.97.1".to_string(),
+        "--case".to_string(),
+        real_manifest("origin_macro").display().to_string(),
+        missing_input(dir).display().to_string(),
+        dir.join("origin_candidate.exe").display().to_string(),
+        "--case".to_string(),
+        real_manifest("lunlun_software").display().to_string(),
+        missing_input(dir).display().to_string(),
+        dir.join("lunlun_candidate.exe").display().to_string(),
+    ]
+}
+
+fn run_preflight(dir: &Path, repo_root: &Path) -> Output {
+    let args = preflight_args(dir, repo_root);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_cli(
+        &arg_refs,
+        &[(
+            "MIDA_ACCEPTANCE_BIN",
+            acceptance_bin().display().to_string(),
+        )],
+    )
+}
+
+/// Baseline: two real locked manifests, missing samples, pinned CLI. The
+/// ONLY expected outcome is NotReady (missing protected inputs), and the
+/// digest chain must hold: envelope == report == acceptance-recomputed.
+#[test]
+fn offline_preflight_rejects_without_samples_and_chain_is_consistent() {
+    let dir = temp_dir("chain");
+    let repo_root = scratch_repo(&dir);
+    let output = run_preflight(&dir, &repo_root);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "missing samples must be NotReady (exit 2): {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "missing samples must be NotReady (exit 2): {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let envelope_path = dir.join("runner-config-envelope.json");
+    let report_path = dir.join("preflight.json");
+    assert!(envelope_path.exists(), "envelope must be emitted");
+    assert!(report_path.exists(), "report must be written");
+
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&fs::read(&envelope_path).unwrap()).unwrap();
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report_path).unwrap()).unwrap();
+
+    assert_eq!(
+        report["status"].as_str(),
+        Some("not_ready"),
+        "status: {report}"
+    );
+    let reasons: Vec<&str> = report["reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_str().unwrap())
+        .collect();
+    assert!(
+        reasons
+            .iter()
+            .any(|r| r.contains("cannot read protected input")),
+        "reasons: {reasons:?}"
+    );
+
+    // Chain: runner-emitted digest == report digest == acceptance-recomputed.
+    let envelope_digest = envelope["runner_config_digest"]
+        .as_str()
+        .unwrap()
+        .to_lowercase();
+    let report_digest = report["runner_config_digest"]
+        .as_str()
+        .unwrap()
+        .to_lowercase();
+    assert_eq!(envelope_digest, report_digest, "envelope vs report digest");
+    let parsed: mida_acceptance::RunnerConfig =
+        serde_json::from_value(envelope["runner_config"].clone()).unwrap();
+    let recomputed = mida_acceptance::runner_config_digest(&parsed);
+    assert_eq!(
+        envelope_digest, recomputed,
+        "producer vs acceptance recompute"
+    );
+    assert_eq!(
+        mida_cli::runner_preflight::envelope_runner_config_digest(&dir).unwrap(),
+        envelope_digest,
+        "bundle-path digest source must match"
+    );
+    assert_eq!(envelope_digest.len(), 64);
+
+    // The envelope carries the full contract fields.
+    assert_eq!(
+        envelope["schema_version"].as_str(),
+        Some("mida.runner-config-envelope/v1")
+    );
+    assert!(!envelope["cli_binary_sha256"].as_str().unwrap().is_empty());
+    assert!(!envelope["tool_revision"].as_str().unwrap().is_empty());
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Tampering the producer digest must be rejected with a drift reason.
+#[test]
+fn tampered_digest_rejected() {
+    let dir = temp_dir("tamper_digest");
+    let repo_root = scratch_repo(&dir);
+    let env = &[(
+        "MIDA_ACCEPTANCE_BIN",
+        acceptance_bin().display().to_string(),
+    )];
+    let args = preflight_args(&dir, &repo_root);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let baseline = run_cli(&arg_refs, env);
+    assert_eq!(baseline.status.code(), Some(2), "baseline NotReady");
+
+    // Flip one hex char of the producer digest.
+    let envelope_path = dir.join("runner-config-envelope.json");
+    let mut envelope: serde_json::Value =
+        serde_json::from_slice(&fs::read(&envelope_path).unwrap()).unwrap();
+    let digest = envelope["runner_config_digest"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let flipped = format!(
+        "{}{}{}",
+        &digest[..0],
+        if digest.as_bytes()[0] == b'a' {
+            "b"
+        } else {
+            "a"
+        },
+        &digest[1..]
+    );
+    envelope["runner_config_digest"] = serde_json::json!(flipped);
+    fs::write(
+        &envelope_path,
+        serde_json::to_vec_pretty(&envelope).unwrap(),
+    )
+    .unwrap();
+
+    let tampered = run_cli(&arg_refs, env);
+    assert_eq!(
+        tampered.status.code(),
+        Some(2),
+        "tampered digest must be rejected"
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.join("preflight.json")).unwrap()).unwrap();
+    let reasons: Vec<&str> = report["reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_str().unwrap())
+        .collect();
+    assert!(
+        reasons
+            .iter()
+            .any(|r| r.contains("runner-config-envelope digest drift")),
+        "reasons: {reasons:?}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Unknown fields in the envelope must fail closed (no report, hard reject).
+#[test]
+fn tampered_unknown_field_rejected() {
+    let dir = temp_dir("tamper_unknown");
+    let repo_root = scratch_repo(&dir);
+    let env = &[(
+        "MIDA_ACCEPTANCE_BIN",
+        acceptance_bin().display().to_string(),
+    )];
+    let args = preflight_args(&dir, &repo_root);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let baseline = run_cli(&arg_refs, env);
+    assert_eq!(baseline.status.code(), Some(2), "baseline NotReady");
+
+    let envelope_path = dir.join("runner-config-envelope.json");
+    let mut envelope: serde_json::Value =
+        serde_json::from_slice(&fs::read(&envelope_path).unwrap()).unwrap();
+    envelope["sneaky_extra"] = serde_json::json!(1);
+    fs::write(
+        &envelope_path,
+        serde_json::to_vec_pretty(&envelope).unwrap(),
+    )
+    .unwrap();
+
+    let tampered = run_cli(&arg_refs, env);
+    assert!(
+        tampered.status.code() != Some(0),
+        "unknown envelope field must be rejected: {}",
+        String::from_utf8_lossy(&tampered.stderr)
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Tampering the CLI binary identity in the envelope must be rejected.
+#[test]
+fn tampered_cli_hash_rejected() {
+    let dir = temp_dir("tamper_cli");
+    let repo_root = scratch_repo(&dir);
+    let env = &[(
+        "MIDA_ACCEPTANCE_BIN",
+        acceptance_bin().display().to_string(),
+    )];
+    let args = preflight_args(&dir, &repo_root);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let baseline = run_cli(&arg_refs, env);
+    assert_eq!(baseline.status.code(), Some(2), "baseline NotReady");
+
+    let envelope_path = dir.join("runner-config-envelope.json");
+    let mut envelope: serde_json::Value =
+        serde_json::from_slice(&fs::read(&envelope_path).unwrap()).unwrap();
+    envelope["cli_binary_sha256"] = serde_json::json!("f".repeat(64));
+    fs::write(
+        &envelope_path,
+        serde_json::to_vec_pretty(&envelope).unwrap(),
+    )
+    .unwrap();
+
+    let tampered = run_cli(&arg_refs, env);
+    assert_eq!(
+        tampered.status.code(),
+        Some(2),
+        "tampered CLI hash must be rejected"
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.join("preflight.json")).unwrap()).unwrap();
+    let reasons: Vec<&str> = report["reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_str().unwrap())
+        .collect();
+    assert!(
+        reasons
+            .iter()
+            .any(|r| r.contains("does not match expected")),
+        "reasons: {reasons:?}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Tampering the tool revision (in the config inside the envelope) must be
+/// rejected: the acceptance git probe sees the real HEAD and reports drift.
+#[test]
+fn tampered_tool_revision_rejected() {
+    let dir = temp_dir("tamper_revision");
+    let repo_root = scratch_repo(&dir);
+    let env = &[(
+        "MIDA_ACCEPTANCE_BIN",
+        acceptance_bin().display().to_string(),
+    )];
+    let args = preflight_args(&dir, &repo_root);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let baseline = run_cli(&arg_refs, env);
+    assert_eq!(baseline.status.code(), Some(2), "baseline NotReady");
+
+    let envelope_path = dir.join("runner-config-envelope.json");
+    let mut envelope: serde_json::Value =
+        serde_json::from_slice(&fs::read(&envelope_path).unwrap()).unwrap();
+    envelope["runner_config"]["tool_revision"] =
+        serde_json::json!("deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+    fs::write(
+        &envelope_path,
+        serde_json::to_vec_pretty(&envelope).unwrap(),
+    )
+    .unwrap();
+
+    let tampered = run_cli(&arg_refs, env);
+    assert_eq!(
+        tampered.status.code(),
+        Some(2),
+        "tampered revision must be rejected"
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.join("preflight.json")).unwrap()).unwrap();
+    let reasons: Vec<&str> = report["reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_str().unwrap())
+        .collect();
+    assert!(
+        reasons
+            .iter()
+            .any(|r| r.contains("tool revision drift") || r.contains("digest drift")),
+        "reasons: {reasons:?}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The launch boundary must consume the Ready report BEFORE any process
+/// creation: with a NotReady report (or no envelope at all), the unpack run
+/// is blocked even before PE parsing — proven with a garbage input that is
+/// not a valid PE and would fail later in the pipeline if the gate did not
+/// exist.
+#[test]
+fn launch_gate_blocks_before_process_creation() {
+    // A gated run with an unavailable envelope must be blocked immediately.
+    let dir = temp_dir("launch_no_envelope");
+    let garbage = dir.join("input.bin");
+    fs::write(&garbage, b"NOT-A-PE-NOT-A-PE-NOT-A-PE").unwrap();
+    let candidate = dir.join("candidate.exe");
+    let output = run_cli(
+        &[
+            "/unpack",
+            garbage.to_str().unwrap(),
+            "--output",
+            candidate.to_str().unwrap(),
+            "--preflight-dir",
+            dir.to_str().unwrap(),
+        ],
+        &[],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "missing envelope must block launch"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("launch blocked") && stderr.contains("envelope"),
+        "stderr: {stderr}"
+    );
+    assert!(!candidate.exists(), "no candidate may be produced");
+    let _ = fs::remove_dir_all(&dir);
+
+    // A gated run with a NotReady report must be blocked before PE parsing.
+    let dir = temp_dir("launch_not_ready");
+    let repo_root = scratch_repo(&dir);
+    let env = &[(
+        "MIDA_ACCEPTANCE_BIN",
+        acceptance_bin().display().to_string(),
+    )];
+    let args = preflight_args(&dir, &repo_root);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let preflight = run_cli(&arg_refs, env);
+    assert_eq!(preflight.status.code(), Some(2), "preflight NotReady");
+
+    let garbage = dir.join("input.bin");
+    fs::write(&garbage, b"NOT-A-PE-NOT-A-PE-NOT-A-PE").unwrap();
+    let candidate = dir.join("candidate.exe");
+    let output = run_cli(
+        &[
+            "/unpack",
+            garbage.to_str().unwrap(),
+            "--output",
+            candidate.to_str().unwrap(),
+            "--preflight-dir",
+            dir.to_str().unwrap(),
+        ],
+        &[],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "NotReady report must block launch"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("launch blocked") && stderr.contains("preflight gate"),
+        "stderr: {stderr}"
+    );
+    assert!(!candidate.exists(), "no candidate may be produced");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A syntactically valid `ready` report whose digest no longer matches the
+/// envelope must be blocked by the launch gate (defense in depth at the
+/// boundary), before any process creation.
+#[test]
+fn launch_gate_rejects_digest_drift() {
+    let dir = temp_dir("launch_drift");
+    let repo_root = scratch_repo(&dir);
+    let env = &[(
+        "MIDA_ACCEPTANCE_BIN",
+        acceptance_bin().display().to_string(),
+    )];
+    let args = preflight_args(&dir, &repo_root);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let preflight = run_cli(&arg_refs, env);
+    assert_eq!(preflight.status.code(), Some(2), "preflight NotReady");
+
+    // Build a syntactically valid READY report, then tamper its digest so it
+    // no longer matches the envelope.
+    let envelope_path = dir.join("runner-config-envelope.json");
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&fs::read(&envelope_path).unwrap()).unwrap();
+    let correct_digest = envelope["runner_config_digest"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let flipped = format!(
+        "{}{}",
+        if correct_digest.as_bytes()[0] == b'a' {
+            "b"
+        } else {
+            "a"
+        },
+        &correct_digest[1..]
+    );
+    let report_path = dir.join("preflight.json");
+    fs::write(
+        &report_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": "mida.preflight-report/v1",
+            "status": "ready",
+            "reasons": [],
+            "runner_config_digest": flipped,
+            "head_revision": null,
+            "worktree_clean": true,
+            "toolchain_matches": true,
+            "cli_binary_sha256": envelope["cli_binary_sha256"],
+            "cli_binary_matches": true,
+            "cases": [
+                {"case_id": "origin_macro", "identity_ok": true, "reasons": []},
+                {"case_id": "lunlun_software", "identity_ok": true, "reasons": []}
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let garbage = dir.join("input.bin");
+    fs::write(&garbage, b"NOT-A-PE-NOT-A-PE-NOT-A-PE").unwrap();
+    let candidate = dir.join("candidate.exe");
+    let output = run_cli(
+        &[
+            "/unpack",
+            garbage.to_str().unwrap(),
+            "--output",
+            candidate.to_str().unwrap(),
+            "--preflight-dir",
+            dir.to_str().unwrap(),
+        ],
+        &[],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "digest drift must block launch"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("digest drift"), "stderr: {stderr}");
+    assert!(!candidate.exists(), "no candidate may be produced");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Positive control: a valid `ready` report whose digest matches the
+/// envelope passes the gate, and the pipeline continues past it — the
+/// garbage input then fails at PE parsing (proving the gate is consumed
+/// BEFORE any process creation, and that gate-passing is not silently
+/// bypassing the pipeline).
+#[test]
+fn launch_gate_accepts_ready_report_and_pipeline_continues() {
+    let dir = temp_dir("launch_ready");
+    let repo_root = scratch_repo(&dir);
+    let env = &[(
+        "MIDA_ACCEPTANCE_BIN",
+        acceptance_bin().display().to_string(),
+    )];
+    let args = preflight_args(&dir, &repo_root);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let preflight = run_cli(&arg_refs, env);
+    assert_eq!(preflight.status.code(), Some(2), "preflight NotReady");
+
+    let envelope_path = dir.join("runner-config-envelope.json");
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&fs::read(&envelope_path).unwrap()).unwrap();
+    let correct_digest = envelope["runner_config_digest"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let report_path = dir.join("preflight.json");
+    fs::write(
+        &report_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": "mida.preflight-report/v1",
+            "status": "ready",
+            "reasons": [],
+            "runner_config_digest": correct_digest,
+            "head_revision": null,
+            "worktree_clean": true,
+            "toolchain_matches": true,
+            "cli_binary_sha256": envelope["cli_binary_sha256"],
+            "cli_binary_matches": true,
+            "cases": [
+                {"case_id": "origin_macro", "identity_ok": true, "reasons": []},
+                {"case_id": "lunlun_software", "identity_ok": true, "reasons": []}
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let garbage = dir.join("input.bin");
+    fs::write(&garbage, b"NOT-A-PE-NOT-A-PE-NOT-A-PE").unwrap();
+    let candidate = dir.join("candidate.exe");
+    let output = run_cli(
+        &[
+            "/unpack",
+            garbage.to_str().unwrap(),
+            "--output",
+            candidate.to_str().unwrap(),
+            "--preflight-dir",
+            dir.to_str().unwrap(),
+        ],
+        &[],
+    );
+    // The gate passed; the pipeline continued to PE parsing, which fails on
+    // the garbage input — NOT with a "launch blocked" gate error.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Failed to parse PE header"),
+        "gate must pass and the pipeline must continue past it: {stderr}"
+    );
+    assert!(
+        !stderr.contains("launch blocked"),
+        "the gate must NOT block a valid ready report: {stderr}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}

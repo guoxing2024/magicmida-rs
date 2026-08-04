@@ -1,4 +1,4 @@
-﻿//! CLI argument parsing — `/unpack`, `/generic-unpack`, `/dump-process`, `/verify`.
+//! CLI argument parsing — `/unpack`, `/generic-unpack`, `/dump-process`, `/verify`.
 
 use std::path::PathBuf;
 
@@ -26,6 +26,10 @@ pub enum Command {
         /// Optional capture policy from `--capture-policy=PATH` (case-manifest shape).
         /// Empty = plugin/profile defaults only.
         capture_policy: DumpCapturePolicy,
+        /// P6.2: when set, the launch boundary consumes a Ready offline
+        /// preflight report from this directory before any sample process
+        /// is created.
+        preflight_dir: Option<PathBuf>,
         verbose: bool,
     },
     /// Packer-agnostic full dump (no Themida shrink).
@@ -46,6 +50,18 @@ pub enum Command {
         unpacked: PathBuf,
         reference: PathBuf,
     },
+    /// P6.2: offline preflight gate — emit the runner-config envelope, drive
+    /// the independent verifier, and consume the ready/not_ready report.
+    OfflinePreflight {
+        output_dir: PathBuf,
+        /// (manifest, protected input, candidate output) per case.
+        cases: Vec<(PathBuf, PathBuf, PathBuf)>,
+        cli_binary: PathBuf,
+        repo_root: PathBuf,
+        toolchain_pin_file: PathBuf,
+        expected_toolchain: String,
+        acceptance_bin: Option<PathBuf>,
+    },
     Help,
     Version,
 }
@@ -64,6 +80,9 @@ pub fn parse_args() -> Result<Command, String> {
         }
         "/dump-process" | "--dump-process" | "dump-process" => parse_dump_process(&args),
         "/verify" | "--verify" | "verify" => parse_verify(&args),
+        "/offline-preflight" | "--offline-preflight" | "offline-preflight" => {
+            parse_offline_preflight(&args)
+        }
         other => Err(format!(
             "Unknown command '{}'. Use --help for usage information.",
             other
@@ -104,6 +123,7 @@ fn parse_unpack(args: &[String]) -> Result<Command, String> {
     let mut cli_no_pure_rebuild = false;
     let mut capture_policy = DumpCapturePolicy::default();
     let mut capture_policy_path: Option<PathBuf> = None;
+    let mut preflight_dir: Option<PathBuf> = None;
 
     let mut i = 3;
     while i < args.len() {
@@ -114,6 +134,13 @@ fn parse_unpack(args: &[String]) -> Result<Command, String> {
                     return Err("Missing output path after -o/--output.".into());
                 }
                 output = Some(PathBuf::from(&args[i]));
+            }
+            "--preflight-dir" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("Missing directory after --preflight-dir.".into());
+                }
+                preflight_dir = Some(PathBuf::from(&args[i]));
             }
             "--data-sections" | "--create-data-sections" => create_data_sections = true,
             "--shrink" => shrink = true,
@@ -214,6 +241,7 @@ fn parse_unpack(args: &[String]) -> Result<Command, String> {
         profile,
         pure_rebuild,
         capture_policy,
+        preflight_dir,
         verbose,
     })
 }
@@ -324,6 +352,68 @@ fn parse_verify(args: &[String]) -> Result<Command, String> {
     Ok(Command::Verify {
         unpacked: PathBuf::from(&args[2]),
         reference: PathBuf::from(&args[3]),
+    })
+}
+
+fn parse_offline_preflight(args: &[String]) -> Result<Command, String> {
+    if args.len() < 3 {
+        return Err(
+            "Usage: mida-cli /offline-preflight <output-dir> --cli-binary=<path> \
+             --repo-root=<path> --toolchain-pin=<path> --expected-toolchain=<ver> \
+             --case <manifest> <input> <output> [--case ...] [--acceptance-bin=<path>]"
+                .into(),
+        );
+    }
+    let output_dir = PathBuf::from(&args[2]);
+    let mut cli_binary: Option<PathBuf> = None;
+    let mut repo_root: Option<PathBuf> = None;
+    let mut toolchain_pin_file: Option<PathBuf> = None;
+    let mut expected_toolchain: Option<String> = None;
+    let mut acceptance_bin: Option<PathBuf> = None;
+    let mut cases: Vec<(PathBuf, PathBuf, PathBuf)> = Vec::new();
+    let mut i = 3;
+    while i < args.len() {
+        let arg = &args[i];
+        if let Some(v) = arg.strip_prefix("--cli-binary=") {
+            cli_binary = Some(PathBuf::from(v));
+        } else if let Some(v) = arg.strip_prefix("--repo-root=") {
+            repo_root = Some(PathBuf::from(v));
+        } else if let Some(v) = arg.strip_prefix("--toolchain-pin=") {
+            toolchain_pin_file = Some(PathBuf::from(v));
+        } else if let Some(v) = arg.strip_prefix("--expected-toolchain=") {
+            expected_toolchain = Some(v.to_string());
+        } else if let Some(v) = arg.strip_prefix("--acceptance-bin=") {
+            acceptance_bin = Some(PathBuf::from(v));
+        } else if arg == "--case" {
+            if i + 3 >= args.len() {
+                return Err("Missing manifest/input/output after --case.".into());
+            }
+            cases.push((
+                PathBuf::from(&args[i + 1]),
+                PathBuf::from(&args[i + 2]),
+                PathBuf::from(&args[i + 3]),
+            ));
+            i += 3;
+        } else {
+            return Err(format!("Unknown offline-preflight option: {arg}"));
+        }
+        i += 1;
+    }
+    let cli_binary = cli_binary.ok_or("Missing --cli-binary=<path>.")?;
+    let repo_root = repo_root.ok_or("Missing --repo-root=<path>.")?;
+    let toolchain_pin_file = toolchain_pin_file.ok_or("Missing --toolchain-pin=<path>.")?;
+    let expected_toolchain = expected_toolchain.ok_or("Missing --expected-toolchain=<ver>.")?;
+    if cases.is_empty() {
+        return Err("At least one --case triple is required.".into());
+    }
+    Ok(Command::OfflinePreflight {
+        output_dir,
+        cases,
+        cli_binary,
+        repo_root,
+        toolchain_pin_file,
+        expected_toolchain,
+        acceptance_bin,
     })
 }
 

@@ -122,6 +122,7 @@ pub fn unpack(
     profile: DumpProfile,
     pure_rebuild: bool,
     capture_policy: mida_pe::DumpCapturePolicy,
+    preflight_dir: Option<&Path>,
 ) -> Result<(), anyhow::Error> {
     use tracing::info;
     info!("=== UNPACK START ===");
@@ -138,6 +139,23 @@ pub fn unpack(
     // ---- step 1: resolve output path ----
     let output_path = resolve_output_path(input, output);
     info!("Output: {}", output_path.display());
+
+    // ---- step 1b: P6.2 launch boundary ----
+    // When a preflight directory is supplied, the run may not create the
+    // sample process until the offline preflight report is Ready and its
+    // digest chain matches the runner-config envelope. Runs without
+    // --preflight-dir keep legacy behaviour.
+    if let Some(preflight_dir) = preflight_dir {
+        let envelope = crate::runner_preflight::RunnerConfigEnvelope::read(preflight_dir)
+            .map_err(|e| anyhow!("launch blocked: runner-config envelope unavailable: {e:#}"))?;
+        crate::runner_preflight::require_ready_before_launch(preflight_dir, &envelope).map_err(
+            |e| anyhow!("launch blocked by preflight gate before any process creation: {e:#}"),
+        )?;
+        info!(
+            "Preflight gate: Ready — envelope digest {} consumed",
+            envelope.runner_config_digest
+        );
+    }
 
     // ---- step 2: parse PE header ----
     log::log(LogType::Info, &format!("Loading: {}", input.display()));

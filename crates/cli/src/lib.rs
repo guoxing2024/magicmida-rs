@@ -9,6 +9,7 @@ pub mod capture_policy_file;
 pub mod commands;
 pub mod log;
 pub mod origin_pure;
+pub mod runner_preflight;
 pub mod unpacker;
 
 use std::error::Error;
@@ -103,6 +104,8 @@ pub fn print_help() {
     println!("  /generic-unpack <file> [options]   Packer-agnostic full dump (no shrink)");
     println!("  /dump-process <pid> <file>         Dump .text from running process");
     println!("  /verify <unpacked> <ref>           Verify against reference");
+    println!("  /offline-preflight <dir> [options] Emit runner-config envelope and run the");
+    println!("                                    independent offline preflight gate");
     println!();
     println!("GENERIC OPTIONS:");
     println!("  -o, --output <file>     Output path (default: <stem>_genericU.exe)");
@@ -115,6 +118,8 @@ pub fn print_help() {
     println!("  -o, --output <file>          Output path (default: <input>U.exe)");
     println!("  --data-sections              Restore .rdata/.data sections from process");
     println!("  --shrink                     Remove Themida-specific sections (default)");
+    println!("  --preflight-dir <dir>        Require a Ready offline-preflight report from");
+    println!("                               <dir> before any sample process is created");
     println!("  --no-shrink                  Keep all sections");
     println!("  --oep=crt|captured|rva=N     PE entry policy (default: captured)");
     println!("  --profile=oreans-classic      Oreans mainline profile (default)");

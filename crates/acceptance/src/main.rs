@@ -13,10 +13,12 @@
 //! Report writes never alias candidate, oracle, or evidence inputs.
 
 use std::env;
-use std::fs::{File, Metadata, OpenOptions};
+use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process;
+
+use serde::Deserialize;
 
 use mida_acceptance::oreans_gate::OREANS_TWO_SAMPLE_OBSERVATIONS_SCHEMA_VERSION;
 use mida_acceptance::{
@@ -68,8 +70,12 @@ fn run() -> Result<i32, String> {
             args.remove(0);
             cmd_oreans_two_sample_gate(&args)
         }
+        "preflight" => {
+            args.remove(0);
+            cmd_preflight(&args)
+        }
         other => Err(format!(
-            "unknown command '{other}'. Use: check-static | check-with-behavior | oreans-pe-evidence | oreans-two-sample-gate"
+            "unknown command '{other}'. Use: check-static | check-with-behavior | oreans-pe-evidence | oreans-two-sample-gate | preflight"
         )),
     }
 }
@@ -84,6 +90,11 @@ Usage:
   mida-acceptance check-with-behavior <candidate> --behavior-evidence <path> [options]
   mida-acceptance oreans-pe-evidence <candidate> [options]
   mida-acceptance oreans-two-sample-gate <observations.json> [options]
+  mida-acceptance preflight --envelope <path> --output-dir <dir> --cli-binary <path>
+                            --repo-root <path> --toolchain-pin <path>
+                            --expected-toolchain <ver> --case <manifest> <input> <output>
+                            [--case ...]
+                            (verifies the runner-config envelope + writes preflight.json)
 
 Options:
   --expected-sha256 <hex>  Fail-closed if file digest does not match
@@ -1038,4 +1049,187 @@ fn same_file(
     _right: &Metadata,
 ) -> std::io::Result<bool> {
     Ok(false)
+}
+
+/// Verifier-side copy of the `mida.runner-config-envelope/v1` emitted by the
+/// runner (`mida-cli`). Deny-unknown-fields: any tampered or drifted field
+/// fails closed. The acceptance crate stays dependency-free of production.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunnerConfigEnvelopeV1 {
+    #[serde(rename = "$schema")]
+    #[allow(dead_code)]
+    schema: String,
+    schema_version: String,
+    runner_config: serde_json::Value,
+    runner_config_digest: String,
+    cli_binary_sha256: String,
+    tool_revision: String,
+}
+
+/// Worktree probe host: runs `git` in the repository root. Any probe failure
+/// yields `clean_determined = false` (fail closed).
+struct GitWorktreeProbe {
+    repo_root: PathBuf,
+}
+
+impl mida_acceptance::WorktreeProbe for GitWorktreeProbe {
+    fn probe(&self) -> mida_acceptance::WorktreeState {
+        use std::process::Command;
+        let head = Command::new("git")
+            .arg("-C")
+            .arg(&self.repo_root)
+            .args(["rev-parse", "--verify", "HEAD"])
+            .output();
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&self.repo_root)
+            .args(["status", "--porcelain"])
+            .output();
+        match (head, status) {
+            (Ok(h), Ok(s)) if h.status.success() && s.status.success() => {
+                mida_acceptance::WorktreeState {
+                    head_revision: String::from_utf8_lossy(&h.stdout).trim().to_string(),
+                    clean: s.stdout.is_empty(),
+                    clean_determined: true,
+                }
+            }
+            _ => mida_acceptance::WorktreeState {
+                head_revision: String::new(),
+                clean: false,
+                clean_determined: false,
+            },
+        }
+    }
+}
+
+/// `mida-acceptance preflight`: independent verifier of the runner-emitted
+/// envelope. Reparses the envelope JSON with the acceptance `RunnerConfig`,
+/// recomputes the digest with the acceptance canonical implementation, and
+/// cross-checks it against the producer digest before running every offline
+/// check. Writes `preflight.json` under the output dir.
+///
+/// Exit codes: 0 = Ready, 2 = NotReady, 1 = I/O or configuration error.
+fn cmd_preflight(args: &[String]) -> Result<i32, String> {
+    use std::path::{Path, PathBuf};
+
+    let mut envelope_path: Option<PathBuf> = None;
+    let mut output_dir: Option<PathBuf> = None;
+    let mut cli_binary: Option<PathBuf> = None;
+    let mut repo_root: Option<PathBuf> = None;
+    let mut toolchain_pin: Option<PathBuf> = None;
+    let mut expected_toolchain: Option<String> = None;
+    let mut cases: Vec<(PathBuf, PathBuf, PathBuf)> = Vec::new();
+
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        let take = |i: &mut usize, label: &str| -> Result<PathBuf, String> {
+            *i += 1;
+            if *i >= args.len() {
+                return Err(format!("Missing value after {label}."));
+            }
+            Ok(PathBuf::from(&args[*i]))
+        };
+        match arg.as_str() {
+            "--envelope" => envelope_path = Some(take(&mut i, "--envelope")?),
+            "--output-dir" => output_dir = Some(take(&mut i, "--output-dir")?),
+            "--cli-binary" => cli_binary = Some(take(&mut i, "--cli-binary")?),
+            "--repo-root" => repo_root = Some(take(&mut i, "--repo-root")?),
+            "--toolchain-pin" => toolchain_pin = Some(take(&mut i, "--toolchain-pin")?),
+            "--expected-toolchain" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("Missing value after --expected-toolchain.".into());
+                }
+                expected_toolchain = Some(args[i].clone());
+            }
+            "--case" => {
+                let manifest = take(&mut i, "--case")?;
+                let input = take(&mut i, "--case")?;
+                let output = take(&mut i, "--case")?;
+                cases.push((manifest, input, output));
+            }
+            other => return Err(format!("Unknown preflight option: {other}")),
+        }
+        i += 1;
+    }
+
+    let envelope_path = envelope_path.ok_or("Missing --envelope <path>.")?;
+    let output_dir = output_dir.ok_or("Missing --output-dir <dir>.")?;
+    let cli_binary = cli_binary.ok_or("Missing --cli-binary <path>.")?;
+    let repo_root = repo_root.ok_or("Missing --repo-root <path>.")?;
+    let toolchain_pin = toolchain_pin.ok_or("Missing --toolchain-pin <path>.")?;
+    let expected_toolchain = expected_toolchain.ok_or("Missing --expected-toolchain <ver>.")?;
+
+    let envelope_bytes = fs::read(&envelope_path)
+        .map_err(|e| format!("cannot read envelope {}: {e}", envelope_path.display()))?;
+    let envelope: RunnerConfigEnvelopeV1 =
+        serde_json::from_slice(&envelope_bytes).map_err(|e| {
+            format!(
+                "envelope {} rejected (unknown/malformed fields): {e}",
+                envelope_path.display()
+            )
+        })?;
+    if envelope.schema_version != "mida.runner-config-envelope/v1" {
+        return Err(format!(
+            "envelope schema_version {:?} != mida.runner-config-envelope/v1",
+            envelope.schema_version
+        ));
+    }
+
+    // Independent reparse + recompute with the acceptance implementation.
+    let parsed: mida_acceptance::RunnerConfig = serde_json::from_value(envelope.runner_config)
+        .map_err(|e| format!("runner config in envelope rejected: {e}"))?;
+    let mut reasons: Vec<String> = Vec::new();
+    let recomputed = mida_acceptance::runner_config_digest(&parsed);
+    if recomputed != envelope.runner_config_digest.to_lowercase() {
+        reasons.push(format!(
+            "runner-config-envelope digest drift: acceptance recomputed {recomputed}, \
+             producer emitted {}",
+            envelope.runner_config_digest
+        ));
+    }
+    if envelope.tool_revision != parsed.tool_revision {
+        reasons.push(format!(
+            "envelope tool_revision {:?} does not match runner config {:?}",
+            envelope.tool_revision, parsed.tool_revision
+        ));
+    }
+
+    let probe = GitWorktreeProbe {
+        repo_root: repo_root.clone(),
+    };
+    let borrowed: Vec<(&Path, &Path, &Path)> = cases
+        .iter()
+        .map(|(m, i, o)| (m.as_path(), i.as_path(), o.as_path()))
+        .collect();
+    let request = mida_acceptance::PreflightRequest {
+        cases: borrowed,
+        output_dir: &output_dir,
+        cli_binary: Some(&cli_binary),
+        expected_cli_sha256: &envelope.cli_binary_sha256,
+        runner_config: &parsed,
+        worktree: &probe,
+        output_probe: &mida_acceptance::FsOutputProbe,
+        toolchain_pin_file: &toolchain_pin,
+        expected_toolchain: &expected_toolchain,
+    };
+    let mut report = mida_acceptance::run_offline_preflight(&request);
+    if !reasons.is_empty() {
+        report.reasons.extend(reasons);
+        report.status = mida_acceptance::PreflightStatus::NotReady;
+    }
+    let destination = mida_acceptance::write_preflight_report(&output_dir, &report)
+        .map_err(|e| format!("cannot write preflight report: {e}"))?;
+    match report.status {
+        mida_acceptance::PreflightStatus::Ready => {
+            println!("preflight: READY ({})", destination.display());
+            Ok(0)
+        }
+        mida_acceptance::PreflightStatus::NotReady => {
+            eprintln!("preflight: NOT READY �� {}", report.reasons.join("; "));
+            Ok(2)
+        }
+    }
 }
