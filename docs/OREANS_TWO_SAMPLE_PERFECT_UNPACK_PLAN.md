@@ -321,6 +321,13 @@ Completed in the current offline audit:
    sidecar's embedded identities are cross-checked, and partial bundles are
    never valid runs. See
    [docs/VNEXT_EVIDENCE_BUNDLE_V1.md](VNEXT_EVIDENCE_BUNDLE_V1.md).
+9. Bundle-envelope gate entry (`evaluate_bundle_gate`, schema
+   `mida.oreans-two-sample-bundle-gate/v1`): the v8 gate now consumes
+   evidence bundles directly — envelopes are re-validated, `case_id` and
+   protected-input identity are cross-checked against the locked
+   `lab/cases/v2` manifests, and bare sidecars, v1 manifests, partial
+   markers, tampered hashes, and unparsable sidecars are rejected before any
+   gate logic runs.
 
 Remaining blockers, in order:
 

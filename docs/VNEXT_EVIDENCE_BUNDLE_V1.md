@@ -157,6 +157,14 @@ the offline tests:
   names, aliased paths, stale embedded identities, schema drift, malformed
   fields, and restart recovery over a corrupt destination all fail closed,
   and a leftover `.tmp-*` file is never a valid bundle.
+- `crates/acceptance/src/bundle_gate.rs` — the v8 gate's envelope entry:
+  `evaluate_bundle_gate` re-validates every bundle, cross-checks `case_id`
+  and the protected-input identity against the locked `lab/cases/v2`
+  manifest, re-parses every sidecar into the gate schema, and only then
+  runs the two-sample gate. Bare sidecars, v1 manifests, partial markers,
+  tampered hashes and unparsable sidecars are rejected before any gate
+  logic.
+- `crates/acceptance/tests/bundle_gate.rs` — envelope-gate tests (7).
 
 Run:
 
@@ -168,9 +176,8 @@ cargo test -p mida-cli --test bundle_assembler --offline
 ## 7. Not yet done (next steps)
 
 - The CLI unpack command does not yet invoke the assembler automatically; the
-  post-loop must aggregate the emitted sidecars into a bundle per run (P5
-  wiring, `assemble_evidence_bundle` is ready to be called).
-- The v8 gate should consume the bundle inventory as its input envelope so
-  "which files belong to this run" stops being implicit.
+  post-loop must aggregate the emitted sidecars into a bundle per run and
+  feed it to the bundle-gate entry (P5 wiring is ready:
+  `assemble_evidence_bundle` -> `evaluate_bundle_gate`).
 - The `runner_config_digest` value must come from the frozen runner policy
   that the 10/10 replay records.

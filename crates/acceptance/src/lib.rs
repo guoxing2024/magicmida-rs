@@ -11,6 +11,7 @@
 //! See `docs/ACCEPTANCE_CONTRACT.md` and `docs/VNEXT_BEHAVIORAL_PATH.md`.
 
 pub mod behavior;
+pub mod bundle_gate;
 pub mod check;
 pub mod envelope;
 pub mod evidence_bundle;
@@ -50,6 +51,10 @@ pub use verdict::Verdict;
 pub mod oreans_gate;
 pub mod oreans_pe_evidence;
 
+pub use bundle_gate::{
+    evaluate_bundle_gate, BundleEnvelopeBinding, BundleGateError, BundleGateReport, BundleInput,
+    BUNDLE_GATE_ID, BUNDLE_GATE_SCHEMA_VERSION,
+};
 pub use evidence_bundle::{
     canonical_manifest_hash, canonical_members_hash, validate_evidence_bundle,
     BundleArtifactIdentity, BundleCompletionMarker, BundleMemberRef, BundleVerdict,
