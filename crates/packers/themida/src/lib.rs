@@ -30,6 +30,7 @@ pub mod init;
 pub mod oep;
 pub mod plugin;
 pub mod postprocess;
+pub mod runtime;
 pub mod text_tracer;
 pub mod trace_imports;
 pub mod version;
@@ -75,6 +76,9 @@ pub use oep::{
 pub use plugin::ThemidaPlugin;
 pub use postprocess::{
     create_data_sections, dump_process_code, install_anti_dump_fix, shrink_pe, DataSectionResult,
+};
+pub use runtime::av_oep_handler::{
+    decide_av_oep, AvOepAction, AvOepInput, AvOepOutcome, AvOepQuery, AvOepState, LogLevel,
 };
 pub use text_tracer::{
     decide_text_trace_step, is_oep_already_decrypted, is_valid_x64_prologue_at,
