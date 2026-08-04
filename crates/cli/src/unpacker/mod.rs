@@ -143,23 +143,25 @@ pub fn unpack(
 
     // ---- step 1b: P6.2/P6.3 launch boundary ----
     // When a preflight directory is supplied, the run may not create the
-    // sample process until the offline preflight report is Ready AND the
-    // envelope binds the ACTUAL run configuration (P6.3-A): the config
-    // built from the parsed /unpack arguments — including the resolved
-    // pure-rebuild value with the Origin Macro D3 default — must hash to
-    // the envelope digest, and every parameter must match the P7 fixed-mode
-    // policy for this input. Runs without --preflight-dir keep legacy
-    // behaviour.
+    // sample process until the launch attestation passes (P6.3-B): the
+    // Ready report is re-verified by the independent acceptance verifier
+    // against the current run context, every identity (input, output, CLI
+    // binary, actual run config) is re-checked locally, and the actual
+    // configuration — including the resolved pure-rebuild value with the
+    // Origin Macro D3 default — must match the envelope digest and the P7
+    // fixed-mode policy for this input. A hand-written `ready` JSON is
+    // never an authorization credential. Runs without --preflight-dir keep
+    // legacy behaviour.
+    // P6.3-D will consume the attested evidence context for sidecar and
+    // bundle production; until then it is intentionally retained (and
+    // consumed) only after a successful gated run.
+    let _evidence_ctx: Option<crate::runner_preflight::RunEvidenceContext> = None;
     if let Some(preflight_dir) = preflight_dir {
         let envelope = crate::runner_preflight::RunnerConfigEnvelope::read(preflight_dir)
             .map_err(|e| anyhow!("launch blocked: runner-config envelope unavailable: {e:#}"))?;
-        crate::runner_preflight::require_ready_before_launch(preflight_dir, &envelope).map_err(
-            |e| anyhow!("launch blocked by preflight gate before any process creation: {e:#}"),
-        )?;
-        let cli_binary_sha256 =
-            crate::runner_preflight::sha256_file(&std::env::current_exe().map_err(|e| {
-                anyhow!("launch blocked: cannot resolve the current executable: {e}")
-            })?)
+        let cli_binary = std::env::current_exe()
+            .map_err(|e| anyhow!("launch blocked: cannot resolve the current executable: {e}"))?;
+        let cli_binary_sha256 = crate::runner_preflight::sha256_file(&cli_binary)
             .map_err(|e| anyhow!("launch blocked: cannot digest the current executable: {e}"))?;
         let actual_config = crate::run_spec::runner_config_from_unpack_args(
             oep_policy,
@@ -172,12 +174,6 @@ pub fn unpack(
             &envelope.tool_revision,
             &cli_binary_sha256,
         );
-        crate::runner_preflight::bind_actual_config_to_envelope(preflight_dir, &actual_config)
-            .map_err(|e| {
-                anyhow!(
-                    "launch blocked: actual run config does not match the staged envelope: {e:#}"
-                )
-            })?;
         if let Some(reason) = crate::run_spec::policy_matches(
             &actual_config,
             &crate::run_spec::frozen_run_policy(input),
@@ -187,11 +183,23 @@ pub fn unpack(
                  input: {reason}"
             ));
         }
+        let launch_ctx = crate::runner_preflight::LaunchAttestationContext {
+            input,
+            output: &output_path,
+            cli_binary: &cli_binary,
+            runner_config: &actual_config,
+            acceptance_bin: None,
+        };
+        let context = crate::runner_preflight::attest_ready_before_launch(
+            preflight_dir,
+            &launch_ctx,
+        )
+        .map_err(|e| {
+            anyhow!("launch blocked by preflight attestation before any process creation: {e:#}")
+        })?;
         info!(
-            "Preflight gate: Ready — envelope digest {} bound to the actual run config \
-             (digest {})",
-            envelope.runner_config_digest,
-            mida_core::runner_config::runner_config_digest(&actual_config)
+            "Launch attestation: Ready — case {} bound to envelope digest {}",
+            context.case_id, context.runner_config_digest
         );
     }
 

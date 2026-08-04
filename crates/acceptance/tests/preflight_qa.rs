@@ -171,6 +171,7 @@ fn request_with_probe<'a>(
             "/../../rust-toolchain.toml"
         )),
         expected_toolchain: "1.97.1",
+        repo_root: Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../..")),
     }
 }
 

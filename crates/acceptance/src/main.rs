@@ -1177,6 +1177,15 @@ fn cmd_preflight(args: &[String]) -> Result<i32, String> {
             envelope.schema_version
         ));
     }
+    // P6.3: `$schema` is part of the strict envelope identity — a drifted
+    // schema reference is a config error on both the runner and verifier
+    // sides.
+    if envelope.schema != "./runner-config-envelope.schema.json" {
+        return Err(format!(
+            "envelope $schema {:?} != ./runner-config-envelope.schema.json",
+            envelope.schema
+        ));
+    }
 
     // Independent reparse + recompute with the acceptance implementation.
     let parsed: mida_acceptance::RunnerConfig = serde_json::from_value(envelope.runner_config)
@@ -1214,6 +1223,7 @@ fn cmd_preflight(args: &[String]) -> Result<i32, String> {
         output_probe: &mida_acceptance::FsOutputProbe,
         toolchain_pin_file: &toolchain_pin,
         expected_toolchain: &expected_toolchain,
+        repo_root: &repo_root,
     };
     let mut report = mida_acceptance::run_offline_preflight(&request);
     if !reasons.is_empty() {

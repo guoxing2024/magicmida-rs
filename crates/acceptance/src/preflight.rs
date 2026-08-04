@@ -38,7 +38,11 @@ use crate::identity::sha256_hex;
 use crate::oreans_gate::locked_manifest;
 
 /// Schema id of the preflight report.
-pub const PREFLIGHT_REPORT_SCHEMA_VERSION: &str = "mida.preflight-report/v1";
+///
+/// v2 (P6.3-B): per-case artifact identities and canonical paths are added
+/// so the launch boundary can attest that the current input/output/cli/config
+/// are unchanged since staging.
+pub const PREFLIGHT_REPORT_SCHEMA_VERSION: &str = "mida.preflight-report/v2";
 
 /// The two fixed Oreans cases; preflight is Ready only for exactly this set.
 pub const FIXED_CASE_IDS: [&str; 2] = ["origin_macro", "lunlun_software"];
@@ -90,7 +94,7 @@ pub struct CapabilityCell {
 }
 
 /// Recompute the identity of a file on disk.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileIdentity {
     pub sha256: String,
     pub size_bytes: u64,
@@ -575,6 +579,14 @@ pub struct CasePreflight {
     pub case_id: String,
     pub identity_ok: bool,
     pub reasons: Vec<String>,
+    /// P6.3-B: recomputed protected-input identity at preflight time.
+    pub protected_input: Option<FileIdentity>,
+    /// P6.3-B: canonical protected-input path (for the launch re-run).
+    pub protected_input_path: String,
+    /// P6.3-B: canonical case-manifest path (for the launch re-run).
+    pub manifest_path: String,
+    /// P6.3-B: canonical candidate-output path the launch must match.
+    pub candidate_output: String,
 }
 
 /// Preflight report (deterministic: no timestamps, no random identifiers).
@@ -589,6 +601,13 @@ pub struct PreflightReport {
     pub toolchain_matches: Option<bool>,
     pub cli_binary_sha256: Option<String>,
     pub cli_binary_matches: Option<bool>,
+    /// P6.3-B: canonical CLI binary path pinned at preflight time.
+    pub cli_binary_path: String,
+    /// P6.3-B: runner context recorded so the launch boundary can re-run
+    /// the verifier with the same inputs.
+    pub repo_root: String,
+    pub toolchain_pin_file: String,
+    pub expected_toolchain: String,
     pub cases: Vec<CasePreflight>,
 }
 
@@ -616,6 +635,9 @@ pub struct PreflightRequest<'a> {
     pub output_probe: &'a dyn OutputProbe,
     pub toolchain_pin_file: &'a Path,
     pub expected_toolchain: &'a str,
+    /// P6.3-B: repository root the worktree probe ran against (recorded in
+    /// the report so the launch boundary re-runs the verifier identically).
+    pub repo_root: &'a Path,
 }
 
 /// Canonicalize `p`, falling back to canonicalizing its parent when the
@@ -921,6 +943,10 @@ pub fn run_offline_preflight(request: &PreflightRequest<'_>) -> PreflightReport 
                 .unwrap_or_else(|| manifest_path.display().to_string()),
             identity_ok: verdict.ok,
             reasons: verdict.reasons,
+            protected_input: verdict.file.clone(),
+            protected_input_path: canonicalize_loose(input_path).display().to_string(),
+            manifest_path: canonicalize_loose(manifest_path).display().to_string(),
+            candidate_output: output_canonical_case.display().to_string(),
         });
     }
 
@@ -1013,6 +1039,15 @@ pub fn run_offline_preflight(request: &PreflightRequest<'_>) -> PreflightReport 
         toolchain_matches,
         cli_binary_sha256,
         cli_binary_matches,
+        cli_binary_path: request
+            .cli_binary
+            .map(|p| canonicalize_loose(p).display().to_string())
+            .unwrap_or_default(),
+        repo_root: canonicalize_loose(request.repo_root).display().to_string(),
+        toolchain_pin_file: canonicalize_loose(request.toolchain_pin_file)
+            .display()
+            .to_string(),
+        expected_toolchain: request.expected_toolchain.to_string(),
         cases,
     }
 }

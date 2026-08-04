@@ -467,7 +467,10 @@ fn launch_gate_blocks_before_process_creation() {
         "MIDA_ACCEPTANCE_BIN",
         acceptance_bin().display().to_string(),
     )];
-    let args = preflight_args(&dir, &repo_root);
+    // Stage for the REAL mida-cli binary so the launch-side config digest
+    // check passes and the report gate is the deciding check.
+    let real_cli = PathBuf::from(env!("CARGO_BIN_EXE_mida-cli"));
+    let args = preflight_args_with_cli(&dir, &repo_root, &real_cli);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let preflight = run_cli(&arg_refs, env);
     assert_eq!(preflight.status.code(), Some(2), "preflight NotReady");
@@ -493,7 +496,7 @@ fn launch_gate_blocks_before_process_creation() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("launch blocked") && stderr.contains("preflight gate"),
+        stderr.contains("launch blocked") && stderr.contains("preflight attestation"),
         "stderr: {stderr}"
     );
     assert!(!candidate.exists(), "no candidate may be produced");
@@ -511,7 +514,8 @@ fn launch_gate_rejects_digest_drift() {
         "MIDA_ACCEPTANCE_BIN",
         acceptance_bin().display().to_string(),
     )];
-    let args = preflight_args(&dir, &repo_root);
+    let real_cli = PathBuf::from(env!("CARGO_BIN_EXE_mida-cli"));
+    let args = preflight_args_with_cli(&dir, &repo_root, &real_cli);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let preflight = run_cli(&arg_refs, env);
     assert_eq!(preflight.status.code(), Some(2), "preflight NotReady");
@@ -538,7 +542,7 @@ fn launch_gate_rejects_digest_drift() {
     fs::write(
         &report_path,
         serde_json::to_vec_pretty(&serde_json::json!({
-            "schema_version": "mida.preflight-report/v1",
+            "schema_version": "mida.preflight-report/v2",
             "status": "ready",
             "reasons": [],
             "runner_config_digest": flipped,
@@ -547,9 +551,17 @@ fn launch_gate_rejects_digest_drift() {
             "toolchain_matches": true,
             "cli_binary_sha256": envelope["cli_binary_sha256"],
             "cli_binary_matches": true,
+            "cli_binary_path": "",
+            "repo_root": "",
+            "toolchain_pin_file": "",
+            "expected_toolchain": "1.97.1",
             "cases": [
-                {"case_id": "origin_macro", "identity_ok": true, "reasons": []},
-                {"case_id": "lunlun_software", "identity_ok": true, "reasons": []}
+                {"case_id": "origin_macro", "identity_ok": true, "reasons": [],
+                 "protected_input": null, "protected_input_path": "", "manifest_path": "",
+                 "candidate_output": ""},
+                {"case_id": "lunlun_software", "identity_ok": true, "reasons": [],
+                 "protected_input": null, "protected_input_path": "", "manifest_path": "",
+                 "candidate_output": ""}
             ]
         }))
         .unwrap(),
@@ -581,28 +593,47 @@ fn launch_gate_rejects_digest_drift() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// Positive control: a valid `ready` report whose digest matches the
-/// envelope passes the gate, and the pipeline continues past it — the
-/// garbage input then fails at PE parsing (proving the gate is consumed
-/// BEFORE any process creation, and that gate-passing is not silently
-/// bypassing the pipeline).
+/// A hand-written `ready` report is NOT an authorization credential
+/// (P6.3-B): the launch boundary re-runs the independent acceptance
+/// verifier against the current run context, so a fabricated Ready report
+/// (whose digest chain matches the envelope) is still blocked when the
+/// verifier re-run is NotReady — proven with a garbage input and missing
+/// samples, before any process creation.
 #[test]
-fn launch_gate_accepts_ready_report_and_pipeline_continues() {
-    let dir = temp_dir("launch_ready");
+fn launch_gate_blocks_hand_written_ready_after_verifier_rerun() {
+    let dir = temp_dir("launch_fake_ready");
     let repo_root = scratch_repo(&dir);
     let env = &[(
         "MIDA_ACCEPTANCE_BIN",
         acceptance_bin().display().to_string(),
     )];
-    // Stage the envelope for the REAL mida-cli binary: the launch-side
-    // actual run-config digest must equal the envelope digest (P6.3-A), so
-    // the pinned CLI identity must be the binary that will run.
+    // Stage the envelope for the REAL mida-cli binary so the actual
+    // run-config digest matches at launch; the real preflight is NotReady
+    // (missing samples).
     let real_cli = PathBuf::from(env!("CARGO_BIN_EXE_mida-cli"));
     let args = preflight_args_with_cli(&dir, &repo_root, &real_cli);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let preflight = run_cli(&arg_refs, env);
     assert_eq!(preflight.status.code(), Some(2), "preflight NotReady");
 
+    // Launch input: garbage bytes whose identity is then recorded into the
+    // fabricated Ready report (so the attestation reaches the verifier
+    // re-run instead of failing the local identity match first).
+    let garbage = dir.join("input.bin");
+    fs::write(&garbage, b"NOT-A-PE-NOT-A-PE-NOT-A-PE").unwrap();
+    let candidate = dir.join("candidate.exe");
+    let garbage_identity = {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(fs::read(&garbage).unwrap());
+        let mut hex = String::with_capacity(64);
+        for byte in digest {
+            hex.push_str(&format!("{byte:02x}"));
+        }
+        hex
+    };
+
+    // Fabricate a syntactically valid Ready report with the correct digest
+    // chain, CLI identity, and the current input identity.
     let envelope_path = dir.join("runner-config-envelope.json");
     let envelope: serde_json::Value =
         serde_json::from_slice(&fs::read(&envelope_path).unwrap()).unwrap();
@@ -614,7 +645,7 @@ fn launch_gate_accepts_ready_report_and_pipeline_continues() {
     fs::write(
         &report_path,
         serde_json::to_vec_pretty(&serde_json::json!({
-            "schema_version": "mida.preflight-report/v1",
+            "schema_version": "mida.preflight-report/v2",
             "status": "ready",
             "reasons": [],
             "runner_config_digest": correct_digest,
@@ -623,18 +654,29 @@ fn launch_gate_accepts_ready_report_and_pipeline_continues() {
             "toolchain_matches": true,
             "cli_binary_sha256": envelope["cli_binary_sha256"],
             "cli_binary_matches": true,
+            "cli_binary_path": "",
+            "repo_root": repo_root.display().to_string(),
+            "toolchain_pin_file": workspace_root().join("rust-toolchain.toml").display().to_string(),
+            "expected_toolchain": "1.97.1",
             "cases": [
-                {"case_id": "origin_macro", "identity_ok": true, "reasons": []},
-                {"case_id": "lunlun_software", "identity_ok": true, "reasons": []}
+                {"case_id": "origin_macro", "identity_ok": true, "reasons": [],
+                 "protected_input": {"sha256": garbage_identity, "size_bytes": 25},
+                 "protected_input_path": garbage.display().to_string(),
+                 "manifest_path": real_manifest("origin_macro").display().to_string(),
+                 "candidate_output": candidate.display().to_string()},
+                {"case_id": "lunlun_software", "identity_ok": true, "reasons": [],
+                 "protected_input": null, "protected_input_path": "",
+                 "manifest_path": real_manifest("lunlun_software").display().to_string(),
+                 "candidate_output": ""}
             ]
         }))
         .unwrap(),
     )
     .unwrap();
 
-    let garbage = dir.join("input.bin");
-    fs::write(&garbage, b"NOT-A-PE-NOT-A-PE-NOT-A-PE").unwrap();
-    let candidate = dir.join("candidate.exe");
+    // The attestation re-runs the REAL verifier against the current
+    // context: the fresh report is NotReady (the garbage input does not
+    // match the locked identity), so the fabricated Ready is refused.
     let output = run_cli(
         &[
             "/unpack",
@@ -646,16 +688,13 @@ fn launch_gate_accepts_ready_report_and_pipeline_continues() {
         ],
         &[],
     );
-    // The gate passed; the pipeline continued to PE parsing, which fails on
-    // the garbage input — NOT with a "launch blocked" gate error.
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "hand-written ready must not authorize a launch"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("Failed to parse PE header"),
-        "gate must pass and the pipeline must continue past it: {stderr}"
-    );
-    assert!(
-        !stderr.contains("launch blocked"),
-        "the gate must NOT block a valid ready report: {stderr}"
-    );
+    assert!(stderr.contains("launch blocked"), "stderr: {stderr}");
+    assert!(!candidate.exists(), "no candidate may be produced");
     let _ = fs::remove_dir_all(&dir);
 }
