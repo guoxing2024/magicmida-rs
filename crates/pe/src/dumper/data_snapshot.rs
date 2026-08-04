@@ -35,15 +35,19 @@ pub struct DataSectionSnapshot {
     /// Runtime content of .data section
     pub data_content: Vec<u8>,
     /// Regions to skip during restoration (container metadata positions)
+    #[allow(dead_code)] // legacy restoration path
     pub skip_regions: Vec<SkipRegion>,
 }
 
 /// A region in .data that should not be overwritten during restoration.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // legacy restoration path
 pub struct SkipRegion {
     /// Offset from .data section start
+    #[allow(dead_code)]
     pub offset: u32,
     /// Size of region to skip
+    #[allow(dead_code)]
     pub size: u32,
 }
 
@@ -52,6 +56,7 @@ pub struct SkipRegion {
 /// This function reads the entire .data section at runtime, preserving
 /// all initialized values. Container regions are identified so they
 /// can be skipped during restoration.
+#[allow(dead_code)] // legacy .data capture path
 pub fn capture_data_section(
     pe: &PeHeader,
     debugger: &mut dyn mida_core::DebuggerCore,
@@ -155,6 +160,7 @@ pub fn capture_data_section(
 /// ; Note: Skip regions are handled by not embedding them in the snapshot
 /// ; or by generating multiple memcpy calls around skip regions
 /// ```
+#[allow(dead_code)] // legacy .data restore path
 pub fn build_data_restore_code(
     stub_rva: u32,
     current_offset: usize,

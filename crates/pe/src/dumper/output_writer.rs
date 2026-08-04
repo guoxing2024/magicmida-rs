@@ -195,6 +195,7 @@ pub(crate) fn ensure_section_raw_ranges_covered(out_data: &mut Vec<u8>, pe: &PeH
 /// True when every non-empty raw section range fits in `file_len`.
 ///
 /// Used by unit tests and can be reused by emit-path self-checks.
+#[allow(dead_code)]
 pub(crate) fn section_raw_ranges_fit(pe: &PeHeader, file_len: usize) -> bool {
     pe.sections.iter().all(|section| {
         let ptr = section.header.pointer_to_raw_data as usize;

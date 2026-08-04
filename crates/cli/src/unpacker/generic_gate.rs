@@ -390,7 +390,7 @@ mod tests {
     ) -> Result<(), GenericGateFailure> {
         use mida_pe::{
             ImageDataDirectory, ImageDosHeader, ImageFileHeader, ImageNtHeaders,
-            ImageOptionalHeader, ImageSectionHeader, PeHeader, PeSection,
+            ImageOptionalHeader, PeHeader, PeSection,
         };
         const EXEC: u32 = 0x2000_0000;
         let mut secs: Vec<PeSection> = Vec::new();

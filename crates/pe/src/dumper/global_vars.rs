@@ -12,6 +12,7 @@ use crate::header::PeHeader;
 /// These are regular variables (not SecurityCookie-encoded containers) that are
 /// decrypted/initialized by the unpacker at runtime.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // legacy global-var capture; TLS/global restoration pending
 pub struct GlobalVarSnapshot {
     /// RVA in `.data` where the variable is stored.
     pub rva: u32,
@@ -26,6 +27,7 @@ pub struct GlobalVarSnapshot {
 /// This function disassembles the first N instructions at OEP and extracts all RIP-relative
 /// memory references to .data section. These variables are likely runtime-initialized and
 /// need to be captured from the live process.
+#[allow(dead_code)] // legacy OEP-reference analysis
 pub fn detect_critical_vars_from_oep(
     pe: &PeHeader,
     dump_buf: &[u8],
@@ -122,6 +124,7 @@ pub fn detect_critical_vars_from_oep(
 ///
 /// This function reads the runtime values of variables identified by OEP analysis
 /// or explicitly provided RVAs.
+#[allow(dead_code)] // legacy global-var capture
 pub fn detect_global_vars(
     pe: &PeHeader,
     debugger: &mut dyn mida_core::DebuggerCore,
@@ -189,8 +192,6 @@ pub fn detect_global_vars(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn test_detect_critical_vars_empty() {
         // Test with minimal setup - should not crash

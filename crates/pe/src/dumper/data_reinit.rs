@@ -258,6 +258,7 @@ fn is_data_like_section_name(name: &str) -> bool {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn is_process_local_absolute_pointer(value: u64, image_base: u64, image_end: u64) -> bool {
     is_stale_absolute_pointer(value, image_base, image_end)
 }

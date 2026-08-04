@@ -14,6 +14,7 @@ const FA: u32 = 0x200;
 const SA: u32 = 0x1000;
 
 #[derive(Clone, Copy)]
+#[allow(dead_code)] // PE32 support kept for builder parity; tests are PE32+ today
 pub enum PeKind {
     Pe32,
     Pe32Plus,
@@ -35,6 +36,7 @@ pub struct PeBuildOptions {
 }
 
 #[derive(Clone, Copy, Default)]
+#[allow(dead_code)] // corruption modes are exercised per-test; unused here are kept
 pub enum CorruptMode {
     #[default]
     None,
@@ -69,6 +71,7 @@ impl Default for PeBuildOptions {
 }
 
 impl PeBuildOptions {
+    #[allow(dead_code)] // PE32 builder kept for parity; not used by current tests
     pub fn pe32() -> Self {
         Self {
             kind: PeKind::Pe32,

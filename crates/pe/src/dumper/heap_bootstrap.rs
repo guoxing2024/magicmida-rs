@@ -55,7 +55,7 @@ pub(crate) fn install_heap_bootstrap(
     // r27: ensure VirtualAlloc is imported (heap-slab original-address remap).
     // The stub uses it to reserve the slab at its dump-time address so all
     // intra-heap pointers are correct without rebase (zero false-positives).
-    let virtual_alloc = find_import_rva(imports, "VirtualAlloc");
+    let _virtual_alloc = find_import_rva(imports, "VirtualAlloc");
     let heap_bootstrap = detect_heap_bootstrap(pe, dump_buf, imports);
     // Prefer pre-overlay cookie RVA; fall back to scanning current buffer.
     let cookie_rva = cookie_rva.or_else(|| find_security_cookie_rva(pe, dump_buf));
@@ -186,6 +186,7 @@ pub(crate) struct SecurityCookieSite {
 }
 
 /// Locate SecurityCookie + complement pair; return cookie RVA.
+#[allow(dead_code)] // legacy fallback; superseded by resolve_security_cookie_site
 pub(crate) fn find_security_cookie_rva_public(pe: &PeHeader, dump_buf: &[u8]) -> Option<u32> {
     find_security_cookie_site(pe, dump_buf).map(|s| s.cookie_rva)
 }
@@ -193,6 +194,7 @@ pub(crate) fn find_security_cookie_rva_public(pe: &PeHeader, dump_buf: &[u8]) ->
 /// Locate cookie + complement RVAs before early overlay zeros them.
 ///
 /// Fallback only — prefer [`resolve_security_cookie_site`] with authoritative RVAs.
+#[allow(dead_code)] // legacy fallback; superseded by resolve_security_cookie_site
 pub(crate) fn find_security_cookie_site_public(
     pe: &PeHeader,
     dump_buf: &[u8],

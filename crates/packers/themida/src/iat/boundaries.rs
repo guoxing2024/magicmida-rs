@@ -44,6 +44,7 @@ pub(super) struct IatBlock {
 ///    process them individually.
 ///
 /// The returned blocks are sorted by slot index (ascending).
+#[allow(dead_code)] // legacy block discovery; superseded by boundary scan
 pub(super) fn discover_iat_blocks(iat_data: &[usize]) -> Vec<IatBlock> {
     discover_iat_blocks_with_image(iat_data, 0, 0)
 }

@@ -1,0 +1,47 @@
+name: ci
+
+on:
+  push:
+    branches: [master, oreans/two-sample-mainline]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    env:
+      CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-target
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Check workspace (default features)
+        run: cargo check --workspace --tests --locked
+
+      - name: Run offline tests
+        run: cargo test --workspace --locked
+
+      - name: Check GTO product-recovery feature (off-mainline compile gate)
+        run: cargo check -p mida-cli --features gto-product-recovery --locked
+
+      - name: Artifact policy hygiene
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tools/verify_workspace_hygiene.ps1
+
+  cargo-deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependency governance (advisories, licenses, bans)
+        uses: embarkstudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features

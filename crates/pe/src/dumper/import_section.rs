@@ -64,7 +64,6 @@ pub(crate) fn build_import_table_from_original(
     let mut builder = ImportTableBuilder::new(true); // 64-bit
     let ptr_size = crate::import_table::iat_slot_size(true) as u32; // 64-bit = 8 bytes
     let mut current_iat_rva = original_iat_rva;
-    let mut total_funcs = 0;
     let mut skipped_funcs = 0;
 
     for (dll_name, functions) in &imports {
@@ -92,7 +91,6 @@ pub(crate) fn build_import_table_from_original(
                 is_64bit: true,
             });
             current_iat_rva += ptr_size;
-            total_funcs += 1;
         }
 
         if !thunks.is_empty() {

@@ -197,6 +197,7 @@ pub fn compute_heap_slab_span(heap_globals: &[HeapGlobalSnapshot]) -> Option<(u6
 
 /// True if `va` is a strict-interior address of slab `[old_base, old_base+len)`.
 #[must_use]
+#[allow(dead_code)] // legacy heap-slab analysis; retained for diagnostics
 pub fn heap_slab_covers_interior(old_base: u64, len: u64, va: u64) -> bool {
     va > old_base && va < old_base.saturating_add(len)
 }
@@ -2505,7 +2506,6 @@ fn exhaust_gscript_label_table_entries(
             seen_heaps,
             image_base,
             image_end,
-            dump_buf,
             debugger,
             slot_cap,
         );
@@ -2568,7 +2568,6 @@ fn externalize_label_name_field(
     seen_heaps: &mut BTreeSet<u64>,
     image_base: u64,
     image_end: u64,
-    dump_buf: &[u8],
     debugger: &mut dyn mida_core::DebuggerCore,
     slot_cap: usize,
 ) {
@@ -2820,7 +2819,6 @@ fn externalize_all_label_names_from_table(
             seen_heaps,
             image_base,
             image_end,
-            dump_buf,
             debugger,
             slot_cap,
         );
@@ -3772,6 +3770,7 @@ fn parse_refcounted_string_shell(content: &[u8]) -> Option<(u64, usize)> {
 
 /// Null buffer pointers and keep only the freeable 0x28 shell after the buffer
 /// has been admitted as a separate snapshot (or when free-safety requires it).
+#[allow(dead_code)] // legacy refcounted-string shell sanitizer
 fn sanitize_refcounted_string_shell(content: &mut Vec<u8>) -> bool {
     let Some(_) = parse_refcounted_string_shell(content) else {
         return false;

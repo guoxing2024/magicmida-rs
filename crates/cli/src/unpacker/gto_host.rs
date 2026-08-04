@@ -81,6 +81,10 @@ fn process_has_window_class(pid: u32, class_name: &str) -> bool {
 }
 
 /// Run the AHK/GTO-only unpack host (no `ThemidaState`).
+///
+/// The default build fails closed before the first statement, so everything
+/// after the feature gate is unreachable unless `gto-product-recovery` is on.
+#[allow(unreachable_code)]
 pub(super) fn run_gto_host(
     input: &Path,
     output: Option<&Path>,
@@ -92,6 +96,7 @@ pub(super) fn run_gto_host(
     pure_rebuild: bool,
     // CLI / case-manifest capture policy (may be empty → plugin defaults).
     cli_capture_policy: mida_pe::DumpCapturePolicy,
+    #[allow(unused_mut)] // mutable only under the gto-product-recovery feature
     mut packer: SelectedPacker,
 ) -> Result<(), anyhow::Error> {
     #[cfg(not(feature = "gto-product-recovery"))]
@@ -139,8 +144,7 @@ pub(super) fn run_gto_host(
         LogType::Info,
         &format!("GTO host loading: {}", input.display()),
     );
-    let mut pe =
-        PeHeader::from_file(input).map_err(|e| anyhow!("GTO host PE parse failed: {e}"))?;
+    let pe = PeHeader::from_file(input).map_err(|e| anyhow!("GTO host PE parse failed: {e}"))?;
     let is_64bit = pe.is_64bit;
     if !is_64bit {
         return Err(anyhow!(

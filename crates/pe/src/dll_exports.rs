@@ -131,7 +131,6 @@ pub fn read_dll_exports(dll_path: &Path) -> HashMap<u16, String> {
     // Read export directory structure
     let num_functions_offset = export_file_offset + 20;
     let num_names_offset = export_file_offset + 24;
-    let functions_rva_offset = export_file_offset + 28;
     let names_rva_offset = export_file_offset + 32;
     let ordinals_rva_offset = export_file_offset + 36;
 

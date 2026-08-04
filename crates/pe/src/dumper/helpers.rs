@@ -21,6 +21,7 @@ pub(crate) const MAX_IAT_SLOTS: usize = 5120;
 pub(crate) const MAX_EXPORT_DIRECTORY_BYTES: usize = 16 * 1024 * 1024;
 
 /// Cap for section snapshot / `VirtualSize`-driven process memory reads.
+#[allow(dead_code)] // pending TLS/restoration paths; keep for the P2 work
 pub(crate) const MAX_SECTION_READ_BYTES: usize = 64 * 1024 * 1024;
 
 /// Cap for heap-container content copied from the debuggee.

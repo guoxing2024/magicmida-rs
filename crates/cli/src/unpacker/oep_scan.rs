@@ -839,6 +839,7 @@ mod tests {
     }
 
     /// Real B6 TLS helper prefix (`cmp edx, 2`).
+    #[allow(dead_code)] // legacy B6 plant helper; TLS work pending
     fn plant_tls_helper(buf: &mut [u8], text_rva: u32, rva: u32) {
         let off = (rva - text_rva) as usize;
         let body: &[u8] = &[
@@ -878,6 +879,7 @@ mod tests {
     const S310_WRAPPER_RVA: u32 = 0x165F6C;
     const S310_COOKIE_FN: u32 = 0x1661F0;
     const S310_COMMON_MAIN: u32 = 0x165DF8;
+    #[allow(dead_code)] // legacy B6 TLS helper fixture RVA
     const S310_TLS_HELPER: u32 = 0x165290;
 
     #[test]

@@ -43,15 +43,25 @@ use crate::header::PeHeader;
 
 use super::container_snapshot::ContainerSnapshot;
 
+// TLS restoration machinery is pending the P2 TLS gate; keep it compiled and
+// documented so the section/table/callback work can be wired without archaeology.
+#[allow(dead_code)]
 const IMAGE_SCN_CNT_INITIALIZED_DATA: u32 = 0x0000_0040;
+#[allow(dead_code)]
 const IMAGE_SCN_MEM_READ: u32 = 0x4000_0000;
+#[allow(dead_code)]
 const IMAGE_SCN_MEM_WRITE: u32 = 0x8000_0000;
 
+#[allow(dead_code)]
 const IMAGE_SCN_CNT_CODE: u32 = 0x0000_0020;
+#[allow(dead_code)]
 const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 
+#[allow(dead_code)]
 const TLS_DIRECTORY_SIZE: usize = 0x28; // sizeof(IMAGE_TLS_DIRECTORY64)
+#[allow(dead_code)]
 const TLS_INDEX_SIZE: usize = 4;
+#[allow(dead_code)]
 const TLS_CALLBACK_ARRAY_SIZE: usize = 16; // 1 callback + NULL terminator
 
 /// Install container restoration bootstrap as a TLS callback.
@@ -61,10 +71,11 @@ const TLS_CALLBACK_ARRAY_SIZE: usize = 16; // 1 callback + NULL terminator
 /// - `.boot` section: bootstrap code + metadata + heap snapshots
 ///
 /// Returns the original entry point (unchanged).
+#[allow(dead_code)] // pending P2 TLS restoration
 pub(crate) fn install_tls_callback_bootstrap(
     pe: &mut PeHeader,
     containers: &[ContainerSnapshot],
-    global_vars: &[super::global_vars::GlobalVarSnapshot],
+    _global_vars: &[super::global_vars::GlobalVarSnapshot],
     get_process_heap_iat_rva: u32,
     heap_alloc_iat_rva: u32,
     heap_global_rva: Option<u32>,
@@ -201,6 +212,7 @@ pub(crate) fn install_tls_callback_bootstrap(
 /// +0x030: Callback Array (2 * u64: callback VA + NULL)
 /// +0x040: padding to 0x200
 /// ```
+#[allow(dead_code)] // pending P2 TLS restoration
 fn build_tls_directory(image_base: u64, tls_rva: u32, bootstrap_rva: u32) -> Vec<u8> {
     let mut data = vec![0u8; 0x200];
 

@@ -49,6 +49,7 @@ pub struct ContainerSnapshot {
 /// decrypted/initialized by the unpacker at runtime. Examples include CRT globals,
 /// static initializers, or application state that Themida encrypts in the packed file.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // legacy global-var capture; TLS/global restoration pending
 pub struct GlobalVarSnapshot {
     /// RVA in `.data` where the variable is stored.
     pub rva: u32,

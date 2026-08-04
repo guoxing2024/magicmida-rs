@@ -442,6 +442,7 @@ fn install_container_section(
 }
 
 /// Build bootstrap stub for TLS callback (no jump to OEP, just returns).
+#[allow(dead_code)] // TLS bootstrap pending (P2)
 pub(crate) fn build_tls_bootstrap_stub(
     stub_rva: u32,
     get_process_heap_iat_rva: u32,
@@ -693,7 +694,6 @@ fn build_container_stub_internal(
     }
 
     // Scan-sections table for phase-2.5b (u32 count + (rva,size) pairs).
-    let scan_sections_offset = stub.len();
     stub.extend_from_slice(&u32::try_from(scan_sections.len()).ok()?.to_le_bytes());
     for &(rva, size) in scan_sections {
         stub.extend_from_slice(&rva.to_le_bytes());
@@ -721,12 +721,12 @@ fn build_stub_code(
     heap_global_meta_offset: u32,
     fixup_map_offset: u32,
     range_count: usize,
-    slab_fixup_index: usize,
+    _slab_fixup_index: usize,
     virtual_alloc_iat_rva: Option<u32>,
     slab_old_base: u64,
     slab_data_offset: usize,
-    scan_sections_offset: u32,
-    scan_sections_count: u32,
+    _scan_sections_offset: u32,
+    _scan_sections_count: u32,
     data_snapshot: Option<&super::data_snapshot::DataSectionSnapshot>,
     data_snapshot_offset: usize,
     image_base: u64,

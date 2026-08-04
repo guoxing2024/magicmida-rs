@@ -609,6 +609,7 @@ pub(super) fn is_likely_api_address(addr: usize) -> bool {
 /// Callers that only have an IAT buffer (no process image base) should use
 /// [`is_likely_api_address`] alone. Prefer [`is_within_image_bounds`] when
 /// `image_base` / `image_boundary` are known.
+#[allow(dead_code)] // backward-compatible shim retained for callers
 pub(super) fn is_within_image(addr: usize, _iat_base: usize, _slot_count: usize) -> bool {
     // Backward-compatible shim: without real image bounds we cannot claim
     // "in image". Return false so callers fall through to API / trash logic.

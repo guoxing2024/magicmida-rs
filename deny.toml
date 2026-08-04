@@ -1,0 +1,40 @@
+[advisories]
+version = 2
+yanked = "deny"
+# Advisory severities treated as errors. "high" blocks known CVEs while
+# allowing the triage of lower-severity advisories to proceed.
+severity = "high"
+
+[licenses]
+version = 2
+unlicensed = "deny"
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+]
+# The workspace itself is GPL-3.0; dependency licenses are checked above.
+confidence-threshold = 0.8
+
+[bans]
+version = 2
+multiple-versions = "deny"
+wildcards = "deny"
+highlight = "all"
+deny = [
+    # Deny-by-default list of crates known to cause supply-chain issues.
+    { name = "openssl-sys" },
+]
+skip = []
+skip-tree = []
+
+[sources]
+version = 2
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
