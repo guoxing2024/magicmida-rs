@@ -1,19 +1,24 @@
-//! P6-QA: attack-style preflight tests.
+//! P6-QA (P6.1-hardened): attack-style preflight tests.
 //!
 //! Wrong case, wrong digest/size, path aliases, stale/partial evidence,
 //! dirty worktree, tool-revision drift, runner-digest drift, unknown config
 //! fields, missing bundle members, overwrite-of-input risk — all must yield
-//! `not_ready` reports with precise reasons. The orchestrator module itself
-//! has no process-launch path; the worktree probe is injected.
+//! `not_ready` reports with precise reasons. P6.1 adds: exact case-set
+//! enforcement (0/1/duplicate/extra cases), mandatory CLI identity bound to
+//! `RunnerConfig.cli_binary_sha256`, injective length-prefixed canonical
+//! digest (comma/newline collisions), durable atomic report writes
+//! (overwrite, stale temp, replace-failure preserves old report), empty HEAD,
+//! and output-dir containment/writability. The orchestrator module itself has
+//! no process-launch path; the worktree probe is injected.
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use mida_acceptance::{
-    check_case_identity, run_offline_preflight, runner_config_digest, write_preflight_report,
-    IsolationConfig, PreflightReport, PreflightRequest, PreflightStatus, RunnerConfig,
-    WorktreeProbe, WorktreeState, REQUIRED_BUNDLE_MEMBERS,
+    canonical_runner_config, check_case_identity, run_offline_preflight, runner_config_digest,
+    sha256_hex, write_preflight_report, IsolationConfig, PreflightReport, PreflightRequest,
+    PreflightStatus, RunnerConfig, WorktreeProbe, WorktreeState, REQUIRED_BUNDLE_MEMBERS,
 };
 
 fn temp_dir(tag: &str) -> PathBuf {
@@ -62,6 +67,15 @@ fn runner_config(revision: &str) -> RunnerConfig {
     }
 }
 
+/// Deterministic fake CLI binary; returns (path, sha256_hex of content).
+fn fake_cli(dir: &Path, tag: &str) -> (PathBuf, String) {
+    let content = format!("FAKE-CLI-{tag}");
+    let path = dir.join(format!("mida_cli_{tag}.exe"));
+    fs::write(&path, content.as_bytes()).unwrap();
+    let digest = sha256_hex(content.as_bytes());
+    (path, digest)
+}
+
 struct FakeProbe {
     head: String,
     clean: bool,
@@ -81,13 +95,14 @@ fn request<'a>(
     output_dir: &'a Path,
     config: &'a RunnerConfig,
     probe: &'a dyn WorktreeProbe,
+    cli: Option<(&'a Path, &'a str)>,
     cases: Vec<(&'a Path, &'a Path, &'a Path)>,
 ) -> PreflightRequest<'a> {
     PreflightRequest {
         cases,
         output_dir,
-        cli_binary: None,
-        expected_cli_sha256: None,
+        cli_binary: cli.map(|(path, _)| path),
+        expected_cli_sha256: cli.map(|(_, sha)| sha).unwrap_or(""),
         runner_config: config,
         worktree: probe,
         toolchain_pin_file: Path::new(concat!(
@@ -102,6 +117,28 @@ fn missing_input(dir: &Path) -> PathBuf {
     let p = dir.join("protected_input.bin");
     let _ = fs::remove_file(&p);
     p
+}
+
+fn two_cases(dir: &Path) -> Vec<(PathBuf, PathBuf, PathBuf)> {
+    vec![
+        (
+            real_manifest("origin_macro"),
+            missing_input(dir),
+            dir.join("origin_candidate.exe"),
+        ),
+        (
+            real_manifest("lunlun_software"),
+            missing_input(dir),
+            dir.join("lunlun_candidate.exe"),
+        ),
+    ]
+}
+
+fn borrow_cases(cases: &[(PathBuf, PathBuf, PathBuf)]) -> Vec<(&Path, &Path, &Path)> {
+    cases
+        .iter()
+        .map(|(m, i, o)| (m.as_path(), i.as_path(), o.as_path()))
+        .collect()
 }
 
 /// The two real locked manifests parse strictly and cross-check against the
@@ -132,52 +169,43 @@ fn real_manifests_parse_and_locked_crosscheck() {
     }
 }
 
-/// Orchestrator without samples is not_ready with precise, deterministic
-/// reasons; repeated runs produce identical reports (no timestamps).
+/// With a fully consistent runner (pinned CLI identity, clean worktree,
+/// exact two-case set, empty output dir) the ONLY reasons are the missing
+/// sample files; repeated runs produce identical reports (no timestamps).
 #[test]
 fn orchestrator_not_ready_deterministic_without_samples() {
     let dir = temp_dir("orchestrator");
-    let config = runner_config("oreans/two-sample-mainline@frozen");
+    let (cli_path, cli_digest) = fake_cli(&dir, "det");
+    let mut config = runner_config("oreans/two-sample-mainline@frozen");
+    config.cli_binary_sha256 = cli_digest.clone();
     let probe = FakeProbe {
         head: "oreans/two-sample-mainline@frozen".to_string(),
         clean: true,
     };
-    let manifest_origin = real_manifest("origin_macro");
-    let manifest_lunlun = real_manifest("lunlun_software");
-    let input_origin = missing_input(&dir);
-    let input_lunlun = missing_input(&dir);
-
-    let out_origin = dir.join("origin_candidate.exe");
-    let out_lunlun = dir.join("lunlun_candidate.exe");
-    let req = request(
-        &dir,
-        &config,
-        &probe,
-        vec![
-            (
-                manifest_origin.as_path(),
-                input_origin.as_path(),
-                out_origin.as_path(),
-            ),
-            (
-                manifest_lunlun.as_path(),
-                input_lunlun.as_path(),
-                out_lunlun.as_path(),
-            ),
-        ],
-    );
+    let owned_cases = two_cases(&dir);
+    let cases = borrow_cases(&owned_cases);
+    let req = request(&dir, &config, &probe, Some((&cli_path, &cli_digest)), cases);
     let r1 = run_offline_preflight(&req);
     let r2 = run_offline_preflight(&req);
     assert_eq!(r1, r2, "report must be fully deterministic");
     assert_eq!(r1.status, PreflightStatus::NotReady);
     assert_eq!(r1.cases.len(), 2);
+    assert_eq!(
+        r1.reasons.len(),
+        2,
+        "only the missing inputs: {:?}",
+        r1.reasons
+    );
     assert!(
         r1.reasons
             .iter()
-            .any(|r| r.contains("cannot read protected input")),
+            .all(|r| r.contains("cannot read protected input")),
         "{:?}",
         r1.reasons
     );
+    assert_eq!(r1.worktree_clean, Some(true));
+    assert_eq!(r1.toolchain_matches, Some(true));
+    assert_eq!(r1.cli_binary_matches, Some(true));
 
     // Atomic report write: parses back to the same report.
     let path = write_preflight_report(&dir, &r1).expect("write report");
@@ -227,6 +255,125 @@ fn wrong_case_fails_closed() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// P6.1: the case set must be exactly [origin_macro, lunlun_software] —
+/// empty, single, and duplicate sets must all fail closed.
+#[test]
+fn case_set_requires_exactly_two_fixed_cases() {
+    for (tag, cases) in [
+        ("zero", vec![]),
+        (
+            "one",
+            vec![(
+                real_manifest("origin_macro"),
+                PathBuf::from("missing.bin"),
+                PathBuf::from("out.exe"),
+            )],
+        ),
+        (
+            "duplicate",
+            vec![
+                (
+                    real_manifest("origin_macro"),
+                    PathBuf::from("missing.bin"),
+                    PathBuf::from("out.exe"),
+                ),
+                (
+                    real_manifest("origin_macro"),
+                    PathBuf::from("missing2.bin"),
+                    PathBuf::from("out2.exe"),
+                ),
+            ],
+        ),
+    ] {
+        let dir = temp_dir(tag);
+        let config = runner_config("oreans/two-sample-mainline@frozen");
+        let probe = FakeProbe {
+            head: "oreans/two-sample-mainline@frozen".to_string(),
+            clean: true,
+        };
+        let borrowed: Vec<(&Path, &Path, &Path)> = cases
+            .iter()
+            .map(|(m, i, o)| (m.as_path(), i.as_path(), o.as_path()))
+            .collect();
+        let req = request(&dir, &config, &probe, None, borrowed);
+        let report = run_offline_preflight(&req);
+        assert_eq!(report.status, PreflightStatus::NotReady, "{tag}");
+        assert!(
+            report
+                .reasons
+                .iter()
+                .any(|r| r.contains("fixed cases") || r.contains("case set must be exactly")),
+            "{tag}: {:?}",
+            report.reasons
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+/// P6.1: CLI identity is mandatory and must bind to the runner config.
+#[test]
+fn cli_identity_missing_or_drift_blocks_ready() {
+    let dir = temp_dir("cli_identity");
+    let (cli_path, cli_digest) = fake_cli(&dir, "drift");
+    let owned_cases = two_cases(&dir);
+    let cases = borrow_cases(&owned_cases);
+    let probe = FakeProbe {
+        head: "oreans/two-sample-mainline@frozen".to_string(),
+        clean: true,
+    };
+
+    // Missing expected: no CLI at all.
+    let config = runner_config("oreans/two-sample-mainline@frozen");
+    let req = request(&dir, &config, &probe, None, cases.clone());
+    let report = run_offline_preflight(&req);
+    assert!(
+        report
+            .reasons
+            .iter()
+            .any(|r| r.contains("expected CLI sha256 is missing")),
+        "{:?}",
+        report.reasons
+    );
+
+    // Drift: expected pin does not match the actual binary digest.
+    let mut config = runner_config("oreans/two-sample-mainline@frozen");
+    config.cli_binary_sha256 = "b".repeat(64);
+    let expected_b = "b".repeat(64);
+    let req = request(
+        &dir,
+        &config,
+        &probe,
+        Some((&cli_path, &expected_b)),
+        cases.clone(),
+    );
+    let report = run_offline_preflight(&req);
+    assert!(
+        report
+            .reasons
+            .iter()
+            .any(|r| r.contains("does not match expected")),
+        "{:?}",
+        report.reasons
+    );
+
+    // Config mismatch: expected pin matches the binary but not the runner
+    // config's declared cli_binary_sha256.
+    let mut config = runner_config("oreans/two-sample-mainline@frozen");
+    config.cli_binary_sha256 = "c".repeat(64);
+    let req = request(&dir, &config, &probe, Some((&cli_path, &cli_digest)), cases);
+    let report = run_offline_preflight(&req);
+    assert!(
+        report
+            .reasons
+            .iter()
+            .any(|r| r.contains("does not match runner_config.cli_binary_sha256")),
+        "{:?}",
+        report.reasons
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// Stale evidence in the output dir must block readiness.
 #[test]
 fn stale_evidence_blocks_ready() {
@@ -237,32 +384,35 @@ fn stale_evidence_blocks_ready() {
         head: "oreans/two-sample-mainline@frozen".to_string(),
         clean: true,
     };
-    let manifest_origin = real_manifest("origin_macro");
-    let manifest_lunlun = real_manifest("lunlun_software");
-    let input_origin = missing_input(&dir);
-    let input_lunlun = missing_input(&dir);
-    let out_origin = dir.join("origin_candidate.exe");
-    let out_lunlun = dir.join("lunlun_candidate.exe");
-    let req = request(
-        &dir,
-        &config,
-        &probe,
-        vec![
-            (
-                manifest_origin.as_path(),
-                input_origin.as_path(),
-                out_origin.as_path(),
-            ),
-            (
-                manifest_lunlun.as_path(),
-                input_lunlun.as_path(),
-                out_lunlun.as_path(),
-            ),
-        ],
-    );
+    let owned_cases = two_cases(&dir);
+    let cases = borrow_cases(&owned_cases);
+    let req = request(&dir, &config, &probe, None, cases);
     let report = run_offline_preflight(&req);
     assert!(
         report.reasons.iter().any(|r| r.contains("stale evidence")),
+        "{:?}",
+        report.reasons
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// P6.1: any leftover temp file (old PID-style or new create_new-style) must
+/// block readiness.
+#[test]
+fn stale_temp_blocks_ready() {
+    let dir = temp_dir("stale_temp");
+    fs::write(dir.join(".preflight.json.tmp-1234-5678"), b"{}").unwrap();
+    let config = runner_config("oreans/two-sample-mainline@frozen");
+    let probe = FakeProbe {
+        head: "oreans/two-sample-mainline@frozen".to_string(),
+        clean: true,
+    };
+    let owned_cases = two_cases(&dir);
+    let cases = borrow_cases(&owned_cases);
+    let req = request(&dir, &config, &probe, None, cases);
+    let report = run_offline_preflight(&req);
+    assert!(
+        report.reasons.iter().any(|r| r.contains("leftover temp")),
         "{:?}",
         report.reasons
     );
@@ -278,29 +428,9 @@ fn dirty_worktree_and_revision_drift_block_ready() {
         head: "oreans/two-sample-mainline@other".to_string(),
         clean: false,
     };
-    let manifest_origin = real_manifest("origin_macro");
-    let manifest_lunlun = real_manifest("lunlun_software");
-    let input_origin = missing_input(&dir);
-    let input_lunlun = missing_input(&dir);
-    let out_origin = dir.join("origin_candidate.exe");
-    let out_lunlun = dir.join("lunlun_candidate.exe");
-    let req = request(
-        &dir,
-        &config,
-        &probe,
-        vec![
-            (
-                manifest_origin.as_path(),
-                input_origin.as_path(),
-                out_origin.as_path(),
-            ),
-            (
-                manifest_lunlun.as_path(),
-                input_lunlun.as_path(),
-                out_lunlun.as_path(),
-            ),
-        ],
-    );
+    let owned_cases = two_cases(&dir);
+    let cases = borrow_cases(&owned_cases);
+    let req = request(&dir, &config, &probe, None, cases);
     let report = run_offline_preflight(&req);
     assert!(
         report
@@ -321,6 +451,30 @@ fn dirty_worktree_and_revision_drift_block_ready() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// P6.1: an empty worktree HEAD must fail closed.
+#[test]
+fn empty_head_blocks_ready() {
+    let dir = temp_dir("empty_head");
+    let config = runner_config("oreans/two-sample-mainline@frozen");
+    let probe = FakeProbe {
+        head: String::new(),
+        clean: true,
+    };
+    let owned_cases = two_cases(&dir);
+    let cases = borrow_cases(&owned_cases);
+    let req = request(&dir, &config, &probe, None, cases);
+    let report = run_offline_preflight(&req);
+    assert!(
+        report
+            .reasons
+            .iter()
+            .any(|r| r.contains("head revision is empty")),
+        "{:?}",
+        report.reasons
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// Runner digest is stable for a fixed config and changes on any drift.
 #[test]
 fn runner_digest_stability_and_drift() {
@@ -330,6 +484,57 @@ fn runner_digest_stability_and_drift() {
     let mut drifted = runner_config("rev-1");
     drifted.timeout_secs = 999;
     assert_ne!(runner_config_digest(&a), runner_config_digest(&drifted));
+}
+
+/// P6.1: the length-prefixed canonical encoding must be injective for
+/// commas and newlines — ["a,b"] and ["a","b"] can no longer collide.
+#[test]
+fn canonical_digest_injective_on_separators() {
+    let mut with_comma = runner_config("rev");
+    with_comma.features = vec!["a,b".to_string()];
+    let mut split = runner_config("rev");
+    split.features = vec!["a".to_string(), "b".to_string()];
+    assert_ne!(
+        canonical_runner_config(&with_comma),
+        canonical_runner_config(&split)
+    );
+    assert_ne!(
+        runner_config_digest(&with_comma),
+        runner_config_digest(&split)
+    );
+
+    let mut with_newline = runner_config("rev");
+    with_newline.features = vec!["a\nb".to_string()];
+    assert_ne!(
+        runner_config_digest(&with_newline),
+        runner_config_digest(&split)
+    );
+
+    let mut scalar_nl = runner_config("rev");
+    scalar_nl.oep_policy = "x\ny".to_string();
+    let mut scalar_plain = runner_config("rev");
+    scalar_plain.oep_policy = "x y".to_string();
+    assert_ne!(
+        runner_config_digest(&scalar_nl),
+        runner_config_digest(&scalar_plain)
+    );
+}
+
+/// P6.1: the runner-side producer contract — a config serialized to JSON
+/// (as the runner would emit it) parses strictly and the digest is
+/// independently recomputed and verified by the acceptance crate.
+#[test]
+fn runner_emitted_digest_is_independently_verifiable() {
+    let config = runner_config("oreans/two-sample-mainline@frozen");
+    let emitted_json = serde_json::to_string(&config).unwrap();
+    let parsed: RunnerConfig = serde_json::from_str(&emitted_json).expect("strict parse");
+    let digest = runner_config_digest(&parsed);
+    assert_eq!(digest.len(), 64);
+    assert!(digest.chars().all(|c| c.is_ascii_hexdigit()));
+    // Unknown field must fail closed in the strict contract.
+    let mut value: serde_json::Value = serde_json::from_str(&emitted_json).unwrap();
+    value["sneaky_extra"] = serde_json::json!(1);
+    assert!(serde_json::from_value::<RunnerConfig>(value).is_err());
 }
 
 /// The seven-member bundle contract is pinned: any missing member is a
@@ -394,6 +599,157 @@ fn output_overwrites_input_blocked() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// P6.1: candidate outputs must stay inside the controlled output dir.
+#[test]
+fn candidate_output_outside_output_dir_blocked() {
+    let dir = temp_dir("out_of_bounds");
+    let outside = std::env::temp_dir().join(format!(
+        "mida_preflight_qa_outside_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let config = runner_config("oreans/two-sample-mainline@frozen");
+    let probe = FakeProbe {
+        head: "oreans/two-sample-mainline@frozen".to_string(),
+        clean: true,
+    };
+    let cases = vec![
+        (
+            real_manifest("origin_macro"),
+            missing_input(&dir),
+            outside.join("origin_candidate.exe"),
+        ),
+        (
+            real_manifest("lunlun_software"),
+            missing_input(&dir),
+            dir.join("lunlun_candidate.exe"),
+        ),
+    ];
+    let req = request(&dir, &config, &probe, None, borrow_cases(&cases));
+    let report = run_offline_preflight(&req);
+    assert!(
+        report
+            .reasons
+            .iter()
+            .any(|r| r.contains("outside the controlled output dir")),
+        "{:?}",
+        report.reasons
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// P6.1: an unwritable output dir must fail closed.
+///
+/// On Windows the directory read-only attribute does not block file
+/// creation, so the test denies the "Everyone" write ACE via `icacls`. If
+/// `icacls` is unavailable or refuses, the test skips (the check itself is
+/// still exercised in production paths).
+#[cfg(windows)]
+#[test]
+fn unwritable_output_dir_blocks_ready() {
+    let dir = temp_dir("readonly");
+    let dir_str = dir.to_str().expect("temp path is UTF-8");
+    let sid = "*S-1-1-0";
+    let denied = std::process::Command::new("icacls")
+        .args([dir_str, "/deny", &format!("{sid}:(W)")])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !denied {
+        // Cannot force the condition on this host; the check is covered by
+        // the other output-dir tests.
+        let _ = fs::remove_dir_all(&dir);
+        return;
+    }
+    let owned_cases = two_cases(&dir);
+    let cases = borrow_cases(&owned_cases);
+    let config = runner_config("oreans/two-sample-mainline@frozen");
+    let probe = FakeProbe {
+        head: "oreans/two-sample-mainline@frozen".to_string(),
+        clean: true,
+    };
+    let req = request(&dir, &config, &probe, None, cases);
+    let report = run_offline_preflight(&req);
+    let _ = std::process::Command::new("icacls")
+        .args([dir_str, "/remove:d", sid])
+        .status();
+    assert!(
+        report.reasons.iter().any(|r| r.contains("not writable")),
+        "{:?}",
+        report.reasons
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// P6.1: an existing report is durably replaced (old garbage is gone, new
+/// report parses back), and no temp files are left behind.
+#[test]
+fn existing_report_replaced_atomically() {
+    let dir = temp_dir("replace");
+    fs::write(dir.join("preflight.json"), b"OLD-GARBAGE").unwrap();
+    let config = runner_config("oreans/two-sample-mainline@frozen");
+    let probe = FakeProbe {
+        head: "oreans/two-sample-mainline@frozen".to_string(),
+        clean: true,
+    };
+    let owned_cases = two_cases(&dir);
+    let cases = borrow_cases(&owned_cases);
+    let req = request(&dir, &config, &probe, None, cases);
+    let report = run_offline_preflight(&req);
+    let path = write_preflight_report(&dir, &report).expect("write report");
+    let back: PreflightReport = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(
+        back, report,
+        "old garbage must be replaced by the new report"
+    );
+    let leftovers: Vec<String> = fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.contains(".tmp-"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "no temp files may remain: {leftovers:?}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// P6.1: when the atomic replace fails (destination is a directory), the
+/// previous destination is preserved and the temp file is cleaned up.
+#[test]
+fn replace_failure_preserves_old_destination() {
+    let dir = temp_dir("replace_fail");
+    let destination = dir.join("preflight.json");
+    fs::create_dir(&destination).unwrap();
+    let config = runner_config("oreans/two-sample-mainline@frozen");
+    let probe = FakeProbe {
+        head: "oreans/two-sample-mainline@frozen".to_string(),
+        clean: true,
+    };
+    let owned_cases = two_cases(&dir);
+    let cases = borrow_cases(&owned_cases);
+    let req = request(&dir, &config, &probe, None, cases);
+    let report = run_offline_preflight(&req);
+    let result = write_preflight_report(&dir, &report);
+    assert!(result.is_err(), "replace over a directory must fail");
+    assert!(
+        destination.is_dir(),
+        "the previous destination must be preserved untouched"
+    );
+    let leftovers: Vec<String> = fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.contains(".tmp-"))
+        .collect();
+    assert!(leftovers.is_empty(), "temp must be removed: {leftovers:?}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// Failed preflight still yields a machine-readable not_ready report: the
 /// gating contract for any future launch path.
 #[test]
@@ -404,29 +760,9 @@ fn failed_preflight_produces_actionable_report() {
         head: "oreans/two-sample-mainline@frozen".to_string(),
         clean: true,
     };
-    let manifest_origin = real_manifest("origin_macro");
-    let manifest_lunlun = real_manifest("lunlun_software");
-    let input_origin = missing_input(&dir);
-    let input_lunlun = missing_input(&dir);
-    let out_origin = dir.join("origin_candidate.exe");
-    let out_lunlun = dir.join("lunlun_candidate.exe");
-    let req = request(
-        &dir,
-        &config,
-        &probe,
-        vec![
-            (
-                manifest_origin.as_path(),
-                input_origin.as_path(),
-                out_origin.as_path(),
-            ),
-            (
-                manifest_lunlun.as_path(),
-                input_lunlun.as_path(),
-                out_lunlun.as_path(),
-            ),
-        ],
-    );
+    let owned_cases = two_cases(&dir);
+    let cases = borrow_cases(&owned_cases);
+    let req = request(&dir, &config, &probe, None, cases);
     let report = run_offline_preflight(&req);
     assert_eq!(report.status, PreflightStatus::NotReady);
     assert!(!report.reasons.is_empty());

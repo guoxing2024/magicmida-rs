@@ -17,6 +17,7 @@ pub mod debugger;
 pub mod error;
 pub mod plugin;
 pub mod process;
+pub mod runner_config;
 pub mod runtime_engine;
 pub mod windows_debugger;
 
@@ -36,6 +37,9 @@ pub use plugin::{
 pub use process::{
     cleanup_stub_exe, close_process_handles, create_debug_process, patch_peb_anti_debug,
     CreateProcessOptions, TargetProcess,
+};
+pub use runner_config::{
+    canonical_runner_config, runner_config_digest, IsolationConfig, RunnerConfig,
 };
 pub use runtime_engine::{
     guard_oep_event_script, CapabilityOp, CapabilityRecord, DebuggerCoreEngine, EngineEvent,

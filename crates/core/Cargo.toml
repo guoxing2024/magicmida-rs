@@ -10,6 +10,11 @@ publish.workspace = true
 
 [dependencies]
 pelite = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
 thiserror = { workspace = true }
 tracing = { workspace = true }
 windows = { workspace = true }
+
+[dev-dependencies]
+serde_json = "1"

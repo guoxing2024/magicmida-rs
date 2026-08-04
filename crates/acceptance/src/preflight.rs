@@ -1,24 +1,35 @@
 //! Offline preflight: case identity, runner-config digest, and the
-//! ready/not_ready orchestrator (P6-A/B/C).
+//! ready/not_ready orchestrator (P6-A/B/C, hardened per P6.1).
 //!
-//! This module is pure: it never spawns a process, never calls Win32, and
-//! never opens a sample beyond read-only hashing. The worktree probe is
-//! injected (the CLI/test harness runs `git`; there is no reachable
-//! process-launch path in this module).
+//! This module never spawns a process and never calls Win32; the worktree
+//! probe is injected (the CLI/test harness runs `git`; there is no reachable
+//! process-launch path in this module). It may create files only inside the
+//! caller-controlled `output_dir` (directory creation, a transient
+//! writability probe, and the atomic report write).
 //!
 //! - [`check_case_identity`] (P6-A): independently parses the locked
 //!   `lab/cases/v2` manifest, recomputes the protected input SHA-256/size,
 //!   validates case id / architecture / input-output path aliasing.
-//! - [`RunnerConfig`] + [`runner_config_digest`] (P6-B): canonical
-//!   line-based serialization; stable across runs, no timestamps or random
-//!   directories, any valid field change flips the digest, unknown/missing
-//!   fields fail closed.
+//! - [`RunnerConfig`] + [`runner_config_digest`] (P6-B): the canonical
+//!   length-prefixed encoding is implemented *independently* on the runner
+//!   side (`mida-core::runner_config`, consumed by `mida-cli` in production)
+//!   and mirrored here as the verifier copy. The acceptance crate never
+//!   depends on production crates (see `tests/dependency_boundary.rs`); the
+//!   two implementations are kept honest by the cross-check test in
+//!   `mida-cli` (`tests/runner_config_digest_crosscheck.rs`) which asserts
+//!   both digests agree for the same JSON config. The encoding is injective
+//!   for arbitrary value bytes (commas/newlines/colons cannot collide),
+//!   stable across runs, and unknown/missing fields fail closed.
 //! - [`run_offline_preflight`] (P6-C): aggregates every check into a
-//!   deterministic `ready`/`not_ready` report written atomically.
+//!   deterministic `ready`/`not_ready` report written atomically (unique
+//!   `create_new` temp file, `flush` + `sync_all`, Windows replace-existing;
+//!   a failed replace preserves the previous report).
 
 use std::collections::BTreeSet;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -28,6 +39,9 @@ use crate::oreans_gate::locked_manifest;
 
 /// Schema id of the preflight report.
 pub const PREFLIGHT_REPORT_SCHEMA_VERSION: &str = "mida.preflight-report/v1";
+
+/// The two fixed Oreans cases; preflight is Ready only for exactly this set.
+pub const FIXED_CASE_IDS: [&str; 2] = ["origin_macro", "lunlun_software"];
 
 // ---------------------------------------------------------------------------
 // P6-A: case identity
@@ -301,12 +315,31 @@ pub fn check_case_identity(
 }
 
 // ---------------------------------------------------------------------------
-// P6-B: runner config digest
+// P6-B: runner config digest — verifier-side copy.
+//
+// The runner side (`mida-core::runner_config`, consumed by `mida-cli` in
+// production) implements the same canonical contract independently; the
+// cross-check test in `mida-cli/tests/runner_config_digest_crosscheck.rs`
+// asserts both digests agree for the same JSON config. Encoding contract
+// (length-prefixed, injective):
+//
+// - Every scalar field renders as `name=len:value` where `len` is the
+//   decimal ASCII byte length of `value`; fields are separated by `\n` in a
+//   fixed order.
+// - Every list field renders as `name=count:len:elem...` where `count` is
+//   the element count and each element is `len:elem`; elements are sorted
+//   before encoding.
+// - Booleans render `true`/`false`, integers as decimal ASCII.
+//
+// Because every segment is delimited by its own byte length, values may
+// contain commas, newlines, colons or any other byte without ever colliding
+// with another configuration.
 // ---------------------------------------------------------------------------
 
-/// Canonical runner configuration. `deny_unknown_fields` + required fields
-/// fail closed on drift; no timestamps or random identifiers exist in the
-/// type, so the digest is stable across runs.
+/// Canonical runner configuration (verifier copy; see module docs).
+/// `deny_unknown_fields` + required fields fail closed on drift; no
+/// timestamps or random identifiers exist in the type, so the digest is
+/// stable across runs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunnerConfig {
@@ -369,61 +402,79 @@ impl RunnerConfig {
     }
 }
 
-/// Canonical line-based serialization of the runner config.
-///
-/// Lists are sorted; booleans render `true`/`false`; no whitespace variance
-/// can change the digest. Producer/consumer implement this form
-/// independently (the CLI mirrors it at run time).
-pub fn canonical_runner_config(config: &RunnerConfig) -> String {
-    let mut features: Vec<String> = config.features.clone();
-    features.sort();
-    let mut env: Vec<String> = config.env_allowlist.clone();
-    env.sort();
-    format!(
-        concat!(
-            "tool_revision={}\n",
-            "cli_binary_sha256={}\n",
-            "features={}\n",
-            "debugger_backend={}\n",
-            "oep_policy={}\n",
-            "container_restore={}\n",
-            "shrink={}\n",
-            "data_sections={}\n",
-            "pure_rebuild={}\n",
-            "capture_policy_digest={}\n",
-            "iat_fix_strategy={}\n",
-            "timeout_secs={}\n",
-            "isolation.workspace_policy={}\n",
-            "isolation.process_tree_policy={}\n",
-            "isolation.network_policy={}\n",
-            "attempt_numbering={}\n",
-            "evidence_bundle_schema={}\n",
-            "gate_schema={}\n",
-            "env_allowlist={}\n",
-        ),
-        config.tool_revision,
-        config.cli_binary_sha256.to_lowercase(),
-        features.join(","),
-        config.debugger_backend,
-        config.oep_policy,
-        config.container_restore,
-        config.shrink,
-        config.data_sections,
-        config.pure_rebuild,
-        config.capture_policy_digest.to_lowercase(),
-        config.iat_fix_strategy,
-        config.timeout_secs,
-        config.isolation.workspace_policy,
-        config.isolation.process_tree_policy,
-        config.isolation.network_policy,
-        config.attempt_numbering,
-        config.evidence_bundle_schema,
-        config.gate_schema,
-        env.join(","),
-    )
+fn push_scalar(out: &mut String, name: &str, value: &str) {
+    out.push_str(name);
+    out.push('=');
+    out.push_str(&value.len().to_string());
+    out.push(':');
+    out.push_str(value);
+    out.push('\n');
 }
 
-/// SHA-256 digest of the canonical runner config.
+fn push_list(out: &mut String, name: &str, elements: &mut Vec<String>) {
+    elements.sort();
+    out.push_str(name);
+    out.push('=');
+    out.push_str(&elements.len().to_string());
+    out.push(':');
+    for element in elements.iter() {
+        out.push_str(&element.len().to_string());
+        out.push(':');
+        out.push_str(element);
+    }
+    out.push('\n');
+}
+
+/// Canonical, injective serialization of the runner config (verifier copy).
+pub fn canonical_runner_config(config: &RunnerConfig) -> String {
+    let mut out = String::new();
+    push_scalar(&mut out, "tool_revision", &config.tool_revision);
+    push_scalar(
+        &mut out,
+        "cli_binary_sha256",
+        &config.cli_binary_sha256.to_lowercase(),
+    );
+    push_list(&mut out, "features", &mut config.features.clone());
+    push_scalar(&mut out, "debugger_backend", &config.debugger_backend);
+    push_scalar(&mut out, "oep_policy", &config.oep_policy);
+    push_scalar(&mut out, "container_restore", &config.container_restore);
+    push_scalar(&mut out, "shrink", &config.shrink.to_string());
+    push_scalar(&mut out, "data_sections", &config.data_sections.to_string());
+    push_scalar(&mut out, "pure_rebuild", &config.pure_rebuild.to_string());
+    push_scalar(
+        &mut out,
+        "capture_policy_digest",
+        &config.capture_policy_digest.to_lowercase(),
+    );
+    push_scalar(&mut out, "iat_fix_strategy", &config.iat_fix_strategy);
+    push_scalar(&mut out, "timeout_secs", &config.timeout_secs.to_string());
+    push_scalar(
+        &mut out,
+        "isolation.workspace_policy",
+        &config.isolation.workspace_policy,
+    );
+    push_scalar(
+        &mut out,
+        "isolation.process_tree_policy",
+        &config.isolation.process_tree_policy,
+    );
+    push_scalar(
+        &mut out,
+        "isolation.network_policy",
+        &config.isolation.network_policy,
+    );
+    push_scalar(&mut out, "attempt_numbering", &config.attempt_numbering);
+    push_scalar(
+        &mut out,
+        "evidence_bundle_schema",
+        &config.evidence_bundle_schema,
+    );
+    push_scalar(&mut out, "gate_schema", &config.gate_schema);
+    push_list(&mut out, "env_allowlist", &mut config.env_allowlist.clone());
+    out
+}
+
+/// SHA-256 digest of the canonical runner config (64 lowercase hex chars).
 pub fn runner_config_digest(config: &RunnerConfig) -> String {
     sha256_hex(canonical_runner_config(config).as_bytes())
 }
@@ -482,33 +533,138 @@ pub struct PreflightRequest<'a> {
     pub cases: Vec<(&'a Path, &'a Path, &'a Path)>,
     pub output_dir: &'a Path,
     pub cli_binary: Option<&'a Path>,
-    pub expected_cli_sha256: Option<&'a str>,
+    /// Required: the pinned CLI identity. Empty/malformed means NotReady;
+    /// it must equal `runner_config.cli_binary_sha256` and the actual binary
+    /// digest.
+    pub expected_cli_sha256: &'a str,
     pub runner_config: &'a RunnerConfig,
     pub worktree: &'a dyn WorktreeProbe,
     pub toolchain_pin_file: &'a Path,
     pub expected_toolchain: &'a str,
 }
 
-/// Write `data` to `destination` atomically (temp + rename, same directory).
-fn atomic_write(destination: &Path, data: &[u8]) -> std::io::Result<()> {
+/// Canonicalize `p`, falling back to canonicalizing its parent when the
+/// path itself does not exist yet (e.g. a candidate output file).
+fn canonicalize_loose(p: &Path) -> PathBuf {
+    if let Ok(c) = fs::canonicalize(p) {
+        return c;
+    }
+    match (
+        p.parent().and_then(|parent| fs::canonicalize(parent).ok()),
+        p.file_name(),
+    ) {
+        (Some(parent), Some(name)) => parent.join(name),
+        _ => p.to_path_buf(),
+    }
+}
+
+/// Write `data` to `destination` durably and atomically (P6.1):
+///
+/// - a uniquely-named temp file next to the destination, created with
+///   `create_new` (no PID-only collision window; concurrent writers get
+///   distinct names);
+/// - `write_all` + `flush` + `sync_all` before the swap;
+/// - on Windows, `MoveFileExW(REPLACE_EXISTING | WRITE_THROUGH)`; elsewhere
+///   `rename`. A failed replace removes the temp and leaves the previous
+///   destination untouched.
+fn atomic_write(destination: &Path, data: &[u8]) -> io::Result<()> {
     let parent = destination
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
     fs::create_dir_all(&parent)?;
-    let tmp = parent.join(format!(".preflight-{}.tmp", std::process::id()));
-    fs::write(&tmp, data)?;
-    fs::rename(&tmp, destination)?;
+    let destination_name = destination
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let mut temp = None;
+    for attempt in 0..32u32 {
+        let name = format!(
+            ".{destination_name}.tmp-{}-{}",
+            std::process::id(),
+            now.saturating_add(u128::from(attempt))
+        );
+        let path = parent.join(name);
+        let mut file = match OpenOptions::new().create_new(true).write(true).open(&path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        };
+        let result = file
+            .write_all(data)
+            .and_then(|_| file.flush())
+            .and_then(|_| file.sync_all());
+        drop(file);
+        if let Err(e) = result {
+            let _ = fs::remove_file(&path);
+            return Err(e);
+        }
+        temp = Some(path);
+        break;
+    }
+    let temp = temp.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "unable to allocate a unique temporary file",
+        )
+    })?;
+    match atomic_replace(&temp, destination) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = fs::remove_file(&temp);
+            Err(e)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn atomic_replace(temp: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(temp, destination)
+}
+
+#[cfg(windows)]
+fn atomic_replace(temp: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    let temp_w: Vec<u16> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination_w: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
+    }
+    let result = unsafe {
+        MoveFileExW(
+            temp_w.as_ptr(),
+            destination_w.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        return Err(io::Error::last_os_error());
+    }
     Ok(())
 }
 
 /// Run every offline check and return the deterministic report.
 ///
-/// `status == Ready` only when every case passes identity, the toolchain is
-/// pinned, the worktree is clean (when determinable), the CLI binary hash
-/// matches (when expected), the output directory is usable, and no stale or
-/// partial evidence would be overwritten. Never writes outside `output_dir`.
+/// `status == Ready` only when every case passes identity, the case set is
+/// exactly the two fixed Oreans cases (no empty/missing/duplicate/extra
+/// entries), the toolchain is pinned, the worktree HEAD is non-empty and
+/// matches the runner config (clean when determinable), the CLI binary digest
+/// equals the required `expected_cli_sha256` which itself equals
+/// `runner_config.cli_binary_sha256`, candidate outputs stay inside
+/// `output_dir`, the output directory is writable, and no stale or partial
+/// evidence would be overwritten. Writes nothing outside `output_dir`.
 pub fn run_offline_preflight(request: &PreflightRequest<'_>) -> PreflightReport {
     let mut reasons: Vec<String> = Vec::new();
 
@@ -535,6 +691,11 @@ pub fn run_offline_preflight(request: &PreflightRequest<'_>) -> PreflightReport 
 
     // Worktree (injected probe).
     let worktree = request.worktree.probe();
+    // P6.1: an empty HEAD cannot pin the run — NotReady regardless of
+    // cleanliness.
+    if worktree.head_revision.trim().is_empty() {
+        reasons.push("worktree head revision is empty; the run cannot be pinned".to_string());
+    }
     let worktree_clean = if worktree.clean_determined {
         if !worktree.clean {
             reasons.push(format!(
@@ -556,20 +717,37 @@ pub fn run_offline_preflight(request: &PreflightRequest<'_>) -> PreflightReport 
         None
     };
 
-    // CLI binary hash.
+    // P6.1: CLI identity is mandatory and must bind to the runner config.
+    let expected_cli = request.expected_cli_sha256.trim();
+    let expected_well_formed = is_64_hex(expected_cli);
+    if expected_cli.is_empty() {
+        reasons.push(
+            "expected CLI sha256 is missing; refusing to run without a pinned CLI identity"
+                .to_string(),
+        );
+    } else if !expected_well_formed {
+        reasons.push(format!(
+            "expected CLI sha256 {:?} is malformed (must be 64 hex chars)",
+            request.expected_cli_sha256
+        ));
+    }
+    if !expected_cli.is_empty()
+        && expected_cli.to_lowercase() != request.runner_config.cli_binary_sha256.to_lowercase()
+    {
+        reasons.push(format!(
+            "expected CLI sha256 {expected_cli} does not match runner_config.cli_binary_sha256 {}",
+            request.runner_config.cli_binary_sha256
+        ));
+    }
     let (cli_binary_sha256, cli_binary_matches) = match request.cli_binary {
         Some(path) => match fs::read(path) {
             Ok(data) => {
                 let digest = sha256_hex(&data);
-                let matches = request
-                    .expected_cli_sha256
-                    .map(|e| e.to_lowercase() == digest)
-                    .unwrap_or(true);
+                let matches = !expected_cli.is_empty() && digest == expected_cli.to_lowercase();
                 if !matches {
                     reasons.push(format!(
-                        "CLI binary {} digest {digest} does not match expected {:?}",
-                        path.display(),
-                        request.expected_cli_sha256
+                        "CLI binary {} digest {digest} does not match expected {expected_cli}",
+                        path.display()
                     ));
                 }
                 (Some(digest), Some(matches))
@@ -591,26 +769,40 @@ pub fn run_offline_preflight(request: &PreflightRequest<'_>) -> PreflightReport 
     }
     let config_digest = runner_config_digest(request.runner_config);
 
-    // Output directory usability (read-only probe; no creation here).
-    match fs::metadata(request.output_dir) {
-        Ok(meta) if meta.is_dir() => {}
-        Ok(_) => reasons.push(format!(
-            "output path {} exists and is not a directory",
+    // Output directory: must exist (created if missing), be writable, and
+    // every candidate output must live inside it.
+    match fs::create_dir_all(request.output_dir) {
+        Ok(()) => {}
+        Err(e) => reasons.push(format!(
+            "output dir {} cannot be created: {e}",
             request.output_dir.display()
         )),
-        Err(_) => {
-            // Missing is fine only if the parent is creatable; report and let
-            // the caller create it. Fail closed: require an existing parent.
-            let parent = request.output_dir.parent();
-            match parent.and_then(|p| fs::metadata(p).ok()) {
-                Some(m) if m.is_dir() => {}
-                _ => reasons.push(format!(
-                    "output dir {} has no usable parent",
-                    request.output_dir.display()
-                )),
-            }
-        }
     }
+    let probe_name = format!(
+        ".preflight-probe-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    let probe_path = request.output_dir.join(probe_name);
+    match OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&probe_path)
+    {
+        Ok(mut probe) => {
+            let _ = probe.write_all(b"probe");
+            drop(probe);
+            let _ = fs::remove_file(&probe_path);
+        }
+        Err(e) => reasons.push(format!(
+            "output dir {} is not writable: {e}",
+            request.output_dir.display()
+        )),
+    }
+    let output_canonical = canonicalize_loose(request.output_dir);
 
     // Stale sidecars / partial bundles / overwrite risk in the output dir.
     if let Ok(entries) = fs::read_dir(request.output_dir) {
@@ -626,7 +818,7 @@ pub fn run_offline_preflight(request: &PreflightRequest<'_>) -> PreflightReport 
                     "stale evidence in output dir would be overwritten: {name}"
                 ));
             }
-            if name.ends_with(".tmp") {
+            if name.ends_with(".tmp") || name.contains(".tmp-") {
                 found_stale = true;
                 reasons.push(format!("leftover temp file in output dir: {name}"));
             }
@@ -637,12 +829,20 @@ pub fn run_offline_preflight(request: &PreflightRequest<'_>) -> PreflightReport 
         }
     }
 
-    // Case identities.
+    // Case identities: exactly the two fixed Oreans cases, each once.
     let mut cases = Vec::with_capacity(request.cases.len());
     for (manifest_path, input_path, output_path) in &request.cases {
         let verdict = check_case_identity(manifest_path, input_path, Some(output_path));
         if !verdict.ok {
             reasons.extend(verdict.reasons.clone());
+        }
+        let output_canonical_case = canonicalize_loose(output_path);
+        if !output_canonical_case.starts_with(&output_canonical) {
+            reasons.push(format!(
+                "candidate output {} is outside the controlled output dir {}",
+                output_path.display(),
+                request.output_dir.display()
+            ));
         }
         cases.push(CasePreflight {
             case_id: verdict
@@ -653,6 +853,29 @@ pub fn run_offline_preflight(request: &PreflightRequest<'_>) -> PreflightReport 
             identity_ok: verdict.ok,
             reasons: verdict.reasons,
         });
+    }
+
+    // P6.1: the case set must be exactly the two fixed Oreans cases — no
+    // empty, missing, duplicate, or extra entries. The case id comes from
+    // the manifest identity (present even when the protected input is
+    // missing), so a missing sample never masks a wrong case set.
+    let mut present_ids: Vec<String> = cases.iter().map(|c| c.case_id.clone()).collect();
+    let mut expected_ids: Vec<String> = FIXED_CASE_IDS.iter().map(|s| s.to_string()).collect();
+    expected_ids.sort();
+    if request.cases.len() != expected_ids.len() {
+        reasons.push(format!(
+            "preflight requires exactly {} fixed cases, got {}",
+            expected_ids.len(),
+            request.cases.len()
+        ));
+    }
+    present_ids.sort();
+    present_ids.dedup();
+    if present_ids != expected_ids {
+        reasons.push(format!(
+            "case set must be exactly [{}, {}] with no duplicates or extras, got {:?}",
+            FIXED_CASE_IDS[0], FIXED_CASE_IDS[1], present_ids
+        ));
     }
 
     // Bundle path rehearsal: the seven members must be accepted by the
@@ -738,101 +961,6 @@ pub fn write_preflight_report(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn sample_runner_config() -> RunnerConfig {
-        RunnerConfig {
-            tool_revision: "oreans/two-sample-mainline@frozen".to_string(),
-            cli_binary_sha256: "a".repeat(64),
-            features: vec!["default".to_string()],
-            debugger_backend: "windows_debug_api".to_string(),
-            oep_policy: "captured".to_string(),
-            container_restore: "off".to_string(),
-            shrink: true,
-            data_sections: true,
-            pure_rebuild: false,
-            capture_policy_digest: String::new(),
-            iat_fix_strategy: "v3-trace".to_string(),
-            timeout_secs: 120,
-            isolation: IsolationConfig {
-                workspace_policy: "isolated-temp".to_string(),
-                process_tree_policy: "single-process".to_string(),
-                network_policy: "blocked".to_string(),
-            },
-            attempt_numbering: "continuous-1-based".to_string(),
-            evidence_bundle_schema: "mida.oreans-evidence-bundle/v2".to_string(),
-            gate_schema: "mida.oreans-two-sample-gate/v8".to_string(),
-            env_allowlist: vec!["CARGO_TARGET_DIR".to_string()],
-        }
-    }
-
-    #[test]
-    fn runner_digest_is_stable_and_serialization_canonical() {
-        let a = sample_runner_config();
-        let b = sample_runner_config();
-        assert_eq!(runner_config_digest(&a), runner_config_digest(&b));
-        assert_eq!(canonical_runner_config(&a), canonical_runner_config(&b));
-        assert_eq!(runner_config_digest(&a).len(), 64);
-    }
-
-    #[test]
-    fn runner_digest_changes_with_any_valid_field() {
-        let base = sample_runner_config();
-        let d0 = runner_config_digest(&base);
-        let mut c = base.clone();
-        c.timeout_secs += 1;
-        assert_ne!(d0, runner_config_digest(&c), "timeout must change digest");
-        let mut c = base.clone();
-        c.shrink = !c.shrink;
-        assert_ne!(d0, runner_config_digest(&c), "shrink must change digest");
-        let mut c = base.clone();
-        c.features.push("gto-product-recovery".to_string());
-        assert_ne!(d0, runner_config_digest(&c), "features must change digest");
-        let mut c = base.clone();
-        c.env_allowlist.push("PATH".to_string());
-        assert_ne!(
-            d0,
-            runner_config_digest(&c),
-            "env allowlist must change digest"
-        );
-        // List order must not matter (canonical sort).
-        let mut c = base.clone();
-        c.features.reverse();
-        assert_eq!(d0, runner_config_digest(&c), "list order is canonicalized");
-    }
-
-    #[test]
-    fn runner_digest_rejects_unknown_and_missing_fields() {
-        let json = serde_json::json!({
-            "tool_revision": "x", "cli_binary_sha256": "a".repeat(64),
-            "features": [], "debugger_backend": "b", "oep_policy": "p",
-            "container_restore": "off", "shrink": true, "data_sections": true,
-            "pure_rebuild": false, "capture_policy_digest": "",
-            "iat_fix_strategy": "s", "timeout_secs": 1,
-            "isolation": {"workspace_policy": "w", "process_tree_policy": "p", "network_policy": "n"},
-            "attempt_numbering": "a", "evidence_bundle_schema": "e", "gate_schema": "g",
-            "env_allowlist": [],
-            "sneaky_extra": 1,
-        });
-        assert!(
-            serde_json::from_value::<RunnerConfig>(json).is_err(),
-            "unknown field must be rejected"
-        );
-        let mut minimal = serde_json::to_value(sample_runner_config()).unwrap();
-        minimal.as_object_mut().unwrap().remove("timeout_secs");
-        assert!(
-            serde_json::from_value::<RunnerConfig>(minimal).is_err(),
-            "missing field must be rejected"
-        );
-    }
-
-    #[test]
-    fn runner_config_validate_fails_closed() {
-        let mut c = sample_runner_config();
-        c.cli_binary_sha256 = "not-hex".to_string();
-        assert!(c.validate().is_some());
-        let c = sample_runner_config();
-        assert!(c.validate().is_none());
-    }
 
     #[test]
     fn identity_check_rejects_digest_mismatch_and_alias() {
