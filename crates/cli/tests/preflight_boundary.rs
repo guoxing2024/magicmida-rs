@@ -105,7 +105,13 @@ fn scratch_repo(parent: &Path) -> PathBuf {
 
 /// Full offline-preflight argument vector for the two fixed cases.
 fn preflight_args(dir: &Path, repo_root: &Path) -> Vec<String> {
-    let cli_binary = fake_binary(dir, "mida_cli.exe");
+    preflight_args_with_cli(dir, repo_root, &fake_binary(dir, "mida_cli.exe"))
+}
+
+/// Same as [`preflight_args`] but with an explicit `--cli-binary` (used by
+/// the launch-gate positive control, which must stage the envelope for the
+/// REAL mida-cli binary so the actual run-config digest matches at launch).
+fn preflight_args_with_cli(dir: &Path, repo_root: &Path, cli_binary: &Path) -> Vec<String> {
     vec![
         "/offline-preflight".to_string(),
         dir.display().to_string(),
@@ -588,7 +594,11 @@ fn launch_gate_accepts_ready_report_and_pipeline_continues() {
         "MIDA_ACCEPTANCE_BIN",
         acceptance_bin().display().to_string(),
     )];
-    let args = preflight_args(&dir, &repo_root);
+    // Stage the envelope for the REAL mida-cli binary: the launch-side
+    // actual run-config digest must equal the envelope digest (P6.3-A), so
+    // the pinned CLI identity must be the binary that will run.
+    let real_cli = PathBuf::from(env!("CARGO_BIN_EXE_mida-cli"));
+    let args = preflight_args_with_cli(&dir, &repo_root, &real_cli);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let preflight = run_cli(&arg_refs, env);
     assert_eq!(preflight.status.code(), Some(2), "preflight NotReady");

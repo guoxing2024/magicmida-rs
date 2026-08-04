@@ -26,6 +26,9 @@ pub enum Command {
         /// Optional capture policy from `--capture-policy=PATH` (case-manifest shape).
         /// Empty = plugin/profile defaults only.
         capture_policy: DumpCapturePolicy,
+        /// P6.3: SHA-256 of the capture-policy file bytes (empty when none).
+        /// Part of the actual run-config identity bound into the envelope.
+        capture_policy_digest: String,
         /// P6.2: when set, the launch boundary consumes a Ready offline
         /// preflight report from this directory before any sample process
         /// is created.
@@ -207,12 +210,17 @@ fn parse_unpack(args: &[String]) -> Result<Command, String> {
         i += 1;
     }
 
-    if let Some(path) = capture_policy_path {
+    if let Some(ref path) = capture_policy_path {
         if !path.is_file() {
             return Err(format!("capture policy file not found: {}", path.display()));
         }
-        capture_policy = crate::capture_policy_file::load_capture_policy_file(&path)?;
+        capture_policy = crate::capture_policy_file::load_capture_policy_file(path)?;
     }
+    let capture_policy_digest = match capture_policy_path.as_ref() {
+        Some(path) => crate::runner_preflight::sha256_file(path)
+            .map_err(|e| format!("cannot digest capture policy {}: {e}", path.display()))?,
+        None => String::new(),
+    };
 
     let container_restore = resolve_container_restore(profile, container_restore_explicit);
 
@@ -241,6 +249,7 @@ fn parse_unpack(args: &[String]) -> Result<Command, String> {
         profile,
         pure_rebuild,
         capture_policy,
+        capture_policy_digest,
         preflight_dir,
         verbose,
     })

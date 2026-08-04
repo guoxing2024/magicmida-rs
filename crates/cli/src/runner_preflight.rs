@@ -27,6 +27,11 @@
 //! == envelope digest
 //! == envelope_runner_config_digest() used for sidecar/bundle requests
 //! ```
+//!
+//! P6.3: the envelope binds the ACTUAL run configuration (built by
+//! `crate::run_spec` from the parsed `/unpack` arguments, including the
+//! Origin Macro pure-rebuild default); [`bind_actual_config_to_envelope`]
+//! is the launch-side equality check.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -42,37 +47,38 @@ pub const RUNNER_CONFIG_ENVELOPE_SCHEMA_VERSION: &str = "mida.runner-config-enve
 pub const RUNNER_CONFIG_ENVELOPE_FILENAME: &str = "runner-config-envelope.json";
 /// Filename of the preflight report inside the preflight output dir.
 pub const PREFLIGHT_REPORT_FILENAME: &str = "preflight.json";
+/// Emitted `$schema` reference of the envelope.
+pub const RUNNER_CONFIG_ENVELOPE_SCHEMA_REF: &str = "./runner-config-envelope.schema.json";
 
 /// Fixed policy of the two-sample Oreans runner (frozen for P7).
 ///
 /// The values mirror the CLI defaults the unpack pipeline applies for the
 /// Oreans path; the envelope binds the run to exactly this policy, and the
-/// acceptance verifier independently recomputes the digest.
+/// acceptance verifier independently recomputes the digest. The P7
+/// fixed-mode comparison (including the Origin Macro pure-rebuild default
+/// for a given input) lives in `crate::run_spec`.
 pub fn frozen_runner_config() -> mida_core::runner_config::RunnerConfig {
-    use mida_core::runner_config::IsolationConfig;
-    mida_core::runner_config::RunnerConfig {
-        tool_revision: String::new(),     // filled at emission time
-        cli_binary_sha256: String::new(), // filled at emission time
-        features: vec!["default".to_string()],
-        debugger_backend: "windows_debug_api".to_string(),
-        oep_policy: "captured".to_string(),
-        container_restore: "off".to_string(),
-        shrink: true,
-        data_sections: false,
-        pure_rebuild: false,
-        capture_policy_digest: String::new(),
-        iat_fix_strategy: "v3-trace".to_string(),
-        timeout_secs: 120,
-        isolation: IsolationConfig {
-            workspace_policy: "isolated-temp".to_string(),
-            process_tree_policy: "single-process".to_string(),
-            network_policy: "blocked".to_string(),
-        },
-        attempt_numbering: "continuous-1-based".to_string(),
-        evidence_bundle_schema: "mida.oreans-evidence-bundle/v2".to_string(),
-        gate_schema: "mida.oreans-two-sample-gate/v8".to_string(),
-        env_allowlist: vec!["CARGO_TARGET_DIR".to_string()],
+    crate::run_spec::frozen_runner_config()
+}
+
+/// Launch-side equality check (P6.3-A): the digest of the ACTUAL run
+/// configuration — built from the parsed `/unpack` arguments, with the
+/// resolved pure-rebuild value — must equal the envelope digest. An
+/// envelope staged as `pure_rebuild=false` can never bind a run that
+/// silently resolves to `true` (or any other parameter divergence).
+pub fn bind_actual_config_to_envelope(
+    output_dir: &Path,
+    actual_config: &mida_core::runner_config::RunnerConfig,
+) -> anyhow::Result<()> {
+    let envelope = RunnerConfigEnvelope::read(output_dir)?;
+    let actual_digest = mida_core::runner_config::runner_config_digest(actual_config);
+    if !actual_digest.eq_ignore_ascii_case(&envelope.runner_config_digest) {
+        bail!(
+            "actual run config digest {actual_digest} != envelope digest {}",
+            envelope.runner_config_digest
+        );
     }
+    Ok(())
 }
 
 /// The `mida.runner-config-envelope/v1` emitted by the runner side.

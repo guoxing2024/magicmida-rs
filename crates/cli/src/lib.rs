@@ -9,6 +9,7 @@ pub mod capture_policy_file;
 pub mod commands;
 pub mod log;
 pub mod origin_pure;
+pub mod run_spec;
 pub mod runner_preflight;
 pub mod unpacker;
 

@@ -122,6 +122,7 @@ pub fn unpack(
     profile: DumpProfile,
     pure_rebuild: bool,
     capture_policy: mida_pe::DumpCapturePolicy,
+    capture_policy_digest: &str,
     preflight_dir: Option<&Path>,
 ) -> Result<(), anyhow::Error> {
     use tracing::info;
@@ -140,20 +141,57 @@ pub fn unpack(
     let output_path = resolve_output_path(input, output);
     info!("Output: {}", output_path.display());
 
-    // ---- step 1b: P6.2 launch boundary ----
+    // ---- step 1b: P6.2/P6.3 launch boundary ----
     // When a preflight directory is supplied, the run may not create the
-    // sample process until the offline preflight report is Ready and its
-    // digest chain matches the runner-config envelope. Runs without
-    // --preflight-dir keep legacy behaviour.
+    // sample process until the offline preflight report is Ready AND the
+    // envelope binds the ACTUAL run configuration (P6.3-A): the config
+    // built from the parsed /unpack arguments — including the resolved
+    // pure-rebuild value with the Origin Macro D3 default — must hash to
+    // the envelope digest, and every parameter must match the P7 fixed-mode
+    // policy for this input. Runs without --preflight-dir keep legacy
+    // behaviour.
     if let Some(preflight_dir) = preflight_dir {
         let envelope = crate::runner_preflight::RunnerConfigEnvelope::read(preflight_dir)
             .map_err(|e| anyhow!("launch blocked: runner-config envelope unavailable: {e:#}"))?;
         crate::runner_preflight::require_ready_before_launch(preflight_dir, &envelope).map_err(
             |e| anyhow!("launch blocked by preflight gate before any process creation: {e:#}"),
         )?;
+        let cli_binary_sha256 =
+            crate::runner_preflight::sha256_file(&std::env::current_exe().map_err(|e| {
+                anyhow!("launch blocked: cannot resolve the current executable: {e}")
+            })?)
+            .map_err(|e| anyhow!("launch blocked: cannot digest the current executable: {e}"))?;
+        let actual_config = crate::run_spec::runner_config_from_unpack_args(
+            oep_policy,
+            container_restore,
+            profile,
+            shrink,
+            do_data_sections,
+            pure_rebuild,
+            capture_policy_digest,
+            &envelope.tool_revision,
+            &cli_binary_sha256,
+        );
+        crate::runner_preflight::bind_actual_config_to_envelope(preflight_dir, &actual_config)
+            .map_err(|e| {
+                anyhow!(
+                    "launch blocked: actual run config does not match the staged envelope: {e:#}"
+                )
+            })?;
+        if let Some(reason) = crate::run_spec::policy_matches(
+            &actual_config,
+            &crate::run_spec::frozen_run_policy(input),
+        ) {
+            return Err(anyhow!(
+                "launch blocked: run config diverges from the P7 fixed-mode policy for this \
+                 input: {reason}"
+            ));
+        }
         info!(
-            "Preflight gate: Ready — envelope digest {} consumed",
-            envelope.runner_config_digest
+            "Preflight gate: Ready — envelope digest {} bound to the actual run config \
+             (digest {})",
+            envelope.runner_config_digest,
+            mida_core::runner_config::runner_config_digest(&actual_config)
         );
     }
 

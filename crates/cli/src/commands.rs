@@ -16,6 +16,7 @@ pub fn run_command(cmd: Command) -> Result<(), anyhow::Error> {
             profile,
             pure_rebuild,
             capture_policy,
+            capture_policy_digest,
             preflight_dir,
             verbose: _,
         } => crate::unpacker::unpack(
@@ -28,6 +29,7 @@ pub fn run_command(cmd: Command) -> Result<(), anyhow::Error> {
             profile,
             pure_rebuild,
             capture_policy,
+            &capture_policy_digest,
             preflight_dir.as_deref(),
         ),
         Command::GenericUnpack {
@@ -88,7 +90,7 @@ pub fn run_offline_preflight_command(
     acceptance_bin: Option<&Path>,
 ) -> Result<(), anyhow::Error> {
     std::fs::create_dir_all(output_dir)?;
-    let mut runner_config = crate::runner_preflight::frozen_runner_config();
+    let mut runner_config = crate::run_spec::frozen_runner_config();
     let tool_revision = crate::runner_preflight::current_tool_revision(repo_root)?;
     let cli_binary_sha256 = crate::runner_preflight::sha256_file(cli_binary)?;
     runner_config.tool_revision = tool_revision.clone();
