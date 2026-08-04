@@ -17,8 +17,9 @@ use std::path::{Path, PathBuf};
 
 use mida_acceptance::{
     canonical_runner_config, check_case_identity, run_offline_preflight, runner_config_digest,
-    sha256_hex, write_preflight_report, IsolationConfig, PreflightReport, PreflightRequest,
-    PreflightStatus, RunnerConfig, WorktreeProbe, WorktreeState, REQUIRED_BUNDLE_MEMBERS,
+    sha256_hex, write_preflight_report, FsOutputProbe, IsolationConfig, OutputProbe,
+    PreflightReport, PreflightRequest, PreflightStatus, RunnerConfig, WorktreeProbe, WorktreeState,
+    REQUIRED_BUNDLE_MEMBERS,
 };
 
 fn temp_dir(tag: &str) -> PathBuf {
@@ -91,12 +92,71 @@ impl WorktreeProbe for FakeProbe {
     }
 }
 
+/// Deterministic failure injection for the output-probe seam (P6.2).
+#[derive(Clone)]
+enum ProbeStage {
+    Create,
+    Write,
+    Sync,
+    Cleanup,
+    Enumerate,
+}
+
+struct FailingOutputProbe {
+    stage: ProbeStage,
+}
+
+impl OutputProbe for FailingOutputProbe {
+    fn probe_writable(&self, output_dir: &Path) -> Result<(), String> {
+        match self.stage {
+            ProbeStage::Create => Err(format!(
+                "output dir {} is not writable: injected create failure",
+                output_dir.display()
+            )),
+            ProbeStage::Write => Err(format!(
+                "output dir {} probe write/sync failed: injected write failure",
+                output_dir.display()
+            )),
+            ProbeStage::Sync => Err(format!(
+                "output dir {} probe write/sync failed: injected sync failure",
+                output_dir.display()
+            )),
+            ProbeStage::Cleanup => Err(format!(
+                "output dir {} probe cleanup failed: injected cleanup failure",
+                output_dir.display()
+            )),
+            ProbeStage::Enumerate => Ok(()),
+        }
+    }
+
+    fn list_entries(&self, output_dir: &Path) -> Result<Vec<String>, String> {
+        match self.stage {
+            ProbeStage::Enumerate => Err(format!(
+                "cannot enumerate output dir {}: injected enumeration failure",
+                output_dir.display()
+            )),
+            _ => Ok(Vec::new()),
+        }
+    }
+}
+
 fn request<'a>(
     output_dir: &'a Path,
     config: &'a RunnerConfig,
     probe: &'a dyn WorktreeProbe,
     cli: Option<(&'a Path, &'a str)>,
     cases: Vec<(&'a Path, &'a Path, &'a Path)>,
+) -> PreflightRequest<'a> {
+    request_with_probe(output_dir, config, probe, cli, cases, &FsOutputProbe)
+}
+
+fn request_with_probe<'a>(
+    output_dir: &'a Path,
+    config: &'a RunnerConfig,
+    probe: &'a dyn WorktreeProbe,
+    cli: Option<(&'a Path, &'a str)>,
+    cases: Vec<(&'a Path, &'a Path, &'a Path)>,
+    output_probe: &'a dyn OutputProbe,
 ) -> PreflightRequest<'a> {
     PreflightRequest {
         cases,
@@ -105,6 +165,7 @@ fn request<'a>(
         expected_cli_sha256: cli.map(|(_, sha)| sha).unwrap_or(""),
         runner_config: config,
         worktree: probe,
+        output_probe,
         toolchain_pin_file: Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../rust-toolchain.toml"
@@ -747,6 +808,195 @@ fn replace_failure_preserves_old_destination() {
         .filter(|n| n.contains(".tmp-"))
         .collect();
     assert!(leftovers.is_empty(), "temp must be removed: {leftovers:?}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// P6.2: a whitespace-wrapped CLI pin must be malformed — validation runs on
+/// the ORIGINAL string, not a trimmed copy.
+#[test]
+fn whitespace_wrapped_cli_sha_is_malformed() {
+    let dir = temp_dir("ws_sha");
+    let (cli_path, _) = fake_cli(&dir, "ws");
+    let config = runner_config("oreans/two-sample-mainline@frozen");
+    let probe = FakeProbe {
+        head: "oreans/two-sample-mainline@frozen".to_string(),
+        clean: true,
+    };
+    let owned_cases = two_cases(&dir);
+    let cases = borrow_cases(&owned_cases);
+    let wrapped = format!(" {}", "a".repeat(64));
+    let req = request(&dir, &config, &probe, Some((&cli_path, &wrapped)), cases);
+    let report = run_offline_preflight(&req);
+    assert!(
+        report
+            .reasons
+            .iter()
+            .any(|r| r.contains("malformed") && r.contains("exactly 64 hex chars")),
+        "{:?}",
+        report.reasons
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// P6.2: every step of the output probe is fail-closed — create, write,
+/// sync, and cleanup failures are all NotReady (injected deterministically
+/// through the OutputProbe seam).
+#[test]
+fn output_probe_failures_block_ready_deterministically() {
+    for (tag, stage) in [
+        ("create", ProbeStage::Create),
+        ("write", ProbeStage::Write),
+        ("sync", ProbeStage::Sync),
+        ("cleanup", ProbeStage::Cleanup),
+    ] {
+        let dir = temp_dir(&format!("probe_{tag}"));
+        let config = runner_config("oreans/two-sample-mainline@frozen");
+        let probe = FakeProbe {
+            head: "oreans/two-sample-mainline@frozen".to_string(),
+            clean: true,
+        };
+        let owned_cases = two_cases(&dir);
+        let cases = borrow_cases(&owned_cases);
+        let output_probe = FailingOutputProbe {
+            stage: stage.clone(),
+        };
+        let req = request_with_probe(&dir, &config, &probe, None, cases, &output_probe);
+        let report = run_offline_preflight(&req);
+        assert_eq!(report.status, PreflightStatus::NotReady, "{tag}");
+        let expected_fragment = match stage {
+            ProbeStage::Create => "is not writable",
+            ProbeStage::Write => "injected write failure",
+            ProbeStage::Sync => "injected sync failure",
+            ProbeStage::Cleanup => "probe cleanup failed",
+            ProbeStage::Enumerate => unreachable!(),
+        };
+        assert!(
+            report.reasons.iter().any(|r| r.contains(expected_fragment)),
+            "{tag}: {:?}",
+            report.reasons
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+/// P6.2: output-dir enumeration failure must be NotReady — stale evidence
+/// must never be silently undetectable.
+#[test]
+fn output_enumeration_failure_blocks_ready() {
+    let dir = temp_dir("enum_fail");
+    fs::write(dir.join("candidate.exe.iat_evidence.json"), b"{}").unwrap();
+    let config = runner_config("oreans/two-sample-mainline@frozen");
+    let probe = FakeProbe {
+        head: "oreans/two-sample-mainline@frozen".to_string(),
+        clean: true,
+    };
+    let owned_cases = two_cases(&dir);
+    let cases = borrow_cases(&owned_cases);
+    let output_probe = FailingOutputProbe {
+        stage: ProbeStage::Enumerate,
+    };
+    let req = request_with_probe(&dir, &config, &probe, None, cases, &output_probe);
+    let report = run_offline_preflight(&req);
+    assert!(
+        report
+            .reasons
+            .iter()
+            .any(|r| r.contains("cannot enumerate output dir")),
+        "{:?}",
+        report.reasons
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// P6.2: leftover .preflight-probe-* files are stale and block readiness.
+#[test]
+fn leftover_probe_file_blocks_ready() {
+    let dir = temp_dir("probe_leftover");
+    fs::write(dir.join(".preflight-probe-123-456"), b"x").unwrap();
+    let config = runner_config("oreans/two-sample-mainline@frozen");
+    let probe = FakeProbe {
+        head: "oreans/two-sample-mainline@frozen".to_string(),
+        clean: true,
+    };
+    let owned_cases = two_cases(&dir);
+    let cases = borrow_cases(&owned_cases);
+    let req = request(&dir, &config, &probe, None, cases);
+    let report = run_offline_preflight(&req);
+    assert!(
+        report.reasons.iter().any(|r| r.contains("leftover temp")),
+        "{:?}",
+        report.reasons
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// P6.2: two correct cases plus a third extra case must be NotReady for
+/// both the cardinality and the set-contract reason.
+#[test]
+fn extra_case_rejected() {
+    let dir = temp_dir("extra_case");
+    let extra_manifest = dir.join("extra.json");
+    fs::write(
+        &extra_manifest,
+        serde_json::to_vec(&serde_json::json!({
+            "$schema": "./case-manifest.schema.json",
+            "schema_version": "mida.case-manifest/v2",
+            "manifest_revision": 1,
+            "case_id": "origin_macro",
+            "display_name": "extra",
+            "primary_artifact_sha256": "1af62999cf5be0b2f21abc39034c122a42aa46cfbfdb546faa184de37ac09ac7",
+            "artifacts": [{"sha256": "1af62999cf5be0b2f21abc39034c122a42aa46cfbfdb546faa184de37ac09ac7", "size_bytes": 5232656, "role": "protected_input"}],
+            "capability_cell": {
+                "platform": "windows", "binary_format": "pe", "architecture": "x86_64",
+                "execution_model": "native", "protection_family": "oreans_candidate",
+                "engine_route": "mida_plugin_oreans", "corpus_role": "regression"
+            },
+            "static_fingerprint": {}, "execution_policy": {}, "oracle": {}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let config = runner_config("oreans/two-sample-mainline@frozen");
+    let probe = FakeProbe {
+        head: "oreans/two-sample-mainline@frozen".to_string(),
+        clean: true,
+    };
+    let cases = vec![
+        (
+            real_manifest("origin_macro"),
+            missing_input(&dir),
+            dir.join("origin_candidate.exe"),
+        ),
+        (
+            real_manifest("lunlun_software"),
+            missing_input(&dir),
+            dir.join("lunlun_candidate.exe"),
+        ),
+        (
+            extra_manifest.clone(),
+            missing_input(&dir),
+            dir.join("extra_candidate.exe"),
+        ),
+    ];
+    let req = request(&dir, &config, &probe, None, borrow_cases(&cases));
+    let report = run_offline_preflight(&req);
+    assert_eq!(report.status, PreflightStatus::NotReady);
+    assert!(
+        report
+            .reasons
+            .iter()
+            .any(|r| r.contains("requires exactly 2 fixed cases")),
+        "cardinality reason missing: {:?}",
+        report.reasons
+    );
+    assert!(
+        report
+            .reasons
+            .iter()
+            .any(|r| r.contains("case set must be exactly")),
+        "set-contract reason missing: {:?}",
+        report.reasons
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 

@@ -492,9 +492,81 @@ pub struct WorktreeState {
     pub clean_determined: bool,
 }
 
-/// Injected probe; the CLI/test harness runs `git`.
+/// Injected probe for the worktree; the CLI/test harness runs `git`.
 pub trait WorktreeProbe {
     fn probe(&self) -> WorktreeState;
+}
+
+/// P6.2: injected seam for output-directory operations. Every step of the
+/// writability probe (create_new -> write_all -> flush -> sync_all -> close
+/// -> remove) and the stale-evidence enumeration must succeed; any failure
+/// is a NotReady reason. The seam lets tests inject deterministic failures
+/// instead of relying only on ACL tricks that may skip.
+pub trait OutputProbe {
+    /// Create a unique probe file in `output_dir`, fully write/sync it,
+    /// close it, and remove it. `Err(reason)` = the directory is not
+    /// writable (or cleanup failed).
+    fn probe_writable(&self, output_dir: &Path) -> Result<(), String>;
+    /// List file names inside `output_dir`. `Err(reason)` = the directory
+    /// cannot be enumerated (fail closed — stale evidence is undetectable).
+    fn list_entries(&self, output_dir: &Path) -> Result<Vec<String>, String>;
+}
+
+/// Real filesystem implementation of [`OutputProbe`].
+pub struct FsOutputProbe;
+
+impl OutputProbe for FsOutputProbe {
+    fn probe_writable(&self, output_dir: &Path) -> Result<(), String> {
+        let probe_name = format!(
+            ".preflight-probe-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let probe_path = output_dir.join(probe_name);
+        let mut probe = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&probe_path)
+            .map_err(|e| format!("output dir {} is not writable: {e}", output_dir.display()))?;
+        probe
+            .write_all(b"probe")
+            .and_then(|_| probe.flush())
+            .and_then(|_| probe.sync_all())
+            .map_err(|e| {
+                let _ = fs::remove_file(&probe_path);
+                format!(
+                    "output dir {} probe write/sync failed: {e}",
+                    output_dir.display()
+                )
+            })?;
+        drop(probe);
+        fs::remove_file(&probe_path).map_err(|e| {
+            format!(
+                "output dir {} probe cleanup failed ({}): {e}",
+                output_dir.display(),
+                probe_path.display()
+            )
+        })
+    }
+
+    fn list_entries(&self, output_dir: &Path) -> Result<Vec<String>, String> {
+        let mut names = Vec::new();
+        for entry in fs::read_dir(output_dir).map_err(|e| {
+            format!(
+                "cannot enumerate output dir {} (stale evidence undetectable): {e}",
+                output_dir.display()
+            )
+        })? {
+            let entry = entry.map_err(|e| {
+                format!("cannot enumerate output dir {}: {e}", output_dir.display())
+            })?;
+            names.push(entry.file_name().to_string_lossy().to_string());
+        }
+        Ok(names)
+    }
 }
 
 /// Per-case preflight result.
@@ -539,6 +611,9 @@ pub struct PreflightRequest<'a> {
     pub expected_cli_sha256: &'a str,
     pub runner_config: &'a RunnerConfig,
     pub worktree: &'a dyn WorktreeProbe,
+    /// P6.2: injected output-dir probe (filesystem in production, failure
+    /// stubs in tests).
+    pub output_probe: &'a dyn OutputProbe,
     pub toolchain_pin_file: &'a Path,
     pub expected_toolchain: &'a str,
 }
@@ -717,22 +792,27 @@ pub fn run_offline_preflight(request: &PreflightRequest<'_>) -> PreflightReport 
         None
     };
 
-    // P6.1: CLI identity is mandatory and must bind to the runner config.
-    let expected_cli = request.expected_cli_sha256.trim();
-    let expected_well_formed = is_64_hex(expected_cli);
-    if expected_cli.is_empty() {
+    // P6.1/P6.2: CLI identity is mandatory and must bind to the runner
+    // config. The pin is validated on the ORIGINAL string — whitespace is
+    // not trimmed before `is_64_hex`, so `" <64 hex> "` is malformed and
+    // NotReady. After validation, lowercase normalization is used only for
+    // comparison.
+    let expected_cli_original = request.expected_cli_sha256;
+    let expected_well_formed = is_64_hex(expected_cli_original);
+    if expected_cli_original.is_empty() {
         reasons.push(
             "expected CLI sha256 is missing; refusing to run without a pinned CLI identity"
                 .to_string(),
         );
     } else if !expected_well_formed {
         reasons.push(format!(
-            "expected CLI sha256 {:?} is malformed (must be 64 hex chars)",
+            "expected CLI sha256 {:?} is malformed (must be exactly 64 hex chars)",
             request.expected_cli_sha256
         ));
     }
-    if !expected_cli.is_empty()
-        && expected_cli.to_lowercase() != request.runner_config.cli_binary_sha256.to_lowercase()
+    let expected_cli = expected_cli_original.to_lowercase();
+    if expected_well_formed
+        && expected_cli != request.runner_config.cli_binary_sha256.to_lowercase()
     {
         reasons.push(format!(
             "expected CLI sha256 {expected_cli} does not match runner_config.cli_binary_sha256 {}",
@@ -743,10 +823,10 @@ pub fn run_offline_preflight(request: &PreflightRequest<'_>) -> PreflightReport 
         Some(path) => match fs::read(path) {
             Ok(data) => {
                 let digest = sha256_hex(&data);
-                let matches = !expected_cli.is_empty() && digest == expected_cli.to_lowercase();
+                let matches = expected_well_formed && digest == expected_cli;
                 if !matches {
                     reasons.push(format!(
-                        "CLI binary {} digest {digest} does not match expected {expected_cli}",
+                        "CLI binary {} digest {digest} does not match expected {expected_cli_original}",
                         path.display()
                     ));
                 }
@@ -770,7 +850,9 @@ pub fn run_offline_preflight(request: &PreflightRequest<'_>) -> PreflightReport 
     let config_digest = runner_config_digest(request.runner_config);
 
     // Output directory: must exist (created if missing), be writable, and
-    // every candidate output must live inside it.
+    // every candidate output must live inside it. The writability probe
+    // checks the FULL chain (create_new -> write_all -> flush -> sync_all
+    // -> close -> remove); any failure is NotReady.
     match fs::create_dir_all(request.output_dir) {
         Ok(()) => {}
         Err(e) => reasons.push(format!(
@@ -778,55 +860,42 @@ pub fn run_offline_preflight(request: &PreflightRequest<'_>) -> PreflightReport 
             request.output_dir.display()
         )),
     }
-    let probe_name = format!(
-        ".preflight-probe-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    );
-    let probe_path = request.output_dir.join(probe_name);
-    match OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&probe_path)
-    {
-        Ok(mut probe) => {
-            let _ = probe.write_all(b"probe");
-            drop(probe);
-            let _ = fs::remove_file(&probe_path);
-        }
-        Err(e) => reasons.push(format!(
-            "output dir {} is not writable: {e}",
-            request.output_dir.display()
-        )),
+    if let Err(reason) = request.output_probe.probe_writable(request.output_dir) {
+        reasons.push(reason);
     }
     let output_canonical = canonicalize_loose(request.output_dir);
 
     // Stale sidecars / partial bundles / overwrite risk in the output dir.
-    if let Ok(entries) = fs::read_dir(request.output_dir) {
-        let mut found_stale = false;
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.ends_with("_evidence.json")
-                || name.ends_with(".transform_manifest.json")
-                || name.ends_with(".bundle.json")
-            {
-                found_stale = true;
-                reasons.push(format!(
-                    "stale evidence in output dir would be overwritten: {name}"
-                ));
+    // P6.2: enumeration failure is NotReady — stale evidence must never be
+    // undetectable. Leftover probe files (.preflight-probe-*) are stale too.
+    match request.output_probe.list_entries(request.output_dir) {
+        Ok(names) => {
+            let mut found_stale = false;
+            for name in names {
+                if name.ends_with("_evidence.json")
+                    || name.ends_with(".transform_manifest.json")
+                    || name.ends_with(".bundle.json")
+                {
+                    found_stale = true;
+                    reasons.push(format!(
+                        "stale evidence in output dir would be overwritten: {name}"
+                    ));
+                }
+                if name.ends_with(".tmp")
+                    || name.contains(".tmp-")
+                    || name.starts_with(".preflight-probe-")
+                {
+                    found_stale = true;
+                    reasons.push(format!("leftover temp file in output dir: {name}"));
+                }
             }
-            if name.ends_with(".tmp") || name.contains(".tmp-") {
-                found_stale = true;
-                reasons.push(format!("leftover temp file in output dir: {name}"));
+            if found_stale {
+                reasons.push(
+                    "output dir must be empty of evidence/temp files before a run".to_string(),
+                );
             }
         }
-        if found_stale {
-            reasons
-                .push("output dir must be empty of evidence/temp files before a run".to_string());
-        }
+        Err(reason) => reasons.push(reason),
     }
 
     // Case identities: exactly the two fixed Oreans cases, each once.
@@ -855,11 +924,11 @@ pub fn run_offline_preflight(request: &PreflightRequest<'_>) -> PreflightReport 
         });
     }
 
-    // P6.1: the case set must be exactly the two fixed Oreans cases — no
-    // empty, missing, duplicate, or extra entries. The case id comes from
+    // P6.1/P6.2: the case set must be exactly the two fixed Oreans cases —
+    // no empty, missing, duplicate, or extra entries. The case id comes from
     // the manifest identity (present even when the protected input is
     // missing), so a missing sample never masks a wrong case set.
-    let mut present_ids: Vec<String> = cases.iter().map(|c| c.case_id.clone()).collect();
+    let present_ids: Vec<String> = cases.iter().map(|c| c.case_id.clone()).collect();
     let mut expected_ids: Vec<String> = FIXED_CASE_IDS.iter().map(|s| s.to_string()).collect();
     expected_ids.sort();
     if request.cases.len() != expected_ids.len() {
@@ -869,9 +938,11 @@ pub fn run_offline_preflight(request: &PreflightRequest<'_>) -> PreflightReport 
             request.cases.len()
         ));
     }
-    present_ids.sort();
-    present_ids.dedup();
-    if present_ids != expected_ids {
+    let set_ok = present_ids.len() == expected_ids.len()
+        && FIXED_CASE_IDS
+            .iter()
+            .all(|id| present_ids.iter().filter(|p| *p == id).count() == 1);
+    if !set_ok {
         reasons.push(format!(
             "case set must be exactly [{}, {}] with no duplicates or extras, got {:?}",
             FIXED_CASE_IDS[0], FIXED_CASE_IDS[1], present_ids

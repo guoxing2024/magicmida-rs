@@ -94,6 +94,7 @@ pub use oreans_pe_evidence::{
 pub use preflight::{
     canonical_runner_config, check_case_identity, run_offline_preflight, runner_config_digest,
     write_preflight_report, CaseIdentity, CaseManifestV2, CasePreflight, FileIdentity,
-    IdentityVerdict, IsolationConfig, PreflightReport, PreflightRequest, PreflightStatus,
-    RunnerConfig, WorktreeProbe, WorktreeState, PREFLIGHT_REPORT_SCHEMA_VERSION,
+    FsOutputProbe, IdentityVerdict, IsolationConfig, OutputProbe, PreflightReport,
+    PreflightRequest, PreflightStatus, RunnerConfig, WorktreeProbe, WorktreeState,
+    PREFLIGHT_REPORT_SCHEMA_VERSION,
 };
