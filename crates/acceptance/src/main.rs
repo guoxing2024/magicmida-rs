@@ -1051,12 +1051,12 @@ fn same_file(
     Ok(false)
 }
 
-/// Verifier-side copy of the `mida.runner-config-envelope/v2` emitted by the
+/// Verifier-side copy of the `mida.runner-config-envelope/v3` emitted by the
 /// runner (`mida-cli`). Deny-unknown-fields: any tampered or drifted field
 /// fails closed. The acceptance crate stays dependency-free of production.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RunnerConfigEnvelopeV2 {
+struct RunnerConfigEnvelopeV3 {
     #[serde(rename = "$schema")]
     #[allow(dead_code)]
     schema: String,
@@ -1065,6 +1065,8 @@ struct RunnerConfigEnvelopeV2 {
     runner_config_digest: String,
     cli_binary_sha256: String,
     tool_revision: String,
+    verifier_source: String,
+    verifier_path: String,
     verifier_sha256: String,
 }
 
@@ -1165,16 +1167,16 @@ fn cmd_preflight(args: &[String]) -> Result<i32, String> {
 
     let envelope_bytes = fs::read(&envelope_path)
         .map_err(|e| format!("cannot read envelope {}: {e}", envelope_path.display()))?;
-    let envelope: RunnerConfigEnvelopeV2 =
+    let envelope: RunnerConfigEnvelopeV3 =
         serde_json::from_slice(&envelope_bytes).map_err(|e| {
             format!(
                 "envelope {} rejected (unknown/malformed fields): {e}",
                 envelope_path.display()
             )
         })?;
-    if envelope.schema_version != "mida.runner-config-envelope/v2" {
+    if envelope.schema_version != "mida.runner-config-envelope/v3" {
         return Err(format!(
-            "envelope schema_version {:?} != mida.runner-config-envelope/v2",
+            "envelope schema_version {:?} != mida.runner-config-envelope/v3",
             envelope.schema_version
         ));
     }
@@ -1186,6 +1188,15 @@ fn cmd_preflight(args: &[String]) -> Result<i32, String> {
             "envelope $schema {:?} != ./runner-config-envelope.schema.json",
             envelope.schema
         ));
+    }
+    if envelope.verifier_source != "<cli-dir>/mida-acceptance.exe" {
+        return Err(format!(
+            "envelope verifier_source {:?} != <cli-dir>/mida-acceptance.exe",
+            envelope.verifier_source
+        ));
+    }
+    if envelope.verifier_path.trim().is_empty() {
+        return Err("envelope verifier_path must be non-empty".to_string());
     }
     if envelope.verifier_sha256.len() != 64
         || !envelope

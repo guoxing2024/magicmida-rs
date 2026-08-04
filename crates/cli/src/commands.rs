@@ -1,4 +1,4 @@
-﻿//! Command dispatch — maps CLI commands to unpacker functions.
+//! Command dispatch — maps CLI commands to unpacker functions.
 
 use std::path::Path;
 
@@ -18,7 +18,6 @@ pub fn run_command(cmd: Command) -> Result<(), anyhow::Error> {
             capture_policy,
             capture_policy_digest,
             preflight_dir,
-            acceptance_bin,
             verbose: _,
         } => crate::unpacker::unpack(
             &input,
@@ -32,7 +31,6 @@ pub fn run_command(cmd: Command) -> Result<(), anyhow::Error> {
             capture_policy,
             &capture_policy_digest,
             preflight_dir.as_deref(),
-            acceptance_bin.as_deref(),
         ),
         Command::GenericUnpack {
             input,
@@ -62,7 +60,6 @@ pub fn run_command(cmd: Command) -> Result<(), anyhow::Error> {
             repo_root,
             toolchain_pin_file,
             expected_toolchain,
-            acceptance_bin,
         } => run_offline_preflight_command(
             &output_dir,
             &cases,
@@ -70,7 +67,6 @@ pub fn run_command(cmd: Command) -> Result<(), anyhow::Error> {
             &repo_root,
             &toolchain_pin_file,
             &expected_toolchain,
-            acceptance_bin.as_deref(),
         ),
         Command::Help | Command::Version => {
             unreachable!("Help and Version commands should be handled before run_command")
@@ -89,7 +85,6 @@ pub fn run_offline_preflight_command(
     repo_root: &Path,
     toolchain_pin_file: &Path,
     expected_toolchain: &str,
-    acceptance_bin: Option<&Path>,
 ) -> Result<(), anyhow::Error> {
     std::fs::create_dir_all(output_dir)?;
     let mut runner_config = crate::run_spec::frozen_runner_config();
@@ -97,17 +92,15 @@ pub fn run_offline_preflight_command(
     let cli_binary_sha256 = crate::runner_preflight::sha256_file(cli_binary)?;
     runner_config.tool_revision = tool_revision.clone();
     runner_config.cli_binary_sha256 = cli_binary_sha256.clone();
-    // P6.3.1: pin the verifier identity into the envelope at staging. The
-    // environment is never trusted; the verifier is the explicit
-    // --acceptance-bin or the sibling next to the CLI binary.
-    let verifier_path = acceptance_bin
-        .map(Path::to_path_buf)
-        .unwrap_or_else(crate::runner_preflight::resolve_acceptance_bin);
-    let verifier_sha256 = crate::runner_preflight::sha256_file(&verifier_path)?;
+    // P6.3.2: the verifier can ONLY be the unique CLI sibling
+    // (`resolve_verifier_identity` — no env, no caller path, no PATH). The
+    // canonical path and SHA-256 are both pinned into the envelope.
+    let (verifier_path, verifier_sha256) = crate::runner_preflight::resolve_verifier_identity()?;
     let envelope = crate::runner_preflight::RunnerConfigEnvelope::build(
         &runner_config,
         &cli_binary_sha256,
         &tool_revision,
+        &verifier_path.display().to_string(),
         &verifier_sha256,
     );
     let borrowed: Vec<(&Path, &Path, &Path)> = cases
@@ -122,7 +115,6 @@ pub fn run_offline_preflight_command(
         repo_root,
         toolchain_pin_file,
         expected_toolchain,
-        acceptance_bin,
     )?;
     if !ready {
         return Err(crate::unpacker::GenericGateFailure {

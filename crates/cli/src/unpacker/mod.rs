@@ -124,7 +124,6 @@ pub fn unpack(
     capture_policy: mida_pe::DumpCapturePolicy,
     capture_policy_digest: &str,
     preflight_dir: Option<&Path>,
-    acceptance_bin: Option<&Path>,
 ) -> Result<(), anyhow::Error> {
     use tracing::info;
     info!("=== UNPACK START ===");
@@ -188,7 +187,6 @@ pub fn unpack(
             output: &output_path,
             cli_binary: &cli_binary,
             runner_config: &actual_config,
-            acceptance_bin,
         };
         let context = crate::runner_preflight::attest_ready_before_launch(
             preflight_dir,
@@ -537,7 +535,7 @@ pub fn unpack(
         // P6.3-D: after a successful gated run, produce the evidence bundle
         // from the attested single-use context (consumed by value).
         if let Some(ctx) = evidence_ctx.take() {
-            crate::runner_preflight::complete_run_evidence(ctx, acceptance_bin, &output_path)
+            crate::runner_preflight::complete_run_evidence(ctx, &output_path)
                 .map_err(|e| anyhow!("evidence bundle assembly failed after a gated run: {e:#}"))?;
         }
         return Ok(());
@@ -1506,7 +1504,7 @@ pub fn unpack(
     // P6.3-D: after a successful gated run, produce the evidence bundle
     // from the attested single-use context (seven members, atomic).
     if let Some(ctx) = evidence_ctx.take() {
-        crate::runner_preflight::complete_run_evidence(ctx, acceptance_bin, &output_path)
+        crate::runner_preflight::complete_run_evidence(ctx, &output_path)
             .map_err(|e| anyhow!("evidence bundle assembly failed after a gated run: {e:#}"))?;
     }
 

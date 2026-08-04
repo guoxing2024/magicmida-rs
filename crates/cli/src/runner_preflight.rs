@@ -43,16 +43,20 @@ use crate::unpacker::sidecar_io::atomic_write;
 
 /// Schema id of the runner-config envelope.
 ///
-/// v2 (P6.3.1): binds the verifier binary identity (`verifier_sha256`) so
-/// the production launch and PE-evidence paths never trust an unbound
-/// verifier. v1 envelopes no longer parse (no persisted v1 envelopes exist).
-pub const RUNNER_CONFIG_ENVELOPE_SCHEMA_VERSION: &str = "mida.runner-config-envelope/v2";
+/// v3 (P6.3.2): binds the verifier PATH identity (canonical CLI sibling
+/// path + controlled relative marker) together with `verifier_sha256`, so
+/// staging, launch re-attestation, PE-evidence and bundle completion all
+/// validate path AND hash. v1/v2 envelopes no longer parse (no persisted
+/// ones exist).
+pub const RUNNER_CONFIG_ENVELOPE_SCHEMA_VERSION: &str = "mida.runner-config-envelope/v3";
 /// Filename of the envelope inside the preflight output dir.
 pub const RUNNER_CONFIG_ENVELOPE_FILENAME: &str = "runner-config-envelope.json";
 /// Filename of the preflight report inside the preflight output dir.
 pub const PREFLIGHT_REPORT_FILENAME: &str = "preflight.json";
 /// Emitted `$schema` reference of the envelope.
 pub const RUNNER_CONFIG_ENVELOPE_SCHEMA_REF: &str = "./runner-config-envelope.schema.json";
+/// The controlled relative identity of the verifier: always the CLI sibling.
+pub const VERIFIER_SOURCE_TOKEN: &str = "<cli-dir>/mida-acceptance.exe";
 
 /// Fixed policy of the two-sample Oreans runner (frozen for P7).
 ///
@@ -85,7 +89,7 @@ pub fn bind_actual_config_to_envelope(
     Ok(())
 }
 
-/// The `mida.runner-config-envelope/v2` emitted by the runner side.
+/// The `mida.runner-config-envelope/v3` emitted by the runner side.
 ///
 /// `deny_unknown_fields` + required fields: a tampered envelope (unknown
 /// field, missing field) fails closed at deserialization.
@@ -103,9 +107,15 @@ pub struct RunnerConfigEnvelope {
     pub cli_binary_sha256: String,
     /// Tool revision (git HEAD) the run is pinned to.
     pub tool_revision: String,
+    /// Controlled relative identity of the verifier (always the CLI
+    /// sibling; see [`VERIFIER_SOURCE_TOKEN`]).
+    pub verifier_source: String,
+    /// Canonical path of the verifier sibling at staging (P6.3.2): the
+    /// launch re-resolves the sibling and compares BOTH path and hash.
+    pub verifier_path: String,
     /// SHA-256 of the independent acceptance verifier binary pinned at
-    /// staging (P6.3.1): the launch and PE-evidence paths fail closed unless
-    /// the verifier they resolve hashes to exactly this.
+    /// staging: the launch and PE-evidence paths fail closed unless the
+    /// verifier they resolve hashes to exactly this.
     pub verifier_sha256: String,
 }
 
@@ -115,6 +125,7 @@ impl RunnerConfigEnvelope {
         runner_config: &mida_core::runner_config::RunnerConfig,
         cli_binary_sha256: &str,
         tool_revision: &str,
+        verifier_path: &str,
         verifier_sha256: &str,
     ) -> RunnerConfigEnvelope {
         let digest = mida_core::runner_config::runner_config_digest(runner_config);
@@ -125,6 +136,8 @@ impl RunnerConfigEnvelope {
             runner_config_digest: digest,
             cli_binary_sha256: cli_binary_sha256.to_lowercase(),
             tool_revision: tool_revision.to_string(),
+            verifier_source: VERIFIER_SOURCE_TOKEN.to_string(),
+            verifier_path: verifier_path.to_string(),
             verifier_sha256: verifier_sha256.to_lowercase(),
         }
     }
@@ -202,28 +215,72 @@ pub struct PreflightCaseGate {
     pub candidate_output: String,
 }
 
-/// Resolve the `mida-acceptance` verifier binary.
+/// Resolve the `mida-acceptance` verifier binary (P6.3.2 unique production
+/// resolver).
 ///
-/// P6.3.1: the production resolution NEVER consults `MIDA_ACCEPTANCE_BIN`
-/// (a caller-controllable environment override would let an untrusted
-/// verifier substitute itself for the independent one). Production uses a
-/// sibling `mida-acceptance(.exe)` next to the CLI binary, then PATH. Tests
-/// inject the verifier explicitly through `--acceptance-bin` or the
-/// attestation/bundle parameters — never through the environment.
-pub fn resolve_acceptance_bin() -> PathBuf {
-    if let Ok(current_exe) = std::env::current_exe() {
-        if let Some(parent) = current_exe.parent() {
-            let sibling = parent.join("mida-acceptance.exe");
-            if sibling.exists() {
-                return sibling;
-            }
-            let sibling_naked = parent.join("mida-acceptance");
-            if sibling_naked.exists() {
-                return sibling_naked;
-            }
-        }
+/// The verifier can ONLY be the exact sibling `mida-acceptance.exe` of the
+/// running `mida-cli` binary. The resolver:
+///
+/// - never consults `MIDA_ACCEPTANCE_BIN` or any other environment variable;
+/// - never accepts a caller-supplied path;
+/// - never falls back to PATH;
+/// - returns a hard error when the sibling is missing, is not a regular
+///   file, or does not canonicalize to exactly the expected sibling path.
+///
+/// The trust root is the deployment unit: whoever controls the `mida-cli`
+/// install controls the sibling `mida-acceptance.exe` beside it (replacing
+/// the sibling is equivalent to replacing the CLI itself — host trust, not
+/// a CLI interface bypass).
+pub fn resolve_acceptance_bin() -> anyhow::Result<PathBuf> {
+    let current_exe = std::env::current_exe()
+        .context("cannot resolve the current executable to locate the verifier sibling")?;
+    resolve_acceptance_bin_from_cli(&current_exe)
+}
+
+/// The sibling-only resolver for a given CLI executable (testable). See
+/// [`resolve_acceptance_bin`] for the security contract.
+pub fn resolve_acceptance_bin_from_cli(cli_exe: &Path) -> anyhow::Result<PathBuf> {
+    let parent = cli_exe.parent().ok_or_else(|| {
+        anyhow!(
+            "current executable {} has no parent directory",
+            cli_exe.display()
+        )
+    })?;
+    let expected = parent.join("mida-acceptance.exe");
+    let canonical = std::fs::canonicalize(&expected)
+        .with_context(|| format!("verifier sibling {} does not exist", expected.display()))?;
+    let meta = std::fs::metadata(&canonical)
+        .with_context(|| format!("cannot stat verifier sibling {}", canonical.display()))?;
+    if !meta.is_file() {
+        bail!(
+            "verifier sibling {} is not a regular file; refusing to use it as the \
+             independent verifier",
+            canonical.display()
+        );
     }
-    PathBuf::from("mida-acceptance")
+    // Canonical path must be exactly `cli_dir/mida-acceptance.exe` (the
+    // controlled relative identity), not a re-link, symlink escape, or any
+    // other location.
+    let expected_canonical_parent = std::fs::canonicalize(parent)
+        .with_context(|| format!("cannot canonicalize CLI directory {}", parent.display()))?;
+    let expected_full = expected_canonical_parent.join("mida-acceptance.exe");
+    if canonical != expected_full {
+        bail!(
+            "verifier resolves to {} which is not exactly the CLI sibling {}; \
+             path drift is refused",
+            canonical.display(),
+            expected_full.display()
+        );
+    }
+    Ok(canonical)
+}
+
+/// Resolve the verifier sibling and recompute its SHA-256 (used by the
+/// envelope, the launch attestation and the bundle PE-evidence path).
+pub fn resolve_verifier_identity() -> anyhow::Result<(PathBuf, String)> {
+    let verifier = resolve_acceptance_bin()?;
+    let sha = sha256_file(&verifier)?;
+    Ok((verifier, sha))
 }
 
 /// Outcome of the envelope reuse policy (P6.3-C): the envelope file is
@@ -277,6 +334,8 @@ pub fn envelope_reuse_policy(
             .cli_binary_sha256
             .eq_ignore_ascii_case(&candidate.cli_binary_sha256)
         || existing.tool_revision != candidate.tool_revision
+        || existing.verifier_source != candidate.verifier_source
+        || existing.verifier_path != candidate.verifier_path
         || !existing
             .verifier_sha256
             .eq_ignore_ascii_case(&candidate.verifier_sha256)
@@ -311,11 +370,8 @@ pub fn run_offline_preflight(
     repo_root: &Path,
     toolchain_pin_file: &Path,
     expected_toolchain: &str,
-    acceptance_bin: Option<&Path>,
 ) -> anyhow::Result<bool> {
-    let verifier = acceptance_bin
-        .map(Path::to_path_buf)
-        .unwrap_or_else(resolve_acceptance_bin);
+    let (verifier, _) = resolve_verifier_identity()?;
     // P6.3-C: fail-closed reuse — first creation only when the file is
     // absent; an existing envelope must parse strictly and match the
     // would-be envelope field-by-field. Any failure preserves the original
@@ -465,8 +521,6 @@ pub struct LaunchAttestationContext<'a> {
     pub cli_binary: &'a Path,
     /// The ACTUAL runner config built from the parsed `/unpack` arguments.
     pub runner_config: &'a mida_core::runner_config::RunnerConfig,
-    /// Verifier override (tests); `None` resolves the acceptance binary.
-    pub acceptance_bin: Option<&'a Path>,
 }
 
 /// The unique evidence context produced by a successful launch attestation
@@ -791,27 +845,42 @@ pub fn attest_ready_before_launch(
     Ok(context)
 }
 
-/// Resolve the verifier this run would use, compute its SHA-256, and fail
-/// closed unless it matches the envelope-pinned verifier identity (P6.3.1).
+/// Resolve the verifier this run would use (unique CLI-sibling resolver),
+/// then fail closed unless its canonical path identity AND SHA-256 both
+/// match the envelope-pinned verifier (P6.3.2: path + hash, not hash alone).
 fn verify_verifier_identity(
-    ctx: &LaunchAttestationContext<'_>,
+    _ctx: &LaunchAttestationContext<'_>,
     envelope: &RunnerConfigEnvelope,
 ) -> anyhow::Result<String> {
-    let verifier = ctx
-        .acceptance_bin
-        .map(Path::to_path_buf)
-        .unwrap_or_else(resolve_acceptance_bin);
-    let sha = sha256_file(&verifier).with_context(|| {
+    let (verifier, sha) = resolve_verifier_identity()?;
+    // Path identity: the resolved sibling must be the recorded path AND the
+    // controlled relative source must match.
+    if envelope.verifier_source != VERIFIER_SOURCE_TOKEN {
+        bail!(
+            "envelope verifier_source {:?} != {VERIFIER_SOURCE_TOKEN}; source drift is refused",
+            envelope.verifier_source
+        );
+    }
+    let resolved_canonical = std::fs::canonicalize(&verifier).with_context(|| {
         format!(
-            "cannot digest the acceptance verifier {}",
+            "cannot canonicalize resolved verifier {}",
             verifier.display()
         )
     })?;
+    let recorded = PathBuf::from(&envelope.verifier_path);
+    if resolved_canonical != recorded {
+        bail!(
+            "acceptance verifier resolves to {} which != the envelope-pinned path {}; \
+             verifier path drift is refused",
+            resolved_canonical.display(),
+            recorded.display()
+        );
+    }
     if !sha.eq_ignore_ascii_case(&envelope.verifier_sha256) {
         bail!(
             "acceptance verifier {} (sha {sha}) does not match the envelope-pinned \
-             verifier {}; verifier replacement, path drift or hash drift is refused",
-            verifier.display(),
+             verifier sha {}; verifier replacement or hash drift is refused",
+            resolved_canonical.display(),
             envelope.verifier_sha256
         );
     }
@@ -828,10 +897,7 @@ fn rerun_verifier(
     target_case_id: &str,
     ctx: &LaunchAttestationContext<'_>,
 ) -> anyhow::Result<()> {
-    let verifier = ctx
-        .acceptance_bin
-        .map(Path::to_path_buf)
-        .unwrap_or_else(resolve_acceptance_bin);
+    let (verifier, _) = resolve_verifier_identity()?;
     let envelope_path = output_dir.join(RUNNER_CONFIG_ENVELOPE_FILENAME);
     let mut cmd = Command::new(&verifier);
     cmd.arg("preflight")
@@ -932,15 +998,10 @@ fn evidence_members(candidate: &Path) -> anyhow::Result<Vec<(String, PathBuf)>> 
 
 /// Emit the PE evidence sidecar through the independent acceptance binary
 /// (`mida-acceptance oreans-pe-evidence <candidate> --report <dest>`).
-/// Exit 0/2 are verifiable outcomes; anything else fails closed.
-fn emit_pe_evidence(
-    candidate: &Path,
-    destination: &Path,
-    acceptance_bin: Option<&Path>,
-) -> anyhow::Result<()> {
-    let verifier = acceptance_bin
-        .map(Path::to_path_buf)
-        .unwrap_or_else(resolve_acceptance_bin);
+/// The verifier is the unique CLI sibling (never env/caller/PATH). Exit 0/2
+/// are verifiable outcomes; anything else fails closed.
+fn emit_pe_evidence(candidate: &Path, destination: &Path) -> anyhow::Result<()> {
+    let (verifier, _) = resolve_verifier_identity()?;
     let status = Command::new(&verifier)
         .arg("oreans-pe-evidence")
         .arg(candidate)
@@ -977,16 +1038,15 @@ fn emit_pe_evidence(
 /// attestation context. Returns the bundle manifest path.
 pub fn complete_run_evidence(
     context: RunEvidenceContext,
-    acceptance_bin: Option<&Path>,
     candidate: &Path,
 ) -> anyhow::Result<PathBuf> {
-    // P6.3.1: the PE-evidence verifier must be the envelope-pinned identity
-    // (no unbound environment override).
-    verify_bundle_verifier_identity(&context, acceptance_bin)?;
+    // P6.3.2: the PE-evidence verifier must be the attested CLI-sibling
+    // identity (path + hash) — no env, no caller path, no PATH.
+    verify_bundle_verifier_identity(&context)?;
 
     let members = evidence_members(candidate)?;
     let pe_evidence_path = candidate.with_extension("pe_evidence.json");
-    emit_pe_evidence(candidate, &pe_evidence_path, acceptance_bin)?;
+    emit_pe_evidence(candidate, &pe_evidence_path)?;
     for (name, path) in &members {
         if !path.is_file() {
             bail!(
@@ -1016,25 +1076,15 @@ pub fn complete_run_evidence(
     Ok(bundle_output)
 }
 
-/// Fail closed unless the verifier this bundle run would use hashes to the
-/// context's attested verifier identity (P6.3.1).
-fn verify_bundle_verifier_identity(
-    context: &RunEvidenceContext,
-    acceptance_bin: Option<&Path>,
-) -> anyhow::Result<()> {
-    let verifier = acceptance_bin
-        .map(Path::to_path_buf)
-        .unwrap_or_else(resolve_acceptance_bin);
-    let sha = sha256_file(&verifier).with_context(|| {
-        format!(
-            "cannot digest the acceptance verifier {}",
-            verifier.display()
-        )
-    })?;
+/// Fail closed unless the verifier this bundle run would use is the unique
+/// CLI sibling AND matches the context's attested verifier identity (path +
+/// hash, P6.3.2).
+fn verify_bundle_verifier_identity(context: &RunEvidenceContext) -> anyhow::Result<()> {
+    let (verifier, sha) = resolve_verifier_identity()?;
     if !sha.eq_ignore_ascii_case(context.verifier_sha256()) {
         bail!(
             "acceptance verifier {} (sha {sha}) does not match the attested verifier {}; \
-             verifier replacement, path drift or hash drift is refused",
+             verifier replacement or hash drift is refused",
             verifier.display(),
             context.verifier_sha256()
         );
@@ -1081,4 +1131,135 @@ pub fn current_tool_revision(repo_root: &Path) -> anyhow::Result<String> {
         bail!("git HEAD is empty in {}", repo_root.display());
     }
     Ok(revision)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "mida_resolver_{tag}_{}_{}",
+            std::process::id(),
+            nanos
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write(path: &Path, bytes: &[u8]) {
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// A fake "mida-acceptance.exe" that is NOT the real binary — used to
+    /// prove the resolver only ever accepts the exact sibling and never a
+    /// PATH entry or a byte-copy elsewhere.
+    fn fake_acceptance(dir: &Path) -> PathBuf {
+        let p = dir.join("mida-acceptance.exe");
+        write(&p, b"FAKE-ACCEPTANCE-1");
+        p
+    }
+
+    #[test]
+    fn resolver_accepts_exact_sibling_regular_file() {
+        let dir = temp_dir("ok");
+        let cli = dir.join("mida-cli.exe");
+        write(&cli, b"CLI");
+        let sibling = fake_acceptance(&dir);
+        let resolved = resolve_acceptance_bin_from_cli(&cli).expect("sibling resolves");
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(&sibling).unwrap(),
+            "must resolve to the exact sibling"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn resolver_hard_fails_when_sibling_missing() {
+        let dir = temp_dir("missing");
+        let cli = dir.join("mida-cli.exe");
+        write(&cli, b"CLI");
+        let err = resolve_acceptance_bin_from_cli(&cli).expect_err("missing sibling must fail");
+        assert!(err.to_string().contains("does not exist"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn resolver_hard_fails_when_sibling_not_regular() {
+        let dir = temp_dir("notreg");
+        let cli = dir.join("mida-cli.exe");
+        write(&cli, b"CLI");
+        let sibling = dir.join("mida-acceptance.exe");
+        std::fs::create_dir(&sibling).unwrap(); // a directory, not a file
+        let err = resolve_acceptance_bin_from_cli(&cli).expect_err("dir sibling must fail");
+        assert!(err.to_string().contains("not a regular file"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn resolver_rejects_path_drift_away_from_sibling() {
+        let dir = temp_dir("drift");
+        let cli = dir.join("mida-cli.exe");
+        write(&cli, b"CLI");
+        // A verifier placed at the sibling path IS accepted; but a copy of the
+        // same bytes at ANY OTHER path must never be selected.
+        fake_acceptance(&dir);
+        let other = dir.join("somewhere-else/mida-acceptance.exe");
+        std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+        write(&other, b"FAKE-ACCEPTANCE-1");
+        // Resolver still returns the sibling, never the other copy.
+        let resolved = resolve_acceptance_bin_from_cli(&cli).expect("sibling wins");
+        assert_ne!(resolved, other);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn resolver_never_consults_path() {
+        let dir = temp_dir("path");
+        let cli = dir.join("mida-cli.exe");
+        write(&cli, b"CLI");
+        let sibling = fake_acceptance(&dir);
+        // A DIFFERENT fake acceptance in a PATH directory must be ignored.
+        let path_dir = dir.join("path-dir");
+        std::fs::create_dir_all(&path_dir).unwrap();
+        let in_path = path_dir.join("mida-acceptance.exe");
+        write(&in_path, b"PATH-ACCEPTANCE-DIFFERENT");
+        // Override PATH for this process.
+        let old_path = std::env::var_os("PATH").clone();
+        let mut paths =
+            std::env::split_paths(&old_path.clone().unwrap_or_default()).collect::<Vec<_>>();
+        paths.push(path_dir.clone());
+        std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
+        let resolved = resolve_acceptance_bin_from_cli(&cli).expect("sibling resolves");
+        assert_eq!(resolved, std::fs::canonicalize(&sibling).unwrap());
+        match old_path {
+            Some(p) => std::env::set_var("PATH", p),
+            None => std::env::remove_var("PATH"),
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn resolver_rejects_sibling_that_is_a_byte_copy_to_another_path() {
+        // The resolver must only select the exact sibling; a byte-identical
+        // copy placed at a sibling-adjacent path is not the sibling.
+        let dir = temp_dir("bytecopy");
+        let cli = dir.join("mida-cli.exe");
+        write(&cli, b"CLI");
+        let sibling = fake_acceptance(&dir);
+        let real_dir = dir.join("real");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let other = real_dir.join("acceptance-copy.exe");
+        write(&other, &std::fs::read(&sibling).unwrap());
+        let resolved = resolve_acceptance_bin_from_cli(&cli).expect("sibling resolves");
+        assert_eq!(resolved, std::fs::canonicalize(&sibling).unwrap());
+        assert_ne!(resolved, other, "a byte copy elsewhere is never selected");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

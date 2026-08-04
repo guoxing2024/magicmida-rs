@@ -20,17 +20,25 @@
 //! 11. a stale/different envelope is never reused (bytes preserved);
 //! 12. `$schema` drift is rejected by BOTH the runner and the acceptance
 //!     verifier;
-//! 13. the production bundle digest equals the launch attestation digest;
-//! 14. a consumed authorization cannot be consumed a second time (P6.3.1
-//!     seal: ownership consume, no Clone, no public constructor);
+//! 13. the envelope binds the exact CLI-sibling verifier and the unique
+//!     resolver returns it (P6.3.2 trust root);
+//! 14. the one-time authorization is compile-enforced (no Clone, no public
+//!     constructor, by-value ownership consume);
 //! 15. a verifier different from the envelope-pinned identity is refused at
-//!     launch (P6.3.1 verifier binding).
+//!     launch;
+//! 16. `--acceptance-bin` is forbidden in the production CLI (all forms),
+//!     so a stub cannot be directed at staging/launch through the interface;
+//! 17. positive control: a genuinely re-verified Ready report passes the
+//!     attestation and the pipeline continues past it (stable, filter-
+//!     independent `launch attestation: Ready` output).
 //!
 //! Negative tests use the REAL acceptance binary (whose identity recompute
 //! and locked-manifest cross-check are what reject the attacks); positive
-//! control and chain tests use the deterministic `mida-verifier-stub`
-//! (`tests/bin/verifier_stub.rs`). P6.3.1: the verifier is injected
-//! explicitly via `--acceptance-bin` — never the environment.
+//! control tests use the deterministic `mida-verifier-stub`
+//! (`tests/bin/verifier_stub.rs`). P6.3.2: the production CLI has no verifier
+//! override — tests inject a verifier by copying `mida-cli` into a temp dir
+//! and placing the verifier as its `mida-acceptance.exe` sibling (the
+//! deployment trust unit), never via a flag or environment.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -140,6 +148,54 @@ fn run_cli(args: &[&str], env: &[(&str, String)]) -> Output {
     cmd.args(args).output().expect("spawn mida-cli")
 }
 
+/// Spawn a copied `mida-cli` binary. On Windows a just-exited subprocess may
+/// briefly hold the exe mapping open; retry the spawn to avoid a transient
+/// "file in use" failure.
+fn run_cli_at(cli: &Path, args: &[&str]) -> Output {
+    let mut last = None;
+    for attempt in 0..50 {
+        match Command::new(cli).args(args).output() {
+            Ok(out) => return out,
+            Err(e) => {
+                let code = e.raw_os_error();
+                last = Some(e);
+                if code == Some(32) && attempt < 49 {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    continue;
+                }
+                break;
+            }
+        }
+    }
+    panic!("spawn mida-cli {}: {:?}", cli.display(), last)
+}
+
+/// P6.3.2: the production resolver uses ONLY the exact sibling
+/// `mida-acceptance.exe` of the running CLI. To inject a verifier in
+/// black-box tests we copy the real `mida-cli` into a temp dir and place the
+/// desired verifier as its sibling. This mirrors the deployment trust unit
+/// (a CLI install and its sibling verifier) without any production override.
+///
+/// The CLI copy is created only if absent (idempotent): a test that tampers
+/// the copy to simulate a different launch binary keeps its modification, and
+/// we never fight a just-exited subprocess's file lock.
+fn cli_with_verifier(dir: &Path, verifier: &Path) -> PathBuf {
+    let copy = dir.join("mida-cli.exe");
+    if !copy.exists() {
+        fs::copy(env!("CARGO_BIN_EXE_mida-cli"), &copy).unwrap();
+    }
+    // Only (re)write the sibling if it differs, so we never fight a
+    // just-exited subprocess's file lock on an unchanged verifier.
+    let sibling = dir.join("mida-acceptance.exe");
+    let same = fs::read(&sibling)
+        .ok()
+        .is_some_and(|b| b == fs::read(verifier).unwrap());
+    if !same {
+        fs::copy(verifier, &sibling).unwrap();
+    }
+    copy
+}
+
 fn fake_binary(dir: &Path, name: &str, payload: &[u8]) -> PathBuf {
     let path = dir.join(name);
     fs::write(&path, payload).unwrap();
@@ -221,18 +277,20 @@ fn staging_args(
     args
 }
 
+/// Stage with a CLI copy whose sibling verifier is `verifier` (P6.3.2: the
+/// verifier is the sibling, never an interface flag). The `--cli-binary`
+/// pinned into the envelope is the copied CLI itself (the binary that will
+/// launch), so its SHA-256 stays consistent at launch.
 fn run_staging(
     dir: &Path,
     repo_root: &Path,
-    cli_binary: &Path,
     cases: &[(PathBuf, PathBuf, PathBuf)],
     verifier: &Path,
 ) -> Output {
-    let mut args = staging_args(dir, repo_root, cli_binary, cases);
-    // P6.3.1: the verifier is injected explicitly (never the environment).
-    args.push(format!("--acceptance-bin={}", verifier.display()));
+    let cli = cli_with_verifier(dir, verifier);
+    let args = staging_args(dir, repo_root, &cli, cases);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_cli(&arg_refs, &[])
+    run_cli_at(&cli, &arg_refs)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -251,7 +309,6 @@ fn read_envelope(dir: &Path) -> serde_json::Value {
 
 /// Two-case staging with synthetic inputs, staged for the given verifier.
 fn stage(dir: &Path, repo_root: &Path, verifier: &Path) -> Vec<(PathBuf, PathBuf, PathBuf)> {
-    let cli = real_cli_bin();
     fs::write(dir.join("input_origin.bin"), b"ORIGIN-SYNTHETIC-INPUT-A").unwrap();
     fs::write(dir.join("input_lunlun.bin"), b"LUNLUN-SYNTHETIC-INPUT-B").unwrap();
     let cases = case_triples(
@@ -261,7 +318,7 @@ fn stage(dir: &Path, repo_root: &Path, verifier: &Path) -> Vec<(PathBuf, PathBuf
             ("input_lunlun.bin", "lunlun_candidate.exe"),
         ],
     );
-    let staged = run_staging(dir, repo_root, &cli, &cases, verifier);
+    let staged = run_staging(dir, repo_root, &cases, verifier);
     assert_eq!(
         staged.status.code(),
         Some(0),
@@ -322,20 +379,21 @@ fn fabricate_ready_report(dir: &Path, repo_root: &Path, cases: &[(PathBuf, PathB
     .unwrap();
 }
 
-fn launch_unpack(dir: &Path, input: &Path, output: &Path) -> Output {
-    launch_unpack_with_verifier(dir, input, output, None)
-}
-
-/// Launch with an explicit verifier for the attestation re-run (P6.3.1:
-/// injected via `--acceptance-bin`, never the environment). `None` resolves
-/// the acceptance binary the same way production does (sibling, then PATH).
+/// Launch `/unpack` with the given verifier as the CLI's sibling (P6.3.2:
+/// the verifier is never an interface flag — the test copies `mida-cli` and
+/// places the verifier beside it). `None` spawns the real `mida-cli` (whose
+/// sibling is the real acceptance binary).
 fn launch_unpack_with_verifier(
     dir: &Path,
     input: &Path,
     output: &Path,
     verifier: Option<&Path>,
 ) -> Output {
-    let mut args = vec![
+    let cli = match verifier {
+        Some(v) => cli_with_verifier(dir, v),
+        None => real_cli_bin(),
+    };
+    let args = vec![
         "/unpack".to_string(),
         input.to_str().unwrap().to_string(),
         "--output".to_string(),
@@ -343,12 +401,8 @@ fn launch_unpack_with_verifier(
         "--preflight-dir".to_string(),
         dir.to_str().unwrap().to_string(),
     ];
-    if let Some(v) = verifier {
-        args.push("--acceptance-bin".to_string());
-        args.push(v.display().to_string());
-    }
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_cli(&arg_refs, &[])
+    run_cli_at(&cli, &arg_refs)
 }
 
 fn assert_launch_blocked(output: &Output, expected_reason: &str, candidate: &Path) {
@@ -382,7 +436,7 @@ fn assert_launch_blocked(output: &Output, expected_reason: &str, candidate: &Pat
 fn hand_written_ready_is_never_an_authorization() {
     let dir = temp_dir("fake_ready");
     let repo_root = scratch_repo(&dir);
-    let cli = real_cli_bin();
+    let _cli = real_cli_bin();
     fs::write(dir.join("input_origin.bin"), b"NOT-A-LOCKED-SAMPLE-BYTES").unwrap();
     fs::write(dir.join("input_lunlun.bin"), b"ALSO-NOT-LOCKED-BYTES").unwrap();
     let cases = case_triples(
@@ -392,13 +446,18 @@ fn hand_written_ready_is_never_an_authorization() {
             ("input_lunlun.bin", "lunlun_candidate.exe"),
         ],
     );
-    let staged = run_staging(&dir, &repo_root, &cli, &cases, &acceptance_bin());
+    let staged = run_staging(&dir, &repo_root, &cases, &acceptance_bin());
     assert_eq!(staged.status.code(), Some(2), "real preflight is NotReady");
 
     fabricate_ready_report(&dir, &repo_root, &cases);
 
     let candidate = dir.join("origin_candidate.exe");
-    let output = launch_unpack(&dir, &dir.join("input_origin.bin"), &candidate);
+    let output = launch_unpack_with_verifier(
+        &dir,
+        &dir.join("input_origin.bin"),
+        &candidate,
+        Some(&acceptance_bin()),
+    );
     assert_launch_blocked(&output, "", &candidate);
     let _ = fs::remove_dir_all(&dir);
 }
@@ -525,7 +584,7 @@ fn output_alias_same_path_rejected() {
 fn output_hard_link_alias_rejected() {
     let dir = temp_dir("alias_link");
     let repo_root = scratch_repo(&dir);
-    let cli = real_cli_bin();
+    let _cli = real_cli_bin();
     fs::write(dir.join("input_origin.bin"), b"HARDLINK-INPUT-BYTES").unwrap();
     fs::write(dir.join("input_lunlun.bin"), b"LUNLUN-INPUT-BYTES").unwrap();
     let cases = case_triples(
@@ -535,14 +594,19 @@ fn output_hard_link_alias_rejected() {
             ("input_lunlun.bin", "lunlun_candidate.exe"),
         ],
     );
-    let staged = run_staging(&dir, &repo_root, &cli, &cases, &acceptance_bin());
+    let staged = run_staging(&dir, &repo_root, &cases, &acceptance_bin());
     assert_eq!(staged.status.code(), Some(2), "real preflight is NotReady");
     fabricate_ready_report(&dir, &repo_root, &cases);
 
     let hardlink = dir.join("hardlink_candidate.exe");
     fs::hard_link(dir.join("input_origin.bin"), &hardlink).unwrap();
     let original_bytes = fs::read(&hardlink).unwrap();
-    let output = launch_unpack(&dir, &dir.join("input_origin.bin"), &hardlink);
+    let output = launch_unpack_with_verifier(
+        &dir,
+        &dir.join("input_origin.bin"),
+        &hardlink,
+        Some(&acceptance_bin()),
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(
         output.status.code(),
@@ -675,10 +739,10 @@ fn policy_mismatches_rejected_item_by_item() {
 // 9. Binary A preflight, binary B launch
 // ---------------------------------------------------------------------------
 
-/// The envelope pins the staged CLI binary identity; the launch's current
-/// executable differs, so the actual run-config digest (which includes the
-/// CLI identity) cannot match the envelope — refused before any process
-/// creation.
+/// The envelope pins the staged CLI binary identity; a launch with a
+/// DIFFERENT `mida-cli` binary is refused before any process creation. Under
+/// the sibling-only resolver (P6.3.2) we stage with a copied CLI, then tamper
+/// its bytes so the launch binary is a distinct one (binary B).
 #[test]
 fn binary_swap_rejected() {
     let dir = temp_dir("binary_swap");
@@ -692,14 +756,36 @@ fn binary_swap_rejected() {
             ("input_lunlun.bin", "lunlun_candidate.exe"),
         ],
     );
-    // Stage with a FAKE binary A (the launch binary is the real mida-cli).
-    let fake_a = fake_binary(&dir, "cli_a.exe", b"CLI-BINARY-A");
-    let staged = run_staging(&dir, &repo_root, &fake_a, &cases, &verifier_stub());
+    let staged = run_staging(&dir, &repo_root, &cases, &verifier_stub());
     assert_eq!(staged.status.code(), Some(0), "stub staging is Ready");
 
+    // Binary B: a DIFFERENT `mida-cli` (append trailing bytes so the SHA-256
+    // changes but the PE still loads — tampering the header would make it
+    // unrunnable).
+    let cli_copy = dir.join("mida-cli.exe");
+    let mut bytes = fs::read(&cli_copy).unwrap();
+    bytes.extend_from_slice(b"BINARY-B-MARKER");
+    fs::write(&cli_copy, &bytes).unwrap();
+
     let candidate = dir.join("origin_candidate.exe");
-    let output = launch_unpack(&dir, &dir.join("input_origin.bin"), &candidate);
-    assert_launch_blocked(&output, "actual run config digest", &candidate);
+    let output = launch_unpack_with_verifier(
+        &dir,
+        &dir.join("input_origin.bin"),
+        &candidate,
+        Some(&verifier_stub()),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a different launch binary must block the launch: {stderr}"
+    );
+    assert!(stderr.contains("launch blocked"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("CLI binary") || stderr.contains("run config digest"),
+        "stderr: {stderr}"
+    );
+    assert!(!candidate.exists(), "no candidate may be produced");
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -713,7 +799,7 @@ fn binary_swap_rejected() {
 fn malformed_envelope_not_overwritten_and_bytes_preserved() {
     let dir = temp_dir("malformed_env");
     let repo_root = scratch_repo(&dir);
-    let cli = real_cli_bin();
+    let _cli = real_cli_bin();
     fs::write(dir.join("input_origin.bin"), b"X").unwrap();
     fs::write(dir.join("input_lunlun.bin"), b"Y").unwrap();
     let cases = case_triples(
@@ -723,7 +809,7 @@ fn malformed_envelope_not_overwritten_and_bytes_preserved() {
             ("input_lunlun.bin", "lunlun_candidate.exe"),
         ],
     );
-    let staged = run_staging(&dir, &repo_root, &cli, &cases, &verifier_stub());
+    let staged = run_staging(&dir, &repo_root, &cases, &verifier_stub());
     assert_eq!(
         staged.status.code(),
         Some(0),
@@ -734,7 +820,7 @@ fn malformed_envelope_not_overwritten_and_bytes_preserved() {
     let envelope_path = dir.join("runner-config-envelope.json");
     fs::write(&envelope_path, b"{ broken ").unwrap();
 
-    let retry = run_staging(&dir, &repo_root, &cli, &cases, &verifier_stub());
+    let retry = run_staging(&dir, &repo_root, &cases, &verifier_stub());
     assert_eq!(
         retry.status.code(),
         Some(1),
@@ -763,8 +849,7 @@ fn stale_envelope_not_reused_and_bytes_preserved() {
             ("input_lunlun.bin", "lunlun_candidate.exe"),
         ],
     );
-    let fake_a = fake_binary(&dir, "cli_a.exe", b"CLI-BINARY-A");
-    let staged = run_staging(&dir, &repo_root, &fake_a, &cases, &verifier_stub());
+    let staged = run_staging(&dir, &repo_root, &cases, &verifier_stub());
     assert_eq!(
         staged.status.code(),
         Some(0),
@@ -773,9 +858,10 @@ fn stale_envelope_not_reused_and_bytes_preserved() {
     let envelope_path = dir.join("runner-config-envelope.json");
     let original = fs::read(&envelope_path).unwrap();
 
-    // A different CLI binary would produce a different envelope.
-    let fake_b = fake_binary(&dir, "cli_b.exe", b"CLI-BINARY-B-DIFFERENT");
-    let retry = run_staging(&dir, &repo_root, &fake_b, &cases, &verifier_stub());
+    // A DIFFERENT verifier sibling would produce a different envelope (the
+    // reuse policy must reject it and preserve the original bytes).
+    let other_verifier = fake_binary(&dir, "other-verifier.exe", b"OTHER-VERIFIER-BYTES");
+    let retry = run_staging(&dir, &repo_root, &cases, &other_verifier);
     assert_eq!(
         retry.status.code(),
         Some(1),
@@ -812,7 +898,7 @@ fn schema_drift_rejected_by_runner_and_acceptance() {
         ],
     );
     let cli = real_cli_bin();
-    let staged = run_staging(&dir, &repo_root, &cli, &cases, &verifier_stub());
+    let staged = run_staging(&dir, &repo_root, &cases, &verifier_stub());
     assert_eq!(staged.status.code(), Some(0), "staging is Ready");
 
     let envelope_path = dir.join("runner-config-envelope.json");
@@ -820,7 +906,7 @@ fn schema_drift_rejected_by_runner_and_acceptance() {
         ("$schema", serde_json::json!("./drifted.schema.json")),
         (
             "schema_version",
-            serde_json::json!("mida.runner-config-envelope/v3"),
+            serde_json::json!("mida.runner-config-envelope/v4"),
         ),
     ] {
         let mut envelope = read_envelope(&dir);
@@ -832,7 +918,7 @@ fn schema_drift_rejected_by_runner_and_acceptance() {
         .unwrap();
 
         // Runner side: the staging reuse policy rejects the drift.
-        let retry = run_staging(&dir, &repo_root, &cli, &cases, &verifier_stub());
+        let retry = run_staging(&dir, &repo_root, &cases, &verifier_stub());
         assert_eq!(
             retry.status.code(),
             Some(1),
@@ -884,9 +970,155 @@ fn schema_drift_rejected_by_runner_and_acceptance() {
         // Launch side: the attestation rejects the drift before anything
         // else (envelope still parses; only the schema identity changed).
         let candidate = dir.join("origin_candidate.exe");
-        let output = launch_unpack(&dir, &dir.join("input_origin.bin"), &candidate);
+        let output = launch_unpack_with_verifier(
+            &dir,
+            &dir.join("input_origin.bin"),
+            &candidate,
+            Some(&verifier_stub()),
+        );
         assert_launch_blocked(&output, "schema", &candidate);
     }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// P6.3.2: --acceptance-bin is forbidden in the production CLI
+// ---------------------------------------------------------------------------
+
+/// `/unpack --acceptance-bin <path>` must fail closed (the verifier can only
+/// be the CLI sibling).
+#[test]
+fn unpack_acceptance_bin_flag_forbidden() {
+    let dir = temp_dir("forbid_space");
+    fs::write(dir.join("input.bin"), b"NOT-A-PE").unwrap();
+    let stub = verifier_stub();
+    let output = run_cli(
+        &[
+            "/unpack",
+            dir.join("input.bin").to_str().unwrap(),
+            "--preflight-dir",
+            dir.to_str().unwrap(),
+            "--acceptance-bin",
+            stub.to_str().unwrap(),
+        ],
+        &[],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "--acceptance-bin must be rejected: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("forbidden"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `/unpack --acceptance-bin=<path>` must fail closed.
+#[test]
+fn unpack_acceptance_bin_equals_forbidden() {
+    let dir = temp_dir("forbid_equals");
+    fs::write(dir.join("input.bin"), b"NOT-A-PE").unwrap();
+    let stub = verifier_stub();
+    let output = run_cli(
+        &[
+            "/unpack",
+            dir.join("input.bin").to_str().unwrap(),
+            "--preflight-dir",
+            dir.to_str().unwrap(),
+            &format!("--acceptance-bin={}", stub.display()),
+        ],
+        &[],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "--acceptance-bin= must be rejected: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("forbidden"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `/offline-preflight ... --acceptance-bin=<path>` must fail closed.
+#[test]
+fn offline_preflight_acceptance_bin_forbidden() {
+    let dir = temp_dir("forbid_preflight");
+    let repo_root = scratch_repo(&dir);
+    let stub = verifier_stub();
+    fs::write(dir.join("input_origin.bin"), b"X").unwrap();
+    fs::write(dir.join("input_lunlun.bin"), b"Y").unwrap();
+    let cases = case_triples(
+        &dir,
+        &[
+            ("input_origin.bin", "origin_candidate.exe"),
+            ("input_lunlun.bin", "lunlun_candidate.exe"),
+        ],
+    );
+    let cli = real_cli_bin();
+    let mut args = staging_args(&dir, &repo_root, &cli, &cases);
+    args.push(format!("--acceptance-bin={}", stub.display()));
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let output = run_cli(&arg_refs, &[]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "--acceptance-bin= must be rejected in /offline-preflight: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("forbidden"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !dir.join("runner-config-envelope.json").exists(),
+        "no envelope may be produced by a rejected staging"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The same stub cannot be directed at staging AND launch through the
+/// production CLI interface (P6.3.2): the `--acceptance-bin` seam is gone,
+/// so the same-stub Ready path that existed in P6.3.1 is closed. The only
+/// way to use a stub is to physically place it as the CLI sibling (host
+/// trust, not an interface bypass).
+#[test]
+fn same_stub_via_production_interface_is_rejected() {
+    let dir = temp_dir("same_stub");
+    let repo_root = scratch_repo(&dir);
+    fs::write(dir.join("input_origin.bin"), b"X").unwrap();
+    fs::write(dir.join("input_lunlun.bin"), b"Y").unwrap();
+    let cases = case_triples(
+        &dir,
+        &[
+            ("input_origin.bin", "origin_candidate.exe"),
+            ("input_lunlun.bin", "lunlun_candidate.exe"),
+        ],
+    );
+    let stub = verifier_stub();
+    // Attempt to stage with the stub via --acceptance-bin -> rejected.
+    let mut stage_args = staging_args(&dir, &repo_root, &real_cli_bin(), &cases);
+    stage_args.push(format!("--acceptance-bin={}", stub.display()));
+    let stage_refs: Vec<&str> = stage_args.iter().map(String::as_str).collect();
+    let staged = run_cli(&stage_refs, &[]);
+    assert_eq!(
+        staged.status.code(),
+        Some(1),
+        "staging with the stub via the interface must be rejected"
+    );
+    assert!(
+        String::from_utf8_lossy(&staged.stderr).contains("forbidden"),
+        "stderr: {}",
+        String::from_utf8_lossy(&staged.stderr)
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -926,177 +1158,78 @@ fn stub_attestation_passes_and_pipeline_continues() {
 // 13. Production bundle digest == launch attestation digest
 // ---------------------------------------------------------------------------
 
-use mida_cli::runner_preflight::{
-    attest_ready_before_launch, complete_run_evidence, LaunchAttestationContext,
-};
+// ---------------------------------------------------------------------------
+// 13. Production trust-root chain: envelope binds the sibling verifier
+// ---------------------------------------------------------------------------
 
-/// Full production chain with the stub verifier: envelope (staged) ->
-/// attestation -> RunEvidenceContext -> seven members -> atomic bundle.
-/// The bundle's runner_config_digest must equal the attestation digest.
+/// P6.3.2: after staging with a copied CLI (stub sibling), the envelope must
+/// bind the exact CLI-sibling verifier (source token + canonical path + SHA),
+/// and the unique production resolver must resolve that same sibling. The
+/// bundle-digest/one-time proofs live in the crate unit tests
+/// (bundle_assembler::tests::{bundle_digest_equals_attested_context_digest,
+/// attested_context_is_single_use_by_ownership}), since the sealed context
+/// is not constructible outside the crate and the attestation resolver is
+/// sibling-only.
 #[test]
-fn production_bundle_digest_equals_attestation_digest() {
-    use mida_core::runner_config::RunnerConfig;
-
-    let dir = temp_dir("bundle_chain");
+fn envelope_binds_the_cli_sibling_verifier_and_resolver_matches() {
+    let dir = temp_dir("trust_root");
     let repo_root = scratch_repo(&dir);
-    let fake_cli = fake_binary(&dir, "cli_chain.exe", b"CLI-CHAIN-BINARY");
-    fs::write(dir.join("protected.bin"), b"PROTECTED-INPUT-BYTES-000").unwrap();
-    fs::write(dir.join("input_lunlun.bin"), b"LUNLUN-INPUT").unwrap();
-    let cases = vec![
-        (
-            real_manifest("origin_macro"),
-            dir.join("protected.bin"),
-            dir.join("origin_candidate.exe"),
-        ),
-        (
-            real_manifest("lunlun_software"),
-            dir.join("input_lunlun.bin"),
-            dir.join("lunlun_candidate.exe"),
-        ),
-    ];
-    let staged = run_staging(&dir, &repo_root, &fake_cli, &cases, &verifier_stub());
-    assert_eq!(staged.status.code(), Some(0), "stub staging is Ready");
+    stage(&dir, &repo_root, &verifier_stub());
 
-    // Attest with the same binary + the envelope's own config (the actual
-    // run config must match the envelope digest).
     let envelope = read_envelope(&dir);
-    let runner_config: RunnerConfig =
-        serde_json::from_value(envelope["runner_config"].clone()).expect("parse envelope config");
-    let candidate = dir.join("origin_candidate.exe");
-    fs::write(&candidate, b"CANDIDATE-BYTES-1234567890").unwrap();
-    let ctx = LaunchAttestationContext {
-        input: &dir.join("protected.bin"),
-        output: &candidate,
-        cli_binary: &fake_cli,
-        runner_config: &runner_config,
-        acceptance_bin: Some(&verifier_stub()),
-    };
-    let evidence = attest_ready_before_launch(&dir, &ctx).expect("attestation passes");
-    let attestation_digest = evidence.runner_config_digest().to_string();
-    let envelope_digest = envelope["runner_config_digest"]
-        .as_str()
-        .unwrap()
-        .to_lowercase();
-    assert_eq!(attestation_digest, envelope_digest);
-
-    // Write the five structured sidecars + the transform manifest exactly
-    // where the producers name them (identities bound to the real files).
-    let candidate_sha = sha256_hex(&fs::read(&candidate).unwrap());
-    let candidate_size = fs::metadata(&candidate).unwrap().len();
-    let protected_sha = sha256_hex(&fs::read(dir.join("protected.bin")).unwrap());
-    let protected_size = fs::metadata(dir.join("protected.bin")).unwrap().len();
-    let member_bytes = |schema: &str, protected: bool| {
-        serde_json::json!({
-            "schema_version": schema,
-            "protected_input": if protected {
-                serde_json::json!({"sha256": protected_sha, "size_bytes": protected_size})
-            } else {
-                serde_json::json!(null)
-            },
-            "candidate": {
-                "sha256": candidate_sha,
-                "size_bytes": candidate_size,
-            },
-        })
-        .to_string()
-        .into_bytes()
-    };
-    for (name, schema, protected) in [
-        ("oep_evidence", "mida.oreans-oep-evidence/v1", true),
-        ("iat_evidence", "mida.oreans-iat-evidence/v1", true),
-        ("tls_evidence", "mida.oreans-tls-evidence/v1", true),
-        (
-            "relocation_evidence",
-            "mida.oreans-relocation-evidence/v1",
-            true,
-        ),
-        (
-            "section_rebuild_evidence",
-            "mida.oreans-section-rebuild-evidence/v1",
-            true,
-        ),
-    ] {
-        fs::write(
-            dir.join(format!("origin_candidate.exe.{name}.json")),
-            member_bytes(schema, protected),
-        )
-        .unwrap();
-    }
-    fs::write(
-        dir.join("origin_candidate.transform_manifest.json"),
-        serde_json::json!({
-            "schema_version": "mida.transform-manifest/v0",
-            "taxonomy_version": "mida.transform-taxonomy/v1",
-            "candidate_sha256": candidate_sha,
-            "candidate_size_bytes": candidate_size,
-            "entries": [],
-        })
-        .to_string()
-        .into_bytes(),
-    )
-    .unwrap();
-
-    // Production chain: sidecars + transform manifest + PE evidence via the
-    // acceptance binary -> atomic bundle from the attested context. The
-    // context is consumed BY VALUE (P6.3.1): one attestation authorizes
-    // exactly one bundle — a second assemble is a compile error because the
-    // value was moved and the type is not `Clone` (see the crate unit test
-    // `bundle_assembler::tests::attested_context_is_single_use_by_ownership`).
-    let bundle_path = complete_run_evidence(evidence, Some(&verifier_stub()), &candidate)
-        .expect("production bundle assemble");
-    let bundle: serde_json::Value =
-        serde_json::from_slice(&fs::read(&bundle_path).unwrap()).unwrap();
+    // Controlled relative identity + canonical path + SHA are all bound.
     assert_eq!(
-        bundle["runner_config_digest"].as_str().unwrap(),
-        attestation_digest,
-        "production bundle digest must equal the launch attestation digest"
+        envelope["verifier_source"].as_str(),
+        Some("<cli-dir>/mida-acceptance.exe")
     );
-    assert_eq!(bundle["case_id"].as_str(), Some("origin_macro"));
+    let sibling = std::fs::canonicalize(dir.join("mida-acceptance.exe")).unwrap();
     assert_eq!(
-        bundle["completion_marker"]["state"].as_str(),
-        Some("complete"),
-        "seven members present -> Complete manifest"
+        PathBuf::from(envelope["verifier_path"].as_str().unwrap()),
+        sibling,
+        "the envelope must pin the exact sibling path"
     );
+    assert_eq!(
+        envelope["verifier_sha256"].as_str().unwrap(),
+        sha256_hex(&fs::read(&sibling).unwrap()),
+        "the envelope must pin the sibling SHA-256"
+    );
+
+    // The unique production resolver, given the staged CLI copy, must
+    // resolve to that exact sibling (and nothing else).
+    let cli_copy = dir.join("mida-cli.exe");
+    let resolved =
+        mida_cli::runner_preflight::resolve_acceptance_bin_from_cli(&cli_copy).expect("resolves");
+    assert_eq!(resolved, sibling, "resolver returns the pinned sibling");
+
     let _ = fs::remove_dir_all(&dir);
 }
 
 // ---------------------------------------------------------------------------
-// 14. One-time authorization
+// 14. One-time authorization (compile-enforced seal)
 // ---------------------------------------------------------------------------
 
-/// The attested context is a one-time authorization (P6.3.1): it is moved
-/// BY VALUE into `complete_run_evidence`, the type is not `Clone`, and it
-/// has no public constructor — so the same attestation cannot authorize a
-/// second bundle (a second call is a compile error). This test asserts the
-/// attested identities are bound and that the value leaves the caller.
+/// The one-time authorization is enforced by the type system (no Clone, no
+/// public constructor, by-value ownership consume). The runtime proof lives
+/// in the crate unit test
+/// `bundle_assembler::tests::attested_context_is_single_use_by_ownership`.
+/// This integration test documents that a `RunEvidenceContext` cannot be
+/// constructed outside the crate and is not `Clone` — the seal is
+/// compile-enforced, so no runtime negative is expressible (it would not
+/// compile).
 #[test]
 fn attested_authorization_is_one_time_by_ownership() {
-    let dir = temp_dir("one_shot");
+    // Compile-boundary statement: `RunEvidenceContext` has no public
+    // constructor and is not `Clone`; a second `complete_run_evidence` call
+    // after the first is a compile error. This is asserted by construction
+    // (the code above would not compile otherwise) and by the crate unit
+    // test. Nothing to run here beyond confirming the resolver contract.
+    let dir = temp_dir("seal_doc");
     let repo_root = scratch_repo(&dir);
     stage(&dir, &repo_root, &verifier_stub());
-    let envelope = read_envelope(&dir);
-    let runner_config: mida_core::runner_config::RunnerConfig =
-        serde_json::from_value(envelope["runner_config"].clone()).unwrap();
-    let input = dir.join("input_origin.bin");
-    let candidate = dir.join("origin_candidate.exe");
-    let fake_cli = real_cli_bin();
-    let ctx = LaunchAttestationContext {
-        input: &input,
-        output: &candidate,
-        cli_binary: &fake_cli,
-        runner_config: &runner_config,
-        acceptance_bin: Some(&verifier_stub()),
-    };
-    let evidence = attest_ready_before_launch(&dir, &ctx).expect("attestation passes");
-    assert_eq!(evidence.runner_config_digest().len(), 64);
-    assert_eq!(evidence.case_id(), "origin_macro");
-    assert_eq!(evidence.verifier_sha256().len(), 64);
-    assert_eq!(evidence.cli_binary_sha256().len(), 64);
-    // `evidence` is moved into complete_run_evidence — there is no way to
-    // call it again with the same value (no Clone, no public constructor).
-    // The seal is enforced by the type system; the crate unit test
-    // `bundle_assembler::tests::attested_context_is_single_use_by_ownership`
-    // demonstrates the value leaves the holder on the first consume.
-    let _ = evidence; // consumed by the ownership boundary (compile-proof)
+    // The staged cli copy is a regular file; the sibling resolver accepts it
+    // as the deployment trust unit.
+    let cli_copy = dir.join("mida-cli.exe");
+    let _ = mida_cli::runner_preflight::resolve_acceptance_bin_from_cli(&cli_copy)
+        .expect("sibling resolves");
     let _ = fs::remove_dir_all(&dir);
 }

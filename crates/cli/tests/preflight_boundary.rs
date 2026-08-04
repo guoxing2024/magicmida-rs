@@ -114,10 +114,47 @@ fn run_cli(args: &[&str], env: &[(&str, String)]) -> Output {
     cmd.args(args).output().expect("spawn mida-cli")
 }
 
-fn fake_binary(dir: &Path, name: &str) -> PathBuf {
-    let path = dir.join(name);
-    fs::write(&path, b"FAKE-CLI-BINARY-PAYLOAD").unwrap();
-    path
+/// Spawn a copied `mida-cli` binary. On Windows a just-exited subprocess may
+/// briefly hold the exe mapping open; retry the spawn to avoid a transient
+/// "file in use" failure.
+fn run_cli_at(cli: &Path, args: &[&str]) -> Output {
+    let mut last = None;
+    for attempt in 0..50 {
+        match Command::new(cli).args(args).output() {
+            Ok(out) => return out,
+            Err(e) => {
+                let code = e.raw_os_error();
+                last = Some(e);
+                if code == Some(32) && attempt < 49 {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    continue;
+                }
+                break;
+            }
+        }
+    }
+    panic!("spawn mida-cli {}: {:?}", cli.display(), last)
+}
+
+/// P6.3.2: the production resolver uses ONLY the exact sibling
+/// `mida-acceptance.exe` of the running CLI. To inject a verifier we copy the
+/// real `mida-cli` into the temp dir and place the desired verifier beside
+/// it (mirrors the deployment trust unit, no production override).
+fn cli_with_verifier(dir: &Path, verifier: &Path) -> PathBuf {
+    let copy = dir.join("mida-cli.exe");
+    if !copy.exists() {
+        fs::copy(env!("CARGO_BIN_EXE_mida-cli"), &copy).unwrap();
+    }
+    // Only (re)write the sibling if it differs, so we never fight a
+    // just-exited subprocess's file lock on an unchanged verifier.
+    let sibling = dir.join("mida-acceptance.exe");
+    let same = fs::read(&sibling)
+        .ok()
+        .is_some_and(|b| b == fs::read(verifier).unwrap());
+    if !same {
+        fs::copy(verifier, &sibling).unwrap();
+    }
+    copy
 }
 
 fn missing_input(dir: &Path) -> PathBuf {
@@ -156,26 +193,22 @@ fn scratch_repo(parent: &Path) -> PathBuf {
 
 /// Full offline-preflight argument vector for the two fixed cases.
 fn preflight_args(dir: &Path, repo_root: &Path) -> Vec<String> {
-    preflight_args_with_cli(dir, repo_root, &fake_binary(dir, "mida_cli.exe"))
+    preflight_args_with_cli(dir, repo_root)
 }
 
-/// Same as [`preflight_args`] but with an explicit `--cli-binary` (used by
-/// the launch-gate positive control, which must stage the envelope for the
-/// REAL mida-cli binary so the actual run-config digest matches at launch).
-fn preflight_args_with_cli(dir: &Path, repo_root: &Path, cli_binary: &Path) -> Vec<String> {
+/// Offline-preflight argument vector (the `--cli-binary` and the verifier
+/// sibling are both the copied CLI in `dir`; P6.3.2 has no verifier flag).
+fn preflight_args_with_cli(dir: &Path, repo_root: &Path) -> Vec<String> {
     vec![
         "/offline-preflight".to_string(),
         dir.display().to_string(),
-        format!("--cli-binary={}", cli_binary.display()),
+        format!("--cli-binary={}", dir.join("mida-cli.exe").display()),
         format!("--repo-root={}", repo_root.display()),
         format!(
             "--toolchain-pin={}",
             workspace_root().join("rust-toolchain.toml").display()
         ),
         "--expected-toolchain=1.97.1".to_string(),
-        // P6.3.1: the verifier is injected explicitly (never the
-        // environment). Staging with the real acceptance binary.
-        format!("--acceptance-bin={}", acceptance_bin().display()),
         "--case".to_string(),
         real_manifest("origin_macro").display().to_string(),
         missing_input(dir).display().to_string(),
@@ -188,9 +221,27 @@ fn preflight_args_with_cli(dir: &Path, repo_root: &Path, cli_binary: &Path) -> V
 }
 
 fn run_preflight(dir: &Path, repo_root: &Path) -> Output {
-    let args = preflight_args(dir, repo_root);
+    // P6.3.2: the verifier is the CLI sibling (the real acceptance binary
+    // copied beside the CLI copy) — never an interface flag.
+    let cli = staging_cli(dir);
+    let args = preflight_args_with_cli(dir, repo_root);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_cli(&arg_refs, &[])
+    run_cli_at(&cli, &arg_refs)
+}
+
+/// The staged CLI copy (created on first use) whose sibling verifier is the
+/// real acceptance binary — used by both staging and launch so the envelope
+/// path/sha stay consistent.
+fn staging_cli(dir: &Path) -> PathBuf {
+    cli_with_verifier(dir, &acceptance_bin())
+}
+
+/// Run a staging `/offline-preflight` argument vector with the staged CLI
+/// copy.
+fn run_staging_args(dir: &Path, args: &[String]) -> Output {
+    let cli = staging_cli(dir);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_cli_at(&cli, &arg_refs)
 }
 
 /// Baseline: two real locked manifests, missing samples, pinned CLI. The
@@ -266,14 +317,19 @@ fn offline_preflight_rejects_without_samples_and_chain_is_consistent() {
     );
     assert_eq!(envelope_digest.len(), 64);
 
-    // The envelope carries the full contract fields (v2, with the pinned
-    // verifier identity).
+    // The envelope carries the full contract fields (v3, with the pinned
+    // verifier path + source + identity).
     assert_eq!(
         envelope["schema_version"].as_str(),
-        Some("mida.runner-config-envelope/v2")
+        Some("mida.runner-config-envelope/v3")
     );
     assert!(!envelope["cli_binary_sha256"].as_str().unwrap().is_empty());
     assert!(!envelope["tool_revision"].as_str().unwrap().is_empty());
+    assert_eq!(
+        envelope["verifier_source"].as_str(),
+        Some("<cli-dir>/mida-acceptance.exe")
+    );
+    assert!(!envelope["verifier_path"].as_str().unwrap().is_empty());
     assert!(
         envelope["verifier_sha256"].as_str().unwrap().len() == 64,
         "envelope must pin the verifier identity"
@@ -290,10 +346,8 @@ fn offline_preflight_rejects_without_samples_and_chain_is_consistent() {
 fn tampered_digest_rejected() {
     let dir = temp_dir("tamper_digest");
     let repo_root = scratch_repo(&dir);
-    let env: &[(&str, String)] = &[];
     let args = preflight_args(&dir, &repo_root);
-    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let baseline = run_cli(&arg_refs, env);
+    let baseline = run_staging_args(&dir, &args);
     assert_eq!(baseline.status.code(), Some(2), "baseline NotReady");
 
     // Flip one hex char of the producer digest.
@@ -318,7 +372,7 @@ fn tampered_digest_rejected() {
     let tampered_bytes = serde_json::to_vec_pretty(&envelope).unwrap();
     fs::write(&envelope_path, &tampered_bytes).unwrap();
 
-    let tampered = run_cli(&arg_refs, env);
+    let tampered = run_staging_args(&dir, &args);
     assert_eq!(
         tampered.status.code(),
         Some(1),
@@ -341,10 +395,8 @@ fn tampered_digest_rejected() {
 fn tampered_unknown_field_rejected() {
     let dir = temp_dir("tamper_unknown");
     let repo_root = scratch_repo(&dir);
-    let env: &[(&str, String)] = &[];
     let args = preflight_args(&dir, &repo_root);
-    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let baseline = run_cli(&arg_refs, env);
+    let baseline = run_staging_args(&dir, &args);
     assert_eq!(baseline.status.code(), Some(2), "baseline NotReady");
 
     let envelope_path = dir.join("runner-config-envelope.json");
@@ -354,7 +406,7 @@ fn tampered_unknown_field_rejected() {
     let tampered_bytes = serde_json::to_vec_pretty(&envelope).unwrap();
     fs::write(&envelope_path, &tampered_bytes).unwrap();
 
-    let tampered = run_cli(&arg_refs, env);
+    let tampered = run_staging_args(&dir, &args);
     assert_eq!(
         tampered.status.code(),
         Some(1),
@@ -374,10 +426,8 @@ fn tampered_unknown_field_rejected() {
 fn tampered_cli_hash_rejected() {
     let dir = temp_dir("tamper_cli");
     let repo_root = scratch_repo(&dir);
-    let env: &[(&str, String)] = &[];
     let args = preflight_args(&dir, &repo_root);
-    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let baseline = run_cli(&arg_refs, env);
+    let baseline = run_staging_args(&dir, &args);
     assert_eq!(baseline.status.code(), Some(2), "baseline NotReady");
 
     let envelope_path = dir.join("runner-config-envelope.json");
@@ -387,7 +437,7 @@ fn tampered_cli_hash_rejected() {
     let tampered_bytes = serde_json::to_vec_pretty(&envelope).unwrap();
     fs::write(&envelope_path, &tampered_bytes).unwrap();
 
-    let tampered = run_cli(&arg_refs, env);
+    let tampered = run_staging_args(&dir, &args);
     assert_eq!(
         tampered.status.code(),
         Some(1),
@@ -409,10 +459,8 @@ fn tampered_cli_hash_rejected() {
 fn tampered_tool_revision_rejected() {
     let dir = temp_dir("tamper_revision");
     let repo_root = scratch_repo(&dir);
-    let env: &[(&str, String)] = &[];
     let args = preflight_args(&dir, &repo_root);
-    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let baseline = run_cli(&arg_refs, env);
+    let baseline = run_staging_args(&dir, &args);
     assert_eq!(baseline.status.code(), Some(2), "baseline NotReady");
 
     let envelope_path = dir.join("runner-config-envelope.json");
@@ -423,7 +471,7 @@ fn tampered_tool_revision_rejected() {
     let tampered_bytes = serde_json::to_vec_pretty(&envelope).unwrap();
     fs::write(&envelope_path, &tampered_bytes).unwrap();
 
-    let tampered = run_cli(&arg_refs, env);
+    let tampered = run_staging_args(&dir, &args);
     assert_eq!(
         tampered.status.code(),
         Some(1),
@@ -478,19 +526,18 @@ fn launch_gate_blocks_before_process_creation() {
     // A gated run with a NotReady report must be blocked before PE parsing.
     let dir = temp_dir("launch_not_ready");
     let repo_root = scratch_repo(&dir);
-    let env: &[(&str, String)] = &[];
-    // Stage for the REAL mida-cli binary so the launch-side config digest
-    // check passes and the report gate is the deciding check.
-    let real_cli = PathBuf::from(env!("CARGO_BIN_EXE_mida-cli"));
-    let args = preflight_args_with_cli(&dir, &repo_root, &real_cli);
-    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let preflight = run_cli(&arg_refs, env);
+    // Stage + launch with the staged CLI copy (sibling verifier = real
+    // acceptance) so the envelope path/sha stay consistent.
+    let args = preflight_args_with_cli(&dir, &repo_root);
+    let preflight = run_staging_args(&dir, &args);
     assert_eq!(preflight.status.code(), Some(2), "preflight NotReady");
 
     let garbage = dir.join("input.bin");
     fs::write(&garbage, b"NOT-A-PE-NOT-A-PE-NOT-A-PE").unwrap();
     let candidate = dir.join("candidate.exe");
-    let output = run_cli(
+    let launch_cli = staging_cli(&dir);
+    let output = run_cli_at(
+        &launch_cli,
         &[
             "/unpack",
             garbage.to_str().unwrap(),
@@ -499,7 +546,6 @@ fn launch_gate_blocks_before_process_creation() {
             "--preflight-dir",
             dir.to_str().unwrap(),
         ],
-        &[],
     );
     assert_eq!(
         output.status.code(),
@@ -522,11 +568,8 @@ fn launch_gate_blocks_before_process_creation() {
 fn launch_gate_rejects_digest_drift() {
     let dir = temp_dir("launch_drift");
     let repo_root = scratch_repo(&dir);
-    let env: &[(&str, String)] = &[];
-    let real_cli = PathBuf::from(env!("CARGO_BIN_EXE_mida-cli"));
-    let args = preflight_args_with_cli(&dir, &repo_root, &real_cli);
-    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let preflight = run_cli(&arg_refs, env);
+    let args = preflight_args_with_cli(&dir, &repo_root);
+    let preflight = run_staging_args(&dir, &args);
     assert_eq!(preflight.status.code(), Some(2), "preflight NotReady");
 
     // Build a syntactically valid READY report, then tamper its digest so it
@@ -580,7 +623,9 @@ fn launch_gate_rejects_digest_drift() {
     let garbage = dir.join("input.bin");
     fs::write(&garbage, b"NOT-A-PE-NOT-A-PE-NOT-A-PE").unwrap();
     let candidate = dir.join("candidate.exe");
-    let output = run_cli(
+    let launch_cli = staging_cli(&dir);
+    let output = run_cli_at(
+        &launch_cli,
         &[
             "/unpack",
             garbage.to_str().unwrap(),
@@ -589,7 +634,6 @@ fn launch_gate_rejects_digest_drift() {
             "--preflight-dir",
             dir.to_str().unwrap(),
         ],
-        &[],
     );
     assert_eq!(
         output.status.code(),
@@ -612,14 +656,10 @@ fn launch_gate_rejects_digest_drift() {
 fn launch_gate_blocks_hand_written_ready_after_verifier_rerun() {
     let dir = temp_dir("launch_fake_ready");
     let repo_root = scratch_repo(&dir);
-    let env: &[(&str, String)] = &[];
-    // Stage the envelope for the REAL mida-cli binary so the actual
-    // run-config digest matches at launch; the real preflight is NotReady
-    // (missing samples).
-    let real_cli = PathBuf::from(env!("CARGO_BIN_EXE_mida-cli"));
-    let args = preflight_args_with_cli(&dir, &repo_root, &real_cli);
-    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let preflight = run_cli(&arg_refs, env);
+    // Stage + launch with the staged CLI copy (sibling verifier = real
+    // acceptance); the real preflight is NotReady (missing samples).
+    let args = preflight_args_with_cli(&dir, &repo_root);
+    let preflight = run_staging_args(&dir, &args);
     assert_eq!(preflight.status.code(), Some(2), "preflight NotReady");
 
     // Launch input: garbage bytes whose identity is then recorded into the
@@ -683,7 +723,9 @@ fn launch_gate_blocks_hand_written_ready_after_verifier_rerun() {
     // The attestation re-runs the REAL verifier against the current
     // context: the fresh report is NotReady (the garbage input does not
     // match the locked identity), so the fabricated Ready is refused.
-    let output = run_cli(
+    let launch_cli = staging_cli(&dir);
+    let output = run_cli_at(
+        &launch_cli,
         &[
             "/unpack",
             garbage.to_str().unwrap(),
@@ -692,7 +734,6 @@ fn launch_gate_blocks_hand_written_ready_after_verifier_rerun() {
             "--preflight-dir",
             dir.to_str().unwrap(),
         ],
-        &[],
     );
     assert_eq!(
         output.status.code(),

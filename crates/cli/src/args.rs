@@ -33,10 +33,6 @@ pub enum Command {
         /// preflight report from this directory before any sample process
         /// is created.
         preflight_dir: Option<PathBuf>,
-        /// P6.3.1: explicit acceptance-verifier binary for the launch
-        /// attestation / PE evidence (test injection seam). `None` resolves
-        /// the sibling `mida-acceptance`; the environment is never trusted.
-        acceptance_bin: Option<PathBuf>,
         verbose: bool,
     },
     /// Packer-agnostic full dump (no Themida shrink).
@@ -67,7 +63,6 @@ pub enum Command {
         repo_root: PathBuf,
         toolchain_pin_file: PathBuf,
         expected_toolchain: String,
-        acceptance_bin: Option<PathBuf>,
     },
     Help,
     Version,
@@ -131,7 +126,6 @@ fn parse_unpack(args: &[String]) -> Result<Command, String> {
     let mut capture_policy = DumpCapturePolicy::default();
     let mut capture_policy_path: Option<PathBuf> = None;
     let mut preflight_dir: Option<PathBuf> = None;
-    let mut acceptance_bin: Option<PathBuf> = None;
 
     let mut i = 3;
     while i < args.len() {
@@ -150,12 +144,15 @@ fn parse_unpack(args: &[String]) -> Result<Command, String> {
                 }
                 preflight_dir = Some(PathBuf::from(&args[i]));
             }
+            // P6.3.2: the verifier is never caller-selectable in production.
+            // Both forms are forbidden and fail closed (no hidden flag, no
+            // environment, no PATH fallback).
             "--acceptance-bin" => {
-                i += 1;
-                if i >= args.len() {
-                    return Err("Missing path after --acceptance-bin.".into());
-                }
-                acceptance_bin = Some(PathBuf::from(&args[i]));
+                return Err(
+                    "--acceptance-bin is forbidden in production: the acceptance \
+                            verifier can only be the CLI sibling mida-acceptance.exe"
+                        .into(),
+                );
             }
             "--data-sections" | "--create-data-sections" => create_data_sections = true,
             "--shrink" => shrink = true,
@@ -163,6 +160,13 @@ fn parse_unpack(args: &[String]) -> Result<Command, String> {
             "-v" | "--verbose" => verbose = true,
             "--pure-rebuild" => cli_pure_rebuild = true,
             "--no-pure-rebuild" => cli_no_pure_rebuild = true,
+            other if other.starts_with("--acceptance-bin=") => {
+                return Err(
+                    "--acceptance-bin is forbidden in production: the acceptance \
+                            verifier can only be the CLI sibling mida-acceptance.exe"
+                        .into(),
+                );
+            }
             other if other.starts_with("--oep=") => {
                 oep_policy = parse_oep_policy(&other["--oep=".len()..])?;
             }
@@ -263,7 +267,6 @@ fn parse_unpack(args: &[String]) -> Result<Command, String> {
         capture_policy,
         capture_policy_digest,
         preflight_dir,
-        acceptance_bin,
         verbose,
     })
 }
@@ -382,7 +385,7 @@ fn parse_offline_preflight(args: &[String]) -> Result<Command, String> {
         return Err(
             "Usage: mida-cli /offline-preflight <output-dir> --cli-binary=<path> \
              --repo-root=<path> --toolchain-pin=<path> --expected-toolchain=<ver> \
-             --case <manifest> <input> <output> [--case ...] [--acceptance-bin=<path>]"
+             --case <manifest> <input> <output> [--case ...]"
                 .into(),
         );
     }
@@ -391,7 +394,6 @@ fn parse_offline_preflight(args: &[String]) -> Result<Command, String> {
     let mut repo_root: Option<PathBuf> = None;
     let mut toolchain_pin_file: Option<PathBuf> = None;
     let mut expected_toolchain: Option<String> = None;
-    let mut acceptance_bin: Option<PathBuf> = None;
     let mut cases: Vec<(PathBuf, PathBuf, PathBuf)> = Vec::new();
     let mut i = 3;
     while i < args.len() {
@@ -404,8 +406,13 @@ fn parse_offline_preflight(args: &[String]) -> Result<Command, String> {
             toolchain_pin_file = Some(PathBuf::from(v));
         } else if let Some(v) = arg.strip_prefix("--expected-toolchain=") {
             expected_toolchain = Some(v.to_string());
-        } else if let Some(v) = arg.strip_prefix("--acceptance-bin=") {
-            acceptance_bin = Some(PathBuf::from(v));
+        } else if arg == "--acceptance-bin" || arg.starts_with("--acceptance-bin=") {
+            // P6.3.2: the verifier is never caller-selectable in production.
+            return Err(
+                "--acceptance-bin is forbidden in production: the acceptance \
+                        verifier can only be the CLI sibling mida-acceptance.exe"
+                    .into(),
+            );
         } else if arg == "--case" {
             if i + 3 >= args.len() {
                 return Err("Missing manifest/input/output after --case.".into());
@@ -435,7 +442,6 @@ fn parse_offline_preflight(args: &[String]) -> Result<Command, String> {
         repo_root,
         toolchain_pin_file,
         expected_toolchain,
-        acceptance_bin,
     })
 }
 
