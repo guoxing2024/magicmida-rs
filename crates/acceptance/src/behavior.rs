@@ -130,7 +130,6 @@ impl TransformManifest {
         &self.entries
     }
 
-
     /// Fail-closed: manifest must bind to candidate bytes; then merge entries
     /// into evidence ledger. Manifest is **authoritative** for matching
     /// `(id, kind)` keys — evidence cannot invent a stronger equivalence_rule
@@ -323,9 +322,7 @@ pub enum BehaviorEvidenceError {
     ManifestLedgerConflict { id: String, kind: String },
     #[error("transform_manifest missing required taxonomy_version")]
     TaxonomyVersionMissing,
-    #[error(
-        "transform_manifest taxonomy_version mismatch: got='{got}' expected='{expected}'"
-    )]
+    #[error("transform_manifest taxonomy_version mismatch: got='{got}' expected='{expected}'")]
     TaxonomyVersionMismatch { got: String, expected: String },
 }
 
@@ -362,7 +359,9 @@ impl BehaviorEvidence {
         // reference.kind=none (audit residual: Accepted still call-side forgeable).
         if ev.verdict == BehaviorVerdict::Pass {
             if !is_product_probe_id(&ev.probe.id) {
-                return Err(BehaviorEvidenceError::UnregisteredProbe(ev.probe.id.clone()));
+                return Err(BehaviorEvidenceError::UnregisteredProbe(
+                    ev.probe.id.clone(),
+                ));
             }
             if !reference_supports_product_accept(&ev.reference) {
                 return Err(BehaviorEvidenceError::ReferenceRequired(
@@ -385,8 +384,7 @@ impl BehaviorEvidence {
     /// Whether evidence.candidate matches on-disk / in-memory candidate bytes.
     pub fn binds_to_candidate(&self, candidate_bytes: &[u8]) -> bool {
         let dig = sha256_hex(candidate_bytes);
-        dig == self.candidate.sha256
-            && (candidate_bytes.len() as u64) == self.candidate.size_bytes
+        dig == self.candidate.sha256 && (candidate_bytes.len() as u64) == self.candidate.size_bytes
     }
 }
 
@@ -432,7 +430,11 @@ fn reference_supports_product_accept(reference: &BehaviorReference) -> bool {
 const REGISTERED_TRANSFORM_RULES: &[(&str, &str, &str)] = &[
     ("iat_rebuild", "pe_repair", "pe_iat_rebuild_v0"),
     ("reloc_rebind", "pe_repair", "pe_reloc_rebind_v0"),
-    ("clear_stale_ptrs", "pe_repair", "clear_stale_process_ptrs_v0"),
+    (
+        "clear_stale_ptrs",
+        "pe_repair",
+        "clear_stale_process_ptrs_v0",
+    ),
 ];
 
 fn transform_rule_allowed(id: &str, kind: &str, rule: &str) -> bool {
@@ -443,11 +445,7 @@ fn transform_rule_allowed(id: &str, kind: &str, rule: &str) -> bool {
 
 fn ledger_blocks_product_accept(ledger: &[TransformLedgerEntry]) -> bool {
     ledger.iter().any(|e| match e.equivalence_rule.as_deref() {
-        Some(rule)
-            if !rule.is_empty() && transform_rule_allowed(&e.id, &e.kind, rule) =>
-        {
-            false
-        }
+        Some(rule) if !rule.is_empty() && transform_rule_allowed(&e.id, &e.kind, rule) => false,
         _ => true, // missing/empty/unregistered/mismatched → block
     })
 }
@@ -616,8 +614,9 @@ pub(crate) fn compose_with_behavior(
             report.verdict = Verdict::StructuralPassBehaviorPending;
             report.warnings.push(WarningRecord {
                 code: "behavior_inconclusive".to_string(),
-                message: "behavior evidence Inconclusive; verdict remains StructuralPassBehaviorPending"
-                    .to_string(),
+                message:
+                    "behavior evidence Inconclusive; verdict remains StructuralPassBehaviorPending"
+                        .to_string(),
             });
         }
     }

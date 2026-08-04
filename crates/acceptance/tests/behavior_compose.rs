@@ -1,14 +1,14 @@
 //! B-A2: library compose path with pre-recorded behavior evidence.
 
-use mida_acceptance::{
-    check_static, check_with_behavior, check_with_behavior_managed,
-    check_with_behavior_managed_lab, sha256_hex, BehaviorEvidence, BehaviorVerdict,
-    CheckStaticOptions, VerifiedManagedCandidate, Verdict, BEHAVIOR_EVIDENCE_SCHEMA_VERSION,
-    ROLE_CANDIDATE,
-};
 use mida_acceptance::behavior::{
     BehaviorCandidate, BehaviorPolicy, BehaviorProbe, BehaviorProbeResult, BehaviorProducer,
     BehaviorReference,
+};
+use mida_acceptance::{
+    check_static, check_with_behavior, check_with_behavior_managed,
+    check_with_behavior_managed_lab, sha256_hex, BehaviorEvidence, BehaviorVerdict,
+    CheckStaticOptions, Verdict, VerifiedManagedCandidate, BEHAVIOR_EVIDENCE_SCHEMA_VERSION,
+    ROLE_CANDIDATE,
 };
 
 #[allow(dead_code)]
@@ -25,11 +25,7 @@ fn opts() -> CheckStaticOptions {
     }
 }
 
-fn evidence_for(
-    pe: &[u8],
-    verdict: BehaviorVerdict,
-    result_status: &str,
-) -> BehaviorEvidence {
+fn evidence_for(pe: &[u8], verdict: BehaviorVerdict, result_status: &str) -> BehaviorEvidence {
     let reference = if verdict == BehaviorVerdict::Pass {
         BehaviorReference {
             kind: "bilateral".to_string(),
@@ -112,10 +108,7 @@ fn manifest_unknown_taxonomy_version_rejected() {
     );
     let err = VerifiedManagedCandidate::verify(&pe, json.as_bytes()).unwrap_err();
     assert!(
-        matches!(
-            err,
-            BehaviorEvidenceError::TaxonomyVersionMismatch { .. }
-        ),
+        matches!(err, BehaviorEvidenceError::TaxonomyVersionMismatch { .. }),
         "expected TaxonomyVersionMismatch, got: {err:?}"
     );
 }
@@ -124,7 +117,10 @@ fn manifest_unknown_taxonomy_version_rejected() {
 fn manifest_exact_taxonomy_v1_binds_for_managed() {
     let pe = build_pe(&PeBuildOptions::pe32_plus());
     let m = empty_managed_for(&pe);
-    assert_eq!(m.manifest().taxonomy_version(), "mida.transform-taxonomy/v1");
+    assert_eq!(
+        m.manifest().taxonomy_version(),
+        "mida.transform-taxonomy/v1"
+    );
     let ev = evidence_for(&pe, BehaviorVerdict::Pass, "pass");
     // Unsigned managed is product-capped at Pending; taxonomy still binds.
     let report = check_with_behavior_managed(&pe, &opts(), &ev, &m);

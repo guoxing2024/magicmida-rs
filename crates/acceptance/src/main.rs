@@ -3,10 +3,13 @@
 //! ```text
 //! mida-acceptance check-static <candidate> [options]
 //! mida-acceptance check-with-behavior <candidate> --behavior-evidence <json> [options]
+//! mida-acceptance oreans-pe-evidence <candidate> [options]
+//! mida-acceptance oreans-two-sample-gate <observations.json> [options]
 //! ```
 //!
-//! Exit codes: 0 = StructuralPassBehaviorPending or Accepted,
-//! 2 = Rejected, 1 = I/O or config error.
+//! Exit codes: 0 = StructuralPassBehaviorPending, Accepted, successful Oreans PE
+//! evidence, or a closed two-sample gate; 2 = Rejected, an open gate, or an
+//! Oreans validation failure; 1 = I/O or config error.
 //! Report writes never alias candidate, oracle, or evidence inputs.
 
 use std::env;
@@ -15,11 +18,12 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 
+use mida_acceptance::oreans_gate::OREANS_TWO_SAMPLE_OBSERVATIONS_SCHEMA_VERSION;
 use mida_acceptance::{
-    check_static, check_with_behavior, check_with_behavior_managed,
-    check_with_behavior_managed_lab, check_with_behavior_signed, BehaviorEvidence,
-    CheckStaticOptions, EnvelopePolicy, HmacSha256Verifier, SignatureEnvelope,
-    VerifiedManagedCandidate, Verdict,
+    build_oreans_pe_evidence, check_static, check_with_behavior, check_with_behavior_managed,
+    check_with_behavior_managed_lab, check_with_behavior_signed, evaluate_oreans_two_sample_gate,
+    BehaviorEvidence, CheckStaticOptions, EnvelopePolicy, HmacSha256Verifier, OreansGateVerdict,
+    OreansSampleObservation, SignatureEnvelope, Verdict, VerifiedManagedCandidate,
 };
 
 fn main() {
@@ -56,8 +60,16 @@ fn run() -> Result<i32, String> {
             args.remove(0);
             cmd_check_with_behavior(&args)
         }
+        "oreans-pe-evidence" => {
+            args.remove(0);
+            cmd_oreans_pe_evidence(&args)
+        }
+        "oreans-two-sample-gate" => {
+            args.remove(0);
+            cmd_oreans_two_sample_gate(&args)
+        }
         other => Err(format!(
-            "unknown command '{other}'. Use: check-static | check-with-behavior"
+            "unknown command '{other}'. Use: check-static | check-with-behavior | oreans-pe-evidence | oreans-two-sample-gate"
         )),
     }
 }
@@ -70,6 +82,8 @@ mida-acceptance - independent PE acceptance kernel (R0B + B-A2 compose)
 Usage:
   mida-acceptance check-static <candidate> [options]
   mida-acceptance check-with-behavior <candidate> --behavior-evidence <path> [options]
+  mida-acceptance oreans-pe-evidence <candidate> [options]
+  mida-acceptance oreans-two-sample-gate <observations.json> [options]
 
 Options:
   --expected-sha256 <hex>  Fail-closed if file digest does not match
@@ -78,7 +92,7 @@ Options:
   --oracle <path>          Legacy oracle file (comparison observation only)
   --behavior-evidence <p>  Pre-recorded mida.behavior-evidence/v0 JSON (compose only)
   --report <path>          Write deterministic JSON report to path
-                           (must not alias candidate/oracle/evidence/manifest/envelope)
+                           (must not alias any input file)
   --allow-unmanaged-candidate
                            check-with-behavior only: allow missing sibling
                            *.transform_manifest.json (experimental / lab)
@@ -94,8 +108,8 @@ Options:
   -V, --version            Show version
 
 Exit codes:
-  0  StructuralPassBehaviorPending or Accepted (check-with-behavior only for Accepted)
-  2  Rejected
+  0  StructuralPassBehaviorPending, Accepted, successful Oreans PE evidence, or closed gate
+  2  Rejected, open gate, or Oreans validation failure
   1  I/O, configuration, or internal error
 
 Notes:
@@ -106,6 +120,209 @@ Notes:
   unless --allow-unsigned-managed (lab).
 "
     );
+}
+
+fn cmd_oreans_pe_evidence(args: &[String]) -> Result<i32, String> {
+    if args.is_empty() {
+        return Err(
+            "Usage: mida-acceptance oreans-pe-evidence <candidate> [--expected-sha256 HEX] [--expected-size BYTES] [--report PATH]".into(),
+        );
+    }
+
+    let mut candidate: Option<PathBuf> = None;
+    let mut expected_sha256: Option<String> = None;
+    let mut expected_size: Option<u64> = None;
+    let mut report_path: Option<PathBuf> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--expected-sha256" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("missing value after --expected-sha256".into());
+                }
+                expected_sha256 = Some(parse_expected_sha256(&args[i])?);
+            }
+            flag if flag.starts_with("--expected-sha256=") => {
+                expected_sha256 = Some(parse_expected_sha256(&flag["--expected-sha256=".len()..])?);
+            }
+            "--expected-size" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("missing value after --expected-size".into());
+                }
+                expected_size = Some(parse_expected_size(&args[i])?);
+            }
+            flag if flag.starts_with("--expected-size=") => {
+                expected_size = Some(parse_expected_size(&flag["--expected-size=".len()..])?);
+            }
+            "--report" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("missing value after --report".into());
+                }
+                report_path = Some(PathBuf::from(&args[i]));
+            }
+            flag if flag.starts_with("--report=") => {
+                report_path = Some(PathBuf::from(&flag["--report=".len()..]));
+            }
+            "-h" | "--help" => {
+                print_help();
+                return Ok(0);
+            }
+            other if other.starts_with('-') => {
+                return Err(format!("unknown option '{other}'"));
+            }
+            other => {
+                if candidate.is_some() {
+                    return Err(format!("unexpected argument '{other}'"));
+                }
+                candidate = Some(PathBuf::from(other));
+            }
+        }
+        i += 1;
+    }
+
+    let candidate = candidate.ok_or_else(|| "missing <candidate> path".to_string())?;
+    let (bytes, candidate_file) = read_input(&candidate, "candidate")?;
+    let actual_sha256 = mida_acceptance::sha256_hex(&bytes);
+    let actual_size = bytes.len() as u64;
+
+    if let Some(expected) = expected_sha256.as_deref() {
+        if expected != actual_sha256 {
+            eprintln!(
+                "error: expected SHA-256 {expected}, candidate '{}' has {actual_sha256}",
+                candidate.display()
+            );
+            return Ok(2);
+        }
+    }
+    if let Some(expected) = expected_size {
+        if expected != actual_size {
+            eprintln!(
+                "error: expected size {expected} bytes, candidate '{}' has {actual_size} bytes",
+                candidate.display()
+            );
+            return Ok(2);
+        }
+    }
+
+    let evidence = match build_oreans_pe_evidence(&bytes) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            eprintln!(
+                "error: Oreans PE evidence construction failed for '{}': {error}",
+                candidate.display()
+            );
+            return Ok(2);
+        }
+    };
+    let mut json = serde_json::to_string_pretty(&evidence)
+        .map_err(|error| format!("failed to serialize Oreans PE evidence: {error}"))?;
+    println!("{json}");
+
+    if let Some(report_path) = report_path {
+        json.push('\n');
+        write_report(
+            &report_path,
+            json.as_bytes(),
+            (&candidate, &candidate_file),
+            None,
+        )?;
+    }
+
+    Ok(0)
+}
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OreansObservationBundle {
+    schema_version: String,
+    observations: Vec<OreansSampleObservation>,
+}
+
+fn cmd_oreans_two_sample_gate(args: &[String]) -> Result<i32, String> {
+    if args.is_empty() {
+        return Err(
+            "Usage: mida-acceptance oreans-two-sample-gate <observations.json> [--report PATH]"
+                .into(),
+        );
+    }
+
+    let mut observations_path: Option<PathBuf> = None;
+    let mut report_path: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--report" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("missing value after --report".into());
+                }
+                report_path = Some(PathBuf::from(&args[i]));
+            }
+            flag if flag.starts_with("--report=") => {
+                report_path = Some(PathBuf::from(&flag["--report=".len()..]));
+            }
+            "-h" | "--help" => {
+                print_help();
+                return Ok(0);
+            }
+            other if other.starts_with('-') => {
+                return Err(format!("unknown option '{other}'"));
+            }
+            other => {
+                if observations_path.is_some() {
+                    return Err(format!("unexpected argument '{other}'"));
+                }
+                observations_path = Some(PathBuf::from(other));
+            }
+        }
+        i += 1;
+    }
+
+    let observations_path =
+        observations_path.ok_or_else(|| "missing <observations.json> path".to_string())?;
+    let (input_bytes, observations_file) = read_input(&observations_path, "observations bundle")?;
+    let bundle: OreansObservationBundle =
+        serde_json::from_slice(&input_bytes).map_err(|error| {
+            format!(
+                "invalid Oreans observations bundle JSON '{}': {error}",
+                observations_path.display()
+            )
+        })?;
+    if bundle.schema_version != OREANS_TWO_SAMPLE_OBSERVATIONS_SCHEMA_VERSION {
+        return Err(format!(
+            "invalid Oreans observations bundle schema_version '{}'; expected {}",
+            bundle.schema_version, OREANS_TWO_SAMPLE_OBSERVATIONS_SCHEMA_VERSION
+        ));
+    }
+
+    let report = match evaluate_oreans_two_sample_gate(&bundle.observations) {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!("error: Oreans two-sample gate input cannot form a report: {error}");
+            return Ok(2);
+        }
+    };
+    let mut json = serde_json::to_string_pretty(&report)
+        .map_err(|error| format!("failed to serialize Oreans two-sample gate report: {error}"))?;
+    println!("{json}");
+
+    if let Some(report_path) = report_path {
+        json.push('\n');
+        write_report_for_input(
+            &report_path,
+            json.as_bytes(),
+            "observations bundle",
+            (&observations_path, &observations_file),
+        )?;
+    }
+
+    Ok(match report.final_verdict {
+        OreansGateVerdict::Closed => 0,
+        OreansGateVerdict::Open => 2,
+    })
 }
 
 fn cmd_check_static(args: &[String]) -> Result<i32, String> {
@@ -300,8 +517,7 @@ fn cmd_check_with_behavior(args: &[String]) -> Result<i32, String> {
                 envelope_hmac_key_hex = Some(args[i].clone());
             }
             flag if flag.starts_with("--envelope-hmac-key-hex=") => {
-                envelope_hmac_key_hex =
-                    Some(flag["--envelope-hmac-key-hex=".len()..].to_string());
+                envelope_hmac_key_hex = Some(flag["--envelope-hmac-key-hex=".len()..].to_string());
             }
             "--expected-sha256" => {
                 i += 1;
@@ -444,9 +660,11 @@ fn cmd_check_with_behavior(args: &[String]) -> Result<i32, String> {
     // Note: `evidence` from CLI parse is used for *unsigned* paths only.
     // Signed path seals evidence from hashed JSON inside verify_bundle (audit P0).
     let mut envelope_file: Option<File> = None;
-    let mut report = if let (Some(ref env_path), Some(ref man_bytes), Some(_)) =
-        (resolved_envelope.as_ref(), manifest_bytes.as_ref(), managed.as_ref())
-    {
+    let mut report = if let (Some(ref env_path), Some(ref man_bytes), Some(_)) = (
+        resolved_envelope.as_ref(),
+        manifest_bytes.as_ref(),
+        managed.as_ref(),
+    ) {
         let (env_bytes, env_file) = read_input(env_path, "signature-envelope")?;
         envelope_file = Some(env_file);
         let envelope = SignatureEnvelope::parse_json(&env_bytes)
@@ -522,14 +740,10 @@ fn cmd_check_with_behavior(args: &[String]) -> Result<i32, String> {
             (&candidate, &candidate_file),
             oracle.as_deref().zip(oracle_file.as_ref()),
             Some((evidence_path.as_path(), &evidence_file)),
-            manifest_file
+            manifest_file.as_ref().map(|f| (manifest_path.as_path(), f)),
+            envelope_file
                 .as_ref()
-                .map(|f| (manifest_path.as_path(), f)),
-            envelope_file.as_ref().and_then(|f| {
-                resolved_envelope
-                    .as_ref()
-                    .map(|p| (p.as_path(), f))
-            }),
+                .and_then(|f| resolved_envelope.as_ref().map(|p| (p.as_path(), f))),
         )?;
     }
 
@@ -562,6 +776,16 @@ fn hex_nibble(b: u8) -> Result<u8, String> {
     }
 }
 
+fn parse_expected_sha256(raw: &str) -> Result<String, String> {
+    let value = raw.trim();
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!(
+            "invalid --expected-sha256 value '{raw}' (expected 64 hexadecimal characters)"
+        ));
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
 fn parse_expected_size(raw: &str) -> Result<u64, String> {
     let t = raw.trim();
     if t.is_empty() {
@@ -589,12 +813,52 @@ fn write_report(
     write_report_with_extra(report_path, body, candidate, oracle, None, None, None)
 }
 
+fn write_report_for_input(
+    report_path: &Path,
+    body: &[u8],
+    input_label: &str,
+    input: (&Path, &File),
+) -> Result<(), String> {
+    write_report_with_extra_label(
+        report_path,
+        body,
+        input_label,
+        input,
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
 /// Write report after rejecting alias against candidate, optional oracle,
 /// behavior-evidence, transform_manifest, and signature envelope (audit P1).
 fn write_report_with_extra(
     report_path: &Path,
     body: &[u8],
     candidate: (&Path, &File),
+    oracle: Option<(&Path, &File)>,
+    evidence: Option<(&Path, &File)>,
+    manifest: Option<(&Path, &File)>,
+    envelope: Option<(&Path, &File)>,
+) -> Result<(), String> {
+    write_report_with_extra_label(
+        report_path,
+        body,
+        "candidate",
+        candidate,
+        oracle,
+        evidence,
+        manifest,
+        envelope,
+    )
+}
+
+fn write_report_with_extra_label(
+    report_path: &Path,
+    body: &[u8],
+    input_label: &str,
+    input: (&Path, &File),
     oracle: Option<(&Path, &File)>,
     evidence: Option<(&Path, &File)>,
     manifest: Option<(&Path, &File)>,
@@ -615,9 +879,9 @@ fn write_report_with_extra(
         report_path,
         &report_file,
         &report_metadata,
-        "candidate",
-        candidate.0,
-        candidate.1,
+        input_label,
+        input.0,
+        input.1,
     )?;
     if let Some((oracle_path, oracle_file)) = oracle {
         reject_input_alias(

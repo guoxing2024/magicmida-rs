@@ -161,8 +161,7 @@ fn compose_managed_uncapped(
         report.failures.push(FailureRecord {
             gate_id: "transform_manifest".to_string(),
             code: "managed_candidate_bytes_mismatch".to_string(),
-            message: "VerifiedManagedCandidate does not match provided candidate bytes"
-                .to_string(),
+            message: "VerifiedManagedCandidate does not match provided candidate bytes".to_string(),
         });
         return report;
     }

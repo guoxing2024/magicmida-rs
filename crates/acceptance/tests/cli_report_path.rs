@@ -217,11 +217,7 @@ fn check_with_behavior_identity_mismatch_exit_2() {
     fs::write(&candidate, original).expect("write candidate");
     write_minimal_evidence(&evidence, &"bb".repeat(32), 9999, "Pass", "pass");
 
-    let output = run_behavior(&[
-        &candidate,
-        Path::new("--behavior-evidence"),
-        &evidence,
-    ]);
+    let output = run_behavior(&[&candidate, Path::new("--behavior-evidence"), &evidence]);
 
     assert_eq!(output.status.code(), Some(2), "{output:?}");
     assert_eq!(fs::read(&candidate).expect("read candidate"), original);

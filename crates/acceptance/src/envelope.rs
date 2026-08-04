@@ -364,8 +364,7 @@ impl SignatureEnvelope {
     ///
     /// Stable JSON object with fixed key order (serde struct field order).
     pub fn canonical_message(&self) -> Result<Vec<u8>, EnvelopeError> {
-        serde_json::to_vec(&self.payload)
-            .map_err(|e| EnvelopeError::Canonical(e.to_string()))
+        serde_json::to_vec(&self.payload).map_err(|e| EnvelopeError::Canonical(e.to_string()))
     }
 
     /// Full bind + policy + signature verify. Returns a sealed bundle.
@@ -417,10 +416,7 @@ impl SignatureEnvelope {
         if evidence.reference.kind != self.payload.reference_kind {
             return Err(EnvelopeError::ReferenceMismatch);
         }
-        match (
-            &self.payload.reference_sha256,
-            &evidence.reference.sha256,
-        ) {
+        match (&self.payload.reference_sha256, &evidence.reference.sha256) {
             (None, None) => {}
             (Some(a), Some(b)) if a.eq_ignore_ascii_case(b) => {}
             _ => return Err(EnvelopeError::ReferenceMismatch),
@@ -635,7 +631,10 @@ fn is_uuid_like(s: &str) -> bool {
     true
 }
 
-fn enforce_freshness(payload: &EnvelopePayload, policy: &EnvelopePolicy) -> Result<(), EnvelopeError> {
+fn enforce_freshness(
+    payload: &EnvelopePayload,
+    policy: &EnvelopePolicy,
+) -> Result<(), EnvelopeError> {
     let created = parse_rfc3339_utc(&payload.created_utc).map_err(EnvelopeError::BadCreatedUtc)?;
     let now = policy.now_unix_secs.unwrap_or_else(unix_now_secs);
     let skew = policy.max_clock_skew_secs as i64;
@@ -673,7 +672,11 @@ fn parse_rfc3339_utc(s: &str) -> Result<i64, String> {
         return Err(format!("too short: {t}"));
     }
     let b = t.as_bytes();
-    if b[4] != b'-' || b[7] != b'-' || (b[10] != b'T' && b[10] != b't') || b[13] != b':' || b[16] != b':'
+    if b[4] != b'-'
+        || b[7] != b'-'
+        || (b[10] != b'T' && b[10] != b't')
+        || b[13] != b':'
+        || b[16] != b':'
     {
         return Err(format!("bad layout: {t}"));
     }
@@ -782,8 +785,7 @@ mod tests {
     use super::*;
     use crate::behavior::{
         BehaviorCandidate, BehaviorEvidence, BehaviorPolicy, BehaviorProbe, BehaviorProbeResult,
-        BehaviorProducer, BehaviorReference, BehaviorVerdict,
-        BEHAVIOR_EVIDENCE_SCHEMA_VERSION,
+        BehaviorProducer, BehaviorReference, BehaviorVerdict, BEHAVIOR_EVIDENCE_SCHEMA_VERSION,
     };
 
     fn tiny_pe() -> Vec<u8> {
@@ -810,7 +812,9 @@ mod tests {
             },
             reference: BehaviorReference {
                 kind: "bilateral".into(),
-                sha256: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
+                sha256: Some(
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                ),
                 notes: None,
             },
             probe: BehaviorProbe {

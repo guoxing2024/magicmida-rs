@@ -29,7 +29,7 @@ pub use behavior::{
     TransformManifest, VerifiedManagedCandidate, BEHAVIOR_EVIDENCE_SCHEMA_VERSION,
     TRANSFORM_TAXONOMY_VERSION,
 };
-// compose_with_behavior is deliberately NOT re-exported — use check_* entry points.
+// compose_with_behavior is deliberately NOT re-exported; use check_* entry points.
 pub use check::{
     check_static, check_static_verdict, check_with_behavior, check_with_behavior_managed,
     check_with_behavior_managed_lab, check_with_behavior_signed, CheckStaticOptions,
@@ -46,3 +46,35 @@ pub use report::{
     REPORT_SCHEMA_VERSION,
 };
 pub use verdict::Verdict;
+pub mod oreans_gate;
+pub mod oreans_pe_evidence;
+
+pub use oreans_gate::{
+    evaluate_oreans_two_sample_gate, locked_manifest, OreansArtifactIdentity,
+    OreansAslrSimulationCase, OreansAslrSimulationEvidence, OreansBehaviorEvidence,
+    OreansBehaviorObservable, OreansBehaviorStimulus, OreansEvidenceRef,
+    OreansFinalBehaviorVerdict, OreansFinalImportEvidence, OreansFinalRelocationBlockEvidence,
+    OreansFinalRelocationEvidence, OreansFinalRelocationTargetEvidence, OreansFinalTlsEvidence,
+    OreansGateError, OreansGateVerdict, OreansIatArtifactIdentity, OreansIatEvidence,
+    OreansIatReportEvidence, OreansIatSlotEvidence, OreansIsolatedReplay,
+    OreansManifestBindingReport, OreansPrerequisites,
+    OreansRelocationEvidence as OreansGateRelocationEvidence,
+    OreansRelocationPreservationComparison, OreansReplayAttempt, OreansRuntimeRelocationEvidence,
+    OreansRuntimeRelocationTargetEvidence, OreansRuntimeTlsCallbackEvidence,
+    OreansRuntimeTlsEvidence, OreansSampleGateReport, OreansSampleManifestLock,
+    OreansSampleObservation, OreansSectionRebuildArtifactIdentity, OreansSectionRebuildDirectory,
+    OreansSectionRebuildEvidence, OreansSectionRebuildSection, OreansTlsArtifactIdentity,
+    OreansTlsEvidence, OreansTlsPreservationComparison, OreansTwoSampleGateReport,
+    OREANS_BEHAVIOR_ORACLE_SCHEMA_VERSION, OREANS_IAT_EVIDENCE_SCHEMA_VERSION,
+    OREANS_ISOLATED_REPLAY_ATTEMPTS, OREANS_ISOLATED_REPLAY_SCHEMA_VERSION, OREANS_NON_GATE_CASES,
+    OREANS_PREREQUISITE_EVIDENCE_SCHEMA_VERSION, OREANS_RELOCATION_EVIDENCE_SCHEMA_VERSION,
+    OREANS_SAMPLE_MANIFESTS, OREANS_SECTION_REBUILD_EVIDENCE_SCHEMA_VERSION,
+    OREANS_TLS_EVIDENCE_SCHEMA_VERSION, OREANS_TWO_SAMPLE_GATE_ID,
+    OREANS_TWO_SAMPLE_GATE_SCHEMA_VERSION,
+};
+pub use oreans_pe_evidence::{
+    build_oreans_pe_evidence, OreansExceptionEvidence, OreansPeCandidateIdentity,
+    OreansPeDirectoryCoverage, OreansPeEvidence, OreansPeEvidenceError, OreansPeSectionEvidence,
+    OreansRelocationEvidence, OreansRuntimeFunctionEvidence,
+    OreansTlsEvidence as OreansPeTlsEvidence, OREANS_PE_EVIDENCE_SCHEMA_VERSION,
+};
