@@ -90,22 +90,36 @@ attestation digest.
   the attestation and crate unit tests). `complete_run_evidence` and
   `assemble_evidence_bundle` take it BY VALUE, so one attestation
   authorizes exactly one bundle — a second use is a compile error.
-- The envelope is `mida.runner-config-envelope/v2` and binds the verifier
-  binary identity (`verifier_sha256`, pinned at staging). The launch
-  attestation and the PE-evidence path recompute the verifier they would
-  use and fail closed on any replacement / path drift / hash drift.
-- Production verifier resolution never consults the environment
-  (`MIDA_ACCEPTANCE_BIN` removed); tests inject the verifier explicitly via
-  `--acceptance-bin` (both `/offline-preflight` and `/unpack`) or the
-  attestation/bundle parameters.
 - The launch attestation emits a stable, filter-independent gate line
   (`launch attestation: Ready (...)`), so the positive control does not
   depend on the log filter.
+
+### P6.3.2 verifier trust root
+
+- The production CLI has NO verifier override. `--acceptance-bin` (all
+  forms) is forbidden and fails closed on both `/unpack` and
+  `/offline-preflight`; the environment is never read; there is no PATH
+  fallback.
+- The only verifier source is the exact sibling `mida-acceptance.exe` of
+  the running `mida-cli` (`resolve_acceptance_bin_from_cli`). The resolver
+  returns `Result` and hard-fails when the sibling is missing, is not a
+  regular file, or does not canonicalize to exactly `cli_dir/mida-acceptance.exe`.
+- The envelope is `mida.runner-config-envelope/v3` and binds the verifier's
+  controlled relative source (`<cli-dir>/mida-acceptance.exe`), its
+  canonical path, AND its SHA-256. Staging, launch re-attestation,
+  PE-evidence and bundle completion all re-resolve the sibling and validate
+  path identity AND hash — reporting no unchecked path drift.
+- The trust root is the deployment unit: whoever controls the `mida-cli`
+  install controls its sibling verifier (replacing the sibling is equivalent
+  to replacing the CLI itself — host trust, not a CLI interface bypass).
+- Tests inject a verifier by copying `mida-cli` into a temp dir and placing
+  the verifier as its `mida-acceptance.exe` sibling — never a flag or
+  environment override.
 - Tests fail closed on a stale sibling `mida-acceptance` binary (it must be
   newer than the acceptance sources); the `cargo test --workspace` gate
   rebuilds it fresh (hermetic).
 
-## Attack tests (`crates/cli/tests/launch_attestation.rs`, 16 tests)
+## Attack tests (`crates/cli/tests/launch_attestation.rs`, 20 tests)
 
 1. hand-written `ready` is never an authorization (verifier re-run
    NotReady blocks);
@@ -125,19 +139,24 @@ attestation digest.
 11. a stale/different envelope is never reused (bytes preserved);
 12. `$schema` drift is rejected by both the runner and the acceptance
     verifier;
-13. the production bundle digest equals the launch attestation digest;
-14. an attested authorization is one-time by ownership (P6.3.1 seal: the
-    context is moved into the assembler; no Clone, no public constructor);
+13. the envelope binds the exact CLI-sibling verifier (source token +
+    canonical path + SHA) and the unique resolver returns it;
+14. the one-time authorization is compile-enforced (no Clone, no public
+    constructor, by-value ownership consume);
 15. a verifier different from the envelope-pinned identity is refused at
     launch;
-16. positive control: a genuinely re-verified Ready report passes the
-    attestation and the pipeline continues past it.
+16. `--acceptance-bin` is forbidden in the production CLI (all forms), so a
+    stub cannot be directed at staging/launch through the interface (the
+    same-stub Ready path that existed in P6.3.1 is closed);
+17. positive control: a genuinely re-verified Ready report passes the
+    attestation and the pipeline continues past it (stable Ready output,
+    passes under `RUST_LOG=warn`).
 
-Negative tests use the real `mida-acceptance` binary; the pass-path and
-chain tests use the deterministic `mida-verifier-stub`
+Negative tests use the real `mida-acceptance` binary; the pass-path tests
+use the deterministic `mida-verifier-stub`
 (`crates/cli/tests/bin/verifier_stub.rs`, a test-support bin that mirrors
 the acceptance CLI surface). The assembler unit tests
-(`bundle_assembler::tests`) now live in the crate so they can construct a
+(`bundle_assembler::tests`) live in the crate so they can construct a
 sealed `RunEvidenceContext` and exercise the by-value ownership consume.
 
 ## Remaining boundaries
@@ -145,9 +164,15 @@ sealed `RunEvidenceContext` and exercise the by-value ownership consume.
 - The attestation re-runs the verifier process; the report file is trusted
   only as the verifier's output (locally recomputed identities and the
   digest chain are the authority).
+- The verifier trust root is the deployment unit: the sibling
+  `mida-acceptance.exe` beside `mida-cli`. Substituting the sibling is host
+  trust (equivalent to replacing the CLI), not a CLI interface bypass — the
+  interface (no `--acceptance-bin`, no env, no PATH) cannot direct the
+  resolver to any other binary.
 - The `v8` two-sample gate consumer (observations from live runs) is
   outside this change: the bundle digest equality with the attestation is
   enforced, but a live P7 smoke is still gated by operator authorization.
+- No real sample was opened or started; P7 is NOT authorized.
 - The AHK/GTO product-recovery route does not participate in the Oreans
   evidence-bundle chain (its attested context stays unused).
 - No claim of live, perfect, universal, or 10/10 behavior is made.
