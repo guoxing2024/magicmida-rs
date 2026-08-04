@@ -37,7 +37,7 @@ import time
 from pathlib import Path
 
 
-REPO_ROOT_DEFAULT = Path(__file__).resolve().parent.parent
+REPO_ROOT_DEFAULT = Path(__file__).resolve().parent.parent.parent.parent
 DEFAULT_TARGET = Path(
     r"D:\MidaVault\lab\evidence\gto_launcher\r27_nobypass_round0_20260725"
     r"\gto_protected.exe"

@@ -23,7 +23,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[1]
+REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / "tools"))
 from _r3_corpus import (  # noqa: E402
     FORBIDDEN_HOLDOUT_IDS,

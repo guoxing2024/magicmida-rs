@@ -588,8 +588,14 @@ def run_self_test() -> int:
         u_path.unlink(missing_ok=True)
 
     # load production clean-bytes manifest via loader (R2 may seal all five)
-    repo = Path(__file__).resolve().parents[1]
-    prod = repo / "docs" / "GTO_PRODUCT_RECOVERY_ROUTE_E_CLEAN_BYTES_20260730.json"
+    repo = Path(__file__).resolve().parents[3]
+    prod = (
+        repo
+        / "archive"
+        / "gto-20260730"
+        / "docs"
+        / "GTO_PRODUCT_RECOVERY_ROUTE_E_CLEAN_BYTES_20260730.json"
+    )
     if prod.is_file():
         sites_p, meta_p = load_clean_bytes_manifest(prod)
         assert meta_p["site_count"] >= 5

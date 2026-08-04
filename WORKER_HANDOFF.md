@@ -54,7 +54,7 @@ Perfect unpack of exactly two samples.
 
 ## GTO-PRODUCT-RECOVERY proposal filed (2026-07-29) — NOT a re-entry authorization
 
-**Proposal artifact:** [`docs/GTO_PRODUCT_RECOVERY_CHARTER_20260729.md`](docs/GTO_PRODUCT_RECOVERY_CHARTER_20260729.md) (new file on this baseline; both files resolve from repo root).
+**Proposal artifact:** [`archive/gto-20260730/docs/GTO_PRODUCT_RECOVERY_CHARTER_20260729.md`](archive/gto-20260730/docs/GTO_PRODUCT_RECOVERY_CHARTER_20260729.md) (new file on this baseline; both files resolve from repo root).
 
 **Status (proposal only, no action authorized):**
 
@@ -84,11 +84,11 @@ Perfect unpack of exactly two samples.
 
 ## Phase 0.5 Route D audit filed (2026-07-29) — read-only, no budget consumed
 
-**Audit artifact:** `docs/GTO_PRODUCT_RECOVERY_ROUTE_D_AUDIT_20260729.md` (new docs-only audit file; filed for expert review).
+**Audit artifact:** `archive/gto-20260730/docs/GTO_PRODUCT_RECOVERY_ROUTE_D_AUDIT_20260729.md` (new docs-only audit file; filed for expert review).
 
 **Status (read-only audit only, no action authorized):**
 
-- This is a **Phase 0.5 read-only debug-context audit** under `docs/GTO_PRODUCT_RECOVERY_CHARTER_20260729.md` §6.4 Route D. **Not** Phase 1. **Not** R1B re-entry. **Not** E2 activation. **Not** a live run. **Not** a source-code edit. **Not** push.
+- This is a **Phase 0.5 read-only debug-context audit** under `archive/gto-20260730/docs/GTO_PRODUCT_RECOVERY_CHARTER_20260729.md` §6.4 Route D. **Not** Phase 1. **Not** R1B re-entry. **Not** E2 activation. **Not** a live run. **Not** a source-code edit. **Not** push.
 - **Budget consumed = 0** (docs-only; no Rust/Python diff, no rebuild, no re-measure; per `docs/GTO_RESEARCH_CHARTER_20260728.md` §4.4 step 4 budget-burn rule, **investigation that does not produce Rust/Python diff + rebuild + re-measure is not a budget round**).
 - **`GTO-POINTEE-EPOCH` ledger is UNCHANGED** (used=2 / cap=2 / remaining=0).
 - **`GTO-PRODUCT-RECOVERY` ledger namespace is UNCHANGED** (Phase 0.5 = 0 rounds; Phase 1 still requires separate governance per charter §3.3 + §6.5 third-pass 2026-07-29).
@@ -112,8 +112,8 @@ Perfect unpack of exactly two samples.
 **Next action requires (separately from this filing):**
 
 - Expert review of the audit document.
-- Operator names `GTO-PRODUCT-RECOVERY Phase 1 on Route X` literally (per `docs/GTO_PRODUCT_RECOVERY_CHARTER_20260729.md` §3.3 + §8.6) **and** a new expert ruling OR charter amendment recorded in this handoff that explicitly allocates rounds in the `GTO-PRODUCT-RECOVERY` ledger namespace. **This Phase 0.5 audit does not allocate any rounds; it only informs method-class choice.**
-- If DRx is to be used at all: a separate governance proposal (e.g. `docs/GTO_PRODUCT_RECOVERY_LOCAL_HARNESS_20260729.md`) for a non-GTO local flag-acceptance harness is required first; **out of scope for this audit**.
+- Operator names `GTO-PRODUCT-RECOVERY Phase 1 on Route X` literally (per `archive/gto-20260730/docs/GTO_PRODUCT_RECOVERY_CHARTER_20260729.md` §3.3 + §8.6) **and** a new expert ruling OR charter amendment recorded in this handoff that explicitly allocates rounds in the `GTO-PRODUCT-RECOVERY` ledger namespace. **This Phase 0.5 audit does not allocate any rounds; it only informs method-class choice.**
+- If DRx is to be used at all: a separate governance proposal (e.g. `archive/gto-20260730/docs/GTO_PRODUCT_RECOVERY_LOCAL_HARNESS_20260729.md`) for a non-GTO local flag-acceptance harness is required first; **out of scope for this audit**.
 
 ## GTO-PRODUCT-RECOVERY Phase 1 Route A R1 — COMMITTED (2026-07-29/30)
 
@@ -122,13 +122,13 @@ Perfect unpack of exactly two samples.
 - Machine pre-report `aggregate.json` (R1 vault): `stability_score=1.0`; items 1–7 true; **`item_8_report=false` by design**; **`evidence_bar_pass=false`**.
 - Final R1 pass = expert acceptance after report review (strength-corrected: expand not proven; protect=32=`PAGE_EXECUTE_READ`; protection_transition supporting-weak only).
 - **Ledger after R1 commit:** Route A used=1 / cap=2 / remaining=1 (before R2).
-- Report: `docs/GTO_PRODUCT_RECOVERY_ROUTE_A_R1_20260729.md`. Plan: `docs/GTO_PRODUCT_RECOVERY_ROUTE_A_R1_PLAN_20260729.md`.
+- Report: `archive/gto-20260730/docs/GTO_PRODUCT_RECOVERY_ROUTE_A_R1_20260729.md`. Plan: `archive/gto-20260730/docs/GTO_PRODUCT_RECOVERY_ROUTE_A_R1_PLAN_20260729.md`.
 - Vault (READ-ONLY): `D:\MidaVault\scratch\product_recovery_route_a_r1_n3_20260729-155500\`.
 - **No push** of R1 commit required by that authorization; local seal only unless separately ordered.
 
 ## GTO-PRODUCT-RECOVERY Phase 1 Route A R2 — ACCEPTED / CLOSEOUT-READY (2026-07-30)
 
-**Status (per `docs/GTO_PRODUCT_RECOVERY_ROUTE_A_R2_20260730.md`):**
+**Status (per `archive/gto-20260730/docs/GTO_PRODUCT_RECOVERY_ROUTE_A_R2_20260730.md`):**
 
 - **R2 PASS accepted by expert review (2026-07-30).** Status = **accepted / closeout-ready**.
 - Machine pre-report `aggregate.json` (vault, unchanged): **N=5/5**, **reproduction_count=5**, identity **independent_count=5**; items 1–7 true; **`item_8_report=false` by design**; **`evidence_bar_pass=false`**. Human report layer accepted as item 8; machine aggregate is **not** rewritten to flip those flags.
@@ -139,9 +139,9 @@ Perfect unpack of exactly two samples.
 **R2 round artifacts (closeout commit on `codex/gto-product-recovery-route-a` from R1 seal `55976c9`; no push):**
 
 - Modified: `crates/cli/src/bin/mida_gto_product_recovery_observer.rs` (candidate_regions lifetime + multi-page fingerprint + neighborhood; honest bindings; round/drx/veh/injection flags).
-- Modified: `tools/_mtr_acq_route_a_observer.py` (N=5 default, `--round`).
-- Modified: `tools/_mtr_acq_route_a_aggregate.py` (family clustering + R2 evidence bar).
-- New: `docs/GTO_PRODUCT_RECOVERY_ROUTE_A_R2_20260730.md` (includes expert acceptance block).
+- Modified: `archive/gto-20260730/tools/_mtr_acq_route_a_observer.py` (N=5 default, `--round`).
+- Modified: `archive/gto-20260730/tools/_mtr_acq_route_a_aggregate.py` (family clustering + R2 evidence bar).
+- New: `archive/gto-20260730/docs/GTO_PRODUCT_RECOVERY_ROUTE_A_R2_20260730.md` (includes expert acceptance block).
 - Modified: `WORKER_HANDOFF.md` (this section).
 
 **R2 evidence (vault only, READ-ONLY input):**
@@ -189,9 +189,9 @@ Perfect unpack of exactly two samples.
 - Selected family: `sz0x120000|fp1891a1ae5a1e8f8f` (size `0x127000`, protect=32 `PAGE_EXECUTE_READ`, 5/5, identity dims=5)
 - Vault input (READ-ONLY): evidence set id `product_recovery_route_a_r2_n5_20260730-012013` (no vault rewrite; aggregate `item_8_report=false` retained)
 - Output:
-  - `docs/GTO_PRODUCT_RECOVERY_ROUTE_A_CANDIDATE_METADATA_20260730.json`
-  - `docs/GTO_PRODUCT_RECOVERY_ROUTE_A_CANDIDATE_METADATA_20260730.md`
-  - `tools/_mtr_route_a_candidate_metadata.py`
+  - `archive/gto-20260730/docs/GTO_PRODUCT_RECOVERY_ROUTE_A_CANDIDATE_METADATA_20260730.json`
+  - `archive/gto-20260730/docs/GTO_PRODUCT_RECOVERY_ROUTE_A_CANDIDATE_METADATA_20260730.md`
+  - `archive/gto-20260730/tools/_mtr_route_a_candidate_metadata.py`
 - Non-claims retained (not product 1.0; not gto perfect unpack; not R1B; not E2; not DRx/VEH/injection; not bypass; expand not proven; not necessarily RWX; no `.boot` module-visible binding).
 - Next-governance recommendation: accept M0 as deterministic R2 primary-anchor descriptor; any successor is a **separate** route-selection ruling (e.g. Route B); **do not reopen Route A R3**.
 - Local commit on branch `codex/gto-route-a-candidate-metadata` (parent `2c8ebeabbcd6da55ec2359300241d5aff3c461b8`; subject `gto: add route a candidate metadata pack`; four allowed files only). Record tip via `git rev-parse codex/gto-route-a-candidate-metadata`. **No push.**
@@ -423,7 +423,7 @@ Next governance step requires operator naming the route and new expert ruling/ch
 ### Changed files
 - crates/pe/src/dumper/container_bootstrap.rs (rollback of invalid R2 stub plant block)
 - crates/pe/src/dumper/heap_global_snapshot.rs (rollback of bogus placeholder test)
-- docs/GTO_PRODUCT_RECOVERY_ROUTE_C_RESIDUAL_STOP_20260730.md (new)
+- archive/gto-20260730/docs/GTO_PRODUCT_RECOVERY_ROUTE_C_RESIDUAL_STOP_20260730.md (new)
 - WORKER_HANDOFF.md (updated tail + R1 correction)
 
 ### Actual change
@@ -450,7 +450,7 @@ used=2 / cap=2 / remaining=0 (final Route C round; no R3)
 
 ## GTO-PRODUCT-RECOVERY Route D P0 Proposal (2026-07-30)
 
-**Proposal artifact:** `docs/GTO_PRODUCT_RECOVERY_ROUTE_D_P0_20260730.md` (new file on this baseline).
+**Proposal artifact:** `archive/gto-20260730/docs/GTO_PRODUCT_RECOVERY_ROUTE_D_P0_20260730.md` (new file on this baseline).
 
 **Status (proposal only, no action authorized):**
 - This is a **read-only governance proposal** — a docs-only artifact that **proposes** opening a **new** battlefield `GTO-PRODUCT-RECOVERY Route D` with a **proposed** ledger namespace. It does **not** open the battlefield; it does **not** allocate budget; it does **not** authorize any code change.
@@ -480,16 +480,16 @@ used=2 / cap=2 / remaining=0 (final Route C round; no R3)
 **Ledger:** used=1 / cap=2 / remaining=1
 
 ### Status
-- Deterministic harness: `tools/_mtr_gto_product_perfect_validate.py`
+- Deterministic harness: `archive/gto-20260730/tools/_mtr_gto_product_perfect_validate.py`
 - Flags: `--help`, `--self-test`, optional `--candidate`, optional `--output`
 - Env gate: `MIDA_GTO_BYPASS` / `MIDA_GTO_SEMANTIC_REPAIR` must be absent
 - Candidate (if supplied): sha256 + size in deterministic JSON
 - **Hard rule:** no live/UI/script evidence → overall **INCONCLUSIVE** (never invent PASS / product_1_0)
-- Report: `docs/GTO_PRODUCT_RECOVERY_ROUTE_D_R1_20260730.md`
+- Report: `archive/gto-20260730/docs/GTO_PRODUCT_RECOVERY_ROUTE_D_R1_20260730.md`
 
 ### Validation
-- `python tools/_mtr_gto_product_perfect_validate.py --help`
-- `python tools/_mtr_gto_product_perfect_validate.py --self-test`
+- `python archive/gto-20260730/tools/_mtr_gto_product_perfect_validate.py --help`
+- `python archive/gto-20260730/tools/_mtr_gto_product_perfect_validate.py --self-test`
 
 ### Non-claims
 - Not product 1.0 / not gto perfect unpack
@@ -508,12 +508,12 @@ used=2 / cap=2 / remaining=0 (final Route C round; no R3)
 - Defect: bypass gate only scanned forbidden env strings; did not verify 5 r26b patch sites
 
 ### R2 result
-- Hardened `tools/_mtr_gto_product_perfect_validate.py`:
+- Hardened `archive/gto-20260730/tools/_mtr_gto_product_perfect_validate.py`:
   - explicit r26b sites: `0x5c5d`, `0x63f4`, `0x34f66`, `0x34f59`, `0x6757`
   - missing candidate → INCONCLUSIVE; too small → FAIL; unsealed clean bytes → INCONCLUSIVE per site (never invent PASS)
   - `--evidence-json` for natural/UI/script evidence (explicit true + source/hash/timestamp)
   - `product_1_0` only if all required gates PASS
-- Report: `docs/GTO_PRODUCT_RECOVERY_ROUTE_D_R2_20260730.md`
+- Report: `archive/gto-20260730/docs/GTO_PRODUCT_RECOVERY_ROUTE_D_R2_20260730.md`
 - Validation: `--help` + `--self-test` OK
 - Status: **INCONCLUSIVE / residual** (no sealed clean bytes + no real live evidence → not product 1.0)
 
@@ -525,7 +525,7 @@ used=2 / cap=2 / remaining=0 (final Route C round; no R3)
 
 ## GTO-PRODUCT-RECOVERY Route E P0 Proposal (2026-07-30)
 
-**Proposal artifact:** `docs/GTO_PRODUCT_RECOVERY_ROUTE_E_P0_20260730.md`
+**Proposal artifact:** `archive/gto-20260730/docs/GTO_PRODUCT_RECOVERY_ROUTE_E_P0_20260730.md`
 **Base:** `9686221` on `codex/gto-route-d-r1`
 **Status:** proposal only — **0 rounds consumed**; implementation **not started**
 
@@ -558,13 +558,13 @@ used=2 / cap=2 / remaining=0 (final Route C round; no R3)
 **Ledger:** used=1 / cap=2 / remaining=1
 
 ### Result
-- Manifest: `docs/GTO_PRODUCT_RECOVERY_ROUTE_E_CLEAN_BYTES_20260730.json`
+- Manifest: `archive/gto-20260730/docs/GTO_PRODUCT_RECOVERY_ROUTE_E_CLEAN_BYTES_20260730.json`
 - All five r26b sites **UNSEALED** (no authorized offline clean-byte source; bytes not invented)
-- Harness: `--clean-bytes-json` integrated in `tools/_mtr_gto_product_perfect_validate.py`
+- Harness: `--clean-bytes-json` integrated in `archive/gto-20260730/tools/_mtr_gto_product_perfect_validate.py`
 - sealed+match → PASS; sealed+mismatch → FAIL; unsealed → INCONCLUSIVE
 - Self-test OK (synthetic seals only)
 - Production status: **INCONCLUSIVE** (no product_1_0; live/UI/script evidence still required for R2)
-- Report: `docs/GTO_PRODUCT_RECOVERY_ROUTE_E_R1_20260730.md`
+- Report: `archive/gto-20260730/docs/GTO_PRODUCT_RECOVERY_ROUTE_E_R1_20260730.md`
 
 ### Non-claims
 - Not product 1.0
@@ -588,8 +588,8 @@ used=2 / cap=2 / remaining=0 (final Route C round; no R3)
 - natural_execution / ui_script_path / script_engine_execution **FAIL**
 - Harness: `product_1_0=false` → **RESIDUAL-STOP**
 - Product 1.0 / perfect unpack **not achieved**
-- Report: `docs/GTO_PRODUCT_RECOVERY_ROUTE_E_R2_20260730.md`
-- Seal: `docs/GTO_PRODUCT_RECOVERY_ROUTE_E_RESIDUAL_STOP_20260730.md`
+- Report: `archive/gto-20260730/docs/GTO_PRODUCT_RECOVERY_ROUTE_E_R2_20260730.md`
+- Seal: `archive/gto-20260730/docs/GTO_PRODUCT_RECOVERY_ROUTE_E_RESIDUAL_STOP_20260730.md`
 - Residual blocker: no-bypass cold-start / heap-rebasing wall
 
 ### Hygiene
@@ -617,7 +617,7 @@ used=2 / cap=2 / remaining=0 (final Route C round; no R3)
   - covers r27 pre-object gap class (`0x846898` before `0x846bb0`)
 - Unit tests: `heap_slab_span_covers_r27_pre_object_gap` PASS
 - Route E harness self-test + clean-byte/evidence run: still `product_1_0=false`
-- Report: `docs/GTO_PRODUCT_RECOVERY_ROUTE_F_R1_20260730.md`
+- Report: `archive/gto-20260730/docs/GTO_PRODUCT_RECOVERY_ROUTE_F_R1_20260730.md`
 - Status: **INCONCLUSIVE** (fix landed; no live no-bypass product 1.0 proof this round)
 
 ### Non-claims
@@ -636,7 +636,7 @@ used=2 / cap=2 / remaining=0 (final Route C round; no R3)
   - FATAL: target exited during observation (`IAT_resolved=true`, `frozen_rip=None`)
   - no new no-bypass candidate produced; slab prefix **not live-remeasured**
 - Harness (Route E clean-bytes + evidence): `overall_status=FAIL`, `product_1_0=false`
-- Report: `docs/GTO_PRODUCT_RECOVERY_ROUTE_F_R2_20260730.md`
+- Report: `archive/gto-20260730/docs/GTO_PRODUCT_RECOVERY_ROUTE_F_R2_20260730.md`
 - Status: **RESIDUAL-STOP** — product 1.0 / perfect unpack **not achieved**
 - Residual blocker: no-bypass dump observation exit before freeze/dump (cannot prove F R1 on live); UI/script gates unproven
 
@@ -658,7 +658,7 @@ used=2 / cap=2 / remaining=0 (final Route C round; no R3)
   - size 71803392; sha256 `fde04b4321a73aedd8dec58e68a5ded1e9fbe873e389270c6c565596f23dd29f`
   - R0B StructuralPassBehaviorPending; clean-byte sites 5/5 PASS
 - Harness: `product_1_0=false` (live/UI/script evidence still FAIL)
-- Report: `docs/GTO_PRODUCT_RECOVERY_ROUTE_G_R1_20260730.md`
+- Report: `archive/gto-20260730/docs/GTO_PRODUCT_RECOVERY_ROUTE_G_R1_20260730.md`
 - Status: acquisition reliability **improved**; **not** product 1.0
 
 ### Non-claims
@@ -675,8 +675,8 @@ used=2 / cap=2 / remaining=0 (final Route C round; no R3)
 - Candidate: sha256 `fde04b4321a73aedd8dec58e68a5ded1e9fbe873e389270c6c565596f23dd29f` size 71803392
 - Probes (NO_BYPASS=1): load_no_crash **Pass** (1/3); window NewClassName **Fail** AV `0xc0000005`; script engine execution **Fail**
 - Harness: clean-byte **PASS**; `product_1_0=false`; overall **FAIL**
-- Evidence: `docs/GTO_PRODUCT_RECOVERY_ROUTE_G_EVIDENCE_20260730.json`
-- Report: `docs/GTO_PRODUCT_RECOVERY_ROUTE_G_R2_20260730.md`
+- Evidence: `archive/gto-20260730/docs/GTO_PRODUCT_RECOVERY_ROUTE_G_EVIDENCE_20260730.json`
+- Report: `archive/gto-20260730/docs/GTO_PRODUCT_RECOVERY_ROUTE_G_R2_20260730.md`
 - Status: **RESIDUAL-STOP** — product 1.0 / perfect unpack **not achieved**
 - Residual blocker: no-bypass UI path AV + no script-engine runtime proof
 
@@ -686,7 +686,7 @@ used=2 / cap=2 / remaining=0 (final Route C round; no R3)
 
 ## GTO-PRODUCT-RECOVERY Route H P0 Proposal (2026-07-30)
 
-**Proposal artifact:** `docs/GTO_PRODUCT_RECOVERY_ROUTE_H_P0_20260730.md`
+**Proposal artifact:** `archive/gto-20260730/docs/GTO_PRODUCT_RECOVERY_ROUTE_H_P0_20260730.md`
 **Base:** `f756950` on `codex/gto-route-g-r1`
 **Status:** proposal only — **0 rounds consumed**; implementation **not started**
 **Route G:** used=2/cap=2 **closed**; **no R3**
@@ -731,8 +731,8 @@ used=2 / cap=2 / remaining=0 (final Route C round; no R3)
 - Dump: **ui_seen=false**, last_resort IAT+9s
 - load/UI probes: **WinError 193** (invalid PE); clean-byte vs old seals **FAIL**
 - `product_1_0=false` — **not** product PASS
-- Report: `docs/GTO_PRODUCT_RECOVERY_ROUTE_H_R1_20260730.md`
-- Evidence: `docs/GTO_PRODUCT_RECOVERY_ROUTE_H_EVIDENCE_20260730.json`
+- Report: `archive/gto-20260730/docs/GTO_PRODUCT_RECOVERY_ROUTE_H_R1_20260730.md`
+- Evidence: `archive/gto-20260730/docs/GTO_PRODUCT_RECOVERY_ROUTE_H_EVIDENCE_20260730.json`
 - Residual: new-layout dump not loader-valid; clean-byte must re-seal for 46539ea7; UI never seen live
 
 ### Non-claims
@@ -764,8 +764,8 @@ used=2 / cap=2 / remaining=0 (final Route C round; no R3)
 **UI path AV `0xc0000005` before NewClassName** (product UI / script blocked).
 
 ### Docs
-- Report: `docs/GTO_PRODUCT_RECOVERY_ROUTE_H_R2_20260731.md`
-- Evidence: `docs/GTO_PRODUCT_RECOVERY_ROUTE_H_EVIDENCE_20260730.json` (round=R2, real timestamps)
+- Report: `archive/gto-20260730/docs/GTO_PRODUCT_RECOVERY_ROUTE_H_R2_20260731.md`
+- Evidence: `archive/gto-20260730/docs/GTO_PRODUCT_RECOVERY_ROUTE_H_EVIDENCE_20260730.json` (round=R2, real timestamps)
 
 ### Non-claims
 - Not product 1.0 / not perfect unpack

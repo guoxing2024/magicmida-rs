@@ -94,7 +94,7 @@ Plugin identify does **not** enable those stages by itself.
 | R4-A0 identify | `live_20260723-223131_r4a0_id`: dual-select **ahk_gto** conf=80; oreans=NoMatch |
 | R4-A1 GTO | `live_20260723-223852_r4a1_gto`: selected=**ahk_gto** conf=80; dump family=ahk_gto; R0B StructuralPass* |
 | R4-A1 Origin | `batch_…_r4a1_oreans_reg`: selected=**oreans_themida** conf=83; EP `0x13e0`; IAT 295/295 |
-| R4-A2 harness | `tools/_gto_live_smoke.py` → `batch_…_r4a2_gto`: family=ahk_gto conf=80 EP `0xecc000` R0B StructuralPass* |
+| R4-A2 harness | `archive/gto-20260730/tools/_gto_live_smoke.py` → `batch_…_r4a2_gto`: family=ahk_gto conf=80 EP `0xecc000` R0B StructuralPass* |
 | R4-A2 Origin | `batch_…_r4a2_oreans_reg` EP `0x13e0` R0B StructuralPass* (no GTO profile) |
 | R4-A3 GTO | `batch_…_r4a3b_gto`: recovered cookie site + Planted MSVC default; PostCrt→pre-OEP INFO; R0B StructuralPass* |
 | R4-A3 Origin | `batch_…_r4a3_oreans_reg` EP `0x13e0` R0B StructuralPass* |
@@ -113,7 +113,7 @@ cargo test -p mida-packers-ahk-gto --offline
 cargo test -p mida-cli --lib --offline selected_
 cargo test -p mida-cli --lib --offline r4_select
 # GTO harness (explicit profile; not R4/R3 gate):
-python tools\_gto_live_smoke.py --cases gto_launcher --tag r4a3_gto --require-r0b
+python archive\gto-20260730\tools\_gto_live_smoke.py --cases gto_launcher --tag r4a3_gto --require-r0b
 # Oreans broader reg (engineering R4-B; not R3 10x, not R4-C):
 python tools\_oreans_repeat_smoke.py --cases origin_macro,lunlun_software,xiongxiong_duokai --count 1 --tag r4b_oreans_reg --require-r0b --require-holdout --expect-ep origin_macro=0x13e0
 ```
@@ -122,7 +122,7 @@ python tools\_oreans_repeat_smoke.py --cases origin_macro,lunlun_software,xiongx
 
 | Item | Detail |
 |------|--------|
-| GTO command | `python tools\_gto_live_smoke.py --cases gto_launcher --tag r4c_gto --require-r0b` |
+| GTO command | `python archive\gto-20260730\tools\_gto_live_smoke.py --cases gto_launcher --tag r4c_gto --require-r0b` |
 | Oreans command | `python tools\_oreans_repeat_smoke.py --cases origin_macro,lunlun_software,xiongxiong_duokai --count 1 --tag r4c_oreans_reg --require-r0b --require-holdout --expect-ep …` |
 | GTO batch | `D:\MidaVault\lab\evidence\_gto_smoke\batch_20260723-225951_r4c_gto` |
 | Oreans batch | `D:\MidaVault\lab\evidence\_repeat\batch_20260723-230053_r4c_oreans_reg` |

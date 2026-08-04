@@ -69,7 +69,7 @@ closes the **largest safe gaps** without lying about gates.
 
 ### U2 — Regression cadence (continuous)
 
-1. `tools/_smoke_p1_origin_gto.cmd` after each host-touching commit.
+1. `archive/gto-20260730/tools/_smoke_p1_origin_gto.cmd` after each host-touching commit.
 2. On demand (not every micro-commit): Lunlun 1×, holdout 1× (not R3 10× re-gate).
 3. Synthetic: `cargo test -p mida-acceptance --offline`; B-A1/B-A3 smokes if behavior code touched.
 
@@ -168,7 +168,7 @@ cargo test -p mida-acceptance --offline
 cargo test -p mida-cli --lib --offline dual_select
 python tools\_behavior_ba3_smoke.py
 python lab\cases\verify_manifests.py --objects-root D:\MidaVault\objects\sha256
-cmd /c tools\_smoke_p1_origin_gto.cmd
+cmd /c archive\gto-20260730\tools\_smoke_p1_origin_gto.cmd
 ```
 
 Non-claims after green smokes: **not** R3 10×, **not** R4 re-gate, **not**

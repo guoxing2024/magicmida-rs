@@ -2,6 +2,9 @@
 target/
 .cargo-target/
 
+# Local toolchain directory (recreated by rustup when RUSTUP_HOME is repo-local)
+.rustup-local/
+
 # Local agent / session noise (never product)
 bash_events/
 conversations/

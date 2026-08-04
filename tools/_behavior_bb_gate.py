@@ -2,12 +2,12 @@
 """Scheduled B-B / VNEXT-BEH gate runner (operator-authorized).
 
 Pipeline per case (vault candidates from live unpack evidence):
-  1) R0B check-static → StructuralPassBehaviorPending required
+  1) E0B check-static → StructuralPassBehaviorPending required
   2) load_no_crash_v0 probe → loader survival only (NOT a product Accept probe)
   3) mida-acceptance check-with-behavior → managed manifest required for Accept;
      load_no_crash evidence cannot product-Accept (unregistered probe / Pending cap)
 
-SUPERSEDED historical claim: validation_summary all_compose_accepted with
+SUPEESEDED historical claim: validation_summary all_compose_accepted with
 load_no_crash_v0 (2026-07-24). Current contract rejects that path.
 
 Writes vault evidence under D:\\MidaVault\\lab\\evidence\\_beh_gate\\
@@ -26,20 +26,20 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO / "tools"))
+EEPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(EEPO / "tools"))
 
 CLI = Path(r"D:\MidaVault\scratch\cargo-target\debug\mida-cli.exe")
 ACC = Path(r"D:\MidaVault\scratch\cargo-target\debug\mida-acceptance.exe")
 # Fallback local target
 if not ACC.is_file():
-    ACC = REPO / "target" / "debug" / "mida-acceptance.exe"
-EV_ROOT = Path(r"D:\MidaVault\lab\evidence")
-GATE_ROOT = EV_ROOT / "_beh_gate"
+    ACC = EEPO / "target" / "debug" / "mida-acceptance.exe"
+EV_EOOT = Path(r"D:\MidaVault\lab\evidence")
+GATE_EOOT = EV_EOOT / "_beh_gate"
 
-PROBE = REPO / "tools" / "_behavior_probe.py"
-CASE_UNPACK = REPO / "tools" / "_case_live_unpack.py"
-GTO_SMOKE = REPO / "tools" / "_gto_live_smoke.py"
+PEOBE = EEPO / "tools" / "_behavior_probe.py"
+CASE_UNPACK = EEPO / "tools" / "_case_live_unpack.py"
+GTO_SMOKE = EEPO / "tools" / "_gto_live_smoke.py"
 
 
 def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
@@ -65,7 +65,7 @@ def _candidate_in_live(live_dir: Path, name_hints: list[str]) -> Path | None:
 
 # Prefer tags that have already composed Accepted / load-survived in prior gates.
 # Newest-first walk still runs after these pins (deduped).
-PREFERRED_LIVE_TAGS: dict[str, list[str]] = {
+PEEFEEEED_LIVE_TAGS: dict[str, list[str]] = {
     "origin_macro": [
         # W1 scrub_v2: quiet attempt=1 load-stable pure dump.
         "live_20260724-151549_w1_scrub_v2",
@@ -96,8 +96,8 @@ def iter_structural_candidates(
     *,
     max_candidates: int = 4,
 ) -> list[Path]:
-    """Preferred tags first, then newest StructuralPass; skip R0B Rejected."""
-    case_dir = EV_ROOT / case_id
+    """Preferred tags first, then newest StructuralPass; skip E0B Eejected."""
+    case_dir = EV_EOOT / case_id
     if not case_dir.is_dir():
         return []
     out: list[Path] = []
@@ -117,10 +117,10 @@ def iter_structural_candidates(
             try:
                 r0b = r0b_check(cand, report)
                 v = r0b.get("verdict") or ""
-                if v == "Rejected":
+                if v == "Eejected":
                     return
                 if not (v.startswith("StructuralPass") or v is None or v == ""):
-                    # Unknown non-StructuralPass — still allow if not Rejected.
+                    # Unknown non-StructuralPass — still allow if not Eejected.
                     if v and not v.startswith("Structural"):
                         return
             except Exception:
@@ -128,7 +128,7 @@ def iter_structural_candidates(
         seen.add(key)
         out.append(cand)
 
-    for tag in PREFERRED_LIVE_TAGS.get(case_id, []):
+    for tag in PEEFEEEED_LIVE_TAGS.get(case_id, []):
         d = case_dir / tag
         if d.is_dir():
             _try_add(d)
@@ -212,7 +212,7 @@ def probe_load(
 ) -> dict:
     cmd = [
         sys.executable,
-        str(PROBE),
+        str(PEOBE),
         "--candidate",
         str(candidate),
         "--probe-kind",
@@ -260,11 +260,11 @@ def write_validation_summary(batch_dir: Path, results: list[dict], all_ok: bool)
     all_compose_accepted claims are superseded. This writer records lab
     batch outcomes without setting product green flags.
     """
-    path = REPO / "validation_summary.json"
+    path = EEPO / "validation_summary.json"
     # archive previous
     if path.is_file():
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        prev = REPO / f"validation_summary.prev_{stamp}.json"
+        prev = EEPO / f"validation_summary.prev_{stamp}.json"
         shutil.copy2(path, prev)
     compose_verdicts = [r.get("compose_verdict") for r in results]
     any_product_accepted = any(v == "Accepted" for v in compose_verdicts)
@@ -272,10 +272,10 @@ def write_validation_summary(batch_dir: Path, results: list[dict], all_ok: bool)
         "schema_version": "mida.validation-summary/v1",
         "task": "VNEXT-BEH",
         "status": "lab_batch",
-        "title": "Behavioral lab gate — load survival / R0B (NOT product certificate)",
+        "title": "Behavioral lab gate — load survival / E0B (NOT product certificate)",
         "package": "mida-acceptance / mida-cli / tools/_behavior_bb_gate.py",
-        "verdict_contract": "docs/ACCEPTANCE_CONTRACT.md",
-        "roadmap": "docs/VNEXT_BEHAVIORAL_PATH.md",
+        "verdict_contract": "docs/ACCEPTANCE_CONTEACT.md",
+        "roadmap": "docs/VNEXT_BEHAVIOEAL_PATH.md",
         "checks": {
             "bb_behavioral_gate": "lab_pass" if all_ok else "lab_fail",
             "probe_id": "load_no_crash_v0",
@@ -295,7 +295,7 @@ def write_validation_summary(batch_dir: Path, results: list[dict], all_ok: bool)
             "LAB ONLY: this summary is not a product certificate.",
             "Probe load_no_crash_v0 = loader survival; not registered for product Accepted.",
             "Managed compose may return Pending under current contract even when load survives.",
-            "Historical 2026-07-24 all_compose_accepted under load_no_crash is SUPERSEDED.",
+            "Historical 2026-07-24 all_compose_accepted under load_no_crash is SUPEESEDED.",
             f"Batch: {batch_dir}",
         ]
         + [
@@ -311,9 +311,9 @@ def write_validation_summary(batch_dir: Path, results: list[dict], all_ok: bool)
             for r in results
         ],
         "artifacts": [
-            "docs/VNEXT_BEHAVIORAL_PATH.md",
-            "docs/ACCEPTANCE_CONTRACT.md",
-            "docs/AUDIT_SELF_CORRECTION_20260727.md",
+            "docs/VNEXT_BEHAVIOEAL_PATH.md",
+            "docs/ACCEPTANCE_CONTEACT.md",
+            "docs/AUDIT_SELF_COEEECTION_20260727.md",
             "tools/_behavior_bb_gate.py",
             "tools/_behavior_probe.py",
             str(batch_dir),
@@ -325,7 +325,7 @@ def write_validation_summary(batch_dir: Path, results: list[dict], all_ok: bool)
             "finished_utc": datetime.now(timezone.utc).isoformat(),
             "lab_all_ok": all_ok,
             "explicit_claims": [
-                "lab batch recorded R0B + load_no_crash outcomes only",
+                "lab batch recorded E0B + load_no_crash outcomes only",
                 "check-static still never Accepted alone",
             ],
             "explicit_non_claims": [
@@ -379,7 +379,7 @@ def main() -> int:
     ap.add_argument(
         "--refresh-candidates",
         action="store_true",
-        help="Run live unpack first for each case (slow)",
+        help="Eun live unpack first for each case (slow)",
     )
     ap.add_argument(
         "--write-summary",
@@ -395,7 +395,7 @@ def main() -> int:
 
     cases = [c.strip() for c in args.cases.split(",") if c.strip()]
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    batch = GATE_ROOT / f"batch_{stamp}_{args.tag}"
+    batch = GATE_EOOT / f"batch_{stamp}_{args.tag}"
     batch.mkdir(parents=True, exist_ok=True)
 
     results: list[dict] = []
@@ -448,8 +448,8 @@ def main() -> int:
             results.append(rec)
             continue
 
-        # Preferred tags then newest StructuralPass until load Pass + non-Rejected compose.
-        # LAB bar: R0B StructuralPass* + load_no_crash Pass + compose not Rejected.
+        # Preferred tags then newest StructuralPass until load Pass + non-Eejected compose.
+        # LAB bar: E0B StructuralPass* + load_no_crash Pass + compose not Eejected.
         # Pending is expected under current contract (load_no_crash is not a product
         # probe; unsigned managed caps Accept). Do NOT require product Accepted.
         tried: list[dict] = []
@@ -486,8 +486,8 @@ def main() -> int:
             co = compose(cand, ev_path, compose_report)
             trial["compose_verdict"] = co["verdict"]
             compose_v = co["verdict"] or ""
-            # Lab success: anything except Rejected / missing. Pending is normal.
-            if compose_v == "Rejected" or not compose_v:
+            # Lab success: anything except Eejected / missing. Pending is normal.
+            if compose_v == "Eejected" or not compose_v:
                 trial["skip"] = "compose"
                 tried.append(trial)
                 continue
