@@ -209,8 +209,14 @@ pub fn handle_trace_step(
         );
     }
 
-    let ip = query.get_rip(trace.trace_thread_id).unwrap_or(0) as usize;
-    let sp = query.get_rsp(trace.trace_thread_id).unwrap_or(0) as usize;
+    let ip = query
+        .get_rip(trace.trace_thread_id)
+        .ok_or_else(|| "get_thread_context_control failed: no RIP".to_string())?
+        as usize;
+    let sp = query
+        .get_rsp(trace.trace_thread_id)
+        .ok_or_else(|| "get_thread_context_control failed: no RSP".to_string())?
+        as usize;
 
     if trace.trace_counter.is_multiple_of(50000) {
         query.log(
