@@ -19,6 +19,7 @@ pub mod gates;
 pub mod identity;
 pub mod oracle;
 pub mod pe;
+pub mod preflight;
 pub mod report;
 pub mod verdict;
 
@@ -89,4 +90,10 @@ pub use oreans_pe_evidence::{
     OreansPeDirectoryCoverage, OreansPeEvidence, OreansPeEvidenceError, OreansPeSectionEvidence,
     OreansRelocationEvidence, OreansRuntimeFunctionEvidence,
     OreansTlsEvidence as OreansPeTlsEvidence, OREANS_PE_EVIDENCE_SCHEMA_VERSION,
+};
+pub use preflight::{
+    canonical_runner_config, check_case_identity, run_offline_preflight, runner_config_digest,
+    write_preflight_report, CaseIdentity, CaseManifestV2, CasePreflight, FileIdentity,
+    IdentityVerdict, IsolationConfig, PreflightReport, PreflightRequest, PreflightStatus,
+    RunnerConfig, WorktreeProbe, WorktreeState, PREFLIGHT_REPORT_SCHEMA_VERSION,
 };
