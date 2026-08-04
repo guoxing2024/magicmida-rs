@@ -199,6 +199,7 @@ pub fn handle_trace_step(
         );
         trace.failed_count += 1;
         trace.failed_slots.push(trace.current_slot);
+        trace.current_slot += 1;
         return advance_to_next_slot(query, trace);
     }
 
@@ -322,16 +323,26 @@ fn handle_trace_result(
         trace.failed_slots.push(trace.current_slot);
     }
 
+    // The armed slot's outcome is consumed: move past it, then advance.
+    trace.current_slot += 1;
     advance_to_next_slot(query, trace)
 }
 
 /// Move to the next IAT slot that needs tracing, or write the resolved IAT
 /// back to the target if all slots are done.
+///
+/// Slot-0 fix (P6-0, explicit semantic correction after the P3 migration):
+/// the legacy walk pre-incremented `current_slot` before its first
+/// examination, so slot 0 — the first real thunk of the IAT — was never
+/// classified and non-empty tables could never report `product_complete`.
+/// The increment now happens where the *previous* slot's outcome is
+/// consumed (`handle_trace_result` / step give-up), so the walk classifies
+/// every slot from index 0. This is a deliberate behavior change from the
+/// P3 baseline, pinned by dedicated tests.
 pub fn advance_to_next_slot(
     query: &mut dyn IatTraceQuery,
     trace: &mut IatTraceState,
 ) -> Result<IatTraceAction, String> {
-    trace.current_slot += 1;
     trace.traced_api = 0;
     trace.trace_in_vm = false;
     trace.trace_counter = 0;

@@ -259,33 +259,44 @@ fn full_pipeline_guard_tls_oep_iat_dump() {
         TRACE_THREAD,
         TRACE_SP,
     );
-
-    // Arm slot 1.
+    // Arm slot 0 (P6-0: the walk classifies every slot from index 0).
     let action = advance_to_next_slot(&mut iat_query, &mut trace).expect("advance");
     assert!(matches!(action, IatTraceAction::TraceSlot { .. }));
+    assert_eq!(trace.current_slot, 0);
 
-    // Resolve slot 1 -> Finished with writeback.
+    // Resolve slot 0 -> arm slot 1.
+    let action = handle_trace_step(&mut iat_query, &mut trace).expect("step");
+    assert!(matches!(action, IatTraceAction::TraceSlot { .. }));
+    assert_eq!(trace.slot_values[0], REAL_API);
+
+    // Resolve slot 1 -> Finished with writeback and product-complete.
     let action = handle_trace_step(&mut iat_query, &mut trace).expect("step");
     match action {
         IatTraceAction::Finished {
-            writeback, aborted, ..
+            writeback,
+            product_complete,
+            aborted,
         } => {
             assert!(writeback);
+            assert!(
+                product_complete,
+                "P6-0: fully accounted non-empty IAT is product-complete"
+            );
             assert!(!aborted);
         }
         other => panic!("expected Finished, got {other:?}"),
     }
     assert_eq!(trace.slot_values[1], REAL_API);
-    assert_eq!(trace.resolved_count, 1);
+    assert_eq!(trace.resolved_count, 2);
+    assert_eq!(trace.slots_accounted(), 2);
     // protect(exe) + write + protect(restore).
     assert_eq!(iat_query.protect, 2);
     assert_eq!(iat_query.writes, 1);
 
     // Dump boundary: OEP + resolved IAT are both available for the dump.
     assert_eq!(outcome.state.oep, Some(OEP));
-    assert_eq!(trace.resolved_count, 1);
+    assert_eq!(trace.resolved_count, 2);
 }
-
 /// Every action maps to exactly one host-side continue: the IAT step
 /// decisions must never imply a double continue.
 #[test]
