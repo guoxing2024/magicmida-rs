@@ -92,8 +92,7 @@ pub(crate) fn retarget_iat_gap_call_sites(
         let val = u64::from_le_bytes(dump_buf[off..off + 8].try_into().unwrap_or([0; 8]));
         if val == 0 {
             let prev = u64::from_le_bytes(dump_buf[off - 8..off].try_into().unwrap_or([0; 8]));
-            let next =
-                u64::from_le_bytes(dump_buf[off + 8..off + 16].try_into().unwrap_or([0; 8]));
+            let next = u64::from_le_bytes(dump_buf[off + 8..off + 16].try_into().unwrap_or([0; 8]));
             if prev != 0 && next != 0 {
                 interior_zeros.push(off as u32);
             }
@@ -123,9 +122,7 @@ pub(crate) fn retarget_iat_gap_call_sites(
     let mut sites_seen = 0usize;
 
     for section in pe.sections.iter().filter(|s| {
-        s.characteristics & IMAGE_SCN_MEM_EXECUTE != 0
-            || s.name == ".text"
-            || s.name == ".wfix"
+        s.characteristics & IMAGE_SCN_MEM_EXECUTE != 0 || s.name == ".text" || s.name == ".wfix"
     }) {
         let start = section.virtual_address as usize;
         let end = start
@@ -146,8 +143,7 @@ pub(crate) fn retarget_iat_gap_call_sites(
                     let window_start = i.saturating_sub(0x40);
                     let window = &dump_buf[window_start..i];
                     if let Some(api_name) = classify_gap_call(window, slot_rva, &gap_api) {
-                        if let Some(&target_slot) =
-                            slot_by_name.get(&api_name.to_ascii_lowercase())
+                        if let Some(&target_slot) = slot_by_name.get(&api_name.to_ascii_lowercase())
                         {
                             let new_disp = target_slot as i64 - next_rva as i64;
                             if let Ok(d) = i32::try_from(new_disp) {
@@ -308,7 +304,9 @@ mod tests {
 
     #[test]
     fn msgbox_utype_imm_detected() {
-        let pre = [0x41, 0xB8, 0x0A, 0x00, 0x00, 0x00, 0x48, 0x8D, 0x15, 0, 0, 0, 0];
+        let pre = [
+            0x41, 0xB8, 0x0A, 0x00, 0x00, 0x00, 0x48, 0x8D, 0x15, 0, 0, 0, 0,
+        ];
         assert!(window_has_msgbox_utype(&pre));
     }
 

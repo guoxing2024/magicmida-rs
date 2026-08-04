@@ -219,45 +219,84 @@ pub fn relocations_from_map(
     let raw = slice_rva(map, dd.virtual_address, dd.size, max)?;
     let mut out = Vec::new();
     let mut pos = 0usize;
-    while pos + 8 <= raw.len() {
-        let page_rva = u32::from_le_bytes(raw[pos..pos + 4].try_into().unwrap());
-        let block_size = u32::from_le_bytes(raw[pos + 4..pos + 8].try_into().unwrap()) as usize;
-        if block_size < 8 || pos + block_size > raw.len() {
+    while pos < raw.len() {
+        let remaining = raw.len() - pos;
+        if remaining < 8 {
+            if raw[pos..].iter().all(|&b| b == 0) {
+                break;
+            }
+            return Err(PeError::Parse(format!(
+                "truncated basereloc header at +{pos:#x}"
+            )));
+        }
+        let page_rva = u32::from_le_bytes(
+            raw[pos..pos + 4]
+                .try_into()
+                .map_err(|_| PeError::Parse("invalid basereloc page RVA width".into()))?,
+        );
+        let block_size_u32 = u32::from_le_bytes(
+            raw[pos + 4..pos + 8]
+                .try_into()
+                .map_err(|_| PeError::Parse("invalid basereloc block size width".into()))?,
+        );
+        let block_size = usize::try_from(block_size_u32)
+            .map_err(|_| PeError::Parse("basereloc block size does not fit usize".into()))?;
+        if block_size < 8 || block_size % 4 != 0 {
             return Err(PeError::Parse(format!(
                 "invalid basereloc block at +{pos:#x}: size={block_size:#x}"
             )));
         }
+        let block_end = pos
+            .checked_add(block_size)
+            .ok_or_else(|| PeError::Parse("basereloc block range overflow".into()))?;
+        if block_end > raw.len() {
+            return Err(PeError::Parse(format!(
+                "basereloc block at +{pos:#x} extends beyond directory"
+            )));
+        }
         let entries = (block_size - 8) / 2;
         for i in 0..entries {
-            let eoff = pos + 8 + i * 2;
-            let ent = u16::from_le_bytes(raw[eoff..eoff + 2].try_into().unwrap());
+            let eoff = pos
+                .checked_add(8)
+                .and_then(|n| n.checked_add(i.checked_mul(2)?))
+                .ok_or_else(|| PeError::Parse("basereloc entry offset overflow".into()))?;
+            let ent = u16::from_le_bytes(
+                raw[eoff..eoff + 2]
+                    .try_into()
+                    .map_err(|_| PeError::Parse("invalid basereloc entry width".into()))?,
+            );
             let typ = ent >> 12;
-            let off = (ent & 0x0FFF) as u32;
+            let off = u32::from(ent & 0x0FFF);
             if typ == IMAGE_REL_BASED_ABSOLUTE {
                 continue;
             }
-            out.push((page_rva.wrapping_add(off), typ));
+            let rva = page_rva
+                .checked_add(off)
+                .ok_or_else(|| PeError::Parse(format!("basereloc RVA overflow at +{eoff:#x}")))?;
+            out.push((rva, typ));
         }
-        pos += block_size;
-        // Align progress if block_size is odd (should not happen; PE uses 4-byte align).
-        if block_size % 4 != 0 {
-            pos = (pos + 3) & !3;
-            if pos > raw.len() {
-                break;
-            }
-        }
+        pos = block_end;
     }
     Ok(out)
 }
 
 /// True when section `[va, va+vsz)` fully covers `[dir_va, dir_va+dir_sz)`.
-fn section_covers_directory(sec_va: u32, sec_vsz: u32, dir_va: u32, dir_sz: u32) -> bool {
+fn section_covers_directory(
+    sec_va: u32,
+    sec_vsz: u32,
+    dir_va: u32,
+    dir_sz: u32,
+) -> Result<bool, PeError> {
     if dir_va == 0 || dir_sz == 0 || sec_vsz == 0 {
-        return false;
+        return Ok(false);
     }
-    let sec_end = sec_va.saturating_add(sec_vsz);
-    let dir_end = dir_va.saturating_add(dir_sz);
-    sec_va <= dir_va && sec_end >= dir_end
+    let sec_end = sec_va
+        .checked_add(sec_vsz)
+        .ok_or_else(|| PeError::Parse("section directory coverage range overflow".into()))?;
+    let dir_end = dir_va
+        .checked_add(dir_sz)
+        .ok_or_else(|| PeError::Parse("directory range overflow".into()))?;
+    Ok(sec_va <= dir_va && sec_end >= dir_end)
 }
 
 /// Build a pure [`RebuildPlan`] from a memory-layout image map.
@@ -308,7 +347,7 @@ pub fn plan_from_memory_image(
         }
     }
 
-    let mut relocs = if opts.rebind_relocations {
+    let relocs = if opts.rebind_relocations {
         relocations_from_map(map, &pe, opts.max_slice_bytes)?
     } else {
         Vec::new()
@@ -326,7 +365,7 @@ pub fn plan_from_memory_image(
                         sec.virtual_size,
                         exc_dd.virtual_address,
                         exc_dd.size,
-                    )
+                    )?
                 {
                     continue;
                 }
@@ -339,7 +378,7 @@ pub fn plan_from_memory_image(
                 sec.virtual_size,
                 reloc_dd.virtual_address,
                 reloc_dd.size,
-            )
+            )?
         {
             continue;
         }
@@ -552,6 +591,34 @@ mod tests {
             relocs.iter().any(|(rva, typ)| *rva == 0x1000 && *typ == 10),
             "expected DIR64 at 0x1000, got {relocs:?}"
         );
+    }
+
+    #[test]
+    fn malformed_relocation_block_size_is_rejected() {
+        let file = synthetic_map_with_exception_and_reloc();
+        let mut map = file_image_to_va_map(&file);
+        let pe = PeHeader::from_bytes(&map).expect("pe");
+        let dd = pe.nt_headers.optional_header.data_directory[DIR_BASERELOC];
+        let off = dd.virtual_address as usize;
+        map[off + 4..off + 8].copy_from_slice(&10u32.to_le_bytes());
+        let err = relocations_from_map(&map, &pe, 16 * 1024 * 1024)
+            .expect_err("non-aligned relocation block must fail");
+        assert!(matches!(err, PeError::Parse(_)));
+    }
+
+    #[test]
+    fn relocation_page_rva_overflow_is_rejected() {
+        let file = synthetic_map_with_exception_and_reloc();
+        let mut map = file_image_to_va_map(&file);
+        let pe = PeHeader::from_bytes(&map).expect("pe");
+        let dd = pe.nt_headers.optional_header.data_directory[DIR_BASERELOC];
+        let off = dd.virtual_address as usize;
+        map[off..off + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        map[off + 4..off + 8].copy_from_slice(&8u32.to_le_bytes());
+        map[off + 8..off + 10].copy_from_slice(&0x3001u16.to_le_bytes());
+        let err = relocations_from_map(&map, &pe, 16 * 1024 * 1024)
+            .expect_err("relocation RVA overflow must fail");
+        assert!(matches!(err, PeError::Parse(_)));
     }
 
     #[test]

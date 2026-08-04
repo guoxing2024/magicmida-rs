@@ -21,8 +21,7 @@ use crate::byte_map::{exception_builder_from_map, relocations_from_map, section_
 use crate::error::PeError;
 use crate::header::PeHeader;
 use crate::rebuild::{
-    rebuild_pe_image_with_meta, PlannedSection, RebuildPlan, DIR_BASERELOC,
-    DIR_EXCEPTION,
+    rebuild_pe_image_with_meta, PlannedSection, RebuildPlan, DIR_BASERELOC, DIR_EXCEPTION,
 };
 
 /// Options for the pure rebuild emit path (host side).
@@ -377,7 +376,14 @@ pub fn emit_pure_rebuild_with_parity(
     pe: &PeHeader,
     dump_buf: &[u8],
     opts: &PureRebuildEmitOptions,
-) -> Result<(Vec<u8>, PureRebuildParitySnapshot, PureRebuildParitySnapshot), PeError> {
+) -> Result<
+    (
+        Vec<u8>,
+        PureRebuildParitySnapshot,
+        PureRebuildParitySnapshot,
+    ),
+    PeError,
+> {
     let host = PureRebuildParitySnapshot::from_pe(pe);
     let image = emit_pure_rebuild(pe, dump_buf, opts)?;
     let re = PeHeader::from_bytes(&image)?;
@@ -398,9 +404,7 @@ fn section_covers(sec_rva: u32, sec_vsize: u32, dir_rva: u32, dir_size: u32) -> 
 mod tests {
     use super::*;
     use crate::header::{ImageDataDirectory, PeHeader};
-    use crate::rebuild::{
-        rebuild_pe_image, PlannedSection, RebuildPlan, DIR_IAT, DIR_IMPORT,
-    };
+    use crate::rebuild::{rebuild_pe_image, PlannedSection, RebuildPlan, DIR_IAT, DIR_IMPORT};
     use crate::utils::align_up;
 
     fn synthetic_va_image() -> (PeHeader, Vec<u8>) {
@@ -593,10 +597,10 @@ mod tests {
     /// Not byte-identical; not runtime. Typed import rebind remains out of scope.
     #[test]
     fn r1e_dual_path_import_content_structural_corpus() {
-        use crate::header::{ImageDataDirectory, ImageSectionHeader, PeSection};
-        use crate::import_table::{ImportModule, ImportTableBuilder, ImportThunk};
         use super::super::output_writer::write_output_file;
         use super::super::types::{ContainerRestoreMode, DumpOptions, DumpProfile};
+        use crate::header::{ImageDataDirectory, ImageSectionHeader, PeSection};
+        use crate::import_table::{ImportModule, ImportTableBuilder, ImportThunk};
         use mida_acceptance::{check_static, CheckStaticOptions, Verdict, ROLE_CANDIDATE};
 
         // --- Host-prepared model (what dump_process has after IAT rebuild) ---
@@ -684,7 +688,10 @@ mod tests {
             emit_pure_rebuild_with_parity(&pe, &dump_buf, &pure_opts).expect("pure emit");
         let pure_pe = PeHeader::from_bytes(&pure_bytes).expect("reparse pure");
         assert!(
-            pure_pe.sections.iter().any(|s| s.name.starts_with(".import")),
+            pure_pe
+                .sections
+                .iter()
+                .any(|s| s.name.starts_with(".import")),
             "pure emit must keep host .import content section"
         );
         assert_eq!(
@@ -764,7 +771,11 @@ mod tests {
             "pure dual-path candidate must pass R0B static gates: {:?}",
             pure_report.failures
         );
-        assert!(pure_report.failures.is_empty(), "{:?}", pure_report.failures);
+        assert!(
+            pure_report.failures.is_empty(),
+            "{:?}",
+            pure_report.failures
+        );
 
         // Legacy is also judged when it is a well-formed PE; pointer fixups may
         // differ, but structural loader gates should still pass on this corpus.
@@ -799,11 +810,8 @@ mod tests {
         let mut plan = RebuildPlan::pe32_plus();
         plan.image_base = 0x140000000;
         plan.entry_point_rva = 0x1000;
-        plan.sections.push(PlannedSection::new(
-            ".text",
-            0x6000_0020,
-            vec![0xC3],
-        ));
+        plan.sections
+            .push(PlannedSection::new(".text", 0x6000_0020, vec![0xC3]));
         plan.imports = Some(imports);
         let meta = rebuild_pe_image_with_meta(&plan).expect("oracle rebuild");
         let oracle = meta.image;
@@ -936,7 +944,10 @@ mod tests {
         assert!(
             plan.sections.iter().any(|s| s.name == ".winlice"),
             "rebind-off must keep exception cover section; got {:?}",
-            plan.sections.iter().map(|s| s.name.as_str()).collect::<Vec<_>>()
+            plan.sections
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>()
         );
         assert_eq!(plan.image_base, 0x0000_0140_0000_0000);
 
@@ -1006,7 +1017,13 @@ mod tests {
         opts.rebind_exceptions = true;
         let plan = plan_from_host_dump(&pe, &dump_buf, &opts).expect("plan");
         // If rebind produced entries, cover section is skipped.
-        if plan.exceptions.as_ref().map(|b| b.function_count()).unwrap_or(0) > 0 {
+        if plan
+            .exceptions
+            .as_ref()
+            .map(|b| b.function_count())
+            .unwrap_or(0)
+            > 0
+        {
             assert!(
                 !plan.sections.iter().any(|s| s.name == ".winlice"),
                 "rebind-on should skip exception cover section"

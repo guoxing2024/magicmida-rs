@@ -559,3 +559,300 @@ pub fn read_original_import_table_with_rvas(path: &Path) -> Vec<(String, u32, Ve
 
     result
 }
+
+/// One normalized import identity at a final-candidate IAT slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalImportIdentity {
+    /// IAT slot RVA in the serialized candidate.
+    pub slot_rva: u32,
+    /// Lowercase ASCII-normalized DLL/module name.
+    pub module_name: String,
+    /// Exactly one of `function_name` and `ordinal` is populated.
+    pub function_name: Option<String>,
+    /// Exactly one of `function_name` and `ordinal` is populated.
+    pub ordinal: Option<u16>,
+}
+
+/// Strictly parse every import descriptor, lookup thunk, and final IAT thunk.
+///
+/// The parser is deliberately independent from the legacy lossy import APIs:
+/// it returns `Result`, preserves function-name case, treats ordinal imports as
+/// first-class identities, and verifies that the serialized `FirstThunk` bytes
+/// agree with the lookup encoding at the same slot RVA.
+pub fn parse_final_import_identities(
+    bytes: &[u8],
+) -> Result<Vec<FinalImportIdentity>, crate::error::PeError> {
+    let pe = PeHeader::from_bytes(bytes)?;
+    let dir = pe.nt_headers.optional_header.data_directory[1];
+    if dir.virtual_address == 0 || dir.size == 0 {
+        return Err(crate::error::PeError::Parse(
+            "final candidate has no import directory".into(),
+        ));
+    }
+    let dir_start = dir.virtual_address;
+    let dir_end = dir_start
+        .checked_add(dir.size)
+        .ok_or_else(|| crate::error::PeError::Parse("import directory RVA overflow".into()))?;
+    let ptr_size = if pe.is_64bit { 8usize } else { 4usize };
+    let ordinal_flag = if pe.is_64bit {
+        0x8000_0000_0000_0000u64
+    } else {
+        0x8000_0000u64
+    };
+
+    let mut out = Vec::new();
+    let mut seen_slots = std::collections::HashSet::new();
+    let mut desc_rva = dir_start;
+    let mut terminated = false;
+    while desc_rva.checked_add(20).is_some_and(|end| end <= dir_end) {
+        let desc = read_rva_exact(bytes, &pe, desc_rva, 20, "import descriptor")?;
+        // IMAGE_IMPORT_DESCRIPTOR is terminated only by a full 20-byte zero
+        // record.  Timestamp/forwarder fields are not ignorable here.
+        if desc.iter().all(|byte| *byte == 0) {
+            terminated = true;
+            break;
+        }
+        let oft = u32::from_le_bytes(desc[0..4].try_into().unwrap());
+        let name_rva = u32::from_le_bytes(desc[12..16].try_into().unwrap());
+        let first_thunk = u32::from_le_bytes(desc[16..20].try_into().unwrap());
+        if name_rva == 0 || first_thunk == 0 {
+            return Err(crate::error::PeError::Parse(format!(
+                "invalid import descriptor at RVA {desc_rva:#x}"
+            )));
+        }
+        let module_name = normalize_module_name(read_rva_cstring(bytes, &pe, name_rva, "module")?)?;
+        let lookup_rva = if oft != 0 { oft } else { first_thunk };
+        let mut index = 0usize;
+
+        loop {
+            let delta = u32::try_from(
+                index
+                    .checked_mul(ptr_size)
+                    .ok_or_else(|| crate::error::PeError::Parse("thunk index overflow".into()))?,
+            )
+            .map_err(|_| crate::error::PeError::Parse("thunk RVA overflow".into()))?;
+            let lookup = lookup_rva
+                .checked_add(delta)
+                .ok_or_else(|| crate::error::PeError::Parse("lookup thunk RVA overflow".into()))?;
+            let iat_rva = first_thunk
+                .checked_add(delta)
+                .ok_or_else(|| crate::error::PeError::Parse("IAT slot RVA overflow".into()))?;
+            let lookup_value = decode_thunk(read_rva_exact(
+                bytes,
+                &pe,
+                lookup,
+                ptr_size,
+                "import lookup thunk",
+            )?);
+            let final_value = decode_thunk(read_rva_exact(
+                bytes,
+                &pe,
+                iat_rva,
+                ptr_size,
+                "final IAT thunk",
+            )?);
+            if lookup_value == 0 {
+                if final_value != 0 {
+                    return Err(crate::error::PeError::Parse(format!(
+                        "final IAT terminator mismatch at slot RVA {iat_rva:#x}"
+                    )));
+                }
+                break;
+            }
+            if final_value != lookup_value {
+                return Err(crate::error::PeError::Parse(format!(
+                    "lookup/final thunk encoding mismatch at slot RVA {iat_rva:#x}"
+                )));
+            }
+            if !seen_slots.insert(iat_rva) {
+                return Err(crate::error::PeError::Parse(format!(
+                    "duplicate final import slot RVA {iat_rva:#x}"
+                )));
+            }
+            let lookup_identity =
+                decode_import_identity(bytes, &pe, lookup_value, ordinal_flag, iat_rva)?;
+            let final_identity =
+                decode_import_identity(bytes, &pe, final_value, ordinal_flag, iat_rva)?;
+            if lookup_identity != final_identity {
+                return Err(crate::error::PeError::Parse(format!(
+                    "lookup/final IAT identity mismatch at slot RVA {iat_rva:#x}"
+                )));
+            }
+            let (function_name, ordinal) = lookup_identity;
+            if function_name.is_some() == ordinal.is_some() {
+                return Err(crate::error::PeError::Parse(format!(
+                    "import identity is not exactly-one at slot RVA {iat_rva:#x}"
+                )));
+            }
+            out.push(FinalImportIdentity {
+                slot_rva: iat_rva,
+                module_name: module_name.clone(),
+                function_name,
+                ordinal,
+            });
+            index = index
+                .checked_add(1)
+                .ok_or_else(|| crate::error::PeError::Parse("thunk count overflow".into()))?;
+            if index > 1_000_000 {
+                return Err(crate::error::PeError::Parse(
+                    "import thunk count exceeds safety limit".into(),
+                ));
+            }
+        }
+
+        desc_rva = desc_rva
+            .checked_add(20)
+            .ok_or_else(|| crate::error::PeError::Parse("descriptor RVA overflow".into()))?;
+    }
+    if !terminated {
+        return Err(crate::error::PeError::Parse(
+            "import descriptor array is not terminated within directory".into(),
+        ));
+    }
+    if out.is_empty() {
+        return Err(crate::error::PeError::Parse(
+            "final candidate import table has no thunks".into(),
+        ));
+    }
+    out.sort_by_key(|item| item.slot_rva);
+    Ok(out)
+}
+
+fn decode_thunk(bytes: &[u8]) -> u64 {
+    match bytes.len() {
+        8 => u64::from_le_bytes(bytes.try_into().unwrap()),
+        4 => u32::from_le_bytes(bytes.try_into().unwrap()) as u64,
+        _ => unreachable!("PE thunk width is 4 or 8 bytes"),
+    }
+}
+
+fn decode_import_identity(
+    bytes: &[u8],
+    pe: &PeHeader,
+    value: u64,
+    ordinal_flag: u64,
+    slot_rva: u32,
+) -> Result<(Option<String>, Option<u16>), crate::error::PeError> {
+    if value & ordinal_flag != 0 {
+        // Ordinal is the low 16 bits.  Zero is representable and therefore
+        // accepted; only reserved bits outside the flag/ordinal are invalid.
+        if value & !ordinal_flag & !0xffff != 0 {
+            return Err(crate::error::PeError::Parse(format!(
+                "invalid reserved ordinal bits at slot RVA {slot_rva:#x}"
+            )));
+        }
+        return Ok((None, Some((value & 0xffff) as u16)));
+    }
+    let hint_name_rva = u32::try_from(value).map_err(|_| {
+        crate::error::PeError::Parse(format!(
+            "import hint/name RVA out of range at slot RVA {slot_rva:#x}"
+        ))
+    })?;
+    let name_rva = hint_name_rva
+        .checked_add(2)
+        .ok_or_else(|| crate::error::PeError::Parse("hint/name RVA overflow".into()))?;
+    let name = read_rva_cstring(bytes, pe, name_rva, "function")?;
+    Ok((Some(validate_function_name(name)?), None))
+}
+
+fn normalize_module_name(bytes: &[u8]) -> Result<String, crate::error::PeError> {
+    let text = validate_import_name(bytes, "module")?;
+    Ok(text.to_ascii_lowercase())
+}
+
+fn validate_function_name(bytes: &[u8]) -> Result<String, crate::error::PeError> {
+    Ok(validate_import_name(bytes, "function")?.to_string())
+}
+
+fn validate_import_name<'a>(bytes: &'a [u8], what: &str) -> Result<&'a str, crate::error::PeError> {
+    if bytes.is_empty() {
+        return Err(crate::error::PeError::Parse(format!("empty {what} name")));
+    }
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| crate::error::PeError::Parse(format!("{what} name is not UTF-8")))?;
+    if text.as_bytes().contains(&0) || text.trim().is_empty() {
+        return Err(crate::error::PeError::Parse(format!(
+            "invalid empty {what} name"
+        )));
+    }
+    Ok(text)
+}
+
+fn read_rva_exact<'a>(
+    bytes: &'a [u8],
+    pe: &PeHeader,
+    rva: u32,
+    len: usize,
+    what: &str,
+) -> Result<&'a [u8], crate::error::PeError> {
+    let offset = pe.rva_to_offset(rva).ok_or_else(|| {
+        crate::error::PeError::Parse(format!("{what} RVA {rva:#x} is outside sections"))
+    })? as usize;
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| crate::error::PeError::Parse(format!("{what} file offset overflow")))?;
+    if end > bytes.len() {
+        return Err(crate::error::PeError::Parse(format!(
+            "{what} exceeds serialized candidate bounds"
+        )));
+    }
+    let section = pe
+        .sections
+        .iter()
+        .find(|section| {
+            let start = section.virtual_address as u64;
+            let end_rva = start + section.raw_size as u64;
+            (rva as u64) >= start && (rva as u64) + len as u64 <= end_rva
+        })
+        .ok_or_else(|| {
+            crate::error::PeError::Parse(format!(
+                "{what} RVA {rva:#x} is outside serialized raw section data"
+            ))
+        })?;
+    let expected = section.raw_offset as usize + (rva - section.virtual_address) as usize;
+    if expected != offset {
+        return Err(crate::error::PeError::Parse(format!(
+            "{what} RVA mapping is inconsistent"
+        )));
+    }
+    Ok(&bytes[offset..end])
+}
+
+fn read_rva_cstring<'a>(
+    bytes: &'a [u8],
+    pe: &PeHeader,
+    rva: u32,
+    what: &str,
+) -> Result<&'a [u8], crate::error::PeError> {
+    let offset = pe.rva_to_offset(rva).ok_or_else(|| {
+        crate::error::PeError::Parse(format!("{what} RVA {rva:#x} is outside sections"))
+    })? as usize;
+    let section = pe
+        .sections
+        .iter()
+        .find(|section| {
+            (rva as u64) >= section.virtual_address as u64
+                && (rva as u64) < section.virtual_address as u64 + section.raw_size as u64
+        })
+        .ok_or_else(|| {
+            crate::error::PeError::Parse(format!("{what} is outside serialized raw section data"))
+        })?;
+    let section_end = (section.raw_offset as usize)
+        .checked_add(section.raw_size as usize)
+        .ok_or_else(|| crate::error::PeError::Parse("section bounds overflow".into()))?
+        .min(bytes.len());
+    if offset >= section_end || offset >= bytes.len() {
+        return Err(crate::error::PeError::Parse(format!(
+            "empty/out-of-range {what}"
+        )));
+    }
+    let nul = bytes[offset..section_end]
+        .iter()
+        .position(|byte| *byte == 0)
+        .ok_or_else(|| crate::error::PeError::Parse(format!("unterminated {what}")))?;
+    let value = &bytes[offset..offset + nul];
+    if value.is_empty() {
+        return Err(crate::error::PeError::Parse(format!("empty {what}")));
+    }
+    Ok(value)
+}

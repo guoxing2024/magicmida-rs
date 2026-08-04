@@ -5,6 +5,8 @@
 /// them when the image loads at a different base address.
 use std::collections::BTreeMap;
 
+use crate::error::PeError;
+
 /// A single relocation entry
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RelocationEntry {
@@ -51,17 +53,29 @@ impl RelocationTableBuilder {
             .push(RelocationEntry { rva, typ });
     }
 
-    /// Scan data for absolute addresses and add relocations
+    /// Scan data for absolute addresses and add relocations.
     ///
-    /// This scans a section for pointers that point to the image itself.
-    /// Such pointers need to be relocated when the image loads at a different base.
+    /// This compatibility wrapper preserves the historical infallible API.
+    /// New code should use [`Self::scan_and_add_relocations_checked`] so RVA
+    /// and image-range overflow is not silently accepted.
     pub fn scan_and_add_relocations(&mut self, data: &[u8], section_rva: u32, is_64bit: bool) {
+        let _ = self.scan_and_add_relocations_checked(data, section_rva, is_64bit);
+    }
+
+    /// Checked variant of [`Self::scan_and_add_relocations`].
+    pub fn scan_and_add_relocations_checked(
+        &mut self,
+        data: &[u8],
+        section_rva: u32,
+        is_64bit: bool,
+    ) -> Result<(), PeError> {
         use tracing::debug;
 
         let ptr_size = if is_64bit { 8 } else { 4 };
-        let image_start = self.image_base;
-        let image_end = self.image_base + self.image_size as u64;
-
+        let image_end = self
+            .image_base
+            .checked_add(self.image_size as u64)
+            .ok_or_else(|| PeError::Parse("relocation image range overflow".into()))?;
         let mut found_count = 0;
 
         for offset in (0..data.len().saturating_sub(ptr_size - 1)).step_by(ptr_size) {
@@ -71,15 +85,19 @@ impl RelocationTableBuilder {
                 u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap_or([0; 4])) as u64
             };
 
-            // Check if this looks like an absolute address pointing to our image
-            if addr >= image_start && addr < image_end {
-                let entry_rva = section_rva + offset as u32;
-
-                let reloc_type = if is_64bit {
-                    10 // IMAGE_REL_BASED_DIR64
-                } else {
-                    3 // IMAGE_REL_BASED_HIGHLOW
-                };
+            if addr >= self.image_base && addr < image_end {
+                let entry_rva = section_rva
+                    .checked_add(u32::try_from(offset).map_err(|_| {
+                        PeError::Parse("relocation scan offset exceeds PE32".into())
+                    })?)
+                    .ok_or_else(|| PeError::Parse("relocation RVA overflow".into()))?;
+                if entry_rva >= self.image_size {
+                    return Err(PeError::Parse(format!(
+                        "relocation RVA {entry_rva:#x} outside image size {:#x}",
+                        self.image_size
+                    )));
+                }
+                let reloc_type = if is_64bit { 10 } else { 3 };
                 self.add_relocation(entry_rva, reloc_type);
                 found_count += 1;
             }
@@ -91,6 +109,7 @@ impl RelocationTableBuilder {
                 section_rva, found_count
             );
         }
+        Ok(())
     }
 
     /// Get total number of relocations
@@ -98,47 +117,142 @@ impl RelocationTableBuilder {
         self.blocks.values().map(|v| v.len()).sum()
     }
 
-    /// Build the .reloc section data
-    ///
-    /// Format: Multiple IMAGE_BASE_RELOCATION blocks, each covering a 4KB page
-    /// Each block has:
-    ///   DWORD VirtualAddress (page RVA)
-    ///   DWORD SizeOfBlock (size of this block including header)
-    ///   WORD  TypeOffset entries (type in high 4 bits, offset in low 12 bits)
-    pub fn build(&self) -> Vec<u8> {
+    /// Validate all relocation entries before serialization.
+    pub fn validate(&self) -> Result<(), PeError> {
+        if self.image_size == 0 && !self.blocks.is_empty() {
+            return Err(PeError::Parse("relocation image size is zero".into()));
+        }
+        for (&page_rva, entries) in &self.blocks {
+            if page_rva & 0xFFF != 0 || page_rva >= self.image_size {
+                return Err(PeError::Parse(format!(
+                    "relocation page RVA {page_rva:#x} outside image"
+                )));
+            }
+            for entry in entries {
+                if entry.rva < page_rva || entry.rva - page_rva > 0xFFF {
+                    return Err(PeError::Parse(format!(
+                        "relocation RVA {:#x} does not belong to page {page_rva:#x}",
+                        entry.rva
+                    )));
+                }
+                if entry.rva >= self.image_size {
+                    return Err(PeError::Parse(format!(
+                        "relocation RVA {:#x} outside image size {:#x}",
+                        entry.rva, self.image_size
+                    )));
+                }
+                if entry.typ > 0xF {
+                    return Err(PeError::Parse(format!(
+                        "relocation type {} exceeds PE nibble",
+                        entry.typ
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Build the .reloc section data, rejecting malformed ranges.
+    pub fn build_checked(&self) -> Result<Vec<u8>, PeError> {
+        self.validate()?;
         let mut reloc_data = Vec::new();
 
         for (&page_rva, entries) in &self.blocks {
-            // Each block must be aligned to 4 bytes and have an even number of entries
             let mut entries = entries.clone();
-
-            // If odd number of entries, add a padding entry (type 0 = ABSOLUTE, no-op)
             if entries.len() % 2 != 0 {
                 entries.push(RelocationEntry {
                     rva: page_rva,
                     typ: 0,
                 });
             }
-
-            // Block header: VirtualAddress + SizeOfBlock
-            let block_size = 8 + (entries.len() * 2); // 8-byte header + 2 bytes per entry
+            let block_size = 8usize
+                .checked_add(
+                    entries
+                        .len()
+                        .checked_mul(2)
+                        .ok_or_else(|| PeError::Parse("relocation block size overflow".into()))?,
+                )
+                .ok_or_else(|| PeError::Parse("relocation block size overflow".into()))?;
+            let block_size_u32 = u32::try_from(block_size)
+                .map_err(|_| PeError::Parse("relocation block exceeds PE32 size".into()))?;
             reloc_data.extend_from_slice(&page_rva.to_le_bytes());
-            reloc_data.extend_from_slice(&(block_size as u32).to_le_bytes());
+            reloc_data.extend_from_slice(&block_size_u32.to_le_bytes());
 
-            // Entries: type (4 bits) + offset (12 bits)
             for entry in entries {
                 let offset_in_page = entry.rva - page_rva;
                 let type_offset = (entry.typ << 12) | (offset_in_page as u16 & 0xFFF);
                 reloc_data.extend_from_slice(&type_offset.to_le_bytes());
             }
         }
-
-        // Align to 4 bytes
         while reloc_data.len() % 4 != 0 {
             reloc_data.push(0);
         }
+        Ok(reloc_data)
+    }
 
-        reloc_data
+    /// Compatibility serializer for callers that already guarantee valid
+    /// entries.  Invalid builders emit an empty table rather than wrapping.
+    pub fn build(&self) -> Vec<u8> {
+        self.build_checked().unwrap_or_default()
+    }
+
+    /// Apply this builder's relocations to an image copied at `new_base`.
+    ///
+    /// This is a pure ASLR correctness primitive used by synthetic tests and
+    /// recovery verification; it never touches a live process.
+    pub fn apply_to_image(
+        &self,
+        image: &mut [u8],
+        new_base: u64,
+        is_64bit: bool,
+    ) -> Result<(), PeError> {
+        self.validate()?;
+        let delta = if new_base >= self.image_base {
+            new_base - self.image_base
+        } else {
+            self.image_base - new_base
+        };
+        for entries in self.blocks.values() {
+            for entry in entries {
+                if entry.typ == 0 {
+                    continue;
+                }
+                let width = if is_64bit { 8 } else { 4 };
+                let off = entry.rva as usize;
+                let end = off
+                    .checked_add(width)
+                    .ok_or_else(|| PeError::Parse("relocation image offset overflow".into()))?;
+                if end > image.len() {
+                    return Err(PeError::Parse(format!(
+                        "relocation RVA {:#x} exceeds image buffer",
+                        entry.rva
+                    )));
+                }
+                if is_64bit {
+                    let old = u64::from_le_bytes(image[off..end].try_into().unwrap());
+                    let value = if new_base >= self.image_base {
+                        old.checked_add(delta)
+                    } else {
+                        old.checked_sub(delta)
+                    }
+                    .ok_or_else(|| PeError::Parse("DIR64 relocation overflow".into()))?;
+                    image[off..end].copy_from_slice(&value.to_le_bytes());
+                } else {
+                    let old = u32::from_le_bytes(image[off..end].try_into().unwrap());
+                    let delta32 = u32::try_from(delta).map_err(|_| {
+                        PeError::Parse("HIGHLOW relocation delta exceeds u32".into())
+                    })?;
+                    let value = if new_base >= self.image_base {
+                        old.checked_add(delta32)
+                    } else {
+                        old.checked_sub(delta32)
+                    }
+                    .ok_or_else(|| PeError::Parse("HIGHLOW relocation overflow".into()))?;
+                    image[off..end].copy_from_slice(&value.to_le_bytes());
+                }
+            }
+        }
+        Ok(())
     }
 }
 

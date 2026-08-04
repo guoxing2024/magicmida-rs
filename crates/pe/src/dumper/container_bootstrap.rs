@@ -311,8 +311,8 @@ fn install_container_section(
     // r27 Round 2: collect writable non-standard sections (Themida .,\W etc.)
     // for phase-2.5b interior heap-pointer rebase at runtime.
     const STD_SECTIONS: &[&str] = &[
-        ".text", ".rdata", ".data", ".pdata", ".bss", ".tls", ".rsrc",
-        ".idata", ".reloc", ".import", ".edata", ".boot",
+        ".text", ".rdata", ".data", ".pdata", ".bss", ".tls", ".rsrc", ".idata", ".reloc",
+        ".import", ".edata", ".boot",
     ];
     let scan_sections: Vec<(u32, u32)> = pe
         .sections
@@ -462,7 +462,7 @@ pub(crate) fn build_tls_bootstrap_stub(
         &[],
         None, // heap_slab (TLS path not used for GTO)
         None, // virtual_alloc (TLS path)
-        &[], // scan_sections (TLS path)
+        &[],  // scan_sections (TLS path)
         data_snapshot,
         image_base,
         data_section_rva,
@@ -503,7 +503,11 @@ fn build_container_stub_internal(
         .len()
         .checked_add(heap_globals.len())?
         .checked_add(if slab_present { 1 } else { 0 })?;
-    let slab_fixup_index = if slab_present { range_count.checked_sub(1)? } else { 0 };
+    let slab_fixup_index = if slab_present {
+        range_count.checked_sub(1)?
+    } else {
+        0
+    };
     let slab_old_base = heap_slab.map(|s| s.old_base).unwrap_or(0);
     let slab_len = heap_slab.map(|s| s.content.len()).unwrap_or(0);
     let mut measured_code = Vec::new();
@@ -550,9 +554,8 @@ fn build_container_stub_internal(
             .iter()
             .try_fold(0usize, |total, g| total.checked_add(g.content.len()))?,
     )?;
-    let slab_data_offset = data_snapshot_offset.checked_add(
-        data_snapshot.map(|s| s.data_content.len()).unwrap_or(0),
-    )?;
+    let slab_data_offset = data_snapshot_offset
+        .checked_add(data_snapshot.map(|s| s.data_content.len()).unwrap_or(0))?;
     let slab_data_end = slab_data_offset.checked_add(slab_len)?;
     // scan_sections table (u32 count + (rva,size) pairs) placed after slab content.
     let scan_sections_table_size = 4usize + scan_sections.len().checked_mul(8)?;
@@ -1047,7 +1050,7 @@ fn build_stub_code(
             stub.push(0x00);
             // Success: store new_begin, memcpy slab content
             stub.extend_from_slice(&[0x48, 0x89, 0x43, 0x10]); // mov [rbx+0x10], rax
-            // memcpy(rax, stub+slab_data_offset, size): rcx=rax, rdx=src, r8=size
+                                                               // memcpy(rax, stub+slab_data_offset, size): rcx=rax, rdx=src, r8=size
             stub.extend_from_slice(&[0x48, 0x89, 0xc1]); // mov rcx, rax
             stub.extend_from_slice(&[0x48, 0x8d, 0x15]); // lea rdx, [rip+disp]
             let lea_next = stub_rva.checked_add(stub.len() as u32)?.checked_add(4)?;
@@ -1071,7 +1074,7 @@ fn build_stub_code(
             let call2_next = stub_rva.checked_add(stub.len() as u32)?.checked_add(4)?;
             stub.extend_from_slice(&relative_displacement(call2_next, heap_alloc_iat_rva)?);
             stub.extend_from_slice(&[0x48, 0x89, 0x43, 0x10]); // mov [rbx+0x10], rax
-            // memcpy(rax, stub+slab_data_offset, size)
+                                                               // memcpy(rax, stub+slab_data_offset, size)
             stub.extend_from_slice(&[0x48, 0x89, 0xc1]); // mov rcx, rax
             stub.extend_from_slice(&[0x48, 0x8d, 0x15]); // lea rdx, [rip+disp]
             let lea2_next = stub_rva.checked_add(stub.len() as u32)?.checked_add(4)?;
@@ -1365,14 +1368,16 @@ fn retarget_gto_resume_entry(dump_buf: &[u8], scanned_entry: u32) -> u32 {
         // creates NewClassName window — all without bypass patches.
         let pe_ep = {
             let e_off = u32::from_le_bytes(
-                dump_buf.get(0x3c..0x40)
+                dump_buf
+                    .get(0x3c..0x40)
                     .map(|s| s.try_into().unwrap_or([0; 4]))
                     .unwrap_or([0; 4]),
             ) as usize;
             // Optional header starts at e_off + 4 (PE sig) + 20 (COFF header) = e_off + 24
             let ao = e_off + 24;
             u32::from_le_bytes(
-                dump_buf.get(ao + 16..ao + 20)
+                dump_buf
+                    .get(ao + 16..ao + 20)
                     .map(|s| s.try_into().unwrap_or([0; 4]))
                     .unwrap_or([0; 4]),
             )
@@ -1631,8 +1636,11 @@ mod tests {
             .position(|w| w == clear)
             .expect("clear volatile regs before OEP");
         assert_eq!(stub[pos + clear.len()], 0xe9, "clear must precede near jmp");
-        let rel =
-            i32::from_le_bytes(stub[pos + clear.len() + 1..pos + clear.len() + 5].try_into().unwrap());
+        let rel = i32::from_le_bytes(
+            stub[pos + clear.len() + 1..pos + clear.len() + 5]
+                .try_into()
+                .unwrap(),
+        );
         let next = stub_rva + (pos + clear.len() + 5) as u32;
         assert_eq!((next as i64 + i64::from(rel)) as u32, oep);
     }
@@ -1759,29 +1767,29 @@ mod tests {
         // Arg order must match build_stub_code (24 params after stub buffer).
         build_stub_code(
             &mut stub,
-            0x1000,            // stub_rva
-            None,              // original_entry_point (TLS mode)
-            0x2000,            // get_process_heap_iat_rva
-            0x2010,            // heap_alloc_iat_rva
-            0,                 // container_count
-            0,                 // heap_global_count
-            0,                 // metadata_offset
-            0,                 // heap_global_meta_offset
-            0,                 // fixup_map_offset
-            0,                 // range_count
-            0,                 // slab_fixup_index
-            None,              // virtual_alloc_iat_rva
-            0,                 // slab_old_base
-            0,                 // slab_data_offset
-            0,                 // scan_sections_offset
-            0,                 // scan_sections_count
-            None,              // data_snapshot
-            0,                 // data_snapshot_offset
-            0x140000000,       // image_base
-            0,                 // data_section_rva
-            None,              // heap_global_rva
-            None,              // cookie_rva
-            None,              // cookie_mirror
+            0x1000,      // stub_rva
+            None,        // original_entry_point (TLS mode)
+            0x2000,      // get_process_heap_iat_rva
+            0x2010,      // heap_alloc_iat_rva
+            0,           // container_count
+            0,           // heap_global_count
+            0,           // metadata_offset
+            0,           // heap_global_meta_offset
+            0,           // fixup_map_offset
+            0,           // range_count
+            0,           // slab_fixup_index
+            None,        // virtual_alloc_iat_rva
+            0,           // slab_old_base
+            0,           // slab_data_offset
+            0,           // scan_sections_offset
+            0,           // scan_sections_count
+            None,        // data_snapshot
+            0,           // data_snapshot_offset
+            0x140000000, // image_base
+            0,           // data_section_rva
+            None,        // heap_global_rva
+            None,        // cookie_rva
+            None,        // cookie_mirror
         )
         .expect("TLS stub should build");
 

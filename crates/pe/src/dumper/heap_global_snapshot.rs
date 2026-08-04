@@ -562,7 +562,7 @@ pub fn detect_heap_globals(
                 live_ptr: value,
                 content: Vec::new(),
                 is_heap_handle: true,
-            is_image_inline: false,
+                is_image_inline: false,
             });
             continue;
         }
@@ -702,7 +702,7 @@ pub fn detect_heap_globals(
             live_ptr: value,
             content,
             is_heap_handle: false,
-        is_image_inline: false,
+            is_image_inline: false,
         });
     }
 
@@ -979,7 +979,10 @@ fn capture_image_inline_gscript(
             old_size = removed.content.len(),
             "Replacing gscript pointer-slot capture with image-inline body"
         );
-    } else if out.iter().any(|g| g.rva == gscript_rva && g.is_image_inline) {
+    } else if out
+        .iter()
+        .any(|g| g.rva == gscript_rva && g.is_image_inline)
+    {
         return;
     }
 
@@ -1011,16 +1014,12 @@ fn capture_image_inline_gscript(
                     if o + 40 > dump_buf.len() {
                         break;
                     }
-                    let va = u32::from_le_bytes(
-                        dump_buf[o + 12..o + 16].try_into().unwrap_or_default(),
-                    );
-                    let vsz = u32::from_le_bytes(
-                        dump_buf[o + 8..o + 12].try_into().unwrap_or_default(),
-                    );
+                    let va =
+                        u32::from_le_bytes(dump_buf[o + 12..o + 16].try_into().unwrap_or_default());
+                    let vsz =
+                        u32::from_le_bytes(dump_buf[o + 8..o + 12].try_into().unwrap_or_default());
                     if gscript_rva >= va && gscript_rva < va.saturating_add(vsz.max(1)) {
-                        rem = va
-                            .saturating_add(vsz)
-                            .saturating_sub(gscript_rva) as usize;
+                        rem = va.saturating_add(vsz).saturating_sub(gscript_rva) as usize;
                         break;
                     }
                 }
@@ -1029,7 +1028,10 @@ fn capture_image_inline_gscript(
         rem
     };
     let min_need = 0xC00usize;
-    let mut cap = policy.gscript_content_cap().max(min_need).min(MAX_HEAP_GLOBAL_BYTES);
+    let mut cap = policy
+        .gscript_content_cap()
+        .max(min_need)
+        .min(MAX_HEAP_GLOBAL_BYTES);
     if section_remain > 0 {
         cap = cap.min(section_remain);
     }
@@ -1057,8 +1059,7 @@ fn capture_image_inline_gscript(
     if size < min_need {
         warn!(
             rva = format_args!("{gscript_rva:#x}"),
-            size,
-            "gscript image-inline capture too small; leaving without inline body"
+            size, "gscript image-inline capture too small; leaving without inline body"
         );
         return;
     }
@@ -1089,8 +1090,7 @@ fn capture_image_inline_gscript(
     if got < min_need {
         warn!(
             rva = format_args!("{gscript_rva:#x}"),
-            got,
-            "gscript image-inline capture failed"
+            got, "gscript image-inline capture failed"
         );
         return;
     }
@@ -1180,7 +1180,7 @@ fn ensure_hot_root_slots(
                     live_ptr: value,
                     content: Vec::new(),
                     is_heap_handle: true,
-                is_image_inline: false,
+                    is_image_inline: false,
                 });
                 continue;
             }
@@ -1204,7 +1204,7 @@ fn ensure_hot_root_slots(
                 live_ptr: value,
                 content: Vec::new(),
                 is_heap_handle: true,
-            is_image_inline: false,
+                is_image_inline: false,
             });
             continue;
         }
@@ -1264,13 +1264,7 @@ fn ensure_hot_root_slots(
             // WinMain AVs. Carve the parent to end at this base, then capture
             // the full exclusive object below.
             if carve_parent_at_hot_base(out, value) {
-                size = estimate_object_size(
-                    dump_buf,
-                    rva as usize,
-                    value,
-                    debugger,
-                    ensure_probe,
-                );
+                size = estimate_object_size(dump_buf, rva as usize, value, debugger, ensure_probe);
                 if rva == 0x147868 {
                     let count_off = 0x147888usize;
                     if count_off + 4 <= dump_buf.len() {
@@ -1406,7 +1400,7 @@ fn ensure_hot_root_slots(
             live_ptr: value,
             content,
             is_heap_handle: false,
-        is_image_inline: false,
+            is_image_inline: false,
         });
     }
 }
@@ -1440,11 +1434,10 @@ fn exhaust_gscript_first_hop(
     let Some(gscript_rva) = policy.gscript_root() else {
         return;
     };
-    let Some(gscript_idx) = out.iter().position(|g| {
-        g.rva == gscript_rva
-            && !g.is_heap_handle
-            && g.content.len() >= 8
-    }) else {
+    let Some(gscript_idx) = out
+        .iter()
+        .position(|g| g.rva == gscript_rva && !g.is_heap_handle && g.content.len() >= 8)
+    else {
         warn!(
             rva = format_args!("{gscript_rva:#x}"),
             "gscript first-hop exhaust skipped: root not captured"
@@ -1458,10 +1451,7 @@ fn exhaust_gscript_first_hop(
     // → WinMain 0x48fb0 lookup returns null after MessageBox.
     let default_span = policy.first_hop_span();
     let span = if out[gscript_idx].is_image_inline {
-        out[gscript_idx]
-            .content
-            .len()
-            .min(0x1800.max(default_span))
+        out[gscript_idx].content.len().min(0x1800.max(default_span))
     } else {
         default_span.min(out[gscript_idx].content.len())
     };
@@ -1602,7 +1592,7 @@ fn exhaust_gscript_first_hop(
             live_ptr: value,
             content: child,
             is_heap_handle: false,
-        is_image_inline: false,
+            is_image_inline: false,
         });
         added += 1;
     }
@@ -1664,8 +1654,7 @@ fn exhaust_gscript_child_link_fields(
                 skipped += 1;
                 continue;
             }
-            let value =
-                u64::from_le_bytes(content[loff..loff + 8].try_into().unwrap_or_default());
+            let value = u64::from_le_bytes(content[loff..loff + 8].try_into().unwrap_or_default());
             if !is_heap_pointer(value, image_base, image_end) || value < MIN_HEAP_POINTER {
                 continue;
             }
@@ -1916,8 +1905,16 @@ pub fn repair_gscript_window_strings(heap_globals: &mut Vec<HeapGlobalSnapshot>)
     }
 
     let g = &mut heap_globals[gscript_idx];
-    let old_class = u64::from_le_bytes(g.content[OFF_CLASS..OFF_CLASS + 8].try_into().unwrap_or([0; 8]));
-    let old_title = u64::from_le_bytes(g.content[OFF_TITLE..OFF_TITLE + 8].try_into().unwrap_or([0; 8]));
+    let old_class = u64::from_le_bytes(
+        g.content[OFF_CLASS..OFF_CLASS + 8]
+            .try_into()
+            .unwrap_or([0; 8]),
+    );
+    let old_title = u64::from_le_bytes(
+        g.content[OFF_TITLE..OFF_TITLE + 8]
+            .try_into()
+            .unwrap_or([0; 8]),
+    );
     g.content[OFF_CLASS..OFF_CLASS + 8].copy_from_slice(&CLASS_LIVE.to_le_bytes());
     g.content[OFF_TITLE..OFF_TITLE + 8].copy_from_slice(&TITLE_LIVE.to_le_bytes());
     info!(
@@ -1941,9 +1938,8 @@ pub fn mark_labels_non_nested(heap_globals: &mut [HeapGlobalSnapshot]) {
     if table_ptr == 0 {
         return;
     }
-    let count = u32::from_le_bytes(
-        gscript.content[0x10..0x14].try_into().unwrap_or_default(),
-    ) as usize;
+    let count =
+        u32::from_le_bytes(gscript.content[0x10..0x14].try_into().unwrap_or_default()) as usize;
     let Some(table) = heap_globals
         .iter()
         .find(|g| g.live_ptr == table_ptr && g.content.len() >= 8)
@@ -2081,7 +2077,10 @@ pub fn sort_gscript_label_table(heap_globals: &mut [HeapGlobalSnapshot]) {
     let new_count = named.len() as u32;
     let changed = before_named != after_named || (count as u32) != new_count;
     if !changed {
-        info!(count = new_count, "gscript label table already sorted by mName");
+        info!(
+            count = new_count,
+            "gscript label table already sorted by mName"
+        );
         return;
     }
     for (i, live) in out_ptrs.iter().enumerate() {
@@ -2183,8 +2182,11 @@ pub fn repair_label_names_after_scrub(heap_globals: &mut Vec<HeapGlobalSnapshot>
     let mut repaired = 0usize;
     let mut names_added = 0usize;
     for i in 0..count.min(table_content.len() / 8).min(512) {
-        let label_live =
-            u64::from_le_bytes(table_content[i * 8..i * 8 + 8].try_into().unwrap_or_default());
+        let label_live = u64::from_le_bytes(
+            table_content[i * 8..i * 8 + 8]
+                .try_into()
+                .unwrap_or_default(),
+        );
         if label_live == 0 {
             break;
         }
@@ -2367,7 +2369,10 @@ fn exhaust_gscript_label_table_entries(
     debugger: &mut dyn mida_core::DebuggerCore,
     policy: &DumpCapturePolicy,
 ) {
-    let Some(gscript) = out.iter().find(|g| g.is_image_inline && g.content.len() >= 8) else {
+    let Some(gscript) = out
+        .iter()
+        .find(|g| g.is_image_inline && g.content.len() >= 8)
+    else {
         return;
     };
     let table_ptr = u64::from_le_bytes(gscript.content[0..8].try_into().unwrap_or_default());
@@ -2396,8 +2401,7 @@ fn exhaust_gscript_label_table_entries(
     let mut skipped = 0usize;
     for i in 0..count.min(table_content.len() / 8).min(512) {
         let off = i * 8;
-        let value =
-            u64::from_le_bytes(table_content[off..off + 8].try_into().unwrap_or_default());
+        let value = u64::from_le_bytes(table_content[off..off + 8].try_into().unwrap_or_default());
         if value == 0 {
             break;
         }
@@ -2509,9 +2513,15 @@ fn exhaust_gscript_label_table_entries(
             heap = format_args!("{value:#x}"),
             size = child.len(),
             table_off = format_args!("{off:#x}"),
-            name_ptr = format_args!("{:#x}", u64::from_le_bytes(
-                child.get(0x28..0x30).and_then(|b| b.try_into().ok()).unwrap_or([0; 8])
-            )),
+            name_ptr = format_args!(
+                "{:#x}",
+                u64::from_le_bytes(
+                    child
+                        .get(0x28..0x30)
+                        .and_then(|b| b.try_into().ok())
+                        .unwrap_or([0; 8])
+                )
+            ),
             "Captured gscript label-table entry"
         );
         *total_bytes = total_bytes.saturating_add(child.len());
@@ -2756,7 +2766,10 @@ fn externalize_all_label_names_from_table(
     debugger: &mut dyn mida_core::DebuggerCore,
     policy: &DumpCapturePolicy,
 ) {
-    let Some(gscript) = out.iter().find(|g| g.is_image_inline && g.content.len() >= 8) else {
+    let Some(gscript) = out
+        .iter()
+        .find(|g| g.is_image_inline && g.content.len() >= 8)
+    else {
         return;
     };
     let table_ptr = u64::from_le_bytes(gscript.content[0..8].try_into().unwrap_or_default());
@@ -2782,12 +2795,17 @@ fn externalize_all_label_names_from_table(
     let slot_cap = MAX_HEAP_GLOBAL_SLOTS.saturating_sub(HEAP_DANGLING_SLOT_RESERVE / 8);
     let mut fixed = 0usize;
     for i in 0..count.min(table_content.len() / 8).min(512) {
-        let value =
-            u64::from_le_bytes(table_content[i * 8..i * 8 + 8].try_into().unwrap_or_default());
+        let value = u64::from_le_bytes(
+            table_content[i * 8..i * 8 + 8]
+                .try_into()
+                .unwrap_or_default(),
+        );
         if value == 0 {
             break;
         }
-        let Some(idx) = out.iter().position(|g| g.live_ptr == value && g.content.len() >= 0x30)
+        let Some(idx) = out
+            .iter()
+            .position(|g| g.live_ptr == value && g.content.len() >= 0x30)
         else {
             continue;
         };
@@ -2837,11 +2855,7 @@ fn externalize_all_label_names_from_table(
 ///
 /// exact-base multi_fixup cannot rewrite interior VAs; leaving them plants
 /// dump-time freelist addresses into cold start (r15b AV @0x57d01).
-fn sanitize_dangling_object_links(
-    out: &mut [HeapGlobalSnapshot],
-    image_base: u64,
-    image_end: u64,
-) {
+fn sanitize_dangling_object_links(out: &mut [HeapGlobalSnapshot], image_base: u64, image_end: u64) {
     const LINK_OFFS: &[usize] = &[0x00, 0x08, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38];
     let exact: BTreeSet<u64> = out
         .iter()
@@ -2852,7 +2866,12 @@ fn sanitize_dangling_object_links(
     let ranges: Vec<(u64, u64)> = out
         .iter()
         .filter(|g| !g.is_heap_handle && g.content.len() >= 8)
-        .map(|g| (g.live_ptr, g.live_ptr.saturating_add(g.content.len() as u64)))
+        .map(|g| {
+            (
+                g.live_ptr,
+                g.live_ptr.saturating_add(g.content.len() as u64),
+            )
+        })
         .collect();
     let mut nulled = 0usize;
     for g in out.iter_mut() {
@@ -2903,7 +2922,10 @@ fn sanitize_dangling_object_links(
         }
     }
     if nulled > 0 {
-        info!(nulled, "Nulled dangling object-link interiors (exact-base safe)");
+        info!(
+            nulled,
+            "Nulled dangling object-link interiors (exact-base safe)"
+        );
     }
 }
 
@@ -3025,9 +3047,7 @@ fn normalize_cmd_table_capture(
         }
         _ => return,
     }
-    *total_bytes = total_bytes
-        .saturating_sub(old)
-        .saturating_add(buf.len());
+    *total_bytes = total_bytes.saturating_sub(old).saturating_add(buf.len());
     g.content = buf;
     info!(
         rva = format_args!("{TABLE_RVA:#x}"),
@@ -3080,9 +3100,10 @@ fn exhaust_pointer_table_first_hop_span(
     probe: usize,
 ) {
     let slot_cap = MAX_HEAP_GLOBAL_SLOTS.saturating_sub(HEAP_DANGLING_SLOT_RESERVE / 2);
-    let Some(table_idx) = out.iter().position(|g| {
-        g.rva == table_rva && !g.is_heap_handle && g.content.len() >= 8
-    }) else {
+    let Some(table_idx) = out
+        .iter()
+        .position(|g| g.rva == table_rva && !g.is_heap_handle && g.content.len() >= 8)
+    else {
         return;
     };
 
@@ -3268,7 +3289,9 @@ fn expand_hot_root_children(
         .iter()
         .enumerate()
         .filter(|(_, g)| {
-            policy.hot_expand_seed_rvas.contains(&g.rva) && !g.is_heap_handle && g.content.len() >= 8
+            policy.hot_expand_seed_rvas.contains(&g.rva)
+                && !g.is_heap_handle
+                && g.content.len() >= 8
         })
         .map(|(i, _)| i)
         .collect();
@@ -3438,7 +3461,7 @@ fn expand_hot_root_children(
                 live_ptr: value,
                 content,
                 is_heap_handle: false,
-            is_image_inline: false,
+                is_image_inline: false,
             });
             added += 1;
             total_added += 1;
@@ -3677,7 +3700,7 @@ fn expand_heap_graph(
                 live_ptr: value,
                 content,
                 is_heap_handle: false,
-            is_image_inline: false,
+                is_image_inline: false,
             });
             node_priority.push(child_pri);
             added += 1;
@@ -3899,7 +3922,7 @@ fn admit_string_buffer_child(
         live_ptr: buf,
         content: body,
         is_heap_handle: false,
-    is_image_inline: false,
+        is_image_inline: false,
     });
     true
 }
@@ -4079,7 +4102,7 @@ fn split_swallowed_siblings(
                 live_ptr: value,
                 content,
                 is_heap_handle: false,
-            is_image_inline: false,
+                is_image_inline: false,
             });
             added += 1;
         }
@@ -4246,7 +4269,7 @@ fn capture_dangling_edges(
             live_ptr: value,
             content,
             is_heap_handle: false,
-        is_image_inline: false,
+            is_image_inline: false,
         });
         added += 1;
     }

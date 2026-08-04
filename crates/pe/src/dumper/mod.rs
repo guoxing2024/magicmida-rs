@@ -36,9 +36,9 @@ mod header_patch;
 mod heap_bootstrap;
 mod heap_global_snapshot;
 mod helpers;
+mod iat_gap_retarget;
 mod import_rebuild;
 mod import_section;
-mod iat_gap_retarget;
 mod original_imports;
 mod output_writer;
 mod pure_rebuild_adapter;
@@ -55,17 +55,17 @@ mod wrapper_materialize;
 
 // Re-export public API
 pub use self::capture_policy::DumpCapturePolicy;
-pub use self::dump_process::{dump_dotnet_with_source, dump_process};
+pub use self::dump_process::{dump_dotnet_with_source, dump_process, dump_process_with_report};
 pub use self::helpers::is_dotnet;
-pub use self::import_rebuild::rebuild_import_table;
+pub use self::import_rebuild::{rebuild_import_table, rebuild_import_table_with_report};
 pub use self::original_imports::get_original_imports;
 pub use self::pure_rebuild_adapter::{
-    emit_pure_rebuild, emit_pure_rebuild_with_parity, plan_from_host_dump,
-    PureRebuildEmitOptions, PureRebuildParitySnapshot,
+    emit_pure_rebuild, emit_pure_rebuild_with_parity, plan_from_host_dump, PureRebuildEmitOptions,
+    PureRebuildParitySnapshot,
 };
 pub use self::remote_modules::take_module_snapshot;
 pub use self::snapshot_manifest::manifest_path_for_output;
 pub use self::types::{
-    ContainerRestoreMode, DumpOptions, DumpProfile, DumpProfileCapabilities, EarlySectionSnapshot,
-    ExperimentalStagePlan, OepPolicy, RemoteModule,
+    ContainerRestoreMode, DumpOptions, DumpProcessReport, DumpProfile, DumpProfileCapabilities,
+    EarlySectionSnapshot, ExperimentalStagePlan, OepPolicy, RemoteModule,
 };

@@ -400,8 +400,7 @@ pub(crate) fn find_security_cookie_site_for_value(
                 data_cookie_hits.push(rva);
                 // Adjacent complement at +8 or -8 (MSVC typical).
                 if offset + 16 <= slice.len() {
-                    let next =
-                        u64::from_le_bytes(slice[offset + 8..offset + 16].try_into().ok()?);
+                    let next = u64::from_le_bytes(slice[offset + 8..offset + 16].try_into().ok()?);
                     if next == want {
                         adjacent.push(SecurityCookieSite {
                             cookie_rva: rva,
@@ -410,8 +409,7 @@ pub(crate) fn find_security_cookie_site_for_value(
                     }
                 }
                 if offset >= 8 {
-                    let prev =
-                        u64::from_le_bytes(slice[offset - 8..offset].try_into().ok()?);
+                    let prev = u64::from_le_bytes(slice[offset - 8..offset].try_into().ok()?);
                     if prev == want {
                         adjacent.push(SecurityCookieSite {
                             cookie_rva: rva,

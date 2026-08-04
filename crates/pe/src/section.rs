@@ -11,8 +11,8 @@
 //! | `sanitize`                   | `TPEHeader.Sanitize`                      |
 //! | `rename_section`             | `TPESection.Rename`                       |
 
+use crate::error::PeError;
 use crate::header::{ImageSectionHeader, PeHeader, PeSection};
-use crate::utils::align_up;
 
 // Section characteristics constants
 const IMAGE_SCN_MEM_READ: u32 = 0x40000000;
@@ -72,26 +72,54 @@ impl PeHeader {
     /// Corresponds to `TPEHeader.CreateSection` in `PEInfo.pas`.
     /// Create a new section and return the index of the new section.
     pub fn create_section_index(&mut self, name: &str, virtual_size: u32) -> usize {
-        let prev = &self.sections[self.sections.len() - 1];
+        self.try_create_section_index(name, virtual_size)
+            .unwrap_or_else(|err| {
+                tracing::error!(%err, "create_section_index rejected malformed section state");
+                self.sections.len()
+            })
+    }
 
-        let mut virtual_address = prev.virtual_address + prev.virtual_size;
-        self.section_align(&mut virtual_address);
+    /// Fallible variant of [`Self::create_section_index`] for hostile/malformed input.
+    pub fn try_create_section_index(
+        &mut self,
+        name: &str,
+        virtual_size: u32,
+    ) -> Result<usize, PeError> {
+        let prev = self.sections.last().ok_or_else(|| {
+            PeError::Parse("cannot create section without a previous section".into())
+        })?;
 
-        let mut raw_size = virtual_size;
-        self.file_align(&mut raw_size);
+        let virtual_end = prev
+            .virtual_address
+            .checked_add(prev.virtual_size)
+            .ok_or_else(|| PeError::Parse("previous section virtual end overflow".into()))?;
+        let virtual_address = checked_align_up(
+            virtual_end,
+            self.nt_headers.optional_header.section_alignment,
+            "new section virtual address",
+        )?;
+
+        let raw_size = checked_align_up(
+            virtual_size,
+            self.nt_headers.optional_header.file_alignment,
+            "new section raw size",
+        )?;
 
         // Compute the correct file offset for the new section.
-        // Find the end of the last section's raw data.
-        let mut raw_offset = 0;
+        let mut raw_offset = 0u32;
         for s in &self.sections {
-            let s_end = s.header.pointer_to_raw_data + s.header.size_of_raw_data;
-            if s_end > raw_offset {
-                raw_offset = s_end;
-            }
+            let s_end = s
+                .header
+                .pointer_to_raw_data
+                .checked_add(s.header.size_of_raw_data)
+                .ok_or_else(|| PeError::Parse("section raw end overflow".into()))?;
+            raw_offset = raw_offset.max(s_end);
         }
-        // File-align the new offset
-        let file_align = self.nt_headers.optional_header.file_alignment;
-        raw_offset = align_up(raw_offset, file_align);
+        raw_offset = checked_align_up(
+            raw_offset,
+            self.nt_headers.optional_header.file_alignment,
+            "new section raw offset",
+        )?;
 
         let new_section = PeSection {
             header: ImageSectionHeader {
@@ -115,67 +143,99 @@ impl PeHeader {
             extra_data: None,
         };
 
-        self.nt_headers.optional_header.size_of_image += align_up(
+        let image_increment = checked_align_up(
             virtual_size,
             self.nt_headers.optional_header.section_alignment,
-        );
+            "new section image size",
+        )?;
+        self.nt_headers.optional_header.size_of_image = self
+            .nt_headers
+            .optional_header
+            .size_of_image
+            .checked_add(image_increment)
+            .ok_or_else(|| PeError::Parse("SizeOfImage overflow".into()))?;
         self.sections.push(new_section);
 
         let idx = self.sections.len() - 1;
         self.sections[idx].rename(name);
 
-        idx
+        Ok(idx)
     }
 
     /// Delete a section at the given index.
     ///
-    /// Shifts remaining sections' `PointerToRawData` backward by the deleted
-    /// section's size, merges the deleted section's `VirtualSize` into the
-    /// *preceding* section, and decrements `NumberOfSections`.
-    ///
-    /// Corresponds to `TPEHeader.DeleteSection` in `PEInfo.pas`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `index == 0` (cannot merge into preceding section) or if
-    /// `index` is out of bounds.
+    /// This compatibility wrapper keeps the historical `()` API. Invalid input is
+    /// rejected without panicking; callers that need the reason should use
+    /// [`Self::try_delete_section`].
     pub fn delete_section(&mut self, index: usize) {
-        assert!(
-            index > 0,
-            "Cannot delete section 0 — no preceding section to merge into"
-        );
-        assert!(index < self.sections.len(), "Section index out of range");
+        if let Err(err) = self.try_delete_section(index) {
+            tracing::error!(%err, index, "delete_section rejected malformed input");
+        }
+    }
+
+    /// Fallible section deletion for external/malformed input.
+    pub fn try_delete_section(&mut self, index: usize) -> Result<(), PeError> {
+        if index == 0 {
+            return Err(PeError::Parse(
+                "cannot delete section 0 without a preceding section".into(),
+            ));
+        }
+        if index >= self.sections.len() {
+            return Err(PeError::Parse(format!(
+                "section index {index} out of range"
+            )));
+        }
 
         let is_last = index == self.sections.len() - 1;
-
+        let deleted_ptr = self.sections[index].header.pointer_to_raw_data;
         let sz = if is_last {
-            self.nt_headers.optional_header.size_of_image
-                - self.sections[index].header.pointer_to_raw_data
+            self.nt_headers
+                .optional_header
+                .size_of_image
+                .checked_sub(deleted_ptr)
+                .ok_or_else(|| {
+                    PeError::Parse("deleted section raw pointer exceeds SizeOfImage".into())
+                })?
         } else {
-            self.sections[index + 1].header.pointer_to_raw_data
-                - self.sections[index].header.pointer_to_raw_data
+            self.sections[index + 1]
+                .header
+                .pointer_to_raw_data
+                .checked_sub(deleted_ptr)
+                .ok_or_else(|| PeError::Parse("section raw pointers are not ordered".into()))?
         };
 
-        // Shift PointerToRawData of sections after the deleted one
+        // Shift PointerToRawData of sections after the deleted one.
         for i in (index + 1)..self.sections.len() {
-            self.sections[i].header.pointer_to_raw_data -= sz;
+            self.sections[i].header.pointer_to_raw_data = self.sections[i]
+                .header
+                .pointer_to_raw_data
+                .checked_sub(sz)
+                .ok_or_else(|| PeError::Parse("section raw pointer underflow".into()))?;
             self.sections[i].update_from_header();
         }
 
-        // Merge VirtualSize into the preceding section (Pascal: Idx - 1)
-        self.sections[index - 1].header.virtual_size += self.sections[index].header.virtual_size;
-        let mut merged_vs = self.sections[index - 1].header.virtual_size;
-        self.section_align(&mut merged_vs);
+        // Merge VirtualSize into the preceding section.
+        let merged_vs = self.sections[index - 1]
+            .header
+            .virtual_size
+            .checked_add(self.sections[index].header.virtual_size)
+            .ok_or_else(|| PeError::Parse("merged section virtual size overflow".into()))?;
+        let merged_vs = checked_align_up(
+            merged_vs,
+            self.nt_headers.optional_header.section_alignment,
+            "merged section virtual size",
+        )?;
         self.sections[index - 1].header.virtual_size = merged_vs;
         self.sections[index - 1].update_from_header();
 
-        // Remove from vec
         self.sections.remove(index);
         self.nt_headers.file_header.number_of_sections = self
             .nt_headers
             .file_header
             .number_of_sections
-            .saturating_sub(1);
+            .checked_sub(1)
+            .ok_or_else(|| PeError::Parse("section count underflow".into()))?;
+        Ok(())
     }
 
     /// Trim oversized sections whose raw data is padded with trailing zeros.
@@ -503,6 +563,20 @@ impl PeSection {
 // Tests
 // ---------------------------------------------------------------------------
 
+fn checked_align_up(value: u32, alignment: u32, what: &str) -> Result<u32, PeError> {
+    if alignment == 0 {
+        return Err(PeError::Parse(format!("{what}: alignment is zero")));
+    }
+    let remainder = value % alignment;
+    if remainder == 0 {
+        Ok(value)
+    } else {
+        value
+            .checked_add(alignment - remainder)
+            .ok_or_else(|| PeError::Parse(format!("{what} alignment overflow")))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -611,10 +685,27 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
-    fn test_delete_section_zero_panics() {
+    fn test_delete_section_zero_is_rejected_without_panic() {
         let mut pe = make_test_pe();
-        pe.delete_section(0); // cannot delete the first section
+        let err = pe
+            .try_delete_section(0)
+            .expect_err("first section is not deletable");
+        assert!(matches!(err, PeError::Parse(_)));
+        pe.delete_section(0); // compatibility wrapper must not panic
+        assert_eq!(pe.sections.len(), 1);
+    }
+
+    #[test]
+    fn test_create_section_empty_table_is_rejected_without_panic() {
+        let mut pe = make_test_pe();
+        pe.sections.clear();
+        let err = pe
+            .try_create_section_index(".data", 0x100)
+            .expect_err("empty section table must be rejected");
+        assert!(matches!(err, PeError::Parse(_)));
+        let idx = pe.create_section_index(".data", 0x100);
+        assert_eq!(idx, 0);
+        assert!(pe.sections.is_empty());
     }
 
     #[test]

@@ -7,6 +7,7 @@ use tracing::{debug, info, warn};
 
 use crate::error::PeError;
 use crate::header::PeHeader;
+use crate::iat_completeness::{IatRecoveryReport, IatSlotReport, IatSlotStatus};
 use crate::import_table::{iat_slot_size, ImportModule, ImportTableBuilder, ImportThunk};
 
 use super::helpers::{
@@ -31,7 +32,31 @@ pub fn rebuild_import_table(
     image_base: u64,
     is_64bit: bool,
 ) -> Result<ImportTableBuilder, PeError> {
-    let (_, _, builder) = rebuild_import_table_inner(
+    let (builder, report) =
+        rebuild_import_table_with_report(debugger, iat_address, iat_size, image_base, is_64bit)?;
+    if !report.is_complete() {
+        return Err(PeError::Parse(format!(
+            "IAT recovery incomplete: {}",
+            report.failure_summary()
+        )));
+    }
+    Ok(builder)
+}
+
+/// Rebuild the IAT and return an auditable per-slot report.
+///
+/// This API intentionally returns partial output together with the report so
+/// callers can preserve evidence.  Callers that need a usable/complete table
+/// must gate on [`IatRecoveryReport::is_complete`], or use
+/// [`rebuild_import_table`] which does so for them.
+pub fn rebuild_import_table_with_report(
+    debugger: &mut dyn mida_core::DebuggerCore,
+    iat_address: u64,
+    iat_size: usize,
+    image_base: u64,
+    is_64bit: bool,
+) -> Result<(ImportTableBuilder, IatRecoveryReport), PeError> {
+    let (_, _, builder, report) = rebuild_import_table_inner(
         debugger,
         iat_address,
         iat_size,
@@ -40,7 +65,9 @@ pub fn rebuild_import_table(
         None, // no original imports for ApiSet decisions
     )?;
 
-    builder.ok_or_else(|| PeError::Parse("Import table reconstruction produced no output".into()))
+    let builder = builder
+        .ok_or_else(|| PeError::Parse("Import table reconstruction produced no output".into()))?;
+    Ok((builder, report))
 }
 
 // -----------------------------------------------------------------------
@@ -54,7 +81,15 @@ pub(crate) fn rebuild_import_table_complete(
     image_base: u64,
     is_64bit: bool,
     iat_override: Option<(usize, usize)>,
-) -> Result<(Vec<u8>, usize, Option<ImportTableBuilder>), PeError> {
+) -> Result<
+    (
+        Vec<u8>,
+        usize,
+        Option<ImportTableBuilder>,
+        IatRecoveryReport,
+    ),
+    PeError,
+> {
     // Find IAT location — either from the PE header or from the override.
     let (iat_address, iat_size) = if let Some((addr, size)) = iat_override {
         info!("Using override IAT location: {addr:#x}, size {size:#x}");
@@ -125,17 +160,29 @@ fn rebuild_import_table_inner(
     image_base: u64,
     is_64bit: bool,
     _original_imports: Option<&[String]>,
-) -> Result<(Vec<u8>, usize, Option<ImportTableBuilder>), PeError> {
+) -> Result<
+    (
+        Vec<u8>,
+        usize,
+        Option<ImportTableBuilder>,
+        IatRecoveryReport,
+    ),
+    PeError,
+> {
     let ptr_size = iat_slot_size(is_64bit);
 
     // Read the IAT
     let mut iat_data =
         super::helpers::alloc_capped(iat_size, super::helpers::MAX_IAT_READ_BYTES, "IAT rebuild")?;
-    let _read = debugger
+    let bytes_read = debugger
         .read_memory(iat_address as usize, &mut iat_data)
         .map_err(|e| PeError::Parse(format!("Failed to read IAT: {e}")))?;
-    if _read < iat_size {
-        warn!(expected = iat_size, actual = _read, "Short read on IAT");
+    if bytes_read < iat_size {
+        warn!(
+            expected = iat_size,
+            actual = bytes_read,
+            "Short read on IAT"
+        );
     }
 
     // Take a snapshot of all loaded modules
@@ -189,15 +236,35 @@ fn rebuild_import_table_inner(
 
     for i in 0..slot_count {
         let off = i * ptr_size;
-        let slot_val = read_ptr(&iat_data, off, is_64bit);
-
+        let fully_read = off
+            .checked_add(ptr_size)
+            .is_some_and(|end| end <= bytes_read);
         let mut slot = IatSlot {
             candidates: Vec::new(),
+            observed_value: None,
+            rebuilt_value: None,
             chosen: None,
-            is_zero: slot_val == 0,
+            is_zero: false,
+            status: if fully_read {
+                IatSlotStatus::Unresolved
+            } else {
+                IatSlotStatus::ShortRead
+            },
         };
 
+        if !fully_read {
+            slots.push(slot);
+            continue;
+        }
+
+        // Capture the live value once, before PASS2 is allowed to mutate the
+        // reconstruction buffer.  Reports must never re-read `iat_data` after
+        // `write_ptr`, otherwise observed evidence becomes the chosen value.
+        let slot_val = read_ptr(&iat_data, off, is_64bit);
+        slot.observed_value = Some(slot_val);
+        slot.is_zero = slot_val == 0;
         if slot.is_zero {
+            slot.status = IatSlotStatus::ZeroTerminator;
             slots.push(slot);
             continue;
         }
@@ -211,11 +278,24 @@ fn rebuild_import_table_inner(
         );
 
         if slot.candidates.is_empty() {
+            let inside_module = modules
+                .iter()
+                .any(|m| m.end_off > m.base && slot_val >= m.base && slot_val < m.end_off);
+            slot.status = if inside_module {
+                IatSlotStatus::Stale
+            } else {
+                IatSlotStatus::Unresolved
+            };
             debug!(
                 iat_va = format!("{:#x}", iat_address + off as u64),
                 slot_val = format!("{slot_val:#x}"),
+                status = ?slot.status,
                 "IAT slot unresolvable"
             );
+        } else if modules.iter().any(|m| m.end_off <= m.base) {
+            slot.status = IatSlotStatus::InvalidModule;
+        } else {
+            slot.status = IatSlotStatus::Resolved;
         }
 
         slots.push(slot);
@@ -236,7 +316,47 @@ fn rebuild_import_table_inner(
         &forward_map,
     );
 
-    Ok((iat_data, iat_size, Some(builder)))
+    let mut report = IatRecoveryReport::new(iat_size, bytes_read, ptr_size);
+    for (slot_index, slot) in slots.iter().enumerate() {
+        let (module_name, function_name, ordinal) = slot
+            .chosen
+            .and_then(|chosen| slot.candidates.get(chosen))
+            .and_then(|candidate| {
+                modules
+                    .get(candidate.module_index)
+                    .map(|module| (module, candidate))
+            })
+            .map(|(module, candidate)| {
+                let raw_name = module.exports.get(&candidate.address).cloned().or_else(|| {
+                    forward_map
+                        .get(&candidate.address)
+                        .map(|(_, name)| name.clone())
+                });
+                let (function_name, ordinal) = export_identity(raw_name);
+                (Some(module.name.clone()), function_name, ordinal)
+            })
+            .unwrap_or((None, None, None));
+        let slot_address = iat_address + (slot_index * ptr_size) as u64;
+        let slot_rva = slot_address
+            .checked_sub(image_base)
+            .and_then(|rva| u32::try_from(rva).ok());
+        let observed_value = slot.observed_value;
+        report.slots.push(IatSlotReport {
+            slot_index,
+            slot_address,
+            slot_rva,
+            observed_value,
+            rebuilt_value: slot.rebuilt_value,
+            // Compatibility field deliberately aliases the immutable capture.
+            slot_value: observed_value,
+            status: slot.status,
+            module_name,
+            function_name,
+            ordinal,
+        });
+    }
+
+    Ok((iat_data, iat_size, Some(builder), report))
 }
 
 // -----------------------------------------------------------------------
@@ -347,6 +467,21 @@ fn collect_candidates(
 // pass2_vote (Pass 2 voting + thunk building)
 // -----------------------------------------------------------------------
 
+/// Convert the stable export-table spelling into first-class identity fields.
+///
+/// Export snapshots encode ordinal-only exports as `#N`; the report keeps the
+/// ordinal separately so later sidecars do not need to parse a display string.
+fn export_identity(raw_name: Option<String>) -> (Option<String>, Option<u16>) {
+    match raw_name {
+        Some(name) if name.starts_with('#') => name
+            .get(1..)
+            .and_then(|ordinal| ordinal.parse::<u16>().ok())
+            .map_or((None, None), |ordinal| (None, Some(ordinal))),
+        Some(name) if !name.is_empty() => (Some(name), None),
+        _ => (None, None),
+    }
+}
+
 fn pass2_vote(
     slots: &mut [IatSlot],
     modules: &[RemoteModule],
@@ -400,10 +535,12 @@ fn pass2_vote(
         let winner_mi = match winner_idx {
             Some(mi) => mi,
             None => {
-                debug!(
-                    group_start,
-                    group_end, "IAT group has no valid candidates, skipping"
-                );
+                for slot in &mut slots[group_start..=group_end] {
+                    if !slot.is_zero {
+                        slot.status = IatSlotStatus::Unresolved;
+                    }
+                }
+                debug!(group_start, group_end, "IAT group has no valid candidates");
                 i = group_end + 1;
                 continue;
             }
@@ -419,58 +556,68 @@ fn pass2_vote(
                     break;
                 }
             }
-            if !found_winner && !slots[j].candidates.is_empty() {
-                slots[j].chosen = Some(0);
+            if !found_winner {
+                // A candidate from another module is not a valid substitute for
+                // the winning module.  Do not serialize a thunk under the
+                // winner's ImportModule with a different module's identity.
+                slots[j].chosen = None;
+                slots[j].rebuilt_value = None;
+                if !slots[j].is_zero {
+                    slots[j].status = IatSlotStatus::Unresolved;
+                }
             }
         }
 
-        // Build thunks
+        // Build thunks.  Resolve the stable export identity before writing the
+        // chosen address into the output buffer; the original observation is
+        // already frozen in `IatSlot::observed_value`.
         let module_name = modules[winner_mi].name.clone();
         let mut thunks: Vec<ImportThunk> = Vec::new();
 
         for j in group_start..=group_end {
-            let chosen = match slots[j].chosen {
-                Some(c) => &slots[j].candidates[c],
+            let chosen = match slots[j]
+                .chosen
+                .and_then(|candidate| slots[j].candidates.get(candidate))
+                .cloned()
+            {
+                Some(chosen) => chosen,
                 None => {
+                    slots[j].chosen = None;
+                    slots[j].rebuilt_value = None;
+                    if slots[j].status == IatSlotStatus::Resolved {
+                        slots[j].status = IatSlotStatus::Unresolved;
+                    }
                     warn!(
                         iat_va = format!("{:#x}", iat_address + (j * ptr_size) as u64),
-                        "IAT slot has no candidate for winning module, skipping"
+                        "IAT slot has no candidate for winning module"
                     );
                     continue;
                 }
             };
 
-            let actual_module_index = chosen.module_index;
-            let func_name = modules[actual_module_index]
-                .exports
-                .get(&chosen.address)
-                .cloned()
-                .or_else(|| {
-                    forward_map
-                        .get(&chosen.address)
-                        .map(|(_, name)| name.clone())
-                });
-
-            write_ptr(iat_data, j * ptr_size, chosen.address, is_64bit);
-
-            let (function_name, ordinal) = if let Some(ref name) = func_name {
-                if let Some(ordinal_str) = name.strip_prefix('#') {
-                    let ord: u16 = ordinal_str.parse().unwrap_or(0);
-                    (None, Some(ord))
-                } else {
-                    (Some(name.clone()), None)
-                }
-            } else {
-                let placeholder = format!("_unknown_{:#x}", chosen.address);
+            let Some(module) = modules.get(chosen.module_index) else {
+                slots[j].status = IatSlotStatus::InvalidModule;
+                continue;
+            };
+            let raw_name = module.exports.get(&chosen.address).cloned().or_else(|| {
+                forward_map
+                    .get(&chosen.address)
+                    .map(|(_, name)| name.clone())
+            });
+            let (function_name, ordinal) = export_identity(raw_name);
+            if function_name.is_none() && ordinal.is_none() {
+                slots[j].status = IatSlotStatus::Stale;
                 tracing::warn!(
-                    "IAT slot {} at {:#x}: unresolved, using placeholder '{}'",
+                    "IAT slot {} at {:#x}: export identity unavailable",
                     j,
                     iat_address + (j * ptr_size) as u64,
-                    placeholder
                 );
-                (Some(placeholder), None)
-            };
+                continue;
+            }
 
+            write_ptr(iat_data, j * ptr_size, chosen.address, is_64bit);
+            slots[j].rebuilt_value = Some(chosen.address);
+            slots[j].status = IatSlotStatus::Resolved;
             thunks.push(ImportThunk {
                 iat_address: (iat_address - image_base) as u32 + (j * ptr_size) as u32,
                 function_name,
@@ -496,4 +643,117 @@ fn pass2_vote(
     );
 
     builder
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pass2_buffer_mutation_does_not_overwrite_observed_value() {
+        let mut iat_data = vec![0u8; 8];
+        let observed = 0x1111_2222_3333_4444u64;
+        let rebuilt = 0x5555_6666_7777_8888u64;
+        write_ptr(&mut iat_data, 0, observed, true);
+        let mut slot = IatSlot {
+            candidates: Vec::new(),
+            observed_value: Some(read_ptr(&iat_data, 0, true)),
+            rebuilt_value: None,
+            chosen: None,
+            is_zero: false,
+            status: IatSlotStatus::Unresolved,
+        };
+
+        // This is the same mutation performed by PASS2.  The report source is
+        // the frozen field, never a second read from the modified buffer.
+        write_ptr(&mut iat_data, 0, rebuilt, true);
+        slot.rebuilt_value = Some(rebuilt);
+
+        assert_eq!(slot.observed_value, Some(observed));
+        assert_eq!(slot.rebuilt_value, Some(rebuilt));
+        assert_eq!(read_ptr(&iat_data, 0, true), rebuilt);
+        assert_ne!(slot.observed_value, slot.rebuilt_value);
+    }
+
+    #[test]
+    fn pass2_rejects_cross_module_fallback_for_a_slot() {
+        let modules = vec![
+            RemoteModule {
+                base: 0x1000,
+                end_off: 0x2000,
+                name: "kernel32.dll".into(),
+                exports: std::collections::HashMap::from([(0x1100, "First".into())]),
+                forwards: Vec::new(),
+            },
+            RemoteModule {
+                base: 0x2000,
+                end_off: 0x3000,
+                name: "user32.dll".into(),
+                exports: std::collections::HashMap::from([(0x2100, "Second".into())]),
+                forwards: Vec::new(),
+            },
+        ];
+        let mut iat_data = vec![0u8; 16];
+        write_ptr(&mut iat_data, 0, 0x1100, true);
+        write_ptr(&mut iat_data, 8, 0x2100, true);
+        let mut slots = vec![
+            IatSlot {
+                candidates: vec![ResolutionCandidate {
+                    address: 0x1100,
+                    module_index: 0,
+                }],
+                observed_value: Some(0x1100),
+                rebuilt_value: None,
+                chosen: None,
+                is_zero: false,
+                status: IatSlotStatus::Resolved,
+            },
+            IatSlot {
+                candidates: vec![ResolutionCandidate {
+                    address: 0x2100,
+                    module_index: 1,
+                }],
+                observed_value: Some(0x2100),
+                rebuilt_value: None,
+                chosen: None,
+                is_zero: false,
+                status: IatSlotStatus::Resolved,
+            },
+        ];
+
+        let builder = pass2_vote(
+            &mut slots,
+            &modules,
+            &mut iat_data,
+            0x5000,
+            0x4000,
+            true,
+            8,
+            2,
+            &std::collections::HashMap::new(),
+        );
+
+        assert_eq!(builder.modules.len(), 1);
+        assert_eq!(builder.modules[0].name, "kernel32.dll");
+        assert_eq!(builder.modules[0].thunks.len(), 1);
+        assert_eq!(slots[0].chosen, Some(0));
+        assert_eq!(slots[0].rebuilt_value, Some(0x1100));
+        assert_eq!(slots[1].chosen, None);
+        assert_eq!(slots[1].rebuilt_value, None);
+        assert_eq!(slots[1].status, IatSlotStatus::Unresolved);
+        assert_eq!(read_ptr(&iat_data, 8, true), 0x2100);
+    }
+
+    #[test]
+    fn ordinal_export_identity_is_not_only_a_display_string() {
+        assert_eq!(export_identity(Some("#42".into())), (None, Some(42)));
+        assert_eq!(
+            export_identity(Some("CreateFileW".into())),
+            (Some("CreateFileW".into()), None)
+        );
+        assert_eq!(
+            export_identity(Some("#not-an-ordinal".into())),
+            (None, None)
+        );
+    }
 }

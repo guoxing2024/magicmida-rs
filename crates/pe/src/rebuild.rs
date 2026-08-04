@@ -17,7 +17,6 @@ use crate::header::{
 use crate::import_table::ImportTableBuilder;
 use crate::relocation::RelocationTableBuilder;
 use crate::tls::TlsDirectoryBuilder;
-use crate::utils::align_up;
 
 const IMAGE_DOS_SIGNATURE: u16 = 0x5A4D;
 const IMAGE_NT_SIGNATURE: u32 = 0x0000_4550;
@@ -26,6 +25,7 @@ const PE32_PLUS_MAGIC: u16 = 0x20B;
 const DEFAULT_E_LFANEW: u32 = 0x80;
 const DEFAULT_FILE_ALIGNMENT: u32 = 0x200;
 const DEFAULT_SECTION_ALIGNMENT: u32 = 0x1000;
+const MAX_REBUILD_OUTPUT_SIZE: usize = 512 * 1024 * 1024;
 
 /// Data-directory indices used by the rebuild pipeline.
 pub const DIR_EXPORT: usize = 0;
@@ -242,12 +242,14 @@ pub fn rebuild_pe_image_with_meta(plan: &RebuildPlan) -> Result<RebuildResult, P
     let opt_size: usize = if plan.is_64bit { 0xF0 } else { 0xE0 };
 
     // Pre-count sections so header size is correct before assigning raw pointers.
-    let section_count = content.len()
-        + usize::from(has_exports)
-        + usize::from(has_imports)
-        + usize::from(has_exceptions)
-        + usize::from(has_tls)
-        + usize::from(has_relocs);
+    let section_count = content
+        .len()
+        .checked_add(usize::from(has_exports))
+        .and_then(|n| n.checked_add(usize::from(has_imports)))
+        .and_then(|n| n.checked_add(usize::from(has_exceptions)))
+        .and_then(|n| n.checked_add(usize::from(has_tls)))
+        .and_then(|n| n.checked_add(usize::from(has_relocs)))
+        .ok_or_else(|| PeError::Parse("section count overflow".into()))?;
     if section_count == 0 {
         return Err(PeError::Parse("rebuild produced zero sections".into()));
     }
@@ -255,22 +257,29 @@ pub fn rebuild_pe_image_with_meta(plan: &RebuildPlan) -> Result<RebuildResult, P
         return Err(PeError::InvalidSectionCount(section_count as u32));
     }
 
-    let nt_core = 4usize + 20 + opt_size + section_count * 40;
+    let nt_core = 4usize
+        .checked_add(20)
+        .and_then(|n| n.checked_add(opt_size))
+        .and_then(|n| n.checked_add(section_count.checked_mul(40)?))
+        .ok_or_else(|| PeError::Parse("NT header size overflow".into()))?;
     let headers_end = (e_lfanew as usize)
         .checked_add(nt_core)
         .ok_or_else(|| PeError::Parse("headers end overflow".into()))?;
-    let size_of_headers = align_up(
+    let size_of_headers = checked_align_up(
         u32::try_from(headers_end).map_err(|_| PeError::Parse("headers end too large".into()))?,
         fa,
-    );
+        "headers size",
+    )?;
 
     // Assign VAs for content sections first (directories need target VAs).
     // Fixed `virtual_address` preserves host dump layout (R1-E); None packs.
     let mut next_va = sa;
     let mut laid_out: Vec<LaidSection> = Vec::with_capacity(section_count);
     for sec in &content {
-        let vsize = effective_virtual_size(sec);
-        let raw_size = align_up(sec.data.len() as u32, fa);
+        let vsize = effective_virtual_size(sec)?;
+        let data_len = u32::try_from(sec.data.len())
+            .map_err(|_| PeError::Parse("section data exceeds PE32 size".into()))?;
+        let raw_size = checked_align_up(data_len, fa, "section raw size")?;
         let va = match sec.virtual_address {
             Some(fixed) => {
                 if fixed < sa {
@@ -289,10 +298,10 @@ pub fn rebuild_pe_image_with_meta(plan: &RebuildPlan) -> Result<RebuildResult, P
                     // Allow exact placement into a gap only if it does not overlap
                     // a previously laid section.
                     for prev in &laid_out {
-                        let prev_end = prev
-                            .virtual_address
-                            .checked_add(prev.virtual_size.max(1))
-                            .ok_or_else(|| PeError::Parse("section VA overflow".into()))?;
+                        let prev_end =
+                            prev.virtual_address
+                                .checked_add(prev.virtual_size.max(1))
+                                .ok_or_else(|| PeError::Parse("section VA overflow".into()))?;
                         let this_end = fixed
                             .checked_add(vsize.max(1))
                             .ok_or_else(|| PeError::Parse("section VA overflow".into()))?;
@@ -323,7 +332,7 @@ pub fn rebuild_pe_image_with_meta(plan: &RebuildPlan) -> Result<RebuildResult, P
         let end = va
             .checked_add(vsize.max(1))
             .ok_or_else(|| PeError::Parse("section VA overflow".into()))?;
-        let aligned_end = align_up(end, sa);
+        let aligned_end = checked_align_up(end, sa, "section virtual end")?;
         if aligned_end > next_va {
             next_va = aligned_end;
         }
@@ -338,8 +347,9 @@ pub fn rebuild_pe_image_with_meta(plan: &RebuildPlan) -> Result<RebuildResult, P
             virtual_address: export_va,
             size: export_size,
         };
-        let vsize = export_data.len() as u32;
-        let raw_size = align_up(vsize.max(1), fa);
+        let vsize = u32::try_from(export_data.len())
+            .map_err(|_| PeError::Parse("export data exceeds PE32 size".into()))?;
+        let raw_size = checked_align_up(vsize.max(1), fa, "export raw size")?;
         laid_out.push(LaidSection {
             name: ".edata".into(),
             characteristics: 0x4000_0040, // CNT_INITIALIZED_DATA | MEM_READ
@@ -349,12 +359,13 @@ pub fn rebuild_pe_image_with_meta(plan: &RebuildPlan) -> Result<RebuildResult, P
             raw_offset: 0,
             data: export_data,
         });
-        next_va = align_up(
+        next_va = checked_align_up(
             export_va
                 .checked_add(vsize.max(1))
                 .ok_or_else(|| PeError::Parse("export VA overflow".into()))?,
             sa,
-        );
+            "export virtual end",
+        )?;
     }
 
     let mut import_directory = ImageDataDirectory::default();
@@ -363,24 +374,47 @@ pub fn rebuild_pe_image_with_meta(plan: &RebuildPlan) -> Result<RebuildResult, P
         let builder = plan.imports.as_ref().expect("imports checked");
         let import_va = next_va;
         let (import_data, _strings_off, iat_off) = builder.build_section_data(import_va);
-        let desc_size = (builder.module_count() + 1) * crate::import_table::IMPORT_DESCRIPTOR_SIZE;
+        let desc_size = builder
+            .module_count()
+            .checked_add(1)
+            .and_then(|n| n.checked_mul(crate::import_table::IMPORT_DESCRIPTOR_SIZE))
+            .ok_or_else(|| PeError::Parse("import descriptor size overflow".into()))?;
+        let desc_size = u32::try_from(desc_size)
+            .map_err(|_| PeError::Parse("import descriptor size exceeds PE32 limit".into()))?;
         import_directory = ImageDataDirectory {
             virtual_address: import_va,
-            size: desc_size as u32,
+            size: desc_size,
         };
         // IAT is the contiguous FirstThunk region only (ILT follows in the same section).
         let ptr_size = crate::import_table::iat_slot_size(builder.is_64bit);
-        let iat_only: usize = builder
-            .modules
-            .iter()
-            .map(|m| (m.thunks.len() + 1) * ptr_size)
-            .sum();
+        let iat_only = builder.modules.iter().try_fold(0usize, |total, m| {
+            let slots = m
+                .thunks
+                .len()
+                .checked_add(1)
+                .ok_or_else(|| PeError::Parse("IAT slot count overflow".into()))?;
+            let bytes = slots
+                .checked_mul(ptr_size)
+                .ok_or_else(|| PeError::Parse("IAT size overflow".into()))?;
+            total
+                .checked_add(bytes)
+                .ok_or_else(|| PeError::Parse("IAT size overflow".into()))
+        })?;
+        let iat_rva = import_va
+            .checked_add(
+                u32::try_from(iat_off)
+                    .map_err(|_| PeError::Parse("IAT offset exceeds PE32 limit".into()))?,
+            )
+            .ok_or_else(|| PeError::Parse("IAT RVA overflow".into()))?;
+        let iat_size = u32::try_from(iat_only)
+            .map_err(|_| PeError::Parse("IAT size exceeds PE32 limit".into()))?;
         iat_directory = ImageDataDirectory {
-            virtual_address: import_va.saturating_add(iat_off),
-            size: iat_only as u32,
+            virtual_address: iat_rva,
+            size: iat_size,
         };
-        let vsize = import_data.len() as u32;
-        let raw_size = align_up(vsize, fa);
+        let vsize = u32::try_from(import_data.len())
+            .map_err(|_| PeError::Parse("import data exceeds PE32 size".into()))?;
+        let raw_size = checked_align_up(vsize, fa, "import raw size")?;
         laid_out.push(LaidSection {
             name: ".idata".into(),
             characteristics: 0xC000_0040, // CNT_INITIALIZED_DATA | MEM_READ | MEM_WRITE
@@ -390,12 +424,13 @@ pub fn rebuild_pe_image_with_meta(plan: &RebuildPlan) -> Result<RebuildResult, P
             raw_offset: 0,
             data: import_data,
         });
-        next_va = align_up(
+        next_va = checked_align_up(
             import_va
                 .checked_add(vsize.max(1))
                 .ok_or_else(|| PeError::Parse("import VA overflow".into()))?,
             sa,
-        );
+            "import virtual end",
+        )?;
     }
 
     let mut exception_directory = ImageDataDirectory::default();
@@ -407,8 +442,9 @@ pub fn rebuild_pe_image_with_meta(plan: &RebuildPlan) -> Result<RebuildResult, P
             virtual_address: exception_va,
             size: dir_size,
         };
-        let vsize = exception_data.len() as u32;
-        let raw_size = align_up(vsize.max(1), fa);
+        let vsize = u32::try_from(exception_data.len())
+            .map_err(|_| PeError::Parse("exception data exceeds PE32 size".into()))?;
+        let raw_size = checked_align_up(vsize.max(1), fa, "exception raw size")?;
         laid_out.push(LaidSection {
             name: ".pdata".into(),
             characteristics: 0x4000_0040, // CNT_INITIALIZED_DATA | MEM_READ
@@ -418,12 +454,13 @@ pub fn rebuild_pe_image_with_meta(plan: &RebuildPlan) -> Result<RebuildResult, P
             raw_offset: 0,
             data: exception_data,
         });
-        next_va = align_up(
+        next_va = checked_align_up(
             exception_va
                 .checked_add(vsize.max(1))
                 .ok_or_else(|| PeError::Parse("exception VA overflow".into()))?,
             sa,
-        );
+            "exception virtual end",
+        )?;
     }
 
     let mut tls_directory = ImageDataDirectory::default();
@@ -435,8 +472,9 @@ pub fn rebuild_pe_image_with_meta(plan: &RebuildPlan) -> Result<RebuildResult, P
             virtual_address: tls_va,
             size: dir_size,
         };
-        let vsize = tls_data.len() as u32;
-        let raw_size = align_up(vsize.max(1), fa);
+        let vsize = u32::try_from(tls_data.len())
+            .map_err(|_| PeError::Parse("TLS data exceeds PE32 size".into()))?;
+        let raw_size = checked_align_up(vsize.max(1), fa, "TLS raw size")?;
         laid_out.push(LaidSection {
             name: ".tls".into(),
             characteristics: 0xC000_0040, // CNT_INITIALIZED_DATA | MEM_READ | MEM_WRITE
@@ -446,28 +484,33 @@ pub fn rebuild_pe_image_with_meta(plan: &RebuildPlan) -> Result<RebuildResult, P
             raw_offset: 0,
             data: tls_data,
         });
-        next_va = align_up(
+        next_va = checked_align_up(
             tls_va
                 .checked_add(vsize.max(1))
                 .ok_or_else(|| PeError::Parse("tls VA overflow".into()))?,
             sa,
-        );
+            "TLS virtual end",
+        )?;
     }
 
     let mut basereloc_directory = ImageDataDirectory::default();
     if has_relocs {
+        let reloc_scan_end = next_va
+            .checked_add(sa)
+            .ok_or_else(|| PeError::Parse("relocation scan range overflow".into()))?;
         let mut rb = RelocationTableBuilder::new(
             plan.image_base,
             // provisional; reloc builder only uses image_base for scan_and_add
-            next_va.saturating_add(sa),
+            reloc_scan_end,
         );
         for &(rva, typ) in &plan.relocations {
             rb.add_relocation(rva, typ);
         }
         let reloc_data = rb.build();
         let reloc_va = next_va;
-        let vsize = reloc_data.len() as u32;
-        let raw_size = align_up(vsize.max(1), fa);
+        let vsize = u32::try_from(reloc_data.len())
+            .map_err(|_| PeError::Parse("relocation data exceeds PE32 size".into()))?;
+        let raw_size = checked_align_up(vsize.max(1), fa, "relocation raw size")?;
         basereloc_directory = ImageDataDirectory {
             virtual_address: reloc_va,
             size: vsize.max(1),
@@ -481,12 +524,13 @@ pub fn rebuild_pe_image_with_meta(plan: &RebuildPlan) -> Result<RebuildResult, P
             raw_offset: 0,
             data: reloc_data,
         });
-        next_va = align_up(
+        next_va = checked_align_up(
             reloc_va
                 .checked_add(vsize.max(1))
                 .ok_or_else(|| PeError::Parse("reloc VA overflow".into()))?,
             sa,
-        );
+            "relocation virtual end",
+        )?;
     }
 
     let size_of_image = next_va;
@@ -502,7 +546,15 @@ pub fn rebuild_pe_image_with_meta(plan: &RebuildPlan) -> Result<RebuildResult, P
             .checked_add(sec.raw_size)
             .ok_or_else(|| PeError::Parse("raw offset overflow".into()))?;
     }
-    let file_size = next_raw as usize;
+    let file_size = usize::try_from(next_raw)
+        .map_err(|_| PeError::Parse("output file size does not fit usize".into()))?;
+    if file_size > MAX_REBUILD_OUTPUT_SIZE {
+        return Err(PeError::SizeLimit {
+            what: "rebuild output".into(),
+            size: file_size,
+            max: MAX_REBUILD_OUTPUT_SIZE,
+        });
+    }
 
     // Build PeHeader model for serialize_headers.
     let mut pe = synthesize_pe_header(plan, e_lfanew, fa, sa, size_of_headers, size_of_image)?;
@@ -565,7 +617,11 @@ pub fn rebuild_pe_image_with_meta(plan: &RebuildPlan) -> Result<RebuildResult, P
 
     let mut nt_blob = pe.serialize_headers()?;
     // Drop legacy 0x200 pad; full-image layout owns header padding via size_of_headers.
-    let nt_core_len = 4 + 20 + opt_size + pe.sections.len() * 40;
+    let nt_core_len = 4usize
+        .checked_add(20)
+        .and_then(|n| n.checked_add(opt_size))
+        .and_then(|n| n.checked_add(pe.sections.len().checked_mul(40)?))
+        .ok_or_else(|| PeError::Parse("serialized NT header size overflow".into()))?;
     if nt_blob.len() < nt_core_len {
         return Err(PeError::Parse(
             "serialize_headers shorter than NT core".into(),
@@ -631,11 +687,27 @@ struct LaidSection {
     data: Vec<u8>,
 }
 
-fn effective_virtual_size(sec: &PlannedSection) -> u32 {
+fn effective_virtual_size(sec: &PlannedSection) -> Result<u32, PeError> {
     if sec.virtual_size > 0 {
-        sec.virtual_size
+        Ok(sec.virtual_size)
     } else {
-        (sec.data.len() as u32).max(1)
+        Ok(u32::try_from(sec.data.len())
+            .map_err(|_| PeError::Parse("section data exceeds PE32 size".into()))?
+            .max(1))
+    }
+}
+
+fn checked_align_up(value: u32, alignment: u32, what: &str) -> Result<u32, PeError> {
+    if alignment == 0 {
+        return Err(PeError::Parse(format!("{what}: alignment is zero")));
+    }
+    let remainder = value % alignment;
+    if remainder == 0 {
+        Ok(value)
+    } else {
+        value
+            .checked_add(alignment - remainder)
+            .ok_or_else(|| PeError::Parse(format!("{what} alignment overflow")))
     }
 }
 
@@ -830,6 +902,20 @@ mod tests {
             "DYNAMIC_BASE expected when prefer_aslr"
         );
         assert!(pe.sections.iter().any(|s| s.name == ".reloc"));
+    }
+
+    #[test]
+    fn rebuild_rejects_fixed_section_virtual_end_overflow() {
+        let mut plan = RebuildPlan::pe32_plus();
+        plan.sections.push(PlannedSection::with_rva(
+            ".bad",
+            0xC000_0040,
+            0xFFFF_F000,
+            0x2000,
+            vec![0u8; 1],
+        ));
+        let err = rebuild_pe_image(&plan).expect_err("fixed VA overflow must fail");
+        assert!(matches!(err, PeError::Parse(_)));
     }
 
     #[test]

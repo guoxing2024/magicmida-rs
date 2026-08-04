@@ -148,14 +148,20 @@ impl ImportTableBuilder {
                 .max()
                 .unwrap_or(0);
             let iat = if max_iat > 0 { max_iat + 8 } else { 0 };
-            self.modules[mi].thunks.push(crate::import_table::ImportThunk {
-                iat_address: iat,
-                function_name: Some(func.to_string()),
-                ordinal: None,
-                is_64bit: self.is_64bit,
-            });
+            self.modules[mi]
+                .thunks
+                .push(crate::import_table::ImportThunk {
+                    iat_address: iat,
+                    function_name: Some(func.to_string()),
+                    ordinal: None,
+                    is_64bit: self.is_64bit,
+                });
             // Return 0 if we couldn't compute a real IAT (builder will reassign)
-            if iat > 0 { Some(iat) } else { None }
+            if iat > 0 {
+                Some(iat)
+            } else {
+                None
+            }
         }
     }
 

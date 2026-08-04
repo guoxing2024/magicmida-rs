@@ -1,6 +1,6 @@
-//! Main dump orchestration — `dump_process` and `dump_dotnet`.
+//! Main dump orchestration ?`dump_process` and `dump_dotnet`.
 //!
-//! Extracted from `dumper.rs` — corresponds to `TDumper.DumpToFile`
+//! Extracted from `dumper.rs` ?corresponds to `TDumper.DumpToFile`
 //! and `TDumperDotnet.DumpToFile` in `Dumper.pas`.
 
 use std::path::Path;
@@ -29,12 +29,12 @@ use super::header_patch::{shrink_sections, validate_and_patch_pe_header};
 /// *either* code RVAs (pointing into `.text`, outside the export directory)
 /// *or* forwarder RVAs (pointing to a forwarder string such as
 /// `"ntdll.NtCreateFile"` that lives *inside* the export directory).  Only
-/// forwarder RVAs — those that fall within
-/// `[original_export_rva, original_export_rva + export_size)` — are shifted
+/// forwarder RVAs ?those that fall within
+/// `[original_export_rva, original_export_rva + export_size)` ?are shifted
 /// by `delta`.  Code RVAs are left untouched: the code did not move.
 ///
 /// `AddressOfNameOrdinals` array *elements* are ordinals (not RVAs) and are
-/// never adjusted — only the directory field (0x24) is relocated.
+/// never adjusted ?only the directory field (0x24) is relocated.
 ///
 /// # Fail-closed
 ///
@@ -44,15 +44,15 @@ use super::header_patch::{shrink_sections, validate_and_patch_pe_header};
 ///
 /// # Arguments
 ///
-/// - `export_data` — the full export directory blob (directory + arrays +
+/// - `export_data` ?the full export directory blob (directory + arrays +
 ///   strings) captured from the original export range.  Offsets within it are
 ///   `rva - original_export_rva`.
-/// - `original_export_rva` — the RVA the export directory had *before* the
+/// - `original_export_rva` ?the RVA the export directory had *before* the
 ///   move (used to validate that fields point inside the directory and to
 ///   classify forwarder vs code RVAs).
-/// - `export_size` — the size of the original export directory range.
+/// - `export_size` ?the size of the original export directory range.
 ///   `export_data.len()` may be larger (padding) but must be `>= export_size`.
-/// - `delta` — `new_export_rva.wrapping_sub(original_export_rva)`.
+/// - `delta` ?`new_export_rva.wrapping_sub(original_export_rva)`.
 fn relocate_export_table_rvas(
     export_data: &mut [u8],
     original_export_rva: u32,
@@ -163,8 +163,8 @@ fn relocate_export_table_rvas(
         }
         // Relocate the directory field.
         write_u32(export_data, 0x1C, addr_funcs.wrapping_add(delta))?;
-        // Relocate each function RVA: forwarder (inside dir) → +delta;
-        // code RVA (outside dir) → unchanged.  Zero entries are skipped
+        // Relocate each function RVA: forwarder (inside dir)  -> +delta;
+        // code RVA (outside dir)  -> unchanged.  Zero entries are skipped
         // (unexported slot).
         for i in 0..num_functions {
             let off = arr_off + i * 4;
@@ -176,7 +176,7 @@ fn relocate_export_table_rvas(
             if is_forwarder {
                 write_u32(export_data, off, func_rva.wrapping_add(delta))?;
             }
-            // else: code RVA — leave unchanged.
+            // else: code RVA ?leave unchanged.
         }
     }
 
@@ -247,7 +247,7 @@ use super::import_rebuild::rebuild_import_table_complete;
 use super::import_section::{build_import_table_from_original, create_import_section};
 use super::output_writer::write_output_file;
 use super::sections::{create_pdata_section, create_reloc_section};
-use super::types::{DumpOptions, EarlySectionSnapshot};
+use super::types::{DumpOptions, DumpProcessReport, EarlySectionSnapshot};
 
 /// Dump a PE image from the target process into a file.
 ///
@@ -269,6 +269,16 @@ pub fn dump_process(
     debugger: &mut dyn mida_core::DebuggerCore,
     opts: &DumpOptions,
 ) -> Result<(), PeError> {
+    dump_process_with_report(debugger, opts).map(|_| ())
+}
+
+/// Dump a PE image and return the evidence collected after the final candidate
+/// has been serialized successfully.  The compatibility [`dump_process`]
+/// wrapper above intentionally discards this report.
+pub fn dump_process_with_report(
+    debugger: &mut dyn mida_core::DebuggerCore,
+    opts: &DumpOptions,
+) -> Result<DumpProcessReport, PeError> {
     // 1. Read PE headers
     let mut header_buf = vec![0u8; 0x1000];
     let read = debugger
@@ -282,10 +292,35 @@ pub fn dump_process(
 
     let mut pe = PeHeader::from_bytes(&header_buf)?;
 
+    // Capture immutable runtime TLS evidence before any header patch, shrink,
+    // sanitize, or section reconstruction changes the parsed PE semantics.
+    let tls_report =
+        crate::tls_observation::observe_tls_runtime(&pe, opts.image_base, |address, buffer| {
+            let native_address = usize::try_from(address)
+                .map_err(|_| format!("TLS reader address {address:#x} does not fit usize"))?;
+            debugger
+                .read_memory(native_address, buffer)
+                .map_err(|error| error.to_string())
+        });
+    // Freeze relocation facts before header patching, shrinking, sanitizing,
+    // or rebuilding .reloc. Rebuilt relocation bytes are never runtime proof.
+    let relocation_report = crate::relocation_observation::observe_relocations_runtime(
+        &pe,
+        opts.image_base,
+        |address, buffer| {
+            let native_address = usize::try_from(address).map_err(|_| {
+                format!("relocation reader address {address:#x} does not fit usize")
+            })?;
+            debugger
+                .read_memory(native_address, buffer)
+                .map_err(|error| error.to_string())
+        },
+    );
+
     // 1a. Validate and patch PE header fields
     validate_and_patch_pe_header(&mut pe, opts)?;
 
-    // 1b. Always capture Exception DD — needed for shrink restore *and* for
+    // 1b. Always capture Exception DD ?needed for shrink restore *and* for
     // no-shrink dumps where the table lives in a zero-raw Themida section
     // (R0B: exception_no_raw / directory_start_unmapped).
     const IMAGE_DIRECTORY_ENTRY_EXCEPTION: usize = 3;
@@ -371,17 +406,24 @@ pub fn dump_process(
     let is_64bit = pe.is_64bit;
 
     // 2. Rebuild import table if requested
-    let (iat_image, _iat_image_size, mut import_builder) = if opts.fix_imports {
-        rebuild_import_table_complete(
+    let (iat_image, _iat_image_size, mut import_builder, iat_report) = if opts.fix_imports {
+        let (iat_image, iat_size, import_builder, report) = rebuild_import_table_complete(
             debugger,
             &mut pe,
             opts.image_base,
             is_64bit,
             opts.iat_location,
-        )?
+        )?;
+        (iat_image, iat_size, import_builder, Some(report))
     } else {
-        (Vec::new(), 0usize, None)
+        (Vec::new(), 0usize, None, None)
     };
+
+    if let Some(report) = iat_report.as_ref().filter(|_| opts.fix_imports) {
+        if !report.is_complete() {
+            warn!(reason = %report.failure_summary(), "IAT recovery is incomplete; percentage/threshold gates are disabled");
+        }
+    }
 
     // Determine the original IAT RVA
     let original_iat_rva = if let Some((addr, _)) = opts.iat_location {
@@ -394,7 +436,7 @@ pub fn dump_process(
     //
     // Holdout Oreans (stub on-disk imports, fat runtime IAT):
     // - Live rebuild may report "77%" against *all* slots including zeros, then
-    //   wrongly fall back to original PE which only has ~10 thunks — far worse.
+    //   wrongly fall back to original PE which only has ~10 thunks ?far worse.
     // Rules:
     // 1. Denominator = non-zero live IAT slots (zeros are module delimiters).
     // 2. Fall back to original only when it has *more* thunks than rebuild
@@ -403,79 +445,21 @@ pub fn dump_process(
         std::collections::HashMap::new();
     if opts.fix_imports {
         let live_empty = import_builder.as_ref().is_none_or(|b| b.thunk_count() == 0);
-        let ptr_size = if is_64bit { 8usize } else { 4usize };
-
         let use_original = if live_empty {
             true
-        } else if let Some(ref ep) = opts.executable_path {
-            let rebuilt_count = import_builder
-                .as_ref()
-                .map(|b| b.thunk_count())
-                .unwrap_or(0);
-
-            let runtime_iat_slots = if let Some((_iat_va, iat_size)) = opts.iat_location {
-                iat_size / ptr_size
-            } else {
-                let iat_dir =
-                    pe.nt_headers.optional_header.data_directory[IMAGE_DIRECTORY_ENTRY_IAT];
-                if iat_dir.size > 0 {
-                    (iat_dir.size as usize) / ptr_size
-                } else {
-                    let orig_imports = crate::original_imports::read_original_import_table(ep);
-                    orig_imports.iter().map(|(_, funcs)| funcs.len()).sum()
-                }
-            };
-
-            // Non-zero live slots from the captured IAT image (best denominator).
-            let nonzero_slots = if !iat_image.is_empty() && ptr_size > 0 {
-                iat_image
-                    .chunks_exact(ptr_size)
-                    .filter(|c| c.iter().any(|&b| b != 0))
-                    .count()
-                    .max(1)
-            } else {
-                runtime_iat_slots.max(1)
-            };
-            // Report both spans; gate coverage on non-zero slots.
-            let denom = nonzero_slots;
-            let threshold = (denom as f64 * 0.9) as usize;
-            let pct = ((rebuilt_count as f64 / denom as f64) * 100.0) as u32;
-
-            let orig_imports = crate::original_imports::read_original_import_table(ep);
-            let original_count: usize = orig_imports.iter().map(|(_, funcs)| funcs.len()).sum();
-
-            if rebuilt_count >= threshold {
-                info!(
-                    rebuilt = rebuilt_count,
-                    nonzero_slots = denom,
-                    total_slots = runtime_iat_slots,
-                    pct,
-                    "IAT rebuild sufficient: {}/{} non-zero slots ({}% coverage; total_slots={}) - using rebuilt table",
-                    rebuilt_count, denom, pct, runtime_iat_slots
-                );
-                false
-            } else if original_count > rebuilt_count {
-                warn!(
-                    rebuilt = rebuilt_count,
-                    original = original_count,
-                    nonzero_slots = denom,
-                    pct,
-                    "IAT rebuild incomplete: {}/{} non-zero ({}%); original has more thunks ({}) - using original import table",
-                    rebuilt_count, denom, pct, original_count
-                );
-                true
-            } else {
-                warn!(
-                    rebuilt = rebuilt_count,
-                    original = original_count,
-                    nonzero_slots = denom,
-                    total_slots = runtime_iat_slots,
-                    pct,
-                    "IAT rebuild incomplete vs non-zero slots ({}/{} = {}%), but original is not richer ({} thunks) - keeping rebuilt table",
-                    rebuilt_count, denom, pct, original_count
-                );
-                false
-            }
+        } else if !iat_report
+            .as_ref()
+            .is_some_and(|report| report.is_complete())
+        {
+            // Fail closed: an incomplete live report may be useful for
+            // diagnostics, but it is never sufficient for the perfect gate.
+            warn!(
+                reason = %iat_report
+                    .as_ref()
+                    .map_or_else(|| "IAT evidence missing".to_string(), |report| report.failure_summary()),
+                "IAT recovery incomplete; refusing to treat live table as complete"
+            );
+            true
         } else {
             false
         };
@@ -755,7 +739,7 @@ pub fn dump_process(
         }
     }
 
-    // 2d. Build function-name → resolved address map
+    // 2d. Build function-name  -> resolved address map
     if import_builder.is_some() {
         if let Some(ref builder) = import_builder {
             if !iat_image.is_empty() && original_iat_rva != 0 {
@@ -799,7 +783,14 @@ pub fn dump_process(
     pe.sanitize();
     for s in &pe.sections {
         if s.virtual_size > 0x100000 {
-            info!("POST-SANITIZE: {} va={:#x} vsz={:#x} raw={:#x} ptr={:#x}", s.name, s.virtual_address, s.virtual_size, s.header.size_of_raw_data, s.header.pointer_to_raw_data);
+            info!(
+                "POST-SANITIZE: {} va={:#x} vsz={:#x} raw={:#x} ptr={:#x}",
+                s.name,
+                s.virtual_address,
+                s.virtual_size,
+                s.header.size_of_raw_data,
+                s.header.pointer_to_raw_data
+            );
         }
     }
 
@@ -826,7 +817,7 @@ pub fn dump_process(
     }
 
     // GTO/AHK experimental stages are gated by DumpProfile (default OreansClassic).
-    // Never re-guess profile from filename/SHA/section names — only opts.profile.
+    // Never re-guess profile from filename/SHA/section names ?only opts.profile.
     let stage_plan = opts.profile.stage_plan();
     info!(
         profile = ?opts.profile,
@@ -852,12 +843,7 @@ pub fn dump_process(
         .clone()
         .resolve_for_profile(opts.profile);
     let mut heap_globals = if stage_plan.detect_heap_globals {
-        super::heap_global_snapshot::detect_heap_globals(
-            &pe,
-            &dump_buf,
-            debugger,
-            &capture_policy,
-        )
+        super::heap_global_snapshot::detect_heap_globals(&pe, &dump_buf, debugger, &capture_policy)
     } else {
         Vec::new()
     };
@@ -877,14 +863,14 @@ pub fn dump_process(
     // table-derived label count after scrub so bootstrap payload keeps it.
     super::heap_global_snapshot::resynthesize_gscript_label_count(&mut heap_globals);
     // R-GTO-UI r18/r19b: scrub / slot-cap leave Label.mName null or dangling
-    // while inline UTF-16 remains at +0x30 → 0x48fb0 wcscmp AV. Repair offline
+    // while inline UTF-16 remains at +0x30  -> 0x48fb0 wcscmp AV. Repair offline
     // (scrub now also preserves UTF-16-looking qwords).
     super::heap_global_snapshot::repair_label_names_after_scrub(&mut heap_globals);
     // R-GTO-UI r20: binary search in 0x48fb0 requires mName-ordered table.
-    // Dump capture order is unsorted → lookup "A_Args"/others always miss.
+    // Dump capture order is unsorted  -> lookup "A_Args"/others always miss.
     super::heap_global_snapshot::sort_gscript_label_table(&mut heap_globals);
     // R-GTO-UI r21: Label+0x23==0 redirects via +0x10; dump has null nested
-    // → AV at 0xc13ea after successful A_Args lookup. Mark non-nested.
+    //  -> AV at 0xc13ea after successful A_Args lookup. Mark non-nested.
     super::heap_global_snapshot::mark_labels_non_nested(&mut heap_globals);
     // R-GTO-UI r21b: WinMain re-inits [0x141bf0] after Label bind; dump free-list
     // body AVs later. Zero-slab large enough for re-init stores only.
@@ -897,7 +883,7 @@ pub fn dump_process(
     // Only when MIDA_GTO_NO_BYPASS=1 (root-cause measurement). Default (bypass)
     // path skips slab to avoid rebase false-positives regressing the working
     // r26b NewClassName path.
-    // Capture-class transforms (taxonomy v1 §4.3) — recorded for bound manifest.
+    // Capture-class transforms (taxonomy v1 ?4.3) ?recorded for bound manifest.
     let mut capture_transforms: Vec<(&'static str, &'static str)> = Vec::new();
 
     let heap_slab = if no_bypass && stage_plan.detect_heap_globals {
@@ -984,7 +970,7 @@ pub fn dump_process(
             opts.executable_path.as_deref(),
         );
     } else {
-        info!("R-GTO-UI r27: skipping .data scrub (NO_BYPASS — VM re-executes, initializes .data itself)");
+        info!("R-GTO-UI r27: skipping .data scrub (NO_BYPASS ?VM re-executes, initializes .data itself)");
     }
 
     // R-GTO-UI round 5/7: re-init CRITICAL_SECTION objects in `.data` whose
@@ -992,11 +978,8 @@ pub fn dump_process(
     // `RtlEnterCriticalSection` when WinMain re-enters them. Driven by
     // `DumpCapturePolicy::cs_reinit_rvas`.
     if !capture_policy.cs_reinit_rvas.is_empty() {
-        super::data_reinit::reinit_critical_sections(
-            &mut dump_buf,
-            &capture_policy.cs_reinit_rvas,
-        );
-        // Sample-policy CS list → disclose (taxonomy: pe_repair / cs_reinit).
+        super::data_reinit::reinit_critical_sections(&mut dump_buf, &capture_policy.cs_reinit_rvas);
+        // Sample-policy CS list  -> disclose (taxonomy: pe_repair / cs_reinit).
         capture_transforms.push(("cs_reinit", "pe_repair"));
     }
 
@@ -1024,10 +1007,10 @@ pub fn dump_process(
                     .into(),
             ));
         }
-        warn!("Could not plant default SecurityCookie — CRT may skip cookie init");
+        warn!("Could not plant default SecurityCookie ?CRT may skip cookie init");
     }
 
-    // 4b. Shrink path: Themida sections deleted — restore Exception + reloc
+    // 4b. Shrink path: Themida sections deleted ?restore Exception + reloc
     // placeholders before import/bootstrap layout. No-shrink .pdata is deferred
     // until after trim_huge_sections (see 5d/5d2): sanitize() temporarily sets
     // SizeOfRawData = VirtualSize on zero-raw .themida, which would make an
@@ -1050,8 +1033,8 @@ pub fn dump_process(
     //     to fill gaps left by removed Themida sections, but .text
     //     contains absolute address references (mov rax, 0x1400ec2000)
     //     that point to the original VAs.  fix_hardcoded_addresses only
-    //     patches runtime ImageBase → file ImageBase, not VA shifts.
-    //     Keeping original VAs avoids this problem — the gaps are
+    //     patches runtime ImageBase  -> file ImageBase, not VA shifts.
+    //     Keeping original VAs avoids this problem ?the gaps are
     //     unused memory and don't affect file size (sanitize sets
     //     ptr=VA so the file only contains actual section data).
     // if opts.shrink {
@@ -1166,8 +1149,8 @@ pub fn dump_process(
         );
     }
     // Follow E8/E9 (and movabs) from .text/.wfix into zero-raw .fill pages
-    // that still hold live decrypted code — without this, wrappers call into
-    // empty BSS (e.g. .wfix `call 0x334c98` → C0000005 / C0000409).
+    // that still hold live decrypted code ?without this, wrappers call into
+    // empty BSS (e.g. .wfix `call 0x334c98`  -> C0000005 / C0000409).
     if stage_plan.materialize_fill_code_refs {
         let _ = super::wrapper_materialize::materialize_fill_code_refs(
             &mut pe,
@@ -1199,7 +1182,7 @@ pub fn dump_process(
     }
 
     // R-GTO-UI round 9: Themida multi-block IAT leaves zero separators that a
-    // residual set of call sites still reference → call [null] AV. Retarget
+    // residual set of call sites still reference  -> call [null] AV. Retarget
     // those sites to the rebuilt FirstThunk for MessageBoxW / LocalFree /
     // SendMessageW (heuristics + original import gap names). AhkGto only.
     if stage_plan.patch_wrapper_iat_call_sites {
@@ -1244,7 +1227,14 @@ pub fn dump_process(
     let _delta = pe.trim_huge_sections(&dump_buf, &mut iat_raw_addr);
     for s in &pe.sections {
         if s.virtual_size > 0x100000 {
-            info!("POST-TRIM: {} va={:#x} vsz={:#x} raw={:#x} ptr={:#x}", s.name, s.virtual_address, s.virtual_size, s.header.size_of_raw_data, s.header.pointer_to_raw_data);
+            info!(
+                "POST-TRIM: {} va={:#x} vsz={:#x} raw={:#x} ptr={:#x}",
+                s.name,
+                s.virtual_address,
+                s.virtual_size,
+                s.header.size_of_raw_data,
+                s.header.pointer_to_raw_data
+            );
         }
     }
 
@@ -1277,9 +1267,8 @@ pub fn dump_process(
     // 5e. Rebuild .edata section for AutoHotkey and other DLLs.
     //
     // CRITICAL: This must run BEFORE write_output_file so the section goes
-    // through the unified serialize flow (serialize_headers →
-    // write_section_data).  The old code appended .edata AFTER serialization,
-    // which left the section table / data directories / file layout
+    // through the unified serialize flow (`serialize_headers` then
+    // `write_section_data`).  The old code appended .edata AFTER serialization,
     // inconsistent and corrupted the output (the export bytes were written
     // at the new RVA as a raw file offset, but PointerToRawData was 0, so the
     // loader could not find them and the section table was stale).
@@ -1352,7 +1341,7 @@ pub fn dump_process(
     };
 
     // Verify AddressOfEntryPoint only (OptionalHeader + 16). Never use
-    // e_lfanew+24+SizeOfOptionalHeader — that lands on the section table and
+    // e_lfanew+24+SizeOfOptionalHeader ?that lands on the section table and
     // writing there corrupts the first section's SizeOfRawData (audit P0).
     if output_entry_point != 0 {
         if let Some(file_ep) = read_address_of_entry_point(&out_data) {
@@ -1360,7 +1349,7 @@ pub fn dump_process(
                 warn!(
                     file_ep = format_args!("{file_ep:#x}"),
                     expected = format_args!("{output_entry_point:#x}"),
-                    "AddressOfEntryPoint mismatch after serialize — correcting"
+                    "AddressOfEntryPoint mismatch after serialize ?correcting"
                 );
                 patch_address_of_entry_point(&mut out_data, output_entry_point);
             }
@@ -1375,10 +1364,10 @@ pub fn dump_process(
     let gto_bypass = matches!(opts.profile, crate::DumpProfile::AhkGtoExperimental)
         && std::env::var("MIDA_GTO_BYPASS").ok().as_deref() == Some("1");
     // In-memory transform list for post-write fail-closed artifact manifest.
-    // Start from capture-class rows recorded earlier (taxonomy v1 §4.3).
+    // Start from capture-class rows recorded earlier (taxonomy v1 ?4.3).
     let mut applied_transforms: Vec<(&'static str, &'static str)> = capture_transforms;
     if gto_bypass {
-        warn!("R-GTO-UI: MIDA_GTO_BYPASS=1 — applying diagnostic sample patches (NOT product-Accepted)");
+        warn!("R-GTO-UI: MIDA_GTO_BYPASS=1 ?applying diagnostic sample patches (NOT product-Accepted)");
         patch_gto_skip_loadfile_reentry(&mut out_data);
         patch_gto_registerclass_classname(&mut out_data);
         patch_gto_skip_msgloop_crash(&mut out_data);
@@ -1399,12 +1388,12 @@ pub fn dump_process(
 
     debug_section_chars(&out_data, "After fix_hardcoded_addresses");
 
-    // ===超越 Pascal: 文件布局重排===
+    // === Pascal: repack section layout ===
     if opts.shrink {
         crate::postprocess::pack_section_layout(&mut out_data, &pe)?;
     }
 
-    // ===超越 Pascal: 生成重定位表===
+    // === Pascal: build relocation table ===
     if opts.shrink {
         crate::postprocess::build_relocation_table(&mut out_data, None, is_64bit)?;
     }
@@ -1423,9 +1412,13 @@ pub fn dump_process(
     }
 
     // Atomic-ish emit: write exclusive temp beside target, re-check alias on
-    // the temp identity path, then rename. Narrows check→write TOCTOU where
+    // the temp identity path, then rename. Narrows check/write TOCTOU where
     // a hard link can be planted after the alias probe (audit residual).
-    write_output_atomic(&opts.output_path, &out_data, opts.executable_path.as_deref())?;
+    write_output_atomic(
+        &opts.output_path,
+        &out_data,
+        opts.executable_path.as_deref(),
+    )?;
 
     // Always emit a bound transform manifest (empty ledger for clean dumps) so
     // stale sibling manifests from prior bypass runs cannot poison clean re-runs,
@@ -1468,7 +1461,25 @@ pub fn dump_process(
         &capture_policy,
     );
 
-    Ok(())
+    // The report is returned only after the candidate and its required bound
+    // manifest have both been written successfully.  Any earlier error exits
+    // without a success report.
+    let iat_evidence_complete = iat_report
+        .as_ref()
+        .is_some_and(|report| report.is_complete());
+    Ok(DumpProcessReport {
+        fix_imports_requested: opts.fix_imports,
+        iat_evidence_present: iat_report.is_some(),
+        iat_evidence_complete,
+        iat_report,
+        tls_evidence_present: tls_report.directory_present,
+        tls_evidence_complete: tls_report.is_complete(),
+        tls_report,
+        relocation_evidence_present: relocation_report.directory_present,
+        relocation_evidence_complete: relocation_report.is_complete(),
+        relocation_report,
+        output_size: out_data.len(),
+    })
 }
 
 /// True when Exception DD [rva, rva+size) is not fully covered by any section's
@@ -1508,8 +1519,8 @@ fn exception_directory_lacks_raw(pe: &PeHeader, rva: u32, size: u32) -> bool {
 /// This MUST be called before `write_output_file` so the section flows
 /// through the normal serialize path (`serialize_headers` writes the
 /// section table, `write_section_data` emits `extra_data` at
-/// `pointer_to_raw_data`).  Appending `.edata` after serialization — as the
-/// old code did — left the section table stale, set `PointerToRawData = 0`,
+/// `pointer_to_raw_data`).  Appending `.edata` after serialization ?as the
+/// old code did ?left the section table stale, set `PointerToRawData = 0`,
 /// and wrote the export bytes at the RVA as a raw file offset, corrupting
 /// the output.
 ///
@@ -1593,7 +1604,7 @@ fn create_edata_section(
         };
 
     info!(
-        "Relocated export table: {:#x} → {:#x} (size {:#x}, delta {:#x}, raw {:#x})",
+        "Relocated export table: {:#x}  -> {:#x} (size {:#x}, delta {:#x}, raw {:#x})",
         original_export_rva, new_export_rva, export_size, delta, raw_size
     );
     Ok(())
@@ -1693,7 +1704,7 @@ fn apply_early_section_overlays(
 /// Replace only `call 0x35520` (5 bytes at 0x6757) with `mov eax,1` so the
 /// existing success path runs `call 0x1b10` and keeps the UI alive.
 
-/// Patch WinMain unconditional MessageBoxW call @0x5c5d → mov eax,1; nop.
+/// Patch WinMain unconditional MessageBoxW call @0x5c5d  -> mov eax,1; nop.
 ///
 /// Call is `ff 15 rel32` (6 bytes). Without this, cold start sticks on #32770
 /// and the NewClassName window is never created for the external probe.
@@ -1713,7 +1724,7 @@ fn patch_gto_skip_winmain_messagebox(image: &mut [u8]) {
     image[file_off..file_off + 6].copy_from_slice(&[0xb8, 0x01, 0x00, 0x00, 0x00, 0x90]);
     info!(
         site_rva = format_args!("{SITE_RVA:#x}"),
-        "R-GTO-UI: patched WinMain MessageBoxW → mov eax,1 (unblock UI)"
+        "R-GTO-UI: patched WinMain MessageBoxW  -> mov eax,1 (unblock UI)"
     );
 }
 
@@ -1729,7 +1740,11 @@ fn patch_gto_skip_msgloop_crash(image: &mut [u8]) {
     if image[file_off] != 0xe8 {
         return;
     }
-    let rel = i32::from_le_bytes(image[file_off + 1..file_off + 5].try_into().unwrap_or([0; 4]));
+    let rel = i32::from_le_bytes(
+        image[file_off + 1..file_off + 5]
+            .try_into()
+            .unwrap_or([0; 4]),
+    );
     let next = CALL_RVA.wrapping_add(5);
     let target = next.wrapping_add(rel as u32);
     if target != TARGET_RVA {
@@ -1738,7 +1753,7 @@ fn patch_gto_skip_msgloop_crash(image: &mut [u8]) {
     image[file_off..file_off + 5].copy_from_slice(&[0xb8, 0x01, 0x00, 0x00, 0x00]);
     info!(
         call_rva = format_args!("{CALL_RVA:#x}"),
-        "R-GTO-UI: patched call 0x35520 → mov eax,1 (keep msg pump 0x1b10)"
+        "R-GTO-UI: patched call 0x35520  -> mov eax,1 (keep msg pump 0x1b10)"
     );
 }
 
@@ -1748,7 +1763,9 @@ fn find_utf16_string_rva(image: &[u8], s: &str) -> Option<u32> {
         needle.extend_from_slice(&ch.to_le_bytes());
     }
     needle.extend_from_slice(&[0, 0]);
-    let file_off = image.windows(needle.len()).position(|w| w == needle.as_slice())?;
+    let file_off = image
+        .windows(needle.len())
+        .position(|w| w == needle.as_slice())?;
     rva_from_file_offset(image, file_off)
 }
 
@@ -1782,17 +1799,17 @@ fn rva_from_file_offset(image: &[u8], file_off: usize) -> Option<u32> {
 ///
 /// Two sites must agree (r25b lesson):
 /// - `0x34dbb`: early non-empty check was `mov rax,[gscript+0xbd8]`; after
-///   `0x345e0` that slot is empty/static → function returns 0 before WNDCLASS setup.
+///   `0x345e0` that slot is empty/static  -> function returns 0 before WNDCLASS setup.
 /// - `0x34ed4`: real `lpszClassName` lea (stock points at `AutoHotkey2`).
 ///
-/// Patch both to `lea …,[NewClassName]` (7-byte rip-relative forms).
+/// Patch both to `lea ?,[NewClassName]` (7-byte rip-relative forms).
 fn patch_gto_registerclass_classname(image: &mut [u8]) {
     let Some(class_rva) = find_utf16_string_rva(image, "NewClassName") else {
         warn!("R-GTO-UI: NewClassName UTF-16 not found; skip class patches");
         return;
     };
 
-    // --- 0x34dbb: mov rax,[rcx+0xbd8] (7) → lea rax,[NewClassName] (7) ---
+    // --- 0x34dbb: mov rax,[rcx+0xbd8] (7)  -> lea rax,[NewClassName] (7) ---
     const CHECK_RVA: u32 = 0x34dbb;
     if let Some(file_off) = rva_to_file_offset(image, CHECK_RVA) {
         if file_off + 7 <= image.len() {
@@ -1809,29 +1826,27 @@ fn patch_gto_registerclass_classname(image: &mut [u8]) {
                 info!(
                     site_rva = format_args!("{CHECK_RVA:#x}"),
                     class_rva = format_args!("{class_rva:#x}"),
-                    "R-GTO-UI: patched RegisterClass empty-check → lea NewClassName"
+                    "R-GTO-UI: patched RegisterClass empty-check  -> lea NewClassName"
                 );
             }
         }
     }
 
-    // --- 0x34ed4: lea rax,[AutoHotkey2] → lea rax,[NewClassName] ---
+    // --- 0x34ed4: lea rax,[AutoHotkey2]  -> lea rax,[NewClassName] ---
     const CLASS_RVA_SITE: u32 = 0x34ed4;
     if let Some(file_off) = rva_to_file_offset(image, CLASS_RVA_SITE) {
-        if file_off + 7 <= image.len()
-            && image[file_off..file_off + 3] == [0x48, 0x8d, 0x05]
-        {
+        if file_off + 7 <= image.len() && image[file_off..file_off + 3] == [0x48, 0x8d, 0x05] {
             let next = CLASS_RVA_SITE.wrapping_add(7);
             let disp = class_rva.wrapping_sub(next) as i32;
             image[file_off + 3..file_off + 7].copy_from_slice(&disp.to_le_bytes());
             info!(
                 site_rva = format_args!("{CLASS_RVA_SITE:#x}"),
                 class_rva = format_args!("{class_rva:#x}"),
-                "R-GTO-UI: retargeted RegisterClass lpszClassName → NewClassName"
+                "R-GTO-UI: retargeted RegisterClass lpszClassName  -> NewClassName"
             );
         }
     }
-    // --- 0x34f66: mov rdx,[0x141bf8] → lea rdx,[NewClassName] ---
+    // --- 0x34f66: mov rdx,[0x141bf8]  -> lea rdx,[NewClassName] ---
     // CreateWindowExW lpClassName. Global often holds atom/other class
     // (r26: rdx=0x120238 "edit"/static) so UI appears as ZhuChuangKou or not
     // at all under the NewClassName oracle.
@@ -1853,13 +1868,13 @@ fn patch_gto_registerclass_classname(image: &mut [u8]) {
                 info!(
                     site_rva = format_args!("{CW_CLASS_RVA:#x}"),
                     class_rva = format_args!("{class_rva:#x}"),
-                    "R-GTO-UI: patched CreateWindowEx lpClassName → lea NewClassName"
+                    "R-GTO-UI: patched CreateWindowEx lpClassName  -> lea NewClassName"
                 );
             }
         }
     }
 
-    // --- 0x34f59: mov r9d, 0x00CF0000 → 0x01CF0000 (WS_VISIBLE) ---
+    // --- 0x34f59: mov r9d, 0x00CF0000  -> 0x01CF0000 (WS_VISIBLE) ---
     // Stock style is WS_OVERLAPPEDWINDOW without WS_VISIBLE, so NewClassName
     // hwnd exists but IsWindowVisible=0 and the window oracle ignores it (r26b).
     const STYLE_RVA: u32 = 0x34f59;
@@ -1871,13 +1886,11 @@ fn patch_gto_registerclass_classname(image: &mut [u8]) {
             image[file_off + 2..file_off + 6].copy_from_slice(&0x01cf_0000u32.to_le_bytes());
             info!(
                 site_rva = format_args!("{STYLE_RVA:#x}"),
-                "R-GTO-UI: patched CreateWindow style → WS_VISIBLE|WS_OVERLAPPEDWINDOW"
+                "R-GTO-UI: patched CreateWindow style  -> WS_VISIBLE|WS_OVERLAPPEDWINDOW"
             );
         }
     }
-
 }
-
 
 fn patch_gto_skip_loadfile_reentry(image: &mut [u8]) {
     const CALL_RVA: u32 = 0x63f4;
@@ -1892,7 +1905,11 @@ fn patch_gto_skip_loadfile_reentry(image: &mut [u8]) {
     if image[file_off] != 0xe8 {
         return;
     }
-    let rel = i32::from_le_bytes(image[file_off + 1..file_off + 5].try_into().unwrap_or([0; 4]));
+    let rel = i32::from_le_bytes(
+        image[file_off + 1..file_off + 5]
+            .try_into()
+            .unwrap_or([0; 4]),
+    );
     let next = CALL_RVA.wrapping_add(5);
     let target = next.wrapping_add(rel as u32);
     if target != TARGET_RVA {
@@ -1903,7 +1920,7 @@ fn patch_gto_skip_loadfile_reentry(image: &mut [u8]) {
     // Keep length 5: mov eax,imm32 is already 5 bytes (no extra nops needed).
     info!(
         call_rva = format_args!("{CALL_RVA:#x}"),
-        "R-GTO-UI: patched LoadFile re-entry call → mov eax,1 (skip reload)"
+        "R-GTO-UI: patched LoadFile re-entry call  -> mov eax,1 (skip reload)"
     );
 }
 
@@ -1950,7 +1967,8 @@ fn address_of_entry_point_file_offset(image: &[u8]) -> Option<usize> {
         return None;
     }
     // Sanity: SizeOfOptionalHeader must cover AddressOfEntryPoint.
-    let soh = u16::from_le_bytes(image.get(e_lfanew + 20..e_lfanew + 22)?.try_into().ok()?) as usize;
+    let soh =
+        u16::from_le_bytes(image.get(e_lfanew + 20..e_lfanew + 22)?.try_into().ok()?) as usize;
     if soh < 20 {
         return None;
     }
@@ -1959,7 +1977,9 @@ fn address_of_entry_point_file_offset(image: &[u8]) -> Option<usize> {
 
 fn read_address_of_entry_point(image: &[u8]) -> Option<u32> {
     let off = address_of_entry_point_file_offset(image)?;
-    Some(u32::from_le_bytes(image.get(off..off + 4)?.try_into().ok()?))
+    Some(u32::from_le_bytes(
+        image.get(off..off + 4)?.try_into().ok()?,
+    ))
 }
 
 fn patch_address_of_entry_point(image: &mut [u8], ep: u32) -> bool {
@@ -2002,10 +2022,7 @@ fn file_identity(path: &Path) -> std::io::Result<(u32, u64)> {
     use std::fs::OpenOptions;
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
-    let file = OpenOptions::new()
-        .read(true)
-        .share_mode(0x7)
-        .open(path)?;
+    let file = OpenOptions::new().read(true).share_mode(0x7).open(path)?;
     #[repr(C)]
     #[derive(Default)]
     struct FileTime {
@@ -2094,7 +2111,7 @@ fn write_bound_transform_manifest(
     transforms: &[(&str, &str)],
     input: Option<&Path>,
 ) -> Result<(), PeError> {
-    // Taxonomy: docs/TRANSFORM_TAXONOMY_V1.md — empty entries = standard
+    // Taxonomy: docs/TRANSFORM_TAXONOMY_V1.md ?empty entries = standard
     // reconstruction only; sample_bypass ids must appear when GTO bypass runs.
     const TAXONOMY: &str = "mida.transform-taxonomy/v1";
     let sha = candidate_sha256_hex(candidate_bytes);
@@ -2120,9 +2137,9 @@ fn write_bound_transform_manifest(
         ));
     }
     let note = if transforms.is_empty() {
-        "clean dump — empty ledger (standard reconstruction only per taxonomy v1)"
+        "clean dump ?empty ledger (standard reconstruction only per taxonomy v1)"
     } else {
-        "diagnostic transforms — blocks product Accepted unless registered rule"
+        "diagnostic transforms ?blocks product Accepted unless registered rule"
     };
     let body = format!(
         concat!(
@@ -2151,22 +2168,14 @@ fn write_bound_transform_manifest(
     Ok(())
 }
 
-fn write_output_atomic(
-    output: &Path,
-    data: &[u8],
-    input: Option<&Path>,
-) -> Result<(), PeError> {
+fn write_output_atomic(output: &Path, data: &[u8], input: Option<&Path>) -> Result<(), PeError> {
     replace_file_atomic(output, data, input)
 }
 
 /// Exclusive temp + replace destination without delete-then-rename gap.
 /// Windows: `MoveFileExW(REPLACE_EXISTING | WRITE_THROUGH)`. Elsewhere: rename
 /// onto non-existing path only (no silent copy).
-fn replace_file_atomic(
-    output: &Path,
-    data: &[u8],
-    input: Option<&Path>,
-) -> Result<(), PeError> {
+fn replace_file_atomic(output: &Path, data: &[u8], input: Option<&Path>) -> Result<(), PeError> {
     if let Some(src) = input {
         if output_aliases_input(src, output) {
             return Err(PeError::Io(std::io::Error::new(
@@ -2201,9 +2210,24 @@ fn replace_file_atomic(
                 .write(true)
                 .create_new(true)
                 .open(&tmp_path)
-                .map_err(PeError::Io)?;
-            f.write_all(data).map_err(PeError::Io)?;
-            f.sync_all().map_err(PeError::Io)?;
+                .map_err(|e| {
+                    PeError::Io(std::io::Error::new(
+                        e.kind(),
+                        format!("open temp '{}': {e}", tmp_path.display()),
+                    ))
+                })?;
+            f.write_all(data).map_err(|e| {
+                PeError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("write temp '{}': {e}", tmp_path.display()),
+                ))
+            })?;
+            f.sync_all().map_err(|e| {
+                PeError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("sync temp '{}': {e}", tmp_path.display()),
+                ))
+            })?;
             Ok(())
         })();
         if let Err(e) = write_tmp {
@@ -2243,17 +2267,41 @@ fn replace_via_os(tmp: &Path, output: &Path) -> Result<(), PeError> {
     let existing: Vec<u16> = tmp.as_os_str().encode_wide().chain(Some(0)).collect();
     let new_name: Vec<u16> = output.as_os_str().encode_wide().chain(Some(0)).collect();
     // SAFETY: null-terminated wide paths; kernel32 MoveFileExW.
-    let ok = unsafe {
-        MoveFileExW(
-            existing.as_ptr(),
-            new_name.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if ok == 0 {
-        return Err(PeError::Io(std::io::Error::last_os_error()));
+    // Security software may briefly hold a freshly-written executable/image
+    // after fsync. Preserve the atomic replace contract and retry only the
+    // transient Windows sharing/access errors instead of falling back to a
+    // delete-then-rename or non-atomic copy.
+    let mut last_error = None;
+    const MAX_REPLACE_ATTEMPTS: u32 = 40;
+    for attempt in 1..=MAX_REPLACE_ATTEMPTS {
+        let ok = unsafe {
+            MoveFileExW(
+                existing.as_ptr(),
+                new_name.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if ok != 0 {
+            return Ok(());
+        }
+        let e = std::io::Error::last_os_error();
+        let transient = matches!(e.raw_os_error(), Some(5 | 32 | 33));
+        last_error = Some(e);
+        if !transient || attempt == MAX_REPLACE_ATTEMPTS {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
     }
-    Ok(())
+    let e = last_error.unwrap_or_else(std::io::Error::last_os_error);
+    Err(PeError::Io(std::io::Error::new(
+        e.kind(),
+        format!(
+            "MoveFileExW '{}' -> '{}' failed after {} attempts: {e}",
+            tmp.display(),
+            output.display(),
+            MAX_REPLACE_ATTEMPTS
+        ),
+    )))
 }
 
 #[cfg(not(windows))]
@@ -2263,7 +2311,6 @@ fn replace_via_os(tmp: &Path, output: &Path) -> Result<(), PeError> {
     }
     std::fs::rename(tmp, output).map_err(PeError::Io)
 }
-
 
 #[cfg(test)]
 mod overlay_tests {
@@ -2275,6 +2322,20 @@ mod overlay_tests {
             rva,
             bytes: bytes.to_vec(),
         }
+    }
+
+    #[test]
+    fn dump_process_wrapper_and_report_api_keep_distinct_return_types() {
+        let _: fn(&mut dyn mida_core::DebuggerCore, &DumpOptions) -> Result<(), PeError> =
+            dump_process;
+        let _: fn(
+            &mut dyn mida_core::DebuggerCore,
+            &DumpOptions,
+        ) -> Result<DumpProcessReport, PeError> = dump_process_with_report;
+        let _: fn(
+            &mut dyn mida_core::DebuggerCore,
+            &DumpOptions,
+        ) -> Result<crate::DumpProcessReport, PeError> = dump_process_with_report;
     }
 
     #[test]
@@ -2353,7 +2414,7 @@ mod overlay_tests {
 /// Dump a .NET assembly with **required** protected-input path for alias checks.
 ///
 /// `entry_point_rva` is written directly to `AddressOfEntryPoint` (it is already
-/// an RVA — do **not** subtract `image_base` again; audit residual P1).
+/// an RVA ?do **not** subtract `image_base` again; audit residual P1).
 ///
 /// Production callers must pass the protected source path. There is no
 /// source-less public wrapper (audit residual P2).
@@ -2429,10 +2490,10 @@ pub fn dump_dotnet_with_source(
     pe.section_align(&mut image_size);
     pe.nt_headers.optional_header.size_of_image = image_size;
 
-    // entry_point_rva is already RVA (PeHeader::entry_point) — write as-is.
+    // entry_point_rva is already RVA (PeHeader::entry_point) ?write as-is.
     pe.nt_headers.optional_header.address_of_entry_point = entry_point_rva;
 
-    // Headers must overwrite file offset 0 — never append (audit residual).
+    // Headers must overwrite file offset 0 ?never append (audit residual).
     let header_data = pe.serialize_headers()?;
     if header_data.len() > out_data.len() {
         out_data.resize(header_data.len(), 0);
@@ -2451,18 +2512,14 @@ pub fn dump_dotnet_with_source(
 
     write_output_atomic(output_path, &out_data, Some(source_path))?;
 
-    // Always emit bound manifest (empty ledger) — same contract as native dump.
-    if let Err(e) =
-        write_bound_transform_manifest(output_path, &out_data, &[], Some(source_path))
-    {
+    // Always emit bound manifest (empty ledger) ?same contract as native dump.
+    if let Err(e) = write_bound_transform_manifest(output_path, &out_data, &[], Some(source_path)) {
         let cleanup = remove_dump_and_manifest(output_path);
         return Err(match cleanup {
             Ok(()) => e,
             Err(ce) => PeError::Io(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!(
-                    ".NET transform_manifest failed ({e}); residual cleanup failed: {ce}"
-                ),
+                format!(".NET transform_manifest failed ({e}); residual cleanup failed: {ce}"),
             )),
         });
     }
@@ -2774,7 +2831,7 @@ mod edata_relocation_tests {
     }
 
     /// An array whose end crosses `export_size` but still lies inside the
-    /// raw-padded buffer must be rejected — bounds are against `export_size`,
+    /// raw-padded buffer must be rejected ?bounds are against `export_size`,
     /// not the padded buffer length.
     #[test]
     fn relocate_rejects_array_crossing_export_size_into_raw_padding() {
@@ -2783,7 +2840,7 @@ mod edata_relocation_tests {
         // directory field RVA stays inside [dir_start, export_size).
         let mut buf = build_export_blob();
         buf.resize(0x200, 0); // clearly larger than export_size (raw padding)
-                              // num_functions (offset 0x14) = 7 → array end = 0x28 + 7*4 = 0x44.
+                              // num_functions (offset 0x14) = 7  -> array end = 0x28 + 7*4 = 0x44.
         buf[0x14..0x18].copy_from_slice(&7u32.to_le_bytes());
         // export_size = 0x40: includes all directory fields + Name field
         // (0x38) but the functions array end (0x44) > 0x40, while <= 0x200.
@@ -2836,9 +2893,8 @@ mod edata_relocation_tests {
         // has no extra_data (.text); provide a zeroed image-sized buffer.
         let dump_buf = vec![0u8; pe.size_of_image() as usize];
 
-        // Real pipeline call: empty dump_buf / thunks / containers are safe —
+        // Real pipeline call: empty dump_buf / thunks / containers are safe;
         // write_output_file early-returns on the IAT paths and .text falls
-        // back to zeros (we only assert .edata here).
         let opts = DumpOptions {
             image_base,
             entry_point,
@@ -2894,7 +2950,7 @@ mod edata_relocation_tests {
         assert_eq!(addr_names, edata_va + 0x30);
         assert_eq!(addr_ordinals, edata_va + 0x34);
 
-        // Name RVA array[0] → "Func1" string.
+        // Name RVA array[0]  -> "Func1" string.
         let names_off = (addr_names - edata_va) as usize;
         let name_rva = u32::from_le_bytes(blob[names_off..names_off + 4].try_into().unwrap());
         assert_eq!(name_rva, edata_va + 0x48);
@@ -2906,13 +2962,13 @@ mod edata_relocation_tests {
             .unwrap();
         assert_eq!(&blob[name_off..name_end], b"Func1");
 
-        // Ordinal array[0] → index 1 (points at the forwarder slot).
+        // Ordinal array[0]  -> index 1 (points at the forwarder slot).
         let ord_off = (addr_ordinals - edata_va) as usize;
         let ord_idx = u16::from_le_bytes(blob[ord_off..ord_off + 2].try_into().unwrap());
         assert_eq!(ord_idx, 1);
 
         // Functions array[1] (the ordinal-targeted slot) is a forwarder RVA
-        // inside the .edata directory → forwarder string.
+        // inside the .edata directory  -> forwarder string.
         let funcs_off = (addr_funcs - edata_va) as usize;
         let fwd_slot = funcs_off + ord_idx as usize * 4;
         let fwd_rva = u32::from_le_bytes(blob[fwd_slot..fwd_slot + 4].try_into().unwrap());
@@ -2931,7 +2987,7 @@ mod edata_relocation_tests {
 
     /// Precise regression: a buffer that is physically >= 40 bytes but whose
     /// *declared* `export_size` < 40 must be rejected BEFORE the directory is
-    /// read — even when every directory field is zero.  This prevents
+    /// read ?even when every directory field is zero.  This prevents
     /// zero-padded garbage from being interpreted as a valid directory.
     #[test]
     fn relocate_rejects_small_export_size_even_with_large_buffer_and_zero_fields() {
@@ -2970,7 +3026,7 @@ mod edata_relocation_tests {
         assert_eq!(written, 0x1000, "serialized OEP must be the RVA, not 0");
     }
 
-    /// AddressOfEntryPoint lives at OptionalHeader+16 — NEVER at
+    /// AddressOfEntryPoint lives at OptionalHeader+16 ?NEVER at
     /// e_lfanew+24+SizeOfOptionalHeader (that is the first section header).
     #[test]
     fn address_of_entry_point_offset_is_not_section_table() {
@@ -2996,10 +3052,16 @@ mod edata_relocation_tests {
         let off = super::address_of_entry_point_file_offset(&image).expect("ep off");
         assert_eq!(off, e_lfanew + 24 + 16);
         assert_ne!(off, sect0 + 16, "must not land on section SizeOfRawData");
-        assert_eq!(super::read_address_of_entry_point(&image), Some(expected_ep));
+        assert_eq!(
+            super::read_address_of_entry_point(&image),
+            Some(expected_ep)
+        );
 
         assert!(super::patch_address_of_entry_point(&mut image, 0x1234_5678));
-        assert_eq!(super::read_address_of_entry_point(&image), Some(0x1234_5678));
+        assert_eq!(
+            super::read_address_of_entry_point(&image),
+            Some(0x1234_5678)
+        );
         // Section SizeOfRawData must be untouched.
         let raw_after = u32::from_le_bytes(image[sect0 + 16..sect0 + 20].try_into().unwrap());
         assert_eq!(raw_after, poison_raw);
@@ -3013,7 +3075,7 @@ mod edata_relocation_tests {
         let mut pe = pe_with_text_section(0x1000, 0x200);
         pe.nt_headers.optional_header.data_directory[0] = ImageDataDirectory {
             virtual_address: ORIGINAL_EXPORT_RVA,
-            // Declared size 32 — too small for a directory.
+            // Declared size 32 ?too small for a directory.
             size: 32,
         };
         // Blob physically >= 40 bytes; padding would otherwise hide the

@@ -58,11 +58,8 @@ const FORBIDDEN_API_TOKENS: &[&str] = &[
 #[test]
 fn pure_pe_modules_exclude_live_and_win32_surfaces() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let workspace_root = manifest_dir
-        .parent()
-        .and_then(|p| p.parent())
-        .expect("workspace root")
-        .to_path_buf();
+    let report_path = temp_report_path();
+    let _report_cleanup = ReportCleanup::new(report_path.clone());
 
     let mut module_hits: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut missing = Vec::new();
@@ -105,7 +102,7 @@ fn pure_pe_modules_exclude_live_and_win32_surfaces() {
         "note": "Crate-level windows/mida-core deps remain for adapter modules; pure paths must stay clean. API names inside string data (ApiSet tables) are allowed.",
     });
 
-    write_report(&workspace_root, &report);
+    write_report(&report_path, &report);
 
     assert!(
         missing.is_empty(),
@@ -185,10 +182,32 @@ fn is_inside_string_literal(src: &str, index: usize) -> bool {
     in_string
 }
 
-fn write_report(workspace_root: &Path, report: &serde_json::Value) {
-    let out_path = workspace_root.join("pe_purity_boundary.json");
+fn temp_report_path() -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "mida-pe-purity-boundary-{}.json",
+        std::process::id()
+    ))
+}
+
+struct ReportCleanup {
+    path: PathBuf,
+}
+
+impl ReportCleanup {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl Drop for ReportCleanup {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn write_report(out_path: &Path, report: &serde_json::Value) {
     fs::write(
-        &out_path,
+        out_path,
         serde_json::to_string_pretty(report).expect("serialize purity report") + "\n",
     )
     .unwrap_or_else(|e| panic!("write {}: {e}", out_path.display()));

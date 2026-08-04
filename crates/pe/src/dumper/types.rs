@@ -40,7 +40,7 @@ pub enum ContainerRestoreMode {
     /// Detect containers, zero triples, do not install any restore stub.
     Off,
     /// After `__security_init_cookie` (patch CRT jmp) restore heaps then continue.
-    /// Default: safe for MSVC CRT re-entry (启动器-class).
+    /// Default: safe for MSVC CRT re-entry (启动??class).
     #[default]
     PostCrt,
     /// Pre-EP / TLS-style restore (breaks MSVC `_ioinit` on this sample).
@@ -56,7 +56,7 @@ pub enum ContainerRestoreMode {
 ///
 /// Default is the conservative Oreans/Themida path. GTO/AHK heap-graph,
 /// container restore, and wrapper materialization are **never** auto-selected
-/// by filename, SHA, or section names — they require an explicit CLI opt-in.
+/// by filename, SHA, or section names ??they require an explicit CLI opt-in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DumpProfile {
     /// Conservative Oreans/Themida dump: PE image + OEP + import rebuild only.
@@ -68,7 +68,7 @@ pub enum DumpProfile {
 
 /// Capability flags derived from a [`DumpProfile`].
 ///
-/// Pure data — no process I/O. Callers pass these (or the profile) through
+/// Pure data ??no process I/O. Callers pass these (or the profile) through
 /// [`DumpOptions`]; the dumper must not re-guess the profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DumpProfileCapabilities {
@@ -82,7 +82,7 @@ pub struct DumpProfileCapabilities {
 
 /// Which of the seven high-risk experimental stages are enabled.
 ///
-/// Pure stage plan for gating and synthetic tests — no process dependency.
+/// Pure stage plan for gating and synthetic tests ??no process dependency.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExperimentalStagePlan {
     pub detect_containers: bool,
@@ -172,6 +172,42 @@ impl ExperimentalStagePlan {
 }
 
 // -----------------------------------------------------------------------
+// DumpProcessReport
+// -----------------------------------------------------------------------
+
+/// Evidence returned after a dump candidate has been fully serialized.
+///
+/// The report is deliberately separate from [`DumpOptions`]: callers can
+/// distinguish a requested IAT reconstruction from evidence that was actually
+/// collected, and can gate on the immutable per-slot report without parsing a
+/// log or guessing from the output file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DumpProcessReport {
+    /// Whether the caller requested live IAT reconstruction.
+    pub fix_imports_requested: bool,
+    /// Whether an IAT recovery report was produced.
+    pub iat_evidence_present: bool,
+    /// Whether the produced IAT report passed the strict completeness gate.
+    pub iat_evidence_complete: bool,
+    /// The immutable IAT evidence, when `fix_imports` was requested.
+    pub iat_report: Option<crate::iat_completeness::IatRecoveryReport>,
+    /// Whether the initial runtime TLS data directory was present.
+    pub tls_evidence_present: bool,
+    /// Whether the immutable runtime TLS observation had no blocker.
+    pub tls_evidence_complete: bool,
+    /// Immutable runtime TLS observation captured before dump mutation.
+    pub tls_report: crate::tls_observation::TlsObservationReport,
+    /// Immutable runtime base-relocation observation captured before dump mutation.
+    pub relocation_evidence_present: bool,
+    /// Whether the immutable runtime relocation observation had no blocker.
+    pub relocation_evidence_complete: bool,
+    /// Immutable runtime base-relocation observation.
+    pub relocation_report: crate::relocation_observation::RelocationObservationReport,
+    /// Number of bytes in the final candidate written to disk.
+    pub output_size: usize,
+}
+
+// -----------------------------------------------------------------------
 // DumpOptions
 // -----------------------------------------------------------------------
 
@@ -225,7 +261,7 @@ pub struct DumpOptions {
     pub container_restore: ContainerRestoreMode,
 
     /// Dump behaviour profile. Default [`DumpProfile::OreansClassic`].
-    /// Must be passed explicitly from CLI / callers — never re-guessed here.
+    /// Must be passed explicitly from CLI / callers ??never re-guessed here.
     pub profile: DumpProfile,
 
     /// Authoritative MSVC SecurityCookie RVA from offline CRT resolve.
@@ -327,9 +363,9 @@ pub struct RemoteModule {
     pub(crate) end_off: u64,
     /// Module name (lowercase, e.g. `"kernel32.dll"`).
     pub(crate) name: String,
-    /// Export table: address → function name (or `"#ordinal"`).
+    /// Export table: address ??function name (or `"#ordinal"`).
     pub(crate) exports: std::collections::HashMap<u64, String>,
-    /// Forward entries: `"module.function"` → export address in this module.
+    /// Forward entries: `"module.function"` ??export address in this module.
     #[allow(dead_code)]
     pub(crate) forwards: Vec<(String, u64)>,
 }
@@ -348,11 +384,17 @@ pub(crate) struct ResolutionCandidate {
 pub(crate) struct IatSlot {
     /// All valid resolutions for this slot.
     pub(crate) candidates: Vec<ResolutionCandidate>,
+    /// Immutable pointer value captured from the live read before PASS2.
+    pub(crate) observed_value: Option<u64>,
+    /// Pointer value written into the reconstructed IAT buffer by PASS2.
+    pub(crate) rebuilt_value: Option<u64>,
     /// Index into `candidates` of the chosen resolution, or `None` if
     /// unresolved.
     pub(crate) chosen: Option<usize>,
     /// `true` if the slot value is zero (group separator).
     pub(crate) is_zero: bool,
+    /// Fail-closed state carried into the public recovery report.
+    pub(crate) status: crate::iat_completeness::IatSlotStatus,
 }
 
 // -----------------------------------------------------------------------

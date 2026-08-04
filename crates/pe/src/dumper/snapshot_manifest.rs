@@ -114,10 +114,7 @@ pub(crate) fn render_manifest_json(
     heap_globals: &[HeapGlobalSnapshot],
     capture_policy: &DumpCapturePolicy,
 ) -> Result<String, String> {
-    let container_payload: u64 = containers
-        .iter()
-        .map(|c| c.heap_content.len() as u64)
-        .sum();
+    let container_payload: u64 = containers.iter().map(|c| c.heap_content.len() as u64).sum();
     let heap_payload: u64 = heap_globals
         .iter()
         .filter(|g| !g.is_heap_handle)
@@ -132,22 +129,13 @@ pub(crate) fn render_manifest_json(
 
     let mut buf = String::with_capacity(4096 + heap_globals.len() * 96);
     buf.push_str("{\n");
-    buf.push_str(&format!(
-        "  \"schema_version\": \"{}\",\n",
-        SCHEMA_VERSION
-    ));
+    buf.push_str(&format!("  \"schema_version\": \"{}\",\n", SCHEMA_VERSION));
     buf.push_str(&format!(
         "  \"output_path\": \"{}\",\n",
         json_escape(&output_path.display().to_string())
     ));
-    buf.push_str(&format!(
-        "  \"profile\": \"{}\",\n",
-        profile_label(profile)
-    ));
-    buf.push_str(&format!(
-        "  \"image_base\": \"{}\",\n",
-        hex_u64(image_base)
-    ));
+    buf.push_str(&format!("  \"profile\": \"{}\",\n", profile_label(profile)));
+    buf.push_str(&format!("  \"image_base\": \"{}\",\n", hex_u64(image_base)));
     buf.push_str(&format!(
         "  \"entry_point_rva\": \"{}\",\n",
         hex_u32(entry_point_rva)
@@ -227,7 +215,10 @@ pub(crate) fn render_manifest_json(
         buf.push_str("    {\n");
         buf.push_str(&format!("      \"rva\": \"{}\",\n", hex_u32(g.rva)));
         buf.push_str(&format!("      \"content_size\": {payload},\n"));
-        buf.push_str(&format!("      \"live_ptr\": \"{}\",\n", hex_u64(g.live_ptr)));
+        buf.push_str(&format!(
+            "      \"live_ptr\": \"{}\",\n",
+            hex_u64(g.live_ptr)
+        ));
         buf.push_str(&format!(
             "      \"is_heap_handle\": {},\n",
             if g.is_heap_handle { "true" } else { "false" }
@@ -249,10 +240,7 @@ pub(crate) fn render_manifest_json(
     buf.push_str("  ],\n");
 
     buf.push_str("  \"summary\": {\n");
-    buf.push_str(&format!(
-        "    \"container_count\": {},\n",
-        containers.len()
-    ));
+    buf.push_str(&format!("    \"container_count\": {},\n", containers.len()));
     buf.push_str(&format!(
         "    \"heap_global_count\": {},\n",
         heap_globals.len()
@@ -260,8 +248,12 @@ pub(crate) fn render_manifest_json(
     buf.push_str(&format!("    \"image_roots\": {image_roots},\n"));
     buf.push_str(&format!("    \"graph_children\": {graph_children},\n"));
     buf.push_str(&format!("    \"heap_handles\": {heap_handles},\n"));
-    buf.push_str(&format!("    \"container_payload_bytes\": {container_payload},\n"));
-    buf.push_str(&format!("    \"heap_global_payload_bytes\": {heap_payload},\n"));
+    buf.push_str(&format!(
+        "    \"container_payload_bytes\": {container_payload},\n"
+    ));
+    buf.push_str(&format!(
+        "    \"heap_global_payload_bytes\": {heap_payload},\n"
+    ));
     buf.push_str(&format!(
         "    \"total_capture_payload_bytes\": {}\n",
         container_payload.saturating_add(heap_payload)
@@ -279,7 +271,10 @@ mod tests {
     fn manifest_path_uses_stem() {
         let p = PathBuf::from(r"D:\out\gto_unpacked.exe");
         let m = manifest_path_for_output(&p);
-        assert_eq!(m.file_name().and_then(|s| s.to_str()), Some("gto_unpacked.dump_snapshot.json"));
+        assert_eq!(
+            m.file_name().and_then(|s| s.to_str()),
+            Some("gto_unpacked.dump_snapshot.json")
+        );
     }
 
     #[test]
@@ -318,14 +313,14 @@ mod tests {
                 live_ptr: 0x3971ff0,
                 content: vec![0u8; 0x4000],
                 is_heap_handle: false,
-            is_image_inline: false,
+                is_image_inline: false,
             },
             HeapGlobalSnapshot {
                 rva: 0,
                 live_ptr: 0x10000,
                 content: vec![0u8; 64],
                 is_heap_handle: false,
-            is_image_inline: false,
+                is_image_inline: false,
             },
         ];
         let policy = DumpCapturePolicy::ahk_gto_default();
