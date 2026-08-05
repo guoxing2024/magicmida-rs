@@ -887,6 +887,62 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_live_slots_fail_closed_and_never_count_as_resolved() {
+        // P8-D Lunlun negative-case semantics: a live IAT with an Unresolved
+        // slot must not be accepted. The producer must mark it as a blocker
+        // (fail-closed), and the Unresolved slot must never be turned into a
+        // resolved import. This matches the gate contract and keeps protection-
+        // induced unresolved imports visible instead of masked.
+        let dir = temp_dir("unresolved-lunlun");
+        let (protected, candidate) =
+            write_pair(&dir, &minimal_candidate(false, false, b"ExitProcess\0"));
+        let mut report = report_for(1, false, "ExitProcess");
+        // Turn slot 0 into an Unresolved slot (observed but not rebuilt).
+        report.iat_report.as_mut().unwrap().slots[0].status = IatSlotStatus::Unresolved;
+        report.iat_report.as_mut().unwrap().slots[0].rebuilt_value = None;
+        report.iat_report.as_mut().unwrap().slots[0].module_name = None;
+        report.iat_report.as_mut().unwrap().slots[0].function_name = None;
+
+        let sidecar = build_iat_evidence(&protected, &candidate, &report).unwrap();
+        assert!(!sidecar.prerequisite_passes);
+        let blocker = sidecar.blocker.as_deref().unwrap();
+        assert!(
+            blocker.contains("Unresolved") || blocker.contains("unresolved"),
+            "Unresolved live slot must appear as a blocker, got: {blocker}"
+        );
+        // The final-import table may still parse, but it must NOT gain a fake
+        // import for the unresolved slot beyond what the candidate holds.
+        assert!(
+            sidecar.final_imports.is_empty() || sidecar.final_imports.len() == 1,
+            "unresolved must not fabricate imports"
+        );
+    }
+
+    #[test]
+    fn resolved_live_slot_maps_one_to_one_to_final_import() {
+        // P8-D: a Resolved live slot must map to exactly one final import with
+        // matching module/function (producer-side, gate contract mirror).
+        let dir = temp_dir("resolved-map");
+        let (protected, candidate) =
+            write_pair(&dir, &minimal_candidate(false, false, b"ExitProcess\0"));
+        let report = report_for(1, false, "ExitProcess");
+        let sidecar = build_iat_evidence(&protected, &candidate, &report).unwrap();
+        assert!(sidecar.prerequisite_passes, "{:?}", sidecar.blocker);
+        let evidence = sidecar.iat_report.unwrap();
+        let resolved = evidence
+            .slots
+            .iter()
+            .filter(|s| s.status == "Resolved")
+            .collect::<Vec<_>>();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(sidecar.final_imports.len(), 1);
+        assert_eq!(
+            sidecar.final_imports[0].function_name.as_deref(),
+            Some("ExitProcess")
+        );
+    }
+
+    #[test]
     fn short_read_and_alignment_or_coverage_fail_closed() {
         let dir = temp_dir("coverage");
         let (protected, candidate) =

@@ -658,4 +658,63 @@ mod tests {
             "one slot per thunk, no phantom entries"
         );
     }
+
+    #[test]
+    fn unresolved_zero_slots_do_not_produce_final_imports() {
+        // P8-D: an unresolved IAT slot is emitted as a zero (loader terminator),
+        // so the independent final-PE reader must NOT turn it into a final
+        // import. Only resolved thunks reconstruct into final imports; the
+        // resolved<->final mapping stays one-to-one (gate contract).
+        let pe_bytes = crate::header::make_minimal_pe64();
+        let mut pe = PeHeader::from_bytes(&pe_bytes).expect("minimal pe");
+        pe.nt_headers.optional_header.size_of_image = 0x6000;
+
+        let mut builder = ImportTableBuilder::new(true);
+        {
+            let m = builder.add_module("kernel32.dll");
+            m.thunks.push(ImportThunk {
+                iat_address: 0x1100,
+                function_name: Some("ResolvedApi".to_string()),
+                ordinal: None,
+                is_64bit: true,
+            });
+            // Second slot models an UNRESOLVED import: its IAT entry is written
+            // as 0 (loader terminator) in the emitted image.
+            m.thunks.push(ImportThunk {
+                iat_address: 0x1108,
+                function_name: None,
+                ordinal: None,
+                is_64bit: true,
+            });
+        }
+
+        let mut dump_buf = vec![0u8; 0x2000];
+        let _ = create_import_section(&mut pe, &builder, 0x1100, &mut dump_buf, true);
+
+        let mut image = assemble_image(&pe, &pe_bytes[..0x40]);
+        let (_, thunks) = builder.build_import_section_no_iat(
+            pe.nt_headers.optional_header.data_directory[IMAGE_DIRECTORY_ENTRY_IMPORT]
+                .virtual_address,
+            0x1100,
+        );
+        // Simulate emission of an unresolved slot as zero: overwrite the second
+        // IAT entry with 0 so the parser sees it as a terminator.
+        let mut resolved_thunks = thunks;
+        if resolved_thunks.len() >= 2 {
+            resolved_thunks[1] = 0;
+        }
+        write_iat_to_output(&mut image, &pe, &resolved_thunks, 0x1100, true);
+
+        let final_imports = crate::original_imports::parse_final_import_identities(&image)
+            .expect("parse final imports");
+        assert_eq!(
+            final_imports.len(),
+            1,
+            "only the resolved thunk reconstructs into a final import"
+        );
+        assert_eq!(
+            final_imports[0].function_name.as_deref(),
+            Some("ResolvedApi")
+        );
+    }
 }
