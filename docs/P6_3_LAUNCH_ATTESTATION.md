@@ -348,17 +348,21 @@ case_id.
 
 ## 3. Distinct identity-swap attacks
 
-The three identity attacks are now genuinely distinct documents (each breaks
-the case_id <-> protected_input binding and is rejected by the acceptance
-subprocess itself with exit 2 and `does not match the locked manifest`):
+Two of the three identity attacks break the case_id <-> protected_input
+binding and are rejected by the acceptance subprocess itself (exit 2,
+`does not match the locked manifest`), with every per-case and case-set digest
+recomputed honestly:
 
 - case_id swap (configs + protected_input stay in their slots, labels swapped);
 - protected_input swap (case_id + configs stay, identities exchanged);
-- case_id + protected_input swap (both transposed).
 
-All per-case and case-set digests are recomputed honestly in every attack, so
-the rejection comes from the keyed-identity check — not from a synthetic-file
-identity mismatch.
+The third — the TRUE dual swap — exchanges BOTH the case_id and the
+protected_input together while each runner CONFIG stays in its original slot.
+This keeps every case bound to its OWN protected identity, so the keyed
+binding stays VALID and is NOT rejected on identity grounds. The rejection is
+proven at the launch-attestation level (`bind_actual_config_to_envelope`
+compares the ACTUAL config digest only against the selected case's digest).
+See the P6.3.3.2.1 note below.
 
 ## 4. Case-specific policy binding
 
@@ -371,6 +375,47 @@ never guessed from the case_id string. Unit tests prove:
   (`bind_actual_config_to_envelope` compares the ACTUAL config's recomputed
   digest only against the selected case's digest) even when every envelope
   digest is re-sealed.
+
+# P6.3.3.2.1 True Dual-Swap Test Closure
+
+Status: implemented on `oreans/two-sample-mainline`. Pure offline engineering;
+no real sample process was created; no `D:\MidaVault` sample path is read.
+
+## True dual swap corrected
+
+Previously `case_id_and_protected_input_swap_rejected_by_verifier` normalized
+(to the case_id-keyed map) to the same case entries as the protected_input-only
+swap, differing only in array order — it did not exercise a genuine dual swap.
+
+The corrected TRUE dual swap exchanges the case_id AND the protected_input
+together while each runner CONFIG stays in its original slot, producing:
+
+```
+lunlun_software + LUNLUN identity + Origin policy(true)
+origin_macro   + ORIGIN  identity + Lunlun policy(false)
+```
+
+This keeps each case bound to its OWN protected identity, so:
+
+- the acceptance keyed-identity check stays VALID (no `does not match the
+  locked manifest`); the dual-swap test asserts the verifier does NOT reject
+  on identity grounds;
+- the attack is rejected by the launch-attestation case-policy/config-digest
+  check: `bind_actual_config_to_envelope` recomputes the ACTUAL config digest
+  and compares it only against the SELECTED case's digest. The rejection
+  reason cites the digest (never a synthetic-input identity mismatch).
+
+## Canonical pairwise-distinct proof
+
+The baseline, case_id-only, protected_input-only, and true-dual-swap envelopes
+are canonicalized (case_configs sorted by case_id) and asserted pairwise
+distinct — not merely `assert_ne!` against the baseline.
+
+## Boundaries after P6.3.3.2.1
+
+- No real sample process was created; P7 is NOT authorized.
+- `validation_summary.json` remains `open`; no claim of live, perfect,
+  universal, or 10/10 behavior is made.
 
 ## Boundaries after P6.3.3.2
 

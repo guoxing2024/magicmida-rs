@@ -1066,42 +1066,117 @@ fn protected_input_swap_rejected_by_verifier() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// P6.3.3.2-B: swapping BOTH the case_id labels AND the protected_input
-/// identities (the two entries are fully transposed; every per-case + case-set
-/// digest re-sealed honestly) must be rejected. `origin_macro` ends up bound
-/// to the LUNLUN identity and `lunlun_software` to the ORIGIN identity, so the
-/// keyed binding is broken. The final JSON differs from the case_id-only and
-/// protected_input-only swaps.
+/// P6.3.3.2.1: the TRUE dual swap — BOTH the case_id and the protected_input
+/// are exchanged together, while each runner CONFIG stays in its original
+/// slot. The result keeps every case bound to its OWN protected identity
+/// (the keyed case_id <-> protected_input binding stays VALID), so the
+/// acceptance verifier must NOT report locked-manifest identity drift. The
+/// rejection of this attack comes from the launch-attestation
+/// case-policy/config-digest check (`bind_actual_config_to_envelope`), proven
+/// in the CLI crate; here we prove the identity side stays legal.
 #[test]
 fn case_id_and_protected_input_swap_rejected_by_verifier() {
     let dir = temp_dir("dual_swap");
     let repo_root = scratch_repo(&dir);
-    // Transpose BOTH the case_id labels and the protected_input identities:
-    // origin_macro is now bound to the LUNLUN identity (with the lunlun
-    // config), lunlun_software to the ORIGIN identity (with the origin
-    // config).
+    // True dual swap: swap case_id labels AND protected_input identities
+    // together; the configs stay in their original slots.
+    //   lunlun_software + LUNLUN identity + Origin policy(true)
+    //   origin_macro   + ORIGIN  identity + Lunlun policy(false)
     let env = v4_envelope_json(vec![
-        case_entry_with_policy("lunlun_software", ORIGIN_SHA, ORIGIN_SIZE, false),
-        case_entry_with_policy("origin_macro", LUNLUN_SHA, LUNLUN_SIZE, true),
+        case_entry_with_policy("lunlun_software", LUNLUN_SHA, LUNLUN_SIZE, true),
+        case_entry_with_policy("origin_macro", ORIGIN_SHA, ORIGIN_SIZE, false),
     ]);
     assert_ne!(
         env,
         valid_v4_envelope_json(),
-        "dual swap must produce distinct envelope JSON"
+        "true dual swap must produce distinct envelope JSON"
     );
     let out = run_acceptance_on_envelope(&dir, &repo_root, &env);
+    // The identity binding is VALID (each case carries its own locked
+    // identity), so the verifier is NotReady only from the synthetic files —
+    // it must NOT report keyed-identity drift. The config mismatch is caught
+    // by the launch-attestation digest check, not by this acceptance path.
     assert_eq!(
         out.status.code(),
         Some(2),
-        "dual swap must be NotReady: {}",
+        "true dual swap + synthetic files -> NotReady (identity): {}",
         String::from_utf8_lossy(&out.stderr)
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("does not match the locked manifest"),
-        "keyed-identity drift must be reported by the verifier: {stderr}"
+        !stderr.contains("does not match the locked manifest"),
+        "the true dual swap keeps a VALID keyed identity; it must not be \
+         rejected on identity grounds: {stderr}"
     );
     let _ = fs::remove_dir_all(&dir);
+}
+
+/// P6.3.3.2.1: the baseline, case_id-only, protected_input-only, and
+/// true-dual-swap envelopes are pairwise-distinct after canonicalization
+/// (sorting the case_configs by case_id). A weaker `assert_ne!(env,
+/// baseline)` would not prove the three attack documents are genuinely
+/// different from one another.
+#[test]
+fn identity_swap_envelopes_are_pairwise_distinct_after_canonicalization() {
+    // The four envelopes under test.
+    let baseline = valid_v4_envelope_json();
+    let case_id_only = v4_envelope_json(vec![
+        case_entry_with_policy("lunlun_software", ORIGIN_SHA, ORIGIN_SIZE, true),
+        case_entry_with_policy("origin_macro", LUNLUN_SHA, LUNLUN_SIZE, false),
+    ]);
+    let protected_input_only = v4_envelope_json(vec![
+        case_entry_with_policy("origin_macro", LUNLUN_SHA, LUNLUN_SIZE, true),
+        case_entry_with_policy("lunlun_software", ORIGIN_SHA, ORIGIN_SIZE, false),
+    ]);
+    let true_dual_swap = v4_envelope_json(vec![
+        case_entry_with_policy("lunlun_software", LUNLUN_SHA, LUNLUN_SIZE, true),
+        case_entry_with_policy("origin_macro", ORIGIN_SHA, ORIGIN_SIZE, false),
+    ]);
+
+    let docs = vec![
+        ("baseline", baseline),
+        ("case_id-only", case_id_only),
+        ("protected_input-only", protected_input_only),
+        ("true-dual-swap", true_dual_swap),
+    ];
+    // Every pair must be distinct under canonical (sorted-by-case_id) form.
+    for i in 0..docs.len() {
+        for j in (i + 1)..docs.len() {
+            assert_ne!(
+                canonical_case_entries(&docs[i].1),
+                canonical_case_entries(&docs[j].1),
+                "{} and {} must be pairwise distinct after canonicalization",
+                docs[i].0,
+                docs[j].0
+            );
+        }
+    }
+}
+
+/// Canonicalize an envelope's case set by sorting its `case_configs` by
+/// `case_id`, keeping only the identity-and-config binding (the runner-config
+/// digest is included so config policy swaps are visible). Used to compare
+/// envelopes independent of array order.
+fn canonical_case_entries(envelope: &serde_json::Value) -> Vec<String> {
+    let mut entries: Vec<String> = envelope["case_configs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| {
+            format!(
+                "{}|{}|{}|{}",
+                c["case_id"].as_str().unwrap(),
+                c["protected_input"]["sha256"]
+                    .as_str()
+                    .unwrap()
+                    .to_lowercase(),
+                c["protected_input"]["size_bytes"].as_u64().unwrap(),
+                c["runner_config_digest"].as_str().unwrap().to_lowercase(),
+            )
+        })
+        .collect();
+    entries.sort();
+    entries
 }
 
 /// P6.3.3.1-B: a v3 single-config envelope must be rejected (no silent

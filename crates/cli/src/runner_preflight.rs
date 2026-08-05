@@ -1064,10 +1064,13 @@ fn verify_verifier_identity(
 /// - the resolved canonical path equals the pinned path;
 /// - the resolved SHA-256 equals the pinned SHA-256.
 ///
-/// Extracted as a pure seam so the verifier-replacement rejection can be
-/// proven offline in a hermetic unit test WITHOUT selecting a real locked
+/// This is a PUBLIC offline seam shared by the launch attestation
+/// ([`verify_verifier_identity`]) and the hermetic tests: the
+/// verifier-replacement rejection is proven WITHOUT selecting a real locked
 /// case or creating a sample process (P6.3.3.2: the launch attestation only
-/// reaches this check after a case is matched by input identity).
+/// reaches this check after a case is matched by input identity). It is
+/// `pub` specifically so the black-box `launch_attestation` integration tests
+/// can drive the already-selected-case context offline.
 pub fn verify_verifier_identity_bindings(
     envelope: &RunnerConfigEnvelope,
     resolved_path: &Path,
@@ -1728,35 +1731,34 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// P6.3.3.2: a config swapped between the two cases is rejected at the
-    /// launch-attestation level (the digest is recomputed from the ACTUAL
-    /// config and compared only to the selected case's digest) — even when
-    /// every envelope digest is re-sealed honestly. This is the negative
-    /// control for the case-specific policy binding: Origin's frozen policy
-    /// (pure=true) bound to the Lunlun case fails.
+    /// P6.3.3.2.1: the TRUE dual swap — both the case_id and the
+    /// protected_input are exchanged together while each runner CONFIG stays
+    /// in its original slot, so every case keeps its OWN protected identity
+    /// (the keyed binding stays valid) but carries the OTHER case's policy.
+    /// Rejected at the launch-attestation level: `bind_actual_config_to_envelope`
+    /// recomputes the ACTUAL config digest and compares it only against the
+    /// SELECTED case's digest — even when every envelope digest is re-sealed
+    /// honestly. The rejection must cite the config/policy digest, never a
+    /// synthetic-input identity mismatch.
+    ///
+    /// Resulting envelope (identity valid, config swapped):
+    ///   lunlun_software + LUNLUN identity + Origin policy(true)
+    ///   origin_macro   + ORIGIN  identity + Lunlun policy(false)
     #[test]
-    fn case_policy_swap_rejected_even_with_digests_resealed() {
-        let dir = temp_dir("policy_swap");
-        let env = v4_envelope();
+    fn true_dual_swap_rejected_by_launch_attestation_config_digest() {
+        let dir = temp_dir("dual_swap");
+        let mut env = v4_envelope();
+        // Origin slot keeps its ORIGIN identity but now carries the LUNLUN
+        // policy (pure=false); the Lunlun slot keeps LUNLUN identity but
+        // carries the ORIGIN policy (pure=true).
+        env.case_configs[0] = case_config("origin_macro", ORIGIN_ID, false);
+        env.case_configs[1] = case_config("lunlun_software", LUNLUN_ID, true);
+        env.case_set_digest = case_set_digest(&env.case_configs);
         env.write(&dir).unwrap();
 
-        // A full re-seal of the envelope where origin_macro's config is
-        // swapped to Lunlun's pure=false policy (and the digest recomputed).
-        let mut swapped = v4_envelope();
-        let origin_idx = swapped
-            .case_configs
-            .iter()
-            .position(|c| c.case_id == "origin_macro")
-            .unwrap();
-        swapped.case_configs[origin_idx] = case_config("origin_macro", ORIGIN_ID, false);
-        swapped.case_set_digest = case_set_digest(&swapped.case_configs);
-        swapped.write(&dir).unwrap();
-
-        // The Lunlun actual config (pure=false) bound to the LUNLUN identity
-        // must still FAIL: origin_macro's config is now pure=false, but the
-        // ORIGIN identity still selects the origin case whose config digest
-        // (pure=false) is NOT what the Origin frozen policy resolves to.
-        // Here we prove the pure=false config cannot bind to the ORIGIN case:
+        // The launch binds the ORIGIN identity to the REAL Origin frozen
+        // policy (pure=true). The selected origin_macro case now holds the
+        // lunlun (pure=false) config digest, so the actual digest mismatches.
         let origin_identity = FileIdentityGate {
             sha256: ORIGIN_ID.to_string(),
             size_bytes: 5_232_656,
@@ -1767,7 +1769,23 @@ mod tests {
             .expect_err("Origin pure=true actual must not bind a pure=false envelope case");
         assert!(
             err.to_string().contains("digest"),
-            "the rejection must cite the digest mismatch: {err}"
+            "the rejection must cite the config/digest, not an input mismatch: {err}"
+        );
+
+        // Symmetric negative control: the Lunlun identity bound to the real
+        // Lunlun frozen policy (pure=false) must also fail against the origin
+        // (pure=true) config now carried by the lunlun case.
+        let lunlun_identity = FileIdentityGate {
+            sha256: LUNLUN_ID.to_string(),
+            size_bytes: 4_976_144,
+        };
+        let mut lunlun_actual = crate::run_spec::frozen_runner_config();
+        lunlun_actual.pure_rebuild = false;
+        let err2 = bind_actual_config_to_envelope(&dir, &lunlun_actual, &lunlun_identity)
+            .expect_err("Lunlun pure=false actual must not bind a pure=true envelope case");
+        assert!(
+            err2.to_string().contains("digest"),
+            "the rejection must cite the config/digest: {err2}"
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }

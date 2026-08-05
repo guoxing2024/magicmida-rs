@@ -680,7 +680,7 @@ fn output_hard_link_alias_rejected() {
 /// AFTER a case is selected by the (real, locked) input identity. Because the
 /// default tests are hermetic (no real sample processes, no `D:\MidaVault`),
 /// the already-selected-case context is constructed offline through the PURE
-/// seam `verify_verifier_identity_bindings` (a crate-internal function the
+/// seam `verify_verifier_identity_bindings` (the public offline seam the
 /// launch attestation shares). That seam builds an attestation context with a
 /// case already bound and swaps the verifier; the seam must reject with a
 /// verifier-identity reason — never a generic "launch blocked".
