@@ -556,7 +556,10 @@ pub fn rebuild_pe_image_with_meta(plan: &RebuildPlan) -> Result<RebuildResult, P
         });
     }
 
-    // Build PeHeader model for serialize_headers.
+    // Build PeHeader model for serialize_headers.  Section names must be
+    // unique and <=8 bytes before serialization (P8.1-B); dedup is
+    // deterministic and never touches RVA/raw/characteristics.
+    assign_unique_section_names(&mut laid_out);
     let mut pe = synthesize_pe_header(plan, e_lfanew, fa, sa, size_of_headers, size_of_image)?;
     pe.sections = laid_out.iter().map(|s| pe_section_from_laid(s)).collect();
     pe.nt_headers.file_header.number_of_sections = pe.sections.len() as u16;
@@ -725,6 +728,64 @@ fn section_name_bytes(name: &str) -> [u8; 8] {
     let n = bytes.len().min(8);
     out[..n].copy_from_slice(&bytes[..n]);
     out
+}
+
+/// Deterministically assign unique, <=8-byte section names across every
+/// section in the emitted PE (content sections plus auto-generated
+/// .edata/.idata/.pdata/.tls/.reloc).
+///
+/// The loader reads a section name as a fixed 8-byte field, so two distinct
+/// String names that truncate to the same `[u8; 8]` are a collision.  This
+/// pass guarantees every `[u8; 8]` is unique without touching section RVA,
+/// raw range, or characteristics:
+///
+///   - The first section with a given 8-byte name keeps it.
+///   - A later duplicate is renamed with a stable numeric suffix derived from
+///     its own base name (`.rdata` -> `.rdat001`, `.rdat002`, ...), matching
+///     the P8.1-B scheme.  The suffix never depends on time or randomness.
+///   - If a generated suffix would collide with an existing name (including a
+///     section literally named `.rdat001`), the index advances until a free,
+///     <=8-byte name is found.
+///
+/// The pass is order-deterministic: identical input plans produce identical
+/// names, and any genuinely ambiguous suffix race still resolves to a
+/// collision-free, fail-closed outcome.
+fn assign_unique_section_names(sections: &mut [LaidSection]) {
+    use std::collections::HashSet;
+    let mut used: HashSet<[u8; 8]> = HashSet::new();
+    for sec in sections.iter_mut() {
+        let base = sec.name.clone();
+        let candidate = section_name_bytes(&base);
+        if used.insert(candidate) {
+            continue;
+        }
+        // Collision: generate stable numeric suffixes until one is free.
+        let mut idx = 1usize;
+        loop {
+            let suffixed = suffixed_section_name(&base, idx);
+            let bytes = section_name_bytes(&suffixed);
+            if used.insert(bytes) {
+                sec.name = suffixed;
+                break;
+            }
+            idx += 1;
+            // Deterministic safety bound; 8-char names offer a finite space.
+            debug_assert!(idx < 10_000, "section name suffix search runaway");
+        }
+    }
+}
+
+/// Build a deterministic suffix name `prefix + index` for a duplicate section,
+/// where `prefix` is the leading bytes of `base` chosen so the whole name fits
+/// in 8 bytes.  `.rdata` (6 chars) with idx 1 -> prefix `.rdat` + `001` =
+/// `.rdat001`.  For indexes >= 1000 the suffix widens and the prefix shrinks so
+/// the result never exceeds 8 bytes.
+fn suffixed_section_name(base: &str, idx: usize) -> String {
+    let suffix = format!("{idx:03}");
+    let suffix_bytes = suffix.len();
+    let prefix_bytes = 8usize.saturating_sub(suffix_bytes);
+    let prefix: String = base.chars().take(prefix_bytes).collect();
+    format!("{prefix}{suffix}")
 }
 
 fn pe_section_from_laid(s: &LaidSection) -> PeSection {
@@ -1143,5 +1204,301 @@ mod tests {
         let meta = rebuild_pe_image_with_meta(&plan).expect("rebuild");
         assert_ne!(meta.import_directory.virtual_address, 0xDEAD_0000);
         assert_ne!(meta.import_directory.virtual_address, 0);
+    }
+
+    // --- P8.1-B: deterministic unique section emission ---
+
+    /// Section name helper used by the duplicate-name tests.
+    fn assert_names_unique_and_short(pe: &PeHeader) {
+        let names: Vec<&str> = pe.sections.iter().map(|s| s.name.as_str()).collect();
+        let mut set = std::collections::HashSet::new();
+        for name in &names {
+            assert!(
+                name.len() <= 8,
+                "section name {name:?} exceeds 8 bytes"
+            );
+            assert!(
+                set.insert(name.to_string()),
+                "duplicate section name {name:?} emitted"
+            );
+        }
+        // All serialized header names must match the String names (no hidden
+        // truncation collision after dedup).
+        for s in &pe.sections {
+            let hdr = section_name_bytes(&s.name);
+            assert_eq!(
+                decode_name(hdr),
+                s.name,
+                "header name field must match section String name"
+            );
+        }
+    }
+
+    fn decode_name(bytes: [u8; 8]) -> String {
+        let len = bytes.iter().position(|b| *b == 0).unwrap_or(8);
+        String::from_utf8_lossy(&bytes[..len]).into_owned()
+    }
+
+    #[test]
+    fn duplicate_section_names_get_deterministic_unique_suffixes() {
+        // .rdata repeated -> first keeps .rdata, later get .rdat001/.rdat002.
+        let mut plan = RebuildPlan::pe32_plus();
+        plan.sections
+            .push(PlannedSection::new(".text", 0x6000_0020, vec![0xC3]));
+        for _ in 0..3 {
+            plan.sections.push(PlannedSection::new(
+                ".rdata",
+                0x4000_0040,
+                vec![0x00, 0x01, 0x02],
+            ));
+        }
+        plan.entry_point_rva = 0x1000;
+        let image = rebuild_pe_image(&plan).expect("rebuild");
+        let pe = PeHeader::from_bytes(&image).expect("reparse");
+        let names: Vec<&str> = pe.sections.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![".text", ".rdata", ".rdat001", ".rdat002"],
+            "first keeps original, later duplicates get stable suffixes"
+        );
+        assert_names_unique_and_short(&pe);
+    }
+
+    #[test]
+    fn emitted_sections_are_unique_dirs_preserved_size_of_image_aligned() {
+        // Independent re-read of the emitted candidate: unique names, content
+        // directories still point at their data, entry section unchanged,
+        // SizeOfImage == aligned max section extent, absent directories use the
+        // canonical zero encoding.
+        let mut imports = ImportTableBuilder::new(true);
+        {
+            let m: &mut ImportModule = imports.add_module("kernel32.dll");
+            m.thunks.push(ImportThunk {
+                iat_address: 0,
+                function_name: Some("ExitProcess".into()),
+                ordinal: None,
+                is_64bit: true,
+            });
+        }
+        let mut plan = RebuildPlan::pe32_plus();
+        plan.sections.push(PlannedSection::new(
+            ".text",
+            0x6000_0020,
+            vec![0x48, 0xC7, 0xC0, 0, 0, 0, 0, 0xC3],
+        ));
+        plan.entry_point_rva = 0x1000;
+        plan.imports = Some(imports);
+        // A duplicate content section name to force the dedup pass.
+        plan.sections.push(PlannedSection::new(
+            ".text",
+            0x4000_0040,
+            vec![0xAA, 0xBB],
+        ));
+        plan.relocations = vec![(0x1000, 10)];
+        plan.prefer_aslr = true;
+
+        let meta = rebuild_pe_image_with_meta(&plan).expect("rebuild");
+        let pe = PeHeader::from_bytes(&meta.image).expect("reparse");
+        assert_names_unique_and_short(&pe);
+
+        // Section names are unique and the duplicate .text got a suffix.
+        let text_names = pe
+            .sections
+            .iter()
+            .filter(|s| s.name.starts_with(".text"))
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(text_names, vec![".text", ".text001"]);
+
+        // Directories still point at their typed sections (.idata/.reloc).
+        let import_dir = pe.nt_headers.optional_header.data_directory[DIR_IMPORT];
+        assert_ne!(import_dir.virtual_address, 0);
+        assert!(
+            pe.sections
+                .iter()
+                .any(|s| s.name.starts_with(".idata")
+                    && s.virtual_address <= import_dir.virtual_address
+                    && import_dir.virtual_address + import_dir.size
+                        <= s.virtual_address + s.virtual_size),
+            "import directory must still point at its section"
+        );
+
+        // Entry section unchanged.
+        let entry = pe.nt_headers.optional_header.address_of_entry_point;
+        assert_eq!(entry, 0x1000);
+        assert!(
+            pe.sections
+                .iter()
+                .any(|s| s.name == ".text" && s.virtual_address <= entry && entry < s.virtual_address + s.virtual_size),
+            "entry RVA must stay in the original .text section"
+        );
+
+        // SizeOfImage == aligned max section extent.
+        let sa = pe.nt_headers.optional_header.section_alignment;
+        let max_end = pe
+            .sections
+            .iter()
+            .map(|s| s.virtual_address + s.virtual_size)
+            .max()
+            .expect("sections present");
+        let aligned = (max_end + sa - 1) / sa * sa;
+        assert_eq!(
+            pe.nt_headers.optional_header.size_of_image, aligned,
+            "SizeOfImage must equal the aligned max section extent"
+        );
+
+        // Absent directories use the canonical zero encoding.
+        for i in [DIR_RESOURCE, DIR_SECURITY, DIR_DEBUG, DIR_LOAD_CONFIG, DIR_EXCEPTION] {
+            let dd = pe.nt_headers.optional_header.data_directory[i];
+            assert_eq!(
+                dd.virtual_address, 0,
+                "absent directory {i} virtual_address must be zero"
+            );
+            assert_eq!(
+                dd.size, 0,
+                "absent directory {i} size must be zero"
+            );
+        }
+    }
+
+    #[test]
+    fn eight_byte_truncation_collision_is_deduplicated() {
+        // ABCDEFGH and ABCDEFGHI truncate to the same [u8;8]; the second must
+        // get a deterministic suffix rather than emit a duplicate header name.
+        let mut plan = RebuildPlan::pe32_plus();
+        plan.sections
+            .push(PlannedSection::new(".text", 0x6000_0020, vec![0xC3]));
+        plan.sections.push(PlannedSection::new(
+            "ABCDEFGH",
+            0x4000_0040,
+            vec![1],
+        ));
+        plan.sections.push(PlannedSection::new(
+            "ABCDEFGHI",
+            0x4000_0040,
+            vec![2],
+        ));
+        plan.entry_point_rva = 0x1000;
+        let image = rebuild_pe_image(&plan).expect("rebuild");
+        let pe = PeHeader::from_bytes(&image).expect("reparse");
+        assert_names_unique_and_short(&pe);
+        let names: Vec<&str> = pe.sections.iter().map(|s| s.name.as_str()).collect();
+        // First keeps ABCDEFGH (truncated to 8); the 9-char one must differ.
+        assert_eq!(names[1], "ABCDEFGH");
+        assert_ne!(names[2], "ABCDEFGH", "9-char name must not collide");
+        assert!(!names.contains(&"ABCDEFGHI".to_string().as_str()), "over-8-char name must be shortened");
+    }
+
+    #[test]
+    fn same_prefix_and_existing_suffix_collision_resolve() {
+        // A real .rdat001 plus duplicate .rdata must not collide.
+        let mut plan = RebuildPlan::pe32_plus();
+        plan.sections
+            .push(PlannedSection::new(".text", 0x6000_0020, vec![0xC3]));
+        plan.sections.push(PlannedSection::new(
+            ".rdata",
+            0x4000_0040,
+            vec![1],
+        ));
+        plan.sections.push(PlannedSection::new(
+            ".rdata",
+            0x4000_0040,
+            vec![2],
+        ));
+        // A real section literally named .rdat001 (the suffix the dup would pick).
+        plan.sections.push(PlannedSection::new(
+            ".rdat001",
+            0x4000_0040,
+            vec![3],
+        ));
+        plan.entry_point_rva = 0x1000;
+        let image = rebuild_pe_image(&plan).expect("rebuild");
+        let pe = PeHeader::from_bytes(&image).expect("reparse");
+        assert_names_unique_and_short(&pe);
+        let names: std::collections::HashSet<&str> =
+            pe.sections.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(".rdata"), "first .rdata keeps its name");
+        assert!(names.contains(".rdat001"), "real .rdat001 keeps its name");
+        assert_eq!(names.len(), pe.sections.len(), "all names unique");
+    }
+
+    #[test]
+    fn more_than_nine_duplicates_all_get_unique_names() {
+        // 12 identical .rdata sections -> .rdat001.. .rdat012, all unique.
+        let mut plan = RebuildPlan::pe32_plus();
+        plan.sections
+            .push(PlannedSection::new(".text", 0x6000_0020, vec![0xC3]));
+        for _ in 0..12 {
+            plan.sections.push(PlannedSection::new(
+                ".rdata",
+                0x4000_0040,
+                vec![1],
+            ));
+        }
+        plan.entry_point_rva = 0x1000;
+        let image = rebuild_pe_image(&plan).expect("rebuild");
+        let pe = PeHeader::from_bytes(&image).expect("reparse");
+        assert_names_unique_and_short(&pe);
+        let names: Vec<&str> = pe.sections.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names[0], ".text");
+        assert_eq!(names[1], ".rdata");
+        for (i, name) in names.iter().skip(2).enumerate() {
+            assert_eq!(*name, format!(".rdat{:03}", i + 1).as_str());
+        }
+    }
+
+    #[test]
+    fn empty_and_whitespace_names_do_not_collide() {
+        // Empty section names must serialize as 8 zero bytes without colliding.
+        let mut plan = RebuildPlan::pe32_plus();
+        plan.sections
+            .push(PlannedSection::new(".text", 0x6000_0020, vec![0xC3]));
+        plan.sections.push(PlannedSection::new(
+            "",
+            0x4000_0040,
+            vec![1],
+        ));
+        plan.sections.push(PlannedSection::new(
+            "",
+            0x4000_0040,
+            vec![2],
+        ));
+        plan.entry_point_rva = 0x1000;
+        let image = rebuild_pe_image(&plan).expect("rebuild");
+        let pe = PeHeader::from_bytes(&image).expect("reparse");
+        assert_names_unique_and_short(&pe);
+        let names: Vec<&str> = pe.sections.iter().map(|s| s.name.as_str()).collect();
+        // First empty keeps empty; the duplicate gets a suffix.
+        assert_eq!(names[1], "");
+        assert!(!names[2].is_empty());
+        assert_ne!(names[2], "", "duplicate empty must be renamed");
+    }
+
+    #[test]
+    fn naming_is_deterministic_across_runs() {
+        // Identical plans produce identical emitted section names.
+        fn build() -> Vec<String> {
+            let mut plan = RebuildPlan::pe32_plus();
+            plan.sections
+                .push(PlannedSection::new(".text", 0x6000_0020, vec![0xC3]));
+            for _ in 0..4 {
+                plan.sections.push(PlannedSection::new(
+                    ".data",
+                    0xC000_0040,
+                    vec![1],
+                ));
+            }
+            plan.entry_point_rva = 0x1000;
+            let image = rebuild_pe_image(&plan).expect("rebuild");
+            let pe = PeHeader::from_bytes(&image).expect("reparse");
+            pe.sections.iter().map(|s| s.name.clone()).collect()
+        }
+        let a = build();
+        let b = build();
+        assert_eq!(a, b, "section naming must be deterministic");
+        let mut set = std::collections::HashSet::new();
+        for name in &a {
+            assert!(set.insert(name.clone()), "duplicate {name}");
+        }
     }
 }
