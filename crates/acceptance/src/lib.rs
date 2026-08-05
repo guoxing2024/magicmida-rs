@@ -95,6 +95,6 @@ pub use preflight::{
     canonical_runner_config, check_case_identity, run_offline_preflight, runner_config_digest,
     write_preflight_report, CaseIdentity, CaseManifestV2, CasePreflight, FileIdentity,
     FsOutputProbe, IdentityVerdict, IsolationConfig, OutputProbe, PreflightReport,
-    PreflightRequest, PreflightStatus, RunnerConfig, WorktreeProbe, WorktreeState,
+    PreflightRequest, PreflightStatus, RunnerConfig, WorktreeProbe, WorktreeState, FIXED_CASE_IDS,
     PREFLIGHT_REPORT_SCHEMA_VERSION,
 };

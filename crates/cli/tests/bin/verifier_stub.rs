@@ -164,7 +164,7 @@ fn cmd_preflight(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let runner_config_digest = envelope["runner_config_digest"]
+    let runner_config_digest = envelope["case_set_digest"]
         .as_str()
         .unwrap_or_default()
         .to_lowercase();
@@ -176,24 +176,52 @@ fn cmd_preflight(args: &[String]) -> ExitCode {
         .map(|(s, _)| s)
         .unwrap_or_default();
 
+    // P6.3.3: the v4 envelope is case-bound. For each case, report the
+    // envelope's per-case protected-input identity (from case_configs) and
+    // per-case runner-config digest so the report cross-validates against
+    // the envelope. The stub is deliberately dumb and does not recompute the
+    // file — it mirrors the envelope so pass-path tests are hermetic.
+    let case_configs = envelope["case_configs"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let case_by_id = |case_id: &str| -> Option<&serde_json::Value> {
+        case_configs
+            .iter()
+            .find(|c| c["case_id"].as_str() == Some(case_id))
+    };
     let case_entries: Vec<serde_json::Value> = cases
         .iter()
         .map(|(manifest, input, output)| {
-            let identity = file_identity(input);
+            let case_id = manifest
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let protected = case_by_id(&case_id)
+                .and_then(|c| c.get("protected_input").cloned())
+                .unwrap_or_else(|| {
+                    file_identity(input)
+                        .map(|(s, z)| serde_json::json!({"sha256": s, "size_bytes": z}))
+                        .unwrap_or(serde_json::Value::Null)
+                });
             serde_json::json!({
-                "case_id": manifest.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
+                "case_id": case_id,
                 "identity_ok": true,
                 "reasons": [],
-                "protected_input": identity.map(|(s, z)| serde_json::json!({"sha256": s, "size_bytes": z})).unwrap_or(serde_json::Value::Null),
+                "protected_input": protected,
                 "protected_input_path": canonicalize_loose(input).to_string_lossy().to_string(),
                 "manifest_path": canonicalize_loose(manifest).to_string_lossy().to_string(),
                 "candidate_output": canonicalize_loose(output).to_string_lossy().to_string(),
+                "runner_config_digest": case_by_id(&case_id)
+                    .and_then(|c| c["runner_config_digest"].as_str())
+                    .map(|s| serde_json::json!(s.to_lowercase()))
+                    .unwrap_or(serde_json::Value::Null),
             })
         })
         .collect();
 
     let report = serde_json::json!({
-        "schema_version": "mida.preflight-report/v2",
+        "schema_version": "mida.preflight-report/v3",
         "status": "ready",
         "reasons": [],
         "runner_config_digest": runner_config_digest,

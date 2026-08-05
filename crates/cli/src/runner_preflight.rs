@@ -6,9 +6,10 @@
 //! - **Producer (this module, `mida-cli` production)**: builds
 //!   [`mida_core::runner_config::RunnerConfig`] from the actual run policy,
 //!   computes the digest with `mida_core::runner_config::runner_config_digest`,
-//!   and atomically emits the `mida.runner-config-envelope/v2` envelope
-//!   (full config JSON + producer digest + CLI binary SHA-256 + tool
-//!   revision + verifier SHA-256 identity).
+//!   and atomically emits the `mida.runner-config-envelope/v4` envelope
+//!   (case-bound: one full config JSON + producer digest per case, plus CLI
+//!   binary SHA-256, tool revision, verifier identity, and a sealed
+//!   `case_set_digest` over every case config and its case/input binding).
 //! - **Verifier (`mida-acceptance` binary)**: reparses the envelope JSON
 //!   with its own dependency-free `RunnerConfig`, recomputes the digest with
 //!   its own canonical implementation, and produces `preflight.json`.
@@ -30,8 +31,18 @@
 //!
 //! P6.3: the envelope binds the ACTUAL run configuration (built by
 //! `crate::run_spec` from the parsed `/unpack` arguments, including the
-//! Origin Macro pure-rebuild default); [`bind_actual_config_to_envelope`]
-//! is the launch-side equality check.
+//! Origin Macro pure-rebuild default).
+//!
+//! P6.3.3: the envelope is case-bound. `/offline-preflight` builds one
+//! per-case `RunnerConfig` from `frozen_run_policy(case.input)` — the Origin
+//! Macro D3 default resolves `pure_rebuild=true` for origin_macro and
+//! `false` for lunlun_software — so a single envelope can honestly
+//! authorize both cases. The launch boundary ([`attest_ready_before_launch`])
+//! first matches the current protected input to EXACTLY ONE case, then
+//! compares the actual config digest against ONLY that case's
+//! `runner_config_digest`; the selected digest flows into the evidence
+//! context and bundle. A v3 single-config envelope fails closed (no silent
+//! upgrade).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -46,9 +57,15 @@ use crate::unpacker::sidecar_io::atomic_write;
 /// v3 (P6.3.2): binds the verifier PATH identity (canonical CLI sibling
 /// path + controlled relative marker) together with `verifier_sha256`, so
 /// staging, launch re-attestation, PE-evidence and bundle completion all
-/// validate path AND hash. v1/v2 envelopes no longer parse (no persisted
-/// ones exist).
-pub const RUNNER_CONFIG_ENVELOPE_SCHEMA_VERSION: &str = "mida.runner-config-envelope/v3";
+/// validate path AND hash.
+///
+/// v4 (P6.3.3): binds configuration PER CASE. The top-level single
+/// `runner_config`/`runner_config_digest` is removed (it could not authorize
+/// both Origin `pure_rebuild=true` and Lunlun `pure_rebuild=false`); it is
+/// replaced by a `case_configs` collection (exactly the two fixed cases)
+/// and a sealed `case_set_digest` over every case config + case/input
+/// binding. v3 envelopes no longer parse (fail-closed, no silent upgrade).
+pub const RUNNER_CONFIG_ENVELOPE_SCHEMA_VERSION: &str = "mida.runner-config-envelope/v4";
 /// Filename of the envelope inside the preflight output dir.
 pub const RUNNER_CONFIG_ENVELOPE_FILENAME: &str = "runner-config-envelope.json";
 /// Filename of the preflight report inside the preflight output dir.
@@ -69,40 +86,89 @@ pub fn frozen_runner_config() -> mida_core::runner_config::RunnerConfig {
     crate::run_spec::frozen_runner_config()
 }
 
-/// Launch-side equality check (P6.3-A): the digest of the ACTUAL run
+/// One case-bound runner config entry inside the v4 envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaseRunnerConfigEnvelope {
+    /// The fixed case id (`origin_macro` or `lunlun_software`).
+    pub case_id: String,
+    /// Verified protected-input identity of this case.
+    pub protected_input: FileIdentityGate,
+    /// Full runner config JSON, as the runner will apply it for this case.
+    pub runner_config: serde_json::Value,
+    /// Producer-computed per-case digest
+    /// (`mida_core::runner_config::runner_config_digest`).
+    pub runner_config_digest: String,
+}
+
+/// Select the unique envelope case whose protected input identity matches the
+/// actual config's context — but the caller must supply the protected input
+/// identity to bind against (the config itself carries no identity). This is
+/// the launch-side per-case binding (P6.3.3): the ACTUAL config digest is
+/// compared against EXACTLY ONE case digest. The input is matched separately
+/// in [`attest_ready_before_launch`]; here we select by `input_identity` and
+/// reject 0 or 2+ matches.
+///
+/// Returns the matched [`CaseRunnerConfigEnvelope`].
+pub fn select_case_config<'a>(
+    envelope: &'a RunnerConfigEnvelope,
+    input_identity: &FileIdentityGate,
+) -> anyhow::Result<&'a CaseRunnerConfigEnvelope> {
+    let mut matches: Vec<&CaseRunnerConfigEnvelope> = envelope
+        .case_configs
+        .iter()
+        .filter(|c| c.protected_input == *input_identity)
+        .collect();
+    if matches.len() != 1 {
+        bail!(
+            "protected input matches {} case configs (expected exactly one); \
+             cross-case or third-input selection is refused",
+            matches.len()
+        );
+    }
+    Ok(matches.remove(0))
+}
+
+/// Launch-side equality check (P6.3-A/P6.3.3): the digest of the ACTUAL run
 /// configuration — built from the parsed `/unpack` arguments, with the
-/// resolved pure-rebuild value — must equal the envelope digest. An
-/// envelope staged as `pure_rebuild=false` can never bind a run that
-/// silently resolves to `true` (or any other parameter divergence).
+/// resolved pure-rebuild value — must equal the digest of the UNIQUE case
+/// the current input belongs to. A case config staged with
+/// `pure_rebuild=false` can never bind a run that silently resolves to
+/// `true` (or any other parameter divergence); the actual config is never
+/// compared against another case's digest.
 pub fn bind_actual_config_to_envelope(
     output_dir: &Path,
     actual_config: &mida_core::runner_config::RunnerConfig,
+    input_identity: &FileIdentityGate,
 ) -> anyhow::Result<()> {
     let envelope = RunnerConfigEnvelope::read(output_dir)?;
+    let case = select_case_config(&envelope, input_identity)?;
     let actual_digest = mida_core::runner_config::runner_config_digest(actual_config);
-    if !actual_digest.eq_ignore_ascii_case(&envelope.runner_config_digest) {
+    if !actual_digest.eq_ignore_ascii_case(&case.runner_config_digest) {
         bail!(
-            "actual run config digest {actual_digest} != envelope digest {}",
-            envelope.runner_config_digest
+            "actual run config digest {actual_digest} != envelope case {} digest {}",
+            case.case_id,
+            case.runner_config_digest
         );
     }
     Ok(())
 }
 
-/// The `mida.runner-config-envelope/v3` emitted by the runner side.
+/// The `mida.runner-config-envelope/v4` emitted by the runner side.
 ///
 /// `deny_unknown_fields` + required fields: a tampered envelope (unknown
 /// field, missing field) fails closed at deserialization.
+///
+/// P6.3.3: configuration is case-bound. There is no ambiguous top-level
+/// `runner_config`/`runner_config_digest`; instead `case_configs` holds
+/// exactly the two fixed cases, each with its own full config and digest,
+/// and `case_set_digest` seals every case config and its case/input binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunnerConfigEnvelope {
     #[serde(rename = "$schema")]
     pub schema: String,
     pub schema_version: String,
-    /// Full runner config JSON, as the runner will apply it.
-    pub runner_config: serde_json::Value,
-    /// Producer-computed digest (`mida_core::runner_config::runner_config_digest`).
-    pub runner_config_digest: String,
     /// SHA-256 of the CLI binary that will perform the run.
     pub cli_binary_sha256: String,
     /// Tool revision (git HEAD) the run is pinned to.
@@ -117,28 +183,60 @@ pub struct RunnerConfigEnvelope {
     /// staging: the launch and PE-evidence paths fail closed unless the
     /// verifier they resolve hashes to exactly this.
     pub verifier_sha256: String,
+    /// Sealed hash over every case config + its case/input binding. Any
+    /// single-case tamper changes this and the independent verifier refuses
+    /// the whole envelope.
+    pub case_set_digest: String,
+    /// Exactly the two fixed Oreans cases, each with its own config/digest.
+    pub case_configs: Vec<CaseRunnerConfigEnvelope>,
+}
+
+/// Canonical, injective encoding of one case-bound config entry (case id,
+/// protected input identity, per-case runner-config digest). Used to seal
+/// the whole case set into `case_set_digest`.
+fn canonical_case_entry(entry: &CaseRunnerConfigEnvelope) -> String {
+    format!(
+        "case={}\nprotected_input={}|{}\nrunner_config_digest={}\n",
+        entry.case_id,
+        entry.protected_input.sha256.to_lowercase(),
+        entry.protected_input.size_bytes,
+        entry.runner_config_digest.to_lowercase()
+    )
+}
+
+/// SHA-256 (lowercase hex) of the canonical case-set encoding (P6.3.3).
+fn case_set_digest(case_configs: &[CaseRunnerConfigEnvelope]) -> String {
+    let mut entries: Vec<String> = case_configs.iter().map(canonical_case_entry).collect();
+    entries.sort();
+    let mut canonical = String::new();
+    for e in entries {
+        canonical.push_str(&e);
+    }
+    sha256_hex(canonical.as_bytes())
 }
 
 impl RunnerConfigEnvelope {
-    /// Build the envelope from the frozen policy + runtime pinning inputs.
+    /// Build the envelope from one per-case config per input, plus runtime
+    /// pinning inputs. `case_configs` must contain exactly the two fixed
+    /// cases (validated by the caller/`build_checked`).
     pub fn build(
-        runner_config: &mida_core::runner_config::RunnerConfig,
+        case_configs: Vec<CaseRunnerConfigEnvelope>,
         cli_binary_sha256: &str,
         tool_revision: &str,
         verifier_path: &str,
         verifier_sha256: &str,
     ) -> RunnerConfigEnvelope {
-        let digest = mida_core::runner_config::runner_config_digest(runner_config);
+        let case_set_digest = case_set_digest(&case_configs);
         RunnerConfigEnvelope {
             schema: RUNNER_CONFIG_ENVELOPE_SCHEMA_REF.to_string(),
             schema_version: RUNNER_CONFIG_ENVELOPE_SCHEMA_VERSION.to_string(),
-            runner_config: serde_json::to_value(runner_config).expect("runner config serializes"),
-            runner_config_digest: digest,
             cli_binary_sha256: cli_binary_sha256.to_lowercase(),
             tool_revision: tool_revision.to_string(),
             verifier_source: VERIFIER_SOURCE_TOKEN.to_string(),
             verifier_path: verifier_path.to_string(),
             verifier_sha256: verifier_sha256.to_lowercase(),
+            case_set_digest,
+            case_configs,
         }
     }
 
@@ -165,16 +263,57 @@ impl RunnerConfigEnvelope {
         })
     }
 
-    /// Producer-computed digest, as the launch boundary uses it.
-    pub fn digest(&self) -> &str {
-        &self.runner_config_digest
+    /// The sealed case-set digest (the whole-envelope identity, P6.3.3).
+    pub fn case_set(&self) -> &str {
+        &self.case_set_digest
+    }
+
+    /// Validate the case-config set shape: exactly the two fixed cases, each
+    /// once, each with a well-formed digest and non-empty protected identity.
+    /// Returns the first reason or `None` when valid.
+    pub fn validate_case_set(&self) -> Option<String> {
+        let present: Vec<&str> = self
+            .case_configs
+            .iter()
+            .map(|c| c.case_id.as_str())
+            .collect();
+        if self.case_configs.len() != FIXED_CASE_IDS.len() {
+            return Some(format!(
+                "envelope must contain exactly {} case configs, got {}",
+                FIXED_CASE_IDS.len(),
+                self.case_configs.len()
+            ));
+        }
+        for id in FIXED_CASE_IDS {
+            if present.iter().filter(|p| **p == id).count() != 1 {
+                return Some(format!(
+                    "envelope case set must contain exactly one {id} entry, got {:?}",
+                    present
+                ));
+            }
+        }
+        for c in &self.case_configs {
+            if !is_64_hex(&c.runner_config_digest) {
+                return Some(format!(
+                    "case {} runner_config_digest must be exactly 64 hex chars",
+                    c.case_id
+                ));
+            }
+            if !is_64_hex(&c.protected_input.sha256) || c.protected_input.size_bytes == 0 {
+                return Some(format!(
+                    "case {} protected_input identity is malformed",
+                    c.case_id
+                ));
+            }
+        }
+        None
     }
 }
 
 /// The preflight report as the launch boundary consumes it (strict).
 ///
 /// This is a minimal runner-side copy of the acceptance report contract
-/// (`mida.preflight-report/v2`); unknown fields fail closed so a drifted
+/// (`mida.preflight-report/v3`); unknown fields fail closed so a drifted
 /// report schema cannot slip past.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -182,6 +321,7 @@ pub struct PreflightReportGate {
     pub schema_version: String,
     pub status: String,
     pub reasons: Vec<String>,
+    /// The envelope's sealed case-set digest (P6.3.3).
     pub runner_config_digest: String,
     pub head_revision: Option<String>,
     pub worktree_clean: Option<bool>,
@@ -196,7 +336,7 @@ pub struct PreflightReportGate {
 }
 
 /// One artifact identity as recorded in the gate report.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileIdentityGate {
     pub sha256: String,
@@ -213,6 +353,8 @@ pub struct PreflightCaseGate {
     pub protected_input_path: String,
     pub manifest_path: String,
     pub candidate_output: String,
+    /// P6.3.3: the per-case runner-config digest recorded by the report.
+    pub runner_config_digest: Option<String>,
 }
 
 /// Resolve the `mida-acceptance` verifier binary (P6.3.2 unique production
@@ -326,10 +468,10 @@ pub fn envelope_reuse_policy(
     };
     if existing.schema != candidate.schema
         || existing.schema_version != candidate.schema_version
-        || existing.runner_config != candidate.runner_config
+        || existing.case_configs != candidate.case_configs
         || !existing
-            .runner_config_digest
-            .eq_ignore_ascii_case(&candidate.runner_config_digest)
+            .case_set_digest
+            .eq_ignore_ascii_case(&candidate.case_set_digest)
         || !existing
             .cli_binary_sha256
             .eq_ignore_ascii_case(&candidate.cli_binary_sha256)
@@ -380,9 +522,9 @@ pub fn run_offline_preflight(
         EnvelopeReuse::Missing => envelope.write(output_dir)?,
         EnvelopeReuse::ExistingMatches => {
             eprintln!(
-                "reusing existing runner-config envelope (digest {}); the verifier \
+                "reusing existing runner-config envelope (case-set digest {}); the verifier \
                  independently recomputes and cross-checks it",
-                envelope.runner_config_digest
+                envelope.case_set_digest
             );
             output_dir.join(RUNNER_CONFIG_ENVELOPE_FILENAME)
         }
@@ -430,7 +572,11 @@ pub fn run_offline_preflight(
 }
 
 /// Schema id of the preflight report the gate consumes.
-pub const PREFLIGHT_REPORT_SCHEMA_VERSION: &str = "mida.preflight-report/v2";
+///
+/// v3 (P6.3.3): each case entry carries its own `runner_config_digest`, so
+/// the report can cross-validate every case's config against the v4
+/// envelope. v2 reports (single top-level digest) no longer parse.
+pub const PREFLIGHT_REPORT_SCHEMA_VERSION: &str = "mida.preflight-report/v3";
 
 /// The two fixed Oreans cases; the launch attestation accepts exactly this
 /// set (no cross-case reuse).
@@ -442,14 +588,16 @@ pub const FIXED_CASE_IDS: [&str; 2] = ["origin_macro", "lunlun_software"];
 /// `Ok(())` only when:
 ///
 /// - the report parses strictly (unknown fields fail closed) as
-///   `mida.preflight-report/v2`;
+///   `mida.preflight-report/v3`;
 /// - `status == "ready"`;
-/// - `report.runner_config_digest == envelope.runner_config_digest`
-///   (the acceptance-recomputed digest equals the runner-emitted digest);
+/// - the report's case set cross-validates against the envelope case set:
+///   the same two fixed cases, each with matching protected-input identity
+///   and per-case runner-config digest (P6.3.3 report/envelope cross-check);
 /// - `cli_binary_matches == true`.
 ///
-/// Any envelope/report absence, schema drift, digest drift, or CLI identity
-/// drift is an error — the caller must not create a sample process.
+/// Any envelope/report absence, schema drift, case-set drift, per-case
+/// digest drift, or CLI identity drift is an error — the caller must not
+/// create a sample process.
 pub fn require_ready_before_launch(
     output_dir: &Path,
     envelope: &RunnerConfigEnvelope,
@@ -465,7 +613,7 @@ pub fn require_ready_before_launch(
     Ok(())
 }
 
-/// Strictly parse the gate report (deny-unknown-fields, v2 shape).
+/// Strictly parse the gate report (deny-unknown-fields, v3 shape).
 pub fn read_gate_report(output_dir: &Path) -> anyhow::Result<PreflightReportGate> {
     let report_path = output_dir.join(PREFLIGHT_REPORT_FILENAME);
     let bytes = std::fs::read(&report_path)
@@ -478,8 +626,9 @@ pub fn read_gate_report(output_dir: &Path) -> anyhow::Result<PreflightReportGate
     })
 }
 
-/// The shared ready-chain checks: status ready, digest equality with the
-/// envelope, CLI identity matched.
+/// The shared ready-chain checks: status ready, report case set cross-validates
+/// against the envelope case set (case id, protected identity, per-case
+/// digest), and the CLI identity matched.
 fn check_chain_ready(
     report: &PreflightReportGate,
     envelope: &RunnerConfigEnvelope,
@@ -491,12 +640,58 @@ fn check_chain_ready(
             report.reasons.join("; ")
         );
     }
-    if report.runner_config_digest.to_lowercase() != envelope.runner_config_digest.to_lowercase() {
+    // The report's top-level digest is the envelope's sealed case-set digest.
+    if !report
+        .runner_config_digest
+        .eq_ignore_ascii_case(&envelope.case_set_digest)
+    {
         bail!(
-            "runner-config digest drift: report {} vs envelope {}",
+            "runner-config case-set digest drift: report {} vs envelope {}",
             report.runner_config_digest,
-            envelope.runner_config_digest
+            envelope.case_set_digest
         );
+    }
+    // P6.3.3: cross-validate every report case against the envelope case.
+    // The report must carry a digest for every case and it must equal the
+    // envelope's per-case digest; case set must be exactly the fixed set.
+    if report.cases.len() != envelope.case_configs.len() {
+        bail!(
+            "preflight report case count {} != envelope case config count {}",
+            report.cases.len(),
+            envelope.case_configs.len()
+        );
+    }
+    for env_case in &envelope.case_configs {
+        let report_case = report
+            .cases
+            .iter()
+            .find(|c| c.case_id == env_case.case_id)
+            .ok_or_else(|| {
+                anyhow!(
+                    "preflight report is missing case {} present in the envelope",
+                    env_case.case_id
+                )
+            })?;
+        if report_case.protected_input.as_ref() != Some(&env_case.protected_input) {
+            bail!(
+                "case {} protected-input identity drift between report and envelope",
+                env_case.case_id
+            );
+        }
+        let report_digest = report_case.runner_config_digest.as_deref().ok_or_else(|| {
+            anyhow!(
+                "case {} report is missing its runner_config_digest",
+                env_case.case_id
+            )
+        })?;
+        if !report_digest.eq_ignore_ascii_case(&env_case.runner_config_digest) {
+            bail!(
+                "case {} runner-config digest drift: report {} vs envelope {}",
+                env_case.case_id,
+                report_digest,
+                env_case.runner_config_digest
+            );
+        }
     }
     if report.cli_binary_matches != Some(true) {
         bail!(
@@ -703,8 +898,12 @@ pub fn attest_ready_before_launch(
         );
     }
 
-    // P6.3-A: the actual run-config digest must equal the envelope digest.
-    bind_actual_config_to_envelope(output_dir, ctx.runner_config)?;
+    // P6.3-A/P6.3.3: the actual run-config digest must equal the digest of
+    // the UNIQUE case the current input belongs to. The input identity is
+    // computed first (it drives both the per-case config selection here and
+    // the report case matching below).
+    let current_identity = file_identity(ctx.input)?;
+    bind_actual_config_to_envelope(output_dir, ctx.runner_config, &current_identity)?;
 
     // Current CLI identity (attack: binary A staged, binary B launched).
     let current_cli_sha = sha256_file(ctx.cli_binary)?;
@@ -727,7 +926,6 @@ pub fn attest_ready_before_launch(
     check_chain_ready(&pre_report, &envelope)?;
 
     // The current input must match EXACTLY one preflight case identity.
-    let current_identity = file_identity(ctx.input)?;
     let matches: Vec<&PreflightCaseGate> = pre_report
         .cases
         .iter()
@@ -832,7 +1030,9 @@ pub fn attest_ready_before_launch(
     }
 
     // Every cross-identity is bound: build the single-use evidence context.
-    let digest = envelope_runner_config_digest(output_dir)?;
+    // P6.3.3: the digest is the SELECTED case's digest (never a shared or
+    // another case's digest) — it flows into the bundle for this case.
+    let digest = envelope_case_runner_config_digest(output_dir, &current_identity)?;
     let context = RunEvidenceContext::new(
         target_case_id,
         envelope.tool_revision.clone(),
@@ -942,12 +1142,18 @@ fn rerun_verifier(
     }
 }
 
-/// Digest the launch boundary reports for sidecar/bundle requests. Always
-/// the producer-computed value, equality with the report proven by
-/// `tests/preflight_boundary.rs`.
-pub fn envelope_runner_config_digest(output_dir: &Path) -> anyhow::Result<String> {
+/// Digest the launch boundary reports for sidecar/bundle requests. P6.3.3:
+/// the SELECTED case (the one whose protected input matches `input_identity`)
+/// is chosen first, and its per-case digest is returned — the value that
+/// flows into the evidence context and bundle. Always the producer-computed
+/// value; equality with the report proven by `tests/preflight_boundary.rs`.
+pub fn envelope_case_runner_config_digest(
+    output_dir: &Path,
+    input_identity: &FileIdentityGate,
+) -> anyhow::Result<String> {
     let envelope = RunnerConfigEnvelope::read(output_dir)?;
-    Ok(envelope.runner_config_digest.to_lowercase())
+    let case = select_case_config(&envelope, input_identity)?;
+    Ok(case.runner_config_digest.to_lowercase())
 }
 
 // ---------------------------------------------------------------------------
@@ -1260,6 +1466,179 @@ mod tests {
         let resolved = resolve_acceptance_bin_from_cli(&cli).expect("sibling resolves");
         assert_eq!(resolved, std::fs::canonicalize(&sibling).unwrap());
         assert_ne!(resolved, other, "a byte copy elsewhere is never selected");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // P6.3.3: case-bound envelope + per-case digest selection (positive
+    // control, hermetic — no process launch).
+    // -----------------------------------------------------------------------
+
+    /// The locked protected-input identities (mirror of the case manifests).
+    const ORIGIN_ID: &str = "1af62999cf5be0b2f21abc39034c122a42aa46cfbfdb546faa184de37ac09ac7";
+    const LUNLUN_ID: &str = "8a0118d04e03752728999c845536c29215d2a626ac65845c22e3f1149de0db07";
+
+    fn case_config(case_id: &str, sha: &str, pure_rebuild: bool) -> CaseRunnerConfigEnvelope {
+        let mut config = crate::run_spec::frozen_runner_config();
+        config.pure_rebuild = pure_rebuild;
+        let digest = mida_core::runner_config::runner_config_digest(&config);
+        CaseRunnerConfigEnvelope {
+            case_id: case_id.to_string(),
+            protected_input: FileIdentityGate {
+                sha256: sha.to_string(),
+                size_bytes: if case_id == "origin_macro" {
+                    5_232_656
+                } else {
+                    4_976_144
+                },
+            },
+            runner_config: serde_json::to_value(&config).unwrap(),
+            runner_config_digest: digest,
+        }
+    }
+
+    fn v4_envelope() -> RunnerConfigEnvelope {
+        RunnerConfigEnvelope::build(
+            vec![
+                case_config("origin_macro", ORIGIN_ID, true),
+                case_config("lunlun_software", LUNLUN_ID, false),
+            ],
+            &"a".repeat(64),
+            "rev",
+            "C:\\dummy\\mida-acceptance.exe",
+            &"b".repeat(64),
+        )
+    }
+
+    #[test]
+    fn case_bound_envelope_carries_distinct_origin_and_lunlun_configs() {
+        let env = v4_envelope();
+        assert!(env.validate_case_set().is_none(), "case set is well-formed");
+        let origin = env
+            .case_configs
+            .iter()
+            .find(|c| c.case_id == "origin_macro")
+            .unwrap();
+        let lunlun = env
+            .case_configs
+            .iter()
+            .find(|c| c.case_id == "lunlun_software")
+            .unwrap();
+        // Origin resolves pure_rebuild=true, Lunlun pure_rebuild=false (D3).
+        let origin_cfg: serde_json::Value = origin.runner_config.clone();
+        assert_eq!(origin_cfg["pure_rebuild"], serde_json::json!(true));
+        let lunlun_cfg: serde_json::Value = lunlun.runner_config.clone();
+        assert_eq!(lunlun_cfg["pure_rebuild"], serde_json::json!(false));
+        // Distinct per-case digests.
+        assert_ne!(origin.runner_config_digest, lunlun.runner_config_digest);
+        // The sealed case-set digest covers both case + input bindings.
+        assert_eq!(env.case_set_digest.len(), 64);
+    }
+
+    #[test]
+    fn select_case_config_picks_the_unique_case_by_input_identity() {
+        let env = v4_envelope();
+        let origin_identity = FileIdentityGate {
+            sha256: ORIGIN_ID.to_string(),
+            size_bytes: 5_232_656,
+        };
+        let lunlun_identity = FileIdentityGate {
+            sha256: LUNLUN_ID.to_string(),
+            size_bytes: 4_976_144,
+        };
+        let origin = select_case_config(&env, &origin_identity).unwrap();
+        assert_eq!(origin.case_id, "origin_macro");
+        let lunlun = select_case_config(&env, &lunlun_identity).unwrap();
+        assert_eq!(lunlun.case_id, "lunlun_software");
+        // Origin and Lunlun select DIFFERENT digests.
+        assert_ne!(origin.runner_config_digest, lunlun.runner_config_digest);
+        // A third / unknown identity matches 0 cases -> refused.
+        let unknown = FileIdentityGate {
+            sha256: "c".repeat(64),
+            size_bytes: 1,
+        };
+        assert!(
+            select_case_config(&env, &unknown).is_err(),
+            "0 matches must be refused"
+        );
+    }
+
+    #[test]
+    fn bind_actual_config_compares_only_the_selected_case_digest() {
+        let dir = temp_dir("bind_case");
+        let env = v4_envelope();
+        env.write(&dir).unwrap();
+
+        // Origin actual config (pure_rebuild=true) against Origin digest
+        // passes; the same actual config is NOT compared to Lunlun's digest.
+        let origin_identity = FileIdentityGate {
+            sha256: ORIGIN_ID.to_string(),
+            size_bytes: 5_232_656,
+        };
+        let mut origin_actual = crate::run_spec::frozen_run_policy(Path::new("x.bin"));
+        origin_actual.pure_rebuild = true;
+        assert!(bind_actual_config_to_envelope(&dir, &origin_actual, &origin_identity).is_ok());
+        // A Lunlun actual config (pure_rebuild=false) against Lunlun digest
+        // passes.
+        let lunlun_identity = FileIdentityGate {
+            sha256: LUNLUN_ID.to_string(),
+            size_bytes: 4_976_144,
+        };
+        let mut lunlun_actual = crate::run_spec::frozen_runner_config();
+        lunlun_actual.pure_rebuild = false;
+        assert!(bind_actual_config_to_envelope(&dir, &lunlun_actual, &lunlun_identity).is_ok());
+
+        // Wrong pairing: an Origin actual config (pure=true) bound to the
+        // LUNLUN identity -> its digest must NOT equal Lunlun's digest -> fail.
+        assert!(
+            bind_actual_config_to_envelope(&dir, &origin_actual, &lunlun_identity).is_err(),
+            "Origin config must never match the Lunlun digest"
+        );
+        // And a Lunlun actual (pure=false) bound to the ORIGIN identity fails.
+        assert!(
+            bind_actual_config_to_envelope(&dir, &lunlun_actual, &origin_identity).is_err(),
+            "Lunlun config must never match the Origin digest"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn v4_envelope_seals_case_set_and_rejects_missing_duplicate_extra() {
+        let dir = temp_dir("case_set");
+        let env = v4_envelope();
+        env.write(&dir).unwrap();
+        // The sealed digest round-trips and is stable.
+        assert_eq!(
+            env.case_set_digest,
+            case_set_digest(&env.case_configs),
+            "case-set digest must be recomputable from the case configs"
+        );
+        // Missing a case is rejected.
+        let mut missing = v4_envelope();
+        missing
+            .case_configs
+            .retain(|c| c.case_id != "lunlun_software");
+        assert!(
+            missing.validate_case_set().is_some(),
+            "missing case rejected"
+        );
+        // Duplicate is rejected.
+        let mut dup = v4_envelope();
+        dup.case_configs
+            .push(case_config("origin_macro", ORIGIN_ID, true));
+        assert!(dup.validate_case_set().is_some(), "duplicate case rejected");
+        // Extra (third) case is rejected.
+        let mut extra = v4_envelope();
+        extra
+            .case_configs
+            .push(case_config("gto_launcher", &"d".repeat(64), false));
+        assert!(extra.validate_case_set().is_some(), "extra case rejected");
+        // Tampering one per-case digest, then re-sealing the case set, must
+        // change the case-set digest (any single-case tamper breaks the seal).
+        let mut tampered = v4_envelope();
+        tampered.case_configs[0].runner_config_digest = "e".repeat(64);
+        tampered.case_set_digest = case_set_digest(&tampered.case_configs);
+        assert_ne!(tampered.case_set_digest, env.case_set_digest);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

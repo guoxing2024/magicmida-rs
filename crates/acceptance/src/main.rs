@@ -24,9 +24,14 @@ use mida_acceptance::oreans_gate::OREANS_TWO_SAMPLE_OBSERVATIONS_SCHEMA_VERSION;
 use mida_acceptance::{
     build_oreans_pe_evidence, check_static, check_with_behavior, check_with_behavior_managed,
     check_with_behavior_managed_lab, check_with_behavior_signed, evaluate_oreans_two_sample_gate,
-    BehaviorEvidence, CheckStaticOptions, EnvelopePolicy, HmacSha256Verifier, OreansGateVerdict,
-    OreansSampleObservation, SignatureEnvelope, Verdict, VerifiedManagedCandidate,
+    sha256_hex, BehaviorEvidence, CheckStaticOptions, EnvelopePolicy, HmacSha256Verifier,
+    OreansGateVerdict, OreansSampleObservation, SignatureEnvelope, Verdict,
+    VerifiedManagedCandidate, FIXED_CASE_IDS,
 };
+
+fn is_64_hex(value: &str) -> bool {
+    value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit())
+}
 
 fn main() {
     let code = match run() {
@@ -1051,23 +1056,36 @@ fn same_file(
     Ok(false)
 }
 
-/// Verifier-side copy of the `mida.runner-config-envelope/v3` emitted by the
+/// Verifier-side copy of the `mida.runner-config-envelope/v4` emitted by the
 /// runner (`mida-cli`). Deny-unknown-fields: any tampered or drifted field
 /// fails closed. The acceptance crate stays dependency-free of production.
+///
+/// P6.3.3: configuration is case-bound — each case has its own config and
+/// digest; `case_set_digest` seals the whole set.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RunnerConfigEnvelopeV3 {
+struct RunnerConfigEnvelopeV4 {
     #[serde(rename = "$schema")]
     #[allow(dead_code)]
     schema: String,
     schema_version: String,
-    runner_config: serde_json::Value,
-    runner_config_digest: String,
     cli_binary_sha256: String,
     tool_revision: String,
     verifier_source: String,
     verifier_path: String,
     verifier_sha256: String,
+    case_set_digest: String,
+    case_configs: Vec<CaseConfigEnvelopeV4>,
+}
+
+/// One case-bound config entry in the v4 envelope (verifier copy).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CaseConfigEnvelopeV4 {
+    case_id: String,
+    protected_input: mida_acceptance::FileIdentity,
+    runner_config: serde_json::Value,
+    runner_config_digest: String,
 }
 
 /// Worktree probe host: runs `git` in the repository root. Any probe failure
@@ -1167,16 +1185,17 @@ fn cmd_preflight(args: &[String]) -> Result<i32, String> {
 
     let envelope_bytes = fs::read(&envelope_path)
         .map_err(|e| format!("cannot read envelope {}: {e}", envelope_path.display()))?;
-    let envelope: RunnerConfigEnvelopeV3 =
+    let envelope: RunnerConfigEnvelopeV4 =
         serde_json::from_slice(&envelope_bytes).map_err(|e| {
             format!(
                 "envelope {} rejected (unknown/malformed fields): {e}",
                 envelope_path.display()
             )
         })?;
-    if envelope.schema_version != "mida.runner-config-envelope/v3" {
+    if envelope.schema_version != "mida.runner-config-envelope/v4" {
         return Err(format!(
-            "envelope schema_version {:?} != mida.runner-config-envelope/v3",
+            "envelope schema_version {:?} != mida.runner-config-envelope/v4 \
+             (a v3 single-config envelope is refused; case-bound v4 required)",
             envelope.schema_version
         ));
     }
@@ -1206,26 +1225,113 @@ fn cmd_preflight(args: &[String]) -> Result<i32, String> {
     {
         return Err("envelope verifier_sha256 must be exactly 64 hex chars".to_string());
     }
+    if !is_64_hex(&envelope.case_set_digest) {
+        return Err("envelope case_set_digest must be exactly 64 hex chars".to_string());
+    }
 
-    // Independent reparse + recompute with the acceptance implementation.
-    let parsed: mida_acceptance::RunnerConfig = serde_json::from_value(envelope.runner_config)
-        .map_err(|e| format!("runner config in envelope rejected: {e}"))?;
     let mut reasons: Vec<String> = Vec::new();
-    let recomputed = mida_acceptance::runner_config_digest(&parsed);
-    if recomputed != envelope.runner_config_digest.to_lowercase() {
+
+    // P6.3.3: independently reparse + recompute EVERY case config with the
+    // acceptance implementation, and validate the case_id <-> protected
+    // identity <-> config digest binding. A drift in any single case makes
+    // the WHOLE preflight NotReady.
+    let mut case_config_digests: Vec<Option<String>> = Vec::new();
+    if envelope.case_configs.len() != FIXED_CASE_IDS.len() {
         reasons.push(format!(
-            "runner-config-envelope digest drift: acceptance recomputed {recomputed}, \
-             producer emitted {}",
-            envelope.runner_config_digest
+            "envelope must contain exactly {} case configs, got {}",
+            FIXED_CASE_IDS.len(),
+            envelope.case_configs.len()
         ));
     }
-    if envelope.tool_revision != parsed.tool_revision {
-        reasons.push(format!(
-            "envelope tool_revision {:?} does not match runner config {:?}",
-            envelope.tool_revision, parsed.tool_revision
-        ));
+    let mut present: Vec<&str> = Vec::new();
+    for case in &envelope.case_configs {
+        present.push(case.case_id.as_str());
+        // Independent reparse of this case's config.
+        let parsed: mida_acceptance::RunnerConfig =
+            match serde_json::from_value(case.runner_config.clone()) {
+                Ok(c) => c,
+                Err(e) => {
+                    reasons.push(format!("case {} runner config rejected: {e}", case.case_id));
+                    case_config_digests.push(None);
+                    continue;
+                }
+            };
+        if !is_64_hex(&case.runner_config_digest) {
+            reasons.push(format!(
+                "case {} runner_config_digest must be exactly 64 hex chars",
+                case.case_id
+            ));
+        }
+        let recomputed = mida_acceptance::runner_config_digest(&parsed);
+        if recomputed != case.runner_config_digest.to_lowercase() {
+            reasons.push(format!(
+                "case {} runner-config digest drift: acceptance recomputed {recomputed}, \
+                 producer emitted {}",
+                case.case_id, case.runner_config_digest
+            ));
+        }
+        if !is_64_hex(&case.protected_input.sha256) || case.protected_input.size_bytes == 0 {
+            reasons.push(format!(
+                "case {} protected_input identity is malformed",
+                case.case_id
+            ));
+        }
+        // case_id must be one of the two fixed cases and the tool revision
+        // must agree with the envelope.
+        if !FIXED_CASE_IDS.contains(&case.case_id.as_str()) {
+            reasons.push(format!(
+                "case {:?} is not one of the two fixed Oreans cases",
+                case.case_id
+            ));
+        }
+        if envelope.tool_revision != parsed.tool_revision {
+            reasons.push(format!(
+                "case {} tool_revision {:?} does not match runner config {:?}",
+                case.case_id, envelope.tool_revision, parsed.tool_revision
+            ));
+        }
+        case_config_digests.push(Some(case.runner_config_digest.to_lowercase()));
+    }
+    // Case set must be exactly {origin_macro, lunlun_software}, each once.
+    for id in FIXED_CASE_IDS {
+        if present.iter().filter(|p| **p == id).count() != 1 {
+            reasons.push(format!(
+                "envelope case set must contain exactly one {id} entry, got {:?}",
+                present
+            ));
+        }
+    }
+    // Recompute the sealed case-set digest from the verified per-case values
+    // and cross-check against the envelope's case_set_digest.
+    {
+        let mut entries: Vec<String> = envelope
+            .case_configs
+            .iter()
+            .map(|c| {
+                format!(
+                    "case={}\nprotected_input={}|{}\nrunner_config_digest={}\n",
+                    c.case_id,
+                    c.protected_input.sha256.to_lowercase(),
+                    c.protected_input.size_bytes,
+                    c.runner_config_digest.to_lowercase()
+                )
+            })
+            .collect();
+        entries.sort();
+        let recomputed_set = sha256_hex(entries.concat().as_bytes());
+        if recomputed_set != envelope.case_set_digest.to_lowercase() {
+            reasons.push(format!(
+                "envelope case_set_digest drift: acceptance recomputed {recomputed_set}, \
+                 producer emitted {}",
+                envelope.case_set_digest
+            ));
+        }
     }
 
+    // The report's runner_config_digest is the sealed case-set digest; the
+    // per-case digests flow into the report's cases. For the (legacy,
+    // rejected) single-config path we keep a placeholder that can never pass
+    // the v4 schema check.
     let probe = GitWorktreeProbe {
         repo_root: repo_root.clone(),
     };
@@ -1238,12 +1344,17 @@ fn cmd_preflight(args: &[String]) -> Result<i32, String> {
         output_dir: &output_dir,
         cli_binary: Some(&cli_binary),
         expected_cli_sha256: &envelope.cli_binary_sha256,
-        runner_config: &parsed,
+        runner_config: &mida_acceptance::RunnerConfig::placeholder_for_preflight(
+            &envelope.tool_revision,
+            &envelope.cli_binary_sha256,
+        ),
         worktree: &probe,
         output_probe: &mida_acceptance::FsOutputProbe,
         toolchain_pin_file: &toolchain_pin,
         expected_toolchain: &expected_toolchain,
         repo_root: &repo_root,
+        case_config_digests,
+        case_set_digest: envelope.case_set_digest.clone(),
     };
     let mut report = mida_acceptance::run_offline_preflight(&request);
     if !reasons.is_empty() {

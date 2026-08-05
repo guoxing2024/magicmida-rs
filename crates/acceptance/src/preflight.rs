@@ -42,7 +42,12 @@ use crate::oreans_gate::locked_manifest;
 /// v2 (P6.3-B): per-case artifact identities and canonical paths are added
 /// so the launch boundary can attest that the current input/output/cli/config
 /// are unchanged since staging.
-pub const PREFLIGHT_REPORT_SCHEMA_VERSION: &str = "mida.preflight-report/v2";
+///
+/// v3 (P6.3.3): each case entry carries its own `runner_config_digest`, and
+/// the report's top-level `runner_config_digest` is the envelope's sealed
+/// case-set digest — so the report can cross-validate every case's config
+/// against the v4 envelope.
+pub const PREFLIGHT_REPORT_SCHEMA_VERSION: &str = "mida.preflight-report/v3";
 
 /// The two fixed Oreans cases; preflight is Ready only for exactly this set.
 pub const FIXED_CASE_IDS: [&str; 2] = ["origin_macro", "lunlun_software"];
@@ -404,6 +409,38 @@ impl RunnerConfig {
         }
         None
     }
+
+    /// A placeholder for the v4 (case-bound) preflight path: the per-case
+    /// configs are verified individually, so this shared value only carries
+    /// the tool revision / CLI identity for the top-level consistency checks
+    /// and never represents any single case's run. Its digest is NOT used for
+    /// a case — per-case digests come from the envelope.
+    pub fn placeholder_for_preflight(tool_revision: &str, cli_binary_sha256: &str) -> Self {
+        use crate::preflight::IsolationConfig as IC;
+        Self {
+            tool_revision: tool_revision.to_string(),
+            cli_binary_sha256: cli_binary_sha256.to_string(),
+            features: vec!["default".to_string()],
+            debugger_backend: "windows_debug_api".to_string(),
+            oep_policy: "captured".to_string(),
+            container_restore: "off".to_string(),
+            shrink: true,
+            data_sections: false,
+            pure_rebuild: false,
+            capture_policy_digest: String::new(),
+            iat_fix_strategy: "v3-trace".to_string(),
+            timeout_secs: 120,
+            isolation: IC {
+                workspace_policy: "isolated-temp".to_string(),
+                process_tree_policy: "single-process".to_string(),
+                network_policy: "blocked".to_string(),
+            },
+            attempt_numbering: "continuous-1-based".to_string(),
+            evidence_bundle_schema: "mida.oreans-evidence-bundle/v2".to_string(),
+            gate_schema: "mida.oreans-two-sample-gate/v8".to_string(),
+            env_allowlist: vec!["CARGO_TARGET_DIR".to_string()],
+        }
+    }
 }
 
 fn push_scalar(out: &mut String, name: &str, value: &str) {
@@ -587,6 +624,10 @@ pub struct CasePreflight {
     pub manifest_path: String,
     /// P6.3-B: canonical candidate-output path the launch must match.
     pub candidate_output: String,
+    /// P6.3.3: the per-case runner-config digest (the envelope-recomputed,
+    /// independently-verified value). Present only when the v4 envelope
+    /// supplied one; the launch boundary requires it for every case.
+    pub runner_config_digest: Option<String>,
 }
 
 /// Preflight report (deterministic: no timestamps, no random identifiers).
@@ -595,6 +636,9 @@ pub struct PreflightReport {
     pub schema_version: String,
     pub status: PreflightStatus,
     pub reasons: Vec<String>,
+    /// P6.3.3: the sealed case-set digest of the v4 envelope (the whole
+    /// envelope identity). For the legacy single-config path this holds the
+    /// single config digest.
     pub runner_config_digest: String,
     pub head_revision: Option<String>,
     pub worktree_clean: Option<bool>,
@@ -638,6 +682,14 @@ pub struct PreflightRequest<'a> {
     /// P6.3-B: repository root the worktree probe ran against (recorded in
     /// the report so the launch boundary re-runs the verifier identically).
     pub repo_root: &'a Path,
+    /// P6.3.3: per-case runner-config digest from the v4 envelope, aligned
+    /// by index with `cases`. `None` = no per-case digest supplied (legacy
+    /// single-config path). When supplied, the orchestrator records it in
+    /// each `CasePreflight.runner_config_digest`.
+    pub case_config_digests: Vec<Option<String>>,
+    /// P6.3.3: the sealed case-set digest of the v4 envelope. When
+    /// non-empty, it is recorded as `PreflightReport.runner_config_digest`.
+    pub case_set_digest: String,
 }
 
 /// Canonicalize `p`, falling back to canonicalizing its parent when the
@@ -922,7 +974,7 @@ pub fn run_offline_preflight(request: &PreflightRequest<'_>) -> PreflightReport 
 
     // Case identities: exactly the two fixed Oreans cases, each once.
     let mut cases = Vec::with_capacity(request.cases.len());
-    for (manifest_path, input_path, output_path) in &request.cases {
+    for (idx, (manifest_path, input_path, output_path)) in request.cases.iter().enumerate() {
         let verdict = check_case_identity(manifest_path, input_path, Some(output_path));
         if !verdict.ok {
             reasons.extend(verdict.reasons.clone());
@@ -934,6 +986,18 @@ pub fn run_offline_preflight(request: &PreflightRequest<'_>) -> PreflightReport 
                 output_path.display(),
                 request.output_dir.display()
             ));
+        }
+        // P6.3.3: the per-case runner-config digest (from the v4 envelope,
+        // independently recomputed by the verifier). A missing expected
+        // digest when one is required is a drift/contract failure.
+        let case_digest = request.case_config_digests.get(idx).cloned().flatten();
+        if let Some(d) = &case_digest {
+            if !is_64_hex(d) {
+                reasons.push(format!(
+                    "case {:?} runner_config_digest is malformed",
+                    verdict.identity.as_ref().map(|i| i.case_id.as_str())
+                ));
+            }
         }
         cases.push(CasePreflight {
             case_id: verdict
@@ -947,6 +1011,7 @@ pub fn run_offline_preflight(request: &PreflightRequest<'_>) -> PreflightReport 
             protected_input_path: canonicalize_loose(input_path).display().to_string(),
             manifest_path: canonicalize_loose(manifest_path).display().to_string(),
             candidate_output: output_canonical_case.display().to_string(),
+            runner_config_digest: case_digest.map(|d| d.to_lowercase()),
         });
     }
 
@@ -1029,7 +1094,14 @@ pub fn run_offline_preflight(request: &PreflightRequest<'_>) -> PreflightReport 
         schema_version: PREFLIGHT_REPORT_SCHEMA_VERSION.to_string(),
         status,
         reasons,
-        runner_config_digest: config_digest,
+        // P6.3.3: the v4 path records the sealed case-set digest (the whole
+        // envelope identity); the legacy single-config path records the
+        // single config digest.
+        runner_config_digest: if request.case_set_digest.is_empty() {
+            config_digest
+        } else {
+            request.case_set_digest.to_lowercase()
+        },
         head_revision: if worktree.head_revision.is_empty() {
             None
         } else {
