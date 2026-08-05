@@ -19,6 +19,8 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
 /// Stable, order-independent buckets for one v8 gate sample's failures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TaxonomyBucket {
@@ -157,6 +159,114 @@ pub fn total(counts: &BTreeMap<TaxonomyBucket, usize>) -> usize {
     counts.values().sum()
 }
 
+/// Stable per-sample classification of a v8 two-sample gate report.
+///
+/// This is the P8.1-C reproducible taxonomy output. It is derived from the
+/// gate report's per-sample `failures` lists only; it never re-derives a gate
+/// decision, never accesses D:/MidaVault, and never opens a real sample. The
+/// input SHA-256 lets an audit reproduce the exact classification from the
+/// same bytes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GateReportClassification {
+    /// SHA-256 of the exact input report bytes (64 lowercase hex chars).
+    pub input_sha256: String,
+    /// Total failures across all samples.
+    pub total_failures: usize,
+    /// Per-sample bucket counts keyed by case_id.
+    pub samples: Vec<SampleClassification>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SampleClassification {
+    pub case_id: String,
+    /// Total failures for this sample.
+    pub total_failures: usize,
+    /// Bucket -> count, stable BTreeMap order.
+    pub buckets: BTreeMap<String, usize>,
+    /// Number of failures that fell into `Other` (always surfaced, never
+    /// dropped).
+    pub other_count: usize,
+    /// The raw text of every `Other` failure, in original report order.
+    pub other_failures: Vec<String>,
+    /// Number of non-`Other` failures that did not reach a known bucket. This
+    /// is always 0 here; `other` is the only catch-all.
+    pub unclassified: usize,
+}
+
+/// Classify an already-serialized v8 two-sample gate report.
+///
+/// The caller provides the exact report bytes so the input SHA-256 is bound to
+/// the same bytes the classification was derived from. The report is parsed
+/// with a lean schema that mirrors the `failures` and `case_id` fields of
+/// [`crate::OreansTwoSampleGateReport`] — the only fields classification reads
+/// — so a real gate report (which carries many additional evidence fields)
+/// classifies without re-deriving any gate decision.
+pub fn classify_gate_report(report_bytes: &[u8]) -> Result<GateReportClassification, String> {
+    let input_sha256 = crate::sha256_hex(report_bytes);
+    #[derive(Deserialize)]
+    struct LeanSample {
+        case_id: String,
+        #[serde(default)]
+        failures: Vec<String>,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct LeanReport {
+        #[allow(dead_code)]
+        schema_version: String,
+        #[allow(dead_code)]
+        gate_id: String,
+        #[serde(default)]
+        #[allow(dead_code)]
+        required_cases: Vec<String>,
+        #[serde(default)]
+        #[allow(dead_code)]
+        excluded_cases: Vec<String>,
+        #[serde(default)]
+        samples: Vec<LeanSample>,
+        #[serde(default)]
+        #[allow(dead_code)]
+        final_verdict: String,
+    }
+    let report: LeanReport = serde_json::from_slice(report_bytes).map_err(|error| {
+        format!("report is not a valid Oreans two-sample gate report: {error}")
+    })?;
+    let mut samples = Vec::new();
+    let mut total_failures = 0usize;
+    for sample in &report.samples {
+        let counts = summarize(&sample.failures);
+        let sample_total = total(&counts);
+        total_failures = total_failures.saturating_add(sample_total);
+        let other_count = counts.get(&TaxonomyBucket::Other).copied().unwrap_or(0);
+        let other_failures: Vec<String> = sample
+            .failures
+            .iter()
+            .filter(|f| classify(f) == TaxonomyBucket::Other)
+            .cloned()
+            .collect();
+        let buckets: BTreeMap<String, usize> = counts
+            .into_iter()
+            .filter(|(bucket, _)| *bucket != TaxonomyBucket::Other)
+            .map(|(bucket, count)| (bucket.label().to_string(), count))
+            .collect();
+        samples.push(SampleClassification {
+            case_id: sample.case_id.clone(),
+            total_failures: sample_total,
+            other_count,
+            other_failures,
+            unclassified: 0,
+            buckets,
+        });
+    }
+    Ok(GateReportClassification {
+        input_sha256,
+        total_failures,
+        samples,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,6 +398,138 @@ mod tests {
         assert_eq!(
             classify("prerequisite failed: structural evidence: artifact_sha256 is not a lowercase 64-hex SHA-256"),
             TaxonomyBucket::PrerequisiteSurvivalStructural
+        );
+    }
+
+    // --- P8.1-C: reproducible gate-report classification ---
+
+    /// Build a minimal v8 gate report JSON with the given per-sample failures.
+    fn report_json(case_failures: &[(&str, Vec<&str>)]) -> serde_json::Value {
+        let samples: Vec<serde_json::Value> = case_failures
+            .iter()
+            .map(|(case_id, failures)| {
+                serde_json::json!({
+                    "case_id": case_id,
+                    "failures": failures,
+                    "prerequisites_pass": false,
+                    "passed": false,
+                    "final_behavior_verdict": "NotRun",
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "schema_version": "mida.oreans-two-sample-gate/v8",
+            "gate_id": "oreans_two_sample_perfect_unpack",
+            "required_cases": ["origin_macro", "lunlun_software"],
+            "excluded_cases": [],
+            "samples": samples,
+            "final_verdict": "open"
+        })
+    }
+
+    #[test]
+    fn classify_gate_report_produces_stable_counts_and_input_hash() {
+        let json = report_json(&[(
+            "origin_macro",
+            vec![
+                "prerequisite failed: structured OEP evidence: VA is missing",
+                "prerequisite failed: structured IAT evidence: structured IAT report: Unresolved status at slot 1",
+                "prerequisite failed: structured section rebuild evidence: duplicate section name",
+                "a brand-new gate message not yet in the taxonomy",
+            ],
+        )]);
+        let bytes = serde_json::to_vec(&json).unwrap();
+        let report = classify_gate_report(&bytes).expect("classify");
+        assert_eq!(report.total_failures, 4);
+        assert_eq!(report.samples.len(), 1);
+        let sample = &report.samples[0];
+        assert_eq!(sample.case_id, "origin_macro");
+        assert_eq!(sample.total_failures, 4);
+        assert_eq!(sample.buckets["oep"], 1);
+        assert_eq!(sample.buckets["iat-unresolved"], 1);
+        assert_eq!(sample.buckets["section-rebuild"], 1);
+        assert_eq!(sample.other_count, 1);
+        assert_eq!(sample.other_failures.len(), 1);
+        assert!(sample.other_failures[0].contains("brand-new"));
+        // Input SHA-256 is 64 lowercase hex and bound to the same bytes.
+        assert_eq!(report.input_sha256.len(), 64);
+        assert!(report.input_sha256.chars().all(|c| c.is_ascii_hexdigit()));
+        let expected_hash = crate::sha256_hex(&bytes);
+        assert_eq!(report.input_sha256, expected_hash);
+    }
+
+    #[test]
+    fn classify_gate_report_handles_multiple_samples_and_unknown() {
+        let json = report_json(&[
+            (
+                "origin_macro",
+                vec![
+                    "prerequisite failed: structured TLS evidence: callback ordering is not preserved",
+                    "unknown text one",
+                ],
+            ),
+            (
+                "lunlun_software",
+                vec![
+                    "prerequisite failed: structured relocation evidence: final relocation DYNAMIC_BASE is not set",
+                    "unknown text two",
+                    "unknown text three",
+                ],
+            ),
+        ]);
+        let bytes = serde_json::to_vec(&json).unwrap();
+        let report = classify_gate_report(&bytes).expect("classify");
+        assert_eq!(report.total_failures, 5);
+        assert_eq!(report.samples.len(), 2);
+        let origin = &report.samples[0];
+        assert_eq!(origin.buckets["tls"], 1);
+        assert_eq!(origin.other_count, 1);
+        let lunlun = &report.samples[1];
+        assert_eq!(lunlun.buckets["relocation"], 1);
+        assert_eq!(lunlun.other_count, 2);
+        assert_eq!(lunlun.other_failures.len(), 2);
+        // `unknown` buckets are never silently folded; Other carries the raw
+        // text and is always surfaced in the output.
+        assert!(!report.samples.iter().all(|s| s.other_count == 0));
+    }
+
+    #[test]
+    fn classify_gate_report_rejects_non_gate_json() {
+        assert!(classify_gate_report(b"not json").is_err());
+        assert!(
+            classify_gate_report(br#"{"hello": 1}"#).is_err(),
+            "unknown schema must be rejected"
+        );
+    }
+
+    #[test]
+    fn classify_gate_report_empty_failures_yield_zero_buckets() {
+        let json = report_json(&[("origin_macro", vec![]), ("lunlun_software", vec![])]);
+        let bytes = serde_json::to_vec(&json).unwrap();
+        let report = classify_gate_report(&bytes).expect("classify");
+        assert_eq!(report.total_failures, 0);
+        assert_eq!(report.samples.len(), 2);
+        for sample in &report.samples {
+            assert_eq!(sample.total_failures, 0);
+            assert!(sample.buckets.is_empty());
+            assert_eq!(sample.other_count, 0);
+            assert!(sample.other_failures.is_empty());
+        }
+    }
+
+    #[test]
+    fn classify_gate_report_other_raw_text_preserves_order() {
+        let json = report_json(&[(
+            "origin_macro",
+            vec!["zzz first", "aaa second", "known failure: structured OEP evidence: VA is missing"],
+        )]);
+        let bytes = serde_json::to_vec(&json).unwrap();
+        let report = classify_gate_report(&bytes).expect("classify");
+        let sample = &report.samples[0];
+        // Other text keeps original report order (not sorted).
+        assert_eq!(
+            sample.other_failures,
+            vec!["zzz first", "aaa second"]
         );
     }
 }

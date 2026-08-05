@@ -75,12 +75,16 @@ fn run() -> Result<i32, String> {
             args.remove(0);
             cmd_oreans_two_sample_gate(&args)
         }
+        "classify-gate-report" => {
+            args.remove(0);
+            cmd_classify_gate_report(&args)
+        }
         "preflight" => {
             args.remove(0);
             cmd_preflight(&args)
         }
         other => Err(format!(
-            "unknown command '{other}'. Use: check-static | check-with-behavior | oreans-pe-evidence | oreans-two-sample-gate | preflight"
+            "unknown command '{other}'. Use: check-static | check-with-behavior | oreans-pe-evidence | oreans-two-sample-gate | classify-gate-report | preflight"
         )),
     }
 }
@@ -95,6 +99,7 @@ Usage:
   mida-acceptance check-with-behavior <candidate> --behavior-evidence <path> [options]
   mida-acceptance oreans-pe-evidence <candidate> [options]
   mida-acceptance oreans-two-sample-gate <observations.json> [options]
+  mida-acceptance classify-gate-report <bundle_gate_report.json> [--report PATH]
   mida-acceptance preflight --envelope <path> --output-dir <dir> --cli-binary <path>
                             --repo-root <path> --toolchain-pin <path>
                             --expected-toolchain <ver> --case <manifest> <input> <output>
@@ -339,6 +344,73 @@ fn cmd_oreans_two_sample_gate(args: &[String]) -> Result<i32, String> {
         OreansGateVerdict::Closed => 0,
         OreansGateVerdict::Open => 2,
     })
+}
+
+/// `mida-acceptance classify-gate-report <bundle_gate_report.json>`:
+/// reproducible, read-only taxonomy classification of a v8 two-sample gate
+/// report's per-sample failures.
+///
+/// The input report is never modified and must be named explicitly. The output
+/// is a stable JSON document binding the input SHA-256 to the per-bucket counts
+/// so an audit can reproduce the classification from the same bytes. It never
+/// opens a real sample and never touches D:/MidaVault. Exit 0 on success, 1 on
+/// I/O or schema error.
+fn cmd_classify_gate_report(args: &[String]) -> Result<i32, String> {
+    if args.is_empty() {
+        return Err(
+            "Usage: mida-acceptance classify-gate-report <bundle_gate_report.json> [--report PATH]"
+                .into(),
+        );
+    }
+    let mut report_path: Option<PathBuf> = None;
+    let mut input_path: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--report" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("missing value after --report".into());
+                }
+                report_path = Some(PathBuf::from(&args[i]));
+            }
+            flag if flag.starts_with("--report=") => {
+                report_path = Some(PathBuf::from(&flag["--report=".len()..]));
+            }
+            "-h" | "--help" => {
+                print_help();
+                return Ok(0);
+            }
+            other if other.starts_with('-') => {
+                return Err(format!("unknown option '{other}'"));
+            }
+            other => {
+                if input_path.is_some() {
+                    return Err(format!("unexpected argument '{other}'"));
+                }
+                input_path = Some(PathBuf::from(other));
+            }
+        }
+        i += 1;
+    }
+    let input_path = input_path.ok_or_else(|| "missing <bundle_gate_report.json> path".to_string())?;
+    let (input_bytes, input_file) = read_input(&input_path, "gate report")?;
+    let classification = mida_acceptance::failure_taxonomy::classify_gate_report(&input_bytes)
+        .map_err(|error| format!("classify-gate-report: {error}"))?;
+    let mut json = serde_json::to_string_pretty(&classification)
+        .map_err(|error| format!("failed to serialize classification: {error}"))?;
+    println!("{json}");
+
+    if let Some(report_path) = report_path {
+        json.push('\n');
+        write_report_for_input(
+            &report_path,
+            json.as_bytes(),
+            "gate report",
+            (&input_path, &input_file),
+        )?;
+    }
+    Ok(0)
 }
 
 fn cmd_check_static(args: &[String]) -> Result<i32, String> {
