@@ -15,6 +15,7 @@ pub mod bundle_gate;
 pub mod check;
 pub mod envelope;
 pub mod evidence_bundle;
+pub mod failure_taxonomy;
 pub mod gates;
 pub mod identity;
 pub mod oracle;
