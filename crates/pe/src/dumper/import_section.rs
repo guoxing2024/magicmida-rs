@@ -922,7 +922,12 @@ mod tests {
         let (_, final_imports) = emit_and_read_final(&builder);
         let pairs: Vec<(String, String)> = final_imports
             .iter()
-            .map(|i| (i.module_name.clone(), i.function_name.clone().unwrap_or_default()))
+            .map(|i| {
+                (
+                    i.module_name.clone(),
+                    i.function_name.clone().unwrap_or_default(),
+                )
+            })
             .collect();
         assert!(
             pairs.contains(&("kernel32.dll".into(), "KApi".into())),

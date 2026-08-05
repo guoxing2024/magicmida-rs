@@ -1213,10 +1213,7 @@ mod tests {
         let names: Vec<&str> = pe.sections.iter().map(|s| s.name.as_str()).collect();
         let mut set = std::collections::HashSet::new();
         for name in &names {
-            assert!(
-                name.len() <= 8,
-                "section name {name:?} exceeds 8 bytes"
-            );
+            assert!(name.len() <= 8, "section name {name:?} exceeds 8 bytes");
             assert!(
                 set.insert(name.to_string()),
                 "duplicate section name {name:?} emitted"
@@ -1289,11 +1286,8 @@ mod tests {
         plan.entry_point_rva = 0x1000;
         plan.imports = Some(imports);
         // A duplicate content section name to force the dedup pass.
-        plan.sections.push(PlannedSection::new(
-            ".text",
-            0x4000_0040,
-            vec![0xAA, 0xBB],
-        ));
+        plan.sections
+            .push(PlannedSection::new(".text", 0x4000_0040, vec![0xAA, 0xBB]));
         plan.relocations = vec![(0x1000, 10)];
         plan.prefer_aslr = true;
 
@@ -1314,12 +1308,10 @@ mod tests {
         let import_dir = pe.nt_headers.optional_header.data_directory[DIR_IMPORT];
         assert_ne!(import_dir.virtual_address, 0);
         assert!(
-            pe.sections
-                .iter()
-                .any(|s| s.name.starts_with(".idata")
-                    && s.virtual_address <= import_dir.virtual_address
-                    && import_dir.virtual_address + import_dir.size
-                        <= s.virtual_address + s.virtual_size),
+            pe.sections.iter().any(|s| s.name.starts_with(".idata")
+                && s.virtual_address <= import_dir.virtual_address
+                && import_dir.virtual_address + import_dir.size
+                    <= s.virtual_address + s.virtual_size),
             "import directory must still point at its section"
         );
 
@@ -1327,9 +1319,9 @@ mod tests {
         let entry = pe.nt_headers.optional_header.address_of_entry_point;
         assert_eq!(entry, 0x1000);
         assert!(
-            pe.sections
-                .iter()
-                .any(|s| s.name == ".text" && s.virtual_address <= entry && entry < s.virtual_address + s.virtual_size),
+            pe.sections.iter().any(|s| s.name == ".text"
+                && s.virtual_address <= entry
+                && entry < s.virtual_address + s.virtual_size),
             "entry RVA must stay in the original .text section"
         );
 
@@ -1348,16 +1340,19 @@ mod tests {
         );
 
         // Absent directories use the canonical zero encoding.
-        for i in [DIR_RESOURCE, DIR_SECURITY, DIR_DEBUG, DIR_LOAD_CONFIG, DIR_EXCEPTION] {
+        for i in [
+            DIR_RESOURCE,
+            DIR_SECURITY,
+            DIR_DEBUG,
+            DIR_LOAD_CONFIG,
+            DIR_EXCEPTION,
+        ] {
             let dd = pe.nt_headers.optional_header.data_directory[i];
             assert_eq!(
                 dd.virtual_address, 0,
                 "absent directory {i} virtual_address must be zero"
             );
-            assert_eq!(
-                dd.size, 0,
-                "absent directory {i} size must be zero"
-            );
+            assert_eq!(dd.size, 0, "absent directory {i} size must be zero");
         }
     }
 
@@ -1368,16 +1363,10 @@ mod tests {
         let mut plan = RebuildPlan::pe32_plus();
         plan.sections
             .push(PlannedSection::new(".text", 0x6000_0020, vec![0xC3]));
-        plan.sections.push(PlannedSection::new(
-            "ABCDEFGH",
-            0x4000_0040,
-            vec![1],
-        ));
-        plan.sections.push(PlannedSection::new(
-            "ABCDEFGHI",
-            0x4000_0040,
-            vec![2],
-        ));
+        plan.sections
+            .push(PlannedSection::new("ABCDEFGH", 0x4000_0040, vec![1]));
+        plan.sections
+            .push(PlannedSection::new("ABCDEFGHI", 0x4000_0040, vec![2]));
         plan.entry_point_rva = 0x1000;
         let image = rebuild_pe_image(&plan).expect("rebuild");
         let pe = PeHeader::from_bytes(&image).expect("reparse");
@@ -1386,7 +1375,10 @@ mod tests {
         // First keeps ABCDEFGH (truncated to 8); the 9-char one must differ.
         assert_eq!(names[1], "ABCDEFGH");
         assert_ne!(names[2], "ABCDEFGH", "9-char name must not collide");
-        assert!(!names.contains(&"ABCDEFGHI".to_string().as_str()), "over-8-char name must be shortened");
+        assert!(
+            !names.contains(&"ABCDEFGHI".to_string().as_str()),
+            "over-8-char name must be shortened"
+        );
     }
 
     #[test]
@@ -1395,22 +1387,13 @@ mod tests {
         let mut plan = RebuildPlan::pe32_plus();
         plan.sections
             .push(PlannedSection::new(".text", 0x6000_0020, vec![0xC3]));
-        plan.sections.push(PlannedSection::new(
-            ".rdata",
-            0x4000_0040,
-            vec![1],
-        ));
-        plan.sections.push(PlannedSection::new(
-            ".rdata",
-            0x4000_0040,
-            vec![2],
-        ));
+        plan.sections
+            .push(PlannedSection::new(".rdata", 0x4000_0040, vec![1]));
+        plan.sections
+            .push(PlannedSection::new(".rdata", 0x4000_0040, vec![2]));
         // A real section literally named .rdat001 (the suffix the dup would pick).
-        plan.sections.push(PlannedSection::new(
-            ".rdat001",
-            0x4000_0040,
-            vec![3],
-        ));
+        plan.sections
+            .push(PlannedSection::new(".rdat001", 0x4000_0040, vec![3]));
         plan.entry_point_rva = 0x1000;
         let image = rebuild_pe_image(&plan).expect("rebuild");
         let pe = PeHeader::from_bytes(&image).expect("reparse");
@@ -1429,11 +1412,8 @@ mod tests {
         plan.sections
             .push(PlannedSection::new(".text", 0x6000_0020, vec![0xC3]));
         for _ in 0..12 {
-            plan.sections.push(PlannedSection::new(
-                ".rdata",
-                0x4000_0040,
-                vec![1],
-            ));
+            plan.sections
+                .push(PlannedSection::new(".rdata", 0x4000_0040, vec![1]));
         }
         plan.entry_point_rva = 0x1000;
         let image = rebuild_pe_image(&plan).expect("rebuild");
@@ -1453,16 +1433,10 @@ mod tests {
         let mut plan = RebuildPlan::pe32_plus();
         plan.sections
             .push(PlannedSection::new(".text", 0x6000_0020, vec![0xC3]));
-        plan.sections.push(PlannedSection::new(
-            "",
-            0x4000_0040,
-            vec![1],
-        ));
-        plan.sections.push(PlannedSection::new(
-            "",
-            0x4000_0040,
-            vec![2],
-        ));
+        plan.sections
+            .push(PlannedSection::new("", 0x4000_0040, vec![1]));
+        plan.sections
+            .push(PlannedSection::new("", 0x4000_0040, vec![2]));
         plan.entry_point_rva = 0x1000;
         let image = rebuild_pe_image(&plan).expect("rebuild");
         let pe = PeHeader::from_bytes(&image).expect("reparse");
@@ -1482,11 +1456,8 @@ mod tests {
             plan.sections
                 .push(PlannedSection::new(".text", 0x6000_0020, vec![0xC3]));
             for _ in 0..4 {
-                plan.sections.push(PlannedSection::new(
-                    ".data",
-                    0xC000_0040,
-                    vec![1],
-                ));
+                plan.sections
+                    .push(PlannedSection::new(".data", 0xC000_0040, vec![1]));
             }
             plan.entry_point_rva = 0x1000;
             let image = rebuild_pe_image(&plan).expect("rebuild");

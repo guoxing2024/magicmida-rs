@@ -1713,7 +1713,9 @@ fn validate_reason_counts(report: &OreansIatReportEvidence) -> Vec<String> {
     }
     // `unknown` and pending must never be silently accepted as a pass signal.
     if let Some(unknown) = recomputed.get("unknown") {
-        failures.push(format!("{unknown} slots have unresolved reason 'unknown' (fail-closed)"));
+        failures.push(format!(
+            "{unknown} slots have unresolved reason 'unknown' (fail-closed)"
+        ));
     }
     if pending != 0 {
         failures.push(format!(

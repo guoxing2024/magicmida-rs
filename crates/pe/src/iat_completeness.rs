@@ -199,10 +199,14 @@ impl IatRecoveryReport {
     /// output.  Slots with a missing reason are not folded into `unknown`;
     /// they are counted separately via [`Self::pending_live_confirmation`].
     #[must_use]
-    pub fn count_unresolved_by_reason(&self) -> std::collections::BTreeMap<IatUnresolvedReason, usize> {
+    pub fn count_unresolved_by_reason(
+        &self,
+    ) -> std::collections::BTreeMap<IatUnresolvedReason, usize> {
         let mut counts = std::collections::BTreeMap::new();
         for slot in &self.slots {
-            if slot.status == IatSlotStatus::Resolved || slot.status == IatSlotStatus::ZeroTerminator {
+            if slot.status == IatSlotStatus::Resolved
+                || slot.status == IatSlotStatus::ZeroTerminator
+            {
                 continue;
             }
             if let Some(reason) = slot.unresolved_reason {
@@ -523,7 +527,11 @@ mod tests {
 
     // --- P8.1-A: deterministic unresolved reason classification ---
 
-    fn slot_with_reason(index: usize, status: IatSlotStatus, reason: Option<IatUnresolvedReason>) -> IatSlotReport {
+    fn slot_with_reason(
+        index: usize,
+        status: IatSlotStatus,
+        reason: Option<IatUnresolvedReason>,
+    ) -> IatSlotReport {
         let mut s = slot(index, status);
         s.unresolved_reason = reason;
         s
@@ -536,7 +544,10 @@ mod tests {
             (IatUnresolvedReason::ShortRead, "short_read"),
             (IatUnresolvedReason::InvalidModule, "invalid_module"),
             (IatUnresolvedReason::ModuleNotFound, "module_not_found"),
-            (IatUnresolvedReason::AddressNotExported, "address_not_exported"),
+            (
+                IatUnresolvedReason::AddressNotExported,
+                "address_not_exported",
+            ),
             (IatUnresolvedReason::NameResolution, "name_resolution"),
             (IatUnresolvedReason::OrdinalResolution, "ordinal_resolution"),
             (IatUnresolvedReason::Stale, "stale"),
@@ -573,9 +584,21 @@ mod tests {
         let mut report = IatRecoveryReport::new(40, 40, 8);
         report.slots = vec![
             slot_with_reason(0, IatSlotStatus::Resolved, None),
-            slot_with_reason(1, IatSlotStatus::Unresolved, Some(IatUnresolvedReason::ModuleNotFound)),
-            slot_with_reason(2, IatSlotStatus::Unresolved, Some(IatUnresolvedReason::ModuleNotFound)),
-            slot_with_reason(3, IatSlotStatus::Unresolved, Some(IatUnresolvedReason::Unknown)),
+            slot_with_reason(
+                1,
+                IatSlotStatus::Unresolved,
+                Some(IatUnresolvedReason::ModuleNotFound),
+            ),
+            slot_with_reason(
+                2,
+                IatSlotStatus::Unresolved,
+                Some(IatUnresolvedReason::ModuleNotFound),
+            ),
+            slot_with_reason(
+                3,
+                IatSlotStatus::Unresolved,
+                Some(IatUnresolvedReason::Unknown),
+            ),
             slot_with_reason(4, IatSlotStatus::ZeroTerminator, None),
         ];
         let counts = report.count_unresolved_by_reason();
@@ -596,9 +619,14 @@ mod tests {
         ];
         assert_eq!(report.pending_live_confirmation(), 2);
         assert!(report.count_unresolved_by_reason().is_empty());
-        assert!(!report.is_complete(), "pending live confirmation must fail closed");
         assert!(
-            report.failure_summary().contains("pending live confirmation"),
+            !report.is_complete(),
+            "pending live confirmation must fail closed"
+        );
+        assert!(
+            report
+                .failure_summary()
+                .contains("pending live confirmation"),
             "failure summary must name pending live confirmation, got: {}",
             report.failure_summary()
         );
@@ -615,7 +643,9 @@ mod tests {
             slot_with_reason(1, IatSlotStatus::Unresolved, None),
         ];
         assert_eq!(report.pending_live_confirmation(), 1);
-        assert!(!report.count_unresolved_by_reason().contains_key(&IatUnresolvedReason::Unknown));
+        assert!(!report
+            .count_unresolved_by_reason()
+            .contains_key(&IatUnresolvedReason::Unknown));
     }
 
     #[test]
@@ -647,10 +677,16 @@ mod tests {
             } else {
                 IatSlotStatus::Unresolved
             };
-            report.slots.push(slot_with_reason(i, status, Some(*reason)));
+            report
+                .slots
+                .push(slot_with_reason(i, status, Some(*reason)));
         }
         let counts = report.count_unresolved_by_reason();
-        assert_eq!(counts.len(), 11, "all eleven reason buckets must be present");
+        assert_eq!(
+            counts.len(),
+            11,
+            "all eleven reason buckets must be present"
+        );
         assert!(!report.is_complete(), "unresolved slots always fail closed");
     }
 }

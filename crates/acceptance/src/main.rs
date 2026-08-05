@@ -393,7 +393,8 @@ fn cmd_classify_gate_report(args: &[String]) -> Result<i32, String> {
         }
         i += 1;
     }
-    let input_path = input_path.ok_or_else(|| "missing <bundle_gate_report.json> path".to_string())?;
+    let input_path =
+        input_path.ok_or_else(|| "missing <bundle_gate_report.json> path".to_string())?;
     let (input_bytes, input_file) = read_input(&input_path, "gate report")?;
     let classification = mida_acceptance::failure_taxonomy::classify_gate_report(&input_bytes)
         .map_err(|error| format!("classify-gate-report: {error}"))?;

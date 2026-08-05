@@ -30,17 +30,17 @@ use mida_acceptance::oreans_gate::{
     OreansRelocationEvidence as GateRelocationEvidence, OREANS_OEP_EVIDENCE_SCHEMA_VERSION,
 };
 use mida_acceptance::{
-    build_oreans_pe_evidence, canonical_manifest_hash, canonical_members_hash, evaluate_bundle_gate,
-    BundleArtifactIdentity, BundleCompletionMarker, BundleInput, BundleMemberRef, OreansArtifactIdentity,
-    OreansEvidenceBundle, OreansFinalBehaviorVerdict, OreansIatEvidence, OreansIsolatedReplay,
-    OreansPrerequisites,
-    OreansSampleObservation, OreansSectionRebuildEvidence, OreansTlsEvidence, OreansGateVerdict,
+    build_oreans_pe_evidence, canonical_manifest_hash, canonical_members_hash,
+    evaluate_bundle_gate, BundleArtifactIdentity, BundleCompletionMarker, BundleInput,
+    BundleMemberRef, OreansArtifactIdentity, OreansEvidenceBundle, OreansFinalBehaviorVerdict,
+    OreansGateVerdict, OreansIatEvidence, OreansIsolatedReplay, OreansPrerequisites,
+    OreansSampleObservation, OreansSectionRebuildEvidence, OreansTlsEvidence,
     OREANS_EVIDENCE_BUNDLE_SCHEMA_VERSION, OREANS_IAT_EVIDENCE_SCHEMA_VERSION,
     OREANS_RELOCATION_EVIDENCE_SCHEMA_VERSION, OREANS_SECTION_REBUILD_EVIDENCE_SCHEMA_VERSION,
     OREANS_TLS_EVIDENCE_SCHEMA_VERSION, TRANSFORM_MANIFEST_SCHEMA_VERSION,
 };
 use mida_pe::import_table::{ImportTableBuilder, ImportThunk};
-use mida_pe::rebuild::{rebuild_pe_image, RebuildPlan, PlannedSection};
+use mida_pe::rebuild::{rebuild_pe_image, PlannedSection, RebuildPlan};
 use mida_pe::tls::TlsDirectoryBuilder;
 
 const ORIGIN_SHA: &str = "1af62999cf5be0b2f21abc39034c122a42aa46cfbfdb546faa184de37ac09ac7";
@@ -195,7 +195,10 @@ fn tls_evidence(
     pe: &mida_acceptance::OreansPeEvidence,
 ) -> OreansTlsEvidence {
     let image_base = pe.image_base;
-    let detail = pe.tls_detail.as_ref().expect("emitted candidate has TLS detail");
+    let detail = pe
+        .tls_detail
+        .as_ref()
+        .expect("emitted candidate has TLS detail");
     let raw = raw_offset_of(pe, ".tls").unwrap_or(0);
     OreansTlsEvidence {
         schema_version: OREANS_TLS_EVIDENCE_SCHEMA_VERSION.to_string(),
@@ -302,7 +305,10 @@ fn relocation_evidence(
     let image_base = pe.image_base;
     let runtime_base = image_base + 0x0100_0000;
     let normalized = image_base + 0x1234;
-    let reloc_detail = pe.relocation_detail.as_ref().expect("candidate has reloc detail");
+    let reloc_detail = pe
+        .relocation_detail
+        .as_ref()
+        .expect("candidate has reloc detail");
     let raw = raw_offset_of(pe, ".reloc").unwrap_or(0);
     GateRelocationEvidence {
         schema_version: OREANS_RELOCATION_EVIDENCE_SCHEMA_VERSION.to_string(),
@@ -441,8 +447,7 @@ fn section_rebuild_evidence(
             raw_offset: s.raw_offset,
             raw_size: s.raw_size,
             characteristics: s.characteristics,
-            virtual_end: u64::from(s.virtual_address)
-                + u64::from(s.virtual_size.max(s.raw_size)),
+            virtual_end: u64::from(s.virtual_address) + u64::from(s.virtual_size.max(s.raw_size)),
             raw_end: u64::from(s.raw_offset) + u64::from(s.raw_size),
         })
         .collect::<Vec<_>>();
@@ -629,7 +634,9 @@ fn observation_members(observation: &OreansSampleObservation) -> BTreeMap<String
     members
 }
 
-fn envelope(observation: &OreansSampleObservation) -> (OreansEvidenceBundle, BTreeMap<String, Vec<u8>>) {
+fn envelope(
+    observation: &OreansSampleObservation,
+) -> (OreansEvidenceBundle, BTreeMap<String, Vec<u8>>) {
     let files = observation_members(observation);
     let mut members: Vec<BundleMemberRef> = files
         .iter()
@@ -684,10 +691,18 @@ fn synthetic_pipeline_emits_bundle_and_gate_domains_pass() {
 
     // Independent bundle validator accepts the producer-assembled bundles.
     let verdict = mida_acceptance::validate_evidence_bundle(&origin_bundle, &origin_files);
-    assert!(verdict.valid, "origin bundle must be valid: {:?}", verdict.reasons);
+    assert!(
+        verdict.valid,
+        "origin bundle must be valid: {:?}",
+        verdict.reasons
+    );
     assert!(verdict.complete);
     let verdict = mida_acceptance::validate_evidence_bundle(&lunlun_bundle, &lunlun_files);
-    assert!(verdict.valid, "lunlun bundle must be valid: {:?}", verdict.reasons);
+    assert!(
+        verdict.valid,
+        "lunlun bundle must be valid: {:?}",
+        verdict.reasons
+    );
     assert!(verdict.complete);
 
     // v8 gate consumes both bundles and evaluates all domains.
@@ -699,9 +714,21 @@ fn synthetic_pipeline_emits_bundle_and_gate_domains_pass() {
 
     for sample in &report.gate.samples {
         // OEP / IAT / relocation / section-rebuild domains all pass.
-        assert!(sample.oep_evidence_pass, "OEP domain must pass for {}", sample.case_id);
-        assert!(sample.iat_evidence_pass, "IAT domain must pass for {}", sample.case_id);
-        assert!(sample.relocation_evidence_pass, "relocation domain must pass for {}", sample.case_id);
+        assert!(
+            sample.oep_evidence_pass,
+            "OEP domain must pass for {}",
+            sample.case_id
+        );
+        assert!(
+            sample.iat_evidence_pass,
+            "IAT domain must pass for {}",
+            sample.case_id
+        );
+        assert!(
+            sample.relocation_evidence_pass,
+            "relocation domain must pass for {}",
+            sample.case_id
+        );
         assert!(
             sample.section_rebuild_evidence_pass,
             "section-rebuild domain must pass for {}",
@@ -719,14 +746,21 @@ fn synthetic_pipeline_emits_bundle_and_gate_domains_pass() {
         );
 
         // Behavior / survival / structural / replay stay explicitly open/NotRun.
-        assert!(!sample.prerequisites_pass, "survival/structural stay open for {}", sample.case_id);
+        assert!(
+            !sample.prerequisites_pass,
+            "survival/structural stay open for {}",
+            sample.case_id
+        );
         assert_eq!(
             sample.final_behavior_verdict,
             OreansFinalBehaviorVerdict::NotRun,
             "behavior oracle stays NotRun for {}",
             sample.case_id
         );
-        assert!(sample.isolated_replay.attempts.is_empty(), "replay 10/10 stays open");
+        assert!(
+            sample.isolated_replay.attempts.is_empty(),
+            "replay 10/10 stays open"
+        );
     }
 
     // The gate overall stays open because behavior + replay are not in the
@@ -818,7 +852,10 @@ fn tampered_candidate_with_recomputed_hashes_is_rejected() {
         "tampered candidate with recomputed hashes must be rejected by the independent validator"
     );
     assert!(
-        verdict.reasons.iter().any(|r| r.contains("iat_evidence candidate")),
+        verdict
+            .reasons
+            .iter()
+            .any(|r| r.contains("iat_evidence candidate")),
         "rejection must name the stale sidecar identity, got: {:?}",
         verdict.reasons
     );

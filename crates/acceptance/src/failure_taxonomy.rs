@@ -230,9 +230,8 @@ pub fn classify_gate_report(report_bytes: &[u8]) -> Result<GateReportClassificat
         #[allow(dead_code)]
         final_verdict: String,
     }
-    let report: LeanReport = serde_json::from_slice(report_bytes).map_err(|error| {
-        format!("report is not a valid Oreans two-sample gate report: {error}")
-    })?;
+    let report: LeanReport = serde_json::from_slice(report_bytes)
+        .map_err(|error| format!("report is not a valid Oreans two-sample gate report: {error}"))?;
     let mut samples = Vec::new();
     let mut total_failures = 0usize;
     for sample in &report.samples {
@@ -521,15 +520,16 @@ mod tests {
     fn classify_gate_report_other_raw_text_preserves_order() {
         let json = report_json(&[(
             "origin_macro",
-            vec!["zzz first", "aaa second", "known failure: structured OEP evidence: VA is missing"],
+            vec![
+                "zzz first",
+                "aaa second",
+                "known failure: structured OEP evidence: VA is missing",
+            ],
         )]);
         let bytes = serde_json::to_vec(&json).unwrap();
         let report = classify_gate_report(&bytes).expect("classify");
         let sample = &report.samples[0];
         // Other text keeps original report order (not sorted).
-        assert_eq!(
-            sample.other_failures,
-            vec!["zzz first", "aaa second"]
-        );
+        assert_eq!(sample.other_failures, vec!["zzz first", "aaa second"]);
     }
 }

@@ -7,7 +7,9 @@ use tracing::{debug, info, warn};
 
 use crate::error::PeError;
 use crate::header::PeHeader;
-use crate::iat_completeness::{IatRecoveryReport, IatSlotReport, IatSlotStatus, IatUnresolvedReason};
+use crate::iat_completeness::{
+    IatRecoveryReport, IatSlotReport, IatSlotStatus, IatUnresolvedReason,
+};
 use crate::import_table::{iat_slot_size, ImportModule, ImportTableBuilder, ImportThunk};
 
 use super::helpers::{
