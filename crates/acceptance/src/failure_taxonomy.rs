@@ -211,30 +211,36 @@ pub fn classify_gate_report(report_bytes: &[u8]) -> Result<GateReportClassificat
         #[serde(default)]
         failures: Vec<String>,
     }
+    // The classifier reads only `samples`. A raw v8 two-sample gate report
+    // carries `samples` at the top level; a bundle-gate report
+    // (`mida.oreans-two-sample-bundle-gate/v1`) wraps it under `gate.samples`.
+    // Both are accepted so the P7-R2 bundle report classifies read-only.
     #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
     struct LeanReport {
         #[allow(dead_code)]
         schema_version: String,
-        #[allow(dead_code)]
-        gate_id: String,
-        #[serde(default)]
-        #[allow(dead_code)]
-        required_cases: Vec<String>,
-        #[serde(default)]
-        #[allow(dead_code)]
-        excluded_cases: Vec<String>,
         #[serde(default)]
         samples: Vec<LeanSample>,
         #[serde(default)]
-        #[allow(dead_code)]
-        final_verdict: String,
+        gate: Option<LeanGate>,
+    }
+    #[derive(Deserialize)]
+    struct LeanGate {
+        #[serde(default)]
+        samples: Vec<LeanSample>,
     }
     let report: LeanReport = serde_json::from_slice(report_bytes)
         .map_err(|error| format!("report is not a valid Oreans two-sample gate report: {error}"))?;
+    let lean_samples = if !report.samples.is_empty() {
+        &report.samples[..]
+    } else if let Some(gate) = &report.gate {
+        &gate.samples[..]
+    } else {
+        &[][..]
+    };
     let mut samples = Vec::new();
     let mut total_failures = 0usize;
-    for sample in &report.samples {
+    for sample in lean_samples {
         let counts = summarize(&sample.failures);
         let sample_total = total(&counts);
         total_failures = total_failures.saturating_add(sample_total);
@@ -531,5 +537,28 @@ mod tests {
         let sample = &report.samples[0];
         // Other text keeps original report order (not sorted).
         assert_eq!(sample.other_failures, vec!["zzz first", "aaa second"]);
+    }
+
+    #[test]
+    fn classify_gate_report_accepts_bundle_gate_shape() {
+        // P8.1.1-A: the real P7-R2 report is a bundle-gate report
+        // (mida.oreans-two-sample-bundle-gate/v1) whose samples live under
+        // `gate.samples`, not at the top level. The classifier must read them.
+        let inner = report_json(&[(
+            "origin_macro",
+            vec!["prerequisite failed: structured OEP evidence: VA is missing"],
+        )]);
+        let bundle = serde_json::json!({
+            "schema_version": "mida.oreans-two-sample-bundle-gate/v1",
+            "gate_id": "oreans_two_sample_bundle_gate",
+            "envelopes": [],
+            "gate": inner,
+        });
+        let bytes = serde_json::to_vec(&bundle).unwrap();
+        let report = classify_gate_report(&bytes).expect("classify bundle-gate shape");
+        assert_eq!(report.samples.len(), 1);
+        assert_eq!(report.samples[0].case_id, "origin_macro");
+        assert_eq!(report.samples[0].buckets["oep"], 1);
+        assert_eq!(report.samples[0].other_count, 0);
     }
 }
