@@ -300,7 +300,7 @@ sample fixture. All default tests use synthetic inputs; the D3 pure-rebuild
 distinction and the case-bound digest selection are proven by hermetic unit
 tests. Real-sample fixtures are reserved for an explicitly authorized
 separate live target and are never auto-detected. The
-`preflight_boundary` suite (14 tests) now includes subprocess attack tests that
+`preflight_boundary` suite (15 tests) now includes subprocess attack tests that
 invoke the real `mida-acceptance` binary on hand-constructed v4 envelopes:
 
 - valid v4 envelope positive control (keyed-identity check clean);
@@ -310,6 +310,69 @@ invoke the real `mida-acceptance` binary on hand-constructed v4 envelopes:
 - v3 / missing / duplicate / extra case -> rejected.
 
 ## Boundaries after P6.3.3.1
+
+- No real sample process was created; P7 is NOT authorized.
+- `validation_summary.json` remains `open`.
+- No claim of live, perfect, universal, or 10/10 behavior is made.
+
+# P6.3.3.2 Acceptance Verifier / Attestation Test Closure
+
+Status: implemented on `oreans/two-sample-mainline`.
+
+Scope: pure offline engineering. No real sample process was created; no
+`D:\MidaVault` sample path is read by the default workspace tests.
+
+## 1. Verifier replacement at launch (offline seam)
+
+The launch attestation only reaches the verifier-identity check AFTER a case
+is selected by the (real, locked) input identity. Because the default tests
+are hermetic, the already-selected-case context is constructed through the
+pure seam `verify_verifier_identity_bindings` (a crate-internal function
+shared with `attest_ready_before_launch`). It compares the envelope-pinned
+verifier (path + SHA-256 + source token) against the sibling the run would
+resolve to, and fails with a verifier-identity reason (`replacement` /
+`drift`) — never a generic "launch blocked". Unit + integration tests assert
+this reason explicitly.
+
+## 2. Positional digest residue removed
+
+`PreflightRequest.case_config_digests` was an index-aligned `Vec<Option<_>>`;
+a reordered envelope `case_configs` or a reordered `--case` vector could
+re-bind a per-case digest to the wrong case. It is now a
+`BTreeMap<case_id, digest>`, and `run_offline_preflight` looks up each case's
+digest by `case_id` (never by array position). The acceptance verifier builds
+the map from its keyed `envelope_by_case` map. A new attack test reorders the
+envelope `case_configs` (lunlun before origin, all digests re-sealed) and
+asserts the produced report keeps each per-case digest keyed to its own
+case_id.
+
+## 3. Distinct identity-swap attacks
+
+The three identity attacks are now genuinely distinct documents (each breaks
+the case_id <-> protected_input binding and is rejected by the acceptance
+subprocess itself with exit 2 and `does not match the locked manifest`):
+
+- case_id swap (configs + protected_input stay in their slots, labels swapped);
+- protected_input swap (case_id + configs stay, identities exchanged);
+- case_id + protected_input swap (both transposed).
+
+All per-case and case-set digests are recomputed honestly in every attack, so
+the rejection comes from the keyed-identity check — not from a synthetic-file
+identity mismatch.
+
+## 4. Case-specific policy binding
+
+The production pure-rebuild policy is resolved from the REAL protected-input
+bytes via `is_origin_macro_protected_input` (`crates/cli/src/origin_pure.rs`),
+never guessed from the case_id string. Unit tests prove:
+
+- an Origin-bound input resolves `pure_rebuild=true`, any other input `false`;
+- a config swapped between cases is rejected at the launch-attestation level
+  (`bind_actual_config_to_envelope` compares the ACTUAL config's recomputed
+  digest only against the selected case's digest) even when every envelope
+  digest is re-sealed.
+
+## Boundaries after P6.3.3.2
 
 - No real sample process was created; P7 is NOT authorized.
 - `validation_summary.json` remains `open`.

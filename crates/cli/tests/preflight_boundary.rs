@@ -803,8 +803,17 @@ const LUNLUN_SHA: &str = "8a0118d04e03752728999c845536c29215d2a626ac65845c22e3f1
 const LUNLUN_SIZE: u64 = 4_976_144;
 
 /// A synthetic (valid) runner config for a case, and its acceptance-computed
-/// digest.
+/// digest. `pure_rebuild` selects Origin (true) or legacy (false) policy so
+/// an attack can pair a case's config with either case_id independently.
 fn case_runner_config(case_id: &str) -> (mida_acceptance::RunnerConfig, String) {
+    case_runner_config_pure(case_id, case_id == "origin_macro")
+}
+
+/// Build a synthetic runner config with an explicit pure-rebuild policy.
+fn case_runner_config_pure(
+    _case_id: &str,
+    pure_rebuild: bool,
+) -> (mida_acceptance::RunnerConfig, String) {
     let mut cfg = mida_acceptance::RunnerConfig {
         tool_revision: "rev".to_string(),
         cli_binary_sha256: "a".repeat(64),
@@ -814,7 +823,7 @@ fn case_runner_config(case_id: &str) -> (mida_acceptance::RunnerConfig, String) 
         container_restore: "off".to_string(),
         shrink: true,
         data_sections: false,
-        pure_rebuild: case_id == "origin_macro",
+        pure_rebuild,
         capture_policy_digest: String::new(),
         iat_fix_strategy: "v3-trace".to_string(),
         timeout_secs: 120,
@@ -838,6 +847,23 @@ fn case_runner_config(case_id: &str) -> (mida_acceptance::RunnerConfig, String) 
 /// input identity, with a per-case digest computed from its config.
 fn case_entry_json(case_id: &str, sha: &str, size: u64) -> serde_json::Value {
     let (cfg, digest) = case_runner_config(case_id);
+    serde_json::json!({
+        "case_id": case_id,
+        "protected_input": { "sha256": sha, "size_bytes": size },
+        "runner_config": serde_json::to_value(&cfg).unwrap(),
+        "runner_config_digest": digest,
+    })
+}
+
+/// A case entry with an EXPLICIT pure-rebuild policy and explicit case_id,
+/// so an attack can decouple the config policy from the case_id label.
+fn case_entry_with_policy(
+    case_id: &str,
+    sha: &str,
+    size: u64,
+    pure_rebuild: bool,
+) -> serde_json::Value {
+    let (cfg, digest) = case_runner_config_pure(case_id, pure_rebuild);
     serde_json::json!({
         "case_id": case_id,
         "protected_input": { "sha256": sha, "size_bytes": size },
@@ -972,17 +998,26 @@ fn valid_v4_envelope_passes_keyed_identity_check() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// P6.3.3.1-B: swapping case_id (and re-sealing every digest honestly) must be
-/// rejected by the acceptance verifier's keyed identity check.
+/// P6.3.3.2-B: swapping ONLY the case_id labels (protected_input and config
+/// stay bound to the same slot, every per-case + case-set digest re-sealed
+/// honestly) must be rejected by the acceptance verifier's keyed identity
+/// check. The final envelope JSON genuinely differs from the honest baseline.
 #[test]
 fn case_id_swap_rejected_by_verifier() {
     let dir = temp_dir("cid_swap");
     let repo_root = scratch_repo(&dir);
-    // Swap case_id while keeping the correct protected-input binding per
-    // case: now case_id "origin_macro" is bound to the LUNLUN identity.
-    let origin_entry = case_entry_json("origin_macro", LUNLUN_SHA, LUNLUN_SIZE);
-    let lunlun_entry = case_entry_json("lunlun_software", ORIGIN_SHA, ORIGIN_SIZE);
-    let env = v4_envelope_json(vec![origin_entry, lunlun_entry]);
+    // Slot A keeps its ORIGIN identity + origin (pure=true) config, but is
+    // labeled lunlun_software; slot B keeps LUNLUN + lunlun config, labeled
+    // origin_macro. The case_id <-> protected_input binding is broken.
+    let env = v4_envelope_json(vec![
+        case_entry_with_policy("lunlun_software", ORIGIN_SHA, ORIGIN_SIZE, true),
+        case_entry_with_policy("origin_macro", LUNLUN_SHA, LUNLUN_SIZE, false),
+    ]);
+    assert_ne!(
+        env,
+        valid_v4_envelope_json(),
+        "case_id swap must produce distinct envelope JSON"
+    );
     let out = run_acceptance_on_envelope(&dir, &repo_root, &env);
     assert_eq!(
         out.status.code(),
@@ -993,22 +1028,29 @@ fn case_id_swap_rejected_by_verifier() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("does not match the locked manifest"),
-        "keyed-identity drift must be reported: {stderr}"
+        "keyed-identity drift must be reported by the verifier: {stderr}"
     );
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// P6.3.3.1-B: swapping protected_input (re-sealing every digest honestly)
-/// must be rejected by the verifier's keyed identity check.
+/// P6.3.3.2-B: swapping ONLY the protected_input identities (case_id labels
+/// and configs stay in their canonical slots, every digest re-sealed) must be
+/// rejected. The final JSON differs from the case_id-swap and the baseline.
 #[test]
 fn protected_input_swap_rejected_by_verifier() {
     let dir = temp_dir("pin_swap");
     let repo_root = scratch_repo(&dir);
-    // origin_macro bound to the LUNLUN protected identity, lunlun_software
-    // bound to the ORIGIN protected identity (case_id unchanged).
-    let origin_entry = case_entry_json("origin_macro", LUNLUN_SHA, LUNLUN_SIZE);
-    let lunlun_entry = case_entry_json("lunlun_software", ORIGIN_SHA, ORIGIN_SIZE);
-    let env = v4_envelope_json(vec![origin_entry, lunlun_entry]);
+    // case_id labels and configs stay; only the protected_input identities
+    // are exchanged between the two slots.
+    let env = v4_envelope_json(vec![
+        case_entry_with_policy("origin_macro", LUNLUN_SHA, LUNLUN_SIZE, true),
+        case_entry_with_policy("lunlun_software", ORIGIN_SHA, ORIGIN_SIZE, false),
+    ]);
+    assert_ne!(
+        env,
+        valid_v4_envelope_json(),
+        "protected_input swap must produce distinct envelope JSON"
+    );
     let out = run_acceptance_on_envelope(&dir, &repo_root, &env);
     assert_eq!(
         out.status.code(),
@@ -1019,22 +1061,34 @@ fn protected_input_swap_rejected_by_verifier() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("does not match the locked manifest"),
-        "keyed-identity drift must be reported: {stderr}"
+        "keyed-identity drift must be reported by the verifier: {stderr}"
     );
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// P6.3.3.1-B: swapping BOTH case_id AND protected_input (all hashes
-/// re-sealed) must still be rejected.
+/// P6.3.3.2-B: swapping BOTH the case_id labels AND the protected_input
+/// identities (the two entries are fully transposed; every per-case + case-set
+/// digest re-sealed honestly) must be rejected. `origin_macro` ends up bound
+/// to the LUNLUN identity and `lunlun_software` to the ORIGIN identity, so the
+/// keyed binding is broken. The final JSON differs from the case_id-only and
+/// protected_input-only swaps.
 #[test]
 fn case_id_and_protected_input_swap_rejected_by_verifier() {
     let dir = temp_dir("dual_swap");
     let repo_root = scratch_repo(&dir);
-    // Swap both the case_id AND the protected input, keeping the configs'
-    // per-case digest honest; the verifier's keyed binding must still reject.
-    let origin_entry = case_entry_json("origin_macro", LUNLUN_SHA, LUNLUN_SIZE);
-    let lunlun_entry = case_entry_json("lunlun_software", ORIGIN_SHA, ORIGIN_SIZE);
-    let env = v4_envelope_json(vec![origin_entry, lunlun_entry]);
+    // Transpose BOTH the case_id labels and the protected_input identities:
+    // origin_macro is now bound to the LUNLUN identity (with the lunlun
+    // config), lunlun_software to the ORIGIN identity (with the origin
+    // config).
+    let env = v4_envelope_json(vec![
+        case_entry_with_policy("lunlun_software", ORIGIN_SHA, ORIGIN_SIZE, false),
+        case_entry_with_policy("origin_macro", LUNLUN_SHA, LUNLUN_SIZE, true),
+    ]);
+    assert_ne!(
+        env,
+        valid_v4_envelope_json(),
+        "dual swap must produce distinct envelope JSON"
+    );
     let out = run_acceptance_on_envelope(&dir, &repo_root, &env);
     assert_eq!(
         out.status.code(),
@@ -1045,7 +1099,7 @@ fn case_id_and_protected_input_swap_rejected_by_verifier() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("does not match the locked manifest"),
-        "keyed-identity drift must be reported: {stderr}"
+        "keyed-identity drift must be reported by the verifier: {stderr}"
     );
     let _ = fs::remove_dir_all(&dir);
 }
@@ -1077,7 +1131,71 @@ fn v3_envelope_rejected_by_verifier() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// P6.3.3.1-B: missing, duplicate, and extra case configs are all rejected.
+/// P6.3.3.2-B: reordering the envelope's `case_configs` (lunlun before
+/// origin, every per-case + case-set digest re-sealed honestly) must NOT
+/// re-bind any per-case digest to the wrong case_id. The verifier keys each
+/// digest by case_id (never by array position), so the produced report must
+/// carry the CORRECT per-case digest for each case_id. The only NotReady here
+/// is the synthetic-file identity mismatch.
+#[test]
+fn case_configs_order_swap_does_not_rebind_per_case_digests() {
+    let dir = temp_dir("order_swap");
+    let repo_root = scratch_repo(&dir);
+    let env = v4_envelope_json(vec![
+        case_entry_with_policy("lunlun_software", LUNLUN_SHA, LUNLUN_SIZE, false),
+        case_entry_with_policy("origin_macro", ORIGIN_SHA, ORIGIN_SIZE, true),
+    ]);
+    assert_ne!(
+        env,
+        valid_v4_envelope_json(),
+        "a reordered envelope is still a distinct document"
+    );
+    let out = run_acceptance_on_envelope(&dir, &repo_root, &env);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "reordered envelope + synthetic files -> NotReady (identity): {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("does not match the locked manifest"),
+        "no keyed-identity drift for a reordered (honestly re-sealed) envelope: {stderr}"
+    );
+
+    // The produced report must key each per-case digest by its own case_id —
+    // NOT by array position. The origin entry is now index 1, so if the
+    // verifier bound by position the origin case would carry the lunlun
+    // digest.
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.join("preflight.json")).unwrap()).unwrap();
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.join("runner-config-envelope.json")).unwrap())
+            .unwrap();
+    for case in report["cases"].as_array().unwrap() {
+        let case_id = case["case_id"].as_str().unwrap();
+        let expected = envelope["case_configs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["case_id"].as_str() == Some(case_id))
+            .unwrap()["runner_config_digest"]
+            .as_str()
+            .unwrap()
+            .to_lowercase();
+        assert_eq!(
+            case["runner_config_digest"]
+                .as_str()
+                .unwrap()
+                .to_lowercase(),
+            expected,
+            "case {case_id} per-case digest must be keyed by case_id, not position"
+        );
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// P6.3.3.2-B: missing, duplicate, and extra case configs are all rejected.
 #[test]
 fn missing_duplicate_extra_case_rejected_by_verifier() {
     let dir = temp_dir("case_set_attacks");

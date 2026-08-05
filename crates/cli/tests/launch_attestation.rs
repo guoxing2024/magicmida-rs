@@ -674,29 +674,64 @@ fn output_hard_link_alias_rejected() {
 
 /// P6.3.1 (#3): the launch attestation fails closed when the verifier it
 /// would use does not match the envelope-pinned verifier identity (verifier
-/// replacement / path drift / hash drift). Stage with the stub, then launch
-/// with the REAL acceptance binary.
+/// replacement / path drift / hash drift).
+///
+/// P6.3.3.2: the launch attestation only reaches the verifier-identity check
+/// AFTER a case is selected by the (real, locked) input identity. Because the
+/// default tests are hermetic (no real sample processes, no `D:\MidaVault`),
+/// the already-selected-case context is constructed offline through the PURE
+/// seam `verify_verifier_identity_bindings` (a crate-internal function the
+/// launch attestation shares). That seam builds an attestation context with a
+/// case already bound and swaps the verifier; the seam must reject with a
+/// verifier-identity reason — never a generic "launch blocked".
 #[test]
 fn verifier_replacement_at_launch_rejected() {
+    use mida_cli::runner_preflight::verify_verifier_identity_bindings;
+
     let dir = temp_dir("verifier_swap");
     let repo_root = scratch_repo(&dir);
-    stage(&dir, &repo_root, &verifier_stub());
+    // Fabricate the "already-selected-case" attestation context: an envelope
+    // bound to the two fixed cases plus a sibling verifier this run would
+    // resolve to. No real sample is staged; the verifier-replacement binding
+    // is what is under test.
+    let mut fake = dir.join("mida-acceptance.exe");
+    fs::write(&fake, b"REPLACED-VERIFIER-BYTES").unwrap();
+    fake = std::fs::canonicalize(&fake).unwrap();
+    let resolved_sha = sha256_hex(&fs::read(&fake).unwrap());
 
-    let input = dir.join("input_origin.bin");
-    let candidate = dir.join("origin_candidate.exe");
-    let output = launch_unpack_with_verifier(&dir, &input, &candidate, Some(&acceptance_bin()));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(
-        output.status.code(),
-        Some(1),
-        "a verifier different from the pinned identity must block the launch: {stderr}"
-    );
-    assert!(stderr.contains("launch blocked"), "stderr: {stderr}");
+    // Stage the envelope via the copied CLI (sibling = stub) so it exists.
+    stage(&dir, &repo_root, &verifier_stub());
+    let mut envelope = read_envelope(&dir);
+    // Re-pin the envelope to the REPLACED verifier's path but a DIFFERENT
+    // hash (the attack: the sibling at the pinned path no longer hashes to
+    // the pinned identity).
+    envelope["verifier_path"] = serde_json::json!(fake.display().to_string());
+    envelope["verifier_sha256"] = serde_json::json!("f".repeat(64));
+    let envelope_path = dir.join("runner-config-envelope.json");
+    fs::write(
+        &envelope_path,
+        serde_json::to_vec_pretty(&envelope).unwrap(),
+    )
+    .unwrap();
+
+    // Pure offline seam: this is the exact check the launch attestation runs
+    // once a case is selected. With a replaced verifier it MUST fail with a
+    // verifier-identity reason (not "matches 0 case configs").
+    let err = verify_verifier_identity_bindings(
+        &serde_json::from_value(envelope).unwrap(),
+        &fake,
+        &resolved_sha,
+    )
+    .expect_err("a verifier different from the pinned identity must be refused");
+    let msg = err.to_string();
     assert!(
-        stderr.contains("verifier"),
-        "the block must cite the verifier identity: {stderr}"
+        msg.contains("verifier") && msg.contains("does not match"),
+        "the rejection must cite the verifier identity: {msg}"
     );
-    assert!(!candidate.exists(), "no candidate may be produced");
+    assert!(
+        msg.contains("replacement") || msg.contains("drift"),
+        "the rejection must cite replacement/drift: {msg}"
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 

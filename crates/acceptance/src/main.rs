@@ -1268,8 +1268,11 @@ fn cmd_preflight(args: &[String]) -> Result<i32, String> {
     }
 
     // 2. Per-case keyed validation: protected identity <-> case_id <-> digest.
-    // The report carries per-case digests keyed by case_id.
-    let mut case_config_digests: Vec<Option<String>> = Vec::new();
+    // P6.3.3.2: per-case digests are collected KEYED by case_id (never as an
+    // index-aligned vector), so a reordered envelope `case_configs` or a
+    // reordered `--case` vector cannot re-bind a digest to the wrong case.
+    let mut case_config_digests: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
     for case in &envelope.case_configs {
         // The manifest-declared protected identity for this case_id.
         let locked = mida_acceptance::locked_manifest(&case.case_id);
@@ -1279,7 +1282,6 @@ fn cmd_preflight(args: &[String]) -> Result<i32, String> {
                     "envelope case {:?} is not one of the two fixed Oreans cases",
                     case.case_id
                 ));
-                case_config_digests.push(None);
                 continue;
             }
             Some(manifest) => {
@@ -1314,7 +1316,6 @@ fn cmd_preflight(args: &[String]) -> Result<i32, String> {
                 Ok(c) => c,
                 Err(e) => {
                     reasons.push(format!("case {} runner config rejected: {e}", case.case_id));
-                    case_config_digests.push(None);
                     continue;
                 }
             };
@@ -1338,7 +1339,10 @@ fn cmd_preflight(args: &[String]) -> Result<i32, String> {
                 case.case_id, envelope.tool_revision, parsed.tool_revision
             ));
         }
-        case_config_digests.push(Some(case.runner_config_digest.to_lowercase()));
+        case_config_digests.insert(
+            case.case_id.clone(),
+            case.runner_config_digest.to_lowercase(),
+        );
     }
 
     // 3. Recompute the sealed case-set digest in a FIXED canonical order

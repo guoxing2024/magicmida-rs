@@ -682,11 +682,13 @@ pub struct PreflightRequest<'a> {
     /// P6.3-B: repository root the worktree probe ran against (recorded in
     /// the report so the launch boundary re-runs the verifier identically).
     pub repo_root: &'a Path,
-    /// P6.3.3: per-case runner-config digest from the v4 envelope, aligned
-    /// by index with `cases`. `None` = no per-case digest supplied (legacy
-    /// single-config path). When supplied, the orchestrator records it in
-    /// each `CasePreflight.runner_config_digest`.
-    pub case_config_digests: Vec<Option<String>>,
+    /// P6.3.3.2: per-case runner-config digest from the v4 envelope, KEYED
+    /// by `case_id` (never aligned by array index — a reordered `--case`
+    /// vector must not re-bind a digest to a different case). When a case's
+    /// key is absent, the orchestrator records `None` (legacy single-config
+    /// path). When present, it is recorded in the matching
+    /// `CasePreflight.runner_config_digest`.
+    pub case_config_digests: std::collections::BTreeMap<String, String>,
     /// P6.3.3: the sealed case-set digest of the v4 envelope. When
     /// non-empty, it is recorded as `PreflightReport.runner_config_digest`.
     pub case_set_digest: String,
@@ -974,7 +976,7 @@ pub fn run_offline_preflight(request: &PreflightRequest<'_>) -> PreflightReport 
 
     // Case identities: exactly the two fixed Oreans cases, each once.
     let mut cases = Vec::with_capacity(request.cases.len());
-    for (idx, (manifest_path, input_path, output_path)) in request.cases.iter().enumerate() {
+    for (manifest_path, input_path, output_path) in request.cases.iter() {
         let verdict = check_case_identity(manifest_path, input_path, Some(output_path));
         if !verdict.ok {
             reasons.extend(verdict.reasons.clone());
@@ -987,10 +989,18 @@ pub fn run_offline_preflight(request: &PreflightRequest<'_>) -> PreflightReport 
                 request.output_dir.display()
             ));
         }
-        // P6.3.3: the per-case runner-config digest (from the v4 envelope,
-        // independently recomputed by the verifier). A missing expected
-        // digest when one is required is a drift/contract failure.
-        let case_digest = request.case_config_digests.get(idx).cloned().flatten();
+        // P6.3.3.2: the per-case runner-config digest is looked up KEYED by
+        // case_id — never by `idx`. A reordered `--case` vector (or a
+        // reordered envelope `case_configs`) must NOT re-bind a digest to a
+        // different case. The case_id comes from the manifest identity when
+        // present; otherwise the manifest path is used as a stable fallback
+        // so a missing sample never masks a digest-bind error.
+        let case_id = verdict
+            .identity
+            .as_ref()
+            .map(|i| i.case_id.clone())
+            .unwrap_or_else(|| manifest_path.display().to_string());
+        let case_digest = request.case_config_digests.get(&case_id).cloned();
         if let Some(d) = &case_digest {
             if !is_64_hex(d) {
                 reasons.push(format!(

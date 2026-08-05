@@ -172,7 +172,7 @@ fn request_with_probe<'a>(
         )),
         expected_toolchain: "1.97.1",
         repo_root: Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../..")),
-        case_config_digests: Vec::new(),
+        case_config_digests: std::collections::BTreeMap::new(),
         case_set_digest: String::new(),
     }
 }
