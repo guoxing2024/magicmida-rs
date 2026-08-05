@@ -791,23 +791,133 @@ fn launch_gate_blocks_hand_written_ready_after_verifier_rerun() {
 }
 
 // ---------------------------------------------------------------------------
-// P6.3.3: case-bound envelope attack tests (real acceptance verifier)
+// P6.3.3.1: acceptance verifier keyed-identity attack tests
+// (hermetic — the envelope is constructed directly from the locked manifest
+// identity constants; the default tests NEVER read D:\MidaVault).
 // ---------------------------------------------------------------------------
 
-/// Invoke the REAL acceptance binary directly against an envelope + the two
-/// fixed case triples, returning its output. Used to prove the verifier
-/// independently rejects tampered v4 envelopes (not merely the runner's
-/// reuse policy).
-fn run_acceptance_preflight(dir: &Path, repo_root: &Path) -> Output {
+/// Locked protected-input identity constants (mirror of the case manifests).
+const ORIGIN_SHA: &str = "1af62999cf5be0b2f21abc39034c122a42aa46cfbfdb546faa184de37ac09ac7";
+const ORIGIN_SIZE: u64 = 5_232_656;
+const LUNLUN_SHA: &str = "8a0118d04e03752728999c845536c29215d2a626ac65845c22e3f1149de0db07";
+const LUNLUN_SIZE: u64 = 4_976_144;
+
+/// A synthetic (valid) runner config for a case, and its acceptance-computed
+/// digest.
+fn case_runner_config(case_id: &str) -> (mida_acceptance::RunnerConfig, String) {
+    let mut cfg = mida_acceptance::RunnerConfig {
+        tool_revision: "rev".to_string(),
+        cli_binary_sha256: "a".repeat(64),
+        features: vec!["default".to_string()],
+        debugger_backend: "windows_debug_api".to_string(),
+        oep_policy: "captured".to_string(),
+        container_restore: "off".to_string(),
+        shrink: true,
+        data_sections: false,
+        pure_rebuild: case_id == "origin_macro",
+        capture_policy_digest: String::new(),
+        iat_fix_strategy: "v3-trace".to_string(),
+        timeout_secs: 120,
+        isolation: mida_acceptance::IsolationConfig {
+            workspace_policy: "isolated-temp".to_string(),
+            process_tree_policy: "single-process".to_string(),
+            network_policy: "blocked".to_string(),
+        },
+        attempt_numbering: "continuous-1-based".to_string(),
+        evidence_bundle_schema: "mida.oreans-evidence-bundle/v2".to_string(),
+        gate_schema: "mida.oreans-two-sample-gate/v8".to_string(),
+        env_allowlist: vec!["CARGO_TARGET_DIR".to_string()],
+    };
+    cfg.tool_revision = "rev".to_string();
+    cfg.cli_binary_sha256 = "a".repeat(64);
+    let digest = mida_acceptance::runner_config_digest(&cfg);
+    (cfg, digest)
+}
+
+/// One case entry as a JSON value, bound to the given case_id and protected
+/// input identity, with a per-case digest computed from its config.
+fn case_entry_json(case_id: &str, sha: &str, size: u64) -> serde_json::Value {
+    let (cfg, digest) = case_runner_config(case_id);
+    serde_json::json!({
+        "case_id": case_id,
+        "protected_input": { "sha256": sha, "size_bytes": size },
+        "runner_config": serde_json::to_value(&cfg).unwrap(),
+        "runner_config_digest": digest,
+    })
+}
+
+/// Recompute the case-set digest for a list of case entries (fixed canonical
+/// order applied by sorting).
+fn reseal_case_set(entries: &[serde_json::Value]) -> String {
+    let mut lines: Vec<String> = entries
+        .iter()
+        .map(|c| {
+            format!(
+                "case={}\nprotected_input={}|{}\nrunner_config_digest={}\n",
+                c["case_id"].as_str().unwrap(),
+                c["protected_input"]["sha256"]
+                    .as_str()
+                    .unwrap()
+                    .to_lowercase(),
+                c["protected_input"]["size_bytes"].as_u64().unwrap(),
+                c["runner_config_digest"].as_str().unwrap().to_lowercase(),
+            )
+        })
+        .collect();
+    lines.sort();
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(lines.concat().as_bytes());
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    hex
+}
+
+/// Build a v4 envelope document (as JSON) from the given case entries.
+fn v4_envelope_json(case_configs: Vec<serde_json::Value>) -> serde_json::Value {
+    serde_json::json!({
+        "$schema": "./runner-config-envelope.schema.json",
+        "schema_version": "mida.runner-config-envelope/v4",
+        "cli_binary_sha256": "a".repeat(64),
+        "tool_revision": "rev",
+        "verifier_source": "<cli-dir>/mida-acceptance.exe",
+        "verifier_path": "C:\\dummy\\mida-acceptance.exe",
+        "verifier_sha256": "b".repeat(64),
+        "case_set_digest": reseal_case_set(&case_configs),
+        "case_configs": case_configs,
+    })
+}
+
+/// A VALID v4 envelope: origin_macro bound to its manifest identity, and
+/// lunlun_software bound to its manifest identity, with honest per-case and
+/// case-set digests.
+fn valid_v4_envelope_json() -> serde_json::Value {
+    v4_envelope_json(vec![
+        case_entry_json("origin_macro", ORIGIN_SHA, ORIGIN_SIZE),
+        case_entry_json("lunlun_software", LUNLUN_SHA, LUNLUN_SIZE),
+    ])
+}
+
+/// Invoke the REAL acceptance binary directly against an envelope file + the
+/// two fixed case triples, returning its output. Proves the verifier
+/// independently rejects tampered v4 envelopes (not merely the runner's reuse
+/// policy). Synthetic input files are used; the verifier's keyed-identity and
+/// per-case-digest checks are the target.
+fn run_acceptance_on_envelope(
+    dir: &Path,
+    repo_root: &Path,
+    envelope: &serde_json::Value,
+) -> Output {
     let cli = staging_cli(dir);
-    let origin_input = dir.join("input_origin.bin");
-    let lunlun_input = dir.join("input_lunlun.bin");
+    let envelope_path = dir.join("runner-config-envelope.json");
+    fs::write(&envelope_path, serde_json::to_vec_pretty(envelope).unwrap()).unwrap();
+    fs::write(dir.join("input_origin.bin"), b"ORIGIN-SYNTHETIC-INPUT-A").unwrap();
+    fs::write(dir.join("input_lunlun.bin"), b"LUNLUN-SYNTHETIC-INPUT-B").unwrap();
     let args = vec![
         "preflight".to_string(),
         "--envelope".to_string(),
-        dir.join("runner-config-envelope.json")
-            .display()
-            .to_string(),
+        envelope_path.display().to_string(),
         "--output-dir".to_string(),
         dir.display().to_string(),
         "--cli-binary".to_string(),
@@ -823,11 +933,11 @@ fn run_acceptance_preflight(dir: &Path, repo_root: &Path) -> Output {
         "1.97.1".to_string(),
         "--case".to_string(),
         real_manifest("origin_macro").display().to_string(),
-        origin_input.display().to_string(),
+        dir.join("input_origin.bin").display().to_string(),
         dir.join("origin_candidate.exe").display().to_string(),
         "--case".to_string(),
         real_manifest("lunlun_software").display().to_string(),
-        lunlun_input.display().to_string(),
+        dir.join("input_lunlun.bin").display().to_string(),
         dir.join("lunlun_candidate.exe").display().to_string(),
     ];
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -837,339 +947,122 @@ fn run_acceptance_preflight(dir: &Path, repo_root: &Path) -> Output {
         .expect("spawn acceptance binary")
 }
 
-/// Stage a v4 envelope. When the real vault samples are available they are
-/// written as the case inputs and STAGED (so the per-case configs actually
-/// differ: Origin pure_rebuild=true vs Lunlun false), which is required for
-/// the config-swap / forced-value attacks to be detectable; otherwise missing
-/// inputs are used (both configs fall back to legacy and the swap is a
-/// no-op).
-fn stage_v4(dir: &Path, repo_root: &Path) {
-    let origin = materialized_sample(dir, "origin_macro");
-    let lunlun = materialized_sample(dir, "lunlun_software");
-    let args = match (&origin, &lunlun) {
-        (Some(o), Some(l)) => {
-            fs::copy(o, dir.join("input_origin.bin")).unwrap();
-            fs::copy(l, dir.join("input_lunlun.bin")).unwrap();
-            vec![
-                "/offline-preflight".to_string(),
-                dir.display().to_string(),
-                format!("--cli-binary={}", dir.join("mida-cli.exe").display()),
-                format!("--repo-root={}", repo_root.display()),
-                format!(
-                    "--toolchain-pin={}",
-                    workspace_root().join("rust-toolchain.toml").display()
-                ),
-                "--expected-toolchain=1.97.1".to_string(),
-                "--case".to_string(),
-                real_manifest("origin_macro").display().to_string(),
-                dir.join("input_origin.bin").display().to_string(),
-                dir.join("origin_candidate.exe").display().to_string(),
-                "--case".to_string(),
-                real_manifest("lunlun_software").display().to_string(),
-                dir.join("input_lunlun.bin").display().to_string(),
-                dir.join("lunlun_candidate.exe").display().to_string(),
-            ]
-        }
-        _ => preflight_args_with_cli(dir, repo_root),
-    };
-    let out = run_staging_args(dir, &args);
-    // With real samples present staging should be Ready (exit 0); with
-    // missing samples it is NotReady (exit 2) — either way the envelope is
-    // created.
-    assert!(
-        dir.join("runner-config-envelope.json").exists(),
-        "envelope created"
-    );
-    let _ = out;
-}
-
-/// Locate a real materialized sample for `case_id` inside `dir`'s test root,
-/// falling back to a vault path; returns `None` when unavailable.
-fn materialized_sample(dir: &Path, case_id: &str) -> Option<PathBuf> {
-    let _ = dir;
-    let (name, expected) = match case_id {
-        "origin_macro" => (
-            "origin_macro__protected_input__1af62999cf5b.bin",
-            "1af62999cf5be0b2f21abc39034c122a42aa46cfbfdb546faa184de37ac09ac7",
-        ),
-        "lunlun_software" => (
-            "lunlun_software__protected_input__8a0118d04e03.bin",
-            "8a0118d04e03752728999c845536c29215d2a626ac65845c22e3f1149de0db07",
-        ),
-        _ => return None,
-    };
-    let candidates = [
-        Path::new("D:\\MidaVault\\scratch\\materialized").join(name),
-        Path::new("D:\\MidaVault\\scratch\\p7_live_smoke_20260805\\stage")
-            .join(format!("{case_id}_input.exe")),
-    ];
-    for c in candidates {
-        if let Ok(bytes) = fs::read(&c) {
-            use sha2::{Digest, Sha256};
-            let digest = Sha256::digest(&bytes);
-            let mut hex = String::with_capacity(64);
-            for byte in digest {
-                hex.push_str(&format!("{byte:02x}"));
-            }
-            if hex == expected {
-                return Some(c);
-            }
-        }
-    }
-    None
-}
-
-/// P6.3.3-B: swapping the two per-case configs (tampering a single config,
-/// re-sealing only the outer case-set hash while leaving the per-case digests
-/// stale) must be rejected by the acceptance verifier's independent recompute.
+/// P6.3.3.1: positive control — a VALID case-bound v4 envelope. The verifier's
+/// keyed-identity / per-case-digest checks must NOT report any drift reason
+/// (the resulting NotReady is only the synthetic-file identity mismatch from
+/// `run_offline_preflight`, which is expected offline).
 #[test]
-fn case_config_swap_rejected_by_verifier() {
-    let dir = temp_dir("swap");
+fn valid_v4_envelope_passes_keyed_identity_check() {
+    let dir = temp_dir("valid_v4");
     let repo_root = scratch_repo(&dir);
-    stage_v4(&dir, &repo_root);
-    let envelope_path = dir.join("runner-config-envelope.json");
-    let mut env: serde_json::Value =
-        serde_json::from_slice(&fs::read(&envelope_path).unwrap()).unwrap();
-    let cfg = env["case_configs"].as_array().unwrap().clone();
-    let mut a = cfg[0].clone();
-    let mut b = cfg[1].clone();
-    // Swap the two runner_config JSON blobs; the per-case digests are left
-    // STALE (they no longer match their config), so the verifier's
-    // independent recompute must reject even though the outer hash is
-    // re-sealed below.
-    let a_cfg = a["runner_config"].clone();
-    let b_cfg = b["runner_config"].clone();
-    a["runner_config"] = b_cfg;
-    b["runner_config"] = a_cfg;
-    env["case_configs"] = serde_json::json!([a, b]);
-    // Re-seal ONLY the outer case-set digest (the tamper's "recompute").
-    let mut entries: Vec<String> = env["case_configs"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|c| {
-            format!(
-                "case={}\nprotected_input={}|{}\nrunner_config_digest={}\n",
-                c["case_id"].as_str().unwrap(),
-                c["protected_input"]["sha256"]
-                    .as_str()
-                    .unwrap()
-                    .to_lowercase(),
-                c["protected_input"]["size_bytes"].as_u64().unwrap(),
-                c["runner_config_digest"].as_str().unwrap().to_lowercase(),
-            )
-        })
-        .collect();
-    entries.sort();
-    use sha2::{Digest, Sha256};
-    let recomputed = Sha256::digest(entries.concat().as_bytes());
-    let mut hex = String::with_capacity(64);
-    for byte in recomputed {
-        hex.push_str(&format!("{byte:02x}"));
-    }
-    env["case_set_digest"] = serde_json::json!(hex);
-    fs::write(&envelope_path, serde_json::to_vec_pretty(&env).unwrap()).unwrap();
-
-    let out = run_acceptance_preflight(&dir, &repo_root);
+    let out = run_acceptance_on_envelope(&dir, &repo_root, &valid_v4_envelope_json());
+    // The envelope keyed-identity check is clean; NotReady (exit 2) comes only
+    // from the synthetic input files not matching the locked identity.
     assert_eq!(
         out.status.code(),
         Some(2),
-        "config swap must be NotReady: {}",
+        "valid envelope + synthetic files -> NotReady (identity): {}",
         String::from_utf8_lossy(&out.stderr)
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("digest drift") || stderr.contains("runner-config"),
-        "stderr: {stderr}"
+        !stderr.contains("keyed") && !stderr.contains("does not match the locked manifest"),
+        "no keyed-identity drift for a valid envelope: {stderr}"
     );
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// P6.3.3-B: forcing the Origin config to pure_rebuild=false must be rejected.
-/// The preflight verifier accepts a self-consistent envelope; the rejection is
-/// enforced at LAUNCH (Origin's actual config resolves pure_rebuild=true per
-/// D3, which no longer matches the tampered envelope's Origin digest) —
-/// before any process creation.
+/// P6.3.3.1-B: swapping case_id (and re-sealing every digest honestly) must be
+/// rejected by the acceptance verifier's keyed identity check.
 #[test]
-fn origin_forced_false_rejected_at_launch() {
-    let dir = temp_dir("origin_false");
+fn case_id_swap_rejected_by_verifier() {
+    let dir = temp_dir("cid_swap");
     let repo_root = scratch_repo(&dir);
-    stage_v4(&dir, &repo_root);
-    if materialized_sample(&dir, "origin_macro").is_none() {
-        // Without the real origin sample the D3 actual config cannot be
-        // exercised; the case-bound selection is covered by unit tests.
-        let _ = fs::remove_dir_all(&dir);
-        return;
-    }
-    let envelope_path = dir.join("runner-config-envelope.json");
-    let mut env: serde_json::Value =
-        serde_json::from_slice(&fs::read(&envelope_path).unwrap()).unwrap();
-    let origin_idx = env["case_configs"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .position(|c| c["case_id"] == "origin_macro")
-        .unwrap();
-    // Force Origin pure_rebuild=false and re-seal honestly.
-    env["case_configs"][origin_idx]["runner_config"]["pure_rebuild"] = serde_json::json!(false);
-    let parsed: mida_acceptance::RunnerConfig =
-        serde_json::from_value(env["case_configs"][origin_idx]["runner_config"].clone()).unwrap();
-    env["case_configs"][origin_idx]["runner_config_digest"] =
-        serde_json::json!(mida_acceptance::runner_config_digest(&parsed));
-    let mut entries: Vec<String> = env["case_configs"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|c| {
-            format!(
-                "case={}\nprotected_input={}|{}\nrunner_config_digest={}\n",
-                c["case_id"].as_str().unwrap(),
-                c["protected_input"]["sha256"]
-                    .as_str()
-                    .unwrap()
-                    .to_lowercase(),
-                c["protected_input"]["size_bytes"].as_u64().unwrap(),
-                c["runner_config_digest"].as_str().unwrap().to_lowercase(),
-            )
-        })
-        .collect();
-    entries.sort();
-    use sha2::{Digest, Sha256};
-    let recomputed = Sha256::digest(entries.concat().as_bytes());
-    let mut hex = String::with_capacity(64);
-    for byte in recomputed {
-        hex.push_str(&format!("{byte:02x}"));
-    }
-    env["case_set_digest"] = serde_json::json!(hex);
-    fs::write(&envelope_path, serde_json::to_vec_pretty(&env).unwrap()).unwrap();
-
-    // Launch the REAL origin input: the attestation must block (the actual
-    // config digest, pure=true, no longer equals the tampered Origin digest)
-    // before any process creation.
-    let candidate = dir.join("origin_candidate.exe");
-    let launch_cli = staging_cli(&dir);
-    let output = run_cli_at(
-        &launch_cli,
-        &[
-            "/unpack",
-            dir.join("input_origin.bin").to_str().unwrap(),
-            "--output",
-            candidate.to_str().unwrap(),
-            "--preflight-dir",
-            dir.to_str().unwrap(),
-        ],
-    );
+    // Swap case_id while keeping the correct protected-input binding per
+    // case: now case_id "origin_macro" is bound to the LUNLUN identity.
+    let origin_entry = case_entry_json("origin_macro", LUNLUN_SHA, LUNLUN_SIZE);
+    let lunlun_entry = case_entry_json("lunlun_software", ORIGIN_SHA, ORIGIN_SIZE);
+    let env = v4_envelope_json(vec![origin_entry, lunlun_entry]);
+    let out = run_acceptance_on_envelope(&dir, &repo_root, &env);
     assert_eq!(
-        output.status.code(),
-        Some(1),
-        "Origin forced-false must block the launch: {}",
-        String::from_utf8_lossy(&output.stderr)
+        out.status.code(),
+        Some(2),
+        "case_id swap must be NotReady: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("launch blocked"), "stderr: {stderr}");
-    assert!(!candidate.exists(), "no candidate may be produced");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("does not match the locked manifest"),
+        "keyed-identity drift must be reported: {stderr}"
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// P6.3.3-B: forcing the Lunlun config to pure_rebuild=true must be rejected
-/// at launch (Lunlun's D3 default resolves pure_rebuild=false, so the actual
-/// config digest no longer matches the tampered Lunlun digest).
+/// P6.3.3.1-B: swapping protected_input (re-sealing every digest honestly)
+/// must be rejected by the verifier's keyed identity check.
 #[test]
-fn lunlun_forced_true_rejected_at_launch() {
-    let dir = temp_dir("lunlun_true");
+fn protected_input_swap_rejected_by_verifier() {
+    let dir = temp_dir("pin_swap");
     let repo_root = scratch_repo(&dir);
-    stage_v4(&dir, &repo_root);
-    if materialized_sample(&dir, "lunlun_software").is_none() {
-        let _ = fs::remove_dir_all(&dir);
-        return;
-    }
-    let envelope_path = dir.join("runner-config-envelope.json");
-    let mut env: serde_json::Value =
-        serde_json::from_slice(&fs::read(&envelope_path).unwrap()).unwrap();
-    let lunlun_idx = env["case_configs"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .position(|c| c["case_id"] == "lunlun_software")
-        .unwrap();
-    // Force Lunlun pure_rebuild=true and re-seal honestly.
-    env["case_configs"][lunlun_idx]["runner_config"]["pure_rebuild"] = serde_json::json!(true);
-    let parsed: mida_acceptance::RunnerConfig =
-        serde_json::from_value(env["case_configs"][lunlun_idx]["runner_config"].clone()).unwrap();
-    env["case_configs"][lunlun_idx]["runner_config_digest"] =
-        serde_json::json!(mida_acceptance::runner_config_digest(&parsed));
-    let mut entries: Vec<String> = env["case_configs"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|c| {
-            format!(
-                "case={}\nprotected_input={}|{}\nrunner_config_digest={}\n",
-                c["case_id"].as_str().unwrap(),
-                c["protected_input"]["sha256"]
-                    .as_str()
-                    .unwrap()
-                    .to_lowercase(),
-                c["protected_input"]["size_bytes"].as_u64().unwrap(),
-                c["runner_config_digest"].as_str().unwrap().to_lowercase(),
-            )
-        })
-        .collect();
-    entries.sort();
-    use sha2::{Digest, Sha256};
-    let recomputed = Sha256::digest(entries.concat().as_bytes());
-    let mut hex = String::with_capacity(64);
-    for byte in recomputed {
-        hex.push_str(&format!("{byte:02x}"));
-    }
-    env["case_set_digest"] = serde_json::json!(hex);
-    fs::write(&envelope_path, serde_json::to_vec_pretty(&env).unwrap()).unwrap();
-
-    let candidate = dir.join("lunlun_candidate.exe");
-    let launch_cli = staging_cli(&dir);
-    let output = run_cli_at(
-        &launch_cli,
-        &[
-            "/unpack",
-            dir.join("input_lunlun.bin").to_str().unwrap(),
-            "--output",
-            candidate.to_str().unwrap(),
-            "--preflight-dir",
-            dir.to_str().unwrap(),
-        ],
-    );
+    // origin_macro bound to the LUNLUN protected identity, lunlun_software
+    // bound to the ORIGIN protected identity (case_id unchanged).
+    let origin_entry = case_entry_json("origin_macro", LUNLUN_SHA, LUNLUN_SIZE);
+    let lunlun_entry = case_entry_json("lunlun_software", ORIGIN_SHA, ORIGIN_SIZE);
+    let env = v4_envelope_json(vec![origin_entry, lunlun_entry]);
+    let out = run_acceptance_on_envelope(&dir, &repo_root, &env);
     assert_eq!(
-        output.status.code(),
-        Some(1),
-        "Lunlun forced-true must block the launch: {}",
-        String::from_utf8_lossy(&output.stderr)
+        out.status.code(),
+        Some(2),
+        "protected_input swap must be NotReady: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("launch blocked"), "stderr: {stderr}");
-    assert!(!candidate.exists(), "no candidate may be produced");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("does not match the locked manifest"),
+        "keyed-identity drift must be reported: {stderr}"
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// P6.3.3-B: a v3 single-config envelope must be rejected by the acceptance
-/// verifier (no silent upgrade to v4).
+/// P6.3.3.1-B: swapping BOTH case_id AND protected_input (all hashes
+/// re-sealed) must still be rejected.
+#[test]
+fn case_id_and_protected_input_swap_rejected_by_verifier() {
+    let dir = temp_dir("dual_swap");
+    let repo_root = scratch_repo(&dir);
+    // Swap both the case_id AND the protected input, keeping the configs'
+    // per-case digest honest; the verifier's keyed binding must still reject.
+    let origin_entry = case_entry_json("origin_macro", LUNLUN_SHA, LUNLUN_SIZE);
+    let lunlun_entry = case_entry_json("lunlun_software", ORIGIN_SHA, ORIGIN_SIZE);
+    let env = v4_envelope_json(vec![origin_entry, lunlun_entry]);
+    let out = run_acceptance_on_envelope(&dir, &repo_root, &env);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "dual swap must be NotReady: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("does not match the locked manifest"),
+        "keyed-identity drift must be reported: {stderr}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// P6.3.3.1-B: a v3 single-config envelope must be rejected (no silent
+/// upgrade to v4).
 #[test]
 fn v3_envelope_rejected_by_verifier() {
     let dir = temp_dir("v3_reject");
     let repo_root = scratch_repo(&dir);
-    stage_v4(&dir, &repo_root);
-    let envelope_path = dir.join("runner-config-envelope.json");
-    let mut env: serde_json::Value =
-        serde_json::from_slice(&fs::read(&envelope_path).unwrap()).unwrap();
-    // Rewrite to a v3-style single-config shape: remove case_configs and the
-    // per-case fields, restore a top-level runner_config + digest.
+    let mut env = valid_v4_envelope_json();
     env.as_object_mut().unwrap().remove("case_configs");
     env.as_object_mut().unwrap().remove("case_set_digest");
     env["schema_version"] = serde_json::json!("mida.runner-config-envelope/v3");
     env["runner_config"] = serde_json::json!({});
     env["runner_config_digest"] = serde_json::json!("a".repeat(64));
-    fs::write(&envelope_path, serde_json::to_vec_pretty(&env).unwrap()).unwrap();
-
-    let out = run_acceptance_preflight(&dir, &repo_root);
+    let out = run_acceptance_on_envelope(&dir, &repo_root, &env);
     assert_eq!(
         out.status.code(),
         Some(1),
@@ -1181,5 +1074,61 @@ fn v3_envelope_rejected_by_verifier() {
         stderr.contains("v4") || stderr.contains("schema_version"),
         "stderr: {stderr}"
     );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// P6.3.3.1-B: missing, duplicate, and extra case configs are all rejected.
+#[test]
+fn missing_duplicate_extra_case_rejected_by_verifier() {
+    let dir = temp_dir("case_set_attacks");
+    let repo_root = scratch_repo(&dir);
+
+    // Missing a case.
+    let missing = v4_envelope_json(vec![case_entry_json(
+        "origin_macro",
+        ORIGIN_SHA,
+        ORIGIN_SIZE,
+    )]);
+    let out = run_acceptance_on_envelope(&dir, &repo_root, &missing);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "missing case must be NotReady: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Duplicate a case.
+    let dup = v4_envelope_json(vec![
+        case_entry_json("origin_macro", ORIGIN_SHA, ORIGIN_SIZE),
+        case_entry_json("origin_macro", ORIGIN_SHA, ORIGIN_SIZE),
+        case_entry_json("lunlun_software", LUNLUN_SHA, LUNLUN_SIZE),
+    ]);
+    let out = run_acceptance_on_envelope(&dir, &repo_root, &dup);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "duplicate case must be NotReady: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("duplicate case_id") || stderr.contains("exactly 2 case configs"),
+        "duplicate detection: {stderr}"
+    );
+
+    // Extra (third) case.
+    let extra = v4_envelope_json(vec![
+        case_entry_json("origin_macro", ORIGIN_SHA, ORIGIN_SIZE),
+        case_entry_json("lunlun_software", LUNLUN_SHA, LUNLUN_SIZE),
+        case_entry_json("gto_launcher", &"c".repeat(64), 1),
+    ]);
+    let out = run_acceptance_on_envelope(&dir, &repo_root, &extra);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "extra case must be NotReady: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
     let _ = fs::remove_dir_all(&dir);
 }

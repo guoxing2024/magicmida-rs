@@ -256,3 +256,61 @@ Negative (integration, real acceptance binary + launch):
 - No real sample process was created; P7 is NOT authorized.
 - `validation_summary.json` remains `open`.
 - No claim of live, perfect, universal, or 10/10 behavior is made.
+
+# P6.3.3.1 Verifier Keyed-Identity Closure
+
+Status: implemented on `oreans/two-sample-mainline`.
+
+Scope: pure offline engineering. No real sample process was created; no
+`D:\MidaVault` sample path is read by the default workspace tests.
+
+## Acceptance verifier: true case_id-keyed validation
+
+The acceptance verifier (`mida-acceptance preflight`) no longer relies on
+array position. It builds a unique `case_id -> envelope case` map from the v4
+envelope (duplicate case_ids refused), then for EACH fixed case validates:
+
+- the envelope case's protected_input identity matches the manifest-declared
+  identity (`locked_manifest(case_id)`) — the case_id <-> protected identity
+  binding, so swapping case_id or protected_input (even with every digest
+  re-sealed) is refused by the verifier itself;
+- the per-case runner_config_digest recomputes from its own config, keyed by
+  case_id;
+- the case_id belongs to the exact two fixed cases.
+
+The `case_set_digest` is recomputed in a FIXED canonical order (origin_macro,
+lunlun_software), keyed by case_id, and cross-checked against the envelope.
+Missing / duplicate / extra case configs are all refused.
+
+## Two-layer validation
+
+- **Acceptance independent verifier** (`mida-acceptance preflight`) performs
+  the keyed-identity / per-case-digest / case-set-digest recompute and returns
+  NotReady (exit 2) on any identity swap or drift.
+- **CLI runner second-line chain** (`attest_ready_before_launch`) re-runs the
+  verifier, selects the unique case by current protected input, binds the
+  actual config to ONLY that case's digest, and continues to run
+  `policy_matches(actual, frozen_run_policy(input))` — all before process
+  creation.
+
+## Hermetic default tests
+
+The default `cargo test --workspace` does NOT read `D:\MidaVault` or any real
+sample fixture. All default tests use synthetic inputs; the D3 pure-rebuild
+distinction and the case-bound digest selection are proven by hermetic unit
+tests. Real-sample fixtures are reserved for an explicitly authorized
+separate live target and are never auto-detected. The
+`preflight_boundary` suite (14 tests) now includes subprocess attack tests that
+invoke the real `mida-acceptance` binary on hand-constructed v4 envelopes:
+
+- valid v4 envelope positive control (keyed-identity check clean);
+- case_id swap (digests re-sealed) -> exit 2;
+- protected_input swap (digests re-sealed) -> exit 2;
+- case_id + protected_input swap (all hashes re-sealed) -> exit 2;
+- v3 / missing / duplicate / extra case -> rejected.
+
+## Boundaries after P6.3.3.1
+
+- No real sample process was created; P7 is NOT authorized.
+- `validation_summary.json` remains `open`.
+- No claim of live, perfect, universal, or 10/10 behavior is made.

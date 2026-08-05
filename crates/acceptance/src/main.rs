@@ -1231,11 +1231,34 @@ fn cmd_preflight(args: &[String]) -> Result<i32, String> {
 
     let mut reasons: Vec<String> = Vec::new();
 
-    // P6.3.3: independently reparse + recompute EVERY case config with the
-    // acceptance implementation, and validate the case_id <-> protected
-    // identity <-> config digest binding. A drift in any single case makes
-    // the WHOLE preflight NotReady.
-    let mut case_config_digests: Vec<Option<String>> = Vec::new();
+    // P6.3.3.1: TRUE case_id-keyed validation. The verifier builds a unique
+    // case_id -> envelope case map from the envelope (duplicate case_ids are
+    // refused), then for EACH fixed case validates:
+    //   - the envelope case's protected_input matches the manifest-declared
+    //     identity (case_id <-> protected identity binding);
+    //   - the per-case runner_config_digest recomputes from its own config;
+    //   - the case_id belongs to the exact two fixed cases.
+    // No array index is trusted; the case_set_digest is recomputed in a fixed
+    // canonical order (origin_macro, lunlun_software).
+
+    // 1. Envelope case set shape + unique case_id map.
+    let mut envelope_by_case: std::collections::BTreeMap<String, &CaseConfigEnvelopeV4> =
+        std::collections::BTreeMap::new();
+    for case in &envelope.case_configs {
+        if envelope_by_case.contains_key(&case.case_id) {
+            reasons.push(format!(
+                "envelope contains duplicate case_id {:?}; each case must appear exactly once",
+                case.case_id
+            ));
+        } else {
+            envelope_by_case.insert(case.case_id.clone(), case);
+        }
+    }
+    for id in FIXED_CASE_IDS {
+        if !envelope_by_case.contains_key(id) {
+            reasons.push(format!("envelope is missing case config {id}"));
+        }
+    }
     if envelope.case_configs.len() != FIXED_CASE_IDS.len() {
         reasons.push(format!(
             "envelope must contain exactly {} case configs, got {}",
@@ -1243,10 +1266,49 @@ fn cmd_preflight(args: &[String]) -> Result<i32, String> {
             envelope.case_configs.len()
         ));
     }
-    let mut present: Vec<&str> = Vec::new();
+
+    // 2. Per-case keyed validation: protected identity <-> case_id <-> digest.
+    // The report carries per-case digests keyed by case_id.
+    let mut case_config_digests: Vec<Option<String>> = Vec::new();
     for case in &envelope.case_configs {
-        present.push(case.case_id.as_str());
-        // Independent reparse of this case's config.
+        // The manifest-declared protected identity for this case_id.
+        let locked = mida_acceptance::locked_manifest(&case.case_id);
+        match locked {
+            None => {
+                reasons.push(format!(
+                    "envelope case {:?} is not one of the two fixed Oreans cases",
+                    case.case_id
+                ));
+                case_config_digests.push(None);
+                continue;
+            }
+            Some(manifest) => {
+                // Keyed identity binding: case_id -> protected_input must match
+                // the manifest-declared identity exactly.
+                if !is_64_hex(&case.protected_input.sha256) || case.protected_input.size_bytes == 0
+                {
+                    reasons.push(format!(
+                        "case {} protected_input identity is malformed",
+                        case.case_id
+                    ));
+                }
+                if case.protected_input.sha256.to_lowercase()
+                    != manifest.protected_input_sha256.to_lowercase()
+                    || case.protected_input.size_bytes != manifest.protected_input_size_bytes
+                {
+                    reasons.push(format!(
+                        "case {} protected_input identity does not match the locked manifest \
+                         (envelope {}/{} vs manifest {}/{})",
+                        case.case_id,
+                        case.protected_input.sha256.to_lowercase(),
+                        case.protected_input.size_bytes,
+                        manifest.protected_input_sha256.to_lowercase(),
+                        manifest.protected_input_size_bytes,
+                    ));
+                }
+            }
+        }
+        // Independent reparse + per-case digest recompute keyed by case_id.
         let parsed: mida_acceptance::RunnerConfig =
             match serde_json::from_value(case.runner_config.clone()) {
                 Ok(c) => c,
@@ -1270,20 +1332,6 @@ fn cmd_preflight(args: &[String]) -> Result<i32, String> {
                 case.case_id, case.runner_config_digest
             ));
         }
-        if !is_64_hex(&case.protected_input.sha256) || case.protected_input.size_bytes == 0 {
-            reasons.push(format!(
-                "case {} protected_input identity is malformed",
-                case.case_id
-            ));
-        }
-        // case_id must be one of the two fixed cases and the tool revision
-        // must agree with the envelope.
-        if !FIXED_CASE_IDS.contains(&case.case_id.as_str()) {
-            reasons.push(format!(
-                "case {:?} is not one of the two fixed Oreans cases",
-                case.case_id
-            ));
-        }
         if envelope.tool_revision != parsed.tool_revision {
             reasons.push(format!(
                 "case {} tool_revision {:?} does not match runner config {:?}",
@@ -1292,31 +1340,22 @@ fn cmd_preflight(args: &[String]) -> Result<i32, String> {
         }
         case_config_digests.push(Some(case.runner_config_digest.to_lowercase()));
     }
-    // Case set must be exactly {origin_macro, lunlun_software}, each once.
-    for id in FIXED_CASE_IDS {
-        if present.iter().filter(|p| **p == id).count() != 1 {
-            reasons.push(format!(
-                "envelope case set must contain exactly one {id} entry, got {:?}",
-                present
-            ));
-        }
-    }
-    // Recompute the sealed case-set digest from the verified per-case values
-    // and cross-check against the envelope's case_set_digest.
+
+    // 3. Recompute the sealed case-set digest in a FIXED canonical order
+    // (FIXED_CASE_IDS), keyed by case_id, and cross-check the envelope.
     {
-        let mut entries: Vec<String> = envelope
-            .case_configs
-            .iter()
-            .map(|c| {
-                format!(
+        let mut entries: Vec<String> = Vec::with_capacity(FIXED_CASE_IDS.len());
+        for id in FIXED_CASE_IDS {
+            if let Some(case) = envelope_by_case.get(id) {
+                entries.push(format!(
                     "case={}\nprotected_input={}|{}\nrunner_config_digest={}\n",
-                    c.case_id,
-                    c.protected_input.sha256.to_lowercase(),
-                    c.protected_input.size_bytes,
-                    c.runner_config_digest.to_lowercase()
-                )
-            })
-            .collect();
+                    case.case_id,
+                    case.protected_input.sha256.to_lowercase(),
+                    case.protected_input.size_bytes,
+                    case.runner_config_digest.to_lowercase()
+                ));
+            }
+        }
         entries.sort();
         let recomputed_set = sha256_hex(entries.concat().as_bytes());
         if recomputed_set != envelope.case_set_digest.to_lowercase() {
