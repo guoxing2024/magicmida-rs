@@ -70,7 +70,7 @@ pub use oreans_gate::{
     OreansFinalBehaviorVerdict, OreansFinalImportEvidence, OreansFinalRelocationBlockEvidence,
     OreansFinalRelocationEvidence, OreansFinalRelocationTargetEvidence, OreansFinalTlsEvidence,
     OreansGateError, OreansGateVerdict, OreansIatArtifactIdentity, OreansIatEvidence,
-    OreansIatReportEvidence, OreansIatSlotEvidence, OreansIsolatedReplay,
+    OreansIatReasonCounts, OreansIatReportEvidence, OreansIatSlotEvidence, OreansIsolatedReplay,
     OreansManifestBindingReport, OreansPrerequisites,
     OreansRelocationEvidence as OreansGateRelocationEvidence,
     OreansRelocationPreservationComparison, OreansReplayAttempt, OreansRuntimeRelocationEvidence,

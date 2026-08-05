@@ -509,9 +509,25 @@ pub struct OreansIatSlotEvidence {
     pub rebuilt_value: Option<u64>,
     pub slot_value: Option<u64>,
     pub status: String,
+    /// Deterministic root-cause reason for a non-resolved slot, when known.
+    /// Absent on resolved/zero-terminator slots; `None` on a non-resolved slot
+    /// means pending live confirmation.
+    pub unresolved_reason: Option<String>,
     pub module_name: Option<String>,
     pub function_name: Option<String>,
     pub ordinal: Option<u16>,
+}
+
+/// Stable per-reason counts over a recovery report's non-resolved slots.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OreansIatReasonCounts {
+    /// Map from unresolved reason to count.  `unknown`, if present, is never
+    /// folded away.
+    pub by_reason: std::collections::BTreeMap<String, usize>,
+    /// Non-resolved slots whose reason could not be established without a live
+    /// run.  Never fabricated or counted as `unknown`.
+    pub pending_live_confirmation: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -521,6 +537,7 @@ pub struct OreansIatReportEvidence {
     pub bytes_read: usize,
     pub slot_size: usize,
     pub slots: Vec<OreansIatSlotEvidence>,
+    pub unresolved_reason_counts: OreansIatReasonCounts,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1638,12 +1655,70 @@ fn validate_iat_report(report: &OreansIatReportEvidence, pe32_plus: bool) -> Vec
                 if slot.rebuilt_value.is_some() {
                     failures.push(format!("{} slot {position} has rebuilt_value", slot.status));
                 }
+                // A deterministic unresolved reason is required on every
+                // non-resolved slot.  A missing reason is pending live
+                // confirmation; `unknown` must never be silently accepted.
+                match slot.unresolved_reason.as_deref() {
+                    None => failures.push(format!(
+                        "{} slot {position} missing unresolved_reason (pending live confirmation)",
+                        slot.status
+                    )),
+                    Some(reason) => {
+                        if reason == "unknown" {
+                            failures.push(format!(
+                                "{} slot {position} has unresolved reason 'unknown' (fail-closed)",
+                                slot.status
+                            ));
+                        }
+                    }
+                }
             }
             other => failures.push(format!("unknown IAT slot status '{other}'")),
         }
     }
     if resolved == 0 {
         failures.push("no resolved thunk slots".to_string());
+    }
+    failures
+}
+
+/// Recompute the per-reason counts over the report's non-resolved slots and
+/// compare them to the sidecar's `unresolved_reason_counts`.  A mismatch, a
+/// folded `unknown`, or a fabricated pending count fails closed.
+fn validate_reason_counts(report: &OreansIatReportEvidence) -> Vec<String> {
+    let mut failures = Vec::new();
+    let mut recomputed: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut pending = 0usize;
+    for slot in &report.slots {
+        if matches!(slot.status.as_str(), "Resolved" | "ZeroTerminator") {
+            continue;
+        }
+        match slot.unresolved_reason.as_deref() {
+            Some(reason) => *recomputed.entry(reason.to_string()).or_insert(0) += 1,
+            None => pending += 1,
+        }
+    }
+    if recomputed != report.unresolved_reason_counts.by_reason {
+        failures.push(format!(
+            "unresolved_reason_counts mismatch: sidecar={:?} recomputed={:?}",
+            report.unresolved_reason_counts.by_reason, recomputed
+        ));
+    }
+    if pending != report.unresolved_reason_counts.pending_live_confirmation {
+        failures.push(format!(
+            "pending_live_confirmation count mismatch: sidecar={} recomputed={pending}",
+            report.unresolved_reason_counts.pending_live_confirmation
+        ));
+    }
+    // `unknown` and pending must never be silently accepted as a pass signal.
+    if let Some(unknown) = recomputed.get("unknown") {
+        failures.push(format!("{unknown} slots have unresolved reason 'unknown' (fail-closed)"));
+    }
+    if pending != 0 {
+        failures.push(format!(
+            "{pending} non-resolved slots are pending live confirmation (fail-closed)"
+        ));
     }
     failures
 }
@@ -1796,6 +1871,13 @@ fn validate_iat_evidence(
             .iter()
             .map(|failure| format!("structured IAT report: {failure}")),
     );
+    if let Some(report) = evidence.iat_report.as_ref() {
+        failures.extend(
+            validate_reason_counts(report)
+                .iter()
+                .map(|failure| format!("structured IAT report: {failure}")),
+        );
+    }
     failures.extend(validate_final_imports(
         &evidence.final_imports,
         evidence.iat_report.as_ref(),

@@ -12,8 +12,8 @@ use mida_acceptance::{
     OreansBehaviorObservable, OreansBehaviorStimulus, OreansEvidenceRef,
     OreansFinalBehaviorVerdict, OreansFinalImportEvidence, OreansFinalRelocationBlockEvidence,
     OreansFinalRelocationEvidence, OreansFinalRelocationTargetEvidence, OreansGateError,
-    OreansGateRelocationEvidence, OreansGateVerdict, OreansIatEvidence, OreansIatReportEvidence,
-    OreansIatSlotEvidence, OreansIsolatedReplay, OreansPrerequisites,
+    OreansGateRelocationEvidence, OreansGateVerdict, OreansIatEvidence, OreansIatReasonCounts,
+    OreansIatReportEvidence, OreansIatSlotEvidence, OreansIsolatedReplay, OreansPrerequisites,
     OreansRelocationPreservationComparison, OreansReplayAttempt, OreansRuntimeRelocationEvidence,
     OreansRuntimeRelocationTargetEvidence, OreansRuntimeTlsCallbackEvidence,
     OreansRuntimeTlsEvidence, OreansSampleObservation, OreansTlsArtifactIdentity,
@@ -242,6 +242,10 @@ fn iat_evidence(
             requested_bytes: 16,
             bytes_read: 16,
             slot_size: 8,
+            unresolved_reason_counts: mida_acceptance::OreansIatReasonCounts {
+                by_reason: std::collections::BTreeMap::new(),
+                pending_live_confirmation: 0,
+            },
             slots: vec![
                 OreansIatSlotEvidence {
                     slot_index: 0,
@@ -251,6 +255,7 @@ fn iat_evidence(
                     rebuilt_value: Some(0x7000),
                     slot_value: Some(0x7000),
                     status: "Resolved".to_string(),
+                    unresolved_reason: None,
                     module_name: Some("KERNEL32.DLL".to_string()),
                     function_name: Some("ExitProcess".to_string()),
                     ordinal: None,
@@ -263,6 +268,7 @@ fn iat_evidence(
                     rebuilt_value: None,
                     slot_value: Some(0),
                     status: "ZeroTerminator".to_string(),
+                    unresolved_reason: None,
                     module_name: None,
                     function_name: None,
                     ordinal: None,

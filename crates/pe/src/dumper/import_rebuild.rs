@@ -7,7 +7,7 @@ use tracing::{debug, info, warn};
 
 use crate::error::PeError;
 use crate::header::PeHeader;
-use crate::iat_completeness::{IatRecoveryReport, IatSlotReport, IatSlotStatus};
+use crate::iat_completeness::{IatRecoveryReport, IatSlotReport, IatSlotStatus, IatUnresolvedReason};
 use crate::import_table::{iat_slot_size, ImportModule, ImportTableBuilder, ImportThunk};
 
 use super::helpers::{
@@ -250,6 +250,11 @@ fn rebuild_import_table_inner(
             } else {
                 IatSlotStatus::ShortRead
             },
+            unresolved_reason: if fully_read {
+                None
+            } else {
+                Some(IatUnresolvedReason::ShortRead)
+            },
         };
 
         if !fully_read {
@@ -281,19 +286,26 @@ fn rebuild_import_table_inner(
             let inside_module = modules
                 .iter()
                 .any(|m| m.end_off > m.base && slot_val >= m.base && slot_val < m.end_off);
-            slot.status = if inside_module {
-                IatSlotStatus::Stale
+            if inside_module {
+                slot.status = IatSlotStatus::Stale;
+                slot.unresolved_reason = Some(IatUnresolvedReason::AddressNotExported);
             } else {
-                IatSlotStatus::Unresolved
-            };
+                slot.status = IatSlotStatus::Unresolved;
+                // The value lies outside every loaded module range.  This is a
+                // deterministic offline classification; it does not assert any
+                // protection cause.
+                slot.unresolved_reason = Some(IatUnresolvedReason::ModuleNotFound);
+            }
             debug!(
                 iat_va = format!("{:#x}", iat_address + off as u64),
                 slot_val = format!("{slot_val:#x}"),
                 status = ?slot.status,
+                reason = ?slot.unresolved_reason,
                 "IAT slot unresolvable"
             );
         } else if modules.iter().any(|m| m.end_off <= m.base) {
             slot.status = IatSlotStatus::InvalidModule;
+            slot.unresolved_reason = Some(IatUnresolvedReason::InvalidModule);
         } else {
             slot.status = IatSlotStatus::Resolved;
         }
@@ -350,6 +362,7 @@ fn rebuild_import_table_inner(
             // Compatibility field deliberately aliases the immutable capture.
             slot_value: observed_value,
             status: slot.status,
+            unresolved_reason: slot.unresolved_reason,
             module_name,
             function_name,
             ordinal,
@@ -662,6 +675,7 @@ mod tests {
             chosen: None,
             is_zero: false,
             status: IatSlotStatus::Unresolved,
+            unresolved_reason: Some(IatUnresolvedReason::ModuleNotFound),
         };
 
         // This is the same mutation performed by PASS2.  The report source is
@@ -707,6 +721,7 @@ mod tests {
                 chosen: None,
                 is_zero: false,
                 status: IatSlotStatus::Resolved,
+                unresolved_reason: None,
             },
             IatSlot {
                 candidates: vec![ResolutionCandidate {
@@ -718,6 +733,7 @@ mod tests {
                 chosen: None,
                 is_zero: false,
                 status: IatSlotStatus::Resolved,
+                unresolved_reason: None,
             },
         ];
 

@@ -395,6 +395,9 @@ pub(crate) struct IatSlot {
     pub(crate) is_zero: bool,
     /// Fail-closed state carried into the public recovery report.
     pub(crate) status: crate::iat_completeness::IatSlotStatus,
+    /// Deterministic root-cause reason for a non-`Resolved` slot, carried into
+    /// the public recovery report.
+    pub(crate) unresolved_reason: Option<crate::iat_completeness::IatUnresolvedReason>,
 }
 
 // -----------------------------------------------------------------------

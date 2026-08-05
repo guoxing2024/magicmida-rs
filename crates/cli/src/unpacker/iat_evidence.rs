@@ -38,9 +38,25 @@ pub(crate) struct IatSlotEvidence {
     pub rebuilt_value: Option<u64>,
     pub slot_value: Option<u64>,
     pub status: String,
+    /// Deterministic root-cause reason for a non-resolved slot, when known.
+    /// Absent on resolved/zero-terminator slots; `None` on a non-resolved slot
+    /// means pending live confirmation.
+    pub unresolved_reason: Option<String>,
     pub module_name: Option<String>,
     pub function_name: Option<String>,
     pub ordinal: Option<u16>,
+}
+
+/// Stable per-reason counts over a recovery report's non-resolved slots.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct IatReasonCounts {
+    /// Map from unresolved reason to count.  Keys are the stable `as_str()`
+    /// identifiers.  The `unknown` reason, if present, is never folded away.
+    pub by_reason: BTreeMap<String, usize>,
+    /// Non-resolved slots whose reason could not be established without a live
+    /// run.  These are never fabricated or counted as `unknown`.
+    pub pending_live_confirmation: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -59,6 +75,8 @@ pub(crate) struct IatReportEvidence {
     pub bytes_read: usize,
     pub slot_size: usize,
     pub slots: Vec<IatSlotEvidence>,
+    /// Stable per-reason counts over the non-resolved slots.
+    pub unresolved_reason_counts: IatReasonCounts,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -344,7 +362,31 @@ fn iat_report_to_evidence(report: &IatRecoveryReport) -> IatReportEvidence {
         requested_bytes: report.requested_bytes,
         bytes_read: report.bytes_read,
         slot_size: report.slot_size,
+        unresolved_reason_counts: reason_counts(report),
         slots,
+    }
+}
+
+fn reason_counts(report: &IatRecoveryReport) -> IatReasonCounts {
+    let mut by_reason = BTreeMap::new();
+    let mut pending_live_confirmation = 0usize;
+    for slot in &report.slots {
+        if matches!(
+            slot.status,
+            IatSlotStatus::Resolved | IatSlotStatus::ZeroTerminator
+        ) {
+            continue;
+        }
+        match slot.unresolved_reason {
+            Some(reason) => {
+                *by_reason.entry(reason.as_str().to_string()).or_insert(0) += 1;
+            }
+            None => pending_live_confirmation += 1,
+        }
+    }
+    IatReasonCounts {
+        by_reason,
+        pending_live_confirmation,
     }
 }
 
@@ -357,6 +399,7 @@ fn slot_to_evidence(slot: &IatSlotReport) -> IatSlotEvidence {
         rebuilt_value: slot.rebuilt_value,
         slot_value: slot.slot_value,
         status: status_name(slot.status).to_string(),
+        unresolved_reason: slot.unresolved_reason.map(|r| r.as_str().to_string()),
         module_name: slot.module_name.clone(),
         function_name: slot.function_name.clone(),
         ordinal: slot.ordinal,
@@ -745,6 +788,7 @@ mod tests {
                 rebuilt_value: Some(0x7fff_0000_1000 + index as u64),
                 slot_value: Some(0x7fff_0000_1000 + index as u64),
                 status: IatSlotStatus::Resolved,
+                unresolved_reason: None,
                 module_name: Some("KERNEL32.DLL".into()),
                 function_name: (!ordinal).then(|| function.to_string()),
                 ordinal: ordinal.then_some(0),
@@ -758,6 +802,7 @@ mod tests {
             rebuilt_value: None,
             slot_value: Some(0),
             status: IatSlotStatus::ZeroTerminator,
+            unresolved_reason: None,
             module_name: None,
             function_name: None,
             ordinal: None,

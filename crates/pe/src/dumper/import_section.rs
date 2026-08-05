@@ -455,6 +455,7 @@ pub(crate) fn fill_additional_iat_locations(
 mod tests {
     use super::*;
     use crate::header::PeHeader;
+    use crate::original_imports::FinalImportIdentity;
 
     /// Zero terminator slots in `import_thunks` must overwrite stale live pointers.
     #[test]
@@ -715,6 +716,380 @@ mod tests {
         assert_eq!(
             final_imports[0].function_name.as_deref(),
             Some("ResolvedApi")
+        );
+    }
+
+    // --- P8.1-A: resolved<->unresolved sequence attacks ---
+
+    /// Emit a full on-disk PE for a builder whose thunks carry explicit IAT
+    /// RVAs (possibly leaving sparse gaps), then independently re-read the
+    /// final import identities from the serialized bytes.
+    fn emit_and_read_final(builder: &ImportTableBuilder) -> (Vec<u8>, Vec<FinalImportIdentity>) {
+        let pe_bytes = crate::header::make_minimal_pe64();
+        let mut pe = PeHeader::from_bytes(&pe_bytes).expect("minimal pe");
+        pe.nt_headers.optional_header.size_of_image = 0x6000;
+
+        let mut dump_buf = vec![0u8; 0x2000];
+        let _ = create_import_section(&mut pe, builder, 0x1100, &mut dump_buf, true);
+
+        let mut image = assemble_image(&pe, &pe_bytes[..0x40]);
+        let (_, thunks) = builder.build_import_section_no_iat(
+            pe.nt_headers.optional_header.data_directory[IMAGE_DIRECTORY_ENTRY_IMPORT]
+                .virtual_address,
+            0x1100,
+        );
+        write_iat_to_output(&mut image, &pe, &thunks, 0x1100, true);
+
+        let final_imports = crate::original_imports::parse_final_import_identities(&image)
+            .expect("parse final imports");
+        (image, final_imports)
+    }
+
+    #[test]
+    fn resolved_unresolved_resolved_sequence_both_reachable() {
+        // P8.1-A #5: Resolved(A) -> Unresolved(gap at 0x1108) -> Resolved(B).
+        // The split-into-contiguous-runs emission must NOT let the loader stop
+        // at the internal zero and drop B. Independent re-read of the final PE
+        // must prove BOTH A and B are reachable final imports.
+        let mut builder = ImportTableBuilder::new(true);
+        {
+            let m = builder.add_module("kernel32.dll");
+            // A at 0x1100; the 0x1108 slot is UNRESOLVED (absent, stays zero in
+            // the IAT); B at 0x1110.
+            m.thunks.push(ImportThunk {
+                iat_address: 0x1100,
+                function_name: Some("ApiA".to_string()),
+                ordinal: None,
+                is_64bit: true,
+            });
+            m.thunks.push(ImportThunk {
+                iat_address: 0x1110,
+                function_name: Some("ApiB".to_string()),
+                ordinal: None,
+                is_64bit: true,
+            });
+        }
+
+        let (image, final_imports) = emit_and_read_final(&builder);
+
+        // Both A and B must be independently reachable. A parser that stops at
+        // the zero terminator (0x1108) and reports only A would fail this.
+        let names: Vec<String> = final_imports
+            .iter()
+            .filter_map(|item| item.function_name.clone())
+            .collect();
+        assert!(
+            names.contains(&"ApiA".to_string()),
+            "ApiA must be reachable, got {names:?}"
+        );
+        assert!(
+            names.contains(&"ApiB".to_string()),
+            "ApiB must be reachable after an internal unresolved gap, got {names:?}"
+        );
+        // Each resolved slot maps to exactly one final import; no phantom.
+        let mut slot_rvas: Vec<u32> = final_imports.iter().map(|i| i.slot_rva).collect();
+        slot_rvas.sort_unstable();
+        assert_eq!(slot_rvas, vec![0x1100, 0x1110], "no phantom, no duplicate");
+        assert!(
+            !names.contains(&"".to_string()),
+            "no blank-name phantom import"
+        );
+        // The unresolved gap slot itself must carry a zero terminator in the
+        // emitted IAT (never a fabricated import).
+        let iat_off = pe_section_rva_to_off(&image, 0x1108);
+        assert_eq!(
+            u64::from_le_bytes(image[iat_off..iat_off + 8].try_into().unwrap()),
+            0,
+            "unresolved gap slot must be zero, not a fabricated import"
+        );
+    }
+
+    /// Resolve a raw file offset for an RVA in the assembled image (headers +
+    /// minimal sections; only .text at RVA 0x1000/raw 0x200 is used here).
+    /// The `image` parameter documents the buffer the RVA is relative to; it is
+    /// not read because the minimal fixture has a fixed layout.
+    fn pe_section_rva_to_off(_image: &[u8], rva: u32) -> usize {
+        // The minimal PE's first section is at RVA 0x1000, raw offset 0x200.
+        assert!(rva >= 0x1000);
+        0x200 + (rva - 0x1000) as usize
+    }
+
+    #[test]
+    fn unresolved_at_first_slot_fails_closed_no_phantom() {
+        // #6a: unresolved in the FIRST slot. The emitted table must not turn the
+        // leading zero into a phantom import; later resolved thunks stay
+        // reachable via their own run.
+        let mut builder = ImportTableBuilder::new(true);
+        {
+            let m = builder.add_module("kernel32.dll");
+            // 0x1100 unresolved (absent), B at 0x1108 resolved.
+            m.thunks.push(ImportThunk {
+                iat_address: 0x1108,
+                function_name: Some("Only".to_string()),
+                ordinal: None,
+                is_64bit: true,
+            });
+        }
+        let (image, final_imports) = emit_and_read_final(&builder);
+        assert_eq!(final_imports.len(), 1, "no phantom from leading unresolved");
+        assert_eq!(final_imports[0].slot_rva, 0x1108);
+        let iat_off = pe_section_rva_to_off(&image, 0x1100);
+        assert_eq!(
+            u64::from_le_bytes(image[iat_off..iat_off + 8].try_into().unwrap()),
+            0
+        );
+    }
+
+    #[test]
+    fn unresolved_at_last_slot_terminates_run_without_phantom() {
+        // #6c: unresolved in the LAST slot. The zero terminator correctly ends
+        // the run; no phantom import is produced for it.
+        let mut builder = ImportTableBuilder::new(true);
+        {
+            let m = builder.add_module("kernel32.dll");
+            m.thunks.push(ImportThunk {
+                iat_address: 0x1100,
+                function_name: Some("Only".to_string()),
+                ordinal: None,
+                is_64bit: true,
+            });
+            // 0x1108 unresolved (absent) is the trailing terminator slot.
+        }
+        let (image, final_imports) = emit_and_read_final(&builder);
+        assert_eq!(final_imports.len(), 1);
+        assert_eq!(final_imports[0].slot_rva, 0x1100);
+        let iat_off = pe_section_rva_to_off(&image, 0x1108);
+        assert_eq!(
+            u64::from_le_bytes(image[iat_off..iat_off + 8].try_into().unwrap()),
+            0
+        );
+    }
+
+    #[test]
+    fn multiple_consecutive_unresolved_do_not_collapse_following_resolved() {
+        // #6d: several consecutive unresolved slots (0x1100,0x1108,0x1110) with
+        // a resolved slot after them (0x1118). The resolved slot must remain
+        // reachable via its own contiguous run.
+        let mut builder = ImportTableBuilder::new(true);
+        {
+            let m = builder.add_module("kernel32.dll");
+            m.thunks.push(ImportThunk {
+                iat_address: 0x1118,
+                function_name: Some("Survivor".to_string()),
+                ordinal: None,
+                is_64bit: true,
+            });
+        }
+        let (image, final_imports) = emit_and_read_final(&builder);
+        assert_eq!(final_imports.len(), 1);
+        assert_eq!(final_imports[0].slot_rva, 0x1118);
+        assert_eq!(final_imports[0].function_name.as_deref(), Some("Survivor"));
+        for rva in [0x1100u32, 0x1108, 0x1110] {
+            let off = pe_section_rva_to_off(&image, rva);
+            assert_eq!(
+                u64::from_le_bytes(image[off..off + 8].try_into().unwrap()),
+                0,
+                "unresolved slot RVA {rva:#x} must be zero"
+            );
+        }
+    }
+
+    #[test]
+    fn cross_module_unresolved_keeps_both_modules_imports() {
+        // #6e: unresolved slots across module boundaries. Each module's resolved
+        // thunks remain independently reachable via its own descriptor run.
+        // Both thunk RVAs stay inside the minimal .text raw extent (0x1000..
+        // 0x1200) so the IAT is raw-backed.
+        let mut builder = ImportTableBuilder::new(true);
+        {
+            let m = builder.add_module("kernel32.dll");
+            m.thunks.push(ImportThunk {
+                iat_address: 0x1100,
+                function_name: Some("KApi".to_string()),
+                ordinal: None,
+                is_64bit: true,
+            });
+        }
+        {
+            let m = builder.add_module("user32.dll");
+            m.thunks.push(ImportThunk {
+                iat_address: 0x1110,
+                function_name: Some("UApi".to_string()),
+                ordinal: None,
+                is_64bit: true,
+            });
+        }
+        let (_, final_imports) = emit_and_read_final(&builder);
+        let pairs: Vec<(String, String)> = final_imports
+            .iter()
+            .map(|i| (i.module_name.clone(), i.function_name.clone().unwrap_or_default()))
+            .collect();
+        assert!(
+            pairs.contains(&("kernel32.dll".into(), "KApi".into())),
+            "kernel32 import missing: {pairs:?}"
+        );
+        assert!(
+            pairs.contains(&("user32.dll".into(), "UApi".into())),
+            "user32 import missing: {pairs:?}"
+        );
+    }
+
+    #[test]
+    fn adjacent_module_runs_without_gap_fail_closed_not_truncated() {
+        // P8.1-A #4: when two module runs would share a terminator slot (no gap
+        // between them), the emitted IAT is ambiguous — the first run's
+        // terminator is claimed by the second module's thunk. The independent
+        // reader must FAIL CLOSED (reject the duplicate slot) rather than
+        // silently emitting a truncated table that only reaches one module.
+        let mut builder = ImportTableBuilder::new(true);
+        {
+            let m = builder.add_module("kernel32.dll");
+            m.thunks.push(ImportThunk {
+                iat_address: 0x1100,
+                function_name: Some("KApi".to_string()),
+                ordinal: None,
+                is_64bit: true,
+            });
+        }
+        {
+            let m = builder.add_module("user32.dll");
+            // 0x1108 is immediately after kernel32's thunk: no terminator gap.
+            m.thunks.push(ImportThunk {
+                iat_address: 0x1108,
+                function_name: Some("UApi".to_string()),
+                ordinal: None,
+                is_64bit: true,
+            });
+        }
+        let pe_bytes = crate::header::make_minimal_pe64();
+        let mut pe = PeHeader::from_bytes(&pe_bytes).expect("minimal pe");
+        pe.nt_headers.optional_header.size_of_image = 0x6000;
+        let mut dump_buf = vec![0u8; 0x2000];
+        let _ = create_import_section(&mut pe, &builder, 0x1100, &mut dump_buf, true);
+        let mut image = assemble_image(&pe, &pe_bytes[..0x40]);
+        let (_, thunks) = builder.build_import_section_no_iat(
+            pe.nt_headers.optional_header.data_directory[IMAGE_DIRECTORY_ENTRY_IMPORT]
+                .virtual_address,
+            0x1100,
+        );
+        write_iat_to_output(&mut image, &pe, &thunks, 0x1100, true);
+        let result = crate::original_imports::parse_final_import_identities(&image);
+        assert!(
+            result.is_err(),
+            "ambiguous adjacent runs must fail closed, not truncate to one module"
+        );
+    }
+
+    #[test]
+    fn resolved_name_and_ordinal_mix_emits_exactly_one_identity_each() {
+        // #6f: resolved slots mixing name and ordinal imports. Each slot yields
+        // exactly one final import identity (name XOR ordinal).
+        let mut builder = ImportTableBuilder::new(true);
+        {
+            let m = builder.add_module("kernel32.dll");
+            m.thunks.push(ImportThunk {
+                iat_address: 0x1100,
+                function_name: Some("ByName".to_string()),
+                ordinal: None,
+                is_64bit: true,
+            });
+            m.thunks.push(ImportThunk {
+                iat_address: 0x1108,
+                function_name: None,
+                ordinal: Some(42),
+                is_64bit: true,
+            });
+        }
+        let (_, final_imports) = emit_and_read_final(&builder);
+        assert_eq!(final_imports.len(), 2);
+        let by_name = final_imports
+            .iter()
+            .find(|i| i.slot_rva == 0x1100)
+            .expect("by-name slot");
+        assert_eq!(by_name.function_name.as_deref(), Some("ByName"));
+        assert_eq!(by_name.ordinal, None);
+        let by_ord = final_imports
+            .iter()
+            .find(|i| i.slot_rva == 0x1108)
+            .expect("by-ordinal slot");
+        assert_eq!(by_ord.function_name, None);
+        assert_eq!(by_ord.ordinal, Some(42));
+    }
+
+    #[test]
+    fn duplicate_resolved_slot_fails_closed_on_independent_read() {
+        // #6g: two resolved thunks claiming the SAME IAT slot must fail closed —
+        // the emitted PE cannot hold two identities in one slot. The independent
+        // final-PE reader must reject the duplicate-slot table rather than
+        // silently emitting a phantom or truncated import set.
+        let mut builder = ImportTableBuilder::new(true);
+        {
+            let m = builder.add_module("kernel32.dll");
+            m.thunks.push(ImportThunk {
+                iat_address: 0x1100,
+                function_name: Some("First".to_string()),
+                ordinal: None,
+                is_64bit: true,
+            });
+            // Second thunk illegally claims the same slot.
+            m.thunks.push(ImportThunk {
+                iat_address: 0x1100,
+                function_name: Some("Second".to_string()),
+                ordinal: None,
+                is_64bit: true,
+            });
+        }
+        let pe_bytes = crate::header::make_minimal_pe64();
+        let mut pe = PeHeader::from_bytes(&pe_bytes).expect("minimal pe");
+        pe.nt_headers.optional_header.size_of_image = 0x6000;
+        let mut dump_buf = vec![0u8; 0x2000];
+        let _ = create_import_section(&mut pe, &builder, 0x1100, &mut dump_buf, true);
+        let mut image = assemble_image(&pe, &pe_bytes[..0x40]);
+        let (_, thunks) = builder.build_import_section_no_iat(
+            pe.nt_headers.optional_header.data_directory[IMAGE_DIRECTORY_ENTRY_IMPORT]
+                .virtual_address,
+            0x1100,
+        );
+        write_iat_to_output(&mut image, &pe, &thunks, 0x1100, true);
+
+        let result = crate::original_imports::parse_final_import_identities(&image);
+        assert!(
+            result.is_err(),
+            "independent reader must fail closed on a duplicate-slot table, got {:?}",
+            result
+        );
+        let err = format!("{}", result.err().unwrap());
+        assert!(
+            err.contains("duplicate final import slot RVA"),
+            "error must name the duplicate slot, got: {err}"
+        );
+    }
+
+    #[test]
+    fn unresolved_reason_unknown_stays_fail_closed() {
+        // #6h: an unresolved slot with reason "unknown" must stay fail-closed
+        // and must not produce a phantom import or a silently truncated table.
+        // This is enforced at the gate/evidence layer (iat_evidence and
+        // oreans_gate); the emission layer guarantees an unresolved slot emits a
+        // zero terminator and no final import.
+        let mut builder = ImportTableBuilder::new(true);
+        {
+            let m = builder.add_module("kernel32.dll");
+            m.thunks.push(ImportThunk {
+                iat_address: 0x1100,
+                function_name: Some("Known".to_string()),
+                ordinal: None,
+                is_64bit: true,
+            });
+        }
+        let (image, final_imports) = emit_and_read_final(&builder);
+        assert_eq!(final_imports.len(), 1);
+        assert_eq!(final_imports[0].function_name.as_deref(), Some("Known"));
+        // The trailing unresolved terminator is zero.
+        let off = pe_section_rva_to_off(&image, 0x1108);
+        assert_eq!(
+            u64::from_le_bytes(image[off..off + 8].try_into().unwrap()),
+            0
         );
     }
 }
