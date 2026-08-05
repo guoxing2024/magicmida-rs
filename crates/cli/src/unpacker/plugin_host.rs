@@ -561,4 +561,61 @@ mod tests {
             "ahk_gto"
         );
     }
+
+    #[test]
+    fn sync_plugin_milestones_propagates_runtime_oep_provenance() {
+        // P8-B: the host must propagate the runtime OEP provenance from the
+        // loop state into the plugin context (source/VA/RVA), and must not let
+        // a later sync overwrite a confirmed provenance with an unknown one.
+        use crate::unpacker::loop_state::LoopState;
+        use mida_core::{OepProvenance, RuntimeBase, Rva};
+
+        let mut packer = SelectedPacker::Oreans(ThemidaPlugin::new());
+        let mut ctx = PluginCtx::default();
+        let mut ls = LoopState::default();
+        ls.oep = Some(0x14000_13e0usize);
+        ls.oep_provenance = OepProvenance::trace(
+            0x14000_13e0,
+            "runtime PossibleOEP confirmed as application prologue",
+        );
+        ls.oep_found_via_scanning = false;
+
+        sync_plugin_milestones(&mut packer, &mut ctx, &ls, 0x14000_0000);
+
+        assert_eq!(ctx.oep_provenance.source, mida_core::OepSource::Trace);
+        assert_eq!(ctx.oep_provenance.va, Some(0x14000_13e0));
+        assert_eq!(ctx.oep_provenance.rva, Some(0x13e0));
+        assert_eq!(ctx.oep_rva, Some(Rva(0x13e0)));
+        assert!(!ctx.oep_found_via_scanning);
+        assert!(ctx.oep_provenance.application_oep);
+
+        // A second sync with an identical provenance must not clobber it.
+        sync_plugin_milestones(&mut packer, &mut ctx, &ls, 0x14000_0000);
+        assert_eq!(ctx.oep_provenance.source, mida_core::OepSource::Trace);
+        assert_eq!(ctx.oep_provenance.rva, Some(0x13e0));
+
+        // The runtime_base helper must be set so the RVA derivation holds.
+        assert_eq!(ctx.runtime_base, Some(RuntimeBase(0x14000_0000)));
+    }
+
+    #[test]
+    fn sync_plugin_milestones_does_not_downgrade_unknown_to_fabricated_rva() {
+        // A provenance that never established a runtime VA must not gain a
+        // fabricated RVA just because the image base is known.
+        use crate::unpacker::loop_state::LoopState;
+        use mida_core::OepProvenance;
+
+        let mut packer = SelectedPacker::Oreans(ThemidaPlugin::new());
+        let mut ctx = PluginCtx::default();
+        let mut ls = LoopState::default();
+        ls.oep = Some(0x14000_13e0usize);
+        ls.oep_provenance = OepProvenance::unknown("no trustworthy OEP");
+        ls.oep_found_via_scanning = true;
+
+        sync_plugin_milestones(&mut packer, &mut ctx, &ls, 0x14000_0000);
+
+        assert_eq!(ctx.oep_provenance.source, mida_core::OepSource::Unknown);
+        assert_eq!(ctx.oep_provenance.va, None);
+        assert_eq!(ctx.oep_provenance.rva, None);
+    }
 }

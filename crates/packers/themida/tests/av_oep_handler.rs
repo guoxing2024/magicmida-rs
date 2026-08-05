@@ -315,6 +315,83 @@ fn virtualized_oep_redirect_returns_redirect_and_continues() {
 }
 
 #[test]
+fn valid_x64_code_branch_keeps_runtime_va_and_trace_provenance() {
+    // P8-B regression: the "OEP looks like valid x64 code — using as-is for
+    // non-MSVC compiler" branch previously set provenance to Unknown, dropping
+    // the runtime VA/RVA and forcing the OEP evidence sidecar to fail closed.
+    // A runtime PossibleOEP whose bytes confirm an x64 application prologue
+    // must keep source=Trace, va=Some, rva derivable, application_oep=true.
+    let mut query = ScriptedQuery::with_guard(GuardAccessResult::PossibleOEP {
+        address: (BASE + 0x13e0) as usize,
+    });
+    query.ret_addr = Some(BASE + 0x3000); // inside .themida → virtualized path
+    query.tls = Some(TlsCallbackResult {
+        oep_found: false,
+        oep_address: None,
+        tls_callbacks_executed: 0,
+    });
+    query.pattern_oep = None; // try_find_correct_oep returns nothing
+    query.scan_oep = None; // no scan replacement
+    query.code_bytes = Some(vec![0x48, 0x89, 0x5c, 0x24]); // rex.W mov [rsp+..],rbx (valid x64 prologue)
+    let mut themida = state();
+    let mut av = AvOepState {
+        guard_installed: true,
+        virtualized_oep_retries: 3, // retries exhausted → last PossibleOEP path
+        last_possible_oep: Some((BASE + 0x13e0) as usize),
+        ..AvOepState::default()
+    };
+    let mut input = input();
+    input.virtualized_oep_max_retries = 3;
+    let (_action, out) = decide(&mut query, &mut themida, &mut av, &input);
+
+    assert_eq!(out.oep, Some((BASE + 0x13e0) as usize));
+    assert_eq!(out.provenance.source, mida_core::OepSource::Trace);
+    assert_eq!(out.provenance.va, Some(BASE + 0x13e0));
+    assert!(out.provenance.application_oep);
+    assert!(!out.provenance.bootstrap_or_ambiguous);
+    // RVA is derived later at the CLI layer via record_oep_provenance
+    // (oep_va_to_rva against the runtime base); at the handler layer the VA is
+    // authoritative and the RVA may still be unset.
+    assert!(
+        !out.oep_found_via_scanning,
+        "valid-x64 acceptance is not a scan"
+    );
+}
+
+#[test]
+fn unconfirmed_possible_oep_keeps_runtime_va() {
+    // P8-B: a PossibleOEP accepted without a confirming pattern/scan trace
+    // still keeps its runtime VA (source=Trace), so the OEP evidence is not
+    // forced to unknown; the gate still fails closed on any entry mismatch.
+    let mut query = ScriptedQuery::with_guard(GuardAccessResult::PossibleOEP {
+        address: (BASE + 0x13e0) as usize,
+    });
+    query.ret_addr = Some(BASE + 0x3000); // inside .themida
+    query.tls = Some(TlsCallbackResult {
+        oep_found: false,
+        oep_address: None,
+        tls_callbacks_executed: 0,
+    });
+    query.pattern_oep = None;
+    query.scan_oep = None;
+    query.code_bytes = Some(vec![0x90, 0x90, 0x90, 0x90]); // NOPs: NOT a valid x64 prologue
+    let mut themida = state();
+    let mut av = AvOepState {
+        guard_installed: true,
+        virtualized_oep_retries: 3,
+        last_possible_oep: Some((BASE + 0x13e0) as usize),
+        ..AvOepState::default()
+    };
+    let mut input = input();
+    input.virtualized_oep_max_retries = 3;
+    let (_action, out) = decide(&mut query, &mut themida, &mut av, &input);
+
+    // Even without byte confirmation, the accepted PossibleOEP keeps its VA.
+    assert_eq!(out.provenance.source, mida_core::OepSource::Trace);
+    assert_eq!(out.provenance.va, Some(BASE + 0x13e0));
+}
+
+#[test]
 fn not_guarded_av_storm_breaks_with_fallback_and_freeze() {
     let mut query = ScriptedQuery::with_guard(GuardAccessResult::NotGuarded);
     let mut themida = state();

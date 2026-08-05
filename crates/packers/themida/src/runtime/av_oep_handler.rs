@@ -494,9 +494,16 @@ fn decide_possible_oep(
             );
         } else {
             state.oep = Some(address);
-            state.provenance = OepProvenance::unknown(format!(
-                "PossibleOEP without confirming trace: {address:#x}"
-            ));
+            // P8-B: a PossibleOEP without a confirming pattern/scan trace is
+            // still a runtime-observed address that the host accepts as the
+            // OEP candidate. Keep the runtime VA and mark it trace so the OEP
+            // evidence retains source/VA/RVA; the gate still fails closed on
+            // entry-RVA mismatch / ambiguity rather than dropping the address
+            // into unknown.
+            state.provenance = OepProvenance::trace(
+                address as u64,
+                format!("PossibleOEP accepted without confirming pattern trace: {address:#x}"),
+            );
         }
     }
 
@@ -594,9 +601,20 @@ fn decide_possible_oep(
                             "OEP looks like valid x64 code — using as-is for non-MSVC compiler ({oep_addr:#x})"
                         ));
                         state.oep = Some(oep_addr);
-                        state.provenance = OepProvenance::unknown(format!(
-                            "PossibleOEP byte-shape heuristic only: {oep_addr:#x}"
-                        ));
+                        // P8-B: this OEP is a runtime-observed PossibleOEP
+                        // (guard AV fault address) confirmed by its x64 prologue
+                        // byte shape. It is a runtime trace milestone, not a
+                        // .text scan and not the PE entry point fallback, so it
+                        // must keep the runtime VA and trace source. Marking it
+                        // unknown dropped the VA/RVA and made the OEP evidence
+                        // fail closed for an otherwise-valid application OEP.
+                        state.provenance = OepProvenance::trace(
+                            oep_addr as u64,
+                            format!(
+                                "runtime PossibleOEP confirmed as valid x64 application prologue: {oep_addr:#x}"
+                            ),
+                        );
+                        state.oep_found_via_scanning = false;
                     }
                 }
             }

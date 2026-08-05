@@ -10,6 +10,7 @@ use mida_core::OepProvenance;
 // LoopState — mutable tracking variables for the debug loop
 // ---------------------------------------------------------------------------
 
+#[derive(Default)]
 pub(super) struct LoopState {
     pub(super) guard_installed: bool,
     pub(super) close_handle_bp_set: bool,

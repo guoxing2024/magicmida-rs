@@ -667,6 +667,59 @@ mod tests {
     }
 
     #[test]
+    fn record_oep_provenance_derives_rva_and_keeps_runtime_identity() {
+        // P8-B: record_oep_provenance must derive the RVA from the runtime base
+        // and keep the full runtime provenance (source/VA/application_oep), so
+        // the post-loop sidecar consumes the same confirmed provenance.
+        let mut ctx = PluginCtx {
+            runtime_base: Some(RuntimeBase(0x14000_0000)),
+            preferred_base: Some(PreferredBase(0x14000_0000)),
+            ..Default::default()
+        };
+        ctx.record_oep_provenance(OepProvenance::trace(
+            0x14000_13e0,
+            "runtime PossibleOEP confirmed as application prologue",
+        ));
+        assert_eq!(ctx.oep_rva, Some(Rva(0x13e0)));
+        assert_eq!(ctx.oep_provenance.source, OepSource::Trace);
+        assert_eq!(ctx.oep_provenance.va, Some(0x14000_13e0));
+        assert_eq!(ctx.oep_provenance.rva, Some(0x13e0));
+        assert!(ctx.oep_provenance.application_oep);
+        assert!(!ctx.oep_provenance.bootstrap_or_ambiguous);
+        assert!(!ctx.oep_found_via_scanning);
+    }
+
+    #[test]
+    fn record_oep_provenance_scan_fallback_is_preserved_not_overwritten() {
+        // A scan fallback provenance must not be silently rewritten to a
+        // runtime source; the gate relies on the preserved ScanFallback flag.
+        let mut ctx = PluginCtx {
+            runtime_base: Some(RuntimeBase(0x14000_0000)),
+            ..Default::default()
+        };
+        ctx.record_oep_provenance(OepProvenance::scan_fallback(
+            0x14000_13e0,
+            "live .text scan selected OEP",
+        ));
+        assert_eq!(ctx.oep_provenance.source, OepSource::ScanFallback);
+        assert_eq!(ctx.oep_provenance.va, Some(0x14000_13e0));
+        assert!(ctx.oep_provenance.bootstrap_or_ambiguous);
+        assert!(!ctx.oep_provenance.application_oep);
+        assert!(ctx.oep_found_via_scanning);
+    }
+
+    #[test]
+    fn record_oep_provenance_requires_runtime_base_for_rva() {
+        // Without a runtime base the RVA stays unset; the gate must fail
+        // closed rather than fabricate an RVA from the preferred base alone.
+        let mut ctx = PluginCtx::default();
+        ctx.record_oep_provenance(OepProvenance::trace(0x14000_13e0, "runtime RIP observed"));
+        assert_eq!(ctx.oep_provenance.va, Some(0x14000_13e0));
+        assert_eq!(ctx.oep_provenance.rva, None);
+        assert_eq!(ctx.oep_rva, None);
+    }
+
+    #[test]
     fn refresh_loop_policy_short_wait_and_close_handle() {
         let mut p = NullPackerPlugin;
         let mut ctx = PluginCtx {
