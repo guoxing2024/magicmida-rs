@@ -241,7 +241,15 @@ pub(crate) fn create_import_section(
 
     let import_dir_size = builder
         .emitted_descriptor_count()
-        .saturating_mul(crate::import_table::IMPORT_DESCRIPTOR_SIZE);
+        .saturating_mul(crate::import_table::IMPORT_DESCRIPTOR_SIZE)
+        // The import directory must cover the null terminator descriptor too.
+        // `build_import_section_no_iat` appends a full 20-byte zero descriptor
+        // immediately after the last real descriptor. The independent final-PE
+        // parser (`parse_final_import_identities`) fails closed when the
+        // directory does not reach that terminator ("import descriptor array is
+        // not terminated within directory"). Include the terminator so the
+        // emitted directory is self-terminating and the loader/parser agree.
+        .saturating_add(crate::import_table::IMPORT_DESCRIPTOR_SIZE);
     pe.nt_headers.optional_header.data_directory[IMAGE_DIRECTORY_ENTRY_IMPORT] =
         crate::header::ImageDataDirectory {
             virtual_address: section_va,
@@ -492,6 +500,162 @@ mod tests {
         assert_eq!(
             slot1, 0,
             "zero terminator must overwrite stale live pointer"
+        );
+    }
+
+    #[test]
+    fn import_directory_size_covers_null_terminator_descriptor() {
+        // P8-C: the import directory must reach the full 20-byte null
+        // terminator descriptor appended by build_import_section_no_iat, so the
+        // independent final-PE parser (`parse_final_import_identities`) does
+        // not report "import descriptor array is not terminated within
+        // directory". Regression for the P7-R2 origin candidate (296 resolved +
+        // 17 terminator slots, final_imports empty).
+        let pe_bytes = crate::header::make_minimal_pe64();
+        let mut pe = PeHeader::from_bytes(&pe_bytes).expect("minimal pe");
+        // Minimal image size so create_section_index can append .import.
+        pe.nt_headers.optional_header.size_of_image = 0x6000;
+
+        let mut builder = ImportTableBuilder::new(true);
+        builder.add_module("kernel32.dll");
+        let thunks = [
+            0x2000u32, // resolved slot (dummy IAT address)
+            0x2010u32, // second resolved slot
+        ];
+        let mod_b = builder.modules.last_mut().expect("module");
+        for addr in thunks {
+            mod_b.thunks.push(ImportThunk {
+                iat_address: addr,
+                function_name: Some("SomeApi".to_string()),
+                ordinal: None,
+                is_64bit: true,
+            });
+        }
+
+        let mut dump_buf = vec![0u8; 0x400];
+        let _ = create_import_section(&mut pe, &builder, 0x2000, &mut dump_buf, true);
+
+        let dir = pe.nt_headers.optional_header.data_directory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+        let desc_count = builder.emitted_descriptor_count();
+        // Directory must cover desc_count real descriptors PLUS the null
+        // terminator descriptor (one full 20-byte record).
+        let expected = (desc_count + 1) * crate::import_table::IMPORT_DESCRIPTOR_SIZE;
+        assert_eq!(
+            dir.size as usize, expected,
+            "import directory size must include the null terminator descriptor"
+        );
+        // And the section data written by build_import_section_no_iat really
+        // contains a null terminator immediately after the last real descriptor.
+        let (section_data, _) = builder.build_import_section_no_iat(dir.virtual_address, 0x2000);
+        let term_offset = desc_count * crate::import_table::IMPORT_DESCRIPTOR_SIZE;
+        assert!(term_offset + 20 <= section_data.len());
+        assert!(
+            section_data[term_offset..term_offset + 20]
+                .iter()
+                .all(|&b| b == 0),
+            "section data must append a full null terminator descriptor"
+        );
+    }
+
+    /// Assemble a full on-disk PE image from a `PeHeader` whose sections carry
+    /// `extra_data` (headers + per-section raw payloads at their raw offsets).
+    /// `dos_prefix` is the original DOS/e_lfanew stub (bytes before the NT
+    /// signature), because `serialize_headers` emits only the NT core.
+    fn assemble_image(pe: &PeHeader, dos_prefix: &[u8]) -> Vec<u8> {
+        let mut image = pe.serialize_headers().expect("serialize headers");
+        let mut out = dos_prefix.to_vec();
+        out.extend_from_slice(&image);
+        image = out;
+        for section in &pe.sections {
+            let ptr = section.header.pointer_to_raw_data as usize;
+            let raw_sz = section.header.size_of_raw_data as usize;
+            let end = ptr.saturating_add(raw_sz);
+            if image.len() < end {
+                image.resize(end, 0);
+            }
+            if let Some(data) = &section.extra_data {
+                let n = std::cmp::min(data.len(), raw_sz);
+                image[ptr..ptr + n].copy_from_slice(&data[..n]);
+            }
+        }
+        image
+    }
+
+    #[test]
+    fn emission_end_to_end_parse_final_imports_reconstructs_target_set() {
+        // P8-C end-to-end: ImportTableBuilder → create_import_section → full
+        // on-disk image → parse_final_import_identities must reconstruct the
+        // exact target set (module + function per slot). This is the
+        // "negative → candidate" proof that reconstruction runs end-to-end and
+        // the independent final-PE reader agrees with the emitted table.
+        let pe_bytes = crate::header::make_minimal_pe64();
+        let mut pe = PeHeader::from_bytes(&pe_bytes).expect("minimal pe");
+        pe.nt_headers.optional_header.size_of_image = 0x6000;
+
+        let mut builder = ImportTableBuilder::new(true);
+        {
+            let m = builder.add_module("kernel32.dll");
+            for (i, name) in ["ExitProcess", "GetProcAddress", "LoadLibraryA"]
+                .iter()
+                .enumerate()
+            {
+                m.thunks.push(ImportThunk {
+                    iat_address: 0x1100 + (i as u32) * 8, // inside .text (RVA 0x1000..)
+                    function_name: Some(name.to_string()),
+                    ordinal: None,
+                    is_64bit: true,
+                });
+            }
+        }
+        {
+            let m = builder.add_module("user32.dll");
+            m.thunks.push(ImportThunk {
+                iat_address: 0x1120,
+                function_name: Some("MessageBoxA".to_string()),
+                ordinal: None,
+                is_64bit: true,
+            });
+        }
+
+        let mut dump_buf = vec![0u8; 0x2000];
+        let _ = create_import_section(&mut pe, &builder, 0x1100, &mut dump_buf, true);
+
+        let mut image = assemble_image(&pe, &pe_bytes[..0x40]);
+        // Emit the Hint/Name RVAs into the IAT (FirstThunk) region, exactly as
+        // the real emission does via write_iat_to_output.
+        let (_, thunks) = builder.build_import_section_no_iat(
+            pe.nt_headers.optional_header.data_directory[IMAGE_DIRECTORY_ENTRY_IMPORT]
+                .virtual_address,
+            0x1100,
+        );
+        write_iat_to_output(&mut image, &pe, &thunks, 0x1100, true);
+
+        let final_imports = crate::original_imports::parse_final_import_identities(&image)
+            .expect("parse final imports");
+
+        // Reconstructed set must equal the builder's target set.
+        let expected = builder
+            .modules
+            .iter()
+            .flat_map(|m| {
+                m.thunks
+                    .iter()
+                    .map(|t| (m.name.clone(), t.function_name.clone()))
+            })
+            .collect::<std::collections::HashSet<_>>();
+        let got = final_imports
+            .iter()
+            .map(|item| (item.module_name.clone(), item.function_name.clone()))
+            .collect::<std::collections::HashSet<_>>();
+
+        assert_eq!(
+            got, expected,
+            "final imports must equal the emitted target set"
+        );
+        assert_eq!(
+            final_imports.len(),
+            4,
+            "one slot per thunk, no phantom entries"
         );
     }
 }
