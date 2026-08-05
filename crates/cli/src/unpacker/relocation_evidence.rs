@@ -525,6 +525,10 @@ fn compare_runtime_final(
             blockers.push(format!("{name} was not preserved"));
         }
     }
+    // P8-E: the gate recomputes preservation independently and requires the
+    // blocker lists to be sorted and deduplicated. Sort here so the sidecar's
+    // preservation matches the gate's recomputation field-for-field.
+    stable_blockers(&mut blockers);
     let all_preserved = blockers.is_empty();
     RelocationPreservationComparison {
         pe_kind_preserved,
@@ -833,4 +837,101 @@ fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
 fn stable_blockers(blockers: &mut Vec<String>) {
     blockers.sort();
     blockers.dedup();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mida_pe::RelocationObservationReport;
+
+    fn final_evidence(dynamic_base: bool, relocs_stripped: bool) -> FinalRelocationEvidence {
+        FinalRelocationEvidence {
+            directory_present: true,
+            pe32_plus: true,
+            pointer_size: 8,
+            image_base: 0x14000_0000,
+            size_of_image: 0x1000,
+            directory_rva: 0x1000,
+            directory_size: 0x200,
+            directory_raw_offset: Some(0x200),
+            directory_raw_backed: true,
+            dynamic_base,
+            relocs_stripped,
+            block_count: 1,
+            entry_count: 1,
+            non_absolute_entry_count: 1,
+            observed_types: vec![10],
+            blocks: Vec::new(),
+            targets: Vec::new(),
+            all_targets_raw_backed: true,
+            has_non_absolute_entry: true,
+            blockers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn preservation_blockers_are_sorted_and_deduplicated() {
+        // P8-E: the gate recomputes preservation independently and requires
+        // sorted+deduped blocker lists. The producer must match field-for-field
+        // so 'preservation comparison disagrees with recomputation' does not
+        // fire merely because the sidecar order differed.
+        let runtime = RelocationObservationReport {
+            dynamic_base: true,
+            relocs_stripped: false,
+            pe32_plus: true,
+            pointer_size: 8,
+            ..Default::default()
+        };
+        // Final differs on DYNAMIC_BASE, relocs_stripped, and target set
+        // (empty vs empty is equal, so force a mismatch via block/entry counts
+        // that feed target_set by length — both empty keeps length equal, so
+        // use non-empty target counts through a longer target list instead).
+        let mut final_candidate = final_evidence(false, true);
+        // target_set_preserved compares target lists by length+fields; keep
+        // both empty but force failure via pe_kind/pointer mismatch to get a
+        // multi-item blocker set.
+        final_candidate.pe32_plus = false;
+        final_candidate.pointer_size = 4;
+
+        let preserved = compare_runtime_final(&runtime, &final_candidate);
+        // More than one blocker: pe_kind, pointer size, DYNAMIC_BASE, RELOCS_STRIPPED.
+        assert!(
+            preserved.blockers.len() >= 3,
+            "expected multiple preservation blockers, got {:?}",
+            preserved.blockers
+        );
+        // Sorted and deduplicated (stable_blockers contract).
+        let mut sorted = preserved.blockers.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            preserved.blockers, sorted,
+            "blockers must be sorted+deduped"
+        );
+    }
+
+    #[test]
+    fn matching_dynamic_base_passes_preservation() {
+        // P8-E: with the emission fix the final candidate keeps DYNAMIC_BASE
+        // when the runtime observed it, so DYNAMIC_BASE preservation passes.
+        let runtime = RelocationObservationReport {
+            dynamic_base: true,
+            relocs_stripped: false,
+            pe32_plus: true,
+            pointer_size: 8,
+            ..Default::default()
+        };
+        let final_candidate = final_evidence(true, false);
+        let preserved = compare_runtime_final(&runtime, &final_candidate);
+        assert!(
+            preserved.dynamic_base_preserved,
+            "DYNAMIC_BASE must be preserved when both sides set it"
+        );
+        assert!(
+            preserved.relocs_stripped_preserved,
+            "RELOCS_STRIPPED must be preserved when both agree"
+        );
+        // With empty target lists on both sides, target set is trivially equal.
+        assert!(preserved.target_set_preserved);
+    }
 }

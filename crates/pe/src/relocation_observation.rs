@@ -103,6 +103,7 @@ impl RelocationObservationReport {
 pub fn observe_relocations_runtime<F, E>(
     pe: &PeHeader,
     load_base: u64,
+    preferred_image_base: u64,
     mut read_memory: F,
 ) -> RelocationObservationReport
 where
@@ -117,7 +118,7 @@ where
         pe32_plus: pe.is_64bit,
         pointer_size,
         runtime_image_base: load_base,
-        preferred_image_base: pe.image_base,
+        preferred_image_base,
         size_of_image: pe.size_of_image(),
         directory_rva: directory.virtual_address,
         directory_size: directory.size,
@@ -412,11 +413,12 @@ mod tests {
         memory[directory + 8..directory + 10].copy_from_slice(&0xA100u16.to_le_bytes());
         let target = 0x1100usize;
         memory[target..target + 8].copy_from_slice(&(runtime_base + 0x1234).to_le_bytes());
-        let report = observe_relocations_runtime(&pe, runtime_base, |address, buffer| {
-            let offset = usize::try_from(address - runtime_base).expect("offset");
-            buffer.copy_from_slice(&memory[offset..offset + buffer.len()]);
-            Ok::<usize, String>(buffer.len())
-        });
+        let report =
+            observe_relocations_runtime(&pe, runtime_base, pe.image_base, |address, buffer| {
+                let offset = usize::try_from(address - runtime_base).expect("offset");
+                buffer.copy_from_slice(&memory[offset..offset + buffer.len()]);
+                Ok::<usize, String>(buffer.len())
+            });
         assert!(report.is_complete(), "{report:#?}");
         assert_eq!(report.non_absolute_entry_count, 1);
         assert_eq!(report.targets[0].normalized_value, Some(0x140001234));

@@ -304,9 +304,20 @@ pub fn dump_process_with_report(
         });
     // Freeze relocation facts before header patching, shrinking, sanitizing,
     // or rebuilding .reloc. Rebuilt relocation bytes are never runtime proof.
+    // preferred_image_base is the on-disk PE base (the runtime `pe.image_base`
+    // may be the ASLR load base); read it from the disk executable when
+    // available so relocation image identity matches the PE evidence.
+    let preferred_image_base = opts
+        .executable_path
+        .as_ref()
+        .and_then(|path| std::fs::read(path).ok())
+        .and_then(|bytes| crate::header::PeHeader::from_bytes(&bytes).ok())
+        .map(|disk_pe| disk_pe.nt_headers.optional_header.image_base)
+        .unwrap_or_else(|| pe.image_base);
     let relocation_report = crate::relocation_observation::observe_relocations_runtime(
         &pe,
         opts.image_base,
+        preferred_image_base,
         |address, buffer| {
             let native_address = usize::try_from(address).map_err(|_| {
                 format!("relocation reader address {address:#x} does not fit usize")
