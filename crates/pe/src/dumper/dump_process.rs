@@ -1320,7 +1320,13 @@ pub fn dump_process_with_report(
             entry_point_rva: output_entry_point,
             rebind_exceptions: false,
             rebind_relocations: false,
-            prefer_aslr_when_relocs: false,
+            // P8-E: preserve ASLR when the (post-patch) PE still requests it.
+            // header_patch only clears DYNAMIC_BASE for genuinely fixed-base
+            // inputs, so prefer_aslr_when_relocs should mirror that bit: a
+            // candidate that rebuilds a full `.reloc` and whose original
+            // requested ASLR must keep DYNAMIC_BASE in the emitted image.
+            prefer_aslr_when_relocs: (pe.nt_headers.optional_header.dll_characteristics & 0x0040)
+                != 0,
             preserve_section_vas: true,
             carry_host_data_directories: true,
             max_slice_bytes: super::helpers::MAX_IMAGE_DUMP_BYTES,

@@ -63,8 +63,18 @@ pub(crate) fn validate_and_patch_pe_header(
                     );
                 }
                 // 禁用 ASLR：程序加载到固定基址，不需要重定位表
-                pe.nt_headers.optional_header.dll_characteristics &=
-                    !IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE;
+                // P8-E: only clear DYNAMIC_BASE for genuinely fixed-base inputs
+                // (the on-disk PE did not request ASLR). The dump rebuilds a
+                // full `.reloc` from the live image; if the original requested
+                // ASLR we must preserve DYNAMIC_BASE so the relocation evidence
+                // stays coherent and the loader can rebase the candidate.
+                let disk_dynamic_base = disk_pe.nt_headers.optional_header.dll_characteristics
+                    & IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE
+                    != 0;
+                if !disk_dynamic_base {
+                    pe.nt_headers.optional_header.dll_characteristics &=
+                        !IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE;
+                }
                 info!("validated PE header fields");
             }
         }
