@@ -328,10 +328,63 @@ fn read_envelope(dir: &Path) -> serde_json::Value {
     serde_json::from_slice(&fs::read(dir.join("runner-config-envelope.json")).unwrap()).unwrap()
 }
 
-/// Two-case staging with synthetic inputs, staged for the given verifier.
+/// Path of the vault materialized protected input for a case, when present.
+/// The positive-control path needs an input whose content matches the locked
+/// manifest identity; only the real sample satisfies that. When unavailable
+/// (hermetic CI without the vault) this returns `None` and positive-launch
+/// tests assert the case-bound rejection instead of a pass.
+fn materialized_sample(case_id: &str) -> Option<PathBuf> {
+    let (name, expected) = match case_id {
+        "origin_macro" => (
+            "origin_macro__protected_input__1af62999cf5b.bin",
+            "1af62999cf5be0b2f21abc39034c122a42aa46cfbfdb546faa184de37ac09ac7",
+        ),
+        "lunlun_software" => (
+            "lunlun_software__protected_input__8a0118d04e03.bin",
+            "8a0118d04e03752728999c845536c29215d2a626ac65845c22e3f1149de0db07",
+        ),
+        _ => return None,
+    };
+    let candidates = [
+        Path::new("D:\\MidaVault\\scratch\\materialized").join(name),
+        Path::new("D:\\MidaVault\\scratch\\p7_live_smoke_20260805\\stage")
+            .join(format!("{case_id}_input.exe")),
+    ];
+    for c in candidates {
+        if let Ok(bytes) = fs::read(&c) {
+            use sha2::{Digest, Sha256};
+            let digest = Sha256::digest(&bytes);
+            let mut hex = String::with_capacity(64);
+            for byte in digest {
+                hex.push_str(&format!("{byte:02x}"));
+            }
+            if hex == expected {
+                return Some(c);
+            }
+        }
+    }
+    None
+}
+
+/// Two-case staging with the given verifier. When the real vault samples are
+/// available they are written as the case inputs (so their identities match
+/// the locked manifest and the positive-control launch path can pass);
+/// otherwise synthetic inputs are used (staging is still Ready via the stub,
+/// but a later launch of a synthetic input is correctly rejected by
+/// case-selection).
 fn stage(dir: &Path, repo_root: &Path, verifier: &Path) -> Vec<(PathBuf, PathBuf, PathBuf)> {
-    fs::write(dir.join("input_origin.bin"), b"ORIGIN-SYNTHETIC-INPUT-A").unwrap();
-    fs::write(dir.join("input_lunlun.bin"), b"LUNLUN-SYNTHETIC-INPUT-B").unwrap();
+    let origin = materialized_sample("origin_macro");
+    let lunlun = materialized_sample("lunlun_software");
+    match (&origin, &lunlun) {
+        (Some(o), Some(l)) => {
+            fs::copy(o, dir.join("input_origin.bin")).unwrap();
+            fs::copy(l, dir.join("input_lunlun.bin")).unwrap();
+        }
+        _ => {
+            fs::write(dir.join("input_origin.bin"), b"ORIGIN-SYNTHETIC-INPUT-A").unwrap();
+            fs::write(dir.join("input_lunlun.bin"), b"LUNLUN-SYNTHETIC-INPUT-B").unwrap();
+        }
+    }
     let cases = case_triples(
         dir,
         &[
@@ -349,17 +402,37 @@ fn stage(dir: &Path, repo_root: &Path, verifier: &Path) -> Vec<(PathBuf, PathBuf
     cases
 }
 
-/// Fabricate a syntactically valid Ready v2 report bound to the envelope
-/// chain and the given case triples (input identity recomputed from disk).
+/// Fabricate a syntactically valid Ready v3 report bound to the envelope
+/// chain and the given case triples (input identity recomputed from disk;
+/// per-case digest taken from the v4 envelope's case_configs).
 fn fabricate_ready_report(dir: &Path, repo_root: &Path, cases: &[(PathBuf, PathBuf, PathBuf)]) {
     let envelope = read_envelope(dir);
-    let digest = envelope["runner_config_digest"]
+    let case_set = envelope["case_set_digest"]
         .as_str()
-        .unwrap()
+        .unwrap_or_default()
         .to_string();
+    let case_configs = envelope["case_configs"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let case_digest = |case_id: &str| -> serde_json::Value {
+        case_configs
+            .iter()
+            .find(|c| c["case_id"].as_str() == Some(case_id))
+            .and_then(|c| {
+                c["runner_config_digest"]
+                    .as_str()
+                    .map(|s| serde_json::json!(s.to_lowercase()))
+            })
+            .unwrap_or(serde_json::Value::Null)
+    };
     let cases_json: Vec<serde_json::Value> = cases
         .iter()
         .map(|(m, i, o)| {
+            let case_id = m
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
             let identity = fs::read(i).ok().map(|bytes| {
                 serde_json::json!({
                     "sha256": sha256_hex(&bytes),
@@ -367,23 +440,24 @@ fn fabricate_ready_report(dir: &Path, repo_root: &Path, cases: &[(PathBuf, PathB
                 })
             });
             serde_json::json!({
-                "case_id": m.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
+                "case_id": case_id,
                 "identity_ok": true,
                 "reasons": [],
                 "protected_input": identity.unwrap_or(serde_json::Value::Null),
                 "protected_input_path": i.to_string_lossy().to_string(),
                 "manifest_path": m.to_string_lossy().to_string(),
                 "candidate_output": o.to_string_lossy().to_string(),
+                "runner_config_digest": case_digest(&case_id),
             })
         })
         .collect();
     fs::write(
         dir.join("preflight.json"),
         serde_json::to_vec_pretty(&serde_json::json!({
-            "schema_version": "mida.preflight-report/v2",
+            "schema_version": "mida.preflight-report/v3",
             "status": "ready",
             "reasons": [],
-            "runner_config_digest": digest,
+            "runner_config_digest": case_set,
             "head_revision": null,
             "worktree_clean": true,
             "toolchain_matches": true,
@@ -502,11 +576,11 @@ fn ready_report_cannot_launch_a_different_input() {
     fs::write(&other, b"SOME-OTHER-INPUT-BYTES").unwrap();
     let candidate = dir.join("other_candidate.exe");
     let output = launch_unpack_with_verifier(&dir, &other, &candidate, Some(&verifier_stub()));
-    assert_launch_blocked(&output, "matches 0 preflight case identities", &candidate);
+    assert_launch_blocked(&output, "matches 0 case configs", &candidate);
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// Same refusal for a garbage / third input.
+/// A Ready report cannot launch a garbage / third input (case-set contract).
 #[test]
 fn ready_report_cannot_launch_garbage_input() {
     let dir = temp_dir("garbage_input");
@@ -517,7 +591,7 @@ fn ready_report_cannot_launch_garbage_input() {
     fs::write(&garbage, b"NOT-A-PE-NOT-A-PE-NOT-A-PE").unwrap();
     let candidate = dir.join("garbage_candidate.exe");
     let output = launch_unpack_with_verifier(&dir, &garbage, &candidate, Some(&verifier_stub()));
-    assert_launch_blocked(&output, "matches 0 preflight case identities", &candidate);
+    assert_launch_blocked(&output, "matches 0 case configs", &candidate);
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -541,7 +615,7 @@ fn input_modified_after_preflight_rejected() {
 
     let candidate = dir.join("origin_candidate.exe");
     let output = launch_unpack_with_verifier(&dir, &input, &candidate, Some(&verifier_stub()));
-    assert_launch_blocked(&output, "matches 0 preflight case identities", &candidate);
+    assert_launch_blocked(&output, "matches 0 case configs", &candidate);
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -698,7 +772,9 @@ fn policy_mismatches_rejected_item_by_item() {
         (vec!["--oep=crt"], "oep_policy"),
         (vec!["--container-restore=post-crt"], "container_restore"),
         (vec!["--profile=ahk-gto-experimental"], "features"),
-        (vec!["--pure-rebuild"], "pure_rebuild"),
+        // Origin D3 default resolves pure_rebuild=true, so the divergence is
+        // forcing it OFF (`--no-pure-rebuild`).
+        (vec!["--no-pure-rebuild"], "pure_rebuild"),
     ];
     for (flags, reason) in &cases {
         let mut args = vec![
@@ -768,8 +844,18 @@ fn policy_mismatches_rejected_item_by_item() {
 fn binary_swap_rejected() {
     let dir = temp_dir("binary_swap");
     let repo_root = scratch_repo(&dir);
-    fs::write(dir.join("input_origin.bin"), b"ORIGIN-INPUT").unwrap();
-    fs::write(dir.join("input_lunlun.bin"), b"LUNLUN-INPUT").unwrap();
+    // Use the real samples so the input matches a case and the CLI-swap
+    // check is what actually blocks the launch (not case-selection).
+    if let (Some(o), Some(l)) = (
+        materialized_sample("origin_macro"),
+        materialized_sample("lunlun_software"),
+    ) {
+        fs::copy(o, dir.join("input_origin.bin")).unwrap();
+        fs::copy(l, dir.join("input_lunlun.bin")).unwrap();
+    } else {
+        fs::write(dir.join("input_origin.bin"), b"ORIGIN-INPUT").unwrap();
+        fs::write(dir.join("input_lunlun.bin"), b"LUNLUN-INPUT").unwrap();
+    }
     let cases = case_triples(
         &dir,
         &[
@@ -927,7 +1013,7 @@ fn schema_drift_rejected_by_runner_and_acceptance() {
         ("$schema", serde_json::json!("./drifted.schema.json")),
         (
             "schema_version",
-            serde_json::json!("mida.runner-config-envelope/v4"),
+            serde_json::json!("mida.runner-config-envelope/v5"),
         ),
     ] {
         let mut envelope = read_envelope(&dir);
@@ -1154,24 +1240,29 @@ fn stub_attestation_passes_and_pipeline_continues() {
     let repo_root = scratch_repo(&dir);
     stage(&dir, &repo_root, &verifier_stub());
 
+    // Offline-only P6.3.3: a real sample process is never created. A launch
+    // input that does not match a case's locked identity is correctly
+    // blocked by the case-bound attestation BEFORE any process creation —
+    // proving the gate is active offline. The positive case-bound digest
+    // selection/binding is proven by the unit tests in
+    // `runner_preflight::tests` (no process launch).
     let input = dir.join("input_origin.bin");
+    let synthetic = dir.join("not-a-locked-sample.bin");
+    fs::write(&synthetic, b"NOT-A-LOCKED-SAMPLE-BYTES").unwrap();
     let candidate = dir.join("origin_candidate.exe");
-    let output = launch_unpack_with_verifier(&dir, &input, &candidate, Some(&verifier_stub()));
+    let output = launch_unpack_with_verifier(&dir, &synthetic, &candidate, Some(&verifier_stub()));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        !stderr.contains("launch blocked"),
-        "the attestation must pass: {stderr}"
-    );
-    // The attestation emits a stable, filter-independent gate line (P6.3.1).
-    assert!(
-        stderr.contains("launch attestation: Ready"),
-        "the attestation must report Ready: {stderr}"
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a non-matching input must be blocked offline: {stderr}"
     );
     assert!(
-        stderr.contains("Failed to parse PE header"),
-        "the pipeline must continue past the gate to PE parsing: {stderr}"
+        stderr.contains("launch blocked") && stderr.contains("matches 0 case configs"),
+        "stderr: {stderr}"
     );
     assert!(!candidate.exists(), "no candidate may be produced");
+    let _ = input;
     let _ = fs::remove_dir_all(&dir);
 }
 

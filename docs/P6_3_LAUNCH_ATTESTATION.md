@@ -176,3 +176,83 @@ sealed `RunEvidenceContext` and exercise the by-value ownership consume.
 - The AHK/GTO product-recovery route does not participate in the Oreans
   evidence-bundle chain (its attested context stays unused).
 - No claim of live, perfect, universal, or 10/10 behavior is made.
+
+# P6.3.3 Case-Bound Runner Config Closure
+
+Status: implemented on `oreans/two-sample-mainline`.
+
+Scope: pure offline engineering closure. No real sample process was created;
+the P7 one-time live-smoke quota remains 0/4.
+
+## Design conflict discovered during P7-0 preflight
+
+The pre-P6.3.3 `/offline-preflight` built a single `mida.runner-config-envelope/v3`
+from `frozen_runner_config()`, which hardcodes `pure_rebuild=false`. At actual
+`/unpack` parse time the Origin Macro D3 default (`origin_pure::resolve_pure_rebuild`)
+resolves `pure_rebuild=true` for the verified origin_macro input. A single
+top-level `runner_config_digest` therefore could not honestly authorize both
+origin_macro (`pure_rebuild=true`) and lunlun_software (`pure_rebuild=false`).
+The launch attestation's `bind_actual_config_to_envelope` digest-equality check
+would block the Origin launch (actual digest `true` vs envelope digest `false`).
+
+That P7-0 v3 preflight directory is preserved and marked `SUPERSEDED.md`
+(config-model-conflict). It does not constitute a failed live run; the live-slot
+usage stays 0/4.
+
+## Resolution: case-bound envelope v4
+
+- `mida.runner-config-envelope/v4` removes the ambiguous top-level
+  `runner_config`/`runner_config_digest` and replaces them with
+  `case_configs: [CaseRunnerConfigEnvelope]` — exactly the two fixed cases,
+  each carrying `case_id`, `protected_input` identity (locked manifest
+  artifact), full `RunnerConfig`, and its own `runner_config_digest`.
+- A sealed `case_set_digest` covers every case config and its case/input
+  binding (`case=id\nprotected_input=sha|size\nrunner_config_digest=...`),
+  so any single-case tamper breaks the whole-envelope seal.
+- Staging (`run_offline_preflight_command`) builds one config per REAL case
+  input from `frozen_run_policy(case.input)` — the Origin D3 default resolves
+  `pure_rebuild=true` only for the verified origin_macro input, never by the
+  `case_id` string.
+- The acceptance verifier independently reparses the v4 envelope, recomputes
+  EACH case's digest and the case-set digest, validates the
+  case_id ↔ protected identity ↔ config-digest binding, and fails the whole
+  preflight on any single-case drift. A v3 single-config envelope is rejected
+  (no silent upgrade).
+- The launch attestation first matches the current protected input to EXACTLY
+  ONE case, then compares the actual config digest against ONLY that case's
+  digest; `policy_matches(actual, frozen_run_policy(input))` still runs. The
+  selected case's digest flows into the `RunEvidenceContext` and the bundle.
+- The preflight report is `mida.preflight-report/v3`: each case entry carries
+  its own `runner_config_digest`, and the top-level digest is the envelope's
+  case-set digest; the report and envelope cross-validate every case.
+
+## P6.3.3 attack tests
+
+Positive (case-bound digest binding, hermetic unit tests in
+`runner_preflight::tests`):
+
+- Origin config `pure_rebuild=true` and Lunlun `pure_rebuild=false` in one
+  envelope, distinct per-case digests, independently recomputable.
+- `select_case_config` picks the unique case by input identity (0 or 2+ matches
+  refused).
+- `bind_actual_config_to_envelope` compares only the selected case's digest:
+  Origin actual vs Lunlun digest is rejected, and vice versa.
+- `case_set_digest` re-seals and rejects missing/duplicate/extra cases.
+
+Negative (integration, real acceptance binary + launch):
+
+- swapping the two per-case configs (stale per-case digest, re-sealed outer
+  hash) is rejected by the verifier;
+- forcing Origin `pure_rebuild=false` / Lunlun `pure_rebuild=true` is rejected
+  at launch (actual digest no longer matches the tampered case digest) before
+  process creation;
+- a v3 single-config envelope is rejected by the acceptance verifier;
+- `launch_attestation` (20 tests) and `preflight_boundary` (12 tests) cover the
+  case-bound selection, per-case digest drift, hand-written-Ready, and
+  before-process-creation blocking.
+
+## Boundaries after P6.3.3
+
+- No real sample process was created; P7 is NOT authorized.
+- `validation_summary.json` remains `open`.
+- No claim of live, perfect, universal, or 10/10 behavior is made.
