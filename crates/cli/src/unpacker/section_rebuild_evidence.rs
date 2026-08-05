@@ -99,6 +99,16 @@ pub(crate) fn write_section_rebuild_evidence(
     Ok(sidecar)
 }
 
+fn align_up_u64(value: u64, alignment: u64) -> u64 {
+    if alignment <= 1 {
+        return value;
+    }
+    value
+        .checked_add(alignment - 1)
+        .map(|sum| sum / alignment * alignment)
+        .unwrap_or(u64::MAX)
+}
+
 fn build_section_rebuild_evidence(
     protected_path: &Path,
     protected_bytes: &[u8],
@@ -162,10 +172,13 @@ fn build_section_rebuild_evidence(
             let present = directory.virtual_address != 0 || directory.size != 0;
             let security_file_offset = index == 4 && present;
             let end = directory.virtual_address.checked_add(directory.size);
+            // P8-F: an absent directory (RVA 0) must not report in_image=true;
+            // gate recomputation requires the same so both agree field-for-field.
             let in_image = if security_file_offset {
                 false
             } else {
-                end.is_some_and(|end| end <= optional.size_of_image)
+                directory.virtual_address != 0
+                    && end.is_some_and(|end| end <= optional.size_of_image)
             };
             let raw_backed = if security_file_offset {
                 usize::try_from(directory.virtual_address)
@@ -173,13 +186,14 @@ fn build_section_rebuild_evidence(
                     .and_then(|offset| offset.checked_add(directory.size as usize))
                     .is_some_and(|end| end <= candidate_bytes.len())
             } else {
-                end.is_some_and(|end| {
-                    pe.sections.iter().any(|section| {
-                        section.raw_size != 0
-                            && directory.virtual_address >= section.virtual_address
-                            && end <= section.virtual_address.saturating_add(section.raw_size)
+                directory.virtual_address != 0
+                    && end.is_some_and(|end| {
+                        pe.sections.iter().any(|section| {
+                            section.raw_size != 0
+                                && directory.virtual_address >= section.virtual_address
+                                && end <= section.virtual_address.saturating_add(section.raw_size)
+                        })
                     })
-                })
             };
             Directory {
                 index: index as u8,
@@ -253,12 +267,52 @@ fn build_section_rebuild_evidence(
         blockers.push("entry is not executable and raw-backed".to_string());
     }
     for directory in &directories {
-        if directory.present
-            && (!directory.in_image || !directory.raw_backed)
-            && !directory.security_file_offset
-        {
-            blockers.push(format!("directory {} is not raw-backed", directory.index));
+        // P8-F: align directory coverage checks with the gate so the sidecar's
+        // `section_rebuild_evidence_pass` recomputes field-for-field with the
+        // independent validator.
+        if directory.present {
+            if directory.size == 0 {
+                blockers.push(format!("directory {} has zero size", directory.index));
+            }
+            if directory.security_file_offset {
+                if directory.index != 4 {
+                    blockers.push(format!(
+                        "security directory {} is not file-backed",
+                        directory.index
+                    ));
+                }
+            } else if !directory.in_image || !directory.raw_backed {
+                blockers.push(format!(
+                    "directory {} is not in a raw-backed section",
+                    directory.index
+                ));
+            }
+        } else if directory.in_image || directory.raw_backed || directory.security_file_offset {
+            blockers.push(format!(
+                "absent directory {} has non-canonical coverage",
+                directory.index
+            ));
         }
+    }
+    // P8-F: duplicate section names are a production-contract violation the
+    // gate rejects; the producer must report them so the pass flag agrees.
+    let mut section_names = std::collections::HashSet::new();
+    for section in &sections {
+        if !section_names.insert(section.name.clone()) {
+            blockers.push(format!("duplicate section name '{}'", section.name));
+        }
+    }
+    // P8-F: SizeOfImage must equal the section-aligned extent of the highest
+    // virtual end, matching the gate's recomputation (not merely divisible).
+    let max_virtual_end = virtual_ranges
+        .iter()
+        .map(|range| range.1)
+        .max()
+        .unwrap_or(u64::from(optional.size_of_headers));
+    let section_aligned_image =
+        align_up_u64(max_virtual_end, u64::from(optional.section_alignment));
+    if section_aligned_image != u64::from(optional.size_of_image) {
+        blockers.push("SizeOfImage does not equal aligned section extent".to_string());
     }
     blockers.sort();
     blockers.dedup();
@@ -581,6 +635,94 @@ mod tests {
         assert!(write_section_rebuild_evidence(&candidate, &candidate).is_err());
         fs::hard_link(&candidate, &alias).unwrap();
         assert!(write_section_rebuild_evidence(&candidate, &alias).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn minimal_pe_with_sections(names: &[&str]) -> Vec<u8> {
+        let mut bytes = vec![0u8; 0x600];
+        bytes[0..2].copy_from_slice(&0x5a4du16.to_le_bytes());
+        bytes[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        bytes[0x80..0x84].copy_from_slice(&0x0000_4550u32.to_le_bytes());
+        bytes[0x84..0x86].copy_from_slice(&0x8664u16.to_le_bytes());
+        bytes[0x86..0x88].copy_from_slice(&(names.len() as u16).to_le_bytes());
+        bytes[0x94..0x96].copy_from_slice(&0xf0u16.to_le_bytes());
+        let optional = 0x98;
+        bytes[optional..optional + 2].copy_from_slice(&0x20bu16.to_le_bytes());
+        bytes[optional + 16..optional + 20].copy_from_slice(&0x1000u32.to_le_bytes());
+        bytes[optional + 24..optional + 32]
+            .copy_from_slice(&0x0000_0001_4000_0000u64.to_le_bytes());
+        bytes[optional + 32..optional + 36].copy_from_slice(&0x1000u32.to_le_bytes());
+        bytes[optional + 36..optional + 40].copy_from_slice(&0x200u32.to_le_bytes());
+        bytes[optional + 56..optional + 60]
+            .copy_from_slice(&(0x1000 + (names.len() as u32) * 0x1000).to_le_bytes());
+        bytes[optional + 60..optional + 64].copy_from_slice(&0x200u32.to_le_bytes());
+        let mut section = optional + 0xf0;
+        for (i, name) in names.iter().enumerate() {
+            bytes[section..section + name.len().min(8)].copy_from_slice(name.as_bytes());
+            let va = 0x1000 + (i as u32) * 0x1000;
+            bytes[section + 8..section + 12].copy_from_slice(&0x200u32.to_le_bytes()); // VS
+            bytes[section + 12..section + 16].copy_from_slice(&va.to_le_bytes()); // VA
+            bytes[section + 16..section + 20].copy_from_slice(&0x200u32.to_le_bytes()); // rawsize
+            bytes[section + 20..section + 24].copy_from_slice(&0x200u32.to_le_bytes()); // rawoff
+            bytes[section + 36..section + 40].copy_from_slice(&0x6000_0020u32.to_le_bytes());
+            section += 0x28;
+        }
+        bytes
+    }
+
+    #[test]
+    fn duplicate_section_names_fail_closed() {
+        // P8-F: the producer must report duplicate section names so its
+        // section_rebuild_evidence_pass agrees with the gate's recomputation
+        // (which rejects duplicate names).
+        let root = temp_dir("dup");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let protected = root.join("protected.exe");
+        let candidate = root.join("candidate.exe");
+        // Two .rdata sections => duplicate name.
+        fs::write(&protected, minimal_pe_with_sections(&[".rdata", ".rdata"])).unwrap();
+        fs::write(&candidate, minimal_pe_with_sections(&[".rdata", ".rdata"])).unwrap();
+        let sidecar = write_section_rebuild_evidence(&protected, &candidate).unwrap();
+        let value: SectionRebuildEvidenceSidecar =
+            serde_json::from_slice(&fs::read(&sidecar).unwrap()).unwrap();
+        assert!(!value.section_rebuild_evidence_pass);
+        assert!(
+            value
+                .blockers
+                .iter()
+                .any(|b| b.contains("duplicate section name '.rdata'")),
+            "blockers must include the duplicate section name, got {:?}",
+            value.blockers
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn absent_directories_are_canonical_when_zero() {
+        // P8-F: an absent directory (RVA 0 / size 0) must report in_image=false
+        // and raw_backed=false so it is NOT flagged as non-canonical coverage.
+        // A normal PE has many absent directories and must stay passable.
+        let root = temp_dir("absent");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let protected = root.join("protected.exe");
+        let candidate = root.join("candidate.exe");
+        fs::write(&protected, minimal_pe()).unwrap();
+        fs::write(&candidate, minimal_pe()).unwrap();
+        let sidecar = write_section_rebuild_evidence(&protected, &candidate).unwrap();
+        let value: SectionRebuildEvidenceSidecar =
+            serde_json::from_slice(&fs::read(&sidecar).unwrap()).unwrap();
+        assert!(value.section_rebuild_evidence_pass, "{:?}", value.blockers);
+        // All 16 directories absent (minimal_pe has none set) must be canonical.
+        assert!(
+            value
+                .blockers
+                .iter()
+                .all(|b| !b.contains("absent directory")),
+            "absent zero directories must be canonical, got {:?}",
+            value.blockers
+        );
         let _ = fs::remove_dir_all(root);
     }
 }

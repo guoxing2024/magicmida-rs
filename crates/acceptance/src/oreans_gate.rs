@@ -2914,7 +2914,8 @@ fn validate_section_rebuild_evidence(
                             && end <= section.virtual_address.saturating_add(section.raw_size)
                     })
                 });
-                let in_image = end.is_some_and(|end| end <= evidence.size_of_image);
+                let in_image =
+                    directory.rva != 0 && end.is_some_and(|end| end <= evidence.size_of_image);
                 if directory.in_image != in_image || directory.raw_backed != backed {
                     failures.push(format!(
                         "directory {} coverage flags are not recomputed",
