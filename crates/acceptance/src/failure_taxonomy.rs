@@ -203,44 +203,170 @@ pub struct SampleClassification {
 /// [`crate::OreansTwoSampleGateReport`] — the only fields classification reads
 /// — so a real gate report (which carries many additional evidence fields)
 /// classifies without re-deriving any gate decision.
+///
+/// # Fail-closed schema selection (P8.1.1.1-A)
+///
+/// Exactly two report shapes are accepted, and they are discriminated
+/// explicitly rather than by an ambiguous "top-level samples non-empty wins,
+/// else `gate.samples`" fallback:
+///
+/// 1. **Raw v8** — `mida.oreans-two-sample-gate/v8` with
+///    `gate_id = oreans_two_sample_perfect_unpack`. Samples are read from the
+///    **top-level** `samples`. A raw v8 report must not carry a `gate`.
+/// 2. **Bundle v1** — `mida.oreans-two-sample-bundle-gate/v1` with
+///    `gate_id = oreans_two_sample_bundle_gate`. It must contain a `gate`
+///    object whose inner `schema_version` is exactly `mida.oreans-two-sample-gate/v8`
+///    and inner `gate_id` is exactly `oreans_two_sample_perfect_unpack`.
+///    Samples are read from **`gate.samples`**. A bundle v1 report must not
+///    carry top-level `samples`.
+///
+/// Any of the following is a hard `Err` (never an empty success):
+/// missing `schema_version`, unknown `schema_version`, wrong inner gate
+/// `schema_version`/`gate_id`, missing/empty samples, missing or duplicate
+/// required cases, a case outside `{origin_macro, lunlun_software}`, or an
+/// empty/duplicate `case_id`. Conflicting shapes (a raw v8 carrying `gate`, or
+/// a bundle v1 carrying top-level `samples`) are rejected rather than resolved
+/// by priority.
+///
+/// The required case set must be exactly present: `origin_macro` and
+/// `lunlun_software`. A non-empty case set is required; `failure` text may be
+/// empty, but the case set may not.
 pub fn classify_gate_report(report_bytes: &[u8]) -> Result<GateReportClassification, String> {
     let input_sha256 = crate::sha256_hex(report_bytes);
-    #[derive(Deserialize)]
+    #[derive(Clone, Deserialize)]
     struct LeanSample {
+        #[serde(default)]
         case_id: String,
         #[serde(default)]
         failures: Vec<String>,
     }
-    // The classifier reads only `samples`. A raw v8 two-sample gate report
-    // carries `samples` at the top level; a bundle-gate report
-    // (`mida.oreans-two-sample-bundle-gate/v1`) wraps it under `gate.samples`.
-    // Both are accepted so the P7-R2 bundle report classifies read-only.
+    #[derive(Deserialize)]
+    struct LeanGate {
+        #[serde(default)]
+        schema_version: String,
+        #[serde(default)]
+        gate_id: String,
+        #[serde(default)]
+        samples: Vec<LeanSample>,
+    }
     #[derive(Deserialize)]
     struct LeanReport {
-        #[allow(dead_code)]
+        #[serde(default)]
         schema_version: String,
+        #[serde(default)]
+        gate_id: String,
         #[serde(default)]
         samples: Vec<LeanSample>,
         #[serde(default)]
         gate: Option<LeanGate>,
     }
-    #[derive(Deserialize)]
-    struct LeanGate {
-        #[serde(default)]
-        samples: Vec<LeanSample>,
-    }
     let report: LeanReport = serde_json::from_slice(report_bytes)
         .map_err(|error| format!("report is not a valid Oreans two-sample gate report: {error}"))?;
-    let lean_samples = if !report.samples.is_empty() {
-        &report.samples[..]
-    } else if let Some(gate) = &report.gate {
-        &gate.samples[..]
+
+    let v8_schema = crate::OREANS_TWO_SAMPLE_GATE_SCHEMA_VERSION;
+    let v8_id = crate::OREANS_TWO_SAMPLE_GATE_ID;
+    let bundle_schema = crate::BUNDLE_GATE_SCHEMA_VERSION;
+    let bundle_id = crate::BUNDLE_GATE_ID;
+
+    // Missing / unknown schema_version is always a hard error.
+    if report.schema_version.is_empty() {
+        return Err("report is missing schema_version".to_string());
+    }
+
+    // Explicit, mutually exclusive shape discrimination. Never fall back from
+    // one source to the other.
+    let lean_samples: Vec<LeanSample> = if report.schema_version == v8_schema {
+        // Raw v8 two-sample gate report. Samples live at the top level.
+        if report.gate_id != v8_id {
+            return Err(format!(
+                "raw v8 report has unexpected gate_id {report_gate_id:?}; expected {v8_id:?}",
+                report_gate_id = report.gate_id
+            ));
+        }
+        if report.gate.is_some() {
+            return Err(
+                "raw v8 report must not carry a `gate`; its samples live at the top level"
+                    .to_string(),
+            );
+        }
+        report.samples
+    } else if report.schema_version == bundle_schema {
+        // Bundle-gate report. Samples live under `gate.samples` and the inner
+        // gate must itself be an exact v8 two-sample gate.
+        if report.gate_id != bundle_id {
+            return Err(format!(
+                "bundle-gate report has unexpected gate_id {report_gate_id:?}; expected {bundle_id:?}",
+                report_gate_id = report.gate_id
+            ));
+        }
+        if !report.samples.is_empty() {
+            return Err(
+                "bundle-gate report must not carry top-level `samples`; its samples live under `gate`"
+                    .to_string(),
+            );
+        }
+        let gate = report
+            .gate
+            .as_ref()
+            .ok_or_else(|| "bundle-gate report is missing its inner `gate` object".to_string())?;
+        if gate.schema_version != v8_schema {
+            return Err(format!(
+                "bundle-gate inner `gate` has schema_version {:?}; expected the exact v8 schema {v8_schema:?}",
+                gate.schema_version
+            ));
+        }
+        if gate.gate_id != v8_id {
+            return Err(format!(
+                "bundle-gate inner `gate` has gate_id {:?}; expected {v8_id:?}",
+                gate.gate_id
+            ));
+        }
+        gate.samples.clone()
     } else {
-        &[][..]
+        return Err(format!(
+            "report has unknown schema_version {:?}; expected {v8_schema:?} or {bundle_schema:?}",
+            report.schema_version
+        ));
     };
+
+    // A non-empty case set is required (failure text may be empty).
+    if lean_samples.is_empty() {
+        return Err("report samples are empty; no cases to classify".to_string());
+    }
+
+    // The required case set must be exactly present: origin_macro and
+    // lunlun_software. Missing, duplicate, extra, or empty case_id is rejected.
+    let required: &[&str] = &["origin_macro", "lunlun_software"];
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    for sample in &lean_samples {
+        if sample.case_id.is_empty() {
+            return Err("report contains a sample with an empty case_id".to_string());
+        }
+        *seen.entry(sample.case_id.clone()).or_insert(0) += 1;
+    }
+    for case in required {
+        let count = seen.get(*case).copied().unwrap_or(0);
+        if count == 0 {
+            return Err(format!(
+                "report is missing required case {case:?}; present cases: {present:?}",
+                present = seen.keys().collect::<Vec<_>>()
+            ));
+        }
+        if count > 1 {
+            return Err(format!("report contains duplicate case {case:?}"));
+        }
+    }
+    for case in seen.keys() {
+        if !required.contains(&case.as_str()) {
+            return Err(format!(
+                "report contains unexpected case {case:?}; only {required:?} are accepted"
+            ));
+        }
+    }
+
     let mut samples = Vec::new();
     let mut total_failures = 0usize;
-    for sample in lean_samples {
+    for sample in &lean_samples {
         let counts = summarize(&sample.failures);
         let sample_total = total(&counts);
         total_failures = total_failures.saturating_add(sample_total);
@@ -265,6 +391,9 @@ pub fn classify_gate_report(report_bytes: &[u8]) -> Result<GateReportClassificat
             buckets,
         });
     }
+    // Keep required-case ordering stable for deterministic output regardless
+    // of report order (raw v8 and bundle v1 may list cases in either order).
+    samples.sort_by(|a, b| a.case_id.cmp(&b.case_id));
     Ok(GateReportClassification {
         input_sha256,
         total_failures,
@@ -434,28 +563,35 @@ mod tests {
 
     #[test]
     fn classify_gate_report_produces_stable_counts_and_input_hash() {
-        let json = report_json(&[(
-            "origin_macro",
-            vec![
-                "prerequisite failed: structured OEP evidence: VA is missing",
-                "prerequisite failed: structured IAT evidence: structured IAT report: Unresolved status at slot 1",
-                "prerequisite failed: structured section rebuild evidence: duplicate section name",
-                "a brand-new gate message not yet in the taxonomy",
-            ],
-        )]);
+        let json = report_json(&[
+            (
+                "origin_macro",
+                vec![
+                    "prerequisite failed: structured OEP evidence: VA is missing",
+                    "prerequisite failed: structured IAT evidence: structured IAT report: Unresolved status at slot 1",
+                    "prerequisite failed: structured section rebuild evidence: duplicate section name",
+                    "a brand-new gate message not yet in the taxonomy",
+                ],
+            ),
+            ("lunlun_software", vec![]),
+        ]);
         let bytes = serde_json::to_vec(&json).unwrap();
         let report = classify_gate_report(&bytes).expect("classify");
         assert_eq!(report.total_failures, 4);
-        assert_eq!(report.samples.len(), 1);
-        let sample = &report.samples[0];
-        assert_eq!(sample.case_id, "origin_macro");
-        assert_eq!(sample.total_failures, 4);
-        assert_eq!(sample.buckets["oep"], 1);
-        assert_eq!(sample.buckets["iat-unresolved"], 1);
-        assert_eq!(sample.buckets["section-rebuild"], 1);
-        assert_eq!(sample.other_count, 1);
-        assert_eq!(sample.other_failures.len(), 1);
-        assert!(sample.other_failures[0].contains("brand-new"));
+        assert_eq!(report.samples.len(), 2);
+        // Output is deterministic and case-sorted, so lunlun_software is first.
+        let lunlun = &report.samples[0];
+        assert_eq!(lunlun.case_id, "lunlun_software");
+        assert_eq!(lunlun.total_failures, 0);
+        let origin = &report.samples[1];
+        assert_eq!(origin.case_id, "origin_macro");
+        assert_eq!(origin.total_failures, 4);
+        assert_eq!(origin.buckets["oep"], 1);
+        assert_eq!(origin.buckets["iat-unresolved"], 1);
+        assert_eq!(origin.buckets["section-rebuild"], 1);
+        assert_eq!(origin.other_count, 1);
+        assert_eq!(origin.other_failures.len(), 1);
+        assert!(origin.other_failures[0].contains("brand-new"));
         // Input SHA-256 is 64 lowercase hex and bound to the same bytes.
         assert_eq!(report.input_sha256.len(), 64);
         assert!(report.input_sha256.chars().all(|c| c.is_ascii_hexdigit()));
@@ -486,13 +622,16 @@ mod tests {
         let report = classify_gate_report(&bytes).expect("classify");
         assert_eq!(report.total_failures, 5);
         assert_eq!(report.samples.len(), 2);
-        let origin = &report.samples[0];
-        assert_eq!(origin.buckets["tls"], 1);
-        assert_eq!(origin.other_count, 1);
-        let lunlun = &report.samples[1];
+        // Output is case-sorted: lunlun_software before origin_macro.
+        let lunlun = &report.samples[0];
+        assert_eq!(lunlun.case_id, "lunlun_software");
         assert_eq!(lunlun.buckets["relocation"], 1);
         assert_eq!(lunlun.other_count, 2);
         assert_eq!(lunlun.other_failures.len(), 2);
+        let origin = &report.samples[1];
+        assert_eq!(origin.case_id, "origin_macro");
+        assert_eq!(origin.buckets["tls"], 1);
+        assert_eq!(origin.other_count, 1);
         // `unknown` buckets are never silently folded; Other carries the raw
         // text and is always surfaced in the output.
         assert!(!report.samples.iter().all(|s| s.other_count == 0));
@@ -524,17 +663,24 @@ mod tests {
 
     #[test]
     fn classify_gate_report_other_raw_text_preserves_order() {
-        let json = report_json(&[(
-            "origin_macro",
-            vec![
-                "zzz first",
-                "aaa second",
-                "known failure: structured OEP evidence: VA is missing",
-            ],
-        )]);
+        let json = report_json(&[
+            (
+                "origin_macro",
+                vec![
+                    "zzz first",
+                    "aaa second",
+                    "known failure: structured OEP evidence: VA is missing",
+                ],
+            ),
+            ("lunlun_software", vec![]),
+        ]);
         let bytes = serde_json::to_vec(&json).unwrap();
         let report = classify_gate_report(&bytes).expect("classify");
-        let sample = &report.samples[0];
+        let sample = report
+            .samples
+            .iter()
+            .find(|s| s.case_id == "origin_macro")
+            .expect("origin_macro present");
         // Other text keeps original report order (not sorted).
         assert_eq!(sample.other_failures, vec!["zzz first", "aaa second"]);
     }
@@ -544,10 +690,13 @@ mod tests {
         // P8.1.1-A: the real P7-R2 report is a bundle-gate report
         // (mida.oreans-two-sample-bundle-gate/v1) whose samples live under
         // `gate.samples`, not at the top level. The classifier must read them.
-        let inner = report_json(&[(
-            "origin_macro",
-            vec!["prerequisite failed: structured OEP evidence: VA is missing"],
-        )]);
+        let inner = report_json(&[
+            (
+                "origin_macro",
+                vec!["prerequisite failed: structured OEP evidence: VA is missing"],
+            ),
+            ("lunlun_software", vec![]),
+        ]);
         let bundle = serde_json::json!({
             "schema_version": "mida.oreans-two-sample-bundle-gate/v1",
             "gate_id": "oreans_two_sample_bundle_gate",
@@ -556,9 +705,235 @@ mod tests {
         });
         let bytes = serde_json::to_vec(&bundle).unwrap();
         let report = classify_gate_report(&bytes).expect("classify bundle-gate shape");
-        assert_eq!(report.samples.len(), 1);
-        assert_eq!(report.samples[0].case_id, "origin_macro");
-        assert_eq!(report.samples[0].buckets["oep"], 1);
-        assert_eq!(report.samples[0].other_count, 0);
+        assert_eq!(report.samples.len(), 2);
+        assert_eq!(report.samples[0].case_id, "lunlun_software");
+        assert_eq!(report.samples[0].buckets.len(), 0);
+        assert_eq!(report.samples[1].case_id, "origin_macro");
+        assert_eq!(report.samples[1].buckets["oep"], 1);
+        assert_eq!(report.samples[1].other_count, 0);
+    }
+
+    // --- P8.1.1.1-A: fail-closed schema selection ---
+
+    /// Build a raw v8 gate report JSON with the given per-sample failures,
+    /// defaulting to the exact required case set.
+    fn raw_v8_json(case_failures: &[(&str, Vec<&str>)]) -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": "mida.oreans-two-sample-gate/v8",
+            "gate_id": "oreans_two_sample_perfect_unpack",
+            "required_cases": ["origin_macro", "lunlun_software"],
+            "excluded_cases": [],
+            "samples": case_failures
+                .iter()
+                .map(|(case_id, failures)| serde_json::json!({
+                    "case_id": case_id,
+                    "failures": failures,
+                }))
+                .collect::<Vec<_>>(),
+            "final_verdict": "open"
+        })
+    }
+
+    /// Build a bundle-gate v1 report JSON wrapping the given inner v8 gate JSON.
+    fn bundle_v1_json(inner: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": "mida.oreans-two-sample-bundle-gate/v1",
+            "gate_id": "oreans_two_sample_bundle_gate",
+            "envelopes": [],
+            "gate": inner,
+        })
+    }
+
+    /// Assert that classifying the given JSON errors (never succeeds).
+    fn assert_rejects(json: serde_json::Value) {
+        let bytes = serde_json::to_vec(&json).unwrap();
+        assert!(
+            classify_gate_report(&bytes).is_err(),
+            "expected fail-closed rejection for {json}"
+        );
+    }
+
+    #[test]
+    fn taxonomy_rejects_missing_schema_version() {
+        let mut json = raw_v8_json(&[("origin_macro", vec![]), ("lunlun_software", vec![])]);
+        let obj = json.as_object_mut().unwrap();
+        obj.remove("schema_version");
+        assert_rejects(json);
+    }
+
+    #[test]
+    fn taxonomy_rejects_unknown_schema_version() {
+        let mut json = raw_v8_json(&[("origin_macro", vec![]), ("lunlun_software", vec![])]);
+        let obj = json.as_object_mut().unwrap();
+        obj.insert(
+            "schema_version".into(),
+            "mida.oreans-two-sample-gate/v9".into(),
+        );
+        assert_rejects(json);
+    }
+
+    #[test]
+    fn taxonomy_rejects_raw_v8_missing_samples() {
+        let mut json = raw_v8_json(&[("origin_macro", vec![]), ("lunlun_software", vec![])]);
+        let obj = json.as_object_mut().unwrap();
+        obj.remove("samples");
+        assert_rejects(json);
+    }
+
+    #[test]
+    fn taxonomy_rejects_raw_v8_empty_samples() {
+        let json = raw_v8_json(&[]);
+        assert_rejects(json);
+    }
+
+    #[test]
+    fn taxonomy_rejects_bundle_v1_missing_gate() {
+        let mut json = bundle_v1_json(raw_v8_json(&[
+            ("origin_macro", vec![]),
+            ("lunlun_software", vec![]),
+        ]));
+        let obj = json.as_object_mut().unwrap();
+        obj.remove("gate");
+        assert_rejects(json);
+    }
+
+    #[test]
+    fn taxonomy_rejects_bundle_v1_gate_samples_empty() {
+        let mut inner = raw_v8_json(&[("origin_macro", vec![]), ("lunlun_software", vec![])]);
+        let inner_obj = inner.as_object_mut().unwrap();
+        inner_obj.insert("samples".into(), serde_json::json!([]));
+        assert_rejects(bundle_v1_json(inner));
+    }
+
+    #[test]
+    fn taxonomy_rejects_bundle_v1_inner_gate_wrong_schema() {
+        let mut inner = raw_v8_json(&[("origin_macro", vec![]), ("lunlun_software", vec![])]);
+        let inner_obj = inner.as_object_mut().unwrap();
+        inner_obj.insert(
+            "schema_version".into(),
+            "mida.oreans-two-sample-gate/v8-drift".into(),
+        );
+        assert_rejects(bundle_v1_json(inner));
+    }
+
+    #[test]
+    fn taxonomy_rejects_wrong_gate_id() {
+        // Raw v8 with a wrong gate_id must be rejected.
+        let mut json = raw_v8_json(&[("origin_macro", vec![]), ("lunlun_software", vec![])]);
+        let obj = json.as_object_mut().unwrap();
+        obj.insert("gate_id".into(), "some_other_gate".into());
+        assert_rejects(json);
+
+        // Bundle v1 with a wrong top-level gate_id must be rejected.
+        let mut bundle = bundle_v1_json(raw_v8_json(&[
+            ("origin_macro", vec![]),
+            ("lunlun_software", vec![]),
+        ]));
+        let bundle_obj = bundle.as_object_mut().unwrap();
+        bundle_obj.insert("gate_id".into(), "wrong_bundle_gate".into());
+        assert_rejects(bundle);
+
+        // Bundle v1 whose inner gate has a wrong gate_id must be rejected.
+        let mut inner = raw_v8_json(&[("origin_macro", vec![]), ("lunlun_software", vec![])]);
+        let inner_obj = inner.as_object_mut().unwrap();
+        inner_obj.insert("gate_id".into(), "not_perfect_unpack".into());
+        assert_rejects(bundle_v1_json(inner));
+    }
+
+    #[test]
+    fn taxonomy_rejects_duplicate_case() {
+        let json = raw_v8_json(&[
+            ("origin_macro", vec![]),
+            ("origin_macro", vec![]),
+            ("lunlun_software", vec![]),
+        ]);
+        assert_rejects(json);
+    }
+
+    #[test]
+    fn taxonomy_rejects_missing_case() {
+        // Only one of the two required cases present -> missing case.
+        let json = raw_v8_json(&[("origin_macro", vec![])]);
+        assert_rejects(json);
+    }
+
+    #[test]
+    fn taxonomy_rejects_extra_case() {
+        let json = raw_v8_json(&[
+            ("origin_macro", vec![]),
+            ("lunlun_software", vec![]),
+            ("some_other_case", vec![]),
+        ]);
+        assert_rejects(json);
+    }
+
+    #[test]
+    fn taxonomy_rejects_empty_case_id() {
+        let json = raw_v8_json(&[("", vec![]), ("lunlun_software", vec![])]);
+        assert_rejects(json);
+    }
+
+    #[test]
+    fn taxonomy_rejects_raw_schema_carrying_contradictory_gate_samples() {
+        // A raw v8 report must not carry a `gate`; samples must live at the
+        // top level. Carrying both is a conflicting shape and is rejected.
+        let mut json = raw_v8_json(&[("origin_macro", vec![]), ("lunlun_software", vec![])]);
+        let obj = json.as_object_mut().unwrap();
+        obj.insert(
+            "gate".into(),
+            serde_json::json!({
+                "schema_version": "mida.oreans-two-sample-gate/v8",
+                "gate_id": "oreans_two_sample_perfect_unpack",
+                "samples": [],
+            }),
+        );
+        assert_rejects(json);
+    }
+
+    #[test]
+    fn taxonomy_rejects_bundle_schema_carrying_contradictory_top_level_samples() {
+        // A bundle v1 report must not carry top-level `samples`; its samples
+        // live under `gate`. Carrying both is a conflicting shape and is
+        // rejected rather than resolved by priority.
+        let mut json = bundle_v1_json(raw_v8_json(&[
+            ("origin_macro", vec![]),
+            ("lunlun_software", vec![]),
+        ]));
+        let obj = json.as_object_mut().unwrap();
+        obj.insert(
+            "samples".into(),
+            serde_json::json!([{
+                "case_id": "origin_macro",
+                "failures": ["prerequisite failed: structured OEP evidence: VA is missing"],
+            }]),
+        );
+        assert_rejects(json);
+    }
+
+    #[test]
+    fn taxonomy_rejects_unknown_top_level_shape_without_empty_success() {
+        // A drifted / unknown top-level report shape must not silently return
+        // an empty success classification.
+        for json in [
+            serde_json::json!({"hello": 1}),
+            serde_json::json!({"schema_version": "totally.unknown/schema", "samples": []}),
+            serde_json::json!({"schema_version": "mida.oreans-two-sample-gate/v8"}),
+        ] {
+            assert_rejects(json);
+        }
+    }
+
+    #[test]
+    fn taxonomy_accepts_both_cases_with_empty_failure_text() {
+        // failure text may be empty, but the case set must be non-empty.
+        let json = raw_v8_json(&[("origin_macro", vec![]), ("lunlun_software", vec![])]);
+        let bytes = serde_json::to_vec(&json).unwrap();
+        let report = classify_gate_report(&bytes).expect("empty failures but full case set");
+        assert_eq!(report.total_failures, 0);
+        assert_eq!(report.samples.len(), 2);
+        for sample in &report.samples {
+            assert_eq!(sample.total_failures, 0);
+            assert!(sample.buckets.is_empty());
+        }
     }
 }
