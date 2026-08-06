@@ -43,6 +43,9 @@ pub(crate) mod sidecar_io;
 mod tls_evidence;
 mod verify;
 
+#[cfg(test)]
+mod production_e2e;
+
 use std::fs;
 use std::path::Path;
 

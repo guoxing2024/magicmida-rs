@@ -2122,7 +2122,9 @@ fn remove_dump_and_manifest(output: &Path) -> Result<(), String> {
 
 /// Bound artifact manifest: candidate digest + transforms.
 /// Always written (empty entries for clean dumps). Fail-closed.
-fn write_bound_transform_manifest(
+/// Exposed so crate tests call the real production writer (never a test-only
+/// re-assembly of the manifest).
+pub fn write_bound_transform_manifest(
     output: &Path,
     candidate_bytes: &[u8],
     transforms: &[(&str, &str)],
