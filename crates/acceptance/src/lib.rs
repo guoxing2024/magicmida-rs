@@ -19,6 +19,7 @@ pub mod evidence_bundle;
 pub mod failure_taxonomy;
 pub mod gates;
 pub mod identity;
+pub mod isolated_replay_ledger;
 pub mod oracle;
 pub mod pe;
 pub mod preflight;
@@ -55,6 +56,11 @@ pub use envelope::{
     VerifiedSignedBundle, ENVELOPE_SCHEMA_VERSION, SIG_ALG_ED25519_V1, SIG_ALG_HMAC_SHA256_V0,
 };
 pub use identity::{sha256_hex, ArtifactIdentity, ROLE_CANDIDATE, ROLE_LEGACY_ORACLE};
+pub use isolated_replay_ledger::{
+    verify_replay_ledger, IsolatedReplayLedger, ReplayAttemptRecord, ReplayAttemptState,
+    ReplayChainIdentity, ReplayCompletionMarker, ReplayLedgerError, ReplayObservableVerdict,
+    ReplayVerifierIdentity, ISOLATED_REPLAY_LEDGER_SCHEMA_VERSION, REPLAY_ATTEMPTS_EXACT,
+};
 pub use oracle::{observe_oracle, OracleObservation};
 pub use report::{
     AcceptanceReport, FailureRecord, GateResult, GateStatus, ResidualRisk, WarningRecord,
