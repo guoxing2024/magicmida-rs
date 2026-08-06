@@ -397,6 +397,19 @@ pub fn default_packer_family() -> String {
     "oreans_themida".to_string()
 }
 
+/// The packer family that routes to the legacy Oreans evidence contract.
+pub const PACKER_FAMILY_OREANS: &str = "oreans_themida";
+/// The AHK/GTO packer family that routes to the generic
+/// `mida.unpack-evidence-bundle/v1` contract.
+pub const PACKER_FAMILY_AHK_GTO: &str = "ahk_gto";
+
+/// Families this toolchain can bind to an evidence contract. Kept independent
+/// of `mida-core` (the acceptance crate must not depend on production crates);
+/// must stay in sync with `mida_core::runner_config::packer_family`.
+pub fn is_known_packer_family(family: &str) -> bool {
+    matches!(family, PACKER_FAMILY_OREANS | PACKER_FAMILY_AHK_GTO)
+}
+
 impl RunnerConfig {
     /// Validate shapes (digests, non-empty identifiers). Returns the first
     /// reason or `None` when valid.

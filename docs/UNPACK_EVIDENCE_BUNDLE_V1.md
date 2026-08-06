@@ -38,23 +38,25 @@ context. Family selects the evidence contract:
 | family_id | evidence bundle schema | gate schema |
 |---|---|---|
 | `oreans_themida` | `mida.oreans-evidence-bundle/v2` | `mida.oreans-two-sample-gate/v8` |
-| `ahk_gto` | `mida.unpack-evidence-bundle/v1` | `mida.unpack-gate/none` |
+| `ahk_gto` | `mida.unpack-evidence-bundle/v1` | `no-gate` (explicit absent marker, not a schema id) |
 | unknown | refused (no schema resolves) | refused |
 
 Dispatch is fail-closed on every seam:
 
 - a missing/empty `family_id` in a generic bundle is rejected;
 - an unknown generic schema version is rejected;
-- a generic consumer only accepts `family_id = ahk_gto` (an Oreans family id is
-  rejected);
+- a generic consumer accepts any REGISTERED generic family (extensible family
+  registry; currently `ahk_gto`) — an Oreans or unknown family id is rejected;
 - an Oreans v2 bundle cannot deserialize into the generic type (v2 schema id +
   `deny_unknown_fields`, no `family_id`), so Oreans evidence is never consumed
   as GTO generic evidence;
 - a GTO generic bundle cannot deserialize into `OreansEvidenceBundle` (generic
   schema id + `family_id` are unknown fields there), so GTO evidence is never
   consumed as Oreans evidence;
-- any member whose `schema_version` does not match the family's expected
-  schema is rejected (no cross-family member smuggling);
+- every member must carry a GENERIC `mida.unpack-*-evidence/v1` schema — an
+  Oreans `mida.oreans-*-evidence/v1` member under a generic envelope is rejected,
+  and a generic member under an Oreans envelope is rejected by the Oreans
+  consumer (no cross-family member smuggling in either direction);
 - an unknown packer family at the runner-config / evidence-context boundary
   fails closed (no evidence contract is chosen).
 
@@ -68,12 +70,16 @@ selected by family in `runner_preflight::complete_run_evidence`:
 `oreans_themida` → the v2 assembler, `ahk_gto` → the generic assembler, unknown
 → refused.
 
-The launch boundary attests a run before the input PE is parsed (the input is
-not yet identified), so the attested evidence context starts on the
-Oreans-compat family; once `dual_select_packer` identifies GTO, the context is
-rebound to `ahk_gto` (`RunEvidenceContext::rebind_family`) so its evidence
-routes to the generic contract. A garbage input is still refused at the launch
-boundary *before* any PE work (the attestation gate precedes PE parsing).
+G2-R1: the packer family is bound at STAGING time, not at launch. The case
+manifest's `capability_cell.protection_family` is mapped to a packer family and
+sealed into the envelope's per-case `family_id` (part of the case-set digest).
+The launch boundary resolves that family BEFORE building the actual/frozen
+policy or the digest, and the attestation binds the single-use evidence context
+to the envelope's family. There is NO rebind path: after the input PE is
+parsed, the PE-identified family must equal the attested envelope family, and
+any mismatch fails closed BEFORE the sample process is created. A garbage input
+is still refused at the launch boundary *before* any PE work (the attestation
+gate precedes PE parsing).
 
 ## 4. Manifest shape
 
@@ -100,9 +106,13 @@ The generic bundle is the Oreans v2 bundle plus `family_id`:
 ```
 
 `deny_unknown_fields` is enforced on both sides. The seven required members are
-the same family-agnostic sidecars the Oreans contract binds (OEP, IAT, TLS,
-relocation, section rebuild, PE, transform manifest); the generic bundle
-manifests them under a family-agnostic envelope with a `family_id`. The two
+the same logical sidecars as the Oreans contract (OEP, IAT, TLS, relocation,
+section rebuild, PE, transform manifest), but each carries a GENERIC,
+family-agnostic schema id — `mida.unpack-oep-evidence/v1`,
+`mida.unpack-iat-evidence/v1`, `mida.unpack-tls-evidence/v1`,
+`mida.unpack-relocation-evidence/v1`, `mida.unpack-section-rebuild-evidence/v1`,
+`mida.unpack-pe-evidence/v1` — never the Oreans `mida.oreans-*-evidence/v1`
+sidecars. The generic envelope manifests them under a `family_id`. The two
 sealed hashes (`members_sha256`, `manifest_sha256`, the latter covering
 `family_id`) and the identity-chain checks behave exactly as in v2. A partial
 `completion_marker` is never a valid bundle.
@@ -126,9 +136,15 @@ digests — are always distinct. A family-less legacy config parses as
 - generic producer -> consumer round-trip (`mida-cli` unit + cross-contamination
   integration tests) — offline, synthetic sidecars;
 - Oreans v2/v8 vectors remain green (untouched);
-- family/schema cross-contamination is rejected on both directions;
-- missing family, unknown schema, wrong member schema, partial marker all
-  fail closed.
+- family/schema cross-contamination is rejected on both directions (generic
+  envelope + Oreans member, Oreans envelope + generic member);
+- missing family, unknown family, unknown schema, wrong member schema, partial
+  marker all fail closed;
+- family/digest binding: an Oreans envelope case refuses a GTO-family config
+  (no rebind / no masquerading an Oreans digest as GTO); an unknown or missing
+  envelope family fails case-set validation; GTO and Oreans digests are never
+  equal; the PE-identified family must equal the attested envelope family
+  before process creation.
 
 ## 8. Current standing
 

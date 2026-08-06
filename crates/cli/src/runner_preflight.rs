@@ -92,6 +92,13 @@ pub fn frozen_runner_config() -> mida_core::runner_config::RunnerConfig {
 pub struct CaseRunnerConfigEnvelope {
     /// The fixed case id (`origin_macro` or `lunlun_software`).
     pub case_id: String,
+    /// The packer family this case's run belongs to. This is bound at STAGING
+    /// time from the case manifest's `protection_family` and is part of the
+    /// sealed case-set digest, so the attestation always builds the actual /
+    /// frozen policy against the SAME family the envelope was staged for. A
+    /// case can never switch family after staging (that would change the
+    /// sealed digest and be refused).
+    pub family_id: String,
     /// Verified protected-input identity of this case.
     pub protected_input: FileIdentityGate,
     /// Full runner config JSON, as the runner will apply it for this case.
@@ -143,6 +150,19 @@ pub fn bind_actual_config_to_envelope(
 ) -> anyhow::Result<()> {
     let envelope = RunnerConfigEnvelope::read(output_dir)?;
     let case = select_case_config(&envelope, input_identity)?;
+    // G2-R1: the packer family is bound at staging and cannot change. The
+    // actual config's family must match the envelope case's family EXACTLY
+    // (not just by digest) — this is what makes a digest forged under one
+    // family unusable for another: the family is compared field-by-field
+    // before the digest check, and the digest also embeds the family.
+    if actual_config.packer_family != case.family_id {
+        bail!(
+            "actual run config family {:?} != envelope case {} family {:?} (fail-closed)",
+            actual_config.packer_family,
+            case.case_id,
+            case.family_id
+        );
+    }
     let actual_digest = mida_core::runner_config::runner_config_digest(actual_config);
     if !actual_digest.eq_ignore_ascii_case(&case.runner_config_digest) {
         bail!(
@@ -192,12 +212,14 @@ pub struct RunnerConfigEnvelope {
 }
 
 /// Canonical, injective encoding of one case-bound config entry (case id,
-/// protected input identity, per-case runner-config digest). Used to seal
-/// the whole case set into `case_set_digest`.
+/// packer family, protected input identity, per-case runner-config digest).
+/// The family is part of the sealed case-set digest, so switching a case's
+/// family after staging is a tamper that breaks the seal.
 fn canonical_case_entry(entry: &CaseRunnerConfigEnvelope) -> String {
     format!(
-        "case={}\nprotected_input={}|{}\nrunner_config_digest={}\n",
+        "case={}\nfamily={}\nprotected_input={}|{}\nrunner_config_digest={}\n",
         entry.case_id,
+        entry.family_id.to_lowercase(),
         entry.protected_input.sha256.to_lowercase(),
         entry.protected_input.size_bytes,
         entry.runner_config_digest.to_lowercase()
@@ -293,6 +315,18 @@ impl RunnerConfigEnvelope {
             }
         }
         for c in &self.case_configs {
+            if c.family_id.trim().is_empty() {
+                return Some(format!(
+                    "case {} family_id is missing or empty (fail-closed)",
+                    c.case_id
+                ));
+            }
+            if !mida_core::runner_config::packer_family::is_known_family(&c.family_id) {
+                return Some(format!(
+                    "case {} has unknown packer family {:?} (fail-closed)",
+                    c.case_id, c.family_id
+                ));
+            }
             if !is_64_hex(&c.runner_config_digest) {
                 return Some(format!(
                     "case {} runner_config_digest must be exactly 64 hex chars",
@@ -821,38 +855,6 @@ impl RunEvidenceContext {
         &self.packer_family
     }
 
-    /// Rebind the attested context to an explicit packer family. Consumed BY
-    /// VALUE (single-use): the launch attestation authorizes one evidence
-    /// bundle, and rebinding happens exactly once — after the PE-level family
-    /// identity is known but before any evidence is emitted. The family must
-    /// be non-empty and a recognized contract family; an unknown family fails
-    /// closed so the evidence never lands on the wrong contract.
-    ///
-    /// G2: the launch boundary attests a run before the packer family is
-    /// identified (the input is not yet parsed), so the context starts on the
-    /// Oreans-compat family; once `dual_select_packer` identifies GTO, the
-    /// caller rebinds to `ahk_gto` so the evidence routes to the generic
-    /// `mida.unpack-evidence-bundle/v1` contract.
-    pub(crate) fn rebind_family(self, family: &str) -> anyhow::Result<RunEvidenceContext> {
-        if family.trim().is_empty() {
-            bail!("RunEvidenceContext rebind family must be non-empty");
-        }
-        use crate::run_spec;
-        if run_spec::evidence_bundle_schema_for_family(family).is_empty() {
-            bail!("cannot rebind evidence context to unknown packer family {family:?}");
-        }
-        Ok(RunEvidenceContext {
-            case_id: self.case_id,
-            tool_revision: self.tool_revision,
-            runner_config_digest: self.runner_config_digest,
-            verifier_sha256: self.verifier_sha256,
-            protected_input: self.protected_input,
-            candidate: self.candidate,
-            cli_binary_sha256: self.cli_binary_sha256,
-            packer_family: family.to_string(),
-        })
-    }
-
     /// The attested case id.
     pub fn case_id(&self) -> &str {
         &self.case_id
@@ -958,7 +960,6 @@ pub fn canonicalize_loose(p: &Path) -> PathBuf {
 pub fn attest_ready_before_launch(
     output_dir: &Path,
     ctx: &LaunchAttestationContext<'_>,
-    family: &str,
 ) -> anyhow::Result<RunEvidenceContext> {
     let envelope = RunnerConfigEnvelope::read(output_dir)?;
     if envelope.schema != RUNNER_CONFIG_ENVELOPE_SCHEMA_REF {
@@ -1108,9 +1109,16 @@ pub fn attest_ready_before_launch(
     // Every cross-identity is bound: build the single-use evidence context.
     // P6.3.3: the digest is the SELECTED case's digest (never a shared or
     // another case's digest) — it flows into the bundle for this case.
+    // G2-R1: the packer family is the ENVELOPE's bound family for this input
+    // (staging-sealed). The actual config's family was already checked equal
+    // to it by `bind_actual_config_to_envelope`, so the evidence context is
+    // bound to the authoritative envelope family — never a caller-supplied or
+    // rebindable one.
+    let selected_case = select_case_config(&envelope, &current_identity)?;
+    let attested_family = selected_case.family_id.clone();
     let digest = envelope_case_runner_config_digest(output_dir, &current_identity)?;
     let context = RunEvidenceContext::new_with_family(
-        family.to_string(),
+        attested_family,
         target_case_id,
         envelope.tool_revision.clone(),
         digest,
@@ -1613,6 +1621,7 @@ mod tests {
         let digest = mida_core::runner_config::runner_config_digest(&config);
         CaseRunnerConfigEnvelope {
             case_id: case_id.to_string(),
+            family_id: config.packer_family.clone(),
             protected_input: FileIdentityGate {
                 sha256: sha.to_string(),
                 size_bytes: if case_id == "origin_macro" {
@@ -1727,6 +1736,67 @@ mod tests {
         assert!(
             bind_actual_config_to_envelope(&dir, &lunlun_actual, &origin_identity).is_err(),
             "Lunlun config must never match the Origin digest"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// G2-R1: a packer family is bound at STAGING and cannot be switched. An
+    /// actual config carrying a different family than the envelope case is
+    /// refused by the launch boundary — so an Oreans-staged case can never be
+    /// attested under a GTO-family config (or vice versa). This is what makes
+    /// the removed `rebind_family` path unnecessary and unsafe to reintroduce:
+    /// the family is checked field-by-field before the digest, and the digest
+    /// also embeds the family.
+    #[test]
+    fn g2r1_oreans_case_rejects_gto_family_config() {
+        use mida_core::runner_config::packer_family;
+        let dir = temp_dir("g2r1_bind_family");
+        let env = v4_envelope(); // family_id = oreans_themida for both cases
+        env.write(&dir).unwrap();
+        let origin_identity = FileIdentityGate {
+            sha256: ORIGIN_ID.to_string(),
+            size_bytes: 5_232_656,
+        };
+        // The SAME policy as the Oreans Origin case but carrying the GTO
+        // family: a GTO-family digest must never bind to an Oreans envelope
+        // case (this is the "rebind a GTO family onto an Oreans attestation"
+        // attack, now impossible).
+        let mut gto_actual = crate::run_spec::frozen_run_policy_for_family(
+            Path::new("x.bin"),
+            packer_family::AHK_GTO,
+        );
+        gto_actual.pure_rebuild = true;
+        assert!(
+            bind_actual_config_to_envelope(&dir, &gto_actual, &origin_identity).is_err(),
+            "a GTO-family config must never bind to an Oreans envelope case"
+        );
+        // A family-less actual config defaults to Oreans and still binds.
+        let mut oreans_actual = crate::run_spec::frozen_run_policy(Path::new("x.bin"));
+        oreans_actual.pure_rebuild = true;
+        assert_eq!(oreans_actual.packer_family, packer_family::OREANS);
+        assert!(
+            bind_actual_config_to_envelope(&dir, &oreans_actual, &origin_identity).is_ok(),
+            "the Oreans-family (default) config binds to the Oreans case"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// G2-R1: unknown / missing family in the envelope case fails closed at
+    /// case-set validation (before any process/attestation work).
+    #[test]
+    fn g2r1_unknown_family_in_envelope_fails_closed() {
+        let dir = temp_dir("g2r1_unknown_family");
+        let mut env = v4_envelope();
+        env.case_configs[0].family_id = "bogus_family".to_string();
+        assert!(
+            env.validate_case_set().is_some(),
+            "an unknown family_id in the envelope must fail case-set validation"
+        );
+        let mut empty_family = v4_envelope();
+        empty_family.case_configs[1].family_id = String::new();
+        assert!(
+            empty_family.validate_case_set().is_some(),
+            "a missing family_id in the envelope must fail case-set validation"
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1992,24 +2062,25 @@ mod tests {
         let protected = (protected_sha.clone(), protected_bytes.len() as u64);
         let candidate = (candidate_sha.clone(), candidate_bytes.len() as u64);
 
-        // Build the 7 member files with their exact family-agnostic schemas.
+        // Build the 7 member files with their exact family-agnostic (GENERIC)
+        // schemas — `mida.unpack-*-evidence/v1`, never the Oreans variants.
         let evidence_dir = dir.join("evidence");
         std::fs::create_dir_all(&evidence_dir).unwrap();
         let member_specs: Vec<(&str, &str, bool)> = vec![
-            ("oep_evidence", "mida.oreans-oep-evidence/v1", true),
-            ("iat_evidence", "mida.oreans-iat-evidence/v1", true),
-            ("tls_evidence", "mida.oreans-tls-evidence/v1", true),
+            ("oep_evidence", "mida.unpack-oep-evidence/v1", true),
+            ("iat_evidence", "mida.unpack-iat-evidence/v1", true),
+            ("tls_evidence", "mida.unpack-tls-evidence/v1", true),
             (
                 "relocation_evidence",
-                "mida.oreans-relocation-evidence/v1",
+                "mida.unpack-relocation-evidence/v1",
                 true,
             ),
             (
                 "section_rebuild_evidence",
-                "mida.oreans-section-rebuild-evidence/v1",
+                "mida.unpack-section-rebuild-evidence/v1",
                 true,
             ),
-            ("pe_evidence", "mida.oreans-pe-evidence/v1", false),
+            ("pe_evidence", "mida.unpack-pe-evidence/v1", false),
             ("transform_manifest", "mida.transform-manifest/v0", false),
         ];
         let mut members = Vec::new();

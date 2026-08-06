@@ -21,8 +21,9 @@
 //! - the protected input and the candidate are re-read from disk and their
 //!   SHA-256/size bound into the manifest;
 //! - every required member is present exactly once, its path is unique, its
-//!   JSON top-level `schema_version` matches the expected schema, and its
-//!   embedded identities match the re-read artifacts;
+//!   JSON top-level `schema_version` matches the expected GENERIC schema
+//!   (`mida.unpack-*-evidence/v1`, never an Oreans sidecar), and its embedded
+//!   identities match the re-read artifacts;
 //! - the manifest is written atomically (temp file + fsync + rename).
 
 use std::collections::BTreeSet;
@@ -42,18 +43,23 @@ pub const GENERIC_BUNDLE_SCHEMA_VERSION: &str = "mida.unpack-evidence-bundle/v1"
 /// Schema id of the bound transform manifest.
 pub const TRANSFORM_MANIFEST_SCHEMA_VERSION: &str = "mida.transform-manifest/v0";
 
-/// Logical member names and their expected sidecar schema ids (the
-/// family-agnostic sidecars shared with the Oreans contract).
+/// Logical member names and their expected GENERIC sidecar schema ids. A
+/// generic bundle's members always carry the family-agnostic
+/// `mida.unpack-*-evidence/v1` schemas — never the Oreans
+/// `mida.oreans-*-evidence/v1` schemas — so a generic bundle can never smuggle
+/// an Oreans sidecar and an Oreans envelope can never carry a generic member.
+/// These must stay in lockstep with
+/// `mida_acceptance::generic_bundle::REQUIRED_UNPACK_MEMBERS`.
 pub const EXPECTED_MEMBER_SCHEMAS: [(&str, &str); 7] = [
-    ("oep_evidence", "mida.oreans-oep-evidence/v1"),
-    ("iat_evidence", "mida.oreans-iat-evidence/v1"),
-    ("tls_evidence", "mida.oreans-tls-evidence/v1"),
-    ("relocation_evidence", "mida.oreans-relocation-evidence/v1"),
+    ("oep_evidence", "mida.unpack-oep-evidence/v1"),
+    ("iat_evidence", "mida.unpack-iat-evidence/v1"),
+    ("tls_evidence", "mida.unpack-tls-evidence/v1"),
+    ("relocation_evidence", "mida.unpack-relocation-evidence/v1"),
     (
         "section_rebuild_evidence",
-        "mida.oreans-section-rebuild-evidence/v1",
+        "mida.unpack-section-rebuild-evidence/v1",
     ),
-    ("pe_evidence", "mida.oreans-pe-evidence/v1"),
+    ("pe_evidence", "mida.unpack-pe-evidence/v1"),
     ("transform_manifest", TRANSFORM_MANIFEST_SCHEMA_VERSION),
 ];
 

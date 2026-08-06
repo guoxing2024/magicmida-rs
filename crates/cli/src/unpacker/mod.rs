@@ -159,7 +159,13 @@ pub fn unpack(
     // legacy behaviour.
     // P6.3-D: the attested evidence context flows into sidecar and bundle
     // production after a successful gated run.
+    // G2-R1: the packer family is bound at STAGING time into the envelope case
+    // for this input (from the case manifest's `protection_family`). It is
+    // resolved HERE — before the actual/frozen policy and the digest are built
+    // and before the Ready attestation — so a run can never attest under one
+    // family and then switch to another. There is no rebind path.
     let mut evidence_ctx: Option<crate::runner_preflight::RunEvidenceContext> = None;
+    let mut attested_family: Option<String> = None;
     if let Some(preflight_dir) = preflight_dir {
         let envelope = crate::runner_preflight::RunnerConfigEnvelope::read(preflight_dir)
             .map_err(|e| anyhow!("launch blocked: runner-config envelope unavailable: {e:#}"))?;
@@ -167,7 +173,23 @@ pub fn unpack(
             .map_err(|e| anyhow!("launch blocked: cannot resolve the current executable: {e}"))?;
         let cli_binary_sha256 = crate::runner_preflight::sha256_file(&cli_binary)
             .map_err(|e| anyhow!("launch blocked: cannot digest the current executable: {e}"))?;
-        let actual_config = crate::run_spec::runner_config_from_unpack_args(
+        // Resolve the envelope-bound family for THIS input before building the
+        // actual config (the input is matched by identity, not yet parsed). If
+        // the input is not a staged case input (e.g. a hermetic synthetic
+        // input in tests), case-selection fails here and the run is refused by
+        // the attestation below; the actual config is still built with a
+        // conservative (Oreans-compat) family so the P7 policy divergence
+        // reasons remain visible before the case-selection refusal.
+        let mut family = mida_core::runner_config::packer_family::OREANS.to_string();
+        if let Ok(current_identity) = crate::runner_preflight::file_identity(input) {
+            if let Ok(staged) =
+                crate::runner_preflight::select_case_config(&envelope, &current_identity)
+            {
+                family = staged.family_id.clone();
+            }
+        }
+        let actual_config = crate::run_spec::runner_config_from_unpack_args_family(
+            &family,
             oep_policy,
             container_restore,
             profile,
@@ -180,7 +202,7 @@ pub fn unpack(
         );
         if let Some(reason) = crate::run_spec::policy_matches(
             &actual_config,
-            &crate::run_spec::frozen_run_policy(input),
+            &crate::run_spec::frozen_run_policy_for_family(input, &family),
         ) {
             return Err(anyhow!(
                 "launch blocked: run config diverges from the P7 fixed-mode policy for this \
@@ -193,16 +215,13 @@ pub fn unpack(
             cli_binary: &cli_binary,
             runner_config: &actual_config,
         };
+        // The attestation binds the ENVELOPE's family (staging-sealed) into
+        // the single-use evidence context — never a caller-supplied or
+        // rebindable family. `attest_ready_before_launch` reads it from the
+        // matched case and fails closed if the actual config family differs.
         let context = crate::runner_preflight::attest_ready_before_launch(
             preflight_dir,
             &launch_ctx,
-            // G2: the packer family is not known yet (the input PE has not
-            // been parsed — the launch boundary gates the run BEFORE any
-            // process/PE work). The context starts on the Oreans-compat
-            // family; once `dual_select_packer` identifies GTO below, it is
-            // rebound to `ahk_gto` so its evidence routes to the generic
-            // contract instead of masquerading as Oreans evidence.
-            mida_core::runner_config::packer_family::OREANS,
         )
         .map_err(|e| {
             anyhow!("launch blocked by preflight attestation before any process creation: {e:#}")
@@ -211,15 +230,18 @@ pub fn unpack(
         // stable, filter-independent line (the `info!` below is for verbose
         // logging only and must not be the sole signal tests rely on).
         eprintln!(
-            "launch attestation: Ready (case {}; runner-config digest {})",
+            "launch attestation: Ready (case {}; family {}; runner-config digest {})",
             context.case_id(),
+            context.packer_family(),
             context.runner_config_digest()
         );
         info!(
-            "Launch attestation: Ready — case {} bound to envelope digest {}",
+            "Launch attestation: Ready — case {} (family {}) bound to envelope digest {}",
             context.case_id(),
+            context.packer_family(),
             context.runner_config_digest()
         );
+        attested_family = Some(family);
         evidence_ctx = Some(context);
     }
     // ---- step 2: parse PE header ----
@@ -289,26 +311,20 @@ pub fn unpack(
         }
     }
 
-    // ---- G2: bind the attested evidence context to the identified family ----
-    // The launch boundary attested the run on the Oreans-compat family (the
-    // input PE was not parsed yet). Now that `dual_select_packer` has
-    // identified the family, rebind the context so GTO evidence routes to the
-    // generic `mida.unpack-evidence-bundle/v1` contract and never masquerades
-    // as Oreans evidence. Oreans stays on the legacy v2 contract (rebinding to
-    // the same family is a no-op); an unknown family fails closed in
-    // `rebind_family`.
-    if evidence_ctx.is_some() && selected_family != mida_core::runner_config::packer_family::OREANS
-    {
-        let ctx = evidence_ctx
-            .take()
-            .expect("rebind: attested evidence context present")
-            .rebind_family(selected_family)
-            .map_err(|e| anyhow!("launch blocked: cannot bind evidence family: {e:#}"))?;
-        evidence_ctx = Some(ctx);
-        info!(
-            family = selected_family,
-            "Evidence context rebound to identified packer family"
-        );
+    // ---- G2-R1: PE-identified family must match the attested family ----
+    // The packer family was bound at STAGING into the envelope, resolved and
+    // attested BEFORE any policy/digest/process work above. Now that the input
+    // PE is parsed, the PE-identified family must equal the attested envelope
+    // family. Any mismatch (or an unknown attestation family) fails closed
+    // BEFORE the sample process is created — there is no rebind path.
+    if let Some(attested) = attested_family.as_deref() {
+        if selected_family != attested {
+            return Err(anyhow!(
+                "launch blocked: PE-identified packer family {selected_family:?} != attested \
+                 envelope family {attested:?}; refusing to launch (fail-closed before process \
+                 creation)"
+            ));
+        }
     }
 
     // ---- family host PE layout probe (shared post-attach/post-loop skeleton) ----

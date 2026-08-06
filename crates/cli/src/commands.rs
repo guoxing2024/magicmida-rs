@@ -105,14 +105,20 @@ pub fn run_offline_preflight_command(
     // artifact (the authoritative identity the verifier cross-references),
     // so the case-set seal is stable even when the sample file is absent
     // (the verifier reports NotReady; the envelope stays well-formed).
+    // G2-R1: the packer family is bound at STAGING time from the case
+    // manifest's `protection_family`, and becomes part of the sealed envelope
+    // (family_id). The launch attestation uses exactly this family for the
+    // actual/frozen policy and the digest — a case can never change family
+    // after staging.
     let mut case_configs = Vec::with_capacity(cases.len());
     for (manifest, input, _output) in cases {
-        let mut config = crate::run_spec::frozen_run_policy(input);
+        let (case_id, protected_input, family_id) = case_identity_from_manifest(manifest)?;
+        let mut config = crate::run_spec::frozen_run_policy_for_family(input, &family_id);
         config.tool_revision = tool_revision.clone();
         config.cli_binary_sha256 = cli_binary_sha256.clone();
-        let (case_id, protected_input) = case_identity_from_manifest(manifest)?;
         case_configs.push(CaseRunnerConfigEnvelope {
             case_id,
+            family_id,
             protected_input,
             runner_config: serde_json::to_value(&config)
                 .expect("per-case runner config serializes"),
@@ -154,13 +160,15 @@ pub fn run_offline_preflight_command(
     Ok(())
 }
 
-/// Read the fixed `case_id` and the locked protected-input identity from a
-/// `mida.case-manifest/v2` manifest. The envelope's per-case id and input
-/// identity must agree with the verifier's `check_case_identity` (which
-/// derives them the same way from the manifest).
+/// Read the fixed `case_id`, the locked protected-input identity, and the
+/// packer family (from `protection_family`) of a `mida.case-manifest/v2`
+/// manifest. The envelope's per-case id and input identity must agree with the
+/// verifier's `check_case_identity` (which derives them the same way from the
+/// manifest). G2-R1: the family is bound at staging and becomes the envelope's
+/// `family_id`; an unknown `protection_family` fails closed (no guessed family).
 fn case_identity_from_manifest(
     manifest: &Path,
-) -> Result<(String, crate::runner_preflight::FileIdentityGate), anyhow::Error> {
+) -> Result<(String, crate::runner_preflight::FileIdentityGate, String), anyhow::Error> {
     let bytes = std::fs::read(manifest)?;
     let value: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|e| anyhow::anyhow!("manifest {}: {e}", manifest.display()))?;
@@ -168,6 +176,26 @@ fn case_identity_from_manifest(
         .get("case_id")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("manifest {} has no case_id", manifest.display()))?
+        .to_string();
+    let protection_family = value
+        .get("capability_cell")
+        .and_then(|c| c.get("protection_family"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "manifest {} has no capability_cell.protection_family; cannot bind a packer \
+                 family",
+                manifest.display()
+            )
+        })?;
+    let family_id = crate::run_spec::packer_family_from_protection_family(protection_family)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "manifest {} protection_family {protection_family:?} is not a known packer \
+                 family; refusing to stage (fail-closed)",
+                manifest.display()
+            )
+        })?
         .to_string();
     let protected = value
         .get("artifacts")
@@ -207,5 +235,6 @@ fn case_identity_from_manifest(
             sha256: sha,
             size_bytes: size,
         },
+        family_id,
     ))
 }

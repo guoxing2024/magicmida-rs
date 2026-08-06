@@ -37,6 +37,29 @@ pub mod packer_family {
     /// AHK/GTO family — routes to the generic `mida.unpack-evidence-bundle/v1`
     /// contract. Its products must never be disguised as Oreans evidence.
     pub const AHK_GTO: &str = "ahk_gto";
+
+    /// Families that record their evidence through the generic
+    /// `mida.unpack-evidence-bundle/v1` contract. Extend this list when a new
+    /// family adopts the generic contract; the generic consumer accepts any
+    /// family in this registry (it is not hard-coded to `ahk_gto`).
+    pub const GENERIC_FAMILIES: [&str; 1] = [AHK_GTO];
+
+    /// A family that routes to the generic `mida.unpack-evidence-bundle/v1`
+    /// contract. Family-agnostic: any registered generic family is accepted.
+    pub fn is_generic_family(family: &str) -> bool {
+        GENERIC_FAMILIES.contains(&family)
+    }
+
+    /// The Oreans family (legacy `mida.oreans-evidence-bundle/v2` contract).
+    pub fn is_oreans_family(family: &str) -> bool {
+        family == OREANS
+    }
+
+    /// A family this toolchain knows how to bind to an evidence contract
+    /// (either the legacy Oreans contract or the generic contract).
+    pub fn is_known_family(family: &str) -> bool {
+        is_generic_family(family) || is_oreans_family(family)
+    }
 }
 
 /// Default family for a family-less (legacy) runner config. Kept as the
@@ -406,5 +429,21 @@ mod tests {
             runner_config_digest(&parsed),
             runner_config_digest(&sample_runner_config())
         );
+    }
+
+    #[test]
+    fn packer_family_registry_distinguishes_generic_and_oreans() {
+        // The generic family registry is extensible and not hard-coded to a
+        // single family id. GTO is currently the only generic family.
+        assert!(packer_family::is_generic_family(packer_family::AHK_GTO));
+        assert!(packer_family::is_known_family(packer_family::AHK_GTO));
+        assert!(!packer_family::is_generic_family(packer_family::OREANS));
+        assert!(packer_family::is_oreans_family(packer_family::OREANS));
+        assert!(packer_family::is_known_family(packer_family::OREANS));
+        // Unknown families are refused everywhere (fail-closed).
+        assert!(!packer_family::is_generic_family("bogus_family"));
+        assert!(!packer_family::is_oreans_family("bogus_family"));
+        assert!(!packer_family::is_known_family("bogus_family"));
+        assert!(!packer_family::is_known_family(""));
     }
 }

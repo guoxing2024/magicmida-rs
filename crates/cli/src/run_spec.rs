@@ -97,12 +97,32 @@ pub fn evidence_bundle_schema_for_family(family: &str) -> String {
     }
 }
 
+/// Explicit "no acceptance gate" marker for a packer family whose products are
+/// not yet accepted by any gate consumer. This is deliberately NOT a schema id
+/// (no `/vN` version suffix) so it can never be mistaken for a real gate
+/// schema or forged into one; a family with no gate simply records that its
+/// products are not accepted.
+pub const UNPACK_GATE_ABSENT: &str = "no-gate";
+
+/// Map a case manifest's `protection_family` (see `lab/cases/v2/
+/// case-manifest.schema.json`) to the packer-family identity the runner binds
+/// into the config and the envelope. Unknown protection families return
+/// `None` so staging fails closed rather than guessing a family.
+pub fn packer_family_from_protection_family(protection_family: &str) -> Option<&'static str> {
+    match protection_family {
+        "oreans_candidate" => Some(packer_family::OREANS),
+        "ahk_gto_candidate" => Some(packer_family::AHK_GTO),
+        _ => None,
+    }
+}
+
 /// The gate-schema id for a packer family. Oreans keeps the v8 two-sample gate;
-/// GTO has no gate consumer yet (its products are not accepted).
+/// GTO has no gate consumer yet (its products are not accepted) — it records
+/// [`UNPACK_GATE_ABSENT`] explicitly rather than a forged schema id.
 pub fn gate_schema_for_family(family: &str) -> String {
     match family {
         packer_family::OREANS => "mida.oreans-two-sample-gate/v8".to_string(),
-        packer_family::AHK_GTO => "mida.unpack-gate/none".to_string(),
+        packer_family::AHK_GTO => UNPACK_GATE_ABSENT.to_string(),
         _ => String::new(),
     }
 }

@@ -15,12 +15,15 @@
 //! [`consume_unpack_bundle`]):
 //! - a missing or empty `family_id` is rejected;
 //! - an unknown generic schema version is rejected;
-//! - the family must be `ahk_gto` for this generic contract (Oreans bundles
-//!   belong to the Oreans consumer and are rejected here);
+//! - the family must be a *registered generic family* (currently `ahk_gto`);
+//!   Oreans bundles belong to the Oreans consumer and are rejected here;
 //! - an Oreans v2 bundle masquerading as a generic bundle (wrong
 //!   `schema_version`, or `family_id` absent) is rejected;
-//! - any member schema that does not match the expected family schema is
-//!   rejected (no cross-family member smuggling).
+//! - every member must carry a *generic* `mida.unpack-*-evidence/v1` schema —
+//!   an Oreans `mida.oreans-*-evidence/v1` member under a generic envelope is
+//!   rejected (no cross-family member smuggling);
+//! - any member schema that does not match the expected generic schema is
+//!   rejected.
 //!
 //! The black-box boundary is the same as the Oreans contract: this module is
 //! the only authority on generic-bundle validity, and the producer
@@ -31,42 +34,65 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::identity::sha256_hex;
-use crate::oreans_gate::{
-    OREANS_IAT_EVIDENCE_SCHEMA_VERSION, OREANS_OEP_EVIDENCE_SCHEMA_VERSION,
-    OREANS_RELOCATION_EVIDENCE_SCHEMA_VERSION, OREANS_SECTION_REBUILD_EVIDENCE_SCHEMA_VERSION,
-    OREANS_TLS_EVIDENCE_SCHEMA_VERSION,
-};
-use crate::oreans_pe_evidence::OREANS_PE_EVIDENCE_SCHEMA_VERSION;
 
 /// Schema id of the generic unpack-evidence bundle.
 pub const UNPACK_EVIDENCE_BUNDLE_SCHEMA_VERSION: &str = "mida.unpack-evidence-bundle/v1";
 
-/// The packer family allowed under the generic contract (AHK/GTO). Oreans runs
-/// must NOT use the generic contract — they keep `mida.oreans-evidence-bundle/v2`.
+/// The generic contract's current packer family (AHK/GTO). The consumer does
+/// NOT hard-code to this id — it accepts any registered generic family
+/// ([`generic_families`]); this constant is kept as the documented primary
+/// generic family and for producer/test convenience.
 pub const GENERIC_PACKER_FAMILY: &str = "ahk_gto";
 /// The Oreans family id (rejected by this generic consumer).
 pub const OREANS_PACKER_FAMILY: &str = "oreans_themida";
 
+/// The families that record evidence through this generic contract. This is
+/// the generic contract's OWN extensible family registry (kept independent of
+/// `mida-core::runner_config::packer_family` because the acceptance crate must
+/// not depend on production crates). Extend this list when a new family adopts
+/// the generic contract; the consumer accepts any family in it.
+pub fn generic_families() -> &'static [&'static str] {
+    &[GENERIC_PACKER_FAMILY]
+}
+
+/// A family that routes to the generic `mida.unpack-evidence-bundle/v1`
+/// contract. Family-agnostic: any registered generic family is accepted.
+pub fn is_generic_family(family: &str) -> bool {
+    generic_families().contains(&family)
+}
+
 /// Schema id of the bound transform manifest written next to a candidate.
 pub const TRANSFORM_MANIFEST_SCHEMA_VERSION: &str = "mida.transform-manifest/v0";
 
+/// Family-agnostic member schemas of the generic bundle. These are the
+/// generic, versioned sidecar schemas every generic family's members must
+/// carry. They are deliberately distinct from the Oreans
+/// `mida.oreans-*-evidence/v1` schemas, so a generic bundle can never smuggle
+/// an Oreans sidecar (and an Oreans envelope can never carry a generic member).
+pub const UNPACK_OEP_EVIDENCE_SCHEMA_VERSION: &str = "mida.unpack-oep-evidence/v1";
+pub const UNPACK_IAT_EVIDENCE_SCHEMA_VERSION: &str = "mida.unpack-iat-evidence/v1";
+pub const UNPACK_TLS_EVIDENCE_SCHEMA_VERSION: &str = "mida.unpack-tls-evidence/v1";
+pub const UNPACK_RELOCATION_EVIDENCE_SCHEMA_VERSION: &str = "mida.unpack-relocation-evidence/v1";
+pub const UNPACK_SECTION_REBUILD_EVIDENCE_SCHEMA_VERSION: &str =
+    "mida.unpack-section-rebuild-evidence/v1";
+pub const UNPACK_PE_EVIDENCE_SCHEMA_VERSION: &str = "mida.unpack-pe-evidence/v1";
+
 /// Logical member names required for a generic bundle to be a complete valid
-/// run, with their expected sidecar schema ids. These are the same
-/// family-agnostic sidecars the Oreans contract binds; the generic bundle
-/// manifests them under a family-agnostic envelope and a `family_id`.
+/// run, with their expected generic sidecar schema ids. The generic bundle
+/// manifests them under a family-agnostic envelope with a `family_id`.
 pub const REQUIRED_UNPACK_MEMBERS: [(&str, &str); 7] = [
-    ("oep_evidence", OREANS_OEP_EVIDENCE_SCHEMA_VERSION),
-    ("iat_evidence", OREANS_IAT_EVIDENCE_SCHEMA_VERSION),
-    ("tls_evidence", OREANS_TLS_EVIDENCE_SCHEMA_VERSION),
+    ("oep_evidence", UNPACK_OEP_EVIDENCE_SCHEMA_VERSION),
+    ("iat_evidence", UNPACK_IAT_EVIDENCE_SCHEMA_VERSION),
+    ("tls_evidence", UNPACK_TLS_EVIDENCE_SCHEMA_VERSION),
     (
         "relocation_evidence",
-        OREANS_RELOCATION_EVIDENCE_SCHEMA_VERSION,
+        UNPACK_RELOCATION_EVIDENCE_SCHEMA_VERSION,
     ),
     (
         "section_rebuild_evidence",
-        OREANS_SECTION_REBUILD_EVIDENCE_SCHEMA_VERSION,
+        UNPACK_SECTION_REBUILD_EVIDENCE_SCHEMA_VERSION,
     ),
-    ("pe_evidence", OREANS_PE_EVIDENCE_SCHEMA_VERSION),
+    ("pe_evidence", UNPACK_PE_EVIDENCE_SCHEMA_VERSION),
     ("transform_manifest", TRANSFORM_MANIFEST_SCHEMA_VERSION),
 ];
 
@@ -345,11 +371,14 @@ pub fn validate_unpack_bundle(
     if bundle.family_id.trim().is_empty() {
         return UnpackBundleVerdict::invalid("family_id is missing or empty; refuse (fail-closed)");
     }
-    if bundle.family_id != GENERIC_PACKER_FAMILY {
+    // The generic contract accepts any REGISTERED generic family (extensible
+    // registry, currently `ahk_gto`); an Oreans family id or an unknown family
+    // is refused — Oreans evidence belongs to the Oreans consumer.
+    if !is_generic_family(&bundle.family_id) {
         return UnpackBundleVerdict::invalid(format!(
-            "family_id {:?} is not the generic GTO family {:?}; \
-             Oreans evidence belongs to the Oreans consumer",
-            bundle.family_id, GENERIC_PACKER_FAMILY
+            "family_id {:?} is not a registered generic family; \
+             Oreans/unknown evidence belongs to its own consumer (fail-closed)",
+            bundle.family_id
         ));
     }
     validate_plain_field(&bundle.family_id, "family_id", false, &mut reasons);
@@ -539,7 +568,7 @@ mod tests {
 
     fn pe_evidence(candidate_sha: &str) -> Vec<u8> {
         serde_json::json!({
-            "schema_version": OREANS_PE_EVIDENCE_SCHEMA_VERSION,
+            "schema_version": UNPACK_PE_EVIDENCE_SCHEMA_VERSION,
             "candidate": { "sha256": candidate_sha, "size_bytes": 20 },
         })
         .to_string()
@@ -701,11 +730,14 @@ mod tests {
     fn wrong_member_schema_fails_closed() {
         let bundle = complete_gto_bundle();
         let mut files = files_for(&bundle);
-        // Sneak an Oreans-only schema under the iat_evidence member name.
+        // Cross-family member smuggling: an Oreans `mida.oreans-*-evidence`
+        // sidecar under a generic member name must be rejected. The generic
+        // contract only accepts `mida.unpack-*-evidence/v1` members, so an
+        // Oreans member under a generic envelope fails closed.
         files.insert(
             "iat_evidence".to_string(),
             sidecar(
-                "mida.oreans-iat-evidence/v9",
+                "mida.oreans-iat-evidence/v1",
                 &bundle.protected_input.sha256,
                 &bundle.candidate.sha256,
             ),
@@ -733,5 +765,70 @@ mod tests {
         assert!(!verdict.valid);
         assert!(verdict.reasons.iter().any(|r| r.contains("partial")));
         assert!(consume_unpack_bundle(&bundle, &files).is_err());
+    }
+
+    /// G2-R1: the generic bundle's member schemas are the family-agnostic
+    /// `mida.unpack-*-evidence/v1` set — never the Oreans `mida.oreans-*`
+    /// sidecars. This is what makes a generic bundle unable to smuggle an
+    /// Oreans member (and vice versa).
+    #[test]
+    fn generic_member_schemas_are_family_agnostic_not_oreans() {
+        for (name, schema) in REQUIRED_UNPACK_MEMBERS {
+            if name == "transform_manifest" {
+                continue; // shared, versioned transform manifest
+            }
+            assert!(
+                schema.starts_with("mida.unpack-"),
+                "member {name} must carry a generic mida.unpack-* schema, got {schema}"
+            );
+            assert!(
+                !schema.starts_with("mida.oreans-"),
+                "member {name} must never carry an Oreans schema, got {schema}"
+            );
+        }
+        // And the Oreans contract's own members are the opposite set — the two
+        // never overlap, so an Oreans member cannot satisfy a generic bundle
+        // (and a generic member cannot satisfy an Oreans bundle).
+        for (name, schema) in crate::evidence_bundle::REQUIRED_BUNDLE_MEMBERS {
+            if name == "transform_manifest" {
+                continue;
+            }
+            assert!(
+                schema.starts_with("mida.oreans-"),
+                "Oreans member {name} must carry an oreans-* schema, got {schema}"
+            );
+            assert!(
+                !schema.starts_with("mida.unpack-"),
+                "Oreans member {name} must never carry a generic mida.unpack-* schema"
+            );
+        }
+    }
+
+    /// G2-R1: an Oreans v2 bundle carrying a generic `mida.unpack-*` member is
+    /// refused by the Oreans consumer. Here we prove the seam without touching
+    /// Oreans internals: the Oreans member-schema set is disjoint from the
+    /// generic set, so any generic member under an Oreans envelope fails the
+    /// Oreans consumer's own schema check (already covered by
+    /// `evidence_bundle::tests::sidecar_schema_drift_is_detected`).
+    #[test]
+    fn oreans_member_schemas_are_disjoint_from_generic() {
+        for (name, schema) in crate::evidence_bundle::REQUIRED_BUNDLE_MEMBERS {
+            if name == "transform_manifest" {
+                continue;
+            }
+            assert!(
+                schema.starts_with("mida.oreans-") && !schema.starts_with("mida.unpack-"),
+                "Oreans member {name} schema {schema} must be disjoint from the generic set"
+            );
+        }
+        for (name, schema) in REQUIRED_UNPACK_MEMBERS {
+            if name == "transform_manifest" {
+                continue;
+            }
+            assert!(
+                schema.starts_with("mida.unpack-") && !schema.starts_with("mida.oreans-"),
+                "generic member {name} schema {schema} must be disjoint from the Oreans set"
+            );
+        }
     }
 }

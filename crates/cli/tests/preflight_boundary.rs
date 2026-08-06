@@ -845,11 +845,14 @@ fn case_runner_config_pure(
 }
 
 /// One case entry as a JSON value, bound to the given case_id and protected
-/// input identity, with a per-case digest computed from its config.
+/// input identity, with a per-case digest computed from its config. The
+/// staging-sealed `family_id` is the config's packer family (Oreans for these
+/// synthetic cases).
 fn case_entry_json(case_id: &str, sha: &str, size: u64) -> serde_json::Value {
     let (cfg, digest) = case_runner_config(case_id);
     serde_json::json!({
         "case_id": case_id,
+        "family_id": cfg.packer_family,
         "protected_input": { "sha256": sha, "size_bytes": size },
         "runner_config": serde_json::to_value(&cfg).unwrap(),
         "runner_config_digest": digest,
@@ -867,6 +870,7 @@ fn case_entry_with_policy(
     let (cfg, digest) = case_runner_config_pure(case_id, pure_rebuild);
     serde_json::json!({
         "case_id": case_id,
+        "family_id": cfg.packer_family,
         "protected_input": { "sha256": sha, "size_bytes": size },
         "runner_config": serde_json::to_value(&cfg).unwrap(),
         "runner_config_digest": digest,
@@ -874,14 +878,19 @@ fn case_entry_with_policy(
 }
 
 /// Recompute the case-set digest for a list of case entries (fixed canonical
-/// order applied by sorting).
+/// order applied by sorting). The `family_id` is part of the sealed digest.
 fn reseal_case_set(entries: &[serde_json::Value]) -> String {
     let mut lines: Vec<String> = entries
         .iter()
         .map(|c| {
+            let family = c
+                .get("family_id")
+                .and_then(|f| f.as_str())
+                .unwrap_or("oreans_themida");
             format!(
-                "case={}\nprotected_input={}|{}\nrunner_config_digest={}\n",
+                "case={}\nfamily={}\nprotected_input={}|{}\nrunner_config_digest={}\n",
                 c["case_id"].as_str().unwrap(),
+                family.to_lowercase(),
                 c["protected_input"]["sha256"]
                     .as_str()
                     .unwrap()
@@ -1165,8 +1174,12 @@ fn canonical_case_entries(envelope: &serde_json::Value) -> Vec<String> {
         .iter()
         .map(|c| {
             format!(
-                "{}|{}|{}|{}",
+                "{}|{}|{}|{}|{}",
                 c["case_id"].as_str().unwrap(),
+                c.get("family_id")
+                    .and_then(|f| f.as_str())
+                    .unwrap_or("oreans_themida")
+                    .to_lowercase(),
                 c["protected_input"]["sha256"]
                     .as_str()
                     .unwrap()

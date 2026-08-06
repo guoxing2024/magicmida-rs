@@ -1156,6 +1156,9 @@ struct RunnerConfigEnvelopeV4 {
 #[serde(deny_unknown_fields)]
 struct CaseConfigEnvelopeV4 {
     case_id: String,
+    /// The packer family this case's run belongs to (staging-sealed; part of
+    /// the case-set digest). The verifier checks it is a known family.
+    family_id: String,
     protected_input: mida_acceptance::FileIdentity,
     runner_config: serde_json::Value,
     runner_config_digest: String,
@@ -1398,6 +1401,23 @@ fn cmd_preflight(args: &[String]) -> Result<i32, String> {
                 case.case_id
             ));
         }
+        // G2-R1: the envelope's staging-sealed family must be a known family
+        // and must agree with the family embedded in the per-case runner
+        // config. A family mismatch (or an unknown family) fails closed.
+        if case.family_id.trim().is_empty()
+            || !mida_acceptance::is_known_packer_family(&case.family_id)
+        {
+            reasons.push(format!(
+                "case {} family_id {:?} is not a known packer family (fail-closed)",
+                case.case_id, case.family_id
+            ));
+        }
+        if parsed.packer_family != case.family_id {
+            reasons.push(format!(
+                "case {} runner-config packer_family {:?} != envelope family_id {:?} (fail-closed)",
+                case.case_id, parsed.packer_family, case.family_id
+            ));
+        }
         let recomputed = mida_acceptance::runner_config_digest(&parsed);
         if recomputed != case.runner_config_digest.to_lowercase() {
             reasons.push(format!(
@@ -1425,8 +1445,9 @@ fn cmd_preflight(args: &[String]) -> Result<i32, String> {
         for id in FIXED_CASE_IDS {
             if let Some(case) = envelope_by_case.get(id) {
                 entries.push(format!(
-                    "case={}\nprotected_input={}|{}\nrunner_config_digest={}\n",
+                    "case={}\nfamily={}\nprotected_input={}|{}\nrunner_config_digest={}\n",
                     case.case_id,
+                    case.family_id.to_lowercase(),
                     case.protected_input.sha256.to_lowercase(),
                     case.protected_input.size_bytes,
                     case.runner_config_digest.to_lowercase()
