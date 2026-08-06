@@ -1,8 +1,13 @@
 //! AHK/GTO [`PackerPlugin`] (R4-A0).
 //!
 //! Identify fingerprints from vault `gto_launcher` static layout (entry
-//! section `.KI3`, scrambled section names). Live dump still requires
-//! explicit `--profile=ahk-gto-experimental` on the host.
+//! section `.KI3`, scrambled section names, numbered `.dataN` payloads).
+//! Identification and routing are available in the default build (G0): a
+//! `gto_launcher`-shaped layout is recognized and routed to the AHK/GTO host.
+//! The heavyweight recovery route (`run_gto_host` in `mida-cli`) still requires
+//! the `gto-product-recovery` feature / `--profile=ahk-gto-experimental`; that
+//! gate is not touched here. Live dump always requires explicit
+//! `--profile=ahk-gto-experimental` on the host.
 
 use mida_core::{
     ContinueStatus, DebugEvent, DumpAdvice, EngineEvent, HostLoopFacts, IdentifyInput,
@@ -50,8 +55,10 @@ impl AhkGtoPlugin {
 
     /// Heuristic score from section names (0..=100).
     ///
-    /// This is compiled only for the explicitly enabled off-mainline route.
-    #[cfg(feature = "gto-product-recovery")]
+    /// Identification is part of the default surface (G0): it must never be
+    /// gated so that a default build can select the GTO family. The
+    /// `gto-product-recovery` feature only gates the heavyweight recovery
+    /// route, not recognition.
     fn score_sections(names: &[String]) -> u8 {
         let mut score = 0u8;
         let mut scrambled = 0u8;
@@ -111,13 +118,13 @@ impl AhkGtoPlugin {
     }
 }
 
-#[cfg(feature = "gto-product-recovery")]
+/// GTO/Oreans negative-signal marker. Oreans section names always score 0 so a
+/// real Oreans binary is never claimed by the GTO family.
 fn is_oreans_marker(name: &str) -> bool {
     name == ".themida" || name == ".boot" || name == ".winlice" || name.starts_with(".winlic")
 }
 
 /// GTO numbered data payload sections (e.g. `.data0`, `.data1`, `.data2`).
-#[cfg(feature = "gto-product-recovery")]
 fn is_gto_numbered_data_section(name: &str) -> bool {
     let n = name.trim();
     if !n.starts_with(".data") || n == ".data" {
@@ -128,7 +135,6 @@ fn is_gto_numbered_data_section(name: &str) -> bool {
 }
 
 /// Non-standard PE section names (scrambled / placeholder).
-#[cfg(feature = "gto-product-recovery")]
 fn is_scrambled_section_name(name: &str) -> bool {
     if name.is_empty() || name.starts_with('.') && name.len() <= 1 {
         return false;
@@ -159,23 +165,18 @@ impl PackerPlugin for AhkGtoPlugin {
     }
 
     fn identify(&self, input: &IdentifyInput) -> IdentifyResult {
-        #[cfg(feature = "gto-product-recovery")]
-        {
-            let score = Self::score_sections(&input.section_names);
-            if score >= 40 {
-                return IdentifyResult::Match {
-                    confidence: score.min(100),
-                };
-            }
-            if score > 0 {
-                return IdentifyResult::Ambiguous;
-            }
+        // Identification is always available (G0): a GTO-shaped layout can be
+        // recognized and routed in the default build. The `gto-product-recovery`
+        // feature gates the heavyweight recovery route only, not this match.
+        let score = Self::score_sections(&input.section_names);
+        if score >= 40 {
+            return IdentifyResult::Match {
+                confidence: score.min(100),
+            };
         }
-
-        // The product-recovery route is not part of the default workspace
-        // surface. Keep the plugin type available to the CLI's compatibility
-        // layer, but make default builds categorically unable to select it.
-        let _ = input;
+        if score > 0 {
+            return IdentifyResult::Ambiguous;
+        }
         IdentifyResult::NoMatch
     }
 
@@ -336,14 +337,8 @@ mod tests {
         assert_eq!(AhkGtoPlugin::new().family_id(), "ahk_gto");
     }
 
-    #[cfg(not(feature = "gto-product-recovery"))]
-    #[test]
-    fn product_recovery_identification_is_disabled_by_default() {
-        let r = AhkGtoPlugin::new().identify(&input(&[".text", ".KI3", ".data0", ".data1"]));
-        assert_eq!(r, IdentifyResult::NoMatch);
-    }
+    // --- G0: identification is available in the default build ---
 
-    #[cfg(feature = "gto-product-recovery")]
     #[test]
     fn gto_ki3_layout_matches() {
         // Vault gto_launcher section set (simplified).
@@ -356,11 +351,31 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "gto-product-recovery")]
     #[test]
     fn ki3_alone_matches() {
         let r = AhkGtoPlugin::new().identify(&input(&[".text", ".KI3", ".rsrc"]));
         assert!(matches!(r, IdentifyResult::Match { confidence } if confidence >= 40));
+    }
+
+    #[test]
+    fn numbered_data_sections_match_without_ki3() {
+        // 2026-07-30 updated 启动器.exe layout (sha256 46539ea7…): no .KI3.
+        let r = AhkGtoPlugin::new().identify(&input(&[
+            ".text", ".rdata", ".data", ".pdata", "_RDATA", ".data0", ".data1", ".data2", ".rsrc",
+        ]));
+        match r {
+            IdentifyResult::Match { confidence } => assert!(confidence >= 40, "conf={confidence}"),
+            other => panic!("expected Match, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn identify_record_stores_confidence() {
+        let mut p = AhkGtoPlugin::new();
+        let _ = p.identify_record(&input(&[".KI3"]));
+        assert!(p.last_identify_confidence >= 40);
+        let _ = p.identify_record(&input(&[".text"]));
+        assert_eq!(p.last_identify_confidence, 0);
     }
 
     #[test]
@@ -375,28 +390,7 @@ mod tests {
         assert_eq!(r, IdentifyResult::NoMatch);
     }
 
-    #[cfg(feature = "gto-product-recovery")]
-    #[test]
-    fn numbered_data_sections_match_without_ki3() {
-        // 2026-07-30 updated 启动器.exe layout (sha256 46539ea7…): no .KI3.
-        let r = AhkGtoPlugin::new().identify(&input(&[
-            ".text", ".rdata", ".data", ".pdata", "_RDATA", ".data0", ".data1", ".data2", ".rsrc",
-        ]));
-        match r {
-            IdentifyResult::Match { confidence } => assert!(confidence >= 40, "conf={confidence}"),
-            other => panic!("expected Match, got {other:?}"),
-        }
-    }
-
-    #[cfg(feature = "gto-product-recovery")]
-    #[test]
-    fn identify_record_stores_confidence() {
-        let mut p = AhkGtoPlugin::new();
-        let _ = p.identify_record(&input(&[".KI3"]));
-        assert!(p.last_identify_confidence >= 40);
-        let _ = p.identify_record(&input(&[".text"]));
-        assert_eq!(p.last_identify_confidence, 0);
-    }
+    // --- gto-product-recovery: heavyweight recovery route tests only ---
 
     #[cfg(feature = "gto-product-recovery")]
     #[test]

@@ -74,6 +74,13 @@ traceability. Its current coupling, heuristics, and historical tests are inputs
 to refactoring; they are not the vNext architecture and do not establish product
 acceptance.
 
+**Strategic role split (see README):** the primary long-term target is
+`gto_launcher`. The Oreans pair `origin_macro` + `lunlun_software` is the active
+regression gate — the fail-closed wall that GTO work must not break and the
+place where the structured evidence stack closes end-to-end first. Both families
+target the same engine/plugin boundaries below; they share the engine, not the
+policy.
+
 ### R1 progress
 
 - **R1-A:** pure PE API sketch and module inventory

@@ -8,6 +8,12 @@
 > - [COURSE_CORRECTION_WORK_ORDER.md](COURSE_CORRECTION_WORK_ORDER.md) ← **B-B 之后执行序**  
 > 快照：B-B 四案 `compose=Accepted`（`load_no_crash_v0`）→ **VNEXT-BEH 已写**；**产品 1.0 未宣称**。
 
+> **战略定位更新（2026-08-01）：** 本仓库的**长期主攻线是 `gto_launcher`**；
+> `origin_macro` + `lunlun_software` 是**当前回归门**（GTO 工作不得破坏的
+> fail-closed 墙，也是结构化证据栈最先端到端闭环的地方）。下列把 GTO 写成
+> "R4 候选 / 未来第二族 / 非主线"的旧措辞，均按此定位解读：GTO 不再是附属支线，
+> 但 Oreans 回归门契约本身（本文 §4、[OREANS_TWO_SAMPLE_PERFECT_UNPACK_PLAN.md](OREANS_TWO_SAMPLE_PERFECT_UNPACK_PLAN.md)）不因此放宽。
+
 **审计日期:** 2026-07-24（无人值守计划 + host thin-split 续；文首状态已纠偏）  
 **基线分支:** `baseline/legacy-recovery-20260722`  
 **HEAD:** 见 `git log -1`；纠偏序 [COURSE_CORRECTION_WORK_ORDER.md](COURSE_CORRECTION_WORK_ORDER.md)  
@@ -64,7 +70,7 @@ R1   纯 PE 模型 + rebuild 管线         ✅ R1-A..E 合成 corpus 关闭（M
      生产 dump 默认 pure              🟡 Origin-only 默认 pure（D3）；其它仍 legacy
 R2   统一 runtime/event + replay       ✅ Slice0–4 落地（handler 体仍在 cli）
 R3   Oreans 插件 + Origin/Lunlun/盲样  ✅ 结构门关闭 (10× + holdout); IAT holdout 100%
-R4   第二个独立保护族插件              ✅ 结构门关闭 (VNEXT-R4; GTO experimental + Oreans reg)
+R4   第二个独立保护族插件              ✅ 结构门关闭 (VNEXT-R4; GTO experimental + Oreans reg)；**GTO 现已升级为长期主攻线**
 BEH  独立行为验收                      🟡 B-B 四案 Accepted（load survival）→ VNEXT-BEH 已写；≠ 产品 1.0
 1.0  完美脱壳                          ⬜ 被 R-LOAD-FLAKE / R-PURE-LOGIC 等阻塞 → 见纠偏工作序
 ```
@@ -208,11 +214,13 @@ CLI 表面：
 - **风险：** 节/版本启发式差异；IAT 边界；shrink 误删。  
 - **基线（2026-07-23）：** `live_20260723-163436_p1fix3` → R0B StructuralPass（**degraded**：forced OEP + IAT 41/352 + 无 v3-trace）。
 
-#### C. GTO Launcher（AHK/GTO 研究）
+#### C. GTO Launcher（AHK/GTO 研究 — 长期主攻线）
 
-- **目标：** **显式** `--profile=ahk-gto-experimental`；**不**冒充 Oreans 生产。  
-- **风险：** heap/container 极重；无 reloc；CRT 敏感。  
-- **产品：** R4 候选，非 R3 必过。
+- **目标：** **长期主攻线**（见 README）。当前仍走**显式**
+  `--profile=ahk-gto-experimental`；**不**冒充 Oreans 生产，也不借 Oreans
+  回归门宣告 GTO 已恢复。
+- **风险：** heap/container 极重；无 reloc；CRT 敏感。
+- **产品：** 主攻线目标，非 R3 必过；Oreans 二样本是其回归门。
 
 #### D. Dali Plugin（托管/CLR）
 
@@ -519,7 +527,7 @@ M6  R4 第二族插件 + 1.0 评审
 1. **最终目的**是可证据化的“完美脱壳”（loader-valid + 行为等价 + 可复现 + 多族），不是单一启发式 dump。  
 2. **当前最强资产：** 独立 acceptance（R0B，本机已复验）+ 纯 PE rebuild（R1）+ vault 合约 + **Origin/Lunlun live StructuralPass 证据包**。  
 3. **当前最强负债：** Lunlun degraded IAT/OEP；pure raw packing residual + 未 flip；无行为/replay；单体调试循环。  
-4. **四个样品职责：** Origin/Lunlun 扛 Oreans 主线；GTO 未来第二族；Dali 明确范围外。  
+4. **四个样品职责：** GTO 是**长期主攻线**；Origin/Lunlun 是当前**回归门**（扛 Oreans 结构化证据闭环）；Dali 明确范围外。  
 5. **下一步唯一正确顺序（验证驱动）：** Phase2 Origin pure 结构对齐已完成 → **Lunlun pure smoke / R1-F 可选 / 显式 flip 决策** → R2 引擎 → R3 Oreans 门禁 → 行为 Accepted → R4。禁止跳过门禁默认 flip pure。  
 6. Windows 主机消除了“无法物化样品”的环境借口；**完美脱壳仍取决于证据阶梯，不取决于换了 OS。**
 

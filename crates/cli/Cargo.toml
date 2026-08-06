@@ -10,8 +10,11 @@ publish.workspace = true
 
 [features]
 default = []
-# Deliberately off-mainline: enables the isolated AHK/GTO product-recovery route.
-gto-product-recovery = ["dep:mida-packers-ahk-gto", "mida-packers-ahk-gto/gto-product-recovery"]
+# Enables the heavyweight AHK/GTO product-recovery route (independent GTO host,
+# heap/container capture, live GTO recovery). Identification and routing of
+# GTO-shaped samples are available in the default build (G0); this feature
+# unlocks the actual recovery execution, which stays explicitly opt-in.
+gto-product-recovery = ["mida-packers-ahk-gto/gto-product-recovery"]
 
 [dependencies]
 mida-core = { path = "../core" }
@@ -19,7 +22,7 @@ mida-pe = { path = "../pe" }
 mida-disasm = { path = "../disasm" }
 mida-tracer = { path = "../tracer" }
 mida-packers-themida = { path = "../packers/themida" }
-mida-packers-ahk-gto = { path = "../packers/ahk_gto", default-features = false, optional = true }
+mida-packers-ahk-gto = { path = "../packers/ahk_gto", default-features = false }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

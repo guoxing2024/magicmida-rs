@@ -1,8 +1,23 @@
 # WORKER_HANDOFF — operational takeover 2026-07-29 (1 of 2 samples)
 
+## Strategic role update (2026-08-01)
+
+**The repository's primary long-term line is `gto_launcher`.** The Oreans pair
+`origin_macro` + `lunlun_software` is the **active regression gate** — the
+fail-closed wall that GTO work must not quietly break, and where the structured
+OEP/IAT/TLS/reloc/section/behavior/replay evidence stack closes end-to-end
+first. See README and `docs/VNEXT_ARCHITECTURE.md`.
+
+All the historical GTO governance records below (Routes A–H, R1B/E2 seals,
+ledgers, charters under `archive/gto-20260730/`) remain authoritative about
+**what was attempted and what remains open** on the GTO recovery itself; none of
+them are superseded on that point, and none of them claimed product 1.0. This
+update does **not** reopen any sealed route or ledger — it only re-states the
+repository-level priority: GTO is the main line, Oreans is the regression gate.
+
 ## Goal (binding): docs/PROJECT_GOAL_20260725.md
 
-Perfect unpack of exactly two samples.
+Perfect unpack of exactly two samples (the Oreans regression gate).
 
 | sample | status |
 |--------|--------|

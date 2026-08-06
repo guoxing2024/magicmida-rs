@@ -11,7 +11,10 @@ publish = false
 
 [features]
 default = []
-# This research route is intentionally unavailable unless explicitly opted in.
+# Marks the heavyweight AHK/GTO product-recovery route. Identification and
+# family routing are available in the default build (G0); this feature gates
+# the recovery execution itself (independent GTO host, heap/container capture),
+# which stays explicitly opt-in via `mida-cli --features gto-product-recovery`.
 gto-product-recovery = []
 
 [dependencies]

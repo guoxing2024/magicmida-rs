@@ -9,6 +9,11 @@ behind stable interfaces and tested against an independent acceptance kernel. A
 historical output, including the Origin macro oracle candidate, is regression
 input only and is never proof that a new output is correct.
 
+Strategically, the primary long-term target is `gto_launcher`
+(`D:\Tools\RE\dumps\gto\启动器.exe`). The Oreans `origin_macro` +
+`lunlun_software` pair remains the active regression gate, but GTO is now a
+first-class support line, not a side quest.
+
 ## Repository scope
 
 The active repository contains only:
@@ -44,20 +49,51 @@ verdict contract is defined in
 [docs/ACCEPTANCE_CONTRACT.md](docs/ACCEPTANCE_CONTRACT.md). Existing crate names
 do not imply that those boundaries have already been achieved.
 
-### Current Oreans two-sample mainline
+### Current sample lines
 
-The current focused product goal is **perfect unpacking of exactly**
-`origin_macro` + `lunlun_software`, not `gto_launcher` and not a generic or
-universal claim. The fixed identities and fail-closed gates are documented in
-[docs/OREANS_TWO_SAMPLE_PERFECT_UNPACK_PLAN.md](docs/OREANS_TWO_SAMPLE_PERFECT_UNPACK_PLAN.md).
+The repository now has two explicit sample tracks:
+
+- **Primary strategic line:** `gto_launcher`
+  (`D:\Tools\RE\dumps\gto\启动器.exe`), with manifest
+  `lab/cases/v2/gto_launcher.json`.
+- **Active regression gate:** `origin_macro` + `lunlun_software`, with fixed
+  identities and fail-closed gates documented in
+  [docs/OREANS_TWO_SAMPLE_PERFECT_UNPACK_PLAN.md](docs/OREANS_TWO_SAMPLE_PERFECT_UNPACK_PLAN.md).
+
 A structural `Accepted`, historical oracle match, Shiguang server/icon patch,
-GTO holdout result, or retry-selected replay is not proof of perfect unpacking.
-The gate remains open until both samples pass OEP, complete IAT, TLS,
-relocations, section rebuild, behavior equivalence, and 10 consecutive isolated
-runs. The evidence-bundle inventory contract that makes a run record auditable
-is defined in [docs/VNEXT_EVIDENCE_BUNDLE_V1.md](docs/VNEXT_EVIDENCE_BUNDLE_V1.md).
+GTO holdout result, or retry-selected replay is not proof of perfect unpacking
+for any line. The gate remains open until each declared line passes the
+relevant OEP, IAT, TLS, relocation, section rebuild, behavior equivalence, and
+10 consecutive isolated-run requirements. The evidence-bundle inventory contract
+that makes a run record auditable is defined in
+[docs/VNEXT_EVIDENCE_BUNDLE_V1.md](docs/VNEXT_EVIDENCE_BUNDLE_V1.md).
 **Current status: not closed; this README makes no claim of perfect or
-universal Oreans unpacking.**
+universal unpacking.**
+
+### GTO default entry (G0)
+
+`gto_launcher` is now a first-class sample in the **default build**: the
+`mida-packers-ahk-gto` plugin is a workspace member and `mida-cli` default
+build, so a GTO-shaped layout (`.KI3` entry section, scrambled section names,
+numbered `.data0`/`.data1` payload sections) is recognized and routed to the
+`ahk_gto` family by `dual_select_packer` without any feature flag.
+
+This is **recognition and routing only**. The heavyweight GTO recovery route
+(the independent `run_gto_host`, heap/container capture) still requires an
+explicit opt-in:
+
+- `cargo build -p mida-cli --features gto-product-recovery` to compile the
+  recovery host; and
+- `--profile=ahk-gto-experimental` at unpack time for the experimental dump
+  stages.
+
+A default-build run that identifies GTO but is not opted in fails closed with a
+clear error rather than silently degrading to a non-GTO path. Default profile
+remains `oreans-classic`; no unpack silently becomes an experimental GTO path.
+
+GTO perfect unpack is **not** closed, and the Oreans `origin_macro` +
+`lunlun_software` regression gate must remain green: GTO work must not break
+that fixed evidence stack.
 
 ### Acceptance kernel (R0B)
 
@@ -121,13 +157,25 @@ The verifier checks schema semantics, object size/hash, forbidden legacy path
 references, and self-certifying language. Dynamic execution remains forbidden
 unless a case explicitly authorizes a fixed digest under an isolated runner.
 
+## Long-term plan
+
+1. Make `gto_launcher` a first-class product path with a dedicated replay and
+   evidence bundle, not just an experimental profile.
+2. Keep `origin_macro` + `lunlun_software` as the regression wall so GTO work
+   cannot quietly break the Oreans baseline.
+3. Finish runtime/event and family-plugin separation so GTO and Oreans share
+   the engine but not the policy.
+4. Keep structured OEP, IAT, TLS, relocation, section rebuild, and behavior
+   evidence mandatory for every supported line.
+5. Only then widen support to additional sample families.
+
 ## Release rule
 
 "Universal" and "perfect" are goals, not status labels. A production release
 requires an independent acceptance kernel, deterministic replay evidence,
 holdout cases, and at least two production-quality packer-family plugins. The
-Oreans suite must pass ten consecutive isolated runs before it can satisfy its
-family gate.
+GTO launcher line must be first-class, and the Oreans suite must still pass ten
+consecutive isolated runs before it can satisfy its family gate.
 
 ## License
 

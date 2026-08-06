@@ -1,30 +1,42 @@
 # Oreans Two-Sample Perfect Unpack Plan
 
-**Status:** current mainline goal and gate definition (2026-08-01)
+**Status:** active regression gate definition for the `gto_launcher` main line
+(2026-08-01)
 
 **Scope:** exactly two fixed Oreans samples: `origin_macro` and
-`lunlun_software`. This document is a goal/gate contract, not a success report.
+`lunlun_software`. This document is a gate contract, not a success report.
 No sample executable is run by the documentation-only work that introduced this
 file.
 
-## 1. Authority and scope correction
+## 1. Authority and role
 
-For the current Oreans mainline, this document is the focused source of truth.
-The older GTO-centered goal documents remain tracked historical governance
-records; they do not redefine this mainline. In particular:
+**Role in the repository's main line:** the primary long-term strategic target
+is `gto_launcher` (see README). `origin_macro` + `lunlun_software` are the
+**active regression gate** for that line: they are the fixed, fail-closed wall
+that GTO work must not quietly break, and they remain the place where the
+structured OEP/IAT/TLS/reloc/section/behavior/replay evidence stack is first
+exercised and closed end-to-end. This document is the focused gate contract for
+that pair.
 
-- `gto_launcher` is **not** one of the two samples in this gate.
+`gto_launcher` is **not** one of the two samples in this gate, and this gate
+does **not** define the GTO recovery roadmap. The GTO product-recovery and GTO
+research routes are separate workstreams (see WORKER_HANDOFF.md and
+`archive/gto-20260730/`); this document neither authorizes nor blocks them. In
+particular:
+
 - `xiongxiong_duokai` is a historical/R3 holdout and is **not** a required
-  third sample for this two-sample product gate.
-- GTO product-recovery and GTO research routes are separate workstreams. They
-  must not be used to declare either Oreans sample perfectly unpacked.
+  third sample for this two-sample regression gate.
+- GTO product-recovery and GTO research routes must not be used to declare
+  either Oreans sample perfectly unpacked, and closing this Oreans gate must
+  not be used to declare GTO recovered.
 - The Shiguang server/icon patch workflow is compatibility/product patch work,
   not an unpack-success criterion.
 
-The following older records are useful evidence/history only and must be read
-with the scope correction above:
+The following records are useful evidence/history only for **this gate** and
+must be read with the role split above (GTO main line vs Oreans regression gate):
 
-- `docs/PROJECT_GOAL_20260725.md` - older goal definition with a GTO target.
+- `docs/PROJECT_GOAL_20260725.md` - historical goal definition; the current
+  strategic target is `gto_launcher` per README, not the two Oreans samples.
 - `docs/VNEXT_R3_OREANS_PATH.md` - Oreans structural/R3 history and residuals.
 - `docs/AUDIT_PACKAGE_20260724.md` - historical acceptance-package results;
   it explicitly says product 1.0 was not claimed.
@@ -32,12 +44,12 @@ with the scope correction above:
   structure plus bounded process survival, not UI/script/business equivalence.
 - `archive/gto-20260730/docs/GTO_PRODUCT_RECOVERY_CHARTER_20260729.md` and
   `docs/GTO_RESEARCH_CHARTER_20260728.md` - GTO-only governance/research
-  records (product-recovery route sealed under `archive/gto-20260730/`), not
-  this gate.
+  records (product-recovery route sealed under `archive/gto-20260730/`); they
+  define the GTO workstream, not this gate.
 
 ## 2. Fixed sample identities
 
-These identities are immutable for this mainline. A result from a different
+These identities are immutable for this regression gate. A result from a different
 file, renamed copy, rebuilt input, or unpinned vault object is not evidence for
 the corresponding case.
 
@@ -58,7 +70,7 @@ can self-certify a candidate. `lunlun_software` has no oracle in its manifest.
 
 ## 3. What "perfect unpack"means here
 
-A candidate is perfect for this mainline only when **both** fixed cases pass all
+A candidate is perfect for this gate only when **both** fixed cases pass all
 of the gates below, with evidence tied to the fixed input digest and the exact
 candidate digest. Passing one case, passing a structural checker, or loading
 long enough is not enough.
@@ -274,12 +286,12 @@ following occurs for either `origin_macro` or `lunlun_software`:
 
 One sample passing does not compensate for the other sample failing. Until both
 cases pass every gate and the evidence bundle is readable and auditable, the
-mainline remains **open** and no perfect/universal claim is allowed.
+regression gate remains **open** and no perfect/universal claim is allowed.
 
-## 5. Current status: open and not completed
+## 5. Current status: gate open and not completed
 
-The only target samples are `origin_macro` and `lunlun_software`. The repository
-now contains the v8/v6 gate contract, strict structured OEP evidence, the
+The only regression-gate samples are `origin_macro` and `lunlun_software`. The
+repository now contains the v8/v6 gate contract, strict structured OEP evidence, the
 candidate-bound IAT, TLS, relocation, and section rebuild sidecars, and first-class structured
 IAT/TLS/relocation/section-rebuild gate
 validation. It
@@ -347,7 +359,7 @@ Remaining blockers, in order:
 
 ## 6. Explicit non-gates
 
-The following are not success criteria for this mainline:
+The following are not success criteria for this regression gate:
 
 - Shiguang server endpoint edits, server-response changes, icon replacement, or
   the scripts/docs under the Shiguang update workflow;
@@ -400,7 +412,7 @@ The following are not success criteria for this mainline:
 
 ## 8. Close condition
 
-The mainline closes only with a signed/readable evidence bundle showing, for
+This regression gate closes only with a signed/readable evidence bundle showing, for
 **both** `origin_macro` and `lunlun_software`:
 
 - fixed input digest and size;
