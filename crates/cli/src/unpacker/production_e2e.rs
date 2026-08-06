@@ -36,7 +36,7 @@ mod tests {
 
     use mida_core::OepProvenance;
     use mida_pe::import_table::{ImportTableBuilder, ImportThunk};
-    use mida_pe::rebuild::{rebuild_pe_image, RebuildPlan, PlannedSection};
+    use mida_pe::rebuild::{rebuild_pe_image, PlannedSection, RebuildPlan};
     use mida_pe::tls::TlsDirectoryBuilder;
     use mida_pe::{
         DumpProcessReport, IatRecoveryReport, IatSlotReport, IatSlotStatus,
@@ -97,11 +97,8 @@ mod tests {
         // ret at RVA 0x100A.
         text[0x0A] = 0xC3;
         let mut plan = RebuildPlan::pe32_plus();
-        plan.sections.push(PlannedSection::new(
-            ".text",
-            0x6000_0020,
-            text,
-        ));
+        plan.sections
+            .push(PlannedSection::new(".text", 0x6000_0020, text));
         plan.entry_point_rva = 0x1000;
         plan.imports = Some(imports);
         plan.relocations = vec![(0x1002, 10)];
@@ -117,18 +114,15 @@ mod tests {
     /// are DERIVED from the emitted candidate's actual structure, so the real
     /// producers produce sidecars the gate's recomputation accepts.
     fn report_for(candidate: &[u8]) -> DumpProcessReport {
-        let pe = mida_acceptance::build_oreans_pe_evidence(candidate)
-            .expect("candidate PE evidence");
+        let pe =
+            mida_acceptance::build_oreans_pe_evidence(candidate).expect("candidate PE evidence");
         let image_base = pe.image_base;
         let tls = pe.tls_detail.as_ref().expect("candidate has TLS detail");
 
         // IAT: one resolved slot at the candidate's actual final-import RVA.
         let final_imports =
             mida_pe::parse_final_import_identities(candidate).expect("parse final imports");
-        let resolved_rva = final_imports
-            .first()
-            .map(|i| i.slot_rva)
-            .unwrap_or(0x2043);
+        let resolved_rva = final_imports.first().map(|i| i.slot_rva).unwrap_or(0x2043);
         let mut iat_slots = Vec::new();
         iat_slots.push(IatSlotReport {
             slot_index: 0,
@@ -214,7 +208,10 @@ mod tests {
         // detail. Match the passing acceptance-test convention: the runtime
         // observed a load at a displaced base and normalized to the preferred
         // base (image_base + offset).
-        let reloc_detail = pe.relocation_detail.as_ref().expect("candidate reloc detail");
+        let reloc_detail = pe
+            .relocation_detail
+            .as_ref()
+            .expect("candidate reloc detail");
         let target_rva = 0x1002u32;
         let runtime_base = image_base + 0x0100_0000;
         let relocation_report = RelocationObservationReport {
@@ -309,8 +306,8 @@ mod tests {
 
         // PE evidence through the production builder (the CLI binary wraps it).
         let pe_evidence_path = candidate.with_extension("pe_evidence.json");
-        let pe_evidence = mida_acceptance::build_oreans_pe_evidence(&candidate_bytes)
-            .expect("build PE evidence");
+        let pe_evidence =
+            mida_acceptance::build_oreans_pe_evidence(&candidate_bytes).expect("build PE evidence");
         fs::write(
             &pe_evidence_path,
             serde_json::to_vec_pretty(&pe_evidence).unwrap(),
@@ -400,8 +397,15 @@ mod tests {
             size_bytes: protected_bytes.len() as u64,
         };
         let read = |name: &str| -> Vec<u8> {
-            fs::read(run.members.iter().find(|(n, _)| n == name).unwrap().1.clone())
-                .expect("read sidecar")
+            fs::read(
+                run.members
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .unwrap()
+                    .1
+                    .clone(),
+            )
+            .expect("read sidecar")
         };
         let oep: OreansOepEvidence =
             serde_json::from_slice(&read("oep_evidence")).expect("parse oep sidecar");
@@ -463,7 +467,9 @@ mod tests {
     /// valid structured evidence) re-labeled for the second fixed case. It is
     /// NOT the production claim under test — origin is. It only satisfies the
     /// two-sample gate's case-set requirement.
-    fn companion_lunlun(origin: &mida_acceptance::OreansSampleObservation) -> mida_acceptance::OreansSampleObservation {
+    fn companion_lunlun(
+        origin: &mida_acceptance::OreansSampleObservation,
+    ) -> mida_acceptance::OreansSampleObservation {
         let mut companion = origin.clone();
         companion.case_id = "lunlun_software".to_string();
         companion
@@ -497,11 +503,7 @@ mod tests {
 
         // Independent validator accepts the producer-assembled bundle.
         let verdict = mida_acceptance::validate_evidence_bundle(&bundle, &files);
-        assert!(
-            verdict.valid,
-            "bundle must be valid: {:?}",
-            verdict.reasons
-        );
+        assert!(verdict.valid, "bundle must be valid: {:?}", verdict.reasons);
         assert!(verdict.complete);
 
         // Chain consistency bound through the attested context.
