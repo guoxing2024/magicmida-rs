@@ -390,6 +390,41 @@ mod tests {
         assert_eq!(r, IdentifyResult::NoMatch);
     }
 
+    /// G3-R1: a `.rdataN` numbered-payload layout (e.g. the current
+    /// `启动器.exe` with `.rdata0/.rdata1/.rdata2` but NO `.KI3` and NO
+    /// `.dataN`) is NOT a strong GTO match. It is Ambiguous at most, so a plain
+    /// PE or an unrelated binary is never claimed as GTO from a section name
+    /// alone. Extending `.rdataN` into a strong GTO signal requires
+    /// characteristics/entropy/raw-virtual-size evidence, which `IdentifyInput`
+    /// does not carry; that is a governance-gated change, not a silent one.
+    #[test]
+    fn rdata_numbered_payload_without_ki3_is_ambiguous_not_match() {
+        // Mirrors the current real sample section set (no .KI3, no .dataN).
+        let r = AhkGtoPlugin::new().identify(&input(&[
+            ".text", ".rdata", ".data", ".pdata", ".fptable", ".rdata0", ".rdata1", ".rdata2",
+            ".rsrc",
+        ]));
+        assert_eq!(
+            r,
+            IdentifyResult::Ambiguous,
+            "a .rdataN payload with no .KI3/.dataN must stay Ambiguous (conservative)"
+        );
+        // A plain PE with a lone non-standard section is also not a Match.
+        let plain = AhkGtoPlugin::new().identify(&input(&[".text", ".rdata", ".rdata1", ".rsrc"]));
+        assert_eq!(plain, IdentifyResult::Ambiguous);
+        assert!(!matches!(plain, IdentifyResult::Match { .. }));
+    }
+
+    /// G3-R1: `.dataN` numbered payload sections remain a strong GTO signal
+    /// (existing behavior preserved) even without `.KI3`.
+    #[test]
+    fn data_numbered_payload_remains_match_without_ki3() {
+        let r = AhkGtoPlugin::new().identify(&input(&[
+            ".text", ".rdata", ".data", ".pdata", ".data0", ".data1", ".data2", ".rsrc",
+        ]));
+        assert!(matches!(r, IdentifyResult::Match { confidence } if confidence >= 40));
+    }
+
     // --- gto-product-recovery: heavyweight recovery route tests only ---
 
     #[cfg(feature = "gto-product-recovery")]

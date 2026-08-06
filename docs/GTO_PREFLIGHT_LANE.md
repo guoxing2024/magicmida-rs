@@ -118,3 +118,28 @@ GTO lane is a separate case id and that no real GTO sample has been accepted.
   GTO-family config and rejects an Oreans one; acceptance `check_case_identity`
   passes a GTO no-gate manifest without a locked manifest.
 
+
+## 8. G3-R1: GTO sample identity & `.rdataN` recognizer analysis
+
+A real-sample identity audit found the protected GTO sample `启动器.exe` does
+NOT match the `gto_launcher.json` protected-input identity, and its current
+layout (`.fptable/.rdata0/.rdata1/.rdata2`, no `.KI3`) is only `Ambiguous` for
+`dual_select_packer` (falls back to `oreans_themida`). See
+`D:\Tools\RE\dumps\gto\g3-acceptance\<run>\g3r1\`.
+
+Key findings:
+
+- The manifest (`lab/cases/v2/gto_launcher.json`) binds `4d5770af…/8583680`,
+  which matches `_dyncdb/launcher.exe` (`.KI3` layout, recognized as `ahk_gto`).
+- The current `启动器.exe` was updated (08-07 01:10) to `bd7366d6…/13373952`
+  with a `.rdataN` layout and NO `.KI3`, so `dual_select_packer` scores it 30
+  (< 40) → `Ambiguous` → falls back to Oreans. Authority adjudication is
+  BLOCKED (which file is the authoritative main sample).
+- The recognizer (`AhkGtoPlugin::identify`) is section-name–only; `.rdataN` is
+  NOT a strong GTO signal without characteristics/entropy/raw-virtual-size
+  evidence (which `IdentifyInput` does not carry). **It is kept conservative**
+  (`Ambiguous`, not `Match`), per the "lowest false-positive risk" rule — no
+  threshold change, no unconditional `.rdataN` match. `.dataN` numbering remains
+  a strong GTO signal. Locked by tests
+  `rdata_numbered_payload_without_ki3_is_ambiguous_not_match` and
+  `data_numbered_payload_remains_match_without_ki3`.
