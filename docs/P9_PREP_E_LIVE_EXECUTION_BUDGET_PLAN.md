@@ -18,13 +18,22 @@
   P9-Prep A–D closure.
 - Working tree must be clean before the live run.
 
-## 2. Baseline participation
+## 2. Baseline participation (SEMANTICS_B: protected vs candidate)
 
-The P7-R2 baseline (`mida.oreans-two-sample-bundle-gate/v1` report) is **not a
-live input** to the P9 gate. It is used only as a **regression cross-check** of
-the offline taxonomy counts (337/1504) and of the bundle-gate report shape. It
-does **not** contribute any live process, candidate, or replay evidence, and its
-smoke attempts are **never** auto-counted into the new 10/10 (P9-Prep-C #6).
+P9 acceptance semantics are **protected-sample behavior vs candidate unpacked
+output** (SEMANTICS_B, per P9-RESET-A). The word "baseline" in the historical
+P7-R2 context refers to a **toolchain-revision worktree** (`858f66e`) used to
+verify a fix, NOT a P9 acceptance input. The P7-R2 baseline report
+(`mida.oreans-two-sample-bundle-gate/v1`) is **not a live input** to the P9
+gate. It is used only as a **regression cross-check** of the offline taxonomy
+counts (337/1504) and of the bundle-gate report shape. It does **not**
+contribute any live process, candidate, or replay evidence, and its smoke
+attempts are **never** auto-counted into the new 10/10 (P9-Prep-C #6).
+
+The 46-process / 22-slot budget below covers **protected reference behavior +
+candidate final live unpack + candidate isolated replay** only. It contains
+**no baseline-revision process**: a historical toolchain baseline is not
+launched, not un-packed, and not compared as a live acceptance side.
 
 ## 3. Protected / reference behavior runs (per case)
 

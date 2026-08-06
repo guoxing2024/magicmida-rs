@@ -61,7 +61,7 @@ canonical path + SHA-256。envelope `verifier_source = <cli-dir>/mida-acceptance
 ## 五、ScyllaHide 环境身份（本次实际 staging 重新计算）
 
 来源（已批准第三方）：`D:\MidaVault\scratch\b0_a1_cargo_target\debug\`，复制到新
-execution root 的两个 debug staging 目录 `<root>\scyllahide\baseline\` 和
+execution root 的两个 debug staging 目录 `<root>\scyllahide\reference\` 和
 `<root>\scyllahide\candidate\`。
 
 | File | size | SHA-256 (小写 64 hex) | PE | regular | MOTW |
@@ -70,9 +70,9 @@ execution root 的两个 debug staging 目录 `<root>\scyllahide\baseline\` 和
 | HookLibraryx64.dll | 19,968 | `d4b20eed23caebad7efa53e5f2f3c86d445864c2d3e43b343e01c8a9785e800e` | AMD64 | yes | none |
 | scylla_hide.ini | 1,324 | `17d51120c13b54e64ea6615ee9b885fa07a4a41bd3008ed559fdbabe8184ff8e` | config (not PE) | yes | none |
 
-- baseline 与 candidate 两 staging 目录 **字节级完全一致**（三文件逐一比对 identical=True）。
-- 目录读写探针：baseline 和 candidate 均 write_probe=ok、read_probe=ok。
-- 目标 debug 目录：`<root>\scyllahide\baseline\`（reference）和 `<root>\scyllahide\candidate\`（candidate）。
+- reference 与 candidate 两 staging 目录 **字节级完全一致**（三文件逐一比对 identical=True）。
+- 目录读写探针：reference 和 candidate 均 write_probe=ok、read_probe=ok。
+- 目标 debug 目录：`<root>\scyllahide\reference\`（reference）和 `<root>\scyllahide\candidate\`（candidate）。
 - 无 MOTW Zone.Identifier 阻断。
 - 注入日志关键字检查方式：live 时对 InjectorCLI 输出/日志中的注入成功关键字与 ScyllaHide 注入 API 返回状态做断言（不在本工单执行）。
 
@@ -120,7 +120,7 @@ execution root 的两个 debug staging 目录 `<root>\scyllahide\baseline\` 和
 - **CLI/verifier SHA**：`7686d2c0...` / `8f8bcdc6...`。
 - **两 case runner digest**：origin `98458253...`，lunlun `d838f51e...`（preflight 生成 + verifier 验证）。
 - **ScyllaHide 三文件 SHA**：`211f7b80...`、`d4b20eed...`、`17d51120...`。
-- **两侧 staging 路径**：`<root>\scyllahide\baseline\` 与 `<root>\scyllahide\candidate\`，字节一致。
+- **两侧 staging 路径**：`<root>\scyllahide\reference\` 与 `<root>\scyllahide\candidate\`，字节一致。
 - **新 execution root**：`D:\MidaVault\scratch\p9_live_169c122a_20260806_140803`。
 - **Ready preflight 结果**：`preflight.json status=ready`，两 case READY。
 - **0 个真实样品进程**：本工单未创建任何样品进程。
