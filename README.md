@@ -113,6 +113,18 @@ Oreans fixed two-sample lane is unchanged. **No real GTO sample has been run**:
 this is lane-implementation-complete offline, NOT a completed/perfect/accepted
 GTO result.
 
+### Immutable sample identity (G3-R2)
+
+`D:\Tools\RE\dumps\gto\启动器.exe` is a dynamic source path that automation
+overwrites. Before staging/preflight, a source is frozen into an immutable,
+content-addressed snapshot whose hash/size become the case identity; the source
+path is provenance only. Capture is fail-closed (`source_changed_during_capture`
+if the file changes mid-capture), revisions are hash-derived, and old revisions
+stay reproducible by hash. See
+[docs/SAMPLE_IDENTITY_LIFECYCLE.md](docs/SAMPLE_IDENTITY_LIFECYCLE.md). The
+sealed `lab/cases/v2/gto_launcher.json` is untouched and the authoritative GTO
+sample revision is still under adjudication.
+
 ### Acceptance kernel (R0B)
 
 `mida-acceptance` is an independent crate: it must not depend on production

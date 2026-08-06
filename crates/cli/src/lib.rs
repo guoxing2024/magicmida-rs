@@ -11,6 +11,7 @@ pub mod log;
 pub mod origin_pure;
 pub mod run_spec;
 pub mod runner_preflight;
+pub mod sample_snapshot;
 pub mod unpacker;
 
 use std::error::Error;

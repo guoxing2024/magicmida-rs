@@ -143,3 +143,16 @@ Key findings:
   a strong GTO signal. Locked by tests
   `rdata_numbered_payload_without_ki3_is_ambiguous_not_match` and
   `data_numbered_payload_remains_match_without_ki3`.
+
+## 9. Immutable sample identity (G3-R2)
+
+Before a GTO case is staged, the protected sample must be **frozen into an
+immutable snapshot** (see `docs/SAMPLE_IDENTITY_LIFECYCLE.md` and
+`crate::sample_snapshot`). The dynamic path
+`D:\Tools\RE\dumps\gto\启动器.exe` is a source, not an identity: each capture
+yields a hash-derived revision, and the manifest binds a frozen revision, never
+the live path. Capture is fail-closed (`source_changed_during_capture`), and the
+offline snapshot-to-staging seam (`StagingIdentity` + `staging_identity_matches`)
+drives staging from the snapshot hash/size. The authoritative GTO sample
+revision is still under adjudication; the next wiring step is for GTO staging to
+consume a snapshot path as its input identity.
