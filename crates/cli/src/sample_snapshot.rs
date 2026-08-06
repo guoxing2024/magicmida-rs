@@ -233,25 +233,24 @@ enum PublishOutcome {
     AlreadyExists,
 }
 
-/// Atomically promote `temp` to `target` with NO-REPLACE semantics.
+/// Atomically promote `temp` to `target` with TRUE no-replace semantics.
 ///
-/// Windows `fs::rename` (MoveFile) already refuses to overwrite an existing
-/// destination, but that platform behavior is NOT portable: on Unix `rename`
-/// silently replaces. This helper makes the no-replace guarantee explicit and
-/// deterministic on every platform:
-/// - if `target` exists at entry, return [`PublishOutcome::AlreadyExists`]
-///   without touching it;
-/// - otherwise attempt the rename; if it fails because the target appeared
-///   concurrently (a racing publisher), return [`PublishOutcome::AlreadyExists`]
-///   (do not retry/overwrite);
-/// - only a successful rename returns [`PublishOutcome::Published`].
+/// This uses `fs::hard_link` (the portable `link(2)` / `CreateHardLinkW`
+/// primitive), NOT `exists + rename`. `hard_link` either atomically creates a
+/// new directory entry `target` pointing at the already-fully-written `temp`
+/// inode, or fails with `AlreadyExists` if `target` already exists. There is no
+/// TOCTOU window between a pre-check and the link, and on every platform it
+/// NEVER overwrites an existing `target`.
+///
+/// No half-written file is ever exposed: the `temp` inode is written and closed
+/// before the link, so a reader that finds `target` always sees the complete
+/// snapshot bytes.
 fn publish_no_replace(temp: &Path, target: &Path) -> std::io::Result<PublishOutcome> {
-    if target.exists() {
-        return Ok(PublishOutcome::AlreadyExists);
-    }
-    match fs::rename(temp, target) {
+    match fs::hard_link(temp, target) {
         Ok(()) => Ok(PublishOutcome::Published),
-        Err(_) if target.exists() => Ok(PublishOutcome::AlreadyExists),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            Ok(PublishOutcome::AlreadyExists)
+        }
         Err(e) => Err(e),
     }
 }
@@ -322,58 +321,78 @@ fn capture_snapshot_impl(
     // exactly like the fresh-capture path. If the source changes or becomes
     // unreadable while we verify the existing snapshot, we fail closed.
     if target_file.is_file() {
-        let verified = match verified_read_snapshot(snapshot_root, logical_sample_id, &first_sha) {
-            Ok(v) => v,
-            Err(e) => {
-                // Existing target present but unverifiable (tampered/truncated/
-                // replaced). Refuse; do NOT overwrite and do NOT delete it.
-                return Err(CaptureError::SnapshotAlreadyExistsButMismatch(format!(
-                    "{} exists but verified re-read failed: {e}",
-                    target_file.display()
-                )));
-            }
-        };
-        // The on-disk snapshot must actually match the intended hash/size.
-        if verified.snapshot_sha256 != first_sha || verified.snapshot_size_bytes != first_size {
-            return Err(CaptureError::SnapshotAlreadyExistsButMismatch(format!(
-                "{} exists but verified content does not match intended hash/size",
-                target_file.display()
-            )));
+        // Classify the existing target WITHOUT returning yet. Even a corrupt,
+        // mismatching, or unverifiable existing snapshot must still ride through
+        // the second source read, so a source change during verification wins
+        // over the snapshot mismatch (and we never delete/overwrite the bad
+        // existing snapshot).
+        enum Existing {
+            Verified(VerifiedSnapshot),
+            Mismatch,
+            Unverifiable(String),
         }
+        let existing = match verified_read_snapshot(snapshot_root, logical_sample_id, &first_sha) {
+            Ok(v) if v.snapshot_sha256 == first_sha && v.snapshot_size_bytes == first_size => {
+                Existing::Verified(v)
+            }
+            Ok(_) => Existing::Mismatch,
+            Err(e) => Existing::Unverifiable(format!(
+                "{} exists but verified re-read failed: {e}",
+                target_file.display()
+            )),
+        };
 
         // TEST seam: allow a test to mutate/delete the source after the existing
-        // snapshot has been verified but before the second read.
+        // snapshot has been classified but before the second read.
         if let Some(hook) = before_second_read.as_mut() {
             hook();
         }
 
-        // Second read of the source — mandatory in the reuse path too.
+        // Second read of the source — mandatory in the reuse path too, even when
+        // the existing snapshot is corrupt/missing/unverifiable.
         let second = fs::read(source).map_err(|e| CaptureError::SourceUnreadable(e.to_string()))?;
         let second_sha = sha256_hex(&second);
         let second_size = second.len() as u64;
 
-        // Fail-closed stability: source must be identical across both reads. The
-        // existing snapshot is NOT deleted; we simply refuse to reuse it.
+        // Precedence: source stability first. The existing snapshot is NOT
+        // deleted; we simply refuse to reuse it.
         if first_sha != second_sha || first_size != second_size {
             return Err(CaptureError::SourceChangedDuringCapture);
         }
 
-        // Stable source + verified existing snapshot -> reuse it idempotently.
-        return Ok(sample_snapshot_from_verified(
-            &verified,
-            snapshot_root,
-            source,
-            provenance_tool_revision,
-        ));
+        // Source is stable. Now decide from the classified existing snapshot.
+        return match existing {
+            // Stable source + verified identical snapshot -> reuse it.
+            Existing::Verified(v) => Ok(sample_snapshot_from_verified(
+                &v,
+                snapshot_root,
+                source,
+                provenance_tool_revision,
+            )),
+            Existing::Mismatch => Err(CaptureError::SnapshotAlreadyExistsButMismatch(format!(
+                "{} exists but verified content does not match intended hash/size",
+                target_file.display()
+            ))),
+            Existing::Unverifiable(m) => Err(CaptureError::SnapshotAlreadyExistsButMismatch(m)),
+        };
     }
 
-    fs::create_dir_all(&target_dir)
-        .map_err(|e| CaptureError::SnapshotWriteFailed(e.to_string()))?;
+    // Create the parent dirs (`snapshot_root` / `logical_id`) idempotently, then
+    // create the leaf content-address dir ONLY if it does not already exist. We
+    // record whether WE created the leaf so cleanup can remove it without ever
+    // deleting a directory that a concurrent task created or populated.
+    let parent_dir = target_dir.parent().expect("target_dir has a parent");
+    fs::create_dir_all(parent_dir).map_err(|e| CaptureError::SnapshotWriteFailed(e.to_string()))?;
+    let dir_created_by_us = match fs::create_dir(&target_dir) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(e) => return Err(CaptureError::SnapshotWriteFailed(e.to_string())),
+    };
 
     // Unique temp file (never a fixed `.capturing.tmp`) so concurrent captures
     // never collide. A small guard ensures EVERY failure path removes it.
     let temp_file = target_dir.join(unique_temp_name());
-    let mut guard = TempGuard::new(temp_file.clone());
+    let guard = TempGuard::new(temp_file.clone());
     if let Err(e) = fs::write(&temp_file, &first) {
         return Err(CaptureError::SnapshotWriteFailed(e.to_string()));
     }
@@ -394,11 +413,10 @@ fn capture_snapshot_impl(
         Ok(b) => b,
         Err(e) => {
             // Second read failed (e.g. source deleted mid-capture). Fail closed
-            // and remove OUR temp file and the (now empty) target dir. We never
-            // remove a directory that a concurrent task has populated — the
-            // `remove_dir` below only succeeds on an empty dir.
+            // and remove OUR temp file. Remove the target dir only if we created
+            // it (and only if it is still empty) — never a concurrent task's dir.
             drop(guard); // removes temp file
-            let _ = fs::remove_dir(&target_dir);
+            cleanup_failed_dir(&target_dir, dir_created_by_us);
             return Err(CaptureError::SourceUnreadable(e.to_string()));
         }
     };
@@ -411,10 +429,10 @@ fn capture_snapshot_impl(
         && first_sha == snap_sha
         && first_size == snap_size;
     if !stable {
-        // TempGuard removes the temp file on drop; also remove the target dir if
-        // it is now empty (never clobber another revision).
+        // TempGuard removes the temp file on drop; remove the target dir only if
+        // we created it and it is empty.
         drop(guard);
-        let _ = fs::remove_dir(&target_dir);
+        cleanup_failed_dir(&target_dir, dir_created_by_us);
         return Err(CaptureError::SourceChangedDuringCapture);
     }
 
@@ -424,12 +442,14 @@ fn capture_snapshot_impl(
         hook();
     }
 
-    // Publish with explicit no-replace semantics. If the target already exists
-    // (a concurrent capture published the same bytes), verify it; identical ->
-    // reuse, mismatch/unverifiable -> fail-closed. We NEVER overwrite.
+    // Publish with a genuinely atomic no-replace primitive. If the target
+    // already exists (a concurrent capture published the same bytes), verify it;
+    // identical -> reuse, mismatch/unverifiable -> fail-closed. We NEVER
+    // overwrite. After a successful hard link BOTH the temp and target point at
+    // the same fully-written inode, so the guard still removes the temp.
     match publish_no_replace(&temp_file, &target_file) {
         Ok(PublishOutcome::Published) => {
-            guard.disarm(); // temp no longer exists (it was renamed)
+            drop(guard); // remove the temp; the target hard link keeps the data
         }
         Ok(PublishOutcome::AlreadyExists) => {
             drop(guard); // remove our temp; we did not publish it
@@ -484,9 +504,8 @@ fn capture_snapshot_impl(
 struct TempGuard {
     path: PathBuf,
     /// Whether the temp file should be removed on drop. `disarm()` flips this to
-    /// `false` once the file has been successfully promoted (renamed) so drop
-    /// does not attempt to delete a file that no longer exists / that now is the
-    /// published snapshot.
+    /// `false` so drop does not attempt to delete the file (e.g. after it has
+    /// been renamed to its final destination).
     armed: bool,
 }
 
@@ -496,7 +515,11 @@ impl TempGuard {
     }
 
     /// Disarm the guard: drop will no longer remove the temp file. Only call
-    /// this after the temp file has been renamed to its final destination.
+    /// this after the temp file has been moved to its final destination and no
+    /// longer needs cleanup. Exercised by `temp_guard_disarm_really_changes_state`;
+    /// in production the hard-link publish path always drops the guard (the temp
+    /// must still be removed), so this is not called from lib code.
+    #[allow(dead_code)]
     fn disarm(&mut self) {
         self.armed = false;
     }
@@ -507,6 +530,17 @@ impl Drop for TempGuard {
         if self.armed {
             let _ = fs::remove_file(&self.path);
         }
+    }
+}
+
+/// Remove a failed capture's content-address directory, but ONLY if this capture
+/// created it (`dir_created_by_us`). `fs::remove_dir` only succeeds on an empty
+/// directory, so a directory that a concurrent task has populated is left alone.
+/// This closes the cleanup TOCTOU: we prefer leaving an empty dir behind over
+/// ever deleting a directory owned/populated by a concurrent task.
+fn cleanup_failed_dir(target_dir: &Path, dir_created_by_us: bool) {
+    if dir_created_by_us {
+        let _ = fs::remove_dir(target_dir);
     }
 }
 
@@ -1480,6 +1514,322 @@ mod tests {
         assert!(
             names.iter().all(|n| !n.starts_with(".capturing-")),
             "no leftover temp files: {names:?}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// R3-1: `publish_no_replace` is a genuinely atomic no-replace primitive
+    /// (hard link). A second link to an existing target is `AlreadyExists` and
+    /// the first target's full content is preserved (never overwritten, never
+    /// half-written).
+    #[test]
+    fn atomic_publish_hard_link_never_overwrites() {
+        let root = temp_root("atomic_publish");
+        let snap_root = root.join("snapshots");
+        let dir = snap_root
+            .join("gto_launcher")
+            .join(&sha256_hex(b"ATOMIC-CONTENT"));
+        fs::create_dir_all(&dir).unwrap();
+        let temp = dir.join(".capturing-1-1-1.tmp");
+        let target = dir.join(SNAPSHOT_FILENAME);
+        let payload = b"ATOMIC-NO-REPLACE-PAYLOAD";
+        fs::write(&temp, payload).unwrap();
+
+        // First publish wins.
+        assert_eq!(
+            publish_no_replace(&temp, &target).unwrap(),
+            PublishOutcome::Published
+        );
+        // Target is fully written (no half-written exposure).
+        assert_eq!(fs::read(&target).unwrap(), payload);
+
+        // A second publish to the same target is AlreadyExists (never overwrite).
+        assert_eq!(
+            publish_no_replace(&temp, &target).unwrap(),
+            PublishOutcome::AlreadyExists
+        );
+        // The original target content is intact, not replaced.
+        assert_eq!(fs::read(&target).unwrap(), payload);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// R3-2: real concurrent publishers racing on the same content address never
+    /// overwrite each other and never expose a half-written file. Exactly one
+    /// final target exists and its content is the full payload.
+    #[test]
+    fn concurrent_publishers_never_overwrite_or_expose_partial() {
+        let root = temp_root("concurrent_pub");
+        let snap_root = root.join("snapshots");
+        let dir = snap_root
+            .join("gto_launcher")
+            .join(&sha256_hex(b"RACE-PAYLOAD"));
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join(SNAPSHOT_FILENAME);
+        let payload = b"CONCURRENT-NO-REPLACE-ATOMIC-PUBLISH-PAYLOAD";
+
+        // Each publisher writes its OWN temp, then races to hard-link it to the
+        // shared target. Only the first link succeeds; the rest get AlreadyExists.
+        let mut handles = Vec::new();
+        for i in 0..12 {
+            let dir = dir.clone();
+            let target = target.clone();
+            let payload = payload.to_vec();
+            handles.push(std::thread::spawn(move || {
+                let temp = dir.join(format!(".capturing-pub-{i}.tmp"));
+                fs::write(&temp, &payload).unwrap();
+                let outcome = publish_no_replace(&temp, &target).unwrap();
+                // Every publisher removes its own temp regardless of outcome.
+                let _ = fs::remove_file(&temp);
+                outcome
+            }));
+        }
+        let outcomes: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        // Exactly one Publisher wins; the rest see AlreadyExists.
+        let published = outcomes
+            .iter()
+            .filter(|o| **o == PublishOutcome::Published)
+            .count();
+        let already = outcomes
+            .iter()
+            .filter(|o| **o == PublishOutcome::AlreadyExists)
+            .count();
+        assert_eq!(published, 1, "exactly one publisher must win: {outcomes:?}");
+        assert_eq!(already, outcomes.len() - 1);
+
+        // Final target is complete (no half-written file) and correct.
+        assert!(target.is_file());
+        let final_bytes = fs::read(&target).unwrap();
+        assert_eq!(final_bytes.len(), payload.len(), "must not be truncated");
+        assert_eq!(final_bytes, payload);
+        // No temp files left.
+        let names: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().all(|n| !n.starts_with(".capturing-pub-")),
+            "no leftover publisher temp files: {names:?}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// R3-3: even when the existing snapshot is corrupt/empty/unverifiable, the
+    /// idempotent-reuse path still completes the second source read before
+    /// failing closed on the bad existing snapshot.
+    #[test]
+    fn corrupt_existing_snapshot_reuse_path_still_completes_second_read() {
+        let root = temp_root("corrupt_reuse");
+        let src = root.join("src.bin");
+        let payload = b"CORRUPT-REUSE-CONTENT";
+        fs::write(&src, payload).unwrap();
+        let snap_root = root.join("snapshots");
+        let a = capture_snapshot(&src, &snap_root, "gto_launcher", "rev").unwrap();
+        let a_path = a.snapshot_abs_path.clone();
+
+        // Corrupt the on-disk snapshot (truncate to 0 → unverifiable), then
+        // re-capture. A flag proves the second read is reached.
+        fs::write(&a_path, b"").unwrap();
+        let reached_second_read = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = reached_second_read.clone();
+        let err = capture_snapshot_impl(
+            &src,
+            &snap_root,
+            "gto_launcher",
+            "rev",
+            Some(Box::new(move || {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            })),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            reached_second_read.load(std::sync::atomic::Ordering::SeqCst),
+            "reuse path must complete the second source read even when the existing snapshot is corrupt"
+        );
+        assert!(matches!(
+            err,
+            CaptureError::SnapshotAlreadyExistsButMismatch(_)
+        ));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// R3-3b: same for a MISMATCHING existing snapshot (present but wrong hash).
+    #[test]
+    fn mismatching_existing_snapshot_reuse_path_still_completes_second_read() {
+        let root = temp_root("mismatch_reuse");
+        let src = root.join("src.bin");
+        let payload = b"MISMATCH-REUSE-CONTENT";
+        fs::write(&src, payload).unwrap();
+        let snap_root = root.join("snapshots");
+        let a = capture_snapshot(&src, &snap_root, "gto_launcher", "rev").unwrap();
+        let a_path = a.snapshot_abs_path.clone();
+
+        // Overwrite with DIFFERENT content → verified snapshot no longer matches
+        // the intended hash (Mismatch), but the file is still readable.
+        fs::write(&a_path, b"DIFFERENT-BYTES-NOT-MATCHING").unwrap();
+        let reached_second_read = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = reached_second_read.clone();
+        let err = capture_snapshot_impl(
+            &src,
+            &snap_root,
+            "gto_launcher",
+            "rev",
+            Some(Box::new(move || {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            })),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            reached_second_read.load(std::sync::atomic::Ordering::SeqCst),
+            "reuse path must complete the second source read even on a mismatching existing snapshot"
+        );
+        assert!(matches!(
+            err,
+            CaptureError::SnapshotAlreadyExistsButMismatch(_)
+        ));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// R3-3c: when the source CHANGES during verification of a corrupt existing
+    /// snapshot, `SourceChangedDuringCapture` wins (source stability takes
+    /// precedence over the bad snapshot), and the existing snapshot is preserved.
+    #[test]
+    fn corrupt_existing_snapshot_but_source_changed_wins() {
+        let root = temp_root("corrupt_reuse_change");
+        let src = root.join("src.bin");
+        let payload = b"CORRUPT-REUSE-CHANGE-A";
+        fs::write(&src, payload).unwrap();
+        let snap_root = root.join("snapshots");
+        let a = capture_snapshot(&src, &snap_root, "gto_launcher", "rev").unwrap();
+        let a_path = a.snapshot_abs_path.clone();
+
+        // Corrupt the existing snapshot, then mutate the source between the two
+        // reads.
+        fs::write(&a_path, b"").unwrap();
+        let hook_src = src.clone();
+        let err = capture_snapshot_impl(
+            &src,
+            &snap_root,
+            "gto_launcher",
+            "rev",
+            Some(Box::new(move || {
+                fs::write(&hook_src, b"CORRUPT-REUSE-CHANGE-B").unwrap();
+            })),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(err, CaptureError::SourceChangedDuringCapture);
+        // The corrupt existing snapshot is neither deleted nor overwritten.
+        assert!(a_path.is_file());
+        assert_eq!(fs::read(&a_path).unwrap(), b"");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// R3-4: fresh-capture cleanup never deletes a directory it did NOT create
+    /// (the TOCTOU fix). If the leaf dir already exists (a concurrent task's
+    /// dir), a failing capture removes only its own temp file and leaves the
+    /// dir intact.
+    #[test]
+    fn fresh_capture_cleanup_preserves_precreated_dir() {
+        let root = temp_root("preserve_dir");
+        let src = root.join("src.bin");
+        fs::write(&src, b"PRESERVE-DIR-CONTENT").unwrap();
+        let snap_root = root.join("snapshots");
+        let want_sha = sha256_hex(b"PRESERVE-DIR-CONTENT");
+        let dir = snap_root.join("gto_launcher").join(&want_sha);
+        fs::create_dir_all(&dir).unwrap(); // pre-created (not by this capture)
+
+        // Source deleted between the two reads -> fresh capture fails on the
+        // second read. It must remove its temp but NOT the pre-existing dir.
+        let hook_src = src.clone();
+        let err = capture_snapshot_impl(
+            &src,
+            &snap_root,
+            "gto_launcher",
+            "rev",
+            Some(Box::new(move || {
+                fs::remove_file(&hook_src).unwrap();
+            })),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, CaptureError::SourceUnreadable(_)));
+        // The pre-created dir is preserved (empty, but still present).
+        assert!(
+            dir.is_dir(),
+            "must not delete a pre-existing (concurrent) dir"
+        );
+        let names: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().all(|n| !n.starts_with(".capturing-")),
+            "own temp removed but dir preserved: {names:?}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// R3-4b: when THIS capture created the leaf dir and it is left empty after
+    /// cleanup, the empty dir is removed (not leaked), while a dir it did not
+    /// create is left behind. Uses the internal fresh-capture path.
+    #[test]
+    fn fresh_capture_cleanup_removes_only_own_empty_dir() {
+        let root = temp_root("own_dir");
+        let src = root.join("src.bin");
+        fs::write(&src, b"OWN-DIR-CONTENT").unwrap();
+        let snap_root = root.join("snapshots");
+        let want_sha = sha256_hex(b"OWN-DIR-CONTENT");
+        let dir = snap_root.join("gto_launcher").join(&want_sha);
+
+        // Source deleted between the two reads. The dir was created by THIS
+        // capture (via fs::create_dir), so it is removed after cleanup.
+        let hook_src = src.clone();
+        let err = capture_snapshot_impl(
+            &src,
+            &snap_root,
+            "gto_launcher",
+            "rev",
+            Some(Box::new(move || {
+                fs::remove_file(&hook_src).unwrap();
+            })),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, CaptureError::SourceUnreadable(_)));
+        assert!(
+            !dir.exists(),
+            "a dir created by this capture and left empty should be removed"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// R3-5: `TempGuard::disarm` really changes guard state — a disarmed guard
+    /// does NOT delete the temp file on drop, an armed one does.
+    #[test]
+    fn temp_guard_disarm_really_changes_state() {
+        let root = temp_root("guard_disarm");
+        fs::create_dir_all(&root).unwrap();
+
+        // Armed guard: file removed on drop.
+        let armed_file = root.join("armed.tmp");
+        fs::write(&armed_file, b"armed").unwrap();
+        {
+            let _g = TempGuard::new(armed_file.clone());
+        }
+        assert!(!armed_file.exists(), "armed guard must remove its file");
+
+        // Disarmed guard: file preserved on drop.
+        let disarmed_file = root.join("disarmed.tmp");
+        fs::write(&disarmed_file, b"disarmed").unwrap();
+        {
+            let mut g = TempGuard::new(disarmed_file.clone());
+            g.disarm();
+        }
+        assert!(
+            disarmed_file.exists(),
+            "disarmed guard must NOT remove its file"
         );
         let _ = fs::remove_dir_all(&root);
     }
