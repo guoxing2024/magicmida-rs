@@ -25,9 +25,10 @@ use mida_acceptance::oreans_gate::OREANS_TWO_SAMPLE_OBSERVATIONS_SCHEMA_VERSION;
 use mida_acceptance::{
     build_oreans_pe_evidence, build_unpack_pe_evidence, check_static, check_with_behavior,
     check_with_behavior_managed, check_with_behavior_managed_lab, check_with_behavior_signed,
-    evaluate_oreans_two_sample_gate, sha256_hex, BehaviorEvidence, CheckStaticOptions,
-    EnvelopePolicy, HmacSha256Verifier, OreansGateVerdict, OreansPeEvidence, OreansPeEvidenceError,
-    OreansSampleObservation, SignatureEnvelope, Verdict, VerifiedManagedCandidate, FIXED_CASE_IDS,
+    evaluate_oreans_two_sample_gate, is_generic_packer_family, sha256_hex, BehaviorEvidence,
+    CheckStaticOptions, EnvelopePolicy, HmacSha256Verifier, OreansGateVerdict, OreansPeEvidence,
+    OreansPeEvidenceError, OreansSampleObservation, SignatureEnvelope, Verdict,
+    VerifiedManagedCandidate, FIXED_CASE_IDS, GTO_CASE_ID,
 };
 
 fn is_64_hex(value: &str) -> bool {
@@ -1372,12 +1373,14 @@ fn cmd_preflight(args: &[String]) -> Result<i32, String> {
             reasons.push(format!("envelope is missing case config {id}"));
         }
     }
-    if envelope.case_configs.len() != FIXED_CASE_IDS.len() {
-        reasons.push(format!(
-            "envelope must contain exactly {} case configs, got {}",
-            FIXED_CASE_IDS.len(),
-            envelope.case_configs.len()
-        ));
+    // Any present case must be either an Oreans fixed case or the GTO lane.
+    for case in &envelope.case_configs {
+        if !FIXED_CASE_IDS.contains(&case.case_id.as_str()) && case.case_id != GTO_CASE_ID {
+            reasons.push(format!(
+                "envelope case {:?} is neither an Oreans fixed case nor the GTO lane case",
+                case.case_id
+            ));
+        }
     }
 
     // 2. Per-case keyed validation: protected identity <-> case_id <-> digest.
@@ -1387,7 +1390,28 @@ fn cmd_preflight(args: &[String]) -> Result<i32, String> {
     let mut case_config_digests: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
     for case in &envelope.case_configs {
-        // The manifest-declared protected identity for this case_id.
+        // GTO no-gate lane case: not an Oreans fixed case and has no locked
+        // manifest. Its identity is bound from the envelope declaration, and
+        // its family must be a registered generic family (ahk_gto).
+        if case.case_id == GTO_CASE_ID {
+            if !mida_acceptance::is_known_packer_family(&case.family_id)
+                || !mida_acceptance::is_generic_packer_family(&case.family_id)
+            {
+                reasons.push(format!(
+                    "GTO lane case {} must carry a registered generic family (ahk_gto), \
+                     got {:?} (fail-closed)",
+                    case.case_id, case.family_id
+                ));
+            }
+            if !is_64_hex(&case.protected_input.sha256) || case.protected_input.size_bytes == 0 {
+                reasons.push(format!(
+                    "GTO lane case {} protected_input identity is malformed",
+                    case.case_id
+                ));
+            }
+            continue;
+        }
+        // The manifest-declared protected identity for this case_id (Oreans).
         let locked = mida_acceptance::locked_manifest(&case.case_id);
         match locked {
             None => {
@@ -1475,21 +1499,21 @@ fn cmd_preflight(args: &[String]) -> Result<i32, String> {
         );
     }
 
-    // 3. Recompute the sealed case-set digest in a FIXED canonical order
-    // (FIXED_CASE_IDS), keyed by case_id, and cross-check the envelope.
+    // 3. Recompute the sealed case-set digest over EVERY envelope case config
+    // (fixed canonical order applied by sorting, keyed by case_id) and
+    // cross-check the envelope. This mirrors the CLI producer, which hashes
+    // every case (Oreans fixed + optional GTO lane).
     {
-        let mut entries: Vec<String> = Vec::with_capacity(FIXED_CASE_IDS.len());
-        for id in FIXED_CASE_IDS {
-            if let Some(case) = envelope_by_case.get(id) {
-                entries.push(format!(
-                    "case={}\nfamily={}\nprotected_input={}|{}\nrunner_config_digest={}\n",
-                    case.case_id,
-                    case.family_id.to_lowercase(),
-                    case.protected_input.sha256.to_lowercase(),
-                    case.protected_input.size_bytes,
-                    case.runner_config_digest.to_lowercase()
-                ));
-            }
+        let mut entries: Vec<String> = Vec::with_capacity(envelope.case_configs.len());
+        for case in &envelope.case_configs {
+            entries.push(format!(
+                "case={}\nfamily={}\nprotected_input={}|{}\nrunner_config_digest={}\n",
+                case.case_id,
+                case.family_id.to_lowercase(),
+                case.protected_input.sha256.to_lowercase(),
+                case.protected_input.size_bytes,
+                case.runner_config_digest.to_lowercase()
+            ));
         }
         entries.sort();
         let recomputed_set = sha256_hex(entries.concat().as_bytes());

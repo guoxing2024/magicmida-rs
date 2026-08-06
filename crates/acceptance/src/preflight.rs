@@ -49,8 +49,23 @@ use crate::oreans_gate::locked_manifest;
 /// against the v4 envelope.
 pub const PREFLIGHT_REPORT_SCHEMA_VERSION: &str = "mida.preflight-report/v3";
 
-/// The two fixed Oreans cases; preflight is Ready only for exactly this set.
+/// The two fixed Oreans cases; preflight is Ready only for exactly this set
+/// (the Oreans fixed regression lane).
 pub const FIXED_CASE_IDS: [&str; 2] = ["origin_macro", "lunlun_software"];
+
+/// The independent GTO generic/no-gate lane case id. It is NOT part of the
+/// Oreans fixed regression gate; it carries family `ahk_gto`, a `no-gate`
+/// acceptance state, and produces generic `mida.unpack-*` evidence.
+pub const GTO_CASE_ID: &str = "gto_launcher";
+
+/// The manifest `capability_cell.protection_family` value that identifies the
+/// AHK/GTO lane (mirrors the CLI `packer_family_from_protection_family`).
+pub const GTO_PROTECTION_FAMILY: &str = "ahk_gto_candidate";
+
+/// Whether a case manifest declares the GTO generic/no-gate lane.
+pub fn is_gto_lane_manifest(case_id: &str, protection_family: &str) -> bool {
+    case_id == GTO_CASE_ID && protection_family == GTO_PROTECTION_FAMILY
+}
 
 // ---------------------------------------------------------------------------
 // P6-A: case identity
@@ -177,15 +192,26 @@ pub fn check_case_identity(
         ));
     }
 
-    // Cross-check against the embedded locked manifest (v8 gate source).
-    let locked = locked_manifest(&manifest.case_id).map(|l| {
-        (
-            l.case_id,
-            l.protected_input_sha256,
-            l.protected_input_size_bytes,
-        )
-    });
-    if locked.is_none() {
+    // Cross-check against the embedded locked manifest (v8 gate source) for
+    // the Oreans fixed lane. The GTO generic/no-gate lane has no locked
+    // manifest (it is not an accepted sample); its identity is bound from the
+    // manifest declaration and the on-disk recompute below.
+    let gto_lane = is_gto_lane_manifest(
+        &manifest.case_id,
+        &manifest.capability_cell.protection_family,
+    );
+    let locked = if gto_lane {
+        None
+    } else {
+        locked_manifest(&manifest.case_id).map(|l| {
+            (
+                l.case_id,
+                l.protected_input_sha256,
+                l.protected_input_size_bytes,
+            )
+        })
+    };
+    if locked.is_none() && !gto_lane {
         reasons.push(format!(
             "case_id {:?} is not one of the two fixed Oreans cases",
             manifest.case_id
@@ -408,6 +434,15 @@ pub const PACKER_FAMILY_AHK_GTO: &str = "ahk_gto";
 /// must stay in sync with `mida_core::runner_config::packer_family`.
 pub fn is_known_packer_family(family: &str) -> bool {
     matches!(family, PACKER_FAMILY_OREANS | PACKER_FAMILY_AHK_GTO)
+}
+
+/// A family that records evidence through the generic
+/// `mida.unpack-evidence-bundle/v1` contract (currently `ahk_gto`). Extend
+/// when a new family adopts the generic contract; kept independent of
+/// `mida-core` because the acceptance crate must not depend on production
+/// crates.
+pub fn is_generic_packer_family(family: &str) -> bool {
+    family == PACKER_FAMILY_AHK_GTO
 }
 
 impl RunnerConfig {
@@ -1054,27 +1089,36 @@ pub fn run_offline_preflight(request: &PreflightRequest<'_>) -> PreflightReport 
         });
     }
 
-    // P6.1/P6.2: the case set must be exactly the two fixed Oreans cases —
-    // no empty, missing, duplicate, or extra entries. The case id comes from
-    // the manifest identity (present even when the protected input is
-    // missing), so a missing sample never masks a wrong case set.
+    // P6.1/P6.2: the case set must be exactly the two Oreans fixed cases
+    // (each once) plus, optionally, the independent GTO no-gate lane case.
+    // No empty, missing, duplicate, or unknown entries.
     let present_ids: Vec<String> = cases.iter().map(|c| c.case_id.clone()).collect();
-    let mut expected_ids: Vec<String> = FIXED_CASE_IDS.iter().map(|s| s.to_string()).collect();
-    expected_ids.sort();
-    if request.cases.len() != expected_ids.len() {
-        reasons.push(format!(
-            "preflight requires exactly {} fixed cases, got {}",
-            expected_ids.len(),
-            request.cases.len()
-        ));
+    let mut seen = std::collections::BTreeMap::<String, usize>::new();
+    for id in &present_ids {
+        *seen.entry(id.clone()).or_insert(0) += 1;
     }
-    let set_ok = present_ids.len() == expected_ids.len()
-        && FIXED_CASE_IDS
-            .iter()
-            .all(|id| present_ids.iter().filter(|p| *p == id).count() == 1);
-    if !set_ok {
+    // Every case id must be recognized (Oreans fixed or GTO lane).
+    for id in &present_ids {
+        if !FIXED_CASE_IDS.contains(&id.as_str()) && id != GTO_CASE_ID {
+            reasons.push(format!(
+                "case {:?} is neither an Oreans fixed case nor the GTO lane case (fail-closed)",
+                id
+            ));
+        }
+        if seen[id] != 1 {
+            reasons.push(format!(
+                "case {id} must appear exactly once, got {}",
+                seen[id]
+            ));
+        }
+    }
+    // The Oreans fixed regression lane must be complete.
+    let oreans_ok = FIXED_CASE_IDS
+        .iter()
+        .all(|id| present_ids.iter().filter(|p| *p == id).count() == 1);
+    if !oreans_ok {
         reasons.push(format!(
-            "case set must be exactly [{}, {}] with no duplicates or extras, got {:?}",
+            "Oreans fixed lane must contain exactly [{}, {}] with no duplicates, got {:?}",
             FIXED_CASE_IDS[0], FIXED_CASE_IDS[1], present_ids
         ));
     }
@@ -1270,5 +1314,66 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// G3: a GTO no-gate lane manifest (`case_id=gto_launcher`,
+    /// `protection_family=ahk_gto_candidate`) with a file matching its declared
+    /// identity passes `check_case_identity` WITHOUT a locked manifest (the GTO
+    /// lane has no locked/accepted sample). The `no-gate` state means the
+    /// identity chain passed, NOT that the sample is accepted.
+    #[test]
+    fn gto_lane_case_identity_passes_no_gate() {
+        let dir =
+            std::env::temp_dir().join(format!("mida_preflight_gto_lane_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let payload = b"GTO-LANE-SYNTHETIC-PROTECTED-INPUT-000000";
+        let input = dir.join("gto_protected.bin");
+        fs::write(&input, payload).unwrap();
+        let digest = sha256_hex(payload);
+        let size = payload.len() as u64;
+        let manifest = dir.join("gto_launcher.json");
+        fs::write(
+            &manifest,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "$schema": "./case-manifest.schema.json",
+                "schema_version": "mida.case-manifest/v2",
+                "manifest_revision": 1,
+                "case_id": "gto_launcher",
+                "display_name": "gto lane",
+                "primary_artifact_sha256": digest,
+                "artifacts": [{"sha256": digest, "size_bytes": size, "role": "protected_input"}],
+                "capability_cell": {
+                    "platform": "windows", "binary_format": "pe", "architecture": "x86_64",
+                    "execution_model": "native", "protection_family": "ahk_gto_candidate",
+                    "engine_route": "mida_plugin_ahk_gto", "corpus_role": "holdout"
+                },
+                "static_fingerprint": {}, "execution_policy": {}, "oracle": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let verdict = check_case_identity(&manifest, &input, None);
+        assert!(
+            verdict.ok,
+            "GTO lane identity chain must pass (no-gate): {:?}",
+            verdict.reasons
+        );
+        assert_eq!(
+            verdict.identity.as_ref().map(|i| i.case_id.as_str()),
+            Some("gto_launcher")
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// G3: `is_gto_lane_manifest` requires BOTH the `gto_launcher` case id AND
+    /// the `ahk_gto_candidate` protection family — a GTO id with a different
+    /// protection family is NOT a valid GTO lane and must fail closed.
+    #[test]
+    fn gto_lane_manifest_requires_id_and_protection_family() {
+        assert!(is_gto_lane_manifest("gto_launcher", "ahk_gto_candidate"));
+        assert!(!is_gto_lane_manifest("origin_macro", "ahk_gto_candidate"));
+        assert!(!is_gto_lane_manifest("gto_launcher", "gto"));
+        assert!(!is_gto_lane_manifest("gto_launcher", "oreans_candidate"));
+        assert!(!is_gto_lane_manifest("", "ahk_gto_candidate"));
     }
 }

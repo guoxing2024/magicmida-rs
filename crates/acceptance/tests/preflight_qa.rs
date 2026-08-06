@@ -367,7 +367,9 @@ fn case_set_requires_exactly_two_fixed_cases() {
             report
                 .reasons
                 .iter()
-                .any(|r| r.contains("fixed cases") || r.contains("case set must be exactly")),
+                .any(|r| r.contains("Oreans fixed lane")
+                    || r.contains("appears more than once")
+                    || r.contains("case set must be exactly")),
             "{tag}: {:?}",
             report.reasons
         );
@@ -989,15 +991,19 @@ fn extra_case_rejected() {
         report
             .reasons
             .iter()
-            .any(|r| r.contains("requires exactly 2 fixed cases")),
-        "cardinality reason missing: {:?}",
+            .any(|r| r.contains("appears more than once")
+                || r.contains("Oreans fixed lane")
+                || r.contains("appear exactly once")),
+        "cardinality/duplicate reason missing: {:?}",
         report.reasons
     );
     assert!(
         report
             .reasons
             .iter()
-            .any(|r| r.contains("case set must be exactly")),
+            .any(|r| r.contains("Oreans fixed lane")
+                || r.contains("appears more than once")
+                || r.contains("case set must be exactly")),
         "set-contract reason missing: {:?}",
         report.reasons
     );

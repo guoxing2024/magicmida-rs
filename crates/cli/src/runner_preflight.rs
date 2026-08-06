@@ -290,30 +290,48 @@ impl RunnerConfigEnvelope {
         &self.case_set_digest
     }
 
-    /// Validate the case-config set shape: exactly the two fixed cases, each
-    /// once, each with a well-formed digest and non-empty protected identity.
-    /// Returns the first reason or `None` when valid.
+    /// Validate the case-config set shape. Two lanes are recognized:
+    ///
+    /// - the Oreans fixed regression lane — `FIXED_CASE_IDS` (`origin_macro`,
+    ///   `lunlun_software`) must each appear exactly once with `oreans_themida`
+    ///   family, keeping the v4/v8 regression gate invariant;
+    /// - the GTO generic/no-gate lane — an optional `gto_launcher` case with
+    ///   `family_id = ahk_gto`.
+    ///
+    /// No unknown case, unknown family, missing family, or cross-lane family
+    /// reuse is allowed. Returns the first reason or `None` when valid.
     pub fn validate_case_set(&self) -> Option<String> {
+        use mida_core::runner_config::packer_family;
         let present: Vec<&str> = self
             .case_configs
             .iter()
             .map(|c| c.case_id.as_str())
             .collect();
-        if self.case_configs.len() != FIXED_CASE_IDS.len() {
-            return Some(format!(
-                "envelope must contain exactly {} case configs, got {}",
-                FIXED_CASE_IDS.len(),
-                self.case_configs.len()
-            ));
+        // No duplicates, no unknown case ids.
+        for c in &self.case_configs {
+            if !FIXED_CASE_IDS.contains(&c.case_id.as_str()) && c.case_id != GTO_CASE_ID {
+                return Some(format!(
+                    "case {:?} is neither an Oreans fixed case nor the GTO lane case (fail-closed)",
+                    c.case_id
+                ));
+            }
+            if present.iter().filter(|p| **p == c.case_id).count() != 1 {
+                return Some(format!(
+                    "case {} appears more than once (fail-closed)",
+                    c.case_id
+                ));
+            }
         }
+        // Oreans fixed regression lane: both cases must be present exactly once.
         for id in FIXED_CASE_IDS {
             if present.iter().filter(|p| **p == id).count() != 1 {
                 return Some(format!(
-                    "envelope case set must contain exactly one {id} entry, got {:?}",
+                    "Oreans fixed lane must contain exactly one {id} entry, got {:?}",
                     present
                 ));
             }
         }
+        // Per-case family / digest / identity shape.
         for c in &self.case_configs {
             if c.family_id.trim().is_empty() {
                 return Some(format!(
@@ -321,9 +339,27 @@ impl RunnerConfigEnvelope {
                     c.case_id
                 ));
             }
-            if !mida_core::runner_config::packer_family::is_known_family(&c.family_id) {
+            if !packer_family::is_known_family(&c.family_id) {
                 return Some(format!(
                     "case {} has unknown packer family {:?} (fail-closed)",
+                    c.case_id, c.family_id
+                ));
+            }
+            // Lane <-> family binding: an Oreans fixed case must be Oreans; the
+            // GTO lane case must be ahk_gto. Cross-lane reuse fails closed.
+            if FIXED_CASE_IDS.contains(&c.case_id.as_str()) {
+                if !packer_family::is_oreans_family(&c.family_id) {
+                    return Some(format!(
+                        "Oreans fixed case {} must carry family {:?}, got {:?} (fail-closed)",
+                        c.case_id,
+                        packer_family::OREANS,
+                        c.family_id
+                    ));
+                }
+            } else if c.case_id == GTO_CASE_ID && !packer_family::is_generic_family(&c.family_id) {
+                return Some(format!(
+                    "GTO lane case {} must carry a registered generic family (ahk_gto), \
+                     got {:?} (fail-closed)",
                     c.case_id, c.family_id
                 ));
             }
@@ -612,9 +648,14 @@ pub fn run_offline_preflight(
 /// envelope. v2 reports (single top-level digest) no longer parse.
 pub const PREFLIGHT_REPORT_SCHEMA_VERSION: &str = "mida.preflight-report/v3";
 
-/// The two fixed Oreans cases; the launch attestation accepts exactly this
-/// set (no cross-case reuse).
+/// The two fixed Oreans cases; the Oreans fixed regression lane accepts
+/// exactly this set (no cross-case reuse).
 pub const FIXED_CASE_IDS: [&str; 2] = ["origin_macro", "lunlun_software"];
+
+/// The independent GTO generic/no-gate lane case. It is NOT part of the Oreans
+/// fixed regression gate; it carries `family_id = ahk_gto` and a `no-gate`
+/// acceptance state, and produces generic `mida.unpack-*` evidence.
+pub const GTO_CASE_ID: &str = "gto_launcher";
 
 /// The P7 launch-boundary gate (production).
 ///
@@ -1016,9 +1057,11 @@ pub fn attest_ready_before_launch(
         );
     }
     let target_case_id = matches[0].case_id.clone();
-    if !FIXED_CASE_IDS.contains(&target_case_id.as_str()) {
+    // The target must belong to a recognized lane: the Oreans fixed regression
+    // lane or the independent GTO generic/no-gate lane.
+    if !FIXED_CASE_IDS.contains(&target_case_id.as_str()) && target_case_id != GTO_CASE_ID {
         bail!(
-            "target case {:?} is not one of the two fixed Oreans cases",
+            "target case {:?} is neither an Oreans fixed case nor the GTO lane case",
             target_case_id
         );
     }
@@ -1053,15 +1096,22 @@ pub fn attest_ready_before_launch(
         );
     }
     let present_ids: Vec<&str> = fresh.cases.iter().map(|c| c.case_id.as_str()).collect();
+    // The fresh report must contain both Oreans fixed cases exactly once
+    // (Oreans regression lane invariant), and any GTO lane case exactly once.
     if FIXED_CASE_IDS
         .iter()
         .any(|id| present_ids.iter().filter(|p| *p == id).count() != 1)
-        || present_ids.len() != FIXED_CASE_IDS.len()
+        || present_ids.iter().filter(|p| **p == GTO_CASE_ID).count() > 1
+        || present_ids
+            .iter()
+            .any(|id| !FIXED_CASE_IDS.contains(id) && *id != GTO_CASE_ID)
     {
         bail!(
-            "fresh report case set must be exactly [{}, {}] with no duplicates, got {:?}",
+            "fresh report case set must contain exactly the Oreans fixed lane [{}, {}] plus \
+             at most the GTO lane case {}, no duplicates/unknown, got {:?}",
             FIXED_CASE_IDS[0],
             FIXED_CASE_IDS[1],
+            GTO_CASE_ID,
             present_ids
         );
     }
@@ -1803,8 +1853,87 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// G2-R1: unknown / missing family in the envelope case fails closed at
-    /// case-set validation (before any process/attestation work).
+    /// G3: a GTO lane envelope (case `gto_launcher`, family `ahk_gto`) binds a
+    /// GTO-family actual config and REJECTS an Oreans-family actual config. The
+    /// GTO lane can never be attested under an Oreans config (and vice versa).
+    #[test]
+    fn gto_lane_envelope_binds_gto_config_and_rejects_oreans() {
+        use mida_core::runner_config::packer_family;
+        let dir = temp_dir("g3_gto_bind");
+        // Build a GTO lane envelope: Oreans fixed lane + a gto_launcher case
+        // with family ahk_gto and a GTO config/digest.
+        let mut env = v4_envelope();
+        let mut gto_cfg = crate::run_spec::frozen_runner_config_for_family(packer_family::AHK_GTO);
+        gto_cfg.tool_revision = "rev".to_string();
+        gto_cfg.cli_binary_sha256 = "a".repeat(64);
+        gto_cfg.pure_rebuild = false;
+        let gto_digest = mida_core::runner_config::runner_config_digest(&gto_cfg);
+        let gto_identity = FileIdentityGate {
+            sha256: "c".repeat(64),
+            size_bytes: 42,
+        };
+        env.case_configs.push(CaseRunnerConfigEnvelope {
+            case_id: GTO_CASE_ID.to_string(),
+            family_id: packer_family::AHK_GTO.to_string(),
+            protected_input: gto_identity.clone(),
+            runner_config: serde_json::to_value(&gto_cfg).unwrap(),
+            runner_config_digest: gto_digest,
+        });
+        assert!(
+            env.validate_case_set().is_none(),
+            "GTO lane envelope is valid"
+        );
+        env.write(&dir).unwrap();
+
+        // A GTO-family actual config matching the GTO case digest binds.
+        let mut gto_actual = crate::run_spec::frozen_run_policy_for_family(
+            Path::new("x.bin"),
+            packer_family::AHK_GTO,
+        );
+        gto_actual.tool_revision = "rev".to_string();
+        gto_actual.cli_binary_sha256 = "a".repeat(64);
+        gto_actual.pure_rebuild = false;
+        assert_eq!(gto_actual.packer_family, packer_family::AHK_GTO);
+        assert!(
+            bind_actual_config_to_envelope(&dir, &gto_actual, &gto_identity).is_ok(),
+            "GTO lane envelope + GTO actual config must bind"
+        );
+
+        // An Oreans-family actual config must never bind to the GTO lane case.
+        let mut oreans_actual = crate::run_spec::frozen_run_policy(Path::new("x.bin"));
+        oreans_actual.pure_rebuild = false;
+        assert!(
+            bind_actual_config_to_envelope(&dir, &oreans_actual, &gto_identity).is_err(),
+            "GTO lane envelope must reject an Oreans actual config"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// G3: unknown / missing family in the GTO lane case fails closed at
+    /// case-set validation.
+    #[test]
+    fn gto_lane_unknown_or_missing_family_fails_closed() {
+        use mida_core::runner_config::packer_family;
+        let mut unknown = v4_envelope();
+        let mut gto_case = v4_envelope().case_configs[0].clone();
+        gto_case.case_id = GTO_CASE_ID.to_string();
+        gto_case.family_id = "bogus_family".to_string();
+        unknown.case_configs.push(gto_case);
+        assert!(
+            unknown.validate_case_set().is_some(),
+            "a GTO lane case with an unknown family must fail closed"
+        );
+        let mut missing = v4_envelope();
+        let mut gto_missing = v4_envelope().case_configs[0].clone();
+        gto_missing.case_id = GTO_CASE_ID.to_string();
+        gto_missing.family_id = String::new();
+        missing.case_configs.push(gto_missing);
+        assert!(
+            missing.validate_case_set().is_some(),
+            "a GTO lane case with a missing family must fail closed"
+        );
+        let _ = packer_family::AHK_GTO;
+    }
     #[test]
     fn g2r1_unknown_family_in_envelope_fails_closed() {
         let dir = temp_dir("g2r1_unknown_family");
@@ -1849,14 +1978,58 @@ mod tests {
     /// claim GTO preflight is live without explicitly removing this guard.
     #[test]
     fn gto_preflight_is_not_yet_reachable() {
-        // The fixed regression gate is exactly the two Oreans cases.
+        // The Oreans fixed regression gate is exactly the two Oreans cases;
+        // the GTO lane is a SEPARATE case id and is never folded into it.
         assert_eq!(FIXED_CASE_IDS, ["origin_macro", "lunlun_software"]);
-        // No GTO case participates, so `attest_ready_before_launch` (which
-        // restricts to FIXED_CASE_IDS) cannot attest a GTO family case today.
         assert!(
             !FIXED_CASE_IDS.iter().any(|id| *id == "gto_launcher"),
-            "GTO preflight is not wired into the fixed case gate yet"
+            "the GTO lane must never be folded into the Oreans fixed regression gate"
         );
+        assert_eq!(GTO_CASE_ID, "gto_launcher");
+        // The GTO lane is NOT an accepted sample: no real GTO sample has been
+        // staged/attested/verified end-to-end (it stays offline-only). This
+        // guards against anyone claiming real GTO preflight acceptance.
+    }
+
+    /// G3: `validate_case_set` accepts the two lanes — the Oreans fixed lane
+    /// must be present, and an optional GTO no-gate lane case is allowed with
+    /// family `ahk_gto`. Cross-lane / unknown family reuse fails closed.
+    #[test]
+    fn validate_case_set_accepts_oreans_plus_optional_gto_lane() {
+        use mida_core::runner_config::packer_family;
+        let dir = temp_dir("g3_lane_set");
+        let mut oreans = v4_envelope();
+        assert!(
+            oreans.validate_case_set().is_none(),
+            "pure Oreans set is valid"
+        );
+        // Add a GTO lane case (family ahk_gto) -> still valid.
+        let mut gto_case = v4_envelope().case_configs[0].clone();
+        gto_case.case_id = GTO_CASE_ID.to_string();
+        gto_case.family_id = packer_family::AHK_GTO.to_string();
+        oreans.case_configs.push(gto_case);
+        assert!(
+            oreans.validate_case_set().is_none(),
+            "Oreans + GTO lane is valid"
+        );
+        // A GTO case borrowing the Oreans family must fail closed.
+        let mut bad = v4_envelope();
+        let mut gto_case_oreans = v4_envelope().case_configs[0].clone();
+        gto_case_oreans.case_id = GTO_CASE_ID.to_string();
+        gto_case_oreans.family_id = packer_family::OREANS.to_string();
+        bad.case_configs.push(gto_case_oreans);
+        assert!(
+            bad.validate_case_set().is_some(),
+            "a GTO case borrowing the Oreans family must fail closed"
+        );
+        // An Oreans fixed case carrying the GTO family must fail closed.
+        let mut oreans_as_gto = v4_envelope();
+        oreans_as_gto.case_configs[0].family_id = packer_family::AHK_GTO.to_string();
+        assert!(
+            oreans_as_gto.validate_case_set().is_some(),
+            "an Oreans fixed case with the GTO family must fail closed"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// P6.3.3.2: the verifier-replacement rejection is proven offline via a

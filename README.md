@@ -102,6 +102,17 @@ GTO perfect unpack is **not** closed — the open work is the recovery itself
 `origin_macro` + `lunlun_software` regression gate must remain green: GTO work
 must not break that fixed evidence stack.
 
+### GTO preflight lane (G3, offline)
+
+A separate, family-aware / no-gate GTO preflight lane is wired into the CLI and
+acceptance code paths and covered by offline tests — see
+[docs/GTO_PREFLIGHT_LANE.md](docs/GTO_PREFLIGHT_LANE.md). It stages `gto_launcher`
+with `family_id=ahk_gto` into the envelope, attests it against that family, and
+produces generic `mida.unpack-*` evidence with an explicit `no-gate` state. The
+Oreans fixed two-sample lane is unchanged. **No real GTO sample has been run**:
+this is lane-implementation-complete offline, NOT a completed/perfect/accepted
+GTO result.
+
 ### Acceptance kernel (R0B)
 
 `mida-acceptance` is an independent crate: it must not depend on production

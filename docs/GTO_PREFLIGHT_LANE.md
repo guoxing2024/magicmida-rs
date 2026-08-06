@@ -1,8 +1,29 @@
-# GTO Preflight Lane — G3 Design (family-aware / no-gate)
+# GTO Preflight Lane — G3 (family-aware / no-gate)
 
-**Status:** DESIGN (G2-R2-hardening stage B). Not yet wired into production
-staging/attestation; the fixed Oreans two-sample v4/v8 regression gate is
-unchanged. No real GTO sample is executed.
+**Status:** G3 lane implementation complete **offline**. The lane is wired into
+the CLI and acceptance code paths and covered by offline tests, but no real GTO
+sample has been run — it is NOT `completed`/`perfect`/accepted. The fixed Oreans
+two-sample v4/v8 regression gate is unchanged.
+
+## 0. What is wired (G3)
+
+- `validate_case_set` (CLI) recognizes two lanes: the Oreans fixed lane
+  (`origin_macro` + `lunlun_software`, family `oreans_themida`) plus an
+  optional GTO no-gate lane case (`gto_launcher`, family `ahk_gto`).
+  Cross-lane / unknown / missing family fails closed.
+- `attest_ready_before_launch` (CLI) accepts a `gto_launcher` target case and
+  binds the evidence context to `ahk_gto` (no rebind). The Oreans lane keeps
+  its v8 gate unchanged.
+- staging (`commands.rs`) derives `family_id` from the manifest
+  `capability_cell.protection_family` via
+  `packer_family_from_protection_family` (`ahk_gto_candidate` → `ahk_gto`).
+- acceptance `check_case_identity` passes a GTO no-gate manifest (case id
+  `gto_launcher` + `protection_family=ahk_gto_candidate`) through the identity
+  chain WITHOUT a locked manifest; `run_offline_preflight` and the envelope
+  case-set check accept the optional GTO lane.
+- The GTO lane keeps `gate_schema = UNPACK_GATE_ABSENT = "no-gate"` and
+  produces generic `mida.unpack-*` evidence. `no-gate` means "no acceptance
+  gate yet", never "accepted".
 
 ## 1. Goal
 
@@ -79,13 +100,11 @@ offline-tested.
 
 ## 6. Reachability today
 
-The GTO lane is **not** production-reachable: `validate_case_set` and
-`attest_ready_before_launch` still require exactly the two Oreans cases, so a
-GTO case cannot be staged/attested through the production path yet. The lane
-components (family dispatch, generic producers, digest binding, fail-closed
-family checks) are unit-tested; wiring the lane into staging/attestation is a
-separate, later step. A reachability-guard test
-(`gto_preflight_is_not_yet_reachable`) locks this boundary.
+The GTO lane is wired into the code paths and verified **offline**, but a real
+GTO sample has NOT been run — the lane is not real-sample-verified. The Oreans
+fixed regression lane is unchanged and its v4/v8 gate stays green. The
+reachability-guard test (`gto_preflight_is_not_yet_reachable`) still asserts the
+GTO lane is a separate case id and that no real GTO sample has been accepted.
 
 ## 7. Verification posture
 
@@ -94,3 +113,8 @@ separate, later step. A reachability-guard test
 - Lane components are tested through the real `evidence_schema` dispatch, the
   real sidecar/PE producers, the generic assembler + consumer, and the
   family/digest binding.
+- G3 lane tests: `validate_case_set` accepts Oreans + optional GTO lane and
+  rejects cross-lane/unknown/missing family; a GTO lane envelope binds a
+  GTO-family config and rejects an Oreans one; acceptance `check_case_identity`
+  passes a GTO no-gate manifest without a locked manifest.
+
