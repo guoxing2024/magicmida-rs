@@ -22,11 +22,11 @@ use serde::Deserialize;
 
 use mida_acceptance::oreans_gate::OREANS_TWO_SAMPLE_OBSERVATIONS_SCHEMA_VERSION;
 use mida_acceptance::{
-    build_oreans_pe_evidence, check_static, check_with_behavior, check_with_behavior_managed,
-    check_with_behavior_managed_lab, check_with_behavior_signed, evaluate_oreans_two_sample_gate,
-    sha256_hex, BehaviorEvidence, CheckStaticOptions, EnvelopePolicy, HmacSha256Verifier,
-    OreansGateVerdict, OreansSampleObservation, SignatureEnvelope, Verdict,
-    VerifiedManagedCandidate, FIXED_CASE_IDS,
+    build_oreans_pe_evidence, build_unpack_pe_evidence, check_static, check_with_behavior,
+    check_with_behavior_managed, check_with_behavior_managed_lab, check_with_behavior_signed,
+    evaluate_oreans_two_sample_gate, sha256_hex, BehaviorEvidence, CheckStaticOptions,
+    EnvelopePolicy, HmacSha256Verifier, OreansGateVerdict, OreansPeEvidence, OreansPeEvidenceError,
+    OreansSampleObservation, SignatureEnvelope, Verdict, VerifiedManagedCandidate, FIXED_CASE_IDS,
 };
 
 fn is_64_hex(value: &str) -> bool {
@@ -71,6 +71,10 @@ fn run() -> Result<i32, String> {
             args.remove(0);
             cmd_oreans_pe_evidence(&args)
         }
+        "unpack-pe-evidence" => {
+            args.remove(0);
+            cmd_unpack_pe_evidence(&args)
+        }
         "oreans-two-sample-gate" => {
             args.remove(0);
             cmd_oreans_two_sample_gate(&args)
@@ -84,7 +88,7 @@ fn run() -> Result<i32, String> {
             cmd_preflight(&args)
         }
         other => Err(format!(
-            "unknown command '{other}'. Use: check-static | check-with-behavior | oreans-pe-evidence | oreans-two-sample-gate | classify-gate-report | preflight"
+            "unknown command '{other}'. Use: check-static | check-with-behavior | oreans-pe-evidence | unpack-pe-evidence | oreans-two-sample-gate | classify-gate-report | preflight"
         )),
     }
 }
@@ -144,10 +148,41 @@ Notes:
 }
 
 fn cmd_oreans_pe_evidence(args: &[String]) -> Result<i32, String> {
+    cmd_pe_evidence_impl(
+        args,
+        "oreans-pe-evidence",
+        build_oreans_pe_evidence,
+        "Oreans PE evidence",
+    )
+}
+
+/// Emit the generic, family-agnostic PE evidence (`mida.unpack-pe-evidence/v1`)
+/// through the same acceptance-binary seam as the Oreans PE evidence. The
+/// payload build is shared ([`build_unpack_pe_evidence`]); only the schema id
+/// differs, so a generic (`ahk_gto`) run never produces Oreans PE evidence.
+fn cmd_unpack_pe_evidence(args: &[String]) -> Result<i32, String> {
+    cmd_pe_evidence_impl(
+        args,
+        "unpack-pe-evidence",
+        build_unpack_pe_evidence,
+        "generic PE evidence",
+    )
+}
+
+/// Shared PE-evidence command driver: parse `<candidate>` + expected
+/// identity/`--report` options, build the family-appropriate PE evidence, and
+/// write the report. `build` selects the family-specific schema id.
+fn cmd_pe_evidence_impl(
+    args: &[String],
+    command_name: &str,
+    build: fn(&[u8]) -> Result<OreansPeEvidence, OreansPeEvidenceError>,
+    label: &str,
+) -> Result<i32, String> {
     if args.is_empty() {
-        return Err(
-            "Usage: mida-acceptance oreans-pe-evidence <candidate> [--expected-sha256 HEX] [--expected-size BYTES] [--report PATH]".into(),
-        );
+        return Err(format!(
+            "Usage: mida-acceptance {command_name} <candidate> [--expected-sha256 HEX] \
+             [--expected-size BYTES] [--report PATH]"
+        ));
     }
 
     let mut candidate: Option<PathBuf> = None;
@@ -229,18 +264,18 @@ fn cmd_oreans_pe_evidence(args: &[String]) -> Result<i32, String> {
         }
     }
 
-    let evidence = match build_oreans_pe_evidence(&bytes) {
+    let evidence = match build(&bytes) {
         Ok(evidence) => evidence,
         Err(error) => {
             eprintln!(
-                "error: Oreans PE evidence construction failed for '{}': {error}",
+                "error: {label} construction failed for '{}': {error}",
                 candidate.display()
             );
             return Ok(2);
         }
     };
     let mut json = serde_json::to_string_pretty(&evidence)
-        .map_err(|error| format!("failed to serialize Oreans PE evidence: {error}"))?;
+        .map_err(|error| format!("failed to serialize {label}: {error}"))?;
     println!("{json}");
 
     if let Some(report_path) = report_path {

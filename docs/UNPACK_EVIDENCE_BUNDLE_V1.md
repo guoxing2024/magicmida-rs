@@ -144,7 +144,29 @@ digests — are always distinct. A family-less legacy config parses as
   (no rebind / no masquerading an Oreans digest as GTO); an unknown or missing
   envelope family fails case-set validation; GTO and Oreans digests are never
   equal; the PE-identified family must equal the attested envelope family
-  before process creation.
+  before process creation;
+- G2-R2 production-shaped: the shared sidecar producers (IAT/OEP/TLS/section)
+  dispatch their member schema by family (`mida.oreans-*` vs
+  `mida.unpack-*`) through a single `evidence_schema` dispatch; the generic
+  PE-evidence producer (`build_unpack_pe_evidence` / `unpack-pe-evidence`
+  command) is schema-distinct from the Oreans one and never crosses lines; a
+  real producer output matches the generic assembler's expected member schema.
+
+## 7b. GTO preflight reachability (G2-R2, choice B)
+
+The generic producers are now real and family-wired, but the GTO **preflight
+lane is NOT yet reachable end-to-end**. This is a deliberate, documented choice:
+
+- the fixed two-sample regression gate (`FIXED_CASE_IDS`) remains strictly
+  `origin_macro` + `lunlun_software` (both Oreans), so no GTO case can be
+  staged into the envelope today;
+- `attest_ready_before_launch` restricts to those two Oreans cases, so a GTO
+  family attestation is not exercisable through the production staging path;
+- the GTO family / digest / attest / generic-bundle path is unit-tested and the
+  producers are family-correct, but wiring GTO into the preflight lane is a
+  **later, separate task** (independent family-aware / no-gate GTO lane);
+- a reachability-guard test (`gto_preflight_is_not_yet_reachable`) locks this
+  boundary so no future change can silently claim GTO preflight is live.
 
 ## 8. Current standing
 

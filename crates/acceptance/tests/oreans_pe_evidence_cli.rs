@@ -162,3 +162,35 @@ fn report_candidate_alias_is_rejected_without_modifying_candidate() {
     assert!(stderr.contains("aliases candidate"), "stderr: {stderr}");
     assert_eq!(fs::read(&candidate).expect("candidate preserved"), bytes);
 }
+
+/// G2-R2: the `unpack-pe-evidence` command emits the generic
+/// `mida.unpack-pe-evidence/v1` schema while `oreans-pe-evidence` emits the
+/// Oreans schema — the two commands and schemas never cross lines.
+#[test]
+fn unpack_pe_evidence_command_emits_generic_schema_not_oreans() {
+    let dir = TestDir::new();
+    let (candidate, bytes) = write_pe(&dir, "candidate.bin");
+
+    let generic = run(&["unpack-pe-evidence", candidate.to_str().unwrap()]);
+    assert_eq!(generic.status.code(), Some(0), "{generic:?}");
+    let generic_json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&generic.stdout)).expect("generic JSON");
+    assert_eq!(generic_json["schema_version"], "mida.unpack-pe-evidence/v1");
+    assert_eq!(generic_json["valid"], true);
+    assert_eq!(
+        generic_json["candidate"]["sha256"],
+        mida_acceptance::sha256_hex(&bytes)
+    );
+
+    // Same payload, different schema id — the commands are schema-distinct.
+    let oreans = run(&["oreans-pe-evidence", candidate.to_str().unwrap()]);
+    assert_eq!(oreans.status.code(), Some(0), "{oreans:?}");
+    let oreans_json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&oreans.stdout)).expect("oreans JSON");
+    assert_eq!(oreans_json["schema_version"], "mida.oreans-pe-evidence/v1");
+    assert_ne!(
+        generic_json["schema_version"],
+        oreans_json["schema_version"]
+    );
+    assert_eq!(generic_json["candidate"], oreans_json["candidate"]);
+}

@@ -308,11 +308,16 @@ mod tests {
                 .with_rva(Some(0x1000));
 
         // Five real sidecar producers.
-        write_oep_evidence(&protected, &candidate, &provenance).expect("oep evidence");
-        write_iat_evidence(&protected, &candidate, &report).expect("iat evidence");
-        write_tls_evidence(&protected, &candidate, &report).expect("tls evidence");
-        write_relocation_evidence(&protected, &candidate, &report).expect("reloc evidence");
-        write_section_rebuild_evidence(&protected, &candidate).expect("section evidence");
+        write_oep_evidence(&protected, &candidate, &provenance, "oreans_themida")
+            .expect("oep evidence");
+        write_iat_evidence(&protected, &candidate, &report, "oreans_themida")
+            .expect("iat evidence");
+        write_tls_evidence(&protected, &candidate, &report, "oreans_themida")
+            .expect("tls evidence");
+        write_relocation_evidence(&protected, &candidate, &report, "oreans_themida")
+            .expect("reloc evidence");
+        write_section_rebuild_evidence(&protected, &candidate, "oreans_themida")
+            .expect("section evidence");
 
         // Transform manifest through the production writer (pass the candidate
         // path; the writer derives the `.transform_manifest.json` sibling).

@@ -399,7 +399,7 @@ pub(super) fn run_post_loop_phases(
     let dump_report = mida_pe::dump_process_with_report(dbg, &dump_opts)
         .map_err(|e| anyhow!("Dump failed: {e}"))?;
 
-    let iat_sidecar_path = write_iat_evidence(input, output_path, &dump_report)
+    let iat_sidecar_path = write_iat_evidence(input, output_path, &dump_report, family_id)
         .context("write candidate-bound IAT evidence sidecar")?;
     log::log(
         LogType::Info,
@@ -409,7 +409,7 @@ pub(super) fn run_post_loop_phases(
         ),
     );
 
-    let tls_sidecar_path = write_tls_evidence(input, output_path, &dump_report)
+    let tls_sidecar_path = write_tls_evidence(input, output_path, &dump_report, family_id)
         .context("write candidate-bound TLS evidence sidecar")?;
     log::log(
         LogType::Info,
@@ -419,8 +419,9 @@ pub(super) fn run_post_loop_phases(
         ),
     );
 
-    let relocation_sidecar_path = write_relocation_evidence(input, output_path, &dump_report)
-        .context("write candidate-bound relocation evidence sidecar")?;
+    let relocation_sidecar_path =
+        write_relocation_evidence(input, output_path, &dump_report, family_id)
+            .context("write candidate-bound relocation evidence sidecar")?;
     log::log(
         LogType::Info,
         &format!(
@@ -429,8 +430,9 @@ pub(super) fn run_post_loop_phases(
         ),
     );
 
-    let section_rebuild_sidecar_path = write_section_rebuild_evidence(input, output_path)
-        .context("write candidate-bound section rebuild evidence sidecar")?;
+    let section_rebuild_sidecar_path =
+        write_section_rebuild_evidence(input, output_path, family_id)
+            .context("write candidate-bound section rebuild evidence sidecar")?;
     log::log(
         LogType::Info,
         &format!(
@@ -439,7 +441,7 @@ pub(super) fn run_post_loop_phases(
         ),
     );
 
-    let sidecar_path = write_oep_evidence(input, output_path, oep_provenance)
+    let sidecar_path = write_oep_evidence(input, output_path, oep_provenance, family_id)
         .context("write native OEP provenance sidecar")?;
     log::log(
         LogType::Info,

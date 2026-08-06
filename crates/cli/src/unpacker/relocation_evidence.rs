@@ -13,7 +13,6 @@ use mida_pe::{PeHeader, RelocationObservationReport};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub(crate) const SCHEMA_VERSION: &str = "mida.oreans-relocation-evidence/v1";
 const RELOC_DIRECTORY_INDEX: usize = 5;
 const IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE: u16 = 0x0040;
 const IMAGE_FILE_RELOCS_STRIPPED: u16 = 0x0001;
@@ -168,9 +167,10 @@ pub(crate) fn write_relocation_evidence(
     protected_input: &Path,
     candidate: &Path,
     report: &mida_pe::DumpProcessReport,
+    family: &str,
 ) -> anyhow::Result<PathBuf> {
     let sidecar = sidecar_path(candidate)?;
-    let value = build_relocation_evidence(protected_input, candidate, report)?;
+    let value = build_relocation_evidence(protected_input, candidate, report, family)?;
     ensure_sidecar_is_safe(&sidecar, protected_input, candidate)?;
     let json =
         serde_json::to_vec_pretty(&value).context("serialize relocation evidence sidecar")?;
@@ -182,7 +182,14 @@ pub(crate) fn build_relocation_evidence(
     protected_input: &Path,
     candidate: &Path,
     report: &mida_pe::DumpProcessReport,
+    family: &str,
 ) -> anyhow::Result<RelocationEvidenceSidecar> {
+    let schema_version = super::evidence_schema::member_schema_for_family(
+        family,
+        super::evidence_schema::EvidenceMemberKind::Relocation,
+    )
+    .map_err(anyhow::Error::msg)?
+    .to_string();
     if same_file(protected_input, candidate)? {
         return Err(anyhow!("protected input and candidate are the same file"));
     }
@@ -242,7 +249,7 @@ pub(crate) fn build_relocation_evidence(
         && final_candidate.has_non_absolute_entry;
 
     Ok(RelocationEvidenceSidecar {
-        schema_version: SCHEMA_VERSION.to_string(),
+        schema_version: schema_version.clone(),
         protected_input: protected_identity,
         candidate: candidate_identity,
         runtime: runtime.clone(),

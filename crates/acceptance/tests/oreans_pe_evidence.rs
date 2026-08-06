@@ -356,3 +356,23 @@ fn malformed_header_errors_are_structured() {
     assert!(!error.message.is_empty());
     let _: OreansPeEvidenceError = error;
 }
+
+/// G2-R2: the generic PE-evidence producer emits `mida.unpack-pe-evidence/v1`
+/// while the Oreans producer emits `mida.oreans-pe-evidence/v1` — the two never
+/// cross lines. Same payload shape; only the schema id differs.
+#[test]
+fn generic_and_oreans_pe_evidence_do_not_cross_schemas() {
+    use mida_acceptance::{build_unpack_pe_evidence, UNPACK_PE_EVIDENCE_SCHEMA_VERSION};
+    let bytes = base_pe();
+    let oreans = build_oreans_pe_evidence(&bytes).expect("oreans PE evidence");
+    assert_eq!(oreans.schema_version, OREANS_PE_EVIDENCE_SCHEMA_VERSION);
+    assert_eq!(oreans.schema_version, "mida.oreans-pe-evidence/v1");
+    let generic = build_unpack_pe_evidence(&bytes).expect("generic PE evidence");
+    assert_eq!(generic.schema_version, UNPACK_PE_EVIDENCE_SCHEMA_VERSION);
+    assert_eq!(generic.schema_version, "mida.unpack-pe-evidence/v1");
+    // Identical payload, only the schema id differs.
+    assert_eq!(oreans.candidate, generic.candidate);
+    assert_ne!(oreans.schema_version, generic.schema_version);
+    // Malformed input fails closed for both producers.
+    assert!(build_unpack_pe_evidence(&[0u8; 16]).is_err());
+}

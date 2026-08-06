@@ -13,6 +13,7 @@ use mida_pe::{PeHeader, TlsCallbackStatus, TlsObservationReport, MAX_TLS_CALLBAC
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+#[allow(dead_code)] // legacy Oreans schema id; production uses evidence_schema dispatch
 pub(crate) const SCHEMA_VERSION: &str = "mida.oreans-tls-evidence/v1";
 const TLS_DIRECTORY_INDEX: usize = 9;
 const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
@@ -131,9 +132,10 @@ pub(crate) fn write_tls_evidence(
     protected_input: &Path,
     candidate: &Path,
     report: &mida_pe::DumpProcessReport,
+    family: &str,
 ) -> anyhow::Result<PathBuf> {
     let sidecar = sidecar_path(candidate)?;
-    let value = build_tls_evidence(protected_input, candidate, report)?;
+    let value = build_tls_evidence(protected_input, candidate, report, family)?;
     ensure_sidecar_is_safe(&sidecar, protected_input, candidate)?;
     let json = serde_json::to_vec_pretty(&value).context("serialize TLS evidence sidecar")?;
     atomic_write(&sidecar, &json)?;
@@ -144,7 +146,14 @@ pub(crate) fn build_tls_evidence(
     protected_input: &Path,
     candidate: &Path,
     report: &mida_pe::DumpProcessReport,
+    family: &str,
 ) -> anyhow::Result<TlsEvidenceSidecar> {
+    let schema_version = super::evidence_schema::member_schema_for_family(
+        family,
+        super::evidence_schema::EvidenceMemberKind::Tls,
+    )
+    .map_err(anyhow::Error::msg)?
+    .to_string();
     if same_file(protected_input, candidate)? {
         return Err(anyhow!("protected input and candidate are the same file"));
     }
@@ -199,7 +208,7 @@ pub(crate) fn build_tls_evidence(
     stable_blockers(&mut blockers);
 
     Ok(TlsEvidenceSidecar {
-        schema_version: SCHEMA_VERSION.to_string(),
+        schema_version: schema_version.clone(),
         protected_input: protected_identity,
         candidate: candidate_identity,
         runtime,
@@ -1275,7 +1284,8 @@ mod tests {
     fn pe32_plus_happy_preservation_and_end_at_size_of_image() {
         let spec = ImageSpec::default();
         let (_dir, protected, candidate_path, report) = good_pair("pe64", &spec);
-        let sidecar = build_tls_evidence(&protected, &candidate_path, &report).unwrap();
+        let sidecar =
+            build_tls_evidence(&protected, &candidate_path, &report, "oreans_themida").unwrap();
         assert!(sidecar.prerequisite_passes, "{:?}", sidecar.blockers);
         assert_eq!(sidecar.final_candidate.end_rva, Some(spec.size_of_image));
         assert_eq!(sidecar.runtime.index_value, Some(7));
@@ -1288,7 +1298,8 @@ mod tests {
         spec.pe32_plus = false;
         spec.directory_size = 24;
         let (_dir, protected, candidate_path, report) = good_pair("pe32", &spec);
-        let sidecar = build_tls_evidence(&protected, &candidate_path, &report).unwrap();
+        let sidecar =
+            build_tls_evidence(&protected, &candidate_path, &report, "oreans_themida").unwrap();
         assert!(sidecar.prerequisite_passes, "{:?}", sidecar.blockers);
         assert_eq!(sidecar.final_candidate.pointer_size, 4);
     }
@@ -1310,7 +1321,8 @@ mod tests {
                 absent_report(true, bytes.len()),
             )
         };
-        let sidecar = build_tls_evidence(&protected, &candidate_path, &report).unwrap();
+        let sidecar =
+            build_tls_evidence(&protected, &candidate_path, &report, "oreans_themida").unwrap();
         assert!(sidecar.prerequisite_passes, "{:?}", sidecar.blockers);
         assert!(!sidecar.runtime_evidence_present);
         assert!(!sidecar.final_candidate.directory_present);
@@ -1322,7 +1334,8 @@ mod tests {
         let spec = ImageSpec::default();
         let (_dir, protected, candidate_path, mut report) = good_pair("diagnostic", &spec);
         report.tls_evidence_present = false;
-        let sidecar = build_tls_evidence(&protected, &candidate_path, &report).unwrap();
+        let sidecar =
+            build_tls_evidence(&protected, &candidate_path, &report, "oreans_themida").unwrap();
         assert!(!sidecar.prerequisite_passes);
         assert!(sidecar
             .blockers
@@ -1335,7 +1348,8 @@ mod tests {
         let spec = ImageSpec::default();
         let (_dir, protected, candidate_path, mut report) = good_pair("identity", &spec);
         let bytes = fs::read(&candidate_path).unwrap();
-        let sidecar = build_tls_evidence(&protected, &candidate_path, &report).unwrap();
+        let sidecar =
+            build_tls_evidence(&protected, &candidate_path, &report, "oreans_themida").unwrap();
         let mut hasher = Sha256::new();
         hasher.update(&bytes);
         assert_eq!(
@@ -1344,7 +1358,8 @@ mod tests {
         );
         assert_eq!(sidecar.candidate.size_bytes, bytes.len() as u64);
         report.output_size += 1;
-        let sidecar = build_tls_evidence(&protected, &candidate_path, &report).unwrap();
+        let sidecar =
+            build_tls_evidence(&protected, &candidate_path, &report, "oreans_themida").unwrap();
         assert!(sidecar.blockers.iter().any(|b| b.contains("output_size")));
     }
 
@@ -1353,7 +1368,8 @@ mod tests {
         let mut spec = ImageSpec::default();
         spec.directory_size = 0;
         let (_dir, protected, candidate_path, report) = good_pair("partial-dd", &spec);
-        let sidecar = build_tls_evidence(&protected, &candidate_path, &report).unwrap();
+        let sidecar =
+            build_tls_evidence(&protected, &candidate_path, &report, "oreans_themida").unwrap();
         assert!(sidecar
             .final_candidate
             .blockers
@@ -1369,7 +1385,8 @@ mod tests {
         let directory_offset = rva_offset(&spec, spec.directory_rva).unwrap();
         bytes.truncate(directory_offset + 39);
         fs::write(&candidate_path, &bytes).unwrap();
-        let sidecar = build_tls_evidence(&protected, &candidate_path, &report).unwrap();
+        let sidecar =
+            build_tls_evidence(&protected, &candidate_path, &report, "oreans_themida").unwrap();
         assert!(
             sidecar
                 .final_candidate
@@ -1387,7 +1404,8 @@ mod tests {
         spec.section_raw_size = 0x1000;
         spec.size_of_image = 0x3000;
         let (_dir, protected, candidate_path, report) = good_pair("unbacked-dd", &spec);
-        let sidecar = build_tls_evidence(&protected, &candidate_path, &report).unwrap();
+        let sidecar =
+            build_tls_evidence(&protected, &candidate_path, &report, "oreans_themida").unwrap();
         assert!(sidecar
             .final_candidate
             .blockers
@@ -1400,7 +1418,8 @@ mod tests {
         let mut spec = ImageSpec::default();
         spec.index_rva = 0x3000;
         let (_dir, protected, candidate_path, report) = good_pair("index-unmapped", &spec);
-        let sidecar = build_tls_evidence(&protected, &candidate_path, &report).unwrap();
+        let sidecar =
+            build_tls_evidence(&protected, &candidate_path, &report, "oreans_themida").unwrap();
         assert!(sidecar
             .final_candidate
             .blockers
@@ -1412,7 +1431,8 @@ mod tests {
         spec.size_of_image = 0x4000;
         spec.callbacks_rva = 0x3000;
         let (_dir, protected, candidate_path, report) = good_pair("callbacks-unmapped", &spec);
-        let sidecar = build_tls_evidence(&protected, &candidate_path, &report).unwrap();
+        let sidecar =
+            build_tls_evidence(&protected, &candidate_path, &report, "oreans_themida").unwrap();
         assert!(sidecar
             .final_candidate
             .blockers
@@ -1432,7 +1452,8 @@ mod tests {
             .collect();
         spec.null_terminated = false;
         let (_dir, protected, candidate_path, report) = good_pair("unterminated", &spec);
-        let sidecar = build_tls_evidence(&protected, &candidate_path, &report).unwrap();
+        let sidecar =
+            build_tls_evidence(&protected, &candidate_path, &report, "oreans_themida").unwrap();
         assert!(sidecar
             .final_candidate
             .blockers
@@ -1445,7 +1466,8 @@ mod tests {
         let mut spec = ImageSpec::default();
         spec.section_exec = false;
         let (_dir, protected, candidate_path, report) = good_pair("non-exec", &spec);
-        let sidecar = build_tls_evidence(&protected, &candidate_path, &report).unwrap();
+        let sidecar =
+            build_tls_evidence(&protected, &candidate_path, &report, "oreans_themida").unwrap();
         assert!(sidecar
             .final_candidate
             .blockers
@@ -1459,7 +1481,8 @@ mod tests {
         let (_dir, protected, candidate_path, mut report) = good_pair("mismatch", &spec);
         report.tls_report.callback_slots[0].callback_rva = Some(0x1510);
         report.tls_report.index_rva = Some(0x1210);
-        let sidecar = build_tls_evidence(&protected, &candidate_path, &report).unwrap();
+        let sidecar =
+            build_tls_evidence(&protected, &candidate_path, &report, "oreans_themida").unwrap();
         assert!(sidecar
             .blockers
             .iter()
@@ -1473,7 +1496,8 @@ mod tests {
         let (_dir, protected, candidate_path, mut report) = good_pair("fields", &spec);
         report.tls_report.size_of_zero_fill += 1;
         report.tls_report.characteristics ^= 1;
-        let sidecar = build_tls_evidence(&protected, &candidate_path, &report).unwrap();
+        let sidecar =
+            build_tls_evidence(&protected, &candidate_path, &report, "oreans_themida").unwrap();
         assert!(sidecar
             .blockers
             .iter()
@@ -1491,7 +1515,8 @@ mod tests {
         spec.start_rva = 0x1800;
         spec.end_rva = 0x1900;
         let (_dir, protected, candidate_path, report) = good_pair("virtual-tail", &spec);
-        let sidecar = build_tls_evidence(&protected, &candidate_path, &report).unwrap();
+        let sidecar =
+            build_tls_evidence(&protected, &candidate_path, &report, "oreans_themida").unwrap();
         assert!(sidecar
             .final_candidate
             .blockers
@@ -1506,10 +1531,13 @@ mod tests {
         let bytes = candidate(&spec);
         let (_protected, candidate_path) = write_pair(&dir, &bytes);
         let report = runtime_report(&spec, bytes.len());
-        assert!(build_tls_evidence(&candidate_path, &candidate_path, &report).is_err());
+        assert!(
+            build_tls_evidence(&candidate_path, &candidate_path, &report, "oreans_themida")
+                .is_err()
+        );
         let hardlink = dir.join("candidate-hardlink.exe");
         fs::hard_link(&candidate_path, &hardlink).unwrap();
-        assert!(build_tls_evidence(&candidate_path, &hardlink, &report).is_err());
+        assert!(build_tls_evidence(&candidate_path, &hardlink, &report, "oreans_themida").is_err());
     }
 
     #[test]
@@ -1518,7 +1546,8 @@ mod tests {
         let (_dir, protected, candidate_path, report) = good_pair("atomic", &spec);
         let written_sidecar_path = sidecar_path(&candidate_path).unwrap();
         fs::write(&written_sidecar_path, b"stale").unwrap();
-        let written = write_tls_evidence(&protected, &candidate_path, &report).unwrap();
+        let written =
+            write_tls_evidence(&protected, &candidate_path, &report, "oreans_themida").unwrap();
         let parsed: TlsEvidenceSidecar =
             serde_json::from_slice(&fs::read(&written).unwrap()).unwrap();
         assert_eq!(parsed.schema_version, SCHEMA_VERSION);
@@ -1535,14 +1564,17 @@ mod tests {
         let destination = sidecar_path(&candidate_path).unwrap();
         fs::create_dir(&destination).unwrap();
         let report = runtime_report(&spec, fs::metadata(&candidate_path).unwrap().len() as usize);
-        assert!(write_tls_evidence(&protected, &candidate_path, &report).is_err());
+        assert!(
+            write_tls_evidence(&protected, &candidate_path, &report, "oreans_themida").is_err()
+        );
     }
 
     #[test]
     fn schema_roundtrip_and_unknown_field_rejection() {
         let spec = ImageSpec::default();
         let (_dir, protected, candidate_path, report) = good_pair("schema", &spec);
-        let value = build_tls_evidence(&protected, &candidate_path, &report).unwrap();
+        let value =
+            build_tls_evidence(&protected, &candidate_path, &report, "oreans_themida").unwrap();
         let json = serde_json::to_string(&value).unwrap();
         let decoded: TlsEvidenceSidecar = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, value);
@@ -1552,5 +1584,21 @@ mod tests {
             .unwrap()
             .insert("unknown".into(), serde_json::Value::Null);
         assert!(serde_json::from_value::<TlsEvidenceSidecar>(object).is_err());
+    }
+
+    /// G2-R2: the TLS sidecar producer emits the family-appropriate schema —
+    /// `mida.oreans-tls-evidence/v1` for Oreans, `mida.unpack-tls-evidence/v1`
+    /// for a generic family (ahk_gto). An unknown family fails closed.
+    #[test]
+    fn tls_sidecar_schema_dispatches_by_family() {
+        let spec = ImageSpec::default();
+        let (_dir, protected, candidate_path, report) = good_pair("tls_family", &spec);
+        let oreans =
+            build_tls_evidence(&protected, &candidate_path, &report, "oreans_themida").unwrap();
+        assert_eq!(oreans.schema_version, "mida.oreans-tls-evidence/v1");
+        let gto = build_tls_evidence(&protected, &candidate_path, &report, "ahk_gto").unwrap();
+        assert_eq!(gto.schema_version, "mida.unpack-tls-evidence/v1");
+        assert_eq!(oreans.candidate, gto.candidate);
+        assert!(build_tls_evidence(&protected, &candidate_path, &report, "bogus").is_err());
     }
 }

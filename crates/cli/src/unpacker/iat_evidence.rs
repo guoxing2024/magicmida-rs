@@ -18,8 +18,6 @@ use mida_pe::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub(crate) const SCHEMA_VERSION: &str = "mida.oreans-iat-evidence/v1";
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ArtifactIdentity {
@@ -104,7 +102,14 @@ pub(crate) fn build_iat_evidence(
     protected_input: &Path,
     candidate: &Path,
     report: &mida_pe::DumpProcessReport,
+    family: &str,
 ) -> anyhow::Result<IatEvidenceSidecar> {
+    let schema_version = super::evidence_schema::member_schema_for_family(
+        family,
+        super::evidence_schema::EvidenceMemberKind::Iat,
+    )
+    .map_err(anyhow::Error::msg)?
+    .to_string();
     let (_, protected_identity) = read_artifact(protected_input).with_context(|| {
         format!(
             "read protected input for IAT evidence: {}",
@@ -139,7 +144,7 @@ pub(crate) fn build_iat_evidence(
     let Some(iat_report) = report.iat_report.as_ref() else {
         blockers.push("iat_report missing".to_string());
         return Ok(IatEvidenceSidecar {
-            schema_version: SCHEMA_VERSION.to_string(),
+            schema_version: schema_version.clone(),
             protected_input: protected_identity,
             candidate: candidate_identity,
             fix_imports_requested: report.fix_imports_requested,
@@ -172,7 +177,7 @@ pub(crate) fn build_iat_evidence(
 
     let prerequisite_passes = blockers.is_empty();
     Ok(IatEvidenceSidecar {
-        schema_version: SCHEMA_VERSION.to_string(),
+        schema_version: schema_version.clone(),
         protected_input: protected_identity,
         candidate: candidate_identity,
         fix_imports_requested: report.fix_imports_requested,
@@ -189,9 +194,10 @@ pub(crate) fn write_iat_evidence(
     protected_input: &Path,
     candidate: &Path,
     report: &mida_pe::DumpProcessReport,
+    family: &str,
 ) -> anyhow::Result<PathBuf> {
     let sidecar = sidecar_path(candidate)?;
-    let sidecar_value = build_iat_evidence(protected_input, candidate, report)?;
+    let sidecar_value = build_iat_evidence(protected_input, candidate, report, family)?;
     ensure_sidecar_is_safe(&sidecar, protected_input, candidate)?;
     let mut json =
         serde_json::to_vec_pretty(&sidecar_value).context("serialize IAT evidence sidecar")?;
@@ -842,7 +848,8 @@ mod tests {
         let bytes = minimal_candidate(false, false, b"ExitProcess\0");
         let (protected, candidate) = write_pair(&dir, &bytes);
         let report = report_for(1, false, "ExitProcess");
-        let sidecar = build_iat_evidence(&protected, &candidate, &report).unwrap();
+        let sidecar =
+            build_iat_evidence(&protected, &candidate, &report, "oreans_themida").unwrap();
         assert!(sidecar.prerequisite_passes, "{:?}", sidecar.blocker);
         let evidence = sidecar.iat_report.unwrap();
         assert_eq!(evidence.requested_bytes, 16);
@@ -868,13 +875,13 @@ mod tests {
         let mut report = report_for(1, false, "ExitProcess");
         report.iat_report.as_mut().unwrap().slots[0].module_name = Some("kernel32.dll".into());
         assert!(
-            build_iat_evidence(&protected, &candidate, &report)
+            build_iat_evidence(&protected, &candidate, &report, "oreans_themida")
                 .unwrap()
                 .prerequisite_passes
         );
         report.iat_report.as_mut().unwrap().slots[0].function_name = Some("exitprocess".into());
         assert!(
-            !build_iat_evidence(&protected, &candidate, &report)
+            !build_iat_evidence(&protected, &candidate, &report, "oreans_themida")
                 .unwrap()
                 .prerequisite_passes
         );
@@ -885,7 +892,8 @@ mod tests {
         let dir = temp_dir("ordinal0");
         let (protected, candidate) = write_pair(&dir, &minimal_candidate(false, true, b"Unused\0"));
         let report = report_for(1, true, "Unused");
-        let sidecar = build_iat_evidence(&protected, &candidate, &report).unwrap();
+        let sidecar =
+            build_iat_evidence(&protected, &candidate, &report, "oreans_themida").unwrap();
         assert!(sidecar.prerequisite_passes, "{:?}", sidecar.blocker);
         assert_eq!(sidecar.final_imports[0].ordinal, Some(0));
     }
@@ -919,14 +927,16 @@ mod tests {
         let mut report = report_for(1, false, "ExitProcess");
         report.iat_evidence_present = false;
         report.iat_evidence_complete = false;
-        let sidecar = build_iat_evidence(&protected, &candidate, &report).unwrap();
+        let sidecar =
+            build_iat_evidence(&protected, &candidate, &report, "oreans_themida").unwrap();
         assert!(sidecar.iat_evidence_present);
         assert!(sidecar.iat_evidence_complete);
         assert!(!sidecar.prerequisite_passes);
         assert!(sidecar.blocker.as_deref().unwrap().contains("disagrees"));
         report.iat_report.as_mut().unwrap().bytes_read = 8;
         report.iat_evidence_complete = true;
-        let sidecar = build_iat_evidence(&protected, &candidate, &report).unwrap();
+        let sidecar =
+            build_iat_evidence(&protected, &candidate, &report, "oreans_themida").unwrap();
         assert!(!sidecar.iat_evidence_complete);
         assert!(!sidecar.prerequisite_passes);
     }
@@ -948,7 +958,8 @@ mod tests {
         report.iat_report.as_mut().unwrap().slots[0].module_name = None;
         report.iat_report.as_mut().unwrap().slots[0].function_name = None;
 
-        let sidecar = build_iat_evidence(&protected, &candidate, &report).unwrap();
+        let sidecar =
+            build_iat_evidence(&protected, &candidate, &report, "oreans_themida").unwrap();
         assert!(!sidecar.prerequisite_passes);
         let blocker = sidecar.blocker.as_deref().unwrap();
         assert!(
@@ -971,7 +982,8 @@ mod tests {
         let (protected, candidate) =
             write_pair(&dir, &minimal_candidate(false, false, b"ExitProcess\0"));
         let report = report_for(1, false, "ExitProcess");
-        let sidecar = build_iat_evidence(&protected, &candidate, &report).unwrap();
+        let sidecar =
+            build_iat_evidence(&protected, &candidate, &report, "oreans_themida").unwrap();
         assert!(sidecar.prerequisite_passes, "{:?}", sidecar.blocker);
         let evidence = sidecar.iat_report.unwrap();
         let resolved = evidence
@@ -997,7 +1009,8 @@ mod tests {
         iat.requested_bytes = 15;
         iat.bytes_read = 14;
         iat.slots.pop();
-        let sidecar = build_iat_evidence(&protected, &candidate, &report).unwrap();
+        let sidecar =
+            build_iat_evidence(&protected, &candidate, &report, "oreans_themida").unwrap();
         assert!(!sidecar.prerequisite_passes);
         let blocker = sidecar.blocker.unwrap();
         assert!(
@@ -1013,7 +1026,8 @@ mod tests {
         let (protected, candidate_one) =
             write_pair(&dir, &minimal_candidate(false, false, b"ExitProcess\0"));
         let report_two = report_for(2, false, "ExitProcess");
-        let sidecar = build_iat_evidence(&protected, &candidate_one, &report_two).unwrap();
+        let sidecar =
+            build_iat_evidence(&protected, &candidate_one, &report_two, "oreans_themida").unwrap();
         assert!(!sidecar.prerequisite_passes);
         let candidate_two = dir.join("candidate-two.exe");
         fs::write(
@@ -1022,7 +1036,8 @@ mod tests {
         )
         .unwrap();
         let report_one = report_for(1, false, "ExitProcess");
-        let sidecar = build_iat_evidence(&protected, &candidate_two, &report_one).unwrap();
+        let sidecar =
+            build_iat_evidence(&protected, &candidate_two, &report_one, "oreans_themida").unwrap();
         assert!(!sidecar.prerequisite_passes);
         let mut duplicate = minimal_candidate(false, false, b"ExitProcess\0");
         let desc2 = rva_off(0x1114);
@@ -1074,9 +1089,11 @@ mod tests {
         let protected_before = fs::read(&protected).unwrap();
         let candidate_before = fs::read(&candidate).unwrap();
         let report = report_for(1, false, "ExitProcess");
-        let sidecar_path = write_iat_evidence(&protected, &candidate, &report).unwrap();
+        let sidecar_path =
+            write_iat_evidence(&protected, &candidate, &report, "oreans_themida").unwrap();
         fs::write(&sidecar_path, b"stale sibling\n").unwrap();
-        let replaced = write_iat_evidence(&protected, &candidate, &report).unwrap();
+        let replaced =
+            write_iat_evidence(&protected, &candidate, &report, "oreans_themida").unwrap();
         assert_eq!(replaced, sidecar_path);
         let json: IatEvidenceSidecar =
             serde_json::from_slice(&fs::read(&sidecar_path).unwrap()).unwrap();
@@ -1093,10 +1110,10 @@ mod tests {
         let report = report_for(1, false, "ExitProcess");
         let sidecar = candidate.with_file_name("candidate.exe.iat_evidence.json");
         fs::copy(&candidate, &sidecar).unwrap();
-        assert!(write_iat_evidence(&sidecar, &candidate, &report).is_err());
+        assert!(write_iat_evidence(&sidecar, &candidate, &report, "oreans_themida").is_err());
         fs::remove_file(&sidecar).unwrap();
         fs::hard_link(&candidate, &sidecar).unwrap();
-        assert!(write_iat_evidence(&protected, &candidate, &report).is_err());
+        assert!(write_iat_evidence(&protected, &candidate, &report, "oreans_themida").is_err());
     }
 
     #[test]
@@ -1107,7 +1124,7 @@ mod tests {
         let report = report_for(1, false, "ExitProcess");
         let sidecar = candidate.with_file_name("candidate.exe.iat_evidence.json");
         fs::create_dir(&sidecar).unwrap();
-        let result = write_iat_evidence(&protected, &candidate, &report);
+        let result = write_iat_evidence(&protected, &candidate, &report, "oreans_themida");
         assert!(result.is_err(), "directory sidecar destination must fail");
     }
 
@@ -1129,8 +1146,27 @@ mod tests {
             relocation_report: mida_pe::RelocationObservationReport::default(),
             output_size: bytes.len(),
         };
-        let sidecar = build_iat_evidence(&protected, &candidate, &report).unwrap();
+        let sidecar =
+            build_iat_evidence(&protected, &candidate, &report, "oreans_themida").unwrap();
         assert!(!sidecar.prerequisite_passes);
         assert!(sidecar.iat_report.is_none());
+    }
+
+    /// G2-R2: the shared IAT sidecar producer emits the family-appropriate
+    /// schema — `mida.oreans-iat-evidence/v1` for Oreans, `mida.unpack-iat-evidence/v1`
+    /// for a generic family (ahk_gto). An unknown family fails closed.
+    #[test]
+    fn iat_sidecar_schema_dispatches_by_family() {
+        let dir = temp_dir("iat_family");
+        let bytes = minimal_candidate(false, false, b"ExitProcess\0");
+        let (protected, candidate) = write_pair(&dir, &bytes);
+        let report = report_for(1, false, "ExitProcess");
+        let oreans = build_iat_evidence(&protected, &candidate, &report, "oreans_themida").unwrap();
+        assert_eq!(oreans.schema_version, "mida.oreans-iat-evidence/v1");
+        let gto = build_iat_evidence(&protected, &candidate, &report, "ahk_gto").unwrap();
+        assert_eq!(gto.schema_version, "mida.unpack-iat-evidence/v1");
+        // Same payload otherwise; only the schema id differs.
+        assert_eq!(oreans.candidate, gto.candidate);
+        assert!(build_iat_evidence(&protected, &candidate, &report, "bogus").is_err());
     }
 }

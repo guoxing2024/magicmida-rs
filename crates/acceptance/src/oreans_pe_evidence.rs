@@ -16,6 +16,11 @@ use crate::pe::view::{
 };
 
 pub const OREANS_PE_EVIDENCE_SCHEMA_VERSION: &str = "mida.oreans-pe-evidence/v1";
+/// The generic, family-agnostic PE-evidence schema id (used by the generic
+/// `mida.unpack-evidence-bundle/v1` contract's `pe_evidence` member). The
+/// payload structure is identical to the Oreans PE evidence; only the schema
+/// id differs.
+pub const UNPACK_PE_EVIDENCE_SCHEMA_VERSION: &str = "mida.unpack-pe-evidence/v1";
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 #[error("{code}: {message}")]
@@ -129,13 +134,35 @@ pub struct OreansPeEvidence {
     pub exception_detail: Option<OreansExceptionEvidence>,
 }
 
-/// Build structured evidence from the exact final serialized candidate bytes.
+/// Build structured Oreans PE evidence from the exact final serialized
+/// candidate bytes.
 ///
 /// The candidate digest and size are always computed here; callers cannot
 /// substitute an identity record. All selected directories and architecture-
 /// specific structures are validated before a report is returned.
 pub fn build_oreans_pe_evidence(
     candidate_bytes: &[u8],
+) -> Result<OreansPeEvidence, OreansPeEvidenceError> {
+    build_pe_evidence(candidate_bytes, OREANS_PE_EVIDENCE_SCHEMA_VERSION)
+}
+
+/// Build the generic, family-agnostic PE evidence (`mida.unpack-pe-evidence/v1`)
+/// from the same serialized candidate bytes. The payload and validation are
+/// shared with the Oreans PE evidence ([`build_pe_evidence`]); only the schema
+/// id differs. This is what the generic (`ahk_gto`) evidence path emits so it
+/// never masquerades as Oreans PE evidence.
+pub fn build_unpack_pe_evidence(
+    candidate_bytes: &[u8],
+) -> Result<OreansPeEvidence, OreansPeEvidenceError> {
+    build_pe_evidence(candidate_bytes, UNPACK_PE_EVIDENCE_SCHEMA_VERSION)
+}
+
+/// Shared PE-evidence payload builder: parse + validate the candidate and
+/// bind it to a family-appropriate schema id. The payload structure is
+/// identical across families; only `schema_version` is family-specific.
+fn build_pe_evidence(
+    candidate_bytes: &[u8],
+    schema_version: &str,
 ) -> Result<OreansPeEvidence, OreansPeEvidenceError> {
     let digest = hex_lower(&Sha256::digest(candidate_bytes));
     let image = try_parse(candidate_bytes).map_err(OreansPeEvidenceError::parse)?;
@@ -183,7 +210,7 @@ pub fn build_oreans_pe_evidence(
         .collect();
 
     Ok(OreansPeEvidence {
-        schema_version: OREANS_PE_EVIDENCE_SCHEMA_VERSION.to_string(),
+        schema_version: schema_version.to_string(),
         valid: true,
         candidate: OreansPeCandidateIdentity {
             sha256: digest,

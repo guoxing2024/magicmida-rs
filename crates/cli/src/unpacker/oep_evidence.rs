@@ -15,6 +15,7 @@ use mida_pe::PeHeader;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+#[allow(dead_code)] // legacy Oreans schema id; production uses evidence_schema dispatch
 const SCHEMA_VERSION: &str = "mida.oreans-oep-evidence/v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -64,7 +65,14 @@ pub(super) fn write_oep_evidence(
     protected_input: &Path,
     candidate: &Path,
     provenance: &OepProvenance,
+    family: &str,
 ) -> anyhow::Result<PathBuf> {
+    let schema_version = super::evidence_schema::member_schema_for_family(
+        family,
+        super::evidence_schema::EvidenceMemberKind::Oep,
+    )
+    .map_err(anyhow::Error::msg)?
+    .to_string();
     let (_, protected_identity) = read_artifact(protected_input).with_context(|| {
         format!(
             "read protected input for OEP evidence: {}",
@@ -93,7 +101,7 @@ pub(super) fn write_oep_evidence(
     );
 
     let sidecar_value = OepEvidenceSidecar {
-        schema_version: SCHEMA_VERSION.to_string(),
+        schema_version: schema_version.clone(),
         protected_input: protected_identity,
         candidate: candidate_identity,
         source: source_name(provenance.source).to_string(),
@@ -457,8 +465,13 @@ mod tests {
     fn runtime_rip_matching_rva_passes_and_binds_exact_digest_size() {
         let dir = temp_dir("runtime-pass");
         let (input, candidate) = write_fixture(&dir, 0x1234);
-        let sidecar =
-            write_oep_evidence(&input, &candidate, &pass_provenance(0x1234)).expect("write");
+        let sidecar = write_oep_evidence(
+            &input,
+            &candidate,
+            &pass_provenance(0x1234),
+            "oreans_themida",
+        )
+        .expect("write");
         let value = read_sidecar(&sidecar);
         assert_eq!(value["schema_version"], SCHEMA_VERSION);
         assert_eq!(value["source"], "runtime_rip");
@@ -490,8 +503,9 @@ mod tests {
         let (input, candidate) = write_fixture(&dir, 0x1234);
         let provenance = OepProvenance::trace(0x1400_1234, "trace resolved application OEP")
             .with_rva(Some(0x1234));
-        let value =
-            read_sidecar(&write_oep_evidence(&input, &candidate, &provenance).expect("write"));
+        let value = read_sidecar(
+            &write_oep_evidence(&input, &candidate, &provenance, "oreans_themida").expect("write"),
+        );
         assert_eq!(value["source"], "trace");
         assert_eq!(value["prerequisite_passes"], true);
         cleanup(dir);
@@ -503,8 +517,9 @@ mod tests {
         let (input, candidate) = write_fixture(&dir, 0x1234);
         let provenance =
             OepProvenance::scan_fallback(0x1400_1234, "scan fallback").with_rva(Some(0x1234));
-        let value =
-            read_sidecar(&write_oep_evidence(&input, &candidate, &provenance).expect("write"));
+        let value = read_sidecar(
+            &write_oep_evidence(&input, &candidate, &provenance, "oreans_themida").expect("write"),
+        );
         assert_eq!(value["source"], "scan_fallback");
         assert_eq!(value["prerequisite_passes"], false);
         assert!(value["blocker"]
@@ -519,7 +534,9 @@ mod tests {
         let dir = temp_dir("unknown-fail");
         let (input, candidate) = write_fixture(&dir, 0x1234);
         let unknown = OepProvenance::unknown("no trustworthy OEP");
-        let value = read_sidecar(&write_oep_evidence(&input, &candidate, &unknown).expect("write"));
+        let value = read_sidecar(
+            &write_oep_evidence(&input, &candidate, &unknown, "oreans_themida").expect("write"),
+        );
         assert_eq!(value["source"], "unknown");
         assert_eq!(value["prerequisite_passes"], false);
         assert!(value["blocker"]
@@ -528,7 +545,9 @@ mod tests {
             .contains("unknown"));
 
         let missing = OepProvenance::runtime_rip(0x1400_1234, "address incomplete");
-        let value = read_sidecar(&write_oep_evidence(&input, &candidate, &missing).expect("write"));
+        let value = read_sidecar(
+            &write_oep_evidence(&input, &candidate, &missing, "oreans_themida").expect("write"),
+        );
         assert_eq!(value["prerequisite_passes"], false);
         assert!(value["blocker"].as_str().expect("blocker").contains("RVA"));
         cleanup(dir);
@@ -546,8 +565,9 @@ mod tests {
             true,
         )
         .with_rva(Some(0x1234));
-        let value =
-            read_sidecar(&write_oep_evidence(&input, &candidate, &provenance).expect("write"));
+        let value = read_sidecar(
+            &write_oep_evidence(&input, &candidate, &provenance, "oreans_themida").expect("write"),
+        );
         assert_eq!(value["prerequisite_passes"], false);
         assert!(value["blocker"]
             .as_str()
@@ -561,7 +581,13 @@ mod tests {
         let dir = temp_dir("mismatch-fail");
         let (input, candidate) = write_fixture(&dir, 0x1234);
         let value = read_sidecar(
-            &write_oep_evidence(&input, &candidate, &pass_provenance(0x5678)).expect("write"),
+            &write_oep_evidence(
+                &input,
+                &candidate,
+                &pass_provenance(0x5678),
+                "oreans_themida",
+            )
+            .expect("write"),
         );
         assert_eq!(value["final_entry_rva"], 0x1234);
         assert_eq!(value["entry_rva_matches_provenance"], false);
@@ -577,15 +603,25 @@ mod tests {
     fn rewrite_is_deterministic_and_parseable() {
         let dir = temp_dir("deterministic");
         let (input, candidate) = write_fixture(&dir, 0x1234);
-        let sidecar =
-            write_oep_evidence(&input, &candidate, &pass_provenance(0x1234)).expect("write");
+        let sidecar = write_oep_evidence(
+            &input,
+            &candidate,
+            &pass_provenance(0x1234),
+            "oreans_themida",
+        )
+        .expect("write");
         let first = fs::read(&sidecar).expect("first bytes");
         assert_eq!(
             sidecar.file_name().and_then(|name| name.to_str()),
             Some("candidate.exe.oep_evidence.json")
         );
-        let second_path =
-            write_oep_evidence(&input, &candidate, &pass_provenance(0x1234)).expect("rewrite");
+        let second_path = write_oep_evidence(
+            &input,
+            &candidate,
+            &pass_provenance(0x1234),
+            "oreans_themida",
+        )
+        .expect("rewrite");
         let second = fs::read(second_path).expect("second bytes");
         assert_eq!(first, second);
         let _: OepEvidenceSidecar = serde_json::from_slice(&first).expect("typed parse");
@@ -602,7 +638,12 @@ mod tests {
         fs::write(&input, b"protected-original").expect("input");
         fs::write(&candidate, minimal_pe64(0x1234)).expect("candidate");
         let original = fs::read(&input).expect("original");
-        let result = write_oep_evidence(&input, &candidate, &pass_provenance(0x1234));
+        let result = write_oep_evidence(
+            &input,
+            &candidate,
+            &pass_provenance(0x1234),
+            "oreans_themida",
+        );
         assert!(result.is_err());
         assert_eq!(fs::read(&input).expect("input after"), original);
         cleanup(dir);
@@ -616,7 +657,13 @@ mod tests {
         fs::hard_link(&input, &sidecar).expect("hard link input");
         let input_before = fs::read(&input).expect("input before");
         let candidate_before = fs::read(&candidate).expect("candidate before");
-        assert!(write_oep_evidence(&input, &candidate, &pass_provenance(0x1234)).is_err());
+        assert!(write_oep_evidence(
+            &input,
+            &candidate,
+            &pass_provenance(0x1234),
+            "oreans_themida"
+        )
+        .is_err());
         assert_eq!(fs::read(&input).expect("input after"), input_before);
         assert_eq!(
             fs::read(&candidate).expect("candidate after"),
@@ -624,7 +671,13 @@ mod tests {
         );
         fs::remove_file(&sidecar).expect("remove input link");
         fs::hard_link(&candidate, &sidecar).expect("hard link candidate");
-        assert!(write_oep_evidence(&input, &candidate, &pass_provenance(0x1234)).is_err());
+        assert!(write_oep_evidence(
+            &input,
+            &candidate,
+            &pass_provenance(0x1234),
+            "oreans_themida"
+        )
+        .is_err());
         assert_eq!(fs::read(&input).expect("input final"), input_before);
         assert_eq!(
             fs::read(&candidate).expect("candidate final"),
@@ -639,8 +692,63 @@ mod tests {
         let (input, candidate) = write_fixture(&dir, 0x1234);
         fs::write(&candidate, b"not a PE").expect("invalid candidate");
         let sidecar = sidecar_path(&candidate).expect("sidecar path");
-        assert!(write_oep_evidence(&input, &candidate, &pass_provenance(0x1234)).is_err());
+        assert!(write_oep_evidence(
+            &input,
+            &candidate,
+            &pass_provenance(0x1234),
+            "oreans_themida"
+        )
+        .is_err());
         assert!(!sidecar.exists());
+        cleanup(dir);
+    }
+
+    /// G2-R2: the OEP sidecar producer emits the family-appropriate schema —
+    /// `mida.oreans-oep-evidence/v1` for Oreans, `mida.unpack-oep-evidence/v1`
+    /// for a generic family (ahk_gto). An unknown family fails closed.
+    #[test]
+    fn oep_sidecar_schema_dispatches_by_family() {
+        let dir = temp_dir("oep_family");
+        let (input, candidate) = write_fixture(&dir, 0x1234);
+        let oreans = write_oep_evidence(
+            &input,
+            &candidate,
+            &pass_provenance(0x1234),
+            "oreans_themida",
+        )
+        .expect("oreans oep");
+        assert_eq!(
+            read_sidecar(&oreans)["schema_version"],
+            "mida.oreans-oep-evidence/v1"
+        );
+        let gto = write_oep_evidence(&input, &candidate, &pass_provenance(0x1234), "ahk_gto")
+            .expect("gto oep");
+        assert_eq!(
+            read_sidecar(&gto)["schema_version"],
+            "mida.unpack-oep-evidence/v1"
+        );
+        assert!(write_oep_evidence(&input, &candidate, &pass_provenance(0x1234), "bogus").is_err());
+        cleanup(dir);
+    }
+
+    /// G2-R2: the REAL OEP producer output (family `ahk_gto`) matches the
+    /// schema the generic bundle assembler expects for its `oep_evidence`
+    /// member — so a genuinely-produced sidecar is consumable by the generic
+    /// assembler, not just a hand-built fixture.
+    #[test]
+    fn real_oep_producer_output_matches_generic_assembler_member_schema() {
+        let dir = temp_dir("real_oep_generic");
+        let (input, candidate) = write_fixture(&dir, 0x1234);
+        let path =
+            write_oep_evidence(&input, &candidate, &pass_provenance(0x1234), "ahk_gto").unwrap();
+        let value = read_sidecar(&path);
+        assert_eq!(value["schema_version"], "mida.unpack-oep-evidence/v1");
+        let expected = crate::unpacker::generic_bundle_assembler::EXPECTED_MEMBER_SCHEMAS
+            .iter()
+            .find(|(n, _)| *n == "oep_evidence")
+            .expect("oep_evidence member")
+            .1;
+        assert_eq!(value["schema_version"], expected);
         cleanup(dir);
     }
 }

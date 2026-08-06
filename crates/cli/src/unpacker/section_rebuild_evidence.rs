@@ -12,6 +12,7 @@ use mida_pe::PeHeader;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+#[allow(dead_code)] // legacy Oreans schema id; production uses evidence_schema dispatch
 pub(crate) const SCHEMA_VERSION: &str = "mida.oreans-section-rebuild-evidence/v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -76,6 +77,7 @@ pub(crate) struct SectionRebuildEvidenceSidecar {
 pub(crate) fn write_section_rebuild_evidence(
     protected_input: &Path,
     candidate: &Path,
+    family: &str,
 ) -> anyhow::Result<PathBuf> {
     if same_file(protected_input, candidate)? {
         return Err(anyhow!("protected input and candidate are the same file"));
@@ -89,6 +91,7 @@ pub(crate) fn write_section_rebuild_evidence(
         &candidate_bytes,
         protected,
         candidate_identity,
+        family,
     )?;
     let sidecar = sidecar_path(candidate)?;
     ensure_sidecar_is_safe(&sidecar, protected_input, candidate)?;
@@ -116,7 +119,14 @@ fn build_section_rebuild_evidence(
     candidate_bytes: &[u8],
     protected: ArtifactIdentity,
     candidate: ArtifactIdentity,
+    family: &str,
 ) -> anyhow::Result<SectionRebuildEvidenceSidecar> {
+    let schema_version = super::evidence_schema::member_schema_for_family(
+        family,
+        super::evidence_schema::EvidenceMemberKind::SectionRebuild,
+    )
+    .map_err(anyhow::Error::msg)?
+    .to_string();
     let _protected_parse = PeHeader::from_bytes(protected_bytes)
         .with_context(|| format!("parse protected PE {}", protected_path.display()))?;
     let pe = PeHeader::from_bytes(candidate_bytes)
@@ -317,7 +327,7 @@ fn build_section_rebuild_evidence(
     blockers.sort();
     blockers.dedup();
     Ok(SectionRebuildEvidenceSidecar {
-        schema_version: SCHEMA_VERSION.to_string(),
+        schema_version: schema_version.clone(),
         protected_input: protected,
         candidate,
         machine: pe.nt_headers.file_header.machine,
@@ -565,7 +575,8 @@ mod tests {
         let candidate = root.join("candidate.exe");
         fs::write(&protected, minimal_pe()).unwrap();
         fs::write(&candidate, minimal_pe()).unwrap();
-        let sidecar = write_section_rebuild_evidence(&protected, &candidate).unwrap();
+        let sidecar =
+            write_section_rebuild_evidence(&protected, &candidate, "oreans_themida").unwrap();
         let first = fs::read(&sidecar).unwrap();
         let value: SectionRebuildEvidenceSidecar = serde_json::from_slice(&first).unwrap();
         assert_eq!(value.schema_version, SCHEMA_VERSION);
@@ -574,7 +585,8 @@ mod tests {
             fs::metadata(&candidate).unwrap().len()
         );
         assert!(value.section_rebuild_evidence_pass);
-        let second_path = write_section_rebuild_evidence(&protected, &candidate).unwrap();
+        let second_path =
+            write_section_rebuild_evidence(&protected, &candidate, "oreans_themida").unwrap();
         assert_eq!(sidecar, second_path);
         assert!(!root
             .join(format!(
@@ -632,9 +644,9 @@ mod tests {
         let alias = root.join("candidate-alias.exe");
         fs::write(&protected, minimal_pe()).unwrap();
         fs::write(&candidate, minimal_pe()).unwrap();
-        assert!(write_section_rebuild_evidence(&candidate, &candidate).is_err());
+        assert!(write_section_rebuild_evidence(&candidate, &candidate, "oreans_themida").is_err());
         fs::hard_link(&candidate, &alias).unwrap();
-        assert!(write_section_rebuild_evidence(&candidate, &alias).is_err());
+        assert!(write_section_rebuild_evidence(&candidate, &alias, "oreans_themida").is_err());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -683,7 +695,8 @@ mod tests {
         // Two .rdata sections => duplicate name.
         fs::write(&protected, minimal_pe_with_sections(&[".rdata", ".rdata"])).unwrap();
         fs::write(&candidate, minimal_pe_with_sections(&[".rdata", ".rdata"])).unwrap();
-        let sidecar = write_section_rebuild_evidence(&protected, &candidate).unwrap();
+        let sidecar =
+            write_section_rebuild_evidence(&protected, &candidate, "oreans_themida").unwrap();
         let value: SectionRebuildEvidenceSidecar =
             serde_json::from_slice(&fs::read(&sidecar).unwrap()).unwrap();
         assert!(!value.section_rebuild_evidence_pass);
@@ -710,7 +723,8 @@ mod tests {
         let candidate = root.join("candidate.exe");
         fs::write(&protected, minimal_pe()).unwrap();
         fs::write(&candidate, minimal_pe()).unwrap();
-        let sidecar = write_section_rebuild_evidence(&protected, &candidate).unwrap();
+        let sidecar =
+            write_section_rebuild_evidence(&protected, &candidate, "oreans_themida").unwrap();
         let value: SectionRebuildEvidenceSidecar =
             serde_json::from_slice(&fs::read(&sidecar).unwrap()).unwrap();
         assert!(value.section_rebuild_evidence_pass, "{:?}", value.blockers);
@@ -723,6 +737,32 @@ mod tests {
             "absent zero directories must be canonical, got {:?}",
             value.blockers
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// G2-R2: the section-rebuild sidecar producer emits the family-appropriate
+    /// schema — `mida.oreans-section-rebuild-evidence/v1` for Oreans,
+    /// `mida.unpack-section-rebuild-evidence/v1` for a generic family (ahk_gto).
+    /// An unknown family fails closed.
+    #[test]
+    fn section_rebuild_schema_dispatches_by_family() {
+        let root = temp_dir("section_family");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let protected = root.join("protected.exe");
+        let candidate = root.join("candidate.exe");
+        fs::write(&protected, minimal_pe()).unwrap();
+        fs::write(&candidate, minimal_pe()).unwrap();
+        let oreans =
+            write_section_rebuild_evidence(&protected, &candidate, "oreans_themida").unwrap();
+        let o: SectionRebuildEvidenceSidecar =
+            serde_json::from_slice(&fs::read(&oreans).unwrap()).unwrap();
+        assert_eq!(o.schema_version, "mida.oreans-section-rebuild-evidence/v1");
+        let gto = write_section_rebuild_evidence(&protected, &candidate, "ahk_gto").unwrap();
+        let g: SectionRebuildEvidenceSidecar =
+            serde_json::from_slice(&fs::read(&gto).unwrap()).unwrap();
+        assert_eq!(g.schema_version, "mida.unpack-section-rebuild-evidence/v1");
+        assert!(write_section_rebuild_evidence(&protected, &candidate, "bogus").is_err());
         let _ = fs::remove_dir_all(root);
     }
 }

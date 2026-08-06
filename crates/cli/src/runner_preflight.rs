@@ -1310,19 +1310,41 @@ fn evidence_members(candidate: &Path) -> anyhow::Result<Vec<(String, PathBuf)>> 
     Ok(members)
 }
 
-/// Emit the PE evidence sidecar through the independent acceptance binary
-/// (`mida-acceptance oreans-pe-evidence <candidate> --report <dest>`).
-/// The verifier is the unique CLI sibling (never env/caller/PATH). Exit 0/2
-/// are verifiable outcomes; anything else fails closed.
-fn emit_pe_evidence(candidate: &Path, destination: &Path) -> anyhow::Result<()> {
+/// The acceptance command that produces PE evidence for a packer family.
+/// Oreans → `oreans-pe-evidence`; a registered generic family → the generic
+/// `unpack-pe-evidence`. Unknown families fail closed (no Oreans fallback).
+fn pe_evidence_command_for_family(family: &str) -> anyhow::Result<&'static str> {
+    use mida_core::runner_config::packer_family;
+    if packer_family::is_oreans_family(family) {
+        Ok("oreans-pe-evidence")
+    } else if packer_family::is_generic_family(family) {
+        Ok("unpack-pe-evidence")
+    } else {
+        bail!(
+            "unknown packer family {family:?}; cannot choose a PE-evidence producer (fail-closed)"
+        );
+    }
+}
+
+/// Emit the PE evidence sidecar through the independent acceptance binary.
+/// The family selects the command: `oreans_themida` → `oreans-pe-evidence`
+/// (`mida.oreans-pe-evidence/v1`); a registered generic family → the
+/// `unpack-pe-evidence` command (`mida.unpack-pe-evidence/v1`). The generic
+/// path never masquerades as Oreans PE evidence. The verifier is the unique
+/// CLI sibling (never env/caller/PATH). Exit 0/2 are verifiable outcomes;
+/// anything else fails closed.
+fn emit_pe_evidence(candidate: &Path, destination: &Path, family: &str) -> anyhow::Result<()> {
+    let command = pe_evidence_command_for_family(family)?;
     let (verifier, _) = resolve_verifier_identity()?;
     let status = Command::new(&verifier)
-        .arg("oreans-pe-evidence")
+        .arg(command)
         .arg(candidate)
         .arg("--report")
         .arg(destination)
         .status()
-        .with_context(|| format!("spawn acceptance binary {verifier:?} for PE evidence"))?;
+        .with_context(|| {
+            format!("spawn acceptance binary {verifier:?} for {command} PE evidence")
+        })?;
     match status.code() {
         Some(0) => Ok(()),
         Some(2) => bail!(
@@ -1367,7 +1389,7 @@ pub fn complete_run_evidence(
 
     let members = evidence_members(candidate)?;
     let pe_evidence_path = candidate.with_extension("pe_evidence.json");
-    emit_pe_evidence(candidate, &pe_evidence_path)?;
+    emit_pe_evidence(candidate, &pe_evidence_path, context.packer_family())?;
     for (name, path) in &members {
         if !path.is_file() {
             bail!(
@@ -1801,6 +1823,42 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// G2-R2: the PE-evidence command dispatches by family — Oreans →
+    /// `oreans-pe-evidence`, a generic family (ahk_gto) → `unpack-pe-evidence`.
+    /// The two never cross lines and an unknown family fails closed.
+    #[test]
+    fn pe_evidence_command_dispatches_by_family() {
+        use mida_core::runner_config::packer_family;
+        assert_eq!(
+            pe_evidence_command_for_family(packer_family::OREANS).unwrap(),
+            "oreans-pe-evidence"
+        );
+        assert_eq!(
+            pe_evidence_command_for_family(packer_family::AHK_GTO).unwrap(),
+            "unpack-pe-evidence"
+        );
+        assert!(pe_evidence_command_for_family("bogus").is_err());
+        assert!(pe_evidence_command_for_family("").is_err());
+    }
+
+    /// G2-R2 (reachability guard, choice B): the GTO preflight lane is NOT yet
+    /// wired. The fixed two-sample regression gate is strictly the two Oreans
+    /// cases, so no GTO case can be staged into the envelope today — the GTO
+    /// family/digest/attest path is unit-tested but not end-to-end reachable.
+    /// This assertion locks that boundary so a future change cannot silently
+    /// claim GTO preflight is live without explicitly removing this guard.
+    #[test]
+    fn gto_preflight_is_not_yet_reachable() {
+        // The fixed regression gate is exactly the two Oreans cases.
+        assert_eq!(FIXED_CASE_IDS, ["origin_macro", "lunlun_software"]);
+        // No GTO case participates, so `attest_ready_before_launch` (which
+        // restricts to FIXED_CASE_IDS) cannot attest a GTO family case today.
+        assert!(
+            !FIXED_CASE_IDS.iter().any(|id| *id == "gto_launcher"),
+            "GTO preflight is not wired into the fixed case gate yet"
+        );
+    }
+
     /// P6.3.3.2: the verifier-replacement rejection is proven offline via a
     /// PURE seam (`verify_verifier_identity_bindings`), WITHOUT selecting a
     /// real locked case or creating a sample process. A fabricated envelope
@@ -2062,25 +2120,45 @@ mod tests {
         let protected = (protected_sha.clone(), protected_bytes.len() as u64);
         let candidate = (candidate_sha.clone(), candidate_bytes.len() as u64);
 
-        // Build the 7 member files with their exact family-agnostic (GENERIC)
-        // schemas — `mida.unpack-*-evidence/v1`, never the Oreans variants.
+        // Build the 7 member files. Member schemas come from the PRODUCTION
+        // family-aware dispatch (`evidence_schema::member_schema_for_family`
+        // with the GTO family), so the test exercises the real dispatch rather
+        // than a hand-rolled set.
         let evidence_dir = dir.join("evidence");
         std::fs::create_dir_all(&evidence_dir).unwrap();
+        use crate::unpacker::evidence_schema::{member_schema_for_family, EvidenceMemberKind};
+        const GTO_FAMILY: &str = "ahk_gto";
         let member_specs: Vec<(&str, &str, bool)> = vec![
-            ("oep_evidence", "mida.unpack-oep-evidence/v1", true),
-            ("iat_evidence", "mida.unpack-iat-evidence/v1", true),
-            ("tls_evidence", "mida.unpack-tls-evidence/v1", true),
+            (
+                "oep_evidence",
+                member_schema_for_family(GTO_FAMILY, EvidenceMemberKind::Oep).unwrap(),
+                true,
+            ),
+            (
+                "iat_evidence",
+                member_schema_for_family(GTO_FAMILY, EvidenceMemberKind::Iat).unwrap(),
+                true,
+            ),
+            (
+                "tls_evidence",
+                member_schema_for_family(GTO_FAMILY, EvidenceMemberKind::Tls).unwrap(),
+                true,
+            ),
             (
                 "relocation_evidence",
-                "mida.unpack-relocation-evidence/v1",
+                member_schema_for_family(GTO_FAMILY, EvidenceMemberKind::Relocation).unwrap(),
                 true,
             ),
             (
                 "section_rebuild_evidence",
-                "mida.unpack-section-rebuild-evidence/v1",
+                member_schema_for_family(GTO_FAMILY, EvidenceMemberKind::SectionRebuild).unwrap(),
                 true,
             ),
-            ("pe_evidence", "mida.unpack-pe-evidence/v1", false),
+            (
+                "pe_evidence",
+                member_schema_for_family(GTO_FAMILY, EvidenceMemberKind::Pe).unwrap(),
+                false,
+            ),
             ("transform_manifest", "mida.transform-manifest/v0", false),
         ];
         let mut members = Vec::new();

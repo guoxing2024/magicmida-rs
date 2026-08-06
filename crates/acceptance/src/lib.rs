@@ -120,10 +120,11 @@ pub use oreans_gate::{
     OREANS_TWO_SAMPLE_GATE_SCHEMA_VERSION,
 };
 pub use oreans_pe_evidence::{
-    build_oreans_pe_evidence, OreansExceptionEvidence, OreansPeCandidateIdentity,
-    OreansPeDirectoryCoverage, OreansPeEvidence, OreansPeEvidenceError, OreansPeSectionEvidence,
-    OreansRelocationEvidence, OreansRuntimeFunctionEvidence,
+    build_oreans_pe_evidence, build_unpack_pe_evidence, OreansExceptionEvidence,
+    OreansPeCandidateIdentity, OreansPeDirectoryCoverage, OreansPeEvidence, OreansPeEvidenceError,
+    OreansPeSectionEvidence, OreansRelocationEvidence, OreansRuntimeFunctionEvidence,
     OreansTlsEvidence as OreansPeTlsEvidence, OREANS_PE_EVIDENCE_SCHEMA_VERSION,
+    UNPACK_PE_EVIDENCE_SCHEMA_VERSION,
 };
 pub use preflight::{
     canonical_runner_config, check_case_identity, is_known_packer_family, run_offline_preflight,
