@@ -11,6 +11,7 @@
 //! See `docs/ACCEPTANCE_CONTRACT.md` and `docs/VNEXT_BEHAVIORAL_PATH.md`.
 
 pub mod behavior;
+pub mod behavior_oracle_contract;
 pub mod bundle_gate;
 pub mod check;
 pub mod envelope;
@@ -34,6 +35,15 @@ pub use behavior::{
     TRANSFORM_TAXONOMY_VERSION,
 };
 // compose_with_behavior is deliberately NOT re-exported; use check_* entry points.
+pub use behavior_oracle_contract::{
+    parse_contract_evidence, require_identical_stimulus_plan, verify_contract,
+    verify_contract_bound, BehaviorChainIdentity, BehaviorComparator, BehaviorCompletionMarker,
+    BehaviorContractVerdict, BehaviorExecution, BehaviorObservable, BehaviorObserved,
+    BehaviorObservedStatus, BehaviorOracleContractError, BehaviorOracleContractEvidence,
+    BehaviorStimulus, ComputedObservable, ContractVerdict, ExpectedBinding, ObservableVerdict,
+    StimulusPlanRef, StimulusPlanRegistry, BEHAVIOR_ORACLE_CONTRACT_SCHEMA_VERSION,
+    BLOCKER_CASE_BUSINESS_DEFINITION, CONTRACT_REQUIRED_CASES,
+};
 pub use check::{
     check_static, check_static_verdict, check_with_behavior, check_with_behavior_managed,
     check_with_behavior_managed_lab, check_with_behavior_signed, CheckStaticOptions,
