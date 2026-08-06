@@ -652,4 +652,47 @@ mod tests {
         assert_eq!(evidence_bundle_schema_for_family("bogus"), "");
         assert_eq!(gate_schema_for_family("bogus"), "");
     }
+
+    /// G3 lane: a case manifest's `protection_family` maps to the packer-family
+    /// identity at staging. A GTO candidate → `ahk_gto` (generic contract);
+    /// an Oreans candidate → `oreans_themida`; unknown protection families fail
+    /// closed (None) so staging never guesses a family.
+    #[test]
+    fn protection_family_maps_to_packer_family_for_lane() {
+        assert_eq!(
+            packer_family_from_protection_family("ahk_gto_candidate"),
+            Some(packer_family::AHK_GTO)
+        );
+        assert_eq!(
+            packer_family_from_protection_family("oreans_candidate"),
+            Some(packer_family::OREANS)
+        );
+        assert_eq!(
+            packer_family_from_protection_family("packed_managed_candidate"),
+            None
+        );
+        assert_eq!(
+            packer_family_from_protection_family("unprotected_fixture"),
+            None
+        );
+        assert_eq!(packer_family_from_protection_family("unknown"), None);
+        assert_eq!(packer_family_from_protection_family(""), None);
+    }
+
+    /// G3 lane: a GTO-family config carries the generic contract and an
+    /// explicit no-gate state — never a forged gate schema — and its digest
+    /// differs from the Oreans config.
+    #[test]
+    fn gto_lane_config_is_generic_and_no_gate() {
+        let gto = frozen_runner_config_for_family(packer_family::AHK_GTO);
+        assert_eq!(gto.packer_family, packer_family::AHK_GTO);
+        assert_eq!(gto.evidence_bundle_schema, "mida.unpack-evidence-bundle/v1");
+        assert_eq!(gto.gate_schema, UNPACK_GATE_ABSENT);
+        assert_eq!(gto.gate_schema, "no-gate");
+        let oreans = frozen_runner_config_for_family(packer_family::OREANS);
+        assert_ne!(
+            mida_core::runner_config::runner_config_digest(&gto),
+            mida_core::runner_config::runner_config_digest(&oreans)
+        );
+    }
 }
