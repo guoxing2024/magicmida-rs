@@ -23,6 +23,7 @@ pub mod oracle;
 pub mod pe;
 pub mod preflight;
 pub mod report;
+pub mod survival_structural_evidence;
 pub mod verdict;
 
 #[cfg(test)]
@@ -58,6 +59,14 @@ pub use oracle::{observe_oracle, OracleObservation};
 pub use report::{
     AcceptanceReport, FailureRecord, GateResult, GateStatus, ResidualRisk, WarningRecord,
     REPORT_SCHEMA_VERSION,
+};
+pub use survival_structural_evidence::{
+    verify_structural_evidence, verify_survival_evidence, ExpectedEvidenceBinding,
+    StructuralBundleValidation, StructuralDomainResult, StructuralDomainVerdict,
+    StructuralEvidence, SurvivalChainIdentity, SurvivalCompletionMarker, SurvivalEvidence,
+    SurvivalExitObservation, SurvivalProcessObservation, SurvivalStructuralEvidenceError,
+    SurvivalVerdict, ARTIFACT_SHA256_SEMANTIC_PIN, STRUCTURAL_EVIDENCE_SCHEMA_VERSION,
+    SURVIVAL_EVIDENCE_SCHEMA_VERSION,
 };
 pub use verdict::Verdict;
 pub mod oreans_gate;
