@@ -39,19 +39,28 @@ source path is recorded only as provenance.
 
 Staging is driven by a **snapshot path**, never the live source path. The
 offline `sample_snapshot::StagingIdentity` carries the snapshot hash/size as
-the identity and the source path as provenance; `staging_identity_matches`
-fails closed unless the snapshot hash AND size equal an expected manifest
-identity. A new revision therefore never passes an old manifest-bound identity,
-and a tampered snapshot is rejected.
+the identity and the source path as provenance.
+
+**Verified resolve is mandatory before staging.** `verified_read_snapshot`
+re-reads the on-disk snapshot and recomputes its SHA-256, size, and
+revision/logical-id consistency; a modified, truncated, replaced, missing, or
+forged snapshot is rejected (`VerifiedResolveFailed`). `staging_identity_matches`
+does NOT trust the in-memory `StagingIdentity` hash/size alone: it re-verifies
+the on-disk snapshot against the expected manifest identity. A forged in-memory
+identity (matching claim, wrong/missing disk file) cannot bypass this. A new
+revision therefore never passes an old manifest-bound identity, and a tampered
+snapshot is rejected (verified by real on-disk tamper tests).
 
 ## Current wiring point
 
-`mida-cli` exposes `crate::sample_snapshot` (capture, resolve, staging-identity
-seam) with offline tests. It is NOT yet wired into the GTO preflight lane: the
-sealed `lab/cases/v2/gto_launcher.json` is untouched, and the authoritative
-sample revision is still under adjudication. The next wiring step is for a GTO
-staging entry to take a snapshot path as its input identity and bind the case to
-the snapshot hash/size.
+`mida-cli` exposes `crate::sample_snapshot` (capture, verified resolve,
+staging-identity seam) with offline tests covering idempotent capture,
+concurrent publication, fail-closed cleanup, verified resolve, real disk
+tampering, and path-boundary validation. It is NOT yet wired into the GTO
+preflight lane: the sealed `lab/cases/v2/gto_launcher.json` is untouched, and
+the authoritative sample revision is still under adjudication. The next wiring
+step is for a GTO staging entry to take a verified snapshot path as its input
+identity and bind the case to the snapshot hash/size.
 
 ## Rules
 
