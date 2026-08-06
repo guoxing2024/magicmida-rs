@@ -18,6 +18,7 @@ pub mod envelope;
 pub mod evidence_bundle;
 pub mod failure_taxonomy;
 pub mod gates;
+pub mod generic_bundle;
 pub mod identity;
 pub mod isolated_replay_ledger;
 pub mod oracle;
@@ -87,6 +88,13 @@ pub use evidence_bundle::{
     BundleArtifactIdentity, BundleCompletionMarker, BundleMemberRef, BundleVerdict,
     OreansEvidenceBundle, OREANS_EVIDENCE_BUNDLE_SCHEMA_VERSION, REQUIRED_BUNDLE_MEMBERS,
     TRANSFORM_MANIFEST_SCHEMA_VERSION,
+};
+pub use generic_bundle::{
+    canonical_manifest_hash as generic_canonical_manifest_hash,
+    canonical_members_hash as generic_canonical_members_hash, consume_unpack_bundle,
+    validate_unpack_bundle, UnpackArtifactIdentity, UnpackBundleVerdict, UnpackCompletionMarker,
+    UnpackEvidenceBundle, UnpackMemberRef, GENERIC_PACKER_FAMILY, OREANS_PACKER_FAMILY,
+    REQUIRED_UNPACK_MEMBERS, UNPACK_EVIDENCE_BUNDLE_SCHEMA_VERSION,
 };
 pub use oreans_gate::{
     evaluate_oreans_two_sample_gate, locked_manifest, OreansArtifactIdentity,

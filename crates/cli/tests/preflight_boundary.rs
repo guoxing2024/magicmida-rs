@@ -815,6 +815,7 @@ fn case_runner_config_pure(
     pure_rebuild: bool,
 ) -> (mida_acceptance::RunnerConfig, String) {
     let mut cfg = mida_acceptance::RunnerConfig {
+        packer_family: "oreans_themida".to_string(),
         tool_revision: "rev".to_string(),
         cli_binary_sha256: "a".repeat(64),
         features: vec!["default".to_string()],

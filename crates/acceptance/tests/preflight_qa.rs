@@ -44,6 +44,7 @@ fn real_manifest(case_id: &str) -> PathBuf {
 
 fn runner_config(revision: &str) -> RunnerConfig {
     RunnerConfig {
+        packer_family: "oreans_themida".to_string(),
         tool_revision: revision.to_string(),
         cli_binary_sha256: "a".repeat(64),
         features: vec!["default".to_string()],

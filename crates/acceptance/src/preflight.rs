@@ -352,6 +352,9 @@ pub fn check_case_identity(
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunnerConfig {
+    /// Packer family (Oreans-compat default; GTO sets `ahk_gto` explicitly).
+    #[serde(default = "default_packer_family")]
+    pub packer_family: String,
     pub tool_revision: String,
     /// SHA-256 of the CLI binary that performs the run.
     pub cli_binary_sha256: String,
@@ -386,10 +389,21 @@ pub struct IsolationConfig {
     pub network_policy: String,
 }
 
+/// Default family for a family-less (legacy) runner config. Oreans-compat
+/// wrapper: legacy wire JSON and the old no-family policy builders parse and
+/// behave exactly as before. GTO configs must set `packer_family = "ahk_gto"`
+/// explicitly so their digest differs from Oreans.
+pub fn default_packer_family() -> String {
+    "oreans_themida".to_string()
+}
+
 impl RunnerConfig {
     /// Validate shapes (digests, non-empty identifiers). Returns the first
     /// reason or `None` when valid.
     pub fn validate(&self) -> Option<String> {
+        if self.packer_family.trim().is_empty() {
+            return Some("packer_family must be non-empty".to_string());
+        }
         if self.tool_revision.trim().is_empty() {
             return Some("tool_revision must be non-empty".to_string());
         }
@@ -418,6 +432,7 @@ impl RunnerConfig {
     pub fn placeholder_for_preflight(tool_revision: &str, cli_binary_sha256: &str) -> Self {
         use crate::preflight::IsolationConfig as IC;
         Self {
+            packer_family: default_packer_family(),
             tool_revision: tool_revision.to_string(),
             cli_binary_sha256: cli_binary_sha256.to_string(),
             features: vec!["default".to_string()],
@@ -469,6 +484,7 @@ fn push_list(out: &mut String, name: &str, elements: &mut Vec<String>) {
 /// Canonical, injective serialization of the runner config (verifier copy).
 pub fn canonical_runner_config(config: &RunnerConfig) -> String {
     let mut out = String::new();
+    push_scalar(&mut out, "packer_family", &config.packer_family);
     push_scalar(&mut out, "tool_revision", &config.tool_revision);
     push_scalar(
         &mut out,

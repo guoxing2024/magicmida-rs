@@ -25,6 +25,7 @@ pub mod bundle_assembler;
 mod dump;
 mod early_snapshots;
 mod generic;
+pub mod generic_bundle_assembler;
 mod generic_gate;
 mod gto_host;
 mod helpers;
@@ -195,6 +196,13 @@ pub fn unpack(
         let context = crate::runner_preflight::attest_ready_before_launch(
             preflight_dir,
             &launch_ctx,
+            // G2: the packer family is not known yet (the input PE has not
+            // been parsed — the launch boundary gates the run BEFORE any
+            // process/PE work). The context starts on the Oreans-compat
+            // family; once `dual_select_packer` identifies GTO below, it is
+            // rebound to `ahk_gto` so its evidence routes to the generic
+            // contract instead of masquerading as Oreans evidence.
+            mida_core::runner_config::packer_family::OREANS,
         )
         .map_err(|e| {
             anyhow!("launch blocked by preflight attestation before any process creation: {e:#}")
@@ -279,6 +287,28 @@ pub fn unpack(
                 "PackerPlugin identify: no strong family match (default Oreans host path)"
             );
         }
+    }
+
+    // ---- G2: bind the attested evidence context to the identified family ----
+    // The launch boundary attested the run on the Oreans-compat family (the
+    // input PE was not parsed yet). Now that `dual_select_packer` has
+    // identified the family, rebind the context so GTO evidence routes to the
+    // generic `mida.unpack-evidence-bundle/v1` contract and never masquerades
+    // as Oreans evidence. Oreans stays on the legacy v2 contract (rebinding to
+    // the same family is a no-op); an unknown family fails closed in
+    // `rebind_family`.
+    if evidence_ctx.is_some() && selected_family != mida_core::runner_config::packer_family::OREANS
+    {
+        let ctx = evidence_ctx
+            .take()
+            .expect("rebind: attested evidence context present")
+            .rebind_family(selected_family)
+            .map_err(|e| anyhow!("launch blocked: cannot bind evidence family: {e:#}"))?;
+        evidence_ctx = Some(ctx);
+        info!(
+            family = selected_family,
+            "Evidence context rebound to identified packer family"
+        );
     }
 
     // ---- family host PE layout probe (shared post-attach/post-loop skeleton) ----

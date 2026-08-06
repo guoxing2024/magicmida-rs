@@ -28,12 +28,41 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+/// Canonical packer-family identity used by the runner config. Distinct
+/// families route to distinct evidence contracts and never share a digest.
+pub mod packer_family {
+    /// Oreans/Themida family — routes to `mida.oreans-evidence-bundle/v2` and
+    /// the `mida.oreans-two-sample-gate/v8` consumer.
+    pub const OREANS: &str = "oreans_themida";
+    /// AHK/GTO family — routes to the generic `mida.unpack-evidence-bundle/v1`
+    /// contract. Its products must never be disguised as Oreans evidence.
+    pub const AHK_GTO: &str = "ahk_gto";
+}
+
+/// Default family for a family-less (legacy) runner config. Kept as the
+/// Oreans family so that pre-family wire JSON and old no-family policy
+/// builders continue to parse and behave exactly as before (Oreans-compat
+/// wrapper). GTO runs must set [`packer_family::AHK_GTO`] explicitly.
+pub fn default_packer_family() -> String {
+    packer_family::OREANS.to_string()
+}
+
 /// Canonical runner configuration. `deny_unknown_fields` + required fields
 /// fail closed on drift; no timestamps or random identifiers exist in the
 /// type, so the digest is stable across runs.
+///
+/// `packer_family` carries the identity of the packer family a run belongs to
+/// ([`packer_family::OREANS`] / [`packer_family::AHK_GTO`]). It defaults to
+/// Oreans for backward compatibility (family-less wire JSON parses as Oreans),
+/// so the old Oreans API is preserved unchanged; GTO configs set it explicitly
+/// and therefore produce a different runner digest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunnerConfig {
+    /// Packer family (see [`packer_family`]). Defaults to Oreans for
+    /// backward compatibility; GTO must set it explicitly.
+    #[serde(default = "default_packer_family")]
+    pub packer_family: String,
     pub tool_revision: String,
     /// SHA-256 of the CLI binary that performs the run.
     pub cli_binary_sha256: String,
@@ -76,6 +105,9 @@ impl RunnerConfig {
     /// Validate shapes (digests, non-empty identifiers). Returns the first
     /// reason or `None` when valid.
     pub fn validate(&self) -> Option<String> {
+        if self.packer_family.trim().is_empty() {
+            return Some("packer_family must be non-empty".to_string());
+        }
         if self.tool_revision.trim().is_empty() {
             return Some("tool_revision must be non-empty".to_string());
         }
@@ -128,6 +160,7 @@ fn push_list(out: &mut String, name: &str, elements: &mut Vec<String>) {
 /// verifier share this form via `mida-core`.
 pub fn canonical_runner_config(config: &RunnerConfig) -> String {
     let mut out = String::new();
+    push_scalar(&mut out, "packer_family", &config.packer_family);
     push_scalar(&mut out, "tool_revision", &config.tool_revision);
     push_scalar(
         &mut out,
@@ -192,6 +225,7 @@ mod tests {
 
     pub(crate) fn sample_runner_config() -> RunnerConfig {
         RunnerConfig {
+            packer_family: packer_family::OREANS.to_string(),
             tool_revision: "oreans/two-sample-mainline@frozen".to_string(),
             cli_binary_sha256: "a".repeat(64),
             features: vec!["default".to_string()],
@@ -343,5 +377,34 @@ mod tests {
         assert!(c.validate().is_some());
         let c = sample_runner_config();
         assert!(c.validate().is_none());
+    }
+
+    #[test]
+    fn packer_family_distinguishes_oreans_and_gto_digests() {
+        let oreans = sample_runner_config();
+        let mut gto = sample_runner_config();
+        gto.packer_family = packer_family::AHK_GTO.to_string();
+        // The packer family is part of the config identity: GTO and Oreans
+        // never share a runner digest.
+        assert_ne!(
+            runner_config_digest(&oreans),
+            runner_config_digest(&gto),
+            "packer_family must change the runner digest"
+        );
+        assert_eq!(oreans.packer_family, packer_family::OREANS);
+    }
+
+    #[test]
+    fn familyless_wire_json_defaults_to_oreans() {
+        // Backward compatibility: a family-less legacy config parses as the
+        // Oreans family and yields the same digest as an explicit Oreans one.
+        let mut json = serde_json::to_value(sample_runner_config()).unwrap();
+        json.as_object_mut().unwrap().remove("packer_family");
+        let parsed: RunnerConfig = serde_json::from_value(json).expect("family-less JSON parses");
+        assert_eq!(parsed.packer_family, packer_family::OREANS);
+        assert_eq!(
+            runner_config_digest(&parsed),
+            runner_config_digest(&sample_runner_config())
+        );
     }
 }

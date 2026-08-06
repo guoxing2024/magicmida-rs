@@ -11,7 +11,12 @@
 //!   *before* the digest is computed, so the digest is an honest identity of
 //!   what the run will do — an envelope that says `pure_rebuild=false` can
 //!   never match a run that silently resolved to `true`.
-//! - [`frozen_runner_config`] is the P7 fixed-mode default policy; the
+//! - [`runner_config_from_unpack_args_family`] additionally binds the packer
+//!   family. The legacy family-less API ([`runner_config_from_unpack_args`])
+//!   is preserved as an Oreans-compat wrapper (family defaults to Oreans).
+//! - [`frozen_runner_config`] is the P7 fixed-mode default policy for the
+//!   Oreans family; [`frozen_runner_config_for_family`] builds the fixed-mode
+//!   policy for an explicit family (GTO uses the generic contract). The
 //!   staging command emits the envelope from exactly this policy unless the
 //!   operator binds explicit run-config flags.
 //! - [`frozen_run_policy`] resolves the fixed-mode expectation for a given
@@ -24,7 +29,7 @@
 
 use std::path::Path;
 
-use mida_core::runner_config::RunnerConfig;
+use mida_core::runner_config::{packer_family, RunnerConfig};
 use mida_pe::{ContainerRestoreMode, DumpProfile, OepPolicy};
 
 /// Enabled feature set of this CLI build (canonical order is applied at
@@ -71,14 +76,43 @@ pub fn feature_identity(profile: DumpProfile) -> Vec<String> {
     features
 }
 
+/// Full feature identity for an explicit family: build features + profile +
+/// family feature marker. GTO configs carry `family=ahk-gto` (and vice versa),
+/// so a GTO run and an Oreans run never share a feature identity even when the
+/// dump profile happens to align.
+pub fn feature_identity_for_family(profile: DumpProfile, family: &str) -> Vec<String> {
+    let mut features = feature_identity(profile);
+    features.push(format!("family={family}"));
+    features
+}
+
+/// The evidence-bundle schema id for a packer family. Oreans routes to the
+/// legacy `mida.oreans-evidence-bundle/v2`; GTO routes to the generic
+/// `mida.unpack-evidence-bundle/v1`. Unknown families fail closed (empty).
+pub fn evidence_bundle_schema_for_family(family: &str) -> String {
+    match family {
+        packer_family::OREANS => "mida.oreans-evidence-bundle/v2".to_string(),
+        packer_family::AHK_GTO => "mida.unpack-evidence-bundle/v1".to_string(),
+        _ => String::new(),
+    }
+}
+
+/// The gate-schema id for a packer family. Oreans keeps the v8 two-sample gate;
+/// GTO has no gate consumer yet (its products are not accepted).
+pub fn gate_schema_for_family(family: &str) -> String {
+    match family {
+        packer_family::OREANS => "mida.oreans-two-sample-gate/v8".to_string(),
+        packer_family::AHK_GTO => "mida.unpack-gate/none".to_string(),
+        _ => String::new(),
+    }
+}
+
 /// Build the canonical runner config from the *actual* parsed `/unpack`
-/// arguments. `pure_rebuild` must already be the resolved value (CLI flags +
-/// Origin Macro D3 default); `capture_policy_digest` is the SHA-256 of the
-/// capture-policy file bytes (empty when no policy is loaded);
-/// `tool_revision` / `cli_binary_sha256` are the runtime pinning inputs.
+/// arguments and an explicit packer family.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
-pub fn runner_config_from_unpack_args(
+pub fn runner_config_from_unpack_args_family(
+    family: &str,
     oep_policy: OepPolicy,
     container_restore: ContainerRestoreMode,
     profile: DumpProfile,
@@ -91,9 +125,10 @@ pub fn runner_config_from_unpack_args(
 ) -> RunnerConfig {
     use mida_core::runner_config::IsolationConfig;
     RunnerConfig {
+        packer_family: family.to_string(),
         tool_revision: tool_revision.to_string(),
         cli_binary_sha256: cli_binary_sha256.to_string(),
-        features: feature_identity(profile),
+        features: feature_identity_for_family(profile, family),
         debugger_backend: "windows_debug_api".to_string(),
         oep_policy: oep_policy_id(oep_policy),
         container_restore: container_restore_id(container_restore),
@@ -109,10 +144,46 @@ pub fn runner_config_from_unpack_args(
             network_policy: "blocked".to_string(),
         },
         attempt_numbering: "continuous-1-based".to_string(),
-        evidence_bundle_schema: "mida.oreans-evidence-bundle/v2".to_string(),
-        gate_schema: "mida.oreans-two-sample-gate/v8".to_string(),
+        evidence_bundle_schema: evidence_bundle_schema_for_family(family),
+        gate_schema: gate_schema_for_family(family),
         env_allowlist: vec!["CARGO_TARGET_DIR".to_string()],
     }
+}
+
+/// Build the canonical runner config from the *actual* parsed `/unpack`
+/// arguments. `pure_rebuild` must already be the resolved value (CLI flags +
+/// Origin Macro D3 default); `capture_policy_digest` is the SHA-256 of the
+/// capture-policy file bytes (empty when no policy is loaded);
+/// `tool_revision` / `cli_binary_sha256` are the runtime pinning inputs.
+///
+/// Oreans-compat wrapper: this family-less API binds the Oreans family (the
+/// legacy contract), matching the pre-family behavior exactly. GTO runs use
+/// [`runner_config_from_unpack_args_family`].
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn runner_config_from_unpack_args(
+    oep_policy: OepPolicy,
+    container_restore: ContainerRestoreMode,
+    profile: DumpProfile,
+    shrink: bool,
+    data_sections: bool,
+    pure_rebuild: bool,
+    capture_policy_digest: &str,
+    tool_revision: &str,
+    cli_binary_sha256: &str,
+) -> RunnerConfig {
+    runner_config_from_unpack_args_family(
+        packer_family::OREANS,
+        oep_policy,
+        container_restore,
+        profile,
+        shrink,
+        data_sections,
+        pure_rebuild,
+        capture_policy_digest,
+        tool_revision,
+        cli_binary_sha256,
+    )
 }
 
 /// The P7 fixed-mode default policy of the two-sample Oreans runner.
@@ -123,11 +194,21 @@ pub fn runner_config_from_unpack_args(
 /// divergence.
 #[must_use]
 pub fn frozen_runner_config() -> RunnerConfig {
+    frozen_runner_config_for_family(packer_family::OREANS)
+}
+
+/// The fixed-mode default policy for an explicit packer family. GTO and
+/// Oreans carry distinct `packer_family`, feature, and evidence-schema
+/// identities, so their frozen policies — and their runner digests — never
+/// collide.
+#[must_use]
+pub fn frozen_runner_config_for_family(family: &str) -> RunnerConfig {
     use mida_core::runner_config::IsolationConfig;
     RunnerConfig {
+        packer_family: family.to_string(),
         tool_revision: String::new(),     // filled at emission time
         cli_binary_sha256: String::new(), // filled at emission time
-        features: feature_identity(DumpProfile::OreansClassic),
+        features: feature_identity_for_family(DumpProfile::OreansClassic, family),
         debugger_backend: "windows_debug_api".to_string(),
         oep_policy: "captured".to_string(),
         container_restore: "off".to_string(),
@@ -143,21 +224,31 @@ pub fn frozen_runner_config() -> RunnerConfig {
             network_policy: "blocked".to_string(),
         },
         attempt_numbering: "continuous-1-based".to_string(),
-        evidence_bundle_schema: "mida.oreans-evidence-bundle/v2".to_string(),
-        gate_schema: "mida.oreans-two-sample-gate/v8".to_string(),
+        evidence_bundle_schema: evidence_bundle_schema_for_family(family),
+        gate_schema: gate_schema_for_family(family),
         env_allowlist: vec!["CARGO_TARGET_DIR".to_string()],
     }
 }
 
-/// The fixed-mode expectation for one protected input: the frozen policy
-/// with the Origin Macro pure-rebuild default (D3) resolved for `input`.
-/// This is what the launch boundary compares the actual policy against —
-/// the Origin default is part of the configuration identity, so an envelope
-/// staged for `pure_rebuild=false` can never authorize a run that silently
-/// resolves to `true` (and vice versa).
+/// The fixed-mode expectation for one protected input under the Oreans family:
+/// the frozen policy with the Origin Macro pure-rebuild default (D3) resolved
+/// for `input`. This is what the launch boundary compares the actual policy
+/// against — the Origin default is part of the configuration identity, so an
+/// envelope staged for `pure_rebuild=false` can never authorize a run that
+/// silently resolves to `true` (and vice versa).
 #[must_use]
 pub fn frozen_run_policy(input: &Path) -> RunnerConfig {
     let mut policy = frozen_runner_config();
+    let (pure, _) = crate::origin_pure::resolve_pure_rebuild(input, false, false);
+    policy.pure_rebuild = pure;
+    policy
+}
+
+/// Family-aware fixed-mode expectation: the frozen policy for `family` with the
+/// Origin Macro pure-rebuild default resolved for `input`.
+#[must_use]
+pub fn frozen_run_policy_for_family(input: &Path, family: &str) -> RunnerConfig {
+    let mut policy = frozen_runner_config_for_family(family);
     let (pure, _) = crate::origin_pure::resolve_pure_rebuild(input, false, false);
     policy.pure_rebuild = pure;
     policy
@@ -167,6 +258,12 @@ pub fn frozen_run_policy(input: &Path) -> RunnerConfig {
 /// except the runtime-filled `tool_revision` / `cli_binary_sha256`. Returns
 /// the first divergence reason, or `None` when the policies match.
 pub fn policy_matches(actual: &RunnerConfig, expected: &RunnerConfig) -> Option<String> {
+    if actual.packer_family != expected.packer_family {
+        return Some(format!(
+            "packer_family {:?} != fixed-mode {:?}",
+            actual.packer_family, expected.packer_family
+        ));
+    }
     if actual.features != expected.features {
         return Some(format!(
             "features {:?} != fixed-mode {:?}",
@@ -453,5 +550,86 @@ mod tests {
             profile_id(DumpProfile::AhkGtoExperimental),
             "ahk-gto-experimental"
         );
+    }
+
+    /// G2: the family is part of the config identity. GTO and Oreans must have
+    /// distinguishable features, frozen policies, and runner digests.
+    #[test]
+    fn gto_and_oreans_policies_and_digests_differ() {
+        let oreans = runner_config_from_unpack_args(
+            OepPolicy::Captured,
+            ContainerRestoreMode::Off,
+            DumpProfile::AhkGtoExperimental,
+            true,
+            false,
+            false,
+            "",
+            "rev",
+            &"a".repeat(64),
+        );
+        let gto = runner_config_from_unpack_args_family(
+            packer_family::AHK_GTO,
+            OepPolicy::Captured,
+            ContainerRestoreMode::Off,
+            DumpProfile::AhkGtoExperimental,
+            true,
+            false,
+            false,
+            "",
+            "rev",
+            &"a".repeat(64),
+        );
+        assert_eq!(oreans.packer_family, packer_family::OREANS);
+        assert_eq!(gto.packer_family, packer_family::AHK_GTO);
+        // Feature identity differs because family is a feature marker.
+        assert_ne!(oreans.features, gto.features);
+        assert!(oreans.features.iter().any(|f| f == "family=oreans_themida"));
+        assert!(gto.features.iter().any(|f| f == "family=ahk_gto"));
+        // Evidence/gate schema differ (Oreans keeps v2/v8; GTO is generic).
+        assert_eq!(
+            oreans.evidence_bundle_schema,
+            "mida.oreans-evidence-bundle/v2"
+        );
+        assert_eq!(gto.evidence_bundle_schema, "mida.unpack-evidence-bundle/v1");
+        assert_eq!(oreans.gate_schema, "mida.oreans-two-sample-gate/v8");
+        // Digests differ.
+        assert_ne!(
+            mida_core::runner_config::runner_config_digest(&oreans),
+            mida_core::runner_config::runner_config_digest(&gto)
+        );
+    }
+
+    /// G2: the frozen fixed-mode policies (and their digests) differ by family.
+    #[test]
+    fn frozen_policies_differ_by_family() {
+        let oreans = frozen_runner_config_for_family(packer_family::OREANS);
+        let gto = frozen_runner_config_for_family(packer_family::AHK_GTO);
+        assert_eq!(oreans.packer_family, packer_family::OREANS);
+        assert_eq!(gto.packer_family, packer_family::AHK_GTO);
+        assert_ne!(
+            mida_core::runner_config::runner_config_digest(&oreans),
+            mida_core::runner_config::runner_config_digest(&gto)
+        );
+        assert_eq!(
+            frozen_runner_config().packer_family,
+            packer_family::OREANS,
+            "the no-arg frozen builder remains the Oreans wrapper"
+        );
+        // policy_matches treats family as binding (fail-closed on cross-family).
+        let mut gto2 = oreans.clone();
+        gto2.packer_family = packer_family::AHK_GTO.to_string();
+        assert!(
+            policy_matches(&gto2, &oreans)
+                .unwrap()
+                .contains("packer_family"),
+            "a GTO policy must never match the Oreans frozen policy"
+        );
+    }
+
+    /// G2: schema resolution for unknown families fails closed.
+    #[test]
+    fn unknown_family_fails_closed_on_schema_resolution() {
+        assert_eq!(evidence_bundle_schema_for_family("bogus"), "");
+        assert_eq!(gate_schema_for_family("bogus"), "");
     }
 }

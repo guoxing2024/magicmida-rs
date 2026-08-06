@@ -738,11 +738,19 @@ pub struct RunEvidenceContext {
     protected_input: PathBuf,
     candidate: PathBuf,
     cli_binary_sha256: String,
+    /// Packer family this run belongs to (`oreans_themida` or `ahk_gto`).
+    /// Drives the evidence-contract family dispatch.
+    packer_family: String,
 }
 
 impl RunEvidenceContext {
     /// Internal constructor — reachable only from crate-internal code (the
     /// attestation) and crate unit tests. Never a public forgery entry.
+    ///
+    /// Oreans-compat wrapper: binds the Oreans family, matching the pre-G2
+    /// behaviour. Kept so the family-less legacy API and its tests remain
+    /// valid; G2 attestation uses [`RunEvidenceContext::new_with_family`].
+    #[allow(dead_code)] // legacy family-less wrapper; used by Oreans tests.
     pub(crate) fn new(
         case_id: String,
         tool_revision: String,
@@ -752,6 +760,35 @@ impl RunEvidenceContext {
         candidate: PathBuf,
         cli_binary_sha256: String,
     ) -> anyhow::Result<RunEvidenceContext> {
+        Self::new_with_family(
+            mida_core::runner_config::packer_family::OREANS.to_string(),
+            case_id,
+            tool_revision,
+            runner_config_digest,
+            verifier_sha256,
+            protected_input,
+            candidate,
+            cli_binary_sha256,
+        )
+    }
+
+    /// Internal constructor that additionally binds the packer family. The
+    /// family-less [`RunEvidenceContext::new`] is preserved as an Oreans-compat
+    /// wrapper. GTO runs bind `ahk_gto` explicitly so their generic evidence
+    /// contract is selected.
+    pub(crate) fn new_with_family(
+        packer_family: String,
+        case_id: String,
+        tool_revision: String,
+        runner_config_digest: String,
+        verifier_sha256: String,
+        protected_input: PathBuf,
+        candidate: PathBuf,
+        cli_binary_sha256: String,
+    ) -> anyhow::Result<RunEvidenceContext> {
+        if packer_family.trim().is_empty() {
+            bail!("RunEvidenceContext packer_family must be non-empty");
+        }
         if case_id.trim().is_empty() {
             bail!("RunEvidenceContext case_id must be non-empty");
         }
@@ -775,6 +812,44 @@ impl RunEvidenceContext {
             protected_input,
             candidate,
             cli_binary_sha256: cli_binary_sha256.to_lowercase(),
+            packer_family,
+        })
+    }
+
+    /// The attested packer family (Oreans-compat default when unbound).
+    pub fn packer_family(&self) -> &str {
+        &self.packer_family
+    }
+
+    /// Rebind the attested context to an explicit packer family. Consumed BY
+    /// VALUE (single-use): the launch attestation authorizes one evidence
+    /// bundle, and rebinding happens exactly once — after the PE-level family
+    /// identity is known but before any evidence is emitted. The family must
+    /// be non-empty and a recognized contract family; an unknown family fails
+    /// closed so the evidence never lands on the wrong contract.
+    ///
+    /// G2: the launch boundary attests a run before the packer family is
+    /// identified (the input is not yet parsed), so the context starts on the
+    /// Oreans-compat family; once `dual_select_packer` identifies GTO, the
+    /// caller rebinds to `ahk_gto` so the evidence routes to the generic
+    /// `mida.unpack-evidence-bundle/v1` contract.
+    pub(crate) fn rebind_family(self, family: &str) -> anyhow::Result<RunEvidenceContext> {
+        if family.trim().is_empty() {
+            bail!("RunEvidenceContext rebind family must be non-empty");
+        }
+        use crate::run_spec;
+        if run_spec::evidence_bundle_schema_for_family(family).is_empty() {
+            bail!("cannot rebind evidence context to unknown packer family {family:?}");
+        }
+        Ok(RunEvidenceContext {
+            case_id: self.case_id,
+            tool_revision: self.tool_revision,
+            runner_config_digest: self.runner_config_digest,
+            verifier_sha256: self.verifier_sha256,
+            protected_input: self.protected_input,
+            candidate: self.candidate,
+            cli_binary_sha256: self.cli_binary_sha256,
+            packer_family: family.to_string(),
         })
     }
 
@@ -883,6 +958,7 @@ pub fn canonicalize_loose(p: &Path) -> PathBuf {
 pub fn attest_ready_before_launch(
     output_dir: &Path,
     ctx: &LaunchAttestationContext<'_>,
+    family: &str,
 ) -> anyhow::Result<RunEvidenceContext> {
     let envelope = RunnerConfigEnvelope::read(output_dir)?;
     if envelope.schema != RUNNER_CONFIG_ENVELOPE_SCHEMA_REF {
@@ -1033,7 +1109,8 @@ pub fn attest_ready_before_launch(
     // P6.3.3: the digest is the SELECTED case's digest (never a shared or
     // another case's digest) — it flows into the bundle for this case.
     let digest = envelope_case_runner_config_digest(output_dir, &current_identity)?;
-    let context = RunEvidenceContext::new(
+    let context = RunEvidenceContext::new_with_family(
+        family.to_string(),
         target_case_id,
         envelope.tool_revision.clone(),
         digest,
@@ -1260,6 +1337,11 @@ fn emit_pe_evidence(candidate: &Path, destination: &Path) -> anyhow::Result<()> 
 /// context. The bundle's runner-config digest always equals the launch
 /// attestation digest.
 ///
+/// G2 family dispatch: the family bound by the attested context selects the
+/// evidence contract — `oreans_themida` → `mida.oreans-evidence-bundle/v2`,
+/// `ahk_gto` → the generic `mida.unpack-evidence-bundle/v1`. GTO products are
+/// never assembled as Oreans evidence. An unknown family fails closed.
+///
 /// `context` is consumed BY VALUE (P6.3.1): the type is not `Clone` and has
 /// no public constructor, so one attestation authorizes exactly one bundle.
 /// `candidate` is the actual run output path (member files live next to
@@ -1269,6 +1351,8 @@ pub fn complete_run_evidence(
     context: RunEvidenceContext,
     candidate: &Path,
 ) -> anyhow::Result<PathBuf> {
+    use mida_core::runner_config::packer_family;
+
     // P6.3.2: the PE-evidence verifier must be the attested CLI-sibling
     // identity (path + hash) — no env, no caller path, no PATH.
     verify_bundle_verifier_identity(&context)?;
@@ -1285,7 +1369,6 @@ pub fn complete_run_evidence(
             );
         }
     }
-    let bundle_output = candidate.with_extension("bundle.json");
     let emitted_at = {
         use std::time::{SystemTime, UNIX_EPOCH};
         let secs = SystemTime::now()
@@ -1294,15 +1377,38 @@ pub fn complete_run_evidence(
             .as_secs();
         format!("{secs}")
     };
-    let request = crate::unpacker::bundle_assembler::AssembleRequest {
-        emitted_at,
-        protected_input: context.protected_input().to_path_buf(),
-        candidate: context.candidate().to_path_buf(),
-        members,
-        output: bundle_output.clone(),
-    };
-    crate::unpacker::bundle_assembler::assemble_evidence_bundle(&request, context)?;
-    Ok(bundle_output)
+
+    match context.packer_family() {
+        family if family == packer_family::OREANS => {
+            let bundle_output = candidate.with_extension("bundle.json");
+            let request = crate::unpacker::bundle_assembler::AssembleRequest {
+                emitted_at,
+                protected_input: context.protected_input().to_path_buf(),
+                candidate: context.candidate().to_path_buf(),
+                members,
+                output: bundle_output.clone(),
+            };
+            crate::unpacker::bundle_assembler::assemble_evidence_bundle(&request, context)?;
+            Ok(bundle_output)
+        }
+        family if family == packer_family::AHK_GTO => {
+            let bundle_output = candidate.with_extension("unpack_bundle.json");
+            let request = crate::unpacker::generic_bundle_assembler::AssembleRequest {
+                emitted_at,
+                protected_input: context.protected_input().to_path_buf(),
+                candidate: context.candidate().to_path_buf(),
+                members,
+                output: bundle_output.clone(),
+            };
+            crate::unpacker::generic_bundle_assembler::assemble_generic_evidence_bundle(
+                &request, context,
+            )?;
+            Ok(bundle_output)
+        }
+        other => bail!(
+            "unknown packer_family {other:?}; cannot choose an evidence contract (fail-closed)"
+        ),
+    }
 }
 
 /// Fail closed unless the verifier this bundle run would use is the unique
@@ -1827,6 +1933,232 @@ mod tests {
         tampered.case_configs[0].runner_config_digest = "e".repeat(64);
         tampered.case_set_digest = case_set_digest(&tampered.case_configs);
         assert_ne!(tampered.case_set_digest, env.case_set_digest);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ---------------------------------------------------------------------
+    // G2: family-agnostic generic evidence contract — producer -> consumer
+    // round-trip, run entirely offline with synthetic member sidecars. Uses
+    // the real `generic_bundle_assembler` (producer) and the independent
+    // `mida-acceptance` consumer, proving the two implementations agree.
+    // ---------------------------------------------------------------------
+
+    /// Build the JSON bytes of one family-agnostic sidecar member with the
+    /// identities embedded exactly as the producer's `check_embedded_identity`
+    /// (and the consumer's `check_sidecar_identity`) require.
+    fn g2_sidecar(
+        schema: &str,
+        protected: Option<(String, u64)>,
+        candidate: (String, u64),
+    ) -> Vec<u8> {
+        let mut obj = serde_json::json!({
+            "schema_version": schema,
+            "candidate": { "sha256": candidate.0, "size_bytes": candidate.1 },
+        });
+        if let Some((sha, size)) = protected {
+            obj["protected_input"] = serde_json::json!({ "sha256": sha, "size_bytes": size });
+        }
+        serde_json::to_vec(&obj).unwrap()
+    }
+
+    fn g2_transform_manifest(candidate: (String, u64)) -> Vec<u8> {
+        serde_json::json!({
+            "schema_version": "mida.transform-manifest/v0",
+            "taxonomy_version": "mida.transform-taxonomy/v1",
+            "candidate_sha256": candidate.0,
+            "candidate_size_bytes": candidate.1,
+            "entries": [],
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    /// Produce a GTO-family generic bundle from synthetic inputs via the real
+    /// producer, then hand the emitted manifest + member bytes to the
+    /// `mida-acceptance` consumer. Returns the consumer verdict.
+    fn g2_produce_and_consume(dir: &std::path::Path) -> mida_acceptance::UnpackBundleVerdict {
+        use crate::unpacker::generic_bundle_assembler::{
+            assemble_generic_evidence_bundle, AssembleRequest,
+        };
+
+        let protected_path = dir.join("protected.bin");
+        let candidate_path = dir.join("candidate.bin");
+        let protected_bytes = b"G2-PROTECTED-INPUT-00000000000000";
+        let candidate_bytes = b"G2-CANDIDATE-OUTPUT-000000000000000";
+        write(&protected_path, protected_bytes);
+        write(&candidate_path, candidate_bytes);
+        let protected_sha = sha256_hex(protected_bytes);
+        let candidate_sha = sha256_hex(candidate_bytes);
+        let protected = (protected_sha.clone(), protected_bytes.len() as u64);
+        let candidate = (candidate_sha.clone(), candidate_bytes.len() as u64);
+
+        // Build the 7 member files with their exact family-agnostic schemas.
+        let evidence_dir = dir.join("evidence");
+        std::fs::create_dir_all(&evidence_dir).unwrap();
+        let member_specs: Vec<(&str, &str, bool)> = vec![
+            ("oep_evidence", "mida.oreans-oep-evidence/v1", true),
+            ("iat_evidence", "mida.oreans-iat-evidence/v1", true),
+            ("tls_evidence", "mida.oreans-tls-evidence/v1", true),
+            (
+                "relocation_evidence",
+                "mida.oreans-relocation-evidence/v1",
+                true,
+            ),
+            (
+                "section_rebuild_evidence",
+                "mida.oreans-section-rebuild-evidence/v1",
+                true,
+            ),
+            ("pe_evidence", "mida.oreans-pe-evidence/v1", false),
+            ("transform_manifest", "mida.transform-manifest/v0", false),
+        ];
+        let mut members = Vec::new();
+        for (name, schema, has_protected) in &member_specs {
+            let path = evidence_dir.join(format!("{name}.json"));
+            let bytes = if *name == "transform_manifest" {
+                g2_transform_manifest(candidate.clone())
+            } else {
+                g2_sidecar(
+                    schema,
+                    if *has_protected {
+                        Some(protected.clone())
+                    } else {
+                        None
+                    },
+                    candidate.clone(),
+                )
+            };
+            write(&path, &bytes);
+            members.push((name.to_string(), path));
+        }
+
+        let context = RunEvidenceContext::new_with_family(
+            mida_core::runner_config::packer_family::AHK_GTO.to_string(),
+            "gto_launcher".to_string(),
+            "oreans/two-sample-mainline@test".to_string(),
+            "ab12".repeat(16),
+            "cd34".repeat(16),
+            protected_path,
+            candidate_path.clone(),
+            "ef56".repeat(16),
+        )
+        .expect("GTO evidence context builds");
+
+        let output = evidence_dir.join("unpack_bundle.json");
+        let request = AssembleRequest {
+            emitted_at: "2026-08-04T12:00:00Z".to_string(),
+            protected_input: dir.join("protected.bin"),
+            candidate: candidate_path.clone(),
+            members: members.clone(),
+            output: output.clone(),
+        };
+        assemble_generic_evidence_bundle(&request, context)
+            .expect("producer assembles generic bundle");
+
+        // Consumer side: read the emitted manifest + member bytes.
+        let raw = std::fs::read_to_string(&output).unwrap();
+        let bundle: mida_acceptance::UnpackEvidenceBundle =
+            serde_json::from_str(&raw).expect("consumer parses emitted manifest");
+        let mut files: std::collections::BTreeMap<String, Vec<u8>> =
+            std::collections::BTreeMap::new();
+        for m in &bundle.members {
+            let src = evidence_dir.join(&m.relative_path);
+            files.insert(m.name.clone(), std::fs::read(&src).unwrap());
+        }
+        mida_acceptance::validate_unpack_bundle(&bundle, &files)
+    }
+
+    /// Read the emitted generic bundle manifest back from the producer output.
+    fn g2_read_emitted_bundle(dir: &std::path::Path) -> mida_acceptance::UnpackEvidenceBundle {
+        let raw = std::fs::read_to_string(dir.join("evidence/unpack_bundle.json")).unwrap();
+        serde_json::from_str(&raw).expect("consumer parses emitted generic manifest")
+    }
+
+    /// Reconstruct the consumer `files` map from the emitted manifest's member
+    /// paths (the member files live next to the emitted bundle).
+    fn g2_member_files(
+        dir: &std::path::Path,
+        bundle: &mida_acceptance::UnpackEvidenceBundle,
+    ) -> std::collections::BTreeMap<String, Vec<u8>> {
+        let evidence_dir = dir.join("evidence");
+        let mut files = std::collections::BTreeMap::new();
+        for m in &bundle.members {
+            let src = evidence_dir.join(&m.relative_path);
+            files.insert(m.name.clone(), std::fs::read(&src).unwrap());
+        }
+        files
+    }
+
+    #[test]
+    fn g2_generic_bundle_producer_consumer_round_trip_is_valid() {
+        let dir = temp_dir("g2_roundtrip");
+        let verdict = g2_produce_and_consume(&dir);
+        assert!(
+            verdict.valid && verdict.complete,
+            "producer output must be accepted by consumer: {:?}",
+            verdict.reasons
+        );
+        // The high-level `consume_unpack_bundle` seam also accepts it.
+        let bundle = g2_read_emitted_bundle(&dir);
+        let files = g2_member_files(&dir, &bundle);
+        assert!(
+            mida_acceptance::consume_unpack_bundle(&bundle, &files).is_ok(),
+            "consume_unpack_bundle must accept producer output"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn g2_oreans_v2_evidence_is_rejected_by_generic_consumer() {
+        // An Oreans v2 manifest (v2 schema id, no family_id) must be refused by
+        // the generic consumer: it cannot even deserialize (family_id required +
+        // deny_unknown_fields), and a family-less/wrong-schema manifest is
+        // rejected at the schema seam. This is the "Oreans evidence disguised as
+        // GTO generic evidence" cross-contamination rejection.
+        let dir = temp_dir("g2_oreans_reject");
+        // Mimic the exact Oreans v2 bundle wire form (see
+        // mida_acceptance::OreansEvidenceBundle) without family_id.
+        let oreans_json = serde_json::json!({
+            "schema_version": "mida.oreans-evidence-bundle/v2",
+            "case_id": "origin_macro",
+            "tool_revision": "rev",
+            "runner_config_digest": "ab12".repeat(16),
+            "emitted_at": "2026-08-04T12:00:00Z",
+            "completion_marker": { "state": "complete" },
+            "protected_input": { "sha256": "a".repeat(64), "size_bytes": 10 },
+            "candidate": { "sha256": "b".repeat(64), "size_bytes": 20 },
+            "members_sha256": "c".repeat(64),
+            "manifest_sha256": "d".repeat(64),
+            "members": [],
+        });
+        let parsed = serde_json::from_value::<mida_acceptance::UnpackEvidenceBundle>(oreans_json);
+        assert!(
+            parsed.is_err(),
+            "an Oreans v2 manifest must not parse as a generic bundle (fail-closed)"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn g2_generic_evidence_is_rejected_by_oreans_consumer() {
+        // Conversely, a GTO generic bundle must never be accepted as Oreans
+        // evidence. The Oreans consumer type is family-agnostic-neutral but the
+        // schema id differs, so a generic manifest cannot deserialize into
+        // `mida_acceptance::OreansEvidenceBundle`.
+        let dir = temp_dir("g2_generic_as_oreans");
+        // Emit a real GTO generic bundle via the producer.
+        let verdict = g2_produce_and_consume(&dir);
+        assert!(
+            verdict.valid,
+            "sanity: the same producer output is a valid generic bundle"
+        );
+        // The emitted manifest JSON cannot parse as an Oreans v2 bundle.
+        let raw = std::fs::read_to_string(dir.join("evidence/unpack_bundle.json")).unwrap();
+        let as_oreans = serde_json::from_str::<mida_acceptance::OreansEvidenceBundle>(&raw);
+        assert!(
+            as_oreans.is_err(),
+            "a GTO generic bundle must never deserialize as Oreans evidence (fail-closed)"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

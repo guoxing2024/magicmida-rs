@@ -35,6 +35,52 @@ fn config_json(features: &[&str], oep_policy: &str, env: &[&str]) -> serde_json:
     })
 }
 
+/// Family-less legacy JSON must parse identically on both sides (Oreans
+/// default) and a family-less config must produce a DIFFERENT digest from the
+/// same config carrying the GTO family — on both the producer and the verifier.
+#[test]
+fn gto_and_oreans_digests_differ_on_both_sides() {
+    let legacy = config_json(&["default"], "captured", &["CARGO_TARGET_DIR"]);
+    let legacy_json = serde_json::to_string(&legacy).unwrap();
+    let r_legacy: mida_core::runner_config::RunnerConfig =
+        serde_json::from_str(&legacy_json).expect("family-less parses on runner side");
+    let v_legacy: mida_acceptance::RunnerConfig =
+        serde_json::from_str(&legacy_json).expect("family-less parses on verifier side");
+    assert_eq!(r_legacy.packer_family, "oreans_themida");
+    assert_eq!(v_legacy.packer_family, "oreans_themida");
+
+    // Explicit GTO family (same everything else) must change the digest on BOTH
+    // independent implementations — the frozen GTO policy never equals the
+    // frozen Oreans policy.
+    let mut gto = config_json(&["default"], "captured", &["CARGO_TARGET_DIR"]);
+    gto["packer_family"] = json!("ahk_gto");
+    let gto_json = serde_json::to_string(&gto).unwrap();
+    let r_gto: mida_core::runner_config::RunnerConfig =
+        serde_json::from_str(&gto_json).expect("GTO parses on runner side");
+    let v_gto: mida_acceptance::RunnerConfig =
+        serde_json::from_str(&gto_json).expect("GTO parses on verifier side");
+    assert_eq!(r_gto.packer_family, "ahk_gto");
+
+    // Producer and verifier agree on each digest...
+    assert_eq!(
+        mida_core::runner_config::runner_config_digest(&r_legacy),
+        mida_acceptance::runner_config_digest(&v_legacy)
+    );
+    assert_eq!(
+        mida_core::runner_config::runner_config_digest(&r_gto),
+        mida_acceptance::runner_config_digest(&v_gto)
+    );
+    // ...and Oreans vs GTO differ on both sides.
+    assert_ne!(
+        mida_core::runner_config::runner_config_digest(&r_legacy),
+        mida_core::runner_config::runner_config_digest(&r_gto)
+    );
+    assert_ne!(
+        mida_acceptance::runner_config_digest(&v_legacy),
+        mida_acceptance::runner_config_digest(&v_gto)
+    );
+}
+
 /// Both implementations must produce the identical canonical digest for the
 /// same emitted JSON config.
 #[test]
