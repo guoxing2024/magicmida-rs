@@ -57,7 +57,7 @@ pub use iat::{
     detect_compiler, determine_iat_address, fix_iat, fixup_api_call_sites, CompilerHint,
     IatFixStrategy, IatLocation,
 };
-pub use init::{init_pe_details, locate_themida_section, ThemidaPeInfo};
+pub use init::{init_pe_details, locate_themida_section, themida_pe_info_basic, ThemidaPeInfo};
 pub use oep::{
     cookie_complement_from_security_init_xrefs, decode_msvc_oep_wrapper, encode_msvc_oep_wrapper,
     find_cookie_complement_site, find_real_oep_by_scanning, find_real_oep_in_bytes,

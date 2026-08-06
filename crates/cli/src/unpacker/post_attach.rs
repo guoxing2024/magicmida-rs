@@ -48,6 +48,33 @@ pub(super) fn run_post_attach_path(
     input: &Path,
     output_path: &Path,
 ) -> Result<(), anyhow::Error> {
+    // G1: shared post-attach skeleton. The observation stage is the only
+    // family-specific decision point — AHK/GTO uses its own observation policy
+    // (UI / multi-section watch / no-bypass), Oreans uses the plain-.text
+    // freeze. Everything downstream (provenance, milestones, dump via
+    // `run_post_loop_phases`) is shared.
+    if uses_gto_observation(packer.family_id()) {
+        return run_gto_post_attach(
+            dbg,
+            state,
+            pe,
+            packer,
+            plugin_ctx,
+            early_section_snapshots,
+            is_dotnet,
+            is_64bit,
+            do_data_sections,
+            shrink,
+            oep_policy,
+            container_restore,
+            profile,
+            pure_rebuild,
+            capture_policy,
+            input,
+            output_path,
+        );
+    }
+
     let image_base_usize = dbg.image_base() as usize;
     let text_sec = &state.pe_info.pe_sections[0];
     let text_start = image_base_usize + text_sec.virtual_address as usize;
@@ -347,6 +374,138 @@ pub(super) fn run_post_attach_path(
     return Ok(());
 }
 
+/// AHK/GTO variant of the shared post-attach skeleton (G1).
+///
+/// Uses the GTO observation policy ([`crate::unpacker::gto_host::observe_gto`])
+/// instead of the Oreans plain-`.text` freeze, then shares the exact same
+/// provenance / milestones / `run_post_loop_phases` dump path as Oreans. The
+/// GTO dump therefore uses the shared post-loop skeleton; the heavyweight
+/// experimental dump stages remain gated by [`DumpProfile::AhkGtoExperimental`]
+/// and the `gto-product-recovery` feature.
+#[allow(clippy::too_many_arguments)]
+#[allow(unreachable_code)]
+#[allow(unused_mut)]
+fn run_gto_post_attach(
+    mut dbg: &mut ProcessSession,
+    mut state: &mut ThemidaState,
+    mut pe: &mut PeHeader,
+    mut packer: &mut SelectedPacker,
+    mut plugin_ctx: &mut PluginCtx,
+    early_section_snapshots: &mut Vec<EarlySectionSnapshot>,
+    is_dotnet: bool,
+    is_64bit: bool,
+    do_data_sections: bool,
+    shrink: bool,
+    oep_policy: OepPolicy,
+    container_restore: ContainerRestoreMode,
+    profile: DumpProfile,
+    pure_rebuild: bool,
+    capture_policy: mida_pe::DumpCapturePolicy,
+    input: &Path,
+    output_path: &Path,
+) -> Result<(), anyhow::Error> {
+    use crate::log::{self, LogType};
+
+    // G1: GTO routing is shared with Oreans (GTO can be recognized and routed
+    // in the default build), but the heavyweight GTO recovery execution stays
+    // explicitly opt-in. Without `--features gto-product-recovery` the shared
+    // GTO post-attach path fails closed with a clear error rather than
+    // silently running the experimental dump stages. The
+    // `--profile=ahk-gto-experimental` profile additionally gates the
+    // experimental dump capabilities inside the shared post-loop.
+    #[cfg(not(feature = "gto-product-recovery"))]
+    {
+        let _ = (
+            dbg,
+            state,
+            pe,
+            packer,
+            plugin_ctx,
+            early_section_snapshots,
+            is_dotnet,
+            is_64bit,
+            do_data_sections,
+            shrink,
+            oep_policy,
+            container_restore,
+            profile,
+            pure_rebuild,
+            capture_policy,
+            input,
+            output_path,
+        );
+        return Err(anyhow!(
+            "GTO recovery route is disabled in the default build; \
+             rebuild mida-cli with --features gto-product-recovery to opt in"
+        ));
+    }
+
+    let observation = super::gto_host::observe_gto(dbg, pe, profile, early_section_snapshots)?;
+    let oep_addr = observation.oep_addr;
+    let frozen_rip = observation.frozen_rip;
+
+    refresh_early_snapshots_after_loader(dbg, early_section_snapshots)?;
+    merge_reinitializable_data_state(dbg, early_section_snapshots, pe.size_of_image() as usize)?;
+    log_snapshot_summary(early_section_snapshots, "GTO pre-.text baseline");
+
+    log::log(
+        LogType::Info,
+        "GTO post-attach: process observed — proceeding to shared IAT repair + dump",
+    );
+
+    // Shared downstream: OEP provenance, plugin milestones, then the same
+    // `run_post_loop_phases` used by Oreans.
+    plugin_ctx.ensure_runtime_base(dbg.image_base());
+    let fallback_evidence = Some(format!(
+        "GTO post-attach observation selected OEP VA {oep_addr:#x}"
+    ));
+    let provenance = post_attach_oep_provenance(frozen_rip, oep_addr, fallback_evidence);
+    packer.note_oep_accepted(&mut plugin_ctx, oep_addr as u64, frozen_rip.is_none());
+    plugin_ctx.record_oep_provenance(provenance);
+    let post_attach_advice = enter_dump_phase(
+        &mut packer,
+        &mut plugin_ctx,
+        "PackerPlugin dump_advice (GTO post-attach)",
+    );
+
+    run_post_loop_phases(
+        &mut dbg,
+        &mut state,
+        &mut pe,
+        Some(oep_addr),
+        is_dotnet,
+        is_64bit,
+        do_data_sections,
+        shrink,
+        true,                           // post-attach mode
+        false,                          // process still attached
+        packer.uses_oreans_iat_trace(), // false for ahk_gto → live IAT rebuild at dump
+        packer.family_id(),
+        oep_policy,
+        container_restore,
+        profile,
+        pure_rebuild,
+        capture_policy,
+        early_section_snapshots,
+        input,
+        output_path,
+        plugin_ctx.oep_rva,
+        &plugin_ctx.oep_provenance,
+        post_attach_advice,
+    )?;
+
+    log::log(LogType::Good, "Done.");
+    Ok(())
+}
+
+/// Whether the shared post-attach skeleton should use the GTO observation
+/// policy instead of the Oreans plain-`.text` freeze. This is the single
+/// family-specific decision point in the shared post-attach path (G1).
+#[must_use]
+fn uses_gto_observation(family_id: &str) -> bool {
+    family_id == "ahk_gto"
+}
+
 fn post_attach_oep_provenance(
     frozen_rip: Option<usize>,
     oep_addr: usize,
@@ -393,5 +552,15 @@ mod tests {
         assert!(!provenance.application_oep);
         assert!(provenance.bootstrap_or_ambiguous);
         assert!(!provenance.application_oep_prerequisite_passes());
+    }
+
+    // G1: the shared post-attach skeleton routes GTO to the GTO observation
+    // policy and Oreans to the Oreans policy — the two families do not pollute
+    // each other, and GTO is a shared-skeleton route, not a separate host.
+    #[test]
+    fn uses_gto_observation_routes_ahk_gto_only() {
+        assert!(uses_gto_observation("ahk_gto"));
+        assert!(!uses_gto_observation("oreans_themida"));
+        assert!(!uses_gto_observation("null"));
     }
 }

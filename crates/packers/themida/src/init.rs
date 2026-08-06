@@ -145,6 +145,42 @@ pub fn init_pe_details(
     })
 }
 
+/// Build a minimal [`ThemidaPeInfo`] directly from a PE header without the
+/// Oreans-specific assumptions of [`init_pe_details`].
+///
+/// Used by non-Oreans families (currently AHK/GTO) that share the post-attach
+/// / post-loop skeleton but do not run Themida version detection, virtualised
+/// OEP checks, or Themida section location. Version stays [`ThemidaVersion::Unknown`],
+/// no Themida section, `is_vm_oep=false`, and no TLS callback guess. This is
+/// layout plumbing only; family policy still decides how the sample is observed
+/// and dumped.
+#[must_use]
+pub fn themida_pe_info_basic(pe: &PeHeader, is_64bit: bool) -> ThemidaPeInfo {
+    let image_base = pe.image_base;
+    let image_boundary = image_base + u64::from(pe.size_of_image());
+    let base_of_data = if is_64bit {
+        let first_section = pe.sections.first().map(|s| s.virtual_address).unwrap_or(0);
+        u64::from(first_section) + u64::from(pe.nt_headers.optional_header.size_of_code)
+    } else {
+        pe.nt_headers
+            .optional_header
+            .base_of_data
+            .map(u64::from)
+            .unwrap_or(0)
+    };
+    ThemidaPeInfo {
+        image_base,
+        image_boundary,
+        base_of_data,
+        pe_sections: pe.sections.clone(),
+        major_linker_version: pe.nt_headers.optional_header.major_linker_version,
+        themida_version: version::ThemidaVersion::Unknown,
+        is_vm_oep: false,
+        themida_section: None,
+        tls_total: 0,
+    }
+}
+
 /// Walk the section table and return the index of the section most likely to
 /// be the Themida protection stub.
 ///

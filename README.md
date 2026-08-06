@@ -70,30 +70,37 @@ that makes a run record auditable is defined in
 **Current status: not closed; this README makes no claim of perfect or
 universal unpacking.**
 
-### GTO default entry (G0)
+### GTO default entry (G0) and shared mainline skeleton (G1)
 
-`gto_launcher` is now a first-class sample in the **default build**: the
+`gto_launcher` is a first-class sample in the **default build**: the
 `mida-packers-ahk-gto` plugin is a workspace member and `mida-cli` default
 build, so a GTO-shaped layout (`.KI3` entry section, scrambled section names,
 numbered `.data0`/`.data1` payload sections) is recognized and routed to the
 `ahk_gto` family by `dual_select_packer` without any feature flag.
 
-This is **recognition and routing only**. The heavyweight GTO recovery route
-(the independent `run_gto_host`, heap/container capture) still requires an
-explicit opt-in:
+Since G1, the GTO family no longer runs a full independent host: it shares the
+same mainline skeleton as Oreans — same `unpack` create-process, same
+post-attach observation loop, same post-loop dump. The only family-specific
+decision point is the observation policy (GTO uses UI-window / multi-section
+watch; Oreans uses the plain-`.text` freeze). GTO-specific policy, profile,
+capture hint, and evidence semantics are preserved in the plugin/policy layer.
 
-- `cargo build -p mida-cli --features gto-product-recovery` to compile the
-  recovery host; and
+Heavyweight GTO recovery still requires explicit opt-in:
+
+- `cargo build -p mida-cli --features gto-product-recovery` for the recovery
+  stages (shared-skeleton GTO path fails closed without it); and
 - `--profile=ahk-gto-experimental` at unpack time for the experimental dump
   stages.
 
 A default-build run that identifies GTO but is not opted in fails closed with a
-clear error rather than silently degrading to a non-GTO path. Default profile
-remains `oreans-classic`; no unpack silently becomes an experimental GTO path.
+clear error rather than silently running the experimental recovery path. Default
+profile remains `oreans-classic`; no unpack silently becomes an experimental
+GTO path.
 
-GTO perfect unpack is **not** closed, and the Oreans `origin_macro` +
-`lunlun_software` regression gate must remain green: GTO work must not break
-that fixed evidence stack.
+GTO perfect unpack is **not** closed — the open work is the recovery itself
+(no-bypass cold-start / heap-rebasing wall), not routing. The Oreans
+`origin_macro` + `lunlun_software` regression gate must remain green: GTO work
+must not break that fixed evidence stack.
 
 ### Acceptance kernel (R0B)
 

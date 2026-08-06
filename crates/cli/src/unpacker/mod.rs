@@ -280,31 +280,12 @@ pub fn unpack(
         }
     }
 
-    // ---- D4: independent GTO host (no ThemidaState) ----
-    // (The Oreans evidence-bundle chain does not apply to the AHK/GTO
-    // product-recovery route; a gated GTO run keeps its attested context
-    // unused.)
-    if selected_family == "ahk_gto" {
-        log::log(
-            LogType::Info,
-            "Routing to independent GTO host (no ThemidaState / init_pe_details)",
-        );
-        return gto_host::run_gto_host(
-            input,
-            output,
-            do_data_sections,
-            shrink,
-            oep_policy,
-            container_restore,
-            profile,
-            pure_rebuild,
-            capture_policy,
-            packer,
-        );
-    }
-
-    // ---- step 3: host PE layout probe (Oreans ThemidaPeInfo host state) ----
-    // Oreans path only from here. Read entry-point bytes for virtualised OEP.
+    // ---- family host PE layout probe (shared post-attach/post-loop skeleton) ----
+    // Both Oreans and AHK/GTO continue down the shared main flow from here
+    // (G1): same create-process, same post-attach observation loop, same
+    // post-loop dump. Family differences are decided in the plugin/policy
+    // layer. Oreans builds full ThemidaPeInfo (version / virtualised OEP /
+    // Themida section); AHK/GTO builds a minimal layout (no Oreans assumptions).
     let ep_offset_val = pe.rva_to_offset(pe.entry_point).unwrap_or(0) as usize;
     let entry_bytes = fs::read(input).ok().and_then(|data| {
         data.get(ep_offset_val..ep_offset_val.saturating_add(8))
@@ -321,8 +302,16 @@ pub fn unpack(
     }
     let entry_bytes_ref = entry_bytes.as_deref();
 
-    let pe_info = init_pe_details(&pe, is_64bit, entry_bytes_ref, Some(input))
-        .map_err(|e| anyhow!("Host PE layout probe failed (family={selected_family}): {e}"))?;
+    let pe_info = if selected_family == "ahk_gto" {
+        log::log(
+            LogType::Info,
+            "GTO family: minimal shared-host PE layout (no Oreans version/OEP probe)",
+        );
+        mida_packers_themida::themida_pe_info_basic(&pe, is_64bit)
+    } else {
+        init_pe_details(&pe, is_64bit, entry_bytes_ref, Some(input))
+            .map_err(|e| anyhow!("Host PE layout probe failed (family={selected_family}): {e}"))?
+    };
 
     log::log(
         LogType::Info,
