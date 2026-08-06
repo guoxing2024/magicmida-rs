@@ -79,8 +79,8 @@ pub mod oreans_gate;
 pub mod oreans_pe_evidence;
 
 pub use bundle_gate::{
-    evaluate_bundle_gate, BundleEnvelopeBinding, BundleGateError, BundleGateReport, BundleInput,
-    BUNDLE_GATE_ID, BUNDLE_GATE_SCHEMA_VERSION,
+    evaluate_bundle_gate, evaluate_bundle_gate_with_manifest, BundleEnvelopeBinding,
+    BundleGateError, BundleGateReport, BundleInput, BUNDLE_GATE_ID, BUNDLE_GATE_SCHEMA_VERSION,
 };
 pub use evidence_bundle::{
     canonical_manifest_hash, canonical_members_hash, validate_evidence_bundle,

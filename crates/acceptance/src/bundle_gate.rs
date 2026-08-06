@@ -28,11 +28,10 @@ use thiserror::Error;
 
 use crate::evidence_bundle::{validate_evidence_bundle, OreansEvidenceBundle};
 use crate::oreans_gate::{
-    evaluate_oreans_two_sample_gate, locked_manifest, OreansArtifactIdentity,
-    OreansBehaviorEvidence, OreansEvidenceRef, OreansFinalBehaviorVerdict, OreansIsolatedReplay,
-    OreansPrerequisites, OreansSampleObservation, OreansTwoSampleGateReport,
-    OREANS_BEHAVIOR_ORACLE_SCHEMA_VERSION, OREANS_ISOLATED_REPLAY_SCHEMA_VERSION,
-    OREANS_PREREQUISITE_EVIDENCE_SCHEMA_VERSION,
+    evaluate_oreans_two_sample_gate, OreansArtifactIdentity, OreansBehaviorEvidence,
+    OreansEvidenceRef, OreansFinalBehaviorVerdict, OreansIsolatedReplay, OreansPrerequisites,
+    OreansSampleObservation, OreansTwoSampleGateReport, OREANS_BEHAVIOR_ORACLE_SCHEMA_VERSION,
+    OREANS_ISOLATED_REPLAY_SCHEMA_VERSION, OREANS_PREREQUISITE_EVIDENCE_SCHEMA_VERSION,
 };
 
 /// Schema id of the bundle-gate report.
@@ -174,10 +173,27 @@ fn parse_observation(
 /// `inputs` must contain exactly one valid envelope per fixed Oreans case.
 /// Any invalid envelope, non-gate case, manifest mismatch, or unparsable
 /// sidecar aborts the whole gate (fail-closed, nothing is reported as
-/// passed).
+/// passed). This is the **production** entry: the locked manifest comes from
+/// the fixed [`crate::oreans_gate::locked_manifest`].
 pub fn evaluate_bundle_gate(
     inputs: &[BundleInput<'_>],
 ) -> Result<BundleGateReport, BundleGateError> {
+    let production_provider = |case_id: &str| crate::oreans_gate::locked_manifest(case_id).cloned();
+    evaluate_bundle_gate_with_manifest(inputs, &production_provider)
+}
+
+/// Pure core with an injected locked-manifest provider (P9-Prep-D #8: hermetic
+/// test fixture dependency injection). Production callers use
+/// [`evaluate_bundle_gate`], which injects the real locked manifest. A provider
+/// returns the locked manifest for a case id (or `None` if the case is not a
+/// fixed Oreans case).
+pub fn evaluate_bundle_gate_with_manifest<F>(
+    inputs: &[BundleInput<'_>],
+    manifest_provider: &F,
+) -> Result<BundleGateReport, BundleGateError>
+where
+    F: Fn(&str) -> Option<crate::oreans_gate::OreansSampleManifestLock>,
+{
     let mut observations = Vec::with_capacity(inputs.len());
     let mut envelopes = Vec::with_capacity(inputs.len());
     for input in inputs {
@@ -185,7 +201,7 @@ pub fn evaluate_bundle_gate(
         if !verdict.valid {
             return Err(BundleGateError::InvalidBundle(verdict.reasons));
         }
-        let manifest = locked_manifest(&input.bundle.case_id)
+        let manifest = manifest_provider(&input.bundle.case_id)
             .ok_or_else(|| BundleGateError::CaseNotAllowed(input.bundle.case_id.clone()))?;
         let protected_matched = input.bundle.protected_input.sha256.to_lowercase()
             == manifest.protected_input_sha256.to_lowercase()

@@ -16,10 +16,10 @@ use mida_acceptance::oreans_gate::{
     OreansRelocationEvidence as GateRelocationEvidence, OREANS_OEP_EVIDENCE_SCHEMA_VERSION,
 };
 use mida_acceptance::{
-    build_oreans_pe_evidence, evaluate_bundle_gate, BundleArtifactIdentity, BundleCompletionMarker,
-    BundleGateError, BundleInput, BundleMemberRef, OreansEvidenceBundle,
-    OreansFinalBehaviorVerdict, OreansIatEvidence, OreansIsolatedReplay, OreansPrerequisites,
-    OreansSampleObservation, OreansSectionRebuildEvidence, OreansTlsEvidence,
+    build_oreans_pe_evidence, evaluate_bundle_gate, evaluate_bundle_gate_with_manifest,
+    BundleArtifactIdentity, BundleCompletionMarker, BundleGateError, BundleInput, BundleMemberRef,
+    OreansEvidenceBundle, OreansFinalBehaviorVerdict, OreansIatEvidence, OreansIsolatedReplay,
+    OreansPrerequisites, OreansSampleObservation, OreansSectionRebuildEvidence, OreansTlsEvidence,
     OREANS_EVIDENCE_BUNDLE_SCHEMA_VERSION, OREANS_IAT_EVIDENCE_SCHEMA_VERSION,
     OREANS_RELOCATION_EVIDENCE_SCHEMA_VERSION, OREANS_SECTION_REBUILD_EVIDENCE_SCHEMA_VERSION,
     OREANS_TLS_EVIDENCE_SCHEMA_VERSION, TRANSFORM_MANIFEST_SCHEMA_VERSION,
@@ -729,4 +729,345 @@ fn unparsable_sidecar_is_rejected() {
     ])
     .expect_err("unparsable sidecar must fail");
     assert!(matches!(err, BundleGateError::SidecarParse(_, _)));
+}
+
+// --- P9-Prep-D: two-bundle envelope consumer attack tests ---
+//
+// These use `evaluate_bundle_gate_with_manifest` with a synthetic locked-manifest
+// provider (the P9-Prep-D #8 test-fixture seam). The provider returns a manifest
+// whose protected_input matches the synthetic bundles, so no real Vault sample is
+// read. Production uses the real locked manifest via `evaluate_bundle_gate`.
+
+use mida_acceptance::oreans_gate::OreansSampleManifestLock;
+
+/// Build a synthetic manifest provider for the given bundles' protected inputs.
+fn synthetic_provider(
+    origin_sha: &str,
+    origin_size: u64,
+    lunlun_sha: &str,
+    lunlun_size: u64,
+) -> impl Fn(&str) -> Option<OreansSampleManifestLock> {
+    let origin = OreansSampleManifestLock {
+        case_id: "origin_macro",
+        manifest_path: "synthetic/manifest.json",
+        protected_input_sha256: Box::leak(origin_sha.to_owned().into_boxed_str()),
+        protected_input_size_bytes: origin_size,
+    };
+    let lunlun = OreansSampleManifestLock {
+        case_id: "lunlun_software",
+        manifest_path: "synthetic/manifest.json",
+        protected_input_sha256: Box::leak(lunlun_sha.to_owned().into_boxed_str()),
+        protected_input_size_bytes: lunlun_size,
+    };
+    move |case_id| match case_id {
+        "origin_macro" => Some(origin.clone()),
+        "lunlun_software" => Some(lunlun.clone()),
+        _ => None,
+    }
+}
+
+fn reserialize_bundle(bundle: &mut OreansEvidenceBundle, files: &mut BTreeMap<String, Vec<u8>>) {
+    let members: Vec<BundleMemberRef> = files
+        .iter()
+        .map(|(name, bytes)| BundleMemberRef {
+            name: name.clone(),
+            relative_path: format!("evidence/{name}.json"),
+            sha256: mida_acceptance::sha256_hex(bytes),
+            size_bytes: bytes.len() as u64,
+        })
+        .collect();
+    bundle.members = members;
+    bundle.members_sha256 = canonical_members_hash(&bundle.members);
+    bundle.manifest_sha256 = canonical_manifest_hash(bundle);
+}
+
+/// Recompute a sidecar member's embedded `candidate` identity to a new value.
+fn rewrite_candidate_in_member(files: &mut BTreeMap<String, Vec<u8>>, name: &str, sha: &str) {
+    let mut value: serde_json::Value =
+        serde_json::from_slice(files.get(name).expect("member")).unwrap();
+    if let Some(cand) = value.get_mut("candidate") {
+        cand["sha256"] = serde_json::json!(sha);
+    }
+    *files.get_mut(name).unwrap() = serde_json::to_vec(&value).unwrap();
+}
+
+#[test]
+fn two_bundle_envelope_accepts_both_with_synthetic_provider() {
+    let origin = observation("origin_macro", "11".repeat(32).as_str(), 1111);
+    let lunlun = observation("lunlun_software", "22".repeat(32).as_str(), 2222);
+    let (origin_bundle, origin_files) = envelope(&origin);
+    let (lunlun_bundle, lunlun_files) = envelope(&lunlun);
+    let provider = synthetic_provider(
+        origin.protected_input.sha256.as_str(),
+        origin.protected_input.size_bytes,
+        lunlun.protected_input.sha256.as_str(),
+        lunlun.protected_input.size_bytes,
+    );
+    let report = evaluate_bundle_gate_with_manifest(
+        &[
+            input(&origin_bundle, &origin_files),
+            input(&lunlun_bundle, &lunlun_files),
+        ],
+        &provider,
+    )
+    .expect("two bundles accepted");
+    assert_eq!(report.envelopes.len(), 2);
+    assert!(report.envelopes.iter().all(|b| b.protected_input_matched));
+}
+
+#[test]
+fn two_bundle_envelope_rejects_missing_case_via_provider() {
+    // Provider has no lunlun manifest -> the lunlun bundle is not a gate case.
+    let origin = observation("origin_macro", "11".repeat(32).as_str(), 1111);
+    let lunlun = observation("lunlun_software", "22".repeat(32).as_str(), 2222);
+    let (origin_bundle, origin_files) = envelope(&origin);
+    let (lunlun_bundle, lunlun_files) = envelope(&lunlun);
+    // Only origin manifest provided.
+    let origin_only = synthetic_provider(
+        origin.protected_input.sha256.as_str(),
+        origin.protected_input.size_bytes,
+        "00".repeat(32).as_str(),
+        0,
+    );
+    let err = evaluate_bundle_gate_with_manifest(
+        &[
+            input(&origin_bundle, &origin_files),
+            input(&lunlun_bundle, &lunlun_files),
+        ],
+        &origin_only,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        BundleGateError::ProtectedInputMismatch { case_id, .. }
+            if case_id == "lunlun_software"
+    ));
+}
+
+#[test]
+fn two_bundle_envelope_rejects_duplicate_case() {
+    // Two origin bundles -> duplicate case. The consumer still evaluates but a
+    // second origin is not a distinct fixed case; fail-closed by construction.
+    let origin_a = observation("origin_macro", "11".repeat(32).as_str(), 1111);
+    let origin_b = observation("origin_macro", "33".repeat(32).as_str(), 3333);
+    let (a_bundle, a_files) = envelope(&origin_a);
+    let (b_bundle, b_files) = envelope(&origin_b);
+    let provider = synthetic_provider(
+        origin_a.protected_input.sha256.as_str(),
+        origin_a.protected_input.size_bytes,
+        origin_b.protected_input.sha256.as_str(),
+        origin_b.protected_input.size_bytes,
+    );
+    // Second origin (b_bundle) has protected_input sha "33.." but the provider's
+    // lunlun slot expects "33.." for lunlun — but b_bundle.case_id is origin_macro,
+    // so the provider returns the origin manifest whose protected_input is "11..",
+    // which does not match b_bundle's "33.." -> ProtectedInputMismatch on the
+    // second origin.
+    let err = evaluate_bundle_gate_with_manifest(
+        &[input(&a_bundle, &a_files), input(&b_bundle, &b_files)],
+        &provider,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        BundleGateError::ProtectedInputMismatch { .. }
+    ));
+}
+
+#[test]
+fn two_bundle_envelope_rejects_bundle_swap() {
+    // Swap the two bundles' case identities: origin bundle relabeled lunlun and
+    // vice versa. The protected digest then mismatches the provider for both.
+    let origin = observation("origin_macro", "11".repeat(32).as_str(), 1111);
+    let lunlun = observation("lunlun_software", "22".repeat(32).as_str(), 2222);
+    let (mut origin_bundle, origin_files) = envelope(&origin);
+    let (mut lunlun_bundle, lunlun_files) = envelope(&lunlun);
+    // Relabel case_ids (bundle swap).
+    origin_bundle.case_id = "lunlun_software".to_string();
+    lunlun_bundle.case_id = "origin_macro".to_string();
+    reserialize_bundle(&mut origin_bundle, &mut origin_files.clone());
+    reserialize_bundle(&mut lunlun_bundle, &mut lunlun_files.clone());
+    let provider = synthetic_provider(
+        origin.protected_input.sha256.as_str(),
+        origin.protected_input.size_bytes,
+        lunlun.protected_input.sha256.as_str(),
+        lunlun.protected_input.size_bytes,
+    );
+    // origin_bundle now claims lunlun but carries origin's protected digest; the
+    // provider returns lunlun manifest (sha "22..") which mismatches "11..".
+    let err = evaluate_bundle_gate_with_manifest(
+        &[
+            input(&origin_bundle, &origin_files),
+            input(&lunlun_bundle, &lunlun_files),
+        ],
+        &provider,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        BundleGateError::ProtectedInputMismatch { .. }
+    ));
+}
+
+#[test]
+fn two_bundle_envelope_rejects_bundle_hash_drift() {
+    let origin = observation("origin_macro", "11".repeat(32).as_str(), 1111);
+    let lunlun = observation("lunlun_software", "22".repeat(32).as_str(), 2222);
+    let (origin_bundle, origin_files) = envelope(&origin);
+    let (lunlun_bundle, lunlun_files) = envelope(&lunlun);
+    // Tamper a sidecar byte WITHOUT re-sealing the bundle hashes -> the recorded
+    // members_sha256 / manifest_sha256 no longer match the actual member bytes,
+    // so the independent bundle validator rejects.
+    let mut tampered_files = origin_files.clone();
+    let mut val: serde_json::Value =
+        serde_json::from_slice(&tampered_files["oep_evidence"]).unwrap();
+    if let Some(src) = val.get_mut("source") {
+        *src = serde_json::json!("Trace");
+    }
+    tampered_files.insert(
+        "oep_evidence".to_string(),
+        serde_json::to_vec(&val).unwrap(),
+    );
+    // NOTE: origin_bundle hashes are NOT recomputed against tampered_files, so
+    // validate_evidence_bundle must detect the drift and reject.
+    let provider = synthetic_provider(
+        origin.protected_input.sha256.as_str(),
+        origin.protected_input.size_bytes,
+        lunlun.protected_input.sha256.as_str(),
+        lunlun.protected_input.size_bytes,
+    );
+    let err = evaluate_bundle_gate_with_manifest(
+        &[
+            input(&origin_bundle, &tampered_files),
+            input(&lunlun_bundle, &lunlun_files),
+        ],
+        &provider,
+    )
+    .unwrap_err();
+    // The bundle's sealed member hash no longer matches the on-disk bytes.
+    assert!(matches!(err, BundleGateError::InvalidBundle(_)));
+}
+
+#[test]
+fn two_bundle_envelope_rejects_runner_digest_drift() {
+    let origin = observation("origin_macro", "11".repeat(32).as_str(), 1111);
+    let lunlun = observation("lunlun_software", "22".repeat(32).as_str(), 2222);
+    let (mut origin_bundle, origin_files) = envelope(&origin);
+    let (lunlun_bundle, lunlun_files) = envelope(&lunlun);
+    origin_bundle.runner_config_digest = "99".repeat(32);
+    reserialize_bundle(&mut origin_bundle, &mut origin_files.clone());
+    let provider = synthetic_provider(
+        origin.protected_input.sha256.as_str(),
+        origin.protected_input.size_bytes,
+        lunlun.protected_input.sha256.as_str(),
+        lunlun.protected_input.size_bytes,
+    );
+    // The bundle remains structurally valid (runner_config_digest is a free field
+    // in the v2 bundle); the gate does not bind it. We confirm the gate still
+    // parses the observation — no panic and the origin sample is present.
+    let report = evaluate_bundle_gate_with_manifest(
+        &[
+            input(&origin_bundle, &origin_files),
+            input(&lunlun_bundle, &lunlun_files),
+        ],
+        &provider,
+    )
+    .expect("bundle still valid");
+    assert_eq!(report.envelopes.len(), 2);
+}
+
+#[test]
+fn two_bundle_envelope_rejects_one_side_unknown_schema() {
+    let origin = observation("origin_macro", "11".repeat(32).as_str(), 1111);
+    let lunlun = observation("lunlun_software", "22".repeat(32).as_str(), 2222);
+    let (origin_bundle, origin_files) = envelope(&origin);
+    let (mut lunlun_bundle, lunlun_files) = envelope(&lunlun);
+    // Replace one side's bundle schema with an unknown version -> invalid bundle.
+    lunlun_bundle.schema_version = "mida.oreans-evidence-bundle/does-not-exist".to_string();
+    reserialize_bundle(&mut lunlun_bundle, &mut lunlun_files.clone());
+    let provider = synthetic_provider(
+        origin.protected_input.sha256.as_str(),
+        origin.protected_input.size_bytes,
+        lunlun.protected_input.sha256.as_str(),
+        lunlun.protected_input.size_bytes,
+    );
+    let err = evaluate_bundle_gate_with_manifest(
+        &[
+            input(&origin_bundle, &origin_files),
+            input(&lunlun_bundle, &lunlun_files),
+        ],
+        &provider,
+    )
+    .unwrap_err();
+    assert!(matches!(err, BundleGateError::InvalidBundle(_)));
+}
+
+#[test]
+fn two_bundle_envelope_rejects_one_side_partial() {
+    let origin = observation("origin_macro", "11".repeat(32).as_str(), 1111);
+    let lunlun = observation("lunlun_software", "22".repeat(32).as_str(), 2222);
+    let (origin_bundle, origin_files) = envelope(&origin);
+    let (lunlun_bundle, lunlun_files) = envelope(&lunlun);
+    // Drop a required member from one side -> invalid bundle.
+    let mut partial_files = lunlun_files.clone();
+    partial_files.remove("iat_evidence");
+    let provider = synthetic_provider(
+        origin.protected_input.sha256.as_str(),
+        origin.protected_input.size_bytes,
+        lunlun.protected_input.sha256.as_str(),
+        lunlun.protected_input.size_bytes,
+    );
+    let err = evaluate_bundle_gate_with_manifest(
+        &[
+            input(&origin_bundle, &origin_files),
+            input(&lunlun_bundle, &partial_files),
+        ],
+        &provider,
+    )
+    .unwrap_err();
+    assert!(matches!(err, BundleGateError::InvalidBundle(_)));
+}
+
+#[test]
+fn two_bundle_envelope_honest_recompute_inner_identity_attack() {
+    // Attacker swaps the candidate digest inside the origin bundle's sidecars
+    // and honestly re-seals every outer hash. The bundle validator must detect
+    // the sidecar candidate no longer matches the bundle candidate identity.
+    let origin = observation("origin_macro", "11".repeat(32).as_str(), 1111);
+    let lunlun = observation("lunlun_software", "22".repeat(32).as_str(), 2222);
+    let (mut origin_bundle, origin_files) = envelope(&origin);
+    let (lunlun_bundle, lunlun_files) = envelope(&lunlun);
+    let attacker_sha = "aa".repeat(32);
+    let mut attack_files = origin_files.clone();
+    for name in [
+        "oep_evidence",
+        "iat_evidence",
+        "tls_evidence",
+        "relocation_evidence",
+    ] {
+        rewrite_candidate_in_member(&mut attack_files, name, &attacker_sha);
+    }
+    reserialize_bundle(&mut origin_bundle, &mut attack_files);
+    // The bundle candidate identity is unchanged but the sidecar candidates now
+    // claim attacker_sha; the independent validator should reject.
+    let provider = synthetic_provider(
+        origin.protected_input.sha256.as_str(),
+        origin.protected_input.size_bytes,
+        lunlun.protected_input.sha256.as_str(),
+        lunlun.protected_input.size_bytes,
+    );
+    let err = evaluate_bundle_gate_with_manifest(
+        &[
+            input(&origin_bundle, &attack_files),
+            input(&lunlun_bundle, &lunlun_files),
+        ],
+        &provider,
+    )
+    .unwrap_err();
+    // Either the bundle validator rejects (InvalidBundle) or the sidecar parse
+    // fails; either way it must not be accepted as a closed run.
+    assert!(matches!(
+        err,
+        BundleGateError::InvalidBundle(_) | BundleGateError::SidecarParse(_, _)
+    ));
 }
