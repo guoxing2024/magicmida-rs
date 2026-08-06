@@ -701,4 +701,37 @@ mod tests {
         assert_eq!(ctx.oep_provenance.va, None);
         assert_eq!(ctx.oep_provenance.rva, None);
     }
+
+    /// REAL-SAMPLE-ONLY (ignored): read the protected GTO sample's PE identity
+    /// and run `dual_select_packer` to record the identified packer family.
+    /// This is read-only (parses the PE header, never launches the sample).
+    /// Run manually with `--ignored` for a real-sample acceptance run.
+    #[test]
+    #[ignore]
+    fn real_sample_dual_select_identifies_family() {
+        let sample = std::path::Path::new("D:/Tools/RE/dumps/gto/启动器.exe");
+        if !sample.exists() {
+            eprintln!("sample not present; skipping real-sample identification");
+            return;
+        }
+        let data = std::fs::read(sample).expect("read sample");
+        let header = mida_pe::PeHeader::from_bytes(&data).expect("parse PE header");
+        let is_64bit = header.is_64bit;
+        let entry_rva = header.entry_point;
+        let size_of_image = header.size_of_image();
+        let section_names: Vec<String> = header.sections.iter().map(|s| s.name.clone()).collect();
+        eprintln!(
+            "sample={} is_64bit={} entry_rva=0x{:x} size_of_image=0x{:x} sections={:?}",
+            sample.display(),
+            is_64bit,
+            entry_rva,
+            size_of_image,
+            section_names
+        );
+        let (_packer, oreans_id, gto_id, family) =
+            dual_select_packer(is_64bit, entry_rva, size_of_image, section_names);
+        eprintln!("dual_select: family={family} oreans_id={oreans_id:?} gto_id={gto_id:?}");
+        // For the GTO sample we EXPECT ahk_gto; this test only reports, it
+        // does not gate on the outcome (real-sample observation).
+    }
 }
