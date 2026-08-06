@@ -145,12 +145,21 @@ digests — are always distinct. A family-less legacy config parses as
   envelope family fails case-set validation; GTO and Oreans digests are never
   equal; the PE-identified family must equal the attested envelope family
   before process creation;
-- G2-R2 production-shaped: the shared sidecar producers (IAT/OEP/TLS/section)
-  dispatch their member schema by family (`mida.oreans-*` vs
-  `mida.unpack-*`) through a single `evidence_schema` dispatch; the generic
-  PE-evidence producer (`build_unpack_pe_evidence` / `unpack-pe-evidence`
-  command) is schema-distinct from the Oreans one and never crosses lines; a
-  real producer output matches the generic assembler's expected member schema.
+- G2-R2 production-shaped: the shared sidecar producers (IAT/OEP/TLS/**relocation**/
+  section) all dispatch their member schema by family (`mida.oreans-*` vs
+  `mida.unpack-*`) through the single `crate::unpacker::evidence_schema`
+  dispatch, and an unknown family fails closed; the generic PE-evidence producer
+  (`build_unpack_pe_evidence` / `unpack-pe-evidence` command) is schema-distinct
+  from the Oreans one and never crosses lines.
+  **Coverage depth:** the IAT/OEP/TLS/relocation/section producers each have a
+  REAL-producer family-dispatch test that calls the production build/write
+  helper (not just a string constant) — for relocation this includes both
+  `build_relocation_evidence` and a `write_relocation_evidence` GTO sidecar
+  whose emitted JSON is asserted to carry `mida.unpack-relocation-evidence/v1`.
+  The generic assembler + consumer round-trip uses real producer-dispatched
+  schemas; a real OEP producer output is additionally asserted to match the
+  generic assembler's expected member schema. No real GTO/Oreans sample is
+  executed anywhere.
 
 ## 7b. GTO preflight reachability (G2-R2, choice B)
 

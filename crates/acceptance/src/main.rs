@@ -4,6 +4,7 @@
 //! mida-acceptance check-static <candidate> [options]
 //! mida-acceptance check-with-behavior <candidate> --behavior-evidence <json> [options]
 //! mida-acceptance oreans-pe-evidence <candidate> [options]
+//! mida-acceptance unpack-pe-evidence <candidate> [options]
 //! mida-acceptance oreans-two-sample-gate <observations.json> [options]
 //! ```
 //!
@@ -102,6 +103,7 @@ Usage:
   mida-acceptance check-static <candidate> [options]
   mida-acceptance check-with-behavior <candidate> --behavior-evidence <path> [options]
   mida-acceptance oreans-pe-evidence <candidate> [options]
+  mida-acceptance unpack-pe-evidence <candidate> [options]
   mida-acceptance oreans-two-sample-gate <observations.json> [options]
   mida-acceptance classify-gate-report <bundle_gate_report.json> [--report PATH]
   mida-acceptance preflight --envelope <path> --output-dir <dir> --cli-binary <path>

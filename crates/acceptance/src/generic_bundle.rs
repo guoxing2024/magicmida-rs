@@ -773,6 +773,36 @@ mod tests {
     /// Oreans member (and vice versa).
     #[test]
     fn generic_member_schemas_are_family_agnostic_not_oreans() {
+        // A2: lock the EXACT generic member schema ids. These must match the
+        // CLI producer side (`mida-cli::unpacker::evidence_schema` /
+        // `generic_bundle_assembler::EXPECTED_MEMBER_SCHEMAS`); the acceptance
+        // consumer keeps its own copy because it must not depend on the CLI
+        // crate, so this exact-value table is the cross-crate drift guard.
+        let expected: &[(&str, &str)] = &[
+            ("oep_evidence", "mida.unpack-oep-evidence/v1"),
+            ("iat_evidence", "mida.unpack-iat-evidence/v1"),
+            ("tls_evidence", "mida.unpack-tls-evidence/v1"),
+            ("relocation_evidence", "mida.unpack-relocation-evidence/v1"),
+            (
+                "section_rebuild_evidence",
+                "mida.unpack-section-rebuild-evidence/v1",
+            ),
+            ("pe_evidence", "mida.unpack-pe-evidence/v1"),
+            ("transform_manifest", "mida.transform-manifest/v0"),
+        ];
+        for (name, expected_schema) in expected {
+            let (actual_name, actual_schema) = REQUIRED_UNPACK_MEMBERS
+                .iter()
+                .find(|(n, _)| n == name)
+                .unwrap_or_else(|| panic!("required member {name} is missing"));
+            assert_eq!(actual_name, name);
+            assert_eq!(
+                actual_schema, expected_schema,
+                "generic consumer member {name} schema drifts from the locked contract table"
+            );
+        }
+        // The same set is exactly what the CLI producer's dispatch resolves for
+        // a generic family, and the Oreans set is disjoint (never shared).
         for (name, schema) in REQUIRED_UNPACK_MEMBERS {
             if name == "transform_manifest" {
                 continue; // shared, versioned transform manifest

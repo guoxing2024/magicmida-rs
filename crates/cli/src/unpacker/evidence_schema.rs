@@ -133,4 +133,42 @@ mod tests {
         assert!(member_schema_for_family("bogus", EvidenceMemberKind::Iat).is_err());
         assert!(member_schema_for_family("", EvidenceMemberKind::Pe).is_err());
     }
+
+    /// A2: the family-aware dispatch stays in lockstep with the generic bundle
+    /// assembler's `EXPECTED_MEMBER_SCHEMAS` — the two producer-side schema
+    /// tables must never drift. (The acceptance consumer's
+    /// `REQUIRED_UNPACK_MEMBERS` is independently locked by its own test; the
+    /// consumer never depends on this crate.)
+    #[test]
+    fn dispatch_matches_generic_assembler_member_schemas() {
+        use crate::unpacker::generic_bundle_assembler::EXPECTED_MEMBER_SCHEMAS;
+        use mida_core::runner_config::packer_family;
+        let member_kind = |name: &str| match name {
+            "oep_evidence" => Some(EvidenceMemberKind::Oep),
+            "iat_evidence" => Some(EvidenceMemberKind::Iat),
+            "tls_evidence" => Some(EvidenceMemberKind::Tls),
+            "relocation_evidence" => Some(EvidenceMemberKind::Relocation),
+            "section_rebuild_evidence" => Some(EvidenceMemberKind::SectionRebuild),
+            "pe_evidence" => Some(EvidenceMemberKind::Pe),
+            "transform_manifest" => None, // shared, versioned; not in the dispatch enum
+            _ => panic!("unexpected member name {name:?}"),
+        };
+        for (name, expected_schema) in EXPECTED_MEMBER_SCHEMAS {
+            match member_kind(name) {
+                None => assert_eq!(expected_schema, "mida.transform-manifest/v0"),
+                Some(kind) => {
+                    let generic = member_schema_for_family(packer_family::AHK_GTO, kind).unwrap();
+                    assert_eq!(
+                        generic, expected_schema,
+                        "dispatch generic schema for {name} drifts from generic_bundle_assembler"
+                    );
+                    let oreans = member_schema_for_family(packer_family::OREANS, kind).unwrap();
+                    assert!(
+                        oreans.starts_with("mida.oreans-"),
+                        "Oreans schema for {name} must be mida.oreans-*: {oreans}"
+                    );
+                }
+            }
+        }
+    }
 }

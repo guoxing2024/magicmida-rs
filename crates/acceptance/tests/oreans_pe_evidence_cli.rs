@@ -194,3 +194,37 @@ fn unpack_pe_evidence_command_emits_generic_schema_not_oreans() {
     );
     assert_eq!(generic_json["candidate"], oreans_json["candidate"]);
 }
+
+/// A3: the CLI `--help`/usage lists BOTH PE-evidence commands — the Oreans and
+/// the generic `unpack-pe-evidence` — and the unknown-command hint mentions
+/// both, so the help text and the command routing never drift.
+#[test]
+fn help_lists_both_pe_evidence_commands() {
+    let help = run(&["--help"]);
+    assert_eq!(help.status.code(), Some(0), "{help:?}");
+    let text = String::from_utf8_lossy(&help.stdout).to_string();
+    assert!(
+        text.contains("oreans-pe-evidence"),
+        "--help must list oreans-pe-evidence: {text}"
+    );
+    assert!(
+        text.contains("unpack-pe-evidence"),
+        "--help must list unpack-pe-evidence: {text}"
+    );
+
+    // No-arg run also prints the same usage.
+    let bare = run(&[]);
+    let bare_text = String::from_utf8_lossy(&bare.stdout).to_string();
+    assert!(
+        bare_text.contains("unpack-pe-evidence"),
+        "bare usage must list unpack-pe-evidence: {bare_text}"
+    );
+
+    // Unknown-command hint must name both commands.
+    let unknown = run(&["nope"]);
+    let err = String::from_utf8_lossy(&unknown.stderr).to_string();
+    assert!(
+        err.contains("oreans-pe-evidence") && err.contains("unpack-pe-evidence"),
+        "unknown-command hint must list both PE-evidence commands: {err}"
+    );
+}

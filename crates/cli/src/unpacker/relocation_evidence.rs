@@ -941,4 +941,132 @@ mod tests {
         // With empty target lists on both sides, target set is trivially equal.
         assert!(preserved.target_set_preserved);
     }
+
+    /// A minimal legal PE64 that `parse_final_candidate` can parse. The exact
+    /// section/directory layout is not important for the schema-dispatch test;
+    /// the sidecar is returned (possibly with blockers) once the PE parses.
+    fn minimal_pe64() -> Vec<u8> {
+        let mut buf = vec![0u8; 512];
+        buf[0..2].copy_from_slice(b"MZ");
+        buf[60..64].copy_from_slice(&0x40u32.to_le_bytes());
+        let nt = 0x40usize;
+        buf[nt..nt + 4].copy_from_slice(b"PE\0\0");
+        let fh = nt + 4;
+        buf[fh..fh + 2].copy_from_slice(&0x8664u16.to_le_bytes());
+        buf[fh + 2..fh + 4].copy_from_slice(&1u16.to_le_bytes());
+        buf[fh + 16..fh + 18].copy_from_slice(&0xF0u16.to_le_bytes());
+        let oh = nt + 24;
+        buf[oh..oh + 2].copy_from_slice(&0x20Bu16.to_le_bytes());
+        buf[oh + 16..oh + 20].copy_from_slice(&0x1000u32.to_le_bytes());
+        buf[oh + 24..oh + 32].copy_from_slice(&0x1400_0000_0u64.to_le_bytes());
+        buf[oh + 32..oh + 36].copy_from_slice(&0x1000u32.to_le_bytes());
+        buf[oh + 36..oh + 40].copy_from_slice(&0x200u32.to_le_bytes());
+        buf[oh + 56..oh + 60].copy_from_slice(&0x2000u32.to_le_bytes());
+        buf[oh + 60..oh + 64].copy_from_slice(&0x200u32.to_le_bytes());
+        let sh = nt + 24 + 0xF0;
+        buf[sh..sh + 5].copy_from_slice(b".text");
+        buf[sh + 8..sh + 12].copy_from_slice(&0x1000u32.to_le_bytes());
+        buf[sh + 12..sh + 16].copy_from_slice(&0x1000u32.to_le_bytes());
+        buf[sh + 16..sh + 20].copy_from_slice(&0x200u32.to_le_bytes());
+        buf[sh + 20..sh + 24].copy_from_slice(&0x200u32.to_le_bytes());
+        buf[sh + 36..sh + 40].copy_from_slice(&0x6000_0020u32.to_le_bytes());
+        buf
+    }
+
+    fn write_reloc_pair(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let protected = dir.join("protected.exe");
+        let candidate = dir.join("candidate.exe");
+        std::fs::write(&protected, b"protected-input").expect("protected");
+        std::fs::write(&candidate, minimal_pe64()).expect("candidate");
+        (protected, candidate)
+    }
+
+    fn absent_tls_report() -> mida_pe::TlsObservationReport {
+        mida_pe::TlsObservationReport {
+            directory_present: false,
+            pe32_plus: false,
+            pointer_size: 4,
+            directory_rva: 0,
+            directory_size: 0,
+            directory_bytes_read: 0,
+            start_address_of_raw_data: 0,
+            start_rva: None,
+            end_address_of_raw_data: 0,
+            end_rva: None,
+            address_of_index: 0,
+            index_rva: None,
+            address_of_callbacks: 0,
+            callbacks_rva: None,
+            size_of_zero_fill: 0,
+            characteristics: 0,
+            index_bytes_read: 0,
+            index_value: None,
+            callback_slots: Vec::new(),
+            null_terminated: false,
+            blockers: Vec::new(),
+        }
+    }
+
+    fn reloc_report(output_size: usize) -> mida_pe::DumpProcessReport {
+        mida_pe::DumpProcessReport {
+            fix_imports_requested: false,
+            iat_evidence_present: false,
+            iat_evidence_complete: true,
+            iat_report: None,
+            tls_evidence_present: false,
+            tls_evidence_complete: true,
+            tls_report: absent_tls_report(),
+            relocation_evidence_present: false,
+            relocation_evidence_complete: true,
+            relocation_report: mida_pe::RelocationObservationReport::default(),
+            output_size,
+        }
+    }
+
+    /// A1: the REAL relocation producer dispatches its member schema by family —
+    /// `mida.oreans-relocation-evidence/v1` for Oreans, `mida.unpack-relocation-evidence/v1`
+    /// for a generic family (ahk_gto), and fails closed on an unknown family.
+    #[test]
+    fn relocation_sidecar_schema_dispatches_by_family() {
+        let dir = std::env::temp_dir().join(format!("mida-reloc-family-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (protected, candidate) = write_reloc_pair(&dir);
+        let report = reloc_report(minimal_pe64().len());
+
+        let oreans =
+            build_relocation_evidence(&protected, &candidate, &report, "oreans_themida").unwrap();
+        assert_eq!(oreans.schema_version, "mida.oreans-relocation-evidence/v1");
+
+        let gto = build_relocation_evidence(&protected, &candidate, &report, "ahk_gto").unwrap();
+        assert_eq!(gto.schema_version, "mida.unpack-relocation-evidence/v1");
+
+        assert!(build_relocation_evidence(&protected, &candidate, &report, "bogus").is_err());
+        assert!(build_relocation_evidence(&protected, &candidate, &report, "").is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A1: the REAL relocation producer's `write_relocation_evidence` emits a
+    /// disk sidecar whose JSON schema is the generic `mida.unpack-relocation-evidence/v1`
+    /// for the GTO family — never the Oreans schema.
+    #[test]
+    fn relocation_write_gto_sidecar_has_generic_schema() {
+        let dir = std::env::temp_dir().join(format!("mida-reloc-write-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (protected, candidate) = write_reloc_pair(&dir);
+        let report = reloc_report(minimal_pe64().len());
+
+        let path = write_relocation_evidence(&protected, &candidate, &report, "ahk_gto").unwrap();
+        let json = std::fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            value["schema_version"],
+            "mida.unpack-relocation-evidence/v1"
+        );
+        assert!(!json.contains("mida.oreans-relocation-evidence"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
