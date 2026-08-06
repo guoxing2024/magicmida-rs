@@ -38,11 +38,20 @@ source path is recorded only as provenance.
   capture. If the source changes or becomes unreadable while the existing
   snapshot is being verified, capture fails closed and the existing snapshot is
   neither deleted nor overwritten (G3-R2-R2).
-- **Publish is no-replace.** A dedicated `publish_no_replace` helper makes the
-  no-replace guarantee explicit and portable (it does not rely on Windows
-  `rename` refusing to overwrite). If the target already exists, capture only
-  reuses it when it is verified byte-identical; a mismatched/unverifiable
-  target fails closed and is never overwritten.
+- **Publish is atomic no-replace.** `publish_no_replace` uses
+  `std::fs::hard_link(temp, target)`, not `exists()+rename()`. On Unix this is
+  the atomic directory-entry creation semantics of `link(2)`; on Windows the
+  standard library maps to the no-replace `CreateHardLinkW` operation. A race
+  yields exactly one successful `Published` result and `AlreadyExists` for the
+  losers; an existing target is never overwritten and no half-written target is
+  visible because the temp file was fully written and verified first. The temp
+  and target are deliberately in the same hash directory, so they must be on
+  the same filesystem/volume; cross-volume publication is not supported.
+- **Failed-capture cleanup is ownership-safe.** A failed fresh capture removes
+  only its own uniquely named temp file. It does not remove the shared
+  content-addressed hash directory, even when that directory is empty: directory
+  ownership can change between an existence check and cleanup, while an empty
+  directory is harmless metadata.
 - If the file changes during capture, the caller must **not** proceed to
   staging.
 
@@ -55,10 +64,12 @@ the identity and the source path as provenance.
 **Verified resolve is mandatory before staging.** `verified_read_snapshot`
 re-reads the on-disk snapshot and recomputes its SHA-256, size, and
 revision/logical-id consistency; a modified, truncated, replaced, missing, or
-forged snapshot is rejected (`VerifiedResolveFailed`). `staging_identity_matches`
-does NOT trust the in-memory `StagingIdentity` hash/size alone: it re-verifies
-the on-disk snapshot against the expected manifest identity. A forged in-memory
-identity (matching claim, wrong/missing disk file) cannot bypass this.
+forged snapshot is rejected (`VerifiedResolveFailed`). The returned
+`VerifiedSnapshot`, including `snapshot_bytes`, proves only what was observed at
+that read instant; it is not a durable immutability proof. `staging_identity_matches`
+does NOT trust the in-memory `SampleSnapshot`/`StagingIdentity` hash/size alone:
+it re-verifies the on-disk snapshot against the expected manifest identity at the
+staging boundary. A forged or stale in-memory identity cannot bypass this.
 
 **Revision integrity is part of the identity.** `staging_identity_matches` also
 requires `staging.revision == revision_id(logical_sample_id, canonical_sha256)`.

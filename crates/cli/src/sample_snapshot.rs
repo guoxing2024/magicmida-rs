@@ -320,7 +320,7 @@ fn capture_snapshot_impl(
     // only trusted if the source is verified stable across the whole capture,
     // exactly like the fresh-capture path. If the source changes or becomes
     // unreadable while we verify the existing snapshot, we fail closed.
-    if target_file.is_file() {
+    if target_file.exists() {
         // Classify the existing target WITHOUT returning yet. Even a corrupt,
         // mismatching, or unverifiable existing snapshot must still ride through
         // the second source read, so a source change during verification wins
@@ -377,17 +377,12 @@ fn capture_snapshot_impl(
         };
     }
 
-    // Create the parent dirs (`snapshot_root` / `logical_id`) idempotently, then
-    // create the leaf content-address dir ONLY if it does not already exist. We
-    // record whether WE created the leaf so cleanup can remove it without ever
-    // deleting a directory that a concurrent task created or populated.
-    let parent_dir = target_dir.parent().expect("target_dir has a parent");
-    fs::create_dir_all(parent_dir).map_err(|e| CaptureError::SnapshotWriteFailed(e.to_string()))?;
-    let dir_created_by_us = match fs::create_dir(&target_dir) {
-        Ok(()) => true,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
-        Err(e) => return Err(CaptureError::SnapshotWriteFailed(e.to_string())),
-    };
+    // Create the parent and leaf content-addressed directories idempotently.
+    // Failed captures leave an empty leaf directory behind: ownership cannot be
+    // tracked safely after another task observes or populates the same directory,
+    // so cleanup is limited to this capture's own temp file.
+    fs::create_dir_all(&target_dir)
+        .map_err(|e| CaptureError::SnapshotWriteFailed(e.to_string()))?;
 
     // Unique temp file (never a fixed `.capturing.tmp`) so concurrent captures
     // never collide. A small guard ensures EVERY failure path removes it.
@@ -413,10 +408,9 @@ fn capture_snapshot_impl(
         Ok(b) => b,
         Err(e) => {
             // Second read failed (e.g. source deleted mid-capture). Fail closed
-            // and remove OUR temp file. Remove the target dir only if we created
-            // it (and only if it is still empty) — never a concurrent task's dir.
-            drop(guard); // removes temp file
-            cleanup_failed_dir(&target_dir, dir_created_by_us);
+            // and remove only OUR temp file. The hash directory may be shared by
+            // another capture, so it is intentionally left in place.
+            drop(guard);
             return Err(CaptureError::SourceUnreadable(e.to_string()));
         }
     };
@@ -429,10 +423,9 @@ fn capture_snapshot_impl(
         && first_sha == snap_sha
         && first_size == snap_size;
     if !stable {
-        // TempGuard removes the temp file on drop; remove the target dir only if
-        // we created it and it is empty.
+        // TempGuard removes only this capture's temp file. Empty hash directories
+        // are harmless metadata and remain available to concurrent publishers.
         drop(guard);
-        cleanup_failed_dir(&target_dir, dir_created_by_us);
         return Err(CaptureError::SourceChangedDuringCapture);
     }
 
@@ -533,20 +526,10 @@ impl Drop for TempGuard {
     }
 }
 
-/// Remove a failed capture's content-address directory, but ONLY if this capture
-/// created it (`dir_created_by_us`). `fs::remove_dir` only succeeds on an empty
-/// directory, so a directory that a concurrent task has populated is left alone.
-/// This closes the cleanup TOCTOU: we prefer leaving an empty dir behind over
-/// ever deleting a directory owned/populated by a concurrent task.
-fn cleanup_failed_dir(target_dir: &Path, dir_created_by_us: bool) {
-    if dir_created_by_us {
-        let _ = fs::remove_dir(target_dir);
-    }
-}
-
 /// Resolve the immutable snapshot file for a known content address
 /// (`<logical_id>/<sha256>/snapshot.bin`) if it exists, WITHOUT re-verifying
-/// content. Prefer [`verified_read_snapshot`] before staging.
+/// content. The returned path is only a locator; prefer
+/// [`verified_read_snapshot`] at every staging/preflight boundary.
 ///
 /// The hash is canonicalized to lowercase so upper/mixed-case callers still
 /// resolve to the same content address.
@@ -570,8 +553,10 @@ pub fn resolve_snapshot(
 }
 
 /// A snapshot that has been re-read from disk and verified (hash, size, and
-/// revision/logical-id consistency). Staging must only trust a verified
-/// snapshot, never a cached hash/size from an in-memory struct.
+/// revision/logical-id consistency). `snapshot_bytes` and the other fields are
+/// observations from that read instant, not a durable immutability proof.
+/// Staging must re-verify the path again at its own boundary and must never trust
+/// a cached hash/size from an older in-memory struct.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedSnapshot {
     pub logical_sample_id: String,
@@ -648,8 +633,10 @@ pub struct StagingIdentity {
 }
 
 impl SampleSnapshot {
-    /// Derive the staging identity for this immutable snapshot. The identity is
-    /// the snapshot hash/size; the source path is provenance only.
+    /// Derive a point-in-time staging identity for this snapshot. The identity
+    /// is the snapshot hash/size; the source path is provenance only. Callers
+    /// must still run `staging_identity_matches` (which re-verifies disk bytes)
+    /// immediately before staging/preflight.
     ///
     /// NOTE: staging MUST still verify against disk (see
     /// [`verified_staging_identity_matches`]) before use; this in-memory value
@@ -999,6 +986,33 @@ mod tests {
             &snap.snapshot_sha256,
             snap.snapshot_size_bytes
         ));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// R3-6: `SampleSnapshot` is a point-in-time observation. Staging must
+    /// re-verify the on-disk bytes after that object is returned.
+    #[test]
+    fn sample_snapshot_is_point_in_time_and_staging_reverifies() {
+        let root = temp_root("point_in_time_boundary");
+        let src = root.join("src.bin");
+        fs::write(&src, b"POINT-IN-TIME-CONTENT").unwrap();
+        let snap_root = root.join("snapshots");
+        let snapshot = capture_snapshot(&src, &snap_root, "gto_launcher", "rev").unwrap();
+        let staging = snapshot.to_staging_identity();
+
+        fs::write(&snapshot.snapshot_abs_path, b"POST-CAPTURE-TAMPER").unwrap();
+        assert!(
+            verified_read_snapshot(&snap_root, "gto_launcher", &snapshot.snapshot_sha256).is_err()
+        );
+        assert!(
+            !staging_identity_matches(
+                &staging,
+                &snap_root,
+                &snapshot.snapshot_sha256,
+                snapshot.snapshot_size_bytes
+            ),
+            "staging must re-verify disk bytes instead of trusting SampleSnapshot"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1554,54 +1568,65 @@ mod tests {
     }
 
     /// R3-2: real concurrent publishers racing on the same content address never
-    /// overwrite each other and never expose a half-written file. Exactly one
-    /// final target exists and its content is the full payload.
+    /// overwrite each other and never expose a half-written file. Distinct payloads
+    /// make the winning publisher observable: the final target must equal the full
+    /// payload belonging to the sole `Published` result.
     #[test]
     fn concurrent_publishers_never_overwrite_or_expose_partial() {
         let root = temp_root("concurrent_pub");
         let snap_root = root.join("snapshots");
         let dir = snap_root
             .join("gto_launcher")
-            .join(&sha256_hex(b"RACE-PAYLOAD"));
+            .join(&sha256_hex(b"RACE-ADDRESS"));
         fs::create_dir_all(&dir).unwrap();
         let target = dir.join(SNAPSHOT_FILENAME);
-        let payload = b"CONCURRENT-NO-REPLACE-ATOMIC-PUBLISH-PAYLOAD";
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(12));
 
-        // Each publisher writes its OWN temp, then races to hard-link it to the
-        // shared target. Only the first link succeeds; the rest get AlreadyExists.
         let mut handles = Vec::new();
         for i in 0..12 {
             let dir = dir.clone();
             let target = target.clone();
-            let payload = payload.to_vec();
+            let barrier = barrier.clone();
             handles.push(std::thread::spawn(move || {
+                let payload = format!("CONCURRENT-PUBLISH-PAYLOAD-{i:02}-FULL").into_bytes();
                 let temp = dir.join(format!(".capturing-pub-{i}.tmp"));
                 fs::write(&temp, &payload).unwrap();
+                barrier.wait();
                 let outcome = publish_no_replace(&temp, &target).unwrap();
-                // Every publisher removes its own temp regardless of outcome.
                 let _ = fs::remove_file(&temp);
-                outcome
+                (i, payload, outcome)
             }));
         }
-        let outcomes: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-        // Exactly one Publisher wins; the rest see AlreadyExists.
-        let published = outcomes
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let winners: Vec<_> = results
             .iter()
-            .filter(|o| **o == PublishOutcome::Published)
-            .count();
-        let already = outcomes
-            .iter()
-            .filter(|o| **o == PublishOutcome::AlreadyExists)
-            .count();
-        assert_eq!(published, 1, "exactly one publisher must win: {outcomes:?}");
-        assert_eq!(already, outcomes.len() - 1);
+            .filter(|(_, _, outcome)| *outcome == PublishOutcome::Published)
+            .collect();
+        assert_eq!(
+            winners.len(),
+            1,
+            "exactly one publisher must win: {results:?}"
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|(_, _, outcome)| *outcome == PublishOutcome::AlreadyExists)
+                .count(),
+            results.len() - 1
+        );
 
-        // Final target is complete (no half-written file) and correct.
-        assert!(target.is_file());
         let final_bytes = fs::read(&target).unwrap();
-        assert_eq!(final_bytes.len(), payload.len(), "must not be truncated");
-        assert_eq!(final_bytes, payload);
-        // No temp files left.
+        assert_eq!(
+            final_bytes.as_slice(),
+            winners[0].1.as_slice(),
+            "target must be the winner's full payload"
+        );
+        assert!(
+            results
+                .iter()
+                .any(|(_, payload, _)| final_bytes.as_slice() == payload.as_slice()),
+            "target must equal one complete publisher payload"
+        );
         let names: Vec<String> = fs::read_dir(&dir)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -1771,27 +1796,28 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// R3-4b: when THIS capture created the leaf dir and it is left empty after
-    /// cleanup, the empty dir is removed (not leaked), while a dir it did not
-    /// create is left behind. Uses the internal fresh-capture path.
+    /// R3-4b: a failed fresh capture removes only its own temp file and never
+    /// removes a file that another capture places in the shared hash directory.
+    /// Empty hash directories are intentionally allowed to remain.
     #[test]
-    fn fresh_capture_cleanup_removes_only_own_empty_dir() {
-        let root = temp_root("own_dir");
+    fn fresh_capture_failure_does_not_delete_concurrent_temp() {
+        let root = temp_root("concurrent_cleanup");
         let src = root.join("src.bin");
-        fs::write(&src, b"OWN-DIR-CONTENT").unwrap();
+        fs::write(&src, b"CONCURRENT-CLEANUP-CONTENT").unwrap();
         let snap_root = root.join("snapshots");
-        let want_sha = sha256_hex(b"OWN-DIR-CONTENT");
+        let want_sha = sha256_hex(b"CONCURRENT-CLEANUP-CONTENT");
         let dir = snap_root.join("gto_launcher").join(&want_sha);
+        let marker = dir.join(".capturing-other-task.tmp");
 
-        // Source deleted between the two reads. The dir was created by THIS
-        // capture (via fs::create_dir), so it is removed after cleanup.
         let hook_src = src.clone();
+        let hook_marker = marker.clone();
         let err = capture_snapshot_impl(
             &src,
             &snap_root,
             "gto_launcher",
             "rev",
             Some(Box::new(move || {
+                fs::write(&hook_marker, b"other-task-temp").unwrap();
                 fs::remove_file(&hook_src).unwrap();
             })),
             None,
@@ -1799,9 +1825,14 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, CaptureError::SourceUnreadable(_)));
         assert!(
-            !dir.exists(),
-            "a dir created by this capture and left empty should be removed"
+            marker.is_file(),
+            "another task's temp must never be removed"
         );
+        let names: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.iter().any(|n| n == ".capturing-other-task.tmp"));
         let _ = fs::remove_dir_all(&root);
     }
 
