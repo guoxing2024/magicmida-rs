@@ -17,6 +17,7 @@ use mida_core::{
 };
 use mida_packers_ahk_gto::AhkGtoPlugin;
 use mida_packers_themida::ThemidaPlugin;
+use mida_pe::DumpProfile;
 
 use super::loop_state::LoopState;
 
@@ -30,6 +31,19 @@ use super::loop_state::LoopState;
 pub(super) enum SelectedPacker {
     Oreans(ThemidaPlugin),
     AhkGto(AhkGtoPlugin),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct IatLocationHint {
+    pub(super) address: usize,
+    pub(super) size: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum GtoRouteCapability {
+    BuildDisabled,
+    SharedObservation,
+    ExperimentalRecovery,
 }
 
 impl SelectedPacker {
@@ -49,6 +63,23 @@ impl SelectedPacker {
         matches!(self, Self::Oreans(_))
     }
 
+    #[must_use]
+    pub(super) fn uses_gto_observation(&self) -> bool {
+        matches!(self, Self::AhkGto(_))
+    }
+
+    #[must_use]
+    pub(super) fn accept_iat_location_hint(
+        &self,
+        hint: Option<IatLocationHint>,
+    ) -> Option<IatLocationHint> {
+        if self.uses_gto_observation() {
+            hint
+        } else {
+            None
+        }
+    }
+
     /// Apply family-specific session timeouts / thresholds.
     pub(super) fn apply_session_defaults(&self, ctx: &mut PluginCtx) {
         match self {
@@ -65,6 +96,40 @@ impl SelectedPacker {
             Self::AhkGto(p) => p.last_identify_confidence,
         }
     }
+}
+
+#[must_use]
+pub(super) fn gto_route_capability(profile: DumpProfile) -> GtoRouteCapability {
+    if !cfg!(feature = "gto-product-recovery") {
+        GtoRouteCapability::BuildDisabled
+    } else if matches!(profile, DumpProfile::AhkGtoExperimental) {
+        GtoRouteCapability::ExperimentalRecovery
+    } else {
+        GtoRouteCapability::SharedObservation
+    }
+}
+
+pub(super) fn validate_gto_route(
+    profile: DumpProfile,
+    post_attach_mode: bool,
+) -> Result<(), &'static str> {
+    if matches!(
+        gto_route_capability(profile),
+        GtoRouteCapability::BuildDisabled
+    ) {
+        return Err(
+            "GTO route disabled in default build; rebuild with --features gto-product-recovery",
+        );
+    }
+    if !post_attach_mode {
+        return Err("GTO route requires post-attach mode; refusing Oreans debug-loop fallback");
+    }
+    Ok(())
+}
+
+#[must_use]
+pub(super) fn gto_heavy_capabilities_enabled(profile: DumpProfile) -> bool {
+    matches!(profile, DumpProfile::AhkGtoExperimental)
 }
 
 /// Dual-identify Oreans vs AHK/GTO and build the session packer (R4-A1 / G0).
@@ -432,6 +497,57 @@ mod tests {
     fn selected_gto_family_id() {
         let p = SelectedPacker::AhkGto(AhkGtoPlugin::new());
         assert_eq!(p.family_id(), "ahk_gto");
+    }
+
+    #[test]
+    fn uses_gto_observation_routes_ahk_gto_only() {
+        let gto = SelectedPacker::AhkGto(AhkGtoPlugin::new());
+        let oreans = SelectedPacker::Oreans(ThemidaPlugin::new());
+        assert!(gto.uses_gto_observation());
+        assert!(!oreans.uses_gto_observation());
+    }
+
+    #[test]
+    fn gto_iat_hint_does_not_pollute_oreans() {
+        let hint = IatLocationHint {
+            address: 0x1400_2000,
+            size: 0x11e0,
+        };
+        let oreans = SelectedPacker::Oreans(ThemidaPlugin::new());
+        assert_eq!(oreans.accept_iat_location_hint(Some(hint)), None);
+    }
+
+    #[cfg(not(feature = "gto-product-recovery"))]
+    #[test]
+    fn default_build_disables_gto_route_for_both_profiles() {
+        assert_eq!(
+            gto_route_capability(DumpProfile::OreansClassic),
+            GtoRouteCapability::BuildDisabled
+        );
+        assert_eq!(
+            gto_route_capability(DumpProfile::AhkGtoExperimental),
+            GtoRouteCapability::BuildDisabled
+        );
+        assert!(validate_gto_route(DumpProfile::OreansClassic, true).is_err());
+    }
+
+    #[cfg(feature = "gto-product-recovery")]
+    #[test]
+    fn feature_build_profile_only_controls_heavy_capabilities() {
+        assert_eq!(
+            gto_route_capability(DumpProfile::OreansClassic),
+            GtoRouteCapability::SharedObservation
+        );
+        assert_eq!(
+            gto_route_capability(DumpProfile::AhkGtoExperimental),
+            GtoRouteCapability::ExperimentalRecovery
+        );
+        assert!(!gto_heavy_capabilities_enabled(DumpProfile::OreansClassic));
+        assert!(gto_heavy_capabilities_enabled(
+            DumpProfile::AhkGtoExperimental
+        ));
+        assert!(validate_gto_route(DumpProfile::OreansClassic, true).is_ok());
+        assert!(validate_gto_route(DumpProfile::OreansClassic, false).is_err());
     }
 
     #[cfg(feature = "gto-product-recovery")]

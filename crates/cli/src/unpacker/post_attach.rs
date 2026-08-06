@@ -53,7 +53,7 @@ pub(super) fn run_post_attach_path(
     // (UI / multi-section watch / no-bypass), Oreans uses the plain-.text
     // freeze. Everything downstream (provenance, milestones, dump via
     // `run_post_loop_phases`) is shared.
-    if uses_gto_observation(packer.family_id()) {
+    if packer.uses_gto_observation() {
         return run_gto_post_attach(
             dbg,
             state,
@@ -357,6 +357,7 @@ pub(super) fn run_post_attach_path(
         false, // process still attached
         packer.uses_oreans_iat_trace(),
         packer.family_id(),
+        None,
         oep_policy,
         container_restore,
         profile,
@@ -443,6 +444,7 @@ fn run_gto_post_attach(
     let observation = super::gto_host::observe_gto(dbg, pe, profile, early_section_snapshots)?;
     let oep_addr = observation.oep_addr;
     let frozen_rip = observation.frozen_rip;
+    let iat_override = packer.accept_iat_location_hint(observation.iat_override);
 
     refresh_early_snapshots_after_loader(dbg, early_section_snapshots)?;
     merge_reinitializable_data_state(dbg, early_section_snapshots, pe.size_of_image() as usize)?;
@@ -481,6 +483,7 @@ fn run_gto_post_attach(
         false,                          // process still attached
         packer.uses_oreans_iat_trace(), // false for ahk_gto → live IAT rebuild at dump
         packer.family_id(),
+        iat_override,
         oep_policy,
         container_restore,
         profile,
@@ -496,14 +499,6 @@ fn run_gto_post_attach(
 
     log::log(LogType::Good, "Done.");
     Ok(())
-}
-
-/// Whether the shared post-attach skeleton should use the GTO observation
-/// policy instead of the Oreans plain-`.text` freeze. This is the single
-/// family-specific decision point in the shared post-attach path (G1).
-#[must_use]
-fn uses_gto_observation(family_id: &str) -> bool {
-    family_id == "ahk_gto"
 }
 
 fn post_attach_oep_provenance(
@@ -552,15 +547,5 @@ mod tests {
         assert!(!provenance.application_oep);
         assert!(provenance.bootstrap_or_ambiguous);
         assert!(!provenance.application_oep_prerequisite_passes());
-    }
-
-    // G1: the shared post-attach skeleton routes GTO to the GTO observation
-    // policy and Oreans to the Oreans policy — the two families do not pollute
-    // each other, and GTO is a shared-skeleton route, not a separate host.
-    #[test]
-    fn uses_gto_observation_routes_ahk_gto_only() {
-        assert!(uses_gto_observation("ahk_gto"));
-        assert!(!uses_gto_observation("oreans_themida"));
-        assert!(!uses_gto_observation("null"));
     }
 }

@@ -29,6 +29,7 @@ use mida_core::DebuggerCore;
 use mida_pe::{DumpProfile, EarlySectionSnapshot, PeHeader};
 
 use super::early_snapshots::update_pre_text_snapshots;
+use super::plugin_host::IatLocationHint;
 use super::session::ProcessSession;
 
 /// Product login window class for this GTO research sample (protected baseline).
@@ -39,6 +40,10 @@ const GTO_UI_POST_WINDOW_SETTLE: std::time::Duration = std::time::Duration::from
 /// Route H / no-bypass: extra settle after NewClassName so gscript/heap roots
 /// include post-GUI state (H1: early dump incomplete for cold UI).
 const GTO_NO_BYPASS_UI_POST_WINDOW_SETTLE: std::time::Duration = std::time::Duration::from_secs(5);
+const GTO_R4C_IAT_SIZE: usize = 0x11e0;
+const GTO_MAX_IAT_READ: usize = 40_960;
+const GTO_IAT_SCAN_CAP: usize = 0x3000;
+const GTO_MIN_IAT_SIZE: usize = 0x400;
 
 /// Outcome of the GTO observation stage: the recovered OEP candidate and
 /// whether it came from a frozen RIP (always `None` today — GTO uses scan).
@@ -46,6 +51,79 @@ const GTO_NO_BYPASS_UI_POST_WINDOW_SETTLE: std::time::Duration = std::time::Dura
 pub(super) struct GtoObservation {
     pub oep_addr: usize,
     pub frozen_rip: Option<usize>,
+    pub iat_override: Option<IatLocationHint>,
+}
+
+fn gto_iat_hint_from_live_span(
+    address: usize,
+    image_base: usize,
+    bytes: &[u8],
+) -> Option<IatLocationHint> {
+    if address == 0 || bytes.len() < 8 {
+        return None;
+    }
+
+    let slot_count = bytes.len() / 8;
+    let mut first_api = None;
+    let mut last_api = 0usize;
+    let mut miss_run = 0usize;
+    for slot in 0..slot_count {
+        let offset = slot * 8;
+        let value = u64::from_le_bytes(bytes[offset..offset + 8].try_into().ok()?) as usize;
+        let is_api = value >= 0x7FF0_0000_0000
+            || (value >= 0x1800_0000
+                && value < 0x7FFF_FFFF_FFFF
+                && !(value >= image_base && value < image_base.saturating_add(0x1000_0000)));
+        if is_api {
+            if first_api.is_none() {
+                first_api = Some(slot);
+            }
+            last_api = slot;
+            miss_run = 0;
+        } else if first_api.is_some() {
+            miss_run = miss_run.saturating_add(1);
+            if miss_run >= 48 {
+                break;
+            }
+        }
+    }
+
+    first_api?;
+    let r4c_slots = GTO_R4C_IAT_SIZE / 8;
+    let slots = last_api
+        .saturating_add(2)
+        .max(r4c_slots.saturating_sub(16))
+        .min(slot_count)
+        .min(r4c_slots);
+    let mut size = (slots * 8).min(GTO_MAX_IAT_READ).max(GTO_MIN_IAT_SIZE);
+    if last_api + 2 >= r4c_slots.saturating_sub(32) {
+        size = GTO_R4C_IAT_SIZE;
+    }
+    if size == 0
+        || size < GTO_MIN_IAT_SIZE
+        || size > GTO_R4C_IAT_SIZE
+        || size > bytes.len()
+        || !size.is_multiple_of(8)
+    {
+        return None;
+    }
+    Some(IatLocationHint { address, size })
+}
+
+fn observe_gto_iat_override(
+    dbg: &ProcessSession,
+    address: usize,
+    image_base: usize,
+    section_size: usize,
+) -> Option<IatLocationHint> {
+    let scan_size = section_size.min(GTO_MAX_IAT_READ).min(GTO_IAT_SCAN_CAP);
+    if address == 0 || scan_size < GTO_MIN_IAT_SIZE {
+        return None;
+    }
+    let mut bytes = vec![0u8; scan_size];
+    let bytes_read = dbg.read_memory(address, &mut bytes).ok()?;
+    let live_bytes = &bytes[..bytes_read.min(bytes.len())];
+    gto_iat_hint_from_live_span(address, image_base, live_bytes)
 }
 
 /// True when `pid` owns a top-level window with the given class name.
@@ -154,6 +232,7 @@ pub(super) fn observe_gto(
         .or_else(|| pe.sections.get(1));
     let iat_rva = rdata_sec.map(|s| s.virtual_address).unwrap_or(0xFD000);
     let iat_addr = image_base_usize + iat_rva as usize;
+    let iat_section_size = rdata_sec.map(|s| s.virtual_size as usize).unwrap_or(0x8000);
 
     log::log(
         LogType::Info,
@@ -419,8 +498,62 @@ pub(super) fn observe_gto(
         }
     };
 
+    let iat_override = observe_gto_iat_override(dbg, iat_addr, image_base_usize, iat_section_size);
+    match iat_override {
+        Some(hint) => log::log(
+            LogType::Info,
+            &format!(
+                "GTO observation: live IAT override address={:#x} size={:#x}",
+                hint.address, hint.size
+            ),
+        ),
+        None => log::log(
+            LogType::Warn,
+            "GTO observation: no valid live IAT span; shared discovery fallback remains active",
+        ),
+    }
+
     Ok(GtoObservation {
         oep_addr,
         frozen_rip,
+        iat_override,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn live_span_with_api_at(slot: usize) -> Vec<u8> {
+        let mut bytes = vec![0u8; GTO_IAT_SCAN_CAP];
+        let offset = slot * 8;
+        bytes[offset..offset + 8].copy_from_slice(&0x7FF9_1234_5678u64.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn gto_r4c_policy_preserves_11e0_size() {
+        let r4c_slots = GTO_R4C_IAT_SIZE / 8;
+        let bytes = live_span_with_api_at(r4c_slots - 34);
+        let hint = gto_iat_hint_from_live_span(0x1400_4000, 0x1400_0000, &bytes)
+            .expect("valid GTO live span");
+        assert_eq!(hint.address, 0x1400_4000);
+        assert_eq!(hint.size, GTO_R4C_IAT_SIZE);
+    }
+
+    #[test]
+    fn valid_gto_live_span_produces_hint() {
+        let bytes = live_span_with_api_at(16);
+        let hint = gto_iat_hint_from_live_span(0x1400_4000, 0x1400_0000, &bytes);
+        assert!(hint.is_some());
+    }
+
+    #[test]
+    fn missing_live_api_span_falls_back_to_none() {
+        let bytes = vec![0u8; GTO_IAT_SCAN_CAP];
+        assert_eq!(
+            gto_iat_hint_from_live_span(0x1400_4000, 0x1400_0000, &bytes),
+            None
+        );
+    }
 }

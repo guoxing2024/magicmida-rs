@@ -17,7 +17,7 @@ use crate::log::{self, LogType};
 use mida_core::{DebuggerCore, OepProvenance, RuntimeBase, Rva, Va};
 use mida_packers_themida::{
     create_data_sections, determine_iat_address, fix_iat, fixup_api_call_sites,
-    install_anti_dump_fix, shrink_pe, CompilerHint, IatFixStrategy, ThemidaState,
+    install_anti_dump_fix, shrink_pe, CompilerHint, IatFixStrategy, IatLocation, ThemidaState,
 };
 use mida_pe::{
     ContainerRestoreMode, DumpCapturePolicy, DumpOptions, DumpProfile, EarlySectionSnapshot,
@@ -28,6 +28,7 @@ use super::helpers::{compute_data_section_bounds, resolve_host_api};
 use super::iat_evidence::write_iat_evidence;
 use super::oep_evidence::write_oep_evidence;
 use super::oep_scan::{resolve_oep_va, scan_live_memory_for_real_oep};
+use super::plugin_host::IatLocationHint;
 use super::relocation_evidence::write_relocation_evidence;
 use super::section_rebuild_evidence::write_section_rebuild_evidence;
 use super::session::ProcessSession;
@@ -53,6 +54,7 @@ pub(super) fn run_post_loop_phases(
     skip_v3_iat_trace: bool,
     uses_oreans_iat_trace: bool,
     family_id: &str,
+    iat_override: Option<IatLocationHint>,
     oep_policy: OepPolicy,
     container_restore: ContainerRestoreMode,
     profile: DumpProfile,
@@ -99,18 +101,32 @@ pub(super) fn run_post_loop_phases(
     let mut text_buf = vec![0u8; text_size.min(0x100_000)];
     let _ = dbg.read_memory(text_start, &mut text_buf);
 
-    let iat = determine_iat_address(
-        dbg,
-        oep_addr,
-        text_start,
-        &text_buf,
-        data_section_base,
-        data_section_size,
-        state.pe_info.is_vm_oep,
-        CompilerHint::Auto,
-        &state.guard_addrs,
-    )?
-    .ok_or_else(|| anyhow!("IAT not found"))?;
+    let iat = if let Some(hint) = iat_override {
+        info!(
+            address = %format!("{:#x}", hint.address),
+            size = %format!("{:#x}", hint.size),
+            family = family_id,
+            "Using family-observed IAT override"
+        );
+        IatLocation {
+            address: hint.address,
+            size: hint.size,
+            requires_writable_section: false,
+        }
+    } else {
+        determine_iat_address(
+            dbg,
+            oep_addr,
+            text_start,
+            &text_buf,
+            data_section_base,
+            data_section_size,
+            state.pe_info.is_vm_oep,
+            CompilerHint::Auto,
+            &state.guard_addrs,
+        )?
+        .ok_or_else(|| anyhow!("IAT not found"))?
+    };
 
     log::log(
         LogType::Info,

@@ -75,8 +75,9 @@ use helpers::{
 use iat_trace::{handle_trace_step, TracePhase};
 use loop_state::LoopState;
 use plugin_host::{
-    dual_select_packer, enter_dump_phase, note_plugin_av_break, note_plugin_iat_complete,
-    plugin_leave_reason, refresh_plugin_loop_policy, sync_plugin_milestones,
+    dual_select_packer, enter_dump_phase, gto_heavy_capabilities_enabled, note_plugin_av_break,
+    note_plugin_iat_complete, plugin_leave_reason, refresh_plugin_loop_policy,
+    sync_plugin_milestones, validate_gto_route,
 };
 use post_attach::run_post_attach_path;
 use post_loop::run_post_loop_phases;
@@ -374,6 +375,15 @@ pub fn unpack(
         .first()
         .is_some_and(|s| s.name == ".text")
         && !is_dotnet;
+    if packer.uses_gto_observation() {
+        validate_gto_route(profile, text_is_plain_for_attach)
+            .map_err(|reason| anyhow!("GTO preflight blocked before process creation: {reason}"))?;
+        if !gto_heavy_capabilities_enabled(profile) {
+            warn!(
+                "GTO shared observation enabled; heavy capabilities remain disabled without --profile=ahk-gto-experimental"
+            );
+        }
+    }
     let opts = CreateProcessOptions {
         executable: input.to_path_buf(),
         command_line: None,
@@ -1480,6 +1490,7 @@ pub fn unpack(
         ls.process_exited || plugin_ctx.skip_v3_iat_trace,
         packer.uses_oreans_iat_trace(),
         packer.family_id(),
+        None,
         oep_policy,
         container_restore,
         profile,
