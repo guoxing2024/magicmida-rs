@@ -1,10 +1,10 @@
-//! P8.1.1-B: real CLI production evidence pipeline end-to-end.
+//! P8.1.1-B / P8.1.1.1-B: **single-production-bundle structured-domain E2E**.
 //!
-//! This crate-internal test drives the FULL production evidence chain through
-//! the real CLI producers — it never hand-constructs an acceptance evidence
-//! type to replace a producer, never hand-constructs an `OreansEvidenceBundle`
-//! or any bundle hash instead of the atomic assembler, and never substitutes a
-//! test fixture for a production function:
+//! This crate-internal test drives the real production evidence chain through
+//! the real CLI producers for ONE production bundle — it never hand-constructs
+//! an acceptance evidence type to replace a producer, never hand-constructs an
+//! `OreansEvidenceBundle` or any bundle hash instead of the atomic assembler,
+//! and never substitutes a test fixture for a production function:
 //!
 //!   synthetic candidate PE + replay report
 //!   -> write_oep_evidence / write_iat_evidence / write_tls_evidence /
@@ -22,10 +22,26 @@
 //! introduced — the digest/identity come exclusively from
 //! `RunEvidenceContext::new` (crate-private).
 //!
-//! The origin case carries the real production evidence under test. A minimal
-//! lunlun companion observation is supplied only to satisfy the two-sample
-//! gate's case-set requirement; it is not the production claim (its domains
-//! are left open/NotRun and are never asserted).
+//! # Claim boundary (P8.1.1.1-B)
+//!
+//! This is a **single-production-bundle structured-domain E2E**, not a
+//! two-bundle / bundle-gate E2E:
+//!
+//! - Only the **origin bundle** comes from the real atomic assembler; its four
+//!   structured domains (OEP / IAT / relocation / section-rebuild) are what the
+//!   test asserts pass.
+//! - The **lunlun companion** is a synthetic observation that only satisfies
+//!   the raw v8 two-sample gate's fixed case-set (`{origin_macro,
+//!   lunlun_software}`); it is not a separately-assembled production bundle and
+//!   its domains are left open / NotRun and never asserted.
+//! - This test therefore does **not** prove the two-bundle envelope consumer
+//!   (`mida.oreans-two-sample-bundle-gate/v1` with two sealed bundles).
+//!   Proving the two-bundle envelope consumer is deferred to **P9** with real
+//!   evidence.
+//!
+//! The positive test is intentionally named for this boundary
+//! (`single_production_bundle_structured_domain_e2e_four_domains_pass`); it is
+//! not described as a complete two-bundle / bundle-gate E2E.
 
 #[cfg(test)]
 mod tests {
@@ -465,8 +481,11 @@ mod tests {
 
     /// A lunlun companion observation: the same production sidecars (already
     /// valid structured evidence) re-labeled for the second fixed case. It is
-    /// NOT the production claim under test — origin is. It only satisfies the
-    /// two-sample gate's case-set requirement.
+    /// **synthetic** — it is NOT a separately-assembled production bundle. It
+    /// only satisfies the raw v8 two-sample gate's fixed case-set
+    /// (`{origin_macro, lunlun_software}`). Its domains are left open / NotRun
+    /// and never asserted. Proving a real second production bundle (and the
+    /// two-bundle envelope consumer) is deferred to P9.
     fn companion_lunlun(
         origin: &mida_acceptance::OreansSampleObservation,
     ) -> mida_acceptance::OreansSampleObservation {
@@ -488,10 +507,13 @@ mod tests {
         assert_eq!(bundle.manifest_sha256.len(), 64);
     }
 
-    /// Positive: five real producers -> real assembler -> independent
-    /// validator -> v8 gate. Origin's four structured domains pass.
+    /// Positive: single-production-bundle structured-domain E2E. Five real
+    /// producers -> real assembler -> independent validator -> v8 gate.
+    /// Origin's four structured domains pass. This is NOT a two-bundle
+    /// envelope E2E (the lunlun companion is synthetic and only satisfies the
+    /// raw gate's case set; the two-bundle envelope consumer is P9).
     #[test]
-    fn production_evidence_pipeline_four_domains_pass() {
+    fn single_production_bundle_structured_domain_e2e_four_domains_pass() {
         let run = build_run();
         let bundle_output = assemble(&run, context(&run));
 

@@ -2122,8 +2122,47 @@ fn remove_dump_and_manifest(output: &Path) -> Result<(), String> {
 
 /// Bound artifact manifest: candidate digest + transforms.
 /// Always written (empty entries for clean dumps). Fail-closed.
-/// Exposed so crate tests call the real production writer (never a test-only
-/// re-assembly of the manifest).
+///
+/// # Production API contract
+///
+/// This is a supported production writer, used by the real dump paths
+/// [`dump_process_with_report`] and [`dump_dotnet_with_source`] to emit the
+/// sibling `.transform_manifest.json` that binds a candidate's digest to the
+/// dump/transform ledger. It is also the seam the production evidence pipeline
+/// uses to produce the transform-manifest bundle member through the same
+/// writer (never a test-only re-assembly).
+///
+/// ## Parameters
+/// - `output`: candidate PE path. The manifest is written to the sibling
+///   `output` with extension `.transform_manifest.json` (via
+///   [`transform_manifest_path`]).
+/// - `candidate_bytes`: exact candidate bytes whose digest and size are
+///   recorded. The caller must pass the same bytes that are serialized to
+///   `output`; the writer computes the digest itself rather than trusting a
+///   caller-supplied digest.
+/// - `transforms`: ordered list of `(id, kind)` transform ledger entries. An
+///   empty list records a clean dump (standard reconstruction only per the
+///   transform taxonomy). A non-empty list records diagnostic transforms that
+///   block product `Accepted` unless a registered rule exists.
+/// - `input`: optional protected/source input path used only for the fail-closed
+///   alias guard (see below). `None` is permitted and skips the alias check.
+///
+/// ## Identity constraints
+/// The recorded `candidate_sha256` / `candidate_size_bytes` are computed from
+/// `candidate_bytes`, so a manifest is always self-consistent with the exact
+/// candidate bytes passed in. The writer never accepts a caller-supplied
+/// digest, so a caller cannot record a digest for bytes it did not pass.
+///
+/// ## Atomic write semantics
+/// The manifest is written through [`replace_file_atomic`]: an exclusive
+/// temp-then-`MoveFileExW(REPLACE_EXISTING|WRITE_THROUGH)` (Windows) or
+/// rename-onto-non-existing (elsewhere) sequence with no delete-then-rename
+/// gap. If `input` aliases the destination manifest path, the write is refused
+/// (`output_aliases_input`) rather than overwriting the input.
+///
+/// ## Error contract
+/// `Err(PeError)` on alias collision or I/O failure. The manifest is either
+/// written in full or not at all.
 pub fn write_bound_transform_manifest(
     output: &Path,
     candidate_bytes: &[u8],
@@ -3111,5 +3150,138 @@ mod edata_relocation_tests {
             pe.sections.iter().all(|s| !s.name.starts_with(".edata")),
             "no .edata section must be created on rejection"
         );
+    }
+}
+
+#[cfg(test)]
+mod transform_manifest_tests {
+    use super::*;
+
+    fn temp(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "mida_tfm_{}_{}_{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The writer derives the sibling `.transform_manifest.json` from the
+    /// candidate path and records the candidate's own digest/size.
+    #[test]
+    fn writes_manifest_with_candidate_digest_and_sibling_path() {
+        let dir = temp("sibling");
+        let candidate = dir.join("candidate.exe");
+        let candidate_bytes = b"candidate image bytes";
+        write_bound_transform_manifest(&candidate, candidate_bytes, &[], None).unwrap();
+        let manifest = candidate.with_extension("transform_manifest.json");
+        assert!(manifest.is_file());
+        let text = std::fs::read_to_string(&manifest).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["schema_version"], "mida.transform-manifest/v0");
+        assert_eq!(
+            value["candidate_sha256"],
+            candidate_sha256_hex(candidate_bytes)
+        );
+        assert_eq!(value["candidate_size_bytes"], candidate_bytes.len() as u64);
+        // Clean dump: empty entries ledger.
+        assert_eq!(value["entries"], serde_json::Value::Array(vec![]));
+    }
+
+    /// A caller-supplied digest is never trusted; the recorded digest is always
+    /// computed from the exact candidate bytes passed.
+    #[test]
+    fn manifest_digest_binds_to_passed_bytes_not_path() {
+        let dir = temp("bind");
+        let candidate = dir.join("candidate.exe");
+        let a = b"first bytes";
+        let b = b"second bytes";
+        write_bound_transform_manifest(&candidate, a, &[], None).unwrap();
+        let text_a =
+            std::fs::read_to_string(&candidate.with_extension("transform_manifest.json")).unwrap();
+        let sha_a: String = serde_json::from_str::<serde_json::Value>(&text_a).unwrap()
+            ["candidate_sha256"]
+            .as_str()
+            .unwrap()
+            .into();
+        assert_eq!(sha_a, candidate_sha256_hex(a));
+
+        write_bound_transform_manifest(&candidate, b, &[], None).unwrap();
+        let text_b =
+            std::fs::read_to_string(&candidate.with_extension("transform_manifest.json")).unwrap();
+        let sha_b: String = serde_json::from_str::<serde_json::Value>(&text_b).unwrap()
+            ["candidate_sha256"]
+            .as_str()
+            .unwrap()
+            .into();
+        assert_eq!(sha_b, candidate_sha256_hex(b));
+        assert_ne!(sha_a, sha_b);
+    }
+
+    /// Non-empty transforms serialize into the ledger with taxonomy note.
+    #[test]
+    fn records_transform_entries() {
+        let dir = temp("transforms");
+        let candidate = dir.join("candidate.exe");
+        let bytes = b"image";
+        write_bound_transform_manifest(
+            &candidate,
+            bytes,
+            &[("sample_bypass", "relocation"), ("oep_fix", "oep")],
+            None,
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&candidate.with_extension("transform_manifest.json")).unwrap(),
+        )
+        .unwrap();
+        let entries = value["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["id"], "sample_bypass");
+        assert_eq!(entries[0]["kind"], "relocation");
+        assert_eq!(entries[1]["id"], "oep_fix");
+        assert_eq!(entries[1]["kind"], "oep");
+        assert!(value["note"]
+            .as_str()
+            .unwrap()
+            .contains("diagnostic transforms"));
+    }
+
+    /// Fail-closed alias guard: writing a manifest over an input that aliases
+    /// the destination manifest path is refused, never overwriting the input.
+    #[test]
+    fn refuses_to_overwrite_input_alias() {
+        let dir = temp("alias");
+        let candidate = dir.join("candidate.exe");
+        // The destination manifest path derives to `candidate.transform_manifest.json`.
+        let manifest_dest = candidate.with_extension("transform_manifest.json");
+        // An input that aliases that exact destination must be refused.
+        std::fs::write(&manifest_dest, b"original input").unwrap();
+        let err = write_bound_transform_manifest(&candidate, b"bytes", &[], Some(&manifest_dest))
+            .expect_err("alias write must be refused");
+        assert!(format!("{err}").contains("alias"));
+        // The input must be untouched.
+        assert_eq!(
+            std::fs::read_to_string(&manifest_dest).unwrap(),
+            "original input"
+        );
+    }
+
+    /// Atomic write: the manifest appears atomically; the JSON is well-formed.
+    #[test]
+    fn manifest_is_well_formed_json_and_reads_back() {
+        let dir = temp("atomic");
+        let candidate = dir.join("candidate.exe");
+        write_bound_transform_manifest(&candidate, b"data", &[("x", "y")], None).unwrap();
+        let manifest = candidate.with_extension("transform_manifest.json");
+        let parsed: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest).unwrap())
+            .expect("manifest must be valid JSON");
+        assert_eq!(parsed["schema_version"], "mida.transform-manifest/v0");
+        assert_eq!(parsed["taxonomy_version"], "mida.transform-taxonomy/v1");
     }
 }
