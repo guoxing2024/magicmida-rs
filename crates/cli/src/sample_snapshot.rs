@@ -205,12 +205,55 @@ pub fn validate_logical_sample_id(id: &str) -> Result<(), CaptureError> {
     Ok(())
 }
 
-/// Validate a content hash: exactly 64 lowercase hex chars.
+/// Validate a content hash: exactly 64 hex chars (any case accepted).
+///
+/// Callers MUST use [`canonical_hash`] before treating the value as an
+/// identity/hash component so resolve, verified resolve, and revision
+/// construction all agree on the same lowercase canonical form.
 pub fn validate_hash(sha256: &str) -> Result<(), CaptureError> {
     if sha256.len() != 64 || !sha256.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(CaptureError::InvalidHash(sha256.to_string()));
     }
     Ok(())
+}
+
+/// Canonical (lowercase) form of a validated SHA-256 hex string. All identity,
+/// path, and revision construction must use this form so that upper/mixed-case
+/// inputs never diverge from the canonical address.
+pub fn canonical_hash(sha256: &str) -> String {
+    sha256.to_ascii_lowercase()
+}
+
+/// Explicit no-replace publish outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublishOutcome {
+    /// We won the race: the temp file became the final snapshot.
+    Published,
+    /// The target already exists; nothing was overwritten.
+    AlreadyExists,
+}
+
+/// Atomically promote `temp` to `target` with NO-REPLACE semantics.
+///
+/// Windows `fs::rename` (MoveFile) already refuses to overwrite an existing
+/// destination, but that platform behavior is NOT portable: on Unix `rename`
+/// silently replaces. This helper makes the no-replace guarantee explicit and
+/// deterministic on every platform:
+/// - if `target` exists at entry, return [`PublishOutcome::AlreadyExists`]
+///   without touching it;
+/// - otherwise attempt the rename; if it fails because the target appeared
+///   concurrently (a racing publisher), return [`PublishOutcome::AlreadyExists`]
+///   (do not retry/overwrite);
+/// - only a successful rename returns [`PublishOutcome::Published`].
+fn publish_no_replace(temp: &Path, target: &Path) -> std::io::Result<PublishOutcome> {
+    if target.exists() {
+        return Ok(PublishOutcome::AlreadyExists);
+    }
+    match fs::rename(temp, target) {
+        Ok(()) => Ok(PublishOutcome::Published),
+        Err(_) if target.exists() => Ok(PublishOutcome::AlreadyExists),
+        Err(e) => Err(e),
+    }
 }
 
 /// Capture an immutable snapshot of `source` into `snapshot_root`.
@@ -241,19 +284,21 @@ pub fn capture_snapshot(
         logical_sample_id,
         provenance_tool_revision,
         None,
+        None,
     )
 }
 
-/// Internal capture with an optional hook invoked between the two source reads.
-/// The hook is a pure TEST seam (production passes `None`): it lets a test
-/// mutate the source file mid-capture to deterministically exercise the
-/// `SourceChangedDuringCapture` fail-closed path without racing.
+/// Internal capture with optional hooks invoked between the two source reads and
+/// before publish. The hooks are a pure TEST seam (production passes `None`):
+/// they let a test mutate/delete the source or inject a racy target
+/// deterministically without racing.
 fn capture_snapshot_impl(
     source: &Path,
     snapshot_root: &Path,
     logical_sample_id: &str,
     provenance_tool_revision: &str,
     mut before_second_read: Option<Box<dyn FnMut() + Send>>,
+    mut before_publish: Option<Box<dyn FnMut() + Send>>,
 ) -> Result<SampleSnapshot, CaptureError> {
     validate_logical_sample_id(logical_sample_id)?;
 
@@ -271,33 +316,55 @@ fn capture_snapshot_impl(
     let target_file = target_dir.join(SNAPSHOT_FILENAME);
 
     // Idempotent reuse: if a complete, verified snapshot already exists for this
-    // content address, reuse it. NEVER overwrite. If it exists but its on-disk
-    // content does not match the intended hash/size, fail closed.
+    // content address, reuse it. NEVER overwrite and NEVER delete it. Crucially,
+    // the reuse path STILL completes BOTH source reads: the existing snapshot is
+    // only trusted if the source is verified stable across the whole capture,
+    // exactly like the fresh-capture path. If the source changes or becomes
+    // unreadable while we verify the existing snapshot, we fail closed.
     if target_file.is_file() {
-        match verified_read_snapshot(snapshot_root, logical_sample_id, &first_sha) {
-            Ok(snap)
-                if snap.snapshot_sha256 == first_sha && snap.snapshot_size_bytes == first_size =>
-            {
-                return Ok(sample_snapshot_from_verified(
-                    &snap,
-                    snapshot_root,
-                    source,
-                    provenance_tool_revision,
-                ));
-            }
-            Ok(_) => {
-                return Err(CaptureError::SnapshotAlreadyExistsButMismatch(format!(
-                    "{} exists but verified content does not match intended hash/size",
-                    target_file.display()
-                )));
-            }
+        let verified = match verified_read_snapshot(snapshot_root, logical_sample_id, &first_sha) {
+            Ok(v) => v,
             Err(e) => {
+                // Existing target present but unverifiable (tampered/truncated/
+                // replaced). Refuse; do NOT overwrite and do NOT delete it.
                 return Err(CaptureError::SnapshotAlreadyExistsButMismatch(format!(
                     "{} exists but verified re-read failed: {e}",
                     target_file.display()
                 )));
             }
+        };
+        // The on-disk snapshot must actually match the intended hash/size.
+        if verified.snapshot_sha256 != first_sha || verified.snapshot_size_bytes != first_size {
+            return Err(CaptureError::SnapshotAlreadyExistsButMismatch(format!(
+                "{} exists but verified content does not match intended hash/size",
+                target_file.display()
+            )));
         }
+
+        // TEST seam: allow a test to mutate/delete the source after the existing
+        // snapshot has been verified but before the second read.
+        if let Some(hook) = before_second_read.as_mut() {
+            hook();
+        }
+
+        // Second read of the source — mandatory in the reuse path too.
+        let second = fs::read(source).map_err(|e| CaptureError::SourceUnreadable(e.to_string()))?;
+        let second_sha = sha256_hex(&second);
+        let second_size = second.len() as u64;
+
+        // Fail-closed stability: source must be identical across both reads. The
+        // existing snapshot is NOT deleted; we simply refuse to reuse it.
+        if first_sha != second_sha || first_size != second_size {
+            return Err(CaptureError::SourceChangedDuringCapture);
+        }
+
+        // Stable source + verified existing snapshot -> reuse it idempotently.
+        return Ok(sample_snapshot_from_verified(
+            &verified,
+            snapshot_root,
+            source,
+            provenance_tool_revision,
+        ));
     }
 
     fs::create_dir_all(&target_dir)
@@ -306,7 +373,7 @@ fn capture_snapshot_impl(
     // Unique temp file (never a fixed `.capturing.tmp`) so concurrent captures
     // never collide. A small guard ensures EVERY failure path removes it.
     let temp_file = target_dir.join(unique_temp_name());
-    let mut guard = TempGuard(temp_file.clone());
+    let mut guard = TempGuard::new(temp_file.clone());
     if let Err(e) = fs::write(&temp_file, &first) {
         return Err(CaptureError::SnapshotWriteFailed(e.to_string()));
     }
@@ -317,13 +384,24 @@ fn capture_snapshot_impl(
     let snap_sha = sha256_hex(&snap_bytes);
     let snap_size = snap_bytes.len() as u64;
 
-    // TEST seam: allow a test to mutate the source before the second read.
+    // TEST seam: allow a test to mutate/delete the source before the second read.
     if let Some(hook) = before_second_read.as_mut() {
         hook();
     }
 
     // Second read of the source.
-    let second = fs::read(source).map_err(|e| CaptureError::SourceUnreadable(e.to_string()))?;
+    let second = match fs::read(source) {
+        Ok(b) => b,
+        Err(e) => {
+            // Second read failed (e.g. source deleted mid-capture). Fail closed
+            // and remove OUR temp file and the (now empty) target dir. We never
+            // remove a directory that a concurrent task has populated — the
+            // `remove_dir` below only succeeds on an empty dir.
+            drop(guard); // removes temp file
+            let _ = fs::remove_dir(&target_dir);
+            return Err(CaptureError::SourceUnreadable(e.to_string()));
+        }
+    };
     let second_sha = sha256_hex(&second);
     let second_size = second.len() as u64;
 
@@ -340,23 +418,26 @@ fn capture_snapshot_impl(
         return Err(CaptureError::SourceChangedDuringCapture);
     }
 
-    // Publish: promote the temp file to the final content-addressed name.
-    // Windows `rename` does not overwrite an existing target, so handle the
-    // concurrent case: if the target already exists, verify it matches; if it
-    // does, reuse it (idempotent) and drop our temp; if it mismatches, fail.
-    let publish_result = fs::rename(&temp_file, &target_file);
-    match publish_result {
-        Ok(()) => {
-            guard.disarm();
+    // TEST seam: allow a test to inject a racy target between temp verification
+    // and publish, exercising the no-replace path deterministically.
+    if let Some(hook) = before_publish.as_mut() {
+        hook();
+    }
+
+    // Publish with explicit no-replace semantics. If the target already exists
+    // (a concurrent capture published the same bytes), verify it; identical ->
+    // reuse, mismatch/unverifiable -> fail-closed. We NEVER overwrite.
+    match publish_no_replace(&temp_file, &target_file) {
+        Ok(PublishOutcome::Published) => {
+            guard.disarm(); // temp no longer exists (it was renamed)
         }
-        Err(_) if target_file.is_file() => {
-            // A concurrent capture may have published the same bytes.
+        Ok(PublishOutcome::AlreadyExists) => {
+            drop(guard); // remove our temp; we did not publish it
             match verified_read_snapshot(snapshot_root, logical_sample_id, &first_sha) {
                 Ok(snap)
                     if snap.snapshot_sha256 == first_sha
                         && snap.snapshot_size_bytes == first_size =>
                 {
-                    drop(guard); // remove our temp; reuse the concurrent one
                     return Ok(sample_snapshot_from_verified(
                         &snap,
                         snapshot_root,
@@ -400,32 +481,56 @@ fn capture_snapshot_impl(
 }
 
 /// RAII guard that removes the temp file on drop unless disarmed.
-struct TempGuard(PathBuf);
+struct TempGuard {
+    path: PathBuf,
+    /// Whether the temp file should be removed on drop. `disarm()` flips this to
+    /// `false` once the file has been successfully promoted (renamed) so drop
+    /// does not attempt to delete a file that no longer exists / that now is the
+    /// published snapshot.
+    armed: bool,
+}
 
 impl TempGuard {
-    fn disarm(&mut self) {}
+    fn new(path: PathBuf) -> Self {
+        TempGuard { path, armed: true }
+    }
+
+    /// Disarm the guard: drop will no longer remove the temp file. Only call
+    /// this after the temp file has been renamed to its final destination.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
 }
 
 impl Drop for TempGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
+        if self.armed {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
 /// Resolve the immutable snapshot file for a known content address
 /// (`<logical_id>/<sha256>/snapshot.bin`) if it exists, WITHOUT re-verifying
 /// content. Prefer [`verified_read_snapshot`] before staging.
+///
+/// The hash is canonicalized to lowercase so upper/mixed-case callers still
+/// resolve to the same content address.
 pub fn resolve_snapshot(
     snapshot_root: &Path,
     logical_sample_id: &str,
     sha256: &str,
 ) -> Option<PathBuf> {
-    if validate_logical_sample_id(logical_sample_id).is_err() || validate_hash(sha256).is_err() {
+    if validate_logical_sample_id(logical_sample_id).is_err() {
+        return None;
+    }
+    let hash = canonical_hash(sha256);
+    if validate_hash(&hash).is_err() {
         return None;
     }
     let p = snapshot_root
         .join(logical_sample_id)
-        .join(sha256)
+        .join(&hash)
         .join(SNAPSHOT_FILENAME);
     p.is_file().then_some(p)
 }
@@ -440,6 +545,9 @@ pub struct VerifiedSnapshot {
     pub snapshot_sha256: String,
     pub snapshot_size_bytes: u64,
     pub snapshot_abs_path: PathBuf,
+    /// The verified on-disk bytes, so a caller can re-derive identity (e.g. PE
+    /// identity) from the actual content rather than trusting a cached struct.
+    pub snapshot_bytes: Vec<u8>,
 }
 
 /// Re-read a snapshot from disk and fail-closed unless:
@@ -453,7 +561,7 @@ pub fn verified_read_snapshot(
     sha256: &str,
 ) -> Result<VerifiedSnapshot, CaptureError> {
     validate_logical_sample_id(logical_sample_id)?;
-    let hash = sha256.to_ascii_lowercase();
+    let hash = canonical_hash(sha256);
     validate_hash(&hash)?;
     let p = snapshot_root
         .join(logical_sample_id)
@@ -485,6 +593,7 @@ pub fn verified_read_snapshot(
         snapshot_sha256: actual_sha,
         snapshot_size_bytes: actual_size,
         snapshot_abs_path: p,
+        snapshot_bytes: bytes,
     })
 }
 
@@ -524,6 +633,10 @@ impl SampleSnapshot {
 
 /// Build a `SampleSnapshot` from a verified snapshot (idempotent-reuse path).
 /// The source path and tool revision are provenance only.
+///
+/// Identity-related fields (logical_sample_id, revision, snapshot hash/size, and
+/// PE identity) are derived from the VERIFIED on-disk bytes so a reused snapshot
+/// carries the same identity metadata as a fresh capture of the same bytes.
 fn sample_snapshot_from_verified(
     verified: &VerifiedSnapshot,
     snapshot_root: &Path,
@@ -539,7 +652,7 @@ fn sample_snapshot_from_verified(
         snapshot_sha256: verified.snapshot_sha256.clone(),
         source_size_bytes: verified.snapshot_size_bytes,
         snapshot_size_bytes: verified.snapshot_size_bytes,
-        pe_identity: None,
+        pe_identity: pe_identity_of(&verified.snapshot_bytes),
         packer_family_observation: None,
         capture_status: CaptureStatus::Captured,
         provenance_tool_revision: provenance_tool_revision.to_string(),
@@ -550,36 +663,48 @@ fn sample_snapshot_from_verified(
 
 /// Build a `StagingIdentity` from a VERIFIED snapshot (the only trustworthy
 /// source for staging). Rejects an in-memory-only identity.
+///
+/// The revision is DERIVED from the canonical hash and logical id rather than
+/// copied verbatim from a possibly-forged in-memory value.
 pub fn staging_identity_from_verified(
     verified: &VerifiedSnapshot,
     source_path: &Path,
 ) -> StagingIdentity {
+    let canonical = canonical_hash(&verified.snapshot_sha256);
     StagingIdentity {
         logical_sample_id: verified.logical_sample_id.clone(),
-        revision: verified.revision.clone(),
-        snapshot_sha256: verified.snapshot_sha256.clone(),
+        revision: revision_id(&verified.logical_sample_id, &canonical),
+        snapshot_sha256: canonical,
         snapshot_size_bytes: verified.snapshot_size_bytes,
         source_path: source_path.to_path_buf(),
     }
 }
 
-/// Fail-closed: true only when the staging identity's snapshot hash AND size
-/// match an expected manifest identity exactly, AND the on-disk snapshot is
-/// re-verified (so a forged in-memory identity cannot bypass). A mismatch
-/// (wrong revision, tampered/forged hash/size, missing/corrupt disk file) is
-/// refused.
+/// Fail-closed: true only when the staging identity's snapshot hash, SIZE, AND
+/// REVISION all match the expected manifest identity exactly, AND the on-disk
+/// snapshot is re-verified (so a forged in-memory identity cannot bypass).
+///
+/// A mismatch (wrong revision, tampered/forged hash/size, missing/corrupt disk
+/// file) is refused. The revision must equal
+/// `revision_id(logical_sample_id, canonical_snapshot_sha256)`.
 pub fn staging_identity_matches(
     staging: &StagingIdentity,
     snapshot_root: &Path,
     expected_sha256: &str,
     expected_size_bytes: u64,
 ) -> bool {
+    let canonical = canonical_hash(expected_sha256);
     // The identity must claim the expected hash/size...
-    let hash_ok = staging
-        .snapshot_sha256
-        .eq_ignore_ascii_case(expected_sha256)
+    let hash_ok = canonical_hash(&staging.snapshot_sha256) == canonical
         && staging.snapshot_size_bytes == expected_size_bytes;
     if !hash_ok {
+        return false;
+    }
+    // ...and its revision must be the hash-derived revision of its OWN logical
+    // id + canonical hash. A `StagingIdentity` with correct hash/size but a
+    // forged/re-ordered revision is rejected.
+    let expected_revision = revision_id(&staging.logical_sample_id, &canonical);
+    if staging.revision != expected_revision {
         return false;
     }
     // ...and the on-disk snapshot must actually verify to that hash/size.
@@ -659,6 +784,7 @@ mod tests {
             Some(Box::new(move || {
                 fs::write(&hook_src, b"VERSION-TWO-PAYLOAD-DIFFERENT").unwrap();
             })),
+            None,
         );
         assert_eq!(result, Err(CaptureError::SourceChangedDuringCapture));
         // No snapshot file was kept (temp deleted, dir removed if empty).
@@ -984,6 +1110,7 @@ mod tests {
             Some(Box::new(move || {
                 fs::write(&hook_src, b"CLEANUP-REV-B-DIFFERENT").unwrap();
             })),
+            None,
         )
         .unwrap_err();
         assert_eq!(err, CaptureError::SourceChangedDuringCapture);
@@ -1033,5 +1160,363 @@ mod tests {
             &format!("{}/..", "a".repeat(62))
         )
         .is_none());
+    }
+
+    /// R2-1: the idempotent-reuse path STILL completes both source reads. If the
+    /// source changes between the first read and the second read (while the
+    /// existing snapshot is being verified), capture fails closed and the
+    /// pre-existing revision A is preserved (never deleted/overwritten).
+    #[test]
+    fn reuse_path_source_change_during_verification_fails_closed() {
+        let root = temp_root("reuse_change");
+        let src = root.join("src.bin");
+        fs::write(&src, b"REUSE-REV-A-CONTENT").unwrap();
+        let snap_root = root.join("snapshots");
+        // Capture revision A.
+        let a = capture_snapshot(&src, &snap_root, "gto_launcher", "rev").unwrap();
+        let a_hash = a.snapshot_sha256.clone();
+        let a_path = a.snapshot_abs_path.clone();
+        let a_bytes = fs::read(&a_path).unwrap();
+
+        // Second capture reads A first, the existing snapshot verifies, then the
+        // source is mutated to B BEFORE the second read. Must fail closed.
+        let hook_src = src.clone();
+        let err = capture_snapshot_impl(
+            &src,
+            &snap_root,
+            "gto_launcher",
+            "rev",
+            Some(Box::new(move || {
+                fs::write(&hook_src, b"REUSE-REV-B-DIFFERENT").unwrap();
+            })),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(err, CaptureError::SourceChangedDuringCapture);
+
+        // Revision A is preserved: not deleted, not overwritten, still verifies.
+        assert!(a_path.is_file());
+        assert_eq!(fs::read(&a_path).unwrap(), a_bytes);
+        assert!(verified_read_snapshot(&snap_root, "gto_launcher", &a_hash).is_ok());
+        // No revision B was published (source changed).
+        let b_hash = sha256_hex(b"REUSE-REV-B-DIFFERENT");
+        assert!(
+            !snap_root
+                .join("gto_launcher")
+                .join(&b_hash)
+                .join(SNAPSHOT_FILENAME)
+                .exists(),
+            "no revision B may be published when the source changed"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// R2-2: deleting the source after the existing snapshot is verified but
+    /// before the second read causes the second read to fail; capture fails
+    /// closed and the existing revision A is preserved.
+    #[test]
+    fn reuse_path_second_read_fails_when_source_deleted() {
+        let root = temp_root("reuse_delete");
+        let src = root.join("src.bin");
+        fs::write(&src, b"REUSE-DELETE-A").unwrap();
+        let snap_root = root.join("snapshots");
+        let a = capture_snapshot(&src, &snap_root, "gto_launcher", "rev").unwrap();
+        let a_hash = a.snapshot_sha256.clone();
+        let a_path = a.snapshot_abs_path.clone();
+        let a_bytes = fs::read(&a_path).unwrap();
+
+        // Delete the source between verification and the second read.
+        let hook_src = src.clone();
+        let err = capture_snapshot_impl(
+            &src,
+            &snap_root,
+            "gto_launcher",
+            "rev",
+            Some(Box::new(move || {
+                fs::remove_file(&hook_src).unwrap();
+            })),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, CaptureError::SourceUnreadable(_)),
+            "second-read failure must be fail-closed unreadable, got {err:?}"
+        );
+        // Existing snapshot preserved.
+        assert!(a_path.is_file());
+        assert_eq!(fs::read(&a_path).unwrap(), a_bytes);
+        assert!(verified_read_snapshot(&snap_root, "gto_launcher", &a_hash).is_ok());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// R2-4: a second-read failure in the FRESH-capture path (source deleted
+    /// after the temp is written) leaves no `.capturing-*`, no `snapshot.bin`,
+    /// and no leftover empty hash directory. The cleanup must run after the temp
+    /// write, so this exercises the real "source vanished mid-capture" case, not
+    /// a fake first-read-missing scenario.
+    #[test]
+    fn second_read_failure_cleans_temp_and_empty_hash_dir() {
+        let root = temp_root("second_read_cleanup");
+        let src = root.join("src.bin");
+        fs::write(&src, b"SECOND-READ-CLEANUP-A").unwrap();
+        let snap_root = root.join("snapshots");
+        let sha_a = sha256_hex(b"SECOND-READ-CLEANUP-A");
+        let dir_a = snap_root.join("gto_launcher").join(&sha_a);
+
+        // Delete the source between the two reads (after first read + temp write).
+        let hook_src = src.clone();
+        let err = capture_snapshot_impl(
+            &src,
+            &snap_root,
+            "gto_launcher",
+            "rev",
+            Some(Box::new(move || {
+                fs::remove_file(&hook_src).unwrap();
+            })),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, CaptureError::SourceUnreadable(_)),
+            "got {err:?}"
+        );
+        // No .capturing-* anywhere under the hash dir.
+        let entries: Vec<String> = fs::read_dir(&dir_a)
+            .map(|d| {
+                d.map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        assert!(
+            entries.iter().all(|n| !n.starts_with(".capturing-")),
+            "no leftover temp files: {entries:?}"
+        );
+        assert!(
+            !dir_a.join(SNAPSHOT_FILENAME).exists(),
+            "no snapshot.bin may be kept on a failed second read"
+        );
+        // The hash dir must be empty (or removed entirely).
+        assert!(
+            fs::read_dir(&dir_a)
+                .map(|mut d| d.next().is_none())
+                .unwrap_or(true),
+            "hash dir {} must be empty/removed after a failed second read",
+            dir_a.display()
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// R2-3a: revision-only forgery. The logical id, hash, size, and on-disk
+    /// file are all correct; ONLY the revision string is wrong. Staging must
+    /// reject it.
+    #[test]
+    fn only_revision_is_forged_rejected() {
+        let root = temp_root("rev_forged");
+        let src = root.join("src.bin");
+        fs::write(&src, b"REV-FORGERY-CONTENT").unwrap();
+        let snap_root = root.join("snapshots");
+        let snap = capture_snapshot(&src, &snap_root, "gto_launcher", "rev").unwrap();
+
+        // Everything correct EXCEPT revision.
+        let forged = StagingIdentity {
+            logical_sample_id: snap.logical_sample_id.clone(),
+            revision: "gto_launcher@sha256-0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            snapshot_sha256: snap.snapshot_sha256.clone(),
+            snapshot_size_bytes: snap.snapshot_size_bytes,
+            source_path: src.clone(),
+        };
+        assert_ne!(forged.revision, snap.revision);
+        // Real disk + correct hash/size are NOT enough: the revision is checked.
+        assert!(!staging_identity_matches(
+            &forged,
+            &snap_root,
+            &snap.snapshot_sha256,
+            snap.snapshot_size_bytes
+        ));
+
+        // The genuine identity still matches.
+        let ok = staging_identity_from_verified(
+            &verified_read_snapshot(&snap_root, "gto_launcher", &snap.snapshot_sha256).unwrap(),
+            &src,
+        );
+        assert!(staging_identity_matches(
+            &ok,
+            &snap_root,
+            &snap.snapshot_sha256,
+            snap.snapshot_size_bytes
+        ));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// R2-3b: a revision built from a DIFFERENT hash (or a DIFFERENT logical id)
+    /// is rejected even when hash/size/disk match.
+    #[test]
+    fn revision_with_wrong_hash_or_logical_id_rejected() {
+        let root = temp_root("rev_wrong");
+        let src = root.join("src.bin");
+        fs::write(&src, b"REV-WRONG-CONTENT").unwrap();
+        let snap_root = root.join("snapshots");
+        let snap = capture_snapshot(&src, &snap_root, "gto_launcher", "rev").unwrap();
+        let other_hash = sha256_hex(b"OTHER-BYTES-NOT-THE-SNAPSHOT");
+
+        // (a) revision derived from a different hash.
+        let wrong_hash_rev = StagingIdentity {
+            logical_sample_id: snap.logical_sample_id.clone(),
+            revision: revision_id("gto_launcher", &other_hash),
+            snapshot_sha256: snap.snapshot_sha256.clone(),
+            snapshot_size_bytes: snap.snapshot_size_bytes,
+            source_path: src.clone(),
+        };
+        assert!(!staging_identity_matches(
+            &wrong_hash_rev,
+            &snap_root,
+            &snap.snapshot_sha256,
+            snap.snapshot_size_bytes
+        ));
+
+        // (b) revision derived from a different logical id.
+        let wrong_id_rev = StagingIdentity {
+            logical_sample_id: snap.logical_sample_id.clone(),
+            revision: revision_id("some_other_logical", &snap.snapshot_sha256),
+            snapshot_sha256: snap.snapshot_sha256.clone(),
+            snapshot_size_bytes: snap.snapshot_size_bytes,
+            source_path: src.clone(),
+        };
+        assert!(!staging_identity_matches(
+            &wrong_id_rev,
+            &snap_root,
+            &snap.snapshot_sha256,
+            snap.snapshot_size_bytes
+        ));
+
+        // Genuine still matches.
+        assert!(staging_identity_matches(
+            &snap.to_staging_identity(),
+            &snap_root,
+            &snap.snapshot_sha256,
+            snap.snapshot_size_bytes
+        ));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// R2-5: fresh and reused snapshots of the same bytes carry IDENTICAL
+    /// identity metadata (revision, hash, size, PE identity, logical id). Only
+    /// the provenance fields (source_path, captured_at, provenance_tool_revision)
+    /// may reflect the specific capture.
+    #[test]
+    fn fresh_and_reused_snapshot_have_same_identity_metadata() {
+        let root = temp_root("fresh_reuse_identity");
+        let src = root.join("src.bin");
+        // A minimal valid PE so `pe_identity_of` produces `Some`.
+        fs::write(&src, minimal_pe_bytes()).unwrap();
+        let snap_root = root.join("snapshots");
+        let fresh = capture_snapshot(&src, &snap_root, "gto_launcher", "rev@first").unwrap();
+        let reused = capture_snapshot(&src, &snap_root, "gto_launcher", "rev@second").unwrap();
+
+        // Identity fields identical.
+        assert_eq!(fresh.logical_sample_id, reused.logical_sample_id);
+        assert_eq!(fresh.revision, reused.revision);
+        assert_eq!(fresh.snapshot_sha256, reused.snapshot_sha256);
+        assert_eq!(fresh.snapshot_size_bytes, reused.snapshot_size_bytes);
+        assert_eq!(fresh.source_sha256, reused.source_sha256);
+        assert_eq!(fresh.source_size_bytes, reused.source_size_bytes);
+        assert_eq!(fresh.snapshot_abs_path, reused.snapshot_abs_path);
+        assert_eq!(fresh.pe_identity, reused.pe_identity);
+        // PE identity is actually parsed in both paths (not None in reuse).
+        assert!(
+            fresh.pe_identity.is_some() && reused.pe_identity.is_some(),
+            "both fresh and reused must carry a PE identity"
+        );
+
+        // Provenance fields reflect each capture (they are NOT identity).
+        assert_eq!(fresh.provenance_tool_revision, "rev@first");
+        assert_eq!(reused.provenance_tool_revision, "rev@second");
+        assert!(reused.captured_at >= fresh.captured_at);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// R2-6: publish no-replace race. After temp verification but before publish,
+    /// a WRONG target is placed at the content address. Publish must detect it,
+    /// refuse to overwrite it, and fail closed. The wrong target is preserved.
+    #[test]
+    fn publish_race_wrong_target_rejected_and_not_overwritten() {
+        let root = temp_root("publish_race");
+        let src = root.join("src.bin");
+        fs::write(&src, b"PUBLISH-RACE-CONTENT").unwrap();
+        let snap_root = root.join("snapshots");
+        let want_sha = sha256_hex(b"PUBLISH-RACE-CONTENT");
+        let target_file = snap_root
+            .join("gto_launcher")
+            .join(&want_sha)
+            .join(SNAPSHOT_FILENAME);
+        let wrong_bytes = b"WRONG-TARGET-INJECTED-BYTES";
+
+        // Inject a wrong target between temp verification and publish.
+        let injected = target_file.clone();
+        let err = capture_snapshot_impl(
+            &src,
+            &snap_root,
+            "gto_launcher",
+            "rev",
+            None,
+            Some(Box::new(move || {
+                fs::write(&injected, wrong_bytes).unwrap();
+            })),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            CaptureError::SnapshotAlreadyExistsButMismatch(_)
+        ));
+        // The injected wrong target was NOT overwritten.
+        assert!(target_file.is_file());
+        assert_eq!(fs::read(&target_file).unwrap(), wrong_bytes);
+        // No temp file left behind.
+        let dir = snap_root.join("gto_launcher").join(&want_sha);
+        let names: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().all(|n| !n.starts_with(".capturing-")),
+            "no leftover temp files: {names:?}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A tiny valid PE (PE32+ DOS + NT headers + one section) so the PE-identity
+    /// parse succeeds. Used to prove fresh/reused PE-identity consistency.
+    fn minimal_pe_bytes() -> Vec<u8> {
+        let mut v = Vec::new();
+        // DOS header: 'MZ' + e_lfanew at 0x3c = 0x80.
+        v.extend_from_slice(b"MZ");
+        v.resize(0x40, 0);
+        v[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        // Pad from the 64-byte DOS header out to the NT-header offset (0x80).
+        v.resize(0x80, 0);
+        // PE signature.
+        v.extend_from_slice(b"PE\0\0");
+        // COFF header (20 bytes).
+        v.extend_from_slice(&0x14cu16.to_le_bytes()); // machine: IMAGE_FILE_MACHINE_AMD64
+        v.extend_from_slice(&1u16.to_le_bytes()); // number of sections
+        v.extend_from_slice(&0u32.to_le_bytes()); // timestamp
+        v.extend_from_slice(&0u32.to_le_bytes()); // ptr to symtab
+        v.extend_from_slice(&0u32.to_le_bytes()); // num symbols
+        v.extend_from_slice(&240u16.to_le_bytes()); // size of optional header (PE32+ = 0xF0)
+        v.extend_from_slice(&0u16.to_le_bytes()); // characteristics
+                                                  // Optional header magic 0x20b (PE32+).
+        v.extend_from_slice(&0x20bu16.to_le_bytes());
+        // NT headers = sig(4) + coff(20) + optional(240). Pad through the
+        // PE32+ optional header (240 bytes total, incl. the 2-byte magic already
+        // written).
+        let nt_offset = 0x80usize;
+        let opt_start = nt_offset + 4 + 20;
+        v.resize(opt_start + 240, 0);
+        // After the optional header: one section header (40 bytes) named ".text",
+        // plus trailing padding so `nt_slice` fully contains the section table.
+        let base = opt_start + 240;
+        v.resize(base + 40 + 48, 0);
+        v[base..base + 8].copy_from_slice(b".text\0\0\0");
+        v
     }
 }

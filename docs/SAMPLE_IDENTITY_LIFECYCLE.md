@@ -32,6 +32,17 @@ source path is recorded only as provenance.
   write; unless size and hash are identical on both reads AND the snapshot
   equals the source, the capture is rejected with
   `source_changed_during_capture` and no half-written snapshot is kept.
+- **The idempotent-reuse path is no less strict than a fresh capture.** Reusing
+  an existing content-addressed snapshot still requires BOTH source reads: the
+  source must be byte-stable across the whole capture, exactly like a fresh
+  capture. If the source changes or becomes unreadable while the existing
+  snapshot is being verified, capture fails closed and the existing snapshot is
+  neither deleted nor overwritten (G3-R2-R2).
+- **Publish is no-replace.** A dedicated `publish_no_replace` helper makes the
+  no-replace guarantee explicit and portable (it does not rely on Windows
+  `rename` refusing to overwrite). If the target already exists, capture only
+  reuses it when it is verified byte-identical; a mismatched/unverifiable
+  target fails closed and is never overwritten.
 - If the file changes during capture, the caller must **not** proceed to
   staging.
 
@@ -47,20 +58,30 @@ revision/logical-id consistency; a modified, truncated, replaced, missing, or
 forged snapshot is rejected (`VerifiedResolveFailed`). `staging_identity_matches`
 does NOT trust the in-memory `StagingIdentity` hash/size alone: it re-verifies
 the on-disk snapshot against the expected manifest identity. A forged in-memory
-identity (matching claim, wrong/missing disk file) cannot bypass this. A new
-revision therefore never passes an old manifest-bound identity, and a tampered
-snapshot is rejected (verified by real on-disk tamper tests).
+identity (matching claim, wrong/missing disk file) cannot bypass this.
+
+**Revision integrity is part of the identity.** `staging_identity_matches` also
+requires `staging.revision == revision_id(logical_sample_id, canonical_sha256)`.
+A `StagingIdentity` with the correct hash/size/disk but a forged or re-ordered
+revision (derived from a different hash or a different logical id) is rejected
+(G3-R2-R2). Hash inputs are canonicalized to lowercase, so resolve, verified
+resolve, and revision construction all agree on the same address.
+
+A new revision therefore never passes an old manifest-bound identity, and a
+tampered snapshot is rejected (verified by real on-disk tamper tests).
 
 ## Current wiring point
 
 `mida-cli` exposes `crate::sample_snapshot` (capture, verified resolve,
-staging-identity seam) with offline tests covering idempotent capture,
-concurrent publication, fail-closed cleanup, verified resolve, real disk
-tampering, and path-boundary validation. It is NOT yet wired into the GTO
-preflight lane: the sealed `lab/cases/v2/gto_launcher.json` is untouched, and
-the authoritative sample revision is still under adjudication. The next wiring
-step is for a GTO staging entry to take a verified snapshot path as its input
-identity and bind the case to the snapshot hash/size.
+staging-identity seam) with offline tests covering idempotent capture
+(incl. the reuse path's two-read stability), concurrent publication, no-replace
+publish races, fail-closed cleanup of a failed second read, revision-integrity
+forgery rejection, verified resolve, real disk tampering, path-boundary
+validation, and fresh/reused PE-identity consistency. It is NOT yet wired into
+the GTO preflight lane: the sealed `lab/cases/v2/gto_launcher.json` is
+untouched, and the authoritative sample revision is still under adjudication.
+The next wiring step is for a GTO staging entry to take a verified snapshot path
+as its input identity and bind the case to the snapshot hash/size.
 
 ## Rules
 
