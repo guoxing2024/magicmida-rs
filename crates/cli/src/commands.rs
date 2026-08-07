@@ -283,10 +283,21 @@ fn prepare_offline_preflight_staging(
         let mut config = crate::run_spec::frozen_run_policy_for_family(&verified_input, &family_id);
         config.tool_revision = tool_revision.to_string();
         config.cli_binary_sha256 = cli_binary_sha256.to_string();
+        // G3-R3-R1: the GTO lane seals its immutable snapshot PATH into the
+        // envelope so launch can require identity+path double-binding. The
+        // snapshot path is under snapshot_root; Oreans keeps live-input
+        // semantics and carries None (no path binding).
+        let is_gto = case_id == crate::runner_preflight::GTO_CASE_ID;
+        let sealed_input_path = if is_gto {
+            Some(verified_input.display().to_string())
+        } else {
+            None
+        };
         case_configs.push(CaseRunnerConfigEnvelope {
             case_id,
             family_id,
             protected_input: bound_identity,
+            protected_input_path: sealed_input_path,
             runner_config: serde_json::to_value(&config)
                 .expect("per-case runner config serializes"),
             runner_config_digest: mida_core::runner_config::runner_config_digest(&config),
@@ -956,6 +967,7 @@ mod tests {
                 case_id: case_id.to_string(),
                 family_id: mida_core::runner_config::packer_family::OREANS.to_string(),
                 protected_input: identity,
+                protected_input_path: None, // Oreans live-input lane: no path binding
                 runner_config: serde_json::to_value(&config).unwrap(),
                 runner_config_digest: mida_core::runner_config::runner_config_digest(&config),
             }
@@ -985,6 +997,7 @@ mod tests {
             case_id: crate::runner_preflight::GTO_CASE_ID.to_string(),
             family_id: packer_family::AHK_GTO.to_string(),
             protected_input: gto_identity.clone(),
+            protected_input_path: None, // path binding tested separately
             runner_config: serde_json::to_value(&gto_config).unwrap(),
             runner_config_digest: mida_core::runner_config::runner_config_digest(&gto_config),
         };
@@ -1030,6 +1043,7 @@ mod tests {
             case_id: crate::runner_preflight::GTO_CASE_ID.to_string(),
             family_id: packer_family::AHK_GTO.to_string(),
             protected_input: gto_identity.clone(),
+            protected_input_path: None,
             runner_config: serde_json::to_value(&oreans_config).unwrap(),
             runner_config_digest: mida_core::runner_config::runner_config_digest(&oreans_config),
         };
@@ -1082,6 +1096,7 @@ mod tests {
             case_id: crate::runner_preflight::GTO_CASE_ID.to_string(),
             family_id: "not_a_family".to_string(),
             protected_input: gto_identity.clone(),
+            protected_input_path: None,
             runner_config: serde_json::to_value(&gto_config).unwrap(),
             runner_config_digest: mida_core::runner_config::runner_config_digest(&gto_config),
         };
@@ -1105,6 +1120,7 @@ mod tests {
                 sha256: fake_sha(0x40),
                 size_bytes: 64,
             },
+            protected_input_path: None,
             runner_config: serde_json::to_value(&gto_config).unwrap(),
             runner_config_digest: mida_core::runner_config::runner_config_digest(&gto_config),
         };

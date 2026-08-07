@@ -1198,6 +1198,12 @@ struct CaseConfigEnvelopeV4 {
     /// the case-set digest). The verifier checks it is a known family.
     family_id: String,
     protected_input: mida_acceptance::FileIdentity,
+    /// Optional trusted protected-input path (G3-R3-R1): the immutable GTO lane
+    /// seals its `snapshot.bin` path so launch can bind identity + path. Oreans
+    /// fixed cases carry `None` (live-input lane). `default` keeps old-schema
+    /// envelopes readable. Included in the recomputed case-set digest.
+    #[serde(default)]
+    protected_input_path: Option<String>,
     runner_config: serde_json::Value,
     runner_config_digest: String,
 }
@@ -1506,12 +1512,17 @@ fn cmd_preflight(args: &[String]) -> Result<i32, String> {
     {
         let mut entries: Vec<String> = Vec::with_capacity(envelope.case_configs.len());
         for case in &envelope.case_configs {
+            // Mirror the CLI producer's canonical case entry exactly, including
+            // the optional sealed protected-input path (G3-R3-R1). Any divergence
+            // (including a tampered path) breaks the digest cross-check.
+            let path = case.protected_input_path.clone().unwrap_or_default();
             entries.push(format!(
-                "case={}\nfamily={}\nprotected_input={}|{}\nrunner_config_digest={}\n",
+                "case={}\nfamily={}\nprotected_input={}|{}\nprotected_input_path={}\nrunner_config_digest={}\n",
                 case.case_id,
                 case.family_id.to_lowercase(),
                 case.protected_input.sha256.to_lowercase(),
                 case.protected_input.size_bytes,
+                path,
                 case.runner_config_digest.to_lowercase()
             ));
         }

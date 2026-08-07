@@ -199,3 +199,31 @@ updated `D:\Tools\RE\dumps\gto\启动器.exe`). No real GTO sample process was r
 GTO remains `NOT completed / NOT perfect / NOT accepted`; `no-gate` means there is
 no acceptance gate, not that the product is accepted. The next step is real
 snapshot staging + run acceptance only after the authority decision.
+
+## 11. GTO launch path + identity double binding (G3-R3-R1)
+
+The immutable snapshot is now bound into the **launch attestation**, not just
+staging/preflight. `attest_ready_before_launch` matches the GTO target case by
+hash/size, then `enforce_gto_snapshot_path_binding` additionally requires the
+launch input to be the **exact immutable `snapshot.bin` path** sealed at staging:
+
+- The envelope's GTO `CaseRunnerConfigEnvelope` now carries an optional
+  `protected_input_path` (the sealed snapshot path). It is part of the
+  canonical case-set digest, so tampering the path breaks the seal (CLI
+  `canonical_case_entry`, acceptance `main.rs` recompute, and the hermetic
+  `preflight_boundary` reseal all include it).
+- At launch, for the GTO lane: `canonicalize(ctx.input)` must equal the
+  canonical sealed snapshot path, the report's recorded path must equal the
+  sealed path, and the path must be a well-formed `<root>/gto_launcher/<sha>/
+  snapshot.bin` under a controlled snapshot_root (`snapshot_root_of_snapshot`,
+  which also rejects relative, `..`-containing, malformed, and non-canonical
+  addresses). Canonical comparison resolves symlinks/junctions, so a live
+  source or alias with identical bytes but a different path is refused.
+- `rerun_verifier` feeds the GTO target case the recorded snapshot path (never
+  a live-source alias), and `RunEvidenceContext` binds the snapshot path.
+- Oreans fixed cases are unaffected: they carry `protected_input_path = None`
+  and keep their live-input lane (no path binding).
+
+A live dynamic source — even one byte-identical to the snapshot — is refused at
+launch; it is provenance only. This closes the boundary gap where a GTO case
+could pass preflight on `snapshot.bin` but launch on a same-hash live source.

@@ -105,6 +105,17 @@ offline wiring only — the authoritative sample revision is still under
 adjudication, and no real GTO sample has been run. The sealed
 `lab/cases/v2/gto_launcher.json` is untouched.
 
+**Launch attestation binds identity AND path (G3-R3-R1).** At launch,
+`attest_ready_before_launch` additionally requires the GTO input's canonical
+path to equal the immutable snapshot path sealed into the envelope (which is
+part of the sealed case-set digest) and to be a well-formed address under the
+controlled snapshot_root. `canonicalize` resolves symlinks/junctions, so a live
+dynamic source — even one byte-identical to the snapshot — is refused at
+launch; `rerun_verifier` and the `RunEvidenceContext` both consume the snapshot
+path, never a live-source alias. Oreans fixed cases keep their live-input lane
+and are not path-bound. This closes the gap where a GTO case could pass
+preflight on `snapshot.bin` but launch on a same-hash live source.
+
 ## Rules
 
 - The dynamic path is a source; the manifest binds a frozen revision, never the

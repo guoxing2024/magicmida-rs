@@ -878,7 +878,8 @@ fn case_entry_with_policy(
 }
 
 /// Recompute the case-set digest for a list of case entries (fixed canonical
-/// order applied by sorting). The `family_id` is part of the sealed digest.
+/// order applied by sorting). The `family_id` and the optional sealed
+/// `protected_input_path` (G3-R3-R1) are part of the sealed digest.
 fn reseal_case_set(entries: &[serde_json::Value]) -> String {
     let mut lines: Vec<String> = entries
         .iter()
@@ -887,8 +888,13 @@ fn reseal_case_set(entries: &[serde_json::Value]) -> String {
                 .get("family_id")
                 .and_then(|f| f.as_str())
                 .unwrap_or("oreans_themida");
+            let path = c
+                .get("protected_input_path")
+                .and_then(|p| p.as_str())
+                .unwrap_or_default()
+                .to_lowercase();
             format!(
-                "case={}\nfamily={}\nprotected_input={}|{}\nrunner_config_digest={}\n",
+                "case={}\nfamily={}\nprotected_input={}|{}\nprotected_input_path={}\nrunner_config_digest={}\n",
                 c["case_id"].as_str().unwrap(),
                 family.to_lowercase(),
                 c["protected_input"]["sha256"]
@@ -896,6 +902,7 @@ fn reseal_case_set(entries: &[serde_json::Value]) -> String {
                     .unwrap()
                     .to_lowercase(),
                 c["protected_input"]["size_bytes"].as_u64().unwrap(),
+                path,
                 c["runner_config_digest"].as_str().unwrap().to_lowercase(),
             )
         })

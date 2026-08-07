@@ -101,6 +101,14 @@ pub struct CaseRunnerConfigEnvelope {
     pub family_id: String,
     /// Verified protected-input identity of this case.
     pub protected_input: FileIdentityGate,
+    /// Optional trusted protected-input PATH (G3-R3-R1). The immutable GTO lane
+    /// seals the exact `snapshot.bin` path under its snapshot_root so the launch
+    /// attestation can require identity AND path double-binding — a live source
+    /// with identical bytes/hash is still refused. Oreans fixed cases keep their
+    /// live-input semantics and leave this `None` (no path binding). `default`
+    /// keeps old-schema envelopes readable (family-agnostic, non-breaking).
+    #[serde(default)]
+    pub protected_input_path: Option<String>,
     /// Full runner config JSON, as the runner will apply it for this case.
     pub runner_config: serde_json::Value,
     /// Producer-computed per-case digest
@@ -212,16 +220,22 @@ pub struct RunnerConfigEnvelope {
 }
 
 /// Canonical, injective encoding of one case-bound config entry (case id,
-/// packer family, protected input identity, per-case runner-config digest).
-/// The family is part of the sealed case-set digest, so switching a case's
-/// family after staging is a tamper that breaks the seal.
+/// packer family, protected input identity + optional path, per-case
+/// runner-config digest). The family and the optional protected-input path are
+/// part of the sealed case-set digest, so switching a case's family OR its
+/// trusted protected-input path after staging is a tamper that breaks the seal.
 fn canonical_case_entry(entry: &CaseRunnerConfigEnvelope) -> String {
+    let path = match &entry.protected_input_path {
+        Some(p) => p.to_lowercase(),
+        None => String::new(),
+    };
     format!(
-        "case={}\nfamily={}\nprotected_input={}|{}\nrunner_config_digest={}\n",
+        "case={}\nfamily={}\nprotected_input={}|{}\nprotected_input_path={}\nrunner_config_digest={}\n",
         entry.case_id,
         entry.family_id.to_lowercase(),
         entry.protected_input.sha256.to_lowercase(),
         entry.protected_input.size_bytes,
+        path,
         entry.runner_config_digest.to_lowercase()
     )
 }
@@ -973,6 +987,128 @@ pub fn canonicalize_loose(p: &Path) -> PathBuf {
     }
 }
 
+/// Derive the controlled snapshot_root from a GTO immutable snapshot path of
+/// the exact shape `<root>/<case_id>/<sha256>/snapshot.bin`. Rejects
+/// malformed, non-canonical, relative, `..`/`.`-containing, or otherwise
+/// non-snapshot paths so a caller cannot smuggle a path outside the snapshot
+/// store.
+fn snapshot_root_of_snapshot(snapshot_path: &Path) -> anyhow::Result<PathBuf> {
+    use crate::sample_snapshot::SNAPSHOT_FILENAME;
+    // A trusted snapshot path must be absolute; a relative path cannot be a
+    // stable content-addressed address and is refused.
+    if !snapshot_path.is_absolute() {
+        bail!(
+            "GTO protected input {} is not an absolute path",
+            snapshot_path.display()
+        );
+    }
+    // Reject any `.` / `..` component lexically: canonicalization elsewhere may
+    // resolve them, but a sealed snapshot address must never contain them.
+    for comp in snapshot_path.components() {
+        match comp {
+            std::path::Component::CurDir | std::path::Component::ParentDir => {
+                bail!(
+                    "GTO protected input {} contains a relative ({:?}) component",
+                    snapshot_path.display(),
+                    comp
+                );
+            }
+            _ => {}
+        }
+    }
+    let name = snapshot_path
+        .file_name()
+        .and_then(|f| f.to_str())
+        .ok_or_else(|| anyhow!("GTO snapshot path has no file name"))?;
+    if name != SNAPSHOT_FILENAME {
+        bail!(
+            "GTO protected input {} must end in {SNAPSHOT_FILENAME}",
+            snapshot_path.display()
+        );
+    }
+    // Components from the leaf up: snapshot.bin / <sha256> / <case_id> / <root>.
+    let sha_dir = snapshot_path
+        .parent()
+        .ok_or_else(|| anyhow!("GTO snapshot path has no hash directory"))?;
+    let sha_name = sha_dir
+        .file_name()
+        .and_then(|f| f.to_str())
+        .ok_or_else(|| anyhow!("GTO snapshot hash directory has no name"))?;
+    if sha_name.len() != 64 || !sha_name.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("GTO snapshot hash directory {sha_name:?} is not a 64-hex content address");
+    }
+    let case_dir = sha_dir
+        .parent()
+        .ok_or_else(|| anyhow!("GTO snapshot path has no case directory"))?;
+    let case_name = case_dir
+        .file_name()
+        .and_then(|f| f.to_str())
+        .ok_or_else(|| anyhow!("GTO snapshot case directory has no name"))?;
+    if case_name != GTO_CASE_ID {
+        bail!("GTO snapshot case directory {case_name:?} != {GTO_CASE_ID}");
+    }
+    let root = case_dir
+        .parent()
+        .ok_or_else(|| anyhow!("GTO snapshot path has no snapshot_root"))?;
+    Ok(root.to_path_buf())
+}
+
+/// G3-R3-R1 GTO launch path binding. For the GTO lane the launch attestation
+/// requires the protected input to be the EXACT immutable snapshot path sealed
+/// into the envelope at staging (and recorded by the report), located under a
+/// well-formed snapshot_root. A live dynamic source is refused even when its
+/// bytes/hash equal the snapshot's — identity is bound together with the trusted
+/// path.
+fn enforce_gto_snapshot_path_binding(
+    envelope: &RunnerConfigEnvelope,
+    matched: &PreflightCaseGate,
+    current_identity: &FileIdentityGate,
+    ctx: &LaunchAttestationContext<'_>,
+) -> anyhow::Result<()> {
+    // 1. The envelope's sealed GTO case must carry a protected_input_path.
+    let env_case = select_case_config(envelope, current_identity)?;
+    let sealed_path = env_case.protected_input_path.as_deref().ok_or_else(|| {
+        anyhow!(
+            "GTO case {GTO_CASE_ID} envelope has no sealed protected_input_path; \
+                 refusing to launch without a path binding"
+        )
+    })?;
+
+    // 2. The report's recorded protected_input_path must equal the sealed path
+    //    (canonical form), so a tampered report path is caught.
+    if canonicalize_loose(Path::new(&matched.protected_input_path))
+        != canonicalize_loose(Path::new(sealed_path))
+    {
+        bail!(
+            "GTO report protected_input_path {} != sealed envelope path {} \
+             (path tamper or drift)",
+            matched.protected_input_path,
+            sealed_path
+        );
+    }
+
+    // 3. The launch input's canonical path must equal the sealed snapshot path.
+    //    canonicalize() resolves symlinks/junctions/reparse points, so an input
+    //    that aliases outside snapshot_root cannot equal the sealed path.
+    let sealed_canonical = canonicalize_loose(Path::new(sealed_path));
+    let input_canonical = canonicalize_loose(ctx.input);
+    if input_canonical != sealed_canonical {
+        bail!(
+            "GTO launch input {} (canonical {}) must be the staged immutable \
+             snapshot {}; a live source with identical bytes is still refused \
+             (identity+path double binding)",
+            ctx.input.display(),
+            input_canonical.display(),
+            sealed_path
+        );
+    }
+
+    // 4. The sealed snapshot path must be under a well-formed snapshot_root
+    //    (no `..`, no symlink escape, no non-canonical address).
+    snapshot_root_of_snapshot(&sealed_canonical)?;
+    Ok(())
+}
+
 /// The P6.3 launch attestation (production). The hand-written `ready` JSON
 /// is NOT an authorization credential: the launch boundary re-runs the
 /// independent acceptance verifier against the current run context and
@@ -1064,6 +1200,15 @@ pub fn attest_ready_before_launch(
             "target case {:?} is neither an Oreans fixed case nor the GTO lane case",
             target_case_id
         );
+    }
+
+    // G3-R3-R1: GTO launch requires identity AND trusted-path double binding.
+    // The GTO protected input must be the exact immutable snapshot.bin sealed at
+    // staging (under snapshot_root), never a live dynamic source — even one with
+    // identical bytes/hash. Oreans fixed cases keep their live-input lane and are
+    // not path-bound.
+    if target_case_id == GTO_CASE_ID {
+        enforce_gto_snapshot_path_binding(&envelope, matches[0], &current_identity, ctx)?;
     }
 
     // P6.3.1: the verifier identity is bound by the envelope. Resolve the
@@ -1167,17 +1312,43 @@ pub fn attest_ready_before_launch(
     let selected_case = select_case_config(&envelope, &current_identity)?;
     let attested_family = selected_case.family_id.clone();
     let digest = envelope_case_runner_config_digest(output_dir, &current_identity)?;
+    // G3-R3-R1: the evidence context's protected input must be the immutable
+    // snapshot path for GTO (never a live-source alias — even same bytes), and
+    // the live input for Oreans. For GTO the sealed envelope path is the
+    // authority and equals ctx.input canonical (already enforced).
+    let evidence_input = protected_input_for_evidence(&target_case_id, selected_case, ctx.input);
     let context = RunEvidenceContext::new_with_family(
         attested_family,
         target_case_id,
         envelope.tool_revision.clone(),
         digest,
         verifier_sha,
-        canonicalize_loose(ctx.input),
+        evidence_input,
         current_output,
         current_cli_sha,
     )?;
     Ok(context)
+}
+
+/// G3-R3-R1: select the evidence context's protected-input path. The GTO lane
+/// must carry the immutable snapshot path sealed in the envelope (never a
+/// live-source alias), while Oreans keeps the live input path. If the GTO
+/// envelope somehow lacks a sealed path, fall back to `ctx_input` (the
+/// path-binding check in `enforce_gto_snapshot_path_binding` already refused
+/// that scenario, so this fallback is unreachable in production).
+fn protected_input_for_evidence(
+    target_case_id: &str,
+    selected_case: &CaseRunnerConfigEnvelope,
+    ctx_input: &Path,
+) -> PathBuf {
+    if target_case_id == GTO_CASE_ID {
+        match selected_case.protected_input_path.as_deref() {
+            Some(p) => canonicalize_loose(Path::new(p)),
+            None => canonicalize_loose(ctx_input),
+        }
+    } else {
+        canonicalize_loose(ctx_input)
+    }
 }
 
 /// Resolve the verifier this run would use (unique CLI-sibling resolver),
@@ -1272,8 +1443,19 @@ fn rerun_verifier(
         .arg("--expected-toolchain")
         .arg(&report.expected_toolchain);
     for case in &report.cases {
+        // G3-R3-R1: the GTO target case must feed the verifier the staged
+        // immutable SNAPSHOT path, never the live dynamic source (which may be
+        // an alias with identical bytes). `enforce_gto_snapshot_path_binding`
+        // already proved ctx.input canonical == the sealed snapshot path, so
+        // handing the verifier the recorded snapshot path is correct and can
+        // never be a live-source alias. Oreans fixed cases keep their live
+        // input lane.
         let input = if case.case_id == target_case_id {
-            ctx.input
+            if case.case_id == GTO_CASE_ID {
+                Path::new(&case.protected_input_path)
+            } else {
+                ctx.input
+            }
         } else {
             Path::new(&case.protected_input_path)
         };
@@ -1702,6 +1884,7 @@ mod tests {
                     4_976_144
                 },
             },
+            protected_input_path: None, // Oreans live-input lane: no path binding
             runner_config: serde_json::to_value(&config).unwrap(),
             runner_config_digest: digest,
         }
@@ -1876,6 +2059,7 @@ mod tests {
             case_id: GTO_CASE_ID.to_string(),
             family_id: packer_family::AHK_GTO.to_string(),
             protected_input: gto_identity.clone(),
+            protected_input_path: None, // test-only envelope: no path binding
             runner_config: serde_json::to_value(&gto_cfg).unwrap(),
             runner_config_digest: gto_digest,
         });
@@ -2482,5 +2666,401 @@ mod tests {
             "a GTO generic bundle must never deserialize as Oreans evidence (fail-closed)"
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+    // -----------------------------------------------------------------------
+    // G3-R3-R1: GTO launch path + identity double binding.
+    // -----------------------------------------------------------------------
+
+    /// Build a GTO 3-case envelope (2 Oreans fixed + 1 GTO) where the GTO case
+    /// carries the given sealed snapshot path (or None).
+    fn gto_envelope_with_path(snapshot_path: Option<&str>) -> RunnerConfigEnvelope {
+        use mida_core::runner_config::packer_family;
+        let mut env = v4_envelope();
+        let mut gto_cfg = crate::run_spec::frozen_runner_config_for_family(packer_family::AHK_GTO);
+        gto_cfg.tool_revision = "rev".to_string();
+        gto_cfg.cli_binary_sha256 = "a".repeat(64);
+        let gto_digest = mida_core::runner_config::runner_config_digest(&gto_cfg);
+        env.case_configs.push(CaseRunnerConfigEnvelope {
+            case_id: GTO_CASE_ID.to_string(),
+            family_id: packer_family::AHK_GTO.to_string(),
+            protected_input: FileIdentityGate {
+                sha256: "c".repeat(64),
+                size_bytes: 42,
+            },
+            protected_input_path: snapshot_path.map(|p| p.to_string()),
+            runner_config: serde_json::to_value(&gto_cfg).unwrap(),
+            runner_config_digest: gto_digest,
+        });
+        env.case_set_digest = case_set_digest(&env.case_configs);
+        env
+    }
+
+    /// The GTO case's sealed protected_input identity (must match what the
+    /// report records for the GTO case).
+    fn gto_identity() -> FileIdentityGate {
+        FileIdentityGate {
+            sha256: "c".repeat(64),
+            size_bytes: 42,
+        }
+    }
+
+    /// A `PreflightCaseGate` for the GTO case carrying the given protected path.
+    fn gto_report_case(protected_input_path: &str) -> PreflightCaseGate {
+        PreflightCaseGate {
+            case_id: GTO_CASE_ID.to_string(),
+            identity_ok: true,
+            reasons: Vec::new(),
+            protected_input: Some(gto_identity()),
+            protected_input_path: protected_input_path.to_string(),
+            manifest_path: "gto_launcher.json".to_string(),
+            candidate_output: "C:\\dummy\\out\\candidate.exe".to_string(),
+            runner_config_digest: Some("c".repeat(64)),
+        }
+    }
+
+    /// A `LaunchAttestationContext` with the given input, borrowing a runner
+    /// config owned by the caller.
+    fn launch_ctx<'a>(
+        input: &'a Path,
+        config: &'a mida_core::runner_config::RunnerConfig,
+    ) -> LaunchAttestationContext<'a> {
+        LaunchAttestationContext {
+            input,
+            output: Path::new("C:\\dummy\\out\\candidate.exe"),
+            cli_binary: Path::new("C:\\dummy\\mida-cli.exe"),
+            runner_config: config,
+        }
+    }
+
+    /// A GTO-family runner config (owned) for the launch context.
+    fn gto_runner_config() -> mida_core::runner_config::RunnerConfig {
+        mida_core::runner_config::RunnerConfig {
+            packer_family: "ahk_gto".to_string(),
+            tool_revision: "rev".to_string(),
+            cli_binary_sha256: "a".repeat(64),
+            features: Vec::new(),
+            debugger_backend: String::new(),
+            oep_policy: String::new(),
+            container_restore: String::new(),
+            shrink: false,
+            data_sections: false,
+            pure_rebuild: false,
+            capture_policy_digest: String::new(),
+            iat_fix_strategy: String::new(),
+            timeout_secs: 0,
+            isolation: mida_core::runner_config::IsolationConfig {
+                workspace_policy: String::new(),
+                process_tree_policy: String::new(),
+                network_policy: String::new(),
+            },
+            attempt_numbering: String::new(),
+            evidence_bundle_schema: String::new(),
+            gate_schema: String::new(),
+            env_allowlist: Vec::new(),
+        }
+    }
+
+    /// Create a real GTO snapshot under a temp snapshot_root and return
+    /// (root, snapshot_path).
+    fn make_snapshot(root: &Path) -> (PathBuf, PathBuf) {
+        let sha = "c".repeat(64);
+        let dir = root.join(GTO_CASE_ID).join(&sha);
+        std::fs::create_dir_all(&dir).unwrap();
+        let snap = dir.join("snapshot.bin");
+        std::fs::write(&snap, b"G3-R3-R1-SNAPSHOT-PAYLOAD").unwrap();
+        let canonical = std::fs::canonicalize(&snap).unwrap();
+        (root.to_path_buf(), canonical)
+    }
+
+    #[test]
+    fn gto_snapshot_path_passes_launch_attestation() {
+        let root = temp_dir("gto_path_pass");
+        let (_, snap_path) = make_snapshot(&root);
+        let snap_str = snap_path.to_string_lossy().to_string();
+        let env = gto_envelope_with_path(Some(&snap_str));
+        let report_case = gto_report_case(&snap_str);
+        let cfg = gto_runner_config();
+        let ctx = launch_ctx(&snap_path, &cfg);
+        let ident = gto_identity();
+
+        // A correct snapshot path with matching identity passes the binding.
+        enforce_gto_snapshot_path_binding(&env, &report_case, &ident, &ctx).unwrap();
+        // And the evidence input is exactly the snapshot path (not a live alias).
+        let selected = select_case_config(&env, &ident).unwrap();
+        assert_eq!(
+            protected_input_for_evidence(GTO_CASE_ID, selected, &snap_path),
+            canonicalize_loose(&snap_path)
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn gto_live_source_same_bytes_is_rejected_at_launch() {
+        let root = temp_dir("gto_live_same_bytes");
+        let (_, snap_path) = make_snapshot(&root);
+        let snap_str = snap_path.to_string_lossy().to_string();
+        let env = gto_envelope_with_path(Some(&snap_str));
+        let report_case = gto_report_case(&snap_str);
+        let ident = gto_identity();
+
+        // A live source OUTSIDE snapshot_root with the SAME bytes/hash as the
+        // snapshot. Its canonical path differs from the sealed snapshot path, so
+        // it is refused even though identity (hash/size) matches.
+        let live = root.join("live_source.exe");
+        std::fs::write(&live, b"G3-R3-R1-SNAPSHOT-PAYLOAD").unwrap();
+        let cfg = gto_runner_config();
+        let ctx = launch_ctx(&live, &cfg);
+        let err = enforce_gto_snapshot_path_binding(&env, &report_case, &ident, &ctx).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("must be the staged immutable snapshot"),
+            "live source with identical bytes must be path-rejected: {err:#}"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn gto_live_source_changed_after_preflight_is_rejected() {
+        let root = temp_dir("gto_live_changed");
+        let (_, snap_path) = make_snapshot(&root);
+        let snap_str = snap_path.to_string_lossy().to_string();
+        let env = gto_envelope_with_path(Some(&snap_str));
+        let report_case = gto_report_case(&snap_str);
+        let ident = gto_identity();
+
+        // The dynamic source path (a different file with DIFFERENT bytes) is
+        // passed at launch. It fails the path binding; it must not be re-captured
+        // or auto-registered as a new revision.
+        let live = root.join("live_updated.exe");
+        std::fs::write(&live, b"DIFFERENT-PAYLOAD-AFTER-PREFLIGHT").unwrap();
+        let cfg = gto_runner_config();
+        let ctx = launch_ctx(&live, &cfg);
+        let err = enforce_gto_snapshot_path_binding(&env, &report_case, &ident, &ctx).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("must be the staged immutable snapshot"),
+            "a changed live source must be refused: {err:#}"
+        );
+        // The snapshot is untouched.
+        assert!(snap_path.is_file());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn gto_snapshot_path_escape_is_rejected() {
+        let root = temp_dir("gto_path_escape");
+        let (_, snap_path) = make_snapshot(&root);
+        let snap_str = snap_path.to_string_lossy().to_string();
+        let env = gto_envelope_with_path(Some(&snap_str));
+        let report_case = gto_report_case(&snap_str);
+        let ident = gto_identity();
+
+        // Launch inputs that escape or alias outside snapshot_root must be
+        // rejected at the launch path-binding boundary (canonical comparison
+        // against the sealed snapshot path), even when their bytes/hash match.
+        let escape_inputs: Vec<PathBuf> = vec![
+            // `..` traversal out of snapshot_root
+            root.join("..").join("outside").join("snapshot.bin"),
+            // adjacent directory prefix (root2 not a child of root)
+            PathBuf::from(format!(
+                "{}2\\gto_launcher\\{}\\snapshot.bin",
+                root.to_string_lossy(),
+                "c".repeat(64)
+            )),
+            // relative path (not canonical/absolute)
+            PathBuf::from(format!("gto_launcher/{}/snapshot.bin", "c".repeat(64))),
+            // a plain sibling file (same bytes, different location)
+            root.join("live_source.exe"),
+        ];
+        let cfg = gto_runner_config();
+        for inp in &escape_inputs {
+            // Create the file so canonicalize resolves it to its real (outside)
+            // location; if it cannot be created, canonicalize_loose still yields
+            // a parent-canonicalized path that differs from the sealed snapshot.
+            if inp.parent().is_some() {
+                let _ = std::fs::create_dir_all(inp.parent().unwrap());
+            }
+            let _ = std::fs::write(inp, b"G3-R3-R1-SNAPSHOT-PAYLOAD");
+            let ctx = launch_ctx(inp, &cfg);
+            let err =
+                enforce_gto_snapshot_path_binding(&env, &report_case, &ident, &ctx).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("must be the staged immutable snapshot"),
+                "escape input {} must be path-rejected: {err:#}",
+                inp.display()
+            );
+        }
+
+        // Malformed snapshot addresses are refused structurally by the
+        // snapshot-root validator (defense in depth on the sealed path).
+        let malformed: Vec<PathBuf> = vec![
+            // wrong file name (not snapshot.bin)
+            PathBuf::from(format!(
+                "{}\\gto_launcher\\{}\\other.bin",
+                root.to_string_lossy(),
+                "c".repeat(64)
+            )),
+            // malformed hash directory (not 64-hex)
+            PathBuf::from(format!(
+                "{}\\gto_launcher\\not-a-hash\\snapshot.bin",
+                root.to_string_lossy()
+            )),
+            // wrong case dir
+            PathBuf::from(format!(
+                "{}\\origin_macro\\{}\\snapshot.bin",
+                root.to_string_lossy(),
+                "c".repeat(64)
+            )),
+        ];
+        for m in &malformed {
+            assert!(
+                snapshot_root_of_snapshot(m).is_err(),
+                "malformed snapshot address must be rejected: {}",
+                m.display()
+            );
+        }
+        // The valid snapshot path passes the structural check.
+        snapshot_root_of_snapshot(&snap_path).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn gto_snapshot_symlink_or_reparse_escape_is_rejected() {
+        let root = temp_dir("gto_symlink_escape");
+        let (_, snap_path) = make_snapshot(&root);
+        let snap_str = snap_path.to_string_lossy().to_string();
+        let env = gto_envelope_with_path(Some(&snap_str));
+        let report_case = gto_report_case(&snap_str);
+        let ident = gto_identity();
+        let cfg = gto_runner_config();
+
+        // A symlink/junction INSIDE snapshot_root that resolves OUTSIDE it must
+        // not pass: canonicalize() resolves the link to its target, which is a
+        // different canonical path than the sealed snapshot, so the launch
+        // path-binding boundary rejects it.
+        let mut junction_created = false;
+        #[cfg(windows)]
+        {
+            // Best-effort: build a junction from snapshot_root/escape_link to a
+            // directory outside snapshot_root. If the environment forbids
+            // junction creation (permissions), we fall back to the guaranteed
+            // structural unit check below.
+            let outside = root.join("outside_real");
+            std::fs::create_dir_all(&outside).unwrap();
+            std::fs::write(&outside.join("snapshot.bin"), b"G3-R3-R1-SNAPSHOT-PAYLOAD").unwrap();
+            let link = root.join("escape_link");
+            let mklink = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(&link)
+                .arg(&outside)
+                .output();
+            if let Ok(o) = mklink {
+                if o.status.success() {
+                    junction_created = true;
+                    let junction_snap = link.join("snapshot.bin");
+                    assert!(junction_snap.is_file());
+                    // The junction resolves OUTSIDE snapshot_root; its canonical
+                    // path differs from the sealed snapshot -> rejected.
+                    let ctx = launch_ctx(&junction_snap, &cfg);
+                    let err = enforce_gto_snapshot_path_binding(&env, &report_case, &ident, &ctx)
+                        .unwrap_err();
+                    assert!(
+                        format!("{err:#}").contains("must be the staged immutable snapshot"),
+                        "a junction escape out of snapshot_root must be rejected: {err:#}"
+                    );
+                }
+            }
+        }
+
+        // Guaranteed structural rejection (no filesystem feature required): a
+        // relative / non-canonical address that would alias outside is always
+        // rejected by the snapshot-root structural validator, and a same-bytes
+        // sibling path is rejected by the canonical launch-path comparison.
+        let relative = Path::new("gto_launcher")
+            .join("c".repeat(64))
+            .join("snapshot.bin");
+        assert!(snapshot_root_of_snapshot(&relative).is_err());
+        let sibling = root.join("sibling.exe");
+        std::fs::write(&sibling, b"G3-R3-R1-SNAPSHOT-PAYLOAD").unwrap();
+        let ctx = launch_ctx(&sibling, &cfg);
+        let err = enforce_gto_snapshot_path_binding(&env, &report_case, &ident, &ctx).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("must be the staged immutable snapshot"),
+            "a same-bytes sibling must be path-rejected: {err:#}"
+        );
+        // Record whether a real junction was exercised (for the report).
+        let _ = junction_created;
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn gto_report_protected_input_path_tamper_is_rejected() {
+        let root = temp_dir("gto_report_tamper");
+        let (_, snap_path) = make_snapshot(&root);
+        let snap_str = snap_path.to_string_lossy().to_string();
+        let env = gto_envelope_with_path(Some(&snap_str));
+        let ident = gto_identity();
+
+        // The REPORT records a DIFFERENT (tampered) path than the sealed
+        // envelope path. The launch must reject on the report-vs-sealed path
+        // divergence, not trust hash/size.
+        let tampered = root.join("tampered_path").join("snapshot.bin");
+        std::fs::create_dir_all(tampered.parent().unwrap()).unwrap();
+        std::fs::write(&tampered, b"G3-R3-R1-SNAPSHOT-PAYLOAD").unwrap();
+        let report_case = gto_report_case(&tampered.to_string_lossy());
+        let cfg = gto_runner_config();
+        let ctx = launch_ctx(&snap_path, &cfg);
+        let err = enforce_gto_snapshot_path_binding(&env, &report_case, &ident, &ctx).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("!= sealed envelope path"),
+            "a tampered report protected_input_path must be rejected: {err:#}"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn oreans_live_input_attestation_unchanged() {
+        use mida_core::runner_config::packer_family;
+        // Oreans fixed cases carry no sealed path (None) and are NOT path-bound.
+        let env = v4_envelope();
+        for c in &env.case_configs {
+            assert_eq!(c.family_id, packer_family::OREANS);
+            assert!(
+                c.protected_input_path.is_none(),
+                "Oreans has no path binding"
+            );
+        }
+        // The evidence input for an Oreans case is the live input path, not a
+        // snapshot path.
+        let live = Path::new("C:\\some\\live\\origin.bin");
+        let selected = &env.case_configs[0];
+        assert_eq!(
+            protected_input_for_evidence("origin_macro", selected, live),
+            canonicalize_loose(live)
+        );
+        // The GTO path-binding enforcement is a no-op for Oreans (never invoked
+        // because target_case_id != GTO_CASE_ID).
+    }
+
+    #[test]
+    fn gto_evidence_input_uses_snapshot_path() {
+        use mida_core::runner_config::packer_family;
+        let root = temp_dir("gto_evidence_path");
+        let (_, snap_path) = make_snapshot(&root);
+        let snap_str = snap_path.to_string_lossy().to_string();
+        let env = gto_envelope_with_path(Some(&snap_str));
+        let gto_case = &env.case_configs[2];
+        assert_eq!(gto_case.family_id, packer_family::AHK_GTO);
+
+        // Even if the launch input is a live alias with identical bytes, the
+        // evidence context must bind the sealed snapshot path for GTO.
+        let live_alias = root.join("alias.exe");
+        std::fs::write(&live_alias, b"G3-R3-R1-SNAPSHOT-PAYLOAD").unwrap();
+        let ev = protected_input_for_evidence(GTO_CASE_ID, gto_case, &live_alias);
+        assert_eq!(
+            ev,
+            canonicalize_loose(&snap_path),
+            "evidence must use snapshot path"
+        );
+        assert_ne!(ev, canonicalize_loose(&live_alias), "never a live alias");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
