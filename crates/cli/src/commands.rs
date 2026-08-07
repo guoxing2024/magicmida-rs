@@ -992,12 +992,15 @@ mod tests {
             size_bytes: 128,
         };
 
-        // Valid GTO case (family=ahk_gto + GTO config).
+        // Valid GTO case (family=ahk_gto + GTO config + a sealed snapshot path).
         let gto_case = crate::runner_preflight::CaseRunnerConfigEnvelope {
             case_id: crate::runner_preflight::GTO_CASE_ID.to_string(),
             family_id: packer_family::AHK_GTO.to_string(),
             protected_input: gto_identity.clone(),
-            protected_input_path: None, // path binding tested separately
+            protected_input_path: Some(
+                "C:\\snapshots\\gto_launcher\\cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\\snapshot.bin"
+                    .to_string(),
+            ),
             runner_config: serde_json::to_value(&gto_config).unwrap(),
             runner_config_digest: mida_core::runner_config::runner_config_digest(&gto_config),
         };
@@ -1043,7 +1046,10 @@ mod tests {
             case_id: crate::runner_preflight::GTO_CASE_ID.to_string(),
             family_id: packer_family::AHK_GTO.to_string(),
             protected_input: gto_identity.clone(),
-            protected_input_path: None,
+            protected_input_path: Some(
+                "C:\\snapshots\\gto_launcher\\cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\\snapshot.bin"
+                    .to_string(),
+            ),
             runner_config: serde_json::to_value(&oreans_config).unwrap(),
             runner_config_digest: mida_core::runner_config::runner_config_digest(&oreans_config),
         };

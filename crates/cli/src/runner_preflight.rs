@@ -359,6 +359,29 @@ impl RunnerConfigEnvelope {
                     c.case_id, c.family_id
                 ));
             }
+            // G3-R3-R2 lane/path schema: the GTO lane MUST seal a non-empty
+            // immutable protected-input path; Oreans fixed cases MUST carry None
+            // (live-input lane — injecting a path is a tamper that fails closed).
+            if c.case_id == GTO_CASE_ID {
+                match c.protected_input_path.as_deref() {
+                    Some(p) if !p.trim().is_empty() => {}
+                    _ => {
+                        return Some(format!(
+                            "GTO lane case {} must carry a non-empty protected_input_path \
+                             (immutable snapshot) (fail-closed)",
+                            c.case_id
+                        ));
+                    }
+                }
+            } else if FIXED_CASE_IDS.contains(&c.case_id.as_str()) {
+                if c.protected_input_path.is_some() {
+                    return Some(format!(
+                        "Oreans fixed case {} must NOT carry a protected_input_path \
+                         (live-input lane) (fail-closed)",
+                        c.case_id
+                    ));
+                }
+            }
             // Lane <-> family binding: an Oreans fixed case must be Oreans; the
             // GTO lane case must be ahk_gto. Cross-lane reuse fails closed.
             if FIXED_CASE_IDS.contains(&c.case_id.as_str()) {
@@ -987,12 +1010,13 @@ pub fn canonicalize_loose(p: &Path) -> PathBuf {
     }
 }
 
-/// Derive the controlled snapshot_root from a GTO immutable snapshot path of
-/// the exact shape `<root>/<case_id>/<sha256>/snapshot.bin`. Rejects
-/// malformed, non-canonical, relative, `..`/`.`-containing, or otherwise
+/// Derive the controlled snapshot_root and the 64-hex hash directory from a GTO
+/// immutable snapshot path of the exact shape
+/// `<root>/<case_id>/<sha256>/snapshot.bin`. Returns `(snapshot_root, hash_dir)`.
+/// Rejects malformed, non-canonical, relative, `..`/`.`-containing, or otherwise
 /// non-snapshot paths so a caller cannot smuggle a path outside the snapshot
 /// store.
-fn snapshot_root_of_snapshot(snapshot_path: &Path) -> anyhow::Result<PathBuf> {
+fn snapshot_root_of_snapshot(snapshot_path: &Path) -> anyhow::Result<(PathBuf, String)> {
     use crate::sample_snapshot::SNAPSHOT_FILENAME;
     // A trusted snapshot path must be absolute; a relative path cannot be a
     // stable content-addressed address and is refused.
@@ -1050,7 +1074,7 @@ fn snapshot_root_of_snapshot(snapshot_path: &Path) -> anyhow::Result<PathBuf> {
     let root = case_dir
         .parent()
         .ok_or_else(|| anyhow!("GTO snapshot path has no snapshot_root"))?;
-    Ok(root.to_path_buf())
+    Ok((root.to_path_buf(), sha_name.to_string()))
 }
 
 /// G3-R3-R1 GTO launch path binding. For the GTO lane the launch attestation
@@ -1104,8 +1128,17 @@ fn enforce_gto_snapshot_path_binding(
     }
 
     // 4. The sealed snapshot path must be under a well-formed snapshot_root
-    //    (no `..`, no symlink escape, no non-canonical address).
-    snapshot_root_of_snapshot(&sealed_canonical)?;
+    //    (no `..`, no symlink escape, no non-canonical address), AND its
+    //    content-address hash directory must equal the sealed protected-input
+    //    hash (case-normalized). This binds the trusted path to the identity.
+    let (_, sealed_hash_dir) = snapshot_root_of_snapshot(&sealed_canonical)?;
+    if !sealed_hash_dir.eq_ignore_ascii_case(&current_identity.sha256) {
+        bail!(
+            "GTO snapshot path hash dir {sealed_hash_dir:?} != protected_input sha {} \
+             (content-address path/identity mismatch; fail-closed)",
+            current_identity.sha256.to_lowercase()
+        );
+    }
     Ok(())
 }
 
@@ -2059,7 +2092,10 @@ mod tests {
             case_id: GTO_CASE_ID.to_string(),
             family_id: packer_family::AHK_GTO.to_string(),
             protected_input: gto_identity.clone(),
-            protected_input_path: None, // test-only envelope: no path binding
+            protected_input_path: Some(
+                "C:\\snapshots\\gto_launcher\\cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\\snapshot.bin"
+                    .to_string(),
+            ),
             runner_config: serde_json::to_value(&gto_cfg).unwrap(),
             runner_config_digest: gto_digest,
         });
@@ -2191,6 +2227,10 @@ mod tests {
         let mut gto_case = v4_envelope().case_configs[0].clone();
         gto_case.case_id = GTO_CASE_ID.to_string();
         gto_case.family_id = packer_family::AHK_GTO.to_string();
+        gto_case.protected_input_path = Some(
+            "C:\\snapshots\\gto_launcher\\cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\\snapshot.bin"
+                .to_string(),
+        );
         oreans.case_configs.push(gto_case);
         assert!(
             oreans.validate_case_set().is_none(),
@@ -3062,5 +3102,153 @@ mod tests {
         );
         assert_ne!(ev, canonicalize_loose(&live_alias), "never a live alias");
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // G3-R3-R2: GTO digest through the launch-boundary gate + CLI path schema.
+    // -----------------------------------------------------------------------
+
+    /// Build a `ready` preflight report for a 3-case envelope (2 Oreans + GTO),
+    /// with per-case digests matching the envelope and a ready status.
+    fn ready_report_for_envelope(env: &RunnerConfigEnvelope) -> PreflightReportGate {
+        let mut cases: Vec<PreflightCaseGate> = env
+            .case_configs
+            .iter()
+            .map(|c| PreflightCaseGate {
+                case_id: c.case_id.clone(),
+                identity_ok: true,
+                reasons: Vec::new(),
+                protected_input: Some(c.protected_input.clone()),
+                protected_input_path: c.protected_input_path.clone().unwrap_or_default(),
+                manifest_path: format!("{}.json", c.case_id),
+                candidate_output: format!("C:\\dummy\\out\\{}.exe", c.case_id),
+                runner_config_digest: Some(c.runner_config_digest.clone()),
+            })
+            .collect();
+        // Sort to a deterministic order matching the envelope's cross-validation.
+        cases.sort_by(|a, b| a.case_id.cmp(&b.case_id));
+        PreflightReportGate {
+            schema_version: PREFLIGHT_REPORT_SCHEMA_VERSION.to_string(),
+            status: "ready".to_string(),
+            reasons: Vec::new(),
+            runner_config_digest: env.case_set_digest.clone(),
+            head_revision: None,
+            worktree_clean: Some(true),
+            toolchain_matches: Some(true),
+            cli_binary_sha256: Some(env.cli_binary_sha256.clone()),
+            cli_binary_matches: Some(true),
+            cli_binary_path: "C:\\dummy\\mida-cli.exe".to_string(),
+            repo_root: "C:\\dummy\\repo".to_string(),
+            toolchain_pin_file: "C:\\dummy\\toolchain.toml".to_string(),
+            expected_toolchain: "1.97.1".to_string(),
+            cases,
+        }
+    }
+
+    /// B-hermetic: the launch-boundary gate (`check_chain_ready`) accepts a ready
+    /// report whose GTO per-case digest matches the envelope — proving the GTO
+    /// digest flows through the gate exactly like Oreans (P1 closure).
+    #[test]
+    fn gto_check_chain_ready_accepts_verified_digest() {
+        use mida_core::runner_config::packer_family;
+        // Build a 3-case envelope: 2 Oreans fixed + 1 GTO with a sealed path.
+        let mut env = v4_envelope();
+        let mut gto_cfg = crate::run_spec::frozen_runner_config_for_family(packer_family::AHK_GTO);
+        gto_cfg.tool_revision = "rev".to_string();
+        gto_cfg.cli_binary_sha256 = "a".repeat(64);
+        let gto_digest = mida_core::runner_config::runner_config_digest(&gto_cfg);
+        env.case_configs.push(CaseRunnerConfigEnvelope {
+            case_id: GTO_CASE_ID.to_string(),
+            family_id: packer_family::AHK_GTO.to_string(),
+            protected_input: gto_identity(),
+            protected_input_path: Some(
+                "C:\\snapshots\\gto_launcher\\cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\\snapshot.bin"
+                    .to_string(),
+            ),
+            runner_config: serde_json::to_value(&gto_cfg).unwrap(),
+            runner_config_digest: gto_digest,
+        });
+        env.case_set_digest = case_set_digest(&env.case_configs);
+        assert_eq!(
+            env.validate_case_set(),
+            None,
+            "3-case GTO envelope is valid"
+        );
+
+        let report = ready_report_for_envelope(&env);
+        check_chain_ready(&report, &env).unwrap();
+    }
+
+    /// C-negative (CLI): tampering the GTO per-case digest in the report is
+    /// rejected by `check_chain_ready`.
+    #[test]
+    fn gto_check_chain_ready_rejects_tampered_digest() {
+        use mida_core::runner_config::packer_family;
+        let mut env = v4_envelope();
+        let mut gto_cfg = crate::run_spec::frozen_runner_config_for_family(packer_family::AHK_GTO);
+        gto_cfg.tool_revision = "rev".to_string();
+        gto_cfg.cli_binary_sha256 = "a".repeat(64);
+        let gto_digest = mida_core::runner_config::runner_config_digest(&gto_cfg);
+        env.case_configs.push(CaseRunnerConfigEnvelope {
+            case_id: GTO_CASE_ID.to_string(),
+            family_id: packer_family::AHK_GTO.to_string(),
+            protected_input: gto_identity(),
+            protected_input_path: Some(
+                "C:\\snapshots\\gto_launcher\\cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\\snapshot.bin"
+                    .to_string(),
+            ),
+            runner_config: serde_json::to_value(&gto_cfg).unwrap(),
+            runner_config_digest: gto_digest,
+        });
+        env.case_set_digest = case_set_digest(&env.case_configs);
+
+        let mut report = ready_report_for_envelope(&env);
+        // Tamper the GTO report digest.
+        for c in &mut report.cases {
+            if c.case_id == GTO_CASE_ID {
+                c.runner_config_digest = Some("0".repeat(64));
+            }
+        }
+        let err = check_chain_ready(&report, &env).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("digest drift"),
+            "a tampered GTO per-case digest must be rejected at the gate: {err:#}"
+        );
+    }
+
+    /// C-negative (CLI): `validate_case_set` rejects a GTO case with a missing
+    /// protected_input_path.
+    #[test]
+    fn gto_validate_case_set_missing_path_rejected() {
+        use mida_core::runner_config::packer_family;
+        let mut env = v4_envelope();
+        let mut gto_cfg = crate::run_spec::frozen_runner_config_for_family(packer_family::AHK_GTO);
+        let gto_digest = mida_core::runner_config::runner_config_digest(&gto_cfg);
+        env.case_configs.push(CaseRunnerConfigEnvelope {
+            case_id: GTO_CASE_ID.to_string(),
+            family_id: packer_family::AHK_GTO.to_string(),
+            protected_input: gto_identity(),
+            protected_input_path: None, // missing path -> fail-closed
+            runner_config: serde_json::to_value(&gto_cfg).unwrap(),
+            runner_config_digest: gto_digest,
+        });
+        let reason = env.validate_case_set();
+        assert!(
+            reason.is_some() && reason.as_deref().unwrap().contains("protected_input_path"),
+            "a GTO case with a missing path must be rejected: {reason:?}"
+        );
+    }
+
+    /// C-negative (CLI): `validate_case_set` rejects an Oreans fixed case that
+    /// carries a protected_input_path.
+    #[test]
+    fn gto_validate_case_set_oreans_with_path_rejected() {
+        let mut env = v4_envelope();
+        env.case_configs[0].protected_input_path = Some("C:\\evil\\origin.bin".to_string());
+        let reason = env.validate_case_set();
+        assert!(
+            reason.is_some() && reason.as_deref().unwrap().contains("protected_input_path"),
+            "an Oreans case with a path must be rejected: {reason:?}"
+        );
     }
 }

@@ -35,6 +35,74 @@ fn is_64_hex(value: &str) -> bool {
     value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+/// The immutable snapshot file name (must match the CLI producer's
+/// `crate::sample_snapshot::SNAPSHOT_FILENAME`).
+const SNAPSHOT_FILENAME: &str = "snapshot.bin";
+
+/// Validate a GTO immutable snapshot path and return its 64-hex hash directory
+/// component, WITHOUT relying on canonicalization. The path must be absolute,
+/// free of `.`/`..` components, and of the exact shape
+/// `<root>/gto_launcher/<sha256>/snapshot.bin`. The returned hash is
+/// case-preserved so the caller can compare it (case-normalized) against the
+/// sealed `protected_input.sha256`. This runs BEFORE any canonicalize() so a raw
+/// `..` or relative path is rejected even if it would later resolve to the same
+/// file.
+fn gto_snapshot_hash_dir(path: &str) -> Result<String, String> {
+    let p = std::path::Path::new(path);
+    // Absolute path required; a relative path is never a trusted snapshot.
+    if !p.is_absolute() {
+        return Err(format!("GTO snapshot path {path:?} is not absolute"));
+    }
+    // Reject `.`/`..` components lexically (before canonicalization).
+    for comp in p.components() {
+        match comp {
+            std::path::Component::CurDir | std::path::Component::ParentDir => {
+                return Err(format!(
+                    "GTO snapshot path {path:?} contains a relative ({comp:?}) component"
+                ));
+            }
+            _ => {}
+        }
+    }
+    // File name must be snapshot.bin.
+    let name = p
+        .file_name()
+        .and_then(|f| f.to_str())
+        .ok_or_else(|| format!("GTO snapshot path {path:?} has no file name"))?;
+    if name != SNAPSHOT_FILENAME {
+        return Err(format!(
+            "GTO snapshot path {path:?} must end in {SNAPSHOT_FILENAME}"
+        ));
+    }
+    // <sha256> dir.
+    let sha_dir = p
+        .parent()
+        .ok_or_else(|| format!("GTO snapshot path {path:?} has no hash directory"))?;
+    let sha_name = sha_dir
+        .file_name()
+        .and_then(|f| f.to_str())
+        .ok_or_else(|| format!("GTO snapshot path {path:?} hash dir has no name"))?;
+    if !is_64_hex(sha_name) {
+        return Err(format!(
+            "GTO snapshot path hash dir {sha_name:?} is not a 64-hex content address"
+        ));
+    }
+    // case dir must be gto_launcher.
+    let case_dir = sha_dir
+        .parent()
+        .ok_or_else(|| format!("GTO snapshot path {path:?} has no case directory"))?;
+    let case_name = case_dir
+        .file_name()
+        .and_then(|f| f.to_str())
+        .ok_or_else(|| format!("GTO snapshot path {path:?} case dir has no name"))?;
+    if case_name != GTO_CASE_ID {
+        return Err(format!(
+            "GTO snapshot case directory {case_name:?} != {GTO_CASE_ID}"
+        ));
+    }
+    Ok(sha_name.to_string())
+}
+
 fn main() {
     let code = match run() {
         Ok(v) => v,
@@ -1396,64 +1464,107 @@ fn cmd_preflight(args: &[String]) -> Result<i32, String> {
     let mut case_config_digests: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
     for case in &envelope.case_configs {
-        // GTO no-gate lane case: not an Oreans fixed case and has no locked
-        // manifest. Its identity is bound from the envelope declaration, and
-        // its family must be a registered generic family (ahk_gto).
+        // Common shape (both lanes): family must be a known packer family, and
+        // the protected-input identity must be well-formed.
+        if case.family_id.trim().is_empty()
+            || !mida_acceptance::is_known_packer_family(&case.family_id)
+        {
+            reasons.push(format!(
+                "case {} family_id {:?} is not a known packer family (fail-closed)",
+                case.case_id, case.family_id
+            ));
+        }
+        if !is_64_hex(&case.protected_input.sha256) || case.protected_input.size_bytes == 0 {
+            reasons.push(format!(
+                "case {} protected_input identity is malformed",
+                case.case_id
+            ));
+        }
+
+        // G3-R3-R2 lane/path schema: the GTO lane MUST seal a non-empty immutable
+        // protected-input path; Oreans fixed cases MUST carry None (live-input).
         if case.case_id == GTO_CASE_ID {
-            if !mida_acceptance::is_known_packer_family(&case.family_id)
-                || !mida_acceptance::is_generic_packer_family(&case.family_id)
-            {
+            if !mida_acceptance::is_generic_packer_family(&case.family_id) {
                 reasons.push(format!(
                     "GTO lane case {} must carry a registered generic family (ahk_gto), \
                      got {:?} (fail-closed)",
                     case.case_id, case.family_id
                 ));
             }
-            if !is_64_hex(&case.protected_input.sha256) || case.protected_input.size_bytes == 0 {
-                reasons.push(format!(
-                    "GTO lane case {} protected_input identity is malformed",
-                    case.case_id
-                ));
-            }
-            continue;
-        }
-        // The manifest-declared protected identity for this case_id (Oreans).
-        let locked = mida_acceptance::locked_manifest(&case.case_id);
-        match locked {
-            None => {
-                reasons.push(format!(
-                    "envelope case {:?} is not one of the two fixed Oreans cases",
-                    case.case_id
-                ));
-                continue;
-            }
-            Some(manifest) => {
-                // Keyed identity binding: case_id -> protected_input must match
-                // the manifest-declared identity exactly.
-                if !is_64_hex(&case.protected_input.sha256) || case.protected_input.size_bytes == 0
-                {
+            match case.protected_input_path.as_deref() {
+                Some(p) if !p.trim().is_empty() => {
+                    // G3-R3-R2 content-addressed binding: the snapshot path must be
+                    // a well-formed `<root>/gto_launcher/<sha256>/snapshot.bin`
+                    // whose hash directory equals the sealed protected-input hash
+                    // (case-normalized). This runs BEFORE any canonicalization so a
+                    // raw `.`/`..` or absolute-path bypass is rejected.
+                    match gto_snapshot_hash_dir(p) {
+                        Ok(dir_hash) => {
+                            if !dir_hash.eq_ignore_ascii_case(&case.protected_input.sha256) {
+                                reasons.push(format!(
+                                    "GTO case {} snapshot path hash dir {dir_hash:?} != \
+                                     sealed protected_input sha {} (fail-closed)",
+                                    case.case_id,
+                                    case.protected_input.sha256.to_lowercase()
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            reasons.push(format!(
+                                "GTO case {} snapshot path rejected: {e}",
+                                case.case_id
+                            ));
+                        }
+                    }
+                }
+                _ => {
                     reasons.push(format!(
-                        "case {} protected_input identity is malformed",
+                        "GTO lane case {} must carry a non-empty protected_input_path \
+                         (immutable snapshot) (fail-closed)",
                         case.case_id
                     ));
                 }
-                if case.protected_input.sha256.to_lowercase()
-                    != manifest.protected_input_sha256.to_lowercase()
-                    || case.protected_input.size_bytes != manifest.protected_input_size_bytes
-                {
+            }
+        } else if FIXED_CASE_IDS.contains(&case.case_id.as_str()) {
+            if case.protected_input_path.is_some() {
+                reasons.push(format!(
+                    "Oreans fixed case {} must NOT carry a protected_input_path \
+                     (live-input lane) (fail-closed)",
+                    case.case_id
+                ));
+            }
+            // Oreans-only: the manifest-declared protected identity for this
+            // case_id must match the envelope's protected_input exactly.
+            let locked = mida_acceptance::locked_manifest(&case.case_id);
+            match locked {
+                None => {
                     reasons.push(format!(
-                        "case {} protected_input identity does not match the locked manifest \
-                         (envelope {}/{} vs manifest {}/{})",
-                        case.case_id,
-                        case.protected_input.sha256.to_lowercase(),
-                        case.protected_input.size_bytes,
-                        manifest.protected_input_sha256.to_lowercase(),
-                        manifest.protected_input_size_bytes,
+                        "envelope case {:?} is not one of the two fixed Oreans cases",
+                        case.case_id
                     ));
+                }
+                Some(manifest) => {
+                    if case.protected_input.sha256.to_lowercase()
+                        != manifest.protected_input_sha256.to_lowercase()
+                        || case.protected_input.size_bytes != manifest.protected_input_size_bytes
+                    {
+                        reasons.push(format!(
+                            "case {} protected_input identity does not match the locked manifest \
+                             (envelope {}/{} vs manifest {}/{})",
+                            case.case_id,
+                            case.protected_input.sha256.to_lowercase(),
+                            case.protected_input.size_bytes,
+                            manifest.protected_input_sha256.to_lowercase(),
+                            manifest.protected_input_size_bytes,
+                        ));
+                    }
                 }
             }
         }
-        // Independent reparse + per-case digest recompute keyed by case_id.
+        // Independent reparse + per-case digest recompute keyed by case_id. This
+        // common block runs for BOTH the Oreans fixed lane and the GTO generic
+        // no-gate lane — GTO must be validated exactly as strictly as Oreans
+        // (P1 G3-R3-R2: no `continue` shortcut).
         let parsed: mida_acceptance::RunnerConfig =
             match serde_json::from_value(case.runner_config.clone()) {
                 Ok(c) => c,
@@ -1468,17 +1579,8 @@ fn cmd_preflight(args: &[String]) -> Result<i32, String> {
                 case.case_id
             ));
         }
-        // G2-R1: the envelope's staging-sealed family must be a known family
-        // and must agree with the family embedded in the per-case runner
-        // config. A family mismatch (or an unknown family) fails closed.
-        if case.family_id.trim().is_empty()
-            || !mida_acceptance::is_known_packer_family(&case.family_id)
-        {
-            reasons.push(format!(
-                "case {} family_id {:?} is not a known packer family (fail-closed)",
-                case.case_id, case.family_id
-            ));
-        }
+        // G2-R1: the envelope's staging-sealed family must agree with the family
+        // embedded in the per-case runner config. A mismatch fails closed.
         if parsed.packer_family != case.family_id {
             reasons.push(format!(
                 "case {} runner-config packer_family {:?} != envelope family_id {:?} (fail-closed)",
@@ -1512,10 +1614,16 @@ fn cmd_preflight(args: &[String]) -> Result<i32, String> {
     {
         let mut entries: Vec<String> = Vec::with_capacity(envelope.case_configs.len());
         for case in &envelope.case_configs {
-            // Mirror the CLI producer's canonical case entry exactly, including
-            // the optional sealed protected-input path (G3-R3-R1). Any divergence
+            // Mirror the CLI producer's canonical case entry EXACTLY, including
+            // the optional sealed protected-input path lowercased (G3-R3-R2: the
+            // CLI lowercases it, so the acceptance recompute must too, or a
+            // mixed-case Windows path drifts the digest). Any divergence
             // (including a tampered path) breaks the digest cross-check.
-            let path = case.protected_input_path.clone().unwrap_or_default();
+            let path = case
+                .protected_input_path
+                .clone()
+                .unwrap_or_default()
+                .to_lowercase();
             entries.push(format!(
                 "case={}\nfamily={}\nprotected_input={}|{}\nprotected_input_path={}\nrunner_config_digest={}\n",
                 case.case_id,

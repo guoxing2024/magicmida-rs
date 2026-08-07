@@ -227,3 +227,35 @@ launch input to be the **exact immutable `snapshot.bin` path** sealed at staging
 A live dynamic source — even one byte-identical to the snapshot — is refused at
 launch; it is provenance only. This closes the boundary gap where a GTO case
 could pass preflight on `snapshot.bin` but launch on a same-hash live source.
+## 12. GTO verifier/digest chain closure (G3-R3-R2)
+
+Two gaps in the GTO chain were closed:
+
+**1. Acceptance GTO runner-config validation (P1).** The acceptance verifier's
+GTO branch used to `continue` after a shallow family/identity check, skipping
+the shared strict runner-config validation. Now GTO runs the SAME common checks
+as Oreans: strict `RunnerConfig` reparse, `parsed.packer_family == family_id`,
+independent digest recompute, `tool_revision` cross-check, and insertion into the
+keyed `case_config_digests`. GTO remains generic/no-gate and never enters the
+Oreans locked-manifest or v8 gate.
+
+**2. CLI/acceptance canonical-encoding drift (P1).** The CLI lowercases
+`protected_input_path` in its canonical case entry; the acceptance recompute now
+lowercases it identically, so a mixed-case Windows snapshot path produces a
+stable case-set digest across both sides (locked by a real-acceptance-binary
+test and a cross-crate reseal test).
+
+**Lane/path schema (tightened both sides).** The GTO envelope must seal a
+non-empty `protected_input_path`; Oreans fixed cases must carry `None`. Missing
+GTO path, Oreans-injected path, unknown family, and a content-address hash
+directory ≠ `protected_input.sha256` all fail closed on BOTH the CLI
+(`validate_case_set`, `enforce_gto_snapshot_path_binding`) and the acceptance
+verifier. A raw sealed path containing `.`/`..` is rejected before
+canonicalization even when it would resolve to the same snapshot.
+
+Tests: 9 real-acceptance-binary integration tests (positive mixed-case envelope
+→ clean report + matching GTO per-case digest; chain write→verifier→read_gate_report;
+runner-config family/digest tamper, missing GTO path, Oreans-with-path,
+hash-dir mismatch, raw `..` path, and mixed-case digest stability negatives) plus
+4 hermetic gate tests (`check_chain_ready` accepts the verified GTO digest and
+rejects a tampered one; `validate_case_set` rejects missing-path / Oreans-with-path).

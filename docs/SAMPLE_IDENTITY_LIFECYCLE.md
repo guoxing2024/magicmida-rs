@@ -116,6 +116,16 @@ path, never a live-source alias. Oreans fixed cases keep their live-input lane
 and are not path-bound. This closes the gap where a GTO case could pass
 preflight on `snapshot.bin` but launch on a same-hash live source.
 
+**Verifier/digest chain closure (G3-R3-R2).** The acceptance verifier now
+validates the GTO runner-config with the SAME strictness as Oreans (strict
+`RunnerConfig` reparse, `packer_family == family_id`, independent digest
+recompute, `tool_revision` cross-check) instead of a shallow `continue`, and the
+CLI/acceptance canonical encodings agree on lowercasing `protected_input_path`
+so a mixed-case Windows snapshot path never drifts the case-set digest. The GTO
+envelope must seal a non-empty snapshot path and its hash directory must equal
+the sealed `protected_input.sha256`; Oreans carries `None`. These are enforced
+on both the CLI and the independent acceptance verifier.
+
 ## Rules
 
 - The dynamic path is a source; the manifest binds a frozen revision, never the
