@@ -88,11 +88,22 @@ staging-identity seam) with offline tests covering idempotent capture
 (incl. the reuse path's two-read stability), concurrent publication, no-replace
 publish races, fail-closed cleanup of a failed second read, revision-integrity
 forgery rejection, verified resolve, real disk tampering, path-boundary
-validation, and fresh/reused PE-identity consistency. It is NOT yet wired into
-the GTO preflight lane: the sealed `lab/cases/v2/gto_launcher.json` is
-untouched, and the authoritative sample revision is still under adjudication.
-The next wiring step is for a GTO staging entry to take a verified snapshot path
-as its input identity and bind the case to the snapshot hash/size.
+validation, and fresh/reused PE-identity consistency.
+
+As of G3-R3 the immutable snapshot is wired into the **production GTO staging
+boundary offline**: `run_offline_preflight_command(_with_snapshot_root)`
+captures the protected input into a content-addressed snapshot, verified-resolves
+it from disk, requires the snapshot hash/size/revision to match the sealed
+`lab/cases/v2/gto_launcher.json` `protected_input` identity, and binds the GTO
+envelope to the snapshot path (family `ahk_gto`, generic evidence + `no-gate`).
+The snapshot is re-verified from disk before the envelope is sealed and again at
+the last boundary before the verifier runs; any manifest mismatch or post-capture
+tamper fails closed with a structured NotReady and never produces a launchable
+envelope. The two Oreans fixed cases (`origin_macro`, `lunlun_software`) keep
+their existing v2/v8 live-input lane, isolated by case_id dispatch. This is
+offline wiring only — the authoritative sample revision is still under
+adjudication, and no real GTO sample has been run. The sealed
+`lab/cases/v2/gto_launcher.json` is untouched.
 
 ## Rules
 

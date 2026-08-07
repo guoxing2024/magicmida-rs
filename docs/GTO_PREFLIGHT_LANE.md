@@ -154,5 +154,48 @@ yields a hash-derived revision, and the manifest binds a frozen revision, never
 the live path. Capture is fail-closed (`source_changed_during_capture`), and the
 offline snapshot-to-staging seam (`StagingIdentity` + `staging_identity_matches`)
 drives staging from the snapshot hash/size. The authoritative GTO sample
-revision is still under adjudication; the next wiring step is for GTO staging to
-consume a snapshot path as its input identity.
+revision is still under adjudication. The offline production staging wiring that
+consumes a snapshot path as the GTO input identity is described in section 10.
+
+## 10. Production snapshot-to-preflight wiring (G3-R3)
+
+The immutable snapshot is now wired into the **production GTO staging boundary**
+offline (no real sample was run). `run_offline_preflight_command` and its new
+snapshot-aware variant `run_offline_preflight_command_with_snapshot_root` stage
+each GTO case through the immutable-snapshot lifecycle before any envelope is
+sealed:
+
+1. **Capture / reuse.** `capture_snapshot` freezes the caller's protected input
+   into a content-addressed `snapshot.bin` under
+   `<snapshot_root>/<case_id>/<sha256>/`. The `logical_sample_id` is bound to
+   `gto_launcher`. Reuse is idempotent and fail-closed on source change.
+2. **Verified resolve.** `verified_read_snapshot` re-reads the snapshot from disk
+   and recomputes hash/size/revision. A cached `SampleSnapshot` is never trusted.
+3. **Staging identity.** `staging_identity_matches` requires the snapshot hash,
+   size, AND hash-derived revision to match the **locked manifest** `protected_input`
+   identity. The dynamic source path is provenance only.
+4. **Envelope.** On success, the GTO case's `family_id` is `ahk_gto`, the
+   protected-input identity is the verified snapshot hash/size, the runner config
+   uses the generic evidence schema, and the gate schema is `no-gate`
+   (`UNPACK_GATE_ABSENT`). The two Oreans fixed cases retain their existing
+   v2/v8 live-input lane (isolated by case_id dispatch).
+5. **Boundary re-verification.** The snapshot is re-verified from disk (a) at the
+   staging entry, (b) before the runner-config envelope is sealed, and (c) at the
+   last trusted boundary before the verifier is invoked. A snapshot modified,
+   truncated, deleted, or replaced between boundaries fails closed.
+
+**Manifest mismatch fails closed.** If the snapshot hash/size differ from the
+manifest, staging returns a structured NotReady (`GenericGateFailure`) that
+carries `case_id`, expected hash/size, and observed hash/size. No launchable
+envelope is produced, no launch attestation runs, no target process is created,
+the manifest is not rewritten, and no observed revision is automatically
+registered as the authoritative `gto_launcher` revision. Existing snapshot
+revisions are never deleted or overwritten.
+
+**Status.** This is offline wiring of the production staging boundary — it is not
+real-sample perfect-unpack acceptance. The authoritative sample revision remains
+under adjudication (manifest-bound `_dyncdb/launcher.exe` vs the dynamically
+updated `D:\Tools\RE\dumps\gto\启动器.exe`). No real GTO sample process was run.
+GTO remains `NOT completed / NOT perfect / NOT accepted`; `no-gate` means there is
+no acceptance gate, not that the product is accepted. The next step is real
+snapshot staging + run acceptance only after the authority decision.

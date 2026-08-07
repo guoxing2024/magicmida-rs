@@ -125,6 +125,21 @@ stay reproducible by hash. See
 sealed `lab/cases/v2/gto_launcher.json` is untouched and the authoritative GTO
 sample revision is still under adjudication.
 
+### Production snapshot-to-preflight wiring (G3-R3, offline)
+
+The immutable snapshot is wired into the **production GTO staging boundary**:
+`run_offline_preflight_command(_with_snapshot_root)` captures the protected
+input, verified-resolves it from disk, requires the snapshot hash/size/revision
+to match the sealed manifest's `protected_input` identity, and binds the GTO
+envelope to the snapshot path (family `ahk_gto`, generic evidence + `no-gate`).
+The snapshot is re-verified from disk before the envelope is sealed and again at
+the last trusted boundary before the verifier runs; a manifest mismatch or any
+post-capture tamper fails closed with a structured NotReady and never yields a
+launchable envelope. The two Oreans fixed cases keep their v2/v8 live-input lane.
+**This is offline wiring only — no real GTO sample has been run.** GTO remains
+`NOT completed / NOT perfect / NOT accepted`; `no-gate` means there is no
+acceptance gate, not that the product is accepted.
+
 ### Acceptance kernel (R0B)
 
 `mida-acceptance` is an independent crate: it must not depend on production

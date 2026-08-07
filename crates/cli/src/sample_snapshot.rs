@@ -287,6 +287,25 @@ pub fn capture_snapshot(
     )
 }
 
+#[cfg(test)]
+pub(crate) fn capture_snapshot_with_hooks(
+    source: &Path,
+    snapshot_root: &Path,
+    logical_sample_id: &str,
+    provenance_tool_revision: &str,
+    before_second_read: Option<Box<dyn FnMut() + Send>>,
+    before_publish: Option<Box<dyn FnMut() + Send>>,
+) -> Result<SampleSnapshot, CaptureError> {
+    capture_snapshot_impl(
+        source,
+        snapshot_root,
+        logical_sample_id,
+        provenance_tool_revision,
+        before_second_read,
+        before_publish,
+    )
+}
+
 /// Internal capture with optional hooks invoked between the two source reads and
 /// before publish. The hooks are a pure TEST seam (production passes `None`):
 /// they let a test mutate/delete the source or inject a racy target
