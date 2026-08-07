@@ -3224,7 +3224,7 @@ mod tests {
     fn gto_validate_case_set_missing_path_rejected() {
         use mida_core::runner_config::packer_family;
         let mut env = v4_envelope();
-        let mut gto_cfg = crate::run_spec::frozen_runner_config_for_family(packer_family::AHK_GTO);
+        let gto_cfg = crate::run_spec::frozen_runner_config_for_family(packer_family::AHK_GTO);
         let gto_digest = mida_core::runner_config::runner_config_digest(&gto_cfg);
         env.case_configs.push(CaseRunnerConfigEnvelope {
             case_id: GTO_CASE_ID.to_string(),

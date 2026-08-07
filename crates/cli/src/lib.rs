@@ -5,6 +5,7 @@
 //! The binary is a thin wrapper over [`run`] / [`exit_code_for_error`].
 
 pub mod args;
+pub mod authority_dossier;
 pub mod capture_policy_file;
 pub mod commands;
 pub mod log;

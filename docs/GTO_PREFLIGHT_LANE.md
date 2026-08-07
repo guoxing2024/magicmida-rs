@@ -327,3 +327,48 @@ correspondence negatives (envelope-GTO-lacks-case, case-GTO-lacks-envelope,
 duplicate `--case` GTO, duplicate envelope GTO, malformed manifest id) all fail
 closed; the raw `..`, hash-dir mismatch, and family/digest-tamper negatives stay
 green; Oreans live-input/v2/v8 regression stays green.
+
+## 15. Sample authority adjudication dossier + promotion gate (G3-R4)
+
+The GTO sample's authority is NOT auto-decided; this task builds the audit
+inputs and an explicit promotion gate (offline only).
+
+**`mida.sample-authority-dossier/v1`** (`crate::authority_dossier`): a machine-
+readable dossier of the observed sample revisions. It records logical_sample_id,
+packer_family, manifest_path, manifest_declared_identity, observed_revisions[]
+(each with sha256, size, immutable_snapshot_path, availability
+`verified`/`missing`/`historical-record-only`, comparison_verdict
+`matches_manifest`/`differs_from_manifest`, PE base identity), source_path
+(provenance only), capture_tool_revision, captured_at (provenance only),
+family_observation, authority_status (always `pending_human_decision`),
+blockers[], completion_marker, and a sealed_dossier_hash over the canonical
+content. It never auto-fills accepted/promoted/current_authority.
+
+**Producer** (`produce_authority_dossier`): for a live candidate source it
+calls `capture_snapshot` then `verified_read_snapshot` (fail-closed if the
+source changes between the two reads), extracts hash/size/PE identity, and never
+trusts the live source directly. A historical revision whose file is gone is
+recorded as `historical-record-only` (no fake snapshot). Output path is
+caller-provided; it never writes into `lab/cases/v2` and never mutates a
+manifest. Timestamps/source paths are provenance only and never part of any
+revision identity.
+
+**`mida.sample-authority-decision/v1`**: an externally-provided human decision
+(logical_sample_id, selected_revision_sha256, selected_revision_size,
+dossier_sha256, decision `retain_manifest`/`promote_revision`/`reject_revision`,
+decision_reason, decided_by, decided_at, acknowledgement[]). This task generates
+only a pending template; it never creates an approved decision.
+
+**Promotion gate** (`apply_decision`): a pure offline verifier that recomputes
+the dossier sealed hash, requires the selected revision to be in the dossier with
+matching hash/size, re-reads the verified snapshot from disk, requires all three
+acknowledgements, and then:
+- `retain_manifest` may only select the current manifest identity;
+- `promote_revision` returns a HUMAN-APPLY-ONLY promotion plan (never writes the
+  manifest);
+- `reject_revision` never enters staging;
+- pending/missing/unknown decision, dossier-hash mismatch, outside-revision, or
+  hash/size mismatch all fail closed.
+
+Production GTO staging still treats the manifest `protected_input` as the sole
+current authority; the promotion plan is never wired to a manifest write.
