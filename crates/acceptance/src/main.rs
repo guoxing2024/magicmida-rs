@@ -103,6 +103,63 @@ fn gto_snapshot_hash_dir(path: &str) -> Result<String, String> {
     Ok(sha_name.to_string())
 }
 
+/// Read the `case_id` from a `mida.case-manifest/v2` (best-effort; empty when
+/// the manifest is unreadable/malformed).
+fn read_manifest_case_id(manifest_path: &Path) -> Option<String> {
+    let bytes = fs::read(manifest_path).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    value
+        .get("case_id")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+}
+
+/// Bind the ACTUAL `--case` GTO input to the envelope's sealed immutable
+/// snapshot path. Independent verifier enforcement (P6.3-G3-R3-R2-R1): a
+/// same-bytes different-path live source/alias is refused HERE, not deferred
+/// to the CLI launch helper.
+///
+/// Returns the verified sealed path (for the report) on success, or a reason
+/// on failure.
+fn bind_gto_actual_input_to_sealed(
+    actual_input: &Path,
+    env_gto: &CaseConfigEnvelopeV4,
+) -> Result<String, String> {
+    // 1. Sealed path must be present and non-empty.
+    let sealed = env_gto
+        .protected_input_path
+        .as_deref()
+        .filter(|p| !p.trim().is_empty())
+        .ok_or_else(|| "GTO lane case has no non-empty protected_input_path".to_string())?;
+    // 2. Structural validation of the RAW sealed path (absolute, no `.`/`..`,
+    //    `<root>/gto_launcher/<sha256>/snapshot.bin`) and return the hash dir.
+    let sealed_hash = gto_snapshot_hash_dir(sealed)?;
+    // 3. Content-address binding: the path's hash directory must equal the
+    //    sealed protected-input SHA-256 (case-normalized).
+    if !sealed_hash.eq_ignore_ascii_case(&env_gto.protected_input.sha256) {
+        return Err(format!(
+            "GTO snapshot path hash dir {sealed_hash:?} != sealed protected_input sha {} \
+             (fail-closed)",
+            env_gto.protected_input.sha256.to_lowercase()
+        ));
+    }
+    // 4. Canonical(actual input) must equal canonical(sealed path). A live
+    //    source or alias with identical bytes but a different path is refused.
+    let actual_canon = mida_acceptance::preflight::canonicalize_loose(actual_input);
+    let sealed_canon = mida_acceptance::preflight::canonicalize_loose(Path::new(sealed));
+    if actual_canon != sealed_canon {
+        return Err(format!(
+            "GTO actual input {} (canonical {}) != sealed immutable snapshot {} \
+             (canonical {}); a same-bytes live source/alias is refused (fail-closed)",
+            actual_input.display(),
+            actual_canon.display(),
+            sealed,
+            sealed_canon.display()
+        ));
+    }
+    Ok(sealed.to_string())
+}
+
 fn main() {
     let code = match run() {
         Ok(v) => v,
@@ -1645,6 +1702,31 @@ fn cmd_preflight(args: &[String]) -> Result<i32, String> {
         }
     }
 
+    // P6.3-G3-R3-R2-R1: independently bind each GTO `--case` actual input to
+    // the envelope's sealed `protected_input_path`. The verifier refuses a
+    // same-bytes different-path live source/alias by itself (canonical equality
+    // + content-address structure), never relying on the CLI launch helper.
+    // Oreans fixed cases keep their live-input lane and are not path-bound.
+    let mut gto_protected_input_path: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    for (manifest, input, _output) in &cases {
+        let case_id = read_manifest_case_id(manifest).unwrap_or_default();
+        if case_id != GTO_CASE_ID {
+            continue;
+        }
+        let env_gto = envelope
+            .case_configs
+            .iter()
+            .find(|c| c.case_id == GTO_CASE_ID)
+            .ok_or_else(|| "envelope is missing the gto_launcher case".to_string())?;
+        match bind_gto_actual_input_to_sealed(input, env_gto) {
+            Ok(sealed) => {
+                gto_protected_input_path.insert(GTO_CASE_ID.to_string(), sealed);
+            }
+            Err(e) => reasons.push(e),
+        }
+    }
+
     // The report's runner_config_digest is the sealed case-set digest; the
     // per-case digests flow into the report's cases. For the (legacy,
     // rejected) single-config path we keep a placeholder that can never pass
@@ -1671,6 +1753,7 @@ fn cmd_preflight(args: &[String]) -> Result<i32, String> {
         expected_toolchain: &expected_toolchain,
         repo_root: &repo_root,
         case_config_digests,
+        gto_protected_input_path,
         case_set_digest: envelope.case_set_digest.clone(),
     };
     let mut report = mida_acceptance::run_offline_preflight(&request);

@@ -44,6 +44,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+mod common;
+
 fn temp_dir(tag: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -69,67 +71,7 @@ fn real_manifest(case_id: &str) -> PathBuf {
 }
 
 fn acceptance_bin() -> PathBuf {
-    let cli_bin = PathBuf::from(env!("CARGO_BIN_EXE_mida-cli"));
-    let sibling = cli_bin
-        .parent()
-        .expect("cli binary has a parent")
-        .join("mida-acceptance.exe");
-    assert!(
-        sibling.exists(),
-        "acceptance binary missing: {}",
-        sibling.display()
-    );
-    assert_acceptance_fresh(&sibling);
-    sibling
-}
-
-/// Fail closed on a stale sibling acceptance binary (P6.3.1 hermetic tests):
-/// the binary must be newer than every acceptance source file, otherwise the
-/// test would silently run against a verifier that does not match the
-/// current build. The `cargo test --workspace` gate rebuilds it fresh.
-fn assert_acceptance_fresh(sibling: &Path) {
-    let acc_root = workspace_root().join("crates/acceptance");
-    let binary_mtime = fs::metadata(sibling)
-        .and_then(|m| m.modified())
-        .expect("acceptance binary mtime");
-    let mut stale = false;
-    for path in source_files(&acc_root) {
-        let mtime = match fs::metadata(&path).and_then(|m| m.modified()) {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
-        if mtime > binary_mtime {
-            stale = true;
-            break;
-        }
-    }
-    assert!(
-        !stale,
-        "stale acceptance binary {} (newer than acceptance source); \
-         run `cargo test --workspace` to rebuild it before testing",
-        sibling.display()
-    );
-}
-
-/// Recursively collect the `.rs` sources (plus Cargo.toml) of a crate.
-fn source_files(root: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        if let Ok(entries) = fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.is_dir() {
-                    stack.push(p);
-                } else if p.extension().map(|e| e == "rs").unwrap_or(false)
-                    || p.file_name().map(|n| n == "Cargo.toml").unwrap_or(false)
-                {
-                    out.push(p);
-                }
-            }
-        }
-    }
-    out
+    common::acceptance_bin()
 }
 
 fn verifier_stub() -> PathBuf {

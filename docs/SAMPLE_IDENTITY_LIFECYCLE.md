@@ -126,6 +126,18 @@ envelope must seal a non-empty snapshot path and its hash directory must equal
 the sealed `protected_input.sha256`; Oreans carries `None`. These are enforced
 on both the CLI and the independent acceptance verifier.
 
+**Verifier input↔sealed-path binding (G3-R3-R2-R1).** The independent
+`mida-acceptance` verifier binds each GTO `--case` actual input to the
+envelope's sealed `protected_input_path` by case_id: it requires the sealed path
+to be absolute and free of `.`/`..`, structurally `<root>/gto_launcher/
+<sha256>/snapshot.bin` with its hash directory equal to the sealed
+`protected_input.sha256`, and `canonicalize(actual) == canonicalize(sealed)` — so
+a same-bytes live source/alias is refused by the verifier itself, not just the
+CLI launch helper. The report's GTO `protected_input_path` is the verified
+sealed snapshot path. The CLI launch helper validates the raw sealed path before
+canonicalization, and the real-verifier tests are self-contained in the
+acceptance package so `cargo test -p mida-cli` passes in a fresh target.
+
 ## Rules
 
 - The dynamic path is a source; the manifest binds a frozen revision, never the

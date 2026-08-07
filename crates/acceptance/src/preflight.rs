@@ -753,6 +753,14 @@ pub struct PreflightRequest<'a> {
     /// path). When present, it is recorded in the matching
     /// `CasePreflight.runner_config_digest`.
     pub case_config_digests: std::collections::BTreeMap<String, String>,
+    /// P6.3-G3-R3-R2-R1: the VERIFIED sealed immutable snapshot path for the
+    /// GTO lane case, KEYED by `case_id`. When the orchestrator (the
+    /// acceptance verifier) has independently bound the actual `--case` GTO
+    /// input to the envelope's sealed `protected_input_path` (canonical
+    /// equality + content-address structure), it records the sealed path here
+    /// so the report's GTO `protected_input_path` is that verified snapshot
+    /// path — never a same-bytes live-source alias.
+    pub gto_protected_input_path: std::collections::BTreeMap<String, String>,
     /// P6.3.3: the sealed case-set digest of the v4 envelope. When
     /// non-empty, it is recorded as `PreflightReport.runner_config_digest`.
     pub case_set_digest: String,
@@ -760,7 +768,7 @@ pub struct PreflightRequest<'a> {
 
 /// Canonicalize `p`, falling back to canonicalizing its parent when the
 /// path itself does not exist yet (e.g. a candidate output file).
-fn canonicalize_loose(p: &Path) -> PathBuf {
+pub fn canonicalize_loose(p: &Path) -> PathBuf {
     if let Ok(c) = fs::canonicalize(p) {
         return c;
     }
@@ -1073,6 +1081,14 @@ pub fn run_offline_preflight(request: &PreflightRequest<'_>) -> PreflightReport 
                 ));
             }
         }
+        // P6.3-G3-R3-R2-R1: for the GTO lane the report's protected-input path
+        // is the VERIFIED sealed immutable snapshot path (already bound to the
+        // actual input by the verifier), never the raw `--case` input alias.
+        let report_input_path = request
+            .gto_protected_input_path
+            .get(&case_id)
+            .cloned()
+            .unwrap_or_else(|| canonicalize_loose(input_path).display().to_string());
         cases.push(CasePreflight {
             case_id: verdict
                 .identity
@@ -1082,7 +1098,7 @@ pub fn run_offline_preflight(request: &PreflightRequest<'_>) -> PreflightReport 
             identity_ok: verdict.ok,
             reasons: verdict.reasons,
             protected_input: verdict.file.clone(),
-            protected_input_path: canonicalize_loose(input_path).display().to_string(),
+            protected_input_path: report_input_path,
             manifest_path: canonicalize_loose(manifest_path).display().to_string(),
             candidate_output: output_canonical_case.display().to_string(),
             runner_config_digest: case_digest.map(|d| d.to_lowercase()),

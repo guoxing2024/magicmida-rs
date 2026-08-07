@@ -19,6 +19,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+mod common;
+
 fn temp_dir(tag: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -44,67 +46,7 @@ fn real_manifest(case_id: &str) -> PathBuf {
 }
 
 fn acceptance_bin() -> PathBuf {
-    let cli_bin = PathBuf::from(env!("CARGO_BIN_EXE_mida-cli"));
-    let sibling = cli_bin
-        .parent()
-        .expect("cli binary has a parent")
-        .join("mida-acceptance.exe");
-    assert!(
-        sibling.exists(),
-        "acceptance binary missing: {}",
-        sibling.display()
-    );
-    assert_acceptance_fresh(&sibling);
-    sibling
-}
-
-/// Fail closed on a stale sibling acceptance binary (P6.3.1 hermetic tests):
-/// the binary must be newer than every acceptance source file, otherwise the
-/// test would silently run against a verifier that does not match the
-/// current build. The `cargo test --workspace` gate rebuilds it fresh.
-fn assert_acceptance_fresh(sibling: &Path) {
-    let acc_root = workspace_root().join("crates/acceptance");
-    let binary_mtime = fs::metadata(sibling)
-        .and_then(|m| m.modified())
-        .expect("acceptance binary mtime");
-    let mut stale = false;
-    for path in source_files(&acc_root) {
-        let mtime = match fs::metadata(&path).and_then(|m| m.modified()) {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
-        if mtime > binary_mtime {
-            stale = true;
-            break;
-        }
-    }
-    assert!(
-        !stale,
-        "stale acceptance binary {} (newer than acceptance source); \
-         run `cargo test --workspace` to rebuild it before testing",
-        sibling.display()
-    );
-}
-
-/// Recursively collect the `.rs` sources (plus Cargo.toml) of a crate.
-fn source_files(root: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        if let Ok(entries) = fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.is_dir() {
-                    stack.push(p);
-                } else if p.extension().map(|e| e == "rs").unwrap_or(false)
-                    || p.file_name().map(|n| n == "Cargo.toml").unwrap_or(false)
-                {
-                    out.push(p);
-                }
-            }
-        }
-    }
-    out
+    common::acceptance_bin()
 }
 
 fn run_cli(args: &[&str], env: &[(&str, String)]) -> Output {
@@ -1348,11 +1290,14 @@ fn missing_duplicate_extra_case_rejected_by_verifier() {
 }
 
 // ---------------------------------------------------------------------------
-// G3-R3-R2: GTO verifier/digest chain — real acceptance binary + negative tests.
+// G3-R3-R2/G3-R3-R2-R1: CLI-side canonical-encoding stability for the sealed
+// GTO path. The digest is case-normalized (the producer lowercases the path), so
+// a semantically legal mixed-case root/hash produces the same case-set digest
+// as its lowercased form.
 // ---------------------------------------------------------------------------
 
-/// Build a GTO (generic/no-gate) runner config + its digest.
-fn gto_runner_config() -> (mida_acceptance::RunnerConfig, String) {
+/// Build a GTO case entry with the given sealed protected_input_path.
+fn gto_case_entry_with_path(path: &str) -> serde_json::Value {
     let mut cfg = mida_acceptance::RunnerConfig {
         packer_family: "ahk_gto".to_string(),
         tool_revision: "rev".to_string(),
@@ -1380,356 +1325,46 @@ fn gto_runner_config() -> (mida_acceptance::RunnerConfig, String) {
     cfg.tool_revision = "rev".to_string();
     cfg.cli_binary_sha256 = "a".repeat(64);
     let digest = mida_acceptance::runner_config_digest(&cfg);
-    (cfg, digest)
-}
-
-/// The GTO protected-input SHA (matches the snapshot hash-directory in the path).
-const GTO_SHA: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
-const GTO_SIZE: u64 = 42;
-
-/// A MIXED-CASE Windows snapshot path for the GTO case (uppercased hash dir).
-fn mixed_case_gto_path() -> String {
-    format!(
-        "C:\\SnapShots\\GtO_LaUnChEr\\{}\\SnapShot.bin",
-        GTO_SHA.to_uppercase()
-    )
-}
-
-/// A GTO case entry (family ahk_gto, generic/no-gate config, sealed mixed-case
-/// protected_input_path) for a v4 envelope.
-fn gto_case_entry_json() -> serde_json::Value {
-    let (cfg, digest) = gto_runner_config();
     serde_json::json!({
         "case_id": "gto_launcher",
-        "family_id": cfg.packer_family,
-        "protected_input": { "sha256": GTO_SHA, "size_bytes": GTO_SIZE },
-        "protected_input_path": mixed_case_gto_path(),
+        "family_id": "ahk_gto",
+        "protected_input": { "sha256": "c".repeat(64), "size_bytes": 42 },
+        "protected_input_path": path,
         "runner_config": serde_json::to_value(&cfg).unwrap(),
         "runner_config_digest": digest,
     })
 }
 
-/// Build a full v4 envelope from the given case configs (re-sealing the digest).
-fn envelope_from_configs(configs: Vec<serde_json::Value>) -> serde_json::Value {
-    let digest = reseal_case_set(&configs);
-    let mut env = v4_envelope_json(configs);
-    env["case_set_digest"] = serde_json::json!(digest);
-    env
-}
-
-/// A full envelope: the two Oreans fixed cases + the given GTO case.
-fn full_envelope_with_gto(gto_case: serde_json::Value) -> serde_json::Value {
-    envelope_from_configs(vec![
-        case_entry_json("origin_macro", ORIGIN_SHA, ORIGIN_SIZE),
-        case_entry_json("lunlun_software", LUNLUN_SHA, LUNLUN_SIZE),
-        gto_case,
-    ])
-}
-
-/// Invoke the REAL acceptance binary against a GTO envelope + Oreans triples +
-/// a GTO case triple. Returns output.
-fn run_acceptance_on_gto_envelope(
-    dir: &Path,
-    repo_root: &Path,
-    envelope: &serde_json::Value,
-    gto_input: &Path,
-) -> Output {
-    let cli = staging_cli(dir);
-    let envelope_path = dir.join("runner-config-envelope.json");
-    fs::write(&envelope_path, serde_json::to_vec_pretty(envelope).unwrap()).unwrap();
-    fs::write(dir.join("input_origin.bin"), b"ORIGIN-SYNTHETIC-INPUT-A").unwrap();
-    fs::write(dir.join("input_lunlun.bin"), b"LUNLUN-SYNTHETIC-INPUT-B").unwrap();
-    let args = vec![
-        "preflight".to_string(),
-        "--envelope".to_string(),
-        envelope_path.display().to_string(),
-        "--output-dir".to_string(),
-        dir.display().to_string(),
-        "--cli-binary".to_string(),
-        cli.display().to_string(),
-        "--repo-root".to_string(),
-        repo_root.display().to_string(),
-        "--toolchain-pin".to_string(),
-        workspace_root()
-            .join("rust-toolchain.toml")
-            .display()
-            .to_string(),
-        "--expected-toolchain".to_string(),
-        "1.97.1".to_string(),
-        "--case".to_string(),
-        real_manifest("origin_macro").display().to_string(),
-        dir.join("input_origin.bin").display().to_string(),
-        dir.join("origin_candidate.exe").display().to_string(),
-        "--case".to_string(),
-        real_manifest("lunlun_software").display().to_string(),
-        dir.join("input_lunlun.bin").display().to_string(),
-        dir.join("lunlun_candidate.exe").display().to_string(),
-        "--case".to_string(),
-        real_manifest("gto_launcher").display().to_string(),
-        gto_input.display().to_string(),
-        dir.join("gto_candidate.exe").display().to_string(),
-    ];
-    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    Command::new(&acceptance_bin())
-        .args(&arg_refs)
-        .output()
-        .expect("spawn acceptance binary")
-}
-
-/// Write a real GTO snapshot file under the given dir and return its path.
-fn write_gto_snapshot(dir: &Path) -> PathBuf {
-    let p = dir
-        .join("snapshots")
-        .join("gto_launcher")
-        .join(GTO_SHA)
-        .join("snapshot.bin");
-    fs::create_dir_all(p.parent().unwrap()).unwrap();
-    fs::write(&p, b"GTO-SNAPSHOT-PAYLOAD").unwrap();
-    p
-}
-
-/// Read the preflight report emitted by the acceptance binary as JSON.
-fn read_report(dir: &Path) -> serde_json::Value {
-    let raw = fs::read(dir.join("preflight.json")).unwrap();
-    serde_json::from_slice(&raw).unwrap()
-}
-
-/// A. Production-shaped positive control: a real envelope with a GTO case and a
-/// MIXED-CASE protected_input_path is accepted by the real acceptance binary.
-/// The report's GTO runner_config_digest equals the envelope per-case digest and
-/// the case-set digest passes the independent recompute (no drift reason).
-#[test]
-fn gto_real_acceptance_produces_clean_report_and_digest() {
-    let dir = temp_dir("gto_acc_ok");
-    let repo_root = scratch_repo(&dir);
-    let gto_path = write_gto_snapshot(&dir);
-
-    let envelope = full_envelope_with_gto(gto_case_entry_json());
-    let out = run_acceptance_on_gto_envelope(&dir, &repo_root, &envelope, &gto_path);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    // A clean mixed-case GTO envelope must produce NotReady (exit 2) only from
-    // the synthetic files / no real run — never a digest drift or a GTO
-    // validation reason.
-    assert_eq!(out.status.code(), Some(2), "expected NotReady: {stderr}");
-    assert!(
-        !stderr.contains("digest drift")
-            && !stderr.contains("runner-config digest drift")
-            && !stderr.contains("protected_input_path")
-            && !stderr.contains("runner config rejected")
-            && !stderr.contains("hash dir"),
-        "no GTO/verifier/digest rejection for a valid mixed-case envelope: {stderr}"
-    );
-
-    // The report is emitted; the GTO case's runner_config_digest is present and
-    // equals the envelope per-case digest; the report top-level digest equals the
-    // envelope case-set digest.
-    let report = read_report(&dir);
-    let gto_report = report["cases"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|c| c["case_id"].as_str() == Some("gto_launcher"))
-        .expect("report contains gto_launcher case");
-    let expected_digest = envelope["case_configs"][2]["runner_config_digest"]
-        .as_str()
-        .unwrap()
-        .to_lowercase();
-    assert_eq!(
-        gto_report["runner_config_digest"]
-            .as_str()
-            .unwrap()
-            .to_lowercase(),
-        expected_digest,
-        "report GTO runner_config_digest must equal the envelope per-case digest"
-    );
-    assert_eq!(
-        report["runner_config_digest"]
-            .as_str()
-            .unwrap()
-            .to_lowercase(),
-        envelope["case_set_digest"].as_str().unwrap().to_lowercase(),
-        "report runner_config_digest must equal the envelope case-set digest"
-    );
-    let _ = fs::remove_dir_all(&dir);
-}
-
-/// B. Production-shaped chain: write the envelope, run the REAL acceptance
-/// verifier, read the report with `read_gate_report` (the launch boundary's
-/// strict parser), and confirm the GTO case is present with a matching digest.
-#[test]
-fn gto_chain_write_verifier_read_report() {
-    let dir = temp_dir("gto_chain");
-    let repo_root = scratch_repo(&dir);
-    let gto_path = write_gto_snapshot(&dir);
-
-    let envelope = full_envelope_with_gto(gto_case_entry_json());
-    let out = run_acceptance_on_gto_envelope(&dir, &repo_root, &envelope, &gto_path);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(2), "expected NotReady: {stderr}");
-    assert!(
-        !stderr.contains("digest drift"),
-        "no digest drift: {stderr}"
-    );
-
-    // The launch boundary parses the report with the strict gate-report parser.
-    let report = mida_cli::runner_preflight::read_gate_report(&dir).unwrap();
-    assert_eq!(
-        report.runner_config_digest.to_lowercase(),
-        envelope["case_set_digest"].as_str().unwrap().to_lowercase(),
-        "report case-set digest must match the envelope seal"
-    );
-    assert!(
-        report.cases.iter().any(|c| c.case_id == "gto_launcher"),
-        "report carries the GTO lane case"
-    );
-    let _ = fs::remove_dir_all(&dir);
-}
-
-/// C1. Negative: tampering the GTO runner_config JSON (family mismatch) is
-/// rejected by the real acceptance binary (P1: GTO must be validated as
-/// strictly as Oreans).
-#[test]
-fn gto_runner_config_family_tamper_rejected() {
-    let dir = temp_dir("gto_cfg_tamper");
-    let repo_root = scratch_repo(&dir);
-    let gto_path = write_gto_snapshot(&dir);
-
-    let mut gto = gto_case_entry_json();
-    gto["runner_config"]["packer_family"] = serde_json::json!("oreans_themida");
-    let envelope = full_envelope_with_gto(gto);
-    let out = run_acceptance_on_gto_envelope(&dir, &repo_root, &envelope, &gto_path);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("packer_family") && stderr.contains("oreans_themida"),
-        "GTO runner-config family tamper must be rejected: {stderr}"
-    );
-    let _ = fs::remove_dir_all(&dir);
-}
-
-/// C2. Negative: tampering the GTO runner_config_digest is rejected.
-#[test]
-fn gto_runner_config_digest_tamper_rejected() {
-    let dir = temp_dir("gto_dig_tamper");
-    let repo_root = scratch_repo(&dir);
-    let gto_path = write_gto_snapshot(&dir);
-
-    let mut gto = gto_case_entry_json();
-    gto["runner_config_digest"] = serde_json::json!("0".repeat(64));
-    let envelope = full_envelope_with_gto(gto);
-    let out = run_acceptance_on_gto_envelope(&dir, &repo_root, &envelope, &gto_path);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("digest drift") || stderr.contains("recomputed"),
-        "GTO runner-config digest tamper must be rejected: {stderr}"
-    );
-    let _ = fs::remove_dir_all(&dir);
-}
-
-/// C3. Negative: missing GTO protected_input_path is rejected.
-#[test]
-fn gto_missing_path_rejected() {
-    let dir = temp_dir("gto_missing_path");
-    let repo_root = scratch_repo(&dir);
-    let gto_path = write_gto_snapshot(&dir);
-
-    let mut gto = gto_case_entry_json();
-    gto["protected_input_path"] = serde_json::Value::Null;
-    let envelope = full_envelope_with_gto(gto);
-    let out = run_acceptance_on_gto_envelope(&dir, &repo_root, &envelope, &gto_path);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("protected_input_path"),
-        "a GTO case without a protected_input_path must be rejected: {stderr}"
-    );
-    let _ = fs::remove_dir_all(&dir);
-}
-
-/// C4. Negative: an Oreans fixed case carrying a protected_input_path is rejected.
-#[test]
-fn oreans_with_path_rejected() {
-    let dir = temp_dir("oreans_path");
-    let repo_root = scratch_repo(&dir);
-    let gto_path = write_gto_snapshot(&dir);
-
-    let mut configs = vec![
-        case_entry_json("origin_macro", ORIGIN_SHA, ORIGIN_SIZE),
-        case_entry_json("lunlun_software", LUNLUN_SHA, LUNLUN_SIZE),
-        gto_case_entry_json(),
-    ];
-    configs[0]["protected_input_path"] = serde_json::json!("C:\\evil\\origin.bin");
-    let envelope = envelope_from_configs(configs);
-    let out = run_acceptance_on_gto_envelope(&dir, &repo_root, &envelope, &gto_path);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("origin_macro") && stderr.contains("protected_input_path"),
-        "an Oreans fixed case with a protected_input_path must be rejected: {stderr}"
-    );
-    let _ = fs::remove_dir_all(&dir);
-}
-
-/// C5. Negative: the snapshot hash directory differs from protected_input.sha256.
-#[test]
-fn gto_hash_dir_mismatch_rejected() {
-    let dir = temp_dir("gto_hash_mismatch");
-    let repo_root = scratch_repo(&dir);
-    // Sealed path hash dir (d..) != protected_input.sha256 (c..).
-    let wrong_sha = "d".repeat(64);
-    let gto_path = dir
-        .join("snapshots")
-        .join("gto_launcher")
-        .join(&wrong_sha)
-        .join("snapshot.bin");
-    fs::create_dir_all(gto_path.parent().unwrap()).unwrap();
-    fs::write(&gto_path, b"GTO-SNAPSHOT-PAYLOAD").unwrap();
-
-    let mut gto = gto_case_entry_json();
-    gto["protected_input_path"] = serde_json::json!(gto_path.display().to_string());
-    let envelope = full_envelope_with_gto(gto);
-    let out = run_acceptance_on_gto_envelope(&dir, &repo_root, &envelope, &gto_path);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("hash dir") || stderr.contains("!= sealed protected_input sha"),
-        "a hash-directory mismatch must be rejected: {stderr}"
-    );
-    let _ = fs::remove_dir_all(&dir);
-}
-
-/// C6. Negative: a raw sealed path containing `..` is rejected even though it
-/// could canonicalize to the same snapshot.
-#[test]
-fn gto_raw_dotdot_path_rejected() {
-    let dir = temp_dir("gto_dotdot");
-    let repo_root = scratch_repo(&dir);
-    let gto_path = write_gto_snapshot(&dir);
-
-    let mut gto = gto_case_entry_json();
-    gto["protected_input_path"] = serde_json::json!(format!(
-        "{}\\snapshots\\..\\snapshots\\gto_launcher\\{}\\snapshot.bin",
-        dir.display(),
-        GTO_SHA
-    ));
-    let envelope = full_envelope_with_gto(gto);
-    let out = run_acceptance_on_gto_envelope(&dir, &repo_root, &envelope, &gto_path);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("relative") || stderr.contains("`..`") || stderr.contains("parent"),
-        "a raw `..` path must be rejected: {stderr}"
-    );
-    let _ = fs::remove_dir_all(&dir);
-}
-
-/// C7. CLI-side canonical-encoding stability: a mixed-case protected_input_path
-/// must produce the SAME case-set digest as its lowercased form (the sealed
-/// encoding lowercases the path on both the producer and the recompute).
 #[test]
 fn gto_mixed_case_path_digest_is_stable() {
-    let mixed = full_envelope_with_gto(gto_case_entry_json());
-    let mut lower = gto_case_entry_json();
-    lower["protected_input_path"] = serde_json::json!(mixed_case_gto_path().to_lowercase());
-    let lower_env = full_envelope_with_gto(lower);
+    // A semantically legal snapshot path: only the ROOT and the 64-hex hash dir
+    // are case-varied; the fixed `gto_launcher` case dir and `snapshot.bin`
+    // filename are preserved (the verifier would reject a changed case dir or
+    // filename).
+    let legal = "C:\\SnapShots\\gto_launcher\\CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC\\snapshot.bin";
+    let lower = legal.to_lowercase();
+
+    let mut mixed_env = v4_envelope_json(vec![
+        case_entry_json("origin_macro", ORIGIN_SHA, ORIGIN_SIZE),
+        case_entry_json("lunlun_software", LUNLUN_SHA, LUNLUN_SIZE),
+        gto_case_entry_with_path(legal),
+    ]);
+    mixed_env["case_set_digest"] = serde_json::json!(reseal_case_set(
+        mixed_env["case_configs"].as_array().unwrap()
+    ));
+
+    let mut lower_env = v4_envelope_json(vec![
+        case_entry_json("origin_macro", ORIGIN_SHA, ORIGIN_SIZE),
+        case_entry_json("lunlun_software", LUNLUN_SHA, LUNLUN_SIZE),
+        gto_case_entry_with_path(&lower),
+    ]);
+    lower_env["case_set_digest"] = serde_json::json!(reseal_case_set(
+        lower_env["case_configs"].as_array().unwrap()
+    ));
+
     assert_eq!(
-        mixed["case_set_digest"].as_str().unwrap(),
+        mixed_env["case_set_digest"].as_str().unwrap(),
         lower_env["case_set_digest"].as_str().unwrap(),
-        "the case-set digest must be case-normalized (mixed-case path == lowercased)"
+        "the case-set digest must be case-normalized (mixed-case root/hash == lowercased)"
     );
 }

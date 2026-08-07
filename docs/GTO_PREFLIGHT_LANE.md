@@ -259,3 +259,37 @@ runner-config family/digest tamper, missing GTO path, Oreans-with-path,
 hash-dir mismatch, raw `..` path, and mixed-case digest stability negatives) plus
 4 hermetic gate tests (`check_chain_ready` accepts the verified GTO digest and
 rejects a tampered one; `validate_case_set` rejects missing-path / Oreans-with-path).
+
+## 13. Verifier input↔sealed-path binding + self-contained tests (G3-R3-R2-R1)
+
+**Independent verifier path binding.** The `mida-acceptance` verifier now binds
+each GTO `--case` actual input to the envelope's sealed `protected_input_path`
+by case_id, independently of the CLI launch helper. For the GTO case it requires
+the sealed path to be non-empty and absolute, free of `.`/`..`, of the exact
+shape `<root>/gto_launcher/<sha256>/snapshot.bin`, with its hash directory equal
+to `protected_input.sha256` (case-normalized), and `canonicalize(actual input)`
+equal to `canonicalize(sealed path)` — a same-bytes live source/alias is refused
+by the verifier itself. The report's GTO `protected_input_path` is the verified
+sealed snapshot path. Oreans keeps its live-input lane.
+
+**Launch helper raw-path first.** `enforce_gto_snapshot_path_binding` now
+validates the RAW sealed path lexically/shape-wise (absolute, no `.`/`..`,
+content-address structure, hash binding) BEFORE any canonical comparison, so a
+raw `..` is refused even if it would canonicalize to the same snapshot.
+
+**Self-contained package tests.** The real-`mida-acceptance` binary tests moved
+to the acceptance package's own integration tests (`crates/acceptance/tests/`),
+which are self-contained via `CARGO_BIN_EXE_mida-acceptance`. The CLI integration
+tests (`preflight_boundary.rs`, `launch_attestation.rs`) resolve/build the
+acceptance binary on demand into a dedicated, per-process target dir (hermetic,
+concurrency-safe via cargo's build lock and distinct temp dirs), so
+`cargo test -p mida-cli --offline` passes in a fresh `CARGO_TARGET_DIR` without
+first running `cargo test -p mida-acceptance` or `cargo test --workspace`.
+
+Tests: `verifier_accepts_exact_bound_gto_snapshot`,
+`verifier_rejects_same_bytes_different_gto_path`,
+`verifier_rejects_gto_raw_dotdot_path`, `verifier_report_binds_sealed_gto_path`,
+`gto_positive_control_has_no_gto_rejection_reasons` (+ 5 GTO/Oreans negatives in
+`crates/acceptance/tests/gto_verifier.rs`), and the CLI hermetic
+`launch_helper_rejects_raw_dotdot_before_canonicalization`. Oreans v2/v8
+regression stays green.

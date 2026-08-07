@@ -1098,7 +1098,22 @@ fn enforce_gto_snapshot_path_binding(
         )
     })?;
 
-    // 2. The report's recorded protected_input_path must equal the sealed path
+    // 2. Validate the RAW sealed_path lexically/shape-wise BEFORE any
+    //    canonicalization (G3-R3-R2-R1): it must be absolute, free of `.`/`..`,
+    //    of the exact shape `<root>/gto_launcher/<sha256>/snapshot.bin`, and its
+    //    content-address hash directory must equal the sealed protected-input
+    //    hash. A raw `..`/relative path is refused even if it would later
+    //    canonicalize to the same snapshot.
+    let (_, sealed_hash_dir) = snapshot_root_of_snapshot(Path::new(sealed_path))?;
+    if !sealed_hash_dir.eq_ignore_ascii_case(&current_identity.sha256) {
+        bail!(
+            "GTO snapshot path hash dir {sealed_hash_dir:?} != protected_input sha {} \
+             (content-address path/identity mismatch; fail-closed)",
+            current_identity.sha256.to_lowercase()
+        );
+    }
+
+    // 3. The report's recorded protected_input_path must equal the sealed path
     //    (canonical form), so a tampered report path is caught.
     if canonicalize_loose(Path::new(&matched.protected_input_path))
         != canonicalize_loose(Path::new(sealed_path))
@@ -1111,7 +1126,7 @@ fn enforce_gto_snapshot_path_binding(
         );
     }
 
-    // 3. The launch input's canonical path must equal the sealed snapshot path.
+    // 4. The launch input's canonical path must equal the sealed snapshot path.
     //    canonicalize() resolves symlinks/junctions/reparse points, so an input
     //    that aliases outside snapshot_root cannot equal the sealed path.
     let sealed_canonical = canonicalize_loose(Path::new(sealed_path));
@@ -1124,19 +1139,6 @@ fn enforce_gto_snapshot_path_binding(
             ctx.input.display(),
             input_canonical.display(),
             sealed_path
-        );
-    }
-
-    // 4. The sealed snapshot path must be under a well-formed snapshot_root
-    //    (no `..`, no symlink escape, no non-canonical address), AND its
-    //    content-address hash directory must equal the sealed protected-input
-    //    hash (case-normalized). This binds the trusted path to the identity.
-    let (_, sealed_hash_dir) = snapshot_root_of_snapshot(&sealed_canonical)?;
-    if !sealed_hash_dir.eq_ignore_ascii_case(&current_identity.sha256) {
-        bail!(
-            "GTO snapshot path hash dir {sealed_hash_dir:?} != protected_input sha {} \
-             (content-address path/identity mismatch; fail-closed)",
-            current_identity.sha256.to_lowercase()
         );
     }
     Ok(())
@@ -3250,5 +3252,33 @@ mod tests {
             reason.is_some() && reason.as_deref().unwrap().contains("protected_input_path"),
             "an Oreans case with a path must be rejected: {reason:?}"
         );
+    }
+
+    /// G3-R3-R2-R1 (三): the launch helper rejects a raw `..` in the sealed
+    /// protected-input path BEFORE canonicalization. `enforce_gto_snapshot_path_binding`
+    /// must fail closed on the raw path's lexical/shape validation, not rely on
+    /// a later canonical comparison or the `rerun_verifier`.
+    #[test]
+    fn launch_helper_rejects_raw_dotdot_before_canonicalization() {
+        let root = temp_dir("launch_dotdot");
+        let (_, snap_path) = make_snapshot(&root);
+        // A raw sealed path containing `..` that WOULD canonicalize to the same
+        // snapshot is still rejected by the lexical/shape validator.
+        let raw_dotdot = format!(
+            "{}\\snapshots\\..\\snapshots\\gto_launcher\\{}\\snapshot.bin",
+            root.display(),
+            "c".repeat(64)
+        );
+        let env = gto_envelope_with_path(Some(&raw_dotdot));
+        let report_case = gto_report_case(&raw_dotdot);
+        let ident = gto_identity();
+        let cfg = gto_runner_config();
+        let ctx = launch_ctx(&snap_path, &cfg);
+        let err = enforce_gto_snapshot_path_binding(&env, &report_case, &ident, &ctx).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("relative") || format!("{err:#}").contains("ParentDir"),
+            "a raw `..` sealed path must be rejected by the launch helper: {err:#}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
