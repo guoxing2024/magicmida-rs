@@ -859,3 +859,70 @@ fn malformed_case_manifest_id_rejected() {
     );
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// G3-R5-R1: a sealed logical-id directory that is a junction pointing OUTSIDE
+/// the snapshot_root must be rejected by the independent acceptance verifier,
+/// even though the actual input uses the same sealed path and hash/size/bytes
+/// all match. Per-case identity_ok=false with a clear path-binding reason.
+#[cfg(windows)]
+#[test]
+fn acceptance_junction_escape_of_logical_dir_identity_ok_false() {
+    let dir = temp_dir("acc_junction_logical");
+    let (envelope, manifest, snap_path, sha, size) = setup_positive(&dir);
+    let _ = manifest;
+    // Move the real snapshot dir content into an OUTSIDE dir, then replace
+    // <snapshot_root>/gto_launcher with a junction to outside/gto_launcher.
+    let snap_root = dir.join("snapshots");
+    let outside = dir.join("outside_real");
+    let outside_gto = outside.join("gto_launcher");
+    let sha_dir = outside_gto.join(&sha);
+    std::fs::create_dir_all(&sha_dir).unwrap();
+    // Copy the real snapshot into the outside structure.
+    std::fs::copy(&snap_path, sha_dir.join("snapshot.bin")).unwrap();
+    // Remove the real gto_launcher dir and junction it to outside/gto_launcher.
+    std::fs::remove_dir_all(&snap_root.join("gto_launcher")).unwrap();
+    let mklink = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&snap_root.join("gto_launcher"))
+        .arg(&outside_gto)
+        .output()
+        .expect("mklink must be invocable");
+    assert!(
+        mklink.status.success(),
+        "junction creation failed: {}",
+        String::from_utf8_lossy(&mklink.stderr)
+    );
+    // The sealed path (and the actual --case input) is the same snapshot path,
+    // which now resolves through the junction to OUTSIDE the snapshot_root.
+    let sealed = snap_root
+        .join("gto_launcher")
+        .join(&sha)
+        .join("snapshot.bin");
+    assert!(sealed.is_file(), "junction must expose the snapshot");
+
+    // The original envelope's sealed protected_input_path already points at the
+    // junctioned snapshot path; the manifest declares the real sha/size.
+    let out = run_verifier(&dir, &envelope, &dir.join("gto_launcher.json"), &sealed);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "expected NotReady: {stderr}");
+    let report = read_report(&dir);
+    let gto = gto_report_case(&report);
+    assert_eq!(
+        gto["identity_ok"].as_bool(),
+        Some(false),
+        "junction-escaped GTO case must be identity_ok=false: {gto}"
+    );
+    let reasons: Vec<&str> = gto["reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_str().unwrap())
+        .collect();
+    assert!(
+        reasons.iter().any(|r| r.contains("path")
+            || r.contains("escape")
+            || r.contains("failed disk verification")),
+        "GTO case reasons must cite the path-binding failure: {gto}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}

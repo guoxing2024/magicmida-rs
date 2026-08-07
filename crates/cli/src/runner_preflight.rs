@@ -1085,19 +1085,39 @@ fn enforce_gto_snapshot_path_binding(
         );
     }
 
-    // 4. The launch input's canonical path must equal the sealed snapshot path.
-    //    canonicalize() resolves symlinks/junctions/reparse points, so an input
-    //    that aliases outside snapshot_root cannot equal the sealed path.
-    let sealed_canonical = canonicalize_loose(Path::new(sealed_path));
-    let input_canonical = canonicalize_loose(ctx.input);
-    if input_canonical != sealed_canonical {
+    // 4. STRICT disk-level canonicalization of the sealed snapshot path and the
+    //    launch input, with canonical snapshot_root containment. `canonical_verify_snapshot_path`
+    //    strictly canonicalizes (NO loose fallback) and requires the canonical
+    //    path to stay under the canonical snapshot_root with the correct
+    //    logical/hash layers, so a junction/symlink/reparse escape of the sealed
+    //    path's logical/hash/file layer is rejected. The launch input's canonical
+    //    form must equal the sealed path's canonical form.
+    let sealed_canonical = crate::sample_snapshot::canonical_verify_snapshot_path(
+        Path::new(sealed_path),
+        GTO_CASE_ID,
+        &current_identity.sha256,
+    )
+    .map_err(|e| anyhow::anyhow!("GTO sealed snapshot path failed disk verification: {e}"))?;
+    let input_canonical = crate::sample_snapshot::canonical_verify_snapshot_path(
+        ctx.input,
+        GTO_CASE_ID,
+        &current_identity.sha256,
+    )
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "GTO launch input {} failed disk verification (missing/reparse/escape): {e}",
+            ctx.input.display()
+        )
+    })?;
+    if input_canonical.snapshot_path != sealed_canonical.snapshot_path {
         bail!(
             "GTO launch input {} (canonical {}) must be the staged immutable \
-             snapshot {}; a live source with identical bytes is still refused \
-             (identity+path double binding)",
+             snapshot {} (canonical {}); a live source or alias with identical \
+             bytes is still refused (identity+path double binding)",
             ctx.input.display(),
-            input_canonical.display(),
-            sealed_path
+            input_canonical.snapshot_path.display(),
+            sealed_path,
+            sealed_canonical.snapshot_path.display()
         );
     }
     Ok(())
@@ -2805,9 +2825,15 @@ mod tests {
         let ident = gto_identity();
 
         // A live source OUTSIDE snapshot_root with the SAME bytes/hash as the
-        // snapshot. Its canonical path differs from the sealed snapshot path, so
-        // it is refused even though identity (hash/size) matches.
-        let live = root.join("live_source.exe");
+        // snapshot, placed at a DIFFERENT (but structurally valid) snapshot-root
+        // path. Its canonical path differs from the sealed snapshot path, so it
+        // is refused even though identity (hash/size) matches.
+        let live_root = root.join("live_snapshots");
+        let live = live_root
+            .join("gto_launcher")
+            .join("c".repeat(64))
+            .join(crate::sample_snapshot::SNAPSHOT_FILENAME);
+        std::fs::create_dir_all(live.parent().unwrap()).unwrap();
         std::fs::write(&live, b"G3-R3-R1-SNAPSHOT-PAYLOAD").unwrap();
         let cfg = gto_runner_config();
         let ctx = launch_ctx(&live, &cfg);
@@ -2829,9 +2855,14 @@ mod tests {
         let ident = gto_identity();
 
         // The dynamic source path (a different file with DIFFERENT bytes) is
-        // passed at launch. It fails the path binding; it must not be re-captured
-        // or auto-registered as a new revision.
-        let live = root.join("live_updated.exe");
+        // passed at launch at a different (structurally valid) snapshot path. It
+        // fails the path binding; it must not be re-captured or auto-registered.
+        let live_root = root.join("live_snapshots");
+        let live = live_root
+            .join("gto_launcher")
+            .join("c".repeat(64))
+            .join(crate::sample_snapshot::SNAPSHOT_FILENAME);
+        std::fs::create_dir_all(live.parent().unwrap()).unwrap();
         std::fs::write(&live, b"DIFFERENT-PAYLOAD-AFTER-PREFLIGHT").unwrap();
         let cfg = gto_runner_config();
         let ctx = launch_ctx(&live, &cfg);
@@ -2873,9 +2904,8 @@ mod tests {
         ];
         let cfg = gto_runner_config();
         for inp in &escape_inputs {
-            // Create the file so canonicalize resolves it to its real (outside)
-            // location; if it cannot be created, canonicalize_loose still yields
-            // a parent-canonicalized path that differs from the sealed snapshot.
+            // Create the file so canonicalize resolves it; a failing escape is
+            // still rejected fail-closed.
             if inp.parent().is_some() {
                 let _ = std::fs::create_dir_all(inp.parent().unwrap());
             }
@@ -2883,9 +2913,15 @@ mod tests {
             let ctx = launch_ctx(inp, &cfg);
             let err =
                 enforce_gto_snapshot_path_binding(&env, &report_case, &ident, &ctx).unwrap_err();
+            let msg = format!("{err:#}");
             assert!(
-                format!("{err:#}").contains("must be the staged immutable snapshot"),
-                "escape input {} must be path-rejected: {err:#}",
+                msg.contains("must be the staged immutable snapshot")
+                    || msg.contains("failed disk verification")
+                    || msg.contains("contains a relative")
+                    || msg.contains("must end in snapshot.bin")
+                    || msg.contains("escapes canonical snapshot root")
+                    || msg.contains("is not absolute"),
+                "escape input {} must be path-rejected: {msg}",
                 inp.display()
             );
         }
@@ -2958,14 +2994,19 @@ mod tests {
                     junction_created = true;
                     let junction_snap = link.join("snapshot.bin");
                     assert!(junction_snap.is_file());
-                    // The junction resolves OUTSIDE snapshot_root; its canonical
-                    // path differs from the sealed snapshot -> rejected.
+                    // The junction path is not a well-formed content-addressed
+                    // address (no logical/hash layers), so the launch helper must
+                    // fail closed on it.
                     let ctx = launch_ctx(&junction_snap, &cfg);
                     let err = enforce_gto_snapshot_path_binding(&env, &report_case, &ident, &ctx)
                         .unwrap_err();
+                    let msg = format!("{err:#}");
                     assert!(
-                        format!("{err:#}").contains("must be the staged immutable snapshot"),
-                        "a junction escape out of snapshot_root must be rejected: {err:#}"
+                        msg.contains("failed disk verification")
+                            || msg.contains("must be the staged immutable snapshot")
+                            || msg.contains("escapes canonical snapshot root")
+                            || msg.contains("must end in snapshot.bin"),
+                        "a junction escape out of snapshot_root must be rejected: {msg}"
                     );
                 }
             }
@@ -2979,7 +3020,12 @@ mod tests {
             .join("c".repeat(64))
             .join("snapshot.bin");
         assert!(snapshot_root_of_snapshot(&relative).is_err());
-        let sibling = root.join("sibling.exe");
+        let sibling_root = root.join("sibling_snapshots");
+        let sibling = sibling_root
+            .join("gto_launcher")
+            .join("c".repeat(64))
+            .join(crate::sample_snapshot::SNAPSHOT_FILENAME);
+        std::fs::create_dir_all(sibling.parent().unwrap()).unwrap();
         std::fs::write(&sibling, b"G3-R3-R1-SNAPSHOT-PAYLOAD").unwrap();
         let ctx = launch_ctx(&sibling, &cfg);
         let err = enforce_gto_snapshot_path_binding(&env, &report_case, &ident, &ctx).unwrap_err();

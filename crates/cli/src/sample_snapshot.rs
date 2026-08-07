@@ -65,6 +65,18 @@ pub fn parse_snapshot_path(path: &Path) -> Result<ParsedSnapshotPath, String> {
     if !path.is_absolute() {
         return Err(format!("snapshot path {} is not absolute", path.display()));
     }
+    // Reject `.` / `..` at the RAW string level BEFORE `Path::components()`
+    // normalizes them away (on Windows a `/./` or `\.\` interior segment is
+    // collapsed by the path parser). Handle drive/UNC/`\\?\` prefixes so a
+    // legitimate absolute path is never falsely rejected.
+    let raw = path.to_string_lossy();
+    for comp in raw.split(['/', '\\']) {
+        if comp == "." || comp == ".." {
+            return Err(format!(
+                "snapshot path {raw} contains a relative ({comp:?}) component"
+            ));
+        }
+    }
     // Reject `.` / `..` lexically (before any canonicalization).
     for comp in path.components() {
         match comp {
@@ -141,6 +153,101 @@ pub fn parse_snapshot_path(path: &Path) -> Result<ParsedSnapshotPath, String> {
         sha256: sha_name.to_string(),
         snapshot_path: path.to_path_buf(),
     })
+}
+
+/// Strictly canonicalize a trusted snapshot path and verify it stays under the
+/// canonical `snapshot_root` with the correct logical-sample and hash layers.
+///
+/// This is the disk-level counterpart of [`parse_snapshot_path`]: it parses the
+/// RAW path lexically, then STRICT-canonicalizes it (NO `canonicalize_loose`
+/// fallback — a missing file or any canonicalization/reparse failure fails
+/// closed), canonicalizes the lexical `snapshot_root`, and requires:
+/// - the canonical full path to be under the canonical `snapshot_root`;
+/// - the canonical path to still match `<canonical_root>/<logical>/<sha>/snapshot.bin`
+///   (so a logical/hash/file layer that is a junction/symlink/reparse point
+///   escaping `snapshot_root` is rejected).
+///
+/// `expected_logical_sample_id` / `expected_sha256` must match the parsed (and
+/// re-parsed canonical) values.
+pub fn canonical_verify_snapshot_path(
+    path: &Path,
+    expected_logical_sample_id: &str,
+    expected_sha256: &str,
+) -> Result<ParsedSnapshotPath, String> {
+    // 1. Lexical parse first (rejects relative, ./.., wrong filename, bad hash).
+    let parsed = parse_snapshot_path(path)?;
+    if parsed.logical_sample_id != expected_logical_sample_id {
+        return Err(format!(
+            "snapshot path {} logical-sample directory {:?} != expected {expected_logical_sample_id:?}",
+            path.display(),
+            parsed.logical_sample_id
+        ));
+    }
+    if !parsed.sha256.eq_ignore_ascii_case(expected_sha256) {
+        return Err(format!(
+            "snapshot path {} hash directory {:?} != expected sha {expected_sha256}",
+            path.display(),
+            parsed.sha256
+        ));
+    }
+    // 2. STRICT canonicalize of the full path — no loose fallback. A junction /
+    //    symlink / reparse that resolves elsewhere, or a missing file, fails here.
+    let canonical = std::fs::canonicalize(path).map_err(|e| {
+        format!(
+            "snapshot path {} cannot be canonicalized (missing or reparse failure): {e}",
+            path.display()
+        )
+    })?;
+    // 3. STRICT canonicalize of the lexical snapshot_root.
+    let canonical_root = std::fs::canonicalize(&parsed.snapshot_root).map_err(|e| {
+        format!(
+            "snapshot root {} cannot be canonicalized: {e}",
+            parsed.snapshot_root.display()
+        )
+    })?;
+    // 4. The canonical full path must be under the canonical snapshot_root.
+    if !canonical.starts_with(&canonical_root) {
+        return Err(format!(
+            "canonical snapshot path {} escapes canonical snapshot root {} \
+             (junction/symlink/reparse escape is rejected)",
+            canonical.display(),
+            canonical_root.display()
+        ));
+    }
+    // 5. Re-parse the canonical path; it must still match the exact structure
+    //    with the expected logical id and hash (a layer junction cannot have
+    //    silently re-pointed the identity).
+    let canonical_parsed = parse_snapshot_path(&canonical).map_err(|e| {
+        format!(
+            "canonical snapshot path {} is not a well-formed snapshot address: {e}",
+            canonical.display()
+        )
+    })?;
+    if canonical_parsed.snapshot_root != canonical_root {
+        return Err(format!(
+            "canonical snapshot root {} != canonicalized lexical root {}",
+            canonical_parsed.snapshot_root.display(),
+            canonical_root.display()
+        ));
+    }
+    if canonical_parsed.logical_sample_id != expected_logical_sample_id {
+        return Err(format!(
+            "canonical snapshot logical-sample directory {:?} != expected {expected_logical_sample_id:?} \
+             (junction escape of the logical dir is rejected)",
+            canonical_parsed.logical_sample_id
+        ));
+    }
+    if !canonical_parsed
+        .sha256
+        .eq_ignore_ascii_case(expected_sha256)
+    {
+        return Err(format!(
+            "canonical snapshot hash directory {:?} != expected sha {expected_sha256} \
+             (junction escape of the hash dir is rejected)",
+            canonical_parsed.sha256
+        ));
+    }
+    Ok(canonical_parsed)
 }
 
 /// A process-wide monotonic counter used to make temp-file names unique.
@@ -2098,5 +2205,163 @@ mod tests {
             .join(SNAPSHOT_FILENAME);
         assert!(parse_snapshot_path(&other).is_ok());
         assert!(runner_preflight::snapshot_root_of_snapshot(&other).is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // G3-R5-R1: strict canonical snapshot_root containment + raw ".".
+    // ------------------------------------------------------------------
+
+    /// A real, existing snapshot at a canonical content-addressed path passes
+    /// strict disk verification.
+    #[test]
+    fn canonical_normal_snapshot_passes() {
+        let root = temp_root("canonical_ok");
+        let sha = "c".repeat(64);
+        let path = root.join("gto_launcher").join(&sha).join(SNAPSHOT_FILENAME);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"SNAPSHOT-CONTENT").unwrap();
+        let parsed = canonical_verify_snapshot_path(&path, "gto_launcher", &sha).unwrap();
+        // The returned snapshot_root is the STRICT-canonicalized root.
+        assert_eq!(parsed.snapshot_root, std::fs::canonicalize(&root).unwrap());
+        assert_eq!(parsed.snapshot_path, std::fs::canonicalize(&path).unwrap());
+        assert!(parsed.snapshot_path.starts_with(&parsed.snapshot_root));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Strict canonicalization: a missing/nonexistent snapshot fails closed and
+    /// never falls back to the loose parent-canonicalized path.
+    #[test]
+    fn canonicalization_failure_does_not_fall_back() {
+        let root = temp_root("canonical_missing");
+        let sha = "c".repeat(64);
+        let path = root.join("gto_launcher").join(&sha).join(SNAPSHOT_FILENAME);
+        // The file does NOT exist.
+        assert!(canonical_verify_snapshot_path(&path, "gto_launcher", &sha).is_err());
+        // Even if the parent directory exists, a missing snapshot must not fall
+        // back to a loose path.
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let err = canonical_verify_snapshot_path(&path, "gto_launcher", &sha).unwrap_err();
+        assert!(
+            err.contains("cannot be canonicalized") || err.contains("missing"),
+            "missing snapshot must fail closed, no loose fallback: {err}"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A raw "." interior segment (C:\root\.\gto_launcher\<sha>\snapshot.bin) is
+    /// rejected by the raw-string component check, even though Windows
+    /// `Path::components()` would normalize `/./` away.
+    #[test]
+    fn raw_dot_path_rejected() {
+        let root = std::env::temp_dir().join("mida_raw_dot_root");
+        let raw = format!(
+            "{}\\.\\gto_launcher\\{}\\snapshot.bin",
+            root.display(),
+            "c".repeat(64)
+        );
+        assert!(
+            parse_snapshot_path(std::path::Path::new(&raw)).is_err(),
+            "raw . interior segment must be rejected"
+        );
+        // Mixed separator form too.
+        let raw2 = format!(
+            "{}/./gto_launcher/{}/snapshot.bin",
+            root.display(),
+            "c".repeat(64)
+        );
+        assert!(
+            parse_snapshot_path(std::path::Path::new(&raw2)).is_err(),
+            "raw /./ interior segment must be rejected"
+        );
+    }
+
+    /// A junction at the logical-sample directory that escapes the snapshot_root
+    /// must be rejected by the launch helper. Deterministic: if junction creation
+    /// fails, the test FAILS (no silent skip).
+    #[cfg(windows)]
+    #[test]
+    fn junction_escape_of_logical_dir_rejected() {
+        let root = temp_root("junction_logical");
+        let sha = "c".repeat(64);
+        // Real snapshot under root.
+        let real = root.join("gto_launcher").join(&sha).join(SNAPSHOT_FILENAME);
+        std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+        std::fs::write(&real, b"JUNCTION-SNAPSHOT-CONTENT").unwrap();
+        // An OUTSIDE directory holding the same logical/hash structure.
+        let outside = root.join("outside_real");
+        std::fs::create_dir_all(outside.join("gto_launcher").join(&sha)).unwrap();
+        std::fs::write(
+            outside
+                .join("gto_launcher")
+                .join(&sha)
+                .join(SNAPSHOT_FILENAME),
+            b"JUNCTION-SNAPSHOT-CONTENT",
+        )
+        .unwrap();
+        // Replace root/gto_launcher with a junction to outside/gto_launcher.
+        std::fs::remove_dir_all(&root.join("gto_launcher")).unwrap();
+        let mklink = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&root.join("gto_launcher"))
+            .arg(&outside.join("gto_launcher"))
+            .output()
+            .expect("mklink must be invocable");
+        assert!(
+            mklink.status.success(),
+            "junction creation failed: {}",
+            String::from_utf8_lossy(&mklink.stderr)
+        );
+        // The sealed path root/gto_launcher/<sha>/snapshot.bin now resolves to
+        // outside/gto_launcher/<sha>/snapshot.bin, which is NOT under root.
+        let sealed = root.join("gto_launcher").join(&sha).join(SNAPSHOT_FILENAME);
+        assert!(sealed.is_file(), "junction must expose the snapshot");
+        // Strict canonical verify must reject the escape.
+        let err = canonical_verify_snapshot_path(&sealed, "gto_launcher", &sha).unwrap_err();
+        assert!(
+            err.contains("escapes canonical snapshot root")
+                || err.contains("cannot be canonicalized")
+                || err.contains("not a well-formed snapshot address")
+                || err.contains("!= canonicalized lexical root"),
+            "junction escape of the logical dir must be rejected: {err}"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A junction at the hash directory that escapes the snapshot_root must be
+    /// rejected.
+    #[cfg(windows)]
+    #[test]
+    fn junction_escape_of_hash_dir_rejected() {
+        let root = temp_root("junction_hash");
+        let sha = "c".repeat(64);
+        let real = root.join("gto_launcher").join(&sha).join(SNAPSHOT_FILENAME);
+        std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+        std::fs::write(&real, b"HASH-JUNCTION-CONTENT").unwrap();
+        let outside = root.join("outside_real");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join(SNAPSHOT_FILENAME), b"HASH-JUNCTION-CONTENT").unwrap();
+        // Replace root/gto_launcher/<sha> with a junction to outside.
+        std::fs::remove_dir_all(&root.join("gto_launcher").join(&sha)).unwrap();
+        let mklink = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&root.join("gto_launcher").join(&sha))
+            .arg(&outside)
+            .output()
+            .expect("mklink must be invocable");
+        assert!(
+            mklink.status.success(),
+            "junction creation failed: {}",
+            String::from_utf8_lossy(&mklink.stderr)
+        );
+        let sealed = root.join("gto_launcher").join(&sha).join(SNAPSHOT_FILENAME);
+        assert!(sealed.is_file());
+        let err = canonical_verify_snapshot_path(&sealed, "gto_launcher", &sha).unwrap_err();
+        assert!(
+            err.contains("escapes canonical snapshot root")
+                || err.contains("cannot be canonicalized")
+                || err.contains("not a well-formed snapshot address"),
+            "junction escape of the hash dir must be rejected: {err}"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

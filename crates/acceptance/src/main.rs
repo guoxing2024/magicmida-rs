@@ -94,18 +94,40 @@ fn bind_gto_actual_input_to_sealed(
             env_gto.protected_input.sha256.to_lowercase()
         ));
     }
-    // 4. Canonical(actual input) must equal canonical(sealed path). A live
-    //    source or alias with identical bytes but a different path is refused.
-    let actual_canon = mida_acceptance::preflight::canonicalize_loose(actual_input);
-    let sealed_canon = mida_acceptance::preflight::canonicalize_loose(Path::new(sealed));
-    if actual_canon != sealed_canon {
+    // 4. STRICT disk-level canonical verification of the sealed path and the
+    //    actual input, with canonical snapshot_root containment. `canonical_verify_snapshot_path`
+    //    strictly canonicalizes (NO loose fallback) and requires the canonical
+    //    path to stay under the canonical snapshot_root with the correct
+    //    logical/hash layers, so a junction/symlink/reparse escape of the sealed
+    //    path's logical/hash/file layer is rejected. A missing file or any
+    //    canonicalization failure also fails closed (never falls back to the raw
+    //    path).
+    let sealed_canon = mida_acceptance::snapshot_path::canonical_verify_snapshot_path(
+        Path::new(sealed),
+        GTO_CASE_ID,
+        &env_gto.protected_input.sha256,
+    )
+    .map_err(|e| format!("GTO sealed snapshot path failed disk verification: {e}"))?;
+    let actual_canon = mida_acceptance::snapshot_path::canonical_verify_snapshot_path(
+        actual_input,
+        GTO_CASE_ID,
+        &env_gto.protected_input.sha256,
+    )
+    .map_err(|e| {
+        format!(
+            "GTO actual input {} failed disk verification (missing/reparse/escape): {e}",
+            actual_input.display()
+        )
+    })?;
+    if actual_canon.snapshot_path != sealed_canon.snapshot_path {
         return Err(format!(
             "GTO actual input {} (canonical {}) != sealed immutable snapshot {} \
-             (canonical {}); a same-bytes live source/alias is refused (fail-closed)",
+             (canonical {}); a live source/alias with identical bytes is refused \
+             (identity+path double binding, fail-closed)",
             actual_input.display(),
-            actual_canon.display(),
+            actual_canon.snapshot_path.display(),
             sealed,
-            sealed_canon.display()
+            sealed_canon.snapshot_path.display()
         ));
     }
     Ok(sealed.to_string())

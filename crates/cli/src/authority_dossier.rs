@@ -766,18 +766,34 @@ pub fn apply_decision(
             {
                 return Err("promoted snapshot re-verification failed (hash/size)".to_string());
             }
-            // P2-4: canonical-cross-check the dossier's recorded path against the
-            // disk-verified snapshot path. A forged/drifted immutable_snapshot_path
-            // in the dossier is rejected even though the dossier is sealed (the
-            // seal covers it, but the DISK is the authority for the promoted path).
-            let recorded_canon = canonicalize_loose(Path::new(&rev.immutable_snapshot_path));
-            let verified_canon = canonicalize_loose(&verified.snapshot_abs_path);
-            if recorded_canon != verified_canon {
+            // P2-4 / G3-R5-R1: strict-canonical-verify the dossier's recorded
+            // path against the CALLER's trusted snapshot_root. A forged/drifted
+            // immutable_snapshot_path (or a junction/reparse alias that canonicalizes
+            // to the same bytes elsewhere) is rejected. STRICT canonicalize with no
+            // loose fallback: a missing/non-canonicalizable recorded path fails.
+            let recorded_canon = sample_snapshot::canonical_verify_snapshot_path(
+                Path::new(&rev.immutable_snapshot_path),
+                &dossier.logical_sample_id,
+                &rev.sha256,
+            )
+            .map_err(|e| {
+                format!("promoted revision recorded path failed disk verification: {e}")
+            })?;
+            // The disk-verified snapshot (from the trusted snapshot_root) must
+            // canonicalize to the SAME canonical path as the recorded one.
+            let verified_canon =
+                std::fs::canonicalize(&verified.snapshot_abs_path).map_err(|e| {
+                    format!(
+                        "disk-verified snapshot path {} cannot be canonicalized: {e}",
+                        verified.snapshot_abs_path.display()
+                    )
+                })?;
+            if recorded_canon.snapshot_path != verified_canon {
                 return Err(format!(
                     "promoted revision recorded snapshot path {} (canonical {}) != \
                      disk-verified snapshot path {} (canonical {})",
                     rev.immutable_snapshot_path,
-                    recorded_canon.display(),
+                    recorded_canon.snapshot_path.display(),
                     verified.snapshot_abs_path.display(),
                     verified_canon.display()
                 ));
@@ -797,21 +813,6 @@ pub fn apply_decision(
         }
         DECISION_REJECT_REVISION => Ok(DecisionOutcome::RejectRevision),
         other => Err(format!("unknown decision {other:?}")),
-    }
-}
-
-/// Canonicalize `p`, falling back to canonicalizing its parent when the path
-/// itself does not exist yet (mirrors the CLI launch helper's semantics).
-fn canonicalize_loose(p: &Path) -> PathBuf {
-    if let Ok(c) = std::fs::canonicalize(p) {
-        return c;
-    }
-    match (
-        p.parent().and_then(|par| std::fs::canonicalize(par).ok()),
-        p.file_name(),
-    ) {
-        (Some(parent), Some(name)) => parent.join(name),
-        _ => p.to_path_buf(),
     }
 }
 
@@ -1686,13 +1687,16 @@ mod tests {
         // Forge the immutable_snapshot_path to a DIFFERENT but structurally valid
         // content-addressed path (different snapshot_root, same structure), then
         // RESEAL so the seal is internally consistent. Semantic validation passes
-        // (valid structure), but the canonical cross-check against the
-        // disk-verified path must still reject it in apply_decision.
+        // (valid structure). The forged root exists with a valid snapshot so the
+        // canonical-equality cross-check against the disk-verified path (under the
+        // REAL snapshot_root) is what must reject it in apply_decision.
         let forged_root = root.join("other_snapshots");
         let forged_path = forged_root
             .join("gto_launcher")
             .join(&sha)
             .join(sample_snapshot::SNAPSHOT_FILENAME);
+        std::fs::create_dir_all(forged_path.parent().unwrap()).unwrap();
+        std::fs::write(&forged_path, b"FORGED-DIFFERENT-CONTENT").unwrap();
         let mut forged = dossier.clone();
         forged.observed_revisions[0].immutable_snapshot_path = forged_path.display().to_string();
         forged.sealed_dossier_hash = forged.compute_sealed_hash();

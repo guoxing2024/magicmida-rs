@@ -8,10 +8,12 @@
     { "path": "C:/gto_launcher/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc/snapshot.bin", "expected": "valid", "logical_sample_id": "gto_launcher", "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" },
     { "path": "relative/gto_launcher/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc/snapshot.bin", "expected": "invalid", "logical_sample_id": "", "sha256": "" },
     { "path": "__ROOT__/../outside/gto_launcher/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc/snapshot.bin", "expected": "invalid", "logical_sample_id": "", "sha256": "" },
+    { "path": "__ROOT__/./gto_launcher/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc/snapshot.bin", "expected": "invalid", "logical_sample_id": "", "sha256": "" },
     { "path": "__ROOT__/gto_launcher/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc/other.bin", "expected": "invalid", "logical_sample_id": "", "sha256": "" },
     { "path": "__ROOT__/gto_launcher/not-a-hash/snapshot.bin", "expected": "invalid", "logical_sample_id": "", "sha256": "" },
     { "path": "__ROOT__/gto_launcher/short/snapshot.bin", "expected": "invalid", "logical_sample_id": "", "sha256": "" },
     { "path": "__ROOT__/gto_launcher/CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC/snapshot.bin", "expected": "invalid", "logical_sample_id": "", "sha256": "" },
+    { "path": "__ROOT__/bad..id/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/snapshot.bin", "expected": "invalid", "logical_sample_id": "", "sha256": "" },
     { "path": "__ROOT__/gto_launcher/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/snapshot.bin", "expected": "valid", "logical_sample_id": "gto_launcher", "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
   ]
 }

@@ -475,3 +475,40 @@ On Windows, `/./` is normalized away by `Path::components()`, so a `.` component
 cannot be triggered from a string path; the `..` component IS preserved and
 rejected. GTO/Oreans semantics, the generic evidence/no-gate contract, and the
 CreateProcess-before family-mismatch fail-closed are unchanged.
+
+## 19. Canonical snapshot_root containment + sealed-path junction escape (G3-R5-R1)
+
+The snapshot-path contract now includes STRICT disk-level canonicalization with
+canonical snapshot_root containment, closing the sealed-path junction/reparse
+escape:
+
+- **`canonical_verify_snapshot_path`** (mirrored in `mida-cli::sample_snapshot`
+  and `mida_acceptance::snapshot_path`): after the lexical `parse_snapshot_path`,
+  it STRICT-canonicalizes the snapshot path and the lexical `snapshot_root` (NO
+  `canonicalize_loose` fallback — a missing file or any canonicalization/reparse
+  failure fails closed), then requires:
+  - the canonical full path to be under the canonical `snapshot_root`;
+  - the canonical path to still match `<canonical_root>/<logical>/<sha>/snapshot.bin`
+    (so a logical/hash/file layer junction/symlink/reparse escaping the root is
+    rejected).
+- **CLI launch helper** (`enforce_gto_snapshot_path_binding`) and the
+  **independent acceptance verifier** (`bind_gto_actual_input_to_sealed`) both
+  use it; a same-bytes different-path alias or a junction escape yields a
+  per-case fail-closed (identity_ok=false + path-binding reason) in the report.
+- **authority dossier promotion** verifies the recorded `immutable_snapshot_path`
+  through `canonical_verify_snapshot_path` against the caller's trusted
+  snapshot_root and `verified_read_snapshot`; a non-canonical alias is not a
+  legal recorded path.
+
+**Raw "." handling.** A `.` interior segment is rejected at the RAW string level
+(`\.\` / `/./`) BEFORE `Path::components()` normalizes it away on Windows. Drive /
+UNC / `\?\` prefixes and mixed separators are handled so a legitimate absolute
+path is never falsely rejected. `..` / relative / wrong-filename / malformed /
+uppercase-hash rejection is preserved.
+
+**Contract vectors** (`tests/fixtures/snapshot_path_contract.json`) now include
+the raw-`.` and `bad..id` logical-sample-id cases; CLI and acceptance must agree
+on every vector (P2-1: the acceptance parser also mirrors
+`validate_logical_sample_id` — non-empty, no separators, no `.`/`..`).
+Junction-escape tests are deterministic: if junction creation fails the test
+FAILS (no silent skip).
