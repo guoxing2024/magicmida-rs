@@ -761,6 +761,12 @@ pub struct PreflightRequest<'a> {
     /// so the report's GTO `protected_input_path` is that verified snapshot
     /// path — never a same-bytes live-source alias.
     pub gto_protected_input_path: std::collections::BTreeMap<String, String>,
+    /// P6.3-G3-R3-R2-R1-R1: per-case GTO path-binding FAILURES, KEYED by
+    /// `case_id`. When the orchestrator's GTO actual-input ↔ sealed-path
+    /// binding failed, the GTO case must be reported as a per-case verdict
+    /// failure: `identity_ok = false`, a clear path-binding reason, and an
+    /// UNVERIFIED (empty) `protected_input_path` — never a live-source alias.
+    pub gto_path_binding_failures: std::collections::BTreeMap<String, String>,
     /// P6.3.3: the sealed case-set digest of the v4 envelope. When
     /// non-empty, it is recorded as `PreflightReport.runner_config_digest`.
     pub case_set_digest: String,
@@ -1081,22 +1087,31 @@ pub fn run_offline_preflight(request: &PreflightRequest<'_>) -> PreflightReport 
                 ));
             }
         }
-        // P6.3-G3-R3-R2-R1: for the GTO lane the report's protected-input path
-        // is the VERIFIED sealed immutable snapshot path (already bound to the
-        // actual input by the verifier), never the raw `--case` input alias.
-        let report_input_path = request
-            .gto_protected_input_path
-            .get(&case_id)
-            .cloned()
-            .unwrap_or_else(|| canonicalize_loose(input_path).display().to_string());
+        // P6.3-G3-R3-R2-R1 / -R1: for the GTO lane the report's protected-input
+        // path must be the VERIFIED sealed immutable snapshot path (already bound
+        // to the actual input by the verifier), never the raw `--case` input
+        // alias. When the binding FAILED, the GTO case is a per-case verdict
+        // failure: identity_ok=false, a clear path-binding reason, and an
+        // UNVERIFIED (empty) protected_input_path.
+        let mut gto_reasons: Vec<String> = Vec::new();
+        let mut report_input_path = canonicalize_loose(input_path).display().to_string();
+        if let Some(failure) = request.gto_path_binding_failures.get(&case_id) {
+            gto_reasons.push(format!("GTO path binding failed: {failure}"));
+            report_input_path = String::new(); // unverified; never a live alias
+        } else if let Some(sealed) = request.gto_protected_input_path.get(&case_id) {
+            report_input_path = sealed.clone();
+        }
+        let mut final_reasons = verdict.reasons;
+        final_reasons.extend(gto_reasons);
+        let identity_ok = verdict.ok && request.gto_path_binding_failures.get(&case_id).is_none();
         cases.push(CasePreflight {
             case_id: verdict
                 .identity
                 .as_ref()
                 .map(|i| i.case_id.clone())
                 .unwrap_or_else(|| manifest_path.display().to_string()),
-            identity_ok: verdict.ok,
-            reasons: verdict.reasons,
+            identity_ok,
+            reasons: final_reasons,
             protected_input: verdict.file.clone(),
             protected_input_path: report_input_path,
             manifest_path: canonicalize_loose(manifest_path).display().to_string(),

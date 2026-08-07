@@ -138,6 +138,14 @@ sealed snapshot path. The CLI launch helper validates the raw sealed path before
 canonicalization, and the real-verifier tests are self-contained in the
 acceptance package so `cargo test -p mida-cli` passes in a fresh target.
 
+**Per-case GTO binding semantics (G3-R3-R2-R1-R1).** A GTO path-binding failure
+is a per-case verdict on the GTO case: `identity_ok=false`, a clear
+`GTO path binding failed` reason, and an empty/unverified `protected_input_path`
+— never a live-source alias. The acceptance verifier also enforces bidirectional
+case-set ↔ `--case` correspondence (envelope GTO case present iff the `--case`
+inputs contain exactly one GTO case; duplicate/missing/unknown/malformed case ids
+fail closed). Oreans live-input semantics and the v2/v8 gate are unchanged.
+
 ## Rules
 
 - The dynamic path is a source; the manifest binds a frozen revision, never the

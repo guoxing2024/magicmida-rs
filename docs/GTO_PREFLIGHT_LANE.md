@@ -293,3 +293,37 @@ Tests: `verifier_accepts_exact_bound_gto_snapshot`,
 `crates/acceptance/tests/gto_verifier.rs`), and the CLI hermetic
 `launch_helper_rejects_raw_dotdot_before_canonicalization`. Oreans v2/v8
 regression stays green.
+
+## 14. Per-case GTO binding + bidirectional case correspondence (G3-R3-R2-R1-R1)
+
+**Per-case GTO path-binding semantics.** A GTO actual-input ↔ sealed-path
+binding failure is now a per-case verdict on the GTO case itself, not a
+top-level-only note:
+- the GTO case `identity_ok` is `false`;
+- the GTO case `reasons` includes a clear `GTO path binding failed: …` reason;
+- the report's GTO `protected_input_path` is empty/unverified — it never falls
+  back to the raw `--case` input, a live source, or `canonicalize_loose(input)`;
+- the top-level reasons may still carry the failure, but never replace the
+  per-case failure.
+On success the report's GTO `protected_input_path` is exactly the verified
+sealed snapshot path. Oreans live-input semantics are untouched.
+
+**Bidirectional case-set ↔ `--case` correspondence.** The acceptance verifier
+builds an envelope case inventory and a `--case` manifest inventory (by case_id,
+order-independent) and requires them to correspond:
+- Oreans fixed lane: `origin_macro` and `lunlun_software` exactly once each in
+  both the envelope and the `--case` inputs;
+- GTO lane: present in the envelope IFF present in `--case`, at most once per
+  side — envelope-has-GTO/`--case`-lacks-GTO, `--case`-has-GTO/envelope-lacks-GTO,
+  duplicate GTO, and malformed/unreadable `--case` manifest case_id all fail
+  closed before the report is usable.
+
+Tests (crates/acceptance/tests/gto_verifier.rs): the exact-bound positive control
+asserts GTO `identity_ok=true`, empty reasons, report path == sealed path,
+per-case digest == envelope digest, and case-set digest == envelope digest; the
+same-bytes/different-path control asserts NotReady, GTO `identity_ok=false`, a
+path-binding reason, and a report path that is NOT the live source; the five
+correspondence negatives (envelope-GTO-lacks-case, case-GTO-lacks-envelope,
+duplicate `--case` GTO, duplicate envelope GTO, malformed manifest id) all fail
+closed; the raw `..`, hash-dir mismatch, and family/digest-tamper negatives stay
+green; Oreans live-input/v2/v8 regression stays green.

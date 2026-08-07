@@ -175,6 +175,7 @@ fn request_with_probe<'a>(
         repo_root: Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../..")),
         case_config_digests: std::collections::BTreeMap::new(),
         gto_protected_input_path: std::collections::BTreeMap::new(),
+        gto_path_binding_failures: std::collections::BTreeMap::new(),
         case_set_digest: String::new(),
     }
 }

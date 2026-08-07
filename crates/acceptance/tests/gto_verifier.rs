@@ -312,6 +312,52 @@ fn run_verifier(
         .expect("spawn acceptance binary")
 }
 
+/// A generic `--case` triple: (manifest, input, output).
+type CaseTriple = (PathBuf, PathBuf, PathBuf);
+
+/// Invoke the real acceptance binary against an envelope with an arbitrary
+/// list of `--case` triples.
+fn run_verifier_with_triples(
+    dir: &Path,
+    envelope: &serde_json::Value,
+    triples: &[CaseTriple],
+) -> Output {
+    let envelope_path = dir.join("runner-config-envelope.json");
+    fs::write(&envelope_path, serde_json::to_vec_pretty(envelope).unwrap()).unwrap();
+    fs::write(dir.join("input_origin.bin"), b"ORIGIN-SYNTHETIC-INPUT").unwrap();
+    fs::write(dir.join("input_lunlun.bin"), b"LUNLUN-SYNTHETIC-INPUT").unwrap();
+    let cli = fake_cli_binary(dir);
+    let mut args = vec![
+        "preflight".to_string(),
+        "--envelope".to_string(),
+        envelope_path.display().to_string(),
+        "--output-dir".to_string(),
+        dir.display().to_string(),
+        "--cli-binary".to_string(),
+        cli.display().to_string(),
+        "--repo-root".to_string(),
+        workspace_root().display().to_string(),
+        "--toolchain-pin".to_string(),
+        workspace_root()
+            .join("rust-toolchain.toml")
+            .display()
+            .to_string(),
+        "--expected-toolchain".to_string(),
+        "1.97.1".to_string(),
+    ];
+    for (manifest, input, output) in triples {
+        args.push("--case".to_string());
+        args.push(manifest.display().to_string());
+        args.push(input.display().to_string());
+        args.push(output.display().to_string());
+    }
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    Command::new(acceptance_bin())
+        .args(&arg_refs)
+        .output()
+        .expect("spawn acceptance binary")
+}
+
 /// Read the preflight report emitted by the acceptance binary.
 fn read_report(dir: &Path) -> serde_json::Value {
     let raw = fs::read(dir.join("preflight.json")).unwrap();
@@ -418,10 +464,45 @@ fn verifier_rejects_same_bytes_different_gto_path() {
     let manifest2 = write_gto_manifest(&dir, &sha, size);
     let out = run_verifier(&dir, &envelope, &manifest2, &live);
     let stderr = String::from_utf8_lossy(&out.stderr);
+    // Overall state is NotReady.
+    assert_eq!(out.status.code(), Some(2), "expected NotReady: {stderr}");
+    // Per-case verdict: the GTO case must be identity_ok=false with a clear
+    // path-binding failure reason, and its protected_input_path must NOT be the
+    // live source (it is unverified/empty).
+    let report = read_report(&dir);
+    let gto = gto_report_case(&report);
+    assert_eq!(
+        gto["identity_ok"].as_bool(),
+        Some(false),
+        "GTO case must be identity_ok=false on path binding failure: {gto}"
+    );
+    let reasons: Vec<&str> = gto["reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_str().unwrap())
+        .collect();
     assert!(
-        stderr.contains("must be the staged immutable snapshot")
-            || stderr.contains("same-bytes live source/alias is refused"),
-        "a same-bytes different-path GTO input must be rejected by the verifier: {stderr}"
+        reasons
+            .iter()
+            .any(|r| r.contains("GTO path binding failed")),
+        "GTO case reasons must include the path-binding failure: {gto}"
+    );
+    assert!(
+        !reasons
+            .iter()
+            .any(|r| r.contains("must be the staged immutable snapshot"))
+            || reasons
+                .iter()
+                .any(|r| r.contains("same-bytes live source/alias is refused")
+                    || r.contains("GTO path binding failed")),
+        "the reason must cite the path/alias refusal: {gto}"
+    );
+    // The report must NOT record the live source path as a verified path.
+    let report_path = gto["protected_input_path"].as_str().unwrap();
+    assert!(
+        report_path.is_empty() || !report_path.contains("live_source.exe"),
+        "report GTO protected_input_path must not be the live source alias: {report_path}"
     );
     let _ = fs::remove_dir_all(&dir);
 }
@@ -609,6 +690,172 @@ fn gto_hash_dir_mismatch_rejected() {
     assert!(
         stderr.contains("hash dir") || stderr.contains("!= sealed protected_input sha"),
         "a hash-directory mismatch must be rejected: {stderr}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Build an envelope with ONLY the two Oreans fixed cases (no GTO lane).
+fn oreans_only_envelope() -> serde_json::Value {
+    let configs = vec![
+        case_entry(
+            "origin_macro",
+            "oreans_themida",
+            ORIGIN_SHA,
+            ORIGIN_SIZE,
+            None,
+        ),
+        case_entry(
+            "lunlun_software",
+            "oreans_themida",
+            LUNLUN_SHA,
+            LUNLUN_SIZE,
+            None,
+        ),
+    ];
+    let case_set = reseal_case_set(&configs);
+    serde_json::json!({
+        "$schema": "./runner-config-envelope.schema.json",
+        "schema_version": "mida.runner-config-envelope/v4",
+        "cli_binary_sha256": "a".repeat(64),
+        "tool_revision": "rev",
+        "verifier_source": "<cli-dir>/mida-acceptance.exe",
+        "verifier_path": "C:\\dummy\\mida-acceptance.exe",
+        "verifier_sha256": "b".repeat(64),
+        "case_set_digest": case_set,
+        "case_configs": configs,
+    })
+}
+
+/// Build the standard Oreans + GTO `--case` triples (with a real snapshot path).
+fn standard_triples(dir: &Path, gto_manifest: &Path, gto_input: &Path) -> Vec<CaseTriple> {
+    fs::write(dir.join("input_origin.bin"), b"ORIGIN-SYNTHETIC-INPUT").unwrap();
+    fs::write(dir.join("input_lunlun.bin"), b"LUNLUN-SYNTHETIC-INPUT").unwrap();
+    vec![
+        (
+            real_manifest("origin_macro"),
+            dir.join("input_origin.bin"),
+            dir.join("origin_candidate.exe"),
+        ),
+        (
+            real_manifest("lunlun_software"),
+            dir.join("input_lunlun.bin"),
+            dir.join("lunlun_candidate.exe"),
+        ),
+        (
+            gto_manifest.to_path_buf(),
+            gto_input.to_path_buf(),
+            dir.join("gto_candidate.exe"),
+        ),
+    ]
+}
+
+/// R1: envelope has GTO but `--case` lacks GTO — must fail closed.
+#[test]
+fn envelope_has_gto_case_input_lacks_gto_rejected() {
+    let dir = temp_dir("env_gto_no_case");
+    let (envelope, _manifest, snap_path, _sha, _size) = setup_positive(&dir);
+    // `--case` triples: Oreans only (no GTO).
+    let mut triples = standard_triples(&dir, &dir.join("nonexistent.json"), &snap_path);
+    triples.pop(); // drop the GTO triple
+    let out = run_verifier_with_triples(&dir, &envelope, &triples);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "expected NotReady: {stderr}");
+    assert!(
+        stderr.contains("GTO lane correspondence mismatch"),
+        "envelope-has-GTO / --case-lacks-GTO must be rejected: {stderr}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// R1: `--case` has GTO but envelope lacks GTO — must fail closed.
+#[test]
+fn case_input_has_gto_envelope_lacks_gto_rejected() {
+    let dir = temp_dir("case_gto_no_env");
+    let envelope = oreans_only_envelope();
+    let (_, _manifest, snap_path, sha, size) = setup_positive(&dir);
+    let gto_manifest = write_gto_manifest(&dir, &sha, size);
+    let triples = standard_triples(&dir, &gto_manifest, &snap_path);
+    let out = run_verifier_with_triples(&dir, &envelope, &triples);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "expected NotReady: {stderr}");
+    assert!(
+        stderr.contains("GTO lane correspondence mismatch"),
+        "--case-has-GTO / envelope-lacks-GTO must be rejected: {stderr}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// R1: duplicate GTO `--case` input — must fail closed.
+#[test]
+fn duplicate_gto_case_input_rejected() {
+    let dir = temp_dir("dup_gto_case");
+    let (envelope, gto_manifest, snap_path, _sha, _size) = setup_positive(&dir);
+    let mut triples = standard_triples(&dir, &gto_manifest, &snap_path);
+    // Add a duplicate GTO `--case` triple.
+    triples.push((
+        gto_manifest.clone(),
+        snap_path.clone(),
+        dir.join("gto_dup.exe"),
+    ));
+    let out = run_verifier_with_triples(&dir, &envelope, &triples);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "expected NotReady: {stderr}");
+    assert!(
+        stderr.contains("GTO lane must appear at most once") || stderr.contains("exactly one"),
+        "duplicate GTO --case must be rejected: {stderr}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// R1: duplicate GTO envelope case — must fail closed.
+#[test]
+fn duplicate_gto_envelope_case_rejected() {
+    let dir = temp_dir("dup_gto_env");
+    let (envelope, _manifest, snap_path, _sha, _size) = setup_positive(&dir);
+    // Duplicate the GTO case in the envelope.
+    let mut env = envelope;
+    let gto_case = env["case_configs"][2].clone();
+    env["case_configs"].as_array_mut().unwrap().push(gto_case);
+    env["case_set_digest"] =
+        serde_json::json!(reseal_case_set(env["case_configs"].as_array().unwrap()));
+    let gto_manifest = write_gto_manifest(
+        &dir,
+        &sha256_hex(&fs::read(&snap_path).unwrap()),
+        fs::metadata(&snap_path).unwrap().len(),
+    );
+    let triples = standard_triples(&dir, &gto_manifest, &snap_path);
+    let out = run_verifier_with_triples(&dir, &env, &triples);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "expected NotReady: {stderr}");
+    assert!(
+        stderr.contains("GTO lane must appear at most once") || stderr.contains("exactly one"),
+        "duplicate GTO envelope case must be rejected: {stderr}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// R1: a malformed/unreadable `--case` manifest case_id must fail closed and
+/// must not silently skip GTO binding.
+#[test]
+fn malformed_case_manifest_id_rejected() {
+    let dir = temp_dir("malformed_manifest");
+    let (envelope, _manifest, snap_path, sha, size) = setup_positive(&dir);
+    let good_gto_manifest = write_gto_manifest(&dir, &sha, size);
+    // A malformed manifest (invalid JSON) as a `--case`.
+    let bad_manifest = dir.join("bad_manifest.json");
+    fs::write(&bad_manifest, b"NOT-JSON{{{{").unwrap();
+    let mut triples = standard_triples(&dir, &good_gto_manifest, &snap_path);
+    triples.push((
+        bad_manifest,
+        snap_path.clone(),
+        dir.join("bad_candidate.exe"),
+    ));
+    let out = run_verifier_with_triples(&dir, &envelope, &triples);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "expected NotReady: {stderr}");
+    assert!(
+        stderr.contains("unreadable/malformed case_id"),
+        "a malformed --case manifest case_id must fail closed: {stderr}"
     );
     let _ = fs::remove_dir_all(&dir);
 }

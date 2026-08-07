@@ -1702,12 +1702,90 @@ fn cmd_preflight(args: &[String]) -> Result<i32, String> {
         }
     }
 
-    // P6.3-G3-R3-R2-R1: independently bind each GTO `--case` actual input to
-    // the envelope's sealed `protected_input_path`. The verifier refuses a
+    // P6.3-G3-R3-R2-R1 / -R1: independently bind each GTO `--case` actual input
+    // to the envelope's sealed `protected_input_path`, and enforce the
+    // bidirectional case-set ↔ `--case` correspondence. The verifier refuses a
     // same-bytes different-path live source/alias by itself (canonical equality
     // + content-address structure), never relying on the CLI launch helper.
     // Oreans fixed cases keep their live-input lane and are not path-bound.
+    //
+    // Bidirectional correspondence (section 二): the envelope's case inventory
+    // and the `--case` manifest inventory must match case-for-case (by case_id,
+    // order-independent). Oreans fixed lane must contain origin_macro and
+    // lunlun_software exactly once each; the optional GTO lane must be present
+    // in the envelope IFF it is present in the `--case` inputs (and at most
+    // once in each). Malformed/unreadable `--case` manifests fail closed.
+    let mut envelope_case_inventory: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    for c in &envelope.case_configs {
+        *envelope_case_inventory
+            .entry(c.case_id.clone())
+            .or_insert(0) += 1;
+    }
+    let mut request_case_inventory: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    for (manifest, _input, _output) in &cases {
+        match read_manifest_case_id(manifest) {
+            Some(id) => *request_case_inventory.entry(id).or_insert(0) += 1,
+            None => reasons.push(format!(
+                "case manifest {} has an unreadable/malformed case_id; \
+                 GTO binding must not be silently skipped (fail-closed)",
+                manifest.display()
+            )),
+        }
+    }
+    // Oreans fixed lane: exactly once each (request side).
+    for id in FIXED_CASE_IDS {
+        if request_case_inventory.get(id).copied().unwrap_or(0) != 1 {
+            reasons.push(format!(
+                "--case must contain exactly one {id}, got {} (fail-closed)",
+                request_case_inventory.get(id).copied().unwrap_or(0)
+            ));
+        }
+        if envelope_case_inventory.get(id).copied().unwrap_or(0) != 1 {
+            reasons.push(format!(
+                "envelope must contain exactly one {id}, got {} (fail-closed)",
+                envelope_case_inventory.get(id).copied().unwrap_or(0)
+            ));
+        }
+    }
+    // GTO lane bidirectional correspondence: present in envelope IFF present in
+    // --case, exactly once in each.
+    let env_gto_count = envelope_case_inventory
+        .get(GTO_CASE_ID)
+        .copied()
+        .unwrap_or(0);
+    let req_gto_count = request_case_inventory
+        .get(GTO_CASE_ID)
+        .copied()
+        .unwrap_or(0);
+    if env_gto_count != req_gto_count {
+        reasons.push(format!(
+            "GTO lane correspondence mismatch: envelope has {env_gto_count} \
+             gto_launcher case(s), --case has {req_gto_count} (must match; fail-closed)"
+        ));
+    }
+    if env_gto_count > 1 || req_gto_count > 1 {
+        reasons.push(format!(
+            "GTO lane must appear at most once per side: envelope {env_gto_count}, \
+             --case {req_gto_count} (fail-closed)"
+        ));
+    }
+    // Any unknown case_id in either inventory fails closed.
+    for id in envelope_case_inventory
+        .keys()
+        .chain(request_case_inventory.keys())
+    {
+        if !FIXED_CASE_IDS.contains(&id.as_str()) && id != GTO_CASE_ID {
+            reasons.push(format!(
+                "case {id:?} is not a recognized lane case (fail-closed)"
+            ));
+        }
+    }
+
     let mut gto_protected_input_path: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    let mut gto_path_binding_failures: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
     for (manifest, input, _output) in &cases {
         let case_id = read_manifest_case_id(manifest).unwrap_or_default();
@@ -1717,13 +1795,26 @@ fn cmd_preflight(args: &[String]) -> Result<i32, String> {
         let env_gto = envelope
             .case_configs
             .iter()
-            .find(|c| c.case_id == GTO_CASE_ID)
-            .ok_or_else(|| "envelope is missing the gto_launcher case".to_string())?;
+            .find(|c| c.case_id == GTO_CASE_ID);
+        let Some(env_gto) = env_gto else {
+            // Envelope lacks the GTO case while `--case` provides one: record a
+            // per-case binding failure (not a hard error) so the report is
+            // produced with the correspondence reason and a GTO per-case failure.
+            gto_path_binding_failures.insert(
+                GTO_CASE_ID.to_string(),
+                "envelope is missing the gto_launcher case".to_string(),
+            );
+            continue;
+        };
         match bind_gto_actual_input_to_sealed(input, env_gto) {
             Ok(sealed) => {
                 gto_protected_input_path.insert(GTO_CASE_ID.to_string(), sealed);
             }
-            Err(e) => reasons.push(e),
+            Err(e) => {
+                // Per-case verdict failure: the GTO case itself is reported as
+                // identity_ok=false with this reason, never a top-level-only note.
+                gto_path_binding_failures.insert(GTO_CASE_ID.to_string(), e);
+            }
         }
     }
 
@@ -1754,6 +1845,7 @@ fn cmd_preflight(args: &[String]) -> Result<i32, String> {
         repo_root: &repo_root,
         case_config_digests,
         gto_protected_input_path,
+        gto_path_binding_failures,
         case_set_digest: envelope.case_set_digest.clone(),
     };
     let mut report = mida_acceptance::run_offline_preflight(&request);
