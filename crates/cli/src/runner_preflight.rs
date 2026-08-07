@@ -537,74 +537,103 @@ pub fn resolve_verifier_identity() -> anyhow::Result<(PathBuf, String)> {
     Ok((verifier, sha))
 }
 
-/// `#[cfg(test)]` dependency-injection seam for the verifier spawn sites.
+/// `#[cfg(test)]` dependency-injection seam for the verifier spawn sites and
+/// the deterministic launch-stop boundary.
 ///
 /// The production `resolve_verifier_identity` / `rerun_verifier` /
-/// `run_offline_preflight` are never altered in non-test builds: there is no
-/// verifier override, no recorded-args capture, and every spawn really runs.
-/// In tests only, a hook can (a) inject a stub verifier path and (b) record the
+/// `run_offline_preflight` / `unpack` are never altered in non-test builds:
+/// there is no verifier override, no recorded-args capture, no caller-
+/// selectable launch-stop, no short-circuit and no injectable verifier —
+/// every spawn and every process creation really runs. The non-test variants
+/// below are compile-time no-ops with identical signatures, so the production
+/// dispatch path is byte-for-byte untouched.
+///
+/// In tests only, a hook can (a) inject a stub verifier path, (b) record the
 /// exact args (especially `--snapshot-root`) the verifier WOULD receive, then
-/// short-circuit the spawn so the test path terminates before any process is
-/// created. This proves the custom snapshot root flows all the way to the
-/// verifier command line without starting a sample or verifier process.
-#[cfg(test)]
-static TEST_VERIFIER_OVERRIDE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+/// short-circuit the spawn so no verifier process is created, and (c) enable a
+/// deterministic launch-stop boundary so the /unpack dispatch test terminates
+/// with a stable, unique sentinel error AFTER the launch attestation produced
+/// Ready but BEFORE any PE parse / real process creation — never by relying on
+/// a malformed synthetic PE failing to parse.
+///
+/// All of this state is thread-local: a fake verifier / launch-stop armed on
+/// one test thread is invisible to every other test thread, so parallel tests
+/// can never observe the seam. Each test arms the seams through
+/// [`DispatchTestGuard`] (RAII), which restores the prior override, recorders
+/// and launch-stop flag on drop — including when a test panics.
+// ---------------------------------------------------------------------------
 
+/// Stable, unique sentinel returned by the test-only launch-stop boundary
+/// after the launch attestation produced Ready and before any PE parse /
+/// process creation. The exact message (with the unique token) is what the
+/// positive dispatch tests assert on, so they never accept a malformed-PE
+/// parse failure as a substitute.
 #[cfg(test)]
-static TEST_RECORDED_VERIFIER_ARGS: std::sync::Mutex<Vec<String>> =
-    std::sync::Mutex::new(Vec::new());
+pub(crate) const TEST_LAUNCH_STOP_MESSAGE: &str =
+    "test-only launch-stop: attestation Ready, refusing real sample launch";
 
+/// Unique sentinel token embedded in the launch-stop error, so tests can
+/// match exactly without ambiguity.
 #[cfg(test)]
-static TEST_RECORDED_SNAPSHOT_ROOTS: std::sync::Mutex<Vec<String>> =
-    std::sync::Mutex::new(Vec::new());
+pub(crate) const TEST_LAUNCH_STOP_TOKEN: &str = "TEST_LAUNCH_STOP_SENTINEL";
 
+// Thread-local test seam state. Because it is thread-local, one test thread
+// arming the seam never leaks the fake verifier / launch-stop / recorders to
+// any other thread — the state-isolation requirement is met structurally,
+// not by a coarse global test lock.
+#[cfg(test)]
+thread_local! {
+    static TEST_VERIFIER_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        std::cell::RefCell::new(None);
+    static TEST_RECORDED_VERIFIER_ARGS: std::cell::RefCell<Vec<String>> =
+        std::cell::RefCell::new(Vec::new());
+    static TEST_RECORDED_SNAPSHOT_ROOTS: std::cell::RefCell<Vec<String>> =
+        std::cell::RefCell::new(Vec::new());
+    static TEST_LAUNCH_STOP_ENABLED: std::cell::Cell<bool> = std::cell::Cell::new(false);
+    static TEST_SAMPLE_LAUNCH_ATTEMPTED: std::cell::Cell<u32> = std::cell::Cell::new(0);
+}
+
+/// Read the current thread's injected verifier override (if any).
 #[cfg(test)]
 pub(crate) fn test_verifier_override() -> Option<PathBuf> {
-    TEST_VERIFIER_OVERRIDE.lock().unwrap().clone()
+    TEST_VERIFIER_OVERRIDE.with(|c| c.borrow().clone())
 }
 
-#[cfg(test)]
-pub(crate) fn set_test_verifier_override(path: PathBuf) {
-    *TEST_VERIFIER_OVERRIDE.lock().unwrap() = Some(path);
-    TEST_RECORDED_VERIFIER_ARGS.lock().unwrap().clear();
-    TEST_RECORDED_SNAPSHOT_ROOTS.lock().unwrap().clear();
-}
-
+/// The current thread's recorded verifier spawn arg-strings (full command
+/// line per spawn, including `--snapshot-root`). Empty until a spawn is
+/// short-circuited by the seam.
 #[cfg(test)]
 pub(crate) fn test_verifier_recorder() -> Vec<String> {
-    TEST_RECORDED_VERIFIER_ARGS.lock().unwrap().clone()
+    TEST_RECORDED_VERIFIER_ARGS.with(|c| c.borrow().clone())
 }
 
+/// The current thread's recorded `--snapshot-root` values the verifier WOULD
+/// have received. Empty when the seam never reached `rerun_verifier` (e.g. a
+/// root mismatch fails closed first).
 #[cfg(test)]
 pub(crate) fn test_snapshot_root_recorder() -> Vec<String> {
-    TEST_RECORDED_SNAPSHOT_ROOTS.lock().unwrap().clone()
+    TEST_RECORDED_SNAPSHOT_ROOTS.with(|c| c.borrow().clone())
 }
 
 /// Record a verifier spawn's args (test seam) and return `true` to short-circuit
 /// the spawn (no process created). Production calls the plain spawn path.
 #[cfg(test)]
 fn maybe_record_verifier_spawn(args: &[std::ffi::OsString]) -> bool {
-    if TEST_VERIFIER_OVERRIDE.lock().unwrap().is_none() {
+    if TEST_VERIFIER_OVERRIDE.with(|c| c.borrow().is_none()) {
         return false;
     }
     let arg_strs: Vec<String> = args
         .iter()
         .filter_map(|a| a.to_str().map(|s| s.to_string()))
         .collect();
-    TEST_RECORDED_VERIFIER_ARGS
-        .lock()
-        .unwrap()
-        .push(arg_strs.join(" "));
+    TEST_RECORDED_VERIFIER_ARGS.with(|c| c.borrow_mut().push(arg_strs.join(" ")));
     // Extract `--snapshot-root <val>` (and `--snapshot-root=<val>`).
     for (i, a) in arg_strs.iter().enumerate() {
         if let Some(v) = a.strip_prefix("--snapshot-root=") {
-            TEST_RECORDED_SNAPSHOT_ROOTS
-                .lock()
-                .unwrap()
-                .push(v.to_string());
+            TEST_RECORDED_SNAPSHOT_ROOTS.with(|c| c.borrow_mut().push(v.to_string()));
         } else if a == "--snapshot-root" {
             if let Some(v) = arg_strs.get(i + 1) {
-                TEST_RECORDED_SNAPSHOT_ROOTS.lock().unwrap().push(v.clone());
+                TEST_RECORDED_SNAPSHOT_ROOTS.with(|c| c.borrow_mut().push(v.clone()));
             }
         }
     }
@@ -614,6 +643,108 @@ fn maybe_record_verifier_spawn(args: &[std::ffi::OsString]) -> bool {
 #[cfg(not(test))]
 fn maybe_record_verifier_spawn(_args: &[std::ffi::OsString]) -> bool {
     false
+}
+
+/// Deterministic test-only launch-stop boundary. Called from `unpack` after
+/// the launch attestation produced Ready and immediately before any PE parse /
+/// process creation. When a test armed the seam (via [`DispatchTestGuard`]),
+/// it returns the stable, unique sentinel error so the dispatch test
+/// terminates deterministically at exactly this point — never by relying on a
+/// malformed synthetic PE failing to parse, and never reaching
+/// `PeHeader::from_file` / `WindowsDebugger::new` / `CreateProcess`. The
+/// production build has no caller-selectable stop: this is a compile-time
+/// no-op (`Ok(())`).
+#[cfg(test)]
+pub(crate) fn maybe_test_launch_stop() -> anyhow::Result<()> {
+    if TEST_LAUNCH_STOP_ENABLED.with(|c| c.get()) {
+        anyhow::bail!("{TEST_LAUNCH_STOP_MESSAGE} [{TEST_LAUNCH_STOP_TOKEN}]");
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+pub(crate) fn maybe_test_launch_stop() -> anyhow::Result<()> {
+    Ok(())
+}
+
+/// Test-only sample-process boundary recorder: fired immediately before the
+/// real `WindowsDebugger::new`/`CreateProcess` boundary to record that a real
+/// sample launch was about to be attempted. The dispatch tests assert this
+/// stays empty — the launch-stop sentinel fires earlier, proving the process-
+/// creation path is never reached. Production is a compile-time no-op.
+#[cfg(test)]
+pub(crate) fn note_sample_launch_attempted() {
+    TEST_SAMPLE_LAUNCH_ATTEMPTED.with(|c| c.set(c.get() + 1));
+}
+
+#[cfg(not(test))]
+pub(crate) fn note_sample_launch_attempted() {}
+
+/// Test-only read of the current thread's sample-process boundary recorder:
+/// `true` if a real sample-process launch was about to be attempted on this
+/// thread. The dispatch tests assert this stays `false`.
+#[cfg(test)]
+pub(crate) fn test_sample_launch_attempted_any() -> bool {
+    TEST_SAMPLE_LAUNCH_ATTEMPTED.with(|c| c.get() > 0)
+}
+
+/// RAII guard that arms the test-only launch seams for the CURRENT thread and
+/// restores every piece of prior state on drop — including when a test panics
+/// (Rust runs `Drop` during unwinding). Because all seam state is thread-local,
+/// the guard only affects the arming thread; concurrent tests on other threads
+/// never observe the override, launch-stop or recorders, so the seam cannot
+/// pollute parallel tests even without a coarse global lock.
+#[cfg(test)]
+pub(crate) struct DispatchTestGuard {
+    prev_override: Option<PathBuf>,
+    prev_verifier_args: Vec<String>,
+    prev_snapshot_roots: Vec<String>,
+    prev_launch_stop: bool,
+    prev_sample_attempted: u32,
+}
+
+#[cfg(test)]
+impl DispatchTestGuard {
+    /// Arm the seam on this thread: inject `verifier_path`, enable the
+    /// launch-stop boundary, and snapshot + clear the recorders.
+    pub(crate) fn arm(verifier_path: PathBuf) -> Self {
+        let prev_override = TEST_VERIFIER_OVERRIDE.with(|c| c.borrow().clone());
+        let prev_verifier_args = test_verifier_recorder();
+        let prev_snapshot_roots = test_snapshot_root_recorder();
+        let prev_launch_stop = TEST_LAUNCH_STOP_ENABLED.with(|c| c.get());
+        let prev_sample_attempted = TEST_SAMPLE_LAUNCH_ATTEMPTED.with(|c| c.get());
+        TEST_VERIFIER_OVERRIDE.with(|c| *c.borrow_mut() = Some(verifier_path));
+        TEST_LAUNCH_STOP_ENABLED.with(|c| c.set(true));
+        TEST_RECORDED_VERIFIER_ARGS.with(|c| c.borrow_mut().clear());
+        TEST_RECORDED_SNAPSHOT_ROOTS.with(|c| c.borrow_mut().clear());
+        TEST_SAMPLE_LAUNCH_ATTEMPTED.with(|c| c.set(0));
+        DispatchTestGuard {
+            prev_override,
+            prev_verifier_args,
+            prev_snapshot_roots,
+            prev_launch_stop,
+            prev_sample_attempted,
+        }
+    }
+
+    /// Whether the sample-process boundary recorder fired on this thread
+    /// while the guard was armed. Every dispatch test asserts this is `false`.
+    pub(crate) fn sample_launch_attempted(&self) -> bool {
+        TEST_SAMPLE_LAUNCH_ATTEMPTED.with(|c| c.get() > 0)
+    }
+}
+
+#[cfg(test)]
+impl Drop for DispatchTestGuard {
+    fn drop(&mut self) {
+        TEST_VERIFIER_OVERRIDE.with(|c| *c.borrow_mut() = self.prev_override.take());
+        TEST_RECORDED_VERIFIER_ARGS
+            .with(|c| *c.borrow_mut() = std::mem::take(&mut self.prev_verifier_args));
+        TEST_RECORDED_SNAPSHOT_ROOTS
+            .with(|c| *c.borrow_mut() = std::mem::take(&mut self.prev_snapshot_roots));
+        TEST_LAUNCH_STOP_ENABLED.with(|c| c.set(self.prev_launch_stop));
+        TEST_SAMPLE_LAUNCH_ATTEMPTED.with(|c| c.set(self.prev_sample_attempted));
+    }
 }
 
 /// Outcome of the envelope reuse policy (P6.3-C): the envelope file is
@@ -3502,17 +3633,24 @@ mod tests {
             .join(format!("{case_id}.json"))
     }
 
-    /// Serializes the G3-R5-R1-R1-R1-R1-R1-R1 dispatch tests (they share the
-    /// global #[cfg(test)] verifier seam, so they must not run concurrently).
+    /// Serializes the G3-R5-R1-R1-R1-R1-R1-R1 dispatch tests. Seam state is
+    /// thread-local, so the four tests are independent and safe to run in any
+    /// order and in parallel with any other test; this lock additionally
+    /// serializes them against shared temp-dir roots. Correctness of seam
+    /// isolation does NOT depend on this lock (proven by the state-isolation
+    /// tests below, which run on separate threads).
     static TEST_DISPATCH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// Write a fake verifier stub into `dir` and inject it via the #[cfg(test)]
-    /// seam (also clearing any prior recordings). Returns the verifier path.
-    fn inject_test_verifier(dir: &Path) -> PathBuf {
+    /// Write a fake verifier stub into `dir` and arm the thread-local
+    /// #[cfg(test)] seam via the RAII [`DispatchTestGuard`] (injecting the
+    /// stub verifier and enabling the deterministic launch-stop boundary).
+    /// Returns the verifier path and the guard, which restores the prior
+    /// override / recorders / launch-stop state on drop — including on panic.
+    fn arm_dispatch_guard(dir: &Path) -> (PathBuf, DispatchTestGuard) {
         let v = dir.join("mida-acceptance.exe");
         std::fs::write(&v, b"FAKE-VERIFIER-STUB").unwrap();
-        set_test_verifier_override(v.clone());
-        v
+        let guard = DispatchTestGuard::arm(v.clone());
+        (v, guard)
     }
 
     /// Fabricate a GTO v4 envelope + Ready report whose GTO sealed path is under
@@ -3679,7 +3817,7 @@ mod tests {
             "cases": vec![
                 serde_json::json!({"case_id":"origin_macro","identity_ok":true,"reasons":[],"protected_input":{"sha256":"1af62999cf5be0b2f21abc39034c122a42aa46cfbfdb546faa184de37ac09ac7","size_bytes":5232656},"protected_input_path":"","manifest_path":real_manifest("origin_macro").display().to_string(),"candidate_output":dir.join("origin_candidate.exe").display().to_string(),"runner_config_digest":oreans_digest}),
                 serde_json::json!({"case_id":"lunlun_software","identity_ok":true,"reasons":[],"protected_input":{"sha256":"8a0118d04e03752728999c845536c29215d2a626ac65845c22e3f1149de0db07","size_bytes":4976144},"protected_input_path":"","manifest_path":real_manifest("lunlun_software").display().to_string(),"candidate_output":dir.join("lunlun_candidate.exe").display().to_string(),"runner_config_digest":oreans_digest}),
-                serde_json::json!({"case_id":"gto_launcher","identity_ok":true,"reasons":[],"protected_input":{"sha256":gto_sha,"size_bytes":gto_size},"protected_input_path":sealed_snap.display().to_string(),"manifest_path":manifest.display().to_string(),"candidate_output":candidate_output.display().to_string(),"runner_config_digest":gto_digest}),
+                serde_json::json!({"case_id":"gto_launcher","identity_ok":true,"reasons":[],"protected_input":{"sha256":gto_sha,"size_bytes":gto_size},"protected_input_path":sealed_snap.display().to_string(),"manifest_path":manifest.display().to_string(),"candidate_output":crate::runner_preflight::canonicalize_loose(&candidate_output).display().to_string(),"runner_config_digest":gto_digest}),
             ],
         });
         std::fs::write(
@@ -3710,10 +3848,14 @@ mod tests {
         p
     }
 
-    /// Custom root: rerun verifier receives the same `--snapshot-root`.
+    /// Custom root: the dispatch chain runs to completion (attestation Ready,
+    /// rerun verifier records the custom root) and then terminates exactly at
+    /// the deterministic test-only launch-stop boundary — never by a malformed
+    /// PE parse failure. The sample-process recorder stays empty and no
+    /// candidate is produced.
     #[test]
     fn unpack_dispatch_threads_custom_snapshot_root_to_launch_attestation() {
-        let _guard = TEST_DISPATCH_LOCK.lock().unwrap();
+        let _lock = TEST_DISPATCH_LOCK.lock().unwrap();
         let root = temp_dir("unpack_custom_root");
         let custom_root = root.join("custom_store");
         let dir = root.join("preflight");
@@ -3734,8 +3876,9 @@ mod tests {
             true,
         );
 
-        // Inject the verifier stub via the #[cfg(test)] seam.
-        inject_test_verifier(&dir);
+        // Arm the thread-local seam via the RAII guard (stub verifier +
+        // launch-stop boundary). It restores state on drop, even on panic.
+        let (_verifier, _dispatch_guard) = arm_dispatch_guard(&dir);
 
         let cmd = crate::args::Command::Unpack {
             input: sealed_snap.clone(),
@@ -3752,18 +3895,19 @@ mod tests {
             snapshot_root: Some(custom_root.clone()),
             verbose: false,
         };
-        let out = crate::commands::run_command(cmd);
-        // The launch attestation must succeed past the root cross-check (the
-        // verifier seam records --snapshot-root and terminates the test path).
-        let err = match out {
+        let err = match crate::commands::run_command(cmd) {
             Ok(()) => String::new(),
             Err(e) => format!("{e:#}"),
         };
+        // (a) The run stopped EXACTLY at the test-only launch-stop sentinel,
+        // after attestation Ready and before any PE parse / process creation.
+        // The synthetic GTO bytes are deliberately not a PE, so if the launch-
+        // stop did not fire the test would fail with a parse error instead.
         assert!(
-            !err.contains("root mismatch") && !err.contains("does not match the sealed path root"),
-            "custom-root launch must pass the root cross-check: {err}"
+            err.contains(super::TEST_LAUNCH_STOP_TOKEN),
+            "dispatch must terminate at the launch-stop sentinel after Ready, got: {err}"
         );
-        // The seam recorded the custom root as --snapshot-root for rerun_verifier.
+        // (b) The rerun verifier received the custom snapshot root.
         let recorded = test_snapshot_root_recorder();
         assert!(
             recorded
@@ -3774,13 +3918,28 @@ mod tests {
                 )),
             "rerun verifier must receive the custom snapshot root, got {recorded:?}"
         );
+        // The verifier spawn-args recorder proves the seam fired at rerun_verifier.
+        assert!(
+            !test_verifier_recorder().is_empty(),
+            "the verifier seam must have recorded a spawn"
+        );
+        // (c) The sample-process boundary recorder is empty — no real process
+        // creation was ever attempted.
+        assert!(
+            !_dispatch_guard.sample_launch_attempted(),
+            "no sample-process launch may be attempted in a dispatch test"
+        );
+        // (d) No candidate may be produced.
+        assert!(!candidate.exists(), "no candidate may be produced");
         std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// Default root: snapshot_root=None selects <preflight_dir>/sample-snapshots.
+    /// The chain runs to completion (attestation Ready) and stops exactly at
+    /// the test-only launch-stop sentinel; sample recorder empty, no candidate.
     #[test]
     fn unpack_dispatch_defaults_snapshot_root_from_preflight_dir() {
-        let _guard = TEST_DISPATCH_LOCK.lock().unwrap();
+        let _lock = TEST_DISPATCH_LOCK.lock().unwrap();
         let root = temp_dir("unpack_default_root");
         let default_root = root.join("preflight").join("sample-snapshots");
         let dir = root.join("preflight");
@@ -3802,7 +3961,7 @@ mod tests {
             true,
         );
 
-        inject_test_verifier(&dir);
+        let (_verifier, _dispatch_guard) = arm_dispatch_guard(&dir);
 
         let cmd = crate::args::Command::Unpack {
             input: sealed_snap.clone(),
@@ -3819,16 +3978,16 @@ mod tests {
             snapshot_root: None,
             verbose: false,
         };
-        let out = crate::commands::run_command(cmd);
-        let err = match out {
+        let err = match crate::commands::run_command(cmd) {
             Ok(()) => String::new(),
             Err(e) => format!("{e:#}"),
         };
+        // (a) Exact launch-stop sentinel after Ready.
         assert!(
-            !err.contains("root mismatch") && !err.contains("does not match the sealed path root"),
-            "default-root launch must pass the root cross-check: {err}"
+            err.contains(super::TEST_LAUNCH_STOP_TOKEN),
+            "dispatch must terminate at the launch-stop sentinel after Ready, got: {err}"
         );
-        // The rerun verifier receives the DEFAULT root <preflight_dir>/sample-snapshots.
+        // (b) The rerun verifier receives the DEFAULT root <preflight_dir>/sample-snapshots.
         let recorded = test_snapshot_root_recorder();
         assert!(
             recorded
@@ -3839,6 +3998,17 @@ mod tests {
                 )),
             "rerun verifier must receive the default snapshot root, got {recorded:?}"
         );
+        assert!(
+            !test_verifier_recorder().is_empty(),
+            "the verifier seam must have recorded a spawn"
+        );
+        // (c) No sample-process launch attempted.
+        assert!(
+            !_dispatch_guard.sample_launch_attempted(),
+            "no sample-process launch may be attempted in a dispatch test"
+        );
+        // (d) No candidate produced.
+        assert!(!candidate.exists(), "no candidate may be produced");
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -3869,7 +4039,7 @@ mod tests {
             true,
         );
 
-        inject_test_verifier(&dir);
+        let (_verifier, _dispatch_guard) = arm_dispatch_guard(&dir);
 
         // Launch WITHOUT --snapshot-root -> default root (sample-snapshots)
         // mismatches the sealed custom root -> fail-closed before rerun_verifier.
@@ -3889,26 +4059,43 @@ mod tests {
             verbose: false,
         };
         let err = crate::commands::run_command(cmd).unwrap_err();
+        let err_str = format!("{err:#}");
+        // (a) The failure is EXACTLY the root-mismatch class — asserted
+        // positively, not merely "not something else", so an arbitrary later
+        // error cannot masquerade as the fail-closed root check.
         assert!(
-            format!("{err:#}").contains("root mismatch")
-                || format!("{err:#}").contains("does not match the sealed path root"),
-            "staging/launch root mismatch must fail-closed before process: {err:#}"
+            err_str.contains("root mismatch")
+                || err_str.contains("does not match the sealed path root"),
+            "staging/launch root mismatch must be the exact failure, got: {err_str}"
         );
-        // The seam never reached rerun_verifier (no snapshot root recorded), so
-        // no process was created.
+        // (b) The verifier recorder is empty — the seam never reached
+        // rerun_verifier, so no verifier spawn was recorded.
         let recorded = test_snapshot_root_recorder();
         assert!(
             recorded.is_empty(),
             "no verifier spawn on root mismatch: {recorded:?}"
         );
+        assert!(
+            test_verifier_recorder().is_empty(),
+            "no verifier args may be recorded on root mismatch"
+        );
+        // (c) The sample-process boundary recorder is empty — no process
+        // creation was ever attempted.
+        assert!(
+            !_dispatch_guard.sample_launch_attempted(),
+            "no sample-process launch may be attempted on root mismatch"
+        );
+        // (d) No candidate produced.
         assert!(!candidate.exists(), "no candidate may be produced");
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    /// The rerun verifier receives the SAME custom snapshot root as staging.
+    /// The rerun verifier receives the SAME custom snapshot root as staging,
+    /// then the dispatch stops exactly at the test-only launch-stop sentinel
+    /// (sample recorder empty, no candidate).
     #[test]
     fn unpack_dispatch_rerun_verifier_receives_same_snapshot_root() {
-        let _guard = TEST_DISPATCH_LOCK.lock().unwrap();
+        let _lock = TEST_DISPATCH_LOCK.lock().unwrap();
         let root = temp_dir("unpack_same_root");
         let custom_root = root.join("custom_store");
         let dir = root.join("preflight");
@@ -3929,7 +4116,7 @@ mod tests {
             true,
         );
 
-        inject_test_verifier(&dir);
+        let (_verifier, _dispatch_guard) = arm_dispatch_guard(&dir);
 
         let cmd = crate::args::Command::Unpack {
             input: sealed_snap.clone(),
@@ -3946,17 +4133,18 @@ mod tests {
             snapshot_root: Some(custom_root.clone()),
             verbose: false,
         };
-        let out = crate::commands::run_command(cmd);
-        let err = match out {
+        let err = match crate::commands::run_command(cmd) {
             Ok(()) => String::new(),
             Err(e) => format!("{e:#}"),
         };
+        // (a) Exact launch-stop sentinel after Ready (never a root mismatch,
+        // never a malformed-PE parse error).
         assert!(
-            !err.contains("root mismatch") && !err.contains("does not match the sealed path root"),
-            "custom-root launch must pass: {err}"
+            err.contains(super::TEST_LAUNCH_STOP_TOKEN),
+            "dispatch must terminate at the launch-stop sentinel after Ready, got: {err}"
         );
-        // The recorded --snapshot-root equals the caller's custom root (the same
-        // root staging used), not the default and not derived from the path.
+        // (b) The recorded --snapshot-root equals the caller's custom root (the
+        // same root staging used), not the default and not derived from the path.
         let recorded = test_snapshot_root_recorder();
         let has_custom = recorded.iter().any(|r| {
             crate::sample_snapshot::paths_equivalent(std::path::Path::new(r), &custom_root)
@@ -3971,6 +4159,158 @@ mod tests {
             has_custom && !has_default,
             "rerun verifier must receive the custom root (not default): {recorded:?}"
         );
+        assert!(
+            !test_verifier_recorder().is_empty(),
+            "the verifier seam must have recorded a spawn"
+        );
+        // (c) No sample-process launch attempted.
+        assert!(
+            !_dispatch_guard.sample_launch_attempted(),
+            "no sample-process launch may be attempted in a dispatch test"
+        );
+        // (d) No candidate produced.
+        assert!(!candidate.exists(), "no candidate may be produced");
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // ------------------------------------------------------------------
+    // Dispatch seam state isolation. The test-only seams are thread-local and
+    // RAII-managed: they must restore prior state on normal drop AND on panic,
+    // and must never leak to another test thread. These tests prove that
+    // independence so the four dispatch tests above do not rely on a coarse
+    // global lock to avoid polluting each other or unrelated tests.
+    // ------------------------------------------------------------------
+
+    /// Normal Drop: arming then dropping the guard restores the override,
+    /// recorders, launch-stop flag and sample recorder to their prior state.
+    #[test]
+    fn dispatch_guard_drop_restores_all_seam_state() {
+        // Pre-arm: default empty state.
+        assert_eq!(test_verifier_override(), None);
+        assert!(test_verifier_recorder().is_empty());
+        assert!(test_snapshot_root_recorder().is_empty());
+        // Arm and mutate. (Use `DispatchTestGuard::arm` directly so no stub
+        // file is written to disk.)
+        {
+            let path = PathBuf::from("stub-verifier.exe");
+            let guard = DispatchTestGuard::arm(path.clone());
+            assert_eq!(test_verifier_override(), Some(path));
+            assert!(test_verifier_recorder().is_empty());
+            // Record a verifier spawn through the seam on this thread.
+            let args: Vec<std::ffi::OsString> = vec![
+                std::ffi::OsString::from("preflight"),
+                std::ffi::OsString::from("--snapshot-root"),
+                std::ffi::OsString::from("C:\\snap"),
+            ];
+            assert!(super::maybe_record_verifier_spawn(&args));
+            assert!(!test_verifier_recorder().is_empty());
+            assert!(!test_snapshot_root_recorder().is_empty());
+            assert!(!guard.sample_launch_attempted());
+        }
+        // After Drop: everything restored to the pre-arm (empty) state.
+        assert_eq!(test_verifier_override(), None);
+        assert!(test_verifier_recorder().is_empty());
+        assert!(test_snapshot_root_recorder().is_empty());
+        assert!(!crate::runner_preflight::test_sample_launch_attempted_any());
+    }
+
+    /// Panic path: if a test panics while the guard is armed, Drop still runs
+    /// during unwinding and restores the override/recorders/launch-stop, so a
+    /// panicked dispatch test cannot leak the fake verifier into later tests.
+    #[test]
+    fn dispatch_guard_restores_state_after_panic() {
+        // Clear to a known baseline first (a prior test on this thread could
+        // have left state only if a bug skipped Drop — which is what we assert
+        // is NOT the case).
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = DispatchTestGuard::arm(PathBuf::from("panic-verifier.exe"));
+            // The guard is armed; assert it is observable on this thread.
+            assert!(test_verifier_override().is_some());
+            // Force a panic inside the guard scope.
+            panic!("intentional panic to exercise guard Drop during unwinding");
+        });
+        // After the panic unwound, the guard's Drop restored state.
+        assert_eq!(test_verifier_override(), None);
+        assert!(test_verifier_recorder().is_empty());
+        assert!(test_snapshot_root_recorder().is_empty());
+        assert!(!crate::runner_preflight::test_sample_launch_attempted_any());
+        // The launch-stop flag is off again: a dispatch would NOT stop early.
+        assert!(
+            crate::runner_preflight::maybe_test_launch_stop().is_ok(),
+            "launch-stop must be disabled after guard drop"
+        );
+    }
+
+    /// Cross-thread isolation: a fake verifier / launch-stop armed on one test
+    /// thread is invisible on another thread. This is the property that keeps
+    /// non-dispatch tests (running in parallel on other threads) from ever
+    /// observing the seam — not the dispatch test lock.
+    #[test]
+    fn dispatch_guard_override_is_thread_local() {
+        // Arm on THIS thread.
+        let guard = DispatchTestGuard::arm(PathBuf::from("thread-local-verifier.exe"));
+        assert!(test_verifier_override().is_some());
+        // A spawned thread must see NO override, no launch-stop, empty recorders.
+        let handle = std::thread::spawn(|| {
+            let override_seen = test_verifier_override().is_some();
+            let rec_seen = !test_verifier_recorder().is_empty();
+            let roots_seen = !test_snapshot_root_recorder().is_empty();
+            let launch_stop_on = crate::runner_preflight::maybe_test_launch_stop().is_err();
+            (override_seen, rec_seen, roots_seen, launch_stop_on)
+        });
+        let (override_seen, rec_seen, roots_seen, launch_stop_on) = handle.join().unwrap();
+        assert!(
+            !override_seen && !rec_seen && !roots_seen && !launch_stop_on,
+            "other thread must not observe this thread's dispatch seam \
+             (override={override_seen} rec={rec_seen} roots={roots_seen} stop={launch_stop_on})"
+        );
+        // Drop the guard on the arming thread and confirm the other thread was
+        // unaffected by our drop too (already proven above).
+        drop(guard);
+        assert_eq!(test_verifier_override(), None);
+    }
+
+    /// The default/custom/mismatch dispatch tests are order-independent:
+    /// arming the seam does not depend on any prior test's leftovers, and the
+    /// guard fully restores state, so running them in any sequence leaves the
+    /// thread-local seam in its default (disabled) state. This runs the guard
+    /// arm/drop cycle repeatedly and asserts a stable end state.
+    #[test]
+    fn dispatch_tests_have_no_ordering_dependency() {
+        for i in 0..8 {
+            // Simulate the custom / default / mismatch dispatch patterns in a
+            // mixed order; each fully arms and drops the seam independently.
+            if i % 3 == 0 {
+                let _g = DispatchTestGuard::arm(PathBuf::from("custom"));
+                assert!(crate::runner_preflight::maybe_test_launch_stop().is_err());
+            } else if i % 3 == 1 {
+                let _g = DispatchTestGuard::arm(PathBuf::from("default"));
+            } else {
+                // mismatch: no launch-stop reached; just arm and drop.
+                let _g = DispatchTestGuard::arm(PathBuf::from("mismatch"));
+            }
+            // After each iteration the seam must be back to default.
+            assert_eq!(
+                test_verifier_override(),
+                None,
+                "iteration {i} must leave no verifier override"
+            );
+            assert!(
+                test_verifier_recorder().is_empty(),
+                "iteration {i} recorder leak"
+            );
+            assert!(
+                test_snapshot_root_recorder().is_empty(),
+                "iteration {i} root recorder leak"
+            );
+            assert!(
+                crate::runner_preflight::maybe_test_launch_stop().is_ok(),
+                "iteration {i} launch-stop must be off"
+            );
+            assert!(
+                !crate::runner_preflight::test_sample_launch_attempted_any(),
+                "iteration {i} sample recorder leak"
+            );
+        }
     }
 }

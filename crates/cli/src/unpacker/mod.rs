@@ -254,6 +254,16 @@ pub fn unpack(
         );
         attested_family = Some(family);
         evidence_ctx = Some(context);
+
+        // ---- deterministic test-only launch-stop boundary ----
+        // The launch attestation has produced Ready. Before any PE parse or
+        // process creation, the #[cfg(test)] seam may stop the dispatch
+        // deterministically with a stable, unique sentinel error so the
+        // production-shaped /unpack tests terminate here — never by relying on
+        // a malformed synthetic PE failing to parse. Production is a compile-
+        // time no-op (always Ok), so real runs proceed to `PeHeader::from_file`
+        // and the sample process exactly as before.
+        crate::runner_preflight::maybe_test_launch_stop()?;
     }
     // ---- step 2: parse PE header ----
     log::log(LogType::Info, &format!("Loading: {}", input.display()));
@@ -470,6 +480,11 @@ pub fn unpack(
     // and stub EXE, and will clean them up via `Drop` when this struct goes
     // out of scope.  `ProcessSession` wraps it in `DebuggerCoreEngine` (R2
     // wait/continue pump) and caches per-session `ResolvedApis`.
+    // Record the real sample-process launch boundary (test-only). This fires
+    // immediately before the actual process creation; the dispatch tests
+    // assert it stays empty because the launch-stop sentinel fires earlier.
+    // Production is a compile-time no-op.
+    crate::runner_preflight::note_sample_launch_attempted();
     let mut dbg = ProcessSession::new(
         mida_core::WindowsDebugger::new(&opts).context("Failed to create debuggee process")?,
     );
