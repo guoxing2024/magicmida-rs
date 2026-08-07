@@ -616,3 +616,41 @@ Tests: unpack_snapshot_root_arg_is_parsed (args), gto_sealed_root_cross_check_ma
 (hermetic), plus the existing custom-root staging + acceptance real-binary root
 tests. Oreans live-input / `protected_input_path=None` / v2/v8 gate and GTO
 generic/no-gate are unchanged.
+
+## 23. Production `/unpack` dispatch coverage for custom snapshot root (G3-R5-R1-R1-R1-R1-R1-R1)
+
+Component-level tests (`custom_snapshot_root_is_used_for_staging`,
+`gto_sealed_root_cross_check_match_and_mismatch`,
+`unpack_snapshot_root_arg_is_parsed`) prove the root flows into the staging /
+cross-check / CLI-parsing pieces. This task adds production-shaped tests that
+drive the REAL `commands::run_command(Command::Unpack { .. })` through
+`unpacker::unpack` -> `LaunchAttestationContext` -> `attest_ready_before_launch`
+-> `verify_gto_sealed_root_matches` -> `enforce_gto_snapshot_path_binding` ->
+`rerun_verifier`, using a minimal `#[cfg(test)]` verifier-injection seam:
+
+- `TEST_VERIFIER_OVERRIDE` / `TEST_RECORDED_*` statics let a test inject a stub
+  verifier path and RECORD the exact args (esp. `--snapshot-root`) the verifier
+  would receive, then short-circuit the spawn. Production builds are unaffected:
+  the seam is `#[cfg(test)]`-only, `resolve_verifier_identity` /
+  `rerun_verifier` / `run_offline_preflight` behave identically in non-test
+  builds (no override, real spawn, no recorded-args capture). The verifier stays
+  non-caller-selectable in production (P6.3.2).
+- The four tests are serialized by a shared test lock (they share the global seam
+  statics).
+
+Tests:
+- `unpack_dispatch_threads_custom_snapshot_root_to_launch_attestation` — custom
+  root; the recorded `--snapshot-root` equals the caller's custom root.
+- `unpack_dispatch_defaults_snapshot_root_from_preflight_dir` — `snapshot_root=None`;
+  the recorded `--snapshot-root` equals `<preflight_dir>/sample-snapshots`.
+- `unpack_dispatch_rejects_staging_launch_root_mismatch_before_process` — staged
+  under a custom root, launched with the default root -> fail-closed before
+  CreateProcess with a clear root-mismatch reason; no verifier spawn, no
+  candidate produced.
+- `unpack_dispatch_rerun_verifier_receives_same_snapshot_root` — the recorded
+  `--snapshot-root` is the custom root (not the default, not derived from the
+  path).
+
+The tests terminate at the seam before any sample/verifier process is created
+(no spawn, no sample-process marker). Oreans live-input /
+`protected_input_path=None` / v2/v8 gate and GTO generic/no-gate are unchanged.

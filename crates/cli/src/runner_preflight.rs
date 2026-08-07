@@ -527,9 +527,93 @@ pub fn resolve_acceptance_bin_from_cli(cli_exe: &Path) -> anyhow::Result<PathBuf
 /// Resolve the verifier sibling and recompute its SHA-256 (used by the
 /// envelope, the launch attestation and the bundle PE-evidence path).
 pub fn resolve_verifier_identity() -> anyhow::Result<(PathBuf, String)> {
+    #[cfg(test)]
+    if let Some(path) = test_verifier_override() {
+        let sha = sha256_file(&path)?;
+        return Ok((path, sha));
+    }
     let verifier = resolve_acceptance_bin()?;
     let sha = sha256_file(&verifier)?;
     Ok((verifier, sha))
+}
+
+/// `#[cfg(test)]` dependency-injection seam for the verifier spawn sites.
+///
+/// The production `resolve_verifier_identity` / `rerun_verifier` /
+/// `run_offline_preflight` are never altered in non-test builds: there is no
+/// verifier override, no recorded-args capture, and every spawn really runs.
+/// In tests only, a hook can (a) inject a stub verifier path and (b) record the
+/// exact args (especially `--snapshot-root`) the verifier WOULD receive, then
+/// short-circuit the spawn so the test path terminates before any process is
+/// created. This proves the custom snapshot root flows all the way to the
+/// verifier command line without starting a sample or verifier process.
+#[cfg(test)]
+static TEST_VERIFIER_OVERRIDE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+static TEST_RECORDED_VERIFIER_ARGS: std::sync::Mutex<Vec<String>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+static TEST_RECORDED_SNAPSHOT_ROOTS: std::sync::Mutex<Vec<String>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) fn test_verifier_override() -> Option<PathBuf> {
+    TEST_VERIFIER_OVERRIDE.lock().unwrap().clone()
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_verifier_override(path: PathBuf) {
+    *TEST_VERIFIER_OVERRIDE.lock().unwrap() = Some(path);
+    TEST_RECORDED_VERIFIER_ARGS.lock().unwrap().clear();
+    TEST_RECORDED_SNAPSHOT_ROOTS.lock().unwrap().clear();
+}
+
+#[cfg(test)]
+pub(crate) fn test_verifier_recorder() -> Vec<String> {
+    TEST_RECORDED_VERIFIER_ARGS.lock().unwrap().clone()
+}
+
+#[cfg(test)]
+pub(crate) fn test_snapshot_root_recorder() -> Vec<String> {
+    TEST_RECORDED_SNAPSHOT_ROOTS.lock().unwrap().clone()
+}
+
+/// Record a verifier spawn's args (test seam) and return `true` to short-circuit
+/// the spawn (no process created). Production calls the plain spawn path.
+#[cfg(test)]
+fn maybe_record_verifier_spawn(args: &[std::ffi::OsString]) -> bool {
+    if TEST_VERIFIER_OVERRIDE.lock().unwrap().is_none() {
+        return false;
+    }
+    let arg_strs: Vec<String> = args
+        .iter()
+        .filter_map(|a| a.to_str().map(|s| s.to_string()))
+        .collect();
+    TEST_RECORDED_VERIFIER_ARGS
+        .lock()
+        .unwrap()
+        .push(arg_strs.join(" "));
+    // Extract `--snapshot-root <val>` (and `--snapshot-root=<val>`).
+    for (i, a) in arg_strs.iter().enumerate() {
+        if let Some(v) = a.strip_prefix("--snapshot-root=") {
+            TEST_RECORDED_SNAPSHOT_ROOTS
+                .lock()
+                .unwrap()
+                .push(v.to_string());
+        } else if a == "--snapshot-root" {
+            if let Some(v) = arg_strs.get(i + 1) {
+                TEST_RECORDED_SNAPSHOT_ROOTS.lock().unwrap().push(v.clone());
+            }
+        }
+    }
+    true
+}
+
+#[cfg(not(test))]
+fn maybe_record_verifier_spawn(_args: &[std::ffi::OsString]) -> bool {
+    false
 }
 
 /// Outcome of the envelope reuse policy (P6.3-C): the envelope file is
@@ -1539,6 +1623,14 @@ fn rerun_verifier(
             .arg(&case.manifest_path)
             .arg(input)
             .arg(output);
+    }
+    // `#[cfg(test)]` seam: if a test injected a verifier override, record the
+    // exact args (esp. `--snapshot-root`) and short-circuit the spawn so no
+    // process is created and the test path terminates here. Production always
+    // really spawns (the seam is a no-op and returns false).
+    let recorded_args: Vec<std::ffi::OsString> = cmd.get_args().map(|a| a.to_os_string()).collect();
+    if maybe_record_verifier_spawn(&recorded_args) {
+        return Ok(()); // test seam: exit-0 Ready, no process created
     }
     let status = cmd
         .status()
@@ -3384,6 +3476,500 @@ mod tests {
         assert!(
             format!("{err:#}").contains("invalid") || format!("{err:#}").contains("not absolute"),
             "malformed sealed path must fail: {err:#}"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // ------------------------------------------------------------------
+    // G3-R5-R1-R1-R1-R1-R1-R1: production-shaped `/unpack` dispatch coverage.
+    // These drive run_command(Command::Unpack { .. }) through
+    // unpacker::unpack -> LaunchAttestationContext -> attest_ready_before_launch
+    // -> verify_gto_sealed_root_matches -> enforce_gto_snapshot_path_binding ->
+    // rerun_verifier, using the #[cfg(test)] verifier seam to record the
+    // `--snapshot-root` the verifier would receive and to terminate before any
+    // process is created.
+    // ------------------------------------------------------------------
+
+    /// Workspace root (for rust-toolchain.toml / real manifests).
+    fn workspace_root() -> PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+    }
+
+    /// A real locked Oreans manifest path.
+    fn real_manifest(case_id: &str) -> PathBuf {
+        workspace_root()
+            .join("lab/cases/v2")
+            .join(format!("{case_id}.json"))
+    }
+
+    /// Serializes the G3-R5-R1-R1-R1-R1-R1-R1 dispatch tests (they share the
+    /// global #[cfg(test)] verifier seam, so they must not run concurrently).
+    static TEST_DISPATCH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Write a fake verifier stub into `dir` and inject it via the #[cfg(test)]
+    /// seam (also clearing any prior recordings). Returns the verifier path.
+    fn inject_test_verifier(dir: &Path) -> PathBuf {
+        let v = dir.join("mida-acceptance.exe");
+        std::fs::write(&v, b"FAKE-VERIFIER-STUB").unwrap();
+        set_test_verifier_override(v.clone());
+        v
+    }
+
+    /// Fabricate a GTO v4 envelope + Ready report whose GTO sealed path is under
+    /// `snapshot_root`, matching exactly what `unpack` will build from the given
+    /// `Command::Unpack` args (so `bind_actual_config_to_envelope` passes).
+    /// Returns the real snapshot path that must be the launch input.
+    #[allow(clippy::too_many_arguments)]
+    fn fabricate_gto_unpack_state(
+        dir: &Path,
+        snapshot_root: &Path,
+        gto_bytes: &[u8],
+        manifest: &Path,
+        candidate_output: &Path,
+        oep: mida_pe::OepPolicy,
+        restore: mida_pe::ContainerRestoreMode,
+        profile: mida_pe::DumpProfile,
+        shrink: bool,
+    ) -> (PathBuf, serde_json::Value, serde_json::Value) {
+        use mida_core::runner_config::packer_family;
+        use mida_core::runner_config::{IsolationConfig, RunnerConfig};
+
+        let gto_sha = sha256_hex(gto_bytes);
+        let gto_size = gto_bytes.len() as u64;
+        let sealed_snap = snapshot_root
+            .join("gto_launcher")
+            .join(&gto_sha)
+            .join("snapshot.bin");
+        std::fs::create_dir_all(sealed_snap.parent().unwrap()).unwrap();
+        std::fs::write(&sealed_snap, gto_bytes).unwrap();
+
+        // The exact config `unpack` builds from the given args + family ahk_gto.
+        let cli_binary_sha256 =
+            crate::runner_preflight::sha256_file(&std::env::current_exe().unwrap()).unwrap();
+        let tool_revision = "rev";
+        let gto_cfg = crate::run_spec::runner_config_from_unpack_args_family(
+            packer_family::AHK_GTO,
+            oep,
+            restore,
+            profile,
+            shrink,
+            false,
+            false,
+            "",
+            tool_revision,
+            &cli_binary_sha256,
+        );
+        let gto_digest = mida_core::runner_config::runner_config_digest(&gto_cfg);
+
+        // Oreans configs (their digests are pinned in the envelope; the launch
+        // only matches the GTO case by input identity).
+        let oreans_cfg = RunnerConfig {
+            packer_family: packer_family::OREANS.to_string(),
+            tool_revision: tool_revision.to_string(),
+            cli_binary_sha256: cli_binary_sha256.clone(),
+            features: Vec::new(),
+            debugger_backend: String::new(),
+            oep_policy: String::new(),
+            container_restore: String::new(),
+            shrink: false,
+            data_sections: false,
+            pure_rebuild: false,
+            capture_policy_digest: String::new(),
+            iat_fix_strategy: String::new(),
+            timeout_secs: 0,
+            isolation: IsolationConfig {
+                workspace_policy: String::new(),
+                process_tree_policy: String::new(),
+                network_policy: String::new(),
+            },
+            attempt_numbering: String::new(),
+            evidence_bundle_schema: String::new(),
+            gate_schema: String::new(),
+            env_allowlist: Vec::new(),
+        };
+        let oreans_digest = mida_core::runner_config::runner_config_digest(&oreans_cfg);
+
+        // Verifier identity: the seam injects a fake verifier; the envelope
+        // must pin its canonical path + sha so verify_verifier_identity passes.
+        let verifier = dir.join("mida-acceptance.exe");
+        std::fs::write(&verifier, b"FAKE-VERIFIER-STUB").unwrap();
+        let verifier_canon = std::fs::canonicalize(&verifier).unwrap();
+        let verifier_sha = crate::runner_preflight::sha256_file(&verifier_canon).unwrap();
+
+        let configs = vec![
+            serde_json::json!({
+                "case_id": "origin_macro",
+                "family_id": packer_family::OREANS,
+                "protected_input": {"sha256": "1af62999cf5be0b2f21abc39034c122a42aa46cfbfdb546faa184de37ac09ac7", "size_bytes": 5232656},
+                "protected_input_path": null,
+                "runner_config": serde_json::to_value(&oreans_cfg).unwrap(),
+                "runner_config_digest": oreans_digest,
+            }),
+            serde_json::json!({
+                "case_id": "lunlun_software",
+                "family_id": packer_family::OREANS,
+                "protected_input": {"sha256": "8a0118d04e03752728999c845536c29215d2a626ac65845c22e3f1149de0db07", "size_bytes": 4976144},
+                "protected_input_path": null,
+                "runner_config": serde_json::to_value(&oreans_cfg).unwrap(),
+                "runner_config_digest": oreans_digest,
+            }),
+            serde_json::json!({
+                "case_id": "gto_launcher",
+                "family_id": packer_family::AHK_GTO,
+                "protected_input": {"sha256": gto_sha, "size_bytes": gto_size},
+                "protected_input_path": sealed_snap.display().to_string(),
+                "runner_config": serde_json::to_value(&gto_cfg).unwrap(),
+                "runner_config_digest": gto_digest,
+            }),
+        ];
+        let mut entries: Vec<String> = configs
+            .iter()
+            .map(|c| {
+                let path = c
+                    .get("protected_input_path")
+                    .and_then(|p| p.as_str())
+                    .unwrap_or_default()
+                    .to_lowercase();
+                format!(
+                    "case={}\nfamily={}\nprotected_input={}|{}\nprotected_input_path={}\nrunner_config_digest={}\n",
+                    c["case_id"].as_str().unwrap(),
+                    c["family_id"].as_str().unwrap().to_lowercase(),
+                    c["protected_input"]["sha256"].as_str().unwrap().to_lowercase(),
+                    c["protected_input"]["size_bytes"].as_u64().unwrap(),
+                    path,
+                    c["runner_config_digest"].as_str().unwrap().to_lowercase(),
+                )
+            })
+            .collect();
+        entries.sort();
+        let case_set = sha256_hex(entries.concat().as_bytes());
+
+        let envelope = serde_json::json!({
+            "$schema": "./runner-config-envelope.schema.json",
+            "schema_version": "mida.runner-config-envelope/v4",
+            "cli_binary_sha256": cli_binary_sha256,
+            "tool_revision": tool_revision,
+            "verifier_source": "<cli-dir>/mida-acceptance.exe",
+            "verifier_path": verifier_canon.display().to_string(),
+            "verifier_sha256": verifier_sha,
+            "case_set_digest": case_set,
+            "case_configs": configs,
+        });
+        std::fs::write(
+            dir.join("runner-config-envelope.json"),
+            serde_json::to_vec_pretty(&envelope).unwrap(),
+        )
+        .unwrap();
+
+        // Ready report with all three cases matching the envelope.
+        let report = serde_json::json!({
+            "schema_version": "mida.preflight-report/v3",
+            "status": "ready",
+            "reasons": [],
+            "runner_config_digest": case_set,
+            "head_revision": null,
+            "worktree_clean": true,
+            "toolchain_matches": true,
+            "cli_binary_sha256": envelope["cli_binary_sha256"],
+            "cli_binary_matches": true,
+            "cli_binary_path": std::env::current_exe().unwrap().display().to_string(),
+            "repo_root": dir.display().to_string(),
+            "toolchain_pin_file": workspace_root().join("rust-toolchain.toml").display().to_string(),
+            "expected_toolchain": "1.97.1",
+            "cases": vec![
+                serde_json::json!({"case_id":"origin_macro","identity_ok":true,"reasons":[],"protected_input":{"sha256":"1af62999cf5be0b2f21abc39034c122a42aa46cfbfdb546faa184de37ac09ac7","size_bytes":5232656},"protected_input_path":"","manifest_path":real_manifest("origin_macro").display().to_string(),"candidate_output":dir.join("origin_candidate.exe").display().to_string(),"runner_config_digest":oreans_digest}),
+                serde_json::json!({"case_id":"lunlun_software","identity_ok":true,"reasons":[],"protected_input":{"sha256":"8a0118d04e03752728999c845536c29215d2a626ac65845c22e3f1149de0db07","size_bytes":4976144},"protected_input_path":"","manifest_path":real_manifest("lunlun_software").display().to_string(),"candidate_output":dir.join("lunlun_candidate.exe").display().to_string(),"runner_config_digest":oreans_digest}),
+                serde_json::json!({"case_id":"gto_launcher","identity_ok":true,"reasons":[],"protected_input":{"sha256":gto_sha,"size_bytes":gto_size},"protected_input_path":sealed_snap.display().to_string(),"manifest_path":manifest.display().to_string(),"candidate_output":candidate_output.display().to_string(),"runner_config_digest":gto_digest}),
+            ],
+        });
+        std::fs::write(
+            dir.join("preflight.json"),
+            serde_json::to_vec_pretty(&report).unwrap(),
+        )
+        .unwrap();
+        (sealed_snap, envelope, report)
+    }
+
+    /// A minimal GTO manifest for the synthetic case.
+    fn gto_synthetic_manifest(dir: &Path, gto_sha: &str, gto_size: u64) -> PathBuf {
+        let p = dir.join("gto_launcher.json");
+        std::fs::write(
+            &p,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "$schema": "./case-manifest.schema.json",
+                "schema_version": "mida.case-manifest/v2",
+                "case_id": "gto_launcher",
+                "primary_artifact_sha256": gto_sha,
+                "artifacts": [{"sha256": gto_sha, "size_bytes": gto_size, "role": "protected_input"}],
+                "capability_cell": {"protection_family": "ahk_gto_candidate", "engine_route": "mida_plugin_ahk_gto"},
+                "static_fingerprint": {}, "execution_policy": {}, "oracle": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        p
+    }
+
+    /// Custom root: rerun verifier receives the same `--snapshot-root`.
+    #[test]
+    fn unpack_dispatch_threads_custom_snapshot_root_to_launch_attestation() {
+        let _guard = TEST_DISPATCH_LOCK.lock().unwrap();
+        let root = temp_dir("unpack_custom_root");
+        let custom_root = root.join("custom_store");
+        let dir = root.join("preflight");
+        std::fs::create_dir_all(&dir).unwrap();
+        let gto_bytes = b"CUSTOM-ROOT-DISPATCH-GTO";
+        let gto_sha = sha256_hex(gto_bytes);
+        let manifest = gto_synthetic_manifest(&dir, &gto_sha, gto_bytes.len() as u64);
+        let candidate = dir.join("gto_candidate.exe");
+        let (sealed_snap, _envelope, _report) = fabricate_gto_unpack_state(
+            &dir,
+            &custom_root,
+            gto_bytes,
+            &manifest,
+            &candidate,
+            mida_pe::OepPolicy::Captured,
+            mida_pe::ContainerRestoreMode::Off,
+            mida_pe::DumpProfile::OreansClassic,
+            true,
+        );
+
+        // Inject the verifier stub via the #[cfg(test)] seam.
+        inject_test_verifier(&dir);
+
+        let cmd = crate::args::Command::Unpack {
+            input: sealed_snap.clone(),
+            output: Some(candidate.clone()),
+            create_data_sections: false,
+            shrink: true,
+            oep_policy: mida_pe::OepPolicy::Captured,
+            container_restore: mida_pe::ContainerRestoreMode::Off,
+            profile: mida_pe::DumpProfile::OreansClassic,
+            pure_rebuild: false,
+            capture_policy: mida_pe::DumpCapturePolicy::default(),
+            capture_policy_digest: String::new(),
+            preflight_dir: Some(dir.clone()),
+            snapshot_root: Some(custom_root.clone()),
+            verbose: false,
+        };
+        let out = crate::commands::run_command(cmd);
+        // The launch attestation must succeed past the root cross-check (the
+        // verifier seam records --snapshot-root and terminates the test path).
+        let err = match out {
+            Ok(()) => String::new(),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            !err.contains("root mismatch") && !err.contains("does not match the sealed path root"),
+            "custom-root launch must pass the root cross-check: {err}"
+        );
+        // The seam recorded the custom root as --snapshot-root for rerun_verifier.
+        let recorded = test_snapshot_root_recorder();
+        assert!(
+            recorded
+                .iter()
+                .any(|r| crate::sample_snapshot::paths_equivalent(
+                    std::path::Path::new(r),
+                    &custom_root
+                )),
+            "rerun verifier must receive the custom snapshot root, got {recorded:?}"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Default root: snapshot_root=None selects <preflight_dir>/sample-snapshots.
+    #[test]
+    fn unpack_dispatch_defaults_snapshot_root_from_preflight_dir() {
+        let _guard = TEST_DISPATCH_LOCK.lock().unwrap();
+        let root = temp_dir("unpack_default_root");
+        let default_root = root.join("preflight").join("sample-snapshots");
+        let dir = root.join("preflight");
+        std::fs::create_dir_all(&dir).unwrap();
+        let gto_bytes = b"DEFAULT-ROOT-DISPATCH-GTO";
+        let gto_sha = sha256_hex(gto_bytes);
+        let manifest = gto_synthetic_manifest(&dir, &gto_sha, gto_bytes.len() as u64);
+        let candidate = dir.join("gto_candidate.exe");
+        // The sealed path is under the DEFAULT root (sample-snapshots).
+        let (sealed_snap, _envelope, _report) = fabricate_gto_unpack_state(
+            &dir,
+            &default_root,
+            gto_bytes,
+            &manifest,
+            &candidate,
+            mida_pe::OepPolicy::Captured,
+            mida_pe::ContainerRestoreMode::Off,
+            mida_pe::DumpProfile::OreansClassic,
+            true,
+        );
+
+        inject_test_verifier(&dir);
+
+        let cmd = crate::args::Command::Unpack {
+            input: sealed_snap.clone(),
+            output: Some(candidate.clone()),
+            create_data_sections: false,
+            shrink: true,
+            oep_policy: mida_pe::OepPolicy::Captured,
+            container_restore: mida_pe::ContainerRestoreMode::Off,
+            profile: mida_pe::DumpProfile::OreansClassic,
+            pure_rebuild: false,
+            capture_policy: mida_pe::DumpCapturePolicy::default(),
+            capture_policy_digest: String::new(),
+            preflight_dir: Some(dir.clone()),
+            snapshot_root: None,
+            verbose: false,
+        };
+        let out = crate::commands::run_command(cmd);
+        let err = match out {
+            Ok(()) => String::new(),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            !err.contains("root mismatch") && !err.contains("does not match the sealed path root"),
+            "default-root launch must pass the root cross-check: {err}"
+        );
+        // The rerun verifier receives the DEFAULT root <preflight_dir>/sample-snapshots.
+        let recorded = test_snapshot_root_recorder();
+        assert!(
+            recorded
+                .iter()
+                .any(|r| crate::sample_snapshot::paths_equivalent(
+                    std::path::Path::new(r),
+                    &default_root
+                )),
+            "rerun verifier must receive the default snapshot root, got {recorded:?}"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Mismatch: staged under a custom root, launched with the default root
+    /// (snapshot_root=None) -> fail-closed before any process creation with a
+    /// root-mismatch reason.
+    #[test]
+    fn unpack_dispatch_rejects_staging_launch_root_mismatch_before_process() {
+        let _guard = TEST_DISPATCH_LOCK.lock().unwrap();
+        let root = temp_dir("unpack_mismatch");
+        let custom_root = root.join("custom_store");
+        let dir = root.join("preflight");
+        std::fs::create_dir_all(&dir).unwrap();
+        let gto_bytes = b"MISMATCH-ROOT-DISPATCH-GTO";
+        let gto_sha = sha256_hex(gto_bytes);
+        let manifest = gto_synthetic_manifest(&dir, &gto_sha, gto_bytes.len() as u64);
+        let candidate = dir.join("gto_candidate.exe");
+        // Staged under the CUSTOM root.
+        let (sealed_snap, _envelope, _report) = fabricate_gto_unpack_state(
+            &dir,
+            &custom_root,
+            gto_bytes,
+            &manifest,
+            &candidate,
+            mida_pe::OepPolicy::Captured,
+            mida_pe::ContainerRestoreMode::Off,
+            mida_pe::DumpProfile::OreansClassic,
+            true,
+        );
+
+        inject_test_verifier(&dir);
+
+        // Launch WITHOUT --snapshot-root -> default root (sample-snapshots)
+        // mismatches the sealed custom root -> fail-closed before rerun_verifier.
+        let cmd = crate::args::Command::Unpack {
+            input: sealed_snap.clone(),
+            output: Some(candidate.clone()),
+            create_data_sections: false,
+            shrink: true,
+            oep_policy: mida_pe::OepPolicy::Captured,
+            container_restore: mida_pe::ContainerRestoreMode::Off,
+            profile: mida_pe::DumpProfile::OreansClassic,
+            pure_rebuild: false,
+            capture_policy: mida_pe::DumpCapturePolicy::default(),
+            capture_policy_digest: String::new(),
+            preflight_dir: Some(dir.clone()),
+            snapshot_root: None,
+            verbose: false,
+        };
+        let err = crate::commands::run_command(cmd).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("root mismatch")
+                || format!("{err:#}").contains("does not match the sealed path root"),
+            "staging/launch root mismatch must fail-closed before process: {err:#}"
+        );
+        // The seam never reached rerun_verifier (no snapshot root recorded), so
+        // no process was created.
+        let recorded = test_snapshot_root_recorder();
+        assert!(
+            recorded.is_empty(),
+            "no verifier spawn on root mismatch: {recorded:?}"
+        );
+        assert!(!candidate.exists(), "no candidate may be produced");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The rerun verifier receives the SAME custom snapshot root as staging.
+    #[test]
+    fn unpack_dispatch_rerun_verifier_receives_same_snapshot_root() {
+        let _guard = TEST_DISPATCH_LOCK.lock().unwrap();
+        let root = temp_dir("unpack_same_root");
+        let custom_root = root.join("custom_store");
+        let dir = root.join("preflight");
+        std::fs::create_dir_all(&dir).unwrap();
+        let gto_bytes = b"SAME-ROOT-DISPATCH-GTO";
+        let gto_sha = sha256_hex(gto_bytes);
+        let manifest = gto_synthetic_manifest(&dir, &gto_sha, gto_bytes.len() as u64);
+        let candidate = dir.join("gto_candidate.exe");
+        let (sealed_snap, _envelope, _report) = fabricate_gto_unpack_state(
+            &dir,
+            &custom_root,
+            gto_bytes,
+            &manifest,
+            &candidate,
+            mida_pe::OepPolicy::Captured,
+            mida_pe::ContainerRestoreMode::Off,
+            mida_pe::DumpProfile::OreansClassic,
+            true,
+        );
+
+        inject_test_verifier(&dir);
+
+        let cmd = crate::args::Command::Unpack {
+            input: sealed_snap.clone(),
+            output: Some(candidate.clone()),
+            create_data_sections: false,
+            shrink: true,
+            oep_policy: mida_pe::OepPolicy::Captured,
+            container_restore: mida_pe::ContainerRestoreMode::Off,
+            profile: mida_pe::DumpProfile::OreansClassic,
+            pure_rebuild: false,
+            capture_policy: mida_pe::DumpCapturePolicy::default(),
+            capture_policy_digest: String::new(),
+            preflight_dir: Some(dir.clone()),
+            snapshot_root: Some(custom_root.clone()),
+            verbose: false,
+        };
+        let out = crate::commands::run_command(cmd);
+        let err = match out {
+            Ok(()) => String::new(),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            !err.contains("root mismatch") && !err.contains("does not match the sealed path root"),
+            "custom-root launch must pass: {err}"
+        );
+        // The recorded --snapshot-root equals the caller's custom root (the same
+        // root staging used), not the default and not derived from the path.
+        let recorded = test_snapshot_root_recorder();
+        let has_custom = recorded.iter().any(|r| {
+            crate::sample_snapshot::paths_equivalent(std::path::Path::new(r), &custom_root)
+        });
+        let has_default = recorded.iter().any(|r| {
+            crate::sample_snapshot::paths_equivalent(
+                std::path::Path::new(r),
+                &dir.join("sample-snapshots"),
+            )
+        });
+        assert!(
+            has_custom && !has_default,
+            "rerun verifier must receive the custom root (not default): {recorded:?}"
         );
         std::fs::remove_dir_all(&root).unwrap();
     }
