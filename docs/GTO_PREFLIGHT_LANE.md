@@ -413,3 +413,36 @@ pending template; `apply_decision` stably fails closed on it.
 
 Production GTO staging still treats the manifest `protected_input` as the sole
 current authority; the promotion plan is never wired to a manifest write.
+
+## 17. Unified revision identity key + snapshot-path contract inventory (G3-R4-R1-R1)
+
+**Unified identity key.** The authority dossier's revision identity is now
+uniformly `(canonical sha256, size_bytes)` across sealing and decisions:
+- `apply_decision` selects an observed revision by the FULL key
+  (`selected_revision_sha256` + `selected_revision_size`), so a revision that
+  shares a sha256 with a DIFFERENT size is a distinct identity, not an
+  ambiguity. 0 exact matches fails closed; >1 exact matches means a duplicate
+  full identity (rejected). `selected_revision_sha256` must be canonical
+  lowercase and well-formed.
+- `canonical_content()` sorts `observed_revisions` by the full key (sha256 then
+  size_bytes). Duplicate full identities are rejected earlier by the producer
+  and `verify_semantics`, so the sort never has to mask a duplicate.
+- Candidate input order never changes the equivalent dossier's canonical content
+  or `sealed_dossier_hash` (verified by forward/reverse ordering tests).
+
+**Snapshot-path contract inventory (multiple implementations).** The GTO
+immutable snapshot path layout `<root>/gto_launcher/<sha256>/snapshot.bin` is
+currently parsed in three places, kept in sync but NOT unified:
+1. `crate::authority_dossier::validate_snapshot_path` — content-addressed path
+   structural validation for the authority dossier (any logical_sample_id).
+2. `crate::runner_preflight::snapshot_root_of_snapshot` — the CLI launch
+   helper's path/boundary validation (hard-coded to the GTO lane).
+3. the acceptance crate's GTO path parser (`gto_snapshot_hash_dir` in
+   `crates/acceptance/src/main.rs`) — the independent verifier's structural
+   check.
+
+These are multiple implementations by design (independent verifier boundary;
+dossier vs launch lane). **If the snapshot layout ever changes, all three must be
+audited together**; this task does not refactor the production launch lane. The
+GTO launch lane and the authority dossier remain separate; the dossier's
+promotion plan is never wired to the manifest or to staging.

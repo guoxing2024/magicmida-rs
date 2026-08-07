@@ -149,7 +149,14 @@ impl AuthorityDossier {
     fn canonical_content(&self) -> String {
         // Sort observed revisions by sha256 for determinism.
         let mut revs: Vec<&ObservedRevision> = self.observed_revisions.iter().collect();
-        revs.sort_by(|a, b| a.sha256.cmp(&b.sha256));
+        // Sort by the FULL identity key (canonical sha256, then size_bytes) for
+        // determinism. Duplicate full identities are rejected earlier by the
+        // producer / verify_semantics, so this sort never has to mask a duplicate.
+        revs.sort_by(|a, b| {
+            a.sha256
+                .cmp(&b.sha256)
+                .then_with(|| a.size_bytes.cmp(&b.size_bytes))
+        });
         let mut out = String::new();
         out.push_str(&format!("schema={}\n", self.schema));
         out.push_str(&format!("logical_sample_id={}\n", self.logical_sample_id));
@@ -682,30 +689,43 @@ pub fn apply_decision(
         }
     }
     let sel_sha = sample_snapshot::canonical_hash(&decision.selected_revision_sha256);
-    // The selected revision must be present in the dossier, and the identity
-    // (sha256+size_bytes) must be unique within the dossier (no "first match").
+    // selected_revision_sha256 must be canonical lowercase (and well-formed).
+    if decision.selected_revision_sha256 != sel_sha
+        || crate::sample_snapshot::validate_hash(&sel_sha).is_err()
+    {
+        return Err(format!(
+            "decision selected_revision_sha256 {:?} is not canonical lowercase / well-formed",
+            decision.selected_revision_sha256
+        ));
+    }
+    // Exact match on the FULL identity key (canonical sha256, size_bytes). A
+    // revision with the same sha but a different size is a DISTINCT identity, so
+    // it must not make the selection ambiguous. 0 matches fails closed; >1 exact
+    // matches means a duplicate identity (already rejected at producer / semantic
+    // validation, but enforced here too).
     let matches: Vec<&ObservedRevision> = dossier
         .observed_revisions
         .iter()
-        .filter(|r| r.sha256.eq_ignore_ascii_case(&sel_sha))
+        .filter(|r| {
+            r.sha256.eq_ignore_ascii_case(&sel_sha)
+                && r.size_bytes == decision.selected_revision_size
+        })
         .collect();
     if matches.is_empty() {
-        return Err(format!("decision revision {sel_sha} is not in the dossier"));
+        return Err(format!(
+            "decision revision {sel_sha}|{} is not in the dossier",
+            decision.selected_revision_size
+        ));
     }
     if matches.len() > 1 {
         return Err(format!(
-            "decision revision {sel_sha} is ambiguous: it matches {} observed \
-             revisions (duplicate identities are rejected)",
+            "decision revision {sel_sha}|{} is ambiguous: {} exact matches \
+             (duplicate identities are rejected)",
+            decision.selected_revision_size,
             matches.len()
         ));
     }
     let rev = matches[0];
-    if rev.size_bytes != decision.selected_revision_size {
-        return Err(format!(
-            "decision size {} != dossier revision size {}",
-            decision.selected_revision_size, rev.size_bytes
-        ));
-    }
 
     match decision.decision.as_str() {
         DECISION_RETAIN_MANIFEST => {
@@ -1248,7 +1268,10 @@ mod tests {
         // (8) Decision hash correct but size wrong.
         let dec3 = make_decision(&dossier, &sha, size + 1, DECISION_RETAIN_MANIFEST);
         let err = apply_decision(&dossier, &dec3, &snap_root, &manifest_path).unwrap_err();
-        assert!(err.contains("size"), "size mismatch: {err}");
+        assert!(
+            err.contains("not in the dossier"),
+            "size mismatch must fail closed: {err}"
+        );
 
         // (9) retain_manifest selecting a non-manifest revision.
         let other_bytes = b"NOT-MANIFEST-REV";
@@ -1804,5 +1827,302 @@ mod tests {
             "empty decided_at rejected: {err}"
         );
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // ------------------------------------------------------------------
+    // G3-R4-R1-R1: unified (sha256, size_bytes) identity key.
+    // ------------------------------------------------------------------
+
+    /// Build a dossier with two observed revisions sharing the same sha256 but
+    /// DIFFERENT sizes (distinct identities), plus seal it. This is only
+    /// constructible directly (the producer derives sha from content, so real
+    /// captures can't share a sha with different sizes).
+    fn dossier_with_same_sha_diff_size(sha: &str) -> AuthorityDossier {
+        let mut d = AuthorityDossier {
+            schema: DOSSIER_SCHEMA.to_string(),
+            logical_sample_id: "gto_launcher".to_string(),
+            packer_family: "ahk_gto".to_string(),
+            manifest_path: "gto_launcher.json".to_string(),
+            manifest_declared_identity: ManifestIdentity {
+                sha256: "0".repeat(64),
+                size_bytes: 1,
+            },
+            observed_revisions: vec![
+                ObservedRevision {
+                    sha256: sha.to_string(),
+                    size_bytes: 100,
+                    immutable_snapshot_path: String::new(), // non-verified to avoid path checks
+                    availability: AVAIL_HISTORICAL_RECORD_ONLY.to_string(),
+                    comparison_verdict: DIFFERS_FROM_MANIFEST.to_string(),
+                    pe_identity: None,
+                },
+                ObservedRevision {
+                    sha256: sha.to_string(),
+                    size_bytes: 200,
+                    immutable_snapshot_path: String::new(),
+                    availability: AVAIL_HISTORICAL_RECORD_ONLY.to_string(),
+                    comparison_verdict: DIFFERS_FROM_MANIFEST.to_string(),
+                    pe_identity: None,
+                },
+            ],
+            source_path: "launcher.exe".to_string(),
+            capture_tool_revision: "rev".to_string(),
+            captured_at: "2026-08-07T00:00:00Z".to_string(),
+            authority_status: STATUS_PENDING.to_string(),
+            family_observation: FamilyObservation {
+                selected_family: "ahk_gto".to_string(),
+                identify_verdict: "identify".to_string(),
+            },
+            blockers: vec![],
+            dossier_member_manifest: "gto_launcher.json".to_string(),
+            completion_marker: COMPLETION_MARKER.to_string(),
+            sealed_dossier_hash: String::new(),
+        };
+        d.sealed_dossier_hash = d.compute_sealed_hash();
+        d
+    }
+
+    /// Same sha, different size => distinct identities; verify_semantics accepts
+    /// them, and the decision can select one of them exactly by size.
+    #[test]
+    fn same_sha_diff_size_are_distinct_and_selectable_by_size() {
+        let sha = "a".repeat(64);
+        let d = dossier_with_same_sha_diff_size(&sha);
+        d.verify_semantics().unwrap();
+        d.verify_sealed().unwrap();
+        // Two distinct identities (same sha, different size) are NOT duplicates.
+        assert_eq!(d.observed_revisions.len(), 2);
+
+        // Select the size-100 one exactly (by full (sha, size) key).
+        let dec_100 = reject_decision(&d, &sha, 100);
+        let out = apply_decision(&d, &dec_100, &root_of(&d), &Path::new("gto_launcher.json"))
+            .expect("decision must select the size-100 revision by (sha,size)");
+        assert_eq!(out, DecisionOutcome::RejectRevision);
+
+        // Select the size-200 one exactly.
+        let dec_200 = reject_decision(&d, &sha, 200);
+        let out = apply_decision(&d, &dec_200, &root_of(&d), &Path::new("gto_launcher.json"))
+            .expect("decision must select the size-200 revision by (sha,size)");
+        assert_eq!(out, DecisionOutcome::RejectRevision);
+
+        // A nonexistent size fails closed (not ambiguous).
+        let dec_300 = reject_decision(&d, &sha, 300);
+        let err = apply_decision(&d, &dec_300, &root_of(&d), &Path::new("gto_launcher.json"))
+            .unwrap_err();
+        assert!(
+            err.contains("not in the dossier"),
+            "nonexistent size fails closed: {err}"
+        );
+    }
+
+    /// Build a `reject_revision` decision against the given dossier and sha+size.
+    fn reject_decision(d: &AuthorityDossier, sha: &str, size: u64) -> AuthorityDecision {
+        AuthorityDecision {
+            schema: DECISION_SCHEMA.to_string(),
+            logical_sample_id: d.logical_sample_id.clone(),
+            selected_revision_sha256: sha.to_string(),
+            selected_revision_size: size,
+            dossier_sha256: d.sealed_dossier_hash.clone(),
+            decision: DECISION_REJECT_REVISION.to_string(),
+            decision_reason: "test".to_string(),
+            decided_by: "human".to_string(),
+            decided_at: "2026-08-07T12:00:00Z".to_string(),
+            acknowledgement: vec![
+                ACK_SOURCE_NOT_AUTHORITY.to_string(),
+                ACK_NO_AUTOMATIC_MANIFEST_MUTATION.to_string(),
+                ACK_NO_PERFECT_UNPACK_ACCEPTANCE.to_string(),
+            ],
+        }
+    }
+
+    /// A decision with a non-canonical / malformed selected sha is rejected.
+    #[test]
+    fn decision_non_canonical_sha_rejected() {
+        let d = dossier_with_same_sha_diff_size(&"a".repeat(64));
+        let dec = AuthorityDecision {
+            schema: DECISION_SCHEMA.to_string(),
+            logical_sample_id: d.logical_sample_id.clone(),
+            selected_revision_sha256: "A".repeat(64), // uppercase = non-canonical
+            selected_revision_size: 100,
+            dossier_sha256: d.sealed_dossier_hash.clone(),
+            decision: DECISION_REJECT_REVISION.to_string(),
+            decision_reason: "test".to_string(),
+            decided_by: "human".to_string(),
+            decided_at: "2026-08-07T12:00:00Z".to_string(),
+            acknowledgement: vec![
+                ACK_SOURCE_NOT_AUTHORITY.to_string(),
+                ACK_NO_AUTOMATIC_MANIFEST_MUTATION.to_string(),
+                ACK_NO_PERFECT_UNPACK_ACCEPTANCE.to_string(),
+            ],
+        };
+        let err =
+            apply_decision(&d, &dec, &root_of(&d), &Path::new("gto_launcher.json")).unwrap_err();
+        assert!(
+            err.contains("not canonical lowercase"),
+            "non-canonical sha: {err}"
+        );
+    }
+
+    /// A full (sha,size) duplicate in the dossier is rejected by verify_semantics
+    /// and would make a decision ambiguous.
+    #[test]
+    fn full_duplicate_identity_rejected_by_semantics() {
+        let sha = "b".repeat(64);
+        let mut d = dossier_with_same_sha_diff_size(&sha);
+        // Add a third revision with the SAME (sha, size) as the first.
+        d.observed_revisions.push(ObservedRevision {
+            sha256: sha.clone(),
+            size_bytes: 100,
+            immutable_snapshot_path: String::new(),
+            availability: AVAIL_HISTORICAL_RECORD_ONLY.to_string(),
+            comparison_verdict: DIFFERS_FROM_MANIFEST.to_string(),
+            pe_identity: None,
+        });
+        d.sealed_dossier_hash = d.compute_sealed_hash();
+        let err = d.verify_semantics().unwrap_err();
+        assert!(
+            err.contains("duplicate revision identity"),
+            "full duplicate rejected: {err}"
+        );
+    }
+
+    /// Forward/reverse candidate ordering produces identical identity sets,
+    /// canonical content, and sealed hash.
+    #[test]
+    fn forward_reverse_candidates_identical_dossier() {
+        let root = temp_dir("fwd_rev");
+        let a = b"REV-A-CONTENT";
+        let b = b"REV-B-CONTENT-DIFFERENT";
+        let src_a = root.join("a.exe");
+        let src_b = root.join("b.exe");
+        write_bytes(&src_a, a);
+        write_bytes(&src_b, b);
+        let sha_a = sha256(a);
+        let sha_b = sha256(b);
+        let candidates_fwd = vec![
+            live_candidate(&src_a, &sha_a, a.len() as u64),
+            live_candidate(&src_b, &sha_b, b.len() as u64),
+        ];
+        let candidates_rev = vec![
+            live_candidate(&src_b, &sha_b, b.len() as u64),
+            live_candidate(&src_a, &sha_a, a.len() as u64),
+        ];
+        let out_fwd = root.join("fwd.json");
+        let out_rev = root.join("rev.json");
+        let manifest_sha = sha_a.clone();
+        let manifest_size = a.len() as u64;
+        let d_fwd = make_dossier(
+            &root,
+            &manifest_sha,
+            manifest_size,
+            &candidates_fwd,
+            &out_fwd,
+        )
+        .unwrap();
+        let d_rev = make_dossier(
+            &root,
+            &manifest_sha,
+            manifest_size,
+            &candidates_rev,
+            &out_rev,
+        )
+        .unwrap();
+        // Identity sets are equal (sorted by full key).
+        let mut ids_fwd: Vec<(String, u64)> = d_fwd
+            .observed_revisions
+            .iter()
+            .map(|r| (r.sha256.clone(), r.size_bytes))
+            .collect();
+        let mut ids_rev: Vec<(String, u64)> = d_rev
+            .observed_revisions
+            .iter()
+            .map(|r| (r.sha256.clone(), r.size_bytes))
+            .collect();
+        ids_fwd.sort();
+        ids_rev.sort();
+        assert_eq!(ids_fwd, ids_rev);
+        // Canonical content and sealed hash are identical regardless of order.
+        assert_eq!(d_fwd.compute_sealed_hash(), d_rev.compute_sealed_hash());
+        assert_eq!(d_fwd.sealed_dossier_hash, d_rev.sealed_dossier_hash);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// promote_revision still only selects availability=verified revisions whose
+    /// snapshot re-verifies from disk; a historical-record-only revision is never
+    /// promotable even though the identity key is now (sha,size).
+    #[test]
+    fn promote_requires_verified_and_disk_reverify() {
+        let root = temp_dir("promote_verified_only");
+        let bytes = b"VERIFIED-REV";
+        let sha = sha256(bytes);
+        let size = bytes.len() as u64;
+        let src = root.join("launcher.exe");
+        write_bytes(&src, bytes);
+        let old_sha = "4".repeat(64);
+        let old_size = 8_583_680;
+        let candidates = vec![live_candidate(&src, &sha, size)];
+        let output = root.join("dossier.json");
+        let dossier = make_dossier(&root, &old_sha, old_size, &candidates, &output).unwrap();
+        let snap_root = root.join("snapshots");
+        let manifest_path = root.join("gto_launcher.json");
+
+        // Verified revision is promotable.
+        let dec = make_decision(&dossier, &sha, size, DECISION_PROMOTE_REVISION);
+        let out = apply_decision(&dossier, &dec, &snap_root, &manifest_path).unwrap();
+        assert!(matches!(out, DecisionOutcome::Promote(_)));
+
+        // Tamper the snapshot on disk -> promote fails (disk re-verify).
+        let rev = dossier
+            .observed_revisions
+            .iter()
+            .find(|r| r.sha256 == sha)
+            .unwrap();
+        let snap_path = Path::new(&rev.immutable_snapshot_path);
+        let full = std::fs::read(snap_path).unwrap();
+        std::fs::write(snap_path, &full[..full.len() / 2]).unwrap();
+        let err = apply_decision(&dossier, &dec, &snap_root, &manifest_path).unwrap_err();
+        assert!(
+            err.contains("re-verify"),
+            "tampered snapshot fails promote: {err}"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A historical-record-only revision is not promotable (the identity-key fix
+    /// must not grant it promotion capability).
+    #[test]
+    fn historical_record_still_not_promotable() {
+        let root = temp_dir("hist_not_promotable");
+        let bytes = b"MANIFEST-REV";
+        let sha = sha256(bytes);
+        let size = bytes.len() as u64;
+        let src = root.join("launcher.exe");
+        write_bytes(&src, bytes);
+        let hist_sha = "7".repeat(64);
+        let hist_size = 13_633_536;
+        let candidates = vec![
+            live_candidate(&src, &sha, size),
+            historical_candidate(&hist_sha, hist_size),
+        ];
+        let output = root.join("dossier.json");
+        let dossier = make_dossier(&root, &sha, size, &candidates, &output).unwrap();
+        let dec = make_decision(&dossier, &hist_sha, hist_size, DECISION_PROMOTE_REVISION);
+        let err = apply_decision(
+            &dossier,
+            &dec,
+            &root.join("snapshots"),
+            &root.join("gto_launcher.json"),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("cannot be promoted"),
+            "historical-record-only still cannot be promoted: {err}"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Helper: a dummy snapshot root for decisions that don't touch disk.
+    fn root_of(_d: &AuthorityDossier) -> PathBuf {
+        std::env::temp_dir().join("authority_dossier_root_placeholder")
     }
 }
