@@ -446,3 +446,32 @@ dossier vs launch lane). **If the snapshot layout ever changes, all three must b
 audited together**; this task does not refactor the production launch lane. The
 GTO launch lane and the authority dossier remain separate; the dossier's
 promotion plan is never wired to the manifest or to staging.
+
+## 18. Unified snapshot-path contract (G3-R5)
+
+The content-addressed snapshot path contract `<snapshot_root>/<logical_sample_id>/
+<sha256>/snapshot.bin` is now unified into a shared parser with a single set of
+rules, removing the earlier three-way drift:
+
+- **Canonical helper** `mida-cli::sample_snapshot::parse_snapshot_path(path) ->
+  ParsedSnapshotPath { snapshot_root, logical_sample_id, sha256, snapshot_path }`
+  is the single implementation inside `mida-cli`. `authority_dossier::validate_snapshot_path`
+  and `runner_preflight::snapshot_root_of_snapshot` (the GTO launch wrapper) both
+  delegate to it and add only their lane/dossier-specific logical-id checks.
+- **Acceptance copy** `mida_acceptance::snapshot_path::parse_snapshot_path`
+  implements the SAME contract (the independent verifier cannot depend on
+  `mida-cli`; the dependency boundary is one-way). `gto_snapshot_hash_dir`
+  delegates to it and enforces the GTO lane case id.
+- **Shared contract vectors** (`tests/fixtures/snapshot_path_contract.json`):
+  the CLI and the acceptance verifier's parsers are validated against the SAME
+  vectors, so neither may diverge. The vectors lock: absolute-only, `.`/`..`
+  rejection, exact `snapshot.bin` filename, exactly-64-LOWERCASE-hex hash dir
+  (uppercase and non-hex are rejected), valid logical-sample id, and any absolute
+  root. The `..`/root-escape/sibling vectors are rejected; a `gto_launcher` vs
+  non-GTO logical directory is distinguished by the lane wrappers on top of the
+  structural contract.
+
+On Windows, `/./` is normalized away by `Path::components()`, so a `.` component
+cannot be triggered from a string path; the `..` component IS preserved and
+rejected. GTO/Oreans semantics, the generic evidence/no-gate contract, and the
+CreateProcess-before family-mismatch fail-closed are unchanged.

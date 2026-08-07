@@ -30,6 +30,119 @@ use sha2::{Digest, Sha256};
 /// The filename used for a snapshot inside its content-addressed directory.
 pub const SNAPSHOT_FILENAME: &str = "snapshot.bin";
 
+/// The canonical content-addressed snapshot path contract:
+/// `<snapshot_root>/<logical_sample_id>/<sha256>/snapshot.bin`.
+///
+/// A snapshot path is TRUSTED only when it matches this exact layout AND is
+/// absolute and free of `.`/`..`. `parse_snapshot_path` parses a path into this
+/// structured value; every caller must validate it through the same contract
+/// (see the cross-boundary contract vectors).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedSnapshotPath {
+    pub snapshot_root: std::path::PathBuf,
+    pub logical_sample_id: String,
+    /// Canonical lowercase 64-hex content-address hash directory.
+    pub sha256: String,
+    pub snapshot_path: std::path::PathBuf,
+}
+
+/// Parse a trusted immutable snapshot path of the exact shape
+/// `<snapshot_root>/<logical_sample_id>/<sha256>/snapshot.bin` into a structured
+/// value. Fail-closed on any of:
+/// - relative path;
+/// - `.` / `..` components;
+/// - wrong file name (not `SNAPSHOT_FILENAME`);
+/// - a hash directory that is not exactly 64 lowercase hex;
+/// - a missing `snapshot_root` / `logical_sample_id` / hash directory.
+///
+/// This is the single shared implementation of the snapshot-path contract inside
+/// `mida-cli` (`authority_dossier` and `runner_preflight` both delegate here).
+/// The independent `mida-acceptance` verifier keeps a minimal local copy of the
+/// SAME contract (it cannot depend on production crates) and is validated by the
+/// same contract vectors.
+pub fn parse_snapshot_path(path: &Path) -> Result<ParsedSnapshotPath, String> {
+    // A trusted snapshot path must be absolute.
+    if !path.is_absolute() {
+        return Err(format!("snapshot path {} is not absolute", path.display()));
+    }
+    // Reject `.` / `..` lexically (before any canonicalization).
+    for comp in path.components() {
+        match comp {
+            std::path::Component::CurDir | std::path::Component::ParentDir => {
+                return Err(format!(
+                    "snapshot path {} contains a relative ({comp:?}) component",
+                    path.display()
+                ));
+            }
+            _ => {}
+        }
+    }
+    // File name must be `snapshot.bin`.
+    let name = path
+        .file_name()
+        .and_then(|f| f.to_str())
+        .ok_or_else(|| format!("snapshot path {} has no file name", path.display()))?;
+    if name != SNAPSHOT_FILENAME {
+        return Err(format!(
+            "snapshot path {} must end in {SNAPSHOT_FILENAME}",
+            path.display()
+        ));
+    }
+    // `<sha256>` directory: exactly 64 lowercase hex.
+    let sha_dir = path
+        .parent()
+        .ok_or_else(|| format!("snapshot path {} has no hash directory", path.display()))?;
+    let sha_name = sha_dir
+        .file_name()
+        .and_then(|f| f.to_str())
+        .ok_or_else(|| {
+            format!(
+                "snapshot path {} hash directory has no name",
+                path.display()
+            )
+        })?;
+    if sha_name.len() != 64
+        || !sha_name.bytes().all(|b| b.is_ascii_hexdigit())
+        || sha_name != sha_name.to_ascii_lowercase()
+    {
+        return Err(format!(
+            "snapshot path hash directory {sha_name:?} is not exactly 64 lowercase hex"
+        ));
+    }
+    // `<logical_sample_id>` directory.
+    let logical_dir = sha_dir.parent().ok_or_else(|| {
+        format!(
+            "snapshot path {} has no logical-sample directory",
+            path.display()
+        )
+    })?;
+    let logical_name = logical_dir
+        .file_name()
+        .and_then(|f| f.to_str())
+        .ok_or_else(|| {
+            format!(
+                "snapshot path {} logical-sample directory has no name",
+                path.display()
+            )
+        })?;
+    if !validate_logical_sample_id(logical_name).is_ok() {
+        return Err(format!(
+            "snapshot path {} logical-sample directory {logical_name:?} is invalid",
+            path.display()
+        ));
+    }
+    // `<snapshot_root>`.
+    let root = logical_dir
+        .parent()
+        .ok_or_else(|| format!("snapshot path {} has no snapshot_root", path.display()))?;
+    Ok(ParsedSnapshotPath {
+        snapshot_root: root.to_path_buf(),
+        logical_sample_id: logical_name.to_string(),
+        sha256: sha_name.to_string(),
+        snapshot_path: path.to_path_buf(),
+    })
+}
+
 /// A process-wide monotonic counter used to make temp-file names unique.
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1918,5 +2031,72 @@ mod tests {
         v.resize(base + 40 + 48, 0);
         v[base..base + 8].copy_from_slice(b".text\0\0\0");
         v
+    }
+
+    // ------------------------------------------------------------------
+    // G3-R5: shared snapshot-path contract vectors. This parser must agree with
+    // the independent mida-acceptance verifier's copy (same fixture).
+    // ------------------------------------------------------------------
+
+    /// Load the shared contract vectors and validate `parse_snapshot_path`.
+    #[test]
+    fn shared_snapshot_path_contract_vectors() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("tests/fixtures/snapshot_path_contract.json");
+        let raw = std::fs::read_to_string(&fixture)
+            .unwrap_or_else(|e| panic!("cannot read contract fixture {}: {e}", fixture.display()));
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let real_root = std::env::temp_dir().join("mida_snapshot_path_contract_root");
+        for v in value["vectors"].as_array().unwrap() {
+            let raw_path = v["path"]
+                .as_str()
+                .unwrap()
+                .replace("__ROOT__", &real_root.display().to_string());
+            let expected = v["expected"].as_str().unwrap();
+            let path = std::path::Path::new(&raw_path);
+            let parsed = parse_snapshot_path(path);
+            match expected {
+                "valid" => {
+                    let p =
+                        parsed.unwrap_or_else(|e| panic!("vector {raw_path} should be valid: {e}"));
+                    assert_eq!(
+                        p.logical_sample_id,
+                        v["logical_sample_id"].as_str().unwrap()
+                    );
+                    assert_eq!(p.sha256, v["sha256"].as_str().unwrap());
+                    assert_eq!(p.snapshot_path, path);
+                }
+                "invalid" => {
+                    assert!(parsed.is_err(), "vector {raw_path} must be invalid");
+                }
+                other => panic!("unknown expected {other} in fixture"),
+            }
+        }
+    }
+
+    /// The CLI launch helper's GTO wrapper (`snapshot_root_of_snapshot`) must
+    /// reject a path whose logical-sample directory is not the GTO lane case id.
+    #[test]
+    fn cli_gto_wrapper_rejects_non_gto_logical_dir() {
+        use crate::runner_preflight;
+        let real_root = std::env::temp_dir().join("mida_gto_wrapper_root");
+        let good = real_root
+            .join("gto_launcher")
+            .join("c".repeat(64))
+            .join(SNAPSHOT_FILENAME);
+        // GTO lane logical dir is accepted by the shared parser and the wrapper.
+        let parsed = parse_snapshot_path(&good).unwrap();
+        assert_eq!(parsed.logical_sample_id, "gto_launcher");
+        let (root, hash) = runner_preflight::snapshot_root_of_snapshot(&good).unwrap();
+        assert_eq!(root, real_root);
+        assert_eq!(hash, "c".repeat(64));
+        // A non-GTO logical dir fails the GTO wrapper (though structurally valid).
+        let other = real_root
+            .join("origin_macro")
+            .join("c".repeat(64))
+            .join(SNAPSHOT_FILENAME);
+        assert!(parse_snapshot_path(&other).is_ok());
+        assert!(runner_preflight::snapshot_root_of_snapshot(&other).is_err());
     }
 }

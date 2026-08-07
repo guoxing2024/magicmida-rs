@@ -35,72 +35,23 @@ fn is_64_hex(value: &str) -> bool {
     value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-/// The immutable snapshot file name (must match the CLI producer's
-/// `crate::sample_snapshot::SNAPSHOT_FILENAME`).
-const SNAPSHOT_FILENAME: &str = "snapshot.bin";
-
 /// Validate a GTO immutable snapshot path and return its 64-hex hash directory
-/// component, WITHOUT relying on canonicalization. The path must be absolute,
-/// free of `.`/`..` components, and of the exact shape
-/// `<root>/gto_launcher/<sha256>/snapshot.bin`. The returned hash is
-/// case-preserved so the caller can compare it (case-normalized) against the
-/// sealed `protected_input.sha256`. This runs BEFORE any canonicalize() so a raw
-/// `..` or relative path is rejected even if it would later resolve to the same
-/// file.
+/// component via the shared contract, WITHOUT relying on canonicalization. The
+/// path must be absolute, free of `.`/`..`, of the exact shape
+/// `<root>/gto_launcher/<sha256>/snapshot.bin`, and its logical-sample directory
+/// must be the GTO lane case id. The returned hash is case-preserved so the
+/// caller can compare it (case-normalized) against the sealed
+/// `protected_input.sha256`. This runs BEFORE any canonicalize() so a raw `..` or
+/// relative path is rejected even if it would later resolve to the same file.
 fn gto_snapshot_hash_dir(path: &str) -> Result<String, String> {
-    let p = std::path::Path::new(path);
-    // Absolute path required; a relative path is never a trusted snapshot.
-    if !p.is_absolute() {
-        return Err(format!("GTO snapshot path {path:?} is not absolute"));
-    }
-    // Reject `.`/`..` components lexically (before canonicalization).
-    for comp in p.components() {
-        match comp {
-            std::path::Component::CurDir | std::path::Component::ParentDir => {
-                return Err(format!(
-                    "GTO snapshot path {path:?} contains a relative ({comp:?}) component"
-                ));
-            }
-            _ => {}
-        }
-    }
-    // File name must be snapshot.bin.
-    let name = p
-        .file_name()
-        .and_then(|f| f.to_str())
-        .ok_or_else(|| format!("GTO snapshot path {path:?} has no file name"))?;
-    if name != SNAPSHOT_FILENAME {
+    let parsed = mida_acceptance::snapshot_path::parse_snapshot_path(std::path::Path::new(path))?;
+    if parsed.logical_sample_id != GTO_CASE_ID {
         return Err(format!(
-            "GTO snapshot path {path:?} must end in {SNAPSHOT_FILENAME}"
+            "GTO snapshot logical-sample directory {:?} != {GTO_CASE_ID}",
+            parsed.logical_sample_id
         ));
     }
-    // <sha256> dir.
-    let sha_dir = p
-        .parent()
-        .ok_or_else(|| format!("GTO snapshot path {path:?} has no hash directory"))?;
-    let sha_name = sha_dir
-        .file_name()
-        .and_then(|f| f.to_str())
-        .ok_or_else(|| format!("GTO snapshot path {path:?} hash dir has no name"))?;
-    if !is_64_hex(sha_name) {
-        return Err(format!(
-            "GTO snapshot path hash dir {sha_name:?} is not a 64-hex content address"
-        ));
-    }
-    // case dir must be gto_launcher.
-    let case_dir = sha_dir
-        .parent()
-        .ok_or_else(|| format!("GTO snapshot path {path:?} has no case directory"))?;
-    let case_name = case_dir
-        .file_name()
-        .and_then(|f| f.to_str())
-        .ok_or_else(|| format!("GTO snapshot path {path:?} case dir has no name"))?;
-    if case_name != GTO_CASE_ID {
-        return Err(format!(
-            "GTO snapshot case directory {case_name:?} != {GTO_CASE_ID}"
-        ));
-    }
-    Ok(sha_name.to_string())
+    Ok(parsed.sha256)
 }
 
 /// Read the `case_id` from a `mida.case-manifest/v2` (best-effort; empty when

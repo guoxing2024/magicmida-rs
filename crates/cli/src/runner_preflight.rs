@@ -1013,68 +1013,27 @@ pub fn canonicalize_loose(p: &Path) -> PathBuf {
 /// Derive the controlled snapshot_root and the 64-hex hash directory from a GTO
 /// immutable snapshot path of the exact shape
 /// `<root>/<case_id>/<sha256>/snapshot.bin`. Returns `(snapshot_root, hash_dir)`.
-/// Rejects malformed, non-canonical, relative, `..`/`.`-containing, or otherwise
+///
+/// This delegates to the shared `sample_snapshot::parse_snapshot_path` contract
+/// (absolute, no `.`/`..`, exact filename, 64-lowercase-hex hash directory) and
+/// then requires the logical-sample directory to be the GTO lane case id. It
+/// rejects malformed, non-canonical, relative, `..`/`.`-containing, or otherwise
 /// non-snapshot paths so a caller cannot smuggle a path outside the snapshot
 /// store.
-fn snapshot_root_of_snapshot(snapshot_path: &Path) -> anyhow::Result<(PathBuf, String)> {
-    use crate::sample_snapshot::SNAPSHOT_FILENAME;
-    // A trusted snapshot path must be absolute; a relative path cannot be a
-    // stable content-addressed address and is refused.
-    if !snapshot_path.is_absolute() {
-        bail!(
-            "GTO protected input {} is not an absolute path",
+pub(crate) fn snapshot_root_of_snapshot(snapshot_path: &Path) -> anyhow::Result<(PathBuf, String)> {
+    let parsed = crate::sample_snapshot::parse_snapshot_path(snapshot_path).map_err(|e| {
+        anyhow::anyhow!(
+            "GTO protected input {} invalid: {e}",
             snapshot_path.display()
+        )
+    })?;
+    if parsed.logical_sample_id != GTO_CASE_ID {
+        bail!(
+            "GTO snapshot case directory {:?} != {GTO_CASE_ID}",
+            parsed.logical_sample_id
         );
     }
-    // Reject any `.` / `..` component lexically: canonicalization elsewhere may
-    // resolve them, but a sealed snapshot address must never contain them.
-    for comp in snapshot_path.components() {
-        match comp {
-            std::path::Component::CurDir | std::path::Component::ParentDir => {
-                bail!(
-                    "GTO protected input {} contains a relative ({:?}) component",
-                    snapshot_path.display(),
-                    comp
-                );
-            }
-            _ => {}
-        }
-    }
-    let name = snapshot_path
-        .file_name()
-        .and_then(|f| f.to_str())
-        .ok_or_else(|| anyhow!("GTO snapshot path has no file name"))?;
-    if name != SNAPSHOT_FILENAME {
-        bail!(
-            "GTO protected input {} must end in {SNAPSHOT_FILENAME}",
-            snapshot_path.display()
-        );
-    }
-    // Components from the leaf up: snapshot.bin / <sha256> / <case_id> / <root>.
-    let sha_dir = snapshot_path
-        .parent()
-        .ok_or_else(|| anyhow!("GTO snapshot path has no hash directory"))?;
-    let sha_name = sha_dir
-        .file_name()
-        .and_then(|f| f.to_str())
-        .ok_or_else(|| anyhow!("GTO snapshot hash directory has no name"))?;
-    if sha_name.len() != 64 || !sha_name.bytes().all(|b| b.is_ascii_hexdigit()) {
-        bail!("GTO snapshot hash directory {sha_name:?} is not a 64-hex content address");
-    }
-    let case_dir = sha_dir
-        .parent()
-        .ok_or_else(|| anyhow!("GTO snapshot path has no case directory"))?;
-    let case_name = case_dir
-        .file_name()
-        .and_then(|f| f.to_str())
-        .ok_or_else(|| anyhow!("GTO snapshot case directory has no name"))?;
-    if case_name != GTO_CASE_ID {
-        bail!("GTO snapshot case directory {case_name:?} != {GTO_CASE_ID}");
-    }
-    let root = case_dir
-        .parent()
-        .ok_or_else(|| anyhow!("GTO snapshot path has no snapshot_root"))?;
-    Ok((root.to_path_buf(), sha_name.to_string()))
+    Ok((parsed.snapshot_root, parsed.sha256))
 }
 
 /// G3-R3-R1 GTO launch path binding. For the GTO lane the launch attestation

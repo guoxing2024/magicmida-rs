@@ -822,65 +822,32 @@ fn is_known_family(family: &str) -> bool {
 }
 
 /// Validate that a snapshot path has the exact content-addressed structure
-/// `<root>/<logical_sample_id>/<sha256>/snapshot.bin`: absolute, free of `.`/`..`,
-/// correct filename, correct 64-hex hash directory (== `sha256`), and correct
-/// case directory (== `logical_sample_id`). This reuses the same structural rules
-/// as `sample_snapshot`'s content-address layout (and the CLI launch helper) so
-/// no divergent path-parsing is introduced.
+/// `<root>/<logical_sample_id>/<sha256>/snapshot.bin`, delegating to the shared
+/// `sample_snapshot::parse_snapshot_path` contract and then cross-checking the
+/// parsed logical id and hash against the expected ones. This is the single
+/// shared path parser inside `mida-cli` (authority dossier and the launch helper
+/// both use it); it is validated against the same contract vectors as the
+/// independent acceptance verifier's minimal copy.
 fn validate_snapshot_path(
     path: &Path,
     logical_sample_id: &str,
     sha256: &str,
 ) -> Result<(), String> {
-    if !path.is_absolute() {
-        return Err(format!("snapshot path {} is not absolute", path.display()));
-    }
-    for comp in path.components() {
-        match comp {
-            std::path::Component::CurDir | std::path::Component::ParentDir => {
-                return Err(format!(
-                    "snapshot path {} contains a relative ({comp:?}) component",
-                    path.display()
-                ));
-            }
-            _ => {}
-        }
-    }
-    if path.file_name().and_then(|f| f.to_str()) != Some(sample_snapshot::SNAPSHOT_FILENAME) {
+    let parsed = sample_snapshot::parse_snapshot_path(path)?;
+    if parsed.logical_sample_id != logical_sample_id {
         return Err(format!(
-            "snapshot path {} must end in {}",
+            "snapshot path {} logical-sample directory {:?} != expected logical_sample_id {:?}",
             path.display(),
-            sample_snapshot::SNAPSHOT_FILENAME
+            parsed.logical_sample_id,
+            logical_sample_id
         ));
     }
-    let sha_dir = path
-        .parent()
-        .ok_or_else(|| format!("snapshot path {} has no hash directory", path.display()))?;
-    let sha_name = sha_dir
-        .file_name()
-        .and_then(|f| f.to_str())
-        .ok_or_else(|| format!("snapshot path {} hash dir has no name", path.display()))?;
-    if !sha_name.eq_ignore_ascii_case(sha256) || !sample_snapshot::validate_hash(sha_name).is_ok() {
+    if !parsed.sha256.eq_ignore_ascii_case(sha256) {
         return Err(format!(
             "snapshot path {} hash directory {:?} does not match sha256 {}",
             path.display(),
-            sha_name,
+            parsed.sha256,
             sha256
-        ));
-    }
-    let case_dir = sha_dir
-        .parent()
-        .ok_or_else(|| format!("snapshot path {} has no case directory", path.display()))?;
-    let case_name = case_dir
-        .file_name()
-        .and_then(|f| f.to_str())
-        .ok_or_else(|| format!("snapshot path {} case dir has no name", path.display()))?;
-    if case_name != logical_sample_id {
-        return Err(format!(
-            "snapshot path {} case directory {:?} != logical_sample_id {:?}",
-            path.display(),
-            case_name,
-            logical_sample_id
         ));
     }
     Ok(())

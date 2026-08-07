@@ -1,0 +1,17 @@
+{
+  "schema": "mida.snapshot-path-contract/v1",
+  "description": "Canonical content-addressed snapshot path contract vectors. Layout: <snapshot_root>/<logical_sample_id>/<sha256>/snapshot.bin. Each vector's path uses __ROOT__ as a placeholder for a real absolute snapshot root (tests substitute it). Both mida-cli::sample_snapshot::parse_snapshot_path and the independent mida-acceptance verifier's parse_snapshot_path MUST agree on every vector; they implement the same contract. The hash directory must be exactly 64 LOWERCASE hex (uppercase is rejected). GTO-lane / dossier-specific logical-id checks are enforced by the callers on top of this structural contract.",
+  "vectors": [
+    { "path": "__ROOT__/gto_launcher/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc/snapshot.bin", "expected": "valid", "logical_sample_id": "gto_launcher", "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" },
+    { "path": "__ROOT__/origin_macro/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc/snapshot.bin", "expected": "valid", "logical_sample_id": "origin_macro", "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" },
+    { "path": "__ROOT__/not_a_lane/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc/snapshot.bin", "expected": "valid", "logical_sample_id": "not_a_lane", "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" },
+    { "path": "C:/gto_launcher/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc/snapshot.bin", "expected": "valid", "logical_sample_id": "gto_launcher", "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" },
+    { "path": "relative/gto_launcher/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc/snapshot.bin", "expected": "invalid", "logical_sample_id": "", "sha256": "" },
+    { "path": "__ROOT__/../outside/gto_launcher/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc/snapshot.bin", "expected": "invalid", "logical_sample_id": "", "sha256": "" },
+    { "path": "__ROOT__/gto_launcher/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc/other.bin", "expected": "invalid", "logical_sample_id": "", "sha256": "" },
+    { "path": "__ROOT__/gto_launcher/not-a-hash/snapshot.bin", "expected": "invalid", "logical_sample_id": "", "sha256": "" },
+    { "path": "__ROOT__/gto_launcher/short/snapshot.bin", "expected": "invalid", "logical_sample_id": "", "sha256": "" },
+    { "path": "__ROOT__/gto_launcher/CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC/snapshot.bin", "expected": "invalid", "logical_sample_id": "", "sha256": "" },
+    { "path": "__ROOT__/gto_launcher/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/snapshot.bin", "expected": "valid", "logical_sample_id": "gto_launcher", "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+  ]
+}

@@ -25,6 +25,7 @@ pub mod oracle;
 pub mod pe;
 pub mod preflight;
 pub mod report;
+pub mod snapshot_path;
 pub mod survival_structural_evidence;
 pub mod verdict;
 
