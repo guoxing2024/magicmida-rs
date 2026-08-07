@@ -284,14 +284,24 @@ pub fn canonical_verify_snapshot_path(
     Ok(canonical_parsed)
 }
 
-/// Compare two paths as equivalent after normalizing the Windows `\\?\` prefix
-/// and case (used to detect a trusted root that is itself a reparse alias).
-fn paths_equivalent(a: &Path, b: &Path) -> bool {
+/// Compare two paths as equivalent after prefix-aware normalization and
+/// case-insensitive comparison (used to detect a trusted root that is itself a
+/// reparse alias and to cross-check caller vs sealed roots).
+///
+/// Only a LEADING Windows extended-length prefix is stripped: `\\?\D:\...` ->
+/// `D:\...`, `\\?\UNC\server\share` -> `\\server\share`, and `\\.\` device paths
+/// are left as-is (not a valid snapshot root anyway). No mid-path replacement is
+/// performed, so a literal `\\?\` in a component name is preserved.
+pub fn paths_equivalent(a: &Path, b: &Path) -> bool {
     fn norm(p: &Path) -> String {
-        let s = p
-            .to_string_lossy()
-            .replace("\\\\?\\", "")
-            .replace("\\??", "");
+        let raw = p.to_string_lossy().into_owned();
+        let s = if let Some(rest) = raw.strip_prefix("\\\\?\\UNC\\") {
+            format!("\\\\{rest}")
+        } else if let Some(rest) = raw.strip_prefix("\\\\?\\") {
+            rest.to_string()
+        } else {
+            raw
+        };
         s.to_lowercase()
     }
     norm(a) == norm(b)
@@ -2480,5 +2490,37 @@ mod tests {
             "a trusted-root mismatch must be rejected: {err}"
         );
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Prefix-aware path equivalence: extended-length / UNC forms normalize to
+    /// the same path as their plain drive / UNC counterparts, but genuinely
+    /// different paths are NOT equivalent.
+    #[test]
+    fn paths_equivalent_unc_and_extended_prefix_vectors() {
+        // \\?\D:\snapshots  ==  D:\snapshots
+        assert!(paths_equivalent(
+            Path::new("\\\\?\\D:\\snapshots"),
+            Path::new("D:\\snapshots")
+        ));
+        // \\?\UNC\server\share  ==  \\server\share
+        assert!(paths_equivalent(
+            Path::new("\\\\?\\UNC\\server\\share"),
+            Path::new("\\\\server\\share")
+        ));
+        // case-insensitive
+        assert!(paths_equivalent(
+            Path::new("D:\\SnapShots"),
+            Path::new("d:\\snapshots")
+        ));
+        // a mid-path literal "\\?\" is NOT stripped (prefix-aware)
+        assert!(!paths_equivalent(
+            Path::new("D:\\snapshots\\x\\\\?\\y"),
+            Path::new("D:\\snapshots\\x\\y")
+        ));
+        // genuinely different paths are not equivalent
+        assert!(!paths_equivalent(
+            Path::new("D:\\snapshots"),
+            Path::new("E:\\snapshots")
+        ));
     }
 }

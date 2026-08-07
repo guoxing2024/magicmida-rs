@@ -210,11 +210,13 @@ pub fn unpack(
                  input: {reason}"
             ));
         }
+        let snapshot_root = preflight_dir.join(crate::commands::GTO_SNAPSHOT_DIRNAME);
         let launch_ctx = crate::runner_preflight::LaunchAttestationContext {
             input,
             output: &output_path,
             cli_binary: &cli_binary,
             runner_config: &actual_config,
+            snapshot_root: &snapshot_root,
         };
         // The attestation binds the ENVELOPE's family (staging-sealed) into
         // the single-use evidence context — never a caller-supplied or

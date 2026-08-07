@@ -249,14 +249,22 @@ pub fn canonical_verify_snapshot_path(
     Ok(canonical_parsed)
 }
 
-/// Compare two paths as equivalent after normalizing the Windows `\\?\` prefix
-/// and case (used to detect a trusted root that is itself a reparse alias).
-fn paths_equivalent(a: &Path, b: &Path) -> bool {
+/// Compare two paths as equivalent after prefix-aware normalization and
+/// case-insensitive comparison (mirror of `mida-cli::sample_snapshot::paths_equivalent`).
+///
+/// Only a LEADING Windows extended-length prefix is stripped: `\\?\D:\...` ->
+/// `D:\...`, `\\?\UNC\server\share` -> `\\server\share`, and `\\.\` device paths
+/// are left as-is. No mid-path replacement is performed.
+pub fn paths_equivalent(a: &Path, b: &Path) -> bool {
     fn norm(p: &Path) -> String {
-        let s = p
-            .to_string_lossy()
-            .replace("\\\\?\\", "")
-            .replace("\\??", "");
+        let raw = p.to_string_lossy().into_owned();
+        let s = if let Some(rest) = raw.strip_prefix("\\\\?\\UNC\\") {
+            format!("\\\\{rest}")
+        } else if let Some(rest) = raw.strip_prefix("\\\\?\\") {
+            rest.to_string()
+        } else {
+            raw
+        };
         s.to_lowercase()
     }
     norm(a) == norm(b)

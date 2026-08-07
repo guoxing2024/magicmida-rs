@@ -545,3 +545,43 @@ vectors cover the lexical-shape cases; the trusted-root containment cases
 deterministic junction tests in both the CLI and the acceptance verifier.
 Oreans live-input / `protected_input_path=None` / v2/v8 gate and the GTO
 generic/no-gate contract are unchanged.
+
+## 21. Trusted snapshot-root end-to-end propagation (G3-R5-R1-R1-R1)
+
+The trusted snapshot root now flows verbatim through all four stages, with a
+single source of truth:
+
+- **staging** (`run_offline_preflight_command_with_snapshot_root`): the caller's
+  `snapshot_root` is passed unchanged to `prepare_offline_preflight_staging` and
+  `run_offline_preflight` (never re-derived as `output_dir/sample-snapshots`).
+  The default `run_offline_preflight_command` still explicitly selects
+  `<output_dir>/sample-snapshots`; the custom-root API supports a durable store
+  outside `output_dir`.
+- **first verifier** (`run_offline_preflight`): passes the caller `snapshot_root`
+  as `--snapshot-root` to the acceptance binary.
+- **launch attestation** (`attest_ready_before_launch`): uses
+  `ctx.snapshot_root` (added to `LaunchAttestationContext`). A sealed+caller
+  cross-check requires the caller root to match the root embedded in the sealed
+  protected_input_path; a staging/launch root mismatch fails closed (never
+  derived from the path, never silently reverted to default).
+- **second verifier** (`rerun_verifier`): uses `ctx.snapshot_root` for
+  `--snapshot-root`.
+
+**Acceptance `--snapshot-root` is optional** and required ONLY when a GTO case
+is present: an Oreans-only envelope runs the legacy live-input lane without it,
+and a GTO case without it fails closed per-case (`identity_ok=false` with a
+missing-root reason); the root is never guessed from the sealed path, the actual
+input, or the output dir.
+
+**Prefix-aware path normalization** (`paths_equivalent`) strips only a LEADING
+Windows extended-length/UNC prefix (`\?\D:\` -> `D:\`, `\?\UNC\server\share`
+-> `\server\share`), never a mid-path literal, and compares case-insensitively;
+CLI and acceptance mirror it.
+
+Tests: custom_snapshot_root_is_used_for_staging (CLI), the acceptance
+gto_present_without_snapshot_root_rejected and
+oreans_only_without_snapshot_root_compatible (real binary),
+paths_equivalent_unc_and_extended_prefix_vectors (CLI + acceptance), and the
+existing default-root / junction / live-source regressions stay green.
+Oreans live-input / `protected_input_path=None` / v2/v8 gate and GTO
+generic/no-gate are unchanged.

@@ -170,6 +170,7 @@ pub fn run_offline_preflight_command_with_snapshot_root(
         repo_root,
         toolchain_pin_file,
         expected_toolchain,
+        snapshot_root,
     )?;
     if !ready {
         return Err(crate::unpacker::GenericGateFailure {
@@ -1189,5 +1190,48 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mida_g3r3_{tag}_{}_{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// G3-R5-R1-R1-R1: a CUSTOM snapshot root (outside the default
+    /// `<output_dir>/sample-snapshots`) is honored by staging — the staged GTO
+    /// immutable snapshot path is under the custom root, never the default.
+    #[test]
+    fn custom_snapshot_root_is_used_for_staging() {
+        let root = temp_root("custom_root_staging");
+        let src = root.join("launcher.bin");
+        let src_bytes = b"CUSTOM-ROOT-PROTECTED-INPUT";
+        std::fs::write(&src, src_bytes).unwrap();
+        let want_sha = crate::sample_snapshot::sha256_hex(src_bytes);
+        let want_size = src_bytes.len() as u64;
+        let manifest = write_gto_manifest(&root.join("gto_launcher.json"), &want_sha, want_size);
+        // The custom root is OUTSIDE the default output-dir/sample-snapshots.
+        let custom_root = root.join("custom_durable_store");
+        let cases = full_cases(root.as_path(), &manifest, &src, 0x11, 0x22);
+
+        let prepared = prepare_offline_preflight_staging(
+            &custom_root,
+            &cases,
+            "CLI-SHA",
+            "rev",
+            "verifier",
+            "VSHA",
+            &mut *real_capture(),
+            &mut *noop_after(),
+        )
+        .unwrap();
+        // The GTO staged protected input must be under the CUSTOM root.
+        let gto_staged = &prepared.cases[2].1;
+        assert!(
+            gto_staged.starts_with(&custom_root),
+            "GTO staged input must be under the custom root, got {}",
+            gto_staged.display()
+        );
+        assert!(
+            !gto_staged.starts_with(&snapshot_root(root.as_path())),
+            "GTO staged input must NOT be under the default output-dir/sample-snapshots"
+        );
+        // The Oreans staged inputs remain their caller sources (not snapshotted).
+        assert!(!prepared.cases[0].1.starts_with(&custom_root));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -72,3 +72,32 @@ fn acceptance_gto_wrapper_rejects_non_gto_logical_dir() {
     assert_eq!(parsed_other.logical_sample_id, "origin_macro");
     assert_ne!(parsed_other.logical_sample_id, "gto_launcher");
 }
+
+/// The acceptance `paths_equivalent` must agree with the CLI's on UNC /
+/// extended-length prefix normalization.
+#[test]
+fn paths_equivalent_unc_and_extended_prefix_vectors() {
+    use mida_acceptance::snapshot_path::paths_equivalent;
+    use std::path::Path;
+    assert!(paths_equivalent(
+        Path::new("\\\\?\\D:\\snapshots"),
+        Path::new("D:\\snapshots")
+    ));
+    assert!(paths_equivalent(
+        Path::new("\\\\?\\UNC\\server\\share"),
+        Path::new("\\\\server\\share")
+    ));
+    assert!(paths_equivalent(
+        Path::new("D:\\SnapShots"),
+        Path::new("d:\\snapshots")
+    ));
+    // prefix-aware: a mid-path literal "\\?\" is not stripped
+    assert!(!paths_equivalent(
+        Path::new("D:\\snapshots\\x\\\\?\\y"),
+        Path::new("D:\\snapshots\\x\\y")
+    ));
+    assert!(!paths_equivalent(
+        Path::new("D:\\snapshots"),
+        Path::new("E:\\snapshots")
+    ));
+}

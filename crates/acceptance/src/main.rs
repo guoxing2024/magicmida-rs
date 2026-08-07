@@ -1401,11 +1401,14 @@ fn cmd_preflight(args: &[String]) -> Result<i32, String> {
 
     let envelope_path = envelope_path.ok_or("Missing --envelope <path>.")?;
     let output_dir = output_dir.ok_or("Missing --output-dir <dir>.")?;
-    let snapshot_root = snapshot_root.ok_or("Missing --snapshot-root <dir>.")?;
     let cli_binary = cli_binary.ok_or("Missing --cli-binary <path>.")?;
     let repo_root = repo_root.ok_or("Missing --repo-root <path>.")?;
     let toolchain_pin = toolchain_pin.ok_or("Missing --toolchain-pin <path>.")?;
     let expected_toolchain = expected_toolchain.ok_or("Missing --expected-toolchain <ver>.")?;
+    // `--snapshot-root` is OPTIONAL and only required when a GTO case is present
+    // (Oreans-only envelopes run the legacy live-input lane without it). A GTO
+    // case without it fails closed per-case; the root is never guessed from the
+    // sealed path, the actual input, or the output dir.
 
     let envelope_bytes = fs::read(&envelope_path)
         .map_err(|e| format!("cannot read envelope {}: {e}", envelope_path.display()))?;
@@ -1785,7 +1788,17 @@ fn cmd_preflight(args: &[String]) -> Result<i32, String> {
             );
             continue;
         };
-        match bind_gto_actual_input_to_sealed(input, env_gto, &snapshot_root) {
+        let Some(trusted_snapshot_root) = snapshot_root.as_deref() else {
+            // A GTO case is present but `--snapshot-root` was not supplied:
+            // fail-closed per-case (never guess the root from the sealed path,
+            // actual input, or output dir).
+            gto_path_binding_failures.insert(
+                GTO_CASE_ID.to_string(),
+                "GTO case present but --snapshot-root was not provided".to_string(),
+            );
+            continue;
+        };
+        match bind_gto_actual_input_to_sealed(input, env_gto, trusted_snapshot_root) {
             Ok(sealed) => {
                 gto_protected_input_path.insert(GTO_CASE_ID.to_string(), sealed);
             }

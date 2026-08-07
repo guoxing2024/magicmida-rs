@@ -619,6 +619,7 @@ pub fn run_offline_preflight(
     repo_root: &Path,
     toolchain_pin_file: &Path,
     expected_toolchain: &str,
+    snapshot_root: &Path,
 ) -> anyhow::Result<bool> {
     let (verifier, _) = resolve_verifier_identity()?;
     // P6.3-C: fail-closed reuse — first creation only when the file is
@@ -644,7 +645,7 @@ pub fn run_offline_preflight(
         .arg("--output-dir")
         .arg(output_dir)
         .arg("--snapshot-root")
-        .arg(output_dir.join(crate::commands::GTO_SNAPSHOT_DIRNAME))
+        .arg(snapshot_root)
         .arg("--cli-binary")
         .arg(cli_binary)
         .arg("--repo-root")
@@ -830,6 +831,11 @@ pub struct LaunchAttestationContext<'a> {
     pub cli_binary: &'a Path,
     /// The ACTUAL runner config built from the parsed `/unpack` arguments.
     pub runner_config: &'a mida_core::runner_config::RunnerConfig,
+    /// The TRUSTED immutable-snapshot root for this launch, provided by the
+    /// caller (the same root used at staging). It is NOT derived from the sealed
+    /// protected_input_path; it is cross-checked against the sealed path's root
+    /// so a staging/launch root mismatch fails closed.
+    pub snapshot_root: &'a Path,
 }
 
 /// The unique evidence context produced by a successful launch attestation
@@ -1225,17 +1231,39 @@ pub fn attest_ready_before_launch(
     // The GTO protected input must be the exact immutable snapshot.bin sealed at
     // staging (under snapshot_root), never a live dynamic source — even one with
     // identical bytes/hash. Oreans fixed cases keep their live-input lane and are
-    // not path-bound. The trusted snapshot_root is the controlled store below the
-    // preflight output dir (caller-provided anchor, NOT derived from the sealed
-    // path).
+    // not path-bound. The trusted snapshot_root is the CALLER-provided anchor
+    // (`ctx.snapshot_root`, the same root used at staging), NOT derived from the
+    // sealed path. A sealed+caller cross-check requires the caller root to match
+    // the sealed path's lexical root, so a staging/launch root mismatch fails
+    // closed.
     if target_case_id == GTO_CASE_ID {
-        let trusted_snapshot_root = output_dir.join(crate::commands::GTO_SNAPSHOT_DIRNAME);
+        let trusted_snapshot_root = ctx.snapshot_root;
+        // Sealed+caller cross-check: the caller's trusted root must lexically
+        // match the root embedded in the sealed protected_input_path.
+        let sealed_root = crate::sample_snapshot::parse_snapshot_path(Path::new(
+            &matches[0].protected_input_path,
+        ))
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "sealed GTO path {} invalid: {e}",
+                matches[0].protected_input_path
+            )
+        })?
+        .snapshot_root;
+        if !crate::sample_snapshot::paths_equivalent(&sealed_root, trusted_snapshot_root) {
+            bail!(
+                "GTO launch trusted snapshot_root {} does not match the sealed path root {} \
+                 (staging/launch root mismatch; fail-closed)",
+                trusted_snapshot_root.display(),
+                sealed_root.display()
+            );
+        }
         enforce_gto_snapshot_path_binding(
             &envelope,
             matches[0],
             &current_identity,
             ctx,
-            &trusted_snapshot_root,
+            trusted_snapshot_root,
         )?;
     }
 
@@ -1463,7 +1491,7 @@ fn rerun_verifier(
         .arg("--output-dir")
         .arg(output_dir)
         .arg("--snapshot-root")
-        .arg(output_dir.join(crate::commands::GTO_SNAPSHOT_DIRNAME))
+        .arg(ctx.snapshot_root)
         .arg("--cli-binary")
         .arg(ctx.cli_binary)
         .arg("--repo-root")
@@ -2759,6 +2787,7 @@ mod tests {
     /// config owned by the caller.
     fn launch_ctx<'a>(
         input: &'a Path,
+        snapshot_root: &'a Path,
         config: &'a mida_core::runner_config::RunnerConfig,
     ) -> LaunchAttestationContext<'a> {
         LaunchAttestationContext {
@@ -2766,6 +2795,7 @@ mod tests {
             output: Path::new("C:\\dummy\\out\\candidate.exe"),
             cli_binary: Path::new("C:\\dummy\\mida-cli.exe"),
             runner_config: config,
+            snapshot_root,
         }
     }
 
@@ -2817,7 +2847,7 @@ mod tests {
         let env = gto_envelope_with_path(Some(&snap_str));
         let report_case = gto_report_case(&snap_str);
         let cfg = gto_runner_config();
-        let ctx = launch_ctx(&snap_path, &cfg);
+        let ctx = launch_ctx(&snap_path, &root, &cfg);
         let ident = gto_identity();
 
         // A correct snapshot path with matching identity passes the binding.
@@ -2852,7 +2882,7 @@ mod tests {
         std::fs::create_dir_all(live.parent().unwrap()).unwrap();
         std::fs::write(&live, b"G3-R3-R1-SNAPSHOT-PAYLOAD").unwrap();
         let cfg = gto_runner_config();
-        let ctx = launch_ctx(&live, &cfg);
+        let ctx = launch_ctx(&live, &root, &cfg);
         let err =
             enforce_gto_snapshot_path_binding(&env, &report_case, &ident, &ctx, &root).unwrap_err();
         assert!(
@@ -2885,7 +2915,7 @@ mod tests {
         std::fs::create_dir_all(live.parent().unwrap()).unwrap();
         std::fs::write(&live, b"DIFFERENT-PAYLOAD-AFTER-PREFLIGHT").unwrap();
         let cfg = gto_runner_config();
-        let ctx = launch_ctx(&live, &cfg);
+        let ctx = launch_ctx(&live, &root, &cfg);
         let err =
             enforce_gto_snapshot_path_binding(&env, &report_case, &ident, &ctx, &root).unwrap_err();
         assert!(
@@ -2934,7 +2964,7 @@ mod tests {
                 let _ = std::fs::create_dir_all(inp.parent().unwrap());
             }
             let _ = std::fs::write(inp, b"G3-R3-R1-SNAPSHOT-PAYLOAD");
-            let ctx = launch_ctx(inp, &cfg);
+            let ctx = launch_ctx(inp, &root, &cfg);
             let err = enforce_gto_snapshot_path_binding(&env, &report_case, &ident, &ctx, &root)
                 .unwrap_err();
             let msg = format!("{err:#}");
@@ -3021,7 +3051,7 @@ mod tests {
                     // The junction path is not a well-formed content-addressed
                     // address (no logical/hash layers), so the launch helper must
                     // fail closed on it.
-                    let ctx = launch_ctx(&junction_snap, &cfg);
+                    let ctx = launch_ctx(&junction_snap, &root, &cfg);
                     let err =
                         enforce_gto_snapshot_path_binding(&env, &report_case, &ident, &ctx, &root)
                             .unwrap_err();
@@ -3052,7 +3082,7 @@ mod tests {
             .join(crate::sample_snapshot::SNAPSHOT_FILENAME);
         std::fs::create_dir_all(sibling.parent().unwrap()).unwrap();
         std::fs::write(&sibling, b"G3-R3-R1-SNAPSHOT-PAYLOAD").unwrap();
-        let ctx = launch_ctx(&sibling, &cfg);
+        let ctx = launch_ctx(&sibling, &root, &cfg);
         let err =
             enforce_gto_snapshot_path_binding(&env, &report_case, &ident, &ctx, &root).unwrap_err();
         assert!(
@@ -3083,7 +3113,7 @@ mod tests {
         std::fs::write(&tampered, b"G3-R3-R1-SNAPSHOT-PAYLOAD").unwrap();
         let report_case = gto_report_case(&tampered.to_string_lossy());
         let cfg = gto_runner_config();
-        let ctx = launch_ctx(&snap_path, &cfg);
+        let ctx = launch_ctx(&snap_path, &root, &cfg);
         let err =
             enforce_gto_snapshot_path_binding(&env, &report_case, &ident, &ctx, &root).unwrap_err();
         assert!(
@@ -3308,7 +3338,7 @@ mod tests {
         let report_case = gto_report_case(&raw_dotdot);
         let ident = gto_identity();
         let cfg = gto_runner_config();
-        let ctx = launch_ctx(&snap_path, &cfg);
+        let ctx = launch_ctx(&snap_path, &root, &cfg);
         let err =
             enforce_gto_snapshot_path_binding(&env, &report_case, &ident, &ctx, &root).unwrap_err();
         assert!(

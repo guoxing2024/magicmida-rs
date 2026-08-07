@@ -314,6 +314,56 @@ fn run_verifier(
         .expect("spawn acceptance binary")
 }
 
+/// Invoke the acceptance binary WITHOUT `--snapshot-root` (to prove Oreans-only
+/// compatibility / GTO fail-closed when the root is omitted).
+fn run_verifier_without_snapshot_root(
+    dir: &Path,
+    envelope: &serde_json::Value,
+    gto_manifest: &Path,
+    gto_input: &Path,
+) -> Output {
+    let envelope_path = dir.join("runner-config-envelope.json");
+    fs::write(&envelope_path, serde_json::to_vec_pretty(envelope).unwrap()).unwrap();
+    fs::write(dir.join("input_origin.bin"), b"ORIGIN-SYNTHETIC-INPUT").unwrap();
+    fs::write(dir.join("input_lunlun.bin"), b"LUNLUN-SYNTHETIC-INPUT").unwrap();
+    let cli = fake_cli_binary(dir);
+    let args = vec![
+        "preflight".to_string(),
+        "--envelope".to_string(),
+        envelope_path.display().to_string(),
+        "--output-dir".to_string(),
+        dir.display().to_string(),
+        "--cli-binary".to_string(),
+        cli.display().to_string(),
+        "--repo-root".to_string(),
+        workspace_root().display().to_string(),
+        "--toolchain-pin".to_string(),
+        workspace_root()
+            .join("rust-toolchain.toml")
+            .display()
+            .to_string(),
+        "--expected-toolchain".to_string(),
+        "1.97.1".to_string(),
+        "--case".to_string(),
+        real_manifest("origin_macro").display().to_string(),
+        dir.join("input_origin.bin").display().to_string(),
+        dir.join("origin_candidate.exe").display().to_string(),
+        "--case".to_string(),
+        real_manifest("lunlun_software").display().to_string(),
+        dir.join("input_lunlun.bin").display().to_string(),
+        dir.join("lunlun_candidate.exe").display().to_string(),
+        "--case".to_string(),
+        gto_manifest.display().to_string(),
+        gto_input.display().to_string(),
+        dir.join("gto_candidate.exe").display().to_string(),
+    ];
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    Command::new(acceptance_bin())
+        .args(&arg_refs)
+        .output()
+        .expect("spawn acceptance binary")
+}
+
 /// A generic `--case` triple: (manifest, input, output).
 type CaseTriple = (PathBuf, PathBuf, PathBuf);
 
@@ -996,6 +1046,110 @@ fn acceptance_root_junction_alias_to_valid_tree_identity_ok_false() {
             || r.contains("reparse")
             || r.contains("junction")),
         "GTO case reasons must cite the root path-binding failure: {gto}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// G3-R5-R1-R1-R1: a GTO case present without `--snapshot-root` must fail
+/// closed per-case (never guess the root).
+#[test]
+fn gto_present_without_snapshot_root_rejected() {
+    let dir = temp_dir("gto_no_snapshot_root");
+    let (envelope, _manifest, snap_path, _sha, _size) = setup_positive(&dir);
+    let out = run_verifier_without_snapshot_root(
+        &dir,
+        &envelope,
+        &dir.join("gto_launcher.json"),
+        &snap_path,
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "expected NotReady: {stderr}");
+    let report = read_report(&dir);
+    let gto = gto_report_case(&report);
+    assert_eq!(
+        gto["identity_ok"].as_bool(),
+        Some(false),
+        "GTO without --snapshot-root must be identity_ok=false: {gto}"
+    );
+    let reasons: Vec<&str> = gto["reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_str().unwrap())
+        .collect();
+    assert!(
+        reasons
+            .iter()
+            .any(|r| r.contains("--snapshot-root") || r.contains("path")),
+        "GTO reasons must cite the missing snapshot root: {gto}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// G3-R5-R1-R1-R1: an Oreans-only envelope WITHOUT `--snapshot-root` must still
+/// run the legacy live-input verification (no GTO case -> no root required).
+#[test]
+fn oreans_only_without_snapshot_root_compatible() {
+    let dir = temp_dir("oreans_no_snapshot_root");
+    let envelope = oreans_only_envelope();
+    let envelope_path = dir.join("runner-config-envelope.json");
+    fs::write(
+        &envelope_path,
+        serde_json::to_vec_pretty(&envelope).unwrap(),
+    )
+    .unwrap();
+    fs::write(dir.join("input_origin.bin"), b"ORIGIN-SYNTHETIC-INPUT").unwrap();
+    fs::write(dir.join("input_lunlun.bin"), b"LUNLUN-SYNTHETIC-INPUT").unwrap();
+    let cli = fake_cli_binary(&dir);
+    let args = vec![
+        "preflight".to_string(),
+        "--envelope".to_string(),
+        envelope_path.display().to_string(),
+        "--output-dir".to_string(),
+        dir.display().to_string(),
+        "--cli-binary".to_string(),
+        cli.display().to_string(),
+        "--repo-root".to_string(),
+        workspace_root().display().to_string(),
+        "--toolchain-pin".to_string(),
+        workspace_root()
+            .join("rust-toolchain.toml")
+            .display()
+            .to_string(),
+        "--expected-toolchain".to_string(),
+        "1.97.1".to_string(),
+        "--case".to_string(),
+        real_manifest("origin_macro").display().to_string(),
+        dir.join("input_origin.bin").display().to_string(),
+        dir.join("origin_candidate.exe").display().to_string(),
+        "--case".to_string(),
+        real_manifest("lunlun_software").display().to_string(),
+        dir.join("input_lunlun.bin").display().to_string(),
+        dir.join("lunlun_candidate.exe").display().to_string(),
+    ];
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = Command::new(acceptance_bin())
+        .args(&arg_refs)
+        .output()
+        .expect("spawn acceptance binary");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // Oreans-only runs the legacy live-input verification WITHOUT --snapshot-root;
+    // overall NotReady is expected (synthetic files), but there is no config
+    // error about a missing snapshot root.
+    assert_eq!(out.status.code(), Some(2), "expected NotReady: {stderr}");
+    assert!(
+        !stderr.contains("--snapshot-root"),
+        "Oreans-only must not require --snapshot-root: {stderr}"
+    );
+    let report = read_report(&dir);
+    // Both Oreans cases present; neither is a GTO path-binding failure.
+    assert!(
+        report["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["case_id"].as_str() != Some("gto_launcher")),
+        "Oreans-only envelope has no GTO case"
     );
     let _ = fs::remove_dir_all(&dir);
 }
