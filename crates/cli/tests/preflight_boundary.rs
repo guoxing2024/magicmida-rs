@@ -905,6 +905,8 @@ fn run_acceptance_on_envelope(
         envelope_path.display().to_string(),
         "--output-dir".to_string(),
         dir.display().to_string(),
+        "--snapshot-root".to_string(),
+        dir.join("snapshots").display().to_string(),
         "--cli-binary".to_string(),
         cli.display().to_string(),
         "--repo-root".to_string(),

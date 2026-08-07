@@ -281,6 +281,8 @@ fn run_verifier(
         envelope_path.display().to_string(),
         "--output-dir".to_string(),
         dir.display().to_string(),
+        "--snapshot-root".to_string(),
+        dir.join("snapshots").display().to_string(),
         "--cli-binary".to_string(),
         cli.display().to_string(),
         "--repo-root".to_string(),
@@ -333,6 +335,8 @@ fn run_verifier_with_triples(
         envelope_path.display().to_string(),
         "--output-dir".to_string(),
         dir.display().to_string(),
+        "--snapshot-root".to_string(),
+        dir.join("snapshots").display().to_string(),
         "--cli-binary".to_string(),
         cli.display().to_string(),
         "--repo-root".to_string(),
@@ -923,6 +927,75 @@ fn acceptance_junction_escape_of_logical_dir_identity_ok_false() {
             || r.contains("escape")
             || r.contains("failed disk verification")),
         "GTO case reasons must cite the path-binding failure: {gto}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// G3-R5-R1-R1: a snapshot_root that is ITSELF a junction (reparse alias) to a
+/// directory holding a VALID snapshot tree must be rejected by the independent
+/// acceptance verifier. Per-case identity_ok=false with a root-alias reason.
+#[cfg(windows)]
+#[test]
+fn acceptance_root_junction_alias_to_valid_tree_identity_ok_false() {
+    let dir = temp_dir("acc_root_junction");
+    let (envelope, manifest, _snap_path, sha, size) = setup_positive(&dir);
+    let _ = manifest;
+    // setup_positive created <dir>/snapshots/gto_launcher/<sha>/snapshot.bin.
+    let snap_root = dir.join("snapshots");
+    let physical = dir.join("physical_root");
+    // Move the real snapshot tree under a physical dir.
+    let physical_gto = physical.join("gto_launcher");
+    let sha_dir = physical_gto.join(&sha);
+    std::fs::create_dir_all(&sha_dir).unwrap();
+    std::fs::copy(
+        snap_root
+            .join("gto_launcher")
+            .join(&sha)
+            .join("snapshot.bin"),
+        sha_dir.join("snapshot.bin"),
+    )
+    .unwrap();
+    // Replace the snapshot_root with a junction to the physical dir.
+    std::fs::remove_dir_all(&snap_root).unwrap();
+    let mklink = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&snap_root)
+        .arg(&physical)
+        .output()
+        .expect("mklink must be invocable");
+    assert!(
+        mklink.status.success(),
+        "junction creation failed: {}",
+        String::from_utf8_lossy(&mklink.stderr)
+    );
+    let sealed = snap_root
+        .join("gto_launcher")
+        .join(&sha)
+        .join("snapshot.bin");
+    assert!(sealed.is_file(), "junction must expose the snapshot");
+
+    let out = run_verifier(&dir, &envelope, &dir.join("gto_launcher.json"), &sealed);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "expected NotReady: {stderr}");
+    let report = read_report(&dir);
+    let gto = gto_report_case(&report);
+    assert_eq!(
+        gto["identity_ok"].as_bool(),
+        Some(false),
+        "a root-junction-aliased GTO case must be identity_ok=false: {gto}"
+    );
+    let reasons: Vec<&str> = gto["reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_str().unwrap())
+        .collect();
+    assert!(
+        reasons.iter().any(|r| r.contains("path")
+            || r.contains("root")
+            || r.contains("reparse")
+            || r.contains("junction")),
+        "GTO case reasons must cite the root path-binding failure: {gto}"
     );
     let _ = fs::remove_dir_all(&dir);
 }

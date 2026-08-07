@@ -75,6 +75,7 @@ fn read_manifest_case_id(manifest_path: &Path) -> Option<String> {
 fn bind_gto_actual_input_to_sealed(
     actual_input: &Path,
     env_gto: &CaseConfigEnvelopeV4,
+    trusted_snapshot_root: &Path,
 ) -> Result<String, String> {
     // 1. Sealed path must be present and non-empty.
     let sealed = env_gto
@@ -104,12 +105,14 @@ fn bind_gto_actual_input_to_sealed(
     //    path).
     let sealed_canon = mida_acceptance::snapshot_path::canonical_verify_snapshot_path(
         Path::new(sealed),
+        trusted_snapshot_root,
         GTO_CASE_ID,
         &env_gto.protected_input.sha256,
     )
     .map_err(|e| format!("GTO sealed snapshot path failed disk verification: {e}"))?;
     let actual_canon = mida_acceptance::snapshot_path::canonical_verify_snapshot_path(
         actual_input,
+        trusted_snapshot_root,
         GTO_CASE_ID,
         &env_gto.protected_input.sha256,
     )
@@ -1354,6 +1357,7 @@ fn cmd_preflight(args: &[String]) -> Result<i32, String> {
 
     let mut envelope_path: Option<PathBuf> = None;
     let mut output_dir: Option<PathBuf> = None;
+    let mut snapshot_root: Option<PathBuf> = None;
     let mut cli_binary: Option<PathBuf> = None;
     let mut repo_root: Option<PathBuf> = None;
     let mut toolchain_pin: Option<PathBuf> = None;
@@ -1373,6 +1377,7 @@ fn cmd_preflight(args: &[String]) -> Result<i32, String> {
         match arg.as_str() {
             "--envelope" => envelope_path = Some(take(&mut i, "--envelope")?),
             "--output-dir" => output_dir = Some(take(&mut i, "--output-dir")?),
+            "--snapshot-root" => snapshot_root = Some(take(&mut i, "--snapshot-root")?),
             "--cli-binary" => cli_binary = Some(take(&mut i, "--cli-binary")?),
             "--repo-root" => repo_root = Some(take(&mut i, "--repo-root")?),
             "--toolchain-pin" => toolchain_pin = Some(take(&mut i, "--toolchain-pin")?),
@@ -1396,6 +1401,7 @@ fn cmd_preflight(args: &[String]) -> Result<i32, String> {
 
     let envelope_path = envelope_path.ok_or("Missing --envelope <path>.")?;
     let output_dir = output_dir.ok_or("Missing --output-dir <dir>.")?;
+    let snapshot_root = snapshot_root.ok_or("Missing --snapshot-root <dir>.")?;
     let cli_binary = cli_binary.ok_or("Missing --cli-binary <path>.")?;
     let repo_root = repo_root.ok_or("Missing --repo-root <path>.")?;
     let toolchain_pin = toolchain_pin.ok_or("Missing --toolchain-pin <path>.")?;
@@ -1779,7 +1785,7 @@ fn cmd_preflight(args: &[String]) -> Result<i32, String> {
             );
             continue;
         };
-        match bind_gto_actual_input_to_sealed(input, env_gto) {
+        match bind_gto_actual_input_to_sealed(input, env_gto, &snapshot_root) {
             Ok(sealed) => {
                 gto_protected_input_path.insert(GTO_CASE_ID.to_string(), sealed);
             }

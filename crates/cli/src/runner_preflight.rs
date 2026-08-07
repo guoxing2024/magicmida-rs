@@ -643,6 +643,8 @@ pub fn run_offline_preflight(
         .arg(&envelope_path)
         .arg("--output-dir")
         .arg(output_dir)
+        .arg("--snapshot-root")
+        .arg(output_dir.join(crate::commands::GTO_SNAPSHOT_DIRNAME))
         .arg("--cli-binary")
         .arg(cli_binary)
         .arg("--repo-root")
@@ -1047,6 +1049,7 @@ fn enforce_gto_snapshot_path_binding(
     matched: &PreflightCaseGate,
     current_identity: &FileIdentityGate,
     ctx: &LaunchAttestationContext<'_>,
+    trusted_snapshot_root: &Path,
 ) -> anyhow::Result<()> {
     // 1. The envelope's sealed GTO case must carry a protected_input_path.
     let env_case = select_case_config(envelope, current_identity)?;
@@ -1094,12 +1097,14 @@ fn enforce_gto_snapshot_path_binding(
     //    form must equal the sealed path's canonical form.
     let sealed_canonical = crate::sample_snapshot::canonical_verify_snapshot_path(
         Path::new(sealed_path),
+        trusted_snapshot_root,
         GTO_CASE_ID,
         &current_identity.sha256,
     )
     .map_err(|e| anyhow::anyhow!("GTO sealed snapshot path failed disk verification: {e}"))?;
     let input_canonical = crate::sample_snapshot::canonical_verify_snapshot_path(
         ctx.input,
+        trusted_snapshot_root,
         GTO_CASE_ID,
         &current_identity.sha256,
     )
@@ -1220,9 +1225,18 @@ pub fn attest_ready_before_launch(
     // The GTO protected input must be the exact immutable snapshot.bin sealed at
     // staging (under snapshot_root), never a live dynamic source — even one with
     // identical bytes/hash. Oreans fixed cases keep their live-input lane and are
-    // not path-bound.
+    // not path-bound. The trusted snapshot_root is the controlled store below the
+    // preflight output dir (caller-provided anchor, NOT derived from the sealed
+    // path).
     if target_case_id == GTO_CASE_ID {
-        enforce_gto_snapshot_path_binding(&envelope, matches[0], &current_identity, ctx)?;
+        let trusted_snapshot_root = output_dir.join(crate::commands::GTO_SNAPSHOT_DIRNAME);
+        enforce_gto_snapshot_path_binding(
+            &envelope,
+            matches[0],
+            &current_identity,
+            ctx,
+            &trusted_snapshot_root,
+        )?;
     }
 
     // P6.3.1: the verifier identity is bound by the envelope. Resolve the
@@ -1448,6 +1462,8 @@ fn rerun_verifier(
         .arg(&envelope_path)
         .arg("--output-dir")
         .arg(output_dir)
+        .arg("--snapshot-root")
+        .arg(output_dir.join(crate::commands::GTO_SNAPSHOT_DIRNAME))
         .arg("--cli-binary")
         .arg(ctx.cli_binary)
         .arg("--repo-root")
@@ -2805,7 +2821,7 @@ mod tests {
         let ident = gto_identity();
 
         // A correct snapshot path with matching identity passes the binding.
-        enforce_gto_snapshot_path_binding(&env, &report_case, &ident, &ctx).unwrap();
+        enforce_gto_snapshot_path_binding(&env, &report_case, &ident, &ctx, &root).unwrap();
         // And the evidence input is exactly the snapshot path (not a live alias).
         let selected = select_case_config(&env, &ident).unwrap();
         assert_eq!(
@@ -2837,9 +2853,13 @@ mod tests {
         std::fs::write(&live, b"G3-R3-R1-SNAPSHOT-PAYLOAD").unwrap();
         let cfg = gto_runner_config();
         let ctx = launch_ctx(&live, &cfg);
-        let err = enforce_gto_snapshot_path_binding(&env, &report_case, &ident, &ctx).unwrap_err();
+        let err =
+            enforce_gto_snapshot_path_binding(&env, &report_case, &ident, &ctx, &root).unwrap_err();
         assert!(
-            format!("{err:#}").contains("must be the staged immutable snapshot"),
+            format!("{err:#}").contains("must be the staged immutable snapshot")
+                || format!("{err:#}")
+                    .contains("lexical snapshot_root != caller trusted snapshot_root")
+                || format!("{err:#}").contains("failed disk verification"),
             "live source with identical bytes must be path-rejected: {err:#}"
         );
         std::fs::remove_dir_all(&root).unwrap();
@@ -2866,9 +2886,13 @@ mod tests {
         std::fs::write(&live, b"DIFFERENT-PAYLOAD-AFTER-PREFLIGHT").unwrap();
         let cfg = gto_runner_config();
         let ctx = launch_ctx(&live, &cfg);
-        let err = enforce_gto_snapshot_path_binding(&env, &report_case, &ident, &ctx).unwrap_err();
+        let err =
+            enforce_gto_snapshot_path_binding(&env, &report_case, &ident, &ctx, &root).unwrap_err();
         assert!(
-            format!("{err:#}").contains("must be the staged immutable snapshot"),
+            format!("{err:#}").contains("must be the staged immutable snapshot")
+                || format!("{err:#}")
+                    .contains("lexical snapshot_root != caller trusted snapshot_root")
+                || format!("{err:#}").contains("failed disk verification"),
             "a changed live source must be refused: {err:#}"
         );
         // The snapshot is untouched.
@@ -2911,8 +2935,8 @@ mod tests {
             }
             let _ = std::fs::write(inp, b"G3-R3-R1-SNAPSHOT-PAYLOAD");
             let ctx = launch_ctx(inp, &cfg);
-            let err =
-                enforce_gto_snapshot_path_binding(&env, &report_case, &ident, &ctx).unwrap_err();
+            let err = enforce_gto_snapshot_path_binding(&env, &report_case, &ident, &ctx, &root)
+                .unwrap_err();
             let msg = format!("{err:#}");
             assert!(
                 msg.contains("must be the staged immutable snapshot")
@@ -2998,8 +3022,9 @@ mod tests {
                     // address (no logical/hash layers), so the launch helper must
                     // fail closed on it.
                     let ctx = launch_ctx(&junction_snap, &cfg);
-                    let err = enforce_gto_snapshot_path_binding(&env, &report_case, &ident, &ctx)
-                        .unwrap_err();
+                    let err =
+                        enforce_gto_snapshot_path_binding(&env, &report_case, &ident, &ctx, &root)
+                            .unwrap_err();
                     let msg = format!("{err:#}");
                     assert!(
                         msg.contains("failed disk verification")
@@ -3028,9 +3053,13 @@ mod tests {
         std::fs::create_dir_all(sibling.parent().unwrap()).unwrap();
         std::fs::write(&sibling, b"G3-R3-R1-SNAPSHOT-PAYLOAD").unwrap();
         let ctx = launch_ctx(&sibling, &cfg);
-        let err = enforce_gto_snapshot_path_binding(&env, &report_case, &ident, &ctx).unwrap_err();
+        let err =
+            enforce_gto_snapshot_path_binding(&env, &report_case, &ident, &ctx, &root).unwrap_err();
         assert!(
-            format!("{err:#}").contains("must be the staged immutable snapshot"),
+            format!("{err:#}").contains("must be the staged immutable snapshot")
+                || format!("{err:#}")
+                    .contains("lexical snapshot_root != caller trusted snapshot_root")
+                || format!("{err:#}").contains("failed disk verification"),
             "a same-bytes sibling must be path-rejected: {err:#}"
         );
         // Record whether a real junction was exercised (for the report).
@@ -3055,7 +3084,8 @@ mod tests {
         let report_case = gto_report_case(&tampered.to_string_lossy());
         let cfg = gto_runner_config();
         let ctx = launch_ctx(&snap_path, &cfg);
-        let err = enforce_gto_snapshot_path_binding(&env, &report_case, &ident, &ctx).unwrap_err();
+        let err =
+            enforce_gto_snapshot_path_binding(&env, &report_case, &ident, &ctx, &root).unwrap_err();
         assert!(
             format!("{err:#}").contains("!= sealed envelope path"),
             "a tampered report protected_input_path must be rejected: {err:#}"
@@ -3279,7 +3309,8 @@ mod tests {
         let ident = gto_identity();
         let cfg = gto_runner_config();
         let ctx = launch_ctx(&snap_path, &cfg);
-        let err = enforce_gto_snapshot_path_binding(&env, &report_case, &ident, &ctx).unwrap_err();
+        let err =
+            enforce_gto_snapshot_path_binding(&env, &report_case, &ident, &ctx, &root).unwrap_err();
         assert!(
             format!("{err:#}").contains("relative") || format!("{err:#}").contains("ParentDir"),
             "a raw `..` sealed path must be rejected by the launch helper: {err:#}"

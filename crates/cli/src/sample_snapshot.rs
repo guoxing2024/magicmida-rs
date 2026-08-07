@@ -168,14 +168,40 @@ pub fn parse_snapshot_path(path: &Path) -> Result<ParsedSnapshotPath, String> {
 ///   escaping `snapshot_root` is rejected).
 ///
 /// `expected_logical_sample_id` / `expected_sha256` must match the parsed (and
+/// Strictly canonicalize a trusted snapshot path and verify it stays under the
+/// CANONICAL caller-provided `trusted_snapshot_root` with the correct
+/// logical-sample and hash layers.
+///
+/// This is the disk-level counterpart of [`parse_snapshot_path`]: it parses the
+/// RAW path lexically, then STRICT-canonicalizes (NO `canonicalize_loose`
+/// fallback — a missing file or any canonicalization/reparse failure fails
+/// closed). The caller supplies the trusted root explicitly (NOT derived from
+/// the path), so:
+/// - the path's LEXICAL snapshot_root must equal the trusted root;
+/// - a trusted root that is itself a junction/symlink/reparse alias is rejected;
+/// - the canonical path must be under the canonical trusted root;
+/// - the canonical path must still match
+///   `<canonical_root>/<logical>/<sha>/snapshot.bin` (a logical/hash/file layer
+///   junction/symlink/reparse escaping the trusted root is rejected).
+///
+/// `expected_logical_sample_id` / `expected_sha256` must match the parsed (and
 /// re-parsed canonical) values.
 pub fn canonical_verify_snapshot_path(
     path: &Path,
+    trusted_snapshot_root: &Path,
     expected_logical_sample_id: &str,
     expected_sha256: &str,
 ) -> Result<ParsedSnapshotPath, String> {
     // 1. Lexical parse first (rejects relative, ./.., wrong filename, bad hash).
     let parsed = parse_snapshot_path(path)?;
+    if !paths_equivalent(&parsed.snapshot_root, trusted_snapshot_root) {
+        return Err(format!(
+            "snapshot path {} lexical snapshot_root {} != caller trusted snapshot_root {}",
+            path.display(),
+            parsed.snapshot_root.display(),
+            trusted_snapshot_root.display()
+        ));
+    }
     if parsed.logical_sample_id != expected_logical_sample_id {
         return Err(format!(
             "snapshot path {} logical-sample directory {:?} != expected {expected_logical_sample_id:?}",
@@ -190,44 +216,52 @@ pub fn canonical_verify_snapshot_path(
             parsed.sha256
         ));
     }
-    // 2. STRICT canonicalize of the full path — no loose fallback. A junction /
-    //    symlink / reparse that resolves elsewhere, or a missing file, fails here.
+    // 2. STRICT canonicalize of the TRUSTED root. If the trusted root itself is
+    //    a reparse alias (junction/symlink), its canonical form differs from its
+    //    lexical form and must be rejected -- the operator's trusted root must be
+    //    a real directory, not a pointer.
+    let canonical_trusted = std::fs::canonicalize(trusted_snapshot_root).map_err(|e| {
+        format!(
+            "trusted snapshot root {} cannot be canonicalized: {e}",
+            trusted_snapshot_root.display()
+        )
+    })?;
+    if !paths_equivalent(&canonical_trusted, trusted_snapshot_root) {
+        return Err(format!(
+            "trusted snapshot root {} resolves to {} (junction/symlink/reparse alias is rejected)",
+            trusted_snapshot_root.display(),
+            canonical_trusted.display()
+        ));
+    }
+    // 3. STRICT canonicalize of the full path -- no loose fallback.
     let canonical = std::fs::canonicalize(path).map_err(|e| {
         format!(
             "snapshot path {} cannot be canonicalized (missing or reparse failure): {e}",
             path.display()
         )
     })?;
-    // 3. STRICT canonicalize of the lexical snapshot_root.
-    let canonical_root = std::fs::canonicalize(&parsed.snapshot_root).map_err(|e| {
-        format!(
-            "snapshot root {} cannot be canonicalized: {e}",
-            parsed.snapshot_root.display()
-        )
-    })?;
-    // 4. The canonical full path must be under the canonical snapshot_root.
-    if !canonical.starts_with(&canonical_root) {
+    // 4. The canonical full path must be under the canonical trusted root.
+    if !canonical.starts_with(&canonical_trusted) {
         return Err(format!(
-            "canonical snapshot path {} escapes canonical snapshot root {} \
+            "canonical snapshot path {} escapes canonical trusted snapshot root {} \
              (junction/symlink/reparse escape is rejected)",
             canonical.display(),
-            canonical_root.display()
+            canonical_trusted.display()
         ));
     }
     // 5. Re-parse the canonical path; it must still match the exact structure
-    //    with the expected logical id and hash (a layer junction cannot have
-    //    silently re-pointed the identity).
+    //    with the expected logical id and hash.
     let canonical_parsed = parse_snapshot_path(&canonical).map_err(|e| {
         format!(
             "canonical snapshot path {} is not a well-formed snapshot address: {e}",
             canonical.display()
         )
     })?;
-    if canonical_parsed.snapshot_root != canonical_root {
+    if canonical_parsed.snapshot_root != canonical_trusted {
         return Err(format!(
-            "canonical snapshot root {} != canonicalized lexical root {}",
+            "canonical snapshot root {} != canonical trusted root {}",
             canonical_parsed.snapshot_root.display(),
-            canonical_root.display()
+            canonical_trusted.display()
         ));
     }
     if canonical_parsed.logical_sample_id != expected_logical_sample_id {
@@ -248,6 +282,19 @@ pub fn canonical_verify_snapshot_path(
         ));
     }
     Ok(canonical_parsed)
+}
+
+/// Compare two paths as equivalent after normalizing the Windows `\\?\` prefix
+/// and case (used to detect a trusted root that is itself a reparse alias).
+fn paths_equivalent(a: &Path, b: &Path) -> bool {
+    fn norm(p: &Path) -> String {
+        let s = p
+            .to_string_lossy()
+            .replace("\\\\?\\", "")
+            .replace("\\??", "");
+        s.to_lowercase()
+    }
+    norm(a) == norm(b)
 }
 
 /// A process-wide monotonic counter used to make temp-file names unique.
@@ -2220,7 +2267,7 @@ mod tests {
         let path = root.join("gto_launcher").join(&sha).join(SNAPSHOT_FILENAME);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, b"SNAPSHOT-CONTENT").unwrap();
-        let parsed = canonical_verify_snapshot_path(&path, "gto_launcher", &sha).unwrap();
+        let parsed = canonical_verify_snapshot_path(&path, &root, "gto_launcher", &sha).unwrap();
         // The returned snapshot_root is the STRICT-canonicalized root.
         assert_eq!(parsed.snapshot_root, std::fs::canonicalize(&root).unwrap());
         assert_eq!(parsed.snapshot_path, std::fs::canonicalize(&path).unwrap());
@@ -2236,11 +2283,11 @@ mod tests {
         let sha = "c".repeat(64);
         let path = root.join("gto_launcher").join(&sha).join(SNAPSHOT_FILENAME);
         // The file does NOT exist.
-        assert!(canonical_verify_snapshot_path(&path, "gto_launcher", &sha).is_err());
+        assert!(canonical_verify_snapshot_path(&path, &root, "gto_launcher", &sha).is_err());
         // Even if the parent directory exists, a missing snapshot must not fall
         // back to a loose path.
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let err = canonical_verify_snapshot_path(&path, "gto_launcher", &sha).unwrap_err();
+        let err = canonical_verify_snapshot_path(&path, &root, "gto_launcher", &sha).unwrap_err();
         assert!(
             err.contains("cannot be canonicalized") || err.contains("missing"),
             "missing snapshot must fail closed, no loose fallback: {err}"
@@ -2316,12 +2363,13 @@ mod tests {
         let sealed = root.join("gto_launcher").join(&sha).join(SNAPSHOT_FILENAME);
         assert!(sealed.is_file(), "junction must expose the snapshot");
         // Strict canonical verify must reject the escape.
-        let err = canonical_verify_snapshot_path(&sealed, "gto_launcher", &sha).unwrap_err();
+        let err = canonical_verify_snapshot_path(&sealed, &root, "gto_launcher", &sha).unwrap_err();
         assert!(
             err.contains("escapes canonical snapshot root")
                 || err.contains("cannot be canonicalized")
                 || err.contains("not a well-formed snapshot address")
-                || err.contains("!= canonicalized lexical root"),
+                || err.contains("!= canonicalized lexical root")
+                || err.contains("!= canonical trusted root"),
             "junction escape of the logical dir must be rejected: {err}"
         );
         std::fs::remove_dir_all(&root).unwrap();
@@ -2355,12 +2403,81 @@ mod tests {
         );
         let sealed = root.join("gto_launcher").join(&sha).join(SNAPSHOT_FILENAME);
         assert!(sealed.is_file());
-        let err = canonical_verify_snapshot_path(&sealed, "gto_launcher", &sha).unwrap_err();
+        let err = canonical_verify_snapshot_path(&sealed, &root, "gto_launcher", &sha).unwrap_err();
         assert!(
             err.contains("escapes canonical snapshot root")
                 || err.contains("cannot be canonicalized")
                 || err.contains("not a well-formed snapshot address"),
             "junction escape of the hash dir must be rejected: {err}"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A trusted root that is ITSELF a junction (reparse alias) to a directory
+    /// holding a valid snapshot tree must be rejected: the operator's trusted
+    /// root must be a real directory, not a pointer.
+    #[cfg(windows)]
+    #[test]
+    fn snapshot_root_junction_alias_to_valid_tree_rejected() {
+        let root = temp_root("root_junction_valid");
+        let sha = "c".repeat(64);
+        // A REAL snapshot tree under an outside physical dir.
+        let outside = root.join("physical_root");
+        let real = outside
+            .join("gto_launcher")
+            .join(&sha)
+            .join(SNAPSHOT_FILENAME);
+        std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+        std::fs::write(&real, b"ROOT-JUNCTION-CONTENT").unwrap();
+        // The trusted root is a junction pointing to `outside`.
+        let trusted = root.join("trusted_root");
+        std::fs::create_dir_all(&trusted).unwrap();
+        std::fs::remove_dir_all(&trusted).unwrap();
+        let mklink = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&trusted)
+            .arg(&outside)
+            .output()
+            .expect("mklink must be invocable");
+        assert!(
+            mklink.status.success(),
+            "junction creation failed: {}",
+            String::from_utf8_lossy(&mklink.stderr)
+        );
+        // A snapshot path under the trusted (junction) root that resolves to a
+        // VALID snapshot tree must still be rejected because the trusted root
+        // itself is a reparse alias.
+        let sealed = trusted
+            .join("gto_launcher")
+            .join(&sha)
+            .join(SNAPSHOT_FILENAME);
+        assert!(sealed.is_file(), "junction must expose the snapshot");
+        let err =
+            canonical_verify_snapshot_path(&sealed, &trusted, "gto_launcher", &sha).unwrap_err();
+        assert!(
+            err.contains("junction/symlink/reparse alias") || err.contains("resolves to"),
+            "a trusted root that is a junction alias must be rejected: {err}"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A caller-supplied trusted root that differs from the path's LEXICAL root
+    /// (alternate root) is rejected.
+    #[test]
+    fn trusted_root_mismatch_rejected() {
+        let root = temp_root("trusted_mismatch");
+        let sha = "c".repeat(64);
+        let path = root.join("gto_launcher").join(&sha).join(SNAPSHOT_FILENAME);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"TRUSTED-MISMATCH-CONTENT").unwrap();
+        // The caller claims a DIFFERENT trusted root (alternate).
+        let alt = root.join("alt_root");
+        std::fs::create_dir_all(&alt).unwrap();
+        let err = canonical_verify_snapshot_path(&path, &alt, "gto_launcher", &sha).unwrap_err();
+        assert!(
+            err.contains("lexical snapshot_root")
+                || err.contains("!= caller trusted snapshot_root"),
+            "a trusted-root mismatch must be rejected: {err}"
         );
         std::fs::remove_dir_all(&root).unwrap();
     }

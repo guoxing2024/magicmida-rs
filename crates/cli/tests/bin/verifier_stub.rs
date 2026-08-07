@@ -102,6 +102,11 @@ fn cmd_preflight(args: &[String]) -> ExitCode {
         match args[i].as_str() {
             "--envelope" => envelope_path = take(&mut i, "--envelope"),
             "--output-dir" => output_dir = take(&mut i, "--output-dir"),
+            // The acceptance verifier receives the caller's trusted snapshot root;
+            // the stub accepts and ignores it (it does not do disk verification).
+            "--snapshot-root" => {
+                let _ = take(&mut i, "--snapshot-root");
+            }
             "--cli-binary" => cli_binary = take(&mut i, "--cli-binary"),
             "--repo-root" => repo_root = take(&mut i, "--repo-root"),
             "--toolchain-pin" => toolchain_pin = take(&mut i, "--toolchain-pin"),

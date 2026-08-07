@@ -141,13 +141,34 @@ pub fn parse_snapshot_path(path: &Path) -> Result<ParsedSnapshotPath, String> {
 /// STRICT `std::fs::canonicalize` with NO loose fallback: a missing file or any
 /// canonicalization/reparse failure fails closed. A junction/symlink/reparse
 /// whose logical/hash/file layer resolves OUTSIDE the canonical snapshot_root is
-/// rejected. Both the CLI and this copy are validated by the same contract tests.
+/// Strictly canonicalize a trusted snapshot path and verify it stays under the
+/// CANONICAL caller-provided `trusted_snapshot_root` with the correct
+/// logical-sample and hash layers (mirror of
+/// `mida-cli::sample_snapshot::canonical_verify_snapshot_path`).
+///
+/// STRICT `std::fs::canonicalize` with NO loose fallback: a missing file or any
+/// canonicalization/reparse failure fails closed. The caller supplies the
+/// trusted root explicitly (NOT derived from the path), so:
+/// - the path's LEXICAL snapshot_root must equal the trusted root;
+/// - a trusted root that is itself a junction/symlink/reparse alias is rejected;
+/// - the canonical path must be under the canonical trusted root;
+/// - a junction/symlink/reparse whose logical/hash/file layer resolves OUTSIDE
+///   the canonical trusted root is rejected.
 pub fn canonical_verify_snapshot_path(
     path: &Path,
+    trusted_snapshot_root: &Path,
     expected_logical_sample_id: &str,
     expected_sha256: &str,
 ) -> Result<ParsedSnapshotPath, String> {
     let parsed = parse_snapshot_path(path)?;
+    if !paths_equivalent(&parsed.snapshot_root, trusted_snapshot_root) {
+        return Err(format!(
+            "snapshot path {} lexical snapshot_root {} != caller trusted snapshot_root {}",
+            path.display(),
+            parsed.snapshot_root.display(),
+            trusted_snapshot_root.display()
+        ));
+    }
     if parsed.logical_sample_id != expected_logical_sample_id {
         return Err(format!(
             "snapshot path {} logical-sample directory {:?} != expected {expected_logical_sample_id:?}",
@@ -162,24 +183,37 @@ pub fn canonical_verify_snapshot_path(
             parsed.sha256
         ));
     }
+    // STRICT canonicalize of the TRUSTED root: if it is itself a reparse alias
+    // (junction/symlink), its canonical form differs from its lexical form, which
+    // must be rejected -- the operator's trusted root must be a real directory,
+    // not a pointer.
+    let canonical_trusted = std::fs::canonicalize(trusted_snapshot_root).map_err(|e| {
+        format!(
+            "trusted snapshot root {} cannot be canonicalized: {e}",
+            trusted_snapshot_root.display()
+        )
+    })?;
+    if !paths_equivalent(&canonical_trusted, trusted_snapshot_root) {
+        return Err(format!(
+            "trusted snapshot root {} resolves to {} (junction/symlink/reparse alias is rejected)",
+            trusted_snapshot_root.display(),
+            canonical_trusted.display()
+        ));
+    }
+    // STRICT canonicalize of the full path.
     let canonical = std::fs::canonicalize(path).map_err(|e| {
         format!(
             "snapshot path {} cannot be canonicalized (missing or reparse failure): {e}",
             path.display()
         )
     })?;
-    let canonical_root = std::fs::canonicalize(&parsed.snapshot_root).map_err(|e| {
-        format!(
-            "snapshot root {} cannot be canonicalized: {e}",
-            parsed.snapshot_root.display()
-        )
-    })?;
-    if !canonical.starts_with(&canonical_root) {
+    // The canonical full path must be under the canonical trusted root.
+    if !canonical.starts_with(&canonical_trusted) {
         return Err(format!(
-            "canonical snapshot path {} escapes canonical snapshot root {} \
+            "canonical snapshot path {} escapes canonical trusted snapshot root {} \
              (junction/symlink/reparse escape is rejected)",
             canonical.display(),
-            canonical_root.display()
+            canonical_trusted.display()
         ));
     }
     let canonical_parsed = parse_snapshot_path(&canonical).map_err(|e| {
@@ -188,11 +222,11 @@ pub fn canonical_verify_snapshot_path(
             canonical.display()
         )
     })?;
-    if canonical_parsed.snapshot_root != canonical_root {
+    if canonical_parsed.snapshot_root != canonical_trusted {
         return Err(format!(
-            "canonical snapshot root {} != canonicalized lexical root {}",
+            "canonical snapshot root {} != canonical trusted root {}",
             canonical_parsed.snapshot_root.display(),
-            canonical_root.display()
+            canonical_trusted.display()
         ));
     }
     if canonical_parsed.logical_sample_id != expected_logical_sample_id {
@@ -213,4 +247,17 @@ pub fn canonical_verify_snapshot_path(
         ));
     }
     Ok(canonical_parsed)
+}
+
+/// Compare two paths as equivalent after normalizing the Windows `\\?\` prefix
+/// and case (used to detect a trusted root that is itself a reparse alias).
+fn paths_equivalent(a: &Path, b: &Path) -> bool {
+    fn norm(p: &Path) -> String {
+        let s = p
+            .to_string_lossy()
+            .replace("\\\\?\\", "")
+            .replace("\\??", "");
+        s.to_lowercase()
+    }
+    norm(a) == norm(b)
 }

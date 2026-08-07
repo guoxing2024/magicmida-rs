@@ -766,13 +766,14 @@ pub fn apply_decision(
             {
                 return Err("promoted snapshot re-verification failed (hash/size)".to_string());
             }
-            // P2-4 / G3-R5-R1: strict-canonical-verify the dossier's recorded
-            // path against the CALLER's trusted snapshot_root. A forged/drifted
-            // immutable_snapshot_path (or a junction/reparse alias that canonicalizes
-            // to the same bytes elsewhere) is rejected. STRICT canonicalize with no
-            // loose fallback: a missing/non-canonicalizable recorded path fails.
+            // P2-4 / G3-R5-R1 / G3-R5-R1-R1: strict-canonical-verify the dossier's
+            // recorded path against the CALLER's trusted snapshot_root. A
+            // forged/drifted immutable_snapshot_path, an alternate-root path, or a
+            // root/logical/hash junction alias that canonicalizes to the same bytes
+            // elsewhere is rejected. STRICT canonicalize with no loose fallback.
             let recorded_canon = sample_snapshot::canonical_verify_snapshot_path(
                 Path::new(&rev.immutable_snapshot_path),
+                snapshot_root,
                 &dossier.logical_sample_id,
                 &rev.sha256,
             )
@@ -1710,7 +1711,10 @@ mod tests {
         let dec = make_decision(&forged, &sha, size, DECISION_PROMOTE_REVISION);
         let err = apply_decision(&forged, &dec, &snap_root, &manifest_path).unwrap_err();
         assert!(
-            err.contains("recorded snapshot path") || err.contains("!= disk-verified"),
+            err.contains("recorded snapshot path")
+                || err.contains("!= disk-verified")
+                || err.contains("lexical snapshot_root != caller trusted snapshot_root")
+                || err.contains("failed disk verification"),
             "a forged recorded snapshot path must be rejected even after reseal: {err}"
         );
         let _ = manifest_path;
@@ -2095,5 +2099,51 @@ mod tests {
     /// Helper: a dummy snapshot root for decisions that don't touch disk.
     fn root_of(_d: &AuthorityDossier) -> PathBuf {
         std::env::temp_dir().join("authority_dossier_root_placeholder")
+    }
+
+    /// G3-R5-R1-R1: a genuine recorded path under the caller's trusted
+    /// snapshot_root produces a PromotionPlan; a recorded path at an ALTERNATE
+    /// root is rejected.
+    #[test]
+    fn genuine_path_in_trusted_root_promotes_alternate_root_rejected() {
+        let root = temp_dir("dossier_trusted");
+        let bytes = b"PROMOTE-TRUSTED";
+        let sha = sha256(bytes);
+        let size = bytes.len() as u64;
+        let src = root.join("launcher.exe");
+        write_bytes(&src, bytes);
+        let old_sha = "4".repeat(64);
+        let old_size = 8_583_680;
+        let candidates = vec![live_candidate(&src, &sha, size)];
+        let output = root.join("dossier.json");
+        let dossier = make_dossier(&root, &old_sha, old_size, &candidates, &output).unwrap();
+        let snap_root = root.join("snapshots");
+        let manifest_path = root.join("gto_launcher.json");
+
+        // Genuine recorded path under the trusted snap_root -> PromotionPlan.
+        let dec = make_decision(&dossier, &sha, size, DECISION_PROMOTE_REVISION);
+        let out = apply_decision(&dossier, &dec, &snap_root, &manifest_path).unwrap();
+        assert!(matches!(out, DecisionOutcome::Promote(_)));
+
+        // Forge the recorded path to an ALTERNATE root (valid structure) and
+        // reseal -> rejected.
+        let alt_root = root.join("alt_snapshots");
+        let alt_path = alt_root
+            .join("gto_launcher")
+            .join(&sha)
+            .join(sample_snapshot::SNAPSHOT_FILENAME);
+        std::fs::create_dir_all(alt_path.parent().unwrap()).unwrap();
+        std::fs::write(&alt_path, b"ALT-ROOT-CONTENT").unwrap();
+        let mut forged = dossier.clone();
+        forged.observed_revisions[0].immutable_snapshot_path = alt_path.display().to_string();
+        forged.sealed_dossier_hash = forged.compute_sealed_hash();
+        forged.verify_semantics().unwrap();
+        let dec2 = make_decision(&forged, &sha, size, DECISION_PROMOTE_REVISION);
+        let err = apply_decision(&forged, &dec2, &snap_root, &manifest_path).unwrap_err();
+        assert!(
+            err.contains("lexical snapshot_root") || err.contains("failed disk verification"),
+            "an alternate-root recorded path must be rejected: {err}"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

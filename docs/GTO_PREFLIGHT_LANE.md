@@ -512,3 +512,36 @@ on every vector (P2-1: the acceptance parser also mirrors
 `validate_logical_sample_id` — non-empty, no separators, no `.`/`..`).
 Junction-escape tests are deterministic: if junction creation fails the test
 FAILS (no silent skip).
+
+## 20. Trusted snapshot-root provenance/binding (G3-R5-R1-R1)
+
+The snapshot-path contract now uses an EXPLICIT, caller-provided trusted
+snapshot_root instead of deriving it from the path:
+
+- **CLI launch lane** (`attest_ready_before_launch` -> `enforce_gto_snapshot_path_binding`):
+  the trusted root is `<output_dir>/sample-snapshots` (the controlled store),
+  passed as an explicit argument, not derived from the sealed path. The lexical
+  shape of the sealed path is still validated first; then the sealed path and the
+  trusted root are STRICT-canonicalized and the canonical path must be under the
+  canonical trusted root and match `<canonical_root>/gto_launcher/<sha>/snapshot.bin`.
+  A trusted root that is itself a junction/symlink/reparse alias is rejected
+  (its canonical form differs from its lexical form), and an alternate-root path
+  is rejected.
+- **Independent acceptance verifier**: a `--snapshot-root` arg threads the same
+  trusted root into `bind_gto_actual_input_to_sealed`, which uses
+  `mida_acceptance::snapshot_path::canonical_verify_snapshot_path` with the
+  trusted root. The report's GTO `protected_input_path` is only the trusted-root-
+  verified sealed path; a root junction alias yields per-case identity_ok=false
+  with a root/path-binding reason.
+- **Authority dossier promotion**: `apply_decision` verifies the recorded
+  `immutable_snapshot_path` via `canonical_verify_snapshot_path` with the
+  caller's trusted snapshot_root and `verified_read_snapshot`. A recorded path at
+  an alternate root, a root junction alias, or a logical/hash junction alias is
+  rejected; only a genuine path under the trusted root yields a PromotionPlan.
+
+The verifier stub accepts (and ignores) `--snapshot-root`. The shared contract
+vectors cover the lexical-shape cases; the trusted-root containment cases
+(root junction, alternate root, canonical escape) are locked by dedicated
+deterministic junction tests in both the CLI and the acceptance verifier.
+Oreans live-input / `protected_input_path=None` / v2/v8 gate and the GTO
+generic/no-gate contract are unchanged.
