@@ -1134,6 +1134,36 @@ fn enforce_gto_snapshot_path_binding(
     Ok(())
 }
 
+/// Sealed+caller cross-check for the GTO launch trusted root: the caller's
+/// trusted snapshot_root must lexically match the root embedded in the sealed
+/// protected_input_path (the root that staging used). A mismatch means a
+/// staging/launch root divergence and fails closed before any process creation.
+/// This is the shared seam that keeps the launch root equal to the staging root
+/// without deriving it from the path.
+pub(crate) fn verify_gto_sealed_root_matches(
+    caller_snapshot_root: &Path,
+    sealed_protected_input_path: &str,
+) -> anyhow::Result<()> {
+    let sealed_root =
+        crate::sample_snapshot::parse_snapshot_path(Path::new(sealed_protected_input_path))
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "sealed GTO path {} invalid: {e}",
+                    sealed_protected_input_path
+                )
+            })?
+            .snapshot_root;
+    if !crate::sample_snapshot::paths_equivalent(&sealed_root, caller_snapshot_root) {
+        anyhow::bail!(
+            "GTO launch trusted snapshot_root {} does not match the sealed path root {} \
+             (staging/launch root mismatch; fail-closed)",
+            caller_snapshot_root.display(),
+            sealed_root.display()
+        );
+    }
+    Ok(())
+}
+
 /// The P6.3 launch attestation (production). The hand-written `ready` JSON
 /// is NOT an authorization credential: the launch boundary re-runs the
 /// independent acceptance verifier against the current run context and
@@ -1240,24 +1270,7 @@ pub fn attest_ready_before_launch(
         let trusted_snapshot_root = ctx.snapshot_root;
         // Sealed+caller cross-check: the caller's trusted root must lexically
         // match the root embedded in the sealed protected_input_path.
-        let sealed_root = crate::sample_snapshot::parse_snapshot_path(Path::new(
-            &matches[0].protected_input_path,
-        ))
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "sealed GTO path {} invalid: {e}",
-                matches[0].protected_input_path
-            )
-        })?
-        .snapshot_root;
-        if !crate::sample_snapshot::paths_equivalent(&sealed_root, trusted_snapshot_root) {
-            bail!(
-                "GTO launch trusted snapshot_root {} does not match the sealed path root {} \
-                 (staging/launch root mismatch; fail-closed)",
-                trusted_snapshot_root.display(),
-                sealed_root.display()
-            );
-        }
+        verify_gto_sealed_root_matches(trusted_snapshot_root, &matches[0].protected_input_path)?;
         enforce_gto_snapshot_path_binding(
             &envelope,
             matches[0],
@@ -3346,5 +3359,32 @@ mod tests {
             "a raw `..` sealed path must be rejected by the launch helper: {err:#}"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// G3-R5-R1-R1-R1-R1: the sealed+caller root cross-check passes when the
+    /// caller root matches the sealed path root, and fails closed on mismatch.
+    #[test]
+    fn gto_sealed_root_cross_check_match_and_mismatch() {
+        let root = temp_dir("root_cross_check");
+        let sha = "c".repeat(64);
+        // A sealed path under `root`.
+        let sealed = format!("{}\\gto_launcher\\{}\\snapshot.bin", root.display(), sha);
+        // Match: caller root == sealed path root.
+        verify_gto_sealed_root_matches(&root, &sealed).unwrap();
+        // Mismatch: caller root differs (alternate root) -> fail-closed.
+        let alt = root.join("alt_root");
+        let err = verify_gto_sealed_root_matches(&alt, &sealed).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("root mismatch")
+                || format!("{err:#}").contains("does not match the sealed path root"),
+            "root mismatch must be a clear fail-closed: {err:#}"
+        );
+        // A malformed sealed path fails the parse.
+        let err = verify_gto_sealed_root_matches(&root, "not-a-path").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("invalid") || format!("{err:#}").contains("not absolute"),
+            "malformed sealed path must fail: {err:#}"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

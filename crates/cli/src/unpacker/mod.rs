@@ -130,6 +130,7 @@ pub fn unpack(
     capture_policy: mida_pe::DumpCapturePolicy,
     capture_policy_digest: &str,
     preflight_dir: Option<&Path>,
+    snapshot_root: Option<&Path>,
 ) -> Result<(), anyhow::Error> {
     use tracing::info;
     info!("=== UNPACK START ===");
@@ -210,7 +211,14 @@ pub fn unpack(
                  input: {reason}"
             ));
         }
-        let snapshot_root = preflight_dir.join(crate::commands::GTO_SNAPSHOT_DIRNAME);
+        // The trusted immutable-snapshot root for this launch is the CALLER-
+        // supplied root (must equal the root used at staging). It is never
+        // re-derived from preflight_dir unless the caller omitted it, in which
+        // case the default `<preflight_dir>/sample-snapshots` is used.
+        let snapshot_root = match snapshot_root {
+            Some(root) => root.to_path_buf(),
+            None => preflight_dir.join(crate::commands::GTO_SNAPSHOT_DIRNAME),
+        };
         let launch_ctx = crate::runner_preflight::LaunchAttestationContext {
             input,
             output: &output_path,

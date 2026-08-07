@@ -18,6 +18,7 @@ pub fn run_command(cmd: Command) -> Result<(), anyhow::Error> {
             capture_policy,
             capture_policy_digest,
             preflight_dir,
+            snapshot_root,
             verbose: _,
         } => crate::unpacker::unpack(
             &input,
@@ -31,6 +32,7 @@ pub fn run_command(cmd: Command) -> Result<(), anyhow::Error> {
             capture_policy,
             &capture_policy_digest,
             preflight_dir.as_deref(),
+            snapshot_root.as_deref(),
         ),
         Command::GenericUnpack {
             input,

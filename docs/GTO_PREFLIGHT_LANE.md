@@ -585,3 +585,34 @@ paths_equivalent_unc_and_extended_prefix_vectors (CLI + acceptance), and the
 existing default-root / junction / live-source regressions stay green.
 Oreans live-input / `protected_input_path=None` / v2/v8 gate and GTO
 generic/no-gate are unchanged.
+
+## 22. Custom snapshot-root propagation into the production `/unpack` launch (G3-R5-R1-R1-R1-R1)
+
+The trusted snapshot root now flows from staging into the REAL `/unpack` launch
+chain, not just the offline helpers. Previously `unpacker::unpack` hard-coded
+`preflight_dir/sample-snapshots`, so a custom-root preflight then a real
+`/unpack --preflight-dir` would fail-closed on a launch/staging root mismatch.
+
+- `Command::Unpack` gained an optional `snapshot_root` (`--snapshot-root`); when
+  absent the default `<preflight_dir>/sample-snapshots` is used. It is never
+  re-derived from the sealed path or guessed from the output dir.
+- `unpacker::unpack(input, ..., preflight_dir, snapshot_root)` threads the
+  caller root into `LaunchAttestationContext.snapshot_root`; `attest_ready_before_launch`
+  cross-checks it against the sealed path root (a staging/launch mismatch fails
+  closed before CreateProcess) and passes it to `rerun_verifier` (`--snapshot-root`).
+- The cross-check is extracted into `runner_preflight::verify_gto_sealed_root_matches`
+  and hermetic-tested (match passes, alternate-root mismatch fails with a clear
+  "root mismatch" reason, malformed sealed path fails).
+
+Propagation:
+```
+caller --snapshot-root (or default <preflight_dir>/sample-snapshots)
+  -> unpacker::unpack
+  -> LaunchAttestationContext.snapshot_root
+  -> attest_ready_before_launch (verify_gto_sealed_root_matches + enforce_gto_snapshot_path_binding)
+  -> rerun_verifier --snapshot-root
+```
+Tests: unpack_snapshot_root_arg_is_parsed (args), gto_sealed_root_cross_check_match_and_mismatch
+(hermetic), plus the existing custom-root staging + acceptance real-binary root
+tests. Oreans live-input / `protected_input_path=None` / v2/v8 gate and GTO
+generic/no-gate are unchanged.

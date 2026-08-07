@@ -33,6 +33,11 @@ pub enum Command {
         /// preflight report from this directory before any sample process
         /// is created.
         preflight_dir: Option<PathBuf>,
+        /// Optional caller-supplied trusted immutable-snapshot root for this
+        /// launch (must equal the root used at staging). When None, the default
+        /// `<preflight_dir>/sample-snapshots` is used. Never derived from the
+        /// sealed path.
+        snapshot_root: Option<PathBuf>,
         verbose: bool,
     },
     /// Packer-agnostic full dump (no Themida shrink).
@@ -126,6 +131,7 @@ fn parse_unpack(args: &[String]) -> Result<Command, String> {
     let mut capture_policy = DumpCapturePolicy::default();
     let mut capture_policy_path: Option<PathBuf> = None;
     let mut preflight_dir: Option<PathBuf> = None;
+    let mut snapshot_root: Option<PathBuf> = None;
 
     let mut i = 3;
     while i < args.len() {
@@ -143,6 +149,16 @@ fn parse_unpack(args: &[String]) -> Result<Command, String> {
                     return Err("Missing directory after --preflight-dir.".into());
                 }
                 preflight_dir = Some(PathBuf::from(&args[i]));
+            }
+            // Optional caller-supplied trusted immutable-snapshot root for the
+            // launch attestation (must equal the staging root). When absent the
+            // default `<preflight_dir>/sample-snapshots` is used.
+            "--snapshot-root" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("Missing directory after --snapshot-root.".into());
+                }
+                snapshot_root = Some(PathBuf::from(&args[i]));
             }
             // P6.3.2: the verifier is never caller-selectable in production.
             // Both forms are forbidden and fail closed (no hidden flag, no
@@ -267,6 +283,7 @@ fn parse_unpack(args: &[String]) -> Result<Command, String> {
         capture_policy,
         capture_policy_digest,
         preflight_dir,
+        snapshot_root,
         verbose,
     })
 }
@@ -509,6 +526,7 @@ pub fn resolve_container_restore(
 mod tests {
     use super::*;
     use mida_pe::{ContainerRestoreMode, DumpProfile, OepPolicy};
+    use std::path::Path;
 
     #[test]
     fn default_unpack_oep_policy_preserves_runtime_capture() {
@@ -530,6 +548,58 @@ mod tests {
         assert!(!caps.install_heap_bootstrap);
         assert!(!caps.materialize_wrappers);
         assert!(!caps.patch_wrapper_calls);
+    }
+
+    /// `--snapshot-root` on `/unpack` is parsed and threaded into the Unpack
+    /// command (defaulting to None so the launch uses `<preflight_dir>/sample-snapshots`).
+    #[test]
+    fn unpack_snapshot_root_arg_is_parsed() {
+        let dir =
+            std::env::temp_dir().join(format!("mida_args_snapshot_root_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("input.exe");
+        std::fs::write(&input, b"x").unwrap();
+        let cmd = parse_unpack(&vec![
+            "mida-cli".to_string(),
+            "/unpack".to_string(),
+            input.display().to_string(),
+            "--preflight-dir".to_string(),
+            "C:\\preflight".to_string(),
+            "--snapshot-root".to_string(),
+            "D:\\custom_store".to_string(),
+        ])
+        .unwrap();
+        match cmd {
+            Command::Unpack {
+                preflight_dir,
+                snapshot_root,
+                ..
+            } => {
+                assert_eq!(
+                    preflight_dir.as_deref().unwrap(),
+                    Path::new("C:\\preflight")
+                );
+                assert_eq!(
+                    snapshot_root.as_deref().unwrap(),
+                    Path::new("D:\\custom_store")
+                );
+            }
+            _ => panic!("expected Unpack"),
+        }
+        // Without --snapshot-root, snapshot_root is None (default applies).
+        let cmd2 = parse_unpack(&vec![
+            "mida-cli".to_string(),
+            "/unpack".to_string(),
+            input.display().to_string(),
+            "--preflight-dir".to_string(),
+            "C:\\preflight".to_string(),
+        ])
+        .unwrap();
+        match cmd2 {
+            Command::Unpack { snapshot_root, .. } => assert!(snapshot_root.is_none()),
+            _ => panic!("expected Unpack"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
