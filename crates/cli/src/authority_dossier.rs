@@ -171,6 +171,10 @@ impl AuthorityDossier {
             "capture_tool_revision={}\n",
             self.capture_tool_revision
         ));
+        // captured_at is provenance only and never part of any revision identity,
+        // BUT it IS part of the dossier-level seal: a dossier's capture timestamp
+        // is a property of that dossier, so changing it must break the seal.
+        out.push_str(&format!("captured_at={}\n", self.captured_at));
         out.push_str(&format!("authority_status={}\n", self.authority_status));
         out.push_str(&format!(
             "family_observation={}|{}\n",
@@ -218,8 +222,24 @@ impl AuthorityDossier {
 
     /// Fail-closed: recompute the sealed hash and require it equals the stored
     /// `sealed_dossier_hash`, and that the schema/completion/status invariants
-    /// hold.
+    /// hold, plus full semantic validation (`verify_semantics`).
     pub fn verify_sealed(&self) -> Result<(), String> {
+        self.verify_semantics()?;
+        let recomputed = self.compute_sealed_hash();
+        if !recomputed.eq_ignore_ascii_case(&self.sealed_dossier_hash) {
+            return Err(format!(
+                "dossier sealed hash drift: recomputed {recomputed}, stored {}",
+                self.sealed_dossier_hash
+            ));
+        }
+        Ok(())
+    }
+
+    /// Full semantic validation of a dossier, independent of the sealed hash.
+    /// Rejects malformed identity, unknown family, invalid availability/verdict,
+    /// non-pending status, missing completion marker, malformed/escaping snapshot
+    /// paths, and duplicate revision identities. Called by [`verify_sealed`].
+    pub fn verify_semantics(&self) -> Result<(), String> {
         if self.schema != DOSSIER_SCHEMA {
             return Err(format!(
                 "dossier schema {:?} != {DOSSIER_SCHEMA}",
@@ -235,12 +255,95 @@ impl AuthorityDossier {
                 self.authority_status
             ));
         }
-        let recomputed = self.compute_sealed_hash();
-        if !recomputed.eq_ignore_ascii_case(&self.sealed_dossier_hash) {
+        // logical_sample_id must be valid.
+        sample_snapshot::validate_logical_sample_id(&self.logical_sample_id)
+            .map_err(|e| format!("dossier logical_sample_id invalid: {e}"))?;
+        // manifest_declared_identity.sha256 must be valid and canonical lowercase.
+        let manifest_sha = sample_snapshot::canonical_hash(&self.manifest_declared_identity.sha256);
+        if crate::sample_snapshot::validate_hash(&manifest_sha).is_err()
+            || self.manifest_declared_identity.sha256 != manifest_sha
+        {
             return Err(format!(
-                "dossier sealed hash drift: recomputed {recomputed}, stored {}",
-                self.sealed_dossier_hash
+                "dossier manifest_declared_identity.sha256 {:?} is malformed or not canonical lowercase",
+                self.manifest_declared_identity.sha256
             ));
+        }
+        if self.manifest_declared_identity.size_bytes == 0 {
+            return Err("dossier manifest_declared_identity.size_bytes is zero".to_string());
+        }
+        // packer_family must be a known family and GTO/Oreans isolated.
+        if !is_known_family(&self.packer_family) {
+            return Err(format!(
+                "dossier packer_family {:?} is not a known family",
+                self.packer_family
+            ));
+        }
+        // family_observation selected_family must be known too.
+        if !is_known_family(&self.family_observation.selected_family) {
+            return Err(format!(
+                "dossier family_observation.selected_family {:?} is not known",
+                self.family_observation.selected_family
+            ));
+        }
+        // Track duplicate identity (sha256+size_bytes).
+        let mut seen: std::collections::BTreeSet<(String, u64)> = std::collections::BTreeSet::new();
+        for r in &self.observed_revisions {
+            // Revision sha256 must be valid canonical lowercase.
+            let r_sha = sample_snapshot::canonical_hash(&r.sha256);
+            if crate::sample_snapshot::validate_hash(&r_sha).is_err() || r.sha256 != r_sha {
+                return Err(format!(
+                    "revision sha256 {:?} is malformed or not canonical",
+                    r.sha256
+                ));
+            }
+            if r.size_bytes == 0 {
+                return Err(format!("revision {r_sha} size_bytes is zero"));
+            }
+            // availability / comparison_verdict enum.
+            if !matches!(
+                r.availability.as_str(),
+                AVAIL_VERIFIED | AVAIL_MISSING | AVAIL_HISTORICAL_RECORD_ONLY
+            ) {
+                return Err(format!(
+                    "revision {r_sha} has unknown availability {:?}",
+                    r.availability
+                ));
+            }
+            if !matches!(
+                r.comparison_verdict.as_str(),
+                MATCHES_MANIFEST | DIFFERS_FROM_MANIFEST
+            ) {
+                return Err(format!(
+                    "revision {r_sha} has unknown comparison_verdict {:?}",
+                    r.comparison_verdict
+                ));
+            }
+            // Path rules: verified must have a legal snapshot path; missing /
+            // historical-record-only must have an EMPTY path.
+            if r.availability == AVAIL_VERIFIED {
+                if r.immutable_snapshot_path.trim().is_empty() {
+                    return Err(format!(
+                        "verified revision {r_sha} has an empty snapshot path"
+                    ));
+                }
+                validate_snapshot_path(
+                    Path::new(&r.immutable_snapshot_path),
+                    &self.logical_sample_id,
+                    &r_sha,
+                )
+                .map_err(|e| format!("revision {r_sha} snapshot path invalid: {e}"))?;
+            } else if !r.immutable_snapshot_path.trim().is_empty() {
+                return Err(format!(
+                    "non-verified revision {r_sha} must have an empty snapshot path"
+                ));
+            }
+            // No duplicate identity (same sha256 + size_bytes).
+            if !seen.insert((r_sha.clone(), r.size_bytes)) {
+                return Err(format!(
+                    "duplicate revision identity {r_sha}|{} (must be unique)",
+                    r.size_bytes
+                ));
+            }
         }
         Ok(())
     }
@@ -385,6 +488,19 @@ pub fn produce_authority_dossier(
                     "revision {sha} is historical-record-only (file absent); no snapshot"
                 ));
             }
+        }
+    }
+
+    // P2-3: reject duplicate revision identities (sha256 + size_bytes) at the
+    // producer stage so the dossier can never carry an ambiguous revision.
+    let mut seen: std::collections::BTreeSet<(String, u64)> = std::collections::BTreeSet::new();
+    for o in &observed {
+        let key = (sample_snapshot::canonical_hash(&o.sha256), o.size_bytes);
+        if !seen.insert(key.clone()) {
+            return Err(format!(
+                "duplicate revision identity {}|{} (candidates must be unique)",
+                key.0, key.1
+            ));
         }
     }
 
@@ -539,7 +655,10 @@ pub fn apply_decision(
             decision.dossier_sha256, dossier.sealed_dossier_hash
         ));
     }
-    // Acknowledgements must all be present.
+    // Acknowledgements must all be present (exact match). Extra acknowledgements
+    // beyond the three required are permitted and documented; a duplicate of one
+    // required ack cannot substitute for a missing required ack (each required
+    // line is checked independently).
     for ack in [
         ACK_SOURCE_NOT_AUTHORITY,
         ACK_NO_AUTOMATIC_MANIFEST_MUTATION,
@@ -549,13 +668,38 @@ pub fn apply_decision(
             return Err(format!("decision is missing acknowledgement {ack:?}"));
         }
     }
+    // decision_reason / decided_by / decided_at must not be empty or the pending
+    // placeholder — a "decided" decision must carry a real human attribution.
+    for (field, value) in [
+        ("decision_reason", decision.decision_reason.as_str()),
+        ("decided_by", decision.decided_by.as_str()),
+        ("decided_at", decision.decided_at.as_str()),
+    ] {
+        if value.trim().is_empty() || value == "pending" {
+            return Err(format!(
+                "decision {field} must not be empty or the pending placeholder"
+            ));
+        }
+    }
     let sel_sha = sample_snapshot::canonical_hash(&decision.selected_revision_sha256);
-    // The selected revision must be present in the dossier.
-    let rev = dossier
+    // The selected revision must be present in the dossier, and the identity
+    // (sha256+size_bytes) must be unique within the dossier (no "first match").
+    let matches: Vec<&ObservedRevision> = dossier
         .observed_revisions
         .iter()
-        .find(|r| r.sha256.eq_ignore_ascii_case(&sel_sha))
-        .ok_or_else(|| format!("decision revision {sel_sha} is not in the dossier"))?;
+        .filter(|r| r.sha256.eq_ignore_ascii_case(&sel_sha))
+        .collect();
+    if matches.is_empty() {
+        return Err(format!("decision revision {sel_sha} is not in the dossier"));
+    }
+    if matches.len() > 1 {
+        return Err(format!(
+            "decision revision {sel_sha} is ambiguous: it matches {} observed \
+             revisions (duplicate identities are rejected)",
+            matches.len()
+        ));
+    }
+    let rev = matches[0];
     if rev.size_bytes != decision.selected_revision_size {
         return Err(format!(
             "decision size {} != dossier revision size {}",
@@ -584,7 +728,16 @@ pub fn apply_decision(
                     rev.availability
                 ));
             }
-            // Re-read the verified snapshot and re-check hash/size from disk.
+            // The dossier's recorded snapshot path must already be a well-formed
+            // content-addressed path (absolute, no ./.., correct structure) and
+            // must not be empty.
+            validate_snapshot_path(
+                Path::new(&rev.immutable_snapshot_path),
+                &dossier.logical_sample_id,
+                &rev.sha256,
+            )
+            .map_err(|e| format!("promoted revision recorded path invalid: {e}"))?;
+            // Re-read the verified snapshot from disk and re-check hash/size.
             let verified =
                 verified_read_snapshot(snapshot_root, &dossier.logical_sample_id, &rev.sha256)
                     .map_err(|e| format!("cannot re-verify promoted snapshot: {e}"))?;
@@ -593,11 +746,29 @@ pub fn apply_decision(
             {
                 return Err("promoted snapshot re-verification failed (hash/size)".to_string());
             }
+            // P2-4: canonical-cross-check the dossier's recorded path against the
+            // disk-verified snapshot path. A forged/drifted immutable_snapshot_path
+            // in the dossier is rejected even though the dossier is sealed (the
+            // seal covers it, but the DISK is the authority for the promoted path).
+            let recorded_canon = canonicalize_loose(Path::new(&rev.immutable_snapshot_path));
+            let verified_canon = canonicalize_loose(&verified.snapshot_abs_path);
+            if recorded_canon != verified_canon {
+                return Err(format!(
+                    "promoted revision recorded snapshot path {} (canonical {}) != \
+                     disk-verified snapshot path {} (canonical {})",
+                    rev.immutable_snapshot_path,
+                    recorded_canon.display(),
+                    verified.snapshot_abs_path.display(),
+                    verified_canon.display()
+                ));
+            }
+            // The plan must carry the DISK-VERIFIED canonical snapshot path, never
+            // the raw dossier field.
             Ok(DecisionOutcome::Promote(PromotionPlan {
                 logical_sample_id: dossier.logical_sample_id.clone(),
                 promote_sha256: rev.sha256.clone(),
                 promote_size_bytes: rev.size_bytes,
-                snapshot_path: rev.immutable_snapshot_path.clone(),
+                snapshot_path: verified_canon.display().to_string(),
                 target_manifest_path: target_manifest_path.display().to_string(),
                 note: "HUMAN-APPLY ONLY: update the manifest protected_input to this \
                        hash/size; no automatic manifest write is performed by this verifier."
@@ -607,6 +778,92 @@ pub fn apply_decision(
         DECISION_REJECT_REVISION => Ok(DecisionOutcome::RejectRevision),
         other => Err(format!("unknown decision {other:?}")),
     }
+}
+
+/// Canonicalize `p`, falling back to canonicalizing its parent when the path
+/// itself does not exist yet (mirrors the CLI launch helper's semantics).
+fn canonicalize_loose(p: &Path) -> PathBuf {
+    if let Ok(c) = std::fs::canonicalize(p) {
+        return c;
+    }
+    match (
+        p.parent().and_then(|par| std::fs::canonicalize(par).ok()),
+        p.file_name(),
+    ) {
+        (Some(parent), Some(name)) => parent.join(name),
+        _ => p.to_path_buf(),
+    }
+}
+
+/// True when `family` is a known packer family (reuses `mida_core`'s family
+/// registry, preserving the GTO/Oreans family isolation).
+fn is_known_family(family: &str) -> bool {
+    mida_core::runner_config::packer_family::is_known_family(family)
+}
+
+/// Validate that a snapshot path has the exact content-addressed structure
+/// `<root>/<logical_sample_id>/<sha256>/snapshot.bin`: absolute, free of `.`/`..`,
+/// correct filename, correct 64-hex hash directory (== `sha256`), and correct
+/// case directory (== `logical_sample_id`). This reuses the same structural rules
+/// as `sample_snapshot`'s content-address layout (and the CLI launch helper) so
+/// no divergent path-parsing is introduced.
+fn validate_snapshot_path(
+    path: &Path,
+    logical_sample_id: &str,
+    sha256: &str,
+) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err(format!("snapshot path {} is not absolute", path.display()));
+    }
+    for comp in path.components() {
+        match comp {
+            std::path::Component::CurDir | std::path::Component::ParentDir => {
+                return Err(format!(
+                    "snapshot path {} contains a relative ({comp:?}) component",
+                    path.display()
+                ));
+            }
+            _ => {}
+        }
+    }
+    if path.file_name().and_then(|f| f.to_str()) != Some(sample_snapshot::SNAPSHOT_FILENAME) {
+        return Err(format!(
+            "snapshot path {} must end in {}",
+            path.display(),
+            sample_snapshot::SNAPSHOT_FILENAME
+        ));
+    }
+    let sha_dir = path
+        .parent()
+        .ok_or_else(|| format!("snapshot path {} has no hash directory", path.display()))?;
+    let sha_name = sha_dir
+        .file_name()
+        .and_then(|f| f.to_str())
+        .ok_or_else(|| format!("snapshot path {} hash dir has no name", path.display()))?;
+    if !sha_name.eq_ignore_ascii_case(sha256) || !sample_snapshot::validate_hash(sha_name).is_ok() {
+        return Err(format!(
+            "snapshot path {} hash directory {:?} does not match sha256 {}",
+            path.display(),
+            sha_name,
+            sha256
+        ));
+    }
+    let case_dir = sha_dir
+        .parent()
+        .ok_or_else(|| format!("snapshot path {} has no case directory", path.display()))?;
+    let case_name = case_dir
+        .file_name()
+        .and_then(|f| f.to_str())
+        .ok_or_else(|| format!("snapshot path {} case dir has no name", path.display()))?;
+    if case_name != logical_sample_id {
+        return Err(format!(
+            "snapshot path {} case directory {:?} != logical_sample_id {:?}",
+            path.display(),
+            case_name,
+            logical_sample_id
+        ));
+    }
+    Ok(())
 }
 
 /// A `mida.sample-authority-decision/v1` template with a given decision and the
@@ -1095,7 +1352,10 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            err.contains("not in the dossier") || err.contains("size"),
+            err.contains("not in the dossier")
+                || err.contains("size")
+                || err.contains("pending placeholder")
+                || err.contains("must not be empty"),
             "a pending/empty decision must block staging: {err}"
         );
         // authority_status stays pending.
@@ -1215,5 +1475,334 @@ mod tests {
         v.resize(base + 40 + 48, 0);
         v[base..base + 8].copy_from_slice(b".text\0\0\0");
         v
+    }
+
+    // ------------------------------------------------------------------
+    // G3-R4-R1 P2-1: captured_at is part of the dossier-level seal.
+    // ------------------------------------------------------------------
+    #[test]
+    fn captured_at_in_seal_tamper_rejected() {
+        let root = temp_dir("seal_captured_at");
+        let bytes = b"SEAL-REV";
+        let sha = sha256(bytes);
+        let size = bytes.len() as u64;
+        let src = root.join("launcher.exe");
+        write_bytes(&src, bytes);
+        let candidates = vec![live_candidate(&src, &sha, size)];
+        let output = root.join("dossier.json");
+        let dossier = make_dossier(&root, &sha, size, &candidates, &output).unwrap();
+        dossier.verify_sealed().unwrap();
+
+        // Changing ONLY captured_at must break the seal.
+        let mut tampered = dossier.clone();
+        tampered.captured_at = "2099-01-01T00:00:00Z".to_string();
+        assert!(
+            tampered.verify_sealed().is_err(),
+            "changing captured_at must break the dossier seal"
+        );
+        // But the revision identity (sha256 + size) is unchanged.
+        assert_eq!(tampered.observed_revisions[0].sha256, sha);
+        assert_eq!(tampered.observed_revisions[0].size_bytes, size);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // ------------------------------------------------------------------
+    // G3-R4-R1 P2-2: semantic validation rejects malformed dossiers.
+    // ------------------------------------------------------------------
+    #[test]
+    fn verify_semantics_rejects_unknown_family() {
+        let root = temp_dir("sem_family");
+        let bytes = b"FAMILY-REV";
+        let sha = sha256(bytes);
+        let size = bytes.len() as u64;
+        let src = root.join("launcher.exe");
+        write_bytes(&src, bytes);
+        let candidates = vec![live_candidate(&src, &sha, size)];
+        let output = root.join("dossier.json");
+        let dossier = make_dossier(&root, &sha, size, &candidates, &output).unwrap();
+        dossier.verify_sealed().unwrap();
+
+        // Unknown packer_family -> rejected.
+        let mut d = dossier.clone();
+        d.packer_family = "not_a_family".to_string();
+        d.sealed_dossier_hash = d.compute_sealed_hash();
+        assert!(
+            d.verify_semantics().is_err(),
+            "unknown packer_family must be rejected"
+        );
+        // Unknown family_observation.selected_family -> rejected.
+        let mut d2 = dossier.clone();
+        d2.family_observation.selected_family = "bogus".to_string();
+        d2.sealed_dossier_hash = d2.compute_sealed_hash();
+        assert!(
+            d2.verify_semantics().is_err(),
+            "unknown selected_family rejected"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn verify_semantics_rejects_malformed_identity_and_path() {
+        let root = temp_dir("sem_malformed");
+        let bytes = b"MALFORMED-REV";
+        let sha = sha256(bytes);
+        let size = bytes.len() as u64;
+        let src = root.join("launcher.exe");
+        write_bytes(&src, bytes);
+        let candidates = vec![live_candidate(&src, &sha, size)];
+        let output = root.join("dossier.json");
+        let dossier = make_dossier(&root, &sha, size, &candidates, &output).unwrap();
+        dossier.verify_sealed().unwrap();
+
+        // Malformed manifest identity sha.
+        let mut d = dossier.clone();
+        d.manifest_declared_identity.sha256 = "not-a-hash".to_string();
+        d.sealed_dossier_hash = d.compute_sealed_hash();
+        assert!(
+            d.verify_semantics().is_err(),
+            "malformed manifest sha rejected"
+        );
+
+        // Non-canonical (uppercase) revision sha -> rejected.
+        let mut d2 = dossier.clone();
+        d2.observed_revisions[0].sha256 = sha.to_uppercase();
+        d2.sealed_dossier_hash = d2.compute_sealed_hash();
+        assert!(
+            d2.verify_semantics().is_err(),
+            "non-canonical revision sha rejected"
+        );
+
+        // Verified revision with a `..` path -> rejected.
+        let mut d3 = dossier.clone();
+        d3.observed_revisions[0].immutable_snapshot_path = format!(
+            "{}\\snapshots\\..\\snapshots\\gto_launcher\\{}\\snapshot.bin",
+            root.display(),
+            sha
+        );
+        d3.sealed_dossier_hash = d3.compute_sealed_hash();
+        assert!(d3.verify_semantics().is_err(), "path escape rejected");
+
+        // Non-verified revision with a non-empty snapshot path -> rejected.
+        let mut d4 = dossier.clone();
+        d4.observed_revisions[0].availability = AVAIL_HISTORICAL_RECORD_ONLY.to_string();
+        d4.observed_revisions[0].immutable_snapshot_path = "C:\\x\\snapshot.bin".to_string();
+        d4.sealed_dossier_hash = d4.compute_sealed_hash();
+        assert!(
+            d4.verify_semantics().is_err(),
+            "non-verified non-empty path rejected"
+        );
+
+        // Invalid availability enum -> rejected.
+        let mut d5 = dossier.clone();
+        d5.observed_revisions[0].availability = "bogus".to_string();
+        d5.sealed_dossier_hash = d5.compute_sealed_hash();
+        assert!(
+            d5.verify_semantics().is_err(),
+            "invalid availability rejected"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // ------------------------------------------------------------------
+    // G3-R4-R1 P2-3: duplicate revision identity is rejected.
+    // ------------------------------------------------------------------
+    #[test]
+    fn duplicate_revision_identity_rejected_and_no_plan() {
+        let root = temp_dir("dup_revision");
+        let bytes = b"MANIFEST-REV";
+        let sha = sha256(bytes);
+        let size = bytes.len() as u64;
+        let src = root.join("launcher.exe");
+        write_bytes(&src, bytes);
+        // Two candidates with the SAME hash+size: one live, one historical.
+        let candidates = vec![
+            live_candidate(&src, &sha, size),
+            historical_candidate(&sha, size),
+        ];
+        let output = root.join("dossier.json");
+        // The producer must fail-closed on the duplicate identity.
+        let err = make_dossier(&root, &sha, size, &candidates, &output).unwrap_err();
+        assert!(
+            err.contains("duplicate revision identity"),
+            "duplicate revision identity must fail the producer: {err}"
+        );
+        assert!(!output.exists(), "no dossier written on duplicate");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn same_hash_different_size_is_distinct_identity() {
+        let root = temp_dir("hash_diff_size");
+        // Two different-size sources with the SAME hash is impossible for a real
+        // SHA-256, but the producer keys identity on (sha, size) — so two distinct
+        // (sha, size) pairs are allowed, and reordering the candidates yields the
+        // same dossier.
+        let a = b"REV-A-CONTENT";
+        let b = b"REV-B-CONTENT-DIFFERENT";
+        let src_a = root.join("a.exe");
+        let src_b = root.join("b.exe");
+        write_bytes(&src_a, a);
+        write_bytes(&src_b, b);
+        let sha_a = sha256(a);
+        let sha_b = sha256(b);
+        let candidates_fwd = vec![
+            live_candidate(&src_a, &sha_a, a.len() as u64),
+            live_candidate(&src_b, &sha_b, b.len() as u64),
+        ];
+        let candidates_rev = vec![
+            live_candidate(&src_b, &sha_b, b.len() as u64),
+            live_candidate(&src_a, &sha_a, a.len() as u64),
+        ];
+        let out_fwd = root.join("fwd.json");
+        let out_rev = root.join("rev.json");
+        let d_fwd = make_dossier(&root, &sha_a, a.len() as u64, &candidates_fwd, &out_fwd).unwrap();
+        let d_rev = make_dossier(&root, &sha_a, a.len() as u64, &candidates_rev, &out_rev).unwrap();
+        // Reordering the candidates must not change the revision set (sorted by
+        // sha in canonical_content) nor the sealed hash.
+        assert_eq!(d_fwd.sealed_dossier_hash, d_rev.sealed_dossier_hash);
+        let mut hashes_fwd: Vec<String> = d_fwd
+            .observed_revisions
+            .iter()
+            .map(|r| r.sha256.clone())
+            .collect();
+        let mut hashes_rev: Vec<String> = d_rev
+            .observed_revisions
+            .iter()
+            .map(|r| r.sha256.clone())
+            .collect();
+        hashes_fwd.sort();
+        hashes_rev.sort();
+        assert_eq!(hashes_fwd, hashes_rev);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // ------------------------------------------------------------------
+    // G3-R4-R1 P2-4: forged snapshot path is rejected even after reseal.
+    // ------------------------------------------------------------------
+    #[test]
+    fn forged_snapshot_path_rejected_even_after_reseal() {
+        let root = temp_dir("forged_path");
+        let bytes = b"FORGE-REV";
+        let sha = sha256(bytes);
+        let size = bytes.len() as u64;
+        let src = root.join("launcher.exe");
+        write_bytes(&src, bytes);
+        let candidates = vec![live_candidate(&src, &sha, size)];
+        let output = root.join("dossier.json");
+        let dossier = make_dossier(&root, &sha, size, &candidates, &output).unwrap();
+        let snap_root = root.join("snapshots");
+        let manifest_path = root.join("gto_launcher.json");
+
+        // Forge the immutable_snapshot_path to a DIFFERENT but structurally valid
+        // content-addressed path (different snapshot_root, same structure), then
+        // RESEAL so the seal is internally consistent. Semantic validation passes
+        // (valid structure), but the canonical cross-check against the
+        // disk-verified path must still reject it in apply_decision.
+        let forged_root = root.join("other_snapshots");
+        let forged_path = forged_root
+            .join("gto_launcher")
+            .join(&sha)
+            .join(sample_snapshot::SNAPSHOT_FILENAME);
+        let mut forged = dossier.clone();
+        forged.observed_revisions[0].immutable_snapshot_path = forged_path.display().to_string();
+        forged.sealed_dossier_hash = forged.compute_sealed_hash();
+        // Semantic validation passes (valid structure), but the seal is bound to
+        // the forged content.
+        forged.verify_semantics().unwrap();
+
+        // apply_decision re-reads the REAL snapshot (under the real snapshot_root)
+        // and canonical-cross-checks the recorded path against the disk path.
+        // The forged path points elsewhere -> rejected.
+        let dec = make_decision(&forged, &sha, size, DECISION_PROMOTE_REVISION);
+        let err = apply_decision(&forged, &dec, &snap_root, &manifest_path).unwrap_err();
+        assert!(
+            err.contains("recorded snapshot path") || err.contains("!= disk-verified"),
+            "a forged recorded snapshot path must be rejected even after reseal: {err}"
+        );
+        let _ = manifest_path;
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn promotion_plan_uses_verified_canonical_path() {
+        let root = temp_dir("promote_verified");
+        let bytes = b"PROMOTE-VERIFIED";
+        let sha = sha256(bytes);
+        let size = bytes.len() as u64;
+        let src = root.join("launcher.exe");
+        write_bytes(&src, bytes);
+        let manifest_path = root.join("gto_launcher.json");
+        let old_sha = "4".repeat(64);
+        let old_size = 8_583_680;
+        let candidates = vec![live_candidate(&src, &sha, size)];
+        let output = root.join("dossier.json");
+        let dossier = make_dossier(&root, &old_sha, old_size, &candidates, &output).unwrap();
+        let snap_root = root.join("snapshots");
+
+        let dec = make_decision(&dossier, &sha, size, DECISION_PROMOTE_REVISION);
+        let outcome = apply_decision(&dossier, &dec, &snap_root, &manifest_path).unwrap();
+        match outcome {
+            DecisionOutcome::Promote(plan) => {
+                // The plan must carry the DISK-VERIFIED canonical snapshot path,
+                // which equals the real snapshot (not a forged field).
+                let snap = snap_root
+                    .join("gto_launcher")
+                    .join(&sha)
+                    .join(sample_snapshot::SNAPSHOT_FILENAME);
+                assert_eq!(
+                    plan.snapshot_path,
+                    std::fs::canonicalize(&snap).unwrap().display().to_string(),
+                    "promotion plan must use the disk-verified canonical path"
+                );
+            }
+            _ => panic!("expected a promotion plan"),
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // ------------------------------------------------------------------
+    // G3-R4-R1 P2-5: decision field hardening.
+    // ------------------------------------------------------------------
+    #[test]
+    fn decision_empty_or_pending_fields_rejected() {
+        let root = temp_dir("decision_fields");
+        let bytes = b"FIELD-REV";
+        let sha = sha256(bytes);
+        let size = bytes.len() as u64;
+        let src = root.join("launcher.exe");
+        write_bytes(&src, bytes);
+        let candidates = vec![live_candidate(&src, &sha, size)];
+        let output = root.join("dossier.json");
+        let dossier = make_dossier(&root, &sha, size, &candidates, &output).unwrap();
+        let snap_root = root.join("snapshots");
+        let manifest_path = root.join("gto_launcher.json");
+
+        // Empty decision_reason.
+        let mut d = make_decision(&dossier, &sha, size, DECISION_RETAIN_MANIFEST);
+        d.decision_reason = String::new();
+        let err = apply_decision(&dossier, &d, &snap_root, &manifest_path).unwrap_err();
+        assert!(
+            err.contains("decision_reason"),
+            "empty reason rejected: {err}"
+        );
+
+        // pending decided_by.
+        let mut d2 = make_decision(&dossier, &sha, size, DECISION_RETAIN_MANIFEST);
+        d2.decided_by = "pending".to_string();
+        let err = apply_decision(&dossier, &d2, &snap_root, &manifest_path).unwrap_err();
+        assert!(
+            err.contains("decided_by"),
+            "pending decided_by rejected: {err}"
+        );
+
+        // Empty decided_at.
+        let mut d3 = make_decision(&dossier, &sha, size, DECISION_RETAIN_MANIFEST);
+        d3.decided_at = String::new();
+        let err = apply_decision(&dossier, &d3, &snap_root, &manifest_path).unwrap_err();
+        assert!(
+            err.contains("decided_at"),
+            "empty decided_at rejected: {err}"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

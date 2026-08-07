@@ -372,3 +372,44 @@ acknowledgements, and then:
 
 Production GTO staging still treats the manifest `protected_input` as the sole
 current authority; the promotion plan is never wired to a manifest write.
+
+## 16. Dossier semantic seal + deterministic revision selection hardening (G3-R4-R1)
+
+Three offline-audit findings on the G3-R4 dossier were hardened:
+
+**1. `captured_at` is part of the dossier-level seal.** `AuthorityDossier::canonical_content()`
+now includes `captured_at`. A capture timestamp is provenance only and never part
+of any revision identity (revision ID remains `sha256` + `size_bytes`), but it IS
+a property of a specific dossier, so changing it breaks `verify_sealed()`.
+
+**2. Full semantic validation (`verify_semantics`, called by `verify_sealed`).**
+Rejects: invalid `logical_sample_id`; malformed / non-canonical manifest or
+revision sha256; unknown `packer_family` or `family_observation.selected_family`
+(reuses `mida_core`'s known-family registry, preserving GTO/Oreans isolation);
+invalid `availability` / `comparison_verdict`; `authority_status` not
+`pending_human_decision`; missing completion marker; a verified revision with an
+empty or structurally invalid snapshot path (`validate_snapshot_path`: absolute,
+no `.`/`..`, `<root>/<logical_sample_id>/<sha256>/snapshot.bin`); a
+missing/historical-record-only revision with a non-empty snapshot path; and a
+duplicate revision identity (`sha256` + `size_bytes`).
+
+**3. Deterministic revision selection.** The producer rejects duplicate
+revision identities fail-closed; `apply_decision` no longer uses "first match" —
+it rejects a decision whose selected revision matches more than one observed
+revision. Reordering candidate sources yields the same dossier (revisions sorted
+by sha in the canonical seal).
+
+**4. Promotion-plan path cross-check.** `apply_decision`'s promote path validates
+the recorded `immutable_snapshot_path`, re-reads the verified snapshot from disk,
+canonical-compares the recorded path against `verified.snapshot_abs_path`, and
+emits the plan with the DISK-VERIFIED canonical path — never the raw dossier
+field. A forged recorded path is rejected even after resealing.
+
+**5. Decision hardening.** `decision_reason`, `decided_by`, `decided_at` must not
+be empty or the `pending` placeholder. The three acknowledgements are required
+exactly (extra acks permitted and documented); a duplicate of one required ack
+cannot substitute for a missing one. `pending_decision_template` still emits a
+pending template; `apply_decision` stably fails closed on it.
+
+Production GTO staging still treats the manifest `protected_input` as the sole
+current authority; the promotion plan is never wired to a manifest write.
