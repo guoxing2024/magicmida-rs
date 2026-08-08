@@ -38,6 +38,7 @@ pub(crate) fn write_dump_snapshot_manifest(
     heap_globals: &[HeapGlobalSnapshot],
     capture_policy: &DumpCapturePolicy,
     rebase_summary: Option<&RuntimeRebaseSummary>,
+    overlay_ledger: &[super::raw_slab_coherence::TransformedRegionOverlay],
 ) {
     let path = manifest_path_for_output(output_path);
     match render_manifest_json(
@@ -49,6 +50,7 @@ pub(crate) fn write_dump_snapshot_manifest(
         heap_globals,
         capture_policy,
         rebase_summary,
+        overlay_ledger,
     ) {
         Ok(json) => match fs::File::create(&path).and_then(|mut f| f.write_all(json.as_bytes())) {
             Ok(()) => {
@@ -118,6 +120,7 @@ pub(crate) fn render_manifest_json(
     heap_globals: &[HeapGlobalSnapshot],
     capture_policy: &DumpCapturePolicy,
     rebase_summary: Option<&RuntimeRebaseSummary>,
+    overlay_ledger: &[super::raw_slab_coherence::TransformedRegionOverlay],
 ) -> Result<String, String> {
     let container_payload: u64 = containers.iter().map(|c| c.heap_content.len() as u64).sum();
     let heap_payload: u64 = heap_globals
@@ -344,6 +347,35 @@ pub(crate) fn render_manifest_json(
         buf.push_str("  }\n");
     }
 
+    // GTO R0-C.1 raw-slab overlay ledger (build-time diagnostic; never
+    // acceptance). Proves raw coherence + transformed-child overlay applied to
+    // the patched backing slab.
+    if !overlay_ledger.is_empty() {
+        buf.push_str(",\n");
+        buf.push_str("  \"overlay_ledger\": [\n");
+        for (i, o) in overlay_ledger.iter().enumerate() {
+            buf.push_str(&format!(
+                "    {{\"child_kind\": \"{}\", \"child_old_base\": \"{}\", \
+                 \"child_size\": {}, \"slab_offset\": {}, \
+                 \"raw_child_sha256\": \"{}\", \"raw_slab_slice_sha256\": \"{}\", \
+                 \"transformed_child_sha256\": \"{}\", \"overlay_applied\": {}}}",
+                o.child_kind.label(),
+                hex_u64(o.child_old_base),
+                o.child_size,
+                o.slab_offset,
+                o.raw_child_digest,
+                o.raw_slab_slice_digest,
+                o.transformed_child_digest,
+                o.overlay_applied
+            ));
+            if i + 1 < overlay_ledger.len() {
+                buf.push(',');
+            }
+            buf.push('\n');
+        }
+        buf.push_str("  ]\n");
+    }
+
     buf.push_str("}\n");
     Ok(buf)
 }
@@ -373,6 +405,7 @@ mod tests {
             &[],
             &DumpCapturePolicy::default(),
             None,
+            &[],
         )
         .unwrap();
         assert!(json.contains(SCHEMA_VERSION));
@@ -419,6 +452,7 @@ mod tests {
             &heap_globals,
             &policy,
             None,
+            &[],
         )
         .unwrap();
         assert!(json.contains("0x145710"));
@@ -466,6 +500,7 @@ mod tests {
             &[],
             &DumpCapturePolicy::ahk_gto_default(),
             Some(&summary),
+            &[],
         )
         .unwrap();
         assert!(json.contains("\"runtime_rebase\": {"));

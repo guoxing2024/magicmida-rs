@@ -858,6 +858,31 @@ pub fn dump_process_with_report(
     } else {
         Vec::new()
     };
+    // ---- R0-C.1: capture the RAW heap slab and RAW children BEFORE transforms ----
+    // The transforms below (scrub/repair/sort/sanitize) rewrite the child payloads
+    // offline. The slab must be captured from the same live state as the raw
+    // children so raw coherence can be proven, then the transformed bytes are
+    // overlaid onto a patched backing slab. Only when MIDA_GTO_NO_BYPASS=1.
+    let no_bypass = std::env::var("MIDA_GTO_NO_BYPASS").ok().as_deref() == Some("1");
+    let mut raw_capture: Option<super::raw_slab_coherence::RawSlabCapture> = None;
+    if no_bypass && stage_plan.detect_heap_globals {
+        if let Some(raw_slab) =
+            super::heap_global_snapshot::capture_heap_slab(&heap_globals, debugger)
+        {
+            let raw_children =
+                super::raw_slab_coherence::raw_children_from_capture(&containers, &heap_globals);
+            raw_capture = Some(super::raw_slab_coherence::RawSlabCapture {
+                slab: raw_slab,
+                children: raw_children,
+            });
+        }
+    }
+    // Track capture/transform provenance (taxonomy v1 capture-class transforms).
+    let mut capture_transforms: Vec<(&'static str, &'static str)> = Vec::new();
+    let mut overlay_ledger: Vec<super::raw_slab_coherence::TransformedRegionOverlay> = Vec::new();
+    if raw_capture.is_some() {
+        capture_transforms.push(("heap_slab_raw_capture", "capture"));
+    }
     // Zero dangling inter-object pointers that fall outside captured ranges so
     // post-CRT restore does not hand ntdll stale heap addresses (RtlpFindEntry).
     let image_end = (opts.image_base as u64).saturating_add(pe.size_of_image() as u64);
@@ -888,22 +913,48 @@ pub fn dump_process_with_report(
     super::heap_global_snapshot::sanitize_ahk_runtime_global(&mut heap_globals);
     // R-GTO-UI r22b: gscript+0xbd8 must be NewClassName for RegisterClass @0x34db0.
     super::heap_global_snapshot::repair_gscript_window_strings(&mut heap_globals);
-    // r27: no_bypass flag also gates slab capture (avoid rebase regression).
-    let no_bypass = std::env::var("MIDA_GTO_NO_BYPASS").ok().as_deref() == Some("1");
-    // r27: capture heap slab for interior-pointer rebase (heap rebasing wall).
-    // Only when MIDA_GTO_NO_BYPASS=1 (root-cause measurement). Default (bypass)
-    // path skips slab to avoid rebase false-positives regressing the working
-    // r26b NewClassName path.
-    // Capture-class transforms (taxonomy v1 ?4.3) ?recorded for bound manifest.
-    let mut capture_transforms: Vec<(&'static str, &'static str)> = Vec::new();
 
-    let heap_slab = if no_bypass && stage_plan.detect_heap_globals {
-        super::heap_global_snapshot::capture_heap_slab(&heap_globals, debugger)
+    // ---- R0-C.1: patched backing slab via transformed-child overlay ----
+    // After transforms, build the authoritative backing slab by overlaying the
+    // transformed child bytes onto the RAW slab (raw coherence verified). The
+    // planner then normalizes against the patched slab + transformed children.
+    let transform_ids: &[&'static str] = &[
+        "scrub_uncaptured_heap_pointers",
+        "resynthesize_gscript_label_count",
+        "repair_label_names_after_scrub",
+        "sort_gscript_label_table",
+        "mark_labels_non_nested",
+        "sanitize_ahk_runtime_global",
+        "repair_gscript_window_strings",
+    ];
+    let heap_slab = if let Some(raw) = raw_capture.as_ref() {
+        match super::raw_slab_coherence::build_patched_backing_slab(
+            raw,
+            &heap_globals,
+            &containers,
+            transform_ids,
+        ) {
+            Ok((patched, overlays)) => {
+                capture_transforms.push(("heap_slab_restore", "capture"));
+                // Record overlay ledger into diagnostics (later surfaced in the
+                // snapshot manifest / summary).
+                overlay_ledger = overlays;
+                Some(patched)
+            }
+            Err(e) => {
+                // Raw coherence or overlay failure: fail closed — do NOT silently
+                // continue with an un-patched slab or a drift-prone plan.
+                return Err(PeError::GtoStage {
+                    stage: "raw_slab_overlay".into(),
+                    error: format!("{e:#}"),
+                });
+            }
+        }
     } else {
         None
     };
     if heap_slab.is_some() {
-        capture_transforms.push(("heap_slab_restore", "capture"));
+        capture_transforms.push(("heap_slab_overlay", "capture"));
     }
     // Cookie + complement RVAs must be captured before early overlay zeros storage.
     // Prefer authoritative site from offline CRT resolve; never fuzzy-rescan when set.
@@ -1614,6 +1665,7 @@ pub fn dump_process_with_report(
         &heap_globals,
         &capture_policy,
         rebase_summary.as_ref(),
+        &overlay_ledger,
     );
 
     // The report is returned only after the candidate and its required bound

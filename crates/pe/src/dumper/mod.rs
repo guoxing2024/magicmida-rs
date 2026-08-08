@@ -42,6 +42,7 @@ mod import_section;
 mod original_imports;
 mod output_writer;
 mod pure_rebuild_adapter;
+mod raw_slab_coherence;
 mod remote_modules;
 mod runtime_bootstrap;
 mod runtime_rebase;
