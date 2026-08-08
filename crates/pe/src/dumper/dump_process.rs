@@ -1151,9 +1151,10 @@ pub fn dump_process_with_report(
                 ) {
                     Ok(t) => t,
                     Err(e) => {
-                        return Err(PeError::Parse(format!(
-                            "GTO R0-B: external resolver build failed: {e:#}"
-                        )));
+                        return Err(PeError::GtoStage {
+                            stage: "external_resolver_build".into(),
+                            error: format!("{e:#}"),
+                        });
                     }
                 }
             }
@@ -1174,9 +1175,10 @@ pub fn dump_process_with_report(
         ) {
             Ok(p) => p,
             Err(e) => {
-                return Err(PeError::Parse(format!(
-                    "GTO R0-B: runtime rebase plan failed closed: {e:#}"
-                )));
+                return Err(PeError::GtoStage {
+                    stage: "runtime_rebase_plan_validation".into(),
+                    error: format!("{e:#}"),
+                });
             }
         };
 
@@ -1199,9 +1201,10 @@ pub fn dump_process_with_report(
         let installed = match installed {
             Ok(v) => v,
             Err(e) => {
-                return Err(PeError::Parse(format!(
-                    "GTO R0-B: plan-driven bootstrap install failed: {e:#}"
-                )));
+                return Err(PeError::GtoStage {
+                    stage: "bootstrap_install".into(),
+                    error: format!("{e:#}"),
+                });
             }
         };
 
@@ -1221,16 +1224,20 @@ pub fn dump_process_with_report(
         );
         let contract_valid = contract.is_ok();
         if let Err(e) = contract {
-            return Err(PeError::Parse(format!(
-                "GTO R0-B: bootstrap contract invalid: {e:#}"
-            )));
+            return Err(PeError::GtoStage {
+                stage: "bootstrap_contract_validation".into(),
+                error: format!("{e:#}"),
+            });
         }
         // Emitted digest must match the prepared plan digest.
         if installed.emitted_plan_digest != prepared.plan.plan_digest {
-            return Err(PeError::Parse(format!(
-                "GTO R0-B: emitted plan digest {} != prepared digest {}",
-                installed.emitted_plan_digest, prepared.plan.plan_digest
-            )));
+            return Err(PeError::GtoStage {
+                stage: "bootstrap_plan_digest_mismatch".into(),
+                error: format!(
+                    "emitted {} != prepared {}",
+                    installed.emitted_plan_digest, prepared.plan.plan_digest
+                ),
+            });
         }
 
         // Finalize the summary (Complete only if everything holds).
@@ -1244,9 +1251,10 @@ pub fn dump_process_with_report(
         ) {
             Ok(s) => s,
             Err(e) => {
-                return Err(PeError::Parse(format!(
-                    "GTO R0-B: final summary not Complete: {e:#}"
-                )));
+                return Err(PeError::GtoStage {
+                    stage: "final_summary_not_complete".into(),
+                    error: format!("{e:#}"),
+                });
             }
         };
         info!(

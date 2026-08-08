@@ -194,4 +194,38 @@ mod tests {
         );
         help.contains("--gate-profile")
     }
+
+    #[test]
+    fn gto_stage_error_maps_to_nonzero_fatal() {
+        // A GTO stage-boundary error must produce a non-zero exit code and
+        // keep its stable stage marker in the anyhow chain (so the controller
+        // stderr shows stage + root cause, not a generic "unpack failed").
+        let e = mida_pe::PeError::GtoStage {
+            stage: "runtime_rebase_plan_validation".into(),
+            error: "RequiredPointerUnresolved: slot 3".into(),
+        };
+        let err: anyhow::Error = anyhow::Error::from(e);
+        let code = exit_code_for_error(err.as_ref());
+        assert_ne!(code, 0);
+        assert_eq!(code, EXIT_FATAL);
+        let text = format!("{:#}", err);
+        assert!(text.contains("GTO_UNPACK_FAILED"), "got: {text}");
+        assert!(
+            text.contains("stage=runtime_rebase_plan_validation"),
+            "got: {text}"
+        );
+        assert!(text.contains("RequiredPointerUnresolved"), "got: {text}");
+    }
+
+    #[test]
+    fn gto_stage_is_not_confused_for_gate_failure() {
+        // A GTO stage failure is a fatal error (exit 1), NOT a gate failure
+        // (exit 2); it must not be downgraded or relabeled.
+        let e = mida_pe::PeError::GtoStage {
+            stage: "bootstrap_contract_validation".into(),
+            error: "contract invalid".into(),
+        };
+        let err: anyhow::Error = anyhow::Error::from(e);
+        assert_eq!(exit_code_for_error(err.as_ref()), EXIT_FATAL);
+    }
 }

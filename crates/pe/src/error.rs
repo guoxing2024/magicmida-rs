@@ -37,6 +37,19 @@ pub enum PeError {
     #[error("PE parse error: {0}")]
     Parse(String),
 
+    /// A GTO/AHK stage-boundary failure with a stable machine-parseable stage
+    /// id. Keeps the specific error text in ``error`` while adding a stable
+    /// stage marker so a live-route failure is attributable to the exact
+    /// pipeline stage. This is error-context only: it never changes recovery
+    /// semantics or dump decisions.
+    #[error("GTO_UNPACK_FAILED stage={stage} error={error}")]
+    GtoStage {
+        /// Stable pipeline stage id (e.g. ``runtime_rebase_plan_validation``).
+        stage: String,
+        /// Specific stage error text (root cause), preserving the chain.
+        error: String,
+    },
+
     /// The unknown or unsupported optional header magic.
     #[error("Unknown optional header magic: {0:#x}")]
     UnknownMagic(u16),
@@ -56,4 +69,47 @@ pub enum PeError {
         /// Configured maximum in bytes.
         max: usize,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gto_stage_display_is_structured() {
+        let e = PeError::GtoStage {
+            stage: "runtime_rebase_plan_validation".into(),
+            error: "RequiredPointerUnresolved: slot 3".into(),
+        };
+        let s = e.to_string();
+        assert!(s.contains("GTO_UNPACK_FAILED"), "got: {s}");
+        assert!(
+            s.contains("stage=runtime_rebase_plan_validation"),
+            "got: {s}"
+        );
+        assert!(s.contains("error=RequiredPointerUnresolved"), "got: {s}");
+    }
+
+    #[test]
+    fn gto_stage_keeps_source_error_text() {
+        let e = PeError::GtoStage {
+            stage: "bootstrap_install".into(),
+            error: "HeapBootstrapError::MissingImport(\"VirtualAlloc\")".into(),
+        };
+        let s = e.to_string();
+        assert!(s.contains("stage=bootstrap_install"), "got: {s}");
+        assert!(s.contains("VirtualAlloc"), "got: {s}");
+    }
+
+    #[test]
+    fn gto_stage_is_nonzero_error_source() {
+        let e = PeError::GtoStage {
+            stage: "final_summary_not_complete".into(),
+            error: "RebaseError::RequiredRuntimeCaptureMissing".into(),
+        };
+        // Implements std::error::Error (thiserror) -> usable in anyhow chains.
+        let _: &dyn std::error::Error = &e;
+        let s = format!("{:#}", e);
+        assert!(s.contains("final_summary_not_complete"), "got: {s}");
+    }
 }
