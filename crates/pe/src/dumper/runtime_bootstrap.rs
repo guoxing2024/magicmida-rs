@@ -839,13 +839,15 @@ fn emit_two_phase_code(
     ha_iat: u32,
     original_oep_rva: u32,
     cookie_rva_placeholder: u32,
-    image_base: u64,
+    _image_base: u64,
 ) -> Result<(Vec<u8>, CodePatchPoints), HeapBootstrapError> {
     use super::x64_asm as a;
     let mut s: Vec<u8> = Vec::new();
 
-    // ---- Prologue: push nonvolatiles; align stack ----
-    for r in [3u8, 6, 7, 12, 13, 14, 15] {
+    // ---- Prologue: Win64 ABI. 8 pushes + sub rsp,0x28 gives RSP mod16 == 0
+    // before API calls with a full 32-byte shadow space (entry RSP mod16 == 8).
+    // rbp is dedicated to the runtime-loaded image base (ASLR scheme B).
+    for r in [3u8, 5, 6, 7, 12, 13, 14, 15] {
         a::push_r64(&mut s, r);
     }
     a::sub_rsp_imm8(&mut s, 0x28);
@@ -857,6 +859,12 @@ fn emit_two_phase_code(
     let d = rel32(gph_next, gph_iat)?;
     s[gph_disp_at..gph_disp_at + 4].copy_from_slice(&d);
     a::mov_r64_r64(&mut s, 14, 0); // mov r14, rax
+
+    // ---- rbp = actual loaded image base (ASLR scheme B) ----
+    // PEB = gs:[0x60]; ImageBaseAddress = [PEB+0x10].
+    a::mov_r64_gs_disp32(&mut s, 0, 0x60); // mov rax, gs:[0x60]  (PEB)
+    a::mov_r64_mem(&mut s, 0, &a::Mem::rax(0x10)); // mov rax, [rax+0x10] (loaded base)
+    a::mov_r64_r64(&mut s, 5, 0); // mov rbp, rax
 
     // ---- r15 = meta base (lea, patched) ----
     let meta_leia = s.len();
@@ -916,7 +924,7 @@ fn emit_two_phase_code(
     // ---- p1_inline ----
     let p1_inline = s.len();
     patch_rel32(&mut s, p1_jz_inline, p1_inline)?;
-    a::mov_r64_imm64(&mut s, 10, image_base); // mov r10, image_base
+    a::mov_r64_r64(&mut s, 10, 5); // mov r10, rbp (loaded image base)
     a::mov_r32_mem(&mut s, 9, &a::Mem::r12(0x18)); // mov r9d, [r12+0x18] (image_rva, 32-bit)
     a::add_r64_r64(&mut s, 10, 9); // add r10, r9
     a::mov_mem_r64(&mut s, &a::Mem::rbx_index(11, 8), 10); // [rbx+r11*8] = r10
@@ -994,7 +1002,7 @@ fn emit_two_phase_code(
     a::cmp_r8b_imm8(&mut s, 8, 1);
     a::jcc_rel32(&mut s, 0x85, 0); // jne not_image
     let p2_jne_image = s.len() - 4;
-    a::mov_r64_imm64(&mut s, 10, image_base);
+    a::mov_r64_r64(&mut s, 10, 5); // mov r10, rbp (loaded image base)
     a::mov_r32_mem(&mut s, 9, &a::Mem::r12(0x18)); // mov r9d, [r12+0x18] (image_rva)
     a::add_r64_r64(&mut s, 10, 9);
     a::mov_r64_r64(&mut s, 2, 10); // mov rdx, r10
@@ -1016,7 +1024,7 @@ fn emit_two_phase_code(
     a::add_r64_r64(&mut s, 1, 9); // add rcx, r9 (resolver entry)
     a::mov_r32_mem(&mut s, 8, &a::Mem::rcx(8)); // mov r8d, [rcx+8] (iat_rva)
                                                 // r10 = image_base + iat_rva ; rdx = [r10]
-    a::mov_r64_imm64(&mut s, 10, image_base);
+    a::mov_r64_r64(&mut s, 10, 5); // mov r10, rbp (loaded image base)
     a::add_r64_r64(&mut s, 10, 8); // r10 += iat_rva -> iat_slot address
     a::mov_r64_mem(&mut s, 2, &a::Mem::r10(0)); // rdx = [r10] (resolved API value)
     a::jmp_rel32(&mut s, 0); // jmp p2_write
@@ -1046,7 +1054,7 @@ fn emit_two_phase_code(
 
     // ===================== Completion cookie =====================
     // mov r10, image_base ; add r10, cookie_rva ; mov dword [r10], 1
-    a::mov_r64_imm64(&mut s, 10, image_base);
+    a::mov_r64_r64(&mut s, 10, 5); // mov r10, rbp (loaded image base)
     a::add_r64_imm32(&mut s, 10, cookie_rva_placeholder as i32);
     let cookie_patch_pos = s.len() - 4;
     a::mov_dword_mem_imm32(&mut s, &a::Mem::r10(0), 1);
@@ -1057,13 +1065,15 @@ fn emit_two_phase_code(
     }
 
     // ===================== Epilogue + jmp OEP =====================
+    // Symmetric with the 8-push prologue + sub rsp,0x28.
     a::add_rsp_imm8(&mut s, 0x28);
-    for r in [15u8, 14, 13, 12, 7, 6, 3] {
+    for r in [15u8, 14, 13, 12, 7, 6, 5, 3] {
         a::pop_r64(&mut s, r);
     }
     a::jmp_rel32(&mut s, 0); // jmp rel32 OEP (patched)
     let jmp_oep_at = s.len() - 4;
-    let jmp_oep_next = boot_rva + s.len() as u32 + 4;
+    // rel32 is relative to the address after the 5-byte jmp (= disp end).
+    let jmp_oep_next = boot_rva + jmp_oep_at as u32 + 4;
     let oep_rel = i32::try_from(i64::from(original_oep_rva) - i64::from(jmp_oep_next))
         .map_err(|_| HeapBootstrapError::Codegen("OEP jump out of range".into()))?;
     s[jmp_oep_at..jmp_oep_at + 4].copy_from_slice(&oep_rel.to_le_bytes());
@@ -1581,8 +1591,8 @@ mod machine_code_tests {
     use super::*;
     use crate::dumper::container_snapshot::ContainerSnapshot;
     use crate::dumper::runtime_rebase::{
-        build_runtime_rebase_plan, declared_slots_from_capture, summarize_plan, ExternalTarget,
-        RuntimeRebasePlan,
+        build_runtime_rebase_plan, declared_slots_from_capture, summarize_plan,
+        validate_rebased_snapshots, ExternalTarget, RuntimeRebasePlan,
     };
     use iced_x86::{Decoder, DecoderOptions, MemorySize, Mnemonic, Register};
 
@@ -2000,9 +2010,452 @@ mod machine_code_tests {
     }
 
     /// ASLR scheme A synthetic model: the emitted stub bakes the preferred
-    /// image base; a contract with a different loaded base must fail.
+    /// ASLR scheme B: the stub reads the actual loaded image base at runtime
+    /// from the PEB (`mov rax, gs:[0x60]` then `mov rax, [rax+0x10]`), so it
+    /// does not embed a preferred-base immediate.
     #[test]
-    fn aslr_scheme_a_loaded_must_equal_preferred() {
+    fn aslr_scheme_b_reads_peb_image_base() {
+        let plan = plan_from(&[container(
+            0x1000,
+            0x500000,
+            0x500010,
+            0x500020,
+            region_bytes(0x10, &[(0, 0x500000)]),
+        )]);
+        let _meta = meta_of(&plan);
+        let code = stub_code(&plan);
+        let insns = decode_all(&code);
+        // The stub must read gs:[0x60] (PEB) and then [PEB+0x10] (ImageBase).
+        let has_gs_read = insns.iter().any(|i| {
+            i.mnemonic() == Mnemonic::Mov
+                && i.segment_prefix() == Register::GS
+                && i.memory_base() == Register::None
+                && i.memory_displacement64() == 0x60
+        });
+        assert!(has_gs_read, "stub must read the PEB via gs:[0x60]");
+        let has_peb_deref = insns.iter().any(|i| {
+            i.mnemonic() == Mnemonic::Mov
+                && i.memory_base() == iced_x86::Register::RAX
+                && i.memory_displacement64() == 0x10
+        });
+        assert!(
+            has_peb_deref,
+            "stub must read [PEB+0x10] for the image base"
+        );
+        // No preferred-base immediate must be present (scheme B, not A).
+        let has_imm64 = insns
+            .iter()
+            .any(|i| i.op_count() == 2 && i.op1_kind() == iced_x86::OpKind::Immediate64);
+        assert!(
+            !has_imm64,
+            "scheme B stub must not embed a preferred-base immediate"
+        );
+    }
+
+    /// Win64 ABI stack-alignment simulation. Tracks RSP across the emitted
+    /// stub's push/pop/sub/add and asserts:
+    /// - entry RSP mod16 == 8;
+    /// - before every `call` (GetProcessHeap/HeapAlloc), RSP mod16 == 0;
+    /// - before the OEP jmp, RSP is restored to the entry value;
+    /// - push/pop count is balanced.
+    #[test]
+    fn win64_abi_stack_alignment() {
+        let plan = plan_from(&[container(
+            0x1000,
+            0x500000,
+            0x500010,
+            0x500020,
+            region_bytes(0x10, &[(0, 0x500000)]),
+        )]);
+        let code = stub_code(&plan);
+        let insns = decode_all(&code);
+
+        let entry_rsp: i64 = 8; // mod16 == 8 (post-return-address / jmp transfer)
+        let mut rsp = entry_rsp;
+        let mut push_count = 0i64;
+        let mut pop_count = 0i64;
+        let mut call_sites: Vec<(usize, i64)> = Vec::new(); // (offset, rsp_mod16)
+        let mut oep_jmp_rsp: Option<i64> = None;
+
+        for (off, insn) in insns.iter().enumerate() {
+            match insn.mnemonic() {
+                Mnemonic::Push => {
+                    rsp -= 8;
+                    push_count += 1;
+                }
+                Mnemonic::Pop => {
+                    rsp += 8;
+                    pop_count += 1;
+                }
+                Mnemonic::Call => {
+                    // RSP before the call must be 16-aligned. The callee's ret
+                    // restores RSP, so we do not mutate it here (we only track
+                    // the caller-frame RSP across the stub's own push/pop/sub).
+                    call_sites.push((off, rsp.rem_euclid(16)));
+                }
+                Mnemonic::Sub
+                    if insn.op0_register() == Register::RSP
+                        && (insn.op1_kind() == iced_x86::OpKind::Immediate8
+                            || insn.op1_kind() == iced_x86::OpKind::Immediate8to64
+                            || insn.op1_kind() == iced_x86::OpKind::Immediate32to64) =>
+                {
+                    rsp -= insn.immediate(1) as i64;
+                }
+                Mnemonic::Add
+                    if insn.op0_register() == Register::RSP
+                        && (insn.op1_kind() == iced_x86::OpKind::Immediate8
+                            || insn.op1_kind() == iced_x86::OpKind::Immediate8to64
+                            || insn.op1_kind() == iced_x86::OpKind::Immediate32to64) =>
+                {
+                    rsp += insn.immediate(1) as i64;
+                }
+                Mnemonic::Jmp => {
+                    // Record RSP at the OEP transfer (the near jmp at the end).
+                    oep_jmp_rsp = Some(rsp);
+                }
+                _ => {}
+            }
+        }
+
+        // Push/pop balanced (the memcpy helper pushes/pops rdi,rsi locally).
+        assert_eq!(push_count, pop_count, "push/pop must balance");
+        // Entry RSP mod16 == 8.
+        assert_eq!(entry_rsp.rem_euclid(16), 8, "entry rsp mod16 must be 8");
+        // Before each API call, RSP mod16 == 0.
+        assert!(
+            !call_sites.is_empty(),
+            "must contain at least the GetProcessHeap / HeapAlloc calls"
+        );
+        for (off, m) in &call_sites {
+            assert_eq!(
+                *m, 0,
+                "call at offset {off:#x} must have rsp mod16 == 0, got {m}"
+            );
+        }
+        // OEP jmp: RSP restored to entry value.
+        if let Some(oep) = oep_jmp_rsp {
+            assert_eq!(oep, entry_rsp, "OEP jmp must see entry RSP");
+        }
+    }
+
+    /// All pushes and pops must be byte-count balanced (net stack delta 0).
+    #[test]
+    fn win64_abi_push_pop_balanced() {
+        let plan = plan_from(&[container(
+            0x1000,
+            0x500000,
+            0x500010,
+            0x500020,
+            region_bytes(0x10, &[(0, 0x500000)]),
+        )]);
+        let code = stub_code(&plan);
+        let insns = decode_all(&code);
+        let mut delta = 0i64;
+        for insn in &insns {
+            match insn.mnemonic() {
+                Mnemonic::Push => delta += 1,
+                Mnemonic::Pop => delta -= 1,
+                _ => {}
+            }
+        }
+        assert_eq!(delta, 0, "net push/pop delta must be 0");
+    }
+
+    /// The prologue must be 8 pushes (rbx,rbp,rsi,rdi,r12-r15) + sub rsp,0x28.
+    #[test]
+    fn win64_abi_prologue_8_pushes_plus_sub_28() {
+        let plan = plan_from(&[container(
+            0x1000,
+            0x500000,
+            0x500010,
+            0x500020,
+            region_bytes(0x10, &[(0, 0x500000)]),
+        )]);
+        let code = stub_code(&plan);
+        let insns = decode_all(&code);
+        // First 8 instructions are pushes.
+        for i in 0..8 {
+            assert_eq!(insns[i].mnemonic(), Mnemonic::Push, "prologue push #{i}");
+        }
+        // 9th is sub rsp, imm.
+        assert_eq!(insns[8].mnemonic(), Mnemonic::Sub);
+        assert_eq!(
+            insns[8].immediate(1),
+            0x28,
+            "sub rsp must be 0x28 (immediate is op1)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Requirement #3: validate the FINAL blob from build_runtime_bootstrap(),
+    // not the bare emit_two_phase_code() output.
+    // -----------------------------------------------------------------------
+
+    /// Build the final `.boot` blob for a synthetic plan via
+    /// `build_runtime_bootstrap()`.
+    fn build_final_boot_blob_for_test(
+        plan: &RuntimeRebasePlan,
+        boot_rva: u32,
+    ) -> (Vec<u8>, BootContractLayout, u32) {
+        let pe = crate::header::make_minimal_pe64();
+        let mut pe = crate::header::PeHeader::from_bytes(&pe).unwrap();
+        pe.nt_headers.optional_header.image_base = NEW_IB;
+        let prepared = crate::dumper::runtime_rebase::PreparedRuntimeRebase {
+            plan: plan.clone(),
+            summary: summarize_plan(plan, None, 0x5a10, None, "none", false),
+        };
+        let mut imports = crate::import_table::ImportTableBuilder::new(true);
+        imports.ensure_function("kernel32.dll", "GetProcessHeap");
+        imports.ensure_function("kernel32.dll", "HeapAlloc");
+        let result = build_runtime_bootstrap(&mut pe, &imports, &prepared, 0x5a10, boot_rva)
+            .expect("build final blob");
+        (
+            result.blob,
+            BootContractLayout {
+                header_off: result.layout.header_off,
+                payload_off: result.layout.payload_off,
+                map_off: result.layout.map_off,
+                cookie_off: result.layout.cookie_off,
+                total: result.layout.total,
+                preferred_image_base: pe.nt_headers.optional_header.image_base,
+            },
+            result.completion_cookie_rva,
+        )
+    }
+
+    /// Decode the final blob's code (up to header_off) and metadata.
+    fn decode_final_boot_blob(
+        blob: &[u8],
+        layout: &BootContractLayout,
+        ip_base: u64,
+    ) -> (Vec<iced_x86::Instruction>, BootMetadata) {
+        let code = &blob[..layout.header_off];
+        let mut d = Decoder::with_ip(64, code, ip_base, DecoderOptions::NONE);
+        let mut insns = Vec::new();
+        while d.can_decode() {
+            insns.push(d.decode());
+        }
+        let meta = decode_plan_metadata(blob, layout.header_off).expect("decode final metadata");
+        (insns, meta)
+    }
+
+    /// Validate the final blob: lea patches, cookie patch, header offsets,
+    /// payload address, map/cookie non-overlap, OEP rel32, memory bases.
+    #[test]
+    fn validate_final_boot_blob() {
+        let a = container(
+            0x1000,
+            0x500000,
+            0x500010,
+            0x500020,
+            region_bytes(0x10, &[(0, 0x600000)]),
+        );
+        let b = container(
+            0x2000,
+            0x600000,
+            0x600020,
+            0x600040,
+            region_bytes(0x20, &[(0, 0x600000)]),
+        );
+        let plan = plan_from(&[a, b]);
+        let boot_rva = 0x2000u32;
+        let (blob, layout, cookie_rva) = build_final_boot_blob_for_test(&plan, boot_rva);
+        let (insns, meta) = decode_final_boot_blob(&blob, &layout, boot_rva as u64);
+
+        // 1. Meta lea displacement patched: lea r15, [rip+disp] targets
+        //    boot_rva + header_off.
+        let meta_lea = insns
+            .iter()
+            .find(|i| i.mnemonic() == Mnemonic::Lea && i.op0_register() == Register::R15);
+        let meta_lea = meta_lea.expect("meta lea present");
+        let meta_lea_target = meta_lea.ip_rel_memory_address();
+
+        assert_eq!(
+            meta_lea_target,
+            (boot_rva + layout.header_off as u32) as u64,
+            "meta lea patched"
+        );
+
+        // 2. Alloc-map lea displacement patched: lea rbx, [rip+disp] targets
+        //    boot_rva + map_off.
+        let map_lea = insns
+            .iter()
+            .find(|i| i.mnemonic() == Mnemonic::Lea && i.op0_register() == Register::RBX);
+        let map_lea = map_lea.expect("map lea present");
+        let map_lea_target = map_lea.ip_rel_memory_address();
+        assert_eq!(
+            map_lea_target,
+            (boot_rva + layout.map_off as u32) as u64,
+            "alloc-map lea patched"
+        );
+
+        // 3. Cookie immediate patched: `add r10, imm` has imm == cookie_rva.
+        let expected_cookie_rva = boot_rva + layout.cookie_off as u32;
+        assert_eq!(cookie_rva, expected_cookie_rva, "cookie rva from layout");
+        let cookie_add = insns.iter().find(|i| {
+            i.mnemonic() == Mnemonic::Add
+                && i.op0_register() == Register::R10
+                && (i.op1_kind() == iced_x86::OpKind::Immediate32to64
+                    || i.op1_kind() == iced_x86::OpKind::Immediate32)
+                && i.immediate(1) == expected_cookie_rva as u64
+        });
+        assert!(
+            cookie_add.is_some(),
+            "cookie immediate patched to {expected_cookie_rva:#x}"
+        );
+
+        // 4. Metadata header decodes: counts match the plan.
+        assert_eq!(meta.regions.len(), plan.regions.len());
+        assert_eq!(meta.fixups.len(), plan.pointers.len());
+        assert_eq!(meta.resolvers.len(), plan.external_targets.len());
+
+        // 5. Map/cookie do not overlap (cookie is last).
+        assert!(layout.cookie_off >= layout.map_off, "cookie after map");
+        assert!(
+            layout.cookie_off >= layout.payload_off,
+            "cookie after payload"
+        );
+        assert!(layout.cookie_off >= layout.header_off, "cookie after code");
+
+        // 6. All memory operands with base R12 are correct.
+        for insn in insns.iter().filter(|i| i.memory_base() == Register::R12) {
+            let disp = insn.memory_displacement64();
+            assert!(
+                [0u64, 4, 8, 0xc, 0x10, 0x14, 0x18, 0x1c].contains(&disp),
+                "r12 base with bad disp {disp:#x}"
+            );
+        }
+
+        // 7. OEP rel32 target correct: the final near jmp targets 0x5a10.
+        let oep_jmp = insns.iter().rev().find(|i| i.mnemonic() == Mnemonic::Jmp);
+        let oep_jmp = oep_jmp.expect("OEP near jmp");
+        assert_eq!(oep_jmp.near_branch_target(), 0x5a10, "OEP rel32 patched");
+    }
+
+    /// The final blob's decoded payload, run through simulate_runtime_rebase
+    /// with IAT contents, must yield correctly patched payloads.
+    #[test]
+    fn final_blob_simulate_with_iat() {
+        let api_va = 0x7ff9_1000_2000u64;
+        let modules = vec![(
+            "kernel32.dll".to_string(),
+            0x7ff9_1000_0000u64,
+            0x7ff9_1000_4000u64,
+        )];
+        let mut resolvers = crate::dumper::runtime_rebase::ExternalResolverTable::new();
+        resolvers
+            .insert(ExternalTarget {
+                module_identity: "kernel32.dll".to_string(),
+                module_rva: api_va - 0x7ff9_1000_0000,
+                import_dll: "kernel32.dll".to_string(),
+                import_name_or_ordinal: "HeapAlloc".to_string(),
+                iat_rva: Some(0xf0100),
+                resolution_kind: ExternalResolutionKind::ViaIat,
+            })
+            .unwrap();
+        // Region 0 points to region 1 (0x600000) and to an external API.
+        let a = container(
+            0x1000,
+            0x500000,
+            0x500020,
+            0x500040,
+            region_bytes(0x20, &[(0, 0x600000), (8, api_va)]),
+        );
+        let b = container(
+            0x2000,
+            0x600000,
+            0x600020,
+            0x600040,
+            region_bytes(0x20, &[(0, 0x600000)]),
+        );
+        let slots = declared_slots_from_capture(&[a.clone(), b.clone()], &[], None);
+        let plan = build_runtime_rebase_plan(
+            &[a, b],
+            &[],
+            None,
+            &slots,
+            &resolvers,
+            &modules,
+            OLD_IB,
+            NEW_IB,
+        )
+        .unwrap()
+        .unwrap();
+        let boot_rva = 0x2000u32;
+        let (blob, layout, _cookie) = build_final_boot_blob_for_test(&plan, boot_rva);
+        let (_, meta) = decode_final_boot_blob(&blob, &layout, boot_rva as u64);
+        // Simulate with allocation bases and IAT contents.
+        let bases = [0x900000u64, 0xa00000];
+        let loaded_base = NEW_IB;
+        let iat_slot = loaded_base + 0xf0100;
+        let mut iat = std::collections::HashMap::new();
+        iat.insert(iat_slot, api_va);
+        let patched = simulate_runtime_rebase(&meta, &bases, loaded_base, &iat).unwrap();
+        // Region 0 slot 0 -> region 1 new base; slot 1 -> resolved API VA.
+        assert_eq!(
+            u64::from_le_bytes(patched[0][0..8].try_into().unwrap()),
+            0xa00000,
+            "A->B rebased"
+        );
+        assert_eq!(
+            u64::from_le_bytes(patched[0][8..16].try_into().unwrap()),
+            api_va,
+            "external writes resolved API VA"
+        );
+        // No old-range pointer remains.
+        validate_rebased_snapshots(
+            &plan,
+            &patched.iter().map(|v| v.as_slice()).collect::<Vec<_>>(),
+        )
+        .unwrap();
+    }
+
+    /// Requirement #4: the stub's allocation-failure path (p1_fail) is an
+    /// infinite loop that cannot reach OEP. Verify the `eb fe` (jmp $) exists
+    /// in the code, and that no near-jmp from it targets OEP.
+    #[test]
+    fn allocation_fail_path_cannot_reach_oep() {
+        let plan = plan_from(&[container(
+            0x1000,
+            0x500000,
+            0x500010,
+            0x500020,
+            region_bytes(0x10, &[(0, 0x500000)]),
+        )]);
+        let code = stub_code(&plan);
+        // Decode at the emit-time boot_rva so rel32 targets are correct.
+        let mut d = Decoder::with_ip(64, &code, 0x2000, DecoderOptions::NONE);
+        let mut insns = Vec::new();
+        while d.can_decode() {
+            insns.push(d.decode());
+        }
+        // Find `jmp $` (eb fe) = infinite loop (the fail path).
+        let infinite = insns
+            .iter()
+            .any(|i| i.mnemonic() == Mnemonic::Jmp && i.near_branch_target() == i.ip());
+        assert!(infinite, "fail path must be an infinite loop (jmp $)");
+        // The OEP transfer is the LAST near jmp (targets 0x5a10). The infinite
+        // loop must appear before it (fail path precedes the successful epilogue).
+        let oep_jmp = insns
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, i)| i.mnemonic() == Mnemonic::Jmp && i.near_branch_target() == 0x5a10);
+        assert!(oep_jmp.is_some(), "OEP near jmp present");
+        // The infinite-loop jmp must not be after the OEP transfer (it is the
+        // p1_fail path, which is emitted before Phase 2 and the epilogue).
+        let inf_idx = insns
+            .iter()
+            .position(|i| i.mnemonic() == Mnemonic::Jmp && i.near_branch_target() == i.ip())
+            .expect("infinite loop index");
+        let oep_idx = oep_jmp.unwrap().0;
+        assert!(inf_idx < oep_idx, "fail loop before OEP transfer");
+    }
+
+    /// Requirement #4: simulate_runtime_rebase with an empty allocation_bases
+    /// (allocation failure) must fail closed, not produce a partial payload.
+    #[test]
+    fn simulate_allocation_failure_fails_closed() {
         let plan = plan_from(&[container(
             0x1000,
             0x500000,
@@ -2011,17 +2464,28 @@ mod machine_code_tests {
             region_bytes(0x10, &[(0, 0x500000)]),
         )]);
         let meta = meta_of(&plan);
-        // The stub embeds NEW_IB as image_base.
-        let code = stub_code(&plan);
-        let insns = decode_all(&code);
-        // movabs r10, imm64 with imm == NEW_IB (InImage / cookie / inline use it).
-        let has_image_base = insns.iter().any(|i| {
-            i.mnemonic() == Mnemonic::Mov
-                && i.op1_kind() == iced_x86::OpKind::Immediate64
-                && i.immediate(1) == NEW_IB
-        });
-        assert!(has_image_base, "stub must embed the preferred image base");
-        // A loaded base != preferred is a contract failure (validated elsewhere).
-        let _ = meta;
+        let err = simulate_runtime_rebase(&meta, &[], NEW_IB, &Default::default()).unwrap_err();
+        assert!(matches!(err, HeapBootstrapError::Codegen(_)));
+    }
+
+    /// Requirement #4: simulate_runtime_rebase with a dangling fixup (source
+    /// offset past the payload) must fail closed.
+    #[test]
+    fn simulate_fixup_out_of_bounds_fails_closed() {
+        let plan = plan_from(&[container(
+            0x1000,
+            0x500000,
+            0x500010,
+            0x500020,
+            region_bytes(0x10, &[(0, 0x500000)]),
+        )]);
+        let mut meta = meta_of(&plan);
+        // Corrupt a fixup source_offset to be out of bounds.
+        if let Some(f) = meta.fixups.iter_mut().find(|f| f.classification != 0) {
+            f.source_offset = usize::MAX;
+        }
+        let err =
+            simulate_runtime_rebase(&meta, &[0x900000], NEW_IB, &Default::default()).unwrap_err();
+        assert!(matches!(err, HeapBootstrapError::Codegen(_)));
     }
 }

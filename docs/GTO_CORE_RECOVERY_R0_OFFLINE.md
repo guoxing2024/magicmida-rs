@@ -281,3 +281,65 @@ payload offset 语义未统一；external IAT 模拟把 iat_slot 当 resolved_va
 ## B1.5 诚实边界
 
 机器码级验证用 iced-x86 反汇编证明 emitted stub 的 memory operand base、load 宽度、rel32 target、cookie write、OEP transfer 结构正确；但真实进程中的运行时执行（寄存器状态、IAT 内容、heap 分配）仍需下一轮受控 live route 验证。ASLR scheme A 要求在 live 前确认实际 loaded base == preferred base，否则 fail-closed。
+
+
+---
+
+# 附录：R0-B.2 — Win64 ABI 与真实 loaded-base gate
+
+**Base:** `2f3938e`（R0-B.1 之后）
+
+## B2.1 Win64 stack alignment 修复
+
+- Prologue 改为 **8 pushes（rbx,rbp,rsi,rdi,r12-r15）+ sub rsp,0x28**。入口 RSP mod16==8，8 pushes（64B）→ mod16==8，sub 0x28（40B）→ mod16==0，API call 前对齐且含完整 32-byte shadow space。
+- Epilogue 完全对称：`add rsp,0x28` + 8 pops（逆序，含 rbp）。
+- inline memcpy helper 的 push rdi/rsi + pop rsi/rdi 净 0，不破坏 caller stack contract（rep movsb 内无 call）。
+- 机器码 ABI 测试（`win64_abi_stack_alignment`）模拟 RSP：入口 mod16==8、GetProcessHeap/HeapAlloc call 前 mod16==0、OEP jmp 前 RSP 恢复 entry、push/pop 平衡；`win64_abi_prologue_8_pushes_plus_sub_28` 断言前 8 条是 push 且 sub 为 0x28。
+
+## B2.2 ASLR Scheme B（运行时 loaded base）
+
+- 弃用 scheme A（`pe.header.image_base == preferred` 并非 actual loaded base）。
+- Stub 经 PEB 获取实际 loaded base：`mov rax, gs:[0x60]`（PEB）→ `mov rax, [rax+0x10]`（ImageBaseAddress）→ `mov rbp, rax`。
+- image-inline / InImage / external IAT / completion cookie 全部用 rbp（实际 base），**移除所有 preferred-base immediate**。
+- `validate_bootstrap_contract` 不再要求 loaded==preferred；改为校验 preferred base 非 0（metadata 自洽）。实际 loaded base 是运行时观测，离线缺失为 NotReady，绝不冒充 match。
+- 机器码测试 `aslr_scheme_b_reads_peb_image_base`：断言 stub 有 `gs:[0x60]` 读、`[rax+0x10]` deref、且无 preferred-base immediate64。
+
+## B2.3 final blob 机器码验证
+
+新增 `build_final_boot_blob_for_test` / `decode_final_boot_blob` / `validate_final_boot_blob`（针对 `build_runtime_bootstrap()` 的最终 blob，非裸 emitter）：
+- meta lea displacement 已 patch（`lea r15,[rip+disp]` 目标 = boot_rva+header_off）；
+- alloc-map lea 已 patch（目标 = boot_rva+map_off）；
+- cookie immediate 已 patch（`add r10,imm` = cookie_rva，cookie_rva = boot_rva+cookie_off）；
+- metadata header offset 解码正确（region/fixup/resolver 计数匹配 plan）；
+- map/cookie 不重叠（cookie 最后）；
+- OEP rel32 target 正确（修正了 OEP jmp rel32 off-by-4 bug）；
+- 所有 `[r12+off]` memory operand base 正确；
+- decode 后 simulate_runtime_rebase（带 IAT contents）得到正确 payload。
+
+## B2.4 修正 OEP rel32 bug
+
+`jmp_oep_next` 原先用 `boot_rva + s.len() + 4`（多算 4），导致 OEP jmp 目标偏 4。改为 `boot_rva + jmp_oep_at + 4`（jmp 指令后地址）。
+
+## B2.5 runtime model 补充
+
+- `simulate_runtime_rebase` 已覆盖：external 写 IAT slot contents、slot 地址 != API 地址、缺 IAT contents fail-closed、ASLR loaded base 改变仍按新 IAT 内容解析。
+- 新增机器码测试：allocation fail path 是无限循环（`jmp $`）且在 OEP transfer 之前（不可达 OEP）；空 allocation_bases（allocation 失败）fail-closed；fixup 越界 fail-closed。
+
+## B2.6 修改文件
+
+- `crates/pe/src/dumper/runtime_bootstrap.rs`：prologue/epilogue ABI、PEB base、OEP rel32 修复、fail-path 测试。
+- `crates/pe/src/dumper/x64_asm.rs`：新增 `mov_r64_gs_disp32`（PEB 读）。
+- `crates/pe/src/dumper/runtime_rebase.rs`：contract 改 scheme B（移除 loaded==preferred）。
+
+## B2.7 验证
+
+- `cargo test -p mida-pe --offline`：314 lib pass + 其余（含 win64_abi 3 项、machine_code_tests 18 项）。
+- `cargo test -p mida-cli --features gto-product-recovery --offline`：8 bins / 0 fail。
+- `cargo test -p mida-packers-ahk-gto --features gto-product-recovery --offline`：2 bins / 0 fail。
+- `cargo test --workspace --offline`：42 bins / 0 fail。
+- `cargo fmt --all -- --check`、`git diff --check` 干净。
+- **未改 acceptance / gto_host / bwhook；未运行真实 sample。**
+
+## B2.8 诚实边界
+
+实际 loaded base 是运行时观测，离线无法取得；因此 recovery summary 对 base_match 只能报 NotReady，绝不冒充 match。机器码级验证证明 stub 的 ABI 对齐、PEB base 读取、OEP rel32、fail-path 结构正确；真实进程中的运行时执行仍需下一轮受控 live route 验证。

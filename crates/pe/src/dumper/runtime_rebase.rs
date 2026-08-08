@@ -1393,18 +1393,20 @@ pub fn validate_bootstrap_contract(
         )));
     }
 
-    // ASLR scheme A: the stub is emitted against the preferred image base
-    // (hardcoded movabs image_base). The cold-start PE must load at that base;
-    // if the actual loaded base differs, the stub's InImage/cookie/image-inline
-    // addresses are wrong and the recovery must fail closed before live.
-    let preferred = contract.preferred_image_base;
-    let loaded = pe.nt_headers.optional_header.image_base;
-    if loaded != preferred {
-        return Err(RebaseError::Contract(format!(
-            "ASLR scheme A violated: PE loaded base {loaded:#x} != preferred {preferred:#x}; \
-             the stub addresses image_base {preferred:#x} and would be wrong at {loaded:#x}. \
-             Recovery is not safe to run."
-        )));
+    // ASLR scheme B: the emitted stub reads the actual loaded image base at
+    // runtime from the PEB (`gs:[0x60]` -> `[+0x10]`) and uses it for every
+    // image-relative address (image-inline, InImage, IAT, completion cookie).
+    // There is therefore no fixed-base equality requirement here. The *actual*
+    // loaded base is a runtime observation; without one, the recovery cannot be
+    // marked Complete (the caller reports NotReady, never a match).
+    //
+    // We do record the preferred base that was compiled into the metadata header
+    // (diagnostic only) and require that it is non-zero so the metadata is
+    // self-consistent.
+    if contract.preferred_image_base == 0 {
+        return Err(RebaseError::Contract(
+            "preferred image base is 0; metadata inconsistent".into(),
+        ));
     }
 
     // Completion cookie slot placement (requirement R0-B.1 #6): must be inside
@@ -2460,22 +2462,16 @@ mod tests {
         let boot_rva = pe.sections[0].virtual_address;
         let cookie_rva = boot_rva + contract.cookie_off as u32;
         // Valid contract passes (boot in exec section, cookie in writable range,
-        // preferred == loaded, cookie non-overlapping).
-        let ok = validate_bootstrap_contract(&pe, boot_rva, None, 0x1000, 1, cookie_rva, &contract);
-        // The minimal PE may or may not have a writable section covering the
-        // cookie; accept either path (the essential checks are covered below).
-        let _ = ok;
+        // cookie non-overlapping).
+        let _ = validate_bootstrap_contract(&pe, boot_rva, None, 0x1000, 1, cookie_rva, &contract);
 
-        // ASLR scheme A violation: a different loaded base must fail closed.
-        let loaded = pe.nt_headers.optional_header.image_base;
-        pe.nt_headers.optional_header.image_base = loaded.wrapping_add(0x1000000);
-        let aslr =
-            validate_bootstrap_contract(&pe, boot_rva, None, 0x1000, 1, cookie_rva, &contract);
-        assert!(
-            aslr.is_err(),
-            "ASLR scheme A: loaded base != preferred must fail closed"
-        );
-        pe.nt_headers.optional_header.image_base = loaded;
+        // ASLR scheme B: a zero preferred base is metadata-inconsistent and must
+        // fail closed; there is no loaded==preferred requirement (the stub reads
+        // the actual base at runtime via PEB).
+        let mut bad = contract;
+        bad.preferred_image_base = 0;
+        let zero = validate_bootstrap_contract(&pe, boot_rva, None, 0x1000, 1, cookie_rva, &bad);
+        assert!(zero.is_err(), "zero preferred base must fail closed");
     }
 
     // 21b. Cookie overlap with code must fail closed.

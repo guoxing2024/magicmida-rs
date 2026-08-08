@@ -378,6 +378,20 @@ pub fn test_r64_r64(out: &mut Vec<u8>, a: u8, b: u8) {
     out.push(modrm);
 }
 
+/// Emit `mov r64, [gs:disp32]`. Used to read the TEB/PEB (e.g. `gs:[0x60]`
+/// is the PEB pointer on x64 Windows; the image base lives at `[PEB+0x10]`).
+pub fn mov_r64_gs_disp32(out: &mut Vec<u8>, dest: u8, disp: i32) {
+    let rex_b = dest >= 8;
+    out.push(0x65); // GS segment override
+    out.push(rex_prefix(true, false, false, rex_b));
+    out.push(0x8b);
+    // mod=00, reg=dest, r/m=100 (SIB with disp32, no base = absolute).
+    let modrm = (0 << 6) | ((dest & 7) << 3) | 0b100;
+    out.push(modrm);
+    out.push(0x25); // SIB: no base, no index
+    out.extend_from_slice(&disp.to_le_bytes());
+}
+
 /// Emit `mov r64, r64`.
 pub fn mov_r64_r64(out: &mut Vec<u8>, dest: u8, src: u8) {
     let rex_r = src >= 8;
