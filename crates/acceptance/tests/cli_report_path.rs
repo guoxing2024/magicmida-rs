@@ -358,12 +358,17 @@ fn product_consumer_gates_on_parse_product_report() {
     // the strict parser and must see it as NOT product-acceptable.
     let report = parse_product_report(stdout.trim().as_bytes()).expect("strict parse");
     assert!(
-        !report.product_acceptable,
+        !report.product_acceptable(),
         "unsigned-lab must not be product-acceptable"
     );
     // The `--allow-unsigned-managed` lab path reports Lab (never Product).
-    assert_ne!(report.trust_tier, TrustTier::Product);
-    assert_eq!(report.verdict, Verdict::Accepted);
+    assert_ne!(report.trust_tier(), TrustTier::Product);
+    assert_eq!(report.verdict(), Verdict::Accepted);
+    // The strict product gate must REJECT this unsigned-lab report.
+    assert!(
+        !report.is_product_acceptance(),
+        "unsigned-lab report must not pass the product gate"
+    );
 }
 
 fn build_minimal_pe(dir: &TestDir) -> Vec<u8> {

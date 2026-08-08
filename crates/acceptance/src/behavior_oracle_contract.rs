@@ -527,10 +527,11 @@ pub(crate) struct VerifiedObservationBindings {
 
 /// A real, verifier-verified runtime observation. All fields are private and
 /// there is NO public constructor: a value of this type can only be produced by
-/// [`verify_observation_artifact`], which reads the actual observation bytes and
-/// environment manifest, recomputes their hashes, binds every trust field, and
-/// HMAC-signs the whole binding under the externally-injected verifier key.
-/// External callers cannot manufacture one.
+/// the real verifier seam (`observation_verifier_proto::verify_observation_artifact`,
+/// a `#[cfg(test)]` prototype — see below), which reads the actual observation
+/// bytes and environment manifest, recomputes their hashes, binds every trust
+/// field, and HMAC-signs the whole binding under the externally-injected
+/// verifier key. External callers cannot manufacture one.
 #[derive(Debug, Clone)]
 pub(crate) struct VerifiedObservationArtifact {
     observation_source_hash: String,
@@ -539,172 +540,40 @@ pub(crate) struct VerifiedObservationArtifact {
     bindings: VerifiedObservationBindings,
 }
 
-/// HMAC-SHA256 (RFC 2104) over `msg` keyed by `key`, returned as 64-hex. Used to
-/// derive the opaque observation trust token from an externally-injected
-/// verifier key.
-fn hmac_sha256(key: &[u8], msg: &[u8]) -> String {
-    const BLOCK: usize = 64;
-    let mut key_block = [0u8; BLOCK];
-    if key.len() > BLOCK {
-        let d = crate::sha256_hex(key);
-        let bytes = hex_to_bytes(&d);
-        key_block[..32.min(bytes.len())].copy_from_slice(&bytes[..32.min(bytes.len())]);
-    } else {
-        key_block[..key.len()].copy_from_slice(key);
-    }
-    let mut ipad = [0x36u8; BLOCK];
-    let mut opad = [0x5cu8; BLOCK];
-    for i in 0..BLOCK {
-        ipad[i] ^= key_block[i];
-        opad[i] ^= key_block[i];
-    }
-    let inner = crate::sha256_hex(&[ipad.as_slice(), msg].concat());
-    let inner_bytes = hex_to_bytes(&inner);
-    crate::sha256_hex(&[opad.as_slice(), inner_bytes.as_slice()].concat())
-}
-
-/// Decode a 64-char lowercase hex SHA-256 into 32 raw bytes. Panics on
-/// malformed input (only ever called on freshly-computed 64-hex values).
-fn hex_to_bytes(hex: &str) -> Vec<u8> {
-    (0..hex.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("valid hex"))
-        .collect()
-}
-
-/// Compute the opaque observation token: HMAC-SHA256 over the canonical binding
-/// string (observation + environment hashes + every trust field), keyed by the
-/// injected verifier key. The key is NOT in the library and is NOT derivable
-/// from the observation strings, so a caller cannot recompute the token.
-fn observer_token_for(
-    key: &[u8],
-    observation_source_hash: &str,
-    execution_environment_digest: &str,
-    bindings: &VerifiedObservationBindings,
-) -> TrustToken {
-    let mut msg = String::new();
-    msg.push_str(&format!("obs={observation_source_hash};"));
-    msg.push_str(&format!("env={execution_environment_digest};"));
-    msg.push_str(&format!("case={};", bindings.case_id));
-    msg.push_str(&format!("cand={};", bindings.candidate_sha256));
-    msg.push_str(&format!("prot={};", bindings.protected_sha256));
-    msg.push_str(&format!("probe={};", bindings.probe_sha256));
-    msg.push_str(&format!("runner={};", bindings.runner_sha256));
-    msg.push_str(&format!("toolrev={};", bindings.tool_revision));
-    msg.push_str(&format!("cfg={};", bindings.runner_config_digest));
-    TrustToken(hmac_sha256(key, msg.as_bytes()))
-}
-
-/// Canonicalize the environment manifest bytes into a stable digest. The
-/// canonicalization must be deterministic and reject unknown/malformed keys so
-/// that modifying the environment manifest changes the digest.
-fn canonical_environment_digest(
-    env_manifest: &[u8],
-) -> Result<String, BehaviorOracleContractError> {
-    // Environment manifest is a JSON object of environment facts. We re-serialize
-    // it in a canonical (sorted-key) form so reordering keys or changing a value
-    // changes the digest, while byte-for-byte formatting differences do not.
-    let value: serde_json::Value =
-        serde_json::from_slice(env_manifest).map_err(BehaviorOracleContractError::Json)?;
-    let obj = value
-        .as_object()
-        .ok_or(BehaviorOracleContractError::BadEnvironmentManifest)?;
-    if obj.is_empty() {
-        return Err(BehaviorOracleContractError::BadEnvironmentManifest);
-    }
-    let canonical = canonicalize_json(&value);
-    Ok(crate::sha256_hex(canonical.as_bytes()))
-}
-
-/// Deterministic, key-sorted JSON serialization (stable order, compact, no
-/// insignificant whitespace). Used so a digest is order-independent but
-/// value-dependent.
-fn canonicalize_json(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::Object(map) => {
-            let mut entries: Vec<_> = map
-                .iter()
-                .map(|(k, v)| format!("{k}:{}", canonicalize_json(v)))
-                .collect();
-            entries.sort();
-            format!("{{{}}}", entries.join(","))
-        }
-        serde_json::Value::Array(arr) => {
-            let inner: Vec<String> = arr.iter().map(canonicalize_json).collect();
-            format!("[{}]", inner.join(","))
-        }
-        serde_json::Value::String(s) => format!("\"{s}\""),
-        other => other.to_string(),
-    }
-}
-
-/// The REAL verifier seam that turns observation artifact bytes into a trusted
-/// [`VerifiedObservationArtifact`]. This is `pub(crate)`: it is reachable only
-/// inside the acceptance crate (the verifier), never by library consumers.
-///
-/// It performs the actual artifact verification:
-/// - reads and re-hashes the observation bytes → `observation_source_hash`;
-/// - reads and canonicalizes the environment manifest → `execution_environment_digest`;
-/// - binds case_id, candidate, protected input, probe, runner, tool revision,
-///   runner config digest;
-/// - HMAC-signs the whole binding under the EXTERNALLY-INJECTED `verifier_key`
-///   (a real trust-root secret, never hardcoded here and never serialized).
-///
-/// The `observation_source_hash` / `execution_environment_digest` / `case_id`
-/// fields declared on the candidate evidence are cross-checked against these
-/// recomputed values: the evidence may only claim an observation that the
-/// verifier actually produced for exactly this artifact.
-///
-/// In the current codebase NO production trust root is configured, so this seam
-/// is the honest boundary: offline there is no real observation to verify and
-/// the trusted registry stays empty (every candidate is `NotRun`/`Pending`).
-pub(crate) fn verify_observation_artifact(
-    observation_bytes: &[u8],
-    env_manifest: &[u8],
-    verifier_key: &[u8],
-    bindings: &VerifiedObservationBindings,
-) -> Result<VerifiedObservationArtifact, BehaviorOracleContractError> {
-    if verifier_key.is_empty() {
-        return Err(BehaviorOracleContractError::NoTrustedVerifierKey);
-    }
-    let observation_source_hash = crate::sha256_hex(observation_bytes);
-    let execution_environment_digest = canonical_environment_digest(env_manifest)?;
-    // Reject an empty / blank observation: a real artifact must have content.
-    if observation_bytes.is_empty() {
-        return Err(BehaviorOracleContractError::BadObservationIdentity);
-    }
-    // Cross-check the bindings are well-formed before minting.
-    if !is_sha256(&bindings.candidate_sha256)
-        || !is_sha256(&bindings.protected_sha256)
-        || !is_sha256(&bindings.probe_sha256)
-        || !is_sha256(&bindings.runner_sha256)
-        || !is_sha256(&bindings.runner_config_digest)
-        || bindings.case_id.trim().is_empty()
-        || bindings.tool_revision.trim().is_empty()
-    {
-        return Err(BehaviorOracleContractError::BadObservationBindings);
-    }
-    let token = observer_token_for(
-        verifier_key,
-        &observation_source_hash,
-        &execution_environment_digest,
-        bindings,
-    );
-    Ok(VerifiedObservationArtifact {
-        observation_source_hash,
-        execution_environment_digest,
-        token,
-        bindings: bindings.clone(),
-    })
-}
+// ---------------------------------------------------------------------------
+// PRODUCTION BOUNDARY (P2 / P9-live blocker)
+// ---------------------------------------------------------------------------
+//
+// The observation-verification machinery that mints a `VerifiedObservationArtifact`
+// and ingests it into the trusted registry (`verify_observation_artifact`,
+// `canonical_environment_digest`, `observer_token_for`, `hmac_sha256`, ...) is a
+// **test-only prototype**. There is NO real production artifact verifier and NO
+// configured production trust root in this codebase (the per-case business
+// oracle is a documented P9-live blocker). Therefore:
+//
+//   - these functions live in a `#[cfg(test)]` module and are NOT compiled into
+//     production (no dead_code, no false "wired" claim);
+//   - production always keeps the `TrustedObservationRegistry` EMPTY, so the
+//     offline verdict is always `NotRun`/`Pending`;
+//   - the prototype is deliberately NOT reachable by library consumers
+//     (`verify_observation_artifact` is not `pub`), so a caller cannot pick its
+//     own key and establish a trust root;
+//   - wiring a real production verifier (external observation attestation +
+//     fixed public-key allowlist) is outstanding P9 work; until then the Product
+//     behavior-Pass path is NOT implemented.
+//
+// See `mod observation_verifier_proto` at the end of this file for the
+// prototype implementation and its regression tests.
 
 /// Verifier-side registry of TRUSTED runtime observations (P1 issue 1: no
 /// self-reported-`Some` false-green, no caller self-minting).
 ///
 /// A behavioral `Pass` is ONLY possible for an observation that was actually
-/// verified by the real verifier seam ([`verify_observation_artifact`]) and
-/// ingested here. There is NO public minting API and the registry is empty by
-/// default; a caller cannot construct a Product trust root from raw strings.
+/// verified by the real verifier seam
+/// (`observation_verifier_proto::verify_observation_artifact`, a `#[cfg(test)]`
+/// prototype) and ingested here. There is NO public minting API and the
+/// registry is empty by default; a caller cannot construct a Product trust root
+/// from raw strings.
 ///
 /// `observation_is_trusted` is replay-resistant: it requires the evidence's
 /// opaque token to exactly match the token bound to the verified observation
@@ -724,10 +593,12 @@ impl TrustedObservationRegistry {
         Self::default()
     }
 
-    /// Ingest a real verifier-verified observation. `pub(crate)`: only the
-    /// verifier can call this, and only with an artifact it produced. A
+    /// Ingest a real verifier-verified observation. Reachable only from the
+    /// `#[cfg(test)]` prototype seam (`observation_verifier_proto`) — there is
+    /// no production verifier, so this is not compiled into production. A
     /// duplicate observation_source_hash with different content is refused
     /// (fail-closed, never silently overwritten).
+    #[cfg(test)]
     pub(crate) fn ingest(
         &mut self,
         artifact: VerifiedObservationArtifact,
@@ -746,6 +617,10 @@ impl TrustedObservationRegistry {
 
     /// Whether the evidence's observation is trusted. See the type docs for the
     /// full binding requirements (token + all trust fields must match).
+    ///
+    /// The token comparison is CONSTANT-TIME (no early exit on the first
+    /// differing byte), so a remote oracle cannot use timing to recover token
+    /// bytes from a query boundary.
     pub fn observation_is_trusted(&self, evidence: &BehaviorOracleContractEvidence) -> bool {
         let proof = &evidence.equivalence_proof;
         let source = proof.observation_source_hash.trim().to_lowercase();
@@ -753,12 +628,12 @@ impl TrustedObservationRegistry {
             // Not a verifier-verified observation (empty offline registry → false).
             return false;
         };
-        // Token must match the verified artifact's token.
-        if !proof
-            .trust_token
-            .trim()
-            .eq_ignore_ascii_case(artifact.token.as_str())
-        {
+        // Defensive: the artifact's stored source must equal the map key.
+        if artifact.observation_source_hash.trim().to_lowercase() != source {
+            return false;
+        }
+        // Constant-time token comparison.
+        if !ct_eq_hex(proof.trust_token.trim(), artifact.token.as_str()) {
             return false;
         }
         // Environment digest must match.
@@ -777,6 +652,23 @@ impl TrustedObservationRegistry {
             && evidence.tool_revision.trim() == b.tool_revision
             && evidence.runner_config_digest.trim().to_lowercase() == b.runner_config_digest
     }
+}
+
+/// Constant-time equality over two lowercase hex strings of equal length.
+/// Returns `false` immediately only on a length mismatch; otherwise every byte
+/// pair is compared and the result is the XOR of all differences (no early exit
+/// on the first differing byte).
+fn ct_eq_hex(a: &str, b: &str) -> bool {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for i in 0..a.len() {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
 }
 
 /// A single computed observable result (verifier output).
@@ -872,6 +764,8 @@ pub enum BehaviorOracleContractError {
     NoTrustedVerifierKey,
     #[error("environment manifest is missing or malformed")]
     BadEnvironmentManifest,
+    #[error("environment manifest rejected: {0}")]
+    EnvironmentManifestRejected(String),
     #[error(
         "observation artifact bindings are malformed (must be non-empty + well-formed hashes)"
     )]
@@ -1362,6 +1256,9 @@ pub fn offline_test_plan_lunlun() -> (String, Vec<BehaviorStimulus>) {
 
 #[cfg(test)]
 mod tests {
+    use super::observation_verifier_proto::{
+        canonical_environment_digest, observer_token_for, verify_observation_artifact,
+    };
     use super::*;
     use crate::oreans_gate::OreansArtifactIdentity;
 
@@ -1555,8 +1452,10 @@ mod tests {
 
     /// Test observation artifact bytes (non-empty, verifier-verified in tests).
     const TEST_OBSERVATION_BYTES: &[u8] = b"real-probe-observation-log";
-    /// Test environment manifest (a JSON object; canonicalized by the verifier).
-    const TEST_ENV_MANIFEST: &[u8] = br#"{"arch":"x86_64","os":"win","budget":"controlled"}"#;
+    /// Test environment manifest — a strict `EnvironmentManifestV1` (with
+    /// schema_version), canonicalized by the verifier.
+    const TEST_ENV_MANIFEST: &[u8] =
+        br#"{"schema_version":"mida.environment-manifest/v1","arch":"x86_64","os":"win","budget":"controlled"}"#;
     /// Externally-injected verifier key used by the tests. This is NOT a
     /// hardcoded library secret — it is injected at the seam exactly as a real
     /// deployment would inject a verifier trust-root key.
@@ -2424,7 +2323,7 @@ mod tests {
         let plan = default_plan_sha();
         let mut ev = valid_evidence("origin_macro", &plan);
         ev.equivalence_proof.execution_environment_digest =
-            canonical_environment_digest(br#"{"arch":"arm64","os":"win","budget":"unlimited"}"#)
+            canonical_environment_digest(br#"{"schema_version":"mida.environment-manifest/v1","arch":"arm64","os":"win","budget":"unlimited"}"#)
                 .expect("env");
         let out = verify_contract_bound(
             &ev,
@@ -2787,5 +2686,494 @@ mod tests {
             err,
             BehaviorOracleContractError::BadCandidateIdentity
         ));
+    }
+}
+
+// ===========================================================================
+// `observation_verifier_proto` — TEST-ONLY PRODUCTION BOUNDARY (P2 / P9-live)
+// ===========================================================================
+//
+// This module contains the OBSERVATION-VERIFIER PROTOTYPE. It is `#[cfg(test)]`
+// only: there is NO real production artifact verifier and NO configured
+// production trust root in this codebase (the per-case business oracle is a
+// documented P9-live blocker). These functions are NOT compiled into production
+// and are NOT reachable by library consumers, so no caller can pick its own key
+// and establish a trust root. Production keeps the `TrustedObservationRegistry`
+// empty and the offline verdict is always `NotRun`/`Pending`.
+//
+// The environment-manifest canonicalization here is a real, injective encoding
+// (P1): type-tagged, UTF-8-length-prefixed, sorted keys, explicit counts — so
+// `{"a":1,"b":2}` and `{"a:1,b":2}` canonicalize to DIFFERENT digests and keys
+// or values containing `:`, `,`, `"`, `\`, NUL or control bytes cannot collide.
+// The token binding is likewise domain-separated and length-prefixed.
+#[cfg(test)]
+mod observation_verifier_proto {
+    use super::*;
+
+    /// Domain prefix for the environment-manifest canonical encoding.
+    const ENV_DOMAIN_PREFIX: &[u8] = b"mida.environment-manifest/v1";
+    /// Domain prefix for the observation-token HMAC binding.
+    const TOKEN_DOMAIN_PREFIX: &[u8] = b"mida.observation-token/v1";
+    /// Minimum verifier-key strength (256-bit = 32 bytes) required to mint.
+    const MIN_VERIFIER_KEY_BYTES: usize = 32;
+
+    /// A JSON value parsed injectively: objects preserve every key and reject
+    /// DUPLICATE keys (a `serde_json::Value` would silently dedupe). Only
+    /// integers are kept for numbers (floats are ambiguous and rejected).
+    #[derive(Debug, Clone)]
+    pub(super) enum RawJson {
+        Null,
+        Bool(bool),
+        I64(i64),
+        Str(String),
+        Arr(Vec<RawJson>),
+        /// Object entries in document order (duplicate keys rejected at parse).
+        Obj(Vec<(String, RawJson)>),
+    }
+
+    impl<'de> Deserialize<'de> for RawJson {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            struct V;
+            impl<'de> serde::de::Visitor<'de> for V {
+                type Value = RawJson;
+                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    f.write_str("any JSON value")
+                }
+                fn visit_unit<E: serde::de::Error>(self) -> Result<RawJson, E> {
+                    Ok(RawJson::Null)
+                }
+                fn visit_none<E: serde::de::Error>(self) -> Result<RawJson, E> {
+                    Ok(RawJson::Null)
+                }
+                fn visit_some<D: serde::Deserializer<'de>>(
+                    self,
+                    d: D,
+                ) -> Result<RawJson, D::Error> {
+                    RawJson::deserialize(d)
+                }
+                fn visit_bool<E: serde::de::Error>(self, b: bool) -> Result<RawJson, E> {
+                    Ok(RawJson::Bool(b))
+                }
+                fn visit_i64<E: serde::de::Error>(self, n: i64) -> Result<RawJson, E> {
+                    Ok(RawJson::I64(n))
+                }
+                fn visit_u64<E: serde::de::Error>(self, n: u64) -> Result<RawJson, E> {
+                    i64::try_from(n)
+                        .map(RawJson::I64)
+                        .map_err(serde::de::Error::custom)
+                }
+                fn visit_f64<E: serde::de::Error>(self, _n: f64) -> Result<RawJson, E> {
+                    Err(serde::de::Error::custom(
+                        "floating-point numbers are not allowed in an environment manifest \
+                         (ambiguous canonical representation)",
+                    ))
+                }
+                fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<RawJson, E> {
+                    Ok(RawJson::Str(s.to_string()))
+                }
+                fn visit_string<E: serde::de::Error>(self, s: String) -> Result<RawJson, E> {
+                    Ok(RawJson::Str(s))
+                }
+                fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                    self,
+                    mut seq: A,
+                ) -> Result<RawJson, A::Error> {
+                    let mut items = Vec::new();
+                    while let Some(v) = seq.next_element::<RawJson>()? {
+                        items.push(v);
+                    }
+                    Ok(RawJson::Arr(items))
+                }
+                fn visit_map<A: serde::de::MapAccess<'de>>(
+                    self,
+                    mut map: A,
+                ) -> Result<RawJson, A::Error> {
+                    let mut out: Vec<(String, RawJson)> = Vec::new();
+                    while let Some(key) = map.next_key::<String>()? {
+                        if out.iter().any(|(k, _)| k == &key) {
+                            return Err(serde::de::Error::custom(format!(
+                                "duplicate object key '{key}'"
+                            )));
+                        }
+                        let val: RawJson = map.next_value()?;
+                        out.push((key, val));
+                    }
+                    Ok(RawJson::Obj(out))
+                }
+            }
+            d.deserialize_any(V)
+        }
+    }
+
+    /// Parse raw manifest bytes into an injective [`RawJson`]. Rejects malformed
+    /// JSON and duplicate keys.
+    pub(super) fn parse_raw_json(bytes: &[u8]) -> Result<RawJson, BehaviorOracleContractError> {
+        serde_json::from_slice(bytes).map_err(BehaviorOracleContractError::Json)
+    }
+
+    /// The strict typed environment manifest. `deny_unknown_fields` + required
+    /// fields reject unknown/missing keys; `schema_version` is validated. A
+    /// real environment manifest must conform to exactly this schema.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct EnvironmentManifestV1 {
+        schema_version: String,
+        arch: String,
+        os: String,
+        budget: String,
+    }
+
+    const ENV_MANIFEST_SCHEMA: &str = "mida.environment-manifest/v1";
+
+    /// Canonical, INJECTIVE serialization of a JSON value (domain-prefixed,
+    /// type-tagged, UTF-8-length-prefixed, sorted object keys, explicit array/
+    /// object counts). Two JSON documents canonicalize to equal bytes ONLY if
+    /// they are semantically identical (same type, same key multiset with equal
+    /// bytes, same array order, same values). Key/value boundaries never rely on
+    /// `:`, `,` or unescaped delimiters, so those characters cannot collide.
+    pub(super) fn canonical_environment_serialization(value: &RawJson) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(ENV_DOMAIN_PREFIX);
+        encode_value(value, &mut out);
+        out
+    }
+
+    fn encode_value(v: &RawJson, out: &mut Vec<u8>) {
+        match v {
+            RawJson::Null => out.push(0x00),
+            RawJson::Bool(false) => out.push(0x01),
+            RawJson::Bool(true) => out.push(0x02),
+            RawJson::Str(s) => {
+                out.push(0x03);
+                out.extend_from_slice(&(s.len() as u64).to_le_bytes());
+                out.extend_from_slice(s.as_bytes());
+            }
+            RawJson::I64(n) => {
+                out.push(0x04);
+                out.extend_from_slice(&n.to_le_bytes());
+            }
+            RawJson::Arr(items) => {
+                out.push(0x05);
+                out.extend_from_slice(&(items.len() as u64).to_le_bytes());
+                for it in items {
+                    encode_value(it, out);
+                }
+            }
+            RawJson::Obj(entries) => {
+                out.push(0x06);
+                out.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+                let mut sorted: Vec<&(String, RawJson)> = entries.iter().collect();
+                // Object keys sorted by UTF-8 bytes (order-independent digest).
+                sorted.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+                for (k, v) in sorted {
+                    out.extend_from_slice(&(k.len() as u64).to_le_bytes());
+                    out.extend_from_slice(k.as_bytes());
+                    encode_value(v, out);
+                }
+            }
+        }
+    }
+
+    /// Generic injective digest of a JSON object (no strict-schema check). Used
+    /// by the collision / injectivity regression tests to prove the encoder is
+    /// injective on arbitrary JSON.
+    pub(super) fn raw_env_digest(bytes: &[u8]) -> Result<String, BehaviorOracleContractError> {
+        let raw = parse_raw_json(bytes)?;
+        if !matches!(raw, RawJson::Obj(ref e) if !e.is_empty()) {
+            return Err(BehaviorOracleContractError::BadEnvironmentManifest);
+        }
+        Ok(crate::sha256_hex(&canonical_environment_serialization(
+            &raw,
+        )))
+    }
+
+    /// STRICT environment-manifest digest for the verifier path: parses (rejecting
+    /// duplicate keys / malformed JSON), requires a non-empty object, validates
+    /// the strict [`EnvironmentManifestV1`] schema (rejecting unknown/missing
+    /// fields and a bad `schema_version`), then canonicalizes injectively.
+    pub(super) fn canonical_environment_digest(
+        env_manifest: &[u8],
+    ) -> Result<String, BehaviorOracleContractError> {
+        let raw = parse_raw_json(env_manifest)?;
+        if !matches!(raw, RawJson::Obj(ref e) if !e.is_empty()) {
+            return Err(BehaviorOracleContractError::BadEnvironmentManifest);
+        }
+        // Strict schema validation: unknown / missing / wrong-version / float /
+        // duplicate keys all rejected here (duplicates already rejected by RawJson).
+        let typed: EnvironmentManifestV1 = serde_json::from_slice(env_manifest)
+            .map_err(|e| BehaviorOracleContractError::EnvironmentManifestRejected(e.to_string()))?;
+        if typed.schema_version != ENV_MANIFEST_SCHEMA {
+            return Err(BehaviorOracleContractError::EnvironmentManifestRejected(format!(
+                "unsupported environment-manifest schema_version '{}' (expected {ENV_MANIFEST_SCHEMA})",
+                typed.schema_version
+            )));
+        }
+        Ok(crate::sha256_hex(&canonical_environment_serialization(
+            &raw,
+        )))
+    }
+
+    /// HMAC-SHA256 (RFC 2104), returned as 64-hex. Self-contained; validated
+    /// against RFC 4231 test vectors below.
+    pub(super) fn hmac_sha256(key: &[u8], msg: &[u8]) -> String {
+        const BLOCK: usize = 64;
+        let mut key_block = [0u8; BLOCK];
+        if key.len() > BLOCK {
+            let d = crate::sha256_hex(key);
+            let bytes = hex_to_bytes(&d);
+            key_block[..32.min(bytes.len())].copy_from_slice(&bytes[..32.min(bytes.len())]);
+        } else {
+            key_block[..key.len()].copy_from_slice(key);
+        }
+        let mut ipad = [0x36u8; BLOCK];
+        let mut opad = [0x5cu8; BLOCK];
+        for i in 0..BLOCK {
+            ipad[i] ^= key_block[i];
+            opad[i] ^= key_block[i];
+        }
+        let inner = crate::sha256_hex(&[ipad.as_slice(), msg].concat());
+        let inner_bytes = hex_to_bytes(&inner);
+        crate::sha256_hex(&[opad.as_slice(), inner_bytes.as_slice()].concat())
+    }
+
+    /// Decode a 64-char lowercase hex SHA-256 into 32 raw bytes. Panics on
+    /// malformed input (only ever called on freshly-computed 64-hex values).
+    fn hex_to_bytes(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("valid hex"))
+            .collect()
+    }
+
+    /// Domain-separated, length-prefixed binary encoding of every trust binding.
+    /// Replaces the old `format!("k=v;")` text so future non-hash fields cannot
+    /// create boundary ambiguity.
+    fn bindings_serialization(
+        observation_source_hash: &str,
+        execution_environment_digest: &str,
+        bindings: &VerifiedObservationBindings,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(TOKEN_DOMAIN_PREFIX);
+        for field in [
+            observation_source_hash,
+            execution_environment_digest,
+            &bindings.case_id,
+            &bindings.candidate_sha256,
+            &bindings.protected_sha256,
+            &bindings.probe_sha256,
+            &bindings.runner_sha256,
+            &bindings.tool_revision,
+            &bindings.runner_config_digest,
+        ] {
+            out.extend_from_slice(&(field.len() as u64).to_le_bytes());
+            out.extend_from_slice(field.as_bytes());
+        }
+        out
+    }
+
+    /// Compute the opaque observation token: HMAC-SHA256 over the domain-separated
+    /// length-prefixed binding, keyed by the injected verifier key.
+    pub(super) fn observer_token_for(
+        key: &[u8],
+        observation_source_hash: &str,
+        execution_environment_digest: &str,
+        bindings: &VerifiedObservationBindings,
+    ) -> TrustToken {
+        let msg = bindings_serialization(
+            observation_source_hash,
+            execution_environment_digest,
+            bindings,
+        );
+        TrustToken(hmac_sha256(key, &msg))
+    }
+
+    /// The REAL verifier seam (prototype): turns observation bytes into a trusted
+    /// artifact. Requires a 256-bit-or-stronger externally-injected verifier key,
+    /// re-hashes the observation, canonicalizes the environment manifest, binds
+    /// every trust field, and HMAC-signs the whole binding. Only this function
+    /// can produce a [`VerifiedObservationArtifact`]; it is reachable only from
+    /// this `#[cfg(test)]` module and the crate's own tests.
+    pub(super) fn verify_observation_artifact(
+        observation_bytes: &[u8],
+        env_manifest: &[u8],
+        verifier_key: &[u8],
+        bindings: &VerifiedObservationBindings,
+    ) -> Result<VerifiedObservationArtifact, BehaviorOracleContractError> {
+        if verifier_key.len() < MIN_VERIFIER_KEY_BYTES {
+            return Err(BehaviorOracleContractError::NoTrustedVerifierKey);
+        }
+        if observation_bytes.is_empty() {
+            return Err(BehaviorOracleContractError::BadObservationIdentity);
+        }
+        if !is_sha256(&bindings.candidate_sha256)
+            || !is_sha256(&bindings.protected_sha256)
+            || !is_sha256(&bindings.probe_sha256)
+            || !is_sha256(&bindings.runner_sha256)
+            || !is_sha256(&bindings.runner_config_digest)
+            || bindings.case_id.trim().is_empty()
+            || bindings.tool_revision.trim().is_empty()
+        {
+            return Err(BehaviorOracleContractError::BadObservationBindings);
+        }
+        let observation_source_hash = crate::sha256_hex(observation_bytes);
+        let execution_environment_digest = canonical_environment_digest(env_manifest)?;
+        let token = observer_token_for(
+            verifier_key,
+            &observation_source_hash,
+            &execution_environment_digest,
+            bindings,
+        );
+        Ok(VerifiedObservationArtifact {
+            observation_source_hash,
+            execution_environment_digest,
+            token,
+            bindings: bindings.clone(),
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// RFC 4231 Test Case 1: key=0x0b * 20, data="Hi There".
+        const RFC4231_CASE1_KEY: [u8; 20] = [0x0b; 20];
+        const RFC4231_CASE1_DATA: &[u8] = b"Hi There";
+        const RFC4231_CASE1_EXPECTED: &str =
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7";
+
+        #[test]
+        fn rfc4231_case1_hmac_sha256() {
+            assert_eq!(
+                hmac_sha256(&RFC4231_CASE1_KEY, RFC4231_CASE1_DATA),
+                RFC4231_CASE1_EXPECTED
+            );
+        }
+
+        #[test]
+        fn collision_key_value_delimiter_objects_differ() {
+            // {"a":1,"b":2} vs {"a:1,b":2} must canonicalize to DIFFERENT digests.
+            let a = raw_env_digest(br#"{"a":1,"b":2}"#).unwrap();
+            let b = raw_env_digest(br#"{"a:1,b":2}"#).unwrap();
+            assert_ne!(a, b, "canonicalization must be injective");
+        }
+
+        #[test]
+        fn keys_with_metacharacters_do_not_collide() {
+            let plain = raw_env_digest(br#"{"k":"v"}"#).unwrap();
+            for key in [
+                ":", ",", "\"", "\\", "a:b", "a,b", "a\"b", "a\\b", "a\u{0}b",
+            ] {
+                // Build the JSON with proper escaping so the special character is
+                // genuinely part of the key.
+                let mut obj = serde_json::Map::new();
+                obj.insert(key.to_string(), serde_json::Value::String("v".to_string()));
+                let json = serde_json::Value::Object(obj).to_string();
+                let digest = raw_env_digest(json.as_bytes()).unwrap();
+                assert_ne!(plain, digest, "key {:?} must not collide", key);
+            }
+        }
+
+        #[test]
+        fn string_values_with_metacharacters_do_not_collide() {
+            let plain = raw_env_digest(br#"{"k":"plain"}"#).unwrap();
+            for val in [
+                ":", ",", "\"", "\\", "a:b", "a,b", "a\"b", "a\\b", "a\u{0}b",
+            ] {
+                let json = serde_json::json!({ "k": val }).to_string();
+                let digest = raw_env_digest(json.as_bytes()).unwrap();
+                assert_ne!(plain, digest, "value {:?} must not collide", val);
+            }
+        }
+
+        #[test]
+        fn key_reorder_same_digest() {
+            let a = raw_env_digest(br#"{"a":1,"b":2,"c":3}"#).unwrap();
+            let b = raw_env_digest(br#"{"c":3,"a":1,"b":2}"#).unwrap();
+            assert_eq!(a, b, "key reorder must be order-independent (same digest)");
+        }
+
+        #[test]
+        fn value_change_different_digest() {
+            let a = raw_env_digest(br#"{"a":1,"b":2}"#).unwrap();
+            let b = raw_env_digest(br#"{"a":1,"b":3}"#).unwrap();
+            assert_ne!(a, b);
+        }
+
+        #[test]
+        fn duplicate_key_rejected() {
+            assert!(
+                raw_env_digest(br#"{"a":1,"a":2}"#).is_err(),
+                "duplicate keys must be rejected"
+            );
+        }
+
+        #[test]
+        fn unknown_field_rejected_by_strict_manifest() {
+            let err = canonical_environment_digest(
+                br#"{"schema_version":"mida.environment-manifest/v1","arch":"x86_64","os":"win","budget":"c","extra":"x"}"#,
+            )
+            .unwrap_err();
+            assert!(matches!(
+                err,
+                BehaviorOracleContractError::EnvironmentManifestRejected(_)
+            ));
+        }
+
+        #[test]
+        fn missing_required_field_rejected_by_strict_manifest() {
+            let err = canonical_environment_digest(
+                br#"{"schema_version":"mida.environment-manifest/v1","arch":"x86_64","os":"win"}"#,
+            )
+            .unwrap_err();
+            assert!(matches!(
+                err,
+                BehaviorOracleContractError::EnvironmentManifestRejected(_)
+            ));
+        }
+
+        #[test]
+        fn wrong_schema_version_rejected() {
+            let err = canonical_environment_digest(
+                br#"{"schema_version":"mida.environment-manifest/v0","arch":"x86_64","os":"win","budget":"c"}"#,
+            )
+            .unwrap_err();
+            assert!(matches!(
+                err,
+                BehaviorOracleContractError::EnvironmentManifestRejected(_)
+            ));
+        }
+
+        #[test]
+        fn malformed_json_rejected() {
+            assert!(raw_env_digest(b"not json {").is_err());
+        }
+
+        #[test]
+        fn empty_object_rejected() {
+            assert!(raw_env_digest(b"{}").is_err());
+            assert!(canonical_environment_digest(b"{}").is_err());
+        }
+
+        #[test]
+        fn array_order_is_bound() {
+            let a = raw_env_digest(br#"{"a":[1,2,3]}"#).unwrap();
+            let b = raw_env_digest(br#"{"a":[3,2,1]}"#).unwrap();
+            assert_ne!(a, b, "array order must change the digest");
+        }
+
+        #[test]
+        fn valid_strict_manifest_hashes() {
+            let d = canonical_environment_digest(
+                br#"{"schema_version":"mida.environment-manifest/v1","arch":"x86_64","os":"win","budget":"controlled"}"#,
+            )
+            .unwrap();
+            assert_eq!(d.len(), 64);
+        }
+
+        #[test]
+        fn float_rejected() {
+            assert!(raw_env_digest(br#"{"a":1.5}"#).is_err());
+        }
     }
 }

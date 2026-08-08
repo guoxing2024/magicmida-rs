@@ -69,7 +69,12 @@ pub enum TrustTier {
     Rejected,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// The acceptance report OUTPUT type. It is intentionally `Serialize`-only:
+/// machine consumers must NOT deserialize an `AcceptanceReport` directly (a raw
+/// deserialize could not enforce the strict product-gating semantics). To read a
+/// report from bytes, use [`parse_product_report`], which returns a
+/// [`ValidatedProductReport`] whose product gate is enforced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AcceptanceReport {
     pub schema_version: String,
     pub artifact: ArtifactIdentity,
@@ -143,15 +148,26 @@ pub enum ReportError {
     UnknownField(String),
     #[error("report trust fields are inconsistent: {0}")]
     Inconsistent(String),
+    #[error(
+        "report is NOT product-acceptable (trust_tier={trust_tier:?}, verdict={verdict:?}, \
+         product_acceptable={product_acceptable})"
+    )]
+    NotProductAccepted {
+        trust_tier: TrustTier,
+        verdict: Verdict,
+        product_acceptable: bool,
+    },
 }
 
-/// Strict, field-locked projection of an [`AcceptanceReport`]. This is the
-/// ONLY shape a product consumer deserializes: `deny_unknown_fields` rejects
-/// any report carrying a field this product pipeline does not know about, so
-/// an attacker cannot smuggle a forged trust field under an unknown key.
+/// Strict, field-locked PRIVATE wire type. This is the ONLY shape a product
+/// consumer deserializes from bytes: `deny_unknown_fields` rejects any report
+/// carrying a field this product pipeline does not know about, so an attacker
+/// cannot smuggle a forged trust field under an unknown key. It is private so
+/// the only way to obtain a validated product report is through
+/// [`parse_product_report`].
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ProductReportStrict {
+struct ProductReportWire {
     schema_version: String,
     artifact: ArtifactIdentity,
     verdict: Verdict,
@@ -162,6 +178,76 @@ struct ProductReportStrict {
     warnings: Vec<WarningRecord>,
     residual_risks: Vec<ResidualRisk>,
     oracle_observations: Vec<OracleObservation>,
+}
+
+/// A STRICT, VALIDATED product report produced ONLY by [`parse_product_report`].
+///
+/// Its fields are private; a machine consumer can only read the outcome through
+/// [`require_product_acceptance`], which enforces the product gate centrally.
+/// There is no way to construct a `ValidatedProductReport` from an arbitrary
+/// `AcceptanceReport`, so a lab/unsigned/rejected report cannot be misread as
+/// product-acceptable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedProductReport {
+    schema_version: String,
+    artifact: ArtifactIdentity,
+    verdict: Verdict,
+    trust_tier: TrustTier,
+    product_acceptable: bool,
+    gates: Vec<GateResult>,
+    failures: Vec<FailureRecord>,
+    warnings: Vec<WarningRecord>,
+    residual_risks: Vec<ResidualRisk>,
+    oracle_observations: Vec<OracleObservation>,
+}
+
+impl ValidatedProductReport {
+    /// The validated product trust tier.
+    pub fn trust_tier(&self) -> TrustTier {
+        self.trust_tier
+    }
+
+    /// The validated verdict.
+    pub fn verdict(&self) -> Verdict {
+        self.verdict
+    }
+
+    /// Whether the validated report is product-acceptable.
+    pub fn product_acceptable(&self) -> bool {
+        self.product_acceptable
+    }
+
+    /// The validated artifact identity.
+    pub fn artifact(&self) -> &ArtifactIdentity {
+        &self.artifact
+    }
+
+    /// Enforce the product acceptance gate. Returns `Ok(&self)` ONLY when the
+    /// report is `trust_tier == Product` AND `verdict == Accepted` AND
+    /// `product_acceptable == true`. Lab / Unsigned / Rejected / Pending reports
+    /// return an explicit error.
+    ///
+    /// This is the single product-gating entry point a machine consumer calls
+    /// before treating a run as product-acceptable.
+    pub fn require_product_acceptance(&self) -> Result<&Self, ReportError> {
+        if self.trust_tier == TrustTier::Product
+            && self.verdict == Verdict::Accepted
+            && self.product_acceptable
+        {
+            Ok(self)
+        } else {
+            Err(ReportError::NotProductAccepted {
+                trust_tier: self.trust_tier,
+                verdict: self.verdict,
+                product_acceptable: self.product_acceptable,
+            })
+        }
+    }
+
+    /// True when the validated report is product-acceptable (gate passed).
+    pub fn is_product_acceptance(&self) -> bool {
+        self.require_product_acceptance().is_ok()
+    }
 }
 
 /// STRICT product-gating parser for machine consumers.
@@ -181,9 +267,10 @@ struct ProductReportStrict {
 ///       Product tier.
 ///
 /// Product consumers MUST call this instead of deserializing `AcceptanceReport`
-/// directly, so that the product-gating semantics are enforced centrally.
-pub fn parse_product_report(bytes: &[u8]) -> Result<AcceptanceReport, ReportError> {
-    let strict: ProductReportStrict = serde_json::from_slice(bytes)?;
+/// directly, so that the product-gating semantics are enforced centrally. The
+/// returned [`ValidatedProductReport`] is the only gate-checkable value.
+pub fn parse_product_report(bytes: &[u8]) -> Result<ValidatedProductReport, ReportError> {
+    let strict: ProductReportWire = serde_json::from_slice(bytes)?;
 
     if strict.schema_version != REPORT_SCHEMA_VERSION {
         return Err(ReportError::SchemaVersion(strict.schema_version));
@@ -203,7 +290,7 @@ pub fn parse_product_report(bytes: &[u8]) -> Result<AcceptanceReport, ReportErro
         ));
     }
 
-    Ok(AcceptanceReport {
+    Ok(ValidatedProductReport {
         schema_version: strict.schema_version,
         artifact: strict.artifact,
         verdict: strict.verdict,
@@ -256,9 +343,14 @@ mod tests {
         let r = base_report();
         let bytes = r.to_json().unwrap();
         let parsed = parse_product_report(bytes.as_bytes()).unwrap();
-        assert!(parsed.product_acceptable);
-        assert_eq!(parsed.trust_tier, TrustTier::Product);
-        assert_eq!(parsed.verdict, Verdict::Accepted);
+        assert!(parsed.product_acceptable());
+        assert_eq!(parsed.trust_tier(), TrustTier::Product);
+        assert_eq!(parsed.verdict(), Verdict::Accepted);
+        // The product gate must pass for a genuine Product+Accepted report.
+        parsed
+            .require_product_acceptance()
+            .expect("product gate passes");
+        assert!(parsed.is_product_acceptance());
     }
 
     #[test]
@@ -374,7 +466,70 @@ mod tests {
         r.product_acceptable = false;
         let bytes = r.to_json().unwrap();
         let parsed = parse_product_report(bytes.as_bytes()).unwrap();
-        assert!(!parsed.product_acceptable);
-        assert_eq!(parsed.trust_tier, TrustTier::Lab);
+        assert!(!parsed.product_acceptable());
+        assert_eq!(parsed.trust_tier(), TrustTier::Lab);
+        // Lab Accepted parses but the product gate REJECTS it.
+        let err = parsed.require_product_acceptance().unwrap_err();
+        assert!(matches!(err, ReportError::NotProductAccepted { .. }));
+    }
+
+    /// Lab Accepted (parses) → require_product_acceptance() rejects.
+    #[test]
+    fn product_gate_rejects_lab_accepted() {
+        let mut r = AcceptanceReport::new(artifact());
+        r.verdict = Verdict::Accepted;
+        r.trust_tier = TrustTier::Lab;
+        r.product_acceptable = false;
+        let parsed = parse_product_report(r.to_json().unwrap().as_bytes()).unwrap();
+        assert!(!parsed.is_product_acceptance());
+        assert!(matches!(
+            parsed.require_product_acceptance(),
+            Err(ReportError::NotProductAccepted { .. })
+        ));
+    }
+
+    /// Unsigned Accepted → require_product_acceptance() rejects.
+    #[test]
+    fn product_gate_rejects_unsigned_accepted() {
+        let mut r = AcceptanceReport::new(artifact());
+        r.verdict = Verdict::Accepted;
+        r.trust_tier = TrustTier::Unsigned;
+        r.product_acceptable = false;
+        let parsed = parse_product_report(r.to_json().unwrap().as_bytes()).unwrap();
+        assert!(!parsed.is_product_acceptance());
+        assert!(matches!(
+            parsed.require_product_acceptance(),
+            Err(ReportError::NotProductAccepted { .. })
+        ));
+    }
+
+    /// Rejected Product tier → require_product_acceptance() rejects.
+    #[test]
+    fn product_gate_rejects_rejected_product_tier() {
+        let mut r = AcceptanceReport::new(artifact());
+        r.verdict = Verdict::Rejected;
+        r.trust_tier = TrustTier::Product;
+        r.product_acceptable = false;
+        let parsed = parse_product_report(r.to_json().unwrap().as_bytes()).unwrap();
+        assert!(!parsed.is_product_acceptance());
+        assert!(matches!(
+            parsed.require_product_acceptance(),
+            Err(ReportError::NotProductAccepted { .. })
+        ));
+    }
+
+    /// Pending (StructuralPassBehaviorPending) Product tier → rejects.
+    #[test]
+    fn product_gate_rejects_pending_product_tier() {
+        let mut r = AcceptanceReport::new(artifact());
+        r.verdict = Verdict::StructuralPassBehaviorPending;
+        r.trust_tier = TrustTier::Product;
+        r.product_acceptable = false;
+        let parsed = parse_product_report(r.to_json().unwrap().as_bytes()).unwrap();
+        assert!(!parsed.is_product_acceptance());
+        assert!(matches!(
+            parsed.require_product_acceptance(),
+            Err(ReportError::NotProductAccepted { .. })
+        ));
     }
 }

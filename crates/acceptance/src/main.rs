@@ -25,10 +25,10 @@ use mida_acceptance::oreans_gate::OREANS_TWO_SAMPLE_OBSERVATIONS_SCHEMA_VERSION;
 use mida_acceptance::{
     build_oreans_pe_evidence, build_unpack_pe_evidence, check_static, check_with_behavior,
     check_with_behavior_managed, check_with_behavior_managed_lab, check_with_behavior_signed,
-    evaluate_oreans_two_sample_gate, is_generic_packer_family, sha256_hex, BehaviorEvidence,
-    CheckStaticOptions, EnvelopePolicy, HmacSha256Verifier, OreansGateVerdict, OreansPeEvidence,
-    OreansPeEvidenceError, OreansSampleObservation, SignatureEnvelope, Verdict,
-    VerifiedManagedCandidate, FIXED_CASE_IDS, GTO_CASE_ID,
+    evaluate_oreans_two_sample_gate, sha256_hex, BehaviorEvidence, CheckStaticOptions,
+    EnvelopePolicy, HmacSha256Verifier, OreansGateVerdict, OreansPeEvidence, OreansPeEvidenceError,
+    OreansSampleObservation, SignatureEnvelope, Verdict, VerifiedManagedCandidate, FIXED_CASE_IDS,
+    GTO_CASE_ID,
 };
 
 fn is_64_hex(value: &str) -> bool {

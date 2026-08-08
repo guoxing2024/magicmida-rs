@@ -68,7 +68,7 @@ pub use isolated_replay_ledger::{
 pub use oracle::{observe_oracle, OracleObservation};
 pub use report::{
     parse_product_report, AcceptanceReport, FailureRecord, GateResult, GateStatus, ReportError,
-    ResidualRisk, TrustTier, WarningRecord, REPORT_SCHEMA_VERSION,
+    ResidualRisk, TrustTier, ValidatedProductReport, WarningRecord, REPORT_SCHEMA_VERSION,
 };
 pub use survival_structural_evidence::{
     verify_structural_evidence, verify_survival_evidence, ExpectedEvidenceBinding,
