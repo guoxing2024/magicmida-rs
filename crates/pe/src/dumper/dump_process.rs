@@ -1216,6 +1216,8 @@ pub fn dump_process_with_report(
             tls_rva,
             installed.original_oep_rva,
             installed.region_count,
+            installed.completion_cookie_rva,
+            &installed.contract_layout,
         );
         let contract_valid = contract.is_ok();
         if let Err(e) = contract {

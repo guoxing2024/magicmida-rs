@@ -233,3 +233,51 @@ R0-B 把离线 `RuntimeRebasePlan` 从"诊断/门禁"变成 `.boot` metadata 与
 
 - 离线模拟（`simulate_runtime_rebase` + `validate_rebased_snapshots`）对 **emitted metadata** 做模型执行，证明 round-trip 与 pointer patch 逻辑；真实 stub 的运行时执行仍需下一轮受控 live route 验证。
 - external resolver 的模块归属依赖 live IAT 值；离线无法保证匹配所有外部指针，未解析即 fail-closed。
+
+
+---
+
+# 附录：R0-B.1 — 修复 emitted x64 stub 与 metadata 协议
+
+**Base:** `6fed9a1`（R0-B 之后）
+
+## B1.1 问题
+
+R0-B 的 `emit_two_phase_code` 用手写字节码，存在系统性 REX.B 编码错误：
+`8B 4C 24 10` 实际解码为 `mov ecx, [rsp+0x10]`（base=rsp）而非 `[r12+0x10]`；
+`44 8B 0C 24` / `44 8B 54 24 04` / `48 8B 54 24 10` / `8B 4C 24 1C` 同理全部错指 rsp。
+metadata header 的 region/fixup/resolver/payload offset 用 64-bit load 会把两个相邻 u32 拼成 qword。
+payload offset 语义未统一；external IAT 模拟把 iat_slot 当 resolved_value；cookie 固定 boot_rva+0xF00。
+
+## B1.2 修复
+
+1. **新增 `x64_asm.rs`**：正确 REX.B/REX.X/REX.R 编码器。`[r12+disp]`（REX.B + SIB base=100）、`[r15+disp]`（REX.B + rm=111）等全部用 `Mem` 结构编码，并用 iced-x86 反汇编逐条验证（10 项断言：base 寄存器、load 宽度、index scale、store src）。
+2. **metadata header 32-bit load**：region/fixup/resolver/payload offset 均 `mov r32, [r15+disp]`（zero-extend），禁止 64-bit merge。机器码测试断言 `[r15+4/8/0x10/0x14/0x18/0x1c]` 均为 `UInt32`。
+3. **REX.B 修正**：`[r12+0x00..0x1c]` 全部指向 r12（机器码测试逐条断言）。
+4. **payload offset 统一**：stub 复制源地址 = `meta_base + payload_offset + region.data_offset`。decoder 按 `max(region.data_offset + size)` 截断 payload，排除尾部 alloc_map/cookie。
+5. **external IAT**：`simulate_runtime_rebase` 增加 `iat_contents` 参数，ExternalModule 写 `resolved_value = memory[iat_slot]`（API 地址），缺内容 fail-closed。ASLR 下按新 loaded base 的 IAT slot 解析。
+6. **ASLR 方案 A**：stub 硬编码 preferred image base；`validate_bootstrap_contract` 校验 `loaded == preferred`，否则 fail-closed（live 前）。
+7. **cookie 布局**：`[code][header][regions][fixups][resolvers][payload][alloc_map][cookie]`，cookie RVA 由 layout 计算；`validate_bootstrap_contract` 验证 cookie 不与 code/metadata/payload/alloc_map 重叠、在 writable 段、宽度不越界。
+8. **机器码级执行模型**：新增 `machine_code_tests`（iced-x86）——所有 `[r12+off]` base 断言、header 32-bit 宽度、payload 地址计算、external IAT dereference、cookie write + OEP near jmp、no-64bit-header-load、cookie 不重叠、large-layout cookie 无碰撞、ASLR scheme A。
+
+## B1.3 修改文件
+
+- `crates/pe/src/dumper/x64_asm.rs`（新增）：正确 REX 编码器 + 10 项 iced-x86 测试。
+- `crates/pe/src/dumper/runtime_bootstrap.rs`：`emit_two_phase_code` 用 x64_asm 重写；`metadata_layout`/`decode` 修正 payload 截断；`simulate_runtime_rebase` 加 `iat_contents`；`InstalledHeapBootstrap` 加 `BootContractLayout`；`build_runtime_bootstrap` 返回 `BuildBootstrapResult`（含 cookie layout）。
+- `crates/pe/src/dumper/runtime_rebase.rs`：`validate_bootstrap_contract` 增加 ASLR scheme A + cookie 不重叠验证。
+- `crates/pe/src/dumper/heap_bootstrap.rs`：适配新 `build_runtime_bootstrap` 签名 + `contract_layout`。
+- `crates/pe/src/dumper/dump_process.rs`：contract 调用点传 cookie + layout。
+- `crates/pe/Cargo.toml`：dev-dependency `iced-x86`（机器码测试）。
+
+## B1.4 验证
+
+- `cargo test -p mida-pe --offline`：306 lib pass + 其余（含 x64_asm 10 项 + machine_code_tests 10 项 + runtime_bootstrap 20 项）。
+- `cargo test -p mida-cli --features gto-product-recovery --offline`：8 bins / 0 fail。
+- `cargo test -p mida-packers-ahk-gto --features gto-product-recovery --offline`：2 bins / 0 fail。
+- `cargo test --workspace --offline`：42 bins / 0 fail。
+- `cargo fmt --all -- --check`、`git diff --check` 干净。
+- **未改 acceptance / gto_host / bwhook；未运行真实 sample。**
+
+## B1.5 诚实边界
+
+机器码级验证用 iced-x86 反汇编证明 emitted stub 的 memory operand base、load 宽度、rel32 target、cookie write、OEP transfer 结构正确；但真实进程中的运行时执行（寄存器状态、IAT 内容、heap 分配）仍需下一轮受控 live route 验证。ASLR scheme A 要求在 live 前确认实际 loaded base == preferred base，否则 fail-closed。

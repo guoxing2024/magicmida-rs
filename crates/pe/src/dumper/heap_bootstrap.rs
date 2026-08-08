@@ -56,32 +56,26 @@ pub(crate) fn install_heap_bootstrap(
         return Err(HeapBootstrapError::NotX64);
     }
 
-    // Reserve the `.boot` section. The completion cookie lives in `.boot`
-    // (writable), so we can place it at a fixed offset after the metadata.
-    // We create the section first to learn boot_rva, then pass it in.
+    // Reserve the `.boot` section; the completion cookie is laid out at the very
+    // end of the blob (never overlapping code/metadata/payload/alloc map).
     let boot_section_idx = pe.create_section_index(".boot", 0x1000);
     let boot_rva = pe.sections[boot_section_idx].virtual_address;
 
-    // Completion cookie: a dedicated writable slot at boot_rva + 0xF00
-    // (inside the reserved `.boot` region; .boot is marked writable below).
-    let completion_cookie_rva = boot_rva.saturating_add(0xF00);
+    let built =
+        match build_runtime_bootstrap(pe, imports, prepared_rebase, original_entry_point, boot_rva)
+        {
+            Ok(v) => v,
+            Err(e) => {
+                pe.sections.remove(boot_section_idx);
+                return Err(e);
+            }
+        };
+    let blob = built.blob;
+    let meta_offset = built.meta_offset;
+    let completion_cookie_rva = built.completion_cookie_rva;
 
-    let (blob, meta_offset) = match build_runtime_bootstrap(
-        pe,
-        imports,
-        prepared_rebase,
-        original_entry_point,
-        completion_cookie_rva,
-    ) {
-        Ok(v) => v,
-        Err(e) => {
-            pe.sections.remove(boot_section_idx);
-            return Err(e);
-        }
-    };
-
-    // Size to section alignment; ensure the blob (code + metadata + alloc map)
-    // is fully covered by SizeOfRawData.
+    // Size to section alignment; ensure the blob (code + metadata + alloc map +
+    // cookie) is fully covered by SizeOfRawData.
     let stub_len = blob.len();
     let aligned_size = crate::utils::align_up(stub_len as u32, 0x1000).max(0x1000);
 
@@ -165,6 +159,14 @@ pub(crate) fn install_heap_bootstrap(
         resolver_count: prepared_rebase.plan.external_targets.len(),
         emitted_plan_digest: prepared_rebase.plan.plan_digest.clone(),
         bootstrap_kind: bootstrap_kind.to_string(),
+        contract_layout: super::runtime_bootstrap::BootContractLayout {
+            header_off: built.layout.header_off,
+            payload_off: built.layout.payload_off,
+            map_off: built.layout.map_off,
+            cookie_off: built.layout.cookie_off,
+            total: built.layout.total,
+            preferred_image_base: pe.nt_headers.optional_header.image_base,
+        },
     })
 }
 

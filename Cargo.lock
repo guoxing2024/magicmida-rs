@@ -214,6 +214,7 @@ dependencies = [
 name = "mida-pe"
 version = "0.1.0"
 dependencies = [
+ "iced-x86",
  "mida-acceptance",
  "mida-core",
  "mida-disasm",

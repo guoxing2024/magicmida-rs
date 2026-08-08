@@ -19,6 +19,7 @@ sha2 = "0.10"
 
 [dev-dependencies]
 serde_json = "1"
+iced-x86 = { workspace = true }
 # R1-E dual-path corpus only: pure emit candidates judged by independent R0B gates.
 # Production `mida-pe` must not depend on `mida-acceptance` (boundary is one-way).
 mida-acceptance = { path = "../acceptance" }

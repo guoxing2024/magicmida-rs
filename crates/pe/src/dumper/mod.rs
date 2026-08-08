@@ -54,6 +54,7 @@ mod tls_bootstrap;
 mod types;
 mod wrapper_call_patch;
 mod wrapper_materialize;
+mod x64_asm;
 
 // Re-export public API
 pub use self::capture_policy::DumpCapturePolicy;
