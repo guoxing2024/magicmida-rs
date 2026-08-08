@@ -40,12 +40,13 @@ pub use behavior::{
 };
 // compose_with_behavior is deliberately NOT re-exported; use check_* entry points.
 pub use behavior_oracle_contract::{
-    parse_contract_evidence, require_identical_stimulus_plan, verify_contract,
-    verify_contract_bound, BehaviorChainIdentity, BehaviorComparator, BehaviorCompletionMarker,
-    BehaviorContractVerdict, BehaviorExecution, BehaviorObservable, BehaviorObserved,
-    BehaviorObservedStatus, BehaviorOracleContractError, BehaviorOracleContractEvidence,
-    BehaviorStimulus, ComputedObservable, ContractVerdict, ExpectedBinding, ObservableVerdict,
-    StimulusPlanRef, StimulusPlanRegistry, BEHAVIOR_ORACLE_CONTRACT_SCHEMA_VERSION,
+    canonical_stimuli_hash, canonical_stimulus_serialization, parse_contract_evidence,
+    require_identical_stimulus_plan, verify_contract, verify_contract_bound, BehaviorChainIdentity,
+    BehaviorComparator, BehaviorCompletionMarker, BehaviorContractVerdict, BehaviorExecution,
+    BehaviorObservable, BehaviorObserved, BehaviorObservedStatus, BehaviorOracleContractError,
+    BehaviorOracleContractEvidence, BehaviorStimulus, ComputedObservable, ContractVerdict,
+    EquivalenceProof, ExpectedBinding, ObservableVerdict, PatchProofEntry, StimulusPlanRef,
+    StimulusPlanRegistry, TransformProofEntry, BEHAVIOR_ORACLE_CONTRACT_SCHEMA_VERSION,
     BLOCKER_CASE_BUSINESS_DEFINITION, CONTRACT_REQUIRED_CASES,
 };
 pub use check::{
@@ -65,8 +66,8 @@ pub use isolated_replay_ledger::{
 };
 pub use oracle::{observe_oracle, OracleObservation};
 pub use report::{
-    AcceptanceReport, FailureRecord, GateResult, GateStatus, ResidualRisk, WarningRecord,
-    REPORT_SCHEMA_VERSION,
+    AcceptanceReport, FailureRecord, GateResult, GateStatus, ResidualRisk, TrustTier,
+    WarningRecord, REPORT_SCHEMA_VERSION,
 };
 pub use survival_structural_evidence::{
     verify_structural_evidence, verify_survival_evidence, ExpectedEvidenceBinding,

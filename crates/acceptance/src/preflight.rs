@@ -515,7 +515,7 @@ fn push_scalar(out: &mut String, name: &str, value: &str) {
     out.push('\n');
 }
 
-fn push_list(out: &mut String, name: &str, elements: &mut Vec<String>) {
+fn push_list(out: &mut String, name: &str, elements: &mut [String]) {
     elements.sort();
     out.push_str(name);
     out.push('=');
@@ -587,6 +587,257 @@ pub fn runner_config_digest(config: &RunnerConfig) -> String {
 // ---------------------------------------------------------------------------
 // P6-C: offline preflight orchestrator
 // ---------------------------------------------------------------------------
+
+/// Strict `rust-toolchain.toml` `[toolchain].channel` parser (P1 toolchain-pin
+/// hardening).
+///
+/// The previous check used `text.contains("channel = \"{expected}\"")`, which a
+/// comment or a different section could spoof (e.g. `# channel = "1.97.1"` next
+/// to `[toolchain] channel = "nightly"` would "pass" for `1.97.1`). This parser
+/// only reads the real `[toolchain]` table at top level and extracts the actual
+/// `channel` string, failing closed on:
+///
+/// - a `channel` key that is not a TOML basic string;
+/// - duplicate `channel` keys in `[toolchain]`;
+/// - `channel` appearing at the root level or in a non-`[toolchain]` section;
+/// - an unknown top-level `[toolchain]` key (only `channel`, `profile`,
+///   `components`, `targets` are recognized) — a caller may not smuggle a
+///   second channel under a different name;
+/// - malformed TOML (unterminated string / section header / key-value).
+///
+/// Comments are stripped only *outside* string literals; a `#` inside a quoted
+/// value is data, never a comment. The result is the raw decoded channel value
+/// (unescaped) or `None` when no `[toolchain]` table exists.
+pub fn parse_toolchain_channel(content: &str) -> Result<Option<String>, String> {
+    const KNOWN_TOOLCHAIN_KEYS: [&str; 4] = ["channel", "profile", "components", "targets"];
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Section {
+        Root,
+        Toolchain,
+        Other,
+    }
+
+    let mut current = Section::Root;
+    let mut channel: Option<String> = None;
+    // Track whether `channel` was seen at root or in a non-toolchain section,
+    // which must be refused even if `[toolchain]` never declares one.
+    let mut saw_channel_elsewhere = false;
+
+    for (lineno, raw) in content.lines().enumerate() {
+        let line = raw.trim();
+
+        // Skip blank lines and full-line comments.
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        // A `[section]` header. Only `[toolchain]` at top level is honored.
+        if line.starts_with('[') {
+            if !line.ends_with(']') {
+                return Err(format!(
+                    "line {}: malformed section header {:?}",
+                    lineno + 1,
+                    line
+                ));
+            }
+            let name = line[1..line.len() - 1].trim();
+            if name.is_empty() || name.contains(' ') || name.contains('.') {
+                return Err(format!(
+                    "line {}: unsupported section header {:?} (only top-level [toolchain])",
+                    lineno + 1,
+                    line
+                ));
+            }
+            current = if name == "toolchain" {
+                Section::Toolchain
+            } else {
+                Section::Other
+            };
+            continue;
+        }
+
+        // A key = value line. Split on the first `=`, honoring quoted strings
+        // (so `channel = "a=b"` does not split on the `=` inside the string).
+        let eq = find_unquoted_equals(line).ok_or_else(|| {
+            format!(
+                "line {}: expected a key = value pair, got {:?}",
+                lineno + 1,
+                line
+            )
+        })?;
+        let key = line[..eq].trim();
+        let value_rest = &line[eq + 1..];
+        // Strip a trailing comment that is outside any string literal.
+        let value_text = match strip_trailing_comment(value_rest) {
+            Some(v) => v,
+            None => {
+                return Err(format!(
+                    "line {}: unterminated string in value {:?}",
+                    lineno + 1,
+                    line
+                ))
+            }
+        };
+        let value = value_text.trim();
+        if value.is_empty() {
+            return Err(format!(
+                "line {}: key {:?} has an empty value",
+                lineno + 1,
+                key
+            ));
+        }
+
+        match current {
+            Section::Toolchain => {
+                if !KNOWN_TOOLCHAIN_KEYS.contains(&key) {
+                    return Err(format!(
+                        "line {}: unknown key {:?} in [toolchain] (only {:?} are allowed)",
+                        lineno + 1,
+                        key,
+                        KNOWN_TOOLCHAIN_KEYS
+                    ));
+                }
+                if key == "channel" {
+                    if channel.is_some() {
+                        return Err(format!(
+                            "line {}: duplicate [toolchain].channel is refused",
+                            lineno + 1
+                        ));
+                    }
+                    // `channel` must be a basic string; other toolchain keys may
+                    // be strings or arrays, but we only need to reject a
+                    // non-string `channel`.
+                    if !value.starts_with('"') {
+                        return Err(format!(
+                            "line {}: [toolchain].channel must be a TOML string",
+                            lineno + 1
+                        ));
+                    }
+                    channel = Some(
+                        parse_toml_string(value)
+                            .map_err(|e| format!("line {}: {e}", lineno + 1))?,
+                    );
+                }
+            }
+            Section::Root | Section::Other => {
+                if key == "channel" {
+                    // A `channel` key outside `[toolchain]` must never be
+                    // mistaken for the pin.
+                    saw_channel_elsewhere = true;
+                }
+            }
+        }
+    }
+
+    if saw_channel_elsewhere {
+        return Err(
+            "channel key present outside [toolchain]; refusing to treat a non-toolchain \
+             channel as the pin"
+                .to_string(),
+        );
+    }
+    Ok(channel)
+}
+
+/// Locate the index of the first `=` that is not inside a double-quoted string
+/// literal (used to split `key = value` robustly).
+fn find_unquoted_equals(line: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let mut in_string = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'"' {
+            // Skip an escaped quote inside a string.
+            if in_string && i > 0 && bytes[i - 1] == b'\\' {
+                // still inside; escape consumed the quote
+            } else {
+                in_string = !in_string;
+            }
+        } else if b == b'=' && !in_string {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Strip a trailing `# comment` that is outside any string literal. Returns
+/// `None` when the line has an unterminated string.
+fn strip_trailing_comment(line: &str) -> Option<&str> {
+    let bytes = line.as_bytes();
+    let mut in_string = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'"' {
+            if in_string && i > 0 && bytes[i - 1] == b'\\' {
+                // escaped quote
+            } else {
+                in_string = !in_string;
+            }
+        } else if b == b'#' && !in_string {
+            return Some(&line[..i]);
+        }
+        i += 1;
+    }
+    if in_string {
+        None
+    } else {
+        Some(line)
+    }
+}
+
+/// Parse a TOML basic string literal `"..."` (with `\"`, `\\`, `\n`, `\t`,
+/// `\r`) into its decoded value. The input must already start with `"`.
+fn parse_toml_string(value: &str) -> Result<String, String> {
+    if !value.starts_with('"') {
+        return Err("expected a double-quoted string".to_string());
+    }
+    let bytes = value.as_bytes();
+    let mut out = String::new();
+    let mut i = 1;
+    let mut closed = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\\' {
+            i += 1;
+            if i >= bytes.len() {
+                return Err("unterminated escape sequence".to_string());
+            }
+            let esc = bytes[i];
+            out.push(match esc {
+                b'"' => '"',
+                b'\\' => '\\',
+                b'n' => '\n',
+                b't' => '\t',
+                b'r' => '\r',
+                b'u' | b'U' => {
+                    return Err("unicode escapes are not supported in the toolchain pin".to_string())
+                }
+                other => return Err(format!("unsupported escape \\{}", other as char)),
+            });
+            i += 1;
+        } else if b == b'"' {
+            closed = true;
+            i += 1;
+            break;
+        } else {
+            out.push(b as char);
+            i += 1;
+        }
+    }
+    if !closed {
+        return Err("unterminated string literal".to_string());
+    }
+    // Trailing content after the closing quote is not allowed for a scalar.
+    if value[i..].trim().is_empty() {
+        Ok(out)
+    } else {
+        Err("unexpected content after the closing quote".to_string())
+    }
+}
 
 /// Worktree state probed outside this module (no process launch here).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -897,18 +1148,27 @@ fn atomic_replace(temp: &Path, destination: &Path) -> io::Result<()> {
 pub fn run_offline_preflight(request: &PreflightRequest<'_>) -> PreflightReport {
     let mut reasons: Vec<String> = Vec::new();
 
-    // Toolchain pin.
-    let toolchain_matches = match fs::read_to_string(request.toolchain_pin_file) {
-        Ok(text) => {
-            let ok = text.contains(&format!("channel = \"{}\"", request.expected_toolchain));
-            if !ok {
+    // Toolchain pin. The **expected** channel is derived from the trusted
+    // repository-root `rust-toolchain.toml` (the authoritative pin, part of the
+    // checked-in tree the worktree probe verifies), never from the caller's
+    // `--expected-toolchain`. The caller-supplied value is only a consistency
+    // cross-check: a caller fabricating a self-consistent-but-wrong policy
+    // (a fake pin file plus a matching `--expected-toolchain`) is refused
+    // because the repo-root pin is the ground truth.
+    //
+    // Both files are parsed STRICTLY (no substring matching): a `channel` in a
+    // comment or in a non-`[toolchain]` section is never honored.
+    let actual_channel = match fs::read_to_string(request.toolchain_pin_file) {
+        Ok(text) => match parse_toolchain_channel(&text) {
+            Ok(channel) => channel,
+            Err(e) => {
                 reasons.push(format!(
-                    "rust-toolchain.toml does not pin channel {:?}",
-                    request.expected_toolchain
+                    "rust-toolchain.toml {} rejected: {e}",
+                    request.toolchain_pin_file.display()
                 ));
+                None
             }
-            Some(ok)
-        }
+        },
         Err(e) => {
             reasons.push(format!(
                 "cannot read toolchain pin {}: {e}",
@@ -917,6 +1177,70 @@ pub fn run_offline_preflight(request: &PreflightRequest<'_>) -> PreflightReport 
             None
         }
     };
+    // The authoritative expected channel comes from the repo-root pin (when it
+    // exists). The caller-supplied `expected_toolchain` is cross-checked against
+    // it, and both must agree before the run may be pinned.
+    let authoritative_channel =
+        match fs::read_to_string(request.repo_root.join("rust-toolchain.toml")) {
+            Ok(text) => match parse_toolchain_channel(&text) {
+                Ok(Some(channel)) => Some(channel),
+                Ok(None) => {
+                    reasons.push(
+                    "repo-root rust-toolchain.toml has no [toolchain].channel; the run cannot be \
+                     pinned to a trusted toolchain"
+                        .to_string(),
+                );
+                    None
+                }
+                Err(e) => {
+                    reasons.push(format!("repo-root rust-toolchain.toml rejected: {e}"));
+                    None
+                }
+            },
+            Err(_) => {
+                // No repo-root pin: fall back to the caller-supplied expected value
+                // so the legacy (single pinned toolchain) lane still works, but it
+                // is no longer authoritative.
+                Some(request.expected_toolchain.trim().to_string())
+            }
+        };
+
+    let toolchain_matches = if let Some(actual) = actual_channel.as_deref() {
+        // The actual pin (toolchain_pin_file) must match the authoritative
+        // channel exactly.
+        let ok = authoritative_channel
+            .as_deref()
+            .map(|expected| actual == expected)
+            .unwrap_or(false);
+        if !ok {
+            reasons.push(format!(
+                "rust-toolchain.toml channel {:?} does not match the pinned channel {:?}",
+                actual,
+                authoritative_channel.as_deref().unwrap_or("(none)")
+            ));
+        }
+        Some(ok)
+    } else {
+        // Actual channel could not be determined (read/parse failure already
+        // recorded). NotReady.
+        None
+    };
+
+    // Consistency cross-check: the caller-supplied expected toolchain must
+    // agree with the authoritative repo-root-derived channel when one exists.
+    // A caller fabricating its own consistent-but-wrong policy fails here.
+    if let (Some(expected_call), Some(auth)) = (
+        Some(request.expected_toolchain.trim()),
+        authoritative_channel.as_deref(),
+    ) {
+        if !expected_call.is_empty() && expected_call != auth {
+            reasons.push(format!(
+                "caller-supplied expected toolchain {:?} does not match the repo-root pin {:?}; \
+                 refusing a self-consistent-but-wrong toolchain policy",
+                expected_call, auth
+            ));
+        }
+    }
 
     // Worktree (injected probe).
     let worktree = request.worktree.probe();
@@ -1103,7 +1427,7 @@ pub fn run_offline_preflight(request: &PreflightRequest<'_>) -> PreflightReport 
         }
         let mut final_reasons = verdict.reasons;
         final_reasons.extend(gto_reasons);
-        let identity_ok = verdict.ok && request.gto_path_binding_failures.get(&case_id).is_none();
+        let identity_ok = verdict.ok && !request.gto_path_binding_failures.contains_key(&case_id);
         cases.push(CasePreflight {
             case_id: verdict
                 .identity
@@ -1233,7 +1557,11 @@ pub fn run_offline_preflight(request: &PreflightRequest<'_>) -> PreflightReport 
         toolchain_pin_file: canonicalize_loose(request.toolchain_pin_file)
             .display()
             .to_string(),
-        expected_toolchain: request.expected_toolchain.to_string(),
+        // P1: the report records the authoritative (repo-root-derived)
+        // expected toolchain, never the raw caller-supplied value.
+        expected_toolchain: authoritative_channel
+            .clone()
+            .unwrap_or_else(|| request.expected_toolchain.to_string()),
         cases,
     }
 }
@@ -1253,6 +1581,7 @@ pub fn write_preflight_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     #[test]
     fn identity_check_rejects_digest_mismatch_and_alias() {
@@ -1406,5 +1735,188 @@ mod tests {
         assert!(!is_gto_lane_manifest("gto_launcher", "gto"));
         assert!(!is_gto_lane_manifest("gto_launcher", "oreans_candidate"));
         assert!(!is_gto_lane_manifest("", "ahk_gto_candidate"));
+    }
+
+    // --- P1 toolchain-pin strict parser (no substring acceptance) ---
+
+    #[test]
+    fn toolchain_comment_with_target_channel_does_not_match() {
+        // The comment contains the target channel but the real [toolchain]
+        // channel is different. The old `contains` check would pass; the strict
+        // parser must NOT.
+        let content = "# channel = \"1.97.1\"\n[toolchain]\nchannel = \"nightly\"\n";
+        let parsed = parse_toolchain_channel(content).unwrap();
+        assert_eq!(parsed.as_deref(), Some("nightly"));
+    }
+
+    #[test]
+    fn toolchain_extra_section_with_target_string_does_not_match() {
+        // A non-toolchain section carries a `channel` string; the real
+        // [toolchain] channel differs. Must not treat the extra-section string
+        // as the pin.
+        let content = "[build]\nchannel = \"1.97.1\"\n[toolchain]\nchannel = \"nightly\"\n";
+        assert!(parse_toolchain_channel(content).is_err());
+    }
+
+    #[test]
+    fn toolchain_channel_outside_section_is_refused() {
+        // A root-level `channel` (not inside [toolchain]) must be refused even
+        // if it would equal the target.
+        let content = "channel = \"1.97.1\"\n[toolchain]\nchannel = \"nightly\"\n";
+        assert!(parse_toolchain_channel(content).is_err());
+    }
+
+    #[test]
+    fn toolchain_correct_channel_parses() {
+        let content = "[toolchain]\nchannel = \"1.97.1\"\nprofile = \"minimal\"\n";
+        let parsed = parse_toolchain_channel(content).unwrap();
+        assert_eq!(parsed.as_deref(), Some("1.97.1"));
+    }
+
+    #[test]
+    fn toolchain_missing_section_returns_none() {
+        assert_eq!(parse_toolchain_channel("[build]\nfoo = 1\n").unwrap(), None);
+        assert_eq!(parse_toolchain_channel("").unwrap(), None);
+    }
+
+    #[test]
+    fn toolchain_malformed_toml_rejected() {
+        // Unterminated string.
+        assert!(parse_toolchain_channel("[toolchain]\nchannel = \"1.97").is_err());
+        // Duplicate channel.
+        assert!(parse_toolchain_channel("[toolchain]\nchannel=\"1\"\nchannel=\"2\"\n").is_err());
+        // channel is not a string.
+        assert!(parse_toolchain_channel("[toolchain]\nchannel = 1.97\n").is_err());
+        // Unknown key in [toolchain] (a smuggled second channel name).
+        assert!(
+            parse_toolchain_channel("[toolchain]\nchannel=\"1\"\nalt_channel=\"2\"\n").is_err()
+        );
+        // Malformed section header.
+        assert!(parse_toolchain_channel("[toolchain\nchannel=\"1\"\n").is_err());
+        // Unterminated section header.
+        assert!(parse_toolchain_channel("[toolchain\n").is_err());
+    }
+
+    #[test]
+    fn toolchain_string_with_hash_is_not_comment() {
+        // `#` inside a quoted value is data, not a comment.
+        let content = "[toolchain]\nchannel = \"1.9#7.1\"\n";
+        let parsed = parse_toolchain_channel(content).unwrap();
+        assert_eq!(parsed.as_deref(), Some("1.9#7.1"));
+    }
+
+    /// P1: a caller fabricating a self-consistent-but-wrong toolchain policy
+    /// (a fake pin file whose real channel is `nightly` + `--expected-toolchain
+    /// =1.97.1`) must NOT be pinned to 1.97.1 — the strict parser reads the
+    /// real channel and the authoritative repo-root pin governs.
+    #[test]
+    fn caller_cannot_self_consistently_forge_toolchain_policy() {
+        let dir = std::env::temp_dir().join(format!("mida_toolchain_forge_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let pin = dir.join("rust-toolchain.toml");
+        // The pin file a caller could supply: comment with the target channel,
+        // real channel nightly.
+        fs::write(
+            &pin,
+            "# channel = \"1.97.1\"\n[toolchain]\nchannel = \"nightly\"\n",
+        )
+        .unwrap();
+        // Repo-root authoritative pin (the real pinned toolchain).
+        let repo_root = dir.join("repo");
+        fs::create_dir_all(&repo_root).unwrap();
+        fs::write(
+            repo_root.join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"1.97.1\"\n",
+        )
+        .unwrap();
+
+        let cli_sha = "a".repeat(64);
+        let config = RunnerConfig::placeholder_for_preflight("rev@1", &cli_sha);
+        let probe = FakeProbeForToolchain;
+        let cases: Vec<(&Path, &Path, &Path)> = Vec::new();
+        let req = PreflightRequest {
+            cases,
+            output_dir: &dir,
+            cli_binary: None,
+            expected_cli_sha256: &cli_sha,
+            runner_config: &config,
+            worktree: &probe,
+            output_probe: &FsOutputProbe,
+            toolchain_pin_file: &pin,
+            expected_toolchain: "1.97.1",
+            repo_root: &repo_root,
+            case_config_digests: BTreeMap::new(),
+            gto_protected_input_path: BTreeMap::new(),
+            gto_path_binding_failures: BTreeMap::new(),
+            case_set_digest: String::new(),
+        };
+        let report = run_offline_preflight(&req);
+        // The attack pin (real channel nightly) does NOT match the authoritative
+        // 1.97.1 pin: toolchain_matches must be false.
+        assert_eq!(report.toolchain_matches, Some(false));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// P1: caller-supplied expected toolchain that disagrees with the
+    /// authoritative repo-root pin is refused (NotReady).
+    #[test]
+    fn caller_expected_toolchain_mismatch_with_repo_pin_is_not_ready() {
+        let dir =
+            std::env::temp_dir().join(format!("mida_toolchain_mismatch_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let pin = dir.join("rust-toolchain.toml");
+        fs::write(&pin, "[toolchain]\nchannel = \"1.97.1\"\n").unwrap();
+        let repo_root = dir.join("repo");
+        fs::create_dir_all(&repo_root).unwrap();
+        fs::write(
+            repo_root.join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"1.97.1\"\n",
+        )
+        .unwrap();
+
+        let cli_sha = "a".repeat(64);
+        let config = RunnerConfig::placeholder_for_preflight("rev@1", &cli_sha);
+        let probe = FakeProbeForToolchain;
+        let cases: Vec<(&Path, &Path, &Path)> = Vec::new();
+        let req = PreflightRequest {
+            cases,
+            output_dir: &dir,
+            cli_binary: None,
+            expected_cli_sha256: &cli_sha,
+            runner_config: &config,
+            worktree: &probe,
+            output_probe: &FsOutputProbe,
+            toolchain_pin_file: &pin,
+            expected_toolchain: "2.0.0", // self-consistent caller value, wrong
+            repo_root: &repo_root,
+            case_config_digests: BTreeMap::new(),
+            gto_protected_input_path: BTreeMap::new(),
+            gto_path_binding_failures: BTreeMap::new(),
+            case_set_digest: String::new(),
+        };
+        let report = run_offline_preflight(&req);
+        assert_eq!(report.status, PreflightStatus::NotReady);
+        assert!(
+            report
+                .reasons
+                .iter()
+                .any(|r| r.contains("self-consistent-but-wrong")),
+            "{:?}",
+            report.reasons
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A minimal worktree probe returning a fixed HEAD (used by the toolchain
+    /// forge tests so the orchestrator runs without a real git repo).
+    struct FakeProbeForToolchain;
+    impl WorktreeProbe for FakeProbeForToolchain {
+        fn probe(&self) -> WorktreeState {
+            WorktreeState {
+                head_revision: "rev@1".to_string(),
+                clean: true,
+                clean_determined: true,
+            }
+        }
     }
 }

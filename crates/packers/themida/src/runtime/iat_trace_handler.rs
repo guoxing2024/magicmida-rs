@@ -189,7 +189,10 @@ pub fn handle_trace_step(
 ) -> Result<IatTraceAction, String> {
     trace.trace_counter += 1;
 
-    if trace.trace_counter > TRACE_LIMIT {
+    // Check instruction limit. `>=` (not `>`) makes the limit "at most
+    // TRACE_LIMIT instructions executed": the slot fails once `trace_counter`
+    // reaches TRACE_LIMIT.
+    if trace.trace_counter >= TRACE_LIMIT {
         query.log(
             LogLevel::Info,
             &format!(

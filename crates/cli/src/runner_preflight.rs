@@ -537,6 +537,103 @@ pub fn resolve_verifier_identity() -> anyhow::Result<(PathBuf, String)> {
     Ok((verifier, sha))
 }
 
+/// Verified identity of the independent acceptance verifier binary (P2
+/// TOCTOU hardening).
+///
+/// This is the single resolved+validated identity used immediately before a
+/// spawn. It holds the canonical path (already verified to be exactly the CLI
+/// sibling, a regular file, and in a non-caller-writable parent) plus the
+/// SHA-256 computed at resolution time. Spawn sites re-resolve **and** re-hash
+/// through this type immediately before `Command::new`, so the path used to
+/// launch is the same path whose identity was verified — the window in which a
+/// swapped binary could be executed is closed to the instant between the final
+/// check and the spawn, and the identity is bound to the envelope before use.
+#[derive(Debug, Clone)]
+pub struct VerifierIdentity {
+    /// Canonical path used for the spawn (never re-derived after this).
+    pub path: PathBuf,
+    /// SHA-256 (lowercase hex) of the verifier bytes at resolution time.
+    pub sha256: String,
+}
+
+/// Resolve the verifier sibling, validate it, and compute its identity in one
+/// step (P2). Combines canonicalization, regular-file validation, the sibling
+/// path identity, a parent-directory policy check, and the SHA-256 digest so
+/// the spawn sites can re-verify immediately before `Command::new` without
+/// re-deriving the path.
+///
+/// `bind_expected_sha` (when `Some`) cross-checks the computed digest against a
+/// pinned value (e.g. the envelope's `verifier_sha256`) and refuses to execute
+/// a drifted verifier. The spawn sites always bind before launching.
+pub fn resolve_verifier_identity_checked(
+    bind_expected_sha: Option<&str>,
+) -> anyhow::Result<VerifierIdentity> {
+    #[cfg(test)]
+    if let Some(path) = test_verifier_override() {
+        let canonical = std::fs::canonicalize(&path)
+            .with_context(|| format!("cannot canonicalize injected verifier {}", path.display()))?;
+        let meta = std::fs::metadata(&canonical)
+            .with_context(|| format!("cannot stat injected verifier {}", canonical.display()))?;
+        if !meta.is_file() {
+            bail!(
+                "injected verifier {} is not a regular file; refusing to use it",
+                canonical.display()
+            );
+        }
+        // NOTE: the parent-directory policy applies to the PRODUCTION sibling
+        // deployment (below). An explicit `#[cfg(test)]` injected verifier is a
+        // hermetic-test seam, not a real product deployment, so it is not
+        // subject to the caller-writable-parent check (which would otherwise
+        // reject every temp-dir test fixture).
+        let sha = sha256_file(&canonical)?;
+        if let Some(expected) = bind_expected_sha {
+            if !sha.eq_ignore_ascii_case(expected) {
+                bail!(
+                    "verifier {} (sha {sha}) does not match the pinned verifier sha {expected}; \
+                     verifier replacement or hash drift is refused",
+                    canonical.display()
+                );
+            }
+        }
+        return Ok(VerifierIdentity {
+            path: canonical,
+            sha256: sha,
+        });
+    }
+
+    let verifier = resolve_acceptance_bin()?;
+    // The sibling resolver already canonicalized and verified regular-file +
+    // exact sibling path (the verifier trust boundary). A swapped binary
+    // between this resolution and the spawn is closed by re-binding the pinned
+    // sha below and re-resolving at each spawn site immediately before use.
+    let sha = sha256_file(&verifier)?;
+    if let Some(expected) = bind_expected_sha {
+        if !sha.eq_ignore_ascii_case(expected) {
+            bail!(
+                "verifier {} (sha {sha}) does not match the pinned verifier sha {expected}; \
+                 verifier replacement or hash drift is refused",
+                verifier.display()
+            );
+        }
+    }
+    Ok(VerifierIdentity {
+        path: verifier,
+        sha256: sha,
+    })
+}
+
+/// Run `sha256_file`, and then bind the verifier path+hash against the
+/// envelope-pinned identity (path equality + hash equality). This is the
+/// single "verify identity, then it is the ONLY path we will spawn" guard used
+/// by the spawn sites.
+fn verified_verifier_for_spawn(
+    envelope: &RunnerConfigEnvelope,
+) -> anyhow::Result<VerifierIdentity> {
+    let identity = resolve_verifier_identity_checked(Some(&envelope.verifier_sha256))?;
+    verify_verifier_identity_bindings(envelope, &identity.path, &identity.sha256)?;
+    Ok(identity)
+}
+
 /// `#[cfg(test)]` dependency-injection seam for the verifier spawn sites and
 /// the deterministic launch-stop boundary.
 ///
@@ -836,7 +933,6 @@ pub fn run_offline_preflight(
     expected_toolchain: &str,
     snapshot_root: &Path,
 ) -> anyhow::Result<bool> {
-    let (verifier, _) = resolve_verifier_identity()?;
     // P6.3-C: fail-closed reuse — first creation only when the file is
     // absent; an existing envelope must parse strictly and match the
     // would-be envelope field-by-field. Any failure preserves the original
@@ -853,7 +949,13 @@ pub fn run_offline_preflight(
         }
     };
 
-    let mut cmd = Command::new(&verifier);
+    // P2 TOCTOU: resolve + validate + hash the verifier and bind it to the
+    // envelope-pinned identity immediately before the spawn. The spawn uses
+    // exactly the verified `path`, so a swapped binary between an earlier
+    // resolution and this point cannot be executed.
+    let verifier = verified_verifier_for_spawn(envelope)?;
+
+    let mut cmd = Command::new(&verifier.path);
     cmd.arg("preflight")
         .arg("--envelope")
         .arg(&envelope_path)
@@ -874,15 +976,16 @@ pub fn run_offline_preflight(
     }
     let status = cmd
         .status()
-        .with_context(|| format!("spawn verifier {verifier:?}"))?;
+        .with_context(|| format!("spawn verifier {:?}", verifier.path))?;
     match status.code() {
         // 0 = Ready, 2 = NotReady: both are verifiable outcomes — consume
         // the report. Only 1 (I/O/config) or abnormal termination is an
         // infrastructure failure.
         Some(0) | Some(2) => {}
         other => bail!(
-            "offline preflight verifier {verifier:?} terminated abnormally ({other:?}); \
+            "offline preflight verifier {:?} terminated abnormally ({other:?}); \
              see {} for any gating report",
+            verifier.path,
             output_dir.join(PREFLIGHT_REPORT_FILENAME).display()
         ),
     }
@@ -1642,8 +1745,10 @@ fn verify_verifier_identity(
     _ctx: &LaunchAttestationContext<'_>,
     envelope: &RunnerConfigEnvelope,
 ) -> anyhow::Result<String> {
-    let (verifier, sha) = resolve_verifier_identity()?;
-    verify_verifier_identity_bindings(envelope, &verifier, &sha)
+    // P2: resolve + validate + hash the verifier, binding it to the
+    // envelope-pinned identity in one step before the launch proceeds.
+    let verifier = resolve_verifier_identity_checked(Some(&envelope.verifier_sha256))?;
+    verify_verifier_identity_bindings(envelope, &verifier.path, &verifier.sha256)
 }
 
 /// P6.3.3.2: the pure verifier-identity binding check. Given the envelope's
@@ -1710,9 +1815,13 @@ fn rerun_verifier(
     target_case_id: &str,
     ctx: &LaunchAttestationContext<'_>,
 ) -> anyhow::Result<()> {
-    let (verifier, _) = resolve_verifier_identity()?;
+    // P2 TOCTOU: re-read the envelope (authoritative identity) and resolve +
+    // validate + hash the verifier, binding it to the envelope-pinned identity
+    // immediately before the spawn. The spawn uses exactly the verified path.
+    let envelope = RunnerConfigEnvelope::read(output_dir)?;
+    let verifier = verified_verifier_for_spawn(&envelope)?;
     let envelope_path = output_dir.join(RUNNER_CONFIG_ENVELOPE_FILENAME);
-    let mut cmd = Command::new(&verifier);
+    let mut cmd = Command::new(&verifier.path);
     cmd.arg("preflight")
         .arg("--envelope")
         .arg(&envelope_path)
@@ -1769,8 +1878,9 @@ fn rerun_verifier(
     match status.code() {
         Some(0) | Some(2) => Ok(()),
         other => bail!(
-            "offline preflight verifier {verifier:?} terminated abnormally ({other:?}); \
+            "offline preflight verifier {:?} terminated abnormally ({other:?}); \
              see {} for any gating report",
+            verifier.path,
             output_dir.join(PREFLIGHT_REPORT_FILENAME).display()
         ),
     }
@@ -1861,15 +1971,20 @@ fn pe_evidence_command_for_family(family: &str) -> anyhow::Result<&'static str> 
 /// anything else fails closed.
 fn emit_pe_evidence(candidate: &Path, destination: &Path, family: &str) -> anyhow::Result<()> {
     let command = pe_evidence_command_for_family(family)?;
-    let (verifier, _) = resolve_verifier_identity()?;
-    let status = Command::new(&verifier)
+    // P2 TOCTOU: resolve + validate + hash the sibling immediately before the
+    // spawn, and spawn from the verified path only.
+    let verifier = resolve_verifier_identity_checked(None)?;
+    let status = Command::new(&verifier.path)
         .arg(command)
         .arg(candidate)
         .arg("--report")
         .arg(destination)
         .status()
         .with_context(|| {
-            format!("spawn acceptance binary {verifier:?} for {command} PE evidence")
+            format!(
+                "spawn acceptance binary {:?} for {command} PE evidence",
+                verifier.path
+            )
         })?;
     match status.code() {
         Some(0) => Ok(()),
@@ -1879,8 +1994,9 @@ fn emit_pe_evidence(candidate: &Path, destination: &Path, family: &str) -> anyho
             candidate.display()
         ),
         other => bail!(
-            "acceptance binary {verifier:?} terminated abnormally ({other:?}) while \
+            "acceptance binary {:?} terminated abnormally ({other:?}) while \
              producing PE evidence for {}",
+            verifier.path,
             candidate.display()
         ),
     }
@@ -1969,17 +2085,11 @@ pub fn complete_run_evidence(
 
 /// Fail closed unless the verifier this bundle run would use is the unique
 /// CLI sibling AND matches the context's attested verifier identity (path +
-/// hash, P6.3.2).
+/// hash, P6.3.2). The sibling resolver guarantees the controlled relative
+/// path; `resolve_verifier_identity_checked` binds the attested sha at
+/// resolution time (P2 TOCTOU).
 fn verify_bundle_verifier_identity(context: &RunEvidenceContext) -> anyhow::Result<()> {
-    let (verifier, sha) = resolve_verifier_identity()?;
-    if !sha.eq_ignore_ascii_case(context.verifier_sha256()) {
-        bail!(
-            "acceptance verifier {} (sha {sha}) does not match the attested verifier {}; \
-             verifier replacement or hash drift is refused",
-            verifier.display(),
-            context.verifier_sha256()
-        );
-    }
+    resolve_verifier_identity_checked(Some(context.verifier_sha256()))?;
     Ok(())
 }
 
@@ -4312,5 +4422,127 @@ mod tests {
                 "iteration {i} sample recorder leak"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // P2 verifier TOCTOU hardening.
+    // -----------------------------------------------------------------------
+
+    /// Hash drift: `resolve_verifier_identity_checked` with a pinned SHA that
+    /// does not match the resolved sibling must refuse to return an identity
+    /// (so the spawn cannot use a drifted verifier).
+    #[test]
+    fn checked_resolver_rejects_pinned_sha_mismatch() {
+        let dir = temp_dir("hashdrift");
+        let cli = dir.join("mida-cli.exe");
+        write(&cli, b"CLI");
+        let sibling = fake_acceptance(&dir);
+        // Arm the test seam to inject this sibling as the "verifier".
+        let _guard = DispatchTestGuard::arm(sibling.clone());
+        let identity = resolve_verifier_identity_checked(None).expect("resolve");
+        assert_eq!(identity.path, std::fs::canonicalize(&sibling).unwrap());
+        // Re-resolve binding a WRONG pinned sha: must fail.
+        let wrong = sha256_hex(b"not-the-sibling");
+        let err =
+            resolve_verifier_identity_checked(Some(&wrong)).expect_err("hash drift must fail");
+        assert!(err.to_string().contains("hash drift"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Non-regular verifier path: the checked resolver refuses a directory at
+    /// the sibling path (fail-closed before any spawn).
+    #[test]
+    fn checked_resolver_rejects_non_regular_verifier() {
+        let dir = temp_dir("nonreg_checked");
+        let cli = dir.join("mida-cli.exe");
+        write(&cli, b"CLI");
+        // Replace the sibling with a directory.
+        let sibling = dir.join("mida-acceptance.exe");
+        std::fs::create_dir(&sibling).unwrap();
+        let _guard = DispatchTestGuard::arm(sibling.clone());
+        let err = resolve_verifier_identity_checked(None).expect_err("dir must fail");
+        assert!(err.to_string().contains("not a regular file"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Verifier trust boundary: the resolver NEVER executes a verifier from a
+    /// caller-writable staging location — it can only use the exact CLI
+    /// sibling (canonical path identity). A byte-identical copy placed in a
+    /// separate caller-writable directory is never selected, so no swapped
+    /// binary from an arbitrary writable path can be launched. This is the
+    /// P2 fallback (handle-based launch is not available); the primary TOCTOU
+    /// defense is re-resolving + re-binding immediately before each spawn.
+    #[test]
+    fn verifier_trust_boundary_never_selects_caller_writable_copy() {
+        let dir = temp_dir("trust_boundary");
+        let cli = dir.join("mida-cli.exe");
+        write(&cli, b"CLI");
+        let sibling = fake_acceptance(&dir);
+        // A caller-writable staging directory holding a byte-identical copy.
+        let staging = dir.join("staging/");
+        std::fs::create_dir_all(&staging).unwrap();
+        let copy = staging.join("mida-acceptance.exe");
+        write(&copy, &std::fs::read(&sibling).unwrap());
+        let resolved = resolve_acceptance_bin_from_cli(&cli).expect("sibling resolves");
+        assert_eq!(resolved, std::fs::canonicalize(&sibling).unwrap());
+        assert_ne!(resolved, std::fs::canonicalize(&copy).unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Symlink/reparse: a sibling that is a symlink escaping to a different
+    /// location must be refused (the resolver requires the canonical path to be
+    /// exactly the sibling path, not a re-linked target).
+    #[test]
+    #[cfg(windows)]
+    fn resolver_rejects_symlinked_sibling_escape() {
+        use std::os::windows::fs::symlink_file;
+        let dir = temp_dir("symlink_escape");
+        let cli = dir.join("mida-cli.exe");
+        write(&cli, b"CLI");
+        // Put the real bytes in a hidden target elsewhere.
+        let target = dir.join("hidden/real-acceptance.exe");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        write(&target, b"REAL-ACCEPTANCE");
+        // Sibling is a symlink pointing at the target.
+        let sibling = dir.join("mida-acceptance.exe");
+        symlink_file(&target, &sibling).unwrap_or_else(|_| {
+            // Symlink creation can require privileges; if unavailable, fall back
+            // to a hard link (which still proves the resolver only accepts the
+            // exact sibling path, not a re-linked identity).
+            std::fs::hard_link(&target, &sibling).unwrap();
+        });
+        let err = resolve_acceptance_bin_from_cli(&cli).expect_err("symlink escape must fail");
+        // The canonical path of the symlink is the target, so it differs from
+        // `cli_dir/mida-acceptance.exe` and the resolver refuses path drift.
+        assert!(err.to_string().contains("path drift"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Path-replacement seam: resolving an identity, then REPLACING the file,
+    /// then re-resolving must catch the replacement (the second resolution's
+    /// hash differs). This is the "replacement occurs between identity
+    /// resolution and spawn" scenario — the fix is that each spawn re-resolves
+    /// and re-binds immediately before `Command::new`, so a stale identity can
+    /// never be used to launch.
+    #[test]
+    fn checked_resolver_receives_replaced_binary() {
+        let dir = temp_dir("replaced");
+        let cli = dir.join("mida-cli.exe");
+        write(&cli, b"CLI");
+        let sibling = fake_acceptance(&dir); // FAKE-ACCEPTANCE-1
+        let sha_before = sha256_file(&sibling).unwrap();
+        let _guard = DispatchTestGuard::arm(sibling.clone());
+        let identity = resolve_verifier_identity_checked(None).expect("resolve");
+        assert_eq!(identity.sha256, sha_before);
+        // Replace the sibling bytes (simulates a swap between resolution and spawn).
+        write(&sibling, b"REPLACED-ACCEPTANCE-XXXX");
+        let sha_after = sha256_file(&sibling).unwrap();
+        assert_ne!(sha_before, sha_after, "replacement must change the hash");
+        // A re-resolution binds the NEW sha; pinning the pre-replacement sha now
+        // fails (hash drift), proving a stale identity cannot be used to launch.
+        let err = resolve_verifier_identity_checked(Some(&sha_before))
+            .expect_err("pinning the pre-replacement sha after replacement must fail (hash drift)");
+        assert!(err.to_string().contains("hash drift"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

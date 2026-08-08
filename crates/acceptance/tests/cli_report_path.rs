@@ -308,11 +308,24 @@ fn allow_unsigned_managed_can_accept() {
         evidence.to_str().unwrap(),
         "--allow-unsigned-managed",
     ]);
-    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    // P1 Lab/Product isolation: `--allow-unsigned-managed` is lab-only. It may
+    // report verdict Accepted, but it must NOT use the product exit code (0):
+    // a lab Accept returns exit 3, and the report marks trust_tier=lab with
+    // product_acceptable=false so a machine consumer cannot mistake it for a
+    // product acceptance.
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("\"verdict\":\"Accepted\""),
         "lab flag should allow Accepted, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("\"trust_tier\":\"lab\""),
+        "lab report must mark trust_tier=lab, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("\"product_acceptable\":false"),
+        "lab Accept must not be product-acceptable, got: {stdout}"
     );
 }
 

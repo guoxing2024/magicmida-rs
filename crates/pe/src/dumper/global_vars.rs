@@ -69,17 +69,12 @@ pub fn detect_critical_vars_from_oep(
 
                 // Check for RIP-relative (mod=00, r/m=101)
                 // ModR/M format: [mod:2][reg:3][r/m:3]
-                // RIP-relative: mod=00 (0b00), r/m=101 (0b101)
-                // This gives us x05, x0D, x15, x1D, x25, x2D, x35, x3D
-                if (modrm & 0xC7) == 0x05
-                    || (modrm & 0xC7) == 0x0D
-                    || (modrm & 0xC7) == 0x15
-                    || (modrm & 0xC7) == 0x1D
-                    || (modrm & 0xC7) == 0x25
-                    || (modrm & 0xC7) == 0x2D
-                    || (modrm & 0xC7) == 0x35
-                    || (modrm & 0xC7) == 0x3D
-                {
+                // RIP-relative requires mod=00 (0b00) and r/m=101 (0b101).
+                // The `reg` field (bits 5:3) is irrelevant to the addressing
+                // mode and is masked off, so `modrm & 0xC7 == 0x05` is the
+                // single sufficient and necessary test (the values x05/x0D/x15/
+                // x1D/x25/x2D/x35/x3D all reduce to 0x05 under the 0xC7 mask).
+                if (modrm & 0xC7) == 0x05 {
                     // Read 32-bit displacement
                     let disp =
                         i32::from_le_bytes([code[i + 3], code[i + 4], code[i + 5], code[i + 6]]);
@@ -89,17 +84,18 @@ pub fn detect_critical_vars_from_oep(
                     let next_rip = oep_rva + (i as u32) + instr_len;
                     let target_rva = (next_rip as i64 + disp as i64) as u32;
 
-                    // Check if target is in .data section
-                    if target_rva >= data_start && target_rva < data_end {
-                        if !critical_rvas.contains(&target_rva) {
-                            critical_rvas.push(target_rva);
+                    // Check if target is in .data section (deduplicate).
+                    if target_rva >= data_start
+                        && target_rva < data_end
+                        && !critical_rvas.contains(&target_rva)
+                    {
+                        critical_rvas.push(target_rva);
 
-                            debug!(
-                                target_rva = format_args!("{:#x}", target_rva),
-                                oep_offset = format_args!("{:#x}", i),
-                                "Detected critical var referenced from OEP"
-                            );
-                        }
+                        debug!(
+                            target_rva = format_args!("{:#x}", target_rva),
+                            oep_offset = format_args!("{:#x}", i),
+                            "Detected critical var referenced from OEP"
+                        );
                     }
                 }
             }

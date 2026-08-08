@@ -86,8 +86,10 @@ pub(crate) fn trace_one_slot(
                 DebugEvent::SingleStep { address, .. } => {
                     counter += 1;
 
-                    // Check instruction limit.
-                    if counter > limit {
+                    // Check instruction limit. `>=` (not `>`) makes the limit
+                    // "at most `limit` instructions executed": the trace stops
+                    // once `counter` reaches `limit`.
+                    if counter >= limit {
                         log(LogMsgType::Info, "Giving up trace due to instruction limit");
                         return Ok(());
                     }

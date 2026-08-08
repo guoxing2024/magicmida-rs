@@ -24,11 +24,21 @@
 //!   must be `Pass`; any `Missing`/`NotRun`/`Unknown`/`Malformed`/`Timeout`/
 //!   `Partial`/`Mismatch` fails the whole contract. `reason` must be non-empty.
 //! - The protected and candidate must have run the **same** canonical stimulus
-//!   plan (`stimulus_plan_sha256` must match the canonical plan registry). A side
-//!   cannot add/remove/reorder/change a stimulus.
-//! - Equivalence manufacture is rejected: a server/icon patch, forced visibility,
-//!   skipped product code, semantic bypass, case-specific success override, or a
-//!   "return Pass based on sample hash" override is a hard error.
+//!   plan (`stimulus_plan_sha256` must match the canonical plan registry), and
+//!   the evidence's `stimuli` must match the registered canonical plan CONTENT
+//!   exactly. Registration is content-bound: `register` recomputes the
+//!   canonical content hash and refuses a declared hash that does not match,
+//!   and verification compares the full canonical stimulus set (add/remove/
+//!   reorder/id/value changes all fail). Preserving a valid hash while
+//!   tampering `evidence.stimuli` is rejected.
+//! - Equivalence manufacture is rejected from a STRUCTURED `equivalence_proof`
+//!   block (P1): a server/icon patch, forced visibility, skipped product code,
+//!   injected modules, or a transform/patch outside the allowlist is a hard
+//!   error. The free-text `reason` is human explanation only and is never
+//!   consulted for a verdict — the old substring blacklist is gone.
+//! - The structured proof must bind a real runtime observation; when the probe
+//!   did not run offline the verdict is `NotRun` (Pending), never a fabricated
+//!   `Pass`.
 //! - Producer and verifier keep independent serde types and independent
 //!   canonical/digest implementations; the verifier never depends on a producer
 //!   crate.
@@ -209,6 +219,127 @@ impl ObservableVerdict {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Structured equivalence proof (P1: no free-text-reason security control)
+// ---------------------------------------------------------------------------
+//
+// The previous `reject_equivalence_manufacture` scanned the free-text `reason`
+// for a fixed list of markers. That is not a security control: a caller can
+// change case, insert whitespace, use synonyms, omit the reason, or drive a
+// patch through runtime injection. The security state now lives in a
+// structured `equivalence_proof` block; `reason` is human explanation only and
+// is never consulted for a verdict.
+
+/// A registered, allowlisted repair transform that does NOT manufacture
+/// equivalence (mirrors the taxonomy in `crate::behavior`). `kind` is the
+/// transform class; `rule_id` the allowlisted rule. Any transform outside this
+/// set fails closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AllowedTransform {
+    pub id: &'static str,
+    pub kind: &'static str,
+    pub rule_id: &'static str,
+}
+
+/// The allowlisted, benign repair transforms (PE IAT rebuild, reloc rebind,
+/// stale-pointer clear). A transform outside this set — regardless of how it is
+/// spelled in a reason or a ledger — is an equivalence-manufacture marker.
+pub const ALLOWED_EQUIVALENCE_TRANSFORMS: &[AllowedTransform] = &[
+    AllowedTransform {
+        id: "iat_rebuild",
+        kind: "pe_repair",
+        rule_id: "pe_iat_rebuild_v0",
+    },
+    AllowedTransform {
+        id: "reloc_rebind",
+        kind: "pe_repair",
+        rule_id: "pe_reloc_rebind_v0",
+    },
+    AllowedTransform {
+        id: "clear_stale_ptrs",
+        kind: "pe_repair",
+        rule_id: "clear_stale_process_ptrs_v0",
+    },
+];
+
+/// One structured transform actually applied to the candidate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransformProofEntry {
+    pub id: String,
+    pub kind: String,
+    /// The allowlisted rule id, when the transform is a registered benign repair.
+    #[serde(default)]
+    pub equivalence_rule: Option<String>,
+}
+
+/// One structured runtime patch (bytes/state patched after load).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PatchProofEntry {
+    pub id: String,
+    /// Description of the patched region (never a security gate by itself).
+    pub description: String,
+}
+
+/// Structured equivalence proof bound to the evidence.
+///
+/// The verifier reads equivalence-manufacture state ONLY from this block:
+///
+/// - `skipped_product_code` / `forced_visibility` / a non-empty
+///   `server_patch_state` / `icon_patch_state` / `injected_module_list`, or a
+///   `transform_ledger` / `runtime_patch_ledger` entry outside the allowlist
+///   → the verdict is `Fail` (equivalence manufacture).
+/// - A missing or malformed block (or a missing required binding such as probe
+///   identity) → the evidence is rejected.
+/// - A complete block that cannot establish real runtime observation
+///   (`observation_source_hash` / `execution_environment_digest` are `None`,
+///   i.e. offline, no real probe) → the verdict is `NotRun` (Pending), never
+///   `Pass`. The offline contract cannot fabricate a real behavioral Pass.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EquivalenceProof {
+    pub probe_binary_identity: BehaviorChainIdentity,
+    pub runner_binary_identity: BehaviorChainIdentity,
+    /// Modules loaded into the probe process (by name or digest).
+    #[serde(default)]
+    pub loaded_modules: Vec<String>,
+    /// Transforms actually applied to the candidate (structured). Required:
+    /// a proof without a transform ledger is incomplete and fails parse
+    /// (fail-closed — the absence of a ledger cannot silently pass).
+    pub transform_ledger: Vec<TransformProofEntry>,
+    /// Runtime patches applied after load (structured). Required for the same
+    /// reason as `transform_ledger`.
+    pub runtime_patch_ledger: Vec<PatchProofEntry>,
+    /// Modules injected into the candidate (non-empty → manufacture).
+    #[serde(default)]
+    pub injected_module_list: Vec<String>,
+    /// Product code deliberately skipped (true → manufacture).
+    #[serde(default)]
+    pub skipped_product_code: bool,
+    /// Forced UI visibility override (true → manufacture).
+    #[serde(default)]
+    pub forced_visibility: bool,
+    /// Server-side patch/response override state (Some → manufacture).
+    #[serde(default)]
+    pub server_patch_state: Option<String>,
+    /// Icon patch state (Some → manufacture).
+    #[serde(default)]
+    pub icon_patch_state: Option<String>,
+    /// Hash of the raw observation source (probe logs). `None` when the probe
+    /// did not run (offline) — verdict becomes `NotRun`, never `Pass`.
+    pub observation_source_hash: Option<String>,
+    /// Digest of the execution environment. `None` when offline — verdict
+    /// becomes `NotRun`, never `Pass`.
+    pub execution_environment_digest: Option<String>,
+}
+
+impl EquivalenceProof {
+    fn is_well_formed(&self) -> bool {
+        self.probe_binary_identity.is_well_formed() && self.runner_binary_identity.is_well_formed()
+    }
+}
+
 /// Final contract verdict recomputed by the verifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -235,13 +366,57 @@ pub struct BehaviorOracleContractEvidence {
     pub execution: BehaviorExecution,
     pub stimuli: Vec<BehaviorStimulus>,
     pub observables: Vec<BehaviorObservable>,
+    /// Structured equivalence proof (P1). `reason` is human-only; all
+    /// equivalence-manufacture state is read from here.
+    pub equivalence_proof: EquivalenceProof,
     pub reason: String,
+}
+
+/// Canonical, stable serialization of an ordered stimulus plan.
+///
+/// The encoding is length-prefixed and injective (commas/semicolons/`=`
+/// inside `id`/`value` bytes cannot collide), and the order is pinned by
+/// sorting on the (id, value) pair so the digest does not depend on vector
+/// order or any HashMap iteration order. This is the single source of truth
+/// for "same stimulus plan" — the registry and the evidence content both
+/// canonicalize through it, so add/remove/reorder/id/value changes all change
+/// the digest.
+pub fn canonical_stimulus_serialization(stimuli: &[BehaviorStimulus]) -> String {
+    let mut entries: Vec<(&str, &str)> = stimuli
+        .iter()
+        .map(|s| (s.id.as_str(), s.value.as_str()))
+        .collect();
+    // Sort by (id, value): a reordered plan canonicalizes to the same bytes
+    // only if the multiset of (id, value) pairs is identical.
+    entries.sort_unstable();
+    let mut out = String::new();
+    for (id, value) in entries {
+        out.push_str(&format!(
+            "id={}:{};value={}:{};",
+            id.len(),
+            id,
+            value.len(),
+            value
+        ));
+    }
+    out
+}
+
+/// SHA-256 (64 lowercase hex) of the canonical stimulus serialization.
+pub fn canonical_stimuli_hash(stimuli: &[BehaviorStimulus]) -> String {
+    crate::sha256_hex(canonical_stimulus_serialization(stimuli).as_bytes())
 }
 
 /// The canonical stimulus-plan registry. For offline tests, plans are registered
 /// by content hash; the registry may be empty until per-case business plans are
 /// defined (a P9-live blocker). A plan referenced by evidence must be present
 /// here (or provided via an explicit plan-supply seam for hermetic tests).
+///
+/// Registration is **content-bound**: `register` recomputes the canonical hash
+/// of the supplied stimuli and rejects any entry whose `sha256` does not match
+/// that content (or that silently overwrites a different plan under the same
+/// hash). This closes the "keep a valid hash, tamper the stimuli" gap — a
+/// registered hash always maps to exactly one canonical stimulus set.
 #[derive(Debug, Clone, Default)]
 pub struct StimulusPlanRegistry {
     plans: std::collections::BTreeMap<String, Vec<BehaviorStimulus>>,
@@ -252,12 +427,59 @@ impl StimulusPlanRegistry {
         Self::default()
     }
 
-    pub fn register(&mut self, sha256: String, stimuli: Vec<BehaviorStimulus>) {
-        self.plans.insert(sha256, stimuli);
+    /// Register a canonical stimulus plan under its content hash.
+    ///
+    /// Returns `Err` (and records nothing) when:
+    /// - the supplied `sha256` is not the canonical content hash of `stimuli`;
+    /// - a different stimulus set is already registered under the same hash
+    ///   (silent overwrite is refused).
+    pub fn register(
+        &mut self,
+        sha256: String,
+        stimuli: Vec<BehaviorStimulus>,
+    ) -> Result<(), BehaviorOracleContractError> {
+        let actual = canonical_stimuli_hash(&stimuli);
+        if !actual.eq_ignore_ascii_case(&sha256) {
+            return Err(BehaviorOracleContractError::StimulusPlanHashMismatch {
+                declared: sha256,
+                computed: actual,
+            });
+        }
+        if let Some(existing) = self.plans.get(&sha256.to_lowercase()) {
+            if existing != &stimuli {
+                return Err(BehaviorOracleContractError::StimulusPlanHashCollision(
+                    sha256,
+                ));
+            }
+            return Ok(());
+        }
+        self.plans.insert(sha256.to_lowercase(), stimuli);
+        Ok(())
     }
 
+    /// Look up the canonical plan by content hash.
     pub fn plan(&self, sha256: &str) -> Option<&[BehaviorStimulus]> {
-        self.plans.get(sha256).map(Vec::as_slice)
+        self.plans.get(&sha256.to_lowercase()).map(Vec::as_slice)
+    }
+
+    /// Fail-closed content check: the evidence's stimuli must canonicalize to
+    /// exactly the canonical plan registered under the evidence's plan hash.
+    /// `None` when the plan is not registered (never a silent accept).
+    pub fn validate_evidence_plan_content(
+        &self,
+        evidence: &BehaviorOracleContractEvidence,
+    ) -> Result<(), BehaviorOracleContractError> {
+        let canonical = self.plan(&evidence.stimulus_plan.sha256).ok_or_else(|| {
+            BehaviorOracleContractError::UnregisteredStimulusPlan(
+                evidence.stimulus_plan.sha256.clone(),
+            )
+        })?;
+        if canonical != evidence.stimuli.as_slice() {
+            return Err(BehaviorOracleContractError::StimulusPlanContentMismatch {
+                plan_sha: evidence.stimulus_plan.sha256.clone(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -324,10 +546,40 @@ pub enum BehaviorOracleContractError {
     BadObservableField(String),
     #[error("stimulus plan sha256 '{0}' is not registered in the canonical registry")]
     UnregisteredStimulusPlan(String),
+    #[error(
+        "registered plan hash '{declared}' does not match the canonical hash of the supplied \
+         stimuli '{computed}' (content-bound registration refused)"
+    )]
+    StimulusPlanHashMismatch { declared: String, computed: String },
+    #[error(
+        "a different canonical stimulus set is already registered under plan hash '{0}'; \
+         silently overwriting a plan with the same hash is refused"
+    )]
+    StimulusPlanHashCollision(String),
+    #[error(
+        "evidence stimuli do not match the canonical plan '{plan_sha}' (add/remove/reorder/id/\
+         value drift refused)"
+    )]
+    StimulusPlanContentMismatch { plan_sha: String },
     #[error("reason is empty")]
     EmptyReason,
-    #[error("evidence declares an equivalence-manufacture marker ('{0}')")]
+    #[error("equivalence_proof is malformed or missing required identities")]
+    BadEquivalenceProof,
+    #[error(
+        "equivalence_proof declares an equivalence-manufacture marker: {0} (structured; never \
+         reason text)"
+    )]
     EquivalenceManufacture(String),
+    #[error(
+        "equivalence_proof transform '{id}' (kind '{kind}') is not in the allowlist — \
+         fail-closed (equivalence manufacture)"
+    )]
+    UnallowedTransform { id: String, kind: String },
+    #[error(
+        "equivalence_proof runtime patch '{id}' cannot be bound to an allowlisted transform — \
+         fail-closed (equivalence manufacture)"
+    )]
+    UnallowedPatch { id: String },
 }
 
 /// Recompute one observable's verdict from its observed value and comparator.
@@ -459,35 +711,136 @@ fn validate_contract_shape(
     if evidence.reason.trim().is_empty() {
         return Err(BehaviorOracleContractError::EmptyReason);
     }
+    // P1: the structured equivalence proof must be well-formed (required
+    // identities present). `reason` text is human-only and never a gate.
+    validate_equivalence_proof_shape(evidence)?;
     Ok(())
 }
 
-/// Reject equivalence-manufacture markers. The evidence must not claim a
-/// server/icon patch, forced visibility, skipped product code, semantic bypass,
-/// case-specific success override, or a sample-hash-based pass override.
+/// Validate the structured equivalence proof is well-formed (required
+/// identities present). The `reason` field is never consulted here.
+fn validate_equivalence_proof_shape(
+    evidence: &BehaviorOracleContractEvidence,
+) -> Result<(), BehaviorOracleContractError> {
+    if !evidence.equivalence_proof.is_well_formed() {
+        return Err(BehaviorOracleContractError::BadEquivalenceProof);
+    }
+    Ok(())
+}
+
+/// Return the allowlist rule id for a transform `(id, kind)`, if registered.
+fn allowlisted_transform_rule(id: &str, kind: &str) -> Option<&'static str> {
+    ALLOWED_EQUIVALENCE_TRANSFORMS
+        .iter()
+        .find(|t| t.id == id && t.kind == kind)
+        .map(|t| t.rule_id)
+}
+
+/// Reject equivalence manufacture from the STRUCTURED proof (P1). The evidence
+/// must not declare a server/icon patch, forced visibility, skipped product
+/// code, injected modules, or a transform/patch outside the allowlist. Any such
+/// marker is a hard error regardless of how the free-text `reason` is phrased.
 fn reject_equivalence_manufacture(
     evidence: &BehaviorOracleContractEvidence,
 ) -> Result<(), BehaviorOracleContractError> {
-    const FORBIDDEN: [&str; 6] = [
-        "server_patch",
-        "icon_patch",
-        "forced_visibility",
-        "skip_product_code",
-        "semantic_bypass",
-        "case_specific_success_override",
-    ];
-    let blob = format!("{:?}", evidence.reason);
-    for marker in FORBIDDEN {
-        if blob.contains(marker) {
+    let proof = &evidence.equivalence_proof;
+
+    // Boolean / string manufacture markers (structured, not reason text).
+    if proof.skipped_product_code {
+        return Err(BehaviorOracleContractError::EquivalenceManufacture(
+            "skipped_product_code=true".to_string(),
+        ));
+    }
+    if proof.forced_visibility {
+        return Err(BehaviorOracleContractError::EquivalenceManufacture(
+            "forced_visibility=true".to_string(),
+        ));
+    }
+    if let Some(state) = proof.server_patch_state.as_deref() {
+        if !state.trim().is_empty() {
             return Err(BehaviorOracleContractError::EquivalenceManufacture(
-                marker.to_string(),
+                format!("server_patch_state={state:?}"),
             ));
         }
     }
-    // The evidence has no equivalence field to carry a hash-based pass override;
-    // the verifier recomputes the verdict from observables only, so no caller can
-    // return Pass based on sample hash.
+    if let Some(state) = proof.icon_patch_state.as_deref() {
+        if !state.trim().is_empty() {
+            return Err(BehaviorOracleContractError::EquivalenceManufacture(
+                format!("icon_patch_state={state:?}"),
+            ));
+        }
+    }
+    if !proof.injected_module_list.is_empty() {
+        return Err(BehaviorOracleContractError::EquivalenceManufacture(
+            "injected_module_list is non-empty".to_string(),
+        ));
+    }
+
+    // Structured transform ledger: every transform must be allowlisted.
+    for entry in &proof.transform_ledger {
+        let Some(rule) = allowlisted_transform_rule(&entry.id, &entry.kind) else {
+            return Err(BehaviorOracleContractError::UnallowedTransform {
+                id: entry.id.clone(),
+                kind: entry.kind.clone(),
+            });
+        };
+        // The entry's equivalence_rule must match the allowlisted rule exactly;
+        // a mismatched/missing rule fails closed.
+        if entry.equivalence_rule.as_deref() != Some(rule) {
+            return Err(BehaviorOracleContractError::UnallowedTransform {
+                id: entry.id.clone(),
+                kind: entry.kind.clone(),
+            });
+        }
+    }
+
+    // Structured runtime patch ledger: a runtime patch is only acceptable when
+    // it is a binding of an allowlisted transform; any patch with no matching
+    // allowlisted transform in the ledger fails closed.
+    if !proof.runtime_patch_ledger.is_empty() {
+        for patch in &proof.runtime_patch_ledger {
+            let bound = proof
+                .transform_ledger
+                .iter()
+                .any(|t| allowlisted_transform_rule(&t.id, &t.kind).is_some() && t.id == patch.id);
+            if !bound {
+                return Err(BehaviorOracleContractError::UnallowedPatch {
+                    id: patch.id.clone(),
+                });
+            }
+        }
+    }
+
     Ok(())
+}
+
+/// Whether the structured proof establishes a REAL runtime observation (not an
+/// offline placeholder). When the probe did not run (`observation_source_hash`
+/// and `execution_environment_digest` are `None`), a behavioral `Pass` cannot
+/// be claimed — the contract returns `NotRun` (Pending), never `Pass`.
+fn proof_establishes_real_observation(evidence: &BehaviorOracleContractEvidence) -> bool {
+    let proof = &evidence.equivalence_proof;
+    proof.observation_source_hash.is_some() && proof.execution_environment_digest.is_some()
+}
+
+/// Derive the final contract verdict from the recomputed observables.
+///
+/// - any observable failing → `Fail`;
+/// - all observables passing but the structured proof does NOT establish a real
+///   runtime observation (offline) → `NotRun` (Pending), never `Pass`;
+/// - all observables passing AND a real observation is bound → `Pass`.
+fn derive_final_verdict(
+    all_pass: bool,
+    evidence: &BehaviorOracleContractEvidence,
+) -> BehaviorContractVerdict {
+    if !all_pass {
+        return BehaviorContractVerdict::Fail;
+    }
+    if proof_establishes_real_observation(evidence) {
+        BehaviorContractVerdict::Pass
+    } else {
+        BehaviorContractVerdict::NotRun
+    }
 }
 
 /// Full fail-closed verification. Recomputes every observable verdict from the
@@ -502,13 +855,11 @@ pub fn verify_contract(
     validate_contract_shape(evidence)?;
     reject_equivalence_manufacture(evidence)?;
 
-    // Canonical stimulus plan must be registered (both sides ran the same plan,
-    // identified by content hash).
-    if registry.plan(&evidence.stimulus_plan.sha256).is_none() {
-        return Err(BehaviorOracleContractError::UnregisteredStimulusPlan(
-            evidence.stimulus_plan.sha256.clone(),
-        ));
-    }
+    // Canonical stimulus plan must be registered AND the evidence's stimuli
+    // must match the registered canonical plan content exactly. A registered
+    // hash alone is not enough: preserving a valid hash while tampering
+    // `evidence.stimuli` must fail.
+    registry.validate_evidence_plan_content(evidence)?;
 
     // Recompute every observable verdict; derive final verdict.
     let mut per_observable = Vec::with_capacity(evidence.observables.len());
@@ -523,11 +874,7 @@ pub fn verify_contract(
             verdict,
         });
     }
-    let final_verdict = if all_pass {
-        BehaviorContractVerdict::Pass
-    } else {
-        BehaviorContractVerdict::Fail
-    };
+    let final_verdict = derive_final_verdict(all_pass, evidence);
     Ok(ContractVerdict {
         final_verdict,
         per_observable,
@@ -537,10 +884,13 @@ pub fn verify_contract(
 
 /// Validate that two observations (protected vs candidate) used the **same**
 /// canonical stimulus plan. The protected input and candidate must both carry
-/// the identical `stimulus_plan.sha256`.
+/// the identical `stimulus_plan.sha256`, AND both evidences' `stimuli` must
+/// match the canonical plan registered under that hash (a hash alone is not
+/// sufficient — see [`StimulusPlanRegistry::validate_evidence_plan_content`]).
 pub fn require_identical_stimulus_plan(
     protected: &BehaviorOracleContractEvidence,
     candidate: &BehaviorOracleContractEvidence,
+    registry: &StimulusPlanRegistry,
 ) -> Result<(), BehaviorOracleContractError> {
     if protected.stimulus_plan.sha256 != candidate.stimulus_plan.sha256 {
         return Err(BehaviorOracleContractError::UnregisteredStimulusPlan(
@@ -550,6 +900,11 @@ pub fn require_identical_stimulus_plan(
             ),
         ));
     }
+    // Both sides must already have passed canonical plan-content validation;
+    // enforce it here so a caller that skips `verify_contract*` cannot feed a
+    // tampered plan to this comparison.
+    registry.validate_evidence_plan_content(protected)?;
+    registry.validate_evidence_plan_content(candidate)?;
     Ok(())
 }
 
@@ -605,12 +960,10 @@ pub fn verify_contract_bound(
         ));
     }
 
-    // Canonical stimulus plan must be registered.
-    if registry.plan(&evidence.stimulus_plan.sha256).is_none() {
-        return Err(BehaviorOracleContractError::UnregisteredStimulusPlan(
-            evidence.stimulus_plan.sha256.clone(),
-        ));
-    }
+    // Canonical stimulus plan must be registered AND the evidence's stimuli
+    // must match the registered canonical plan content exactly (hash alone is
+    // not sufficient; see `validate_evidence_plan_content`).
+    registry.validate_evidence_plan_content(evidence)?;
 
     // Recompute observable verdicts; derive final verdict.
     let mut per_observable = Vec::with_capacity(evidence.observables.len());
@@ -625,11 +978,7 @@ pub fn verify_contract_bound(
             verdict,
         });
     }
-    let final_verdict = if all_pass {
-        BehaviorContractVerdict::Pass
-    } else {
-        BehaviorContractVerdict::Fail
-    };
+    let final_verdict = derive_final_verdict(all_pass, evidence);
     Ok(ContractVerdict {
         final_verdict,
         per_observable,
@@ -671,7 +1020,7 @@ pub fn offline_test_plan_origin() -> (String, Vec<BehaviorStimulus>) {
             value: "exit".to_string(),
         },
     ];
-    let sha = crate::sha256_hex(serde_json::to_string(&stimuli).unwrap().as_bytes());
+    let sha = canonical_stimuli_hash(&stimuli);
     (sha, stimuli)
 }
 
@@ -686,7 +1035,7 @@ pub fn offline_test_plan_lunlun() -> (String, Vec<BehaviorStimulus>) {
             value: "exit".to_string(),
         },
     ];
-    let sha = crate::sha256_hex(serde_json::to_string(&stimuli).unwrap().as_bytes());
+    let sha = canonical_stimuli_hash(&stimuli);
     (sha, stimuli)
 }
 
@@ -739,8 +1088,39 @@ mod tests {
         }
     }
 
+    /// The canonical (startup/quit) stimulus set shared by the default
+    /// `valid_evidence` and the default registered plan.
+    fn canonical_stimuli() -> Vec<BehaviorStimulus> {
+        vec![
+            BehaviorStimulus {
+                id: "startup".into(),
+                value: "launch".into(),
+            },
+            BehaviorStimulus {
+                id: "quit".into(),
+                value: "exit".into(),
+            },
+        ]
+    }
+
+    /// Content-bound registration: registers `stimuli` under their real
+    /// canonical hash, or under `overridden_sha` when supplied (to build a
+    /// tampered-hash collision test).
+    fn register_stimuli(
+        reg: &mut StimulusPlanRegistry,
+        stimuli: Vec<BehaviorStimulus>,
+        overridden_sha: Option<&str>,
+    ) {
+        let sha = overridden_sha
+            .map(str::to_string)
+            .unwrap_or_else(|| canonical_stimuli_hash(&stimuli));
+        reg.register(sha, stimuli).unwrap();
+    }
+
     fn registry_with(plan_sha: &str) -> StimulusPlanRegistry {
         let mut r = StimulusPlanRegistry::new();
+        // Register the canonical stimuli under the given plan hash only when it
+        // equals the content hash (otherwise this is a mismatch-reject test).
         r.register(
             plan_sha.to_string(),
             vec![
@@ -753,8 +1133,15 @@ mod tests {
                     value: "exit".into(),
                 },
             ],
-        );
+        )
+        .unwrap();
         r
+    }
+
+    /// The plan sha the default `valid_evidence` must carry to match the
+    /// canonical startup/quit stimuli registered by `registry_with`.
+    fn default_plan_sha() -> String {
+        canonical_stimuli_hash(&canonical_stimuli())
     }
 
     fn valid_evidence(case_id: &str, plan_sha: &str) -> BehaviorOracleContractEvidence {
@@ -769,16 +1156,7 @@ mod tests {
             verifier_identity: verifier_id(),
             stimulus_plan: plan_ref(plan_sha),
             execution: execution(),
-            stimuli: vec![
-                BehaviorStimulus {
-                    id: "startup".into(),
-                    value: "launch".into(),
-                },
-                BehaviorStimulus {
-                    id: "quit".into(),
-                    value: "exit".into(),
-                },
-            ],
+            stimuli: canonical_stimuli(),
             observables: vec![
                 BehaviorObservable {
                     id: "exit_code".into(),
@@ -801,7 +1179,27 @@ mod tests {
                     expected: "MIDA_BEH_MARKER".into(),
                 },
             ],
+            equivalence_proof: clean_proof(),
             reason: "contract-shaped candidate observables all pass".to_string(),
+        }
+    }
+
+    /// A clean, complete, allowlist-clean structured equivalence proof that
+    /// establishes a real runtime observation (so the contract may `Pass`).
+    fn clean_proof() -> EquivalenceProof {
+        EquivalenceProof {
+            probe_binary_identity: cli_id(),
+            runner_binary_identity: verifier_id(),
+            loaded_modules: Vec::new(),
+            transform_ledger: Vec::new(),
+            runtime_patch_ledger: Vec::new(),
+            injected_module_list: Vec::new(),
+            skipped_product_code: false,
+            forced_visibility: false,
+            server_patch_state: None,
+            icon_patch_state: None,
+            observation_source_hash: Some(sha("observation-source")),
+            execution_environment_digest: Some(sha("exec-env")),
         }
     }
 
@@ -820,7 +1218,7 @@ mod tests {
 
     #[test]
     fn verifies_valid_contract_to_pass() {
-        let plan = sha("plan");
+        let plan = default_plan_sha();
         let ev = valid_evidence("origin_macro", &plan);
         let reg = registry_with(&plan);
         let out = verify_contract_bound(&ev, &expected("origin_macro", &plan), &reg).unwrap();
@@ -831,7 +1229,7 @@ mod tests {
 
     #[test]
     fn recomputes_verdict_ignoring_declared_verdict() {
-        let plan = sha("plan");
+        let plan = default_plan_sha();
         let mut ev = valid_evidence("origin_macro", &plan);
         ev.observables[0] = BehaviorObservable {
             id: "exit_code".into(),
@@ -851,17 +1249,18 @@ mod tests {
 
     #[test]
     fn protected_and_candidate_can_share_plan_via_require_identical() {
-        let plan = sha("plan");
+        let plan = default_plan_sha();
         let p = valid_evidence("origin_macro", &plan);
         let c = valid_evidence("origin_macro", &plan);
-        require_identical_stimulus_plan(&p, &c).unwrap();
+        let reg = registry_with(&plan);
+        require_identical_stimulus_plan(&p, &c, &reg).unwrap();
     }
 
     // --- structural / schema attacks ---
 
     #[test]
     fn rejects_unknown_schema_version() {
-        let plan = sha("plan");
+        let plan = default_plan_sha();
         let mut ev = valid_evidence("origin_macro", &plan);
         ev.schema_version = "mida.unknown/v9".into();
         let err = parse_contract_evidence(&serde_json::to_vec(&ev).unwrap()).unwrap_err();
@@ -876,7 +1275,7 @@ mod tests {
 
     #[test]
     fn rejects_non_gate_case() {
-        let plan = sha("plan");
+        let plan = default_plan_sha();
         let mut ev = valid_evidence("shiguang", &plan);
         ev.schema_version = BEHAVIOR_ORACLE_CONTRACT_SCHEMA_VERSION.into();
         let err = parse_contract_evidence(&serde_json::to_vec(&ev).unwrap()).unwrap_err();
@@ -888,7 +1287,7 @@ mod tests {
 
     #[test]
     fn rejects_empty_stimuli() {
-        let plan = sha("plan");
+        let plan = default_plan_sha();
         let mut ev = valid_evidence("origin_macro", &plan);
         ev.stimuli.clear();
         let err =
@@ -899,7 +1298,7 @@ mod tests {
 
     #[test]
     fn rejects_empty_observables() {
-        let plan = sha("plan");
+        let plan = default_plan_sha();
         let mut ev = valid_evidence("origin_macro", &plan);
         ev.observables.clear();
         let err =
@@ -910,7 +1309,7 @@ mod tests {
 
     #[test]
     fn rejects_duplicate_stimulus_id() {
-        let plan = sha("plan");
+        let plan = default_plan_sha();
         let mut ev = valid_evidence("origin_macro", &plan);
         ev.stimuli.push(BehaviorStimulus {
             id: "startup".into(),
@@ -924,7 +1323,7 @@ mod tests {
 
     #[test]
     fn rejects_empty_stimulus_value() {
-        let plan = sha("plan");
+        let plan = default_plan_sha();
         let mut ev = valid_evidence("origin_macro", &plan);
         ev.stimuli[0].value = "".into();
         let err =
@@ -938,7 +1337,7 @@ mod tests {
 
     #[test]
     fn rejects_duplicate_observable_id() {
-        let plan = sha("plan");
+        let plan = default_plan_sha();
         let mut ev = valid_evidence("origin_macro", &plan);
         ev.observables.push(ev.observables[0].clone());
         let err =
@@ -952,7 +1351,7 @@ mod tests {
 
     #[test]
     fn rejects_empty_observable_expected() {
-        let plan = sha("plan");
+        let plan = default_plan_sha();
         let mut ev = valid_evidence("origin_macro", &plan);
         ev.observables[1].expected = "".into();
         let err =
@@ -968,7 +1367,7 @@ mod tests {
 
     #[test]
     fn rejects_protected_candidate_identity_swap() {
-        let plan = sha("plan");
+        let plan = default_plan_sha();
         let ev = valid_evidence("origin_macro", &plan);
         let mut exp = expected("origin_macro", &plan);
         std::mem::swap(&mut exp.candidate, &mut exp.protected_input);
@@ -981,7 +1380,7 @@ mod tests {
 
     #[test]
     fn rejects_candidate_identity_drift() {
-        let plan = sha("plan");
+        let plan = default_plan_sha();
         let mut ev = valid_evidence("origin_macro", &plan);
         ev.candidate = valid_identity("different-candidate");
         let err =
@@ -995,7 +1394,7 @@ mod tests {
 
     #[test]
     fn rejects_runner_config_digest_drift() {
-        let plan = sha("plan");
+        let plan = default_plan_sha();
         let mut ev = valid_evidence("origin_macro", &plan);
         ev.runner_config_digest = "bb".repeat(32);
         let err =
@@ -1009,7 +1408,7 @@ mod tests {
 
     #[test]
     fn rejects_tool_revision_drift() {
-        let plan = sha("plan");
+        let plan = default_plan_sha();
         let mut ev = valid_evidence("origin_macro", &plan);
         ev.tool_revision = "other/revision@2".into();
         let err =
@@ -1023,7 +1422,7 @@ mod tests {
 
     #[test]
     fn rejects_stimulus_plan_drift_unregistered() {
-        let plan = sha("plan");
+        let plan = default_plan_sha();
         let mut ev = valid_evidence("origin_macro", &plan);
         ev.stimulus_plan = plan_ref(&sha("different-plan"));
         let err =
@@ -1037,16 +1436,35 @@ mod tests {
 
     #[test]
     fn rejects_candidate_and_protected_using_different_plan() {
-        let plan_a = sha("plan-a");
-        let plan_b = sha("plan-b");
-        let p = valid_evidence("origin_macro", &plan_a);
-        let c = valid_evidence("origin_macro", &plan_b);
-        assert!(require_identical_stimulus_plan(&p, &c).is_err());
+        // Two genuinely different canonical plans (different content → different
+        // hash). Both are registered so the failure is the plan divergence, not
+        // an unregistered-plan error.
+        let plan_a_stim = canonical_stimuli();
+        let plan_b_stim = vec![
+            BehaviorStimulus {
+                id: "startup".into(),
+                value: "launch".into(),
+            },
+            BehaviorStimulus {
+                id: "quit".into(),
+                value: "exit-now".into(),
+            },
+        ];
+        let plan_a = canonical_stimuli_hash(&plan_a_stim);
+        let plan_b = canonical_stimuli_hash(&plan_b_stim);
+        let mut p = valid_evidence("origin_macro", &plan_a);
+        p.stimuli = plan_a_stim;
+        let mut c = valid_evidence("origin_macro", &plan_b);
+        c.stimuli = plan_b_stim;
+        let mut reg = StimulusPlanRegistry::new();
+        register_stimuli(&mut reg, p.stimuli.clone(), None);
+        register_stimuli(&mut reg, c.stimuli.clone(), None);
+        assert!(require_identical_stimulus_plan(&p, &c, &reg).is_err());
     }
 
     #[test]
     fn rejects_case_id_drift() {
-        let plan = sha("plan");
+        let plan = default_plan_sha();
         let mut ev = valid_evidence("origin_macro", &plan);
         ev.case_id = "lunlun_software".into();
         let err =
@@ -1062,7 +1480,7 @@ mod tests {
 
     #[test]
     fn missing_observable_fails_closed() {
-        let plan = sha("plan");
+        let plan = default_plan_sha();
         let mut ev = valid_evidence("origin_macro", &plan);
         ev.observables[1].observed.status = BehaviorObservedStatus::Missing;
         let out =
@@ -1074,7 +1492,7 @@ mod tests {
 
     #[test]
     fn timeout_observable_fails_closed() {
-        let plan = sha("plan");
+        let plan = default_plan_sha();
         let mut ev = valid_evidence("origin_macro", &plan);
         ev.observables[0].observed.status = BehaviorObservedStatus::Timeout;
         let out =
@@ -1085,7 +1503,7 @@ mod tests {
 
     #[test]
     fn malformed_observable_fails_closed() {
-        let plan = sha("plan");
+        let plan = default_plan_sha();
         let mut ev = valid_evidence("origin_macro", &plan);
         ev.observables[0].observed.status = BehaviorObservedStatus::Malformed;
         let out =
@@ -1096,7 +1514,7 @@ mod tests {
 
     #[test]
     fn partial_observable_fails_closed() {
-        let plan = sha("plan");
+        let plan = default_plan_sha();
         let mut ev = valid_evidence("origin_macro", &plan);
         ev.observables[0].observed.status = BehaviorObservedStatus::Partial;
         let out =
@@ -1107,7 +1525,7 @@ mod tests {
 
     #[test]
     fn mismatch_observable_fails_closed() {
-        let plan = sha("plan");
+        let plan = default_plan_sha();
         let mut ev = valid_evidence("origin_macro", &plan);
         ev.observables[0].observed.value = "7".into();
         let out =
@@ -1119,7 +1537,7 @@ mod tests {
 
     #[test]
     fn caller_cannot_pass_a_verdict() {
-        let plan = sha("plan");
+        let plan = default_plan_sha();
         let ev = valid_evidence("origin_macro", &plan);
         let value: serde_json::Value =
             serde_json::from_slice(&serde_json::to_vec(&ev).unwrap()).unwrap();
@@ -1129,7 +1547,7 @@ mod tests {
 
     #[test]
     fn single_failure_cannot_forge_overall_pass() {
-        let plan = sha("plan");
+        let plan = default_plan_sha();
         let mut ev = valid_evidence("origin_macro", &plan);
         ev.observables[1].observed.value = "NO_MARKER".into();
         ev.reason = "overall pass".into();
@@ -1141,7 +1559,7 @@ mod tests {
 
     #[test]
     fn stale_evidence_binding_emitted_at_required() {
-        let plan = sha("plan");
+        let plan = default_plan_sha();
         let mut ev = valid_evidence("origin_macro", &plan);
         ev.execution.completion.done = false;
         let err =
@@ -1152,7 +1570,7 @@ mod tests {
 
     #[test]
     fn rejects_empty_reason() {
-        let plan = sha("plan");
+        let plan = default_plan_sha();
         let mut ev = valid_evidence("origin_macro", &plan);
         ev.reason = "".into();
         let err =
@@ -1165,9 +1583,79 @@ mod tests {
 
     #[test]
     fn rejects_equivalence_manufacture_marker() {
-        let plan = sha("plan");
+        let plan = default_plan_sha();
         let mut ev = valid_evidence("origin_macro", &plan);
-        ev.reason = "achieved via server_patch bypass".into();
+        // P1: manufacture is a STRUCTURED field, not reason text. Setting the
+        // structured server-patch state must reject.
+        ev.equivalence_proof.server_patch_state = Some("patched".into());
+        let err =
+            verify_contract_bound(&ev, &expected("origin_macro", &plan), &registry_with(&plan))
+                .unwrap_err();
+        assert!(matches!(
+            err,
+            BehaviorOracleContractError::EquivalenceManufacture(_)
+        ));
+    }
+
+    /// P1: the free-text `reason` is human-only — it must NOT trigger a verdict
+    /// on its own, in either direction. A manufacture-sounding reason with a
+    /// CLEAN structured proof does not fail (the structured proof is the gate).
+    #[test]
+    fn reason_text_is_not_a_security_control() {
+        let plan = default_plan_sha();
+        let mut ev = valid_evidence("origin_macro", &plan);
+        ev.reason = "we used server_patch, SERVER_PATCH, forced_visibility and \
+                     semantic_bypass to make it work"
+            .into();
+        // Clean structured proof → still verifies (passes or NotRun, never a
+        // manufacture rejection from reason text alone).
+        let out =
+            verify_contract_bound(&ev, &expected("origin_macro", &plan), &registry_with(&plan))
+                .unwrap();
+        assert_ne!(out.final_verdict, BehaviorContractVerdict::Fail);
+    }
+
+    /// P1: reason text with case/spacing/synonym variants must NOT be treated
+    /// as a manufacture marker (the old substring blacklist is gone).
+    #[test]
+    fn reason_text_variants_do_not_mark_manufacture() {
+        for reason in [
+            "server patch",
+            "SERVER_PATCH",
+            "server_patch ",
+            "semantic bypass",
+            "case specific success override",
+            "",
+        ] {
+            let plan = default_plan_sha();
+            let mut ev = valid_evidence("origin_macro", &plan);
+            ev.reason = reason.to_string();
+            // Empty reason is still rejected by shape (human text must exist);
+            // other variants with a clean structured proof are not manufacture.
+            let err =
+                verify_contract_bound(&ev, &expected("origin_macro", &plan), &registry_with(&plan))
+                    .err();
+            if reason.is_empty() {
+                assert!(matches!(
+                    err,
+                    Some(BehaviorOracleContractError::EmptyReason)
+                ));
+            } else {
+                assert!(!matches!(
+                    err,
+                    Some(BehaviorOracleContractError::EquivalenceManufacture(_))
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn structured_server_patch_without_reason_marker_still_rejected() {
+        let plan = default_plan_sha();
+        let mut ev = valid_evidence("origin_macro", &plan);
+        // Structured patch state set, but reason says nothing about it.
+        ev.reason = "clean run".into();
+        ev.equivalence_proof.server_patch_state = Some("on".into());
         let err =
             verify_contract_bound(&ev, &expected("origin_macro", &plan), &registry_with(&plan))
                 .unwrap_err();
@@ -1178,8 +1666,121 @@ mod tests {
     }
 
     #[test]
+    fn unknown_transform_in_ledger_rejected() {
+        let plan = default_plan_sha();
+        let mut ev = valid_evidence("origin_macro", &plan);
+        ev.equivalence_proof
+            .transform_ledger
+            .push(TransformProofEntry {
+                id: "gto_bypass".into(),
+                kind: "sample_bypass".into(),
+                equivalence_rule: Some("whatever".into()),
+            });
+        let err =
+            verify_contract_bound(&ev, &expected("origin_macro", &plan), &registry_with(&plan))
+                .unwrap_err();
+        assert!(matches!(
+            err,
+            BehaviorOracleContractError::UnallowedTransform { .. }
+        ));
+    }
+
+    #[test]
+    fn allowlisted_transform_with_mismatched_rule_rejected() {
+        let plan = default_plan_sha();
+        let mut ev = valid_evidence("origin_macro", &plan);
+        // iat_rebuild is allowlisted ONLY with rule pe_iat_rebuild_v0.
+        ev.equivalence_proof
+            .transform_ledger
+            .push(TransformProofEntry {
+                id: "iat_rebuild".into(),
+                kind: "pe_repair".into(),
+                equivalence_rule: Some("pe_iat_rebuild_v0".into()),
+            });
+        // Matching rule → clean proof, still passes (real observation bound).
+        let out =
+            verify_contract_bound(&ev, &expected("origin_macro", &plan), &registry_with(&plan))
+                .unwrap();
+        assert_eq!(out.final_verdict, BehaviorContractVerdict::Pass);
+
+        // Mismatched rule → reject.
+        ev.equivalence_proof.transform_ledger[0].equivalence_rule = Some("wrong_rule".into());
+        let err =
+            verify_contract_bound(&ev, &expected("origin_macro", &plan), &registry_with(&plan))
+                .unwrap_err();
+        assert!(matches!(
+            err,
+            BehaviorOracleContractError::UnallowedTransform { .. }
+        ));
+    }
+
+    #[test]
+    fn unbound_runtime_patch_rejected() {
+        let plan = default_plan_sha();
+        let mut ev = valid_evidence("origin_macro", &plan);
+        ev.equivalence_proof
+            .runtime_patch_ledger
+            .push(PatchProofEntry {
+                id: "raw_patch".into(),
+                description: "patched the IAT bytes directly".into(),
+            });
+        let err =
+            verify_contract_bound(&ev, &expected("origin_macro", &plan), &registry_with(&plan))
+                .unwrap_err();
+        assert!(matches!(
+            err,
+            BehaviorOracleContractError::UnallowedPatch { .. }
+        ));
+    }
+
+    #[test]
+    fn missing_observation_source_returns_not_run_not_pass() {
+        let plan = default_plan_sha();
+        let mut ev = valid_evidence("origin_macro", &plan);
+        ev.equivalence_proof.observation_source_hash = None;
+        let out =
+            verify_contract_bound(&ev, &expected("origin_macro", &plan), &registry_with(&plan))
+                .unwrap();
+        // Offline / no real observation → Pending, never a fabricated Pass.
+        assert_eq!(out.final_verdict, BehaviorContractVerdict::NotRun);
+    }
+
+    #[test]
+    fn missing_probe_identity_rejected() {
+        let plan = default_plan_sha();
+        let mut ev = valid_evidence("origin_macro", &plan);
+        ev.equivalence_proof.probe_binary_identity = BehaviorChainIdentity {
+            sha256: String::new(),
+            version: String::new(),
+        };
+        let err =
+            verify_contract_bound(&ev, &expected("origin_macro", &plan), &registry_with(&plan))
+                .unwrap_err();
+        assert!(matches!(
+            err,
+            BehaviorOracleContractError::BadEquivalenceProof
+        ));
+    }
+
+    #[test]
+    fn missing_transform_ledger_rejected_on_parse() {
+        // A structured proof missing the `transform_ledger` field must be
+        // rejected by the strict schema (it is a required security field).
+        let plan = default_plan_sha();
+        let ev = valid_evidence("origin_macro", &plan);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&serde_json::to_vec(&ev).unwrap()).unwrap();
+        value["equivalence_proof"]
+            .as_object_mut()
+            .unwrap()
+            .remove("transform_ledger");
+        let bytes = serde_json::to_vec(&value).unwrap();
+        assert!(parse_contract_evidence(&bytes).is_err());
+    }
+
+    #[test]
     fn no_sample_hash_pass_override_path() {
-        let plan = sha("plan");
+        let plan = default_plan_sha();
         let ev = valid_evidence("origin_macro", &plan);
         let value: serde_json::Value =
             serde_json::from_slice(&serde_json::to_vec(&ev).unwrap()).unwrap();
@@ -1188,11 +1789,145 @@ mod tests {
         assert!(value.get("success_override").is_none());
     }
 
+    // --- stimulus plan CONTENT binding (P1: keep-hash / tamper-stimuli) ---
+
+    /// Retains the valid registered hash but replaces `evidence.stimuli` with a
+    /// do-nothing plan (the exact acceptance criterion). Must reject. The
+    /// replacement is shape-valid (non-empty ids/values) so the failure is the
+    /// content mismatch, not an earlier shape rejection.
+    #[test]
+    fn keep_valid_hash_tamper_stimuli_do_nothing_rejected() {
+        let plan = default_plan_sha();
+        let mut ev = valid_evidence("origin_macro", &plan);
+        ev.stimuli = vec![BehaviorStimulus {
+            id: "noop".into(),
+            value: "noop".into(),
+        }];
+        let err =
+            verify_contract_bound(&ev, &expected("origin_macro", &plan), &registry_with(&plan))
+                .unwrap_err();
+        assert!(matches!(
+            err,
+            BehaviorOracleContractError::StimulusPlanContentMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn same_hash_different_value_rejected() {
+        let plan = default_plan_sha();
+        let mut ev = valid_evidence("origin_macro", &plan);
+        ev.stimuli[0].value = "altered-launch".into();
+        let err =
+            verify_contract_bound(&ev, &expected("origin_macro", &plan), &registry_with(&plan))
+                .unwrap_err();
+        assert!(matches!(
+            err,
+            BehaviorOracleContractError::StimulusPlanContentMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn same_hash_one_fewer_stimulus_rejected() {
+        let plan = default_plan_sha();
+        let mut ev = valid_evidence("origin_macro", &plan);
+        ev.stimuli.pop(); // remove one stimulus
+        let err =
+            verify_contract_bound(&ev, &expected("origin_macro", &plan), &registry_with(&plan))
+                .unwrap_err();
+        assert!(matches!(
+            err,
+            BehaviorOracleContractError::StimulusPlanContentMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn same_hash_reordered_stimuli_rejected() {
+        let plan = default_plan_sha();
+        let mut ev = valid_evidence("origin_macro", &plan);
+        ev.stimuli.reverse(); // reorder
+        let err =
+            verify_contract_bound(&ev, &expected("origin_macro", &plan), &registry_with(&plan))
+                .unwrap_err();
+        assert!(matches!(
+            err,
+            BehaviorOracleContractError::StimulusPlanContentMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn same_hash_modified_stimulus_id_rejected() {
+        let plan = default_plan_sha();
+        let mut ev = valid_evidence("origin_macro", &plan);
+        ev.stimuli[1].id = "rename".into();
+        let err =
+            verify_contract_bound(&ev, &expected("origin_macro", &plan), &registry_with(&plan))
+                .unwrap_err();
+        assert!(matches!(
+            err,
+            BehaviorOracleContractError::StimulusPlanContentMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn register_rejects_hash_content_mismatch() {
+        let mut reg = StimulusPlanRegistry::new();
+        let wrong_hash = sha("not-the-content-hash");
+        let err = reg
+            .register(wrong_hash.clone(), canonical_stimuli())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BehaviorOracleContractError::StimulusPlanHashMismatch { .. }
+        ));
+        // Nothing was recorded under the bogus hash.
+        assert!(reg.plan(&wrong_hash).is_none());
+    }
+
+    #[test]
+    fn register_rejects_duplicate_hash_different_content() {
+        let mut reg = StimulusPlanRegistry::new();
+        register_stimuli(&mut reg, canonical_stimuli(), None);
+        // The same declared hash but a different stimulus set must be refused:
+        // content-bound registration means the declared hash binds the exact
+        // content, so a different set under the canonical hash is rejected
+        // (a real SHA-256 collision between two distinct sets is cryptographically
+        // infeasible; the hash binding is the effective guard).
+        let different = vec![BehaviorStimulus {
+            id: "startup".into(),
+            value: "other".into(),
+        }];
+        let err = reg
+            .register(canonical_stimuli_hash(&canonical_stimuli()), different)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BehaviorOracleContractError::StimulusPlanHashMismatch { .. }
+        ));
+        // The canonical plan is untouched.
+        assert!(reg.plan(&default_plan_sha()).is_some());
+    }
+
+    #[test]
+    fn verify_contract_also_enforces_plan_content() {
+        // `verify_contract` (non-bound) must enforce the same content binding.
+        let plan = default_plan_sha();
+        let mut ev = valid_evidence("origin_macro", &plan);
+        ev.stimuli = vec![BehaviorStimulus {
+            id: "x".into(),
+            value: "y".into(),
+        }];
+        let err = verify_contract(&ev, &registry_with(&plan)).unwrap_err();
+        assert!(matches!(
+            err,
+            BehaviorOracleContractError::StimulusPlanContentMismatch { .. }
+        ));
+    }
+
     // --- honest recomputation identity attack ---
 
     #[test]
     fn honest_recompute_candidate_hash_identity_attack() {
-        let plan = sha("plan");
+        let plan = default_plan_sha();
         let mut ev = valid_evidence("origin_macro", &plan);
         ev.candidate = valid_identity("attacker-candidate");
         let bytes = serde_json::to_vec(&ev).unwrap();

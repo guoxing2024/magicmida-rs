@@ -952,6 +952,14 @@ fn cmd_check_with_behavior(args: &[String]) -> Result<i32, String> {
                  this is lab diagnostic only, not product authenticity"
                 .to_string(),
         });
+        // P1: an HMAC trust root is lab-only. Force the trust tier to Lab so the
+        // report and exit code never look like a product acceptance even though
+        // `check_with_behavior_signed` labels the envelope path Product.
+        report.trust_tier = mida_acceptance::TrustTier::Lab;
+        report.product_acceptable = false;
+    } else {
+        // Recompute from whatever tier the library assigned.
+        report.refresh_product_acceptable();
     }
 
     let json = report
@@ -975,7 +983,18 @@ fn cmd_check_with_behavior(args: &[String]) -> Result<i32, String> {
         )?;
     }
 
-    Ok(report.verdict.exit_code())
+    // P1 Lab/Product exit-code isolation. Exit 0 is reserved for PRODUCT
+    // acceptance. A lab/unsigned `Accepted` (trust_tier != Product) returns a
+    // distinct exit code (3) so a script reading only the exit code can never
+    // mistake a lab diagnostic for a product acceptance. Rejected stays 2,
+    // pending stays 0 (pending is not an accept).
+    let exit = match report.verdict {
+        Verdict::Accepted if report.trust_tier == mida_acceptance::TrustTier::Product => 0,
+        Verdict::Accepted => 3, // lab / unsigned Accept → not product
+        Verdict::Rejected => 2,
+        Verdict::StructuralPassBehaviorPending => 0,
+    };
+    Ok(exit)
 }
 
 fn hex_decode_key(s: &str) -> Result<Vec<u8>, String> {

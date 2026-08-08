@@ -5,7 +5,9 @@ use crate::envelope::VerifiedSignedBundle;
 use crate::gates;
 use crate::identity::{ArtifactIdentity, IdentityError, ROLE_CANDIDATE};
 use crate::oracle::{observe_oracle, OracleObservation};
-use crate::report::{AcceptanceReport, FailureRecord, GateResult, GateStatus, WarningRecord};
+use crate::report::{
+    AcceptanceReport, FailureRecord, GateResult, GateStatus, TrustTier, WarningRecord,
+};
 use crate::verdict::Verdict;
 use thiserror::Error;
 
@@ -68,6 +70,13 @@ pub fn check_static(bytes: &[u8], opts: &CheckStaticOptions) -> AcceptanceReport
             message: "R0B contract forbids Accepted verdict".to_string(),
         });
     }
+    // Static path never has a signature envelope → not product-acceptable.
+    report.trust_tier = if report.verdict == Verdict::Rejected {
+        TrustTier::Rejected
+    } else {
+        TrustTier::Unsigned
+    };
+    report.refresh_product_acceptable();
     report
 }
 
@@ -96,6 +105,13 @@ pub fn check_with_behavior(
                 .to_string(),
         });
     }
+    // Unmanaged (no signed envelope) is never product-acceptable.
+    report.trust_tier = if report.verdict == Verdict::Rejected {
+        TrustTier::Rejected
+    } else {
+        TrustTier::Unsigned
+    };
+    report.refresh_product_acceptable();
     report
 }
 
@@ -122,6 +138,13 @@ pub fn check_with_behavior_managed(
                 .to_string(),
         });
     }
+    // Unsigned managed has no verified envelope → not product-acceptable.
+    report.trust_tier = if report.verdict == Verdict::Rejected {
+        TrustTier::Rejected
+    } else {
+        TrustTier::Unsigned
+    };
+    report.refresh_product_acceptable();
     report
 }
 
@@ -142,6 +165,13 @@ pub fn check_with_behavior_managed_lab(
                 .to_string(),
         });
     }
+    // P1: lab-only Accept. Never product-acceptable even when verdict == Accepted.
+    report.trust_tier = if report.verdict == Verdict::Rejected {
+        TrustTier::Rejected
+    } else {
+        TrustTier::Lab
+    };
+    report.refresh_product_acceptable();
     report
 }
 
@@ -194,7 +224,17 @@ pub fn check_with_behavior_signed(
     opts: &CheckStaticOptions,
     signed: &VerifiedSignedBundle,
 ) -> AcceptanceReport {
-    compose_managed_uncapped(bytes, opts, signed.evidence(), signed.managed())
+    let mut report = compose_managed_uncapped(bytes, opts, signed.evidence(), signed.managed());
+    // P1: a verified signature envelope (non-caller-controlled trust root) is
+    // the product trust tier. product_acceptable is true only when the verdict
+    // is Accepted.
+    report.trust_tier = if report.verdict == Verdict::Rejected {
+        TrustTier::Rejected
+    } else {
+        TrustTier::Product
+    };
+    report.refresh_product_acceptable();
+    report
 }
 
 fn report_identity_failure(
@@ -265,6 +305,8 @@ fn report_identity_failure(
         report.oracle_observations.push(obs);
     }
     report.finalize_r0b();
+    report.trust_tier = TrustTier::Rejected;
+    report.refresh_product_acceptable();
     report
 }
 

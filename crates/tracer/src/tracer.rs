@@ -19,6 +19,21 @@ use crate::LogMsgType;
 /// hard-codes 500 000 — we use the same default here.
 const DEFAULT_TRACE_LIMIT: u64 = 500_000;
 
+/// Resolve the effective instruction limit for a trace.
+///
+/// `limit == 0` is the explicit "no limit given" sentinel and maps to
+/// [`DEFAULT_TRACE_LIMIT`]. Any nonzero `limit` is used verbatim (there is no
+/// "zero instructions" limit — a caller that wants to stop immediately passes
+/// `limit == 1`). This is kept explicit so `limit == 0` can never be confused
+/// with a caller-specified zero-instruction limit.
+pub(crate) fn resolve_trace_limit(limit: u64) -> u64 {
+    if limit == 0 {
+        DEFAULT_TRACE_LIMIT
+    } else {
+        limit
+    }
+}
+
 // ---------------------------------------------------------------------------
 // TracePredicate type alias
 // ---------------------------------------------------------------------------
@@ -183,6 +198,16 @@ impl<'a> Tracer<'a> {
     /// an error occurs) the traced thread is left suspended at the last
     /// single-step location so the caller can inspect its context.
     ///
+    /// # Instruction limit
+    ///
+    /// `limit` is "the maximum number of instructions executed": the trace
+    /// stops as soon as `limit` single-steps have occurred, and on limit-hit
+    /// `TraceResult::instructions_executed == limit`. `limit == 0` is the
+    /// explicit "no limit given" sentinel and is replaced with
+    /// [`DEFAULT_TRACE_LIMIT`]; it is not the same as a caller-specified limit
+    /// of `0` (there is no "zero instructions" limit — a caller that wants to
+    /// stop immediately should use `limit == 1`).
+    ///
     /// # Errors
     ///
     /// Returns [`TracerError::TraceBreak`] if an unexpected exception fires
@@ -197,11 +222,7 @@ impl<'a> Tracer<'a> {
         // ---- initialise state ------------------------------------------------
 
         self.counter = 0;
-        self.limit = if limit == 0 {
-            DEFAULT_TRACE_LIMIT
-        } else {
-            limit
-        };
+        self.limit = resolve_trace_limit(limit);
         self.limit_reached = false;
         self.start_address = address;
 
@@ -280,8 +301,14 @@ impl<'a> Tracer<'a> {
                         DebugEvent::SingleStep { address, .. } => {
                             self.counter += 1;
 
-                            // Check instruction limit.
-                            if self.counter > self.limit {
+                            // Check instruction limit. `>=` (not `>`) gives the
+                            // documented semantics "at most `limit` instructions
+                            // executed": when `counter` reaches `limit` we have
+                            // executed exactly `limit` single-steps and stop
+                            // there. `limit == 1` therefore processes exactly
+                            // one single-step, and `instructions_executed` equals
+                            // `limit` on limit-hit.
+                            if self.counter >= self.limit {
                                 self.limit_reached = true;
                                 (self.log)(
                                     LogMsgType::Info,
@@ -445,6 +472,7 @@ fn thread_id_of(ev: &DebugEvent) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mida_core::error::CoreError;
 
     #[test]
     fn tracer_creation() {
@@ -481,5 +509,145 @@ mod tests {
             exc_type: 1,
         };
         assert_eq!(thread_id_of(&ev), 99);
+    }
+
+    // -----------------------------------------------------------------------
+    // Instruction-limit semantics (P2: off-by-one fix).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn limit_zero_maps_to_default_not_zero() {
+        // `limit == 0` is the "no limit given" sentinel → DEFAULT_TRACE_LIMIT;
+        // it must never be mistaken for a zero-instruction limit.
+        assert_eq!(resolve_trace_limit(0), DEFAULT_TRACE_LIMIT);
+        assert_eq!(resolve_trace_limit(1), 1);
+        assert_eq!(resolve_trace_limit(2), 2);
+        assert_eq!(resolve_trace_limit(10), 10);
+    }
+
+    /// A minimal `DebuggerCore` mock that serves a fixed queue of SingleStep
+    /// events, then an ExitProcess. Used to exercise the `trace()` loop's
+    /// instruction-limit behavior without a real debugger.
+    struct StepQueueDebugger {
+        steps: std::collections::VecDeque<DebugEvent>,
+    }
+
+    impl DebuggerCore for StepQueueDebugger {
+        fn process_handle(&self) -> windows::Win32::Foundation::HANDLE {
+            windows::Win32::Foundation::HANDLE(std::ptr::null_mut())
+        }
+        fn pid(&self) -> u32 {
+            1
+        }
+        fn image_base(&self) -> u64 {
+            0
+        }
+        fn wait_event(&mut self) -> Result<DebugEvent, CoreError> {
+            self.steps
+                .pop_front()
+                .ok_or_else(|| CoreError::ProcessCreation("no more events".into()))
+        }
+        fn continue_event(&mut self, _: u32, _: ContinueStatus) -> Result<(), CoreError> {
+            Ok(())
+        }
+        fn read_memory(&self, _: usize, _: &mut [u8]) -> Result<usize, CoreError> {
+            Ok(0)
+        }
+        fn write_memory(&mut self, _: usize, _: &[u8]) -> Result<usize, CoreError> {
+            Ok(0)
+        }
+        fn get_thread_context(&self, _: u32) -> Result<CONTEXT, CoreError> {
+            // SAFETY: a zeroed CONTEXT is a valid initial register state for a
+            // synthetic trace; the loop only touches EFlags/Rip via the struct.
+            Ok(unsafe { std::mem::zeroed() })
+        }
+        fn set_thread_context(&self, _: u32, _: &CONTEXT) -> Result<(), CoreError> {
+            Ok(())
+        }
+    }
+
+    fn run_trace_with_steps(limit: u64, steps: usize) -> TraceResult {
+        let mut dbg = StepQueueDebugger {
+            steps: (0..steps)
+                .map(|i| DebugEvent::SingleStep {
+                    thread_id: 1,
+                    address: 0x1000 + i as u64,
+                })
+                .collect(),
+        };
+        let log_fn = |_: LogMsgType, _: &str| {};
+        // A predicate that never stops: the limit is the only stop condition.
+        let predicate = Box::new(|_: &Tracer, _: &mut CONTEXT| false);
+        let mut tracer = Tracer::new(1, predicate, &log_fn);
+        tracer.trace(&mut dbg, 0x1000, limit).expect("trace")
+    }
+
+    /// limit=1: the trace processes EXACTLY one single-step, then stops with
+    /// limit_reached and instructions_executed == 1 (no off-by-one).
+    #[test]
+    fn trace_limit_one_executes_exactly_one_instruction() {
+        let result = run_trace_with_steps(1, 3);
+        assert!(result.limit_reached);
+        assert_eq!(result.instructions_executed, 1);
+    }
+
+    /// limit=2: exactly two instructions, then stops.
+    #[test]
+    fn trace_limit_two_executes_exactly_two_instructions() {
+        let result = run_trace_with_steps(2, 3);
+        assert!(result.limit_reached);
+        assert_eq!(result.instructions_executed, 2);
+    }
+
+    /// limit reached: `instructions_executed` equals `limit` exactly.
+    #[test]
+    fn trace_limit_reached_count_equals_limit() {
+        for limit in [1u64, 2, 3, 5, 8] {
+            let result = run_trace_with_steps(limit, limit as usize + 2);
+            assert!(result.limit_reached, "limit {limit} must be reached");
+            assert_eq!(
+                result.instructions_executed, limit,
+                "instructions_executed must equal limit {limit}"
+            );
+        }
+    }
+
+    /// A predicate that returns `true` on the FIRST step stops before the limit
+    /// is hit (limit not reached). This confirms the predicate path is
+    /// independent of the limit counter.
+    #[test]
+    fn trace_stops_on_predicate_before_limit() {
+        let mut dbg = StepQueueDebugger {
+            steps: vec![DebugEvent::SingleStep {
+                thread_id: 1,
+                address: 0x1000,
+            }]
+            .into(),
+        };
+        let log_fn = |_: LogMsgType, _: &str| {};
+        let predicate = Box::new(|_: &Tracer, _: &mut CONTEXT| true);
+        let mut tracer = Tracer::new(1, predicate, &log_fn);
+        let result = tracer.trace(&mut dbg, 0x1000, 100).expect("trace");
+        assert!(!result.limit_reached);
+        assert_eq!(result.instructions_executed, 1);
+    }
+
+    /// limit=0 uses the default (no practical limit); a predicate stops it, so
+    /// the trace does not spin until 500_000.
+    #[test]
+    fn trace_limit_zero_uses_default_and_predicate_stops() {
+        let mut dbg = StepQueueDebugger {
+            steps: vec![DebugEvent::SingleStep {
+                thread_id: 1,
+                address: 0x1000,
+            }]
+            .into(),
+        };
+        let log_fn = |_: LogMsgType, _: &str| {};
+        let predicate = Box::new(|_: &Tracer, _: &mut CONTEXT| true);
+        let mut tracer = Tracer::new(1, predicate, &log_fn);
+        let result = tracer.trace(&mut dbg, 0x1000, 0).expect("trace");
+        assert!(!result.limit_reached);
+        assert_eq!(result.instructions_executed, 1);
     }
 }
