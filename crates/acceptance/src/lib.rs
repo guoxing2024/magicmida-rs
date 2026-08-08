@@ -46,8 +46,9 @@ pub use behavior_oracle_contract::{
     BehaviorObservable, BehaviorObserved, BehaviorObservedStatus, BehaviorOracleContractError,
     BehaviorOracleContractEvidence, BehaviorStimulus, ComputedObservable, ContractVerdict,
     EquivalenceProof, ExpectedBinding, ObservableVerdict, PatchProofEntry, StimulusPlanRef,
-    StimulusPlanRegistry, TransformProofEntry, BEHAVIOR_ORACLE_CONTRACT_SCHEMA_VERSION,
-    BLOCKER_CASE_BUSINESS_DEFINITION, CONTRACT_REQUIRED_CASES,
+    StimulusPlanRegistry, TransformProofEntry, TrustedObservationRegistry,
+    BEHAVIOR_ORACLE_CONTRACT_SCHEMA_VERSION, BLOCKER_CASE_BUSINESS_DEFINITION,
+    CONTRACT_REQUIRED_CASES,
 };
 pub use check::{
     check_static, check_static_verdict, check_with_behavior, check_with_behavior_managed,

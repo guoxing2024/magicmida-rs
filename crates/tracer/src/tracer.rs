@@ -301,29 +301,13 @@ impl<'a> Tracer<'a> {
                         DebugEvent::SingleStep { address, .. } => {
                             self.counter += 1;
 
-                            // Check instruction limit. `>=` (not `>`) gives the
-                            // documented semantics "at most `limit` instructions
-                            // executed": when `counter` reaches `limit` we have
-                            // executed exactly `limit` single-steps and stop
-                            // there. `limit == 1` therefore processes exactly
-                            // one single-step, and `instructions_executed` equals
-                            // `limit` on limit-hit.
-                            if self.counter >= self.limit {
-                                self.limit_reached = true;
-                                (self.log)(
-                                    LogMsgType::Info,
-                                    "Giving up trace due to instruction limit",
-                                );
-                                return Ok(TraceResult {
-                                    start_address: self.start_address,
-                                    end_address: address,
-                                    instructions_executed: self.counter,
-                                    limit_reached: true,
-                                });
-                            }
-
                             // Fetch context so the predicate can inspect
-                            // (and optionally modify) registers.
+                            // (and optionally modify) registers. The predicate
+                            // is invoked on EVERY executed instruction —
+                            // including the limit-th one — so it always has a
+                            // chance to stop or mutate state before the limit
+                            // check (P2 issue 6: limit-hit does not skip the
+                            // predicate).
                             let mut ctx =
                                 debugger.get_thread_context(self.thread_id).map_err(|e| {
                                     TracerError::Debugger {
@@ -341,6 +325,28 @@ impl<'a> Tracer<'a> {
                                     end_address: address,
                                     instructions_executed: self.counter,
                                     limit_reached: false,
+                                });
+                            }
+
+                            // Check instruction limit. `>=` (not `>`) gives the
+                            // documented semantics "at most `limit` instructions
+                            // executed": when `counter` reaches `limit` we have
+                            // executed exactly `limit` single-steps (the predicate
+                            // already ran on this one) and stop there.
+                            // `limit == 1` therefore processes exactly one
+                            // single-step, and `instructions_executed` equals
+                            // `limit` on limit-hit.
+                            if self.counter >= self.limit {
+                                self.limit_reached = true;
+                                (self.log)(
+                                    LogMsgType::Info,
+                                    "Giving up trace due to instruction limit",
+                                );
+                                return Ok(TraceResult {
+                                    start_address: self.start_address,
+                                    end_address: address,
+                                    instructions_executed: self.counter,
+                                    limit_reached: true,
                                 });
                             }
 
@@ -649,5 +655,45 @@ mod tests {
         let result = tracer.trace(&mut dbg, 0x1000, 0).expect("trace");
         assert!(!result.limit_reached);
         assert_eq!(result.instructions_executed, 1);
+    }
+
+    /// P2 issue 6: the predicate is invoked on EVERY executed instruction,
+    /// including the limit-th one. A predicate that stops on the limit-th step
+    /// must yield a predicate-stop (not a limit-stop), proving limit-hit does
+    /// not swallow the predicate's decision.
+    #[test]
+    fn predicate_runs_on_the_limit_hit_instruction() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let mut dbg = StepQueueDebugger {
+            steps: (0..2)
+                .map(|i| DebugEvent::SingleStep {
+                    thread_id: 1,
+                    address: 0x1000 + i as u64,
+                })
+                .collect(),
+        };
+        let log_fn = |_: LogMsgType, _: &str| {};
+        // Stop on the 2nd instruction (which is exactly the limit=2 hit).
+        let invocations = Rc::new(Cell::new(0u32));
+        let count = Rc::clone(&invocations);
+        let predicate = Box::new(move |_: &Tracer, _: &mut CONTEXT| {
+            count.set(count.get() + 1);
+            count.get() >= 2
+        });
+        let mut tracer = Tracer::new(1, predicate, &log_fn);
+        let result = tracer.trace(&mut dbg, 0x1000, 2).expect("trace");
+        // The predicate fired twice (both instructions), and on the limit-th
+        // instruction it returned true → predicate-stop, NOT limit-reached.
+        assert_eq!(
+            invocations.get(),
+            2,
+            "predicate must run on every step incl. limit"
+        );
+        assert!(
+            !result.limit_reached,
+            "predicate stop must win over the limit"
+        );
+        assert_eq!(result.instructions_executed, 2);
     }
 }

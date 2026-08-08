@@ -189,23 +189,6 @@ pub fn handle_trace_step(
 ) -> Result<IatTraceAction, String> {
     trace.trace_counter += 1;
 
-    // Check instruction limit. `>=` (not `>`) makes the limit "at most
-    // TRACE_LIMIT instructions executed": the slot fails once `trace_counter`
-    // reaches TRACE_LIMIT.
-    if trace.trace_counter >= TRACE_LIMIT {
-        query.log(
-            LogLevel::Info,
-            &format!(
-                "Giving up trace slot {} due to instruction limit ({}/{})",
-                trace.current_slot, trace.trace_counter, TRACE_LIMIT
-            ),
-        );
-        trace.failed_count += 1;
-        trace.failed_slots.push(trace.current_slot);
-        trace.current_slot += 1;
-        return advance_to_next_slot(query, trace);
-    }
-
     if trace.trace_counter.is_multiple_of(5000) {
         query.log(
             LogLevel::Info,
@@ -240,7 +223,11 @@ pub fn handle_trace_step(
         }
     }
 
-    match trace_is_at_api(
+    // Run the decision FIRST on this instruction (P2 issue 6: the limit-th step
+    // is still classified — a FoundApi/HitVm on the limit-th step is honored,
+    // not swallowed by the limit). Only a `Continue` that does not stop the
+    // slot is subject to the instruction limit.
+    let action = match trace_is_at_api(
         ip,
         sp,
         trace.trace_start_sp,
@@ -257,7 +244,7 @@ pub fn handle_trace_step(
         TraceStepDecision::HitVm { ip: vm_ip } => {
             trace.trace_in_vm = true;
             query.log(LogLevel::Info, &format!("Trace ran into VM at {vm_ip:#x}"));
-            handle_trace_result(query, trace)
+            return handle_trace_result(query, trace);
         }
         TraceStepDecision::SkipAntiTraceApi {
             ip: api_ip,
@@ -267,17 +254,36 @@ pub fn handle_trace_step(
                 LogLevel::Info,
                 &format!("Skipping anti-trace API at {api_ip:#x}"),
             );
-            Ok(IatTraceAction::ContinueWithContext {
+            IatTraceAction::ContinueWithContext {
                 rip: target_ip as u64,
                 rsp: sp.saturating_add(8) as u64,
-            })
+            }
         }
         TraceStepDecision::FoundApi { ip: api_ip } => {
             trace.traced_api = api_ip;
-            handle_trace_result(query, trace)
+            return handle_trace_result(query, trace);
         }
-        TraceStepDecision::Continue => Ok(IatTraceAction::ContinueWithTrap),
+        TraceStepDecision::Continue => IatTraceAction::ContinueWithTrap,
+    };
+
+    // The decision did not stop the slot. Check the instruction limit: `>=`
+    // (not `>`) means "at most TRACE_LIMIT instructions executed" — the slot
+    // fails once `trace_counter` reaches TRACE_LIMIT.
+    if trace.trace_counter >= TRACE_LIMIT {
+        query.log(
+            LogLevel::Info,
+            &format!(
+                "Giving up trace slot {} due to instruction limit ({}/{})",
+                trace.current_slot, trace.trace_counter, TRACE_LIMIT
+            ),
+        );
+        trace.failed_count += 1;
+        trace.failed_slots.push(trace.current_slot);
+        trace.current_slot += 1;
+        return advance_to_next_slot(query, trace);
     }
+
+    Ok(action)
 }
 
 /// Classify one slot result and advance. Never jumps `current_slot` to total

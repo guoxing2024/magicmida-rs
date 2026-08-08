@@ -43,6 +43,16 @@
 //! `runner_config_digest`; the selected digest flows into the evidence
 //! context and bundle. A v3 single-config envelope fails closed (no silent
 //! upgrade).
+//!
+//! ## Verifier TOCTOU — RESIDUAL (P2)
+//!
+//! The verifier identity is re-resolved + re-hashed at each spawn site
+//! immediately before `Command::new` and bound to the envelope-pinned SHA-256
+//! (see [`VerifierIdentity`]). This narrows but does NOT eliminate the
+//! time-of-check/time-of-use window: a handle-based launch (open with
+//! no-write/no-delete sharing across the spawn) is not implemented on this
+//! platform. This is documented as a residual risk, not a full fix; the
+//! sibling-only resolver is the trust boundary.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -541,13 +551,21 @@ pub fn resolve_verifier_identity() -> anyhow::Result<(PathBuf, String)> {
 /// TOCTOU hardening).
 ///
 /// This is the single resolved+validated identity used immediately before a
-/// spawn. It holds the canonical path (already verified to be exactly the CLI
-/// sibling, a regular file, and in a non-caller-writable parent) plus the
-/// SHA-256 computed at resolution time. Spawn sites re-resolve **and** re-hash
-/// through this type immediately before `Command::new`, so the path used to
-/// launch is the same path whose identity was verified — the window in which a
-/// swapped binary could be executed is closed to the instant between the final
-/// check and the spawn, and the identity is bound to the envelope before use.
+/// spawn. It holds the canonical path (verified to be exactly the CLI sibling,
+/// a regular file) plus the SHA-256 computed at resolution time. Spawn sites
+/// re-resolve **and** re-hash through this type immediately before
+/// `Command::new`, so the path used to launch is the same path whose identity
+/// was verified.
+///
+/// **RESIDUAL RISK (documented, not fully closed):** this narrows but does NOT
+/// eliminate the TOCTOU window. Between the final hash and `Command::new` a
+/// privileged local actor could still swap the file at the (immutable-looking)
+/// canonical path, and a true handle-based launch (open the verifier with
+/// no-write/no-delete sharing, hold the handle across the spawn, or launch from
+/// an immutable staging copy) is NOT implemented on this platform. The sibling-
+/// only resolver is the trust boundary: a swapped verifier must be placed at
+/// the exact CLI sibling path. Treat this as a REDUCED-RISK mitigation, not a
+/// TOCTOU elimination.
 #[derive(Debug, Clone)]
 pub struct VerifierIdentity {
     /// Canonical path used for the spawn (never re-derived after this).
@@ -558,13 +576,15 @@ pub struct VerifierIdentity {
 
 /// Resolve the verifier sibling, validate it, and compute its identity in one
 /// step (P2). Combines canonicalization, regular-file validation, the sibling
-/// path identity, a parent-directory policy check, and the SHA-256 digest so
-/// the spawn sites can re-verify immediately before `Command::new` without
-/// re-deriving the path.
+/// path identity, and the SHA-256 digest so the spawn sites can re-verify
+/// immediately before `Command::new` without re-deriving the path.
 ///
 /// `bind_expected_sha` (when `Some`) cross-checks the computed digest against a
 /// pinned value (e.g. the envelope's `verifier_sha256`) and refuses to execute
 /// a drifted verifier. The spawn sites always bind before launching.
+///
+/// **TOCTOU residual:** this reduces the swap window but does not eliminate it
+/// (see [`VerifierIdentity`]). Handle-based launch is not implemented.
 pub fn resolve_verifier_identity_checked(
     bind_expected_sha: Option<&str>,
 ) -> anyhow::Result<VerifierIdentity> {

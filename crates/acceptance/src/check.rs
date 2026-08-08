@@ -225,12 +225,21 @@ pub fn check_with_behavior_signed(
     signed: &VerifiedSignedBundle,
 ) -> AcceptanceReport {
     let mut report = compose_managed_uncapped(bytes, opts, signed.evidence(), signed.managed());
-    // P1: a verified signature envelope (non-caller-controlled trust root) is
-    // the product trust tier. product_acceptable is true only when the verdict
-    // is Accepted.
+    // P1 issue 3: the trust tier is derived from the ENVELOPE's signature
+    // algorithm, not assumed Product. An HMAC-signed envelope (the only
+    // implemented algorithm today) uses a caller-controlled shared secret and
+    // is a LAB trust root; Ed25519 (reserved, non-caller-controlled) is the
+    // Product tier. So the signed library path must NOT label an HMAC envelope
+    // as Product.
+    let algorithm = signed.envelope().signature().algorithm.as_str();
     report.trust_tier = if report.verdict == Verdict::Rejected {
         TrustTier::Rejected
+    } else if algorithm == crate::envelope::SIG_ALG_HMAC_SHA256_V0 {
+        TrustTier::Lab
     } else {
+        // Ed25519 / unknown: only a non-HMAC product algorithm is Product. For
+        // any not-yet-implemented algorithm the bundle could not have verified,
+        // so this branch is only reachable for a verified Ed25519 envelope.
         TrustTier::Product
     };
     report.refresh_product_acceptable();

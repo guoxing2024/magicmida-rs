@@ -1177,9 +1177,11 @@ pub fn run_offline_preflight(request: &PreflightRequest<'_>) -> PreflightReport 
             None
         }
     };
-    // The authoritative expected channel comes from the repo-root pin (when it
-    // exists). The caller-supplied `expected_toolchain` is cross-checked against
-    // it, and both must agree before the run may be pinned.
+    // The authoritative expected channel comes from the repo-root pin. The
+    // caller-supplied `expected_toolchain` is cross-checked against it, and both
+    // must agree before the run may be pinned. A MISSING repo-root pin is
+    // FAIL-CLOSED: there is no trusted channel to pin to, so the run is NotReady
+    // (the caller cannot substitute its own expected value as the authority).
     let authoritative_channel =
         match fs::read_to_string(request.repo_root.join("rust-toolchain.toml")) {
             Ok(text) => match parse_toolchain_channel(&text) {
@@ -1197,11 +1199,15 @@ pub fn run_offline_preflight(request: &PreflightRequest<'_>) -> PreflightReport 
                     None
                 }
             },
-            Err(_) => {
-                // No repo-root pin: fall back to the caller-supplied expected value
-                // so the legacy (single pinned toolchain) lane still works, but it
-                // is no longer authoritative.
-                Some(request.expected_toolchain.trim().to_string())
+            Err(e) => {
+                // Fail-closed: without the authoritative repo-root pin, the run
+                // cannot be pinned. A caller fabricating a missing-pin repo root
+                // and supplying its own expected toolchain is refused.
+                reasons.push(format!(
+                    "repo-root rust-toolchain.toml is missing/unreadable ({e}); the run cannot be \
+                 pinned to a trusted toolchain (caller cannot substitute an expected value)"
+                ));
+                None
             }
         };
 
@@ -1904,6 +1910,56 @@ mod tests {
             "{:?}",
             report.reasons
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// P1 issue 2: a MISSING authoritative repo-root pin is FAIL-CLOSED. A
+    /// caller pointing `repo_root` at a directory with no rust-toolchain.toml
+    /// (and supplying its own `expected_toolchain`) cannot substitute its value
+    /// as the authority — the run is NotReady.
+    #[test]
+    fn missing_repo_pin_is_fail_closed_not_fail_open() {
+        let dir =
+            std::env::temp_dir().join(format!("mida_toolchain_missing_pin_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let pin = dir.join("rust-toolchain.toml");
+        fs::write(&pin, "[toolchain]\nchannel = \"1.97.1\"\n").unwrap();
+        // repo_root has NO rust-toolchain.toml (the authoritative pin is absent).
+        let repo_root = dir.join("repo");
+        fs::create_dir_all(&repo_root).unwrap();
+
+        let cli_sha = "a".repeat(64);
+        let config = RunnerConfig::placeholder_for_preflight("rev@1", &cli_sha);
+        let probe = FakeProbeForToolchain;
+        let cases: Vec<(&Path, &Path, &Path)> = Vec::new();
+        let req = PreflightRequest {
+            cases,
+            output_dir: &dir,
+            cli_binary: None,
+            expected_cli_sha256: &cli_sha,
+            runner_config: &config,
+            worktree: &probe,
+            output_probe: &FsOutputProbe,
+            toolchain_pin_file: &pin,
+            expected_toolchain: "1.97.1", // caller-supplied, but NOT authoritative
+            repo_root: &repo_root,
+            case_config_digests: BTreeMap::new(),
+            gto_protected_input_path: BTreeMap::new(),
+            gto_path_binding_failures: BTreeMap::new(),
+            case_set_digest: String::new(),
+        };
+        let report = run_offline_preflight(&req);
+        assert_eq!(report.status, PreflightStatus::NotReady);
+        assert!(
+            report
+                .reasons
+                .iter()
+                .any(|r| r.contains("missing/unreadable") || r.contains("cannot be pinned")),
+            "{:?}",
+            report.reasons
+        );
+        // The toolchain is NOT matched (no authoritative pin to match).
+        assert_eq!(report.toolchain_matches, Some(false));
         let _ = fs::remove_dir_all(&dir);
     }
 

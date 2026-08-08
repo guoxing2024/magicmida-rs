@@ -3,7 +3,7 @@
 //! A strict, independently verifiable, fail-closed behavior-oracle contract for
 //! the two fixed Oreans cases. This module is the **verifier** — it never runs a
 //! probe, never opens a sample, and never imports a producer crate. The producer
-//! side writes `mida.oreans-behavior-oracle-contract/v1` evidence JSON; this
+//! side writes `mida.oreans-behavior-oracle-contract/v2` evidence JSON; this
 //! module re-parses it into independent serde types and recomputes every verdict
 //! from recorded observations plus deterministic comparators.
 //!
@@ -62,7 +62,11 @@ use thiserror::Error;
 use crate::oreans_gate::OreansArtifactIdentity;
 
 /// Fixed schema version for the case-bound behavior oracle contract.
-pub const BEHAVIOR_ORACLE_CONTRACT_SCHEMA_VERSION: &str = "mida.oreans-behavior-oracle-contract/v1";
+///
+/// v2: adds the required structured `equivalence_proof` block (P1 — free-text
+/// `reason` is no longer a security gate) and the order-bound stimulus-plan
+/// content binding. v1 evidence (no `equivalence_proof`) is rejected.
+pub const BEHAVIOR_ORACLE_CONTRACT_SCHEMA_VERSION: &str = "mida.oreans-behavior-oracle-contract/v2";
 
 /// Number of fixed cases the contract is bound to.
 pub const CONTRACT_REQUIRED_CASES: &[&str] = &["origin_macro", "lunlun_software"];
@@ -326,12 +330,18 @@ pub struct EquivalenceProof {
     /// Icon patch state (Some → manufacture).
     #[serde(default)]
     pub icon_patch_state: Option<String>,
-    /// Hash of the raw observation source (probe logs). `None` when the probe
-    /// did not run (offline) — verdict becomes `NotRun`, never `Pass`.
-    pub observation_source_hash: Option<String>,
-    /// Digest of the execution environment. `None` when offline — verdict
-    /// becomes `NotRun`, never `Pass`.
-    pub execution_environment_digest: Option<String>,
+    /// Hash of the raw observation source (probe logs). **Required**: the
+    /// caller must supply it, but the verifier does NOT trust a self-reported
+    /// hash to establish a real observation — the hash must be registered in
+    /// the verifier-side [`TrustedObservationRegistry`] for the verdict to be
+    /// `Pass`. An unregistered observation (or a mismatch between the
+    /// observation hash and its environment digest) yields `NotRun` (Pending),
+    /// never a fabricated `Pass`.
+    pub observation_source_hash: String,
+    /// Digest of the execution environment that produced the observation.
+    /// **Required** and cross-checked against the registered environment for
+    /// the observation source hash.
+    pub execution_environment_digest: String,
 }
 
 impl EquivalenceProof {
@@ -375,28 +385,22 @@ pub struct BehaviorOracleContractEvidence {
 /// Canonical, stable serialization of an ordered stimulus plan.
 ///
 /// The encoding is length-prefixed and injective (commas/semicolons/`=`
-/// inside `id`/`value` bytes cannot collide), and the order is pinned by
-/// sorting on the (id, value) pair so the digest does not depend on vector
-/// order or any HashMap iteration order. This is the single source of truth
-/// for "same stimulus plan" — the registry and the evidence content both
+/// inside `id`/`value` bytes cannot collide), and it **preserves the plan's
+/// execution order** (the order of the `Vec`). This is the single source of
+/// truth for "same stimulus plan" — the registry and the evidence content both
 /// canonicalize through it, so add/remove/reorder/id/value changes all change
-/// the digest.
+/// the digest. Because the order is preserved (not sorted), two plans that run
+/// the same stimuli in a different order produce different hashes, binding the
+/// order into the hash.
 pub fn canonical_stimulus_serialization(stimuli: &[BehaviorStimulus]) -> String {
-    let mut entries: Vec<(&str, &str)> = stimuli
-        .iter()
-        .map(|s| (s.id.as_str(), s.value.as_str()))
-        .collect();
-    // Sort by (id, value): a reordered plan canonicalizes to the same bytes
-    // only if the multiset of (id, value) pairs is identical.
-    entries.sort_unstable();
     let mut out = String::new();
-    for (id, value) in entries {
+    for s in stimuli {
         out.push_str(&format!(
             "id={}:{};value={}:{};",
-            id.len(),
-            id,
-            value.len(),
-            value
+            s.id.len(),
+            s.id,
+            s.value.len(),
+            s.value
         ));
     }
     out
@@ -483,6 +487,65 @@ impl StimulusPlanRegistry {
     }
 }
 
+/// Verifier-side registry of TRUSTED runtime observations (P1 issue 1: no
+/// self-reported-`Some` false-green).
+///
+/// A behavioral `Pass` must be backed by an observation that the VERIFIER has
+/// independently registered as trustworthy — never by a caller-supplied
+/// `observation_source_hash` / `execution_environment_digest` pair. Offline
+/// (no trusted probe run) this registry is empty, so `derive_final_verdict`
+/// returns `NotRun` (Pending) for any evidence whose observation is not
+/// registered; a self-reported hash alone can never green-light a `Pass`.
+#[derive(Debug, Clone, Default)]
+pub struct TrustedObservationRegistry {
+    /// `observation_source_hash -> execution_environment_digest`.
+    observations: std::collections::BTreeMap<String, String>,
+}
+
+impl TrustedObservationRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a verifier-trusted observation: the exact hash of the raw
+    /// observation source and the execution-environment digest that produced
+    /// it. Both must be well-formed 64-hex. Returns `Err` on malformed input.
+    pub fn register(
+        &mut self,
+        observation_source_hash: &str,
+        execution_environment_digest: &str,
+    ) -> Result<(), BehaviorOracleContractError> {
+        let h = observation_source_hash.trim().to_lowercase();
+        let e = execution_environment_digest.trim().to_lowercase();
+        if !is_sha256(&h) || !is_sha256(&e) {
+            return Err(BehaviorOracleContractError::BadObservationIdentity);
+        }
+        self.observations.insert(h, e);
+        Ok(())
+    }
+
+    /// Whether the evidence's self-declared observation is trusted AND matches
+    /// the registered environment digest exactly. A self-reported hash that is
+    /// not registered (or registered with a different environment digest)
+    /// yields `NotRun` (Pending), never `Pass`.
+    pub fn observation_is_trusted(&self, evidence: &BehaviorOracleContractEvidence) -> bool {
+        let h = evidence
+            .equivalence_proof
+            .observation_source_hash
+            .trim()
+            .to_lowercase();
+        let e = evidence
+            .equivalence_proof
+            .execution_environment_digest
+            .trim()
+            .to_lowercase();
+        self.observations
+            .get(&h)
+            .map(|registered| *registered == e)
+            .unwrap_or(false)
+    }
+}
+
 /// A single computed observable result (verifier output).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComputedObservable {
@@ -565,6 +628,11 @@ pub enum BehaviorOracleContractError {
     EmptyReason,
     #[error("equivalence_proof is malformed or missing required identities")]
     BadEquivalenceProof,
+    #[error(
+        "equivalence_proof observation_source_hash / execution_environment_digest must be \
+         well-formed 64-hex"
+    )]
+    BadObservationIdentity,
     #[error(
         "equivalence_proof declares an equivalence-manufacture marker: {0} (structured; never \
          reason text)"
@@ -725,6 +793,16 @@ fn validate_equivalence_proof_shape(
     if !evidence.equivalence_proof.is_well_formed() {
         return Err(BehaviorOracleContractError::BadEquivalenceProof);
     }
+    // The observation source hash and environment digest must be well-formed
+    // 64-hex (they are required fields). A malformed value is rejected up
+    // front; a well-formed but UNREGISTERED value is not trusted for a Pass
+    // (see `TrustedObservationRegistry::observation_is_trusted`).
+    let proof = &evidence.equivalence_proof;
+    if !is_sha256(proof.observation_source_hash.trim())
+        || !is_sha256(proof.execution_environment_digest.trim())
+    {
+        return Err(BehaviorOracleContractError::BadObservationIdentity);
+    }
     Ok(())
 }
 
@@ -814,29 +892,24 @@ fn reject_equivalence_manufacture(
     Ok(())
 }
 
-/// Whether the structured proof establishes a REAL runtime observation (not an
-/// offline placeholder). When the probe did not run (`observation_source_hash`
-/// and `execution_environment_digest` are `None`), a behavioral `Pass` cannot
-/// be claimed — the contract returns `NotRun` (Pending), never `Pass`.
-fn proof_establishes_real_observation(evidence: &BehaviorOracleContractEvidence) -> bool {
-    let proof = &evidence.equivalence_proof;
-    proof.observation_source_hash.is_some() && proof.execution_environment_digest.is_some()
-}
-
 /// Derive the final contract verdict from the recomputed observables.
 ///
 /// - any observable failing → `Fail`;
-/// - all observables passing but the structured proof does NOT establish a real
-///   runtime observation (offline) → `NotRun` (Pending), never `Pass`;
-/// - all observables passing AND a real observation is bound → `Pass`.
+/// - all observables passing but the observation is NOT verifier-trusted
+///   (offline: no trusted probe run registered) → `NotRun` (Pending), never
+///   `Pass`. A self-reported `observation_source_hash`/`execution_environment_
+///   digest` is never sufficient — the observation must be registered in the
+///   verifier-side [`TrustedObservationRegistry`];
+/// - all observables passing AND the observation is verifier-trusted → `Pass`.
 fn derive_final_verdict(
     all_pass: bool,
     evidence: &BehaviorOracleContractEvidence,
+    trusted_observations: &TrustedObservationRegistry,
 ) -> BehaviorContractVerdict {
     if !all_pass {
         return BehaviorContractVerdict::Fail;
     }
-    if proof_establishes_real_observation(evidence) {
+    if trusted_observations.observation_is_trusted(evidence) {
         BehaviorContractVerdict::Pass
     } else {
         BehaviorContractVerdict::NotRun
@@ -850,6 +923,7 @@ fn derive_final_verdict(
 pub fn verify_contract(
     evidence: &BehaviorOracleContractEvidence,
     registry: &StimulusPlanRegistry,
+    trusted_observations: &TrustedObservationRegistry,
 ) -> Result<ContractVerdict, BehaviorOracleContractError> {
     // Shape + equivalence-manufacture checks.
     validate_contract_shape(evidence)?;
@@ -874,7 +948,7 @@ pub fn verify_contract(
             verdict,
         });
     }
-    let final_verdict = derive_final_verdict(all_pass, evidence);
+    let final_verdict = derive_final_verdict(all_pass, evidence, trusted_observations);
     Ok(ContractVerdict {
         final_verdict,
         per_observable,
@@ -927,6 +1001,7 @@ pub fn verify_contract_bound(
     evidence: &BehaviorOracleContractEvidence,
     expected: &ExpectedBinding,
     registry: &StimulusPlanRegistry,
+    trusted_observations: &TrustedObservationRegistry,
 ) -> Result<ContractVerdict, BehaviorOracleContractError> {
     // Shape + equivalence-manufacture checks.
     validate_contract_shape(evidence)?;
@@ -978,7 +1053,7 @@ pub fn verify_contract_bound(
             verdict,
         });
     }
-    let final_verdict = derive_final_verdict(all_pass, evidence);
+    let final_verdict = derive_final_verdict(all_pass, evidence, trusted_observations);
     Ok(ContractVerdict {
         final_verdict,
         per_observable,
@@ -1185,7 +1260,9 @@ mod tests {
     }
 
     /// A clean, complete, allowlist-clean structured equivalence proof that
-    /// establishes a real runtime observation (so the contract may `Pass`).
+    /// establishes a verifier-trusted runtime observation (so the contract may
+    /// `Pass`). The observation hash/environment pair must be registered in the
+    /// returned [`TrustedObservationRegistry`] for a `Pass`.
     fn clean_proof() -> EquivalenceProof {
         EquivalenceProof {
             probe_binary_identity: cli_id(),
@@ -1198,9 +1275,18 @@ mod tests {
             forced_visibility: false,
             server_patch_state: None,
             icon_patch_state: None,
-            observation_source_hash: Some(sha("observation-source")),
-            execution_environment_digest: Some(sha("exec-env")),
+            observation_source_hash: sha("observation-source"),
+            execution_environment_digest: sha("exec-env"),
         }
+    }
+
+    /// The verifier-side trusted observation registry that registers the clean
+    /// proof's observation, so `valid_evidence` may `Pass`.
+    fn trusted_observations() -> TrustedObservationRegistry {
+        let mut reg = TrustedObservationRegistry::new();
+        reg.register(&sha("observation-source"), &sha("exec-env"))
+            .expect("register clean observation");
+        reg
     }
 
     fn expected(case_id: &str, plan_sha: &str) -> ExpectedBinding {
@@ -1221,7 +1307,13 @@ mod tests {
         let plan = default_plan_sha();
         let ev = valid_evidence("origin_macro", &plan);
         let reg = registry_with(&plan);
-        let out = verify_contract_bound(&ev, &expected("origin_macro", &plan), &reg).unwrap();
+        let out = verify_contract_bound(
+            &ev,
+            &expected("origin_macro", &plan),
+            &reg,
+            &trusted_observations(),
+        )
+        .unwrap();
         assert_eq!(out.final_verdict, BehaviorContractVerdict::Pass);
         assert!(out.per_observable.iter().all(|o| o.verdict.is_pass()));
         assert!(!out.reason.trim().is_empty());
@@ -1242,7 +1334,13 @@ mod tests {
             expected: "0".into(),
         };
         let reg = registry_with(&plan);
-        let out = verify_contract_bound(&ev, &expected("origin_macro", &plan), &reg).unwrap();
+        let out = verify_contract_bound(
+            &ev,
+            &expected("origin_macro", &plan),
+            &reg,
+            &trusted_observations(),
+        )
+        .unwrap();
         assert_eq!(out.final_verdict, BehaviorContractVerdict::Fail);
         assert!(out.per_observable[0].verdict != ObservableVerdict::Pass);
     }
@@ -1269,7 +1367,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_field() {
-        let json = br#"{"schema_version":"mida.oreans-behavior-oracle-contract/v1","bogus":1}"#;
+        let json = br#"{"schema_version":"mida.oreans-behavior-oracle-contract/v2","bogus":1}"#;
         assert!(parse_contract_evidence(json).is_err());
     }
 
@@ -1290,9 +1388,13 @@ mod tests {
         let plan = default_plan_sha();
         let mut ev = valid_evidence("origin_macro", &plan);
         ev.stimuli.clear();
-        let err =
-            verify_contract_bound(&ev, &expected("origin_macro", &plan), &registry_with(&plan))
-                .unwrap_err();
+        let err = verify_contract_bound(
+            &ev,
+            &expected("origin_macro", &plan),
+            &registry_with(&plan),
+            &trusted_observations(),
+        )
+        .unwrap_err();
         assert!(matches!(err, BehaviorOracleContractError::EmptyStimuli));
     }
 
@@ -1301,9 +1403,13 @@ mod tests {
         let plan = default_plan_sha();
         let mut ev = valid_evidence("origin_macro", &plan);
         ev.observables.clear();
-        let err =
-            verify_contract_bound(&ev, &expected("origin_macro", &plan), &registry_with(&plan))
-                .unwrap_err();
+        let err = verify_contract_bound(
+            &ev,
+            &expected("origin_macro", &plan),
+            &registry_with(&plan),
+            &trusted_observations(),
+        )
+        .unwrap_err();
         assert!(matches!(err, BehaviorOracleContractError::EmptyObservables));
     }
 
@@ -1315,9 +1421,13 @@ mod tests {
             id: "startup".into(),
             value: "x".into(),
         });
-        let err =
-            verify_contract_bound(&ev, &expected("origin_macro", &plan), &registry_with(&plan))
-                .unwrap_err();
+        let err = verify_contract_bound(
+            &ev,
+            &expected("origin_macro", &plan),
+            &registry_with(&plan),
+            &trusted_observations(),
+        )
+        .unwrap_err();
         assert!(matches!(err, BehaviorOracleContractError::BadStimulusId(_)));
     }
 
@@ -1326,9 +1436,13 @@ mod tests {
         let plan = default_plan_sha();
         let mut ev = valid_evidence("origin_macro", &plan);
         ev.stimuli[0].value = "".into();
-        let err =
-            verify_contract_bound(&ev, &expected("origin_macro", &plan), &registry_with(&plan))
-                .unwrap_err();
+        let err = verify_contract_bound(
+            &ev,
+            &expected("origin_macro", &plan),
+            &registry_with(&plan),
+            &trusted_observations(),
+        )
+        .unwrap_err();
         assert!(matches!(
             err,
             BehaviorOracleContractError::EmptyStimulusValue(_)
@@ -1340,9 +1454,13 @@ mod tests {
         let plan = default_plan_sha();
         let mut ev = valid_evidence("origin_macro", &plan);
         ev.observables.push(ev.observables[0].clone());
-        let err =
-            verify_contract_bound(&ev, &expected("origin_macro", &plan), &registry_with(&plan))
-                .unwrap_err();
+        let err = verify_contract_bound(
+            &ev,
+            &expected("origin_macro", &plan),
+            &registry_with(&plan),
+            &trusted_observations(),
+        )
+        .unwrap_err();
         assert!(matches!(
             err,
             BehaviorOracleContractError::BadObservableId(_)
@@ -1354,9 +1472,13 @@ mod tests {
         let plan = default_plan_sha();
         let mut ev = valid_evidence("origin_macro", &plan);
         ev.observables[1].expected = "".into();
-        let err =
-            verify_contract_bound(&ev, &expected("origin_macro", &plan), &registry_with(&plan))
-                .unwrap_err();
+        let err = verify_contract_bound(
+            &ev,
+            &expected("origin_macro", &plan),
+            &registry_with(&plan),
+            &trusted_observations(),
+        )
+        .unwrap_err();
         assert!(matches!(
             err,
             BehaviorOracleContractError::BadObservableField(_)
@@ -1371,7 +1493,8 @@ mod tests {
         let ev = valid_evidence("origin_macro", &plan);
         let mut exp = expected("origin_macro", &plan);
         std::mem::swap(&mut exp.candidate, &mut exp.protected_input);
-        let err = verify_contract_bound(&ev, &exp, &registry_with(&plan)).unwrap_err();
+        let err = verify_contract_bound(&ev, &exp, &registry_with(&plan), &trusted_observations())
+            .unwrap_err();
         assert!(matches!(
             err,
             BehaviorOracleContractError::BadCandidateIdentity
@@ -1383,9 +1506,13 @@ mod tests {
         let plan = default_plan_sha();
         let mut ev = valid_evidence("origin_macro", &plan);
         ev.candidate = valid_identity("different-candidate");
-        let err =
-            verify_contract_bound(&ev, &expected("origin_macro", &plan), &registry_with(&plan))
-                .unwrap_err();
+        let err = verify_contract_bound(
+            &ev,
+            &expected("origin_macro", &plan),
+            &registry_with(&plan),
+            &trusted_observations(),
+        )
+        .unwrap_err();
         assert!(matches!(
             err,
             BehaviorOracleContractError::BadCandidateIdentity
@@ -1397,9 +1524,13 @@ mod tests {
         let plan = default_plan_sha();
         let mut ev = valid_evidence("origin_macro", &plan);
         ev.runner_config_digest = "bb".repeat(32);
-        let err =
-            verify_contract_bound(&ev, &expected("origin_macro", &plan), &registry_with(&plan))
-                .unwrap_err();
+        let err = verify_contract_bound(
+            &ev,
+            &expected("origin_macro", &plan),
+            &registry_with(&plan),
+            &trusted_observations(),
+        )
+        .unwrap_err();
         assert!(matches!(
             err,
             BehaviorOracleContractError::RunnerConfigDigestMismatch(_, _)
@@ -1411,9 +1542,13 @@ mod tests {
         let plan = default_plan_sha();
         let mut ev = valid_evidence("origin_macro", &plan);
         ev.tool_revision = "other/revision@2".into();
-        let err =
-            verify_contract_bound(&ev, &expected("origin_macro", &plan), &registry_with(&plan))
-                .unwrap_err();
+        let err = verify_contract_bound(
+            &ev,
+            &expected("origin_macro", &plan),
+            &registry_with(&plan),
+            &trusted_observations(),
+        )
+        .unwrap_err();
         assert!(matches!(
             err,
             BehaviorOracleContractError::ToolRevisionMismatch(_, _)
@@ -1425,9 +1560,13 @@ mod tests {
         let plan = default_plan_sha();
         let mut ev = valid_evidence("origin_macro", &plan);
         ev.stimulus_plan = plan_ref(&sha("different-plan"));
-        let err =
-            verify_contract_bound(&ev, &expected("origin_macro", &plan), &registry_with(&plan))
-                .unwrap_err();
+        let err = verify_contract_bound(
+            &ev,
+            &expected("origin_macro", &plan),
+            &registry_with(&plan),
+            &trusted_observations(),
+        )
+        .unwrap_err();
         assert!(matches!(
             err,
             BehaviorOracleContractError::UnregisteredStimulusPlan(_)
@@ -1467,9 +1606,13 @@ mod tests {
         let plan = default_plan_sha();
         let mut ev = valid_evidence("origin_macro", &plan);
         ev.case_id = "lunlun_software".into();
-        let err =
-            verify_contract_bound(&ev, &expected("origin_macro", &plan), &registry_with(&plan))
-                .unwrap_err();
+        let err = verify_contract_bound(
+            &ev,
+            &expected("origin_macro", &plan),
+            &registry_with(&plan),
+            &trusted_observations(),
+        )
+        .unwrap_err();
         assert!(matches!(
             err,
             BehaviorOracleContractError::CaseIdMismatch(_, _)
@@ -1483,9 +1626,13 @@ mod tests {
         let plan = default_plan_sha();
         let mut ev = valid_evidence("origin_macro", &plan);
         ev.observables[1].observed.status = BehaviorObservedStatus::Missing;
-        let out =
-            verify_contract_bound(&ev, &expected("origin_macro", &plan), &registry_with(&plan))
-                .unwrap();
+        let out = verify_contract_bound(
+            &ev,
+            &expected("origin_macro", &plan),
+            &registry_with(&plan),
+            &trusted_observations(),
+        )
+        .unwrap();
         assert_eq!(out.final_verdict, BehaviorContractVerdict::Fail);
         assert!(out.per_observable[1].verdict == ObservableVerdict::Missing);
     }
@@ -1495,9 +1642,13 @@ mod tests {
         let plan = default_plan_sha();
         let mut ev = valid_evidence("origin_macro", &plan);
         ev.observables[0].observed.status = BehaviorObservedStatus::Timeout;
-        let out =
-            verify_contract_bound(&ev, &expected("origin_macro", &plan), &registry_with(&plan))
-                .unwrap();
+        let out = verify_contract_bound(
+            &ev,
+            &expected("origin_macro", &plan),
+            &registry_with(&plan),
+            &trusted_observations(),
+        )
+        .unwrap();
         assert_eq!(out.final_verdict, BehaviorContractVerdict::Fail);
     }
 
@@ -1506,9 +1657,13 @@ mod tests {
         let plan = default_plan_sha();
         let mut ev = valid_evidence("origin_macro", &plan);
         ev.observables[0].observed.status = BehaviorObservedStatus::Malformed;
-        let out =
-            verify_contract_bound(&ev, &expected("origin_macro", &plan), &registry_with(&plan))
-                .unwrap();
+        let out = verify_contract_bound(
+            &ev,
+            &expected("origin_macro", &plan),
+            &registry_with(&plan),
+            &trusted_observations(),
+        )
+        .unwrap();
         assert_eq!(out.final_verdict, BehaviorContractVerdict::Fail);
     }
 
@@ -1517,9 +1672,13 @@ mod tests {
         let plan = default_plan_sha();
         let mut ev = valid_evidence("origin_macro", &plan);
         ev.observables[0].observed.status = BehaviorObservedStatus::Partial;
-        let out =
-            verify_contract_bound(&ev, &expected("origin_macro", &plan), &registry_with(&plan))
-                .unwrap();
+        let out = verify_contract_bound(
+            &ev,
+            &expected("origin_macro", &plan),
+            &registry_with(&plan),
+            &trusted_observations(),
+        )
+        .unwrap();
         assert_eq!(out.final_verdict, BehaviorContractVerdict::Fail);
     }
 
@@ -1528,9 +1687,13 @@ mod tests {
         let plan = default_plan_sha();
         let mut ev = valid_evidence("origin_macro", &plan);
         ev.observables[0].observed.value = "7".into();
-        let out =
-            verify_contract_bound(&ev, &expected("origin_macro", &plan), &registry_with(&plan))
-                .unwrap();
+        let out = verify_contract_bound(
+            &ev,
+            &expected("origin_macro", &plan),
+            &registry_with(&plan),
+            &trusted_observations(),
+        )
+        .unwrap();
         assert_eq!(out.final_verdict, BehaviorContractVerdict::Fail);
         assert!(out.per_observable[0].verdict == ObservableVerdict::Mismatch);
     }
@@ -1551,9 +1714,13 @@ mod tests {
         let mut ev = valid_evidence("origin_macro", &plan);
         ev.observables[1].observed.value = "NO_MARKER".into();
         ev.reason = "overall pass".into();
-        let out =
-            verify_contract_bound(&ev, &expected("origin_macro", &plan), &registry_with(&plan))
-                .unwrap();
+        let out = verify_contract_bound(
+            &ev,
+            &expected("origin_macro", &plan),
+            &registry_with(&plan),
+            &trusted_observations(),
+        )
+        .unwrap();
         assert_eq!(out.final_verdict, BehaviorContractVerdict::Fail);
     }
 
@@ -1562,9 +1729,13 @@ mod tests {
         let plan = default_plan_sha();
         let mut ev = valid_evidence("origin_macro", &plan);
         ev.execution.completion.done = false;
-        let err =
-            verify_contract_bound(&ev, &expected("origin_macro", &plan), &registry_with(&plan))
-                .unwrap_err();
+        let err = verify_contract_bound(
+            &ev,
+            &expected("origin_macro", &plan),
+            &registry_with(&plan),
+            &trusted_observations(),
+        )
+        .unwrap_err();
         assert!(matches!(err, BehaviorOracleContractError::BadExecution));
     }
 
@@ -1573,9 +1744,13 @@ mod tests {
         let plan = default_plan_sha();
         let mut ev = valid_evidence("origin_macro", &plan);
         ev.reason = "".into();
-        let err =
-            verify_contract_bound(&ev, &expected("origin_macro", &plan), &registry_with(&plan))
-                .unwrap_err();
+        let err = verify_contract_bound(
+            &ev,
+            &expected("origin_macro", &plan),
+            &registry_with(&plan),
+            &trusted_observations(),
+        )
+        .unwrap_err();
         assert!(matches!(err, BehaviorOracleContractError::EmptyReason));
     }
 
@@ -1588,9 +1763,13 @@ mod tests {
         // P1: manufacture is a STRUCTURED field, not reason text. Setting the
         // structured server-patch state must reject.
         ev.equivalence_proof.server_patch_state = Some("patched".into());
-        let err =
-            verify_contract_bound(&ev, &expected("origin_macro", &plan), &registry_with(&plan))
-                .unwrap_err();
+        let err = verify_contract_bound(
+            &ev,
+            &expected("origin_macro", &plan),
+            &registry_with(&plan),
+            &trusted_observations(),
+        )
+        .unwrap_err();
         assert!(matches!(
             err,
             BehaviorOracleContractError::EquivalenceManufacture(_)
@@ -1609,9 +1788,13 @@ mod tests {
             .into();
         // Clean structured proof → still verifies (passes or NotRun, never a
         // manufacture rejection from reason text alone).
-        let out =
-            verify_contract_bound(&ev, &expected("origin_macro", &plan), &registry_with(&plan))
-                .unwrap();
+        let out = verify_contract_bound(
+            &ev,
+            &expected("origin_macro", &plan),
+            &registry_with(&plan),
+            &trusted_observations(),
+        )
+        .unwrap();
         assert_ne!(out.final_verdict, BehaviorContractVerdict::Fail);
     }
 
@@ -1632,9 +1815,13 @@ mod tests {
             ev.reason = reason.to_string();
             // Empty reason is still rejected by shape (human text must exist);
             // other variants with a clean structured proof are not manufacture.
-            let err =
-                verify_contract_bound(&ev, &expected("origin_macro", &plan), &registry_with(&plan))
-                    .err();
+            let err = verify_contract_bound(
+                &ev,
+                &expected("origin_macro", &plan),
+                &registry_with(&plan),
+                &trusted_observations(),
+            )
+            .err();
             if reason.is_empty() {
                 assert!(matches!(
                     err,
@@ -1656,9 +1843,13 @@ mod tests {
         // Structured patch state set, but reason says nothing about it.
         ev.reason = "clean run".into();
         ev.equivalence_proof.server_patch_state = Some("on".into());
-        let err =
-            verify_contract_bound(&ev, &expected("origin_macro", &plan), &registry_with(&plan))
-                .unwrap_err();
+        let err = verify_contract_bound(
+            &ev,
+            &expected("origin_macro", &plan),
+            &registry_with(&plan),
+            &trusted_observations(),
+        )
+        .unwrap_err();
         assert!(matches!(
             err,
             BehaviorOracleContractError::EquivalenceManufacture(_)
@@ -1676,9 +1867,13 @@ mod tests {
                 kind: "sample_bypass".into(),
                 equivalence_rule: Some("whatever".into()),
             });
-        let err =
-            verify_contract_bound(&ev, &expected("origin_macro", &plan), &registry_with(&plan))
-                .unwrap_err();
+        let err = verify_contract_bound(
+            &ev,
+            &expected("origin_macro", &plan),
+            &registry_with(&plan),
+            &trusted_observations(),
+        )
+        .unwrap_err();
         assert!(matches!(
             err,
             BehaviorOracleContractError::UnallowedTransform { .. }
@@ -1698,16 +1893,24 @@ mod tests {
                 equivalence_rule: Some("pe_iat_rebuild_v0".into()),
             });
         // Matching rule → clean proof, still passes (real observation bound).
-        let out =
-            verify_contract_bound(&ev, &expected("origin_macro", &plan), &registry_with(&plan))
-                .unwrap();
+        let out = verify_contract_bound(
+            &ev,
+            &expected("origin_macro", &plan),
+            &registry_with(&plan),
+            &trusted_observations(),
+        )
+        .unwrap();
         assert_eq!(out.final_verdict, BehaviorContractVerdict::Pass);
 
         // Mismatched rule → reject.
         ev.equivalence_proof.transform_ledger[0].equivalence_rule = Some("wrong_rule".into());
-        let err =
-            verify_contract_bound(&ev, &expected("origin_macro", &plan), &registry_with(&plan))
-                .unwrap_err();
+        let err = verify_contract_bound(
+            &ev,
+            &expected("origin_macro", &plan),
+            &registry_with(&plan),
+            &trusted_observations(),
+        )
+        .unwrap_err();
         assert!(matches!(
             err,
             BehaviorOracleContractError::UnallowedTransform { .. }
@@ -1724,9 +1927,13 @@ mod tests {
                 id: "raw_patch".into(),
                 description: "patched the IAT bytes directly".into(),
             });
-        let err =
-            verify_contract_bound(&ev, &expected("origin_macro", &plan), &registry_with(&plan))
-                .unwrap_err();
+        let err = verify_contract_bound(
+            &ev,
+            &expected("origin_macro", &plan),
+            &registry_with(&plan),
+            &trusted_observations(),
+        )
+        .unwrap_err();
         assert!(matches!(
             err,
             BehaviorOracleContractError::UnallowedPatch { .. }
@@ -1737,11 +1944,55 @@ mod tests {
     fn missing_observation_source_returns_not_run_not_pass() {
         let plan = default_plan_sha();
         let mut ev = valid_evidence("origin_macro", &plan);
-        ev.equivalence_proof.observation_source_hash = None;
-        let out =
-            verify_contract_bound(&ev, &expected("origin_macro", &plan), &registry_with(&plan))
-                .unwrap();
-        // Offline / no real observation → Pending, never a fabricated Pass.
+        // A well-formed but UNREGISTERED observation (self-reported Some-equivalent)
+        // is not verifier-trusted → NotRun (Pending), never a fabricated Pass.
+        ev.equivalence_proof.observation_source_hash = sha("self-reported-fake-observation");
+        ev.equivalence_proof.execution_environment_digest = sha("self-reported-fake-env");
+        let out = verify_contract_bound(
+            &ev,
+            &expected("origin_macro", &plan),
+            &registry_with(&plan),
+            &trusted_observations(),
+        )
+        .unwrap();
+        // Self-reported observation is not registered → Pending, never Pass.
+        assert_eq!(out.final_verdict, BehaviorContractVerdict::NotRun);
+    }
+
+    /// P1 issue 1: a caller self-reporting `Some(observation_hash)` must NOT
+    /// green-light a `Pass`. The observation must be registered in the
+    /// verifier-side trusted registry. This is the false-green regression test.
+    #[test]
+    fn self_reported_observation_cannot_produce_pass() {
+        let plan = default_plan_sha();
+        let mut ev = valid_evidence("origin_macro", &plan);
+        // The caller fabricates a well-formed but unregistered observation.
+        ev.equivalence_proof.observation_source_hash = sha("forged-source");
+        ev.equivalence_proof.execution_environment_digest = sha("forged-env");
+        let out = verify_contract_bound(
+            &ev,
+            &expected("origin_macro", &plan),
+            &registry_with(&plan),
+            &trusted_observations(),
+        )
+        .unwrap();
+        assert_eq!(out.final_verdict, BehaviorContractVerdict::NotRun);
+    }
+
+    /// A REGISTERED observation with a DIFFERENT environment digest is also not
+    /// trusted (the pair must match exactly).
+    #[test]
+    fn registered_observation_wrong_environment_is_not_run() {
+        let plan = default_plan_sha();
+        let mut ev = valid_evidence("origin_macro", &plan);
+        ev.equivalence_proof.execution_environment_digest = sha("different-env");
+        let out = verify_contract_bound(
+            &ev,
+            &expected("origin_macro", &plan),
+            &registry_with(&plan),
+            &trusted_observations(),
+        )
+        .unwrap();
         assert_eq!(out.final_verdict, BehaviorContractVerdict::NotRun);
     }
 
@@ -1753,9 +2004,13 @@ mod tests {
             sha256: String::new(),
             version: String::new(),
         };
-        let err =
-            verify_contract_bound(&ev, &expected("origin_macro", &plan), &registry_with(&plan))
-                .unwrap_err();
+        let err = verify_contract_bound(
+            &ev,
+            &expected("origin_macro", &plan),
+            &registry_with(&plan),
+            &trusted_observations(),
+        )
+        .unwrap_err();
         assert!(matches!(
             err,
             BehaviorOracleContractError::BadEquivalenceProof
@@ -1803,9 +2058,13 @@ mod tests {
             id: "noop".into(),
             value: "noop".into(),
         }];
-        let err =
-            verify_contract_bound(&ev, &expected("origin_macro", &plan), &registry_with(&plan))
-                .unwrap_err();
+        let err = verify_contract_bound(
+            &ev,
+            &expected("origin_macro", &plan),
+            &registry_with(&plan),
+            &trusted_observations(),
+        )
+        .unwrap_err();
         assert!(matches!(
             err,
             BehaviorOracleContractError::StimulusPlanContentMismatch { .. }
@@ -1817,9 +2076,13 @@ mod tests {
         let plan = default_plan_sha();
         let mut ev = valid_evidence("origin_macro", &plan);
         ev.stimuli[0].value = "altered-launch".into();
-        let err =
-            verify_contract_bound(&ev, &expected("origin_macro", &plan), &registry_with(&plan))
-                .unwrap_err();
+        let err = verify_contract_bound(
+            &ev,
+            &expected("origin_macro", &plan),
+            &registry_with(&plan),
+            &trusted_observations(),
+        )
+        .unwrap_err();
         assert!(matches!(
             err,
             BehaviorOracleContractError::StimulusPlanContentMismatch { .. }
@@ -1831,9 +2094,13 @@ mod tests {
         let plan = default_plan_sha();
         let mut ev = valid_evidence("origin_macro", &plan);
         ev.stimuli.pop(); // remove one stimulus
-        let err =
-            verify_contract_bound(&ev, &expected("origin_macro", &plan), &registry_with(&plan))
-                .unwrap_err();
+        let err = verify_contract_bound(
+            &ev,
+            &expected("origin_macro", &plan),
+            &registry_with(&plan),
+            &trusted_observations(),
+        )
+        .unwrap_err();
         assert!(matches!(
             err,
             BehaviorOracleContractError::StimulusPlanContentMismatch { .. }
@@ -1845,13 +2112,42 @@ mod tests {
         let plan = default_plan_sha();
         let mut ev = valid_evidence("origin_macro", &plan);
         ev.stimuli.reverse(); // reorder
-        let err =
-            verify_contract_bound(&ev, &expected("origin_macro", &plan), &registry_with(&plan))
-                .unwrap_err();
+        let err = verify_contract_bound(
+            &ev,
+            &expected("origin_macro", &plan),
+            &registry_with(&plan),
+            &trusted_observations(),
+        )
+        .unwrap_err();
         assert!(matches!(
             err,
             BehaviorOracleContractError::StimulusPlanContentMismatch { .. }
         ));
+    }
+
+    /// P5: the stimulus-plan hash is ORDER-bound — two plans running the same
+    /// stimuli in a different order produce different canonical hashes, so the
+    /// registry keys them as distinct plans (order matters for behavior).
+    #[test]
+    fn stimulus_hash_binds_order() {
+        let forward = canonical_stimuli();
+        let reversed = {
+            let mut v = canonical_stimuli();
+            v.reverse();
+            v
+        };
+        let h_forward = canonical_stimuli_hash(&forward);
+        let h_reversed = canonical_stimuli_hash(&reversed);
+        assert_ne!(
+            h_forward, h_reversed,
+            "reordering must change the canonical hash (order-bound)"
+        );
+        // Both register independently as distinct plans (no collision).
+        let mut reg = StimulusPlanRegistry::new();
+        register_stimuli(&mut reg, forward, None);
+        register_stimuli(&mut reg, reversed, None);
+        assert!(reg.plan(&h_forward).is_some());
+        assert!(reg.plan(&h_reversed).is_some());
     }
 
     #[test]
@@ -1859,9 +2155,13 @@ mod tests {
         let plan = default_plan_sha();
         let mut ev = valid_evidence("origin_macro", &plan);
         ev.stimuli[1].id = "rename".into();
-        let err =
-            verify_contract_bound(&ev, &expected("origin_macro", &plan), &registry_with(&plan))
-                .unwrap_err();
+        let err = verify_contract_bound(
+            &ev,
+            &expected("origin_macro", &plan),
+            &registry_with(&plan),
+            &trusted_observations(),
+        )
+        .unwrap_err();
         assert!(matches!(
             err,
             BehaviorOracleContractError::StimulusPlanContentMismatch { .. }
@@ -1916,7 +2216,7 @@ mod tests {
             id: "x".into(),
             value: "y".into(),
         }];
-        let err = verify_contract(&ev, &registry_with(&plan)).unwrap_err();
+        let err = verify_contract(&ev, &registry_with(&plan), &trusted_observations()).unwrap_err();
         assert!(matches!(
             err,
             BehaviorOracleContractError::StimulusPlanContentMismatch { .. }
@@ -1936,6 +2236,7 @@ mod tests {
             &reparsed,
             &expected("origin_macro", &plan),
             &registry_with(&plan),
+            &trusted_observations(),
         )
         .unwrap_err();
         assert!(matches!(

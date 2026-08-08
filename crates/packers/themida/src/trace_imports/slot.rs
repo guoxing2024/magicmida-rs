@@ -86,14 +86,6 @@ pub(crate) fn trace_one_slot(
                 DebugEvent::SingleStep { address, .. } => {
                     counter += 1;
 
-                    // Check instruction limit. `>=` (not `>`) makes the limit
-                    // "at most `limit` instructions executed": the trace stops
-                    // once `counter` reaches `limit`.
-                    if counter >= limit {
-                        log(LogMsgType::Info, "Giving up trace due to instruction limit");
-                        return Ok(());
-                    }
-
                     // Fetch latest context.
                     ctx = debugger.get_thread_context(thread_id).map_err(|e| {
                         ThemidaError::Debugger(format!(
@@ -183,6 +175,16 @@ pub(crate) fn trace_one_slot(
                     }
 
                     // ---- Continue tracing ---------------------------------
+
+                    // Check instruction limit AFTER the decision ran on this
+                    // instruction (P2 issue 6: the limit-th step is still
+                    // classified/decided, then the trace stops once `counter`
+                    // reaches `limit`). `>=` (not `>`) means "at most `limit`
+                    // instructions executed".
+                    if counter >= limit {
+                        log(LogMsgType::Info, "Giving up trace due to instruction limit");
+                        return Ok(());
+                    }
 
                     // Re-set TF so the next instruction also single-steps.
                     ctx.EFlags |= 0x100;
