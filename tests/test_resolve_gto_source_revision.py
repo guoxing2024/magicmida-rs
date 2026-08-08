@@ -10,6 +10,7 @@ import hashlib
 import importlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -141,9 +142,10 @@ class ResolverTestCase(unittest.TestCase):
         self.payload_size = len(self.real_payload)
 
     def tearDown(self):
-        # Restore any injected hooks.
+        # Restore any injected hooks and test seams.
         resolver.HASH_FILE_HOOK = None
         resolver.SIZE_HOOK = None
+        resolver.set_repo_root_for_test(None)
         self.temp.cleanup()
 
     # ---- helpers ------------------------------------------------------
@@ -936,43 +938,76 @@ class ManifestSingleReadTests(ResolverTestCase):
 
 class PathSafetyTests(ResolverTestCase):
     def test_vault_root_inside_repo_rejected(self):
-        # RepoRoot = repo; VaultRoot inside it must fail closed.
-        manifest = make_manifest(payload_sha=self.payload_sha, size=self.payload_size)
-        mpath = self.write_manifest(manifest)
+        # Simulate a repository root via the private test seam; VaultRoot inside
+        # it must fail closed. No public --RepoRoot override exists.
         repo = self.manifest_dir  # pretend this is the repo root
-        vault_inside = repo / "vault"
-        with self.assertRaises(resolver.ResolverError) as ctx:
-            resolver.resolve(
-                manifest_path=mpath,
-                case_id="gto_launcher",
-                vault_root=vault_inside,
-                evidence_dir=self.evidence,
-                source_path=None,
-                force_acquire=False,
-                retain_unmatched=False,
-                observed_revisions_dir=self.observed,
-                repo_root=repo,
-            )
-        self.assertEqual(ctx.exception.exit_code, EXIT_SOURCE_INVALID)
+        resolver.set_repo_root_for_test(repo)
+        try:
+            manifest = make_manifest(payload_sha=self.payload_sha, size=self.payload_size)
+            mpath = self.write_manifest(manifest)
+            vault_inside = repo / "vault"
+            with self.assertRaises(resolver.ResolverError) as ctx:
+                resolver.resolve(
+                    manifest_path=mpath,
+                    case_id="gto_launcher",
+                    vault_root=vault_inside,
+                    evidence_dir=self.evidence,
+                    source_path=None,
+                    force_acquire=False,
+                    retain_unmatched=False,
+                    observed_revisions_dir=self.observed,
+                )
+            self.assertEqual(ctx.exception.exit_code, EXIT_SOURCE_INVALID)
+        finally:
+            resolver.set_repo_root_for_test(None)
 
     def test_observed_dir_inside_repo_rejected(self):
-        manifest = make_manifest(payload_sha=self.payload_sha, size=self.payload_size)
-        mpath = self.write_manifest(manifest)
         repo = self.manifest_dir
-        observed_inside = repo / "observed"
-        with self.assertRaises(resolver.ResolverError) as ctx:
-            resolver.resolve(
-                manifest_path=mpath,
-                case_id="gto_launcher",
-                vault_root=self.vault_root,
-                evidence_dir=self.evidence,
-                source_path=None,
-                force_acquire=False,
-                retain_unmatched=False,
-                observed_revisions_dir=observed_inside,
-                repo_root=repo,
-            )
-        self.assertEqual(ctx.exception.exit_code, EXIT_SOURCE_INVALID)
+        resolver.set_repo_root_for_test(repo)
+        try:
+            manifest = make_manifest(payload_sha=self.payload_sha, size=self.payload_size)
+            mpath = self.write_manifest(manifest)
+            observed_inside = repo / "observed"
+            with self.assertRaises(resolver.ResolverError) as ctx:
+                resolver.resolve(
+                    manifest_path=mpath,
+                    case_id="gto_launcher",
+                    vault_root=self.vault_root,
+                    evidence_dir=self.evidence,
+                    source_path=None,
+                    force_acquire=False,
+                    retain_unmatched=False,
+                    observed_revisions_dir=observed_inside,
+                )
+            self.assertEqual(ctx.exception.exit_code, EXIT_SOURCE_INVALID)
+        finally:
+            resolver.set_repo_root_for_test(None)
+
+    def test_staging_never_inside_repo(self):
+        # The observed/staging path must also be rejected when under the repo.
+        repo = self.manifest_dir
+        resolver.set_repo_root_for_test(repo)
+        try:
+            manifest = make_manifest(payload_sha=self.payload_sha, size=self.payload_size)
+            mpath = self.write_manifest(manifest)
+            # VaultRoot outside repo, but the derived observed-revisions default
+            # would be vault_root.parent/observed-revisions (outside too). Force
+            # an observed dir inside the repo instead.
+            observed_inside = repo / "observed"
+            with self.assertRaises(resolver.ResolverError) as ctx:
+                resolver.resolve(
+                    manifest_path=mpath,
+                    case_id="gto_launcher",
+                    vault_root=self.vault_root,
+                    evidence_dir=self.evidence,
+                    source_path=self.write_source(self.real_payload),
+                    force_acquire=False,
+                    retain_unmatched=True,
+                    observed_revisions_dir=observed_inside,
+                )
+            self.assertEqual(ctx.exception.exit_code, EXIT_SOURCE_INVALID)
+        finally:
+            resolver.set_repo_root_for_test(None)
 
     def test_vault_reparse_artifact_rejected(self):
         real = self.manifest_dir / "real.bin"
@@ -1030,7 +1065,6 @@ class WrapperExitCodeTests(ResolverTestCase):
             "-VaultRoot", str(self.vault_root),
             "-EvidenceDir", str(self.evidence),
             "-CaseId", "gto_launcher",
-            "-RepoRoot", str(REPO_ROOT),
         ])
         self.assertEqual(proc.returncode, 13)
 
@@ -1042,7 +1076,6 @@ class WrapperExitCodeTests(ResolverTestCase):
             "-VaultRoot", str(self.vault_root),
             "-EvidenceDir", str(self.evidence),
             "-CaseId", "gto_launcher",
-            "-RepoRoot", str(REPO_ROOT),
         ])
         self.assertEqual(proc.returncode, 14)
 
@@ -1055,9 +1088,325 @@ class WrapperExitCodeTests(ResolverTestCase):
             "-VaultRoot", str(self.vault_root),
             "-EvidenceDir", str(self.evidence),
             "-CaseId", "gto_launcher",
-            "-RepoRoot", str(REPO_ROOT),
         ])
         self.assertEqual(proc.returncode, 0)
+
+
+# ===========================================================================
+# R1.2: authoritative repo root / retention / identity-safe cleanup / exit codes
+# ===========================================================================
+
+class AuthoritativeRepoRootTests(ResolverTestCase):
+    def test_core_derives_repo_root_from_own_location(self):
+        self.assertEqual(resolver._default_repo_root(), REPO_ROOT.resolve())
+        # No public --RepoRoot flag exists in the CLI parser (cannot forge).
+        parser = resolver._build_parser()
+        arg_names = [a.dest for a in parser._actions]
+        self.assertNotIn("RepoRoot", arg_names)
+        self.assertNotIn("repo_root", arg_names)
+
+    def test_fake_repo_root_flag_is_unknown_arg_exit_2(self):
+        # The CLI has no --RepoRoot override; passing one is a usage error only.
+        manifest = make_manifest(payload_sha=self.payload_sha, size=self.payload_size)
+        mpath = self.write_manifest(manifest)
+        proc = subprocess.run(
+            [sys.executable, str(CORE_PY),
+             "--ManifestPath", str(mpath),
+             "--VaultRoot", str(self.vault_root),
+             "--EvidenceDir", str(self.evidence),
+             "--RepoRoot", str(REPO_ROOT)],
+            capture_output=True, text=True,
+        )
+        # exit 2 = argparse usage error, NEVER a resolver status path.
+        self.assertEqual(proc.returncode, 2)
+
+    def test_cli_vault_inside_repo_exit_15(self):
+        # Create a synthetic vault inside the real repo to prove the core's own
+        # authoritative-root check fires even via the direct subprocess CLI.
+        inner = Path(tempfile.mkdtemp(prefix=".vault-inside-repo-", dir=str(REPO_ROOT)))
+        try:
+            manifest = make_manifest(payload_sha=self.payload_sha, size=self.payload_size)
+            mpath = self.write_manifest(manifest)
+            evidence2 = self.manifest_dir / "ev2"
+            evidence2.mkdir()
+            proc = subprocess.run(
+                [sys.executable, str(CORE_PY),
+                 "--ManifestPath", str(mpath),
+                 "--VaultRoot", str(inner),
+                 "--EvidenceDir", str(evidence2)],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(proc.returncode, 15)
+        finally:
+            shutil.rmtree(inner, ignore_errors=True)
+
+    def test_cli_observed_inside_repo_exit_15(self):
+        inner = Path(tempfile.mkdtemp(prefix=".obs-inside-repo-", dir=str(REPO_ROOT)))
+        try:
+            manifest = make_manifest(payload_sha=self.payload_sha, size=self.payload_size)
+            mpath = self.write_manifest(manifest)
+            source = self.write_source(self.real_payload)  # matches manifest
+            evidence2 = self.manifest_dir / "ev3"
+            evidence2.mkdir()
+            proc = subprocess.run(
+                [sys.executable, str(CORE_PY),
+                 "--ManifestPath", str(mpath),
+                 "--VaultRoot", str(self.vault_root),
+                 "--EvidenceDir", str(evidence2),
+                 "--SourcePath", str(source),
+                 "--RetainUnmatched",
+                 "--ObservedRevisionsDir", str(inner)],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(proc.returncode, 15)
+        finally:
+            shutil.rmtree(inner, ignore_errors=True)
+
+    def test_cli_omits_repo_root_still_rejects(self):
+        # The authoritative root is always derived; a vault inside it is
+        # rejected with no RepoRoot argument at all.
+        inner = Path(tempfile.mkdtemp(prefix=".vault-omit-", dir=str(REPO_ROOT)))
+        try:
+            manifest = make_manifest(payload_sha=self.payload_sha, size=self.payload_size)
+            mpath = self.write_manifest(manifest)
+            evidence2 = self.manifest_dir / "ev4"
+            evidence2.mkdir()
+            proc = subprocess.run(
+                [sys.executable, str(CORE_PY),
+                 "--ManifestPath", str(mpath),
+                 "--VaultRoot", str(inner),
+                 "--EvidenceDir", str(evidence2)],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(proc.returncode, 15)
+        finally:
+            shutil.rmtree(inner, ignore_errors=True)
+
+
+class RetentionNoRereadTests(ResolverTestCase):
+    def test_retention_archives_first_snapshot_not_later_revision(self):
+        manifest = make_manifest(payload_sha=self.payload_sha, size=self.payload_size)
+        revision_a = b"REV-A-" + b"\x00" * 40
+        source = self.write_source(revision_a)
+        sha_a = sha256b(revision_a)
+        # Count how many times the mutable locator's bytes are read.
+        reads = {"source_bytes": 0}
+
+        def counted_hash(path):
+            if path == source:
+                reads["source_bytes"] += 1
+            return resolver.sha256_file(path)
+
+        resolver.HASH_FILE_HOOK = counted_hash
+        try:
+            exit_code, _ = self.run_resolve(
+                manifest, source=source, retain_unmatched=True, observed_dir=self.observed
+            )
+            # After the primary snapshot, mutate the source to revision B.
+            source.write_bytes(b"REV-B-" + b"\x00" * 40)
+        finally:
+            resolver.HASH_FILE_HOOK = None
+        self.assertEqual(exit_code, EXIT_SAMPLE_MISMATCH)
+        # Archived object must be revision A (from the first snapshot), not B.
+        archived = self.observed / sha_a[:2] / sha_a / "artifact.exe"
+        self.assertTrue(archived.exists())
+        self.assertEqual(archived.read_bytes(), revision_a)
+        self.assertEqual(resolver.sha256_file(archived), sha_a)
+        # The mutable source must NOT have been re-snapshot after the primary
+        # H1/H2/H3 pass (retention sourced bytes from StableCopy A). The hook
+        # counts H1 and H3 (H2 reads the staging temp, not the source).
+        self.assertLessEqual(reads["source_bytes"], 2)
+
+    def test_retention_works_when_source_deleted_after_snapshot(self):
+        manifest = make_manifest(payload_sha=self.payload_sha, size=self.payload_size)
+        revision_a = b"REV-A-" + b"\x00" * 40
+        source = self.write_source(revision_a)
+        sha_a = sha256b(revision_a)
+        exit_code, _ = self.run_resolve(
+            manifest, source=source, retain_unmatched=True, observed_dir=self.observed
+        )
+        # Delete the mutable source entirely; retention must already have used
+        # the first StableCopy.
+        source.unlink()
+        self.assertEqual(exit_code, EXIT_SAMPLE_MISMATCH)
+        archived = self.observed / sha_a[:2] / sha_a / "artifact.exe"
+        self.assertTrue(archived.exists())
+        self.assertEqual(archived.read_bytes(), revision_a)
+
+    def test_archived_hash_equals_record_observed_sha256(self):
+        manifest = make_manifest(payload_sha=self.payload_sha, size=self.payload_size)
+        revision_a = b"REV-A-" + b"\x00" * 40
+        source = self.write_source(revision_a)
+        sha_a = sha256b(revision_a)
+        exit_code, _ = self.run_resolve(
+            manifest, source=source, retain_unmatched=True, observed_dir=self.observed
+        )
+        self.assertEqual(exit_code, EXIT_SAMPLE_MISMATCH)
+        rec = self.read_record()
+        self.assertEqual(rec["observed_sha256"], sha_a)
+        archived = self.observed / sha_a[:2] / sha_a / "artifact.exe"
+        self.assertEqual(resolver.sha256_file(archived), sha_a)
+        self.assertEqual(rec["observed_sha256"], resolver.sha256_file(archived))
+        self.assertTrue(rec.get("observed_archive_verified"))
+        self.assertEqual(rec["observed_archive_path"], str(archived))
+
+
+class OwnershipSafeCleanupTests(ResolverTestCase):
+    def _direct_publish(self, dest_data=None, flaky_dest_hash=False, replace_dest=None):
+        staging = self.manifest_dir / "stage.bin"
+        staging.write_bytes(self.real_payload)
+        dest = self.vault_root / "artifact.exe"
+        if dest_data is not None:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(dest_data)
+        if replace_dest is not None:
+            # A concurrent actor will swap the dest file's content after link.
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(replace_dest)
+        return staging, dest
+
+    def test_concurrent_replace_not_deleted(self):
+        staging, dest = self._direct_publish(replace_dest=b"CONCURRENT-" + b"\x00" * 40)
+        replacement = b"CONCURRENT-" + b"\x00" * 40
+        # Force post-publish rehash to fail by making dest hash differ via hook.
+        def flaky(path):
+            if path == dest:
+                return sha256b(b"BAD")
+            return resolver.sha256_file(path)
+
+        resolver.HASH_FILE_HOOK = flaky
+        try:
+            with self.assertRaises(resolver.ResolverError) as ctx:
+                resolver.publish_no_clobber(staging, dest, self.payload_sha, self.payload_size)
+        finally:
+            resolver.HASH_FILE_HOOK = None
+        self.assertEqual(ctx.exception.exit_code, EXIT_VAULT_CORRUPT)
+        # The concurrent replacement file must still exist with its bytes.
+        self.assertTrue(dest.exists())
+        self.assertEqual(dest.read_bytes(), replacement)
+
+    def test_own_link_cleaned_on_normal_rehash_failure(self):
+        staging, dest = self._direct_publish()
+        # Force post-publish rehash to fail but keep identity (same inode) ->
+        # resolver removes its own link.
+        def flaky(path):
+            if path == dest:
+                return sha256b(b"BAD")
+            return resolver.sha256_file(path)
+
+        resolver.HASH_FILE_HOOK = flaky
+        try:
+            with self.assertRaises(resolver.ResolverError) as ctx:
+                resolver.publish_no_clobber(staging, dest, self.payload_sha, self.payload_size)
+        finally:
+            resolver.HASH_FILE_HOOK = None
+        self.assertEqual(ctx.exception.exit_code, EXIT_VAULT_CORRUPT)
+        # Our own link is removed (no bad object left).
+        self.assertFalse(dest.exists())
+
+    def test_identity_comparison_error_defaults_no_delete(self):
+        staging, dest = self._direct_publish()
+        # Make _file_identity return None (identity comparison unavailable) and
+        # force rehash failure: resolver must fail closed and NOT delete.
+        orig = resolver._file_identity
+        resolver._file_identity = lambda p: None
+        resolver.HASH_FILE_HOOK = lambda p: (sha256b(b"BAD") if p == dest
+                                             else resolver.sha256_file(p))
+        try:
+            with self.assertRaises(resolver.ResolverError) as ctx:
+                resolver.publish_no_clobber(staging, dest, self.payload_sha, self.payload_size)
+        finally:
+            resolver._file_identity = orig
+            resolver.HASH_FILE_HOOK = None
+        self.assertEqual(ctx.exception.exit_code, EXIT_VAULT_CORRUPT)
+        # Identity unavailable -> must NOT have deleted dest.
+        self.assertTrue(dest.exists())
+
+
+class ExitCodeContractTests(ResolverTestCase):
+    def test_force_acquire_no_source_exit_15_not_2(self):
+        # Correct vault exists; --ForceAcquire with no SourcePath must return a
+        # documented resolver status (15), never argparse exit 2.
+        self.seed_vault(self.real_payload)
+        manifest = make_manifest(payload_sha=self.payload_sha, size=self.payload_size)
+        mpath = self.write_manifest(manifest)
+        proc = subprocess.run(
+            [sys.executable, str(CORE_PY),
+             "--ManifestPath", str(mpath),
+             "--VaultRoot", str(self.vault_root),
+             "--EvidenceDir", str(self.evidence),
+             "--ForceAcquire"],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 15)
+        self.assertNotEqual(proc.returncode, 2)
+
+    def test_manifest_missing_exit_14(self):
+        missing = self.manifest_dir / "nope.json"
+        proc = subprocess.run(
+            [sys.executable, str(CORE_PY),
+             "--ManifestPath", str(missing),
+             "--VaultRoot", str(self.vault_root),
+             "--EvidenceDir", str(self.evidence)],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 14)
+
+    def test_manifest_is_directory_exit_14(self):
+        d = self.manifest_dir / "adir"
+        d.mkdir()
+        proc = subprocess.run(
+            [sys.executable, str(CORE_PY),
+             "--ManifestPath", str(d),
+             "--VaultRoot", str(self.vault_root),
+             "--EvidenceDir", str(self.evidence)],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 14)
+
+
+class ReparseSeamTests(ResolverTestCase):
+    """Non-skippable deterministic seam tests (no filesystem symlinks needed)."""
+
+    def test_seam_vault_reparse_fails_closed(self):
+        # Monkeypatch reparse detection to True; the vault path must fail closed.
+        self.seed_vault(self.real_payload)
+        manifest = make_manifest(payload_sha=self.payload_sha, size=self.payload_size)
+        orig = resolver._is_reparse_point
+        resolver._is_reparse_point = lambda p: True
+        try:
+            exit_code, _ = self.run_resolve(manifest)
+        finally:
+            resolver._is_reparse_point = orig
+        self.assertEqual(exit_code, EXIT_VAULT_CORRUPT)
+
+    def test_seam_existing_destination_reparse_fails_closed(self):
+        staging = self.manifest_dir / "stage.bin"
+        staging.write_bytes(self.real_payload)
+        dest = self.vault_root / "dest.bin"
+        dest.write_bytes(self.real_payload)
+        orig = resolver._is_reparse_point
+        resolver._is_reparse_point = lambda p: True
+        try:
+            with self.assertRaises(resolver.ResolverError) as ctx:
+                resolver.publish_no_clobber(
+                    staging, dest, self.payload_sha, self.payload_size
+                )
+        finally:
+            resolver._is_reparse_point = orig
+        self.assertEqual(ctx.exception.exit_code, EXIT_VAULT_CORRUPT)
+
+    def test_seam_source_reparse_fails_closed(self):
+        source = self.write_source(self.real_payload)
+        manifest = make_manifest(payload_sha=self.payload_sha, size=self.payload_size)
+        orig = resolver._is_reparse_point
+        resolver._is_reparse_point = lambda p: True
+        try:
+            with self.assertRaises(resolver.ResolverError) as ctx:
+                resolver.stable_snapshot(source, self.vault_root)
+        finally:
+            resolver._is_reparse_point = orig
+        self.assertEqual(ctx.exception.exit_code, EXIT_SOURCE_INVALID)
 
 
 if __name__ == "__main__":

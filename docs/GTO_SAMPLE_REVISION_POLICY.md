@@ -183,14 +183,33 @@ a digest.
 **Storage location.** `VaultRoot` and `ObservedRevisionsDir` must be outside the
 repository root; the resolver rejects them (`SourceInvalid`) if they fall inside
 the repository, and staging is always created on the destination volume outside
-the repo.
+the repo. The repository root is derived **authoritatively by the resolver
+itself** from its own file location (there is no public `--RepoRoot` override a
+caller could use to forge a different trust root).
 
-**Path-replacement TOCTOU remains.** This resolver pins identity at snapshot
-time, but there is still a time-of-check/time-of-use window between the resolver
-recording `resolved_vault_path` and a downstream process consuming it. A
-downstream executor must re-hash the file immediately before spawn and must not
-treat the resolver alone as eliminating all TOCTOU. The digest (not the path)
-remains the authority.
+**Retention never re-reads the mutable locator.** Once the first H1/H2/H3
+snapshot produces a verified `StableCopy`, retention of an unmatched revision
+sources bytes strictly from that verified copy — never from the mutable path
+again. On a different volume the verified bytes are staged onto the observed
+volume and cross-verified (hash/size) before the no-clobber publish. The record
+reports `observed_sha256` equal to the archived object's digest, plus
+`observed_archive_path` and `observed_archive_verified`. Deleting or updating the
+mutable source after the primary snapshot does not change the archived revision.
+
+**Ownership-safe cleanup.** After a successful `os.link`, the resolver records
+the staging/destination file identity (`os.stat(follow_symlinks=False)` +
+`os.path.samestat`). If post-publish verification fails it removes the
+destination name only when the destination identity still equals the identity it
+created. If a concurrent actor replaced the destination (identity differs), or
+the identity cannot be compared, the resolver fails closed and never unlinks the
+(possibly concurrent) object.
+
+**Path-replacement TOCTOU remains.** File-identity checks narrow the window, but
+there is still a time-of-check/time-of-use gap between the resolver recording
+`resolved_vault_path` and a downstream process consuming it. A downstream
+executor must re-hash the file immediately before spawn and must not treat the
+resolver alone as eliminating all TOCTOU. The digest (not the path) remains the
+authority.
 
 ### 3.5.1 Resolver exit codes (machine-consumable)
 
@@ -201,13 +220,15 @@ remains the authority.
 | 11 | `SampleIdentityMismatch` | Stable snapshot digest/size differ from manifest. |
 | 12 | `AuthorizedRevisionUnavailable` | No authorized vault object and no (usable) mutable locator. |
 | 13 | `VaultObjectCorrupt` | Vault object exists but re-hash/size mismatch; overwrite refused. |
-| 14 | `ManifestInvalid` | Manifest failed strict validation; nothing was touched. |
-| 15 | `SourceInvalid` | Source not a regular file, or a reparse point/symlink. |
+| 14 | `ManifestInvalid` | Manifest missing, not a file, unreadable, or failed strict validation. |
+| 15 | `SourceInvalid` | Source not a regular file / reparse point, or `--ForceAcquire` without `--SourcePath`, or a storage root inside the repository. |
 | 16 | `ResolutionRecordWriteFailed` | Could not atomically write `resolved_source.json`. |
 | 17 | `InternalError` | Unexpected failure. |
 
 All failure codes are non-zero. The PowerShell wrapper returns the Python
-core's code unchanged.
+core's code unchanged. Exit code `2` is reserved **only** for argparse CLI usage
+errors (unknown flag, missing required flag); it is never produced by a normal
+resolver status path.
 
 ### 3.5.2 Success gate
 

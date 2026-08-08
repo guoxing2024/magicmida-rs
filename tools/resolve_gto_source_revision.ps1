@@ -34,9 +34,6 @@
 .PARAMETER ObservedRevisionsDir
     Directory for retained unmatched revisions.
 
-.PARAMETER RepoRoot
-    Repository root; used to reject storage roots placed inside the repository.
-
 .PARAMETER Help
     Show this help and exit.
 
@@ -65,8 +62,6 @@ param(
     [switch]$RetainUnmatched,
     [string]$ObservedRevisionsDir,
 
-    [string]$RepoRoot,
-
     [switch]$Help
 )
 
@@ -86,13 +81,11 @@ if (-not $ManifestPath -or -not $VaultRoot -or -not $EvidenceDir) {
     exit 17
 }
 
-# --- Locate repository root from this script's location ---
+# --- Locate the core beside this script. ---
+# The authoritative repository root is derived by the Python core from its own
+# location; the wrapper does NOT override it (no --RepoRoot).
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$repoRoot = Split-Path -Parent $scriptDir
 $corePy = Join-Path $scriptDir "_resolve_gto_source_revision.py"
-
-# Honor an explicit -RepoRoot, else derive from the script location.
-if (-not $RepoRoot) { $RepoRoot = $repoRoot }
 
 if (-not (Test-Path $corePy -PathType Leaf)) {
     [Console]::Error.WriteLine("resolver core not found: $corePy")
@@ -120,8 +113,7 @@ $coreArgs = @(
     "--ManifestPath", $ManifestPath,
     "--VaultRoot", $VaultRoot,
     "--EvidenceDir", $EvidenceDir,
-    "--CaseId", $CaseId,
-    "--RepoRoot", $repoRoot
+    "--CaseId", $CaseId
 )
 if ($SourcePath) { $coreArgs += @("--SourcePath", $SourcePath) }
 if ($ForceAcquire) { $coreArgs += "--ForceAcquire" }

@@ -196,7 +196,7 @@ def _size(path: Path) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Path safety helpers
+# Path safety helpers / authoritative repository root
 # ---------------------------------------------------------------------------
 
 def _is_reparse_point(path: Path) -> bool:
@@ -224,9 +224,39 @@ def _is_within(path: Path, root: Path) -> bool:
         return False
 
 
-def _assert_storage_outside_repo(storage_root: Path, repo_root: Path, what: str) -> None:
-    """Reject storage roots that live inside the repository."""
-    if repo_root is not None and _is_within(storage_root, repo_root):
+def _default_repo_root() -> Path:
+    """Authoritative repository root, derived from this module's own location.
+
+    ``tools/_resolve_gto_source_revision.py`` -> parent ``tools`` -> parent repo
+    root (e.g. ``D:\\Claude project\\magicmida-rs``).
+    """
+    return Path(__file__).resolve().parent.parent
+
+
+# Private, test-only seam. Production code never sets this; there is no public
+# --RepoRoot override. Callers cannot forge a different trust root.
+_TEST_REPO_ROOT_OVERRIDE: Optional[Path] = None
+
+
+def set_repo_root_for_test(path: Optional[Path]) -> None:
+    """Test-only seam to isolate the repository root. Not a production override.
+
+    Pass ``None`` to reset to the authoritative derivation.
+    """
+    global _TEST_REPO_ROOT_OVERRIDE
+    _TEST_REPO_ROOT_OVERRIDE = Path(path) if path is not None else None
+
+
+def _effective_repo_root() -> Path:
+    if _TEST_REPO_ROOT_OVERRIDE is not None:
+        return _TEST_REPO_ROOT_OVERRIDE
+    return _default_repo_root()
+
+
+def _assert_storage_outside_repo(storage_root: Path, what: str) -> None:
+    """Reject storage roots that live inside the authoritative repository."""
+    repo_root = _effective_repo_root()
+    if _is_within(storage_root, repo_root):
         raise ResolverError(
             EXIT_SOURCE_INVALID,
             f"{what} must not be inside the repository root: {storage_root}",
@@ -362,18 +392,33 @@ def vault_object_path(vault_root: Path, sha256: str) -> Path:
 # Atomic no-clobber publish
 # ---------------------------------------------------------------------------
 
+def _file_identity(path: Path) -> Optional[os.stat_result]:
+    """Return ``os.stat(path, follow_symlinks=False)`` or None on error."""
+    try:
+        return os.stat(path, follow_symlinks=False)
+    except OSError:
+        return None
+
+
 def publish_no_clobber(staging: Path, dest: Path, sha256: str, size: int) -> str:
     """Atomically publish ``staging`` bytes at ``dest`` without clobbering.
 
     Uses ``os.link`` (atomic hard-link create) which fails atomically with
     ``FileExistsError`` if ``dest`` already exists. No check-then-replace.
 
+    Ownership-safe cleanup: after a successful link, ``dest`` and ``staging``
+    are the same file (hard links). If post-publish verification fails we remove
+    the ``dest`` name only when its identity still equals the identity we created
+    (``os.path.samestat``). If a concurrent actor replaced ``dest``, its identity
+    differs and we never unlink it.
+
     Returns:
         "published"         - this invocation created ``dest``.
         "existing_match"    - ``dest`` already held identical bytes (idempotent).
 
     Raises ResolverError(EXIT_VAULT_CORRUPT) if ``dest`` exists with different
-    bytes, is a reparse point, or post-publish verification fails.
+    bytes, is a reparse point, was replaced concurrently, or post-publish
+    verification fails.
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -409,17 +454,48 @@ def publish_no_clobber(staging: Path, dest: Path, sha256: str, size: int) -> str
 
     # We created dest via our own hard link. Post-publish rehash.
     if _hash_file(dest) != sha256 or _size(dest) != size:
-        # Remove only the object this invocation created (we own this name).
+        _remove_own_link_or_report_replacement(staging, dest, sha256, size)
+        raise ResolverError(
+            EXIT_VAULT_CORRUPT,
+            f"vault object failed post-publish hash verification "
+            f"(expected {sha256[:12]}.../{size}) for {dest}",
+        )
+    return "published"
+
+
+def _remove_own_link_or_report_replacement(
+    staging: Path, dest: Path, expected_sha: str, expected_size: int
+) -> None:
+    """Ownership-safe cleanup after post-publish verification failure.
+
+    If ``dest`` still shares identity with the staging we linked from (the
+    hard-link name this invocation created), unlink it. If ``dest`` was replaced
+    by a concurrent actor (identity differs), never unlink; raise
+    VaultObjectCorrupt describing the replacement.
+    """
+    dest_id = _file_identity(dest)
+    staging_id = _file_identity(staging)
+    if dest_id is None or staging_id is None:
+        # Identity comparison unavailable/errored. Do not delete; fail closed.
+        raise ResolverError(
+            EXIT_VAULT_CORRUPT,
+            f"post-publish verification failed and file identity could not be "
+            f"confirmed; refusing to delete possibly-concurrent object: {dest}",
+        )
+    if os.path.samestat(dest_id, staging_id):
+        # Same inode -> the dest name is our own hard link. Remove it.
         try:
             os.unlink(dest)
         except OSError:
             pass
-        raise ResolverError(
-            EXIT_VAULT_CORRUPT,
-            f"vault object failed post-publish hash verification; "
-            f"removed our copy: {dest}",
-        )
-    return "published"
+        return
+    # Identity differs -> a concurrent actor replaced dest. Never unlink.
+    raise ResolverError(
+        EXIT_VAULT_CORRUPT,
+        f"post-publish verification failed and destination identity changed; "
+        f"destination was replaced concurrently, NOT deleting: {dest} "
+        f"(expected {expected_sha[:12]}.../{expected_size})",
+    )
 
 
 def check_existing_vault_object(
@@ -480,6 +556,36 @@ class StableCopy:
         except OSError:
             pass
         self.path = None
+
+
+def stage_copy_from(src: Path, sha256: str, size: int, staging_dir: Path) -> StableCopy:
+    """Copy an already-verified ``src`` file into a temp on ``staging_dir``.
+
+    Used to relocate a StableCopy onto another volume without re-reading the
+    mutable locator. Re-verifies the new staging's hash/size against the
+    verified source's digest/size. Raises VaultObjectCorrupt on any mismatch.
+    """
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".retain-", suffix=".tmp", dir=str(staging_dir))
+    os.close(fd)
+    tmp = Path(tmp_path)
+    try:
+        shutil.copyfile(src, tmp)
+        h = _hash_file(tmp)
+        s = _size(tmp)
+        if h != sha256 or s != size:
+            raise ResolverError(
+                EXIT_VAULT_CORRUPT,
+                f"retained staging copy failed verification "
+                f"(expected {sha256[:12]}.../{size}, got {h[:12]}.../{s})",
+            )
+        return StableCopy(tmp, sha256, size, {})
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def stable_snapshot(source: Path, staging_dir: Path) -> StableCopy:
@@ -636,18 +742,20 @@ def resolve(
     force_acquire: bool,
     retain_unmatched: bool,
     observed_revisions_dir: Optional[Path],
-    repo_root: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Resolve the authorized revision. Returns the resolved_source record dict."""
-    # Storage roots must be outside the repository.
-    _assert_storage_outside_repo(vault_root, repo_root, "VaultRoot")
+    # Storage roots must be outside the authoritative repository.
+    _assert_storage_outside_repo(vault_root, "VaultRoot")
     if observed_revisions_dir is not None:
-        _assert_storage_outside_repo(
-            observed_revisions_dir, repo_root, "ObservedRevisionsDir"
-        )
+        _assert_storage_outside_repo(observed_revisions_dir, "ObservedRevisionsDir")
 
     # Read the manifest exactly once; authority fields and digest share one buffer.
-    manifest_bytes = manifest_path.read_bytes()
+    try:
+        manifest_bytes = manifest_path.read_bytes()
+    except OSError as exc:
+        raise ResolverError(
+            EXIT_MANIFEST_INVALID, f"cannot read manifest {manifest_path}: {exc}"
+        ) from exc
     manifest_sha = sha256_bytes(manifest_bytes)
     parsed = validate_manifest_bytes(manifest_bytes, case_id)
     record = _new_record(parsed, manifest_path, source_path, manifest_sha)
@@ -683,7 +791,7 @@ def resolve(
             # Never replace the existing object.
             if source_path is None:
                 raise ResolverError(
-                    EXIT_UNAVAILABLE,
+                    EXIT_SOURCE_INVALID,
                     "--ForceAcquire requires a mutable source path",
                 )
             record["resolution_mode"] = "authorized_vault"
@@ -741,11 +849,9 @@ def resolve(
             if copy.sha256 != expected_sha or copy.size != expected_size:
                 if retain_unmatched and observed_revisions_dir is not None:
                     _archive_observed(
-                        source_path,
+                        copy,
                         observed_revisions_dir,
-                        expected_sha,
-                        expected_size,
-                        repo_root,
+                        record,
                     )
                 raise ResolverError(
                     EXIT_SAMPLE_MISMATCH,
@@ -771,26 +877,27 @@ def resolve(
 
 
 def _archive_observed(
-    source: Path,
-    observed_dir: Path,
-    expected_sha: str,
-    expected_size: int,
-    repo_root: Optional[Path],
+    verified: StableCopy, observed_dir: Path, record: Dict[str, Any]
 ) -> None:
     """Archive a stable-but-unmatched revision (non-promoting, no-clobber).
 
-    Re-snapshots the source on the observed volume so the hard-link publish
-    stays on one volume. Verifies the existing observed object is identical
-    (idempotent) or fail-closed on difference; never overwrites.
+    Sources bytes strictly from the already-verified ``verified`` StableCopy
+    (the first H1/H2/H3 snapshot); the mutable locator is never re-read. On a
+    different volume the verified bytes are staged onto the observed volume and
+    cross-verified before the no-clobber publish. Never overwrites.
     """
-    _assert_storage_outside_repo(observed_dir, repo_root, "ObservedRevisionsDir")
-    # Fresh stable copy on the observed volume.
-    copy = stable_snapshot(source, observed_dir)
+    _assert_storage_outside_repo(observed_dir, "ObservedRevisionsDir")
+    # Stage from the verified copy onto the observed volume, then no-clobber
+    # publish. This never re-opens the mutable locator.
+    staged = stage_copy_from(verified.path, verified.sha256, verified.size, observed_dir)
     try:
-        dest = observed_dir / copy.sha256[:2] / copy.sha256 / "artifact.exe"
-        publish_no_clobber(copy.path, dest, copy.sha256, copy.size)
+        dest = observed_dir / verified.sha256[:2] / verified.sha256 / "artifact.exe"
+        publish_no_clobber(staged.path, dest, verified.sha256, verified.size)
     finally:
-        copy.discard()
+        staged.discard()
+    # Record the archived object identity (equals the first snapshot digest).
+    record["observed_archive_path"] = str(dest)
+    record["observed_archive_verified"] = True
 
 
 # ---------------------------------------------------------------------------
@@ -811,7 +918,6 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--VaultRoot", required=True, help="content-addressed vault root")
     p.add_argument("--EvidenceDir", required=True, help="output dir for resolved_source.json")
     p.add_argument("--SourcePath", default=None, help="mutable acquisition locator (optional)")
-    p.add_argument("--RepoRoot", default=None, help="repository root (rejects storage inside it)")
     p.add_argument(
         "--ForceAcquire",
         action="store_true",
@@ -840,14 +946,17 @@ def main(argv: Optional[list] = None) -> int:
         vault_root = Path(args.VaultRoot)
         evidence_dir = Path(args.EvidenceDir)
         source_path = Path(args.SourcePath) if args.SourcePath else None
-        repo_root = Path(args.RepoRoot) if args.RepoRoot else None
         observed_dir = (
             Path(args.ObservedRevisionsDir) if args.ObservedRevisionsDir else None
         )
         if args.RetainUnmatched and observed_dir is None:
             observed_dir = vault_root.parent / "observed-revisions"
         if args.ForceAcquire and source_path is None:
-            parser.error("--ForceAcquire requires --SourcePath")
+            # Documented resolver state, not a CLI usage error (exit 2).
+            raise ResolverError(
+                EXIT_SOURCE_INVALID,
+                "--ForceAcquire requires --SourcePath (SourceInvalid)",
+            )
 
         resolve(
             manifest_path=manifest_path,
@@ -858,7 +967,6 @@ def main(argv: Optional[list] = None) -> int:
             force_acquire=args.ForceAcquire,
             retain_unmatched=args.RetainUnmatched,
             observed_revisions_dir=observed_dir,
-            repo_root=repo_root,
         )
         return EXIT_OK
     except ResolverError as exc:
