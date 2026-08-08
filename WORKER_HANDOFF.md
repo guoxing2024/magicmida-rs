@@ -1,5 +1,42 @@
 # WORKER_HANDOFF — operational takeover 2026-07-29 (1 of 2 samples)
 
+## CRITICAL SAMPLE IDENTITY RULE — mutable GTO path (2026-08-08)
+
+> `D:\Tools\RE\dumps\gto\启动器.exe` is mutable and may auto-update. Never
+> trust it by path or filename. Snapshot it, verify stability, resolve by
+> SHA-256, and run only the manifest-authorized immutable vault object.
+
+Binding rules for every future worker:
+
+- `lab/cases/v2/gto_launcher.json` is the revision identity authority.
+- The mutable path is discovery/input convenience only.
+- Resolve the manifest-authorized immutable vault object first
+  (`tools/resolve_gto_source_revision.ps1`); do not re-read the mutable path
+  when the authorized vault object already verifies.
+- Every live/evidence workspace must first contain `resolved_source.json` with
+  observed/expected SHA-256 and size, manifest revision, immutable vault path,
+  source-stability result, and `revision_match`.
+- Live commands consume the resolved vault path, never the mutable path.
+- Live-round budget starts only after `resolved_source.json` reports both source
+  stability and an exact revision match. Identity mismatch/update races are
+  preflight stops, not bootstrap/runtime executions, and must be ledgered
+  separately for all future routes.
+- A mismatch stops before build/unpack/launch and is reported as
+  `SampleIdentityMismatch`, not a recovery-code failure.
+- A source that changes during copy/hash is `SourceChangedDuringSnapshot` and
+  must not be executed.
+- A new digest is a new revision. Do not update the manifest merely to make a
+  preflight pass; promotion requires a dedicated reviewed manifest revision and
+  separately authorized live route.
+
+Exit codes and full procedure:
+`docs/GTO_SAMPLE_REVISION_POLICY.md`.
+
+Route I R1 on 2026-08-08 stopped correctly at preflight because the mutable path
+contained `bd7366d6...` / 13,373,952 bytes instead of the manifest-authorized
+`4d5770af...` / 8,583,680-byte revision. No sample or candidate was executed, so
+that round produced no bootstrap/OEP/UI/script result.
+
 ## Strategic role update (2026-08-01)
 
 **The repository's primary long-term line is `gto_launcher`.** The Oreans pair

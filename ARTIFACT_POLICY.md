@@ -15,6 +15,34 @@ The following must not exist anywhere in the active worktree:
 
 Store retained binaries outside the repository by SHA-256. Source-controlled manifests may refer to a vault object by its digest, size, role, and provenance, but must not contain a machine-specific absolute path or claim that an artifact is accepted/perfect without validation evidence.
 
+## Mutable external source paths
+
+An external path can be a mutable acquisition locator and must never be treated
+as artifact identity. In particular, `D:\Tools\RE\dumps\gto\启动器.exe` may
+auto-update or be replaced without notice. Before any sample-derived task:
+
+1. Resolve the manifest-authorized immutable vault object first; if it exists and
+   re-verifies, do not re-read the mutable path.
+2. Only when the authorized vault object is absent, hash and size the source,
+   copy it to a temporary external file, hash both the copy and source again,
+   and require all observations to match (H1/H2/H3 stable copy).
+3. Resolve the stable copy into the external content-addressed vault by SHA-256.
+4. Compare the vault object with the source-controlled case manifest digest and
+   size.
+5. Run only the verified vault path recorded in a per-run `resolved_source.json`;
+   never re-open the mutable locator after validation.
+6. Fail closed on `SourceChangedDuringSnapshot`, `SampleIdentityMismatch`, or
+   `AuthorizedRevisionUnavailable`.
+
+This is automated by `tools/resolve_gto_source_revision.ps1` /
+`tools/_resolve_gto_source_revision.py`; see
+`docs/GTO_SAMPLE_REVISION_POLICY.md`.
+
+A newly observed digest is a new revision. It does not supersede the manifest
+until a dedicated reviewed commit increments the manifest revision and records
+new authority. See
+[docs/GTO_SAMPLE_REVISION_POLICY.md](docs/GTO_SAMPLE_REVISION_POLICY.md).
+
 ## Binary fixture exception
 
 A `.bin` file is allowed only when all of the following are true:

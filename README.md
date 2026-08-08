@@ -14,6 +14,25 @@ Strategically, the primary long-term target is `gto_launcher`
 `lunlun_software` pair remains the active regression gate, but GTO is now a
 first-class support line, not a side quest.
 
+### Mutable GTO acquisition path (mandatory)
+
+`D:\Tools\RE\dumps\gto\启动器.exe` is a **mutable locator**, not a sample
+identity. The file may auto-update or be replaced without notice. Never run it
+because its path or filename matches. Before any build, unpack, or live route,
+resolve the bytes to an immutable vault object and compare it with the pinned
+`protected_input` in `lab/cases/v2/gto_launcher.json`. Execute only the matching
+vault object. A mismatch is `SampleIdentityMismatch` and must stop before
+execution; a new digest requires a separately reviewed manifest revision.
+
+Resolution is automated by a fail-closed preflight resolver:
+`tools/resolve_gto_source_revision.ps1` (core
+`tools/_resolve_gto_source_revision.py`). It resolves the manifest-authorized
+vault object first and never re-reads the mutable path when the authorized
+vault object already verifies. Exit codes are machine-consumable (see
+`docs/GTO_SAMPLE_REVISION_POLICY.md` §3.5).
+
+See [docs/GTO_SAMPLE_REVISION_POLICY.md](docs/GTO_SAMPLE_REVISION_POLICY.md).
+
 ## Repository scope
 
 The active repository contains only:
