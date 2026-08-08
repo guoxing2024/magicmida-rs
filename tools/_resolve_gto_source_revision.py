@@ -8,7 +8,8 @@ Authority model
 ---------------
 1.  ``lab/cases/v2/<case_id>.json`` is the identity authority. The authorized
     protected_input digest+size come ONLY from the manifest after strict
-    validation.
+    validation, and the manifest is read exactly once (the authority fields and
+    the recorded manifest digest come from the same byte buffer).
 2.  A content-addressed vault object (by SHA-256) that reproduces that digest
     and size is the immutable, executable source.
 3.  The mutable acquisition path is a locator, never an identity. It is read
@@ -20,7 +21,18 @@ Modes
 - authorized_vault  : resolve an existing, re-hashed vault object; do not read
                       the mutable locator.
 - mutable_snapshot  : stable-copy the mutable locator (H1/H2/H3), verify it
-                      matches the manifest, then place it in the vault.
+                      matches the manifest, then no-clobber publish it into the
+                      vault.
+
+Promotion contract
+------------------
+Vault and observed-revision artifact promotion is atomic and no-clobber. We use
+an atomic hard-link publish (``os.link``) which fails atomically if the
+destination exists. We never ``os.replace`` an existing artifact and never use a
+check-then-replace pattern. If the destination already exists it is verified
+(idempotent when identical, ``VaultObjectCorrupt`` when different) and never
+overwritten. Post-publish verification failure removes only the object this
+invocation created.
 
 Exit codes (stable, machine-consumable):
     0   ResolvedAuthorizedRevision
@@ -90,12 +102,19 @@ RESOLVED_SCHEMA = "mida.resolved-source/v1"
 
 
 class ResolverError(Exception):
-    """Carries an exit code (and optional detail)."""
+    """Carries an exit code, optional detail, and optional structured data."""
 
-    def __init__(self, exit_code: int, detail: str) -> None:
+    def __init__(
+        self,
+        exit_code: int,
+        detail: str,
+        *,
+        observations: Optional[Dict[str, Any]] = None,
+    ) -> None:
         super().__init__(detail)
         self.exit_code = exit_code
         self.detail = detail
+        self.observations = observations
 
     @property
     def status(self) -> str:
@@ -115,12 +134,8 @@ def _reject_duplicate_keys(pairs):
     return result
 
 
-def _load_json_strict(path: Path) -> Dict[str, Any]:
-    """Load JSON rejecting duplicate keys and malformed input."""
-    try:
-        raw = path.read_bytes()
-    except OSError as exc:
-        raise ValueError(f"cannot read manifest: {exc}") from exc
+def _parse_json_bytes(raw: bytes) -> Dict[str, Any]:
+    """Strictly parse a JSON document from bytes (rejects dup keys, trailing junk)."""
     decoder = json.JSONDecoder(object_pairs_hook=_reject_duplicate_keys)
     try:
         text = raw.decode("utf-8-sig")
@@ -129,7 +144,6 @@ def _load_json_strict(path: Path) -> Dict[str, Any]:
         raise ValueError(f"malformed JSON: {exc}") from exc
     if not isinstance(value, dict):
         raise ValueError("manifest root must be a JSON object")
-    # raw_decode stops at the first value; reject trailing non-whitespace.
     if _end != len(text):
         remainder = text[_end:].strip()
         if remainder:
@@ -147,10 +161,6 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: fh.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
-
-
-def sha256_text(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -186,17 +196,55 @@ def _size(path: Path) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Manifest validation
+# Path safety helpers
 # ---------------------------------------------------------------------------
 
-def validate_manifest(manifest_path: Path, case_id: str) -> Dict[str, Any]:
-    """Return validated manifest fields. Raises ResolverError on any violation."""
-    if not manifest_path.exists():
-        raise ResolverError(
-            EXIT_MANIFEST_INVALID, f"manifest path does not exist: {manifest_path}"
-        )
+def _is_reparse_point(path: Path) -> bool:
+    if path.is_symlink():
+        return True
     try:
-        manifest = _load_json_strict(manifest_path)
+        import ctypes
+
+        FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+        attrs = ctypes.windll.kernel32.GetFileAttributesW(str(path))
+        if attrs == 0xFFFFFFFF:
+            return False
+        return bool(attrs & FILE_ATTRIBUTE_REPARSE_POINT)
+    except Exception:  # pragma: no cover - non-Windows fallback
+        return False
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    """True if ``path`` is ``root`` itself or lies under it."""
+    try:
+        rp = root.resolve()
+        pp = path.resolve()
+        return pp == rp or rp in pp.parents
+    except OSError:
+        return False
+
+
+def _assert_storage_outside_repo(storage_root: Path, repo_root: Path, what: str) -> None:
+    """Reject storage roots that live inside the repository."""
+    if repo_root is not None and _is_within(storage_root, repo_root):
+        raise ResolverError(
+            EXIT_SOURCE_INVALID,
+            f"{what} must not be inside the repository root: {storage_root}",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Manifest validation (single-read binding)
+# ---------------------------------------------------------------------------
+
+def validate_manifest_bytes(data: bytes, case_id: str) -> Dict[str, Any]:
+    """Strictly validate a manifest already held in memory.
+
+    ``data`` is the single source of truth: both the authority fields and any
+    caller-computed digest must come from this same byte buffer.
+    """
+    try:
+        manifest = _parse_json_bytes(data)
     except ValueError as exc:
         raise ResolverError(EXIT_MANIFEST_INVALID, str(exc)) from exc
 
@@ -281,12 +329,22 @@ def validate_manifest(manifest_path: Path, case_id: str) -> Dict[str, Any]:
         )
 
     return {
-        "manifest": manifest,
         "case_id": case_id,
         "manifest_revision": rev,
         "expected_sha256": protected_sha,
         "expected_size_bytes": size,
     }
+
+
+def validate_manifest(manifest_path: Path, case_id: str) -> Dict[str, Any]:
+    """Read-once convenience wrapper used by CLI/tests."""
+    try:
+        data = manifest_path.read_bytes()
+    except OSError as exc:
+        raise ResolverError(
+            EXIT_MANIFEST_INVALID, f"cannot read manifest: {exc}"
+        ) from exc
+    return validate_manifest_bytes(data, case_id)
 
 
 # ---------------------------------------------------------------------------
@@ -300,19 +358,92 @@ def vault_object_path(vault_root: Path, sha256: str) -> Path:
     return vault_root / "sha256" / sha256[:2] / sha256 / "artifact.exe"
 
 
-def _is_reparse_point(path: Path) -> bool:
-    if path.is_symlink():
-        return True
-    try:
-        import ctypes
+# ---------------------------------------------------------------------------
+# Atomic no-clobber publish
+# ---------------------------------------------------------------------------
 
-        FILE_ATTRIBUTE_REPARSE_POINT = 0x400
-        attrs = ctypes.windll.kernel32.GetFileAttributesW(str(path))
-        if attrs == 0xFFFFFFFF:
-            return False
-        return bool(attrs & FILE_ATTRIBUTE_REPARSE_POINT)
-    except Exception:  # pragma: no cover - non-Windows fallback
-        return False
+def publish_no_clobber(staging: Path, dest: Path, sha256: str, size: int) -> str:
+    """Atomically publish ``staging`` bytes at ``dest`` without clobbering.
+
+    Uses ``os.link`` (atomic hard-link create) which fails atomically with
+    ``FileExistsError`` if ``dest`` already exists. No check-then-replace.
+
+    Returns:
+        "published"         - this invocation created ``dest``.
+        "existing_match"    - ``dest`` already held identical bytes (idempotent).
+
+    Raises ResolverError(EXIT_VAULT_CORRUPT) if ``dest`` exists with different
+    bytes, is a reparse point, or post-publish verification fails.
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.link(staging, dest)
+    except FileExistsError:
+        # Destination already exists. Verify it; never overwrite.
+        if not dest.is_file():
+            raise ResolverError(
+                EXIT_VAULT_CORRUPT,
+                f"existing destination is not a regular file; refusing: {dest}",
+            )
+        if _is_reparse_point(dest):
+            raise ResolverError(
+                EXIT_VAULT_CORRUPT,
+                f"existing destination is a reparse point; refusing: {dest}",
+            )
+        existing_sha = _hash_file(dest)
+        existing_size = _size(dest)
+        if existing_sha == sha256 and existing_size == size:
+            return "existing_match"
+        raise ResolverError(
+            EXIT_VAULT_CORRUPT,
+            f"existing destination differs "
+            f"(expected {sha256[:12]}.../{size}, "
+            f"got {existing_sha[:12] if existing_sha else '?'}/"
+            f"{existing_size if existing_size is not None else '?'}); "
+            f"refusing to overwrite: {dest}",
+        )
+    except OSError as exc:
+        raise ResolverError(
+            EXIT_VAULT_CORRUPT, f"atomic publish failed for {dest}: {exc}"
+        ) from exc
+
+    # We created dest via our own hard link. Post-publish rehash.
+    if _hash_file(dest) != sha256 or _size(dest) != size:
+        # Remove only the object this invocation created (we own this name).
+        try:
+            os.unlink(dest)
+        except OSError:
+            pass
+        raise ResolverError(
+            EXIT_VAULT_CORRUPT,
+            f"vault object failed post-publish hash verification; "
+            f"removed our copy: {dest}",
+        )
+    return "published"
+
+
+def check_existing_vault_object(
+    vault_path: Path, expected_sha: str, expected_size: int
+) -> Tuple[bool, Optional[str], Optional[int]]:
+    """Return (present, sha_or_None, size_or_None) for an existing vault object.
+
+    Raises VaultObjectCorrupt if present but not a regular file / is a reparse.
+    """
+    if not vault_path.exists():
+        return False, None, None
+    if not vault_path.is_file():
+        raise ResolverError(
+            EXIT_VAULT_CORRUPT,
+            f"vault object not a regular file: {vault_path}",
+        )
+    if _is_reparse_point(vault_path):
+        raise ResolverError(
+            EXIT_VAULT_CORRUPT,
+            f"vault object is a reparse point; refusing: {vault_path}",
+        )
+    obj_sha = _hash_file(vault_path)
+    obj_size = _size(vault_path)
+    return True, obj_sha, obj_size
 
 
 # ---------------------------------------------------------------------------
@@ -323,18 +454,24 @@ class StableCopy:
     """A verified stable temp copy of the mutable source.
 
     ``path`` holds bytes verified to satisfy H1==H2==H3 and all sizes equal.
-    Caller owns cleanup via ``discard()`` or promotion via ``promote_to``.
+    Caller owns cleanup via ``discard()`` or promotion via ``publish_no_clobber``.
     """
 
-    __slots__ = ("path", "sha256", "size")
+    __slots__ = ("path", "sha256", "size", "observations")
 
-    def __init__(self, path: Path, sha256: str, size: int) -> None:
+    def __init__(
+        self,
+        path: Path,
+        sha256: str,
+        size: int,
+        observations: Dict[str, Any],
+    ) -> None:
         self.path = path
         self.sha256 = sha256
         self.size = size
+        self.observations = observations
 
     def discard(self) -> None:
-        # Consumed copies (path is None after promotion) are left in place.
         if self.path is None:
             return
         try:
@@ -344,24 +481,15 @@ class StableCopy:
             pass
         self.path = None
 
-    def promote_to(self, dest: Path) -> None:
-        """Atomically move the verified bytes into place, then re-hash."""
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        os.replace(self.path, dest)
-        if _hash_file(dest) != self.sha256 or _size(dest) != self.size:
-            raise ResolverError(
-                EXIT_VAULT_CORRUPT,
-                f"vault object failed post-write hash verification: {dest}",
-            )
-        self.path = None  # consumed; discard becomes a no-op
-
 
 def stable_snapshot(source: Path, staging_dir: Path) -> StableCopy:
     """Stable-copy ``source`` into a random temp file under ``staging_dir``.
 
     H1/S1 from source, copy, H2/S2 from the copy, H3/S3 from the source again.
-    Require all equal. Returns a verified StableCopy (temp file) whose bytes
-    satisfy the checks. Raises ResolverError on invalid source or change.
+    Require all equal. Returns a verified StableCopy whose bytes satisfy the
+    checks, plus the full H1/H2/H3/S1/S2/S3 observation set. Raises
+    ResolverError(EXIT_SOURCE_CHANGED) with those observations when the source
+    changes during the copy.
     """
     if not source.exists():
         raise ResolverError(
@@ -392,13 +520,15 @@ def stable_snapshot(source: Path, staging_dir: Path) -> StableCopy:
         h3 = _hash_file(source)
         s3 = _size(source)
 
+        observations = {"h1": h1, "h2": h2, "h3": h3, "s1": s1, "s2": s2, "s3": s3}
         if not (h1 == h2 == h3 and s1 == s2 == s3):
             raise ResolverError(
                 EXIT_SOURCE_CHANGED,
                 f"source changed during snapshot (H=[{h1[:8]}..,{h2[:8]}..,{h3[:8]}..] "
                 f"S=[{s1},{s2},{s3}])",
+                observations=observations,
             )
-        return StableCopy(tmp, h1, s1)
+        return StableCopy(tmp, h1, s1, observations)
     except BaseException:
         try:
             os.unlink(tmp)
@@ -437,8 +567,9 @@ def utc_now() -> str:
 
 
 def tool_sha256() -> str:
+    """SHA-256 of the raw bytes of this core module."""
     try:
-        return sha256_text(Path(__file__).read_text(encoding="utf-8"))
+        return sha256_bytes(Path(__file__).read_bytes())
     except OSError:
         return ""
 
@@ -489,6 +620,12 @@ def _new_record(parsed, manifest_path, source_path, manifest_sha) -> Dict[str, A
     }
 
 
+def _set_source_changed(record: Dict[str, Any], exc: ResolverError) -> None:
+    record["source_stable_during_snapshot"] = False
+    if exc.observations:
+        record["snapshot_observation"] = exc.observations
+
+
 def resolve(
     *,
     manifest_path: Path,
@@ -499,48 +636,95 @@ def resolve(
     force_acquire: bool,
     retain_unmatched: bool,
     observed_revisions_dir: Optional[Path],
+    repo_root: Optional[Path] = None,
 ) -> Dict[str, Any]:
-    parsed = validate_manifest(manifest_path, case_id)
-    manifest_sha = sha256_bytes(manifest_path.read_bytes())
+    """Resolve the authorized revision. Returns the resolved_source record dict."""
+    # Storage roots must be outside the repository.
+    _assert_storage_outside_repo(vault_root, repo_root, "VaultRoot")
+    if observed_revisions_dir is not None:
+        _assert_storage_outside_repo(
+            observed_revisions_dir, repo_root, "ObservedRevisionsDir"
+        )
+
+    # Read the manifest exactly once; authority fields and digest share one buffer.
+    manifest_bytes = manifest_path.read_bytes()
+    manifest_sha = sha256_bytes(manifest_bytes)
+    parsed = validate_manifest_bytes(manifest_bytes, case_id)
     record = _new_record(parsed, manifest_path, source_path, manifest_sha)
     expected_sha = parsed["expected_sha256"]
     expected_size = parsed["expected_size_bytes"]
     vault_path = vault_object_path(vault_root, expected_sha)
 
     try:
-        # --- Mode A: authorized vault-first (default) ---
-        if not force_acquire:
-            if vault_path.exists():
-                if not vault_path.is_file():
-                    raise ResolverError(
-                        EXIT_VAULT_CORRUPT,
-                        f"vault object not a regular file: {vault_path}",
-                    )
-                obj_sha = _hash_file(vault_path)
-                obj_size = _size(vault_path)
-                if obj_sha == expected_sha and obj_size == expected_size:
-                    record.update(
-                        {
-                            "resolution_mode": "authorized_vault",
-                            "resolved_vault_path": str(vault_path),
-                            "observed_sha256": obj_sha,
-                            "observed_size_bytes": obj_size,
-                            "source_stable_during_snapshot": None,
-                            "vault_object_verified": True,
-                            "revision_match": True,
-                            "resolution_status": STATUS_RESOLVED,
-                        }
-                    )
-                    return _finalize_record(record, evidence_dir)
-                raise ResolverError(
-                    EXIT_VAULT_CORRUPT,
-                    f"vault object exists but content mismatch "
-                    f"(expected {expected_sha[:12]}.../{expected_size}, "
-                    f"got {obj_sha[:12] if obj_sha else '?'}/{obj_size if obj_size is not None else '?'}); "
-                    f"refusing to overwrite: {vault_path}",
-                )
+        # --- Always inspect the existing vault object (integrity first). ---
+        present, obj_sha, obj_size = check_existing_vault_object(
+            vault_path, expected_sha, expected_size
+        )
 
-        # --- Mode B: mutable acquisition (only when vault absent or forced) ---
+        if present and obj_sha == expected_sha and obj_size == expected_size:
+            # Correct existing object.
+            if not force_acquire:
+                record.update(
+                    {
+                        "resolution_mode": "authorized_vault",
+                        "resolved_vault_path": str(vault_path),
+                        "observed_sha256": obj_sha,
+                        "observed_size_bytes": obj_size,
+                        "source_stable_during_snapshot": None,
+                        "vault_object_verified": True,
+                        "revision_match": True,
+                        "resolution_status": STATUS_RESOLVED,
+                    }
+                )
+                return _finalize_record(record, evidence_dir)
+
+            # --ForceAcquire: verify the source, then cross-verify the source
+            # against the existing correct object and DISCARD the snapshot.
+            # Never replace the existing object.
+            if source_path is None:
+                raise ResolverError(
+                    EXIT_UNAVAILABLE,
+                    "--ForceAcquire requires a mutable source path",
+                )
+            record["resolution_mode"] = "authorized_vault"
+            copy = stable_snapshot(source_path, vault_root)
+            try:
+                record["source_stable_during_snapshot"] = True
+                record["observed_sha256"] = copy.sha256
+                record["observed_size_bytes"] = copy.size
+                if copy.sha256 != expected_sha or copy.size != expected_size:
+                    raise ResolverError(
+                        EXIT_SAMPLE_MISMATCH,
+                        f"stable snapshot does not match manifest "
+                        f"(got {copy.sha256[:12]}.../{copy.size}, "
+                        f"expected {expected_sha[:12]}.../{expected_size})",
+                    )
+                # Cross-verified; keep the existing object, discard our snapshot.
+                record.update(
+                    {
+                        "resolved_vault_path": str(vault_path),
+                        "vault_object_verified": True,
+                        "revision_match": True,
+                        "resolution_status": STATUS_RESOLVED,
+                    }
+                )
+                return _finalize_record(record, evidence_dir)
+            finally:
+                copy.discard()
+
+        if present:
+            # present but corrupt/different -> VaultObjectCorrupt (also with
+            # --ForceAcquire; ForceAcquire must not bypass integrity).
+            raise ResolverError(
+                EXIT_VAULT_CORRUPT,
+                f"vault object exists but content mismatch "
+                f"(expected {expected_sha[:12]}.../{expected_size}, "
+                f"got {obj_sha[:12] if obj_sha else '?'}/"
+                f"{obj_size if obj_size is not None else '?'}); "
+                f"refusing to overwrite: {vault_path}",
+            )
+
+        # --- Vault absent: mutable acquisition with no-clobber publish. ---
         if source_path is None:
             raise ResolverError(
                 EXIT_UNAVAILABLE,
@@ -556,7 +740,13 @@ def resolve(
 
             if copy.sha256 != expected_sha or copy.size != expected_size:
                 if retain_unmatched and observed_revisions_dir is not None:
-                    _archive_observed(copy, observed_revisions_dir, vault_root)
+                    _archive_observed(
+                        source_path,
+                        observed_revisions_dir,
+                        expected_sha,
+                        expected_size,
+                        repo_root,
+                    )
                 raise ResolverError(
                     EXIT_SAMPLE_MISMATCH,
                     f"stable snapshot does not match manifest "
@@ -564,7 +754,7 @@ def resolve(
                     f"expected {expected_sha[:12]}.../{expected_size})",
                 )
 
-            copy.promote_to(vault_path)
+            publish_no_clobber(copy.path, vault_path, copy.sha256, copy.size)
             record["resolved_vault_path"] = str(vault_path)
             record["vault_object_verified"] = True
             record["revision_match"] = True
@@ -574,20 +764,33 @@ def resolve(
             copy.discard()
     except ResolverError as exc:
         record["resolution_status"] = exc.status
+        if exc.exit_code == EXIT_SOURCE_CHANGED:
+            _set_source_changed(record, exc)
         _finalize_record(record, evidence_dir)
         raise
 
 
-def _archive_observed(copy: StableCopy, observed_dir: Path, vault_root: Path) -> None:
-    """Archive a stable-but-unmatched revision (non-promoting, no overwrite)."""
-    dest = observed_dir / copy.sha256[:2] / copy.sha256 / "artifact.exe"
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    if dest.exists():
-        raise ResolverError(
-            EXIT_VAULT_CORRUPT,
-            f"observed revision path already present; refusing overwrite: {dest}",
-        )
-    copy.promote_to(dest)
+def _archive_observed(
+    source: Path,
+    observed_dir: Path,
+    expected_sha: str,
+    expected_size: int,
+    repo_root: Optional[Path],
+) -> None:
+    """Archive a stable-but-unmatched revision (non-promoting, no-clobber).
+
+    Re-snapshots the source on the observed volume so the hard-link publish
+    stays on one volume. Verifies the existing observed object is identical
+    (idempotent) or fail-closed on difference; never overwrites.
+    """
+    _assert_storage_outside_repo(observed_dir, repo_root, "ObservedRevisionsDir")
+    # Fresh stable copy on the observed volume.
+    copy = stable_snapshot(source, observed_dir)
+    try:
+        dest = observed_dir / copy.sha256[:2] / copy.sha256 / "artifact.exe"
+        publish_no_clobber(copy.path, dest, copy.sha256, copy.size)
+    finally:
+        copy.discard()
 
 
 # ---------------------------------------------------------------------------
@@ -608,10 +811,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--VaultRoot", required=True, help="content-addressed vault root")
     p.add_argument("--EvidenceDir", required=True, help="output dir for resolved_source.json")
     p.add_argument("--SourcePath", default=None, help="mutable acquisition locator (optional)")
+    p.add_argument("--RepoRoot", default=None, help="repository root (rejects storage inside it)")
     p.add_argument(
         "--ForceAcquire",
         action="store_true",
-        help="read the mutable locator even if an authorized vault object exists",
+        help="verify the mutable source even if an authorized vault object exists "
+        "(never overwrites the existing object)",
     )
     p.add_argument(
         "--RetainUnmatched",
@@ -635,6 +840,7 @@ def main(argv: Optional[list] = None) -> int:
         vault_root = Path(args.VaultRoot)
         evidence_dir = Path(args.EvidenceDir)
         source_path = Path(args.SourcePath) if args.SourcePath else None
+        repo_root = Path(args.RepoRoot) if args.RepoRoot else None
         observed_dir = (
             Path(args.ObservedRevisionsDir) if args.ObservedRevisionsDir else None
         )
@@ -652,6 +858,7 @@ def main(argv: Optional[list] = None) -> int:
             force_acquire=args.ForceAcquire,
             retain_unmatched=args.RetainUnmatched,
             observed_revisions_dir=observed_dir,
+            repo_root=repo_root,
         )
         return EXIT_OK
     except ResolverError as exc:

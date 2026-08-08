@@ -669,5 +669,396 @@ class RetentionTests(ResolverTestCase):
         )
 
 
+# ===========================================================================
+# R1.1: no-clobber promotion primitives
+# ===========================================================================
+
+class NoClobberPublishTests(ResolverTestCase):
+    """Direct tests of the atomic hard-link publish primitive."""
+
+    def test_publish_no_clobber_creates_new(self):
+        staging = self.manifest_dir / "staging.bin"
+        staging.write_bytes(self.real_payload)
+        dest = self.vault_root / "dest.bin"
+        result = resolver.publish_no_clobber(
+            staging, dest, self.payload_sha, self.payload_size
+        )
+        self.assertEqual(result, "published")
+        self.assertTrue(dest.exists())
+        self.assertEqual(resolver.sha256_file(dest), self.payload_sha)
+
+    def test_publish_no_clobber_existing_identical_is_idempotent(self):
+        staging = self.manifest_dir / "staging.bin"
+        staging.write_bytes(self.real_payload)
+        dest = self.vault_root / "dest.bin"
+        dest.write_bytes(self.real_payload)
+        result = resolver.publish_no_clobber(
+            staging, dest, self.payload_sha, self.payload_size
+        )
+        self.assertEqual(result, "existing_match")
+        # bytes unchanged (no clobber)
+        self.assertEqual(dest.read_bytes(), self.real_payload)
+
+    def test_publish_no_clobber_existing_different_is_corrupt_and_not_overwritten(self):
+        staging = self.manifest_dir / "staging.bin"
+        staging.write_bytes(self.real_payload)
+        dest = self.vault_root / "dest.bin"
+        dest.write_bytes(b"\x00" * self.payload_size)  # wrong bytes
+        with self.assertRaises(resolver.ResolverError) as ctx:
+            resolver.publish_no_clobber(staging, dest, self.payload_sha, self.payload_size)
+        self.assertEqual(ctx.exception.exit_code, EXIT_VAULT_CORRUPT)
+        # original bytes unchanged (no clobber)
+        self.assertEqual(dest.read_bytes(), b"\x00" * self.payload_size)
+
+    def test_publish_no_clobber_existing_reparse_rejected(self):
+        staging = self.manifest_dir / "staging.bin"
+        staging.write_bytes(self.real_payload)
+        real = self.manifest_dir / "real.bin"
+        real.write_bytes(self.real_payload)
+        dest = self.vault_root / "dest.bin"
+        try:
+            os.symlink(real, dest)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks unavailable")
+        with self.assertRaises(resolver.ResolverError) as ctx:
+            resolver.publish_no_clobber(staging, dest, self.payload_sha, self.payload_size)
+        self.assertEqual(ctx.exception.exit_code, EXIT_VAULT_CORRUPT)
+
+    def test_no_os_replace_for_vault_artifacts(self):
+        # Static guarantee: the core never uses os.replace on vault/observed
+        # artifact promotion paths.
+        core = CORE_PY.read_text(encoding="utf-8")
+        # os.replace is still allowed for the atomic *record* write, but the
+        # publish primitive must use os.link only.
+        self.assertIn("os.link", core)
+        self.assertNotIn("os.replace(self.path", core)
+
+
+class ForceAcquireTests(ResolverTestCase):
+    def test_force_acquire_corrupt_vault_returns_corrupt_bytes_unchanged(self):
+        vp = self.seed_vault(b"\x00" * self.payload_size)  # wrong bytes
+        manifest = make_manifest(payload_sha=self.payload_sha, size=self.payload_size)
+        source = self.write_source(self.real_payload)
+        exit_code, _ = self.run_resolve(
+            manifest, source=source, force_acquire=True
+        )
+        self.assertEqual(exit_code, EXIT_VAULT_CORRUPT)
+        # original wrong bytes unchanged; source never promoted over it.
+        self.assertEqual(vp.read_bytes(), b"\x00" * self.payload_size)
+
+    def test_force_acquire_correct_vault_keeps_destination(self):
+        vp = self.seed_vault(self.real_payload)  # correct object
+        manifest = make_manifest(payload_sha=self.payload_sha, size=self.payload_size)
+        source = self.write_source(self.real_payload)
+        exit_code, result = self.run_resolve(
+            manifest, source=source, force_acquire=True
+        )
+        self.assertEqual(exit_code, EXIT_OK)
+        self.assertTrue(result["revision_match"])
+        # destination file identity/bytes preserved (not replaced)
+        self.assertEqual(vp.read_bytes(), self.real_payload)
+        self.assertEqual(result["resolved_vault_path"], str(vp))
+
+    def test_force_acquire_correct_vault_with_different_source_is_mismatch(self):
+        self.seed_vault(self.real_payload)  # correct object
+        manifest = make_manifest(payload_sha=self.payload_sha, size=self.payload_size)
+        source = self.write_source(b"DIFFERENT-" + b"\x00" * 40)
+        exit_code, _ = self.run_resolve(
+            manifest, source=source, force_acquire=True
+        )
+        self.assertEqual(exit_code, EXIT_SAMPLE_MISMATCH)
+        # destination still intact
+        vp = resolver.vault_object_path(self.vault_root, self.payload_sha)
+        self.assertEqual(vp.read_bytes(), self.real_payload)
+
+
+class PromotionRaceTests(ResolverTestCase):
+    """Destination appearing between snapshot and publish."""
+
+    def test_promotion_race_correct_existing_is_idempotent(self):
+        # Vault absent, mutable source matches. But a concurrent actor creates
+        # the correct vault object before publish. Simulate by pre-seeding the
+        # correct object, which the no-clobber publish treats as idempotent.
+        vp = self.seed_vault(self.real_payload)
+        manifest = make_manifest(payload_sha=self.payload_sha, size=self.payload_size)
+        source = self.write_source(self.real_payload)
+        exit_code, result = self.run_resolve(manifest, source=source)
+        self.assertEqual(exit_code, EXIT_OK)
+        self.assertTrue(result["revision_match"])
+        self.assertEqual(vp.read_bytes(), self.real_payload)
+
+    def test_promotion_race_wrong_existing_is_corrupt(self):
+        # Concurrent actor placed wrong bytes at the destination; publish must
+        # fail closed and not overwrite them.
+        vp = self.seed_vault(b"\x00" * self.payload_size)
+        manifest = make_manifest(payload_sha=self.payload_sha, size=self.payload_size)
+        source = self.write_source(self.real_payload)
+        exit_code, _ = self.run_resolve(manifest, source=source)
+        self.assertEqual(exit_code, EXIT_VAULT_CORRUPT)
+        self.assertEqual(vp.read_bytes(), b"\x00" * self.payload_size)
+
+
+class PostPublishRehashTests(ResolverTestCase):
+    def test_post_publish_rehash_failure_no_match_no_bad_object(self):
+        # Force post-publish rehash to fail: after the hard-link is created,
+        # the destination's hash differs, so publish_no_clobber removes it.
+        # The only _hash_file(dest) call is the post-publish check (dest did
+        # not exist before), so a path-specific hook is deterministic.
+        manifest = make_manifest(payload_sha=self.payload_sha, size=self.payload_size)
+        source = self.write_source(self.real_payload)
+        vp = resolver.vault_object_path(self.vault_root, self.payload_sha)
+
+        def flaky(path):
+            if path == vp:
+                return resolver.sha256_bytes(b"BAD")
+            return resolver.sha256_file(path)
+
+        resolver.HASH_FILE_HOOK = flaky
+        try:
+            exit_code, _ = self.run_resolve(manifest, source=source)
+        finally:
+            resolver.HASH_FILE_HOOK = None
+        self.assertEqual(exit_code, EXIT_VAULT_CORRUPT)
+        # No revision_match in the record; no bad object left.
+        rec = self.read_record()
+        self.assertFalse(rec["revision_match"])
+        self.assertFalse(rec["vault_object_verified"])
+        self.assertFalse(vp.exists(), "bad object must not remain")
+
+
+class ObservedConcurrencyTests(ResolverTestCase):
+    def test_observed_identical_is_idempotent(self):
+        manifest = make_manifest(payload_sha=self.payload_sha, size=self.payload_size)
+        unmatched = b"NEW-REVISION-" + b"\x00" * 30
+        source = self.write_source(unmatched)
+        sha = sha256b(unmatched)
+        # Pre-place correct observed object.
+        od = self.observed / sha[:2] / sha
+        od.mkdir(parents=True)
+        (od / "artifact.exe").write_bytes(unmatched)
+        exit_code, _ = self.run_resolve(
+            manifest, source=source, retain_unmatched=True, observed_dir=self.observed
+        )
+        self.assertEqual(exit_code, EXIT_SAMPLE_MISMATCH)
+        # observed bytes preserved
+        self.assertEqual((od / "artifact.exe").read_bytes(), unmatched)
+
+    def test_observed_different_is_rejected_no_overwrite(self):
+        manifest = make_manifest(payload_sha=self.payload_sha, size=self.payload_size)
+        unmatched = b"NEW-REVISION-" + b"\x00" * 30
+        source = self.write_source(unmatched)
+        sha = sha256b(unmatched)
+        od = self.observed / sha[:2] / sha
+        od.mkdir(parents=True)
+        (od / "artifact.exe").write_bytes(b"\x00" * len(unmatched))  # wrong
+        exit_code, _ = self.run_resolve(
+            manifest, source=source, retain_unmatched=True, observed_dir=self.observed
+        )
+        self.assertEqual(exit_code, EXIT_VAULT_CORRUPT)
+        # original (wrong) observed bytes unchanged
+        self.assertEqual((od / "artifact.exe").read_bytes(), b"\x00" * len(unmatched))
+
+
+class SourceChangedEvidenceTests(ResolverTestCase):
+    def test_source_changed_record_has_false_and_observation(self):
+        manifest = make_manifest(payload_sha=self.payload_sha, size=self.payload_size)
+        source = self.write_source(self.real_payload)
+        calls = {"n": 0}
+
+        def flaky(path):
+            calls["n"] += 1
+            if calls["n"] == 3:
+                return sha256b(b"CHANGED-" + path.read_bytes())
+            return resolver.sha256_file(path)
+
+        resolver.HASH_FILE_HOOK = flaky
+        exit_code, _ = self.run_resolve(manifest, source=source)
+        self.assertEqual(exit_code, EXIT_SOURCE_CHANGED)
+        rec = self.read_record()
+        self.assertEqual(rec["resolution_status"], "SourceChangedDuringSnapshot")
+        # must be false, NOT null
+        self.assertIs(rec["source_stable_during_snapshot"], False)
+        self.assertFalse(rec["revision_match"])
+        self.assertFalse(rec["vault_object_verified"])
+        self.assertIsNone(rec["resolved_vault_path"])
+        obs = rec.get("snapshot_observation")
+        self.assertIsNotNone(obs)
+        self.assertIn("h1", obs)
+        self.assertIn("h2", obs)
+        self.assertIn("h3", obs)
+        self.assertIn("s1", obs)
+        self.assertIn("s2", obs)
+        self.assertIn("s3", obs)
+
+
+class ManifestSingleReadTests(ResolverTestCase):
+    def test_manifest_read_once_digest_binds_to_same_buffer(self):
+        # Write a valid manifest, resolve, then change the file on disk.
+        # The record must reflect the ORIGINAL bytes (no re-read after parse).
+        self.seed_vault(self.real_payload)
+        manifest = make_manifest(payload_sha=self.payload_sha, size=self.payload_size)
+        mpath = self.write_manifest(manifest)
+        original_bytes = mpath.read_bytes()
+        try:
+            result = resolver.resolve(
+                manifest_path=mpath,
+                case_id="gto_launcher",
+                vault_root=self.vault_root,
+                evidence_dir=self.evidence,
+                source_path=None,
+                force_acquire=False,
+                retain_unmatched=False,
+                observed_revisions_dir=self.observed,
+            )
+        except resolver.ResolverError as exc:
+            self.fail(f"resolve failed: {exc.detail}")
+        self.assertTrue(result["revision_match"])
+        expected_digest = resolver.sha256_bytes(original_bytes)
+        self.assertEqual(result["manifest_sha256"], expected_digest)
+
+        # Drift: mutate the file after resolution. Record must still bind to the
+        # originally-read buffer.
+        mpath.write_text('{"schema_version":"mida.case-manifest/v2","drift":true}',
+                         encoding="utf-8")
+        rec = json.loads((self.evidence / "resolved_source.json").read_text(encoding="utf-8"))
+        self.assertEqual(rec["manifest_sha256"], expected_digest)
+        self.assertEqual(rec["expected_sha256"], self.payload_sha)
+
+    def test_validate_manifest_bytes_is_single_buffer(self):
+        payload = json.dumps(
+            make_manifest(payload_sha=self.payload_sha, size=self.payload_size),
+            indent=2,
+        ).encode("utf-8")
+        parsed = resolver.validate_manifest_bytes(payload, "gto_launcher")
+        self.assertEqual(parsed["expected_sha256"], self.payload_sha)
+        self.assertEqual(parsed["expected_size_bytes"], self.payload_size)
+
+
+class PathSafetyTests(ResolverTestCase):
+    def test_vault_root_inside_repo_rejected(self):
+        # RepoRoot = repo; VaultRoot inside it must fail closed.
+        manifest = make_manifest(payload_sha=self.payload_sha, size=self.payload_size)
+        mpath = self.write_manifest(manifest)
+        repo = self.manifest_dir  # pretend this is the repo root
+        vault_inside = repo / "vault"
+        with self.assertRaises(resolver.ResolverError) as ctx:
+            resolver.resolve(
+                manifest_path=mpath,
+                case_id="gto_launcher",
+                vault_root=vault_inside,
+                evidence_dir=self.evidence,
+                source_path=None,
+                force_acquire=False,
+                retain_unmatched=False,
+                observed_revisions_dir=self.observed,
+                repo_root=repo,
+            )
+        self.assertEqual(ctx.exception.exit_code, EXIT_SOURCE_INVALID)
+
+    def test_observed_dir_inside_repo_rejected(self):
+        manifest = make_manifest(payload_sha=self.payload_sha, size=self.payload_size)
+        mpath = self.write_manifest(manifest)
+        repo = self.manifest_dir
+        observed_inside = repo / "observed"
+        with self.assertRaises(resolver.ResolverError) as ctx:
+            resolver.resolve(
+                manifest_path=mpath,
+                case_id="gto_launcher",
+                vault_root=self.vault_root,
+                evidence_dir=self.evidence,
+                source_path=None,
+                force_acquire=False,
+                retain_unmatched=False,
+                observed_revisions_dir=observed_inside,
+                repo_root=repo,
+            )
+        self.assertEqual(ctx.exception.exit_code, EXIT_SOURCE_INVALID)
+
+    def test_vault_reparse_artifact_rejected(self):
+        real = self.manifest_dir / "real.bin"
+        real.write_bytes(self.real_payload)
+        vp = resolver.vault_object_path(self.vault_root, self.payload_sha)
+        vp.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.symlink(real, vp)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks unavailable")
+        manifest = make_manifest(payload_sha=self.payload_sha, size=self.payload_size)
+        exit_code, _ = self.run_resolve(manifest)
+        self.assertEqual(exit_code, EXIT_VAULT_CORRUPT)
+
+
+class ToolHashTests(ResolverTestCase):
+    def test_resolver_tool_sha256_is_raw_bytes_digest(self):
+        expected = hashlib.sha256(CORE_PY.read_bytes()).hexdigest()
+        self.assertEqual(resolver.tool_sha256(), expected)
+
+    def test_record_tool_sha256_matches_file(self):
+        self.seed_vault(self.real_payload)
+        manifest = make_manifest(payload_sha=self.payload_sha, size=self.payload_size)
+        exit_code, result = self.run_resolve(manifest)
+        self.assertEqual(exit_code, EXIT_OK)
+        self.assertEqual(result["resolver_tool_sha256"],
+                         hashlib.sha256(CORE_PY.read_bytes()).hexdigest())
+
+
+class WrapperExitCodeTests(ResolverTestCase):
+    """Real subprocess tests: the wrapper preserves core exit codes."""
+
+    def _run_wrapper(self, args):
+        if not WRAPPER_PS1.exists():
+            self.skipTest("wrapper not present")
+        ps = shutil_which("powershell")
+        if ps is None:
+            self.skipTest("powershell not found")
+        cmd = [
+            "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+            "-File", str(WRAPPER_PS1),
+        ] + args
+        return subprocess.run(cmd, capture_output=True, text=True)
+
+    def test_wrapper_missing_args_exit_17(self):
+        proc = self._run_wrapper([])
+        self.assertEqual(proc.returncode, 17)
+
+    def test_wrapper_vault_corrupt_exit_13(self):
+        self.seed_vault(b"\x00" * self.payload_size)
+        manifest = make_manifest(payload_sha=self.payload_sha, size=self.payload_size)
+        mpath = self.write_manifest(manifest)
+        proc = self._run_wrapper([
+            "-ManifestPath", str(mpath),
+            "-VaultRoot", str(self.vault_root),
+            "-EvidenceDir", str(self.evidence),
+            "-CaseId", "gto_launcher",
+            "-RepoRoot", str(REPO_ROOT),
+        ])
+        self.assertEqual(proc.returncode, 13)
+
+    def test_wrapper_manifest_invalid_exit_14(self):
+        mpath = self.manifest_dir / "bad.json"
+        mpath.write_text("{ not json !!!", encoding="utf-8")
+        proc = self._run_wrapper([
+            "-ManifestPath", str(mpath),
+            "-VaultRoot", str(self.vault_root),
+            "-EvidenceDir", str(self.evidence),
+            "-CaseId", "gto_launcher",
+            "-RepoRoot", str(REPO_ROOT),
+        ])
+        self.assertEqual(proc.returncode, 14)
+
+    def test_wrapper_success_exit_0(self):
+        self.seed_vault(self.real_payload)
+        manifest = make_manifest(payload_sha=self.payload_sha, size=self.payload_size)
+        mpath = self.write_manifest(manifest)
+        proc = self._run_wrapper([
+            "-ManifestPath", str(mpath),
+            "-VaultRoot", str(self.vault_root),
+            "-EvidenceDir", str(self.evidence),
+            "-CaseId", "gto_launcher",
+            "-RepoRoot", str(REPO_ROOT),
+        ])
+        self.assertEqual(proc.returncode, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

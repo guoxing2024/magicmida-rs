@@ -25,13 +25,20 @@
     Case id; defaults to gto_launcher.
 
 .PARAMETER ForceAcquire
-    Read the mutable locator even if an authorized vault object exists.
+    Verify the mutable source even if an authorized vault object exists. Never
+    overwrites the existing object.
 
 .PARAMETER RetainUnmatched
     Archive a stable-but-unmatched snapshot under observed-revisions (never promotes).
 
 .PARAMETER ObservedRevisionsDir
     Directory for retained unmatched revisions.
+
+.PARAMETER RepoRoot
+    Repository root; used to reject storage roots placed inside the repository.
+
+.PARAMETER Help
+    Show this help and exit.
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File tools/resolve_gto_source_revision.ps1 `
@@ -58,6 +65,8 @@ param(
     [switch]$RetainUnmatched,
     [string]$ObservedRevisionsDir,
 
+    [string]$RepoRoot,
+
     [switch]$Help
 )
 
@@ -70,8 +79,10 @@ if ($Help) {
 }
 
 # --- Required-argument validation (after help path) ---
+# Use [Console]::Error.WriteLine (non-terminating) so the `exit` below actually
+# runs even though $ErrorActionPreference = "Stop".
 if (-not $ManifestPath -or -not $VaultRoot -or -not $EvidenceDir) {
-    Write-Error "ManifestPath, VaultRoot, and EvidenceDir are required (use -Help for usage)."
+    [Console]::Error.WriteLine("ManifestPath, VaultRoot, and EvidenceDir are required (use -Help for usage).")
     exit 17
 }
 
@@ -80,8 +91,11 @@ $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot = Split-Path -Parent $scriptDir
 $corePy = Join-Path $scriptDir "_resolve_gto_source_revision.py"
 
+# Honor an explicit -RepoRoot, else derive from the script location.
+if (-not $RepoRoot) { $RepoRoot = $repoRoot }
+
 if (-not (Test-Path $corePy -PathType Leaf)) {
-    Write-Error "resolver core not found: $corePy"
+    [Console]::Error.WriteLine("resolver core not found: $corePy")
     exit 17   # InternalError
 }
 
@@ -97,7 +111,7 @@ foreach ($candidate in @("python", "py")) {
     }
 }
 if ($null -eq $python) {
-    Write-Error "python not found on PATH"
+    [Console]::Error.WriteLine("python not found on PATH")
     exit 17
 }
 
@@ -106,7 +120,8 @@ $coreArgs = @(
     "--ManifestPath", $ManifestPath,
     "--VaultRoot", $VaultRoot,
     "--EvidenceDir", $EvidenceDir,
-    "--CaseId", $CaseId
+    "--CaseId", $CaseId,
+    "--RepoRoot", $repoRoot
 )
 if ($SourcePath) { $coreArgs += @("--SourcePath", $SourcePath) }
 if ($ForceAcquire) { $coreArgs += "--ForceAcquire" }

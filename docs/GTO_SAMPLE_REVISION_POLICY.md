@@ -1,6 +1,6 @@
 # GTO Sample Revision and Mutable Source Path Policy
 
-**Status:** mandatory handoff and live-run policy  
+**Status:** mandatory handoff and live-run policy
 **Effective:** 2026-08-08
 
 ## 1. The problem
@@ -152,6 +152,45 @@ without reading `-SourcePath`. Show usage with:
 powershell -ExecutionPolicy Bypass -File `
   D:\Claude project\magicmida-rs\tools\resolve_gto_source_revision.ps1 -Help
 ```
+
+### 3.5.0 Promotion, ForceAcquire, and TOCTOU
+
+**No-clobber promotion.** Vault and observed-revision artifacts are published
+atomically with an atomic hard-link create (`os.link`), which fails atomically
+if the destination already exists. There is no `exists()+replace` and no
+`os.replace` on artifact promotion. If the destination already exists it is
+re-hashed: identical bytes are an idempotent success, different bytes are
+`VaultObjectCorrupt`, and existing bytes are never overwritten. If post-publish
+verification fails, the resolver removes only the object this invocation
+created.
+
+**`--ForceAcquire` never overwrites.** When the authorized vault object already
+exists, `--ForceAcquire` verifies the mutable source and cross-checks it against
+the existing object, then **discards** the snapshot. It does not replace the
+existing object, and it cannot bypass an existing object's integrity check (a
+corrupt existing object is `VaultObjectCorrupt` even under `--ForceAcquire`).
+
+**`SourceChangedDuringSnapshot` evidence.** The resolution record reports
+`source_stable_during_snapshot: false` (never `null`) plus a structured
+`snapshot_observation` block with `h1/h2/h3/s1/s2/s3`, so downstream tooling can
+consume the race deterministically rather than parsing a stderr string.
+
+**Manifest single-read binding.** The resolver reads the manifest file exactly
+once. The recorded `manifest_sha256` and the authority fields (digest/size) are
+all derived from that same byte buffer; it never re-opens the manifest to fetch
+a digest.
+
+**Storage location.** `VaultRoot` and `ObservedRevisionsDir` must be outside the
+repository root; the resolver rejects them (`SourceInvalid`) if they fall inside
+the repository, and staging is always created on the destination volume outside
+the repo.
+
+**Path-replacement TOCTOU remains.** This resolver pins identity at snapshot
+time, but there is still a time-of-check/time-of-use window between the resolver
+recording `resolved_vault_path` and a downstream process consuming it. A
+downstream executor must re-hash the file immediately before spawn and must not
+treat the resolver alone as eliminating all TOCTOU. The digest (not the path)
+remains the authority.
 
 ### 3.5.1 Resolver exit codes (machine-consumable)
 
