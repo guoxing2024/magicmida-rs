@@ -13,6 +13,7 @@ use tracing::{info, warn};
 use super::capture_policy::DumpCapturePolicy;
 use super::container_snapshot::ContainerSnapshot;
 use super::heap_global_snapshot::HeapGlobalSnapshot;
+use super::runtime_rebase::RuntimeRebaseSummary;
 use super::types::DumpProfile;
 
 pub(crate) const SCHEMA_VERSION: &str = "mida.dump-snapshot-manifest/v0";
@@ -36,6 +37,7 @@ pub(crate) fn write_dump_snapshot_manifest(
     containers: &[ContainerSnapshot],
     heap_globals: &[HeapGlobalSnapshot],
     capture_policy: &DumpCapturePolicy,
+    rebase_summary: Option<&RuntimeRebaseSummary>,
 ) {
     let path = manifest_path_for_output(output_path);
     match render_manifest_json(
@@ -46,6 +48,7 @@ pub(crate) fn write_dump_snapshot_manifest(
         containers,
         heap_globals,
         capture_policy,
+        rebase_summary,
     ) {
         Ok(json) => match fs::File::create(&path).and_then(|mut f| f.write_all(json.as_bytes())) {
             Ok(()) => {
@@ -53,6 +56,7 @@ pub(crate) fn write_dump_snapshot_manifest(
                     path = %path.display(),
                     containers = containers.len(),
                     heap_globals = heap_globals.len(),
+                    rebase = rebase_summary.is_some(),
                     "Wrote dump snapshot manifest"
                 );
             }
@@ -113,6 +117,7 @@ pub(crate) fn render_manifest_json(
     containers: &[ContainerSnapshot],
     heap_globals: &[HeapGlobalSnapshot],
     capture_policy: &DumpCapturePolicy,
+    rebase_summary: Option<&RuntimeRebaseSummary>,
 ) -> Result<String, String> {
     let container_payload: u64 = containers.iter().map(|c| c.heap_content.len() as u64).sum();
     let heap_payload: u64 = heap_globals
@@ -259,6 +264,76 @@ pub(crate) fn render_manifest_json(
         container_payload.saturating_add(heap_payload)
     ));
     buf.push_str("  }\n");
+
+    // GTO R0 runtime rebase summary (offline diagnostic; never acceptance).
+    // Present only on the AhkGtoExperimental recovery path. State is one of
+    // Complete / Incomplete / Rejected — never acceptance terms.
+    if let Some(s) = rebase_summary {
+        buf.push_str(",\n");
+        buf.push_str("  \"runtime_rebase\": {\n");
+        buf.push_str(&format!("    \"regions_total\": {},\n", s.regions_total));
+        buf.push_str(&format!(
+            "    \"regions_required\": {},\n",
+            s.regions_required
+        ));
+        buf.push_str(&format!("    \"bytes_captured\": {},\n", s.bytes_captured));
+        buf.push_str(&format!(
+            "    \"pointer_slots_total\": {},\n",
+            s.pointer_slots_total
+        ));
+        buf.push_str(&format!(
+            "    \"intra_region_pointers\": {},\n",
+            s.intra_region_pointers
+        ));
+        buf.push_str(&format!("    \"image_pointers\": {},\n", s.image_pointers));
+        buf.push_str(&format!(
+            "    \"external_pointers\": {},\n",
+            s.external_pointers
+        ));
+        buf.push_str(&format!("    \"null_or_tagged\": {},\n", s.null_or_tagged));
+        buf.push_str(&format!(
+            "    \"unresolved_required\": {},\n",
+            s.unresolved_required
+        ));
+        buf.push_str(&format!(
+            "    \"unresolved_optional\": {},\n",
+            s.unresolved_optional
+        ));
+        buf.push_str(&format!(
+            "    \"image_roots_patched\": {},\n",
+            s.image_roots_patched
+        ));
+        buf.push_str(&format!(
+            "    \"bootstrap_kind\": \"{}\",\n",
+            json_escape(&s.bootstrap_kind)
+        ));
+        buf.push_str(&format!(
+            "    \"bootstrap_rva\": {},\n",
+            s.bootstrap_rva
+                .map(|r| format!("\"{}\"", hex_u32(r)))
+                .unwrap_or_else(|| "null".to_string())
+        ));
+        buf.push_str(&format!(
+            "    \"original_oep_rva\": \"{}\",\n",
+            hex_u32(s.original_oep_rva)
+        ));
+        buf.push_str(&format!(
+            "    \"completion_cookie_rva\": {},\n",
+            s.completion_cookie_rva
+                .map(|r| format!("\"{}\"", hex_u32(r)))
+                .unwrap_or_else(|| "null".to_string())
+        ));
+        buf.push_str(&format!(
+            "    \"deterministic_plan_digest\": \"{}\",\n",
+            s.deterministic_plan_digest
+        ));
+        buf.push_str(&format!(
+            "    \"recovery_status\": \"{}\"\n",
+            s.recovery_status.label()
+        ));
+        buf.push_str("  }\n");
+    }
+
     buf.push_str("}\n");
     Ok(buf)
 }
@@ -287,6 +362,7 @@ mod tests {
             &[],
             &[],
             &DumpCapturePolicy::default(),
+            None,
         )
         .unwrap();
         assert!(json.contains(SCHEMA_VERSION));
@@ -332,6 +408,7 @@ mod tests {
             &containers,
             &heap_globals,
             &policy,
+            None,
         )
         .unwrap();
         assert!(json.contains("0x145710"));
@@ -343,5 +420,45 @@ mod tests {
         assert!(json.contains("\"container_payload_bytes\": 72"));
         assert!(json.contains("\"source\": \"ahk_gto_defaults\""));
         assert!(json.contains("\"0x149d50\""));
+    }
+
+    #[test]
+    fn rebase_summary_renders_status_complete() {
+        let summary = RuntimeRebaseSummary {
+            regions_total: 3,
+            regions_required: 3,
+            bytes_captured: 4096,
+            pointer_slots_total: 7,
+            intra_region_pointers: 2,
+            image_pointers: 1,
+            external_pointers: 1,
+            null_or_tagged: 2,
+            unresolved_required: 0,
+            unresolved_optional: 1,
+            image_roots_patched: 1,
+            bootstrap_kind: "pre_oep_container".to_string(),
+            bootstrap_rva: Some(0x2f000),
+            original_oep_rva: 0x5a10,
+            completion_cookie_rva: None,
+            deterministic_plan_digest: "abc123".to_string(),
+            recovery_status: crate::dumper::runtime_rebase::RebaseStatus::Complete,
+        };
+        let json = render_manifest_json(
+            Path::new("cand.exe"),
+            DumpProfile::AhkGtoExperimental,
+            0x140000000,
+            0x5a10,
+            &[],
+            &[],
+            &DumpCapturePolicy::ahk_gto_default(),
+            Some(&summary),
+        )
+        .unwrap();
+        assert!(json.contains("\"runtime_rebase\": {"));
+        assert!(json.contains("\"regions_total\": 3"));
+        assert!(json.contains("\"unresolved_required\": 0"));
+        assert!(json.contains("\"bootstrap_kind\": \"pre_oep_container\""));
+        assert!(json.contains("\"recovery_status\": \"Complete\""));
+        assert!(json.contains("\"deterministic_plan_digest\": \"abc123\""));
     }
 }

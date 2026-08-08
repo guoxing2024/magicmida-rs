@@ -43,6 +43,7 @@ mod original_imports;
 mod output_writer;
 mod pure_rebuild_adapter;
 mod remote_modules;
+mod runtime_rebase;
 mod sections;
 mod serialize;
 mod snapshot_manifest;
@@ -66,6 +67,12 @@ pub use self::pure_rebuild_adapter::{
     PureRebuildParitySnapshot,
 };
 pub use self::remote_modules::take_module_snapshot;
+pub use self::runtime_rebase::{
+    build_runtime_rebase_plan, plan_and_validate_for_dump, summarize_plan,
+    validate_bootstrap_contract, validate_rebased_snapshots, validate_runtime_rebase_plan,
+    PointerClassification, RebaseError, RebaseRegion, RebaseStatus, RuntimeRebasePlan,
+    RuntimeRebaseSummary,
+};
 pub use self::snapshot_manifest::manifest_path_for_output;
 pub use self::types::{
     ContainerRestoreMode, DumpOptions, DumpProcessReport, DumpProfile, DumpProfileCapabilities,

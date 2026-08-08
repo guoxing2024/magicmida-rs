@@ -1105,11 +1105,61 @@ pub fn dump_process_with_report(
         warn!("No import_builder - skipping import section creation");
     }
 
+    // GTO R0: diagnostic summary of the offline runtime rebase plan. `None`
+    // unless the AhkGtoExperimental recovery produced a validated plan.
+    let mut rebase_summary: Option<super::runtime_rebase::RuntimeRebaseSummary> = None;
+
     let output_entry_point = if stage_plan.install_heap_bootstrap {
         // Resolve VirtualAlloc IAT slot AFTER section build assigned addresses.
         let virtual_alloc_iat = import_builder
             .as_ref()
             .and_then(|b| b.find_function_iat("VirtualAlloc"));
+        // GTO R0: build + validate the deterministic runtime rebase plan offline,
+        // before the runtime bootstrap stub is installed. A plan that leaves a
+        // required old heap/private pointer unresolved fails closed — we refuse
+        // to emit a candidate that cannot cold-start (never a partial copy).
+        {
+            let new_image_base = pe.nt_headers.optional_header.image_base;
+            match super::runtime_rebase::plan_and_validate_for_dump(
+                &containers,
+                &heap_globals,
+                heap_slab.as_ref(),
+                opts.image_base,
+                new_image_base,
+                None, // boot_rva unknown until the bootstrap section is created
+                opts.entry_point,
+                None, // completion cookie RVA resolved from the installed stub
+            ) {
+                Ok(None) => {
+                    info!(
+                        profile = ?opts.profile,
+                        "GTO R0: no captured allocations to rebase (empty plan)"
+                    );
+                }
+                Ok(Some(summary)) => {
+                    info!(
+                        regions_total = summary.regions_total,
+                        regions_required = summary.regions_required,
+                        bytes_captured = summary.bytes_captured,
+                        pointer_slots_total = summary.pointer_slots_total,
+                        intra_region_pointers = summary.intra_region_pointers,
+                        image_pointers = summary.image_pointers,
+                        external_pointers = summary.external_pointers,
+                        null_or_tagged = summary.null_or_tagged,
+                        unresolved_required = summary.unresolved_required,
+                        digest = %summary.deterministic_plan_digest,
+                        status = summary.recovery_status.label(),
+                        "GTO R0: runtime rebase plan validated offline"
+                    );
+                    rebase_summary = Some(summary);
+                }
+                Err(e) => {
+                    return Err(PeError::Parse(format!(
+                        "GTO R0: runtime rebase plan failed closed: {e:#}"
+                    )));
+                }
+            }
+        }
         match import_builder.as_ref().and_then(|builder| {
             super::heap_bootstrap::install_heap_bootstrap(
                 &mut pe,
@@ -1476,6 +1526,7 @@ pub fn dump_process_with_report(
         &containers,
         &heap_globals,
         &capture_policy,
+        rebase_summary.as_ref(),
     );
 
     // The report is returned only after the candidate and its required bound
