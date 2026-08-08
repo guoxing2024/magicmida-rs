@@ -225,22 +225,25 @@ pub fn check_with_behavior_signed(
     signed: &VerifiedSignedBundle,
 ) -> AcceptanceReport {
     let mut report = compose_managed_uncapped(bytes, opts, signed.evidence(), signed.managed());
-    // P1 issue 3: the trust tier is derived from the ENVELOPE's signature
-    // algorithm, not assumed Product. An HMAC-signed envelope (the only
-    // implemented algorithm today) uses a caller-controlled shared secret and
-    // is a LAB trust root; Ed25519 (reserved, non-caller-controlled) is the
-    // Product tier. So the signed library path must NOT label an HMAC envelope
-    // as Product.
+    // P1 issue 3 / review round 3: the trust tier is derived from an EXACT
+    // allowlist over the envelope's signature algorithm, never by defaulting
+    // an unknown algorithm to Product.
+    //
+    //   - mida.ed25519/v1  -> Product   (reserved; the only Product algorithm)
+    //   - mida.hmac-sha256/v0 -> Lab    (caller-controlled shared secret)
+    //   - anything else    -> Rejected  (unknown algorithm must NOT enter the
+    //                                     Product chain; fail closed)
     let algorithm = signed.envelope().signature().algorithm.as_str();
     report.trust_tier = if report.verdict == Verdict::Rejected {
         TrustTier::Rejected
     } else if algorithm == crate::envelope::SIG_ALG_HMAC_SHA256_V0 {
         TrustTier::Lab
-    } else {
-        // Ed25519 / unknown: only a non-HMAC product algorithm is Product. For
-        // any not-yet-implemented algorithm the bundle could not have verified,
-        // so this branch is only reachable for a verified Ed25519 envelope.
+    } else if algorithm == crate::envelope::SIG_ALG_ED25519_V1 {
         TrustTier::Product
+    } else {
+        // Unknown / not-yet-implemented algorithm: cannot be a legitimate
+        // verified product bundle → not Product (fail closed).
+        TrustTier::Rejected
     };
     report.refresh_product_acceptable();
     report

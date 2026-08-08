@@ -138,6 +138,14 @@ pub(crate) fn trace_one_slot(
                                 LogMsgType::Info,
                                 &format!("Skipping anti-trace API at {ip:#x}"),
                             );
+                            // Check instruction limit AFTER the decision ran on
+                            // this instruction (P2 issue 6). A SkipAntiTraceApi
+                            // must NOT bypass the limit: if we have reached
+                            // `limit`, stop here instead of continuing.
+                            if counter >= limit {
+                                log(LogMsgType::Info, "Giving up trace due to instruction limit");
+                                return Ok(());
+                            }
                             // Pop the return address from the stack and continue from it.
                             #[cfg(target_arch = "x86")]
                             {

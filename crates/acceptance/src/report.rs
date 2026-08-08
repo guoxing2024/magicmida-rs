@@ -1,4 +1,8 @@
 //! Deterministic acceptance JSON report.
+//!
+//! v2 adds the machine-consumable product-trust fields `trust_tier` and
+//! `product_acceptable` (P1/P2). v1 reports lacked these and must be rejected
+//! by machine consumers that gate on product acceptance.
 
 use serde::{Deserialize, Serialize};
 
@@ -6,7 +10,7 @@ use crate::identity::ArtifactIdentity;
 use crate::oracle::OracleObservation;
 use crate::verdict::Verdict;
 
-pub const REPORT_SCHEMA_VERSION: &str = "mida.acceptance-report/v1";
+pub const REPORT_SCHEMA_VERSION: &str = "mida.acceptance-report/v2";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

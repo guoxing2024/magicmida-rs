@@ -330,17 +330,22 @@ pub struct EquivalenceProof {
     /// Icon patch state (Some → manufacture).
     #[serde(default)]
     pub icon_patch_state: Option<String>,
-    /// Hash of the raw observation source (probe logs). **Required**: the
-    /// caller must supply it, but the verifier does NOT trust a self-reported
-    /// hash to establish a real observation — the hash must be registered in
-    /// the verifier-side [`TrustedObservationRegistry`] for the verdict to be
-    /// `Pass`. An unregistered observation (or a mismatch between the
-    /// observation hash and its environment digest) yields `NotRun` (Pending),
-    /// never a fabricated `Pass`.
+    /// Opaque trust token minted ONLY by the verifier's real artifact-verification
+    /// step (see [`TrustedObservationRegistry::issue`]). It is an unguessable,
+    /// non-caller-derivable value (derived from a verifier-held secret salt +
+    /// the verified observation), so a caller who merely knows the observation
+    /// hashes cannot forge a token. The verdict is `Pass` only when this token
+    /// resolves to a trusted, issued observation that exactly matches the
+    /// declared `observation_source_hash` / `execution_environment_digest`.
+    pub trust_token: String,
+    /// Hash of the raw observation source (probe logs). **Descriptive**: this
+    /// field is cross-checked against the observation bound to the `trust_token`.
+    /// It is not, by itself, proof of a real observation — only the opaque
+    /// `trust_token` is.
     pub observation_source_hash: String,
     /// Digest of the execution environment that produced the observation.
-    /// **Required** and cross-checked against the registered environment for
-    /// the observation source hash.
+    /// **Descriptive** and cross-checked against the observation bound to the
+    /// `trust_token`.
     pub execution_environment_digest: String,
 }
 
@@ -487,19 +492,51 @@ impl StimulusPlanRegistry {
     }
 }
 
+/// An opaque trust token minted by the verifier's real artifact-verification
+/// step. The token is an unguessable, non-caller-derivable 64-hex value; a
+/// caller who only knows the observation hashes cannot produce it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrustToken(String);
+
+impl TrustToken {
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Verifier-held secret salt used to mint opaque observation trust tokens. This
+/// lives only inside the verifier crate and is NEVER serialized into evidence,
+/// so a caller cannot recompute a valid token from the observation hashes.
+const OBSERVER_TOKEN_SECRET_SALT: &[u8] = b"mida-acceptance-v2-observer-secret-salt";
+
+/// Derive the opaque token for a given observation (source hash + environment
+/// digest) under the verifier's secret salt.
+fn observer_token_for(source: &str, env: &str) -> TrustToken {
+    let mut msg = Vec::with_capacity(OBSERVER_TOKEN_SECRET_SALT.len() + source.len() + env.len());
+    msg.extend_from_slice(OBSERVER_TOKEN_SECRET_SALT);
+    msg.extend_from_slice(source.trim().to_lowercase().as_bytes());
+    msg.extend_from_slice(env.trim().to_lowercase().as_bytes());
+    TrustToken(crate::sha256_hex(&msg))
+}
+
 /// Verifier-side registry of TRUSTED runtime observations (P1 issue 1: no
 /// self-reported-`Some` false-green).
 ///
-/// A behavioral `Pass` must be backed by an observation that the VERIFIER has
-/// independently registered as trustworthy — never by a caller-supplied
-/// `observation_source_hash` / `execution_environment_digest` pair. Offline
-/// (no trusted probe run) this registry is empty, so `derive_final_verdict`
-/// returns `NotRun` (Pending) for any evidence whose observation is not
-/// registered; a self-reported hash alone can never green-light a `Pass`.
+/// A behavioral `Pass` must be backed by an OPAQUE [`TrustToken`] minted by the
+/// verifier's real artifact-verification step — never by a caller-supplied
+/// `observation_source_hash` / `execution_environment_digest` pair. [`issue`]
+/// is the only way to mint a token, and it binds the observation to the
+/// verifier secret salt. `observation_is_trusted` requires the evidence's token
+/// to exactly match the verifier-minted token for its declared observation AND
+/// that observation to have been actually issued. Offline (no real probe
+/// verification) no token is issued, so the verdict is `NotRun` (Pending); a
+/// forged token is rejected.
+///
+/// [`issue`]: Self::issue
 #[derive(Debug, Clone, Default)]
 pub struct TrustedObservationRegistry {
-    /// `observation_source_hash -> execution_environment_digest`.
-    observations: std::collections::BTreeMap<String, String>,
+    /// `token_secret -> (observation_source_hash, execution_environment_digest)`.
+    observations: std::collections::BTreeMap<String, (String, String)>,
 }
 
 impl TrustedObservationRegistry {
@@ -507,42 +544,47 @@ impl TrustedObservationRegistry {
         Self::default()
     }
 
-    /// Register a verifier-trusted observation: the exact hash of the raw
-    /// observation source and the execution-environment digest that produced
-    /// it. Both must be well-formed 64-hex. Returns `Err` on malformed input.
-    pub fn register(
+    /// Mint an opaque trust token for an observation that the verifier actually
+    /// verified (real artifact-verification step). Both inputs must be
+    /// well-formed 64-hex. Returns `Err` on malformed input; on success returns
+    /// the opaque token to embed in the evidence.
+    pub fn issue(
         &mut self,
         observation_source_hash: &str,
         execution_environment_digest: &str,
-    ) -> Result<(), BehaviorOracleContractError> {
-        let h = observation_source_hash.trim().to_lowercase();
-        let e = execution_environment_digest.trim().to_lowercase();
-        if !is_sha256(&h) || !is_sha256(&e) {
+    ) -> Result<TrustToken, BehaviorOracleContractError> {
+        let source = observation_source_hash.trim().to_lowercase();
+        let env = execution_environment_digest.trim().to_lowercase();
+        if !is_sha256(&source) || !is_sha256(&env) {
             return Err(BehaviorOracleContractError::BadObservationIdentity);
         }
-        self.observations.insert(h, e);
-        Ok(())
+        let token = observer_token_for(&source, &env);
+        self.observations
+            .insert(token.as_str().to_string(), (source, env));
+        Ok(token)
     }
 
-    /// Whether the evidence's self-declared observation is trusted AND matches
-    /// the registered environment digest exactly. A self-reported hash that is
-    /// not registered (or registered with a different environment digest)
-    /// yields `NotRun` (Pending), never `Pass`.
+    /// Whether the evidence's observation is backed by a verifier-minted opaque
+    /// trust token that (a) exactly matches the verifier's token for the
+    /// declared observation and (b) corresponds to an actually-issued
+    /// observation. A forged/unregistered token yields `NotRun` (Pending),
+    /// never `Pass`.
     pub fn observation_is_trusted(&self, evidence: &BehaviorOracleContractEvidence) -> bool {
-        let h = evidence
-            .equivalence_proof
-            .observation_source_hash
+        let proof = &evidence.equivalence_proof;
+        let source = proof.observation_source_hash.trim().to_lowercase();
+        let env = proof.execution_environment_digest.trim().to_lowercase();
+        // The declared token must be the verifier-minted token for this
+        // (source, env) pair, AND the pair must have been issued.
+        let expected = observer_token_for(&source, &env);
+        proof
+            .trust_token
             .trim()
-            .to_lowercase();
-        let e = evidence
-            .equivalence_proof
-            .execution_environment_digest
-            .trim()
-            .to_lowercase();
-        self.observations
-            .get(&h)
-            .map(|registered| *registered == e)
-            .unwrap_or(false)
+            .eq_ignore_ascii_case(expected.as_str())
+            && self
+                .observations
+                .get(expected.as_str())
+                .map(|(s, e)| *s == source && *e == env)
+                .unwrap_or(false)
     }
 }
 
@@ -793,13 +835,14 @@ fn validate_equivalence_proof_shape(
     if !evidence.equivalence_proof.is_well_formed() {
         return Err(BehaviorOracleContractError::BadEquivalenceProof);
     }
-    // The observation source hash and environment digest must be well-formed
-    // 64-hex (they are required fields). A malformed value is rejected up
-    // front; a well-formed but UNREGISTERED value is not trusted for a Pass
-    // (see `TrustedObservationRegistry::observation_is_trusted`).
+    // The observation source hash, environment digest, and the opaque trust
+    // token must all be well-formed 64-hex. A malformed value is rejected up
+    // front; a well-formed but UNREGISTERED / FORGED token is not trusted for a
+    // Pass (see `TrustedObservationRegistry::observation_is_trusted`).
     let proof = &evidence.equivalence_proof;
     if !is_sha256(proof.observation_source_hash.trim())
         || !is_sha256(proof.execution_environment_digest.trim())
+        || !is_sha256(proof.trust_token.trim())
     {
         return Err(BehaviorOracleContractError::BadObservationIdentity);
     }
@@ -896,10 +939,10 @@ fn reject_equivalence_manufacture(
 ///
 /// - any observable failing → `Fail`;
 /// - all observables passing but the observation is NOT verifier-trusted
-///   (offline: no trusted probe run registered) → `NotRun` (Pending), never
-///   `Pass`. A self-reported `observation_source_hash`/`execution_environment_
-///   digest` is never sufficient — the observation must be registered in the
-///   verifier-side [`TrustedObservationRegistry`];
+///   (offline: no opaque token issued for a real probe run) → `NotRun`
+///   (Pending), never `Pass`. A self-reported observation hash or a forged
+///   trust token is never sufficient — the evidence must carry a token minted
+///   by the verifier-side [`TrustedObservationRegistry`];
 /// - all observables passing AND the observation is verifier-trusted → `Pass`.
 fn derive_final_verdict(
     all_pass: bool,
@@ -1261,8 +1304,9 @@ mod tests {
 
     /// A clean, complete, allowlist-clean structured equivalence proof that
     /// establishes a verifier-trusted runtime observation (so the contract may
-    /// `Pass`). The observation hash/environment pair must be registered in the
-    /// returned [`TrustedObservationRegistry`] for a `Pass`.
+    /// `Pass`). The `trust_token` must be the one minted by the
+    /// [`TrustedObservationRegistry`] returned by [`trusted_observations`] for
+    /// the same (source, env) pair — it is opaque and not caller-derivable.
     fn clean_proof() -> EquivalenceProof {
         EquivalenceProof {
             probe_binary_identity: cli_id(),
@@ -1275,17 +1319,20 @@ mod tests {
             forced_visibility: false,
             server_patch_state: None,
             icon_patch_state: None,
+            trust_token: observer_token_for(&sha("observation-source"), &sha("exec-env"))
+                .as_str()
+                .to_string(),
             observation_source_hash: sha("observation-source"),
             execution_environment_digest: sha("exec-env"),
         }
     }
 
-    /// The verifier-side trusted observation registry that registers the clean
-    /// proof's observation, so `valid_evidence` may `Pass`.
+    /// The verifier-side trusted observation registry that issues the opaque
+    /// token for the clean proof's observation, so `valid_evidence` may `Pass`.
     fn trusted_observations() -> TrustedObservationRegistry {
         let mut reg = TrustedObservationRegistry::new();
-        reg.register(&sha("observation-source"), &sha("exec-env"))
-            .expect("register clean observation");
+        reg.issue(&sha("observation-source"), &sha("exec-env"))
+            .expect("issue clean observation token");
         reg
     }
 
@@ -1991,6 +2038,51 @@ mod tests {
             &expected("origin_macro", &plan),
             &registry_with(&plan),
             &trusted_observations(),
+        )
+        .unwrap();
+        assert_eq!(out.final_verdict, BehaviorContractVerdict::NotRun);
+    }
+
+    /// The opaque trust token is NOT caller-derivable: a forged token (even for
+    /// the exact issued (source, env) pair) that does not match the
+    /// verifier-minted value is rejected → NotRun, never Pass.
+    #[test]
+    fn forged_trust_token_is_not_trusted() {
+        let plan = default_plan_sha();
+        let mut ev = valid_evidence("origin_macro", &plan);
+        // Same (source, env) as the issued observation, but a GUESSED token.
+        ev.equivalence_proof.trust_token = sha("attacker-guessed-token");
+        let out = verify_contract_bound(
+            &ev,
+            &expected("origin_macro", &plan),
+            &registry_with(&plan),
+            &trusted_observations(),
+        )
+        .unwrap();
+        assert_eq!(out.final_verdict, BehaviorContractVerdict::NotRun);
+    }
+
+    /// A token minted for observation A cannot authorize observation B (token
+    /// is observation-bound).
+    #[test]
+    fn token_bound_to_one_observation_does_not_authorize_another() {
+        let plan = default_plan_sha();
+        // Mint a token for observation A, but evidence claims observation B with
+        // A's token → not trusted.
+        let mut reg = TrustedObservationRegistry::new();
+        reg.issue(&sha("observation-a"), &sha("env-a"))
+            .expect("issue A");
+        let mut ev = valid_evidence("origin_macro", &plan);
+        ev.equivalence_proof.trust_token = observer_token_for(&sha("observation-a"), &sha("env-a"))
+            .as_str()
+            .to_string();
+        ev.equivalence_proof.observation_source_hash = sha("observation-b");
+        ev.equivalence_proof.execution_environment_digest = sha("env-b");
+        let out = verify_contract_bound(
+            &ev,
+            &expected("origin_macro", &plan),
+            &registry_with(&plan),
+            &reg,
         )
         .unwrap();
         assert_eq!(out.final_verdict, BehaviorContractVerdict::NotRun);

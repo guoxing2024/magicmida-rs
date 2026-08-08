@@ -122,7 +122,7 @@ fn report_schema_fields_present() {
     ] {
         assert!(v.get(key).is_some(), "missing {key}");
     }
-    assert_eq!(v["schema_version"], "mida.acceptance-report/v1");
+    assert_eq!(v["schema_version"], "mida.acceptance-report/v2");
     assert_eq!(v["verdict"], "StructuralPassBehaviorPending");
     // R0B independent parser: residual_risks must stay empty.
     let residual = v["residual_risks"]
