@@ -46,7 +46,7 @@ pub use behavior_oracle_contract::{
     BehaviorObservable, BehaviorObserved, BehaviorObservedStatus, BehaviorOracleContractError,
     BehaviorOracleContractEvidence, BehaviorStimulus, ComputedObservable, ContractVerdict,
     EquivalenceProof, ExpectedBinding, ObservableVerdict, PatchProofEntry, StimulusPlanRef,
-    StimulusPlanRegistry, TransformProofEntry, TrustToken, TrustedObservationRegistry,
+    StimulusPlanRegistry, TransformProofEntry, TrustedObservationRegistry,
     BEHAVIOR_ORACLE_CONTRACT_SCHEMA_VERSION, BLOCKER_CASE_BUSINESS_DEFINITION,
     CONTRACT_REQUIRED_CASES,
 };
@@ -67,8 +67,8 @@ pub use isolated_replay_ledger::{
 };
 pub use oracle::{observe_oracle, OracleObservation};
 pub use report::{
-    AcceptanceReport, FailureRecord, GateResult, GateStatus, ResidualRisk, TrustTier,
-    WarningRecord, REPORT_SCHEMA_VERSION,
+    parse_product_report, AcceptanceReport, FailureRecord, GateResult, GateStatus, ReportError,
+    ResidualRisk, TrustTier, WarningRecord, REPORT_SCHEMA_VERSION,
 };
 pub use survival_structural_evidence::{
     verify_structural_evidence, verify_survival_evidence, ExpectedEvidenceBinding,

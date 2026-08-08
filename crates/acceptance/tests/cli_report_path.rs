@@ -329,6 +329,49 @@ fn allow_unsigned_managed_can_accept() {
     );
 }
 
+/// A product-gating machine consumer must use the STRICT `parse_product_report`
+/// parser (not a raw serde deserialize) so a lab/unsigned report cannot be
+/// misread as product-acceptable.
+#[test]
+fn product_consumer_gates_on_parse_product_report() {
+    use mida_acceptance::{parse_product_report, TrustTier, Verdict};
+
+    let dir = TestDir::new();
+    let pe = build_minimal_pe(&dir);
+    let candidate = dir.path().join("cand.exe");
+    let evidence = dir.path().join("evidence.json");
+    let manifest = dir.path().join("cand.transform_manifest.json");
+    fs::write(&candidate, &pe).unwrap();
+    write_empty_manifest(&manifest, &pe);
+    let dig = mida_acceptance::sha256_hex(&pe);
+    write_minimal_evidence(&evidence, &dig, pe.len() as u64, "Pass", "pass");
+
+    let output = run_behavior_raw(&[
+        "check-with-behavior",
+        candidate.to_str().unwrap(),
+        "--behavior-evidence",
+        evidence.to_str().unwrap(),
+        "--allow-unsigned-managed",
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // The report body is the JSON on stdout; a product consumer parses it with
+    // the strict parser and must see it as NOT product-acceptable.
+    let report = parse_product_report(stdout.trim().as_bytes()).expect("strict parse");
+    assert!(
+        !report.product_acceptable,
+        "unsigned-lab must not be product-acceptable"
+    );
+    // The `--allow-unsigned-managed` lab path reports Lab (never Product).
+    assert_ne!(report.trust_tier, TrustTier::Product);
+    assert_eq!(report.verdict, Verdict::Accepted);
+}
+
+fn build_minimal_pe(dir: &TestDir) -> Vec<u8> {
+    use synth::{build_pe, PeBuildOptions};
+    let _ = dir;
+    build_pe(&PeBuildOptions::pe32_plus())
+}
+
 #[test]
 fn report_cannot_overwrite_transform_manifest() {
     use synth::{build_pe, PeBuildOptions};

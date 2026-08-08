@@ -330,22 +330,22 @@ pub struct EquivalenceProof {
     /// Icon patch state (Some → manufacture).
     #[serde(default)]
     pub icon_patch_state: Option<String>,
-    /// Opaque trust token minted ONLY by the verifier's real artifact-verification
-    /// step (see [`TrustedObservationRegistry::issue`]). It is an unguessable,
-    /// non-caller-derivable value (derived from a verifier-held secret salt +
-    /// the verified observation), so a caller who merely knows the observation
-    /// hashes cannot forge a token. The verdict is `Pass` only when this token
-    /// resolves to a trusted, issued observation that exactly matches the
-    /// declared `observation_source_hash` / `execution_environment_digest`.
+    /// Opaque trust token produced ONLY by the real verifier seam
+    /// ([`verify_observation_artifact`]) for an artifact it actually verified
+    /// under an externally-injected verifier key. A caller cannot mint or
+    /// recompute one. The verdict is `Pass` only when this token resolves, in
+    /// the verifier-side [`TrustedObservationRegistry`], to a verified
+    /// observation whose every trust binding (case/candidate/protected/probe/
+    /// runner/tool revision/runner config digest) matches this evidence exactly.
     pub trust_token: String,
     /// Hash of the raw observation source (probe logs). **Descriptive**: this
-    /// field is cross-checked against the observation bound to the `trust_token`.
-    /// It is not, by itself, proof of a real observation — only the opaque
-    /// `trust_token` is.
+    /// field is cross-checked against the observation bound to the `trust_token`
+    /// and must equal the hash the verifier recomputed from the observation
+    /// artifact bytes. It is not, by itself, proof of a real observation.
     pub observation_source_hash: String,
     /// Digest of the execution environment that produced the observation.
-    /// **Descriptive** and cross-checked against the observation bound to the
-    /// `trust_token`.
+    /// **Descriptive** and cross-checked against the environment digest the
+    /// verifier recomputed from the canonicalized environment manifest.
     pub execution_environment_digest: String,
 }
 
@@ -492,11 +492,15 @@ impl StimulusPlanRegistry {
     }
 }
 
-/// An opaque trust token minted by the verifier's real artifact-verification
-/// step. The token is an unguessable, non-caller-derivable 64-hex value; a
-/// caller who only knows the observation hashes cannot produce it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TrustToken(String);
+/// An opaque trust token held ONLY by the verifier. It is derived with HMAC-
+/// SHA256 over every bound artifact field, keyed by an EXTERNALLY-INJECTED
+/// verifier key (from a real trust root — never a hardcoded or serialized
+/// secret). It is intentionally NOT `Serialize`/`Deserialize`: the value is
+/// carried in evidence as a plain opaque string, but a caller can neither mint
+/// one (no public API) nor recompute one (key not in the library). It is also
+/// NOT re-exported from the crate root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TrustToken(String);
 
 impl TrustToken {
     fn as_str(&self) -> &str {
@@ -504,39 +508,215 @@ impl TrustToken {
     }
 }
 
-/// Verifier-held secret salt used to mint opaque observation trust tokens. This
-/// lives only inside the verifier crate and is NEVER serialized into evidence,
-/// so a caller cannot recompute a valid token from the observation hashes.
-const OBSERVER_TOKEN_SECRET_SALT: &[u8] = b"mida-acceptance-v2-observer-secret-salt";
+/// Trusted bindings the real verifier must cross-check an observation artifact
+/// against before it may enter the trusted registry. These are the artifact's
+/// identity and scope: the observation is ONLY trusted for the exact candidate,
+/// case, protected input, probe, runner, tool revision and runner-config digest
+/// that were verified together. Reusing an observation across any other
+/// artifact is rejected (token replay / scope confusion).
+#[derive(Debug, Clone)]
+pub(crate) struct VerifiedObservationBindings {
+    pub case_id: String,
+    pub candidate_sha256: String,
+    pub protected_sha256: String,
+    pub probe_sha256: String,
+    pub runner_sha256: String,
+    pub tool_revision: String,
+    pub runner_config_digest: String,
+}
 
-/// Derive the opaque token for a given observation (source hash + environment
-/// digest) under the verifier's secret salt.
-fn observer_token_for(source: &str, env: &str) -> TrustToken {
-    let mut msg = Vec::with_capacity(OBSERVER_TOKEN_SECRET_SALT.len() + source.len() + env.len());
-    msg.extend_from_slice(OBSERVER_TOKEN_SECRET_SALT);
-    msg.extend_from_slice(source.trim().to_lowercase().as_bytes());
-    msg.extend_from_slice(env.trim().to_lowercase().as_bytes());
-    TrustToken(crate::sha256_hex(&msg))
+/// A real, verifier-verified runtime observation. All fields are private and
+/// there is NO public constructor: a value of this type can only be produced by
+/// [`verify_observation_artifact`], which reads the actual observation bytes and
+/// environment manifest, recomputes their hashes, binds every trust field, and
+/// HMAC-signs the whole binding under the externally-injected verifier key.
+/// External callers cannot manufacture one.
+#[derive(Debug, Clone)]
+pub(crate) struct VerifiedObservationArtifact {
+    observation_source_hash: String,
+    execution_environment_digest: String,
+    token: TrustToken,
+    bindings: VerifiedObservationBindings,
+}
+
+/// HMAC-SHA256 (RFC 2104) over `msg` keyed by `key`, returned as 64-hex. Used to
+/// derive the opaque observation trust token from an externally-injected
+/// verifier key.
+fn hmac_sha256(key: &[u8], msg: &[u8]) -> String {
+    const BLOCK: usize = 64;
+    let mut key_block = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        let d = crate::sha256_hex(key);
+        let bytes = hex_to_bytes(&d);
+        key_block[..32.min(bytes.len())].copy_from_slice(&bytes[..32.min(bytes.len())]);
+    } else {
+        key_block[..key.len()].copy_from_slice(key);
+    }
+    let mut ipad = [0x36u8; BLOCK];
+    let mut opad = [0x5cu8; BLOCK];
+    for i in 0..BLOCK {
+        ipad[i] ^= key_block[i];
+        opad[i] ^= key_block[i];
+    }
+    let inner = crate::sha256_hex(&[ipad.as_slice(), msg].concat());
+    let inner_bytes = hex_to_bytes(&inner);
+    crate::sha256_hex(&[opad.as_slice(), inner_bytes.as_slice()].concat())
+}
+
+/// Decode a 64-char lowercase hex SHA-256 into 32 raw bytes. Panics on
+/// malformed input (only ever called on freshly-computed 64-hex values).
+fn hex_to_bytes(hex: &str) -> Vec<u8> {
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("valid hex"))
+        .collect()
+}
+
+/// Compute the opaque observation token: HMAC-SHA256 over the canonical binding
+/// string (observation + environment hashes + every trust field), keyed by the
+/// injected verifier key. The key is NOT in the library and is NOT derivable
+/// from the observation strings, so a caller cannot recompute the token.
+fn observer_token_for(
+    key: &[u8],
+    observation_source_hash: &str,
+    execution_environment_digest: &str,
+    bindings: &VerifiedObservationBindings,
+) -> TrustToken {
+    let mut msg = String::new();
+    msg.push_str(&format!("obs={observation_source_hash};"));
+    msg.push_str(&format!("env={execution_environment_digest};"));
+    msg.push_str(&format!("case={};", bindings.case_id));
+    msg.push_str(&format!("cand={};", bindings.candidate_sha256));
+    msg.push_str(&format!("prot={};", bindings.protected_sha256));
+    msg.push_str(&format!("probe={};", bindings.probe_sha256));
+    msg.push_str(&format!("runner={};", bindings.runner_sha256));
+    msg.push_str(&format!("toolrev={};", bindings.tool_revision));
+    msg.push_str(&format!("cfg={};", bindings.runner_config_digest));
+    TrustToken(hmac_sha256(key, msg.as_bytes()))
+}
+
+/// Canonicalize the environment manifest bytes into a stable digest. The
+/// canonicalization must be deterministic and reject unknown/malformed keys so
+/// that modifying the environment manifest changes the digest.
+fn canonical_environment_digest(
+    env_manifest: &[u8],
+) -> Result<String, BehaviorOracleContractError> {
+    // Environment manifest is a JSON object of environment facts. We re-serialize
+    // it in a canonical (sorted-key) form so reordering keys or changing a value
+    // changes the digest, while byte-for-byte formatting differences do not.
+    let value: serde_json::Value =
+        serde_json::from_slice(env_manifest).map_err(BehaviorOracleContractError::Json)?;
+    let obj = value
+        .as_object()
+        .ok_or(BehaviorOracleContractError::BadEnvironmentManifest)?;
+    if obj.is_empty() {
+        return Err(BehaviorOracleContractError::BadEnvironmentManifest);
+    }
+    let canonical = canonicalize_json(&value);
+    Ok(crate::sha256_hex(canonical.as_bytes()))
+}
+
+/// Deterministic, key-sorted JSON serialization (stable order, compact, no
+/// insignificant whitespace). Used so a digest is order-independent but
+/// value-dependent.
+fn canonicalize_json(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<_> = map
+                .iter()
+                .map(|(k, v)| format!("{k}:{}", canonicalize_json(v)))
+                .collect();
+            entries.sort();
+            format!("{{{}}}", entries.join(","))
+        }
+        serde_json::Value::Array(arr) => {
+            let inner: Vec<String> = arr.iter().map(canonicalize_json).collect();
+            format!("[{}]", inner.join(","))
+        }
+        serde_json::Value::String(s) => format!("\"{s}\""),
+        other => other.to_string(),
+    }
+}
+
+/// The REAL verifier seam that turns observation artifact bytes into a trusted
+/// [`VerifiedObservationArtifact`]. This is `pub(crate)`: it is reachable only
+/// inside the acceptance crate (the verifier), never by library consumers.
+///
+/// It performs the actual artifact verification:
+/// - reads and re-hashes the observation bytes → `observation_source_hash`;
+/// - reads and canonicalizes the environment manifest → `execution_environment_digest`;
+/// - binds case_id, candidate, protected input, probe, runner, tool revision,
+///   runner config digest;
+/// - HMAC-signs the whole binding under the EXTERNALLY-INJECTED `verifier_key`
+///   (a real trust-root secret, never hardcoded here and never serialized).
+///
+/// The `observation_source_hash` / `execution_environment_digest` / `case_id`
+/// fields declared on the candidate evidence are cross-checked against these
+/// recomputed values: the evidence may only claim an observation that the
+/// verifier actually produced for exactly this artifact.
+///
+/// In the current codebase NO production trust root is configured, so this seam
+/// is the honest boundary: offline there is no real observation to verify and
+/// the trusted registry stays empty (every candidate is `NotRun`/`Pending`).
+pub(crate) fn verify_observation_artifact(
+    observation_bytes: &[u8],
+    env_manifest: &[u8],
+    verifier_key: &[u8],
+    bindings: &VerifiedObservationBindings,
+) -> Result<VerifiedObservationArtifact, BehaviorOracleContractError> {
+    if verifier_key.is_empty() {
+        return Err(BehaviorOracleContractError::NoTrustedVerifierKey);
+    }
+    let observation_source_hash = crate::sha256_hex(observation_bytes);
+    let execution_environment_digest = canonical_environment_digest(env_manifest)?;
+    // Reject an empty / blank observation: a real artifact must have content.
+    if observation_bytes.is_empty() {
+        return Err(BehaviorOracleContractError::BadObservationIdentity);
+    }
+    // Cross-check the bindings are well-formed before minting.
+    if !is_sha256(&bindings.candidate_sha256)
+        || !is_sha256(&bindings.protected_sha256)
+        || !is_sha256(&bindings.probe_sha256)
+        || !is_sha256(&bindings.runner_sha256)
+        || !is_sha256(&bindings.runner_config_digest)
+        || bindings.case_id.trim().is_empty()
+        || bindings.tool_revision.trim().is_empty()
+    {
+        return Err(BehaviorOracleContractError::BadObservationBindings);
+    }
+    let token = observer_token_for(
+        verifier_key,
+        &observation_source_hash,
+        &execution_environment_digest,
+        bindings,
+    );
+    Ok(VerifiedObservationArtifact {
+        observation_source_hash,
+        execution_environment_digest,
+        token,
+        bindings: bindings.clone(),
+    })
 }
 
 /// Verifier-side registry of TRUSTED runtime observations (P1 issue 1: no
-/// self-reported-`Some` false-green).
+/// self-reported-`Some` false-green, no caller self-minting).
 ///
-/// A behavioral `Pass` must be backed by an OPAQUE [`TrustToken`] minted by the
-/// verifier's real artifact-verification step — never by a caller-supplied
-/// `observation_source_hash` / `execution_environment_digest` pair. [`issue`]
-/// is the only way to mint a token, and it binds the observation to the
-/// verifier secret salt. `observation_is_trusted` requires the evidence's token
-/// to exactly match the verifier-minted token for its declared observation AND
-/// that observation to have been actually issued. Offline (no real probe
-/// verification) no token is issued, so the verdict is `NotRun` (Pending); a
-/// forged token is rejected.
+/// A behavioral `Pass` is ONLY possible for an observation that was actually
+/// verified by the real verifier seam ([`verify_observation_artifact`]) and
+/// ingested here. There is NO public minting API and the registry is empty by
+/// default; a caller cannot construct a Product trust root from raw strings.
 ///
-/// [`issue`]: Self::issue
+/// `observation_is_trusted` is replay-resistant: it requires the evidence's
+/// opaque token to exactly match the token bound to the verified observation
+/// AND every trust binding (case/candidate/protected/probe/runner/tool revision/
+/// runner config digest) declared on the evidence to equal the verified
+/// artifact's binding. So a token minted for observation A on candidate A
+/// cannot authorize observation B, candidate B, another case, another runner,
+/// a drifted observation, or a drifted environment.
 #[derive(Debug, Clone, Default)]
 pub struct TrustedObservationRegistry {
-    /// `token_secret -> (observation_source_hash, execution_environment_digest)`.
-    observations: std::collections::BTreeMap<String, (String, String)>,
+    /// `observation_source_hash -> verified artifact`.
+    artifacts: std::collections::BTreeMap<String, VerifiedObservationArtifact>,
 }
 
 impl TrustedObservationRegistry {
@@ -544,47 +724,58 @@ impl TrustedObservationRegistry {
         Self::default()
     }
 
-    /// Mint an opaque trust token for an observation that the verifier actually
-    /// verified (real artifact-verification step). Both inputs must be
-    /// well-formed 64-hex. Returns `Err` on malformed input; on success returns
-    /// the opaque token to embed in the evidence.
-    pub fn issue(
+    /// Ingest a real verifier-verified observation. `pub(crate)`: only the
+    /// verifier can call this, and only with an artifact it produced. A
+    /// duplicate observation_source_hash with different content is refused
+    /// (fail-closed, never silently overwritten).
+    pub(crate) fn ingest(
         &mut self,
-        observation_source_hash: &str,
-        execution_environment_digest: &str,
-    ) -> Result<TrustToken, BehaviorOracleContractError> {
-        let source = observation_source_hash.trim().to_lowercase();
-        let env = execution_environment_digest.trim().to_lowercase();
-        if !is_sha256(&source) || !is_sha256(&env) {
-            return Err(BehaviorOracleContractError::BadObservationIdentity);
+        artifact: VerifiedObservationArtifact,
+    ) -> Result<(), BehaviorOracleContractError> {
+        let key = artifact.observation_source_hash.clone();
+        if let Some(existing) = self.artifacts.get(&key) {
+            if existing.token != artifact.token {
+                return Err(BehaviorOracleContractError::ObservationCollision(key));
+            }
+            // Same token ⇒ same binding; idempotent re-ingest is allowed.
+            return Ok(());
         }
-        let token = observer_token_for(&source, &env);
-        self.observations
-            .insert(token.as_str().to_string(), (source, env));
-        Ok(token)
+        self.artifacts.insert(key, artifact);
+        Ok(())
     }
 
-    /// Whether the evidence's observation is backed by a verifier-minted opaque
-    /// trust token that (a) exactly matches the verifier's token for the
-    /// declared observation and (b) corresponds to an actually-issued
-    /// observation. A forged/unregistered token yields `NotRun` (Pending),
-    /// never `Pass`.
+    /// Whether the evidence's observation is trusted. See the type docs for the
+    /// full binding requirements (token + all trust fields must match).
     pub fn observation_is_trusted(&self, evidence: &BehaviorOracleContractEvidence) -> bool {
         let proof = &evidence.equivalence_proof;
         let source = proof.observation_source_hash.trim().to_lowercase();
-        let env = proof.execution_environment_digest.trim().to_lowercase();
-        // The declared token must be the verifier-minted token for this
-        // (source, env) pair, AND the pair must have been issued.
-        let expected = observer_token_for(&source, &env);
-        proof
+        let Some(artifact) = self.artifacts.get(&source) else {
+            // Not a verifier-verified observation (empty offline registry → false).
+            return false;
+        };
+        // Token must match the verified artifact's token.
+        if !proof
             .trust_token
             .trim()
-            .eq_ignore_ascii_case(expected.as_str())
-            && self
-                .observations
-                .get(expected.as_str())
-                .map(|(s, e)| *s == source && *e == env)
-                .unwrap_or(false)
+            .eq_ignore_ascii_case(artifact.token.as_str())
+        {
+            return false;
+        }
+        // Environment digest must match.
+        if proof.execution_environment_digest.trim().to_lowercase()
+            != artifact.execution_environment_digest
+        {
+            return false;
+        }
+        // Every trust binding must match (replay / scope-confusion resistant).
+        let b = &artifact.bindings;
+        evidence.case_id.trim() == b.case_id.trim()
+            && evidence.candidate.sha256.trim().to_lowercase() == b.candidate_sha256
+            && evidence.protected_input.sha256.trim().to_lowercase() == b.protected_sha256
+            && evidence.cli_identity.sha256.trim().to_lowercase() == b.probe_sha256
+            && evidence.verifier_identity.sha256.trim().to_lowercase() == b.runner_sha256
+            && evidence.tool_revision.trim() == b.tool_revision
+            && evidence.runner_config_digest.trim().to_lowercase() == b.runner_config_digest
     }
 }
 
@@ -675,6 +866,18 @@ pub enum BehaviorOracleContractError {
          well-formed 64-hex"
     )]
     BadObservationIdentity,
+    #[error(
+        "no trusted verifier key configured — observation trust cannot be established offline"
+    )]
+    NoTrustedVerifierKey,
+    #[error("environment manifest is missing or malformed")]
+    BadEnvironmentManifest,
+    #[error(
+        "observation artifact bindings are malformed (must be non-empty + well-formed hashes)"
+    )]
+    BadObservationBindings,
+    #[error("conflicting observation artifact re-registered under the same source hash")]
+    ObservationCollision(String),
     #[error(
         "equivalence_proof declares an equivalence-manufacture marker: {0} (structured; never \
          reason text)"
@@ -1304,10 +1507,17 @@ mod tests {
 
     /// A clean, complete, allowlist-clean structured equivalence proof that
     /// establishes a verifier-trusted runtime observation (so the contract may
-    /// `Pass`). The `trust_token` must be the one minted by the
-    /// [`TrustedObservationRegistry`] returned by [`trusted_observations`] for
-    /// the same (source, env) pair — it is opaque and not caller-derivable.
+    /// `Pass`). The `trust_token` and the observation hashes are the ones the
+    /// REAL verifier seam [`verify_observation_artifact`] produces for
+    /// `TEST_OBSERVATION_BYTES` / `TEST_ENV_MANIFEST` under the externally
+    /// injected `TEST_VERIFIER_KEY` and the case's trust bindings — so
+    /// `valid_evidence` claims exactly an observation the verifier actually
+    /// verified (matching what [`trusted_observations`] ingested).
     fn clean_proof() -> EquivalenceProof {
+        let bindings = test_bindings("origin_macro");
+        let obs = sha256_bytes(TEST_OBSERVATION_BYTES);
+        let env = canonical_environment_digest(TEST_ENV_MANIFEST).expect("canonical env");
+        let token = observer_token_for(TEST_VERIFIER_KEY, &obs, &env, &bindings);
         EquivalenceProof {
             probe_binary_identity: cli_id(),
             runner_binary_identity: verifier_id(),
@@ -1319,21 +1529,55 @@ mod tests {
             forced_visibility: false,
             server_patch_state: None,
             icon_patch_state: None,
-            trust_token: observer_token_for(&sha("observation-source"), &sha("exec-env"))
-                .as_str()
-                .to_string(),
-            observation_source_hash: sha("observation-source"),
-            execution_environment_digest: sha("exec-env"),
+            trust_token: token.as_str().to_string(),
+            observation_source_hash: obs,
+            execution_environment_digest: env,
         }
     }
 
-    /// The verifier-side trusted observation registry that issues the opaque
-    /// token for the clean proof's observation, so `valid_evidence` may `Pass`.
+    /// The verifier-side trusted observation registry populated through the REAL
+    /// verifier seam: it verifies `TEST_OBSERVATION_BYTES` / `TEST_ENV_MANIFEST`
+    /// under the injected test key and ingests the resulting artifact. This is
+    /// the only way a `Pass` can occur in tests — exactly as in production, a
+    /// `Pass` requires a verifier-verified observation.
     fn trusted_observations() -> TrustedObservationRegistry {
         let mut reg = TrustedObservationRegistry::new();
-        reg.issue(&sha("observation-source"), &sha("exec-env"))
-            .expect("issue clean observation token");
+        let artifact = verify_observation_artifact(
+            TEST_OBSERVATION_BYTES,
+            TEST_ENV_MANIFEST,
+            TEST_VERIFIER_KEY,
+            &test_bindings("origin_macro"),
+        )
+        .expect("verify real observation artifact");
+        reg.ingest(artifact).expect("ingest verified artifact");
         reg
+    }
+
+    /// Test observation artifact bytes (non-empty, verifier-verified in tests).
+    const TEST_OBSERVATION_BYTES: &[u8] = b"real-probe-observation-log";
+    /// Test environment manifest (a JSON object; canonicalized by the verifier).
+    const TEST_ENV_MANIFEST: &[u8] = br#"{"arch":"x86_64","os":"win","budget":"controlled"}"#;
+    /// Externally-injected verifier key used by the tests. This is NOT a
+    /// hardcoded library secret — it is injected at the seam exactly as a real
+    /// deployment would inject a verifier trust-root key.
+    const TEST_VERIFIER_KEY: &[u8] = b"unit-test-injected-verifier-key-material";
+
+    fn sha256_bytes(b: &[u8]) -> String {
+        crate::sha256_hex(b)
+    }
+
+    /// The trust bindings the tests use, matching the identity fields that
+    /// `valid_evidence(case_id)` produces.
+    fn test_bindings(case_id: &str) -> VerifiedObservationBindings {
+        VerifiedObservationBindings {
+            case_id: case_id.to_string(),
+            candidate_sha256: sha("candidate"),
+            protected_sha256: sha("protected"),
+            probe_sha256: sha("cli-binary"),
+            runner_sha256: sha("verifier"),
+            tool_revision: "oreans/two-sample-mainline@1".to_string(),
+            runner_config_digest: "aa".repeat(32),
+        }
     }
 
     fn expected(case_id: &str, plan_sha: &str) -> ExpectedBinding {
@@ -1991,10 +2235,11 @@ mod tests {
     fn missing_observation_source_returns_not_run_not_pass() {
         let plan = default_plan_sha();
         let mut ev = valid_evidence("origin_macro", &plan);
-        // A well-formed but UNREGISTERED observation (self-reported Some-equivalent)
+        // A well-formed but UNVERIFIED observation (self-reported Some-equivalent)
         // is not verifier-trusted → NotRun (Pending), never a fabricated Pass.
         ev.equivalence_proof.observation_source_hash = sha("self-reported-fake-observation");
         ev.equivalence_proof.execution_environment_digest = sha("self-reported-fake-env");
+        ev.equivalence_proof.trust_token = sha("self-reported-fake-token");
         let out = verify_contract_bound(
             &ev,
             &expected("origin_macro", &plan),
@@ -2002,20 +2247,22 @@ mod tests {
             &trusted_observations(),
         )
         .unwrap();
-        // Self-reported observation is not registered → Pending, never Pass.
+        // Self-reported observation is not verifier-verified → Pending, never Pass.
         assert_eq!(out.final_verdict, BehaviorContractVerdict::NotRun);
     }
 
-    /// P1 issue 1: a caller self-reporting `Some(observation_hash)` must NOT
-    /// green-light a `Pass`. The observation must be registered in the
-    /// verifier-side trusted registry. This is the false-green regression test.
+    /// P1 issue 1: a caller self-reporting an observation hash + environment
+    /// digest must NOT green-light a `Pass`, even with a well-formed token.
+    /// Only an observation the real verifier seam verified is trusted. This is
+    /// the false-green regression test.
     #[test]
     fn self_reported_observation_cannot_produce_pass() {
         let plan = default_plan_sha();
         let mut ev = valid_evidence("origin_macro", &plan);
-        // The caller fabricates a well-formed but unregistered observation.
+        // The caller fabricates a well-formed but never-verified observation.
         ev.equivalence_proof.observation_source_hash = sha("forged-source");
         ev.equivalence_proof.execution_environment_digest = sha("forged-env");
+        ev.equivalence_proof.trust_token = sha("forged-token");
         let out = verify_contract_bound(
             &ev,
             &expected("origin_macro", &plan),
@@ -2026,8 +2273,8 @@ mod tests {
         assert_eq!(out.final_verdict, BehaviorContractVerdict::NotRun);
     }
 
-    /// A REGISTERED observation with a DIFFERENT environment digest is also not
-    /// trusted (the pair must match exactly).
+    /// A verifier-verified observation with a DIFFERENT environment digest is
+    /// not trusted (environment digest drift).
     #[test]
     fn registered_observation_wrong_environment_is_not_run() {
         let plan = default_plan_sha();
@@ -2044,13 +2291,13 @@ mod tests {
     }
 
     /// The opaque trust token is NOT caller-derivable: a forged token (even for
-    /// the exact issued (source, env) pair) that does not match the
+    /// the exact verified (source, env) pair) that does not match the
     /// verifier-minted value is rejected → NotRun, never Pass.
     #[test]
     fn forged_trust_token_is_not_trusted() {
         let plan = default_plan_sha();
         let mut ev = valid_evidence("origin_macro", &plan);
-        // Same (source, env) as the issued observation, but a GUESSED token.
+        // Same (source, env) as the verified observation, but a GUESSED token.
         ev.equivalence_proof.trust_token = sha("attacker-guessed-token");
         let out = verify_contract_bound(
             &ev,
@@ -2062,22 +2309,37 @@ mod tests {
         assert_eq!(out.final_verdict, BehaviorContractVerdict::NotRun);
     }
 
-    /// A token minted for observation A cannot authorize observation B (token
-    /// is observation-bound).
+    /// A token minted (via the real verifier seam) for observation A cannot
+    /// authorize observation B: the token is observation-bound.
     #[test]
     fn token_bound_to_one_observation_does_not_authorize_another() {
         let plan = default_plan_sha();
-        // Mint a token for observation A, but evidence claims observation B with
-        // A's token → not trusted.
+        // Verify observation A through the real seam.
+        let obs_a: &[u8] = b"observation-a-log";
         let mut reg = TrustedObservationRegistry::new();
-        reg.issue(&sha("observation-a"), &sha("env-a"))
-            .expect("issue A");
+        let artifact_a = verify_observation_artifact(
+            obs_a,
+            TEST_ENV_MANIFEST,
+            TEST_VERIFIER_KEY,
+            &test_bindings("origin_macro"),
+        )
+        .expect("verify A");
+        reg.ingest(artifact_a).expect("ingest A");
+        // Evidence claims observation B with A's token → not trusted.
         let mut ev = valid_evidence("origin_macro", &plan);
-        ev.equivalence_proof.trust_token = observer_token_for(&sha("observation-a"), &sha("env-a"))
-            .as_str()
-            .to_string();
+        let obs_a_hash = sha256_bytes(obs_a);
         ev.equivalence_proof.observation_source_hash = sha("observation-b");
-        ev.equivalence_proof.execution_environment_digest = sha("env-b");
+        ev.equivalence_proof.execution_environment_digest =
+            canonical_environment_digest(TEST_ENV_MANIFEST).expect("env");
+        // Reuse A's token: it must NOT authorize observation B.
+        ev.equivalence_proof.trust_token = observer_token_for(
+            TEST_VERIFIER_KEY,
+            &obs_a_hash,
+            &canonical_environment_digest(TEST_ENV_MANIFEST).expect("env"),
+            &test_bindings("origin_macro"),
+        )
+        .as_str()
+        .to_string();
         let out = verify_contract_bound(
             &ev,
             &expected("origin_macro", &plan),
@@ -2086,6 +2348,196 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out.final_verdict, BehaviorContractVerdict::NotRun);
+    }
+
+    /// Caller cannot self-issue a trusted observation: the real verifier seam
+    /// requires the externally-injected key and real artifact bytes; an empty
+    /// registry (no real verification) yields NotRun. This proves there is no
+    /// public path for a caller to mint a Pass.
+    #[test]
+    fn caller_cannot_self_issue_a_trusted_observation() {
+        let plan = default_plan_sha();
+        // Offline: no real artifact verifier has run, so the registry is empty.
+        let empty_reg = TrustedObservationRegistry::new();
+        let ev = valid_evidence("origin_macro", &plan);
+        let out = verify_contract_bound(
+            &ev,
+            &expected("origin_macro", &plan),
+            &registry_with(&plan),
+            &empty_reg,
+        )
+        .unwrap();
+        assert_eq!(out.final_verdict, BehaviorContractVerdict::NotRun);
+        // And even a caller-supplied token can never become trusted without the
+        // real verifier seam ingesting an artifact for it.
+        assert!(!empty_reg.observation_is_trusted(&ev));
+    }
+
+    /// Without a real verifier key (empty), the artifact verification fails
+    /// closed — there is no way to mint an observation trust token offline.
+    #[test]
+    fn artifact_verification_requires_verifier_key() {
+        let err = verify_observation_artifact(
+            TEST_OBSERVATION_BYTES,
+            TEST_ENV_MANIFEST,
+            b"", // no key
+            &test_bindings("origin_macro"),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            BehaviorOracleContractError::NoTrustedVerifierKey
+        ));
+    }
+
+    /// The empty-offline-registry must not trust any evidence, so a caller
+    /// cannot manufacture Product trust without the real verifier.
+    #[test]
+    fn empty_offline_registry_never_trusts() {
+        let reg = TrustedObservationRegistry::new();
+        let ev = valid_evidence("origin_macro", &default_plan_sha());
+        assert!(!reg.observation_is_trusted(&ev));
+    }
+
+    /// Observation bytes drift: the verifier verified one observation log; the
+    /// evidence claims a different observation_source_hash → NotRun.
+    #[test]
+    fn observation_bytes_drift_is_not_trusted() {
+        let plan = default_plan_sha();
+        let mut ev = valid_evidence("origin_macro", &plan);
+        // The verifier verified TEST_OBSERVATION_BYTES; drift the claimed hash.
+        ev.equivalence_proof.observation_source_hash = sha256_bytes(b"drifted-observation-log");
+        let out = verify_contract_bound(
+            &ev,
+            &expected("origin_macro", &plan),
+            &registry_with(&plan),
+            &trusted_observations(),
+        )
+        .unwrap();
+        assert_eq!(out.final_verdict, BehaviorContractVerdict::NotRun);
+    }
+
+    /// Environment manifest drift: the verifier canonicalized TEST_ENV_MANIFEST;
+    /// a different environment digest → NotRun.
+    #[test]
+    fn environment_digest_drift_is_not_trusted() {
+        let plan = default_plan_sha();
+        let mut ev = valid_evidence("origin_macro", &plan);
+        ev.equivalence_proof.execution_environment_digest =
+            canonical_environment_digest(br#"{"arch":"arm64","os":"win","budget":"unlimited"}"#)
+                .expect("env");
+        let out = verify_contract_bound(
+            &ev,
+            &expected("origin_macro", &plan),
+            &registry_with(&plan),
+            &trusted_observations(),
+        )
+        .unwrap();
+        assert_eq!(out.final_verdict, BehaviorContractVerdict::NotRun);
+    }
+
+    /// Replay across a different CANDIDATE is rejected: a token verified for
+    /// candidate A cannot authorize candidate B.
+    #[test]
+    fn token_verified_for_candidate_a_does_not_authorize_candidate_b() {
+        let reg = trusted_observations();
+        let mut ev = valid_evidence("origin_macro", &default_plan_sha());
+        ev.candidate = valid_identity("attacker-candidate");
+        // The registry must refuse to trust this evidence: the token is bound
+        // to the original candidate, not attacker-candidate.
+        assert!(!reg.observation_is_trusted(&ev));
+    }
+
+    /// Replay across a different CASE is rejected.
+    #[test]
+    fn token_verified_for_case_a_does_not_authorize_case_b() {
+        let reg = trusted_observations(); // minted for origin_macro
+        let ev = valid_evidence("lunlun_software", &default_plan_sha());
+        assert!(!reg.observation_is_trusted(&ev));
+    }
+
+    /// Replay across a different RUNNER (verifier identity) is rejected.
+    #[test]
+    fn token_verified_for_runner_a_does_not_authorize_runner_b() {
+        let reg = trusted_observations();
+        let mut ev = valid_evidence("origin_macro", &default_plan_sha());
+        ev.verifier_identity = BehaviorChainIdentity {
+            sha256: sha("attacker-verifier"),
+            version: "attacker-v1".to_string(),
+        };
+        assert!(!reg.observation_is_trusted(&ev));
+    }
+
+    /// Replay across a different PROBE (cli identity) is rejected.
+    #[test]
+    fn token_verified_for_probe_a_does_not_authorize_probe_b() {
+        let reg = trusted_observations();
+        let mut ev = valid_evidence("origin_macro", &default_plan_sha());
+        ev.cli_identity = BehaviorChainIdentity {
+            sha256: sha("attacker-cli"),
+            version: "attacker-cli-v1".to_string(),
+        };
+        assert!(!reg.observation_is_trusted(&ev));
+    }
+
+    /// Replay across a different RUNNER CONFIG DIGEST is rejected.
+    #[test]
+    fn token_verified_for_runner_config_a_does_not_authorize_config_b() {
+        let reg = trusted_observations();
+        let mut ev = valid_evidence("origin_macro", &default_plan_sha());
+        ev.runner_config_digest = "bb".repeat(32);
+        assert!(!reg.observation_is_trusted(&ev));
+    }
+
+    /// A duplicate observation_source_hash re-verified with DIFFERENT content
+    /// must fail closed (ObservationCollision), never silently overwrite.
+    #[test]
+    fn duplicate_observation_source_with_different_content_fails_closed() {
+        let mut reg = TrustedObservationRegistry::new();
+        let a = verify_observation_artifact(
+            TEST_OBSERVATION_BYTES,
+            TEST_ENV_MANIFEST,
+            TEST_VERIFIER_KEY,
+            &test_bindings("origin_macro"),
+        )
+        .expect("first verify");
+        reg.ingest(a).expect("ingest first");
+        // Re-verify the SAME source hash but different content under a different
+        // key would produce a different token → collision. But the source hash
+        // here is determined by the bytes; to force a collision we must reuse the
+        // same bytes (same hash) yet a different binding ⇒ different token.
+        let different_bindings = VerifiedObservationBindings {
+            candidate_sha256: sha("different-candidate"),
+            ..test_bindings("origin_macro")
+        };
+        let b = verify_observation_artifact(
+            TEST_OBSERVATION_BYTES,
+            TEST_ENV_MANIFEST,
+            TEST_VERIFIER_KEY,
+            &different_bindings,
+        )
+        .expect("second verify");
+        // Same source hash, different token → must fail closed.
+        assert!(reg.ingest(b).is_err());
+    }
+
+    /// Only an artifact the real verifier seam actually verified can produce a
+    /// Pass — the positive control.
+    #[test]
+    fn only_real_verifier_verified_artifact_can_pass() {
+        let plan = default_plan_sha();
+        // Build a registry through the real seam.
+        let reg = trusted_observations();
+        let ev = valid_evidence("origin_macro", &plan);
+        assert!(reg.observation_is_trusted(&ev));
+        let out = verify_contract_bound(
+            &ev,
+            &expected("origin_macro", &plan),
+            &registry_with(&plan),
+            &reg,
+        )
+        .unwrap();
+        assert_eq!(out.final_verdict, BehaviorContractVerdict::Pass);
     }
 
     #[test]

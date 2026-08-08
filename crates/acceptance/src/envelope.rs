@@ -458,16 +458,37 @@ impl SignatureEnvelope {
 
         enforce_freshness(&self.payload, policy)?;
 
-        // Product algorithm reserved; HMAC is lab-only via explicit policy/flag.
-        if self.signature.algorithm == SIG_ALG_ED25519_V1 {
-            return Err(EnvelopeError::AlgorithmUnsupported(
-                SIG_ALG_ED25519_V1.to_string(),
-            ));
-        }
-        if self.signature.algorithm == SIG_ALG_HMAC_SHA256_V0 && !policy.allow_hmac_lab {
-            return Err(EnvelopeError::AlgorithmUnsupported(format!(
-                "{SIG_ALG_HMAC_SHA256_V0} requires EnvelopePolicy.allow_hmac_lab / --allow-hmac-lab"
-            )));
+        // ---- EXACT signature-algorithm allowlist (P2) ---------------------
+        // verify_bundle must reject any algorithm it does not explicitly
+        // implement BEFORE handing bytes to a caller-supplied SignatureVerifier.
+        // An unknown algorithm is AlgorithmUnsupported immediately — it is never
+        // forwarded to a custom verifier (which might return Ok for anything).
+        match self.signature.algorithm.as_str() {
+            // HMAC-SHA256: lab-only, requires the explicit allow_hmac_lab flag.
+            SIG_ALG_HMAC_SHA256_V0 => {
+                if !policy.allow_hmac_lab {
+                    return Err(EnvelopeError::AlgorithmUnsupported(format!(
+                        "{SIG_ALG_HMAC_SHA256_V0} requires EnvelopePolicy.allow_hmac_lab / \
+                         --allow-hmac-lab"
+                    )));
+                }
+            }
+            // Ed25519: the reserved Product algorithm. No real Ed25519 verifier
+            // (with a fixed key allowlist) is implemented yet, so the Product
+            // path is NOT available — an Ed25519 envelope is Rejected/NotReady,
+            // never claimed as a Product pass.
+            SIG_ALG_ED25519_V1 => {
+                return Err(EnvelopeError::AlgorithmUnsupported(format!(
+                    "{SIG_ALG_ED25519_V1} (product) is reserved but not yet implemented; \
+                     Product trust root is not configured"
+                )));
+            }
+            // Any other algorithm: never forwarded to a custom verifier.
+            other => {
+                return Err(EnvelopeError::AlgorithmUnsupported(format!(
+                    "signature algorithm '{other}' is not in the allowlist"
+                )));
+            }
         }
 
         let sig_bytes = hex_decode(&self.signature.value_hex)?;
@@ -937,6 +958,59 @@ mod tests {
             .verify_bundle(&pe, man.as_bytes(), evi_json.as_bytes(), &policy, &verifier)
             .unwrap_err();
         assert!(matches!(err, EnvelopeError::KeyNotAllowed(_)));
+    }
+
+    /// A SignatureVerifier that accepts ANY signature. Used to prove the exact
+    /// algorithm allowlist rejects an unknown algorithm BEFORE the signature is
+    /// ever handed to a (possibly malicious) custom verifier — an AlwaysOk
+    /// verifier must not be able to green-light an unknown algorithm.
+    struct AlwaysOkVerifier;
+
+    impl SignatureVerifier for AlwaysOkVerifier {
+        fn verify(
+            &self,
+            _algorithm: &str,
+            _key_id: &str,
+            _message: &[u8],
+            _signature: &[u8],
+        ) -> Result<(), EnvelopeError> {
+            Ok(())
+        }
+    }
+
+    /// unknown algorithm + AlwaysOkVerifier must FAIL verify_bundle — the exact
+    /// allowlist rejects unknown algorithms before the verifier is called, so a
+    /// permissive custom verifier cannot mint a VerifiedSignedBundle.
+    #[test]
+    fn unknown_algorithm_rejected_before_always_ok_verifier() {
+        let pe = tiny_pe();
+        let man = empty_manifest_for(&pe);
+        let (_ev, evi_json) = evidence_for(&pe);
+        let payload = base_payload(&pe, man.as_bytes(), evi_json.as_bytes());
+        let key = b"unit-test-hmac-key-material";
+        let env = sign_hmac_sha256_for_test(payload, "ci-lab-test-key", key).unwrap();
+        // Swap the signature algorithm to an unknown value in the envelope JSON.
+        let mut value = serde_json::to_value(&env).unwrap();
+        value["signature"]["algorithm"] =
+            serde_json::Value::String("mida.bogus-unknown/v99".to_string());
+        let tampered =
+            SignatureEnvelope::parse_json(serde_json::to_vec(&value).unwrap().as_slice()).unwrap();
+        // Even an AlwaysOk verifier (which would accept any signature) must not
+        // pass an unknown algorithm.
+        let verifier = AlwaysOkVerifier;
+        let err = tampered
+            .verify_bundle(
+                &pe,
+                man.as_bytes(),
+                evi_json.as_bytes(),
+                &lab_policy("ci-lab-test-key"),
+                &verifier,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, EnvelopeError::AlgorithmUnsupported(_)),
+            "unknown algorithm must be AlgorithmUnsupported, got {err:?}"
+        );
     }
 
     #[test]

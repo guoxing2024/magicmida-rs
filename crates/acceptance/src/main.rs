@@ -952,9 +952,12 @@ fn cmd_check_with_behavior(args: &[String]) -> Result<i32, String> {
                  this is lab diagnostic only, not product authenticity"
                 .to_string(),
         });
-        // P1: an HMAC trust root is lab-only. Force the trust tier to Lab so the
-        // report and exit code never look like a product acceptance even though
-        // `check_with_behavior_signed` labels the envelope path Product.
+        // P1/P2: an HMAC trust root is lab-only. `check_with_behavior_signed`
+        // already labels the HMAC algorithm as Lab at the library level (it
+        // never labels an HMAC envelope Product; only Ed25519 is Product and it
+        // is not yet implemented). This defense-in-depth re-asserts Lab and
+        // product_acceptable=false so the report and exit code never look like a
+        // product acceptance through the HMAC lab path.
         report.trust_tier = mida_acceptance::TrustTier::Lab;
         report.product_acceptable = false;
     } else {

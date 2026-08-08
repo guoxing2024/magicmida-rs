@@ -225,26 +225,30 @@ pub fn check_with_behavior_signed(
     signed: &VerifiedSignedBundle,
 ) -> AcceptanceReport {
     let mut report = compose_managed_uncapped(bytes, opts, signed.evidence(), signed.managed());
-    // P1 issue 3 / review round 3: the trust tier is derived from an EXACT
-    // allowlist over the envelope's signature algorithm, never by defaulting
-    // an unknown algorithm to Product.
-    //
-    //   - mida.ed25519/v1  -> Product   (reserved; the only Product algorithm)
-    //   - mida.hmac-sha256/v0 -> Lab    (caller-controlled shared secret)
-    //   - anything else    -> Rejected  (unknown algorithm must NOT enter the
-    //                                     Product chain; fail closed)
+    // P2: the trust tier is derived from an EXACT allowlist over the envelope's
+    // signature algorithm. Only HMAC (mida.hmac-sha256/v0) is implemented today,
+    // and it is a LAB trust root (caller-controlled shared secret). Ed25519 is
+    // the reserved Product algorithm but is NOT implemented (no real verifier /
+    // fixed key allowlist), so any Ed25519 or unknown-algorithm bundle is
+    // fail-closed: trust_tier=Rejected, verdict forced to Rejected, and a
+    // structured failure appended (never verdict=Accepted + trust_tier=Rejected).
     let algorithm = signed.envelope().signature().algorithm.as_str();
-    report.trust_tier = if report.verdict == Verdict::Rejected {
-        TrustTier::Rejected
-    } else if algorithm == crate::envelope::SIG_ALG_HMAC_SHA256_V0 {
-        TrustTier::Lab
-    } else if algorithm == crate::envelope::SIG_ALG_ED25519_V1 {
-        TrustTier::Product
+    if algorithm != crate::envelope::SIG_ALG_HMAC_SHA256_V0 {
+        report.verdict = Verdict::Rejected;
+        report.trust_tier = TrustTier::Rejected;
+        report.failures.push(FailureRecord {
+            gate_id: "signature_algorithm".to_string(),
+            code: "algorithm_not_allowed".to_string(),
+            message: format!(
+                "signature algorithm '{algorithm}' is not the implemented lab HMAC \
+                 algorithm; the Product (Ed25519) path is not yet implemented"
+            ),
+        });
+    } else if report.verdict == Verdict::Rejected {
+        report.trust_tier = TrustTier::Rejected;
     } else {
-        // Unknown / not-yet-implemented algorithm: cannot be a legitimate
-        // verified product bundle → not Product (fail closed).
-        TrustTier::Rejected
-    };
+        report.trust_tier = TrustTier::Lab;
+    }
     report.refresh_product_acceptable();
     report
 }
