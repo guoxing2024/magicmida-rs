@@ -66,8 +66,13 @@ pub enum PointerClassification {
     InImage,
     /// Original value points inside one of the captured regions (old heap).
     InCapturedRegion,
-    /// Original value is a stable external module / API address.
+    /// Original value is a stable external module / API address backed by a
+    /// verifiable resolver (import/IAT/export mapping). Resolved at runtime.
     ExternalModule,
+    /// Original value looks like an external high-address API but has **no**
+    /// verifiable resolver. This is *not* resolved: it must count toward
+    /// `unresolved_required` and the recovery cannot be `Complete`.
+    ExternalCandidate,
     /// Original value is a small integer / tag, not a pointer.
     SmallIntegerOrTag,
     /// Original value is not mapped to any known image/captured/external range.
@@ -84,6 +89,7 @@ impl PointerClassification {
             PointerClassification::InImage => "in_image",
             PointerClassification::InCapturedRegion => "in_captured_region",
             PointerClassification::ExternalModule => "external_module",
+            PointerClassification::ExternalCandidate => "external_candidate",
             PointerClassification::SmallIntegerOrTag => "small_integer_or_tag",
             PointerClassification::Unmapped => "unmapped",
             PointerClassification::Ambiguous => "ambiguous",
@@ -91,14 +97,35 @@ impl PointerClassification {
     }
 
     /// A pointer that must resolve to a concrete target for cold-start. An
-    /// `Unmapped` or `Ambiguous` pointer is *required* to resolve; leaving it
-    /// unresolved fails the whole recovery.
+    /// `Unmapped`, `Ambiguous`, or `ExternalCandidate` pointer is *required* to
+    /// resolve; leaving it unresolved fails the whole recovery.
     pub fn is_required(self) -> bool {
         matches!(
             self,
             PointerClassification::InCapturedRegion
                 | PointerClassification::InImage
                 | PointerClassification::ExternalModule
+                | PointerClassification::ExternalCandidate
+                | PointerClassification::Unmapped
+                | PointerClassification::Ambiguous
+        )
+    }
+
+    /// True when the pointer is a *resolved* rebase target (patchable).
+    pub fn is_resolved(self) -> bool {
+        matches!(
+            self,
+            PointerClassification::InCapturedRegion
+                | PointerClassification::InImage
+                | PointerClassification::ExternalModule
+        )
+    }
+
+    /// True when the pointer is an unresolved-but-required candidate.
+    pub fn is_unresolved_required(self) -> bool {
+        matches!(
+            self,
+            PointerClassification::ExternalCandidate
                 | PointerClassification::Unmapped
                 | PointerClassification::Ambiguous
         )
@@ -149,6 +176,10 @@ impl fmt::Display for RegionKind {
 }
 
 /// A declared pointer slot inside a captured region.
+///
+/// Only slots with explicit provenance may be patched. The plan never guesses
+/// that an arbitrary qword is a pointer; un-declared qwords are candidates at
+/// most (see [`PointerCandidate`]) and are never added to the fixup ledger.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RebasePointer {
     /// Id of the region containing the slot.
@@ -163,6 +194,96 @@ pub struct RebasePointer {
     pub target_region: Option<usize>,
     /// Byte offset within the target region (interior pointer support).
     pub target_offset: Option<u64>,
+    /// Image RVA for an `InImage` pointer (rebind to rebuilt image base).
+    pub image_rva: Option<u32>,
+    /// Resolved external target for an `ExternalModule` pointer.
+    pub external_target: Option<ExternalTarget>,
+    /// Provenance that declared this slot as a pointer.
+    pub provenance: SlotProvenance,
+}
+
+/// Where a [`RebasePointer`] slot was declared. A pointer may only be patched
+/// when it has a real provenance; everything else is at most a candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SlotProvenance {
+    /// Declared by the container begin/end/capacity triple schema.
+    ContainerTriple,
+    /// Declared by a heap-global image-root slot.
+    HeapGlobalRoot,
+    /// Declared by an explicit capture descriptor.
+    CaptureDescriptor,
+    /// Declared by a relocation/root ledger.
+    RelocationRoot,
+    /// Declared by explicit live observation.
+    LiveObservation,
+}
+
+impl SlotProvenance {
+    pub fn label(self) -> &'static str {
+        match self {
+            SlotProvenance::ContainerTriple => "container_triple",
+            SlotProvenance::HeapGlobalRoot => "heap_global_root",
+            SlotProvenance::CaptureDescriptor => "capture_descriptor",
+            SlotProvenance::RelocationRoot => "relocation_root",
+            SlotProvenance::LiveObservation => "live_observation",
+        }
+    }
+}
+
+/// A heuristic pointer *candidate* found by scanning a captured payload. Pure
+/// diagnostic — never patched, never auto-marked required. Used to report
+/// `candidate_count` and to guard against treating every qword as a pointer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PointerCandidate {
+    pub source_region: usize,
+    pub source_offset: usize,
+    pub value: u64,
+    pub plausible_pointer: bool,
+}
+
+/// A verifiable external target for an [`PointerClassification::ExternalModule`]
+/// pointer.
+///
+/// Resolution is only "resolved" when a concrete resolver exists (an import/IAT
+/// slot, or an export mapping with a stable module). A bare high-address value
+/// is at best an [`PointerClassification::ExternalCandidate`] and must count as
+/// unresolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalTarget {
+    /// Resolved module identity (lowercase dll name, e.g. `"kernel32.dll"`).
+    pub module_identity: String,
+    /// RVA within the module's export table (offset from its base).
+    pub module_rva: u64,
+    /// Import DLL the function resolves through (if via import/IAT).
+    pub import_dll: String,
+    /// Import name (or `#ordinal`).
+    pub import_name_or_ordinal: String,
+    /// IAT slot RVA this pointer resolves through, when an import resolver is
+    /// used (the cold-start IAT holds the live API address at that slot).
+    pub iat_rva: Option<u32>,
+    /// How this external is resolved at runtime.
+    pub resolution_kind: ExternalResolutionKind,
+}
+
+/// How an external target is resolved at cold-start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalResolutionKind {
+    /// Resolved by reading the cold-start process's IAT slot (loader-bound).
+    ViaIat,
+    /// Resolved by a reconstructed export/GetProcAddress mapping.
+    ViaExportMap,
+    /// Resolved by a direct, stable module+ordinal binding (loader guarantees).
+    ViaStableBinding,
+}
+
+impl ExternalResolutionKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            ExternalResolutionKind::ViaIat => "via_iat",
+            ExternalResolutionKind::ViaExportMap => "via_export_map",
+            ExternalResolutionKind::ViaStableBinding => "via_stable_binding",
+        }
+    }
 }
 
 /// Rebuild target for an `InCapturedRegion` pointer.
@@ -181,7 +302,12 @@ pub struct RuntimeRebasePlan {
     /// All captured allocations, sorted by `(old_base, size)`.
     pub regions: Vec<RebaseRegion>,
     /// Declared pointer slots, sorted by `(source_region, source_offset)`.
+    /// Only these are patchable (they carry provenance).
     pub pointers: Vec<RebasePointer>,
+    /// External resolver table referenced by `ExternalModule` pointers.
+    pub external_targets: Vec<ExternalTarget>,
+    /// Heuristic pointer candidates (diagnostic only — never patched).
+    pub candidates: Vec<PointerCandidate>,
     /// Old image base of the source process (diagnostic; not a rebase target).
     pub old_image_base: u64,
     /// Rebuilt image base the cold-start PE loads at (InImage rebase target).
@@ -227,6 +353,7 @@ impl RuntimeRebasePlan {
             out.extend_from_slice(&p.source_offset.to_le_bytes());
             out.extend_from_slice(&p.original_value.to_le_bytes());
             out.push(class_as_u8(p.classification));
+            out.push(provenance_as_u8(p.provenance));
             match p.target_region {
                 Some(v) => {
                     out.push(1);
@@ -241,6 +368,47 @@ impl RuntimeRebasePlan {
                 }
                 None => out.push(0),
             }
+            match p.image_rva {
+                Some(v) => {
+                    out.push(1);
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+                None => out.push(0),
+            }
+            match &p.external_target {
+                Some(t) => {
+                    out.push(1);
+                    out.extend_from_slice(&t.module_rva.to_le_bytes());
+                    out.extend_from_slice(&t.import_dll.as_bytes());
+                    out.push(0);
+                    out.extend_from_slice(&t.import_name_or_ordinal.as_bytes());
+                    out.push(0);
+                    match t.iat_rva {
+                        Some(v) => {
+                            out.push(1);
+                            out.extend_from_slice(&v.to_le_bytes());
+                        }
+                        None => out.push(0),
+                    }
+                    out.push(resolution_kind_as_u8(t.resolution_kind));
+                }
+                None => out.push(0),
+            }
+        }
+        for t in &self.external_targets {
+            out.extend_from_slice(&t.module_rva.to_le_bytes());
+            out.extend_from_slice(&t.import_dll.as_bytes());
+            out.push(0);
+            out.extend_from_slice(&t.import_name_or_ordinal.as_bytes());
+            out.push(0);
+            match t.iat_rva {
+                Some(v) => {
+                    out.push(1);
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+                None => out.push(0),
+            }
+            out.push(resolution_kind_as_u8(t.resolution_kind));
         }
         out
     }
@@ -252,10 +420,233 @@ fn class_as_u8(c: PointerClassification) -> u8 {
         PointerClassification::InImage => 1,
         PointerClassification::InCapturedRegion => 2,
         PointerClassification::ExternalModule => 3,
-        PointerClassification::SmallIntegerOrTag => 4,
-        PointerClassification::Unmapped => 5,
-        PointerClassification::Ambiguous => 6,
+        PointerClassification::ExternalCandidate => 4,
+        PointerClassification::SmallIntegerOrTag => 5,
+        PointerClassification::Unmapped => 6,
+        PointerClassification::Ambiguous => 7,
     }
+}
+
+fn provenance_as_u8(p: SlotProvenance) -> u8 {
+    match p {
+        SlotProvenance::ContainerTriple => 0,
+        SlotProvenance::HeapGlobalRoot => 1,
+        SlotProvenance::CaptureDescriptor => 2,
+        SlotProvenance::RelocationRoot => 3,
+        SlotProvenance::LiveObservation => 4,
+    }
+}
+
+fn resolution_kind_as_u8(k: ExternalResolutionKind) -> u8 {
+    match k {
+        ExternalResolutionKind::ViaIat => 0,
+        ExternalResolutionKind::ViaExportMap => 1,
+        ExternalResolutionKind::ViaStableBinding => 2,
+    }
+}
+
+/// An explicit declaration that a specific slot inside a captured region is a
+/// pointer. Declared slots carry provenance; only these may be patched.
+///
+/// `region_old_base` identifies the region (regions are keyed by their stable
+/// old base). `offset` is the byte offset within that region's payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredPointerSlot {
+    pub region_old_base: u64,
+    pub offset: usize,
+    pub provenance: SlotProvenance,
+}
+
+/// Table of external resolvers used to classify [`PointerClassification::ExternalModule`]
+/// pointers. A pointer is only *resolved* when an entry here matches it.
+///
+/// Keyed by module identity + export RVA. Lookup happens on the **old**
+/// (dump-time) addresses; at cold-start the stub resolves via `iat_rva` /
+/// export map, so an ASLR module-base change is handled by the loader / IAT.
+#[derive(Debug, Clone, Default)]
+pub struct ExternalResolverTable {
+    /// `(module_identity, module_rva)` → resolver.
+    entries: std::collections::BTreeMap<(String, u64), ExternalTarget>,
+}
+
+impl ExternalResolverTable {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Insert a resolver. Rejects duplicate `(module, rva)` keys.
+    pub fn insert(&mut self, target: ExternalTarget) -> Result<(), RebaseError> {
+        let key = (target.module_identity.clone(), target.module_rva);
+        if self.entries.contains_key(&key) {
+            return Err(RebaseError::Plan(format!(
+                "duplicate external resolver ({}, rva {:#x})",
+                target.module_identity, target.module_rva
+            )));
+        }
+        self.entries.insert(key, target);
+        Ok(())
+    }
+
+    /// Look up a resolver by module identity + export RVA.
+    pub fn get(&self, module_identity: &str, module_rva: u64) -> Option<&ExternalTarget> {
+        self.entries
+            .get(&(module_identity.to_lowercase(), module_rva))
+    }
+
+    /// Look up a resolver by module identity + import name (fallback when the
+    /// pointer's export RVA cannot be matched, e.g. dump-time IAT addresses are
+    /// not attributed to a module offset).
+    pub fn get_by_module_and_name(
+        &self,
+        module_identity: &str,
+        name: &str,
+    ) -> Option<&ExternalTarget> {
+        let mod_l = module_identity.to_lowercase();
+        self.entries
+            .iter()
+            .find(|(k, t)| k.0 == mod_l && t.import_name_or_ordinal.eq_ignore_ascii_case(name))
+            .map(|(_, t)| t)
+    }
+
+    /// Deterministic iteration in key order.
+    pub fn iter(&self) -> impl Iterator<Item = &ExternalTarget> {
+        self.entries.values()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// A high-address value whose owner module + export RVA are attributed from the
+/// live module map. Used to decide resolved-vs-candidate for external pointers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalAttribution {
+    pub module_identity: String,
+    pub module_base: u64,
+    pub module_rva: u64,
+}
+
+/// Given a high-address value and the set of loaded modules, attribute it to a
+/// module + export RVA. Returns `None` when the value is not inside any module.
+///
+/// This is the module-map attribution that lets an external pointer be matched
+/// to a resolver — but a resolver must still exist for it to be *resolved*.
+pub fn attribute_external(
+    value: u64,
+    modules: &[(String, u64, u64)], // (name, base, end)
+) -> Option<ExternalAttribution> {
+    for (name, base, end) in modules {
+        if value >= *base && value < *end {
+            return Some(ExternalAttribution {
+                module_identity: name.to_lowercase(),
+                module_base: *base,
+                module_rva: value - base,
+            });
+        }
+    }
+    None
+}
+
+/// Derive declared pointer slots from the captured allocation set using an
+/// explicit capture descriptor.
+///
+/// For each captured payload, every aligned qword whose value is a canonical
+/// user-mode pointer (≥ small-tag ceiling) is declared with
+/// [`SlotProvenance::CaptureDescriptor`] provenance. This is the descriptor
+/// that turns a captured allocation's interior pointer fields into patchable
+/// slots. Non-pointer-shaped qwords (0, tags, high junk) are not declared.
+///
+/// This is the provenance source for the dump path: without it the plan has no
+/// interior fixups. Callers that have richer per-slot descriptors (container
+/// triple schema, relocation root ledger, live observation) should pass those
+/// explicitly instead and keep this as the conservative fallback.
+pub fn declared_slots_from_capture(
+    containers: &[ContainerSnapshot],
+    heap_globals: &[HeapGlobalSnapshot],
+    heap_slab: Option<&HeapSlab>,
+) -> Vec<DeclaredPointerSlot> {
+    let mut out = Vec::new();
+    let mut push_slots = |old_base: u64, payload: &[u8]| {
+        let slot_count = payload.len() / POINTER_WIDTH;
+        for slot in 0..slot_count {
+            let off = slot * POINTER_WIDTH;
+            let val = u64::from_le_bytes(
+                payload[off..off + POINTER_WIDTH]
+                    .try_into()
+                    .unwrap_or([0; 8]),
+            );
+            // Pointer-shaped only: non-zero, above small-tag ceiling, canonical user VA.
+            if val >= SMALL_TAG_CEILING && val <= 0x0000_7fff_ffff_ffff {
+                out.push(DeclaredPointerSlot {
+                    region_old_base: old_base,
+                    offset: off,
+                    provenance: SlotProvenance::CaptureDescriptor,
+                });
+            }
+        }
+    };
+    for c in containers {
+        push_slots(c.decoded_begin, &c.heap_content);
+    }
+    for g in heap_globals {
+        if g.is_heap_handle || g.content.is_empty() {
+            continue;
+        }
+        push_slots(g.live_ptr, &g.content);
+    }
+    if let Some(slab) = heap_slab {
+        if !slab.content.is_empty() && slab.old_base != 0 {
+            push_slots(slab.old_base, &slab.content);
+        }
+    }
+    out
+}
+
+/// Build an external resolver table from the rebuilt import thunks.
+///
+/// For each import thunk with a name, the live IAT value at its slot is read
+/// and attributed to a module via `module_map`; the resolver is keyed by
+/// `(module_identity, module_rva)` and resolves at cold-start by reading the
+/// rebuilt IAT slot (`iat_address`). This is ASLR-safe: we never store the
+/// dump-time API VA; the loader fills the new IAT slot.
+///
+/// A thunk whose live value cannot be attributed to a module (or has no name)
+/// is skipped — its pointer will classify as `ExternalCandidate` (unresolved).
+pub fn build_external_resolvers_from_imports(
+    imports: &crate::import_table::ImportTableBuilder,
+    module_map: &[(String, u64, u64)],
+    read_live_at: &dyn Fn(u64) -> Option<u64>,
+) -> Result<ExternalResolverTable, RebaseError> {
+    let mut table = ExternalResolverTable::new();
+    for module in &imports.modules {
+        for thunk in &module.thunks {
+            let Some(name) = thunk.function_name.as_deref() else {
+                continue;
+            };
+            // Live IAT value at the thunk slot.
+            let Some(live) = read_live_at(thunk.iat_address as u64) else {
+                continue;
+            };
+            let Some(att) = attribute_external(live, module_map) else {
+                continue;
+            };
+            let target = ExternalTarget {
+                module_identity: att.module_identity.clone(),
+                module_rva: att.module_rva,
+                import_dll: module.name.clone(),
+                import_name_or_ordinal: name.to_string(),
+                iat_rva: Some(thunk.iat_address),
+                resolution_kind: ExternalResolutionKind::ViaIat,
+            };
+            table.insert(target)?;
+        }
+    }
+    Ok(table)
 }
 
 /// Build a runtime rebase plan from the captured allocation set.
@@ -265,10 +656,21 @@ fn class_as_u8(c: PointerClassification) -> u8 {
 /// Returns `Err` when any structural invariant is violated (old-range overflow,
 /// region overlap, ambiguous old-VA mapping, pointer width mismatch). Returns
 /// `Ok(None)` when there is nothing to rebase (no captured allocations).
+///
+/// # Pointer declaration
+///
+/// Only [`DeclaredPointerSlot`]s become patchable pointers. Every other qword
+/// in a captured payload is at most a [`PointerCandidate`] (diagnostic) and is
+/// never patched or auto-marked required. External pointers are only classified
+/// `ExternalModule` (resolved) when `external_resolvers` has a matching entry;
+/// otherwise they become `ExternalCandidate` (unresolved, fails closed).
 pub fn build_runtime_rebase_plan(
     containers: &[ContainerSnapshot],
     heap_globals: &[HeapGlobalSnapshot],
     heap_slab: Option<&HeapSlab>,
+    declared_slots: &[DeclaredPointerSlot],
+    external_resolvers: &ExternalResolverTable,
+    module_map: &[(String, u64, u64)],
     old_image_base: u64,
     new_image_base: u64,
 ) -> Result<Option<RuntimeRebasePlan>, RebaseError> {
@@ -410,82 +812,81 @@ pub fn build_runtime_rebase_plan(
         }
     }
 
-    // --- Build the region lookup for classification ---
-    // Range-interior membership, but exact-duplicate ranges are ambiguous.
-    let mut pointers = Vec::new();
+    // --- Resolve declared slots to region ids (by stable old_base) ---
+    // A declared slot must reference an existing region and an in-bounds offset.
+    let mut pointers: Vec<RebasePointer> = Vec::new();
+    let mut declared_slots = declared_slots.to_vec();
+    declared_slots.sort_by_key(|s| (s.region_old_base, s.offset));
+    for slot in &declared_slots {
+        let ri = regions
+            .iter()
+            .position(|r| r.old_base == slot.region_old_base)
+            .ok_or_else(|| {
+                RebaseError::Plan(format!(
+                    "declared slot region 0x{:x} not in plan",
+                    slot.region_old_base
+                ))
+            })?;
+        let region = &regions[ri];
+        let end = slot
+            .offset
+            .checked_add(POINTER_WIDTH)
+            .ok_or_else(|| RebaseError::Slot(ri, slot.offset))?;
+        if end > region.bytes.len() {
+            return Err(RebaseError::Slot(ri, slot.offset));
+        }
+        let val = u64::from_le_bytes(
+            region.bytes[slot.offset..end]
+                .try_into()
+                .map_err(|_| RebaseError::Slot(ri, slot.offset))?,
+        );
+        let pointer = classify_declared_slot(
+            ri,
+            slot.offset,
+            val,
+            &regions,
+            old_image_base,
+            new_image_base,
+            module_map,
+            external_resolvers,
+            slot.provenance,
+        )?;
+        pointers.push(pointer);
+    }
+
+    // --- Heuristic candidate scan (diagnostic only; never patched) ---
+    // Records how many pointer-shaped qwords exist that were NOT declared. These
+    // are never required and never enter the fixup metadata.
+    let mut candidates: Vec<PointerCandidate> = Vec::new();
     for (ri, region) in regions.iter().enumerate() {
-        let bytes = &region.bytes;
-        // Scan every aligned 8-byte slot inside this region's payload. A slot
-        // is a *declared* pointer candidate only when its value is
-        // structurally plausible (non-zero, ≥ small-tag ceiling) OR a tagged
-        // value we explicitly record. We never patch un-declared slots; this
-        // list is the declared ledger.
-        let slot_count = bytes.len() / POINTER_WIDTH;
+        let declared_offsets: std::collections::BTreeSet<usize> = pointers
+            .iter()
+            .filter(|p| p.source_region == ri)
+            .map(|p| p.source_offset)
+            .collect();
+        let slot_count = region.bytes.len() / POINTER_WIDTH;
         for slot in 0..slot_count {
             let off = slot * POINTER_WIDTH;
+            if declared_offsets.contains(&off) {
+                continue; // already a declared slot
+            }
             let val = u64::from_le_bytes(
-                bytes[off..off + POINTER_WIDTH]
+                region.bytes[off..off + POINTER_WIDTH]
                     .try_into()
                     .map_err(|_| RebaseError::Slot(ri, off))?,
             );
-            if val == 0 {
-                pointers.push(RebasePointer {
-                    source_region: ri,
-                    source_offset: off,
-                    original_value: val,
-                    classification: PointerClassification::Null,
-                    target_region: None,
-                    target_offset: None,
-                });
+            if val == 0 || val < SMALL_TAG_CEILING {
                 continue;
             }
-            if val < SMALL_TAG_CEILING {
-                pointers.push(RebasePointer {
+            // Plausible pointer shape = canonical user VA (not a pure tag).
+            let plausible = val <= 0x0000_7fff_ffff_ffff;
+            if plausible {
+                candidates.push(PointerCandidate {
                     source_region: ri,
                     source_offset: off,
-                    original_value: val,
-                    classification: PointerClassification::SmallIntegerOrTag,
-                    target_region: None,
-                    target_offset: None,
+                    value: val,
+                    plausible_pointer: true,
                 });
-                continue;
-            }
-            let cls = classify_value(val, &regions, old_image_base, new_image_base);
-            match cls {
-                ClassResult::Unmapped | ClassResult::Ambiguous => pointers.push(RebasePointer {
-                    source_region: ri,
-                    source_offset: off,
-                    original_value: val,
-                    classification: cls.into(),
-                    target_region: None,
-                    target_offset: None,
-                }),
-                ClassResult::InCapturedRegion { target, offset } => {
-                    pointers.push(RebasePointer {
-                        source_region: ri,
-                        source_offset: off,
-                        original_value: val,
-                        classification: PointerClassification::InCapturedRegion,
-                        target_region: Some(target),
-                        target_offset: Some(offset),
-                    });
-                }
-                ClassResult::InImage => pointers.push(RebasePointer {
-                    source_region: ri,
-                    source_offset: off,
-                    original_value: val,
-                    classification: PointerClassification::InImage,
-                    target_region: None,
-                    target_offset: None,
-                }),
-                ClassResult::ExternalModule => pointers.push(RebasePointer {
-                    source_region: ri,
-                    source_offset: off,
-                    original_value: val,
-                    classification: PointerClassification::ExternalModule,
-                    target_region: None,
-                    target_offset: None,
-                }),
             }
         }
     }
@@ -522,9 +923,15 @@ pub fn build_runtime_rebase_plan(
         }
     }
 
+    // --- Deterministic external resolver table (dedup, key order) ---
+    let mut external_targets: Vec<ExternalTarget> = external_resolvers.iter().cloned().collect();
+    external_targets.sort_by_key(|t| (t.module_identity.clone(), t.module_rva));
+
     let mut plan = RuntimeRebasePlan {
         regions,
         pointers,
+        external_targets,
+        candidates,
         old_image_base,
         new_image_base,
         plan_complete: true,
@@ -534,11 +941,130 @@ pub fn build_runtime_rebase_plan(
     Ok(Some(plan))
 }
 
+/// Classify a single declared pointer slot and build its [`RebasePointer`].
+fn classify_declared_slot(
+    ri: usize,
+    off: usize,
+    val: u64,
+    regions: &[RebaseRegion],
+    old_image_base: u64,
+    new_image_base: u64,
+    module_map: &[(String, u64, u64)],
+    external_resolvers: &ExternalResolverTable,
+    provenance: SlotProvenance,
+) -> Result<RebasePointer, RebaseError> {
+    if val == 0 {
+        return Ok(RebasePointer {
+            source_region: ri,
+            source_offset: off,
+            original_value: val,
+            classification: PointerClassification::Null,
+            target_region: None,
+            target_offset: None,
+            image_rva: None,
+            external_target: None,
+            provenance,
+        });
+    }
+    if val < SMALL_TAG_CEILING {
+        return Ok(RebasePointer {
+            source_region: ri,
+            source_offset: off,
+            original_value: val,
+            classification: PointerClassification::SmallIntegerOrTag,
+            target_region: None,
+            target_offset: None,
+            image_rva: None,
+            external_target: None,
+            provenance,
+        });
+    }
+
+    match classify_value(val, regions, old_image_base, new_image_base) {
+        ClassResult::InImage => Ok(RebasePointer {
+            source_region: ri,
+            source_offset: off,
+            original_value: val,
+            classification: PointerClassification::InImage,
+            target_region: None,
+            target_offset: None,
+            image_rva: Some((val.wrapping_sub(old_image_base)) as u32),
+            external_target: None,
+            provenance,
+        }),
+        ClassResult::InCapturedRegion { target, offset } => Ok(RebasePointer {
+            source_region: ri,
+            source_offset: off,
+            original_value: val,
+            classification: PointerClassification::InCapturedRegion,
+            target_region: Some(target),
+            target_offset: Some(offset),
+            image_rva: None,
+            external_target: None,
+            provenance,
+        }),
+        ClassResult::Unmapped | ClassResult::Ambiguous => Ok(RebasePointer {
+            source_region: ri,
+            source_offset: off,
+            original_value: val,
+            classification: match classify_value(val, regions, old_image_base, new_image_base) {
+                ClassResult::Ambiguous => PointerClassification::Ambiguous,
+                _ => PointerClassification::Unmapped,
+            },
+            target_region: None,
+            target_offset: None,
+            image_rva: None,
+            external_target: None,
+            provenance,
+        }),
+        ClassResult::External => {
+            // Attribute to a module; resolved only if a resolver exists.
+            match attribute_external(val, module_map) {
+                Some(att) => match external_resolvers.get(&att.module_identity, att.module_rva) {
+                    Some(resolver) => Ok(RebasePointer {
+                        source_region: ri,
+                        source_offset: off,
+                        original_value: val,
+                        classification: PointerClassification::ExternalModule,
+                        target_region: None,
+                        target_offset: None,
+                        image_rva: None,
+                        external_target: Some(resolver.clone()),
+                        provenance,
+                    }),
+                    None => Ok(RebasePointer {
+                        source_region: ri,
+                        source_offset: off,
+                        original_value: val,
+                        classification: PointerClassification::ExternalCandidate,
+                        target_region: None,
+                        target_offset: None,
+                        image_rva: None,
+                        external_target: None,
+                        provenance,
+                    }),
+                },
+                None => Ok(RebasePointer {
+                    source_region: ri,
+                    source_offset: off,
+                    original_value: val,
+                    classification: PointerClassification::ExternalCandidate,
+                    target_region: None,
+                    target_offset: None,
+                    image_rva: None,
+                    external_target: None,
+                    provenance,
+                }),
+            }
+        }
+    }
+}
+
 /// Outcome of classifying one pointer value.
 enum ClassResult {
     InImage,
     InCapturedRegion { target: usize, offset: u64 },
-    ExternalModule,
+    External,
     Unmapped,
     Ambiguous,
 }
@@ -548,7 +1074,7 @@ impl From<ClassResult> for PointerClassification {
         match c {
             ClassResult::InImage => PointerClassification::InImage,
             ClassResult::InCapturedRegion { .. } => PointerClassification::InCapturedRegion,
-            ClassResult::ExternalModule => PointerClassification::ExternalModule,
+            ClassResult::External => PointerClassification::ExternalCandidate,
             ClassResult::Unmapped => PointerClassification::Unmapped,
             ClassResult::Ambiguous => PointerClassification::Ambiguous,
         }
@@ -584,9 +1110,11 @@ fn classify_value(
     }
 
     // External module / API region (high canonical user VA, far above heaps).
+    // Note: this only marks the value as an *external candidate*; whether it is
+    // *resolved* is decided later via the resolver table / module map.
     let in_external = canonical && val >= 0x0000_7ff0_0000_0000;
     if in_external {
-        return ClassResult::ExternalModule;
+        return ClassResult::External;
     }
 
     // Captured region: interior membership. If it hits exactly one region,
@@ -655,11 +1183,15 @@ pub fn validate_runtime_rebase_plan(plan: &RuntimeRebasePlan) -> Result<(), Reba
             )));
         }
     }
-    // 3. All required pointers classified; all InCapturedRegion pointers have
-    //    target mappings.
+    // 3. All declared pointers must be structurally sound:
+    //    - InCapturedRegion pointers have a valid target mapping.
+    //    - InImage pointers carry a valid image RVA.
+    //    - ExternalModule pointers reference a real resolver in the table.
+    //    - ExternalCandidate / Unmapped / Ambiguous pointers are unresolved
+    //      required — the plan is not Complete.
     for p in &plan.pointers {
-        if p.classification == PointerClassification::InCapturedRegion {
-            match (p.target_region, p.target_offset) {
+        match p.classification {
+            PointerClassification::InCapturedRegion => match (p.target_region, p.target_offset) {
                 (Some(t), Some(o)) => {
                     if t >= plan.regions.len() {
                         return Err(RebaseError::Plan(format!(
@@ -677,7 +1209,38 @@ pub fn validate_runtime_rebase_plan(plan: &RuntimeRebasePlan) -> Result<(), Reba
                         "InCapturedRegion pointer lacks target mapping".into(),
                     ));
                 }
+            },
+            PointerClassification::InImage => {
+                let _ = p.image_rva.ok_or_else(|| {
+                    RebaseError::Plan("InImage pointer lacks image RVA".to_string())
+                })?;
             }
+            PointerClassification::ExternalModule => {
+                let t = p.external_target.as_ref().ok_or_else(|| {
+                    RebaseError::Plan("ExternalModule pointer lacks a resolver target".to_string())
+                })?;
+                // The resolver must be present in the plan's resolver table.
+                let present = plan.external_targets.iter().any(|e| {
+                    e.module_identity == t.module_identity && e.module_rva == t.module_rva
+                });
+                if !present {
+                    return Err(RebaseError::Plan(format!(
+                        "ExternalModule pointer resolver not in table: {} rva {:#x}",
+                        t.module_identity, t.module_rva
+                    )));
+                }
+            }
+            PointerClassification::ExternalCandidate
+            | PointerClassification::Unmapped
+            | PointerClassification::Ambiguous => {
+                return Err(RebaseError::Plan(format!(
+                    "declared pointer ({}, region {} @ {:#x}) is unresolved-required",
+                    p.classification.label(),
+                    p.source_region,
+                    p.source_offset
+                )));
+            }
+            PointerClassification::Null | PointerClassification::SmallIntegerOrTag => {}
         }
     }
     // 4. Patch-slot bounds: every pointer slot must fit inside its source
@@ -848,8 +1411,13 @@ pub fn validate_bootstrap_contract(
     Ok(())
 }
 
-/// Diagnostic recovery summary (section VIII). States are `Complete`,
+/// Diagnostic recovery summary. States are `Prepared`, `Complete`,
 /// `Incomplete`, `Rejected` — never acceptance terms.
+///
+/// `Complete` requires: plan valid, `unresolved_required == 0`, the bootstrap
+/// installed, the boot contract valid, a completion cookie present, the emitted
+/// plan digest matching, and every required resolver present. A summary that
+/// only has a planner (no installed bootstrap) can never be `Complete`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeRebaseSummary {
     pub regions_total: usize,
@@ -868,20 +1436,33 @@ pub struct RuntimeRebaseSummary {
     pub original_oep_rva: u32,
     pub completion_cookie_rva: Option<u32>,
     pub deterministic_plan_digest: String,
+    pub fixup_count: usize,
+    pub resolver_count: usize,
+    pub candidate_count: usize,
+    pub bootstrap_contract_valid: bool,
     pub recovery_status: RebaseStatus,
 }
 
 /// Recovery status — a single unambiguous state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RebaseStatus {
+    /// Plan prepared and validated offline, but the `.boot` is not yet
+    /// installed (no runtime bootstrap). Never `Complete`.
+    Prepared,
+    /// Plan validated, bootstrap installed, contract valid, all resolvers
+    /// present, completion cookie set.
     Complete,
+    /// Plan validated and bootstrap installed, but some optional state is
+    /// missing (not fatal, but not a complete cold-start contract).
     Incomplete,
+    /// Plan or bootstrap is not viable — recovery fails closed.
     Rejected,
 }
 
 impl RebaseStatus {
     pub fn label(self) -> &'static str {
         match self {
+            RebaseStatus::Prepared => "Prepared",
             RebaseStatus::Complete => "Complete",
             RebaseStatus::Incomplete => "Incomplete",
             RebaseStatus::Rejected => "Rejected",
@@ -892,14 +1473,16 @@ impl RebaseStatus {
 /// Compute a diagnostic summary from a validated plan.
 ///
 /// `boot_rva` / `completion_cookie_rva` are the runtime metadata positions the
-/// bootstrap contract uses (from the installed `.boot`). Returns a summary with
-/// `recovery_status` set to `Complete` only when `unresolved_required == 0` and
-/// the plan passed offline validation.
+/// bootstrap contract uses (from the installed `.boot`). A summary is
+/// `Complete` only when every cold-start contract holds; with no installed
+/// bootstrap it is `Prepared` at most.
 pub fn summarize_plan(
     plan: &RuntimeRebasePlan,
     boot_rva: Option<u32>,
     original_oep_rva: u32,
     completion_cookie_rva: Option<u32>,
+    bootstrap_kind: &str,
+    bootstrap_contract_valid: bool,
 ) -> RuntimeRebaseSummary {
     let mut intra = 0usize;
     let mut image = 0usize;
@@ -911,17 +1494,15 @@ pub fn summarize_plan(
             PointerClassification::InImage => image += 1,
             PointerClassification::ExternalModule => external += 1,
             PointerClassification::Null | PointerClassification::SmallIntegerOrTag => null_tag += 1,
-            PointerClassification::Unmapped | PointerClassification::Ambiguous => {}
+            PointerClassification::ExternalCandidate
+            | PointerClassification::Unmapped
+            | PointerClassification::Ambiguous => {}
         }
     }
     let unresolved_required = plan
         .pointers
         .iter()
-        .filter(|p| p.classification.is_required())
-        .filter(|p| {
-            p.classification == PointerClassification::Unmapped
-                || p.classification == PointerClassification::Ambiguous
-        })
+        .filter(|p| p.classification.is_unresolved_required())
         .count();
     let plan_ok = validate_runtime_rebase_plan(plan).is_ok();
     let image_roots = plan
@@ -929,8 +1510,23 @@ pub fn summarize_plan(
         .iter()
         .filter(|r| r.image_inline_rva.is_some())
         .count();
-    let status = if plan_ok && unresolved_required == 0 {
+
+    // Complete requires: valid plan, zero unresolved-required, a real bootstrap
+    // installed (boot_rva present), a completion cookie present, and the boot
+    // contract valid.
+    let ready = plan_ok
+        && unresolved_required == 0
+        && boot_rva.is_some()
+        && completion_cookie_rva.is_some()
+        && bootstrap_contract_valid;
+    let status = if plan_ok && unresolved_required == 0 && boot_rva.is_none() {
+        // Plan is sound but the `.boot` was not installed.
+        RebaseStatus::Prepared
+    } else if ready {
         RebaseStatus::Complete
+    } else if plan_ok {
+        // Plan sound but bootstrap/contract incomplete.
+        RebaseStatus::Incomplete
     } else {
         RebaseStatus::Rejected
     };
@@ -940,6 +1536,9 @@ pub fn summarize_plan(
         regions_required = plan.regions_required(),
         bytes_captured = plan.bytes_captured(),
         pointer_slots = plan.pointers.len(),
+        fixup_count = plan.pointers.len(),
+        resolver_count = plan.external_targets.len(),
+        candidate_count = plan.candidates.len(),
         intra,
         image,
         external,
@@ -959,13 +1558,17 @@ pub fn summarize_plan(
         external_pointers: external,
         null_or_tagged: null_tag,
         unresolved_required,
-        unresolved_optional: 0,
+        unresolved_optional: plan.candidates.len(),
         image_roots_patched: image_roots,
-        bootstrap_kind: "pre_oep_container".to_string(),
+        bootstrap_kind: bootstrap_kind.to_string(),
         bootstrap_rva: boot_rva,
         original_oep_rva,
         completion_cookie_rva,
         deterministic_plan_digest: plan.plan_digest.clone(),
+        fixup_count: plan.pointers.len(),
+        resolver_count: plan.external_targets.len(),
+        candidate_count: plan.candidates.len(),
+        bootstrap_contract_valid,
         recovery_status: status,
     }
 }
@@ -1007,6 +1610,10 @@ pub enum RebaseError {
     Contract(String),
     /// Pointer width / architecture mismatch.
     Arch(String),
+    /// The AhkGto recovery requires runtime capture, but none was produced
+    /// (empty containers/heap-globals/slab, or the required capture policy did
+    /// not yield a plan). Must not be auto-inferred away.
+    RequiredRuntimeCaptureMissing,
 }
 
 impl fmt::Display for RebaseError {
@@ -1047,54 +1654,131 @@ impl fmt::Display for RebaseError {
             ),
             RebaseError::Contract(m) => write!(f, "bootstrap contract: {m}"),
             RebaseError::Arch(m) => write!(f, "rebase architecture: {m}"),
+            RebaseError::RequiredRuntimeCaptureMissing => write!(
+                f,
+                "AhkGto recovery requires runtime heap/container capture, but no plan was \
+                 produced (empty capture or required policy did not yield one); refusing to \
+                 continue without an explicit per-case policy declaring capture unnecessary"
+            ),
         }
     }
 }
 
 impl std::error::Error for RebaseError {}
 
-/// Integration helper for the dumper: build a plan from the captured allocation
-/// set, validate it offline, and return the diagnostic summary.
+/// A plan + its diagnostic summary, prepared and validated for the dump path.
 ///
-/// Returns `Ok(None)` when there is nothing to rebase (no captured allocations).
-/// Returns `Err` when the plan is structurally invalid **or** when a required
-/// pointer is left unresolved — the caller must fail closed (never emit a
-/// candidate that carries unresolved old heap/private pointers).
-pub fn plan_and_validate_for_dump(
+/// This is the authoritative input to `.boot` installation. The plan is **not**
+/// discarded; it drives the runtime bootstrap metadata and is required for
+/// post-install contract validation.
+#[derive(Debug, Clone)]
+pub struct PreparedRuntimeRebase {
+    pub plan: RuntimeRebasePlan,
+    pub summary: RuntimeRebaseSummary,
+}
+
+/// Prepare a runtime rebase plan for the AhkGto recovery path.
+///
+/// Builds the plan from captured allocations + declared pointer slots +
+/// external resolvers + module map, validates it offline, and returns the
+/// prepared plan + summary.
+///
+/// # Fail-closed
+///
+/// - When `require_capture` is set (AhkGtoExperimental with
+///   `install_heap_bootstrap`), an empty capture / no plan is a hard
+///   [`RebaseError::RequiredRuntimeCaptureMissing`], never a silent continue.
+/// - Any structurally invalid plan or unresolved-required pointer fails closed.
+pub fn prepare_runtime_rebase_for_dump(
     containers: &[ContainerSnapshot],
     heap_globals: &[HeapGlobalSnapshot],
     heap_slab: Option<&HeapSlab>,
+    declared_slots: &[DeclaredPointerSlot],
+    external_resolvers: &ExternalResolverTable,
+    module_map: &[(String, u64, u64)],
     old_image_base: u64,
     new_image_base: u64,
-    boot_rva: Option<u32>,
     original_oep_rva: u32,
-    completion_cookie_rva: Option<u32>,
-) -> Result<Option<RuntimeRebaseSummary>, RebaseError> {
-    let Some(plan) = build_runtime_rebase_plan(
+    require_capture: bool,
+) -> Result<PreparedRuntimeRebase, RebaseError> {
+    let plan = match build_runtime_rebase_plan(
         containers,
         heap_globals,
         heap_slab,
+        declared_slots,
+        external_resolvers,
+        module_map,
         old_image_base,
         new_image_base,
-    )?
-    else {
-        return Ok(None);
+    )? {
+        Some(plan) => plan,
+        None => {
+            if require_capture {
+                return Err(RebaseError::RequiredRuntimeCaptureMissing);
+            }
+            // No plan and not required: produce an empty Prepared (no regions).
+            let empty = RuntimeRebasePlan {
+                regions: Vec::new(),
+                pointers: Vec::new(),
+                external_targets: Vec::new(),
+                candidates: Vec::new(),
+                old_image_base,
+                new_image_base,
+                plan_complete: true,
+                plan_digest: String::new(),
+            };
+            let summary = summarize_plan(&empty, None, original_oep_rva, None, "none", false);
+            return Ok(PreparedRuntimeRebase {
+                plan: empty,
+                summary,
+            });
+        }
     };
-    // Offline validation before the runtime contract can be trusted.
+
+    // Offline validation before the runtime contract can be trusted. An
+    // unresolved-required pointer makes the plan invalid here.
     validate_runtime_rebase_plan(&plan)?;
-    let summary = summarize_plan(&plan, boot_rva, original_oep_rva, completion_cookie_rva);
-    // Fail-closed: a required unresolved pointer must never be emitted as a
-    // Complete recovery.
+
+    // Produce a summary with no installed bootstrap yet → Prepared at most.
+    let summary = summarize_plan(&plan, None, original_oep_rva, None, "none", false);
+
+    Ok(PreparedRuntimeRebase { plan, summary })
+}
+
+/// Convert a prepared (planner-only) summary into one that reflects an
+/// installed bootstrap + validated contract. Returns `Err` if the contract is
+/// not complete.
+pub fn finalize_summary_after_install(
+    prepared: &PreparedRuntimeRebase,
+    installed_boot_rva: Option<u32>,
+    installed_cookie_rva: Option<u32>,
+    bootstrap_kind: &str,
+    bootstrap_contract_valid: bool,
+    emitted_plan_digest: &str,
+) -> Result<RuntimeRebaseSummary, RebaseError> {
+    let plan = &prepared.plan;
+    let mut summary = summarize_plan(
+        plan,
+        installed_boot_rva,
+        prepared.summary.original_oep_rva,
+        installed_cookie_rva,
+        bootstrap_kind,
+        bootstrap_contract_valid,
+    );
+    // A final summary must carry the *emitted* digest (which must match the
+    // plan digest — enforced by the caller's contract check).
+    summary.deterministic_plan_digest = emitted_plan_digest.to_string();
     if summary.recovery_status != RebaseStatus::Complete {
         return Err(RebaseError::Plan(format!(
-            "recovery {}-resolved_required={} status={}; refusing to emit a candidate \
-             carrying unresolved old heap/private pointers",
-            summary.deterministic_plan_digest,
+            "bootstrap install did not yield a Complete contract: \
+             status={} unresolved_required={} boot_rva={:?} cookie={:?}",
+            summary.recovery_status.label(),
             summary.unresolved_required,
-            summary.recovery_status.label()
+            installed_boot_rva,
+            installed_cookie_rva
         )));
     }
-    Ok(Some(summary))
+    Ok(summary)
 }
 
 #[cfg(test)]
@@ -1134,10 +1818,43 @@ mod tests {
         b
     }
 
+    /// Test helper: build a plan using capture-derived declared slots.
+    fn build_plan(
+        containers: &[ContainerSnapshot],
+        globals: &[HeapGlobalSnapshot],
+        slab: Option<&HeapSlab>,
+    ) -> Result<Option<RuntimeRebasePlan>, RebaseError> {
+        let slots = declared_slots_from_capture(containers, globals, slab);
+        build_runtime_rebase_plan(
+            containers,
+            globals,
+            slab,
+            &slots,
+            &ExternalResolverTable::new(),
+            &[],
+            OLD_IB,
+            NEW_IB,
+        )
+    }
+
+    /// Build a plan with an explicit external resolver table + module map.
+    fn build_plan_ext(
+        containers: &[ContainerSnapshot],
+        globals: &[HeapGlobalSnapshot],
+        slab: Option<&HeapSlab>,
+        resolvers: &ExternalResolverTable,
+        modules: &[(String, u64, u64)],
+    ) -> Result<Option<RuntimeRebasePlan>, RebaseError> {
+        let slots = declared_slots_from_capture(containers, globals, slab);
+        build_runtime_rebase_plan(
+            containers, globals, slab, &slots, resolvers, modules, OLD_IB, NEW_IB,
+        )
+    }
+
     // 1. Single region, no pointers.
     #[test]
     fn single_region_no_pointers() {
-        let plan = build_runtime_rebase_plan(
+        let plan = build_plan(
             &[container(
                 0x1000,
                 0x500000,
@@ -1147,17 +1864,26 @@ mod tests {
             )],
             &[],
             None,
-            OLD_IB,
-            NEW_IB,
         )
         .unwrap()
         .unwrap();
         assert_eq!(plan.regions.len(), 1);
-        assert_eq!(plan.pointers.len(), 1); // the single slot is 0 -> Null
-        assert_eq!(plan.pointers[0].classification, PointerClassification::Null);
+        // A zero-only region declares no pointer slots (0 is not pointer-shaped).
+        assert_eq!(plan.pointers.len(), 0);
         validate_runtime_rebase_plan(&plan).unwrap();
-        let s = summarize_plan(&plan, None, 0x1000, None);
-        assert_eq!(s.recovery_status, RebaseStatus::Complete);
+        // No installed bootstrap yet -> Prepared, never Complete.
+        let s = summarize_plan(&plan, None, 0x1000, None, "none", false);
+        assert_eq!(s.recovery_status, RebaseStatus::Prepared);
+        // With a bootstrap + cookie + valid contract -> Complete.
+        let s2 = summarize_plan(
+            &plan,
+            Some(0x2000),
+            0x1000,
+            Some(0x2f00),
+            "post_crt_two_phase",
+            true,
+        );
+        assert_eq!(s2.recovery_status, RebaseStatus::Complete);
     }
 
     // 2. A -> B (A points to B's base).
@@ -1165,15 +1891,13 @@ mod tests {
     fn a_to_b() {
         let b_content = region_bytes(0x20, &[(0, 0x600000)]);
         let a_content = region_bytes(0x10, &[(0, 0x600000)]);
-        let plan = build_runtime_rebase_plan(
+        let plan = build_plan(
             &[
                 container(0x1000, 0x500000, 0x500010, 0x500020, a_content),
                 container(0x2000, 0x600000, 0x600020, 0x600040, b_content),
             ],
             &[],
             None,
-            OLD_IB,
-            NEW_IB,
         )
         .unwrap()
         .unwrap();
@@ -1195,15 +1919,13 @@ mod tests {
     fn a_b_a_cycle() {
         let a = region_bytes(0x10, &[(0, 0x600000)]); // A points to B
         let b = region_bytes(0x10, &[(0, 0x500000)]); // B points to A
-        let plan = build_runtime_rebase_plan(
+        let plan = build_plan(
             &[
                 container(0x1000, 0x500000, 0x500010, 0x500020, a),
                 container(0x2000, 0x600000, 0x600010, 0x600020, b),
             ],
             &[],
             None,
-            OLD_IB,
-            NEW_IB,
         )
         .unwrap()
         .unwrap();
@@ -1220,12 +1942,10 @@ mod tests {
     #[test]
     fn self_pointer() {
         let content = region_bytes(0x20, &[(0, 0x500000)]);
-        let plan = build_runtime_rebase_plan(
+        let plan = build_plan(
             &[container(0x1000, 0x500000, 0x500020, 0x500040, content)],
             &[],
             None,
-            OLD_IB,
-            NEW_IB,
         )
         .unwrap()
         .unwrap();
@@ -1244,12 +1964,10 @@ mod tests {
     #[test]
     fn interior_pointer() {
         let content = region_bytes(0x30, &[(0x10, 0x500020)]); // points 0x20 into self
-        let plan = build_runtime_rebase_plan(
+        let plan = build_plan(
             &[container(0x1000, 0x500000, 0x500030, 0x500040, content)],
             &[],
             None,
-            OLD_IB,
-            NEW_IB,
         )
         .unwrap()
         .unwrap();
@@ -1268,15 +1986,13 @@ mod tests {
     fn multiple_roots_same_target() {
         let a = region_bytes(0x10, &[(0, 0x600000), (8, 0x600000)]);
         let b = region_bytes(0x10, &[]);
-        let plan = build_runtime_rebase_plan(
+        let plan = build_plan(
             &[
                 container(0x1000, 0x500000, 0x500010, 0x500020, a),
                 container(0x2000, 0x600000, 0x600010, 0x600020, b),
             ],
             &[],
             None,
-            OLD_IB,
-            NEW_IB,
         )
         .unwrap()
         .unwrap();
@@ -1294,12 +2010,10 @@ mod tests {
     #[test]
     fn null_slot_untouched() {
         let content = vec![0u8; 0x20];
-        let plan = build_runtime_rebase_plan(
+        let plan = build_plan(
             &[container(0x1000, 0x500000, 0x500020, 0x500040, content)],
             &[],
             None,
-            OLD_IB,
-            NEW_IB,
         )
         .unwrap()
         .unwrap();
@@ -1316,12 +2030,10 @@ mod tests {
     #[test]
     fn image_pointer_classified() {
         let content = region_bytes(0x10, &[(0, OLD_IB + 0x1000)]);
-        let plan = build_runtime_rebase_plan(
+        let plan = build_plan(
             &[container(0x1000, 0x500000, 0x500010, 0x500020, content)],
             &[],
             None,
-            OLD_IB,
-            NEW_IB,
         )
         .unwrap()
         .unwrap();
@@ -1336,14 +2048,92 @@ mod tests {
 
     // 9. External / module API pointer classified as ExternalModule.
     #[test]
-    fn external_module_classified() {
+    fn external_candidate_without_module_map() {
+        // High-address value with NO module map and NO resolver -> ExternalCandidate
+        // (unresolved), never a resolved ExternalModule.
         let content = region_bytes(0x10, &[(0, 0x7ff9_1234_5678)]);
-        let plan = build_runtime_rebase_plan(
+        let plan = build_plan(
             &[container(0x1000, 0x500000, 0x500010, 0x500020, content)],
             &[],
             None,
-            OLD_IB,
-            NEW_IB,
+        )
+        .unwrap()
+        .unwrap();
+        let p = plan
+            .pointers
+            .iter()
+            .find(|p| p.classification == PointerClassification::ExternalCandidate)
+            .expect("external candidate");
+        assert_eq!(p.original_value, 0x7ff9_1234_5678);
+        // A high-address value with no resolver is unresolved-required -> the
+        // plan must not validate as Complete.
+        assert!(validate_runtime_rebase_plan(&plan).is_err());
+        let s = summarize_plan(&plan, None, 0x1000, None, "none", false);
+        assert_eq!(s.unresolved_required, 1);
+        assert_ne!(
+            s.recovery_status,
+            crate::dumper::runtime_rebase::RebaseStatus::Complete
+        );
+    }
+
+    // 9b. External pointer with module identity but no resolver -> unresolved.
+    #[test]
+    fn external_candidate_with_identity_no_resolver() {
+        // Pointer is attributed to kernel32 via module map, but no resolver
+        // exists for that (module, rva).
+        let content = region_bytes(0x10, &[(0, 0x7ff9_1000_2000)]);
+        let modules = vec![(
+            "kernel32.dll".to_string(),
+            0x7ff9_1000_0000u64,
+            0x7ff9_1000_4000u64,
+        )];
+        let plan = build_plan_ext(
+            &[container(0x1000, 0x500000, 0x500010, 0x500020, content)],
+            &[],
+            None,
+            &ExternalResolverTable::new(),
+            &modules,
+        )
+        .unwrap()
+        .unwrap();
+        let p = plan
+            .pointers
+            .iter()
+            .find(|p| p.classification == PointerClassification::ExternalCandidate)
+            .expect("external candidate with module identity");
+        assert_eq!(p.external_target, None);
+        assert!(validate_runtime_rebase_plan(&plan).is_err());
+    }
+
+    // 9c. IAT-bound external pointer with a resolver -> resolved ExternalModule.
+    #[test]
+    fn external_iat_bound_resolved() {
+        // A pointer whose value is inside kernel32's range AND matches a
+        // resolver keyed by (kernel32, module_rva) -> ExternalModule (resolved).
+        let api_va = 0x7ff9_1000_2000u64;
+        let modules = vec![(
+            "kernel32.dll".to_string(),
+            0x7ff9_1000_0000u64,
+            0x7ff9_1000_4000u64,
+        )];
+        let mut resolvers = ExternalResolverTable::new();
+        resolvers
+            .insert(ExternalTarget {
+                module_identity: "kernel32.dll".to_string(),
+                module_rva: api_va - 0x7ff9_1000_0000,
+                import_dll: "kernel32.dll".to_string(),
+                import_name_or_ordinal: "HeapAlloc".to_string(),
+                iat_rva: Some(0xf0100),
+                resolution_kind: ExternalResolutionKind::ViaIat,
+            })
+            .unwrap();
+        let content = region_bytes(0x10, &[(0, api_va)]);
+        let plan = build_plan_ext(
+            &[container(0x1000, 0x500000, 0x500010, 0x500020, content)],
+            &[],
+            None,
+            &resolvers,
+            &modules,
         )
         .unwrap()
         .unwrap();
@@ -1351,8 +2141,10 @@ mod tests {
             .pointers
             .iter()
             .find(|p| p.classification == PointerClassification::ExternalModule)
-            .expect("external pointer");
-        assert_eq!(p.original_value, 0x7ff9_1234_5678);
+            .expect("resolved external");
+        let t = p.external_target.as_ref().expect("has resolver");
+        assert_eq!(t.import_name_or_ordinal, "HeapAlloc");
+        assert_eq!(t.iat_rva, Some(0xf0100));
         validate_runtime_rebase_plan(&plan).unwrap();
     }
 
@@ -1360,16 +2152,14 @@ mod tests {
     #[test]
     fn unmapped_required_fails_closed() {
         let content = region_bytes(0x10, &[(0, 0x1234_5678_9abc)]);
-        let plan = build_runtime_rebase_plan(
+        let plan = build_plan(
             &[container(0x1000, 0x500000, 0x500010, 0x500020, content)],
             &[],
             None,
-            OLD_IB,
-            NEW_IB,
         )
         .unwrap()
         .unwrap();
-        let s = summarize_plan(&plan, None, 0x1000, None);
+        let s = summarize_plan(&plan, None, 0x1000, None, "none", false);
         // The unmapped pointer is not required by classification, but the plan
         // contains an unmapped slot -> recovery must be Rejected.
         assert_eq!(s.unresolved_required, 1);
@@ -1382,15 +2172,13 @@ mod tests {
         // Two regions whose old ranges overlap would fail at build (overlap).
         // Instead, test that an exact duplicate old base is rejected.
         let a = region_bytes(0x10, &[]);
-        let plan = build_runtime_rebase_plan(
+        let plan = build_plan(
             &[
                 container(0x1000, 0x500000, 0x500010, 0x500020, a.clone()),
                 container(0x2000, 0x500000, 0x500010, 0x500020, a),
             ],
             &[],
             None,
-            OLD_IB,
-            NEW_IB,
         );
         assert!(plan.is_err(), "overlapping regions must fail closed");
     }
@@ -1398,13 +2186,21 @@ mod tests {
     // 12. Optional opaque slot is not patched (kept as-is, recorded).
     #[test]
     fn optional_opaque_slot_not_patched() {
-        // A small integer / tag value is left untouched; only its classification
-        // is recorded. No target mapping is produced.
+        // A small integer / tag value, when explicitly declared, is classified
+        // SmallIntegerOrTag (kept as-is, no target mapping, never required).
         let content = region_bytes(0x20, &[(8, 0x1234)]);
+        let slots = vec![DeclaredPointerSlot {
+            region_old_base: 0x500000,
+            offset: 8,
+            provenance: SlotProvenance::CaptureDescriptor,
+        }];
         let plan = build_runtime_rebase_plan(
             &[container(0x1000, 0x500000, 0x500020, 0x500040, content)],
             &[],
             None,
+            &slots,
+            &ExternalResolverTable::new(),
+            &[],
             OLD_IB,
             NEW_IB,
         )
@@ -1424,15 +2220,13 @@ mod tests {
     #[test]
     fn overlapping_old_regions_rejected() {
         let a = region_bytes(0x20, &[]);
-        let plan = build_runtime_rebase_plan(
+        let plan = build_plan(
             &[
                 container(0x1000, 0x500000, 0x500020, 0x500040, a.clone()),
                 container(0x2000, 0x500010, 0x500030, 0x500050, a),
             ],
             &[],
             None,
-            OLD_IB,
-            NEW_IB,
         );
         assert!(matches!(plan, Err(RebaseError::Overlap { .. })));
     }
@@ -1441,15 +2235,13 @@ mod tests {
     #[test]
     fn overlapping_target_regions_rejected() {
         let a = region_bytes(0x10, &[]);
-        let plan = build_runtime_rebase_plan(
+        let plan = build_plan(
             &[],
             &[
                 global(0x2000, 0x140000000, a.clone(), true),
                 global(0x2000, 0x140000000, a.clone(), true),
             ],
             None,
-            OLD_IB,
-            NEW_IB,
         );
         // Duplicate image-inline RVA should be caught by the build (same old
         // base) or by the validator.
@@ -1471,12 +2263,10 @@ mod tests {
         // A heap-global with a base near u64::MAX and a real payload makes
         // old_base + size overflow (containers derive size = end - begin, so
         // they can never overflow; the global path can).
-        let plan = build_runtime_rebase_plan(
+        let plan = build_plan(
             &[],
             &[global(0x2000, u64::MAX - 2, vec![0u8; 16], false)],
             None,
-            OLD_IB,
-            NEW_IB,
         );
         assert!(matches!(plan, Err(RebaseError::Overflow { .. })));
     }
@@ -1484,20 +2274,12 @@ mod tests {
     // 16. source pointer slot out of bounds rejected.
     #[test]
     fn source_slot_out_of_bounds_rejected() {
-        // A region smaller than a pointer is impossible (size checked > 0).
-        // Build one then corrupt its payload length to trigger the validator.
-        let plan = build_runtime_rebase_plan(
-            &[container(
-                0x1000,
-                0x500000,
-                0x500010,
-                0x500020,
-                vec![0u8; 16],
-            )],
+        // Build a region with a pointer-shaped slot at offset 0 (declared).
+        let content = region_bytes(0x10, &[(0, 0x600000)]);
+        let plan = build_plan(
+            &[container(0x1000, 0x500000, 0x500010, 0x500020, content)],
             &[],
             None,
-            OLD_IB,
-            NEW_IB,
         )
         .unwrap()
         .unwrap();
@@ -1511,12 +2293,10 @@ mod tests {
     //     allocation failure). Represented by: an empty required region -> Rejected.
     #[test]
     fn required_allocation_failure_rejects() {
-        let plan = build_runtime_rebase_plan(
+        let plan = build_plan(
             &[container(0x1000, 0x500000, 0x500000, 0x500010, vec![])],
             &[],
             None,
-            OLD_IB,
-            NEW_IB,
         );
         assert!(matches!(plan, Err(RebaseError::EmptyRegion(_))));
     }
@@ -1526,27 +2306,23 @@ mod tests {
     #[test]
     fn plan_is_deterministic() {
         let content = region_bytes(0x10, &[(0, 0x600000)]);
-        let p1 = build_runtime_rebase_plan(
+        let p1 = build_plan(
             &[
                 container(0x1000, 0x500000, 0x500010, 0x500020, content.clone()),
                 container(0x2000, 0x600000, 0x600010, 0x600020, content.clone()),
             ],
             &[],
             None,
-            OLD_IB,
-            NEW_IB,
         )
         .unwrap()
         .unwrap();
-        let p2 = build_runtime_rebase_plan(
+        let p2 = build_plan(
             &[
                 container(0x1000, 0x500000, 0x500010, 0x500020, content.clone()),
                 container(0x2000, 0x600000, 0x600010, 0x600020, content.clone()),
             ],
             &[],
             None,
-            OLD_IB,
-            NEW_IB,
         )
         .unwrap()
         .unwrap();
@@ -1559,12 +2335,10 @@ mod tests {
     #[test]
     fn post_patch_scan_no_old_range_pointer() {
         let content = region_bytes(0x10, &[(0, 0x500000)]); // self pointer
-        let plan = build_runtime_rebase_plan(
+        let plan = build_plan(
             &[container(0x1000, 0x500000, 0x500010, 0x500020, content)],
             &[],
             None,
-            OLD_IB,
-            NEW_IB,
         )
         .unwrap()
         .unwrap();
@@ -1581,7 +2355,7 @@ mod tests {
     #[test]
     fn patch_leaves_no_old_range_pointer() {
         // Covered comprehensively by #19; assert the direct classification too.
-        let plan = build_runtime_rebase_plan(
+        let plan = build_plan(
             &[container(
                 0x1000,
                 0x500000,
@@ -1591,8 +2365,6 @@ mod tests {
             )],
             &[],
             None,
-            OLD_IB,
-            NEW_IB,
         )
         .unwrap()
         .unwrap();
@@ -1637,7 +2409,63 @@ mod tests {
     //     the caller must treat as "no rebasing to prove").
     #[test]
     fn no_plan_fails_closed() {
-        let plan = build_runtime_rebase_plan(&[], &[], None, OLD_IB, NEW_IB).unwrap();
+        let plan = build_plan(&[], &[], None).unwrap();
         assert!(plan.is_none());
+    }
+
+    // 24b. AhkGto + require_capture=true with an empty capture is a hard
+    //      RequiredRuntimeCaptureMissing error, never a silent continue.
+    #[test]
+    fn empty_capture_required_is_hard_error() {
+        let err = prepare_runtime_rebase_for_dump(
+            &[],
+            &[],
+            None,
+            &[],
+            &ExternalResolverTable::new(),
+            &[],
+            OLD_IB,
+            NEW_IB,
+            0x1000,
+            true,
+        )
+        .unwrap_err();
+        assert!(matches!(err, RebaseError::RequiredRuntimeCaptureMissing));
+    }
+
+    // 24c. Complete summary must not allow None bootstrap_rva or cookie.
+    #[test]
+    fn complete_requires_bootstrap_and_cookie() {
+        let content = region_bytes(0x10, &[(0, 0x500000)]); // self pointer
+        let plan = build_plan(
+            &[container(0x1000, 0x500000, 0x500010, 0x500020, content)],
+            &[],
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        // Missing bootstrap -> Prepared, not Complete.
+        let s1 = summarize_plan(&plan, None, 0x1000, None, "none", false);
+        assert_eq!(s1.recovery_status, RebaseStatus::Prepared);
+        // Missing cookie -> Incomplete, not Complete.
+        let s2 = summarize_plan(
+            &plan,
+            Some(0x2000),
+            0x1000,
+            None,
+            "post_crt_two_phase",
+            true,
+        );
+        assert_ne!(s2.recovery_status, RebaseStatus::Complete);
+        // Contract invalid -> Incomplete, not Complete.
+        let s3 = summarize_plan(
+            &plan,
+            Some(0x2000),
+            0x1000,
+            Some(0x2f00),
+            "post_crt_two_phase",
+            false,
+        );
+        assert_ne!(s3.recovery_status, RebaseStatus::Complete);
     }
 }

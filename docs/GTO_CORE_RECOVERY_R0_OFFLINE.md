@@ -181,3 +181,55 @@ TLS callback 路径**未接线**（P2），不声称已启用。
 - Oreans 回归保持绿色（workspace 全部测试 0 failed）。
 
 **本工单完成 ≠ GTO Product 1.0。UI/script engine 恢复未在 live 验证，明确为否。**
+
+
+---
+
+# 附录：R0-B — RuntimeRebasePlan 接入真实 .boot 执行链
+
+**Base:** `ace46d3`（R0-A 之后）
+
+## B1. 架构变化
+
+R0-B 把离线 `RuntimeRebasePlan` 从"诊断/门禁"变成 `.boot` metadata 与两阶段分配的**唯一权威计划**：
+
+- 新增 `runtime_bootstrap.rs`：`encode_plan_metadata` / `decode_plan_metadata`（round-trip）、`build_runtime_bootstrap`（两阶段 stub 代码生成）、`simulate_runtime_rebase`（离线模型执行）、`InstalledHeapBootstrap` / `HeapBootstrapError`。
+- `install_heap_bootstrap` 改为强类型 `Result<InstalledHeapBootstrap, HeapBootstrapError>`，接收 `PreparedRuntimeRebase`，不再 `Option<u32>` 回退。
+- `runtime_rebase.rs` 新增 `PreparedRuntimeRebase`、`prepare_runtime_rebase_for_dump`、`DeclaredPointerSlot` / `PointerCandidate` / `SlotProvenance`、`ExternalTarget` / `ExternalResolverTable` / `ExternalAttribution`；`ExternalCandidate` 未解析即 fail-closed。
+
+## B2. 修改文件
+
+- `runtime_rebase.rs`：plan API + declared-pointer 模型 + external resolver + 24 项 tests（含 external/空 plan/Complete 语义）。
+- `runtime_bootstrap.rs`（新增）：metadata 编解码 + 两阶段 stub + 离线模拟 + 10 项 tests。
+- `heap_bootstrap.rs`：`install_heap_bootstrap` 强 Result，plan 驱动。
+- `dump_process.rs`：prepare → install → `validate_bootstrap_contract` → digest 校验 → finalize summary；任一失败写盘前 `Err`。
+- `snapshot_manifest.rs`：`runtime_rebase` 块新增 fixup_count / resolver_count / candidate_count / bootstrap_contract_valid。
+- `container_bootstrap.rs`：旧 hand-rolled emitter 标记 legacy（dead-code allowed），CRT helper 提升为 `pub(crate)` 供新路径复用。
+
+## B3. 两阶段 stub（计划驱动）
+
+- Phase 1：遍历 region 表，heap-target 用 `HeapAlloc` 分配并记录 `new_base` 到 alloc map；image-inline 复制到 `image_base+image_rva`。required allocation 失败进入无限循环 fail path，**不跳 OEP**。
+- Phase 2：遍历 fixup 表——`InCapturedRegion` 用 `target_new_base + target_offset`；`InImage` 用 `loaded_image_base + image_rva`；`ExternalModule` 读 cold-start IAT slot；Null/SmallTag 不改；ExternalCandidate/Unmapped/Ambiguous 不应出现在 metadata（plan 已 fail-closed）。
+- 完成后设置 completion cookie → 清 volatile regs → `jmp` 真实 OEP。
+
+## B4. ExternalModule 解析
+
+不再仅凭 `value >= 0x7ff0...` 判定 resolved。新增 `ExternalTarget { module_identity, module_rva, import_dll, import_name_or_ordinal, iat_rva, resolution_kind }`。只有模块 map 能归属 + resolver table 有匹配条目才算 resolved；否则 `ExternalCandidate` 计入 unresolved_required，recovery 不能 Complete，dump fail-closed。运行期经 `iat_rva`（cold-start IAT slot，loader 填充）解析，**ASLR 安全、不保留 dump-time API VA**。
+
+## B5. 诊断字段
+
+`RuntimeRebaseSummary` 新增：`fixup_count`、`resolver_count`、`candidate_count`、`bootstrap_contract_valid`。状态仅 Prepared / Complete / Incomplete / Rejected。`Complete` 要求 plan valid + unresolved_required==0 + boot_rva 存在 + completion cookie 存在 + contract valid + digest 匹配 + resolver 全存在。仅 planner 未安装 → Prepared/Incomplete，绝不 Complete。
+
+## B6. 验证
+
+- `cargo test -p mida-pe --offline`：285 lib pass + 其余。
+- `cargo test -p mida-cli --features gto-product-recovery --offline`：8 bins / 0 fail。
+- `cargo test -p mida-packers-ahk-gto --features gto-product-recovery --offline`：2 bins / 0 fail。
+- `cargo test --workspace --offline`：42 bins / 0 fail。
+- `cargo fmt --all -- --check`、`git diff --check` 干净。
+- **未改 acceptance / gto_host / bwhook；未运行真实 sample。**
+
+## B7. 诚实边界
+
+- 离线模拟（`simulate_runtime_rebase` + `validate_rebased_snapshots`）对 **emitted metadata** 做模型执行，证明 round-trip 与 pointer patch 逻辑；真实 stub 的运行时执行仍需下一轮受控 live route 验证。
+- external resolver 的模块归属依赖 live IAT 值；离线无法保证匹配所有外部指针，未解析即 fail-closed。

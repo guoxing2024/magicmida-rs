@@ -1,5 +1,7 @@
 //! Reinitialize stale CRT heap state before transferring control to the OEP.
 
+#![allow(dead_code)]
+
 use std::collections::{HashMap, HashSet};
 
 use tracing::{info, warn};
@@ -8,7 +10,6 @@ use crate::header::PeHeader;
 use crate::import_table::ImportTableBuilder;
 
 use super::container_snapshot::ContainerSnapshot;
-use super::heap_global_snapshot::HeapGlobalSnapshot;
 use super::types::ContainerRestoreMode;
 
 const IMAGE_SCN_CNT_CODE: u32 = 0x0000_0020;
@@ -26,151 +27,145 @@ struct HeapBootstrap {
     get_process_heap_iat_rva: u32,
 }
 
-/// Install heap / container bootstrap according to [`ContainerRestoreMode`].
+/// Install heap / container bootstrap for the AhkGto recovery path.
 ///
-/// Returns the **PE entry point** to write (CRT EP unchanged for PostCrt;
-/// bootstrap RVA only for PreCrt / simple heap EP stubs).
+/// The plan-driven `.boot` is built from the authoritative `PreparedRuntimeRebase`
+/// (regions + declared pointer fixups + external resolvers), never by
+/// re-guessing a mapping. This is the strong-Result entry point: under
+/// `AhkGtoExperimental` every failure is a hard error that must occur before
+/// the candidate is written — there is no `None` + fallback to `opts.entry_point`.
+///
+/// PostCrt keeps the PE EP at the MSVC CRT wrapper and patches its trailing
+/// `jmp` to `.boot`; the stub restores then jumps to the real OEP.
 pub(crate) fn install_heap_bootstrap(
     pe: &mut PeHeader,
     dump_buf: &mut [u8],
     imports: &ImportTableBuilder,
     original_entry_point: u32,
-    containers: &[ContainerSnapshot],
-    heap_globals: &[HeapGlobalSnapshot],
-    heap_slab: Option<&super::heap_global_snapshot::HeapSlab>,
-    virtual_alloc_iat_rva: Option<u32>,
+    prepared_rebase: &super::runtime_rebase::PreparedRuntimeRebase,
     restore_mode: ContainerRestoreMode,
-    // Cookie storage RVA captured from the late dump (before early overlay).
-    cookie_rva: Option<u32>,
-    // Optional AHK call-obfuscation cookie mirror (src,dst) image RVAs.
+    _cookie_rva: Option<u32>,
     cookie_mirror: Option<(u32, u32)>,
-    _debugger: Option<&mut dyn mida_core::DebuggerCore>,
-) -> Option<u32> {
+) -> Result<
+    super::runtime_bootstrap::InstalledHeapBootstrap,
+    super::runtime_bootstrap::HeapBootstrapError,
+> {
+    use super::runtime_bootstrap::{build_runtime_bootstrap, HeapBootstrapError};
+
     if !pe.is_64bit {
-        return None;
+        return Err(HeapBootstrapError::NotX64);
     }
 
-    let get_process_heap = find_import_rva(imports, "GetProcessHeap");
-    let heap_alloc = find_import_rva(imports, "HeapAlloc");
-    // r27: ensure VirtualAlloc is imported (heap-slab original-address remap).
-    // The stub uses it to reserve the slab at its dump-time address so all
-    // intra-heap pointers are correct without rebase (zero false-positives).
-    let _virtual_alloc = find_import_rva(imports, "VirtualAlloc");
-    let heap_bootstrap = detect_heap_bootstrap(pe, dump_buf, imports);
-    // Prefer pre-overlay cookie RVA; fall back to scanning current buffer.
-    let cookie_rva = cookie_rva.or_else(|| find_security_cookie_rva(pe, dump_buf));
+    // Reserve the `.boot` section. The completion cookie lives in `.boot`
+    // (writable), so we can place it at a fixed offset after the metadata.
+    // We create the section first to learn boot_rva, then pass it in.
+    let boot_section_idx = pe.create_section_index(".boot", 0x1000);
+    let boot_rva = pe.sections[boot_section_idx].virtual_address;
 
-    let needs_restore = !containers.is_empty() || !heap_globals.is_empty();
-    if needs_restore {
-        match restore_mode {
-            ContainerRestoreMode::Off => {
-                warn!(
-                    containers = containers.len(),
-                    heap_globals = heap_globals.len(),
-                    "Container/heap-global restore disabled"
-                );
-                return None;
-            }
-            ContainerRestoreMode::PostCrt => {
-                let (Some(gph), Some(ha)) = (get_process_heap, heap_alloc) else {
-                    warn!("Container restore needs GetProcessHeap + HeapAlloc imports");
-                    return None;
-                };
-                // Never write CRT heap global from this stub (stdio poison).
-                return super::container_bootstrap::install_post_crt_container_restore(
-                    pe,
-                    dump_buf,
-                    containers,
-                    heap_globals,
-                    heap_slab,
-                    virtual_alloc_iat_rva,
-                    gph,
-                    ha,
-                    original_entry_point,
-                    cookie_rva,
-                    None, // do not refresh CRT heap global pre-stdio
-                    cookie_mirror,
-                );
-            }
-            ContainerRestoreMode::PreCrt => {
-                warn!(
-                    containers = containers.len(),
-                    heap_globals = heap_globals.len(),
-                    "Installing PRE-CRT container bootstrap (experimental; may break MSVC stdio)"
-                );
-                let (Some(gph), Some(ha)) = (get_process_heap, heap_alloc) else {
-                    return None;
-                };
-                return super::container_bootstrap::install_container_bootstrap(
-                    pe,
-                    containers,
-                    heap_globals,
-                    heap_slab,
-                    virtual_alloc_iat_rva,
-                    gph,
-                    ha,
-                    original_entry_point,
-                    pe.nt_headers.optional_header.image_base,
-                    cookie_rva,
-                    // Pre-CRT: still avoid writing CRT heap global.
-                    None,
-                    cookie_mirror,
-                );
-            }
-        }
-    }
+    // Completion cookie: a dedicated writable slot at boot_rva + 0xF00
+    // (inside the reserved `.boot` region; .boot is marked writable below).
+    let completion_cookie_rva = boot_rva.saturating_add(0xF00);
 
-    // No containers / heap globals: optional simple EP heap bootstrap for non-CRT.
-    // Skip when EP looks like MSVC CRT wrapper — CRT must own heap globals.
-    if is_crt_entry_wrapper(dump_buf, original_entry_point) {
-        info!(
-            entry = format_args!("{original_entry_point:#x}"),
-            "Skipping simple heap EP bootstrap (CRT entry must re-init itself)"
-        );
-        return None;
-    }
-
-    let bootstrap = heap_bootstrap?;
-
-    let section_idx = pe.create_section_index(".boot", 0x200);
-    let stub_rva = pe.sections[section_idx].virtual_address;
-    let stub = match build_stub(stub_rva, original_entry_point, bootstrap) {
-        Some(stub) => stub,
-        None => {
-            pe.sections.remove(section_idx);
-            pe.nt_headers.optional_header.size_of_image = pe
-                .sections
-                .last()
-                .map(|section| {
-                    crate::utils::align_up(
-                        section.virtual_address.saturating_add(section.virtual_size),
-                        pe.nt_headers.optional_header.section_alignment,
-                    )
-                })
-                .unwrap_or(pe.nt_headers.optional_header.size_of_headers);
-            warn!("Heap bootstrap targets are outside the x64 relative-address range");
-            return None;
+    let (blob, meta_offset) = match build_runtime_bootstrap(
+        pe,
+        imports,
+        prepared_rebase,
+        original_entry_point,
+        completion_cookie_rva,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            pe.sections.remove(boot_section_idx);
+            return Err(e);
         }
     };
 
-    let section = &mut pe.sections[section_idx];
-    section.characteristics = IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ;
+    // Size to section alignment; ensure the blob (code + metadata + alloc map)
+    // is fully covered by SizeOfRawData.
+    let stub_len = blob.len();
+    let aligned_size = crate::utils::align_up(stub_len as u32, 0x1000).max(0x1000);
+
+    let section = &mut pe.sections[boot_section_idx];
+    section.characteristics =
+        IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE;
     section.header.characteristics = section.characteristics;
-    section.header.virtual_size = 0x200;
-    section.virtual_size = 0x200;
-    section.header.size_of_raw_data = 0x200;
-    section.raw_size = 0x200;
-    section.extra_data = Some(stub);
+    section.header.virtual_size = aligned_size;
+    section.virtual_size = aligned_size;
+    section.header.size_of_raw_data = aligned_size;
+    section.raw_size = aligned_size;
+    if section.header.pointer_to_raw_data == 0 {
+        section.header.pointer_to_raw_data = aligned_size;
+        section.raw_offset = aligned_size;
+    }
+    section.extra_data = Some(blob);
 
     info!(
-        stub_rva = format_args!("{stub_rva:#x}"),
-        heap_global_rva = format_args!("{:#x}", bootstrap.heap_global_rva),
-        get_process_heap_iat_rva = format_args!("{:#x}", bootstrap.get_process_heap_iat_rva),
+        boot_rva = format_args!("{boot_rva:#x}"),
+        metadata_rva = format_args!("{:#x}", boot_rva + meta_offset as u32),
+        cookie_rva = format_args!("{completion_cookie_rva:#x}"),
         original_entry_point = format_args!("{original_entry_point:#x}"),
-        "Installed pre-OEP process heap bootstrap"
+        digest = %prepared_rebase.plan.plan_digest,
+        "Installed plan-driven runtime bootstrap (.boot)"
     );
 
-    Some(stub_rva)
+    // PostCrt wiring: patch CRT wrapper `jmp` → .boot; PE EP stays CRT wrapper.
+    // If the entry is not an MSVC CRT wrapper, install pre-OEP (PE EP = .boot).
+    let (entry_point_rva, bootstrap_kind) = match restore_mode {
+        ContainerRestoreMode::PostCrt => {
+            if super::container_bootstrap::looks_like_crt_entry_wrapper(
+                dump_buf,
+                original_entry_point,
+            ) {
+                match super::container_bootstrap::patch_crt_wrapper_jmp_to_stub(
+                    dump_buf,
+                    original_entry_point,
+                    boot_rva,
+                ) {
+                    Ok(original_target) => {
+                        info!(
+                            entry = format_args!("{original_entry_point:#x}"),
+                            boot = format_args!("{boot_rva:#x}"),
+                            continue_target = format_args!("{original_target:#x}"),
+                            "PostCrt: CRT wrapper jmp -> .boot (PE EP stays CRT)"
+                        );
+                        (original_entry_point, "post_crt_two_phase")
+                    }
+                    Err(msg) => {
+                        warn!(
+                            reason = msg,
+                            "PostCrt CRT patch failed; using pre-OEP .boot EP"
+                        );
+                        (boot_rva, "pre_oep_two_phase")
+                    }
+                }
+            } else {
+                warn!(
+                    entry = format_args!("{original_entry_point:#x}"),
+                    "PostCrt: entry is not MSVC CRT wrapper; pre-OEP .boot EP"
+                );
+                (boot_rva, "pre_oep_two_phase")
+            }
+        }
+        ContainerRestoreMode::PreCrt | ContainerRestoreMode::Off => (boot_rva, "pre_oep_two_phase"),
+    };
+
+    // Cookie mirror is currently handled by the runtime stub's cookie path;
+    // this field is kept for diagnostics.
+    let _ = cookie_mirror;
+
+    Ok(super::runtime_bootstrap::InstalledHeapBootstrap {
+        entry_point_rva,
+        boot_rva,
+        metadata_rva: boot_rva.saturating_add(meta_offset as u32),
+        metadata_size: stub_len as u32,
+        completion_cookie_rva,
+        original_oep_rva: original_entry_point,
+        region_count: prepared_rebase.plan.regions.len(),
+        pointer_fixup_count: prepared_rebase.plan.pointers.len(),
+        resolver_count: prepared_rebase.plan.external_targets.len(),
+        emitted_plan_digest: prepared_rebase.plan.plan_digest.clone(),
+        bootstrap_kind: bootstrap_kind.to_string(),
+    })
 }
 
 /// MSVC x64 default SecurityCookie. `__security_init_cookie` only regenerates

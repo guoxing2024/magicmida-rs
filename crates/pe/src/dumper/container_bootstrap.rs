@@ -26,6 +26,8 @@
 //! `scrt_main` target. CRT stdio (`_ioinit`) still runs after cookie init and
 //! is not poisoned by pre-EP heap-global writes.
 
+#![allow(dead_code)]
+
 use tracing::{info, warn};
 
 use crate::header::PeHeader;
@@ -227,7 +229,7 @@ pub(crate) fn install_post_crt_container_restore(
 }
 
 /// MSVC x64 PE entry probe: `sub rsp,28h; call; add rsp,28h; jmp`.
-fn looks_like_crt_entry_wrapper(dump_buf: &[u8], ep_rva: u32) -> bool {
+pub(crate) fn looks_like_crt_entry_wrapper(dump_buf: &[u8], ep_rva: u32) -> bool {
     let off = ep_rva as usize;
     let Some(bytes) = dump_buf.get(off..off.saturating_add(14)) else {
         return false;
@@ -250,7 +252,7 @@ fn looks_like_crt_entry_wrapper(dump_buf: &[u8], ep_rva: u32) -> bool {
 ///
 /// When `stub_rva == 0`, only returns the original jmp target RVA.
 /// When `stub_rva != 0`, patches the jmp to `stub_rva` and returns the same original target.
-fn patch_crt_wrapper_jmp_to_stub(
+pub(crate) fn patch_crt_wrapper_jmp_to_stub(
     dump_buf: &mut [u8],
     crt_entry_rva: u32,
     stub_rva: u32,

@@ -291,6 +291,16 @@ pub(crate) fn render_manifest_json(
             s.external_pointers
         ));
         buf.push_str(&format!("    \"null_or_tagged\": {},\n", s.null_or_tagged));
+        buf.push_str(&format!("    \"fixup_count\": {},\n", s.fixup_count));
+        buf.push_str(&format!("    \"resolver_count\": {},\n", s.resolver_count));
+        buf.push_str(&format!(
+            "    \"candidate_count\": {},\n",
+            s.candidate_count
+        ));
+        buf.push_str(&format!(
+            "    \"bootstrap_contract_valid\": {},\n",
+            s.bootstrap_contract_valid
+        ));
         buf.push_str(&format!(
             "    \"unresolved_required\": {},\n",
             s.unresolved_required
@@ -436,11 +446,15 @@ mod tests {
             unresolved_required: 0,
             unresolved_optional: 1,
             image_roots_patched: 1,
-            bootstrap_kind: "pre_oep_container".to_string(),
+            bootstrap_kind: "post_crt_two_phase".to_string(),
             bootstrap_rva: Some(0x2f000),
             original_oep_rva: 0x5a10,
-            completion_cookie_rva: None,
+            completion_cookie_rva: Some(0x2ff00),
             deterministic_plan_digest: "abc123".to_string(),
+            fixup_count: 7,
+            resolver_count: 1,
+            candidate_count: 3,
+            bootstrap_contract_valid: true,
             recovery_status: crate::dumper::runtime_rebase::RebaseStatus::Complete,
         };
         let json = render_manifest_json(
@@ -457,7 +471,11 @@ mod tests {
         assert!(json.contains("\"runtime_rebase\": {"));
         assert!(json.contains("\"regions_total\": 3"));
         assert!(json.contains("\"unresolved_required\": 0"));
-        assert!(json.contains("\"bootstrap_kind\": \"pre_oep_container\""));
+        assert!(json.contains("\"bootstrap_kind\": \"post_crt_two_phase\""));
+        assert!(json.contains("\"fixup_count\": 7"));
+        assert!(json.contains("\"resolver_count\": 1"));
+        assert!(json.contains("\"bootstrap_contract_valid\": true"));
+        assert!(json.contains("\"completion_cookie_rva\": \"0x2ff00\""));
         assert!(json.contains("\"recovery_status\": \"Complete\""));
         assert!(json.contains("\"deterministic_plan_digest\": \"abc123\""));
     }

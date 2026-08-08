@@ -1105,85 +1105,162 @@ pub fn dump_process_with_report(
         warn!("No import_builder - skipping import section creation");
     }
 
-    // GTO R0: diagnostic summary of the offline runtime rebase plan. `None`
-    // unless the AhkGtoExperimental recovery produced a validated plan.
+    // GTO R0-B: the runtime rebase plan + diagnostic summary. `None` unless the
+    // AhkGtoExperimental recovery installed a validated plan-driven bootstrap.
     let mut rebase_summary: Option<super::runtime_rebase::RuntimeRebaseSummary> = None;
 
     let output_entry_point = if stage_plan.install_heap_bootstrap {
-        // Resolve VirtualAlloc IAT slot AFTER section build assigned addresses.
-        let virtual_alloc_iat = import_builder
-            .as_ref()
-            .and_then(|b| b.find_function_iat("VirtualAlloc"));
-        // GTO R0: build + validate the deterministic runtime rebase plan offline,
-        // before the runtime bootstrap stub is installed. A plan that leaves a
-        // required old heap/private pointer unresolved fails closed — we refuse
-        // to emit a candidate that cannot cold-start (never a partial copy).
-        {
-            let new_image_base = pe.nt_headers.optional_header.image_base;
-            match super::runtime_rebase::plan_and_validate_for_dump(
-                &containers,
-                &heap_globals,
-                heap_slab.as_ref(),
-                opts.image_base,
-                new_image_base,
-                None, // boot_rva unknown until the bootstrap section is created
-                opts.entry_point,
-                None, // completion cookie RVA resolved from the installed stub
-            ) {
-                Ok(None) => {
-                    info!(
-                        profile = ?opts.profile,
-                        "GTO R0: no captured allocations to rebase (empty plan)"
-                    );
-                }
-                Ok(Some(summary)) => {
-                    info!(
-                        regions_total = summary.regions_total,
-                        regions_required = summary.regions_required,
-                        bytes_captured = summary.bytes_captured,
-                        pointer_slots_total = summary.pointer_slots_total,
-                        intra_region_pointers = summary.intra_region_pointers,
-                        image_pointers = summary.image_pointers,
-                        external_pointers = summary.external_pointers,
-                        null_or_tagged = summary.null_or_tagged,
-                        unresolved_required = summary.unresolved_required,
-                        digest = %summary.deterministic_plan_digest,
-                        status = summary.recovery_status.label(),
-                        "GTO R0: runtime rebase plan validated offline"
-                    );
-                    rebase_summary = Some(summary);
-                }
-                Err(e) => {
-                    return Err(PeError::Parse(format!(
-                        "GTO R0: runtime rebase plan failed closed: {e:#}"
-                    )));
+        // Build the authoritative plan from the captured allocations + declared
+        // pointer slots + external resolvers + module map. Fail closed on any
+        // structural or unresolved-required condition.
+        let new_image_base = pe.nt_headers.optional_header.image_base;
+
+        // Module map from the live process (for external pointer attribution).
+        let module_map: Vec<(String, u64, u64)> = super::remote_modules::take_module_snapshot(
+            debugger.process_handle(),
+            debugger.pid(),
+            opts.image_base,
+            pe.is_64bit,
+        )
+        .unwrap_or_default()
+        .into_iter()
+        .map(|m| (m.name.clone(), m.base, m.end_off))
+        .collect();
+
+        // Declared pointer slots from the capture descriptor (pointer-shaped
+        // qwords inside captured allocations). Provenance-driven.
+        let declared_slots = super::runtime_rebase::declared_slots_from_capture(
+            &containers,
+            &heap_globals,
+            heap_slab.as_ref(),
+        );
+
+        // External resolvers from the rebuilt import table (ASLR-safe via IAT).
+        let external_resolvers = match import_builder.as_ref() {
+            Some(builder) => {
+                let read_live = |rva: u64| -> Option<u64> {
+                    let mut buf = [0u8; 8];
+                    let va = opts.image_base + rva;
+                    debugger.read_memory(va as usize, &mut buf).ok()?;
+                    Some(u64::from_le_bytes(buf))
+                };
+                match super::runtime_rebase::build_external_resolvers_from_imports(
+                    builder,
+                    &module_map,
+                    &read_live,
+                ) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        return Err(PeError::Parse(format!(
+                            "GTO R0-B: external resolver build failed: {e:#}"
+                        )));
+                    }
                 }
             }
-        }
-        match import_builder.as_ref().and_then(|builder| {
-            super::heap_bootstrap::install_heap_bootstrap(
+            None => super::runtime_rebase::ExternalResolverTable::default(),
+        };
+
+        let prepared = match super::runtime_rebase::prepare_runtime_rebase_for_dump(
+            &containers,
+            &heap_globals,
+            heap_slab.as_ref(),
+            &declared_slots,
+            &external_resolvers,
+            &module_map,
+            opts.image_base,
+            new_image_base,
+            opts.entry_point,
+            true, // require_capture: empty plan is a hard error
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                return Err(PeError::Parse(format!(
+                    "GTO R0-B: runtime rebase plan failed closed: {e:#}"
+                )));
+            }
+        };
+
+        // Install the plan-driven bootstrap. Strong Result — no None fallback.
+        let installed = match import_builder.as_ref() {
+            Some(builder) => super::heap_bootstrap::install_heap_bootstrap(
                 &mut pe,
                 &mut dump_buf,
                 builder,
                 opts.entry_point,
-                &containers,
-                &heap_globals,
-                heap_slab.as_ref(),
-                virtual_alloc_iat,
+                &prepared,
                 opts.container_restore,
                 cookie_rva,
                 cookie_mirror,
-                Some(debugger),
-            )
-        }) {
-            Some(ep) => {
-                // Bootstrap may run without a heap slab; disclose separately from
-                // `heap_slab_restore` (taxonomy capture class; audit P1).
-                capture_transforms.push(("heap_bootstrap", "capture"));
-                ep
+            ),
+            None => Err(super::runtime_bootstrap::HeapBootstrapError::MissingImport(
+                "import_builder",
+            )),
+        };
+        let installed = match installed {
+            Ok(v) => v,
+            Err(e) => {
+                return Err(PeError::Parse(format!(
+                    "GTO R0-B: plan-driven bootstrap install failed: {e:#}"
+                )));
             }
-            None => opts.entry_point,
+        };
+
+        // Post-install contract validation before write.
+        let tls_rva = pe.nt_headers.optional_header.data_directory[9]
+            .virtual_address
+            .ne(&0)
+            .then_some(pe.nt_headers.optional_header.data_directory[9].virtual_address);
+        let contract = super::runtime_rebase::validate_bootstrap_contract(
+            &pe,
+            installed.boot_rva,
+            tls_rva,
+            installed.original_oep_rva,
+            installed.region_count,
+        );
+        let contract_valid = contract.is_ok();
+        if let Err(e) = contract {
+            return Err(PeError::Parse(format!(
+                "GTO R0-B: bootstrap contract invalid: {e:#}"
+            )));
         }
+        // Emitted digest must match the prepared plan digest.
+        if installed.emitted_plan_digest != prepared.plan.plan_digest {
+            return Err(PeError::Parse(format!(
+                "GTO R0-B: emitted plan digest {} != prepared digest {}",
+                installed.emitted_plan_digest, prepared.plan.plan_digest
+            )));
+        }
+
+        // Finalize the summary (Complete only if everything holds).
+        let summary = match super::runtime_rebase::finalize_summary_after_install(
+            &prepared,
+            Some(installed.boot_rva),
+            Some(installed.completion_cookie_rva),
+            &installed.bootstrap_kind,
+            contract_valid,
+            &installed.emitted_plan_digest,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                return Err(PeError::Parse(format!(
+                    "GTO R0-B: final summary not Complete: {e:#}"
+                )));
+            }
+        };
+        info!(
+            regions_total = summary.regions_total,
+            fixup_count = summary.fixup_count,
+            resolver_count = summary.resolver_count,
+            unresolved_required = summary.unresolved_required,
+            boot_rva = format_args!("{:#x}", installed.boot_rva),
+            cookie_rva = format_args!("{:#x}", installed.completion_cookie_rva),
+            digest = %summary.deterministic_plan_digest,
+            status = summary.recovery_status.label(),
+            "GTO R0-B: plan-driven runtime bootstrap installed and validated"
+        );
+        rebase_summary = Some(summary);
+        capture_transforms.push(("heap_bootstrap", "capture"));
+        installed.entry_point_rva
     } else {
         opts.entry_point
     };

@@ -43,6 +43,7 @@ mod original_imports;
 mod output_writer;
 mod pure_rebuild_adapter;
 mod remote_modules;
+mod runtime_bootstrap;
 mod runtime_rebase;
 mod sections;
 mod serialize;
@@ -67,11 +68,18 @@ pub use self::pure_rebuild_adapter::{
     PureRebuildParitySnapshot,
 };
 pub use self::remote_modules::take_module_snapshot;
+pub use self::runtime_bootstrap::{
+    build_runtime_bootstrap, decode_plan_metadata, encode_plan_metadata, simulate_runtime_rebase,
+    BootFixup, BootMetadata, BootRegion, BootResolver, HeapBootstrapError, InstalledHeapBootstrap,
+};
 pub use self::runtime_rebase::{
-    build_runtime_rebase_plan, plan_and_validate_for_dump, summarize_plan,
-    validate_bootstrap_contract, validate_rebased_snapshots, validate_runtime_rebase_plan,
-    PointerClassification, RebaseError, RebaseRegion, RebaseStatus, RuntimeRebasePlan,
-    RuntimeRebaseSummary,
+    attribute_external, build_external_resolvers_from_imports, build_runtime_rebase_plan,
+    declared_slots_from_capture, finalize_summary_after_install, prepare_runtime_rebase_for_dump,
+    summarize_plan, validate_bootstrap_contract, validate_rebased_snapshots,
+    validate_runtime_rebase_plan, DeclaredPointerSlot, ExternalAttribution, ExternalResolutionKind,
+    ExternalResolverTable, ExternalTarget, PointerCandidate, PointerClassification,
+    PreparedRuntimeRebase, RebaseError, RebaseRegion, RebaseStatus, RuntimeRebasePlan,
+    RuntimeRebaseSummary, SlotProvenance,
 };
 pub use self::snapshot_manifest::manifest_path_for_output;
 pub use self::types::{
