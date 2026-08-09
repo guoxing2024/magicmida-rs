@@ -476,6 +476,7 @@ mod tests {
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
                 extent_evidence: CaptureExtentEvidence::default(),
+                transform_ids: Vec::new(),
                 provenance: RegionProvenance::default(),
             },
             HeapGlobalSnapshot {
@@ -486,6 +487,7 @@ mod tests {
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
                 extent_evidence: CaptureExtentEvidence::default(),
+                transform_ids: Vec::new(),
                 provenance: RegionProvenance::default(),
             },
         ];

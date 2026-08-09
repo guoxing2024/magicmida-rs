@@ -2432,6 +2432,7 @@ mod tests {
             provenance: RegionProvenance::default(),
             extent_kind: CaptureExtentKind::ObservedAllocation,
             extent_evidence: CaptureExtentEvidence::default(),
+            transform_ids: Vec::new(),
         }
     }
 
@@ -3678,6 +3679,7 @@ mod tests {
             is_image_inline: false,
             extent_kind: CaptureExtentKind::ObservedAllocation,
             extent_evidence: CaptureExtentEvidence::default(),
+            transform_ids: Vec::new(),
             provenance: RegionProvenance::default(),
         };
         let plan = build_plan(&[], &[handle], None).unwrap();

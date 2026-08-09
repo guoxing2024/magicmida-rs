@@ -253,6 +253,10 @@ pub struct HeapGlobalSnapshot {
     /// Capture evidence (GTO R0-F.1). Bound to first-hop / interior snapshots
     /// so runtime ownership can be derived deterministically.
     pub extent_evidence: CaptureExtentEvidence,
+    /// Transform ids that actually modified this child (GTO R0-F.1). Populated
+    /// by the dump pipeline by diffing content across each transform. An
+    /// unchanged child has an empty list (it is never claimed as a writer).
+    pub transform_ids: Vec<String>,
 }
 
 /// A captured heap slab: one contiguous blob covering the span of all
@@ -697,6 +701,7 @@ pub fn detect_heap_globals(
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
                 extent_evidence: CaptureExtentEvidence::default(),
+                transform_ids: Vec::new(),
                 provenance: RegionProvenance::default(),
             });
             continue;
@@ -840,6 +845,7 @@ pub fn detect_heap_globals(
             is_image_inline: false,
             extent_kind: CaptureExtentKind::default(),
             extent_evidence: CaptureExtentEvidence::default(),
+            transform_ids: Vec::new(),
             provenance: RegionProvenance::default(),
         });
     }
@@ -1107,6 +1113,23 @@ pub fn detect_heap_globals(
 ///
 /// Must run on RAW snapshots (before transforms) so raw-coherence with the slab
 /// is meaningful.
+///
+/// Record which children a transform actually modified (GTO R0-F.1 per-child
+/// transform provenance). Compares each child's content before/after the
+/// transform and appends `transform_id` to the `transform_ids` of every child
+/// whose bytes changed. Unchanged children are never claimed as writers.
+pub fn record_transform_applied(
+    heap_globals: &mut [HeapGlobalSnapshot],
+    before: &[HeapGlobalSnapshot],
+    transform_id: &str,
+) {
+    for (g, b) in heap_globals.iter_mut().zip(before.iter()) {
+        if g.live_ptr == b.live_ptr && g.content != b.content {
+            g.transform_ids.push(transform_id.to_string());
+        }
+    }
+}
+
 pub fn reconcile_duplicate_heap_globals(
     out: &mut Vec<HeapGlobalSnapshot>,
     raw_slab: Option<&HeapSlab>,
@@ -1369,6 +1392,7 @@ fn capture_image_inline_gscript(
         is_image_inline: true,
         extent_kind: CaptureExtentKind::default(),
         extent_evidence: CaptureExtentEvidence::default(),
+        transform_ids: Vec::new(),
         provenance: RegionProvenance::default(),
     });
 }
@@ -1435,6 +1459,7 @@ fn ensure_hot_root_slots(
                     is_image_inline: false,
                     extent_kind: CaptureExtentKind::default(),
                     extent_evidence: CaptureExtentEvidence::default(),
+                    transform_ids: Vec::new(),
                     provenance: RegionProvenance::default(),
                 });
                 continue;
@@ -1462,6 +1487,7 @@ fn ensure_hot_root_slots(
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
                 extent_evidence: CaptureExtentEvidence::default(),
+                transform_ids: Vec::new(),
                 provenance: RegionProvenance::default(),
             });
             continue;
@@ -1589,6 +1615,7 @@ fn ensure_hot_root_slots(
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
                 extent_evidence: CaptureExtentEvidence::default(),
+                transform_ids: Vec::new(),
                 provenance: RegionProvenance::default(),
             });
             continue;
@@ -1664,6 +1691,7 @@ fn ensure_hot_root_slots(
             is_image_inline: false,
             extent_kind: CaptureExtentKind::default(),
             extent_evidence: CaptureExtentEvidence::default(),
+            transform_ids: Vec::new(),
             provenance: RegionProvenance::default(),
         });
     }
@@ -1891,6 +1919,7 @@ fn exhaust_gscript_first_hop(
                 containing_parent_size: containing_parent.map(|(_, s)| s),
             },
             provenance: RegionProvenance::default(),
+            transform_ids: Vec::new(),
         });
         added += 1;
     }
@@ -2066,6 +2095,7 @@ fn exhaust_gscript_child_link_fields(
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
                 extent_evidence: CaptureExtentEvidence::default(),
+                transform_ids: Vec::new(),
                 provenance: RegionProvenance::default(),
             });
             added += 1;
@@ -2221,6 +2251,7 @@ pub fn repair_gscript_window_strings(heap_globals: &mut Vec<HeapGlobalSnapshot>)
             is_image_inline: false,
             extent_kind: CaptureExtentKind::default(),
             extent_evidence: CaptureExtentEvidence::default(),
+            transform_ids: Vec::new(),
             provenance: RegionProvenance::SyntheticDerived {
                 transform_id: "repair_gscript_window_strings".to_string(),
                 source_anchor: anchor.to_string(),
@@ -2588,6 +2619,7 @@ pub fn repair_label_names_after_scrub(heap_globals: &mut Vec<HeapGlobalSnapshot>
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
                 extent_evidence: CaptureExtentEvidence::default(),
+                transform_ids: Vec::new(),
                 provenance: RegionProvenance::default(),
             });
             names_added += 1;
@@ -2861,6 +2893,7 @@ fn exhaust_gscript_label_table_entries(
             is_image_inline: false,
             extent_kind: CaptureExtentKind::default(),
             extent_evidence: CaptureExtentEvidence::default(),
+            transform_ids: Vec::new(),
             provenance: RegionProvenance::default(),
         });
         added += 1;
@@ -2987,6 +3020,7 @@ fn externalize_label_name_field(
             is_image_inline: false,
             extent_kind: CaptureExtentKind::default(),
             extent_evidence: CaptureExtentEvidence::default(),
+            transform_ids: Vec::new(),
             provenance: RegionProvenance::default(),
         });
     }
@@ -3175,6 +3209,7 @@ fn externalize_all_label_names_from_table(
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
                 extent_evidence: CaptureExtentEvidence::default(),
+                transform_ids: Vec::new(),
                 provenance: RegionProvenance::default(),
             });
             fixed += 1;
@@ -3565,6 +3600,7 @@ fn exhaust_pointer_table_first_hop_span(
             is_image_inline: false,
             extent_kind: CaptureExtentKind::default(),
             extent_evidence: CaptureExtentEvidence::default(),
+            transform_ids: Vec::new(),
             provenance: RegionProvenance::default(),
         });
         added += 1;
@@ -3802,6 +3838,7 @@ fn expand_hot_root_children(
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
                 extent_evidence: CaptureExtentEvidence::default(),
+                transform_ids: Vec::new(),
                 provenance: RegionProvenance::default(),
             });
             added += 1;
@@ -4044,6 +4081,7 @@ fn expand_heap_graph(
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
                 extent_evidence: CaptureExtentEvidence::default(),
+                transform_ids: Vec::new(),
                 provenance: RegionProvenance::default(),
             });
             node_priority.push(child_pri);
@@ -4270,6 +4308,7 @@ fn admit_string_buffer_child(
         is_image_inline: false,
         extent_kind: CaptureExtentKind::default(),
         extent_evidence: CaptureExtentEvidence::default(),
+        transform_ids: Vec::new(),
         provenance: RegionProvenance::default(),
     });
     true
@@ -4453,6 +4492,7 @@ fn split_swallowed_siblings(
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
                 extent_evidence: CaptureExtentEvidence::default(),
+                transform_ids: Vec::new(),
                 provenance: RegionProvenance::default(),
             });
             added += 1;
@@ -4623,6 +4663,7 @@ fn capture_dangling_edges(
             is_image_inline: false,
             extent_kind: CaptureExtentKind::default(),
             extent_evidence: CaptureExtentEvidence::default(),
+            transform_ids: Vec::new(),
             provenance: RegionProvenance::default(),
         });
         added += 1;
@@ -5314,6 +5355,7 @@ mod tests {
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
                 extent_evidence: CaptureExtentEvidence::default(),
+                transform_ids: Vec::new(),
                 provenance: RegionProvenance::default(),
             },
             HeapGlobalSnapshot {
@@ -5324,6 +5366,7 @@ mod tests {
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
                 extent_evidence: CaptureExtentEvidence::default(),
+                transform_ids: Vec::new(),
                 provenance: RegionProvenance::default(),
             },
         ];
@@ -5348,6 +5391,7 @@ mod tests {
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
                 extent_evidence: CaptureExtentEvidence::default(),
+                transform_ids: Vec::new(),
                 provenance: RegionProvenance::default(),
             },
             HeapGlobalSnapshot {
@@ -5358,6 +5402,7 @@ mod tests {
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
                 extent_evidence: CaptureExtentEvidence::default(),
+                transform_ids: Vec::new(),
                 provenance: RegionProvenance::default(),
             },
             // Heap handle must not set min_obj by itself.
@@ -5369,6 +5414,7 @@ mod tests {
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
                 extent_evidence: CaptureExtentEvidence::default(),
+                transform_ids: Vec::new(),
                 provenance: RegionProvenance::default(),
             },
         ];
@@ -5400,6 +5446,7 @@ mod tests {
             is_image_inline: false,
             extent_kind: CaptureExtentKind::default(),
             extent_evidence: CaptureExtentEvidence::default(),
+            transform_ids: Vec::new(),
             provenance: RegionProvenance::default(),
         }];
         assert!(compute_heap_slab_span(&globals).is_none());
@@ -5420,6 +5467,7 @@ mod tests {
             is_image_inline: true,
             extent_kind: CaptureExtentKind::default(),
             extent_evidence: CaptureExtentEvidence::default(),
+            transform_ids: Vec::new(),
             provenance: RegionProvenance::ImageInline,
         };
         gscript.content[0xbd0..0xbd8].copy_from_slice(&0xa190a8u64.to_le_bytes());
@@ -5480,6 +5528,7 @@ mod tests {
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
                 extent_evidence: CaptureExtentEvidence::default(),
+                transform_ids: Vec::new(),
                 provenance: RegionProvenance::default(),
             },
             HeapGlobalSnapshot {
@@ -5490,6 +5539,7 @@ mod tests {
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
                 extent_evidence: CaptureExtentEvidence::default(),
+                transform_ids: Vec::new(),
                 provenance: RegionProvenance::default(),
             },
         ];
@@ -5525,6 +5575,7 @@ mod tests {
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
                 extent_evidence: CaptureExtentEvidence::default(),
+                transform_ids: Vec::new(),
                 provenance: RegionProvenance::default(),
             },
             HeapGlobalSnapshot {
@@ -5535,6 +5586,7 @@ mod tests {
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
                 extent_evidence: CaptureExtentEvidence::default(),
+                transform_ids: Vec::new(),
                 provenance: RegionProvenance::default(),
             },
         ];
@@ -5566,6 +5618,7 @@ mod tests {
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
                 extent_evidence: CaptureExtentEvidence::default(),
+                transform_ids: Vec::new(),
                 provenance: RegionProvenance::default(),
             },
             HeapGlobalSnapshot {
@@ -5576,6 +5629,7 @@ mod tests {
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
                 extent_evidence: CaptureExtentEvidence::default(),
+                transform_ids: Vec::new(),
                 provenance: RegionProvenance::default(),
             },
         ];
@@ -5600,6 +5654,7 @@ mod tests {
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
                 extent_evidence: CaptureExtentEvidence::default(),
+                transform_ids: Vec::new(),
                 provenance: RegionProvenance::default(),
             },
             HeapGlobalSnapshot {
@@ -5610,6 +5665,7 @@ mod tests {
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
                 extent_evidence: CaptureExtentEvidence::default(),
+                transform_ids: Vec::new(),
                 provenance: RegionProvenance::default(),
             },
         ];
@@ -5627,6 +5683,7 @@ mod tests {
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
                 extent_evidence: CaptureExtentEvidence::default(),
+                transform_ids: Vec::new(),
                 provenance: RegionProvenance::default(),
             },
             HeapGlobalSnapshot {
@@ -5637,6 +5694,7 @@ mod tests {
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
                 extent_evidence: CaptureExtentEvidence::default(),
+                transform_ids: Vec::new(),
                 provenance: RegionProvenance::default(),
             },
         ];

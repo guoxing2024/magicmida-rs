@@ -360,7 +360,11 @@ pub fn build_patched_backing_slab(
     raw_capture: &RawSlabCapture,
     transformed_globals: &[HeapGlobalSnapshot],
     transformed_containers: &[ContainerSnapshot],
-    transform_ids: &[&'static str],
+    // The global round transform list. NOT attributed to individual children:
+    // per-child provenance comes from `HeapGlobalSnapshot.transform_ids`
+    // (populated by diffing content across each transform). Retained for API
+    // compatibility / round documentation.
+    _transform_ids: &[&'static str],
 ) -> Result<(HeapSlab, Vec<TransformedRegionOverlay>), OverlayError> {
     let slab = &raw_capture.slab;
     let mut backing = slab.content.clone();
@@ -380,7 +384,14 @@ pub fn build_patched_backing_slab(
     // SyntheticDerived children (created by an offline transform, no raw
     // source) are carried but excluded from raw-coherence; UnknownSynthetic
     // fails closed. See GTO Core Recovery R0-D.
-    let mut transformed: Vec<(u64, usize, Vec<u8>, RawChildKind, RegionProvenance)> = Vec::new();
+    let mut transformed: Vec<(
+        u64,
+        usize,
+        Vec<u8>,
+        RawChildKind,
+        RegionProvenance,
+        Vec<String>,
+    )> = Vec::new();
     for g in transformed_globals {
         if g.is_heap_handle || g.is_image_inline || g.content.is_empty() {
             continue;
@@ -391,6 +402,7 @@ pub fn build_patched_backing_slab(
             g.content.clone(),
             RawChildKind::HeapGlobal,
             g.provenance.clone(),
+            g.transform_ids.clone(),
         ));
     }
     for c in transformed_containers {
@@ -412,10 +424,11 @@ pub fn build_patched_backing_slab(
             RegionProvenance::RawCaptured {
                 raw_digest: String::new(),
             },
+            Vec::new(),
         ));
     }
     // Deterministic order by (old_base, kind).
-    transformed.sort_by_key(|(base, _, _, kind, _)| (*base, *kind as u8));
+    transformed.sort_by_key(|(base, _, _, kind, _, _)| (*base, *kind as u8));
 
     let mut overlays: Vec<TransformedRegionOverlay> = Vec::new();
     // GTO R0-F: track resolved writes at slab-byte granularity for conflict
@@ -423,11 +436,14 @@ pub fn build_patched_backing_slab(
     let mut resolved_writes: std::collections::BTreeMap<usize, ResolvedWrite> =
         std::collections::BTreeMap::new();
 
-    for (child_base, child_size, transformed_bytes, kind, provenance) in &transformed {
+    for (child_base, child_size, transformed_bytes, kind, provenance, child_transform_ids) in
+        &transformed
+    {
         let child_base = *child_base;
         let child_size = *child_size;
         let kind = *kind;
         let transformed_bytes = transformed_bytes.clone();
+        let child_transform_ids = child_transform_ids.clone();
         // R0-D: UnknownSynthetic always fails closed.
         if let RegionProvenance::UnknownSynthetic = &provenance {
             return Err(OverlayError::RawChildMissing {
@@ -616,7 +632,9 @@ pub fn build_patched_backing_slab(
                 write_runs.push((s, acc.len(), acc));
             }
         }
-        let my_transform_ids: Vec<String> = transform_ids.iter().map(|s| s.to_string()).collect();
+        // GTO R0-F.1: use per-child transform provenance (which transforms
+        // actually modified this child), not the global round list. The global
+        // `transform_ids` is no longer attributed to every child.
         // Resolve each write byte against already-applied writes.
         let mut contributed_new_write = false;
         let mut all_shared_with_same_base = true;
@@ -634,7 +652,7 @@ pub fn build_patched_backing_slab(
                                 child_old_base: child_base,
                                 child_size,
                                 child_byte_offset,
-                                transform_ids: my_transform_ids.clone(),
+                                transform_ids: child_transform_ids.clone(),
                             },
                         );
                         contributed_new_write = true;
@@ -667,7 +685,7 @@ pub fn build_patched_backing_slab(
                             a_after_byte: existing.value,
                             b_after_byte: val,
                             a_transform_ids: existing.transform_ids.clone(),
-                            b_transform_ids: my_transform_ids.clone(),
+                            b_transform_ids: child_transform_ids.clone(),
                         });
                     }
                 }
@@ -693,13 +711,13 @@ pub fn build_patched_backing_slab(
         // this child sit inside another transformed child's range?
         let contained_in = transformed
             .iter()
-            .find(|(ob, osz, _, ok, _)| {
+            .find(|(ob, osz, _, ok, _, _)| {
                 // exclude this child itself
                 !(*ok == kind && *ob == child_base)
                     && *ob <= child_base
                     && child_base + child_size as u64 <= ob.saturating_add(*osz as u64)
             })
-            .map(|(ob, _, _, _, _)| *ob);
+            .map(|(ob, _, _, _, _, _)| *ob);
         overlays.push(TransformedRegionOverlay {
             child_kind: kind,
             child_old_base: child_base,
@@ -708,7 +726,7 @@ pub fn build_patched_backing_slab(
             raw_child_digest: sha256_hex(raw_child_bytes),
             raw_slab_slice_digest: sha256_hex(raw_slab_slice),
             transformed_child_digest: t_digest,
-            transform_ids: my_transform_ids,
+            transform_ids: child_transform_ids,
             overlay_applied: true,
             contained_in_old_base: contained_in,
         });
@@ -742,6 +760,7 @@ mod tests {
             provenance: RegionProvenance::default(),
             extent_kind: CaptureExtentKind::default(),
             extent_evidence: CaptureExtentEvidence::default(),
+            transform_ids: Vec::new(),
         }
     }
 
@@ -755,6 +774,7 @@ mod tests {
             provenance: RegionProvenance::default(),
             extent_kind: CaptureExtentKind::default(),
             extent_evidence: CaptureExtentEvidence::default(),
+            transform_ids: Vec::new(),
         }
     }
 
@@ -934,7 +954,8 @@ mod tests {
             }],
         };
         let transformed_bytes = vec![0x42u8; 0x1a];
-        let transformed = global(ROUTEK_CHILD_BASE, transformed_bytes.clone(), false);
+        let mut transformed = global(ROUTEK_CHILD_BASE, transformed_bytes.clone(), false);
+        transformed.transform_ids = vec!["repair_gscript_window_strings".to_string()];
         let (patched, overlays) = build_patched_backing_slab(
             &raw_capture,
             &[transformed],
@@ -970,7 +991,8 @@ mod tests {
             }],
         };
         let repaired = b"NewClassName".to_vec();
-        let transformed = global(ROUTEK_CHILD_BASE, repaired.clone(), false);
+        let mut transformed = global(ROUTEK_CHILD_BASE, repaired.clone(), false);
+        transformed.transform_ids = vec!["repair_gscript_window_strings".to_string()];
         let (patched, o) = build_patched_backing_slab(
             &raw_capture,
             &[transformed],
@@ -1002,7 +1024,8 @@ mod tests {
             }],
         };
         let scrubbed = vec![0u8; 16];
-        let transformed = global(ROUTEK_CHILD_BASE, scrubbed.clone(), false);
+        let mut transformed = global(ROUTEK_CHILD_BASE, scrubbed.clone(), false);
+        transformed.transform_ids = vec!["scrub_uncaptured_heap_pointers".to_string()];
         let (patched, o) = build_patched_backing_slab(
             &raw_capture,
             &[transformed],

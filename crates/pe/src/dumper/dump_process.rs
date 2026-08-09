@@ -898,32 +898,86 @@ pub fn dump_process_with_report(
     // post-CRT restore does not hand ntdll stale heap addresses (RtlpFindEntry).
     let image_end = (opts.image_base as u64).saturating_add(pe.size_of_image() as u64);
     if stage_plan.scrub_uncaptured_heap_pointers {
+        let before = heap_globals.clone();
         super::heap_global_snapshot::scrub_uncaptured_heap_pointers(
             &mut containers,
             &mut heap_globals,
             opts.image_base as u64,
             image_end,
         );
+        super::heap_global_snapshot::record_transform_applied(
+            &mut heap_globals,
+            &before,
+            "scrub_uncaptured_heap_pointers",
+        );
     }
     // R-GTO-UI r17b: scrub walks every qword and can clear gscript count@+0x10
     // when the live dword was embedded in a pointer-shaped qword. Re-apply
     // table-derived label count after scrub so bootstrap payload keeps it.
-    super::heap_global_snapshot::resynthesize_gscript_label_count(&mut heap_globals);
+    {
+        let before = heap_globals.clone();
+        super::heap_global_snapshot::resynthesize_gscript_label_count(&mut heap_globals);
+        super::heap_global_snapshot::record_transform_applied(
+            &mut heap_globals,
+            &before,
+            "resynthesize_gscript_label_count",
+        );
+    }
     // R-GTO-UI r18/r19b: scrub / slot-cap leave Label.mName null or dangling
     // while inline UTF-16 remains at +0x30  -> 0x48fb0 wcscmp AV. Repair offline
     // (scrub now also preserves UTF-16-looking qwords).
-    super::heap_global_snapshot::repair_label_names_after_scrub(&mut heap_globals);
+    {
+        let before = heap_globals.clone();
+        super::heap_global_snapshot::repair_label_names_after_scrub(&mut heap_globals);
+        super::heap_global_snapshot::record_transform_applied(
+            &mut heap_globals,
+            &before,
+            "repair_label_names_after_scrub",
+        );
+    }
     // R-GTO-UI r20: binary search in 0x48fb0 requires mName-ordered table.
     // Dump capture order is unsorted  -> lookup "A_Args"/others always miss.
-    super::heap_global_snapshot::sort_gscript_label_table(&mut heap_globals);
+    {
+        let before = heap_globals.clone();
+        super::heap_global_snapshot::sort_gscript_label_table(&mut heap_globals);
+        super::heap_global_snapshot::record_transform_applied(
+            &mut heap_globals,
+            &before,
+            "sort_gscript_label_table",
+        );
+    }
     // R-GTO-UI r21: Label+0x23==0 redirects via +0x10; dump has null nested
     //  -> AV at 0xc13ea after successful A_Args lookup. Mark non-nested.
-    super::heap_global_snapshot::mark_labels_non_nested(&mut heap_globals);
+    {
+        let before = heap_globals.clone();
+        super::heap_global_snapshot::mark_labels_non_nested(&mut heap_globals);
+        super::heap_global_snapshot::record_transform_applied(
+            &mut heap_globals,
+            &before,
+            "mark_labels_non_nested",
+        );
+    }
     // R-GTO-UI r21b: WinMain re-inits [0x141bf0] after Label bind; dump free-list
     // body AVs later. Zero-slab large enough for re-init stores only.
-    super::heap_global_snapshot::sanitize_ahk_runtime_global(&mut heap_globals);
+    {
+        let before = heap_globals.clone();
+        super::heap_global_snapshot::sanitize_ahk_runtime_global(&mut heap_globals);
+        super::heap_global_snapshot::record_transform_applied(
+            &mut heap_globals,
+            &before,
+            "sanitize_ahk_runtime_global",
+        );
+    }
     // R-GTO-UI r22b: gscript+0xbd8 must be NewClassName for RegisterClass @0x34db0.
-    super::heap_global_snapshot::repair_gscript_window_strings(&mut heap_globals);
+    {
+        let before = heap_globals.clone();
+        super::heap_global_snapshot::repair_gscript_window_strings(&mut heap_globals);
+        super::heap_global_snapshot::record_transform_applied(
+            &mut heap_globals,
+            &before,
+            "repair_gscript_window_strings",
+        );
+    }
 
     // ---- R0-C.1: patched backing slab via transformed-child overlay ----
     // After transforms, build the authoritative backing slab by overlaying the
