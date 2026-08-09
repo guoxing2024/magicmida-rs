@@ -12,6 +12,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
 use crate::header::PeHeader;
@@ -105,10 +106,66 @@ const MIN_FILL_ONLY_CAPTURE_BYTES: usize = MAX_HEAP_GLOBAL_BYTES + 1;
 /// (e.g. AHK `g_script` at `0x149d50`, used as `lea rcx,[g_script]`), not an
 /// 8-byte pointer slot. Capture reads live image bytes at `image_base+rva`;
 /// bootstrap memcpys into that image address and records fixup
+/// Provenance taxonomy for a heap-global region (GTO Core Recovery R0-D).
+///
+/// Distinguishes how a region's bytes and live address were obtained, which
+/// governs whether it may participate in raw-coherence overlay and how it is
+/// materialized at runtime. A synthetic region must never be reported as
+/// raw-captured.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegionProvenance {
+    /// Bytes + live address read directly from the debuggee (pre-transform).
+    /// May participate in raw coherence and be overlaid after a transform.
+    RawCaptured {
+        /// sha256 (hex) of the raw bytes as read from the debuggee.
+        raw_digest: String,
+    },
+    /// A raw-captured region that was modified by one or more offline
+    /// transforms. Bound to its raw source region and the transform ledger.
+    TransformedRawCaptured {
+        /// sha256 (hex) of the pre-transform raw bytes.
+        raw_digest: String,
+        /// transform ids applied to this region (deterministic order).
+        transform_ids: Vec<String>,
+    },
+    /// No raw source: bytes were synthesized by an offline transform for
+    /// product recovery. Must bind a transform id, a source anchor or
+    /// deterministic construction rule, and a construction digest. Never
+    /// claimed as raw-observed. Materialized via independent runtime
+    /// allocation (HeapAlloc) — not an in-image region.
+    SyntheticDerived {
+        /// transform id that created this region.
+        transform_id: String,
+        /// source anchor: the slot/region that references it, or the
+        /// deterministic construction rule that produced the bytes.
+        source_anchor: String,
+        /// sha256 (hex) of the constructed bytes (deterministic).
+        construction_digest: String,
+    },
+    /// Object body lives in the image at `rva`; proven image ownership
+    /// required (not merely "address looks like an image"). Never routed
+    /// through the heap allocation path.
+    ImageInline,
+    /// Resolved at cold-start through the resolver / IAT semantics; a
+    /// dump-time API VA is never written into the candidate.
+    ExternalResolved,
+    /// Provenance could not be established. Always fail-closed; never
+    /// reaches a Complete plan and never writes a candidate.
+    UnknownSynthetic,
+}
+
+impl Default for RegionProvenance {
+    fn default() -> Self {
+        RegionProvenance::RawCaptured {
+            raw_digest: String::new(),
+        }
+    }
+}
+
 /// `old=live_ptr(=image_base+rva) → new=image_base+rva` so child edges that
 /// still hold the live image base remap correctly. Planting a heap clone at
 /// `*[rva]` is wrong for this class (R-GTO-UI script-heap-resume).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct HeapGlobalSnapshot {
     /// Image RVA of the 8-byte slot that holds the heap pointer (`0` = no plant).
     /// For `is_image_inline`, RVA of the in-image object body.
@@ -122,6 +179,8 @@ pub struct HeapGlobalSnapshot {
     pub is_heap_handle: bool,
     /// Object body lives in the image at `rva` (not a pointer slot).
     pub is_image_inline: bool,
+    /// Provenance of this region (default `RawCaptured`).
+    pub provenance: RegionProvenance,
 }
 
 /// A captured heap slab: one contiguous blob covering the span of all
@@ -564,6 +623,7 @@ pub fn detect_heap_globals(
                 content: Vec::new(),
                 is_heap_handle: true,
                 is_image_inline: false,
+                provenance: RegionProvenance::default(),
             });
             continue;
         }
@@ -704,6 +764,7 @@ pub fn detect_heap_globals(
             content,
             is_heap_handle: false,
             is_image_inline: false,
+            provenance: RegionProvenance::default(),
         });
     }
 
@@ -1119,6 +1180,7 @@ fn capture_image_inline_gscript(
         content,
         is_heap_handle: false,
         is_image_inline: true,
+        provenance: RegionProvenance::default(),
     });
 }
 
@@ -1182,6 +1244,7 @@ fn ensure_hot_root_slots(
                     content: Vec::new(),
                     is_heap_handle: true,
                     is_image_inline: false,
+                    provenance: RegionProvenance::default(),
                 });
                 continue;
             }
@@ -1206,6 +1269,7 @@ fn ensure_hot_root_slots(
                 content: Vec::new(),
                 is_heap_handle: true,
                 is_image_inline: false,
+                provenance: RegionProvenance::default(),
             });
             continue;
         }
@@ -1330,6 +1394,7 @@ fn ensure_hot_root_slots(
                 content: tiny,
                 is_heap_handle: false,
                 is_image_inline: false,
+                provenance: RegionProvenance::default(),
             });
             continue;
         }
@@ -1402,6 +1467,7 @@ fn ensure_hot_root_slots(
             content,
             is_heap_handle: false,
             is_image_inline: false,
+            provenance: RegionProvenance::default(),
         });
     }
 }
@@ -1594,6 +1660,7 @@ fn exhaust_gscript_first_hop(
             content: child,
             is_heap_handle: false,
             is_image_inline: false,
+            provenance: RegionProvenance::default(),
         });
         added += 1;
     }
@@ -1767,6 +1834,7 @@ fn exhaust_gscript_child_link_fields(
                 content: child,
                 is_heap_handle: false,
                 is_image_inline: false,
+                provenance: RegionProvenance::default(),
             });
             added += 1;
         }
@@ -1882,6 +1950,12 @@ pub fn repair_gscript_window_strings(heap_globals: &mut Vec<HeapGlobalSnapshot>)
     // Low user-space synthetic lives (must be plantable HeapAlloc targets and
     // within multi_fixup / is_heap_pointer acceptance). High VAs like
     // 0x50c1a550001 failed at runtime (r22b: +0xbd8 fell back to 0x106644).
+    //
+    // R0-D: these are SyntheticDerived regions — synthesized by this transform
+    // for product recovery, with NO raw source in the captured heap slab. They
+    // are excluded from raw-coherence overlay (no raw child exists by design)
+    // and must never be reported as raw-captured. Their old_base is a logical
+    // placement target, not an observed live allocation.
     const CLASS_LIVE: u64 = 0x0020_0000;
     const TITLE_LIVE: u64 = 0x0020_1000;
 
@@ -1895,12 +1969,29 @@ pub fn repair_gscript_window_strings(heap_globals: &mut Vec<HeapGlobalSnapshot>)
             body.extend_from_slice(&ch.to_le_bytes());
         }
         body.extend_from_slice(&[0, 0]);
+        // Deterministic construction digest = sha256 of the constructed wide
+        // string bytes (transform id carried separately on the provenance).
+        let construction_digest = {
+            let mut h = Sha256::new();
+            h.update(body.as_slice());
+            format!("{:x}", h.finalize())
+        };
+        let anchor = if live == CLASS_LIVE {
+            "gscript+0xbd8 (RegisterClass lpszClassName)"
+        } else {
+            "gscript+0xbd0 (CreateWindow title)"
+        };
         heap_globals.push(HeapGlobalSnapshot {
             rva: 0,
             live_ptr: live,
             content: body,
             is_heap_handle: false,
             is_image_inline: false,
+            provenance: RegionProvenance::SyntheticDerived {
+                transform_id: "repair_gscript_window_strings".to_string(),
+                source_anchor: anchor.to_string(),
+                construction_digest,
+            },
         });
         added += 1;
     }
@@ -2261,6 +2352,7 @@ pub fn repair_label_names_after_scrub(heap_globals: &mut Vec<HeapGlobalSnapshot>
                 content: body,
                 is_heap_handle: false,
                 is_image_inline: false,
+                provenance: RegionProvenance::default(),
             });
             names_added += 1;
         }
@@ -2531,6 +2623,7 @@ fn exhaust_gscript_label_table_entries(
             content: child,
             is_heap_handle: false,
             is_image_inline: false,
+            provenance: RegionProvenance::default(),
         });
         added += 1;
     }
@@ -2654,6 +2747,7 @@ fn externalize_label_name_field(
             content: body,
             is_heap_handle: false,
             is_image_inline: false,
+            provenance: RegionProvenance::default(),
         });
     }
 
@@ -2839,6 +2933,7 @@ fn externalize_all_label_names_from_table(
                 content,
                 is_heap_handle: false,
                 is_image_inline: false,
+                provenance: RegionProvenance::default(),
             });
             fixed += 1;
         }
@@ -3226,6 +3321,7 @@ fn exhaust_pointer_table_first_hop_span(
             content: child,
             is_heap_handle: false,
             is_image_inline: false,
+            provenance: RegionProvenance::default(),
         });
         added += 1;
     }
@@ -3460,6 +3556,7 @@ fn expand_hot_root_children(
                 content,
                 is_heap_handle: false,
                 is_image_inline: false,
+                provenance: RegionProvenance::default(),
             });
             added += 1;
             total_added += 1;
@@ -3699,6 +3796,7 @@ fn expand_heap_graph(
                 content,
                 is_heap_handle: false,
                 is_image_inline: false,
+                provenance: RegionProvenance::default(),
             });
             node_priority.push(child_pri);
             added += 1;
@@ -3922,6 +4020,7 @@ fn admit_string_buffer_child(
         content: body,
         is_heap_handle: false,
         is_image_inline: false,
+        provenance: RegionProvenance::default(),
     });
     true
 }
@@ -4102,6 +4201,7 @@ fn split_swallowed_siblings(
                 content,
                 is_heap_handle: false,
                 is_image_inline: false,
+                provenance: RegionProvenance::default(),
             });
             added += 1;
         }
@@ -4269,6 +4369,7 @@ fn capture_dangling_edges(
             content,
             is_heap_handle: false,
             is_image_inline: false,
+            provenance: RegionProvenance::default(),
         });
         added += 1;
     }
@@ -4957,6 +5058,7 @@ mod tests {
                 content: vec![0x1; 0x100],
                 is_heap_handle: false,
                 is_image_inline: false,
+                provenance: RegionProvenance::default(),
             },
             HeapGlobalSnapshot {
                 rva: 0x149d50,
@@ -4964,6 +5066,7 @@ mod tests {
                 content: vec![0x2; 0x200],
                 is_heap_handle: false,
                 is_image_inline: false,
+                provenance: RegionProvenance::default(),
             },
         ];
         sanitize_ahk_runtime_global(&mut globals);
@@ -4985,6 +5088,7 @@ mod tests {
                 content: vec![0u8; 0x40],
                 is_heap_handle: false,
                 is_image_inline: false,
+                provenance: RegionProvenance::default(),
             },
             HeapGlobalSnapshot {
                 rva: 0x2000,
@@ -4992,6 +5096,7 @@ mod tests {
                 content: vec![0u8; 0x20],
                 is_heap_handle: false,
                 is_image_inline: false,
+                provenance: RegionProvenance::default(),
             },
             // Heap handle must not set min_obj by itself.
             HeapGlobalSnapshot {
@@ -5000,6 +5105,7 @@ mod tests {
                 content: vec![0u8; 8],
                 is_heap_handle: true,
                 is_image_inline: false,
+                provenance: RegionProvenance::default(),
             },
         ];
         let (old_base, end) = compute_heap_slab_span(&globals).expect("span");
@@ -5028,7 +5134,68 @@ mod tests {
             content: vec![0u8; 0x40],
             is_heap_handle: false,
             is_image_inline: false,
+            provenance: RegionProvenance::default(),
         }];
         assert!(compute_heap_slab_span(&globals).is_none());
+    }
+
+    // GTO Core Recovery R0-D: the window-string repair must mark its synthetic
+    // children with SyntheticDerived provenance (not RawCaptured), and repoint
+    // gscript+0xbd8/0xbd0 to those synthetic lives.
+    #[test]
+    fn r0d_window_string_repair_marks_synthetic_derived() {
+        // gscript-like inline global with class/title slots at +0xbd0/+0xbd8
+        // holding old (dump-path) strings.
+        let mut gscript = HeapGlobalSnapshot {
+            rva: 0x149d50,
+            live_ptr: 0x1400_0000_0 + 0x149d50,
+            content: vec![0u8; 0xbd8 + 16],
+            is_heap_handle: false,
+            is_image_inline: true,
+            provenance: RegionProvenance::ImageInline,
+        };
+        gscript.content[0xbd0..0xbd8].copy_from_slice(&0xa190a8u64.to_le_bytes());
+        gscript.content[0xbd8..0xbd0 + 8 + 8].copy_from_slice(&0xa18ec0u64.to_le_bytes());
+        let mut globals = vec![gscript];
+        repair_gscript_window_strings(&mut globals);
+        // Two synthetic children added (0x200000 class, 0x201000 title).
+        let synth: Vec<_> = globals
+            .iter()
+            .filter(|g| g.live_ptr == 0x200000 || g.live_ptr == 0x201000)
+            .collect();
+        assert_eq!(synth.len(), 2);
+        for g in &synth {
+            assert!(!g.is_image_inline);
+            assert!(!g.is_heap_handle);
+            match &g.provenance {
+                RegionProvenance::SyntheticDerived {
+                    transform_id,
+                    construction_digest,
+                    ..
+                } => {
+                    assert_eq!(transform_id, "repair_gscript_window_strings");
+                    // construction digest == sha256 of the content bytes.
+                    assert_eq!(
+                        *construction_digest,
+                        format!("{:x}", {
+                            let mut h = Sha256::new();
+                            h.update(&g.content);
+                            h.finalize()
+                        })
+                    );
+                }
+                other => panic!("expected SyntheticDerived, got {other:?}"),
+            }
+        }
+        // Class slot +0xbd8 == 0x200000, title slot +0xbd0 == 0x201000.
+        let gscript = &globals[0];
+        assert_eq!(
+            u64::from_le_bytes(gscript.content[0xbd8..0xbd8 + 8].try_into().unwrap()),
+            0x200000
+        );
+        assert_eq!(
+            u64::from_le_bytes(gscript.content[0xbd0..0xbd0 + 8].try_into().unwrap()),
+            0x201000
+        );
     }
 }

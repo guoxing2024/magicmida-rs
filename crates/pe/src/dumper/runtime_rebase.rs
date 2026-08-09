@@ -46,7 +46,7 @@ use std::fmt;
 use tracing::info;
 
 use super::container_snapshot::ContainerSnapshot;
-use super::heap_global_snapshot::{HeapGlobalSnapshot, HeapSlab};
+use super::heap_global_snapshot::{HeapGlobalSnapshot, HeapSlab, RegionProvenance};
 
 /// Pointer width this plan reasons about. GTO/R0 is x64-only; anything narrower
 /// is rejected before a plan is built.
@@ -152,6 +152,11 @@ pub struct RebaseRegion {
     /// When `Some`, this region's body lives inside the image at `image_rva`
     /// (e.g. an image-inline object) rather than in a fresh heap allocation.
     pub image_inline_rva: Option<u32>,
+    /// Provenance of this region (GTO Core Recovery R0-D). SyntheticDerived
+    /// regions are materialized via independent runtime allocation and never
+    /// reported as raw-captured; UnknownSynthetic must not reach a Complete
+    /// plan.
+    pub provenance: RegionProvenance,
 }
 
 /// Provenance of a rebase region (diagnostic only).
@@ -474,6 +479,31 @@ impl RuntimeRebasePlan {
                 None => out.push(0),
             }
             out.extend_from_slice(&r.bytes);
+            // R0-D: bind region provenance into the plan digest so a synthetic
+            // payload change (or provenance change) alters the digest.
+            out.push(region_provenance_tag(&r.provenance));
+            match &r.provenance {
+                RegionProvenance::RawCaptured { raw_digest }
+                | RegionProvenance::TransformedRawCaptured { raw_digest, .. } => {
+                    out.extend_from_slice(raw_digest.as_bytes());
+                    out.push(0);
+                }
+                RegionProvenance::SyntheticDerived {
+                    transform_id,
+                    source_anchor,
+                    construction_digest,
+                } => {
+                    out.extend_from_slice(transform_id.as_bytes());
+                    out.push(0);
+                    out.extend_from_slice(source_anchor.as_bytes());
+                    out.push(0);
+                    out.extend_from_slice(construction_digest.as_bytes());
+                    out.push(0);
+                }
+                RegionProvenance::ImageInline
+                | RegionProvenance::ExternalResolved
+                | RegionProvenance::UnknownSynthetic => {}
+            }
         }
         for p in &self.pointers {
             out.extend_from_slice(&p.source_region.to_le_bytes());
@@ -581,6 +611,18 @@ fn resolution_kind_as_u8(k: ExternalResolutionKind) -> u8 {
         ExternalResolutionKind::ViaIat => 0,
         ExternalResolutionKind::ViaExportMap => 1,
         ExternalResolutionKind::ViaStableBinding => 2,
+    }
+}
+
+/// Deterministic provenance tag for region digest binding (GTO R0-D).
+fn region_provenance_tag(p: &RegionProvenance) -> u8 {
+    match p {
+        RegionProvenance::RawCaptured { .. } => 0,
+        RegionProvenance::TransformedRawCaptured { .. } => 1,
+        RegionProvenance::SyntheticDerived { .. } => 2,
+        RegionProvenance::ImageInline => 3,
+        RegionProvenance::ExternalResolved => 4,
+        RegionProvenance::UnknownSynthetic => 5,
     }
 }
 
@@ -839,6 +881,9 @@ pub fn build_runtime_rebase_plan(
             required: true,
             kind: RegionKind::Container,
             image_inline_rva: None,
+            provenance: RegionProvenance::RawCaptured {
+                raw_digest: String::new(),
+            },
         });
         id = id.saturating_add(1);
     }
@@ -864,6 +909,7 @@ pub fn build_runtime_rebase_plan(
                 required: true,
                 kind: RegionKind::HeapGlobal,
                 image_inline_rva: Some(rva),
+                provenance: RegionProvenance::ImageInline,
             });
             id = id.saturating_add(1);
             continue;
@@ -877,6 +923,7 @@ pub fn build_runtime_rebase_plan(
             required: true,
             kind: RegionKind::HeapGlobal,
             image_inline_rva: None,
+            provenance: g.provenance.clone(),
         });
         id = id.saturating_add(1);
     }
@@ -891,12 +938,28 @@ pub fn build_runtime_rebase_plan(
                 required: true,
                 kind: RegionKind::HeapSlab,
                 image_inline_rva: None,
+                provenance: RegionProvenance::RawCaptured {
+                    raw_digest: String::new(),
+                },
             });
         }
     }
 
     if candidates.is_empty() {
         return Ok(None);
+    }
+
+    // R0-D: a region with UnknownSynthetic provenance must never reach a plan
+    // (fail-closed) — it cannot be materialized safely and must not yield a
+    // candidate. Reject before sorting/normalization so no downstream stage
+    // sees it as a valid region.
+    for c in &candidates {
+        if matches!(c.provenance, RegionProvenance::UnknownSynthetic) {
+            return Err(RebaseError::Plan(format!(
+                "region old_base={:#x} has UnknownSynthetic provenance (fail-closed)",
+                c.old_base
+            )));
+        }
     }
 
     // --- Deterministic sort by (old_base, size) ---
@@ -1498,6 +1561,14 @@ pub fn validate_runtime_rebase_plan(plan: &RuntimeRebasePlan) -> Result<(), Reba
         if !r.required {
             return Err(RebaseError::Plan(format!(
                 "region {} is not required (cold-start contract)",
+                r.id
+            )));
+        }
+        // R0-D: a region with UnknownSynthetic provenance must never reach a
+        // Complete plan or produce a candidate (fail-closed).
+        if matches!(r.provenance, RegionProvenance::UnknownSynthetic) {
+            return Err(RebaseError::Plan(format!(
+                "region {} has UnknownSynthetic provenance (fail-closed)",
                 r.id
             )));
         }
@@ -2265,6 +2336,7 @@ mod tests {
             content,
             is_heap_handle: false,
             is_image_inline: inline,
+            provenance: RegionProvenance::default(),
         }
     }
 
@@ -3160,6 +3232,9 @@ mod tests {
             required: true,
             kind: RegionKind::HeapSlab,
             image_inline_rva: None,
+            provenance: RegionProvenance::RawCaptured {
+                raw_digest: String::new(),
+            },
         };
         let mut map = std::collections::BTreeMap::new();
         map.insert(0x200000u64, (0usize, 0x1000usize)); // child base -> slab+0x1000
@@ -3182,6 +3257,9 @@ mod tests {
             required: true,
             kind: RegionKind::HeapSlab,
             image_inline_rva: None,
+            provenance: RegionProvenance::RawCaptured {
+                raw_digest: String::new(),
+            },
         };
         let mut map2 = std::collections::BTreeMap::new();
         map2.insert(0x200000u64, (0usize, 0x10usize)); // offset 16 == slab size
@@ -3256,6 +3334,56 @@ mod tests {
         let b = global(0x0, 0x1080, vec![0u8; 0x100], false);
         let err = build_plan(&[], &[a, b], None).unwrap_err();
         assert!(matches!(err, RebaseError::Overlap { .. }));
+    }
+
+    // GTO Core Recovery R0-D: a region with UnknownSynthetic provenance must
+    // be rejected by the planner (fail-closed) — it never reaches a Complete
+    // plan or a candidate.
+    #[test]
+    fn r0d_unknown_synthetic_region_rejected() {
+        let mut g = global(0x0, 0x1000, vec![0u8; 0x40], false);
+        g.provenance = RegionProvenance::UnknownSynthetic;
+        let err = build_plan(&[], &[g], None).unwrap_err();
+        assert!(matches!(err, RebaseError::Plan(_)));
+    }
+
+    // GTO Core Recovery R0-D: a SyntheticDerived region is carried into the
+    // plan with SyntheticDerived provenance and its bytes bind into the digest
+    // (a payload change alters the plan digest).
+    #[test]
+    fn r0d_synthetic_region_digest_binds_provenance() {
+        let mk = |bytes: Vec<u8>| {
+            let mut g = global(0x0, 0x200000, bytes, false);
+            g.provenance = RegionProvenance::SyntheticDerived {
+                transform_id: "repair_gscript_window_strings".to_string(),
+                source_anchor: "gscript+0xbd8".to_string(),
+                construction_digest: "abc".to_string(),
+            };
+            g
+        };
+        let plan_a = build_plan(&[], &[mk(b"NewClassName".to_vec())], None)
+            .unwrap()
+            .unwrap();
+        let reg = plan_a
+            .regions
+            .iter()
+            .find(|r| r.old_base == 0x200000)
+            .unwrap();
+        assert!(matches!(
+            reg.provenance,
+            RegionProvenance::SyntheticDerived { .. }
+        ));
+        // The region must carry the synthetic provenance, not raw.
+        assert!(!matches!(
+            reg.provenance,
+            RegionProvenance::RawCaptured { .. }
+        ));
+        // A different synthetic payload must produce a different plan digest
+        // (digest binds synthetic payload + provenance).
+        let plan_b = build_plan(&[], &[mk(b"ZhuChuangKou".to_vec())], None)
+            .unwrap()
+            .unwrap();
+        assert_ne!(plan_a.plan_digest, plan_b.plan_digest);
     }
 
     // 14. adjacency allowed, not coalesced.
@@ -3378,6 +3506,9 @@ mod tests {
                 required: true,
                 kind: RegionKind::HeapSlab,
                 image_inline_rva: None,
+                provenance: RegionProvenance::RawCaptured {
+                    raw_digest: String::new(),
+                },
             },
             RebaseRegion {
                 id: 1,
@@ -3388,6 +3519,9 @@ mod tests {
                 required: true,
                 kind: RegionKind::HeapSlab,
                 image_inline_rva: None,
+                provenance: RegionProvenance::RawCaptured {
+                    raw_digest: String::new(),
+                },
             },
         ];
         let cls = classify_value(0x1ff150, &regs, OLD_IB, NEW_IB);
@@ -3439,6 +3573,7 @@ mod tests {
             content: Vec::new(),
             is_heap_handle: true,
             is_image_inline: false,
+            provenance: RegionProvenance::default(),
         };
         let plan = build_plan(&[], &[handle], None).unwrap();
         // Empty capture (only a handle) -> None (no regions).

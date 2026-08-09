@@ -22,7 +22,7 @@
 use sha2::{Digest, Sha256};
 
 use super::container_snapshot::ContainerSnapshot;
-use super::heap_global_snapshot::{HeapGlobalSnapshot, HeapSlab};
+use super::heap_global_snapshot::{HeapGlobalSnapshot, HeapSlab, RegionProvenance};
 
 /// Kind of a captured child region (for overlay provenance).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -285,8 +285,11 @@ pub fn build_patched_backing_slab(
         .map(|c| (c.old_base, c))
         .collect();
 
-    // Collect transformed children (heap-global + container).
-    let mut transformed: Vec<(u64, usize, Vec<u8>, RawChildKind)> = Vec::new();
+    // Collect transformed children (heap-global + container) with provenance.
+    // SyntheticDerived children (created by an offline transform, no raw
+    // source) are carried but excluded from raw-coherence; UnknownSynthetic
+    // fails closed. See GTO Core Recovery R0-D.
+    let mut transformed: Vec<(u64, usize, Vec<u8>, RawChildKind, RegionProvenance)> = Vec::new();
     for g in transformed_globals {
         if g.is_heap_handle || g.is_image_inline || g.content.is_empty() {
             continue;
@@ -296,6 +299,7 @@ pub fn build_patched_backing_slab(
             g.content.len(),
             g.content.clone(),
             RawChildKind::HeapGlobal,
+            g.provenance.clone(),
         ));
     }
     for c in transformed_containers {
@@ -309,16 +313,56 @@ pub fn build_patched_backing_slab(
         }
         let mut content = c.heap_content.clone();
         content.truncate(size);
-        transformed.push((c.decoded_begin, size, content, RawChildKind::Container));
+        transformed.push((
+            c.decoded_begin,
+            size,
+            content,
+            RawChildKind::Container,
+            RegionProvenance::RawCaptured {
+                raw_digest: String::new(),
+            },
+        ));
     }
     // Deterministic order by (old_base, kind).
-    transformed.sort_by_key(|(base, _, _, kind)| (*base, *kind as u8));
+    transformed.sort_by_key(|(base, _, _, kind, _)| (*base, *kind as u8));
 
     let mut overlays: Vec<TransformedRegionOverlay> = Vec::new();
     // Track applied overlay ranges (half-open) for conflict detection.
     let mut applied_ranges: Vec<(usize, usize, String)> = Vec::new(); // (start, end, digest)
 
-    for (child_base, child_size, transformed_bytes, kind) in transformed {
+    for (child_base, child_size, transformed_bytes, kind, provenance) in transformed {
+        // R0-D: UnknownSynthetic always fails closed.
+        if let RegionProvenance::UnknownSynthetic = &provenance {
+            return Err(OverlayError::RawChildMissing {
+                child_old_base: child_base,
+                child_kind: kind,
+            });
+        }
+        // R0-D: SyntheticDerived children have no raw source by design; they
+        // are recorded as synthetic ledger entries (not overlaid into the
+        // slab) and materialized as independent runtime regions.
+        if let RegionProvenance::SyntheticDerived {
+            transform_id,
+            source_anchor,
+            construction_digest,
+        } = &provenance
+        {
+            let t_digest = sha256_hex(&transformed_bytes);
+            debug_assert_eq!(t_digest, *construction_digest);
+            overlays.push(TransformedRegionOverlay {
+                child_kind: kind,
+                child_old_base: child_base,
+                child_size,
+                slab_offset: 0,
+                raw_child_digest: String::new(),
+                raw_slab_slice_digest: String::new(),
+                transformed_child_digest: t_digest,
+                transform_ids: vec![transform_id.clone()],
+                overlay_applied: false,
+            });
+            let _ = source_anchor;
+            continue;
+        }
         let Some(raw) = raw_by_base.get(&child_base).copied() else {
             return Err(OverlayError::RawChildMissing {
                 child_old_base: child_base,
@@ -480,6 +524,7 @@ mod tests {
             content,
             is_heap_handle: false,
             is_image_inline: inline,
+            provenance: RegionProvenance::default(),
         }
     }
 
@@ -490,6 +535,7 @@ mod tests {
             content: Vec::new(),
             is_heap_handle: true,
             is_image_inline: false,
+            provenance: RegionProvenance::default(),
         }
     }
 
@@ -1071,5 +1117,121 @@ mod tests {
         let gb = global(ROUTEK_CHILD_BASE, repaint(&repaint(&raw)), false);
         let err = build_patched_backing_slab(&raw_capture, &[ga, gb], &[], &["t"]).unwrap_err();
         assert!(matches!(err, OverlayError::OverlayConflict { .. }));
+    }
+
+    fn synthetic(live_ptr: u64, bytes: Vec<u8>, tid: &str) -> HeapGlobalSnapshot {
+        let mut g = global(live_ptr, bytes, false);
+        g.provenance = RegionProvenance::SyntheticDerived {
+            transform_id: tid.to_string(),
+            source_anchor: "gscript+0xbd8 (test)".to_string(),
+            construction_digest: sha256_hex(&g.content),
+        };
+        g
+    }
+
+    // GTO Core Recovery R0-D: the live Route L R1 geometry had a synthetic
+    // window-string child at 0x200000 OUTSIDE the captured slab
+    // [0x9e0000, 0x3977090). R0-D must not fail-closed on a SyntheticDerived
+    // child (no raw source by design) — it is recorded as a synthetic ledger
+    // entry and materialized as an independent runtime region.
+    #[test]
+    fn r0d_synthetic_child_outside_slab_not_rejected() {
+        let slab_base: u64 = 0x9e0000;
+        let slab_sz = 0x2a97090usize;
+        let synthetic_base: u64 = 0x200000;
+        // Raw slab contains a normal captured child inside it.
+        let real_child_bytes = b"real-captured-child".to_vec();
+        let s = slab_with_child(
+            slab_base,
+            slab_sz,
+            slab_base + 0x3000,
+            real_child_bytes.clone(),
+        );
+        let raw_slab_content = s.content.clone();
+        let raw_capture = RawSlabCapture {
+            slab: s,
+            children: vec![RawChild {
+                old_base: slab_base + 0x3000,
+                size: real_child_bytes.len(),
+                raw_bytes: real_child_bytes.clone(),
+                kind: RawChildKind::HeapGlobal,
+            }],
+        };
+        // Transformed: one in-slab raw child (unchanged) + one synthetic child
+        // at 0x200000 (outside the slab, SyntheticDerived provenance).
+        let real = global(slab_base + 0x3000, real_child_bytes.clone(), false);
+        let synth = synthetic(
+            synthetic_base,
+            b"NewClassName".to_vec(),
+            "repair_gscript_window_strings",
+        );
+        let (patched, overlays) = build_patched_backing_slab(
+            &raw_capture,
+            &[real, synth],
+            &[],
+            &["repair_gscript_window_strings"],
+        )
+        .unwrap();
+        // Synthetic child did NOT get written into the slab (it has no slab
+        // offset) and is recorded with overlay_applied=false.
+        let synth_overlays: Vec<_> = overlays
+            .iter()
+            .filter(|o| o.child_old_base == synthetic_base)
+            .collect();
+        assert_eq!(synth_overlays.len(), 1);
+        assert!(!synth_overlays[0].overlay_applied);
+        assert_eq!(synth_overlays[0].slab_offset, 0);
+        assert_eq!(
+            synth_overlays[0].transform_ids,
+            vec!["repair_gscript_window_strings".to_string()]
+        );
+        // The in-slab child overlay still applied.
+        let real_overlays: Vec<_> = overlays
+            .iter()
+            .filter(|o| o.child_old_base == slab_base + 0x3000)
+            .collect();
+        assert_eq!(real_overlays.len(), 1);
+        assert!(real_overlays[0].overlay_applied);
+        // The patched slab is unchanged at the (non-existent) synthetic offset.
+        assert_eq!(patched.content, raw_slab_content);
+    }
+
+    // R0-D: an UnknownSynthetic child must fail closed (never a fallback
+    // candidate, never silently dropped).
+    #[test]
+    fn r0d_unknown_synthetic_fails_closed() {
+        let slab_base: u64 = 0x9e0000;
+        let slab_sz = 0x2000usize;
+        let s = slab(slab_base, vec![0u8; slab_sz]);
+        let raw_capture = RawSlabCapture {
+            slab: s,
+            children: vec![],
+        };
+        let mut g = global(slab_base + 0x1000, vec![0x41u8; 16], false);
+        g.provenance = RegionProvenance::UnknownSynthetic;
+        let err = build_patched_backing_slab(&raw_capture, &[g], &[], &["t"]).unwrap_err();
+        assert!(matches!(err, OverlayError::RawChildMissing { .. }));
+    }
+
+    // R0-D: a SyntheticDerived child must NOT be silently treated as a raw
+    // child (it must carry SyntheticDerived provenance, not RawCaptured).
+    #[test]
+    fn r0d_synthetic_provenance_is_derived_not_raw() {
+        let synth = synthetic(
+            0x200000,
+            b"NewClassName".to_vec(),
+            "repair_gscript_window_strings",
+        );
+        match &synth.provenance {
+            RegionProvenance::SyntheticDerived {
+                transform_id,
+                construction_digest,
+                ..
+            } => {
+                assert_eq!(transform_id, "repair_gscript_window_strings");
+                assert_eq!(*construction_digest, sha256_hex(&synth.content));
+            }
+            other => panic!("expected SyntheticDerived, got {other:?}"),
+        }
     }
 }

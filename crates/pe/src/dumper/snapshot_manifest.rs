@@ -382,6 +382,7 @@ pub(crate) fn render_manifest_json(
 
 #[cfg(test)]
 mod tests {
+    use super::super::heap_global_snapshot::RegionProvenance;
     use super::*;
 
     #[test]
@@ -433,6 +434,7 @@ mod tests {
                 content: vec![0u8; 0x4000],
                 is_heap_handle: false,
                 is_image_inline: false,
+                provenance: RegionProvenance::default(),
             },
             HeapGlobalSnapshot {
                 rva: 0,
@@ -440,6 +442,7 @@ mod tests {
                 content: vec![0u8; 64],
                 is_heap_handle: false,
                 is_image_inline: false,
+                provenance: RegionProvenance::default(),
             },
         ];
         let policy = DumpCapturePolicy::ahk_gto_default();
