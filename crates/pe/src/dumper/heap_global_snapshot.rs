@@ -2190,42 +2190,41 @@ pub fn sanitize_ahk_runtime_global(heap_globals: &mut [HeapGlobalSnapshot]) {
 /// (r20b). Force +0x23=1 so the non-nested success path is taken. Does not
 /// invent nested line objects; only flips the redirect flag.
 
-/// Force gscript window class/title strings for RegisterClass / CreateWindow.
+/// Produce synthetic region requests for gscript window class/title strings.
 ///
 /// R-GTO-UI r22b: after skip-LoadFile, WinMain reaches `0x34db0` but
 /// `gscript+0xbd8` held a dump **path** string (not `NewClassName`) →
 /// RegisterClass path returned 0 and WinMain exited without a product window.
-/// Plant exact wide-string snapshots and repoint +0xbd8 (+0xbd0 title).
-pub fn repair_gscript_window_strings(heap_globals: &mut Vec<HeapGlobalSnapshot>) {
+///
+/// GTO R0-F.2: this transform does NOT pick a hardcoded logical address or push
+/// a fixed-VA snapshot. It returns two [`SyntheticRegionRequest`]s (window
+/// class / title) whose anchor slots (`gscript+0xbd8` / `gscript+0xbd0`) will be
+/// rewritten to the allocator-assigned collision-free base after assignment.
+/// Returns an empty vec when no eligible image-inline gscript exists, or when
+/// the synthetic regions are already present.
+pub fn make_gscript_window_string_requests(
+    heap_globals: &[HeapGlobalSnapshot],
+) -> Vec<SyntheticRegionRequest> {
     const CLASS_NAME: &str = "NewClassName";
     const TITLE_NAME: &str = "ZhuChuangKou";
     const OFF_TITLE: usize = 0xbd0;
     const OFF_CLASS: usize = 0xbd8;
+    const TRANSFORM_ID: &str = "repair_gscript_window_strings";
 
-    let Some(gscript_idx) = heap_globals
+    let Some(gscript) = heap_globals
         .iter()
-        .position(|g| g.is_image_inline && g.content.len() > OFF_CLASS + 8)
+        .find(|g| g.is_image_inline && g.content.len() > OFF_CLASS + 8)
     else {
-        return;
+        return Vec::new();
     };
+    // Anchor region old base = the image-inline gscript object's live base.
+    let anchor_region_base = gscript.live_ptr;
 
-    // Low user-space synthetic lives (must be plantable HeapAlloc targets and
-    // within multi_fixup / is_heap_pointer acceptance). High VAs like
-    // 0x50c1a550001 failed at runtime (r22b: +0xbd8 fell back to 0x106644).
-    //
-    // R0-D: these are SyntheticDerived regions — synthesized by this transform
-    // for product recovery, with NO raw source in the captured heap slab. They
-    // are excluded from raw-coherence overlay (no raw child exists by design)
-    // and must never be reported as raw-captured. Their old_base is a logical
-    // placement target, not an observed live allocation.
-    const CLASS_LIVE: u64 = 0x0020_0000;
-    const TITLE_LIVE: u64 = 0x0020_1000;
-
-    let mut added = 0usize;
-    for (live, text) in [(CLASS_LIVE, CLASS_NAME), (TITLE_LIVE, TITLE_NAME)] {
-        if heap_globals.iter().any(|g| g.live_ptr == live) {
-            continue;
-        }
+    let mut requests = Vec::new();
+    for (synthetic_id, text, off) in [
+        ("gto.window_class", CLASS_NAME, OFF_CLASS),
+        ("gto.window_title", TITLE_NAME, OFF_TITLE),
+    ] {
         let mut body = Vec::with_capacity(text.len() * 2 + 2);
         for ch in text.encode_utf16() {
             body.extend_from_slice(&ch.to_le_bytes());
@@ -2238,50 +2237,479 @@ pub fn repair_gscript_window_strings(heap_globals: &mut Vec<HeapGlobalSnapshot>)
             h.update(body.as_slice());
             format!("{:x}", h.finalize())
         };
-        let anchor = if live == CLASS_LIVE {
+        let anchor = if off == OFF_CLASS {
             "gscript+0xbd8 (RegisterClass lpszClassName)"
         } else {
             "gscript+0xbd0 (CreateWindow title)"
         };
-        heap_globals.push(HeapGlobalSnapshot {
-            rva: 0,
-            live_ptr: live,
-            content: body,
-            is_heap_handle: false,
-            is_image_inline: false,
-            extent_kind: CaptureExtentKind::default(),
-            extent_evidence: CaptureExtentEvidence::default(),
-            transform_ids: Vec::new(),
-            provenance: RegionProvenance::SyntheticDerived {
-                transform_id: "repair_gscript_window_strings".to_string(),
-                source_anchor: anchor.to_string(),
-                construction_digest,
-            },
+        requests.push(SyntheticRegionRequest {
+            synthetic_id: synthetic_id.to_string(),
+            transform_id: TRANSFORM_ID.to_string(),
+            source_anchor: anchor.to_string(),
+            payload: body,
+            construction_digest,
+            alignment: 0x10,
+            pointer_slots: vec![SyntheticPointerAnchor {
+                region_old_base: anchor_region_base,
+                slot_offset: off,
+            }],
         });
-        added += 1;
+    }
+    requests
+}
+
+/// A request to synthesize a runtime region with no raw source (GTO R0-F.2).
+///
+/// Offline transforms that need a fresh heap allocation (e.g. window class /
+/// title strings for RegisterClass / CreateWindow) must NOT pick a hardcoded
+/// logical address. Instead they emit a [`SyntheticRegionRequest`]; a
+/// deterministic, checked free-range allocator later assigns a collision-free
+/// logical old base from the authoritative ranges, and the anchor pointer slots
+/// are rewritten to point at the assigned base.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyntheticRegionRequest {
+    /// Stable identity for the ledger (e.g. `"gto.window_class"`).
+    pub synthetic_id: String,
+    /// Transform id that created this request.
+    pub transform_id: String,
+    /// Source anchor: the slot/region that references this synthetic region.
+    pub source_anchor: String,
+    /// Constructed payload bytes (deterministic).
+    pub payload: Vec<u8>,
+    /// sha256 (hex) of the constructed payload.
+    pub construction_digest: String,
+    /// Required allocation alignment (must be a power of two).
+    pub alignment: usize,
+    /// Pointer slots (inside already-captured regions) that must be rewritten
+    /// to point at the assigned logical old base.
+    pub pointer_slots: Vec<SyntheticPointerAnchor>,
+}
+
+/// An anchor pointer slot referencing a synthetic region: a slot at
+/// `region_old_base + slot_offset` inside an already-captured region whose
+/// 8-byte value must be rewritten to the assigned logical base.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyntheticPointerAnchor {
+    /// Old base of the region whose payload holds the slot (e.g. gscript's
+    /// image-inline live base).
+    pub region_old_base: u64,
+    /// Byte offset of the 8-byte slot within that region's payload.
+    pub slot_offset: usize,
+}
+
+/// A deterministic, collision-free assignment of a synthetic logical base.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyntheticAssignment {
+    /// Stable identity (matches the request's `synthetic_id`).
+    pub synthetic_id: String,
+    /// The assigned logical old base (from the allocator, not a hardcode).
+    pub assigned_logical_old_base: u64,
+    /// Alignment the base honours.
+    pub assignment_alignment: usize,
+}
+
+/// Errors from deterministic synthetic logical-address assignment (GTO R0-F.2).
+#[derive(Debug)]
+pub enum SyntheticAssignError {
+    /// A request is structurally invalid.
+    InvalidRequest(String),
+    /// No collision-free logical range could be found for a request.
+    NoAvailableRange { synthetic_id: String },
+    /// A request has a zero-length or empty payload.
+    EmptyPayload { synthetic_id: String },
+    /// An anchor slot is out of bounds of its region's payload.
+    AnchorOutOfBounds {
+        region_old_base: u64,
+        slot_offset: usize,
+        region_size: usize,
+    },
+    /// An anchor slot is not 8-byte aligned (pointer slots are x64 qwords).
+    AnchorNotAligned {
+        region_old_base: u64,
+        slot_offset: usize,
+    },
+    /// The construction digest recorded on the request does not match the
+    /// actual payload digest.
+    ConstructionDigestMismatch {
+        synthetic_id: String,
+        expected: String,
+        actual: String,
+    },
+    /// The assigned range would collide with an authority range.
+    AuthorityCollision {
+        synthetic_id: String,
+        assigned_base: u64,
+        assigned_size: usize,
+    },
+}
+
+impl std::fmt::Display for SyntheticAssignError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SyntheticAssignError::InvalidRequest(m) => write!(f, "synthetic request invalid: {m}"),
+            SyntheticAssignError::NoAvailableRange { synthetic_id } => {
+                write!(f, "no collision-free range for synthetic '{synthetic_id}'")
+            }
+            SyntheticAssignError::EmptyPayload { synthetic_id } => {
+                write!(f, "synthetic '{synthetic_id}' has empty payload")
+            }
+            SyntheticAssignError::AnchorOutOfBounds {
+                region_old_base,
+                slot_offset,
+                region_size,
+            } => write!(
+                f,
+                "synthetic anchor slot {region_old_base:#x}@{slot_offset:#x} out of bounds \
+                 (region size {region_size:#x})"
+            ),
+            SyntheticAssignError::AnchorNotAligned {
+                region_old_base,
+                slot_offset,
+            } => write!(
+                f,
+                "synthetic anchor slot {region_old_base:#x}@{slot_offset:#x} is not 8-byte aligned"
+            ),
+            SyntheticAssignError::ConstructionDigestMismatch {
+                synthetic_id,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "synthetic '{synthetic_id}' construction digest mismatch (expected {expected}, got {actual})"
+            ),
+            SyntheticAssignError::AuthorityCollision {
+                synthetic_id,
+                assigned_base,
+                assigned_size,
+            } => write!(
+                f,
+                "synthetic '{synthetic_id}' assigned [{assigned_base:#x},+{assigned_size:#x}) \
+                 collides with an authority range"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SyntheticAssignError {}
+
+/// Floor for deterministic synthetic logical placement: above the small-tag
+/// range so an assigned base is never misread as a tag (runtime planner treats
+/// `val < SMALL_TAG_CEILING` as a small integer, never a pointer).
+const SYNTHETIC_FLOOR: u64 = 0x1_0000;
+
+/// sha256 hex of a byte slice (used for construction digests and digest checks).
+fn sha256_hex(data: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(data);
+    format!("{:x}", h.finalize())
+}
+
+/// Public sha256 hex helper (exposed for tests building synthetic requests).
+pub fn sha256_hex_pub(data: &[u8]) -> String {
+    sha256_hex(data)
+}
+
+/// Deterministically assign collision-free synthetic logical addresses to a
+/// set of synthetic region requests, avoiding every authority range.
+///
+/// # Authority ranges to avoid (all must be provided by the caller)
+///
+/// `avoid_ranges` is a set of half-open `[start, end)` ranges that the assigned
+/// logical bases must not intersect. It must include at least: the raw heap
+/// slab span, all observed heap-global ranges, all container ranges, all
+/// image-inline ranges, the source image span, external module map ranges, and
+/// the NULL / small-tag range. The caller collects these from the live capture
+/// + module map.
+///
+/// # Determinism
+///
+/// Requests are assigned in a stable sort order by
+/// `(transform_id, source_anchor, construction_digest, synthetic_id)`, and the
+/// allocator scans addresses upward from a fixed floor. Identical input yields
+/// identical assignments regardless of request order.
+///
+/// # Fail-closed
+///
+/// Any invalid request, empty payload, bad alignment, out-of-bounds /
+/// mis-aligned anchor slot, construction-digest mismatch, authority collision,
+/// range-end overflow, or exhausted logical space returns an error. There is no
+/// fallback to a hardcoded address.
+pub fn assign_synthetic_logical_addresses(
+    requests: &[SyntheticRegionRequest],
+    avoid_ranges: &[(u64, u64)],
+) -> Result<Vec<SyntheticAssignment>, SyntheticAssignError> {
+    // Merge + sort authority ranges into a disjoint, sorted list.
+    let mut ranges: Vec<(u64, u64)> = avoid_ranges
+        .iter()
+        .map(|&(s, e)| {
+            // Normalize to [start, end) with checked arithmetic; skip empty.
+            if e <= s {
+                (s, s)
+            } else {
+                (s, e)
+            }
+        })
+        .filter(|&(s, e)| e > s)
+        .collect();
+    ranges.sort_by_key(|&(s, _)| s);
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for &(s, e) in &ranges {
+        match merged.last_mut() {
+            Some(last) if s <= last.1 => {
+                if e > last.1 {
+                    last.1 = e;
+                }
+            }
+            _ => merged.push((s, e)),
+        }
     }
 
-    let g = &mut heap_globals[gscript_idx];
-    let old_class = u64::from_le_bytes(
-        g.content[OFF_CLASS..OFF_CLASS + 8]
-            .try_into()
-            .unwrap_or([0; 8]),
-    );
-    let old_title = u64::from_le_bytes(
-        g.content[OFF_TITLE..OFF_TITLE + 8]
-            .try_into()
-            .unwrap_or([0; 8]),
-    );
-    g.content[OFF_CLASS..OFF_CLASS + 8].copy_from_slice(&CLASS_LIVE.to_le_bytes());
-    g.content[OFF_TITLE..OFF_TITLE + 8].copy_from_slice(&TITLE_LIVE.to_le_bytes());
-    info!(
-        added,
-        old_class = format_args!("{old_class:#x}"),
-        old_title = format_args!("{old_title:#x}"),
-        class_live = format_args!("{CLASS_LIVE:#x}"),
-        title_live = format_args!("{TITLE_LIVE:#x}"),
-        "Repaired gscript window class/title strings (NewClassName / ZhuChuangKou)"
-    );
+    // Deterministic request order.
+    let mut ordered: Vec<&SyntheticRegionRequest> = requests.iter().collect();
+    ordered.sort_by_key(|r| {
+        (
+            r.transform_id.clone(),
+            r.source_anchor.clone(),
+            r.construction_digest.clone(),
+            r.synthetic_id.clone(),
+        )
+    });
+
+    let mut assignments: Vec<SyntheticAssignment> = Vec::new();
+    // Already-assigned synthetic ranges (start, end) so two synthetics never overlap.
+    let mut synthetic_ranges: Vec<(u64, u64)> = Vec::new();
+
+    for req in &ordered {
+        let alignment = req.alignment;
+        if alignment == 0 || !alignment.is_power_of_two() {
+            return Err(SyntheticAssignError::InvalidRequest(format!(
+                "alignment {alignment:#x} is not a power of two"
+            )));
+        }
+        if req.payload.is_empty() {
+            return Err(SyntheticAssignError::EmptyPayload {
+                synthetic_id: req.synthetic_id.clone(),
+            });
+        }
+        // Construction digest must match the actual payload.
+        if sha256_hex(&req.payload) != req.construction_digest {
+            return Err(SyntheticAssignError::ConstructionDigestMismatch {
+                synthetic_id: req.synthetic_id.clone(),
+                expected: req.construction_digest.clone(),
+                actual: sha256_hex(&req.payload),
+            });
+        }
+        let padded_size = req
+            .payload
+            .len()
+            .checked_add(alignment - 1)
+            .map(|v| v & !(alignment - 1))
+            .ok_or_else(|| {
+                SyntheticAssignError::InvalidRequest(format!(
+                    "payload size overflow for '{}'",
+                    req.synthetic_id
+                ))
+            })?;
+        if padded_size == 0 {
+            return Err(SyntheticAssignError::EmptyPayload {
+                synthetic_id: req.synthetic_id.clone(),
+            });
+        }
+
+        // Find the first aligned base >= floor whose [base, base+padded_size)
+        // intersects no authority range and no previously-assigned synthetic.
+        // The scan JUMPS past each collision (to the aligned end of the
+        // colliding range) so it terminates in O(number of ranges), never by
+        // stepping through the whole address space.
+        let floor = SYNTHETIC_FLOOR;
+        let mut candidate = align_up_u64(floor.max(alignment as u64), alignment as u64);
+        let base = loop {
+            let Some(end) = candidate.checked_add(padded_size as u64) else {
+                return Err(SyntheticAssignError::NoAvailableRange {
+                    synthetic_id: req.synthetic_id.clone(),
+                });
+            };
+            let collide_end = merged
+                .iter()
+                .find(|&&(as_, ae)| candidate < ae && as_ < end)
+                .map(|&(_, ae)| ae)
+                .or_else(|| {
+                    synthetic_ranges
+                        .iter()
+                        .find(|&&(ss, se)| candidate < se && ss < end)
+                        .map(|&(_, se)| se)
+                });
+            match collide_end {
+                Some(ce) => {
+                    // Jump to just past the colliding range, aligned up.
+                    let Some(next) = ce.checked_add(alignment as u64 - 1) else {
+                        return Err(SyntheticAssignError::NoAvailableRange {
+                            synthetic_id: req.synthetic_id.clone(),
+                        });
+                    };
+                    candidate = align_up_u64(next, alignment as u64);
+                }
+                None => break candidate,
+            }
+        };
+        synthetic_ranges.push((base, base + padded_size as u64));
+        assignments.push(SyntheticAssignment {
+            synthetic_id: req.synthetic_id.clone(),
+            assigned_logical_old_base: base,
+            assignment_alignment: alignment,
+        });
+    }
+
+    // Final defense-in-depth: re-verify every assigned range is collision-free
+    // against the authority ranges and pairwise-disjoint against every other
+    // assigned range. The forward scan already guarantees this; the explicit
+    // check makes a future refactor fail closed rather than silently overlap.
+    for (i, a) in assignments.iter().enumerate() {
+        let size = requests
+            .iter()
+            .find(|r| r.synthetic_id == a.synthetic_id)
+            .map(|r| r.payload.len())
+            .unwrap_or(0);
+        let padded = (size + (a.assignment_alignment - 1)) & !(a.assignment_alignment - 1);
+        let end = a
+            .assigned_logical_old_base
+            .checked_add(padded as u64)
+            .ok_or_else(|| SyntheticAssignError::NoAvailableRange {
+                synthetic_id: a.synthetic_id.clone(),
+            })?;
+        for &(as_, ae) in &merged {
+            if a.assigned_logical_old_base < ae && as_ < end {
+                return Err(SyntheticAssignError::AuthorityCollision {
+                    synthetic_id: a.synthetic_id.clone(),
+                    assigned_base: a.assigned_logical_old_base,
+                    assigned_size: padded,
+                });
+            }
+        }
+        for (j, b) in assignments.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            let b_size = requests
+                .iter()
+                .find(|r| r.synthetic_id == b.synthetic_id)
+                .map(|r| r.payload.len())
+                .unwrap_or(0);
+            let b_padded = (b_size + (b.assignment_alignment - 1)) & !(b.assignment_alignment - 1);
+            let b_end = b
+                .assigned_logical_old_base
+                .checked_add(b_padded as u64)
+                .unwrap_or(u64::MAX);
+            if a.assigned_logical_old_base < b_end && b.assigned_logical_old_base < end {
+                return Err(SyntheticAssignError::AuthorityCollision {
+                    synthetic_id: a.synthetic_id.clone(),
+                    assigned_base: a.assigned_logical_old_base,
+                    assigned_size: padded,
+                });
+            }
+        }
+    }
+
+    // Return in deterministic sort order (already stable by the request sort).
+    Ok(assignments)
+}
+
+fn align_up_u64(v: u64, alignment: u64) -> u64 {
+    (v + (alignment - 1)) & !(alignment - 1)
+}
+
+/// Validate anchor pointer slots and rewrite each one inside the given region
+/// payload to point at `assigned_base`. Returns the number of slots rewritten.
+///
+/// `regions` is `&mut [(old_base, &mut Vec<u8>)]` so the anchor's owning region
+/// payload can be patched in place. Fails closed on out-of-bounds or
+/// non-8-aligned slots (GTO R0-F.2).
+pub fn rewrite_synthetic_anchor_slots(
+    regions: &mut [(u64, &mut Vec<u8>)],
+    anchors: &[SyntheticPointerAnchor],
+    assigned_base: u64,
+) -> Result<usize, SyntheticAssignError> {
+    let mut rewritten = 0usize;
+    for anchor in anchors {
+        if anchor.slot_offset % 8 != 0 {
+            return Err(SyntheticAssignError::AnchorNotAligned {
+                region_old_base: anchor.region_old_base,
+                slot_offset: anchor.slot_offset,
+            });
+        }
+        let Some((_, payload)) = regions
+            .iter_mut()
+            .find(|(ob, _)| *ob == anchor.region_old_base)
+        else {
+            // Anchor region not present in the provided set: caller responsibility
+            // to pass every region that hosts an anchor.
+            return Err(SyntheticAssignError::InvalidRequest(format!(
+                "anchor region {:#x} not found for slot @{:#x}",
+                anchor.region_old_base, anchor.slot_offset
+            )));
+        };
+        let end = anchor.slot_offset.checked_add(8).ok_or_else(|| {
+            SyntheticAssignError::AnchorOutOfBounds {
+                region_old_base: anchor.region_old_base,
+                slot_offset: anchor.slot_offset,
+                region_size: payload.len(),
+            }
+        })?;
+        if end > payload.len() {
+            return Err(SyntheticAssignError::AnchorOutOfBounds {
+                region_old_base: anchor.region_old_base,
+                slot_offset: anchor.slot_offset,
+                region_size: payload.len(),
+            });
+        }
+        payload[anchor.slot_offset..end].copy_from_slice(&assigned_base.to_le_bytes());
+        rewritten += 1;
+    }
+    Ok(rewritten)
+}
+
+/// Materialize assigned synthetic regions into `HeapGlobalSnapshot`s carrying
+/// full SyntheticDerived provenance + SyntheticDerived extent classification,
+/// so the production planner routes them as independent synthetic allocations
+/// (never absorbed into the raw slab). GTO R0-F.2.
+///
+/// `assigned` must be in the same deterministic order as `requests` (matching
+/// by `synthetic_id`). Returns the materialized snapshots.
+pub fn materialize_synthetic_regions(
+    requests: &[SyntheticRegionRequest],
+    assigned: &[SyntheticAssignment],
+) -> Vec<HeapGlobalSnapshot> {
+    let mut out = Vec::with_capacity(assigned.len());
+    for a in assigned {
+        let Some(req) = requests.iter().find(|r| r.synthetic_id == a.synthetic_id) else {
+            continue;
+        };
+        out.push(HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: a.assigned_logical_old_base,
+            content: req.payload.clone(),
+            is_heap_handle: false,
+            is_image_inline: false,
+            extent_kind: CaptureExtentKind::SyntheticDerived,
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: a.synthetic_id.clone(),
+                capture_path: CapturePath::Synthetic,
+                source_root_rva: None,
+                source_slot_offset: None,
+                probe_requested_size: req.payload.len(),
+                was_interior: false,
+                containing_parent_old_base: None,
+                containing_parent_size: None,
+            },
+            transform_ids: vec![req.transform_id.clone()],
+            provenance: RegionProvenance::SyntheticDerived {
+                transform_id: req.transform_id.clone(),
+                source_anchor: req.source_anchor.clone(),
+                construction_digest: req.construction_digest.clone(),
+            },
+        });
+    }
+    out
 }
 
 pub fn mark_labels_non_nested(heap_globals: &mut [HeapGlobalSnapshot]) {
@@ -5472,47 +5900,36 @@ mod tests {
         };
         gscript.content[0xbd0..0xbd8].copy_from_slice(&0xa190a8u64.to_le_bytes());
         gscript.content[0xbd8..0xbd0 + 8 + 8].copy_from_slice(&0xa18ec0u64.to_le_bytes());
-        let mut globals = vec![gscript];
-        repair_gscript_window_strings(&mut globals);
-        // Two synthetic children added (0x200000 class, 0x201000 title).
-        let synth: Vec<_> = globals
-            .iter()
-            .filter(|g| g.live_ptr == 0x200000 || g.live_ptr == 0x201000)
-            .collect();
-        assert_eq!(synth.len(), 2);
-        for g in &synth {
-            assert!(!g.is_image_inline);
-            assert!(!g.is_heap_handle);
-            match &g.provenance {
-                RegionProvenance::SyntheticDerived {
-                    transform_id,
-                    construction_digest,
-                    ..
-                } => {
-                    assert_eq!(transform_id, "repair_gscript_window_strings");
-                    // construction digest == sha256 of the content bytes.
-                    assert_eq!(
-                        *construction_digest,
-                        format!("{:x}", {
-                            let mut h = Sha256::new();
-                            h.update(&g.content);
-                            h.finalize()
-                        })
-                    );
-                }
-                other => panic!("expected SyntheticDerived, got {other:?}"),
-            }
+        let globals = vec![gscript.clone()];
+        // GTO R0-F.2: window repair now produces two SyntheticRegionRequests
+        // (no fixed-VA snapshot, no legacy placeholder). The requests carry the
+        // SyntheticDerived transform id and anchor slots at +0xbd0/+0xbd8.
+        let requests = make_gscript_window_string_requests(&globals);
+        assert_eq!(requests.len(), 2);
+        for req in &requests {
+            assert_eq!(req.transform_id, "repair_gscript_window_strings");
+            assert_eq!(req.alignment, 0x10);
+            assert!(!req.payload.is_empty());
+            // Construction digest == sha256 of the payload.
+            assert_eq!(
+                req.construction_digest,
+                format!("{:x}", {
+                    let mut h = Sha256::new();
+                    h.update(&req.payload);
+                    h.finalize()
+                })
+            );
+            // Each request anchors into the image-inline gscript at +0xbd0/+0xbd8.
+            assert_eq!(req.pointer_slots.len(), 1);
+            let anchor = &req.pointer_slots[0];
+            assert_eq!(anchor.region_old_base, gscript.live_ptr);
+            assert!(anchor.slot_offset == 0xbd0 || anchor.slot_offset == 0xbd8);
         }
-        // Class slot +0xbd8 == 0x200000, title slot +0xbd0 == 0x201000.
-        let gscript = &globals[0];
-        assert_eq!(
-            u64::from_le_bytes(gscript.content[0xbd8..0xbd8 + 8].try_into().unwrap()),
-            0x200000
-        );
-        assert_eq!(
-            u64::from_le_bytes(gscript.content[0xbd0..0xbd0 + 8].try_into().unwrap()),
-            0x201000
-        );
+        // No legacy fixed-VA synthetic snapshot was pushed into globals.
+        assert!(globals
+            .iter()
+            .all(|g| g.live_ptr != 0x200000 && g.live_ptr != 0x201000));
+        assert!(globals.len() == 1);
     }
 
     // GTO Core Recovery R0-E: identical-bytes duplicate at the same live_ptr is
@@ -5700,5 +6117,377 @@ mod tests {
         ];
         reconcile_duplicate_heap_globals(&mut b, None);
         assert_eq!(b.len(), 2); // both retained; overlay will fail-closed
+    }
+
+    // =====================================================================
+    // GTO Core Recovery R0-F.2 tests
+    // =====================================================================
+
+    fn r0f2_req(synthetic_id: &str, payload: &[u8], slot_off: usize) -> SyntheticRegionRequest {
+        SyntheticRegionRequest {
+            synthetic_id: synthetic_id.to_string(),
+            transform_id: "repair_gscript_window_strings".to_string(),
+            source_anchor: format!("anchor:{synthetic_id}"),
+            payload: payload.to_vec(),
+            construction_digest: sha256_hex(payload),
+            alignment: 0x10,
+            pointer_slots: vec![SyntheticPointerAnchor {
+                region_old_base: 0x1400_0000_0 + 0x149d50,
+                slot_offset: slot_off,
+            }],
+        }
+    }
+
+    /// Route N slab [0x14f000, 0x36f3d30) contains both legacy synthetic
+    /// logical addresses 0x200000 and 0x201000 — proving the fixed-address
+    /// scheme is unsafe in Route N geometry.
+    #[test]
+    fn r0f2_route_n_slab_contains_legacy_synthetic_addresses() {
+        const SLAB_BASE: u64 = 0x14f000;
+        const SLAB_END: u64 = 0x36f3d30;
+        assert!(SLAB_BASE < 0x200000 && 0x201000 < SLAB_END);
+        assert!(SLAB_BASE < 0x201000);
+        assert!(0x200000 > SLAB_BASE);
+        assert!(0x201000 < SLAB_END);
+    }
+
+    /// Window repair produces two requests (class/title), not fixed-VA snapshots.
+    #[test]
+    fn r0f2_window_repair_creates_requests_not_fixed_live_regions() {
+        let mut gscript = HeapGlobalSnapshot {
+            rva: 0x149d50,
+            live_ptr: 0x1400_0000_0 + 0x149d50,
+            content: vec![0u8; 0xbd8 + 16],
+            is_heap_handle: false,
+            is_image_inline: true,
+            extent_kind: CaptureExtentKind::default(),
+            extent_evidence: CaptureExtentEvidence::default(),
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::ImageInline,
+        };
+        let globals = vec![gscript.clone()];
+        let requests = make_gscript_window_string_requests(&globals);
+        assert_eq!(requests.len(), 2);
+        let ids: Vec<&str> = requests.iter().map(|r| r.synthetic_id.as_str()).collect();
+        assert!(ids.contains(&"gto.window_class"));
+        assert!(ids.contains(&"gto.window_title"));
+        // No fixed-VA snapshot was created.
+        assert!(globals
+            .iter()
+            .all(|g| g.live_ptr != 0x200000 && g.live_ptr != 0x201000));
+        let _ = &mut gscript;
+    }
+
+    /// Assigned synthetic bases must avoid the raw heap slab span.
+    #[test]
+    fn r0f2_synthetic_assignment_avoids_raw_slab() {
+        let req = r0f2_req("gto.window_class", b"NewClassName\0", 0xbd8);
+        let avoid = vec![(0x14f000u64, 0x36f3d30u64)];
+        let assigned = assign_synthetic_logical_addresses(&[req], &avoid).unwrap();
+        let base = assigned[0].assigned_logical_old_base;
+        assert!(!(base >= 0x14f000 && base < 0x36f3d30));
+    }
+
+    /// Assigned synthetic bases must avoid the source image and module ranges.
+    #[test]
+    fn r0f2_synthetic_assignment_avoids_image_and_modules() {
+        let req = r0f2_req("gto.window_title", b"ZhuChuangKou\0", 0xbd0);
+        let avoid = vec![
+            (0x140_0000_0u64, 0x141_0000_0u64),         // image span
+            (0x7ff0_0000_0000u64, 0x7ff0_0001_0000u64), // module
+        ];
+        let assigned = assign_synthetic_logical_addresses(&[req], &avoid).unwrap();
+        let base = assigned[0].assigned_logical_old_base;
+        assert!(!(base >= 0x140_0000_0 && base < 0x141_0000_0));
+        assert!(!(base >= 0x7ff0_0000_0000 && base < 0x7ff0_0001_0000));
+    }
+
+    /// Same input => same assignment.
+    #[test]
+    fn r0f2_synthetic_assignment_is_deterministic() {
+        let avoid = vec![(0x14f000u64, 0x36f3d30u64)];
+        let a = assign_synthetic_logical_addresses(
+            &[r0f2_req("gto.window_class", b"NewClassName\0", 0xbd8)],
+            &avoid,
+        )
+        .unwrap();
+        let b = assign_synthetic_logical_addresses(
+            &[r0f2_req("gto.window_class", b"NewClassName\0", 0xbd8)],
+            &avoid,
+        )
+        .unwrap();
+        assert_eq!(
+            a[0].assigned_logical_old_base,
+            b[0].assigned_logical_old_base
+        );
+    }
+
+    /// Reordering requests gives the same assignments (deterministic sort).
+    #[test]
+    fn r0f2_synthetic_assignment_order_independent() {
+        let avoid = vec![(0x14f000u64, 0x36f3d30u64)];
+        let r_class = r0f2_req("gto.window_class", b"NewClassName\0", 0xbd8);
+        let r_title = r0f2_req("gto.window_title", b"ZhuChuangKou\0", 0xbd0);
+        let ab = assign_synthetic_logical_addresses(&[r_class.clone(), r_title.clone()], &avoid)
+            .unwrap();
+        let ba = assign_synthetic_logical_addresses(&[r_title, r_class], &avoid).unwrap();
+        assert_eq!(
+            ab.iter()
+                .find(|a| a.synthetic_id == "gto.window_class")
+                .unwrap()
+                .assigned_logical_old_base,
+            ba.iter()
+                .find(|a| a.synthetic_id == "gto.window_class")
+                .unwrap()
+                .assigned_logical_old_base
+        );
+        assert_eq!(
+            ab.iter()
+                .find(|a| a.synthetic_id == "gto.window_title")
+                .unwrap()
+                .assigned_logical_old_base,
+            ba.iter()
+                .find(|a| a.synthetic_id == "gto.window_title")
+                .unwrap()
+                .assigned_logical_old_base
+        );
+    }
+
+    /// Two synthetic requests must be disjoint.
+    #[test]
+    fn r0f2_two_synthetic_requests_are_disjoint() {
+        let avoid = vec![(0x14f000u64, 0x36f3d30u64)];
+        let assigned = assign_synthetic_logical_addresses(
+            &[
+                r0f2_req("gto.window_class", b"NewClassName\0", 0xbd8),
+                r0f2_req("gto.window_title", b"ZhuChuangKou\0", 0xbd0),
+            ],
+            &avoid,
+        )
+        .unwrap();
+        assert_eq!(assigned.len(), 2);
+        let (b0, b1) = (
+            assigned[0].assigned_logical_old_base,
+            assigned[1].assigned_logical_old_base,
+        );
+        assert_ne!(b0, b1);
+        // Both 16-aligned and non-overlapping (differ by >= 16).
+        assert!(b0 % 16 == 0 && b1 % 16 == 0);
+        assert!(b0.checked_add(16).unwrap() <= b1 || b1.checked_add(16).unwrap() <= b0);
+    }
+
+    /// Range-end overflow / exhausted space fails closed.
+    #[test]
+    fn r0f2_assignment_overflow_fails_closed() {
+        // Cover every address from the floor upward with an authority range so
+        // no collision-free logical base exists. The allocator either overflows
+        // (checked) or reports NoAvailableRange — either way it fails closed.
+        let req = r0f2_req("gto.window_class", b"NewClassName\0", 0xbd8);
+        let avoid = vec![(0x1_0000u64, u64::MAX)];
+        let res = assign_synthetic_logical_addresses(&[req], &avoid);
+        assert!(res.is_err());
+    }
+
+    /// Anchor slot out of bounds fails closed.
+    #[test]
+    fn r0f2_anchor_slot_out_of_bounds_fails_closed() {
+        let req = r0f2_req("gto.window_class", b"NewClassName\0", 0xbd8);
+        let mut payload = vec![0u8; 0x100];
+        let mut regions: Vec<(u64, &mut Vec<u8>)> = vec![(0x1400_0000_0 + 0x149d50, &mut payload)];
+        let res = rewrite_synthetic_anchor_slots(&mut regions, &req.pointer_slots, 0x10000);
+        assert!(res.is_err());
+    }
+
+    /// Assignment rewrites both class and title slots to the assigned bases.
+    #[test]
+    fn r0f2_assignment_rewrites_class_and_title_slots() {
+        let avoid = vec![(0x14f000u64, 0x36f3d30u64)];
+        let r_class = r0f2_req("gto.window_class", b"NewClassName\0", 0xbd8);
+        let r_title = r0f2_req("gto.window_title", b"ZhuChuangKou\0", 0xbd0);
+        let assigned =
+            assign_synthetic_logical_addresses(&[r_class.clone(), r_title.clone()], &avoid)
+                .unwrap();
+        let class_base = assigned
+            .iter()
+            .find(|a| a.synthetic_id == "gto.window_class")
+            .unwrap()
+            .assigned_logical_old_base;
+        let title_base = assigned
+            .iter()
+            .find(|a| a.synthetic_id == "gto.window_title")
+            .unwrap()
+            .assigned_logical_old_base;
+        // gscript payload large enough for both slots.
+        let mut gscript_payload = vec![0u8; 0xbd8 + 16];
+        let base = 0x1400_0000_0 + 0x149d50;
+        let mut regions: Vec<(u64, &mut Vec<u8>)> = vec![(base, &mut gscript_payload)];
+        rewrite_synthetic_anchor_slots(&mut regions, &r_class.pointer_slots, class_base).unwrap();
+        rewrite_synthetic_anchor_slots(&mut regions, &r_title.pointer_slots, title_base).unwrap();
+        assert_eq!(
+            u64::from_le_bytes(gscript_payload[0xbd8..0xbd8 + 8].try_into().unwrap()),
+            class_base
+        );
+        assert_eq!(
+            u64::from_le_bytes(gscript_payload[0xbd0..0xbd0 + 8].try_into().unwrap()),
+            title_base
+        );
+    }
+
+    /// Legacy placeholders (0x200000/0x201000) must never appear in any
+    /// assigned base.
+    #[test]
+    fn r0f2_legacy_placeholders_do_not_reach_assignment() {
+        let avoid = vec![(0x14f000u64, 0x36f3d30u64)];
+        let assigned = assign_synthetic_logical_addresses(
+            &[
+                r0f2_req("gto.window_class", b"NewClassName\0", 0xbd8),
+                r0f2_req("gto.window_title", b"ZhuChuangKou\0", 0xbd0),
+            ],
+            &avoid,
+        )
+        .unwrap();
+        for a in &assigned {
+            assert_ne!(a.assigned_logical_old_base, 0x200000);
+            assert_ne!(a.assigned_logical_old_base, 0x201000);
+        }
+    }
+
+    /// Materialized synthetic regions carry SyntheticDerived extent + provenance.
+    #[test]
+    fn r0f2_synthetic_extent_is_explicit_in_production() {
+        let avoid = vec![(0x14f000u64, 0x36f3d30u64)];
+        let req = r0f2_req("gto.window_class", b"NewClassName\0", 0xbd8);
+        let assigned = assign_synthetic_logical_addresses(&[req.clone()], &avoid).unwrap();
+        let materialized = materialize_synthetic_regions(&[req], &assigned);
+        assert_eq!(materialized.len(), 1);
+        let g = &materialized[0];
+        assert_eq!(g.extent_kind, CaptureExtentKind::SyntheticDerived);
+        assert!(matches!(
+            g.provenance,
+            RegionProvenance::SyntheticDerived { .. }
+        ));
+        assert_eq!(g.live_ptr, assigned[0].assigned_logical_old_base);
+        assert!(!g.is_image_inline);
+    }
+
+    /// SyntheticAllocation ownership is production-assigned by the planner.
+    #[test]
+    fn r0f2_synthetic_ownership_is_synthetic_allocation() {
+        use crate::dumper::runtime_rebase::RuntimeRegionOwnership;
+        let avoid = vec![(0x14f000u64, 0x36f3d30u64)];
+        let req = r0f2_req("gto.window_class", b"NewClassName\0", 0xbd8);
+        let assigned = assign_synthetic_logical_addresses(&[req.clone()], &avoid).unwrap();
+        let materialized = materialize_synthetic_regions(&[req], &assigned);
+        // Build a plan from the materialized synthetic snapshot and confirm the
+        // region's ownership is SyntheticAllocation.
+        let slab = HeapSlab {
+            old_base: 0x14f000,
+            content: vec![0u8; 0x1000],
+        };
+        let plan = crate::dumper::runtime_rebase::build_runtime_rebase_plan(
+            &[],
+            &materialized,
+            Some(&slab),
+            &[],
+            &crate::dumper::runtime_rebase::ExternalResolverTable::new(),
+            &[],
+            0x140_0000_0,
+            0x140_0000_0,
+        )
+        .unwrap()
+        .unwrap();
+        let synth = plan
+            .regions
+            .iter()
+            .find(|r| r.old_base == assigned[0].assigned_logical_old_base)
+            .expect("synthetic region present");
+        assert_eq!(synth.ownership, RuntimeRegionOwnership::SyntheticAllocation);
+        assert_eq!(synth.extent_kind, CaptureExtentKind::SyntheticDerived);
+    }
+
+    /// A synthetic region is never absorbed into the slab (independent region).
+    #[test]
+    fn r0f2_synthetic_is_never_absorbed_into_slab() {
+        let avoid = vec![(0x14f000u64, 0x36f3d30u64)];
+        let req = r0f2_req("gto.window_class", b"NewClassName\0", 0xbd8);
+        let assigned = assign_synthetic_logical_addresses(&[req.clone()], &avoid).unwrap();
+        let materialized = materialize_synthetic_regions(&[req], &assigned);
+        // Slab plus one synthetic snapshot: both must be distinct backing regions.
+        let slab = HeapSlab {
+            old_base: 0x14f000,
+            content: vec![0u8; 0x1000],
+        };
+        let plan = crate::dumper::runtime_rebase::build_runtime_rebase_plan(
+            &[],
+            &materialized,
+            Some(&slab),
+            &[],
+            &crate::dumper::runtime_rebase::ExternalResolverTable::new(),
+            &[],
+            0x140_0000_0,
+            0x140_0000_0,
+        )
+        .unwrap()
+        .unwrap();
+        // Slab region + synthetic region = 2 backing regions; 0 aliases.
+        assert_eq!(plan.regions.len(), 2);
+        assert!(plan.aliases.is_empty());
+    }
+
+    /// The synthetic region's anchor pointer (from gscript) targets the
+    /// synthetic independent region, never the slab offset of a legacy base.
+    #[test]
+    fn r0f2_synthetic_pointer_targets_independent_region() {
+        let avoid = vec![(0x14f000u64, 0x36f3d30u64)];
+        let req = r0f2_req("gto.window_class", b"NewClassName\0", 0xbd8);
+        let assigned = assign_synthetic_logical_addresses(&[req.clone()], &avoid).unwrap();
+        let class_base = assigned[0].assigned_logical_old_base;
+        // gscript image-inline snapshot whose +0xbd8 slot holds the assigned base.
+        let mut gscript = vec![0u8; 0xbd8 + 16];
+        gscript[0xbd8..0xbd8 + 8].copy_from_slice(&class_base.to_le_bytes());
+        let gscript_global = HeapGlobalSnapshot {
+            rva: 0x149d50,
+            live_ptr: 0x1400_0000_0 + 0x149d50,
+            content: gscript,
+            is_heap_handle: false,
+            is_image_inline: true,
+            extent_kind: CaptureExtentKind::BackingObject,
+            extent_evidence: CaptureExtentEvidence::default(),
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::ImageInline,
+        };
+        let materialized = materialize_synthetic_regions(&[req], &assigned);
+        let mut all = materialized;
+        all.push(gscript_global);
+        let slab = HeapSlab {
+            old_base: 0x14f000,
+            content: vec![0u8; 0x1000],
+        };
+        let plan = crate::dumper::runtime_rebase::build_runtime_rebase_plan(
+            &[],
+            &all,
+            Some(&slab),
+            &crate::dumper::runtime_rebase::declared_slots_from_capture(&[], &all, Some(&slab)),
+            &crate::dumper::runtime_rebase::ExternalResolverTable::new(),
+            &[],
+            0x140_0000_0,
+            0x140_0000_0,
+        )
+        .unwrap()
+        .unwrap();
+        // Find the slot in the gscript image-inline region at +0xbd8.
+        let synth_region_id = plan
+            .regions
+            .iter()
+            .find(|r| r.old_base == class_base)
+            .map(|r| r.id)
+            .unwrap();
+        let slot = plan
+            .pointers
+            .iter()
+            .find(|p| p.original_value == class_base)
+            .expect("gscript+0xbd8 slot");
+        assert_eq!(slot.target_region, Some(synth_region_id));
+        assert_eq!(slot.target_offset, Some(0));
     }
 }

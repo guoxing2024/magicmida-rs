@@ -167,18 +167,17 @@ pub struct RebaseRegion {
 }
 
 /// How a region is owned/materialized at runtime (GTO Core Recovery R0-F.1).
+///
+/// A rebase region's ownership is one of: a fresh heap allocation, an image
+/// body, a synthetic allocation, or an external resolver. Absorbed probe /
+/// interior subviews are NOT regions — they live only in [`RegionAlias`] and
+/// are represented by [`AliasOwnership`] (GTO R0-F.2 removed the dead
+/// `SlabOwnedAlias` region variant so no unreachable branch is misleadingly
+/// "implemented").
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeRegionOwnership {
     /// A fresh independent heap allocation at cold-start.
     IndependentAllocation,
-    /// An alias of an authoritative parent region (e.g. a probe window or
-    /// interior subview inside a heap slab). Not independently allocated.
-    SlabOwnedAlias {
-        /// Plan id of the authoritative parent region.
-        parent_region: usize,
-        /// Byte offset of this alias within the parent's old range.
-        parent_offset: u64,
-    },
     /// An image-inline object body (owned by the image, not the heap).
     ImageInline,
     /// A synthetic region allocated independently at cold-start.
@@ -312,6 +311,19 @@ pub fn classify_region_relation(
     }
 }
 
+/// How an absorbed alias is owned at runtime (GTO R0-F.2).
+///
+/// Alias ownership is distinct from [`RuntimeRegionOwnership`]: an alias is
+/// never a runtime allocation; it is a view into its parent's allocation. This
+/// replaces the removed dead `RuntimeRegionOwnership::SlabOwnedAlias` variant so
+/// the ownership model has no unreachable production branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AliasOwnership {
+    /// The alias is a view owned by its slab/parent allocation (not separately
+    /// allocated). The only production alias ownership today.
+    SlabOwned,
+}
+
 /// An absorbed (coalesced) child region that lives inside a normalized parent
 /// backing region. Diagnostic + digest-binding; not a runtime allocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -332,6 +344,9 @@ pub struct RegionAlias {
     pub content_digest: String,
     /// Extent classification of the absorbed child (GTO R0-F.1).
     pub extent_kind: crate::dumper::heap_global_snapshot::CaptureExtentKind,
+    /// Runtime ownership of this alias (GTO R0-F.2). Always `SlabOwned`; an
+    /// alias is a view of its parent, never an independent allocation.
+    pub ownership: AliasOwnership,
 }
 
 /// A declared pointer slot inside a captured region.
@@ -539,16 +554,6 @@ impl RuntimeRebasePlan {
             // alias parent, or alias offset alters the digest.
             out.push(extent_kind_tag(&r.extent_kind));
             out.push(ownership_tag(&r.ownership));
-            match &r.ownership {
-                RuntimeRegionOwnership::SlabOwnedAlias {
-                    parent_region,
-                    parent_offset,
-                } => {
-                    out.extend_from_slice(&(*parent_region as u64).to_le_bytes());
-                    out.extend_from_slice(&parent_offset.to_le_bytes());
-                }
-                _ => {}
-            }
         }
         for p in &self.pointers {
             out.extend_from_slice(&p.source_region.to_le_bytes());
@@ -625,6 +630,8 @@ impl RuntimeRebasePlan {
             out.push(0);
             // GTO R0-F.1: bind the alias's extent kind into the digest.
             out.push(extent_kind_tag(&a.extent_kind));
+            // GTO R0-F.2: bind the alias's ownership into the digest.
+            out.push(alias_ownership_tag(a.ownership));
         }
         out
     }
@@ -689,10 +696,16 @@ fn extent_kind_tag(e: &crate::dumper::heap_global_snapshot::CaptureExtentKind) -
 fn ownership_tag(o: &RuntimeRegionOwnership) -> u8 {
     match o {
         RuntimeRegionOwnership::IndependentAllocation => 0,
-        RuntimeRegionOwnership::SlabOwnedAlias { .. } => 1,
         RuntimeRegionOwnership::ImageInline => 2,
         RuntimeRegionOwnership::SyntheticAllocation => 3,
         RuntimeRegionOwnership::ExternalResolved => 4,
+    }
+}
+
+/// Deterministic alias-ownership tag for plan digest binding (GTO R0-F.2).
+fn alias_ownership_tag(o: AliasOwnership) -> u8 {
+    match o {
+        AliasOwnership::SlabOwned => 0,
     }
 }
 
@@ -999,7 +1012,16 @@ pub fn build_runtime_rebase_plan(
             image_inline_rva: None,
             provenance: g.provenance.clone(),
             extent_kind: g.extent_kind,
-            ownership: RuntimeRegionOwnership::IndependentAllocation,
+            // GTO R0-F.2: a SyntheticDerived region is materialized as a
+            // collision-free independent runtime allocation with
+            // SyntheticDerived extent + SyntheticAllocation ownership. It is
+            // never absorbed into the raw slab (normalize_containment skips
+            // synthetic regions) and never reported as raw-captured.
+            ownership: if matches!(g.provenance, RegionProvenance::SyntheticDerived { .. }) {
+                RuntimeRegionOwnership::SyntheticAllocation
+            } else {
+                RuntimeRegionOwnership::IndependentAllocation
+            },
         });
         id = id.saturating_add(1);
     }
@@ -1242,122 +1264,166 @@ fn normalize_containment(
         .map(|(i, _)| i)
         .collect();
 
-    let mut normalized: Vec<RebaseRegion> = Vec::new();
-    let mut aliases: Vec<RegionAlias> = Vec::new();
-    let mut old_base_map: std::collections::BTreeMap<u64, (usize, usize)> =
-        std::collections::BTreeMap::new();
-    // Track which original candidate ids were absorbed.
-    let mut absorbed: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
-
+    // ---- Pre-pass: decide absorption for every non-slab candidate ----
+    // A candidate is absorbed into a slab only when: it is heap-target
+    // (non-image-inline), NOT a synthetic region (GTO R0-F.2: a SyntheticDerived
+    // region is never absorbed — it is a collision-free independent region), and
+    // it is contained in exactly one slab whose content matches at the offset.
+    // This pre-pass is deterministic and lets us assign normalized slab ids
+    // BEFORE building aliases, so `parent_region` always references the
+    // normalized slab id (never the raw candidate index) — GTO R0-F.2 §十.
+    use crate::dumper::heap_global_snapshot::RegionProvenance as RP;
+    // child_absorb[i] = Some((slab_id, offset)) when candidate i is absorbed.
+    let mut child_absorb: Vec<Option<(usize, usize)>> = vec![None; candidates.len()];
     for (i, r) in candidates.iter().enumerate() {
-        if absorbed.contains(&i) {
+        if r.kind == RegionKind::HeapSlab {
             continue;
         }
-        let is_heap_slab = r.kind == RegionKind::HeapSlab;
-        // A child region (heap-target, non-image-inline) contained in a slab.
-        if !is_heap_slab {
-            // Find exactly one slab that contains this region's range.
-            let mut containing_slab: Option<(usize, usize)> = None; // (slab_id, offset)
-            for &sid in &slab_ids {
-                let slab = &candidates[sid];
-                let rel = classify_region_relation(slab.old_base, slab.size, r.old_base, r.size)?;
-                if rel == RegionRelation::Contains {
-                    if containing_slab.is_some() {
-                        // Two slabs both contain this child: ambiguous parent.
-                        return Err(RebaseError::Plan(format!(
-                            "ambiguous coalescing parent for child region {} (0x{:x},+{:#x}): \
-                             contained in multiple slabs",
-                            i, r.old_base, r.size
-                        )));
-                    }
-                    let off = r
-                        .old_base
-                        .checked_sub(slab.old_base)
-                        .and_then(|v| usize::try_from(v).ok())
-                        .ok_or_else(|| RebaseError::Overflow {
-                            region: i,
-                            old_base: r.old_base,
-                            size: r.size,
-                        })?;
-                    containing_slab = Some((sid, off));
-                }
-            }
-            if let Some((sid, off)) = containing_slab {
-                // Child is heap-target (never image-inline).
-                if r.image_inline_rva.is_some() {
+        if r.image_inline_rva.is_some() {
+            continue; // image-inline never coalesced into a slab
+        }
+        // GTO R0-F.2: a synthetic region (SyntheticDerived) is a collision-free
+        // independent allocation — never absorbed into the raw slab.
+        if matches!(r.provenance, RP::SyntheticDerived { .. }) {
+            continue;
+        }
+        let mut containing_slab: Option<(usize, usize)> = None;
+        for &sid in &slab_ids {
+            let slab = &candidates[sid];
+            let rel = classify_region_relation(slab.old_base, slab.size, r.old_base, r.size)?;
+            if rel == RegionRelation::Contains {
+                if containing_slab.is_some() {
                     return Err(RebaseError::Plan(format!(
-                        "image-inline region {} (0x{:x}) must not be coalesced into a heap slab",
-                        i, r.old_base
+                        "ambiguous coalescing parent for child region {} (0x{:x},+{:#x}): \
+                         contained in multiple slabs",
+                        i, r.old_base, r.size
                     )));
                 }
-                let slab = &candidates[sid];
-                let child_end = r
-                    .size
-                    .checked_add(off)
+                let off = r
+                    .old_base
+                    .checked_sub(slab.old_base)
+                    .and_then(|v| usize::try_from(v).ok())
                     .ok_or_else(|| RebaseError::Overflow {
                         region: i,
                         old_base: r.old_base,
                         size: r.size,
                     })?;
-                if child_end > slab.bytes.len() {
-                    return Err(RebaseError::Overflow {
-                        region: i,
-                        old_base: r.old_base,
-                        size: r.size,
-                    });
-                }
-                // Verify the slab content at the child offset exactly equals the
-                // child's captured bytes. Any mismatch fails closed.
-                let parent_slice = &slab.bytes[off..child_end];
-                if parent_slice != &r.bytes[..] {
-                    let mut mismatch_offset = usize::MAX;
-                    for (k, (a, b)) in parent_slice.iter().zip(r.bytes.iter()).enumerate() {
-                        if a != b {
-                            mismatch_offset = k;
-                            break;
-                        }
-                    }
-                    return Err(RebaseError::Plan(format!(
-                        "contained region content mismatch: parent={} kind={} old_base={:#x} \
-                         child={} kind={} old_base={:#x} child_offset={:#x} mismatch_offset={:#x}",
-                        sid, slab.kind, slab.old_base, i, r.kind, r.old_base, off, mismatch_offset
-                    )));
-                }
-                // Absorb child into the slab (no separate runtime allocation).
-                // The child becomes a SlabOwnedAlias of the parent slab.
-                aliases.push(RegionAlias {
-                    alias_old_base: r.old_base,
-                    alias_size: r.size,
-                    parent_region: sid,
-                    parent_offset: off,
-                    original_kind: r.kind,
-                    required: r.required,
-                    content_digest: sha256_hex(&r.bytes),
-                    extent_kind: r.extent_kind,
-                });
-                absorbed.insert(i);
-                old_base_map.insert(r.old_base, (sid, off));
-                continue;
-            }
-            // GTO R0-F.1: a ProbeWindow or InteriorSubview that is NOT contained
-            // in any authoritative slab/parent cannot become an independent
-            // allocation (a heuristic read window is not a proven heap extent).
-            // Fail closed rather than allocate an unproven region.
-            use crate::dumper::heap_global_snapshot::CaptureExtentKind as CEK;
-            if matches!(r.extent_kind, CEK::ProbeWindow | CEK::InteriorSubview) {
-                return Err(RebaseError::Plan(format!(
-                    "probe/interior region {} (0x{:x},+{:#x}, extent={:?}) is not contained in \
-                     any authoritative slab/parent; refusing independent allocation",
-                    i, r.old_base, r.size, r.extent_kind
-                )));
+                containing_slab = Some((sid, off));
             }
         }
+        if let Some((sid, off)) = containing_slab {
+            let slab = &candidates[sid];
+            let child_end = r
+                .size
+                .checked_add(off)
+                .ok_or_else(|| RebaseError::Overflow {
+                    region: i,
+                    old_base: r.old_base,
+                    size: r.size,
+                })?;
+            if child_end > slab.bytes.len() {
+                return Err(RebaseError::Overflow {
+                    region: i,
+                    old_base: r.old_base,
+                    size: r.size,
+                });
+            }
+            // Content must match the slab at the child offset (raw coherence).
+            let parent_slice = &slab.bytes[off..child_end];
+            if parent_slice != &r.bytes[..] {
+                let mut mismatch_offset = usize::MAX;
+                for (k, (a, b)) in parent_slice.iter().zip(r.bytes.iter()).enumerate() {
+                    if a != b {
+                        mismatch_offset = k;
+                        break;
+                    }
+                }
+                return Err(RebaseError::Plan(format!(
+                    "contained region content mismatch: parent={} kind={} old_base={:#x} \
+                     child={} kind={} old_base={:#x} child_offset={:#x} mismatch_offset={:#x}",
+                    sid, slab.kind, slab.old_base, i, r.kind, r.old_base, off, mismatch_offset
+                )));
+            }
+            child_absorb[i] = Some((sid, off));
+        }
+    }
+    let absorbed: std::collections::BTreeSet<usize> = child_absorb
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| v.is_some())
+        .map(|(i, _)| i)
+        .collect();
+
+    // ---- Assign normalized backing ids ----
+    // A candidate that is not absorbed becomes a backing region with
+    // `new_id = count of non-absorbed candidates before it`. Slabs are never
+    // absorbed, so each slab gets a deterministic normalized id here.
+    let mut candidate_id_to_normalized_id: Vec<Option<usize>> = vec![None; candidates.len()];
+    let mut next_id = 0usize;
+    for (i, _) in candidates.iter().enumerate() {
+        if absorbed.contains(&i) {
+            continue;
+        }
+        candidate_id_to_normalized_id[i] = Some(next_id);
+        next_id += 1;
+    }
+
+    let mut normalized: Vec<RebaseRegion> = Vec::new();
+    let mut aliases: Vec<RegionAlias> = Vec::new();
+    let mut old_base_map: std::collections::BTreeMap<u64, (usize, usize)> =
+        std::collections::BTreeMap::new();
+
+    for (i, r) in candidates.iter().enumerate() {
+        // Non-slab children get their normalized slab id from the pre-pass.
+        if let Some((sid, off)) = child_absorb[i] {
+            // The child is absorbed into the slab. The alias parent references
+            // the NORMALIZED slab id (never the raw candidate index).
+            let slab_norm = candidate_id_to_normalized_id[sid].ok_or_else(|| {
+                RebaseError::Plan(format!(
+                    "slab candidate {} (0x{:x}) not assigned a normalized id",
+                    sid, candidates[sid].old_base
+                ))
+            })?;
+            aliases.push(RegionAlias {
+                alias_old_base: r.old_base,
+                alias_size: r.size,
+                parent_region: slab_norm,
+                parent_offset: off,
+                original_kind: r.kind,
+                required: r.required,
+                content_digest: sha256_hex(&r.bytes),
+                extent_kind: r.extent_kind,
+                ownership: AliasOwnership::SlabOwned,
+            });
+            old_base_map.insert(r.old_base, (slab_norm, off));
+            continue;
+        }
+        let Some(new_id) = candidate_id_to_normalized_id[i] else {
+            continue;
+        };
         // Not absorbed: a backing region.
-        let new_id = normalized.len();
         old_base_map.insert(r.old_base, (new_id, 0));
         let mut region = r.clone();
         region.id = new_id;
         normalized.push(region);
+    }
+
+    // GTO R0-F.1: a ProbeWindow or InteriorSubview that is NOT contained in any
+    // authoritative slab/parent must not survive as a region (a heuristic read
+    // window is not a proven heap extent). Probe/interior views may only exist as
+    // aliases (they were absorbed in the pre-pass) or fail closed.
+    for (i, r) in candidates.iter().enumerate() {
+        if absorbed.contains(&i) {
+            continue;
+        }
+        use crate::dumper::heap_global_snapshot::CaptureExtentKind as CEK;
+        if matches!(r.extent_kind, CEK::ProbeWindow | CEK::InteriorSubview) {
+            return Err(RebaseError::Plan(format!(
+                "probe/interior region {} (0x{:x},+{:#x}, extent={:?}) is not contained in \
+                 any authoritative slab/parent; refusing independent allocation",
+                i, r.old_base, r.size, r.extent_kind
+            )));
+        }
     }
 
     // Sort aliases deterministically by (alias_old_base, parent_region).
@@ -1663,6 +1729,59 @@ pub fn validate_runtime_rebase_plan(plan: &RuntimeRebasePlan) -> Result<(), Reba
                 "region {} has UnknownSynthetic provenance (fail-closed)",
                 r.id
             )));
+        }
+        // GTO R0-F.2: production ownership/provenance/extent invariants. A region
+        // must carry a consistent triple; any mismatch is rejected (fail-closed).
+        use crate::dumper::heap_global_snapshot::CaptureExtentKind as CEK;
+        let is_slab = r.kind == RegionKind::HeapSlab;
+        let is_synthetic = matches!(r.provenance, RegionProvenance::SyntheticDerived { .. });
+        let is_image = matches!(r.provenance, RegionProvenance::ImageInline);
+        match (
+            &r.provenance,
+            &r.ownership,
+            &r.extent_kind,
+            r.image_inline_rva,
+        ) {
+            // Synthetic: provenance SyntheticDerived, extent SyntheticDerived,
+            // ownership SyntheticAllocation, never image-inline.
+            (_, RuntimeRegionOwnership::SyntheticAllocation, CEK::SyntheticDerived, None)
+                if is_synthetic => {}
+            (_, _, _, _) if is_synthetic => {
+                return Err(RebaseError::Plan(format!(
+                    "region {} synthetic must have ownership=SyntheticAllocation, extent=SyntheticDerived, no image_rva (got ownership={:?} extent={:?} image={:?})",
+                    r.id, r.ownership, r.extent_kind, r.image_inline_rva
+                )));
+            }
+            // Image inline: provenance ImageInline, ownership ImageInline, image_rva Some.
+            (_, RuntimeRegionOwnership::ImageInline, _, Some(_)) if is_image => {}
+            (_, _, _, _) if is_image => {
+                return Err(RebaseError::Plan(format!(
+                    "region {} image-inline must have ownership=ImageInline and image_rva=Some (got ownership={:?} image={:?})",
+                    r.id, r.ownership, r.image_inline_rva
+                )));
+            }
+            // Slab backing: kind HeapSlab, extent BackingObject, ownership IndependentAllocation.
+            (_, RuntimeRegionOwnership::IndependentAllocation, CEK::BackingObject, None)
+                if is_slab => {}
+            // Observed allocation: ownership IndependentAllocation, extent
+            // ObservedAllocation (or a supported capture type), not image/synthetic.
+            (_, RuntimeRegionOwnership::IndependentAllocation, CEK::ObservedAllocation, None) => {}
+            // External: ownership ExternalResolved (resolver-backed), not image.
+            (_, RuntimeRegionOwnership::ExternalResolved, _, None) => {}
+            (_, _, CEK::ProbeWindow | CEK::InteriorSubview, _) => {
+                // Probe/interior views may only exist as aliases, never as final
+                // regions (GTO R0-F.1/R0-F.2).
+                return Err(RebaseError::Plan(format!(
+                    "region {} has extent {:?}; probe/interior may only be aliases",
+                    r.id, r.extent_kind
+                )));
+            }
+            (p, o, e, img) => {
+                return Err(RebaseError::Plan(format!(
+                    "region {} has inconsistent ownership/provenance/extent triple: provenance={:?} ownership={:?} extent={:?} image={:?}",
+                    r.id, p, o, e, img
+                )));
+            }
         }
     }
     // 2. Target ranges must not overlap (old ranges already validated; the
@@ -4167,5 +4286,356 @@ mod tests {
         slab2.content[new_b_off..new_b_off + 0x400].copy_from_slice(&vec![0xAAu8; 0x400]);
         let p2 = build_plan(&[], &globals2, Some(&slab2)).unwrap().unwrap();
         assert_ne!(p1.plan_digest, p2.plan_digest);
+    }
+
+    // ---------- GTO Core Recovery R0-F.2 tests ----------
+
+    use super::super::heap_global_snapshot::{
+        assign_synthetic_logical_addresses, materialize_synthetic_regions, SyntheticPointerAnchor,
+        SyntheticRegionRequest,
+    };
+
+    fn r0f2_synth_req(id: &str, payload: &[u8]) -> SyntheticRegionRequest {
+        SyntheticRegionRequest {
+            synthetic_id: id.to_string(),
+            transform_id: "repair_gscript_window_strings".to_string(),
+            source_anchor: format!("anchor:{id}"),
+            payload: payload.to_vec(),
+            construction_digest: super::super::heap_global_snapshot::sha256_hex_pub(payload),
+            alignment: 0x10,
+            pointer_slots: vec![SyntheticPointerAnchor {
+                region_old_base: 0x1400_0000_0 + 0x149d50,
+                slot_offset: if id == "gto.window_class" {
+                    0xbd8
+                } else {
+                    0xbd0
+                },
+            }],
+        }
+    }
+
+    // Route N slab + two probe views + two synthetic requests = 3 runtime owners
+    // (1 slab + 2 synthetics). The views are absorbed as slab aliases.
+    #[test]
+    fn r0f2_route_n_views_and_synthetics_have_three_owners() {
+        const SLAB_BASE: u64 = 0x14f000;
+        const VIEW_A: u64 = 0x96bb80;
+        const VIEW_B: u64 = 0x96bbd0;
+        let a_off = (VIEW_A - SLAB_BASE) as usize;
+        let b_off = (VIEW_B - SLAB_BASE) as usize;
+        let mut slab_content = vec![0u8; b_off + 0x400];
+        for i in 0..0x400 {
+            slab_content[a_off + i] = 0xAA;
+            slab_content[b_off + i] = 0xAA;
+        }
+        let slab = HeapSlab {
+            old_base: SLAB_BASE,
+            content: slab_content,
+        };
+        let mut view_a = global(0x0, VIEW_A, vec![0xAAu8; 0x400], false);
+        view_a.extent_kind = CEK::ProbeWindow;
+        let mut view_b = global(0x0, VIEW_B, vec![0xAAu8; 0x400], false);
+        view_b.extent_kind = CEK::InteriorSubview;
+        // Assign + materialize two synthetic regions avoiding the slab.
+        let avoid = vec![(SLAB_BASE, 0x36f3d30u64)];
+        let requests = vec![
+            r0f2_synth_req("gto.window_class", b"NewClassName\0"),
+            r0f2_synth_req("gto.window_title", b"ZhuChuangKou\0"),
+        ];
+        let assigned = assign_synthetic_logical_addresses(&requests, &avoid).unwrap();
+        let synth_bases: Vec<u64> = assigned
+            .iter()
+            .map(|a| a.assigned_logical_old_base)
+            .collect();
+        let mut materialized = materialize_synthetic_regions(&requests, &assigned);
+        let mut globals = vec![view_a, view_b];
+        globals.append(&mut materialized);
+        let plan = build_plan(&[], &globals, Some(&slab)).unwrap().unwrap();
+        // Backing regions: slab + 2 synthetic = 3 independent-owner regions.
+        assert_eq!(plan.regions.len(), 3);
+        assert_eq!(plan.aliases.len(), 2); // the two probe views absorbed into slab
+                                           // Both synthetic bases are outside the slab.
+        for base in &synth_bases {
+            assert!(*base < SLAB_BASE || *base >= 0x36f3d30);
+        }
+        // Synthetic regions are disjoint.
+        let b0 = synth_bases[0];
+        let b1 = synth_bases[1];
+        let s0 = requests
+            .iter()
+            .find(|r| r.synthetic_id == "gto.window_class")
+            .map(|r| r.payload.len())
+            .unwrap();
+        assert_ne!(b0, b1);
+        assert!(
+            b0.checked_add(s0 as u64).unwrap() <= b1 || b1.checked_add(s0 as u64).unwrap() <= b0
+        );
+        validate_runtime_rebase_plan(&plan).unwrap();
+    }
+
+    // A synthetic allocation failure (empty region) must block OEP (fail closed
+    // before a Complete plan can be reached).
+    #[test]
+    fn r0f2_synthetic_allocation_failure_blocks_oep() {
+        // A synthetic request with an empty payload must fail closed at assignment.
+        let empty = SyntheticRegionRequest {
+            synthetic_id: "gto.empty".to_string(),
+            transform_id: "t".to_string(),
+            source_anchor: "a".to_string(),
+            payload: vec![],
+            construction_digest: super::super::heap_global_snapshot::sha256_hex_pub(&[]),
+            alignment: 0x10,
+            pointer_slots: vec![],
+        };
+        let res = assign_synthetic_logical_addresses(&[empty], &[]);
+        assert!(res.is_err());
+    }
+
+    // Synthetic assignment must bind into the plan digest (changing the assigned
+    // base changes the plan digest).
+    #[test]
+    fn r0f2_synthetic_assignment_changes_plan_digest() {
+        const SLAB_BASE: u64 = 0x14f000;
+        let mk = |avoid: Vec<(u64, u64)>, req: &SyntheticRegionRequest| {
+            let assigned = assign_synthetic_logical_addresses(&[req.clone()], &avoid).unwrap();
+            let mut materialized = materialize_synthetic_regions(&[req.clone()], &assigned);
+            let mut slab_content = vec![0u8; 0x1000];
+            // Slab content at offset 0x500 matches the child bytes (raw coherence).
+            slab_content[0x500..0x508].copy_from_slice(&[0xAAu8; 8]);
+            let slab = HeapSlab {
+                old_base: SLAB_BASE,
+                content: slab_content,
+            };
+            let mut globals = vec![global(0, SLAB_BASE + 0x500, vec![0xAAu8; 8], false)];
+            globals.append(&mut materialized);
+            build_plan(&[], &globals, Some(&slab)).unwrap().unwrap()
+        };
+        let req = r0f2_synth_req("gto.window_class", b"NewClassName\0");
+        // avoid1 covers the low gap AND the slab -> base lands above the slab.
+        let p1 = mk(vec![(0x1_0000u64, 0x36f3d30u64)], &req);
+        // avoid2 leaves the low gap open -> base lands at 0x10000 (below slab).
+        let p2 = mk(vec![(0x14f000u64, 0x36f3d30u64)], &req);
+        assert_ne!(p1.plan_digest, p2.plan_digest);
+    }
+
+    // Validator: a synthetic region with mismatched provenance/extent/ownership
+    // is rejected.
+    #[test]
+    fn r0f2_synthetic_extent_provenance_mismatch_rejected() {
+        // Build a synthetic region with the WRONG extent (ObservedAllocation
+        // instead of SyntheticDerived) but SyntheticDerived provenance.
+        let mut g = global(0x0, 0x10000, b"NewClassName\0".to_vec(), false);
+        g.provenance = RegionProvenance::SyntheticDerived {
+            transform_id: "repair_gscript_window_strings".to_string(),
+            source_anchor: "gscript+0xbd8".to_string(),
+            construction_digest: "abc".to_string(),
+        };
+        g.extent_kind = CEK::ObservedAllocation; // WRONG
+        let plan = build_plan(&[], &[g], None).unwrap().unwrap();
+        // The planner sets ownership=SyntheticAllocation but extent is wrong;
+        // the validator must reject the inconsistent triple.
+        assert!(validate_runtime_rebase_plan(&plan).is_err());
+    }
+
+    // Validator: a probe/interior view cannot survive as a final region.
+    #[test]
+    fn r0f2_probe_or_interior_cannot_survive_as_region() {
+        // A probe window inside a slab is absorbed (alias), so a surviving
+        // region with ProbeWindow extent is only possible outside a slab -> the
+        // planner itself rejects it. Confirm build fails closed.
+        let mut g = global(0x0, 0x1000000, vec![0u8; 0x400], false);
+        g.extent_kind = CEK::ProbeWindow;
+        let res = build_plan(&[], &[g], None);
+        assert!(res.is_err());
+    }
+
+    // Alias parent uses the NORMALIZED region id, not the raw candidate index.
+    // Independent region with old_base < slab base so the slab is NOT region 0.
+    #[test]
+    fn r0f2_alias_parent_uses_normalized_region_id() {
+        const SLAB_BASE: u64 = 0x300000;
+        const CHILD: u64 = 0x320000; // inside slab
+        const INDEP: u64 = 0x100000; // independent region BEFORE the slab
+        let mut slab_content = vec![0u8; 0x400000];
+        slab_content[(CHILD - SLAB_BASE) as usize..(CHILD - SLAB_BASE) as usize + 8]
+            .copy_from_slice(&vec![0x11u8; 8]);
+        let slab = HeapSlab {
+            old_base: SLAB_BASE,
+            content: slab_content,
+        };
+        // Independent ObservedAllocation region before the slab.
+        let indep = global(0x0, INDEP, vec![0x22u8; 16], false);
+        let child = global(0x0, CHILD, vec![0x11u8; 8], false);
+        let plan = build_plan(&[], &[child, indep], Some(&slab))
+            .unwrap()
+            .unwrap();
+        // Sorted by old_base: INDEP(0x100000), SLAB(0x300000), CHILD absorbed.
+        // regions = [INDEP(id0), SLAB(id1)].
+        assert_eq!(plan.regions.len(), 2);
+        assert_eq!(plan.regions[0].old_base, INDEP);
+        assert_eq!(plan.regions[1].old_base, SLAB_BASE);
+        // The child alias's parent must be the SLAB's normalized id = 1, not 0.
+        assert_eq!(plan.aliases.len(), 1);
+        assert_eq!(plan.aliases[0].parent_region, 1);
+        assert_eq!(plan.aliases[0].parent_offset, (CHILD - SLAB_BASE) as usize);
+    }
+
+    // The alias pointer target references the normalized slab region id.
+    #[test]
+    fn r0f2_alias_pointer_uses_normalized_region_id() {
+        const SLAB_BASE: u64 = 0x300000;
+        const CHILD: u64 = 0x320000;
+        const INDEP: u64 = 0x100000;
+        // Child contains a pointer to its own base.
+        let mut child_bytes = vec![0u8; 8];
+        child_bytes.copy_from_slice(&CHILD.to_le_bytes());
+        let mut slab_content = vec![0u8; 0x400000];
+        slab_content[(CHILD - SLAB_BASE) as usize..(CHILD - SLAB_BASE) as usize + 8]
+            .copy_from_slice(&child_bytes);
+        let slab = HeapSlab {
+            old_base: SLAB_BASE,
+            content: slab_content,
+        };
+        let indep = global(0x0, INDEP, vec![0x22u8; 16], false);
+        let child = global(0x0, CHILD, child_bytes, false);
+        let plan = build_plan(&[], &[child, indep], Some(&slab))
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.regions.len(), 2);
+        // The child slot translates to slab (region id 1) at offset.
+        let slot = plan
+            .pointers
+            .iter()
+            .find(|p| p.original_value == CHILD)
+            .expect("child self-pointer");
+        assert_eq!(slot.target_region, Some(1));
+        assert_eq!(slot.target_offset, Some((CHILD - SLAB_BASE) as u64));
+    }
+
+    // Final old ranges are pairwise disjoint after normalization + synthetic
+    // assignment.
+    #[test]
+    fn r0f2_final_old_ranges_are_pairwise_disjoint() {
+        const SLAB_BASE: u64 = 0x14f000;
+        const VIEW_A: u64 = 0x96bb80;
+        const VIEW_B: u64 = 0x96bbd0;
+        let a_off = (VIEW_A - SLAB_BASE) as usize;
+        let b_off = (VIEW_B - SLAB_BASE) as usize;
+        let mut slab_content = vec![0u8; b_off + 0x400];
+        for i in 0..0x400 {
+            slab_content[a_off + i] = 0xAA;
+            slab_content[b_off + i] = 0xAA;
+        }
+        let slab = HeapSlab {
+            old_base: SLAB_BASE,
+            content: slab_content,
+        };
+        let mut view_a = global(0x0, VIEW_A, vec![0xAAu8; 0x400], false);
+        view_a.extent_kind = CEK::ProbeWindow;
+        let mut view_b = global(0x0, VIEW_B, vec![0xAAu8; 0x400], false);
+        view_b.extent_kind = CEK::InteriorSubview;
+        let requests = vec![
+            r0f2_synth_req("gto.window_class", b"NewClassName\0"),
+            r0f2_synth_req("gto.window_title", b"ZhuChuangKou\0"),
+        ];
+        let assigned =
+            assign_synthetic_logical_addresses(&requests, &[(SLAB_BASE, 0x36f3d30u64)]).unwrap();
+        let mut materialized = materialize_synthetic_regions(&requests, &assigned);
+        let mut globals = vec![view_a, view_b];
+        globals.append(&mut materialized);
+        let plan = build_plan(&[], &globals, Some(&slab)).unwrap().unwrap();
+        // All backing region old ranges must be pairwise non-overlapping.
+        let mut ranges: Vec<(u64, u64)> = plan
+            .regions
+            .iter()
+            .map(|r| (r.old_base, r.old_base + r.size as u64))
+            .collect();
+        ranges.sort_by_key(|&(s, _)| s);
+        for w in ranges.windows(2) {
+            assert!(
+                w[0].1 <= w[1].0,
+                "regions overlap: [{:#x},{:#x}) and [{:#x},{:#x})",
+                w[0].0,
+                w[0].1,
+                w[1].0,
+                w[1].1
+            );
+        }
+    }
+
+    // Simulator: with distinct runtime bases, the two gscript window-string
+    // slots are patched to the synthetic allocations' runtime bases.
+    #[test]
+    fn r0f2_simulation_patches_both_window_string_slots() {
+        const SLAB_BASE: u64 = 0x14f000;
+        let req_class = r0f2_synth_req("gto.window_class", b"NewClassName\0");
+        let req_title = r0f2_synth_req("gto.window_title", b"ZhuChuangKou\0");
+        let requests = vec![req_class.clone(), req_title.clone()];
+        let avoid = vec![(SLAB_BASE, 0x36f3d30u64)];
+        let assigned = assign_synthetic_logical_addresses(&requests, &avoid).unwrap();
+        let class_base = assigned
+            .iter()
+            .find(|a| a.synthetic_id == "gto.window_class")
+            .unwrap()
+            .assigned_logical_old_base;
+        let title_base = assigned
+            .iter()
+            .find(|a| a.synthetic_id == "gto.window_title")
+            .unwrap()
+            .assigned_logical_old_base;
+        // gscript image-inline region with +0xbd0/+0xbd8 holding the assigned bases.
+        let mut gscript = vec![0u8; 0xbd8 + 16];
+        gscript[0xbd8..0xbd8 + 8].copy_from_slice(&class_base.to_le_bytes());
+        gscript[0xbd0..0xbd0 + 8].copy_from_slice(&title_base.to_le_bytes());
+        let gscript_global = global(0x149d50, 0x1400_0000_0 + 0x149d50, gscript, true);
+        let mut materialized = materialize_synthetic_regions(&requests, &assigned);
+        let mut globals = vec![gscript_global];
+        globals.append(&mut materialized);
+        let slab = HeapSlab {
+            old_base: SLAB_BASE,
+            content: vec![0u8; 0x1000],
+        };
+        let plan = build_plan(&[], &globals, Some(&slab)).unwrap().unwrap();
+        validate_runtime_rebase_plan(&plan).unwrap();
+        let meta = super::super::runtime_bootstrap::encode_plan_metadata(&plan).unwrap();
+        // Distinct runtime allocation bases per region.
+        let bases: Vec<u64> = (0..meta.regions.len() as u64)
+            .map(|i| 0x5000_0000 + i * 0x100000)
+            .collect();
+        let iat = std::collections::HashMap::new();
+        let payloads =
+            super::super::runtime_bootstrap::simulate_runtime_rebase(&meta, &bases, NEW_IB, &iat)
+                .unwrap();
+        // Locate the gscript region's payload and read +0xbd0/+0xbd8.
+        let gscript_rva = 0x149d50u32;
+        let gscript_idx = plan
+            .regions
+            .iter()
+            .position(|r| r.image_inline_rva == Some(gscript_rva))
+            .unwrap();
+        let patched = &payloads[gscript_idx];
+        let title_val = u64::from_le_bytes(patched[0xbd0..0xbd0 + 8].try_into().unwrap());
+        let class_val = u64::from_le_bytes(patched[0xbd8..0xbd8 + 8].try_into().unwrap());
+        // Both must point at a runtime synthetic allocation base (not a slab
+        // offset of any legacy placeholder).
+        assert_eq!(
+            class_val,
+            bases[plan
+                .regions
+                .iter()
+                .position(|r| r.old_base == class_base)
+                .unwrap()]
+        );
+        assert_eq!(
+            title_val,
+            bases[plan
+                .regions
+                .iter()
+                .position(|r| r.old_base == title_base)
+                .unwrap()]
+        );
+        // And they must NOT be slab + legacy-offset.
+        assert_ne!(class_val, bases[0] + (0x200000 - SLAB_BASE));
+        assert_ne!(title_val, bases[0] + (0x201000 - SLAB_BASE));
     }
 }

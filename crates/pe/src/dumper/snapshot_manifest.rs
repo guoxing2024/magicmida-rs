@@ -12,7 +12,9 @@ use tracing::{info, warn};
 
 use super::capture_policy::DumpCapturePolicy;
 use super::container_snapshot::ContainerSnapshot;
-use super::heap_global_snapshot::HeapGlobalSnapshot;
+use super::heap_global_snapshot::{
+    HeapGlobalSnapshot, SyntheticAssignment, SyntheticRegionRequest,
+};
 use super::runtime_rebase::RuntimeRebaseSummary;
 use super::types::DumpProfile;
 
@@ -39,6 +41,8 @@ pub(crate) fn write_dump_snapshot_manifest(
     capture_policy: &DumpCapturePolicy,
     rebase_summary: Option<&RuntimeRebaseSummary>,
     overlay_ledger: &[super::raw_slab_coherence::TransformedRegionOverlay],
+    synthetic_requests: &[SyntheticRegionRequest],
+    synthetic_assignment_ledger: &[SyntheticAssignment],
 ) {
     let path = manifest_path_for_output(output_path);
     match render_manifest_json(
@@ -51,6 +55,8 @@ pub(crate) fn write_dump_snapshot_manifest(
         capture_policy,
         rebase_summary,
         overlay_ledger,
+        synthetic_requests,
+        synthetic_assignment_ledger,
     ) {
         Ok(json) => match fs::File::create(&path).and_then(|mut f| f.write_all(json.as_bytes())) {
             Ok(()) => {
@@ -121,6 +127,8 @@ pub(crate) fn render_manifest_json(
     capture_policy: &DumpCapturePolicy,
     rebase_summary: Option<&RuntimeRebaseSummary>,
     overlay_ledger: &[super::raw_slab_coherence::TransformedRegionOverlay],
+    synthetic_requests: &[SyntheticRegionRequest],
+    synthetic_assignment_ledger: &[SyntheticAssignment],
 ) -> Result<String, String> {
     let container_payload: u64 = containers.iter().map(|c| c.heap_content.len() as u64).sum();
     let heap_payload: u64 = heap_globals
@@ -513,8 +521,61 @@ pub(crate) fn render_manifest_json(
         buf.push_str("  ]\n");
     }
 
+    // GTO R0-F.2 synthetic-assignment ledger: records the deterministic
+    // collision-free logical-base assignment for every synthetic region request
+    // (window class / title), with its source anchor, payload size, construction
+    // digest, assigned base, alignment, ownership/extent, and whether the
+    // pointer slot was rewritten. Also records the assignment algorithm version.
+    // Diagnostic only — never acceptance.
+    buf.push_str(",\n");
+    buf.push_str("  \"synthetic_assignment_ledger\": [\n");
+    for (i, a) in synthetic_assignment_ledger.iter().enumerate() {
+        let req = synthetic_requests
+            .iter()
+            .find(|r| r.synthetic_id == a.synthetic_id);
+        let source_anchor = req
+            .map(|r| json_escape(&r.source_anchor))
+            .unwrap_or_default();
+        let payload_size = req.map(|r| r.payload.len()).unwrap_or(0);
+        let construction_digest = req
+            .map(|r| json_escape(&r.construction_digest))
+            .unwrap_or_default();
+        let pointer_slot_rewritten = req.map(|r| !r.pointer_slots.is_empty()).unwrap_or(false);
+        buf.push_str(&format!(
+            "    {{\"synthetic_id\": \"{}\", \"transform_id\": \"{}\", \
+             \"source_anchor\": \"{}\", \"payload_size\": {}, \
+             \"construction_digest\": \"{}\", \
+             \"assigned_logical_old_base\": \"{}\", \"alignment\": {}, \
+             \"ownership\": \"synthetic_allocation\", \"extent_kind\": \"synthetic_derived\", \
+             \"collision_checked\": true, \"pointer_slot_rewritten\": {}}}",
+            json_escape(&a.synthetic_id),
+            json_escape(req.map(|r| r.transform_id.as_str()).unwrap_or("")),
+            source_anchor,
+            payload_size,
+            construction_digest,
+            hex_u64(a.assigned_logical_old_base),
+            a.assignment_alignment,
+            pointer_slot_rewritten
+        ));
+        if i + 1 < synthetic_assignment_ledger.len() {
+            buf.push(',');
+        }
+        buf.push('\n');
+    }
+    buf.push_str("  ],\n");
+    buf.push_str(&format!(
+        "  \"synthetic_assignment_algorithm_version\": {}\n",
+        synthetic_assignment_algorithm_version()
+    ));
     buf.push_str("}\n");
     Ok(buf)
+}
+
+/// Version of the deterministic synthetic assignment algorithm (GTO R0-F.2).
+/// Bumped when the allocator's placement/avoidance rules change so manifests
+/// from different algorithm versions are distinguishable.
+pub(crate) fn synthetic_assignment_algorithm_version() -> u32 {
+    1
 }
 
 #[cfg(test)]
@@ -545,6 +606,8 @@ mod tests {
             &[],
             &DumpCapturePolicy::default(),
             None,
+            &[],
+            &[],
             &[],
         )
         .unwrap();
@@ -601,6 +664,8 @@ mod tests {
             &policy,
             None,
             &[],
+            &[],
+            &[],
         )
         .unwrap();
         assert!(json.contains("0x145710"));
@@ -648,6 +713,8 @@ mod tests {
             &[],
             &DumpCapturePolicy::ahk_gto_default(),
             Some(&summary),
+            &[],
+            &[],
             &[],
         )
         .unwrap();
@@ -766,6 +833,8 @@ mod tests {
             &DumpCapturePolicy::ahk_gto_default(),
             Some(&summary),
             &overlay,
+            &[],
+            &[],
         )
         .unwrap();
         // The JSON must parse (valid) and contain all three ledgers.
@@ -782,5 +851,64 @@ mod tests {
         assert!(extents
             .iter()
             .any(|e| e["capture_path"] == "gscript_first_hop"));
+    }
+
+    // GTO R0-F.2: the synthetic-assignment ledger must serialize as valid JSON
+    // with the assigned logical base, source anchor, construction digest,
+    // ownership/extent, pointer-slot-rewrite flag, and algorithm version.
+    #[test]
+    fn r0f2_synthetic_assignment_ledger_serializes_as_valid_json() {
+        use super::super::heap_global_snapshot::{
+            sha256_hex_pub, SyntheticAssignment, SyntheticPointerAnchor, SyntheticRegionRequest,
+        };
+        let payload = b"NewClassName\0".to_vec();
+        let req = SyntheticRegionRequest {
+            synthetic_id: "gto.window_class".to_string(),
+            transform_id: "repair_gscript_window_strings".to_string(),
+            source_anchor: "gscript+0xbd8 (RegisterClass lpszClassName)".to_string(),
+            payload: payload.clone(),
+            construction_digest: sha256_hex_pub(&payload),
+            alignment: 0x10,
+            pointer_slots: vec![SyntheticPointerAnchor {
+                region_old_base: 0x140149d50,
+                slot_offset: 0xbd8,
+            }],
+        };
+        let assigned = vec![SyntheticAssignment {
+            synthetic_id: "gto.window_class".to_string(),
+            assigned_logical_old_base: 0x36f3d30,
+            assignment_alignment: 0x10,
+        }];
+        let json = render_manifest_json(
+            Path::new("cand.exe"),
+            DumpProfile::AhkGtoExperimental,
+            0x140000000,
+            0x70b0,
+            &[],
+            &[],
+            &DumpCapturePolicy::ahk_gto_default(),
+            None,
+            &[],
+            &[req],
+            &assigned,
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid manifest JSON");
+        let ledger = v["synthetic_assignment_ledger"].as_array().unwrap();
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(ledger[0]["synthetic_id"], "gto.window_class");
+        assert_eq!(ledger[0]["assigned_logical_old_base"], "0x36f3d30");
+        assert_eq!(ledger[0]["ownership"], "synthetic_allocation");
+        assert_eq!(ledger[0]["extent_kind"], "synthetic_derived");
+        assert_eq!(ledger[0]["collision_checked"], true);
+        assert_eq!(ledger[0]["pointer_slot_rewritten"], true);
+        assert_eq!(ledger[0]["alignment"], 16);
+        assert_eq!(v["synthetic_assignment_algorithm_version"], 1);
+        // The ledger records the source anchor and construction digest.
+        assert_eq!(
+            ledger[0]["source_anchor"],
+            "gscript+0xbd8 (RegisterClass lpszClassName)"
+        );
+        assert_eq!(ledger[0]["construction_digest"], sha256_hex_pub(&payload));
     }
 }

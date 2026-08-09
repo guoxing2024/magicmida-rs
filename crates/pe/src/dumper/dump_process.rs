@@ -968,15 +968,132 @@ pub fn dump_process_with_report(
             "sanitize_ahk_runtime_global",
         );
     }
-    // R-GTO-UI r22b: gscript+0xbd8 must be NewClassName for RegisterClass @0x34db0.
-    {
-        let before = heap_globals.clone();
-        super::heap_global_snapshot::repair_gscript_window_strings(&mut heap_globals);
-        super::heap_global_snapshot::record_transform_applied(
-            &mut heap_globals,
-            &before,
-            "repair_gscript_window_strings",
-        );
+    // R-GTO-UI r22b / GTO R0-F.2: gscript+0xbd8 must be NewClassName for
+    // RegisterClass @0x34db0, and +0xbd0 the CreateWindow title. The window
+    // repair now PRODUCES SyntheticRegionRequests (no fixed logical address);
+    // the collision-free base is assigned below, after all capture/transform
+    // authority ranges are known.
+    let synthetic_requests =
+        super::heap_global_snapshot::make_gscript_window_string_requests(&heap_globals);
+
+    // ---- GTO R0-F.2: deterministic synthetic logical-address assignment ----
+    // Assign collision-free logical bases for synthetic regions (window class /
+    // title) avoiding every authority range, materialize them as SyntheticDerived
+    // snapshots, and rewrite the anchor pointer slots (gscript+0xbd8/+0xbd0).
+    // Must run BEFORE the raw-slab overlay, declared-slot collection, and runtime
+    // rebase planning so synthetic regions become independent allocations (never
+    // absorbed into the slab). No fallback to a hardcoded address.
+    let mut synthetic_assignment_ledger: Vec<super::heap_global_snapshot::SyntheticAssignment> =
+        Vec::new();
+    // Module map from the live process (external pointer attribution + synthetic
+    // authority ranges). Hoisted so the synthetic assignment and the runtime plan
+    // share one snapshot of the same live state.
+    let module_map: Vec<(String, u64, u64)> = super::remote_modules::take_module_snapshot(
+        debugger.process_handle(),
+        debugger.pid(),
+        opts.image_base,
+        pe.is_64bit,
+    )
+    .unwrap_or_default()
+    .into_iter()
+    .map(|m| (m.name.clone(), m.base, m.end_off))
+    .collect();
+    if !synthetic_requests.is_empty() {
+        // Authority ranges the synthetic allocator must avoid.
+        let mut avoid: Vec<(u64, u64)> = Vec::new();
+        // NULL / small-tag range.
+        avoid.push((0, super::runtime_rebase::SMALL_TAG_CEILING));
+        // Source image span.
+        let image_span = (opts.image_base as u64)
+            .checked_add(pe.size_of_image() as u64)
+            .unwrap_or(u64::MAX);
+        avoid.push((opts.image_base as u64, image_span));
+        // Raw heap slab span + raw containers + observed heap globals.
+        if let Some(raw) = raw_capture.as_ref() {
+            let slab_end = raw
+                .slab
+                .old_base
+                .checked_add(raw.slab.content.len() as u64)
+                .unwrap_or(u64::MAX);
+            avoid.push((raw.slab.old_base, slab_end));
+            for c in &raw.children {
+                let end = c.old_base.checked_add(c.size as u64).unwrap_or(u64::MAX);
+                avoid.push((c.old_base, end));
+            }
+        }
+        for c in &containers {
+            let end = c
+                .decoded_begin
+                .checked_add(c.heap_content.len() as u64)
+                .unwrap_or(u64::MAX);
+            avoid.push((c.decoded_begin, end));
+        }
+        for g in &heap_globals {
+            if g.is_heap_handle || g.content.is_empty() {
+                continue;
+            }
+            let end = g
+                .live_ptr
+                .checked_add(g.content.len() as u64)
+                .unwrap_or(u64::MAX);
+            avoid.push((g.live_ptr, end));
+        }
+        // External module map ranges (live module snapshot).
+        for &(_, base, end) in &module_map {
+            if end > base {
+                avoid.push((base, end));
+            }
+        }
+        match super::heap_global_snapshot::assign_synthetic_logical_addresses(
+            &synthetic_requests,
+            &avoid,
+        ) {
+            Ok(assigned) => {
+                synthetic_assignment_ledger = assigned.clone();
+                // Rewrite the anchor pointer slots in the gscript region payload.
+                let gscript_base = synthetic_requests
+                    .first()
+                    .and_then(|r| r.pointer_slots.first())
+                    .map(|a| a.region_old_base);
+                if let Some(gscript_base) = gscript_base {
+                    let mut anchor_regions: Vec<(u64, &mut Vec<u8>)> = heap_globals
+                        .iter_mut()
+                        .filter(|g| g.live_ptr == gscript_base)
+                        .map(|g| (g.live_ptr, &mut g.content))
+                        .collect();
+                    for (req, assign) in synthetic_requests.iter().zip(assigned.iter()) {
+                        super::heap_global_snapshot::rewrite_synthetic_anchor_slots(
+                            &mut anchor_regions,
+                            &req.pointer_slots,
+                            assign.assigned_logical_old_base,
+                        )
+                        .map_err(|e| PeError::GtoStage {
+                            stage: "synthetic_anchor_rewrite".into(),
+                            error: format!("{e:#}"),
+                        })?;
+                    }
+                }
+                // Materialize + push the synthetic snapshots into heap_globals.
+                let mut materialized = super::heap_global_snapshot::materialize_synthetic_regions(
+                    &synthetic_requests,
+                    &assigned,
+                );
+                heap_globals.append(&mut materialized);
+                for a in &assigned {
+                    info!(
+                        synthetic_id = %a.synthetic_id,
+                        assigned_base = format_args!("{:#x}", a.assigned_logical_old_base),
+                        "Assigned collision-free synthetic logical base"
+                    );
+                }
+            }
+            Err(e) => {
+                return Err(PeError::GtoStage {
+                    stage: "synthetic_assignment".into(),
+                    error: format!("{e:#}"),
+                });
+            }
+        }
     }
 
     // ---- R0-C.1: patched backing slab via transformed-child overlay ----
@@ -990,7 +1107,6 @@ pub fn dump_process_with_report(
         "sort_gscript_label_table",
         "mark_labels_non_nested",
         "sanitize_ahk_runtime_global",
-        "repair_gscript_window_strings",
     ];
     let heap_slab = if let Some(raw) = raw_capture.as_ref() {
         match super::raw_slab_coherence::build_patched_backing_slab(
@@ -1230,18 +1346,6 @@ pub fn dump_process_with_report(
         // pointer slots + external resolvers + module map. Fail closed on any
         // structural or unresolved-required condition.
         let new_image_base = pe.nt_headers.optional_header.image_base;
-
-        // Module map from the live process (for external pointer attribution).
-        let module_map: Vec<(String, u64, u64)> = super::remote_modules::take_module_snapshot(
-            debugger.process_handle(),
-            debugger.pid(),
-            opts.image_base,
-            pe.is_64bit,
-        )
-        .unwrap_or_default()
-        .into_iter()
-        .map(|m| (m.name.clone(), m.base, m.end_off))
-        .collect();
 
         // Declared pointer slots from the capture descriptor (pointer-shaped
         // qwords inside captured allocations). Provenance-driven.
@@ -1731,6 +1835,8 @@ pub fn dump_process_with_report(
         &capture_policy,
         rebase_summary.as_ref(),
         &overlay_ledger,
+        &synthetic_requests,
+        &synthetic_assignment_ledger,
     );
 
     // The report is returned only after the candidate and its required bound
