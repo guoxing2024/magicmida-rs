@@ -540,22 +540,35 @@ pub(crate) fn render_manifest_json(
         let construction_digest = req
             .map(|r| json_escape(&r.construction_digest))
             .unwrap_or_default();
-        let pointer_slot_rewritten = req.map(|r| !r.pointer_slots.is_empty()).unwrap_or(false);
+        let expected_anchor_count = req.map(|r| r.pointer_slots.len()).unwrap_or(0);
+        // GTO R0-F.2.1: rewrite status comes from the PRODUCTION result
+        // (rewritten_anchor_count + materialized), never inferred from a
+        // non-empty slot list.
+        let rewritten_anchor_count = a.rewritten_anchor_count;
+        let anchor_rewrite_verified =
+            a.rewritten_anchor_count > 0 && a.rewritten_anchor_count == expected_anchor_count;
         buf.push_str(&format!(
-            "    {{\"synthetic_id\": \"{}\", \"transform_id\": \"{}\", \
+            "    {{\"synthetic_id\": \"{}\", \"request_digest\": \"{}\", \
+             \"transform_id\": \"{}\", \
              \"source_anchor\": \"{}\", \"payload_size\": {}, \
              \"construction_digest\": \"{}\", \
              \"assigned_logical_old_base\": \"{}\", \"alignment\": {}, \
+             \"expected_anchor_count\": {}, \"rewritten_anchor_count\": {}, \
+             \"anchor_rewrite_verified\": {}, \"materialized\": {}, \
              \"ownership\": \"synthetic_allocation\", \"extent_kind\": \"synthetic_derived\", \
-             \"collision_checked\": true, \"pointer_slot_rewritten\": {}}}",
+             \"collision_checked\": true}}",
             json_escape(&a.synthetic_id),
+            json_escape(&a.request_digest),
             json_escape(req.map(|r| r.transform_id.as_str()).unwrap_or("")),
             source_anchor,
             payload_size,
             construction_digest,
             hex_u64(a.assigned_logical_old_base),
             a.assignment_alignment,
-            pointer_slot_rewritten
+            expected_anchor_count,
+            rewritten_anchor_count,
+            anchor_rewrite_verified,
+            a.materialized
         ));
         if i + 1 < synthetic_assignment_ledger.len() {
             buf.push(',');
@@ -571,11 +584,11 @@ pub(crate) fn render_manifest_json(
     Ok(buf)
 }
 
-/// Version of the deterministic synthetic assignment algorithm (GTO R0-F.2).
-/// Bumped when the allocator's placement/avoidance rules change so manifests
-/// from different algorithm versions are distinguishable.
+/// Version of the deterministic synthetic assignment algorithm (GTO R0-F.2 /
+/// R0-F.2.1). Version 2: assignments are identity-bound (request_digest) with
+/// real rewrite/materialization evidence; checked alignment on all jumps.
 pub(crate) fn synthetic_assignment_algorithm_version() -> u32 {
-    1
+    2
 }
 
 #[cfg(test)]
@@ -859,7 +872,8 @@ mod tests {
     #[test]
     fn r0f2_synthetic_assignment_ledger_serializes_as_valid_json() {
         use super::super::heap_global_snapshot::{
-            sha256_hex_pub, SyntheticAssignment, SyntheticPointerAnchor, SyntheticRegionRequest,
+            sha256_hex_pub, synthetic_request_digest, SyntheticAssignment, SyntheticPointerAnchor,
+            SyntheticRegionRequest,
         };
         let payload = b"NewClassName\0".to_vec();
         let req = SyntheticRegionRequest {
@@ -876,8 +890,11 @@ mod tests {
         };
         let assigned = vec![SyntheticAssignment {
             synthetic_id: "gto.window_class".to_string(),
+            request_digest: synthetic_request_digest(&req),
             assigned_logical_old_base: 0x36f3d30,
             assignment_alignment: 0x10,
+            rewritten_anchor_count: 1,
+            materialized: true,
         }];
         let json = render_manifest_json(
             Path::new("cand.exe"),
@@ -889,7 +906,7 @@ mod tests {
             &DumpCapturePolicy::ahk_gto_default(),
             None,
             &[],
-            &[req],
+            &[req.clone()],
             &assigned,
         )
         .unwrap();
@@ -901,9 +918,14 @@ mod tests {
         assert_eq!(ledger[0]["ownership"], "synthetic_allocation");
         assert_eq!(ledger[0]["extent_kind"], "synthetic_derived");
         assert_eq!(ledger[0]["collision_checked"], true);
-        assert_eq!(ledger[0]["pointer_slot_rewritten"], true);
+        // GTO R0-F.2.1: rewrite status is production evidence, not inferred.
+        assert_eq!(ledger[0]["expected_anchor_count"], 1);
+        assert_eq!(ledger[0]["rewritten_anchor_count"], 1);
+        assert_eq!(ledger[0]["anchor_rewrite_verified"], true);
+        assert_eq!(ledger[0]["materialized"], true);
+        assert_eq!(ledger[0]["request_digest"], synthetic_request_digest(&req));
         assert_eq!(ledger[0]["alignment"], 16);
-        assert_eq!(v["synthetic_assignment_algorithm_version"], 1);
+        assert_eq!(v["synthetic_assignment_algorithm_version"], 2);
         // The ledger records the source anchor and construction digest.
         assert_eq!(
             ledger[0]["source_anchor"],

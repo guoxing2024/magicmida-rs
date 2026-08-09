@@ -4343,11 +4343,8 @@ mod tests {
             r0f2_synth_req("gto.window_title", b"ZhuChuangKou\0"),
         ];
         let assigned = assign_synthetic_logical_addresses(&requests, &avoid).unwrap();
-        let synth_bases: Vec<u64> = assigned
-            .iter()
-            .map(|a| a.assigned_logical_old_base)
-            .collect();
-        let mut materialized = materialize_synthetic_regions(&requests, &assigned);
+        let synth_bases: Vec<u64> = assigned.iter().map(|a| a.old_base()).collect();
+        let mut materialized = materialize_synthetic_regions(&assigned).unwrap();
         let mut globals = vec![view_a, view_b];
         globals.append(&mut materialized);
         let plan = build_plan(&[], &globals, Some(&slab)).unwrap().unwrap();
@@ -4398,7 +4395,7 @@ mod tests {
         const SLAB_BASE: u64 = 0x14f000;
         let mk = |avoid: Vec<(u64, u64)>, req: &SyntheticRegionRequest| {
             let assigned = assign_synthetic_logical_addresses(&[req.clone()], &avoid).unwrap();
-            let mut materialized = materialize_synthetic_regions(&[req.clone()], &assigned);
+            let mut materialized = materialize_synthetic_regions(&assigned).unwrap();
             let mut slab_content = vec![0u8; 0x1000];
             // Slab content at offset 0x500 matches the child bytes (raw coherence).
             slab_content[0x500..0x508].copy_from_slice(&[0xAAu8; 8]);
@@ -4540,7 +4537,7 @@ mod tests {
         ];
         let assigned =
             assign_synthetic_logical_addresses(&requests, &[(SLAB_BASE, 0x36f3d30u64)]).unwrap();
-        let mut materialized = materialize_synthetic_regions(&requests, &assigned);
+        let mut materialized = materialize_synthetic_regions(&assigned).unwrap();
         let mut globals = vec![view_a, view_b];
         globals.append(&mut materialized);
         let plan = build_plan(&[], &globals, Some(&slab)).unwrap().unwrap();
@@ -4575,20 +4572,20 @@ mod tests {
         let assigned = assign_synthetic_logical_addresses(&requests, &avoid).unwrap();
         let class_base = assigned
             .iter()
-            .find(|a| a.synthetic_id == "gto.window_class")
+            .find(|a| a.id() == "gto.window_class")
             .unwrap()
-            .assigned_logical_old_base;
+            .old_base();
         let title_base = assigned
             .iter()
-            .find(|a| a.synthetic_id == "gto.window_title")
+            .find(|a| a.id() == "gto.window_title")
             .unwrap()
-            .assigned_logical_old_base;
+            .old_base();
         // gscript image-inline region with +0xbd0/+0xbd8 holding the assigned bases.
         let mut gscript = vec![0u8; 0xbd8 + 16];
         gscript[0xbd8..0xbd8 + 8].copy_from_slice(&class_base.to_le_bytes());
         gscript[0xbd0..0xbd0 + 8].copy_from_slice(&title_base.to_le_bytes());
         let gscript_global = global(0x149d50, 0x1400_0000_0 + 0x149d50, gscript, true);
-        let mut materialized = materialize_synthetic_regions(&requests, &assigned);
+        let mut materialized = materialize_synthetic_regions(&assigned).unwrap();
         let mut globals = vec![gscript_global];
         globals.append(&mut materialized);
         let slab = HeapSlab {

@@ -2298,14 +2298,51 @@ pub struct SyntheticPointerAnchor {
 }
 
 /// A deterministic, collision-free assignment of a synthetic logical base.
+///
+/// GTO R0-F.2.1: carries the `request_digest` (canonical identity of the bound
+/// request) and the real rewrite/materialization evidence, so a downstream
+/// consumer can verify a full identity-closed loop without re-pairing by
+/// position.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyntheticAssignment {
     /// Stable identity (matches the request's `synthetic_id`).
     pub synthetic_id: String,
+    /// Canonical identity digest of the bound request (see
+    /// [`synthetic_request_digest`]). Binds synthetic_id, transform_id,
+    /// source_anchor, payload/construction digest, alignment, and anchors.
+    pub request_digest: String,
     /// The assigned logical old base (from the allocator, not a hardcode).
     pub assigned_logical_old_base: u64,
     /// Alignment the base honours.
     pub assignment_alignment: usize,
+    /// Number of anchor pointer slots actually rewritten + read-back verified.
+    pub rewritten_anchor_count: usize,
+    /// Whether the region was materialized into a `HeapGlobalSnapshot`.
+    pub materialized: bool,
+}
+
+/// A request and its assignment, bound by identity (GTO R0-F.2.1).
+///
+/// The allocator returns these already-bound objects so a caller never has to
+/// re-pair `request` and `assignment` by position or by re-searching — which was
+/// the root cause of the class/title swap in the R0-F.2 production zip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundSyntheticAssignment {
+    /// The source request (its `synthetic_id` matches `assignment.synthetic_id`).
+    pub request: SyntheticRegionRequest,
+    /// The assignment bound to this request.
+    pub assignment: SyntheticAssignment,
+}
+
+impl BoundSyntheticAssignment {
+    /// Convenience accessor: the bound synthetic id.
+    pub fn id(&self) -> &str {
+        &self.assignment.synthetic_id
+    }
+    /// Convenience accessor: the assigned logical old base.
+    pub fn old_base(&self) -> u64 {
+        self.assignment.assigned_logical_old_base
+    }
 }
 
 /// Errors from deterministic synthetic logical-address assignment (GTO R0-F.2).
@@ -2341,6 +2378,13 @@ pub enum SyntheticAssignError {
         assigned_base: u64,
         assigned_size: usize,
     },
+    /// The request <-> assignment identity mapping is inconsistent (GTO R0-F.2.1).
+    SyntheticAssignmentIdentityMismatch(String),
+    /// Materialization failed / would return a partial set (GTO R0-F.2.1).
+    MaterializationFailed(String),
+    /// The assigned base does not satisfy the requested alignment (checked
+    /// alignment overflow or mis-alignment).
+    AlignmentOverflow { synthetic_id: String },
 }
 
 impl std::fmt::Display for SyntheticAssignError {
@@ -2386,6 +2430,18 @@ impl std::fmt::Display for SyntheticAssignError {
                 "synthetic '{synthetic_id}' assigned [{assigned_base:#x},+{assigned_size:#x}) \
                  collides with an authority range"
             ),
+            SyntheticAssignError::SyntheticAssignmentIdentityMismatch(m) => {
+                write!(f, "synthetic assignment identity mismatch: {m}")
+            }
+            SyntheticAssignError::MaterializationFailed(m) => {
+                write!(f, "synthetic materialization failed: {m}")
+            }
+            SyntheticAssignError::AlignmentOverflow { synthetic_id } => {
+                write!(
+                    f,
+                    "synthetic '{synthetic_id}' assigned base alignment overflowed (near u64::MAX)"
+                )
+            }
         }
     }
 }
@@ -2409,6 +2465,48 @@ pub fn sha256_hex_pub(data: &[u8]) -> String {
     sha256_hex(data)
 }
 
+/// Canonical, domain-separated, length-prefixed identity digest of a synthetic
+/// region request (GTO R0-F.2.1).
+///
+/// Binds `synthetic_id`, `transform_id`, `source_anchor`, the payload bytes,
+/// the construction digest, the alignment, and the pointer anchors (in a
+/// deterministic order). Any change to any identity-bearing field changes the
+/// digest, so an assignment's `request_digest` is a trustworthy binding to its
+/// exact request.
+pub fn synthetic_request_digest(req: &SyntheticRegionRequest) -> String {
+    let mut enc: Vec<u8> = Vec::new();
+    // Domain separation: a fixed marker distinguishes this encoding from any
+    // other digest input.
+    enc.extend_from_slice(b"mida.synthetic-request/v1\0");
+    let mut put_str = |s: &str, enc: &mut Vec<u8>| {
+        enc.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        enc.extend_from_slice(s.as_bytes());
+    };
+    put_str(&req.synthetic_id, &mut enc);
+    put_str(&req.transform_id, &mut enc);
+    put_str(&req.source_anchor, &mut enc);
+    enc.extend_from_slice(&(req.payload.len() as u64).to_le_bytes());
+    enc.extend_from_slice(&req.payload);
+    put_str(&req.construction_digest, &mut enc);
+    enc.extend_from_slice(&(req.alignment as u64).to_le_bytes());
+    // Pointer anchors in deterministic (region_old_base, slot_offset) order.
+    let mut anchors = req.pointer_slots.clone();
+    anchors.sort_by_key(|a| (a.region_old_base, a.slot_offset));
+    enc.extend_from_slice(&(anchors.len() as u64).to_le_bytes());
+    for a in &anchors {
+        enc.extend_from_slice(&a.region_old_base.to_le_bytes());
+        enc.extend_from_slice(&(a.slot_offset as u64).to_le_bytes());
+    }
+    sha256_hex(&enc)
+}
+
+/// Checked alignment-up that returns `None` when `v + (alignment-1)` overflows.
+fn checked_align_up_u64(v: u64, alignment: u64) -> Option<u64> {
+    let mask = alignment.checked_sub(1)?;
+    let bumped = v.checked_add(mask)?;
+    Some(bumped & !mask)
+}
+
 /// Deterministically assign collision-free synthetic logical addresses to a
 /// set of synthetic region requests, avoiding every authority range.
 ///
@@ -2426,18 +2524,31 @@ pub fn sha256_hex_pub(data: &[u8]) -> String {
 /// Requests are assigned in a stable sort order by
 /// `(transform_id, source_anchor, construction_digest, synthetic_id)`, and the
 /// allocator scans addresses upward from a fixed floor. Identical input yields
-/// identical assignments regardless of request order.
+/// identical assignments regardless of request order. The returned
+/// [`BoundSyntheticAssignment`]s are **bound by identity** (`synthetic_id`), so
+/// the caller never re-pairs request and assignment by position.
 ///
 /// # Fail-closed
 ///
 /// Any invalid request, empty payload, bad alignment, out-of-bounds /
-/// mis-aligned anchor slot, construction-digest mismatch, authority collision,
-/// range-end overflow, or exhausted logical space returns an error. There is no
-/// fallback to a hardcoded address.
+/// mis-aligned anchor slot, construction-digest mismatch, duplicate request or
+/// assignment id, missing/extra binding, authority collision, range-end
+/// overflow, checked-alignment overflow near `u64::MAX`, or exhausted logical
+/// space returns an error. There is no fallback to a hardcoded address.
 pub fn assign_synthetic_logical_addresses(
     requests: &[SyntheticRegionRequest],
     avoid_ranges: &[(u64, u64)],
-) -> Result<Vec<SyntheticAssignment>, SyntheticAssignError> {
+) -> Result<Vec<BoundSyntheticAssignment>, SyntheticAssignError> {
+    // GTO R0-F.2.1: request ids must be unique (identity mapping is 1:1).
+    let mut req_ids: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for r in requests {
+        if !req_ids.insert(&r.synthetic_id) {
+            return Err(SyntheticAssignError::SyntheticAssignmentIdentityMismatch(
+                format!("duplicate request synthetic_id '{}'", r.synthetic_id),
+            ));
+        }
+    }
+
     // Merge + sort authority ranges into a disjoint, sorted list.
     let mut ranges: Vec<(u64, u64)> = avoid_ranges
         .iter()
@@ -2475,7 +2586,7 @@ pub fn assign_synthetic_logical_addresses(
         )
     });
 
-    let mut assignments: Vec<SyntheticAssignment> = Vec::new();
+    let mut assignments: Vec<BoundSyntheticAssignment> = Vec::new();
     // Already-assigned synthetic ranges (start, end) so two synthetics never overlap.
     let mut synthetic_ranges: Vec<(u64, u64)> = Vec::new();
 
@@ -2520,9 +2631,14 @@ pub fn assign_synthetic_logical_addresses(
         // intersects no authority range and no previously-assigned synthetic.
         // The scan JUMPS past each collision (to the aligned end of the
         // colliding range) so it terminates in O(number of ranges), never by
-        // stepping through the whole address space.
+        // stepping through the whole address space. All alignment uses the
+        // CHECKED variant so a near-u64::MAX authority range fails closed rather
+        // than panicking/wrapping.
         let floor = SYNTHETIC_FLOOR;
-        let mut candidate = align_up_u64(floor.max(alignment as u64), alignment as u64);
+        let mut candidate = checked_align_up_u64(floor.max(alignment as u64), alignment as u64)
+            .ok_or_else(|| SyntheticAssignError::AlignmentOverflow {
+                synthetic_id: req.synthetic_id.clone(),
+            })?;
         let base = loop {
             let Some(end) = candidate.checked_add(padded_size as u64) else {
                 return Err(SyntheticAssignError::NoAvailableRange {
@@ -2541,35 +2657,49 @@ pub fn assign_synthetic_logical_addresses(
                 });
             match collide_end {
                 Some(ce) => {
-                    // Jump to just past the colliding range, aligned up.
-                    let Some(next) = ce.checked_add(alignment as u64 - 1) else {
-                        return Err(SyntheticAssignError::NoAvailableRange {
+                    // Jump to just past the colliding range, aligned up (checked).
+                    let next = checked_align_up_u64(ce, alignment as u64).ok_or_else(|| {
+                        SyntheticAssignError::AlignmentOverflow {
                             synthetic_id: req.synthetic_id.clone(),
-                        });
-                    };
-                    candidate = align_up_u64(next, alignment as u64);
+                        }
+                    })?;
+                    candidate = next;
                 }
                 None => break candidate,
             }
         };
-        synthetic_ranges.push((base, base + padded_size as u64));
-        assignments.push(SyntheticAssignment {
-            synthetic_id: req.synthetic_id.clone(),
-            assigned_logical_old_base: base,
-            assignment_alignment: alignment,
+        let assigned_end = base.checked_add(padded_size as u64).ok_or_else(|| {
+            SyntheticAssignError::NoAvailableRange {
+                synthetic_id: req.synthetic_id.clone(),
+            }
+        })?;
+        synthetic_ranges.push((base, assigned_end));
+        assignments.push(BoundSyntheticAssignment {
+            request: (*req).clone(),
+            assignment: SyntheticAssignment {
+                synthetic_id: req.synthetic_id.clone(),
+                request_digest: synthetic_request_digest(req),
+                assigned_logical_old_base: base,
+                assignment_alignment: alignment,
+                rewritten_anchor_count: 0,
+                materialized: false,
+            },
         });
     }
+
+    // GTO R0-F.2.1: the returned bound set must be exactly 1:1 (every request
+    // bound, every assignment bound, ids unique, digests consistent). This is
+    // guaranteed by construction, but the explicit check makes a future
+    // refactor fail closed rather than silently pair-by-position.
+    validate_bound_assignments(&assignments)?;
 
     // Final defense-in-depth: re-verify every assigned range is collision-free
     // against the authority ranges and pairwise-disjoint against every other
     // assigned range. The forward scan already guarantees this; the explicit
     // check makes a future refactor fail closed rather than silently overlap.
-    for (i, a) in assignments.iter().enumerate() {
-        let size = requests
-            .iter()
-            .find(|r| r.synthetic_id == a.synthetic_id)
-            .map(|r| r.payload.len())
-            .unwrap_or(0);
+    for (i, b) in assignments.iter().enumerate() {
+        let a = &b.assignment;
+        let size = b.request.payload.len();
         let padded = (size + (a.assignment_alignment - 1)) & !(a.assignment_alignment - 1);
         let end = a
             .assigned_logical_old_base
@@ -2586,21 +2716,20 @@ pub fn assign_synthetic_logical_addresses(
                 });
             }
         }
-        for (j, b) in assignments.iter().enumerate() {
+        for (j, bb) in assignments.iter().enumerate() {
             if i == j {
                 continue;
             }
-            let b_size = requests
-                .iter()
-                .find(|r| r.synthetic_id == b.synthetic_id)
-                .map(|r| r.payload.len())
-                .unwrap_or(0);
-            let b_padded = (b_size + (b.assignment_alignment - 1)) & !(b.assignment_alignment - 1);
-            let b_end = b
+            let b_size = bb.request.payload.len();
+            let b_padded = (b_size + (bb.assignment.assignment_alignment - 1))
+                & !(bb.assignment.assignment_alignment - 1);
+            let b_end = bb
+                .assignment
                 .assigned_logical_old_base
                 .checked_add(b_padded as u64)
                 .unwrap_or(u64::MAX);
-            if a.assigned_logical_old_base < b_end && b.assigned_logical_old_base < end {
+            if a.assigned_logical_old_base < b_end && bb.assignment.assigned_logical_old_base < end
+            {
                 return Err(SyntheticAssignError::AuthorityCollision {
                     synthetic_id: a.synthetic_id.clone(),
                     assigned_base: a.assigned_logical_old_base,
@@ -2614,16 +2743,58 @@ pub fn assign_synthetic_logical_addresses(
     Ok(assignments)
 }
 
+/// Verify that a bound-assignment set is exactly 1:1 by identity (GTO R0-F.2.1).
+///
+/// Enforces: assignment ids all unique; each assignment's `request_digest`
+/// matches its bound request's canonical digest; each request's transform_id /
+/// source_anchor / construction_digest are consistent with its assignment. Fails
+/// closed with [`SyntheticAssignError::SyntheticAssignmentIdentityMismatch`] on
+/// any inconsistency. Duplicate ids, missing/extra bindings, and digest
+/// mismatches are all rejected — never first/last match, never silent ignore,
+/// never position-based binding.
+pub fn validate_bound_assignments(
+    bound: &[BoundSyntheticAssignment],
+) -> Result<(), SyntheticAssignError> {
+    let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for b in bound {
+        if b.request.synthetic_id != b.assignment.synthetic_id {
+            return Err(SyntheticAssignError::SyntheticAssignmentIdentityMismatch(
+                format!(
+                    "request id '{}' != assignment id '{}'",
+                    b.request.synthetic_id, b.assignment.synthetic_id
+                ),
+            ));
+        }
+        if !seen.insert(&b.request.synthetic_id) {
+            return Err(SyntheticAssignError::SyntheticAssignmentIdentityMismatch(
+                format!("duplicate bound synthetic_id '{}'", b.request.synthetic_id),
+            ));
+        }
+        let expect_digest = synthetic_request_digest(&b.request);
+        if b.assignment.request_digest != expect_digest {
+            return Err(SyntheticAssignError::SyntheticAssignmentIdentityMismatch(
+                format!(
+                    "assignment '{}' request_digest mismatch (expected {expect_digest}, got {})",
+                    b.request.synthetic_id, b.assignment.request_digest
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn align_up_u64(v: u64, alignment: u64) -> u64 {
     (v + (alignment - 1)) & !(alignment - 1)
 }
 
-/// Validate anchor pointer slots and rewrite each one inside the given region
-/// payload to point at `assigned_base`. Returns the number of slots rewritten.
+/// Rewrite anchor pointer slots to point at `assigned_base`, then read each
+/// slot back and verify it equals the assigned base. Returns the number of
+/// slots rewritten AND read-back verified (GTO R0-F.2.1).
 ///
 /// `regions` is `&mut [(old_base, &mut Vec<u8>)]` so the anchor's owning region
-/// payload can be patched in place. Fails closed on out-of-bounds or
-/// non-8-aligned slots (GTO R0-F.2).
+/// payload can be patched in place. Fails closed on out-of-bounds, non-8-aligned
+/// slots, or a read-back mismatch (never returns `Ok` without proof the slot was
+/// actually written).
 pub fn rewrite_synthetic_anchor_slots(
     regions: &mut [(u64, &mut Vec<u8>)],
     anchors: &[SyntheticPointerAnchor],
@@ -2663,36 +2834,63 @@ pub fn rewrite_synthetic_anchor_slots(
             });
         }
         payload[anchor.slot_offset..end].copy_from_slice(&assigned_base.to_le_bytes());
+        // Read-back verification: the slot must now hold the assigned base.
+        let read = u64::from_le_bytes(
+            payload[anchor.slot_offset..end]
+                .try_into()
+                .unwrap_or([0; 8]),
+        );
+        if read != assigned_base {
+            return Err(SyntheticAssignError::SyntheticAssignmentIdentityMismatch(
+                format!(
+                    "anchor {:#x}@{:#x} read-back {read:#x} != assigned base {assigned_base:#x}",
+                    anchor.region_old_base, anchor.slot_offset
+                ),
+            ));
+        }
         rewritten += 1;
     }
     Ok(rewritten)
 }
 
-/// Materialize assigned synthetic regions into `HeapGlobalSnapshot`s carrying
-/// full SyntheticDerived provenance + SyntheticDerived extent classification,
-/// so the production planner routes them as independent synthetic allocations
-/// (never absorbed into the raw slab). GTO R0-F.2.
+/// Materialize bound synthetic regions into `HeapGlobalSnapshot`s carrying full
+/// SyntheticDerived provenance + SyntheticDerived extent classification, so the
+/// production planner routes them as independent synthetic allocations (never
+/// absorbed into the raw slab). GTO R0-F.2.
 ///
-/// `assigned` must be in the same deterministic order as `requests` (matching
-/// by `synthetic_id`). Returns the materialized snapshots.
+/// GTO R0-F.2.1: takes `&[BoundSyntheticAssignment]` (already identity-bound by
+/// the allocator) and returns a `Result`. It NEVER silently skips a missing
+/// binding: any mismatch, duplicate id, request-digest inconsistency,
+/// construction-digest inconsistency, or inconsistency between the assigned
+/// base and the materialized snapshot's `live_ptr` / provenance / extent fails
+/// closed. No partial materialization is ever returned.
 pub fn materialize_synthetic_regions(
-    requests: &[SyntheticRegionRequest],
-    assigned: &[SyntheticAssignment],
-) -> Vec<HeapGlobalSnapshot> {
-    let mut out = Vec::with_capacity(assigned.len());
-    for a in assigned {
-        let Some(req) = requests.iter().find(|r| r.synthetic_id == a.synthetic_id) else {
-            continue;
-        };
-        out.push(HeapGlobalSnapshot {
+    bound: &[BoundSyntheticAssignment],
+) -> Result<Vec<HeapGlobalSnapshot>, SyntheticAssignError> {
+    // Enforce exactly 1:1 identity binding (duplicate ids, digest mismatch, etc.).
+    validate_bound_assignments(bound)?;
+
+    let mut out: Vec<HeapGlobalSnapshot> = Vec::with_capacity(bound.len());
+    for b in bound {
+        let req = &b.request;
+        let assignment = &b.assignment;
+        // Construction digest of the payload must match the request's record.
+        if sha256_hex(&req.payload) != req.construction_digest {
+            return Err(SyntheticAssignError::ConstructionDigestMismatch {
+                synthetic_id: req.synthetic_id.clone(),
+                expected: req.construction_digest.clone(),
+                actual: sha256_hex(&req.payload),
+            });
+        }
+        let snap = HeapGlobalSnapshot {
             rva: 0,
-            live_ptr: a.assigned_logical_old_base,
+            live_ptr: assignment.assigned_logical_old_base,
             content: req.payload.clone(),
             is_heap_handle: false,
             is_image_inline: false,
             extent_kind: CaptureExtentKind::SyntheticDerived,
             extent_evidence: CaptureExtentEvidence {
-                capture_id: a.synthetic_id.clone(),
+                capture_id: req.synthetic_id.clone(),
                 capture_path: CapturePath::Synthetic,
                 source_root_rva: None,
                 source_slot_offset: None,
@@ -2707,9 +2905,32 @@ pub fn materialize_synthetic_regions(
                 source_anchor: req.source_anchor.clone(),
                 construction_digest: req.construction_digest.clone(),
             },
-        });
+        };
+        // The materialized snapshot's live_ptr must equal the assigned base, and
+        // its extent must be SyntheticDerived (the production plan derives
+        // ownership=SyntheticAllocation from this). Any inconsistency fails.
+        if snap.live_ptr != assignment.assigned_logical_old_base {
+            return Err(SyntheticAssignError::MaterializationFailed(format!(
+                "synthetic '{}' snapshot live_ptr {:#x} != assigned base {:#x}",
+                req.synthetic_id, snap.live_ptr, assignment.assigned_logical_old_base
+            )));
+        }
+        if snap.extent_kind != CaptureExtentKind::SyntheticDerived {
+            return Err(SyntheticAssignError::MaterializationFailed(format!(
+                "synthetic '{}' materialized extent {:?} != SyntheticDerived",
+                req.synthetic_id, snap.extent_kind
+            )));
+        }
+        out.push(snap);
     }
-    out
+    if out.len() != bound.len() {
+        return Err(SyntheticAssignError::MaterializationFailed(format!(
+            "materialized {} != bound {} (partial materialization not returned)",
+            out.len(),
+            bound.len()
+        )));
+    }
+    Ok(out)
 }
 
 pub fn mark_labels_non_nested(heap_globals: &mut [HeapGlobalSnapshot]) {
@@ -6184,7 +6405,7 @@ mod tests {
         let req = r0f2_req("gto.window_class", b"NewClassName\0", 0xbd8);
         let avoid = vec![(0x14f000u64, 0x36f3d30u64)];
         let assigned = assign_synthetic_logical_addresses(&[req], &avoid).unwrap();
-        let base = assigned[0].assigned_logical_old_base;
+        let base = assigned[0].old_base();
         assert!(!(base >= 0x14f000 && base < 0x36f3d30));
     }
 
@@ -6197,7 +6418,7 @@ mod tests {
             (0x7ff0_0000_0000u64, 0x7ff0_0001_0000u64), // module
         ];
         let assigned = assign_synthetic_logical_addresses(&[req], &avoid).unwrap();
-        let base = assigned[0].assigned_logical_old_base;
+        let base = assigned[0].old_base();
         assert!(!(base >= 0x140_0000_0 && base < 0x141_0000_0));
         assert!(!(base >= 0x7ff0_0000_0000 && base < 0x7ff0_0001_0000));
     }
@@ -6216,10 +6437,7 @@ mod tests {
             &avoid,
         )
         .unwrap();
-        assert_eq!(
-            a[0].assigned_logical_old_base,
-            b[0].assigned_logical_old_base
-        );
+        assert_eq!(a[0].old_base(), b[0].old_base());
     }
 
     /// Reordering requests gives the same assignments (deterministic sort).
@@ -6233,23 +6451,23 @@ mod tests {
         let ba = assign_synthetic_logical_addresses(&[r_title, r_class], &avoid).unwrap();
         assert_eq!(
             ab.iter()
-                .find(|a| a.synthetic_id == "gto.window_class")
+                .find(|a| a.id() == "gto.window_class")
                 .unwrap()
-                .assigned_logical_old_base,
+                .old_base(),
             ba.iter()
-                .find(|a| a.synthetic_id == "gto.window_class")
+                .find(|a| a.id() == "gto.window_class")
                 .unwrap()
-                .assigned_logical_old_base
+                .old_base()
         );
         assert_eq!(
             ab.iter()
-                .find(|a| a.synthetic_id == "gto.window_title")
+                .find(|a| a.id() == "gto.window_title")
                 .unwrap()
-                .assigned_logical_old_base,
+                .old_base(),
             ba.iter()
-                .find(|a| a.synthetic_id == "gto.window_title")
+                .find(|a| a.id() == "gto.window_title")
                 .unwrap()
-                .assigned_logical_old_base
+                .old_base()
         );
     }
 
@@ -6266,10 +6484,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(assigned.len(), 2);
-        let (b0, b1) = (
-            assigned[0].assigned_logical_old_base,
-            assigned[1].assigned_logical_old_base,
-        );
+        let (b0, b1) = (assigned[0].old_base(), assigned[1].old_base());
         assert_ne!(b0, b1);
         // Both 16-aligned and non-overlapping (differ by >= 16).
         assert!(b0 % 16 == 0 && b1 % 16 == 0);
@@ -6309,14 +6524,14 @@ mod tests {
                 .unwrap();
         let class_base = assigned
             .iter()
-            .find(|a| a.synthetic_id == "gto.window_class")
+            .find(|a| a.id() == "gto.window_class")
             .unwrap()
-            .assigned_logical_old_base;
+            .old_base();
         let title_base = assigned
             .iter()
-            .find(|a| a.synthetic_id == "gto.window_title")
+            .find(|a| a.id() == "gto.window_title")
             .unwrap()
-            .assigned_logical_old_base;
+            .old_base();
         // gscript payload large enough for both slots.
         let mut gscript_payload = vec![0u8; 0xbd8 + 16];
         let base = 0x1400_0000_0 + 0x149d50;
@@ -6347,8 +6562,8 @@ mod tests {
         )
         .unwrap();
         for a in &assigned {
-            assert_ne!(a.assigned_logical_old_base, 0x200000);
-            assert_ne!(a.assigned_logical_old_base, 0x201000);
+            assert_ne!(a.old_base(), 0x200000);
+            assert_ne!(a.old_base(), 0x201000);
         }
     }
 
@@ -6358,7 +6573,7 @@ mod tests {
         let avoid = vec![(0x14f000u64, 0x36f3d30u64)];
         let req = r0f2_req("gto.window_class", b"NewClassName\0", 0xbd8);
         let assigned = assign_synthetic_logical_addresses(&[req.clone()], &avoid).unwrap();
-        let materialized = materialize_synthetic_regions(&[req], &assigned);
+        let materialized = materialize_synthetic_regions(&assigned).unwrap();
         assert_eq!(materialized.len(), 1);
         let g = &materialized[0];
         assert_eq!(g.extent_kind, CaptureExtentKind::SyntheticDerived);
@@ -6366,7 +6581,7 @@ mod tests {
             g.provenance,
             RegionProvenance::SyntheticDerived { .. }
         ));
-        assert_eq!(g.live_ptr, assigned[0].assigned_logical_old_base);
+        assert_eq!(g.live_ptr, assigned[0].old_base());
         assert!(!g.is_image_inline);
     }
 
@@ -6377,7 +6592,7 @@ mod tests {
         let avoid = vec![(0x14f000u64, 0x36f3d30u64)];
         let req = r0f2_req("gto.window_class", b"NewClassName\0", 0xbd8);
         let assigned = assign_synthetic_logical_addresses(&[req.clone()], &avoid).unwrap();
-        let materialized = materialize_synthetic_regions(&[req], &assigned);
+        let materialized = materialize_synthetic_regions(&assigned).unwrap();
         // Build a plan from the materialized synthetic snapshot and confirm the
         // region's ownership is SyntheticAllocation.
         let slab = HeapSlab {
@@ -6399,7 +6614,7 @@ mod tests {
         let synth = plan
             .regions
             .iter()
-            .find(|r| r.old_base == assigned[0].assigned_logical_old_base)
+            .find(|r| r.old_base == assigned[0].old_base())
             .expect("synthetic region present");
         assert_eq!(synth.ownership, RuntimeRegionOwnership::SyntheticAllocation);
         assert_eq!(synth.extent_kind, CaptureExtentKind::SyntheticDerived);
@@ -6411,7 +6626,7 @@ mod tests {
         let avoid = vec![(0x14f000u64, 0x36f3d30u64)];
         let req = r0f2_req("gto.window_class", b"NewClassName\0", 0xbd8);
         let assigned = assign_synthetic_logical_addresses(&[req.clone()], &avoid).unwrap();
-        let materialized = materialize_synthetic_regions(&[req], &assigned);
+        let materialized = materialize_synthetic_regions(&assigned).unwrap();
         // Slab plus one synthetic snapshot: both must be distinct backing regions.
         let slab = HeapSlab {
             old_base: 0x14f000,
@@ -6441,7 +6656,7 @@ mod tests {
         let avoid = vec![(0x14f000u64, 0x36f3d30u64)];
         let req = r0f2_req("gto.window_class", b"NewClassName\0", 0xbd8);
         let assigned = assign_synthetic_logical_addresses(&[req.clone()], &avoid).unwrap();
-        let class_base = assigned[0].assigned_logical_old_base;
+        let class_base = assigned[0].old_base();
         // gscript image-inline snapshot whose +0xbd8 slot holds the assigned base.
         let mut gscript = vec![0u8; 0xbd8 + 16];
         gscript[0xbd8..0xbd8 + 8].copy_from_slice(&class_base.to_le_bytes());
@@ -6456,7 +6671,7 @@ mod tests {
             transform_ids: Vec::new(),
             provenance: RegionProvenance::ImageInline,
         };
-        let materialized = materialize_synthetic_regions(&[req], &assigned);
+        let materialized = materialize_synthetic_regions(&assigned).unwrap();
         let mut all = materialized;
         all.push(gscript_global);
         let slab = HeapSlab {
@@ -6489,5 +6704,574 @@ mod tests {
             .expect("gscript+0xbd8 slot");
         assert_eq!(slot.target_region, Some(synth_region_id));
         assert_eq!(slot.target_offset, Some(0));
+    }
+
+    // =====================================================================
+    // GTO Core Recovery R0-F.2.1 — synthetic assignment identity binding
+    // =====================================================================
+
+    /// The production window-string requests: class (gscript+0xbd8) first,
+    /// title (gscript+0xbd0) second — the request creation order that exposes
+    /// the positional-zip bug.
+    fn r0f21_window_requests() -> (SyntheticRegionRequest, SyntheticRegionRequest) {
+        let class = SyntheticRegionRequest {
+            synthetic_id: "gto.window_class".to_string(),
+            transform_id: "repair_gscript_window_strings".to_string(),
+            source_anchor: "gscript+0xbd8 (RegisterClass lpszClassName)".to_string(),
+            payload: "NewClassName\0"
+                .encode_utf16()
+                .flat_map(|c| c.to_le_bytes())
+                .collect::<Vec<u8>>(),
+            construction_digest: sha256_hex_pub(
+                &"NewClassName\0"
+                    .encode_utf16()
+                    .flat_map(|c| c.to_le_bytes())
+                    .collect::<Vec<u8>>(),
+            ),
+            alignment: 0x10,
+            pointer_slots: vec![SyntheticPointerAnchor {
+                region_old_base: 0x1400_0000_0 + 0x149d50,
+                slot_offset: 0xbd8,
+            }],
+        };
+        let title = SyntheticRegionRequest {
+            synthetic_id: "gto.window_title".to_string(),
+            transform_id: "repair_gscript_window_strings".to_string(),
+            source_anchor: "gscript+0xbd0 (CreateWindow title)".to_string(),
+            payload: "ZhuChuangKou\0"
+                .encode_utf16()
+                .flat_map(|c| c.to_le_bytes())
+                .collect::<Vec<u8>>(),
+            construction_digest: sha256_hex_pub(
+                &"ZhuChuangKou\0"
+                    .encode_utf16()
+                    .flat_map(|c| c.to_le_bytes())
+                    .collect::<Vec<u8>>(),
+            ),
+            alignment: 0x10,
+            pointer_slots: vec![SyntheticPointerAnchor {
+                region_old_base: 0x1400_0000_0 + 0x149d50,
+                slot_offset: 0xbd0,
+            }],
+        };
+        (class, title)
+    }
+
+    /// The Route N avoid ranges used in production (small-tag, image, slab,
+    /// globals, containers, modules). For the tests a slab-span avoid is enough.
+    fn r0f21_avoid() -> Vec<(u64, u64)> {
+        vec![
+            (0, 0x1_0000),         // small-tag range
+            (0x14f000, 0x36f3d30), // raw slab span
+        ]
+    }
+
+    /// A production-like helper mirroring dump_process's synthetic path:
+    /// create requests → assign (identity-bound) → rewrite anchors (read-back)
+    /// → materialize (Result) → identity-closed-loop gate. Returns the bound
+    /// set, the rewritten gscript payload, and the materialized snapshots.
+    fn r0f21_production_flow(
+        requests: &[SyntheticRegionRequest],
+    ) -> Result<
+        (
+            Vec<BoundSyntheticAssignment>,
+            Vec<u8>,
+            Vec<HeapGlobalSnapshot>,
+        ),
+        SyntheticAssignError,
+    > {
+        let bound = assign_synthetic_logical_addresses(requests, &r0f21_avoid())?;
+        // gscript image-inline payload large enough for both slots.
+        let mut gscript_payload = vec![0u8; 0xbd8 + 16];
+        let gscript_base = bound
+            .first()
+            .and_then(|b| b.request.pointer_slots.first())
+            .map(|a| a.region_old_base)
+            .unwrap_or(0);
+        let mut regions: Vec<(u64, &mut Vec<u8>)> = vec![(gscript_base, &mut gscript_payload)];
+        for b in &bound {
+            let rewritten = rewrite_synthetic_anchor_slots(
+                &mut regions,
+                &b.request.pointer_slots,
+                b.assignment.assigned_logical_old_base,
+            )?;
+            if rewritten != b.request.pointer_slots.len() {
+                return Err(SyntheticAssignError::SyntheticAssignmentIdentityMismatch(
+                    format!(
+                        "rewrote {rewritten} != expected {}",
+                        b.request.pointer_slots.len()
+                    ),
+                ));
+            }
+        }
+        let materialized = materialize_synthetic_regions(&bound)?;
+        // Identity-closed-loop gate: every materialized snapshot live_ptr == its
+        // assignment base, and it carries SyntheticDerived provenance/extent.
+        for b in &bound {
+            let snap = materialized
+                .iter()
+                .find(|s| s.live_ptr == b.assignment.assigned_logical_old_base)
+                .ok_or_else(|| {
+                    SyntheticAssignError::MaterializationFailed(format!(
+                        "missing materialized snapshot for '{}'",
+                        b.assignment.synthetic_id
+                    ))
+                })?;
+            if snap.extent_kind != CaptureExtentKind::SyntheticDerived {
+                return Err(SyntheticAssignError::MaterializationFailed(format!(
+                    "extent {:?} != SyntheticDerived",
+                    snap.extent_kind
+                )));
+            }
+        }
+        Ok((bound, gscript_payload, materialized))
+    }
+
+    /// The allocator's returned order (sorted by source_anchor) differs from the
+    /// request creation order: title (gscript+0xbd0) sorts before class
+    /// (gscript+0xbd8), so assignment order is [title, class] while requests are
+    /// [class, title].
+    #[test]
+    fn r0f21_allocator_sort_differs_from_request_order() {
+        let (class, title) = r0f21_window_requests();
+        let bound = assign_synthetic_logical_addresses(&[class, title], &r0f21_avoid()).unwrap();
+        let ids: Vec<&str> = bound.iter().map(|b| b.id()).collect();
+        // Request creation order was [class, title]; allocator returns [title, class].
+        assert_eq!(ids, vec!["gto.window_title", "gto.window_class"]);
+    }
+
+    /// The bound assignment pairs by synthetic_id, not by position.
+    #[test]
+    fn r0f21_binding_by_id_not_position() {
+        let (class, title) = r0f21_window_requests();
+        let bound = assign_synthetic_logical_addresses(&[class, title], &r0f21_avoid()).unwrap();
+        // Each bound.request.synthetic_id == bound.assignment.synthetic_id.
+        for b in &bound {
+            assert_eq!(b.request.synthetic_id, b.assignment.synthetic_id);
+        }
+        // The class assignment is bound to the class request (correct payload).
+        let class_b = bound.iter().find(|b| b.id() == "gto.window_class").unwrap();
+        let payload = String::from_utf16(
+            &class_b
+                .request
+                .payload
+                .chunks(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert_eq!(payload, "NewClassName\0");
+    }
+
+    /// gscript+0xbd8 target corresponds to the class payload (NewClassName).
+    #[test]
+    fn r0f21_class_slot_points_to_class_payload() {
+        let (class, title) = r0f21_window_requests();
+        let (bound, gscript_payload, _) = r0f21_production_flow(&[class, title]).unwrap();
+        let class_base = bound
+            .iter()
+            .find(|b| b.id() == "gto.window_class")
+            .unwrap()
+            .old_base();
+        let slot = u64::from_le_bytes(gscript_payload[0xbd8..0xbd8 + 8].try_into().unwrap());
+        assert_eq!(slot, class_base);
+        // And class_base corresponds to the class request's payload region.
+        let class_payload = String::from_utf16(
+            &bound
+                .iter()
+                .find(|b| b.id() == "gto.window_class")
+                .unwrap()
+                .request
+                .payload
+                .chunks(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert_eq!(class_payload, "NewClassName\0");
+    }
+
+    /// gscript+0xbd0 target corresponds to the title payload (ZhuChuangKou).
+    #[test]
+    fn r0f21_title_slot_points_to_title_payload() {
+        let (class, title) = r0f21_window_requests();
+        let (bound, gscript_payload, _) = r0f21_production_flow(&[class, title]).unwrap();
+        let title_base = bound
+            .iter()
+            .find(|b| b.id() == "gto.window_title")
+            .unwrap()
+            .old_base();
+        let slot = u64::from_le_bytes(gscript_payload[0xbd0..0xbd0 + 8].try_into().unwrap());
+        assert_eq!(slot, title_base);
+        let title_payload = String::from_utf16(
+            &bound
+                .iter()
+                .find(|b| b.id() == "gto.window_title")
+                .unwrap()
+                .request
+                .payload
+                .chunks(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert_eq!(title_payload, "ZhuChuangKou\0");
+    }
+
+    /// Reversed request order yields the same identity-bound result.
+    #[test]
+    fn r0f21_reversed_request_order_same_result() {
+        let (class, title) = r0f21_window_requests();
+        let a = assign_synthetic_logical_addresses(&[class.clone(), title.clone()], &r0f21_avoid())
+            .unwrap();
+        let b = assign_synthetic_logical_addresses(&[title, class], &r0f21_avoid()).unwrap();
+        for id in ["gto.window_class", "gto.window_title"] {
+            let ba = a.iter().find(|x| x.id() == id).unwrap();
+            let bb = b.iter().find(|x| x.id() == id).unwrap();
+            assert_eq!(ba.old_base(), bb.old_base());
+            assert_eq!(ba.assignment.request_digest, bb.assignment.request_digest);
+        }
+    }
+
+    /// Reversed assignment order (the production result is a Vec; reassigning
+    /// its order) yields the same per-id binding. The allocator itself returns a
+    /// fixed order, so this proves identity, not order, drives the pairing.
+    #[test]
+    fn r0f21_reversed_assignment_order_same_result() {
+        let (class, title) = r0f21_window_requests();
+        let bound = assign_synthetic_logical_addresses(&[class, title], &r0f21_avoid()).unwrap();
+        let mut reversed = bound.clone();
+        reversed.reverse();
+        // Each bound pair still carries its own request+assignment; reversing
+        // the Vec must not change the materialized payload-to-base mapping.
+        let m1 = materialize_synthetic_regions(&bound).unwrap();
+        let m2 = materialize_synthetic_regions(&reversed).unwrap();
+        // The materialized SET must be identical (compare by live_ptr, order-agnostic).
+        let mut by_base1: Vec<u64> = m1.iter().map(|s| s.live_ptr).collect();
+        let mut by_base2: Vec<u64> = m2.iter().map(|s| s.live_ptr).collect();
+        by_base1.sort_unstable();
+        by_base2.sort_unstable();
+        assert_eq!(by_base1, by_base2);
+    }
+
+    /// Duplicate request synthetic_id fails closed.
+    #[test]
+    fn r0f21_duplicate_request_id_fails_closed() {
+        let (class, _) = r0f21_window_requests();
+        let dup = class.clone();
+        let res = assign_synthetic_logical_addresses(&[class, dup], &r0f21_avoid());
+        assert!(matches!(
+            res,
+            Err(SyntheticAssignError::SyntheticAssignmentIdentityMismatch(_))
+        ));
+    }
+
+    /// Duplicate assignment id fails closed (validate_bound_assignments rejects).
+    #[test]
+    fn r0f21_duplicate_assignment_id_fails_closed() {
+        let (class, _) = r0f21_window_requests();
+        let bound = assign_synthetic_logical_addresses(&[class], &r0f21_avoid()).unwrap();
+        // Duplicate the single bound pair to create a duplicate id set.
+        let mut dup = bound.clone();
+        dup.push(bound[0].clone());
+        let res = validate_bound_assignments(&dup);
+        assert!(matches!(
+            res,
+            Err(SyntheticAssignError::SyntheticAssignmentIdentityMismatch(_))
+        ));
+    }
+
+    /// A bound pair whose request id != assignment id fails closed.
+    #[test]
+    fn r0f21_missing_assignment_fails_closed() {
+        let (class, title) = r0f21_window_requests();
+        let bound = assign_synthetic_logical_addresses(&[class, title], &r0f21_avoid()).unwrap();
+        // Tamper: make one pair's assignment id not match its request id.
+        let mut bad = bound.clone();
+        bad[1].assignment.synthetic_id = "gto.does_not_exist".to_string();
+        let res = validate_bound_assignments(&bad);
+        assert!(matches!(
+            res,
+            Err(SyntheticAssignError::SyntheticAssignmentIdentityMismatch(_))
+        ));
+    }
+
+    /// An extra assignment (a bound pair referencing a request not in the set)
+    /// fails closed via duplicate/identity checks.
+    #[test]
+    fn r0f21_extra_assignment_fails_closed() {
+        let (class, title) = r0f21_window_requests();
+        let bound = assign_synthetic_logical_addresses(&[class, title], &r0f21_avoid()).unwrap();
+        // Add a pair with a synthetic id that has no matching request (clone an
+        // existing request but change its id in the assignment only is an
+        // identity mismatch, which validate_bound_assignments rejects).
+        let mut extra = bound.clone();
+        let mut cloned = extra[0].clone();
+        cloned.assignment.synthetic_id = "gto.extra".to_string();
+        extra.push(cloned);
+        let res = validate_bound_assignments(&extra);
+        assert!(matches!(
+            res,
+            Err(SyntheticAssignError::SyntheticAssignmentIdentityMismatch(_))
+        ));
+    }
+
+    /// A tampered request_digest fails closed.
+    #[test]
+    fn r0f21_request_digest_mismatch_fails_closed() {
+        let (class, _) = r0f21_window_requests();
+        let bound = assign_synthetic_logical_addresses(&[class], &r0f21_avoid()).unwrap();
+        let mut bad = bound.clone();
+        bad[0].assignment.request_digest = "tampered".to_string();
+        let res = validate_bound_assignments(&bad);
+        assert!(matches!(
+            res,
+            Err(SyntheticAssignError::SyntheticAssignmentIdentityMismatch(_))
+        ));
+    }
+
+    /// Materialization with a bound pair whose request is missing fails closed.
+    #[test]
+    fn r0f21_materialization_missing_request_fails_closed() {
+        let (class, title) = r0f21_window_requests();
+        let bound = assign_synthetic_logical_addresses(&[class, title], &r0f21_avoid()).unwrap();
+        // Give one pair an assignment id with no matching request -> the
+        // validate_bound_assignments inside materialize rejects it.
+        let mut bad = bound.clone();
+        bad[0].assignment.synthetic_id = "gto.missing".to_string();
+        let res = materialize_synthetic_regions(&bad);
+        assert!(matches!(
+            res,
+            Err(SyntheticAssignError::SyntheticAssignmentIdentityMismatch(_))
+        ));
+    }
+
+    /// Partial materialization is never returned: if one snapshot fails, the
+    /// whole call returns Err (no partial Vec).
+    #[test]
+    fn r0f21_partial_materialization_not_returned() {
+        let (class, title) = r0f21_window_requests();
+        let bound = assign_synthetic_logical_addresses(&[class, title], &r0f21_avoid()).unwrap();
+        // Corrupt one request's construction digest so its snapshot would
+        // differ; materialize must Err and never return a partial Vec.
+        let mut bad = bound.clone();
+        bad[0].request.construction_digest = "wrong".to_string();
+        let res = materialize_synthetic_regions(&bad);
+        assert!(res.is_err());
+    }
+
+    /// rewritten_anchor_count equals the number of anchor slots (exact).
+    #[test]
+    fn r0f21_rewritten_anchor_count_is_exact() {
+        let (class, title) = r0f21_window_requests();
+        let bound = assign_synthetic_logical_addresses(&[class, title], &r0f21_avoid()).unwrap();
+        let mut gscript_payload = vec![0u8; 0xbd8 + 16];
+        let gscript_base = bound[0].request.pointer_slots[0].region_old_base;
+        let mut regions: Vec<(u64, &mut Vec<u8>)> = vec![(gscript_base, &mut gscript_payload)];
+        for b in &bound {
+            let rewritten = rewrite_synthetic_anchor_slots(
+                &mut regions,
+                &b.request.pointer_slots,
+                b.old_base(),
+            )
+            .unwrap();
+            assert_eq!(rewritten, b.request.pointer_slots.len());
+            assert_eq!(rewritten, 1); // window class/title each have 1 anchor
+        }
+    }
+
+    /// Anchor slots are read-back verified (the slot value == assigned base).
+    #[test]
+    fn r0f21_anchor_slot_is_read_back_verified() {
+        let (class, title) = r0f21_window_requests();
+        let bound = assign_synthetic_logical_addresses(&[class, title], &r0f21_avoid()).unwrap();
+        let mut gscript_payload = vec![0u8; 0xbd8 + 16];
+        let gscript_base = bound[0].request.pointer_slots[0].region_old_base;
+        let mut regions: Vec<(u64, &mut Vec<u8>)> = vec![(gscript_base, &mut gscript_payload)];
+        for b in &bound {
+            rewrite_synthetic_anchor_slots(&mut regions, &b.request.pointer_slots, b.old_base())
+                .unwrap();
+        }
+        // Direct read-back: class slot == class base, title slot == title base.
+        let class_base = bound
+            .iter()
+            .find(|b| b.id() == "gto.window_class")
+            .unwrap()
+            .old_base();
+        let title_base = bound
+            .iter()
+            .find(|b| b.id() == "gto.window_title")
+            .unwrap()
+            .old_base();
+        assert_eq!(
+            u64::from_le_bytes(gscript_payload[0xbd8..0xbd8 + 8].try_into().unwrap()),
+            class_base
+        );
+        assert_eq!(
+            u64::from_le_bytes(gscript_payload[0xbd0..0xbd0 + 8].try_into().unwrap()),
+            title_base
+        );
+        // Cross-check: the two slots do NOT point to each other's base.
+        assert_ne!(
+            u64::from_le_bytes(gscript_payload[0xbd8..0xbd8 + 8].try_into().unwrap()),
+            title_base
+        );
+    }
+
+    /// Manifest: pointer_slot_rewritten (old inferred) is no longer used; the
+    /// ledger derives rewrite from real rewritten_anchor_count == expected.
+    #[test]
+    fn r0f21_manifest_does_not_infer_rewrite_from_nonempty_slots() {
+        // A request with a non-empty slot list but an assignment whose
+        // rewritten_anchor_count is 0 must NOT report anchor_rewrite_verified.
+        let payload = b"NewClassName\0".to_vec();
+        let req = SyntheticRegionRequest {
+            synthetic_id: "gto.window_class".to_string(),
+            transform_id: "t".to_string(),
+            source_anchor: "gscript+0xbd8".to_string(),
+            payload: payload.clone(),
+            construction_digest: sha256_hex_pub(&payload),
+            alignment: 0x10,
+            pointer_slots: vec![SyntheticPointerAnchor {
+                region_old_base: 0x140149d50,
+                slot_offset: 0xbd8,
+            }],
+        };
+        let assigned = vec![SyntheticAssignment {
+            synthetic_id: "gto.window_class".to_string(),
+            request_digest: synthetic_request_digest(&req),
+            assigned_logical_old_base: 0x36f3d30,
+            assignment_alignment: 0x10,
+            rewritten_anchor_count: 0, // NOT rewritten (real evidence)
+            materialized: false,
+        }];
+        let json = super::super::snapshot_manifest::render_manifest_json(
+            std::path::Path::new("cand.exe"),
+            super::super::types::DumpProfile::AhkGtoExperimental,
+            0x140000000,
+            0x70b0,
+            &[],
+            &[],
+            &super::super::capture_policy::DumpCapturePolicy::ahk_gto_default(),
+            None,
+            &[],
+            &[req],
+            &assigned,
+        )
+        .unwrap();
+        // The manifest must NOT claim the rewrite happened just because the
+        // request had non-empty slots.
+        assert!(json.contains("\"rewritten_anchor_count\": 0"));
+        assert!(json.contains("\"anchor_rewrite_verified\": false"));
+        assert!(json.contains("\"expected_anchor_count\": 1"));
+    }
+
+    /// Manifest records real rewrite + materialization evidence (v2).
+    #[test]
+    fn r0f21_manifest_records_real_rewrite_and_materialization() {
+        let (class, title) = r0f21_window_requests();
+        let (bound, _, materialized) = r0f21_production_flow(&[class, title]).unwrap();
+        let ledgers: Vec<SyntheticAssignment> = bound
+            .iter()
+            .map(|b| SyntheticAssignment {
+                synthetic_id: b.assignment.synthetic_id.clone(),
+                request_digest: b.assignment.request_digest.clone(),
+                assigned_logical_old_base: b.assignment.assigned_logical_old_base,
+                assignment_alignment: b.assignment.assignment_alignment,
+                rewritten_anchor_count: 1,
+                materialized: true,
+            })
+            .collect();
+        let reqs: Vec<SyntheticRegionRequest> = bound.iter().map(|b| b.request.clone()).collect();
+        let json = super::super::snapshot_manifest::render_manifest_json(
+            std::path::Path::new("cand.exe"),
+            super::super::types::DumpProfile::AhkGtoExperimental,
+            0x140000000,
+            0x70b0,
+            &[],
+            &materialized,
+            &super::super::capture_policy::DumpCapturePolicy::ahk_gto_default(),
+            None,
+            &[],
+            &reqs,
+            &ledgers,
+        )
+        .unwrap();
+        for id in ["gto.window_class", "gto.window_title"] {
+            assert!(json.contains(&format!("\"synthetic_id\": \"{id}\"")));
+            assert!(json.contains("\"rewritten_anchor_count\": 1"));
+            assert!(json.contains("\"materialized\": true"));
+            assert!(json.contains("\"anchor_rewrite_verified\": true"));
+        }
+    }
+
+    /// Algorithm version is 2 (identity-binding semantics).
+    #[test]
+    fn r0f21_algorithm_version_is_2() {
+        assert_eq!(
+            super::super::snapshot_manifest::synthetic_assignment_algorithm_version(),
+            2
+        );
+    }
+
+    /// Checked alignment near u64::MAX fails closed rather than panicking/wrapping.
+    #[test]
+    fn r0f21_checked_align_near_u64_max_fails_closed() {
+        // checked_align_up_u64 returns None on overflow.
+        assert_eq!(checked_align_up_u64(u64::MAX, 0x10), None);
+        // u64::MAX-15 is 16-aligned; +0xf stays in range -> Some.
+        assert_eq!(
+            checked_align_up_u64(u64::MAX - 15, 0x10),
+            Some(u64::MAX & !0xf)
+        );
+        // A request whose only free range would overflow alignment fails closed.
+        let payload = b"X".to_vec();
+        let req = SyntheticRegionRequest {
+            synthetic_id: "gto.high".to_string(),
+            transform_id: "t".to_string(),
+            source_anchor: "a".to_string(),
+            payload: payload.clone(),
+            construction_digest: sha256_hex_pub(&payload),
+            alignment: 0x10,
+            pointer_slots: vec![],
+        };
+        // Avoid everything from the floor upward; the jump to just-past a range
+        // near u64::MAX must fail closed (NoAvailableRange or AlignmentOverflow),
+        // never panic/wrap.
+        let res = assign_synthetic_logical_addresses(&[req], &[(0x1_0000, u64::MAX)]);
+        assert!(res.is_err());
+    }
+
+    /// Full end-to-end identity loop: request → assignment → rewritten anchor →
+    /// materialized snapshot all share synthetic_id / request_digest / base.
+    #[test]
+    fn r0f21_end_to_end_request_assignment_anchor_snapshot_identity() {
+        let (class, title) = r0f21_window_requests();
+        let (bound, gscript_payload, materialized) =
+            r0f21_production_flow(&[class, title]).unwrap();
+        assert_eq!(bound.len(), 2);
+        assert_eq!(materialized.len(), 2);
+        for b in &bound {
+            let id = b.id();
+            // The materialized snapshot for this id exists at the assigned base.
+            let snap = materialized
+                .iter()
+                .find(|s| s.live_ptr == b.old_base())
+                .expect("materialized snapshot for bound id");
+            // same synthetic_id / request_digest / construction digest / base.
+            assert_eq!(snap.extent_evidence.capture_id, id);
+            assert_eq!(snap.live_ptr, b.assignment.assigned_logical_old_base);
+            assert_eq!(snap.extent_kind, CaptureExtentKind::SyntheticDerived);
+            // The anchor slot in gscript points at this snapshot's base.
+            let slot_off = if id == "gto.window_class" {
+                0xbd8
+            } else {
+                0xbd0
+            };
+            assert_eq!(
+                u64::from_le_bytes(gscript_payload[slot_off..slot_off + 8].try_into().unwrap()),
+                b.old_base()
+            );
+        }
     }
 }

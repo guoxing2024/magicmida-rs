@@ -1048,12 +1048,17 @@ pub fn dump_process_with_report(
             &synthetic_requests,
             &avoid,
         ) {
-            Ok(assigned) => {
-                synthetic_assignment_ledger = assigned.clone();
-                // Rewrite the anchor pointer slots in the gscript region payload.
-                let gscript_base = synthetic_requests
+            Ok(bound) => {
+                // GTO R0-F.2.1: assignments are identity-bound (no positional zip).
+                // Rewrite + read-back verify each anchor, then materialize and
+                // gate a full identity-closed loop BEFORE overlay / planner.
+                let mut materialized = Vec::new();
+                // Track rewrite evidence for the manifest ledger.
+                let mut rewrite_counts: Vec<(String, usize)> = Vec::new();
+                // gscript anchor region base (from the first bound request's slot).
+                let gscript_base = bound
                     .first()
-                    .and_then(|r| r.pointer_slots.first())
+                    .and_then(|b| b.request.pointer_slots.first())
                     .map(|a| a.region_old_base);
                 if let Some(gscript_base) = gscript_base {
                     let mut anchor_regions: Vec<(u64, &mut Vec<u8>)> = heap_globals
@@ -1061,29 +1066,116 @@ pub fn dump_process_with_report(
                         .filter(|g| g.live_ptr == gscript_base)
                         .map(|g| (g.live_ptr, &mut g.content))
                         .collect();
-                    for (req, assign) in synthetic_requests.iter().zip(assigned.iter()) {
-                        super::heap_global_snapshot::rewrite_synthetic_anchor_slots(
-                            &mut anchor_regions,
-                            &req.pointer_slots,
-                            assign.assigned_logical_old_base,
-                        )
-                        .map_err(|e| PeError::GtoStage {
+                    if anchor_regions.is_empty() {
+                        return Err(PeError::GtoStage {
                             stage: "synthetic_anchor_rewrite".into(),
-                            error: format!("{e:#}"),
-                        })?;
+                            error: "gscript anchor region not present in heap_globals".into(),
+                        });
+                    }
+                    // Rewrite anchors bound by identity (each bound pair carries
+                    // its own request + assignment).
+                    for b in &bound {
+                        let rewritten =
+                            super::heap_global_snapshot::rewrite_synthetic_anchor_slots(
+                                &mut anchor_regions,
+                                &b.request.pointer_slots,
+                                b.assignment.assigned_logical_old_base,
+                            )
+                            .map_err(|e| PeError::GtoStage {
+                                stage: "synthetic_anchor_rewrite".into(),
+                                error: format!("{e:#}"),
+                            })?;
+                        let expected = b.request.pointer_slots.len();
+                        // GTO R0-F.2.1: every anchor must be rewritten AND
+                        // read-back verified (rewrite already verifies read-back).
+                        if rewritten != expected {
+                            return Err(PeError::GtoStage {
+                                stage: "synthetic_anchor_rewrite".into(),
+                                error: format!(
+                                    "synthetic '{}' rewrote {rewritten} anchors, expected {expected}",
+                                    b.assignment.synthetic_id
+                                ),
+                            });
+                        }
+                        rewrite_counts.push((b.assignment.synthetic_id.clone(), rewritten));
+                    }
+                } else {
+                    // No anchor region; record empty rewrite evidence per bound.
+                    for b in &bound {
+                        rewrite_counts.push((b.assignment.synthetic_id.clone(), 0));
                     }
                 }
-                // Materialize + push the synthetic snapshots into heap_globals.
-                let mut materialized = super::heap_global_snapshot::materialize_synthetic_regions(
-                    &synthetic_requests,
-                    &assigned,
-                );
+                // Materialize (identity-bound, Result-returning). No partial set.
+                materialized = super::heap_global_snapshot::materialize_synthetic_regions(&bound)
+                    .map_err(|e| PeError::GtoStage {
+                    stage: "synthetic_materialization".into(),
+                    error: format!("{e:#}"),
+                })?;
+                // Full identity-closed loop gate: each materialized snapshot's
+                // live_ptr must equal its bound assignment base and carry the
+                // correct provenance/extent. materialize_synthetic_regions already
+                // enforces this; the explicit gate makes the production invariant
+                // self-documenting before any overlay/planner step.
+                for b in &bound {
+                    let snap = materialized
+                        .iter()
+                        .find(|s| s.live_ptr == b.assignment.assigned_logical_old_base);
+                    match snap {
+                        Some(s) => {
+                            if s.extent_kind
+                                != super::heap_global_snapshot::CaptureExtentKind::SyntheticDerived
+                                || !matches!(
+                                    s.provenance,
+                                    super::heap_global_snapshot::RegionProvenance::SyntheticDerived { .. }
+                                )
+                            {
+                                return Err(PeError::GtoStage {
+                                    stage: "synthetic_identity_gate".into(),
+                                    error: format!(
+                                        "synthetic '{}' materialized snapshot provenance/extent inconsistent",
+                                        b.assignment.synthetic_id
+                                    ),
+                                });
+                            }
+                        }
+                        None => {
+                            return Err(PeError::GtoStage {
+                                stage: "synthetic_identity_gate".into(),
+                                error: format!(
+                                    "synthetic '{}' materialized snapshot missing at base {:#x}",
+                                    b.assignment.synthetic_id,
+                                    b.assignment.assigned_logical_old_base
+                                ),
+                            });
+                        }
+                    }
+                }
+                // Persist the manifest ledger (identity-bound assignments).
+                synthetic_assignment_ledger = bound
+                    .iter()
+                    .map(|b| {
+                        let rewritten = rewrite_counts
+                            .iter()
+                            .find(|(id, _)| *id == b.assignment.synthetic_id)
+                            .map(|(_, r)| *r)
+                            .unwrap_or(0);
+                        super::heap_global_snapshot::SyntheticAssignment {
+                            synthetic_id: b.assignment.synthetic_id.clone(),
+                            request_digest: b.assignment.request_digest.clone(),
+                            assigned_logical_old_base: b.assignment.assigned_logical_old_base,
+                            assignment_alignment: b.assignment.assignment_alignment,
+                            rewritten_anchor_count: rewritten,
+                            materialized: true,
+                        }
+                    })
+                    .collect();
                 heap_globals.append(&mut materialized);
-                for a in &assigned {
+                for b in &bound {
                     info!(
-                        synthetic_id = %a.synthetic_id,
-                        assigned_base = format_args!("{:#x}", a.assigned_logical_old_base),
-                        "Assigned collision-free synthetic logical base"
+                        synthetic_id = %b.assignment.synthetic_id,
+                        assigned_base = format_args!("{:#x}", b.assignment.assigned_logical_old_base),
+                        request_digest = %b.assignment.request_digest,
+                        "Assigned collision-free synthetic logical base (identity-bound)"
                     );
                 }
             }
