@@ -1004,7 +1004,118 @@ pub fn detect_heap_globals(
             "Detected heap-global slots requiring post-CRT restore"
         );
     }
+    // R0-E note: duplicate live_ptr reconciliation runs in dump_process AFTER
+    // the raw slab is captured, so raw-slab coherence can be used as the
+    // authoritative tiebreaker (the slab is the physical-memory ground truth).
     out
+}
+
+/// Reconcile duplicate raw snapshots of the same physical heap allocation.
+///
+/// R0-E: the same `live_ptr` can be admitted by several capture paths (main
+/// slot scan, gscript first-hop, child-link force-admit, string-buffer
+/// admission, dangling edges). All snapshots of one address describe the SAME
+/// physical heap object (a heap address is unique). Keeping two entries with
+/// the same old_base but differing bytes trips the overlay `OverlayConflict`.
+///
+/// Reconciliation rule (deterministic, not last-write-wins / first-pick):
+/// 1. Identical bytes → exact duplicate, keep one.
+/// 2. Differing bytes → the authoritative snapshot is the one whose RAW bytes
+///    match the raw slab slice at `[live_ptr - slab.old_base, ...)`, i.e. the
+///    capture coherent with the physical memory read. The raw slab is the
+///    ground truth captured from the debuggee.
+/// 3. If no duplicate matches the raw slab slice (both drifted), keep the
+///    larger snapshot (most complete read); on an exact size tie with differing
+///    bytes and neither raw-coherent, this is unresolvable capture drift and
+///    the duplicate is retained so the overlay fail-closes with provenance.
+///
+/// Must run on RAW snapshots (before transforms) so raw-coherence with the slab
+/// is meaningful.
+pub fn reconcile_duplicate_heap_globals(
+    out: &mut Vec<HeapGlobalSnapshot>,
+    raw_slab: Option<&HeapSlab>,
+) {
+    let mut by_base: std::collections::BTreeMap<u64, usize> = std::collections::BTreeMap::new();
+    let mut keep = Vec::with_capacity(out.len());
+    let mut dropped = 0usize;
+    let mut drift_retained = 0usize;
+    for g in out.iter() {
+        if g.is_heap_handle || g.content.is_empty() {
+            // Handle slots and empty placeholders are not coalesced by address.
+            keep.push(g.clone());
+            continue;
+        }
+        match by_base.get(&g.live_ptr) {
+            Some(&existing_idx) => {
+                let existing = keep[existing_idx].clone();
+                // Identical bytes → true redundant capture; keep one.
+                if existing.content == g.content
+                    && existing.is_heap_handle == g.is_heap_handle
+                    && existing.is_image_inline == g.is_image_inline
+                {
+                    dropped += 1;
+                    continue;
+                }
+                // Differing bytes: resolve by raw-slab coherence when available.
+                let existing_coh = raw_slab.and_then(|s| {
+                    let off = g.live_ptr.checked_sub(s.old_base)?;
+                    let off = usize::try_from(off).ok()?;
+                    let slice = s.content.get(off..off + existing.content.len())?;
+                    (slice == existing.content.as_slice()).then_some(true)
+                });
+                let g_coh = raw_slab.and_then(|s| {
+                    let off = g.live_ptr.checked_sub(s.old_base)?;
+                    let off = usize::try_from(off).ok()?;
+                    let slice = s.content.get(off..off + g.content.len())?;
+                    (slice == g.content.as_slice()).then_some(true)
+                });
+                match (existing_coh, g_coh) {
+                    (Some(true), _) => {
+                        // Existing entry is coherent with the slab → keep it.
+                        dropped += 1;
+                    }
+                    (_, Some(true)) => {
+                        // New entry is coherent with the slab → replace.
+                        keep[existing_idx] = g.clone();
+                        dropped += 1;
+                    }
+                    _ => {
+                        // Neither is provably coherent. Prefer the larger read;
+                        // on an exact tie keep the existing (deterministic) but
+                        // retain both if bytes differ and neither matches —
+                        // the overlay fail-closes with provenance rather than
+                        // silently choosing a conflicting snapshot.
+                        if g.content.len() > existing.content.len() {
+                            keep[existing_idx] = g.clone();
+                            dropped += 1;
+                        } else if g.content.len() == existing.content.len() {
+                            drift_retained += 1;
+                            // keep both so the overlay reports the conflict
+                            // with full provenance instead of silently picking.
+                            by_base.insert(g.live_ptr, keep.len());
+                            keep.push(g.clone());
+                        } else {
+                            dropped += 1;
+                        }
+                    }
+                }
+            }
+            None => {
+                by_base.insert(g.live_ptr, keep.len());
+                keep.push(g.clone());
+            }
+        }
+    }
+    if dropped > 0 || drift_retained > 0 {
+        info!(
+            before = out.len(),
+            after = keep.len(),
+            dropped,
+            drift_retained,
+            "R0-E: reconciled duplicate raw heap-global captures at the same live_ptr"
+        );
+    }
+    *out = keep;
 }
 
 /// Capture AHK `g_script` as an in-image object body.
@@ -5197,5 +5308,162 @@ mod tests {
             u64::from_le_bytes(gscript.content[0xbd0..0xbd0 + 8].try_into().unwrap()),
             0x201000
         );
+    }
+
+    // GTO Core Recovery R0-E: identical-bytes duplicate at the same live_ptr is
+    // a redundant capture and is reconciled to a single entry.
+    #[test]
+    fn r0e_identical_bytes_duplicate_deduped() {
+        let mut globals = vec![
+            HeapGlobalSnapshot {
+                rva: 0x146890,
+                live_ptr: 0x8d8d60,
+                content: vec![0x41u8; 0x400],
+                is_heap_handle: false,
+                is_image_inline: false,
+                provenance: RegionProvenance::default(),
+            },
+            HeapGlobalSnapshot {
+                rva: 0,
+                live_ptr: 0x8d8d60,
+                content: vec![0x41u8; 0x400],
+                is_heap_handle: false,
+                is_image_inline: false,
+                provenance: RegionProvenance::default(),
+            },
+        ];
+        reconcile_duplicate_heap_globals(&mut globals, None);
+        assert_eq!(globals.len(), 1);
+        assert_eq!(globals[0].live_ptr, 0x8d8d60);
+        assert_eq!(globals[0].content, vec![0x41u8; 0x400]);
+    }
+
+    // GTO Core Recovery R0-E: two entries at the same live_ptr with differing
+    // bytes are reconciled to the one coherent with the raw slab (physical
+    // memory ground truth). Reproduces the Route M R1 conflict geometry.
+    #[test]
+    fn r0e_differing_bytes_prefers_raw_slab_coherent() {
+        // Slab: [0x89f000, ...). The physical bytes at 0x8d8d60 (= offset
+        // 0x39d60 in the slab) are [0xBB; 0x400]. One capture is coherent with
+        // the slab; the other (stale/drifted) is not.
+        let slab_off = (0x8d8d60u64 - 0x89f000u64) as usize; // 0x39d60
+        let mut slab_content = vec![0u8; slab_off + 0x400];
+        for b in slab_content[slab_off..slab_off + 0x400].iter_mut() {
+            *b = 0xBB;
+        }
+        let slab = HeapSlab {
+            old_base: 0x89f000,
+            content: slab_content,
+        };
+        let mut globals = vec![
+            HeapGlobalSnapshot {
+                rva: 0,
+                live_ptr: 0x8d8d60,
+                content: vec![0xBBu8; 0x400], // coherent with slab
+                is_heap_handle: false,
+                is_image_inline: false,
+                provenance: RegionProvenance::default(),
+            },
+            HeapGlobalSnapshot {
+                rva: 0,
+                live_ptr: 0x8d8d60,
+                content: vec![0xAAu8; 0x400], // NOT coherent (drift)
+                is_heap_handle: false,
+                is_image_inline: false,
+                provenance: RegionProvenance::default(),
+            },
+        ];
+        reconcile_duplicate_heap_globals(&mut globals, Some(&slab));
+        assert_eq!(globals.len(), 1);
+        assert_eq!(globals[0].content, vec![0xBBu8; 0x400]);
+    }
+
+    // GTO Core Recovery R0-E: a duplicate whose raw bytes match the slab is
+    // preferred over a non-coherent one regardless of insertion order.
+    #[test]
+    fn r0e_coherent_wins_over_noncoherent_any_order() {
+        let slab_off = (0x8d8d60u64 - 0x89f000u64) as usize;
+        let mut slab_content = vec![0u8; slab_off + 0x20];
+        for b in slab_content[slab_off..slab_off + 0x20].iter_mut() {
+            *b = 0x77;
+        }
+        let slab = HeapSlab {
+            old_base: 0x89f000,
+            content: slab_content,
+        };
+        // Non-coherent first, coherent second.
+        let mut globals = vec![
+            HeapGlobalSnapshot {
+                rva: 0,
+                live_ptr: 0x8d8d60,
+                content: vec![0x11u8; 0x20],
+                is_heap_handle: false,
+                is_image_inline: false,
+                provenance: RegionProvenance::default(),
+            },
+            HeapGlobalSnapshot {
+                rva: 0,
+                live_ptr: 0x8d8d60,
+                content: vec![0x77u8; 0x20],
+                is_heap_handle: false,
+                is_image_inline: false,
+                provenance: RegionProvenance::default(),
+            },
+        ];
+        reconcile_duplicate_heap_globals(&mut globals, Some(&slab));
+        assert_eq!(globals.len(), 1);
+        assert_eq!(globals[0].content, vec![0x77u8; 0x20]);
+    }
+
+    // GTO Core Recovery R0-E: differing bytes with no raw slab (no slab
+    // capture) prefer the larger snapshot; an exact-size tie with differing
+    // bytes is retained so the overlay fail-closes with provenance rather than
+    // silently picking.
+    #[test]
+    fn r0e_no_slab_prefers_larger_keeps_tie_conflict() {
+        // Larger wins.
+        let mut a = vec![
+            HeapGlobalSnapshot {
+                rva: 0,
+                live_ptr: 0x8d8d60,
+                content: vec![0xAAu8; 0x400],
+                is_heap_handle: false,
+                is_image_inline: false,
+                provenance: RegionProvenance::default(),
+            },
+            HeapGlobalSnapshot {
+                rva: 0,
+                live_ptr: 0x8d8d60,
+                content: vec![0xBBu8; 0x200],
+                is_heap_handle: false,
+                is_image_inline: false,
+                provenance: RegionProvenance::default(),
+            },
+        ];
+        reconcile_duplicate_heap_globals(&mut a, None);
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].content, vec![0xAAu8; 0x400]);
+
+        // Exact-size tie with differing bytes and no slab → retained (fail-closed).
+        let mut b = vec![
+            HeapGlobalSnapshot {
+                rva: 0,
+                live_ptr: 0x8d8d60,
+                content: vec![0xAAu8; 0x400],
+                is_heap_handle: false,
+                is_image_inline: false,
+                provenance: RegionProvenance::default(),
+            },
+            HeapGlobalSnapshot {
+                rva: 0,
+                live_ptr: 0x8d8d60,
+                content: vec![0xBBu8; 0x400],
+                is_heap_handle: false,
+                is_image_inline: false,
+                provenance: RegionProvenance::default(),
+            },
+        ];
+        reconcile_duplicate_heap_globals(&mut b, None);
+        assert_eq!(b.len(), 2); // both retained; overlay will fail-closed
     }
 }

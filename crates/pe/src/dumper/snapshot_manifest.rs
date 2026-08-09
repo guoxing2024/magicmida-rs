@@ -358,7 +358,8 @@ pub(crate) fn render_manifest_json(
                 "    {{\"child_kind\": \"{}\", \"child_old_base\": \"{}\", \
                  \"child_size\": {}, \"slab_offset\": {}, \
                  \"raw_child_sha256\": \"{}\", \"raw_slab_slice_sha256\": \"{}\", \
-                 \"transformed_child_sha256\": \"{}\", \"overlay_applied\": {}}}",
+                 \"transformed_child_sha256\": \"{}\", \"overlay_applied\": {}, \
+                 \"contained_in_old_base\": {}}}",
                 o.child_kind.label(),
                 hex_u64(o.child_old_base),
                 o.child_size,
@@ -366,7 +367,11 @@ pub(crate) fn render_manifest_json(
                 o.raw_child_digest,
                 o.raw_slab_slice_digest,
                 o.transformed_child_digest,
-                o.overlay_applied
+                o.overlay_applied,
+                match o.contained_in_old_base {
+                    Some(base) => format!("\"{}\"", hex_u64(base)),
+                    None => "null".to_string(),
+                }
             ));
             if i + 1 < overlay_ledger.len() {
                 buf.push(',');

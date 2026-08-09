@@ -869,6 +869,17 @@ pub fn dump_process_with_report(
         if let Some(raw_slab) =
             super::heap_global_snapshot::capture_heap_slab(&heap_globals, debugger)
         {
+            // R0-E: reconcile duplicate captures at the same live_ptr using
+            // raw-slab coherence (the slab is the physical-memory ground truth)
+            // BEFORE snapshotting raw children, so the raw child set matches
+            // the deduped (authoritative) heap_globals. Prevents two
+            // transformed children on one slab range with differing bytes from
+            // tripping the overlay OverlayConflict (Route M R1 blocker). Runs
+            // on RAW snapshots before any transform.
+            super::heap_global_snapshot::reconcile_duplicate_heap_globals(
+                &mut heap_globals,
+                Some(&raw_slab),
+            );
             let raw_children =
                 super::raw_slab_coherence::raw_children_from_capture(&containers, &heap_globals);
             raw_capture = Some(super::raw_slab_coherence::RawSlabCapture {

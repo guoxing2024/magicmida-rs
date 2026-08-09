@@ -85,6 +85,11 @@ pub struct TransformedRegionOverlay {
     pub transform_ids: Vec<String>,
     /// Whether the overlay was applied.
     pub overlay_applied: bool,
+    /// R0-E Path A: when this child is a contained subview of a backing object
+    /// (force-admit interior child inside its containing object's range), the
+    /// old base of the backing object it was overlaid onto. `None` for a
+    /// standalone overlay or a synthetic region.
+    pub contained_in_old_base: Option<u64>,
 }
 
 /// Errors from raw-coherence verification / transformed overlay.
@@ -328,7 +333,7 @@ pub fn build_patched_backing_slab(
 
     let mut overlays: Vec<TransformedRegionOverlay> = Vec::new();
     // Track applied overlay ranges (half-open) for conflict detection.
-    let mut applied_ranges: Vec<(usize, usize, String)> = Vec::new(); // (start, end, digest)
+    let mut applied_ranges: Vec<(usize, usize, String, u64)> = Vec::new(); // (start, end, digest, old_base)
 
     for (child_base, child_size, transformed_bytes, kind, provenance) in transformed {
         // R0-D: UnknownSynthetic always fails closed.
@@ -359,6 +364,7 @@ pub fn build_patched_backing_slab(
                 transformed_child_digest: t_digest,
                 transform_ids: vec![transform_id.clone()],
                 overlay_applied: false,
+                contained_in_old_base: None,
             });
             let _ = source_anchor;
             continue;
@@ -446,24 +452,30 @@ pub fn build_patched_backing_slab(
                 raw_slab_slice_digest: sha256_hex(raw_slab_slice),
             });
         }
-        // Conflict detection: check this overlay range against applied ranges.
+        // Conflict detection / containment reconciliation (R0-E Path A): check
+        // this overlay range against applied ranges. A child strictly contained
+        // within an already-applied backing object's range is a legitimate
+        // subview (a force-admit interior child inside its containing object),
+        // provided its raw bytes are coherent with the slab (verified above).
+        // It is overlaid onto the backing object at its contained offset rather
+        // than rejected. Identical-range identical-bytes overlays are dedup;
+        // genuine conflicts (identical-range different-bytes, partial overlap,
+        // or a contained child whose raw bytes are incoherent) fail closed.
         let t_digest = sha256_hex(&transformed_bytes);
         let mut deduped = false;
-        for &(s, e, _) in &applied_ranges {
+        let mut contained_in: Option<u64> = None;
+        for &(s, e, ref d, old_base) in &applied_ranges {
             let overlap = slab_offset_us < e && s < child_end;
             if !overlap {
                 continue;
             }
             // Full identical-range identical-bytes overlay is dedup.
             if s == slab_offset_us && e == child_end {
-                // Same range: require identical transformed bytes else conflict.
-                if applied_ranges
-                    .iter()
-                    .any(|(ss, ee, d)| *ss == slab_offset_us && *ee == child_end && d == &t_digest)
-                {
+                if *d == t_digest {
                     deduped = true; // deterministic dedup; skip this overlay
                     break;
                 }
+                // Same address, same range, different bytes -> genuine conflict.
                 return Err(OverlayError::OverlayConflict {
                     a_child_old_base: child_base,
                     b_child_old_base: child_base,
@@ -472,7 +484,16 @@ pub fn build_patched_backing_slab(
                     slab_offset: slab_offset_us,
                 });
             }
-            // Partial / nested overlap of different ranges is a conflict.
+            // Strict containment of THIS child inside an already-applied
+            // backing object -> legitimate subview (R0-E Path A). The child's
+            // raw bytes are coherent with the slab (already verified above), so
+            // it is a real subview of the physical memory the backing covers.
+            if s <= slab_offset_us && child_end <= e {
+                contained_in = Some(old_base);
+                continue; // not a conflict; reconcile as contained subview
+            }
+            // Partial / nested overlap of different (non-containing) ranges, or
+            // a containing range being written after its subview, is a conflict.
             return Err(OverlayError::OverlayConflict {
                 a_child_old_base: child_base,
                 b_child_old_base: child_base,
@@ -481,12 +502,16 @@ pub fn build_patched_backing_slab(
                 slab_offset: slab_offset_us,
             });
         }
+        // If this child overlaps nothing it is standalone; if it is strictly
+        // contained it is a subview. Either way it is applied to the patched
+        // slab at its own offset (the more-specific subview transform wins over
+        // the backing object's generic content at that offset).
         if deduped {
             continue;
         }
         // Apply overlay.
         backing[slab_offset_us..child_end].copy_from_slice(&transformed_bytes);
-        applied_ranges.push((slab_offset_us, child_end, t_digest.clone()));
+        applied_ranges.push((slab_offset_us, child_end, t_digest.clone(), child_base));
         overlays.push(TransformedRegionOverlay {
             child_kind: kind,
             child_old_base: child_base,
@@ -497,6 +522,7 @@ pub fn build_patched_backing_slab(
             transformed_child_digest: t_digest,
             transform_ids: transform_ids.iter().map(|s| s.to_string()).collect(),
             overlay_applied: true,
+            contained_in_old_base: contained_in,
         });
     }
 
@@ -1233,5 +1259,129 @@ mod tests {
             }
             other => panic!("expected SyntheticDerived, got {other:?}"),
         }
+    }
+
+    // GTO Core Recovery R0-E Path A: a force-admit interior child contained
+    // within its backing object's range is reconciled as a subview (overlaid at
+    // its contained offset) rather than rejected as an OverlayConflict. This is
+    // the Route M R1 blocker geometry: slab [0x89f000,...), backing 0x8d8580,
+    // subview child 0x8d8d60 (inside 0x8d8580), both raw-coherent with the slab.
+    #[test]
+    fn r0e_contained_subview_reconciled_not_conflict() {
+        let slab_base: u64 = 0x89f000;
+        let backing_base: u64 = 0x8d8580;
+        let subview_base: u64 = 0x8d8d60;
+        let backing_sz: usize = 6688; // 0x1a20
+        let subview_sz: usize = 0x400;
+        // Raw slab content: backing occupies [0x8d8580, 0x8d8580+6688);
+        // subview bytes at its offset are [0xEE; 0x400], and the backing raw
+        // content matches at that offset (same physical memory).
+        let backing_off = (backing_base - slab_base) as usize; // 0x39580
+        let subview_off = (subview_base - slab_base) as usize; // 0x39d60
+        let subview_in_backing = (subview_base - backing_base) as usize; // 0x7e0
+        let mut slab_content = vec![0u8; backing_off + backing_sz];
+        // Backing raw content at subview offset = [0xEE; 0x400].
+        for i in 0..subview_sz {
+            slab_content[backing_off + subview_in_backing + i] = 0xEE;
+        }
+        let raw_capture = RawSlabCapture {
+            slab: slab(slab_base, slab_content.clone()),
+            children: vec![
+                RawChild {
+                    old_base: backing_base,
+                    size: backing_sz,
+                    raw_bytes: {
+                        // raw backing: zeros with [0xEE;0x400] at subview offset
+                        let mut b = vec![0u8; backing_sz];
+                        b[subview_in_backing..subview_in_backing + subview_sz].fill(0xEE);
+                        b
+                    },
+                    kind: RawChildKind::HeapGlobal,
+                },
+                RawChild {
+                    old_base: subview_base,
+                    size: subview_sz,
+                    raw_bytes: vec![0xEEu8; subview_sz],
+                    kind: RawChildKind::HeapGlobal,
+                },
+            ],
+        };
+        // Transformed: backing unchanged; subview transformed (bytes differ from
+        // raw to exercise the subview overlay). Both raw-coherent with the slab.
+        let backing = global(
+            backing_base,
+            {
+                let mut b = vec![0u8; backing_sz];
+                b[subview_in_backing..subview_in_backing + subview_sz].fill(0xEE);
+                b
+            },
+            false,
+        );
+        let subview_transformed = vec![0xDDu8; subview_sz];
+        let subview = global(subview_base, subview_transformed.clone(), false);
+        let (patched, overlays) = build_patched_backing_slab(
+            &raw_capture,
+            &[backing, subview],
+            &[],
+            &["repair_gscript_window_strings"],
+        )
+        .unwrap();
+        // The subview's transformed bytes must be overlaid at its offset.
+        let subview_overlays: Vec<_> = overlays
+            .iter()
+            .filter(|o| o.child_old_base == subview_base)
+            .collect();
+        assert_eq!(subview_overlays.len(), 1);
+        assert!(subview_overlays[0].overlay_applied);
+        assert_eq!(
+            subview_overlays[0].contained_in_old_base,
+            Some(backing_base)
+        );
+        // Patched slab at subview offset == transformed subview bytes.
+        assert_eq!(
+            &patched.content[subview_off..subview_off + subview_sz],
+            &subview_transformed[..]
+        );
+    }
+
+    // GTO Core Recovery R0-E: a genuinely partial overlap (neither child
+    // contained in the other) still fails closed — the containment
+    // reconciliation does NOT weaken the conflict guarantee for unrelated
+    // overlapping regions. In a single shared slab the partial overlap is
+    // detected either as raw drift (the two children can't both be coherent
+    // over the shared region) or as an OverlayConflict; either is fail-closed.
+    #[test]
+    fn r0e_partial_overlap_still_conflict() {
+        let slab_base: u64 = 0x89f000;
+        let a_base: u64 = 0x89f000 + 0x1000;
+        let b_base: u64 = 0x89f000 + 0x1080;
+        let sz = 0x100usize;
+        let mut slab_content = vec![0u8; 0x2000];
+        // a=[0x1000,0x1100), b=[0x1080,0x1180) share [0x1080,0x1100).
+        slab_content[0x1000..0x1100].copy_from_slice(&vec![0xAA; 0x100]);
+        slab_content[0x1080..0x1180].copy_from_slice(&vec![0xBB; 0x100]);
+        let raw_capture = RawSlabCapture {
+            slab: slab(slab_base, slab_content),
+            children: vec![
+                RawChild {
+                    old_base: a_base,
+                    size: sz,
+                    raw_bytes: vec![0xAA; sz],
+                    kind: RawChildKind::HeapGlobal,
+                },
+                RawChild {
+                    old_base: b_base,
+                    size: sz,
+                    raw_bytes: vec![0xBB; sz],
+                    kind: RawChildKind::HeapGlobal,
+                },
+            ],
+        };
+        let ga = global(a_base, vec![0xAA; sz], false);
+        let gb = global(b_base, vec![0xBB; sz], false);
+        let result = build_patched_backing_slab(&raw_capture, &[ga, gb], &[], &["t"]);
+        // Fail-closed: either raw drift (shared slab region cannot satisfy both
+        // raw-coherence checks) or an overlay conflict. Never a successful plan.
+        assert!(result.is_err());
     }
 }
