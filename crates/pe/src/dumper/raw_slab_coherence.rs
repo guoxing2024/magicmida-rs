@@ -1825,4 +1825,76 @@ mod tests {
         g.extent_kind = CaptureExtentKind::ObservedAllocation;
         assert_eq!(g.extent_kind, CaptureExtentKind::ObservedAllocation);
     }
+
+    // GTO R0-F.1: TransformWriteConflict reports the ACTUAL existing peer size
+    // (not the current child's size) and the authoritative absolute slab byte.
+    #[test]
+    fn r0f1_conflict_reports_existing_peer_size_and_absolute_slab_byte() {
+        let raw_capture = route_n_raw_capture(0xAA);
+        let a_off = (ROUTEN_A_BASE - ROUTEN_SLAB_BASE) as usize;
+        let mut a = vec![0xAAu8; ROUTEN_VIEW_SZ];
+        a[0x50] = 0xBB;
+        let mut b = vec![0xAAu8; ROUTEN_VIEW_SZ];
+        b[0x00] = 0xCC;
+        let err = build_patched_backing_slab(
+            &raw_capture,
+            &[
+                global(ROUTEN_A_BASE, a, false),
+                global(ROUTEN_B_BASE, b, false),
+            ],
+            &[],
+            &["t1", "t2"],
+        )
+        .unwrap_err();
+        match err {
+            OverlayError::TransformWriteConflict {
+                a_size,
+                b_size,
+                before_byte,
+                a_child_byte_offset,
+                b_child_byte_offset,
+                ..
+            } => {
+                // a is the earlier-applied peer (0x96bb80), size 0x400.
+                assert_eq!(a_size, ROUTEN_VIEW_SZ);
+                assert_eq!(b_size, ROUTEN_VIEW_SZ);
+                // before_byte is the absolute slab byte (0xAA), not a run index.
+                assert_eq!(before_byte, 0xAA);
+                // a's child-relative offset of the conflict = 0x50.
+                assert_eq!(a_child_byte_offset, 0x50);
+                // b's child-relative offset = 0x00.
+                assert_eq!(b_child_byte_offset, 0x00);
+                let _ = a_off;
+            }
+            other => panic!("expected TransformWriteConflict, got {other:?}"),
+        }
+    }
+
+    // GTO R0-F.1: per-child transform provenance — a child modified by a
+    // transform carries that transform id, and an unchanged child carries none.
+    #[test]
+    fn r0f1_per_child_transform_ids_not_global_and_unchanged_has_none() {
+        // A modified child: its transform_ids = ["t1"] (not the global list).
+        let raw_capture = route_n_raw_capture(0xAA);
+        let mut a = vec![0xAAu8; ROUTEN_VIEW_SZ];
+        a[0x10] = 0xBB;
+        let mut ga = global(ROUTEN_A_BASE, a, false);
+        ga.transform_ids = vec!["t1".to_string()];
+        // An unchanged child: content == raw, no transform_ids.
+        let gb = global(ROUTEN_B_BASE, vec![0xAAu8; ROUTEN_VIEW_SZ], false);
+        let (_, overlays) =
+            build_patched_backing_slab(&raw_capture, &[ga, gb], &[], &["t1", "t2", "t3"]).unwrap();
+        let overlay_a = overlays
+            .iter()
+            .find(|o| o.child_old_base == ROUTEN_A_BASE)
+            .unwrap();
+        // The modified child's overlay carries only "t1", not the global 3.
+        assert_eq!(overlay_a.transform_ids, vec!["t1".to_string()]);
+        let overlay_b = overlays
+            .iter()
+            .find(|o| o.child_old_base == ROUTEN_B_BASE)
+            .unwrap();
+        // The unchanged child carries no transform writer (empty list).
+        assert!(overlay_b.transform_ids.is_empty());
+    }
 }

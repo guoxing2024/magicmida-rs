@@ -366,14 +366,113 @@ pub(crate) fn render_manifest_json(
             super::heap_global_snapshot::CaptureExtentKind::InteriorSubview => "interior_subview",
             super::heap_global_snapshot::CaptureExtentKind::SyntheticDerived => "synthetic_derived",
         };
+        let path_label = match g.extent_evidence.capture_path {
+            super::heap_global_snapshot::CapturePath::MainSlot => "main_slot",
+            super::heap_global_snapshot::CapturePath::GscriptFirstHop => "gscript_first_hop",
+            super::heap_global_snapshot::CapturePath::GscriptChildLink => "gscript_child_link",
+            super::heap_global_snapshot::CapturePath::StringBufferChild => "string_buffer_child",
+            super::heap_global_snapshot::CapturePath::DanglingEdge => "dangling_edge",
+            super::heap_global_snapshot::CapturePath::ImageInline => "image_inline",
+            super::heap_global_snapshot::CapturePath::Synthetic => "synthetic",
+        };
+        let parent = g.extent_evidence.containing_parent_old_base;
+        let parent_size = g.extent_evidence.containing_parent_size;
         buf.push_str(&format!(
-            "    {{\"old_base\": \"{}\", \"size\": {}, \"extent_kind\": \"{}\", \"rva\": {}}}",
+            "    {{\"capture_id\": \"{}\", \"capture_path\": \"{}\", \
+             \"source_root_rva\": {}, \"source_slot_offset\": {}, \
+             \"old_base\": \"{}\", \"size\": {}, \"extent_kind\": \"{}\", \
+             \"was_interior\": {}, \"parent_old_base\": {}, \"parent_size\": {}, \
+             \"transform_ids\": [{}]}}",
+            json_escape(&g.extent_evidence.capture_id),
+            path_label,
+            g.extent_evidence
+                .source_root_rva
+                .map(|r| format!("\"{}\"", hex_u32(r)))
+                .unwrap_or_else(|| "null".to_string()),
+            g.extent_evidence
+                .source_slot_offset
+                .map(|o| o.to_string())
+                .unwrap_or_else(|| "null".to_string()),
             hex_u64(g.live_ptr),
             g.content.len(),
             extent_label,
-            g.rva
+            g.extent_evidence.was_interior,
+            parent
+                .map(|p| format!("\"{}\"", hex_u64(p)))
+                .unwrap_or_else(|| "null".to_string()),
+            parent_size
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "null".to_string()),
+            g.transform_ids
+                .iter()
+                .map(|t| format!("\"{}\"", json_escape(t)))
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
         if i + 1 < data_globals.len() {
+            buf.push(',');
+        }
+        buf.push('\n');
+    }
+    buf.push_str("  ]\n");
+
+    // GTO R0-F.1 overlap-relationship ledger: for every overlay child that is
+    // a contained subview of another (or overlaps), record the relationship,
+    // overlap range, common parent, and resolution. Diagnostic only.
+    let subview_rels: Vec<_> = overlay_ledger
+        .iter()
+        .filter(|o| o.contained_in_old_base.is_some())
+        .collect();
+    buf.push_str(",\n");
+    buf.push_str("  \"overlap_relationship_ledger\": [\n");
+    for (i, o) in subview_rels.iter().enumerate() {
+        let parent = o.contained_in_old_base.unwrap();
+        buf.push_str(&format!(
+            "    {{\"child_old_base\": \"{}\", \"child_size\": {}, \
+             \"parent_old_base\": \"{}\", \"relationship\": \"ContainedSubview\", \
+             \"overlap_start\": \"{}\", \"overlap_size\": {}, \
+             \"common_parent\": \"{}\", \"resolution\": \"AbsorbedAsSlabOwnedAlias\"}}",
+            hex_u64(o.child_old_base),
+            o.child_size,
+            hex_u64(parent),
+            hex_u64(o.child_old_base),
+            o.child_size,
+            hex_u64(parent)
+        ));
+        if i + 1 < subview_rels.len() {
+            buf.push(',');
+        }
+        buf.push('\n');
+    }
+    buf.push_str("  ]\n");
+
+    // GTO R0-F.1 transformed-write ledger: summarize per-child write runs.
+    buf.push_str(",\n");
+    buf.push_str("  \"transformed_write_ledger\": [\n");
+    for (i, o) in overlay_ledger.iter().enumerate() {
+        let transform_ids = o
+            .transform_ids
+            .iter()
+            .map(|t| format!("\"{}\"", json_escape(t)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        buf.push_str(&format!(
+            "    {{\"child_capture_id\": \"\", \"child_old_base\": \"{}\", \
+             \"child_size\": {}, \"slab_offset\": {}, \
+             \"transformed_digest\": \"{}\", \"transform_ids\": [{}], \
+             \"resolution\": \"{}\"}}",
+            hex_u64(o.child_old_base),
+            o.child_size,
+            o.slab_offset,
+            o.transformed_child_digest,
+            transform_ids,
+            if o.overlay_applied {
+                "AppliedUniqueWrite"
+            } else {
+                "NoTransform"
+            }
+        ));
+        if i + 1 < overlay_ledger.len() {
             buf.push(',');
         }
         buf.push('\n');
@@ -562,5 +661,126 @@ mod tests {
         assert!(json.contains("\"completion_cookie_rva\": \"0x2ff00\""));
         assert!(json.contains("\"recovery_status\": \"Complete\""));
         assert!(json.contains("\"deterministic_plan_digest\": \"abc123\""));
+    }
+
+    // GTO R0-F.1: the manifest must serialize the capture-extent,
+    // overlap-relationship, and transformed-write ledgers as valid JSON.
+    #[test]
+    fn r0f1_ledgers_serialize_as_valid_json() {
+        use crate::dumper::container_snapshot::ContainerSnapshot;
+        use crate::dumper::runtime_rebase::RuntimeRebaseSummary;
+        let container = ContainerSnapshot {
+            rva: 0x145710,
+            decoded_begin: 0x96ad40,
+            decoded_end: 0x96ad88,
+            decoded_capacity: 0x96ae40,
+            cookie: 0x8610479a1eb2,
+            heap_content: vec![0u8; 72],
+        };
+        let mut heap_global = HeapGlobalSnapshot {
+            rva: 0x146890,
+            live_ptr: 0x96bb80,
+            content: vec![0xAAu8; 0x400],
+            is_heap_handle: false,
+            is_image_inline: false,
+            provenance: RegionProvenance::default(),
+            extent_kind: CaptureExtentKind::ProbeWindow,
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: "gscript_first_hop:0x48".to_string(),
+                capture_path: super::super::heap_global_snapshot::CapturePath::GscriptFirstHop,
+                source_root_rva: Some(0x149d50),
+                source_slot_offset: Some(0x48),
+                probe_requested_size: 0x400,
+                was_interior: false,
+                containing_parent_old_base: None,
+                containing_parent_size: None,
+            },
+            transform_ids: vec!["repair_gscript_window_strings".to_string()],
+        };
+        // A second view that is a contained subview of the first.
+        let mut subview = HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: 0x96bbd0,
+            content: vec![0xAAu8; 0x400],
+            is_heap_handle: false,
+            is_image_inline: false,
+            provenance: RegionProvenance::default(),
+            extent_kind: CaptureExtentKind::InteriorSubview,
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: "gscript_first_hop:0x50".to_string(),
+                capture_path: super::super::heap_global_snapshot::CapturePath::GscriptFirstHop,
+                source_root_rva: Some(0x149d50),
+                source_slot_offset: Some(0x50),
+                probe_requested_size: 0x400,
+                was_interior: true,
+                containing_parent_old_base: Some(0x96bb80),
+                containing_parent_size: Some(0x400),
+            },
+            transform_ids: Vec::new(),
+        };
+        let _ = &mut heap_global;
+        let _ = &mut subview;
+        let summary = RuntimeRebaseSummary {
+            regions_total: 1,
+            regions_required: 1,
+            bytes_captured: 0x400,
+            pointer_slots_total: 0,
+            intra_region_pointers: 0,
+            image_pointers: 0,
+            external_pointers: 0,
+            null_or_tagged: 0,
+            unresolved_required: 0,
+            unresolved_optional: 0,
+            image_roots_patched: 0,
+            bootstrap_kind: "post_crt_two_phase".to_string(),
+            bootstrap_rva: Some(0x2f000),
+            original_oep_rva: 0x5a10,
+            completion_cookie_rva: Some(0x2ff00),
+            deterministic_plan_digest: "abc".to_string(),
+            fixup_count: 0,
+            resolver_count: 0,
+            candidate_count: 1,
+            bootstrap_contract_valid: true,
+            recovery_status: crate::dumper::runtime_rebase::RebaseStatus::Complete,
+        };
+        // Overlay with a contained subview relationship.
+        let overlay = vec![super::super::raw_slab_coherence::TransformedRegionOverlay {
+            child_kind: super::super::raw_slab_coherence::RawChildKind::HeapGlobal,
+            child_old_base: 0x96bbd0,
+            child_size: 0x400,
+            slab_offset: 0x81cbd0,
+            raw_child_digest: "a".to_string(),
+            raw_slab_slice_digest: "b".to_string(),
+            transformed_child_digest: "c".to_string(),
+            transform_ids: vec!["repair_gscript_window_strings".to_string()],
+            overlay_applied: true,
+            contained_in_old_base: Some(0x96bb80),
+        }];
+        let json = render_manifest_json(
+            Path::new("cand.exe"),
+            DumpProfile::AhkGtoExperimental,
+            0x140000000,
+            0x70b0,
+            &[container],
+            &[heap_global.clone(), subview.clone()],
+            &DumpCapturePolicy::ahk_gto_default(),
+            Some(&summary),
+            &overlay,
+        )
+        .unwrap();
+        // The JSON must parse (valid) and contain all three ledgers.
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid manifest JSON");
+        assert!(v.get("capture_extent_ledger").is_some());
+        assert!(v.get("overlap_relationship_ledger").is_some());
+        assert!(v.get("transformed_write_ledger").is_some());
+        // The overlap ledger records the contained-subview relationship.
+        let rels = v["overlap_relationship_ledger"].as_array().unwrap();
+        assert_eq!(rels.len(), 1);
+        assert_eq!(rels[0]["relationship"], "ContainedSubview");
+        // The capture-extent ledger records the first-hop source slot.
+        let extents = v["capture_extent_ledger"].as_array().unwrap();
+        assert!(extents
+            .iter()
+            .any(|e| e["capture_path"] == "gscript_first_hop"));
     }
 }
