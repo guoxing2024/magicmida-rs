@@ -347,6 +347,39 @@ pub(crate) fn render_manifest_json(
         buf.push_str("  }\n");
     }
 
+    // GTO R0-F capture extent ledger: records each heap-global's extent
+    // classification (ProbeWindow vs ObservedAllocation vs InteriorSubview vs
+    // BackingObject vs SyntheticDerived). Diagnostic only — never acceptance.
+    buf.push_str(",\n");
+    buf.push_str("  \"capture_extent_ledger\": [\n");
+    let data_globals: Vec<&HeapGlobalSnapshot> = heap_globals
+        .iter()
+        .filter(|g| !g.is_heap_handle && !g.content.is_empty())
+        .collect();
+    for (i, g) in data_globals.iter().enumerate() {
+        let extent_label = match g.extent_kind {
+            super::heap_global_snapshot::CaptureExtentKind::ProbeWindow => "probe_window",
+            super::heap_global_snapshot::CaptureExtentKind::ObservedAllocation => {
+                "observed_allocation"
+            }
+            super::heap_global_snapshot::CaptureExtentKind::BackingObject => "backing_object",
+            super::heap_global_snapshot::CaptureExtentKind::InteriorSubview => "interior_subview",
+            super::heap_global_snapshot::CaptureExtentKind::SyntheticDerived => "synthetic_derived",
+        };
+        buf.push_str(&format!(
+            "    {{\"old_base\": \"{}\", \"size\": {}, \"extent_kind\": \"{}\", \"rva\": {}}}",
+            hex_u64(g.live_ptr),
+            g.content.len(),
+            extent_label,
+            g.rva
+        ));
+        if i + 1 < data_globals.len() {
+            buf.push(',');
+        }
+        buf.push('\n');
+    }
+    buf.push_str("  ]\n");
+
     // GTO R0-C.1 raw-slab overlay ledger (build-time diagnostic; never
     // acceptance). Proves raw coherence + transformed-child overlay applied to
     // the patched backing slab.
@@ -387,7 +420,7 @@ pub(crate) fn render_manifest_json(
 
 #[cfg(test)]
 mod tests {
-    use super::super::heap_global_snapshot::RegionProvenance;
+    use super::super::heap_global_snapshot::{CaptureExtentKind, RegionProvenance};
     use super::*;
 
     #[test]
@@ -439,6 +472,7 @@ mod tests {
                 content: vec![0u8; 0x4000],
                 is_heap_handle: false,
                 is_image_inline: false,
+                extent_kind: CaptureExtentKind::default(),
                 provenance: RegionProvenance::default(),
             },
             HeapGlobalSnapshot {
@@ -447,6 +481,7 @@ mod tests {
                 content: vec![0u8; 64],
                 is_heap_handle: false,
                 is_image_inline: false,
+                extent_kind: CaptureExtentKind::default(),
                 provenance: RegionProvenance::default(),
             },
         ];

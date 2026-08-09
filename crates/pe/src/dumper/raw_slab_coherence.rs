@@ -123,18 +123,61 @@ pub enum OverlayError {
         raw_slab_slice_digest: String,
     },
     /// Two overlays conflict (partial overlap or same range different bytes).
+    /// GTO R0-F: now carries the ACTUAL applied peer (not the current child
+    /// duplicated) so the diagnostic names both real children.
+    ///
+    /// Retained for range-relationship reporting and API stability; the
+    /// write-set overlay emits [`OverlayError::TransformWriteConflict`] for
+    /// genuine same-byte-different-value conflicts, so this variant is not
+    /// constructed on the current path.
+    #[allow(dead_code)]
     OverlayConflict {
         a_child_old_base: u64,
-        b_child_old_base: u64,
         a_size: usize,
+        b_child_old_base: u64,
         b_size: usize,
         slab_offset: usize,
+    },
+    /// Two transforms write the SAME slab byte to DIFFERENT final values.
+    /// Genuine transformed write conflict (fail-closed). See GTO R0-F.
+    TransformWriteConflict {
+        /// old base of the first (earlier-applied) child.
+        a_child_old_base: u64,
+        /// size of the first child.
+        a_size: usize,
+        /// old base of the second (current) child.
+        b_child_old_base: u64,
+        /// size of the second child.
+        b_size: usize,
+        /// slab offset of the first conflicting byte.
+        first_mismatch_slab_offset: usize,
+        /// the raw (before) byte value at that slab offset.
+        before_byte: u8,
+        /// the value the first child's transform wrote.
+        a_after_byte: u8,
+        /// the value the second child's transform writes.
+        b_after_byte: u8,
+        /// transform ids of the first child.
+        a_transform_ids: Vec<String>,
+        /// transform ids of the second child.
+        b_transform_ids: Vec<String>,
     },
     /// No raw counterpart found for a transformed child.
     RawChildMissing {
         child_old_base: u64,
         child_kind: RawChildKind,
     },
+}
+
+/// A single resolved write at one slab byte (for deterministic write-set merge).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedWrite {
+    /// The final byte value written to the slab.
+    value: u8,
+    /// old base of the child that owns this write.
+    child_old_base: u64,
+    /// transform ids that produced this write.
+    transform_ids: Vec<String>,
 }
 
 impl std::fmt::Display for OverlayError {
@@ -191,14 +234,41 @@ impl std::fmt::Display for OverlayError {
             ),
             OverlayError::OverlayConflict {
                 a_child_old_base,
-                b_child_old_base,
                 a_size,
+                b_child_old_base,
                 b_size,
                 slab_offset,
             } => write!(
                 f,
-                "overlay conflict: [{:#x},+{:#x}) vs [{:#x},+{:#x}) both target slab offset {:#x}",
+                "overlay conflict: [{:#x},+{:#x}) vs [{:#x},+{:#x}) overlap at slab offset {:#x}",
                 a_child_old_base, a_size, b_child_old_base, b_size, slab_offset
+            ),
+            OverlayError::TransformWriteConflict {
+                a_child_old_base,
+                a_size,
+                b_child_old_base,
+                b_size,
+                first_mismatch_slab_offset,
+                before_byte,
+                a_after_byte,
+                b_after_byte,
+                a_transform_ids,
+                b_transform_ids,
+            } => write!(
+                f,
+                "transformed write conflict: [{:#x},+{:#x}) vs [{:#x},+{:#x}) \
+                 first_mismatch_slab_offset={:#x} before={:#04x} a_after={:#04x} b_after={:#04x} \
+                 a_transform={:?} b_transform={:?}",
+                a_child_old_base,
+                a_size,
+                b_child_old_base,
+                b_size,
+                first_mismatch_slab_offset,
+                before_byte,
+                a_after_byte,
+                b_after_byte,
+                a_transform_ids,
+                b_transform_ids
             ),
             OverlayError::RawChildMissing {
                 child_old_base,
@@ -332,10 +402,16 @@ pub fn build_patched_backing_slab(
     transformed.sort_by_key(|(base, _, _, kind, _)| (*base, *kind as u8));
 
     let mut overlays: Vec<TransformedRegionOverlay> = Vec::new();
-    // Track applied overlay ranges (half-open) for conflict detection.
-    let mut applied_ranges: Vec<(usize, usize, String, u64)> = Vec::new(); // (start, end, digest, old_base)
+    // GTO R0-F: track resolved writes at slab-byte granularity for conflict
+    // detection. Only differing transformed bytes are writes.
+    let mut resolved_writes: std::collections::BTreeMap<usize, ResolvedWrite> =
+        std::collections::BTreeMap::new();
 
-    for (child_base, child_size, transformed_bytes, kind, provenance) in transformed {
+    for (child_base, child_size, transformed_bytes, kind, provenance) in &transformed {
+        let child_base = *child_base;
+        let child_size = *child_size;
+        let kind = *kind;
+        let transformed_bytes = transformed_bytes.clone();
         // R0-D: UnknownSynthetic always fails closed.
         if let RegionProvenance::UnknownSynthetic = &provenance {
             return Err(OverlayError::RawChildMissing {
@@ -452,66 +528,107 @@ pub fn build_patched_backing_slab(
                 raw_slab_slice_digest: sha256_hex(raw_slab_slice),
             });
         }
-        // Conflict detection / containment reconciliation (R0-E Path A): check
-        // this overlay range against applied ranges. A child strictly contained
-        // within an already-applied backing object's range is a legitimate
-        // subview (a force-admit interior child inside its containing object),
-        // provided its raw bytes are coherent with the slab (verified above).
-        // It is overlaid onto the backing object at its contained offset rather
-        // than rejected. Identical-range identical-bytes overlays are dedup;
-        // genuine conflicts (identical-range different-bytes, partial overlap,
-        // or a contained child whose raw bytes are incoherent) fail closed.
+        // GTO R0-F: conflict resolution is based on the transformed WRITE-SET
+        // (the byte runs where this child's bytes differ from its raw capture),
+        // not on the whole child range. Overlapping capture/probe windows with
+        // disjoint (or identical) writes do NOT conflict; only a transform that
+        // writes the SAME slab byte to a DIFFERENT final value than an
+        // already-resolved write fails closed. Unmodified raw bytes are not
+        // writes and never trigger a conflict by themselves.
         let t_digest = sha256_hex(&transformed_bytes);
-        let mut deduped = false;
-        let mut contained_in: Option<u64> = None;
-        for &(s, e, ref d, old_base) in &applied_ranges {
-            let overlap = slab_offset_us < e && s < child_end;
-            if !overlap {
-                continue;
-            }
-            // Full identical-range identical-bytes overlay is dedup.
-            if s == slab_offset_us && e == child_end {
-                if *d == t_digest {
-                    deduped = true; // deterministic dedup; skip this overlay
-                    break;
+        let raw_len = raw_child_bytes.len().min(child_size);
+        // Compute this child's write-set (slab byte offsets that changed).
+        let mut write_runs: Vec<(usize, usize, Vec<u8>)> = Vec::new(); // (slab_off, len, bytes)
+        {
+            let mut run_start: Option<(usize, Vec<u8>)> = None;
+            for i in 0..raw_len {
+                let so = slab_offset_us + i;
+                if transformed_bytes[i] != raw_child_bytes[i] {
+                    match run_start.as_mut() {
+                        Some((_, acc)) => acc.push(transformed_bytes[i]),
+                        None => run_start = Some((so, vec![transformed_bytes[i]])),
+                    }
+                } else if let Some((s, acc)) = run_start.take() {
+                    write_runs.push((s, acc.len(), acc));
                 }
-                // Same address, same range, different bytes -> genuine conflict.
-                return Err(OverlayError::OverlayConflict {
-                    a_child_old_base: child_base,
-                    b_child_old_base: child_base,
-                    a_size: child_size,
-                    b_size: child_size,
-                    slab_offset: slab_offset_us,
-                });
             }
-            // Strict containment of THIS child inside an already-applied
-            // backing object -> legitimate subview (R0-E Path A). The child's
-            // raw bytes are coherent with the slab (already verified above), so
-            // it is a real subview of the physical memory the backing covers.
-            if s <= slab_offset_us && child_end <= e {
-                contained_in = Some(old_base);
-                continue; // not a conflict; reconcile as contained subview
+            if let Some((s, acc)) = run_start.take() {
+                write_runs.push((s, acc.len(), acc));
             }
-            // Partial / nested overlap of different (non-containing) ranges, or
-            // a containing range being written after its subview, is a conflict.
-            return Err(OverlayError::OverlayConflict {
-                a_child_old_base: child_base,
-                b_child_old_base: child_base,
-                a_size: child_size,
-                b_size: child_size,
-                slab_offset: slab_offset_us,
-            });
         }
-        // If this child overlaps nothing it is standalone; if it is strictly
-        // contained it is a subview. Either way it is applied to the patched
-        // slab at its own offset (the more-specific subview transform wins over
-        // the backing object's generic content at that offset).
-        if deduped {
+        let my_transform_ids: Vec<String> = transform_ids.iter().map(|s| s.to_string()).collect();
+        // Resolve each write byte against already-applied writes.
+        let mut contributed_new_write = false;
+        let mut all_shared_with_same_base = true;
+        let mut any_shared_write = false;
+        for &(so, _, ref bytes) in &write_runs {
+            for (k, &val) in bytes.iter().enumerate() {
+                let abs = so + k;
+                match resolved_writes.get(&abs) {
+                    None => {
+                        resolved_writes.insert(
+                            abs,
+                            ResolvedWrite {
+                                value: val,
+                                child_old_base: child_base,
+                                transform_ids: my_transform_ids.clone(),
+                            },
+                        );
+                        contributed_new_write = true;
+                    }
+                    Some(existing) if existing.value == val => {
+                        // SharedWriteSameValue: same final byte from two
+                        // transforms. Record for ledger; only a true duplicate
+                        // (same base, all writes shared) is deduped.
+                        any_shared_write = true;
+                        if existing.child_old_base != child_base {
+                            all_shared_with_same_base = false;
+                        }
+                    }
+                    Some(existing) => {
+                        return Err(OverlayError::TransformWriteConflict {
+                            a_child_old_base: existing.child_old_base,
+                            a_size: child_size,
+                            b_child_old_base: child_base,
+                            b_size: child_size,
+                            first_mismatch_slab_offset: abs,
+                            before_byte: raw_child_bytes[k],
+                            a_after_byte: existing.value,
+                            b_after_byte: val,
+                            a_transform_ids: existing.transform_ids.clone(),
+                            b_transform_ids: my_transform_ids.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        // Apply the write-set to the patched backing slab.
+        for &(so, len, ref bytes) in &write_runs {
+            backing[so..so + len].copy_from_slice(bytes);
+        }
+        // GTO R0-F: a child whose ENTIRE write-set was already resolved with the
+        // SAME values from the SAME base is a true duplicate (same object
+        // captured twice) and is deduped. An overlapping view (different base)
+        // that happens to share some writes is still recorded (SharedWriteSameValue),
+        // so both real views appear in the ledger.
+        let is_true_duplicate = !write_runs.is_empty()
+            && !contributed_new_write
+            && any_shared_write
+            && all_shared_with_same_base;
+        if is_true_duplicate {
             continue;
         }
-        // Apply overlay.
-        backing[slab_offset_us..child_end].copy_from_slice(&transformed_bytes);
-        applied_ranges.push((slab_offset_us, child_end, t_digest.clone(), child_base));
+        // Compute containment relationship for the ledger (R0-E Path A): does
+        // this child sit inside another transformed child's range?
+        let contained_in = transformed
+            .iter()
+            .find(|(ob, osz, _, ok, _)| {
+                // exclude this child itself
+                !(*ok == kind && *ob == child_base)
+                    && *ob <= child_base
+                    && child_base + child_size as u64 <= ob.saturating_add(*osz as u64)
+            })
+            .map(|(ob, _, _, _, _)| *ob);
         overlays.push(TransformedRegionOverlay {
             child_kind: kind,
             child_old_base: child_base,
@@ -520,7 +637,7 @@ pub fn build_patched_backing_slab(
             raw_child_digest: sha256_hex(raw_child_bytes),
             raw_slab_slice_digest: sha256_hex(raw_slab_slice),
             transformed_child_digest: t_digest,
-            transform_ids: transform_ids.iter().map(|s| s.to_string()).collect(),
+            transform_ids: my_transform_ids,
             overlay_applied: true,
             contained_in_old_base: contained_in,
         });
@@ -539,6 +656,7 @@ pub fn build_patched_backing_slab(
 
 #[cfg(test)]
 mod tests {
+    use super::super::heap_global_snapshot::CaptureExtentKind;
     use super::*;
     use crate::dumper::container_snapshot::ContainerSnapshot;
     use crate::dumper::heap_global_snapshot::{HeapGlobalSnapshot, HeapSlab};
@@ -551,6 +669,7 @@ mod tests {
             is_heap_handle: false,
             is_image_inline: inline,
             provenance: RegionProvenance::default(),
+            extent_kind: CaptureExtentKind::default(),
         }
     }
 
@@ -562,6 +681,7 @@ mod tests {
             is_heap_handle: true,
             is_image_inline: false,
             provenance: RegionProvenance::default(),
+            extent_kind: CaptureExtentKind::default(),
         }
     }
 
@@ -928,7 +1048,7 @@ mod tests {
         let ga = global(ROUTEK_CHILD_BASE, repaint(&raw), false);
         let gb = global(ROUTEK_CHILD_BASE, repaint(&repaint(&raw)), false);
         let err = build_patched_backing_slab(&raw_capture, &[ga, gb], &[], &["t"]).unwrap_err();
-        assert!(matches!(err, OverlayError::OverlayConflict { .. }));
+        assert!(matches!(err, OverlayError::TransformWriteConflict { .. }));
     }
 
     #[test]
@@ -964,7 +1084,7 @@ mod tests {
         let ga = global(ROUTEK_CHILD_BASE, vec![0u8; 32], false);
         let gb = global(ROUTEK_CHILD_BASE + 16, vec![0x01u8; 32], false);
         let err = build_patched_backing_slab(&raw_capture, &[ga, gb], &[], &["t"]).unwrap_err();
-        assert!(matches!(err, OverlayError::OverlayConflict { .. }));
+        assert!(matches!(err, OverlayError::TransformWriteConflict { .. }));
     }
 
     #[test]
@@ -1142,7 +1262,7 @@ mod tests {
         let ga = global(ROUTEK_CHILD_BASE, repaint(&raw), false);
         let gb = global(ROUTEK_CHILD_BASE, repaint(&repaint(&raw)), false);
         let err = build_patched_backing_slab(&raw_capture, &[ga, gb], &[], &["t"]).unwrap_err();
-        assert!(matches!(err, OverlayError::OverlayConflict { .. }));
+        assert!(matches!(err, OverlayError::TransformWriteConflict { .. }));
     }
 
     fn synthetic(live_ptr: u64, bytes: Vec<u8>, tid: &str) -> HeapGlobalSnapshot {
@@ -1383,5 +1503,230 @@ mod tests {
         // Fail-closed: either raw drift (shared slab region cannot satisfy both
         // raw-coherence checks) or an overlay conflict. Never a successful plan.
         assert!(result.is_err());
+    }
+
+    // ---------- GTO Core Recovery R0-F tests ----------
+
+    // Route N geometry constants: overlapping first-hop probe windows.
+    const ROUTEN_SLAB_BASE: u64 = 0x14f000;
+    const ROUTEN_A_BASE: u64 = 0x96bb80;
+    const ROUTEN_B_BASE: u64 = 0x96bbd0;
+    const ROUTEN_VIEW_SZ: usize = 0x400;
+
+    // Build a raw capture where the two Route N views both read from a slab
+    // whose bytes at [A_BASE .. B_BASE+0x400) are all `fill`.
+    fn route_n_raw_capture(fill: u8) -> RawSlabCapture {
+        let a_off = (ROUTEN_A_BASE - ROUTEN_SLAB_BASE) as usize;
+        let end_off = (ROUTEN_B_BASE + ROUTEN_VIEW_SZ as u64 - ROUTEN_SLAB_BASE) as usize;
+        let mut content = vec![0u8; end_off];
+        content[a_off..end_off].fill(fill);
+        RawSlabCapture {
+            slab: slab(ROUTEN_SLAB_BASE, content),
+            children: vec![
+                RawChild {
+                    old_base: ROUTEN_A_BASE,
+                    size: ROUTEN_VIEW_SZ,
+                    raw_bytes: vec![fill; ROUTEN_VIEW_SZ],
+                    kind: RawChildKind::HeapGlobal,
+                },
+                RawChild {
+                    old_base: ROUTEN_B_BASE,
+                    size: ROUTEN_VIEW_SZ,
+                    raw_bytes: vec![fill; ROUTEN_VIEW_SZ],
+                    kind: RawChildKind::HeapGlobal,
+                },
+            ],
+        }
+    }
+
+    // Two overlapping probe windows with DISJOINT transformed writes must NOT
+    // conflict (the core R0-F fix for Route N R1).
+    #[test]
+    fn r0f_overlapping_views_with_disjoint_writes_merge() {
+        let raw_capture = route_n_raw_capture(0xAA);
+        // A writes its first 0x50 bytes to 0xBB; B writes its last 0x20 bytes
+        // to 0xCC. The write-sets are disjoint -> merge, no conflict.
+        let mut a = vec![0xAAu8; ROUTEN_VIEW_SZ];
+        a[..0x50].fill(0xBB);
+        let mut b = vec![0xAAu8; ROUTEN_VIEW_SZ];
+        b[0x3e0..].fill(0xCC);
+        let (patched, overlays) = build_patched_backing_slab(
+            &raw_capture,
+            &[
+                global(ROUTEN_A_BASE, a, false),
+                global(ROUTEN_B_BASE, b, false),
+            ],
+            &[],
+            &["t1", "t2"],
+        )
+        .unwrap();
+        let a_off = (ROUTEN_A_BASE - ROUTEN_SLAB_BASE) as usize;
+        let b_off = (ROUTEN_B_BASE - ROUTEN_SLAB_BASE) as usize;
+        // A's first 0x50 bytes written to 0xBB.
+        assert_eq!(
+            &patched.content[a_off..a_off + 0x50],
+            &vec![0xBBu8; 0x50][..]
+        );
+        // B's last 0x20 bytes written to 0xCC.
+        assert_eq!(
+            &patched.content[b_off + 0x3e0..b_off + 0x400],
+            &vec![0xCCu8; 0x20][..]
+        );
+        // Both overlays present.
+        assert_eq!(overlays.len(), 2);
+    }
+
+    // Two overlapping views with NO transformed writes (unchanged) -> no
+    // conflict, patched slab == raw slab.
+    #[test]
+    fn r0f_overlapping_views_with_no_transforms_need_no_overlay() {
+        let raw_capture = route_n_raw_capture(0xAA);
+        let raw_slab = raw_capture.slab.content.clone();
+        let a = global(ROUTEN_A_BASE, vec![0xAAu8; ROUTEN_VIEW_SZ], false);
+        let b = global(ROUTEN_B_BASE, vec![0xAAu8; ROUTEN_VIEW_SZ], false);
+        let (patched, _) = build_patched_backing_slab(&raw_capture, &[a, b], &[], &["t"]).unwrap();
+        assert_eq!(patched.content, raw_slab);
+    }
+
+    // Same byte written by two transforms to the SAME final value merges
+    // deterministically (SharedWriteSameValue).
+    #[test]
+    fn r0f_same_delta_value_merges_deterministically() {
+        let raw_capture = route_n_raw_capture(0xAA);
+        // Both A and B write byte 0x50 (the overlap) to 0xBB (same value).
+        let mut a = vec![0xAAu8; ROUTEN_VIEW_SZ];
+        a[0x50] = 0xBB;
+        let mut b = vec![0xAAu8; ROUTEN_VIEW_SZ];
+        b[0x00] = 0xBB; // B's offset 0 = slab A_off+0x50
+        let (patched, overlays) = build_patched_backing_slab(
+            &raw_capture,
+            &[
+                global(ROUTEN_A_BASE, a, false),
+                global(ROUTEN_B_BASE, b, false),
+            ],
+            &[],
+            &["t1", "t2"],
+        )
+        .unwrap();
+        let a_off = (ROUTEN_A_BASE - ROUTEN_SLAB_BASE) as usize;
+        assert_eq!(patched.content[a_off + 0x50], 0xBB);
+        assert_eq!(overlays.len(), 2);
+    }
+
+    // Same byte written to DIFFERENT final values -> TransformWriteConflict,
+    // with both real peer bases reported.
+    #[test]
+    fn r0f_different_delta_value_fails_closed() {
+        let raw_capture = route_n_raw_capture(0xAA);
+        // Both write the overlap byte at slab a_off+0x50 (A's offset 0x50,
+        // B's offset 0x00) to different values.
+        let mut a = vec![0xAAu8; ROUTEN_VIEW_SZ];
+        a[0x50] = 0xBB;
+        let mut b = vec![0xAAu8; ROUTEN_VIEW_SZ];
+        b[0x00] = 0xCC;
+        let err = build_patched_backing_slab(
+            &raw_capture,
+            &[
+                global(ROUTEN_A_BASE, a, false),
+                global(ROUTEN_B_BASE, b, false),
+            ],
+            &[],
+            &["t1", "t2"],
+        )
+        .unwrap_err();
+        match err {
+            OverlayError::TransformWriteConflict {
+                a_child_old_base,
+                b_child_old_base,
+                a_after_byte,
+                b_after_byte,
+                ..
+            } => {
+                // The two REAL children are reported (not the current child twice).
+                assert_eq!(a_child_old_base, ROUTEN_A_BASE);
+                assert_eq!(b_child_old_base, ROUTEN_B_BASE);
+                assert_eq!(a_after_byte, 0xBB);
+                assert_eq!(b_after_byte, 0xCC);
+            }
+            other => panic!("expected TransformWriteConflict, got {other:?}"),
+        }
+    }
+
+    // Input order independence: reversing child order gives the same result.
+    #[test]
+    fn r0f_input_order_does_not_change_overlay_result() {
+        let raw_capture = route_n_raw_capture(0xAA);
+        let mut a = vec![0xAAu8; ROUTEN_VIEW_SZ];
+        a[..0x50].fill(0xBB);
+        let mut b = vec![0xAAu8; ROUTEN_VIEW_SZ];
+        b[0x3e0..].fill(0xCC);
+        let g_a = global(ROUTEN_A_BASE, a.clone(), false);
+        let g_b = global(ROUTEN_B_BASE, b.clone(), false);
+        let (p1, _) =
+            build_patched_backing_slab(&raw_capture, &[g_a.clone(), g_b.clone()], &[], &["t"])
+                .unwrap();
+        let (p2, _) = build_patched_backing_slab(&raw_capture, &[g_b, g_a], &[], &["t"]).unwrap();
+        assert_eq!(p1.content, p2.content);
+    }
+
+    // The Route N geometry (two 0x400 views, base delta 0x50, overlap 0x3b0)
+    // with NO transforms produces NO conflict.
+    #[test]
+    fn r0f_route_n_overlapping_probe_windows_no_conflict() {
+        assert_eq!(ROUTEN_B_BASE - ROUTEN_A_BASE, 0x50);
+        assert_eq!(0x400 - (ROUTEN_B_BASE - ROUTEN_A_BASE) as usize, 0x3b0);
+        let raw_capture = route_n_raw_capture(0xAA);
+        let a = global(ROUTEN_A_BASE, vec![0xAAu8; 0x400], false);
+        let b = global(ROUTEN_B_BASE, vec![0xAAu8; 0x400], false);
+        // Raw coherence passes (both match slab), and no writes -> no conflict.
+        assert!(build_patched_backing_slab(&raw_capture, &[a, b], &[], &["t"]).is_ok());
+    }
+
+    // GTO R0-F: a TransformWriteConflict reports the exact slab offset of the
+    // first mismatching byte (not just the range start).
+    #[test]
+    fn r0f_conflict_reports_first_mismatching_slab_byte() {
+        let raw_capture = route_n_raw_capture(0xAA);
+        let a_off = (ROUTEN_A_BASE - ROUTEN_SLAB_BASE) as usize;
+        // A writes at A_off+0x50; B writes at the same slab byte differently.
+        let mut a = vec![0xAAu8; ROUTEN_VIEW_SZ];
+        a[0x50] = 0xBB;
+        let mut b = vec![0xAAu8; ROUTEN_VIEW_SZ];
+        b[0x00] = 0xCC;
+        let err = build_patched_backing_slab(
+            &raw_capture,
+            &[
+                global(ROUTEN_A_BASE, a, false),
+                global(ROUTEN_B_BASE, b, false),
+            ],
+            &[],
+            &["t1", "t2"],
+        )
+        .unwrap_err();
+        match err {
+            OverlayError::TransformWriteConflict {
+                first_mismatch_slab_offset,
+                before_byte,
+                ..
+            } => {
+                assert_eq!(first_mismatch_slab_offset, a_off + 0x50);
+                assert_eq!(before_byte, 0xAA);
+            }
+            other => panic!("expected TransformWriteConflict, got {other:?}"),
+        }
+    }
+
+    // GTO R0-F: a probe-window capture (first-hop estimate without a proven
+    // boundary) must be classified as ProbeWindow, not ObservedAllocation.
+    #[test]
+    fn r0f_probe_window_is_not_claimed_as_allocation_extent() {
+        let mut g = global(ROUTEN_A_BASE, vec![0xAAu8; ROUTEN_VIEW_SZ], false);
+        // The default for a generic helper is ProbeWindow (the conservative
+        // reading). A first-hop probe that only proves readability, not a
+        // boundary, must stay ProbeWindow.
+        assert_eq!(g.extent_kind, CaptureExtentKind::ProbeWindow);
+        // Explicitly mark an observed allocation when a boundary is proven.
+        g.extent_kind = CaptureExtentKind::ObservedAllocation;
+        assert_eq!(g.extent_kind, CaptureExtentKind::ObservedAllocation);
     }
 }

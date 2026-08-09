@@ -2316,6 +2316,7 @@ pub fn finalize_summary_after_install(
 
 #[cfg(test)]
 mod tests {
+    use super::super::heap_global_snapshot::CaptureExtentKind;
     use super::*;
 
     fn container(rva: u32, begin: u64, end: u64, cap: u64, content: Vec<u8>) -> ContainerSnapshot {
@@ -2337,6 +2338,7 @@ mod tests {
             is_heap_handle: false,
             is_image_inline: inline,
             provenance: RegionProvenance::default(),
+            extent_kind: CaptureExtentKind::default(),
         }
     }
 
@@ -3573,6 +3575,7 @@ mod tests {
             content: Vec::new(),
             is_heap_handle: true,
             is_image_inline: false,
+            extent_kind: CaptureExtentKind::default(),
             provenance: RegionProvenance::default(),
         };
         let plan = build_plan(&[], &[handle], None).unwrap();
