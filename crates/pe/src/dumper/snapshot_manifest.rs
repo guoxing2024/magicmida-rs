@@ -420,7 +420,9 @@ pub(crate) fn render_manifest_json(
 
 #[cfg(test)]
 mod tests {
-    use super::super::heap_global_snapshot::{CaptureExtentKind, RegionProvenance};
+    use super::super::heap_global_snapshot::{
+        CaptureExtentEvidence, CaptureExtentKind, RegionProvenance,
+    };
     use super::*;
 
     #[test]
@@ -473,6 +475,7 @@ mod tests {
                 is_heap_handle: false,
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
+                extent_evidence: CaptureExtentEvidence::default(),
                 provenance: RegionProvenance::default(),
             },
             HeapGlobalSnapshot {
@@ -482,6 +485,7 @@ mod tests {
                 is_heap_handle: false,
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
+                extent_evidence: CaptureExtentEvidence::default(),
                 provenance: RegionProvenance::default(),
             },
         ];

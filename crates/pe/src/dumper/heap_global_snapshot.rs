@@ -184,6 +184,51 @@ pub enum CaptureExtentKind {
     SyntheticDerived,
 }
 
+/// How a heap-global snapshot was captured (GTO Core Recovery R0-F.1).
+/// Binds the source path so probe windows are distinguished from observed
+/// allocations, and runtime ownership can be derived deterministically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CapturePath {
+    /// Read directly from an image slot / root (main detection).
+    #[default]
+    MainSlot,
+    /// Force-admitted gscript first-hop edge.
+    GscriptFirstHop,
+    /// Force-admitted gscript child link field.
+    GscriptChildLink,
+    /// Captured string-buffer child (refcounted shell).
+    StringBufferChild,
+    /// Captured dangling edge (final walk).
+    DanglingEdge,
+    /// Image-inline object body (not a heap extent).
+    ImageInline,
+    /// Synthesized by an offline transform.
+    Synthetic,
+}
+
+/// Capture evidence bound to a first-hop / interior snapshot (GTO R0-F.1).
+/// Records enough to derive runtime ownership and alias relationships without
+/// re-reading the debuggee.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CaptureExtentEvidence {
+    /// Deterministic capture id for ledger/reference.
+    pub capture_id: String,
+    /// Which capture path produced this snapshot.
+    pub capture_path: CapturePath,
+    /// Root image RVA that led to this capture (e.g. gscript root).
+    pub source_root_rva: Option<u32>,
+    /// Byte offset of the source slot within the root, if known.
+    pub source_slot_offset: Option<usize>,
+    /// The probe size requested (e.g. first-hop probe cap).
+    pub probe_requested_size: usize,
+    /// Whether this pointer was interior to an already-captured object.
+    pub was_interior: bool,
+    /// Old base of the containing parent object, if any.
+    pub containing_parent_old_base: Option<u64>,
+    /// Size of the containing parent, if any.
+    pub containing_parent_size: Option<usize>,
+}
+
 /// `old=live_ptr(=image_base+rva) → new=image_base+rva` so child edges that
 /// still hold the live image base remap correctly. Planting a heap clone at
 /// `*[rva]` is wrong for this class (R-GTO-UI script-heap-resume).
@@ -205,6 +250,9 @@ pub struct HeapGlobalSnapshot {
     pub provenance: RegionProvenance,
     /// Extent classification (GTO R0-F). Default `ProbeWindow`.
     pub extent_kind: CaptureExtentKind,
+    /// Capture evidence (GTO R0-F.1). Bound to first-hop / interior snapshots
+    /// so runtime ownership can be derived deterministically.
+    pub extent_evidence: CaptureExtentEvidence,
 }
 
 /// A captured heap slab: one contiguous blob covering the span of all
@@ -648,6 +696,7 @@ pub fn detect_heap_globals(
                 is_heap_handle: true,
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
+                extent_evidence: CaptureExtentEvidence::default(),
                 provenance: RegionProvenance::default(),
             });
             continue;
@@ -790,6 +839,7 @@ pub fn detect_heap_globals(
             is_heap_handle: false,
             is_image_inline: false,
             extent_kind: CaptureExtentKind::default(),
+            extent_evidence: CaptureExtentEvidence::default(),
             provenance: RegionProvenance::default(),
         });
     }
@@ -1318,6 +1368,7 @@ fn capture_image_inline_gscript(
         is_heap_handle: false,
         is_image_inline: true,
         extent_kind: CaptureExtentKind::default(),
+        extent_evidence: CaptureExtentEvidence::default(),
         provenance: RegionProvenance::default(),
     });
 }
@@ -1383,6 +1434,7 @@ fn ensure_hot_root_slots(
                     is_heap_handle: true,
                     is_image_inline: false,
                     extent_kind: CaptureExtentKind::default(),
+                    extent_evidence: CaptureExtentEvidence::default(),
                     provenance: RegionProvenance::default(),
                 });
                 continue;
@@ -1409,6 +1461,7 @@ fn ensure_hot_root_slots(
                 is_heap_handle: true,
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
+                extent_evidence: CaptureExtentEvidence::default(),
                 provenance: RegionProvenance::default(),
             });
             continue;
@@ -1535,6 +1588,7 @@ fn ensure_hot_root_slots(
                 is_heap_handle: false,
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
+                extent_evidence: CaptureExtentEvidence::default(),
                 provenance: RegionProvenance::default(),
             });
             continue;
@@ -1609,6 +1663,7 @@ fn ensure_hot_root_slots(
             is_heap_handle: false,
             is_image_inline: false,
             extent_kind: CaptureExtentKind::default(),
+            extent_evidence: CaptureExtentEvidence::default(),
             provenance: RegionProvenance::default(),
         });
     }
@@ -1796,13 +1851,45 @@ fn exhaust_gscript_first_hop(
             "Captured gscript first-hop edge (force-admit)"
         );
         *total_bytes = total_bytes.saturating_add(child.len());
+        // GTO R0-F.1: classify this first-hop capture. If it landed inside an
+        // already-captured object it is an InteriorSubview; otherwise it is a
+        // ProbeWindow (estimate_object_size returned a probe, no boundary proof).
+        // Neither may become an independent heap allocation (normalize_containment
+        // absorbs them into the slab or fails closed).
+        let containing_parent = if was_interior {
+            out.iter()
+                .find(|o| {
+                    !o.is_heap_handle
+                        && !o.content.is_empty()
+                        && o.live_ptr <= value
+                        && value < o.live_ptr.saturating_add(o.content.len() as u64)
+                })
+                .map(|o| (o.live_ptr, o.content.len()))
+        } else {
+            None
+        };
+        let extent_kind = if was_interior {
+            CaptureExtentKind::InteriorSubview
+        } else {
+            CaptureExtentKind::ProbeWindow
+        };
         out.push(HeapGlobalSnapshot {
             rva: 0,
             live_ptr: value,
             content: child,
             is_heap_handle: false,
             is_image_inline: false,
-            extent_kind: CaptureExtentKind::default(),
+            extent_kind,
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: format!("gscript_first_hop:{edge_off:#x}"),
+                capture_path: CapturePath::GscriptFirstHop,
+                source_root_rva: Some(gscript_rva),
+                source_slot_offset: Some(edge_off),
+                probe_requested_size: policy.first_hop_probe().min(MAX_HEAP_GLOBAL_BYTES),
+                was_interior,
+                containing_parent_old_base: containing_parent.map(|(b, _)| b),
+                containing_parent_size: containing_parent.map(|(_, s)| s),
+            },
             provenance: RegionProvenance::default(),
         });
         added += 1;
@@ -1978,6 +2065,7 @@ fn exhaust_gscript_child_link_fields(
                 is_heap_handle: false,
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
+                extent_evidence: CaptureExtentEvidence::default(),
                 provenance: RegionProvenance::default(),
             });
             added += 1;
@@ -2132,6 +2220,7 @@ pub fn repair_gscript_window_strings(heap_globals: &mut Vec<HeapGlobalSnapshot>)
             is_heap_handle: false,
             is_image_inline: false,
             extent_kind: CaptureExtentKind::default(),
+            extent_evidence: CaptureExtentEvidence::default(),
             provenance: RegionProvenance::SyntheticDerived {
                 transform_id: "repair_gscript_window_strings".to_string(),
                 source_anchor: anchor.to_string(),
@@ -2498,6 +2587,7 @@ pub fn repair_label_names_after_scrub(heap_globals: &mut Vec<HeapGlobalSnapshot>
                 is_heap_handle: false,
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
+                extent_evidence: CaptureExtentEvidence::default(),
                 provenance: RegionProvenance::default(),
             });
             names_added += 1;
@@ -2770,6 +2860,7 @@ fn exhaust_gscript_label_table_entries(
             is_heap_handle: false,
             is_image_inline: false,
             extent_kind: CaptureExtentKind::default(),
+            extent_evidence: CaptureExtentEvidence::default(),
             provenance: RegionProvenance::default(),
         });
         added += 1;
@@ -2895,6 +2986,7 @@ fn externalize_label_name_field(
             is_heap_handle: false,
             is_image_inline: false,
             extent_kind: CaptureExtentKind::default(),
+            extent_evidence: CaptureExtentEvidence::default(),
             provenance: RegionProvenance::default(),
         });
     }
@@ -3082,6 +3174,7 @@ fn externalize_all_label_names_from_table(
                 is_heap_handle: false,
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
+                extent_evidence: CaptureExtentEvidence::default(),
                 provenance: RegionProvenance::default(),
             });
             fixed += 1;
@@ -3471,6 +3564,7 @@ fn exhaust_pointer_table_first_hop_span(
             is_heap_handle: false,
             is_image_inline: false,
             extent_kind: CaptureExtentKind::default(),
+            extent_evidence: CaptureExtentEvidence::default(),
             provenance: RegionProvenance::default(),
         });
         added += 1;
@@ -3707,6 +3801,7 @@ fn expand_hot_root_children(
                 is_heap_handle: false,
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
+                extent_evidence: CaptureExtentEvidence::default(),
                 provenance: RegionProvenance::default(),
             });
             added += 1;
@@ -3948,6 +4043,7 @@ fn expand_heap_graph(
                 is_heap_handle: false,
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
+                extent_evidence: CaptureExtentEvidence::default(),
                 provenance: RegionProvenance::default(),
             });
             node_priority.push(child_pri);
@@ -4173,6 +4269,7 @@ fn admit_string_buffer_child(
         is_heap_handle: false,
         is_image_inline: false,
         extent_kind: CaptureExtentKind::default(),
+        extent_evidence: CaptureExtentEvidence::default(),
         provenance: RegionProvenance::default(),
     });
     true
@@ -4355,6 +4452,7 @@ fn split_swallowed_siblings(
                 is_heap_handle: false,
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
+                extent_evidence: CaptureExtentEvidence::default(),
                 provenance: RegionProvenance::default(),
             });
             added += 1;
@@ -4524,6 +4622,7 @@ fn capture_dangling_edges(
             is_heap_handle: false,
             is_image_inline: false,
             extent_kind: CaptureExtentKind::default(),
+            extent_evidence: CaptureExtentEvidence::default(),
             provenance: RegionProvenance::default(),
         });
         added += 1;
@@ -5214,6 +5313,7 @@ mod tests {
                 is_heap_handle: false,
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
+                extent_evidence: CaptureExtentEvidence::default(),
                 provenance: RegionProvenance::default(),
             },
             HeapGlobalSnapshot {
@@ -5223,6 +5323,7 @@ mod tests {
                 is_heap_handle: false,
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
+                extent_evidence: CaptureExtentEvidence::default(),
                 provenance: RegionProvenance::default(),
             },
         ];
@@ -5246,6 +5347,7 @@ mod tests {
                 is_heap_handle: false,
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
+                extent_evidence: CaptureExtentEvidence::default(),
                 provenance: RegionProvenance::default(),
             },
             HeapGlobalSnapshot {
@@ -5255,6 +5357,7 @@ mod tests {
                 is_heap_handle: false,
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
+                extent_evidence: CaptureExtentEvidence::default(),
                 provenance: RegionProvenance::default(),
             },
             // Heap handle must not set min_obj by itself.
@@ -5265,6 +5368,7 @@ mod tests {
                 is_heap_handle: true,
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
+                extent_evidence: CaptureExtentEvidence::default(),
                 provenance: RegionProvenance::default(),
             },
         ];
@@ -5295,6 +5399,7 @@ mod tests {
             is_heap_handle: false,
             is_image_inline: false,
             extent_kind: CaptureExtentKind::default(),
+            extent_evidence: CaptureExtentEvidence::default(),
             provenance: RegionProvenance::default(),
         }];
         assert!(compute_heap_slab_span(&globals).is_none());
@@ -5314,6 +5419,7 @@ mod tests {
             is_heap_handle: false,
             is_image_inline: true,
             extent_kind: CaptureExtentKind::default(),
+            extent_evidence: CaptureExtentEvidence::default(),
             provenance: RegionProvenance::ImageInline,
         };
         gscript.content[0xbd0..0xbd8].copy_from_slice(&0xa190a8u64.to_le_bytes());
@@ -5373,6 +5479,7 @@ mod tests {
                 is_heap_handle: false,
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
+                extent_evidence: CaptureExtentEvidence::default(),
                 provenance: RegionProvenance::default(),
             },
             HeapGlobalSnapshot {
@@ -5382,6 +5489,7 @@ mod tests {
                 is_heap_handle: false,
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
+                extent_evidence: CaptureExtentEvidence::default(),
                 provenance: RegionProvenance::default(),
             },
         ];
@@ -5416,6 +5524,7 @@ mod tests {
                 is_heap_handle: false,
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
+                extent_evidence: CaptureExtentEvidence::default(),
                 provenance: RegionProvenance::default(),
             },
             HeapGlobalSnapshot {
@@ -5425,6 +5534,7 @@ mod tests {
                 is_heap_handle: false,
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
+                extent_evidence: CaptureExtentEvidence::default(),
                 provenance: RegionProvenance::default(),
             },
         ];
@@ -5455,6 +5565,7 @@ mod tests {
                 is_heap_handle: false,
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
+                extent_evidence: CaptureExtentEvidence::default(),
                 provenance: RegionProvenance::default(),
             },
             HeapGlobalSnapshot {
@@ -5464,6 +5575,7 @@ mod tests {
                 is_heap_handle: false,
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
+                extent_evidence: CaptureExtentEvidence::default(),
                 provenance: RegionProvenance::default(),
             },
         ];
@@ -5487,6 +5599,7 @@ mod tests {
                 is_heap_handle: false,
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
+                extent_evidence: CaptureExtentEvidence::default(),
                 provenance: RegionProvenance::default(),
             },
             HeapGlobalSnapshot {
@@ -5496,6 +5609,7 @@ mod tests {
                 is_heap_handle: false,
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
+                extent_evidence: CaptureExtentEvidence::default(),
                 provenance: RegionProvenance::default(),
             },
         ];
@@ -5512,6 +5626,7 @@ mod tests {
                 is_heap_handle: false,
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
+                extent_evidence: CaptureExtentEvidence::default(),
                 provenance: RegionProvenance::default(),
             },
             HeapGlobalSnapshot {
@@ -5521,6 +5636,7 @@ mod tests {
                 is_heap_handle: false,
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
+                extent_evidence: CaptureExtentEvidence::default(),
                 provenance: RegionProvenance::default(),
             },
         ];

@@ -157,6 +157,34 @@ pub struct RebaseRegion {
     /// reported as raw-captured; UnknownSynthetic must not reach a Complete
     /// plan.
     pub provenance: RegionProvenance,
+    /// Extent classification (GTO R0-F.1). Probe windows must not become
+    /// independent allocations; they are absorbed as slab aliases or fail
+    /// closed.
+    pub extent_kind: crate::dumper::heap_global_snapshot::CaptureExtentKind,
+    /// Runtime ownership (GTO R0-F.1). Derives how this region is materialized
+    /// at cold-start (independent HeapAlloc vs slab-owned alias vs image).
+    pub ownership: RuntimeRegionOwnership,
+}
+
+/// How a region is owned/materialized at runtime (GTO Core Recovery R0-F.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeRegionOwnership {
+    /// A fresh independent heap allocation at cold-start.
+    IndependentAllocation,
+    /// An alias of an authoritative parent region (e.g. a probe window or
+    /// interior subview inside a heap slab). Not independently allocated.
+    SlabOwnedAlias {
+        /// Plan id of the authoritative parent region.
+        parent_region: usize,
+        /// Byte offset of this alias within the parent's old range.
+        parent_offset: u64,
+    },
+    /// An image-inline object body (owned by the image, not the heap).
+    ImageInline,
+    /// A synthetic region allocated independently at cold-start.
+    SyntheticAllocation,
+    /// Resolved through the external resolver / IAT at cold-start.
+    ExternalResolved,
 }
 
 /// Provenance of a rebase region (diagnostic only).
@@ -302,6 +330,8 @@ pub struct RegionAlias {
     pub required: bool,
     /// sha256 of the child's captured bytes (for content verification).
     pub content_digest: String,
+    /// Extent classification of the absorbed child (GTO R0-F.1).
+    pub extent_kind: crate::dumper::heap_global_snapshot::CaptureExtentKind,
 }
 
 /// A declared pointer slot inside a captured region.
@@ -504,6 +534,21 @@ impl RuntimeRebasePlan {
                 | RegionProvenance::ExternalResolved
                 | RegionProvenance::UnknownSynthetic => {}
             }
+            // GTO R0-F.1: bind extent kind + runtime ownership into the plan
+            // digest so a probe-window classification change, ownership change,
+            // alias parent, or alias offset alters the digest.
+            out.push(extent_kind_tag(&r.extent_kind));
+            out.push(ownership_tag(&r.ownership));
+            match &r.ownership {
+                RuntimeRegionOwnership::SlabOwnedAlias {
+                    parent_region,
+                    parent_offset,
+                } => {
+                    out.extend_from_slice(&(*parent_region as u64).to_le_bytes());
+                    out.extend_from_slice(&parent_offset.to_le_bytes());
+                }
+                _ => {}
+            }
         }
         for p in &self.pointers {
             out.extend_from_slice(&p.source_region.to_le_bytes());
@@ -578,6 +623,8 @@ impl RuntimeRebasePlan {
             out.push(a.required as u8);
             out.extend_from_slice(a.content_digest.as_bytes());
             out.push(0);
+            // GTO R0-F.1: bind the alias's extent kind into the digest.
+            out.push(extent_kind_tag(&a.extent_kind));
         }
         out
     }
@@ -623,6 +670,29 @@ fn region_provenance_tag(p: &RegionProvenance) -> u8 {
         RegionProvenance::ImageInline => 3,
         RegionProvenance::ExternalResolved => 4,
         RegionProvenance::UnknownSynthetic => 5,
+    }
+}
+
+/// Deterministic extent-kind tag for plan digest binding (GTO R0-F.1).
+fn extent_kind_tag(e: &crate::dumper::heap_global_snapshot::CaptureExtentKind) -> u8 {
+    use crate::dumper::heap_global_snapshot::CaptureExtentKind as CEK;
+    match e {
+        CEK::ProbeWindow => 0,
+        CEK::ObservedAllocation => 1,
+        CEK::BackingObject => 2,
+        CEK::InteriorSubview => 3,
+        CEK::SyntheticDerived => 4,
+    }
+}
+
+/// Deterministic ownership tag for plan digest binding (GTO R0-F.1).
+fn ownership_tag(o: &RuntimeRegionOwnership) -> u8 {
+    match o {
+        RuntimeRegionOwnership::IndependentAllocation => 0,
+        RuntimeRegionOwnership::SlabOwnedAlias { .. } => 1,
+        RuntimeRegionOwnership::ImageInline => 2,
+        RuntimeRegionOwnership::SyntheticAllocation => 3,
+        RuntimeRegionOwnership::ExternalResolved => 4,
     }
 }
 
@@ -884,6 +954,8 @@ pub fn build_runtime_rebase_plan(
             provenance: RegionProvenance::RawCaptured {
                 raw_digest: String::new(),
             },
+            extent_kind: crate::dumper::heap_global_snapshot::CaptureExtentKind::ObservedAllocation,
+            ownership: RuntimeRegionOwnership::IndependentAllocation,
         });
         id = id.saturating_add(1);
     }
@@ -910,6 +982,8 @@ pub fn build_runtime_rebase_plan(
                 kind: RegionKind::HeapGlobal,
                 image_inline_rva: Some(rva),
                 provenance: RegionProvenance::ImageInline,
+                extent_kind: crate::dumper::heap_global_snapshot::CaptureExtentKind::BackingObject,
+                ownership: RuntimeRegionOwnership::ImageInline,
             });
             id = id.saturating_add(1);
             continue;
@@ -924,6 +998,8 @@ pub fn build_runtime_rebase_plan(
             kind: RegionKind::HeapGlobal,
             image_inline_rva: None,
             provenance: g.provenance.clone(),
+            extent_kind: g.extent_kind,
+            ownership: RuntimeRegionOwnership::IndependentAllocation,
         });
         id = id.saturating_add(1);
     }
@@ -941,6 +1017,8 @@ pub fn build_runtime_rebase_plan(
                 provenance: RegionProvenance::RawCaptured {
                     raw_digest: String::new(),
                 },
+                extent_kind: crate::dumper::heap_global_snapshot::CaptureExtentKind::BackingObject,
+                ownership: RuntimeRegionOwnership::IndependentAllocation,
             });
         }
     }
@@ -1246,6 +1324,7 @@ fn normalize_containment(
                     )));
                 }
                 // Absorb child into the slab (no separate runtime allocation).
+                // The child becomes a SlabOwnedAlias of the parent slab.
                 aliases.push(RegionAlias {
                     alias_old_base: r.old_base,
                     alias_size: r.size,
@@ -1254,10 +1333,23 @@ fn normalize_containment(
                     original_kind: r.kind,
                     required: r.required,
                     content_digest: sha256_hex(&r.bytes),
+                    extent_kind: r.extent_kind,
                 });
                 absorbed.insert(i);
                 old_base_map.insert(r.old_base, (sid, off));
                 continue;
+            }
+            // GTO R0-F.1: a ProbeWindow or InteriorSubview that is NOT contained
+            // in any authoritative slab/parent cannot become an independent
+            // allocation (a heuristic read window is not a proven heap extent).
+            // Fail closed rather than allocate an unproven region.
+            use crate::dumper::heap_global_snapshot::CaptureExtentKind as CEK;
+            if matches!(r.extent_kind, CEK::ProbeWindow | CEK::InteriorSubview) {
+                return Err(RebaseError::Plan(format!(
+                    "probe/interior region {} (0x{:x},+{:#x}, extent={:?}) is not contained in \
+                     any authoritative slab/parent; refusing independent allocation",
+                    i, r.old_base, r.size, r.extent_kind
+                )));
             }
         }
         // Not absorbed: a backing region.
@@ -2316,7 +2408,7 @@ pub fn finalize_summary_after_install(
 
 #[cfg(test)]
 mod tests {
-    use super::super::heap_global_snapshot::CaptureExtentKind;
+    use super::super::heap_global_snapshot::{CaptureExtentEvidence, CaptureExtentKind};
     use super::*;
 
     fn container(rva: u32, begin: u64, end: u64, cap: u64, content: Vec<u8>) -> ContainerSnapshot {
@@ -2338,7 +2430,8 @@ mod tests {
             is_heap_handle: false,
             is_image_inline: inline,
             provenance: RegionProvenance::default(),
-            extent_kind: CaptureExtentKind::default(),
+            extent_kind: CaptureExtentKind::ObservedAllocation,
+            extent_evidence: CaptureExtentEvidence::default(),
         }
     }
 
@@ -3237,6 +3330,8 @@ mod tests {
             provenance: RegionProvenance::RawCaptured {
                 raw_digest: String::new(),
             },
+            extent_kind: crate::dumper::heap_global_snapshot::CaptureExtentKind::default(),
+            ownership: RuntimeRegionOwnership::IndependentAllocation,
         };
         let mut map = std::collections::BTreeMap::new();
         map.insert(0x200000u64, (0usize, 0x1000usize)); // child base -> slab+0x1000
@@ -3262,6 +3357,8 @@ mod tests {
             provenance: RegionProvenance::RawCaptured {
                 raw_digest: String::new(),
             },
+            extent_kind: crate::dumper::heap_global_snapshot::CaptureExtentKind::default(),
+            ownership: RuntimeRegionOwnership::IndependentAllocation,
         };
         let mut map2 = std::collections::BTreeMap::new();
         map2.insert(0x200000u64, (0usize, 0x10usize)); // offset 16 == slab size
@@ -3511,6 +3608,8 @@ mod tests {
                 provenance: RegionProvenance::RawCaptured {
                     raw_digest: String::new(),
                 },
+                extent_kind: crate::dumper::heap_global_snapshot::CaptureExtentKind::default(),
+                ownership: RuntimeRegionOwnership::IndependentAllocation,
             },
             RebaseRegion {
                 id: 1,
@@ -3524,6 +3623,8 @@ mod tests {
                 provenance: RegionProvenance::RawCaptured {
                     raw_digest: String::new(),
                 },
+                extent_kind: crate::dumper::heap_global_snapshot::CaptureExtentKind::default(),
+                ownership: RuntimeRegionOwnership::IndependentAllocation,
             },
         ];
         let cls = classify_value(0x1ff150, &regs, OLD_IB, NEW_IB);
@@ -3575,7 +3676,8 @@ mod tests {
             content: Vec::new(),
             is_heap_handle: true,
             is_image_inline: false,
-            extent_kind: CaptureExtentKind::default(),
+            extent_kind: CaptureExtentKind::ObservedAllocation,
+            extent_evidence: CaptureExtentEvidence::default(),
             provenance: RegionProvenance::default(),
         };
         let plan = build_plan(&[], &[handle], None).unwrap();
@@ -3914,5 +4016,154 @@ mod tests {
             res.is_err(),
             "oversized slab must fail closed, not produce a plan"
         );
+    }
+
+    // ---------- GTO Core Recovery R0-F.1 tests ----------
+
+    use crate::dumper::heap_global_snapshot::CaptureExtentKind as CEK;
+
+    // Route N geometry: two overlapping first-hop probe views inside one slab.
+    fn route_n_plan_globals() -> (HeapSlab, Vec<HeapGlobalSnapshot>) {
+        const SLAB_BASE: u64 = 0x14f000;
+        const VIEW_A: u64 = 0x96bb80;
+        const VIEW_B: u64 = 0x96bbd0;
+        let a_off = (VIEW_A - SLAB_BASE) as usize; // 0x81cb80
+        let b_off = (VIEW_B - SLAB_BASE) as usize; // 0x81cbd0
+        let mut slab_content = vec![0u8; b_off + 0x400];
+        for i in 0..0x400 {
+            slab_content[a_off + i] = 0xAA;
+            slab_content[b_off + i] = 0xAA;
+        }
+        let slab = HeapSlab {
+            old_base: SLAB_BASE,
+            content: slab_content,
+        };
+        let mut view_a = global(0x0, VIEW_A, vec![0xAAu8; 0x400], false);
+        view_a.extent_kind = CEK::ProbeWindow;
+        let mut view_b = global(0x0, VIEW_B, vec![0xAAu8; 0x400], false);
+        view_b.extent_kind = CEK::InteriorSubview;
+        (slab, vec![view_a, view_b])
+    }
+
+    // The two overlapping Route N views must share ONE backing allocation (the
+    // slab) as SlabOwnedAliases, not two independent regions.
+    #[test]
+    fn r0f1_route_n_views_share_one_runtime_allocation() {
+        let (slab, globals) = route_n_plan_globals();
+        let plan = build_plan(&[], &globals, Some(&slab)).unwrap().unwrap();
+        // One slab backing region + zero independent heap-global regions.
+        assert_eq!(plan.regions.len(), 1);
+        assert_eq!(plan.regions[0].kind, RegionKind::HeapSlab);
+        // Both views are absorbed aliases.
+        assert_eq!(plan.aliases.len(), 2);
+        // Alias parent_region is the slab.
+        for a in &plan.aliases {
+            assert_eq!(a.parent_region, 0);
+        }
+    }
+
+    // The Route N alias offsets must be 0x81cb80 and 0x81cbd0.
+    #[test]
+    fn r0f1_route_n_alias_offsets_are_81cb80_and_81cbd0() {
+        let (slab, globals) = route_n_plan_globals();
+        let plan = build_plan(&[], &globals, Some(&slab)).unwrap().unwrap();
+        let offsets: Vec<usize> = plan.aliases.iter().map(|a| a.parent_offset).collect();
+        assert!(offsets.contains(&0x81cb80usize));
+        assert!(offsets.contains(&0x81cbd0usize));
+    }
+
+    // Exact pointer targets for the two views translate to the same slab parent
+    // at the correct offsets.
+    #[test]
+    fn r0f1_route_n_exact_pointer_targets_translate_to_same_parent() {
+        const SLAB_BASE: u64 = 0x14f000;
+        const VIEW_A: u64 = 0x96bb80;
+        const VIEW_B: u64 = 0x96bbd0;
+        let a_off = (VIEW_A - SLAB_BASE) as usize; // 0x81cb80
+        let b_off = (VIEW_B - SLAB_BASE) as usize; // 0x81cbd0
+                                                   // Build view contents that AGREE in the overlapping region so the slab
+                                                   // slice is coherent with both. A has a self-pointer at [0..8]; B has a
+                                                   // self-pointer at [0..8]; A's overlap bytes ([0x50..]) equal B's bytes.
+        let mut content_a = vec![0xAAu8; 0x400];
+        content_a[0..8].copy_from_slice(&VIEW_A.to_le_bytes());
+        let mut content_b = vec![0xAAu8; 0x400];
+        content_b[0..8].copy_from_slice(&VIEW_B.to_le_bytes());
+        // Make A's overlap bytes (slab [b_off..a_off+0x400)) equal B's bytes.
+        content_a[0x50..0x400].copy_from_slice(&content_b[0..0x400 - 0x50]);
+        // Slab slice at each view offset is coherent with the respective view.
+        let mut slab_content = vec![0u8; b_off + 0x400];
+        slab_content[a_off..a_off + 0x400].copy_from_slice(&content_a);
+        slab_content[b_off..b_off + 0x400].copy_from_slice(&content_b);
+        let slab = HeapSlab {
+            old_base: SLAB_BASE,
+            content: slab_content,
+        };
+        let mut view_a = global(0x0, VIEW_A, content_a, false);
+        view_a.extent_kind = CEK::ProbeWindow;
+        let mut view_b = global(0x0, VIEW_B, content_b, false);
+        view_b.extent_kind = CEK::InteriorSubview;
+        let globals = vec![view_a, view_b];
+        let plan = build_plan(&[], &globals, Some(&slab)).unwrap().unwrap();
+        // Find pointers whose original value targets A or B.
+        let target_a: Vec<_> = plan
+            .pointers
+            .iter()
+            .filter(|p| p.original_value == VIEW_A)
+            .collect();
+        let target_b: Vec<_> = plan
+            .pointers
+            .iter()
+            .filter(|p| p.original_value == VIEW_B)
+            .collect();
+        // Each exact target resolves to the slab parent (region 0) at its offset.
+        for p in target_a.iter().chain(target_b.iter()) {
+            assert_eq!(p.target_region, Some(0), "must target slab parent");
+            assert_eq!(
+                p.target_offset,
+                Some(p.original_value - SLAB_BASE),
+                "target offset must equal old_base - slab_base"
+            );
+        }
+        assert!(!target_a.is_empty());
+        assert!(!target_b.is_empty());
+    }
+
+    // A probe window NOT inside any slab/parent must fail closed rather than
+    // become an independent allocation.
+    #[test]
+    fn r0f1_probe_window_outside_slab_fails_closed() {
+        // No slab; a single ProbeWindow region.
+        let mut g = global(0x0, 0x500000, vec![0u8; 0x400], false);
+        g.extent_kind = CEK::ProbeWindow;
+        let res = build_plan(&[], &[g], None);
+        assert!(res.is_err(), "probe window outside slab must fail closed");
+    }
+
+    // Extent kind change must alter the plan digest (canonical bytes bind it).
+    #[test]
+    fn r0f1_extent_kind_changes_plan_digest() {
+        let (slab, globals) = route_n_plan_globals();
+        let p1 = build_plan(&[], &globals, Some(&slab)).unwrap().unwrap();
+        let mut globals2 = globals.clone();
+        globals2[0].extent_kind = CEK::ObservedAllocation;
+        let p2 = build_plan(&[], &globals2, Some(&slab)).unwrap().unwrap();
+        assert_ne!(p1.plan_digest, p2.plan_digest);
+    }
+
+    // Alias offset change must alter the plan digest.
+    #[test]
+    fn r0f1_alias_offset_changes_plan_digest() {
+        let (slab, globals) = route_n_plan_globals();
+        let p1 = build_plan(&[], &globals, Some(&slab)).unwrap().unwrap();
+        // Move view B by +0x10 so its alias offset changes (0x81cbe0).
+        let new_b = 0x96bbe0u64;
+        let new_b_off = (new_b - 0x14f000) as usize;
+        let mut globals2 = globals.clone();
+        globals2[1].live_ptr = new_b;
+        let mut slab2 = slab.clone();
+        slab2.content.resize(new_b_off + 0x400, 0u8);
+        slab2.content[new_b_off..new_b_off + 0x400].copy_from_slice(&vec![0xAAu8; 0x400]);
+        let p2 = build_plan(&[], &globals2, Some(&slab2)).unwrap().unwrap();
+        assert_ne!(p1.plan_digest, p2.plan_digest);
     }
 }

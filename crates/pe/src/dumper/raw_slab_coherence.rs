@@ -25,7 +25,7 @@ use super::container_snapshot::ContainerSnapshot;
 use super::heap_global_snapshot::{HeapGlobalSnapshot, HeapSlab, RegionProvenance};
 
 /// Kind of a captured child region (for overlay provenance).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RawChildKind {
     HeapGlobal,
     Container,
@@ -139,16 +139,20 @@ pub enum OverlayError {
         slab_offset: usize,
     },
     /// Two transforms write the SAME slab byte to DIFFERENT final values.
-    /// Genuine transformed write conflict (fail-closed). See GTO R0-F.
+    /// Genuine transformed write conflict (fail-closed). See GTO R0-F / R0-F.1.
     TransformWriteConflict {
         /// old base of the first (earlier-applied) child.
         a_child_old_base: u64,
-        /// size of the first child.
+        /// size of the first child (the ACTUAL existing peer).
         a_size: usize,
+        /// byte offset of the conflict within the first child.
+        a_child_byte_offset: usize,
         /// old base of the second (current) child.
         b_child_old_base: u64,
         /// size of the second child.
         b_size: usize,
+        /// byte offset of the conflict within the second child.
+        b_child_byte_offset: usize,
         /// slab offset of the first conflicting byte.
         first_mismatch_slab_offset: usize,
         /// the raw (before) byte value at that slab offset.
@@ -176,6 +180,10 @@ struct ResolvedWrite {
     value: u8,
     /// old base of the child that owns this write.
     child_old_base: u64,
+    /// size of the owning child (the ACTUAL existing peer, not the current).
+    child_size: usize,
+    /// byte offset of this write within the owning child.
+    child_byte_offset: usize,
     /// transform ids that produced this write.
     transform_ids: Vec<String>,
 }
@@ -246,8 +254,10 @@ impl std::fmt::Display for OverlayError {
             OverlayError::TransformWriteConflict {
                 a_child_old_base,
                 a_size,
+                a_child_byte_offset,
                 b_child_old_base,
                 b_size,
+                b_child_byte_offset,
                 first_mismatch_slab_offset,
                 before_byte,
                 a_after_byte,
@@ -256,13 +266,15 @@ impl std::fmt::Display for OverlayError {
                 b_transform_ids,
             } => write!(
                 f,
-                "transformed write conflict: [{:#x},+{:#x}) vs [{:#x},+{:#x}) \
+                "transformed write conflict: [{:#x},+{:#x})@+{:#x} vs [{:#x},+{:#x})@+{:#x} \
                  first_mismatch_slab_offset={:#x} before={:#04x} a_after={:#04x} b_after={:#04x} \
                  a_transform={:?} b_transform={:?}",
                 a_child_old_base,
                 a_size,
+                a_child_byte_offset,
                 b_child_old_base,
                 b_size,
+                b_child_byte_offset,
                 first_mismatch_slab_offset,
                 before_byte,
                 a_after_byte,
@@ -353,12 +365,16 @@ pub fn build_patched_backing_slab(
     let slab = &raw_capture.slab;
     let mut backing = slab.content.clone();
 
-    // Index raw children by old_base.
-    let raw_by_base: std::collections::BTreeMap<u64, &RawChild> = raw_capture
-        .children
-        .iter()
-        .map(|c| (c.old_base, c))
-        .collect();
+    // GTO R0-F.1: index raw children by (old_base, kind) preserving ALL entries.
+    // A silent BTreeMap collect would drop duplicates (last-write-wins). The
+    // lookup below reconciles duplicates: identical entries dedup deterministically,
+    // distinct entries with a provable slab-coherent authority use that one, and
+    // otherwise fail closed (no silent overwrite).
+    let mut raw_by_key: std::collections::BTreeMap<(u64, RawChildKind), Vec<&RawChild>> =
+        std::collections::BTreeMap::new();
+    for c in &raw_capture.children {
+        raw_by_key.entry((c.old_base, c.kind)).or_default().push(c);
+    }
 
     // Collect transformed children (heap-global + container) with provenance.
     // SyntheticDerived children (created by an offline transform, no raw
@@ -445,11 +461,55 @@ pub fn build_patched_backing_slab(
             let _ = source_anchor;
             continue;
         }
-        let Some(raw) = raw_by_base.get(&child_base).copied() else {
+        let Some(raws) = raw_by_key.get(&(child_base, kind)) else {
             return Err(OverlayError::RawChildMissing {
                 child_old_base: child_base,
                 child_kind: kind,
             });
+        };
+        // GTO R0-F.1: reconcile multiple raw children at the same (base, kind).
+        // Identical entries dedup deterministically; if more than one distinct
+        // raw snapshot remains, prefer the one coherent with the raw slab slice,
+        // else fail closed (ambiguous raw duplicate, never silently overwritten).
+        let raw = if raws.len() == 1 {
+            raws[0]
+        } else {
+            // Slab offset for coherence check.
+            let so = child_base
+                .checked_sub(slab.old_base)
+                .and_then(|v| usize::try_from(v).ok());
+            let distinct: Vec<&&RawChild> = raws
+                .iter()
+                .filter(|r| {
+                    so.and_then(|s| {
+                        slab.content
+                            .get(s..s + r.raw_bytes.len())
+                            .map(|slice| slice == r.raw_bytes.as_slice())
+                    })
+                    .unwrap_or(false)
+                })
+                .collect();
+            if distinct.len() == 1 {
+                distinct[0]
+            } else if distinct.len() > 1 {
+                // Multiple distinct raw children both coherent with the slab:
+                // ambiguous — the raw slab cannot distinguish them.
+                return Err(OverlayError::RawChildMissing {
+                    child_old_base: child_base,
+                    child_kind: kind,
+                });
+            } else {
+                // None coherent; dedup identical bytes only.
+                let first = raws[0];
+                if raws.iter().all(|r| r.raw_bytes == first.raw_bytes) {
+                    first
+                } else {
+                    return Err(OverlayError::RawChildMissing {
+                        child_old_base: child_base,
+                        child_kind: kind,
+                    });
+                }
+            }
         };
         // Slab offset = child_base - slab.old_base (checked).
         let Some(slab_offset) = child_base.checked_sub(slab.old_base) else {
@@ -564,6 +624,7 @@ pub fn build_patched_backing_slab(
         for &(so, _, ref bytes) in &write_runs {
             for (k, &val) in bytes.iter().enumerate() {
                 let abs = so + k;
+                let child_byte_offset = abs - slab_offset_us; // this child's byte offset
                 match resolved_writes.get(&abs) {
                     None => {
                         resolved_writes.insert(
@@ -571,6 +632,8 @@ pub fn build_patched_backing_slab(
                             ResolvedWrite {
                                 value: val,
                                 child_old_base: child_base,
+                                child_size,
+                                child_byte_offset,
                                 transform_ids: my_transform_ids.clone(),
                             },
                         );
@@ -586,13 +649,21 @@ pub fn build_patched_backing_slab(
                         }
                     }
                     Some(existing) => {
+                        // GTO R0-F.1: report the ACTUAL existing peer size (not
+                        // the current child's) and the authoritative raw slab
+                        // byte at the ABSOLUTE slab offset (not a run-relative
+                        // index into the current child).
+                        let a_slab_off = (existing.child_old_base - slab.old_base) as usize;
+                        let a_child_byte_offset = abs.saturating_sub(a_slab_off);
                         return Err(OverlayError::TransformWriteConflict {
                             a_child_old_base: existing.child_old_base,
-                            a_size: child_size,
+                            a_size: existing.child_size,
+                            a_child_byte_offset,
                             b_child_old_base: child_base,
                             b_size: child_size,
+                            b_child_byte_offset: child_byte_offset,
                             first_mismatch_slab_offset: abs,
-                            before_byte: raw_child_bytes[k],
+                            before_byte: slab.content[abs],
                             a_after_byte: existing.value,
                             b_after_byte: val,
                             a_transform_ids: existing.transform_ids.clone(),
@@ -656,7 +727,7 @@ pub fn build_patched_backing_slab(
 
 #[cfg(test)]
 mod tests {
-    use super::super::heap_global_snapshot::CaptureExtentKind;
+    use super::super::heap_global_snapshot::{CaptureExtentEvidence, CaptureExtentKind};
     use super::*;
     use crate::dumper::container_snapshot::ContainerSnapshot;
     use crate::dumper::heap_global_snapshot::{HeapGlobalSnapshot, HeapSlab};
@@ -670,6 +741,7 @@ mod tests {
             is_image_inline: inline,
             provenance: RegionProvenance::default(),
             extent_kind: CaptureExtentKind::default(),
+            extent_evidence: CaptureExtentEvidence::default(),
         }
     }
 
@@ -682,6 +754,7 @@ mod tests {
             is_image_inline: false,
             provenance: RegionProvenance::default(),
             extent_kind: CaptureExtentKind::default(),
+            extent_evidence: CaptureExtentEvidence::default(),
         }
     }
 
