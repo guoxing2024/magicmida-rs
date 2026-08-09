@@ -347,6 +347,13 @@ pub struct RegionAlias {
     /// Runtime ownership of this alias (GTO R0-F.2). Always `SlabOwned`; an
     /// alias is a view of its parent, never an independent allocation.
     pub ownership: AliasOwnership,
+    /// sha256 of the authoritative parent slab slice `[parent_offset, +alias_size)`.
+    /// The parent slab is the payload authority for probe/interior views (GTO R0-G).
+    pub parent_slice_digest: String,
+    /// sha256 of the accepted non-write capture drift between the child capture
+    /// and the authoritative slab slice (empty when no drift). When non-empty,
+    /// the parent slab bytes win; this records the drifted diff (GTO R0-G).
+    pub accepted_drift_digest: String,
 }
 
 /// A declared pointer slot inside a captured region.
@@ -632,6 +639,12 @@ impl RuntimeRebasePlan {
             out.push(extent_kind_tag(&a.extent_kind));
             // GTO R0-F.2: bind the alias's ownership into the digest.
             out.push(alias_ownership_tag(a.ownership));
+            // GTO R0-G: bind the authoritative parent-slice digest and the accepted
+            // non-write drift digest so a change to either alters the plan digest.
+            out.extend_from_slice(a.parent_slice_digest.as_bytes());
+            out.push(0);
+            out.extend_from_slice(a.accepted_drift_digest.as_bytes());
+            out.push(0);
         }
         out
     }
@@ -1329,8 +1342,14 @@ fn normalize_containment(
                 });
             }
             // Content must match the slab at the child offset (raw coherence).
+            // GTO R0-G: for probe/interior views the parent slab is the payload
+            // authority; a non-write capture drift tail is accepted (the child
+            // forms an alias regardless). Strict extents (ObservedAllocation /
+            // BackingObject / Container) still require full-range equality.
             let parent_slice = &slab.bytes[off..child_end];
-            if parent_slice != &r.bytes[..] {
+            use crate::dumper::heap_global_snapshot::CaptureExtentKind as CEK;
+            let is_relaxed_view = matches!(r.extent_kind, CEK::ProbeWindow | CEK::InteriorSubview);
+            if !is_relaxed_view && parent_slice != &r.bytes[..] {
                 let mut mismatch_offset = usize::MAX;
                 for (k, (a, b)) in parent_slice.iter().zip(r.bytes.iter()).enumerate() {
                     if a != b {
@@ -1384,6 +1403,23 @@ fn normalize_containment(
                     sid, candidates[sid].old_base
                 ))
             })?;
+            // GTO R0-G: the parent slab slice is the payload authority. Compute
+            // the authoritative slice digest and the accepted non-write drift
+            // digest (the bytes where the child capture differs from the slab).
+            let slab = &candidates[sid];
+            let parent_slice = &slab.bytes[off..off + r.size];
+            let parent_slice_digest = sha256_hex(parent_slice);
+            let accepted_drift_digest = if parent_slice != &r.bytes[..] {
+                // Accepted non-write capture drift: record the diff (child vs slab).
+                let diff: Vec<u8> = parent_slice
+                    .iter()
+                    .zip(r.bytes.iter())
+                    .map(|(a, b)| a ^ b)
+                    .collect();
+                sha256_hex(&diff)
+            } else {
+                String::new()
+            };
             aliases.push(RegionAlias {
                 alias_old_base: r.old_base,
                 alias_size: r.size,
@@ -1394,6 +1430,8 @@ fn normalize_containment(
                 content_digest: sha256_hex(&r.bytes),
                 extent_kind: r.extent_kind,
                 ownership: AliasOwnership::SlabOwned,
+                parent_slice_digest,
+                accepted_drift_digest,
             });
             old_base_map.insert(r.old_base, (slab_norm, off));
             continue;
@@ -4634,5 +4672,260 @@ mod tests {
         // And they must NOT be slab + legacy-offset.
         assert_ne!(class_val, bases[0] + (0x200000 - SLAB_BASE));
         assert_ne!(title_val, bases[0] + (0x201000 - SLAB_BASE));
+    }
+
+    // ---------- GTO Core Recovery R0-G normalization / plan tests ----------
+
+    /// Route O R1 exact geometry: slab [0x9bf000,+0x1000) containing an interior
+    /// child at 0x9f93e8 (offset 0x3a3e8) with a non-write-drifted tail.
+    fn r0g_route_o_globals(extent: CEK) -> (HeapSlab, HeapGlobalSnapshot) {
+        const SLAB_BASE: u64 = 0x9bf000;
+        const CHILD: u64 = 0x9f93e8;
+        const CHILD_OFF: usize = 0x3a3e8;
+        let mut slab_content = vec![0u8; CHILD_OFF + 0x70];
+        for i in 0..0x70 {
+            slab_content[CHILD_OFF + i] = 0xAA;
+        }
+        let slab = HeapSlab {
+            old_base: SLAB_BASE,
+            content: slab_content,
+        };
+        // Interior child with a non-write-drifted tail (bytes 0x28.. are 0xBB,
+        // unlike the slab 0xAA).
+        let mut child = global(
+            0,
+            CHILD,
+            {
+                let mut b = vec![0xAAu8; 0x70];
+                for i in 0x28..0x70 {
+                    b[i] = 0xBB;
+                }
+                b
+            },
+            false,
+        );
+        child.extent_kind = extent;
+        (slab, child)
+    }
+
+    // Probe/interior alias does NOT require full payload equality.
+    #[test]
+    fn r0g_probe_alias_does_not_require_full_payload_equality() {
+        let (slab, child) = r0g_route_o_globals(CEK::InteriorSubview);
+        let plan = build_plan(&[], &[child], Some(&slab)).unwrap().unwrap();
+        // The interior view is absorbed as a single slab alias, not a region.
+        assert_eq!(plan.regions.len(), 1);
+        assert_eq!(plan.regions[0].kind, RegionKind::HeapSlab);
+        assert_eq!(plan.aliases.len(), 1);
+        validate_runtime_rebase_plan(&plan).unwrap();
+    }
+
+    // The probe alias records the authoritative parent-slice digest.
+    #[test]
+    fn r0g_probe_alias_uses_parent_slice_digest() {
+        let (slab, child) = r0g_route_o_globals(CEK::InteriorSubview);
+        let plan = build_plan(&[], &[child], Some(&slab)).unwrap().unwrap();
+        assert_eq!(plan.aliases.len(), 1);
+        let alias = &plan.aliases[0];
+        // The parent slice digest must equal sha256 of the slab slice at offset.
+        let parent_slice =
+            &slab.content[alias.parent_offset..alias.parent_offset + alias.alias_size];
+        assert_eq!(alias.parent_slice_digest, sha256_hex(parent_slice));
+        // The accepted drift digest is non-empty (child tail != slab tail).
+        assert!(!alias.accepted_drift_digest.is_empty());
+    }
+
+    // The probe alias pointer target maps to the parent slab.
+    #[test]
+    fn r0g_probe_alias_pointer_target_maps_to_parent() {
+        const SLAB_BASE: u64 = 0x9bf000;
+        const CHILD: u64 = 0x9f93e8;
+        let mut slab_content = vec![0u8; (CHILD - SLAB_BASE) as usize + 0x70];
+        let child_off = (CHILD - SLAB_BASE) as usize;
+        // Child self-pointer at offset 0 -> CHILD; slab at that offset must match.
+        slab_content[child_off..child_off + 8].copy_from_slice(&CHILD.to_le_bytes());
+        // Fill rest 0xAA; child tail drifts.
+        for i in 8..0x70 {
+            slab_content[child_off + i] = 0xAA;
+        }
+        let slab = HeapSlab {
+            old_base: SLAB_BASE,
+            content: slab_content,
+        };
+        let mut child = global(
+            0,
+            CHILD,
+            {
+                let mut b = vec![0xAAu8; 0x70];
+                b[0..8].copy_from_slice(&CHILD.to_le_bytes());
+                for i in 0x28..0x70 {
+                    b[i] = 0xBB;
+                }
+                b
+            },
+            false,
+        );
+        child.extent_kind = CEK::InteriorSubview;
+        let plan = build_plan(&[], &[child], Some(&slab)).unwrap().unwrap();
+        // The child's self-pointer (declared from child schema) translates to the
+        // parent slab and targets slab offset (CHILD - SLAB_BASE).
+        let slot = plan
+            .pointers
+            .iter()
+            .find(|p| p.original_value == CHILD)
+            .expect("child self-pointer");
+        assert_eq!(slot.target_region, Some(0));
+        assert_eq!(slot.target_offset, Some(child_off as u64));
+        validate_runtime_rebase_plan(&plan).unwrap();
+    }
+
+    // The declared slot's FINAL value reads from the authoritative slab, not the
+    // stale child tail.
+    #[test]
+    fn r0g_declared_slot_reads_final_slab_value() {
+        const SLAB_BASE: u64 = 0x9bf000;
+        const CHILD: u64 = 0x9f93e8;
+        let child_off = (CHILD - SLAB_BASE) as usize;
+        // Slab slot at child offset 0x30 holds target 0x7f0000 (authoritative).
+        let mut slab_content = vec![0xAAu8; child_off + 0x70];
+        slab_content[child_off + 0x30..child_off + 0x38]
+            .copy_from_slice(&0x7f0000u64.to_le_bytes());
+        let slab = HeapSlab {
+            old_base: SLAB_BASE,
+            content: slab_content,
+        };
+        // The child capture has a STALE value at the same slot (0x6f0000).
+        let mut child = global(
+            0,
+            CHILD,
+            {
+                let mut b = vec![0xAAu8; 0x70];
+                b[0x30..0x38].copy_from_slice(&0x6f0000u64.to_le_bytes());
+                b
+            },
+            false,
+        );
+        child.extent_kind = CEK::InteriorSubview;
+        // Declared slots come from the capture descriptor (child content) BUT the
+        // final pointer value must be read from the authoritative slab.
+        let plan = build_plan(&[], &[child], Some(&slab)).unwrap().unwrap();
+        // The slot is declared (pointer-shaped from child), translated to slab,
+        // and its classification uses the SLAB value (0x7f0000), not 0x6f0000.
+        let slot = plan
+            .pointers
+            .iter()
+            .find(|p| p.source_offset == child_off + 0x30)
+            .expect("declared slot");
+        // The original_value is read from the authoritative slab bytes.
+        assert_eq!(slot.original_value, 0x7f0000);
+    }
+
+    // A transform modifying a declared slot requires preimage coherence (handled
+    // in the overlay); the planner uses the final patched slab value.
+    #[test]
+    fn r0g_declared_slot_transform_requires_preimage_match() {
+        // The overlay enforces preimage coherence for transform writes. Here we
+        // verify the planner reads the patched (post-transform) slab value.
+        const SLAB_BASE: u64 = 0x9bf000;
+        const CHILD: u64 = 0x9f93e8;
+        let child_off = (CHILD - SLAB_BASE) as usize;
+        let mut slab_content = vec![0xAAu8; child_off + 0x70];
+        // Patched slab slot at +0x30 holds the FINAL transformed value 0x9f0000.
+        slab_content[child_off + 0x30..child_off + 0x38]
+            .copy_from_slice(&0x9f0000u64.to_le_bytes());
+        let slab = HeapSlab {
+            old_base: SLAB_BASE,
+            content: slab_content,
+        };
+        let mut child = global(0, CHILD, vec![0xAAu8; 0x70], false);
+        child.extent_kind = CEK::InteriorSubview;
+        let plan = build_plan(&[], &[child], Some(&slab)).unwrap().unwrap();
+        let slot = plan
+            .pointers
+            .iter()
+            .find(|p| p.source_offset == child_off + 0x30)
+            .expect("declared slot");
+        assert_eq!(slot.original_value, 0x9f0000);
+    }
+
+    // The alias capture digest, parent-slice digest, and accepted-drift digest
+    // bind into the plan digest.
+    #[test]
+    fn r0g_alias_capture_and_authority_digests_change_plan_digest() {
+        let (slab1, child1) = r0g_route_o_globals(CEK::InteriorSubview);
+        let p1 = build_plan(&[], &[child1], Some(&slab1)).unwrap().unwrap();
+        // Same geometry but a DIFFERENT drift tail (0xCC instead of 0xBB) changes
+        // the accepted-drift digest -> plan digest changes.
+        let (mut slab2, mut child2) = r0g_route_o_globals(CEK::InteriorSubview);
+        let child_off = (0x9f93e8 - 0x9bf000) as usize;
+        for i in 0x28..0x70 {
+            slab2.content[child_off + i] = 0xAA; // slab unchanged
+        }
+        let mut b = vec![0xAAu8; 0x70];
+        for i in 0x28..0x70 {
+            b[i] = 0xCC; // different drift
+        }
+        child2.content = b;
+        let p2 = build_plan(&[], &[child2], Some(&slab2)).unwrap().unwrap();
+        assert_ne!(p1.plan_digest, p2.plan_digest);
+    }
+
+    // Route O fixture reaches a valid plan end-to-end.
+    #[test]
+    fn r0g_route_o_fixture_reaches_valid_plan() {
+        const SLAB_BASE: u64 = 0x9bf000;
+        const CHILD: u64 = 0x9f93e8;
+        const VIEW_A: u64 = 0x9d0000;
+        const VIEW_B: u64 = 0x9d0050; // delta 0x50 (Route N-equivalent geometry)
+        assert!(VIEW_A > SLAB_BASE && VIEW_B < CHILD);
+        let child_off = (CHILD - SLAB_BASE) as usize; // 0x3a3e8
+                                                      // Slab sized to cover the child and the views.
+        let mut slab_content = vec![0u8; child_off + 0x70];
+        // child at 0x9f93e8 (offset 0x3a3e8), stable prefix 0x28 matching slab.
+        for i in 0..0x70 {
+            slab_content[child_off + i] = 0xAA;
+        }
+        // Route N-equivalent views A/B (delta 0x50, size 0x400).
+        let a_off = (VIEW_A - SLAB_BASE) as usize;
+        let b_off = (VIEW_B - SLAB_BASE) as usize;
+        // The slab content must cover the view region; if a_off+0x400 exceeds the
+        // current size, extend.
+        if a_off + 0x400 > slab_content.len() {
+            slab_content.resize(a_off + 0x400, 0);
+        }
+        for i in 0..0x400 {
+            slab_content[a_off + i] = 0xAA;
+            slab_content[b_off + i] = 0xAA;
+        }
+        let slab = HeapSlab {
+            old_base: SLAB_BASE,
+            content: slab_content,
+        };
+        // Interior child with drifted tail.
+        let mut child = global(
+            0,
+            CHILD,
+            {
+                let mut b = vec![0xAAu8; 0x70];
+                for i in 0x28..0x70 {
+                    b[i] = 0xBB;
+                }
+                b
+            },
+            false,
+        );
+        child.extent_kind = CEK::InteriorSubview;
+        // Two probe views.
+        let mut view_a = global(0, VIEW_A, vec![0xAAu8; 0x400], false);
+        view_a.extent_kind = CEK::ProbeWindow;
+        let mut view_b = global(0, VIEW_B, vec![0xAAu8; 0x400], false);
+        view_b.extent_kind = CEK::InteriorSubview;
+        let globals = vec![child, view_a, view_b];
+        let plan = build_plan(&[], &globals, Some(&slab)).unwrap().unwrap();
+        // One slab backing region; child + A + B = 3 aliases.
+        assert_eq!(plan.regions.len(), 1);
+        assert_eq!(plan.regions[0].kind, RegionKind::HeapSlab);
+        assert_eq!(plan.aliases.len(), 3);
+        validate_runtime_rebase_plan(&plan).unwrap();
     }
 }

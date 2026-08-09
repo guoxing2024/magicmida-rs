@@ -41,6 +41,7 @@ pub(crate) fn write_dump_snapshot_manifest(
     capture_policy: &DumpCapturePolicy,
     rebase_summary: Option<&RuntimeRebaseSummary>,
     overlay_ledger: &[super::raw_slab_coherence::TransformedRegionOverlay],
+    capture_drift_ledger: &[super::raw_slab_coherence::CaptureDriftRun],
     synthetic_requests: &[SyntheticRegionRequest],
     synthetic_assignment_ledger: &[SyntheticAssignment],
 ) {
@@ -55,6 +56,7 @@ pub(crate) fn write_dump_snapshot_manifest(
         capture_policy,
         rebase_summary,
         overlay_ledger,
+        capture_drift_ledger,
         synthetic_requests,
         synthetic_assignment_ledger,
     ) {
@@ -127,6 +129,7 @@ pub(crate) fn render_manifest_json(
     capture_policy: &DumpCapturePolicy,
     rebase_summary: Option<&RuntimeRebaseSummary>,
     overlay_ledger: &[super::raw_slab_coherence::TransformedRegionOverlay],
+    capture_drift_ledger: &[super::raw_slab_coherence::CaptureDriftRun],
     synthetic_requests: &[SyntheticRegionRequest],
     synthetic_assignment_ledger: &[SyntheticAssignment],
 ) -> Result<String, String> {
@@ -521,6 +524,45 @@ pub(crate) fn render_manifest_json(
         buf.push_str("  ]\n");
     }
 
+    // GTO R0-G capture-drift ledger: records each probe/interior non-write drift
+    // run resolved to the authoritative slab (B[i]=S[i]) or a strict-extent
+    // rejection / transform-preimage drift that failed closed. Diagnostic only.
+    buf.push_str(",\n");
+    buf.push_str("  \"capture_drift_ledger\": [\n");
+    for (i, d) in capture_drift_ledger.iter().enumerate() {
+        let resolution_label = match d.resolution {
+            super::raw_slab_coherence::CaptureDriftResolution::NonWriteSlabAuthoritative => {
+                "NonWriteSlabAuthoritative"
+            }
+            super::raw_slab_coherence::CaptureDriftResolution::TransformPreimageDrift => {
+                "TransformPreimageDrift"
+            }
+            super::raw_slab_coherence::CaptureDriftResolution::StrictExtentRejected => {
+                "StrictExtentRejected"
+            }
+        };
+        buf.push_str(&format!(
+            "    {{\"child_capture_id\": \"{}\", \"child_old_base\": \"{}\", \
+             \"child_offset\": {}, \"slab_offset\": {}, \"length\": {}, \
+             \"child_digest\": \"{}\", \"slab_digest\": \"{}\", \
+             \"intersects_transform_write\": {}, \"resolution\": \"{}\"}}",
+            json_escape(&d.child_capture_id),
+            hex_u64(d.child_old_base),
+            d.child_offset,
+            d.slab_offset,
+            d.length,
+            d.child_digest,
+            d.slab_digest,
+            d.intersects_transform_write,
+            resolution_label
+        ));
+        if i + 1 < capture_drift_ledger.len() {
+            buf.push(',');
+        }
+        buf.push('\n');
+    }
+    buf.push_str("  ]\n");
+
     // GTO R0-F.2 synthetic-assignment ledger: records the deterministic
     // collision-free logical-base assignment for every synthetic region request
     // (window class / title), with its source anchor, payload size, construction
@@ -622,6 +664,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
         )
         .unwrap();
         assert!(json.contains(SCHEMA_VERSION));
@@ -679,6 +722,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
         )
         .unwrap();
         assert!(json.contains("0x145710"));
@@ -726,6 +770,7 @@ mod tests {
             &[],
             &DumpCapturePolicy::ahk_gto_default(),
             Some(&summary),
+            &[],
             &[],
             &[],
             &[],
@@ -848,6 +893,7 @@ mod tests {
             &overlay,
             &[],
             &[],
+            &[],
         )
         .unwrap();
         // The JSON must parse (valid) and contain all three ledgers.
@@ -905,6 +951,7 @@ mod tests {
             &[],
             &DumpCapturePolicy::ahk_gto_default(),
             None,
+            &[],
             &[],
             &[req.clone()],
             &assigned,

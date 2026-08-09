@@ -41,6 +41,10 @@ impl RawChildKind {
 }
 
 /// A raw (pre-transform) child snapshot, preserved before any offline repair.
+///
+/// GTO R0-G: carries the capture provenance from [`HeapGlobalSnapshot.extent_evidence`]
+/// so the overlay can decide strict vs write-set-scoped coherence by extent, and
+/// so the capture-drift ledger can bind each drift run to its capture path.
 #[derive(Debug, Clone)]
 pub struct RawChild {
     /// Old (live) allocation base.
@@ -51,6 +55,26 @@ pub struct RawChild {
     pub raw_bytes: Vec<u8>,
     /// Kind (HeapGlobal or Container).
     pub kind: RawChildKind,
+
+    // ---- GTO R0-G capture provenance (copied from HeapGlobalSnapshot) ----
+    /// Deterministic capture id (from `extent_evidence.capture_id`).
+    pub capture_id: String,
+    /// Capture path (GscriptChildLink, GscriptFirstHop, MainSlot, ...).
+    pub capture_path: super::heap_global_snapshot::CapturePath,
+    /// Extent classification (ProbeWindow / InteriorSubview / ObservedAllocation / ...).
+    pub extent_kind: super::heap_global_snapshot::CaptureExtentKind,
+    /// Old base of the source parent whose slot led to this capture (if any).
+    pub source_parent_old_base: Option<u64>,
+    /// Byte offset of the source slot within the parent (if any).
+    pub source_slot_offset: Option<usize>,
+    /// The probe size requested for this capture.
+    pub requested_probe_size: usize,
+    /// Whether this pointer was interior to an already-captured object.
+    pub was_interior: bool,
+    /// Old base of the containing parent object, if any.
+    pub containing_parent_old_base: Option<u64>,
+    /// Size of the containing parent, if any.
+    pub containing_parent_size: Option<usize>,
 }
 
 /// A coherent raw capture bundle: the raw slab plus the raw children it may
@@ -171,6 +195,65 @@ pub enum OverlayError {
         child_old_base: u64,
         child_kind: RawChildKind,
     },
+    /// GTO R0-G: a transform wrote a byte whose preimage drifted between the
+    /// child capture (t1) and the slab read (t2). The transform was derived from
+    /// the old byte `C[i]`, so it cannot safely overwrite the new slab byte
+    /// `S[i]`. Fail-closed.
+    TransformPreimageDrift {
+        /// old base of the child.
+        child_old_base: u64,
+        /// size of the child.
+        child_size: usize,
+        /// slab offset of the first drifted preimage byte.
+        slab_offset: usize,
+        /// child-relative byte offset of the drifted preimage.
+        child_byte_offset: usize,
+        /// the raw child byte (preimage the transform saw).
+        c_byte: u8,
+        /// the authoritative raw slab byte at the same position.
+        s_byte: u8,
+        /// the transformed byte the transform would have written.
+        t_byte: u8,
+        /// transform ids of the child.
+        transform_ids: Vec<String>,
+    },
+}
+
+/// How a capture-drift run (non-atomic child vs slab read) was resolved (GTO R0-G).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureDriftResolution {
+    /// The child is a probe/interior view; the non-write drift is accepted and
+    /// the authoritative raw slab byte wins (`B[i]=S[i]`).
+    NonWriteSlabAuthoritative,
+    /// A transform wrote a byte whose preimage drifted; fail-closed.
+    TransformPreimageDrift,
+    /// A strict extent (ObservedAllocation/BackingObject/Container) had full-range
+    /// drift; fail-closed.
+    StrictExtentRejected,
+}
+
+/// A structured capture-drift run: one contiguous run of bytes where the raw
+/// child capture (t1) differs from the authoritative raw slab slice (t2) (GTO R0-G).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureDriftRun {
+    /// Capture id of the child (from RawChild.capture_id).
+    pub child_capture_id: String,
+    /// Old base of the child.
+    pub child_old_base: u64,
+    /// Child-relative byte offset of this drift run.
+    pub child_offset: usize,
+    /// Absolute slab offset of this drift run.
+    pub slab_offset: usize,
+    /// Length of the drift run.
+    pub length: usize,
+    /// sha256 of the raw child drift run bytes.
+    pub child_digest: String,
+    /// sha256 of the raw slab drift run bytes.
+    pub slab_digest: String,
+    /// Whether this drift run intersects any transformed write byte.
+    pub intersects_transform_write: bool,
+    /// How this drift run was resolved.
+    pub resolution: CaptureDriftResolution,
 }
 
 /// A single resolved write at one slab byte (for deterministic write-set merge).
@@ -282,6 +365,20 @@ impl std::fmt::Display for OverlayError {
                 a_transform_ids,
                 b_transform_ids
             ),
+            OverlayError::TransformPreimageDrift {
+                child_old_base,
+                child_size,
+                slab_offset,
+                child_byte_offset,
+                c_byte,
+                s_byte,
+                t_byte,
+                transform_ids,
+            } => write!(
+                f,
+                "transform preimage drift: child {child_old_base:#x} (size {child_size:#x})                  slab_offset={slab_offset:#x} child_byte_offset={child_byte_offset:#x}                  C={c_byte:#04x} S={s_byte:#04x} T={t_byte:#04x} transform={:?}                  (transform derived from drifted preimage; cannot safely overwrite slab)",
+                transform_ids
+            ),
             OverlayError::RawChildMissing {
                 child_old_base,
                 child_kind,
@@ -327,6 +424,15 @@ pub fn raw_children_from_capture(
             size,
             raw_bytes: raw,
             kind: RawChildKind::Container,
+            capture_id: String::new(),
+            capture_path: super::heap_global_snapshot::CapturePath::MainSlot,
+            extent_kind: super::heap_global_snapshot::CaptureExtentKind::ObservedAllocation,
+            source_parent_old_base: None,
+            source_slot_offset: None,
+            requested_probe_size: 0,
+            was_interior: false,
+            containing_parent_old_base: None,
+            containing_parent_size: None,
         });
     }
     for g in heap_globals {
@@ -338,6 +444,15 @@ pub fn raw_children_from_capture(
             size: g.content.len(),
             raw_bytes: g.content.clone(),
             kind: RawChildKind::HeapGlobal,
+            capture_id: g.extent_evidence.capture_id.clone(),
+            capture_path: g.extent_evidence.capture_path,
+            extent_kind: g.extent_kind,
+            source_parent_old_base: g.extent_evidence.containing_parent_old_base,
+            source_slot_offset: g.extent_evidence.source_slot_offset,
+            requested_probe_size: g.extent_evidence.probe_requested_size,
+            was_interior: g.extent_evidence.was_interior,
+            containing_parent_old_base: g.extent_evidence.containing_parent_old_base,
+            containing_parent_size: g.extent_evidence.containing_parent_size,
         });
     }
     // Deterministic order by (old_base, kind).
@@ -365,7 +480,14 @@ pub fn build_patched_backing_slab(
     // (populated by diffing content across each transform). Retained for API
     // compatibility / round documentation.
     _transform_ids: &[&'static str],
-) -> Result<(HeapSlab, Vec<TransformedRegionOverlay>), OverlayError> {
+) -> Result<
+    (
+        HeapSlab,
+        Vec<TransformedRegionOverlay>,
+        Vec<CaptureDriftRun>,
+    ),
+    OverlayError,
+> {
     let slab = &raw_capture.slab;
     let mut backing = slab.content.clone();
 
@@ -391,6 +513,8 @@ pub fn build_patched_backing_slab(
         RawChildKind,
         RegionProvenance,
         Vec<String>,
+        super::heap_global_snapshot::CaptureExtentKind,
+        String,
     )> = Vec::new();
     for g in transformed_globals {
         if g.is_heap_handle || g.is_image_inline || g.content.is_empty() {
@@ -403,6 +527,8 @@ pub fn build_patched_backing_slab(
             RawChildKind::HeapGlobal,
             g.provenance.clone(),
             g.transform_ids.clone(),
+            g.extent_kind,
+            g.extent_evidence.capture_id.clone(),
         ));
     }
     for c in transformed_containers {
@@ -425,25 +551,40 @@ pub fn build_patched_backing_slab(
                 raw_digest: String::new(),
             },
             Vec::new(),
+            super::heap_global_snapshot::CaptureExtentKind::ObservedAllocation,
+            String::new(),
         ));
     }
     // Deterministic order by (old_base, kind).
-    transformed.sort_by_key(|(base, _, _, kind, _, _)| (*base, *kind as u8));
+    transformed.sort_by_key(|(base, _, _, kind, _, _, _, _)| (*base, *kind as u8));
 
     let mut overlays: Vec<TransformedRegionOverlay> = Vec::new();
+    // GTO R0-G: capture-drift runs ledger (probe/interior non-write drift resolved
+    // to slab authority; strict extents rejected).
+    let mut drift_runs: Vec<CaptureDriftRun> = Vec::new();
     // GTO R0-F: track resolved writes at slab-byte granularity for conflict
     // detection. Only differing transformed bytes are writes.
     let mut resolved_writes: std::collections::BTreeMap<usize, ResolvedWrite> =
         std::collections::BTreeMap::new();
 
-    for (child_base, child_size, transformed_bytes, kind, provenance, child_transform_ids) in
-        &transformed
+    for (
+        child_base,
+        child_size,
+        transformed_bytes,
+        kind,
+        provenance,
+        child_transform_ids,
+        extent_kind,
+        capture_id,
+    ) in &transformed
     {
         let child_base = *child_base;
         let child_size = *child_size;
         let kind = *kind;
         let transformed_bytes = transformed_bytes.clone();
         let child_transform_ids = child_transform_ids.clone();
+        let extent_kind = *extent_kind;
+        let capture_id = capture_id.clone();
         // R0-D: UnknownSynthetic always fails closed.
         if let RegionProvenance::UnknownSynthetic = &provenance {
             return Err(OverlayError::RawChildMissing {
@@ -578,31 +719,43 @@ pub fn build_patched_backing_slab(
                 raw_slab_slice_digest: sha256_hex(&slab.content[slab_offset_us..child_end]),
             });
         }
-        // Raw coherence: raw slab slice == raw child bytes (same length now).
+        // GTO R0-G three-way reconciliation: C = raw child capture (t1), S = raw
+        // slab slice (t2, authoritative), T = transformed child.
+        //   - strict extents (ObservedAllocation / BackingObject / Container):
+        //     full-range raw equality required (C == S); any drift fails closed.
+        //   - probe/interior views (ProbeWindow / InteriorSubview): write-set-scoped
+        //     preimage coherence. Only transformed write bytes need C[i]==S[i];
+        //     non-write drift is accepted (B[i]=S[i], slab authority) and recorded.
         let raw_slab_slice = &slab.content[slab_offset_us..child_end];
-        if raw_slab_slice != raw_child_bytes {
-            let mut first_mismatch = usize::MAX;
-            for (k, (a, b)) in raw_slab_slice
-                .iter()
-                .zip(raw_child_bytes.iter())
-                .enumerate()
-            {
-                if a != b {
-                    first_mismatch = k;
-                    break;
+        use super::heap_global_snapshot::CaptureExtentKind as CEK;
+        let is_strict_extent = matches!(extent_kind, CEK::ObservedAllocation | CEK::BackingObject)
+            || kind == RawChildKind::Container;
+        if is_strict_extent {
+            // Strict: full-range coherence still required.
+            if raw_slab_slice != raw_child_bytes {
+                let mut first_mismatch = usize::MAX;
+                for (k, (a, b)) in raw_slab_slice
+                    .iter()
+                    .zip(raw_child_bytes.iter())
+                    .enumerate()
+                {
+                    if a != b {
+                        first_mismatch = k;
+                        break;
+                    }
                 }
+                return Err(OverlayError::RawCaptureDrift {
+                    child_kind: kind,
+                    child_old_base: child_base,
+                    child_size,
+                    slab_old_base: slab.old_base,
+                    slab_size: slab.content.len(),
+                    slab_offset: slab_offset_us,
+                    first_mismatch_offset: first_mismatch,
+                    raw_child_digest: sha256_hex(raw_child_bytes),
+                    raw_slab_slice_digest: sha256_hex(raw_slab_slice),
+                });
             }
-            return Err(OverlayError::RawCaptureDrift {
-                child_kind: kind,
-                child_old_base: child_base,
-                child_size,
-                slab_old_base: slab.old_base,
-                slab_size: slab.content.len(),
-                slab_offset: slab_offset_us,
-                first_mismatch_offset: first_mismatch,
-                raw_child_digest: sha256_hex(raw_child_bytes),
-                raw_slab_slice_digest: sha256_hex(raw_slab_slice),
-            });
         }
         // GTO R0-F: conflict resolution is based on the transformed WRITE-SET
         // (the byte runs where this child's bytes differ from its raw capture),
@@ -630,6 +783,64 @@ pub fn build_patched_backing_slab(
             }
             if let Some((s, acc)) = run_start.take() {
                 write_runs.push((s, acc.len(), acc));
+            }
+        }
+        // GTO R0-G: for probe/interior views, verify transform-write preimages
+        // are clean (C[i]==S[i]) and accept non-write drift (slab authority).
+        if !is_strict_extent {
+            // A transform write whose preimage drifted cannot safely overwrite S.
+            for &(so, _, ref bytes) in &write_runs {
+                for (k, _) in bytes.iter().enumerate() {
+                    let abs = so + k;
+                    let child_byte_offset = abs - slab_offset_us;
+                    let c_byte = raw_child_bytes[child_byte_offset];
+                    let s_byte = slab.content[abs];
+                    if c_byte != s_byte {
+                        return Err(OverlayError::TransformPreimageDrift {
+                            child_old_base: child_base,
+                            child_size,
+                            slab_offset: abs,
+                            child_byte_offset,
+                            c_byte,
+                            s_byte,
+                            t_byte: transformed_bytes[child_byte_offset],
+                            transform_ids: child_transform_ids.clone(),
+                        });
+                    }
+                }
+            }
+            // Non-write drift runs (C[i]!=S[i] where T[i]==C[i]) are accepted:
+            // the authoritative slab byte wins (B[i]=S[i]); record a drift run.
+            let mut run_start: Option<usize> = None;
+            let mut flush = |start: usize, end: usize, drift_runs: &mut Vec<CaptureDriftRun>| {
+                let child_off = start - slab_offset_us;
+                let len = end - start;
+                drift_runs.push(CaptureDriftRun {
+                    child_capture_id: capture_id.clone(),
+                    child_old_base: child_base,
+                    child_offset: child_off,
+                    slab_offset: start,
+                    length: len,
+                    child_digest: sha256_hex(&raw_child_bytes[child_off..child_off + len]),
+                    slab_digest: sha256_hex(&slab.content[start..end]),
+                    intersects_transform_write: false,
+                    resolution: CaptureDriftResolution::NonWriteSlabAuthoritative,
+                });
+            };
+            for i in 0..raw_len {
+                let so = slab_offset_us + i;
+                let drifted = raw_child_bytes[i] != slab.content[so]
+                    && transformed_bytes[i] == raw_child_bytes[i];
+                if drifted {
+                    if run_start.is_none() {
+                        run_start = Some(so);
+                    }
+                } else if let Some(start) = run_start.take() {
+                    flush(start, so, &mut drift_runs);
+                }
+            }
+            if let Some(start) = run_start.take() {
+                flush(start, slab_offset_us + raw_len, &mut drift_runs);
             }
         }
         // GTO R0-F.1: use per-child transform provenance (which transforms
@@ -711,13 +922,13 @@ pub fn build_patched_backing_slab(
         // this child sit inside another transformed child's range?
         let contained_in = transformed
             .iter()
-            .find(|(ob, osz, _, ok, _, _)| {
+            .find(|(ob, osz, _, ok, _, _, _, _)| {
                 // exclude this child itself
                 !(*ok == kind && *ob == child_base)
                     && *ob <= child_base
                     && child_base + child_size as u64 <= ob.saturating_add(*osz as u64)
             })
-            .map(|(ob, _, _, _, _, _)| *ob);
+            .map(|(ob, _, _, _, _, _, _, _)| *ob);
         overlays.push(TransformedRegionOverlay {
             child_kind: kind,
             child_old_base: child_base,
@@ -732,6 +943,8 @@ pub fn build_patched_backing_slab(
         });
     }
 
+    // Deterministic sort of the drift ledger.
+    drift_runs.sort_by_key(|d| (d.child_old_base, d.slab_offset, d.child_offset));
     // Deterministic overlay sort.
     overlays.sort_by_key(|o| (o.child_old_base, o.slab_offset, o.child_size));
     Ok((
@@ -740,6 +953,7 @@ pub fn build_patched_backing_slab(
             content: backing,
         },
         overlays,
+        drift_runs,
     ))
 }
 
@@ -814,6 +1028,25 @@ mod tests {
         slab(slab_base, content)
     }
 
+    /// Test helper: a RawChild with default (probe-window, no-parent) provenance.
+    fn raw_child(old_base: u64, size: usize, raw_bytes: Vec<u8>, kind: RawChildKind) -> RawChild {
+        RawChild {
+            old_base,
+            size,
+            raw_bytes,
+            kind,
+            capture_id: String::new(),
+            capture_path: super::super::heap_global_snapshot::CapturePath::MainSlot,
+            extent_kind: super::super::heap_global_snapshot::CaptureExtentKind::ProbeWindow,
+            source_parent_old_base: None,
+            source_slot_offset: None,
+            requested_probe_size: 0,
+            was_interior: false,
+            containing_parent_old_base: None,
+            containing_parent_size: None,
+        }
+    }
+
     const ROUTEK_SLAB_BASE: u64 = 0x1ff000;
     const ROUTEK_SLAB_SZ: usize = 0x35a1118;
     const ROUTEK_CHILD_BASE: u64 = 0x200000;
@@ -838,15 +1071,15 @@ mod tests {
         );
         let raw_capture = RawSlabCapture {
             slab: s,
-            children: vec![RawChild {
-                old_base: ROUTEK_CHILD_BASE,
-                size: raw.len(),
-                raw_bytes: raw.clone(),
-                kind: RawChildKind::HeapGlobal,
-            }],
+            children: vec![raw_child(
+                ROUTEK_CHILD_BASE,
+                raw.len(),
+                raw.clone(),
+                RawChildKind::HeapGlobal,
+            )],
         };
         let transformed = global(ROUTEK_CHILD_BASE, raw.clone(), false);
-        let (patched, overlays) =
+        let (patched, overlays, _) =
             build_patched_backing_slab(&raw_capture, &[transformed], &[], &["t"]).unwrap();
         assert_eq!(overlays.len(), 1);
         let off = (ROUTEK_CHILD_BASE - ROUTEK_SLAB_BASE) as usize;
@@ -864,16 +1097,16 @@ mod tests {
         );
         let raw_capture = RawSlabCapture {
             slab: s,
-            children: vec![RawChild {
-                old_base: ROUTEK_CHILD_BASE,
-                size: raw.len(),
-                raw_bytes: raw.clone(),
-                kind: RawChildKind::HeapGlobal,
-            }],
+            children: vec![raw_child(
+                ROUTEK_CHILD_BASE,
+                raw.len(),
+                raw.clone(),
+                RawChildKind::HeapGlobal,
+            )],
         };
         let transformed_bytes = b"REPAIRED-child-xxx".to_vec();
         let transformed = global(ROUTEK_CHILD_BASE, transformed_bytes.clone(), false);
-        let (patched, _) =
+        let (patched, _, _) =
             build_patched_backing_slab(&raw_capture, &[transformed], &[], &["t"]).unwrap();
         let off = (ROUTEK_CHILD_BASE - ROUTEK_SLAB_BASE) as usize;
         assert_eq!(
@@ -893,14 +1126,17 @@ mod tests {
         );
         let raw_capture = RawSlabCapture {
             slab: s,
-            children: vec![RawChild {
-                old_base: ROUTEK_CHILD_BASE,
-                size: raw.len(),
-                raw_bytes: raw.clone(),
-                kind: RawChildKind::HeapGlobal,
-            }],
+            children: vec![raw_child(
+                ROUTEK_CHILD_BASE,
+                raw.len(),
+                raw.clone(),
+                RawChildKind::HeapGlobal,
+            )],
         };
-        let transformed = global(ROUTEK_CHILD_BASE, raw.clone(), false);
+        let mut transformed = global(ROUTEK_CHILD_BASE, raw.clone(), false);
+        // Strict ObservedAllocation extent: full-range drift must be rejected.
+        transformed.extent_kind =
+            super::super::heap_global_snapshot::CaptureExtentKind::ObservedAllocation;
         let err =
             build_patched_backing_slab(&raw_capture, &[transformed], &[], &["t"]).unwrap_err();
         assert!(matches!(err, OverlayError::RawCaptureDrift { .. }));
@@ -917,16 +1153,16 @@ mod tests {
         );
         let raw_capture = RawSlabCapture {
             slab: s,
-            children: vec![RawChild {
-                old_base: ROUTEK_CHILD_BASE,
-                size: raw.len(),
-                raw_bytes: raw.clone(),
-                kind: RawChildKind::HeapGlobal,
-            }],
+            children: vec![raw_child(
+                ROUTEK_CHILD_BASE,
+                raw.len(),
+                raw.clone(),
+                RawChildKind::HeapGlobal,
+            )],
         };
         let transformed_bytes = repaint(&raw);
         let transformed = global(ROUTEK_CHILD_BASE, transformed_bytes.clone(), false);
-        let (patched, _) =
+        let (patched, _, _) =
             build_patched_backing_slab(&raw_capture, &[transformed], &[], &["t"]).unwrap();
         let off = (ROUTEK_CHILD_BASE - ROUTEK_SLAB_BASE) as usize;
         assert_eq!(
@@ -946,17 +1182,17 @@ mod tests {
         );
         let raw_capture = RawSlabCapture {
             slab: s,
-            children: vec![RawChild {
-                old_base: ROUTEK_CHILD_BASE,
-                size: 0x1a,
-                raw_bytes: raw.clone(),
-                kind: RawChildKind::HeapGlobal,
-            }],
+            children: vec![raw_child(
+                ROUTEK_CHILD_BASE,
+                0x1a,
+                raw.clone(),
+                RawChildKind::HeapGlobal,
+            )],
         };
         let transformed_bytes = vec![0x42u8; 0x1a];
         let mut transformed = global(ROUTEK_CHILD_BASE, transformed_bytes.clone(), false);
         transformed.transform_ids = vec!["repair_gscript_window_strings".to_string()];
-        let (patched, overlays) = build_patched_backing_slab(
+        let (patched, overlays, _) = build_patched_backing_slab(
             &raw_capture,
             &[transformed],
             &[],
@@ -983,17 +1219,17 @@ mod tests {
         );
         let raw_capture = RawSlabCapture {
             slab: s,
-            children: vec![RawChild {
-                old_base: ROUTEK_CHILD_BASE,
-                size: raw.len(),
-                raw_bytes: raw.clone(),
-                kind: RawChildKind::HeapGlobal,
-            }],
+            children: vec![raw_child(
+                ROUTEK_CHILD_BASE,
+                raw.len(),
+                raw.clone(),
+                RawChildKind::HeapGlobal,
+            )],
         };
         let repaired = b"NewClassName".to_vec();
         let mut transformed = global(ROUTEK_CHILD_BASE, repaired.clone(), false);
         transformed.transform_ids = vec!["repair_gscript_window_strings".to_string()];
-        let (patched, o) = build_patched_backing_slab(
+        let (patched, o, _) = build_patched_backing_slab(
             &raw_capture,
             &[transformed],
             &[],
@@ -1016,17 +1252,17 @@ mod tests {
         );
         let raw_capture = RawSlabCapture {
             slab: s,
-            children: vec![RawChild {
-                old_base: ROUTEK_CHILD_BASE,
-                size: 16,
-                raw_bytes: raw.clone(),
-                kind: RawChildKind::HeapGlobal,
-            }],
+            children: vec![raw_child(
+                ROUTEK_CHILD_BASE,
+                16,
+                raw.clone(),
+                RawChildKind::HeapGlobal,
+            )],
         };
         let scrubbed = vec![0u8; 16];
         let mut transformed = global(ROUTEK_CHILD_BASE, scrubbed.clone(), false);
         transformed.transform_ids = vec!["scrub_uncaptured_heap_pointers".to_string()];
-        let (patched, o) = build_patched_backing_slab(
+        let (patched, o, _) = build_patched_backing_slab(
             &raw_capture,
             &[transformed],
             &[],
@@ -1049,16 +1285,16 @@ mod tests {
         );
         let raw_capture = RawSlabCapture {
             slab: s,
-            children: vec![RawChild {
-                old_base: ROUTEK_CHILD_BASE,
-                size: 24,
-                raw_bytes: raw.clone(),
-                kind: RawChildKind::Container,
-            }],
+            children: vec![raw_child(
+                ROUTEK_CHILD_BASE,
+                24,
+                raw.clone(),
+                RawChildKind::Container,
+            )],
         };
         let scrubbed = vec![0u8; 24];
         let transformed = container(ROUTEK_CHILD_BASE, ROUTEK_CHILD_BASE + 24, scrubbed.clone());
-        let (patched, o) =
+        let (patched, o, _) =
             build_patched_backing_slab(&raw_capture, &[], &[transformed], &["scrub"]).unwrap();
         assert_eq!(o[0].child_kind, RawChildKind::Container);
         let off = (ROUTEK_CHILD_BASE - ROUTEK_SLAB_BASE) as usize;
@@ -1076,23 +1312,23 @@ mod tests {
         let raw_capture = RawSlabCapture {
             slab: slab(ROUTEK_SLAB_BASE, content),
             children: vec![
-                RawChild {
-                    old_base: ROUTEK_CHILD_BASE,
-                    size: raw_a.len(),
-                    raw_bytes: raw_a.clone(),
-                    kind: RawChildKind::HeapGlobal,
-                },
-                RawChild {
-                    old_base: ROUTEK_SLAB_BASE + 0x3000,
-                    size: raw_b.len(),
-                    raw_bytes: raw_b.clone(),
-                    kind: RawChildKind::HeapGlobal,
-                },
+                raw_child(
+                    ROUTEK_CHILD_BASE,
+                    raw_a.len(),
+                    raw_a.clone(),
+                    RawChildKind::HeapGlobal,
+                ),
+                raw_child(
+                    ROUTEK_SLAB_BASE + 0x3000,
+                    raw_b.len(),
+                    raw_b.clone(),
+                    RawChildKind::HeapGlobal,
+                ),
             ],
         };
         let ga = global(ROUTEK_CHILD_BASE, repaint(&raw_a), false);
         let gb = global(ROUTEK_SLAB_BASE + 0x3000, repaint(&raw_b), false);
-        let (_, overlays) =
+        let (_, overlays, _) =
             build_patched_backing_slab(&raw_capture, &[ga, gb], &[], &["t"]).unwrap();
         assert_eq!(overlays.len(), 2);
     }
@@ -1108,17 +1344,17 @@ mod tests {
         );
         let raw_capture = RawSlabCapture {
             slab: s,
-            children: vec![RawChild {
-                old_base: ROUTEK_CHILD_BASE,
-                size: raw.len(),
-                raw_bytes: raw.clone(),
-                kind: RawChildKind::HeapGlobal,
-            }],
+            children: vec![raw_child(
+                ROUTEK_CHILD_BASE,
+                raw.len(),
+                raw.clone(),
+                RawChildKind::HeapGlobal,
+            )],
         };
         let repaired = repaint(&raw);
         let ga = global(ROUTEK_CHILD_BASE, repaired.clone(), false);
         let gb = global(ROUTEK_CHILD_BASE, repaired.clone(), false);
-        let (_, overlays) =
+        let (_, overlays, _) =
             build_patched_backing_slab(&raw_capture, &[ga, gb], &[], &["t"]).unwrap();
         assert_eq!(overlays.len(), 1);
     }
@@ -1134,12 +1370,12 @@ mod tests {
         );
         let raw_capture = RawSlabCapture {
             slab: s,
-            children: vec![RawChild {
-                old_base: ROUTEK_CHILD_BASE,
-                size: raw.len(),
-                raw_bytes: raw.clone(),
-                kind: RawChildKind::HeapGlobal,
-            }],
+            children: vec![raw_child(
+                ROUTEK_CHILD_BASE,
+                raw.len(),
+                raw.clone(),
+                RawChildKind::HeapGlobal,
+            )],
         };
         let ga = global(ROUTEK_CHILD_BASE, repaint(&raw), false);
         let gb = global(ROUTEK_CHILD_BASE, repaint(&repaint(&raw)), false);
@@ -1162,18 +1398,8 @@ mod tests {
         let raw_capture = RawSlabCapture {
             slab: slab(ROUTEK_SLAB_BASE, content),
             children: vec![
-                RawChild {
-                    old_base: ROUTEK_CHILD_BASE,
-                    size: 32,
-                    raw_bytes: raw_a,
-                    kind: RawChildKind::HeapGlobal,
-                },
-                RawChild {
-                    old_base: ROUTEK_CHILD_BASE + 16,
-                    size: 32,
-                    raw_bytes: raw_b,
-                    kind: RawChildKind::HeapGlobal,
-                },
+                raw_child(ROUTEK_CHILD_BASE, 32, raw_a, RawChildKind::HeapGlobal),
+                raw_child(ROUTEK_CHILD_BASE + 16, 32, raw_b, RawChildKind::HeapGlobal),
             ],
         };
         // transformed overlays differ and partially overlap -> conflict.
@@ -1202,12 +1428,7 @@ mod tests {
     fn r0c1_child_outside_slab() {
         let raw_capture = RawSlabCapture {
             slab: slab(0x1000, vec![0u8; 0x100]),
-            children: vec![RawChild {
-                old_base: 0x2000,
-                size: 8,
-                raw_bytes: vec![0u8; 8],
-                kind: RawChildKind::HeapGlobal,
-            }],
+            children: vec![raw_child(0x2000, 8, vec![0u8; 8], RawChildKind::HeapGlobal)],
         };
         let transformed = global(0x2000, vec![0u8; 8], false);
         let err =
@@ -1224,7 +1445,7 @@ mod tests {
         let inline = global(0x140000000, b"img-inline".to_vec(), true);
         // image-inline globals are skipped by overlay (they live in the image);
         // no overlay is produced.
-        let (_, overlays) =
+        let (_, overlays, _) =
             build_patched_backing_slab(&raw_capture, &[inline], &[], &["t"]).unwrap();
         assert!(overlays.is_empty());
     }
@@ -1236,7 +1457,7 @@ mod tests {
             children: vec![],
         };
         let h = handle(0x8f0000);
-        let (_, overlays) = build_patched_backing_slab(&raw_capture, &[h], &[], &["t"]).unwrap();
+        let (_, overlays, _) = build_patched_backing_slab(&raw_capture, &[h], &[], &["t"]).unwrap();
         assert!(overlays.is_empty());
     }
 
@@ -1246,7 +1467,7 @@ mod tests {
             slab: slab(0x1000, vec![0u8; 0x100]),
             children: vec![],
         };
-        let (_, overlays) = build_patched_backing_slab(&raw_capture, &[], &[], &["t"]).unwrap();
+        let (_, overlays, _) = build_patched_backing_slab(&raw_capture, &[], &[], &["t"]).unwrap();
         assert!(overlays.is_empty());
     }
 
@@ -1260,26 +1481,26 @@ mod tests {
         let raw_capture = RawSlabCapture {
             slab: slab(ROUTEK_SLAB_BASE, content),
             children: vec![
-                RawChild {
-                    old_base: ROUTEK_SLAB_BASE + 0x2000,
-                    size: 3,
-                    raw_bytes: raw_b,
-                    kind: RawChildKind::HeapGlobal,
-                },
-                RawChild {
-                    old_base: ROUTEK_SLAB_BASE + 0x1000,
-                    size: 3,
-                    raw_bytes: raw_a,
-                    kind: RawChildKind::HeapGlobal,
-                },
+                raw_child(
+                    ROUTEK_SLAB_BASE + 0x2000,
+                    3,
+                    raw_b,
+                    RawChildKind::HeapGlobal,
+                ),
+                raw_child(
+                    ROUTEK_SLAB_BASE + 0x1000,
+                    3,
+                    raw_a,
+                    RawChildKind::HeapGlobal,
+                ),
             ],
         };
         let ga = global(ROUTEK_SLAB_BASE + 0x1000, b"XXX".to_vec(), false);
         let gb = global(ROUTEK_SLAB_BASE + 0x2000, b"YYY".to_vec(), false);
-        let (_, o1) =
+        let (_, o1, _) =
             build_patched_backing_slab(&raw_capture, &[gb.clone(), ga.clone()], &[], &["t"])
                 .unwrap();
-        let (_, o2) = build_patched_backing_slab(&raw_capture, &[ga, gb], &[], &["t"]).unwrap();
+        let (_, o2, _) = build_patched_backing_slab(&raw_capture, &[ga, gb], &[], &["t"]).unwrap();
         assert_eq!(o1, o2);
         assert!(o1[0].child_old_base < o1[1].child_old_base);
     }
@@ -1295,16 +1516,16 @@ mod tests {
         );
         let raw_capture = RawSlabCapture {
             slab: s,
-            children: vec![RawChild {
-                old_base: ROUTEK_CHILD_BASE,
-                size: raw.len(),
-                raw_bytes: raw.clone(),
-                kind: RawChildKind::HeapGlobal,
-            }],
+            children: vec![raw_child(
+                ROUTEK_CHILD_BASE,
+                raw.len(),
+                raw.clone(),
+                RawChildKind::HeapGlobal,
+            )],
         };
         let transformed_bytes = repaint(&raw);
         let transformed = global(ROUTEK_CHILD_BASE, transformed_bytes.clone(), false);
-        let (patched, _) =
+        let (patched, _, _) =
             build_patched_backing_slab(&raw_capture, &[transformed], &[], &["t"]).unwrap();
         let off = (ROUTEK_CHILD_BASE - ROUTEK_SLAB_BASE) as usize;
         assert_eq!(
@@ -1324,12 +1545,12 @@ mod tests {
         );
         let raw_capture = RawSlabCapture {
             slab: s,
-            children: vec![RawChild {
-                old_base: ROUTEK_CHILD_BASE,
-                size: raw.len(),
-                raw_bytes: raw,
-                kind: RawChildKind::HeapGlobal,
-            }],
+            children: vec![raw_child(
+                ROUTEK_CHILD_BASE,
+                raw.len(),
+                raw,
+                RawChildKind::HeapGlobal,
+            )],
         };
         let transformed = global(ROUTEK_CHILD_BASE, b"REPAIRED".to_vec(), false);
         let err =
@@ -1348,12 +1569,12 @@ mod tests {
         );
         let raw_capture = RawSlabCapture {
             slab: s,
-            children: vec![RawChild {
-                old_base: ROUTEK_CHILD_BASE,
-                size: raw.len(),
-                raw_bytes: raw.clone(),
-                kind: RawChildKind::HeapGlobal,
-            }],
+            children: vec![raw_child(
+                ROUTEK_CHILD_BASE,
+                raw.len(),
+                raw.clone(),
+                RawChildKind::HeapGlobal,
+            )],
         };
         let ga = global(ROUTEK_CHILD_BASE, repaint(&raw), false);
         let gb = global(ROUTEK_CHILD_BASE, repaint(&repaint(&raw)), false);
@@ -1392,12 +1613,12 @@ mod tests {
         let raw_slab_content = s.content.clone();
         let raw_capture = RawSlabCapture {
             slab: s,
-            children: vec![RawChild {
-                old_base: slab_base + 0x3000,
-                size: real_child_bytes.len(),
-                raw_bytes: real_child_bytes.clone(),
-                kind: RawChildKind::HeapGlobal,
-            }],
+            children: vec![raw_child(
+                slab_base + 0x3000,
+                real_child_bytes.len(),
+                real_child_bytes.clone(),
+                RawChildKind::HeapGlobal,
+            )],
         };
         // Transformed: one in-slab raw child (unchanged) + one synthetic child
         // at 0x200000 (outside the slab, SyntheticDerived provenance).
@@ -1407,7 +1628,7 @@ mod tests {
             b"NewClassName".to_vec(),
             "repair_gscript_window_strings",
         );
-        let (patched, overlays) = build_patched_backing_slab(
+        let (patched, overlays, _) = build_patched_backing_slab(
             &raw_capture,
             &[real, synth],
             &[],
@@ -1503,23 +1724,23 @@ mod tests {
         let raw_capture = RawSlabCapture {
             slab: slab(slab_base, slab_content.clone()),
             children: vec![
-                RawChild {
-                    old_base: backing_base,
-                    size: backing_sz,
-                    raw_bytes: {
+                raw_child(
+                    backing_base,
+                    backing_sz,
+                    {
                         // raw backing: zeros with [0xEE;0x400] at subview offset
                         let mut b = vec![0u8; backing_sz];
                         b[subview_in_backing..subview_in_backing + subview_sz].fill(0xEE);
                         b
                     },
-                    kind: RawChildKind::HeapGlobal,
-                },
-                RawChild {
-                    old_base: subview_base,
-                    size: subview_sz,
-                    raw_bytes: vec![0xEEu8; subview_sz],
-                    kind: RawChildKind::HeapGlobal,
-                },
+                    RawChildKind::HeapGlobal,
+                ),
+                raw_child(
+                    subview_base,
+                    subview_sz,
+                    vec![0xEEu8; subview_sz],
+                    RawChildKind::HeapGlobal,
+                ),
             ],
         };
         // Transformed: backing unchanged; subview transformed (bytes differ from
@@ -1535,7 +1756,7 @@ mod tests {
         );
         let subview_transformed = vec![0xDDu8; subview_sz];
         let subview = global(subview_base, subview_transformed.clone(), false);
-        let (patched, overlays) = build_patched_backing_slab(
+        let (patched, overlays, _) = build_patched_backing_slab(
             &raw_capture,
             &[backing, subview],
             &[],
@@ -1579,22 +1800,17 @@ mod tests {
         let raw_capture = RawSlabCapture {
             slab: slab(slab_base, slab_content),
             children: vec![
-                RawChild {
-                    old_base: a_base,
-                    size: sz,
-                    raw_bytes: vec![0xAA; sz],
-                    kind: RawChildKind::HeapGlobal,
-                },
-                RawChild {
-                    old_base: b_base,
-                    size: sz,
-                    raw_bytes: vec![0xBB; sz],
-                    kind: RawChildKind::HeapGlobal,
-                },
+                raw_child(a_base, sz, vec![0xAA; sz], RawChildKind::HeapGlobal),
+                raw_child(b_base, sz, vec![0xBB; sz], RawChildKind::HeapGlobal),
             ],
         };
-        let ga = global(a_base, vec![0xAA; sz], false);
-        let gb = global(b_base, vec![0xBB; sz], false);
+        let mut ga = global(a_base, vec![0xAA; sz], false);
+        let mut gb = global(b_base, vec![0xBB; sz], false);
+        // Strict ObservedAllocation extents: an unrelated partial overlap with
+        // conflicting bytes must still fail closed (the two children cannot both
+        // be full-range coherent over the shared slab region).
+        ga.extent_kind = super::super::heap_global_snapshot::CaptureExtentKind::ObservedAllocation;
+        gb.extent_kind = super::super::heap_global_snapshot::CaptureExtentKind::ObservedAllocation;
         let result = build_patched_backing_slab(&raw_capture, &[ga, gb], &[], &["t"]);
         // Fail-closed: either raw drift (shared slab region cannot satisfy both
         // raw-coherence checks) or an overlay conflict. Never a successful plan.
@@ -1619,18 +1835,18 @@ mod tests {
         RawSlabCapture {
             slab: slab(ROUTEN_SLAB_BASE, content),
             children: vec![
-                RawChild {
-                    old_base: ROUTEN_A_BASE,
-                    size: ROUTEN_VIEW_SZ,
-                    raw_bytes: vec![fill; ROUTEN_VIEW_SZ],
-                    kind: RawChildKind::HeapGlobal,
-                },
-                RawChild {
-                    old_base: ROUTEN_B_BASE,
-                    size: ROUTEN_VIEW_SZ,
-                    raw_bytes: vec![fill; ROUTEN_VIEW_SZ],
-                    kind: RawChildKind::HeapGlobal,
-                },
+                raw_child(
+                    ROUTEN_A_BASE,
+                    ROUTEN_VIEW_SZ,
+                    vec![fill; ROUTEN_VIEW_SZ],
+                    RawChildKind::HeapGlobal,
+                ),
+                raw_child(
+                    ROUTEN_B_BASE,
+                    ROUTEN_VIEW_SZ,
+                    vec![fill; ROUTEN_VIEW_SZ],
+                    RawChildKind::HeapGlobal,
+                ),
             ],
         }
     }
@@ -1646,7 +1862,7 @@ mod tests {
         a[..0x50].fill(0xBB);
         let mut b = vec![0xAAu8; ROUTEN_VIEW_SZ];
         b[0x3e0..].fill(0xCC);
-        let (patched, overlays) = build_patched_backing_slab(
+        let (patched, overlays, _) = build_patched_backing_slab(
             &raw_capture,
             &[
                 global(ROUTEN_A_BASE, a, false),
@@ -1680,7 +1896,8 @@ mod tests {
         let raw_slab = raw_capture.slab.content.clone();
         let a = global(ROUTEN_A_BASE, vec![0xAAu8; ROUTEN_VIEW_SZ], false);
         let b = global(ROUTEN_B_BASE, vec![0xAAu8; ROUTEN_VIEW_SZ], false);
-        let (patched, _) = build_patched_backing_slab(&raw_capture, &[a, b], &[], &["t"]).unwrap();
+        let (patched, _, _) =
+            build_patched_backing_slab(&raw_capture, &[a, b], &[], &["t"]).unwrap();
         assert_eq!(patched.content, raw_slab);
     }
 
@@ -1694,7 +1911,7 @@ mod tests {
         a[0x50] = 0xBB;
         let mut b = vec![0xAAu8; ROUTEN_VIEW_SZ];
         b[0x00] = 0xBB; // B's offset 0 = slab A_off+0x50
-        let (patched, overlays) = build_patched_backing_slab(
+        let (patched, overlays, _) = build_patched_backing_slab(
             &raw_capture,
             &[
                 global(ROUTEN_A_BASE, a, false),
@@ -1758,10 +1975,11 @@ mod tests {
         b[0x3e0..].fill(0xCC);
         let g_a = global(ROUTEN_A_BASE, a.clone(), false);
         let g_b = global(ROUTEN_B_BASE, b.clone(), false);
-        let (p1, _) =
+        let (p1, _, _) =
             build_patched_backing_slab(&raw_capture, &[g_a.clone(), g_b.clone()], &[], &["t"])
                 .unwrap();
-        let (p2, _) = build_patched_backing_slab(&raw_capture, &[g_b, g_a], &[], &["t"]).unwrap();
+        let (p2, _, _) =
+            build_patched_backing_slab(&raw_capture, &[g_b, g_a], &[], &["t"]).unwrap();
         assert_eq!(p1.content, p2.content);
     }
 
@@ -1882,7 +2100,7 @@ mod tests {
         ga.transform_ids = vec!["t1".to_string()];
         // An unchanged child: content == raw, no transform_ids.
         let gb = global(ROUTEN_B_BASE, vec![0xAAu8; ROUTEN_VIEW_SZ], false);
-        let (_, overlays) =
+        let (_, overlays, _) =
             build_patched_backing_slab(&raw_capture, &[ga, gb], &[], &["t1", "t2", "t3"]).unwrap();
         let overlay_a = overlays
             .iter()
@@ -1896,5 +2114,520 @@ mod tests {
             .unwrap();
         // The unchanged child carries no transform writer (empty list).
         assert!(overlay_b.transform_ids.is_empty());
+    }
+
+    // ---------- GTO Core Recovery R0-G tests ----------
+
+    use super::super::heap_global_snapshot::CaptureExtentKind as CEK;
+    use super::super::heap_global_snapshot::CapturePath;
+
+    /// Route O R1 exact drift geometry (recorded live): child 0x9f93e8 captured
+    /// at 0x70 bytes inside slab [0x9bf000,+0x2db3750), first mismatch at 0x28.
+    const R0G_SLAB_BASE: u64 = 0x9bf000;
+    const R0G_CHILD_BASE: u64 = 0x9f93e8;
+    const R0G_CHILD_SIZE: usize = 0x70;
+    const R0G_CHILD_OFF: usize = 0x3a3e8;
+    const R0G_FIRST_MISMATCH: usize = 0x28;
+
+    /// A raw child in Route O geometry with the given stable prefix length.
+    fn r0g_raw_child_at(base: u64, prefix_match: usize, extent: CEK, capture_id: &str) -> RawChild {
+        let mut bytes = vec![0xAAu8; R0G_CHILD_SIZE];
+        // bytes[0..prefix_match] match the slab; bytes[prefix_match..] drift.
+        for i in prefix_match..R0G_CHILD_SIZE {
+            bytes[i] = 0xBB; // drifted (child != slab)
+        }
+        let mut c = raw_child(base, R0G_CHILD_SIZE, bytes, RawChildKind::HeapGlobal);
+        c.extent_kind = extent;
+        c.capture_id = capture_id.to_string();
+        c
+    }
+
+    /// A raw child at the Route O child base.
+    fn r0g_raw_child(prefix_match: usize, extent: CEK, capture_id: &str) -> RawChild {
+        r0g_raw_child_at(R0G_CHILD_BASE, prefix_match, extent, capture_id)
+    }
+
+    /// A slab whose content at the child offset is all 0xAA (so only bytes past
+    /// `prefix_match` drift in the child).
+    fn r0g_slab() -> HeapSlab {
+        let mut content = vec![0u8; R0G_CHILD_OFF + R0G_CHILD_SIZE];
+        for i in 0..R0G_CHILD_SIZE {
+            content[R0G_CHILD_OFF + i] = 0xAA;
+        }
+        HeapSlab {
+            old_base: R0G_SLAB_BASE,
+            content,
+        }
+    }
+
+    /// A transformed child in Route O geometry; if `write_off < prefix_match` the
+    /// transform writes into the stable prefix (clean preimage), else into the
+    /// drifted region.
+    fn r0g_transformed(
+        prefix_match: usize,
+        write_off: usize,
+        write_val: u8,
+        extent: CEK,
+    ) -> HeapGlobalSnapshot {
+        let mut content = vec![0xAAu8; R0G_CHILD_SIZE];
+        for i in prefix_match..R0G_CHILD_SIZE {
+            content[i] = 0xBB; // raw-child drift baseline
+        }
+        // Apply the transform write (over the raw-child value at that offset).
+        content[write_off] = write_val;
+        let mut g = global(R0G_CHILD_BASE, content, false);
+        g.extent_kind = extent;
+        g
+    }
+
+    // 1. Probe-window non-write drift uses the authoritative slab (B[i]=S[i]).
+    #[test]
+    fn r0g_nonwrite_probe_drift_uses_slab_authority() {
+        let raw_capture = RawSlabCapture {
+            slab: r0g_slab(),
+            children: vec![r0g_raw_child(
+                R0G_FIRST_MISMATCH,
+                CEK::ProbeWindow,
+                "probe1",
+            )],
+        };
+        // No transform: T == C.
+        let mut transformed = global(
+            R0G_CHILD_BASE,
+            {
+                let mut b = vec![0xAAu8; R0G_CHILD_SIZE];
+                for i in R0G_FIRST_MISMATCH..R0G_CHILD_SIZE {
+                    b[i] = 0xBB;
+                }
+                b
+            },
+            false,
+        );
+        transformed.extent_kind = CEK::ProbeWindow;
+        let (patched, _, drift) =
+            build_patched_backing_slab(&raw_capture, &[transformed], &[], &["t"]).unwrap();
+        // The authoritative slab byte wins: patched at child offset is the slab
+        // value (0xAA everywhere, since the slab is all 0xAA).
+        assert_eq!(
+            &patched.content[R0G_CHILD_OFF..R0G_CHILD_OFF + R0G_CHILD_SIZE],
+            &vec![0xAAu8; R0G_CHILD_SIZE][..]
+        );
+        // A NonWriteSlabAuthoritative drift run was recorded covering the tail.
+        assert!(!drift.is_empty());
+        assert!(drift
+            .iter()
+            .any(|d| d.resolution == CaptureDriftResolution::NonWriteSlabAuthoritative));
+        assert!(drift
+            .iter()
+            .all(|d| d.resolution == CaptureDriftResolution::NonWriteSlabAuthoritative));
+    }
+
+    // 2. Interior-subview non-write drift uses the authoritative slab.
+    #[test]
+    fn r0g_nonwrite_interior_drift_uses_slab_authority() {
+        let raw_capture = RawSlabCapture {
+            slab: r0g_slab(),
+            children: vec![r0g_raw_child(
+                R0G_FIRST_MISMATCH,
+                CEK::InteriorSubview,
+                "interior1",
+            )],
+        };
+        let mut transformed = global(
+            R0G_CHILD_BASE,
+            {
+                let mut b = vec![0xAAu8; R0G_CHILD_SIZE];
+                for i in R0G_FIRST_MISMATCH..R0G_CHILD_SIZE {
+                    b[i] = 0xBB;
+                }
+                b
+            },
+            false,
+        );
+        transformed.extent_kind = CEK::InteriorSubview;
+        let (patched, _, drift) =
+            build_patched_backing_slab(&raw_capture, &[transformed], &[], &["t"]).unwrap();
+        assert_eq!(
+            &patched.content[R0G_CHILD_OFF..R0G_CHILD_OFF + R0G_CHILD_SIZE],
+            &vec![0xAAu8; R0G_CHILD_SIZE][..]
+        );
+        assert!(drift
+            .iter()
+            .all(|d| d.resolution == CaptureDriftResolution::NonWriteSlabAuthoritative));
+    }
+
+    // 3. No-transform drift does not modify the slab (patched == raw slab).
+    #[test]
+    fn r0g_no_transform_drift_does_not_modify_slab() {
+        let slab = r0g_slab();
+        let raw_slab = slab.content.clone();
+        let raw_capture = RawSlabCapture {
+            slab,
+            children: vec![r0g_raw_child(
+                R0G_FIRST_MISMATCH,
+                CEK::ProbeWindow,
+                "probe2",
+            )],
+        };
+        // T == C (no transform writes).
+        let mut transformed = global(
+            R0G_CHILD_BASE,
+            {
+                let mut b = vec![0xAAu8; R0G_CHILD_SIZE];
+                for i in R0G_FIRST_MISMATCH..R0G_CHILD_SIZE {
+                    b[i] = 0xBB;
+                }
+                b
+            },
+            false,
+        );
+        transformed.extent_kind = CEK::ProbeWindow;
+        let (patched, _, _) =
+            build_patched_backing_slab(&raw_capture, &[transformed], &[], &["t"]).unwrap();
+        assert_eq!(patched.content, raw_slab);
+    }
+
+    // 4. A transform writing a stable preimage (write < first mismatch) applies.
+    #[test]
+    fn r0g_stable_preimage_transform_write_applies() {
+        let raw_capture = RawSlabCapture {
+            slab: r0g_slab(),
+            children: vec![r0g_raw_child(
+                R0G_FIRST_MISMATCH,
+                CEK::ProbeWindow,
+                "probe3",
+            )],
+        };
+        // Transform writes byte 0x10 (within stable prefix) to 0xEE.
+        let transformed = r0g_transformed(R0G_FIRST_MISMATCH, 0x10, 0xEE, CEK::ProbeWindow);
+        let (patched, _, _) = build_patched_backing_slab(
+            &raw_capture,
+            &[transformed],
+            &[],
+            &["repair_gscript_window_strings"],
+        )
+        .unwrap();
+        // The write was applied at slab offset.
+        assert_eq!(patched.content[R0G_CHILD_OFF + 0x10], 0xEE);
+        // The drifted tail stays at slab authority (0xAA).
+        assert_eq!(patched.content[R0G_CHILD_OFF + R0G_FIRST_MISMATCH], 0xAA);
+    }
+
+    // 5. A transform writing a drifted preimage fails closed (TransformPreimageDrift).
+    #[test]
+    fn r0g_transform_preimage_drift_fails_closed() {
+        let raw_capture = RawSlabCapture {
+            slab: r0g_slab(),
+            children: vec![r0g_raw_child(
+                R0G_FIRST_MISMATCH,
+                CEK::ProbeWindow,
+                "probe4",
+            )],
+        };
+        // Transform writes byte 0x30 (>= first mismatch 0x28), which drifted.
+        let transformed = r0g_transformed(R0G_FIRST_MISMATCH, 0x30, 0xEE, CEK::ProbeWindow);
+        let err =
+            build_patched_backing_slab(&raw_capture, &[transformed], &[], &["t"]).unwrap_err();
+        assert!(matches!(err, OverlayError::TransformPreimageDrift { .. }));
+    }
+
+    // 6. Strict ObservedAllocation full-range drift still fails closed.
+    #[test]
+    fn r0g_strict_observed_allocation_drift_fails_closed() {
+        let raw_capture = RawSlabCapture {
+            slab: r0g_slab(),
+            children: vec![r0g_raw_child(
+                R0G_FIRST_MISMATCH,
+                CEK::ObservedAllocation,
+                "obs1",
+            )],
+        };
+        // Even with no transform, a strict allocation with full-range drift fails.
+        let mut transformed = global(
+            R0G_CHILD_BASE,
+            {
+                let mut b = vec![0xAAu8; R0G_CHILD_SIZE];
+                for i in R0G_FIRST_MISMATCH..R0G_CHILD_SIZE {
+                    b[i] = 0xBB;
+                }
+                b
+            },
+            false,
+        );
+        transformed.extent_kind = CEK::ObservedAllocation;
+        let err =
+            build_patched_backing_slab(&raw_capture, &[transformed], &[], &["t"]).unwrap_err();
+        assert!(matches!(err, OverlayError::RawCaptureDrift { .. }));
+    }
+
+    // 7. BackingObject full-range drift still fails closed.
+    #[test]
+    fn r0g_backing_object_drift_fails_closed() {
+        let raw_capture = RawSlabCapture {
+            slab: r0g_slab(),
+            children: vec![r0g_raw_child(
+                R0G_FIRST_MISMATCH,
+                CEK::BackingObject,
+                "back1",
+            )],
+        };
+        let mut transformed = global(
+            R0G_CHILD_BASE,
+            {
+                let mut b = vec![0xAAu8; R0G_CHILD_SIZE];
+                for i in R0G_FIRST_MISMATCH..R0G_CHILD_SIZE {
+                    b[i] = 0xBB;
+                }
+                b
+            },
+            false,
+        );
+        transformed.extent_kind = CEK::BackingObject;
+        let err =
+            build_patched_backing_slab(&raw_capture, &[transformed], &[], &["t"]).unwrap_err();
+        assert!(matches!(err, OverlayError::RawCaptureDrift { .. }));
+    }
+
+    // 8. Synthetic children still skip raw coherence entirely.
+    #[test]
+    fn r0g_synthetic_still_skips_raw_coherence() {
+        let raw_capture = RawSlabCapture {
+            slab: r0g_slab(),
+            children: vec![],
+        };
+        // A synthetic child (SyntheticDerived provenance) with no raw source.
+        let mut synth = global(0x10000, b"NewClassName\0".to_vec(), false);
+        synth.provenance = RegionProvenance::SyntheticDerived {
+            transform_id: "repair_gscript_window_strings".to_string(),
+            source_anchor: "gscript+0xbd8".to_string(),
+            construction_digest: sha256_hex(&synth.content),
+        };
+        synth.extent_kind = CEK::SyntheticDerived;
+        // Should not fail on raw coherence (no raw child); recorded as synthetic ledger.
+        let (_, overlays, _) =
+            build_patched_backing_slab(&raw_capture, &[synth], &[], &["t"]).unwrap();
+        assert!(!overlays.is_empty());
+        assert!(!overlays[0].overlay_applied);
+    }
+
+    // 9. Drift runs are deterministically sorted.
+    #[test]
+    fn r0g_drift_runs_are_deterministically_sorted() {
+        // Two probe children with drift -> drift runs sorted by (base, slab_offset).
+        let a = R0G_CHILD_BASE;
+        let b = R0G_CHILD_BASE + 0x100;
+        let mut content = vec![0u8; (b - R0G_SLAB_BASE) as usize + R0G_CHILD_SIZE];
+        for off in 0..R0G_CHILD_SIZE {
+            content[(a - R0G_SLAB_BASE) as usize + off] = 0xAA;
+            content[(b - R0G_SLAB_BASE) as usize + off] = 0xAA;
+        }
+        let raw_capture = RawSlabCapture {
+            slab: HeapSlab {
+                old_base: R0G_SLAB_BASE,
+                content,
+            },
+            children: vec![
+                r0g_raw_child_at(a, R0G_FIRST_MISMATCH, CEK::ProbeWindow, "pa"),
+                r0g_raw_child_at(b, R0G_FIRST_MISMATCH, CEK::ProbeWindow, "pb"),
+            ],
+        };
+        let mk = |live: u64, id: &str| {
+            let mut g = global(
+                live,
+                {
+                    let mut b = vec![0xAAu8; R0G_CHILD_SIZE];
+                    for i in R0G_FIRST_MISMATCH..R0G_CHILD_SIZE {
+                        b[i] = 0xBB;
+                    }
+                    b
+                },
+                false,
+            );
+            g.extent_kind = CEK::ProbeWindow;
+            g.extent_evidence.capture_id = id.to_string();
+            g
+        };
+        let ga = mk(a, "pa");
+        let gb = mk(b, "pb");
+        let (_, _, d1) =
+            build_patched_backing_slab(&raw_capture, &[gb.clone(), ga.clone()], &[], &["t"])
+                .unwrap();
+        let (_, _, d2) = build_patched_backing_slab(&raw_capture, &[ga, gb], &[], &["t"]).unwrap();
+        assert_eq!(d1, d2);
+        for w in d1.windows(2) {
+            assert!(w[0].child_old_base <= w[1].child_old_base);
+        }
+    }
+
+    // 10. Drift ledger binds the child capture id.
+    #[test]
+    fn r0g_drift_ledger_binds_capture_id() {
+        let raw_capture = RawSlabCapture {
+            slab: r0g_slab(),
+            children: vec![r0g_raw_child(
+                R0G_FIRST_MISMATCH,
+                CEK::ProbeWindow,
+                "gscript_child_link:0x1:0x0:0x9f93e8:0x400",
+            )],
+        };
+        let mut transformed = global(
+            R0G_CHILD_BASE,
+            {
+                let mut b = vec![0xAAu8; R0G_CHILD_SIZE];
+                for i in R0G_FIRST_MISMATCH..R0G_CHILD_SIZE {
+                    b[i] = 0xBB;
+                }
+                b
+            },
+            false,
+        );
+        transformed.extent_kind = CEK::ProbeWindow;
+        transformed.extent_evidence.capture_id =
+            "gscript_child_link:0x1:0x0:0x9f93e8:0x400".to_string();
+        let (_, _, drift) =
+            build_patched_backing_slab(&raw_capture, &[transformed], &[], &["t"]).unwrap();
+        assert!(!drift.is_empty());
+        for d in &drift {
+            assert_eq!(
+                d.child_capture_id,
+                "gscript_child_link:0x1:0x0:0x9f93e8:0x400"
+            );
+        }
+    }
+
+    // 11. first_mismatch is never used as the allocation size.
+    #[test]
+    fn r0g_first_mismatch_is_not_used_as_size() {
+        // The drift at 0x28 must NOT truncate the child to 0x28. The child keeps
+        // its full captured size (0x70) and the slab stays authoritative.
+        let raw_capture = RawSlabCapture {
+            slab: r0g_slab(),
+            children: vec![r0g_raw_child(
+                R0G_FIRST_MISMATCH,
+                CEK::ProbeWindow,
+                "probe5",
+            )],
+        };
+        let mut transformed = global(
+            R0G_CHILD_BASE,
+            {
+                let mut b = vec![0xAAu8; R0G_CHILD_SIZE];
+                for i in R0G_FIRST_MISMATCH..R0G_CHILD_SIZE {
+                    b[i] = 0xBB;
+                }
+                b
+            },
+            false,
+        );
+        transformed.extent_kind = CEK::ProbeWindow;
+        let (patched, _, _) =
+            build_patched_backing_slab(&raw_capture, &[transformed], &[], &["t"]).unwrap();
+        // The slab content at the full child range (0x70 bytes) is retained.
+        assert_eq!(
+            &patched.content[R0G_CHILD_OFF..R0G_CHILD_OFF + R0G_CHILD_SIZE],
+            &vec![0xAAu8; R0G_CHILD_SIZE][..]
+        );
+    }
+
+    // 12. Input order does not change drift resolution.
+    #[test]
+    fn r0g_input_order_does_not_change_drift_resolution() {
+        let raw_capture = RawSlabCapture {
+            slab: r0g_slab(),
+            children: vec![r0g_raw_child(
+                R0G_FIRST_MISMATCH,
+                CEK::ProbeWindow,
+                "probe6",
+            )],
+        };
+        // T == C (child with the same drift tail as the raw child).
+        let mk = || {
+            let mut g = global(
+                R0G_CHILD_BASE,
+                {
+                    let mut b = vec![0xAAu8; R0G_CHILD_SIZE];
+                    for i in R0G_FIRST_MISMATCH..R0G_CHILD_SIZE {
+                        b[i] = 0xBB;
+                    }
+                    b
+                },
+                false,
+            );
+            g.extent_kind = CEK::ProbeWindow;
+            g
+        };
+        let t1 = mk();
+        let t2 = mk();
+        let (p1, _, d1) = build_patched_backing_slab(&raw_capture, &[t1], &[], &["t"]).unwrap();
+        let (p2, _, d2) = build_patched_backing_slab(&raw_capture, &[t2], &[], &["t"]).unwrap();
+        assert_eq!(p1.content, p2.content);
+        assert_eq!(d1, d2);
+    }
+
+    // 13. Existing transform-write conflict (same byte, different value) still fails.
+    #[test]
+    fn r0g_existing_transform_write_conflict_still_fails() {
+        let raw_capture = route_n_raw_capture(0xAA);
+        let mut a = vec![0xAAu8; ROUTEN_VIEW_SZ];
+        a[0x50] = 0xBB;
+        let mut b = vec![0xAAu8; ROUTEN_VIEW_SZ];
+        b[0x00] = 0xCC;
+        // Both children are strict ObservedAllocation (R0-F semantics preserved).
+        let mut ga = global(ROUTEN_A_BASE, a, false);
+        ga.extent_kind = CEK::ObservedAllocation;
+        let mut gb = global(ROUTEN_B_BASE, b, false);
+        gb.extent_kind = CEK::ObservedAllocation;
+        let err =
+            build_patched_backing_slab(&raw_capture, &[ga, gb], &[], &["t1", "t2"]).unwrap_err();
+        assert!(matches!(err, OverlayError::TransformWriteConflict { .. }));
+    }
+
+    // 14. Existing raw-duplicate ambiguity still fails closed.
+    #[test]
+    fn r0g_existing_raw_duplicate_ambiguity_still_fails() {
+        // Two distinct raw children at the same base with different bytes, NEITHER
+        // slab-coherent (slab holds a third distinct byte pattern) -> ambiguous,
+        // fails closed (no silent overwrite).
+        let s = slab_with_child(
+            ROUTEK_SLAB_BASE,
+            ROUTEK_SLAB_SZ,
+            ROUTEK_CHILD_BASE,
+            b"slab-bytes-xxx".to_vec(),
+        );
+        let raw_capture = RawSlabCapture {
+            slab: s,
+            children: vec![
+                raw_child(
+                    ROUTEK_CHILD_BASE,
+                    14,
+                    b"child-A-bytes".to_vec(),
+                    RawChildKind::HeapGlobal,
+                ),
+                raw_child(
+                    ROUTEK_CHILD_BASE,
+                    14,
+                    b"child-B-bytes".to_vec(),
+                    RawChildKind::HeapGlobal,
+                ),
+            ],
+        };
+        let ga = global(ROUTEK_CHILD_BASE, b"child-A-bytes".to_vec(), false);
+        let gb = global(ROUTEK_CHILD_BASE, b"child-B-bytes".to_vec(), false);
+        // Neither raw child matches the slab ("slab-bytes-xxx"); the two raw
+        // children differ from each other -> ambiguous duplicate -> fail closed.
+        let err = build_patched_backing_slab(&raw_capture, &[ga, gb], &[], &["t"]).unwrap_err();
+        assert!(matches!(err, OverlayError::RawChildMissing { .. }));
+    }
+
+    // 15. Route O exact geometry constant sanity.
+    #[test]
+    fn r0g_route_o_geometry_is_exact() {
+        assert_eq!(R0G_CHILD_BASE - R0G_SLAB_BASE, R0G_CHILD_OFF as u64);
+        assert_eq!(R0G_CHILD_OFF as u64, 0x3a3e8);
+        assert_eq!(R0G_CHILD_SIZE, 0x70);
+        assert_eq!(R0G_FIRST_MISMATCH, 0x28);
+        // The child is inside the Route O slab.
+        assert!(R0G_CHILD_BASE >= R0G_SLAB_BASE);
+        assert!(R0G_CHILD_BASE + R0G_CHILD_SIZE as u64 <= R0G_SLAB_BASE + 0x2db3750);
     }
 }

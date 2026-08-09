@@ -891,6 +891,9 @@ pub fn dump_process_with_report(
     // Track capture/transform provenance (taxonomy v1 capture-class transforms).
     let mut capture_transforms: Vec<(&'static str, &'static str)> = Vec::new();
     let mut overlay_ledger: Vec<super::raw_slab_coherence::TransformedRegionOverlay> = Vec::new();
+    // GTO R0-G: capture-drift runs ledger (probe/interior non-write drift resolved
+    // to slab authority; surfaced in the manifest).
+    let mut capture_drift_ledger: Vec<super::raw_slab_coherence::CaptureDriftRun> = Vec::new();
     if raw_capture.is_some() {
         capture_transforms.push(("heap_slab_raw_capture", "capture"));
     }
@@ -1207,11 +1210,12 @@ pub fn dump_process_with_report(
             &containers,
             transform_ids,
         ) {
-            Ok((patched, overlays)) => {
+            Ok((patched, overlays, drift_runs)) => {
                 capture_transforms.push(("heap_slab_restore", "capture"));
                 // Record overlay ledger into diagnostics (later surfaced in the
                 // snapshot manifest / summary).
                 overlay_ledger = overlays;
+                capture_drift_ledger = drift_runs;
                 Some(patched)
             }
             Err(e) => {
@@ -1927,6 +1931,7 @@ pub fn dump_process_with_report(
         &capture_policy,
         rebase_summary.as_ref(),
         &overlay_ledger,
+        &capture_drift_ledger,
         &synthetic_requests,
         &synthetic_assignment_ledger,
     );
