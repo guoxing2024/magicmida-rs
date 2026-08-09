@@ -4064,6 +4064,120 @@ mod tests {
         }
     }
 
+    // Route R R0-D / Audit Fix 1: the Route P inline fixup (mName @ slab+0x28 ->
+    // label_live+0x30, InCapturedRegion, target = containing slab at +0x30) must
+    // SURVIVE runtime-metadata encoding. We encode the plan to BootMetadata and
+    // inspect the emitted BootFixup, not just the in-memory RebasePointer.
+    #[test]
+    fn route_r_r0d_inline_fixup_survives_metadata_encoding() {
+        use super::super::heap_global_snapshot::CaptureExtentKind as CEK;
+        const SLAB_BASE: u64 = 0x874000;
+        const LABEL: u64 = 0x8aa5f8;
+        const LABEL_SIZE: usize = 0x70;
+        const INLINE: u64 = LABEL + 0x30;
+        let child_off = (LABEL - SLAB_BASE) as usize;
+        let mut slab_content = vec![0u8; child_off + LABEL_SIZE];
+        for i in 0..LABEL_SIZE {
+            slab_content[child_off + i] = 0xAA;
+        }
+        // mName at +0x28 points at the label's own inline +0x30 (interior alias).
+        slab_content[child_off + 0x28..child_off + 0x30].copy_from_slice(&INLINE.to_le_bytes());
+        let slab = HeapSlab {
+            old_base: SLAB_BASE,
+            content: slab_content,
+        };
+        let mut label = global(0, LABEL, vec![0xAAu8; LABEL_SIZE], false);
+        label.extent_kind = CEK::InteriorSubview;
+        let plan = build_plan(&[], &[label], Some(&slab)).unwrap().unwrap();
+        validate_runtime_rebase_plan(&plan).unwrap();
+        // The plan's RebasePointer for mName@+0x28.
+        let slab_region = plan
+            .regions
+            .iter()
+            .find(|r| r.kind == RegionKind::HeapSlab)
+            .expect("slab region");
+        let slot_off = (LABEL - SLAB_BASE) as u64 + 0x28;
+        let ptr = plan
+            .pointers
+            .iter()
+            .find(|p| p.source_region == slab_region.id && p.source_offset == slot_off as usize)
+            .expect("mName fixup pointer");
+        assert_eq!(ptr.original_value, INLINE);
+        // Encode to runtime metadata and inspect the BootFixup.
+        let meta = super::super::runtime_bootstrap::encode_plan_metadata(&plan).unwrap();
+        let f = meta
+            .fixups
+            .iter()
+            .find(|f| f.source_region == slab_region.id && f.source_offset == slot_off as usize)
+            .expect("encoded mName fixup");
+        assert_eq!(f.original_value, INLINE);
+        // InCapturedRegion encodes to byte 2 (see PointerClassification::label_u8).
+        assert_eq!(f.classification, 2);
+        assert_eq!(f.target_region as usize, slab_region.id);
+        assert_eq!(f.target_offset, slot_off + 0x08); // label+0x30 within slab
+    }
+
+    // Route R R0-D / Audit Fix 1: the OTHER-PARENT interior fixup (mName ->
+    // parent_live+0x40) must survive metadata encoding with target = the containing
+    // region at the interior offset.
+    #[test]
+    fn route_r_r0d_other_parent_fixup_survives_metadata_encoding() {
+        use super::super::heap_global_snapshot::CaptureExtentKind as CEK;
+        const SLAB_BASE: u64 = 0x874000;
+        const LABEL: u64 = 0x8aa5f8;
+        const LABEL_SIZE: usize = 0x70;
+        const PARENT: u64 = 0x900000;
+        const PARENT_SIZE: usize = 0x200;
+        const INTERIOR: u64 = PARENT + 0x40;
+        let child_off = (LABEL - SLAB_BASE) as usize;
+        let parent_off = (PARENT - SLAB_BASE) as usize;
+        let slab_sz = (child_off + LABEL_SIZE).max(parent_off + PARENT_SIZE);
+        let mut slab_content = vec![0u8; slab_sz];
+        for i in 0..LABEL_SIZE {
+            slab_content[child_off + i] = 0xAA;
+        }
+        for i in 0..PARENT_SIZE {
+            slab_content[parent_off + i] = 0x55;
+        }
+        slab_content[child_off + 0x28..child_off + 0x30].copy_from_slice(&INTERIOR.to_le_bytes());
+        let slab = HeapSlab {
+            old_base: SLAB_BASE,
+            content: slab_content,
+        };
+        let mut label = global(0, LABEL, vec![0xAAu8; LABEL_SIZE], false);
+        label.extent_kind = CEK::InteriorSubview;
+        let mut parent = global(0, PARENT, vec![0x55u8; PARENT_SIZE], false);
+        parent.extent_kind = CEK::BackingObject;
+        let plan = build_plan(&[], &[label, parent], Some(&slab))
+            .unwrap()
+            .unwrap();
+        validate_runtime_rebase_plan(&plan).unwrap();
+        let slab_region = plan
+            .regions
+            .iter()
+            .find(|r| r.kind == RegionKind::HeapSlab)
+            .expect("slab region");
+        let slot_off = (LABEL - SLAB_BASE) as u64 + 0x28;
+        let ptr = plan
+            .pointers
+            .iter()
+            .find(|p| p.source_region == slab_region.id && p.source_offset == slot_off as usize)
+            .expect("mName fixup pointer");
+        assert_eq!(ptr.original_value, INTERIOR);
+        // The target is the slab region containing the parent, at the interior offset.
+        let meta = super::super::runtime_bootstrap::encode_plan_metadata(&plan).unwrap();
+        let f = meta
+            .fixups
+            .iter()
+            .find(|f| f.source_region == slab_region.id && f.source_offset == slot_off as usize)
+            .expect("encoded mName fixup");
+        assert_eq!(f.original_value, INTERIOR);
+        // InCapturedRegion encodes to byte 2 (see PointerClassification::label_u8).
+        assert_eq!(f.classification, 2);
+        assert_eq!(f.target_region as usize, slab_region.id);
+        assert_eq!(f.target_offset, INTERIOR - SLAB_BASE);
+    }
+
     // 33. simulate_runtime_rebase uses normalized metadata correctly.
     #[test]
     fn r0c_simulate_normalized() {

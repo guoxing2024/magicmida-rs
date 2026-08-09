@@ -43,6 +43,7 @@ pub(crate) fn write_dump_snapshot_manifest(
     overlay_ledger: &[super::raw_slab_coherence::TransformedRegionOverlay],
     capture_drift_ledger: &[super::raw_slab_coherence::CaptureDriftRun],
     transform_preimage_ledger: &[super::raw_slab_coherence::TransformPreimageBinding],
+    transform_run_ledger: &super::raw_slab_coherence::TransformRunLedger,
     synthetic_requests: &[SyntheticRegionRequest],
     synthetic_assignment_ledger: &[SyntheticAssignment],
 ) {
@@ -59,6 +60,7 @@ pub(crate) fn write_dump_snapshot_manifest(
         overlay_ledger,
         capture_drift_ledger,
         transform_preimage_ledger,
+        transform_run_ledger,
         synthetic_requests,
         synthetic_assignment_ledger,
     ) {
@@ -104,6 +106,15 @@ fn hex_u64(v: u64) -> String {
     format!("{v:#x}")
 }
 
+/// Lowercase hex encoding of a byte slice (for manifest byte evidence).
+fn hex_bytes(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
 fn json_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 8);
     for c in s.chars() {
@@ -133,6 +144,7 @@ pub(crate) fn render_manifest_json(
     overlay_ledger: &[super::raw_slab_coherence::TransformedRegionOverlay],
     capture_drift_ledger: &[super::raw_slab_coherence::CaptureDriftRun],
     transform_preimage_ledger: &[super::raw_slab_coherence::TransformPreimageBinding],
+    transform_run_ledger: &super::raw_slab_coherence::TransformRunLedger,
     synthetic_requests: &[SyntheticRegionRequest],
     synthetic_assignment_ledger: &[SyntheticAssignment],
 ) -> Result<String, String> {
@@ -612,6 +624,46 @@ pub(crate) fn render_manifest_json(
     }
     buf.push_str("  ]\n");
 
+    // Route Q R0 Q0-A AF1 Rev 2: byte/run transform write-run ledger. Produced by
+    // the production pipeline (every transform diffs before/after and records
+    // contiguous changed-byte runs, in execution order). Each run carries its
+    // execution `sequence`, full child identity, offset/length, complete
+    // before/after bytes (hex) and self-consistent digests, so a live consumer
+    // can independently re-sha the digests, replay overlapping writer chains in
+    // order, and determine the final writer (e.g. `repair_label_names_after_scrub`
+    // for child +0x28, not `mark_labels_non_nested` which only writes +0x23).
+    // Diagnostic only; array order is execution order (never sorted/deduped).
+    buf.push_str(",\n");
+    buf.push_str("  \"transform_write_run_ledger\": [\n");
+    for (i, r) in transform_run_ledger.runs.iter().enumerate() {
+        buf.push_str(&format!(
+            "    {{\"sequence\": {}, \"child_capture_id\": \"{}\", \
+             \"child_old_base\": \"{}\", \"child_size\": {}, \
+             \"child_offset\": {}, \"length\": {}, \"transform_id\": \"{}\", \
+             \"before_digest\": \"{}\", \"after_digest\": \"{}\", \
+             \"first_before_byte\": {}, \"first_after_byte\": {}, \
+             \"before_bytes_hex\": \"{}\", \"after_bytes_hex\": \"{}\"}}",
+            i,
+            json_escape(&r.child_capture_id),
+            hex_u64(r.child_old_base),
+            r.child_size,
+            r.child_offset,
+            r.length,
+            json_escape(&r.transform_id),
+            r.before_digest,
+            r.after_digest,
+            r.first_before_byte,
+            r.first_after_byte,
+            hex_bytes(&r.before_bytes),
+            hex_bytes(&r.after_bytes)
+        ));
+        if i + 1 < transform_run_ledger.runs.len() {
+            buf.push(',');
+        }
+        buf.push('\n');
+    }
+    buf.push_str("  ]\n");
+
     // GTO R0-F.2 synthetic-assignment ledger: records the deterministic
     // collision-free logical-base assignment for every synthetic region request
     // (window class / title), with its source anchor, payload size, construction
@@ -713,6 +765,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &super::super::raw_slab_coherence::TransformRunLedger::default(),
             &[],
             &[],
         )
@@ -772,6 +825,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &super::super::raw_slab_coherence::TransformRunLedger::default(),
             &[],
             &[],
         )
@@ -824,6 +878,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &super::super::raw_slab_coherence::TransformRunLedger::default(),
             &[],
             &[],
         )
@@ -945,6 +1000,7 @@ mod tests {
             &overlay,
             &[],
             &[],
+            &super::super::raw_slab_coherence::TransformRunLedger::default(),
             &[],
             &[],
         )
@@ -1007,6 +1063,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &super::super::raw_slab_coherence::TransformRunLedger::default(),
             &[req.clone()],
             &assigned,
         )
@@ -1084,6 +1141,7 @@ mod tests {
             &[],
             &[],
             &[interior, strict],
+            &super::super::raw_slab_coherence::TransformRunLedger::default(),
             &[],
             &[],
         )
@@ -1103,5 +1161,111 @@ mod tests {
         assert_eq!(st["basis"], "ChildCapture");
         assert_eq!(st["seeded_from_slab"], false);
         assert_eq!(st["transform_input_digest"], "c_digest");
+    }
+
+    // Route Q R0 AF1 Rev 2 (P1-2): the transform_write_run_ledger must serialize
+    // full before/after bytes + execution sequence + digests so a consumer can
+    // independently re-sha and replay overlapping writer chains.
+    #[test]
+    fn route_q_r0e_manifest_write_run_ledger_roundtrip() {
+        use super::super::raw_slab_coherence::{TransformRunLedger, TransformWriteRun};
+        let sha = |b: &[u8]| -> String {
+            use sha2::{Digest, Sha256};
+            format!("{:x}", Sha256::digest(b))
+        };
+        // Two overlapping runs on the same child byte 0x28 (repair then sanitize),
+        // plus a disjoint run on +0x23 (mark_non_nested) to test ordering.
+        let mut ledger = TransformRunLedger::default();
+        ledger.runs.push(TransformWriteRun {
+            child_capture_id: "c1".into(),
+            child_old_base: 0x8aa5f8,
+            child_size: 0x70,
+            child_offset: 0x28,
+            length: 1,
+            transform_id: "repair_label_names_after_scrub".into(),
+            before_digest: sha(&[0xf0]),
+            after_digest: sha(&[0x28]),
+            first_before_byte: 0xf0,
+            first_after_byte: 0x28,
+            before_bytes: vec![0xf0],
+            after_bytes: vec![0x28],
+        });
+        ledger.runs.push(TransformWriteRun {
+            child_capture_id: "c1".into(),
+            child_old_base: 0x8aa5f8,
+            child_size: 0x70,
+            child_offset: 0x28,
+            length: 1,
+            transform_id: "sanitize_ahk_runtime_global".into(),
+            before_digest: sha(&[0x28]),
+            after_digest: sha(&[0x00]),
+            first_before_byte: 0x28,
+            first_after_byte: 0x00,
+            before_bytes: vec![0x28],
+            after_bytes: vec![0x00],
+        });
+        ledger.runs.push(TransformWriteRun {
+            child_capture_id: "c1".into(),
+            child_old_base: 0x8aa5f8,
+            child_size: 0x70,
+            child_offset: 0x23,
+            length: 1,
+            transform_id: "mark_labels_non_nested".into(),
+            before_digest: sha(&[0x00]),
+            after_digest: sha(&[0x01]),
+            first_before_byte: 0x00,
+            first_after_byte: 0x01,
+            before_bytes: vec![0x00],
+            after_bytes: vec![0x01],
+        });
+        let json = render_manifest_json(
+            Path::new("af1c.exe"),
+            DumpProfile::AhkGtoExperimental,
+            0x140000000,
+            0x70b0,
+            &[],
+            &[],
+            &DumpCapturePolicy::ahk_gto_default(),
+            None,
+            &[],
+            &[],
+            &[],
+            &ledger,
+            &[],
+            &[],
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid manifest JSON");
+        let wrl = v["transform_write_run_ledger"].as_array().unwrap();
+        assert_eq!(wrl.len(), 3);
+        // Execution order preserved (sequence 0..2), not sorted.
+        assert_eq!(wrl[0]["sequence"], 0);
+        assert_eq!(wrl[0]["transform_id"], "repair_label_names_after_scrub");
+        assert_eq!(wrl[1]["sequence"], 1);
+        assert_eq!(wrl[1]["transform_id"], "sanitize_ahk_runtime_global");
+        assert_eq!(wrl[2]["sequence"], 2);
+        assert_eq!(wrl[2]["transform_id"], "mark_labels_non_nested");
+        // Full before/after hex bytes present and digest recomputable.
+        for run in wrl.iter() {
+            let before_hex = run["before_bytes_hex"].as_str().unwrap();
+            let after_hex = run["after_bytes_hex"].as_str().unwrap();
+            let before = hex_decode(before_hex);
+            let after = hex_decode(after_hex);
+            assert_eq!(sha(&before), run["before_digest"].as_str().unwrap());
+            assert_eq!(sha(&after), run["after_digest"].as_str().unwrap());
+            assert_eq!(run["first_before_byte"].as_u64().unwrap() as u8, before[0]);
+            assert_eq!(run["first_after_byte"].as_u64().unwrap() as u8, after[0]);
+        }
+    }
+
+    /// Decode a lowercase hex string into bytes (test helper).
+    fn hex_decode(s: &str) -> Vec<u8> {
+        let s = s.trim();
+        let mut out = Vec::with_capacity(s.len() / 2);
+        for i in (0..s.len()).step_by(2) {
+            let b = u8::from_str_radix(&s[i..i + 2], 16).expect("hex byte");
+            out.push(b);
+        }
+        out
     }
 }

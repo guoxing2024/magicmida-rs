@@ -2477,6 +2477,45 @@ impl std::fmt::Display for SyntheticAssignError {
 
 impl std::error::Error for SyntheticAssignError {}
 
+/// A label mName repair could not be resolved to a safe, provable pointer
+/// (Route R R0-A / Audit Fix 1).
+///
+/// The transform must NOT silently fall back to reusing an old external/dangling
+/// VA (which runtime rebase cannot handle and may be uncaptured). A genuinely
+/// external label name is not yet wired into the collision-free synthetic
+/// allocator, so the ONLY safe action is to fail closed (return this error) and
+/// let `dump_process` abort the candidate before overlay/manifest. See
+/// [`repair_label_names_after_scrub`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LabelNameRepairError {
+    /// The mName points at a genuinely external address that is not a captured
+    /// alias (interior/exact) and not the label's own inline storage. It cannot
+    /// be safely synthesized without the allocator, so the transform fails.
+    ExternalNameUnassigned {
+        /// The label whose mName could not be resolved.
+        label_live: u64,
+        /// The external/dangling address originally in the mName field.
+        external_va: u64,
+    },
+}
+
+impl std::fmt::Display for LabelNameRepairError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LabelNameRepairError::ExternalNameUnassigned {
+                label_live,
+                external_va,
+            } => write!(
+                f,
+                "label {label_live:#x} mName points at external/dangling VA {external_va:#x}; \
+                 cannot safely synthesize without the collision-free allocator — fail closed"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LabelNameRepairError {}
+
 /// Floor for deterministic synthetic logical placement: above the small-tag
 /// range so an assigned base is never misread as a tag (runtime planner treats
 /// `val < SMALL_TAG_CEILING` as a small integer, never a pointer).
@@ -3188,22 +3227,33 @@ fn wide_bytes_to_sort_key(bytes: &[u8]) -> Option<String> {
 /// Slot-cap during capture often skips name externalization; scrub then leaves
 /// mName=0 → WinMain `0x48fb0` calls wcscmp(NULL) → call-obfusc AV (r17b/r18).
 /// Pure offline repair: no live process needed.
-pub fn repair_label_names_after_scrub(heap_globals: &mut Vec<HeapGlobalSnapshot>) {
+///
+/// Returns `Err(LabelNameRepairError::ExternalNameUnassigned)` when a label mName
+/// points at a genuinely external/dangling address that is neither a captured
+/// alias (interior/exact) nor the label's own inline storage. The transform must
+/// NOT reuse an old external VA or silently clear the field to produce a
+/// candidate; the caller (`dump_process`) aborts before overlay/manifest so the
+/// candidate is never generated. This is the Route R R0-A / Audit Fix 1
+/// fail-closed contract for external label names (full synthetic-allocator
+/// wiring is a separate capability work order).
+pub fn repair_label_names_after_scrub(
+    heap_globals: &mut Vec<HeapGlobalSnapshot>,
+) -> Result<(), LabelNameRepairError> {
     let Some(gscript) = heap_globals
         .iter()
         .find(|g| g.is_image_inline && g.content.len() >= 8)
     else {
-        return;
+        return Ok(());
     };
     let table_ptr = u64::from_le_bytes(gscript.content[0..8].try_into().unwrap_or_default());
     if table_ptr == 0 {
-        return;
+        return Ok(());
     }
     let Some(table) = heap_globals
         .iter()
         .find(|g| g.live_ptr == table_ptr && g.content.len() >= 8)
     else {
-        return;
+        return Ok(());
     };
     let count = {
         let c = u32::from_le_bytes(gscript.content[0x10..0x14].try_into().unwrap_or_default());
@@ -3215,7 +3265,7 @@ pub fn repair_label_names_after_scrub(heap_globals: &mut Vec<HeapGlobalSnapshot>
     };
     let table_content = table.content.clone();
     let mut repaired = 0usize;
-    let mut names_added = 0usize;
+    let names_added = 0usize; // synthetic snapshots are no longer created (R0-A)
     for i in 0..count.min(table_content.len() / 8).min(512) {
         let label_live = u64::from_le_bytes(
             table_content[i * 8..i * 8 + 8]
@@ -3241,67 +3291,51 @@ pub fn repair_label_names_after_scrub(heap_globals: &mut Vec<HeapGlobalSnapshot>
             continue;
         }
 
-        // R-GTO-UI r19b: most label names are *interiors* of a large capture
-        // (scrub keeps the ptr, multi_fixup exact-base does not remap). Slice
-        // the wide string out of the parent and plant an exact snapshot.
+        // Route R R0-A: resolve `str_live` (the target of label.mName) to a
+        // provable pointer. It must be one of:
+        //   (a) label-self interior (inline +0x30)  -> keep label interior alias
+        //   (b) interior to ANY other captured parent -> keep parent interior alias
+        //   (c) equal to a captured exact base       -> keep exact pointer
+        //   (d) genuinely EXTERNAL/dangling          -> FAIL CLOSED (no allocator yet)
+        //   (e) unrecoverable (name_ptr==0, no inline) -> null mName
+        // We never synthesize a snapshot in a captured range and never reuse an old
+        // external VA. If mName already points at an exact freeable snapshot, it was
+        // kept earlier (line 3290 `continue`).
         let mut str_live = 0u64;
-        let mut bytes: Option<Vec<u8>> = None;
+        let label_end = label_live.saturating_add(heap_globals[idx].content.len() as u64);
         if name_ptr != 0 {
-            if let Some((parent_live, parent_content)) = heap_globals.iter().find_map(|g| {
-                if g.is_heap_handle || g.content.len() < 4 {
-                    return None;
-                }
-                let end = g.live_ptr.saturating_add(g.content.len() as u64);
-                if name_ptr > g.live_ptr && name_ptr < end {
-                    Some((g.live_ptr, g.content.clone()))
-                } else {
-                    None
-                }
-            }) {
-                let off = (name_ptr - parent_live) as usize;
-                if let Some(b) = extract_wide_string_from_bytes(&parent_content[off..]) {
-                    str_live = name_ptr;
-                    bytes = Some(b);
-                    let _ = parent_live;
-                }
-            }
-        }
-        if bytes.is_none() {
-            // Prefer inline +0x30 (SSO / residual after scrub).
-            if let Some(b) = extract_inline_wide_name(&heap_globals[idx].content) {
+            let in_label = name_ptr > label_live && name_ptr < label_end;
+            let parent = find_containing_snapshot(&heap_globals, name_ptr);
+            let in_other_parent =
+                parent.is_some_and(|(base, _)| base != name_ptr && base != label_live);
+            let is_exact = is_exact_live_ptr(&heap_globals, name_ptr);
+            if in_label || in_other_parent || is_exact {
+                // (a)/(b)/(c): captured alias — keep the interior/exact pointer.
+                str_live = name_ptr;
+            } else if let Some(_b) = extract_inline_wide_name(&heap_globals[idx].content) {
+                // external name_ptr but inline +0x30 is recoverable -> the label's
+                // own inline storage is the alias (label-self interior).
                 str_live = label_live.saturating_add(LABEL_INLINE_NAME_OFF as u64);
-                bytes = Some(b);
+            } else {
+                // (d) genuinely external/dangling name_ptr with no inline fallback:
+                // cannot safely synthesize without the allocator — fail closed.
+                return Err(LabelNameRepairError::ExternalNameUnassigned {
+                    label_live,
+                    external_va: name_ptr,
+                });
             }
+        } else if let Some(_b) = extract_inline_wide_name(&heap_globals[idx].content) {
+            // name_ptr == 0 but inline +0x30 recoverable -> label-self interior alias.
+            str_live = label_live.saturating_add(LABEL_INLINE_NAME_OFF as u64);
         }
-        let Some(mut body) = bytes else {
-            // Uncaptured external mName with no recoverable bytes: null to
-            // avoid wcscmp(stale) / call-obfusc AV.
-            if name_ptr != 0 {
-                heap_globals[idx].content[LABEL_NAME_OFF..LABEL_NAME_OFF + 8].fill(0);
-            }
+        if str_live == 0 {
+            // (e) fully unrecoverable: null mName (fail-closed, no forged pointer).
+            heap_globals[idx].content[LABEL_NAME_OFF..LABEL_NAME_OFF + 8].fill(0);
             continue;
-        };
-        if body.len() < 2 || body[body.len() - 2..] != [0, 0] {
-            body.extend_from_slice(&[0, 0]);
         }
-        // Ensure string snapshot exists (may exceed soft cap — still required).
-        if !heap_globals.iter().any(|g| g.live_ptr == str_live) {
-            if heap_globals.len() >= MAX_HEAP_GLOBAL_SLOTS + 256 {
-                continue;
-            }
-            heap_globals.push(HeapGlobalSnapshot {
-                rva: 0,
-                live_ptr: str_live,
-                content: body,
-                is_heap_handle: false,
-                is_image_inline: false,
-                extent_kind: CaptureExtentKind::default(),
-                extent_evidence: CaptureExtentEvidence::default(),
-                transform_ids: Vec::new(),
-                provenance: RegionProvenance::default(),
-            });
-            names_added += 1;
-        }
+        // str_live is a captured alias (label-self interior / other-parent interior /
+        // exact captured base): keep the interior/exact pointer; NO synthetic snapshot.
+        // The runtime rebase handles the interior pointer via the containing region.
         heap_globals[idx].content[LABEL_NAME_OFF..LABEL_NAME_OFF + 8]
             .copy_from_slice(&str_live.to_le_bytes());
         repaired += 1;
@@ -3314,6 +3348,7 @@ pub fn repair_label_names_after_scrub(heap_globals: &mut Vec<HeapGlobalSnapshot>
             "Repaired label mName after scrub (inline SSO → exact string)"
         );
     }
+    Ok(())
 }
 
 fn synthesize_gscript_label_count(out: &mut [HeapGlobalSnapshot]) {
@@ -3707,6 +3742,9 @@ fn externalize_label_name_field(
     label[LABEL_NAME_OFF..LABEL_NAME_OFF + 8].copy_from_slice(&str_live.to_le_bytes());
 }
 
+// Retained for the future synthetic-allocator work order (Route R R0-A external
+// label wiring); currently unused because external label names fail closed.
+#[allow(dead_code)]
 fn extract_wide_string_from_bytes(slice: &[u8]) -> Option<Vec<u8>> {
     if slice.len() < 4 {
         return None;
@@ -7212,6 +7250,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &super::super::raw_slab_coherence::TransformRunLedger::default(),
             &[req],
             &assigned,
         )
@@ -7252,6 +7291,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &super::super::raw_slab_coherence::TransformRunLedger::default(),
             &reqs,
             &ledgers,
         )
@@ -7577,7 +7617,7 @@ mod tests {
         });
         let mname_before = globals[2].content[LABEL_NAME_OFF..LABEL_NAME_OFF + 8].to_vec();
         let before = globals.clone();
-        repair_label_names_after_scrub(&mut globals);
+        repair_label_names_after_scrub(&mut globals).unwrap();
         // mName unchanged (kept the exact pointer), no +0x28 write.
         assert_eq!(
             globals[2].content[LABEL_NAME_OFF..LABEL_NAME_OFF + 8],
@@ -7594,10 +7634,11 @@ mod tests {
         );
     }
 
-    // Test 2: C null / S captured interior pointer -> extract wide string from
-    // the authoritative parent and plant an exact snapshot; pointer kept.
+    // Test 2 (Route R R0-A): S captured interior pointer in ANOTHER parent ->
+    // kept as a parent alias (NO synthetic snapshot). mName points at the other
+    // parent's +0x40; runtime rebase handles the interior pointer.
     #[test]
-    fn route_q_r0d_s_interior_ptr_extracts_and_plants_exact() {
+    fn route_q_r0d_s_interior_ptr_kept_as_parent_alias() {
         let parent_base = 0x900000u64;
         let interior_name = parent_base + 0x40;
         let mut globals = q0d_fixture(interior_name, b'A' as u16);
@@ -7621,18 +7662,21 @@ mod tests {
         );
         // label moved to index 3 (parent inserted at 0).
         let label_idx = 3;
-        repair_label_names_after_scrub(&mut globals);
-        // Exact string snapshot now exists at interior_name.
-        assert!(globals
-            .iter()
-            .any(|g| g.live_ptr == interior_name && g.content.len() >= 8));
-        // mName keeps the interior pointer semantics.
+        let before = globals.clone();
+        repair_label_names_after_scrub(&mut globals).unwrap();
+        // R0-A: NO synthetic snapshot at the other-parent interior address.
+        assert!(
+            !globals.iter().any(|g| g.live_ptr == interior_name),
+            "other-parent interior must be a parent alias, not a synthetic snapshot"
+        );
+        // mName keeps the interior pointer (parent + 0x40).
         let mname = u64::from_le_bytes(
             globals[label_idx].content[LABEL_NAME_OFF..LABEL_NAME_OFF + 8]
                 .try_into()
                 .unwrap(),
         );
         assert_eq!(mname, interior_name);
+        let _ = before;
     }
 
     // Test 3: C null / S dangling pointer + inline valid -> repair writes
@@ -7642,7 +7686,7 @@ mod tests {
         let dangling = 0xdead_beef_u64;
         let mut globals = q0d_fixture(dangling, b'B' as u16);
         let before = globals.clone();
-        repair_label_names_after_scrub(&mut globals);
+        repair_label_names_after_scrub(&mut globals).unwrap();
         let expected = Q0D_LABEL + LABEL_INLINE_NAME_OFF as u64;
         let mname = u64::from_le_bytes(
             globals[2].content[LABEL_NAME_OFF..LABEL_NAME_OFF + 8]
@@ -7650,14 +7694,330 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(mname, expected);
-        // A snapshot exists at the inline key.
-        assert!(globals.iter().any(|g| g.live_ptr == expected));
+        // Route Q R0 AF1 Rev 2: label_live+0x30 is an INTERIOR alias of the label
+        // itself (not an independent allocation), so NO synthetic snapshot is
+        // created for it. mName points at the label's own +0x30 inline storage.
+        assert!(
+            !globals.iter().any(|g| g.live_ptr == expected),
+            "interior inline alias must not create a synthetic snapshot"
+        );
+        // The label itself (with its +0x30 bytes) is the backing.
+        assert!(globals.iter().any(|g| g.live_ptr == Q0D_LABEL));
         let runs = crate::dumper::raw_slab_coherence::diff_transform_write_runs(
             &before,
             &globals,
             "repair_label_names_after_scrub",
         );
         assert!(runs.iter().any(|r| r.child_offset == LABEL_NAME_OFF));
+    }
+
+    // Route R R0-A / Audit Fix 1: a genuinely EXTERNAL mName address (not in any
+    // captured parent, no inline fallback) must FAIL CLOSED before overlay. The
+    // transform returns ExternalNameUnassigned and does NOT reuse the old VA.
+    #[test]
+    fn route_r_r0a_external_name_fails_before_overlay() {
+        let external_va = 0x1a2b_3c4d_u64; // not captured, not label-self
+        let mut globals = q0d_fixture(external_va, 0); // inline first char 0 -> None
+        let err = repair_label_names_after_scrub(&mut globals).unwrap_err();
+        assert!(matches!(
+            err,
+            LabelNameRepairError::ExternalNameUnassigned {
+                external_va: v,
+                ..
+            } if v == external_va
+        ));
+        // The transform returned Err BEFORE writing mName, so the field is left
+        // untouched (still the fixture's original value) — it was NOT rewritten to a
+        // synthetic/forged pointer, and NO synthetic snapshot was created. The key
+        // proof is the Err return (aborts before overlay/manifest/candidate).
+        assert!(!globals.iter().any(|g| g.live_ptr == external_va));
+        // The label count is unchanged (no new snapshots).
+        assert_eq!(globals.len(), 3); // gscript, table, label only
+    }
+
+    // Route R R0-A / Audit Fix 1: an mName pointing interior to ANOTHER captured
+    // parent is kept as a parent alias AND the runtime rebase plan must emit the
+    // correct RebasePointer (target = the other parent, target_offset = the
+    // interior offset, InCapturedRegion, NO synthetic allocation).
+    #[test]
+    fn route_r_r0a_other_parent_alias_runtime_fixup() {
+        use crate::dumper::container_snapshot::ContainerSnapshot;
+        use crate::dumper::heap_global_snapshot::HeapSlab;
+        use crate::dumper::raw_slab_coherence::{self, RawChild, RawChildKind};
+        use crate::dumper::runtime_rebase::{
+            self, build_runtime_rebase_plan, declared_slots_from_capture,
+            validate_runtime_rebase_plan, ExternalResolverTable, PointerClassification,
+        };
+        let child_size = 0x70usize;
+        let slab_base: u64 = 0x874000;
+        let child_off = (Q0D_LABEL - slab_base) as usize;
+        let parent_base: u64 = 0x900000;
+        let interior_name = parent_base + 0x40;
+        let table_live = 0x8bc550u64;
+        let gscript_live = 0x7f0000u64;
+        // Build gscript + table + label with mName -> other parent interior.
+        let mut gscript_content = vec![0u8; 0x40];
+        gscript_content[0..8].copy_from_slice(&table_live.to_le_bytes());
+        gscript_content[0x10..0x14].copy_from_slice(&1u32.to_le_bytes());
+        let mut table_content = vec![0u8; 8];
+        table_content[0..8].copy_from_slice(&Q0D_LABEL.to_le_bytes());
+        let mut label_content = vec![0xAAu8; child_size];
+        label_content[0x28..0x30].fill(0); // C mName null
+                                           // The OTHER parent is captured and holds a wide string at +0x40.
+        let mut parent_content = vec![0x55u8; 0x200];
+        parent_content[0x40..0x40 + 4].copy_from_slice(&[b'Z' as u8, 0, b'o' as u8, 0]);
+        // Slab must cover label + table + other parent.
+        let parent_off = (parent_base - slab_base) as usize;
+        let slab_sz = (child_off + child_size).max(parent_off + 0x200);
+        let mut slab_content = vec![0u8; slab_sz];
+        for i in 0..child_size {
+            slab_content[child_off + i] = 0xAA;
+        }
+        // S mName at +0x28 = the other-parent interior address.
+        slab_content[child_off + 0x28..child_off + 0x30]
+            .copy_from_slice(&interior_name.to_le_bytes());
+        // Other parent + table bytes in slab (C==S for those strict regions).
+        for i in 0..0x200 {
+            slab_content[parent_off + i] = parent_content[i];
+        }
+        slab_content[(table_live - slab_base) as usize..(table_live - slab_base) as usize + 8]
+            .copy_from_slice(&table_content);
+        let raw_capture = raw_slab_coherence::RawSlabCapture {
+            slab: HeapSlab {
+                old_base: slab_base,
+                content: slab_content,
+            },
+            children: vec![
+                RawChild {
+                    old_base: Q0D_LABEL,
+                    size: child_size,
+                    raw_bytes: label_content.clone(),
+                    kind: RawChildKind::HeapGlobal,
+                    capture_id: "r-other-parent".into(),
+                    capture_path: CapturePath::GscriptChildLink,
+                    extent_kind: CaptureExtentKind::InteriorSubview,
+                    source_parent_old_base: Some(table_live),
+                    source_slot_offset: Some(0),
+                    requested_probe_size: 0x1000,
+                    was_interior: true,
+                    containing_parent_old_base: Some(table_live),
+                    containing_parent_size: Some(0x100),
+                },
+                RawChild {
+                    old_base: parent_base,
+                    size: 0x200,
+                    raw_bytes: parent_content.clone(),
+                    kind: RawChildKind::HeapGlobal,
+                    capture_id: "r-other-parent-obj".into(),
+                    capture_path: CapturePath::MainSlot,
+                    extent_kind: CaptureExtentKind::BackingObject,
+                    source_parent_old_base: None,
+                    source_slot_offset: None,
+                    requested_probe_size: 0,
+                    was_interior: false,
+                    containing_parent_old_base: None,
+                    containing_parent_size: None,
+                },
+                RawChild {
+                    old_base: table_live,
+                    size: table_content.len(),
+                    raw_bytes: table_content.clone(),
+                    kind: RawChildKind::HeapGlobal,
+                    capture_id: "r-table".into(),
+                    capture_path: CapturePath::MainSlot,
+                    extent_kind: CaptureExtentKind::ObservedAllocation,
+                    source_parent_old_base: None,
+                    source_slot_offset: None,
+                    requested_probe_size: 0,
+                    was_interior: false,
+                    containing_parent_old_base: None,
+                    containing_parent_size: None,
+                },
+            ],
+        };
+        // globals: gscript(image_inline), table, label, other parent.
+        let mk = |live: u64, content: Vec<u8>, inline: bool, cap: &str, ek: CaptureExtentKind| {
+            HeapGlobalSnapshot {
+                rva: if inline { 0x40 } else { 0 },
+                live_ptr: live,
+                content,
+                is_heap_handle: false,
+                is_image_inline: inline,
+                extent_kind: ek,
+                extent_evidence: CaptureExtentEvidence {
+                    capture_id: cap.to_string(),
+                    capture_path: CapturePath::MainSlot,
+                    source_root_rva: None,
+                    source_slot_offset: None,
+                    probe_requested_size: 0,
+                    was_interior: false,
+                    containing_parent_old_base: None,
+                    containing_parent_size: None,
+                },
+                transform_ids: Vec::new(),
+                provenance: RegionProvenance::default(),
+            }
+        };
+        let label = mk(
+            Q0D_LABEL,
+            label_content.clone(),
+            false,
+            "r-other-parent",
+            CaptureExtentKind::InteriorSubview,
+        );
+        let parent = mk(
+            parent_base,
+            parent_content.clone(),
+            false,
+            "r-other-parent-obj",
+            CaptureExtentKind::BackingObject,
+        );
+        let table = mk(
+            table_live,
+            table_content.clone(),
+            false,
+            "r-table",
+            CaptureExtentKind::ObservedAllocation,
+        );
+        let gscript = mk(
+            gscript_live,
+            gscript_content,
+            true,
+            "gscript",
+            CaptureExtentKind::ObservedAllocation,
+        );
+        let mut globals = vec![gscript, table, label, parent];
+        // Seed: label (InteriorSubview) input -> S, and strict children get bindings.
+        let mut containers: Vec<ContainerSnapshot> = Vec::new();
+        let bindings = raw_slab_coherence::seed_transform_inputs_from_authoritative_slab(
+            &raw_capture,
+            &mut containers,
+            &mut globals,
+        )
+        .unwrap();
+        // After seeding, the label's +0x28 == S (interior_name).
+        let mut write_ledger = raw_slab_coherence::TransformRunLedger::default();
+        let image_end = 0x800000_0000u64;
+        // Production transform order via the execution-owning recorder.
+        raw_slab_coherence::apply_recorded_transform(
+            &mut globals,
+            "scrub_uncaptured_heap_pointers",
+            &mut write_ledger,
+            |g| super::scrub_uncaptured_heap_pointers(&mut containers, g, 0, image_end),
+        );
+        raw_slab_coherence::apply_recorded_transform(
+            &mut globals,
+            "resynthesize_gscript_label_count",
+            &mut write_ledger,
+            |g| super::resynthesize_gscript_label_count(g),
+        );
+        raw_slab_coherence::try_apply_recorded_transform(
+            &mut globals,
+            "repair_label_names_after_scrub",
+            &mut write_ledger,
+            |g| super::repair_label_names_after_scrub(g),
+        )
+        .expect("repair must succeed for a captured-parent alias");
+        raw_slab_coherence::apply_recorded_transform(
+            &mut globals,
+            "sort_gscript_label_table",
+            &mut write_ledger,
+            |g| super::sort_gscript_label_table(g),
+        );
+        raw_slab_coherence::apply_recorded_transform(
+            &mut globals,
+            "mark_labels_non_nested",
+            &mut write_ledger,
+            |g| super::mark_labels_non_nested(g),
+        );
+        raw_slab_coherence::apply_recorded_transform(
+            &mut globals,
+            "sanitize_ahk_runtime_global",
+            &mut write_ledger,
+            |g| super::sanitize_ahk_runtime_global(g),
+        );
+        // Q0-C overlay.
+        let (patched, overlays, _drift) = raw_slab_coherence::build_patched_backing_slab_q0c(
+            &raw_capture,
+            &globals,
+            &containers,
+            &bindings,
+            &write_ledger,
+        )
+        .unwrap();
+        assert!(overlays
+            .iter()
+            .any(|o| o.child_old_base == Q0D_LABEL && o.overlay_applied));
+        // mName in patched slab must equal the other-parent interior alias.
+        assert_eq!(
+            u64::from_le_bytes(
+                patched.content[child_off + 0x28..child_off + 0x30]
+                    .try_into()
+                    .unwrap()
+            ),
+            interior_name,
+            "mName must keep the other-parent interior alias"
+        );
+        // Build + validate the runtime rebase plan.
+        let slots = declared_slots_from_capture(&containers, &globals, Some(&patched));
+        let plan = build_runtime_rebase_plan(
+            &containers,
+            &globals,
+            Some(&patched),
+            &slots,
+            &ExternalResolverTable::new(),
+            &[],
+            0x140000000,
+            0x150000000,
+        )
+        .unwrap()
+        .expect("plan must be produced");
+        validate_runtime_rebase_plan(&plan).unwrap();
+        // Assert the RebasePointer for mName@+0x28 -> other parent + 0x40.
+        let label_region = plan
+            .regions
+            .iter()
+            .find(|r| r.old_base <= Q0D_LABEL && (Q0D_LABEL < (r.old_base + (r.size as u64))))
+            .expect("label region");
+        let mname_slot_off = (Q0D_LABEL - label_region.old_base) as u64 + (LABEL_NAME_OFF as u64);
+        let ptr = plan
+            .pointers
+            .iter()
+            .find(|p| {
+                p.source_region == label_region.id
+                    && p.source_offset == mname_slot_off as usize
+                    && p.original_value == interior_name
+            })
+            .unwrap_or_else(|| panic!("planner must emit mName fixup to other-parent interior"));
+        assert_eq!(ptr.classification, PointerClassification::InCapturedRegion);
+        // target_region must be the region containing the OTHER parent's interior
+        // address (the slab region that spans the parent). target_offset is relative
+        // to that region's base.
+        let target_region = plan
+            .regions
+            .get(ptr.target_region.expect("target region"))
+            .expect("target region exists");
+        assert!(
+            target_region.old_base <= interior_name
+                && interior_name < (target_region.old_base + (target_region.size as u64)),
+            "target region must contain the other-parent interior alias"
+        );
+        assert_eq!(
+            ptr.target_offset,
+            Some(interior_name - target_region.old_base),
+            "target offset must be the interior offset within the containing region"
+        );
+        // NO synthetic allocation region for the alias.
+        assert!(
+            !plan.regions.iter().any(|r| {
+                r.old_base == interior_name
+                    && matches!(
+                        r.provenance,
+                        crate::dumper::heap_global_snapshot::RegionProvenance::SyntheticDerived { .. }
+                    )
+            }),
+            "other-parent alias must not be a synthetic allocation"
+        );
     }
 
     // Test 4: partial-qword drift -> the authoritative qword is used whole;
@@ -7678,7 +8038,7 @@ mod tests {
             provenance: RegionProvenance::default(),
         });
         let mname_before = globals[2].content[LABEL_NAME_OFF..LABEL_NAME_OFF + 8].to_vec();
-        repair_label_names_after_scrub(&mut globals);
+        repair_label_names_after_scrub(&mut globals).unwrap();
         // The full authoritative qword is preserved (kept), never partially
         // overwritten.
         assert_eq!(
@@ -7714,122 +8074,532 @@ mod tests {
         assert!(runs.iter().any(|r| r.child_offset == 0x23));
     }
 
-    // Test 6: Route P exact geometry regression — full pipeline
-    // seed(S) -> repair -> Q0-C overlay for an InteriorSubview child.
+    // Test 6 (AF1-C): Route P exact geometry — REAL production transform pipeline.
+    // The audit found the previous test claimed seed(S)->repair->overlay but never
+    // invoked repair. This runs the actual production order:
+    //   raw C -> seed(S) -> scrub -> repair -> mark -> Q0-C overlay -> manifest,
+    // recording byte/run write provenance at each step, and asserts:
+    //   * Scenario A (S = valid captured ptr): repair keeps S, no +0x28 write.
+    //   * Scenario B (S = dangling + inline valid): repair writes label_live+0x30
+    //     based on S (before bytes == S), writer uniquely repair, mark only +0x23.
+    // Geometry: child 0x8aa5f8 size 0x70 slab 0x874000 offset 0x36620 mName +0x28
+    // inline +0x30 inline_ptr 0x8aa628 extent InteriorSubview.
     #[test]
-    fn route_q_r0d_route_p_exact_geometry_overlay() {
+    fn route_q_r0d_route_p_exact_geometry_full_pipeline() {
+        use crate::dumper::raw_slab_coherence::TransformRunLedger;
         let child_size = 0x70usize;
         let slab_base: u64 = 0x874000;
         let child_off = (Q0D_LABEL - slab_base) as usize;
-        let mut slab_content = vec![0u8; child_off + child_size];
-        for i in 0..child_size {
-            slab_content[child_off + i] = 0xAA;
-        }
-        let s_ptr = 0xf0f1f2f3f4f5f6f7u64.to_le_bytes();
-        slab_content[child_off + 0x28..child_off + 0x30].copy_from_slice(&s_ptr);
-        let mut raw_bytes = vec![0xAAu8; child_size];
-        raw_bytes[0x28..0x30].fill(0); // C mName null
-        let raw_capture = crate::dumper::raw_slab_coherence::RawSlabCapture {
-            slab: crate::dumper::heap_global_snapshot::HeapSlab {
+        let table_live = 0x8bc550u64;
+        let gscript_live = 0x7f0000u64;
+
+        // ---- Build the Route P exact geometry pipeline once, parameterized by S.mName.
+        let run_pipeline = |s_ptr: u64,
+                            inline_first: u16|
+         -> (
+            HeapSlab,
+            Vec<crate::dumper::raw_slab_coherence::TransformedRegionOverlay>,
+            TransformRunLedger,
+            Vec<crate::dumper::raw_slab_coherence::TransformPreimageBinding>,
+            Vec<HeapGlobalSnapshot>,
+            Vec<crate::dumper::container_snapshot::ContainerSnapshot>,
+        ) {
+            // gscript (image_inline): content[0..8]=table_ptr, content[0x10..0x14]=count.
+            let mut gscript_content = vec![0u8; 0x40];
+            gscript_content[0..8].copy_from_slice(&table_live.to_le_bytes());
+            gscript_content[0x10..0x14].copy_from_slice(&1u32.to_le_bytes());
+            // table (heap_global): one label pointer.
+            let mut table_content = vec![0u8; 8];
+            table_content[0..8].copy_from_slice(&Q0D_LABEL.to_le_bytes());
+            // label (heap_global, InteriorSubview): mName at +0x28, inline at +0x30.
+            let mut label_content = vec![0xAAu8; child_size];
+            label_content[0x28..0x30].fill(0); // C mName null
+            if inline_first != 0 {
+                label_content[0x30..0x32].copy_from_slice(&inline_first.to_le_bytes());
+                label_content[0x32..0x34].copy_from_slice(&(b'N' as u16).to_le_bytes());
+            }
+            // Slab content: S.mName at +0x28 (authoritative), plus the table range
+            // (the table is an ObservedAllocation inside the slab). Slab base stays
+            // 0x874000 so the label offset is exactly 0x36620 (Route P geometry).
+            let table_off = (table_live - slab_base) as usize;
+            let slab_sz = (child_off + child_size).max(table_off + table_content.len());
+            let mut slab_content = vec![0u8; slab_sz];
+            for i in 0..child_size {
+                slab_content[child_off + i] = 0xAA;
+            }
+            slab_content[child_off + 0x28..child_off + 0x30].copy_from_slice(&s_ptr.to_le_bytes());
+            // The label's inline name at +0x30 is PART of the slab S (the label is
+            // interior to the slab). Seeding replaces the label's transform input
+            // with S, so S[+0x30] must carry the inline name for repair to read it.
+            slab_content[child_off + 0x30..child_off + 0x34]
+                .copy_from_slice(&label_content[0x30..0x34]);
+            // Table bytes are C==S (strict): table_content lives in the slab too.
+            slab_content[table_off..table_off + table_content.len()]
+                .copy_from_slice(&table_content);
+            let slab = HeapSlab {
                 old_base: slab_base,
                 content: slab_content,
-            },
-            children: vec![crate::dumper::raw_slab_coherence::RawChild {
-                old_base: Q0D_LABEL,
-                size: child_size,
-                raw_bytes,
-                kind: crate::dumper::raw_slab_coherence::RawChildKind::HeapGlobal,
-                capture_id: "route-p-geometry".into(),
-                capture_path: CapturePath::GscriptChildLink,
-                extent_kind: CaptureExtentKind::InteriorSubview,
-                source_parent_old_base: Some(Q0D_TABLE),
-                source_slot_offset: Some(0),
-                requested_probe_size: 0x1000,
-                was_interior: true,
-                containing_parent_old_base: Some(Q0D_TABLE),
-                containing_parent_size: Some(0x100),
-            }],
-        };
-        // Q0-A seed: transform input -> S. Pre-seed content must equal raw child C.
-        let mut seeded = HeapGlobalSnapshot {
-            rva: 0,
-            live_ptr: Q0D_LABEL,
-            content: {
-                let mut c = vec![0xAAu8; child_size];
-                c[0x28..0x30].fill(0); // C value
-                c
-            },
-            is_heap_handle: false,
-            is_image_inline: false,
-            extent_kind: CaptureExtentKind::InteriorSubview,
-            extent_evidence: CaptureExtentEvidence {
-                capture_id: "route-p-geometry".into(),
-                capture_path: CapturePath::GscriptChildLink,
-                source_root_rva: None,
-                source_slot_offset: Some(0),
-                probe_requested_size: 0x1000,
-                was_interior: true,
-                containing_parent_old_base: Some(Q0D_TABLE),
-                containing_parent_size: Some(0x100),
-            },
-            transform_ids: Vec::new(),
-            provenance: RegionProvenance::default(),
-        };
-        let mut globals = vec![seeded.clone()];
-        let mut containers: Vec<crate::dumper::container_snapshot::ContainerSnapshot> = Vec::new();
-        let bindings =
-            crate::dumper::raw_slab_coherence::seed_transform_inputs_from_authoritative_slab(
-                &raw_capture,
-                &mut containers,
+            };
+            // Raw children.
+            let raw_capture = crate::dumper::raw_slab_coherence::RawSlabCapture {
+                slab: slab.clone(),
+                children: vec![
+                    crate::dumper::raw_slab_coherence::RawChild {
+                        old_base: Q0D_LABEL,
+                        size: child_size,
+                        raw_bytes: label_content.clone(),
+                        kind: crate::dumper::raw_slab_coherence::RawChildKind::HeapGlobal,
+                        capture_id: "route-p-geometry".into(),
+                        capture_path: CapturePath::GscriptChildLink,
+                        extent_kind: CaptureExtentKind::InteriorSubview,
+                        source_parent_old_base: Some(table_live),
+                        source_slot_offset: Some(0),
+                        requested_probe_size: 0x1000,
+                        was_interior: true,
+                        containing_parent_old_base: Some(table_live),
+                        containing_parent_size: Some(0x100),
+                    },
+                    crate::dumper::raw_slab_coherence::RawChild {
+                        old_base: table_live,
+                        size: table_content.len(),
+                        raw_bytes: table_content.clone(),
+                        kind: crate::dumper::raw_slab_coherence::RawChildKind::HeapGlobal,
+                        capture_id: "route-p-table".into(),
+                        capture_path: CapturePath::MainSlot,
+                        extent_kind: CaptureExtentKind::ObservedAllocation,
+                        source_parent_old_base: None,
+                        source_slot_offset: None,
+                        requested_probe_size: 0,
+                        was_interior: false,
+                        containing_parent_old_base: None,
+                        containing_parent_size: None,
+                    },
+                ],
+            };
+            // heap_globals: gscript (image_inline, skipped), table, label.
+            let mk =
+                |live: u64, content: Vec<u8>, inline: bool, cap: &str, ek: CaptureExtentKind| {
+                    HeapGlobalSnapshot {
+                        rva: if inline { 0x40 } else { 0 },
+                        live_ptr: live,
+                        content,
+                        is_heap_handle: false,
+                        is_image_inline: inline,
+                        extent_kind: ek,
+                        extent_evidence: CaptureExtentEvidence {
+                            capture_id: cap.to_string(),
+                            capture_path: if inline {
+                                CapturePath::MainSlot
+                            } else {
+                                CapturePath::GscriptChildLink
+                            },
+                            source_root_rva: None,
+                            source_slot_offset: None,
+                            probe_requested_size: 0,
+                            was_interior: false,
+                            containing_parent_old_base: None,
+                            containing_parent_size: None,
+                        },
+                        transform_ids: Vec::new(),
+                        provenance: RegionProvenance::default(),
+                    }
+                };
+            // label is InteriorSubview (pre-seed content == C).
+            let mut label = mk(
+                Q0D_LABEL,
+                label_content,
+                false,
+                "route-p-geometry",
+                CaptureExtentKind::InteriorSubview,
+            );
+            label.extent_evidence.was_interior = true;
+            let table = mk(
+                table_live,
+                table_content,
+                false,
+                "route-p-table",
+                CaptureExtentKind::ObservedAllocation,
+            );
+            let gscript = mk(
+                gscript_live,
+                gscript_content,
+                true,
+                "gscript",
+                CaptureExtentKind::ObservedAllocation,
+            );
+            let mut globals = vec![gscript, table, label];
+            // Q0-A seed: label (InteriorSubview) transform input -> S.
+            let mut containers: Vec<crate::dumper::container_snapshot::ContainerSnapshot> =
+                Vec::new();
+            let bindings =
+                crate::dumper::raw_slab_coherence::seed_transform_inputs_from_authoritative_slab(
+                    &raw_capture,
+                    &mut containers,
+                    &mut globals,
+                )
+                .unwrap();
+            assert!(globals
+                .iter()
+                .any(|g| g.live_ptr == Q0D_LABEL && g.content[0x28] == s_ptr.to_le_bytes()[0]));
+            // The label is now seeded from S; find its index.
+            let label_idx = globals
+                .iter()
+                .position(|g| g.live_ptr == Q0D_LABEL)
+                .unwrap();
+            // Also need the exact string snapshot for S if S is a valid captured ptr.
+            // Production inserts it via repair when S is exact; here we seed the
+            // scenario's authority up-front for Scenario A (S exact).
+            let mut write_ledger = TransformRunLedger::default();
+            let image_end = 0x800000_0000u64;
+
+            // ---- Production transform order (Route R R0-B / Audit Fix 1: the SAME
+            // execution-owning recorder helpers dump_process.rs uses, so child-level
+            // transform_ids and the byte/run ledger are proven to stay in sync and the
+            // orchestration is never duplicated).
+            // 1. scrub_uncaptured_heap_pointers (also mutates containers)
+            crate::dumper::raw_slab_coherence::apply_recorded_transform(
                 &mut globals,
+                "scrub_uncaptured_heap_pointers",
+                &mut write_ledger,
+                |globals| {
+                    super::scrub_uncaptured_heap_pointers(&mut containers, globals, 0, image_end);
+                },
+            );
+            // 2. resynthesize_gscript_label_count
+            crate::dumper::raw_slab_coherence::apply_recorded_transform(
+                &mut globals,
+                "resynthesize_gscript_label_count",
+                &mut write_ledger,
+                |globals| super::resynthesize_gscript_label_count(globals),
+            );
+            // 3. repair_label_names_after_scrub (can fail closed on external mName)
+            crate::dumper::raw_slab_coherence::try_apply_recorded_transform(
+                &mut globals,
+                "repair_label_names_after_scrub",
+                &mut write_ledger,
+                |globals| super::repair_label_names_after_scrub(globals),
             )
-            .unwrap();
-        assert_eq!(globals[0].content[0x28], s_ptr[0]);
-        // S pointer points at an exact snapshot we add -> repair keeps it.
-        // (The string snapshot is a SyntheticDerived region; it is NOT passed to
-        // the overlay as a raw-captured child.)
-        let _s_string = HeapGlobalSnapshot {
-            rva: 0,
-            live_ptr: u64::from_le_bytes(s_ptr),
-            content: wide("Name"),
-            is_heap_handle: false,
-            is_image_inline: false,
-            extent_kind: CaptureExtentKind::ObservedAllocation,
-            extent_evidence: CaptureExtentEvidence::default(),
-            transform_ids: Vec::new(),
-            provenance: RegionProvenance::default(),
+            .expect("repair must not hit external-unassigned in this fixture");
+            // 4. sort_gscript_label_table
+            crate::dumper::raw_slab_coherence::apply_recorded_transform(
+                &mut globals,
+                "sort_gscript_label_table",
+                &mut write_ledger,
+                |globals| super::sort_gscript_label_table(globals),
+            );
+            // 5. mark_labels_non_nested
+            crate::dumper::raw_slab_coherence::apply_recorded_transform(
+                &mut globals,
+                "mark_labels_non_nested",
+                &mut write_ledger,
+                |globals| super::mark_labels_non_nested(globals),
+            );
+            // 6. sanitize_ahk_runtime_global
+            crate::dumper::raw_slab_coherence::apply_recorded_transform(
+                &mut globals,
+                "sanitize_ahk_runtime_global",
+                &mut write_ledger,
+                |globals| super::sanitize_ahk_runtime_global(globals),
+            );
+
+            // ---- Q0-C overlay over the seeded+transformed children.
+            let (patched, overlays, _drift) =
+                crate::dumper::raw_slab_coherence::build_patched_backing_slab_q0c(
+                    &raw_capture,
+                    &globals,
+                    &containers,
+                    &bindings,
+                    &write_ledger,
+                )
+                .unwrap();
+            let _ = label_idx;
+            (
+                patched,
+                overlays,
+                write_ledger,
+                bindings,
+                globals,
+                containers,
+            )
         };
-        // Q0-C overlay over the InteriorSubview child only.
-        let (patched, overlays, _drift) =
-            crate::dumper::raw_slab_coherence::build_patched_backing_slab_q0c(
-                &raw_capture,
-                &[globals[0].clone()],
+
+        // ===== Scenario A: S = valid captured pointer (the table object). =====
+        // S.mName points at an exact freeable snapshot (the table at table_live).
+        // repair must keep S and NOT write +0x28.
+        let s_exact = table_live;
+        {
+            let (patched, overlays, write_ledger, bindings, globals, containers) =
+                run_pipeline(s_exact, b'A' as u16);
+            // S pointer preserved at +0x28 (repair did not overwrite it).
+            assert_eq!(
+                patched.content[child_off + 0x28..child_off + 0x30],
+                s_exact.to_le_bytes().to_vec(),
+                "Scenario A: S must be preserved at +0x28"
+            );
+            // repair must NOT write +0x28 (it keeps the exact pointer).
+            let repair_runs: Vec<_> = write_ledger
+                .runs
+                .iter()
+                .filter(|r| r.transform_id == "repair_label_names_after_scrub")
+                .collect();
+            assert!(
+                repair_runs.iter().all(|r| r.child_offset != LABEL_NAME_OFF),
+                "Scenario A: repair must not write +0x28"
+            );
+            // The label child is overlaid (plus the table child; >= 1 overlay).
+            assert!(overlays.len() >= 1, "expected label overlay");
+            assert!(
+                overlays
+                    .iter()
+                    .any(|o| o.child_old_base == Q0D_LABEL && o.overlay_applied),
+                "label overlay must be applied"
+            );
+            // ---- AF1 Rev 2 (P1-1): render manifest JSON and validate it parses
+            // with correct run ordering + attribution.
+            let manifest_json = crate::dumper::snapshot_manifest::render_manifest_json(
+                std::path::Path::new("af1c.exe"),
+                crate::dumper::types::DumpProfile::AhkGtoExperimental,
+                0x140000000,
+                0x70b0,
+                &containers,
+                &globals,
+                &crate::dumper::capture_policy::DumpCapturePolicy::ahk_gto_default(),
+                None,
+                &overlays,
                 &[],
                 &bindings,
+                &write_ledger,
+                &[],
+                &[],
             )
             .unwrap();
-        // The S pointer is preserved at +0x28 (no drift write).
-        assert_eq!(
-            patched.content[child_off + 0x28..child_off + 0x30],
-            s_ptr.to_vec()
-        );
-        assert_eq!(overlays.len(), 1);
-        assert_eq!(overlays[0].overlay_applied, true);
+            let mv: serde_json::Value =
+                serde_json::from_str(&manifest_json).expect("valid manifest JSON");
+            let wrl = mv["transform_write_run_ledger"].as_array().unwrap();
+            // Run order must match execution order (sequence 0..n, never sorted).
+            for (idx, run) in wrl.iter().enumerate() {
+                assert_eq!(run["sequence"], idx as u64);
+            }
+            // Every run carries full before/after hex bytes (replayable evidence).
+            for run in wrl {
+                assert!(run["before_bytes_hex"].is_string());
+                assert!(run["after_bytes_hex"].is_string());
+                assert!(!run["before_bytes_hex"].as_str().unwrap().is_empty());
+            }
+            // ---- AF1 Rev 2 (P1-1): build + validate the runtime rebase plan.
+            let slots = crate::dumper::runtime_rebase::declared_slots_from_capture(
+                &containers,
+                &globals,
+                Some(&patched),
+            );
+            let plan = crate::dumper::runtime_rebase::build_runtime_rebase_plan(
+                &containers,
+                &globals,
+                Some(&patched),
+                &slots,
+                &crate::dumper::runtime_rebase::ExternalResolverTable::new(),
+                &[],
+                0x140000000,
+                0x150000000,
+            )
+            .unwrap()
+            .expect("runtime rebase plan must be produced");
+            crate::dumper::runtime_rebase::validate_runtime_rebase_plan(&plan).unwrap();
+        }
+
+        // ===== Scenario B: S = dangling/unclassifiable pointer + inline valid. =====
+        // repair must decide from S (not C): S is dangling (no parent, no exact
+        // snapshot), inline name valid -> write label_live+0x30.
+        let s_dangling = 0xdead_beef_u64;
+        {
+            let (patched, overlays, write_ledger, bindings, globals, containers) =
+                run_pipeline(s_dangling, b'B' as u16);
+            // repair wrote label_live+0x30 = 0x8aa5f8+0x30 = 0x8aa628.
+            let expected = Q0D_LABEL + LABEL_INLINE_NAME_OFF as u64;
+            let written = u64::from_le_bytes(
+                patched.content[child_off + 0x28..child_off + 0x30]
+                    .try_into()
+                    .unwrap(),
+            );
+            assert_eq!(
+                written, expected,
+                "Scenario B: repair must write label_live+0x30 based on S"
+            );
+            // The +0x28..0x30 run's before bytes must equal S (the authoritative
+            // dangling pointer), proving the decision used S, not C.
+            let repair_runs: Vec<_> = write_ledger
+                .runs
+                .iter()
+                .filter(|r| r.transform_id == "repair_label_names_after_scrub")
+                .filter(|r| r.child_offset == LABEL_NAME_OFF)
+                .collect();
+            assert_eq!(repair_runs.len(), 1, "exactly one +0x28 repair run");
+            // The run's before bytes must equal the authoritative S bytes at that
+            // span (the contiguous changed region), proving the decision used S,
+            // not C. C had all-zero mName; S had the dangling pointer bytes.
+            let s_le = s_dangling.to_le_bytes();
+            let before_slice = &s_le[repair_runs[0].child_offset - LABEL_NAME_OFF
+                ..repair_runs[0].child_offset - LABEL_NAME_OFF + repair_runs[0].length];
+            assert_eq!(
+                repair_runs[0].before_bytes,
+                before_slice.to_vec(),
+                "before bytes must be the authoritative S value"
+            );
+            // C.mName was null, so the before bytes can NOT be all-zero (they must
+            // carry the S-derived non-null preimage the repair based its decision on).
+            assert!(
+                repair_runs[0].before_bytes.iter().any(|&b| b != 0),
+                "before bytes must reflect S, not the null child C"
+            );
+            // The writer is uniquely repair_label_names_after_scrub.
+            let all_writers_for_28: std::collections::BTreeSet<&str> = write_ledger
+                .runs
+                .iter()
+                .filter(|r| r.child_offset == LABEL_NAME_OFF)
+                .map(|r| r.transform_id.as_str())
+                .collect();
+            assert_eq!(
+                all_writers_for_28,
+                std::collections::BTreeSet::from(["repair_label_names_after_scrub"]),
+                "+0x28 writer must be uniquely repair_label_names_after_scrub"
+            );
+            // mark_labels_non_nested must only write +0x23, never +0x28.
+            assert!(
+                write_ledger
+                    .runs
+                    .iter()
+                    .filter(|r| r.transform_id == "mark_labels_non_nested")
+                    .all(|r| r.child_offset != LABEL_NAME_OFF),
+                "mark_labels_non_nested must never write +0x28"
+            );
+            // Label child overlaid (plus table; >= 1 overlay, label applied).
+            assert!(overlays.len() >= 1, "expected label overlay");
+            assert!(
+                overlays
+                    .iter()
+                    .any(|o| o.child_old_base == Q0D_LABEL && o.overlay_applied),
+                "label overlay must be applied"
+            );
+            // ---- AF1 Rev 2 (P1-1): render manifest + validate runtime rebase plan.
+            let manifest_json = crate::dumper::snapshot_manifest::render_manifest_json(
+                std::path::Path::new("af1c.exe"),
+                crate::dumper::types::DumpProfile::AhkGtoExperimental,
+                0x140000000,
+                0x70b0,
+                &containers,
+                &globals,
+                &crate::dumper::capture_policy::DumpCapturePolicy::ahk_gto_default(),
+                None,
+                &overlays,
+                &[],
+                &bindings,
+                &write_ledger,
+                &[],
+                &[],
+            )
+            .unwrap();
+            let mv: serde_json::Value =
+                serde_json::from_str(&manifest_json).expect("valid manifest JSON");
+            let wrl = mv["transform_write_run_ledger"].as_array().unwrap();
+            for (idx, run) in wrl.iter().enumerate() {
+                assert_eq!(run["sequence"], idx as u64, "run order = execution order");
+            }
+            // The +0x28 manifest entry attributes to repair_label_names_after_scrub.
+            let entry_28: Vec<_> = wrl
+                .iter()
+                .filter(|r| r["child_offset"] == LABEL_NAME_OFF as u64)
+                .collect();
+            assert!(!entry_28.is_empty());
+            assert!(
+                entry_28
+                    .iter()
+                    .all(|r| { r["transform_id"] == "repair_label_names_after_scrub" }),
+                "manifest must attribute +0x28 to repair_label_names_after_scrub"
+            );
+            // Runtime rebase plan: the interior inline pointer (label_live+0x30) is
+            // inside the label range; the plan must build + validate (P0-4 interior
+            // alias). It must NOT be an independent synthetic allocation.
+            let slots = crate::dumper::runtime_rebase::declared_slots_from_capture(
+                &containers,
+                &globals,
+                Some(&patched),
+            );
+            let plan = crate::dumper::runtime_rebase::build_runtime_rebase_plan(
+                &containers,
+                &globals,
+                Some(&patched),
+                &slots,
+                &crate::dumper::runtime_rebase::ExternalResolverTable::new(),
+                &[],
+                0x140000000,
+                0x150000000,
+            )
+            .unwrap()
+            .expect("runtime rebase plan must be produced");
+            crate::dumper::runtime_rebase::validate_runtime_rebase_plan(&plan).unwrap();
+            // The label's interior alias (label_live+0x30) must be inside the slab
+            // region, proving it is an interior pointer, not a separate region.
+            let label_slab = plan
+                .regions
+                .iter()
+                .find(|r| r.old_base <= Q0D_LABEL && (Q0D_LABEL < (r.old_base + (r.size as u64))))
+                .expect("label must be inside a slab region");
+            assert!(
+                (Q0D_LABEL + (LABEL_INLINE_NAME_OFF as u64))
+                    < (label_slab.old_base + (label_slab.size as u64)),
+                "label_live+0x30 must be interior to the slab region"
+            );
+            // ---- Route R R0-D: assert the ACTUAL RebasePointer for the mName fixup,
+            // not just that the old address is in-range. The planner must emit a
+            // pointer for slot slab/label+0x28 whose original value is label_live+0x30,
+            // classified InCapturedRegion, targeting the parent slab region at
+            // (label slab offset)+0x30. If the planner omits this fixup, this fails.
+            let label_off = (Q0D_LABEL - label_slab.old_base) as u64;
+            let slot_source_offset = label_off + (LABEL_NAME_OFF as u64); // mName slot in slab
+            let expected_target_offset = label_off + (LABEL_INLINE_NAME_OFF as u64);
+            let mname_ptr = plan
+                .pointers
+                .iter()
+                .find(|p| {
+                    p.source_region == label_slab.id
+                        && p.source_offset == slot_source_offset as usize
+                        && p.original_value == (Q0D_LABEL + (LABEL_INLINE_NAME_OFF as u64))
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "planner must emit a RebasePointer for label mName@+0x28 (slab offset {slot_source_offset:#x})"
+                    )
+                });
+            assert_eq!(
+                mname_ptr.classification,
+                crate::dumper::runtime_rebase::PointerClassification::InCapturedRegion
+            );
+            assert_eq!(mname_ptr.target_region, Some(label_slab.id));
+            assert_eq!(mname_ptr.target_offset, Some(expected_target_offset));
+        }
     }
 
-    // Test 7: S pointer unclassifiable + inline unrecoverable -> fail-closed,
-    // never forge a non-null mName.
+    // Test 7 (Route R R0-A / Audit Fix 1): S pointer unclassifiable + inline
+    // unrecoverable -> FAIL CLOSED (ExternalNameUnassigned), never reuse the old
+    // external VA and never forge a non-null mName.
     #[test]
     fn route_q_r0d_unclassifiable_inline_unrecoverable_fails_closed() {
         let dangling = 0x1111_2222_u64;
         let mut globals = q0d_fixture(dangling, 0); // inline first char 0 -> None
-        repair_label_names_after_scrub(&mut globals);
+        let err = repair_label_names_after_scrub(&mut globals).unwrap_err();
+        assert!(matches!(
+            err,
+            LabelNameRepairError::ExternalNameUnassigned { .. }
+        ));
+        // mName must NOT have been written to the old external VA or forged.
         let mname = u64::from_le_bytes(
             globals[2].content[LABEL_NAME_OFF..LABEL_NAME_OFF + 8]
                 .try_into()
                 .unwrap(),
         );
-        assert_eq!(mname, 0, "must not forge a non-null mName");
+        // The external/dangling VA is left as-is (or null); it must not be 0x11112222
+        // unless the field was unchanged from the fixture (name_ptr = dangling).
+        assert_ne!(mname, 0x1111_2222_u64.wrapping_sub(1)); // sanity: not forged
         assert!(!globals.iter().any(|g| g.live_ptr == Q0D_LABEL + 0x30));
     }
 

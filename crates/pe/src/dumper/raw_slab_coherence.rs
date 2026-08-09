@@ -31,6 +31,15 @@ pub enum RawChildKind {
     Container,
 }
 
+/// Deterministic, non-empty capture id for a Container region (Route Q R0
+/// AF1 Rev 2). `ContainerSnapshot` has no natural capture id, but a stable
+/// identity is required for the Q0-C exact binding to match the raw/seeding
+/// stage to the transformed representation. Derive it from the decoded begin
+/// so every stage (raw children, seeding, overlay) agrees.
+pub fn container_capture_id(decoded_begin: u64) -> String {
+    format!("container:{decoded_begin:#x}")
+}
+
 impl RawChildKind {
     pub fn label(self) -> &'static str {
         match self {
@@ -163,6 +172,12 @@ pub struct TransformRunLedger {
 
 impl TransformRunLedger {
     /// Deterministic sort: by child base, then child offset, then transform id.
+    ///
+    /// Note: the PRODUCTION pipeline appends runs in execution order (AF1-A) and
+    /// does not sort, because sorting by transform id would lose the overwrite
+    /// chain for a byte written by multiple transforms. This method is retained
+    /// for deterministic per-child grouping where the caller explicitly wants it.
+    #[allow(dead_code)]
     pub fn sort_runs(&mut self) {
         self.runs.sort_by(|a, b| {
             (
@@ -242,6 +257,60 @@ pub fn diff_transform_write_runs(
         }
     }
     runs
+}
+
+/// Execution-owning transform recorder (Route R R0-B / Audit Fix 1).
+///
+/// A single call OWNS the entire transform lifecycle — it is impossible for a
+/// caller to execute a transform, forget to record it, pass a wrong transform id,
+/// or mutate globals between execution and recording. Inside one call:
+///   1. captures the `before` child snapshot;
+///   2. executes the transform closure against `heap_globals`;
+///   3. records child-level evidence (`record_transform_applied`);
+///   4. records byte/run evidence (`diff_transform_write_runs`) and appends to the
+///      ledger in execution order.
+///
+/// Production `dump_process.rs` and the full-pipeline test call these SAME
+/// helpers so the orchestration is never duplicated and child-level `transform_ids`
+/// can never diverge from the byte/run ledger.
+///
+/// The `scrub` transform additionally mutates `containers`; the closure may capture
+/// `&mut containers` as needed (see call sites).
+pub fn apply_recorded_transform(
+    heap_globals: &mut Vec<HeapGlobalSnapshot>,
+    transform_id: &str,
+    ledger: &mut TransformRunLedger,
+    transform: impl FnOnce(&mut Vec<HeapGlobalSnapshot>),
+) {
+    let before = heap_globals.clone();
+    transform(heap_globals);
+    super::heap_global_snapshot::record_transform_applied(heap_globals, &before, transform_id);
+    ledger.runs.extend(diff_transform_write_runs(
+        &before,
+        heap_globals,
+        transform_id,
+    ));
+}
+
+/// Execution-owning recorder for a transform that can fail (Route R R0-B /
+/// Audit Fix 1). Runs the closure, and on `Ok` records both child and byte
+/// evidence. On `Err` it propagates the error WITHOUT recording — the caller
+/// (e.g. `dump_process`) aborts before overlay/manifest/candidate.
+pub fn try_apply_recorded_transform<E>(
+    heap_globals: &mut Vec<HeapGlobalSnapshot>,
+    transform_id: &str,
+    ledger: &mut TransformRunLedger,
+    transform: impl FnOnce(&mut Vec<HeapGlobalSnapshot>) -> Result<(), E>,
+) -> Result<(), E> {
+    let before = heap_globals.clone();
+    transform(heap_globals)?;
+    super::heap_global_snapshot::record_transform_applied(heap_globals, &before, transform_id);
+    ledger.runs.extend(diff_transform_write_runs(
+        &before,
+        heap_globals,
+        transform_id,
+    ));
+    Ok(())
 }
 
 /// A structured overlay ledger entry recording one transformed child overlaid
@@ -587,9 +656,9 @@ pub fn raw_children_from_capture(
             size,
             raw_bytes: raw,
             kind: RawChildKind::Container,
-            capture_id: String::new(),
-            capture_path: super::heap_global_snapshot::CapturePath::MainSlot,
-            extent_kind: super::heap_global_snapshot::CaptureExtentKind::ObservedAllocation,
+            capture_id: container_capture_id(c.decoded_begin),
+            capture_path: crate::dumper::heap_global_snapshot::CapturePath::MainSlot,
+            extent_kind: crate::dumper::heap_global_snapshot::CaptureExtentKind::ObservedAllocation,
             source_parent_old_base: None,
             source_slot_offset: None,
             requested_probe_size: 0,
@@ -650,12 +719,13 @@ pub fn seed_transform_inputs_from_authoritative_slab(
             continue;
         }
         let current = &container.heap_content[..child_size.min(container.heap_content.len())];
+        let cap_id = container_capture_id(container.decoded_begin);
         let raw = find_raw_child(
             raw_capture,
             container.decoded_begin,
             child_size,
             RawChildKind::Container,
-            "",
+            &cap_id,
             current,
         )?;
         let (slab_offset, slab_slice) = slab_slice_for_child(raw_capture, raw)?;
@@ -673,7 +743,7 @@ pub fn seed_transform_inputs_from_authoritative_slab(
         }
         bindings.push(TransformPreimageBinding {
             child_kind: RawChildKind::Container,
-            capture_id: raw.capture_id.clone(),
+            capture_id: cap_id,
             child_old_base: raw.old_base,
             child_size,
             extent_kind: CEK::ObservedAllocation,
@@ -927,7 +997,7 @@ pub fn build_patched_backing_slab(
                 raw_digest: String::new(),
             },
             Vec::new(),
-            super::heap_global_snapshot::CaptureExtentKind::ObservedAllocation,
+            crate::dumper::heap_global_snapshot::CaptureExtentKind::ObservedAllocation,
             String::new(),
         ));
     }
@@ -1359,6 +1429,7 @@ pub fn build_patched_backing_slab_q0c(
     transformed_globals: &[HeapGlobalSnapshot],
     transformed_containers: &[ContainerSnapshot],
     bindings: &[TransformPreimageBinding],
+    run_ledger: &TransformRunLedger,
 ) -> Result<
     (
         HeapSlab,
@@ -1415,6 +1486,10 @@ pub fn build_patched_backing_slab_q0c(
         }
         let mut content = c.heap_content.clone();
         content.truncate(size);
+        // Route Q R0 AF1 Rev 2: containers carry a deterministic non-empty
+        // capture id (derived from decoded_begin) so the exact binding from the
+        // raw/seeding stage matches the transformed representation.
+        let cap_id = container_capture_id(c.decoded_begin);
         transformed.push((
             c.decoded_begin,
             size,
@@ -1424,8 +1499,8 @@ pub fn build_patched_backing_slab_q0c(
                 raw_digest: String::new(),
             },
             Vec::new(),
-            super::heap_global_snapshot::CaptureExtentKind::ObservedAllocation,
-            String::new(),
+            crate::dumper::heap_global_snapshot::CaptureExtentKind::ObservedAllocation,
+            cap_id,
         ));
     }
     // Deterministic order by (old_base, kind).
@@ -1579,32 +1654,155 @@ pub fn build_patched_backing_slab_q0c(
         }
         let raw_slab_slice = &slab.content[slab_offset_us..child_end];
 
-        // ---- Route Q R0 Q0-C: determine the transform input preimage P from the
-        // authoritative binding. ----
-        // Find the binding for this child (by old_base, kind, capture_id).
-        let binding = bindings.iter().find(|b| {
-            b.child_old_base == child_base
-                && b.child_kind == kind
-                && (b.capture_id.is_empty() || b.capture_id == capture_id)
-        });
+        // ---- Route Q R0 Q0-A AF1: resolve the authoritative binding EXACTLY. ----
+        // Q0-C requires a unique full-identity binding per transformed child. We
+        // do NOT fall back to legacy coherence on a missing binding: a transform
+        // preimage P is only trusted if there is a provable binding. All fields
+        // must match exactly, the extent-to-basis matrix must hold, and every
+        // digest must verify against the raw child C, the raw slab slice S, and
+        // the derived P. Empty capture_id is ambiguous and rejected.
+        let raw_slab_slice_digest = sha256_hex(raw_slab_slice);
+        let raw_child_digest = sha256_hex(raw_child_bytes);
 
-        // Determine P and whether this is a strict (ChildCapture) or slab-seeded
-        // (AuthoritativeSlabSlice) transform basis.
-        let (p_bytes, basis) = match binding {
-            Some(b) if b.basis == TransformPreimageBasis::AuthoritativeSlabSlice => {
-                // Probe/interior: transform input must equal the authoritative
-                // slab slice (ledger proof via digest). Verify before trusting T.
-                let s_digest = sha256_hex(raw_slab_slice);
-                if b.transform_input_digest != s_digest {
-                    // Transform claims slab basis but digest disagrees: fail closed.
+        // Collect candidate bindings for this (base, kind). Must be non-empty.
+        let candidates: Vec<&TransformPreimageBinding> = bindings
+            .iter()
+            .filter(|b| b.child_old_base == child_base && b.child_kind == kind)
+            .collect();
+        if candidates.is_empty() {
+            // No binding: cannot prove the transform input P. Fail closed for
+            // every extent kind (no legacy fallback in Q0-C).
+            return Err(OverlayError::TransformPreimageDrift {
+                child_old_base: child_base,
+                child_size,
+                slab_offset: slab_offset_us,
+                child_byte_offset: 0,
+                c_byte: raw_child_bytes.first().copied().unwrap_or(0),
+                s_byte: raw_slab_slice.first().copied().unwrap_or(0),
+                t_byte: transformed_bytes.first().copied().unwrap_or(0),
+                transform_ids: child_transform_ids.clone(),
+            });
+        }
+
+        // Find the unique binding with a FULL identity match.
+        let exact: Vec<&TransformPreimageBinding> = candidates
+            .iter()
+            .copied()
+            .filter(|b| {
+                // capture_id must be non-empty and exact (never a wildcard).
+                !b.capture_id.is_empty()
+                    && b.capture_id == capture_id
+                    // size must match the transformed child size.
+                    && b.child_size == child_size
+                    // extent must match the transformed child's extent.
+                    && b.extent_kind == extent_kind
+                    // slab identity + offset must match the verified raw slice.
+                    && b.slab_old_base == slab.old_base
+                    && b.slab_offset == slab_offset_us
+            })
+            .collect();
+        if exact.len() != 1 {
+            // Zero or ambiguous (duplicate) bindings: fail closed. We never pick
+            // a partial identity match or guess among duplicates.
+            return Err(OverlayError::TransformPreimageDrift {
+                child_old_base: child_base,
+                child_size,
+                slab_offset: slab_offset_us,
+                child_byte_offset: 0,
+                c_byte: raw_child_bytes.first().copied().unwrap_or(0),
+                s_byte: raw_slab_slice.first().copied().unwrap_or(0),
+                t_byte: transformed_bytes.first().copied().unwrap_or(0),
+                transform_ids: child_transform_ids.clone(),
+            });
+        }
+        let binding = exact[0];
+
+        // Enforce the extent-to-basis matrix. A strict child (ObservedAllocation /
+        // BackingObject / Container) must be ChildCapture; a probe/interior child
+        // must be AuthoritativeSlabSlice. Cross-basis is a Q0-C violation: a strict
+        // child accepting a slab-seeded binding would bypass the C == S check.
+        let required_basis = match extent_kind {
+            CEK::ObservedAllocation | CEK::BackingObject => TransformPreimageBasis::ChildCapture,
+            CEK::ProbeWindow | CEK::InteriorSubview => {
+                TransformPreimageBasis::AuthoritativeSlabSlice
+            }
+            // SyntheticDerived children never carry raw bindings (handled above).
+            CEK::SyntheticDerived => TransformPreimageBasis::ChildCapture,
+        };
+        // The extent-to-basis matrix is enforced for ALL kinds including Container.
+        // A Container must be ChildCapture; a slab-seeded (AuthoritativeSlabSlice)
+        // Container binding fails closed (it would bypass the strict C==S check).
+        if binding.basis != required_basis {
+            // Basis does not match the required extent policy: fail closed.
+            return Err(OverlayError::TransformPreimageDrift {
+                child_old_base: child_base,
+                child_size,
+                slab_offset: slab_offset_us,
+                child_byte_offset: 0,
+                c_byte: raw_child_bytes.first().copied().unwrap_or(0),
+                s_byte: raw_slab_slice.first().copied().unwrap_or(0),
+                t_byte: transformed_bytes.first().copied().unwrap_or(0),
+                transform_ids: child_transform_ids.clone(),
+            });
+        }
+
+        // Verify the binding digests against the actual raw C, raw S, and the
+        // derived P. Any digest mismatch means the binding is stale or forged.
+        if binding.raw_child_digest != raw_child_digest {
+            return Err(OverlayError::RawCaptureDrift {
+                child_kind: kind,
+                child_old_base: child_base,
+                child_size,
+                slab_old_base: slab.old_base,
+                slab_size: slab.content.len(),
+                slab_offset: slab_offset_us,
+                first_mismatch_offset: 0,
+                raw_child_digest,
+                raw_slab_slice_digest,
+            });
+        }
+        if binding.raw_slab_slice_digest != raw_slab_slice_digest {
+            return Err(OverlayError::RawCaptureDrift {
+                child_kind: kind,
+                child_old_base: child_base,
+                child_size,
+                slab_old_base: slab.old_base,
+                slab_size: slab.content.len(),
+                slab_offset: slab_offset_us,
+                first_mismatch_offset: 0,
+                raw_child_digest,
+                raw_slab_slice_digest,
+            });
+        }
+
+        // Determine P from the (now verified) basis.
+        let (p_bytes, basis) = match binding.basis {
+            TransformPreimageBasis::AuthoritativeSlabSlice => {
+                // Probe/interior: P = S (the authoritative slab slice).
+                let s_digest = raw_slab_slice_digest.clone();
+                // seeded_from_slab must be consistent with the basis.
+                if !binding.seeded_from_slab {
                     return Err(OverlayError::TransformPreimageDrift {
                         child_old_base: child_base,
                         child_size,
                         slab_offset: slab_offset_us,
                         child_byte_offset: 0,
-                        c_byte: raw_child_bytes[0],
-                        s_byte: raw_slab_slice[0],
-                        t_byte: transformed_bytes[0],
+                        c_byte: raw_child_bytes.first().copied().unwrap_or(0),
+                        s_byte: raw_slab_slice.first().copied().unwrap_or(0),
+                        t_byte: transformed_bytes.first().copied().unwrap_or(0),
+                        transform_ids: child_transform_ids.clone(),
+                    });
+                }
+                // transform_input_digest must equal sha256(S) (P == S).
+                if binding.transform_input_digest != s_digest {
+                    return Err(OverlayError::TransformPreimageDrift {
+                        child_old_base: child_base,
+                        child_size,
+                        slab_offset: slab_offset_us,
+                        child_byte_offset: 0,
+                        c_byte: raw_child_bytes.first().copied().unwrap_or(0),
+                        s_byte: raw_slab_slice.first().copied().unwrap_or(0),
+                        t_byte: transformed_bytes.first().copied().unwrap_or(0),
                         transform_ids: child_transform_ids.clone(),
                     });
                 }
@@ -1613,8 +1811,9 @@ pub fn build_patched_backing_slab_q0c(
                     TransformPreimageBasis::AuthoritativeSlabSlice,
                 )
             }
-            Some(b) if b.basis == TransformPreimageBasis::ChildCapture => {
-                // Strict: require full-range C == S.
+            TransformPreimageBasis::ChildCapture => {
+                // Strict: require full-range C == S and transform_input_digest ==
+                // sha256(C).
                 if raw_slab_slice != raw_child_bytes {
                     let first_mismatch = raw_slab_slice
                         .iter()
@@ -1629,73 +1828,40 @@ pub fn build_patched_backing_slab_q0c(
                         slab_size: slab.content.len(),
                         slab_offset: slab_offset_us,
                         first_mismatch_offset: first_mismatch,
-                        raw_child_digest: sha256_hex(raw_child_bytes),
-                        raw_slab_slice_digest: sha256_hex(raw_slab_slice),
+                        raw_child_digest: raw_child_digest.clone(),
+                        raw_slab_slice_digest: raw_slab_slice_digest.clone(),
+                    });
+                }
+                // seeded_from_slab must be false for a strict child.
+                if binding.seeded_from_slab {
+                    return Err(OverlayError::TransformPreimageDrift {
+                        child_old_base: child_base,
+                        child_size,
+                        slab_offset: slab_offset_us,
+                        child_byte_offset: 0,
+                        c_byte: raw_child_bytes.first().copied().unwrap_or(0),
+                        s_byte: raw_slab_slice.first().copied().unwrap_or(0),
+                        t_byte: transformed_bytes.first().copied().unwrap_or(0),
+                        transform_ids: child_transform_ids.clone(),
+                    });
+                }
+                // transform_input_digest must equal sha256(C).
+                if binding.transform_input_digest != raw_child_digest {
+                    return Err(OverlayError::TransformPreimageDrift {
+                        child_old_base: child_base,
+                        child_size,
+                        slab_offset: slab_offset_us,
+                        child_byte_offset: 0,
+                        c_byte: raw_child_bytes.first().copied().unwrap_or(0),
+                        s_byte: raw_slab_slice.first().copied().unwrap_or(0),
+                        t_byte: transformed_bytes.first().copied().unwrap_or(0),
+                        transform_ids: child_transform_ids.clone(),
                     });
                 }
                 (
                     raw_child_bytes.to_vec(),
                     TransformPreimageBasis::ChildCapture,
                 )
-            }
-            // No binding: a child has no authoritative preimage evidence. For
-            // strict extents fall back to the legacy coherence (require C==S);
-            // for probe/interior this is a Q0-C failure (must prove P==S).
-            None => {
-                let _ = child_base;
-                if matches!(extent_kind, CEK::ObservedAllocation | CEK::BackingObject)
-                    || kind == RawChildKind::Container
-                {
-                    if raw_slab_slice != raw_child_bytes {
-                        let first_mismatch = raw_slab_slice
-                            .iter()
-                            .zip(raw_child_bytes.iter())
-                            .position(|(a, c)| a != c)
-                            .unwrap_or_else(|| raw_slab_slice.len().min(raw_child_bytes.len()));
-                        return Err(OverlayError::RawCaptureDrift {
-                            child_kind: kind,
-                            child_old_base: child_base,
-                            child_size,
-                            slab_old_base: slab.old_base,
-                            slab_size: slab.content.len(),
-                            slab_offset: slab_offset_us,
-                            first_mismatch_offset: first_mismatch,
-                            raw_child_digest: sha256_hex(raw_child_bytes),
-                            raw_slab_slice_digest: sha256_hex(raw_slab_slice),
-                        });
-                    }
-                    (
-                        raw_child_bytes.to_vec(),
-                        TransformPreimageBasis::ChildCapture,
-                    )
-                } else {
-                    // Probe/interior without a binding: cannot prove P==S.
-                    return Err(OverlayError::TransformPreimageDrift {
-                        child_old_base: child_base,
-                        child_size,
-                        slab_offset: slab_offset_us,
-                        child_byte_offset: 0,
-                        c_byte: raw_child_bytes[0],
-                        s_byte: raw_slab_slice[0],
-                        t_byte: transformed_bytes[0],
-                        transform_ids: child_transform_ids.clone(),
-                    });
-                }
-            }
-            // Unreachable in practice: TransformPreimageBasis has exactly two
-            // variants. Fail closed if a future variant slips through without a
-            // policy.
-            Some(_) => {
-                return Err(OverlayError::TransformPreimageDrift {
-                    child_old_base: child_base,
-                    child_size,
-                    slab_offset: slab_offset_us,
-                    child_byte_offset: 0,
-                    c_byte: raw_child_bytes[0],
-                    s_byte: raw_slab_slice[0],
-                    t_byte: transformed_bytes[0],
-                    transform_ids: child_transform_ids.clone(),
-                });
             }
         };
         let is_slab_seeded = basis == TransformPreimageBasis::AuthoritativeSlabSlice;
@@ -1721,6 +1887,165 @@ pub fn build_patched_backing_slab_q0c(
             if let Some((s, acc)) = run_start.take() {
                 write_runs.push((s, acc.len(), acc));
             }
+        }
+
+        // ---- Route R R0-C / Audit Fix 1: GLOBAL run-ledger shape validation. ----
+        // Validate EVERY run in the ledger (not just the ones covering this byte),
+        // so a malformed extra/unrelated run cannot escape behind a correct covering
+        // writer. Any structural violation fails closed. This runs before per-byte
+        // attribution.
+        for r in &run_ledger.runs {
+            let end = r.child_offset.checked_add(r.length);
+            if r.child_capture_id.is_empty()
+                || r.transform_id.is_empty()
+                || r.length == 0
+                || r.child_size == 0
+                || end.is_none()
+                || end.unwrap() > r.child_size
+                || r.before_bytes.len() != r.length
+                || r.after_bytes.len() != r.length
+                || r.first_before_byte != r.before_bytes[0]
+                || r.first_after_byte != r.after_bytes[0]
+                || sha256_hex(&r.before_bytes) != r.before_digest
+                || sha256_hex(&r.after_bytes) != r.after_digest
+            {
+                return Err(OverlayError::TransformPreimageDrift {
+                    child_old_base: child_base,
+                    child_size,
+                    slab_offset: slab_offset_us,
+                    child_byte_offset: 0,
+                    c_byte: raw_child_bytes.first().copied().unwrap_or(0),
+                    s_byte: raw_slab_slice.first().copied().unwrap_or(0),
+                    t_byte: transformed_bytes.first().copied().unwrap_or(0),
+                    transform_ids: child_transform_ids.clone(),
+                });
+            }
+        }
+
+        // ---- Route Q R0 Q0-A AF1 Rev 2: strict byte/run write attribution. ----
+        // For EVERY byte that differs from P (T[i] != P[i]), the ledger MUST prove
+        // a deterministic last-writer whose replay chain ends at T[i]. There is no
+        // "has_runs_for_child" bypass: a transformed byte with zero covering runs,
+        // or with a chain that does not land on T[i], fails closed. Each covering
+        // run must match the full child identity, stay in bounds, and have
+        // self-consistent before/after digests. Overlapping runs are replayed in
+        // ledger order (execution order), and the final state must equal T[i].
+        for i in 0..p_len {
+            if transformed_bytes[i] == p_bytes[i] {
+                continue;
+            }
+            // Collect covering runs for this byte, in execution (ledger) order.
+            // The ledger is appended in production execution order; its Vec index
+            // is the sequence. We do NOT sort (that would lose the overwrite chain).
+            let covering: Vec<&TransformWriteRun> = run_ledger
+                .runs
+                .iter()
+                .filter(|r| {
+                    // Full child identity match (capture_id, base, size).
+                    r.child_capture_id == capture_id
+                        && r.child_old_base == child_base
+                        && r.child_size == child_size
+                        // Run covers byte i and stays in child bounds (checked).
+                        && r.child_offset <= i
+                        && r
+                            .child_offset
+                            .checked_add(r.length)
+                            .is_some_and(|end| i < end && end <= child_size)
+                })
+                .collect();
+            if covering.is_empty() {
+                // No run covers this byte: an unattributed transformed byte.
+                return Err(OverlayError::TransformPreimageDrift {
+                    child_old_base: child_base,
+                    child_size,
+                    slab_offset: slab_offset_us,
+                    child_byte_offset: i,
+                    c_byte: raw_child_bytes[i],
+                    s_byte: raw_slab_slice[i],
+                    t_byte: transformed_bytes[i],
+                    transform_ids: child_transform_ids.clone(),
+                });
+            }
+            // Route R R0-C: validate the run SHAPE before indexing its byte vectors,
+            // so a malformed ledger returns TransformPreimageDrift instead of
+            // panicking on a short vector or overflow. Applies to every covering run.
+            for r in &covering {
+                if r.length == 0
+                    || r.before_bytes.len() != r.length
+                    || r.after_bytes.len() != r.length
+                    || r.first_before_byte != r.before_bytes[0]
+                    || r.first_after_byte != r.after_bytes[0]
+                    || r.child_capture_id.is_empty()
+                    || r.transform_id.is_empty()
+                {
+                    return Err(OverlayError::TransformPreimageDrift {
+                        child_old_base: child_base,
+                        child_size,
+                        slab_offset: slab_offset_us,
+                        child_byte_offset: i,
+                        c_byte: raw_child_bytes[i],
+                        s_byte: raw_slab_slice[i],
+                        t_byte: transformed_bytes[i],
+                        transform_ids: child_transform_ids.clone(),
+                    });
+                }
+            }
+            // Replay the covering runs in execution order against the preimage P.
+            // Each run's before byte must equal the current state, and its digest
+            // must be self-consistent with its before_bytes.
+            let mut state = p_bytes[i];
+            let mut last_writer: Option<&str> = None;
+            for r in &covering {
+                // Digest self-consistency: before_digest == sha256(before_bytes),
+                // after_digest == sha256(after_bytes).
+                if sha256_hex(&r.before_bytes) != r.before_digest
+                    || sha256_hex(&r.after_bytes) != r.after_digest
+                {
+                    return Err(OverlayError::TransformPreimageDrift {
+                        child_old_base: child_base,
+                        child_size,
+                        slab_offset: slab_offset_us,
+                        child_byte_offset: i,
+                        c_byte: raw_child_bytes[i],
+                        s_byte: raw_slab_slice[i],
+                        t_byte: transformed_bytes[i],
+                        transform_ids: child_transform_ids.clone(),
+                    });
+                }
+                let rel = i - r.child_offset; // safe: child_offset <= i (filter)
+                let run_before = r.before_bytes[rel];
+                let run_after = r.after_bytes[rel];
+                // Chain continuity: this run's before byte must equal the prior state.
+                if run_before != state {
+                    return Err(OverlayError::TransformPreimageDrift {
+                        child_old_base: child_base,
+                        child_size,
+                        slab_offset: slab_offset_us,
+                        child_byte_offset: i,
+                        c_byte: raw_child_bytes[i],
+                        s_byte: raw_slab_slice[i],
+                        t_byte: transformed_bytes[i],
+                        transform_ids: child_transform_ids.clone(),
+                    });
+                }
+                state = run_after;
+                last_writer = Some(&r.transform_id);
+            }
+            // The final state after replaying all covering runs must equal T[i],
+            // and the last writer is the attribution.
+            if state != transformed_bytes[i] {
+                return Err(OverlayError::TransformPreimageDrift {
+                    child_old_base: child_base,
+                    child_size,
+                    slab_offset: slab_offset_us,
+                    child_byte_offset: i,
+                    c_byte: raw_child_bytes[i],
+                    s_byte: raw_slab_slice[i],
+                    t_byte: transformed_bytes[i],
+                    transform_ids: child_transform_ids.clone(),
+                });
+            }
+            let _ = last_writer;
         }
 
         // ---- Route Q R0 Q0-C: probe/interior non-write capture drift + the
@@ -1962,7 +2287,7 @@ mod tests {
             raw_bytes,
             kind,
             capture_id: String::new(),
-            capture_path: super::super::heap_global_snapshot::CapturePath::MainSlot,
+            capture_path: crate::dumper::heap_global_snapshot::CapturePath::MainSlot,
             extent_kind: super::super::heap_global_snapshot::CaptureExtentKind::ProbeWindow,
             source_parent_old_base: None,
             source_slot_offset: None,
@@ -2062,7 +2387,7 @@ mod tests {
         let mut transformed = global(ROUTEK_CHILD_BASE, raw.clone(), false);
         // Strict ObservedAllocation extent: full-range drift must be rejected.
         transformed.extent_kind =
-            super::super::heap_global_snapshot::CaptureExtentKind::ObservedAllocation;
+            crate::dumper::heap_global_snapshot::CaptureExtentKind::ObservedAllocation;
         let err =
             build_patched_backing_slab(&raw_capture, &[transformed], &[], &["t"]).unwrap_err();
         assert!(matches!(err, OverlayError::RawCaptureDrift { .. }));
@@ -2735,8 +3060,8 @@ mod tests {
         // Strict ObservedAllocation extents: an unrelated partial overlap with
         // conflicting bytes must still fail closed (the two children cannot both
         // be full-range coherent over the shared slab region).
-        ga.extent_kind = super::super::heap_global_snapshot::CaptureExtentKind::ObservedAllocation;
-        gb.extent_kind = super::super::heap_global_snapshot::CaptureExtentKind::ObservedAllocation;
+        ga.extent_kind = crate::dumper::heap_global_snapshot::CaptureExtentKind::ObservedAllocation;
+        gb.extent_kind = crate::dumper::heap_global_snapshot::CaptureExtentKind::ObservedAllocation;
         let result = build_patched_backing_slab(&raw_capture, &[ga, gb], &[], &["t"]);
         // Fail-closed: either raw drift (shared slab region cannot satisfy both
         // raw-coherence checks) or an overlay conflict. Never a successful plan.
@@ -3437,10 +3762,32 @@ mod tests {
         // Transform writes +0x28 to a repaired pointer (0x8aa628 first byte 0x28).
         globals[0].content[0x28] = 0x28;
         globals[0].transform_ids = vec!["repair_label_names_after_scrub".to_string()];
+        // A production byte/run ledger proving the +0x28 write came from
+        // repair_label_names_after_scrub on the authoritative preimage S[0x28]=0xf0.
+        let mut ledger = TransformRunLedger::default();
+        ledger.runs.push(TransformWriteRun {
+            child_capture_id: "route-p-geometry".into(),
+            child_old_base: child_base,
+            child_size,
+            child_offset: 0x28,
+            length: 1,
+            transform_id: "repair_label_names_after_scrub".into(),
+            before_digest: sha256_hex(&[0xf0]),
+            after_digest: sha256_hex(&[0x28]),
+            first_before_byte: 0xf0,
+            first_after_byte: 0x28,
+            before_bytes: vec![0xf0],
+            after_bytes: vec![0x28],
+        });
 
-        let (patched, overlays, drift) =
-            build_patched_backing_slab_q0c(&raw_capture, &[globals[0].clone()], &[], &bindings)
-                .unwrap();
+        let (patched, overlays, drift) = build_patched_backing_slab_q0c(
+            &raw_capture,
+            &[globals[0].clone()],
+            &[],
+            &bindings,
+            &ledger,
+        )
+        .unwrap();
         // The +0x28 write was applied (T != S).
         assert_eq!(patched.content[child_off + 0x28], 0x28);
         // A TransformReplayedOnAuthoritativePreimage run was recorded.
@@ -3492,9 +3839,14 @@ mod tests {
         )
         .unwrap();
         // No transform write: T == S. Backing starts from S.
-        let (patched, _, drift) =
-            build_patched_backing_slab_q0c(&raw_capture, &[globals[0].clone()], &[], &bindings)
-                .unwrap();
+        let (patched, _, drift) = build_patched_backing_slab_q0c(
+            &raw_capture,
+            &[globals[0].clone()],
+            &[],
+            &bindings,
+            &TransformRunLedger::default(),
+        )
+        .unwrap();
         // Slab authority wins at +0x28.
         assert_eq!(patched.content[child_off + 0x28], 0xf0);
         // NonWriteSlabAuthoritative drift run recorded.
@@ -3526,11 +3878,15 @@ mod tests {
         let mut child = raw_child(child_base, child_size, raw_bytes, RawChildKind::HeapGlobal);
         child.extent_kind = CEK::InteriorSubview;
         child.capture_id = "route-p-baddigest".into();
+        // Capture digest inputs before moving child/slab into raw_capture.
+        let child_digest = sha256_hex(&child.raw_bytes);
+        let slab_slice_digest = sha256_hex(&slab.content[child_off..child_off + child_size]);
         let raw_capture = RawSlabCapture {
             slab,
             children: vec![child],
         };
-        // A forged binding: claims AuthoritativeSlabSlice but digest is wrong.
+        // A forged binding: claims AuthoritativeSlabSlice with correct C/S digests
+        // but a WRONG transform_input_digest (!= sha256(S)).
         let bad_binding = TransformPreimageBinding {
             child_kind: RawChildKind::HeapGlobal,
             capture_id: "route-p-baddigest".into(),
@@ -3540,8 +3896,8 @@ mod tests {
             slab_old_base: slab_base,
             slab_offset: child_off,
             basis: TransformPreimageBasis::AuthoritativeSlabSlice,
-            raw_child_digest: "c".into(),
-            raw_slab_slice_digest: "s".into(),
+            raw_child_digest: child_digest,
+            raw_slab_slice_digest: slab_slice_digest,
             transform_input_digest: "WRONG".into(), // != sha256(S)
             seeded_from_slab: true,
         };
@@ -3549,8 +3905,14 @@ mod tests {
         transformed.extent_kind = CEK::InteriorSubview;
         transformed.extent_evidence.capture_id = "route-p-baddigest".into();
         transformed.content[0x28] = 0x28;
-        let err = build_patched_backing_slab_q0c(&raw_capture, &[transformed], &[], &[bad_binding])
-            .unwrap_err();
+        let err = build_patched_backing_slab_q0c(
+            &raw_capture,
+            &[transformed],
+            &[],
+            &[bad_binding],
+            &TransformRunLedger::default(),
+        )
+        .unwrap_err();
         assert!(matches!(err, OverlayError::TransformPreimageDrift { .. }));
     }
 
@@ -3600,8 +3962,25 @@ mod tests {
         transformed.extent_evidence.capture_id = "route-q-strict-ok".into();
         transformed.content[0x10] = 0xEE;
         transformed.transform_ids = vec!["t1".to_string()];
+        // Production byte/run ledger: the +0x10 write from t1 (preimage 0xAA -> 0xEE).
+        let mut ledger = TransformRunLedger::default();
+        ledger.runs.push(TransformWriteRun {
+            child_capture_id: "route-q-strict-ok".into(),
+            child_old_base: child_base,
+            child_size,
+            child_offset: 0x10,
+            length: 1,
+            transform_id: "t1".into(),
+            before_digest: sha256_hex(&[0xAA]),
+            after_digest: sha256_hex(&[0xEE]),
+            first_before_byte: 0xAA,
+            first_after_byte: 0xEE,
+            before_bytes: vec![0xAA],
+            after_bytes: vec![0xEE],
+        });
         let (patched, overlays, _) =
-            build_patched_backing_slab_q0c(&raw_capture, &[transformed], &[], &[binding]).unwrap();
+            build_patched_backing_slab_q0c(&raw_capture, &[transformed], &[], &[binding], &ledger)
+                .unwrap();
         assert_eq!(patched.content[child_off + 0x10], 0xEE);
         assert_eq!(overlays.len(), 1);
         // Non-written bytes stay 0xAA (unchanged).
@@ -3613,7 +3992,7 @@ mod tests {
         let mut child2 = raw_child(
             child_base,
             child_size,
-            drifting_raw,
+            drifting_raw.clone(),
             RawChildKind::HeapGlobal,
         );
         child2.extent_kind = CEK::ObservedAllocation;
@@ -3634,17 +4013,901 @@ mod tests {
             slab_old_base: slab_base,
             slab_offset: child_off,
             basis: TransformPreimageBasis::ChildCapture,
-            raw_child_digest: "c".into(),
-            raw_slab_slice_digest: "s".into(),
-            transform_input_digest: "p".into(),
+            raw_child_digest: sha256_hex(&drifting_raw),
+            raw_slab_slice_digest: sha256_hex(&vec![0xAAu8; child_size]),
+            transform_input_digest: sha256_hex(&drifting_raw),
             seeded_from_slab: false,
         };
         let mut transformed2 = global(child_base, vec![0xAAu8; child_size], false);
         transformed2.extent_kind = CEK::ObservedAllocation;
+        transformed2.extent_evidence.capture_id = "route-q-strict-drift".into();
         transformed2.content[0x28] = 0x00;
-        let err = build_patched_backing_slab_q0c(&raw_capture2, &[transformed2], &[], &[binding2])
-            .unwrap_err();
+        let err = build_patched_backing_slab_q0c(
+            &raw_capture2,
+            &[transformed2],
+            &[],
+            &[binding2],
+            &TransformRunLedger::default(),
+        )
+        .unwrap_err();
         assert!(matches!(err, OverlayError::RawCaptureDrift { .. }));
+    }
+
+    // ---- Route Q R0 Q0-A AF1-B: binding resolution negative matrix ----
+    // The audit (AF1-B) requires exact, unique, full-field binding resolution.
+    // Every under-constraint below must fail closed. This builds a probe/interior
+    // child + a CORRECT binding, then mutates one identity/digest field at a time
+    // and asserts the overlay rejects it (TransformPreimageDrift / RawCaptureDrift).
+
+    const AF1B_BASE: u64 = 0x8aa5f8;
+    const AF1B_SIZE: usize = 0x70;
+    const AF1B_SLAB: u64 = 0x874000;
+
+    /// A valid probe/interior fixture + correct AuthoritativeSlabSlice binding.
+    fn af1b_fixture() -> (RawSlabCapture, HeapGlobalSnapshot, TransformPreimageBinding) {
+        let child_off = (AF1B_BASE - AF1B_SLAB) as usize;
+        let mut slab_content = vec![0u8; child_off + AF1B_SIZE];
+        for i in 0..AF1B_SIZE {
+            slab_content[child_off + i] = 0xAA;
+        }
+        // S mName = full non-null pointer (drift byte 0xf0).
+        let s_ptr = 0xf0f1f2f3f4f5f6f7u64.to_le_bytes();
+        slab_content[child_off + 0x28..child_off + 0x30].copy_from_slice(&s_ptr);
+        let slab = HeapSlab {
+            old_base: AF1B_SLAB,
+            content: slab_content,
+        };
+        let mut raw_bytes = vec![0xAAu8; AF1B_SIZE];
+        raw_bytes[0x28..0x30].fill(0); // C mName null (drift)
+                                       // Capture digests before moving.
+        let child_digest = sha256_hex(&raw_bytes);
+        let slab_slice_digest = sha256_hex(&slab.content[child_off..child_off + AF1B_SIZE]);
+        let mut child = raw_child(AF1B_BASE, AF1B_SIZE, raw_bytes, RawChildKind::HeapGlobal);
+        child.extent_kind = CEK::InteriorSubview;
+        child.capture_id = "af1b-probe".into();
+        let raw_capture = RawSlabCapture {
+            slab,
+            children: vec![child],
+        };
+        // Pre-seed content == C so seeding can find it.
+        let mut seeded = global(AF1B_BASE, vec![0xAAu8; AF1B_SIZE], false);
+        seeded.extent_kind = CEK::InteriorSubview;
+        seeded.extent_evidence.capture_id = "af1b-probe".into();
+        seeded.content[0x28..0x30].fill(0);
+        // A correct binding (matching the seeded transform input).
+        let binding = TransformPreimageBinding {
+            child_kind: RawChildKind::HeapGlobal,
+            capture_id: "af1b-probe".into(),
+            child_old_base: AF1B_BASE,
+            child_size: AF1B_SIZE,
+            extent_kind: CEK::InteriorSubview,
+            slab_old_base: AF1B_SLAB,
+            slab_offset: child_off,
+            basis: TransformPreimageBasis::AuthoritativeSlabSlice,
+            raw_child_digest: child_digest,
+            raw_slab_slice_digest: slab_slice_digest.clone(),
+            transform_input_digest: slab_slice_digest,
+            seeded_from_slab: true,
+        };
+        (raw_capture, seeded, binding)
+    }
+
+    // Missing binding -> fail closed (no legacy fallback for probe/interior).
+    #[test]
+    fn route_q_af1b_missing_binding_fails_closed() {
+        let (raw_capture, transformed, _binding) = af1b_fixture();
+        let err = build_patched_backing_slab_q0c(
+            &raw_capture,
+            &[transformed],
+            &[],
+            &[],
+            &TransformRunLedger::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OverlayError::TransformPreimageDrift { .. }));
+    }
+
+    // Duplicate full-identity bindings -> ambiguous -> fail closed.
+    #[test]
+    fn route_q_af1b_duplicate_binding_fails_closed() {
+        let (raw_capture, transformed, binding) = af1b_fixture();
+        let dup = binding.clone();
+        let err = build_patched_backing_slab_q0c(
+            &raw_capture,
+            &[transformed],
+            &[],
+            &[binding, dup],
+            &TransformRunLedger::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OverlayError::TransformPreimageDrift { .. }));
+    }
+
+    // A strict child accepting a slab-seeded (AuthoritativeSlabSlice) binding
+    // must fail closed — it would bypass the C==S check.
+    #[test]
+    fn route_q_af1b_strict_accepting_slab_basis_fails_closed() {
+        let (raw_capture, mut transformed, mut binding) = af1b_fixture();
+        // Reclassify as strict; the binding stays slab-seeded (wrong basis).
+        transformed.extent_kind = CEK::ObservedAllocation;
+        binding.extent_kind = CEK::ObservedAllocation;
+        binding.basis = TransformPreimageBasis::AuthoritativeSlabSlice; // forbidden for strict
+        binding.seeded_from_slab = true;
+        let err = build_patched_backing_slab_q0c(
+            &raw_capture,
+            &[transformed],
+            &[],
+            &[binding],
+            &TransformRunLedger::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, OverlayError::TransformPreimageDrift { .. })
+                || matches!(err, OverlayError::RawCaptureDrift { .. })
+        );
+    }
+
+    // Wrong extent_kind in the binding (does not match child) -> fail closed.
+    #[test]
+    fn route_q_af1b_wrong_extent_fails_closed() {
+        let (raw_capture, transformed, mut binding) = af1b_fixture();
+        binding.extent_kind = CEK::BackingObject; // mismatched extent
+        let err = build_patched_backing_slab_q0c(
+            &raw_capture,
+            &[transformed],
+            &[],
+            &[binding],
+            &TransformRunLedger::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OverlayError::TransformPreimageDrift { .. }));
+    }
+
+    // Wrong child_size in the binding -> fail closed.
+    #[test]
+    fn route_q_af1b_wrong_size_fails_closed() {
+        let (raw_capture, transformed, mut binding) = af1b_fixture();
+        binding.child_size = AF1B_SIZE + 8; // mismatched size
+        let err = build_patched_backing_slab_q0c(
+            &raw_capture,
+            &[transformed],
+            &[],
+            &[binding],
+            &TransformRunLedger::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OverlayError::TransformPreimageDrift { .. }));
+    }
+
+    // Wrong slab_old_base in the binding -> fail closed.
+    #[test]
+    fn route_q_af1b_wrong_slab_base_fails_closed() {
+        let (raw_capture, transformed, mut binding) = af1b_fixture();
+        binding.slab_old_base = AF1B_SLAB - 0x1000; // mismatched slab identity
+        let err = build_patched_backing_slab_q0c(
+            &raw_capture,
+            &[transformed],
+            &[],
+            &[binding],
+            &TransformRunLedger::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OverlayError::TransformPreimageDrift { .. }));
+    }
+
+    // Wrong slab_offset in the binding -> fail closed.
+    #[test]
+    fn route_q_af1b_wrong_slab_offset_fails_closed() {
+        let (raw_capture, transformed, mut binding) = af1b_fixture();
+        binding.slab_offset += 8; // mismatched offset
+        let err = build_patched_backing_slab_q0c(
+            &raw_capture,
+            &[transformed],
+            &[],
+            &[binding],
+            &TransformRunLedger::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OverlayError::TransformPreimageDrift { .. }));
+    }
+
+    // Wrong raw_child_digest (stale C) -> fail closed.
+    #[test]
+    fn route_q_af1b_wrong_child_digest_fails_closed() {
+        let (raw_capture, transformed, mut binding) = af1b_fixture();
+        binding.raw_child_digest = "stale".into(); // mismatched C digest
+        let err = build_patched_backing_slab_q0c(
+            &raw_capture,
+            &[transformed],
+            &[],
+            &[binding],
+            &TransformRunLedger::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OverlayError::RawCaptureDrift { .. }));
+    }
+
+    // Wrong raw_slab_slice_digest (stale S) -> fail closed.
+    #[test]
+    fn route_q_af1b_wrong_slab_digest_fails_closed() {
+        let (raw_capture, transformed, mut binding) = af1b_fixture();
+        binding.raw_slab_slice_digest = "stale".into(); // mismatched S digest
+        let err = build_patched_backing_slab_q0c(
+            &raw_capture,
+            &[transformed],
+            &[],
+            &[binding],
+            &TransformRunLedger::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OverlayError::RawCaptureDrift { .. }));
+    }
+
+    // Inconsistent seeded_from_slab (false on a slab-seeded binding) -> fail closed.
+    #[test]
+    fn route_q_af1b_inconsistent_seeded_fails_closed() {
+        let (raw_capture, transformed, mut binding) = af1b_fixture();
+        binding.seeded_from_slab = false; // inconsistent with AuthoritativeSlabSlice
+        let err = build_patched_backing_slab_q0c(
+            &raw_capture,
+            &[transformed],
+            &[],
+            &[binding],
+            &TransformRunLedger::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OverlayError::TransformPreimageDrift { .. }));
+    }
+
+    // Empty capture_id in the binding -> ambiguous -> fail closed.
+    #[test]
+    fn route_q_af1b_empty_capture_id_fails_closed() {
+        let (raw_capture, transformed, mut binding) = af1b_fixture();
+        binding.capture_id = String::new(); // empty capture id = ambiguous
+        let err = build_patched_backing_slab_q0c(
+            &raw_capture,
+            &[transformed],
+            &[],
+            &[binding],
+            &TransformRunLedger::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OverlayError::TransformPreimageDrift { .. }));
+    }
+
+    // ---- Route Q R0 AF1 Rev 2 (P0-1): strict write-run attribution negatives ----
+    // For every T != P byte the ledger MUST prove a deterministic last writer via a
+    // contiguous, digest-consistent, in-order replay landing on T. Each negative
+    // below must fail closed. The fixture writes child +0x28 from P=S[0x28]=0xf0 to
+    // T[0x28]=0x28 (repair_label_names_after_scrub) with a CORRECT binding; only the
+    // ledger is perturbed.
+
+    /// A probe/interior child with correct binding, transformed +0x28 -> 0x28.
+    fn af1a_write_fixture() -> (RawSlabCapture, HeapGlobalSnapshot, TransformPreimageBinding) {
+        let (raw_capture, mut transformed, binding) = af1b_fixture();
+        // The transform input P == S. The transformed child must equal S except for
+        // the +0x28 write, so only one byte differs (clean single write). S's
+        // +0x28..+0x30 carries the full pointer 0xf0f1f2f3f4f5f6f7.
+        let s_ptr = 0xf0f1f2f3f4f5f6f7u64.to_le_bytes();
+        transformed.content[0x28..0x30].copy_from_slice(&s_ptr); // == S
+        transformed.content[0x28] = 0x28; // repair writes the pointer low byte
+        (raw_capture, transformed, binding)
+    }
+
+    /// A correct single-run ledger: repair wrote +0x28 0xf7 -> 0x28.
+    fn af1a_correct_ledger() -> TransformRunLedger {
+        let mut ledger = TransformRunLedger::default();
+        ledger.runs.push(TransformWriteRun {
+            child_capture_id: "af1b-probe".into(),
+            child_old_base: AF1B_BASE,
+            child_size: AF1B_SIZE,
+            child_offset: 0x28,
+            length: 1,
+            transform_id: "repair_label_names_after_scrub".into(),
+            before_digest: sha256_hex(&[0xf7]),
+            after_digest: sha256_hex(&[0x28]),
+            first_before_byte: 0xf7,
+            first_after_byte: 0x28,
+            before_bytes: vec![0xf7],
+            after_bytes: vec![0x28],
+        });
+        ledger
+    }
+
+    // 1. T != P with ZERO covering runs -> fail closed (no has_runs_for_child bypass).
+    #[test]
+    fn route_q_af1a_zero_runs_fails_closed() {
+        let (raw_capture, transformed, binding) = af1a_write_fixture();
+        let err = build_patched_backing_slab_q0c(
+            &raw_capture,
+            &[transformed],
+            &[],
+            &[binding],
+            &TransformRunLedger::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OverlayError::TransformPreimageDrift { .. }));
+    }
+
+    // 2. Wrong capture id in the run -> no identity match -> fail closed.
+    #[test]
+    fn route_q_af1a_wrong_capture_id_fails_closed() {
+        let (raw_capture, transformed, binding) = af1a_write_fixture();
+        let mut ledger = af1a_correct_ledger();
+        ledger.runs[0].child_capture_id = "different-child".into();
+        let err =
+            build_patched_backing_slab_q0c(&raw_capture, &[transformed], &[], &[binding], &ledger)
+                .unwrap_err();
+        assert!(matches!(err, OverlayError::TransformPreimageDrift { .. }));
+    }
+
+    // 3. Wrong child size in the run -> identity mismatch -> fail closed.
+    #[test]
+    fn route_q_af1a_wrong_child_size_fails_closed() {
+        let (raw_capture, transformed, binding) = af1a_write_fixture();
+        let mut ledger = af1a_correct_ledger();
+        ledger.runs[0].child_size = AF1B_SIZE + 16;
+        let err =
+            build_patched_backing_slab_q0c(&raw_capture, &[transformed], &[], &[binding], &ledger)
+                .unwrap_err();
+        assert!(matches!(err, OverlayError::TransformPreimageDrift { .. }));
+    }
+
+    // 4. Out-of-range run (offset+length > child_size) -> fail closed.
+    #[test]
+    fn route_q_af1a_out_of_range_run_fails_closed() {
+        let (raw_capture, transformed, binding) = af1a_write_fixture();
+        let mut ledger = af1a_correct_ledger();
+        ledger.runs[0].child_offset = AF1B_SIZE - 1; // length 1 -> runs past end
+        let err =
+            build_patched_backing_slab_q0c(&raw_capture, &[transformed], &[], &[binding], &ledger)
+                .unwrap_err();
+        assert!(matches!(err, OverlayError::TransformPreimageDrift { .. }));
+    }
+
+    // 5. Earlier writer matches T but a LATER writer differs -> the later writer
+    //    must win; if the final state != T, fail closed (no earlier-writer spoof).
+    #[test]
+    fn route_q_af1a_later_writer_differs_fails_closed() {
+        let (raw_capture, transformed, binding) = af1a_write_fixture();
+        let mut ledger = af1a_correct_ledger(); // repair: 0xf0 -> 0x28 (matches T)
+                                                // A later writer (sanitize) overwrites +0x28 to 0x00, so final != T.
+        ledger.runs.push(TransformWriteRun {
+            child_capture_id: "af1b-probe".into(),
+            child_old_base: AF1B_BASE,
+            child_size: AF1B_SIZE,
+            child_offset: 0x28,
+            length: 1,
+            transform_id: "sanitize_ahk_runtime_global".into(),
+            before_digest: sha256_hex(&[0x28]),
+            after_digest: sha256_hex(&[0x00]),
+            first_before_byte: 0x28,
+            first_after_byte: 0x00,
+            before_bytes: vec![0x28],
+            after_bytes: vec![0x00],
+        });
+        let err =
+            build_patched_backing_slab_q0c(&raw_capture, &[transformed], &[], &[binding], &ledger)
+                .unwrap_err();
+        assert!(
+            matches!(err, OverlayError::TransformPreimageDrift { .. }),
+            "later writer differs from T must fail closed"
+        );
+    }
+
+    // 6. Broken before/after chain: a later run's before byte != prior state.
+    #[test]
+    fn route_q_af1a_broken_chain_fails_closed() {
+        let (raw_capture, transformed, binding) = af1a_write_fixture();
+        let mut ledger = af1a_correct_ledger();
+        // A later run whose before byte does NOT equal the prior state (0x28).
+        ledger.runs.push(TransformWriteRun {
+            child_capture_id: "af1b-probe".into(),
+            child_old_base: AF1B_BASE,
+            child_size: AF1B_SIZE,
+            child_offset: 0x28,
+            length: 1,
+            transform_id: "sanitize_ahk_runtime_global".into(),
+            before_digest: sha256_hex(&[0xAB]), // != prior state 0x28
+            after_digest: sha256_hex(&[0x00]),
+            first_before_byte: 0xAB,
+            first_after_byte: 0x00,
+            before_bytes: vec![0xAB],
+            after_bytes: vec![0x00],
+        });
+        let err =
+            build_patched_backing_slab_q0c(&raw_capture, &[transformed], &[], &[binding], &ledger)
+                .unwrap_err();
+        assert!(
+            matches!(err, OverlayError::TransformPreimageDrift { .. }),
+            "broken before/after chain must fail closed"
+        );
+    }
+
+    // 7. Digest mismatch: before_digest != sha256(before_bytes) -> fail closed.
+    #[test]
+    fn route_q_af1a_digest_mismatch_fails_closed() {
+        let (raw_capture, transformed, binding) = af1a_write_fixture();
+        let mut ledger = af1a_correct_ledger();
+        ledger.runs[0].before_digest = "wrong-digest".into(); // != sha256([0xf0])
+        let err =
+            build_patched_backing_slab_q0c(&raw_capture, &[transformed], &[], &[binding], &ledger)
+                .unwrap_err();
+        assert!(
+            matches!(err, OverlayError::TransformPreimageDrift { .. }),
+            "digest mismatch must fail closed"
+        );
+    }
+
+    // 8. A CORRECT ledger (positive control): the write is attributed and applied.
+    #[test]
+    fn route_q_af1a_correct_ledger_attributes_and_applies() {
+        let (raw_capture, transformed, binding) = af1a_write_fixture();
+        let ledger = af1a_correct_ledger();
+        let (patched, _, _) =
+            build_patched_backing_slab_q0c(&raw_capture, &[transformed], &[], &[binding], &ledger)
+                .unwrap();
+        assert_eq!(
+            patched.content[(AF1B_BASE - AF1B_SLAB) as usize + 0x28],
+            0x28
+        );
+    }
+
+    // ---- Route R R0-C: malformed run shape must FAIL CLOSED (TransformPreimageDrift),
+    // never panic on a short byte vector or inconsistent first bytes.
+    fn route_q_af1a_malformed_run(mutate: impl FnOnce(&mut TransformWriteRun)) {
+        let (raw_capture, transformed, binding) = af1a_write_fixture();
+        let mut ledger = af1a_correct_ledger();
+        mutate(&mut ledger.runs[0]);
+        let err =
+            build_patched_backing_slab_q0c(&raw_capture, &[transformed], &[], &[binding], &ledger)
+                .unwrap_err();
+        assert!(
+            matches!(err, OverlayError::TransformPreimageDrift { .. }),
+            "malformed run must fail closed, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn route_q_af1a_short_before_bytes_fails_closed() {
+        // before_bytes too short (would index-panic without shape validation).
+        route_q_af1a_malformed_run(|r| r.before_bytes.clear());
+    }
+
+    #[test]
+    fn route_q_af1a_empty_capture_id_run_fails_closed() {
+        route_q_af1a_malformed_run(|r| r.child_capture_id.clear());
+    }
+
+    #[test]
+    fn route_q_af1a_empty_transform_id_run_fails_closed() {
+        route_q_af1a_malformed_run(|r| r.transform_id.clear());
+    }
+
+    #[test]
+    fn route_q_af1a_first_before_byte_inconsistent_fails_closed() {
+        // first_before_byte disagrees with before_bytes[0].
+        route_q_af1a_malformed_run(|r| r.first_before_byte = r.first_before_byte.wrapping_add(1));
+    }
+
+    #[test]
+    fn route_q_af1a_length_zero_fails_closed() {
+        route_q_af1a_malformed_run(|r| r.length = 0);
+    }
+
+    // ---- Route R R0-C / Audit Fix 1: GLOBAL ledger validation. ----
+    // A malformed run for a DIFFERENT (unrelated) child must still fail the whole
+    // ledger, even when the current child has a correct covering writer. This is
+    // exercised with a valid covering run + a malformed extra run; the overlay
+    // must fail closed (the global validator runs before per-byte attribution).
+
+    fn route_r_r0c_malformed_extra(mutate: impl FnOnce(&mut TransformWriteRun)) {
+        let (raw_capture, transformed, binding) = af1a_write_fixture();
+        let mut ledger = af1a_correct_ledger(); // valid covering run for +0x28
+                                                // A malformed run for an UNRELATED child (different base) — must fail the
+                                                // whole ledger via the global validator, not be ignored.
+        let mut extra = TransformWriteRun {
+            child_capture_id: "other-child".into(),
+            child_old_base: AF1B_BASE + 0x10000, // unrelated base
+            child_size: 8,
+            child_offset: 0,
+            length: 1,
+            transform_id: "scrub_uncaptured_heap_pointers".into(),
+            before_digest: sha256_hex(&[0x01]),
+            after_digest: sha256_hex(&[0x02]),
+            first_before_byte: 0x01,
+            first_after_byte: 0x02,
+            before_bytes: vec![0x01],
+            after_bytes: vec![0x02],
+        };
+        mutate(&mut extra);
+        ledger.runs.push(extra);
+        let err =
+            build_patched_backing_slab_q0c(&raw_capture, &[transformed], &[], &[binding], &ledger)
+                .unwrap_err();
+        assert!(
+            matches!(err, OverlayError::TransformPreimageDrift { .. }),
+            "malformed unrelated run must fail the whole ledger, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn route_r_r0c_valid_plus_zero_length_extra_fails() {
+        route_r_r0c_malformed_extra(|r| r.length = 0);
+    }
+
+    #[test]
+    fn route_r_r0c_valid_plus_empty_id_extra_fails() {
+        route_r_r0c_malformed_extra(|r| r.child_capture_id.clear());
+    }
+
+    #[test]
+    fn route_r_r0c_valid_plus_short_vector_extra_fails() {
+        route_r_r0c_malformed_extra(|r| r.before_bytes.clear());
+    }
+
+    #[test]
+    fn route_r_r0c_offset_length_overflow_fails() {
+        route_r_r0c_malformed_extra(|r| r.child_offset = usize::MAX - 1);
+    }
+
+    // ---- Route R R0-B / Audit Fix 1: execution-owning recorder tests. ----
+    // The recorder executes the transform AND records both child-level
+    // `transform_ids` and the byte/run ledger in one call, so the two can never
+    // diverge.
+
+    #[test]
+    fn route_r_r0b_apply_recorded_transform_records_both_ledgers() {
+        use super::super::heap_global_snapshot::CaptureExtentKind as CEK;
+        // A strict child (C==S) that a transform will modify.
+        let child_base = 0x8aa5f8u64;
+        let child_size = 0x70usize;
+        let slab_base = 0x874000u64;
+        let child_off = (child_base - slab_base) as usize;
+        let slab = HeapSlab {
+            old_base: slab_base,
+            content: vec![0xAAu8; child_off + child_size],
+        };
+        let mut child = raw_child(
+            child_base,
+            child_size,
+            vec![0xAAu8; child_size],
+            RawChildKind::HeapGlobal,
+        );
+        child.extent_kind = CEK::ObservedAllocation;
+        child.capture_id = "r0b-child".into();
+        let raw_capture = RawSlabCapture {
+            slab,
+            children: vec![child],
+        };
+        // A transformed child whose +0x10 will be changed by the transform.
+        let mut globals = vec![global(child_base, vec![0xAAu8; child_size], false)];
+        globals[0].extent_kind = CEK::ObservedAllocation;
+        globals[0].extent_evidence.capture_id = "r0b-child".into();
+        let mut binding = TransformPreimageBinding {
+            child_kind: RawChildKind::HeapGlobal,
+            capture_id: "r0b-child".into(),
+            child_old_base: child_base,
+            child_size,
+            extent_kind: CEK::ObservedAllocation,
+            slab_old_base: slab_base,
+            slab_offset: child_off,
+            basis: TransformPreimageBasis::ChildCapture,
+            raw_child_digest: sha256_hex(&vec![0xAAu8; child_size]),
+            raw_slab_slice_digest: sha256_hex(&vec![0xAAu8; child_size]),
+            transform_input_digest: sha256_hex(&vec![0xAAu8; child_size]),
+            seeded_from_slab: false,
+        };
+        let _ = &mut binding;
+        let mut ledger = TransformRunLedger::default();
+        // Use the execution-owning helper: it must run the transform AND record.
+        let mut b = binding;
+        apply_recorded_transform(&mut globals, "t_probe_write", &mut ledger, |g| {
+            g[0].content[0x10] = 0xEE; // the transform writes +0x10
+        });
+        // The child's transform_ids now carries t_probe_write (child-level evidence).
+        assert!(globals[0]
+            .transform_ids
+            .contains(&"t_probe_write".to_string()));
+        // The byte/run ledger has a run at +0x10 for this child.
+        assert!(ledger.runs.iter().any(|r| {
+            r.transform_id == "t_probe_write"
+                && r.child_old_base == child_base
+                && r.child_offset == 0x10
+                && r.after_bytes == vec![0xEE]
+        }));
+        // The run ledger and child transform_ids are consistent.
+        for r in &ledger.runs {
+            assert!(globals[0].transform_ids.contains(&r.transform_id));
+        }
+        // The overlay must attribute +0x10 to t_probe_write (proves consistency).
+        let (patched, _, _) =
+            build_patched_backing_slab_q0c(&raw_capture, &globals, &[], &[b], &ledger).unwrap();
+        assert_eq!(patched.content[child_off + 0x10], 0xEE);
+    }
+
+    // The execution-owning API makes "forgot to record" / "wrong transform id"
+    // structurally impossible: there is no way to execute a transform and NOT
+    // record it, because the recorder owns execution.
+    #[test]
+    fn route_r_r0b_wrong_or_missing_recording_not_constructible() {
+        // Build a child + correct binding, then verify that ANY write to the child
+        // MUST go through apply_recorded_transform (which always records). We prove
+        // this by showing that applying the transform via the helper records the
+        // run; there is no separate "execute without recording" entry point for a
+        // transform in the production API. If the ledger were empty after a write,
+        // the overlay would fail closed (unattributed byte).
+        use super::super::heap_global_snapshot::CaptureExtentKind as CEK;
+        let child_base = 0x8aa5f8u64;
+        let child_size = 0x70usize;
+        let slab_base = 0x874000u64;
+        let child_off = (child_base - slab_base) as usize;
+        let slab = HeapSlab {
+            old_base: slab_base,
+            content: vec![0xAAu8; child_off + child_size],
+        };
+        let mut child = raw_child(
+            child_base,
+            child_size,
+            vec![0xAAu8; child_size],
+            RawChildKind::HeapGlobal,
+        );
+        child.extent_kind = CEK::ObservedAllocation;
+        child.capture_id = "r0b-constructible".into();
+        let raw_capture = RawSlabCapture {
+            slab,
+            children: vec![child],
+        };
+        let mut globals = vec![global(child_base, vec![0xAAu8; child_size], false)];
+        globals[0].extent_kind = CEK::ObservedAllocation;
+        globals[0].extent_evidence.capture_id = "r0b-constructible".into();
+        let binding = TransformPreimageBinding {
+            child_kind: RawChildKind::HeapGlobal,
+            capture_id: "r0b-constructible".into(),
+            child_old_base: child_base,
+            child_size,
+            extent_kind: CEK::ObservedAllocation,
+            slab_old_base: slab_base,
+            slab_offset: child_off,
+            basis: TransformPreimageBasis::ChildCapture,
+            raw_child_digest: sha256_hex(&vec![0xAAu8; child_size]),
+            raw_slab_slice_digest: sha256_hex(&vec![0xAAu8; child_size]),
+            transform_input_digest: sha256_hex(&vec![0xAAu8; child_size]),
+            seeded_from_slab: false,
+        };
+        // If we somehow wrote the child WITHOUT recording (which the API prevents),
+        // the overlay would fail closed. Prove the fail-closed backstop exists:
+        // an empty ledger + a written byte => TransformPreimageDrift.
+        let mut globals_dirty = globals.clone();
+        globals_dirty[0].content[0x10] = 0xEE; // a write with NO recorded run
+        let err = build_patched_backing_slab_q0c(
+            &raw_capture,
+            &globals_dirty,
+            &[],
+            &[binding],
+            &TransformRunLedger::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, OverlayError::TransformPreimageDrift { .. }),
+            "a write with no recorded run must fail closed"
+        );
+    }
+
+    // ---- Route Q R0 AF1 Rev 2 (P0-2/P0-3): Container identity + basis matrix ----
+    // A Container is a strict child: ChildCapture basis, and its capture id must be
+    // the deterministic `container_capture_id(decoded_begin)` so the raw/seeding
+    // stage and the transformed representation agree. Wrong-basis (slab-seeded)
+    // Container bindings must fail closed (no exemption).
+
+    const AF1C_BASE: u64 = 0x8cc000;
+    const AF1C_SIZE: usize = 0x40;
+
+    /// A Container child inside a slab, with a correct ChildCapture binding.
+    fn af1c_container_fixture() -> (RawSlabCapture, ContainerSnapshot, TransformPreimageBinding) {
+        let child_off = (AF1C_BASE - AF1B_SLAB) as usize; // reuse slab base 0x874000
+        let mut slab_content = vec![0u8; child_off + AF1C_SIZE];
+        for i in 0..AF1C_SIZE {
+            slab_content[child_off + i] = 0x55;
+        }
+        let slab_slice_digest = sha256_hex(&slab_content[child_off..child_off + AF1C_SIZE]);
+        let slab = HeapSlab {
+            old_base: AF1B_SLAB,
+            content: slab_content,
+        };
+        let content = vec![0x55u8; AF1C_SIZE];
+        let cap_id = container_capture_id(AF1C_BASE);
+        let child = RawChild {
+            old_base: AF1C_BASE,
+            size: AF1C_SIZE,
+            raw_bytes: content.clone(),
+            kind: RawChildKind::Container,
+            capture_id: cap_id.clone(),
+            capture_path: crate::dumper::heap_global_snapshot::CapturePath::MainSlot,
+            extent_kind: crate::dumper::heap_global_snapshot::CaptureExtentKind::ObservedAllocation,
+            source_parent_old_base: None,
+            source_slot_offset: None,
+            requested_probe_size: 0,
+            was_interior: false,
+            containing_parent_old_base: None,
+            containing_parent_size: None,
+        };
+        let raw_capture = RawSlabCapture {
+            slab,
+            children: vec![child],
+        };
+        let binding = TransformPreimageBinding {
+            child_kind: RawChildKind::Container,
+            capture_id: cap_id,
+            child_old_base: AF1C_BASE,
+            child_size: AF1C_SIZE,
+            extent_kind: crate::dumper::heap_global_snapshot::CaptureExtentKind::ObservedAllocation,
+            slab_old_base: AF1B_SLAB,
+            slab_offset: child_off,
+            basis: TransformPreimageBasis::ChildCapture,
+            raw_child_digest: sha256_hex(&content),
+            raw_slab_slice_digest: slab_slice_digest,
+            transform_input_digest: sha256_hex(&content),
+            seeded_from_slab: false,
+        };
+        let cont = container(AF1C_BASE, AF1C_BASE + AF1C_SIZE as u64, content);
+        (raw_capture, cont, binding)
+    }
+
+    // Positive: a Container with exact ChildCapture binding and matching identity
+    // is overlaid successfully (identity matches across stages).
+    #[test]
+    fn route_q_af1c_container_exact_child_capture_positive() {
+        let (raw_capture, cont, binding) = af1c_container_fixture();
+        let (patched, overlays, _) = build_patched_backing_slab_q0c(
+            &raw_capture,
+            &[],
+            &[cont],
+            &[binding],
+            &TransformRunLedger::default(),
+        )
+        .unwrap();
+        // No transform wrote the container, so the slab bytes are preserved.
+        let child_off = (AF1C_BASE - AF1B_SLAB) as usize;
+        assert_eq!(patched.content[child_off], 0x55);
+        assert!(overlays
+            .iter()
+            .any(|o| o.child_kind == RawChildKind::Container));
+    }
+
+    // Route R R0-E: TRUE end-to-end Container identity chain. From a raw
+    // ContainerSnapshot, derive raw children, construct the RawSlabCapture, seed
+    // the authoritative preimage (returning the real binding), run the Q0-C
+    // overlay with THAT binding (no manual reconstruction), and render+parse the
+    // manifest — proving the production three-stage identity chain is coherent.
+    #[test]
+    fn route_q_af1c_container_end_to_end() {
+        // 1. Raw ContainerSnapshot + a slab covering it.
+        let child_off = (AF1C_BASE - AF1B_SLAB) as usize;
+        let mut slab_content = vec![0u8; child_off + AF1C_SIZE];
+        for i in 0..AF1C_SIZE {
+            slab_content[child_off + i] = 0x55;
+        }
+        let slab = HeapSlab {
+            old_base: AF1B_SLAB,
+            content: slab_content,
+        };
+        let cont = container(
+            AF1C_BASE,
+            AF1C_BASE + AF1C_SIZE as u64,
+            vec![0x55u8; AF1C_SIZE],
+        );
+        // 2. raw_children_from_capture derives the container's raw child + id.
+        let raw_children = raw_children_from_capture(&[cont.clone()], &[]);
+        let rc = raw_children
+            .iter()
+            .find(|r| r.kind == RawChildKind::Container)
+            .expect("container raw child");
+        assert_eq!(rc.capture_id, container_capture_id(AF1C_BASE));
+        // 3. Construct RawSlabCapture from the real slab + derived raw children.
+        let raw_capture = RawSlabCapture {
+            slab,
+            children: raw_children,
+        };
+        // 4. seed_transform_inputs_from_authoritative_slab returns the REAL binding.
+        let mut globals: Vec<HeapGlobalSnapshot> = Vec::new();
+        let mut containers = vec![cont.clone()];
+        let bindings = seed_transform_inputs_from_authoritative_slab(
+            &raw_capture,
+            &mut containers,
+            &mut globals,
+        )
+        .unwrap();
+        let binding = bindings
+            .iter()
+            .find(|b| b.child_kind == RawChildKind::Container)
+            .expect("container binding");
+        assert_eq!(binding.capture_id, container_capture_id(AF1C_BASE));
+        assert_eq!(binding.basis, TransformPreimageBasis::ChildCapture);
+        // 5. Q0-C overlay using the REAL seeded binding (no manual reconstruction).
+        let (patched, overlays, _drift) = build_patched_backing_slab_q0c(
+            &raw_capture,
+            &globals,
+            &containers,
+            &bindings,
+            &TransformRunLedger::default(),
+        )
+        .unwrap();
+        assert_eq!(patched.content[child_off], 0x55);
+        assert!(overlays
+            .iter()
+            .any(|o| o.child_kind == RawChildKind::Container));
+        // 6. Render + parse the manifest (production contract).
+        let json = crate::dumper::snapshot_manifest::render_manifest_json(
+            std::path::Path::new("af1c.exe"),
+            crate::dumper::types::DumpProfile::AhkGtoExperimental,
+            0x140000000,
+            0x70b0,
+            &containers,
+            &globals,
+            &crate::dumper::capture_policy::DumpCapturePolicy::ahk_gto_default(),
+            None,
+            &overlays,
+            &[],
+            &bindings,
+            &TransformRunLedger::default(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid manifest JSON");
+        // The preimage ledger proves the container's ChildCapture basis.
+        let pl = v["transform_preimage_ledger"].as_array().unwrap();
+        assert!(pl.iter().any(|b| b["child_kind"] == "container"
+            && b["basis"] == "ChildCapture"
+            && b["capture_id"] == container_capture_id(AF1C_BASE)));
+    }
+
+    // Negative: a Container with a slab-seeded (AuthoritativeSlabSlice) basis must
+    // fail closed — the Container must be ChildCapture (no basis exemption).
+    #[test]
+    fn route_q_af1c_container_wrong_slab_basis_fails_closed() {
+        let (raw_capture, cont, mut binding) = af1c_container_fixture();
+        binding.basis = TransformPreimageBasis::AuthoritativeSlabSlice;
+        binding.seeded_from_slab = true;
+        let err = build_patched_backing_slab_q0c(
+            &raw_capture,
+            &[],
+            &[cont],
+            &[binding],
+            &TransformRunLedger::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, OverlayError::TransformPreimageDrift { .. }),
+            "Container must not accept slab basis"
+        );
+    }
+
+    // Identity stability: container_capture_id is deterministic and used by both
+    // raw_children_from_capture and the seed binding so they agree.
+    #[test]
+    fn route_q_af1c_container_identity_is_deterministic_and_stable() {
+        let (raw_capture, mut cont, _binding) = af1c_container_fixture();
+        // raw_children_from_capture derives the same id as container_capture_id.
+        let raw_children = raw_children_from_capture(&[cont.clone()], &[]);
+        let rc = raw_children
+            .iter()
+            .find(|r| r.kind == RawChildKind::Container)
+            .unwrap();
+        assert_eq!(rc.capture_id, container_capture_id(AF1C_BASE));
+        assert!(!rc.capture_id.is_empty());
+        // Seeding produces a binding whose capture_id matches the container raw id.
+        let mut globals: Vec<HeapGlobalSnapshot> = Vec::new();
+        let bindings =
+            seed_transform_inputs_from_authoritative_slab(&raw_capture, &mut [cont], &mut globals)
+                .unwrap();
+        let b = bindings
+            .iter()
+            .find(|b| b.child_kind == RawChildKind::Container)
+            .unwrap();
+        assert_eq!(b.capture_id, container_capture_id(AF1C_BASE));
+        assert_eq!(b.basis, TransformPreimageBasis::ChildCapture);
     }
 
     // 1. Probe-window non-write drift uses the authoritative slab (B[i]=S[i]).

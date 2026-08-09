@@ -921,6 +921,14 @@ pub fn dump_process_with_report(
     // GTO R0-G: capture-drift runs ledger (probe/interior non-write drift resolved
     // to slab authority; surfaced in the manifest).
     let mut capture_drift_ledger: Vec<super::raw_slab_coherence::CaptureDriftRun> = Vec::new();
+    // Route Q R0 Q0-A AF1: production byte/run transform provenance ledger.
+    // Every transform records its contiguous write runs (in execution order) so a
+    // live manifest can identify exactly which transform wrote which child byte
+    // (e.g. repair_label_names_after_scrub -> +0x28). Populated by diffing each
+    // transform's before/after child snapshots; passed to the overlay for write-set
+    // verification and serialized into the snapshot manifest.
+    let mut transform_run_ledger: super::raw_slab_coherence::TransformRunLedger =
+        super::raw_slab_coherence::TransformRunLedger::default();
     if raw_capture.is_some() {
         capture_transforms.push(("heap_slab_raw_capture", "capture"));
     }
@@ -928,74 +936,90 @@ pub fn dump_process_with_report(
     // post-CRT restore does not hand ntdll stale heap addresses (RtlpFindEntry).
     let image_end = (opts.image_base as u64).saturating_add(pe.size_of_image() as u64);
     if stage_plan.scrub_uncaptured_heap_pointers {
-        let before = heap_globals.clone();
-        super::heap_global_snapshot::scrub_uncaptured_heap_pointers(
-            &mut containers,
+        super::raw_slab_coherence::apply_recorded_transform(
             &mut heap_globals,
-            opts.image_base as u64,
-            image_end,
-        );
-        super::heap_global_snapshot::record_transform_applied(
-            &mut heap_globals,
-            &before,
             "scrub_uncaptured_heap_pointers",
+            &mut transform_run_ledger,
+            |heap_globals| {
+                super::heap_global_snapshot::scrub_uncaptured_heap_pointers(
+                    &mut containers,
+                    heap_globals,
+                    opts.image_base as u64,
+                    image_end,
+                );
+            },
         );
     }
     // R-GTO-UI r17b: scrub walks every qword and can clear gscript count@+0x10
     // when the live dword was embedded in a pointer-shaped qword. Re-apply
     // table-derived label count after scrub so bootstrap payload keeps it.
     {
-        let before = heap_globals.clone();
-        super::heap_global_snapshot::resynthesize_gscript_label_count(&mut heap_globals);
-        super::heap_global_snapshot::record_transform_applied(
+        super::raw_slab_coherence::apply_recorded_transform(
             &mut heap_globals,
-            &before,
             "resynthesize_gscript_label_count",
+            &mut transform_run_ledger,
+            |heap_globals| {
+                super::heap_global_snapshot::resynthesize_gscript_label_count(heap_globals);
+            },
         );
     }
     // R-GTO-UI r18/r19b: scrub / slot-cap leave Label.mName null or dangling
     // while inline UTF-16 remains at +0x30  -> 0x48fb0 wcscmp AV. Repair offline
     // (scrub now also preserves UTF-16-looking qwords).
     {
-        let before = heap_globals.clone();
-        super::heap_global_snapshot::repair_label_names_after_scrub(&mut heap_globals);
-        super::heap_global_snapshot::record_transform_applied(
+        super::raw_slab_coherence::try_apply_recorded_transform(
             &mut heap_globals,
-            &before,
             "repair_label_names_after_scrub",
-        );
+            &mut transform_run_ledger,
+            |heap_globals| {
+                super::heap_global_snapshot::repair_label_names_after_scrub(heap_globals).map_err(
+                    |e| {
+                        // Route R R0-A / Audit Fix 1: an external label mName could
+                        // not be safely synthesized. Fail closed before overlay /
+                        // manifest / candidate.
+                        PeError::GtoStage {
+                            stage: "repair_label_names_after_scrub".into(),
+                            error: format!("{e:#}"),
+                        }
+                    },
+                )
+            },
+        )?;
     }
     // R-GTO-UI r20: binary search in 0x48fb0 requires mName-ordered table.
     // Dump capture order is unsorted  -> lookup "A_Args"/others always miss.
     {
-        let before = heap_globals.clone();
-        super::heap_global_snapshot::sort_gscript_label_table(&mut heap_globals);
-        super::heap_global_snapshot::record_transform_applied(
+        super::raw_slab_coherence::apply_recorded_transform(
             &mut heap_globals,
-            &before,
             "sort_gscript_label_table",
+            &mut transform_run_ledger,
+            |heap_globals| {
+                super::heap_global_snapshot::sort_gscript_label_table(heap_globals);
+            },
         );
     }
     // R-GTO-UI r21: Label+0x23==0 redirects via +0x10; dump has null nested
     //  -> AV at 0xc13ea after successful A_Args lookup. Mark non-nested.
     {
-        let before = heap_globals.clone();
-        super::heap_global_snapshot::mark_labels_non_nested(&mut heap_globals);
-        super::heap_global_snapshot::record_transform_applied(
+        super::raw_slab_coherence::apply_recorded_transform(
             &mut heap_globals,
-            &before,
             "mark_labels_non_nested",
+            &mut transform_run_ledger,
+            |heap_globals| {
+                super::heap_global_snapshot::mark_labels_non_nested(heap_globals);
+            },
         );
     }
     // R-GTO-UI r21b: WinMain re-inits [0x141bf0] after Label bind; dump free-list
     // body AVs later. Zero-slab large enough for re-init stores only.
     {
-        let before = heap_globals.clone();
-        super::heap_global_snapshot::sanitize_ahk_runtime_global(&mut heap_globals);
-        super::heap_global_snapshot::record_transform_applied(
+        super::raw_slab_coherence::apply_recorded_transform(
             &mut heap_globals,
-            &before,
             "sanitize_ahk_runtime_global",
+            &mut transform_run_ledger,
+            |heap_globals| {
+                super::heap_global_snapshot::sanitize_ahk_runtime_global(heap_globals);
+            },
         );
     }
     // R-GTO-UI r22b / GTO R0-F.2: gscript+0xbd8 must be NewClassName for
@@ -1229,6 +1253,7 @@ pub fn dump_process_with_report(
             &heap_globals,
             &containers,
             &transform_preimage_bindings,
+            &transform_run_ledger,
         ) {
             Ok((patched, overlays, drift_runs)) => {
                 capture_transforms.push(("heap_slab_restore", "capture"));
@@ -1953,6 +1978,7 @@ pub fn dump_process_with_report(
         &overlay_ledger,
         &capture_drift_ledger,
         &transform_preimage_bindings,
+        &transform_run_ledger,
         &synthetic_requests,
         &synthetic_assignment_ledger,
     );
