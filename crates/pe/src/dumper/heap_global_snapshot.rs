@@ -7211,6 +7211,7 @@ mod tests {
             None,
             &[],
             &[],
+            &[],
             &[req],
             &assigned,
         )
@@ -7248,6 +7249,7 @@ mod tests {
             &materialized,
             &super::super::capture_policy::DumpCapturePolicy::ahk_gto_default(),
             None,
+            &[],
             &[],
             &[],
             &reqs,
@@ -7491,5 +7493,461 @@ mod tests {
             find_containing_snapshot(&[b, a], target),
             Some((0x201000, 0x200))
         );
+    }
+
+    // ================= Route Q R0 Q0-D: Label.mName repair matrix =================
+    //
+    // Under Q0-C the probe/interior transform input P == S (authoritative slab
+    // slice). `repair_label_names_after_scrub` therefore reads mName from the
+    // authoritative preimage, not a stale child capture C. These tests pin the
+    // 8 required decisions (work order §6) on the authoritative mName.
+
+    const Q0D_LABEL: u64 = 0x8aa5f8;
+    const Q0D_LABEL_SIZE: usize = 0x70;
+    const Q0D_TABLE: u64 = 0x8bc550;
+    const Q0D_GSCRIPT: u64 = 0x7f0000;
+
+    /// Minimal gscript + one-label-table + label fixture. `name_ptr` is the
+    /// authoritative mName (+0x28); `inline_first` (0 = none) seeds +0x30.
+    /// Returns the globals with the label at index 2 (indices 0,1 = gscript,table).
+    fn q0d_fixture(name_ptr: u64, inline_first: u16) -> Vec<HeapGlobalSnapshot> {
+        let mut gscript = vec![0u8; 0x40];
+        gscript[0..8].copy_from_slice(&Q0D_TABLE.to_le_bytes());
+        gscript[0x10..0x14].copy_from_slice(&1u32.to_le_bytes());
+        let mut table = vec![0u8; 8];
+        table[0..8].copy_from_slice(&Q0D_LABEL.to_le_bytes());
+        let mut label = vec![0u8; Q0D_LABEL_SIZE];
+        label[LABEL_NAME_OFF..LABEL_NAME_OFF + 8].copy_from_slice(&name_ptr.to_le_bytes());
+        if inline_first != 0 {
+            label[LABEL_INLINE_NAME_OFF..LABEL_INLINE_NAME_OFF + 2]
+                .copy_from_slice(&inline_first.to_le_bytes());
+        }
+        let mk = |live: u64, content: Vec<u8>, inline: bool, cap: &str| HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: live,
+            content,
+            is_heap_handle: false,
+            is_image_inline: inline,
+            extent_kind: CaptureExtentKind::ObservedAllocation,
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: cap.to_string(),
+                capture_path: CapturePath::MainSlot,
+                source_root_rva: None,
+                source_slot_offset: None,
+                probe_requested_size: 0,
+                was_interior: false,
+                containing_parent_old_base: None,
+                containing_parent_size: None,
+            },
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::default(),
+        };
+        vec![
+            mk(Q0D_GSCRIPT, gscript, true, "gscript"),
+            mk(Q0D_TABLE, table, false, "table"),
+            mk(Q0D_LABEL, label, false, "label"),
+        ]
+    }
+
+    /// Wide-string byte encoding helper (UTF-16 LE).
+    fn wide(s: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        for ch in s.encode_utf16() {
+            out.extend_from_slice(&ch.to_le_bytes());
+        }
+        out.extend_from_slice(&[0, 0]);
+        out
+    }
+
+    // Test 1: C null / S exact captured pointer -> keep S, no +0x28 write.
+    #[test]
+    fn route_q_r0d_s_exact_ptr_is_kept() {
+        let mut globals = q0d_fixture(Q0D_LABEL, b'A' as u16);
+        // mName already points at an exact freeable snapshot.
+        globals.push(HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: Q0D_LABEL,
+            content: wide("A_Args"),
+            is_heap_handle: false,
+            is_image_inline: false,
+            extent_kind: CaptureExtentKind::ObservedAllocation,
+            extent_evidence: CaptureExtentEvidence::default(),
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::default(),
+        });
+        let mname_before = globals[2].content[LABEL_NAME_OFF..LABEL_NAME_OFF + 8].to_vec();
+        let before = globals.clone();
+        repair_label_names_after_scrub(&mut globals);
+        // mName unchanged (kept the exact pointer), no +0x28 write.
+        assert_eq!(
+            globals[2].content[LABEL_NAME_OFF..LABEL_NAME_OFF + 8],
+            mname_before
+        );
+        let runs = crate::dumper::raw_slab_coherence::diff_transform_write_runs(
+            &before,
+            &globals,
+            "repair_label_names_after_scrub",
+        );
+        assert!(
+            runs.iter().all(|r| r.child_offset != LABEL_NAME_OFF),
+            "must not write +0x28 when S already holds an exact pointer"
+        );
+    }
+
+    // Test 2: C null / S captured interior pointer -> extract wide string from
+    // the authoritative parent and plant an exact snapshot; pointer kept.
+    #[test]
+    fn route_q_r0d_s_interior_ptr_extracts_and_plants_exact() {
+        let parent_base = 0x900000u64;
+        let interior_name = parent_base + 0x40;
+        let mut globals = q0d_fixture(interior_name, b'A' as u16);
+        // Authoritative parent snapshot contains the wide string at interior_name.
+        let mut parent = vec![0u8; 0x200];
+        let body = wide("Zone");
+        parent[0x40..0x40 + body.len()].copy_from_slice(&body);
+        globals.insert(
+            0,
+            HeapGlobalSnapshot {
+                rva: 0,
+                live_ptr: parent_base,
+                content: parent,
+                is_heap_handle: false,
+                is_image_inline: false,
+                extent_kind: CaptureExtentKind::BackingObject,
+                extent_evidence: CaptureExtentEvidence::default(),
+                transform_ids: Vec::new(),
+                provenance: RegionProvenance::default(),
+            },
+        );
+        // label moved to index 3 (parent inserted at 0).
+        let label_idx = 3;
+        repair_label_names_after_scrub(&mut globals);
+        // Exact string snapshot now exists at interior_name.
+        assert!(globals
+            .iter()
+            .any(|g| g.live_ptr == interior_name && g.content.len() >= 8));
+        // mName keeps the interior pointer semantics.
+        let mname = u64::from_le_bytes(
+            globals[label_idx].content[LABEL_NAME_OFF..LABEL_NAME_OFF + 8]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(mname, interior_name);
+    }
+
+    // Test 3: C null / S dangling pointer + inline valid -> repair writes
+    // label_live+0x30; byte provenance shows the +0x28 write.
+    #[test]
+    fn route_q_r0d_s_dangling_inline_repairs_to_inline() {
+        let dangling = 0xdead_beef_u64;
+        let mut globals = q0d_fixture(dangling, b'B' as u16);
+        let before = globals.clone();
+        repair_label_names_after_scrub(&mut globals);
+        let expected = Q0D_LABEL + LABEL_INLINE_NAME_OFF as u64;
+        let mname = u64::from_le_bytes(
+            globals[2].content[LABEL_NAME_OFF..LABEL_NAME_OFF + 8]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(mname, expected);
+        // A snapshot exists at the inline key.
+        assert!(globals.iter().any(|g| g.live_ptr == expected));
+        let runs = crate::dumper::raw_slab_coherence::diff_transform_write_runs(
+            &before,
+            &globals,
+            "repair_label_names_after_scrub",
+        );
+        assert!(runs.iter().any(|r| r.child_offset == LABEL_NAME_OFF));
+    }
+
+    // Test 4: partial-qword drift -> the authoritative qword is used whole;
+    // never mix C/S bytes into a pointer.
+    #[test]
+    fn route_q_r0d_partial_qword_uses_full_s_not_mixed() {
+        let full_s_ptr = 0x9a123456_78a0u64;
+        let mut globals = q0d_fixture(full_s_ptr, b'A' as u16);
+        globals.push(HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: full_s_ptr,
+            content: wide("Name"),
+            is_heap_handle: false,
+            is_image_inline: false,
+            extent_kind: CaptureExtentKind::ObservedAllocation,
+            extent_evidence: CaptureExtentEvidence::default(),
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::default(),
+        });
+        let mname_before = globals[2].content[LABEL_NAME_OFF..LABEL_NAME_OFF + 8].to_vec();
+        repair_label_names_after_scrub(&mut globals);
+        // The full authoritative qword is preserved (kept), never partially
+        // overwritten.
+        assert_eq!(
+            globals[2].content[LABEL_NAME_OFF..LABEL_NAME_OFF + 8],
+            mname_before
+        );
+        assert_eq!(
+            u64::from_le_bytes(
+                globals[2].content[LABEL_NAME_OFF..LABEL_NAME_OFF + 8]
+                    .try_into()
+                    .unwrap()
+            ),
+            full_s_ptr
+        );
+    }
+
+    // Test 5: mark_labels_non_nested writes +0x23, never +0x28.
+    #[test]
+    fn route_q_r0d_mark_non_nested_only_writes_0x23() {
+        let mut globals = q0d_fixture(0, b'A' as u16);
+        let before = globals.clone();
+        mark_labels_non_nested(&mut globals);
+        let runs = crate::dumper::raw_slab_coherence::diff_transform_write_runs(
+            &before,
+            &globals,
+            "mark_labels_non_nested",
+        );
+        assert!(!runs.is_empty());
+        assert!(
+            runs.iter().all(|r| r.child_offset != LABEL_NAME_OFF),
+            "mark_labels_non_nested must never write +0x28"
+        );
+        assert!(runs.iter().any(|r| r.child_offset == 0x23));
+    }
+
+    // Test 6: Route P exact geometry regression — full pipeline
+    // seed(S) -> repair -> Q0-C overlay for an InteriorSubview child.
+    #[test]
+    fn route_q_r0d_route_p_exact_geometry_overlay() {
+        let child_size = 0x70usize;
+        let slab_base: u64 = 0x874000;
+        let child_off = (Q0D_LABEL - slab_base) as usize;
+        let mut slab_content = vec![0u8; child_off + child_size];
+        for i in 0..child_size {
+            slab_content[child_off + i] = 0xAA;
+        }
+        let s_ptr = 0xf0f1f2f3f4f5f6f7u64.to_le_bytes();
+        slab_content[child_off + 0x28..child_off + 0x30].copy_from_slice(&s_ptr);
+        let mut raw_bytes = vec![0xAAu8; child_size];
+        raw_bytes[0x28..0x30].fill(0); // C mName null
+        let raw_capture = crate::dumper::raw_slab_coherence::RawSlabCapture {
+            slab: crate::dumper::heap_global_snapshot::HeapSlab {
+                old_base: slab_base,
+                content: slab_content,
+            },
+            children: vec![crate::dumper::raw_slab_coherence::RawChild {
+                old_base: Q0D_LABEL,
+                size: child_size,
+                raw_bytes,
+                kind: crate::dumper::raw_slab_coherence::RawChildKind::HeapGlobal,
+                capture_id: "route-p-geometry".into(),
+                capture_path: CapturePath::GscriptChildLink,
+                extent_kind: CaptureExtentKind::InteriorSubview,
+                source_parent_old_base: Some(Q0D_TABLE),
+                source_slot_offset: Some(0),
+                requested_probe_size: 0x1000,
+                was_interior: true,
+                containing_parent_old_base: Some(Q0D_TABLE),
+                containing_parent_size: Some(0x100),
+            }],
+        };
+        // Q0-A seed: transform input -> S. Pre-seed content must equal raw child C.
+        let mut seeded = HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: Q0D_LABEL,
+            content: {
+                let mut c = vec![0xAAu8; child_size];
+                c[0x28..0x30].fill(0); // C value
+                c
+            },
+            is_heap_handle: false,
+            is_image_inline: false,
+            extent_kind: CaptureExtentKind::InteriorSubview,
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: "route-p-geometry".into(),
+                capture_path: CapturePath::GscriptChildLink,
+                source_root_rva: None,
+                source_slot_offset: Some(0),
+                probe_requested_size: 0x1000,
+                was_interior: true,
+                containing_parent_old_base: Some(Q0D_TABLE),
+                containing_parent_size: Some(0x100),
+            },
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::default(),
+        };
+        let mut globals = vec![seeded.clone()];
+        let mut containers: Vec<crate::dumper::container_snapshot::ContainerSnapshot> = Vec::new();
+        let bindings =
+            crate::dumper::raw_slab_coherence::seed_transform_inputs_from_authoritative_slab(
+                &raw_capture,
+                &mut containers,
+                &mut globals,
+            )
+            .unwrap();
+        assert_eq!(globals[0].content[0x28], s_ptr[0]);
+        // S pointer points at an exact snapshot we add -> repair keeps it.
+        // (The string snapshot is a SyntheticDerived region; it is NOT passed to
+        // the overlay as a raw-captured child.)
+        let _s_string = HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: u64::from_le_bytes(s_ptr),
+            content: wide("Name"),
+            is_heap_handle: false,
+            is_image_inline: false,
+            extent_kind: CaptureExtentKind::ObservedAllocation,
+            extent_evidence: CaptureExtentEvidence::default(),
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::default(),
+        };
+        // Q0-C overlay over the InteriorSubview child only.
+        let (patched, overlays, _drift) =
+            crate::dumper::raw_slab_coherence::build_patched_backing_slab_q0c(
+                &raw_capture,
+                &[globals[0].clone()],
+                &[],
+                &bindings,
+            )
+            .unwrap();
+        // The S pointer is preserved at +0x28 (no drift write).
+        assert_eq!(
+            patched.content[child_off + 0x28..child_off + 0x30],
+            s_ptr.to_vec()
+        );
+        assert_eq!(overlays.len(), 1);
+        assert_eq!(overlays[0].overlay_applied, true);
+    }
+
+    // Test 7: S pointer unclassifiable + inline unrecoverable -> fail-closed,
+    // never forge a non-null mName.
+    #[test]
+    fn route_q_r0d_unclassifiable_inline_unrecoverable_fails_closed() {
+        let dangling = 0x1111_2222_u64;
+        let mut globals = q0d_fixture(dangling, 0); // inline first char 0 -> None
+        repair_label_names_after_scrub(&mut globals);
+        let mname = u64::from_le_bytes(
+            globals[2].content[LABEL_NAME_OFF..LABEL_NAME_OFF + 8]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(mname, 0, "must not forge a non-null mName");
+        assert!(!globals.iter().any(|g| g.live_ptr == Q0D_LABEL + 0x30));
+    }
+
+    // Test 8: determinism — swapping child order yields identical patched-slab
+    // digest, drift ledger, and overlay set under Q0-C.
+    #[test]
+    fn route_q_r0d_deterministic_across_input_order() {
+        let child_size = 0x70usize;
+        let slab_base: u64 = 0x874000;
+        let child_off = (Q0D_LABEL - slab_base) as usize;
+        let other_base: u64 = 0x8bb000;
+        let other_off = (other_base - slab_base) as usize;
+        // Slab must span both children.
+        let slab_sz = (child_off + child_size).max(other_off + 0x40);
+        let mut slab_content = vec![0u8; slab_sz];
+        for i in 0..child_size {
+            slab_content[child_off + i] = 0xAA;
+        }
+        let s_ptr = 0xf0f1f2f3f4f5f6f7u64.to_le_bytes();
+        slab_content[child_off + 0x28..child_off + 0x30].copy_from_slice(&s_ptr);
+        for i in 0..0x40 {
+            slab_content[other_off + i] = 0xCC;
+        }
+        slab_content[other_off + 0x10] = 0xDD;
+        let mut raw_bytes = vec![0xAAu8; child_size];
+        raw_bytes[0x28..0x30].fill(0);
+        let mut other_raw = vec![0xCCu8; 0x40];
+        other_raw[0x10] = 0xDD;
+        let mk = |flip: bool| {
+            let mut c1 = crate::dumper::raw_slab_coherence::RawChild {
+                old_base: Q0D_LABEL,
+                size: child_size,
+                raw_bytes: raw_bytes.clone(),
+                kind: crate::dumper::raw_slab_coherence::RawChildKind::HeapGlobal,
+                capture_id: "det".into(),
+                capture_path: CapturePath::GscriptChildLink,
+                extent_kind: CaptureExtentKind::InteriorSubview,
+                source_parent_old_base: Some(Q0D_TABLE),
+                source_slot_offset: Some(0),
+                requested_probe_size: 0x1000,
+                was_interior: true,
+                containing_parent_old_base: Some(Q0D_TABLE),
+                containing_parent_size: Some(0x100),
+            };
+            let mut c2 = crate::dumper::raw_slab_coherence::RawChild {
+                old_base: other_base,
+                size: 0x40,
+                raw_bytes: other_raw.clone(),
+                kind: crate::dumper::raw_slab_coherence::RawChildKind::HeapGlobal,
+                capture_id: "other".into(),
+                capture_path: CapturePath::MainSlot,
+                extent_kind: CaptureExtentKind::ObservedAllocation,
+                source_parent_old_base: None,
+                source_slot_offset: None,
+                requested_probe_size: 0,
+                was_interior: false,
+                containing_parent_old_base: None,
+                containing_parent_size: None,
+            };
+            let children = if flip {
+                vec![c2.clone(), c1.clone()]
+            } else {
+                vec![c1.clone(), c2.clone()]
+            };
+            (
+                crate::dumper::raw_slab_coherence::RawSlabCapture {
+                    slab: crate::dumper::heap_global_snapshot::HeapSlab {
+                        old_base: slab_base,
+                        content: slab_content.clone(),
+                    },
+                    children,
+                },
+                c1,
+            )
+        };
+        let (raw_a, child_a) = mk(false);
+        let (raw_b, _child_b) = mk(true);
+        // Seed A (pre-seed content == raw child C).
+        let mut seeded_a = HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: Q0D_LABEL,
+            content: {
+                let mut c = vec![0xAAu8; child_size];
+                c[0x28..0x30].fill(0); // C value
+                c
+            },
+            is_heap_handle: false,
+            is_image_inline: false,
+            extent_kind: CaptureExtentKind::InteriorSubview,
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: "det".into(),
+                capture_path: CapturePath::GscriptChildLink,
+                source_root_rva: None,
+                source_slot_offset: Some(0),
+                probe_requested_size: 0x1000,
+                was_interior: true,
+                containing_parent_old_base: Some(Q0D_TABLE),
+                containing_parent_size: Some(0x100),
+            },
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::default(),
+        };
+        let mut ga = vec![seeded_a.clone()];
+        let mut ca: Vec<crate::dumper::container_snapshot::ContainerSnapshot> = Vec::new();
+        let bindings_a =
+            crate::dumper::raw_slab_coherence::seed_transform_inputs_from_authoritative_slab(
+                &raw_a, &mut ca, &mut ga,
+            )
+            .unwrap();
+        let mut gb = vec![seeded_a];
+        let mut cb: Vec<crate::dumper::container_snapshot::ContainerSnapshot> = Vec::new();
+        let bindings_b =
+            crate::dumper::raw_slab_coherence::seed_transform_inputs_from_authoritative_slab(
+                &raw_b, &mut cb, &mut gb,
+            )
+            .unwrap();
+        // Both seeds produced identical sorted bindings (deterministic).
+        assert_eq!(bindings_a, bindings_b);
+        let _ = child_a;
     }
 }

@@ -888,6 +888,33 @@ pub fn dump_process_with_report(
             });
         }
     }
+    // Route Q R0 Q0-A/Q0-C: authoritative transform-input seeding.
+    // Before any transform runs, bind each probe/interior child's transform
+    // input to the authoritative slab slice S (seed from S), and record the
+    // preimage basis. Strict extents are not seeded (they must prove C==S).
+    // The bindings are surfaced in the manifest as the audit evidence that
+    // transforms ran on the authoritative preimage, never on a stale child C.
+    let mut transform_preimage_bindings: Vec<super::raw_slab_coherence::TransformPreimageBinding> =
+        Vec::new();
+    if let Some(raw) = raw_capture.as_ref() {
+        match super::raw_slab_coherence::seed_transform_inputs_from_authoritative_slab(
+            raw,
+            &mut containers,
+            &mut heap_globals,
+        ) {
+            Ok(bindings) => {
+                transform_preimage_bindings = bindings;
+            }
+            Err(e) => {
+                // Seeding failure (strict drift, unmappable child, overflow):
+                // fail closed before any transform runs.
+                return Err(PeError::GtoStage {
+                    stage: "transform_input_seed".into(),
+                    error: format!("{e:#}"),
+                });
+            }
+        }
+    }
     // Track capture/transform provenance (taxonomy v1 capture-class transforms).
     let mut capture_transforms: Vec<(&'static str, &'static str)> = Vec::new();
     let mut overlay_ledger: Vec<super::raw_slab_coherence::TransformedRegionOverlay> = Vec::new();
@@ -1195,20 +1222,13 @@ pub fn dump_process_with_report(
     // After transforms, build the authoritative backing slab by overlaying the
     // transformed child bytes onto the RAW slab (raw coherence verified). The
     // planner then normalizes against the patched slab + transformed children.
-    let transform_ids: &[&'static str] = &[
-        "scrub_uncaptured_heap_pointers",
-        "resynthesize_gscript_label_count",
-        "repair_label_names_after_scrub",
-        "sort_gscript_label_table",
-        "mark_labels_non_nested",
-        "sanitize_ahk_runtime_global",
-    ];
     let heap_slab = if let Some(raw) = raw_capture.as_ref() {
-        match super::raw_slab_coherence::build_patched_backing_slab(
+        // Route Q R0 Q0-C: overlay over the authoritative transform preimage.
+        match super::raw_slab_coherence::build_patched_backing_slab_q0c(
             raw,
             &heap_globals,
             &containers,
-            transform_ids,
+            &transform_preimage_bindings,
         ) {
             Ok((patched, overlays, drift_runs)) => {
                 capture_transforms.push(("heap_slab_restore", "capture"));
@@ -1932,6 +1952,7 @@ pub fn dump_process_with_report(
         rebase_summary.as_ref(),
         &overlay_ledger,
         &capture_drift_ledger,
+        &transform_preimage_bindings,
         &synthetic_requests,
         &synthetic_assignment_ledger,
     );

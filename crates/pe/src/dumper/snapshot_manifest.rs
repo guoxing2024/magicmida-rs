@@ -42,6 +42,7 @@ pub(crate) fn write_dump_snapshot_manifest(
     rebase_summary: Option<&RuntimeRebaseSummary>,
     overlay_ledger: &[super::raw_slab_coherence::TransformedRegionOverlay],
     capture_drift_ledger: &[super::raw_slab_coherence::CaptureDriftRun],
+    transform_preimage_ledger: &[super::raw_slab_coherence::TransformPreimageBinding],
     synthetic_requests: &[SyntheticRegionRequest],
     synthetic_assignment_ledger: &[SyntheticAssignment],
 ) {
@@ -57,6 +58,7 @@ pub(crate) fn write_dump_snapshot_manifest(
         rebase_summary,
         overlay_ledger,
         capture_drift_ledger,
+        transform_preimage_ledger,
         synthetic_requests,
         synthetic_assignment_ledger,
     ) {
@@ -130,6 +132,7 @@ pub(crate) fn render_manifest_json(
     rebase_summary: Option<&RuntimeRebaseSummary>,
     overlay_ledger: &[super::raw_slab_coherence::TransformedRegionOverlay],
     capture_drift_ledger: &[super::raw_slab_coherence::CaptureDriftRun],
+    transform_preimage_ledger: &[super::raw_slab_coherence::TransformPreimageBinding],
     synthetic_requests: &[SyntheticRegionRequest],
     synthetic_assignment_ledger: &[SyntheticAssignment],
 ) -> Result<String, String> {
@@ -540,6 +543,9 @@ pub(crate) fn render_manifest_json(
             super::raw_slab_coherence::CaptureDriftResolution::StrictExtentRejected => {
                 "StrictExtentRejected"
             }
+            super::raw_slab_coherence::CaptureDriftResolution::TransformReplayedOnAuthoritativePreimage => {
+                "TransformReplayedOnAuthoritativePreimage"
+            }
         };
         buf.push_str(&format!(
             "    {{\"child_capture_id\": \"{}\", \"child_old_base\": \"{}\", \
@@ -557,6 +563,49 @@ pub(crate) fn render_manifest_json(
             resolution_label
         ));
         if i + 1 < capture_drift_ledger.len() {
+            buf.push(',');
+        }
+        buf.push('\n');
+    }
+    buf.push_str("  ]\n");
+
+    // Route Q R0 Q0-A: transform-preimage ledger. Proves the preimage basis of
+    // every transformed child: for probe/interior views the transform input was
+    // seeded from the authoritative slab slice S (AuthoritativeSlabSlice,
+    // transform_input_digest == sha256(S)); for strict extents the child capture
+    // C is used only after proving C == S (ChildCapture). This is the audit
+    // evidence that transforms ran on the authoritative preimage, never on a
+    // stale child capture. Diagnostic only — never acceptance.
+    buf.push_str(",\n");
+    buf.push_str("  \"transform_preimage_ledger\": [\n");
+    for (i, b) in transform_preimage_ledger.iter().enumerate() {
+        let basis_label = match b.basis {
+            super::raw_slab_coherence::TransformPreimageBasis::ChildCapture => "ChildCapture",
+            super::raw_slab_coherence::TransformPreimageBasis::AuthoritativeSlabSlice => {
+                "AuthoritativeSlabSlice"
+            }
+        };
+        buf.push_str(&format!(
+            "    {{\"child_kind\": \"{}\", \"capture_id\": \"{}\", \
+             \"child_old_base\": \"{}\", \"child_size\": {}, \
+             \"extent_kind\": \"{:?}\", \"slab_old_base\": \"{}\", \
+             \"slab_offset\": {}, \"basis\": \"{}\", \
+             \"raw_child_digest\": \"{}\", \"raw_slab_slice_digest\": \"{}\", \
+             \"transform_input_digest\": \"{}\", \"seeded_from_slab\": {}}}",
+            b.child_kind.label(),
+            json_escape(&b.capture_id),
+            hex_u64(b.child_old_base),
+            b.child_size,
+            b.extent_kind,
+            hex_u64(b.slab_old_base),
+            b.slab_offset,
+            basis_label,
+            b.raw_child_digest,
+            b.raw_slab_slice_digest,
+            b.transform_input_digest,
+            b.seeded_from_slab
+        ));
+        if i + 1 < transform_preimage_ledger.len() {
             buf.push(',');
         }
         buf.push('\n');
@@ -665,6 +714,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
         )
         .unwrap();
         assert!(json.contains(SCHEMA_VERSION));
@@ -723,6 +773,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
         )
         .unwrap();
         assert!(json.contains("0x145710"));
@@ -770,6 +821,7 @@ mod tests {
             &[],
             &DumpCapturePolicy::ahk_gto_default(),
             Some(&summary),
+            &[],
             &[],
             &[],
             &[],
@@ -894,6 +946,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
         )
         .unwrap();
         // The JSON must parse (valid) and contain all three ledgers.
@@ -953,6 +1006,7 @@ mod tests {
             None,
             &[],
             &[],
+            &[],
             &[req.clone()],
             &assigned,
         )
@@ -979,5 +1033,75 @@ mod tests {
             "gscript+0xbd8 (RegisterClass lpszClassName)"
         );
         assert_eq!(ledger[0]["construction_digest"], sha256_hex_pub(&payload));
+    }
+
+    // Route Q R0 Q0-E: the manifest must independently prove the transform
+    // preimage basis (probe/interior seeded from S, strict from C after C==S).
+    #[test]
+    fn route_q_r0e_manifest_proves_transform_preimage_basis() {
+        use crate::dumper::raw_slab_coherence::{
+            RawChildKind, TransformPreimageBasis, TransformPreimageBinding,
+        };
+        // A probe/interior binding (seeded from authoritative slab S).
+        let interior = TransformPreimageBinding {
+            child_kind: RawChildKind::HeapGlobal,
+            capture_id: "route-p-geometry".into(),
+            child_old_base: 0x8aa5f8,
+            child_size: 0x70,
+            extent_kind: CaptureExtentKind::InteriorSubview,
+            slab_old_base: 0x874000,
+            slab_offset: 0x36620,
+            basis: TransformPreimageBasis::AuthoritativeSlabSlice,
+            raw_child_digest: "raw_child_digest_abc".into(),
+            raw_slab_slice_digest: "slab_digest_abc".into(),
+            transform_input_digest: "slab_digest_abc".into(), // == sha256(S)
+            seeded_from_slab: true,
+        };
+        // A strict binding (child capture, C==S proven).
+        let strict = TransformPreimageBinding {
+            child_kind: RawChildKind::HeapGlobal,
+            capture_id: "strict1".into(),
+            child_old_base: 0x8bb000,
+            child_size: 0x40,
+            extent_kind: CaptureExtentKind::ObservedAllocation,
+            slab_old_base: 0x874000,
+            slab_offset: 0x47000,
+            basis: TransformPreimageBasis::ChildCapture,
+            raw_child_digest: "c_digest".into(),
+            raw_slab_slice_digest: "s_digest".into(),
+            transform_input_digest: "c_digest".into(), // == raw child digest
+            seeded_from_slab: false,
+        };
+        let json = render_manifest_json(
+            Path::new("cand.exe"),
+            DumpProfile::AhkGtoExperimental,
+            0x140000000,
+            0x70b0,
+            &[],
+            &[],
+            &DumpCapturePolicy::ahk_gto_default(),
+            None,
+            &[],
+            &[],
+            &[interior, strict],
+            &[],
+            &[],
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid manifest JSON");
+        let ledger = v["transform_preimage_ledger"].as_array().unwrap();
+        assert_eq!(ledger.len(), 2);
+        // The interior binding is AuthoritativeSlabSlice and seeded_from_slab,
+        // proving the transform input came from S (transform_input_digest == S).
+        let int = &ledger[0];
+        assert_eq!(int["basis"], "AuthoritativeSlabSlice");
+        assert_eq!(int["seeded_from_slab"], true);
+        assert_eq!(int["transform_input_digest"], "slab_digest_abc");
+        assert_eq!(int["extent_kind"], "InteriorSubview");
+        // The strict binding is ChildCapture, not seeded.
+        let st = &ledger[1];
+        assert_eq!(st["basis"], "ChildCapture");
+        assert_eq!(st["seeded_from_slab"], false);
+        assert_eq!(st["transform_input_digest"], "c_digest");
     }
 }
