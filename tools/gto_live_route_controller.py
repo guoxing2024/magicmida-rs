@@ -94,16 +94,23 @@ def validate_build_capability_preflight(
     Returns an evidence dict with boolean ``ok``. Failure reasons are precise so
     the driver can distinguish configuration problems. Any violation must fail
     BEFORE Popen (protected_spawn stays 0, exit code 7).
+
+    Route W R0 AF1 (WAF1-A/B): the build gate is MANDATORY, not opt-in. Both
+    ``attestation_path`` and ``authorized_head`` must be provided; a missing
+    attestation or a missing authorized HEAD fails closed so an operator can
+    never forget the capability/baseline binding and still reach Popen.
     """
     if not attestation_path:
-        # No --build-attestation supplied: the build gate is NOT applied (legacy
-        # controller behavior preserved). The armed build gate is opt-in; an
-        # operator who wants the W0-D guarantee must pass the flag.
         return {
-            "ok": True,
-            "build_attestation_required": False,
+            "ok": False,
             "build_attestation_arg_present": False,
-            "failure_reason": None,
+            "failure_reason": "build_attestation_arg_missing",
+        }
+    if not authorized_head:
+        return {
+            "ok": False,
+            "build_attestation_arg_present": True,
+            "failure_reason": "authorized_head_arg_missing",
         }
     att = Path(attestation_path)
     if not att.is_file():
@@ -197,7 +204,7 @@ def validate_build_capability_preflight(
             "gto_product_recovery": data.get("gto_product_recovery"),
         }
     baseline = str(data.get("baseline_commit", ""))
-    if authorized_head and baseline and baseline != authorized_head:
+    if not baseline or baseline != authorized_head:
         return {
             "ok": False,
             "build_attestation_arg_present": True,
@@ -208,7 +215,6 @@ def validate_build_capability_preflight(
         }
     return {
         "ok": True,
-        "build_attestation_required": True,
         "build_attestation_arg_present": True,
         "build_attestation_exists": True,
         "build_attestation_path": str(att),
@@ -218,6 +224,7 @@ def validate_build_capability_preflight(
         "requested_features": features,
         "gto_product_recovery": True,
         "baseline_commit": baseline,
+        "authorized_head": authorized_head,
         "schema_version": data.get("schema_version"),
     }
 

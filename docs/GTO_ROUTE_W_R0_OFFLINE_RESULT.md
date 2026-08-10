@@ -4,9 +4,12 @@
 **授权：** Route W R0（OFFLINE ONLY，0 live / 0 spawn / 0 candidate）
 **起点提交：** `ffa72eac245cc9432f7241913f3470eb5fdb0660`（Route V R0 AF1）
 **分支：** `oreans/two-sample-mainline`
-**终态：** **`RouteW_R0_OfflineReady`**（待 W R1 授权）
+**终态：** **`RouteW_R0_AuditFix1ReviewRequested`**
 
 > 本文档是 **离线结果**。Route W R0 是离线 harness 加固，非 live run，未生成 candidate。
+> 2026-08-10：AF1 审计 `RouteW_R0_NotReady`（P0：build gate 是 opt-in，operator 忘了传
+> `--build-attestation` 仍可 Popen）。已修复（WAF1-A..E：build gate 改为强制，
+> 删除 legacy bypass）。
 
 ---
 
@@ -57,12 +60,25 @@ requested_features / capability_probe_output / gto_product_recovery / created_ut
 
 ### W0-D：controller spawn 前 capability 门禁
 
-Controller 新增 `--build-attestation=<path>` 与 `--authorized-head=<head>`：
-- 提供时，Popen 前验证 attestation / path / sha256 / size / baseline / features / capability；
-  任一失败 → `build_capability_preflight_error`，`spawned=false`，`pid=null`，**exit 7**。
-- 未提供时 build gate 不生效（兼容 U/V 既有调用，仅 env/policy exit 6）。
-- 精确原因覆盖 8 种（含 `build_binary_digest_mismatch` / `gto_capability_false` /
-  `gto_feature_not_requested` / `build_baseline_mismatch` 等）。
+Controller 新增 `--build-attestation=<path>` 与 `--authorized-head=<head>`。Popen 前验证
+attestation / path / sha256 / size / baseline / features / capability；任一失败 →
+`build_capability_preflight_error`，`spawned=false`，`pid=null`，**exit 7**。
+精确原因覆盖（含 `build_binary_digest_mismatch` / `gto_capability_false` /
+`gto_feature_not_requested` / `build_baseline_mismatch` / `build_attestation_arg_missing` /
+`authorized_head_arg_missing`）。
+
+#### W0-D AF1（WAF1-A/B/C）：build gate 强制，非 opt-in
+
+原实现 `--build-attestation` 未传时返回 `ok=true`（legacy bypass），operator 忘传参数仍可
+Popen —— 这正是 W0 要堵死的事故。AF1 改为**强制**：
+- `attestation_path is None` → `ok=false`，`failure_reason=build_attestation_arg_missing`，
+  Popen=0，spawned=false，pid=null，exit 7；
+- `authorized_head` 缺失 → `ok=false`，`failure_reason=authorized_head_arg_missing`，
+  exit 7，Popen=0；
+- attestation 的 baseline 必须与 `authorized_head` **精确匹配**（空 baseline 或不等 →
+  `build_baseline_mismatch`）；
+- 删除 `build_attestation_required=False` 的 legacy bypass；U/V 的历史无-attestation 行为
+  不再作为新 controller 的继续绕过口（U/V 需构造合法 attestation 才能到达 env/policy gate）。
 - 实测：真实 attestation + 真实 mida-cli 二进制 → build gate `ok=true`，随后 policy 门禁
   （未给 `--capture-policy`）exit 6 —— 门禁链正确（build → env → policy）。
 
@@ -95,6 +111,18 @@ route_w_r0_attempt_sequence_is_monotonic       ✓  attempt=3 后 auto-derive=4
 （W0-F 的 default/feature build 能力报告由 Rust `build_capabilities_gto_flag_matches_cfg`
 分别在 default（false）与 feature（true）构建下断言，且用真实二进制探针复核。）
 
+#### W0-AF1（WAF1-D/E）测试（+6）
+
+```
+route_w_af1_missing_attestation_arg_fails_before_popen  ✓  build_attestation_arg_missing，Popen=0
+route_w_af1_missing_authorized_head_fails_before_popen  ✓  authorized_head_arg_missing，Popen=0
+route_w_af1_missing_both_fails_before_popen             ✓  build_attestation_arg_missing，Popen=0
+route_w_af1_wrong_head_fails_before_popen               ✓  build_baseline_mismatch，Popen=0
+route_w_af1_valid_attestation_and_head_reaches_mock_popen ✓ 合法 att+head 达 mock Popen=1
+route_w_af1_attempt_auto_sequence_is_real               ✓  main() 两次调用 → 001/002，run=002，001 不变
+```
+删除原先“未传 attestation 仍允许 Popen”的 legacy-bypass 测试语义。
+
 ## 3. 验收结论
 
 | 门禁 | 实测 |
@@ -103,7 +131,7 @@ route_w_r0_attempt_sequence_is_monotonic       ✓  attempt=3 后 auto-derive=4
 | `cargo test -p mida-pe` | **599/0** ✓ |
 | `cargo test -p mida-cli`（feature） | **298/0/1** ✓（296 基线 + 2 新 capability） |
 | `cargo test -p mida-cli`（default） | **296/0/1** ✓（gto=false，capability 测试通过） |
-| `python tools/test_gto_live_route_controller.py` | **28/0** ✓（19 U/V + 9 W0） |
+| `python tools/test_gto_live_route_controller.py` | **34/0** ✓（19 U/V + 9 W0 + 6 WAF1） |
 | default build capability | **false** ✓ |
 | feature build capability | **true** ✓ |
 | build-feature 缺失 → Popen 前 exit 7 | ✓ |
@@ -125,12 +153,12 @@ protected sample。`docs/GTO_ROUTE_V_R1_LIVE_RESULT.md` 保持 untracked（独�
 
 ## 5. 已知风险 / 说明
 
-- `--build-attestation` 是可选的：仅当 operator 显式传入时才启用 build gate。W R1 授权时
-  必须强制使用，否则回到 V R1 的人工记忆风险。
+- `--build-attestation` 与 `--authorized-head` **均为强制**（WAF1）：两者缺失都会在 Popen 前
+  exit 7 拒绝，operator 无法靠忘传参数绕过 capability/baseline 绑定。W R1 授权时必须两者都传。
 - attestation 的 `binary_path` 必须与 controller argv[0] 精确一致（路径规范化后比较）。
 - 真实 build gate 验证（真实 attestation + 真实二进制）在 W R1 live run 时是强制的；本次
   离线已用真实二进制探针验证 `ok=true`。
 
-**终态：`RouteW_R0_OfflineReady`**。待 Route W R1 授权：新 live budget，用 canonical 构建
-（attestation 强制）跑 600s 单次 live run，定位 Route U R1 的 ~110s 静默窗口，并完整演练
-Route T coherence 链。
+**终态：`RouteW_R0_AuditFix1ReviewRequested`**。待 Route W R1 授权：新 live budget，用
+canonical 构建（attestation + authorized-head 强制）跑 600s 单次 live run，定位 Route U R1 的
+~110s 静默窗口，并完整演练 Route T coherence 链。

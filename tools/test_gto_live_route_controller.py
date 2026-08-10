@@ -25,6 +25,9 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 CONTROLLER = HERE / "gto_live_route_controller.py"
 
+# Route W R0 AF1: authorized baseline the attested build must bind to.
+VALID_HEAD = "a" * 40
+
 _results = []
 
 
@@ -64,14 +67,20 @@ def run_controller(ws, *, extra_env_list, allowlist, capture_policy_arg):
     """Invoke the controller binary in a fresh evidence dir. ``capture_policy_arg``
     is ``"present"`` (valid file), ``"missing_file"`` (arg present, file absent), or
     ``"absent"`` (no --capture-policy arg at all). Returns
-    (returncode, controller_run.json dict)."""
+    (returncode, controller_run.json dict).
+
+    Route W R0 AF1: the controller build gate is MANDATORY, so the child argv[0]
+    is a REAL harmless fake binary with a VALID attestation + authorized HEAD,
+    allowing the env/policy gates (the tests' target) to be reached."""
+    binary, att = _setup_armed_env(ws)
     open(ws / "capture_policy.json", "w").write('{"preset":"ahk_gto_defaults"}')
-    cli = "C:\\nonexistent\\mida-cli.exe"
     argv = [
         sys.executable, str(CONTROLLER),
         "--evidence-dir", str(ws),
         "--env-allowlist", "SystemRoot",
         "--env-allowlist", "WINDIR",
+        "--build-attestation", att,
+        "--authorized-head", VALID_HEAD,
     ]
     for a in allowlist:
         argv.append("--env-allowlist")
@@ -79,7 +88,7 @@ def run_controller(ws, *, extra_env_list, allowlist, capture_policy_arg):
     for kv in extra_env_list:
         argv.append("--set-env")
         argv.append(kv)
-    argv += [cli, "/unpack", "dummy.exe", "-o", str(ws / "cand.exe")]
+    argv += [binary, "/unpack", "dummy.exe", "-o", str(ws / "cand.exe")]
     if capture_policy_arg == "present":
         argv.append("--capture-policy=" + str(ws / "capture_policy.json"))
     elif capture_policy_arg == "missing_file":
@@ -116,19 +125,21 @@ def test_no_bypass_missing_fails_before_spawn(ctrl):
 # UAF1-A: no_bypass=1 reaches the child Popen env (mock Popen boundary).
 def test_no_bypass_reaches_popen_env(ctrl):
     ws = Path(tempfile.mkdtemp(prefix="u0_popen_"))
-    open(ws / "capture_policy.json", "w").write('{"preset":"ahk_gto_defaults"}')
+    binary, att = _setup_armed_env(ws)
     FakePopen.calls = []
     orig_popen = ctrl.subprocess.Popen
     ctrl.subprocess.Popen = FakePopen
     try:
         record = ctrl.run_child(
-            argv=["mida-cli.exe", "/unpack", "x.exe", "-o", "cand.exe",
+            argv=[binary, "/unpack", "x.exe", "-o", "cand.exe",
                   "--capture-policy=" + str(ws / "capture_policy.json")],
             cwd=ws,
             evidence_dir=ws,
             env_allowlist=["SystemRoot", "MIDA_GTO_NO_BYPASS"],
             timeout_sec=30,
             extra_env={"MIDA_GTO_NO_BYPASS": "1"},
+            build_attestation_path=att,
+            authorized_head=VALID_HEAD,
         )
     finally:
         ctrl.subprocess.Popen = orig_popen
@@ -261,19 +272,23 @@ def test_capture_policy_reasons_distinct(ctrl):
 # UAF1-D: a preflight failure must NOT call Popen at all (no protected spawn).
 def test_no_popen_call_on_preflight_failure(ctrl):
     ws = Path(tempfile.mkdtemp(prefix="u0_nopopen_"))
+    binary, att = _setup_armed_env(ws)
     FakePopen.calls = []
     orig_popen = ctrl.subprocess.Popen
     ctrl.subprocess.Popen = FakePopen
     try:
-        # Env contract unmet -> run_child returns before Popen.
+        # Build gate passes (valid attestation+head); env contract unmet (no
+        # MIDA_GTO_NO_BYPASS) -> run_child returns before Popen.
         record = ctrl.run_child(
-            argv=["mida-cli.exe", "/unpack", "x.exe", "-o", "cand.exe",
+            argv=[binary, "/unpack", "x.exe", "-o", "cand.exe",
                   "--capture-policy=" + str(ws / "capture_policy.json")],
             cwd=ws,
             evidence_dir=ws,
             env_allowlist=["SystemRoot"],  # no MIDA_GTO_NO_BYPASS
             timeout_sec=30,
             extra_env={},
+            build_attestation_path=att,
+            authorized_head=VALID_HEAD,
         )
     finally:
         ctrl.subprocess.Popen = orig_popen
@@ -309,6 +324,23 @@ def _write_stage_child_script(ws, *, sleep_sec):
 def _run_real_child(ws, *, timeout_sec, script):
     """Invoke the controller against a real (short-lived or sleeping) child."""
     cli = sys.executable  # the probe script runs under the same interpreter
+    # Build gate is MANDATORY (WAF1): create a valid attestation for the child
+    # binary (sys.executable) with matching digest/size + baseline so the build
+    # gate passes and the run can reach Popen and exercise the real child.
+    cli_path = Path(cli)
+    raw = cli_path.read_bytes()
+    att = ws / "gto_cli_build_attestation.json"
+    att.write_text(json.dumps({
+        "schema_version": "mida.build-attestation/v1",
+        "baseline_commit": VALID_HEAD,
+        "binary_path": str(cli_path.resolve()),
+        "binary_sha256": _sha256(raw),
+        "binary_size": len(raw),
+        "cargo_package": "mida-cli",
+        "cargo_profile": "debug",
+        "requested_features": ["gto-product-recovery"],
+        "gto_product_recovery": True,
+    }), encoding="utf-8")
     argv = [
         sys.executable, str(CONTROLLER),
         "--evidence-dir", str(ws),
@@ -319,6 +351,8 @@ def _run_real_child(ws, *, timeout_sec, script):
         "--env-allowlist", "COMSPEC",
         "--set-env", "MIDA_GTO_NO_BYPASS=1",
         "--timeout", str(timeout_sec),
+        "--build-attestation", str(att),
+        "--authorized-head", VALID_HEAD,
         # NOTE: no "--" separator — argparse REMAINDER would capture the literal
         # "--" into args.command (verified: `with--: ['--','cmd',...]`). The live
         # PS driver strips "--" via parameter binding; here we must NOT include it.
@@ -449,6 +483,15 @@ def _policy_arg(ws):
     return "--capture-policy=" + str((ws / "capture_policy.json").resolve())
 
 
+def _setup_armed_env(ws, *, gto=True, head=None):
+    """Create a fake binary + valid attestation + capture-policy so the build
+    gate passes and the run can reach env/policy preflight or Popen. Returns
+    (binary_path, attestation_path)."""
+    binary = _write_fake_binary(ws)
+    att = _make_attestation(ws, binary, gto=gto, head=head if head is not None else VALID_HEAD)
+    return str(binary.resolve()), str(att)
+
+
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -503,7 +546,7 @@ def test_build_attestation_matches_binary(ctrl):
     binary = _write_fake_binary(ws)
     att = _make_attestation(ws, binary)
     ev = ctrl.validate_build_capability_preflight(
-        str(att), [str(binary.resolve()), "/unpack", "x.exe"], None
+        str(att), [str(binary.resolve()), "/unpack", "x.exe"], VALID_HEAD
     )
     raw = binary.read_bytes()
     check("route_w_r0_build_attestation_matches_binary",
@@ -514,8 +557,8 @@ def test_build_attestation_matches_binary(ctrl):
           f"ok={ev.get('ok')} sha_match={ev.get('attested_binary_sha256')==_sha256(raw)} "
           f"size={ev.get('attested_binary_size')} vs {len(raw)}")
 
-# W0-D: missing --build-attestation arg + provided-but-missing file both fail
-# before Popen (when the flag IS supplied).
+# W0-D / WAF1-A: missing --build-attestation arg (or provided-but-missing file)
+# fails before Popen — the build gate is MANDATORY.
 def test_missing_attestation_fails_before_popen(ctrl):
     ws = Path(tempfile.mkdtemp(prefix="w0_missingatt_"))
     binary = _write_fake_binary(ws)
@@ -524,28 +567,31 @@ def test_missing_attestation_fails_before_popen(ctrl):
     ctrl.subprocess.Popen = FakePopen
     try:
         # Flag supplied but file missing.
-        rec_missing = ctrl.run_child(
+        rec_missing_file = ctrl.run_child(
             argv=[str(binary.resolve()), "/unpack", "x.exe", _policy_arg(ws)],
             cwd=ws, evidence_dir=ws, env_allowlist=["MIDA_GTO_NO_BYPASS"],
             timeout_sec=5, extra_env={"MIDA_GTO_NO_BYPASS": "1"},
             build_attestation_path=str(ws / "MISSING.json"),
+            authorized_head=VALID_HEAD,
         )
-        # Flag NOT supplied at all -> build gate not required (ok=True), no block.
-        rec_unrequired = ctrl.run_child(
+        # Flag NOT supplied at all -> build gate MANDATORY fails (exit 7, no Popen).
+        rec_arg_missing = ctrl.run_child(
             argv=[str(binary.resolve()), "/unpack", "x.exe", _policy_arg(ws)],
             cwd=ws, evidence_dir=ws, env_allowlist=["MIDA_GTO_NO_BYPASS"],
             timeout_sec=5, extra_env={"MIDA_GTO_NO_BYPASS": "1"},
+            authorized_head=VALID_HEAD,
         )
     finally:
         ctrl.subprocess.Popen = orig_popen
     check("route_w_r0_missing_attestation_fails_before_popen",
-          rec_missing.get("spawned") is False
-          and rec_missing.get("build_capability_preflight_error") is not None
-          and "build_attestation_file_missing" in rec_missing.get("build_capability_preflight_error", "")
-          and len(FakePopen.calls) == 1  # only the unrequired call reached Popen
-          and rec_unrequired.get("spawned") is True,
-          f"missing_spawned={rec_missing.get('spawned')} "
-          f"missing_err={rec_missing.get('build_capability_preflight_error')} "
+          rec_missing_file.get("spawned") is False
+          and "build_attestation_file_missing" in rec_missing_file.get("build_capability_preflight_error", "")
+          and rec_arg_missing.get("spawned") is False
+          and "build_attestation_arg_missing" in rec_arg_missing.get("build_capability_preflight_error", "")
+          and len(FakePopen.calls) == 0,
+          f"missing_file_spawned={rec_missing_file.get('spawned')} "
+          f"missing_file_err={rec_missing_file.get('build_capability_preflight_error')} "
+          f"arg_missing_err={rec_arg_missing.get('build_capability_preflight_error')} "
           f"popen_calls={len(FakePopen.calls)}")
 
 # W0-D: digest mismatch fails before Popen.
@@ -563,6 +609,7 @@ def test_digest_mismatch_fails_before_popen(ctrl):
             cwd=ws, evidence_dir=ws, env_allowlist=["MIDA_GTO_NO_BYPASS"],
             timeout_sec=5, extra_env={"MIDA_GTO_NO_BYPASS": "1"},
             build_attestation_path=str(att),
+            authorized_head=VALID_HEAD,
         )
     finally:
         ctrl.subprocess.Popen = orig_popen
@@ -586,6 +633,7 @@ def test_feature_false_fails_before_popen(ctrl):
             cwd=ws, evidence_dir=ws, env_allowlist=["MIDA_GTO_NO_BYPASS"],
             timeout_sec=5, extra_env={"MIDA_GTO_NO_BYPASS": "1"},
             build_attestation_path=str(att),
+            authorized_head=VALID_HEAD,
         )
     finally:
         ctrl.subprocess.Popen = orig_popen
@@ -628,6 +676,7 @@ def test_build_preflight_returns_exit_seven(ctrl):
         sys.executable, str(CONTROLLER),
         "--evidence-dir", str(ws),
         "--build-attestation", str(ws / "NOPE.json"),
+        "--authorized-head", VALID_HEAD,
         "--env-allowlist", "MIDA_GTO_NO_BYPASS",
         "--set-env", "MIDA_GTO_NO_BYPASS=1",
         str(binary.resolve()), "/unpack", "x.exe",
@@ -651,6 +700,7 @@ def test_preflight_attempts_are_not_overwritten(ctrl):
             cwd=ws, evidence_dir=ws, env_allowlist=["MIDA_GTO_NO_BYPASS"],
             timeout_sec=5, extra_env={"MIDA_GTO_NO_BYPASS": "1"},
             build_attestation_path=str(ws / "MISSING.json"),
+            authorized_head=VALID_HEAD,
             attempt_sequence=seq,
         )
     files = sorted(ws.glob("controller_attempt_*.json"))
@@ -670,6 +720,7 @@ def test_attempt_sequence_is_monotonic(ctrl):
         cwd=ws, evidence_dir=ws, env_allowlist=["MIDA_GTO_NO_BYPASS"],
         timeout_sec=5, extra_env={"MIDA_GTO_NO_BYPASS": "1"},
         build_attestation_path=str(ws / "MISSING.json"),
+        authorized_head=VALID_HEAD,
         attempt_sequence=3,
     )
     # Next auto-derived sequence must be 4.
@@ -683,6 +734,180 @@ def test_attempt_sequence_is_monotonic(ctrl):
     check("route_w_r0_attempt_sequence_is_monotonic",
           derived == 4,
           f"existing={existing} derived={derived}")
+
+
+# ---------------------------------------------------------------------------
+# Route W R0 AF1 (WAF1) — mandatory build gate + real auto-sequence evidence.
+# ---------------------------------------------------------------------------
+
+def _assert_build_rejection(rec, reason_substr):
+    """Assert a build-capability preflight rejection: no spawn, no Popen, error set."""
+    return (
+        rec.get("spawned") is False
+        and rec.get("pid") is None
+        and rec.get("build_capability_preflight_error") is not None
+        and reason_substr in rec.get("build_capability_preflight_error", "")
+    )
+
+
+# WAF1-A: missing --build-attestation arg fails before Popen.
+def test_missing_attestation_arg_fails_before_popen(ctrl):
+    ws = Path(tempfile.mkdtemp(prefix="waf1_noatt_"))
+    binary, _ = _setup_armed_env(ws)  # attestation exists but we won't pass it
+    FakePopen.calls = []
+    orig_popen = ctrl.subprocess.Popen
+    ctrl.subprocess.Popen = FakePopen
+    try:
+        rec = ctrl.run_child(
+            argv=[binary, "/unpack", "x.exe", _policy_arg(ws)],
+            cwd=ws, evidence_dir=ws, env_allowlist=["MIDA_GTO_NO_BYPASS"],
+            timeout_sec=5, extra_env={"MIDA_GTO_NO_BYPASS": "1"},
+            authorized_head=VALID_HEAD,  # head present but attestation missing
+        )
+    finally:
+        ctrl.subprocess.Popen = orig_popen
+    check("route_w_af1_missing_attestation_arg_fails_before_popen",
+          _assert_build_rejection(rec, "build_attestation_arg_missing")
+          and len(FakePopen.calls) == 0,
+          f"spawned={rec.get('spawned')} err={rec.get('build_capability_preflight_error')} "
+          f"popen={len(FakePopen.calls)}")
+
+
+# WAF1-B: missing --authorized-head fails before Popen.
+def test_missing_authorized_head_fails_before_popen(ctrl):
+    ws = Path(tempfile.mkdtemp(prefix="waf1_nohead_"))
+    binary, att = _setup_armed_env(ws)
+    FakePopen.calls = []
+    orig_popen = ctrl.subprocess.Popen
+    ctrl.subprocess.Popen = FakePopen
+    try:
+        rec = ctrl.run_child(
+            argv=[binary, "/unpack", "x.exe", _policy_arg(ws)],
+            cwd=ws, evidence_dir=ws, env_allowlist=["MIDA_GTO_NO_BYPASS"],
+            timeout_sec=5, extra_env={"MIDA_GTO_NO_BYPASS": "1"},
+            build_attestation_path=att,  # attestation present but head missing
+        )
+    finally:
+        ctrl.subprocess.Popen = orig_popen
+    check("route_w_af1_missing_authorized_head_fails_before_popen",
+          _assert_build_rejection(rec, "authorized_head_arg_missing")
+          and len(FakePopen.calls) == 0,
+          f"spawned={rec.get('spawned')} err={rec.get('build_capability_preflight_error')} "
+          f"popen={len(FakePopen.calls)}")
+
+
+# WAF1-A/B: neither attestation nor head -> fails before Popen.
+def test_missing_both_fails_before_popen(ctrl):
+    ws = Path(tempfile.mkdtemp(prefix="waf1_both_"))
+    binary, _ = _setup_armed_env(ws)
+    FakePopen.calls = []
+    orig_popen = ctrl.subprocess.Popen
+    ctrl.subprocess.Popen = FakePopen
+    try:
+        rec = ctrl.run_child(
+            argv=[binary, "/unpack", "x.exe", _policy_arg(ws)],
+            cwd=ws, evidence_dir=ws, env_allowlist=["MIDA_GTO_NO_BYPASS"],
+            timeout_sec=5, extra_env={"MIDA_GTO_NO_BYPASS": "1"},
+        )
+    finally:
+        ctrl.subprocess.Popen = orig_popen
+    check("route_w_af1_missing_both_fails_before_popen",
+          _assert_build_rejection(rec, "build_attestation_arg_missing")
+          and len(FakePopen.calls) == 0,
+          f"spawned={rec.get('spawned')} err={rec.get('build_capability_preflight_error')} "
+          f"popen={len(FakePopen.calls)}")
+
+
+# WAF1-B: wrong authorized HEAD (baseline mismatch) fails before Popen.
+def test_wrong_head_fails_before_popen(ctrl):
+    ws = Path(tempfile.mkdtemp(prefix="waf1_wronghead_"))
+    binary, att = _setup_armed_env(ws, head="b" * 40)  # attestation baseline = b*40
+    FakePopen.calls = []
+    orig_popen = ctrl.subprocess.Popen
+    ctrl.subprocess.Popen = FakePopen
+    try:
+        rec = ctrl.run_child(
+            argv=[binary, "/unpack", "x.exe", _policy_arg(ws)],
+            cwd=ws, evidence_dir=ws, env_allowlist=["MIDA_GTO_NO_BYPASS"],
+            timeout_sec=5, extra_env={"MIDA_GTO_NO_BYPASS": "1"},
+            build_attestation_path=att,
+            authorized_head=VALID_HEAD,  # attestation baseline (b*40) != authorized head (a*40)
+        )
+    finally:
+        ctrl.subprocess.Popen = orig_popen
+    check("route_w_af1_wrong_head_fails_before_popen",
+          _assert_build_rejection(rec, "build_baseline_mismatch")
+          and len(FakePopen.calls) == 0,
+          f"spawned={rec.get('spawned')} err={rec.get('build_capability_preflight_error')} "
+          f"popen={len(FakePopen.calls)}")
+
+
+# WAF1-A/B: valid attestation + valid head reaches mock Popen.
+def test_valid_attestation_and_head_reaches_mock_popen(ctrl):
+    ws = Path(tempfile.mkdtemp(prefix="waf1_valid_"))
+    binary, att = _setup_armed_env(ws)
+    FakePopen.calls = []
+    orig_popen = ctrl.subprocess.Popen
+    ctrl.subprocess.Popen = FakePopen
+    try:
+        rec = ctrl.run_child(
+            argv=[binary, "/unpack", "x.exe", _policy_arg(ws)],
+            cwd=ws, evidence_dir=ws, env_allowlist=["MIDA_GTO_NO_BYPASS"],
+            timeout_sec=5, extra_env={"MIDA_GTO_NO_BYPASS": "1"},
+            build_attestation_path=att,
+            authorized_head=VALID_HEAD,
+        )
+    finally:
+        ctrl.subprocess.Popen = orig_popen
+    check("route_w_af1_valid_attestation_and_head_reaches_mock_popen",
+          rec.get("spawned") is True and len(FakePopen.calls) == 1
+          and rec.get("build_capability_preflight", {}).get("ok") is True,
+          f"spawned={rec.get('spawned')} popen={len(FakePopen.calls)}")
+
+
+# WAF1-E: real auto-sequence via main() — two calls in the same evidence dir
+# yield controller_attempt_001.json then 002.json, controller_run.json is the
+# latest, and the first attempt file is left unchanged.
+def test_attempt_auto_sequence_is_real(ctrl):
+    ws = Path(tempfile.mkdtemp(prefix="waf1_autoseq_"))
+    binary, att = _setup_armed_env(ws)
+    # First invocation: build gate FAILS (missing attestation file) -> attempt 1.
+    # Use a real subprocess invocation (main()) so the auto-derive logic runs.
+    def invoke():
+        argv = [
+            sys.executable, str(CONTROLLER),
+            "--evidence-dir", str(ws),
+            "--build-attestation", str(ws / "MISSING.json"),
+            "--authorized-head", VALID_HEAD,
+            "--env-allowlist", "MIDA_GTO_NO_BYPASS",
+            "--set-env", "MIDA_GTO_NO_BYPASS=1",
+            binary, "/unpack", "x.exe",
+        ]
+        return subprocess.run(argv, capture_output=True, text=True, timeout=30)
+
+    r1 = invoke()  # attempt 1 -> controller_attempt_001.json
+    first = (ws / "controller_attempt_001.json").read_text(encoding="utf-8")
+    r2 = invoke()  # attempt 2 -> controller_attempt_002.json
+    after_second = (ws / "controller_attempt_001.json").read_text(encoding="utf-8")
+    ok = (
+        r1.returncode == 7 and r2.returncode == 7
+        and (ws / "controller_attempt_001.json").exists()
+        and (ws / "controller_attempt_002.json").exists()
+        and not (ws / "controller_attempt_003.json").exists()
+        # controller_run.json reflects the latest (attempt 2).
+        and json.loads((ws / "controller_run.json").read_text(encoding="utf-8"))["attempt_sequence"] == 2
+        # attempt 1 evidence unchanged.
+        and first == after_second
+        # 001 says attempt_sequence=1, 002 says 2.
+        and json.loads((ws / "controller_attempt_001.json").read_text(encoding="utf-8"))["attempt_sequence"] == 1
+        and json.loads((ws / "controller_attempt_002.json").read_text(encoding="utf-8"))["attempt_sequence"] == 2
+    )
+    check("route_w_af1_attempt_auto_sequence_is_real",
+          ok,
+          f"r1={r1.returncode} r2={r2.returncode} "
+          f"files={sorted(p.name for p in ws.glob('controller_attempt_*.json'))} "
+          f"run_seq={json.loads((ws/'controller_run.json').read_text(encoding='utf-8')).get('attempt_sequence')} "
+          f"first_unchanged={first == after_second}")
 
 
 def main():
@@ -715,9 +940,16 @@ def main():
     test_build_preflight_returns_exit_seven(ctrl)
     test_preflight_attempts_are_not_overwritten(ctrl)
     test_attempt_sequence_is_monotonic(ctrl)
+    # Route W R0 AF1 (WAF1)
+    test_missing_attestation_arg_fails_before_popen(ctrl)
+    test_missing_authorized_head_fails_before_popen(ctrl)
+    test_missing_both_fails_before_popen(ctrl)
+    test_wrong_head_fails_before_popen(ctrl)
+    test_valid_attestation_and_head_reaches_mock_popen(ctrl)
+    test_attempt_auto_sequence_is_real(ctrl)
     passed = sum(1 for _, ok, _ in _results if ok)
     failed = len(_results) - passed
-    print(f"\nroute_u+af1+v0+w0: {passed} passed / {failed} failed / {len(_results)} total")
+    print(f"\nroute_u+af1+v0+w0+waf1: {passed} passed / {failed} failed / {len(_results)} total")
     return 0 if failed == 0 else 1
 
 
