@@ -31,6 +31,94 @@ from typing import Any, Dict, List, Optional
 
 SCHEMA = "mida.live-route-controller/v1"
 
+# Route U R0 (U0-A/U0-B/U0-C): the authorized GTO live-route environment contract.
+# The child MUST run with MIDA_GTO_NO_BYPASS=1 (authoritative raw-capture path),
+# and MUST NOT have any bypass / semantic-repair escape hatches. This contract is
+# enforced BEFORE spawn (protected_spawn stays 0 on any violation) and recorded as
+# effective-env evidence in controller_run.json. It can never rely on implicit
+# parent-shell inheritance.
+GTO_ENV_NO_BYPASS = "MIDA_GTO_NO_BYPASS"
+GTO_ENV_BYPASS = "MIDA_GTO_BYPASS"
+GTO_ENV_SEMANTIC_REPAIR = "MIDA_GTO_SEMANTIC_REPAIR"
+GTO_ENV_CONTRACT_VALUE = "1"
+
+
+def find_capture_policy_path(argv: List[str]) -> Optional[str]:
+    """Extract the ``--capture-policy=<path>`` value from the child argv, if any."""
+    for a in argv:
+        if a.startswith("--capture-policy="):
+            return a[len("--capture-policy="):]
+    return None
+
+
+def validate_capture_policy_preflight(argv: List[str]) -> Dict[str, Any]:
+    """U0-B / UAF1-B: verify the capture-policy file referenced by the child argv
+    exists before spawn. The capture-policy is a MANDATORY input for an authorized
+    live route: a missing ``--capture-policy`` ARGUMENT fails closed (ok=False,
+    failure_reason=capture_policy_arg_missing) just like a present-but-missing FILE
+    (failure_reason=capture_policy_file_missing). Returns an evidence dict with
+    boolean ``ok``. Any violation must fail BEFORE the child starts
+    (protected_spawn stays 0)."""
+    path_str = find_capture_policy_path(argv)
+    if path_str is None:
+        return {
+            "ok": False,
+            "capture_policy_arg_present": False,
+            "capture_policy_path": None,
+            "capture_policy_exists": False,
+            "failure_reason": "capture_policy_arg_missing",
+        }
+    p = Path(path_str)
+    ok = p.is_file()
+    return {
+        "ok": ok,
+        "capture_policy_arg_present": True,
+        "capture_policy_path": str(p),
+        "capture_policy_exists": ok,
+        "failure_reason": "capture_policy_file_missing" if not ok else None,
+    }
+
+
+def validate_authorized_env(env: Dict[str, str], allowlist: List[str]) -> Dict[str, Any]:
+    """Validate the effective child env against the authorized GTO live-route
+    contract. Returns an evidence dict with a boolean ``ok``.
+
+    U0-B: fails (ok=False) when the allowlist does not carry MIDA_GTO_NO_BYPASS,
+    when the effective env does not explicitly set MIDA_GTO_NO_BYPASS=1, or when a
+    bypass / semantic-repair escape hatch is present. The caller MUST NOT spawn when
+    ``ok`` is False (protected_spawn stays 0).
+    """
+    allowlist_has_no_bypass = GTO_ENV_NO_BYPASS in allowlist
+    no_bypass_value = env.get(GTO_ENV_NO_BYPASS)
+    no_bypass_ok = no_bypass_value == GTO_ENV_CONTRACT_VALUE
+    bypass_present = GTO_ENV_BYPASS in env
+    semantic_repair_present = GTO_ENV_SEMANTIC_REPAIR in env
+    ok = allowlist_has_no_bypass and no_bypass_ok and not bypass_present and not semantic_repair_present
+    evidence = {
+        "ok": ok,
+        "allowlist_carries_no_bypass": allowlist_has_no_bypass,
+        "no_bypass_present": GTO_ENV_NO_BYPASS in env,
+        "no_bypass_value": no_bypass_value,
+        "no_bypass_expected": GTO_ENV_CONTRACT_VALUE,
+        "no_bypass_verified": no_bypass_ok,
+        "bypass_present": bypass_present,
+        "bypass_absent": not bypass_present,
+        "semantic_repair_present": semantic_repair_present,
+        "semantic_repair_absent": not semantic_repair_present,
+    }
+    if not ok:
+        reasons = []
+        if not allowlist_has_no_bypass:
+            reasons.append("allowlist_missing_no_bypass")
+        if not no_bypass_ok:
+            reasons.append("no_bypass_not_explicit_1")
+        if bypass_present:
+            reasons.append("bypass_var_present")
+        if semantic_repair_present:
+            reasons.append("semantic_repair_var_present")
+        evidence["failure_reasons"] = reasons
+    return evidence
+
 
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
@@ -131,6 +219,7 @@ def run_child(
         "command_line_display": subprocess.list2cmdline(argv),
         "cwd": str(cwd.resolve()) if cwd else None,
         "environment_allowlist": env_allowlist,
+        "effective_env_contract": None,
         "started_utc": started,
         "finished_utc": None,
         "elapsed_ms": None,
@@ -139,6 +228,8 @@ def run_child(
         "timed_out": False,
         "termination_action": None,
         "process_tree_cleanup_status": None,
+        "spawned": False,
+        "live_environment_preflight_error": None,
         "stdout_raw_path": str(stdout_raw_path),
         "stdout_raw_sha256": None,
         "stdout_raw_size": None,
@@ -150,6 +241,33 @@ def run_child(
         "spawn_error": None,
         "controller_error": None,
     }
+
+    # Route U R0 (U0-B): enforce the authorized env contract BEFORE spawning. If the
+    # effective env does not carry MIDA_GTO_NO_BYPASS=1 (or a bypass/semantic-repair
+    # escape hatch is present), the run FAILS at stage=live_environment_preflight
+    # with protected_spawn=0 — the child is never started and no route attempt is
+    # burned on an environment misconfiguration. Also verify the capture-policy file
+    # referenced by the child argv exists (U0-B).
+    env_contract = validate_authorized_env(env, env_allowlist)
+    policy_preflight = validate_capture_policy_preflight(argv)
+    record["effective_env_contract"] = env_contract
+    record["capture_policy_preflight"] = policy_preflight
+    if not env_contract["ok"] or not policy_preflight["ok"]:
+        preflight_errors = []
+        if not env_contract["ok"]:
+            preflight_errors.extend(env_contract.get("failure_reasons", []))
+        if not policy_preflight["ok"]:
+            preflight_errors.append(policy_preflight.get("failure_reason", "capture_policy_failed"))
+        record["live_environment_preflight_error"] = (
+            "authorized GTO live preflight not met: "
+            + ", ".join(preflight_errors)
+        )
+        atomic_write_bytes(
+            run_json_path,
+            json.dumps(record, indent=2, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            + b"\n",
+        )
+        return record
 
     # Open raw .bin handles and hand them DIRECTLY to Popen (bytes mode, no
     # reader thread, no text decode). This is the fix for the Route J R1 crash.
@@ -167,6 +285,7 @@ def run_child(
                 env=env,
             )
             record["pid"] = proc.pid
+            record["spawned"] = True
             try:
                 returncode = proc.wait(timeout=timeout_sec)
                 timed_out = False
@@ -277,9 +396,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         timeout_sec=args.timeout,
         extra_env=extra_env,
     )
-    print(json.dumps({"exit_code": record["exit_code"],
-                      "controller_error": record["controller_error"],
-                      "timed_out": record["timed_out"]}))
+    print(json.dumps({
+        "exit_code": record["exit_code"],
+        "controller_error": record["controller_error"],
+        "timed_out": record["timed_out"],
+        "spawned": record["spawned"],
+        "live_environment_preflight_error": record["live_environment_preflight_error"],
+    }))
+    # A live_environment_preflight failure means the authorized env contract was not
+    # met and NO child was spawned. Return a distinctive code so the driver can tell
+    # a preflight rejection (no attempt burned) from a genuine child exit.
+    if record.get("live_environment_preflight_error"):
+        return 6
     # Return child exit code if available (0..255), else a controller error code.
     ec = record["exit_code"]
     if ec is None:
