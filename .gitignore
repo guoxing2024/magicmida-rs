@@ -71,3 +71,4 @@ cargo_test.txt
 
 # Reference materials (copyright risk - do not upload)
 reference/
+.hermes/

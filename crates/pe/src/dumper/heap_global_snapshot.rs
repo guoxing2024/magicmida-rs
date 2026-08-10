@@ -837,14 +837,26 @@ pub fn detect_heap_globals(
         );
 
         total_bytes = total_bytes.saturating_add(content.len());
+        // Route S R0-B: main heap-global slot must carry a non-empty deterministic
+        // capture identity (ObservedAllocation / MainSlot). Previously default()
+        // produced empty capture_id which broke the Q0-C exact binding.
         out.push(HeapGlobalSnapshot {
             rva,
             live_ptr: value,
             content,
             is_heap_handle: false,
             is_image_inline: false,
-            extent_kind: CaptureExtentKind::default(),
-            extent_evidence: CaptureExtentEvidence::default(),
+            extent_kind: CaptureExtentKind::ObservedAllocation,
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: format!("mainslot:{rva:#x}:{value:#x}"),
+                capture_path: CapturePath::MainSlot,
+                source_root_rva: Some(rva),
+                source_slot_offset: None,
+                probe_requested_size: 0,
+                was_interior: false,
+                containing_parent_old_base: None,
+                containing_parent_size: None,
+            },
             transform_ids: Vec::new(),
             provenance: RegionProvenance::default(),
         });
@@ -1614,7 +1626,16 @@ fn ensure_hot_root_slots(
                 is_heap_handle: false,
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
-                extent_evidence: CaptureExtentEvidence::default(),
+                extent_evidence: CaptureExtentEvidence {
+                    capture_id: format!("plant_alias:{value:#x}"),
+                    capture_path: CapturePath::MainSlot,
+                    source_root_rva: None,
+                    source_slot_offset: None,
+                    probe_requested_size: 0,
+                    was_interior: false,
+                    containing_parent_old_base: None,
+                    containing_parent_size: None,
+                },
                 transform_ids: Vec::new(),
                 provenance: RegionProvenance::default(),
             });
@@ -1690,7 +1711,16 @@ fn ensure_hot_root_slots(
             is_heap_handle: false,
             is_image_inline: false,
             extent_kind: CaptureExtentKind::default(),
-            extent_evidence: CaptureExtentEvidence::default(),
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: format!("hotroot_ensure:{value:#x}"),
+                capture_path: CapturePath::MainSlot,
+                source_root_rva: None,
+                source_slot_offset: None,
+                probe_requested_size: 0,
+                was_interior: false,
+                containing_parent_old_base: None,
+                containing_parent_size: None,
+            },
             transform_ids: Vec::new(),
             provenance: RegionProvenance::default(),
         });
@@ -3605,7 +3635,16 @@ fn exhaust_gscript_label_table_entries(
             is_heap_handle: false,
             is_image_inline: false,
             extent_kind: CaptureExtentKind::default(),
-            extent_evidence: CaptureExtentEvidence::default(),
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: format!("gscript_label:{value:#x}"),
+                capture_path: CapturePath::MainSlot,
+                source_root_rva: None,
+                source_slot_offset: None,
+                probe_requested_size: 0,
+                was_interior: false,
+                containing_parent_old_base: None,
+                containing_parent_size: None,
+            },
             transform_ids: Vec::new(),
             provenance: RegionProvenance::default(),
         });
@@ -3732,7 +3771,16 @@ fn externalize_label_name_field(
             is_heap_handle: false,
             is_image_inline: false,
             extent_kind: CaptureExtentKind::default(),
-            extent_evidence: CaptureExtentEvidence::default(),
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: format!("external_string:{str_live:#x}"),
+                capture_path: CapturePath::MainSlot,
+                source_root_rva: None,
+                source_slot_offset: None,
+                probe_requested_size: 0,
+                was_interior: false,
+                containing_parent_old_base: None,
+                containing_parent_size: None,
+            },
             transform_ids: Vec::new(),
             provenance: RegionProvenance::default(),
         });
@@ -3924,7 +3972,16 @@ fn externalize_all_label_names_from_table(
                 is_heap_handle: false,
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
-                extent_evidence: CaptureExtentEvidence::default(),
+                extent_evidence: CaptureExtentEvidence {
+                    capture_id: format!("external_string:{live:#x}"),
+                    capture_path: CapturePath::MainSlot,
+                    source_root_rva: None,
+                    source_slot_offset: None,
+                    probe_requested_size: 0,
+                    was_interior: false,
+                    containing_parent_old_base: None,
+                    containing_parent_size: None,
+                },
                 transform_ids: Vec::new(),
                 provenance: RegionProvenance::default(),
             });
@@ -4315,7 +4372,16 @@ fn exhaust_pointer_table_first_hop_span(
             is_heap_handle: false,
             is_image_inline: false,
             extent_kind: CaptureExtentKind::default(),
-            extent_evidence: CaptureExtentEvidence::default(),
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: format!("gscript_child:{value:#x}"),
+                capture_path: CapturePath::GscriptChildLink,
+                source_root_rva: None,
+                source_slot_offset: None,
+                probe_requested_size: 0,
+                was_interior: false,
+                containing_parent_old_base: None,
+                containing_parent_size: None,
+            },
             transform_ids: Vec::new(),
             provenance: RegionProvenance::default(),
         });
@@ -4553,7 +4619,16 @@ fn expand_hot_root_children(
                 is_heap_handle: false,
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
-                extent_evidence: CaptureExtentEvidence::default(),
+                extent_evidence: CaptureExtentEvidence {
+                    capture_id: format!("gscript_seed_child:{value:#x}"),
+                    capture_path: CapturePath::GscriptFirstHop,
+                    source_root_rva: None,
+                    source_slot_offset: None,
+                    probe_requested_size: 0,
+                    was_interior: false,
+                    containing_parent_old_base: None,
+                    containing_parent_size: None,
+                },
                 transform_ids: Vec::new(),
                 provenance: RegionProvenance::default(),
             });
@@ -4796,7 +4871,16 @@ fn expand_heap_graph(
                 is_heap_handle: false,
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
-                extent_evidence: CaptureExtentEvidence::default(),
+                extent_evidence: CaptureExtentEvidence {
+                    capture_id: format!("graph_child:{value:#x}"),
+                    capture_path: CapturePath::GscriptFirstHop,
+                    source_root_rva: None,
+                    source_slot_offset: None,
+                    probe_requested_size: 0,
+                    was_interior: false,
+                    containing_parent_old_base: None,
+                    containing_parent_size: None,
+                },
                 transform_ids: Vec::new(),
                 provenance: RegionProvenance::default(),
             });
@@ -5049,7 +5133,16 @@ fn admit_string_buffer_child(
         is_heap_handle: false,
         is_image_inline: false,
         extent_kind: CaptureExtentKind::default(),
-        extent_evidence: CaptureExtentEvidence::default(),
+        extent_evidence: CaptureExtentEvidence {
+            capture_id: format!("string_buf:{buf:#x}"),
+            capture_path: CapturePath::MainSlot,
+            source_root_rva: None,
+            source_slot_offset: None,
+            probe_requested_size: 0,
+            was_interior: false,
+            containing_parent_old_base: None,
+            containing_parent_size: None,
+        },
         transform_ids: Vec::new(),
         provenance: RegionProvenance::default(),
     });
@@ -5233,7 +5326,16 @@ fn split_swallowed_siblings(
                 is_heap_handle: false,
                 is_image_inline: false,
                 extent_kind: CaptureExtentKind::default(),
-                extent_evidence: CaptureExtentEvidence::default(),
+                extent_evidence: CaptureExtentEvidence {
+                    capture_id: format!("interior_subview:{value:#x}"),
+                    capture_path: CapturePath::MainSlot,
+                    source_root_rva: None,
+                    source_slot_offset: None,
+                    probe_requested_size: 0,
+                    was_interior: false,
+                    containing_parent_old_base: None,
+                    containing_parent_size: None,
+                },
                 transform_ids: Vec::new(),
                 provenance: RegionProvenance::default(),
             });
@@ -5397,14 +5499,29 @@ fn capture_dangling_edges(
             "Captured dangling heap edge (pre-scrub)"
         );
         *total_bytes = total_bytes.saturating_add(content.len());
+        // Route S R0-A: dangling-edge snapshots MUST carry a deterministic
+        // non-empty capture identity (previously CaptureExtentEvidence::default()
+        // produced an empty capture_id / MainSlot path, which broke the Q0-C exact
+        // binding). Explicitly bind: capture_path=DanglingEdge, extent=ProbeWindow,
+        // probe_requested_size=actual cap, was_interior=false, no containing parent.
+        let capture_id = format!("dangling_edge:{value:#x}:{:#x}", content.len());
         out.push(HeapGlobalSnapshot {
             rva: 0,
             live_ptr: value,
             content,
             is_heap_handle: false,
             is_image_inline: false,
-            extent_kind: CaptureExtentKind::default(),
-            extent_evidence: CaptureExtentEvidence::default(),
+            extent_kind: CaptureExtentKind::ProbeWindow,
+            extent_evidence: CaptureExtentEvidence {
+                capture_id,
+                capture_path: CapturePath::DanglingEdge,
+                source_root_rva: None,
+                source_slot_offset: None,
+                probe_requested_size: DANGLING_PROBE_CAP.min(MAX_HEAP_GLOBAL_BYTES),
+                was_interior: false,
+                containing_parent_old_base: None,
+                containing_parent_size: None,
+            },
             transform_ids: Vec::new(),
             provenance: RegionProvenance::default(),
         });

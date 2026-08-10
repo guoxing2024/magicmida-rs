@@ -880,6 +880,17 @@ pub fn dump_process_with_report(
                 &mut heap_globals,
                 Some(&raw_slab),
             );
+            // Route S R0-B: every raw-coherence participant must carry a non-empty
+            // capture identity. Fail at `capture_identity_bind` (here) instead of a
+            // misleading TransformPreimageDrift at overlay time.
+            super::raw_slab_coherence::validate_raw_coherence_capture_identities(
+                &containers,
+                &heap_globals,
+            )
+            .map_err(|e| PeError::GtoStage {
+                stage: "capture_identity_bind".into(),
+                error: format!("{e:#}"),
+            })?;
             let raw_children =
                 super::raw_slab_coherence::raw_children_from_capture(&containers, &heap_globals);
             raw_capture = Some(super::raw_slab_coherence::RawSlabCapture {
