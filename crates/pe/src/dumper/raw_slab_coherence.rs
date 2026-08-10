@@ -873,7 +873,11 @@ pub fn apply_recorded_transform(
         |stats| {
             let before = heap_globals.clone();
             transform(heap_globals);
-            super::heap_global_snapshot::record_transform_applied(heap_globals, &before, transform_id);
+            super::heap_global_snapshot::record_transform_applied(
+                heap_globals,
+                &before,
+                transform_id,
+            );
             let runs = diff_transform_write_runs(&before, heap_globals, transform_id);
             stats.item_count = runs.len();
             stats.byte_count = runs.iter().map(|r| r.length as u64).sum();

@@ -951,7 +951,10 @@ pub fn dump_process_with_report(
     if let Some(main) = main_slab.as_ref() {
         // Route V R0 (V0-A): stage telemetry.
         let _g = super::stage_timing::StageGuard::begin("reconcile_duplicate_heap_globals");
-        super::heap_global_snapshot::reconcile_duplicate_heap_globals(&mut heap_globals, Some(main));
+        super::heap_global_snapshot::reconcile_duplicate_heap_globals(
+            &mut heap_globals,
+            Some(main),
+        );
         drop(_g);
     }
     let mut raw_capture: Option<super::raw_slab_coherence::RawSlabCapture> = None;
