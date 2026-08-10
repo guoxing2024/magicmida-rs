@@ -70,6 +70,12 @@ pub fn run_command(cmd: Command) -> Result<(), anyhow::Error> {
             &toolchain_pin_file,
             &expected_toolchain,
         ),
+        Command::BuildCapabilities => {
+            // Handled in `run()` before run_command (pure query, returns 0);
+            // this arm is a defensive no-op to keep the match exhaustive.
+            crate::print_build_capabilities_json();
+            Ok(())
+        }
         Command::Help | Command::Version => {
             unreachable!("Help and Version commands should be handled before run_command")
         }

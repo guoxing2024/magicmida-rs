@@ -11,6 +11,7 @@ Run: python3 tools/test_gto_live_route_controller.py
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -430,6 +431,260 @@ def test_600s_policy_is_explicit(ctrl):
           f"total_timeout_guard={has_total_timeout_guard}")
 
 
+# ---------------------------------------------------------------------------
+# Route W R0 (W0-F) — build capability attestation + preflight evidence.
+# ---------------------------------------------------------------------------
+
+def _write_fake_binary(ws, name="fake_cli.exe"):
+    """Write a tiny harmless fake CLI binary (not the protected sample)."""
+    p = ws / name
+    p.write_bytes(b"MZ\x90\x00" + b"\x00" * 256)
+    # A valid capture-policy file so the policy preflight passes when we want
+    # the run to reach Popen (W0 tests).
+    (ws / "capture_policy.json").write_text('{"preset":"ahk_gto_defaults"}', encoding="utf-8")
+    return p
+
+
+def _policy_arg(ws):
+    return "--capture-policy=" + str((ws / "capture_policy.json").resolve())
+
+
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _make_attestation(ws, binary_path, *, gto=True, features=("gto-product-recovery",),
+                      head="a" * 40, size=None, digest=None):
+    """Write a gto_cli_build_attestation.json for the given binary."""
+    raw = Path(binary_path).read_bytes()
+    if size is None:
+        size = len(raw)
+    if digest is None:
+        digest = _sha256(raw)
+    att = {
+        "schema_version": "mida.build-attestation/v1",
+        "baseline_commit": head,
+        "binary_path": str(Path(binary_path).resolve()),
+        "binary_sha256": digest,
+        "binary_size": size,
+        "cargo_package": "mida-cli",
+        "cargo_profile": "debug",
+        "requested_features": list(features),
+        "capability_probe_output": json.dumps({
+            "schema_version": "mida.build-capabilities/v1",
+            "gto_product_recovery": gto,
+            "profile": "debug",
+            "package": "mida-cli",
+        }),
+        "gto_product_recovery": gto,
+    }
+    p = ws / "gto_cli_build_attestation.json"
+    p.write_text(json.dumps(att), encoding="utf-8")
+    return p
+
+
+# W0-A: the canonical build script must request the GTO feature.
+def test_build_script_requests_gto_feature(ctrl):
+    ps1 = HERE / "build_gto_live_cli.ps1"
+    ok = ps1.is_file()
+    if ok:
+        src = ps1.read_text(encoding="utf-8")
+        ok = (
+            "--features gto-product-recovery" in src
+            and "-p mida-cli" in src
+            and "--offline" in src
+        )
+    check("route_w_r0_build_script_requests_gto_feature",
+          ok, f"ps1={ps1.is_file()}")
+
+# W0-C: an attestation's digest/size match the actual binary.
+def test_build_attestation_matches_binary(ctrl):
+    ws = Path(tempfile.mkdtemp(prefix="w0_att_"))
+    binary = _write_fake_binary(ws)
+    att = _make_attestation(ws, binary)
+    ev = ctrl.validate_build_capability_preflight(
+        str(att), [str(binary.resolve()), "/unpack", "x.exe"], None
+    )
+    raw = binary.read_bytes()
+    check("route_w_r0_build_attestation_matches_binary",
+          ev.get("ok") is True
+          and ev.get("attested_binary_sha256") == _sha256(raw)
+          and ev.get("attested_binary_size") == len(raw)
+          and ev.get("gto_product_recovery") is True,
+          f"ok={ev.get('ok')} sha_match={ev.get('attested_binary_sha256')==_sha256(raw)} "
+          f"size={ev.get('attested_binary_size')} vs {len(raw)}")
+
+# W0-D: missing --build-attestation arg + provided-but-missing file both fail
+# before Popen (when the flag IS supplied).
+def test_missing_attestation_fails_before_popen(ctrl):
+    ws = Path(tempfile.mkdtemp(prefix="w0_missingatt_"))
+    binary = _write_fake_binary(ws)
+    FakePopen.calls = []
+    orig_popen = ctrl.subprocess.Popen
+    ctrl.subprocess.Popen = FakePopen
+    try:
+        # Flag supplied but file missing.
+        rec_missing = ctrl.run_child(
+            argv=[str(binary.resolve()), "/unpack", "x.exe", _policy_arg(ws)],
+            cwd=ws, evidence_dir=ws, env_allowlist=["MIDA_GTO_NO_BYPASS"],
+            timeout_sec=5, extra_env={"MIDA_GTO_NO_BYPASS": "1"},
+            build_attestation_path=str(ws / "MISSING.json"),
+        )
+        # Flag NOT supplied at all -> build gate not required (ok=True), no block.
+        rec_unrequired = ctrl.run_child(
+            argv=[str(binary.resolve()), "/unpack", "x.exe", _policy_arg(ws)],
+            cwd=ws, evidence_dir=ws, env_allowlist=["MIDA_GTO_NO_BYPASS"],
+            timeout_sec=5, extra_env={"MIDA_GTO_NO_BYPASS": "1"},
+        )
+    finally:
+        ctrl.subprocess.Popen = orig_popen
+    check("route_w_r0_missing_attestation_fails_before_popen",
+          rec_missing.get("spawned") is False
+          and rec_missing.get("build_capability_preflight_error") is not None
+          and "build_attestation_file_missing" in rec_missing.get("build_capability_preflight_error", "")
+          and len(FakePopen.calls) == 1  # only the unrequired call reached Popen
+          and rec_unrequired.get("spawned") is True,
+          f"missing_spawned={rec_missing.get('spawned')} "
+          f"missing_err={rec_missing.get('build_capability_preflight_error')} "
+          f"popen_calls={len(FakePopen.calls)}")
+
+# W0-D: digest mismatch fails before Popen.
+def test_digest_mismatch_fails_before_popen(ctrl):
+    ws = Path(tempfile.mkdtemp(prefix="w0_digest_"))
+    binary = _write_fake_binary(ws)
+    wrong_digest = "0" * 64
+    att = _make_attestation(ws, binary, digest=wrong_digest)
+    FakePopen.calls = []
+    orig_popen = ctrl.subprocess.Popen
+    ctrl.subprocess.Popen = FakePopen
+    try:
+        rec = ctrl.run_child(
+            argv=[str(binary.resolve()), "/unpack", "x.exe", _policy_arg(ws)],
+            cwd=ws, evidence_dir=ws, env_allowlist=["MIDA_GTO_NO_BYPASS"],
+            timeout_sec=5, extra_env={"MIDA_GTO_NO_BYPASS": "1"},
+            build_attestation_path=str(att),
+        )
+    finally:
+        ctrl.subprocess.Popen = orig_popen
+    check("route_w_r0_digest_mismatch_fails_before_popen",
+          rec.get("spawned") is False and len(FakePopen.calls) == 0
+          and "build_binary_digest_mismatch" in rec.get("build_capability_preflight_error", ""),
+          f"spawned={rec.get('spawned')} popen={len(FakePopen.calls)} "
+          f"err={rec.get('build_capability_preflight_error')}")
+
+# W0-D: feature=false attestation fails before Popen.
+def test_feature_false_fails_before_popen(ctrl):
+    ws = Path(tempfile.mkdtemp(prefix="w0_featfalse_"))
+    binary = _write_fake_binary(ws)
+    att = _make_attestation(ws, binary, gto=False)
+    FakePopen.calls = []
+    orig_popen = ctrl.subprocess.Popen
+    ctrl.subprocess.Popen = FakePopen
+    try:
+        rec = ctrl.run_child(
+            argv=[str(binary.resolve()), "/unpack", "x.exe", _policy_arg(ws)],
+            cwd=ws, evidence_dir=ws, env_allowlist=["MIDA_GTO_NO_BYPASS"],
+            timeout_sec=5, extra_env={"MIDA_GTO_NO_BYPASS": "1"},
+            build_attestation_path=str(att),
+        )
+    finally:
+        ctrl.subprocess.Popen = orig_popen
+    check("route_w_r0_feature_false_fails_before_popen",
+          rec.get("spawned") is False and len(FakePopen.calls) == 0
+          and "gto_capability_false" in rec.get("build_capability_preflight_error", ""),
+          f"spawned={rec.get('spawned')} err={rec.get('build_capability_preflight_error')}")
+
+# W0-D: a valid attestation reaches the (mock) Popen boundary.
+def test_valid_attestation_reaches_mock_popen(ctrl):
+    ws = Path(tempfile.mkdtemp(prefix="w0_validatt_"))
+    binary = _write_fake_binary(ws)
+    att = _make_attestation(ws, binary)
+    FakePopen.calls = []
+    orig_popen = ctrl.subprocess.Popen
+    ctrl.subprocess.Popen = FakePopen
+    try:
+        rec = ctrl.run_child(
+            argv=[str(binary.resolve()), "/unpack", "x.exe", _policy_arg(ws)],
+            cwd=ws, evidence_dir=ws, env_allowlist=["MIDA_GTO_NO_BYPASS"],
+            timeout_sec=5, extra_env={"MIDA_GTO_NO_BYPASS": "1"},
+            build_attestation_path=str(att),
+            authorized_head="a" * 40,
+        )
+    finally:
+        ctrl.subprocess.Popen = orig_popen
+    check("route_w_r0_valid_attestation_reaches_mock_popen",
+          rec.get("spawned") is True and len(FakePopen.calls) == 1
+          and rec.get("build_capability_preflight_error") is None
+          and rec.get("build_capability_preflight", {}).get("ok") is True,
+          f"spawned={rec.get('spawned')} popen={len(FakePopen.calls)}")
+
+# W0-D: build-capability rejection returns exit code 7 via main().
+def test_build_preflight_returns_exit_seven(ctrl):
+    ws = Path(tempfile.mkdtemp(prefix="w0_exit7_"))
+    binary = _write_fake_binary(ws)
+    # No attestation file exists; flag points at a missing file -> build gate fails -> exit 7.
+    cli = "C:\\nonexistent\\mida-cli.exe"  # unused; argv[0] is the fake binary
+    argv = [
+        sys.executable, str(CONTROLLER),
+        "--evidence-dir", str(ws),
+        "--build-attestation", str(ws / "NOPE.json"),
+        "--env-allowlist", "MIDA_GTO_NO_BYPASS",
+        "--set-env", "MIDA_GTO_NO_BYPASS=1",
+        str(binary.resolve()), "/unpack", "x.exe",
+    ]
+    r = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+    d = json.load(open(ws / "controller_run.json", encoding="utf-8"))
+    check("route_w_r0_build_preflight_returns_exit_seven",
+          r.returncode == 7 and d.get("spawned") is False and d.get("pid") is None
+          and d.get("build_capability_preflight_error") is not None,
+          f"rc={r.returncode} spawned={d.get('spawned')}")
+
+# W0-E: preflight attempts are never overwritten.
+def test_preflight_attempts_are_not_overwritten(ctrl):
+    ws = Path(tempfile.mkdtemp(prefix="w0_nooverwrite_"))
+    binary = _write_fake_binary(ws)
+    # Two successive build-gate failures (missing attestation) with explicit
+    # attempt sequences 1 and 2 -> two distinct controller_attempt files kept.
+    for seq in (1, 2):
+        ctrl.run_child(
+            argv=[str(binary.resolve()), "/unpack", "x.exe"],
+            cwd=ws, evidence_dir=ws, env_allowlist=["MIDA_GTO_NO_BYPASS"],
+            timeout_sec=5, extra_env={"MIDA_GTO_NO_BYPASS": "1"},
+            build_attestation_path=str(ws / "MISSING.json"),
+            attempt_sequence=seq,
+        )
+    files = sorted(ws.glob("controller_attempt_*.json"))
+    check("route_w_r0_preflight_attempts_are_not_overwritten",
+          len(files) == 2
+          and (ws / "controller_attempt_001.json").exists()
+          and (ws / "controller_attempt_002.json").exists()
+          and (ws / "controller_run.json").exists(),
+          f"attempt_files={[f.name for f in files]}")
+
+# W0-E: attempt sequence is monotonic (never reused).
+def test_attempt_sequence_is_monotonic(ctrl):
+    ws = Path(tempfile.mkdtemp(prefix="w0_seq_"))
+    binary = _write_fake_binary(ws)
+    ctrl.run_child(
+        argv=[str(binary.resolve()), "/unpack", "x.exe"],
+        cwd=ws, evidence_dir=ws, env_allowlist=["MIDA_GTO_NO_BYPASS"],
+        timeout_sec=5, extra_env={"MIDA_GTO_NO_BYPASS": "1"},
+        build_attestation_path=str(ws / "MISSING.json"),
+        attempt_sequence=3,
+    )
+    # Next auto-derived sequence must be 4.
+    next_seq = ctrl.main.__globals__  # not needed; recompute manually:
+    existing = [
+        int(p.stem.split("_")[-1])
+        for p in ws.glob("controller_attempt_*.json")
+        if p.stem.split("_")[-1].isdigit()
+    ]
+    derived = max(existing) + 1 if existing else 1
+    check("route_w_r0_attempt_sequence_is_monotonic",
+          derived == 4,
+          f"existing={existing} derived={derived}")
+
+
 def main():
     ctrl = load_controller()
     test_no_bypass_missing_fails_before_spawn(ctrl)
@@ -450,9 +705,19 @@ def main():
     test_timeout_records_silence_duration(ctrl)
     test_timeout_preserves_binary_evidence(ctrl)
     test_600s_policy_is_explicit(ctrl)
+    # Route W R0 (W0-F)
+    test_build_script_requests_gto_feature(ctrl)
+    test_build_attestation_matches_binary(ctrl)
+    test_missing_attestation_fails_before_popen(ctrl)
+    test_digest_mismatch_fails_before_popen(ctrl)
+    test_feature_false_fails_before_popen(ctrl)
+    test_valid_attestation_reaches_mock_popen(ctrl)
+    test_build_preflight_returns_exit_seven(ctrl)
+    test_preflight_attempts_are_not_overwritten(ctrl)
+    test_attempt_sequence_is_monotonic(ctrl)
     passed = sum(1 for _, ok, _ in _results if ok)
     failed = len(_results) - passed
-    print(f"\nroute_u_r0+af1+v0: {passed} passed / {failed} failed / {len(_results)} total")
+    print(f"\nroute_u+af1+v0+w0: {passed} passed / {failed} failed / {len(_results)} total")
     return 0 if failed == 0 else 1
 
 

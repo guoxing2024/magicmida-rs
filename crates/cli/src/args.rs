@@ -69,6 +69,12 @@ pub enum Command {
         toolchain_pin_file: PathBuf,
         expected_toolchain: String,
     },
+    /// Route W R0 (W0-B): build-capability query. Emits
+    /// `--build-capabilities-json` (build-feature attestation) WITHOUT touching
+    /// any sample / debuggee / candidate / network. Works regardless of the
+    /// enabled feature set (honestly reports `gto_product_recovery` false when
+    /// the feature is disabled).
+    BuildCapabilities,
     Help,
     Version,
 }
@@ -89,6 +95,9 @@ pub fn parse_args() -> Result<Command, String> {
         "/verify" | "--verify" | "verify" => parse_verify(&args),
         "/offline-preflight" | "--offline-preflight" | "offline-preflight" => {
             parse_offline_preflight(&args)
+        }
+        "--build-capabilities-json" | "build-capabilities-json" | "build-capabilities" => {
+            Ok(Command::BuildCapabilities)
         }
         other => Err(format!(
             "Unknown command '{}'. Use --help for usage information.",

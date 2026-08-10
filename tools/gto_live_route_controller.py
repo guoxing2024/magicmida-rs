@@ -80,6 +80,148 @@ def validate_capture_policy_preflight(argv: List[str]) -> Dict[str, Any]:
     }
 
 
+# Route W R0 (W0-D): build-capability preflight. The child argv[0] (the mida-cli
+# binary) must be the exact binary attested by `gto_cli_build_attestation.json`
+# produced by tools/build_gto_live_cli.ps1, AND that attestation must report
+# gto_product_recovery=true. This closes the Route V R1 failure mode where a
+# default-feature (GTO-disabled) binary was silently used. Fails BEFORE spawn
+# (protected_spawn stays 0) with a precise reason and exit code 7.
+def validate_build_capability_preflight(
+    attestation_path: Optional[str], argv: List[str], authorized_head: Optional[str]
+) -> Dict[str, Any]:
+    """Verify the child binary is a GTO-capable, attested build.
+
+    Returns an evidence dict with boolean ``ok``. Failure reasons are precise so
+    the driver can distinguish configuration problems. Any violation must fail
+    BEFORE Popen (protected_spawn stays 0, exit code 7).
+    """
+    if not attestation_path:
+        # No --build-attestation supplied: the build gate is NOT applied (legacy
+        # controller behavior preserved). The armed build gate is opt-in; an
+        # operator who wants the W0-D guarantee must pass the flag.
+        return {
+            "ok": True,
+            "build_attestation_required": False,
+            "build_attestation_arg_present": False,
+            "failure_reason": None,
+        }
+    att = Path(attestation_path)
+    if not att.is_file():
+        return {
+            "ok": False,
+            "build_attestation_arg_present": True,
+            "build_attestation_exists": False,
+            "build_attestation_path": str(att),
+            "failure_reason": "build_attestation_file_missing",
+        }
+    try:
+        # utf-8-sig transparently strips a leading UTF-8 BOM (PowerShell's
+        # Set-Content -Encoding UTF8 writes one) so the attestation parses
+        # regardless of how the build script encoded it.
+        text = att.read_text(encoding="utf-8-sig")
+        data = json.loads(text)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "build_attestation_arg_present": True,
+            "build_attestation_exists": True,
+            "build_attestation_path": str(att),
+            "failure_reason": "build_attestation_invalid_json",
+            "failure_detail": f"{type(exc).__name__}: {exc}",
+        }
+    if not argv:
+        return {
+            "ok": False,
+            "build_attestation_arg_present": True,
+            "failure_reason": "child_argv_empty",
+        }
+    binary_path = argv[0]
+    attested_path = str(data.get("binary_path", ""))
+    # Normalize both to absolute, case-folded for comparison.
+    if os.path.normcase(os.path.abspath(str(binary_path))) != os.path.normcase(
+        os.path.abspath(attested_path)
+    ):
+        return {
+            "ok": False,
+            "build_attestation_arg_present": True,
+            "build_attestation_exists": True,
+            "failure_reason": "build_binary_path_mismatch",
+            "attested_path": attested_path,
+            "child_argv0": str(binary_path),
+        }
+    if not os.path.isfile(str(binary_path)):
+        return {
+            "ok": False,
+            "build_attestation_arg_present": True,
+            "build_attestation_exists": True,
+            "failure_reason": "build_binary_file_missing",
+            "binary_path": str(binary_path),
+        }
+    actual_sha = sha256_file(Path(str(binary_path)))
+    attested_sha = str(data.get("binary_sha256", ""))
+    if actual_sha != attested_sha:
+        return {
+            "ok": False,
+            "build_attestation_arg_present": True,
+            "build_attestation_exists": True,
+            "failure_reason": "build_binary_digest_mismatch",
+            "attested_sha256": attested_sha,
+            "actual_sha256": actual_sha,
+        }
+    actual_size = os.path.getsize(str(binary_path))
+    attested_size = data.get("binary_size")
+    if attested_size != actual_size:
+        return {
+            "ok": False,
+            "build_attestation_arg_present": True,
+            "build_attestation_exists": True,
+            "failure_reason": "build_binary_size_mismatch",
+            "attested_size": attested_size,
+            "actual_size": actual_size,
+        }
+    features = list(data.get("requested_features", []) or [])
+    if "gto-product-recovery" not in features:
+        return {
+            "ok": False,
+            "build_attestation_arg_present": True,
+            "build_attestation_exists": True,
+            "failure_reason": "gto_feature_not_requested",
+            "requested_features": features,
+        }
+    if data.get("gto_product_recovery") is not True:
+        return {
+            "ok": False,
+            "build_attestation_arg_present": True,
+            "build_attestation_exists": True,
+            "failure_reason": "gto_capability_false",
+            "gto_product_recovery": data.get("gto_product_recovery"),
+        }
+    baseline = str(data.get("baseline_commit", ""))
+    if authorized_head and baseline and baseline != authorized_head:
+        return {
+            "ok": False,
+            "build_attestation_arg_present": True,
+            "build_attestation_exists": True,
+            "failure_reason": "build_baseline_mismatch",
+            "attested_baseline": baseline,
+            "authorized_head": authorized_head,
+        }
+    return {
+        "ok": True,
+        "build_attestation_required": True,
+        "build_attestation_arg_present": True,
+        "build_attestation_exists": True,
+        "build_attestation_path": str(att),
+        "attested_binary_path": attested_path,
+        "attested_binary_sha256": attested_sha,
+        "attested_binary_size": attested_size,
+        "requested_features": features,
+        "gto_product_recovery": True,
+        "baseline_commit": baseline,
+        "schema_version": data.get("schema_version"),
+    }
+
+
 def validate_authorized_env(env: Dict[str, str], allowlist: List[str]) -> Dict[str, Any]:
     """Validate the effective child env against the authorized GTO live-route
     contract. Returns an evidence dict with a boolean ``ok``.
@@ -240,6 +382,9 @@ def run_child(
     timeout_sec: float,
     timeout_kill_tree: bool = True,
     extra_env: Optional[Dict[str, str]] = None,
+    build_attestation_path: Optional[str] = None,
+    authorized_head: Optional[str] = None,
+    attempt_sequence: int = 1,
 ) -> Dict[str, Any]:
     """Run ``argv`` as a child, capturing stdout/stderr as raw bytes.
 
@@ -299,7 +444,43 @@ def run_child(
         "last_observed_stage": None,
         "last_observed_stage_event": None,
         "silence_before_timeout_ms": None,
+        # Route W R0 (W0-D): build-capability preflight evidence + exit gate.
+        "build_capability_preflight": None,
+        "build_capability_preflight_error": None,
+        "build_attestation_path": build_attestation_path,
+        # Route W R0 (W0-E): per-attempt evidence preservation.
+        "attempt_sequence": attempt_sequence,
     }
+
+    # Route W R0 (W0-E): evidence is preserved per-attempt. `controller_run.json`
+    # is the latest-attempt pointer, but every attempt (including preflight
+    # rejections) is ALSO written to a monotonic controller_attempt_NNN.json that
+    # is never overwritten or deleted.
+    def write_evidence(record: Dict[str, Any]) -> None:
+        data_bytes = json.dumps(record, indent=2, ensure_ascii=False, sort_keys=True).encode(
+            "utf-8"
+        ) + b"\n"
+        attempt_file = evidence_dir / "controller_attempt_{:03d}.json".format(
+            record["attempt_sequence"]
+        )
+        atomic_write_bytes(attempt_file, data_bytes)
+        atomic_write_bytes(run_json_path, data_bytes)
+
+    # Route W R0 (W0-D): enforce the build-capability contract BEFORE spawning.
+    # If the child binary is not the exact GTO-capable attested build, the run
+    # FAILS with protected_spawn=0, spawned=false, pid=null, exit code 7 — a
+    # build-capability preflight rejection distinct from the env/policy exit 6.
+    build_preflight = validate_build_capability_preflight(
+        build_attestation_path, argv, authorized_head
+    )
+    record["build_capability_preflight"] = build_preflight
+    if not build_preflight["ok"]:
+        record["build_capability_preflight_error"] = (
+            "authorized GTO live build capability not met: "
+            + build_preflight.get("failure_reason", "build_capability_failed")
+        )
+        write_evidence(record)
+        return record
 
     # Route U R0 (U0-B): enforce the authorized env contract BEFORE spawning. If the
     # effective env does not carry MIDA_GTO_NO_BYPASS=1 (or a bypass/semantic-repair
@@ -321,11 +502,7 @@ def run_child(
             "authorized GTO live preflight not met: "
             + ", ".join(preflight_errors)
         )
-        atomic_write_bytes(
-            run_json_path,
-            json.dumps(record, indent=2, ensure_ascii=False, sort_keys=True).encode("utf-8")
-            + b"\n",
-        )
+        write_evidence(record)
         return record
 
     # Open raw .bin handles and hand them DIRECTLY to Popen (bytes mode, no
@@ -477,11 +654,8 @@ def run_child(
     else:
         record["stderr_decode_status"] = "no_output_file"
 
-    # Atomic controller_run.json
-    atomic_write_bytes(
-        run_json_path,
-        json.dumps(record, indent=2, ensure_ascii=False, sort_keys=True).encode("utf-8") + b"\n",
-    )
+    # Atomic evidence write (W0-E): latest-attempt pointer + monotonic attempt file.
+    write_evidence(record)
     return record
 
 
@@ -514,6 +688,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="environment variable names to propagate (repeatable)")
     parser.add_argument("--set-env", action="append", default=[],
                         help="KEY=VALUE extra env (repeatable)")
+    parser.add_argument("--build-attestation", default=None,
+                        help="absolute path to gto_cli_build_attestation.json (W0-D)")
+    parser.add_argument("--authorized-head", default=None,
+                        help="authorized baseline commit the attested build must match (W0-D)")
+    parser.add_argument("--attempt-sequence", type=int, default=None,
+                        help="explicit attempt sequence; if omitted, auto-increment from evidence dir")
     parser.add_argument("command", nargs=argparse.REMAINDER, help="child argv after --")
     args = parser.parse_args(argv)
 
@@ -524,6 +704,20 @@ def main(argv: Optional[List[str]] = None) -> int:
             extra_env[k] = v
 
     cwd = Path(args.cwd) if args.cwd else None
+    # Route W R0 (W0-E): attempt sequence is monotonic and never reused. If not
+    # explicitly given, derive it from existing controller_attempt_*.json files.
+    attempt_seq = args.attempt_sequence
+    if attempt_seq is None:
+        evdir = Path(args.evidence_dir)
+        attempt_seq = 1
+        if evdir.is_dir():
+            existing = [
+                int(p.stem.split("_")[-1])
+                for p in evdir.glob("controller_attempt_*.json")
+                if p.stem.split("_")[-1].isdigit()
+            ]
+            if existing:
+                attempt_seq = max(existing) + 1
     record = run_child(
         argv=args.command,
         cwd=cwd,
@@ -531,14 +725,24 @@ def main(argv: Optional[List[str]] = None) -> int:
         env_allowlist=args.env_allowlist,
         timeout_sec=args.timeout,
         extra_env=extra_env,
+        build_attestation_path=args.build_attestation,
+        authorized_head=args.authorized_head,
+        attempt_sequence=attempt_seq,
     )
     print(json.dumps({
+        "attempt_sequence": record["attempt_sequence"],
         "exit_code": record["exit_code"],
         "controller_error": record["controller_error"],
         "timed_out": record["timed_out"],
         "spawned": record["spawned"],
         "live_environment_preflight_error": record["live_environment_preflight_error"],
+        "build_capability_preflight_error": record["build_capability_preflight_error"],
     }))
+    # A build-capability failure means the child binary is NOT the attested
+    # GTO-capable build and NO child was spawned. Return exit 7 (distinct from
+    # the env/policy exit 6) so the driver can tell which gate rejected.
+    if record.get("build_capability_preflight_error"):
+        return 7
     # A live_environment_preflight failure means the authorized env contract was not
     # met and NO child was spawned. Return a distinctive code so the driver can tell
     # a preflight rejection (no attempt burned) from a genuine child exit.

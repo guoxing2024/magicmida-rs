@@ -64,6 +64,13 @@ pub fn run() -> u8 {
             println!("{NAME} {VERSION}");
             return 0;
         }
+        // Route W R0 (W0-B): pure build-capability query. Must not touch any
+        // sample / debuggee / candidate / network; works with any feature set
+        // and honestly reports gto_product_recovery=false when disabled.
+        Ok(args::Command::BuildCapabilities) => {
+            print_build_capabilities_json();
+            return 0;
+        }
         Ok(cmd) => cmd,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -93,6 +100,38 @@ pub fn run() -> u8 {
             code
         }
     }
+}
+
+/// Route W R0 (W0-B): emit the build-capabilities JSON document to stdout.
+///
+/// This is a pure capability/attestation query: it does NOT read any protected
+/// sample, start any debuggee, create any candidate, or touch the network. It
+/// reports the compile-time feature set so a controller can verify (before
+/// spawning an armed run) that the binary actually carries the GTO recovery
+/// route. `gto_product_recovery` is derived from the exact same
+/// `cfg!(feature = "gto-product-recovery")` check the production GTO gate uses,
+/// so the query and the runtime gate cannot diverge.
+#[must_use]
+pub fn build_capabilities_json() -> String {
+    format!(
+        "{{\n  \"schema_version\": \"mida.build-capabilities/v1\",\n  \
+         \"gto_product_recovery\": {},\n  \"profile\": {},\n  \"package\": {}\n}}",
+        if cfg!(feature = "gto-product-recovery") {
+            "true"
+        } else {
+            "false"
+        },
+        format_args!(
+            "{:?}",
+            std::env::var("PROFILE").unwrap_or_else(|_| "debug".into())
+        ),
+        format_args!("{:?}", NAME),
+    )
+}
+
+/// Print the build-capabilities JSON (W0-B) to stdout.
+pub fn print_build_capabilities_json() {
+    println!("{}", build_capabilities_json());
 }
 
 /// Print the CLI help/usage text (kept in lib so tests can assert on it).
@@ -227,5 +266,31 @@ mod tests {
         };
         let err: anyhow::Error = anyhow::Error::from(e);
         assert_eq!(exit_code_for_error(err.as_ref()), EXIT_FATAL);
+    }
+
+    // Route W R0 (W0-B): the build-capabilities query is a stable, parseable JSON
+    // document whose `gto_product_recovery` field exactly mirrors the compile-time
+    // feature flag (so default builds report false, feature builds report true).
+    #[test]
+    fn build_capabilities_json_is_valid_schema() {
+        let json = build_capabilities_json();
+        let v: serde_json::Value = serde_json::from_str(&json)
+            .unwrap_or_else(|e| panic!("build capabilities must be valid JSON: {e}\n{json}"));
+        assert_eq!(v["schema_version"], "mida.build-capabilities/v1");
+        assert_eq!(v["package"], NAME);
+        assert!(v.get("gto_product_recovery").is_some(), "missing field");
+        assert!(v.get("profile").is_some(), "missing field");
+    }
+
+    #[test]
+    fn build_capabilities_gto_flag_matches_cfg() {
+        let json = build_capabilities_json();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let expected = cfg!(feature = "gto-product-recovery");
+        assert_eq!(
+            v["gto_product_recovery"].as_bool(),
+            Some(expected),
+            "gto_product_recovery must mirror cfg!(feature=gto-product-recovery) = {expected}"
+        );
     }
 }
