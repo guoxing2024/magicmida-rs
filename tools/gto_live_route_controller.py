@@ -318,13 +318,25 @@ def decode_display(raw: bytes, label: str) -> Dict[str, Any]:
         }
 
 
-# Route V R0 (V0-B): match a GTO stage-telemetry log line and extract the
+# Route V R0 (V0-B) / X0-E: match a GTO stage-telemetry log line and extract the
 # stage name and event (enter|exit|error). The Rust CLI emits lines of the form:
-#   [HH:MM:SS] [INFO] stage=<name> event=<enter|exit|error> ... gto_stage_<event>
+#   [HH:MM:SS] [INFO] gto_stage_enter stage="capture_heap_slab" event="enter" ...
+# where the `tracing` field formatter may interleave ANSI SGR escapes around the
+# field names, the `=`, and the values, and the values are QUOTED.
+#
+# X0-E: strip ANSI escapes BEFORE field parsing, and accept both quoted and
+# unquoted field values. This is recording-only evidence; a parse failure or a
+# silent window must never be treated as an early-kill condition.
 _STAGE_RE = re.compile(rb"gto_stage_(\w+)\b")
 
-_STAGE_FIELD_RE = re.compile(rb"\bstage=([^\s\x1b]+)\b")
-_EVENT_FIELD_RE = re.compile(rb"\bevent=([^\s\x1b]+)\b")
+# After ANSI stripping: `stage="name"` or `stage=name`, and `event="e"` / `event=e`.
+_ANSI_ESC_RE = re.compile(rb"\x1b\[[0-9;]*m")
+_STAGE_FIELD_RE = re.compile(rb"\bstage=\"?([^\"\s]+)\"?\b")
+_EVENT_FIELD_RE = re.compile(rb"\bevent=\"?([^\"\s]+)\"?\b")
+
+
+def _strip_ansi(data: bytes) -> bytes:
+    return _ANSI_ESC_RE.sub(b"", data)
 
 
 def _sample_last_stage(stdout_raw_path: Path, stderr_raw_path: Path):
@@ -332,6 +344,8 @@ def _sample_last_stage(stdout_raw_path: Path, stderr_raw_path: Path):
 
     Returns ``(stage_name, event)`` or ``(None, None)`` if nothing parseable was
     found. This is evidence-only: it never influences success/failure decisions.
+    X0-E: ANSI escapes are stripped first; quoted or unquoted field values are
+    both accepted (e.g. stage="raw_slab_overlay" event="error").
     """
     tail = bytearray()
     for p in (stdout_raw_path, stderr_raw_path):
@@ -346,10 +360,11 @@ def _sample_last_stage(stdout_raw_path: Path, stderr_raw_path: Path):
             continue
     if not tail:
         return None, None
+    clean = _strip_ansi(bytes(tail))
     last_stage = None
     last_event = None
     # Scan line-by-line for the marker, keeping the last match.
-    for line in tail.splitlines():
+    for line in clean.splitlines():
         if _STAGE_RE.search(line) is None:
             continue
         m_stage = _STAGE_FIELD_RE.search(line)

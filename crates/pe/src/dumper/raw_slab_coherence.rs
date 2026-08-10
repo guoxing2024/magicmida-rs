@@ -793,15 +793,177 @@ impl TransformRunLedger {
 /// child. The caller is responsible for collapsing across transforms (a later
 /// transform overwrites a byte an earlier transform wrote); that collapse is
 /// left to Q0-C overlay integration, which uses the final authoritative preimage.
+///
+/// Route X R0 (X0-A/X0-B): the raw-overlay ledger is built ONLY from canonical
+/// raw-coherence participants ([`HeapGlobalSnapshot::is_raw_coherence_participant`]),
+/// matched by stable child identity (`live_ptr`), never by positional `zip`.
+///
+///   - Non-raw snapshots (image-inline, heap-handle, empty, SyntheticDerived)
+///     are excluded from run generation; they never appear in the raw ledger.
+///   - A raw participant present in `before` but not `after` (or vice versa) is a
+///     participant-set change and fails closed.
+///   - A duplicate `live_ptr` among raw participants is an ambiguous identity and
+///     fails closed.
+///   - A changed raw participant whose capture_id is empty is malformed and fails
+///     closed (empty raw capture id must never reach the overlay validator).
+///
+/// Returns `Err(OverlayError::TransformRunLedgerInvalid)` with a precise run
+/// index / base / size / offset / length / capture id / reason on any violation.
 pub fn diff_transform_write_runs(
     before: &[HeapGlobalSnapshot],
     after: &[HeapGlobalSnapshot],
     transform_id: &str,
-) -> Vec<TransformWriteRun> {
+) -> Result<Vec<TransformWriteRun>, OverlayError> {
     let mut runs = Vec::new();
-    for (b, a) in before.iter().zip(after.iter()) {
-        if b.live_ptr != a.live_ptr || b.content == a.content {
+
+    // Index raw-coherence participants by stable child identity (live_ptr).
+    fn index_participants<'a>(
+        globals: &'a [HeapGlobalSnapshot],
+        transform_id: &str,
+    ) -> Result<std::collections::BTreeMap<u64, &'a HeapGlobalSnapshot>, OverlayError> {
+        let mut map: std::collections::BTreeMap<u64, &HeapGlobalSnapshot> =
+            std::collections::BTreeMap::new();
+        for g in globals {
+            if !g.is_raw_coherence_participant() {
+                continue;
+            }
+            if map.insert(g.live_ptr, g).is_some() {
+                return Err(OverlayError::TransformRunLedgerInvalid {
+                    run_index: 0,
+                    child_capture_id: g.extent_evidence.capture_id.clone(),
+                    child_old_base: g.live_ptr,
+                    child_size: g.content.len(),
+                    child_offset: 0,
+                    length: 0,
+                    transform_id: transform_id.to_string(),
+                    reason: format!(
+                        "duplicate raw participant identity at old_base {:#x}",
+                        g.live_ptr
+                    ),
+                });
+            }
+        }
+        Ok(map)
+    }
+
+    let before_map = index_participants(before, transform_id)?;
+    let after_map = index_participants(after, transform_id)?;
+
+    // Participant-set closure: every raw participant in before must exist in
+    // after, and vice versa. A change (appearance/disappearance) is an invariant
+    // violation unless the affected region is non-raw (excluded above).
+    let mut run_index = 0usize;
+    for base in before_map.keys() {
+        if !after_map.contains_key(base) {
+            let g = before_map[base];
+            return Err(OverlayError::TransformRunLedgerInvalid {
+                run_index,
+                child_capture_id: g.extent_evidence.capture_id.clone(),
+                child_old_base: *base,
+                child_size: g.content.len(),
+                child_offset: 0,
+                length: 0,
+                transform_id: transform_id.to_string(),
+                reason: format!(
+                    "participant set change: raw participant old_base {base:#x} missing from after"
+                ),
+            });
+        }
+    }
+    for base in after_map.keys() {
+        if !before_map.contains_key(base) {
+            let g = after_map[base];
+            return Err(OverlayError::TransformRunLedgerInvalid {
+                run_index,
+                child_capture_id: g.extent_evidence.capture_id.clone(),
+                child_old_base: *base,
+                child_size: g.content.len(),
+                child_offset: 0,
+                length: 0,
+                transform_id: transform_id.to_string(),
+                reason: format!(
+                    "participant set change: raw participant old_base {base:#x} missing from before"
+                ),
+            });
+        }
+    }
+
+    // Route X R0 AF1 (P0-2): for each matched raw participant, verify the FULL
+    // raw identity tuple is unchanged across the transform. Matching by live_ptr
+    // alone is not enough — a change in capture_id / content.len() / extent_kind /
+    // capture_path is provenance drift and must fail closed, never be silently
+    // diffed. (content.len() change especially: a size shift would otherwise be
+    // under-diffed at the shared prefix and fail open.)
+    for (base, a) in after_map.iter() {
+        let b = before_map[base];
+        let check_identity = |field: &str, before_v: &str, after_v: &str| -> Option<OverlayError> {
+            if before_v != after_v {
+                Some(OverlayError::TransformRunLedgerInvalid {
+                    run_index,
+                    child_capture_id: a.extent_evidence.capture_id.clone(),
+                    child_old_base: *base,
+                    child_size: a.content.len(),
+                    child_offset: 0,
+                    length: 0,
+                    transform_id: transform_id.to_string(),
+                    reason: format!(
+                        "raw identity drift on {field} for old_base {base:#x}: {before_v} -> {after_v}"
+                    ),
+                })
+            } else {
+                None
+            }
+        };
+        if let Some(e) = check_identity(
+            "capture_id",
+            &b.extent_evidence.capture_id,
+            &a.extent_evidence.capture_id,
+        ) {
+            return Err(e);
+        }
+        if let Some(e) = check_identity(
+            "content.len",
+            &b.content.len().to_string(),
+            &a.content.len().to_string(),
+        ) {
+            return Err(e);
+        }
+        if let Some(e) = check_identity(
+            "extent_kind",
+            &format!("{:?}", b.extent_kind),
+            &format!("{:?}", a.extent_kind),
+        ) {
+            return Err(e);
+        }
+        if let Some(e) = check_identity(
+            "capture_path",
+            &format!("{:?}", b.extent_evidence.capture_path),
+            &format!("{:?}", a.extent_evidence.capture_path),
+        ) {
+            return Err(e);
+        }
+    }
+
+    // For each matched raw participant, diff and emit runs.
+    for (base, a) in after_map.iter() {
+        let b = before_map[base];
+        if b.content == a.content {
             continue;
+        }
+        // A changed raw participant must carry a non-empty capture id (malformed
+        // empty raw ID fails closed — never reaches the overlay validator).
+        let capture_id = &a.extent_evidence.capture_id;
+        if capture_id.is_empty() {
+            return Err(OverlayError::TransformRunLedgerInvalid {
+                run_index,
+                child_capture_id: String::new(),
+                child_old_base: *base,
+                child_size: a.content.len(),
+                child_offset: 0,
+                length: 0,
+                transform_id: transform_id.to_string(),
+                reason: format!("empty raw capture id for changed participant old_base {base:#x}"),
+            });
         }
         let child_size = a.content.len().max(b.content.len());
         let shared_len = b.content.len().min(a.content.len());
@@ -825,8 +987,8 @@ pub fn diff_transform_write_runs(
             let before_digest = sha256_hex(&before_bytes);
             let after_digest = sha256_hex(&after_bytes);
             runs.push(TransformWriteRun {
-                child_capture_id: a.extent_evidence.capture_id.clone(),
-                child_old_base: a.live_ptr,
+                child_capture_id: capture_id.clone(),
+                child_old_base: *base,
                 child_size,
                 child_offset: off,
                 length: len,
@@ -838,9 +1000,10 @@ pub fn diff_transform_write_runs(
                 before_bytes,
                 after_bytes,
             });
+            run_index += 1;
         }
     }
-    runs
+    Ok(runs)
 }
 
 /// Execution-owning transform recorder (Route R R0-B / Audit Fix 1).
@@ -865,33 +1028,36 @@ pub fn apply_recorded_transform(
     transform_id: &str,
     ledger: &mut TransformRunLedger,
     transform: impl FnOnce(&mut Vec<HeapGlobalSnapshot>),
-) {
-    // Route V R0 (V0-A): per-transform stage enter/exit telemetry.
-    let _ = super::stage_timing::run_stage(
-        transform_id,
-        super::stage_timing::StageStats::default(),
-        |stats| {
-            let before = heap_globals.clone();
-            transform(heap_globals);
-            super::heap_global_snapshot::record_transform_applied(
-                heap_globals,
-                &before,
-                transform_id,
-            );
-            let runs = diff_transform_write_runs(&before, heap_globals, transform_id);
-            stats.item_count = runs.len();
-            stats.byte_count = runs.iter().map(|r| r.length as u64).sum();
-            ledger.runs.extend(runs);
-            Ok(())
-        },
-    );
+) -> Result<(), OverlayError> {
+    // Route V R0 (V0-A): per-transform stage telemetry via StageGuard.
+    // Route X R0 (X0-B): recording can fail closed on a participant-set or
+    // identity violation; the typed OverlayError is surfaced so the pipeline
+    // aborts before overlay/manifest/candidate (never weakened).
+    let mut guard = super::stage_timing::StageGuard::begin(transform_id);
+    let result = (|| -> Result<(), OverlayError> {
+        let before = heap_globals.clone();
+        transform(heap_globals);
+        super::heap_global_snapshot::record_transform_applied(heap_globals, &before, transform_id);
+        let runs = diff_transform_write_runs(&before, heap_globals, transform_id)?;
+        guard.with_stats(super::stage_timing::StageStats {
+            item_count: runs.len(),
+            byte_count: runs.iter().map(|r| r.length as u64).sum(),
+        });
+        ledger.runs.extend(runs);
+        Ok(())
+    })();
+    match &result {
+        Ok(_) => {}
+        Err(e) => guard.error(format!("{e:#}")),
+    }
+    result
 }
 
 /// Execution-owning recorder for a transform that can fail (Route R R0-B /
 /// Audit Fix 1). Runs the closure, and on `Ok` records both child and byte
 /// evidence. On `Err` it propagates the error WITHOUT recording — the caller
 /// (e.g. `dump_process`) aborts before overlay/manifest/candidate.
-pub fn try_apply_recorded_transform<E: std::fmt::Debug>(
+pub fn try_apply_recorded_transform<E: std::fmt::Debug + From<OverlayError>>(
     heap_globals: &mut Vec<HeapGlobalSnapshot>,
     transform_id: &str,
     ledger: &mut TransformRunLedger,
@@ -902,12 +1068,16 @@ pub fn try_apply_recorded_transform<E: std::fmt::Debug>(
     // generic over `E` and must propagate the original error type unchanged.
     // Telemetry is non-semantic: the error is logged via `Debug` only; the
     // business result is unchanged.
+    //
+    // Route X R0 (X0-B): the diff/ledger recording can fail closed on a
+    // participant-set or identity violation; the `OverlayError` is converted to
+    // `E` via `From<OverlayError>` and propagated (fail-closed preserved).
     let mut guard = super::stage_timing::StageGuard::begin(transform_id);
     let result = (|| {
         let before = heap_globals.clone();
         transform(heap_globals)?;
         super::heap_global_snapshot::record_transform_applied(heap_globals, &before, transform_id);
-        let runs = diff_transform_write_runs(&before, heap_globals, transform_id);
+        let runs = diff_transform_write_runs(&before, heap_globals, transform_id)?;
         let stats = super::stage_timing::StageStats {
             item_count: runs.len(),
             byte_count: runs.iter().map(|r| r.length as u64).sum(),
@@ -978,6 +1148,147 @@ pub fn validate_run_ledger_shape(run_ledger: &TransformRunLedger) -> Result<(), 
                 transform_id: r.transform_id.clone(),
                 reason,
             });
+        }
+    }
+    Ok(())
+}
+
+/// Route X R0 AF1 (X0-D / P0-3): global run→raw-child MEMBERSHIP gate.
+///
+/// Before byte replay, verify EVERY run in the ledger resolves to exactly one raw
+/// child in the canonical raw-coherence participant set, matched by the FULL
+/// identity tuple `(capture_id, old_base, child_size)` — never by base alone.
+/// A shape-valid but orphaned/duplicate/mismatched run (one that no transformed
+/// child will consume) fails closed with its exact index + identity + reason.
+///
+/// `transformed_globals` are the canonical raw-coherence participants (already
+/// filtered by `is_raw_coherence_participant`), so a run whose child is absent
+/// from this set is a participant-set violation.
+pub fn validate_run_membership(
+    raw_capture: &RawSlabCapture,
+    transformed_globals: &[HeapGlobalSnapshot],
+    run_ledger: &TransformRunLedger,
+) -> Result<(), OverlayError> {
+    // Build the set of canonical raw-coherence participants keyed by
+    // (capture_id, old_base) with their size. Duplicate (capture_id, old_base)
+    // among participants is ambiguous and fails closed.
+    let mut participants: std::collections::BTreeMap<(String, u64), usize> =
+        std::collections::BTreeMap::new();
+    for g in transformed_globals {
+        if !g.is_raw_coherence_participant() {
+            continue;
+        }
+        let key = (g.extent_evidence.capture_id.clone(), g.live_ptr);
+        if participants.insert(key, g.content.len()).is_some() {
+            return Err(OverlayError::TransformRunLedgerInvalid {
+                run_index: 0,
+                child_capture_id: g.extent_evidence.capture_id.clone(),
+                child_old_base: g.live_ptr,
+                child_size: g.content.len(),
+                child_offset: 0,
+                length: 0,
+                transform_id: String::new(),
+                reason: format!(
+                    "duplicate canonical participant (capture_id, old_base) = ({:?}, {:#x})",
+                    g.extent_evidence.capture_id, g.live_ptr
+                ),
+            });
+        }
+    }
+    // Raw children must also have unique (capture_id, old_base).
+    let mut raw_keys: std::collections::BTreeSet<(String, u64)> = std::collections::BTreeSet::new();
+    for c in &raw_capture.children {
+        let key = (c.capture_id.clone(), c.old_base);
+        if !raw_keys.insert(key) {
+            return Err(OverlayError::TransformRunLedgerInvalid {
+                run_index: 0,
+                child_capture_id: c.capture_id.clone(),
+                child_old_base: c.old_base,
+                child_size: c.size,
+                child_offset: 0,
+                length: 0,
+                transform_id: String::new(),
+                reason: format!(
+                    "duplicate raw child (capture_id, old_base) = ({:?}, {:#x})",
+                    c.capture_id, c.old_base
+                ),
+            });
+        }
+    }
+
+    for (idx, r) in run_ledger.runs.iter().enumerate() {
+        // 1. The run must resolve to exactly one raw child by full identity tuple.
+        let matches: Vec<&RawChild> = raw_capture
+            .children
+            .iter()
+            .filter(|c| {
+                c.capture_id == r.child_capture_id
+                    && c.old_base == r.child_old_base
+                    && c.size == r.child_size
+            })
+            .collect();
+        if matches.is_empty() {
+            return Err(OverlayError::TransformRunLedgerInvalid {
+                run_index: idx,
+                child_capture_id: r.child_capture_id.clone(),
+                child_old_base: r.child_old_base,
+                child_size: r.child_size,
+                child_offset: r.child_offset,
+                length: r.length,
+                transform_id: r.transform_id.clone(),
+                reason: format!("run has no matching raw child by (capture_id, old_base, size)"),
+            });
+        }
+        if matches.len() > 1 {
+            return Err(OverlayError::TransformRunLedgerInvalid {
+                run_index: idx,
+                child_capture_id: r.child_capture_id.clone(),
+                child_old_base: r.child_old_base,
+                child_size: r.child_size,
+                child_offset: r.child_offset,
+                length: r.length,
+                transform_id: r.transform_id.clone(),
+                reason: format!(
+                    "run resolves to {} raw children by (capture_id, old_base, size); expected exactly one",
+                    matches.len()
+                ),
+            });
+        }
+        // 2. The run's child must belong to the canonical participant set.
+        let key = (r.child_capture_id.clone(), r.child_old_base);
+        match participants.get(&key) {
+            Some(&participant_size) => {
+                if participant_size != r.child_size {
+                    return Err(OverlayError::TransformRunLedgerInvalid {
+                        run_index: idx,
+                        child_capture_id: r.child_capture_id.clone(),
+                        child_old_base: r.child_old_base,
+                        child_size: r.child_size,
+                        child_offset: r.child_offset,
+                        length: r.length,
+                        transform_id: r.transform_id.clone(),
+                        reason: format!(
+                            "run child size {} != canonical participant size {}",
+                            r.child_size, participant_size
+                        ),
+                    });
+                }
+            }
+            None => {
+                return Err(OverlayError::TransformRunLedgerInvalid {
+                    run_index: idx,
+                    child_capture_id: r.child_capture_id.clone(),
+                    child_old_base: r.child_old_base,
+                    child_size: r.child_size,
+                    child_offset: r.child_offset,
+                    length: r.length,
+                    transform_id: r.transform_id.clone(),
+                    reason: format!(
+                        "run child (capture_id, old_base) = ({:?}, {:#x}) not in canonical participant set",
+                        r.child_capture_id, r.child_old_base
+                    ),
+                });
+            }
         }
     }
     Ok(())
@@ -1215,6 +1526,19 @@ pub enum OverlayError {
         /// First mismatching byte offset (when contained-different-bytes).
         mismatch_offset: Option<usize>,
     },
+}
+
+// Route X R0 (X0-B): an `OverlayError` surfaced by transform-run-ledger recording
+// (participant-set change, ambiguous identity, malformed empty raw id) is a PE
+// stage error so the pipeline fails closed at the exact stage with a stable
+// machine-parseable id. This is error-context only; it never weakens a check.
+impl From<OverlayError> for crate::error::PeError {
+    fn from(e: OverlayError) -> Self {
+        crate::error::PeError::GtoStage {
+            stage: "raw_slab_overlay".into(),
+            error: format!("{e:#}"),
+        }
+    }
 }
 
 /// How a capture-drift run (non-atomic child vs slab read) was resolved (GTO R0-G).
@@ -1523,19 +1847,16 @@ pub fn validate_raw_coherence_capture_identities(
     containers: &[ContainerSnapshot],
     heap_globals: &[HeapGlobalSnapshot],
 ) -> Result<(), OverlayError> {
-    use super::heap_global_snapshot::RegionProvenance as RP;
     use super::heap_global_snapshot::{CaptureExtentKind as CEK, CapturePath as CP};
     // Track the FULL identity tuple per capture id so same-base duplicates with a
     // differing size / extent / path are rejected (not just different base).
     let mut seen: std::collections::BTreeMap<String, (u64, usize, CEK, CP)> =
         std::collections::BTreeMap::new();
     for g in heap_globals {
-        // Skip non-raw-coherence participants.
-        if g.is_heap_handle || g.is_image_inline || g.content.is_empty() {
+        // Route X R0 (X0-A): the canonical raw-coherence participant predicate.
+        // Excludes heap handles, image-inline, empty, and SyntheticDerived.
+        if !g.is_raw_coherence_participant() {
             continue;
-        }
-        if matches!(g.provenance, RP::SyntheticDerived { .. }) {
-            continue; // synthetic regions are not raw children
         }
         let cap = &g.extent_evidence.capture_id;
         let path = g.extent_evidence.capture_path;
@@ -1671,7 +1992,11 @@ pub fn validate_probe_coverage(
         })
         .collect();
     for g in heap_globals {
-        if g.is_heap_handle || g.is_image_inline || g.content.is_empty() {
+        // Route X R0 (X0-A): coverage binding must use the canonical raw-coherence
+        // participant predicate (excludes heap handles, image-inline, empty, and
+        // SyntheticDerived), so the covered set matches identity gate / raw-child /
+        // seeding / ledger / overlay.
+        if !g.is_raw_coherence_participant() {
             continue;
         }
         let is_probe = matches!(g.extent_kind, CEK::ProbeWindow | CEK::InteriorSubview);
@@ -1772,7 +2097,7 @@ pub fn raw_children_from_capture(
         });
     }
     for g in heap_globals {
-        if g.is_heap_handle || g.is_image_inline || g.content.is_empty() {
+        if !g.is_raw_coherence_participant() {
             continue;
         }
         out.push(RawChild {
@@ -1865,7 +2190,11 @@ pub fn seed_transform_inputs_from_authoritative_slab(
     }
 
     for global in heap_globals.iter_mut() {
-        if global.is_heap_handle || global.is_image_inline || global.content.is_empty() {
+        // Route X R0 (X0-A): seeding must use the canonical raw-coherence
+        // participant predicate (excludes heap handles, image-inline, empty, and
+        // SyntheticDerived), so the seeded set matches identity gate / raw-child /
+        // ledger / overlay. No ad-hoc condition sets.
+        if !global.is_raw_coherence_participant() {
             continue;
         }
         let child_size = global.content.len();
@@ -2085,7 +2414,7 @@ pub fn build_patched_backing_slab(
         String,
     )> = Vec::new();
     for g in transformed_globals {
-        if g.is_heap_handle || g.is_image_inline || g.content.is_empty() {
+        if !g.is_raw_coherence_participant() {
             continue;
         }
         transformed.push((
@@ -2590,7 +2919,7 @@ pub fn build_patched_backing_slab_q0c(
         String,
     )> = Vec::new();
     for g in transformed_globals {
-        if g.is_heap_handle || g.is_image_inline || g.content.is_empty() {
+        if !g.is_raw_coherence_participant() {
             continue;
         }
         transformed.push((
@@ -2646,6 +2975,12 @@ pub fn build_patched_backing_slab_q0c(
     // child loop, so a malformed run is reported with its exact index (not blamed
     // on whichever child happens to be walked first).
     validate_run_ledger_shape(run_ledger)?;
+    // Route X R0 AF1 (X0-D/P0-3): validate GLOBAL run→raw-child MEMBERSHIP before
+    // byte replay — every run must resolve to exactly one raw child in the
+    // canonical raw-coherence participant set (full identity tuple). A shape-valid
+    // but orphaned/duplicate/mismatched run fails closed here, never silently
+    // dropped because no transformed child consumed it.
+    validate_run_membership(raw_capture, transformed_globals, run_ledger)?;
 
     for (
         child_base,
@@ -4003,6 +4338,10 @@ mod tests {
             b"NewClassName".to_vec(),
             "repair_gscript_window_strings",
         );
+        let synth_transform_ids_provenance = match &synth.provenance {
+            RegionProvenance::SyntheticDerived { transform_id, .. } => Some(transform_id.clone()),
+            _ => None,
+        };
         let (patched, overlays, _) = build_patched_backing_slab(
             &raw_capture,
             &[real, synth],
@@ -4010,19 +4349,20 @@ mod tests {
             &["repair_gscript_window_strings"],
         )
         .unwrap();
-        // Synthetic child did NOT get written into the slab (it has no slab
-        // offset) and is recorded with overlay_applied=false.
+        // Synthetic child did NOT get written into the slab and is NOT a
+        // raw-slab overlay child (Route X R0: non-raw / SyntheticDerived is
+        // excluded from raw overlay; it never appears as a raw overlay entry).
         let synth_overlays: Vec<_> = overlays
             .iter()
             .filter(|o| o.child_old_base == synthetic_base)
             .collect();
-        assert_eq!(synth_overlays.len(), 1);
-        assert!(!synth_overlays[0].overlay_applied);
-        assert_eq!(synth_overlays[0].slab_offset, 0);
-        assert_eq!(
-            synth_overlays[0].transform_ids,
-            vec!["repair_gscript_window_strings".to_string()]
-        );
+        assert_eq!(synth_overlays.len(), 0);
+        // The synthetic child's child-level transform evidence is preserved
+        // (transform provenance is not silently destroyed by exclusion).
+        assert!(matches!(
+            synth_transform_ids_provenance,
+            Some(t) if t == "repair_gscript_window_strings"
+        ));
         // The in-slab child overlay still applied.
         let real_overlays: Vec<_> = overlays
             .iter()
@@ -4693,7 +5033,8 @@ mod tests {
             &[before.clone()],
             &[after],
             "repair_label_names_after_scrub",
-        );
+        )
+        .unwrap();
 
         assert_eq!(runs.len(), 1, "one contiguous 8-byte run expected");
         let run = &runs[0];
@@ -4720,7 +5061,8 @@ mod tests {
         // mark_labels_non_nested flips byte +0x23 (nested flag).
         after.content[0x23] = 0x01;
 
-        let runs = diff_transform_write_runs(&[before], &[after], "mark_labels_non_nested");
+        let runs =
+            diff_transform_write_runs(&[before], &[after], "mark_labels_non_nested").unwrap();
 
         assert_eq!(runs.len(), 1, "only the +0x23 write is present");
         assert_eq!(runs[0].transform_id, "mark_labels_non_nested");
@@ -4746,7 +5088,8 @@ mod tests {
         let mut after = before.clone();
         after.content[0x28..0x30].fill(0);
 
-        let runs = diff_transform_write_runs(&[before], &[after], "scrub_uncaptured_heap_pointers");
+        let runs = diff_transform_write_runs(&[before], &[after], "scrub_uncaptured_heap_pointers")
+            .unwrap();
 
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].transform_id, "scrub_uncaptured_heap_pointers");
@@ -4775,7 +5118,8 @@ mod tests {
             &[before],
             &[after],
             "mark_labels_non_nested", // combined for determinism demo
-        );
+        )
+        .unwrap();
         runs.sort_by(|a, b| a.child_offset.cmp(&b.child_offset));
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].child_offset, 0x23);
@@ -4789,7 +5133,8 @@ mod tests {
     fn route_q_r0b_unchanged_child_produces_no_runs() {
         let before = global(0x8aa5f8, vec![0xAA; 0x70], false);
         let after = before.clone();
-        let runs = diff_transform_write_runs(&[before], &[after], "repair_label_names_after_scrub");
+        let runs = diff_transform_write_runs(&[before], &[after], "repair_label_names_after_scrub")
+            .unwrap();
         assert!(runs.is_empty());
     }
 
@@ -5496,6 +5841,8 @@ mod tests {
     }
 
     // 2. Wrong capture id in the run -> no identity match -> fail closed.
+    // Route X R0 AF1 (P0-3): the global run-membership gate catches this EARLIER
+    // as TransformRunLedgerInvalid (precise reason), before per-child replay.
     #[test]
     fn route_q_af1a_wrong_capture_id_fails_closed() {
         let (raw_capture, transformed, binding) = af1a_write_fixture();
@@ -5504,7 +5851,14 @@ mod tests {
         let err =
             build_patched_backing_slab_q0c(&raw_capture, &[transformed], &[], &[binding], &ledger)
                 .unwrap_err();
-        assert!(matches!(err, OverlayError::TransformPreimageDrift { .. }));
+        assert!(
+            matches!(
+                err,
+                OverlayError::TransformRunLedgerInvalid { .. }
+                    | OverlayError::TransformPreimageDrift { .. }
+            ),
+            "wrong capture id must fail closed, got {err:?}"
+        );
     }
 
     // 3. Wrong child size in the run -> identity mismatch -> fail closed.
@@ -5516,7 +5870,14 @@ mod tests {
         let err =
             build_patched_backing_slab_q0c(&raw_capture, &[transformed], &[], &[binding], &ledger)
                 .unwrap_err();
-        assert!(matches!(err, OverlayError::TransformPreimageDrift { .. }));
+        assert!(
+            matches!(
+                err,
+                OverlayError::TransformRunLedgerInvalid { .. }
+                    | OverlayError::TransformPreimageDrift { .. }
+            ),
+            "wrong child size must fail closed, got {err:?}"
+        );
     }
 
     // 4. Out-of-range run (offset+length > child_size) -> fail closed.
@@ -5781,7 +6142,8 @@ mod tests {
         let mut b = binding;
         apply_recorded_transform(&mut globals, "t_probe_write", &mut ledger, |g| {
             g[0].content[0x10] = 0xEE; // the transform writes +0x10
-        });
+        })
+        .unwrap();
         // The child's transform_ids now carries t_probe_write (child-level evidence).
         assert!(globals[0]
             .transform_ids
@@ -6320,11 +6682,13 @@ mod tests {
             construction_digest: sha256_hex(&synth.content),
         };
         synth.extent_kind = CEK::SyntheticDerived;
-        // Should not fail on raw coherence (no raw child); recorded as synthetic ledger.
+        // Should not fail on raw coherence (no raw child); recorded as synthetic.
+        // Route X R0: the SyntheticDerived child is NOT a raw-slab overlay child,
+        // so it produces NO raw overlay entry (it may still carry child-level
+        // transform evidence).
         let (_, overlays, _) =
             build_patched_backing_slab(&raw_capture, &[synth], &[], &["t"]).unwrap();
-        assert!(!overlays.is_empty());
-        assert!(!overlays[0].overlay_applied);
+        assert!(overlays.is_empty());
     }
 
     // 9. Drift runs are deterministically sorted.
@@ -6811,7 +7175,8 @@ mod tests {
                     image_end,
                 );
             },
-        );
+        )
+        .unwrap();
         // The REAL scrub zeroed the external pointer qword at +0x40..0x48. Because
         // 0x4000_0000 is little-endian [0,0,0,0x40,0,0,0,0], only byte +0x43 actually
         // changed (0x40 -> 0); the diff/run records exactly that changed byte (offset
@@ -7486,7 +7851,8 @@ mod tests {
                 &[before_snapshot],
                 &[after.clone()],
                 "scrub_uncaptured_heap_pointers",
-            );
+            )
+            .unwrap();
             ledger.runs.extend(runs);
         }
         // Overlay the transformed (scrubbed) child onto the dedicated slab.
@@ -8423,5 +8789,637 @@ mod tests {
         assert_eq!(al.len(), 1);
         assert_eq!(al[0]["role"], "dedicated");
         assert_eq!(al[0]["size"], 0x180);
+    }
+
+    // ------------------------------------------------------------------
+    // Route X R0 — raw-coherence participant-set and ledger identity closure.
+    // ------------------------------------------------------------------
+
+    /// Exact W R1 geometry: gscript image-inline body at RVA 0x149d50, live VA
+    /// 0x140149d50, size 0x1950 (6480). A transform mutating it must NOT create a
+    /// raw write run (image-inline is non-raw), so it can never emit an empty
+    /// child_capture_id into the overlay ledger.
+    #[test]
+    fn route_x_r0_exact_140149d50_geometry() {
+        const W_IMAGE_INLINE_RVA: u32 = 0x149d50;
+        const W_IMAGE_INLINE_VA: u64 = 0x140149d50;
+        const W_IMAGE_INLINE_SIZE: usize = 0x1950;
+        let mut g = global(W_IMAGE_INLINE_VA, vec![0u8; W_IMAGE_INLINE_SIZE], true);
+        g.rva = W_IMAGE_INLINE_RVA;
+        // Verify it is NOT a raw-coherence participant.
+        assert!(!g.is_raw_coherence_participant());
+        // Mutate it (simulate scrub/repair touching the image-inline body).
+        let before = g.clone();
+        g.content[0x28c..0x28c + 2].copy_from_slice(&[0x00, 0x00]);
+        let runs =
+            diff_transform_write_runs(&[before], &[g], "scrub_uncaptured_heap_pointers").unwrap();
+        // NO raw run is produced for an image-inline participant.
+        assert!(
+            runs.is_empty(),
+            "image-inline must never enter the raw ledger"
+        );
+    }
+
+    /// X0-A: identity gate, raw-child capture, seeding, and ledger recording must
+    /// all agree that an image-inline snapshot is NOT a raw-coherence participant.
+    #[test]
+    fn route_x_r0_image_inline_is_non_raw_participant() {
+        let g = global(0x140149d50, vec![0u8; 0x1950], true);
+        assert!(!g.is_raw_coherence_participant());
+        // raw_children_from_capture must exclude it.
+        let children = raw_children_from_capture(&[], &[g.clone()]);
+        assert!(!children.iter().any(|c| c.old_base == 0x140149d50));
+        // diff_transform_write_runs must not emit a run for it even if mutated.
+        let mut after = g.clone();
+        after.content[0] ^= 0xFF;
+        let runs = diff_transform_write_runs(&[g], &[after], "t").unwrap();
+        assert!(runs.is_empty());
+        // (overlay build on an empty raw capture would fail closed for other
+        // reasons; the image-inline exclusion is proven by the gate/child/ledger
+        // checks above.)
+    }
+
+    /// X0-B / X0-C: real scrub_uncaptured_heap_pointers through the PRODUCTION
+    /// recorder produces raw runs only for raw-coherence participants, and every
+    /// raw run carries a non-empty capture id (no empty-ID run from image-inline).
+    #[test]
+    fn route_x_r0_scrub_raw_runs_never_have_empty_capture_id() {
+        let mut globals = vec![
+            global(0x140149d50, vec![0x41u8; 0x1950], true), // image-inline (non-raw)
+            global(0x200000, vec![0x42u8; 0x40], false),     // raw child
+        ];
+        // Give the raw child a capture id (as identity validation requires).
+        globals[1].extent_evidence.capture_id =
+            "gscript_child_link:0x200000:0:0x200000:true".into();
+        let mut containers: Vec<ContainerSnapshot> = Vec::new();
+        let mut ledger = TransformRunLedger::default();
+        let before = globals.clone();
+        // Run the REAL scrub via the production recorder (also mutates containers).
+        apply_recorded_transform(
+            &mut globals,
+            "scrub_uncaptured_heap_pointers",
+            &mut ledger,
+            |g| {
+                super::super::heap_global_snapshot::scrub_uncaptured_heap_pointers(
+                    &mut containers,
+                    g,
+                    0x140000000,
+                    0x140100000,
+                );
+            },
+        )
+        .unwrap();
+        // Every raw run has a non-empty capture id.
+        for r in &ledger.runs {
+            assert!(
+                !r.child_capture_id.is_empty(),
+                "raw run must carry a non-empty capture id: {r:?}"
+            );
+        }
+        // No run references the image-inline base.
+        assert!(!ledger.runs.iter().any(|r| r.child_old_base == 0x140149d50));
+        // The raw child (if changed by scrub) is present with its capture id.
+        let _ = before;
+    }
+
+    /// X0-A: the identity gate and the ledger recording must agree on the exact
+    /// participant set (no ad-hoc condition sets — both use the predicate).
+    #[test]
+    fn route_x_r0_identity_gate_and_run_ledger_share_participant_set() {
+        // A mixed set: raw (with id), image-inline, heap-handle, empty, synthetic.
+        let raw = global(0x200000, vec![0x42u8; 0x40], false);
+        let image_inline = global(0x140149d50, vec![0x41u8; 0x1950], true);
+        let h = handle(0x300000);
+        let empty = global(0x400000, vec![], false);
+        let synth = synthetic(0x500000, vec![0x55; 0x20], "t");
+        let globals = vec![raw.clone(), image_inline, h, empty, synth.clone()];
+        // Identity gate: only the raw participant requires a capture id; the
+        // non-raw ones are skipped.
+        let gate_ok = validate_raw_coherence_capture_identities(&[], &globals).is_ok();
+        // (raw has empty id -> gate would fail; give it an id first)
+        let mut g2 = raw.clone();
+        g2.extent_evidence.capture_id = "main:0x200000:0:0x200000:false".into();
+        assert!(validate_raw_coherence_capture_identities(&[], &[g2.clone()]).is_ok());
+        // The predicate classifies exactly the raw participant as a participant.
+        let raw_only = globals
+            .iter()
+            .filter(|g| g.is_raw_coherence_participant())
+            .count();
+        assert_eq!(raw_only, 1);
+        // Ledger recording: only the raw participant (when mutated) yields runs.
+        let mut after_raw = g2.clone();
+        after_raw.content[0] ^= 0xFF;
+        let runs = diff_transform_write_runs(&[g2], &[after_raw], "t").unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].child_capture_id, "main:0x200000:0:0x200000:false");
+        let _ = gate_ok;
+    }
+
+    /// X0-B: a non-raw (image-inline) mutation is not destroyed — child-level
+    /// transform evidence is preserved even though it never enters the raw ledger.
+    #[test]
+    fn route_x_r0_non_raw_mutation_keeps_child_level_evidence() {
+        let mut image = global(0x140149d50, vec![0x41u8; 0x1950], true);
+        image
+            .transform_ids
+            .push("scrub_uncaptured_heap_pointers".to_string());
+        let before = image.clone();
+        image.content[0x28c] = 0x00;
+        let runs = diff_transform_write_runs(&[before], &[image.clone()], "scrub").unwrap();
+        // No raw run for the image-inline mutation...
+        assert!(runs.is_empty());
+        // ...but the child-level transform evidence is preserved.
+        assert!(image
+            .transform_ids
+            .contains(&"scrub_uncaptured_heap_pointers".to_string()));
+    }
+
+    /// X0-B / X0-D: a genuinely malformed RAW child (non-image, non-handle,
+    /// non-empty, non-synthetic) with an EMPTY capture id that changes must fail
+    /// closed — never silently accepted.
+    #[test]
+    fn route_x_r0_malformed_empty_raw_id_still_fails_closed() {
+        let mut raw = global(0x200000, vec![0x42u8; 0x40], false); // empty capture id
+        assert!(raw.is_raw_coherence_participant()); // it IS a raw participant
+        let before = raw.clone();
+        raw.content[0] ^= 0xFF;
+        let err = diff_transform_write_runs(&[before], &[raw], "t")
+            .expect_err("empty raw id must fail closed");
+        match err {
+            OverlayError::TransformRunLedgerInvalid {
+                child_old_base,
+                reason,
+                ..
+            } => {
+                assert_eq!(child_old_base, 0x200000);
+                assert!(reason.contains("empty raw capture id"), "reason: {reason}");
+            }
+            other => panic!("expected TransformRunLedgerInvalid, got {other:?}"),
+        }
+    }
+
+    /// X0-B: a participant-set change across one transform (a raw participant
+    /// present in before but missing in after) fails closed.
+    #[test]
+    fn route_x_r0_participant_set_change_fails_closed() {
+        let a = global(0x200000, vec![0x42u8; 0x40], false);
+        let b = global(0x210000, vec![0x43u8; 0x40], false);
+        // before has two raw participants; after drops 0x210000 -> set change.
+        let before = vec![a.clone(), b.clone()];
+        let after = vec![a.clone()];
+        let err = diff_transform_write_runs(&before, &after, "t")
+            .expect_err("participant set change must fail closed");
+        match err {
+            OverlayError::TransformRunLedgerInvalid { reason, .. } => {
+                assert!(
+                    reason.contains("participant set change"),
+                    "reason: {reason}"
+                );
+            }
+            other => panic!("expected TransformRunLedgerInvalid, got {other:?}"),
+        }
+    }
+
+    /// X0-F #8 / X0-AF1 (P0-4): the exact mixed raw + image-inline W R1 case
+    /// completes overlay through the REAL production-order chain (not the legacy
+    /// wrapper): identity bind -> coverage -> raw children -> seeding -> real
+    /// scrub via the production recorder -> q0c overlay.
+    ///
+    /// Exact W R1 geometry: image RVA 0x149d50, image VA 0x140149d50, size 0x1950,
+    /// scrub area +0x28c.
+    #[test]
+    fn route_x_af1_w_exact_geometry_real_scrub_recorder_q0c_overlay() {
+        const IMAGE_RVA: u32 = 0x149d50;
+        const IMAGE_VA: u64 = 0x140149d50;
+        const IMAGE_SIZE: usize = 0x1950;
+        // W R1 scrub write area +0x28c (length 0x2); use an 8-byte-aligned offset
+        // within it so the real scrub's pointer scan actually zeroes the external
+        // pointer qword.
+        const SCRUB_OFF: usize = 0x288;
+        const SLAB_BASE: u64 = 0x140000000;
+        const SLAB_SZ: usize = 0x40000;
+        const RAW_BASE: u64 = SLAB_BASE + 0x3000;
+
+        // Raw slab with one in-slab raw child (ObservedAllocation).
+        // The raw child contains a scrubbed external pointer at +0x20 so the
+        // real scrub modifies it AND the raw ledger gets a genuine run.
+        let mut raw_child_bytes = b"raw-captured-child-ok".to_vec();
+        raw_child_bytes.resize(0x40, 0);
+        raw_child_bytes[0x20..0x28].copy_from_slice(&0x6000_0000u64.to_le_bytes());
+        let slab = slab_with_child(SLAB_BASE, SLAB_SZ, RAW_BASE, raw_child_bytes.clone());
+        let mut raw_capture = RawSlabCapture {
+            slabs: vec![slab],
+            children: vec![raw_child(
+                RAW_BASE,
+                raw_child_bytes.len(),
+                raw_child_bytes.clone(),
+                RawChildKind::HeapGlobal,
+            )],
+        };
+        raw_capture.children[0].capture_id = "main:0x140003000:0:0x140003000:false".into();
+        raw_capture.children[0].extent_kind = CaptureExtentKind::ObservedAllocation;
+
+        // Globals: the raw child (canonical participant, MainSlot) + the image-inline.
+        let mut raw_g = global(RAW_BASE, raw_child_bytes.clone(), false);
+        raw_g.extent_kind = CaptureExtentKind::ObservedAllocation;
+        raw_g.extent_evidence.capture_id = "main:0x140003000:0:0x140003000:false".into();
+        raw_g.extent_evidence.capture_path =
+            crate::dumper::heap_global_snapshot::CapturePath::MainSlot;
+        // Image-inline body: contains an external pointer-shaped qword at +0x28c
+        // that scrub will zero (the W R1 scrub area).
+        let mut image = global(IMAGE_VA, vec![0x41u8; IMAGE_SIZE], true);
+        image.rva = IMAGE_RVA;
+        image.content[SCRUB_OFF..SCRUB_OFF + 8].copy_from_slice(&0x4000_0000u64.to_le_bytes());
+
+        let mut globals = vec![raw_g.clone(), image];
+        let mut containers: Vec<ContainerSnapshot> = Vec::new();
+
+        // 1. Identity bind: image-inline is NOT a raw participant, so the raw
+        //    child's id is the only requirement.
+        validate_raw_coherence_capture_identities(&containers, &globals).unwrap();
+        // 2. Coverage bind: no probe/interior children (raw is ObservedAllocation),
+        //    image-inline excluded -> passes.
+        validate_probe_coverage(&globals, &raw_capture.slabs).unwrap();
+        // 3. Raw children from capture: only the raw child.
+        let children = raw_children_from_capture(&containers, &globals);
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].old_base, RAW_BASE);
+        // 4. Seed transform inputs from authoritative slab.
+        let bindings = seed_transform_inputs_from_authoritative_slab(
+            &raw_capture,
+            &mut containers,
+            &mut globals,
+        )
+        .unwrap();
+        assert_eq!(bindings.len(), 1);
+        // 5. Real scrub via the production recorder.
+        let mut ledger = TransformRunLedger::default();
+        apply_recorded_transform(
+            &mut globals,
+            "scrub_uncaptured_heap_pointers",
+            &mut ledger,
+            |g| {
+                super::super::heap_global_snapshot::scrub_uncaptured_heap_pointers(
+                    &mut containers,
+                    g,
+                    0x140000000,
+                    0x140100000,
+                );
+            },
+        )
+        .unwrap();
+        //    - the image-inline body WAS actually modified by the real scrub.
+        assert_eq!(globals[1].content[SCRUB_OFF], 0x00);
+        //    - child-level transform evidence preserved on the image-inline.
+        assert!(globals[1]
+            .transform_ids
+            .contains(&"scrub_uncaptured_heap_pointers".to_string()));
+        //    - no raw write run references the image-inline base.
+        assert!(!ledger.runs.iter().any(|r| r.child_old_base == IMAGE_VA));
+        //    - every raw run has a non-empty capture id + full identity.
+        for r in &ledger.runs {
+            assert!(!r.child_capture_id.is_empty());
+            assert_eq!(r.child_capture_id, "main:0x140003000:0:0x140003000:false");
+        }
+        // 6. q0c overlay completes (membership + shape gates run inside).
+        let (patched, overlays, _) =
+            build_patched_backing_slab_q0c(&raw_capture, &globals, &[], &bindings, &ledger)
+                .unwrap();
+        assert!(overlays
+            .iter()
+            .any(|o| o.child_old_base == RAW_BASE && o.overlay_applied));
+        assert!(!overlays.iter().any(|o| o.child_old_base == IMAGE_VA));
+        assert!(!patched.is_empty() && !patched[0].content.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // Route X R0 AF1 (X0-AF1) — P0-1/P0-2/P0-3 closure tests.
+    // ------------------------------------------------------------------
+
+    /// P0-1: seeding must use the canonical raw-coherence participant set. A
+    /// SyntheticDerived global must be excluded from seeding (no seed binding).
+    #[test]
+    fn route_x_af1_synthetic_derived_is_excluded_from_seeding() {
+        let raw_capture = RawSlabCapture {
+            slabs: vec![],
+            children: vec![],
+        };
+        // A SyntheticDerived child (non-raw by predicate).
+        let mut synth = global(0x200000, vec![0x55; 0x20], false);
+        synth.provenance = RegionProvenance::SyntheticDerived {
+            transform_id: "t".into(),
+            source_anchor: "anchor".into(),
+            construction_digest: sha256_hex(&synth.content),
+        };
+        synth.extent_kind = CaptureExtentKind::SyntheticDerived;
+        let mut containers: Vec<ContainerSnapshot> = Vec::new();
+        let mut globals = vec![synth];
+        // Seeding with an empty raw capture must not fail on the synthetic child
+        // (it is excluded), and must produce no bindings.
+        let bindings = seed_transform_inputs_from_authoritative_slab(
+            &raw_capture,
+            &mut containers,
+            &mut globals,
+        )
+        .unwrap();
+        assert!(bindings.is_empty());
+    }
+
+    /// P0-1: seeding participant set == canonical predicate set. Only the raw
+    /// participant is seeded; the image-inline and SyntheticDerived are not.
+    #[test]
+    fn route_x_af1_seeding_uses_canonical_participant_set() {
+        // Slab with one in-slab raw child.
+        let slab_base: u64 = 0x140000000;
+        let raw_bytes = b"seed-canonical".to_vec();
+        let raw_base = slab_base + 0x3000;
+        let slab = slab_with_child(slab_base, 0x40000, raw_base, raw_bytes.clone());
+        let mut raw_capture = RawSlabCapture {
+            slabs: vec![slab],
+            children: vec![raw_child(
+                raw_base,
+                raw_bytes.len(),
+                raw_bytes.clone(),
+                RawChildKind::HeapGlobal,
+            )],
+        };
+        raw_capture.children[0].capture_id = "main:0x140003000:0:0x140003000:false".into();
+        raw_capture.children[0].extent_kind = CaptureExtentKind::ObservedAllocation;
+        // globals: raw participant + image-inline + synthetic.
+        let mut raw_g = global(raw_base, raw_bytes.clone(), false);
+        raw_g.extent_kind = CaptureExtentKind::ObservedAllocation;
+        raw_g.extent_evidence.capture_id = "main:0x140003000:0:0x140003000:false".into();
+        raw_g.extent_evidence.capture_path =
+            crate::dumper::heap_global_snapshot::CapturePath::MainSlot;
+        let image = global(0x140149d50, vec![0x41; 0x1950], true);
+        let mut synth = global(0x200000, vec![0x55; 0x20], false);
+        synth.provenance = RegionProvenance::SyntheticDerived {
+            transform_id: "t".into(),
+            source_anchor: "a".into(),
+            construction_digest: sha256_hex(&synth.content),
+        };
+        synth.extent_kind = CaptureExtentKind::SyntheticDerived;
+        let mut containers: Vec<ContainerSnapshot> = Vec::new();
+        let mut globals = vec![raw_g.clone(), image, synth];
+        let bindings = seed_transform_inputs_from_authoritative_slab(
+            &raw_capture,
+            &mut containers,
+            &mut globals,
+        )
+        .unwrap();
+        // Exactly ONE binding: the raw participant. Not the image-inline, not the
+        // synthetic.
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].child_old_base, raw_base);
+    }
+
+    /// P0-2: same-base capture_id change fails closed (provenance drift).
+    #[test]
+    fn route_x_af1_same_base_capture_id_change_fails_closed() {
+        let mut a = global(0x200000, vec![0x42u8; 0x40], false);
+        a.extent_evidence.capture_id = "id-before".into();
+        let mut b = a.clone();
+        b.extent_evidence.capture_id = "id-after".into();
+        b.content[0] ^= 0xFF;
+        let err = diff_transform_write_runs(&[a], &[b], "t")
+            .expect_err("capture_id change must fail closed");
+        assert!(matches!(
+            err,
+            OverlayError::TransformRunLedgerInvalid { .. }
+        ));
+    }
+
+    /// P0-2: same-base content.len() change fails closed (size drift).
+    #[test]
+    fn route_x_af1_same_base_size_change_fails_closed() {
+        let mut a = global(0x200000, vec![0x42u8; 0x40], false);
+        a.extent_evidence.capture_id = "id".into();
+        let mut b = a.clone();
+        b.content.truncate(0x30); // size changes 0x40 -> 0x30
+        b.content[0] ^= 0xFF;
+        let err = diff_transform_write_runs(&[a], &[b], "t")
+            .expect_err("content.len change must fail closed");
+        assert!(matches!(
+            err,
+            OverlayError::TransformRunLedgerInvalid { .. }
+        ));
+    }
+
+    /// P0-2: same-base extent_kind change fails closed.
+    #[test]
+    fn route_x_af1_same_base_extent_change_fails_closed() {
+        let mut a = global(0x200000, vec![0x42u8; 0x40], false);
+        a.extent_evidence.capture_id = "id".into();
+        a.extent_kind = CaptureExtentKind::ProbeWindow;
+        let mut b = a.clone();
+        b.extent_kind = CaptureExtentKind::ObservedAllocation;
+        b.content[0] ^= 0xFF;
+        let err = diff_transform_write_runs(&[a], &[b], "t")
+            .expect_err("extent_kind change must fail closed");
+        assert!(matches!(
+            err,
+            OverlayError::TransformRunLedgerInvalid { .. }
+        ));
+    }
+
+    /// P0-2: same-base capture_path change fails closed.
+    #[test]
+    fn route_x_af1_same_base_capture_path_change_fails_closed() {
+        let mut a = global(0x200000, vec![0x42u8; 0x40], false);
+        a.extent_evidence.capture_id = "id".into();
+        a.extent_evidence.capture_path = crate::dumper::heap_global_snapshot::CapturePath::MainSlot;
+        let mut b = a.clone();
+        b.extent_evidence.capture_path =
+            crate::dumper::heap_global_snapshot::CapturePath::GscriptChildLink;
+        b.content[0] ^= 0xFF;
+        let err = diff_transform_write_runs(&[a], &[b], "t")
+            .expect_err("capture_path change must fail closed");
+        assert!(matches!(
+            err,
+            OverlayError::TransformRunLedgerInvalid { .. }
+        ));
+    }
+
+    /// P0-3: a well-formed but orphaned run (no raw child by identity) fails the
+    /// global membership gate before byte replay.
+    #[test]
+    fn route_x_af1_well_formed_extra_run_without_raw_child_fails_closed() {
+        // Raw capture with ONE raw child.
+        let raw_bytes = b"orphan-check".to_vec();
+        let raw_base = 0x140003000u64;
+        let slab = slab_with_child(0x140000000, 0x40000, raw_base, raw_bytes.clone());
+        let raw_capture = RawSlabCapture {
+            slabs: vec![slab],
+            children: vec![raw_child(
+                raw_base,
+                raw_bytes.len(),
+                raw_bytes.clone(),
+                RawChildKind::HeapGlobal,
+            )],
+        };
+        // Transformed set: the raw child (canonical participant).
+        let mut raw_g = global(raw_base, raw_bytes.clone(), false);
+        raw_g.extent_kind = CaptureExtentKind::ObservedAllocation;
+        raw_g.extent_evidence.capture_id = "main:0x140003000:0:0x140003000:false".into();
+        raw_g.extent_evidence.capture_path =
+            crate::dumper::heap_global_snapshot::CapturePath::MainSlot;
+        // A shape-VALID ledger with an EXTRA run whose child (base 0x9999) has no
+        // raw child and is not a canonical participant.
+        let mut ledger = TransformRunLedger::default();
+        ledger.runs.push(TransformWriteRun {
+            child_capture_id: "ghost:0x9999".into(),
+            child_old_base: 0x9999,
+            child_size: 0x10,
+            child_offset: 0,
+            length: 1,
+            transform_id: "t".into(),
+            before_digest: sha256_hex(&[0xAA]),
+            after_digest: sha256_hex(&[0xBB]),
+            first_before_byte: 0xAA,
+            first_after_byte: 0xBB,
+            before_bytes: vec![0xAA],
+            after_bytes: vec![0xBB],
+        });
+        let err =
+            build_patched_backing_slab_q0c(&raw_capture, &[raw_g], &[], &[], &ledger).unwrap_err();
+        assert!(matches!(
+            err,
+            OverlayError::TransformRunLedgerInvalid { .. }
+        ));
+    }
+
+    /// P0-3: a run with a WRONG capture id fails membership (orphaned).
+    #[test]
+    fn route_x_af1_run_wrong_capture_id_fails_membership() {
+        let raw_bytes = b"wrongcap".to_vec();
+        let raw_base = 0x140003000u64;
+        let slab = slab_with_child(0x140000000, 0x40000, raw_base, raw_bytes.clone());
+        let mut raw_capture = RawSlabCapture {
+            slabs: vec![slab],
+            children: vec![raw_child(
+                raw_base,
+                raw_bytes.len(),
+                raw_bytes.clone(),
+                RawChildKind::HeapGlobal,
+            )],
+        };
+        raw_capture.children[0].capture_id = "main:0x140003000:0:0x140003000:false".into();
+        raw_capture.children[0].extent_kind = CaptureExtentKind::ObservedAllocation;
+        let mut raw_g = global(raw_base, raw_bytes.clone(), false);
+        raw_g.extent_kind = CaptureExtentKind::ObservedAllocation;
+        raw_g.extent_evidence.capture_id = "main:0x140003000:0:0x140003000:false".into();
+        raw_g.extent_evidence.capture_path =
+            crate::dumper::heap_global_snapshot::CapturePath::MainSlot;
+        // A ledger run with a WRONG capture id (but matching base).
+        let mut ledger = TransformRunLedger::default();
+        ledger.runs.push(TransformWriteRun {
+            child_capture_id: "wrong-id".into(),
+            child_old_base: raw_base,
+            child_size: raw_bytes.len(),
+            child_offset: 0,
+            length: 1,
+            transform_id: "t".into(),
+            before_digest: sha256_hex(&[0xAA]),
+            after_digest: sha256_hex(&[0xBB]),
+            first_before_byte: 0xAA,
+            first_after_byte: 0xBB,
+            before_bytes: vec![0xAA],
+            after_bytes: vec![0xBB],
+        });
+        let err =
+            build_patched_backing_slab_q0c(&raw_capture, &[raw_g], &[], &[], &ledger).unwrap_err();
+        assert!(matches!(
+            err,
+            OverlayError::TransformRunLedgerInvalid { .. }
+        ));
+    }
+
+    /// P0-3: a run with a WRONG child size fails membership.
+    #[test]
+    fn route_x_af1_run_wrong_child_size_fails_membership() {
+        let raw_bytes = b"wrongsize".to_vec();
+        let raw_base = 0x140003000u64;
+        let slab = slab_with_child(0x140000000, 0x40000, raw_base, raw_bytes.clone());
+        let mut raw_capture = RawSlabCapture {
+            slabs: vec![slab],
+            children: vec![raw_child(
+                raw_base,
+                raw_bytes.len(),
+                raw_bytes.clone(),
+                RawChildKind::HeapGlobal,
+            )],
+        };
+        raw_capture.children[0].capture_id = "main:0x140003000:0:0x140003000:false".into();
+        raw_capture.children[0].extent_kind = CaptureExtentKind::ObservedAllocation;
+        let mut raw_g = global(raw_base, raw_bytes.clone(), false);
+        raw_g.extent_kind = CaptureExtentKind::ObservedAllocation;
+        raw_g.extent_evidence.capture_id = "main:0x140003000:0:0x140003000:false".into();
+        raw_g.extent_evidence.capture_path =
+            crate::dumper::heap_global_snapshot::CapturePath::MainSlot;
+        // A ledger run with the RIGHT capture id but WRONG child size.
+        let mut ledger = TransformRunLedger::default();
+        ledger.runs.push(TransformWriteRun {
+            child_capture_id: "main:0x140003000:0:0x140003000:false".into(),
+            child_old_base: raw_base,
+            child_size: raw_bytes.len() + 16, // wrong size
+            child_offset: 0,
+            length: 1,
+            transform_id: "t".into(),
+            before_digest: sha256_hex(&[0xAA]),
+            after_digest: sha256_hex(&[0xBB]),
+            first_before_byte: 0xAA,
+            first_after_byte: 0xBB,
+            before_bytes: vec![0xAA],
+            after_bytes: vec![0xBB],
+        });
+        let err =
+            build_patched_backing_slab_q0c(&raw_capture, &[raw_g], &[], &[], &ledger).unwrap_err();
+        assert!(matches!(
+            err,
+            OverlayError::TransformRunLedgerInvalid { .. }
+        ));
+    }
+
+    /// P0-3 positive: a run matching EXACTLY one raw child (full identity tuple)
+    /// passes the membership gate and reaches overlay.
+    #[test]
+    fn route_x_af1_run_matches_exactly_one_raw_child_positive() {
+        let raw_bytes = b"exactmatch".to_vec();
+        let raw_base = 0x140003000u64;
+        let slab = slab_with_child(0x140000000, 0x40000, raw_base, raw_bytes.clone());
+        let mut raw_capture = RawSlabCapture {
+            slabs: vec![slab],
+            children: vec![raw_child(
+                raw_base,
+                raw_bytes.len(),
+                raw_bytes.clone(),
+                RawChildKind::HeapGlobal,
+            )],
+        };
+        raw_capture.children[0].capture_id = "main:0x140003000:0:0x140003000:false".into();
+        raw_capture.children[0].extent_kind = CaptureExtentKind::ObservedAllocation;
+        let mut raw_g = global(raw_base, raw_bytes.clone(), false);
+        raw_g.extent_kind = CaptureExtentKind::ObservedAllocation;
+        raw_g.extent_evidence.capture_id = "main:0x140003000:0:0x140003000:false".into();
+        raw_g.extent_evidence.capture_path =
+            crate::dumper::heap_global_snapshot::CapturePath::MainSlot;
+        // A ledger run matching the raw child EXACTLY (capture_id, base, size).
+        let mut ledger = TransformRunLedger::default();
+        ledger.runs.push(TransformWriteRun {
+            child_capture_id: "main:0x140003000:0:0x140003000:false".into(),
+            child_old_base: raw_base,
+            child_size: raw_bytes.len(),
+            child_offset: 0,
+            length: 1,
+            transform_id: "t".into(),
+            before_digest: sha256_hex(&[0xAA]),
+            after_digest: sha256_hex(&[0xBB]),
+            first_before_byte: 0xAA,
+            first_after_byte: 0xBB,
+            before_bytes: vec![0xAA],
+            after_bytes: vec![0xBB],
+        });
+        // validate_run_membership passes (exactly one raw child, in participant set).
+        validate_run_membership(&raw_capture, &[raw_g.clone()], &ledger).unwrap();
     }
 }

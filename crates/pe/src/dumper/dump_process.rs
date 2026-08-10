@@ -1095,7 +1095,7 @@ pub fn dump_process_with_report(
                     image_end,
                 );
             },
-        );
+        )?;
     }
     // R-GTO-UI r17b: scrub walks every qword and can clear gscript count@+0x10
     // when the live dword was embedded in a pointer-shaped qword. Re-apply
@@ -1108,7 +1108,7 @@ pub fn dump_process_with_report(
             |heap_globals| {
                 super::heap_global_snapshot::resynthesize_gscript_label_count(heap_globals);
             },
-        );
+        )?;
     }
     // R-GTO-UI r18/r19b: scrub / slot-cap leave Label.mName null or dangling
     // while inline UTF-16 remains at +0x30  -> 0x48fb0 wcscmp AV. Repair offline
@@ -1143,7 +1143,7 @@ pub fn dump_process_with_report(
             |heap_globals| {
                 super::heap_global_snapshot::sort_gscript_label_table(heap_globals);
             },
-        );
+        )?;
     }
     // R-GTO-UI r21: Label+0x23==0 redirects via +0x10; dump has null nested
     //  -> AV at 0xc13ea after successful A_Args lookup. Mark non-nested.
@@ -1155,7 +1155,7 @@ pub fn dump_process_with_report(
             |heap_globals| {
                 super::heap_global_snapshot::mark_labels_non_nested(heap_globals);
             },
-        );
+        )?;
     }
     // R-GTO-UI r21b: WinMain re-inits [0x141bf0] after Label bind; dump free-list
     // body AVs later. Zero-slab large enough for re-init stores only.
@@ -1167,7 +1167,7 @@ pub fn dump_process_with_report(
             |heap_globals| {
                 super::heap_global_snapshot::sanitize_ahk_runtime_global(heap_globals);
             },
-        );
+        )?;
     }
     // R-GTO-UI r22b / GTO R0-F.2: gscript+0xbd8 must be NewClassName for
     // RegisterClass @0x34db0, and +0xbd0 the CreateWindow title. The window

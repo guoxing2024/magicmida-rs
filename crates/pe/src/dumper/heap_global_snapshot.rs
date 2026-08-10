@@ -259,6 +259,38 @@ pub struct HeapGlobalSnapshot {
     pub transform_ids: Vec<String>,
 }
 
+impl HeapGlobalSnapshot {
+    /// Route X R0 (X0-A): THE canonical raw-coherence participant predicate.
+    ///
+    /// A snapshot is a raw-coherence participant if and only if it participates
+    /// in raw capture, authoritative seeding, raw-overlay transform provenance,
+    /// and overlay reconciliation. It must be:
+    ///   - NOT a heap handle (a handle is a pointer, not a data blob);
+    ///   - NOT an image-inline body (image-backed, non-raw; never routed through
+    ///     heap allocation / raw slab overlay);
+    ///   - NOT empty (no bytes to capture or overlay);
+    ///   - NOT SyntheticDerived (no raw source; constructed by an offline transform).
+    ///
+    /// Every production path that decides "does this heap global participate in
+    /// raw slab coherence?" MUST use this predicate — identity validation,
+    /// raw-child construction, transform-input seeding/binding, transform
+    /// write-run recording, and pre-overlay membership validation. No copied
+    /// ad-hoc condition sets are accepted (that was the W R1 participant-set
+    /// invariant violation: an image-inline snapshot entered the raw-overlay
+    /// transform write-run ledger with an empty capture_id).
+    #[must_use]
+    pub fn is_raw_coherence_participant(&self) -> bool {
+        use RegionProvenance as RP;
+        if self.is_heap_handle || self.is_image_inline || self.content.is_empty() {
+            return false;
+        }
+        if matches!(self.provenance, RP::SyntheticDerived { .. }) {
+            return false;
+        }
+        true
+    }
+}
+
 /// A captured heap slab: one contiguous blob covering the span of all
 /// non-handle heap-global live_ptrs **plus a prefix pad** before the first
 /// object. At runtime the stub reserves/copies this blob and rebases every
@@ -299,7 +331,7 @@ pub fn compute_heap_slab_span(heap_globals: &[HeapGlobalSnapshot]) -> Option<(u6
     let mut max_end: u64 = 0;
     let mut count = 0usize;
     for g in heap_globals {
-        if g.is_heap_handle || g.is_image_inline || g.content.is_empty() {
+        if !g.is_raw_coherence_participant() {
             continue;
         }
         if g.live_ptr < MIN_USER_POINTER || g.live_ptr > MAX_USER_POINTER {
@@ -362,7 +394,7 @@ pub fn capture_heap_slab(
     let span = max_end.saturating_sub(min_ptr);
     let data_globals = heap_globals
         .iter()
-        .filter(|g| !g.is_heap_handle && !g.is_image_inline && !g.content.is_empty())
+        .filter(|g| g.is_raw_coherence_participant())
         .count();
     let mut blob = vec![0u8; span as usize];
     // Best-effort RPM in page-sized chunks; zero-fill unreadable gaps.
@@ -7751,16 +7783,27 @@ mod tests {
     // Test 1: C null / S exact captured pointer -> keep S, no +0x28 write.
     #[test]
     fn route_q_r0d_s_exact_ptr_is_kept() {
-        let mut globals = q0d_fixture(Q0D_LABEL, b'A' as u16);
-        // mName already points at an exact freeable snapshot.
+        // mName points at an exact freeable snapshot at SNAP (distinct live_ptr,
+        // so the raw-coherence participant set has unique identities).
+        const SNAP: u64 = 0x900000;
+        let mut globals = q0d_fixture(SNAP, b'A' as u16);
         globals.push(HeapGlobalSnapshot {
             rva: 0,
-            live_ptr: Q0D_LABEL,
+            live_ptr: SNAP,
             content: wide("A_Args"),
             is_heap_handle: false,
             is_image_inline: false,
             extent_kind: CaptureExtentKind::ObservedAllocation,
-            extent_evidence: CaptureExtentEvidence::default(),
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: "string_snapshot:0x900000".into(),
+                capture_path: CapturePath::MainSlot,
+                source_root_rva: None,
+                source_slot_offset: None,
+                probe_requested_size: 0,
+                was_interior: false,
+                containing_parent_old_base: None,
+                containing_parent_size: None,
+            },
             transform_ids: Vec::new(),
             provenance: RegionProvenance::default(),
         });
@@ -7776,7 +7819,8 @@ mod tests {
             &before,
             &globals,
             "repair_label_names_after_scrub",
-        );
+        )
+        .unwrap();
         assert!(
             runs.iter().all(|r| r.child_offset != LABEL_NAME_OFF),
             "must not write +0x28 when S already holds an exact pointer"
@@ -7856,7 +7900,8 @@ mod tests {
             &before,
             &globals,
             "repair_label_names_after_scrub",
-        );
+        )
+        .unwrap();
         assert!(runs.iter().any(|r| r.child_offset == LABEL_NAME_OFF));
     }
 
@@ -8053,18 +8098,27 @@ mod tests {
             "scrub_uncaptured_heap_pointers",
             &mut write_ledger,
             |g| super::scrub_uncaptured_heap_pointers(&mut containers, g, 0, image_end),
-        );
+        )
+        .unwrap();
         raw_slab_coherence::apply_recorded_transform(
             &mut globals,
             "resynthesize_gscript_label_count",
             &mut write_ledger,
             |g| super::resynthesize_gscript_label_count(g),
-        );
+        )
+        .unwrap();
         raw_slab_coherence::try_apply_recorded_transform(
             &mut globals,
             "repair_label_names_after_scrub",
             &mut write_ledger,
-            |g| super::repair_label_names_after_scrub(g),
+            |g| {
+                super::repair_label_names_after_scrub(g).map_err(|e| {
+                    crate::error::PeError::GtoStage {
+                        stage: "repair_label_names_after_scrub".into(),
+                        error: format!("{e:#}"),
+                    }
+                })
+            },
         )
         .expect("repair must succeed for a captured-parent alias");
         raw_slab_coherence::apply_recorded_transform(
@@ -8072,19 +8126,22 @@ mod tests {
             "sort_gscript_label_table",
             &mut write_ledger,
             |g| super::sort_gscript_label_table(g),
-        );
+        )
+        .unwrap();
         raw_slab_coherence::apply_recorded_transform(
             &mut globals,
             "mark_labels_non_nested",
             &mut write_ledger,
             |g| super::mark_labels_non_nested(g),
-        );
+        )
+        .unwrap();
         raw_slab_coherence::apply_recorded_transform(
             &mut globals,
             "sanitize_ahk_runtime_global",
             &mut write_ledger,
             |g| super::sanitize_ahk_runtime_global(g),
-        );
+        )
+        .unwrap();
         // Q0-C overlay.
         let (patched, overlays, _drift) = raw_slab_coherence::build_patched_backing_slab_q0c(
             &raw_capture,
@@ -8214,7 +8271,8 @@ mod tests {
             &before,
             &globals,
             "mark_labels_non_nested",
-        );
+        )
+        .unwrap();
         assert!(!runs.is_empty());
         assert!(
             runs.iter().all(|r| r.child_offset != LABEL_NAME_OFF),
@@ -8413,20 +8471,29 @@ mod tests {
                 |globals| {
                     super::scrub_uncaptured_heap_pointers(&mut containers, globals, 0, image_end);
                 },
-            );
+            )
+            .unwrap();
             // 2. resynthesize_gscript_label_count
             crate::dumper::raw_slab_coherence::apply_recorded_transform(
                 &mut globals,
                 "resynthesize_gscript_label_count",
                 &mut write_ledger,
                 |globals| super::resynthesize_gscript_label_count(globals),
-            );
+            )
+            .unwrap();
             // 3. repair_label_names_after_scrub (can fail closed on external mName)
             crate::dumper::raw_slab_coherence::try_apply_recorded_transform(
                 &mut globals,
                 "repair_label_names_after_scrub",
                 &mut write_ledger,
-                |globals| super::repair_label_names_after_scrub(globals),
+                |globals| {
+                    super::repair_label_names_after_scrub(globals).map_err(|e| {
+                        crate::error::PeError::GtoStage {
+                            stage: "repair_label_names_after_scrub".into(),
+                            error: format!("{e:#}"),
+                        }
+                    })
+                },
             )
             .expect("repair must not hit external-unassigned in this fixture");
             // 4. sort_gscript_label_table
@@ -8435,21 +8502,24 @@ mod tests {
                 "sort_gscript_label_table",
                 &mut write_ledger,
                 |globals| super::sort_gscript_label_table(globals),
-            );
+            )
+            .unwrap();
             // 5. mark_labels_non_nested
             crate::dumper::raw_slab_coherence::apply_recorded_transform(
                 &mut globals,
                 "mark_labels_non_nested",
                 &mut write_ledger,
                 |globals| super::mark_labels_non_nested(globals),
-            );
+            )
+            .unwrap();
             // 6. sanitize_ahk_runtime_global
             crate::dumper::raw_slab_coherence::apply_recorded_transform(
                 &mut globals,
                 "sanitize_ahk_runtime_global",
                 &mut write_ledger,
                 |globals| super::sanitize_ahk_runtime_global(globals),
-            );
+            )
+            .unwrap();
 
             // ---- Q0-C overlay over the seeded+transformed children.
             let (patched, overlays, _drift) =

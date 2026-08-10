@@ -910,6 +910,52 @@ def test_attempt_auto_sequence_is_real(ctrl):
           f"first_unchanged={first == after_second}")
 
 
+# ---------------------------------------------------------------------------
+# Route X R0 (X0-E) — controller stage parser handles ANSI + quoted fields.
+# ---------------------------------------------------------------------------
+
+def _write_stage_log(ws, lines):
+    """Write the given raw (possibly ANSI/quote-formatted) log bytes to a
+    child.stderr.bin for the parser."""
+    data = b"".join(lines)
+    (ws / "child.stderr.bin").write_bytes(data)
+    return ws
+
+
+def test_stage_parser_handles_ansi_quoted_fields(ctrl):
+    ws = Path(tempfile.mkdtemp(prefix="x_ansi_"))
+    # Real Rust tracing format: ANSI SGR codes around field names/`=`/values,
+    # and the field VALUES are quoted.
+    line = (
+        b"[2026-08-10T14:32:03.517270Z] [WARN] gto_stage_error "
+        b"\x1b[3mstage\x1b[2m=\x1b[0m\"raw_slab_overlay\" "
+        b"\x1b[3mevent\x1b[2m=\x1b[0m\"error\" "
+        b"\x1b[3mmonotonic_elapsed_ms\x1b[2m=\x1b[0m288458 "
+        b"\x1b[3mstage_elapsed_ms\x1b[2m=\x1b[0m45\r\n"
+    )
+    _write_stage_log(ws, [line])
+    stage, event = ctrl._sample_last_stage(ws / "child.stdout.bin", ws / "child.stderr.bin")
+    check("route_x_r0_stage_parser_handles_ansi_quoted_fields",
+          stage == "raw_slab_overlay" and event == "error",
+          f"stage={stage} event={event}")
+
+
+def test_stage_parser_reports_raw_slab_overlay_error(ctrl):
+    ws = Path(tempfile.mkdtemp(prefix="x_overlay_"))
+    # Multiple stages; the LAST must win (overlay/error is the terminal event).
+    lines = [
+        b"[t] [INFO] gto_stage_enter \x1b[3mstage\x1b[2m=\x1b[0m\"capture_heap_slab\" \x1b[3mevent\x1b[2m=\x1b[0m\"enter\"\r\n",
+        b"[t] [INFO] gto_stage_exit \x1b[3mstage\x1b[2m=\x1b[0m\"capture_heap_slab\" \x1b[3mevent\x1b[2m=\x1b[0m\"exit\"\r\n",
+        b"[t] [INFO] gto_stage_enter \x1b[3mstage\x1b[2m=\x1b[0m\"raw_slab_overlay\" \x1b[3mevent\x1b[2m=\x1b[0m\"enter\"\r\n",
+        b"[t] [WARN] gto_stage_error \x1b[3mstage\x1b[2m=\x1b[0m\"raw_slab_overlay\" \x1b[3mevent\x1b[2m=\x1b[0m\"error\"\r\n",
+    ]
+    _write_stage_log(ws, lines)
+    stage, event = ctrl._sample_last_stage(ws / "child.stdout.bin", ws / "child.stderr.bin")
+    check("route_x_r0_stage_parser_reports_raw_slab_overlay_error",
+          stage == "raw_slab_overlay" and event == "error",
+          f"stage={stage} event={event}")
+
+
 def main():
     ctrl = load_controller()
     test_no_bypass_missing_fails_before_spawn(ctrl)
@@ -947,9 +993,12 @@ def main():
     test_wrong_head_fails_before_popen(ctrl)
     test_valid_attestation_and_head_reaches_mock_popen(ctrl)
     test_attempt_auto_sequence_is_real(ctrl)
+    # Route X R0 (X0-E)
+    test_stage_parser_handles_ansi_quoted_fields(ctrl)
+    test_stage_parser_reports_raw_slab_overlay_error(ctrl)
     passed = sum(1 for _, ok, _ in _results if ok)
     failed = len(_results) - passed
-    print(f"\nroute_u+af1+v0+w0+waf1: {passed} passed / {failed} failed / {len(_results)} total")
+    print(f"\nroute_u+af1+v0+w0+waf1+x: {passed} passed / {failed} failed / {len(_results)} total")
     return 0 if failed == 0 else 1
 
 
