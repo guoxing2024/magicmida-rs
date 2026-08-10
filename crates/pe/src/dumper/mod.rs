@@ -49,6 +49,7 @@ mod runtime_rebase;
 mod sections;
 mod serialize;
 mod snapshot_manifest;
+mod stage_timing;
 #[cfg(test)]
 mod tests;
 mod tls_bootstrap;

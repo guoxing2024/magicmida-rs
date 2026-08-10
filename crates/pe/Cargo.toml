@@ -20,6 +20,9 @@ sha2 = "0.10"
 [dev-dependencies]
 serde_json = "1"
 iced-x86 = { workspace = true }
+# Route V R0 (V0-E): capture stage-timing telemetry in offline Rust tests. This is
+# a test-only dependency (mida-pe production must not gain tracing_subscriber).
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "registry"] }
 # R1-E dual-path corpus only: pure emit candidates judged by independent R0B gates.
 # Production `mida-pe` must not depend on `mida-acceptance` (boundary is one-way).
 mida-acceptance = { path = "../acceptance" }

@@ -21,6 +21,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -168,6 +169,55 @@ def decode_display(raw: bytes, label: str) -> Dict[str, Any]:
         }
 
 
+# Route V R0 (V0-B): match a GTO stage-telemetry log line and extract the
+# stage name and event (enter|exit|error). The Rust CLI emits lines of the form:
+#   [HH:MM:SS] [INFO] stage=<name> event=<enter|exit|error> ... gto_stage_<event>
+_STAGE_RE = re.compile(rb"gto_stage_(\w+)\b")
+
+_STAGE_FIELD_RE = re.compile(rb"\bstage=([^\s\x1b]+)\b")
+_EVENT_FIELD_RE = re.compile(rb"\bevent=([^\s\x1b]+)\b")
+
+
+def _sample_last_stage(stdout_raw_path: Path, stderr_raw_path: Path):
+    """Best-effort: find the last GTO stage + event seen in the raw output tails.
+
+    Returns ``(stage_name, event)`` or ``(None, None)`` if nothing parseable was
+    found. This is evidence-only: it never influences success/failure decisions.
+    """
+    tail = bytearray()
+    for p in (stdout_raw_path, stderr_raw_path):
+        try:
+            if p.exists():
+                size = p.stat().st_size
+                if size:
+                    with open(p, "rb") as fh:
+                        fh.seek(max(0, size - 8192))
+                        tail.extend(fh.read())
+        except Exception:
+            continue
+    if not tail:
+        return None, None
+    last_stage = None
+    last_event = None
+    # Scan line-by-line for the marker, keeping the last match.
+    for line in tail.splitlines():
+        if _STAGE_RE.search(line) is None:
+            continue
+        m_stage = _STAGE_FIELD_RE.search(line)
+        m_event = _EVENT_FIELD_RE.search(line)
+        if m_stage is not None:
+            try:
+                last_stage = m_stage.group(1).decode("ascii")
+            except Exception:
+                pass
+        if m_event is not None:
+            try:
+                last_event = m_event.group(1).decode("ascii")
+            except Exception:
+                pass
+    return last_stage, last_event
+
+
 def build_env(allowlist: List[str]) -> Dict[str, str]:
     """Build the child environment from an explicit allowlist only.
 
@@ -200,6 +250,7 @@ def run_child(
     evidence_dir.mkdir(parents=True, exist_ok=True)
     started = utc_now()
     t0 = time.monotonic()
+    configured_timeout_sec = timeout_sec
 
     stdout_raw_path = evidence_dir / "child.stdout.bin"
     stderr_raw_path = evidence_dir / "child.stderr.bin"
@@ -240,6 +291,14 @@ def run_child(
         "stderr_decode_status": None,
         "spawn_error": None,
         "controller_error": None,
+        # Route V R0 (V0-B): deadline/output-progress evidence (populated during
+        # and after the child run; present as defaults even on preflight reject).
+        "configured_timeout_sec": configured_timeout_sec,
+        "last_output_growth_utc": None,
+        "last_output_size": 0,
+        "last_observed_stage": None,
+        "last_observed_stage_event": None,
+        "silence_before_timeout_ms": None,
     }
 
     # Route U R0 (U0-B): enforce the authorized env contract BEFORE spawning. If the
@@ -275,6 +334,20 @@ def run_child(
     term_action = None
     cleanup_status = None
     returncode = None
+
+    # Route V R0 (V0-B): deadline/output-progress evidence. While the child runs
+    # we poll the raw output files to learn (a) when output last grew, (b) the
+    # last GTO stage observed in the log, and (c) the silence window before a
+    # timeout. This is RECORDING-ONLY: the kill decision remains total-timeout
+    # only (V0-C keeps no aggressive no-progress kill). The parsed stage is
+    # best-effort evidence and never drives success/failure.
+    last_output_growth_utc = started  # output "last grew" at spawn baseline
+    last_output_size = 0
+    last_observed_stage = None
+    last_observed_stage_event = None
+    silence_before_timeout_ms = None
+    _last_growth_offset = 0.0  # monotonic offset (seconds) from t0 of last growth
+
     try:
         with open(stdout_raw_path, "wb") as fout, open(stderr_raw_path, "wb") as ferr:
             proc = subprocess.Popen(
@@ -286,25 +359,81 @@ def run_child(
             )
             record["pid"] = proc.pid
             record["spawned"] = True
-            try:
-                returncode = proc.wait(timeout=timeout_sec)
-                timed_out = False
-                term_action = None
-                cleanup_status = "exited_naturally"
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                term_action = "terminate_tree"
-                cleanup_status = "terminated"
-                # Terminate the whole process tree.
+            poll_interval = 0.25
+            # Poll until the child exits or the total wall-clock timeout elapses.
+            # We deliberately avoid subprocess.run's blocking wait() so the
+            # output-progress evidence can be captured.
+            while True:
+                # Sample output progress FIRST (even on the exit iteration), so
+                # a fast-exiting child's final bytes are still observed. Best
+                # effort; ignore transient errors.
                 try:
-                    _terminate_tree(proc.pid)
-                    proc.wait(timeout=5)
+                    size_so_far = 0
+                    for p in (stdout_raw_path, stderr_raw_path):
+                        if p.exists():
+                            size_so_far += p.stat().st_size
+                    if size_so_far > last_output_size:
+                        last_output_size = size_so_far
+                        last_output_growth_utc = utc_now()
+                        _last_growth_offset = time.monotonic() - t0
+                    new_stage, new_event = _sample_last_stage(
+                        stdout_raw_path, stderr_raw_path
+                    )
+                    if new_stage is not None:
+                        last_observed_stage = new_stage
+                    if new_event is not None:
+                        last_observed_stage_event = new_event
                 except Exception:
+                    pass
+                rc = proc.poll()
+                if rc is not None:
+                    # Child exited: one more progress sample in case the final
+                    # flush landed after the loop-top sample.
                     try:
-                        proc.kill()
+                        size_so_far = 0
+                        for p in (stdout_raw_path, stderr_raw_path):
+                            if p.exists():
+                                size_so_far += p.stat().st_size
+                        if size_so_far > last_output_size:
+                            last_output_size = size_so_far
+                            last_output_growth_utc = utc_now()
+                            _last_growth_offset = time.monotonic() - t0
+                        new_stage, new_event = _sample_last_stage(
+                            stdout_raw_path, stderr_raw_path
+                        )
+                        if new_stage is not None:
+                            last_observed_stage = new_stage
+                        if new_event is not None:
+                            last_observed_stage_event = new_event
                     except Exception:
                         pass
-                returncode = proc.returncode
+                    returncode = rc
+                    timed_out = False
+                    term_action = None
+                    cleanup_status = "exited_naturally"
+                    break
+                elapsed = time.monotonic() - t0
+                if elapsed >= timeout_sec:
+                    timed_out = True
+                    term_action = "terminate_tree"
+                    cleanup_status = "terminated"
+                    # Record the silence window BEFORE killing: from last observed
+                    # output growth to the moment the timeout fired.
+                    silence_before_timeout_ms = int(
+                        round((elapsed - _last_growth_offset) * 1000)
+                    )
+                    # Terminate the whole process tree.
+                    try:
+                        _terminate_tree(proc.pid)
+                        proc.wait(timeout=5)
+                    except Exception:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                    returncode = proc.returncode
+                    break
+                time.sleep(poll_interval)
     except FileNotFoundError as exc:
         record["spawn_error"] = f"executable not found: {exc}"
     except OSError as exc:
@@ -319,6 +448,13 @@ def run_child(
     record["timed_out"] = timed_out
     record["termination_action"] = term_action
     record["process_tree_cleanup_status"] = cleanup_status
+    # Route V R0 (V0-B): deadline evidence surfaced into controller_run.json.
+    record["configured_timeout_sec"] = configured_timeout_sec
+    record["last_output_growth_utc"] = last_output_growth_utc
+    record["last_output_size"] = last_output_size
+    record["last_observed_stage"] = last_observed_stage
+    record["last_observed_stage_event"] = last_observed_stage_event
+    record["silence_before_timeout_ms"] = silence_before_timeout_ms
 
     # Raw evidence + display copies (decode best-effort, never authoritative).
     if stdout_raw_path.exists():
@@ -373,7 +509,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     parser.add_argument("--evidence-dir", required=True, help="output evidence directory")
     parser.add_argument("--cwd", default=None, help="working directory for the child")
-    parser.add_argument("--timeout", type=float, default=120.0, help="timeout seconds")
+    parser.add_argument("--timeout", type=float, default=600.0, help="timeout seconds")
     parser.add_argument("--env-allowlist", action="append", default=[],
                         help="environment variable names to propagate (repeatable)")
     parser.add_argument("--set-env", action="append", default=[],

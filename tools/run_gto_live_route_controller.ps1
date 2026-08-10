@@ -25,7 +25,7 @@ param(
 
     [string]$Cwd,
 
-    [double]$Timeout = 120.0,
+    [double]$Timeout = 600.0,
 
     [string[]]$EnvAllowlist,
 

@@ -887,7 +887,15 @@ pub fn dump_process_with_report(
     // and raw coherence (seed/overlay) is NOT skipped.
     let main_slab: Option<super::heap_global_snapshot::HeapSlab> =
         if no_bypass && stage_plan.detect_heap_globals {
-            super::heap_global_snapshot::capture_heap_slab(&heap_globals, debugger)
+            // Route V R0 (V0-A): stage telemetry for the heap-slab capture.
+            let mut _stats = super::stage_timing::StageStats::default();
+            let mut _g = super::stage_timing::StageGuard::begin("capture_heap_slab");
+            let _s = super::heap_global_snapshot::capture_heap_slab(&heap_globals, debugger);
+            if let Some(ref s) = _s {
+                _stats.byte_count = s.content.len() as u64;
+            }
+            _g.with_stats(_stats); // attaches counts; exit emitted on drop
+            _s
         } else {
             None
         };
@@ -913,13 +921,20 @@ pub fn dump_process_with_report(
             role: "dedicated",
         });
     }
-    let (normalized, normalization_events) =
-        super::raw_slab_coherence::normalize_authoritative_slabs(&slab_candidates).map_err(
-            |e| PeError::GtoStage {
-                stage: "capture_slab_normalize".into(),
-                error: format!("{e:#}"),
-            },
-        )?;
+    let (normalized, normalization_events) = super::stage_timing::run_stage(
+        "normalize_authoritative_slabs",
+        super::stage_timing::StageStats::default(),
+        |stats| {
+            let r = super::raw_slab_coherence::normalize_authoritative_slabs(&slab_candidates)
+                .map_err(|e| format!("{e:#}"))?;
+            stats.item_count = r.0.len();
+            Ok(r)
+        },
+    )
+    .map_err(|e| PeError::GtoStage {
+        stage: "capture_slab_normalize".into(),
+        error: e,
+    })?;
     let authoritative_slabs: Vec<super::heap_global_snapshot::HeapSlab> =
         normalized.iter().map(|n| n.slab.clone()).collect();
     let slab_normalization_ledger: Vec<(
@@ -934,35 +949,59 @@ pub fn dump_process_with_report(
     // present (the physical-memory ground truth), BEFORE snapshotting raw children.
     // Runs on RAW snapshots before any transform.
     if let Some(main) = main_slab.as_ref() {
-        super::heap_global_snapshot::reconcile_duplicate_heap_globals(
-            &mut heap_globals,
-            Some(main),
-        );
+        // Route V R0 (V0-A): stage telemetry.
+        let _g = super::stage_timing::StageGuard::begin("reconcile_duplicate_heap_globals");
+        super::heap_global_snapshot::reconcile_duplicate_heap_globals(&mut heap_globals, Some(main));
+        drop(_g);
     }
     let mut raw_capture: Option<super::raw_slab_coherence::RawSlabCapture> = None;
     if no_bypass && stage_plan.detect_heap_globals && !authoritative_slabs.is_empty() {
         // Route S R0-B: every raw-coherence participant must carry a non-empty
         // capture identity. Fail at `capture_identity_bind` (here) instead of a
         // misleading TransformPreimageDrift at overlay time.
-        super::raw_slab_coherence::validate_raw_coherence_capture_identities(
-            &containers,
-            &heap_globals,
+        super::stage_timing::run_stage(
+            "capture_identity_bind",
+            super::stage_timing::StageStats::default(),
+            |stats| {
+                stats.item_count = heap_globals.len();
+                super::raw_slab_coherence::validate_raw_coherence_capture_identities(
+                    &containers,
+                    &heap_globals,
+                )
+                .map_err(|e| format!("{e:#}"))
+            },
         )
         .map_err(|e| PeError::GtoStage {
             stage: "capture_identity_bind".into(),
-            error: format!("{e:#}"),
+            error: e,
         })?;
         // Route T R0-A / TAF1-D / TAF1-E: the probe/interior coverage gate runs
         // IMMEDIATELY after identity bind and BEFORE any transform / overlay /
         // runtime plan, unconditionally (even when the slab set is empty — a probe
         // with no slab must fail here, not silently pass).
-        super::raw_slab_coherence::validate_probe_coverage(&heap_globals, &authoritative_slabs)
-            .map_err(|e| PeError::GtoStage {
-                stage: "capture_coverage_bind".into(),
-                error: format!("{e:#}"),
-            })?;
+        super::stage_timing::run_stage(
+            "capture_coverage_bind",
+            super::stage_timing::StageStats::default(),
+            |stats| {
+                stats.item_count = heap_globals.len();
+                super::raw_slab_coherence::validate_probe_coverage(
+                    &heap_globals,
+                    &authoritative_slabs,
+                )
+                .map_err(|e| format!("{e:#}"))
+            },
+        )
+        .map_err(|e| PeError::GtoStage {
+            stage: "capture_coverage_bind".into(),
+            error: e,
+        })?;
+        // Route V R0 (V0-A): stage telemetry for raw_children_from_capture.
+        let mut raw_stats = super::stage_timing::StageStats::default();
+        let mut _rg = super::stage_timing::StageGuard::begin("raw_children_from_capture");
         let raw_children =
             super::raw_slab_coherence::raw_children_from_capture(&containers, &heap_globals);
+        raw_stats.item_count = raw_children.len();
+        _rg.with_stats(raw_stats);
         raw_capture = Some(super::raw_slab_coherence::RawSlabCapture {
             slabs: authoritative_slabs.clone(),
             children: raw_children,
@@ -991,11 +1030,22 @@ pub fn dump_process_with_report(
     let mut transform_preimage_bindings: Vec<super::raw_slab_coherence::TransformPreimageBinding> =
         Vec::new();
     if let Some(raw) = raw_capture.as_ref() {
-        match super::raw_slab_coherence::seed_transform_inputs_from_authoritative_slab(
-            raw,
-            &mut containers,
-            &mut heap_globals,
-        ) {
+        // Route V R0 (V0-A): stage telemetry for transform_input_seed.
+        let seed_result = super::stage_timing::run_stage(
+            "transform_input_seed",
+            super::stage_timing::StageStats::default(),
+            |stats| {
+                let r = super::raw_slab_coherence::seed_transform_inputs_from_authoritative_slab(
+                    raw,
+                    &mut containers,
+                    &mut heap_globals,
+                )
+                .map_err(|e| format!("{e:#}"))?;
+                stats.item_count = r.len();
+                Ok(r)
+            },
+        );
+        match seed_result {
             Ok(bindings) => {
                 transform_preimage_bindings = bindings;
             }
@@ -1004,7 +1054,7 @@ pub fn dump_process_with_report(
                 // fail closed before any transform runs.
                 return Err(PeError::GtoStage {
                     stage: "transform_input_seed".into(),
-                    error: format!("{e:#}"),
+                    error: e,
                 });
             }
         }
@@ -1345,13 +1395,25 @@ pub fn dump_process_with_report(
     let mut all_slabs: Vec<super::heap_global_snapshot::HeapSlab> = Vec::new();
     if let Some(raw) = raw_capture.as_ref() {
         // Route Q R0 Q0-C: overlay over the authoritative transform preimage.
-        match super::raw_slab_coherence::build_patched_backing_slab_q0c(
-            raw,
-            &heap_globals,
-            &containers,
-            &transform_preimage_bindings,
-            &transform_run_ledger,
-        ) {
+        // Route V R0 (V0-A): stage telemetry for raw_slab_overlay.
+        let overlay_result = super::stage_timing::run_stage(
+            "raw_slab_overlay",
+            super::stage_timing::StageStats::default(),
+            |stats| {
+                let r = super::raw_slab_coherence::build_patched_backing_slab_q0c(
+                    raw,
+                    &heap_globals,
+                    &containers,
+                    &transform_preimage_bindings,
+                    &transform_run_ledger,
+                )
+                .map_err(|e| format!("{e:#}"))?;
+                stats.item_count = r.0.len();
+                stats.byte_count = r.0.iter().map(|s| s.content.len() as u64).sum();
+                Ok(r)
+            },
+        );
+        match overlay_result {
             Ok((patched, overlays, drift_runs)) => {
                 capture_transforms.push(("heap_slab_restore", "capture"));
                 // Record overlay ledger into diagnostics (later surfaced in the
@@ -1622,23 +1684,36 @@ pub fn dump_process_with_report(
             None => super::runtime_rebase::ExternalResolverTable::default(),
         };
 
-        let prepared = match super::runtime_rebase::prepare_runtime_rebase_for_dump(
-            &containers,
-            &heap_globals,
-            &all_slabs,
-            &declared_slots,
-            &external_resolvers,
-            &module_map,
-            opts.image_base,
-            new_image_base,
-            opts.entry_point,
-            true, // require_capture: empty plan is a hard error
+        // Route V R0 (V0-A): stage telemetry for the runtime-rebase plan build +
+        // validation (entered together; error path is reported as an error event
+        // on the same stage).
+        let prepared = match super::stage_timing::run_stage(
+            "runtime_rebase_plan_build",
+            super::stage_timing::StageStats::default(),
+            |stats| {
+                let r = super::runtime_rebase::prepare_runtime_rebase_for_dump(
+                    &containers,
+                    &heap_globals,
+                    &all_slabs,
+                    &declared_slots,
+                    &external_resolvers,
+                    &module_map,
+                    opts.image_base,
+                    new_image_base,
+                    opts.entry_point,
+                    true, // require_capture: empty plan is a hard error
+                )
+                .map_err(|e| format!("{e:#}"))?;
+                stats.item_count = r.plan.regions.len();
+                stats.byte_count = r.plan.regions.iter().map(|x| x.size as u64).sum();
+                Ok(r)
+            },
         ) {
             Ok(p) => p,
             Err(e) => {
                 return Err(PeError::GtoStage {
                     stage: "runtime_rebase_plan_validation".into(),
-                    error: format!("{e:#}"),
+                    error: e,
                 });
             }
         };
@@ -1901,6 +1976,7 @@ pub fn dump_process_with_report(
     // overlays, import section construction (as extra_data), and profile
     // stages; pure modules plan + rebuild PE bytes. R1-E preserves host
     // section VAs and carries host data directories for content import/IAT.
+    let _emit_guard = super::stage_timing::StageGuard::begin("candidate_emit");
     let mut out_data = if opts.pure_rebuild {
         info!("R1-E pure rebuild emit path enabled");
         // Phase-2 live parity with legacy write_output_file:
@@ -1954,6 +2030,8 @@ pub fn dump_process_with_report(
             &containers,
         )?
     };
+
+    let _ = _emit_guard.with_byte_count(out_data.len() as u64);
 
     // Verify AddressOfEntryPoint only (OptionalHeader + 16). Never use
     // e_lfanew+24+SizeOfOptionalHeader ?that lands on the section table and
@@ -2114,6 +2192,10 @@ pub fn dump_process_with_report(
                 }
             })
             .collect();
+    // Route V R0 (V0-A): stage telemetry for manifest construction.
+    let mut _ms = super::stage_timing::StageStats::default();
+    _ms.item_count = authoritative_slab_ledger.len();
+    let mut _mg = super::stage_timing::StageGuard::begin("manifest_construction");
     super::snapshot_manifest::write_dump_snapshot_manifest(
         &opts.output_path,
         opts.profile,
@@ -2132,6 +2214,7 @@ pub fn dump_process_with_report(
         &authoritative_slab_ledger,
         &normalization_events,
     );
+    _mg.with_stats(_ms);
 
     // The report is returned only after the candidate and its required bound
     // manifest have both been written successfully.  Any earlier error exits

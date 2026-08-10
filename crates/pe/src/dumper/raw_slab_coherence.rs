@@ -866,35 +866,57 @@ pub fn apply_recorded_transform(
     ledger: &mut TransformRunLedger,
     transform: impl FnOnce(&mut Vec<HeapGlobalSnapshot>),
 ) {
-    let before = heap_globals.clone();
-    transform(heap_globals);
-    super::heap_global_snapshot::record_transform_applied(heap_globals, &before, transform_id);
-    ledger.runs.extend(diff_transform_write_runs(
-        &before,
-        heap_globals,
+    // Route V R0 (V0-A): per-transform stage enter/exit telemetry.
+    let _ = super::stage_timing::run_stage(
         transform_id,
-    ));
+        super::stage_timing::StageStats::default(),
+        |stats| {
+            let before = heap_globals.clone();
+            transform(heap_globals);
+            super::heap_global_snapshot::record_transform_applied(heap_globals, &before, transform_id);
+            let runs = diff_transform_write_runs(&before, heap_globals, transform_id);
+            stats.item_count = runs.len();
+            stats.byte_count = runs.iter().map(|r| r.length as u64).sum();
+            ledger.runs.extend(runs);
+            Ok(())
+        },
+    );
 }
 
 /// Execution-owning recorder for a transform that can fail (Route R R0-B /
 /// Audit Fix 1). Runs the closure, and on `Ok` records both child and byte
 /// evidence. On `Err` it propagates the error WITHOUT recording — the caller
 /// (e.g. `dump_process`) aborts before overlay/manifest/candidate.
-pub fn try_apply_recorded_transform<E>(
+pub fn try_apply_recorded_transform<E: std::fmt::Debug>(
     heap_globals: &mut Vec<HeapGlobalSnapshot>,
     transform_id: &str,
     ledger: &mut TransformRunLedger,
     transform: impl FnOnce(&mut Vec<HeapGlobalSnapshot>) -> Result<(), E>,
 ) -> Result<(), E> {
-    let before = heap_globals.clone();
-    transform(heap_globals)?;
-    super::heap_global_snapshot::record_transform_applied(heap_globals, &before, transform_id);
-    ledger.runs.extend(diff_transform_write_runs(
-        &before,
-        heap_globals,
-        transform_id,
-    ));
-    Ok(())
+    // Route V R0 (V0-A): per-transform stage enter/exit/error telemetry.
+    // Uses a StageGuard directly (not `run_stage`) because this function is
+    // generic over `E` and must propagate the original error type unchanged.
+    // Telemetry is non-semantic: the error is logged via `Debug` only; the
+    // business result is unchanged.
+    let mut guard = super::stage_timing::StageGuard::begin(transform_id);
+    let result = (|| {
+        let before = heap_globals.clone();
+        transform(heap_globals)?;
+        super::heap_global_snapshot::record_transform_applied(heap_globals, &before, transform_id);
+        let runs = diff_transform_write_runs(&before, heap_globals, transform_id);
+        let stats = super::stage_timing::StageStats {
+            item_count: runs.len(),
+            byte_count: runs.iter().map(|r| r.length as u64).sum(),
+        };
+        ledger.runs.extend(runs);
+        guard.with_stats(stats);
+        Ok(())
+    })();
+    match &result {
+        Ok(_) => {}
+        Err(e) => guard.error(format!("{e:?}")),
+    }
+    result
 }
 
 /// Route S R0-D: validate the SHAPE of every run in the ledger ONCE, before any

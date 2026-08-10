@@ -223,6 +223,7 @@ dependencies = [
  "sha2",
  "thiserror",
  "tracing",
+ "tracing-subscriber",
  "windows",
 ]
 
