@@ -1276,11 +1276,11 @@ mod tests {
     }
 
     fn plan_from(containers: &[ContainerSnapshot]) -> RuntimeRebasePlan {
-        let slots = declared_slots_from_capture(containers, &[], None);
+        let slots = declared_slots_from_capture(containers, &[], &[]);
         build_runtime_rebase_plan(
             containers,
             &[],
-            None,
+            &[],
             &slots,
             &crate::dumper::runtime_rebase::ExternalResolverTable::new(),
             &[],
@@ -1445,7 +1445,7 @@ mod tests {
         let plan = build_runtime_rebase_plan(
             &[c],
             &[],
-            None,
+            &[],
             &slots,
             &crate::dumper::runtime_rebase::ExternalResolverTable::new(),
             &[],
@@ -1483,19 +1483,11 @@ mod tests {
             0x500020,
             region_bytes(0x10, &[(0, api_va)]),
         );
-        let slots = declared_slots_from_capture(&[c.clone()], &[], None);
-        let plan = build_runtime_rebase_plan(
-            &[c],
-            &[],
-            None,
-            &slots,
-            &resolvers,
-            &modules,
-            OLD_IB,
-            NEW_IB,
-        )
-        .unwrap()
-        .unwrap();
+        let slots = declared_slots_from_capture(&[c.clone()], &[], &[]);
+        let plan =
+            build_runtime_rebase_plan(&[c], &[], &[], &slots, &resolvers, &modules, OLD_IB, NEW_IB)
+                .unwrap()
+                .unwrap();
         let meta = meta_of(&plan);
         let ext_fixup = meta
             .fixups
@@ -1619,11 +1611,11 @@ mod machine_code_tests {
     }
 
     fn plan_from(containers: &[ContainerSnapshot]) -> RuntimeRebasePlan {
-        let slots = declared_slots_from_capture(containers, &[], None);
+        let slots = declared_slots_from_capture(containers, &[], &[]);
         build_runtime_rebase_plan(
             containers,
             &[],
-            None,
+            &[],
             &slots,
             &crate::dumper::runtime_rebase::ExternalResolverTable::new(),
             &[],
@@ -1784,19 +1776,11 @@ mod machine_code_tests {
             0x500020,
             region_bytes(0x10, &[(0, api_va)]),
         );
-        let slots = declared_slots_from_capture(&[c.clone()], &[], None);
-        let plan = build_runtime_rebase_plan(
-            &[c],
-            &[],
-            None,
-            &slots,
-            &resolvers,
-            &modules,
-            OLD_IB,
-            NEW_IB,
-        )
-        .unwrap()
-        .unwrap();
+        let slots = declared_slots_from_capture(&[c.clone()], &[], &[]);
+        let plan =
+            build_runtime_rebase_plan(&[c], &[], &[], &slots, &resolvers, &modules, OLD_IB, NEW_IB)
+                .unwrap()
+                .unwrap();
         let meta = encode_plan_metadata(&plan).expect("encode");
         let (code, _pts) =
             emit_two_phase_code(0x2000, &meta, 0x2100, 0x2108, 0x5a10, 0x2f00, NEW_IB)
@@ -2368,11 +2352,11 @@ mod machine_code_tests {
             0x600040,
             region_bytes(0x20, &[(0, 0x600000)]),
         );
-        let slots = declared_slots_from_capture(&[a.clone(), b.clone()], &[], None);
+        let slots = declared_slots_from_capture(&[a.clone(), b.clone()], &[], &[]);
         let plan = build_runtime_rebase_plan(
             &[a, b],
             &[],
-            None,
+            &[],
             &slots,
             &resolvers,
             &modules,

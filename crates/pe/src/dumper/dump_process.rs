@@ -11,6 +11,8 @@ use crate::error::PeError;
 use crate::header::PeHeader;
 use crate::original_imports::{read_original_import_table, resolve_imports_via_getprocaddress};
 
+use sha2::Digest as _;
+
 use super::header_patch::{shrink_sections, validate_and_patch_pe_header};
 
 /// Relocate internal RVAs in an IMAGE_EXPORT_DIRECTORY structure.
@@ -853,8 +855,20 @@ pub fn dump_process_with_report(
         .capture_policy
         .clone()
         .resolve_for_profile(opts.profile);
+    // Route T R0-B: dedicated authoritative slabs for each admitted
+    // dangling-edge allocation (surfaced alongside the heap globals).
+    let mut dedicated_slabs: Vec<super::heap_global_snapshot::HeapSlab> = Vec::new();
     let mut heap_globals = if stage_plan.detect_heap_globals {
-        super::heap_global_snapshot::detect_heap_globals(&pe, &dump_buf, debugger, &capture_policy)
+        // Route T R0-B: detect_heap_globals now also returns dedicated
+        // authoritative slabs for each admitted dangling-edge allocation.
+        let (globals, dedicated) = super::heap_global_snapshot::detect_heap_globals(
+            &pe,
+            &dump_buf,
+            debugger,
+            &capture_policy,
+        );
+        dedicated_slabs = dedicated;
+        globals
     } else {
         Vec::new()
     };
@@ -864,40 +878,109 @@ pub fn dump_process_with_report(
     // children so raw coherence can be proven, then the transformed bytes are
     // overlaid onto a patched backing slab. Only when MIDA_GTO_NO_BYPASS=1.
     let no_bypass = std::env::var("MIDA_GTO_NO_BYPASS").ok().as_deref() == Some("1");
-    let mut raw_capture: Option<super::raw_slab_coherence::RawSlabCapture> = None;
-    if no_bypass && stage_plan.detect_heap_globals {
-        if let Some(raw_slab) =
+    // Route T R0 AF1 (TAF1-A/TAF1-F): the authoritative slab SET = the main heap
+    // slab (contiguous cluster, if capture_heap_slab yields one) + every dedicated
+    // dangling-edge slab. This single set flows through raw capture -> seed ->
+    // overlay -> runtime planner, so there is never an overlay-single / runtime-multi
+    // fork. If the main slab is absent (dispersed dangling edges blow the 64MiB cap)
+    // but dedicated slabs exist, the dedicated slabs STILL form the authoritative set
+    // and raw coherence (seed/overlay) is NOT skipped.
+    let main_slab: Option<super::heap_global_snapshot::HeapSlab> =
+        if no_bypass && stage_plan.detect_heap_globals {
             super::heap_global_snapshot::capture_heap_slab(&heap_globals, debugger)
-        {
-            // R0-E: reconcile duplicate captures at the same live_ptr using
-            // raw-slab coherence (the slab is the physical-memory ground truth)
-            // BEFORE snapshotting raw children, so the raw child set matches
-            // the deduped (authoritative) heap_globals. Prevents two
-            // transformed children on one slab range with differing bytes from
-            // tripping the overlay OverlayConflict (Route M R1 blocker). Runs
-            // on RAW snapshots before any transform.
-            super::heap_global_snapshot::reconcile_duplicate_heap_globals(
-                &mut heap_globals,
-                Some(&raw_slab),
-            );
-            // Route S R0-B: every raw-coherence participant must carry a non-empty
-            // capture identity. Fail at `capture_identity_bind` (here) instead of a
-            // misleading TransformPreimageDrift at overlay time.
-            super::raw_slab_coherence::validate_raw_coherence_capture_identities(
-                &containers,
-                &heap_globals,
-            )
+        } else {
+            None
+        };
+    // Route T R0 AF2/AF3 (TAF2-B, TAF3-A/B): build the authoritative slab CANDIDATES
+    // with their TRUE capture roles (main vs dedicated), then normalize
+    // deterministically BEFORE coverage / raw capture / seed. This collapses exact
+    // duplicates and contained-same-bytes aliases into ONE backing region, emits a
+    // full normalization EVENT ledger (which slab dropped, why, survivor), and fails
+    // closed on contained-different-bytes or partial overlap (never implicitly
+    // joining two authorities). The normalized set is the SINGLE authoritative set
+    // shared by coverage / raw capture / seed / overlay / runtime / manifest.
+    let mut slab_candidates: Vec<super::raw_slab_coherence::AuthoritativeSlabCandidate> =
+        Vec::new();
+    if let Some(s) = main_slab.as_ref() {
+        slab_candidates.push(super::raw_slab_coherence::AuthoritativeSlabCandidate {
+            slab: s.clone(),
+            role: "main",
+        });
+    }
+    for d in dedicated_slabs.iter() {
+        slab_candidates.push(super::raw_slab_coherence::AuthoritativeSlabCandidate {
+            slab: d.clone(),
+            role: "dedicated",
+        });
+    }
+    let (normalized, normalization_events) =
+        super::raw_slab_coherence::normalize_authoritative_slabs(&slab_candidates).map_err(
+            |e| PeError::GtoStage {
+                stage: "capture_slab_normalize".into(),
+                error: format!("{e:#}"),
+            },
+        )?;
+    let authoritative_slabs: Vec<super::heap_global_snapshot::HeapSlab> =
+        normalized.iter().map(|n| n.slab.clone()).collect();
+    let slab_normalization_ledger: Vec<(
+        u64,
+        &'static str,
+        super::raw_slab_coherence::SlabNormalization,
+    )> = normalized
+        .iter()
+        .map(|n| (n.slab.old_base, n.role, n.normalization))
+        .collect();
+    // Reconcile duplicate captures against the FIRST (main) authoritative slab when
+    // present (the physical-memory ground truth), BEFORE snapshotting raw children.
+    // Runs on RAW snapshots before any transform.
+    if let Some(main) = main_slab.as_ref() {
+        super::heap_global_snapshot::reconcile_duplicate_heap_globals(
+            &mut heap_globals,
+            Some(main),
+        );
+    }
+    let mut raw_capture: Option<super::raw_slab_coherence::RawSlabCapture> = None;
+    if no_bypass && stage_plan.detect_heap_globals && !authoritative_slabs.is_empty() {
+        // Route S R0-B: every raw-coherence participant must carry a non-empty
+        // capture identity. Fail at `capture_identity_bind` (here) instead of a
+        // misleading TransformPreimageDrift at overlay time.
+        super::raw_slab_coherence::validate_raw_coherence_capture_identities(
+            &containers,
+            &heap_globals,
+        )
+        .map_err(|e| PeError::GtoStage {
+            stage: "capture_identity_bind".into(),
+            error: format!("{e:#}"),
+        })?;
+        // Route T R0-A / TAF1-D / TAF1-E: the probe/interior coverage gate runs
+        // IMMEDIATELY after identity bind and BEFORE any transform / overlay /
+        // runtime plan, unconditionally (even when the slab set is empty — a probe
+        // with no slab must fail here, not silently pass).
+        super::raw_slab_coherence::validate_probe_coverage(&heap_globals, &authoritative_slabs)
             .map_err(|e| PeError::GtoStage {
-                stage: "capture_identity_bind".into(),
+                stage: "capture_coverage_bind".into(),
                 error: format!("{e:#}"),
             })?;
-            let raw_children =
-                super::raw_slab_coherence::raw_children_from_capture(&containers, &heap_globals);
-            raw_capture = Some(super::raw_slab_coherence::RawSlabCapture {
-                slab: raw_slab,
-                children: raw_children,
-            });
-        }
+        let raw_children =
+            super::raw_slab_coherence::raw_children_from_capture(&containers, &heap_globals);
+        raw_capture = Some(super::raw_slab_coherence::RawSlabCapture {
+            slabs: authoritative_slabs.clone(),
+            children: raw_children,
+        });
+    }
+    // Route T R0 AF1 (TAF1-E): if no authoritative slab exists at all but there are
+    // probe/interior heap globals, the coverage gate must STILL fail-closed (never
+    // skip). Run it unconditionally when there is any candidate raw capture.
+    if no_bypass
+        && stage_plan.detect_heap_globals
+        && raw_capture.is_none()
+        && !heap_globals.is_empty()
+    {
+        super::raw_slab_coherence::validate_probe_coverage(&heap_globals, &authoritative_slabs)
+            .map_err(|e| PeError::GtoStage {
+                stage: "capture_coverage_bind".into(),
+                error: format!("{e:#}"),
+            })?;
     }
     // Route Q R0 Q0-A/Q0-C: authoritative transform-input seeding.
     // Before any transform runs, bind each probe/interior child's transform
@@ -1073,14 +1156,15 @@ pub fn dump_process_with_report(
             .checked_add(pe.size_of_image() as u64)
             .unwrap_or(u64::MAX);
         avoid.push((opts.image_base as u64, image_span));
-        // Raw heap slab span + raw containers + observed heap globals.
+        // Raw heap slab span(s) + raw containers + observed heap globals.
         if let Some(raw) = raw_capture.as_ref() {
-            let slab_end = raw
-                .slab
-                .old_base
-                .checked_add(raw.slab.content.len() as u64)
-                .unwrap_or(u64::MAX);
-            avoid.push((raw.slab.old_base, slab_end));
+            for s in &raw.slabs {
+                let slab_end = s
+                    .old_base
+                    .checked_add(s.content.len() as u64)
+                    .unwrap_or(u64::MAX);
+                avoid.push((s.old_base, slab_end));
+            }
             for c in &raw.children {
                 let end = c.old_base.checked_add(c.size as u64).unwrap_or(u64::MAX);
                 avoid.push((c.old_base, end));
@@ -1253,11 +1337,13 @@ pub fn dump_process_with_report(
         }
     }
 
-    // ---- R0-C.1: patched backing slab via transformed-child overlay ----
-    // After transforms, build the authoritative backing slab by overlaying the
-    // transformed child bytes onto the RAW slab (raw coherence verified). The
-    // planner then normalizes against the patched slab + transformed children.
-    let heap_slab = if let Some(raw) = raw_capture.as_ref() {
+    // ---- R0-C.1: patched backing slabs via transformed-child overlay ----
+    // After transforms, build the authoritative backing slabs by overlaying the
+    // transformed child bytes onto the RAW slabs (raw coherence verified). TAF1-C:
+    // the overlay returns ONE patched slab per authoritative slab (main + each
+    // dedicated dangling-edge slab). The planner then normalizes against these.
+    let mut all_slabs: Vec<super::heap_global_snapshot::HeapSlab> = Vec::new();
+    if let Some(raw) = raw_capture.as_ref() {
         // Route Q R0 Q0-C: overlay over the authoritative transform preimage.
         match super::raw_slab_coherence::build_patched_backing_slab_q0c(
             raw,
@@ -1272,7 +1358,9 @@ pub fn dump_process_with_report(
                 // snapshot manifest / summary).
                 overlay_ledger = overlays;
                 capture_drift_ledger = drift_runs;
-                Some(patched)
+                // TAF1-F: the patched slabs ARE the unified slab set for runtime
+                // (main + dedicated, same order/identity as raw_capture.slabs).
+                all_slabs = patched;
             }
             Err(e) => {
                 // Raw coherence or overlay failure: fail closed — do NOT silently
@@ -1283,12 +1371,13 @@ pub fn dump_process_with_report(
                 });
             }
         }
-    } else {
-        None
-    };
-    if heap_slab.is_some() {
+    }
+    if !all_slabs.is_empty() {
         capture_transforms.push(("heap_slab_overlay", "capture"));
     }
+    // NOTE: the probe/interior coverage gate (`capture_coverage_bind`) ran
+    // IMMEDIATELY after `capture_identity_bind`, BEFORE any transform / overlay /
+    // runtime plan (TAF1-D / TAF1-E). It is NOT re-run here.
     // Cookie + complement RVAs must be captured before early overlay zeros storage.
     // Prefer authoritative site from offline CRT resolve; never fuzzy-rescan when set.
     // B7.2.1: authority resolve/validation failure is a hard dump error (no structural success).
@@ -1504,7 +1593,7 @@ pub fn dump_process_with_report(
         let declared_slots = super::runtime_rebase::declared_slots_from_capture(
             &containers,
             &heap_globals,
-            heap_slab.as_ref(),
+            &all_slabs,
         );
 
         // External resolvers from the rebuilt import table (ASLR-safe via IAT).
@@ -1536,7 +1625,7 @@ pub fn dump_process_with_report(
         let prepared = match super::runtime_rebase::prepare_runtime_rebase_for_dump(
             &containers,
             &heap_globals,
-            heap_slab.as_ref(),
+            &all_slabs,
             &declared_slots,
             &external_resolvers,
             &module_map,
@@ -1977,6 +2066,54 @@ pub fn dump_process_with_report(
 
     // Observable capture contract (best-effort sidecar). Never fails the dump.
     // `capture_policy` is the resolved policy used for heap capture above.
+    // Route T R0 AF2 (TAF2-E): build the authoritative-slab ledger proving the
+    // raw (normalized) slab set, the patched (overlaid) slab set, and the manifest
+    // declared set are ONE shared set (TAF1-F). Each normalized slab's raw digest
+    // comes from `authoritative_slabs` (pre-overlay), its patched digest from
+    // `all_slabs` (post-overlay), aligned by sequence/index.
+    let authoritative_slab_ledger: Vec<super::snapshot_manifest::AuthoritativeSlabLedgerEntry> =
+        slab_normalization_ledger
+            .iter()
+            .enumerate()
+            .map(|(i, (base, role, norm))| {
+                let raw_digest = authoritative_slabs
+                    .get(i)
+                    .map(|s| {
+                        let mut h = sha2::Sha256::new();
+                        h.update(&s.content);
+                        format!("{:x}", h.finalize())
+                    })
+                    .unwrap_or_default();
+                let patched_digest = all_slabs
+                    .get(i)
+                    .map(|s| {
+                        let mut h = sha2::Sha256::new();
+                        h.update(&s.content);
+                        format!("{:x}", h.finalize())
+                    })
+                    .unwrap_or_default();
+                let normalization = match norm {
+                    super::raw_slab_coherence::SlabNormalization::Kept => "kept",
+                    super::raw_slab_coherence::SlabNormalization::Deduplicated => "deduplicated",
+                    super::raw_slab_coherence::SlabNormalization::ContainedExactAlias => {
+                        "contained_exact_alias"
+                    }
+                };
+                super::snapshot_manifest::AuthoritativeSlabLedgerEntry {
+                    sequence: i,
+                    role,
+                    old_base: *base,
+                    size: authoritative_slabs
+                        .get(i)
+                        .map(|s| s.content.len())
+                        .unwrap_or(0),
+                    raw_digest,
+                    patched_digest,
+                    normalization,
+                    source: role,
+                }
+            })
+            .collect();
     super::snapshot_manifest::write_dump_snapshot_manifest(
         &opts.output_path,
         opts.profile,
@@ -1992,6 +2129,8 @@ pub fn dump_process_with_report(
         &transform_run_ledger,
         &synthetic_requests,
         &synthetic_assignment_ledger,
+        &authoritative_slab_ledger,
+        &normalization_events,
     );
 
     // The report is returned only after the candidate and its required bound

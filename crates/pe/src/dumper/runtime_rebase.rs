@@ -845,7 +845,7 @@ pub fn attribute_external(
 pub fn declared_slots_from_capture(
     containers: &[ContainerSnapshot],
     heap_globals: &[HeapGlobalSnapshot],
-    heap_slab: Option<&HeapSlab>,
+    heap_slabs: &[HeapSlab],
 ) -> Vec<DeclaredPointerSlot> {
     let mut out = Vec::new();
     let mut push_slots = |old_base: u64, payload: &[u8]| {
@@ -876,7 +876,8 @@ pub fn declared_slots_from_capture(
         }
         push_slots(g.live_ptr, &g.content);
     }
-    if let Some(slab) = heap_slab {
+    // Route T R0-B: declared slots come from EVERY authoritative slab.
+    for slab in heap_slabs {
         if !slab.content.is_empty() && slab.old_base != 0 {
             push_slots(slab.old_base, &slab.content);
         }
@@ -944,7 +945,7 @@ pub fn build_external_resolvers_from_imports(
 pub fn build_runtime_rebase_plan(
     containers: &[ContainerSnapshot],
     heap_globals: &[HeapGlobalSnapshot],
-    heap_slab: Option<&HeapSlab>,
+    heap_slabs: &[HeapSlab],
     declared_slots: &[DeclaredPointerSlot],
     external_resolvers: &ExternalResolverTable,
     module_map: &[(String, u64, u64)],
@@ -1038,7 +1039,10 @@ pub fn build_runtime_rebase_plan(
         });
         id = id.saturating_add(1);
     }
-    if let Some(slab) = heap_slab {
+    // Route T R0-B: every authoritative slab (main heap slab + each dedicated
+    // dangling-edge slab) becomes a HeapSlab candidate. This lets each probe
+    // window absorb into its own slab instead of being rejected as uncovered.
+    for slab in heap_slabs {
         if !slab.content.is_empty() && slab.old_base != 0 {
             candidates.push(RebaseRegion {
                 id,
@@ -1055,6 +1059,7 @@ pub fn build_runtime_rebase_plan(
                 extent_kind: crate::dumper::heap_global_snapshot::CaptureExtentKind::BackingObject,
                 ownership: RuntimeRegionOwnership::IndependentAllocation,
             });
+            id = id.saturating_add(1);
         }
     }
 
@@ -1304,7 +1309,12 @@ fn normalize_containment(
         for &sid in &slab_ids {
             let slab = &candidates[sid];
             let rel = classify_region_relation(slab.old_base, slab.size, r.old_base, r.size)?;
-            if rel == RegionRelation::Contains {
+            // Route T R0-B: a probe/interior child is absorbed into an
+            // authoritative slab when the slab CONTAINS it OR exactly DUPLICATES
+            // it (base+size identical — the dedicated dangling-edge slab covers
+            // the probe window exactly). ExactDuplicate yields offset 0 (the
+            // probe IS the slab's allocation). Other relations never absorb.
+            if rel == RegionRelation::Contains || rel == RegionRelation::ExactDuplicate {
                 if containing_slab.is_some() {
                     return Err(RebaseError::Plan(format!(
                         "ambiguous coalescing parent for child region {} (0x{:x},+{:#x}): \
@@ -1456,11 +1466,44 @@ fn normalize_containment(
         }
         use crate::dumper::heap_global_snapshot::CaptureExtentKind as CEK;
         if matches!(r.extent_kind, CEK::ProbeWindow | CEK::InteriorSubview) {
-            return Err(RebaseError::Plan(format!(
-                "probe/interior region {} (0x{:x},+{:#x}, extent={:?}) is not contained in \
-                 any authoritative slab/parent; refusing independent allocation",
-                i, r.old_base, r.size, r.extent_kind
-            )));
+            // Route T R0-C: precise coverage diagnostic, not a generic string.
+            // Compute the nearest candidate slab authority range (if any) so an
+            // operator can tell WHICH probe is missing slab authority and how far
+            // the nearest authority is.
+            let extent_tag = match r.extent_kind {
+                CEK::ProbeWindow => "ProbeWindow",
+                CEK::InteriorSubview => "InteriorSubview",
+                _ => "other",
+            };
+            let mut nearest: Option<(u64, u64, u64)> = None; // (base, end, gap)
+            for &sid in &slab_ids {
+                let slab = &candidates[sid];
+                let s_end = slab.old_base.saturating_add(slab.size as u64);
+                let gap = if r.old_base >= slab.old_base && r.old_base < s_end {
+                    0
+                } else if r.old_base < slab.old_base {
+                    slab.old_base.saturating_sub(r.old_base)
+                } else {
+                    r.old_base.saturating_sub(s_end)
+                };
+                if nearest.map_or(true, |(_, _, g)| gap < g) {
+                    nearest = Some((slab.old_base, s_end, gap));
+                }
+            }
+            let (n_base, n_end, n_gap) = nearest.unwrap_or((0, 0, u64::MAX));
+            return Err(RebaseError::ProbeCoverageMissing {
+                region: i,
+                child_base: r.old_base,
+                child_size: r.size,
+                extent_kind: extent_tag.to_string(),
+                candidate_slab_count: slab_ids.len(),
+                nearest_authority: if slab_ids.is_empty() {
+                    None
+                } else {
+                    Some((n_base, n_end))
+                },
+                nearest_authority_gap: n_gap,
+            });
         }
     }
 
@@ -2388,6 +2431,27 @@ pub enum RebaseError {
     /// (empty containers/heap-globals/slab, or the required capture policy did
     /// not yield a plan). Must not be auto-inferred away.
     RequiredRuntimeCaptureMissing,
+    /// Route T R0-C: a ProbeWindow / InteriorSubview region is not covered by
+    /// any authoritative slab/parent. Fail-closed (R0-F.1). Carries precise
+    /// coverage diagnostics so an operator does not have to guess which probe
+    /// is missing its slab authority.
+    ProbeCoverageMissing {
+        /// Candidate index of the uncovered probe/interior region.
+        region: usize,
+        /// Old base of the uncovered region.
+        child_base: u64,
+        /// Size of the uncovered region.
+        child_size: usize,
+        /// Extent kind (ProbeWindow / InteriorSubview).
+        extent_kind: String,
+        /// Number of candidate authoritative slabs considered.
+        candidate_slab_count: usize,
+        /// The nearest candidate slab authority range, if any
+        /// `(base, end)`; `None` when no slab exists at all.
+        nearest_authority: Option<(u64, u64)>,
+        /// Distance from the probe base to the nearest authority range, in bytes.
+        nearest_authority_gap: u64,
+    },
 }
 
 impl fmt::Display for RebaseError {
@@ -2441,6 +2505,20 @@ impl fmt::Display for RebaseError {
                  produced (empty capture or required policy did not yield one); refusing to \
                  continue without an explicit per-case policy declaring capture unnecessary"
             ),
+            RebaseError::ProbeCoverageMissing {
+                region,
+                child_base,
+                child_size,
+                extent_kind,
+                candidate_slab_count,
+                nearest_authority,
+                nearest_authority_gap,
+            } => write!(
+                f,
+                "probe/interior region {region} (0x{child_base:x},+{child_size:#x}, extent={extent_kind}) \
+                 is not contained in any authoritative slab/parent (candidate_slab_count={candidate_slab_count}, \
+                 nearest_authority={nearest_authority:?} gap={nearest_authority_gap:#x}); refusing independent allocation"
+            ),
         }
     }
 }
@@ -2473,7 +2551,7 @@ pub struct PreparedRuntimeRebase {
 pub fn prepare_runtime_rebase_for_dump(
     containers: &[ContainerSnapshot],
     heap_globals: &[HeapGlobalSnapshot],
-    heap_slab: Option<&HeapSlab>,
+    heap_slabs: &[HeapSlab],
     declared_slots: &[DeclaredPointerSlot],
     external_resolvers: &ExternalResolverTable,
     module_map: &[(String, u64, u64)],
@@ -2485,7 +2563,7 @@ pub fn prepare_runtime_rebase_for_dump(
     let plan = match build_runtime_rebase_plan(
         containers,
         heap_globals,
-        heap_slab,
+        heap_slabs,
         declared_slots,
         external_resolvers,
         module_map,
@@ -2611,11 +2689,12 @@ mod tests {
         globals: &[HeapGlobalSnapshot],
         slab: Option<&HeapSlab>,
     ) -> Result<Option<RuntimeRebasePlan>, RebaseError> {
-        let slots = declared_slots_from_capture(containers, globals, slab);
+        let slabs: Vec<HeapSlab> = slab.into_iter().cloned().collect();
+        let slots = declared_slots_from_capture(containers, globals, &slabs);
         build_runtime_rebase_plan(
             containers,
             globals,
-            slab,
+            &slabs,
             &slots,
             &ExternalResolverTable::new(),
             &[],
@@ -2632,9 +2711,10 @@ mod tests {
         resolvers: &ExternalResolverTable,
         modules: &[(String, u64, u64)],
     ) -> Result<Option<RuntimeRebasePlan>, RebaseError> {
-        let slots = declared_slots_from_capture(containers, globals, slab);
+        let slabs: Vec<HeapSlab> = slab.into_iter().cloned().collect();
+        let slots = declared_slots_from_capture(containers, globals, &slabs);
         build_runtime_rebase_plan(
-            containers, globals, slab, &slots, resolvers, modules, OLD_IB, NEW_IB,
+            containers, globals, &slabs, &slots, resolvers, modules, OLD_IB, NEW_IB,
         )
     }
 
@@ -2984,7 +3064,7 @@ mod tests {
         let plan = build_runtime_rebase_plan(
             &[container(0x1000, 0x500000, 0x500020, 0x500040, content)],
             &[],
-            None,
+            &[],
             &slots,
             &ExternalResolverTable::new(),
             &[],
@@ -3246,7 +3326,7 @@ mod tests {
         let err = prepare_runtime_rebase_for_dump(
             &[],
             &[],
-            None,
+            &[],
             &[],
             &ExternalResolverTable::new(),
             &[],
@@ -5041,5 +5121,119 @@ mod tests {
         assert_eq!(plan.regions[0].kind, RegionKind::HeapSlab);
         assert_eq!(plan.aliases.len(), 3);
         validate_runtime_rebase_plan(&plan).unwrap();
+    }
+
+    // ---- Route T R0: authoritative probe coverage closure (multi-slab) ----
+
+    /// Build a plan from an explicit set of authoritative slabs (T0-B multi-slab).
+    fn build_plan_slabs(
+        containers: &[ContainerSnapshot],
+        globals: &[HeapGlobalSnapshot],
+        slabs: &[HeapSlab],
+    ) -> Result<Option<RuntimeRebasePlan>, RebaseError> {
+        let slots = declared_slots_from_capture(containers, globals, slabs);
+        build_runtime_rebase_plan(
+            containers,
+            globals,
+            slabs,
+            &slots,
+            &ExternalResolverTable::new(),
+            &[],
+            OLD_IB,
+            NEW_IB,
+        )
+    }
+
+    fn probe_global_pe(live_ptr: u64, size: usize) -> HeapGlobalSnapshot {
+        let mut g = global(0, live_ptr, vec![0u8; size], false);
+        g.extent_kind = CaptureExtentKind::ProbeWindow;
+        g
+    }
+
+    // T0-B fixture: the exact 0x850150 geometry. A dedicated authoritative slab
+    // covering [0x850150, 0x851150) absorbs the ProbeWindow as an alias; no
+    // independent ProbeWindow region survives; plan validation passes.
+    #[test]
+    fn route_t_r0_850150_dedicated_slab_absorbs_probe_alias() {
+        const PROBE: u64 = 0x850150;
+        const SIZE: usize = 0x1000;
+        let probe = probe_global_pe(PROBE, SIZE);
+        let dedicated = HeapSlab {
+            old_base: PROBE,
+            content: vec![0u8; SIZE],
+        };
+        let plan = build_plan_slabs(&[], &[probe], &[dedicated])
+            .unwrap()
+            .unwrap();
+        // The slab is the single backing region; the probe is absorbed as an alias.
+        assert_eq!(plan.regions.len(), 1);
+        assert_eq!(plan.regions[0].kind, RegionKind::HeapSlab);
+        assert_eq!(plan.regions[0].old_base, PROBE);
+        assert_eq!(plan.aliases.len(), 1);
+        let a = &plan.aliases[0];
+        assert_eq!(a.alias_old_base, PROBE);
+        assert_eq!(a.alias_size, SIZE);
+        assert_eq!(a.parent_offset, 0); // probe base == slab base
+        assert_eq!(a.extent_kind, CaptureExtentKind::ProbeWindow);
+        validate_runtime_rebase_plan(&plan).unwrap();
+    }
+
+    // T0-B: multiple probe windows absorbed into ONE slab -> all aliases valid,
+    // no independent ProbeWindow region.
+    #[test]
+    fn route_t_r0_multiple_probes_one_slab_all_aliases() {
+        let g1 = probe_global_pe(0x850150, 0x1000);
+        let g2 = probe_global_pe(0x851a80, 0x200);
+        let g3 = probe_global_pe(0x854cd0, 0x400);
+        let slab = HeapSlab {
+            old_base: 0x850000,
+            content: vec![0u8; 0x6000],
+        };
+        let plan = build_plan_slabs(&[], &[g1, g2, g3], &[slab])
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.regions.len(), 1);
+        assert_eq!(plan.regions[0].kind, RegionKind::HeapSlab);
+        assert_eq!(plan.aliases.len(), 3);
+        for a in &plan.aliases {
+            assert_eq!(a.extent_kind, CaptureExtentKind::ProbeWindow);
+        }
+        validate_runtime_rebase_plan(&plan).unwrap();
+    }
+
+    // T0-C: an uncovered ProbeWindow in the rebase plan fails with the precise
+    // ProbeCoverageMissing RebaseError (carrying child_base/size/extent/slab
+    // count/nearest authority), not a generic Plan string.
+    #[test]
+    fn route_t_r0_uncovered_probe_rebase_error_precise() {
+        let probe = probe_global_pe(0x850150, 0x1000);
+        // Only a far-away slab exists (e.g. the main AHK slab); it does not cover
+        // 0x850150. This mirrors the live Route S R1 condition where the single
+        // main slab's span was capped and no dedicated slab existed.
+        let main_slab = HeapSlab {
+            old_base: 0x9a3000,
+            content: vec![0u8; 0x1000],
+        };
+        let err = build_plan_slabs(&[], &[probe], &[main_slab]).unwrap_err();
+        match err {
+            RebaseError::ProbeCoverageMissing {
+                region,
+                child_base,
+                child_size,
+                extent_kind,
+                candidate_slab_count,
+                nearest_authority,
+                nearest_authority_gap,
+            } => {
+                assert_eq!(child_base, 0x850150);
+                assert_eq!(child_size, 0x1000);
+                assert_eq!(extent_kind, "ProbeWindow");
+                assert_eq!(candidate_slab_count, 1);
+                assert_eq!(nearest_authority, Some((0x9a3000, 0x9a4000)));
+                assert!(nearest_authority_gap > 0);
+                let _ = region;
+            }
+            other => panic!("expected ProbeCoverageMissing, got {other:?}"),
+        }
     }
 }

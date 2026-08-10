@@ -305,6 +305,14 @@ pub fn compute_heap_slab_span(heap_globals: &[HeapGlobalSnapshot]) -> Option<(u6
         if g.live_ptr < MIN_USER_POINTER || g.live_ptr > MAX_USER_POINTER {
             continue;
         }
+        // Route T R0-B: dangling-edge allocations are surfaced as their OWN
+        // dedicated authoritative slabs (see capture_dangling_edges). Exclude
+        // them here so dispersed dangling edges do not inflate the single main
+        // slab span past MAX_HEAP_SLAB_BYTES (which previously made
+        // capture_heap_slab return None and left EVERY probe uncovered).
+        if g.extent_evidence.capture_path == CapturePath::DanglingEdge {
+            continue;
+        }
         count += 1;
         if g.live_ptr < min_obj {
             min_obj = g.live_ptr;
@@ -427,9 +435,9 @@ pub fn detect_heap_globals(
     dump_buf: &[u8],
     debugger: &mut dyn mida_core::DebuggerCore,
     policy: &DumpCapturePolicy,
-) -> Vec<HeapGlobalSnapshot> {
+) -> (Vec<HeapGlobalSnapshot>, Vec<HeapSlab>) {
     if !pe.is_64bit {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
 
     let image_base = pe.nt_headers.optional_header.image_base;
@@ -460,7 +468,7 @@ pub fn detect_heap_globals(
         })
         .collect();
     if data_ranges.is_empty() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
 
     let all_data: Vec<(u32, u32)> = data_ranges.iter().map(|&(lo, hi, _)| (lo, hi)).collect();
@@ -575,7 +583,7 @@ pub fn detect_heap_globals(
     }
 
     if candidate_scores.is_empty() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
 
     // Order by code-xref hotness first (critical .data roots like 0x141bf0),
@@ -599,6 +607,11 @@ pub fn detect_heap_globals(
     });
 
     let mut out: Vec<HeapGlobalSnapshot> = Vec::new();
+    // Route T R0-B: dedicated authoritative slabs for admitted dangling-edge
+    // allocations. Each dangling edge is its own real heap allocation (read
+    // directly from the debuggee), surfaced as its own slab so its ProbeWindow
+    // can be absorbed at runtime-rebase time.
+    let mut dedicated_slabs: Vec<HeapSlab> = Vec::new();
     let mut total_bytes = 0usize;
     let mut rejected_not_heap = 0usize;
     let mut rejected_data = 0usize;
@@ -1046,6 +1059,7 @@ pub fn detect_heap_globals(
     // gscript edge that AHK still walks during auto-exec.
     capture_dangling_edges(
         &mut out,
+        &mut dedicated_slabs,
         &mut total_bytes,
         &mut seen_heaps,
         image_base,
@@ -1101,7 +1115,7 @@ pub fn detect_heap_globals(
     // R0-E note: duplicate live_ptr reconciliation runs in dump_process AFTER
     // the raw slab is captured, so raw-slab coherence can be used as the
     // authoritative tiebreaker (the slab is the physical-memory ground truth).
-    out
+    (out, dedicated_slabs)
 }
 
 /// Reconcile duplicate raw snapshots of the same physical heap allocation.
@@ -5359,6 +5373,7 @@ fn split_swallowed_siblings(
 /// slot/byte caps. Remaining uncaptured edges are scrubbed later.
 fn capture_dangling_edges(
     out: &mut Vec<HeapGlobalSnapshot>,
+    dedicated_slabs: &mut Vec<HeapSlab>,
     total_bytes: &mut usize,
     seen_heaps: &mut BTreeSet<u64>,
     image_base: u64,
@@ -5505,6 +5520,19 @@ fn capture_dangling_edges(
         // binding). Explicitly bind: capture_path=DanglingEdge, extent=ProbeWindow,
         // probe_requested_size=actual cap, was_interior=false, no containing parent.
         let capture_id = format!("dangling_edge:{value:#x}:{:#x}", content.len());
+        // Route T R0-B: a dangling-edge allocation is an authoritative capture of
+        // its own (read directly from the debuggee), so it must ALSO be surfaced
+        // as a dedicated authoritative slab covering exactly [value, value+len).
+        // The ProbeWindow heap global below is then absorbed into this slab as an
+        // alias at runtime-rebase time (R0-F.1), instead of being rejected as an
+        // uncovered probe. This is the coverage closure for the Route S R1
+        // `0x850150` blocker: dispersed dangling edges previously inflated the
+        // single main-slab span past MAX_HEAP_SLAB_BYTES, so capture_heap_slab
+        // returned None and NO probe had authoritative coverage.
+        dedicated_slabs.push(HeapSlab {
+            old_base: value,
+            content: content.clone(),
+        });
         out.push(HeapGlobalSnapshot {
             rva: 0,
             live_ptr: value,
@@ -6812,7 +6840,7 @@ mod tests {
         let plan = crate::dumper::runtime_rebase::build_runtime_rebase_plan(
             &[],
             &materialized,
-            Some(&slab),
+            &[slab.clone()],
             &[],
             &crate::dumper::runtime_rebase::ExternalResolverTable::new(),
             &[],
@@ -6845,7 +6873,7 @@ mod tests {
         let plan = crate::dumper::runtime_rebase::build_runtime_rebase_plan(
             &[],
             &materialized,
-            Some(&slab),
+            &[slab.clone()],
             &[],
             &crate::dumper::runtime_rebase::ExternalResolverTable::new(),
             &[],
@@ -6891,8 +6919,8 @@ mod tests {
         let plan = crate::dumper::runtime_rebase::build_runtime_rebase_plan(
             &[],
             &all,
-            Some(&slab),
-            &crate::dumper::runtime_rebase::declared_slots_from_capture(&[], &all, Some(&slab)),
+            &[slab.clone()],
+            &crate::dumper::runtime_rebase::declared_slots_from_capture(&[], &all, &[slab.clone()]),
             &crate::dumper::runtime_rebase::ExternalResolverTable::new(),
             &[],
             0x140_0000_0,
@@ -7370,6 +7398,8 @@ mod tests {
             &super::super::raw_slab_coherence::TransformRunLedger::default(),
             &[req],
             &assigned,
+            &[],
+            &[],
         )
         .unwrap();
         // The manifest must NOT claim the rewrite happened just because the
@@ -7411,6 +7441,8 @@ mod tests {
             &super::super::raw_slab_coherence::TransformRunLedger::default(),
             &reqs,
             &ledgers,
+            &[],
+            &[],
         )
         .unwrap();
         for id in ["gto.window_class", "gto.window_title"] {
@@ -7900,10 +7932,10 @@ mod tests {
         slab_content[(table_live - slab_base) as usize..(table_live - slab_base) as usize + 8]
             .copy_from_slice(&table_content);
         let raw_capture = raw_slab_coherence::RawSlabCapture {
-            slab: HeapSlab {
+            slabs: vec![HeapSlab {
                 old_base: slab_base,
                 content: slab_content,
-            },
+            }],
             children: vec![
                 RawChild {
                     old_base: Q0D_LABEL,
@@ -8068,7 +8100,7 @@ mod tests {
         // mName in patched slab must equal the other-parent interior alias.
         assert_eq!(
             u64::from_le_bytes(
-                patched.content[child_off + 0x28..child_off + 0x30]
+                patched[0].content[child_off + 0x28..child_off + 0x30]
                     .try_into()
                     .unwrap()
             ),
@@ -8076,11 +8108,11 @@ mod tests {
             "mName must keep the other-parent interior alias"
         );
         // Build + validate the runtime rebase plan.
-        let slots = declared_slots_from_capture(&containers, &globals, Some(&patched));
+        let slots = declared_slots_from_capture(&containers, &globals, &patched);
         let plan = build_runtime_rebase_plan(
             &containers,
             &globals,
-            Some(&patched),
+            &patched,
             &slots,
             &ExternalResolverTable::new(),
             &[],
@@ -8214,7 +8246,7 @@ mod tests {
         let run_pipeline = |s_ptr: u64,
                             inline_first: u16|
          -> (
-            HeapSlab,
+            Vec<HeapSlab>,
             Vec<crate::dumper::raw_slab_coherence::TransformedRegionOverlay>,
             TransformRunLedger,
             Vec<crate::dumper::raw_slab_coherence::TransformPreimageBinding>,
@@ -8259,7 +8291,7 @@ mod tests {
             };
             // Raw children.
             let raw_capture = crate::dumper::raw_slab_coherence::RawSlabCapture {
-                slab: slab.clone(),
+                slabs: vec![slab.clone()],
                 children: vec![
                     crate::dumper::raw_slab_coherence::RawChild {
                         old_base: Q0D_LABEL,
@@ -8449,7 +8481,7 @@ mod tests {
                 run_pipeline(s_exact, b'A' as u16);
             // S pointer preserved at +0x28 (repair did not overwrite it).
             assert_eq!(
-                patched.content[child_off + 0x28..child_off + 0x30],
+                patched[0].content[child_off + 0x28..child_off + 0x30],
                 s_exact.to_le_bytes().to_vec(),
                 "Scenario A: S must be preserved at +0x28"
             );
@@ -8488,6 +8520,8 @@ mod tests {
                 &write_ledger,
                 &[],
                 &[],
+                &[],
+                &[],
             )
             .unwrap();
             let mv: serde_json::Value =
@@ -8507,12 +8541,12 @@ mod tests {
             let slots = crate::dumper::runtime_rebase::declared_slots_from_capture(
                 &containers,
                 &globals,
-                Some(&patched),
+                &patched,
             );
             let plan = crate::dumper::runtime_rebase::build_runtime_rebase_plan(
                 &containers,
                 &globals,
-                Some(&patched),
+                &patched,
                 &slots,
                 &crate::dumper::runtime_rebase::ExternalResolverTable::new(),
                 &[],
@@ -8534,7 +8568,7 @@ mod tests {
             // repair wrote label_live+0x30 = 0x8aa5f8+0x30 = 0x8aa628.
             let expected = Q0D_LABEL + LABEL_INLINE_NAME_OFF as u64;
             let written = u64::from_le_bytes(
-                patched.content[child_off + 0x28..child_off + 0x30]
+                patched[0].content[child_off + 0x28..child_off + 0x30]
                     .try_into()
                     .unwrap(),
             );
@@ -8613,6 +8647,8 @@ mod tests {
                 &write_ledger,
                 &[],
                 &[],
+                &[],
+                &[],
             )
             .unwrap();
             let mv: serde_json::Value =
@@ -8639,12 +8675,12 @@ mod tests {
             let slots = crate::dumper::runtime_rebase::declared_slots_from_capture(
                 &containers,
                 &globals,
-                Some(&patched),
+                &patched,
             );
             let plan = crate::dumper::runtime_rebase::build_runtime_rebase_plan(
                 &containers,
                 &globals,
-                Some(&patched),
+                &patched,
                 &slots,
                 &crate::dumper::runtime_rebase::ExternalResolverTable::new(),
                 &[],
@@ -8783,10 +8819,10 @@ mod tests {
             };
             (
                 crate::dumper::raw_slab_coherence::RawSlabCapture {
-                    slab: crate::dumper::heap_global_snapshot::HeapSlab {
+                    slabs: vec![crate::dumper::heap_global_snapshot::HeapSlab {
                         old_base: slab_base,
                         content: slab_content.clone(),
-                    },
+                    }],
                     children,
                 },
                 c1,

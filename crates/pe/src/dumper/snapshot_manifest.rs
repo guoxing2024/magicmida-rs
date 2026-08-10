@@ -20,6 +20,32 @@ use super::types::DumpProfile;
 
 pub(crate) const SCHEMA_VERSION: &str = "mida.dump-snapshot-manifest/v0";
 
+/// Route T R0 AF2 (TAF2-E): a single authoritative-slab ledger entry. Records the
+/// slab's identity (base/size), its raw (captured) digest, its patched (after
+/// overlay) digest, its role (main / dedicated / alias), its normalization, and
+/// the source. This proves the runtime slab set == overlay slab set == manifest
+/// declared set (TAF1-F).
+#[derive(Debug, Clone)]
+pub struct AuthoritativeSlabLedgerEntry {
+    /// Sequence (index into the normalized slab set).
+    pub sequence: usize,
+    /// Role: "main" | "dedicated" | "alias".
+    pub role: &'static str,
+    /// Old base of the slab.
+    pub old_base: u64,
+    /// Slab size in bytes.
+    pub size: usize,
+    /// sha256 of the RAW slab bytes (before overlay).
+    pub raw_digest: String,
+    /// sha256 of the PATCHED slab bytes (after overlay). Empty when the slab was
+    /// not overlaid (no child wrote to it).
+    pub patched_digest: String,
+    /// Normalization: kept | deduplicated | contained_exact_alias.
+    pub normalization: &'static str,
+    /// Source: "main" | "dedicated".
+    pub source: &'static str,
+}
+
 /// Sidecar path next to the dumped PE: `foo.exe` → `foo.dump_snapshot.json`.
 pub fn manifest_path_for_output(output_path: &Path) -> PathBuf {
     let parent = output_path.parent().unwrap_or_else(|| Path::new("."));
@@ -46,6 +72,8 @@ pub(crate) fn write_dump_snapshot_manifest(
     transform_run_ledger: &super::raw_slab_coherence::TransformRunLedger,
     synthetic_requests: &[SyntheticRegionRequest],
     synthetic_assignment_ledger: &[SyntheticAssignment],
+    authoritative_slab_ledger: &[AuthoritativeSlabLedgerEntry],
+    normalization_events: &[super::raw_slab_coherence::NormalizationEvent],
 ) {
     let path = manifest_path_for_output(output_path);
     match render_manifest_json(
@@ -63,6 +91,8 @@ pub(crate) fn write_dump_snapshot_manifest(
         transform_run_ledger,
         synthetic_requests,
         synthetic_assignment_ledger,
+        authoritative_slab_ledger,
+        normalization_events,
     ) {
         Ok(json) => match fs::File::create(&path).and_then(|mut f| f.write_all(json.as_bytes())) {
             Ok(()) => {
@@ -147,6 +177,8 @@ pub(crate) fn render_manifest_json(
     transform_run_ledger: &super::raw_slab_coherence::TransformRunLedger,
     synthetic_requests: &[SyntheticRegionRequest],
     synthetic_assignment_ledger: &[SyntheticAssignment],
+    authoritative_slab_ledger: &[AuthoritativeSlabLedgerEntry],
+    normalization_events: &[super::raw_slab_coherence::NormalizationEvent],
 ) -> Result<String, String> {
     let container_payload: u64 = containers.iter().map(|c| c.heap_content.len() as u64).sum();
     let heap_payload: u64 = heap_globals
@@ -588,7 +620,59 @@ pub(crate) fn render_manifest_json(
     // C is used only after proving C == S (ChildCapture). This is the audit
     // evidence that transforms ran on the authoritative preimage, never on a
     // stale child capture. Diagnostic only — never acceptance.
+    //
+    // Route T R0 AF2 (TAF2-E): the authoritative slab ledger proves the RUNTIME
+    // slab set == OVERLAY slab set == MANIFEST declared set. Each entry carries
+    // base, size, raw_digest, patched_digest, role, normalization, source.
     buf.push_str(",\n");
+    buf.push_str("  \"authoritative_slab_ledger\": [\n");
+    for (i, e) in authoritative_slab_ledger.iter().enumerate() {
+        buf.push_str(&format!(
+            "    {{\"sequence\": {}, \"role\": \"{}\", \"old_base\": \"{}\", \
+             \"size\": {}, \"raw_digest\": \"{}\", \"patched_digest\": \"{}\", \
+             \"normalization\": \"{}\", \"source\": \"{}\"}}",
+            e.sequence,
+            e.role,
+            hex_u64(e.old_base),
+            e.size,
+            e.raw_digest,
+            e.patched_digest,
+            e.normalization,
+            e.source
+        ));
+        if i + 1 < authoritative_slab_ledger.len() {
+            buf.push(',');
+        }
+        buf.push('\n');
+    }
+    buf.push_str("  ],\n");
+    // Route T R0 AF3 (TAF3-B): the normalization event ledger answers which input
+    // slab was dropped (dedup / contained alias), why, which survivor it belongs
+    // to, its original digest, and the interval relationship. This proves the raw
+    // authority set -> survivor mapping is complete and honest.
+    buf.push_str("  \"normalization_events\": [\n");
+    for (i, e) in normalization_events.iter().enumerate() {
+        buf.push_str(&format!(
+            "    {{\"input_sequence\": {}, \"input_role\": \"{}\", \"input_old_base\": \"{}\", \
+             \"input_size\": {}, \"input_raw_digest\": \"{}\", \"action\": \"{}\", \
+             \"survivor_sequence\": {}, \"relationship\": \"{}\"}}",
+            e.input_sequence,
+            e.input_role,
+            hex_u64(e.input_old_base),
+            e.input_size,
+            e.input_raw_digest,
+            e.action,
+            e.survivor_sequence
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "null".into()),
+            e.relationship
+        ));
+        if i + 1 < normalization_events.len() {
+            buf.push(',');
+        }
+        buf.push('\n');
+    }
+    buf.push_str("  ],\n");
     buf.push_str("  \"transform_preimage_ledger\": [\n");
     for (i, b) in transform_preimage_ledger.iter().enumerate() {
         let basis_label = match b.basis {
@@ -601,7 +685,7 @@ pub(crate) fn render_manifest_json(
             "    {{\"child_kind\": \"{}\", \"capture_id\": \"{}\", \
              \"child_old_base\": \"{}\", \"child_size\": {}, \
              \"extent_kind\": \"{:?}\", \"slab_old_base\": \"{}\", \
-             \"slab_offset\": {}, \"basis\": \"{}\", \
+             \"slab_size\": {}, \"slab_digest\": \"{}\", \"slab_offset\": {}, \"basis\": \"{}\", \
              \"raw_child_digest\": \"{}\", \"raw_slab_slice_digest\": \"{}\", \
              \"transform_input_digest\": \"{}\", \"seeded_from_slab\": {}}}",
             b.child_kind.label(),
@@ -610,6 +694,8 @@ pub(crate) fn render_manifest_json(
             b.child_size,
             b.extent_kind,
             hex_u64(b.slab_old_base),
+            b.slab_size,
+            b.slab_digest,
             b.slab_offset,
             basis_label,
             b.raw_child_digest,
@@ -768,6 +854,8 @@ mod tests {
             &super::super::raw_slab_coherence::TransformRunLedger::default(),
             &[],
             &[],
+            &[],
+            &[],
         )
         .unwrap();
         assert!(json.contains(SCHEMA_VERSION));
@@ -828,6 +916,8 @@ mod tests {
             &super::super::raw_slab_coherence::TransformRunLedger::default(),
             &[],
             &[],
+            &[],
+            &[],
         )
         .unwrap();
         assert!(json.contains("0x145710"));
@@ -879,6 +969,8 @@ mod tests {
             &[],
             &[],
             &super::super::raw_slab_coherence::TransformRunLedger::default(),
+            &[],
+            &[],
             &[],
             &[],
         )
@@ -1003,6 +1095,8 @@ mod tests {
             &super::super::raw_slab_coherence::TransformRunLedger::default(),
             &[],
             &[],
+            &[],
+            &[],
         )
         .unwrap();
         // The JSON must parse (valid) and contain all three ledgers.
@@ -1066,6 +1160,8 @@ mod tests {
             &super::super::raw_slab_coherence::TransformRunLedger::default(),
             &[req.clone()],
             &assigned,
+            &[],
+            &[],
         )
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).expect("valid manifest JSON");
@@ -1107,6 +1203,8 @@ mod tests {
             child_size: 0x70,
             extent_kind: CaptureExtentKind::InteriorSubview,
             slab_old_base: 0x874000,
+            slab_size: 0x48000,
+            slab_digest: "slab_full_digest".into(),
             slab_offset: 0x36620,
             basis: TransformPreimageBasis::AuthoritativeSlabSlice,
             raw_child_digest: "raw_child_digest_abc".into(),
@@ -1122,6 +1220,8 @@ mod tests {
             child_size: 0x40,
             extent_kind: CaptureExtentKind::ObservedAllocation,
             slab_old_base: 0x874000,
+            slab_size: 0x48000,
+            slab_digest: "slab_full_digest".into(),
             slab_offset: 0x47000,
             basis: TransformPreimageBasis::ChildCapture,
             raw_child_digest: "c_digest".into(),
@@ -1142,6 +1242,8 @@ mod tests {
             &[],
             &[interior, strict],
             &super::super::raw_slab_coherence::TransformRunLedger::default(),
+            &[],
+            &[],
             &[],
             &[],
         )
@@ -1231,6 +1333,8 @@ mod tests {
             &[],
             &[],
             &ledger,
+            &[],
+            &[],
             &[],
             &[],
         )
