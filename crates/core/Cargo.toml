@@ -18,3 +18,16 @@ windows = { workspace = true }
 
 [dev-dependencies]
 serde_json = "1"
+
+# Route Z R0 AF2 AF1: the benign capture-epoch helper is TEST-ONLY fixture, not a
+# production binary. It is gated behind a non-default feature so a normal
+# `cargo build -p mida-core` / canonical mida-cli build never produces it. Only
+# the real-Windows harness run (`--features capture-epoch-harness`) builds it.
+[features]
+default = []
+capture-epoch-harness = []
+
+[[bin]]
+name = "capture_epoch_helper"
+path = "src/bin/capture_epoch_helper.rs"
+required-features = ["capture-epoch-harness"]

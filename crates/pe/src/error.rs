@@ -2,6 +2,37 @@
 
 use std::io;
 
+/// Telemetry recorded by a [`with_capture_epoch`](crate::dumper::dump_process::with_capture_epoch)
+/// run. When no epoch was begun (`epoch_begun == false`), the count/ids/elapsed/started
+/// reflect "nothing frozen". Carried on error paths too so a failed live capture
+/// still records which epoch it ran in (Route Z R0 AF2 AF1 AF5 / P1-2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureEpochTelemetry {
+    /// Whether the atomic capture epoch was actually begun (and ended).
+    pub epoch_begun: bool,
+    /// Number of target threads frozen (0 when no epoch).
+    pub suspended_count: usize,
+    /// Suspended thread ids (0/empty when no epoch).
+    pub suspended_thread_ids: Vec<u32>,
+    /// Epoch elapsed milliseconds (0 when no epoch).
+    pub elapsed_ms: u128,
+    /// Epoch start unix ms (0 when no epoch).
+    pub started_ms: u64,
+}
+
+impl CaptureEpochTelemetry {
+    /// Telemetry for a run with NO epoch (nothing frozen).
+    pub fn none() -> Self {
+        Self {
+            epoch_begun: false,
+            suspended_count: 0,
+            suspended_thread_ids: Vec::new(),
+            elapsed_ms: 0,
+            started_ms: 0,
+        }
+    }
+}
+
 /// Errors that can occur during PE parsing and manipulation.
 #[derive(Debug, thiserror::Error)]
 pub enum PeError {
@@ -48,6 +79,42 @@ pub enum PeError {
         stage: String,
         /// Specific stage error text (root cause), preserving the chain.
         error: String,
+    },
+
+    /// The atomic capture epoch's live body AND its restore both failed. Preserves
+    /// BOTH error texts so the caller learns that the capture aborted AND that
+    /// some target threads may still be suspended, plus the epoch telemetry so the
+    /// failed capture's epoch is still recorded (Route Z R0 AF2 AF1 AF4/AF5).
+    #[error(
+        "capture epoch body failed: {body}; AND restore failed: {restore} (epoch telemetry: {telemetry:?})"
+    )]
+    CaptureEpochCombined {
+        /// The live capture body error.
+        body: String,
+        /// The epoch restore (unfreeze) error.
+        restore: String,
+        /// Epoch telemetry captured before the failure.
+        telemetry: CaptureEpochTelemetry,
+    },
+
+    /// The atomic capture epoch's live body failed (restore succeeded). Carries the
+    /// epoch telemetry so the failed capture's epoch is still recorded (P1-2).
+    #[error("capture epoch body failed: {error} (epoch telemetry: {telemetry:?})")]
+    CaptureEpochBodyFailed {
+        /// The live capture body error.
+        error: String,
+        /// Epoch telemetry captured before the failure.
+        telemetry: CaptureEpochTelemetry,
+    },
+
+    /// The atomic capture epoch's restore (unfreeze) failed. Carries the epoch
+    /// telemetry so the failed restore's epoch is still recorded (P1-2).
+    #[error("capture epoch restore failed: {error} (epoch telemetry: {telemetry:?})")]
+    CaptureEpochRestoreFailed {
+        /// The restore (unfreeze) error.
+        error: String,
+        /// Epoch telemetry captured before the failure.
+        telemetry: CaptureEpochTelemetry,
     },
 
     /// The unknown or unsupported optional header magic.

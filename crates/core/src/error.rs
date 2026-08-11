@@ -65,6 +65,65 @@ pub enum CoreError {
     /// `ContinueDebugEvent` parameter errors such as `ERROR_INVALID_PARAMETER`.
     #[error("{0}")]
     DebugState(String),
+
+    /// A capture-epoch restore (unfreeze / rollback) could not resume one or more
+    /// target threads. Carries the exact thread ids, the failing Win32 phase and
+    /// each Win32 error code, so a leaked suspended thread is never swallowed.
+    ///
+    /// This is a hard fail-closed signal: the epoch may be partially restored and
+    /// some threads may still be suspended.
+    #[error(
+        "capture epoch restore failed for {failed_count} thread(s); some may be left suspended: {failed:?}"
+    )]
+    CaptureEpochRestore {
+        /// Number of threads whose restore failed (≥1).
+        failed_count: usize,
+        /// Per-thread restore-failure details (phase + Win32 code).
+        failed: Vec<RestoreFailure>,
+    },
+
+    /// A capture-epoch freeze failed AND rolling back the already-suspended
+    /// threads also failed (partial rollback itself failed). Combines the original
+    /// freeze failure with the rollback failures so the caller learns both that
+    /// freezing was aborted and that some threads may still be suspended.
+    ///
+    /// Exhaustive (fail-closed): this is returned whenever the rollback did NOT
+    /// fully succeed — whether it produced structured per-thread failures
+    /// (`rollback_failed`) or a generic restore error (`rollback_error`). It is
+    /// NEVER treated as a successful rollback.
+    #[error(
+        "capture epoch freeze aborted: {freeze}; rollback ALSO failed (count={rollback_failed_count} structured + generic={rollback_error:?}), some may be left suspended: {rollback_failed:?}"
+    )]
+    CaptureFreezeWithRollbackFailure {
+        /// The original freeze failure (message).
+        freeze: String,
+        /// Number of threads whose rollback-resume failed (≥1 when
+        /// `rollback_failed` is non-empty).
+        rollback_failed_count: usize,
+        /// Per-thread rollback failure details (phase + Win32 code).
+        rollback_failed: Vec<RestoreFailure>,
+        /// A generic (non-per-thread) rollback restore error, when the rollback
+        /// returned an error that was not a structured `CaptureEpochRestore`.
+        /// `None` when the rollback failed structurally (or the rollback succeeded,
+        /// in which case this error is not constructed at all).
+        rollback_error: Option<String>,
+    },
+}
+
+/// Details of one failed thread-restore (unfreeze or rollback-resume) step.
+///
+/// Every restore failure is surfaced with the target thread id, the exact Win32
+/// phase that failed, and the Win32 error code, so a partial restore can never be
+/// misreported as complete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestoreFailure {
+    /// The target thread id that could not be restored.
+    pub thread_id: u32,
+    /// The failing phase: `"open"` (`OpenThread`) or `"resume"` (`ResumeThread`).
+    pub phase: &'static str,
+    /// The Win32 error code from the failed call (`0` when a phase returned the
+    /// invalid suspend count `0xFFFFFFFF` rather than a GetLastError code).
+    pub win32_code: u32,
 }
 
 /// Format a `ContinueDebugEvent` failure with HRESULT, Win32 low-word, and

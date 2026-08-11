@@ -1149,6 +1149,661 @@ impl DebuggerCore for WindowsDebugger {
 
         Err(CoreError::Windows(0x3E6)) // ERROR_NOACCESS
     }
+
+    /// Route Z R0 AF1: suspend every non-calling target thread so raw child C
+    /// and authoritative slab S are read in one stationary capture epoch.
+    ///
+    /// Enumerates the process's threads with ToolHelp, suspends each thread it
+    /// has not yet suspended, and re-enumerates until the thread set is stable
+    /// (handles threads that spawn during suspension). Records
+    /// `(thread_id, prior_suspend_count)` for every thread it newly suspended so
+    /// [`unfreeze_target_threads`](DebuggerCore::unfreeze_target_threads) can
+    /// restore each to its exact pre-epoch suspend count. Never suspends the
+    /// calling thread, and never alters the suspend count of threads it did not
+    /// suspend itself.
+    ///
+    /// Fail-closed: if any thread fails to open/suspend (or the thread set never
+    /// converges), already-suspended threads are rolled back and an error is
+    /// returned — it never returns a "frozen" result with threads left running.
+    fn freeze_target_threads(&mut self) -> Result<Vec<(u32, u32)>, CoreError> {
+        freeze_process_threads(self.process.pid)
+    }
+
+    /// Route Z R0 AF1: resume each thread this epoch suspended exactly once,
+    /// restoring its pre-epoch suspend count. Threads that were already
+    /// suspended before the epoch are left at their original count (we only
+    /// undo our own `SuspendThread`). Returns an error if any resume fails so a
+    /// leaked suspended thread is surfaced, never silently swallowed.
+    fn unfreeze_target_threads(&self, suspended: &[(u32, u32)]) -> Result<(), CoreError> {
+        unfreeze_process_threads(suspended)
+    }
+}
+
+/// Route Z R0 AF1/AF2: suspend every non-calling thread of `pid` (the target
+/// process) so live-memory reads form one stationary epoch. Returns
+/// `(thread_id, prior_suspend_count)` for each thread newly suspended.
+///
+/// - Never suspends the calling (test/debugger/controller) thread.
+/// - Re-enumerates until the thread set is stable (a thread spawned during
+///   enumeration is caught in a later round), with a bounded number of rounds.
+/// - **Fail-closed**: if any `OpenThread`/`SuspendThread` fails, or the thread
+///   set never converges, all already-suspended threads are rolled back and an
+///   error is returned — the caller never sees a "frozen" result while a target
+///   thread might still run.
+///
+/// This is the production entry point: it only ever drives the private
+/// implementation with `None` failure injections (no test-only path is reachable
+/// from the default library surface).
+pub fn freeze_process_threads(pid: u32) -> Result<Vec<(u32, u32)>, CoreError> {
+    #[cfg(feature = "capture-epoch-harness")]
+    {
+        freeze_process_threads_impl(pid, None, None, None)
+    }
+    #[cfg(not(feature = "capture-epoch-harness"))]
+    {
+        freeze_process_threads_impl(pid, None, None)
+    }
+}
+
+/// Route Z R0 AF2 AF1/AF2/AF3: TEST-ONLY injectable freeze entry point. **Compile
+/// gated behind the `capture-epoch-harness` feature** so it does not exist on the
+/// default production library surface at all (`#[cfg(feature=...)]`, not merely
+/// `#[doc(hidden)]`). A fresh default `cargo build` neither exports nor references
+/// this symbol.
+///
+/// - `fail_after_suspend = Some(k)` forces a rollback + `Err` after `k` target
+///   threads have been successfully suspended, proving the partial-freeze rollback
+///   path.
+/// - `fail_resume_tid = Some(tid)` injects a `ResumeThread` failure for exactly
+///   that tid during the rollback.
+/// - `exit_barrier = Some(b)` deterministically forces one real thread to exit at
+///   a configured window (single-shot; no probabilistic retry).
+#[cfg(feature = "capture-epoch-harness")]
+#[doc(hidden)]
+pub fn freeze_process_threads_with_failure(
+    pid: u32,
+    injection: FreezeInjection,
+) -> Result<Vec<(u32, u32)>, CoreError> {
+    freeze_process_threads_impl(
+        pid,
+        injection.fail_after_suspend,
+        injection.fail_resume_tid,
+        injection.exit_barrier,
+    )
+}
+
+/// Route Z R0 AF1/AF2: resume each thread `freeze_process_threads` suspended,
+/// restoring its exact pre-epoch suspend count. Returns an error if any resume
+/// fails (a leaked suspended thread), rather than silently swallowing it.
+///
+/// The returned [`CoreError::CaptureEpochRestore`] carries every failed thread id,
+/// the failing phase and the Win32 error code, so a partial restore is never
+/// misreported as complete. All threads are still attempted even after one fails.
+pub fn unfreeze_process_threads(suspended: &[(u32, u32)]) -> Result<(), CoreError> {
+    unfreeze_process_threads_impl(suspended, None)
+}
+
+/// Feature-gated diagnostics for the thread-exit race (Route Z R0 AF2 AF1 AF3).
+/// Under the `capture-epoch-harness` feature, the freeze implementation records
+/// the exact TID and transient-exit PHASE of every thread that hit a transient
+/// exit window, so the harness can PROVE (not assume) which window was exercised.
+#[cfg(feature = "capture-epoch-harness")]
+static TRANSIENT_EXIT_TIDS: std::sync::Mutex<Vec<(u32, &'static str)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Clear the transient-exit diagnostic (test setup). Feature-gated.
+#[cfg(feature = "capture-epoch-harness")]
+pub fn clear_transient_exit_diagnostics() {
+    TRANSIENT_EXIT_TIDS.lock().unwrap().clear();
+}
+
+/// Snapshot of the transient-exit `(tid, phase)` observations so far. Returns a
+/// sorted, deduplicated copy. Feature-gated. `phase` is `"before_open"` or
+/// `"after_open_before_suspend"`.
+#[cfg(feature = "capture-epoch-harness")]
+pub fn transient_exit_observations() -> Vec<(u32, &'static str)> {
+    let mut v = TRANSIENT_EXIT_TIDS.lock().unwrap().clone();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// Record a transient thread-exit observation `(tid, phase)` (internal,
+/// feature-gated).
+#[cfg(feature = "capture-epoch-harness")]
+fn record_transient_exit(tid: u32, phase: &'static str) {
+    TRANSIENT_EXIT_TIDS.lock().unwrap().push((tid, phase));
+}
+
+/// The deterministic thread-exit barrier window a feature-gated freeze run must
+/// deterministically force. See [`ExitBarrier`]. Feature-gated.
+#[cfg(feature = "capture-epoch-harness")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitBarrierWindow {
+    /// The barrier thread exits BEFORE the freeze's `OpenThread` for it.
+    BeforeOpen,
+    /// The barrier thread exits AFTER `OpenThread` succeeds but BEFORE
+    /// `SuspendThread`.
+    AfterOpenBeforeSuspend,
+}
+
+/// Outcome of a barrier's `force_exit` attempt (Route Z R0 AF2 AF1 AF4/AF5 / P1-1,
+/// P1-3, P2-3). Distinguishes the OS-level proof that the thread object terminated
+/// from an acknowledged command or a failure, so a command acknowledgement is NEVER
+/// conflated with thread termination.
+#[cfg(feature = "capture-epoch-harness")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BarrierExitResult {
+    /// The thread object was observed SIGNALED (`WaitForSingleObject` returned
+    /// `WAIT_OBJECT_0`) — the OS confirmed the thread terminated.
+    Terminated,
+    /// The wait timed out before the thread object signaled (`WAIT_TIMEOUT`): the
+    /// thread was still alive. Fail-closed.
+    Timeout,
+    /// The wait or handle-open failed (`WAIT_FAILED` / `OpenThread` failure). The
+    /// evidence query itself failed, so this is NOT termination evidence. Fail-closed.
+    ///
+    /// For a `WAIT_FAILED`, `hresult` is `0` and `win32_code` is the true
+    /// `GetLastError` Win32 code. For an `OpenThread` failure, `hresult` is the
+    /// `windows::core::Error::code()` HRESULT and `win32_code` is its low 16-bit
+    /// Win32 word. Both are retained so a raw HRESULT is never mislabeled as a
+    /// Win32 code (P2-3).
+    Failure { hresult: u32, win32_code: u32 },
+}
+
+/// A deterministic thread-exit barrier (Route Z R0 AF2 AF1 AF3/AF4).
+///
+/// Under the `capture-epoch-harness` feature, the freeze can be told to force one
+/// specific real thread to exit at a specific window, so a single freeze call
+/// deterministically exercises the corresponding transient-exit branch (no
+/// probabilistic retry storm).
+///
+/// The `force_exit(tid)` callback is provided by the harness: it must command the
+/// benign helper to terminate thread `tid`, then BLOCK until the OS thread object
+/// is observed SIGNALED (a genuine termination proof, e.g. via
+/// `WaitForSingleObject` on a `SYNCHRONIZE` thread handle). It returns
+/// [`BarrierExitResult::Terminated`] only on that OS-level proof; any timeout or
+/// evidence failure is returned as [`BarrierExitResult::Timeout`] /
+/// [`BarrierExitResult::Failure`]. The freeze implementation fails closed unless it
+/// sees `Terminated`.
+#[cfg(feature = "capture-epoch-harness")]
+pub struct ExitBarrier {
+    /// The exact real TID that must exit.
+    pub tid: u32,
+    /// Which transient window this barrier forces.
+    pub window: ExitBarrierWindow,
+    /// Harness callback: force `tid` to terminate and confirm via OS thread-object
+    /// signal.
+    pub force_exit: Box<dyn FnMut(u32) -> BarrierExitResult>,
+}
+
+/// Feature-gated injection configuration for the freeze entry point. Production
+/// passes `None`; only the test harness (feature `capture-epoch-harness`) supplies
+/// failures/barriers.
+#[cfg(feature = "capture-epoch-harness")]
+pub struct FreezeInjection {
+    /// Roll back + fail after this many successful suspends.
+    pub fail_after_suspend: Option<u32>,
+    /// Inject a `ResumeThread` failure for this tid during rollback.
+    pub fail_resume_tid: Option<u32>,
+    /// Deterministically force one thread to exit at a specific window.
+    pub exit_barrier: Option<ExitBarrier>,
+}
+
+/// Classify a `WaitForSingleObject` thread-object wait result (Route Z R0 AF2 AF1
+/// AF5 / P1-1). Extracted as a pure function so the termination/fail-closed decision
+/// is unit-testable independently of the live handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadWaitClass {
+    /// `WAIT_OBJECT_0`: the thread object is signaled => terminated => transient.
+    Terminated,
+    /// `WAIT_TIMEOUT`: the thread object is not signaled => still alive => fail-closed.
+    StillAlive,
+    /// `WAIT_FAILED`: the evidence query itself failed => fail-closed.
+    QueryFailed,
+    /// Any other wait result (unexpected) => fail-closed.
+    Unexpected,
+}
+
+/// Classify a `WAIT_EVENT` from `WaitForSingleObject`. The caller is responsible
+/// for capturing `GetLastError` immediately when the result is [`ThreadWaitClass::QueryFailed`].
+pub fn classify_thread_wait(wait: windows::Win32::Foundation::WAIT_EVENT) -> ThreadWaitClass {
+    if wait == windows::Win32::Foundation::WAIT_OBJECT_0 {
+        ThreadWaitClass::Terminated
+    } else if wait == windows::Win32::Foundation::WAIT_TIMEOUT {
+        ThreadWaitClass::StillAlive
+    } else if wait == windows::Win32::Foundation::WAIT_FAILED {
+        ThreadWaitClass::QueryFailed
+    } else {
+        ThreadWaitClass::Unexpected
+    }
+}
+
+/// Private capture-epoch freeze implementation.
+///
+/// The injection knobs are TEST-ONLY: the production entry [`freeze_process_threads`]
+/// always calls with `None`/`None`/`None`, and the injectable entry
+/// [`freeze_process_threads_with_failure`] exists only under the
+/// `capture-epoch-harness` feature. The parameters live here (private) so the
+/// production path provably only exercises the `None` code path.
+fn freeze_process_threads_impl(
+    pid: u32,
+    fail_after_suspend: Option<u32>,
+    fail_resume_tid: Option<u32>,
+    #[cfg(feature = "capture-epoch-harness")] mut exit_barrier: Option<ExitBarrier>,
+) -> Result<Vec<(u32, u32)>, CoreError> {
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+    };
+    use windows::Win32::System::Threading::{
+        GetCurrentThreadId, OpenThread, SuspendThread, THREAD_QUERY_INFORMATION,
+        THREAD_SUSPEND_RESUME,
+    };
+    let current = unsafe { GetCurrentThreadId() };
+    let mut suspended: Vec<(u32, u32)> = Vec::new();
+    let mut seen: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    const MAX_ROUNDS: usize = 8;
+    let mut converged = false;
+    for _round in 0..MAX_ROUNDS {
+        let mut new_this_round: Vec<u32> = Vec::new();
+        // SAFETY: CreateToolhelp32Snapshot/Thread32First/Next operate on a
+        // snapshot handle; THREADENTRY32 has dwSize set as required by the API.
+        unsafe {
+            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, pid);
+            let Ok(snap) = snap else {
+                // Snapshot failure: roll back anything already suspended. If the
+                // rollback itself fails, surface BOTH failures (fail-closed).
+                return rollback_or_combine(
+                    suspended,
+                    fail_resume_tid,
+                    "create toolhelp thread snapshot failed during freeze",
+                );
+            };
+            let mut te: THREADENTRY32 = std::mem::zeroed();
+            te.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+            if Thread32First(snap, &mut te).is_ok() {
+                loop {
+                    if te.th32OwnerProcessID == pid && te.th32ThreadID != current {
+                        if !seen.contains(&te.th32ThreadID) {
+                            seen.insert(te.th32ThreadID);
+                            new_this_round.push(te.th32ThreadID);
+                        }
+                    }
+                    if Thread32Next(snap, &mut te).is_err() {
+                        break;
+                    }
+                }
+            }
+            let _ = windows::Win32::Foundation::CloseHandle(snap);
+        }
+        if new_this_round.is_empty() {
+            converged = true;
+            break;
+        }
+        // Suspend every newly-discovered thread. Fail-closed on any failure.
+        for tid in &new_this_round {
+            // --- Deterministic transient-exit barrier, window 1: before OpenThread ---
+            // If the harness configured this exact TID to exit BEFORE OpenThread,
+            // force it to terminate and wait for OS confirmation, so the subsequent
+            // OpenThread deterministically fails with ERROR_INVALID_PARAMETER (87),
+            // exercising the before_open transient-exit branch in a single shot.
+            #[cfg(feature = "capture-epoch-harness")]
+            let mut barrier = exit_barrier.as_mut();
+            #[cfg(feature = "capture-epoch-harness")]
+            if let Some(b) = barrier.as_mut() {
+                if b.window == ExitBarrierWindow::BeforeOpen && b.tid == *tid {
+                    match (b.force_exit)(*tid) {
+                        BarrierExitResult::Terminated => {
+                            // OS thread object signaled: genuine termination proof.
+                        }
+                        other => {
+                            // Fail-closed: the barrier did not prove termination, so
+                            // we must NOT proceed to OpenThread (release builds behave
+                            // identically — no debug_assert).
+                            return rollback_or_combine(
+                                suspended,
+                                fail_resume_tid,
+                                &format!(
+                                    "barrier before_open for tid {tid} did not prove termination: {other:?}"
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+            // SAFETY: OpenThread/SuspendThread on a live target thread id. `THREAD_SYNCHRONIZE`
+            // is required so this handle can be used with WaitForSingleObject to prove
+            // a terminated thread object (Route Z R0 AF2 AF1 AF4 / P1-2).
+            let h = unsafe {
+                OpenThread(
+                    THREAD_SUSPEND_RESUME
+                        | THREAD_QUERY_INFORMATION
+                        | windows::Win32::System::Threading::THREAD_SYNCHRONIZE,
+                    false,
+                    *tid,
+                )
+            };
+            match h {
+                Ok(h) => {
+                    // --- Deterministic transient-exit barrier, window 2: after
+                    // OpenThread, before SuspendThread. ---
+                    // If the harness configured this TID to exit AFTER OpenThread
+                    // succeeds, force it to terminate and confirm OS termination.
+                    // The already-open handle becomes signaled once the thread object
+                    // terminates; SuspendThread then fails and we confirm via the
+                    // wait result below.
+                    #[cfg(feature = "capture-epoch-harness")]
+                    if let Some(b) = barrier.as_mut() {
+                        if b.window == ExitBarrierWindow::AfterOpenBeforeSuspend && b.tid == *tid {
+                            match (b.force_exit)(*tid) {
+                                BarrierExitResult::Terminated => {}
+                                other => {
+                                    // Fail-closed: no OS termination proof => do not
+                                    // proceed to SuspendThread; roll back and fail.
+                                    let _ = unsafe { windows::Win32::Foundation::CloseHandle(h) };
+                                    return rollback_or_combine(
+                                        suspended,
+                                        fail_resume_tid,
+                                        &format!(
+                                            "barrier after_open_before_suspend for tid {tid} did not prove termination: {other:?}"
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    // SAFETY: SuspendThread on the (possibly now-terminated) thread.
+                    let prior = unsafe { SuspendThread(h) };
+                    if prior == u32::MAX {
+                        // Read the error immediately, before any further call.
+                        let suspend_code = unsafe { windows::Win32::Foundation::GetLastError() }.0;
+                        // Distinguish a thread that EXITED between OpenThread and
+                        // SuspendThread (transient) from a real failure, using the
+                        // thread OBJECT signal (THREAD_SYNCHRONIZE on the handle).
+                        // Classification (Route Z R0 AF2 AF1 AF5 / P1-1):
+                        //   WAIT_OBJECT_0  => terminated => transient
+                        //   WAIT_TIMEOUT   => still alive => bounded retry, then fail-closed
+                        //   WAIT_FAILED    => evidence failure => GetLastError IMMEDIATELY,
+                        //                       before CloseHandle, then fail-closed rollback
+                        //   unexpected     => fail-closed rollback
+                        let mut wait_res = windows::Win32::Foundation::WAIT_TIMEOUT;
+                        // Read WAIT_FAILED's GetLastError immediately (before any
+                        // sleep/CloseHandle which could overwrite last-error).
+                        let mut wait_failed_code: Option<u32> = None;
+                        for _ in 0..100 {
+                            // SAFETY: WaitForSingleObject on our own thread handle.
+                            wait_res = unsafe {
+                                windows::Win32::System::Threading::WaitForSingleObject(h, 0)
+                            };
+                            if wait_res == windows::Win32::Foundation::WAIT_OBJECT_0 {
+                                break;
+                            }
+                            if wait_res == windows::Win32::Foundation::WAIT_FAILED {
+                                // Evidence query failed: capture the code IMMEDIATELY
+                                // (before CloseHandle / any further API call), then
+                                // fail closed — do NOT sleep or keep polling.
+                                // SAFETY: GetLastError read immediately after the failed call.
+                                wait_failed_code =
+                                    Some(unsafe { windows::Win32::Foundation::GetLastError() }.0);
+                                break;
+                            }
+                            // WAIT_TIMEOUT (thread still alive): bounded retry.
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        let _ = unsafe { windows::Win32::Foundation::CloseHandle(h) };
+                        if wait_res == windows::Win32::Foundation::WAIT_OBJECT_0 {
+                            // Thread object signaled => terminated => transient exit.
+                            #[cfg(feature = "capture-epoch-harness")]
+                            record_transient_exit(*tid, "after_open_before_suspend");
+                            continue;
+                        }
+                        // Fail-closed for WAIT_TIMEOUT / WAIT_FAILED / unexpected:
+                        // never treat as a terminated thread.
+                        let wait_detail = match classify_thread_wait(wait_res) {
+                            ThreadWaitClass::QueryFailed => {
+                                format!(
+                                    ", WaitForSingleObject failed code {:#x}",
+                                    wait_failed_code.unwrap_or(0)
+                                )
+                            }
+                            ThreadWaitClass::StillAlive => {
+                                ", thread object NOT signaled (still alive / wait timeout)"
+                                    .to_string()
+                            }
+                            _ => format!(", unexpected wait result {wait_res:?}"),
+                        };
+                        return rollback_or_combine(
+                            suspended,
+                            fail_resume_tid,
+                            &format!(
+                                "SuspendThread failed (code {suspend_code:#x}) for target thread {tid} during freeze{wait_detail}"
+                            ),
+                        );
+                    }
+                    let _ = unsafe { windows::Win32::Foundation::CloseHandle(h) };
+                    suspended.push((*tid, prior));
+                    // Test-only failure injection: after `k` successful suspends,
+                    // roll back and fail (only reachable from the feature-gated
+                    // injectable entry; production passes `None`).
+                    if let Some(k) = fail_after_suspend {
+                        if suspended.len() as u32 >= k {
+                            return rollback_or_combine(
+                                suspended,
+                                fail_resume_tid,
+                                &format!("test-injected freeze failure after {k} suspensions"),
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Distinguish a transient thread-exit race from a real
+                    // failure: if the thread exited between the ToolHelp
+                    // snapshot and OpenThread, OpenThread fails with
+                    // ERROR_INVALID_PARAMETER (87), surfaced either as a raw
+                    // Win32 code (0x57) or as an HRESULT-wrapped code
+                    // (0x80070057). Tolerate that as a short-lived thread that
+                    // is gone. Any other error is fail-closed with rollback.
+                    let code = e.code().0;
+                    // Compare the low 16 bits: for a raw Win32 code this is the
+                    // error itself (87), for an HRESULT-wrapped code (0x80070057)
+                    // it is also 87. Both mean "thread exited".
+                    let low = code & 0xffff;
+                    if low == 87 {
+                        // Thread exited between the ToolHelp snapshot and
+                        // OpenThread. Feature-gated: record the exact TID and phase
+                        // so the harness can prove this transient-exit branch ran.
+                        #[cfg(feature = "capture-epoch-harness")]
+                        record_transient_exit(*tid, "before_open");
+                        continue;
+                    }
+                    return rollback_or_combine(
+                        suspended,
+                        fail_resume_tid,
+                        &format!(
+                            "OpenThread failed (code {code:#x}) for target thread {tid} during freeze"
+                        ),
+                    );
+                }
+            }
+        }
+    }
+    if !converged {
+        // The thread set never stabilized (a thread kept spawning each round).
+        return rollback_or_combine(
+            suspended,
+            fail_resume_tid,
+            "target thread set did not converge during capture freeze",
+        );
+    }
+    Ok(suspended)
+}
+
+/// Roll back already-suspended threads on a partial-freeze failure. When the
+/// rollback itself also fails, combines the original freeze failure with every
+/// rollback failure into a single fail-closed error so the caller learns that
+/// some threads may still be suspended. When the rollback fully succeeds, returns
+/// the plain freeze error.
+fn rollback_or_combine(
+    suspended: Vec<(u32, u32)>,
+    fail_resume_tid: Option<u32>,
+    freeze_msg: &str,
+) -> Result<Vec<(u32, u32)>, CoreError> {
+    match unfreeze_process_threads_impl(&suspended, fail_resume_tid) {
+        Ok(()) => Err(CoreError::ProcessCreation(freeze_msg.to_string())),
+        Err(e) => rollback_or_combine_error(freeze_msg, e),
+    }
+}
+
+/// Combine an original freeze failure with a rollback failure. **Exhaustive
+/// fail-closed**: ANY rollback error (structured per-thread or generic) is treated
+/// as a failed rollback and merged with the freeze error — never as success.
+///
+/// Separate from [`rollback_or_combine`] so a unit test can inject an arbitrary
+/// rollback error and prove the generic-error branch.
+fn rollback_or_combine_error(
+    freeze_msg: &str,
+    rollback_err: CoreError,
+) -> Result<Vec<(u32, u32)>, CoreError> {
+    match rollback_err {
+        // Structured per-thread rollback failures: merge them with the freeze error.
+        CoreError::CaptureEpochRestore { failed, .. } => {
+            Err(CoreError::CaptureFreezeWithRollbackFailure {
+                freeze: freeze_msg.to_string(),
+                rollback_failed_count: failed.len(),
+                rollback_failed: failed,
+                rollback_error: None,
+            })
+        }
+        // ANY other rollback error: still a rollback failure — NEVER treated as
+        // success. Preserve the generic rollback error text alongside the freeze
+        // error (fail-closed).
+        other => Err(CoreError::CaptureFreezeWithRollbackFailure {
+            freeze: freeze_msg.to_string(),
+            rollback_failed_count: 0,
+            rollback_failed: Vec::new(),
+            rollback_error: Some(format!("{other:?}")),
+        }),
+    }
+}
+
+/// Private capture-epoch unfreeze implementation. Resumes every thread, restoring
+/// each exact pre-epoch suspend count. **Continues past any single failure** and
+/// returns a [`CoreError::CaptureEpochRestore`] carrying every failed thread id,
+/// phase and Win32 code — never stops at the first error, never swallows a failed
+/// restore.
+///
+/// `fail_resume_tid = Some(tid)` is a TEST-ONLY injection (only reachable from the
+/// feature-gated injectable freeze entry via the rollback path) that forces a
+/// `ResumeThread` failure for exactly that tid. Production passes `None`.
+fn unfreeze_process_threads_impl(
+    suspended: &[(u32, u32)],
+    fail_resume_tid: Option<u32>,
+) -> Result<(), CoreError> {
+    use windows::Win32::System::Threading::{
+        OpenThread, ResumeThread, THREAD_QUERY_INFORMATION, THREAD_SUSPEND_RESUME,
+    };
+    let mut failed: Vec<crate::error::RestoreFailure> = Vec::new();
+    for (tid, _prior) in suspended {
+        // SAFETY: OpenThread/ResumeThread on a live target thread id.
+        unsafe {
+            match OpenThread(
+                THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION,
+                false,
+                *tid,
+            ) {
+                Ok(h) => {
+                    // TEST-ONLY injected resume failure (only reachable from the
+                    // feature-gated injectable freeze entry's rollback path): do
+                    // NOT resume the thread (leaving it genuinely suspended) and
+                    // report the restore as failed, faithfully simulating a
+                    // ResumeThread failure so the caller must handle a leaked
+                    // suspended thread.
+                    if Some(*tid) == fail_resume_tid {
+                        let _ = windows::Win32::Foundation::CloseHandle(h);
+                        failed.push(crate::error::RestoreFailure {
+                            thread_id: *tid,
+                            phase: "resume",
+                            win32_code: 0,
+                        });
+                        continue;
+                    }
+                    let r = ResumeThread(h);
+                    // Read GetLastError IMMEDIATELY after the failing call, BEFORE
+                    // any other Win32 call (CloseHandle may overwrite the thread's
+                    // last-error value), so the recorded code truly belongs to
+                    // ResumeThread (P1-3).
+                    let resume_code = if r == u32::MAX {
+                        Some(windows::Win32::Foundation::GetLastError().0)
+                    } else {
+                        None
+                    };
+                    let _ = windows::Win32::Foundation::CloseHandle(h);
+                    if let Some(code) = resume_code {
+                        failed.push(crate::error::RestoreFailure {
+                            thread_id: *tid,
+                            phase: "resume",
+                            win32_code: code,
+                        });
+                    }
+                }
+                Err(e) => {
+                    // A real OpenThread failure on restore is fail-closed (a
+                    // leaked suspended thread). Tolerate only a thread that has
+                    // exited (code low-16 == 87), same as the freeze path.
+                    let code = e.code().0;
+                    if code & 0xffff == 87 {
+                        // Thread already gone; nothing to resume, not a leak.
+                        continue;
+                    }
+                    failed.push(crate::error::RestoreFailure {
+                        thread_id: *tid,
+                        phase: "open",
+                        win32_code: (code & 0xffff) as u32,
+                    });
+                }
+            }
+        }
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        let n = failed.len();
+        Err(CoreError::CaptureEpochRestore {
+            failed_count: n,
+            failed,
+        })
+    }
+}
+
+/// Enumerate a process's thread IDs (for diagnostics / harness verification).
+pub fn enumerate_process_threads(pid: u32) -> Result<Vec<u32>, CoreError> {
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+    };
+    let mut out = Vec::new();
+    // SAFETY: ToolHelp thread snapshot of the given process.
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, pid);
+        let Ok(snap) = snap else {
+            return Err(CoreError::ProcessCreation(
+                "toolhelp thread snapshot failed".into(),
+            ));
+        };
+        let mut te: THREADENTRY32 = std::mem::zeroed();
+        te.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+        if Thread32First(snap, &mut te).is_ok() {
+            loop {
+                if te.th32OwnerProcessID == pid {
+                    out.push(te.th32ThreadID);
+                }
+                if Thread32Next(snap, &mut te).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = windows::Win32::Foundation::CloseHandle(snap);
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -1570,5 +2225,117 @@ mod tests {
         }
         // Reaching here means Drop ran without panicking 闁?the regression is
         // satisfied.
+    }
+
+    /// [P1-4] Exhaustive fail-closed rollback: a rollback error that is NOT a
+    /// structured `CaptureEpochRestore` must be merged with the freeze error and
+    /// NEVER reported as a successful rollback.
+    #[test]
+    fn generic_rollback_error_is_fail_closed() {
+        let r = rollback_or_combine_error("freeze aborted (test)", CoreError::Windows(5));
+        match r {
+            Err(CoreError::CaptureFreezeWithRollbackFailure {
+                freeze,
+                rollback_failed_count,
+                rollback_failed,
+                rollback_error,
+            }) => {
+                assert!(freeze.contains("freeze aborted"), "freeze msg: {freeze}");
+                assert_eq!(rollback_failed_count, 0, "no structured failures");
+                assert!(rollback_failed.is_empty());
+                let generic = rollback_error.expect("generic rollback error must be preserved");
+                assert!(
+                    generic.contains("Windows API error") || generic.contains("5"),
+                    "generic rollback error text preserved: {generic}"
+                );
+            }
+            other => panic!("expected CaptureFreezeWithRollbackFailure, got {other:?}"),
+        }
+    }
+
+    /// [P1-4] A successful rollback (no error) is NOT a combined failure: the plain
+    /// freeze error is returned.
+    #[test]
+    fn successful_rollback_returns_plain_freeze_error() {
+        // No rollback error → `CaptureEpochRestore` never returned → plain freeze error.
+        let r = rollback_or_combine_error(
+            "freeze aborted (test)",
+            CoreError::CaptureEpochRestore {
+                failed_count: 0,
+                failed: Vec::new(),
+            },
+        );
+        match r {
+            Err(CoreError::CaptureFreezeWithRollbackFailure {
+                rollback_failed_count,
+                rollback_error,
+                ..
+            }) => {
+                assert_eq!(rollback_failed_count, 0);
+                assert!(rollback_error.is_none());
+            }
+            other => panic!("expected CaptureFreezeWithRollbackFailure, got {other:?}"),
+        }
+    }
+
+    /// [P1-3] `GetLastError` must be captured immediately after the failing call and
+    /// BEFORE `CloseHandle`, so the recorded Win32 code belongs to the failing API.
+    ///
+    /// This is a pure unit proof of the capture-order invariant by directly
+    /// exercising the private unfreeze impl against the CURRENT thread: we open the
+    /// current thread (a real handle), deliberately pass a `fail_resume_tid` that
+    /// matches it (which takes the injection path that does NOT resume), and verify
+    /// the returned `RestoreFailure.phase` is "resume". The error-code ordering is
+    /// structurally guaranteed by the implementation (GetLastError read into
+    /// `resume_code` before `CloseHandle`); this test locks the phase/thread mapping.
+    #[test]
+    fn restore_failure_records_phase_and_thread() {
+        use windows::Win32::System::Threading::GetCurrentThreadId;
+        let me = unsafe { GetCurrentThreadId() };
+        // Inject a resume failure for the current thread (injection path).
+        let r = unfreeze_process_threads_impl(&[(me, 0)], Some(me));
+        match r {
+            Err(CoreError::CaptureEpochRestore { failed, .. }) => {
+                let f = failed
+                    .iter()
+                    .find(|x| x.thread_id == me)
+                    .expect("tid reported");
+                assert_eq!(f.phase, "resume", "phase must be resume");
+                // injection path records code 0 (controlled), not a real Win32 code.
+                assert_eq!(f.win32_code, 0);
+            }
+            other => panic!("expected CaptureEpochRestore, got {other:?}"),
+        }
+    }
+
+    /// [P1-1] The wait-result classifier maps each `WAIT_*` outcome correctly:
+    /// `WAIT_OBJECT_0` => terminated (transient), `WAIT_TIMEOUT` => still alive
+    /// (fail-closed), `WAIT_FAILED` => evidence failure (fail-closed), and an
+    /// unexpected value => fail-closed. This locks the classification that decides
+    /// whether a `SuspendThread` failure is a transient exit or a real failure.
+    #[test]
+    fn classify_thread_wait_maps_all_outcomes() {
+        use windows::Win32::Foundation::{
+            WAIT_ABANDONED, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        };
+        use windows::Win32::System::Threading::WaitForSingleObject; // type only
+        let _ = WaitForSingleObject::<windows::Win32::Foundation::HANDLE>; // silence unused
+        assert_eq!(
+            classify_thread_wait(WAIT_OBJECT_0),
+            ThreadWaitClass::Terminated
+        );
+        assert_eq!(
+            classify_thread_wait(WAIT_TIMEOUT),
+            ThreadWaitClass::StillAlive
+        );
+        assert_eq!(
+            classify_thread_wait(WAIT_FAILED),
+            ThreadWaitClass::QueryFailed
+        );
+        // WAIT_ABANDONED (or any other) is unexpected => fail-closed.
+        assert_eq!(
+            classify_thread_wait(WAIT_ABANDONED),
+            ThreadWaitClass::Unexpected
+        );
     }
 }

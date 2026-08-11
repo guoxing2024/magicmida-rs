@@ -186,6 +186,12 @@ impl DebuggerCore for ProcessSession {
     ) -> Result<(), CoreError> {
         self.eng.backend().set_thread_context(thread_id, ctx)
     }
+    fn freeze_target_threads(&mut self) -> Result<Vec<(u32, u32)>, CoreError> {
+        self.eng.backend_mut().freeze_target_threads()
+    }
+    fn unfreeze_target_threads(&self, suspended: &[(u32, u32)]) -> Result<(), CoreError> {
+        self.eng.backend().unfreeze_target_threads(suspended)
+    }
 }
 
 // ---------------------------------------------------------------------------

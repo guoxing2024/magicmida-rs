@@ -7,13 +7,115 @@ use std::path::Path;
 
 use tracing::{debug, info, warn};
 
-use crate::error::PeError;
+use crate::error::{CaptureEpochTelemetry, PeError};
 use crate::header::PeHeader;
 use crate::original_imports::{read_original_import_table, resolve_imports_via_getprocaddress};
 
 use sha2::Digest as _;
 
 use super::header_patch::{shrink_sections, validate_and_patch_pe_header};
+
+/// Whether the atomic capture epoch (Route Z R0 AF1/AF2) must be begun for a given
+/// stage plan. The epoch freezes every target thread so live-memory reads (container
+/// snapshot, heap-global snapshot, authoritative-slab capture) come from one
+/// stationary capture epoch.
+///
+/// **Strict gating (Route Z R0 AF2 AF1 AF2 / P1-5):** the epoch is needed ONLY when
+/// at least one live-capture stage that reads live target memory is enabled
+/// (`detect_containers` or `detect_heap_globals`). When no such stage is enabled
+/// (e.g. OreansClassic), the target is NEVER frozen: no freeze is required of the
+/// backend, a `ReadOnlyProcessDebugger` (which cannot freeze) is not forced to fail,
+/// and the non-GTO dump profile keeps its baseline behavior exactly. This keeps
+/// Route Z's fix scoped to the GTO/AHK live-capture chain.
+pub fn capture_epoch_needed(plan: super::types::ExperimentalStagePlan) -> bool {
+    plan.detect_containers || plan.detect_heap_globals
+}
+
+/// Run a live-memory capture body under an atomic capture epoch when `epoch_needed`,
+/// or directly on the plain debugger when not. **This is the exact function
+/// `dump_process` calls**, so the production scope-gating decision (Route Z R0 AF2
+/// AF1 AF3 / P2-1) is locked by real `freeze_target_threads`/`unfreeze_target_threads`
+/// call counts on a mock backend — not a pure-predicate test.
+///
+/// - `epoch_needed == false` (e.g. OreansClassic / no live-capture stage): the epoch
+///   is never begun, `freeze_target_threads` is never called, and the body runs on
+///   the plain debugger (target never frozen).
+/// - `epoch_needed == true` (GTO Route Z capture): the epoch is begun (freeze exactly
+///   once), the body runs on the frozen epoch's debugger, and the epoch is ended
+///   (unfreeze exactly once) before returning. The body result and the restore result
+///   are BOTH captured and combined explicitly (Route Z R0 AF2 AF1 AF4 / P1-4) — the
+///   ordinary error-return path does NOT rely on `Drop`; `Drop` is only the last
+///   resort for panic/unwind. Telemetry `elapsed_ms` is captured AFTER the live body
+///   runs and BEFORE unfreeze (P1-5), so it reflects the full capture window.
+/// - The epoch always ends (and `unfreeze` runs) BEFORE the body's result / telemetry
+///   is returned, so offline work after this call is provably outside the frozen
+///   window.
+pub fn with_capture_epoch<T>(
+    debugger: &mut dyn mida_core::DebuggerCore,
+    epoch_needed: bool,
+    body: impl FnOnce(&mut dyn mida_core::DebuggerCore) -> Result<T, PeError>,
+) -> Result<(T, CaptureEpochTelemetry), PeError> {
+    if !epoch_needed {
+        // No epoch: target never frozen, body runs directly on the plain debugger.
+        let out = body(debugger)?;
+        return Ok((out, CaptureEpochTelemetry::none()));
+    }
+    // Begin the atomic capture epoch (freeze every target thread exactly once).
+    let mut epoch = mida_core::capture_epoch::CaptureEpochGuard::begin(debugger).map_err(|e| {
+        PeError::GtoStage {
+            stage: "capture_epoch_freeze".into(),
+            error: format!("{e}"),
+        }
+    })?;
+    // Capture the epoch-start telemetry (freeze facts, start time) BEFORE the body.
+    let started_ms = epoch.epoch_started_ms();
+    let suspended_count = epoch.suspended_count();
+    let suspended_thread_ids = epoch.suspended_thread_ids();
+
+    // Run the live-memory capture body within the frozen window. Capture the body
+    // result (NOT via `?`) so restore still runs explicitly.
+    let body_result = body(epoch.debugger());
+
+    // Capture the capture-window elapsed time AFTER the body, BEFORE unfreeze (P1-5),
+    // so it reflects detect_containers/detect_heap_globals/capture_heap_slab duration.
+    let elapsed_ms = epoch.elapsed_ms();
+
+    // End the epoch: restore every thread (unfreeze exactly once). Explicit, on both
+    // body success AND failure (never relying on Drop for the ordinary error path).
+    let restore_result = epoch.end().map_err(|e| PeError::GtoStage {
+        stage: "capture_epoch_restore".into(),
+        error: format!("{e}"),
+    });
+    drop(epoch);
+
+    let telemetry = CaptureEpochTelemetry {
+        epoch_begun: true,
+        suspended_count,
+        suspended_thread_ids,
+        elapsed_ms,
+        started_ms,
+    };
+
+    match (body_result, restore_result) {
+        (Ok(v), Ok(())) => Ok((v, telemetry)),
+        // Body failed (restore OK): preserve the epoch telemetry on the error path.
+        (Err(be), Ok(())) => Err(PeError::CaptureEpochBodyFailed {
+            error: format!("{be}"),
+            telemetry: telemetry.clone(),
+        }),
+        // Restore failed (body OK): preserve the epoch telemetry on the error path.
+        (Ok(_), Err(re)) => Err(PeError::CaptureEpochRestoreFailed {
+            error: format!("{re}"),
+            telemetry: telemetry.clone(),
+        }),
+        // Both body and restore failed: preserve BOTH errors AND the telemetry.
+        (Err(be), Err(re)) => Err(PeError::CaptureEpochCombined {
+            body: format!("{be}"),
+            restore: format!("{re}"),
+            telemetry,
+        }),
+    }
+}
 
 /// Relocate internal RVAs in an IMAGE_EXPORT_DIRECTORY structure.
 ///
@@ -843,62 +945,100 @@ pub fn dump_process_with_report(
     // overlay intentionally strips process-local CRT state so the dumped PE
     // can re-run CRT from entry; that also erases encoded container triples.
     // OreansClassic: leave containers empty (no GTO/AHK capture).
-    let mut containers = if stage_plan.detect_containers {
-        super::container_snapshot::detect_containers(&pe, &dump_buf, debugger)
-    } else {
-        Vec::new()
-    };
-    // Zero-raw .fill heap slots must be snapshotted from the LIVE late image
-    // before pointer scrub zeros process-local addresses.
-    // OreansClassic: leave heap_globals empty (no HOT_GSCRIPT_RVAs path).
+    //
+    // Route Z R0 AF1/AF2: the atomic capture epoch — freeze every target thread
+    // so container / heap-global / authoritative-slab reads come from the same
+    // stationary capture epoch (prevents the A2 249 ms child/slab TOCTOU). The
+    // epoch ends before any offline seed/transform/overlay work.
+    //
+    // **Strict gating (Route Z R0 AF2 AF1 AF2 / P1-5):** the epoch is begun ONLY
+    // when at least one live-capture stage that reads live target memory is
+    // enabled (`detect_containers` or `detect_heap_globals`). When no such stage
+    // is enabled (e.g. OreansClassic), the target is NEVER frozen: no freeze is
+    // required of the backend, a `ReadOnlyProcessDebugger` (which cannot freeze)
+    // is not forced to fail, and the non-GTO dump profile keeps its baseline
+    // behavior exactly. This keeps Route Z's fix scoped to the GTO/AHK live-capture
+    // chain instead of expanding to unrelated dump profiles/backends.
+    let epoch_needed = capture_epoch_needed(stage_plan);
     let capture_policy = opts
         .capture_policy
         .clone()
         .resolve_for_profile(opts.profile);
-    // Route T R0-B: dedicated authoritative slabs for each admitted
-    // dangling-edge allocation (surfaced alongside the heap globals).
-    let mut dedicated_slabs: Vec<super::heap_global_snapshot::HeapSlab> = Vec::new();
-    let mut heap_globals = if stage_plan.detect_heap_globals {
-        // Route T R0-B: detect_heap_globals now also returns dedicated
-        // authoritative slabs for each admitted dangling-edge allocation.
-        let (globals, dedicated) = super::heap_global_snapshot::detect_heap_globals(
-            &pe,
-            &dump_buf,
-            debugger,
-            &capture_policy,
-        );
-        dedicated_slabs = dedicated;
-        globals
-    } else {
-        Vec::new()
-    };
-    // ---- R0-C.1: capture the RAW heap slab and RAW children BEFORE transforms ----
-    // The transforms below (scrub/repair/sort/sanitize) rewrite the child payloads
-    // offline. The slab must be captured from the same live state as the raw
-    // children so raw coherence can be proven, then the transformed bytes are
-    // overlaid onto a patched backing slab. Only when MIDA_GTO_NO_BYPASS=1.
     let no_bypass = std::env::var("MIDA_GTO_NO_BYPASS").ok().as_deref() == Some("1");
-    // Route T R0 AF1 (TAF1-A/TAF1-F): the authoritative slab SET = the main heap
-    // slab (contiguous cluster, if capture_heap_slab yields one) + every dedicated
-    // dangling-edge slab. This single set flows through raw capture -> seed ->
-    // overlay -> runtime planner, so there is never an overlay-single / runtime-multi
-    // fork. If the main slab is absent (dispersed dangling edges blow the 64MiB cap)
-    // but dedicated slabs exist, the dedicated slabs STILL form the authoritative set
-    // and raw coherence (seed/overlay) is NOT skipped.
-    let main_slab: Option<super::heap_global_snapshot::HeapSlab> =
-        if no_bypass && stage_plan.detect_heap_globals {
-            // Route V R0 (V0-A): stage telemetry for the heap-slab capture.
-            let mut _stats = super::stage_timing::StageStats::default();
-            let mut _g = super::stage_timing::StageGuard::begin("capture_heap_slab");
-            let _s = super::heap_global_snapshot::capture_heap_slab(&heap_globals, debugger);
-            if let Some(ref s) = _s {
-                _stats.byte_count = s.content.len() as u64;
-            }
-            _g.with_stats(_stats); // attaches counts; exit emitted on drop
-            _s
-        } else {
-            None
-        };
+
+    // Route Z R0 AF1/AF2/AF3: run the live-memory capture under an atomic capture
+    // epoch — freeze every target thread so container / heap-global /
+    // authoritative-slab reads come from the same stationary capture epoch (prevents
+    // the A2 249 ms child/slab TOCTOU). `with_capture_epoch` (the SAME function the
+    // P2-1 call-count regression tests exercise) decides whether the epoch is begun
+    // at all, so:
+    //   - OreansClassic / no live-capture stage: the target is NEVER frozen and the
+    //     epoch is never begun (freeze=0, unfreeze=0).
+    //   - GTO Route Z capture: the epoch is begun once (freeze=1) and ended once
+    //     (unfreeze=1) before returning — all offline seed/transform/overlay work
+    //     below runs AFTER `unfreeze`.
+    let ((mut containers, mut heap_globals, dedicated_slabs, main_slab), capture_tel) =
+        with_capture_epoch(debugger, epoch_needed, |live_dbg| {
+            // Detect SecurityCookie-encoded heap containers from the LIVE late image
+            // BEFORE rewinding `.data` to the early (pre-CRT) baseline.
+            let c = if stage_plan.detect_containers {
+                super::container_snapshot::detect_containers(&pe, &dump_buf, live_dbg)
+            } else {
+                Vec::new()
+            };
+            // Zero-raw .fill heap slots must be snapshotted from the LIVE late image
+            // before pointer scrub zeros process-local addresses.
+            let mut ds: Vec<super::heap_global_snapshot::HeapSlab> = Vec::new();
+            let hg = if stage_plan.detect_heap_globals {
+                // Route T R0-B: detect_heap_globals also returns dedicated
+                // authoritative slabs for each admitted dangling-edge allocation.
+                let (globals, dedicated) = super::heap_global_snapshot::detect_heap_globals(
+                    &pe,
+                    &dump_buf,
+                    live_dbg,
+                    &capture_policy,
+                );
+                ds = dedicated;
+                globals
+            } else {
+                Vec::new()
+            };
+            // ---- R0-C.1: capture the RAW heap slab and RAW children BEFORE transforms ----
+            // The slab must be captured from the same live state as the raw children so
+            // raw coherence can be proven, then the transformed bytes are overlaid onto
+            // a patched backing slab. Only when MIDA_GTO_NO_BYPASS=1.
+            // Route T R0 AF1 (TAF1-A/TAF1-F): the authoritative slab SET = the main
+            // heap slab (if capture_heap_slab yields one) + every dedicated dangling-edge
+            // slab. This single set flows through raw capture -> seed -> overlay ->
+            // runtime planner, so there is never an overlay-single / runtime-multi fork.
+            let ms: Option<super::heap_global_snapshot::HeapSlab> =
+                if no_bypass && stage_plan.detect_heap_globals {
+                    // Route V R0 (V0-A): stage telemetry for the heap-slab capture.
+                    let mut _stats = super::stage_timing::StageStats::default();
+                    let mut _g = super::stage_timing::StageGuard::begin("capture_heap_slab");
+                    let _s = super::heap_global_snapshot::capture_heap_slab(&hg, live_dbg);
+                    if let Some(ref s) = _s {
+                        _stats.byte_count = s.content.len() as u64;
+                    }
+                    _g.with_stats(_stats); // attaches counts; exit emitted on drop
+                    _s
+                } else {
+                    None
+                };
+            Ok((c, hg, ds, ms))
+        })?;
+    // Route Z R0 AF1: log the epoch outcome. All remaining work (slab normalize,
+    // reconcile, seed, transforms, overlay, runtime plan, manifest) is OFFLINE and
+    // runs while the target is NOT frozen.
+    info!(
+        route = "route_z_r0_af1",
+        epoch_begun = capture_tel.epoch_begun,
+        suspended_thread_count = capture_tel.suspended_count,
+        suspended_thread_ids = ?capture_tel.suspended_thread_ids,
+        epoch_elapsed_ms = capture_tel.elapsed_ms as u64,
+        epoch_started_ms = capture_tel.started_ms,
+        "capture epoch handled; target unfrozen before offline seed/transforms"
+    );
     // Route T R0 AF2/AF3 (TAF2-B, TAF3-A/B): build the authoritative slab CANDIDATES
     // with their TRUE capture roles (main vs dedicated), then normalize
     // deterministically BEFORE coverage / raw capture / seed. This collapses exact
@@ -3109,6 +3249,416 @@ fn replace_via_os(tmp: &Path, output: &Path) -> Result<(), PeError> {
         std::fs::remove_file(output).map_err(PeError::Io)?;
     }
     std::fs::rename(tmp, output).map_err(PeError::Io)
+}
+
+/// Route Z R0 AF2 AF1 AF2 / P1-5: the atomic capture epoch must be strictly gated
+/// to the GTO/AHK live-capture chain. These tests pin the `capture_epoch_needed`
+/// predicate that decides whether the epoch (and thus `freeze_target_threads`) is
+/// invoked in `dump_process`. The production call site only begins an epoch inside
+/// `if capture_epoch_needed(stage_plan)`, so `freeze`/`unfreeze` are each called
+/// exactly once for a GTO capture and ZERO times when no live-capture stage is
+/// enabled (OreansClassic).
+#[cfg(test)]
+mod capture_epoch_gating_tests {
+    use super::super::types::{DumpProfile, ExperimentalStagePlan};
+
+    fn oreans_plan() -> ExperimentalStagePlan {
+        DumpProfile::OreansClassic.stage_plan()
+    }
+
+    fn gto_plan() -> ExperimentalStagePlan {
+        DumpProfile::AhkGtoExperimental.stage_plan()
+    }
+
+    /// Scenario (a): OreansClassic / all live-capture stages disabled → no epoch.
+    #[test]
+    fn oreans_classic_does_not_need_epoch() {
+        let plan = oreans_plan();
+        assert!(
+            !plan.detect_containers && !plan.detect_heap_globals,
+            "OreansClassic must have no live-capture stages"
+        );
+        assert_eq!(
+            super::capture_epoch_needed(plan),
+            false,
+            "OreansClassic must NOT begin a capture epoch (freeze=0, unfreeze=0)"
+        );
+    }
+
+    /// Scenario (b): full GTO Route Z capture → exactly one epoch.
+    #[test]
+    fn gto_route_z_needs_epoch() {
+        let plan = gto_plan();
+        assert!(
+            plan.detect_containers && plan.detect_heap_globals,
+            "AhkGtoExperimental must enable both live-capture stages"
+        );
+        assert_eq!(
+            super::capture_epoch_needed(plan),
+            true,
+            "GTO Route Z capture must begin exactly one epoch (freeze=1, unfreeze=1)"
+        );
+    }
+
+    /// A profile with only container capture enabled still needs an epoch.
+    #[test]
+    fn containers_only_needs_epoch() {
+        let mut plan = gto_plan();
+        plan.detect_heap_globals = false;
+        plan.detect_containers = true;
+        assert_eq!(super::capture_epoch_needed(plan), true);
+    }
+
+    /// A profile with only heap-global capture enabled still needs an epoch.
+    #[test]
+    fn heap_globals_only_needs_epoch() {
+        let mut plan = gto_plan();
+        plan.detect_containers = false;
+        plan.detect_heap_globals = true;
+        assert_eq!(super::capture_epoch_needed(plan), true);
+    }
+
+    /// The epoch predicate is independent of the offline-only stages (scrub,
+    /// bootstrap, wrappers, patches) — those run AFTER the epoch ends and never
+    /// require freezing the target.
+    #[test]
+    fn offline_only_stages_never_need_epoch() {
+        let mut plan = gto_plan();
+        plan.detect_containers = false;
+        plan.detect_heap_globals = false;
+        // All remaining stages are offline work (run after `end()`).
+        assert_eq!(super::capture_epoch_needed(plan), false);
+    }
+}
+
+/// Real call-count regression for the production scope gating (Route Z R0 AF2 AF1
+/// AF3 / P2-1). A `DebuggerCore` mock records how many times `freeze_target_threads`
+/// and `unfreeze_target_threads` are actually called, driving the SAME
+/// `with_capture_epoch` function that `dump_process` calls — so the freeze/unfreeze
+/// call counts lock the production control flow, not a pure-predicate assertion.
+#[cfg(test)]
+mod capture_epoch_callcount_tests {
+    use super::super::super::error::PeError;
+    use mida_core::DebuggerCore;
+    use windows::Win32::System::Diagnostics::Debug::CONTEXT;
+
+    /// A minimal `DebuggerCore` that counts freeze/unfreeze calls and tracks
+    /// whether threads are currently frozen. Uses interior mutability so both
+    /// `freeze_target_threads` (`&mut self`) and `unfreeze_target_threads`
+    /// (`&self`) share the same counters.
+    #[derive(Default)]
+    struct CountingDebuggerCell {
+        counts: std::cell::Cell<(usize, usize)>, // (freeze, unfreeze)
+        frozen: std::cell::Cell<bool>,
+        fail_unfreeze: bool,
+    }
+
+    impl DebuggerCore for CountingDebuggerCell {
+        fn process_handle(&self) -> windows::Win32::Foundation::HANDLE {
+            windows::Win32::Foundation::HANDLE(std::ptr::null_mut())
+        }
+        fn pid(&self) -> u32 {
+            1
+        }
+        fn image_base(&self) -> u64 {
+            0x140000000
+        }
+        fn wait_event(&mut self) -> Result<mida_core::DebugEvent, mida_core::CoreError> {
+            Err(mida_core::CoreError::Windows(0))
+        }
+        fn continue_event(
+            &mut self,
+            _t: u32,
+            _s: mida_core::ContinueStatus,
+        ) -> Result<(), mida_core::CoreError> {
+            Err(mida_core::CoreError::Windows(0))
+        }
+        fn read_memory(&self, _a: usize, _b: &mut [u8]) -> Result<usize, mida_core::CoreError> {
+            Err(mida_core::CoreError::Windows(0))
+        }
+        fn write_memory(&mut self, _a: usize, _d: &[u8]) -> Result<usize, mida_core::CoreError> {
+            Err(mida_core::CoreError::Windows(0))
+        }
+        fn get_thread_context(&self, _t: u32) -> Result<CONTEXT, mida_core::CoreError> {
+            Err(mida_core::CoreError::Windows(0))
+        }
+        fn set_thread_context(&self, _t: u32, _c: &CONTEXT) -> Result<(), mida_core::CoreError> {
+            Err(mida_core::CoreError::Windows(0))
+        }
+        fn freeze_target_threads(&mut self) -> Result<Vec<(u32, u32)>, mida_core::CoreError> {
+            let (f, u) = self.counts.get();
+            self.counts.set((f + 1, u));
+            self.frozen.set(true);
+            Ok(vec![(2, 0), (3, 0)])
+        }
+        fn unfreeze_target_threads(
+            &self,
+            _suspended: &[(u32, u32)],
+        ) -> Result<(), mida_core::CoreError> {
+            let (f, u) = self.counts.get();
+            self.counts.set((f, u + 1));
+            self.frozen.set(false);
+            if self.fail_unfreeze {
+                return Err(mida_core::CoreError::Windows(99));
+            }
+            Ok(())
+        }
+    }
+
+    /// Scenario (a): OreansClassic / no live-capture stage → freeze=0, unfreeze=0.
+    #[test]
+    fn no_epoch_zero_freeze_unfreeze() {
+        let mut dbg = CountingDebuggerCell::default();
+        let r = super::with_capture_epoch(&mut dbg, false, |_live| Ok(()));
+        assert!(r.is_ok(), "body must succeed");
+        let (f, u) = dbg.counts.get();
+        assert_eq!(
+            (f, u),
+            (0, 0),
+            "OreansClassic must NOT freeze/unfreeze (freeze={f}, unfreeze={u})"
+        );
+        assert!(!dbg.frozen.get(), "target must remain unfrozen (no epoch)");
+    }
+
+    /// Scenario (b): GTO Route Z capture success → freeze=1, unfreeze=1.
+    #[test]
+    fn gto_capture_freeze_unfreeze_exactly_once() {
+        let mut dbg = CountingDebuggerCell::default();
+        let r = super::with_capture_epoch(&mut dbg, true, |_live| Ok(()));
+        assert!(r.is_ok(), "body must succeed");
+        let (f, u) = dbg.counts.get();
+        assert_eq!(
+            (f, u),
+            (1, 1),
+            "GTO capture must freeze and unfreeze EXACTLY once (freeze={f}, unfreeze={u})"
+        );
+        assert!(
+            !dbg.frozen.get(),
+            "target must be unfrozen after with_capture_epoch returns"
+        );
+    }
+
+    /// Scenario (c): capture body returns Err → freeze=1, unfreeze=1 (epoch Drop
+    /// restores on the error path).
+    #[test]
+    fn capture_body_err_unfreezes_once() {
+        let mut dbg = CountingDebuggerCell::default();
+        let r = super::with_capture_epoch(&mut dbg, true, |_live| -> Result<(), PeError> {
+            Err(PeError::GtoStage {
+                stage: "body".into(),
+                error: "simulated capture body failure".into(),
+            })
+        });
+        assert!(r.is_err(), "body error must propagate");
+        let (f, u) = dbg.counts.get();
+        assert_eq!(
+            (f, u),
+            (1, 1),
+            "capture body Err must restore (Drop) exactly once (freeze={f}, unfreeze={u})"
+        );
+        assert!(
+            !dbg.frozen.get(),
+            "target must be unfrozen after body error"
+        );
+    }
+
+    /// Scenario (d): restore failure is surfaced as an error (never silent success).
+    #[test]
+    fn restore_failure_is_reported() {
+        let mut dbg = CountingDebuggerCell::default();
+        dbg.fail_unfreeze = true;
+        let r = super::with_capture_epoch(&mut dbg, true, |_live| Ok(()));
+        let err = r.expect_err("unfreeze failure must be reported");
+        assert!(
+            err.to_string().contains("capture_epoch_restore"),
+            "restore failure must be surfaced, got: {err}"
+        );
+        let (f, u) = dbg.counts.get();
+        assert_eq!(f, 1, "freeze called once");
+        assert_eq!(u, 1, "unfreeze attempted once (failed, surfaced)");
+    }
+
+    /// Scenario (e): offline work runs only after unfreeze completes.
+    #[test]
+    fn offline_runs_after_unfreeze() {
+        let mut dbg = CountingDebuggerCell::default();
+        // The epoch is begun+ended inside with_capture_epoch; any code after the call
+        // is OFFLINE and must observe the target as unfrozen.
+        let r = super::with_capture_epoch(&mut dbg, true, |_live| Ok(()));
+        assert!(r.is_ok());
+        // Offline work (after with_capture_epoch returns) sees unfrozen target and
+        // completed unfreeze.
+        assert!(
+            !dbg.frozen.get(),
+            "offline work must run with target NOT frozen"
+        );
+        let (f, u) = dbg.counts.get();
+        assert_eq!((f, u), (1, 1), "unfreeze completed before offline work");
+    }
+
+    /// [P1-4] Combination (a): body Ok + restore Ok → Ok, freeze=1/unfreeze=1.
+    #[test]
+    fn combo_body_ok_restore_ok() {
+        let mut dbg = CountingDebuggerCell::default();
+        let r = super::with_capture_epoch(&mut dbg, true, |_live| Ok(42u32));
+        let (v, tel) = r.expect("body Ok + restore Ok must succeed");
+        assert_eq!(v, 42);
+        assert!(tel.epoch_begun);
+        let (f, u) = dbg.counts.get();
+        assert_eq!((f, u), (1, 1), "freeze/unfreeze exactly once");
+    }
+
+    /// [P1-4] Combination (b): body Err + restore Ok → the body error propagates,
+    /// unfreeze exactly once (NOT relying on Drop).
+    #[test]
+    fn combo_body_err_restore_ok() {
+        let mut dbg = CountingDebuggerCell::default();
+        let r = super::with_capture_epoch(&mut dbg, true, |_live| -> Result<u32, PeError> {
+            Err(PeError::GtoStage {
+                stage: "body".into(),
+                error: "body failed".into(),
+            })
+        });
+        let err = r.expect_err("body Err must propagate");
+        assert!(err.to_string().contains("body failed"), "got: {err}");
+        let (f, u) = dbg.counts.get();
+        assert_eq!((f, u), (1, 1), "unfreeze exactly once on body error");
+        assert!(!dbg.frozen.get(), "target unfrozen after body error");
+    }
+
+    /// [P1-4] Combination (c): body Ok + restore Err → the restore error propagates.
+    #[test]
+    fn combo_body_ok_restore_err() {
+        let mut dbg = CountingDebuggerCell::default();
+        dbg.fail_unfreeze = true;
+        let r = super::with_capture_epoch(&mut dbg, true, |_live| Ok(1u32));
+        let err = r.expect_err("restore Err must propagate");
+        assert!(
+            err.to_string().contains("capture_epoch_restore"),
+            "restore failure surfaced, got: {err}"
+        );
+        let (f, u) = dbg.counts.get();
+        assert_eq!(f, 1, "freeze once");
+        assert_eq!(u, 1, "unfreeze attempted once (failed, surfaced)");
+    }
+
+    /// [P1-4] Combination (d): body Err + restore Err → BOTH errors preserved.
+    #[test]
+    fn combo_body_err_restore_err_preserves_both() {
+        let mut dbg = CountingDebuggerCell::default();
+        dbg.fail_unfreeze = true;
+        let r = super::with_capture_epoch(&mut dbg, true, |_live| -> Result<u32, PeError> {
+            Err(PeError::GtoStage {
+                stage: "body".into(),
+                error: "body also failed".into(),
+            })
+        });
+        let err = r.expect_err("combined body+restore error must be returned");
+        let es = err.to_string();
+        assert!(
+            es.contains("body also failed") && es.contains("capture_epoch_restore"),
+            "must preserve BOTH body and restore errors, got: {es}"
+        );
+        let (f, u) = dbg.counts.get();
+        assert_eq!((f, u), (1, 1), "unfreeze attempted exactly once");
+        assert!(!dbg.frozen.get(), "target unfrozen (unfreeze ran)");
+    }
+
+    /// [P1-5] Telemetry `elapsed_ms` must cover the live body duration (captured
+    /// AFTER the body, BEFORE unfreeze), not just the begin overhead.
+    #[test]
+    fn telemetry_elapsed_covers_body() {
+        let mut dbg = CountingDebuggerCell::default();
+        let r = super::with_capture_epoch(&mut dbg, true, |_live| {
+            // An observable, controllable delay inside the live body.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            Ok(())
+        });
+        let (_, tel) = r.expect("capture must succeed");
+        assert!(
+            tel.elapsed_ms >= 20,
+            "elapsed_ms must cover the 20ms body, got {}",
+            tel.elapsed_ms
+        );
+        assert!(tel.epoch_begun, "epoch was begun");
+        assert_eq!(tel.suspended_count, 2, "two fake suspended threads");
+    }
+
+    /// [P1-2] Body-error path must preserve the epoch telemetry (count/ids/elapsed/
+    /// started recoverable from the error), including a 20ms body delay.
+    #[test]
+    fn body_error_preserves_telemetry() {
+        let mut dbg = CountingDebuggerCell::default();
+        let r = super::with_capture_epoch(&mut dbg, true, |_live| -> Result<(), PeError> {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            Err(PeError::GtoStage {
+                stage: "body".into(),
+                error: "body failed".into(),
+            })
+        });
+        match r {
+            Err(PeError::CaptureEpochBodyFailed { error, telemetry }) => {
+                assert!(error.contains("body failed"), "got: {error}");
+                assert!(telemetry.epoch_begun, "epoch was begun");
+                assert_eq!(telemetry.suspended_count, 2, "suspended count preserved");
+                assert_eq!(telemetry.suspended_thread_ids, vec![2, 3], "ids preserved");
+                assert!(
+                    telemetry.elapsed_ms >= 20,
+                    "elapsed must cover the 20ms body on the error path, got {}",
+                    telemetry.elapsed_ms
+                );
+                assert!(telemetry.started_ms > 0, "started_ms preserved");
+            }
+            other => panic!("expected CaptureEpochBodyFailed, got {other:?}"),
+        }
+    }
+
+    /// [P1-2] Restore-error path must preserve the epoch telemetry.
+    #[test]
+    fn restore_error_preserves_telemetry() {
+        let mut dbg = CountingDebuggerCell::default();
+        dbg.fail_unfreeze = true;
+        let r = super::with_capture_epoch(&mut dbg, true, |_live| Ok(()));
+        match r {
+            Err(PeError::CaptureEpochRestoreFailed { error, telemetry }) => {
+                assert!(error.contains("capture_epoch_restore"), "got: {error}");
+                assert!(telemetry.epoch_begun, "epoch was begun");
+                assert_eq!(telemetry.suspended_count, 2, "suspended count preserved");
+                assert_eq!(telemetry.suspended_thread_ids, vec![2, 3], "ids preserved");
+                assert!(telemetry.started_ms > 0, "started_ms preserved");
+            }
+            other => panic!("expected CaptureEpochRestoreFailed, got {other:?}"),
+        }
+    }
+
+    /// [P1-2] Body+restore both failed → combined error preserves BOTH errors AND
+    /// the epoch telemetry.
+    #[test]
+    fn combined_error_preserves_both_and_telemetry() {
+        let mut dbg = CountingDebuggerCell::default();
+        dbg.fail_unfreeze = true;
+        let r = super::with_capture_epoch(&mut dbg, true, |_live| -> Result<(), PeError> {
+            Err(PeError::GtoStage {
+                stage: "body".into(),
+                error: "body also failed".into(),
+            })
+        });
+        match r {
+            Err(PeError::CaptureEpochCombined {
+                body,
+                restore,
+                telemetry,
+            }) => {
+                assert!(body.contains("body also failed"), "got: {body}");
+                assert!(restore.contains("capture_epoch_restore"), "got: {restore}");
+                assert!(telemetry.epoch_begun, "epoch was begun");
+                assert_eq!(telemetry.suspended_count, 2, "suspended count preserved");
+                assert_eq!(telemetry.suspended_thread_ids, vec![2, 3], "ids preserved");
+                assert!(telemetry.started_ms > 0, "started_ms preserved");
+            }
+            other => panic!("expected CaptureEpochCombined, got {other:?}"),
+        }
+    }
 }
 
 #[cfg(test)]

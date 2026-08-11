@@ -25,6 +25,7 @@
 //! `IMAGE_IMPORT_DESCRIPTOR` entries, the hint/name table, and the resolved IAT.
 
 // Submodules
+mod capture_epoch;
 mod capture_policy;
 mod container_bootstrap;
 mod container_snapshot;

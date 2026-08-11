@@ -1644,6 +1644,12 @@ pub enum OverlayError {
         first_mismatch_offset: usize,
         raw_child_digest: String,
         raw_slab_slice_digest: String,
+        /// Route Z R0 AF1: bounded hex excerpt of the raw child bytes around the
+        /// first mismatch (diagnostic; never the whole heap object).
+        raw_child_excerpt: String,
+        /// Route Z R0 AF1: bounded hex excerpt of the slab slice bytes around the
+        /// first mismatch (diagnostic; never the whole slab).
+        raw_slab_slice_excerpt: String,
     },
     /// Two overlays conflict (partial overlap or same range different bytes).
     /// GTO R0-F: now carries the ACTUAL applied peer (not the current child
@@ -1929,10 +1935,13 @@ impl std::fmt::Display for OverlayError {
                 first_mismatch_offset,
                 raw_child_digest,
                 raw_slab_slice_digest,
+                raw_child_excerpt,
+                raw_slab_slice_excerpt,
             } => write!(
                 f,
                 "raw capture drift: kind={} child {:#x} size {:#x} slab [{:#x},+{:#x}) offset {:#x} \
-                 first_mismatch={:#x} raw_child_sha={} raw_slab_slice_sha={}",
+                 first_mismatch={:#x} raw_child_sha={} raw_slab_slice_sha={} \
+                 raw_child_excerpt=[{}] raw_slab_slice_excerpt=[{}]",
                 child_kind.label(),
                 child_old_base,
                 child_size,
@@ -1941,7 +1950,9 @@ impl std::fmt::Display for OverlayError {
                 slab_offset,
                 first_mismatch_offset,
                 raw_child_digest,
-                raw_slab_slice_digest
+                raw_slab_slice_digest,
+                raw_child_excerpt,
+                raw_slab_slice_excerpt
             ),
             OverlayError::OverlayConflict {
                 a_child_old_base,
@@ -2607,6 +2618,34 @@ fn slab_slice_for_child<'a>(
     Ok((base, size, slab_digest, offset, slab_slice))
 }
 
+/// Route Z R0 AF1: build a bounded hex excerpt around the first mismatch so a
+/// live raw-capture drift is diagnosable offline (distinguishing in-place
+/// rewrite / free-reuse / wrong read) without dumping the whole heap object.
+///
+/// Window: up to `PREFIX` bytes before the mismatch offset, then up to `SPAN`
+/// bytes starting at the mismatch. Never exceeds the given byte slice.
+pub fn drift_excerpt(
+    slice: &[u8],
+    mismatch_offset: usize,
+    max_prefix: usize,
+    max_span: usize,
+) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let prefix_start = mismatch_offset.saturating_sub(max_prefix);
+    let span_end = mismatch_offset.saturating_add(max_span).min(slice.len());
+    let mut out = String::with_capacity(2 * (span_end - prefix_start) + 1);
+    let mut first = true;
+    for &b in &slice[prefix_start..span_end] {
+        if !first {
+            out.push(' ');
+        }
+        first = false;
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0xf) as usize] as char);
+    }
+    out
+}
+
 fn raw_capture_drift_error(
     child_kind: RawChildKind,
     child_old_base: u64,
@@ -2622,6 +2661,9 @@ fn raw_capture_drift_error(
         .zip(raw_child.iter())
         .position(|(a, b)| a != b)
         .unwrap_or_else(|| slab_slice.len().min(raw_child.len()));
+    // Route Z R0 AF1: bounded diagnostic excerpt (≤16 bytes before, ≤64 after).
+    let raw_child_excerpt = drift_excerpt(raw_child, first_mismatch_offset, 16, 64);
+    let raw_slab_slice_excerpt = drift_excerpt(slab_slice, first_mismatch_offset, 16, 64);
     OverlayError::RawCaptureDrift {
         child_kind,
         child_old_base,
@@ -2632,6 +2674,8 @@ fn raw_capture_drift_error(
         first_mismatch_offset,
         raw_child_digest: sha256_hex(raw_child),
         raw_slab_slice_digest: sha256_hex(slab_slice),
+        raw_child_excerpt,
+        raw_slab_slice_excerpt,
     }
 }
 
@@ -2906,6 +2950,18 @@ pub fn build_patched_backing_slab(
                 first_mismatch_offset: raw_child_bytes.len().min(child_size),
                 raw_child_digest: sha256_hex(raw_child_bytes),
                 raw_slab_slice_digest: sha256_hex(&slab.content[slab_offset_us..child_end]),
+                raw_child_excerpt: drift_excerpt(
+                    raw_child_bytes,
+                    raw_child_bytes.len().min(child_size),
+                    16,
+                    64,
+                ),
+                raw_slab_slice_excerpt: drift_excerpt(
+                    &slab.content[slab_offset_us..child_end],
+                    raw_child_bytes.len().min(child_size),
+                    16,
+                    64,
+                ),
             });
         }
         // GTO R0-G three-way reconciliation: C = raw child capture (t1), S = raw
@@ -2943,6 +2999,8 @@ pub fn build_patched_backing_slab(
                     first_mismatch_offset: first_mismatch,
                     raw_child_digest: sha256_hex(raw_child_bytes),
                     raw_slab_slice_digest: sha256_hex(raw_slab_slice),
+                    raw_child_excerpt: drift_excerpt(raw_child_bytes, first_mismatch, 16, 64),
+                    raw_slab_slice_excerpt: drift_excerpt(raw_slab_slice, first_mismatch, 16, 64),
                 });
             }
         }
@@ -3453,6 +3511,18 @@ pub fn build_patched_backing_slab_q0c(
                 first_mismatch_offset: raw_child_bytes.len().min(child_size),
                 raw_child_digest: sha256_hex(raw_child_bytes),
                 raw_slab_slice_digest: sha256_hex(&slab_bytes[slab_offset_us..child_end]),
+                raw_child_excerpt: drift_excerpt(
+                    raw_child_bytes,
+                    raw_child_bytes.len().min(child_size),
+                    16,
+                    64,
+                ),
+                raw_slab_slice_excerpt: drift_excerpt(
+                    &slab_bytes[slab_offset_us..child_end],
+                    raw_child_bytes.len().min(child_size),
+                    16,
+                    64,
+                ),
             });
         }
         let raw_slab_slice = &slab_bytes[slab_offset_us..child_end];
@@ -3594,6 +3664,8 @@ pub fn build_patched_backing_slab_q0c(
                 first_mismatch_offset: 0,
                 raw_child_digest,
                 raw_slab_slice_digest,
+                raw_child_excerpt: drift_excerpt(raw_child_bytes, 0, 16, 64),
+                raw_slab_slice_excerpt: drift_excerpt(raw_slab_slice, 0, 16, 64),
             });
         }
         if binding.raw_slab_slice_digest != raw_slab_slice_digest {
@@ -3607,6 +3679,8 @@ pub fn build_patched_backing_slab_q0c(
                 first_mismatch_offset: 0,
                 raw_child_digest,
                 raw_slab_slice_digest,
+                raw_child_excerpt: drift_excerpt(raw_child_bytes, 0, 16, 64),
+                raw_slab_slice_excerpt: drift_excerpt(raw_slab_slice, 0, 16, 64),
             });
         }
 
@@ -3665,6 +3739,13 @@ pub fn build_patched_backing_slab_q0c(
                         first_mismatch_offset: first_mismatch,
                         raw_child_digest: raw_child_digest.clone(),
                         raw_slab_slice_digest: raw_slab_slice_digest.clone(),
+                        raw_child_excerpt: drift_excerpt(raw_child_bytes, first_mismatch, 16, 64),
+                        raw_slab_slice_excerpt: drift_excerpt(
+                            raw_slab_slice,
+                            first_mismatch,
+                            16,
+                            64,
+                        ),
                     });
                 }
                 // seeded_from_slab must be false for a strict child.

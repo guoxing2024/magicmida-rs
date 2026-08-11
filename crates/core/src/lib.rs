@@ -11,6 +11,7 @@
 
 pub mod addr;
 pub mod breakpoint;
+pub mod capture_epoch;
 pub mod cleanup;
 pub mod debug_event_lifecycle;
 pub mod debugger;
@@ -29,7 +30,7 @@ pub use debug_event_lifecycle::{
     classify_av_exc_type, ContinuePlan, DebugEventLifecycle, DecodeDisposition, PendingDebugEvent,
 };
 pub use debugger::{ContinueStatus, DebugEvent, DebuggerCore};
-pub use error::{format_continue_debug_event_error, win32_from_hresult, CoreError};
+pub use error::{format_continue_debug_event_error, win32_from_hresult, CoreError, RestoreFailure};
 pub use plugin::{
     CapturePolicyHint, DumpAdvice, HostLoopFacts, IdentifyInput, IdentifyResult, NullPackerPlugin,
     OepProvenance, OepSource, PackerPlugin, PluginAdvice, PluginCtx, UnpackPhase,

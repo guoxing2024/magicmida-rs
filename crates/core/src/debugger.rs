@@ -354,4 +354,41 @@ pub trait DebuggerCore {
     /// (DR0–DR7) inside the [`CONTEXT`] struct returned by
     /// [`get_thread_context`](Self::get_thread_context).
     fn set_thread_context(&self, thread_id: u32, ctx: &CONTEXT) -> Result<(), CoreError>;
+
+    /// Route Z R0 AF1: freeze every target thread so all live-memory reads
+    /// (raw child C and authoritative slab S) come from the same stationary
+    /// capture epoch. Returns the list of `(thread_id, prior_suspend_count)`
+    /// that were newly suspended, so the caller can restore them exactly.
+    ///
+    /// **Fail-closed default**: a backend that does not implement real thread
+    /// freezing returns an error rather than a no-op "frozen" result, so the
+    /// capture epoch is never silently skipped. A real backend (e.g.
+    /// `WindowsDebugger`) enumerates the target's threads and suspends every
+    /// non-calling thread, re-enumerating until the thread set is stable. It
+    /// must never suspend the calling thread, must record each thread's
+    /// pre-existing suspend count, and must not change the suspend count of
+    /// threads that were already suspended before the epoch.
+    fn freeze_target_threads(&mut self) -> Result<Vec<(u32, u32)>, CoreError> {
+        Err(CoreError::ProcessCreation(
+            "capture epoch freeze not supported by this debugger backend".into(),
+        ))
+    }
+
+    /// Route Z R0 AF1: restore threads to their exact pre-epoch suspend state.
+    /// `suspended` is the list returned by [`freeze_target_threads`](Self::freeze_target_threads).
+    /// Returns an error if any thread could not be resumed (a leaked suspended
+    /// thread), so a failed restore is surfaced rather than silently swallowed.
+    ///
+    /// **Fail-closed default**: a backend that does not implement real unfreezing
+    /// returns an explicit unsupported error rather than a silent `Ok(())`. This
+    /// guarantees a backend that implements only `freeze_target_threads` and forgets
+    /// `unfreeze_target_threads` can never freeze the target and then silently
+    /// "restore" without resuming it. A backend that genuinely supports the capture
+    /// epoch must implement both ends.
+    fn unfreeze_target_threads(&self, suspended: &[(u32, u32)]) -> Result<(), CoreError> {
+        let _ = suspended;
+        Err(CoreError::ProcessCreation(
+            "capture epoch unfreeze not supported by this debugger backend".into(),
+        ))
+    }
 }
