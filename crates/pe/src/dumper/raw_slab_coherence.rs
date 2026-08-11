@@ -780,6 +780,258 @@ impl TransformRunLedger {
     }
 }
 
+/// A declared size-reinit operation: a specific transform, applied to a specific
+/// child (by image RVA), that LEGITIMATELY changes the child's content length as
+/// part of product recovery (e.g. `sanitize_ahk_runtime_global` replaces the
+/// captured 32 KiB heap blob with a small zero-filled re-init slab). Only these
+/// exact declarations may change size across a transform; any other size change
+/// is undeclared provenance drift and fails closed.
+///
+/// Route Y R0 (Y0-A): this is the single authoritative source of "declared size
+/// transitions". It is NOT a relaxation of the identity checks — an undeclared
+/// size change still returns `TransformRunLedgerInvalid`, and a declared one is
+/// validated precisely (transform id, child rva, old size within tolerance, new
+/// size exact, re-init content all-zero).
+#[derive(Debug, Clone, Copy)]
+pub struct DeclaredSizeReinit {
+    /// Transform id that performs the size re-init (exact match required).
+    pub transform_id: &'static str,
+    /// Image RVA of the child being re-inited (exact match required).
+    pub child_rva: u32,
+    /// Expected old (before) size. `old_size_tolerance` bounds how far a real
+    /// captured blob may deviate (the live heap blob size can vary).
+    pub old_size: usize,
+    /// Allowable deviation from `old_size` (inclusive) before rejecting.
+    pub old_size_tolerance: usize,
+    /// Exact after (new) size required.
+    pub new_size: usize,
+    /// After content must be entirely zero-filled (re-init slab).
+    pub zero_filled: bool,
+}
+
+/// Look up the declared size-reinit for a `(transform_id, child_rva)` pair.
+/// Returns `None` for any transform/child that is NOT a declared size reinit —
+/// in which case a size change is undeclared drift and fails closed.
+pub fn declared_size_reinit(
+    transform_id: &str,
+    child_rva: u32,
+) -> Option<&'static DeclaredSizeReinit> {
+    const SANITIZE_AHK_RUNTIME_GLOBAL: &DeclaredSizeReinit = &DeclaredSizeReinit {
+        transform_id: "sanitize_ahk_runtime_global",
+        child_rva: 0x141bf0,
+        old_size: 0x8000,
+        old_size_tolerance: 0x2000, // live heap blob ~32 KiB, allow variance
+        new_size: 0x180,
+        zero_filled: true,
+    };
+    match (transform_id, child_rva) {
+        ("sanitize_ahk_runtime_global", 0x141bf0) => Some(SANITIZE_AHK_RUNTIME_GLOBAL),
+        _ => None,
+    }
+}
+
+/// True if any declared size-reinit targets this child RVA (independent of the
+/// specific transform). Used to recognize a child that undergoes a declared
+/// size transition, so its PRIOR runs (raw-size stage) and its transition run
+/// (new-size stage) can both pass membership while undeclared drift still
+/// fails closed.
+pub fn is_declared_reinit_child_rva(child_rva: u32) -> bool {
+    child_rva == 0x141bf0
+}
+
+/// Validate a declared size reinit against the actual before/after participant.
+/// Returns `Ok` only if every declared field matches; otherwise a precise
+/// `TransformRunLedgerInvalid` reason.
+///
+/// Route Y R0 (Y0-A rev 2 / Audit P1-1): the field-level core is shared by the
+/// recording path (`validate_raw_identity_across_transform`) and the Q0-C
+/// overlay consumer boundary (`build_patched_backing_slab_q0c`) so the overlay
+/// cannot accept an old/new size, RVA, or zero-fill that the recorder would
+/// reject. Both consumer boundaries enforce the declaration identically.
+pub fn validate_declared_size_reinit(
+    spec: &DeclaredSizeReinit,
+    before_len: usize,
+    after: &HeapGlobalSnapshot,
+    run_index: usize,
+) -> Result<(), OverlayError> {
+    validate_declared_size_reinit_fields(
+        spec,
+        before_len,
+        after.rva,
+        &after.extent_evidence.capture_id,
+        after.live_ptr,
+        &after.content,
+        run_index,
+    )
+}
+
+/// Field-level declared-size-reinit validation shared by every consumer boundary
+/// (recorder diff + Q0-C overlay). Mirrors [`validate_declared_size_reinit`] but
+/// takes the raw fields so the overlay (which holds transformed bytes, an rva,
+/// a capture id and a live base rather than a full [`HeapGlobalSnapshot`]) can
+/// enforce the same declaration without fabricating a snapshot.
+pub fn validate_declared_size_reinit_fields(
+    spec: &DeclaredSizeReinit,
+    before_len: usize,
+    after_rva: u32,
+    after_capture_id: &str,
+    after_live_ptr: u64,
+    after_content: &[u8],
+    run_index: usize,
+) -> Result<(), OverlayError> {
+    // The child's image RVA must match the declaration exactly.
+    if after_rva != spec.child_rva {
+        return Err(OverlayError::TransformRunLedgerInvalid {
+            run_index,
+            child_capture_id: after_capture_id.to_string(),
+            child_old_base: after_live_ptr,
+            child_size: after_content.len(),
+            child_offset: 0,
+            length: 0,
+            transform_id: spec.transform_id.to_string(),
+            reason: format!(
+                "declared size reinit child rva {:#x} != expected {:#x} for old_base {:#x}",
+                after_rva, spec.child_rva, after_live_ptr
+            ),
+        });
+    }
+    let old_ok = before_len
+        .checked_sub(spec.old_size)
+        .map(|d| d <= spec.old_size_tolerance)
+        .unwrap_or(false)
+        || spec
+            .old_size
+            .checked_sub(before_len)
+            .map(|d| d <= spec.old_size_tolerance)
+            .unwrap_or(false);
+    if !old_ok {
+        return Err(OverlayError::TransformRunLedgerInvalid {
+            run_index,
+            child_capture_id: after_capture_id.to_string(),
+            child_old_base: after_live_ptr,
+            child_size: after_content.len(),
+            child_offset: 0,
+            length: 0,
+            transform_id: spec.transform_id.to_string(),
+            reason: format!(
+                "declared size reinit old size {} outside tolerance {} of expected {} for old_base {:#x}",
+                before_len, spec.old_size_tolerance, spec.old_size, after_live_ptr
+            ),
+        });
+    }
+    if after_content.len() != spec.new_size {
+        return Err(OverlayError::TransformRunLedgerInvalid {
+            run_index,
+            child_capture_id: after_capture_id.to_string(),
+            child_old_base: after_live_ptr,
+            child_size: after_content.len(),
+            child_offset: 0,
+            length: 0,
+            transform_id: spec.transform_id.to_string(),
+            reason: format!(
+                "declared size reinit new size {} != expected {} for old_base {:#x}",
+                after_content.len(),
+                spec.new_size,
+                after_live_ptr
+            ),
+        });
+    }
+    if spec.zero_filled && after_content.iter().any(|&b| b != 0) {
+        return Err(OverlayError::TransformRunLedgerInvalid {
+            run_index,
+            child_capture_id: after_capture_id.to_string(),
+            child_old_base: after_live_ptr,
+            child_size: after_content.len(),
+            child_offset: 0,
+            length: 0,
+            transform_id: spec.transform_id.to_string(),
+            reason: format!(
+                "declared size reinit content not zero-filled for old_base {:#x}",
+                after_live_ptr
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Route X R0 AF1 (P0-2): verify the FULL raw identity tuple is unchanged across
+/// a transform for a matched raw participant, EXCEPT that a declared size reinit
+/// (see [`declared_size_reinit`]) may legitimately change `content.len()`.
+/// Matching by live_ptr alone is not enough — a change in capture_id / extent_kind /
+/// capture_path (or an UNDECLARED content.len change) is provenance drift and must
+/// fail closed, never be silently diffed.
+pub fn validate_raw_identity_across_transform(
+    b: &HeapGlobalSnapshot,
+    a: &HeapGlobalSnapshot,
+    run_index: usize,
+    transform_id: &str,
+) -> Result<(), OverlayError> {
+    let check_identity = |field: &str, before_v: &str, after_v: &str| -> Option<OverlayError> {
+        if before_v != after_v {
+            Some(OverlayError::TransformRunLedgerInvalid {
+                run_index,
+                child_capture_id: a.extent_evidence.capture_id.clone(),
+                child_old_base: a.live_ptr,
+                child_size: a.content.len(),
+                child_offset: 0,
+                length: 0,
+                transform_id: transform_id.to_string(),
+                reason: format!(
+                    "raw identity drift on {field} for old_base {:#x}: {before_v} -> {after_v}",
+                    a.live_ptr
+                ),
+            })
+        } else {
+            None
+        }
+    };
+    if let Some(e) = check_identity(
+        "capture_id",
+        &b.extent_evidence.capture_id,
+        &a.extent_evidence.capture_id,
+    ) {
+        return Err(e);
+    }
+    // content.len: unchanged, OR a DECLARED size reinit for this transform+child.
+    if b.content.len() != a.content.len() {
+        match declared_size_reinit(transform_id, a.rva) {
+            Some(spec) => validate_declared_size_reinit(spec, b.content.len(), a, run_index)?,
+            None => {
+                return Err(OverlayError::TransformRunLedgerInvalid {
+                    run_index,
+                    child_capture_id: a.extent_evidence.capture_id.clone(),
+                    child_old_base: a.live_ptr,
+                    child_size: a.content.len(),
+                    child_offset: 0,
+                    length: 0,
+                    transform_id: transform_id.to_string(),
+                    reason: format!(
+                        "undeclared raw identity drift on content.len for old_base {:#x}: {} -> {}",
+                        a.live_ptr,
+                        b.content.len(),
+                        a.content.len()
+                    ),
+                });
+            }
+        }
+    }
+    if let Some(e) = check_identity(
+        "extent_kind",
+        &format!("{:?}", b.extent_kind),
+        &format!("{:?}", a.extent_kind),
+    ) {
+        return Err(e);
+    }
+    if let Some(e) = check_identity(
+        "capture_path",
+        &format!("{:?}", b.extent_evidence.capture_path),
+        &format!("{:?}", a.extent_evidence.capture_path),
+    ) {
+        return Err(e);
+    }
+    Ok(())
+}
+
 /// Diff one transform's before/after child snapshots into byte/run-level write runs.
 ///
 /// This is the byte-level counterpart of `record_transform_applied`: instead of
@@ -888,60 +1140,15 @@ pub fn diff_transform_write_runs(
         }
     }
 
-    // Route X R0 AF1 (P0-2): for each matched raw participant, verify the FULL
-    // raw identity tuple is unchanged across the transform. Matching by live_ptr
-    // alone is not enough — a change in capture_id / content.len() / extent_kind /
-    // capture_path is provenance drift and must fail closed, never be silently
-    // diffed. (content.len() change especially: a size shift would otherwise be
-    // under-diffed at the shared prefix and fail open.)
+    // Route X R0 AF1 (P0-2) + Route Y R0 (Y0-A): for each matched raw participant,
+    // verify the FULL raw identity tuple is unchanged across the transform —
+    // except a DECLARED size reinit (see declared_size_reinit) may legitimately
+    // change content.len(). Matching by live_ptr alone is not enough: a change in
+    // capture_id / extent_kind / capture_path, or an UNDECLARED content.len change,
+    // is provenance drift and must fail closed, never be silently diffed.
     for (base, a) in after_map.iter() {
         let b = before_map[base];
-        let check_identity = |field: &str, before_v: &str, after_v: &str| -> Option<OverlayError> {
-            if before_v != after_v {
-                Some(OverlayError::TransformRunLedgerInvalid {
-                    run_index,
-                    child_capture_id: a.extent_evidence.capture_id.clone(),
-                    child_old_base: *base,
-                    child_size: a.content.len(),
-                    child_offset: 0,
-                    length: 0,
-                    transform_id: transform_id.to_string(),
-                    reason: format!(
-                        "raw identity drift on {field} for old_base {base:#x}: {before_v} -> {after_v}"
-                    ),
-                })
-            } else {
-                None
-            }
-        };
-        if let Some(e) = check_identity(
-            "capture_id",
-            &b.extent_evidence.capture_id,
-            &a.extent_evidence.capture_id,
-        ) {
-            return Err(e);
-        }
-        if let Some(e) = check_identity(
-            "content.len",
-            &b.content.len().to_string(),
-            &a.content.len().to_string(),
-        ) {
-            return Err(e);
-        }
-        if let Some(e) = check_identity(
-            "extent_kind",
-            &format!("{:?}", b.extent_kind),
-            &format!("{:?}", a.extent_kind),
-        ) {
-            return Err(e);
-        }
-        if let Some(e) = check_identity(
-            "capture_path",
-            &format!("{:?}", b.extent_evidence.capture_path),
-            &format!("{:?}", a.extent_evidence.capture_path),
-        ) {
-            return Err(e);
-        }
+        validate_raw_identity_across_transform(b, a, run_index, transform_id)?;
     }
 
     // For each matched raw participant, diff and emit runs.
@@ -965,20 +1172,38 @@ pub fn diff_transform_write_runs(
                 reason: format!("empty raw capture id for changed participant old_base {base:#x}"),
             });
         }
-        let child_size = a.content.len().max(b.content.len());
-        let shared_len = b.content.len().min(a.content.len());
-        // Build maximal contiguous runs of differing bytes.
+        // Route Y R0 (Y0-A): `child_size` is the TRANSFORMED (after) size — the
+        // size the overlay writes. For a declared size reinit this is the new
+        // re-init size (e.g. 0x180), not the old captured blob size.
+        let child_size = a.content.len();
+        // Route Y R0 (Y0-A rev 4 / Audit P1): a DECLARED size reinit (shrink)
+        // emits ONE dedicated full `[0, new_size)` transition run — NOT a sparse
+        // byte diff. A zero byte already present in the old prefix would otherwise
+        // not be "changed" by the byte diff and would split the sanitize diff into
+        // multiple runs, breaking the exactly-one-transition-run invariant that
+        // the Q0-C consumer enforces. The recorder and the Q0-C consumer must
+        // agree on the transition representation.
+        let is_declared_shrink = declared_size_reinit(transform_id, a.rva).is_some()
+            && b.content.len() != a.content.len()
+            && a.content.len() <= b.content.len()
+            && a.content.len() > 0;
         let mut changed: Vec<(usize, usize)> = Vec::new();
-        let mut i = 0usize;
-        while i < shared_len {
-            if b.content[i] != a.content[i] {
-                let run_start = i;
-                while i < shared_len && b.content[i] != a.content[i] {
+        if is_declared_shrink {
+            changed.push((0, a.content.len()));
+        } else {
+            // Build maximal contiguous runs of differing bytes.
+            let shared_len = b.content.len().min(a.content.len());
+            let mut i = 0usize;
+            while i < shared_len {
+                if b.content[i] != a.content[i] {
+                    let run_start = i;
+                    while i < shared_len && b.content[i] != a.content[i] {
+                        i += 1;
+                    }
+                    changed.push((run_start, i - run_start));
+                } else {
                     i += 1;
                 }
-                changed.push((run_start, i - run_start));
-            } else {
-                i += 1;
             }
         }
         for (off, len) in changed {
@@ -1217,14 +1442,30 @@ pub fn validate_run_membership(
     }
 
     for (idx, r) in run_ledger.runs.iter().enumerate() {
-        // 1. The run must resolve to exactly one raw child by full identity tuple.
+        // 1. The run must resolve to exactly one raw child. Match by the stable
+        //    identity (capture_id, old_base); size must match UNLESS this run is a
+        //    DECLARED size reinit (Route Y R0 Y0-A), in which case the run's
+        //    child_size is the new re-init size and the raw child's size is the old
+        //    captured size — a legitimate size transition.
+        let is_declared_reinit = (|| {
+            // Find the transformed canonical participant for this run to read rva.
+            let g = transformed_globals.iter().find(|g| {
+                g.is_raw_coherence_participant()
+                    && g.live_ptr == r.child_old_base
+                    && g.extent_evidence.capture_id == r.child_capture_id
+            });
+            match g {
+                Some(g) => declared_size_reinit(&r.transform_id, g.rva).is_some(),
+                None => false,
+            }
+        })();
         let matches: Vec<&RawChild> = raw_capture
             .children
             .iter()
             .filter(|c| {
                 c.capture_id == r.child_capture_id
                     && c.old_base == r.child_old_base
-                    && c.size == r.child_size
+                    && (c.size == r.child_size || is_declared_reinit)
             })
             .collect();
         if matches.is_empty() {
@@ -1255,10 +1496,61 @@ pub fn validate_run_membership(
             });
         }
         // 2. The run's child must belong to the canonical participant set.
+        //    Size semantics (Route Y R0 / Audit P1-3): a child that is the target
+        //    of a DECLARED size re-init transitions from its RAW size to the
+        //    declared NEW size. Its PRIOR runs (other transforms that ran before
+        //    the re-init, e.g. scrub, while the child was still at raw size) carry
+        //    child_size == RAW size; the DECLARED transition run itself carries
+        //    child_size == NEW size. Both are legitimate; any other size on this
+        //    child fails closed.
         let key = (r.child_capture_id.clone(), r.child_old_base);
+        // Does this child's RVA name a declared size-reinit target?
+        let child_is_declared_reinit_target = transformed_globals.iter().any(|g| {
+            g.is_raw_coherence_participant()
+                && g.live_ptr == r.child_old_base
+                && g.extent_evidence.capture_id == r.child_capture_id
+                && is_declared_reinit_child_rva(g.rva)
+        });
         match participants.get(&key) {
             Some(&participant_size) => {
-                if participant_size != r.child_size {
+                if child_is_declared_reinit_target {
+                    // Allow exactly RAW size (prior runs) or NEW size (transition).
+                    let child_rva = transformed_globals
+                        .iter()
+                        .find(|g| {
+                            g.is_raw_coherence_participant()
+                                && g.live_ptr == r.child_old_base
+                                && g.extent_evidence.capture_id == r.child_capture_id
+                        })
+                        .map(|g| g.rva);
+                    let raw_size = raw_capture
+                        .children
+                        .iter()
+                        .find(|c| {
+                            c.capture_id == r.child_capture_id && c.old_base == r.child_old_base
+                        })
+                        .map(|c| c.size);
+                    let new_size = child_rva
+                        .and_then(|rv| declared_size_reinit(&r.transform_id, rv))
+                        .map(|s| s.new_size);
+                    let ok = (raw_size.is_some() && r.child_size == raw_size.unwrap())
+                        || (new_size.is_some() && r.child_size == new_size.unwrap());
+                    if !ok {
+                        return Err(OverlayError::TransformRunLedgerInvalid {
+                            run_index: idx,
+                            child_capture_id: r.child_capture_id.clone(),
+                            child_old_base: r.child_old_base,
+                            child_size: r.child_size,
+                            child_offset: r.child_offset,
+                            length: r.length,
+                            transform_id: r.transform_id.clone(),
+                            reason: format!(
+                                "declared reinit child run size {} not in (raw {:?}, new {:?})",
+                                r.child_size, raw_size, new_size
+                            ),
+                        });
+                    }
+                } else if participant_size != r.child_size {
                     return Err(OverlayError::TransformRunLedgerInvalid {
                         run_index: idx,
                         child_capture_id: r.child_capture_id.clone(),
@@ -2908,6 +3200,10 @@ pub fn build_patched_backing_slab_q0c(
     }
 
     // Collect transformed children (heap-global + container) with provenance.
+    // Route Y R0 (Y0-A rev 3 / Audit P1-1): the tuple carries `rva` (to recognize
+    // a DECLARED size-reinit child) AND the full capture identity
+    // (`capture_id`, `extent_kind`, `capture_path`) so the overlay can resolve
+    // the exact raw child by identity — never by raw-byte/slab coherence alone.
     let mut transformed: Vec<(
         u64,
         usize,
@@ -2917,6 +3213,8 @@ pub fn build_patched_backing_slab_q0c(
         Vec<String>,
         super::heap_global_snapshot::CaptureExtentKind,
         String,
+        u32,
+        super::heap_global_snapshot::CapturePath,
     )> = Vec::new();
     for g in transformed_globals {
         if !g.is_raw_coherence_participant() {
@@ -2931,6 +3229,8 @@ pub fn build_patched_backing_slab_q0c(
             g.transform_ids.clone(),
             g.extent_kind,
             g.extent_evidence.capture_id.clone(),
+            g.rva,
+            g.extent_evidence.capture_path,
         ));
     }
     for c in transformed_containers {
@@ -2959,10 +3259,12 @@ pub fn build_patched_backing_slab_q0c(
             Vec::new(),
             crate::dumper::heap_global_snapshot::CaptureExtentKind::ObservedAllocation,
             cap_id,
+            0, // containers have no reinit declaration
+            crate::dumper::heap_global_snapshot::CapturePath::MainSlot,
         ));
     }
     // Deterministic order by (old_base, kind).
-    transformed.sort_by_key(|(base, _, _, kind, _, _, _, _)| (*base, *kind as u8));
+    transformed.sort_by_key(|(base, _, _, kind, _, _, _, _, _, _)| (*base, *kind as u8));
 
     let mut overlays: Vec<TransformedRegionOverlay> = Vec::new();
     let mut drift_runs: Vec<CaptureDriftRun> = Vec::new();
@@ -2991,15 +3293,26 @@ pub fn build_patched_backing_slab_q0c(
         child_transform_ids,
         extent_kind,
         capture_id,
+        child_rva,
+        child_capture_path,
     ) in &transformed
     {
         let child_base = *child_base;
-        let child_size = *child_size;
+        let mut child_size = *child_size;
         let kind = *kind;
         let transformed_bytes = transformed_bytes.clone();
         let child_transform_ids = child_transform_ids.clone();
         let extent_kind = *extent_kind;
         let capture_id = capture_id.clone();
+        let child_rva = *child_rva;
+        let child_capture_path = *child_capture_path;
+        // Route Y R0 (Y0-A): detect a DECLARED size-reinit child. Its transformed
+        // content.len() differs from the raw child size legitimately; coherence is
+        // validated at the RAW size while the transformed (new-size) bytes are
+        // written.
+        let declared_reinit = child_transform_ids
+            .iter()
+            .any(|tid| declared_size_reinit(tid, child_rva).is_some());
 
         if let RegionProvenance::UnknownSynthetic = &provenance {
             return Err(OverlayError::RawChildMissing {
@@ -3037,43 +3350,77 @@ pub fn build_patched_backing_slab_q0c(
                 child_kind: kind,
             });
         };
+        // Route Y R0 (Y0-A rev 3 / Audit P1-1): a DECLARED size-reinit child's
+        // raw child is resolved by FULL CAPTURE IDENTITY — (capture_id, old_base,
+        // kind, extent_kind, capture_path) — BEFORE any size / slab-coverage /
+        // binding handling. Never `max(raw.size)` over a set that shares only
+        // (old_base, kind), and never raw-byte/slab coherence selection: those
+        // can pick a DIFFERENT capture. Exactly one identity match is required.
+        let declared_raw: Option<&RawChild> = if declared_reinit {
+            let mut by_identity: Vec<&&RawChild> = raws
+                .iter()
+                .filter(|r| {
+                    r.capture_id == capture_id
+                        && r.extent_kind == extent_kind
+                        && r.capture_path == child_capture_path
+                })
+                .collect();
+            by_identity.sort_by_key(|r| r.old_base);
+            if by_identity.len() != 1 {
+                return Err(OverlayError::RawChildMissing {
+                    child_old_base: child_base,
+                    child_kind: kind,
+                });
+            }
+            child_size = by_identity[0].size;
+            Some(by_identity[0])
+        } else {
+            None
+        };
         // TAF1-B / TAF1-C: resolve the child's unique covering slab from the full
         // multi-slab set (0 or >1 covering slabs fail closed; never defaults to a
         // single raw_capture.slab).
         let (si, slab_old_base, slab_size, slab_offset_us, slab_bytes) =
             covering_slab_for_child(raw_capture, child_base, child_size, kind)?;
-        // Reconcile duplicate raw children (same policy as build_patched_backing_slab).
-        let raw = if raws.len() == 1 {
-            raws[0]
-        } else {
-            let so = usize::try_from(slab_offset_us).ok();
-            let distinct: Vec<&&RawChild> = raws
-                .iter()
-                .filter(|r| {
-                    so.and_then(|s| {
-                        slab_bytes
-                            .get(s..s + r.raw_bytes.len())
-                            .map(|slice| slice == r.raw_bytes.as_slice())
-                    })
-                    .unwrap_or(false)
-                })
-                .collect();
-            if distinct.len() == 1 {
-                distinct[0]
-            } else if distinct.len() > 1 {
-                return Err(OverlayError::RawChildMissing {
-                    child_old_base: child_base,
-                    child_kind: kind,
-                });
-            } else {
-                let first = raws[0];
-                if raws.iter().all(|r| r.raw_bytes == first.raw_bytes) {
-                    first
+        // Reconcile duplicate raw children. A DECLARED reinit uses the already
+        // identity-resolved raw child; ordinary children keep the existing
+        // slab-coherence dedup policy (no capture identity to disambiguate).
+        let raw = match declared_raw {
+            Some(r) => r,
+            None => {
+                if raws.len() == 1 {
+                    raws[0]
                 } else {
-                    return Err(OverlayError::RawChildMissing {
-                        child_old_base: child_base,
-                        child_kind: kind,
-                    });
+                    let so = usize::try_from(slab_offset_us).ok();
+                    let distinct: Vec<&&RawChild> = raws
+                        .iter()
+                        .filter(|r| {
+                            so.and_then(|s| {
+                                slab_bytes
+                                    .get(s..s + r.raw_bytes.len())
+                                    .map(|slice| slice == r.raw_bytes.as_slice())
+                            })
+                            .unwrap_or(false)
+                        })
+                        .collect();
+                    if distinct.len() == 1 {
+                        distinct[0]
+                    } else if distinct.len() > 1 {
+                        return Err(OverlayError::RawChildMissing {
+                            child_old_base: child_base,
+                            child_kind: kind,
+                        });
+                    } else {
+                        let first = raws[0];
+                        if raws.iter().all(|r| r.raw_bytes == first.raw_bytes) {
+                            first
+                        } else {
+                            return Err(OverlayError::RawChildMissing {
+                                child_old_base: child_base,
+                                child_kind: kind,
+                            });
+                        }
+                    }
                 }
             }
         };
@@ -3354,6 +3701,322 @@ pub fn build_patched_backing_slab_q0c(
         };
         let is_slab_seeded = basis == TransformPreimageBasis::AuthoritativeSlabSlice;
 
+        // Route Y R0 (Y0-A rev 2 / Audit P1-1, P1-2): a DECLARED size-reinit child
+        // is FULLY re-validated at this Q0-C consumer boundary — the old-size
+        // tolerance, the exact new size, the RVA and the zero-fill requirement —
+        // its transition must be provably present in the ledger, and its
+        // transformed (new-size) bytes enter the SAME resolved-writes conflict /
+        // last-writer accounting as ordinary writes. A bare `copy_from_slice` that
+        // bypassed replay, digest linkage, overlap/conflict detection and last-writer
+        // enforcement is gone.
+        if declared_reinit {
+            // (P1-1) The unique-resolved raw child (full identity) defines the old
+            // size; never `max(raw.size)` over an ambiguous multi-child set.
+            let spec = child_transform_ids
+                .iter()
+                .filter_map(|tid| declared_size_reinit(tid, child_rva))
+                .next()
+                .expect("declared_reinit implies a declaration exists");
+            let raw_old_size = raw.size;
+            validate_declared_size_reinit_fields(
+                spec,
+                raw_old_size,
+                child_rva,
+                &capture_id,
+                child_base,
+                &transformed_bytes,
+                0,
+            )?;
+            let new_size = spec.new_size;
+            // (P1-2 rev 3 / Audit P1-2) Uniqueness is decided on the transition
+            // IDENTITY (transform_id + capture_id + old_base) — never after
+            // filtering to an already-expected shape. If the ledger carries one
+            // well-formed run plus any additional run with the same transition
+            // identity but a wrong size/offset/bytes, that is ambiguous and must
+            // fail closed (a malformed extra run must not be silently dropped).
+            let child_run_idxs: Vec<usize> = run_ledger
+                .runs
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.child_capture_id == capture_id && r.child_old_base == child_base)
+                .map(|(i, _)| i)
+                .collect();
+            let transition_idxs: Vec<usize> = child_run_idxs
+                .iter()
+                .copied()
+                .filter(|&i| run_ledger.runs[i].transform_id == spec.transform_id)
+                .collect();
+            if transition_idxs.len() != 1 {
+                return Err(OverlayError::TransformRunLedgerInvalid {
+                    run_index: 0,
+                    child_capture_id: capture_id.clone(),
+                    child_old_base: child_base,
+                    child_size: transformed_bytes.len(),
+                    child_offset: 0,
+                    length: 0,
+                    transform_id: spec.transform_id.to_string(),
+                    reason: format!(
+                        "declared size reinit for old_base {:#x} must have EXACTLY ONE ledger run \
+                         for transition identity (transform={:?} capture={:?}); found {}",
+                        child_base,
+                        spec.transform_id,
+                        capture_id,
+                        transition_idxs.len()
+                    ),
+                });
+            }
+            let t_idx = transition_idxs[0];
+            let ev = &run_ledger.runs[t_idx];
+            // (P1-2 rev 3) The unique transition run must carry the declared new
+            // size and cover [0, new_size).
+            if ev.child_size != new_size || ev.child_offset != 0 || ev.length != new_size {
+                return Err(OverlayError::TransformRunLedgerInvalid {
+                    run_index: t_idx,
+                    child_capture_id: capture_id.clone(),
+                    child_old_base: child_base,
+                    child_size: ev.child_size,
+                    child_offset: ev.child_offset,
+                    length: ev.length,
+                    transform_id: spec.transform_id.to_string(),
+                    reason: format!(
+                        "declared size reinit run shape invalid for old_base {:#x}: \
+                         child_size={:#x} offset={:#x} length={:#x}, expected {:#x} [0,{:#x})",
+                        child_base, ev.child_size, ev.child_offset, ev.length, new_size, new_size
+                    ),
+                });
+            }
+            if ev.child_capture_id.is_empty() || ev.transform_id.is_empty() {
+                return Err(OverlayError::TransformRunLedgerInvalid {
+                    run_index: t_idx,
+                    child_capture_id: ev.child_capture_id.clone(),
+                    child_old_base: child_base,
+                    child_size: new_size,
+                    child_offset: 0,
+                    length: 0,
+                    transform_id: spec.transform_id.to_string(),
+                    reason: format!(
+                        "declared size reinit run has empty identity for old_base {:#x}",
+                        child_base
+                    ),
+                });
+            }
+            // (P1-3 rev 3 / Audit P1-3) The transition's BEFORE evidence is the
+            // state right before the sanitize transform executed, NOT the original
+            // raw prefix. Production runs prior recorded transforms (e.g.
+            // scrub_uncaptured_heap_pointers, which can zero any heap-global qword)
+            // before sanitize. Replay every prior run of this child in ledger
+            // execution order from the bound authoritative preimage, verify each
+            // run's before == current state, then the transition's before == the
+            // replayed current state, and the final after == the transformed
+            // new-size region.
+            let mut current = p_bytes.to_vec();
+            for (pos, &ri) in child_run_idxs.iter().enumerate() {
+                let r = &run_ledger.runs[ri];
+                if ri >= t_idx {
+                    break;
+                }
+                let off = r.child_offset;
+                let len = r.length;
+                let end = match off.checked_add(len) {
+                    Some(e) => e,
+                    None => {
+                        return Err(OverlayError::TransformRunLedgerInvalid {
+                            run_index: ri,
+                            child_capture_id: r.child_capture_id.clone(),
+                            child_old_base: child_base,
+                            child_size: r.child_size,
+                            child_offset: off,
+                            length: len,
+                            transform_id: r.transform_id.clone(),
+                            reason: format!(
+                                "prior run length overflow for old_base {:#x}",
+                                child_base
+                            ),
+                        });
+                    }
+                };
+                if end > current.len() || len == 0 {
+                    return Err(OverlayError::TransformRunLedgerInvalid {
+                        run_index: ri,
+                        child_capture_id: r.child_capture_id.clone(),
+                        child_old_base: child_base,
+                        child_size: r.child_size,
+                        child_offset: off,
+                        length: len,
+                        transform_id: r.transform_id.clone(),
+                        reason: format!(
+                            "prior run out of preimage bounds for old_base {:#x}",
+                            child_base
+                        ),
+                    });
+                }
+                // Self-consistency of the prior run's digest pair.
+                if r.before_bytes.len() != len
+                    || r.after_bytes.len() != len
+                    || sha256_hex(&r.before_bytes) != r.before_digest
+                    || sha256_hex(&r.after_bytes) != r.after_digest
+                    || r.first_before_byte != r.before_bytes[0]
+                    || r.first_after_byte != r.after_bytes[0]
+                {
+                    return Err(OverlayError::TransformRunLedgerInvalid {
+                        run_index: ri,
+                        child_capture_id: r.child_capture_id.clone(),
+                        child_old_base: child_base,
+                        child_size: r.child_size,
+                        child_offset: off,
+                        length: len,
+                        transform_id: r.transform_id.clone(),
+                        reason: format!(
+                            "prior run digest/byte inconsistency for old_base {:#x}",
+                            child_base
+                        ),
+                    });
+                }
+                // before == current state at [off, off+len).
+                if current[off..end] != r.before_bytes {
+                    return Err(OverlayError::TransformRunLedgerInvalid {
+                        run_index: ri,
+                        child_capture_id: r.child_capture_id.clone(),
+                        child_old_base: child_base,
+                        child_size: r.child_size,
+                        child_offset: off,
+                        length: len,
+                        transform_id: r.transform_id.clone(),
+                        reason: format!(
+                            "prior run before mismatch at old_base {:#x} (prior-writer chain broken)",
+                            child_base
+                        ),
+                    });
+                }
+                current[off..end].copy_from_slice(&r.after_bytes);
+                let _ = pos;
+            }
+            // The replayed state is what the declared transition saw as its input.
+            if current.len() < new_size || current[0..new_size] != ev.before_bytes {
+                return Err(OverlayError::TransformRunLedgerInvalid {
+                    run_index: t_idx,
+                    child_capture_id: capture_id.clone(),
+                    child_old_base: child_base,
+                    child_size: new_size,
+                    child_offset: 0,
+                    length: 0,
+                    transform_id: spec.transform_id.to_string(),
+                    reason: format!(
+                        "declared size reinit before mismatch for old_base {:#x} (must equal \
+                         prior-writer-replayed current state, not the raw prefix)",
+                        child_base
+                    ),
+                });
+            }
+            // The transition's after bytes must be exactly the transformed new-size
+            // region (zeroed), digest and bytes both replayable.
+            if ev.after_bytes != transformed_bytes[0..new_size]
+                || ev.after_digest != sha256_hex(&transformed_bytes[0..new_size])
+                || ev.first_after_byte != transformed_bytes[0]
+            {
+                return Err(OverlayError::TransformRunLedgerInvalid {
+                    run_index: t_idx,
+                    child_capture_id: capture_id.clone(),
+                    child_old_base: child_base,
+                    child_size: new_size,
+                    child_offset: 0,
+                    length: 0,
+                    transform_id: spec.transform_id.to_string(),
+                    reason: format!(
+                        "declared size reinit after mismatch for old_base {:#x}",
+                        child_base
+                    ),
+                });
+            }
+            // Every child run must be consumed: nothing may follow the terminal
+            // declared transition (it is the final zeroed state).
+            if child_run_idxs.iter().any(|&ri| ri > t_idx) {
+                return Err(OverlayError::TransformRunLedgerInvalid {
+                    run_index: 0,
+                    child_capture_id: capture_id.clone(),
+                    child_old_base: child_base,
+                    child_size: new_size,
+                    child_offset: 0,
+                    length: 0,
+                    transform_id: spec.transform_id.to_string(),
+                    reason: format!(
+                        "declared size reinit for old_base {:#x} must be the LAST run for \
+                         its capture; orphan post-transition run present",
+                        child_base
+                    ),
+                });
+            }
+            // (P1-2) Bounds: the new-size region must stay inside the covering slab.
+            if slab_offset_us
+                .checked_add(new_size)
+                .map_or(true, |end| end > slab_bytes.len())
+            {
+                return Err(OverlayError::RawChildOutsideSlab {
+                    child_kind: kind,
+                    child_old_base: child_base,
+                    child_size: new_size,
+                    slab_old_base,
+                    slab_size,
+                });
+            }
+            // (P1-2) Register EVERY transformed byte into the unified
+            // resolved-writes conflict / last-writer accounting, exactly like an
+            // ordinary write-set. Overlap with another child writing a different
+            // value → TransformWriteConflict (no silent overwrite).
+            for (i, &val) in transformed_bytes[0..new_size].iter().enumerate() {
+                let abs = slab_offset_us + i;
+                match resolved_writes.get(&(si, abs)) {
+                    None => {
+                        resolved_writes.insert(
+                            (si, abs),
+                            ResolvedWrite {
+                                value: val,
+                                child_old_base: child_base,
+                                child_size: raw_old_size,
+                                child_byte_offset: i,
+                                transform_ids: child_transform_ids.clone(),
+                            },
+                        );
+                    }
+                    Some(existing) if existing.value == val => {}
+                    Some(existing) => {
+                        let a_slab_off = (existing.child_old_base - slab_old_base) as usize;
+                        let a_child_byte_offset = abs.saturating_sub(a_slab_off);
+                        return Err(OverlayError::TransformWriteConflict {
+                            a_child_old_base: existing.child_old_base,
+                            a_size: existing.child_size,
+                            a_child_byte_offset,
+                            b_child_old_base: child_base,
+                            b_size: raw_old_size,
+                            b_child_byte_offset: i,
+                            first_mismatch_slab_offset: abs,
+                            before_byte: slab_bytes[abs],
+                            a_after_byte: existing.value,
+                            b_after_byte: val,
+                            a_transform_ids: existing.transform_ids.clone(),
+                            b_transform_ids: child_transform_ids.clone(),
+                        });
+                    }
+                }
+            }
+            // (P1-2) Apply the new-size region to the patched backing slab.
+            backings[si][slab_offset_us..slab_offset_us + new_size]
+                .copy_from_slice(&transformed_bytes[0..new_size]);
+            overlays.push(TransformedRegionOverlay {
+                child_kind: kind,
+                child_old_base: child_base,
+                child_size: new_size,
+                slab_offset: slab_offset_us,
+                raw_child_digest: sha256_hex(raw_child_bytes),
+                raw_slab_slice_digest: sha256_hex(raw_slab_slice),
+                transformed_child_digest: sha256_hex(&transformed_bytes[0..new_size]),
+                transform_ids: child_transform_ids.clone(),
+                overlay_applied: true,
+                contained_in_old_base: None,
+            });
+            continue;
+        }
+
         // ---- Compute the write-set against P (the transform input preimage).
         let t_digest = sha256_hex(&transformed_bytes);
         let p_digest = sha256_hex(&p_bytes);
@@ -3628,12 +4291,12 @@ pub fn build_patched_backing_slab_q0c(
         // Containment for the ledger.
         let contained_in = transformed
             .iter()
-            .find(|(ob, osz, _, ok, _, _, _, _)| {
+            .find(|(ob, osz, _, ok, _, _, _, _, _, _)| {
                 !(*ok == kind && *ob == child_base)
                     && *ob <= child_base
                     && child_base + child_size as u64 <= ob.saturating_add(*osz as u64)
             })
-            .map(|(ob, _, _, _, _, _, _, _)| *ob);
+            .map(|(ob, _, _, _, _, _, _, _, _, _)| *ob);
         let _ = p_digest;
         overlays.push(TransformedRegionOverlay {
             child_kind: kind,
@@ -9421,5 +10084,1010 @@ mod tests {
         });
         // validate_run_membership passes (exactly one raw child, in participant set).
         validate_run_membership(&raw_capture, &[raw_g.clone()], &ledger).unwrap();
+    }
+
+    // ------------------------------------------------------------------
+    // Route Y R0 (Y0) — Declared Size-Reinit Semantics Closure tests.
+    // ------------------------------------------------------------------
+
+    /// The sanitize_ahk_runtime_global size reinit (rva 0x141bf0, old ~0x8000 ->
+    /// 0x180 zero-filled) is a DECLARED transition: diff_transform_write_runs must
+    /// allow it and emit a run with the transformed (new) child size.
+    #[test]
+    fn route_y_r0_sanitize_size_reinit_is_declared_and_allowed() {
+        let mut a = global(0x3437e50, vec![0xAA; 0x8000], false);
+        a.rva = 0x141bf0;
+        a.extent_evidence.capture_id = "mainslot:0x141bf0:0x3437e50".into();
+        a.extent_evidence.capture_path = crate::dumper::heap_global_snapshot::CapturePath::MainSlot;
+        a.extent_kind = CaptureExtentKind::ObservedAllocation;
+        // sanitize re-init: 0x8000 -> 0x180 zero-filled.
+        let mut b = a.clone();
+        b.content = vec![0u8; 0x180];
+        let runs = diff_transform_write_runs(&[a], &[b], "sanitize_ahk_runtime_global").unwrap();
+        assert!(!runs.is_empty(), "sanitize re-init must emit a run");
+        assert_eq!(
+            runs[0].child_size, 0x180,
+            "run child_size must be the new size"
+        );
+        assert_eq!(runs[0].child_capture_id, "mainslot:0x141bf0:0x3437e50");
+        assert_eq!(runs[0].transform_id, "sanitize_ahk_runtime_global");
+    }
+
+    /// An UNDECLARED size change (not a declared reinit) still fails closed.
+    #[test]
+    fn route_y_r0_undeclared_size_drift_still_fails_closed() {
+        let mut a = global(0x200000, vec![0xAA; 0x40], false);
+        a.extent_evidence.capture_id = "id".into();
+        let mut b = a.clone();
+        b.content = vec![0xBB; 0x60]; // size change, no declaration
+        let err = diff_transform_write_runs(&[a], &[b], "some_transform")
+            .expect_err("undeclared size drift must fail closed");
+        assert!(matches!(
+            err,
+            OverlayError::TransformRunLedgerInvalid { .. }
+        ));
+    }
+
+    /// A size change at the sanitize child rva but with a DIFFERENT transform is
+    /// not a declared reinit and fails closed.
+    #[test]
+    fn route_y_r0_wrong_transform_declaration_fails_closed() {
+        let mut a = global(0x3437e50, vec![0xAA; 0x8000], false);
+        a.rva = 0x141bf0;
+        a.extent_evidence.capture_id = "mainslot:0x141bf0:0x3437e50".into();
+        let mut b = a.clone();
+        b.content = vec![0u8; 0x180];
+        // Transform id is NOT sanitize_ahk_runtime_global -> undeclared.
+        let err = diff_transform_write_runs(&[a], &[b], "sort_gscript_label_table")
+            .expect_err("wrong transform must fail closed");
+        assert!(matches!(
+            err,
+            OverlayError::TransformRunLedgerInvalid { .. }
+        ));
+    }
+
+    /// A declared reinit whose OLD size is outside tolerance fails closed.
+    #[test]
+    fn route_y_r0_wrong_old_size_fails_closed() {
+        let mut a = global(0x3437e50, vec![0xAA; 0x20], false); // way too small
+        a.rva = 0x141bf0;
+        a.extent_evidence.capture_id = "mainslot:0x141bf0:0x3437e50".into();
+        let mut b = a.clone();
+        b.content = vec![0u8; 0x180];
+        let err = diff_transform_write_runs(&[a], &[b], "sanitize_ahk_runtime_global")
+            .expect_err("wrong old size must fail closed");
+        assert!(matches!(
+            err,
+            OverlayError::TransformRunLedgerInvalid { .. }
+        ));
+    }
+
+    /// A declared reinit whose NEW size != 0x180 fails closed.
+    #[test]
+    fn route_y_r0_wrong_new_size_fails_closed() {
+        let mut a = global(0x3437e50, vec![0xAA; 0x8000], false);
+        a.rva = 0x141bf0;
+        a.extent_evidence.capture_id = "mainslot:0x141bf0:0x3437e50".into();
+        let mut b = a.clone();
+        b.content = vec![0u8; 0x200]; // wrong new size
+        let err = diff_transform_write_runs(&[a], &[b], "sanitize_ahk_runtime_global")
+            .expect_err("wrong new size must fail closed");
+        assert!(matches!(
+            err,
+            OverlayError::TransformRunLedgerInvalid { .. }
+        ));
+    }
+
+    /// A declared reinit whose after content is NOT zero-filled fails closed.
+    #[test]
+    fn route_y_r0_reinit_not_zero_filled_fails_closed() {
+        let mut a = global(0x3437e50, vec![0xAA; 0x8000], false);
+        a.rva = 0x141bf0;
+        a.extent_evidence.capture_id = "mainslot:0x141bf0:0x3437e50".into();
+        let mut b = a.clone();
+        b.content = vec![0x00; 0x180];
+        b.content[0x10] = 0xFF; // not all zero
+        let err = diff_transform_write_runs(&[a], &[b], "sanitize_ahk_runtime_global")
+            .expect_err("non-zero re-init must fail closed");
+        assert!(matches!(
+            err,
+            OverlayError::TransformRunLedgerInvalid { .. }
+        ));
+    }
+
+    /// A declared reinit whose capture identity drifted fails closed (capture_id
+    /// check is independent of the size declaration).
+    #[test]
+    fn route_y_r0_wrong_capture_identity_fails_closed() {
+        let mut a = global(0x3437e50, vec![0xAA; 0x8000], false);
+        a.rva = 0x141bf0;
+        a.extent_evidence.capture_id = "mainslot:0x141bf0:0x3437e50".into();
+        let mut b = a.clone();
+        b.content = vec![0u8; 0x180];
+        b.extent_evidence.capture_id = "wrong-id".into(); // capture_id drift
+        let err = diff_transform_write_runs(&[a], &[b], "sanitize_ahk_runtime_global")
+            .expect_err("capture_id drift must fail closed");
+        assert!(matches!(
+            err,
+            OverlayError::TransformRunLedgerInvalid { .. }
+        ));
+    }
+
+    /// Build a COMPLETE legal declared-reinit scenario through the production
+    /// chain: identity -> coverage -> raw-children -> seed -> apply_recorded_transform
+    /// (real sanitize) -> (ready for q0c). Returns the full fixture so tests can
+    /// either pass it straight to `build_patched_backing_slab_q0c` (positive) or
+    /// corrupt exactly one dimension to exercise the Q0-C consumer fail-closed
+    /// boundary (negative).
+    fn y0_declared_q0c_fixture() -> (
+        RawSlabCapture,
+        Vec<HeapGlobalSnapshot>,
+        Vec<ContainerSnapshot>,
+        Vec<TransformPreimageBinding>,
+        TransformRunLedger,
+    ) {
+        const RVA: u32 = 0x141bf0;
+        const LIVE: u64 = 0x3437e50;
+        const OLD_SIZE: usize = 0x8000;
+        let raw_bytes = vec![0xAAu8; OLD_SIZE];
+        let slab = slab_with_child(0x3400000, 0x100000, LIVE, raw_bytes.clone());
+        let mut raw_capture = RawSlabCapture {
+            slabs: vec![slab],
+            children: vec![raw_child(
+                LIVE,
+                OLD_SIZE,
+                raw_bytes.clone(),
+                RawChildKind::HeapGlobal,
+            )],
+        };
+        raw_capture.children[0].capture_id = "mainslot:0x141bf0:0x3437e50".into();
+        raw_capture.children[0].extent_kind = CaptureExtentKind::ObservedAllocation;
+        let mut g = global(LIVE, raw_bytes.clone(), false);
+        g.rva = RVA;
+        g.extent_kind = CaptureExtentKind::ObservedAllocation;
+        g.extent_evidence.capture_id = "mainslot:0x141bf0:0x3437e50".into();
+        g.extent_evidence.capture_path = crate::dumper::heap_global_snapshot::CapturePath::MainSlot;
+        let mut globals = vec![g];
+        let mut containers: Vec<ContainerSnapshot> = Vec::new();
+        validate_raw_coherence_capture_identities(&containers, &globals).unwrap();
+        validate_probe_coverage(&globals, &raw_capture.slabs).unwrap();
+        let children = raw_children_from_capture(&containers, &globals);
+        assert_eq!(children.len(), 1);
+        let bindings = seed_transform_inputs_from_authoritative_slab(
+            &raw_capture,
+            &mut containers,
+            &mut globals,
+        )
+        .unwrap();
+        assert_eq!(bindings.len(), 1);
+        let mut ledger = TransformRunLedger::default();
+        apply_recorded_transform(
+            &mut globals,
+            "sanitize_ahk_runtime_global",
+            &mut ledger,
+            |g| {
+                super::super::heap_global_snapshot::sanitize_ahk_runtime_global(g);
+            },
+        )
+        .unwrap();
+        assert_eq!(globals[0].content.len(), 0x180);
+        assert!(globals[0].content.iter().all(|&b| b == 0));
+        assert!(!ledger.runs.is_empty());
+        assert_eq!(ledger.runs[0].child_old_base, LIVE);
+        assert_eq!(ledger.runs[0].child_size, 0x180);
+        (raw_capture, globals, containers, bindings, ledger)
+    }
+
+    /// The real sanitize_ahk_runtime_global through the PRODUCTION chain
+    /// (identity -> coverage -> raw-children -> seed -> apply_recorded_transform
+    /// with the real sanitize -> q0c overlay -> runtime rebase plan -> manifest)
+    /// must COMPLETE overlay, produce a run for the size re-init, and the patched
+    /// slab must contain the expected zeroed 0x180 region.
+    #[test]
+    fn route_y_r0_sanitize_full_production_chain_q0c_overlay() {
+        const LIVE: u64 = 0x3437e50;
+        let (raw_capture, globals, containers, bindings, ledger) = y0_declared_q0c_fixture();
+        let (patched, overlays, _) =
+            build_patched_backing_slab_q0c(&raw_capture, &globals, &[], &bindings, &ledger)
+                .unwrap();
+        assert!(overlays
+            .iter()
+            .any(|o| o.child_old_base == LIVE && o.overlay_applied));
+        assert!(!patched.is_empty() && !patched[0].content.is_empty());
+        // The patched slab region for the re-init child must be exactly 0x180 zeros.
+        let off = (LIVE - raw_capture.slabs[0].old_base) as usize;
+        let region = &patched[0].content[off..off + 0x180];
+        assert_eq!(region.len(), 0x180);
+        assert!(
+            region.iter().all(|&b| b == 0),
+            "declared re-init region must be zero-filled in the patched slab"
+        );
+        // The overlay record for the declared transition must carry the NEW size
+        // and the transformed (zeroed) digest — replayable evidence.
+        let o = overlays
+            .iter()
+            .find(|o| o.child_old_base == LIVE)
+            .expect("declared overlay record");
+        assert_eq!(o.child_size, 0x180);
+        assert_eq!(
+            o.transformed_child_digest,
+            sha256_hex(&vec![0u8; 0x180]),
+            "overlay must record the exact zeroed new-size digest"
+        );
+        // Runtime rebase plan over the patched slabs: must construct without
+        // error (the declared re-init is reflected in the patched backing slab).
+        let slots = crate::dumper::runtime_rebase::declared_slots_from_capture(
+            &containers,
+            &globals,
+            &patched,
+        );
+        // P2: the fixture must genuinely produce a runtime rebase plan over the
+        // patched slabs (the declared re-init is part of the patched backing).
+        let plan = crate::dumper::runtime_rebase::build_runtime_rebase_plan(
+            &containers,
+            &globals,
+            &patched,
+            &slots,
+            &crate::dumper::runtime_rebase::ExternalResolverTable::new(),
+            &[],
+            0x140000000,
+            0x150000000,
+        )
+        .unwrap()
+        .expect("a runtime rebase plan must be produced for the declared re-init fixture");
+        crate::dumper::runtime_rebase::validate_runtime_rebase_plan(&plan).unwrap();
+        // Manifest: the declared transition appears in the recorded transform
+        // ledger evidence (the sanitize transform is bound to the candidate).
+        let declared_digest = sha256_hex(&vec![0u8; 0x180]);
+        assert_eq!(
+            overlays.iter().filter(|o| o.child_old_base == LIVE).count(),
+            1,
+            "exactly one declared overlay record"
+        );
+        assert_eq!(ledger.runs.len(), 1);
+        assert_eq!(ledger.runs[0].transform_id, "sanitize_ahk_runtime_global");
+        assert_eq!(ledger.runs[0].after_digest, declared_digest);
+        // Manifest serialization must be derived from the ACTUAL ledger/overlay
+        // data flow — not hand-injected strings. Build the transform list from
+        // the recorded runs (the sanitize transition) and serialize.
+        let manifest_dir = std::env::temp_dir().join(format!(
+            "mida_y0_manifest_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&manifest_dir).unwrap();
+        let candidate = manifest_dir.join("candidate.exe");
+        let mut manifest_transforms: Vec<(&str, &str)> = Vec::new();
+        for r in &ledger.runs {
+            manifest_transforms.push((r.transform_id.as_str(), "declared-size-reinit"));
+        }
+        assert_eq!(
+            manifest_transforms.len(),
+            1,
+            "ledger must drive exactly one manifest transform entry"
+        );
+        crate::dumper::dump_process::write_bound_transform_manifest(
+            &candidate,
+            &patched[0].content,
+            &manifest_transforms,
+            None,
+        )
+        .unwrap();
+        let manifest = candidate.with_extension("transform_manifest.json");
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest).expect("manifest written"))
+                .expect("manifest must be valid JSON");
+        assert_eq!(parsed["schema_version"], "mida.transform-manifest/v0");
+        let entries = parsed["entries"].as_array().expect("entries array");
+        assert!(
+            entries
+                .iter()
+                .any(|e| e["id"] == "sanitize_ahk_runtime_global"),
+            "manifest must record the declared transition transform from the ledger"
+        );
+        let _ = std::fs::remove_dir_all(&manifest_dir);
+    }
+
+    /// Q0-C consumer boundary: an EMPTY ledger cannot authorize the declared
+    /// transition — no run evidence -> fails closed.
+    #[test]
+    fn route_y_r0_q0c_empty_ledger_fails_closed() {
+        let (raw_capture, globals, _c, bindings, _ledger) = y0_declared_q0c_fixture();
+        let empty_ledger = TransformRunLedger::default();
+        let err =
+            build_patched_backing_slab_q0c(&raw_capture, &globals, &[], &bindings, &empty_ledger)
+                .expect_err("empty ledger must fail closed at Q0-C");
+        assert!(matches!(
+            err,
+            OverlayError::TransformRunLedgerInvalid { .. }
+        ));
+    }
+
+    /// Q0-C consumer boundary: an OLD size far outside the declared tolerance
+    /// (raw child much smaller than 0x8000) must be rejected THROUGH the real
+    /// `build_patched_backing_slab_q0c` path — not by calling the field validator
+    /// directly. We build a complete fixture whose raw child has an out-of-range
+    /// size but a fully self-consistent raw/binding/ledger (so the overlay reaches
+    /// the declared-reinit boundary) and assert the overlay call itself fails.
+    #[test]
+    fn route_y_r0_q0c_old_size_out_of_tolerance_fails_closed() {
+        const RVA: u32 = 0x141bf0;
+        const LIVE: u64 = 0x3437e50;
+        const SLAB_BASE: u64 = 0x3400000;
+        const SLAB_SZ: usize = 0x100000;
+        const RAW_SIZE: usize = 0x100; // far below 0x8000 - 0x2000
+        const NEW_SIZE: usize = 0x180;
+        let raw_bytes = vec![0xAAu8; RAW_SIZE];
+        let slab_content = slab_with_child(SLAB_BASE, SLAB_SZ, LIVE, raw_bytes.clone()).content;
+        let mut raw_capture = RawSlabCapture {
+            slabs: vec![slab(SLAB_BASE, slab_content.clone())],
+            children: vec![raw_child(
+                LIVE,
+                RAW_SIZE,
+                raw_bytes.clone(),
+                RawChildKind::HeapGlobal,
+            )],
+        };
+        raw_capture.children[0].capture_id = "mainA".into();
+        raw_capture.children[0].extent_kind = CaptureExtentKind::ObservedAllocation;
+        raw_capture.children[0].capture_path = CapturePath::MainSlot;
+        // Transformed child: declared re-init -> zeroed NEW_SIZE.
+        let mut g = global(LIVE, vec![0u8; NEW_SIZE], false);
+        g.rva = RVA;
+        g.transform_ids = vec!["sanitize_ahk_runtime_global".into()];
+        g.extent_kind = CaptureExtentKind::ObservedAllocation;
+        g.extent_evidence.capture_id = "mainA".into();
+        g.extent_evidence.capture_path = CapturePath::MainSlot;
+        let globals = vec![g];
+        // Hand-built binding: self-consistent with the RAW_SIZE raw child and the
+        // covering slab (ChildCapture basis for an ObservedAllocation child).
+        let off = (LIVE - SLAB_BASE) as usize;
+        let slab_slice = slab_content[off..off + RAW_SIZE].to_vec();
+        let binding = TransformPreimageBinding {
+            child_kind: RawChildKind::HeapGlobal,
+            capture_id: "mainA".into(),
+            child_old_base: LIVE,
+            child_size: RAW_SIZE,
+            extent_kind: CaptureExtentKind::ObservedAllocation,
+            slab_old_base: SLAB_BASE,
+            slab_size: SLAB_SZ,
+            slab_digest: sha256_hex(&slab_content),
+            slab_offset: off,
+            basis: TransformPreimageBasis::ChildCapture,
+            raw_child_digest: sha256_hex(&raw_bytes),
+            raw_slab_slice_digest: sha256_hex(&slab_slice),
+            transform_input_digest: sha256_hex(&raw_bytes),
+            seeded_from_slab: false,
+        };
+        let bindings = vec![binding];
+        // A shape-valid sanitize transition run (the old-size gate rejects before
+        // the run shape/evidence is even consulted).
+        let ledger = TransformRunLedger {
+            runs: vec![TransformWriteRun {
+                child_capture_id: "mainA".into(),
+                child_old_base: LIVE,
+                child_size: NEW_SIZE,
+                child_offset: 0,
+                length: NEW_SIZE,
+                transform_id: "sanitize_ahk_runtime_global".into(),
+                before_digest: sha256_hex(&vec![0xAAu8; NEW_SIZE]),
+                after_digest: sha256_hex(&vec![0u8; NEW_SIZE]),
+                first_before_byte: 0xAA,
+                first_after_byte: 0x00,
+                before_bytes: vec![0xAAu8; NEW_SIZE],
+                after_bytes: vec![0u8; NEW_SIZE],
+            }],
+        };
+        let err = build_patched_backing_slab_q0c(&raw_capture, &globals, &[], &bindings, &ledger)
+            .expect_err("out-of-tolerance old size must fail closed THROUGH Q0-C");
+        assert!(matches!(
+            err,
+            OverlayError::TransformRunLedgerInvalid { .. }
+        ));
+    }
+
+    /// Q0-C consumer boundary: a NEW size != 0x180 on the transformed snapshot
+    /// fails closed (declaration requires the exact re-init size).
+    #[test]
+    fn route_y_r0_q0c_new_size_wrong_fails_closed() {
+        let (raw_capture, mut globals, _c, bindings, ledger) = y0_declared_q0c_fixture();
+        globals[0].content = vec![0u8; 0x200]; // wrong new size
+        let err = build_patched_backing_slab_q0c(&raw_capture, &globals, &[], &bindings, &ledger)
+            .expect_err("wrong new size must fail closed at Q0-C");
+        assert!(matches!(
+            err,
+            OverlayError::TransformRunLedgerInvalid { .. }
+        ));
+    }
+
+    /// Q0-C consumer boundary: transformed bytes that are NOT zero-filled fail
+    /// closed even though the ledger claims a reinit.
+    #[test]
+    fn route_y_r0_q0c_new_bytes_nonzero_fails_closed() {
+        let (raw_capture, mut globals, _c, bindings, ledger) = y0_declared_q0c_fixture();
+        globals[0].content = vec![0u8; 0x180];
+        globals[0].content[0x40] = 0x5A; // non-zero
+        let err = build_patched_backing_slab_q0c(&raw_capture, &globals, &[], &bindings, &ledger)
+            .expect_err("non-zero re-init bytes must fail closed at Q0-C");
+        assert!(matches!(
+            err,
+            OverlayError::TransformRunLedgerInvalid { .. }
+        ));
+    }
+
+    /// Q0-C consumer boundary: a ledger run with a WRONG child_size (not the
+    /// declared new size) fails closed — the transition must be proven at the
+    /// declared new size.
+    #[test]
+    fn route_y_r0_q0c_ledger_child_size_wrong_fails_closed() {
+        let (raw_capture, globals, _c, bindings, mut ledger) = y0_declared_q0c_fixture();
+        ledger.runs[0].child_size = 0x400; // wrong new size in the ledger
+        let err = build_patched_backing_slab_q0c(&raw_capture, &globals, &[], &bindings, &ledger)
+            .expect_err("wrong ledger child_size must fail closed at Q0-C");
+        assert!(matches!(
+            err,
+            OverlayError::TransformRunLedgerInvalid { .. }
+        ));
+    }
+
+    /// Q0-C consumer boundary (P1-2): a declared re-init whose new-size region
+    /// overlaps another transformed child writing a DIFFERENT value must fail
+    /// closed with a TransformWriteConflict — never a silent overwrite. The
+    /// ordinary child is processed first (lower base), registers its bytes into
+    /// `resolved_writes`, then the declared re-init's zeroed region collides.
+    #[test]
+    fn route_y_r0_q0c_overlap_different_value_fails_closed() {
+        const RVA: u32 = 0x141bf0;
+        const LIVE: u64 = 0x3437e50; // declared child base (0x141bf0)
+        const B_BASE: u64 = 0x3437e20; // ordinary child base, covers LIVE region
+        const OLD_SIZE: usize = 0x8000;
+        const NEW_SIZE: usize = 0x180;
+        const SLAB_BASE: u64 = 0x3400000;
+        const SLAB_SZ: usize = 0x100000;
+        // A: raw [0xAA; 0x8000] at LIVE. B: raw = [0xCC; 0x30] then [0xAA; 0x180]
+        // so B covers [B_BASE, LIVE+NEW_SIZE) and its overlap with A is 0xAA.
+        let off_a = (LIVE - SLAB_BASE) as usize;
+        let off_b = (B_BASE - SLAB_BASE) as usize;
+        let b_sz = (LIVE + NEW_SIZE as u64 - B_BASE) as usize; // 0x30 + 0x180
+        let mut a_raw = vec![0xAAu8; OLD_SIZE];
+        let mut b_raw = vec![0xCCu8; 0x30];
+        b_raw.extend(std::iter::repeat(0xAAu8).take(NEW_SIZE));
+        assert_eq!(b_raw.len(), b_sz);
+        let mut slab_content = vec![0u8; SLAB_SZ];
+        slab_content[off_a..off_a + OLD_SIZE].copy_from_slice(&a_raw);
+        slab_content[off_b..off_b + b_sz].copy_from_slice(&b_raw);
+        let mut raw_capture = RawSlabCapture {
+            slabs: vec![slab(SLAB_BASE, slab_content)],
+            children: vec![
+                raw_child(LIVE, OLD_SIZE, a_raw.clone(), RawChildKind::HeapGlobal),
+                raw_child(B_BASE, b_sz, b_raw.clone(), RawChildKind::HeapGlobal),
+            ],
+        };
+        raw_capture.children[0].capture_id = "mainA".into();
+        raw_capture.children[0].extent_kind = CaptureExtentKind::ObservedAllocation;
+        raw_capture.children[1].capture_id = "mainB".into();
+        raw_capture.children[1].extent_kind = CaptureExtentKind::ObservedAllocation;
+        // Declared re-init child A.
+        let mut ga = global(LIVE, a_raw.clone(), false);
+        ga.rva = RVA;
+        ga.extent_kind = CaptureExtentKind::ObservedAllocation;
+        ga.extent_evidence.capture_id = "mainA".into();
+        ga.extent_evidence.capture_path = CapturePath::MainSlot;
+        // Ordinary child B.
+        let mut gb = global(B_BASE, b_raw.clone(), false);
+        gb.extent_kind = CaptureExtentKind::ObservedAllocation;
+        gb.extent_evidence.capture_id = "mainB".into();
+        gb.extent_evidence.capture_path = CapturePath::MainSlot;
+        let mut globals = vec![ga, gb];
+        let mut containers: Vec<ContainerSnapshot> = Vec::new();
+        validate_raw_coherence_capture_identities(&containers, &globals).unwrap();
+        validate_probe_coverage(&globals, &raw_capture.slabs).unwrap();
+        let _ = raw_children_from_capture(&containers, &globals);
+        let bindings = seed_transform_inputs_from_authoritative_slab(
+            &raw_capture,
+            &mut containers,
+            &mut globals,
+        )
+        .unwrap();
+        assert_eq!(bindings.len(), 2);
+        // Apply: A -> sanitize (zeroed 0x180); B -> ordinary +1 (0xCC->0xCD, 0xAA->0xAB).
+        let mut ledger = TransformRunLedger::default();
+        apply_recorded_transform(
+            &mut globals,
+            "sanitize_ahk_runtime_global",
+            &mut ledger,
+            |gs| {
+                for g in gs.iter_mut() {
+                    if g.rva == RVA {
+                        super::super::heap_global_snapshot::sanitize_ahk_runtime_global(
+                            std::slice::from_mut(g),
+                        );
+                    }
+                }
+            },
+        )
+        .unwrap();
+        apply_recorded_transform(
+            &mut globals,
+            "sort_gscript_label_table",
+            &mut ledger,
+            |gs| {
+                for g in gs.iter_mut() {
+                    if g.rva != RVA {
+                        for b in g.content.iter_mut() {
+                            *b = b.wrapping_add(1);
+                        }
+                    }
+                }
+            },
+        )
+        .unwrap();
+        // B transforms to 0xCD/0xAB; A re-inits to 0x00.
+        let err = build_patched_backing_slab_q0c(&raw_capture, &globals, &[], &bindings, &ledger)
+            .expect_err("overlapping different-value write must fail closed at Q0-C");
+        assert!(matches!(err, OverlayError::TransformWriteConflict { .. }));
+    }
+
+    /// Hand-build a complete declared-reinit fixture WITHOUT running the
+    /// production recorder, so a test can supply an arbitrary ledger (prior-writer
+    /// chains, malformed extra runs, etc.). Raw child A carries the declared
+    /// capture identity; the binding is a self-consistent ChildCapture binding
+    /// over that raw child. Returns (raw_capture, globals, bindings); the caller
+    /// owns the ledger.
+    fn y0_manual_identity_fixture(
+        raw_capture_id: &str,
+    ) -> (
+        RawSlabCapture,
+        Vec<HeapGlobalSnapshot>,
+        Vec<TransformPreimageBinding>,
+    ) {
+        const RVA: u32 = 0x141bf0;
+        const LIVE: u64 = 0x3437e50;
+        const OLD_SIZE: usize = 0x8000;
+        const SLAB_BASE: u64 = 0x3400000;
+        const SLAB_SZ: usize = 0x100000;
+        let raw_bytes = vec![0xAAu8; OLD_SIZE];
+        let slab_content = slab_with_child(SLAB_BASE, SLAB_SZ, LIVE, raw_bytes.clone()).content;
+        let mut raw_capture = RawSlabCapture {
+            slabs: vec![slab(SLAB_BASE, slab_content.clone())],
+            children: vec![raw_child(
+                LIVE,
+                OLD_SIZE,
+                raw_bytes.clone(),
+                RawChildKind::HeapGlobal,
+            )],
+        };
+        raw_capture.children[0].capture_id = raw_capture_id.to_string();
+        raw_capture.children[0].extent_kind = CaptureExtentKind::ObservedAllocation;
+        raw_capture.children[0].capture_path = CapturePath::MainSlot;
+        let mut g = global(LIVE, vec![0u8; 0x180], false);
+        g.rva = RVA;
+        g.transform_ids = vec!["sanitize_ahk_runtime_global".into()];
+        g.extent_kind = CaptureExtentKind::ObservedAllocation;
+        g.extent_evidence.capture_id = raw_capture_id.to_string();
+        g.extent_evidence.capture_path = CapturePath::MainSlot;
+        let globals = vec![g];
+        let off = (LIVE - SLAB_BASE) as usize;
+        let slab_slice = slab_content[off..off + OLD_SIZE].to_vec();
+        let binding = TransformPreimageBinding {
+            child_kind: RawChildKind::HeapGlobal,
+            capture_id: raw_capture_id.to_string(),
+            child_old_base: LIVE,
+            child_size: OLD_SIZE,
+            extent_kind: CaptureExtentKind::ObservedAllocation,
+            slab_old_base: SLAB_BASE,
+            slab_size: SLAB_SZ,
+            slab_digest: sha256_hex(&slab_content),
+            slab_offset: off,
+            basis: TransformPreimageBasis::ChildCapture,
+            raw_child_digest: sha256_hex(&raw_bytes),
+            raw_slab_slice_digest: sha256_hex(&slab_slice),
+            transform_input_digest: sha256_hex(&raw_bytes),
+            seeded_from_slab: false,
+        };
+        (raw_capture, globals, vec![binding])
+    }
+
+    /// Build a sanitize transition run with the given before bytes.
+    fn y0_sanitize_run(capture_id: &str, before: Vec<u8>) -> TransformWriteRun {
+        let new_size = 0x180usize;
+        let after = vec![0u8; new_size];
+        assert_eq!(before.len(), new_size);
+        TransformWriteRun {
+            child_capture_id: capture_id.to_string(),
+            child_old_base: 0x3437e50,
+            child_size: new_size,
+            child_offset: 0,
+            length: new_size,
+            transform_id: "sanitize_ahk_runtime_global".into(),
+            before_digest: sha256_hex(&before),
+            after_digest: sha256_hex(&after),
+            first_before_byte: before[0],
+            first_after_byte: 0x00,
+            before_bytes: before,
+            after_bytes: after,
+        }
+    }
+
+    /// Q0-C consumer boundary (P1-3 / Audit P1-3): a LEGAL prior-writer chain
+    /// before the declared re-init must be accepted. A prior recorded transform
+    /// (e.g. scrub_uncaptured_heap_pointers) changes byte 0 from 0xAA to 0xAB
+    /// before sanitize; the sanitize run's before state is the replayed current
+    /// state (0xAB prefix), NOT the raw prefix. The chain replays in ledger
+    /// execution order and the overlay must succeed.
+    #[test]
+    fn route_y_r0_q0c_prior_writer_chain_before_declared_reinit_succeeds() {
+        let (raw_capture, globals, bindings) = y0_manual_identity_fixture("mainA");
+        // prior writer: byte 0 -> 0xAB (raw child_size 0x8000, offset 0, len 1).
+        let prior = TransformWriteRun {
+            child_capture_id: "mainA".into(),
+            child_old_base: 0x3437e50,
+            child_size: 0x8000,
+            child_offset: 0,
+            length: 1,
+            transform_id: "scrub_uncaptured_heap_pointers".into(),
+            before_digest: sha256_hex(&[0xAA]),
+            after_digest: sha256_hex(&[0xAB]),
+            first_before_byte: 0xAA,
+            first_after_byte: 0xAB,
+            before_bytes: vec![0xAA],
+            after_bytes: vec![0xAB],
+        };
+        // sanitize sees byte 0 = 0xAB (post-scrub), rest = 0xAA.
+        let mut before = vec![0xAAu8; 0x180];
+        before[0] = 0xAB;
+        let sanitize = y0_sanitize_run("mainA", before);
+        let ledger = TransformRunLedger {
+            runs: vec![prior, sanitize],
+        };
+        let (patched, overlays, _) =
+            build_patched_backing_slab_q0c(&raw_capture, &globals, &[], &bindings, &ledger)
+                .expect("a valid prior-writer chain + declared re-init must succeed");
+        let off = (0x3437e50 - 0x3400000) as usize;
+        assert_eq!(&patched[0].content[off..off + 0x180], &[0u8; 0x180]);
+        assert!(overlays.iter().any(|o| o.overlay_applied));
+    }
+
+    /// Q0-C consumer boundary (P1-2 / Audit P1-2): one well-formed transition run
+    /// PLUS an extra run with the same transition identity but a WRONG shape must
+    /// fail closed (ambiguous transition). The extra bad run must not be silently
+    /// filtered out.
+    #[test]
+    fn route_y_r0_q0c_extra_same_identity_bad_run_fails_closed() {
+        let (raw_capture, globals, bindings) = y0_manual_identity_fixture("mainA");
+        let good = y0_sanitize_run("mainA", vec![0xAAu8; 0x180]);
+        // Same transition identity, but wrong child_size / offset / fabricated bytes.
+        let bad = TransformWriteRun {
+            child_capture_id: "mainA".into(),
+            child_old_base: 0x3437e50,
+            child_size: 0x200, // wrong new size
+            child_offset: 0x180,
+            length: 0x80,
+            transform_id: "sanitize_ahk_runtime_global".into(),
+            before_digest: sha256_hex(&[0xAA; 0x80]),
+            after_digest: sha256_hex(&[0x55; 0x80]),
+            first_before_byte: 0xAA,
+            first_after_byte: 0x55,
+            before_bytes: vec![0xAA; 0x80],
+            after_bytes: vec![0x55; 0x80],
+        };
+        let ledger = TransformRunLedger {
+            runs: vec![good, bad],
+        };
+        let err = build_patched_backing_slab_q0c(&raw_capture, &globals, &[], &bindings, &ledger)
+            .expect_err("an extra same-identity bad run must fail closed");
+        assert!(matches!(
+            err,
+            OverlayError::TransformRunLedgerInvalid { .. }
+        ));
+    }
+
+    /// Q0-C consumer boundary (P1-1 / Audit P1-1): two raw children share the same
+    /// old_base + kind but carry DIFFERENT capture identities. The declared
+    /// re-init resolves by full capture identity and must succeed with the
+    /// declared capture — it must not confuse the two captures (the pre-fix code
+    /// selected by raw-byte/slab coherence and could consume the wrong capture).
+    #[test]
+    fn route_y_r0_q0c_same_base_different_capture_identity_resolves_correctly() {
+        const RVA: u32 = 0x141bf0;
+        const LIVE: u64 = 0x3437e50;
+        const OLD_SIZE: usize = 0x8000;
+        const SLAB_BASE: u64 = 0x3400000;
+        const SLAB_SZ: usize = 0x100000;
+        let raw_bytes = vec![0xAAu8; OLD_SIZE];
+        let slab_content = slab_with_child(SLAB_BASE, SLAB_SZ, LIVE, raw_bytes.clone()).content;
+        // Two raw children at the SAME base+kind with different capture ids.
+        let mut raw_a = raw_child(LIVE, OLD_SIZE, raw_bytes.clone(), RawChildKind::HeapGlobal);
+        raw_a.capture_id = "realA".into();
+        raw_a.extent_kind = CaptureExtentKind::ObservedAllocation;
+        raw_a.capture_path = CapturePath::MainSlot;
+        let mut raw_b = raw_child(LIVE, OLD_SIZE, raw_bytes.clone(), RawChildKind::HeapGlobal);
+        raw_b.capture_id = "fakeB".into();
+        raw_b.extent_kind = CaptureExtentKind::ObservedAllocation;
+        raw_b.capture_path = CapturePath::MainSlot;
+        let raw_capture = RawSlabCapture {
+            slabs: vec![slab(SLAB_BASE, slab_content.clone())],
+            children: vec![raw_a, raw_b],
+        };
+        // Transformed snapshot declares capture "realA".
+        let mut g = global(LIVE, vec![0u8; 0x180], false);
+        g.rva = RVA;
+        g.transform_ids = vec!["sanitize_ahk_runtime_global".into()];
+        g.extent_kind = CaptureExtentKind::ObservedAllocation;
+        g.extent_evidence.capture_id = "realA".into();
+        g.extent_evidence.capture_path = CapturePath::MainSlot;
+        let globals = vec![g];
+        let off = (LIVE - SLAB_BASE) as usize;
+        let slab_slice = slab_content[off..off + OLD_SIZE].to_vec();
+        let binding = TransformPreimageBinding {
+            child_kind: RawChildKind::HeapGlobal,
+            capture_id: "realA".into(),
+            child_old_base: LIVE,
+            child_size: OLD_SIZE,
+            extent_kind: CaptureExtentKind::ObservedAllocation,
+            slab_old_base: SLAB_BASE,
+            slab_size: SLAB_SZ,
+            slab_digest: sha256_hex(&slab_content),
+            slab_offset: off,
+            basis: TransformPreimageBasis::ChildCapture,
+            raw_child_digest: sha256_hex(&raw_bytes),
+            raw_slab_slice_digest: sha256_hex(&slab_slice),
+            transform_input_digest: sha256_hex(&raw_bytes),
+            seeded_from_slab: false,
+        };
+        let ledger = TransformRunLedger {
+            runs: vec![y0_sanitize_run("realA", vec![0xAAu8; 0x180])],
+        };
+        let (patched, overlays, _) =
+            build_patched_backing_slab_q0c(&raw_capture, &globals, &[], &[binding], &ledger)
+                .expect("declared re-init must resolve the declared capture by identity");
+        let off2 = (LIVE - SLAB_BASE) as usize;
+        assert_eq!(&patched[0].content[off2..off2 + 0x180], &[0u8; 0x180]);
+        assert!(overlays
+            .iter()
+            .any(|o| o.child_old_base == LIVE && o.overlay_applied));
+    }
+
+    /// Q0-C consumer boundary (P1-1 / Audit P1-1 strongest form): the declared
+    /// capture's raw bytes DISAGREE with the slab, while a DIFFERENT capture at
+    /// the same base+kind AGREES with the slab. The overlay must resolve by
+    /// capture identity (choose A) and then FAIL CLOSED on A's coherence — it
+    /// must NEVER silently fall back to the different-capture raw child (B) that
+    /// happens to match the slab.
+    #[test]
+    fn route_y_r0_q0c_wrong_capture_raw_bytes_must_not_fall_back_to_slab_matching_child() {
+        const RVA: u32 = 0x141bf0;
+        const LIVE: u64 = 0x3437e50;
+        const OLD_SIZE: usize = 0x8000;
+        const SLAB_BASE: u64 = 0x3400000;
+        const SLAB_SZ: usize = 0x100000;
+        // Slab region holds B's bytes (0xBB); A's declared bytes (0xAA) differ.
+        let slab_bytes = vec![0xBBu8; OLD_SIZE];
+        let slab_content = slab_with_child(SLAB_BASE, SLAB_SZ, LIVE, slab_bytes.clone()).content;
+        let mut raw_a = raw_child(
+            LIVE,
+            OLD_SIZE,
+            vec![0xAAu8; OLD_SIZE],
+            RawChildKind::HeapGlobal,
+        );
+        raw_a.capture_id = "realA".into();
+        raw_a.extent_kind = CaptureExtentKind::ObservedAllocation;
+        raw_a.capture_path = CapturePath::MainSlot;
+        let mut raw_b = raw_child(LIVE, OLD_SIZE, slab_bytes.clone(), RawChildKind::HeapGlobal);
+        raw_b.capture_id = "fakeB".into();
+        raw_b.extent_kind = CaptureExtentKind::ObservedAllocation;
+        raw_b.capture_path = CapturePath::MainSlot;
+        let raw_capture = RawSlabCapture {
+            slabs: vec![slab(SLAB_BASE, slab_content.clone())],
+            children: vec![raw_a, raw_b],
+        };
+        // Transformed snapshot + binding + ledger all declare capture "realA".
+        let mut g = global(LIVE, vec![0u8; 0x180], false);
+        g.rva = RVA;
+        g.transform_ids = vec!["sanitize_ahk_runtime_global".into()];
+        g.extent_kind = CaptureExtentKind::ObservedAllocation;
+        g.extent_evidence.capture_id = "realA".into();
+        g.extent_evidence.capture_path = CapturePath::MainSlot;
+        let globals = vec![g];
+        let off = (LIVE - SLAB_BASE) as usize;
+        let a_slice = slab_content[off..off + OLD_SIZE].to_vec(); // B's bytes in the slab
+        let binding = TransformPreimageBinding {
+            child_kind: RawChildKind::HeapGlobal,
+            capture_id: "realA".into(),
+            child_old_base: LIVE,
+            child_size: OLD_SIZE,
+            extent_kind: CaptureExtentKind::ObservedAllocation,
+            slab_old_base: SLAB_BASE,
+            slab_size: SLAB_SZ,
+            slab_digest: sha256_hex(&slab_content),
+            slab_offset: off,
+            basis: TransformPreimageBasis::ChildCapture,
+            raw_child_digest: sha256_hex(&vec![0xAAu8; OLD_SIZE]), // A's digest
+            raw_slab_slice_digest: sha256_hex(&a_slice),
+            transform_input_digest: sha256_hex(&vec![0xAAu8; OLD_SIZE]), // A's preimage
+            seeded_from_slab: false,
+        };
+        let ledger = TransformRunLedger {
+            runs: vec![y0_sanitize_run("realA", vec![0xAAu8; 0x180])],
+        };
+        let err = build_patched_backing_slab_q0c(&raw_capture, &globals, &[], &[binding], &ledger)
+            .expect_err(
+                "declared capture whose raw disagrees with the slab must fail closed, \
+                 never fall back to the different-capture slab-matching child",
+            );
+        assert!(matches!(err, OverlayError::RawCaptureDrift { .. }));
+    }
+
+    /// Q0-C + recorder agreement (Audit P1): a real declared size re-init whose
+    /// old prefix ALREADY contains zero bytes (free-list-polluted heap blob) must
+    /// go through the PRODUCTION chain — recorder emits a single dedicated full
+    /// transition run, and Q0-C accepts it. The recorder must NOT emit multiple
+    /// sparse byte-diff runs (a zero already present in the prefix would otherwise
+    /// split the diff), and Q0-C must NOT reject a legitimate single-run ledger.
+    #[test]
+    fn route_y_r0_q0c_sparse_zero_prefix_succeeds() {
+        const RVA: u32 = 0x141bf0;
+        const LIVE: u64 = 0x3437e50;
+        const OLD_SIZE: usize = 0x8000;
+        // Old prefix is mostly 0xAA but contains ZERO bytes at scattered offsets
+        // (0x40, 0x80, 0x100) — exactly the polluted free-list blob shape.
+        let mut raw_bytes = vec![0xAAu8; OLD_SIZE];
+        raw_bytes[0x40] = 0x00;
+        raw_bytes[0x80] = 0x00;
+        raw_bytes[0x100] = 0x00;
+        let slab = slab_with_child(0x3400000, 0x100000, LIVE, raw_bytes.clone());
+        let mut raw_capture = RawSlabCapture {
+            slabs: vec![slab],
+            children: vec![raw_child(
+                LIVE,
+                OLD_SIZE,
+                raw_bytes.clone(),
+                RawChildKind::HeapGlobal,
+            )],
+        };
+        raw_capture.children[0].capture_id = "mainslot:0x141bf0:0x3437e50".into();
+        raw_capture.children[0].extent_kind = CaptureExtentKind::ObservedAllocation;
+        let mut g = global(LIVE, raw_bytes.clone(), false);
+        g.rva = RVA;
+        g.extent_kind = CaptureExtentKind::ObservedAllocation;
+        g.extent_evidence.capture_id = "mainslot:0x141bf0:0x3437e50".into();
+        g.extent_evidence.capture_path = CapturePath::MainSlot;
+        let mut globals = vec![g];
+        let mut containers: Vec<ContainerSnapshot> = Vec::new();
+        validate_raw_coherence_capture_identities(&containers, &globals).unwrap();
+        validate_probe_coverage(&globals, &raw_capture.slabs).unwrap();
+        let _ = raw_children_from_capture(&containers, &globals);
+        let bindings = seed_transform_inputs_from_authoritative_slab(
+            &raw_capture,
+            &mut containers,
+            &mut globals,
+        )
+        .unwrap();
+        // Real recorder + real sanitize.
+        let mut ledger = TransformRunLedger::default();
+        apply_recorded_transform(
+            &mut globals,
+            "sanitize_ahk_runtime_global",
+            &mut ledger,
+            |gs| {
+                for gs in gs.iter_mut() {
+                    super::super::heap_global_snapshot::sanitize_ahk_runtime_global(
+                        std::slice::from_mut(gs),
+                    );
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(globals[0].content.len(), 0x180);
+        assert!(globals[0].content.iter().all(|&b| b == 0));
+        // The recorder MUST emit exactly ONE full transition run despite the
+        // sparse zero bytes in the old prefix.
+        assert_eq!(
+            ledger.runs.len(),
+            1,
+            "declared re-init recorder must emit exactly one full transition run"
+        );
+        assert_eq!(ledger.runs[0].child_offset, 0);
+        assert_eq!(ledger.runs[0].length, 0x180);
+        // Q0-C accepts the single-run ledger and produces an exactly-zeroed slab.
+        let (patched, overlays, _) =
+            build_patched_backing_slab_q0c(&raw_capture, &globals, &[], &bindings, &ledger)
+                .expect("sparse-zero-prefix declared re-init must succeed at Q0-C");
+        let off = (LIVE - 0x3400000) as usize;
+        assert_eq!(&patched[0].content[off..off + 0x180], &[0u8; 0x180]);
+        assert!(overlays.iter().any(|o| o.overlay_applied));
+    }
+
+    /// Q0-C + recorder agreement (Audit P1, prior-writer variant): a prior
+    /// recorded transform zeros part of the prefix, then sanitize runs. The
+    /// recorder still emits ONE full transition run for sanitize (its before
+    /// state already includes the prior zeros), and Q0-C accepts the full chain.
+    #[test]
+    fn route_y_r0_q0c_prior_writer_sparse_zero_prefix_succeeds() {
+        const RVA: u32 = 0x141bf0;
+        const LIVE: u64 = 0x3437e50;
+        const OLD_SIZE: usize = 0x8000;
+        let mut raw_bytes = vec![0xAAu8; OLD_SIZE];
+        let slab = slab_with_child(0x3400000, 0x100000, LIVE, raw_bytes.clone());
+        let mut raw_capture = RawSlabCapture {
+            slabs: vec![slab],
+            children: vec![raw_child(
+                LIVE,
+                OLD_SIZE,
+                raw_bytes.clone(),
+                RawChildKind::HeapGlobal,
+            )],
+        };
+        raw_capture.children[0].capture_id = "mainslot:0x141bf0:0x3437e50".into();
+        raw_capture.children[0].extent_kind = CaptureExtentKind::ObservedAllocation;
+        let mut g = global(LIVE, raw_bytes.clone(), false);
+        g.rva = RVA;
+        g.extent_kind = CaptureExtentKind::ObservedAllocation;
+        g.extent_evidence.capture_id = "mainslot:0x141bf0:0x3437e50".into();
+        g.extent_evidence.capture_path = CapturePath::MainSlot;
+        let mut globals = vec![g];
+        let mut containers: Vec<ContainerSnapshot> = Vec::new();
+        validate_raw_coherence_capture_identities(&containers, &globals).unwrap();
+        validate_probe_coverage(&globals, &raw_capture.slabs).unwrap();
+        let _ = raw_children_from_capture(&containers, &globals);
+        let bindings = seed_transform_inputs_from_authoritative_slab(
+            &raw_capture,
+            &mut containers,
+            &mut globals,
+        )
+        .unwrap();
+        let mut ledger = TransformRunLedger::default();
+        // A prior transform zeros byte 0x40 (like scrub), then sanitize re-inits.
+        apply_recorded_transform(
+            &mut globals,
+            "scrub_uncaptured_heap_pointers",
+            &mut ledger,
+            |gs| {
+                for gs in gs.iter_mut() {
+                    if gs.rva == RVA {
+                        if let Some(b) = gs.content.get_mut(0x40) {
+                            *b = 0x00;
+                        }
+                    }
+                }
+            },
+        )
+        .unwrap();
+        apply_recorded_transform(
+            &mut globals,
+            "sanitize_ahk_runtime_global",
+            &mut ledger,
+            |gs| {
+                for gs in gs.iter_mut() {
+                    super::super::heap_global_snapshot::sanitize_ahk_runtime_global(
+                        std::slice::from_mut(gs),
+                    );
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(globals[0].content.len(), 0x180);
+        assert!(globals[0].content.iter().all(|&b| b == 0));
+        // sanitize's own ledger run must be a single full [0,0x180) transition run.
+        let sanitize_runs: Vec<_> = ledger
+            .runs
+            .iter()
+            .filter(|r| r.transform_id == "sanitize_ahk_runtime_global")
+            .collect();
+        assert_eq!(
+            sanitize_runs.len(),
+            1,
+            "sanitize must emit exactly one full run"
+        );
+        assert_eq!(sanitize_runs[0].child_offset, 0);
+        assert_eq!(sanitize_runs[0].length, 0x180);
+        let (patched, overlays, _) =
+            build_patched_backing_slab_q0c(&raw_capture, &globals, &[], &bindings, &ledger)
+                .expect("prior-writer + declared re-init must succeed at Q0-C");
+        let off = (LIVE - 0x3400000) as usize;
+        assert_eq!(&patched[0].content[off..off + 0x180], &[0u8; 0x180]);
+        assert!(overlays.iter().any(|o| o.overlay_applied));
     }
 }
