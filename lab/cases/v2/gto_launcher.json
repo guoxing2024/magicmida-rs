@@ -1,19 +1,19 @@
 {
   "$schema": "./case-manifest.schema.json",
   "schema_version": "mida.case-manifest/v2",
-  "manifest_revision": 1,
+  "manifest_revision": 2,
   "case_id": "gto_launcher",
   "display_name": "GTO launcher sample",
-  "primary_artifact_sha256": "4d5770afdd2f6d9553fef66826c5a55211b80d8d174360a115f247efafb037c8",
+  "primary_artifact_sha256": "11473d2e6b00d8a7f079e0e2d7eff9cfd0c7134af3c6bd3ca2e600b637895c86",
   "artifacts": [
     {
-      "sha256": "4d5770afdd2f6d9553fef66826c5a55211b80d8d174360a115f247efafb037c8",
-      "size_bytes": 8583680,
+      "sha256": "11473d2e6b00d8a7f079e0e2d7eff9cfd0c7134af3c6bd3ca2e600b637895c86",
+      "size_bytes": 24636416,
       "role": "protected_input"
     },
     {
-      "sha256": "dcc411afaafed6bf3fbc52c0c72eddf79f56fc9aea1516b911d49f59c94af379",
-      "size_bytes": 15497216,
+      "sha256": "4d5770afdd2f6d9553fef66826c5a55211b80d8d174360a115f247efafb037c8",
+      "size_bytes": 8583680,
       "role": "analysis_reference"
     }
   ],
@@ -22,30 +22,34 @@
     "binary_format": "pe",
     "architecture": "x86_64",
     "execution_model": "native",
-    "protection_family": "ahk_gto_candidate",
-    "engine_route": "mida_plugin_ahk_gto",
+    "protection_family": "unknown",
+    "engine_route": "future_plugin_ahk_gto",
     "corpus_role": "research"
   },
   "static_fingerprint": {
-    "artifact_sha256": "4d5770afdd2f6d9553fef66826c5a55211b80d8d174360a115f247efafb037c8",
-    "evidence_basis": "retained_static_report",
+    "artifact_sha256": "11473d2e6b00d8a7f079e0e2d7eff9cfd0c7134af3c6bd3ca2e600b637895c86",
+    "evidence_basis": "direct_header_parse",
     "pe_kind": "PE32+",
     "coff_machine": "0x8664",
     "image_base": "0x140000000",
-    "entry_rva": "0xbd5807",
-    "entry_section": ".KI3",
-    "section_count": 8,
-    "import_descriptor_count": 21,
+    "entry_rva": "0x16fb532",
+    "entry_section": ".rdata2",
+    "section_count": 9,
+    "import_descriptor_count": 16,
     "has_tls": true,
     "has_relocations": false,
     "observed_markers": [
-      "entry_section:.KI3"
+      "section:.fptable",
+      "entry_section:.rdata2",
+      "themlock_marker:absent",
+      "ahk_strings:absent",
+      "version_resource:absent"
     ]
   },
   "execution_policy": {
     "dynamic": {
       "mode": "explicit_authorization_required",
-      "fixed_sha256": "4d5770afdd2f6d9553fef66826c5a55211b80d8d174360a115f247efafb037c8",
+      "fixed_sha256": "11473d2e6b00d8a7f079e0e2d7eff9cfd0c7134af3c6bd3ca2e600b637895c86",
       "timeout_seconds": 120,
       "process_tree_accounting_required": true
     },
@@ -56,13 +60,13 @@
     }
   },
   "oracle": {
-    "oracle_id": "gto_launcher.analysis_reference.dcc411af.v1",
-    "kind": "analysis_reference",
-    "artifact_sha256": "dcc411afaafed6bf3fbc52c0c72eddf79f56fc9aea1516b911d49f59c94af379",
-    "authority": "historical_tool_output",
-    "use": "analysis_comparison_only"
+    "oracle_id": null,
+    "kind": "none",
+    "artifact_sha256": null,
+    "authority": "none",
+    "use": "none"
   },
   "capture_policy": {
-    "preset": "ahk_gto_defaults"
+    "preset": "empty"
   }
 }
