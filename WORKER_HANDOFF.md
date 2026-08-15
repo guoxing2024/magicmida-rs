@@ -822,3 +822,63 @@ used=2 / cap=2 / remaining=0 (final Route C round; no R3)
 ### Non-claims
 - Not product 1.0 / not perfect unpack
 - No bypass / no inventing Pass / no H R3 / no push
+
+### MIDA-SERIAL-09 Local Commit Closure — 2026-08-15
+
+**Date:** 2026-08-15 · **Branch:** `oreans/two-sample-mainline`
+**New HEAD:** `dfbf5913b49d5e1122b8e7ccd1da842c6914c52a`
+**Base HEAD (prior):** `9419ce9c40fd0874b97ac4c4459167d345ac8091`
+
+### A. New HEAD
+
+`dfbf5913b49d5e1122b8e7ccd1da842c6914c52a`
+
+### B. Four local commits (in order, full SHA + message + files)
+
+1. `8c7de4a63ce58b78a7db140d7f8e13aee70a84f9` — `test(cli): add extended-path and subdirectory symlink escape regression tests`
+   - `crates/cli/src/runner_preflight.rs`
+
+2. `b5aba7c183f0bb18c0b4683a13228d59e7459994` — `fix(pe): checked region/slot arithmetic and fallible structural pointer declaration`
+   - `crates/pe/src/dumper/runtime_rebase.rs`
+
+3. `2313947877a15672d1ff5fd986b1cac0d5bf0937` — `feat(pe): gscript label-table capture path with atomic raw-coherence identity and manifest serialization`
+   - `crates/pe/src/dumper/heap_global_snapshot.rs`
+   - `crates/pe/src/dumper/raw_slab_coherence.rs`
+   - `crates/pe/src/dumper/snapshot_manifest.rs`
+
+4. `dfbf5913b49d5e1122b8e7ccd1da842c6914c52a` — `fix(pe): wire heap-window trim and fallible pointer declaration into dump pipeline`
+   - `crates/pe/src/dumper/dump_process.rs`
+
+### C. Verification results
+
+- `cargo test --workspace --offline`: **1885 passed / 0 failed / 2 ignored**
+- `cargo fmt --all -- --check`: **PASS**
+- `git diff --check`: **PASS**
+- tracked working tree: **clean**
+- staged: **0**
+- push: **not executed**
+- dynamic target execution: **none**
+
+### D. Atomic commit boundary
+
+- `runner_preflight`: standalone;
+- `runtime_rebase`: standalone;
+- `heap_global_snapshot` + `raw_slab_coherence` + `snapshot_manifest`: **must be atomic**;
+- `dump_process`: wired last.
+
+### E. Dynamic authorization boundary
+
+- `dynamic_authorized = false`;
+- `governance = RouteY_R1_GTO_LAUNCHER_REV2_DynamicAuthorizationSuspended`;
+- `ReadyForSeparateDynamicWorkOrder` does **not** equal dynamic authorization;
+- local commits and offline tests grant **no** launcher/target/observer/controller/network/firewall/hook/injection/debugger permission;
+- no target, locator, process, network, or controller rerun executed.
+
+### F. P1 deferred (not resolved)
+
+- `DumpCapturePolicy` `hot_root_rvas`/`large_table_rvas` remain bare-RVA policies **unbound** to module/capture identity;
+- `sanitize_ahk_runtime_global` still contains the `0x141bf0` sample-specific special case;
+- MIDA-SERIAL-06 correctly blocked for missing static generic predicate;
+- this P1 is a pre-existing HEAD architecture coupling; the 4 commits did **not** add or widen it;
+- future governance must go through an identity-bound policy / transform evidence-chain independent work order;
+- moving fixed RVAs into a new config item must **not** be claimed as generalization.
