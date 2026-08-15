@@ -1021,42 +1021,40 @@ pub fn detect_heap_globals(
         normalize_cmd_table_capture(&mut out, &mut total_bytes, dump_buf, debugger);
     }
 
-    // R-GTO-UI r13: cmd/dispatch table @0x147868 is a pointer array. Without
-    // exact children, scrub zeros almost all entries → WinMain AV @0x5747a
-    // even when the table slot + count are restored.
+    // MIDA-SERIAL-25: the inline first-hop calls are centralized as
+    // explicit identity-bound sample roles ([`declared_first_hop_roles`]:
+    // 0x147868 count-scaled table + 0x141bf0 bounded field window).
+    // Activation remains identity-gated (sample_active) and
+    // capture-corroborated: density / size / section placement / user-heap
+    // pointer are filters only; hot-root / large-table policy nominations
+    // never self-activate. This does NOT eliminate sample-specific RVA
+    // coupling — the roles carry sample-bound RVAs and layout facts.
+    // Unbound/mismatch/revision-0/digest-mismatch policies never run
+    // first-hop (fail-closed). Missing or ambiguous evidence also fails
+    // closed (no fabricated children, no slot/region expansion).
     if sample_active {
-        exhaust_pointer_table_first_hop(
-            &mut out,
-            &mut total_bytes,
-            &mut seen_heaps,
-            image_base,
-            image_end,
-            dump_buf,
-            debugger,
-            0x147868,
-            policy.first_hop_probe(),
-        );
-    }
-
-    // R-GTO-UI r14: AHK global @0x141bf0 field +0xd8 held interior of a
-    // 1KiB child (not exact base) → multi_fixup left stale VA → AV @0x49055
-    // `cmp byte [rax+0x78],0x62` after MessageBox path (r13=[0x141bf0]).
-    // Span capped: full 13KiB root is not a dense pointer table.
-    // MIDA-SERIAL-15: gated on the identity-bound policy (0x141bf0 is a
-    // sample-specific RVA; without a matching binding this path is skipped).
-    if sample_active {
-        exhaust_pointer_table_first_hop_span(
-            &mut out,
-            &mut total_bytes,
-            &mut seen_heaps,
-            image_base,
-            image_end,
-            dump_buf,
-            debugger,
-            0x141bf0,
-            0x200, // cover +0xd8 and nearby fields only
-            policy.first_hop_probe(),
-        );
+        match derive_first_hop_candidates(&pe, &out, policy, image_base, image_end, dump_buf) {
+            FirstHopCandidateResolution::Resolved(cands) => {
+                exhaust_first_hop_candidates(
+                    &mut out,
+                    &mut total_bytes,
+                    &mut seen_heaps,
+                    image_base,
+                    image_end,
+                    dump_buf,
+                    debugger,
+                    &cands,
+                );
+            }
+            FirstHopCandidateResolution::Missing => {
+                info!(
+                    "MIDA-SERIAL-25: first-hop skipped — no identity-bound role with capture corroboration"
+                );
+            }
+            FirstHopCandidateResolution::Ambiguous => {
+                warn!("MIDA-SERIAL-25: first-hop skipped — ambiguous candidates (same live table body or conflicting extents)");
+            }
+        }
     }
 
     // Then: multi-hop from hot gscript roots (bounded) so title / string-table
@@ -4437,11 +4435,307 @@ fn normalize_cmd_table_capture(
     );
 }
 
-/// Force-admit every heap pointer in a captured pointer-table root (full content).
+/// MIDA-SERIAL-25: identity-bound declared first-hop role.
 ///
-/// Used for AHK cmd/dispatch table @0x147868: entries are heap object pointers.
-/// Scrub zeros uncaptured entries → null table → AV at `mov rcx,[rax+rcx*8]`.
-fn exhaust_pointer_table_first_hop(
+/// This is a SAMPLE-BOUND / identity-bound declaration, NOT a generic
+/// structural discovery: the role, its layout facts (count dword
+/// placement, element size, bounded field window) and its RVAs encode the
+/// bound sample's object model. Activation additionally requires the
+/// current capture to corroborate the declared semantics (verified
+/// count-scaled boundary for the table role; bounded field window +
+/// capture filters for the global-object role). The declaration alone —
+/// like density, size, section placement or a hot-root / large-table
+/// policy nomination — never activates a candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeclaredFirstHopRole {
+    /// Image RVA of the slot that holds the object/table pointer.
+    slot_rva: u32,
+    /// Identity-bound role kind with its structural layout facts.
+    kind: FirstHopRoleKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FirstHopRoleKind {
+    /// Pointer table whose extent is `count * element_size`, where the
+    /// count dword lives at `slot_rva + count_offset` in the dump buffer.
+    /// All arithmetic is checked; the captured extent must EXACTLY equal
+    /// the count-scaled boundary (i.e. the normalized table capture).
+    PointerTableCountScaled {
+        /// Slot-relative byte offset of the element-count dword.
+        count_offset: usize,
+        /// Element size in bytes (pointer stride).
+        element_size: usize,
+    },
+    /// Bounded field window inside a captured global object: walk only
+    /// `min(content.len(), max_span)` bytes from the object base. This is
+    /// the AHK global-object bounded first-hop (cover +0xd8 interior
+    /// child pointer, avoid stale VA after multi-fixup). Never a
+    /// count-scaled pointer table; never widened by density or content
+    /// size beyond `max_span`.
+    BoundedPointerWindow {
+        /// Maximum scan window in bytes (8 <= span <= max_span).
+        max_span: usize,
+    },
+}
+
+/// MIDA-SERIAL-25: the identity-bound declared first-hop roles.
+///
+/// Exactly two sample-bound roles reproduce the HEAD first-hop action set:
+///
+///   Role 1 — AHK cmd/dispatch pointer table @0x147868 with live element
+///   count dword @0x147888 (slot +0x20). Mirrors the count x 8 boundary
+///   already used by `normalize_cmd_table_capture` and the hot-root
+///   ensure path, expressed as a declared identity-bound role.
+///
+///   Role 2 — AHK global object @0x141bf0 bounded field window: scan only
+///   the first 0x200 bytes (cover the +0xd8 interior child pointer). This
+///   reproduces the HEAD `exhaust_pointer_table_first_hop_span(0x141bf0,
+///   0x200, ...)` bounded first-hop as an explicit identity-bound role.
+///
+/// Everything else — every other hot root, every other large-table
+/// nomination, every dense or pointer-rich object — fails closed (Missing).
+fn declared_first_hop_roles() -> &'static [DeclaredFirstHopRole] {
+    &[
+        DeclaredFirstHopRole {
+            slot_rva: 0x147868,
+            kind: FirstHopRoleKind::PointerTableCountScaled {
+                count_offset: 0x20, // count dword @ 0x147888
+                element_size: 8,
+            },
+        },
+        DeclaredFirstHopRole {
+            slot_rva: 0x141bf0,
+            kind: FirstHopRoleKind::BoundedPointerWindow {
+                max_span: 0x200, // cover +0xd8 and nearby fields only
+            },
+        },
+    ]
+}
+
+/// Outcome of verifying a declared count x element-size boundary against the
+/// current capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CountExtentOutcome {
+    /// The declared boundary is established AND exactly matches the captured
+    /// extent. Carries the verified extent in bytes.
+    Verified(usize),
+    /// The boundary cannot be established from the current capture (count
+    /// dword unreadable / out of bounds / checked arithmetic failed /
+    /// count invalid / extent below 8). Fail-closed as Missing.
+    Unverifiable,
+    /// The boundary IS established (count dword readable and valid) but
+    /// CONFLICTS with the captured extent (count-scaled size != content).
+    /// A single slot carrying conflicting structural extents is ambiguous;
+    /// fail-closed as Ambiguous.
+    Conflict,
+}
+
+/// Verify the declared first-hop role boundary against the current capture.
+/// See [`CountExtentOutcome`] for the three-way result.
+///
+/// For [`FirstHopRoleKind::PointerTableCountScaled`] (checks must ALL hold
+/// for [`CountExtentOutcome::Verified`]):
+///   * count dword readable at slot_rva + count_offset in dump_buf;
+///   * count in [1, 0x10000);
+///   * count.checked_mul(element_size) succeeds;
+///   * verified extent >= 8;
+///   * verified extent EXACTLY equals g.content.len() — the captured
+///     extent must be the normalized count-scaled boundary, not a larger
+///     probe window or free-list tail. A readable-but-mismatching count
+///     is a Conflict -> Ambiguous.
+///
+/// For [`FirstHopRoleKind::BoundedPointerWindow`]:
+///   * span = min(content.len(), max_span);
+///   * span in [8, max_span] (content too short -> Unverifiable);
+///   * never widened by density, content size or pointer count;
+///   * never reads or enumerates beyond max_span.
+fn verify_first_hop_role(
+    g: &HeapGlobalSnapshot,
+    role: &DeclaredFirstHopRole,
+    dump_buf: &[u8],
+) -> CountExtentOutcome {
+    match role.kind {
+        FirstHopRoleKind::PointerTableCountScaled {
+            count_offset,
+            element_size,
+        } => {
+            let Some(count_off) = (g.rva as usize).checked_add(count_offset) else {
+                return CountExtentOutcome::Unverifiable;
+            };
+            if count_off
+                .checked_add(4)
+                .map_or(true, |end| end > dump_buf.len())
+            {
+                return CountExtentOutcome::Unverifiable;
+            }
+            let Ok(four) = <[u8; 4]>::try_from(&dump_buf[count_off..count_off + 4]) else {
+                return CountExtentOutcome::Unverifiable;
+            };
+            let n = u32::from_le_bytes(four);
+            if !(1..0x10000).contains(&n) {
+                return CountExtentOutcome::Unverifiable;
+            }
+            let Some(want) = (n as usize).checked_mul(element_size) else {
+                return CountExtentOutcome::Unverifiable;
+            };
+            if want < 8 {
+                return CountExtentOutcome::Unverifiable;
+            }
+            if want != g.content.len() {
+                // Boundary established but conflicting with the captured extent.
+                return CountExtentOutcome::Conflict;
+            }
+            CountExtentOutcome::Verified(want)
+        }
+        FirstHopRoleKind::BoundedPointerWindow { max_span } => {
+            let span = g.content.len().min(max_span);
+            if span < 8 {
+                return CountExtentOutcome::Unverifiable;
+            }
+            CountExtentOutcome::Verified(span)
+        }
+    }
+}
+/// MIDA-SERIAL-25: identity-bound first-hop candidate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FirstHopCandidate {
+    table_rva: u32,
+    live_ptr: u64,
+    section_index: usize,
+    section_name: String,
+    slot_offset_in_section: usize,
+    span: usize,
+    probe: usize,
+    evidence: FirstHopCandidateEvidence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FirstHopCandidateEvidence {
+    /// The declared count x element-size boundary was verified against the
+    /// current capture (identity-bound table role).
+    VerifiedCountScaledExtent,
+    /// The declared bounded field window (identity-bound global-object
+    /// role); span is min(content.len(), max_span), never density-widened.
+    IdentityBoundedPointerWindow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FirstHopCandidateResolution {
+    /// Every candidate has an independent verified identity-bound role.
+    Resolved(Vec<FirstHopCandidate>),
+    /// No candidate passed the role + capture evidence gate -> no first-hop.
+    Missing,
+    /// Conflicting structural claims (same live body by distinct slots,
+    /// or conflicting extents) -> no first-hop.
+    Ambiguous,
+}
+
+/// MIDA-SERIAL-25: derive first-hop candidates from the CURRENT capture.
+///
+/// The inline first-hop calls are centralized as explicit identity-bound
+/// sample roles ([`declared_first_hop_roles`]). Activation remains
+/// identity-gated (the caller wraps this in `if sample_active`) and
+/// capture-corroborated. This does NOT eliminate sample-specific RVA
+/// coupling: the roles carry sample-bound RVAs and layout facts.
+///
+/// Density / size / section placement / user-heap pointer are FILTERS
+/// only — none of them, alone or combined, can admit a candidate.
+/// Deterministic: sorted by (section index, slot offset, rva, live_ptr)
+/// and deduped by that key.
+fn derive_first_hop_candidates(
+    pe: &PeHeader,
+    out: &[HeapGlobalSnapshot],
+    policy: &DumpCapturePolicy,
+    image_base: u64,
+    image_end: u64,
+    dump_buf: &[u8],
+) -> FirstHopCandidateResolution {
+    let roles = declared_first_hop_roles();
+    let mut cands: BTreeMap<(usize, usize, u32, u64), FirstHopCandidate> = BTreeMap::new();
+
+    for g in out {
+        // Filters (never activators): slot present in the capture.
+        if g.rva == 0 || g.is_heap_handle || g.content.len() < 8 {
+            continue;
+        }
+        if policy.gscript_root() == Some(g.rva) {
+            continue;
+        }
+        // Filters: non-executable data section placement.
+        let Some((sec_idx, sec)) = pe.sections.iter().enumerate().find(|(_, s)| {
+            let lo = s.virtual_address;
+            let hi = lo.saturating_add(s.virtual_size.max(1));
+            g.rva >= lo && g.rva < hi
+        }) else {
+            continue;
+        };
+        if sec.characteristics & IMAGE_SCN_MEM_EXECUTE != 0 {
+            continue;
+        }
+        // Filters: object/table body must be a user-heap pointer.
+        if !is_heap_pointer(g.live_ptr, image_base, image_end) {
+            continue;
+        }
+        // Activator: identity-bound declared role for this slot.
+        let Some(role) = roles.iter().find(|r| r.slot_rva == g.rva) else {
+            continue;
+        };
+        // Activator: role-specific structural verification against the
+        // current capture (count-scaled boundary or bounded field window).
+        let (verified, evidence) = match verify_first_hop_role(g, role, dump_buf) {
+            CountExtentOutcome::Verified(v) => match role.kind {
+                FirstHopRoleKind::PointerTableCountScaled { .. } => {
+                    (v, FirstHopCandidateEvidence::VerifiedCountScaledExtent)
+                }
+                FirstHopRoleKind::BoundedPointerWindow { .. } => {
+                    (v, FirstHopCandidateEvidence::IdentityBoundedPointerWindow)
+                }
+            },
+            CountExtentOutcome::Unverifiable => continue,
+            CountExtentOutcome::Conflict => {
+                // A single slot with a conflicting structural extent is
+                // ambiguous — fail closed, run zero first-hop actions.
+                return FirstHopCandidateResolution::Ambiguous;
+            }
+        };
+        let offset_in_sec = g.rva.saturating_sub(sec.virtual_address) as usize;
+        let key = (sec_idx, offset_in_sec, g.rva, g.live_ptr);
+        cands.insert(
+            key,
+            FirstHopCandidate {
+                table_rva: g.rva,
+                live_ptr: g.live_ptr,
+                section_index: sec_idx,
+                section_name: sec.name.clone(),
+                slot_offset_in_section: offset_in_sec,
+                span: verified,
+                probe: policy.first_hop_probe(),
+                evidence,
+            },
+        );
+    }
+
+    if cands.is_empty() {
+        return FirstHopCandidateResolution::Missing;
+    }
+    // Conflict detection: distinct slots claiming the SAME live table body
+    // cannot be uniquely decided -> Ambiguous (fail-closed, no heuristic pick).
+    let mut by_live: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
+    for (_, c) in &cands {
+        by_live.entry(c.live_ptr).or_default().push(c.table_rva);
+    }
+    if by_live.values().any(|v| v.len() > 1) {
+        return FirstHopCandidateResolution::Ambiguous;
+    }
+    FirstHopCandidateResolution::Resolved(cands.into_values().collect())
+}
+
+/// MIDA-SERIAL-25: run first-hop exhaust for every resolved identity-bound
+/// candidate using its role-derived span (count-scaled extent for the
+/// table role; bounded field window for the global-object role). The
+/// candidate source is the explicit identity-bound role declaration —
+/// this does NOT eliminate sample-specific RVA coupling.
+fn exhaust_first_hop_candidates(
     out: &mut Vec<HeapGlobalSnapshot>,
     total_bytes: &mut usize,
     seen_heaps: &mut BTreeSet<u64>,
@@ -4449,21 +4743,40 @@ fn exhaust_pointer_table_first_hop(
     image_end: u64,
     dump_buf: &[u8],
     debugger: &mut dyn mida_core::DebuggerCore,
-    table_rva: u32,
-    probe: usize,
+    candidates: &[FirstHopCandidate],
 ) {
-    exhaust_pointer_table_first_hop_span(
-        out,
-        total_bytes,
-        seen_heaps,
-        image_base,
-        image_end,
-        dump_buf,
-        debugger,
-        table_rva,
-        usize::MAX,
-        probe,
-    );
+    for c in candidates {
+        exhaust_pointer_table_first_hop_span(
+            out,
+            total_bytes,
+            seen_heaps,
+            image_base,
+            image_end,
+            dump_buf,
+            debugger,
+            c.table_rva,
+            c.span,
+            c.probe,
+        );
+        let (kind_label, semantics) = match c.evidence {
+            FirstHopCandidateEvidence::VerifiedCountScaledExtent => {
+                ("pointer_table_count_scaled", "full count-scaled extent")
+            }
+            FirstHopCandidateEvidence::IdentityBoundedPointerWindow => {
+                ("bounded_pointer_window", "bounded field window")
+            }
+        };
+        info!(
+            table_rva = format_args!("{:#x}", c.table_rva),
+            live = format_args!("{:#x}", c.live_ptr),
+            section = %c.section_name,
+            span = c.span,
+            role_kind = kind_label,
+            span_semantics = semantics,
+            evidence = ?c.evidence,
+            "MIDA-SERIAL-25 first-hop candidate exhaust"
+        );
+    }
 }
 
 fn exhaust_pointer_table_first_hop_span(
@@ -10377,5 +10690,1342 @@ mod tests {
             ledger.runs.is_empty(),
             "rejected transform must not enter ledger"
         );
+    }
+
+    // ============ MIDA-SERIAL-23 capture-derived first-hop candidates ============
+
+    /// Build a 64-bit PE header with a non-executable .data section.
+    fn m23_pe(image_base: u64, data_va: u32, data_size: u32) -> crate::header::PeHeader {
+        crate::header::PeHeader {
+            dos_header: crate::header::ImageDosHeader {
+                e_magic: 0x5a4d,
+                e_lfanew: 0x40,
+            },
+            nt_headers: crate::header::ImageNtHeaders {
+                signature: 0x4550,
+                file_header: crate::header::ImageFileHeader {
+                    machine: 0x8664,
+                    number_of_sections: 2,
+                    time_date_stamp: 0x5f5e100,
+                    size_of_optional_header: 0xf0,
+                    characteristics: 0x102,
+                },
+                optional_header: crate::header::ImageOptionalHeader {
+                    magic: 0x20b,
+                    major_linker_version: 0,
+                    minor_linker_version: 0,
+                    size_of_code: 0x1000,
+                    size_of_initialized_data: 0x2000,
+                    size_of_uninitialized_data: 0,
+                    address_of_entry_point: 0x1000,
+                    base_of_code: 0x1000,
+                    base_of_data: None,
+                    image_base,
+                    section_alignment: 0x1000,
+                    file_alignment: 0x200,
+                    major_operating_system_version: 6,
+                    minor_operating_system_version: 0,
+                    major_image_version: 0,
+                    minor_image_version: 0,
+                    major_subsystem_version: 6,
+                    minor_subsystem_version: 0,
+                    win32_version_value: 0,
+                    size_of_image: data_va.saturating_add(data_size).max(0x4000),
+                    size_of_headers: 0x400,
+                    check_sum: 0,
+                    subsystem: 3,
+                    dll_characteristics: 0,
+                    size_of_stack_reserve: 0x100000,
+                    size_of_stack_commit: 0x1000,
+                    size_of_heap_reserve: 0x100000,
+                    size_of_heap_commit: 0x1000,
+                    loader_flags: 0,
+                    number_of_rva_and_sizes: 16,
+                    data_directory: [crate::header::ImageDataDirectory::default(); 16],
+                },
+            },
+            sections: vec![
+                crate::header::PeSection {
+                    header: crate::header::ImageSectionHeader {
+                        name: *b".text\0\0\0",
+                        virtual_size: 0x1000,
+                        virtual_address: 0x1000,
+                        size_of_raw_data: 0x200,
+                        pointer_to_raw_data: 0x400,
+                        pointer_to_relocations: 0,
+                        pointer_to_linenumbers: 0,
+                        number_of_relocations: 0,
+                        number_of_linenumbers: 0,
+                        characteristics: 0x60000020, // EXECUTE|READ
+                    },
+                    name: ".text".to_string(),
+                    virtual_address: 0x1000,
+                    virtual_size: 0x1000,
+                    raw_offset: 0x400,
+                    raw_size: 0x200,
+                    characteristics: 0x60000020,
+                    extra_data: None,
+                },
+                crate::header::PeSection {
+                    header: crate::header::ImageSectionHeader {
+                        name: *b".data\0\0\0",
+                        virtual_size: data_size,
+                        virtual_address: data_va,
+                        size_of_raw_data: data_size.min(0x1000),
+                        pointer_to_raw_data: 0x600,
+                        pointer_to_relocations: 0,
+                        pointer_to_linenumbers: 0,
+                        number_of_relocations: 0,
+                        number_of_linenumbers: 0,
+                        characteristics: 0xC0000040, // INITIALIZED_DATA|READ|WRITE
+                    },
+                    name: ".data".to_string(),
+                    virtual_address: data_va,
+                    virtual_size: data_size,
+                    raw_offset: 0x600,
+                    raw_size: data_size.min(0x1000),
+                    characteristics: 0xC0000040,
+                    extra_data: None,
+                },
+            ],
+            image_base,
+            entry_point: 0x1000,
+            is_64bit: true,
+            file_alignment: 0x200,
+            section_alignment: 0x1000,
+        }
+    }
+
+    /// Minimal non-heap-handle root snapshot helper.
+    fn m23_root(rva: u32, live_ptr: u64, content: Vec<u8>) -> HeapGlobalSnapshot {
+        HeapGlobalSnapshot {
+            rva,
+            live_ptr,
+            content,
+            is_heap_handle: false,
+            is_image_inline: false,
+            extent_kind: CaptureExtentKind::default(),
+            extent_evidence: CaptureExtentEvidence::default(),
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::default(),
+        }
+    }
+
+    /// Dense pointer-array content: live heap pointers in the leading bytes.
+    fn m23_dense_content(live_ptrs: &[u64]) -> Vec<u8> {
+        let mut v = Vec::with_capacity(live_ptrs.len() * 8);
+        for p in live_ptrs {
+            v.extend_from_slice(&p.to_le_bytes());
+        }
+        v
+    }
+
+    /// A generic policy (no sample-specific fields). Sample-specific policy
+    /// declarations can never activate a first-hop candidate by themselves;
+    /// activation requires the identity-bound structural role verification.
+    fn m24_generic_policy() -> DumpCapturePolicy {
+        DumpCapturePolicy::default()
+    }
+
+    /// Build an image dump buffer (index == RVA) with the element-count dword
+    /// written at count_rva. Returns None when the write is out of bounds.
+    fn m24_dump_buf_with_count(size: usize, count_rva: usize, count: u32) -> Option<Vec<u8>> {
+        if count_rva.checked_add(4)? > size {
+            return None;
+        }
+        let mut buf = vec![0u8; size];
+        buf[count_rva..count_rva + 4].copy_from_slice(&count.to_le_bytes());
+        Some(buf)
+    }
+
+    /// Candidate derivation must be driven by structural evidence — never by a
+    /// bare fixed RVA, density, or policy nomination. A non-sample RVA with a
+    /// dense pointer-array capture and .data placement but NO declared role
+    /// must fail closed (Missing); the declared cmd-table slot with a
+    /// verified count x 8 boundary resolves deterministically.
+    #[test]
+    fn m23_first_hop_candidate_is_capture_derived() {
+        let base = 0x140000000u64;
+        let pe = m23_pe(base, 0x2000, 0x150000); // .data covers 0x147868
+        let policy = DumpCapturePolicy::default(); // generic: no declarations
+
+        // (a) Dense pointer-rich object at a NON-sample RVA, no declared
+        // role -> Missing (density alone can never activate).
+        let dense_rva = 0x2010u32;
+        let dense_content = m23_dense_content(&[0x31_0000; 8]); // 100% ptrs
+        let out_dense = vec![m23_root(dense_rva, 0x30_0000, dense_content)];
+        let dump_empty = vec![0u8; 0x6000];
+        let rd =
+            derive_first_hop_candidates(&pe, &out_dense, &policy, base, base + 0x6000, &dump_empty);
+        assert_eq!(
+            rd,
+            FirstHopCandidateResolution::Missing,
+            "dense object without declared role must fail closed"
+        );
+
+        // (b) Declared cmd-table slot with verified count x 8 boundary.
+        let slot_rva = 0x147868u32;
+        let count: u32 = 4;
+        let count_rva = slot_rva as usize + 0x20; // 0x147888
+        let content = m23_dense_content(&[0x31_0000, 0x32_0000, 0x33_0000, 0x34_0000]);
+        assert_eq!(content.len(), (count as usize) * 8);
+        let out = vec![m23_root(slot_rva, 0x30_0000, content.clone())];
+        let dump = m24_dump_buf_with_count(0x150000, count_rva, count).unwrap();
+
+        let res = derive_first_hop_candidates(&pe, &out, &policy, base, base + 0x150000, &dump);
+        // Determinism: identical inputs -> identical candidate key order.
+        let res2 = derive_first_hop_candidates(&pe, &out, &policy, base, base + 0x150000, &dump);
+        assert_eq!(res, res2, "candidate derivation must be deterministic");
+        match res {
+            FirstHopCandidateResolution::Resolved(cands) => {
+                assert_eq!(cands.len(), 1, "exactly one verified candidate");
+                let c = &cands[0];
+                assert_eq!(c.table_rva, slot_rva, "candidate binds the declared slot");
+                assert_eq!(c.live_ptr, 0x30_0000);
+                assert_eq!(c.section_name, ".data");
+                assert_eq!(c.section_index, 1);
+                assert_eq!(c.slot_offset_in_section, slot_rva as usize - 0x2000usize);
+                // Span comes from the verified count x 8 boundary, not density.
+                assert_eq!(c.span, content.len());
+                assert_eq!(
+                    c.evidence,
+                    FirstHopCandidateEvidence::VerifiedCountScaledExtent
+                );
+            }
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+    }
+
+    /// Two different image bases and two different section layouts must not
+    /// change the capture-derived result: the identity-bound cmd-table role
+    /// resolves under both layouts with a verified count x 8 boundary, and
+    /// a bare fixed RVA alone must never activate a candidate.
+    #[test]
+    fn m23_first_hop_candidate_changes_with_image_layout() {
+        let policy = DumpCapturePolicy::default();
+
+        // Layout A: image base 0x140000000, .data at 0x2000, declared slot
+        // 0x147868, count 4 @ 0x147888, content 32 bytes, live table 0x30_0000.
+        let pe_a = m23_pe(0x140000000, 0x2000, 0x150000);
+        let out_a = vec![m23_root(
+            0x147868,
+            0x30_0000,
+            m23_dense_content(&[0x31_0000, 0x32_0000, 0x33_0000, 0x34_0000]),
+        )];
+        let dump_a = m24_dump_buf_with_count(0x150000, 0x147868 + 0x20, 4).unwrap();
+
+        // Layout B: different image base 0x180000000, .data at 0x2000, same
+        // declared slot 0x147868, count 4, different live heaps.
+        let pe_b = m23_pe(0x180000000, 0x2000, 0x150000);
+        let out_b = vec![m23_root(
+            0x147868,
+            0x50_0000,
+            m23_dense_content(&[0x51_0000, 0x52_0000, 0x53_0000, 0x54_0000]),
+        )];
+        let dump_b = m24_dump_buf_with_count(0x150000, 0x147868 + 0x20, 4).unwrap();
+
+        let ra =
+            derive_first_hop_candidates(&pe_a, &out_a, &policy, 0x140000000, 0x140150000, &dump_a);
+        let rb =
+            derive_first_hop_candidates(&pe_b, &out_b, &policy, 0x180000000, 0x180150000, &dump_b);
+        match (ra, rb) {
+            (
+                FirstHopCandidateResolution::Resolved(ca),
+                FirstHopCandidateResolution::Resolved(cb),
+            ) => {
+                assert_eq!(ca.len(), 1);
+                assert_eq!(cb.len(), 1);
+                assert_eq!(ca[0].table_rva, 0x147868);
+                assert_eq!(cb[0].table_rva, 0x147868);
+                assert_eq!(ca[0].live_ptr, 0x30_0000);
+                assert_eq!(cb[0].live_ptr, 0x50_0000);
+                assert_eq!(cb[0].section_name, ".data");
+            }
+            other => panic!("expected both Resolved, got {other:?}"),
+        }
+
+        // A slot at the SAME fixed sample RVA with NO capture evidence
+        // (empty content) must NOT activate.
+        let out_empty = vec![m23_root(0x147868, 0x30_0000, Vec::new())];
+        let re = derive_first_hop_candidates(
+            &pe_a,
+            &out_empty,
+            &policy,
+            0x140000000,
+            0x140150000,
+            &dump_a,
+        );
+        assert_eq!(
+            re,
+            FirstHopCandidateResolution::Missing,
+            "fixed RVA without capture evidence must fail closed"
+        );
+
+        // Same fixed RVA with content that does not match the count x 8
+        // boundary: count 4 establishes a 32-byte boundary, the captured
+        // extent is 64 bytes -> CONFLICTING structural extents -> Ambiguous
+        // (fail-closed, never Resolved).
+        let out_junk = vec![m23_root(0x147868, 0x30_0000, vec![1u8; 0x40])];
+        let rj = derive_first_hop_candidates(
+            &pe_a,
+            &out_junk,
+            &policy,
+            0x140000000,
+            0x140150000,
+            &dump_a,
+        );
+        assert_eq!(
+            rj,
+            FirstHopCandidateResolution::Ambiguous,
+            "conflicting count-scaled boundary must fail closed as Ambiguous"
+        );
+    }
+
+    /// No table/slot/region evidence -> Missing -> first-hop does not run and
+    /// no child is fabricated; the generic capture path is unaffected.
+    #[test]
+    fn m23_missing_candidate_evidence_fails_closed() {
+        let base = 0x140000000u64;
+        // .data spans up to 0x152000 so the declared slot 0x147868 sits in a
+        // real non-executable data section — the evidence failures below are
+        // about content/structural-boundary evidence, not section placement.
+        let pe = m23_pe(base, 0x2000, 0x150000);
+        let policy = DumpCapturePolicy::default();
+        let dump_ok = m24_dump_buf_with_count(0x150000, 0x147888, 4).unwrap();
+
+        // The capture contains NO root at the declared slot RVA.
+        let out_none: Vec<HeapGlobalSnapshot> =
+            vec![m23_root(0x3000, 0x30_0000, m23_dense_content(&[0x31_0000]))];
+        let r =
+            derive_first_hop_candidates(&pe, &out_none, &policy, base, base + 0x152000, &dump_ok);
+        assert_eq!(
+            r,
+            FirstHopCandidateResolution::Missing,
+            "absent slot must fail closed"
+        );
+
+        // Declared slot present but content too short (< 8 bytes) -> Missing.
+        let out_short = vec![m23_root(0x147868, 0x30_0000, vec![0u8; 4])];
+        let r2 =
+            derive_first_hop_candidates(&pe, &out_short, &policy, base, base + 0x152000, &dump_ok);
+        assert_eq!(
+            r2,
+            FirstHopCandidateResolution::Missing,
+            "undersized captured slot must fail closed"
+        );
+
+        // Declared slot present, content >= 8 but live_ptr is NOT a user-heap
+        // pointer (image pointer) -> Missing (pointer filter fails).
+        let image_ptr = base + 0x147868;
+        let out_img = vec![m23_root(0x147868, image_ptr, vec![0u8; 0x40])];
+        let r3 =
+            derive_first_hop_candidates(&pe, &out_img, &policy, base, base + 0x152000, &dump_ok);
+        assert_eq!(
+            r3,
+            FirstHopCandidateResolution::Missing,
+            "image-pointer live_ptr must fail closed"
+        );
+
+        // Declared slot present with valid pointer/section, but the count
+        // dword is ABSENT from dump_buf (count read out of bounds) -> Missing.
+        let out_slot = vec![m23_root(0x147868, 0x30_0000, vec![0u8; 0x20])];
+        let dump_short = vec![0u8; 0x147868 + 0x20]; // count dword out of range
+        let r5 = derive_first_hop_candidates(
+            &pe,
+            &out_slot,
+            &policy,
+            base,
+            base + 0x152000,
+            &dump_short,
+        );
+        assert_eq!(
+            r5,
+            FirstHopCandidateResolution::Missing,
+            "unreadable count dword must fail closed"
+        );
+
+        // No candidates at all (no roots) -> Missing.
+        let r4 = derive_first_hop_candidates(&pe, &[], &policy, base, base + 0x152000, &dump_ok);
+        assert_eq!(r4, FirstHopCandidateResolution::Missing);
+    }
+
+    /// A single declared slot whose count x 8 structural boundary CONFLICTS
+    /// with the captured extent (count says 32 bytes, content is 64 bytes)
+    /// cannot be uniquely decided -> Ambiguous -> fail closed. This is the
+    /// MIDA-SERIAL-24 D-item-2 case (one slot, two conflicting extents).
+    #[test]
+    fn m23_ambiguous_candidates_fail_closed() {
+        let base = 0x140000000u64;
+        let pe = m23_pe(base, 0x2000, 0x150000); // .data covers 0x147868
+        let policy = DumpCapturePolicy::default();
+        // count = 4 -> declared boundary 32 bytes, but the captured content
+        // is 64 bytes (e.g. an oversized probe window that normalize did not
+        // shrink, or a free-list tail). Conflict -> Ambiguous.
+        let dump = m24_dump_buf_with_count(0x150000, 0x147888, 4).unwrap();
+        let out = vec![m23_root(
+            0x147868,
+            0x30_0000,
+            m23_dense_content(&[0x31_0000; 8]), // 64 bytes != 4*8
+        )];
+        let r = derive_first_hop_candidates(&pe, &out, &policy, base, base + 0x152000, &dump);
+        assert_eq!(
+            r,
+            FirstHopCandidateResolution::Ambiguous,
+            "conflicting structural extent must fail closed as Ambiguous"
+        );
+    }
+
+    /// 0x147868 sentinel must never be sanitized/reinitialized, and the
+    /// count*8 normalize semantics survive. (Re-derives the m17 invariant
+    /// against the MIDA-24 candidate seam.)
+    #[test]
+    fn m23_cmd_table_not_sanitized() {
+        let mut globals = vec![
+            m23_root(0x141bf0, 0x1000, vec![0xAAu8; 0x2000]),
+            m23_root(0x147868, 0x2000, vec![0x5Au8; 0x40]),
+        ];
+        sanitize_ahk_runtime_global(&mut globals);
+        let ahk = &globals[0];
+        assert_eq!(ahk.content.len(), 0x180, "0x141bf0 sanitized to 0x180 slab");
+        assert!(ahk.content.iter().all(|&b| b == 0));
+        let cmd = &globals[1];
+        assert_eq!(cmd.content.len(), 0x40);
+        assert!(
+            cmd.content.iter().all(|&b| b == 0x5A),
+            "0x147868 must never be zeroed by sanitize"
+        );
+
+        // 0x141bf0 is a declared identity-bound BOUNDED role in MIDA-25:
+        // it is NOT a count-scaled pointer table. With content larger than
+        // max_span it resolves with span == max_span (0x200) and evidence
+        // IdentityBoundedPointerWindow — never a full-content candidate.
+        let base = 0x140000000u64;
+        let pe = m23_pe(base, 0x2000, 0x150000); // .data covers 0x141bf0
+        let policy = DumpCapturePolicy::default();
+        let dump = vec![0u8; 0x150000];
+        let out = vec![m23_root(0x141bf0, 0x30_0000, vec![0u8; 0x2000])];
+        let r = derive_first_hop_candidates(&pe, &out, &policy, base, base + 0x152000, &dump);
+        match r {
+            FirstHopCandidateResolution::Resolved(cands) => {
+                let c = cands.iter().find(|c| c.table_rva == 0x141bf0).unwrap();
+                assert_eq!(
+                    c.evidence,
+                    FirstHopCandidateEvidence::IdentityBoundedPointerWindow,
+                );
+                assert_eq!(c.span, 0x200, "bounded span must cap at max_span");
+            }
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+    }
+
+    /// The identity gate still wraps the first-hop path: unbound/mismatch/
+    /// revision-0/digest-mismatch policies never reach the legacy fallback —
+    /// the sample_active predicate (production seam in detect_heap_globals)
+    /// denies first-hop entirely, and a rejected gate writes no applied ledger.
+    #[test]
+    fn m23_identity_gate_still_wraps_legacy_fallback() {
+        use super::super::raw_slab_coherence::TransformRunLedger;
+        let module = m15_test_module_identity();
+
+        // A sample-specific policy (hot roots) without a binding: the gate
+        // denies sample activation -> first-hop path (gated by sample_active
+        // in detect_heap_globals) cannot run.
+        let unbound = DumpCapturePolicy::ahk_gto_default();
+        assert!(
+            unbound.has_sample_specific(),
+            "policy carries sample declarations but must not self-activate"
+        );
+        assert!(
+            !unbound.sample_specific_activation(&module),
+            "unbound policy must deny sample paths"
+        );
+
+        // Revision 0 with a binding still denies (unversioned policy).
+        let rev0 = DumpCapturePolicy::ahk_gto_default().with_module_binding(module.clone());
+        assert!(!rev0.sample_specific_activation(&module));
+
+        // A valid (revision + digest) binding activates — matching identity.
+        let valid = DumpCapturePolicy::ahk_gto_default()
+            .with_module_binding(module.clone())
+            .with_policy_revision(1)
+            .with_external_policy_digest(
+                DumpCapturePolicy::ahk_gto_default()
+                    .with_module_binding(module.clone())
+                    .with_policy_revision(1)
+                    .policy_digest_value(),
+            );
+        assert!(valid.sample_specific_activation(&module));
+
+        // Rejected gate -> no applied ledger record (legacy fallback must not
+        // sneak back in under a denied gate).
+        let mut ledger = TransformRunLedger::default();
+        if unbound.sample_specific_activation(&module) {
+            let mut g = vec![];
+            let _ = super::super::raw_slab_coherence::apply_recorded_transform(
+                &mut g,
+                "sanitize_ahk_runtime_global",
+                &mut ledger,
+                |g| super::sanitize_ahk_runtime_global(g),
+            );
+        }
+        assert!(
+            ledger.runs.is_empty(),
+            "denied gate must not write an applied ledger"
+        );
+    }
+
+    /// Execution seam: a resolved candidate's verified count-scaled span drives
+    /// the real pointer-table walk and admits heap children; the walker reads
+    /// the child bodies from the live-map mock.
+    #[test]
+    fn m23_exhaust_seam_uses_candidate_span() {
+        let base = 0x140000000u64;
+        let pe = m23_pe(base, 0x2000, 0x150000); // .data covers 0x147868
+        let slot_rva = 0x147868u32;
+        let table_live = 0x30_0000u64;
+        let child_a = 0x31_0000u64;
+        let child_b = 0x32_0000u64;
+        // count = 4 -> verified span 32 bytes covering child_a and child_b.
+        let content = m23_dense_content(&[child_a, child_b, 0, 0]);
+        let out = vec![m23_root(slot_rva, table_live, content.clone())];
+        let policy = DumpCapturePolicy::default();
+        let dump = m24_dump_buf_with_count(0x150000, slot_rva as usize + 0x20, 4).unwrap();
+
+        let res = derive_first_hop_candidates(&pe, &out, &policy, base, base + 0x152000, &dump);
+        let cands = match res {
+            FirstHopCandidateResolution::Resolved(c) => c,
+            other => panic!("expected Resolved, got {other:?}"),
+        };
+        let c = &cands[0];
+        assert_eq!(c.table_rva, slot_rva);
+        assert_eq!(
+            c.evidence,
+            FirstHopCandidateEvidence::VerifiedCountScaledExtent
+        );
+        assert_eq!(c.span, content.len()); // 4 * 8
+
+        let mut mock = M23RegionMapMock::new();
+        mock.set(child_a, vec![0x11u8; 0x40]);
+        mock.set(child_b, vec![0x22u8; 0x40]);
+
+        let mut globals = out.clone();
+        let mut total_bytes = 0usize;
+        let mut seen = BTreeSet::new();
+        exhaust_first_hop_candidates(
+            &mut globals,
+            &mut total_bytes,
+            &mut seen,
+            base,
+            base + 0x152000,
+            &dump,
+            &mut mock,
+            &cands,
+        );
+        // Both table children admitted as exact-base snapshots.
+        let a = globals.iter().find(|g| g.live_ptr == child_a);
+        let b = globals.iter().find(|g| g.live_ptr == child_b);
+        assert!(a.is_some(), "child A must be admitted from the table walk");
+        assert!(b.is_some(), "child B must be admitted from the table walk");
+        assert!(total_bytes >= 0x40 * 2);
+        assert!(
+            globals.iter().filter(|g| g.rva == 0).count() >= 2,
+            "walked children must be graph children (rva == 0)"
+        );
+    }
+
+    /// Execution seam: Missing / Ambiguous resolution never reaches the
+    /// walker (no fabricated children, no slot/region expansion). This
+    /// mirrors the production `if sample_active { match ... }` seam.
+    #[test]
+    fn m23_exhaust_seam_fails_closed_without_children() {
+        let base = 0x140000000u64;
+        let pe = m23_pe(base, 0x2000, 0x150000); // .data covers 0x147868
+        let mut mock = M23RegionMapMock::new();
+        mock.set(0x30_0000, vec![0x11u8; 0x40]);
+        mock.set(0x31_0000, vec![0x22u8; 0x40]);
+
+        // Missing: no roots in the capture.
+        let policy = DumpCapturePolicy::default();
+        let out_empty: Vec<HeapGlobalSnapshot> = Vec::new();
+        let mut globals = out_empty.clone();
+        let mut total_bytes = 0usize;
+        let mut seen = BTreeSet::new();
+        let dump = vec![0u8; 0x150000];
+        let res =
+            derive_first_hop_candidates(&pe, &out_empty, &policy, base, base + 0x152000, &dump);
+        assert_eq!(res, FirstHopCandidateResolution::Missing);
+        if let FirstHopCandidateResolution::Resolved(cands) = res {
+            exhaust_first_hop_candidates(
+                &mut globals,
+                &mut total_bytes,
+                &mut seen,
+                base,
+                base + 0x152000,
+                &dump,
+                &mut mock,
+                &cands,
+            );
+        }
+        assert!(
+            globals.is_empty(),
+            "Missing resolution must not fabricate children"
+        );
+        assert_eq!(total_bytes, 0);
+
+        // Ambiguous: the declared slot's count x 8 boundary conflicts with
+        // the captured extent (count 4 -> 32 bytes, content 64 bytes).
+        let out_conflict = vec![m23_root(
+            0x147868,
+            0x30_0000,
+            m23_dense_content(&[0x31_0000; 8]),
+        )];
+        let dump_conflict = m24_dump_buf_with_count(0x150000, 0x147888, 4).unwrap();
+        let res2 = derive_first_hop_candidates(
+            &pe,
+            &out_conflict,
+            &policy,
+            base,
+            base + 0x152000,
+            &dump_conflict,
+        );
+        assert_eq!(res2, FirstHopCandidateResolution::Ambiguous);
+        let mut globals2 = out_conflict.clone();
+        let mut total2 = 0usize;
+        let mut seen2 = BTreeSet::new();
+        if let FirstHopCandidateResolution::Resolved(cands) = res2 {
+            exhaust_first_hop_candidates(
+                &mut globals2,
+                &mut total2,
+                &mut seen2,
+                base,
+                base + 0x152000,
+                &dump_conflict,
+                &mut mock,
+                &cands,
+            );
+        }
+        assert_eq!(
+            globals2.len(),
+            1,
+            "Ambiguous resolution must not expand slots/regions"
+        );
+        assert_eq!(total2, 0);
+    }
+
+    /// Minimal memory-map DebuggerCore for driving the real first-hop exhaust
+    /// emitter (MIDA-SERIAL-23 execution seam). Serves fixed (base -> bytes)
+    /// regions; reads outside them fail.
+    #[derive(Default)]
+    struct M23RegionMapMock {
+        regions: std::collections::BTreeMap<u64, Vec<u8>>,
+    }
+
+    impl M23RegionMapMock {
+        fn new() -> Self {
+            Self {
+                regions: std::collections::BTreeMap::new(),
+            }
+        }
+        fn set(&mut self, base: u64, bytes: Vec<u8>) {
+            self.regions.insert(base, bytes);
+        }
+    }
+
+    impl mida_core::DebuggerCore for M23RegionMapMock {
+        fn process_handle(&self) -> windows::Win32::Foundation::HANDLE {
+            windows::Win32::Foundation::HANDLE(std::ptr::null_mut())
+        }
+        fn pid(&self) -> u32 {
+            1
+        }
+        fn image_base(&self) -> u64 {
+            0x140000000
+        }
+        fn wait_event(&mut self) -> Result<mida_core::DebugEvent, mida_core::CoreError> {
+            Err(mida_core::CoreError::Windows(0))
+        }
+        fn continue_event(
+            &mut self,
+            _t: u32,
+            _s: mida_core::ContinueStatus,
+        ) -> Result<(), mida_core::CoreError> {
+            Err(mida_core::CoreError::Windows(0))
+        }
+        fn read_memory(
+            &self,
+            address: usize,
+            buf: &mut [u8],
+        ) -> Result<usize, mida_core::CoreError> {
+            let addr = address as u64;
+            for (base, region) in &self.regions {
+                if addr >= *base && addr < base.saturating_add(region.len() as u64) {
+                    let off = (addr - *base) as usize;
+                    let n = (region.len() - off).min(buf.len());
+                    buf[..n].copy_from_slice(&region[off..off + n]);
+                    return Ok(n);
+                }
+            }
+            Err(mida_core::CoreError::MemoryRead {
+                address: addr,
+                requested: buf.len(),
+            })
+        }
+        fn write_memory(&mut self, _a: usize, _d: &[u8]) -> Result<usize, mida_core::CoreError> {
+            Err(mida_core::CoreError::Windows(0))
+        }
+        fn get_thread_context(
+            &self,
+            _t: u32,
+        ) -> Result<windows::Win32::System::Diagnostics::Debug::CONTEXT, mida_core::CoreError>
+        {
+            Err(mida_core::CoreError::Windows(0))
+        }
+        fn set_thread_context(
+            &self,
+            _t: u32,
+            _c: &windows::Win32::System::Diagnostics::Debug::CONTEXT,
+        ) -> Result<(), mida_core::CoreError> {
+            Err(mida_core::CoreError::Windows(0))
+        }
+    }
+
+    // ============ MIDA-SERIAL-24 adversarial regression tests ============
+
+    /// A dense, un-nominated, pointer-rich object (100% heap pointers in the
+    /// leading 0x100 bytes) with no declared first-hop role must be rejected
+    /// (Missing) — density alone can never activate a candidate.
+    #[test]
+    fn m24_dense_unnominated_pointer_rich_object_is_rejected() {
+        let base = 0x140000000u64;
+        let pe = m23_pe(base, 0x2000, 0x2000);
+        let policy = m24_generic_policy();
+        // 32 qwords, ALL user-heap pointers -> maximally pointer-rich.
+        let mut ptrs = Vec::new();
+        for i in 0..32u64 {
+            ptrs.push(0x40_0000 + i * 0x1000);
+        }
+        let content = m23_dense_content(&ptrs);
+        let out = vec![m23_root(0x2010, 0x30_0000, content)];
+        let dump = vec![0u8; 0x6000];
+        let r = derive_first_hop_candidates(&pe, &out, &policy, base, base + 0x6000, &dump);
+        assert_eq!(
+            r,
+            FirstHopCandidateResolution::Missing,
+            "dense un-nominated object must fail closed"
+        );
+    }
+
+    /// A slot that IS a hot-root nomination (0x18a898) with capture/live-pointer/
+    /// section conditions all satisfied but NO structural pointer-table role
+    /// must be rejected (Missing) — nomination alone cannot activate.
+    #[test]
+    fn m24_hot_root_without_first_hop_role_is_rejected() {
+        let base = 0x140000000u64;
+        // .data covers 0x18a898 (hot fill root in the default policy).
+        let pe = m23_pe(base, 0x2000, 0x180000);
+        // ahk_gto_default nominates 0x18a898 as hot root + expand seed.
+        let policy = DumpCapturePolicy::ahk_gto_default();
+        let content = m23_dense_content(&[0x31_0000; 8]);
+        let out = vec![m23_root(0x18a898, 0x30_0000, content)];
+        let dump = vec![0u8; 0x180000];
+        let r = derive_first_hop_candidates(&pe, &out, &policy, base, base + 0x180000, &dump);
+        assert_eq!(
+            r,
+            FirstHopCandidateResolution::Missing,
+            "hot-root nomination without structural role must fail closed"
+        );
+    }
+
+    /// A slot that IS a large-table nomination (0x148bf8) with a dense pointer
+    /// capture must still be rejected (Missing) when it has no declared
+    /// count-scaled structural role.
+    #[test]
+    fn m24_large_table_nomination_alone_is_rejected() {
+        let base = 0x140000000u64;
+        let pe = m23_pe(base, 0x2000, 0x180000); // covers 0x148bf8
+        let policy = DumpCapturePolicy::ahk_gto_default(); // large_table includes 0x148bf8
+        let content = m23_dense_content(&[0x31_0000; 8]);
+        let out = vec![m23_root(0x148bf8, 0x30_0000, content)];
+        let dump = vec![0u8; 0x180000];
+        let r = derive_first_hop_candidates(&pe, &out, &policy, base, base + 0x180000, &dump);
+        assert_eq!(
+            r,
+            FirstHopCandidateResolution::Missing,
+            "large-table nomination without structural role must fail closed"
+        );
+    }
+
+    /// Density must never select full content span: a dense declared-slot
+    /// capture larger than the verified count-scaled boundary is either
+    /// Missing (count unverifiable) or Ambiguous (count boundary conflicts);
+    /// it is NEVER Resolved with full span.
+    #[test]
+    fn m24_dense_evidence_never_selects_full_span() {
+        let base = 0x140000000u64;
+        let pe = m23_pe(base, 0x2000, 0x150000); // covers 0x147868
+        let policy = m24_generic_policy();
+        // Declared slot 0x147868 with count 4 (32-byte boundary) but the
+        // captured content is 64 bytes of pure pointers (dense, larger than
+        // the boundary). The count boundary CONFLICTS -> Ambiguous, never a
+        // Resolved full-span candidate.
+        let dump = m24_dump_buf_with_count(0x150000, 0x147888, 4).unwrap();
+        let out = vec![m23_root(
+            0x147868,
+            0x30_0000,
+            m23_dense_content(&[0x31_0000; 8]), // 64 bytes != 32
+        )];
+        let r = derive_first_hop_candidates(&pe, &out, &policy, base, base + 0x152000, &dump);
+        assert_eq!(
+            r,
+            FirstHopCandidateResolution::Ambiguous,
+            "density must never grant full span — conflicting boundary fails closed"
+        );
+        // With NO count dword (unverifiable), the same dense content is Missing.
+        let dump_none = vec![0u8; 0x150000];
+        let r2 = derive_first_hop_candidates(&pe, &out, &policy, base, base + 0x152000, &dump_none);
+        assert_eq!(
+            r2,
+            FirstHopCandidateResolution::Missing,
+            "dense content without count boundary must fail closed"
+        );
+    }
+
+    /// Extra policy roots (0x148bf8, 0x148c00, 0x148c98) must not expand the
+    /// first-hop action set merely because they appear in hot-root / large-table
+    /// unions. Each is checked with capture evidence and must fail closed.
+    #[test]
+    fn m24_extra_policy_roots_do_not_expand_old_action_set() {
+        let base = 0x140000000u64;
+        let pe = m23_pe(base, 0x2000, 0x180000); // covers up to 0x149d50 region
+        let policy = DumpCapturePolicy::ahk_gto_default();
+        let dump = vec![0u8; 0x180000];
+        for rva in [0x148bf8u32, 0x148c00, 0x148c98] {
+            assert!(
+                policy.is_hot_root(rva) || policy.is_large_table(rva),
+                "{rva:#x} must be a policy nomination"
+            );
+            let out = vec![m23_root(rva, 0x30_0000, m23_dense_content(&[0x31_0000; 8]))];
+            let r = derive_first_hop_candidates(&pe, &out, &policy, base, base + 0x180000, &dump);
+            assert_eq!(
+                r,
+                FirstHopCandidateResolution::Missing,
+                "extra policy root {rva:#x} must not enter first-hop without structural role"
+            );
+        }
+    }
+
+    /// Conflicting extent on the SAME candidate fails closed: Ambiguous,
+    /// walker zero calls, children zero growth, total_bytes unchanged.
+    #[test]
+    fn m24_conflicting_extent_fails_closed() {
+        let base = 0x140000000u64;
+        let pe = m23_pe(base, 0x2000, 0x150000);
+        let policy = m24_generic_policy();
+        let dump = m24_dump_buf_with_count(0x150000, 0x147888, 4).unwrap();
+        let out = vec![m23_root(
+            0x147868,
+            0x30_0000,
+            m23_dense_content(&[0x31_0000; 8]), // 64B != 4*8
+        )];
+        let r = derive_first_hop_candidates(&pe, &out, &policy, base, base + 0x152000, &dump);
+        assert_eq!(
+            r,
+            FirstHopCandidateResolution::Ambiguous,
+            "conflicting extent must be Ambiguous"
+        );
+        // Walker is never invoked for Ambiguous: no children, no bytes.
+        let mut mock = M23RegionMapMock::new();
+        mock.set(0x31_0000, vec![0x11u8; 0x40]);
+        let mut globals = out.clone();
+        let before_len = globals.len();
+        let mut total_bytes = 0usize;
+        let mut seen = BTreeSet::new();
+        if let FirstHopCandidateResolution::Resolved(cands) = r {
+            exhaust_first_hop_candidates(
+                &mut globals,
+                &mut total_bytes,
+                &mut seen,
+                base,
+                base + 0x152000,
+                &dump,
+                &mut mock,
+                &cands,
+            );
+        }
+        assert_eq!(globals.len(), before_len, "Ambiguous must not add children");
+        assert_eq!(total_bytes, 0, "Ambiguous must not consume budget");
+        assert!(seen.is_empty(), "Ambiguous must not register heap pointers");
+    }
+
+    /// A pointer-rich non-table object must not consume the heap-global budget:
+    /// seen_heaps, slot count, and total bytes all stay unchanged.
+    #[test]
+    fn m24_pointer_rich_non_table_does_not_consume_budget() {
+        let base = 0x140000000u64;
+        let pe = m23_pe(base, 0x2000, 0x2000);
+        let policy = m24_generic_policy();
+        // Non-declared dense object (rva 0x2028) at a NON-sample RVA.
+        let out = vec![m23_root(
+            0x2028,
+            0x30_0000,
+            m23_dense_content(&[0x31_0000; 8]),
+        )];
+        let dump = vec![0u8; 0x6000];
+        let r = derive_first_hop_candidates(&pe, &out, &policy, base, base + 0x6000, &dump);
+        assert_eq!(
+            r,
+            FirstHopCandidateResolution::Missing,
+            "pointer-rich non-table must fail closed"
+        );
+        let mut mock = M23RegionMapMock::new();
+        mock.set(0x31_0000, vec![0x11u8; 0x40]);
+        let mut globals = out.clone();
+        let before_len = globals.len();
+        let mut total_bytes = 0usize;
+        let mut seen = BTreeSet::new();
+        if let FirstHopCandidateResolution::Resolved(cands) = r {
+            exhaust_first_hop_candidates(
+                &mut globals,
+                &mut total_bytes,
+                &mut seen,
+                base,
+                base + 0x6000,
+                &dump,
+                &mut mock,
+                &cands,
+            );
+        }
+        assert_eq!(globals.len(), before_len, "no slots consumed");
+        assert_eq!(total_bytes, 0, "no bytes consumed");
+        assert!(seen.is_empty(), "no heap pointers registered");
+    }
+
+    /// The identity gate remains the OUTER boundary: even a structurally
+    /// plausible fixture must never reach the walker under unbound / mismatch /
+    /// revision-0 / digest-mismatch policies. (The production seam wraps
+    /// derive + exhaust in `if sample_active`; here we prove the gate semantics
+    /// and that a rejected gate performs zero first-hop actions.)
+    #[test]
+    fn m24_identity_gate_remains_outer_boundary() {
+        let module = m15_test_module_identity();
+
+        // Unbound policy: has sample-specific declarations but no binding.
+        let unbound = DumpCapturePolicy::ahk_gto_default();
+        assert!(!unbound.sample_specific_activation(&module));
+
+        // Mismatch: binding for module m1, asked about m2 (different stamp).
+        let m2 = super::super::module_identity::ModuleIdentity {
+            machine: module.machine,
+            time_date_stamp: module.time_date_stamp.wrapping_add(1),
+            size_of_image: module.size_of_image,
+            check_sum: module.check_sum,
+            section_layout_digest: module.section_layout_digest.clone(),
+        };
+        let mismatch = DumpCapturePolicy::ahk_gto_default()
+            .with_module_binding(module.clone())
+            .with_policy_revision(1)
+            .with_external_policy_digest(String::new());
+        assert!(!mismatch.sample_specific_activation(&m2));
+
+        // Revision 0: binding present but unversioned.
+        let rev0 = DumpCapturePolicy::ahk_gto_default().with_module_binding(module.clone());
+        assert!(!rev0.sample_specific_activation(&module));
+
+        // Digest mismatch: stamped digest differs from recomputed value.
+        let bad_digest = DumpCapturePolicy::ahk_gto_default()
+            .with_module_binding(module.clone())
+            .with_policy_revision(1)
+            .with_external_policy_digest("deadbeef".into());
+        assert!(!bad_digest.sample_specific_activation(&module));
+        assert!(!bad_digest.digest_matches());
+
+        // Matching binding activates — but the outer gate is what decides.
+        let valid = DumpCapturePolicy::ahk_gto_default()
+            .with_module_binding(module.clone())
+            .with_policy_revision(1)
+            .with_external_policy_digest(
+                DumpCapturePolicy::ahk_gto_default()
+                    .with_module_binding(module.clone())
+                    .with_policy_revision(1)
+                    .policy_digest_value(),
+            );
+        assert!(valid.sample_specific_activation(&module));
+    }
+
+    /// Every default-policy nomination that is NOT the identity-bound
+    /// cmd-table role (0x147868) must fail closed (Missing) even with
+    /// capture/live-pointer/section conditions satisfied and a dense
+    /// pointer-array body. This pins the action set to the single declared
+    /// structural role — no hot-root / large-table union expansion.
+    #[test]
+    fn m24_all_default_nominations_except_declared_role_fail_closed() {
+        let base = 0x140000000u64;
+        // .data spans [0x2000, 0x202000) so every default-policy RVA below
+        // 0x149d50 sits in a real non-executable section.
+        let pe = m23_pe(base, 0x2000, 0x200000);
+        let policy = DumpCapturePolicy::ahk_gto_default();
+        let dump = vec![0u8; 0x200000];
+        // Union of default hot roots + large tables (excluding gscript root
+        // 0x149d50, which has its own dedicated exhaust path).
+        let mut nominations: Vec<u32> = policy
+            .hot_root_rvas
+            .iter()
+            .chain(policy.large_table_rvas.iter())
+            .copied()
+            .collect();
+        nominations.sort_unstable();
+        nominations.dedup();
+        nominations.retain(|&r| r != 0x149d50);
+        // The only declared first-hop role in MIDA-24 is 0x147868.
+        let declared: Vec<u32> = declared_first_hop_roles()
+            .iter()
+            .map(|r| r.slot_rva)
+            .collect();
+        for rva in &nominations {
+            if declared.contains(rva) {
+                continue; // declared role is validated elsewhere
+            }
+            let out = vec![m23_root(
+                *rva,
+                0x30_0000,
+                m23_dense_content(&[0x31_0000; 8]),
+            )];
+            let r = derive_first_hop_candidates(&pe, &out, &policy, base, base + 0x200000, &dump);
+            assert_eq!(
+                r,
+                FirstHopCandidateResolution::Missing,
+                "default-policy nomination {rva:#x} must not enter first-hop without a declared structural role"
+            );
+        }
+        // Sanity: the union actually covers the extra roots the work order names.
+        for rva in [0x18a898u32, 0x148bf8, 0x148ca8, 0x148c98, 0x148c00] {
+            assert!(
+                nominations.contains(&rva),
+                "{rva:#x} must be part of the default nomination union"
+            );
+        }
+    }
+
+    // ============ MIDA-SERIAL-25 identity-bound role parity tests ============
+
+    /// Helper: build the dump buffer sized to cover a role slot's count dword
+    /// (or just a large data region for bounded roles).
+    fn m25_dump(size: usize) -> Vec<u8> {
+        vec![0u8; size]
+    }
+
+    /// 0x147868 count-scaled role resolves with VerifiedCountScaledExtent when
+    /// the count x 8 boundary exactly matches the captured extent.
+    #[test]
+    fn m25_cmd_table_count_scaled_role_is_resolved() {
+        let base = 0x140000000u64;
+        let pe = m23_pe(base, 0x2000, 0x150000); // .data covers 0x147868
+        let policy = DumpCapturePolicy::default();
+        let dump = m24_dump_buf_with_count(0x150000, 0x147888, 4).unwrap();
+        let content = m23_dense_content(&[0x31_0000, 0x32_0000, 0x33_0000, 0x34_0000]);
+        let out = vec![m23_root(0x147868, 0x30_0000, content.clone())];
+        let r = derive_first_hop_candidates(&pe, &out, &policy, base, base + 0x152000, &dump);
+        match r {
+            FirstHopCandidateResolution::Resolved(cands) => {
+                assert_eq!(cands.len(), 1);
+                let c = &cands[0];
+                assert_eq!(c.table_rva, 0x147868);
+                assert_eq!(c.span, content.len()); // 4 * 8
+                assert_eq!(
+                    c.evidence,
+                    FirstHopCandidateEvidence::VerifiedCountScaledExtent,
+                );
+            }
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+    }
+
+    /// 0x141bf0 bounded role resolves with span == max_span (0x200) when the
+    /// captured content is larger than the window; evidence is
+    /// IdentityBoundedPointerWindow.
+    #[test]
+    fn m25_ahk_global_bounded_role_is_resolved() {
+        let base = 0x140000000u64;
+        let pe = m23_pe(base, 0x2000, 0x150000); // .data covers 0x141bf0
+        let policy = DumpCapturePolicy::default();
+        let dump = m25_dump(0x150000);
+        let content = vec![0u8; 0x2000]; // larger than max_span 0x200
+        let out = vec![m23_root(0x141bf0, 0x30_0000, content)];
+        let r = derive_first_hop_candidates(&pe, &out, &policy, base, base + 0x152000, &dump);
+        match r {
+            FirstHopCandidateResolution::Resolved(cands) => {
+                let c = cands.iter().find(|c| c.table_rva == 0x141bf0).unwrap();
+                assert_eq!(c.span, 0x200, "bounded span must cap at max_span");
+                assert_eq!(
+                    c.evidence,
+                    FirstHopCandidateEvidence::IdentityBoundedPointerWindow,
+                );
+            }
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+    }
+
+    /// Bounded role with content in [8, 0x200) uses only the available extent
+    /// (never reads beyond content).
+    #[test]
+    fn m25_ahk_global_short_capture_uses_only_available_extent() {
+        let base = 0x140000000u64;
+        let pe = m23_pe(base, 0x2000, 0x150000);
+        let policy = DumpCapturePolicy::default();
+        let dump = m25_dump(0x150000);
+        let content = vec![0u8; 0x40]; // 64 bytes, within [8, 0x200)
+        let out = vec![m23_root(0x141bf0, 0x30_0000, content.clone())];
+        let r = derive_first_hop_candidates(&pe, &out, &policy, base, base + 0x152000, &dump);
+        match r {
+            FirstHopCandidateResolution::Resolved(cands) => {
+                let c = cands.iter().find(|c| c.table_rva == 0x141bf0).unwrap();
+                assert_eq!(c.span, content.len(), "span must equal available extent");
+                assert!(c.span < 0x200);
+            }
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+    }
+
+    /// Bounded role with content < 8 bytes fails closed (Missing).
+    #[test]
+    fn m25_ahk_global_too_short_fails_closed() {
+        let base = 0x140000000u64;
+        let pe = m23_pe(base, 0x2000, 0x150000);
+        let policy = DumpCapturePolicy::default();
+        let dump = m25_dump(0x150000);
+        let out = vec![m23_root(0x141bf0, 0x30_0000, vec![0u8; 4])];
+        let r = derive_first_hop_candidates(&pe, &out, &policy, base, base + 0x152000, &dump);
+        assert_eq!(r, FirstHopCandidateResolution::Missing);
+    }
+
+    /// Bounded role with a non-user-heap live pointer fails closed (Missing).
+    #[test]
+    fn m25_ahk_global_invalid_live_pointer_fails_closed() {
+        let base = 0x140000000u64;
+        let pe = m23_pe(base, 0x2000, 0x150000);
+        let policy = DumpCapturePolicy::default();
+        let dump = m25_dump(0x150000);
+        let image_ptr = base + 0x141bf0; // image-resident, not user heap
+        let out = vec![m23_root(0x141bf0, image_ptr, vec![0u8; 0x40])];
+        let r = derive_first_hop_candidates(&pe, &out, &policy, base, base + 0x152000, &dump);
+        assert_eq!(r, FirstHopCandidateResolution::Missing);
+    }
+
+    /// Bounded role in an executable section fails closed (Missing).
+    #[test]
+    fn m25_ahk_global_executable_section_fails_closed() {
+        let base = 0x140000000u64;
+        // 0x141bf0 lies inside .text [0x1000, 0x2000) here.
+        let pe = m23_pe(base, 0x1000, 0x1000); // .data at 0x1000 is EXECUTE
+        let policy = DumpCapturePolicy::default();
+        let dump = m25_dump(0x3000);
+        let out = vec![m23_root(0x141bf0, 0x30_0000, vec![0u8; 0x40])];
+        let r = derive_first_hop_candidates(&pe, &out, &policy, base, base + 0x3000, &dump);
+        assert_eq!(r, FirstHopCandidateResolution::Missing);
+    }
+
+    /// The REAL bounded walker seam: a heap child pointer at +0xd8 inside
+    /// the 0x141bf0 bounded window is admitted as an exact-base child — this
+    /// proves the HEAD 0x141bf0 bounded first-hop purpose is preserved.
+    #[test]
+    fn m25_ahk_global_bounded_walker_reaches_d8_child() {
+        let base = 0x140000000u64;
+        let pe = m23_pe(base, 0x2000, 0x150000);
+        let policy = DumpCapturePolicy::default();
+        let dump = m25_dump(0x150000);
+        let child = 0x31_0000u64;
+        // 0x200-byte content; put a heap pointer at offset +0xd8 (0xd8..0xe0).
+        let mut content = vec![0u8; 0x200];
+        content[0xd8..0xe0].copy_from_slice(&child.to_le_bytes());
+        let out = vec![m23_root(0x141bf0, 0x30_0000, content)];
+        let r = derive_first_hop_candidates(&pe, &out, &policy, base, base + 0x152000, &dump);
+        let cands = match r {
+            FirstHopCandidateResolution::Resolved(c) => c,
+            other => panic!("expected Resolved, got {other:?}"),
+        };
+        let mut mock = M23RegionMapMock::new();
+        mock.set(child, vec![0x11u8; 0x40]);
+        let mut globals = out.clone();
+        let mut total_bytes = 0usize;
+        let mut seen = BTreeSet::new();
+        exhaust_first_hop_candidates(
+            &mut globals,
+            &mut total_bytes,
+            &mut seen,
+            base,
+            base + 0x152000,
+            &dump,
+            &mut mock,
+            &cands,
+        );
+        let admitted = globals.iter().find(|g| g.live_ptr == child);
+        assert!(
+            admitted.is_some(),
+            "+0xd8 interior child must be admitted by the bounded walker"
+        );
+    }
+
+    /// A heap child pointer placed AT or BEYOND +0x200 must NOT be walked:
+    /// the bounded window never reads or enumerates past max_span.
+    #[test]
+    fn m25_ahk_global_pointer_after_0x200_is_not_walked() {
+        let base = 0x140000000u64;
+        let pe = m23_pe(base, 0x2000, 0x150000);
+        let policy = DumpCapturePolicy::default();
+        let dump = m25_dump(0x150000);
+        let outside = 0x32_0000u64;
+        // content longer than 0x200; pointer at +0x200..0x208 (beyond window).
+        let mut content = vec![0u8; 0x300];
+        content[0x200..0x208].copy_from_slice(&outside.to_le_bytes());
+        let out = vec![m23_root(0x141bf0, 0x30_0000, content)];
+        let r = derive_first_hop_candidates(&pe, &out, &policy, base, base + 0x152000, &dump);
+        let cands = match r {
+            FirstHopCandidateResolution::Resolved(c) => c,
+            other => panic!("expected Resolved, got {other:?}"),
+        };
+        let c = cands.iter().find(|c| c.table_rva == 0x141bf0).unwrap();
+        assert_eq!(c.span, 0x200, "span must stay at max_span");
+        let mut mock = M23RegionMapMock::new();
+        mock.set(outside, vec![0x22u8; 0x40]);
+        let mut globals = out.clone();
+        let mut total_bytes = 0usize;
+        let mut seen = BTreeSet::new();
+        exhaust_first_hop_candidates(
+            &mut globals,
+            &mut total_bytes,
+            &mut seen,
+            base,
+            base + 0x152000,
+            &dump,
+            &mut mock,
+            &cands,
+        );
+        let admitted = globals.iter().find(|g| g.live_ptr == outside);
+        assert!(
+            admitted.is_none(),
+            "pointer beyond +0x200 must never be walked"
+        );
+    }
+
+    /// Extra default-policy roots remain rejected even when dense.
+    #[test]
+    fn m25_extra_default_roots_remain_rejected() {
+        let base = 0x140000000u64;
+        let pe = m23_pe(base, 0x2000, 0x200000);
+        let policy = DumpCapturePolicy::ahk_gto_default();
+        let dump = vec![0u8; 0x200000];
+        for rva in [0x18a898u32, 0x148bf8, 0x148ca8, 0x148c98, 0x148c00] {
+            let out = vec![m23_root(rva, 0x30_0000, m23_dense_content(&[0x31_0000; 8]))];
+            let r = derive_first_hop_candidates(&pe, &out, &policy, base, base + 0x200000, &dump);
+            assert_eq!(
+                r,
+                FirstHopCandidateResolution::Missing,
+                "{rva:#x} must remain rejected even when dense"
+            );
+        }
+    }
+
+    /// An arbitrary dense object (non-declared RVA) remains rejected.
+    #[test]
+    fn m25_arbitrary_dense_object_remains_rejected() {
+        let base = 0x140000000u64;
+        let pe = m23_pe(base, 0x2000, 0x6000);
+        let policy = DumpCapturePolicy::default();
+        let dump = vec![0u8; 0x6000];
+        let out = vec![m23_root(
+            0x2028, // not a declared role
+            0x30_0000,
+            m23_dense_content(&[0x31_0000; 8]),
+        )];
+        let r = derive_first_hop_candidates(&pe, &out, &policy, base, base + 0x6000, &dump);
+        assert_eq!(r, FirstHopCandidateResolution::Missing);
+    }
+
+    /// The identity gate rejects BOTH declared roles under unbound /
+    /// mismatch / revision-0 / digest-mismatch: zero first-hop actions.
+    #[test]
+    fn m25_identity_gate_rejects_both_declared_roles() {
+        let module = m15_test_module_identity();
+        let m2 = super::super::module_identity::ModuleIdentity {
+            machine: module.machine,
+            time_date_stamp: module.time_date_stamp.wrapping_add(1),
+            size_of_image: module.size_of_image,
+            check_sum: module.check_sum,
+            section_layout_digest: module.section_layout_digest.clone(),
+        };
+
+        // Unbound.
+        let unbound = DumpCapturePolicy::ahk_gto_default();
+        assert!(!unbound.sample_specific_activation(&module));
+
+        // Mismatch.
+        let mismatch = DumpCapturePolicy::ahk_gto_default()
+            .with_module_binding(module.clone())
+            .with_policy_revision(1)
+            .with_external_policy_digest(String::new());
+        assert!(!mismatch.sample_specific_activation(&m2));
+
+        // Revision 0.
+        let rev0 = DumpCapturePolicy::ahk_gto_default().with_module_binding(module.clone());
+        assert!(!rev0.sample_specific_activation(&module));
+
+        // Digest mismatch.
+        let bad_digest = DumpCapturePolicy::ahk_gto_default()
+            .with_module_binding(module.clone())
+            .with_policy_revision(1)
+            .with_external_policy_digest("deadbeef".into());
+        assert!(!bad_digest.sample_specific_activation(&module));
+
+        // Matching binding activates — but the outer gate decides before any
+        // role resolution; a rejected gate runs zero first-hop actions.
+        let valid = DumpCapturePolicy::ahk_gto_default()
+            .with_module_binding(module.clone())
+            .with_policy_revision(1)
+            .with_external_policy_digest(
+                DumpCapturePolicy::ahk_gto_default()
+                    .with_module_binding(module.clone())
+                    .with_policy_revision(1)
+                    .policy_digest_value(),
+            );
+        assert!(valid.sample_specific_activation(&module));
+    }
+
+    /// A legal fixture containing BOTH declared roles resolves to exactly two
+    /// candidates in deterministic order (0x141bf0 then 0x147868 by section
+    /// offset), with no extra nomination.
+    #[test]
+    fn m25_resolved_action_set_is_exactly_two_roles() {
+        let base = 0x140000000u64;
+        let pe = m23_pe(base, 0x2000, 0x150000); // covers both roles
+        let policy = DumpCapturePolicy::default();
+        let dump = m24_dump_buf_with_count(0x150000, 0x147888, 4).unwrap();
+        let table_content = m23_dense_content(&[0x31_0000, 0x32_0000, 0x33_0000, 0x34_0000]);
+        let global_content = vec![0u8; 0x2000];
+        let out = vec![
+            m23_root(0x147868, 0x40_0000, table_content),
+            m23_root(0x141bf0, 0x50_0000, global_content),
+        ];
+        let r = derive_first_hop_candidates(&pe, &out, &policy, base, base + 0x152000, &dump);
+        match r {
+            FirstHopCandidateResolution::Resolved(cands) => {
+                assert_eq!(cands.len(), 2, "exactly two declared roles");
+                // Deterministic order: by (section idx, slot offset).
+                let rvas: Vec<u32> = cands.iter().map(|c| c.table_rva).collect();
+                assert_eq!(rvas, vec![0x141bf0, 0x147868]);
+                let c0 = cands.iter().find(|c| c.table_rva == 0x141bf0).unwrap();
+                assert_eq!(c0.span, 0x200);
+                assert_eq!(
+                    c0.evidence,
+                    FirstHopCandidateEvidence::IdentityBoundedPointerWindow,
+                );
+                let c1 = cands.iter().find(|c| c.table_rva == 0x147868).unwrap();
+                assert_eq!(c1.span, 4 * 8);
+                assert_eq!(
+                    c1.evidence,
+                    FirstHopCandidateEvidence::VerifiedCountScaledExtent,
+                );
+            }
+            other => panic!("expected Resolved, got {other:?}"),
+        }
     }
 }
