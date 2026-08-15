@@ -734,6 +734,674 @@ pub struct DeclaredPointerSlot {
     pub provenance: SlotProvenance,
 }
 
+/// Structural pointer-declaration kind (R1 STRUCTURAL-POINTER-DECLARATION).
+///
+/// Each declared qword is classified with a kind and the evidence behind the
+/// classification. Kinds are mutually exclusive per slot; a slot is declared
+/// exactly once (dedup) or rejected as a conflict (fail-closed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DeclarationKind {
+    /// Pointer into a captured heap allocation, backed by structural evidence
+    /// (image-root slot / container triple / relocation root / live observation).
+    StructuredHeapPointer,
+    /// Pointer computed relative to a known runtime heap handle
+    /// (e.g. `GetProcessHeap` + offset) — interior-pointer class.
+    KnownRuntimeHandleRelativePointer,
+    /// Pointer into a known object field of a typed AHK object (field-offset
+    /// evidence from object layout).
+    KnownObjectFieldPointer,
+    /// Value in a loaded module's address range — module-relative candidate
+    /// (resolver work deferred to a later work order; never auto-resolved here).
+    ModuleRelativeCandidate,
+    /// AHK tagged scalar (type tag namespace + low data bits). Excluded from
+    /// the pointer set only with structural tag-encoding evidence.
+    TaggedScalar,
+    /// Small scalar (offset/count/sentinel) — excluded only with structural
+    /// evidence (non-aligned, no deref site, field context).
+    SmallScalar,
+    /// Inline UTF-16 text packed into a qword — excluded with shape evidence.
+    InlineText,
+    /// Allocator metadata (HEAP_ENTRY header / freelist link) — excluded only
+    /// with allocation-layout evidence.
+    AllocatorMetadata,
+    /// No structural evidence — MUST stay required (unknown_defaults_to_required).
+    Unknown,
+    /// Same physical slot declared again with identical value/kind/decision —
+    /// audited, merged (both sources retained in the ledger).
+    DuplicateSameSemantics,
+    /// Same physical slot declared with conflicting value/kind/decision —
+    /// terminal fail-closed.
+    DuplicateConflict,
+}
+
+impl DeclarationKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            DeclarationKind::StructuredHeapPointer => "structured_heap_pointer",
+            DeclarationKind::KnownRuntimeHandleRelativePointer => {
+                "known_runtime_handle_relative_pointer"
+            }
+            DeclarationKind::KnownObjectFieldPointer => "known_object_field_pointer",
+            DeclarationKind::ModuleRelativeCandidate => "module_relative_candidate",
+            DeclarationKind::TaggedScalar => "tagged_scalar",
+            DeclarationKind::SmallScalar => "small_scalar",
+            DeclarationKind::InlineText => "inline_text",
+            DeclarationKind::AllocatorMetadata => "allocator_metadata",
+            DeclarationKind::Unknown => "unknown",
+            DeclarationKind::DuplicateSameSemantics => "duplicate_same_semantics",
+            DeclarationKind::DuplicateConflict => "duplicate_conflict",
+        }
+    }
+
+    /// Whether this kind is a pointer that must enter the declared set.
+    pub fn is_declared_pointer(self) -> bool {
+        matches!(
+            self,
+            DeclarationKind::StructuredHeapPointer
+                | DeclarationKind::KnownRuntimeHandleRelativePointer
+                | DeclarationKind::KnownObjectFieldPointer
+                | DeclarationKind::ModuleRelativeCandidate
+                | DeclarationKind::Unknown
+        )
+    }
+
+    /// Whether this kind is a non-pointer exclusion backed by evidence.
+    pub fn is_evidence_excluded(self) -> bool {
+        matches!(
+            self,
+            DeclarationKind::TaggedScalar
+                | DeclarationKind::SmallScalar
+                | DeclarationKind::InlineText
+                | DeclarationKind::AllocatorMetadata
+        )
+    }
+}
+
+/// One auditable slot declaration record (R1 structural pipeline).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotDeclarationRecord {
+    /// Region identity (stable old base of the containing region).
+    pub region_old_base: u64,
+    /// Byte offset within the region payload.
+    pub offset: usize,
+    /// Raw 8-byte value at the slot.
+    pub raw_value: u64,
+    /// Declaration provenance (which structural source declared it).
+    pub provenance: SlotProvenance,
+    /// Declaration kind (mutually exclusive).
+    pub kind: DeclarationKind,
+    /// Human-readable declaration reason (evidence citation).
+    pub reason: String,
+    /// Confidence: high (structural), medium (heuristic+evidence), low (unknown).
+    pub confidence: &'static str,
+    /// Required decision: whether this slot must resolve (unknown → required).
+    pub required: bool,
+    /// Dedup status: none / merged-same-semantics / conflict.
+    pub dedup_status: &'static str,
+    /// Whether a duplicate-conflict was detected at this slot (terminal).
+    pub conflict: bool,
+    /// Source label of the scanning pass that produced this observation
+    /// (container_triple / heap_global / slab_blob).
+    pub source_label: &'static str,
+    /// Whether this observation carries structural provenance (container
+    /// triple / image-root global / graph child).
+    pub is_structural: bool,
+    /// True when this record is a non-structural observation (raw slab blob):
+    /// it never declares a pointer; it is preserved for audit.
+    pub observation_only: bool,
+    /// True when this slot's declaration resolved from a structural source.
+    pub resolved_structural: bool,
+}
+
+/// Result of the structural declaration pipeline.
+#[derive(Debug, Clone, Default)]
+pub struct SlotDeclarations {
+    /// Declared pointer slots (deduped, conflict-free) — the plan input.
+    pub declared: Vec<DeclaredPointerSlot>,
+    /// Full audit ledger: every scanned pointer-shaped qword + its record.
+    pub ledger: Vec<SlotDeclarationRecord>,
+    /// Classification counts by kind (for reports).
+    pub kind_counts: std::collections::BTreeMap<String, usize>,
+    /// Duplicate-same-semantics count (merged, audited).
+    pub duplicate_same_semantics: usize,
+    /// Duplicate-conflict count (terminal).
+    pub duplicate_conflict: usize,
+    /// Unknown-but-required count (kept).
+    pub unknown_required: usize,
+    /// True when any duplicate-conflict was detected (terminal fail-closed).
+    pub has_conflict: bool,
+    /// True structural conflicts: two+ STRUCTURAL declarations of the same
+    /// physical slot disagree on (value, kind, required). Non-structural
+    /// observations never contribute (they reconcile).
+    pub true_structural_conflict: usize,
+    /// Non-structural observation records preserved in the ledger (raw slab
+    /// blob observations; never declarations).
+    pub non_structural_observation: usize,
+    /// Physical slots whose declaration reconciled consistently from at
+    /// least one structural source (no true structural conflict). The
+    /// structural declaration itself resolved; final kind may still be
+    /// Unknown (threshold-only / membership-only under R2 rules) — the
+    /// counter proves the slot's declaration came from structural
+    /// provenance, never from a non-structural observation.
+    pub resolved_structural_declaration: usize,
+}
+
+/// Structural evidence helpers (never a bare numeric threshold).
+fn is_inline_utf16_shape(v: u64) -> bool {
+    fn ok(c: u16) -> bool {
+        c == 0
+            || c == b'_' as u16
+            || c == b'$' as u16
+            || c == b'@' as u16
+            || c == b'#' as u16
+            || c == b'-' as u16
+            || c == b'.' as u16
+            || (b'0' as u16..=b'9' as u16).contains(&c)
+            || (b'A' as u16..=b'Z' as u16).contains(&c)
+            || (b'a' as u16..=b'z' as u16).contains(&c)
+            || (0x80..=0xff).contains(&c)
+    }
+    let lo = (v & 0xffff) as u16;
+    let hi = ((v >> 16) & 0xffff) as u16;
+    let lo2 = ((v >> 32) & 0xffff) as u16;
+    let hi2 = ((v >> 48) & 0xffff) as u16;
+    let units = [lo, hi, lo2, hi2];
+    let nonzero = units.iter().filter(|&&c| c != 0).count();
+    nonzero >= 2 && units.iter().all(|&c| ok(c))
+}
+
+/// Tag-encoding structural evidence: value in the AHK tag namespace
+/// (>= 0x1_0000_0000) AND NOT inside any captured region AND NOT in the module
+/// range (those would make it a real pointer). The type-tag byte at
+/// `(v >> 32) & 0xff` encodes the AHK type; the low 32 bits are the small
+/// tag/data field. This is evidence ONLY when the value is provably outside
+/// every captured region and every module range (never a bare threshold).
+fn is_tag_encoded_shape(v: u64, in_captured: bool, in_module: bool) -> bool {
+    if v < 0x1_0000_0000 {
+        return false;
+    }
+    if in_captured || in_module {
+        // A value >= 0x1_0000_0000 inside a captured region or module range is
+        // a REAL pointer (region/module membership is the structural proof) —
+        // never excluded as a tag.
+        return false;
+    }
+    // Outside every captured region and module range: the high tag byte is the
+    // only type evidence left. Tag namespace with a small data field.
+    let lo32 = (v & 0xffff_ffff) as u32;
+    if v == 0xffff_ffff_ffff_ffff || v == 0x1_0000_0000 || lo32 <= 0x2000 {
+        return true;
+    }
+    // Compound tagged values (0x8_xxxx_xxxx with a larger offset field) — tag
+    // byte at (v>>32)&0xff in the AHK type-tag set with a non-pointer low field.
+    let tag_byte = (v >> 32) & 0xff;
+    // AHK tag bytes seen in the gto_launcher heap: 0x01..0x1f (primitive types),
+    // 0x60/0x68 (string/object tags), 0x80/0x88/0x90 (boxed variants), 0x30/0x38,
+    // 0x40/0x48, 0x50, 0x70..0x7f, 0xa0/0xa8, 0xb0/0xb8, 0xc0/0xc8, 0xd0/0xd8,
+    // 0xe0/0xe8, 0xf0/0xf8. Reject ONLY the pure-type-tag half (low 4 bits
+    // equal tag byte's low nibble or 0) as tagged_scalar; anything else stays
+    // Unknown (required).
+    let lo4 = lo32 & 0xf;
+    let tag_lo4 = (tag_byte as u32) & 0xf;
+    if tag_byte <= 0x1f && lo32 <= 0x2000 {
+        return true;
+    }
+    if (tag_byte & 0xf0) == 0x80 && lo4 == tag_lo4 {
+        // boxed-tag pattern 0x8X_xxxx_xxxx where low nibble mirrors the tag
+        // (e.g. 0x800000008, 0x800000006) — tag constant, not a pointer.
+        return true;
+    }
+    false
+}
+
+fn checked_region_end(region: usize, old_base: u64, size: usize) -> Result<u64, RebaseError> {
+    let size_u64 = u64::try_from(size).map_err(|_| RebaseError::Overflow {
+        region,
+        old_base,
+        size,
+    })?;
+    old_base.checked_add(size_u64).ok_or(RebaseError::Overflow {
+        region,
+        old_base,
+        size,
+    })
+}
+
+fn checked_slot_identity(region_base: u64, offset: usize) -> Result<u64, RebaseError> {
+    let offset_u64 = u64::try_from(offset).map_err(|_| RebaseError::SlotIdentityOverflow {
+        region_base,
+        offset,
+    })?;
+    region_base
+        .checked_add(offset_u64)
+        .ok_or(RebaseError::SlotIdentityOverflow {
+            region_base,
+            offset,
+        })
+}
+
+/// Structural pipeline: scan captured payloads, classify each pointer-shaped
+/// qword with evidence, dedupe (same-semantics merge / conflict fail-closed),
+/// and keep unknown required. No bare numeric-threshold exclusion.
+pub fn declare_pointer_slots_structural(
+    containers: &[ContainerSnapshot],
+    heap_globals: &[HeapGlobalSnapshot],
+    heap_slabs: &[HeapSlab],
+    enumerated_module_ranges: &[(u64, u64)],
+) -> SlotDeclarations {
+    // Compatibility wrapper for existing non-fallible callers. The fallible
+    // entry point below exposes arithmetic failures as RebaseError.
+    declare_pointer_slots_structural_checked(
+        containers,
+        heap_globals,
+        heap_slabs,
+        enumerated_module_ranges,
+    )
+    .unwrap_or_default()
+}
+
+fn declare_pointer_slots_structural_checked(
+    containers: &[ContainerSnapshot],
+    heap_globals: &[HeapGlobalSnapshot],
+    heap_slabs: &[HeapSlab],
+    enumerated_module_ranges: &[(u64, u64)],
+) -> Result<SlotDeclarations, RebaseError> {
+    // Round 2: verified enumerated module ranges (module base/end pairs from the
+    // live module enumeration). Values inside these have a verifiable module
+    // identity; values >= 0x7ff0_0000_0000 outside them are threshold-only and
+    // must remain unknown+required.
+    let module_ranges: Vec<(u64, u64)> = enumerated_module_ranges.to_vec();
+    // Region identity for slot VA computation. Span overflow is terminal: do
+    // not saturate to u64::MAX, which could make an invalid range appear valid.
+    let mut regions: Vec<(u64, u64)> = Vec::new(); // (old_base, end)
+    for c in containers {
+        let region = regions.len();
+        let end = checked_region_end(region, c.decoded_begin, c.heap_content.len())?;
+        regions.push((c.decoded_begin, end));
+    }
+    for g in heap_globals {
+        if g.is_heap_handle || g.content.is_empty() {
+            continue;
+        }
+        let region = regions.len();
+        let end = checked_region_end(region, g.live_ptr, g.content.len())?;
+        regions.push((g.live_ptr, end));
+    }
+    for s in heap_slabs {
+        if !s.content.is_empty() && s.old_base != 0 {
+            let region = regions.len();
+            let end = checked_region_end(region, s.old_base, s.content.len())?;
+            regions.push((s.old_base, end));
+        }
+    }
+    // Pointer-shaped sweep with STRUCTURAL PROVENANCE per qword. A qword is
+    // "structural" only when it comes from a known pointer schema:
+    //   - container triple (SecurityCookie begin/end/cap) — rva is a known root
+    //   - heap-global image root (rva non-zero, not handle/inline)
+    //   - heap-global graph child (extent_evidence / containing parent)
+    // A raw slab blob has NO per-field provenance — its qwords are never
+    // promoted to pointer kinds on membership alone (Round 2 semantic fix).
+    // scanned: (region_base, offset, value, has_structural_provenance, source_label)
+    let mut scanned: Vec<(u64, usize, u64, bool, &'static str)> = Vec::new();
+    let mut push = |old_base: u64, payload: &[u8], structural: bool, label: &'static str| {
+        let n = payload.len() / POINTER_WIDTH;
+        for i in 0..n {
+            let off = i * POINTER_WIDTH;
+            let val = u64::from_le_bytes(payload[off..off + 8].try_into().unwrap_or([0; 8]));
+            if val >= SMALL_TAG_CEILING && val <= 0x0000_7fff_ffff_ffff {
+                scanned.push((old_base, off, val, structural, label));
+            }
+        }
+    };
+    for c in containers {
+        // Container triple: the .data rva is a known pointer root (structural).
+        push(c.decoded_begin, &c.heap_content, true, "container_triple");
+    }
+    for g in heap_globals {
+        if g.is_heap_handle || g.content.is_empty() {
+            continue;
+        }
+        // Image-root slot (rva != 0) or graph child (extent_evidence) is
+        // structural; a bare probe window is not.
+        use crate::dumper::heap_global_snapshot::CapturePath;
+        let structural = g.rva != 0
+            || g.extent_evidence.containing_parent_old_base.is_some()
+            || g.extent_evidence.capture_path != CapturePath::MainSlot;
+        push(g.live_ptr, &g.content, structural, "heap_global");
+    }
+    for s in heap_slabs {
+        if !s.content.is_empty() && s.old_base != 0 {
+            // Raw slab blob: NO per-field provenance.
+            push(s.old_base, &s.content, false, "slab_blob");
+        }
+    }
+
+    // R3 PROVENANCE-CONFLICT RECONCILIATION
+    // (DECLARATION_PROVENANCE_CONFLICT_RECONCILIATION_1).
+    //
+    // R2 failed closed on the fresh reproduce (3,615 duplicate-conflicts)
+    // because the same physical slot was scanned by BOTH the raw slab blob
+    // (no per-field provenance -> unknown) and a heap-global root (structural
+    // provenance -> pointer kind), and ANY kind/value disagreement was treated
+    // as a terminal conflict. That is fail-closed but makes the declaration
+    // stage unable to progress.
+    //
+    // R3 distinguishes the source semantics mandated by the work order:
+    //
+    //   1. TRUE structural-vs-structural conflict — two+ structural
+    //      declarations of the same physical slot disagree on (value, kind,
+    //      required). TERMINAL fail-closed. Never merged, never last-wins,
+    //      never parent/child-prioritized.
+    //   2. Non-structural raw observation + structural declaration of the
+    //      same slot — NOT a semantic conflict. The raw slab blob is only an
+    //      OBSERVATION (it can never declare a pointer); the structural
+    //      declaration is authoritative. The observation is preserved in the
+    //      ledger (auditable) and the slot resolves to the structural kind.
+    //   3. parent/child graph synonym duplicates (same physical slot, same
+    //      value/kind/required, possibly different provenance) — merged,
+    //      every source retained in the ledger.
+    //   4. TRUE value/type conflict of the same physical slot (two structural
+    //      declarations disagree) — terminal fail-closed (covered by 1).
+    //
+    // No last-wins. No silent parent/child priority. No observation is ever
+    // dropped — every scanned qword becomes a ledger record.
+    let mut out = SlotDeclarations::default();
+    // Group by PHYSICAL SLOT VA (region_base + offset): the same physical slot
+    // may be scanned under different raw bases (parent slab + child object
+    // both cover it).
+    let mut by_slot: std::collections::BTreeMap<u64, Vec<SlotDeclarationRecord>> =
+        std::collections::BTreeMap::new();
+
+    for (region_base, off, val, structural, label) in scanned {
+        let slot_va = checked_slot_identity(region_base, off)?;
+        // Round 2 SEMANTIC FIX (retained): membership/threshold alone is NEVER
+        // pointer proof. A slot is declared a pointer kind ONLY when BOTH hold:
+        //   structural_provenance_present == true
+        //   target_membership_or_resolver_evidence == true
+        // Otherwise: unknown + required=true (never dropped, never optional).
+        let in_module = val >= 0x7ff0_0000_0000;
+        let inside = regions.iter().any(|&(b, e)| val >= b && val < e);
+        // threshold-only: value in module address space but NOT in any verified
+        // enumerated module range (no module identity / RVA / PE section).
+        let threshold_only = in_module && !module_ranges.iter().any(|&(b, e)| val >= b && val < e);
+        // verified module membership: inside an enumerated module range.
+        let verified_module = module_ranges.iter().any(|&(b, e)| val >= b && val < e);
+        // membership-only collision: inside a region/module but WITHOUT
+        // structural provenance -> unknown + required.
+        let membership_only = (inside || verified_module) && !structural;
+        let (kind, reason, confidence): (DeclarationKind, String, &'static str) = if membership_only
+        {
+            (
+                    DeclarationKind::Unknown,
+                    format!(
+                        "value {val:#x} has region/module membership but NO structural provenance                          (source {label}) — membership-only collision; unknown + required"
+                    ),
+                    "low",
+                )
+        } else if structural && inside {
+            (
+                    DeclarationKind::StructuredHeapPointer,
+                    format!(
+                        "value {val:#x} inside captured region span AND slot has structural                          provenance (source {label}) — interior heap pointer"
+                    ),
+                    "medium",
+                )
+        } else if structural && verified_module {
+            (
+                    DeclarationKind::ModuleRelativeCandidate,
+                    format!(
+                        "value {val:#x} inside verified enumerated module range AND slot has                          structural provenance (source {label}) — module-relative candidate;                          resolver deferred to later work order"
+                    ),
+                    "medium",
+                )
+        } else if threshold_only {
+            (
+                    DeclarationKind::Unknown,
+                    format!(
+                        "value {val:#x} in module address space (>= 0x7ff0_0000_0000) but NOT in                          any verified enumerated module range — threshold-only; unknown + required                          (numeric_threshold_only is prohibited as a classification)"
+                    ),
+                    "low",
+                )
+        } else if is_inline_utf16_shape(val) {
+            (
+                    DeclarationKind::InlineText,
+                    format!(
+                        "value {val:#x} matches inline UTF-16 shape (2+ ASCII/latin-1 u16 lanes)                          AND is outside every captured region/module — text payload, not a pointer"
+                    ),
+                    "high",
+                )
+        } else if is_tag_encoded_shape(val, false, false) {
+            (
+                    DeclarationKind::TaggedScalar,
+                    format!(
+                        "value {val:#x} matches AHK tagged-scalar encoding (tag namespace >= 0x1_0000_0000,                          outside every captured region and module range, type-tag byte at (v>>32)&0xff);                          type-tag evidence, not a pointer"
+                    ),
+                    "high",
+                )
+        } else if val < 0x100_0000 {
+            // Small value: exclusion requires NON-alignment (a canonical
+            // pointer target must be 8-aligned) OR a non-pointer field
+            // context. Aligned small values remain Unknown (required).
+            if (val & 0x7) != 0 {
+                (
+                        DeclarationKind::SmallScalar,
+                        format!(
+                            "value {val:#x} < 0x1000000 AND not 8-aligned — offset/count/sentinel                              shape; not a canonical pointer target"
+                        ),
+                        "high",
+                    )
+            } else {
+                (
+                        DeclarationKind::Unknown,
+                        format!(
+                            "value {val:#x} < 0x1000000 but 8-aligned — no structural evidence to                              exclude; kept required (unknown_defaults_to_required)"
+                        ),
+                        "low",
+                    )
+            }
+        } else {
+            (
+                    DeclarationKind::Unknown,
+                    format!(
+                        "value {val:#x} >= 0x1000000, not in module range, not in captured                          region — no structural evidence; kept required"
+                    ),
+                    "low",
+                )
+        };
+
+        let required = kind.is_declared_pointer();
+        // R3: a non-structural source (raw slab blob) is an OBSERVATION ONLY —
+        // it can never declare a pointer kind; its record is preserved for
+        // audit and reconciles into a structural declaration when one exists.
+        let observation_only = !structural;
+        by_slot
+            .entry(slot_va)
+            .or_default()
+            .push(SlotDeclarationRecord {
+                region_old_base: region_base,
+                offset: off,
+                raw_value: val,
+                provenance: SlotProvenance::CaptureDescriptor,
+                kind,
+                reason,
+                confidence,
+                required,
+                dedup_status: if observation_only {
+                    "observation_only"
+                } else {
+                    "none"
+                },
+                conflict: false,
+                source_label: label,
+                is_structural: structural,
+                observation_only,
+                resolved_structural: false,
+            });
+    }
+
+    // ---- Reconcile each physical slot ----
+    for (_, recs) in by_slot.iter_mut() {
+        let n_struct = recs.iter().filter(|r| r.is_structural).count();
+        let n_obs = recs.iter().filter(|r| r.observation_only).count();
+        if n_struct == 0 {
+            // No structural provenance: every record is a non-structural
+            // observation. Preserve all of them; the slot stays required
+            // (fail-closed) unless EVERY observation is an evidence-based
+            // exclusion. If any observation lacks exclusion evidence the
+            // slot keeps unknown + required (uncertainty resolves to
+            // required, never to a dropped slot).
+            out.non_structural_observation += n_obs;
+            let any_unknown_required = recs
+                .iter()
+                .any(|r| r.kind == DeclarationKind::Unknown && r.required);
+            if any_unknown_required {
+                out.unknown_required += 1;
+                out.declared.push(DeclaredPointerSlot {
+                    region_old_base: recs[0].region_old_base,
+                    offset: recs[0].offset,
+                    provenance: recs[0].provenance,
+                });
+            }
+            for r in recs.iter_mut() {
+                r.dedup_status = "observation_only";
+            }
+            continue;
+        }
+        // At least one structural declaration. All structural records must
+        // agree on (value, kind, required); disagreement is a TRUE structural
+        // conflict (terminal fail-closed).
+        let first_si = recs.iter().position(|r| r.is_structural).unwrap();
+        let (f_val, f_kind, f_req) = {
+            let f = &recs[first_si];
+            (f.raw_value, f.kind, f.required)
+        };
+        let mut conflict = false;
+        for r in recs.iter() {
+            if r.is_structural && (r.raw_value != f_val || r.kind != f_kind || r.required != f_req)
+            {
+                conflict = true;
+                break;
+            }
+        }
+        out.non_structural_observation += n_obs;
+        if conflict {
+            // TRUE structural conflict — terminal. No last-wins, no
+            // parent/child priority, no merging. Observations are preserved
+            // and marked; the slot is NOT declared.
+            out.true_structural_conflict += 1;
+            out.duplicate_conflict += 1;
+            out.has_conflict = true;
+            for r in recs.iter_mut() {
+                r.conflict = true;
+                r.dedup_status = if r.is_structural {
+                    "duplicate_conflict"
+                } else {
+                    "observation_only"
+                };
+            }
+            continue;
+        }
+        // Consistent structural declaration: resolved.
+        out.resolved_structural_declaration += 1;
+        // A structural source that classifies Unknown (threshold-only /
+        // membership-only under R2 rules) still counts as unknown+required.
+        if f_kind == DeclarationKind::Unknown && f_req {
+            out.unknown_required += 1;
+        }
+        // Structural records merge (same semantics); count merge events.
+        let merges = recs
+            .iter()
+            .filter(|r| r.is_structural)
+            .count()
+            .saturating_sub(1);
+        out.duplicate_same_semantics += merges;
+        if f_req {
+            out.declared.push(DeclaredPointerSlot {
+                region_old_base: recs[first_si].region_old_base,
+                offset: recs[first_si].offset,
+                provenance: recs[first_si].provenance,
+            });
+        }
+        let mut first_structural_seen = false;
+        for r in recs.iter_mut() {
+            if r.is_structural {
+                if !first_structural_seen {
+                    // The canonical structural declaration — dedup_status none.
+                    first_structural_seen = true;
+                    r.dedup_status = "none";
+                } else {
+                    let same = r.raw_value == f_val && r.kind == f_kind && r.required == f_req;
+                    r.dedup_status = if same {
+                        "duplicate_same_semantics"
+                    } else {
+                        "duplicate_conflict"
+                    };
+                }
+            } else {
+                r.dedup_status = "observation_only";
+            }
+            r.resolved_structural = true;
+        }
+    }
+
+    // Flatten the per-slot ledger into the audit ledger deterministically:
+    // by_slot iterates in physical-slot-VA order (BTreeMap) and records within
+    // a slot keep scan order — fully deterministic.
+    for (_, recs) in by_slot {
+        for r in recs {
+            out.ledger.push(r);
+        }
+    }
+
+    // Counts.
+    for rec in &out.ledger {
+        *out.kind_counts
+            .entry(rec.kind.label().to_string())
+            .or_insert(0) += 1;
+    }
+    Ok(out)
+}
+
+/// Legacy entry point (unchanged signature, all callers/tests keep compiling):
+/// now delegates to the structural pipeline and returns the declared slots.
+pub fn declared_slots_from_capture(
+    containers: &[ContainerSnapshot],
+    heap_globals: &[HeapGlobalSnapshot],
+    heap_slabs: &[HeapSlab],
+) -> Vec<DeclaredPointerSlot> {
+    // Legacy wrapper: no verified module ranges -> every in-module-space value
+    // is threshold-only -> unknown+required (safe default, fail-closed).
+    declare_pointer_slots_structural(containers, heap_globals, heap_slabs, &[]).declared
+}
+
+/// Fallible structural declaration: returns the declared slots + audit, and
+/// FAILS CLOSED when any TRUE STRUCTURAL conflict (two+ structural
+/// declarations of the same physical slot disagree on value/kind/required) is
+/// detected. Non-structural raw observations never conflict: they reconcile
+/// into the structural declaration (when present) or stay unknown+required
+/// (when absent). No implicit last-wins, no parent/child priority, no silent
+/// observation drop.
+pub fn declare_pointer_slots_fallible(
+    containers: &[ContainerSnapshot],
+    heap_globals: &[HeapGlobalSnapshot],
+    heap_slabs: &[HeapSlab],
+    enumerated_module_ranges: &[(u64, u64)],
+) -> Result<SlotDeclarations, RebaseError> {
+    let decl = declare_pointer_slots_structural_checked(
+        containers,
+        heap_globals,
+        heap_slabs,
+        enumerated_module_ranges,
+    )?;
+    if decl.has_conflict {
+        return Err(RebaseError::Plan(format!(
+            "true structural conflict in pointer declaration: {} conflicting slot(s);              two or more STRUCTURAL declarations of the same physical slot disagree on              value/kind/required — terminal fail-closed (non-structural observations are              reconciled, not counted)",
+            decl.true_structural_conflict
+        )));
+    }
+    Ok(decl)
+}
+
 /// Table of external resolvers used to classify [`PointerClassification::ExternalModule`]
 /// pointers. A pointer is only *resolved* when an entry here matches it.
 ///
@@ -827,62 +1495,6 @@ pub fn attribute_external(
         }
     }
     None
-}
-
-/// Derive declared pointer slots from the captured allocation set using an
-/// explicit capture descriptor.
-///
-/// For each captured payload, every aligned qword whose value is a canonical
-/// user-mode pointer (≥ small-tag ceiling) is declared with
-/// [`SlotProvenance::CaptureDescriptor`] provenance. This is the descriptor
-/// that turns a captured allocation's interior pointer fields into patchable
-/// slots. Non-pointer-shaped qwords (0, tags, high junk) are not declared.
-///
-/// This is the provenance source for the dump path: without it the plan has no
-/// interior fixups. Callers that have richer per-slot descriptors (container
-/// triple schema, relocation root ledger, live observation) should pass those
-/// explicitly instead and keep this as the conservative fallback.
-pub fn declared_slots_from_capture(
-    containers: &[ContainerSnapshot],
-    heap_globals: &[HeapGlobalSnapshot],
-    heap_slabs: &[HeapSlab],
-) -> Vec<DeclaredPointerSlot> {
-    let mut out = Vec::new();
-    let mut push_slots = |old_base: u64, payload: &[u8]| {
-        let slot_count = payload.len() / POINTER_WIDTH;
-        for slot in 0..slot_count {
-            let off = slot * POINTER_WIDTH;
-            let val = u64::from_le_bytes(
-                payload[off..off + POINTER_WIDTH]
-                    .try_into()
-                    .unwrap_or([0; 8]),
-            );
-            // Pointer-shaped only: non-zero, above small-tag ceiling, canonical user VA.
-            if val >= SMALL_TAG_CEILING && val <= 0x0000_7fff_ffff_ffff {
-                out.push(DeclaredPointerSlot {
-                    region_old_base: old_base,
-                    offset: off,
-                    provenance: SlotProvenance::CaptureDescriptor,
-                });
-            }
-        }
-    };
-    for c in containers {
-        push_slots(c.decoded_begin, &c.heap_content);
-    }
-    for g in heap_globals {
-        if g.is_heap_handle || g.content.is_empty() {
-            continue;
-        }
-        push_slots(g.live_ptr, &g.content);
-    }
-    // Route T R0-B: declared slots come from EVERY authoritative slab.
-    for slab in heap_slabs {
-        if !slab.content.is_empty() && slab.old_base != 0 {
-            push_slots(slab.old_base, &slab.content);
-        }
-    }
-    out
 }
 
 /// Build an external resolver table from the rebuilt import thunks.
@@ -1786,6 +2398,173 @@ fn plan_digest(plan: &RuntimeRebasePlan) -> String {
     d.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Research-only diagnostic (R1 HEAP-REGION-REBASE): describe the first
+/// unresolved-required declared pointer with full source-region identity and a
+/// geometric gap analysis against every captured region, the old image span,
+/// and the external/module ceiling. This is pure diagnostic — it never changes
+/// which pointers are declared, required, or rejected, and the fail-closed
+/// error path is byte-identical up to this suffix.
+fn describe_unresolved_pointer(
+    plan: &RuntimeRebasePlan,
+    p: &RebasePointer,
+    old_image_base: u64,
+) -> String {
+    let region = plan.regions.get(p.source_region);
+    let region_desc = match region {
+        Some(r) => format!(
+            "region[{}] kind={} old_base={:#x} size={:#x} rva={:?} provenance={:?} extent={:?} ownership={:?}",
+            r.id,
+            r.kind,
+            r.old_base,
+            r.size,
+            r.image_inline_rva,
+            r.provenance,
+            r.extent_kind,
+            r.ownership,
+        ),
+        None => "region[?] (out of range)".to_string(),
+    };
+    // Geometric gap analysis of the raw value against every captured region.
+    let mut gap: Vec<String> = Vec::new();
+    for r in &plan.regions {
+        let Some(end) = r.old_base.checked_add(r.size as u64) else {
+            continue;
+        };
+        if p.original_value >= r.old_base && p.original_value < end {
+            gap.push(format!(
+                "inside region {} [old_base {:#x}..{:#x})",
+                r.id, r.old_base, end
+            ));
+            continue;
+        }
+        // distance to nearest edge
+        let dist = if p.original_value < r.old_base {
+            r.old_base - p.original_value
+        } else {
+            p.original_value - end
+        };
+        gap.push(format!(
+            "gap {:#x} to region {} [old_base {:#x}..{:#x})",
+            dist, r.id, r.old_base, end
+        ));
+    }
+    let image_span = 0x1_0000_0000u64;
+    let old_img_end = old_image_base.saturating_add(image_span);
+    format!(
+        "declared pointer ({}, source {} @ {:#x}) is unresolved-required; raw_value={:#x}; old_image_base={:#x} image_span_end={:#x}; in_old_image={}; region_analysis=[{}]",
+        p.classification.label(),
+        region_desc,
+        p.source_offset,
+        p.original_value,
+        old_image_base,
+        old_img_end,
+        p.original_value >= old_image_base && p.original_value < old_img_end,
+        gap.join("; "),
+    )
+}
+
+/// Research-only (R1 HEAP-REGION-REBASE): write the FULL plan (regions +
+/// declared pointers + unresolved-required subset + aliases) as JSON to the
+/// path in env MIDA_GTO_RESEARCH_PLAN_OUT, when set. Pure diagnostic — never
+/// changes plan semantics; fires before the fail-closed validation error.
+fn dump_plan_research_json(plan: &RuntimeRebasePlan) {
+    let Some(out_path) = std::env::var_os("MIDA_GTO_RESEARCH_PLAN_OUT") else {
+        return;
+    };
+    fn js_escape(s: &str) -> String {
+        let mut o = String::with_capacity(s.len() + 8);
+        for c in s.chars() {
+            match c {
+                '"' => o.push_str("\\\""),
+                '\\' => o.push_str("\\\\"),
+                '\n' => o.push_str("\\n"),
+                '\r' => o.push_str("\\r"),
+                '\t' => o.push_str("\\t"),
+                c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+                c => o.push(c),
+            }
+        }
+        o
+    }
+    fn q(s: &str) -> String {
+        format!("\"{}\"", js_escape(s))
+    }
+    let mut body = String::new();
+    body.push_str("{\n");
+    body.push_str(&format!(
+        "  \"old_image_base\": \"{:#x}\",\n",
+        plan.old_image_base
+    ));
+    body.push_str(&format!(
+        "  \"new_image_base\": \"{:#x}\",\n",
+        plan.new_image_base
+    ));
+    body.push_str(&format!("  \"region_count\": {},\n", plan.regions.len()));
+    body.push_str(&format!("  \"pointer_count\": {},\n", plan.pointers.len()));
+    // regions
+    body.push_str("  \"regions\": [\n");
+    for (i, r) in plan.regions.iter().enumerate() {
+        let comma = if i + 1 < plan.regions.len() { "," } else { "" };
+        body.push_str(&format!(
+            "    {{\"id\": {}, \"kind\": {}, \"old_base\": \"{:#x}\", \"size\": {}, \"rva\": {}, \"provenance\": {}, \"extent\": {}, \"ownership\": {}, \"image_inline_rva\": {}, \"required\": {}}}{}\n",
+            r.id,
+            q(&r.kind.to_string()),
+            r.old_base,
+            r.size,
+            match r.image_inline_rva { Some(v) => format!("\"{:#x}\"", v), None => "null".to_string() },
+            q(&format!("{:?}", r.provenance)),
+            q(&format!("{:?}", r.extent_kind)),
+            q(&format!("{:?}", r.ownership)),
+            match r.image_inline_rva { Some(_) => "\"inline\"".to_string(), None => "null".to_string() },
+            r.required,
+            comma
+        ));
+    }
+    body.push_str("  ],\n");
+    // pointers (declared, sorted) — include classification + target + value
+    body.push_str("  \"pointers\": [\n");
+    for (i, p) in plan.pointers.iter().enumerate() {
+        let comma = if i + 1 < plan.pointers.len() { "," } else { "" };
+        body.push_str(&format!(
+            "    {{\"source_region\": {}, \"source_offset\": \"{:#x}\", \"original_value\": \"{:#x}\", \"classification\": {}, \"target_region\": {}, \"target_offset\": {}, \"provenance\": {}}}{}\n",
+            p.source_region,
+            p.source_offset,
+            p.original_value,
+            q(p.classification.label()),
+            match p.target_region { Some(t) => t.to_string(), None => "null".to_string() },
+            match p.target_offset { Some(t) => format!("\"{:#x}\"", t), None => "null".to_string() },
+            q(p.provenance.label()),
+            comma
+        ));
+    }
+    body.push_str("  ],\n");
+    // unresolved-required subset
+    body.push_str("  \"unresolved_required\": [\n");
+    let un: Vec<&RebasePointer> = plan
+        .pointers
+        .iter()
+        .filter(|p| p.classification.is_unresolved_required())
+        .collect();
+    for (i, p) in un.iter().enumerate() {
+        let comma = if i + 1 < un.len() { "," } else { "" };
+        body.push_str(&format!(
+            "    {{\"source_region\": {}, \"source_offset\": \"{:#x}\", \"original_value\": \"{:#x}\", \"classification\": {}}}{}\n",
+            p.source_region,
+            p.source_offset,
+            p.original_value,
+            q(p.classification.label()),
+            comma
+        ));
+    }
+    body.push_str("  ]\n");
+    body.push_str("}\n");
+    if let Err(e) = std::fs::write(&out_path, body.as_bytes()) {
+        tracing::warn!(err = %e, path = ?out_path, "research plan dump write failed");
+    } else {
+        tracing::info!(path = ?out_path, "research plan dump written (diagnostic only)");
+    }
+}
+
 /// Validate the plan structurally (offline, before write).
 ///
 /// Returns a human-readable failure message when the plan cannot be emitted as
@@ -1931,12 +2710,19 @@ pub fn validate_runtime_rebase_plan(plan: &RuntimeRebasePlan) -> Result<(), Reba
             PointerClassification::ExternalCandidate
             | PointerClassification::Unmapped
             | PointerClassification::Ambiguous => {
-                return Err(RebaseError::Plan(format!(
+                // R1 research: keep the original fail-closed message prefix and
+                // append the research-only diagnostic (region identity, raw
+                // value, gap geometry). Validator semantics unchanged — the
+                // plan still fails closed on this pointer.
+                let base = format!(
                     "declared pointer ({}, region {} @ {:#x}) is unresolved-required",
                     p.classification.label(),
                     p.source_region,
                     p.source_offset
-                )));
+                );
+                let detail = describe_unresolved_pointer(plan, p, plan.old_image_base);
+                dump_plan_research_json(plan);
+                return Err(RebaseError::Plan(format!("{base}; {detail}")));
             }
             PointerClassification::Null | PointerClassification::SmallIntegerOrTag => {}
         }
@@ -2410,6 +3196,8 @@ pub enum RebaseError {
     },
     /// A pointer slot read/write was out of bounds.
     Slot(usize, usize),
+    /// Computing a physical slot identity (`region_base + offset`) overflowed.
+    SlotIdentityOverflow { region_base: u64, offset: usize },
     /// A region has zero size.
     EmptyRegion(usize),
     /// A region is invalid (message).
@@ -2482,7 +3270,14 @@ impl fmt::Display for RebaseError {
                 coalescing_allowed,
                 rejection_reason
             ),
-            RebaseError::Slot(r, o) => write!(f, "rebase pointer slot out of bounds (region {r} @ {o:#x})"),
+            RebaseError::Slot(r, o) => write!(
+                f,
+                "rebase pointer slot out of bounds (region {r} @ {o:#x})",
+            ),
+            RebaseError::SlotIdentityOverflow { region_base, offset } => write!(
+                f,
+                "rebase pointer slot identity overflow (region base {region_base:#x} offset {offset:#x})",
+            ),
             RebaseError::EmptyRegion(r) => write!(f, "rebase region {r} has zero size"),
             RebaseError::Region(r, m) => write!(f, "rebase region {r}: {m}"),
             RebaseError::Alignment(r, v, a) => {
@@ -2643,7 +3438,9 @@ pub fn finalize_summary_after_install(
 
 #[cfg(test)]
 mod tests {
-    use super::super::heap_global_snapshot::{CaptureExtentEvidence, CaptureExtentKind};
+    use super::super::heap_global_snapshot::{
+        CaptureExtentEvidence, CaptureExtentKind, CapturePath,
+    };
     use super::*;
 
     fn container(rva: u32, begin: u64, end: u64, cap: u64, content: Vec<u8>) -> ContainerSnapshot {
@@ -5235,5 +6032,622 @@ mod tests {
             }
             other => panic!("expected ProbeCoverageMissing, got {other:?}"),
         }
+    }
+
+    // ============ R1 STRUCTURAL-POINTER-DECLARATION regression tests ============
+
+    /// Build a slab region with a set of (offset, value) qwords.
+    fn slab_with(base: u64, pairs: &[(usize, u64)]) -> HeapSlab {
+        let mut content = vec![0u8; 0x1000];
+        for &(off, v) in pairs {
+            content[off..off + 8].copy_from_slice(&v.to_le_bytes());
+        }
+        HeapSlab {
+            old_base: base,
+            content,
+        }
+    }
+
+    #[test]
+    fn r1_inline_utf16_not_declared_as_pointer() {
+        // gscript inline UTF-16 qword 0x7000740074 = "t.t.p" — must NOT be declared.
+        let slab = slab_with(0x960150, &[(0x78, 0x7000_7400_74)]);
+        let decl = declare_pointer_slots_structural(&[], &[], &[slab], &[]);
+        assert_eq!(decl.declared.len(), 0, "inline UTF-16 must not be declared");
+        assert_eq!(decl.kind_counts.get("inline_text"), Some(&1));
+        // Unknown stays required elsewhere.
+        assert_eq!(decl.unknown_required, 0);
+        assert!(!decl.has_conflict);
+    }
+
+    #[test]
+    fn r1_tagged_scalar_not_declared_with_structural_evidence() {
+        // AHK tag values observed in the gto_launcher heap (0x1_0000_0000 + n,
+        // 0x8_0000_0008 boxed-tag mirror) — tag-encoded evidence, outside any
+        // captured region or module range.
+        let slab = slab_with(
+            0x960150,
+            &[
+                (0x0, 0x1_0000_0000),
+                (0x8, 0x1_0000_0001),
+                (0x10, 0x8_0000_0008),
+            ],
+        );
+        let decl = declare_pointer_slots_structural(&[], &[], &[slab], &[]);
+        assert_eq!(
+            decl.declared.len(),
+            0,
+            "tagged scalars must not be declared"
+        );
+        assert_eq!(decl.kind_counts.get("tagged_scalar"), Some(&3));
+    }
+
+    #[test]
+    fn r1_small_scalar_not_declared_with_structural_evidence() {
+        // Non-8-aligned small values are offsets/counts (0x20000 shape is aligned,
+        // so it stays Unknown/required; the unaligned ones are excluded).
+        let slab = slab_with(
+            0x960150,
+            &[
+                (0x20, 0x9620_21),
+                (0x28, 0x9626_31),
+                (0x30, 0x965a_81),
+                (0x38, 0x96a2_65),
+            ],
+        );
+        let decl = declare_pointer_slots_structural(&[], &[], &[slab], &[]);
+        assert_eq!(
+            decl.declared.len(),
+            0,
+            "unaligned small scalars must not be declared"
+        );
+        assert_eq!(decl.kind_counts.get("small_scalar"), Some(&4));
+    }
+
+    #[test]
+    fn r1_unknown_slot_fails_closed_and_stays_required() {
+        // An aligned small value with no structural evidence stays Unknown + required.
+        let slab = slab_with(0x960150, &[(0x40, 0x20000), (0x48, 0xc9000)]);
+        let decl = declare_pointer_slots_structural(&[], &[], &[slab], &[]);
+        assert_eq!(
+            decl.declared.len(),
+            2,
+            "unknown slots stay declared (required)"
+        );
+        assert_eq!(decl.unknown_required, 2);
+        assert_eq!(decl.kind_counts.get("unknown"), Some(&2));
+    }
+
+    #[test]
+    fn r1_module_relative_candidate_declared() {
+        // R2 semantic: module-relative candidate requires structural provenance
+        // (image-root global) + verified module range. Without provenance it is
+        // threshold-only -> unknown+required (see r2_threshold_only_high_value).
+        let mut content = vec![0u8; 0x2000];
+        content[0x178..0x180].copy_from_slice(&0x7ffd_4749_3070u64.to_le_bytes());
+        let g = global(0x149d50, 0x960150, content, false);
+        let ranges = vec![(0x7ffd_4740_0000u64, 0x7ffd_4752_6000u64)]; // ntdll-like
+        let decl = declare_pointer_slots_structural(&[], &[g], &[], &ranges);
+        assert_eq!(decl.declared.len(), 1);
+        assert_eq!(decl.kind_counts.get("module_relative_candidate"), Some(&1));
+        assert!(decl.ledger[0].required);
+    }
+
+    #[test]
+    fn r1_structured_heap_pointer_declared() {
+        // Value inside a captured region span (0x970000 is within
+        // [0x960150, 0x961150+...] if the region were that large): use a slab
+        // whose span covers the interior target. Here the slab is 0x960150 with
+        // content 0x2000, so 0x961150 is interior.
+        let mut content = vec![0u8; 0x2000];
+        content[0x100..0x108].copy_from_slice(&0x9611_50u64.to_le_bytes());
+        let g = global(0x149d50, 0x960150, content, false);
+        let decl = declare_pointer_slots_structural(&[], &[g], &[], &[]);
+        assert_eq!(decl.declared.len(), 1);
+        assert_eq!(decl.kind_counts.get("structured_heap_pointer"), Some(&1));
+    }
+
+    #[test]
+    fn r1_duplicate_same_semantics_merged_and_audited() {
+        // Same physical slot VA (0x960150+0x28 = 0x960178) scanned from TWO
+        // STRUCTURAL sources (two heap-global image roots covering the slot)
+        // with identical value/kind/required: synonym duplicates merge and
+        // every source is retained in the ledger. (R3: the old slab-blob
+        // duplicate is now an observation that reconciles — see
+        // r3_raw_observation_plus_structural_pointer_same_slot.)
+        let a = global(
+            0x1000,
+            0x960178,
+            0x7ffd_4749_3070u64.to_le_bytes().to_vec(),
+            false,
+        );
+        let b = global(
+            0x1000,
+            0x960178,
+            0x7ffd_4749_3070u64.to_le_bytes().to_vec(),
+            false,
+        );
+        let decl = declare_pointer_slots_structural(&[], &[a, b], &[], &[]);
+        assert_eq!(decl.declared.len(), 1, "same physical slot merged");
+        assert_eq!(decl.duplicate_same_semantics, 1);
+        assert!(!decl.has_conflict);
+        assert_eq!(decl.resolved_structural_declaration, 1);
+        assert_eq!(decl.non_structural_observation, 0);
+        assert_eq!(
+            decl.kind_counts.get("duplicate_same_semantics"),
+            None,
+            "merged records keep their kind; dedup_status carries the merge event"
+        );
+        let structural_recs: Vec<&SlotDeclarationRecord> =
+            decl.ledger.iter().filter(|r| r.is_structural).collect();
+        assert_eq!(
+            structural_recs.len(),
+            2,
+            "both structural sources retained in ledger"
+        );
+        assert_eq!(
+            structural_recs[0].dedup_status, "none",
+            "canonical structural declaration"
+        );
+        assert_eq!(
+            structural_recs[1].dedup_status, "duplicate_same_semantics",
+            "synonym duplicate merged"
+        );
+    }
+
+    #[test]
+    fn r1_duplicate_conflict_fails_closed() {
+        // Same physical slot VA with DIFFERENT values from TWO STRUCTURAL
+        // sources → TRUE structural conflict → fail-closed (R3 semantics:
+        // raw-vs-structural disagreement is no longer a conflict — see
+        // r3_raw_observation_plus_structural_pointer_same_slot).
+        let a = global(
+            0x1000,
+            0x960178,
+            0x7ffd_4749_3070u64.to_le_bytes().to_vec(),
+            false,
+        );
+        let b = global(
+            0x1000,
+            0x960178,
+            0x7ffd_4749_4000u64.to_le_bytes().to_vec(),
+            false,
+        );
+        let decl = declare_pointer_slots_structural(&[], &[a.clone(), b.clone()], &[], &[]);
+        assert!(decl.has_conflict, "conflicting duplicate must be flagged");
+        assert_eq!(decl.duplicate_conflict, 1);
+        assert_eq!(decl.true_structural_conflict, 1);
+        let err = declare_pointer_slots_fallible(&[], &[a, b], &[], &[]).unwrap_err();
+        assert!(
+            matches!(err, RebaseError::Plan(_)),
+            "fallible declaration must fail closed on true structural conflict"
+        );
+    }
+
+    #[test]
+    fn r1_unknown_defaults_to_required_fallible_ok() {
+        // Unknown slots are allowed through fallible (they stay required) — no conflict.
+        let slab = slab_with(0x960150, &[(0x48, 0x20000)]);
+        let decl = declare_pointer_slots_fallible(&[], &[], &[slab], &[]).unwrap();
+        assert_eq!(decl.declared.len(), 1);
+        assert_eq!(decl.unknown_required, 1);
+    }
+
+    // ============ R2 SEMANTIC CORRECTION tests ============
+    // Round 2: membership/threshold alone is NEVER pointer proof.
+
+    #[test]
+    fn r2_in_region_scalar_collision() {
+        // A scalar whose value numerically falls inside a captured region, from a
+        // NON-structural source (raw slab blob). Must be unknown+required, NOT
+        // structured_heap_pointer (membership-only).
+        let mut content = vec![0u8; 0x2000];
+        // region span [0x960150, 0x961150); put a scalar 0x960200 (inside region)
+        // at offset 0x100 of the slab.
+        content[0x100..0x108].copy_from_slice(&0x9602_00u64.to_le_bytes());
+        let slab = HeapSlab {
+            old_base: 0x960150,
+            content,
+        };
+        let decl = declare_pointer_slots_structural(&[], &[], &[slab], &[]);
+        // slab blob = no structural provenance -> unknown+required
+        let rec = decl
+            .ledger
+            .iter()
+            .find(|r| r.raw_value == 0x960200)
+            .expect("scanned");
+        assert_eq!(
+            rec.kind,
+            DeclarationKind::Unknown,
+            "membership-only collision must be unknown"
+        );
+        assert!(rec.required, "unknown must stay required");
+        assert!(!rec.conflict);
+        assert_eq!(
+            decl.kind_counts.get("structured_heap_pointer"),
+            None,
+            "no false structured declaration"
+        );
+    }
+
+    #[test]
+    fn r2_in_module_scalar_collision() {
+        // A scalar whose value lands inside a verified module range, from a
+        // NON-structural source. Must be unknown+required, NOT module_relative_candidate.
+        let mut content = vec![0u8; 0x2000];
+        // kernel32-like range [0x7ffd44ff0000, 0x7ffd450b9000); value at base+0x1000.
+        content[0x100..0x108].copy_from_slice(&0x7ffd_44ff_1000u64.to_le_bytes());
+        let slab = HeapSlab {
+            old_base: 0x960150,
+            content,
+        };
+        let ranges = vec![(0x7ffd_44ff_0000u64, 0x7ffd_450b_9000u64)];
+        let decl = declare_pointer_slots_structural(&[], &[], &[slab], &ranges);
+        let rec = decl
+            .ledger
+            .iter()
+            .find(|r| r.raw_value == 0x7ffd_44ff_1000)
+            .expect("scanned");
+        assert_eq!(
+            rec.kind,
+            DeclarationKind::Unknown,
+            "module membership without provenance must be unknown"
+        );
+        assert!(rec.required);
+        assert_eq!(
+            decl.kind_counts.get("module_relative_candidate"),
+            None,
+            "no false module-relative declaration"
+        );
+    }
+
+    #[test]
+    fn r2_threshold_only_high_value() {
+        // High value >= 0x7ff0_0000_0000 but NOT in any verified module range:
+        // threshold-only -> unknown+required (never module_relative_candidate).
+        let mut content = vec![0u8; 0x2000];
+        content[0x100..0x108].copy_from_slice(&0x7ffd_ffff_0000u64.to_le_bytes());
+        let slab = HeapSlab {
+            old_base: 0x960150,
+            content,
+        };
+        let decl = declare_pointer_slots_structural(&[], &[], &[slab], &[]);
+        let rec = decl
+            .ledger
+            .iter()
+            .find(|r| r.raw_value == 0x7ffd_ffff_0000)
+            .expect("scanned");
+        assert_eq!(
+            rec.kind,
+            DeclarationKind::Unknown,
+            "threshold-only must be unknown"
+        );
+        assert!(rec.required);
+        assert_eq!(decl.kind_counts.get("module_relative_candidate"), None);
+    }
+
+    #[test]
+    fn r2_threshold_only_low_value() {
+        // A value with NO provenance, NO region/module membership, NO tag/text/
+        // scalar shape evidence (0x1000_0000 = 256MB, not tag namespace, not
+        // aligned-small, not inline text): unknown+required.
+        let mut content = vec![0u8; 0x2000];
+        content[0x100..0x108].copy_from_slice(&0x1000_0000u64.to_le_bytes());
+        let slab = HeapSlab {
+            old_base: 0x960150,
+            content,
+        };
+        let decl = declare_pointer_slots_structural(&[], &[], &[slab], &[]);
+        let rec = decl
+            .ledger
+            .iter()
+            .find(|r| r.raw_value == 0x1000_0000)
+            .expect("scanned");
+        assert_eq!(rec.kind, DeclarationKind::Unknown);
+        assert!(rec.required);
+    }
+
+    #[test]
+    fn r2_module_range_without_provenance() {
+        // Value in verified module range, structural source missing -> unknown+required.
+        let mut content = vec![0u8; 0x2000];
+        content[0x100..0x108].copy_from_slice(&0x7ffd_4500_0000u64.to_le_bytes()); // inside kernel32 range
+        let slab = HeapSlab {
+            old_base: 0x960150,
+            content,
+        };
+        let ranges = vec![(0x7ffd_44ff_0000u64, 0x7ffd_450b_9000u64)];
+        let decl = declare_pointer_slots_structural(&[], &[], &[slab], &ranges);
+        let rec = decl
+            .ledger
+            .iter()
+            .find(|r| r.raw_value == 0x7ffd_4500_0000)
+            .expect("scanned");
+        assert_eq!(rec.kind, DeclarationKind::Unknown);
+        assert!(rec.required);
+    }
+
+    #[test]
+    fn r2_capture_region_without_provenance() {
+        // Value in captured region, structural source missing -> unknown+required.
+        let mut content = vec![0u8; 0x2000];
+        content[0x100..0x108].copy_from_slice(&0x9601_50u64.to_le_bytes()); // region base itself
+        let slab = HeapSlab {
+            old_base: 0x960150,
+            content,
+        };
+        let decl = declare_pointer_slots_structural(&[], &[], &[slab], &[]);
+        let rec = decl
+            .ledger
+            .iter()
+            .find(|r| r.raw_value == 0x960150)
+            .expect("scanned");
+        assert_eq!(rec.kind, DeclarationKind::Unknown);
+        assert!(rec.required);
+    }
+
+    #[test]
+    fn r2_true_structured_heap_pointer_with_provenance() {
+        // Structural source (heap_global image root) + value inside region -> structured.
+        let mut content = vec![0u8; 0x2000];
+        content[0x100..0x108].copy_from_slice(&0x9611_50u64.to_le_bytes()); // interior of slab region
+        let g = global(0x149d50, 0x960150, content, false);
+        let decl = declare_pointer_slots_structural(&[], &[g], &[], &[]);
+        let rec = decl
+            .ledger
+            .iter()
+            .find(|r| r.raw_value == 0x961150)
+            .expect("scanned");
+        assert_eq!(
+            rec.kind,
+            DeclarationKind::StructuredHeapPointer,
+            "provenance + membership = structured"
+        );
+        assert!(rec.required);
+    }
+
+    #[test]
+    fn r2_true_module_relative_candidate_with_provenance() {
+        // Structural source + verified module range -> module_relative_candidate.
+        let mut content = vec![0u8; 0x2000];
+        content[0x100..0x108].copy_from_slice(&0x7ffd_44ff_1000u64.to_le_bytes());
+        let g = global(0x149d50, 0x960150, content, false);
+        let ranges = vec![(0x7ffd_44ff_0000u64, 0x7ffd_450b_9000u64)];
+        let decl = declare_pointer_slots_structural(&[], &[g], &[], &ranges);
+        let rec = decl
+            .ledger
+            .iter()
+            .find(|r| r.raw_value == 0x7ffd_44ff_1000)
+            .expect("scanned");
+        assert_eq!(
+            rec.kind,
+            DeclarationKind::ModuleRelativeCandidate,
+            "provenance + verified module = module_relative_candidate"
+        );
+        assert!(rec.required);
+    }
+
+    // ---------- R3 PROVENANCE-CONFLICT RECONCILIATION tests ----------
+    // (RouteY_R1_GTO_LAUNCHER_DECLARATION_PROVENANCE_CONFLICT_RECONCILIATION_1)
+    //
+    // Model: raw slab blob observations are NEVER declarations; structural
+    // sources declare. Same-slot raw observation + structural declaration
+    // reconciles (no conflict). Two structural declarations disagreeing on
+    // value/kind/required is a TRUE structural conflict -> fail-closed.
+    // No last-wins, no parent/child priority, no silent observation drop.
+
+    /// Structural heap-global: image-root rva + containing-parent graph child
+    /// evidence (both make the source structural under R2/R3 rules).
+    fn structural_global(rva: u32, live_ptr: u64, content: Vec<u8>) -> HeapGlobalSnapshot {
+        let mut g = global(rva, live_ptr, content, false);
+        g.extent_evidence.capture_path = CapturePath::GscriptChildLink;
+        g.extent_evidence.containing_parent_old_base = Some(live_ptr.saturating_sub(0x40));
+        g
+    }
+
+    #[test]
+    fn r3_raw_observation_plus_structural_pointer_same_slot() {
+        // Same physical slot VA (0x960178 = slab base 0x960150 + 0x28) seen by
+        // the raw slab blob (non-structural observation, membership value ->
+        // unknown+required) AND by a structural image-root global (pointer
+        // kind). R3: the observation reconciles into the structural
+        // declaration — NO semantic conflict.
+        let slab = slab_with(0x960150, &[(0x28, 0x7ffd_4749_3070)]);
+        let g = structural_global(0x1000, 0x960178, 0x7ffd_4749_3070u64.to_le_bytes().to_vec());
+        let decl = declare_pointer_slots_structural(&[], &[g.clone()], &[slab.clone()], &[]);
+        assert!(
+            !decl.has_conflict,
+            "raw observation + structural declaration must NOT conflict"
+        );
+        assert_eq!(decl.duplicate_conflict, 0);
+        assert_eq!(decl.true_structural_conflict, 0);
+        assert_eq!(decl.resolved_structural_declaration, 1);
+        assert_eq!(
+            decl.non_structural_observation, 1,
+            "observation preserved, never dropped"
+        );
+        assert_eq!(
+            decl.declared.len(),
+            1,
+            "slot declared from the structural source"
+        );
+        let obs = decl
+            .ledger
+            .iter()
+            .find(|r| r.observation_only)
+            .expect("observation record retained");
+        assert_eq!(obs.dedup_status, "observation_only");
+        let struct_rec = decl
+            .ledger
+            .iter()
+            .find(|r| r.is_structural)
+            .expect("structural record retained");
+        assert_eq!(struct_rec.dedup_status, "none");
+        // fallible passes (no conflict)
+        declare_pointer_slots_fallible(&[], &[g], &[slab], &[]).unwrap();
+    }
+
+    #[test]
+    fn r3_parent_structural_plus_child_structural_same_semantics() {
+        // parent/child graph synonym: two STRUCTURAL declarations of the same
+        // physical slot (image-root global + graph-child global) with the same
+        // value/kind/required -> auditable merge, no conflict.
+        let content = 0x7ffd_4749_3070u64.to_le_bytes().to_vec();
+        let parent = global(0x2000, 0x960178, content.clone(), false);
+        let child = structural_global(0x3000, 0x960178, content);
+        let decl = declare_pointer_slots_structural(&[], &[parent, child], &[], &[]);
+        assert!(!decl.has_conflict);
+        assert_eq!(decl.duplicate_same_semantics, 1);
+        assert_eq!(decl.resolved_structural_declaration, 1);
+        assert_eq!(decl.declared.len(), 1);
+        let struct_recs: Vec<&SlotDeclarationRecord> =
+            decl.ledger.iter().filter(|r| r.is_structural).collect();
+        assert_eq!(struct_recs.len(), 2, "both parent and child retained");
+        assert_eq!(struct_recs[0].dedup_status, "none");
+        assert_eq!(struct_recs[1].dedup_status, "duplicate_same_semantics");
+    }
+
+    #[test]
+    fn r3_parent_structural_plus_child_structural_conflict() {
+        // parent/child graph CONFLICT: two structural declarations of the same
+        // physical slot disagree on value -> TRUE structural conflict, terminal
+        // fail-closed. NO parent/child silent priority.
+        let parent = global(
+            0x2000,
+            0x960178,
+            0x7ffd_4749_3070u64.to_le_bytes().to_vec(),
+            false,
+        );
+        let child = structural_global(0x3000, 0x960178, 0x7ffd_4749_4000u64.to_le_bytes().to_vec());
+        let decl =
+            declare_pointer_slots_structural(&[], &[parent.clone(), child.clone()], &[], &[]);
+        assert!(decl.has_conflict);
+        assert_eq!(decl.duplicate_conflict, 1);
+        assert_eq!(decl.true_structural_conflict, 1);
+        assert_eq!(
+            decl.resolved_structural_declaration, 0,
+            "conflict never resolves"
+        );
+        assert_eq!(decl.declared.len(), 0, "conflicting slot is NOT declared");
+        let err = declare_pointer_slots_fallible(&[], &[parent, child], &[], &[]).unwrap_err();
+        assert!(matches!(err, RebaseError::Plan(_)));
+    }
+
+    #[test]
+    fn r3_raw_observation_plus_raw_observation_same_value() {
+        // Two non-structural raw observations of the same physical slot with
+        // the same value: both preserved, slot stays unknown+required (no
+        // structural source -> fail-closed default).
+        let a = slab_with(0x960150, &[(0x28, 0x1000_0000)]);
+        let b = slab_with(0x960150, &[(0x28, 0x1000_0000)]);
+        let decl = declare_pointer_slots_structural(&[], &[], &[a, b], &[]);
+        assert!(!decl.has_conflict);
+        assert_eq!(
+            decl.non_structural_observation, 2,
+            "both observations preserved"
+        );
+        assert_eq!(
+            decl.unknown_required, 1,
+            "slot stays required (unknown default)"
+        );
+        assert_eq!(decl.declared.len(), 1);
+        assert_eq!(decl.resolved_structural_declaration, 0);
+        assert!(decl
+            .ledger
+            .iter()
+            .all(|r| r.dedup_status == "observation_only"));
+    }
+
+    #[test]
+    fn r3_raw_observation_plus_raw_observation_different_value() {
+        // Two non-structural raw observations of the same physical slot with
+        // DIFFERENT values: still NOT a conflict (observations cannot declare);
+        // the slot keeps unknown+required. No last-wins is applied to the
+        // value — both values are retained for audit.
+        let a = slab_with(0x960150, &[(0x28, 0x1000_0000)]);
+        let b = slab_with(0x960150, &[(0x28, 0x2000_0000)]);
+        let decl = declare_pointer_slots_structural(&[], &[], &[a, b], &[]);
+        assert!(
+            !decl.has_conflict,
+            "raw-vs-raw value disagreement is not a structural conflict"
+        );
+        assert_eq!(decl.true_structural_conflict, 0);
+        assert_eq!(decl.non_structural_observation, 2);
+        assert_eq!(decl.unknown_required, 1);
+        assert_eq!(decl.declared.len(), 1);
+        let vals: Vec<u64> = decl.ledger.iter().map(|r| r.raw_value).collect();
+        assert!(
+            vals.contains(&0x1000_0000) && vals.contains(&0x2000_0000),
+            "both values retained, no last-wins"
+        );
+    }
+
+    #[test]
+    fn r3_unknown_observation_without_structural_source() {
+        // Unknown observation with no structural source anywhere: preserved,
+        // unknown + required (fail-closed), declared exactly once.
+        let slab = slab_with(0x960150, &[(0x48, 0x20000)]);
+        let decl = declare_pointer_slots_structural(&[], &[], &[slab.clone()], &[]);
+        assert!(!decl.has_conflict);
+        assert_eq!(decl.non_structural_observation, 1);
+        assert_eq!(decl.unknown_required, 1);
+        assert_eq!(decl.declared.len(), 1);
+        assert_eq!(decl.resolved_structural_declaration, 0);
+        let rec = &decl.ledger[0];
+        assert!(rec.observation_only);
+        assert_eq!(rec.kind, DeclarationKind::Unknown);
+        assert!(rec.required);
+        // fallible passes (observation-only is not a conflict)
+        declare_pointer_slots_fallible(&[], &[], &[slab], &[]).unwrap();
+    }
+
+    #[test]
+    fn p2_4_region_span_overflow_fails_closed() {
+        let slab = HeapSlab {
+            old_base: u64::MAX,
+            content: vec![0u8; 8],
+        };
+        let err = declare_pointer_slots_fallible(&[], &[], &[slab], &[]).unwrap_err();
+        assert!(matches!(
+            err,
+            RebaseError::Overflow {
+                region: 0,
+                old_base: u64::MAX,
+                size: 8,
+            }
+        ));
+    }
+
+    #[test]
+    fn p2_4_slot_identity_overflow_fails_closed() {
+        let err = checked_slot_identity(u64::MAX, 1).unwrap_err();
+        assert!(matches!(
+            &err,
+            RebaseError::SlotIdentityOverflow {
+                region_base: u64::MAX,
+                offset: 1,
+            }
+        ));
+        assert!(err.to_string().contains("slot identity overflow"));
+    }
+
+    #[test]
+    fn p2_4_normal_slot_identity_dedup_is_preserved() {
+        let value = 0x7ffd_4749_3070u64.to_le_bytes().to_vec();
+        let first = global(0x1000, 0x960178, value.clone(), false);
+        let second = global(0x2000, 0x960178, value, false);
+        let decl = declare_pointer_slots_fallible(&[], &[first, second], &[], &[]).unwrap();
+
+        assert!(!decl.has_conflict);
+        assert_eq!(decl.declared.len(), 1);
+        assert_eq!(decl.duplicate_same_semantics, 1);
+        assert!(decl
+            .ledger
+            .iter()
+            .all(|record| record.region_old_base != u64::MAX));
+        assert!(decl
+            .declared
+            .iter()
+            .all(|slot| slot.region_old_base != u64::MAX));
     }
 }
