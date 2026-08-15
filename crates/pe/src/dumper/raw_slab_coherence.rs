@@ -21,8 +21,38 @@
 
 use sha2::{Digest, Sha256};
 
+use super::capture_policy::DumpCapturePolicy;
 use super::container_snapshot::ContainerSnapshot;
 use super::heap_global_snapshot::{HeapGlobalSnapshot, HeapSlab, RegionProvenance};
+use super::module_identity::ModuleIdentity;
+
+/// MIDA-SERIAL-14: reserved gate interface for sample-specific transforms.
+/// MIDA-SERIAL-15 wires this into `sanitize_ahk_runtime_global`,
+/// `normalize_cmd_table_capture`, `multi_fixup`, CS re-init and cookie mirror
+/// call sites. This module provides the decision primitive only; the internal
+/// semantics of those transforms are NOT changed here.
+///
+/// Rules enforced by the underlying policy gate:
+///   * no module binding        -> deny;
+///   * binding mismatch         -> deny;
+///   * policy digest mismatch   -> deny;
+///   * policy revision unset    -> deny;
+///   * matching identity + valid policy -> allow.
+/// The action name is advisory (e.g. "sanitize_ahk_runtime_global"); the RVA
+/// alone is never sufficient.
+pub fn sample_transform_allowed(
+    policy: &DumpCapturePolicy,
+    module: &ModuleIdentity,
+    action: &str,
+) -> bool {
+    policy.allows_sample_transform(module, action)
+}
+
+/// Convenience for MIDA-SERIAL-15: strip a policy to generic-only when the
+/// gate denies (no binding / mismatch / digest / revision failure).
+pub fn policy_for_generic_path(policy: &DumpCapturePolicy) -> DumpCapturePolicy {
+    policy.strip_sample_specific()
+}
 
 /// Kind of a captured child region (for overlay provenance).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -7683,6 +7713,7 @@ mod tests {
             &containers,
             &globals,
             &crate::dumper::capture_policy::DumpCapturePolicy::ahk_gto_default(),
+            false,
             None,
             &overlays,
             &[],
@@ -9458,6 +9489,7 @@ mod tests {
             &[],
             &[],
             &crate::dumper::capture_policy::DumpCapturePolicy::ahk_gto_default(),
+            false,
             None,
             &[],
             &[],
@@ -9867,6 +9899,7 @@ mod tests {
             &[],
             &[],
             &crate::dumper::capture_policy::DumpCapturePolicy::ahk_gto_default(),
+            false,
             None,
             &[],
             &[],
@@ -10096,6 +10129,7 @@ mod tests {
             &[],
             &[],
             &crate::dumper::capture_policy::DumpCapturePolicy::ahk_gto_default(),
+            false,
             None,
             &[],
             &[],

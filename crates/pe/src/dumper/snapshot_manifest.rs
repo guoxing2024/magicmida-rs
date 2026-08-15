@@ -18,7 +18,9 @@ use super::heap_global_snapshot::{
 use super::runtime_rebase::RuntimeRebaseSummary;
 use super::types::DumpProfile;
 
-pub(crate) const SCHEMA_VERSION: &str = "mida.dump-snapshot-manifest/v0";
+pub(crate) const SCHEMA_VERSION: &str = "mida.dump-snapshot-manifest/v1";
+/// Prior schema version still accepted for read-back (no authorization semantics).
+pub(crate) const SCHEMA_VERSION_V0: &str = "mida.dump-snapshot-manifest/v0";
 
 /// Route T R0 AF2 (TAF2-E): a single authoritative-slab ledger entry. Records the
 /// slab's identity (base/size), its raw (captured) digest, its patched (after
@@ -65,6 +67,7 @@ pub(crate) fn write_dump_snapshot_manifest(
     containers: &[ContainerSnapshot],
     heap_globals: &[HeapGlobalSnapshot],
     capture_policy: &DumpCapturePolicy,
+    sample_activation: bool,
     rebase_summary: Option<&RuntimeRebaseSummary>,
     overlay_ledger: &[super::raw_slab_coherence::TransformedRegionOverlay],
     capture_drift_ledger: &[super::raw_slab_coherence::CaptureDriftRun],
@@ -84,6 +87,7 @@ pub(crate) fn write_dump_snapshot_manifest(
         containers,
         heap_globals,
         capture_policy,
+        sample_activation,
         rebase_summary,
         overlay_ledger,
         capture_drift_ledger,
@@ -170,6 +174,7 @@ pub(crate) fn render_manifest_json(
     containers: &[ContainerSnapshot],
     heap_globals: &[HeapGlobalSnapshot],
     capture_policy: &DumpCapturePolicy,
+    sample_activation: bool,
     rebase_summary: Option<&RuntimeRebaseSummary>,
     overlay_ledger: &[super::raw_slab_coherence::TransformedRegionOverlay],
     capture_drift_ledger: &[super::raw_slab_coherence::CaptureDriftRun],
@@ -241,8 +246,38 @@ pub(crate) fn render_manifest_json(
         capture_policy.first_hop_span()
     ));
     buf.push_str(&format!(
-        "    \"expand_seed_count\": {}\n",
+        "    \"expand_seed_count\": {},\n",
         capture_policy.hot_expand_seed_rvas.len()
+    ));
+    // MIDA-SERIAL-14: policy identity evidence (revision / digest / binding).
+    buf.push_str(&format!(
+        "    \"policy_revision\": {},\n",
+        capture_policy.policy_revision
+    ));
+    buf.push_str(&format!(
+        "    \"policy_digest\": \"{}\",\n",
+        json_escape(&capture_policy.policy_digest)
+    ));
+    match &capture_policy.module_binding {
+        Some(m) => {
+            buf.push_str(&format!("    \"module_binding\": {},\n", m.to_json()));
+            buf.push_str(&format!(
+                "    \"module_identity_digest\": \"{}\",\n",
+                m.digest_hex()
+            ));
+        }
+        None => {
+            buf.push_str("    \"module_binding\": null,\n");
+            buf.push_str("    \"module_identity_digest\": \"\",\n");
+        }
+    }
+    buf.push_str(&format!(
+        "    \"has_sample_specific\": {},\n",
+        capture_policy.has_sample_specific()
+    ));
+    buf.push_str(&format!(
+        "    \"sample_specific_activation\": {}\n",
+        sample_activation // MIDA-SERIAL-17: final gate decision from dump_process
     ));
     buf.push_str("  },\n");
 
@@ -850,6 +885,7 @@ mod tests {
             &[],
             &[],
             &DumpCapturePolicy::default(),
+            false,
             None,
             &[],
             &[],
@@ -912,6 +948,7 @@ mod tests {
             &containers,
             &heap_globals,
             &policy,
+            true,
             None,
             &[],
             &[],
@@ -967,6 +1004,7 @@ mod tests {
             &[],
             &[],
             &DumpCapturePolicy::ahk_gto_default(),
+            false,
             Some(&summary),
             &[],
             &[],
@@ -1091,6 +1129,7 @@ mod tests {
             &[container],
             &[heap_global.clone(), subview.clone()],
             &DumpCapturePolicy::ahk_gto_default(),
+            false,
             Some(&summary),
             &overlay,
             &[],
@@ -1156,6 +1195,7 @@ mod tests {
             &[],
             &[],
             &DumpCapturePolicy::ahk_gto_default(),
+            false,
             None,
             &[],
             &[],
@@ -1259,6 +1299,7 @@ mod tests {
             &[],
             &[],
             &DumpCapturePolicy::ahk_gto_default(),
+            false,
             None,
             &[],
             &[],
@@ -1350,6 +1391,7 @@ mod tests {
             &[],
             &[],
             &DumpCapturePolicy::ahk_gto_default(),
+            false,
             None,
             &[],
             &[],
@@ -1382,6 +1424,162 @@ mod tests {
             assert_eq!(run["first_before_byte"].as_u64().unwrap() as u8, before[0]);
             assert_eq!(run["first_after_byte"].as_u64().unwrap() as u8, after[0]);
         }
+    }
+
+    // ============ MIDA-SERIAL-14 manifest v1 identity tests ============
+
+    fn v1_test_module_identity() -> super::super::module_identity::ModuleIdentity {
+        let pe = crate::header::PeHeader {
+            dos_header: crate::header::ImageDosHeader {
+                e_magic: 0x5a4d,
+                e_lfanew: 0x40,
+            },
+            nt_headers: crate::header::ImageNtHeaders {
+                signature: 0x4550,
+                file_header: crate::header::ImageFileHeader {
+                    machine: 0x8664,
+                    number_of_sections: 1,
+                    time_date_stamp: 0x5f5e100,
+                    size_of_optional_header: 0xf0,
+                    characteristics: 0x102,
+                },
+                optional_header: crate::header::ImageOptionalHeader {
+                    magic: 0x20b,
+                    major_linker_version: 0,
+                    minor_linker_version: 0,
+                    size_of_code: 0x1000,
+                    size_of_initialized_data: 0x2000,
+                    size_of_uninitialized_data: 0,
+                    address_of_entry_point: 0x1000,
+                    base_of_code: 0x1000,
+                    base_of_data: None,
+                    image_base: 0x140000000,
+                    section_alignment: 0x1000,
+                    file_alignment: 0x200,
+                    major_operating_system_version: 6,
+                    minor_operating_system_version: 0,
+                    major_image_version: 0,
+                    minor_image_version: 0,
+                    major_subsystem_version: 6,
+                    minor_subsystem_version: 0,
+                    win32_version_value: 0,
+                    size_of_image: 0x3000,
+                    size_of_headers: 0x400,
+                    check_sum: 0,
+                    subsystem: 3,
+                    dll_characteristics: 0,
+                    size_of_stack_reserve: 0x100000,
+                    size_of_stack_commit: 0x1000,
+                    size_of_heap_reserve: 0x100000,
+                    size_of_heap_commit: 0x1000,
+                    loader_flags: 0,
+                    number_of_rva_and_sizes: 16,
+                    data_directory: [crate::header::ImageDataDirectory::default(); 16],
+                },
+            },
+            sections: vec![crate::header::PeSection {
+                header: crate::header::ImageSectionHeader {
+                    name: *b".text\0\0\0",
+                    virtual_size: 0x100,
+                    virtual_address: 0x1000,
+                    size_of_raw_data: 0x200,
+                    pointer_to_raw_data: 0x400,
+                    pointer_to_relocations: 0,
+                    pointer_to_linenumbers: 0,
+                    number_of_relocations: 0,
+                    number_of_linenumbers: 0,
+                    characteristics: 0x60000020,
+                },
+                name: ".text".to_string(),
+                virtual_address: 0x1000,
+                virtual_size: 0x100,
+                raw_offset: 0x400,
+                raw_size: 0x200,
+                characteristics: 0x60000020,
+                extra_data: None,
+            }],
+            image_base: 0x140000000,
+            entry_point: 0x1000,
+            is_64bit: true,
+            file_alignment: 0x200,
+            section_alignment: 0x1000,
+        };
+        super::super::module_identity::ModuleIdentity::from_pe_header(&pe).unwrap()
+    }
+
+    #[test]
+    fn v1_manifest_persists_module_identity_and_policy() {
+        let module = v1_test_module_identity();
+        let policy = DumpCapturePolicy::ahk_gto_default()
+            .with_module_binding(module.clone())
+            .with_policy_revision(2)
+            .with_external_policy_digest(
+                DumpCapturePolicy::ahk_gto_default()
+                    .with_module_binding(module.clone())
+                    .with_policy_revision(2)
+                    .policy_digest_value(),
+            );
+        let json = render_manifest_json(
+            Path::new("cand.exe"),
+            DumpProfile::AhkGtoExperimental,
+            0x140000000,
+            0x70b0,
+            &[],
+            &[],
+            &policy,
+            true,
+            None,
+            &[],
+            &[],
+            &[],
+            &super::super::raw_slab_coherence::TransformRunLedger::default(),
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert!(json.contains(SCHEMA_VERSION));
+        assert!(json.contains("\"policy_revision\": 2"));
+        assert!(json.contains("\"policy_digest\": \""));
+        assert!(json.contains("\"module_binding\": {"));
+        assert!(json.contains("\"module_identity_digest\": \""));
+        assert!(json.contains("\"has_sample_specific\": true"));
+        assert!(json.contains("\"sample_specific_activation\": true"));
+    }
+
+    #[test]
+    fn v1_manifest_unbound_policy_records_inert_fields() {
+        let json = render_manifest_json(
+            Path::new("cand.exe"),
+            DumpProfile::OreansClassic,
+            0x140000000,
+            0x70b0,
+            &[],
+            &[],
+            &DumpCapturePolicy::default(),
+            false,
+            None,
+            &[],
+            &[],
+            &[],
+            &super::super::raw_slab_coherence::TransformRunLedger::default(),
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert!(json.contains("\"module_binding\": null"));
+        assert!(json.contains("\"module_identity_digest\": \"\""));
+        assert!(json.contains("\"has_sample_specific\": false"));
+        assert!(json.contains("\"policy_revision\": 0"));
+    }
+
+    #[test]
+    fn v0_schema_string_still_present_for_compat() {
+        assert_eq!(SCHEMA_VERSION_V0, "mida.dump-snapshot-manifest/v0");
+        assert_ne!(SCHEMA_VERSION, SCHEMA_VERSION_V0);
     }
 
     /// Decode a lowercase hex string into bytes (test helper).

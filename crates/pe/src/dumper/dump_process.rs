@@ -960,10 +960,52 @@ pub fn dump_process_with_report(
     // behavior exactly. This keeps Route Z's fix scoped to the GTO/AHK live-capture
     // chain instead of expanding to unrelated dump profiles/backends.
     let epoch_needed = capture_epoch_needed(stage_plan);
-    let capture_policy = opts
+    let mut capture_policy = opts
         .capture_policy
         .clone()
         .resolve_for_profile(opts.profile);
+    // MIDA-SERIAL-14: identity-bound policy gate. If the resolved policy
+    // carries a module binding, it may activate sample-specific RVAs only for
+    // an exactly matching ModuleIdentity. Without a binding (or on mismatch /
+    // digest / revision failure) the sample-specific fields are stripped and
+    // the dump proceeds on the generic path. The decision is recorded for the
+    // manifest so replays can see whether sample-specific behavior ran.
+    let mut policy_gate_note: Option<String> = None;
+    // Module identity is computed once and kept in scope so later sample
+    // transforms (sanitize / normalize / drop / hot-root) can be gated too.
+    let module_identity = super::module_identity::ModuleIdentity::from_pe_header(&pe).ok();
+    match &module_identity {
+        Some(module) => {
+            if capture_policy.has_sample_specific() {
+                match capture_policy.validate_for_module(module) {
+                    Ok(super::capture_policy::PolicyValidation::ActivationAllowed) => {
+                        policy_gate_note =
+                            Some("sample-specific activated (matching module binding)".into());
+                    }
+                    Err(e) => {
+                        policy_gate_note = Some(format!("sample-specific denied: {e}"));
+                        capture_policy = capture_policy.strip_sample_specific();
+                    }
+                }
+            } else {
+                policy_gate_note = Some("generic-only policy (no sample-specific fields)".into());
+            }
+        }
+        None => {
+            // No usable PE identity (empty/invalid section table): fail closed —
+            // sample-specific behavior must not run without a verified identity.
+            if capture_policy.has_sample_specific() {
+                policy_gate_note =
+                    Some("sample-specific denied: cannot derive module identity from PE".into());
+                capture_policy = capture_policy.strip_sample_specific();
+            }
+        }
+    }
+    // MIDA-SERIAL-15: single gate predicate reused by all sample transforms.
+    let sample_active = match &module_identity {
+        Some(m) => capture_policy.sample_specific_activation(m),
+        None => false,
+    };
     let no_bypass = std::env::var("MIDA_GTO_NO_BYPASS").ok().as_deref() == Some("1");
 
     // Route Z R0 AF1/AF2/AF3: run the live-memory capture under an atomic capture
@@ -1305,7 +1347,10 @@ pub fn dump_process_with_report(
     }
     // R-GTO-UI r21b: WinMain re-inits [0x141bf0] after Label bind; dump free-list
     // body AVs later. Zero-slab large enough for re-init stores only.
-    {
+    // MIDA-SERIAL-15: gated on the identity-bound policy. Without a matching
+    // module binding (or digest/revision failure) this sample-specific sanitize
+    // is skipped entirely and NO transform record is written.
+    if sample_active {
         super::raw_slab_coherence::apply_recorded_transform(
             &mut heap_globals,
             "sanitize_ahk_runtime_global",
@@ -1314,6 +1359,8 @@ pub fn dump_process_with_report(
                 super::heap_global_snapshot::sanitize_ahk_runtime_global(heap_globals);
             },
         )?;
+    } else {
+        info!("MIDA-SERIAL-15: sanitize_ahk_runtime_global skipped (sample gate denied)");
     }
     // R-GTO-UI r22b / GTO R0-F.2: gscript+0xbd8 must be NewClassName for
     // RegisterClass @0x34db0, and +0xbd0 the CreateWindow title. The window
@@ -2382,6 +2429,9 @@ pub fn dump_process_with_report(
     let mut _ms = super::stage_timing::StageStats::default();
     _ms.item_count = authoritative_slab_ledger.len();
     let mut _mg = super::stage_timing::StageGuard::begin("manifest_construction");
+    if let Some(note) = &policy_gate_note {
+        info!(note = %note, "policy gate decision recorded for manifest");
+    }
     super::snapshot_manifest::write_dump_snapshot_manifest(
         &opts.output_path,
         opts.profile,
@@ -2390,6 +2440,7 @@ pub fn dump_process_with_report(
         &containers,
         &heap_globals,
         &capture_policy,
+        sample_active,
         rebase_summary.as_ref(),
         &overlay_ledger,
         &capture_drift_ledger,
