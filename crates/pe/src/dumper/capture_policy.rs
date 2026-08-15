@@ -41,6 +41,20 @@ pub struct DumpCapturePolicy {
     /// any code runs). Dump plant of DEFAULT is not enough.
     pub cookie_mirror_src_rva: Option<u32>,
     pub cookie_mirror_dst_rva: Option<u32>,
+
+    // MIDA-SERIAL-14: identity-bound policy gate. `None` binding means the
+    // sample-specific RVA fields below are inert (generic behavior only).
+    /// Optional module binding: when `Some`, sample-specific RVAs may activate
+    /// only for an exactly matching [`ModuleIdentity`].
+    pub module_binding: Option<super::module_identity::ModuleIdentity>,
+    /// Explicit policy revision (integer). Mismatch rejects sample-specific
+    /// activation; `0` is the unversioned default.
+    pub policy_revision: u32,
+    /// SHA-256 (hex) over the canonical policy content (revision + binding +
+    /// all sample-specific + behavior-affecting generic fields). Empty string
+    /// means "not computed". An externally supplied digest that differs from
+    /// the recomputed value fails closed.
+    pub policy_digest: String,
 }
 
 impl Default for DumpCapturePolicy {
@@ -56,6 +70,9 @@ impl Default for DumpCapturePolicy {
             cs_reinit_rvas: Vec::new(),
             cookie_mirror_src_rva: None,
             cookie_mirror_dst_rva: None,
+            module_binding: None,
+            policy_revision: 0,
+            policy_digest: String::new(),
         }
     }
 }
@@ -109,6 +126,12 @@ impl DumpCapturePolicy {
             // call-obfuscation cookie so the decrypt skip path is taken.
             cookie_mirror_src_rva: Some(0x141020),
             cookie_mirror_dst_rva: Some(0x1454b8),
+            // MIDA-SERIAL-14: the built-in preset is sample-specific; without
+            // a module binding it MUST NOT activate. Callers that want the
+            // preset must bind it to a verified ModuleIdentity first.
+            module_binding: None,
+            policy_revision: 0,
+            policy_digest: String::new(),
         }
     }
 
@@ -130,6 +153,9 @@ impl DumpCapturePolicy {
                 cs_reinit_rvas: Vec::new(),
                 cookie_mirror_src_rva: None,
                 cookie_mirror_dst_rva: None,
+                module_binding: None,
+                policy_revision: 0,
+                policy_digest: String::new(),
             };
         }
         if hint.prefer_ahk_gto_defaults {
@@ -166,6 +192,9 @@ impl DumpCapturePolicy {
             cs_reinit_rvas: Vec::new(),
             cookie_mirror_src_rva: None,
             cookie_mirror_dst_rva: None,
+            module_binding: None,
+            policy_revision: 0,
+            policy_digest: String::new(),
         }
     }
 
@@ -252,6 +281,177 @@ impl DumpCapturePolicy {
         self
     }
 
+    // ================= MIDA-SERIAL-14 identity-bound policy gate =================
+
+    /// Bind this policy to a verified module identity (consumes self).
+    pub fn with_module_binding(mut self, module: super::module_identity::ModuleIdentity) -> Self {
+        self.module_binding = Some(module);
+        self
+    }
+
+    /// Explicitly set the policy revision (consumes self).
+    pub fn with_policy_revision(mut self, revision: u32) -> Self {
+        self.policy_revision = revision;
+        self
+    }
+
+    /// Explicitly stamp an externally supplied policy digest (consumes self).
+    /// The digest is validated against [`Self::policy_digest_value`] by
+    /// [`Self::validate_for_module`]; a mismatch fails closed.
+    pub fn with_external_policy_digest(mut self, digest: String) -> Self {
+        self.policy_digest = digest;
+        self
+    }
+
+    /// Canonical policy digest (SHA-256 hex) over revision + module binding +
+    /// every sample-specific field + behavior-affecting generic fields.
+    /// Does NOT include `policy_digest` itself (no self-reference).
+    pub fn policy_digest_value(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"mida.policy-digest/v1\0");
+        h.update(&self.policy_revision.to_le_bytes());
+        match &self.module_binding {
+            Some(m) => {
+                h.update(b"binding\0");
+                h.update(m.digest_hex().as_bytes());
+            }
+            None => {
+                h.update(b"unbound\0");
+            }
+        }
+        h.update(b"hot_root_rvas\0");
+        for rva in &self.hot_root_rvas {
+            h.update(&rva.to_le_bytes());
+        }
+        h.update(b"large_table_rvas\0");
+        for rva in &self.large_table_rvas {
+            h.update(&rva.to_le_bytes());
+        }
+        h.update(b"gscript_root_rva\0");
+        match self.gscript_root_rva {
+            Some(r) => h.update(&r.to_le_bytes()),
+            None => h.update(b"none\0"),
+        }
+        h.update(b"cs_reinit_rvas\0");
+        for rva in &self.cs_reinit_rvas {
+            h.update(&rva.to_le_bytes());
+        }
+        h.update(b"cookie_mirror\0");
+        match (self.cookie_mirror_src_rva, self.cookie_mirror_dst_rva) {
+            (Some(s), Some(d)) => {
+                h.update(&s.to_le_bytes());
+                h.update(&d.to_le_bytes());
+            }
+            _ => h.update(b"none\0"),
+        }
+        h.update(b"hot_expand_seed_rvas\0");
+        for rva in &self.hot_expand_seed_rvas {
+            h.update(&rva.to_le_bytes());
+        }
+        h.update(b"gscript_content_cap\0");
+        h.update(&self.gscript_root_content_cap.to_le_bytes());
+        h.update(b"first_hop_span\0");
+        h.update(&self.gscript_first_hop_span.to_le_bytes());
+        h.update(b"first_hop_probe\0");
+        h.update(&self.gscript_first_hop_probe.to_le_bytes());
+        format!("{:x}", h.finalize())
+    }
+
+    /// Whether the digest (if any) matches the recomputed value.
+    pub fn digest_matches(&self) -> bool {
+        if self.policy_digest.is_empty() {
+            return true; // not stamped; gate treats unstamped as unverified
+        }
+        self.policy_digest == self.policy_digest_value()
+    }
+
+    /// Validate this policy against a module identity:
+    /// - no binding        -> Err (sample-specific must not activate);
+    /// - binding mismatch  -> Err;
+    /// - digest mismatch   -> Err;
+    /// - revision unset(0) -> Err;
+    /// - matching binding  -> Ok(ActivationAllowed).
+    pub fn validate_for_module(
+        &self,
+        module: &super::module_identity::ModuleIdentity,
+    ) -> Result<PolicyValidation, PolicyGateError> {
+        match &self.module_binding {
+            None => Err(PolicyGateError::UnboundPolicy),
+            Some(bound) => {
+                if bound != module {
+                    return Err(PolicyGateError::ModuleMismatch);
+                }
+                if !self.digest_matches() {
+                    return Err(PolicyGateError::DigestMismatch);
+                }
+                if self.policy_revision == 0 {
+                    return Err(PolicyGateError::UnversionedPolicy);
+                }
+                Ok(PolicyValidation::ActivationAllowed)
+            }
+        }
+    }
+
+    /// True iff sample-specific fields may activate for this module.
+    pub fn sample_specific_activation(
+        &self,
+        module: &super::module_identity::ModuleIdentity,
+    ) -> bool {
+        matches!(
+            self.validate_for_module(module),
+            Ok(PolicyValidation::ActivationAllowed)
+        )
+    }
+
+    /// Whether a specific sample transform/action is allowed for this module.
+    /// `action` is a symbolic name; the RVA alone is never sufficient. Reserved
+    /// for MIDA-SERIAL-15 wiring.
+    pub fn allows_sample_transform(
+        &self,
+        module: &super::module_identity::ModuleIdentity,
+        _action: &str,
+    ) -> bool {
+        self.sample_specific_activation(module)
+    }
+
+    /// Produce a copy with all sample-specific RVA fields stripped (generic
+    /// knobs retained). Used when no binding / mismatch occurs so the dump
+    /// proceeds on the safe generic path.
+    pub fn strip_sample_specific(&self) -> Self {
+        Self {
+            hot_root_rvas: Vec::new(),
+            large_table_rvas: Vec::new(),
+            gscript_root_rva: None,
+            gscript_root_content_cap: self.gscript_root_content_cap,
+            gscript_first_hop_span: self.gscript_first_hop_span,
+            gscript_first_hop_probe: self.gscript_first_hop_probe,
+            hot_expand_seed_rvas: Vec::new(),
+            cs_reinit_rvas: Vec::new(),
+            cookie_mirror_src_rva: None,
+            cookie_mirror_dst_rva: None,
+            module_binding: self.module_binding.clone(),
+            policy_revision: self.policy_revision,
+            policy_digest: self.policy_digest.clone(),
+        }
+    }
+
+    /// True iff this policy currently has any sample-specific field set.
+    pub fn has_sample_specific(&self) -> bool {
+        !self.hot_root_rvas.is_empty()
+            || !self.large_table_rvas.is_empty()
+            || self.gscript_root_rva.is_some()
+            || !self.cs_reinit_rvas.is_empty()
+            || self.cookie_mirror_src_rva.is_some()
+            || self.cookie_mirror_dst_rva.is_some()
+            || !self.hot_expand_seed_rvas.is_empty()
+    }
+
+    /// True iff this policy is generic-only (no sample-specific fields).
+    pub fn is_generic_only(&self) -> bool {
+        !self.has_sample_specific()
+    }
+
     pub fn is_hot_root(&self, rva: u32) -> bool {
         self.hot_root_rvas.contains(&rva)
     }
@@ -288,6 +488,39 @@ impl DumpCapturePolicy {
         }
     }
 }
+
+/// Outcome of [`DumpCapturePolicy::validate_for_module`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyValidation {
+    /// Binding matches, digest valid, revision set — sample-specific allowed.
+    ActivationAllowed,
+}
+
+/// Fail-closed reasons from the policy gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyGateError {
+    /// No module binding on the policy.
+    UnboundPolicy,
+    /// Binding identity does not match the given module.
+    ModuleMismatch,
+    /// Stamped policy digest does not match the recomputed value.
+    DigestMismatch,
+    /// Policy revision is 0 (unversioned) — sample-specific denied.
+    UnversionedPolicy,
+}
+
+impl std::fmt::Display for PolicyGateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PolicyGateError::UnboundPolicy => write!(f, "policy has no module binding"),
+            PolicyGateError::ModuleMismatch => write!(f, "policy module binding mismatch"),
+            PolicyGateError::DigestMismatch => write!(f, "policy digest mismatch"),
+            PolicyGateError::UnversionedPolicy => write!(f, "policy revision unset (0)"),
+        }
+    }
+}
+
+impl std::error::Error for PolicyGateError {}
 
 #[cfg(test)]
 mod tests {
@@ -383,5 +616,190 @@ mod tests {
             DumpProfile::AhkGtoExperimental,
         );
         assert_eq!(p.hot_root_rvas, vec![0x42]);
+    }
+
+    // ============ MIDA-SERIAL-14 policy gate tests ============
+
+    /// Build a ModuleIdentity from a minimal hand-constructed PeHeader.
+    fn test_module_identity(
+        machine: u16,
+        stamp: u32,
+        size_image: u32,
+    ) -> super::super::module_identity::ModuleIdentity {
+        let pe = crate::header::PeHeader {
+            dos_header: crate::header::ImageDosHeader {
+                e_magic: 0x5a4d,
+                e_lfanew: 0x40,
+            },
+            nt_headers: crate::header::ImageNtHeaders {
+                signature: 0x4550,
+                file_header: crate::header::ImageFileHeader {
+                    machine,
+                    number_of_sections: 1,
+                    time_date_stamp: stamp,
+                    size_of_optional_header: 0xf0,
+                    characteristics: 0x102,
+                },
+                optional_header: crate::header::ImageOptionalHeader {
+                    magic: 0x20b,
+                    major_linker_version: 0,
+                    minor_linker_version: 0,
+                    size_of_code: 0x1000,
+                    size_of_initialized_data: 0x2000,
+                    size_of_uninitialized_data: 0,
+                    address_of_entry_point: 0x1000,
+                    base_of_code: 0x1000,
+                    base_of_data: None,
+                    image_base: 0x140000000,
+                    section_alignment: 0x1000,
+                    file_alignment: 0x200,
+                    major_operating_system_version: 6,
+                    minor_operating_system_version: 0,
+                    major_image_version: 0,
+                    minor_image_version: 0,
+                    major_subsystem_version: 6,
+                    minor_subsystem_version: 0,
+                    win32_version_value: 0,
+                    size_of_image: size_image,
+                    size_of_headers: 0x400,
+                    check_sum: 0,
+                    subsystem: 3,
+                    dll_characteristics: 0,
+                    size_of_stack_reserve: 0x100000,
+                    size_of_stack_commit: 0x1000,
+                    size_of_heap_reserve: 0x100000,
+                    size_of_heap_commit: 0x1000,
+                    loader_flags: 0,
+                    number_of_rva_and_sizes: 16,
+                    data_directory: [crate::header::ImageDataDirectory::default(); 16],
+                },
+            },
+            sections: vec![crate::header::PeSection {
+                header: crate::header::ImageSectionHeader {
+                    name: *b".text\0\0\0",
+                    virtual_size: 0x100,
+                    virtual_address: 0x1000,
+                    size_of_raw_data: 0x200,
+                    pointer_to_raw_data: 0x400,
+                    pointer_to_relocations: 0,
+                    pointer_to_linenumbers: 0,
+                    number_of_relocations: 0,
+                    number_of_linenumbers: 0,
+                    characteristics: 0x60000020,
+                },
+                name: ".text".to_string(),
+                virtual_address: 0x1000,
+                virtual_size: 0x100,
+                raw_offset: 0x400,
+                raw_size: 0x200,
+                characteristics: 0x60000020,
+                extra_data: None,
+            }],
+            image_base: 0x140000000,
+            entry_point: 0x1000,
+            is_64bit: true,
+            file_alignment: 0x200,
+            section_alignment: 0x1000,
+        };
+        super::super::module_identity::ModuleIdentity::from_pe_header(&pe).unwrap()
+    }
+
+    #[test]
+    fn unbound_policy_denies_activation() {
+        let module = test_module_identity(0x8664, 0x5f5e100, 0x3000);
+        let p = DumpCapturePolicy::ahk_gto_default();
+        assert!(!p.sample_specific_activation(&module));
+        assert_eq!(
+            p.validate_for_module(&module),
+            Err(PolicyGateError::UnboundPolicy)
+        );
+    }
+
+    #[test]
+    fn matching_binding_permits_activation() {
+        let module = test_module_identity(0x8664, 0x5f5e100, 0x3000);
+        let p = DumpCapturePolicy::ahk_gto_default()
+            .with_module_binding(module.clone())
+            .with_policy_revision(1)
+            .with_external_policy_digest(
+                DumpCapturePolicy::ahk_gto_default()
+                    .with_module_binding(module.clone())
+                    .with_policy_revision(1)
+                    .policy_digest_value(),
+            );
+        assert!(p.sample_specific_activation(&module));
+        assert!(p.allows_sample_transform(&module, "sanitize_ahk_runtime_global"));
+    }
+
+    #[test]
+    fn mismatching_binding_denies_activation() {
+        let m1 = test_module_identity(0x8664, 0x5f5e100, 0x3000);
+        let m2 = test_module_identity(0x8664, 0x5f5e101, 0x3000); // different stamp
+        let p = DumpCapturePolicy::ahk_gto_default()
+            .with_module_binding(m1)
+            .with_policy_revision(1)
+            .with_external_policy_digest(String::new());
+        assert!(!p.sample_specific_activation(&m2));
+        assert_eq!(
+            p.validate_for_module(&m2),
+            Err(PolicyGateError::ModuleMismatch)
+        );
+    }
+
+    #[test]
+    fn revision_zero_denies_activation() {
+        let module = test_module_identity(0x8664, 0x5f5e100, 0x3000);
+        let p = DumpCapturePolicy::ahk_gto_default().with_module_binding(module.clone());
+        assert!(!p.sample_specific_activation(&module));
+        assert_eq!(
+            p.validate_for_module(&module),
+            Err(PolicyGateError::UnversionedPolicy)
+        );
+    }
+
+    #[test]
+    fn digest_tampering_denies_activation() {
+        let module = test_module_identity(0x8664, 0x5f5e100, 0x3000);
+        let p = DumpCapturePolicy::ahk_gto_default()
+            .with_module_binding(module.clone())
+            .with_policy_revision(1)
+            .with_external_policy_digest("deadbeef".to_string()); // tampered
+        assert!(!p.digest_matches());
+        assert!(!p.sample_specific_activation(&module));
+        assert_eq!(
+            p.validate_for_module(&module),
+            Err(PolicyGateError::DigestMismatch)
+        );
+    }
+
+    #[test]
+    fn strip_sample_specific_leaves_generic_only() {
+        let p = DumpCapturePolicy::ahk_gto_default();
+        let stripped = p.strip_sample_specific();
+        assert!(stripped.is_generic_only());
+        assert!(stripped.hot_root_rvas.is_empty());
+        assert!(stripped.cs_reinit_rvas.is_empty());
+        assert_eq!(stripped.gscript_first_hop_span, p.gscript_first_hop_span);
+    }
+
+    #[test]
+    fn generic_only_policy_without_binding_stays_safe() {
+        let p = DumpCapturePolicy::default();
+        assert!(p.is_generic_only());
+        assert!(!p.has_sample_specific());
+        let module = test_module_identity(0x8664, 0x5f5e100, 0x3000);
+        assert!(!p.sample_specific_activation(&module));
+    }
+
+    #[test]
+    fn explicit_rva_without_binding_does_not_bypass_gate() {
+        let module = test_module_identity(0x8664, 0x5f5e100, 0x3000);
+        let p = DumpCapturePolicy {
+            hot_root_rvas: vec![0x1000, 0x2000],
+            ..Default::default()
+        };
+        assert!(!p.sample_specific_activation(&module));
+        let stripped = p.strip_sample_specific();
+        assert!(stripped.is_generic_only());
     }
 }

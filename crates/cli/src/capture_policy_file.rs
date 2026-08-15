@@ -104,6 +104,11 @@ fn parse_capture_policy_value(v: &Value) -> Result<DumpCapturePolicy, String> {
             cs_reinit_rvas: cs_reinit_rvas.clone(),
             cookie_mirror_src_rva: None,
             cookie_mirror_dst_rva: None,
+            // MIDA-SERIAL-14: a CLI JSON policy carries no module identity;
+            // sample-specific fields stay inert until bound by the host.
+            module_binding: None,
+            policy_revision: 0,
+            policy_digest: String::new(),
         }
     } else {
         match preset {

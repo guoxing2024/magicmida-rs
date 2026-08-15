@@ -40,6 +40,7 @@ mod helpers;
 mod iat_gap_retarget;
 mod import_rebuild;
 mod import_section;
+mod module_identity;
 mod original_imports;
 mod output_writer;
 mod pure_rebuild_adapter;
@@ -66,6 +67,7 @@ pub use self::dump_process::{
 };
 pub use self::helpers::is_dotnet;
 pub use self::import_rebuild::{rebuild_import_table, rebuild_import_table_with_report};
+pub use self::module_identity::{ModuleIdentity, ModuleIdentityError};
 pub use self::original_imports::get_original_imports;
 pub use self::pure_rebuild_adapter::{
     emit_pure_rebuild, emit_pure_rebuild_with_parity, plan_from_host_dump, PureRebuildEmitOptions,
