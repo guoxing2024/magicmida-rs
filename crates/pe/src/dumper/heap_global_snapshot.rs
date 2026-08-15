@@ -1704,28 +1704,24 @@ fn ensure_hot_root_slots(
             DEFAULT_SIZE_PROBE_CAP.min(MAX_HEAP_GLOBAL_BYTES)
         };
         let mut size = estimate_object_size(dump_buf, rva as usize, value, debugger, ensure_probe);
-        // R-GTO-UI r13: AHK cmd table at 0x147868 has live count dword at
-        // 0x147888 (entries). Prefer count*8 over RPM ladder (ladder swallows
+        // R-GTO-UI r13: AHK cmd table has live count dword at slot+0x20
+        // (0x147888). Prefer count*8 over RPM ladder (ladder swallows
         // free-list → unreadable first qword after plant / AV @0x5747a).
-        if rva == 0x147868 {
-            let count_off = 0x147888usize;
-            if count_off + 4 <= dump_buf.len() {
-                let n = u32::from_le_bytes(
-                    dump_buf[count_off..count_off + 4]
-                        .try_into()
-                        .unwrap_or([0; 4]),
-                );
-                if (1..0x10000).contains(&n) {
-                    let want = (n as usize).saturating_mul(8).max(8);
-                    if can_read(debugger, value, want, HOT_XREF_SIZE_PROBE_CAP) {
-                        info!(
-                            rva = format_args!("{rva:#x}"),
-                            count = n,
-                            size = want,
-                            "Hot-root ensure: cmd table sized from live count"
-                        );
-                        size = want;
-                    }
+        let cmd_role = CountScaledPointerRole::cmd_table();
+        if cmd_role.is_slot(rva) {
+            if let CountScaledExtent::Established {
+                extent: want,
+                count,
+            } = cmd_role.derive_extent(dump_buf)
+            {
+                if can_read(debugger, value, want, HOT_XREF_SIZE_PROBE_CAP) {
+                    info!(
+                        rva = format_args!("{rva:#x}"),
+                        count,
+                        size = want,
+                        "Hot-root ensure: cmd table sized from live count"
+                    );
+                    size = want;
                 }
             }
         }
@@ -1754,19 +1750,12 @@ fn ensure_hot_root_slots(
             // the full exclusive object below.
             if carve_parent_at_hot_base(out, value) {
                 size = estimate_object_size(dump_buf, rva as usize, value, debugger, ensure_probe);
-                if rva == 0x147868 {
-                    let count_off = 0x147888usize;
-                    if count_off + 4 <= dump_buf.len() {
-                        let n = u32::from_le_bytes(
-                            dump_buf[count_off..count_off + 4]
-                                .try_into()
-                                .unwrap_or([0; 4]),
-                        );
-                        if (1..0x10000).contains(&n) {
-                            let want = (n as usize).saturating_mul(8).max(8);
-                            if can_read(debugger, value, want, HOT_XREF_SIZE_PROBE_CAP) {
-                                size = want;
-                            }
+                if cmd_role.is_slot(rva) {
+                    if let CountScaledExtent::Established { extent: want, .. } =
+                        cmd_role.derive_extent(dump_buf)
+                    {
+                        if can_read(debugger, value, want, HOT_XREF_SIZE_PROBE_CAP) {
+                            size = want;
                         }
                     }
                 }
@@ -1866,7 +1855,7 @@ fn ensure_hot_root_slots(
         }
         // Cmd/dispatch table is a dense pointer array sized by count*8; trailing
         // zero slots are valid empty entries, not free-list padding to trim.
-        if rva != 0x147868 {
+        if !cmd_role.is_slot(rva) {
             content = trim_trailing_zero_pages(content);
         }
         content = truncate_to_avoid_overlap(out, value, content);
@@ -1876,7 +1865,7 @@ fn ensure_hot_root_slots(
         if content.len() < 8 {
             continue;
         }
-        if rva != 0x147868 {
+        if !cmd_role.is_slot(rva) {
             handle_string_shell_on_capture(
                 &mut content,
                 out,
@@ -4369,27 +4358,17 @@ fn normalize_cmd_table_capture(
     dump_buf: &[u8],
     debugger: &mut dyn mida_core::DebuggerCore,
 ) {
-    const TABLE_RVA: u32 = 0x147868;
-    const COUNT_RVA: u32 = 0x147888;
+    let role = CountScaledPointerRole::cmd_table();
     let Some(idx) = out
         .iter()
-        .position(|g| g.rva == TABLE_RVA && !g.is_heap_handle && g.content.len() >= 8)
+        .position(|g| g.rva == role.slot_rva && !g.is_heap_handle && g.content.len() >= 8)
     else {
         return;
     };
-    let count_off = COUNT_RVA as usize;
-    if count_off + 4 > dump_buf.len() {
-        return;
-    }
-    let n = u32::from_le_bytes(
-        dump_buf[count_off..count_off + 4]
-            .try_into()
-            .unwrap_or([0; 4]),
-    );
-    if !(1..0x10000).contains(&n) {
-        return;
-    }
-    let want = (n as usize).saturating_mul(8).max(8);
+    let (want, n) = match role.derive_extent(dump_buf) {
+        CountScaledExtent::Established { extent, count } => (extent, count),
+        CountScaledExtent::Unavailable => return,
+    };
     let g = &mut out[idx];
     let old = g.content.len();
     if old == want {
@@ -4399,7 +4378,7 @@ fn normalize_cmd_table_capture(
         g.content.truncate(want);
         *total_bytes = total_bytes.saturating_sub(old - want);
         info!(
-            rva = format_args!("{TABLE_RVA:#x}"),
+            rva = format_args!("{:#x}", role.slot_rva),
             count = n,
             old_size = old,
             new_size = want,
@@ -4427,12 +4406,105 @@ fn normalize_cmd_table_capture(
     *total_bytes = total_bytes.saturating_sub(old).saturating_add(buf.len());
     g.content = buf;
     info!(
-        rva = format_args!("{TABLE_RVA:#x}"),
+        rva = format_args!("{:#x}", role.slot_rva),
         count = n,
         old_size = old,
         new_size = g.content.len(),
         "Normalized cmd table capture to live count*8 (re-read)"
     );
+}
+
+/// MIDA-SERIAL-27: identity-bound count-scaled pointer-table role.
+///
+/// This is the SINGLE production fact source for the AHK cmd/dispatch
+/// table's identity-bound structural layout. It is explicitly sample-bound:
+/// `slot_rva`, `count_offset` and `element_size` encode the bound sample's
+/// object model; it is NOT a generic pointer-table discovery rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CountScaledPointerRole {
+    /// Image RVA of the slot that holds the object/table pointer.
+    slot_rva: u32,
+    /// Slot-relative byte offset of the element-count dword.
+    count_offset: usize,
+    /// Element size in bytes (pointer stride).
+    element_size: usize,
+    /// Inclusive lower bound for the live element-count dword.
+    min_count: u32,
+    /// Inclusive upper bound for the live element-count dword.
+    max_count: u32,
+    /// Minimum valid derived extent in bytes.
+    min_extent: usize,
+}
+
+/// Shared result of deriving a count-scaled extent from a dump buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CountScaledExtent {
+    /// The count dword was readable and structurally valid; carries the
+    /// checked count * element_size extent in bytes and the validated count.
+    Established { extent: usize, count: u32 },
+    /// The boundary could not be established (unreadable / truncated /
+    /// invalid count / checked arithmetic failed / extent below minimum).
+    Unavailable,
+}
+
+impl CountScaledPointerRole {
+    /// The single production instance: AHK cmd/dispatch table @0x147868,
+    /// count dword @ +0x20 (0x147888), 8-byte elements.
+    const fn cmd_table() -> Self {
+        Self {
+            slot_rva: 0x147868,
+            count_offset: 0x20,
+            element_size: 8,
+            min_count: 1,
+            max_count: 0xffff,
+            min_extent: 8,
+        }
+    }
+
+    /// Identity-bound role predicate.
+    fn is_slot(&self, rva: u32) -> bool {
+        self.slot_rva == rva
+    }
+
+    /// Derive the count dword's RVA as `slot_rva + count_offset` (checked).
+    fn count_rva(&self) -> Option<usize> {
+        (self.slot_rva as usize).checked_add(self.count_offset)
+    }
+
+    /// Shared checked extent derivation.
+    ///
+    /// All consumers use this helper for the identity-bound count-scaled
+    /// role. A count that is readable and valid but whose derived extent does
+    /// not match a captured content length is NOT decided here; callers keep
+    /// their layer-specific conflict handling (e.g. first-hop Ambiguous).
+    fn derive_extent(&self, dump_buf: &[u8]) -> CountScaledExtent {
+        let Some(count_rva) = self.count_rva() else {
+            return CountScaledExtent::Unavailable;
+        };
+        let Some(end) = count_rva.checked_add(4) else {
+            return CountScaledExtent::Unavailable;
+        };
+        if end > dump_buf.len() {
+            return CountScaledExtent::Unavailable;
+        }
+        let Ok(four) = <[u8; 4]>::try_from(&dump_buf[count_rva..count_rva + 4]) else {
+            return CountScaledExtent::Unavailable;
+        };
+        let n = u32::from_le_bytes(four);
+        if !(self.min_count..=self.max_count).contains(&n) {
+            return CountScaledExtent::Unavailable;
+        }
+        let Some(want) = (n as usize).checked_mul(self.element_size) else {
+            return CountScaledExtent::Unavailable;
+        };
+        if want < self.min_extent {
+            return CountScaledExtent::Unavailable;
+        }
+        CountScaledExtent::Established {
+            extent: want,
+            count: n,
+        }
+    }
 }
 
 /// MIDA-SERIAL-25: identity-bound declared first-hop role.
@@ -4495,12 +4567,13 @@ enum FirstHopRoleKind {
 /// Everything else — every other hot root, every other large-table
 /// nomination, every dense or pointer-rich object — fails closed (Missing).
 fn declared_first_hop_roles() -> &'static [DeclaredFirstHopRole] {
+    const CMD: CountScaledPointerRole = CountScaledPointerRole::cmd_table();
     &[
         DeclaredFirstHopRole {
-            slot_rva: 0x147868,
+            slot_rva: CMD.slot_rva,
             kind: FirstHopRoleKind::PointerTableCountScaled {
-                count_offset: 0x20, // count dword @ 0x147888
-                element_size: 8,
+                count_offset: CMD.count_offset,
+                element_size: CMD.element_size,
             },
         },
         DeclaredFirstHopRole {
@@ -4559,28 +4632,21 @@ fn verify_first_hop_role(
             count_offset,
             element_size,
         } => {
-            let Some(count_off) = (g.rva as usize).checked_add(count_offset) else {
-                return CountExtentOutcome::Unverifiable;
-            };
-            if count_off
-                .checked_add(4)
-                .map_or(true, |end| end > dump_buf.len())
+            // The only count-scaled identity role in production is the cmd
+            // table; verification must consume that exact single fact source.
+            // A declared role that drifts from the source fails closed rather
+            // than introducing a second structural definition.
+            let cmd = CountScaledPointerRole::cmd_table();
+            if cmd.slot_rva != role.slot_rva
+                || cmd.count_offset != count_offset
+                || cmd.element_size != element_size
             {
                 return CountExtentOutcome::Unverifiable;
             }
-            let Ok(four) = <[u8; 4]>::try_from(&dump_buf[count_off..count_off + 4]) else {
-                return CountExtentOutcome::Unverifiable;
+            let want = match cmd.derive_extent(dump_buf) {
+                CountScaledExtent::Established { extent, .. } => extent,
+                CountScaledExtent::Unavailable => return CountExtentOutcome::Unverifiable,
             };
-            let n = u32::from_le_bytes(four);
-            if !(1..0x10000).contains(&n) {
-                return CountExtentOutcome::Unverifiable;
-            }
-            let Some(want) = (n as usize).checked_mul(element_size) else {
-                return CountExtentOutcome::Unverifiable;
-            };
-            if want < 8 {
-                return CountExtentOutcome::Unverifiable;
-            }
             if want != g.content.len() {
                 // Boundary established but conflicting with the captured extent.
                 return CountExtentOutcome::Conflict;
@@ -12026,6 +12092,368 @@ mod tests {
                 );
             }
             other => panic!("expected Resolved, got {other:?}"),
+        }
+    }
+
+    // ============ MIDA-SERIAL-27 count-scaled single-source refactor ============
+
+    /// The production cmd-table role is the single fact source consumed by
+    /// normalize, first-hop, and the hot-root ensure path.
+    #[test]
+    fn m27_single_role_consistent_across_consumers() {
+        let cmd = CountScaledPointerRole::cmd_table();
+        assert_eq!(cmd.slot_rva, 0x147868);
+        assert_eq!(cmd.count_offset, 0x20);
+        assert_eq!(cmd.element_size, 8);
+        assert_eq!(cmd.min_count, 1);
+        assert_eq!(cmd.max_count, 0xffff);
+        assert_eq!(cmd.min_extent, 8);
+        assert_eq!(cmd.count_rva(), Some(0x147888));
+
+        // first-hop declared roles must carry the exact same structural facts.
+        let roles = declared_first_hop_roles();
+        let hop = roles
+            .iter()
+            .find(|r| r.slot_rva == cmd.slot_rva)
+            .expect("cmd table role declared");
+        match hop.kind {
+            FirstHopRoleKind::PointerTableCountScaled {
+                count_offset,
+                element_size,
+            } => {
+                assert_eq!(count_offset, cmd.count_offset);
+                assert_eq!(element_size, cmd.element_size);
+            }
+            _ => panic!("cmd table must remain PointerTableCountScaled"),
+        }
+    }
+
+    /// Normalize, first-hop, and ensure all derive the same 32-byte extent for
+    /// count=4 (slot 0x147868, count dword at slot+0x20, element size 8).
+    #[test]
+    fn m27_normal_count_scaled_extent_consistent() {
+        let cmd = CountScaledPointerRole::cmd_table();
+        let base = 0x140000000u64;
+        let live = 0x30_0000u64;
+        let dump_size = 0x150000usize;
+        let dump = m24_dump_buf_with_count(dump_size, cmd.count_rva().unwrap(), 4).unwrap();
+
+        // normalize: over-wide 64-byte capture is truncated to 32 bytes.
+        let mut out = vec![m23_root(cmd.slot_rva, live, vec![0xAAu8; 64])];
+        let mut total = 64usize;
+        let mut mock = M23RegionMapMock::new();
+        normalize_cmd_table_capture(&mut out, &mut total, &dump, &mut mock);
+        assert_eq!(out[0].content.len(), 32);
+        assert_eq!(total, 32);
+
+        // first-hop: same dump/count resolves to VerifiedCountScaledExtent(32).
+        let pe = m23_pe(base, 0x2000, 0x150000);
+        let policy = DumpCapturePolicy::default();
+        let out_fh = vec![m23_root(cmd.slot_rva, live, vec![0u8; 32])];
+        match derive_first_hop_candidates(&pe, &out_fh, &policy, base, base + 0x152000, &dump) {
+            FirstHopCandidateResolution::Resolved(cands) => {
+                assert_eq!(cands.len(), 1);
+                assert_eq!(cands[0].table_rva, cmd.slot_rva);
+                assert_eq!(cands[0].span, 32);
+                assert_eq!(
+                    cands[0].evidence,
+                    FirstHopCandidateEvidence::VerifiedCountScaledExtent
+                );
+            }
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+
+        // ensure: policy hot-root path sizes the capture from the same count.
+        let mut dump_ensure = dump.clone();
+        dump_ensure[cmd.slot_rva as usize..cmd.slot_rva as usize + 8]
+            .copy_from_slice(&live.to_le_bytes());
+        let mut mock = M23RegionMapMock::new();
+        mock.set(live, vec![0xCCu8; 0x1000]);
+        let mut ensure_out = Vec::new();
+        let mut ensure_total = 0usize;
+        let mut seen = BTreeSet::new();
+        let policy = DumpCapturePolicy::ahk_gto_default();
+        ensure_hot_root_slots(
+            &mut ensure_out,
+            &mut ensure_total,
+            &mut seen,
+            base,
+            base + 0x200000,
+            &dump_ensure,
+            &mut mock,
+            &[(0x2000, 0x200000)],
+            &[(0x2000, 0x200000)],
+            &[],
+            &policy,
+        );
+        let cmd_snap = ensure_out
+            .iter()
+            .find(|g| g.rva == cmd.slot_rva)
+            .expect("cmd table captured by ensure");
+        assert_eq!(cmd_snap.content.len(), 32);
+        assert_eq!(ensure_total, 32);
+    }
+
+    /// A count that establishes 32 bytes but whose capture is larger/smaller
+    /// must remain Conflict/Ambiguous in first-hop — never Verified.
+    #[test]
+    fn m27_unmatched_capture_extent_is_conflict_not_verified() {
+        let cmd = CountScaledPointerRole::cmd_table();
+        let base = 0x140000000u64;
+        let pe = m23_pe(base, 0x2000, 0x150000);
+        let policy = DumpCapturePolicy::default();
+        let dump = m24_dump_buf_with_count(0x150000, cmd.count_rva().unwrap(), 4).unwrap();
+
+        for content_len in [8usize, 24, 31, 33, 64] {
+            let out = vec![m23_root(cmd.slot_rva, 0x30_0000, vec![0u8; content_len])];
+            let r = derive_first_hop_candidates(&pe, &out, &policy, base, base + 0x152000, &dump);
+            assert_eq!(
+                r,
+                FirstHopCandidateResolution::Ambiguous,
+                "capture len {content_len} must be Ambiguous/Conflict, not Verified"
+            );
+        }
+    }
+
+    /// Malformed count inputs fail closed consistently for normalize and
+    /// first-hop: both use the same shared CountScaledExtent derivation.
+    #[test]
+    fn m27_malformed_count_fail_closed_consistently() {
+        let cmd = CountScaledPointerRole::cmd_table();
+        let base = 0x140000000u64;
+        let pe = m23_pe(base, 0x2000, 0x150000);
+        let policy = DumpCapturePolicy::default();
+        let mut mock = M23RegionMapMock::new();
+
+        // count = 0
+        let dump0 = m24_dump_buf_with_count(0x150000, cmd.count_rva().unwrap(), 0).unwrap();
+        let mut out = vec![m23_root(cmd.slot_rva, 0x30_0000, vec![0xAAu8; 64])];
+        let mut total = 64;
+        normalize_cmd_table_capture(&mut out, &mut total, &dump0, &mut mock);
+        assert_eq!(
+            out[0].content.len(),
+            64,
+            "normalize must fail closed for count=0"
+        );
+        let out_fh = vec![m23_root(cmd.slot_rva, 0x30_0000, vec![0u8; 32])];
+        assert_eq!(
+            derive_first_hop_candidates(&pe, &out_fh, &policy, base, base + 0x152000, &dump0),
+            FirstHopCandidateResolution::Missing,
+            "first-hop must fail closed for count=0"
+        );
+
+        // count = 0x10000 (>= max)
+        let dump_max =
+            m24_dump_buf_with_count(0x150000, cmd.count_rva().unwrap(), 0x10000).unwrap();
+        let mut out = vec![m23_root(cmd.slot_rva, 0x30_0000, vec![0xAAu8; 64])];
+        let mut total = 64;
+        normalize_cmd_table_capture(&mut out, &mut total, &dump_max, &mut mock);
+        assert_eq!(
+            out[0].content.len(),
+            64,
+            "normalize must fail closed for count>=0x10000"
+        );
+        let out_fh = vec![m23_root(cmd.slot_rva, 0x30_0000, vec![0u8; 32])];
+        assert_eq!(
+            derive_first_hop_candidates(&pe, &out_fh, &policy, base, base + 0x152000, &dump_max),
+            FirstHopCandidateResolution::Missing,
+            "first-hop must fail closed for count>=0x10000"
+        );
+
+        // truncated count dword (count_rva + 4 > dump_buf.len())
+        let truncated = vec![0u8; cmd.count_rva().unwrap() + 3];
+        let mut out = vec![m23_root(cmd.slot_rva, 0x30_0000, vec![0xAAu8; 64])];
+        let mut total = 64;
+        normalize_cmd_table_capture(&mut out, &mut total, &truncated, &mut mock);
+        assert_eq!(
+            out[0].content.len(),
+            64,
+            "normalize must fail closed for truncated count"
+        );
+        let out_fh = vec![m23_root(cmd.slot_rva, 0x30_0000, vec![0u8; 32])];
+        assert_eq!(
+            derive_first_hop_candidates(&pe, &out_fh, &policy, base, base + 0x152000, &truncated),
+            FirstHopCandidateResolution::Missing,
+            "first-hop must fail closed for truncated count"
+        );
+
+        // helper checked arithmetic: slot+offset overflow and count*element_size overflow.
+        let overflow_role = CountScaledPointerRole {
+            slot_rva: u32::MAX,
+            count_offset: usize::MAX,
+            element_size: 8,
+            min_count: 1,
+            max_count: 0xffff,
+            min_extent: 8,
+        };
+        assert_eq!(
+            overflow_role.derive_extent(&vec![0u8; 64]),
+            CountScaledExtent::Unavailable,
+            "slot+count_offset overflow must fail closed"
+        );
+        let mul_overflow_role = CountScaledPointerRole {
+            slot_rva: 0x1000,
+            count_offset: 0,
+            element_size: usize::MAX,
+            min_count: 1,
+            max_count: 0xffff,
+            min_extent: 8,
+        };
+        let mut big_dump = vec![0u8; 0x2000];
+        big_dump[0x1000..0x1004].copy_from_slice(&2u32.to_le_bytes());
+        assert_eq!(
+            mul_overflow_role.derive_extent(&big_dump),
+            CountScaledExtent::Unavailable,
+            "count*element_size overflow must fail closed"
+        );
+    }
+
+    /// ASLR stability: role identity/count location/derived extent do not
+    /// depend on image_base or live VA.
+    #[test]
+    fn m27_aslr_stability_preserves_role_and_extent() {
+        let cmd = CountScaledPointerRole::cmd_table();
+        let dump = m24_dump_buf_with_count(0x150000, cmd.count_rva().unwrap(), 4).unwrap();
+
+        let base_a = 0x140000000u64;
+        let base_b = 0x180000000u64;
+        let pe_a = m23_pe(base_a, 0x2000, 0x150000);
+        let pe_b = m23_pe(base_b, 0x2000, 0x150000);
+        let policy = DumpCapturePolicy::default();
+
+        let out_a = vec![m23_root(cmd.slot_rva, 0x30_0000, vec![0u8; 32])];
+        let out_b = vec![m23_root(cmd.slot_rva, 0x50_0000, vec![0u8; 32])];
+        let ra =
+            derive_first_hop_candidates(&pe_a, &out_a, &policy, base_a, base_a + 0x152000, &dump);
+        let rb =
+            derive_first_hop_candidates(&pe_b, &out_b, &policy, base_b, base_b + 0x152000, &dump);
+        match (ra, rb) {
+            (
+                FirstHopCandidateResolution::Resolved(ca),
+                FirstHopCandidateResolution::Resolved(cb),
+            ) => {
+                assert_eq!(ca[0].table_rva, cmd.slot_rva);
+                assert_eq!(cb[0].table_rva, cmd.slot_rva);
+                assert_eq!(ca[0].span, 32);
+                assert_eq!(cb[0].span, 32);
+                assert_eq!(ca[0].evidence, cb[0].evidence);
+            }
+            other => panic!("expected both Resolved, got {other:?}"),
+        }
+    }
+
+    /// Non-target objects (dense, hot-root, large-table, count-like at another
+    /// RVA) must not activate via the count-scaled role.
+    #[test]
+    fn m27_non_target_objects_do_not_activate() {
+        let cmd = CountScaledPointerRole::cmd_table();
+        let base = 0x140000000u64;
+        let pe = m23_pe(base, 0x2000, 0x200000);
+        let policy = DumpCapturePolicy::default();
+        let dump = m24_dump_buf_with_count(0x200000, cmd.count_rva().unwrap(), 4).unwrap();
+
+        // Dense pointer-rich object at a non-role RVA.
+        let dense = m23_root(0x2010, 0x30_0000, m23_dense_content(&[0x31_0000; 8]));
+        assert_eq!(
+            derive_first_hop_candidates(&pe, &vec![dense], &policy, base, base + 0x200000, &dump),
+            FirstHopCandidateResolution::Missing
+        );
+
+        // Default policy extra hot root / large table with a dense body.
+        let extra_hot = m23_root(0x18a898, 0x30_0000, m23_dense_content(&[0x31_0000; 8]));
+        assert_eq!(
+            derive_first_hop_candidates(
+                &pe,
+                &vec![extra_hot],
+                &policy,
+                base,
+                base + 0x200000,
+                &dump
+            ),
+            FirstHopCandidateResolution::Missing
+        );
+        let extra_large = m23_root(0x148bf8, 0x30_0000, m23_dense_content(&[0x31_0000; 8]));
+        assert_eq!(
+            derive_first_hop_candidates(
+                &pe,
+                &vec![extra_large],
+                &policy,
+                base,
+                base + 0x200000,
+                &dump
+            ),
+            FirstHopCandidateResolution::Missing
+        );
+
+        // Count-like data at another RVA (same count/offset/size shape but not
+        // the identity-bound role) must not activate.
+        let count_like = m23_root(0x150000, 0x30_0000, vec![0u8; 32]);
+        let mut other_dump = vec![0u8; 0x200000];
+        other_dump[0x150020..0x150024].copy_from_slice(&4u32.to_le_bytes());
+        assert_eq!(
+            derive_first_hop_candidates(
+                &pe,
+                &vec![count_like],
+                &policy,
+                base,
+                base + 0x200000,
+                &other_dump
+            ),
+            FirstHopCandidateResolution::Missing
+        );
+    }
+
+    /// The 0x141bf0 bounded-pointer-window role is untouched by the
+    /// count-scaled single-source refactor.
+    #[test]
+    fn m27_bounded_role_unchanged() {
+        let roles = declared_first_hop_roles();
+        let bounded = roles
+            .iter()
+            .find(|r| r.slot_rva == 0x141bf0)
+            .expect("bounded role still declared");
+        assert!(matches!(
+            bounded.kind,
+            FirstHopRoleKind::BoundedPointerWindow { max_span: 0x200 }
+        ));
+        assert_eq!(bounded.slot_rva, 0x141bf0);
+
+        let base = 0x140000000u64;
+        let pe = m23_pe(base, 0x2000, 0x150000);
+        let policy = DumpCapturePolicy::default();
+        let dump = m24_dump_buf_with_count(0x150000, 0x147888, 4).unwrap();
+
+        // +0xd8 is inside the 0x200 window and is walked.
+        let mut content_d8 = vec![0u8; 0x200];
+        content_d8[0xd8..0xe0].copy_from_slice(&0x50_0000u64.to_le_bytes());
+        let out_d8 = vec![m23_root(0x141bf0, 0x50_0000, content_d8)];
+        match derive_first_hop_candidates(&pe, &out_d8, &policy, base, base + 0x152000, &dump) {
+            FirstHopCandidateResolution::Resolved(cands) => {
+                let c = cands.iter().find(|c| c.table_rva == 0x141bf0).unwrap();
+                assert_eq!(c.span, 0x200);
+                assert_eq!(
+                    c.evidence,
+                    FirstHopCandidateEvidence::IdentityBoundedPointerWindow
+                );
+            }
+            other => panic!("expected bounded Resolved, got {other:?}"),
+        }
+
+        // A pointer at exactly 0x200 is outside the bounded window: span remains
+        // 0x200 and the pointer at offset 0x200 is not walked/enumerated.
+        let mut content_bound = vec![0u8; 0x400];
+        content_bound[0x200..0x208].copy_from_slice(&0x60_0000u64.to_le_bytes());
+        let out_bound = vec![m23_root(0x141bf0, 0x60_0000, content_bound)];
+        match derive_first_hop_candidates(&pe, &out_bound, &policy, base, base + 0x152000, &dump) {
+            FirstHopCandidateResolution::Resolved(cands) => {
+                let c = cands.iter().find(|c| c.table_rva == 0x141bf0).unwrap();
+                assert_eq!(c.span, 0x200);
+                assert_eq!(
+                    c.evidence,
+                    FirstHopCandidateEvidence::IdentityBoundedPointerWindow
+                );
+            }
+            other => panic!("expected bounded Resolved, got {other:?}"),
         }
     }
 }
