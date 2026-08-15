@@ -4538,6 +4538,67 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// Windows extended-length path prefix (\\?\C:\...) must NOT bypass the
+    /// canonical/root boundary check. The resolver refuses any resolved path
+    /// that is not exactly the CLI sibling's canonical path; a caller that
+    /// reaches the sibling through an extended-length spelling still ends up
+    /// canonicalized to the same controlled path (never to a symlink target
+    /// outside the CLI directory), and any drift is still refused.
+    #[test]
+    fn resolver_extended_path_prefix_cannot_bypass_sibling_boundary() {
+        use std::os::windows::fs::symlink_file;
+
+        let dir = temp_dir("ext_prefix");
+        let cli = dir.join("mida-cli.exe");
+        write(&cli, b"CLI");
+        // Real bytes live outside the sibling identity.
+        let outside = dir.join("hidden/real-acceptance.exe");
+        std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
+        write(&outside, b"REAL-ACCEPTANCE");
+        let sibling = dir.join("mida-acceptance.exe");
+        symlink_file(&outside, &sibling).unwrap_or_else(|_| {
+            std::fs::hard_link(&outside, &sibling).unwrap();
+        });
+        // Build the \\?\\ extended-length spelling of the sibling and reach the
+        // resolver through it: the CLI's own parent is derived from the real
+        // (non-prefixed) path, but a hostile caller could pass a prefixed path
+        // in. canonicalize must normalize both sides; the boundary check must
+        // still refuse the symlink drift.
+        let canon = std::fs::canonicalize(&sibling).unwrap();
+        let mut prefixed = std::path::PathBuf::from("\\\\?\\");
+        prefixed.push(&canon);
+        // The prefixed spelling canonicalizes to the same path as the sibling;
+        // the resolver must still reject because the canonical target differs
+        // from `cli_dir/mida-acceptance.exe` (path drift).
+        let err = resolve_acceptance_bin_from_cli(&prefixed)
+            .expect_err("extended-path-prefixed symlink escape must fail");
+        assert!(
+            err.to_string().contains("path drift") || err.to_string().contains("does not exist"),
+            "{err}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A symlink sibling whose target is a DIFFERENT directory inside the CLI
+    /// root (subdirectory escape) must also be refused: only the exact
+    /// `cli_dir/mida-acceptance.exe` regular file identity is acceptable.
+    #[test]
+    fn resolver_rejects_symlink_into_subdirectory_escape() {
+        use std::os::windows::fs::symlink_file;
+        let dir = temp_dir("subdir_escape");
+        let cli = dir.join("mida-cli.exe");
+        write(&cli, b"CLI");
+        let nested = dir.join("nested/mida-acceptance.exe");
+        std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        write(&nested, b"NESTED-REAL");
+        let sibling = dir.join("mida-acceptance.exe");
+        symlink_file(&nested, &sibling).unwrap_or_else(|_| {
+            std::fs::hard_link(&nested, &sibling).unwrap();
+        });
+        let err = resolve_acceptance_bin_from_cli(&cli).expect_err("subdirectory escape must fail");
+        assert!(err.to_string().contains("path drift"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
     /// Path-replacement seam: resolving an identity, then REPLACING the file,
     /// then re-resolving must catch the replacement (the second resolution's
     /// hash differs). This is the "replacement occurs between identity
