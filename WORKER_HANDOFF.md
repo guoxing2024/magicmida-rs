@@ -882,3 +882,86 @@ used=2 / cap=2 / remaining=0 (final Route C round; no R3)
 - this P1 is a pre-existing HEAD architecture coupling; the 4 commits did **not** add or widen it;
 - future governance must go through an identity-bound policy / transform evidence-chain independent work order;
 - moving fixed RVAs into a new config item must **not** be claimed as generalization.
+
+### MIDA-SERIAL-19 Identity Gate Local Commit Closure — 2026-08-15
+
+**Date:** 2026-08-15 · **Branch:** `oreans/two-sample-mainline`
+**New HEAD:** `52a48648ddcdc6607f2edb3662596cef03cfaef8`
+**Prior HEAD:** `217db8abc788f89f73260e44a2b703b9a4f2b9ee`
+
+### A. New HEAD
+
+`52a48648ddcdc6607f2edb3662596cef03cfaef8`
+
+### B. Commit 1 / Core
+
+- SHA: `67075123e9ebe8591d56352bc833ae904c43858e`
+- Message: `feat(pe): add ASLR-stable module identity and identity-bound policy gate`
+- Files:
+  - `crates/pe/src/dumper/module_identity.rs`
+  - `crates/pe/src/dumper/mod.rs`
+  - `crates/pe/src/dumper/capture_policy.rs`
+  - `crates/cli/src/capture_policy_file.rs`
+
+### C. Commit 2 / Evidence + Integration
+
+- SHA: `52a48648ddcdc6607f2edb3662596cef03cfaef8`
+- Message: `fix(pe): gate sample transforms and persist truthful activation evidence`
+- Files:
+  - `crates/pe/src/dumper/snapshot_manifest.rs`
+  - `crates/pe/src/dumper/raw_slab_coherence.rs`
+  - `crates/pe/src/dumper/dump_process.rs`
+  - `crates/pe/src/dumper/heap_global_snapshot.rs`
+
+### D. Atomic boundary
+
+- Core can compile independently;
+- Evidence + Integration **must be one atomic commit**;
+- `snapshot_manifest` activation parameter propagation requires `dump_process` to exist in the same commit;
+- the two commits are linearly parented (`6707512` -> `52a4864`, parent of Commit 1 is `217db8a`);
+- no third commit was created;
+- no push.
+
+### E. Verification (offline facts only)
+
+- `cargo check --workspace --offline`: **PASS**
+- `cargo test --workspace --offline`: **1909 passed / 0 failed / 2 ignored**
+- capture_policy: **16 passed**; module_identity: **9 passed**
+- snapshot_manifest: **11 passed**; dump_process: **46 passed**
+- heap_global_snapshot: **73 passed**; raw_slab_coherence: **292 passed**
+- m17_: **2 passed**
+- `cargo fmt --all -- --check`: **PASS**; `git diff --check`: **PASS**
+- tracked working tree: **clean**; staged: **0**; push: **not executed**
+
+### F. Identity gate facts
+
+- `ModuleIdentity` uses Machine, TimeDateStamp, SizeOfImage, CheckSum, canonical section-layout digest;
+- does **not** include `image_base`;
+- unbound / binding mismatch / revision 0 / digest mismatch / missing identity all **fail closed**;
+- only a matching policy permits sample-specific transforms;
+- manifest `sample_specific_activation` is driven by the dump pipeline final `sample_active`;
+- rejected transforms do **not** write applied ledger records.
+
+### G. Fixed-RVA current boundary
+
+- the `0x141bf0` special case still exists but is **identity-bound**;
+- `0x147868`/`0x147888` fixed RVAs are **not generalized**;
+- `0x147868` does **not** enter sanitize/reinit;
+- no new heuristic; no new `cold_reinit_rvas`/`sanitize_reinit_rvas`;
+- MIDA-SERIAL-06 generic-predicate blocker is **not** claimed resolved.
+
+### H. Governance boundary
+
+- `dynamic_authorized = false`;
+- `governance = RouteY_R1_GTO_LAUNCHER_REV2_DynamicAuthorizationSuspended`;
+- approved scope remains only: `RouteY_R1_GTO_LAUNCHER_REV2_RUNTIME_MODULE_IDENTITY_RECAPTURE_2`;
+- local commit closure **≠** dynamic authorization; offline test PASS **≠** dynamic validation;
+- manifest activation=true **≠** authority approval; this record is **not** a new authority approval;
+- no launcher/target started; no observer/controller/network/firewall/hook/injection/debugger executed.
+
+### I. Deferred P1/P2
+
+- `POLICY_UNBOUND_SAMPLE_COUPLING`: identity-gated and statically mitigated, but **governance-deferred / not authority-resolved**;
+- P2: `detect_heap_globals` full debugger pipeline test gap;
+- P2: `sample_transform_allowed`/`policy_for_generic_path` unused reserved interfaces;
+- P2: fixed-RVA generalization still requires an independent governance work order.
