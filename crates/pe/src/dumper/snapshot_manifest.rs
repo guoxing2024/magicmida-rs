@@ -428,6 +428,9 @@ pub(crate) fn render_manifest_json(
             super::heap_global_snapshot::CapturePath::MainSlot => "main_slot",
             super::heap_global_snapshot::CapturePath::GscriptFirstHop => "gscript_first_hop",
             super::heap_global_snapshot::CapturePath::GscriptChildLink => "gscript_child_link",
+            super::heap_global_snapshot::CapturePath::GscriptLabelTableEntry => {
+                "gscript_label_table_entry"
+            }
             super::heap_global_snapshot::CapturePath::StringBufferChild => "string_buffer_child",
             super::heap_global_snapshot::CapturePath::DanglingEdge => "dangling_edge",
             super::heap_global_snapshot::CapturePath::ImageInline => "image_inline",
@@ -1192,8 +1195,9 @@ mod tests {
     // preimage basis (probe/interior seeded from S, strict from C after C==S).
     #[test]
     fn route_q_r0e_manifest_proves_transform_preimage_basis() {
+        use crate::dumper::heap_global_snapshot::{CaptureExtentKind, CapturePath};
         use crate::dumper::raw_slab_coherence::{
-            RawChildKind, TransformPreimageBasis, TransformPreimageBinding,
+            FullCaptureIdentity, RawChildKind, TransformPreimageBasis, TransformPreimageBinding,
         };
         // A probe/interior binding (seeded from authoritative slab S).
         let interior = TransformPreimageBinding {
@@ -1202,6 +1206,15 @@ mod tests {
             child_old_base: 0x8aa5f8,
             child_size: 0x70,
             extent_kind: CaptureExtentKind::InteriorSubview,
+            identity: FullCaptureIdentity::from_plain_parts(
+                RawChildKind::HeapGlobal,
+                "route-p-geometry".into(),
+                0x8aa5f8,
+                0x70,
+                CaptureExtentKind::InteriorSubview,
+                CapturePath::MainSlot,
+                0,
+            ),
             slab_old_base: 0x874000,
             slab_size: 0x48000,
             slab_digest: "slab_full_digest".into(),
@@ -1219,6 +1232,15 @@ mod tests {
             child_old_base: 0x8bb000,
             child_size: 0x40,
             extent_kind: CaptureExtentKind::ObservedAllocation,
+            identity: FullCaptureIdentity::from_plain_parts(
+                RawChildKind::HeapGlobal,
+                "strict1".into(),
+                0x8bb000,
+                0x40,
+                CaptureExtentKind::ObservedAllocation,
+                CapturePath::MainSlot,
+                0,
+            ),
             slab_old_base: 0x874000,
             slab_size: 0x48000,
             slab_digest: "slab_full_digest".into(),

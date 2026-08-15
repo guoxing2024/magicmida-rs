@@ -89,6 +89,7 @@ const MIN_MODULE_REGION: u64 = 0x0000_7ff0_0000_0000;
 /// inter-block pointer graph and caused RtlpFindEntry AVs after restore.
 /// Set above MAX_HEAP_GLOBAL_BYTES so only code-xref'd slots are restored.
 const MIN_FILL_ONLY_CAPTURE_BYTES: usize = MAX_HEAP_GLOBAL_BYTES + 1;
+const GSCRIPT_LABEL_COUNT_END: usize = 0x14;
 
 /// One plain heap-pointer slot in a zero-raw writable section.
 ///
@@ -196,6 +197,11 @@ pub enum CapturePath {
     GscriptFirstHop,
     /// Force-admitted gscript child link field.
     GscriptChildLink,
+    /// Admitted via the gscript label pointer table (+0 of gscript object).
+    /// Route Y R1 A6 AF3: this is the truthful source for a label-table entry
+    /// admitted by `exhaust_gscript_label_table_entries` — NOT MainSlot, which
+    /// semantically means an image/root slot read.
+    GscriptLabelTableEntry,
     /// Captured string-buffer child (refcounted shell).
     StringBufferChild,
     /// Captured dangling edge (final walk).
@@ -1188,6 +1194,14 @@ pub fn record_transform_applied(
     }
 }
 
+/// Read the gscript label-table count without ever indexing a short image
+/// inline body. The field occupies `[0x10..0x14)`; a shorter body is
+/// incomplete input and must fail closed.
+fn gscript_label_count(content: &[u8]) -> Option<usize> {
+    let bytes = content.get(0x10..GSCRIPT_LABEL_COUNT_END)?;
+    Some(u32::from_le_bytes(bytes.try_into().ok()?) as usize)
+}
+
 pub fn reconcile_duplicate_heap_globals(
     out: &mut Vec<HeapGlobalSnapshot>,
     raw_slab: Option<&HeapSlab>,
@@ -1273,6 +1287,118 @@ pub fn reconcile_duplicate_heap_globals(
         );
     }
     *out = keep;
+}
+
+/// Route Y R1 GTO R1 (no-bypass resume): retroactively trim overlapping
+/// heap-global capture windows so adjacent objects never both claim the same
+/// slab bytes.
+///
+/// Why this is needed: `cap_size_before_next_base` only bounds a NEW capture
+/// by the higher bases already in `out` at admission time. Two admission paths
+/// (gscript child-link force-admit and label-table entry exhaust) can admit
+/// adjacent heap objects in an order where the earlier, lower capture's window
+/// already extends past the later neighbor's base. Example (fresh no-bypass
+/// capture of the protected input): label at `0x882ad0` admitted via
+/// child-link force-admit with a 0x400 window [0x882ad0,0x882ed0), then label at
+/// `0x882e18` admitted via label-table exhaust with window [0x882e18,0x883218).
+/// The windows overlap [0x882e18,0x882ed0); the raw-slab overlay fail-closes
+/// with a transformed write conflict (scrub_uncaptured_heap_pointers and
+/// mark_labels_non_nested both write the shared byte at absolute 0x882e3b).
+///
+/// The fix is a general capture normalization, not a sample-specific patch:
+/// for every pair of non-handle heap globals whose windows overlap, the
+/// lower-address capture is trimmed to end at the higher-address capture's
+/// base (the higher capture is the later-discovered, canonical object start).
+/// Deterministic: process by ascending live_ptr; only shrink, never grow, never
+/// reject. A capture trimmed below 8 bytes (or below the size the transform
+/// needs) is dropped by the caller's existing filters downstream.
+///
+/// The raw-window exception is metadata-driven: a main-slot capture that records
+/// an observed allocation with the full hot probe window is the declared-size
+/// reinitialization class. No sample RVA or absolute image address is involved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeapGlobalWindowTrimPolicy {
+    /// Keep declared-size reinitialization windows intact while trimming their
+    /// neighbors. Disable only for callers that intentionally discard that raw
+    /// preimage before the reinit transform runs.
+    pub preserve_declared_size_windows: bool,
+}
+
+impl Default for HeapGlobalWindowTrimPolicy {
+    fn default() -> Self {
+        Self {
+            preserve_declared_size_windows: true,
+        }
+    }
+}
+
+fn is_declared_size_window(g: &HeapGlobalSnapshot) -> bool {
+    g.extent_kind == CaptureExtentKind::ObservedAllocation
+        && g.extent_evidence.capture_path == CapturePath::MainSlot
+        && g.extent_evidence.source_root_rva == Some(g.rva)
+        && g.content.len() == HOT_XREF_SIZE_PROBE_CAP
+}
+
+pub fn trim_overlapping_heap_global_windows(out: &mut Vec<HeapGlobalSnapshot>) -> usize {
+    trim_overlapping_heap_global_windows_with_policy(out, &HeapGlobalWindowTrimPolicy::default())
+}
+/// Trim overlapping heap-global windows under explicit capture policy.
+pub fn trim_overlapping_heap_global_windows_with_policy(
+    out: &mut Vec<HeapGlobalSnapshot>,
+    policy: &HeapGlobalWindowTrimPolicy,
+) -> usize {
+    if out.len() < 2 {
+        return 0;
+    }
+    let mut trimmed = 0usize;
+    // Deterministic ascending base order; stable for equal bases (handles /
+    // image-inline are skipped below anyway).
+    let mut order: Vec<usize> = (0..out.len()).collect();
+    order.sort_by_key(|&i| out[i].live_ptr);
+    for pos in 0..order.len() {
+        let i = order[pos];
+        if out[i].is_heap_handle || out[i].is_image_inline || out[i].content.is_empty() {
+            continue;
+        }
+        // A declared-size reinit consumes the raw preimage before replacing the
+        // body. Preserve that semantic window; its neighbors remain trimmable.
+        if policy.preserve_declared_size_windows && is_declared_size_window(&out[i]) {
+            continue;
+        }
+        let a_start = out[i].live_ptr;
+        let Some(a_end) = a_start.checked_add(out[i].content.len() as u64) else {
+            // An overflowing range cannot be normalized safely. Fail closed.
+            continue;
+        };
+        // Look at every later (higher or equal) capture for an interior base.
+        for &j in &order[pos + 1..] {
+            if out[j].is_heap_handle || out[j].is_image_inline || out[i].content.is_empty() {
+                continue;
+            }
+            // Any later object base inside A is a legitimate canonical boundary;
+            // only the explicitly protected raw window itself is exempt above.
+            let b_start = out[j].live_ptr;
+            if b_start <= a_start {
+                continue;
+            }
+            if b_start < a_end {
+                // B's base is interior to A's window: trim A to end at B.
+                let new_len = usize::try_from(b_start - a_start).unwrap_or(out[i].content.len());
+                if new_len < out[i].content.len() {
+                    out[i].content.truncate(new_len);
+                    trimmed += 1;
+                }
+                break; // A now ends at the nearest higher base; done with A.
+            }
+        }
+    }
+    if trimmed > 0 {
+        info!(
+            trimmed,
+            "R1: trimmed overlapping heap-global capture windows (retroactive next-base cap)"
+        );
+    }
+    trimmed
 }
 
 /// Capture AHK `g_script` as an in-image object body.
@@ -2017,7 +2143,10 @@ fn exhaust_gscript_first_hop(
 /// base multi_fixup never remapped that link → WinMain string walk crashed on
 /// freelist poison after MessageBox. Capture exact bases for common link
 /// offsets so remap lands on freeable snapshots.
-fn exhaust_gscript_child_link_fields(
+/// Route Y R1 A6 AF3 AF1 (P1-1): exposed `pub(crate)` so the AF3 AF1
+/// emitter-driven pre-existing child-link tests can drive the REAL production
+/// child-link emitter with a mock DebuggerCore.
+pub(crate) fn exhaust_gscript_child_link_fields(
     out: &mut Vec<HeapGlobalSnapshot>,
     total_bytes: &mut usize,
     seen_heaps: &mut BTreeSet<u64>,
@@ -3088,8 +3217,9 @@ pub fn mark_labels_non_nested(heap_globals: &mut [HeapGlobalSnapshot]) {
     if table_ptr == 0 {
         return;
     }
-    let count =
-        u32::from_le_bytes(gscript.content[0x10..0x14].try_into().unwrap_or_default()) as usize;
+    let Some(count) = gscript_label_count(&gscript.content) else {
+        return;
+    };
     let Some(table) = heap_globals
         .iter()
         .find(|g| g.live_ptr == table_ptr && g.content.len() >= 8)
@@ -3332,7 +3462,9 @@ pub fn repair_label_names_after_scrub(
         return Ok(());
     };
     let count = {
-        let c = u32::from_le_bytes(gscript.content[0x10..0x14].try_into().unwrap_or_default());
+        let Some(c) = gscript_label_count(&gscript.content) else {
+            return Ok(());
+        };
         if c > 0 {
             c as usize
         } else {
@@ -3495,8 +3627,9 @@ fn count_leading_heap_ptrs(content: &[u8]) -> u32 {
         if v == 0x0350_0350_0350_0350 || v == 0x2828_2828_2828_2828 {
             break;
         }
-        // Reject obvious non-pointers (small integers, high kernel).
-        if v < 0x1_0000 || v >= 0x1_0000_0000 {
+        // Use the same x64 user-heap predicate as capture admission. This
+        // intentionally accepts aligned heap pointers at and above 4 GiB.
+        if !is_heap_pointer(v, 0, 0) {
             break;
         }
         n = n.saturating_add(1);
@@ -3509,7 +3642,9 @@ fn count_leading_heap_ptrs(content: &[u8]) -> u32 {
 }
 
 /// Force-admit every non-null entry in gscript's label pointer table (+0).
-fn exhaust_gscript_label_table_entries(
+/// `pub(crate)` so the AF3 emitter-driven tests can drive the REAL production
+/// emitter with a mock DebuggerCore (Route Y R1 A6 AF3 task 3/4).
+pub(crate) fn exhaust_gscript_label_table_entries(
     out: &mut Vec<HeapGlobalSnapshot>,
     total_bytes: &mut usize,
     seen_heaps: &mut BTreeSet<u64>,
@@ -3525,6 +3660,14 @@ fn exhaust_gscript_label_table_entries(
     else {
         return;
     };
+    // AF3 AF1 (P1-5): the label-table source root RVA is deterministic and fixed
+    // here (before the loop mutates `out`), so the emitter can record it on every
+    // admitted label-table entry without a borrow conflict.
+    let source_root_rva = if gscript.rva != 0 {
+        Some(gscript.rva)
+    } else {
+        None
+    };
     let table_ptr = u64::from_le_bytes(gscript.content[0..8].try_into().unwrap_or_default());
     if table_ptr == 0 {
         return;
@@ -3537,8 +3680,12 @@ fn exhaust_gscript_label_table_entries(
     };
     // Bound by synthesized count if present, else full table content.
     let count = {
-        let g = out.iter().find(|g| g.is_image_inline).unwrap();
-        let c = u32::from_le_bytes(g.content[0x10..0x14].try_into().unwrap_or_default());
+        let Some(g) = out.iter().find(|g| g.is_image_inline) else {
+            return;
+        };
+        let Some(c) = gscript_label_count(&g.content) else {
+            return;
+        };
         if c > 0 {
             c as usize
         } else {
@@ -3560,10 +3707,6 @@ fn exhaust_gscript_label_table_entries(
             break;
         }
         if !is_heap_pointer(value, image_base, image_end) || value < MIN_HEAP_POINTER {
-            skipped += 1;
-            continue;
-        }
-        if value >= 0x1_0000_0000 {
             skipped += 1;
             continue;
         }
@@ -3674,22 +3817,42 @@ fn exhaust_gscript_label_table_entries(
             "Captured gscript label-table entry"
         );
         *total_bytes = total_bytes.saturating_add(child.len());
+        // Route Y R1 A6 AF3: a label-table entry is a REAL gscript Label only
+        // when it carries the canonical `gscript_label:{base}` identity. The
+        // emitter is also the single point where the label's interior/parent
+        // evidence is fixed — BEFORE raw capture freeze — so the Q0-C +0x23
+        // scrub protection is production-reachable (live A6: B was admitted by
+        // this exact emitter). When the label sits inside an already-captured
+        // snapshot, classify it as InteriorSubview with a uniquely-resolved
+        // containing parent; otherwise it stays a ProbeWindow with NO parent
+        // evidence (never protected — no parent to bind). capture_id remains the
+        // canonical base-bound `gscript_label:{value:#x}`; capture_path is the
+        // truthful label-table source (not MainSlot).
+        //
+        // Route Y R1 A6 AF3 AF1 (P1-5): record the deterministic label-table
+        // source evidence — the table-entry byte offset (`off`) and the gscript
+        // root RVA (when present). probe_requested_size is 0 for this family:
+        // the label-table entry size is bounded by `cap_size_before_next_base`,
+        // not by a first-hop probe, so the canonical rule REQUIRES it to be 0
+        // (a non-zero probe evidence would be inconsistent with this family).
+        let (interior_parent, extent_kind) =
+            label_table_entry_interior_classification(out, value, child.len());
         out.push(HeapGlobalSnapshot {
             rva: 0,
             live_ptr: value,
             content: child,
             is_heap_handle: false,
             is_image_inline: false,
-            extent_kind: CaptureExtentKind::default(),
+            extent_kind,
             extent_evidence: CaptureExtentEvidence {
                 capture_id: format!("gscript_label:{value:#x}"),
-                capture_path: CapturePath::MainSlot,
-                source_root_rva: None,
-                source_slot_offset: None,
+                capture_path: CapturePath::GscriptLabelTableEntry,
+                source_root_rva,
+                source_slot_offset: Some(off),
                 probe_requested_size: 0,
-                was_interior: false,
-                containing_parent_old_base: None,
-                containing_parent_size: None,
+                was_interior: interior_parent.is_some(),
+                containing_parent_old_base: interior_parent.map(|(b, _)| b),
+                containing_parent_size: interior_parent.map(|(_, s)| s),
             },
             transform_ids: Vec::new(),
             provenance: RegionProvenance::default(),
@@ -3960,8 +4123,12 @@ fn externalize_all_label_names_from_table(
         return;
     };
     let count = {
-        let g = out.iter().find(|g| g.is_image_inline).unwrap();
-        let c = u32::from_le_bytes(g.content[0x10..0x14].try_into().unwrap_or_default());
+        let Some(g) = out.iter().find(|g| g.is_image_inline) else {
+            return;
+        };
+        let Some(c) = gscript_label_count(&g.content) else {
+            return;
+        };
         if c > 0 {
             c as usize
         } else {
@@ -4127,7 +4294,7 @@ fn looks_like_dense_pointer_table(content: &[u8]) -> bool {
     let mut ptrs = 0u32;
     for i in 0..n {
         let v = u64::from_le_bytes(content[i * 8..i * 8 + 8].try_into().unwrap_or_default());
-        if v >= 0x1_0000 && v < 0x1_0000_0000 {
+        if is_heap_pointer(v, 0, 0) {
             ptrs += 1;
         }
     }
@@ -4984,6 +5151,107 @@ fn find_containing_snapshot(out: &[HeapGlobalSnapshot], target: u64) -> Option<(
     best
 }
 
+/// Route Y R1 A6 AF3: classify a freshly-admitted label-table entry's interior
+/// status deterministically at EMITTER time (before raw capture freeze). Returns
+/// `(Some(parent_base, parent_size), InteriorSubview)` only when the label lies
+/// inside a UNIQUELY-resolved containing snapshot; otherwise `(None, ProbeWindow)`.
+///
+/// The containing parent is the innermost non-empty, non-handle snapshot that
+/// contains the label address. If two DIFFERENT snapshots share the same innermost
+/// (base, size) — i.e. the parent is ambiguous — it fails closed to ProbeWindow
+/// (no parent evidence → the entry is never claimed as InteriorSubview nor
+/// protected). This is the production counterpart of the AF2/AF2R1 fixture's
+/// InteriorSubview + parent classification, now reachable from the real emitter.
+/// Route Y R1 A6 AF3 AF1 (P1-4): resolve the unique containing parent for a
+/// label-table entry admitted by the exhaust emitter, using the **full child
+/// range** (base AND actual size) so a label that starts inside a parent but
+/// extends beyond it is NOT misclassified as InteriorSubview.
+///
+/// Fail-closed rules (each returns `(None, ProbeWindow)` — never a protection):
+/// - 0 parents fully containing the child range;
+/// - child range overflow (`checked_add` fails) — a wrapping span can never be
+///   proven contained;
+/// - >1 parents tied for the **same minimal span** (base/size) — the smallest
+///   containing span must be unique at the identity level;
+/// - the minimal span has >1 distinct capture identities (equal-size different
+///   base, or same base/size different identity) — ambiguity must refuse;
+/// - child starts inside a parent but its end overflows/escapes that parent.
+///
+/// The parent selection is **order-independent**: every candidate is collected
+/// first, then the minimal span is chosen, then uniqueness is enforced. Iteration
+/// order never selects "the first" overlapping parent.
+fn label_table_entry_interior_classification(
+    out: &[HeapGlobalSnapshot],
+    child_base: u64,
+    child_size: usize,
+) -> (Option<(u64, usize)>, CaptureExtentKind) {
+    // checked_add: a wrapping child span can never be proven contained.
+    let Some(child_end) = child_base.checked_add(child_size as u64) else {
+        return (None, CaptureExtentKind::ProbeWindow);
+    };
+    if child_size == 0 {
+        return (None, CaptureExtentKind::ProbeWindow);
+    }
+    // Collect every snapshot that FULLY contains the child range. Only the whole
+    // range matters — a parent that covers only the label's start byte is not a
+    // valid containing parent (P1-4).
+    let mut parents: Vec<(u64, usize)> = Vec::new();
+    for o in out {
+        if o.is_heap_handle || o.content.is_empty() {
+            continue;
+        }
+        // checked_add on the parent span; an overflowing parent span is not a
+        // proven container.
+        let Some(parent_end) = o.live_ptr.checked_add(o.content.len() as u64) else {
+            continue;
+        };
+        if o.live_ptr <= child_base && child_end <= parent_end {
+            parents.push((o.live_ptr, o.content.len()));
+        }
+    }
+    if parents.is_empty() {
+        return (None, CaptureExtentKind::ProbeWindow);
+    }
+    // Minimal containing span = smallest parent_size. Iteration order must not
+    // decide: collect ALL minima first, then require uniqueness at (base,size).
+    let min_size = parents.iter().map(|&(_, s)| s).min().unwrap();
+    let minima: Vec<(u64, usize)> = parents
+        .iter()
+        .copied()
+        .filter(|&(_, s)| s == min_size)
+        .collect();
+    if minima.len() != 1 {
+        // >1 distinct (base,size) at the same minimal span, or the same span
+        // reached twice → ambiguous → refuse.
+        return (None, CaptureExtentKind::ProbeWindow);
+    }
+    let (parent_base, parent_size) = minima[0];
+    // Unique at the identity level: exactly one distinct snapshot at that
+    // base/size. Equal base/size with a DIFFERENT capture identity is ambiguous
+    // (the parent identity is part of the protection binding).
+    let mut same_span = 0usize;
+    let mut distinct_identity_at_span = 0usize;
+    let mut seen_ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for o in out {
+        if o.is_heap_handle || o.content.is_empty() {
+            continue;
+        }
+        if o.live_ptr == parent_base && o.content.len() == parent_size {
+            same_span += 1;
+            if seen_ids.insert(o.extent_evidence.capture_id.clone()) {
+                distinct_identity_at_span += 1;
+            }
+        }
+    }
+    if same_span != 1 || distinct_identity_at_span != 1 {
+        return (None, CaptureExtentKind::ProbeWindow);
+    }
+    (
+        Some((parent_base, parent_size)),
+        CaptureExtentKind::InteriorSubview,
+    )
+}
+
 fn is_exact_live_ptr(out: &[HeapGlobalSnapshot], addr: u64) -> bool {
     out.iter()
         .any(|o| !o.is_heap_handle && o.live_ptr == addr && !o.content.is_empty())
@@ -5754,12 +6022,41 @@ pub fn scrub_uncaptured_heap_pointers(
         }
     }
 
+    // Route Y R1 A6 AF2 (Q0-C narrow mitigation): protect the gscript Label
+    // +0x23 non-nested redirect flag byte from being clobbered by its
+    // CONTAINING PARENT's scrub. Authorization is full-identity: the scrubbing
+    // buffer's CurrentScrubIdentity must equal the protection's parent identity
+    // on every field (capture_id, extent_kind, capture_path, old_base, size,
+    // kind). Address/base/size alone is never sufficient. Containers have no
+    // reliable capture identity and therefore never receive Label-flag
+    // protection. The Label's own buffer is still scrubbed so
+    // `mark_labels_non_nested` can set the flag to 1. This is NOT a general
+    // contained-overlap permission and does NOT weaken Q0-C resolved_writes.
+    let label_protections = gscript_label_flag_protections(heap_globals);
+
     let mut scrubbed = 0usize;
     for c in containers.iter_mut() {
-        scrubbed += scrub_buffer_external_ptrs(&mut c.heap_content, &ranges, image_base, image_end);
+        // Containers have no capture_id/extent/path — no Label-flag protection.
+        let current = CurrentScrubIdentity::container(c.decoded_begin, c.heap_content.len());
+        scrubbed += scrub_buffer_external_ptrs(
+            &mut c.heap_content,
+            &current,
+            &ranges,
+            image_base,
+            image_end,
+            &label_protections,
+        );
     }
     for g in heap_globals.iter_mut() {
-        scrubbed += scrub_buffer_external_ptrs(&mut g.content, &ranges, image_base, image_end);
+        let current = CurrentScrubIdentity::heap_global(g);
+        scrubbed += scrub_buffer_external_ptrs(
+            &mut g.content,
+            &current,
+            &ranges,
+            image_base,
+            image_end,
+            &label_protections,
+        );
     }
     if scrubbed > 0 {
         info!(
@@ -5770,11 +6067,700 @@ pub fn scrub_uncaptured_heap_pointers(
     }
 }
 
-fn scrub_buffer_external_ptrs(
+/// Object kind of the buffer currently being scrubbed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScrubObjectKind {
+    HeapGlobal,
+    Container,
+}
+
+/// Full identity of the buffer currently being scrubbed.
+///
+/// Every authorization field is compared against `LabelFlagProtection.parent`.
+/// Containers carry no reliable capture identity and therefore never equal a
+/// parent identity (which always comes from a heap-global snapshot).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CurrentScrubIdentity {
+    pub(crate) kind: ScrubObjectKind,
+    pub(crate) capture_id: String,
+    pub(crate) extent_kind: CaptureExtentKind,
+    pub(crate) capture_path: CapturePath,
+    pub(crate) old_base: u64,
+    pub(crate) size: usize,
+    /// Route Y R1 A6 AF3 AF2 AF1 (P1-1, option A): the CURRENT scrub parent must
+    /// carry and compare the FULL parent source evidence, so a protection's
+    /// recorded parent can never authorize a scrub whose live snapshot drifted on
+    /// any source-evidence / containing-parent field.
+    pub(crate) source_root_rva: Option<u32>,
+    pub(crate) source_slot_offset: Option<usize>,
+    pub(crate) probe_requested_size: usize,
+    pub(crate) was_interior: bool,
+    pub(crate) containing_parent_old_base: Option<u64>,
+    pub(crate) containing_parent_size: Option<usize>,
+}
+
+impl CurrentScrubIdentity {
+    fn heap_global(g: &HeapGlobalSnapshot) -> Self {
+        Self {
+            kind: ScrubObjectKind::HeapGlobal,
+            capture_id: g.extent_evidence.capture_id.clone(),
+            extent_kind: g.extent_kind,
+            capture_path: g.extent_evidence.capture_path,
+            old_base: g.live_ptr,
+            size: g.content.len(),
+            source_root_rva: g.extent_evidence.source_root_rva,
+            source_slot_offset: g.extent_evidence.source_slot_offset,
+            probe_requested_size: g.extent_evidence.probe_requested_size,
+            was_interior: g.extent_evidence.was_interior,
+            containing_parent_old_base: g.extent_evidence.containing_parent_old_base,
+            containing_parent_size: g.extent_evidence.containing_parent_size,
+        }
+    }
+
+    fn container(old_base: u64, size: usize) -> Self {
+        Self {
+            kind: ScrubObjectKind::Container,
+            capture_id: String::new(),
+            extent_kind: CaptureExtentKind::default(),
+            capture_path: CapturePath::default(),
+            old_base,
+            size,
+            source_root_rva: None,
+            source_slot_offset: None,
+            probe_requested_size: 0,
+            was_interior: false,
+            containing_parent_old_base: None,
+            containing_parent_size: None,
+        }
+    }
+
+    /// True iff this scrub identity is exactly the protection's parent. Every
+    /// parent field — including the full source evidence and containing-parent —
+    /// must match; a single field difference denies authorization.
+    fn matches_parent(&self, parent: &CaptureIdentity) -> bool {
+        self.kind == ScrubObjectKind::HeapGlobal
+            && self.capture_id == parent.capture_id
+            && self.extent_kind == parent.extent_kind
+            && self.capture_path == parent.capture_path
+            && self.old_base == parent.old_base
+            && self.size == parent.size
+            && self.source_root_rva == parent.source_root_rva
+            && self.source_slot_offset == parent.source_slot_offset
+            && self.probe_requested_size == parent.probe_requested_size
+            && self.was_interior == parent.was_interior
+            && self.containing_parent_old_base == parent.containing_parent_old_base
+            && self.containing_parent_size == parent.containing_parent_size
+    }
+}
+
+/// Full capture identity for a child Label or its containing parent.
+/// Every field participates in generation gates and/or scrub authorization.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CaptureIdentity {
+    pub(crate) capture_id: String,
+    pub(crate) extent_kind: CaptureExtentKind,
+    pub(crate) capture_path: CapturePath,
+    pub(crate) old_base: u64,
+    pub(crate) size: usize,
+    /// Route Y R1 A6 AF3: source link offset / probe size for the real
+    /// `gscript_child_link:` family — consumed during family-aware canonical
+    /// re-validation at consume time. None/0 for families that do not encode
+    /// them (e.g. `gscript_label:`).
+    pub(crate) source_slot_offset: Option<usize>,
+    pub(crate) probe_requested_size: usize,
+    /// Route Y R1 A6 AF3 AF1 (P1-6): the source root RVA of the gscript object
+    /// that led to this capture (`gscript_first_hop:` / `gscript_label:` emit the
+    /// gscript root RVA; `gscript_child_link:` has none). Consumed by the
+    /// family-aware canonical parser when the family encodes it.
+    pub(crate) source_root_rva: Option<u32>,
+    /// Route Y R1 A6 AF3 AF1 (P1-6): whether the capture was interior to an
+    /// already-captured object at emit time. Consumed by the consume-time
+    /// predicate (a protection is only reachable for an interior label).
+    pub(crate) was_interior: bool,
+    /// Route Y R1 A6 AF3 AF2 AF1 (P1-1): the containing-parent anchor of the
+    /// snapshot this identity came from. The live scrub parent must match the
+    /// recorded parent on these too — a parent may itself be interior to another
+    /// object, and that containment is part of the identity.
+    pub(crate) containing_parent_old_base: Option<u64>,
+    pub(crate) containing_parent_size: Option<usize>,
+}
+
+impl CaptureIdentity {
+    fn from_heap_global(g: &HeapGlobalSnapshot) -> Self {
+        Self {
+            capture_id: g.extent_evidence.capture_id.clone(),
+            extent_kind: g.extent_kind,
+            capture_path: g.extent_evidence.capture_path,
+            old_base: g.live_ptr,
+            size: g.content.len(),
+            source_slot_offset: g.extent_evidence.source_slot_offset,
+            probe_requested_size: g.extent_evidence.probe_requested_size,
+            source_root_rva: g.extent_evidence.source_root_rva,
+            was_interior: g.extent_evidence.was_interior,
+            containing_parent_old_base: g.extent_evidence.containing_parent_old_base,
+            containing_parent_size: g.extent_evidence.containing_parent_size,
+        }
+    }
+}
+
+/// Strict, full-identity protection entry for a gscript Label's `+0x23`
+/// non-nested redirect flag byte.
+///
+/// ALL carried fields participate in generation and/or scrub authorization.
+/// No field is stored "for documentation only".
+#[derive(Clone, Debug)]
+pub(crate) struct LabelFlagProtection {
+    pub(crate) child: CaptureIdentity,
+    pub(crate) parent: CaptureIdentity,
+    /// Always 0x23 for the non-nested redirect flag.
+    pub(crate) flag_offset: usize,
+    /// Absolute address of the protected flag byte (= child.old_base + 0x23).
+    pub(crate) flag_addr: u64,
+    /// Inclusive-exclusive absolute range of the qword that holds the flag.
+    pub(crate) flag_qword_lo: u64,
+    pub(crate) flag_qword_hi: u64,
+}
+
+/// Canonical gscript Label capture_id form produced by production capture:
+/// `gscript_label:{live_ptr:#x}` (e.g. `gscript_label:0x8e9da8`).
+///
+/// Accepts ONLY that exact form: prefix + `0x` + lowercase hex equal to
+/// `expected_base`. Rejects empty, prefix-only, wrong encoded address,
+/// trailing garbage, uppercase, missing `0x`, and malformed digits.
+pub(crate) fn parse_canonical_gscript_label_capture_id(
+    capture_id: &str,
+    expected_base: u64,
+) -> bool {
+    const PREFIX: &str = "gscript_label:";
+    let Some(rest) = capture_id.strip_prefix(PREFIX) else {
+        return false;
+    };
+    if rest.is_empty() {
+        return false;
+    }
+    // Production emitter: format!("gscript_label:{value:#x}") → "0x" + lowercase hex.
+    let Some(hex) = rest.strip_prefix("0x") else {
+        return false;
+    };
+    if hex.is_empty() {
+        return false;
+    }
+    // Every remaining char must be a lowercase hex digit — no trailing junk.
+    if !hex
+        .bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return false;
+    }
+    let Ok(encoded) = u64::from_str_radix(hex, 16) else {
+        return false;
+    };
+    // Encoded address must equal the Label's live_ptr, AND the string must be
+    // exactly the canonical rendering (rejects leading zeros / alternate forms
+    // that parse to the same integer but are not the production form).
+    encoded == expected_base && capture_id == format!("gscript_label:{expected_base:#x}")
+}
+
+/// Route Y R1 A6 AF3: strict parser for the REAL production `gscript_child_link:`
+/// capture-id family emitted by `exhaust_gscript_child_link_fields`
+/// (heap_global_snapshot.rs):
+/// `gscript_child_link:{parent_live:#x}:{loff:#x}:{value:#x}:{probe}` where
+/// `probe` is the raw decimal probe size.
+///
+/// Validates EVERY encoded field against the snapshot's recorded identity:
+/// parent == containing_parent_old_base, loff == source_slot_offset,
+/// value == live_ptr, probe == probe_requested_size. Rejects any mismatch,
+/// arbitrary prefixes, uppercase / trailing junk / missing fields. The
+/// containing parent MUST be present (a child_link id with no parent evidence is
+/// not a valid interior label identity).
+fn parse_canonical_gscript_child_link_capture_id(
+    capture_id: &str,
+    expected_parent: Option<u64>,
+    expected_loff: Option<usize>,
+    expected_base: u64,
+    expected_probe: usize,
+) -> bool {
+    const PREFIX: &str = "gscript_child_link:";
+    let Some(rest) = capture_id.strip_prefix(PREFIX) else {
+        return false;
+    };
+    if rest.is_empty() {
+        return false;
+    }
+    let parts: Vec<&str> = rest.split(':').collect();
+    if parts.len() != 4 {
+        return false;
+    }
+    let parse_hex = |s: &str| -> Option<u64> {
+        let h = s.strip_prefix("0x")?;
+        if h.is_empty() {
+            return None;
+        }
+        if !h
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return None;
+        }
+        u64::from_str_radix(h, 16).ok()
+    };
+    let parent = match parse_hex(parts[0]) {
+        Some(v) => v,
+        None => return false,
+    };
+    let loff = match parse_hex(parts[1]) {
+        Some(v) => v,
+        None => return false,
+    };
+    let base = match parse_hex(parts[2]) {
+        Some(v) => v,
+        None => return false,
+    };
+    let probe: usize = match parts[3].parse() {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    // Canonical round-trip (no leading zeros / alternate spellings).
+    if capture_id
+        != format!(
+            "gscript_child_link:{parent:#x}:{loff:#x}:{base:#x}:{}",
+            probe
+        )
+    {
+        return false;
+    }
+    let parent_ok = match expected_parent {
+        Some(p) => p == parent,
+        None => false, // child_link id REQUIRES a recorded containing parent
+    };
+    let loff_ok = match expected_loff {
+        Some(l) => (l as u64) == loff,
+        None => false, // child_link id REQUIRES a recorded link offset
+    };
+    parent_ok && loff_ok && base == expected_base && probe == expected_probe
+}
+
+/// Route Y R1 A6 AF3 AF1 (P1-2): the `gscript_first_hop:` family is NOT
+/// authorized for Label-flag protection. Its capture-id encodes only `edge_off`,
+/// which cannot strictly bind child base / parent / probe / was_interior, so
+/// keeping it authorized would be "code allows, test does not prove". A
+/// first-hop-captured table-reachable label therefore stays fail-closed
+/// (never protected). The real emitter `exhaust_gscript_first_hop` still emits
+/// this id for capture/multi_fixup purposes, but `gscript_label_flag_protections`
+/// refuses to authorize it (path gate + family parser both return false).
+
+/// Route Y R1 A6 AF3: family-aware canonical capture-id validation for a
+/// table-reachable gscript Label. Dispatches on the label's ACTUAL production
+/// `capture_path` and validates the id against the snapshot's own recorded
+/// evidence fields. This is the production reachability fix: the A6 chain
+/// captures B via `exhaust_gscript_label_table_entries`, which (after the AF3
+/// emitter fix) emits `GscriptLabelTableEntry` + `gscript_label:{base}` +
+/// InteriorSubview + a unique containing parent; a PRE-EXISTING label first
+/// captured via the real child-link emitter keeps its real
+/// `gscript_child_link:` id and is accepted only with a strict family parser.
+///
+/// Rejects: MainSlot path, ProbeWindow-without-parent, arbitrary `gscript_*`
+/// prefixes (including `gscript_first_hop:`), hand-built `gscript_label:` +
+/// GscriptChildLink tuples, and any id that does not round-trip against the
+/// recorded evidence.
+fn parse_canonical_label_capture_id_for(label: &HeapGlobalSnapshot) -> bool {
+    let ev = &label.extent_evidence;
+    match ev.capture_path {
+        CapturePath::GscriptLabelTableEntry => {
+            parse_canonical_gscript_label_capture_id(&ev.capture_id, label.live_ptr)
+                && parse_canonical_label_table_source_evidence(label)
+        }
+        CapturePath::GscriptChildLink => {
+            // A child-link label must have been captured as interior (was_interior)
+            // — it is an interior subview of its containing parent, so a
+            // non-interior child_link id is inconsistent with the protection
+            // requirement (P1-6: every carried identity field is consumed).
+            ev.was_interior
+                && parse_canonical_gscript_child_link_capture_id(
+                    &ev.capture_id,
+                    ev.containing_parent_old_base,
+                    ev.source_slot_offset,
+                    label.live_ptr,
+                    ev.probe_requested_size,
+                )
+        }
+        // GscriptFirstHop is NOT authorized (AF3 AF1 P1-2): the id encodes only
+        // edge_off and cannot strictly bind base/parent/probe/was_interior.
+        CapturePath::GscriptFirstHop => false,
+        _ => false,
+    }
+}
+
+/// Route Y R1 A6 AF3 AF1 (P1-5/P1-6): the `gscript_label:` label-table family is
+/// only canonical when its deterministic source evidence is present and
+/// consistent with the real emitter output. The exhaust emitter records:
+///   - `source_slot_offset = Some(table_entry_off)` (byte offset within the table);
+///   - `source_root_rva = Some(gscript.rva)` when the image-inline gscript object
+///     carries a non-zero RVA (the production gscript root always does);
+///   - `probe_requested_size == 0` (this family is bounded by
+///     `cap_size_before_next_base`, NOT by a first-hop probe);
+///   - `was_interior` true (a label-table entry is protected only when interior
+///     to a uniquely-resolved containing parent).
+///
+/// A GscriptLabelTableEntry path with missing/absent source evidence, or a
+/// non-zero probe evidence, is NOT canonical and must not be protected.
+fn parse_canonical_label_table_source_evidence(label: &HeapGlobalSnapshot) -> bool {
+    let ev = &label.extent_evidence;
+    // Table-entry offset is deterministic and REQUIRED.
+    if ev.source_slot_offset.is_none() {
+        return false;
+    }
+    // This family never uses a first-hop probe — a non-zero probe evidence is
+    // inconsistent with the real emitter output.
+    if ev.probe_requested_size != 0 {
+        return false;
+    }
+    // The interior label must have been captured as interior (was_interior).
+    if !ev.was_interior {
+        return false;
+    }
+    // source_root_rva is REQUIRED to be present when the emitting gscript root
+    // has a valid RVA. The production image-inline gscript root always has a
+    // non-zero RVA; a None here means the emitter could not establish the root.
+    // We accept Some(rva) OR None — but a Some(rva) must be a plausible gscript
+    // root (rva != 0). A missing root with no RVA is acceptable ONLY when the
+    // root itself had no RVA; to stay conservative we require Some(non-zero).
+    match ev.source_root_rva {
+        Some(rva) => rva != 0,
+        None => false,
+    }
+}
+
+/// Route Y R1 A6 AF3: family-aware canonical re-validation at CONSUME time.
+/// The stored `LabelFlagProtection` child carries the child's capture identity
+/// (id/path/extent/base/size/source_slot_offset/probe). For the child_link
+/// family the expected containing parent is the protection's recorded parent
+/// base (that IS the containing parent by construction); the encoder's parent
+/// field must equal it.
+fn parse_canonical_protection_child_capture_id(p: &LabelFlagProtection) -> bool {
+    let child = &p.child;
+    match child.capture_path {
+        CapturePath::GscriptLabelTableEntry => {
+            parse_canonical_gscript_label_capture_id(&child.capture_id, child.old_base)
+                // Consume-time source-evidence re-validation (P1-5/P1-6). The
+                // stored protection child carries source_root_rva / was_interior
+                // so the exact emitter output is re-verified at scrub time.
+                && child.source_slot_offset.is_some()
+                && child.probe_requested_size == 0
+                && child.was_interior
+                && matches!(child.source_root_rva, Some(rva) if rva != 0)
+        }
+        CapturePath::GscriptChildLink => {
+            // Consume-time: the child must have been captured as interior
+            // (was_interior) and its encoded parent/offset/base/probe must match
+            // the protection's recorded parent evidence (P1-6).
+            child.was_interior
+                && parse_canonical_gscript_child_link_capture_id(
+                    &child.capture_id,
+                    Some(p.parent.old_base), // containing parent == protection parent
+                    child.source_slot_offset,
+                    child.old_base,
+                    child.probe_requested_size,
+                )
+        }
+        // GscriptFirstHop is NOT authorized (AF3 AF1 P1-2).
+        CapturePath::GscriptFirstHop => false,
+        _ => false,
+    }
+}
+
+/// Require exactly one match. 0 → None (no authorization). >1 → None
+/// (ambiguous; never silently pick the first).
+pub(crate) fn unique_heap_global<'a, F>(
+    heap_globals: &'a [HeapGlobalSnapshot],
+    mut pred: F,
+) -> Option<&'a HeapGlobalSnapshot>
+where
+    F: FnMut(&HeapGlobalSnapshot) -> bool,
+{
+    let mut found: Option<&HeapGlobalSnapshot> = None;
+    for g in heap_globals {
+        if pred(g) {
+            if found.is_some() {
+                return None; // duplicate/ambiguous → refuse authorization
+            }
+            found = Some(g);
+        }
+    }
+    found
+}
+
+/// Route Y R1 A6 AF2: collect full-identity protection entries for every
+/// legitimate gscript Label's `+0x23` non-nested redirect flag byte.
+///
+/// Generation requires ALL of:
+///   - exactly one image-inline gscript object with a table pointer;
+///   - exactly one label table at that pointer;
+///   - exactly one label snapshot per table entry address;
+///   - canonical `gscript_label:{base:#x}` capture_id matching live_ptr;
+///   - extent_kind == InteriorSubview (ProbeWindow excluded);
+///   - capture_path ∈ {GscriptChildLink} or GscriptLabelTableEntry;
+///   - content.len() > 0x23; flag_addr via checked_add;
+///   - exactly one containing parent matching declared base AND size;
+///   - parent full identity recorded;
+///   - child range strictly inside parent range;
+///   - flag_addr inside both child and parent ranges.
+///
+/// Any ambiguity (0 or >1 match) refuses to generate a protection entry.
+pub(crate) fn gscript_label_flag_protections(
+    heap_globals: &[HeapGlobalSnapshot],
+) -> Vec<LabelFlagProtection> {
+    let mut protections = Vec::new();
+
+    // Exactly one gscript object (image-inline, content >= 8 for table ptr).
+    let Some(gscript) =
+        unique_heap_global(heap_globals, |g| g.is_image_inline && g.content.len() >= 8)
+    else {
+        return protections;
+    };
+    let table_ptr = u64::from_le_bytes(gscript.content[0..8].try_into().unwrap_or_default());
+    if table_ptr == 0 {
+        return protections;
+    }
+    let Some(count) = gscript_label_count(&gscript.content) else {
+        return protections;
+    };
+
+    // Exactly one label table at table_ptr.
+    let Some(table) = unique_heap_global(heap_globals, |g| {
+        g.live_ptr == table_ptr && g.content.len() >= 8
+    }) else {
+        return protections;
+    };
+    let n = count.min(table.content.len() / 8);
+    for i in 0..n {
+        let entry = u64::from_le_bytes(
+            table.content[i * 8..i * 8 + 8]
+                .try_into()
+                .unwrap_or_default(),
+        );
+        if entry == 0 {
+            continue;
+        }
+        // Exactly one label at the table-entry address.
+        let Some(label) = unique_heap_global(heap_globals, |g| g.live_ptr == entry) else {
+            continue; // 0 or >1 → no protection
+        };
+
+        // Bounds: flag field must exist.
+        if label.content.len() <= 0x23 {
+            continue;
+        }
+        // Extent: only confirmed InteriorSubview lineage.
+        if label.extent_kind != CaptureExtentKind::InteriorSubview {
+            continue;
+        }
+        // Path: only REAL production gscript Label families with FULLY-BOUND
+        // identities. The label-table exhaust emits GscriptLabelTableEntry (AF3
+        // fix); a pre-existing label captured via the real child-link emitter
+        // keeps its GscriptChildLink path. MainSlot is NOT a label path, and
+        // GscriptFirstHop is NOT authorized (AF3 AF1 P1-2): the first-hop
+        // capture-id encodes only `edge_off`, which cannot bind child base /
+        // parent / probe / was_interior on its own, so it cannot be strictly
+        // validated — keeping it would be "code allows, test does not prove".
+        // A first-hop-captured table-reachable label stays fail-closed.
+        let path_ok = matches!(
+            label.extent_evidence.capture_path,
+            CapturePath::GscriptLabelTableEntry | CapturePath::GscriptChildLink
+        );
+        if !path_ok {
+            continue;
+        }
+        // Canonical capture_id: family-aware strict parser validated against the
+        // label's OWN recorded evidence fields (AF3 reachability). Rejects any
+        // hand-built `gscript_label:` + GscriptChildLink tuple, arbitrary
+        // `gscript_*` prefixes, and MainSlot/ProbeWindow-without-parent ids.
+        if !parse_canonical_label_capture_id_for(label) {
+            continue;
+        }
+        // Route Y R1 A6 AF3 AF1 (P1-5): for the label-table family, the recorded
+        // source evidence must match the ACTUAL table context — the table-entry
+        // byte offset `i*8` and the gscript root RVA `gscript.rva`. A correct
+        // base with a wrong table offset or wrong source root is NOT protected.
+        if label.extent_evidence.capture_path == CapturePath::GscriptLabelTableEntry {
+            let expected_off = i * 8;
+            if label.extent_evidence.source_slot_offset != Some(expected_off) {
+                continue;
+            }
+            match label.extent_evidence.source_root_rva {
+                Some(rva) if rva == gscript.rva => {}
+                _ => continue,
+            }
+        }
+
+        let (Some(parent_base), Some(parent_size)) = (
+            label.extent_evidence.containing_parent_old_base,
+            label.extent_evidence.containing_parent_size,
+        ) else {
+            continue; // no owning parent declared → no protection
+        };
+
+        // Exactly one parent matching declared base AND size.
+        let Some(parent) = unique_heap_global(heap_globals, |g| {
+            g.live_ptr == parent_base && g.content.len() == parent_size
+        }) else {
+            continue; // missing or duplicate parent → no protection
+        };
+
+        // Child must be strictly contained in parent.
+        let child_base = label.live_ptr;
+        let child_size = label.content.len();
+        let Some(child_end) = child_base.checked_add(child_size as u64) else {
+            continue;
+        };
+        let Some(parent_end) = parent_base.checked_add(parent_size as u64) else {
+            continue;
+        };
+        if child_base < parent_base || child_end > parent_end {
+            continue; // child not fully inside parent
+        }
+
+        // Flag address via checked_add (no wrapping authorization).
+        let Some(flag_addr) = child_base.checked_add(0x23) else {
+            continue;
+        };
+        // Flag must lie inside the child.
+        if flag_addr < child_base || flag_addr >= child_end {
+            continue;
+        }
+        // Flag must also lie inside the parent.
+        if flag_addr < parent_base || flag_addr >= parent_end {
+            continue;
+        }
+
+        // Qword that holds the flag (aligned down to 8).
+        let flag_qword_lo = flag_addr & !7u64;
+        let Some(flag_qword_hi) = flag_qword_lo.checked_add(8) else {
+            continue;
+        };
+
+        let child = CaptureIdentity::from_heap_global(label);
+        let parent_id = CaptureIdentity::from_heap_global(parent);
+        // Parent identity must be a real heap-global with non-empty capture_id
+        // (containers / empty-id objects cannot be authorized parents).
+        if parent_id.capture_id.is_empty() {
+            continue;
+        }
+
+        protections.push(LabelFlagProtection {
+            child,
+            parent: parent_id,
+            flag_offset: 0x23,
+            flag_addr,
+            flag_qword_lo,
+            flag_qword_hi,
+        });
+    }
+    protections
+}
+
+/// True when the current scrub identity is authorized to skip this qword
+/// under a given protection entry. EVERY identity field is consumed.
+/// Pure, checked range-authorization predicate for the Label +0x23 protection:
+/// `flag_addr` must be inside both child and parent, and the child must be
+/// strictly inside the parent. Every addition is checked — overflow returns
+/// false (no wrapping authorization).
+pub(crate) fn label_flag_range_authorized(
+    child_base: u64,
+    child_size: usize,
+    parent_base: u64,
+    parent_size: usize,
+    flag_addr: u64,
+) -> bool {
+    let Some(child_end) = child_base.checked_add(child_size as u64) else {
+        return false;
+    };
+    let Some(parent_end) = parent_base.checked_add(parent_size as u64) else {
+        return false;
+    };
+    if child_base < parent_base || child_end > parent_end {
+        return false;
+    }
+    if flag_addr < child_base || flag_addr >= child_end {
+        return false;
+    }
+    if flag_addr < parent_base || flag_addr >= parent_end {
+        return false;
+    }
+    true
+}
+
+pub(crate) fn protection_authorizes_qword(
+    current: &CurrentScrubIdentity,
+    p: &LabelFlagProtection,
+    qword_lo: u64,
+    qword_hi: u64,
+) -> bool {
+    // 1. Current buffer must be exactly the recorded parent (full identity).
+    if !current.matches_parent(&p.parent) {
+        return false;
+    }
+    // 2. Child identity must still be canonical for its recorded base — family-aware
+    // (AF3 reachability: accept only REAL production capture-id families, each
+    // strict-validated against the stored child evidence: GscriptLabelTableEntry,
+    // GscriptChildLink. GscriptFirstHop is NOT authorized — its id cannot bind
+    // base/parent/probe/was_interior, so it stays fail-closed.)
+    if !parse_canonical_protection_child_capture_id(p) {
+        return false;
+    }
+    // 3. Child extent/path constraints re-checked at consume time.
+    if p.child.extent_kind != CaptureExtentKind::InteriorSubview {
+        return false;
+    }
+    if !matches!(
+        p.child.capture_path,
+        CapturePath::GscriptLabelTableEntry | CapturePath::GscriptChildLink
+    ) {
+        return false;
+    }
+    // 4. Flag offset must be exactly +0x23.
+    if p.flag_offset != 0x23 {
+        return false;
+    }
+    // 5. flag_addr must equal child.old_base + 0x23 (checked).
+    let Some(expected_flag) = p.child.old_base.checked_add(0x23) else {
+        return false;
+    };
+    if p.flag_addr != expected_flag {
+        return false;
+    }
+    // 6. This qword must be the one that contains the flag.
+    if p.flag_addr < qword_lo || p.flag_addr >= qword_hi {
+        return false;
+    }
+    if qword_lo != p.flag_qword_lo || qword_hi != p.flag_qword_hi {
+        return false;
+    }
+    // 7. Parent/child range relationship still holds (pure, checked, no wrapping).
+    if !label_flag_range_authorized(
+        p.child.old_base,
+        p.child.size,
+        p.parent.old_base,
+        p.parent.size,
+        p.flag_addr,
+    ) {
+        return false;
+    }
+    // 8. Current buffer base/size already equal parent via matches_parent;
+    //    restate the size equality against the live buffer length contract.
+    if current.old_base != p.parent.old_base || current.size != p.parent.size {
+        return false;
+    }
+    true
+}
+
+pub(crate) fn scrub_buffer_external_ptrs(
     buf: &mut [u8],
+    current: &CurrentScrubIdentity,
     ranges: &[(u64, u64)],
     image_base: u64,
     image_end: u64,
+    label_protections: &[LabelFlagProtection],
 ) -> usize {
     let mut n = 0usize;
     let mut off = 0usize;
@@ -5785,6 +6771,20 @@ fn scrub_buffer_external_ptrs(
         // plausible user VA; scrubbing it destroys mName repair material and
         // leaves binary-search labels with null names → wcscmp AV.
         if looks_like_inline_utf16_qword(v) {
+            off += 8;
+            continue;
+        }
+        // Route Y R1 A6 AF2: skip this qword ONLY when full-identity authorization
+        // holds — CurrentScrubIdentity == protection.parent on every field, child
+        // still canonical, flag offset 0x23, qword is exactly the flag qword, and
+        // parent/child range relationship still holds. Never authorize by physical
+        // address, base/size, or capture_id prefix alone.
+        let qword_lo = current.old_base + off as u64;
+        let qword_hi = qword_lo + 8;
+        let protected_here = label_protections
+            .iter()
+            .any(|p| protection_authorizes_qword(current, p, qword_lo, qword_hi));
+        if protected_here {
             off += 8;
             continue;
         }
@@ -6242,6 +7242,67 @@ mod tests {
     }
 
     #[test]
+    fn gscript_short_label_count_is_fail_closed() {
+        let table_ptr = 0x800_000u64;
+        let label_ptr = 0x810_000u64;
+        let mk = |content: Vec<u8>, inline: bool, live_ptr: u64| HeapGlobalSnapshot {
+            rva: 0x2000,
+            live_ptr,
+            content,
+            is_heap_handle: false,
+            is_image_inline: inline,
+            extent_kind: CaptureExtentKind::default(),
+            extent_evidence: CaptureExtentEvidence::default(),
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::default(),
+        };
+
+        for len in [0usize, 8, 0x13] {
+            let mut gscript = vec![0u8; len];
+            if len >= 8 {
+                gscript[0..8].copy_from_slice(&table_ptr.to_le_bytes());
+            }
+            let before = gscript.clone();
+            let mut globals = vec![
+                mk(gscript, true, 0x1400_2000),
+                mk(label_ptr.to_le_bytes().to_vec(), false, table_ptr),
+                mk(vec![0u8; 0x40], false, label_ptr),
+            ];
+            mark_labels_non_nested(&mut globals);
+            assert_eq!(globals[0].content, before, "short gscript must fail closed");
+        }
+
+        let mut gscript = vec![0u8; 0x14];
+        gscript[0..8].copy_from_slice(&table_ptr.to_le_bytes());
+        gscript[0x10..0x14].copy_from_slice(&1u32.to_le_bytes());
+        let mut globals = vec![
+            mk(gscript, true, 0x1400_2000),
+            mk(label_ptr.to_le_bytes().to_vec(), false, table_ptr),
+            mk(vec![0u8; 0x40], false, label_ptr),
+        ];
+        mark_labels_non_nested(&mut globals);
+        assert_eq!(globals[2].content[0x23], 1, "len=0x14 is readable");
+    }
+
+    #[test]
+    fn label_table_pointer_policy_covers_four_gib_boundary() {
+        for value in [0x100_000u64, 0x1_0000_0000, 0x1_0000_0008] {
+            assert_eq!(
+                count_leading_heap_ptrs(&value.to_le_bytes()),
+                1,
+                "valid pointer must be admitted",
+            );
+        }
+        for value in [0x0f_ffffu64, 0x1_0000_0001, MIN_MODULE_REGION] {
+            assert_eq!(
+                count_leading_heap_ptrs(&value.to_le_bytes()),
+                0,
+                "invalid pointer must fail closed",
+            );
+        }
+    }
+
+    #[test]
     fn rejects_system_dll_pointers() {
         assert!(!is_heap_pointer(
             0x0000_7ffa_33b4_1a30,
@@ -6455,6 +7516,116 @@ mod tests {
         assert_eq!(globals.len(), 1);
         assert_eq!(globals[0].live_ptr, 0x8d8d60);
         assert_eq!(globals[0].content, vec![0x41u8; 0x400]);
+    }
+
+    // Route Y R1 GTO R1: adjacent heap objects admitted with overlapping probe
+    // windows are trimmed so the lower capture ends at the higher capture's
+    // base (the R1 raw-slab-overlay transformed-write-conflict geometry).
+    #[test]
+    fn r1_trim_overlapping_heap_global_windows() {
+        let mk = |live: u64, len: usize| HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: live,
+            content: vec![0xAAu8; len],
+            is_heap_handle: false,
+            is_image_inline: false,
+            extent_kind: CaptureExtentKind::default(),
+            extent_evidence: CaptureExtentEvidence::default(),
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::default(),
+        };
+        // A = [0x882ad0, +0x400), B = [0x882e18, +0x400) — overlap 0xb8.
+        let mut globals = vec![mk(0x882ad0, 0x400), mk(0x882e18, 0x400)];
+        let trimmed = trim_overlapping_heap_global_windows(&mut globals);
+        assert_eq!(trimmed, 1, "one capture must be trimmed");
+        assert_eq!(
+            globals[0].content.len(),
+            (0x882e18 - 0x882ad0) as usize,
+            "A must end at B's base"
+        );
+        assert_eq!(globals[1].content.len(), 0x400, "B unchanged");
+        // No overlap remains.
+        let a_end = globals[0].live_ptr + globals[0].content.len() as u64;
+        assert!(a_end <= globals[1].live_ptr);
+    }
+
+    /// A declared-size reinit window is selected by capture metadata, not by
+    /// a sample-private RVA. The same semantic fixture must survive changed
+    /// image bases and changed RVAs.
+    #[test]
+    fn r1_trim_preserves_declared_size_window_across_image_bases() {
+        let mk = |rva: u32, live: u64, len: usize, declared: bool| HeapGlobalSnapshot {
+            rva,
+            live_ptr: live,
+            content: vec![0xAAu8; len],
+            is_heap_handle: false,
+            is_image_inline: false,
+            extent_kind: if declared {
+                CaptureExtentKind::ObservedAllocation
+            } else {
+                CaptureExtentKind::default()
+            },
+            extent_evidence: if declared {
+                CaptureExtentEvidence {
+                    capture_path: CapturePath::MainSlot,
+                    source_root_rva: Some(rva),
+                    ..CaptureExtentEvidence::default()
+                }
+            } else {
+                CaptureExtentEvidence::default()
+            },
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::default(),
+        };
+
+        for image_base in [0x1400_0000_0u64, 0x1800_0000_0] {
+            let target_rva = 0x2abc;
+            let target_live = image_base + 0x20_0000;
+            let mut globals = vec![
+                mk(target_rva, target_live, HOT_XREF_SIZE_PROBE_CAP, true),
+                mk(0x55aa, target_live + 0x900, 0x400, false),
+            ];
+            let trimmed = trim_overlapping_heap_global_windows(&mut globals);
+            assert_eq!(trimmed, 0, "declared raw window must be preserved");
+            assert_eq!(globals[0].content.len(), HOT_XREF_SIZE_PROBE_CAP);
+            assert_eq!(globals[1].content.len(), 0x400);
+        }
+
+        let target_rva = 0x2abc;
+        let mut globals = vec![
+            mk(target_rva, 0x3200_0000, HOT_XREF_SIZE_PROBE_CAP, true),
+            mk(0x55aa, 0x3200_0900, 0x400, false),
+        ];
+        let policy = HeapGlobalWindowTrimPolicy {
+            preserve_declared_size_windows: false,
+        };
+        assert_eq!(
+            trim_overlapping_heap_global_windows_with_policy(&mut globals, &policy),
+            1,
+            "explicit policy can disable raw-window preservation",
+        );
+    }
+
+    /// Lower capture already bounded by a HIGHER known base is untouched.
+    #[test]
+    fn r1_trim_only_affects_interior_base_overlap() {
+        let mk = |live: u64, len: usize| HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: live,
+            content: vec![0xAAu8; len],
+            is_heap_handle: false,
+            is_image_inline: false,
+            extent_kind: CaptureExtentKind::default(),
+            extent_evidence: CaptureExtentEvidence::default(),
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::default(),
+        };
+        // Disjoint windows — nothing to trim.
+        let mut globals = vec![mk(0x1000, 0x100), mk(0x1200, 0x100)];
+        let trimmed = trim_overlapping_heap_global_windows(&mut globals);
+        assert_eq!(trimmed, 0);
+        assert_eq!(globals[0].content.len(), 0x100);
+        assert_eq!(globals[1].content.len(), 0x100);
     }
 
     // GTO Core Recovery R0-E: two entries at the same live_ptr with differing
@@ -7990,9 +9161,9 @@ mod tests {
                     capture_id: "r-other-parent".into(),
                     capture_path: CapturePath::GscriptChildLink,
                     extent_kind: CaptureExtentKind::InteriorSubview,
-                    source_parent_old_base: Some(table_live),
                     source_slot_offset: Some(0),
                     requested_probe_size: 0x1000,
+                    source_root_rva: None,
                     was_interior: true,
                     containing_parent_old_base: Some(table_live),
                     containing_parent_size: Some(0x100),
@@ -8005,9 +9176,9 @@ mod tests {
                     capture_id: "r-other-parent-obj".into(),
                     capture_path: CapturePath::MainSlot,
                     extent_kind: CaptureExtentKind::BackingObject,
-                    source_parent_old_base: None,
                     source_slot_offset: None,
                     requested_probe_size: 0,
+                    source_root_rva: None,
                     was_interior: false,
                     containing_parent_old_base: None,
                     containing_parent_size: None,
@@ -8020,9 +9191,9 @@ mod tests {
                     capture_id: "r-table".into(),
                     capture_path: CapturePath::MainSlot,
                     extent_kind: CaptureExtentKind::ObservedAllocation,
-                    source_parent_old_base: None,
                     source_slot_offset: None,
                     requested_probe_size: 0,
+                    source_root_rva: None,
                     was_interior: false,
                     containing_parent_old_base: None,
                     containing_parent_size: None,
@@ -8052,13 +9223,20 @@ mod tests {
                 provenance: RegionProvenance::default(),
             }
         };
-        let label = mk(
+        let mut label = mk(
             Q0D_LABEL,
             label_content.clone(),
             false,
             "r-other-parent",
             CaptureExtentKind::InteriorSubview,
         );
+        // Align the transformed label's source evidence with the raw child.
+        label.extent_evidence.capture_path = CapturePath::GscriptChildLink;
+        label.extent_evidence.source_slot_offset = Some(0);
+        label.extent_evidence.probe_requested_size = 0x1000;
+        label.extent_evidence.was_interior = true;
+        label.extent_evidence.containing_parent_old_base = Some(table_live);
+        label.extent_evidence.containing_parent_size = Some(0x100);
         let parent = mk(
             parent_base,
             parent_content.clone(),
@@ -8359,9 +9537,9 @@ mod tests {
                         capture_id: "route-p-geometry".into(),
                         capture_path: CapturePath::GscriptChildLink,
                         extent_kind: CaptureExtentKind::InteriorSubview,
-                        source_parent_old_base: Some(table_live),
                         source_slot_offset: Some(0),
                         requested_probe_size: 0x1000,
+                        source_root_rva: None,
                         was_interior: true,
                         containing_parent_old_base: Some(table_live),
                         containing_parent_size: Some(0x100),
@@ -8374,9 +9552,9 @@ mod tests {
                         capture_id: "route-p-table".into(),
                         capture_path: CapturePath::MainSlot,
                         extent_kind: CaptureExtentKind::ObservedAllocation,
-                        source_parent_old_base: None,
                         source_slot_offset: None,
                         requested_probe_size: 0,
+                        source_root_rva: None,
                         was_interior: false,
                         containing_parent_old_base: None,
                         containing_parent_size: None,
@@ -8420,13 +9598,19 @@ mod tests {
                 CaptureExtentKind::InteriorSubview,
             );
             label.extent_evidence.was_interior = true;
-            let table = mk(
+            label.extent_evidence.source_slot_offset = Some(0);
+            label.extent_evidence.probe_requested_size = 0x1000;
+            label.extent_evidence.containing_parent_old_base = Some(table_live);
+            label.extent_evidence.containing_parent_size = Some(0x100);
+            let mut table = mk(
                 table_live,
                 table_content,
                 false,
                 "route-p-table",
                 CaptureExtentKind::ObservedAllocation,
             );
+            // Align the transformed table's source evidence with the raw child.
+            table.extent_evidence.capture_path = CapturePath::MainSlot;
             let gscript = mk(
                 gscript_live,
                 gscript_content,
@@ -8860,9 +10044,9 @@ mod tests {
                 capture_id: "det".into(),
                 capture_path: CapturePath::GscriptChildLink,
                 extent_kind: CaptureExtentKind::InteriorSubview,
-                source_parent_old_base: Some(Q0D_TABLE),
                 source_slot_offset: Some(0),
                 requested_probe_size: 0x1000,
+                source_root_rva: None,
                 was_interior: true,
                 containing_parent_old_base: Some(Q0D_TABLE),
                 containing_parent_size: Some(0x100),
@@ -8875,9 +10059,9 @@ mod tests {
                 capture_id: "other".into(),
                 capture_path: CapturePath::MainSlot,
                 extent_kind: CaptureExtentKind::ObservedAllocation,
-                source_parent_old_base: None,
                 source_slot_offset: None,
                 requested_probe_size: 0,
+                source_root_rva: None,
                 was_interior: false,
                 containing_parent_old_base: None,
                 containing_parent_size: None,
