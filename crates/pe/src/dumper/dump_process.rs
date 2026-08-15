@@ -1095,6 +1095,12 @@ pub fn dump_process_with_report(
             &mut heap_globals,
             Some(main),
         );
+        // Route Y R1 GTO R1: retroactive pairwise window-overlap trim on RAW
+        // captures (before raw children / overlay are built). Adjacent heap
+        // objects admitted via different paths (child-link force-admit vs
+        // label-table exhaust) can have overlapping probe windows; the overlay
+        // would otherwise fail-closed on a transformed write conflict.
+        super::heap_global_snapshot::trim_overlapping_heap_global_windows(&mut heap_globals);
         drop(_g);
     }
     let mut raw_capture: Option<super::raw_slab_coherence::RawSlabCapture> = None;
@@ -1793,13 +1799,50 @@ pub fn dump_process_with_report(
         // structural or unresolved-required condition.
         let new_image_base = pe.nt_headers.optional_header.image_base;
 
-        // Declared pointer slots from the capture descriptor (pointer-shaped
-        // qwords inside captured allocations). Provenance-driven.
-        let declared_slots = super::runtime_rebase::declared_slots_from_capture(
+        // Declared pointer slots from the STRUCTURAL declaration pipeline
+        // (R1 STRUCTURAL-POINTER-DECLARATION + R2 semantic fix): pointer-shaped
+        // qwords are classified with evidence; a pointer kind requires BOTH
+        // structural provenance AND verified target membership (region or
+        // enumerated module range). Membership-only / threshold-only values
+        // stay unknown+required (never dropped, never optional). Duplicate
+        // same-semantics slots are merged and audited; duplicate-CONFLICT fails
+        // closed. Verified module ranges come from the live module_map.
+        let verified_module_ranges: Vec<(u64, u64)> = module_map
+            .iter()
+            .filter(|(_, base, end)| end > base)
+            .map(|&(_, base, end)| (base, end))
+            .collect();
+        let declaration_audit = match super::runtime_rebase::declare_pointer_slots_fallible(
             &containers,
             &heap_globals,
             &all_slabs,
+            &verified_module_ranges,
+        ) {
+            Ok(d) => d,
+            Err(e) => {
+                return Err(PeError::GtoStage {
+                    stage: "pointer_declaration".into(),
+                    error: format!("{e:#}"),
+                });
+            }
+        };
+        // R3 provenance-conflict reconciliation telemetry: the declaration
+        // stage may now progress past non-structural observations, so these
+        // counters are the authoritative proof for the four mandated fresh
+        // reproduce metrics:
+        //   duplicate_conflict_count            = declaration_audit.duplicate_conflict
+        //   true_structural_conflict_count      = declaration_audit.true_structural_conflict
+        //   non_structural_observation_count    = declaration_audit.non_structural_observation
+        //   resolved_structural_declaration_count = declaration_audit.resolved_structural_declaration
+        info!(
+            "pointer_declaration reconciled: duplicate_conflict={} true_structural_conflict={}              non_structural_observation={} resolved_structural_declaration={} unknown_required={}",
+            declaration_audit.duplicate_conflict,
+            declaration_audit.true_structural_conflict,
+            declaration_audit.non_structural_observation,
+            declaration_audit.resolved_structural_declaration,
+            declaration_audit.unknown_required
         );
+        let declared_slots = declaration_audit.declared;
 
         // External resolvers from the rebuilt import table (ASLR-safe via IAT).
         let external_resolvers = match import_builder.as_ref() {
