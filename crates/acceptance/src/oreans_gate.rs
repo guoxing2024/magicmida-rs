@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::oreans_pe_evidence::{
@@ -1916,6 +1917,47 @@ fn validate_tls_identity(
     {
         failures.push(format!("{label} SHA-256/size does not match observation"));
     }
+    // Independent disk re-read: the acceptance consumer never trusts the
+    // producer-written hash/size strings alone. When the artifact path is
+    // present and the file exists, the bytes on disk MUST match the declared
+    // identity. When the path is absent or the file is missing (sealed-bundle
+    // consumption where the disk is not available), the envelope binding
+    // chain already guarantees identity consistency, so this is not a failure.
+    failures.extend(verify_tls_identity_from_disk(label, identity));
+    failures
+}
+
+/// Re-read an artifact from disk and cross-check the declared identity.
+///
+/// Returns failures when the file exists but its SHA-256/size disagree with
+/// the sidecar's declared identity (stale, tampered, or mis-bound artifact).
+/// A missing file is NOT a failure: bundle consumers may not have the disk
+/// artifact; the envelope binding chain covers that path.
+fn verify_tls_identity_from_disk(label: &str, identity: &OreansTlsArtifactIdentity) -> Vec<String> {
+    if identity.path.is_empty() {
+        return Vec::new();
+    }
+    let Ok(bytes) = std::fs::read(&identity.path) else {
+        // Artifact absent on disk: sealed-bundle consumption. Not a failure.
+        return Vec::new();
+    };
+    let mut failures = Vec::new();
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    let actual_sha = format!("{:064x}", hasher.finalize());
+    if actual_sha != identity.sha256 {
+        failures.push(format!(
+            "{label} disk SHA-256 {actual_sha} disagrees with sidecar {}",
+            identity.sha256
+        ));
+    }
+    let actual_size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if actual_size != identity.size_bytes {
+        failures.push(format!(
+            "{label} disk size {actual_size} disagrees with sidecar {}",
+            identity.size_bytes
+        ));
+    }
     failures
 }
 
@@ -3311,5 +3353,41 @@ mod tests {
         for excluded in OREANS_NON_GATE_CASES {
             assert!(locked_manifest(excluded).is_none());
         }
+    }
+    #[test]
+    fn tls_disk_reread_accepts_matching_file_and_skips_missing() {
+        let dir = std::env::temp_dir().join(format!("mida-t5b-unit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("artifact.bin");
+        let bytes = b"unit-test-artifact-bytes".to_vec();
+        std::fs::write(&path, &bytes).unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        let identity = OreansTlsArtifactIdentity {
+            path: path.to_string_lossy().into_owned(),
+            sha256: format!("{:064x}", hasher.finalize()),
+            size_bytes: bytes.len() as u64,
+        };
+        // File present and matching: no failure.
+        assert!(verify_tls_identity_from_disk("protected", &identity).is_empty());
+        // File missing: sealed-bundle consumption, no failure.
+        let missing = OreansTlsArtifactIdentity {
+            path: dir.join("absent.bin").to_string_lossy().into_owned(),
+            sha256: identity.sha256.clone(),
+            size_bytes: identity.size_bytes,
+        };
+        assert!(verify_tls_identity_from_disk("protected", &missing).is_empty());
+        // Empty path: no failure (bundle envelope path).
+        let no_path = OreansTlsArtifactIdentity {
+            path: String::new(),
+            sha256: identity.sha256.clone(),
+            size_bytes: identity.size_bytes,
+        };
+        assert!(verify_tls_identity_from_disk("protected", &no_path).is_empty());
+        // File present but tampered: failure on both hash and size.
+        std::fs::write(&path, b"tampered-bytes").unwrap();
+        let failures = verify_tls_identity_from_disk("protected", &identity);
+        assert!(!failures.is_empty(), "tampered disk must fail");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
