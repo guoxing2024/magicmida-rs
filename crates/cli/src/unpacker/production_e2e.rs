@@ -66,7 +66,7 @@ mod tests {
     use crate::unpacker::oep_evidence::write_oep_evidence;
     use crate::unpacker::relocation_evidence::write_relocation_evidence;
     use crate::unpacker::section_rebuild_evidence::write_section_rebuild_evidence;
-    use crate::unpacker::tls_evidence::write_tls_evidence;
+    use crate::unpacker::tls_evidence::{parse_final_candidate, write_tls_evidence};
 
     use mida_acceptance::oreans_gate::{
         OreansIatEvidence, OreansOepEvidence, OreansRelocationEvidence as GateRelocEvidence,
@@ -178,8 +178,14 @@ mod tests {
         };
 
         // TLS: derive callbacks/index from the candidate's TLS directory.
+        // Raw-data start/end come from the candidate-bound final parse so the
+        // runtime observation matches the actual candidate bytes (preservation
+        // compares runtime vs final candidate and fails closed on drift).
         let callbacks_rva = tls.callback_array_rva.unwrap_or(0);
         let index_rva = tls.address_of_index_rva.unwrap_or(0);
+        let final_tls = parse_final_candidate(candidate).expect("parse final candidate TLS");
+        let final_start = final_tls.start_rva;
+        let final_end = final_tls.end_rva;
         let callback_rvas = &tls.callback_rvas;
         let mut callback_slots = Vec::new();
         for (i, rva) in callback_rvas.iter().enumerate() {
@@ -207,10 +213,10 @@ mod tests {
             directory_rva: pe.tls.rva,
             directory_size: pe.tls.size,
             directory_bytes_read: pe.tls.size as usize,
-            start_address_of_raw_data: image_base + u64::from(callback_rvas[0]),
-            start_rva: Some(callback_rvas[0]),
-            end_address_of_raw_data: image_base + u64::from(callback_rvas[0]) + 0x100,
-            end_rva: Some(callback_rvas[0] + 0x100),
+            start_address_of_raw_data: final_start.map(|r| image_base + u64::from(r)).unwrap_or(0),
+            start_rva: final_start,
+            end_address_of_raw_data: final_end.map(|r| image_base + u64::from(r)).unwrap_or(0),
+            end_rva: final_end,
             address_of_index: image_base + u64::from(index_rva),
             index_rva: Some(index_rva),
             address_of_callbacks: image_base + u64::from(callbacks_rva),

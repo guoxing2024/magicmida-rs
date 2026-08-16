@@ -136,6 +136,13 @@ pub(crate) fn write_tls_evidence(
 ) -> anyhow::Result<PathBuf> {
     let sidecar = sidecar_path(candidate)?;
     let value = build_tls_evidence(protected_input, candidate, report, family)?;
+    // Fail closed: a sidecar with any blocker must never be written as if it
+    // were a passing evidence artifact, and an existing valid sidecar must not
+    // be replaced by a failing one.
+    if !value.prerequisite_passes {
+        let reason = value.blockers.join("; ");
+        return Err(anyhow!("refusing to write TLS evidence sidecar: {reason}"));
+    }
     ensure_sidecar_is_safe(&sidecar, protected_input, candidate)?;
     let json = serde_json::to_vec_pretty(&value).context("serialize TLS evidence sidecar")?;
     atomic_write(&sidecar, &json)?;
@@ -272,7 +279,7 @@ fn tls_callback_status_name(status: TlsCallbackStatus) -> &'static str {
     }
 }
 
-fn parse_final_candidate(bytes: &[u8]) -> anyhow::Result<FinalTlsEvidence> {
+pub(crate) fn parse_final_candidate(bytes: &[u8]) -> anyhow::Result<FinalTlsEvidence> {
     let pe = PeHeader::from_bytes(bytes)
         .map_err(|error| anyhow!("parse final candidate PE: {error}"))?;
     let pointer_size = if pe.is_64bit { 8 } else { 4 };
@@ -331,6 +338,7 @@ fn parse_final_candidate(bytes: &[u8]) -> anyhow::Result<FinalTlsEvidence> {
         evidence
             .blockers
             .push("TLS data-directory range is outside SizeOfImage".to_string());
+        return Ok(evidence);
     }
     let Some(directory_offset) = raw_span(&pe, bytes, directory.virtual_address, directory.size)
     else {
@@ -452,6 +460,47 @@ fn parse_final_candidate(bytes: &[u8]) -> anyhow::Result<FinalTlsEvidence> {
         return Ok(evidence);
     };
     evidence.callbacks_rva = Some(callbacks_rva);
+
+    // Fail closed if the callback array overlaps the TLS directory, the index
+    // slot, or the raw-data template region: an array sharing bytes with those
+    // structures is structurally incoherent and must not be scanned as if it
+    // were an independent NULL-terminated list.
+    let callback_array_bytes = pointer_size as u32;
+    let mut overlap = String::new();
+    let directory_range = (
+        directory.virtual_address,
+        directory.virtual_address.saturating_add(directory.size),
+    );
+    if ranges_overlap(
+        callbacks_rva,
+        callback_array_bytes,
+        directory_range.0,
+        directory_range.1,
+    ) {
+        overlap = "TLS callback array overlaps the TLS directory".to_string();
+    }
+    if let Some(index_rva) = evidence.index_rva {
+        if ranges_overlap(
+            callbacks_rva,
+            callback_array_bytes,
+            index_rva,
+            index_rva.saturating_add(4),
+        ) {
+            overlap = "TLS callback array overlaps the TLS index slot".to_string();
+        }
+    }
+    if overlap.is_empty() {
+        if let (Some(start), Some(end)) = (evidence.start_rva, evidence.end_rva) {
+            if start < end && ranges_overlap(callbacks_rva, callback_array_bytes, start, end) {
+                overlap = "TLS callback array overlaps the TLS raw-data region".to_string();
+            }
+        }
+    }
+    if !overlap.is_empty() {
+        evidence.blockers.push(overlap);
+        stable_blockers(&mut evidence.blockers);
+        return Ok(evidence);
+    }
 
     for slot_index in 0..MAX_TLS_CALLBACK_SLOTS {
         let Some(slot_delta) = slot_index.checked_mul(pointer_size) else {
@@ -582,6 +631,14 @@ fn checked_va_to_rva_end(
 
 fn rva_range_in_image(rva: u32, size: u32, image_size: u32) -> bool {
     rva.checked_add(size).is_some_and(|end| end <= image_size)
+}
+
+/// Whether `[a_start, a_end)` and `[b_start, b_end)` share any byte.
+fn ranges_overlap(a_start: u32, a_len: u32, b_start: u32, b_end: u32) -> bool {
+    let Some(a_end) = a_start.checked_add(a_len) else {
+        return true; // overflowed range overlaps everything conservatively
+    };
+    a_start < b_end && b_start < a_end
 }
 
 // Exact file-backed RVA range. It intentionally does not use
@@ -1446,7 +1503,10 @@ mod tests {
         spec.section_virtual_size = 0x9000;
         spec.section_raw_size = 0x9000;
         spec.size_of_image = 0xa000;
-        spec.callbacks_rva = 0x1800;
+        // Callback array must sit OUTSIDE the TLS raw-data region
+        // (start=0x1600..end=0x2000) so this test isolates the unterminated-array
+        // failure rather than the overlap failure.
+        spec.callbacks_rva = 0x2100;
         spec.callback_rvas = (0..MAX_TLS_CALLBACK_SLOTS)
             .map(|i| 0x3000 + i as u32)
             .collect();
@@ -1600,5 +1660,133 @@ mod tests {
         assert_eq!(gto.schema_version, "mida.unpack-tls-evidence/v1");
         assert_eq!(oreans.candidate, gto.candidate);
         assert!(build_tls_evidence(&protected, &candidate_path, &report, "bogus").is_err());
+    }
+    #[test]
+    fn directory_outside_size_of_image_fails_closed() {
+        let mut spec = ImageSpec::default();
+        // directory RVA+size extends past SizeOfImage (0x2000).
+        spec.directory_rva = 0x1f00;
+        spec.directory_size = 0x200;
+        spec.size_of_image = 0x2000;
+        let (_dir, protected, candidate_path, report) = good_pair("dd-oob", &spec);
+        let sidecar =
+            build_tls_evidence(&protected, &candidate_path, &report, "oreans_themida").unwrap();
+        assert!(
+            sidecar
+                .final_candidate
+                .blockers
+                .iter()
+                .any(|b| b.contains("outside SizeOfImage")),
+            "directory OOB must fail closed: {:?}",
+            sidecar.final_candidate.blockers
+        );
+        assert!(!sidecar.prerequisite_passes);
+    }
+
+    #[test]
+    fn callback_array_overlap_with_directory_and_index_fails_closed() {
+        // Callback array RVA inside the TLS directory region (0x1100..0x1128).
+        let mut spec = ImageSpec::default();
+        spec.callbacks_rva = 0x1100;
+        let (_dir, protected, candidate_path, report) = good_pair("cb-overlap-dd", &spec);
+        let sidecar =
+            build_tls_evidence(&protected, &candidate_path, &report, "oreans_themida").unwrap();
+        assert!(
+            sidecar
+                .final_candidate
+                .blockers
+                .iter()
+                .any(|b| b.contains("overlaps")),
+            "callback array overlapping directory must fail closed: {:?}",
+            sidecar.final_candidate.blockers
+        );
+
+        // Callback array RVA overlapping the TLS index slot (0x1200..0x1204).
+        let mut spec = ImageSpec::default();
+        spec.callbacks_rva = 0x1200;
+        let (_dir, protected, candidate_path, report) = good_pair("cb-overlap-idx", &spec);
+        let sidecar =
+            build_tls_evidence(&protected, &candidate_path, &report, "oreans_themida").unwrap();
+        assert!(
+            sidecar
+                .final_candidate
+                .blockers
+                .iter()
+                .any(|b| b.contains("overlaps")),
+            "callback array overlapping index must fail closed: {:?}",
+            sidecar.final_candidate.blockers
+        );
+    }
+
+    #[test]
+    fn protected_input_identity_is_recomputed_from_disk() {
+        let spec = ImageSpec::default();
+        let dir = temp_dir("protected-identity");
+        let bytes = candidate(&spec);
+        let (protected, candidate_path) = write_pair(&dir, &bytes);
+        let report = runtime_report(&spec, bytes.len());
+        let sidecar =
+            build_tls_evidence(&protected, &candidate_path, &report, "oreans_themida").unwrap();
+        // protected input is the literal bytes written by write_pair.
+        let mut hasher = Sha256::new();
+        hasher.update(b"protected-input");
+        assert_eq!(
+            sidecar.protected_input.sha256,
+            format!("{:064x}", hasher.finalize())
+        );
+        assert_eq!(sidecar.protected_input.size_bytes, 15);
+        // Re-write the protected file with different bytes: the sidecar identity
+        // must track the NEW disk bytes, not anything cached or caller-supplied.
+        fs::write(&protected, b"tampered-protected-input!!").unwrap();
+        let sidecar2 =
+            build_tls_evidence(&protected, &candidate_path, &report, "oreans_themida").unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(b"tampered-protected-input!!");
+        assert_eq!(
+            sidecar2.protected_input.sha256,
+            format!("{:064x}", hasher.finalize())
+        );
+        assert_eq!(sidecar2.protected_input.size_bytes, 26);
+    }
+
+    #[test]
+    fn failed_build_does_not_write_or_overwrite_sidecar() {
+        let spec = ImageSpec::default();
+        let dir = temp_dir("fail-no-write");
+        let bytes = candidate(&spec);
+        let (protected, candidate_path) = write_pair(&dir, &bytes);
+        // A report that disagrees with the candidate disk size forces blockers.
+        let mut report = runtime_report(&spec, bytes.len());
+        report.output_size += 1;
+        let sidecar_path = sidecar_path(&candidate_path).unwrap();
+        // Pre-existing valid sidecar must NOT be clobbered by a failing build.
+        fs::write(&sidecar_path, b"existing-valid-sidecar").unwrap();
+        let value =
+            build_tls_evidence(&protected, &candidate_path, &report, "oreans_themida").unwrap();
+        assert!(!value.prerequisite_passes);
+        assert!(value.blockers.iter().any(|b| b.contains("output_size")));
+        // write_tls_evidence refuses to write a non-passing sidecar.
+        assert!(
+            write_tls_evidence(&protected, &candidate_path, &report, "oreans_themida").is_err()
+        );
+        assert_eq!(fs::read(&sidecar_path).unwrap(), b"existing-valid-sidecar");
+    }
+
+    #[test]
+    fn pe32_callback_pointer_width_and_image_base_arithmetic() {
+        let mut spec = ImageSpec::default();
+        spec.pe32_plus = false;
+        spec.directory_size = 24;
+        spec.callbacks_rva = 0x1300;
+        spec.callback_rvas = vec![0x1500];
+        spec.index_rva = 0x1200;
+        let (_dir, protected, candidate_path, report) = good_pair("pe32-ptr", &spec);
+        let sidecar =
+            build_tls_evidence(&protected, &candidate_path, &report, "oreans_themida").unwrap();
+        assert!(sidecar.prerequisite_passes, "{:?}", sidecar.blockers);
+        assert_eq!(sidecar.final_candidate.pointer_size, 4);
+        assert_eq!(sidecar.final_candidate.callback_rvas, vec![0x1500]);
+        assert_eq!(sidecar.final_candidate.image_base, 0x400000);
+        assert_eq!(sidecar.runtime.pointer_size, 4);
     }
 }
