@@ -9,11 +9,10 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  windows:
+  windows-quality:
     runs-on: windows-latest
     env:
-      CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-target
-      RUSTFLAGS: -D warnings
+      CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-target-quality
     steps:
       - uses: actions/checkout@v4
 
@@ -23,21 +22,39 @@ jobs:
       - name: Format check
         run: cargo fmt --all -- --check
 
-      - name: Check workspace (default features)
-        run: cargo check --workspace --tests --locked
-
-      # `--locked` (not `--offline`): a fresh GitHub runner must download the
-      # lockfile-pinned dependency set once. A separate cache job can add
-      # offline speedups later.
-      - name: Run tests (locked)
-        run: cargo test --workspace --locked
-
-      - name: Check GTO product-recovery feature (off-mainline compile gate)
-        run: cargo check -p mida-cli --features gto-product-recovery --locked
-
       - name: Artifact policy hygiene
         shell: powershell
         run: powershell -NoProfile -ExecutionPolicy Bypass -File tools/verify_workspace_hygiene.ps1
+
+  windows-build-test:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: default
+            check_command: cargo check --workspace --tests --locked
+            test_command: cargo test --workspace --locked
+          - lane: all-features
+            check_command: cargo check --workspace --all-features --tests --locked
+            test_command: cargo test --workspace --all-features --locked
+    env:
+      CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-target-${{ matrix.lane }}
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@stable
+
+      # `--locked` (not `--offline`): a fresh GitHub runner must download the
+      # lockfile-pinned dependency set once. Local reproducibility checks use
+      # the equivalent commands with `--offline` after dependencies exist.
+      - name: Check workspace (${{ matrix.lane }})
+        run: ${{ matrix.check_command }}
+
+      - name: Test workspace (${{ matrix.lane }})
+        run: ${{ matrix.test_command }}
 
   cargo-deny:
     runs-on: ubuntu-latest
