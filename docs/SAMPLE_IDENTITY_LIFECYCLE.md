@@ -12,7 +12,8 @@ Known distinct identities observed (do NOT assume they are the same revision):
 
 | identity | SHA-256 | size | notes |
 |---|---|---|---|
-| manifest-bound | `4d5770af…` | 8583680 | matches `_dyncdb/launcher.exe` (`.KI3` layout) |
+| manifest-bound (rev 2, protected_input) | `11473d2e…` | 24636416 | `.fptable/.rdataN` layout; the only rev2 dynamic target |
+| analysis_reference (rev 1, non-executable) | `4d5770af…` | 8583680 | historical `.KI3` layout; never a rev2 execution target |
 | earlier `启动器.exe` | `79e26e91…` | 13633536 | observed during a prior acceptance run |
 | later `启动器.exe` | `bd7366d6…` | 13373952 | current live file at snapshot time (`.rdataN` layout) |
 

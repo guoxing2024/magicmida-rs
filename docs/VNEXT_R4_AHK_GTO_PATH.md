@@ -51,11 +51,11 @@ Anything short of that is **R4-path engineering**.
 
 ## Family markers (identify)
 
-GTO protected input (sha256 `4d5770af…`):
+GTO protected input (sha256 `11473d2e…` / 24,636,416, manifest rev 2; the historical rev1 `4d5770af…` is analysis_reference only):
 
 | Signal | Notes |
 |--------|-------|
-| Entry section `.KI3` | Primary fingerprint |
+| Entry section `.rdata2` (rev 2); `.KI3` was rev 1 | Primary fingerprint |
 | Scrambled section names | e.g. `.,\\W`, `.|lT` |
 | Section0 named `.text` | Often post-attach / text-poll path |
 | `has_relocations=false` | Residual risk; not an identify-only signal |

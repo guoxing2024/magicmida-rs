@@ -129,8 +129,10 @@ layout (`.fptable/.rdata0/.rdata1/.rdata2`, no `.KI3`) is only `Ambiguous` for
 
 Key findings:
 
-- The manifest (`lab/cases/v2/gto_launcher.json`) binds `4d5770af…/8583680`,
-  which matches `_dyncdb/launcher.exe` (`.KI3` layout, recognized as `ahk_gto`).
+- The manifest (`lab/cases/v2/gto_launcher.json`, revision 2) binds the
+  protected input `11473d2e…/24636416` (`.fptable/.rdataN` layout); the
+  historical rev1 sample `4d5770af…/8583680` (`.KI3` layout) is retained
+  only as `analysis_reference` and is NOT an executable rev2 target.
 - The current `启动器.exe` was updated (08-07 01:10) to `bd7366d6…/13373952`
   with a `.rdataN` layout and NO `.KI3`, so `dual_select_packer` scores it 30
   (< 40) → `Ambiguous` → falls back to Oreans. Authority adjudication is

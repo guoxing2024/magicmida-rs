@@ -1409,5 +1409,200 @@ class ReparseSeamTests(ResolverTestCase):
         self.assertEqual(ctx.exception.exit_code, EXIT_SOURCE_INVALID)
 
 
+# ===========================================================================
+# T1: GTO protected_input vs analysis_reference authority
+# ===========================================================================
+
+class T1AuthorityTests(ResolverTestCase):
+    """T1: the rev2 protected_input is the ONLY executable target; the
+    historical analysis_reference / evidence hashes never substitute for it."""
+
+    def test_analysis_reference_hash_is_not_accepted_as_protected_input(self):
+        # A manifest that lists the protected_input role with the REFERENCE hash
+        # (the T1 forbidden swap) must be rejected: the manifest binds role to
+        # digest, and validate_manifest_bytes requires the protected input to be
+        # the single protected_input artifact. We simulate the swap by declaring
+        # the reference bytes as the protected_input payload.
+        reference_bytes = b"REFERENCE-BYTES-" + b"\x00" * 40
+        manifest = make_manifest(
+            payload_sha=sha256b(reference_bytes),
+            size=len(reference_bytes),
+        )
+        # No vault object for this digest and no source -> AuthorizedRevision
+        # Unavailable (12), never Resolved. The reference bytes do NOT become
+        # an authorized target merely because they were declared.
+        exit_code, _ = self.run_resolve(manifest)
+        self.assertEqual(exit_code, EXIT_UNAVAILABLE)
+
+    def test_analysis_reference_role_alone_does_not_authorize(self):
+        # Even when a role=analysis_reference artifact exists with matching
+        # bytes in the vault, the resolver must only ever resolve the manifest's
+        # protected_input digest. Placing the reference under its own digest
+        # path and resolving the manifest yields Unavailable (the protected
+        # input object is absent) - the reference is never chosen.
+        reference_bytes = b"REF-" + b"\x00" * 40
+        ref_sha = sha256b(reference_bytes)
+        ref_path = resolver.vault_object_path(self.vault_root, ref_sha)
+        ref_path.parent.mkdir(parents=True, exist_ok=True)
+        ref_path.write_bytes(reference_bytes)
+        manifest = make_manifest(
+            payload_sha=self.payload_sha, size=self.payload_size
+        )
+        exit_code, result = self.run_resolve(manifest, source=None)
+        self.assertEqual(exit_code, EXIT_UNAVAILABLE)
+        self.assertIsNone(result)
+
+    def test_mutable_locator_updated_but_not_authorized_is_mismatch(self):
+        # The vault object for the authorized digest is ABSENT; the mutable
+        # locator now holds NEW bytes (auto-update scenario). The resolver must
+        # snapshot, detect the digest differs from the manifest protected input,
+        # and fail closed as SampleIdentityMismatch - never promote the new
+        # bytes and never treat the updated locator as authorized.
+        updated = b"UPDATED-NOT-AUTHORIZED-" + b"\x00" * 40
+        manifest = make_manifest(payload_sha=self.payload_sha, size=self.payload_size)
+        source = self.write_source(updated)
+        exit_code, result = self.run_resolve(
+            manifest, source=source, retain_unmatched=True, observed_dir=self.observed
+        )
+        self.assertEqual(exit_code, EXIT_SAMPLE_MISMATCH)
+        self.assertIsNone(result)
+        # The updated bytes were archived under THEIR OWN digest, not promoted
+        # to the authorized vault path.
+        up_sha = sha256b(updated)
+        archived = self.observed / up_sha[:2] / up_sha / "artifact.exe"
+        self.assertTrue(archived.exists(), "unmatched revision archived under own digest")
+        auth_vault = resolver.vault_object_path(self.vault_root, self.payload_sha)
+        self.assertFalse(auth_vault.exists(), "updated bytes never promoted")
+
+    def test_historical_evidence_hash_cannot_substitute_protected_input(self):
+        # A historical evidence digest (e.g. the rev1 4d5770... analog) present
+        # in the vault under its own address must NOT satisfy resolution for a
+        # manifest whose protected input is a different digest. The resolver
+        # derives the vault path ONLY from the manifest digest.
+        historical = b"HISTORICAL-EVIDENCE-" + b"\x00" * 30
+        hist_sha = sha256b(historical)
+        hist_path = resolver.vault_object_path(self.vault_root, hist_sha)
+        hist_path.parent.mkdir(parents=True, exist_ok=True)
+        hist_path.write_bytes(historical)
+        manifest = make_manifest(
+            payload_sha=self.payload_sha, size=self.payload_size
+        )
+        exit_code, _ = self.run_resolve(manifest, source=None)
+        self.assertEqual(exit_code, EXIT_UNAVAILABLE)
+        # Placing historical bytes at the AUTHORIZED path must still be
+        # VaultObjectCorrupt (content mismatch), never accepted.
+        auth_path = resolver.vault_object_path(self.vault_root, self.payload_sha)
+        auth_path.parent.mkdir(parents=True, exist_ok=True)
+        auth_path.write_bytes(historical)
+        exit_code, _ = self.run_resolve(manifest, source=None)
+        self.assertEqual(exit_code, EXIT_VAULT_CORRUPT)
+
+    def test_manifest_revision_zero_or_negative_rejected(self):
+        # Wrong manifest revision (0 / negative) is invalid - the manifest is
+        # not a valid rev2 authority.
+        for bad_rev in (0, -1):
+            manifest = make_manifest(
+                payload_sha=self.payload_sha, size=self.payload_size,
+                revision=bad_rev,
+            )
+            with self.assertRaises(resolver.ResolverError) as ctx:
+                resolver.validate_manifest(
+                    self.write_manifest(manifest, name=f"bad_rev_{abs(bad_rev)}.json"),
+                    "gto_launcher",
+                )
+            self.assertEqual(ctx.exception.exit_code, EXIT_MANIFEST_INVALID)
+
+
+class T1RealManifestTests(unittest.TestCase):
+    """T1 on the REAL gto_launcher.json: the reference hash 4d5770... must
+    never resolve as the rev2 protected input."""
+
+    REV2_SHA = "11473d2e6b00d8a7f079e0e2d7eff9cfd0c7134af3c6bd3ca2e600b637895c86"
+    REV2_SIZE = 24636416
+    REF_SHA = "4d5770afdd2f6d9553fef66826c5a55211b80d8d174360a115f247efafb037c8"
+    REF_SIZE = 8583680
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        self.vault = root / "vault"
+        self.evidence = root / "evidence"
+        self.observed = root / "observed"
+        self.vault.mkdir()
+        self.evidence.mkdir()
+        self.observed.mkdir()
+        self.manifest_path = AUTHORIZED_MANIFEST
+
+    def tearDown(self):
+        resolver.HASH_FILE_HOOK = None
+        resolver.SIZE_HOOK = None
+        resolver.set_repo_root_for_test(None)
+        self.temp.cleanup()
+
+    def test_real_manifest_authorizes_only_rev2(self):
+        # The real manifest must resolve to 11473d.../24636416 (rev2).
+        parsed = resolver.validate_manifest(self.manifest_path, "gto_launcher")
+        self.assertEqual(parsed["manifest_revision"], 2)
+        self.assertEqual(parsed["expected_sha256"], self.REV2_SHA)
+        self.assertEqual(parsed["expected_size_bytes"], self.REV2_SIZE)
+
+    def test_real_manifest_reference_as_source_is_mismatch(self):
+        # Feed the REFERENCE digest+size (4d5770.../8583680) as the mutable
+        # source: the resolver must fail closed (SampleIdentityMismatch), never
+        # treat the reference as the rev2 protected input.
+        ref_bytes = b"MZ" + b"\x90" * 64  # synthetic; never executed
+        source = self.temp.name and Path(self.temp.name) / "ref.bin"
+        source.write_bytes(ref_bytes)
+        # The resolver only knows the manifest digest; a fake reference-sized
+        # file at the source path will hash to something != 11473d..., so
+        # resolution fails as SampleIdentityMismatch when the vault object for
+        # the authorized digest is absent.
+        try:
+            resolver.resolve(
+                manifest_path=self.manifest_path,
+                case_id="gto_launcher",
+                vault_root=self.vault,
+                evidence_dir=self.evidence,
+                source_path=source,
+                force_acquire=False,
+                retain_unmatched=False,
+                observed_revisions_dir=self.observed,
+            )
+            self.fail("reference source must not resolve as rev2 protected input")
+        except resolver.ResolverError as exc:
+            self.assertEqual(exc.exit_code, EXIT_SAMPLE_MISMATCH)
+        # A failure record IS written, but must never claim a match.
+        rec_path = self.evidence / "resolved_source.json"
+        self.assertTrue(rec_path.exists(), "failure record written")
+        rec = json.loads(rec_path.read_text(encoding="utf-8"))
+        self.assertIs(rec["revision_match"], False)
+        self.assertEqual(rec["resolution_status"], "SampleIdentityMismatch")
+        self.assertNotEqual(rec["expected_sha256"], self.REF_SHA,
+                           "expected stays the rev2 protected input")
+
+    def test_real_manifest_reference_vault_object_not_resolved(self):
+        # Even if the REFERENCE object sits in the vault under ITS digest, the
+        # resolver derives the vault path from the MANIFEST digest (11473d...).
+        # With no 11473d object and no source, it is AuthorizedRevision
+        # Unavailable - the reference is never picked.
+        ref_path = resolver.vault_object_path(self.vault, self.REF_SHA)
+        ref_path.parent.mkdir(parents=True, exist_ok=True)
+        ref_path.write_bytes(b"MZ" + b"\x90" * 64)
+        try:
+            resolver.resolve(
+                manifest_path=self.manifest_path,
+                case_id="gto_launcher",
+                vault_root=self.vault,
+                evidence_dir=self.evidence,
+                source_path=None,
+                force_acquire=False,
+                retain_unmatched=False,
+                observed_revisions_dir=self.observed,
+            )
+            self.fail("reference vault object must not authorize rev2")
+        except resolver.ResolverError as exc:
+            self.assertEqual(exc.exit_code, EXIT_UNAVAILABLE)
+
+
 if __name__ == "__main__":
     unittest.main()

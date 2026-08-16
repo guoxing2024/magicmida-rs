@@ -7,7 +7,7 @@
 | 样品 | case_id | 保护族 | 路径 | manifest SHA-256 |
 |------|---------|--------|------|------------------|
 | 时光一键宏.exe | `origin_macro` | oreans_candidate (Themida) | `D:\Tools\RE\dumps\new\时光一键宏.exe` | `1af62999cf5be0b2f21abc39034c122a42aa46cfbfdb546faa184de37ac09ac7` |
-| 启动器.exe | `gto_launcher` | ahk_gto_candidate (AHK 启动器) | `D:\Tools\RE\dumps\gto\启动器.exe` | `4d5770afdd2f6d9553fef66826c5a55211b80d8d174360a115f247efafb037c8` |
+| 启动器.exe | `gto_launcher` | ahk_gto_candidate (AHK 启动器) | `D:\Tools\RE\dumps\gto\启动器.exe` | `11473d2e6b00d8a7f079e0e2d7eff9cfd0c7134af3c6bd3ca2e600b637895c86`（rev 2；rev1 `4d5770af…` 仅 analysis_reference） |
 
 此目标取代此前 D1–D8/Q1–Q7 的"4 案 + multi-family"通用化叙事。
 Lunlun / Xiongxiong 不再是 1.0 门禁样品（降为回归对照）。

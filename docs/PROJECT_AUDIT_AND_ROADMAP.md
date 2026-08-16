@@ -192,7 +192,7 @@ CLI 表面：
 | **origin_macro** | regression | oreans_candidate | `mida_plugin_oreans` | `1af62999cf5be0b2f21abc39034c122a42aa46cfbfdb546faa184de37ac09ac7` | 5232656 | PE32+，EP `.boot`，`.winlice`，TLS+reloc | legacy `fe92f992…` **仅比较** | ✅ |
 | origin oracle | comparison | — | — | `fe92f992bcf07e630c82ff3a1cfc138a8c2463e3e03f862da171e8781119268f` | 1696768 | 历史 operator 候选 | 非权威 | ✅ |
 | **lunlun_software** | development | oreans_candidate | `mida_plugin_oreans` | `8a0118d04e03752728999c845536c29215d2a626ac65845c22e3f1149de0db07` | 4976144 | PE32+，EP `.boot`，`.themida`，TLS+reloc | 无 | ✅ |
-| **gto_launcher** | research | ahk_gto_candidate | `future_plugin_ahk_gto` | `4d5770afdd2f6d9553fef66826c5a55211b80d8d174360a115f247efafb037c8` | 8583680 | PE32+，EP `.KI3`，无 reloc，TLS | analysis_ref `dcc411af…` | ✅ |
+| **gto_launcher** | research | ahk_gto_candidate | `future_plugin_ahk_gto` | `11473d2e6b00d8a7f079e0e2d7eff9cfd0c7134af3c6bd3ca2e600b637895c86` | 24636416 | PE32+，EP `.rdata2`，9 sections incl `.fptable`，无 reloc，TLS（manifest rev 2） | analysis_ref `4d5770af…`（rev1，仅比较） | ✅ |
 | gto_ref | analysis_reference | — | — | `dcc411afaafed6bf3fbc52c0c72eddf79f56fc9aea1516b911d49f59c94af379` | 15497216 | 历史工具输出 | 非权威 | ✅ |
 | **dali_plugin** | research | packed_managed | **out_of_scope** | `e4f48d5a13589bd7232268d4836f1b7581983536f3310cc066f04d463873165d` | 6129664 | PE32，CLR/`mscoree` | 无 | ✅ |
 | plain_pe32 | negative_control | unprotected | generic_static | `5ae16f20b1131e0e030a5f364340fe20d5425be4684bb1b2514ed4ebbb137df3` | 1024 | 合成最小 PE32 | — | ✅ |
