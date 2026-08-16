@@ -28,6 +28,18 @@ use mida_core::windows_debugger::{
 use mida_core::{CoreError, DebugEvent, DebuggerCore};
 use windows::Win32::System::Diagnostics::Debug::CONTEXT;
 
+/// Process-wide serialization for the real-Windows harness tests.
+///
+/// Every test in this harness launches a helper process and opens Windows
+/// handles (process/thread/mapping). The absolute `GetProcessHandleCount`
+/// assertions (P2-2) measure the TEST process's global handle table, so a
+/// parallel sibling test creating handles would be miscounted as a leak. All
+/// harness tests therefore take this lock for their whole body: exactly one
+/// real-process test runs at a time, the handle-count windows are quiet, and
+/// no `--test-threads=1` CI change is needed. The guard is released on Drop
+/// (including panic unwind) after `cleanup()` has closed every owned handle.
+static HARNESS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 const OFF_COUNTER: usize = 0;
 const OFF_RUNNING: usize = 8;
 const OFF_WORKER: usize = 12;
@@ -400,6 +412,7 @@ fn run_freeze_round(tag: &str) -> Result<(), String> {
 
 #[test]
 fn real_process_freeze_stops_workers() {
+    let _harness_guard = HARNESS_LOCK.lock().unwrap();
     if !helper_available() {
         eprintln!("SKIP: helper not built (enable feature capture-epoch-harness)");
         return;
@@ -410,6 +423,7 @@ fn real_process_freeze_stops_workers() {
 
 #[test]
 fn real_process_unfreeze_resumes_workers() {
+    let _harness_guard = HARNESS_LOCK.lock().unwrap();
     if !helper_available() {
         eprintln!("SKIP: helper not built (enable feature capture-epoch-harness)");
         return;
@@ -421,6 +435,7 @@ fn real_process_unfreeze_resumes_workers() {
 
 #[test]
 fn real_process_freeze_covers_thread_set() {
+    let _harness_guard = HARNESS_LOCK.lock().unwrap();
     if !helper_available() {
         eprintln!("SKIP: helper not built (enable feature capture-epoch-harness)");
         return;
@@ -434,6 +449,7 @@ fn real_process_freeze_covers_thread_set() {
 /// 20x repetition: any single real freeze/restore failure fails the suite.
 #[test]
 fn real_process_repeated_20x_all_pass() {
+    let _harness_guard = HARNESS_LOCK.lock().unwrap();
     if !helper_available() {
         eprintln!("SKIP: helper not built (enable feature capture-epoch-harness)");
         return;
@@ -450,6 +466,7 @@ fn real_process_repeated_20x_all_pass() {
 /// exactly that one layer on unfreeze (never unconditionally resumes to 0).
 #[test]
 fn real_process_prior_suspend_count_restored() {
+    let _harness_guard = HARNESS_LOCK.lock().unwrap();
     if !helper_available() {
         eprintln!("SKIP: helper not built (enable feature capture-epoch-harness)");
         return;
@@ -540,6 +557,7 @@ fn real_process_prior_suspend_count_restored() {
 /// nonexistent target PID returns an error and never reports a "frozen" result.
 #[test]
 fn real_process_partial_freeze_rolls_back() {
+    let _harness_guard = HARNESS_LOCK.lock().unwrap();
     if !helper_available() {
         eprintln!("SKIP: helper not built (enable feature capture-epoch-harness)");
         return;
@@ -682,6 +700,7 @@ impl mida_core::DebuggerCore for FreezeOnlyDebugger {
 /// the restore proof.
 #[test]
 fn real_process_partial_freeze_after_n_threads_rolls_back() {
+    let _harness_guard = HARNESS_LOCK.lock().unwrap();
     if !helper_available() {
         eprintln!("SKIP: helper not built (enable feature capture-epoch-harness)");
         return;
@@ -753,6 +772,7 @@ fn real_process_partial_freeze_after_n_threads_rolls_back() {
 /// thread id + phase. The failed thread is then manually resumed by the test.
 #[test]
 fn real_process_partial_freeze_rollback_failure_reports_tid() {
+    let _harness_guard = HARNESS_LOCK.lock().unwrap();
     if !helper_available() {
         eprintln!("SKIP: helper not built (enable feature capture-epoch-harness)");
         return;
@@ -859,6 +879,7 @@ fn real_process_partial_freeze_rollback_failure_reports_tid() {
 /// path.
 #[test]
 fn real_process_epoch_guard_drop_restores_on_error() {
+    let _harness_guard = HARNESS_LOCK.lock().unwrap();
     if !helper_available() {
         eprintln!("SKIP: helper not built (enable feature capture-epoch-harness)");
         return;
@@ -919,6 +940,7 @@ fn real_process_epoch_guard_drop_restores_on_error() {
 /// panic does not kill the test runner.
 #[test]
 fn real_process_epoch_guard_drop_restores_on_panic() {
+    let _harness_guard = HARNESS_LOCK.lock().unwrap();
     if !helper_available() {
         eprintln!("SKIP: helper not built (enable feature capture-epoch-harness)");
         return;
@@ -977,6 +999,7 @@ fn real_process_epoch_guard_drop_restores_on_panic() {
 /// completes; all threads restored precisely.
 #[test]
 fn real_process_deterministic_exit_before_open() {
+    let _harness_guard = HARNESS_LOCK.lock().unwrap();
     if !helper_available() {
         eprintln!("SKIP: helper not built (enable feature capture-epoch-harness)");
         return;
@@ -1054,6 +1077,7 @@ fn real_process_deterministic_exit_before_open() {
 /// phase proven.
 #[test]
 fn real_process_deterministic_exit_after_open_before_suspend() {
+    let _harness_guard = HARNESS_LOCK.lock().unwrap();
     if !helper_available() {
         eprintln!("SKIP: helper not built (enable feature capture-epoch-harness)");
         return;
@@ -1119,6 +1143,7 @@ fn real_process_deterministic_exit_after_open_before_suspend() {
 /// the barrier TID and phase. Handle count must be net-zero (P2-2).
 #[test]
 fn real_process_barrier_failure_fails_closed_no_handle_leak() {
+    let _harness_guard = HARNESS_LOCK.lock().unwrap();
     if !helper_available() {
         eprintln!("SKIP: helper not built (enable feature capture-epoch-harness)");
         return;
@@ -1227,6 +1252,7 @@ fn thread_exists(tid: u32) -> bool {
 /// double-resume of a running thread would push count negative and fail).
 #[test]
 fn real_process_epoch_end_then_drop_is_idempotent() {
+    let _harness_guard = HARNESS_LOCK.lock().unwrap();
     if !helper_available() {
         eprintln!("SKIP: helper not built (enable feature capture-epoch-harness)");
         return;
@@ -1310,6 +1336,7 @@ fn real_process_epoch_end_then_drop_is_idempotent() {
 /// an explicit unsupported error — never silently resume nothing.
 #[test]
 fn real_process_freeze_only_backend_end_fails_closed() {
+    let _harness_guard = HARNESS_LOCK.lock().unwrap();
     if !helper_available() {
         eprintln!("SKIP: helper not built (enable feature capture-epoch-harness)");
         return;
@@ -1405,6 +1432,7 @@ fn wait_counter_change(shm: &SharedCounter, from: u64) -> bool {
 /// not pollute the process handle count.
 #[test]
 fn real_process_repeated_freeze_has_no_handle_growth() {
+    let _harness_guard = HARNESS_LOCK.lock().unwrap();
     if !helper_available() {
         eprintln!("SKIP: helper not built");
         return;
