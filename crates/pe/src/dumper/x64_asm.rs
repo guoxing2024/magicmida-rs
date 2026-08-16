@@ -266,6 +266,9 @@ pub fn add_r64_r64(out: &mut Vec<u8>, a: u8, b: u8) {
 }
 
 /// Emit `mov r64, imm64` (movabs).
+/// No in-tree caller yet; retained as a standard x64 emitter alongside the
+/// other `mov/add/sub` instruction helpers.
+#[allow(dead_code)]
 pub fn mov_r64_imm64(out: &mut Vec<u8>, dest: u8, imm: u64) {
     let rex_b = dest >= 8;
     out.push(rex_prefix(true, false, false, rex_b));

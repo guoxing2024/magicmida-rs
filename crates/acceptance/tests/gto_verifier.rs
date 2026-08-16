@@ -922,7 +922,7 @@ fn malformed_case_manifest_id_rejected() {
 #[test]
 fn acceptance_junction_escape_of_logical_dir_identity_ok_false() {
     let dir = temp_dir("acc_junction_logical");
-    let (envelope, manifest, snap_path, sha, size) = setup_positive(&dir);
+    let (envelope, manifest, snap_path, sha, _size) = setup_positive(&dir);
     let _ = manifest;
     // Move the real snapshot dir content into an OUTSIDE dir, then replace
     // <snapshot_root>/gto_launcher with a junction to outside/gto_launcher.
@@ -988,7 +988,7 @@ fn acceptance_junction_escape_of_logical_dir_identity_ok_false() {
 #[test]
 fn acceptance_root_junction_alias_to_valid_tree_identity_ok_false() {
     let dir = temp_dir("acc_root_junction");
-    let (envelope, manifest, _snap_path, sha, size) = setup_positive(&dir);
+    let (envelope, manifest, _snap_path, sha, _size) = setup_positive(&dir);
     let _ = manifest;
     // setup_positive created <dir>/snapshots/gto_launcher/<sha>/snapshot.bin.
     let snap_root = dir.join("snapshots");

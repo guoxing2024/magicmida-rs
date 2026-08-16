@@ -746,9 +746,15 @@ pub enum DeclarationKind {
     StructuredHeapPointer,
     /// Pointer computed relative to a known runtime heap handle
     /// (e.g. `GetProcessHeap` + offset) — interior-pointer class.
+    /// Reserved classification: never constructed by the current pipeline,
+    /// kept for the declaration-kind schema label contract.
+    #[allow(dead_code)]
     KnownRuntimeHandleRelativePointer,
     /// Pointer into a known object field of a typed AHK object (field-offset
     /// evidence from object layout).
+    /// Reserved classification: never constructed by the current pipeline,
+    /// kept for the declaration-kind schema label contract.
+    #[allow(dead_code)]
     KnownObjectFieldPointer,
     /// Value in a loaded module's address range — module-relative candidate
     /// (resolver work deferred to a later work order; never auto-resolved here).
@@ -763,14 +769,23 @@ pub enum DeclarationKind {
     InlineText,
     /// Allocator metadata (HEAP_ENTRY header / freelist link) — excluded only
     /// with allocation-layout evidence.
+    /// Reserved classification: never constructed by the current pipeline,
+    /// kept for the declaration-kind schema label contract.
+    #[allow(dead_code)]
     AllocatorMetadata,
     /// No structural evidence — MUST stay required (unknown_defaults_to_required).
     Unknown,
     /// Same physical slot declared again with identical value/kind/decision —
     /// audited, merged (both sources retained in the ledger).
+    /// Reserved classification: never constructed by the current pipeline,
+    /// kept for the declaration-kind schema label contract.
+    #[allow(dead_code)]
     DuplicateSameSemantics,
     /// Same physical slot declared with conflicting value/kind/decision —
     /// terminal fail-closed.
+    /// Reserved classification: never constructed by the current pipeline,
+    /// kept for the declaration-kind schema label contract.
+    #[allow(dead_code)]
     DuplicateConflict,
 }
 
@@ -806,6 +821,9 @@ impl DeclarationKind {
     }
 
     /// Whether this kind is a non-pointer exclusion backed by evidence.
+    /// No in-tree caller yet; retained as the mirror of `is_declared_pointer`
+    /// for exclusion-path consumers.
+    #[allow(dead_code)]
     pub fn is_evidence_excluded(self) -> bool {
         matches!(
             self,
@@ -4041,7 +4059,7 @@ mod tests {
     fn bootstrap_contract_checks() {
         // Build a minimal valid PE for contract checks.
         let pe = crate::header::make_minimal_pe64();
-        let mut pe = crate::header::PeHeader::from_bytes(&pe).unwrap();
+        let pe = crate::header::PeHeader::from_bytes(&pe).unwrap();
         let contract = crate::dumper::runtime_bootstrap::BootContractLayout {
             header_off: 0x100,
             payload_off: 0x200,

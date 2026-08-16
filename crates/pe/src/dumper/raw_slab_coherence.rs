@@ -43,6 +43,9 @@ use super::module_identity::ModuleIdentity;
 ///   * matching identity + valid policy -> allow.
 /// The action name is advisory (e.g. "sanitize_ahk_runtime_global"); the RVA
 /// alone is never sufficient.
+/// Retained as the reserved decision primitive for MIDA-SERIAL-14/15 call-site
+/// wiring; no in-tree caller yet, kept for the documented contract.
+#[allow(dead_code)]
 pub fn sample_transform_allowed(
     policy: &DumpCapturePolicy,
     module: &ModuleIdentity,
@@ -53,6 +56,8 @@ pub fn sample_transform_allowed(
 
 /// Convenience for MIDA-SERIAL-15: strip a policy to generic-only when the
 /// gate denies (no binding / mismatch / digest / revision failure).
+/// Reserved pairing of `sample_transform_allowed`; no in-tree caller yet.
+#[allow(dead_code)]
 pub fn policy_for_generic_path(policy: &DumpCapturePolicy) -> DumpCapturePolicy {
     policy.strip_sample_specific()
 }
@@ -2364,9 +2369,16 @@ pub enum CaptureDriftResolution {
     /// the authoritative raw slab byte wins (`B[i]=S[i]`).
     NonWriteSlabAuthoritative,
     /// A transform wrote a byte whose preimage drifted; fail-closed.
+    /// Never constructed by the current pipeline (drift always fails closed via
+    /// `RawCaptureDrift` error); kept as part of the capture-drift schema
+    /// contract serialized by `snapshot_manifest`.
+    #[allow(dead_code)]
     TransformPreimageDrift,
     /// A strict extent (ObservedAllocation/BackingObject/Container) had full-range
     /// drift; fail-closed.
+    /// Never constructed by the current pipeline; kept for the same schema
+    /// contract (diagnostic resolution labels).
+    #[allow(dead_code)]
     StrictExtentRejected,
     /// Route Q R0 Q0-C: a probe/interior transform wrote a byte whose write-set
     /// was derived from the authoritative slab preimage (`P == S`, proven by the
@@ -3679,6 +3691,9 @@ fn raw_capture_drift_error(
 /// Fail-closed on any raw-coherence drift, range overflow, child outside slab,
 /// or conflicting overlays. Never modifies debuggee memory (offline candidate
 /// construction only).
+/// Legacy single-slab path superseded by `build_patched_backing_slab_q0c`;
+/// retained for API compatibility / round documentation.
+#[allow(dead_code)]
 pub fn build_patched_backing_slab(
     raw_capture: &RawSlabCapture,
     transformed_globals: &[HeapGlobalSnapshot],
@@ -7347,7 +7362,7 @@ mod tests {
         seeded.extent_evidence.capture_id = "af1b-probe".into();
         seeded.content[0x28..0x30].fill(0);
         // A correct binding (matching the seeded transform input).
-        let mut binding = TransformPreimageBinding {
+        let binding = TransformPreimageBinding {
             child_kind: RawChildKind::HeapGlobal,
             capture_id: "af1b-probe".into(),
             child_old_base: AF1B_BASE,
@@ -7956,7 +7971,7 @@ mod tests {
         let _ = &mut binding;
         let mut ledger = TransformRunLedger::default();
         // Use the execution-owning helper: it must run the transform AND record.
-        let mut b = binding;
+        let b = binding;
         apply_recorded_transform(&mut globals, "t_probe_write", &mut ledger, |g| {
             g[0].content[0x10] = 0xEE; // the transform writes +0x10
         })
@@ -8273,7 +8288,7 @@ mod tests {
     // raw_children_from_capture and the seed binding so they agree.
     #[test]
     fn route_q_af1c_container_identity_is_deterministic_and_stable() {
-        let (raw_capture, mut cont, _binding) = af1c_container_fixture();
+        let (raw_capture, cont, _binding) = af1c_container_fixture();
         // raw_children_from_capture derives the same id as container_capture_id.
         let raw_children = raw_children_from_capture(&[cont.clone()], &[]);
         let rc = raw_children
@@ -8837,7 +8852,7 @@ mod tests {
     fn route_s_r0e_route_r1_geometry_overlay_completes() {
         let (raw_capture, transformed, binding) = s0e_dangling_fixture();
         // transform input = S (unchanged): T == P == S at every byte, incl byte 0.
-        let mut ledger = TransformRunLedger::default();
+        let ledger = TransformRunLedger::default();
         // No writes -> empty ledger is valid; overlay must complete.
         let (patched, overlays, _drift) =
             build_patched_backing_slab_q0c(&raw_capture, &[transformed], &[], &[binding], &ledger)
@@ -9021,8 +9036,8 @@ mod tests {
         let mut globals = vec![g];
         let mut containers: Vec<ContainerSnapshot> = Vec::new();
         let mut ledger = TransformRunLedger::default();
-        let mut image_base = 0x140000000u64;
-        let mut image_end = image_base + 0x1000_0000;
+        let image_base = 0x140000000u64;
+        let image_end = image_base + 0x1000_0000;
         apply_recorded_transform(
             &mut globals,
             "scrub_uncaptured_heap_pointers",
@@ -9521,7 +9536,7 @@ mod tests {
         assert_eq!(bindings[0].slab_old_base, DEDICATED);
         assert_eq!(bindings[0].slab_offset, 0);
         // Overlay: dedicated slab is patched in place.
-        let mut ledger = TransformRunLedger::default();
+        let ledger = TransformRunLedger::default();
         let (patched, overlays, _) =
             build_patched_backing_slab_q0c(&raw_capture, &[transformed], &[], &[binding], &ledger)
                 .unwrap();
@@ -9607,7 +9622,7 @@ mod tests {
         assert_eq!(b_main.slab_old_base, MAIN);
         assert_eq!(b_ded.slab_old_base, DEDICATED);
         // Overlay both -> two patched slabs, both children applied.
-        let mut ledger = TransformRunLedger::default();
+        let ledger = TransformRunLedger::default();
         let (patched, overlays, _) =
             build_patched_backing_slab_q0c(&raw_capture, &globals, &[], &bindings, &ledger)
                 .unwrap();
@@ -9689,7 +9704,7 @@ mod tests {
             transform_input_digest: sha256_hex(&vec![0xAAu8; SIZE]),
             seeded_from_slab: true,
         };
-        let mut ledger = TransformRunLedger::default();
+        let ledger = TransformRunLedger::default();
         let (patched, overlays, _) = build_patched_backing_slab_q0c(
             &raw_capture,
             &[main_transformed, dedicated_transformed],
@@ -9760,7 +9775,7 @@ mod tests {
     fn route_t_af1_no_main_slab_does_not_skip_coherence() {
         const DEDICATED: u64 = 0x850150;
         const SIZE: usize = 0x1000;
-        let (raw_capture, transformed, binding, _) = taf1_dedicated_fixture(DEDICATED, SIZE);
+        let (raw_capture, transformed, _binding, _) = taf1_dedicated_fixture(DEDICATED, SIZE);
         // raw_capture has ONLY the dedicated slab (no main slab). Seed must still
         // resolve the child to the dedicated slab.
         let mut globals = vec![transformed];
@@ -9775,7 +9790,7 @@ mod tests {
         assert_eq!(bindings[0].slab_old_base, DEDICATED);
         assert!(bindings[0].seeded_from_slab);
         // Overlay must run (not skipped because no main slab).
-        let mut ledger = TransformRunLedger::default();
+        let ledger = TransformRunLedger::default();
         let (patched, _, _) =
             build_patched_backing_slab_q0c(&raw_capture, &globals, &[], &bindings, &ledger)
                 .unwrap();
@@ -9913,7 +9928,7 @@ mod tests {
             &mut globals,
         )
         .unwrap();
-        let mut ledger = TransformRunLedger::default();
+        let ledger = TransformRunLedger::default();
         let (patched, overlays, _) =
             build_patched_backing_slab_q0c(&raw_capture, &globals, &[], &bindings, &ledger)
                 .unwrap();
@@ -10092,7 +10107,7 @@ mod tests {
         let (raw_capture, transformed, mut binding, _) = taf1_dedicated_fixture(DEDICATED, SIZE);
         // Corrupt the binding's slab_size (still correct base/offset/digest).
         binding.slab_size = SIZE - 1;
-        let mut ledger = TransformRunLedger::default();
+        let ledger = TransformRunLedger::default();
         let err =
             build_patched_backing_slab_q0c(&raw_capture, &[transformed], &[], &[binding], &ledger)
                 .unwrap_err();
@@ -10114,7 +10129,7 @@ mod tests {
         let (raw_capture, transformed, mut binding, _) = taf1_dedicated_fixture(DEDICATED, SIZE);
         // Corrupt the binding's slab_digest (still correct base/size/offset).
         binding.slab_digest = "DEADBEEF".into();
-        let mut ledger = TransformRunLedger::default();
+        let ledger = TransformRunLedger::default();
         let err =
             build_patched_backing_slab_q0c(&raw_capture, &[transformed], &[], &[binding], &ledger)
                 .unwrap_err();
@@ -10136,7 +10151,7 @@ mod tests {
         // Corrupt both base and digest.
         binding.slab_old_base = DEDICATED - 0x1000;
         binding.slab_digest = "DEADBEEF".into();
-        let mut ledger = TransformRunLedger::default();
+        let ledger = TransformRunLedger::default();
         let err =
             build_patched_backing_slab_q0c(&raw_capture, &[transformed], &[], &[binding], &ledger)
                 .unwrap_err();
@@ -10337,7 +10352,7 @@ mod tests {
             bindings[0].slab_old_base, 0x900000,
             "binding must use kept slab"
         );
-        let mut ledger = TransformRunLedger::default();
+        let ledger = TransformRunLedger::default();
         let (patched, _, _) =
             build_patched_backing_slab_q0c(&raw_capture, &globals, &[], &bindings, &ledger)
                 .unwrap();
@@ -10585,7 +10600,7 @@ mod tests {
         let s = HeapSlab {
             old_base: 0x1000,
             content: {
-                let mut c = vec![0x50u8; 0x180];
+                let c = vec![0x50u8; 0x180];
                 c
             },
         };
@@ -11834,7 +11849,7 @@ mod tests {
         let off_a = (LIVE - SLAB_BASE) as usize;
         let off_b = (B_BASE - SLAB_BASE) as usize;
         let b_sz = (LIVE + NEW_SIZE as u64 - B_BASE) as usize; // 0x30 + 0x180
-        let mut a_raw = vec![0xAAu8; OLD_SIZE];
+        let a_raw = vec![0xAAu8; OLD_SIZE];
         let mut b_raw = vec![0xCCu8; 0x30];
         b_raw.extend(std::iter::repeat(0xAAu8).take(NEW_SIZE));
         assert_eq!(b_raw.len(), b_sz);
@@ -11925,8 +11940,6 @@ mod tests {
     /// binding / coverage membership / parent-interior lineage.
     #[test]
     fn route_y_r1_a6_q0c_contained_label_scrub_vs_mark_conflict() {
-        use super::super::heap_global_snapshot::mark_labels_non_nested;
-        use super::super::heap_global_snapshot::scrub_uncaptured_heap_pointers;
         // Geometry mirrors the live A6 conflict byte 0x8e9dcb.
         const A_BASE: u64 = 0x8e93c8; // heap-global parent slot
         const A_SIZE: usize = 0x2000; // 8192
@@ -11935,8 +11948,8 @@ mod tests {
         const SLAB_BASE: u64 = 0x800000;
         const SLAB_SZ: usize = 0x200000;
         // Byte A+0xa03 == B+0x23 == absolute 0x8e9dcb (the conflict byte).
-        let a_off = (A_BASE - SLAB_BASE) as usize;
-        let b_off = (B_BASE - SLAB_BASE) as usize;
+        let _a_off = (A_BASE - SLAB_BASE) as usize;
+        let _b_off = (B_BASE - SLAB_BASE) as usize;
         assert_eq!(A_BASE + 0xa03, 0x8e9dcb);
         assert_eq!(B_BASE + 0x23, 0x8e9dcb);
         // Dangling user pointer (in user range, not in any captured range, not
@@ -11958,17 +11971,16 @@ mod tests {
         let mut b_raw = vec![0xAAu8; B_SIZE];
         b_raw[0x20..0x28].copy_from_slice(&DANGLING.to_le_bytes());
 
-        let (raw_capture, mut globals, mut containers, bindings, ledger) =
-            a6_contained_label_pipeline(
-                &a_raw,
-                &b_raw,
-                A_BASE,
-                A_SIZE,
-                B_BASE,
-                SLAB_BASE,
-                SLAB_SZ,
-                &protected_label_config(),
-            );
+        let (raw_capture, globals, _containers, bindings, ledger) = a6_contained_label_pipeline(
+            &a_raw,
+            &b_raw,
+            A_BASE,
+            A_SIZE,
+            B_BASE,
+            SLAB_BASE,
+            SLAB_SZ,
+            &protected_label_config(),
+        );
 
         // Narrow mitigation (Route Y R1 A6): A's scrub SKIPS the protected
         // Label +0x23 flag qword (A is a DIFFERENT buffer than the Label B), so
@@ -12473,7 +12485,7 @@ mod tests {
         let b_raw = vec![0xAAu8; B_SIZE];
         let mut cfg = protected_label_config();
         cfg.b_size = B_SIZE;
-        let (raw_capture, globals, _containers, bindings, ledger) = a6_contained_label_pipeline(
+        let (_raw_capture, globals, _containers, _bindings, _ledger) = a6_contained_label_pipeline(
             &a_raw, &b_raw, A_BASE, A_SIZE, B_BASE, SLAB_BASE, SLAB_SZ, &cfg,
         );
         // A's scrub clobbers the shared byte (no protection entry for an out-of-bounds
@@ -13185,7 +13197,7 @@ mod tests {
         const RVA: u32 = 0x141bf0;
         const LIVE: u64 = 0x3437e50;
         const OLD_SIZE: usize = 0x8000;
-        let mut raw_bytes = vec![0xAAu8; OLD_SIZE];
+        let raw_bytes = vec![0xAAu8; OLD_SIZE];
         let slab = slab_with_child(0x3400000, 0x100000, LIVE, raw_bytes.clone());
         let mut raw_capture = RawSlabCapture {
             slabs: vec![slab],
@@ -14341,7 +14353,7 @@ mod tests {
     #[test]
     fn route_y_r1_a6_q0c_q0c_single_raw_wrong_source_identity_is_raw_child_missing() {
         let (raw, globals, bindings) = q0c_single_candidate_wrong_identity_fixture();
-        let mut ledger = TransformRunLedger::default();
+        let ledger = TransformRunLedger::default();
         let err =
             build_patched_backing_slab_q0c(&raw, &globals, &[], &bindings, &ledger).unwrap_err();
         assert!(
@@ -14354,7 +14366,7 @@ mod tests {
     #[test]
     fn route_y_r1_a6_q0c_q0c_single_raw_wrong_identity_precedes_slab_failure() {
         let (raw, globals, bindings) = q0c_single_candidate_wrong_identity_fixture();
-        let mut ledger = TransformRunLedger::default();
+        let ledger = TransformRunLedger::default();
         let err =
             build_patched_backing_slab_q0c(&raw, &globals, &[], &bindings, &ledger).unwrap_err();
         assert!(
@@ -14368,7 +14380,7 @@ mod tests {
     #[test]
     fn route_y_r1_a6_q0c_q0c_single_raw_wrong_identity_precedes_byte_drift() {
         let (raw, globals, bindings) = q0c_single_candidate_wrong_identity_fixture();
-        let mut ledger = TransformRunLedger::default();
+        let ledger = TransformRunLedger::default();
         let err =
             build_patched_backing_slab_q0c(&raw, &globals, &[], &bindings, &ledger).unwrap_err();
         assert!(
@@ -14416,7 +14428,7 @@ mod tests {
         transformed.extent_evidence.was_interior = true;
         transformed.extent_evidence.containing_parent_old_base = Some(0x8e93c8);
         transformed.extent_evidence.containing_parent_size = Some(0x2000);
-        let mut ledger = TransformRunLedger::default();
+        let ledger = TransformRunLedger::default();
         let err = build_patched_backing_slab_q0c(&raw_capture, &[transformed], &[], &[], &ledger)
             .unwrap_err();
         assert!(
@@ -14480,7 +14492,6 @@ mod tests {
     // compile-layer proof: the field no longer exists on RawChild.
     #[test]
     fn route_y_r1_a6_q0c_source_parent_and_containing_parent_cannot_diverge() {
-        use super::super::heap_global_snapshot::CapturePath as CP;
         const B_BASE: u64 = 0x8e9da8;
         const B_SIZE: usize = 0x400;
         // A raw child built via `raw_children_from_capture` (production) carries
@@ -14520,14 +14531,13 @@ mod tests {
     #[test]
     fn route_y_r1_a6_q0c_binding_legacy_fields_cannot_diverge_from_full_identity() {
         use super::super::heap_global_snapshot::CaptureExtentKind as CEK;
-        use super::super::heap_global_snapshot::CapturePath as CP;
         const DEDICATED: u64 = 0x850150;
         const SIZE: usize = 0x1000;
         let (raw_capture, transformed, binding, _) = taf1_dedicated_fixture(DEDICATED, SIZE);
         // Each legacy overlapping field is mutated to diverge from `identity`.
         // Every one must fail closed with BindingIdentityInconsistent at the Q0-C
         // entry (before any binding resolution).
-        let mut cases: Vec<(String, fn(&mut TransformPreimageBinding))> = vec![
+        let cases: Vec<(String, fn(&mut TransformPreimageBinding))> = vec![
             ("child_kind".into(), |b| {
                 b.child_kind = RawChildKind::Container
             }),
@@ -14541,7 +14551,7 @@ mod tests {
         for (name, mutate) in cases {
             let mut b = binding.clone();
             mutate(&mut b);
-            let mut ledger = TransformRunLedger::default();
+            let ledger = TransformRunLedger::default();
             let err = build_patched_backing_slab_q0c(
                 &raw_capture,
                 &[transformed.clone()],
@@ -14572,13 +14582,11 @@ mod tests {
     // RawChildMissing (identity pre-resolution precedes binding consistency).
     #[test]
     fn route_y_r1_a6_q0c_q0c_wrong_identity_precedes_binding_identity_inconsistent() {
-        use super::super::heap_global_snapshot::CaptureExtentKind as CEK;
-        use super::super::heap_global_snapshot::CapturePath as CP;
-        let (raw, globals, bindings) = q0c_single_candidate_wrong_identity_fixture();
+        let (raw, globals, _bindings) = q0c_single_candidate_wrong_identity_fixture();
         // A self-contradictory binding (legacy capture_id != identity capture_id).
         let mut bad_binding = taf1_dedicated_fixture(0x850150, 0x1000).2;
         bad_binding.capture_id = "gscript_label:0xDEAD".into(); // diverge from identity
-        let mut ledger = TransformRunLedger::default();
+        let ledger = TransformRunLedger::default();
         let err = build_patched_backing_slab_q0c(&raw, &globals, &[], &[bad_binding], &ledger)
             .unwrap_err();
         assert!(
@@ -14696,7 +14704,7 @@ mod tests {
         let (raw_capture, transformed, mut binding, _) = taf1_dedicated_fixture(DEDICATED, SIZE);
         // Corrupt the binding's legacy extent_kind (identity stays correct).
         binding.extent_kind = CEK::BackingObject;
-        let mut ledger = TransformRunLedger::default();
+        let ledger = TransformRunLedger::default();
         let err =
             build_patched_backing_slab_q0c(&raw_capture, &[transformed], &[], &[binding], &ledger)
                 .unwrap_err();
@@ -14762,7 +14770,7 @@ mod tests {
         // Make the binding self-inconsistent AND orphaned (not the transformed child's).
         orphan.capture_id = "gscript_label:0xORPHAN".into(); // legacy != identity
         orphan.child_old_base = 0x9999; // not any transformed child
-        let mut ledger = TransformRunLedger::default();
+        let ledger = TransformRunLedger::default();
         let err =
             build_patched_backing_slab_q0c(&raw_capture, &[transformed], &[], &[orphan], &ledger)
                 .unwrap_err();
@@ -14808,7 +14816,7 @@ mod tests {
         transformed.extent_evidence.was_interior = true;
         transformed.extent_evidence.containing_parent_old_base = Some(0x8e93c8);
         transformed.extent_evidence.containing_parent_size = Some(0x2000);
-        let mut ledger = TransformRunLedger::default();
+        let ledger = TransformRunLedger::default();
         let err = build_patched_backing_slab_q0c(&raw_capture, &[transformed], &[], &[], &ledger)
             .unwrap_err();
         assert!(
@@ -14839,7 +14847,7 @@ mod tests {
             slabs: vec![],
             children: vec![],
         };
-        let mut ledger = TransformRunLedger::default();
+        let ledger = TransformRunLedger::default();
         let err =
             build_patched_backing_slab_q0c(&raw_capture, &[g], &[], &[], &ledger).unwrap_err();
         assert!(
@@ -14862,7 +14870,7 @@ mod tests {
         // A self-contradictory binding (legacy capture_id != identity capture_id).
         let mut bad_binding = taf1_dedicated_fixture(0x850150, 0x1000).2;
         bad_binding.capture_id = "gscript_label:0xDEAD".into();
-        let mut ledger = TransformRunLedger::default();
+        let ledger = TransformRunLedger::default();
         let err = build_patched_backing_slab_q0c(&raw_capture, &[g], &[], &[bad_binding], &ledger)
             .unwrap_err();
         assert!(
@@ -14960,7 +14968,7 @@ mod tests {
             &mut globals,
         )
         .unwrap();
-        let mut ledger = TransformRunLedger::default();
+        let ledger = TransformRunLedger::default();
         let result =
             build_patched_backing_slab_q0c(&raw_capture, &globals, &[], &bindings, &ledger);
         assert!(
@@ -15408,7 +15416,7 @@ mod tests {
             b.raw_child_digest, digest_b,
             "must NOT be the distractor digest B"
         );
-        let mut ledger = TransformRunLedger::default();
+        let ledger = TransformRunLedger::default();
         // Overlay consumes the SAME plan-resolved raw child (probe=0x100). The
         // overlay ledger's raw_child_digest must be digest A, never B.
         let (patched, overlays, _drift) =
@@ -15638,7 +15646,7 @@ mod tests {
     #[test]
     fn route_y_r1_a6_q0c_same_base_id_path_extent_different_source_root_not_resolved() {
         let (raw, globals, bindings) = q0c_ambiguous_source_fixture("source_root");
-        let mut ledger = TransformRunLedger::default();
+        let ledger = TransformRunLedger::default();
         let err = build_patched_backing_slab_q0c(&raw, &globals, &[], &bindings, &ledger)
             .expect_err("different source_root must not resolve");
         assert!(
@@ -15651,7 +15659,7 @@ mod tests {
     #[test]
     fn route_y_r1_a6_q0c_same_base_id_path_extent_different_source_slot_not_resolved() {
         let (raw, globals, bindings) = q0c_ambiguous_source_fixture("source_slot");
-        let mut ledger = TransformRunLedger::default();
+        let ledger = TransformRunLedger::default();
         let err = build_patched_backing_slab_q0c(&raw, &globals, &[], &bindings, &ledger)
             .expect_err("different source_slot must not resolve");
         assert!(
@@ -15664,7 +15672,7 @@ mod tests {
     #[test]
     fn route_y_r1_a6_q0c_same_base_id_path_extent_different_probe_not_resolved() {
         let (raw, globals, bindings) = q0c_ambiguous_source_fixture("probe");
-        let mut ledger = TransformRunLedger::default();
+        let ledger = TransformRunLedger::default();
         let err = build_patched_backing_slab_q0c(&raw, &globals, &[], &bindings, &ledger)
             .expect_err("different probe must not resolve");
         assert!(
@@ -15677,7 +15685,7 @@ mod tests {
     #[test]
     fn route_y_r1_a6_q0c_same_base_id_path_extent_different_parent_not_resolved() {
         let (raw, globals, bindings) = q0c_ambiguous_source_fixture("parent");
-        let mut ledger = TransformRunLedger::default();
+        let ledger = TransformRunLedger::default();
         let err = build_patched_backing_slab_q0c(&raw, &globals, &[], &bindings, &ledger)
             .expect_err("different parent must not resolve");
         assert!(
@@ -15690,14 +15698,12 @@ mod tests {
     // raw child must fail closed at the overlay exact-match.
     #[test]
     fn route_y_r1_a6_q0c_binding_source_identity_mismatch_fails_closed() {
-        use super::super::heap_global_snapshot::CaptureExtentKind as CEK;
-        use super::super::heap_global_snapshot::CapturePath as CP;
         const DEDICATED: u64 = 0x850150;
         const SIZE: usize = 0x1000;
-        let (raw_capture, transformed, mut binding, _) = taf1_dedicated_fixture(DEDICATED, SIZE);
+        let (raw_capture, transformed, binding, _) = taf1_dedicated_fixture(DEDICATED, SIZE);
         // Flip each source-evidence field on the binding identity in turn. Each
         // must leave the overlay exact-match empty -> TransformPreimageBindingIdentityInvalid.
-        let mut cases: Vec<(String, fn(&mut FullCaptureIdentity))> = vec![
+        let cases: Vec<(String, fn(&mut FullCaptureIdentity))> = vec![
             ("source_root".into(), |id| id.source_root_rva = Some(0xDEAD)),
             ("source_slot".into(), |id| id.source_slot_offset = Some(5)),
             ("probe".into(), |id| id.probe_requested_size += 1),
@@ -15709,7 +15715,7 @@ mod tests {
         for (name, flip) in cases {
             let mut b = binding.clone();
             flip(&mut b.identity);
-            let mut ledger = TransformRunLedger::default();
+            let ledger = TransformRunLedger::default();
             let err = build_patched_backing_slab_q0c(
                 &raw_capture,
                 &[transformed.clone()],
@@ -15907,7 +15913,7 @@ mod tests {
             .expect("declared size reinit with unchanged source identity must be allowed");
         // Flip EACH source-evidence field on the declared-reinit child -> must
         // fail closed (a declared reinit can only change size, never provenance).
-        let mut cases: Vec<(String, fn(&mut HeapGlobalSnapshot))> = vec![
+        let cases: Vec<(String, fn(&mut HeapGlobalSnapshot))> = vec![
             ("source_root_rva".into(), |g| {
                 g.extent_evidence.source_root_rva = Some(0x1000)
             }),
@@ -18117,7 +18123,7 @@ mod tests {
     #[test]
     fn m33_parent_bytes_drift_rejected() {
         use super::super::heap_global_snapshot::CapturePath as CP;
-        let (mut child, mut parent) = m33_probe_with_parent(
+        let (mut child, parent) = m33_probe_with_parent(
             0x850150,
             8,
             0x850000,

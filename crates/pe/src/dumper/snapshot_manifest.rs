@@ -20,6 +20,8 @@ use super::types::DumpProfile;
 
 pub(crate) const SCHEMA_VERSION: &str = "mida.dump-snapshot-manifest/v1";
 /// Prior schema version still accepted for read-back (no authorization semantics).
+/// Referenced only by `#[cfg(test)]` assertions pinning the version strings.
+#[cfg(test)]
 pub(crate) const SCHEMA_VERSION_V0: &str = "mida.dump-snapshot-manifest/v0";
 
 /// Route T R0 AF2 (TAF2-E): a single authoritative-slab ledger entry. Records the

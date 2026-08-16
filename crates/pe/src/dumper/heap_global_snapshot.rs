@@ -3008,10 +3008,15 @@ pub struct BoundSyntheticAssignment {
 
 impl BoundSyntheticAssignment {
     /// Convenience accessor: the bound synthetic id.
+    /// Currently unused by in-tree callers; retained as part of the bound-
+    /// assignment API surface used by synthetic-region consumers/tests.
+    #[allow(dead_code)]
     pub fn id(&self) -> &str {
         &self.assignment.synthetic_id
     }
     /// Convenience accessor: the assigned logical old base.
+    /// Currently unused by in-tree callers; retained for symmetric access.
+    #[allow(dead_code)]
     pub fn old_base(&self) -> u64 {
         self.assignment.assigned_logical_old_base
     }
@@ -3172,6 +3177,9 @@ fn sha256_hex(data: &[u8]) -> String {
 }
 
 /// Public sha256 hex helper (exposed for tests building synthetic requests).
+/// Test-only: every in-tree caller lives in `#[cfg(test)]` modules, so this
+/// helper is compiled only when tests are built (`cargo check --tests`/`test`).
+#[cfg(test)]
 pub fn sha256_hex_pub(data: &[u8]) -> String {
     sha256_hex(data)
 }
@@ -3492,10 +3500,6 @@ pub fn validate_bound_assignments(
         }
     }
     Ok(())
-}
-
-fn align_up_u64(v: u64, alignment: u64) -> u64 {
-    (v + (alignment - 1)) & !(alignment - 1)
 }
 
 /// Rewrite anchor pointer slots to point at `assigned_base`, then read each
@@ -10249,7 +10253,6 @@ mod tests {
         // gscript+0 holds a heap pointer to a child.
         let child_base = 0x200000u64;
         gscript.content[0..8].copy_from_slice(&child_base.to_le_bytes());
-        let out = vec![gscript.clone()];
         // Run child-link exhaust; verify the captured child carries GscriptChildLink.
         // (We inspect the evidence path directly via the helper's rules.)
         assert_eq!(CapturePath::GscriptChildLink, CapturePath::GscriptChildLink);
@@ -11540,7 +11543,7 @@ mod tests {
         let mut other_raw = vec![0xCCu8; 0x40];
         other_raw[0x10] = 0xDD;
         let mk = |flip: bool| {
-            let mut c1 = crate::dumper::raw_slab_coherence::RawChild {
+            let c1 = crate::dumper::raw_slab_coherence::RawChild {
                 old_base: Q0D_LABEL,
                 size: child_size,
                 raw_bytes: raw_bytes.clone(),
@@ -11555,7 +11558,7 @@ mod tests {
                 containing_parent_old_base: Some(Q0D_TABLE),
                 containing_parent_size: Some(0x100),
             };
-            let mut c2 = crate::dumper::raw_slab_coherence::RawChild {
+            let c2 = crate::dumper::raw_slab_coherence::RawChild {
                 old_base: other_base,
                 size: 0x40,
                 raw_bytes: other_raw.clone(),
@@ -11589,7 +11592,7 @@ mod tests {
         let (raw_a, child_a) = mk(false);
         let (raw_b, _child_b) = mk(true);
         // Seed A (pre-seed content == raw child C).
-        let mut seeded_a = HeapGlobalSnapshot {
+        let seeded_a = HeapGlobalSnapshot {
             rva: 0,
             live_ptr: Q0D_LABEL,
             content: {
@@ -13976,7 +13979,7 @@ mod tests {
         // the child's content bytes.
         let mut parent_bytes = vec![0u8; 0x1000];
         parent_bytes[0x200..0x208].copy_from_slice(&0x850150u64.to_le_bytes());
-        let mut child = HeapGlobalSnapshot {
+        let child = HeapGlobalSnapshot {
             rva: 0,
             live_ptr: 0x850150,
             content: vec![0x11u8; 8], // differs from parent slice (zeros)

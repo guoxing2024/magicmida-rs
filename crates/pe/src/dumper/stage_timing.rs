@@ -71,7 +71,10 @@ impl StageGuard {
     }
 
     /// Set the item count reported on exit (e.g. number of heap globals / slabs).
+    /// No in-tree caller yet; retained as the symmetric counterpart of
+    /// `with_byte_count` in the stage-timing builder API.
     #[must_use]
+    #[allow(dead_code)]
     pub fn with_item_count(mut self, item_count: usize) -> Self {
         self.item_count = item_count;
         self

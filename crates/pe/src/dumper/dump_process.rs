@@ -1514,7 +1514,10 @@ pub fn dump_process_with_report(
                 // GTO R0-F.2.1: assignments are identity-bound (no positional zip).
                 // Rewrite + read-back verify each anchor, then materialize and
                 // gate a full identity-closed loop BEFORE overlay / planner.
-                let mut materialized = Vec::new();
+                // Bound below via materialize_synthetic_regions (identity-closed
+                // loop) before any read; early error paths never read it.
+                // `mut` is required by `heap_globals.append(&mut materialized)`.
+                let mut materialized;
                 // Track rewrite evidence for the manifest ledger.
                 let mut rewrite_counts: Vec<(String, usize)> = Vec::new();
                 // gscript anchor region base (from the first bound request's slot).
