@@ -160,7 +160,7 @@ environment digest
 | runtime DLL 缺失 / injector 缺失 | `AntiDebugRuntimeUnavailable` |
 | hash 不匹配 | `AntiDebugRuntimeIdentityMismatch` |
 | architecture 不匹配 | `AntiDebugRuntimeArchitectureMismatch` |
-| profile digest 不匹配 | `AntiDebugRuntimeIdentityMismatch`（或 ProfileMismatch） |
+| profile digest 不匹配 | `AntiDebugProfileMismatch`（专用码，ADR-3A 定案） |
 | target identity 不匹配 | `AntiDebugRuntimeIdentityMismatch` |
 | runtime 初始化失败 | `AntiDebugRuntimeInitializationFailed` |
 | hard-required hook 未安装 | `AntiDebugRuntimePartialHooks` |

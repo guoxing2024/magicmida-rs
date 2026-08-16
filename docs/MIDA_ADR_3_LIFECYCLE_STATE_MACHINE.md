@@ -47,7 +47,7 @@ Proceed
 | `DependencyUnavailable` | runtime/injector artifact 缺失或不可读 | fail-closed；`AntiDebugRuntimeUnavailable`；写 evidence；非 0 退出 |
 | `DependencyIdentityMismatch` | hash/size 不匹配 | fail-closed；`AntiDebugRuntimeIdentityMismatch` |
 | `ArchitectureMismatch` | runtime arch != target arch | fail-closed；`AntiDebugRuntimeArchitectureMismatch` |
-| `ProfileMismatch` | profile/sample/arch/digest 不匹配；unknown required；candidate 误当 hard | fail-closed；`AntiDebugRuntimeIdentityMismatch`（或专用 ProfileMismatch code） |
+| `ProfileMismatch` | profile/sample/arch/digest 不匹配；unknown required；candidate 误当 hard | fail-closed；`AntiDebugProfileMismatch`（专用错误码，ADR-3A 定案；与 runtime identity mismatch 区分） |
 | `TargetIdentityMismatch` | protected input hash/size != manifest | fail-closed；`AntiDebugRuntimeIdentityMismatch` |
 | `RuntimeLoadFailed` | 注入/加载失败；超时 | fail-closed；`AntiDebugRuntimeUnavailable` 或 `AntiDebugRuntimeInitializationFailed` |
 | `RuntimeInitializationFailed` | init 返回失败/超时/initialized=false | fail-closed；`AntiDebugRuntimeInitializationFailed` |

@@ -94,6 +94,7 @@
 |---|---|
 | `AntiDebugRuntimeUnavailable` | runtime DLL/injector 缺失或不可读 |
 | `AntiDebugRuntimeIdentityMismatch` | runtime SHA-256 与期望不符 |
+| `AntiDebugProfileMismatch` | profile 与 sample/architecture/digest 不匹配、unknown surface 出现在 hard_required、required_candidate 被误当 hard_required（ADR-3A 定案专用码） |
 | `AntiDebugRuntimeArchitectureMismatch` | runtime 架构与目标架构不符 |
 | `AntiDebugRuntimeInitializationFailed` | 初始化函数未执行 / initialized=false |
 | `AntiDebugRuntimePartialHooks` | hooks_installed != hooks_expected 或 hook_failures 非空 |
