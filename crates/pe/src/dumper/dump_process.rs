@@ -1089,6 +1089,40 @@ pub fn dump_process_with_report(
         epoch_started_ms = capture_tel.started_ms,
         "capture epoch handled; target unfrozen before offline seed/transforms"
     );
+    // MIDA-SERIAL-34: authoritative-slab authority closure + single normalization
+    // pass. The pipeline order is:
+    //
+    //   heap-global capture (above)
+    //   -> reconcile_duplicate_heap_globals
+    //   -> trim_overlapping_heap_global_windows
+    //   -> collect main/dedicated authority candidates
+    //   -> derive parent-closure candidates from the FINAL raw heap-global
+    //      provenance (never gated on the main/dedicated set being non-empty)
+    //   -> ALL candidates enter normalize_authoritative_slabs in ONE pass
+    //   -> from the normalized result build BOTH authoritative_slabs and
+    //      slab_normalization_ledger (one kept slab <-> one ledger entry)
+    //   -> capture_identity_bind
+    //   -> capture_coverage_bind (uses the FINAL authoritative set; no
+    //      post-normalization mutation)
+    //   -> raw capture -> seed -> overlay -> runtime -> manifest
+    //
+    // Reconcile + trim run on RAW snapshots BEFORE candidate collection so the
+    // closure derives from the final (deduped/trimmed) heap-global provenance.
+    if let Some(main) = main_slab.as_ref() {
+        // Route V R0 (V0-A): stage telemetry.
+        let _g = super::stage_timing::StageGuard::begin("reconcile_duplicate_heap_globals");
+        super::heap_global_snapshot::reconcile_duplicate_heap_globals(
+            &mut heap_globals,
+            Some(main),
+        );
+        // Route Y R1 GTO R1: retroactive pairwise window-overlap trim on RAW
+        // captures (before raw children / overlay are built). Adjacent heap
+        // objects admitted via different paths (child-link force-admit vs
+        // label-table exhaust) can have overlapping probe windows; the overlay
+        // would otherwise fail-closed on a transformed write conflict.
+        super::heap_global_snapshot::trim_overlapping_heap_global_windows(&mut heap_globals);
+        drop(_g);
+    }
     // Route T R0 AF2/AF3 (TAF2-B, TAF3-A/B): build the authoritative slab CANDIDATES
     // with their TRUE capture roles (main vs dedicated), then normalize
     // deterministically BEFORE coverage / raw capture / seed. This collapses exact
@@ -1110,6 +1144,32 @@ pub fn dump_process_with_report(
             slab: d.clone(),
             role: "dedicated",
         });
+    }
+    // MIDA-SERIAL-34: derive parent-closure candidates from the FINAL raw
+    // heap-global provenance and add them to the SAME candidate set BEFORE
+    // normalization. The helper is never gated on the main/dedicated candidate
+    // set being non-empty: even with zero base candidates, strict parent
+    // evidence still produces closure candidates, and with none the coverage
+    // gate fails closed below.
+    let existing_candidate_slabs: Vec<super::heap_global_snapshot::HeapSlab> =
+        slab_candidates.iter().map(|c| c.slab.clone()).collect();
+    let closure_candidates = super::raw_slab_coherence::build_authority_closure_candidates(
+        &heap_globals,
+        &existing_candidate_slabs,
+        &pre_trunc_authority,
+    )
+    .map_err(|e| PeError::GtoStage {
+        stage: "capture_slab_closure".into(),
+        error: format!("{e:#}"),
+    })?;
+    let closure_count = closure_candidates.len();
+    slab_candidates.extend(closure_candidates);
+    if closure_count > 0 {
+        info!(
+            added = closure_count,
+            total = slab_candidates.len(),
+            "Parent-closure candidates joined the normalization set"
+        );
     }
     let (normalized, normalization_events) = super::stage_timing::run_stage(
         "normalize_authoritative_slabs",
@@ -1183,6 +1243,10 @@ pub fn dump_process_with_report(
             super::stage_timing::StageStats::default(),
             |stats| {
                 stats.item_count = heap_globals.len();
+                // MIDA-SERIAL-34: the authoritative set is FINAL here — every
+                // closure candidate was joined into normalization BEFORE this
+                // gate. No post-normalization mutation is permitted; the gate
+                // validates coverage against the single shared authoritative set.
                 super::raw_slab_coherence::validate_probe_coverage(
                     &heap_globals,
                     &authoritative_slabs,

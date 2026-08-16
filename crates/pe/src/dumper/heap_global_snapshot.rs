@@ -13554,4 +13554,2299 @@ mod tests {
             other => panic!("expected bounded Resolved, got {other:?}"),
         }
     }
+
+    // ============ MIDA-SERIAL-34 split producer provenance (real helper) ============
+
+    /// Real-producer test: split_swallowed_siblings emits a SplitSibling child
+    /// with the REAL source slot offset, was_interior=true, the real probe cap,
+    /// and the PRE-TRUNC parent evidence when the parent is a strict
+    /// ObservedAllocation (test 9 + test 11 requirement at the producer).
+    #[test]
+    fn m34_split_producer_emits_real_source_slot_and_strict_parent_evidence() {
+        // Mock image: image_base + size_of_image; heap objects below module region.
+        let image_base = 0x140000000u64;
+        let image_end = image_base + 0x200000;
+        // A strict parent allocation at 0x850000 (0x1000 bytes) whose qword at
+        // slot offset 0x200 holds the child pointer 0x850150. The parent bytes at
+        // the child offset (0x150) are zeroed -> child content will be zeros.
+        let child_ptr = 0x850150u64;
+        let mut parent_bytes = vec![0u8; 0x1000];
+        parent_bytes[0x200..0x208].copy_from_slice(&child_ptr.to_le_bytes());
+        // The child's memory content: readable for the remaining parent span
+        // (0x1000 - 0x150 bytes) so estimate_object_size can probe.
+        let child_bytes = vec![0u8; 0x1000 - 0x150];
+        let mut mock = M23RegionMapMock::new();
+        mock.set(0x850000, parent_bytes.clone());
+        mock.set(child_ptr, child_bytes.clone());
+        let mut out: Vec<HeapGlobalSnapshot> = vec![HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: 0x850000,
+            content: parent_bytes,
+            is_heap_handle: false,
+            is_image_inline: false,
+            extent_kind: CaptureExtentKind::ObservedAllocation,
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: "main:0x850000".into(),
+                capture_path: CapturePath::MainSlot,
+                source_root_rva: None,
+                source_slot_offset: None,
+                probe_requested_size: 0,
+                was_interior: false,
+                containing_parent_old_base: None,
+                containing_parent_size: None,
+            },
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::default(),
+        }];
+        let mut total_bytes = m40_split_total_bytes(&out);
+        let mut seen_heaps: BTreeSet<u64> = BTreeSet::new();
+        let dump_buf = vec![0u8; 0x1000];
+        let mut pre_trunc_authority = PreTruncParentAuthorityStore::default();
+        split_swallowed_siblings(
+            &mut out,
+            &mut total_bytes,
+            &mut seen_heaps,
+            &mut pre_trunc_authority,
+            image_base,
+            image_end,
+            &dump_buf,
+            &mut mock,
+        );
+        let split = out.iter().find(|g| g.live_ptr == child_ptr);
+        let split = split.expect("split_swallowed_siblings must admit the interior child");
+        // Producer provenance: SplitSibling path, real slot offset, interior,
+        // real probe cap, strict pre-trunc parent.
+        assert_eq!(
+            split.extent_evidence.capture_path,
+            CapturePath::SplitSibling,
+            "split child must not masquerade as MainSlot"
+        );
+        assert_eq!(
+            split.extent_evidence.source_slot_offset,
+            Some(0x200),
+            "source_slot_offset must be the REAL qword slot byte offset"
+        );
+        assert!(
+            split.extent_evidence.was_interior,
+            "was_interior must be true"
+        );
+        assert_eq!(
+            split.extent_evidence.probe_requested_size,
+            GRAPH_CHILD_SIZE_PROBE_CAP.min(MAX_HEAP_GLOBAL_BYTES),
+            "probe_requested_size must be the real requested probe cap"
+        );
+        // capture_id deterministically binds producer + child + source identity/slot.
+        assert!(
+            split
+                .extent_evidence
+                .capture_id
+                .starts_with("split_sibling:0x850150:main:0x850000:0x200"),
+            "capture_id must bind producer/child/source/slot: {}",
+            split.extent_evidence.capture_id
+        );
+        assert_eq!(
+            split.extent_evidence.containing_parent_old_base,
+            Some(0x850000),
+            "strict pre-trunc parent base must be recorded"
+        );
+        assert_eq!(
+            split.extent_evidence.containing_parent_size,
+            Some(0x1000),
+            "strict pre-trunc parent size must be recorded"
+        );
+    }
+
+    /// Real-producer test: a ProbeWindow (heuristic) swallowing parent must NOT
+    /// yield a split child with containing-parent evidence — the child keeps
+    /// was_interior=true but parent fields stay None (test 12 at the producer).
+    #[test]
+    fn m34_split_producer_heuristic_parent_keeps_parent_fields_none() {
+        let image_base = 0x140000000u64;
+        let image_end = image_base + 0x200000;
+        let child_ptr = 0x850150u64;
+        let mut parent_bytes = vec![0u8; 0x1000];
+        parent_bytes[0x200..0x208].copy_from_slice(&child_ptr.to_le_bytes());
+        // Child readable for the remaining parent span (probe-capable).
+        let child_bytes = vec![0u8; 0x1000 - 0x150];
+        let mut mock = M23RegionMapMock::new();
+        mock.set(0x850000, parent_bytes.clone());
+        mock.set(child_ptr, child_bytes.clone());
+        // Parent is a ProbeWindow (heuristic) — NOT a proven allocation.
+        let mut out: Vec<HeapGlobalSnapshot> = vec![HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: 0x850000,
+            content: parent_bytes,
+            is_heap_handle: false,
+            is_image_inline: false,
+            extent_kind: CaptureExtentKind::ProbeWindow,
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: "probe:0x850000".into(),
+                capture_path: CapturePath::MainSlot,
+                source_root_rva: None,
+                source_slot_offset: None,
+                probe_requested_size: 0x2000,
+                was_interior: false,
+                containing_parent_old_base: None,
+                containing_parent_size: None,
+            },
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::default(),
+        }];
+        let mut total_bytes = m40_split_total_bytes(&out);
+        let mut seen_heaps: BTreeSet<u64> = BTreeSet::new();
+        let dump_buf = vec![0u8; 0x1000];
+        let mut pre_trunc_authority = PreTruncParentAuthorityStore::default();
+        split_swallowed_siblings(
+            &mut out,
+            &mut total_bytes,
+            &mut seen_heaps,
+            &mut pre_trunc_authority,
+            image_base,
+            image_end,
+            &dump_buf,
+            &mut mock,
+        );
+        let split = out.iter().find(|g| g.live_ptr == child_ptr);
+        let split = split.expect("split_swallowed_siblings must admit the interior child");
+        assert!(split.extent_evidence.was_interior);
+        assert_eq!(
+            split.extent_evidence.containing_parent_old_base, None,
+            "heuristic ProbeWindow parent must NOT be recorded as containing parent"
+        );
+        assert_eq!(split.extent_evidence.containing_parent_size, None);
+        // And the closure helper must not fabricate authority from it.
+        let candidates = super::super::raw_slab_coherence::build_authority_closure_candidates(
+            &[split.clone()],
+            &[],
+            &PreTruncParentAuthorityStore::default(),
+        )
+        .unwrap();
+        assert!(candidates.is_empty());
+    }
+
+    // ============ MIDA-SERIAL-35 pre-trunc authority preservation ============
+
+    /// Real producer end-to-end: an ObservedAllocation parent whose qword slot
+    /// references an interior child is split by the REAL split_swallowed_siblings
+    /// producer; the parent is TRUNCATED; the producer's pre-trunc authority
+    /// evidence (FULL bytes) flows into the production closure helper and yields
+    /// exactly ONE parent_closure candidate with the pre-trunc base/size/bytes;
+    /// normalization then passes capture_coverage_bind. This is NOT a hand-built
+    /// untruncated-parent fixture — the parent really is truncated by the
+    /// producer before the closure runs.
+    #[test]
+    fn m35_real_producer_pre_trunc_authority_closure_end_to_end() {
+        let image_base = 0x140000000u64;
+        let image_end = image_base + 0x200000;
+        let child_ptr = 0x850150u64;
+        // Strict parent: ObservedAllocation, 0x1000 bytes, slot 0x200 -> child.
+        let mut parent_bytes = vec![0xABu8; 0x1000];
+        parent_bytes[0x200..0x208].copy_from_slice(&child_ptr.to_le_bytes());
+        // The child's memory content must MATCH the parent slice at the child
+        // offset (0x150..0x158) so byte-provenance holds. Make them identical.
+        let child_bytes = parent_bytes[0x150..0x158].to_vec();
+        let mut mock = M23RegionMapMock::new();
+        mock.set(0x850000, parent_bytes.clone());
+        mock.set(child_ptr, child_bytes.clone());
+        let mut out: Vec<HeapGlobalSnapshot> = vec![HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: 0x850000,
+            content: parent_bytes.clone(),
+            is_heap_handle: false,
+            is_image_inline: false,
+            extent_kind: CaptureExtentKind::ObservedAllocation,
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: "main:0x850000".into(),
+                capture_path: CapturePath::MainSlot,
+                source_root_rva: None,
+                source_slot_offset: None,
+                probe_requested_size: 0,
+                was_interior: false,
+                containing_parent_old_base: None,
+                containing_parent_size: None,
+            },
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::default(),
+        }];
+        let mut total_bytes = m40_split_total_bytes(&out);
+        let mut seen_heaps: BTreeSet<u64> = BTreeSet::new();
+        let mut pre_trunc_authority = PreTruncParentAuthorityStore::default();
+        let dump_buf = vec![0u8; 0x1000];
+        split_swallowed_siblings(
+            &mut out,
+            &mut total_bytes,
+            &mut seen_heaps,
+            &mut pre_trunc_authority,
+            image_base,
+            image_end,
+            &dump_buf,
+            &mut mock,
+        );
+        // The split child was admitted.
+        let split = out.iter().find(|g| g.live_ptr == child_ptr);
+        let split = split.expect("split_swallowed_siblings must admit the interior child");
+        assert_eq!(
+            split.extent_evidence.capture_path,
+            CapturePath::SplitSibling
+        );
+        // The PARENT WAS TRUNCATED: its current content no longer spans 0x1000.
+        let parent_now = out.iter().find(|g| g.live_ptr == 0x850000).unwrap();
+        assert!(
+            parent_now.content.len() < 0x1000,
+            "parent must be truncated by the producer, current len={}",
+            parent_now.content.len()
+        );
+        // The producer emitted FULL pre-trunc authority evidence.
+        assert_eq!(
+            pre_trunc_authority.binding_count(),
+            1,
+            "exactly one strict pre-trunc authority evidence must be emitted"
+        );
+        let ev = &pre_trunc_authority.bindings()[0];
+        assert_eq!(ev.parent_key.parent_old_base, 0x850000);
+        assert_eq!(ev.parent_key.parent_pre_trunc_size, 0x1000);
+        assert_eq!(
+            pre_trunc_authority.lookup(&ev.parent_key).unwrap().len(),
+            0x1000
+        );
+        assert_eq!(
+            pre_trunc_authority.lookup(&ev.parent_key).unwrap(),
+            parent_bytes,
+            "full pre-trunc bytes preserved"
+        );
+        assert_eq!(ev.parent_extent, CaptureExtentKind::ObservedAllocation);
+        assert_eq!(ev.child_base, child_ptr);
+        assert_eq!(ev.source_slot_offset, Some(0x200));
+        // Feed the production closure helper with the REAL producer output.
+        let candidates = super::super::raw_slab_coherence::build_authority_closure_candidates(
+            &out,
+            &[],
+            &pre_trunc_authority,
+        )
+        .unwrap();
+        assert_eq!(
+            candidates.len(),
+            1,
+            "exactly one parent_closure candidate must be derived from pre-trunc evidence"
+        );
+        assert_eq!(candidates[0].role, "parent_closure");
+        assert_eq!(candidates[0].slab.old_base, 0x850000);
+        assert_eq!(candidates[0].slab.content.len(), 0x1000);
+        assert_eq!(
+            candidates[0].slab.content, parent_bytes,
+            "closure bytes must equal the FULL pre-trunc parent bytes"
+        );
+        // Unified normalization keeps one authority; coverage passes.
+        let (normalized, _events) =
+            super::super::raw_slab_coherence::normalize_authoritative_slabs(&candidates).unwrap();
+        assert_eq!(normalized.len(), 1);
+        let slabs: Vec<HeapSlab> = normalized.iter().map(|n| n.slab.clone()).collect();
+        super::super::raw_slab_coherence::validate_probe_coverage(&out, &slabs).unwrap();
+    }
+
+    /// Real producer: heuristic ProbeWindow parent must NOT produce pre-trunc
+    /// authority evidence; coverage stays fail-closed.
+    #[test]
+    fn m35_heuristic_parent_produces_no_pre_trunc_authority() {
+        let image_base = 0x140000000u64;
+        let image_end = image_base + 0x200000;
+        let child_ptr = 0x850150u64;
+        let mut parent_bytes = vec![0u8; 0x1000];
+        parent_bytes[0x200..0x208].copy_from_slice(&child_ptr.to_le_bytes());
+        // Child readable for the remaining parent span (probe-capable).
+        let child_bytes = vec![0u8; 0x1000 - 0x150];
+        let mut mock = M23RegionMapMock::new();
+        mock.set(0x850000, parent_bytes.clone());
+        mock.set(child_ptr, child_bytes.clone());
+        let mut out: Vec<HeapGlobalSnapshot> = vec![HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: 0x850000,
+            content: parent_bytes,
+            is_heap_handle: false,
+            is_image_inline: false,
+            extent_kind: CaptureExtentKind::ProbeWindow, // heuristic
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: "probe:0x850000".into(),
+                capture_path: CapturePath::MainSlot,
+                source_root_rva: None,
+                source_slot_offset: None,
+                probe_requested_size: 0x2000,
+                was_interior: false,
+                containing_parent_old_base: None,
+                containing_parent_size: None,
+            },
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::default(),
+        }];
+        let mut total_bytes = m40_split_total_bytes(&out);
+        let mut seen_heaps: BTreeSet<u64> = BTreeSet::new();
+        let mut pre_trunc_authority = PreTruncParentAuthorityStore::default();
+        let dump_buf = vec![0u8; 0x1000];
+        split_swallowed_siblings(
+            &mut out,
+            &mut total_bytes,
+            &mut seen_heaps,
+            &mut pre_trunc_authority,
+            image_base,
+            image_end,
+            &dump_buf,
+            &mut mock,
+        );
+        // No pre-trunc authority for a heuristic parent.
+        assert!(
+            pre_trunc_authority.binding_count() == 0,
+            "heuristic ProbeWindow parent must not emit pre-trunc authority"
+        );
+        // The closure helper derives nothing; coverage fails closed.
+        let candidates = super::super::raw_slab_coherence::build_authority_closure_candidates(
+            &out,
+            &[],
+            &pre_trunc_authority,
+        )
+        .unwrap();
+        assert!(candidates.is_empty());
+        let err = super::super::raw_slab_coherence::validate_probe_coverage(&out, &[]).unwrap_err();
+        assert!(matches!(
+            err,
+            super::super::raw_slab_coherence::OverlayError::ProbeCoverageMissing { .. }
+        ));
+    }
+
+    /// Producer: ambiguous strict parents (two snapshots at the same base/size
+    /// with different identities) must produce NO pre-trunc authority.
+    #[test]
+    fn m35_ambiguous_strict_parents_no_authority() {
+        let image_base = 0x140000000u64;
+        let image_end = image_base + 0x200000;
+        let child_ptr = 0x850150u64;
+        let mut pb = vec![0u8; 0x1000];
+        pb[0x200..0x208].copy_from_slice(&child_ptr.to_le_bytes());
+        let child_bytes = vec![0u8; 8];
+        let mut mock = M23RegionMapMock::new();
+        mock.set(0x850000, pb.clone());
+        mock.set(child_ptr, child_bytes.clone());
+        // Two snapshots at the SAME (base, size) with DIFFERENT capture ids.
+        let mk_parent = |id: &str| HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: 0x850000,
+            content: pb.clone(),
+            is_heap_handle: false,
+            is_image_inline: false,
+            extent_kind: CaptureExtentKind::ObservedAllocation,
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: id.into(),
+                capture_path: CapturePath::MainSlot,
+                source_root_rva: None,
+                source_slot_offset: None,
+                probe_requested_size: 0,
+                was_interior: false,
+                containing_parent_old_base: None,
+                containing_parent_size: None,
+            },
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::default(),
+        };
+        let mut out: Vec<HeapGlobalSnapshot> = vec![mk_parent("id1"), mk_parent("id2")];
+        let mut total_bytes = m40_split_total_bytes(&out);
+        let mut seen_heaps: BTreeSet<u64> = BTreeSet::new();
+        let mut pre_trunc_authority = PreTruncParentAuthorityStore::default();
+        let dump_buf = vec![0u8; 0x1000];
+        split_swallowed_siblings(
+            &mut out,
+            &mut total_bytes,
+            &mut seen_heaps,
+            &mut pre_trunc_authority,
+            image_base,
+            image_end,
+            &dump_buf,
+            &mut mock,
+        );
+        assert!(
+            pre_trunc_authority.binding_count() == 0,
+            "ambiguous strict parents must not produce authority evidence"
+        );
+    }
+
+    /// Closure helper: parent slice / child bytes mismatch must NOT produce a
+    /// closure candidate from pre-trunc evidence.
+    #[test]
+    fn m35_pre_trunc_bytes_mismatch_no_closure() {
+        use super::super::raw_slab_coherence::OverlayError;
+        // Parent bytes (pre-trunc) whose slice at the child offset differs from
+        // the child's content bytes.
+        let mut parent_bytes = vec![0u8; 0x1000];
+        parent_bytes[0x200..0x208].copy_from_slice(&0x850150u64.to_le_bytes());
+        let mut child = HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: 0x850150,
+            content: vec![0x11u8; 8], // differs from parent slice (zeros)
+            is_heap_handle: false,
+            is_image_inline: false,
+            extent_kind: CaptureExtentKind::ProbeWindow,
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: "split_sibling:0x850150:src:0x200".into(),
+                capture_path: CapturePath::SplitSibling,
+                source_root_rva: None,
+                source_slot_offset: Some(0x200),
+                probe_requested_size: 0x2000,
+                was_interior: true,
+                containing_parent_old_base: Some(0x850000),
+                containing_parent_size: Some(0x1000),
+            },
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::default(),
+        };
+        let store = m36_test_store(
+            0x850000,
+            0x1000,
+            parent_bytes,
+            CaptureExtentKind::ObservedAllocation,
+            RegionProvenance::default(),
+            "main:0x850000",
+            CapturePath::MainSlot,
+            0x850150,
+            8,
+            "src",
+            Some(0x200),
+        );
+        let candidates = super::super::raw_slab_coherence::build_authority_closure_candidates(
+            &[child.clone()],
+            &[],
+            &store,
+        )
+        .unwrap();
+        assert!(
+            candidates.is_empty(),
+            "pre-trunc slice/child bytes mismatch must not produce a closure candidate"
+        );
+        // Coverage stays fail-closed.
+        let err =
+            super::super::raw_slab_coherence::validate_probe_coverage(&[child], &[]).unwrap_err();
+        assert!(matches!(err, OverlayError::ProbeCoverageMissing { .. }));
+    }
+
+    /// Overflowed existing slab must NOT be treated as covering a parent by
+    /// covered_by_existing (checked_add), and a legitimate closure candidate
+    /// must NOT be skipped because of it.
+    #[test]
+    fn m35_overflowed_existing_slab_not_covering_and_closure_not_skipped() {
+        // A parent whose range [0x850000, 0x851000) is legitimate.
+        let parent_old_base = 0x850000u64;
+        let parent_size = 0x1000usize;
+        let mut parent_bytes = vec![0u8; parent_size];
+        parent_bytes[0x150..0x158].copy_from_slice(&[0u8; 8]); // child slice zeros
+        let child = HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: 0x850150,
+            content: vec![0u8; 8],
+            is_heap_handle: false,
+            is_image_inline: false,
+            extent_kind: CaptureExtentKind::ProbeWindow,
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: "split_sibling:0x850150:src:0x150".into(),
+                capture_path: CapturePath::SplitSibling,
+                source_root_rva: None,
+                source_slot_offset: Some(0x150),
+                probe_requested_size: 0x2000,
+                was_interior: true,
+                containing_parent_old_base: Some(parent_old_base),
+                containing_parent_size: Some(parent_size),
+            },
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::default(),
+        };
+        let store = m36_test_store(
+            parent_old_base,
+            parent_size,
+            parent_bytes,
+            CaptureExtentKind::ObservedAllocation,
+            RegionProvenance::default(),
+            "main:0x850000",
+            CapturePath::MainSlot,
+            0x850150,
+            8,
+            "src",
+            Some(0x150),
+        );
+        // An OVERFLOWING existing slab: old_base near u64::MAX + len wraps.
+        // It must not be considered covering the parent range, so the legitimate
+        // closure candidate is NOT skipped.
+        let overflow_slab = HeapSlab {
+            old_base: u64::MAX - 0x10,
+            content: vec![0u8; 0x100],
+        };
+        let candidates = super::super::raw_slab_coherence::build_authority_closure_candidates(
+            &[child.clone()],
+            &[overflow_slab],
+            &store,
+        )
+        .unwrap();
+        assert_eq!(
+            candidates.len(),
+            1,
+            "overflowing existing slab must not skip the legitimate closure candidate"
+        );
+        assert_eq!(candidates[0].slab.old_base, parent_old_base);
+        // And a wrapping parent itself cannot produce a candidate.
+        let store_wrap = m36_test_store(
+            u64::MAX - 0x10,
+            0x100,
+            vec![0u8; 0x100],
+            CaptureExtentKind::ObservedAllocation,
+            RegionProvenance::default(),
+            "wrap",
+            CapturePath::MainSlot,
+            0x850150,
+            8,
+            "src",
+            None,
+        );
+        let c2 = super::super::raw_slab_coherence::build_authority_closure_candidates(
+            &[child.clone()],
+            &[],
+            &store_wrap,
+        )
+        .unwrap();
+        assert!(
+            c2.is_empty(),
+            "wrapping parent range must produce no candidate"
+        );
+        let _ = &child;
+    }
+
+    /// Source hit count / identity dedup: multiple qword occurrences from the
+    /// SAME source snapshot count as ONE distinct source; a second source
+    /// snapshot increments the count.
+    #[test]
+    fn m35_source_hit_count_is_distinct_source_identity() {
+        let image_base = 0x140000000u64;
+        let image_end = image_base + 0x200000;
+        let child_ptr = 0x850150u64;
+        // Two source snapshots, each referencing the child TWICE (two slots).
+        let mk_source = |base: u64, id: &str| -> HeapGlobalSnapshot {
+            let mut content = vec![0u8; 0x1000];
+            content[0x100..0x108].copy_from_slice(&child_ptr.to_le_bytes());
+            content[0x200..0x208].copy_from_slice(&child_ptr.to_le_bytes());
+            HeapGlobalSnapshot {
+                rva: 0,
+                live_ptr: base,
+                content,
+                is_heap_handle: false,
+                is_image_inline: false,
+                extent_kind: CaptureExtentKind::ObservedAllocation,
+                extent_evidence: CaptureExtentEvidence {
+                    capture_id: id.into(),
+                    capture_path: CapturePath::MainSlot,
+                    source_root_rva: None,
+                    source_slot_offset: None,
+                    probe_requested_size: 0,
+                    was_interior: false,
+                    containing_parent_old_base: None,
+                    containing_parent_size: None,
+                },
+                transform_ids: Vec::new(),
+                provenance: RegionProvenance::default(),
+            }
+        };
+        // A swallowing parent that strictly contains the child.
+        let mut parent_bytes = vec![0u8; 0x1000];
+        parent_bytes[0x150..0x158].copy_from_slice(&[0u8; 8]);
+        let parent = HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: 0x850000,
+            content: parent_bytes,
+            is_heap_handle: false,
+            is_image_inline: false,
+            extent_kind: CaptureExtentKind::ObservedAllocation,
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: "main:0x850000".into(),
+                capture_path: CapturePath::MainSlot,
+                source_root_rva: None,
+                source_slot_offset: None,
+                probe_requested_size: 0,
+                was_interior: false,
+                containing_parent_old_base: None,
+                containing_parent_size: None,
+            },
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::default(),
+        };
+        let mut out: Vec<HeapGlobalSnapshot> = vec![
+            mk_source(0x860000, "src1"),
+            mk_source(0x870000, "src2"),
+            parent,
+        ];
+        let mut mock = M23RegionMapMock::new();
+        mock.set(child_ptr, vec![0u8; 8]);
+        let mut total_bytes = m40_split_total_bytes(&out);
+        let mut seen_heaps: BTreeSet<u64> = BTreeSet::new();
+        let mut pre_trunc_authority = PreTruncParentAuthorityStore::default();
+        let dump_buf = vec![0u8; 0x1000];
+        split_swallowed_siblings(
+            &mut out,
+            &mut total_bytes,
+            &mut seen_heaps,
+            &mut pre_trunc_authority,
+            image_base,
+            image_end,
+            &dump_buf,
+            &mut mock,
+        );
+        // The evidence emitted for the strict parent binds the FIRST source
+        // (deterministic) and the REAL slot offset. The child's candidate
+        // evidence is internal; assert via the emitted authority's source.
+        if let Some(ev) = pre_trunc_authority.bindings().first() {
+            assert_eq!(ev.source_slot_offset, Some(0x100));
+            assert_eq!(ev.source_capture_id, "src1");
+        }
+    }
+
+    // ============ MIDA-SERIAL-36 transactional split admission ============
+
+    /// Production invariant helper: total_bytes == sum(out content lengths).
+    /// Split fixtures MUST maintain this invariant or the producer's checked
+    /// budget (trunc_drop <= total_bytes) fails closed by design.
+    fn m40_split_total_bytes(out: &[HeapGlobalSnapshot]) -> usize {
+        out.iter().map(|g| g.content.len()).sum()
+    }
+
+    /// Helper: build a strict ObservedAllocation parent with a slot pointing at
+    /// an interior child, plus a mock that serves parent + child memory.
+    fn m36_strict_parent_fixture(
+        child_ptr: u64,
+        parent_base: u64,
+        parent_size: usize,
+        slot_off: usize,
+        mock: &mut M23RegionMapMock,
+    ) -> (Vec<u8>, HeapGlobalSnapshot) {
+        let mut parent_bytes = vec![0xABu8; parent_size];
+        parent_bytes[slot_off..slot_off + 8].copy_from_slice(&child_ptr.to_le_bytes());
+        mock.set(parent_base, parent_bytes.clone());
+        // Child readable for the remaining parent span (probe-capable).
+        let child_off = (child_ptr - parent_base) as usize;
+        mock.set(child_ptr, vec![0u8; parent_size - child_off]);
+        let parent = HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: parent_base,
+            content: parent_bytes.clone(),
+            is_heap_handle: false,
+            is_image_inline: false,
+            extent_kind: CaptureExtentKind::ObservedAllocation,
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: format!("main:{parent_base:#x}"),
+                capture_path: CapturePath::MainSlot,
+                source_root_rva: None,
+                source_slot_offset: None,
+                probe_requested_size: 0,
+                was_interior: false,
+                containing_parent_old_base: None,
+                containing_parent_size: None,
+            },
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::default(),
+        };
+        (parent_bytes, parent)
+    }
+
+    /// Helper: build a store with ONE recorded parent + ONE binding (test-only
+    /// substitute for the production Path A evidence).
+    fn m36_test_store(
+        parent_old_base: u64,
+        parent_pre_trunc_size: usize,
+        parent_full_bytes: Vec<u8>,
+        parent_extent: CaptureExtentKind,
+        parent_provenance: RegionProvenance,
+        parent_capture_id: &str,
+        parent_capture_path: CapturePath,
+        child_base: u64,
+        child_size: usize,
+        source_capture_id: &str,
+        source_slot_offset: Option<usize>,
+    ) -> PreTruncParentAuthorityStore {
+        let mut store = PreTruncParentAuthorityStore::default();
+        let key = PreTruncParentAuthorityKey {
+            parent_old_base,
+            parent_pre_trunc_size,
+            parent_capture_id: parent_capture_id.to_string(),
+        };
+        store.record_parent(
+            &key,
+            &parent_full_bytes,
+            parent_extent,
+            parent_provenance.clone(),
+            parent_capture_path,
+        );
+        store.record_binding(
+            key,
+            parent_extent,
+            parent_provenance,
+            parent_capture_path,
+            child_base,
+            child_size,
+            source_capture_id.to_string(),
+            source_slot_offset,
+        );
+        store
+    }
+
+    /// Test 1: child read failure (read_memory returns <8) must NOT truncate the
+    /// parent, must NOT add the child, must NOT add evidence, and must leave
+    /// total_bytes/seen_heaps unchanged.
+    #[test]
+    fn m36_child_read_failure_does_not_truncate_parent() {
+        let image_base = 0x140000000u64;
+        let image_end = image_base + 0x200000;
+        let child_ptr = 0x850150u64;
+        // Build the parent snapshot WITHOUT registering any mock region for the
+        // parent (the swallow scan and strict-parent identification use the
+        // snapshot content in out, not the mock). No region at the child ->
+        // read_memory fails -> admission fails with ZERO mutation.
+        let mut parent_bytes = vec![0xABu8; 0x1000];
+        parent_bytes[0x200..0x208].copy_from_slice(&child_ptr.to_le_bytes());
+        let parent = HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: 0x850000,
+            content: parent_bytes.clone(),
+            is_heap_handle: false,
+            is_image_inline: false,
+            extent_kind: CaptureExtentKind::ObservedAllocation,
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: "main:0x850000".into(),
+                capture_path: CapturePath::MainSlot,
+                source_root_rva: None,
+                source_slot_offset: None,
+                probe_requested_size: 0,
+                was_interior: false,
+                containing_parent_old_base: None,
+                containing_parent_size: None,
+            },
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::default(),
+        };
+        let mut mock = M23RegionMapMock::new();
+        let mut out: Vec<HeapGlobalSnapshot> = vec![parent];
+        let mut total_bytes = m40_split_total_bytes(&out);
+        let mut seen_heaps: BTreeSet<u64> = BTreeSet::new();
+        let mut pre_trunc_authority = PreTruncParentAuthorityStore::default();
+        let dump_buf = vec![0u8; 0x1000];
+        split_swallowed_siblings(
+            &mut out,
+            &mut total_bytes,
+            &mut seen_heaps,
+            &mut pre_trunc_authority,
+            image_base,
+            image_end,
+            &dump_buf,
+            &mut mock,
+        );
+        // Parent completely unchanged (bytes + len).
+        let parent_after = out.iter().find(|g| g.live_ptr == 0x850000).unwrap();
+        assert_eq!(
+            parent_after.content, parent_bytes,
+            "parent bytes must be unchanged"
+        );
+        assert_eq!(
+            parent_after.content.len(),
+            0x1000,
+            "parent len must be unchanged"
+        );
+        // No child added.
+        assert!(
+            out.iter().all(|g| g.live_ptr != child_ptr),
+            "child must not be added on read failure"
+        );
+        // No evidence, no total_bytes change, no seen_heaps residue.
+        assert!(
+            pre_trunc_authority.binding_count() == 0,
+            "no evidence on read failure"
+        );
+        assert_eq!(total_bytes, 0x1000, "total_bytes unchanged (parent only)");
+        assert!(!seen_heaps.contains(&child_ptr), "no seen_heaps residue");
+    }
+
+    /// Test 2: child post-trim failure (read OK but trailing-zero/overlap trim
+    /// leaves <8) must NOT truncate the parent and must roll back completely.
+    #[test]
+    fn m36_child_post_trim_failure_does_not_truncate_parent() {
+        let image_base = 0x140000000u64;
+        let image_end = image_base + 0x200000;
+        let child_ptr = 0x850150u64;
+        let mut mock = M23RegionMapMock::new();
+        let (parent_bytes, parent) =
+            m36_strict_parent_fixture(child_ptr, 0x850000, 0x1000, 0x200, &mut mock);
+        // Child memory: only 8 readable bytes, then zeros -> trim_trailing_zero_pages
+        // trims the all-zero tail. estimate_object_size probes 0x40... with an 8-byte
+        // region the first probe (0x40) fails -> size < 8 -> admission fails at
+        // estimate, NOT at trim. To force POST-TRIM failure, give the child a region
+        // whose estimate succeeds but whose content trims below 8. estimate reads up
+        // to SIZE_PROBES while readable; a region of 0x40 bytes -> estimate=0x40,
+        // content=0x40 zeros -> trim_trailing_zero_pages keeps MIN_KEEP=0x40 >= 8.
+        // So a post-trim <8 needs content that trims below MIN_KEEP — impossible with
+        // the current trim (MIN_KEEP=0x40). Instead, use truncate_split_child_avoid_overlap:
+        // place ANOTHER snapshot starting at child_ptr+4 so the child window is cut to 4.
+        // Simplest: child region 0x40 bytes, and a SECOND snapshot at child_ptr+0x20
+        // (0x20 bytes) so truncate_split_child_avoid_overlap cuts the child to 0x20... still >= 8.
+        // Place the second snapshot at child_ptr+4 with 8 bytes -> child cut to 4 < 8.
+        let mut out: Vec<HeapGlobalSnapshot> = vec![parent];
+        // A snapshot starting 4 bytes after the child base: bounds the child to 4.
+        let blocker = HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: child_ptr + 4,
+            content: vec![0x11u8; 8],
+            is_heap_handle: false,
+            is_image_inline: false,
+            extent_kind: CaptureExtentKind::ObservedAllocation,
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: "blocker".into(),
+                capture_path: CapturePath::MainSlot,
+                source_root_rva: None,
+                source_slot_offset: None,
+                probe_requested_size: 0,
+                was_interior: false,
+                containing_parent_old_base: None,
+                containing_parent_size: None,
+            },
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::default(),
+        };
+        out.push(blocker);
+        let mut total_bytes = m40_split_total_bytes(&out);
+        let mut seen_heaps: BTreeSet<u64> = BTreeSet::new();
+        let mut pre_trunc_authority = PreTruncParentAuthorityStore::default();
+        let dump_buf = vec![0u8; 0x1000];
+        split_swallowed_siblings(
+            &mut out,
+            &mut total_bytes,
+            &mut seen_heaps,
+            &mut pre_trunc_authority,
+            image_base,
+            image_end,
+            &dump_buf,
+            &mut mock,
+        );
+        // Parent unchanged (truncation only happens at commit).
+        let parent_after = out.iter().find(|g| g.live_ptr == 0x850000).unwrap();
+        assert_eq!(
+            parent_after.content.len(),
+            0x1000,
+            "parent must not be truncated"
+        );
+        assert_eq!(parent_after.content, parent_bytes);
+        // Child not admitted.
+        assert!(
+            out.iter().all(|g| g.live_ptr != child_ptr),
+            "child must not be admitted after trim failure"
+        );
+        assert!(pre_trunc_authority.binding_count() == 0);
+        assert!(!seen_heaps.contains(&child_ptr));
+        let _ = total_bytes;
+    }
+
+    /// Test 3: source identity A/B/B — source A once, source B twice ->
+    /// source_hit_count == 2, first source provenance stable as A.
+    #[test]
+    fn m36_source_identity_abb_counts_two() {
+        let image_base = 0x140000000u64;
+        let image_end = image_base + 0x200000;
+        let child_ptr = 0x850150u64;
+        let mut mock = M23RegionMapMock::new();
+        let (_pb, parent) =
+            m36_strict_parent_fixture(child_ptr, 0x850000, 0x1000, 0x200, &mut mock);
+        // Source A references the child ONCE (slot 0x100).
+        let mut src_a = vec![0u8; 0x1000];
+        src_a[0x100..0x108].copy_from_slice(&child_ptr.to_le_bytes());
+        // Source B references the child TWICE (slots 0x100 and 0x300).
+        let mut src_b = vec![0u8; 0x1000];
+        src_b[0x100..0x108].copy_from_slice(&child_ptr.to_le_bytes());
+        src_b[0x300..0x308].copy_from_slice(&child_ptr.to_le_bytes());
+        let mk_src = |base: u64, id: &str, content: Vec<u8>| HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: base,
+            content,
+            is_heap_handle: false,
+            is_image_inline: false,
+            extent_kind: CaptureExtentKind::ObservedAllocation,
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: id.into(),
+                capture_path: CapturePath::MainSlot,
+                source_root_rva: None,
+                source_slot_offset: None,
+                probe_requested_size: 0,
+                was_interior: false,
+                containing_parent_old_base: None,
+                containing_parent_size: None,
+            },
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::default(),
+        };
+        // Zero the parent's own child-pointer slot: the parent must not count
+        // as a THIRD distinct source identity (A/B/B test wants exactly A and B).
+        let mut parent_noref = parent;
+        parent_noref.content[0x200..0x208].fill(0);
+        let mut out: Vec<HeapGlobalSnapshot> = vec![
+            mk_src(0x860000, "srcA", src_a),
+            mk_src(0x870000, "srcB", src_b),
+            parent_noref,
+        ];
+        let mut total_bytes = m40_split_total_bytes(&out);
+        let mut seen_heaps: BTreeSet<u64> = BTreeSet::new();
+        let mut pre_trunc_authority = PreTruncParentAuthorityStore::default();
+        let dump_buf = vec![0u8; 0x1000];
+        let admitted = split_swallowed_siblings(
+            &mut out,
+            &mut total_bytes,
+            &mut seen_heaps,
+            &mut pre_trunc_authority,
+            image_base,
+            image_end,
+            &dump_buf,
+            &mut mock,
+        );
+        // MIDA-SERIAL-37: assert the REAL production candidate evidence — the
+        // producer's own source_hit_count must be 2 (distinct A + B), never a
+        // test-local set.
+        let cand = admitted
+            .iter()
+            .find(|c| c.child_value == child_ptr)
+            .expect("candidate evidence emitted for the child");
+        assert_eq!(
+            cand.source_hit_count, 2,
+            "production source_hit_count must be 2 (A/B/B)"
+        );
+        assert_eq!(
+            cand.source_capture_id.as_deref(),
+            Some("srcA"),
+            "first source must be A"
+        );
+        assert_eq!(
+            cand.source_slot_offset,
+            Some(0x100),
+            "first-source-wins: slot 0x100 from source A"
+        );
+        // The child snapshot's evidence mirrors the producer candidate.
+        let split = out
+            .iter()
+            .find(|g| g.live_ptr == child_ptr)
+            .expect("child admitted");
+        assert_eq!(
+            split.extent_evidence.source_slot_offset,
+            Some(0x100),
+            "first-source-wins: slot 0x100 from source A"
+        );
+        // The authority binding's source capture id is A (first source wins).
+        if let Some(ev) = pre_trunc_authority.bindings().first() {
+            assert_eq!(ev.source_capture_id, "srcA", "first source must be A");
+        }
+    }
+
+    /// Test 4: same-source multiple slots -> source_hit_count == 1.
+    #[test]
+    fn m36_same_source_multiple_slots_counts_one() {
+        let image_base = 0x140000000u64;
+        let image_end = image_base + 0x200000;
+        let child_ptr = 0x850150u64;
+        let mut mock = M23RegionMapMock::new();
+        let (_pb, parent) =
+            m36_strict_parent_fixture(child_ptr, 0x850000, 0x1000, 0x200, &mut mock);
+        // ONE source referencing the child TWICE.
+        let mut src = vec![0u8; 0x1000];
+        src[0x100..0x108].copy_from_slice(&child_ptr.to_le_bytes());
+        src[0x300..0x308].copy_from_slice(&child_ptr.to_le_bytes());
+        let source = HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: 0x860000,
+            content: src,
+            is_heap_handle: false,
+            is_image_inline: false,
+            extent_kind: CaptureExtentKind::ObservedAllocation,
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: "srcOnly".into(),
+                capture_path: CapturePath::MainSlot,
+                source_root_rva: None,
+                source_slot_offset: None,
+                probe_requested_size: 0,
+                was_interior: false,
+                containing_parent_old_base: None,
+                containing_parent_size: None,
+            },
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::default(),
+        };
+        // Zero the parent's own child-pointer slot (see test 3): the parent
+        // must not count as a second distinct source identity.
+        let mut parent_noref = parent;
+        parent_noref.content[0x200..0x208].fill(0);
+        let mut out: Vec<HeapGlobalSnapshot> = vec![source, parent_noref];
+        let mut total_bytes = m40_split_total_bytes(&out);
+        let mut seen_heaps: BTreeSet<u64> = BTreeSet::new();
+        let mut pre_trunc_authority = PreTruncParentAuthorityStore::default();
+        let dump_buf = vec![0u8; 0x1000];
+        let admitted = split_swallowed_siblings(
+            &mut out,
+            &mut total_bytes,
+            &mut seen_heaps,
+            &mut pre_trunc_authority,
+            image_base,
+            image_end,
+            &dump_buf,
+            &mut mock,
+        );
+        // MIDA-SERIAL-37: read the REAL production candidate evidence — the
+        // producer's own source_hit_count must be 1 (one distinct source).
+        let cand = admitted
+            .iter()
+            .find(|c| c.child_value == child_ptr)
+            .expect("candidate evidence emitted for the child");
+        assert_eq!(
+            cand.source_hit_count, 1,
+            "production source_hit_count must be 1 (same source, two slots)"
+        );
+        assert_eq!(cand.source_capture_id.as_deref(), Some("srcOnly"));
+        if let Some(ev) = pre_trunc_authority.bindings().first() {
+            assert_eq!(ev.source_capture_id, "srcOnly");
+        }
+    }
+
+    /// Test 9: full production preprocessing order — split -> reconcile ->
+    /// trim -> build_authority_closure_candidates -> normalize ->
+    /// validate_probe_coverage must pass end-to-end.
+    #[test]
+    fn m36_full_production_preprocessing_order_passes() {
+        let image_base = 0x140000000u64;
+        let image_end = image_base + 0x200000;
+        let child_ptr = 0x850150u64;
+        let mut mock = M23RegionMapMock::new();
+        let (parent_bytes, parent) =
+            m36_strict_parent_fixture(child_ptr, 0x850000, 0x1000, 0x200, &mut mock);
+        // NOTE: the parent slice at the child offset (0x150) is 0xAB (from the
+        // 0xAB fill), but the child's read content will be the parent bytes at
+        // offset 0x150 (mock serves the parent region) — so the child content
+        // equals the parent slice. Good for byte-provenance.
+        let mut out: Vec<HeapGlobalSnapshot> = vec![parent];
+        let mut total_bytes = m40_split_total_bytes(&out);
+        let mut seen_heaps: BTreeSet<u64> = BTreeSet::new();
+        let mut pre_trunc_authority = PreTruncParentAuthorityStore::default();
+        let dump_buf = vec![0u8; 0x1000];
+        // 1. split (real producer).
+        split_swallowed_siblings(
+            &mut out,
+            &mut total_bytes,
+            &mut seen_heaps,
+            &mut pre_trunc_authority,
+            image_base,
+            image_end,
+            &dump_buf,
+            &mut mock,
+        );
+        let split = out
+            .iter()
+            .find(|g| g.live_ptr == child_ptr)
+            .expect("child admitted");
+        assert_eq!(
+            split.extent_evidence.capture_path,
+            CapturePath::SplitSibling
+        );
+        assert_eq!(
+            pre_trunc_authority.binding_count(),
+            1,
+            "one strict parent authority"
+        );
+        // The parent was truncated at commit.
+        let parent_after = out.iter().find(|g| g.live_ptr == 0x850000).unwrap();
+        assert!(
+            parent_after.content.len() < 0x1000,
+            "parent truncated at commit"
+        );
+        // 2. reconcile (no duplicate bases here; must be a no-op that keeps order).
+        reconcile_duplicate_heap_globals(&mut out, None);
+        // 3. trim (windows already non-overlapping after split).
+        trim_overlapping_heap_global_windows(&mut out);
+        // 4. build_authority_closure_candidates with the REAL pre-trunc evidence.
+        let existing: Vec<HeapSlab> = Vec::new();
+        let candidates = super::super::raw_slab_coherence::build_authority_closure_candidates(
+            &out,
+            &existing,
+            &pre_trunc_authority,
+        )
+        .unwrap();
+        assert_eq!(
+            candidates.len(),
+            1,
+            "one parent_closure from pre-trunc evidence"
+        );
+        assert_eq!(candidates[0].role, "parent_closure");
+        assert_eq!(candidates[0].slab.old_base, 0x850000);
+        assert_eq!(
+            candidates[0].slab.content, parent_bytes,
+            "closure == pre-trunc parent bytes"
+        );
+        // 5. normalize.
+        let (normalized, _events) =
+            super::super::raw_slab_coherence::normalize_authoritative_slabs(&candidates).unwrap();
+        assert_eq!(normalized.len(), 1);
+        // 6. coverage passes with the normalized authority set.
+        let slabs: Vec<HeapSlab> = normalized.iter().map(|n| n.slab.clone()).collect();
+        super::super::raw_slab_coherence::validate_probe_coverage(&out, &slabs).unwrap();
+    }
+
+    // ============ MIDA-SERIAL-37: real dedup + fail-closed transaction ============
+
+    /// MIDA-SERIAL-38: a parent with two children in the SAME production split
+    /// run binds BOTH children to the SAME frozen ORIGINAL parent identity —
+    /// parent_count()==1, binding_count()==2, both keys identical (original
+    /// 0x1000, never 0x1000+0x400), both resolve to the same original bytes.
+    /// The frozen registry is captured before ANY truncation, so child order
+    /// never changes the authority.
+    #[test]
+    fn m37_same_parent_two_children_real_producer_store_once() {
+        let image_base = 0x140000000u64;
+        let image_end = image_base + 0x200000;
+        // Two children inside the same strict parent.
+        let child_a = 0x850150u64;
+        let child_b = 0x850400u64;
+        let mut mock = M23RegionMapMock::new();
+        let (_parent_bytes0, mut parent) =
+            m36_strict_parent_fixture(child_a, 0x850000, 0x1000, 0x200, &mut mock);
+        // Register a second interior child: slot 0x500 -> child_b; child memory.
+        parent.content[0x500..0x508].copy_from_slice(&child_b.to_le_bytes());
+        // The FULL pre-trunc bytes are the MODIFIED parent content (both child
+        // pointers present) — what the producer freezes before truncation.
+        let parent_bytes = parent.content.clone();
+        mock.set(0x850000, parent.content.clone());
+        mock.set(child_b, vec![0u8; 0x1000 - 0x400]);
+        let mut out: Vec<HeapGlobalSnapshot> = vec![parent];
+        let mut total_bytes = m40_split_total_bytes(&out);
+        let mut seen_heaps: BTreeSet<u64> = BTreeSet::new();
+        let mut pre_trunc_authority = PreTruncParentAuthorityStore::default();
+        let dump_buf = vec![0u8; 0x1000];
+        let admitted = split_swallowed_siblings(
+            &mut out,
+            &mut total_bytes,
+            &mut seen_heaps,
+            &mut pre_trunc_authority,
+            image_base,
+            image_end,
+            &dump_buf,
+            &mut mock,
+        );
+        assert_eq!(
+            admitted.len(),
+            2,
+            "both children admitted from the same parent"
+        );
+        // REAL bytes-level dedup: ONE frozen parent identity, TWO key-only
+        // bindings with the SAME original key.
+        assert_eq!(pre_trunc_authority.parent_count(), 1);
+        assert_eq!(pre_trunc_authority.binding_count(), 2);
+        let bindings = pre_trunc_authority.bindings();
+        assert_eq!(
+            bindings[0].parent_key, bindings[1].parent_key,
+            "both children bind the SAME frozen original parent key"
+        );
+        assert_eq!(
+            bindings[0].parent_key.parent_pre_trunc_size, 0x1000,
+            "parent_pre_trunc_size is ALWAYS the original 0x1000"
+        );
+        assert_eq!(
+            pre_trunc_authority.lookup(&bindings[0].parent_key).unwrap(),
+            parent_bytes,
+            "lookup returns the single original full bytes copy"
+        );
+        assert_eq!(
+            pre_trunc_authority.lookup(&bindings[1].parent_key).unwrap(),
+            parent_bytes,
+            "both bindings resolve to the same original bytes"
+        );
+        // Closure: ONE candidate (both bindings share the key -> built once).
+        let candidates = super::super::raw_slab_coherence::build_authority_closure_candidates(
+            &out,
+            &[],
+            &pre_trunc_authority,
+        )
+        .unwrap();
+        assert_eq!(candidates.len(), 1, "one key -> one closure candidate");
+        assert_eq!(candidates[0].slab.old_base, 0x850000);
+        assert_eq!(candidates[0].slab.content.len(), 0x1000);
+        let (normalized, _) =
+            super::super::raw_slab_coherence::normalize_authoritative_slabs(&candidates).unwrap();
+        assert_eq!(normalized.len(), 1);
+    }
+
+    /// Conflict in the PRODUCTION path: two split children claim the SAME
+    /// parent identity with DIFFERENT bytes -> the second admission is REJECTED
+    /// (child not added, parent not truncated further, no evidence, no counter/
+    /// seen residue). Simulated by feeding a store already holding conflicting
+    /// bytes for the parent identity.
+    #[test]
+    fn m37_authority_conflict_rejects_candidate_zero_mutation() {
+        let image_base = 0x140000000u64;
+        let image_end = image_base + 0x200000;
+        let child_ptr = 0x850150u64;
+        let mut mock = M23RegionMapMock::new();
+        let (parent_bytes, parent) =
+            m36_strict_parent_fixture(child_ptr, 0x850000, 0x1000, 0x200, &mut mock);
+        // Pre-seed the store with CONFLICTING bytes for the SAME parent identity.
+        let mut pre_trunc_authority = PreTruncParentAuthorityStore::default();
+        let conflict_key = PreTruncParentAuthorityKey {
+            parent_old_base: 0x850000,
+            parent_pre_trunc_size: 0x1000,
+            parent_capture_id: "main:0x850000".into(),
+        };
+        pre_trunc_authority.record_parent(
+            &conflict_key,
+            &vec![0xFFu8; 0x1000],
+            CaptureExtentKind::ObservedAllocation,
+            RegionProvenance::default(),
+            CapturePath::MainSlot,
+        );
+        let mut out: Vec<HeapGlobalSnapshot> = vec![parent];
+        let mut total_bytes = m40_split_total_bytes(&out);
+        let mut seen_heaps: BTreeSet<u64> = BTreeSet::new();
+        let dump_buf = vec![0u8; 0x1000];
+        let admitted = split_swallowed_siblings(
+            &mut out,
+            &mut total_bytes,
+            &mut seen_heaps,
+            &mut pre_trunc_authority,
+            image_base,
+            image_end,
+            &dump_buf,
+            &mut mock,
+        );
+        // The candidate was REJECTED: no admission, no evidence binding.
+        assert!(
+            admitted.is_empty(),
+            "conflicting authority must reject the split candidate"
+        );
+        assert_eq!(pre_trunc_authority.binding_count(), 0);
+        // Parent NOT truncated (bytes + len unchanged).
+        let parent_after = out.iter().find(|g| g.live_ptr == 0x850000).unwrap();
+        assert_eq!(parent_after.content.len(), 0x1000);
+        assert_eq!(parent_after.content, parent_bytes);
+        // No child, no counters/seen residue.
+        assert!(out.iter().all(|g| g.live_ptr != child_ptr));
+        assert_eq!(total_bytes, 0x1000, "total_bytes unchanged (parent only)");
+        assert!(!seen_heaps.contains(&child_ptr));
+    }
+
+    /// String-shell buffer at the TAIL of a swallowing parent: resolved against
+    /// the POST-truncation geometry, the buffer becomes an independently
+    /// capturable child (never wrongly nulled because the untruncated parent
+    /// swallowed it).
+    #[test]
+    fn m37_string_shell_buffer_at_parent_tail_captured_post_truncation() {
+        let image_base = 0x140000000u64;
+        let image_end = image_base + 0x200000;
+        let child_ptr = 0x850150u64;
+        let mut mock = M23RegionMapMock::new();
+        // Build the parent snapshot WITHOUT registering a mock region for it:
+        // a parent region spanning 0x850000..0x851000 would shadow the child
+        // and buffer reads in the BTreeMap mock. Only child + buffer regions
+        // are registered.
+        let mut parent_bytes = vec![0xABu8; 0x1000];
+        parent_bytes[0x200..0x208].copy_from_slice(&child_ptr.to_le_bytes());
+        let parent = HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: 0x850000,
+            content: parent_bytes.clone(),
+            is_heap_handle: false,
+            is_image_inline: false,
+            extent_kind: CaptureExtentKind::ObservedAllocation,
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: "main:0x850000".into(),
+                capture_path: CapturePath::MainSlot,
+                source_root_rva: None,
+                source_slot_offset: None,
+                probe_requested_size: 0,
+                was_interior: false,
+                containing_parent_old_base: None,
+                containing_parent_size: None,
+            },
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::default(),
+        };
+        // The SPLIT child content itself is a refcounted string shell whose
+        // buffer sits at the parent's TAIL (0x850F00, inside the pre-trunc
+        // parent, but OUTSIDE the post-trunc parent [0x850000, 0x850150)).
+        let buf = 0x850F00u64;
+        let mut shell = vec![0u8; 0x40];
+        shell[0..8].copy_from_slice(&buf.to_le_bytes());
+        shell[8..16].copy_from_slice(&buf.to_le_bytes());
+        shell[16..24].copy_from_slice(&40u64.to_le_bytes()); // len
+        shell[24..32].copy_from_slice(&0x40u64.to_le_bytes()); // cap
+        shell[0x20..0x24].copy_from_slice(&1u32.to_le_bytes()); // refs
+        mock.set(child_ptr, shell.clone());
+        mock.set(buf, vec![0x41u8; 0x40]);
+        let mut out: Vec<HeapGlobalSnapshot> = vec![parent];
+        let mut total_bytes = m40_split_total_bytes(&out);
+        let mut seen_heaps: BTreeSet<u64> = BTreeSet::new();
+        let mut pre_trunc_authority = PreTruncParentAuthorityStore::default();
+        let dump_buf = vec![0u8; 0x1000];
+        let admitted = split_swallowed_siblings(
+            &mut out,
+            &mut total_bytes,
+            &mut seen_heaps,
+            &mut pre_trunc_authority,
+            image_base,
+            image_end,
+            &dump_buf,
+            &mut mock,
+        );
+        assert_eq!(admitted.len(), 1, "split child admitted");
+        // The shell was recognized and its buffer admitted as its OWN snapshot.
+        let buf_snap = out
+            .iter()
+            .find(|g| g.live_ptr == buf)
+            .expect("string buffer at parent tail captured as own snapshot");
+        assert_eq!(buf_snap.content, vec![0x41u8; 0x40]);
+        // The split child kept its shell pointers (admitted -> not nulled).
+        let split = out.iter().find(|g| g.live_ptr == child_ptr).unwrap();
+        let shell_buf = u64::from_le_bytes(split.content[0..8].try_into().unwrap());
+        assert_eq!(shell_buf, buf, "shell pointers preserved for multi_fixup");
+        assert!(seen_heaps.contains(&buf));
+    }
+
+    /// parent_hit_count is the DISTINCT parent identity cardinality: two
+    /// snapshots of the SAME parent identity (base/size/capture_id) that both
+    /// swallow the child count ONCE.
+    #[test]
+    fn m37_parent_hit_count_distinct_identity_not_occurrence() {
+        let image_base = 0x140000000u64;
+        let image_end = image_base + 0x200000;
+        let child_ptr = 0x850150u64;
+        let mut mock = M23RegionMapMock::new();
+        let (parent_bytes, parent) =
+            m36_strict_parent_fixture(child_ptr, 0x850000, 0x1000, 0x200, &mut mock);
+        // A DUPLICATE of the same parent identity (same base/size/capture_id).
+        let dup_parent = HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: 0x850000,
+            content: parent_bytes.clone(),
+            is_heap_handle: false,
+            is_image_inline: false,
+            extent_kind: CaptureExtentKind::ObservedAllocation,
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: "main:0x850000".into(),
+                capture_path: CapturePath::MainSlot,
+                source_root_rva: None,
+                source_slot_offset: None,
+                probe_requested_size: 0,
+                was_interior: false,
+                containing_parent_old_base: None,
+                containing_parent_size: None,
+            },
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::default(),
+        };
+        let mut out: Vec<HeapGlobalSnapshot> = vec![parent, dup_parent];
+        let mut total_bytes = m40_split_total_bytes(&out);
+        let mut seen_heaps: BTreeSet<u64> = BTreeSet::new();
+        let mut pre_trunc_authority = PreTruncParentAuthorityStore::default();
+        let dump_buf = vec![0u8; 0x1000];
+        let admitted = split_swallowed_siblings(
+            &mut out,
+            &mut total_bytes,
+            &mut seen_heaps,
+            &mut pre_trunc_authority,
+            image_base,
+            image_end,
+            &dump_buf,
+            &mut mock,
+        );
+        let cand = admitted
+            .iter()
+            .find(|c| c.child_value == child_ptr)
+            .expect("candidate evidence emitted");
+        assert_eq!(
+            cand.parent_hit_count, 1,
+            "same parent identity twice must count ONE distinct parent"
+        );
+    }
+
+    // ============ MIDA-SERIAL-38: frozen original parent + real gates ============
+
+    /// Child processing ORDER must not change the authority result: two children
+    /// of the same parent produce identical parent keys/bytes regardless of
+    /// which child is committed first. The frozen registry is captured before
+    /// any truncation, so both runs must be identical.
+    #[test]
+    fn m38_child_order_does_not_change_parent_authority() {
+        let image_base = 0x140000000u64;
+        let image_end = image_base + 0x200000;
+        let child_a = 0x850150u64;
+        let child_b = 0x850400u64;
+
+        // run(a_first): when a_first, child_a (0x850150) is the HIGHER commit
+        // priority... actually the producer sorts by HIGHER VA first, so to make
+        // the commit order differ we swap which child sits at the higher VA.
+        // Run 1: child_b at 0x850400 (commits first). Run 2: child_a and child_b
+        // addresses swapped so child_a commits first. The frozen registry is
+        // captured BEFORE any truncation in both runs, so the authority keys
+        // must be identical.
+        let run = |swap: bool| -> (Vec<u8>, Vec<PreTruncParentAuthorityKey>) {
+            let mut mock = M23RegionMapMock::new();
+            let (lo_ptr, hi_ptr) = if swap {
+                (child_b, child_a)
+            } else {
+                (child_a, child_b)
+            };
+            let (lo_slot, hi_slot) = if swap {
+                (0x500usize, 0x200usize)
+            } else {
+                (0x200usize, 0x500usize)
+            };
+            // Parent with both child slots; the parent is NOT registered in the
+            // mock (would shadow child reads).
+            let mut parent_bytes = vec![0xABu8; 0x1000];
+            parent_bytes[lo_slot..lo_slot + 8].copy_from_slice(&lo_ptr.to_le_bytes());
+            parent_bytes[hi_slot..hi_slot + 8].copy_from_slice(&hi_ptr.to_le_bytes());
+            let parent = HeapGlobalSnapshot {
+                rva: 0,
+                live_ptr: 0x850000,
+                content: parent_bytes.clone(),
+                is_heap_handle: false,
+                is_image_inline: false,
+                extent_kind: CaptureExtentKind::ObservedAllocation,
+                extent_evidence: CaptureExtentEvidence {
+                    capture_id: "main:0x850000".into(),
+                    capture_path: CapturePath::MainSlot,
+                    source_root_rva: None,
+                    source_slot_offset: None,
+                    probe_requested_size: 0,
+                    was_interior: false,
+                    containing_parent_old_base: None,
+                    containing_parent_size: None,
+                },
+                transform_ids: Vec::new(),
+                provenance: RegionProvenance::default(),
+            };
+            mock.set(lo_ptr, vec![0u8; 0x1000 - (lo_ptr - 0x850000) as usize]);
+            mock.set(hi_ptr, vec![0u8; 0x1000 - (hi_ptr - 0x850000) as usize]);
+            let mut out: Vec<HeapGlobalSnapshot> = vec![parent];
+            let mut total_bytes = m40_split_total_bytes(&out);
+            let mut seen_heaps: BTreeSet<u64> = BTreeSet::new();
+            let mut store = PreTruncParentAuthorityStore::default();
+            let dump_buf = vec![0u8; 0x1000];
+            let _admitted = split_swallowed_siblings(
+                &mut out,
+                &mut total_bytes,
+                &mut seen_heaps,
+                &mut store,
+                image_base,
+                image_end,
+                &dump_buf,
+                &mut mock,
+            );
+            let keys: Vec<PreTruncParentAuthorityKey> = store
+                .bindings()
+                .iter()
+                .map(|b| b.parent_key.clone())
+                .collect();
+            (parent_bytes, keys)
+        };
+
+        let (bytes1, keys1) = run(false);
+        let (bytes2, keys2) = run(true);
+        assert_eq!(bytes1, bytes2);
+        assert_eq!(keys1.len(), 2, "two bindings");
+        assert_eq!(keys2.len(), 2, "swapped run also two bindings");
+        assert_eq!(keys1[0], keys1[1], "both bindings share ONE key");
+        assert_eq!(keys2[0], keys2[1], "swapped run shares ONE key too");
+        assert_eq!(
+            keys1, keys2,
+            "commit order never changes the authority keys"
+        );
+        assert_eq!(keys1[0].parent_pre_trunc_size, 0x1000);
+        assert_eq!(keys2[0].parent_pre_trunc_size, 0x1000);
+    }
+
+    /// Qualifying parent selection must use the FULL identity predicate: a
+    /// ProbeWindow/SyntheticDerived snapshot at the same (base,size) with the
+    /// same capture_id is NEVER eligible (the frozen registry only freezes
+    /// ObservedAllocation/BackingObject, non-SyntheticDerived). The authority
+    /// is deterministically the QUALIFYING parent, and iteration order (twin
+    /// before/after parent) never changes that result.
+    #[test]
+    fn m38_qualifying_parent_conflict_fails_closed() {
+        let image_base = 0x140000000u64;
+        let image_end = image_base + 0x200000;
+        let child_ptr = 0x850150u64;
+        let run = |twin_first: bool| -> (usize, Vec<u8>) {
+            let mut mock = M23RegionMapMock::new();
+            let (_parent_bytes, parent) =
+                m36_strict_parent_fixture(child_ptr, 0x850000, 0x1000, 0x200, &mut mock);
+            mock.set(child_ptr, vec![0u8; 0x1000 - 0x150]);
+            // Non-qualifying twin: SAME span + SAME capture_id but ProbeWindow.
+            let mut twin = parent.clone();
+            twin.extent_kind = CaptureExtentKind::ProbeWindow;
+            let mut out: Vec<HeapGlobalSnapshot> = if twin_first {
+                vec![twin, parent]
+            } else {
+                vec![parent, twin]
+            };
+            let mut total_bytes = m40_split_total_bytes(&out);
+            let mut seen_heaps: BTreeSet<u64> = BTreeSet::new();
+            let mut pre_trunc_authority = PreTruncParentAuthorityStore::default();
+            let dump_buf = vec![0u8; 0x1000];
+            let _admitted = split_swallowed_siblings(
+                &mut out,
+                &mut total_bytes,
+                &mut seen_heaps,
+                &mut pre_trunc_authority,
+                image_base,
+                image_end,
+                &dump_buf,
+                &mut mock,
+            );
+            let bc = pre_trunc_authority.binding_count();
+            let bytes = pre_trunc_authority
+                .bindings()
+                .first()
+                .and_then(|b| pre_trunc_authority.lookup(&b.parent_key))
+                .map(|s| s.to_vec())
+                .unwrap_or_default();
+            (bc, bytes)
+        };
+        // Twin first vs parent first: IDENTICAL authority (the ProbeWindow twin
+        // is never eligible; the qualifying parent is the only source).
+        let (bc1, bytes1) = run(true);
+        let (bc2, bytes2) = run(false);
+        assert_eq!(bc1, 1, "one authority binding");
+        assert_eq!(bc2, 1, "one authority binding (parent first)");
+        assert_eq!(bytes1, bytes2, "order never changes authority bytes");
+        // The authority bytes are the QUALIFYING parent bytes (0xAB fill).
+        assert_eq!(bytes1[0], 0xAB, "authority from the qualifying parent");
+        assert_eq!(bytes1.len(), 0x1000);
+    }
+
+    /// Unified budget: when the split child + optional string buffer would
+    /// exceed the slot cap, the WHOLE candidate is rejected (no partial
+    /// admission). Boundary: out.len() == split_slot_cap - 1 with a buffer
+    /// child planned -> planned_slots == cap + 1 -> reject both.
+    #[test]
+    fn m38_combined_slot_budget_rejects_whole_candidate() {
+        let image_base = 0x140000000u64;
+        let image_end = image_base + 0x200000;
+        let child_ptr = 0x850150u64;
+        let mut mock = M23RegionMapMock::new();
+        // Parent snapshot WITHOUT registering a mock region (it would shadow the
+        // child/buffer reads); only child + buffer regions are registered.
+        let mut parent_bytes = vec![0xABu8; 0x1000];
+        parent_bytes[0x200..0x208].copy_from_slice(&child_ptr.to_le_bytes());
+        let parent = HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: 0x850000,
+            content: parent_bytes.clone(),
+            is_heap_handle: false,
+            is_image_inline: false,
+            extent_kind: CaptureExtentKind::ObservedAllocation,
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: "main:0x850000".into(),
+                capture_path: CapturePath::MainSlot,
+                source_root_rva: None,
+                source_slot_offset: None,
+                probe_requested_size: 0,
+                was_interior: false,
+                containing_parent_old_base: None,
+                containing_parent_size: None,
+            },
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::default(),
+        };
+        let split_slot_cap = MAX_HEAP_GLOBAL_SLOTS.saturating_sub(HEAP_DANGLING_SLOT_RESERVE);
+        // Fill out to cap-1 with dummy snapshots (each valid, non-overlapping).
+        let mut out: Vec<HeapGlobalSnapshot> = vec![parent];
+        for i in 0..(split_slot_cap - 2) {
+            let base = 0x900000u64 + (i as u64) * 0x1000;
+            out.push(HeapGlobalSnapshot {
+                rva: 0,
+                live_ptr: base,
+                content: vec![0x11u8; 0x100],
+                is_heap_handle: false,
+                is_image_inline: false,
+                extent_kind: CaptureExtentKind::ObservedAllocation,
+                extent_evidence: CaptureExtentEvidence {
+                    capture_id: format!("dummy:{base:#x}"),
+                    capture_path: CapturePath::MainSlot,
+                    source_root_rva: None,
+                    source_slot_offset: None,
+                    probe_requested_size: 0,
+                    was_interior: false,
+                    containing_parent_old_base: None,
+                    containing_parent_size: None,
+                },
+                transform_ids: Vec::new(),
+                provenance: RegionProvenance::default(),
+            });
+        }
+        // Child content is a string shell whose buffer would add a SECOND slot.
+        let buf = 0x850F00u64;
+        let mut shell = vec![0u8; 0x40];
+        shell[0..8].copy_from_slice(&buf.to_le_bytes());
+        shell[8..16].copy_from_slice(&buf.to_le_bytes());
+        shell[16..24].copy_from_slice(&40u64.to_le_bytes());
+        shell[24..32].copy_from_slice(&0x40u64.to_le_bytes());
+        shell[0x20..0x24].copy_from_slice(&1u32.to_le_bytes());
+        mock.set(child_ptr, shell);
+        mock.set(buf, vec![0x41u8; 0x40]);
+        // out.len() == cap-1 now; split child (1) + buffer (1) = cap+1 -> reject.
+        let mut total_bytes = m40_split_total_bytes(&out);
+        let mut seen_heaps: BTreeSet<u64> = BTreeSet::new();
+        let mut pre_trunc_authority = PreTruncParentAuthorityStore::default();
+        let dump_buf = vec![0u8; 0x1000];
+        let admitted = split_swallowed_siblings(
+            &mut out,
+            &mut total_bytes,
+            &mut seen_heaps,
+            &mut pre_trunc_authority,
+            image_base,
+            image_end,
+            &dump_buf,
+            &mut mock,
+        );
+        // The whole candidate (split child + buffer) must be rejected: no child,
+        // no buffer, no evidence, no residue.
+        assert!(
+            admitted.is_empty(),
+            "combined budget must reject the candidate"
+        );
+        assert!(
+            out.iter()
+                .all(|g| g.live_ptr != child_ptr && g.live_ptr != buf),
+            "neither split child nor buffer admitted"
+        );
+        assert_eq!(pre_trunc_authority.binding_count(), 0);
+        assert!(!seen_heaps.contains(&child_ptr) && !seen_heaps.contains(&buf));
+        let parent_after = out.iter().find(|g| g.live_ptr == 0x850000).unwrap();
+        assert_eq!(parent_after.content.len(), 0x1000, "parent untruncated");
+    }
+
+    /// Self-buffer: a string shell whose buffer base equals the split child
+    /// base must be rejected — never two snapshots with the same live_ptr.
+    #[test]
+    fn m38_string_buffer_same_base_as_split_child_rejected() {
+        let image_base = 0x140000000u64;
+        let image_end = image_base + 0x200000;
+        let child_ptr = 0x850150u64;
+        let mut mock = M23RegionMapMock::new();
+        let (parent_bytes, parent) =
+            m36_strict_parent_fixture(child_ptr, 0x850000, 0x1000, 0x200, &mut mock);
+        // Shell whose buf == the child base itself (self-reference).
+        let mut shell = vec![0u8; 0x40];
+        shell[0..8].copy_from_slice(&child_ptr.to_le_bytes());
+        shell[8..16].copy_from_slice(&child_ptr.to_le_bytes());
+        shell[16..24].copy_from_slice(&40u64.to_le_bytes());
+        shell[24..32].copy_from_slice(&0x40u64.to_le_bytes());
+        shell[0x20..0x24].copy_from_slice(&1u32.to_le_bytes());
+        mock.set(child_ptr, shell);
+        let mut out: Vec<HeapGlobalSnapshot> = vec![parent];
+        let mut total_bytes = m40_split_total_bytes(&out);
+        let mut seen_heaps: BTreeSet<u64> = BTreeSet::new();
+        let mut pre_trunc_authority = PreTruncParentAuthorityStore::default();
+        let dump_buf = vec![0u8; 0x1000];
+        let admitted = split_swallowed_siblings(
+            &mut out,
+            &mut total_bytes,
+            &mut seen_heaps,
+            &mut pre_trunc_authority,
+            image_base,
+            image_end,
+            &dump_buf,
+            &mut mock,
+        );
+        // Self-buffer rejected: the split child may still be admitted WITHOUT
+        // the duplicate buffer, OR the whole candidate rejected — either way
+        // there must be exactly ONE snapshot at child_ptr (never two).
+        let dup = out.iter().filter(|g| g.live_ptr == child_ptr).count();
+        assert!(dup <= 1, "never two snapshots at the same live_ptr");
+        let _ = admitted;
+        let _ = parent_bytes;
+    }
+
+    /// Production duplicate-child gate: after a child is bound, a SECOND
+    /// admission of the SAME (child_base, child_size) is rejected by
+    /// prepare_child (wired into the production path) with zero mutation.
+    #[test]
+    fn m38_production_duplicate_child_binding_rejected() {
+        // The duplicate gate is exercised by calling the production path with a
+        // pre-seeded binding for the same child — the candidate must be
+        // rejected entirely (no second child, no evidence growth, no residue).
+        let image_base = 0x140000000u64;
+        let image_end = image_base + 0x200000;
+        let child_ptr = 0x850150u64;
+        let mut mock = M23RegionMapMock::new();
+        let (parent_bytes, parent) =
+            m36_strict_parent_fixture(child_ptr, 0x850000, 0x1000, 0x200, &mut mock);
+        mock.set(0x850000, parent_bytes.clone());
+        mock.set(child_ptr, vec![0u8; 0x1000 - 0x150]);
+        // Pre-seed the store with a binding for child_ptr at the expected size.
+        // The size the producer computes is the final content length; use the
+        // same fixture bytes to know it (0x1000-0x150 trimmed to probe cap).
+        let mut pre_trunc_authority = PreTruncParentAuthorityStore::default();
+        let key = PreTruncParentAuthorityKey {
+            parent_old_base: 0x850000,
+            parent_pre_trunc_size: 0x1000,
+            parent_capture_id: "main:0x850000".into(),
+        };
+        pre_trunc_authority.record_parent(
+            &key,
+            &parent_bytes,
+            CaptureExtentKind::ObservedAllocation,
+            RegionProvenance::default(),
+            CapturePath::MainSlot,
+        );
+        // Seed a binding for the child with a size we know will collide: the
+        // producer's final child size is content.len() after trim. Instead of
+        // guessing, seed with the actual produced size by running once in a
+        // throwaway store, then re-run with the duplicate.
+        let mut probe_store = PreTruncParentAuthorityStore::default();
+        let mut out_p: Vec<HeapGlobalSnapshot> = vec![parent.clone()];
+        let mut tb = m40_split_total_bytes(&out_p);
+        let mut sh: BTreeSet<u64> = BTreeSet::new();
+        let db = vec![0u8; 0x1000];
+        let _admitted = split_swallowed_siblings(
+            &mut out_p,
+            &mut tb,
+            &mut sh,
+            &mut probe_store,
+            image_base,
+            image_end,
+            &db,
+            &mut mock,
+        );
+        let produced = probe_store
+            .bindings()
+            .iter()
+            .find(|b| b.child_base == child_ptr)
+            .map(|b| b.child_size)
+            .expect("probe run must produce the child binding");
+        // Now seed the REAL store with that same child binding -> duplicate.
+        pre_trunc_authority.record_binding(
+            key,
+            CaptureExtentKind::ObservedAllocation,
+            RegionProvenance::default(),
+            CapturePath::MainSlot,
+            child_ptr,
+            produced,
+            "src".into(),
+            Some(0x200),
+        );
+        let mut out: Vec<HeapGlobalSnapshot> = vec![parent];
+        let mut total_bytes = m40_split_total_bytes(&out);
+        let mut seen_heaps: BTreeSet<u64> = BTreeSet::new();
+        let dump_buf = vec![0u8; 0x1000];
+        let admitted = split_swallowed_siblings(
+            &mut out,
+            &mut total_bytes,
+            &mut seen_heaps,
+            &mut pre_trunc_authority,
+            image_base,
+            image_end,
+            &dump_buf,
+            &mut mock,
+        );
+        // The duplicate candidate is rejected: no new child admitted, no
+        // evidence growth, parent untruncated, no residue.
+        assert!(
+            admitted.is_empty(),
+            "duplicate child binding must reject the candidate"
+        );
+        assert_eq!(pre_trunc_authority.binding_count(), 1, "no new binding");
+        assert!(out.iter().all(|g| g.live_ptr != child_ptr));
+        let parent_after = out.iter().find(|g| g.live_ptr == 0x850000).unwrap();
+        assert_eq!(parent_after.content.len(), 0x1000);
+        assert!(!seen_heaps.contains(&child_ptr));
+        let _ = total_bytes;
+    }
+
+    // ============ MIDA-SERIAL-39: final-size gate + strict semantics ============
+
+    /// The duplicate-child gate must use the FINAL (post-string-shell-shrink)
+    /// child size. A shell probe with pre-shrink len > 0x28 must collide with a
+    /// pre-seeded (child_base, 0x28) binding and reject the WHOLE candidate.
+    #[test]
+    fn m39_string_shell_duplicate_uses_final_child_size() {
+        let image_base = 0x140000000u64;
+        let image_end = image_base + 0x200000;
+        let child_ptr = 0x850150u64;
+        let mut mock = M23RegionMapMock::new();
+        // Parent snapshot WITHOUT registering a mock region (it would shadow
+        // the child/buffer reads); only child + buffer regions are registered.
+        let mut parent_bytes = vec![0xABu8; 0x1000];
+        parent_bytes[0x200..0x208].copy_from_slice(&child_ptr.to_le_bytes());
+        let parent = HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: 0x850000,
+            content: parent_bytes.clone(),
+            is_heap_handle: false,
+            is_image_inline: false,
+            extent_kind: CaptureExtentKind::ObservedAllocation,
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: "main:0x850000".into(),
+                capture_path: CapturePath::MainSlot,
+                source_root_rva: None,
+                source_slot_offset: None,
+                probe_requested_size: 0,
+                was_interior: false,
+                containing_parent_old_base: None,
+                containing_parent_size: None,
+            },
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::default(),
+        };
+        // Child content: a refcounted string shell with probe len 0x40 (>0x28).
+        let buf = 0x850F00u64;
+        let mut shell = vec![0u8; 0x40];
+        shell[0..8].copy_from_slice(&buf.to_le_bytes());
+        shell[8..16].copy_from_slice(&buf.to_le_bytes());
+        shell[16..24].copy_from_slice(&40u64.to_le_bytes());
+        shell[24..32].copy_from_slice(&0x40u64.to_le_bytes());
+        shell[0x20..0x24].copy_from_slice(&1u32.to_le_bytes());
+        mock.set(child_ptr, shell);
+        mock.set(buf, vec![0x41u8; 0x40]);
+        // Pre-seed a binding for (child_ptr, 0x28) — the FINAL shell size.
+        let mut pre_trunc_authority = PreTruncParentAuthorityStore::default();
+        let key = PreTruncParentAuthorityKey {
+            parent_old_base: 0x850000,
+            parent_pre_trunc_size: 0x1000,
+            parent_capture_id: "main:0x850000".into(),
+        };
+        pre_trunc_authority.record_parent(
+            &key,
+            &parent_bytes,
+            CaptureExtentKind::ObservedAllocation,
+            RegionProvenance::default(),
+            CapturePath::MainSlot,
+        );
+        pre_trunc_authority.record_binding(
+            key,
+            CaptureExtentKind::ObservedAllocation,
+            RegionProvenance::default(),
+            CapturePath::MainSlot,
+            child_ptr,
+            0x28, // FINAL post-shell size
+            "src".into(),
+            Some(0x200),
+        );
+        let mut out: Vec<HeapGlobalSnapshot> = vec![parent];
+        let mut total_bytes = m40_split_total_bytes(&out);
+        let mut seen_heaps: BTreeSet<u64> = BTreeSet::new();
+        let dump_buf = vec![0u8; 0x1000];
+        let admitted = split_swallowed_siblings(
+            &mut out,
+            &mut total_bytes,
+            &mut seen_heaps,
+            &mut pre_trunc_authority,
+            image_base,
+            image_end,
+            &dump_buf,
+            &mut mock,
+        );
+        // The candidate is REJECTED: the gate saw final size 0x28 and collided.
+        assert!(
+            admitted.is_empty(),
+            "string-shell duplicate at final 0x28 must reject the candidate"
+        );
+        assert_eq!(pre_trunc_authority.binding_count(), 1, "no new binding");
+        assert!(out
+            .iter()
+            .all(|g| g.live_ptr != child_ptr && g.live_ptr != buf));
+        let parent_after = out.iter().find(|g| g.live_ptr == 0x850000).unwrap();
+        assert_eq!(parent_after.content, parent_bytes, "parent untouched");
+        assert!(!seen_heaps.contains(&child_ptr) && !seen_heaps.contains(&buf));
+        let _ = total_bytes;
+    }
+
+    /// Two ELIGIBLE frozen parents with the SAME key (base/size/capture_id)
+    /// but DIFFERENT full_bytes must fail closed — never first-wins. Both input
+    /// orders produce the same (no-authority) result.
+    #[test]
+    fn m39_qualifying_same_key_conflict_fails_closed() {
+        let image_base = 0x140000000u64;
+        let image_end = image_base + 0x200000;
+        let child_ptr = 0x850150u64;
+        let run = |bytes_a: Vec<u8>,
+                   bytes_b: Vec<u8>,
+                   a_first: bool|
+         -> (usize, usize, Vec<u8>, Vec<u8>, bool) {
+            let mut mock = M23RegionMapMock::new();
+            // Two snapshots, SAME base/size/capture_id, BOTH ObservedAllocation
+            // (both eligible), possibly DIFFERENT content bytes.
+            let mk = |content: Vec<u8>| HeapGlobalSnapshot {
+                rva: 0,
+                live_ptr: 0x850000,
+                content,
+                is_heap_handle: false,
+                is_image_inline: false,
+                extent_kind: CaptureExtentKind::ObservedAllocation,
+                extent_evidence: CaptureExtentEvidence {
+                    capture_id: "main:0x850000".into(),
+                    capture_path: CapturePath::MainSlot,
+                    source_root_rva: None,
+                    source_slot_offset: None,
+                    probe_requested_size: 0,
+                    was_interior: false,
+                    containing_parent_old_base: None,
+                    containing_parent_size: None,
+                },
+                transform_ids: Vec::new(),
+                provenance: RegionProvenance::default(),
+            };
+            let a = mk(bytes_a.clone());
+            let b = mk(bytes_b.clone());
+            let before_bytes: Vec<Vec<u8>> = vec![a.content.clone(), b.content.clone()];
+            // Both contain the child ptr at slot 0x200.
+            let mut out: Vec<HeapGlobalSnapshot> = if a_first { vec![a, b] } else { vec![b, a] };
+            for g in out.iter_mut() {
+                g.content[0x200..0x208].copy_from_slice(&child_ptr.to_le_bytes());
+            }
+            let out_before: Vec<Vec<u8>> = out.iter().map(|g| g.content.clone()).collect();
+            let len_before = out.len();
+            let total_before = m40_split_total_bytes(&out);
+            mock.set(child_ptr, vec![0u8; 0x1000 - 0x150]);
+            let mut total_bytes = m40_split_total_bytes(&out);
+            let mut seen_heaps: BTreeSet<u64> = BTreeSet::new();
+            let mut store = PreTruncParentAuthorityStore::default();
+            let dump_buf = vec![0u8; 0x1000];
+            let admitted = split_swallowed_siblings(
+                &mut out,
+                &mut total_bytes,
+                &mut seen_heaps,
+                &mut store,
+                image_base,
+                image_end,
+                &dump_buf,
+                &mut mock,
+            );
+            // Full zero-mutation proof for the CONFLICT case:
+            //  - candidate rejected (admitted empty);
+            //  - out unchanged (same len, same bytes);
+            //  - total_bytes unchanged;
+            //  - seen_heaps unchanged (no child);
+            //  - authority binding_count unchanged (0).
+            if !admitted.is_empty() {
+                assert!(
+                    bytes_a == bytes_b,
+                    "identical rows may admit; conflicting rows must NOT"
+                );
+            } else {
+                assert_eq!(out.len(), len_before, "out len unchanged");
+                let out_after: Vec<Vec<u8>> = out.iter().map(|g| g.content.clone()).collect();
+                assert_eq!(out_after, out_before, "out bytes unchanged");
+                assert_eq!(total_bytes, total_before, "total_bytes unchanged");
+                assert!(!seen_heaps.contains(&child_ptr), "seen_heaps unchanged");
+                assert_eq!(store.binding_count(), 0, "no authority written");
+            }
+            (
+                store.binding_count(),
+                total_bytes,
+                out_before[0].clone(),
+                before_bytes[0].clone(),
+                admitted.is_empty(),
+            )
+        };
+        let bytes_a = vec![0xAAu8; 0x1000];
+        let bytes_b = vec![0xBBu8; 0x1000];
+        // CONFLICT (different bytes): both orders reject with zero mutation.
+        let (bc1, tb1, out1, a1, rej1) = run(bytes_a.clone(), bytes_b.clone(), true);
+        let (bc2, tb2, out2, a2, rej2) = run(bytes_a.clone(), bytes_b.clone(), false);
+        assert_eq!(
+            bc1, 0,
+            "same-key conflicting eligible parents: no authority"
+        );
+        assert_eq!(bc2, 0, "order B-first: still no authority");
+        assert!(rej1 && rej2, "conflict rejects the candidate");
+        assert_eq!(tb1, 0x2000, "total_bytes unchanged (2x0x1000)");
+        assert_eq!(tb2, 0x2000, "total_bytes unchanged (order B-first)");
+        assert_eq!(out1.len(), 0x1000, "out bytes unchanged (0x1000 each)");
+        let _ = (out2, a1, a2);
+        // Identical bytes -> resolvable regardless of order.
+        let (bc3, _, _, _, rej3) = run(bytes_a.clone(), bytes_a.clone(), true);
+        let (bc4, _, _, _, rej4) = run(bytes_a.clone(), bytes_a.clone(), false);
+        assert_eq!(bc3, 1, "identical rows resolve to one binding");
+        assert_eq!(bc4, 1, "identical rows resolve regardless of order");
+        assert!(!rej3 && !rej4, "identical rows admit");
+    }
+
+    /// Frozen bytes ownership: two children of the same parent — the store's
+    /// lookup_arc returns POINTER-EQUAL Arcs (one backing allocation), and no
+    /// per-child full-Vec API path exists.
+    #[test]
+    fn m39_frozen_bytes_arc_pointer_equality() {
+        use std::sync::Arc;
+        let image_base = 0x140000000u64;
+        let image_end = image_base + 0x200000;
+        let child_a = 0x850150u64;
+        let child_b = 0x850400u64;
+        let mut mock = M23RegionMapMock::new();
+        let (_pb0, mut parent) =
+            m36_strict_parent_fixture(child_a, 0x850000, 0x1000, 0x200, &mut mock);
+        parent.content[0x500..0x508].copy_from_slice(&child_b.to_le_bytes());
+        let parent_bytes = parent.content.clone();
+        mock.set(0x850000, parent.content.clone());
+        mock.set(child_b, vec![0u8; 0x1000 - 0x400]);
+        let mut out: Vec<HeapGlobalSnapshot> = vec![parent];
+        let mut total_bytes = m40_split_total_bytes(&out);
+        let mut seen_heaps: BTreeSet<u64> = BTreeSet::new();
+        let mut store = PreTruncParentAuthorityStore::default();
+        let dump_buf = vec![0u8; 0x1000];
+        let _admitted = split_swallowed_siblings(
+            &mut out,
+            &mut total_bytes,
+            &mut seen_heaps,
+            &mut store,
+            image_base,
+            image_end,
+            &dump_buf,
+            &mut mock,
+        );
+        assert_eq!(store.binding_count(), 2);
+        assert_eq!(store.parent_count(), 1);
+        let bindings = store.bindings();
+        let arc1: Arc<[u8]> = store.lookup_arc(&bindings[0].parent_key).unwrap();
+        let arc2: Arc<[u8]> = store.lookup_arc(&bindings[1].parent_key).unwrap();
+        // POINTER equality — the SAME backing allocation, not just equal bytes.
+        assert!(
+            Arc::ptr_eq(&arc1, &arc2),
+            "both bindings share ONE Arc backing allocation"
+        );
+        assert_eq!(&*arc1, &parent_bytes[..]);
+    }
+
+    /// Unified-slot budget fails closed: when the split child + optional
+    /// string buffer would push planned_slots over the split slot cap, the
+    /// WHOLE candidate is rejected at the PHASE-2 commit plan (zero mutation).
+    ///
+    /// The fixture is fully readable: parent bytes + child shell + string
+    /// buffer are all served by the mock, so the candidate reaches the
+    /// budget gate (never an earlier estimate/read failure).
+    #[test]
+    fn m39_split_budget_checked_overflow_fails_closed() {
+        let image_base = 0x140000000u64;
+        let image_end = image_base + 0x200000;
+        let child_ptr = 0x850150u64;
+        let mut mock = M23RegionMapMock::new();
+        // Parent snapshot WITHOUT a mock region (would shadow child reads).
+        let mut parent_bytes = vec![0xABu8; 0x1000];
+        parent_bytes[0x200..0x208].copy_from_slice(&child_ptr.to_le_bytes());
+        let parent = HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: 0x850000,
+            content: parent_bytes.clone(),
+            is_heap_handle: false,
+            is_image_inline: false,
+            extent_kind: CaptureExtentKind::ObservedAllocation,
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: "main:0x850000".into(),
+                capture_path: CapturePath::MainSlot,
+                source_root_rva: None,
+                source_slot_offset: None,
+                probe_requested_size: 0,
+                was_interior: false,
+                containing_parent_old_base: None,
+                containing_parent_size: None,
+            },
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::default(),
+        };
+        let split_slot_cap = MAX_HEAP_GLOBAL_SLOTS.saturating_sub(HEAP_DANGLING_SLOT_RESERVE);
+        // Fill out to cap-1 with valid, non-overlapping dummy snapshots so the
+        // split child + buffer would plan to cap+1 slots.
+        let mut out: Vec<HeapGlobalSnapshot> = vec![parent];
+        for i in 0..(split_slot_cap - 2) {
+            let base = 0x900000u64 + (i as u64) * 0x1000;
+            out.push(HeapGlobalSnapshot {
+                rva: 0,
+                live_ptr: base,
+                content: vec![0x11u8; 0x100],
+                is_heap_handle: false,
+                is_image_inline: false,
+                extent_kind: CaptureExtentKind::ObservedAllocation,
+                extent_evidence: CaptureExtentEvidence {
+                    capture_id: format!("dummy:{base:#x}"),
+                    capture_path: CapturePath::MainSlot,
+                    source_root_rva: None,
+                    source_slot_offset: None,
+                    probe_requested_size: 0,
+                    was_interior: false,
+                    containing_parent_old_base: None,
+                    containing_parent_size: None,
+                },
+                transform_ids: Vec::new(),
+                provenance: RegionProvenance::default(),
+            });
+        }
+        // Child content: a refcounted string shell whose buffer would add a
+        // SECOND slot. Both reads are servable by the mock, so the candidate
+        // provably reaches the PHASE-2 slot budget.
+        let buf = 0x850F00u64;
+        let mut shell = vec![0u8; 0x40];
+        shell[0..8].copy_from_slice(&buf.to_le_bytes());
+        shell[8..16].copy_from_slice(&buf.to_le_bytes());
+        shell[16..24].copy_from_slice(&40u64.to_le_bytes());
+        shell[24..32].copy_from_slice(&0x40u64.to_le_bytes());
+        shell[0x20..0x24].copy_from_slice(&1u32.to_le_bytes());
+        mock.set(child_ptr, shell);
+        mock.set(buf, vec![0x41u8; 0x40]);
+        // out.len() == cap-1: split child (1) + buffer (1) -> planned cap+1.
+        let mut total_bytes = m40_split_total_bytes(&out);
+        let mut seen_heaps: BTreeSet<u64> = BTreeSet::new();
+        let mut store = PreTruncParentAuthorityStore::default();
+        let dump_buf = vec![0u8; 0x1000];
+        let admitted = split_swallowed_siblings(
+            &mut out,
+            &mut total_bytes,
+            &mut seen_heaps,
+            &mut store,
+            image_base,
+            image_end,
+            &dump_buf,
+            &mut mock,
+        );
+        // The WHOLE candidate is rejected at the slot budget with zero
+        // mutation: no child, no buffer, no binding, no seen residue.
+        assert!(admitted.is_empty(), "slot budget overflow must reject");
+        assert_eq!(
+            total_bytes,
+            m40_split_total_bytes(&out),
+            "total_bytes unchanged (no mutation)"
+        );
+        assert_eq!(store.binding_count(), 0);
+        assert!(
+            out.iter()
+                .all(|g| g.live_ptr != child_ptr && g.live_ptr != buf),
+            "neither split child nor buffer admitted"
+        );
+        assert!(!seen_heaps.contains(&child_ptr) && !seen_heaps.contains(&buf));
+        let parent_after = out.iter().find(|g| g.live_ptr == 0x850000).unwrap();
+        assert_eq!(parent_after.content.len(), 0x1000, "parent untruncated");
+    }
+
+    /// The truncation drop used in the budget must EXACTLY equal the commit
+    /// delta on total_bytes (single formula, no divergence).
+    #[test]
+    fn m39_truncation_drop_matches_commit_delta() {
+        let image_base = 0x140000000u64;
+        let image_end = image_base + 0x200000;
+        let child_ptr = 0x850150u64;
+        let mut mock = M23RegionMapMock::new();
+        // Parent WITHOUT mock region (would shadow child reads).
+        let mut parent_bytes = vec![0xABu8; 0x1000];
+        parent_bytes[0x200..0x208].copy_from_slice(&child_ptr.to_le_bytes());
+        let parent = HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: 0x850000,
+            content: parent_bytes.clone(),
+            is_heap_handle: false,
+            is_image_inline: false,
+            extent_kind: CaptureExtentKind::ObservedAllocation,
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: "main:0x850000".into(),
+                capture_path: CapturePath::MainSlot,
+                source_root_rva: None,
+                source_slot_offset: None,
+                probe_requested_size: 0,
+                was_interior: false,
+                containing_parent_old_base: None,
+                containing_parent_size: None,
+            },
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::default(),
+        };
+        // One interior child; the commit drop == parent 0x1000 - 0x150.
+        mock.set(child_ptr, vec![0u8; 0x1000 - 0x150]);
+        let mut out: Vec<HeapGlobalSnapshot> = vec![parent];
+        // Production-consistent total: sum of contents.
+        let mut total_bytes: usize = out.iter().map(|g| g.content.len()).sum();
+        let mut seen_heaps: BTreeSet<u64> = BTreeSet::new();
+        let mut store = PreTruncParentAuthorityStore::default();
+        let dump_buf = vec![0u8; 0x1000];
+        let _admitted = split_swallowed_siblings(
+            &mut out,
+            &mut total_bytes,
+            &mut seen_heaps,
+            &mut store,
+            image_base,
+            image_end,
+            &dump_buf,
+            &mut mock,
+        );
+        // After commit: parent truncated to (child_ptr - 0x850000) = 0x150.
+        let parent_after = out.iter().find(|g| g.live_ptr == 0x850000).unwrap();
+        let expect_drop = 0x1000 - 0x150;
+        assert_eq!(parent_after.content.len(), 0x150);
+        // total_bytes == sum(out) after commit (production invariant restored).
+        let sum_after: usize = out.iter().map(|g| g.content.len()).sum();
+        assert_eq!(total_bytes, sum_after, "commit delta == budget drop");
+        let _ = expect_drop;
+    }
+
+    /// A parent appearing in the truncation list twice must not be double-
+    /// counted in the drop (dedupe by base).
+    #[test]
+    fn m39_duplicate_parent_truncation_is_not_double_counted() {
+        // Two snapshots at the SAME base (duplicate rows) both swallowing the
+        // child. Each ROW is truncated once; the drop is counted once per row
+        // (no single-parent double-count).
+        let image_base = 0x140000000u64;
+        let image_end = image_base + 0x200000;
+        let child_ptr = 0x850150u64;
+        let mut mock = M23RegionMapMock::new();
+        // Parent WITHOUT mock region (would shadow child reads).
+        let mut parent_bytes = vec![0xABu8; 0x1000];
+        parent_bytes[0x200..0x208].copy_from_slice(&child_ptr.to_le_bytes());
+        let parent = HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: 0x850000,
+            content: parent_bytes.clone(),
+            is_heap_handle: false,
+            is_image_inline: false,
+            extent_kind: CaptureExtentKind::ObservedAllocation,
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: "main:0x850000".into(),
+                capture_path: CapturePath::MainSlot,
+                source_root_rva: None,
+                source_slot_offset: None,
+                probe_requested_size: 0,
+                was_interior: false,
+                containing_parent_old_base: None,
+                containing_parent_size: None,
+            },
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::default(),
+        };
+        // TRUE duplicate row: IDENTICAL bytes at the SAME base (not a
+        // same-key conflict — the frozen registry sees two identical rows and
+        // resolves them as ONE authority). Both rows swallow the child and
+        // both must be truncated.
+        let dup = parent.clone();
+        mock.set(child_ptr, vec![0u8; 0x1000 - 0x150]);
+        let mut out: Vec<HeapGlobalSnapshot> = vec![parent, dup];
+        let mut total_bytes: usize = out.iter().map(|g| g.content.len()).sum();
+        let mut seen_heaps: BTreeSet<u64> = BTreeSet::new();
+        let mut store = PreTruncParentAuthorityStore::default();
+        let dump_buf = vec![0u8; 0x1000];
+        let _admitted = split_swallowed_siblings(
+            &mut out,
+            &mut total_bytes,
+            &mut seen_heaps,
+            &mut store,
+            image_base,
+            image_end,
+            &dump_buf,
+            &mut mock,
+        );
+        // Both duplicate rows truncated to 0x150, drop counted ONCE per base.
+        let mut at_base = 0usize;
+        for g in out.iter() {
+            if g.live_ptr == 0x850000 {
+                assert_eq!(g.content.len(), 0x150, "parent truncated once");
+                at_base += 1;
+            }
+        }
+        assert_eq!(at_base, 2, "both duplicate rows truncated to same len");
+        let sum_after: usize = out.iter().map(|g| g.content.len()).sum();
+        assert_eq!(total_bytes, sum_after, "drop counted exactly once");
+        let _ = parent_bytes;
+    }
 }

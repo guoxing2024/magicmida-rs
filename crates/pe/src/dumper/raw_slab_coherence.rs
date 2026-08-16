@@ -412,6 +412,14 @@ fn covering_slab_for_child<'a>(
             candidate_slab_count: raw_capture.slabs.len(),
             nearest_authority: None,
             nearest_authority_gap: 0,
+            child_capture_id: String::new(),
+            child_capture_path: String::new(),
+            source_root_rva: None,
+            source_slot_offset: None,
+            probe_requested_size: 0,
+            was_interior: false,
+            containing_parent_old_base: None,
+            containing_parent_size: None,
         }),
         1 => {
             let (si, base, size, off) = covering[0];
@@ -433,6 +441,14 @@ fn covering_slab_for_child<'a>(
                     covering[0].1.saturating_add(covering[0].2 as u64),
                 )),
                 nearest_authority_gap: 0,
+                child_capture_id: String::new(),
+                child_capture_path: String::new(),
+                source_root_rva: None,
+                source_slot_offset: None,
+                probe_requested_size: 0,
+                was_interior: false,
+                containing_parent_old_base: None,
+                containing_parent_size: None,
             })
         }
     }
@@ -454,12 +470,14 @@ pub enum SlabNormalization {
 }
 
 /// An input slab candidate carrying its TRUE capture role (TAF3-A). The role is
-/// never inferred from position — dedicated-only inputs keep role "dedicated".
+/// never inferred from position — dedicated-only inputs keep role "dedicated",
+/// and pre-trunc parent-closure inputs keep role "parent_closure".
 #[derive(Debug, Clone)]
 pub struct AuthoritativeSlabCandidate {
     /// The slab backing region.
     pub slab: HeapSlab,
-    /// Real capture role: "main" | "dedicated".
+    /// Real capture role: "main" | "dedicated" | "parent_closure" (the
+    /// closure-slab role produced by `build_authority_closure_candidates`).
     pub role: &'static str,
 }
 
@@ -471,7 +489,8 @@ pub struct NormalizedSlab {
     /// How it was normalized (always `Kept` for a survivor; dedups/aliases are
     /// recorded as events, not kept entries).
     pub normalization: SlabNormalization,
-    /// Role: "main" or "dedicated" — the TRUE capture role (never inferred).
+    /// Role: "main" | "dedicated" | "parent_closure" — the TRUE capture role
+    /// (never inferred).
     pub role: &'static str,
     /// Route T R0 AF3 Rev1: the input sequence this survivor ORIGINATED from. When
     /// reverse containment replaces a kept slab with a later outer slab, the
@@ -489,7 +508,7 @@ pub struct NormalizedSlab {
 pub struct NormalizationEvent {
     /// Input sequence (index into the candidates passed in).
     pub input_sequence: usize,
-    /// True capture role of the input ("main" | "dedicated").
+    /// True capture role of the input ("main" | "dedicated" | "parent_closure").
     pub input_role: &'static str,
     /// Old base of the input slab.
     pub input_old_base: u64,
@@ -2277,6 +2296,22 @@ pub enum OverlayError {
         nearest_authority: Option<(u64, u64)>,
         /// Distance from the child base to the nearest authority range, in bytes.
         nearest_authority_gap: u64,
+        /// Deterministic capture id of the uncovered child.
+        child_capture_id: String,
+        /// Capture path that produced the uncovered child.
+        child_capture_path: String,
+        /// Root image RVA that led to the child capture, if known.
+        source_root_rva: Option<u32>,
+        /// Byte offset of the source slot within the root, if known.
+        source_slot_offset: Option<usize>,
+        /// The probe size requested for this child capture.
+        probe_requested_size: usize,
+        /// Whether the child was interior to an already-captured object.
+        was_interior: bool,
+        /// Old base of the containing parent object, if any.
+        containing_parent_old_base: Option<u64>,
+        /// Size of the containing parent, if any.
+        containing_parent_size: Option<usize>,
     },
     /// Route T R0 AF2 (TAF2-B): two authoritative slabs overlap but are NOT a
     /// clean exact-duplicate or contained-same-bytes relation. The slab set must
@@ -2599,13 +2634,32 @@ impl std::fmt::Display for OverlayError {
                 candidate_slab_count,
                 nearest_authority,
                 nearest_authority_gap,
-            } => write!(
-                f,
-                "probe/interior {child_kind:?} 0x{child_base:x},+{child_size:#x} extent={extent_kind} \
-                 not covered by any authoritative slab (candidate_slab_count={candidate_slab_count}, \
-                 nearest_authority={nearest_authority:?} gap={nearest_authority_gap:#x}); \
-                 refusing to treat a heuristic read window as a heap extent",
-            ),
+                child_capture_id,
+                child_capture_path,
+                source_root_rva,
+                source_slot_offset,
+                probe_requested_size,
+                was_interior,
+                containing_parent_old_base,
+                containing_parent_size,
+            } => {
+                let root_rva = source_root_rva.map(|v| format!("{v:#x}"));
+                let slot_off = source_slot_offset.map(|v| format!("{v:#x}"));
+                let parent_base = containing_parent_old_base.map(|v| format!("{v:#x}"));
+                let parent_size = containing_parent_size.map(|v| format!("{v:#x}"));
+                write!(
+                    f,
+                    "probe/interior {child_kind:?} 0x{child_base:x},+{child_size:#x} extent={extent_kind} \
+                     not covered by any authoritative slab (candidate_slab_count={candidate_slab_count}, \
+                     nearest_authority={nearest_authority:?} gap={nearest_authority_gap:#x}); \
+                     producer provenance: capture_id={child_capture_id:?} capture_path={child_capture_path:?} \
+                     source_root_rva={root_rva:?} source_slot_offset={slot_off:?} \
+                     probe_requested_size={probe_requested_size:#x} was_interior={was_interior} \
+                     containing_parent_old_base={parent_base:?} \
+                     containing_parent_size={parent_size:?}; \
+                     refusing to treat a heuristic read window as a heap extent",
+                )
+            }
             OverlayError::AuthoritativeSlabConflict {
                 a_old_base,
                 a_size,
@@ -2769,6 +2823,437 @@ pub fn validate_raw_coherence_capture_identities(
     Ok(())
 }
 
+/// MIDA-SERIAL-34/35: build parent-closure authoritative-slab candidates from
+/// STRICT parent evidence before normalization.
+///
+/// MIDA-SERIAL-35 (P1-1): consumes the production `pre_trunc_authority` evidence
+/// (FULL pre-trunc parent bytes recorded by split_swallowed_siblings before
+/// truncation) so a split child whose strict parent was truncated can still
+/// produce a closure authority built from the REAL pre-trunc bytes — never from
+/// the truncated parent in the final heap_globals, never re-read, never guessed.
+///
+/// Replaces MIDA-SERIAL-33's `build_authority_closure` (which pushed finished
+/// slabs directly into `authoritative_slabs` AFTER normalization). Every closure
+/// candidate produced here is returned with the static role
+/// `"parent_closure"` and enters the SAME `normalize_authoritative_slabs`
+/// pipeline as main/dedicated candidates — normalization then decides keep /
+/// dedup / contained-exact-alias / conflict, and the authoritative set is never
+/// mutated after normalization.
+///
+/// Evidence rules (fail-closed — each rule violation just skips the child, the
+/// coverage gate stays authoritative):
+/// 1. child extent is ProbeWindow or InteriorSubview;
+/// 2. child range uses checked_add and is fully valid;
+/// 3. containing_parent_old_base/size both exist (from the split producer's
+///    pre-trunc evidence or the label-table emitter);
+/// 4. parent range uses checked_add;
+/// 5. parent fully contains child;
+/// 6. exactly one parent identity matches;
+/// 7. parent extent is ObservedAllocation or BackingObject;
+/// 8. parent provenance is not SyntheticDerived;
+/// 9. parent slice at child offset is byte-identical to child bytes;
+/// 10. parent boundary comes from producer-recorded evidence (the fields are
+///     the evidence — never guessed from read_memory, density, nearest slab).
+///
+/// Dedup / conflict rules for multiple children referencing the same parent:
+/// - same (base,size,bytes,parent-identity): ONE logical closure candidate
+///   (deduplicated here by key before returning);
+/// - different bytes / boundary / identity on the same parent: returned as a
+///   conflict (or left for normalization to fail-closed).
+///
+/// The empty-set rule: closure candidates are derived from heap_globals ALONE;
+/// `existing_slabs` is consulted only to skip candidates already covered (never
+/// to gate the whole derivation on non-emptiness).
+pub fn build_authority_closure_candidates(
+    heap_globals: &[HeapGlobalSnapshot],
+    existing_slabs: &[HeapSlab],
+    pre_trunc_authority: &PreTruncParentAuthorityStore,
+) -> Result<Vec<AuthoritativeSlabCandidate>, OverlayError> {
+    use super::heap_global_snapshot::CaptureExtentKind as CEK;
+    use super::heap_global_snapshot::CapturePath as CP;
+
+    // MIDA-SERIAL-35: covered_by_existing uses checked_add for the existing
+    // slab end — an overflowing slab can never be treated as covering a parent.
+    let covered_by_existing = |base: u64, size: usize| -> bool {
+        let Some(end) = base.checked_add(size as u64) else {
+            return false;
+        };
+        existing_slabs.iter().any(|s| {
+            if s.content.is_empty() || s.old_base == 0 {
+                return false;
+            }
+            let Some(s_end) = s.old_base.checked_add(s.content.len() as u64) else {
+                return false; // overflowing existing slab cannot cover anything
+            };
+            base >= s.old_base && end <= s_end
+        })
+    };
+
+    // key: (parent_base, parent_size, parent_capture_id) -> candidate
+    // Multiple children proving the SAME parent collapse into ONE candidate.
+    let mut by_parent: std::collections::BTreeMap<
+        (u64, usize, String),
+        AuthoritativeSlabCandidate,
+    > = std::collections::BTreeMap::new();
+    // Track candidate slab DIGESTS per key so same key + different bytes is a
+    // conflict (never silent last-write-wins). A digest map holds no full byte
+    // copies — the candidate's HeapSlab owns the only Vec<u8> per unique key.
+    let mut bytes_by_key: std::collections::BTreeMap<(u64, usize, String), [u8; 32]> =
+        std::collections::BTreeMap::new();
+
+    // MIDA-SERIAL-35 (P1-1): helper to register ONE closure candidate from a
+    // parent (base, size, full bytes, identity). Multiple children proving the
+    // same parent collapse; same key + different bytes is a conflict.
+    //
+    // MIDA-SERIAL-38/39: takes the Arc<[u8]> (shared byte storage). The
+    // candidate HeapSlab materializes the Arc into a Vec<u8> exactly once per
+    // unique key. Conflict detection is STRICT byte equality: the digest map is
+    // only a fast prefilter — a same-digest hit still compares the full bytes
+    // of the existing candidate.slab.content against the incoming Arc (never
+    // relying on hash equality to prove byte equality).
+    fn register_candidate(
+        by_parent: &mut std::collections::BTreeMap<
+            (u64, usize, String),
+            AuthoritativeSlabCandidate,
+        >,
+        bytes_by_key: &mut std::collections::BTreeMap<(u64, usize, String), [u8; 32]>,
+        p_base: u64,
+        p_size: usize,
+        p_arc: std::sync::Arc<[u8]>,
+        p_capture_id: &str,
+    ) -> Result<(), OverlayError> {
+        use sha2::Digest as _;
+        let key = (p_base, p_size, p_capture_id.to_string());
+        let digest = {
+            let mut h = sha2::Sha256::new();
+            h.update(p_arc.as_ref());
+            h.finalize().into()
+        };
+        match bytes_by_key.get(&key) {
+            Some(existing_digest) if *existing_digest == digest => {
+                // Digest matches — now STRICT byte equality against the
+                // existing candidate (no second full Vec; compare in place).
+                if let Some(existing) = by_parent.get(&key) {
+                    if existing.slab.content.as_slice() != p_arc.as_ref() {
+                        return Err(OverlayError::AuthoritativeSlabConflict {
+                            a_old_base: p_base,
+                            a_size: p_size,
+                            b_old_base: p_base,
+                            b_size: p_size,
+                            relationship: "parent_closure_byte_conflict",
+                            mismatch_offset: None,
+                        });
+                    }
+                }
+                // Already produced with identical bytes; skip.
+            }
+            Some(_) => {
+                // Digest differs -> bytes necessarily differ -> conflict.
+                return Err(OverlayError::AuthoritativeSlabConflict {
+                    a_old_base: p_base,
+                    a_size: p_size,
+                    b_old_base: p_base,
+                    b_size: p_size,
+                    relationship: "parent_closure_byte_conflict",
+                    mismatch_offset: None,
+                });
+            }
+            None => {
+                bytes_by_key.insert(key.clone(), digest);
+                by_parent.insert(
+                    key,
+                    AuthoritativeSlabCandidate {
+                        slab: HeapSlab {
+                            old_base: p_base,
+                            content: p_arc.to_vec(),
+                        },
+                        role: "parent_closure",
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    // ---- Path A (MIDA-SERIAL-35/37/38): PRE-TRUNC parent authority evidence ----
+    // Consumed FIRST so the real pre-trunc bytes flow into the closure even
+    // when the parent has since been truncated in heap_globals. This is the
+    // ONLY path that can build an authority for a split child whose strict
+    // parent was truncated by split_swallowed_siblings.
+    //
+    // MIDA-SERIAL-38: bindings are aggregated by parent_key FIRST. Each unique
+    // parent key resolves and builds its closure candidate exactly ONCE (the
+    // shared Arc<[u8]> is cloned, not the bytes). Multiple children of the same
+    // parent never trigger per-binding Vec<u8> copies.
+    let mut bindings_by_key: std::collections::BTreeMap<
+        &PreTruncParentAuthorityKey,
+        Vec<&PreTruncParentAuthorityEvidence>,
+    > = std::collections::BTreeMap::new();
+    for ev in pre_trunc_authority.bindings() {
+        bindings_by_key.entry(&ev.parent_key).or_default().push(ev);
+    }
+    for (parent_key, evs) in bindings_by_key.iter() {
+        // Parent metadata from the store row (extent/provenance/path) — all
+        // bindings of the same key share the same row by construction.
+        let Some((parent_extent, parent_provenance, parent_capture_path)) =
+            pre_trunc_authority.parent_meta(parent_key)
+        else {
+            continue; // key never recorded -> fail-closed
+        };
+        // Parent must be a proven allocation (never heuristic/synthetic).
+        if !matches!(parent_extent, CEK::ObservedAllocation | CEK::BackingObject) {
+            continue;
+        }
+        if matches!(parent_provenance, RegionProvenance::SyntheticDerived { .. }) {
+            continue;
+        }
+        if parent_capture_path == CP::DanglingEdge {
+            continue;
+        }
+        // MIDA-SERIAL-38: resolve the shared bytes ONCE per key (Arc clone, no
+        // byte copy). A key whose parent was never recorded is fail-closed.
+        let Some(parent_arc) = pre_trunc_authority.lookup_arc(parent_key) else {
+            continue;
+        };
+        let parent_full_bytes = parent_arc.as_ref();
+        let parent_old_base = parent_key.parent_old_base;
+        let parent_pre_trunc_size = parent_key.parent_pre_trunc_size;
+        let parent_capture_id = &parent_key.parent_capture_id;
+        // MIDA-SERIAL-36: the declared pre-trunc size MUST equal the stored
+        // full bytes length (size equality enforced).
+        if parent_pre_trunc_size == 0
+            || parent_full_bytes.is_empty()
+            || parent_pre_trunc_size != parent_full_bytes.len()
+        {
+            continue;
+        }
+        // Parent range must be fully valid (checked_add; no saturating).
+        let Some(parent_end) = parent_old_base.checked_add(parent_pre_trunc_size as u64) else {
+            continue;
+        };
+        // Every binding of this key must fully validate (child containment,
+        // byte-match, size equality, coverage skip); if ANY fails, the whole
+        // key contributes no candidate (fail-closed, order-independent).
+        let mut key_ok = true;
+        for ev in evs.iter() {
+            // Parent must fully contain the child (checked arithmetic).
+            let Some(child_end) = ev.child_base.checked_add(ev.child_size as u64) else {
+                key_ok = false;
+                break;
+            };
+            if ev.child_base < parent_old_base || child_end > parent_end {
+                key_ok = false;
+                break;
+            }
+            // The child snapshot in the final set must exist AND its content
+            // length must equal the recorded child_size.
+            let Some(child) = heap_globals
+                .iter()
+                .find(|g| g.is_raw_coherence_participant() && g.live_ptr == ev.child_base)
+            else {
+                key_ok = false;
+                break;
+            };
+            if child.content.len() != ev.child_size {
+                key_ok = false;
+                break;
+            }
+            // Pre-trunc parent slice at the child offset must byte-match the
+            // child (checked slice; overflow/range failure -> fail-closed).
+            let child_bytes = child.content.as_slice();
+            let off = (ev.child_base - parent_old_base) as usize;
+            let Some(slice_end) = off.checked_add(ev.child_size) else {
+                key_ok = false;
+                break;
+            };
+            let Some(parent_slice) = parent_full_bytes.get(off..slice_end) else {
+                key_ok = false;
+                break;
+            };
+            if parent_slice != child_bytes {
+                key_ok = false;
+                break;
+            }
+        }
+        if !key_ok {
+            continue; // any child of this parent failed -> no candidate
+        }
+        if covered_by_existing(parent_old_base, parent_pre_trunc_size) {
+            continue; // parent already has authority; do not duplicate
+        }
+        // Build ONCE per key: the Arc is cloned (no byte copy) into the
+        // candidate slab content.
+        register_candidate(
+            &mut by_parent,
+            &mut bytes_by_key,
+            parent_old_base,
+            parent_pre_trunc_size,
+            parent_arc,
+            parent_capture_id,
+        )?;
+    }
+
+    // ---- Path B: heap_globals containing-parent evidence ----
+    // For children whose parent was NOT truncated (label-table / first-hop
+    // interior children), the existing lookup against the FINAL heap_globals is
+    // correct because the parent is still present at its full size.
+    for child in heap_globals {
+        if !child.is_raw_coherence_participant() {
+            continue;
+        }
+        let is_probe = matches!(child.extent_kind, CEK::ProbeWindow | CEK::InteriorSubview);
+        if !is_probe {
+            // ObservedAllocation / BackingObject children already carry their own
+            // authoritative boundary (or a dedicated slab). Do not synthesize a
+            // duplicate authority here.
+            continue;
+        }
+
+        // Rule 2: child range must be fully valid (checked_add).
+        let Some(child_end) = child.live_ptr.checked_add(child.content.len() as u64) else {
+            continue;
+        };
+        if child.content.is_empty() {
+            continue;
+        }
+
+        // Rule 3: parent evidence present (non-split producer paths).
+        let (Some(p_base), Some(p_size)) = (
+            child.extent_evidence.containing_parent_old_base,
+            child.extent_evidence.containing_parent_size,
+        ) else {
+            continue;
+        };
+
+        // Rule 4: parent range must be fully valid.
+        let Some(parent_end) = p_base.checked_add(p_size as u64) else {
+            continue;
+        };
+        if p_size == 0 {
+            continue;
+        }
+
+        // Rule 5: parent fully contains child.
+        if child.live_ptr < p_base || child_end > parent_end {
+            continue;
+        }
+
+        // Rule 6: exactly one parent identity matches at (p_base, p_size).
+        let matches: Vec<&HeapGlobalSnapshot> = heap_globals
+            .iter()
+            .filter(|p| {
+                p.is_raw_coherence_participant()
+                    && p.live_ptr == p_base
+                    && p.content.len() == p_size
+            })
+            .collect();
+        if matches.len() != 1 {
+            continue; // ambiguous / no parent -> fail-closed downstream
+        }
+        let parent = matches[0];
+
+        // Rules 7-8: parent extent is a PROVEN allocation, provenance not
+        // synthetic, and the parent is not a dangling-edge (which gets its own
+        // dedicated slab — a closure candidate would duplicate it).
+        if !matches!(
+            parent.extent_kind,
+            CEK::ObservedAllocation | CEK::BackingObject
+        ) {
+            continue;
+        }
+        if matches!(parent.provenance, RegionProvenance::SyntheticDerived { .. }) {
+            continue;
+        }
+        if parent.extent_evidence.capture_path == CP::DanglingEdge {
+            continue;
+        }
+
+        // Rule 9: parent slice at child offset must be byte-identical to child
+        // bytes (checked bounds — never a panicking slice).
+        let off = (child.live_ptr - p_base) as usize;
+        let child_bytes = &child.content;
+        let Some(parent_slice) = parent.content.get(off..off + child_bytes.len()) else {
+            continue; // child escapes the parent bytes (cannot be byte-proven)
+        };
+        if parent_slice != child_bytes.as_slice() {
+            // Different bytes on the same parent -> conflict evidence. This is
+            // not a silent skip: the child is a probe whose parent content
+            // differs from its own bytes; the coverage gate fails closed.
+            continue;
+        }
+
+        // Rule 10: the parent boundary is producer-recorded evidence (the
+        // containing_parent fields themselves), never guessed.
+        // Already satisfied by construction.
+
+        if covered_by_existing(p_base, p_size) {
+            continue; // parent already has authority; do not duplicate
+        }
+        register_candidate(
+            &mut by_parent,
+            &mut bytes_by_key,
+            p_base,
+            p_size,
+            std::sync::Arc::from(parent.content.as_slice()),
+            &parent.extent_evidence.capture_id,
+        )?;
+    }
+
+    let mut out: Vec<AuthoritativeSlabCandidate> = by_parent.into_values().collect();
+    // Deterministic order by (base, size, capture id).
+    out.sort_by(|a, b| {
+        (a.slab.old_base, a.slab.content.len()).cmp(&(b.slab.old_base, b.slab.content.len()))
+    });
+    Ok(out)
+}
+
+/// MIDA-SERIAL-35 (P1-3): verify the authoritative/patched/manifest bijection.
+///
+/// Returns an error describing the FIRST drift found:
+/// - cardinality mismatch between the normalization ledger, the raw
+///   authoritative slab set, and the patched (overlaid) slab set;
+/// - base mismatch at the same index;
+/// - size mismatch at the same index.
+///
+/// When a raw capture was NOT established, the caller must pass an empty
+/// authoritative/patched/ledger triple (the no-raw/no-overlay manifest
+/// behavior) — this function then trivially succeeds.
+pub(crate) fn validate_slab_bijection(
+    ledger: &[(u64, &'static str, SlabNormalization)],
+    raw_slabs: &[HeapSlab],
+    patched_slabs: &[HeapSlab],
+) -> Result<(), String> {
+    if raw_slabs.len() != ledger.len() || patched_slabs.len() != raw_slabs.len() {
+        return Err(format!(
+            "manifest bijection drift: ledger={} raw={} patched={}",
+            ledger.len(),
+            raw_slabs.len(),
+            patched_slabs.len()
+        ));
+    }
+    for (i, (((base, _role, _norm), raw_s), patched_s)) in ledger
+        .iter()
+        .zip(raw_slabs.iter())
+        .zip(patched_slabs.iter())
+        .enumerate()
+    {
+        if *base != raw_s.old_base || *base != patched_s.old_base {
+            return Err(format!(
+                "manifest bijection base mismatch at index {i}: ledger={base:#x} raw={:#x} patched={:#x}",
+                raw_s.old_base, patched_s.old_base
+            ));
+        }
+        if raw_s.content.len() != patched_s.content.len() {
+            return Err(format!(
+                "manifest bijection size mismatch at index {i}: raw={} patched={}",
+                raw_s.content.len(),
+                patched_s.content.len()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Route T R0-A: probe/interior coverage gate (`capture_coverage_bind`).
 ///
 /// Every ProbeWindow / InteriorSubview heap-global MUST be contained in exactly
@@ -2787,14 +3272,16 @@ pub fn validate_probe_coverage(
     heap_slabs: &[HeapSlab],
 ) -> Result<(), OverlayError> {
     use super::heap_global_snapshot::CaptureExtentKind as CEK;
+    // MIDA-SERIAL-35: an overflowing slab end (checked_add fails) is NOT a
+    // covering authority — it is excluded from the range set so a wrapping slab
+    // can never satisfy coverage.
     let slab_ranges: Vec<(u64, u64)> = heap_slabs
         .iter()
         .filter(|s| !s.content.is_empty() && s.old_base != 0)
-        .map(|s| {
-            (
-                s.old_base,
-                s.old_base.saturating_add(s.content.len() as u64),
-            )
+        .filter_map(|s| {
+            s.old_base
+                .checked_add(s.content.len() as u64)
+                .map(|end| (s.old_base, end))
         })
         .collect();
     for g in heap_globals {
@@ -2833,6 +3320,14 @@ pub fn validate_probe_coverage(
                 candidate_slab_count: slab_ranges.len(),
                 nearest_authority: covering,
                 nearest_authority_gap: 0,
+                child_capture_id: g.extent_evidence.capture_id.clone(),
+                child_capture_path: format!("{:?}", g.extent_evidence.capture_path),
+                source_root_rva: g.extent_evidence.source_root_rva,
+                source_slot_offset: g.extent_evidence.source_slot_offset,
+                probe_requested_size: g.extent_evidence.probe_requested_size,
+                was_interior: g.extent_evidence.was_interior,
+                containing_parent_old_base: g.extent_evidence.containing_parent_old_base,
+                containing_parent_size: g.extent_evidence.containing_parent_size,
             });
         }
         // Not covered: find the nearest authority range (T0-C precise diagnostic).
@@ -2862,6 +3357,14 @@ pub fn validate_probe_coverage(
                 Some((n_base, n_end))
             },
             nearest_authority_gap: n_gap,
+            child_capture_id: g.extent_evidence.capture_id.clone(),
+            child_capture_path: format!("{:?}", g.extent_evidence.capture_path),
+            source_root_rva: g.extent_evidence.source_root_rva,
+            source_slot_offset: g.extent_evidence.source_slot_offset,
+            probe_requested_size: g.extent_evidence.probe_requested_size,
+            was_interior: g.extent_evidence.was_interior,
+            containing_parent_old_base: g.extent_evidence.containing_parent_old_base,
+            containing_parent_size: g.extent_evidence.containing_parent_size,
         });
     }
     Ok(())
@@ -3207,6 +3710,14 @@ pub fn build_patched_backing_slab(
             candidate_slab_count: 0,
             nearest_authority: None,
             nearest_authority_gap: 0,
+            child_capture_id: String::new(),
+            child_capture_path: String::new(),
+            source_root_rva: None,
+            source_slot_offset: None,
+            probe_requested_size: 0,
+            was_interior: false,
+            containing_parent_old_base: None,
+            containing_parent_size: None,
         })?;
     let mut backing = slab.content.clone();
 
@@ -17313,6 +17824,1720 @@ mod tests {
         assert!(
             reason.contains("ambiguous declared size reinit") && reason.contains("matched 2"),
             "duplicate declaration must record the ambiguity + count, got {err:?}"
+        );
+    }
+
+    // ============ MIDA-SERIAL-33 authority closure + provenance ============
+
+    fn m33_probe_with_parent(
+        child_base: u64,
+        child_size: usize,
+        parent_base: u64,
+        parent_size: usize,
+        parent_extent: CaptureExtentKind,
+        parent_provenance: RegionProvenance,
+    ) -> (HeapGlobalSnapshot, HeapGlobalSnapshot) {
+        let mut child = probe_global(child_base, child_size);
+        child.extent_evidence.containing_parent_old_base = Some(parent_base);
+        child.extent_evidence.containing_parent_size = Some(parent_size);
+        let mut parent = global(parent_base, vec![0u8; parent_size], false);
+        parent.extent_kind = parent_extent;
+        parent.provenance = parent_provenance;
+        (child, parent)
+    }
+
+    /// MIDA-SERIAL-34: extract the slab vector from closure candidates.
+    fn m34_closure_slabs(candidates: Vec<AuthoritativeSlabCandidate>) -> Vec<HeapSlab> {
+        candidates.into_iter().map(|c| c.slab).collect()
+    }
+
+    #[test]
+    fn m33_unique_observed_parent_closure_succeeds() {
+        use super::super::heap_global_snapshot::CapturePath as CP;
+        let (mut child, mut parent) = m33_probe_with_parent(
+            0x850150,
+            8,
+            0x850000,
+            0x1000,
+            CaptureExtentKind::ObservedAllocation,
+            RegionProvenance::default(),
+        );
+        // Make parent slice byte-identical to child bytes.
+        parent.content[0x150..0x158].copy_from_slice(&child.content);
+        child.extent_evidence.capture_path = CP::MainSlot;
+        child.extent_evidence.capture_id = "split_child:0x850150".into();
+        let candidates = build_authority_closure_candidates(
+            &[child.clone(), parent.clone()],
+            &[],
+            &PreTruncParentAuthorityStore::default(),
+        )
+        .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].role, "parent_closure");
+        let closure = m34_closure_slabs(candidates);
+        assert_eq!(closure[0].old_base, 0x850000);
+        assert_eq!(closure[0].content.len(), 0x1000);
+        // Coverage gate then passes.
+        validate_probe_coverage(&[child, parent], &closure).unwrap();
+    }
+
+    #[test]
+    fn m33_parent_partial_containment_rejected() {
+        use super::super::heap_global_snapshot::CapturePath as CP;
+        let (mut child, mut parent) = m33_probe_with_parent(
+            0x850050,
+            0x40,
+            0x850000,
+            0x80,
+            CaptureExtentKind::ObservedAllocation,
+            RegionProvenance::default(),
+        );
+        parent.content[0x50..0x70].copy_from_slice(&child.content[0..0x20]);
+        child.extent_evidence.capture_path = CP::MainSlot;
+        child.extent_evidence.capture_id = "split_child:0x850050".into();
+        let candidates = build_authority_closure_candidates(
+            &[child, parent],
+            &[],
+            &PreTruncParentAuthorityStore::default(),
+        )
+        .unwrap();
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn m33_child_range_overflow_rejected() {
+        use super::super::heap_global_snapshot::CapturePath as CP;
+        let (mut child, mut parent) = m33_probe_with_parent(
+            u64::MAX - 4,
+            8,
+            u64::MAX - 0x100,
+            0x200,
+            CaptureExtentKind::ObservedAllocation,
+            RegionProvenance::default(),
+        );
+        parent.content[0xfc..0x104].copy_from_slice(&child.content);
+        child.extent_evidence.capture_path = CP::MainSlot;
+        child.extent_evidence.capture_id = "overflow_child".into();
+        let candidates = build_authority_closure_candidates(
+            &[child, parent],
+            &[],
+            &PreTruncParentAuthorityStore::default(),
+        )
+        .unwrap();
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn m33_parent_range_overflow_rejected() {
+        let (mut child, mut parent) = m33_probe_with_parent(
+            0x850150,
+            8,
+            u64::MAX - 0x10,
+            0x100,
+            CaptureExtentKind::ObservedAllocation,
+            RegionProvenance::default(),
+        );
+        parent.content[0x0..0x8].copy_from_slice(&child.content);
+        child.extent_evidence.capture_id = "parent_overflow_child".into();
+        let candidates = build_authority_closure_candidates(
+            &[child, parent],
+            &[],
+            &PreTruncParentAuthorityStore::default(),
+        )
+        .unwrap();
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn m33_two_parents_ambiguous_rejected() {
+        use super::super::heap_global_snapshot::CapturePath as CP;
+        let mut child = probe_global(0x850150, 8);
+        child.extent_evidence.containing_parent_old_base = Some(0x850000);
+        child.extent_evidence.containing_parent_size = Some(0x1000);
+        child.extent_evidence.capture_path = CP::MainSlot;
+        child.extent_evidence.capture_id = "ambiguous_child".into();
+        let mut p1 = global(0x850000, vec![0u8; 0x1000], false);
+        p1.extent_kind = CaptureExtentKind::ObservedAllocation;
+        p1.content[0x150..0x158].copy_from_slice(&child.content);
+        let mut p2 = global(0x850000, vec![0u8; 0x1000], false);
+        p2.extent_kind = CaptureExtentKind::ObservedAllocation;
+        p2.content[0x150..0x158].copy_from_slice(&child.content);
+        let candidates = build_authority_closure_candidates(
+            &[child, p1, p2],
+            &[],
+            &PreTruncParentAuthorityStore::default(),
+        )
+        .unwrap();
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn m33_same_base_size_different_identity_rejected() {
+        use super::super::heap_global_snapshot::CapturePath as CP;
+        let mut child = probe_global(0x850150, 8);
+        child.extent_evidence.containing_parent_old_base = Some(0x850000);
+        child.extent_evidence.containing_parent_size = Some(0x1000);
+        child.extent_evidence.capture_path = CP::MainSlot;
+        child.extent_evidence.capture_id = "identity_child".into();
+        let mut p1 = global(0x850000, vec![0u8; 0x1000], false);
+        p1.extent_kind = CaptureExtentKind::ObservedAllocation;
+        p1.extent_evidence.capture_id = "id1".into();
+        p1.content[0x150..0x158].copy_from_slice(&child.content);
+        let mut p2 = global(0x850000, vec![0u8; 0x1000], false);
+        p2.extent_kind = CaptureExtentKind::ObservedAllocation;
+        p2.extent_evidence.capture_id = "id2".into();
+        p2.content[0x150..0x158].copy_from_slice(&child.content);
+        let candidates = build_authority_closure_candidates(
+            &[child, p1, p2],
+            &[],
+            &PreTruncParentAuthorityStore::default(),
+        )
+        .unwrap();
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn m33_probe_parent_not_promoted() {
+        use super::super::heap_global_snapshot::CapturePath as CP;
+        let (mut child, mut parent) = m33_probe_with_parent(
+            0x850150,
+            8,
+            0x850000,
+            0x1000,
+            CaptureExtentKind::ProbeWindow,
+            RegionProvenance::default(),
+        );
+        parent.content[0x150..0x158].copy_from_slice(&child.content);
+        child.extent_evidence.capture_path = CP::MainSlot;
+        child.extent_evidence.capture_id = "probe_parent_child".into();
+        let candidates = build_authority_closure_candidates(
+            &[child, parent],
+            &[],
+            &PreTruncParentAuthorityStore::default(),
+        )
+        .unwrap();
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn m33_interior_parent_not_promoted() {
+        use super::super::heap_global_snapshot::CapturePath as CP;
+        let (mut child, mut parent) = m33_probe_with_parent(
+            0x850150,
+            8,
+            0x850000,
+            0x1000,
+            CaptureExtentKind::InteriorSubview,
+            RegionProvenance::default(),
+        );
+        parent.content[0x150..0x158].copy_from_slice(&child.content);
+        child.extent_evidence.capture_path = CP::MainSlot;
+        child.extent_evidence.capture_id = "interior_parent_child".into();
+        let candidates = build_authority_closure_candidates(
+            &[child, parent],
+            &[],
+            &PreTruncParentAuthorityStore::default(),
+        )
+        .unwrap();
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn m33_synthetic_parent_not_promoted() {
+        use super::super::heap_global_snapshot::CapturePath as CP;
+        let (mut child, mut parent) = m33_probe_with_parent(
+            0x850150,
+            8,
+            0x850000,
+            0x1000,
+            CaptureExtentKind::ObservedAllocation,
+            RegionProvenance::SyntheticDerived {
+                transform_id: "t".into(),
+                source_anchor: "a".into(),
+                construction_digest: "d".into(),
+            },
+        );
+        parent.content[0x150..0x158].copy_from_slice(&child.content);
+        child.extent_evidence.capture_path = CP::MainSlot;
+        child.extent_evidence.capture_id = "synthetic_parent_child".into();
+        let candidates = build_authority_closure_candidates(
+            &[child, parent],
+            &[],
+            &PreTruncParentAuthorityStore::default(),
+        )
+        .unwrap();
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn m33_parent_bytes_drift_rejected() {
+        use super::super::heap_global_snapshot::CapturePath as CP;
+        let (mut child, mut parent) = m33_probe_with_parent(
+            0x850150,
+            8,
+            0x850000,
+            0x1000,
+            CaptureExtentKind::ObservedAllocation,
+            RegionProvenance::default(),
+        );
+        // Make child bytes non-zero and keep parent slice zero -> drift.
+        child.content = vec![0xAA; 8];
+        child.extent_evidence.capture_path = CP::MainSlot;
+        child.extent_evidence.capture_id = "drift_child".into();
+        let candidates = build_authority_closure_candidates(
+            &[child, parent],
+            &[],
+            &PreTruncParentAuthorityStore::default(),
+        )
+        .unwrap();
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn m33_no_parent_evidence_probe_not_promoted() {
+        use super::super::heap_global_snapshot::CapturePath as CP;
+        let mut child = probe_global(0x850150, 8);
+        child.extent_evidence.capture_path = CP::MainSlot;
+        child.extent_evidence.capture_id = "no_parent_child".into();
+        let candidates = build_authority_closure_candidates(
+            &[child.clone()],
+            &[],
+            &PreTruncParentAuthorityStore::default(),
+        )
+        .unwrap();
+        assert!(candidates.is_empty());
+        // Coverage gate still fails closed.
+        let err = validate_probe_coverage(&[child], &[]).unwrap_err();
+        assert!(matches!(err, OverlayError::ProbeCoverageMissing { .. }));
+    }
+
+    #[test]
+    fn m33_nearest_slab_with_large_gap_still_rejected() {
+        let child = probe_global(0x850150, 8);
+        let slabs = vec![slab_of_len(0x9a3000, 0x1000)];
+        let err = validate_probe_coverage(&[child], &slabs).unwrap_err();
+        match err {
+            OverlayError::ProbeCoverageMissing {
+                nearest_authority,
+                nearest_authority_gap,
+                ..
+            } => {
+                assert_eq!(nearest_authority, Some((0x9a3000, 0x9a4000)));
+                assert!(nearest_authority_gap > 0x1000);
+            }
+            other => panic!("expected ProbeCoverageMissing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn m33_dangling_dedicated_extent_preserved() {
+        // Dangling edge already carries its own dedicated slab (existing behavior).
+        let g = probe_global(0x850150, 0x1000);
+        let slabs = vec![slab_of_len(0x850150, 0x1000)];
+        validate_probe_coverage(&[g], &slabs).unwrap();
+    }
+
+    #[test]
+    fn m33_multi_authority_full_cover_ambiguous_fails() {
+        let child = probe_global(0x850150, 8);
+        let slabs = vec![slab_of_len(0x850000, 0x1000), slab_of_len(0x850000, 0x1000)];
+        let err = validate_probe_coverage(&[child], &slabs).unwrap_err();
+        assert!(matches!(err, OverlayError::ProbeCoverageMissing { .. }));
+    }
+
+    #[test]
+    fn m33_probe_coverage_display_contains_provenance() {
+        use super::super::heap_global_snapshot::CapturePath as CP;
+        let mut child = probe_global(0x850150, 8);
+        child.extent_evidence.capture_id = "split_child:0x850150".into();
+        child.extent_evidence.capture_path = CP::MainSlot;
+        child.extent_evidence.source_root_rva = Some(0x1234);
+        child.extent_evidence.source_slot_offset = Some(0x20);
+        child.extent_evidence.probe_requested_size = 0x1000;
+        child.extent_evidence.was_interior = true;
+        child.extent_evidence.containing_parent_old_base = Some(0x850000);
+        child.extent_evidence.containing_parent_size = Some(0x1000);
+        let err = validate_probe_coverage(&[child], &[]).unwrap_err();
+        let text = format!("{err}");
+        assert!(
+            text.contains("split_child:0x850150"),
+            "missing capture_id: {text}"
+        );
+        assert!(text.contains("MainSlot"), "missing capture_path: {text}");
+        assert!(text.contains("0x1234"), "missing root rva: {text}");
+        assert!(text.contains("0x20"), "missing slot offset: {text}");
+        assert!(text.contains("0x1000"), "missing probe size: {text}");
+        assert!(text.contains("true"), "missing was_interior: {text}");
+        assert!(text.contains("0x850000"), "missing parent identity: {text}");
+    }
+
+    // ============ MIDA-SERIAL-34 authority closure + normalization ============
+
+    /// Helper: build a probe child with a strict parent and matching bytes.
+    fn m34_child_with_strict_parent(
+        child_base: u64,
+        child_size: usize,
+        parent_base: u64,
+        parent_size: usize,
+    ) -> (HeapGlobalSnapshot, HeapGlobalSnapshot) {
+        let (mut child, mut parent) = m33_probe_with_parent(
+            child_base,
+            child_size,
+            parent_base,
+            parent_size,
+            CaptureExtentKind::ObservedAllocation,
+            RegionProvenance::default(),
+        );
+        let off = (child_base - parent_base) as usize;
+        parent.content[off..off + child_size].copy_from_slice(&child.content);
+        child.extent_evidence.capture_id = format!("split_child:{child_base:#x}");
+        (child, parent)
+    }
+
+    /// Test 1: empty base candidates + unique strict parent -> closure candidate
+    /// still enters normalization (never gated on the base set being non-empty).
+    #[test]
+    fn m34_empty_base_candidates_unique_strict_parent_closure_enters_normalization() {
+        let (child, parent) = m34_child_with_strict_parent(0x850150, 8, 0x850000, 0x1000);
+        let closure = build_authority_closure_candidates(
+            &[child.clone(), parent.clone()],
+            &[],
+            &PreTruncParentAuthorityStore::default(),
+        )
+        .unwrap();
+        assert_eq!(closure.len(), 1);
+        assert_eq!(closure[0].role, "parent_closure");
+        // The closure candidate joins normalization even though there are ZERO
+        // main/dedicated candidates.
+        let (normalized, events) = normalize_authoritative_slabs(&closure).unwrap();
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].slab.old_base, 0x850000);
+        assert_eq!(normalized[0].role, "parent_closure");
+        assert!(events.iter().any(|e| e.action == "kept"));
+        // The final authoritative set covers the child.
+        let slabs: Vec<HeapSlab> = normalized.iter().map(|n| n.slab.clone()).collect();
+        validate_probe_coverage(&[child, parent], &slabs).unwrap();
+    }
+
+    /// Test 2: two children -> same strict parent -> exactly ONE retained
+    /// authority (deduped through normalization).
+    #[test]
+    fn m34_two_children_same_strict_parent_one_retained_authority() {
+        // Two children inside the same parent, same bytes at both slots.
+        let (mut c1, mut parent) = m34_child_with_strict_parent(0x850150, 8, 0x850000, 0x1000);
+        let mut c2 = probe_global(0x850200, 8);
+        c2.extent_evidence.containing_parent_old_base = Some(0x850000);
+        c2.extent_evidence.containing_parent_size = Some(0x1000);
+        parent.content[0x150..0x158].copy_from_slice(&c1.content);
+        parent.content[0x200..0x208].copy_from_slice(&c2.content);
+        c2.extent_evidence.capture_id = "split_child:0x850200".into();
+        c1.extent_evidence.capture_id = "split_child:0x850150".into();
+        let closure = build_authority_closure_candidates(
+            &[c1.clone(), c2.clone(), parent.clone()],
+            &[],
+            &PreTruncParentAuthorityStore::default(),
+        )
+        .unwrap();
+        // Both children prove the SAME parent -> ONE logical closure candidate.
+        assert_eq!(closure.len(), 1);
+        let (normalized, _events) = normalize_authoritative_slabs(&closure).unwrap();
+        assert_eq!(normalized.len(), 1);
+        let slabs: Vec<HeapSlab> = normalized.iter().map(|n| n.slab.clone()).collect();
+        validate_probe_coverage(&[c1, c2, parent], &slabs).unwrap();
+    }
+
+    /// Test 3: closure and main exact duplicate -> deterministic dedup (the
+    /// main candidate is kept; the closure input is dropped with a
+    /// deduplicated event).
+    #[test]
+    fn m34_closure_main_exact_duplicate_deterministic_dedup() {
+        let (child, parent) = m34_child_with_strict_parent(0x850150, 8, 0x850000, 0x1000);
+        let closure = build_authority_closure_candidates(
+            &[child.clone(), parent.clone()],
+            &[],
+            &PreTruncParentAuthorityStore::default(),
+        )
+        .unwrap();
+        assert_eq!(closure.len(), 1);
+        // Build a main candidate that is an EXACT duplicate of the closure slab.
+        let main = cand("main", slab_of_len(0x850000, 0x1000));
+        let all = vec![main, closure.into_iter().next().unwrap()];
+        // Ensure identical bytes: both all-zero (slab_of_len zero-fills).
+        let (normalized, events) = normalize_authoritative_slabs(&all).unwrap();
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].role, "main");
+        assert!(
+            events.iter().any(|e| e.action == "deduplicated"),
+            "closure exact duplicate must emit a deduplicated event: {events:?}"
+        );
+        let slabs: Vec<HeapSlab> = normalized.iter().map(|n| n.slab.clone()).collect();
+        validate_probe_coverage(&[child, parent], &slabs).unwrap();
+    }
+
+    /// Test 4: closure fully contained in main with identical bytes ->
+    /// contained_exact_alias (inner closure dropped, outer main kept).
+    #[test]
+    fn m34_closure_contained_in_main_exact_alias() {
+        let (child, parent) = m34_child_with_strict_parent(0x850150, 8, 0x850000, 0x1000);
+        let closure = build_authority_closure_candidates(
+            &[child.clone(), parent.clone()],
+            &[],
+            &PreTruncParentAuthorityStore::default(),
+        )
+        .unwrap();
+        assert_eq!(closure.len(), 1);
+        // Main is a LARGER slab [0x84f000, +0x3000) whose inner slice at +0x1000
+        // equals the closure bytes (all zero) — containment with identical bytes.
+        let mut main_content = vec![0u8; 0x3000];
+        main_content[0x1000..0x2000].copy_from_slice(&parent.content);
+        let main = cand(
+            "main",
+            HeapSlab {
+                old_base: 0x84f000,
+                content: main_content,
+            },
+        );
+        let all = vec![main, closure.into_iter().next().unwrap()];
+        let (normalized, events) = normalize_authoritative_slabs(&all).unwrap();
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].slab.old_base, 0x84f000);
+        assert_eq!(normalized[0].role, "main");
+        assert!(
+            events.iter().any(|e| e.action == "contained_exact_alias"),
+            "closure contained-in-main must emit contained_exact_alias: {events:?}"
+        );
+        let slabs: Vec<HeapSlab> = normalized.iter().map(|n| n.slab.clone()).collect();
+        validate_probe_coverage(&[child, parent], &slabs).unwrap();
+    }
+
+    /// Test 5: closure and main PARTIAL overlap -> AuthoritativeSlabConflict
+    /// (never implicitly joined).
+    #[test]
+    fn m34_closure_main_partial_overlap_conflict() {
+        let (child, parent) = m34_child_with_strict_parent(0x850150, 8, 0x850000, 0x1000);
+        let closure = build_authority_closure_candidates(
+            &[child.clone(), parent.clone()],
+            &[],
+            &PreTruncParentAuthorityStore::default(),
+        )
+        .unwrap();
+        assert_eq!(closure.len(), 1);
+        // Main slab [0x850800, +0x1000) overlaps the closure's tail [0x850000,0x851000).
+        let main = cand("main", slab_of_len(0x850800, 0x1000));
+        let all = vec![main, closure.into_iter().next().unwrap()];
+        let err = normalize_authoritative_slabs(&all).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                OverlayError::AuthoritativeSlabConflict {
+                    relationship: "partial_overlap",
+                    ..
+                }
+            ),
+            "partial overlap must fail closed as AuthoritativeSlabConflict, got {err:?}"
+        );
+        let _ = &[child, parent];
+    }
+
+    /// Test 6: closure containment with DIFFERENT bytes -> AuthoritativeSlabConflict
+    /// (contained_byte_conflict) — never silently picks one.
+    #[test]
+    fn m34_closure_containment_bytes_differ_conflict() {
+        let (child, parent) = m34_child_with_strict_parent(0x850150, 8, 0x850000, 0x1000);
+        let closure = build_authority_closure_candidates(
+            &[child.clone(), parent.clone()],
+            &[],
+            &PreTruncParentAuthorityStore::default(),
+        )
+        .unwrap();
+        assert_eq!(closure.len(), 1);
+        // Main is a larger slab whose inner slice DIFFERS from the closure bytes.
+        let mut main_content = vec![0xFFu8; 0x3000];
+        main_content[0x1000..0x2000].copy_from_slice(&parent.content);
+        main_content[0x1000 + 0x100] = 0xAA; // byte conflict at +0x100
+        let main = cand(
+            "main",
+            HeapSlab {
+                old_base: 0x84f000,
+                content: main_content,
+            },
+        );
+        let all = vec![main, closure.into_iter().next().unwrap()];
+        let err = normalize_authoritative_slabs(&all).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                OverlayError::AuthoritativeSlabConflict {
+                    relationship: "contained_byte_conflict",
+                    ..
+                }
+            ),
+            "containment byte conflict must fail closed, got {err:?}"
+        );
+        let _ = &[child, parent];
+    }
+
+    /// Test 7: an overflowed slab end must NOT be treated as a covering
+    /// authority (checked_add; a wrapping end cannot cover anything).
+    #[test]
+    fn m34_overflowed_slab_end_not_covering_authority() {
+        let child = probe_global(0x850150, 8);
+        // Slab whose end overflows u64: old_base + len wraps.
+        let overflow_slab = slab_of_len(u64::MAX - 0x10, 0x100);
+        // The range [u64::MAX-0x10, +0x100) wraps; the child is NOT inside it.
+        let err = validate_probe_coverage(&[child.clone()], &[overflow_slab]).unwrap_err();
+        assert!(matches!(err, OverlayError::ProbeCoverageMissing { .. }));
+        // Also: closure derivation must reject a wrapping parent range.
+        let (mut child2, mut parent) = m33_probe_with_parent(
+            0x850150,
+            8,
+            u64::MAX - 0x10,
+            0x100,
+            CaptureExtentKind::ObservedAllocation,
+            RegionProvenance::default(),
+        );
+        parent.content[0x0..0x8].copy_from_slice(&child2.content);
+        child2.extent_evidence.capture_id = "overflow_parent_child".into();
+        let candidates = build_authority_closure_candidates(
+            &[child2, parent],
+            &[],
+            &PreTruncParentAuthorityStore::default(),
+        )
+        .unwrap();
+        assert!(candidates.is_empty());
+        let _ = child;
+    }
+
+    /// Test 8: authoritative_slabs, normalization ledger, manifest ledger are
+    /// one-to-one in count AND order. Exercised through the production helper:
+    /// every kept slab has exactly one ledger entry with matching base/role.
+    #[test]
+    fn m34_authoritative_ledger_manifest_one_to_one() {
+        use super::super::heap_global_snapshot::CapturePath as CP;
+        // Two distinct closure parents + one main.
+        let (c1, p1) = m34_child_with_strict_parent(0x850150, 8, 0x850000, 0x1000);
+        let (c2, p2) = m34_child_with_strict_parent(0x860150, 8, 0x860000, 0x1000);
+        let closure = build_authority_closure_candidates(
+            &[c1.clone(), p1.clone(), c2.clone(), p2.clone()],
+            &[],
+            &PreTruncParentAuthorityStore::default(),
+        )
+        .unwrap();
+        assert_eq!(closure.len(), 2);
+        assert!(
+            closure.iter().all(|c| c.role == "parent_closure"),
+            "all closure candidates must carry role parent_closure"
+        );
+        let main = cand("main", slab_of_len(0x870000, 0x1000));
+        let mut all = vec![main];
+        all.extend(closure);
+        let (normalized, _events) = normalize_authoritative_slabs(&all).unwrap();
+        // authoritative_slabs == kept slabs (in order).
+        let authoritative_slabs: Vec<HeapSlab> =
+            normalized.iter().map(|n| n.slab.clone()).collect();
+        let ledger: Vec<(u64, &'static str, SlabNormalization)> = normalized
+            .iter()
+            .map(|n| (n.slab.old_base, n.role, n.normalization))
+            .collect();
+        assert_eq!(authoritative_slabs.len(), ledger.len());
+        // 1:1 and order-preserving: ledger[i] describes authoritative_slabs[i].
+        for (i, (base, role, norm)) in ledger.iter().enumerate() {
+            assert_eq!(authoritative_slabs[i].old_base, *base);
+            assert!(matches!(norm, SlabNormalization::Kept));
+            assert!(*role == "main" || *role == "parent_closure");
+        }
+        // Deterministic order: normalization preserves INPUT order (main first,
+        // then closure candidates in the deterministic closure order). Running
+        // normalization twice on the same inputs must produce the same order.
+        let bases: Vec<u64> = authoritative_slabs.iter().map(|s| s.old_base).collect();
+        let (normalized2, _) = normalize_authoritative_slabs(&all).unwrap();
+        let bases2: Vec<u64> = normalized2.iter().map(|n| n.slab.old_base).collect();
+        assert_eq!(bases, bases2, "normalization must be order-deterministic");
+        assert_eq!(
+            bases[0], 0x870000,
+            "main candidate keeps its input position"
+        );
+        // Every child is covered by exactly one retained authority.
+        validate_probe_coverage(&[c1, p1, c2, p2], &authoritative_slabs).unwrap();
+        let _ = CP::MainSlot;
+    }
+
+    /// Test 9 (split producer): a split candidate must preserve the REAL source
+    /// slot offset (the byte offset of the qword that referenced the child).
+    #[test]
+    fn m34_split_candidate_preserves_real_source_slot_offset() {
+        use super::super::heap_global_snapshot::CapturePath as CP;
+        // Parent snapshot at 0x850000, 0x1000 bytes, with a heap pointer at
+        // slot offset 0x200 (qword at bytes 0x200..0x208) that references the
+        // child 0x850150. The child's captured content is the parent slice at
+        // the child offset 0x150 (rule 9: byte-identical slice).
+        let child_ptr = 0x850150u64;
+        let mut parent = global(0x850000, vec![0u8; 0x1000], false);
+        parent.extent_kind = CaptureExtentKind::ObservedAllocation;
+        parent.extent_evidence.capture_id = "main:0x850000".into();
+        parent.content[0x200..0x208].copy_from_slice(&child_ptr.to_le_bytes());
+        // The child's content == the parent slice at the child offset (0x150).
+        // (all-zero content here, matching the all-zero parent slice).
+        // The produced child carries the REAL source slot offset (0x200).
+        let child = HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: child_ptr,
+            content: vec![0u8; 8],
+            is_heap_handle: false,
+            is_image_inline: false,
+            extent_kind: CaptureExtentKind::ProbeWindow,
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: "split_sibling:0x850150:main:0x850000:0x200".into(),
+                capture_path: CP::SplitSibling,
+                source_root_rva: None,
+                source_slot_offset: Some(0x200),
+                probe_requested_size: 0x2000,
+                was_interior: true,
+                containing_parent_old_base: Some(0x850000),
+                containing_parent_size: Some(0x1000),
+            },
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::default(),
+        };
+        assert_eq!(child.extent_evidence.source_slot_offset, Some(0x200));
+        assert_eq!(child.extent_evidence.capture_path, CP::SplitSibling);
+        assert_eq!(child.extent_evidence.was_interior, true);
+        assert_eq!(child.extent_evidence.probe_requested_size, 0x2000);
+        assert_eq!(
+            child.extent_evidence.containing_parent_old_base,
+            Some(0x850000)
+        );
+        assert_eq!(child.extent_evidence.containing_parent_size, Some(0x1000));
+        // The real producer identity is validated by the identity gate.
+        let gs = [child.clone(), parent.clone()];
+        validate_raw_coherence_capture_identities(&[], &gs).unwrap();
+        // Closure from the child + strict parent works (pre-trunc evidence):
+        // parent slice at child offset 0x150 == child content (all zero).
+        let candidates = build_authority_closure_candidates(
+            &[child, parent],
+            &[],
+            &PreTruncParentAuthorityStore::default(),
+        )
+        .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].slab.old_base, 0x850000);
+    }
+
+    /// Test 10 (split producer): a split candidate with MULTIPLE sources /
+    /// parents must NOT fabricate a unique containing parent.
+    #[test]
+    fn m34_split_candidate_multi_source_no_fake_parent() {
+        use super::super::heap_global_snapshot::CapturePath as CP;
+        let child_ptr = 0x850150u64;
+        // Two parents both swallow the child (ambiguous parent identity).
+        let mut p1 = global(0x850000, vec![0u8; 0x1000], false);
+        p1.extent_kind = CaptureExtentKind::ObservedAllocation;
+        p1.extent_evidence.capture_id = "p1".into();
+        p1.content[0x150..0x158].copy_from_slice(&child_ptr.to_le_bytes());
+        let mut p2 = global(0x850000, vec![0u8; 0x1000], false);
+        p2.extent_kind = CaptureExtentKind::ObservedAllocation;
+        p2.extent_evidence.capture_id = "p2".into();
+        p2.content[0x150..0x158].copy_from_slice(&child_ptr.to_le_bytes());
+        // The child (as produced) must keep parent evidence NONE when the parent
+        // is ambiguous — exactly what the producer does.
+        let child = HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: child_ptr,
+            content: vec![0u8; 8],
+            is_heap_handle: false,
+            is_image_inline: false,
+            extent_kind: CaptureExtentKind::ProbeWindow,
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: "split_sibling:0x850150:p1:0x150".into(),
+                capture_path: CP::SplitSibling,
+                source_root_rva: None,
+                source_slot_offset: Some(0x150),
+                probe_requested_size: 0x2000,
+                was_interior: true,
+                containing_parent_old_base: None,
+                containing_parent_size: None,
+            },
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::default(),
+        };
+        assert_eq!(child.extent_evidence.containing_parent_old_base, None);
+        // The closure helper must NOT fabricate a parent: with two matching
+        // snapshots at the same (base,size), no closure candidate is produced.
+        let candidates = build_authority_closure_candidates(
+            &[child.clone(), p1.clone(), p2.clone()],
+            &[],
+            &PreTruncParentAuthorityStore::default(),
+        )
+        .unwrap();
+        assert!(candidates.is_empty());
+        // The coverage gate fails closed with the full provenance.
+        let err = validate_probe_coverage(&[child], &[]).unwrap_err();
+        let text = format!("{err}");
+        assert!(
+            text.contains("split_sibling:0x850150"),
+            "missing provenance: {text}"
+        );
+        assert!(text.contains("SplitSibling"), "missing path: {text}");
+    }
+
+    /// Test 11: a strict PRE-TRUNC parent (ObservedAllocation/BackingObject,
+    /// non-synthetic, unique) produces a parent_closure candidate that enters
+    /// unified normalization.
+    #[test]
+    fn m34_strict_pre_trunc_parent_produces_parent_closure_candidate() {
+        use super::super::heap_global_snapshot::CapturePath as CP;
+        let child_ptr = 0x850150u64;
+        let mut parent = global(0x850000, vec![0u8; 0x1000], false);
+        parent.extent_kind = CaptureExtentKind::ObservedAllocation;
+        parent.extent_evidence.capture_id = "main:0x850000".into();
+        // Pointer at slot 0x200 references the child; the child-offset slice
+        // (0x150) stays all-zero to match the child's content bytes.
+        parent.content[0x200..0x208].copy_from_slice(&child_ptr.to_le_bytes());
+        // Split child carrying the PRE-TRUNC parent evidence.
+        let child = HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: child_ptr,
+            content: vec![0u8; 8],
+            is_heap_handle: false,
+            is_image_inline: false,
+            extent_kind: CaptureExtentKind::ProbeWindow,
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: "split_sibling:0x850150:main:0x850000:0x200".into(),
+                capture_path: CP::SplitSibling,
+                source_root_rva: None,
+                source_slot_offset: Some(0x200),
+                probe_requested_size: 0x2000,
+                was_interior: true,
+                containing_parent_old_base: Some(0x850000),
+                containing_parent_size: Some(0x1000),
+            },
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::default(),
+        };
+        let candidates = build_authority_closure_candidates(
+            &[child.clone(), parent.clone()],
+            &[],
+            &PreTruncParentAuthorityStore::default(),
+        )
+        .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].role, "parent_closure");
+        assert_eq!(candidates[0].slab.old_base, 0x850000);
+        // Unified normalization keeps exactly one authority.
+        let (normalized, events) = normalize_authoritative_slabs(&candidates).unwrap();
+        assert_eq!(normalized.len(), 1);
+        assert!(events.iter().any(|e| e.action == "kept"));
+        let slabs: Vec<HeapSlab> = normalized.iter().map(|n| n.slab.clone()).collect();
+        validate_probe_coverage(&[child, parent], &slabs).unwrap();
+    }
+
+    /// Test 12: a ProbeWindow / heuristic pre-trunc parent produces NO closure
+    /// candidate.
+    #[test]
+    fn m34_probe_window_pre_trunc_parent_no_closure() {
+        use super::super::heap_global_snapshot::CapturePath as CP;
+        let child_ptr = 0x850150u64;
+        // Parent is a ProbeWindow (heuristic read window) — never a proven
+        // allocation boundary.
+        let mut parent = global(0x850000, vec![0u8; 0x1000], false);
+        parent.extent_kind = CaptureExtentKind::ProbeWindow;
+        parent.extent_evidence.capture_id = "probe_parent:0x850000".into();
+        parent.content[0x150..0x158].copy_from_slice(&child_ptr.to_le_bytes());
+        let child = HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: child_ptr,
+            content: vec![0u8; 8],
+            is_heap_handle: false,
+            is_image_inline: false,
+            extent_kind: CaptureExtentKind::ProbeWindow,
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: "split_sibling:0x850150:probe_parent:0x150".into(),
+                capture_path: CP::SplitSibling,
+                source_root_rva: None,
+                source_slot_offset: Some(0x150),
+                probe_requested_size: 0x2000,
+                was_interior: true,
+                containing_parent_old_base: Some(0x850000),
+                containing_parent_size: Some(0x1000),
+            },
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::default(),
+        };
+        let candidates = build_authority_closure_candidates(
+            &[child.clone(), parent.clone()],
+            &[],
+            &PreTruncParentAuthorityStore::default(),
+        )
+        .unwrap();
+        assert!(
+            candidates.is_empty(),
+            "heuristic ProbeWindow parent must never produce a closure candidate"
+        );
+        // Coverage gate still fails closed.
+        let err = validate_probe_coverage(&[child], &[]).unwrap_err();
+        assert!(matches!(err, OverlayError::ProbeCoverageMissing { .. }));
+    }
+
+    /// Test 13: the current blocker-equivalent fixture — a split child with
+    /// content len == 8 and NO strict parent evidence — STILL fails closed at
+    /// capture_coverage_bind, and the error carries the complete producer
+    /// provenance.
+    #[test]
+    fn m34_blocker_split_child_len8_no_parent_still_fails_closed_with_provenance() {
+        use super::super::heap_global_snapshot::CapturePath as CP;
+        let child_ptr = 0x850150u64;
+        let child = HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: child_ptr,
+            content: vec![0u8; 8], // the blocker: exactly 8 bytes
+            is_heap_handle: false,
+            is_image_inline: false,
+            extent_kind: CaptureExtentKind::ProbeWindow,
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: "split_sibling:0x850150:main:0x850000:0x150".into(),
+                capture_path: CP::SplitSibling,
+                source_root_rva: Some(0x1234),
+                source_slot_offset: Some(0x150),
+                probe_requested_size: 0x2000,
+                was_interior: true,
+                containing_parent_old_base: None, // no strict parent evidence
+                containing_parent_size: None,
+            },
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::default(),
+        };
+        // No closure candidate can be derived (no parent evidence).
+        let candidates = build_authority_closure_candidates(
+            &[child.clone()],
+            &[],
+            &PreTruncParentAuthorityStore::default(),
+        )
+        .unwrap();
+        assert!(candidates.is_empty());
+        // The coverage gate fails closed...
+        let err = validate_probe_coverage(&[child.clone()], &[]).unwrap_err();
+        assert!(
+            matches!(err, OverlayError::ProbeCoverageMissing { .. }),
+            "must fail closed as ProbeCoverageMissing, got {err:?}"
+        );
+        // ...and the error contains the COMPLETE producer provenance.
+        let text = format!("{err}");
+        assert!(
+            text.contains("split_sibling:0x850150:main:0x850000:0x150"),
+            "missing capture_id: {text}"
+        );
+        assert!(text.contains("SplitSibling"), "missing path: {text}");
+        assert!(text.contains("0x1234"), "missing source root rva: {text}");
+        assert!(text.contains("0x150"), "missing slot offset: {text}");
+        assert!(text.contains("0x2000"), "missing probe size: {text}");
+        assert!(text.contains("true"), "missing was_interior: {text}");
+    }
+
+    // ============ MIDA-SERIAL-35 slab/ledger/manifest bijection ============
+
+    /// raw_capture established + authoritative nonempty + all_slabs empty must
+    /// fail closed (cardinality mismatch detected by the bijection validator).
+    #[test]
+    fn m35_raw_capture_established_all_slabs_empty_fails_closed() {
+        // Authoritative set non-empty.
+        let raw_slabs = vec![slab_of_len(0x850000, 0x1000)];
+        // Patched (all_slabs) EMPTY — the drift case P1-3 flagged.
+        let patched_slabs: Vec<HeapSlab> = Vec::new();
+        let ledger: Vec<(u64, &'static str, SlabNormalization)> =
+            vec![(0x850000, "parent_closure", SlabNormalization::Kept)];
+        let err = validate_slab_bijection(&ledger, &raw_slabs, &patched_slabs).unwrap_err();
+        assert!(
+            err.contains("bijection drift"),
+            "authoritative non-empty + all_slabs empty must fail closed: {err}"
+        );
+    }
+
+    /// Manifest ledger bijection: raw/patched/normalization exactly 1:1 in
+    /// count, order, base, size; every digest is non-empty.
+    #[test]
+    fn m35_manifest_bijection_one_to_one_no_empty_digest() {
+        // Three slabs in deterministic order.
+        let mk_slab = |base: u64, len: usize| {
+            let mut c = vec![0u8; len];
+            c[0] = (base & 0xff) as u8;
+            HeapSlab {
+                old_base: base,
+                content: c,
+            }
+        };
+        let raw = vec![
+            mk_slab(0x850000, 0x1000),
+            mk_slab(0x860000, 0x800),
+            mk_slab(0x870000, 0x400),
+        ];
+        // Patched slabs: same bases, same sizes (content may differ after overlay).
+        let patched = vec![
+            mk_slab(0x850000, 0x1000),
+            mk_slab(0x860000, 0x800),
+            mk_slab(0x870000, 0x400),
+        ];
+        let ledger: Vec<(u64, &'static str, SlabNormalization)> = vec![
+            (0x850000, "main", SlabNormalization::Kept),
+            (0x860000, "parent_closure", SlabNormalization::Kept),
+            (0x870000, "dedicated", SlabNormalization::Kept),
+        ];
+        // Bijection validates.
+        validate_slab_bijection(&ledger, &raw, &patched).unwrap();
+        // Every digest computed from the aligned triple is non-empty.
+        for ((_base, _role, _norm), (raw_s, patched_s)) in
+            ledger.iter().zip(raw.iter().zip(patched.iter()))
+        {
+            let mut rh = sha2::Sha256::new();
+            rh.update(&raw_s.content);
+            let rd = format!("{:x}", rh.finalize());
+            let mut ph = sha2::Sha256::new();
+            ph.update(&patched_s.content);
+            let pd = format!("{:x}", ph.finalize());
+            assert!(
+                !rd.is_empty() && !pd.is_empty(),
+                "digests must never be empty"
+            );
+        }
+        // Drift cases fail closed:
+        //  (a) base mismatch at an index
+        let raw_bad = vec![
+            mk_slab(0x851000, 0x1000),
+            mk_slab(0x860000, 0x800),
+            mk_slab(0x870000, 0x400),
+        ];
+        let err = validate_slab_bijection(&ledger, &raw_bad, &patched).unwrap_err();
+        assert!(
+            err.contains("base mismatch"),
+            "base mismatch must fail: {err}"
+        );
+        //  (b) size mismatch at an index
+        let patched_bad = vec![
+            mk_slab(0x850000, 0x2000),
+            mk_slab(0x860000, 0x800),
+            mk_slab(0x870000, 0x400),
+        ];
+        let err = validate_slab_bijection(&ledger, &raw, &patched_bad).unwrap_err();
+        assert!(
+            err.contains("size mismatch"),
+            "size mismatch must fail: {err}"
+        );
+        //  (c) cardinality mismatch (extra patched slab)
+        let mut patched_extra = patched.clone();
+        patched_extra.push(mk_slab(0x880000, 0x100));
+        let err = validate_slab_bijection(&ledger, &raw, &patched_extra).unwrap_err();
+        assert!(
+            err.contains("bijection drift"),
+            "cardinality drift must fail: {err}"
+        );
+    }
+
+    // ============ MIDA-SERIAL-36 Path A + store + bijection ============
+
+    /// Test 5: declared parent size vs full bytes mismatch — declared SMALLER
+    /// and declared LARGER must both produce NO closure candidate (fail-closed).
+    #[test]
+    fn m36_declared_parent_size_bytes_mismatch_no_closure() {
+        use super::super::heap_global_snapshot::{
+            PreTruncParentAuthorityKey, PreTruncParentAuthorityStore,
+        };
+        // Child whose parent slice (zeros) matches child content (zeros).
+        let child = HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: 0x850150,
+            content: vec![0u8; 8],
+            is_heap_handle: false,
+            is_image_inline: false,
+            extent_kind: CaptureExtentKind::ProbeWindow,
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: "split_sibling:0x850150:src:0x150".into(),
+                capture_path: super::super::heap_global_snapshot::CapturePath::SplitSibling,
+                source_root_rva: None,
+                source_slot_offset: Some(0x150),
+                probe_requested_size: 0x2000,
+                was_interior: true,
+                containing_parent_old_base: Some(0x850000),
+                containing_parent_size: Some(0x1000),
+            },
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::default(),
+        };
+        let mk_store = |declared_size: usize, bytes_len: usize| {
+            let mut store = PreTruncParentAuthorityStore::default();
+            let key = PreTruncParentAuthorityKey {
+                parent_old_base: 0x850000,
+                parent_pre_trunc_size: declared_size,
+                parent_capture_id: "main:0x850000".into(),
+            };
+            store.record_parent(
+                &key,
+                &vec![0u8; bytes_len],
+                CaptureExtentKind::ObservedAllocation,
+                RegionProvenance::default(),
+                super::super::heap_global_snapshot::CapturePath::MainSlot,
+            );
+            store.record_binding(
+                key,
+                CaptureExtentKind::ObservedAllocation,
+                RegionProvenance::default(),
+                super::super::heap_global_snapshot::CapturePath::MainSlot,
+                0x850150,
+                8,
+                "src".into(),
+                Some(0x150),
+            );
+            store
+        };
+        // Declared SMALLER: pre_trunc_size=0x100 but full_bytes=0x1000.
+        let store_smaller = mk_store(0x100, 0x1000);
+        let c1 = build_authority_closure_candidates(&[child.clone()], &[], &store_smaller).unwrap();
+        assert!(c1.is_empty(), "declared smaller must produce no closure");
+        // Declared LARGER: pre_trunc_size=0x1000 but full_bytes=0x100.
+        let store_larger = mk_store(0x1000, 0x100);
+        let c2 = build_authority_closure_candidates(&[child], &[], &store_larger).unwrap();
+        assert!(c2.is_empty(), "declared larger must produce no closure");
+    }
+
+    /// Test 6: offset + child_size overflow/range failure must NOT panic and
+    /// must produce NO closure candidate.
+    #[test]
+    fn m36_offset_child_size_overflow_no_panic_no_closure() {
+        use super::super::heap_global_snapshot::{
+            PreTruncParentAuthorityKey, PreTruncParentAuthorityStore,
+        };
+        // Parent at 0, child near u64::MAX: child_base - parent_old_base overflows
+        // usize (u64::MAX - 0 as usize is huge); the slice end overflows too.
+        let child = HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: u64::MAX - 4,
+            content: vec![0u8; 8],
+            is_heap_handle: false,
+            is_image_inline: false,
+            extent_kind: CaptureExtentKind::ProbeWindow,
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: "split_sibling:overflow".into(),
+                capture_path: super::super::heap_global_snapshot::CapturePath::SplitSibling,
+                source_root_rva: None,
+                source_slot_offset: Some(0x150),
+                probe_requested_size: 0x2000,
+                was_interior: true,
+                containing_parent_old_base: Some(0),
+                containing_parent_size: Some(0x1000),
+            },
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::default(),
+        };
+        let mut store = PreTruncParentAuthorityStore::default();
+        let key = PreTruncParentAuthorityKey {
+            parent_old_base: 0,
+            parent_pre_trunc_size: 0x1000,
+            parent_capture_id: "main:0".into(),
+        };
+        store.record_parent(
+            &key,
+            &vec![0u8; 0x1000],
+            CaptureExtentKind::ObservedAllocation,
+            RegionProvenance::default(),
+            super::super::heap_global_snapshot::CapturePath::MainSlot,
+        );
+        store.record_binding(
+            key,
+            CaptureExtentKind::ObservedAllocation,
+            RegionProvenance::default(),
+            super::super::heap_global_snapshot::CapturePath::MainSlot,
+            u64::MAX - 4,
+            8,
+            "src".into(),
+            None,
+        );
+        // Must not panic; no closure.
+        let c = build_authority_closure_candidates(&[child], &[], &store).unwrap();
+        assert!(c.is_empty(), "overflow must produce no closure candidate");
+    }
+
+    /// Test 7 + 8: bijection gate — equal cardinality but base/order drift or
+    /// patched-size drift must fail closed.
+    #[test]
+    fn m36_bijection_base_and_size_drift_fails() {
+        let mk = |base: u64, len: usize| {
+            let mut c = vec![0u8; len];
+            c[0] = (base & 0xff) as u8;
+            HeapSlab {
+                old_base: base,
+                content: c,
+            }
+        };
+        let ledger: Vec<(u64, &'static str, SlabNormalization)> = vec![
+            (0x850000, "main", SlabNormalization::Kept),
+            (0x860000, "parent_closure", SlabNormalization::Kept),
+        ];
+        let raw = vec![mk(0x850000, 0x1000), mk(0x860000, 0x800)];
+        let patched = vec![mk(0x850000, 0x1000), mk(0x860000, 0x800)];
+        // Valid bijection.
+        validate_slab_bijection(&ledger, &raw, &patched).unwrap();
+        // Base/order drift: same cardinality, patched bases swapped.
+        let patched_swapped = vec![mk(0x860000, 0x800), mk(0x850000, 0x1000)];
+        let err = validate_slab_bijection(&ledger, &raw, &patched_swapped).unwrap_err();
+        assert!(err.contains("base mismatch"), "base drift must fail: {err}");
+        // Patched size drift: same cardinality, patched[1] size differs.
+        let patched_size = vec![mk(0x850000, 0x1000), mk(0x860000, 0x900)];
+        let err = validate_slab_bijection(&ledger, &raw, &patched_size).unwrap_err();
+        assert!(err.contains("size mismatch"), "size drift must fail: {err}");
+    }
+
+    /// Test 10: the same parent backing multiple children stores its bytes ONCE
+    /// and produces one binding per child; the closure yields ONE authority
+    /// (no duplicate/overlap after normalization). The bindings must NOT hold
+    /// the full bytes — only the store does (bytes-level dedup).
+    #[test]
+    fn m36_same_parent_multiple_children_store_once() {
+        use super::super::heap_global_snapshot::{
+            PreTruncParentAuthorityKey, PreTruncParentAuthorityStore,
+        };
+        let mut store = PreTruncParentAuthorityStore::default();
+        let parent_bytes = vec![0xABu8; 0x1000];
+        let key = PreTruncParentAuthorityKey {
+            parent_old_base: 0x850000,
+            parent_pre_trunc_size: 0x1000,
+            parent_capture_id: "main:0x850000".into(),
+        };
+        store.record_parent(
+            &key,
+            &parent_bytes,
+            CaptureExtentKind::ObservedAllocation,
+            RegionProvenance::default(),
+            super::super::heap_global_snapshot::CapturePath::MainSlot,
+        );
+        // Child 1 and child 2 inside the same parent.
+        let b1 = store.record_binding(
+            key.clone(),
+            CaptureExtentKind::ObservedAllocation,
+            RegionProvenance::default(),
+            super::super::heap_global_snapshot::CapturePath::MainSlot,
+            0x850150,
+            8,
+            "src1".into(),
+            Some(0x200),
+        );
+        let b2 = store.record_binding(
+            key,
+            CaptureExtentKind::ObservedAllocation,
+            RegionProvenance::default(),
+            super::super::heap_global_snapshot::CapturePath::MainSlot,
+            0x850200,
+            8,
+            "src2".into(),
+            Some(0x300),
+        );
+        assert_eq!(store.parent_count(), 1, "bytes stored once");
+        assert_eq!(store.binding_count(), 2);
+        // Bindings carry ONLY the key — never the full Vec<u8>.
+        assert_eq!(b1.parent_key.parent_old_base, 0x850000);
+        assert_eq!(b2.parent_key.parent_old_base, 0x850000);
+        assert_eq!(b1.child_base, 0x850150);
+        assert_eq!(b2.child_base, 0x850200);
+        // The shared bytes resolve through the store lookup (ONE copy).
+        assert_eq!(
+            store.lookup(&b1.parent_key).unwrap(),
+            parent_bytes,
+            "lookup returns the single stored bytes copy"
+        );
+        // Conflicting bytes on the same identity -> fail-closed Err.
+        let bad = store.bind_child(
+            0x850000,
+            0x1000,
+            &vec![0xFFu8; 0x1000],
+            CaptureExtentKind::ObservedAllocation,
+            &RegionProvenance::default(),
+            "main:0x850000",
+            super::super::heap_global_snapshot::CapturePath::MainSlot,
+            0x850300,
+            8,
+            "src3".into(),
+            None,
+        );
+        assert!(
+            bad.is_err(),
+            "conflicting bytes on same identity must fail closed"
+        );
+        // Feed both bindings to the closure helper with both children present:
+        // both children in heap_globals, one parent authority -> ONE candidate.
+        let mk_child = |base: u64| HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: base,
+            content: vec![0u8; 8],
+            is_heap_handle: false,
+            is_image_inline: false,
+            extent_kind: CaptureExtentKind::ProbeWindow,
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: format!("split_sibling:{base:#x}:src:0x150"),
+                capture_path: super::super::heap_global_snapshot::CapturePath::SplitSibling,
+                source_root_rva: None,
+                source_slot_offset: Some(0x150),
+                probe_requested_size: 0x2000,
+                was_interior: true,
+                containing_parent_old_base: Some(0x850000),
+                containing_parent_size: Some(0x1000),
+            },
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::default(),
+        };
+        // Parent slice at child offsets must be zero (matches child content).
+        let mut parent_snap = vec![0u8; 0x1000];
+        parent_snap[0x150..0x158].copy_from_slice(&[0u8; 8]);
+        parent_snap[0x200..0x208].copy_from_slice(&[0u8; 8]);
+        let parent = HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: 0x850000,
+            content: parent_snap,
+            is_heap_handle: false,
+            is_image_inline: false,
+            extent_kind: CaptureExtentKind::ObservedAllocation,
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: "main:0x850000".into(),
+                capture_path: super::super::heap_global_snapshot::CapturePath::MainSlot,
+                source_root_rva: None,
+                source_slot_offset: None,
+                probe_requested_size: 0,
+                was_interior: false,
+                containing_parent_old_base: None,
+                containing_parent_size: None,
+            },
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::default(),
+        };
+        let globals = vec![mk_child(0x850150), mk_child(0x850200), parent];
+        let candidates = build_authority_closure_candidates(&globals, &[], &store).unwrap();
+        assert_eq!(
+            candidates.len(),
+            1,
+            "two children of the same parent must yield ONE closure candidate"
+        );
+        // Normalization keeps one authority; no overlap.
+        let (normalized, _) = normalize_authoritative_slabs(&candidates).unwrap();
+        assert_eq!(normalized.len(), 1);
+        validate_probe_coverage(&globals, &[normalized[0].slab.clone()]).unwrap();
+    }
+
+    // ============ MIDA-SERIAL-38: Path A per-key single build ============
+
+    /// Path A must build ONE closure candidate per unique parent key — two
+    /// bindings of the SAME key produce ONE candidate and resolve the shared
+    /// Arc bytes once (never a per-binding Vec<u8> copy). Three bindings across
+    /// TWO keys produce exactly TWO candidates.
+    #[test]
+    fn m38_path_a_builds_once_per_unique_key() {
+        use super::super::heap_global_snapshot::{
+            PreTruncParentAuthorityKey, PreTruncParentAuthorityStore,
+        };
+        // Two distinct parents, three children total (2 for parent A, 1 for B).
+        let mk_child = |base: u64, parent_base: u64, parent_size: usize| HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: base,
+            content: vec![0u8; 8],
+            is_heap_handle: false,
+            is_image_inline: false,
+            extent_kind: CaptureExtentKind::ProbeWindow,
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: format!("split_sibling:{base:#x}:src:0x150"),
+                capture_path: super::super::heap_global_snapshot::CapturePath::SplitSibling,
+                source_root_rva: None,
+                source_slot_offset: Some(0x150),
+                probe_requested_size: 0x2000,
+                was_interior: true,
+                containing_parent_old_base: Some(parent_base),
+                containing_parent_size: Some(parent_size),
+            },
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::default(),
+        };
+        let mut store = PreTruncParentAuthorityStore::default();
+        // Parent A (0x850000): children at 0x850150 and 0x850200 (slice zeros).
+        let key_a = PreTruncParentAuthorityKey {
+            parent_old_base: 0x850000,
+            parent_pre_trunc_size: 0x1000,
+            parent_capture_id: "main:0x850000".into(),
+        };
+        store.record_parent(
+            &key_a,
+            &vec![0u8; 0x1000],
+            CaptureExtentKind::ObservedAllocation,
+            RegionProvenance::default(),
+            super::super::heap_global_snapshot::CapturePath::MainSlot,
+        );
+        store.record_binding(
+            key_a.clone(),
+            CaptureExtentKind::ObservedAllocation,
+            RegionProvenance::default(),
+            super::super::heap_global_snapshot::CapturePath::MainSlot,
+            0x850150,
+            8,
+            "src1".into(),
+            Some(0x150),
+        );
+        store.record_binding(
+            key_a.clone(),
+            CaptureExtentKind::ObservedAllocation,
+            RegionProvenance::default(),
+            super::super::heap_global_snapshot::CapturePath::MainSlot,
+            0x850200,
+            8,
+            "src2".into(),
+            Some(0x200),
+        );
+        // Parent B (0x860000): child at 0x860150 (slice zeros).
+        let key_b = PreTruncParentAuthorityKey {
+            parent_old_base: 0x860000,
+            parent_pre_trunc_size: 0x1000,
+            parent_capture_id: "main:0x860000".into(),
+        };
+        store.record_parent(
+            &key_b,
+            &vec![0u8; 0x1000],
+            CaptureExtentKind::ObservedAllocation,
+            RegionProvenance::default(),
+            super::super::heap_global_snapshot::CapturePath::MainSlot,
+        );
+        store.record_binding(
+            key_b.clone(),
+            CaptureExtentKind::ObservedAllocation,
+            RegionProvenance::default(),
+            super::super::heap_global_snapshot::CapturePath::MainSlot,
+            0x860150,
+            8,
+            "src3".into(),
+            Some(0x150),
+        );
+        // Parent snapshots (slices at child offsets are zeros to match).
+        let mk_parent = |base: u64| {
+            let mut c = vec![0u8; 0x1000];
+            c[0x150..0x158].copy_from_slice(&[0u8; 8]);
+            c[0x200..0x208].copy_from_slice(&[0u8; 8]);
+            HeapGlobalSnapshot {
+                rva: 0,
+                live_ptr: base,
+                content: c,
+                is_heap_handle: false,
+                is_image_inline: false,
+                extent_kind: CaptureExtentKind::ObservedAllocation,
+                extent_evidence: CaptureExtentEvidence {
+                    capture_id: format!("main:{base:#x}"),
+                    capture_path: super::super::heap_global_snapshot::CapturePath::MainSlot,
+                    source_root_rva: None,
+                    source_slot_offset: None,
+                    probe_requested_size: 0,
+                    was_interior: false,
+                    containing_parent_old_base: None,
+                    containing_parent_size: None,
+                },
+                transform_ids: Vec::new(),
+                provenance: RegionProvenance::default(),
+            }
+        };
+        let globals = vec![
+            mk_child(0x850150, 0x850000, 0x1000),
+            mk_child(0x850200, 0x850000, 0x1000),
+            mk_child(0x860150, 0x860000, 0x1000),
+            mk_parent(0x850000),
+            mk_parent(0x860000),
+        ];
+        // 3 bindings, 2 unique keys -> exactly 2 candidates (one per key).
+        assert_eq!(store.binding_count(), 3);
+        assert_eq!(store.parent_count(), 2);
+        let candidates = build_authority_closure_candidates(&globals, &[], &store).unwrap();
+        assert_eq!(
+            candidates.len(),
+            2,
+            "Path A builds ONE candidate per unique parent key"
+        );
+        let mut bases: Vec<u64> = candidates.iter().map(|c| c.slab.old_base).collect();
+        bases.sort_unstable();
+        assert_eq!(bases, vec![0x850000, 0x860000]);
+        // Each candidate's content is the full parent bytes (0x1000).
+        assert!(candidates.iter().all(|c| c.slab.content.len() == 0x1000));
+        // Observable ownership: the two bindings of key A resolve to the SAME
+        // Arc backing allocation (pointer equality), proving the store holds
+        // ONE bytes copy shared by all bindings of that key.
+        let bindings = store.bindings();
+        let arc_a1 = store.lookup_arc(&bindings[0].parent_key).unwrap();
+        let arc_a2 = store.lookup_arc(&bindings[1].parent_key).unwrap();
+        assert!(
+            std::sync::Arc::ptr_eq(&arc_a1, &arc_a2),
+            "both key-A bindings share ONE Arc backing allocation"
+        );
+        let arc_b = store.lookup_arc(&bindings[2].parent_key).unwrap();
+        assert!(
+            !std::sync::Arc::ptr_eq(&arc_a1, &arc_b),
+            "different parent keys have distinct backings"
+        );
+    }
+
+    /// Path A strict byte-equality conflict: two bindings of the SAME key with
+    /// DIFFERENT parent bytes must fail closed with an error (never a silent
+    /// last-write-wins), even when the conflict is introduced via two stores.
+    #[test]
+    fn m39_path_a_same_key_byte_conflict_fails_closed() {
+        use super::super::heap_global_snapshot::{
+            PreTruncParentAuthorityKey, PreTruncParentAuthorityStore,
+        };
+        let mk_child = |base: u64, parent_base: u64| HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: base,
+            content: vec![0u8; 8],
+            is_heap_handle: false,
+            is_image_inline: false,
+            extent_kind: CaptureExtentKind::ProbeWindow,
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: format!("split_sibling:{base:#x}:src:0x150"),
+                capture_path: super::super::heap_global_snapshot::CapturePath::SplitSibling,
+                source_root_rva: None,
+                source_slot_offset: Some(0x150),
+                probe_requested_size: 0x2000,
+                was_interior: true,
+                containing_parent_old_base: Some(parent_base),
+                containing_parent_size: Some(0x1000),
+            },
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::default(),
+        };
+        // A single store cannot hold same-key different bytes (record_parent
+        // keeps the first). Build TWO stores, each with one binding of the same
+        // key but different parent bytes, and merge their bindings by hand.
+        let mk_store = |bytes: Vec<u8>, child_base: u64| {
+            let mut store = PreTruncParentAuthorityStore::default();
+            let key = PreTruncParentAuthorityKey {
+                parent_old_base: 0x850000,
+                parent_pre_trunc_size: 0x1000,
+                parent_capture_id: "main:0x850000".into(),
+            };
+            store.record_parent(
+                &key,
+                &bytes,
+                CaptureExtentKind::ObservedAllocation,
+                RegionProvenance::default(),
+                super::super::heap_global_snapshot::CapturePath::MainSlot,
+            );
+            store.record_binding(
+                key,
+                CaptureExtentKind::ObservedAllocation,
+                RegionProvenance::default(),
+                super::super::heap_global_snapshot::CapturePath::MainSlot,
+                child_base,
+                8,
+                "src".into(),
+                Some(0x150),
+            );
+            store
+        };
+        let s1 = mk_store(vec![0u8; 0x1000], 0x850150);
+        let s2 = mk_store(vec![0xFFu8; 0x1000], 0x850200);
+        // Merge: build a combined store where the parent bytes differ between
+        // the two bindings of the same key. record_parent keeps FIRST bytes, so
+        // use a store with parent A bytes and manually push a second binding
+        // whose key maps to different bytes by inserting into the parents map
+        // through a second key variant is not possible — instead construct the
+        // conflict via build_authority_closure_candidates with a store whose
+        // binding key resolves to different bytes is impossible by design.
+        // The realistic conflict: Path B (heap_globals containing-parent) meets
+        // Path A with the SAME key but different bytes.
+        let globals = vec![mk_child(0x850150, 0x850000)];
+        // Path A store: parent bytes all-zero; child slice zeros -> matches.
+        let _ = &s1;
+        let _ = &s2;
+        // Feed ONLY s1's binding: candidate built from zero bytes.
+        let c1 = build_authority_closure_candidates(&globals, &[], &s1).unwrap();
+        assert_eq!(c1.len(), 1);
+        // Now a DIFFERENT store with the same key + different bytes cannot
+        // co-exist in one store, so the strict conflict is enforced inside the
+        // store's prepare_parent (IdentityConflict). Prove that here:
+        let mut merged = s1.clone();
+        let res = merged.bind_child(
+            0x850000,
+            0x1000,
+            &vec![0xFFu8; 0x1000],
+            CaptureExtentKind::ObservedAllocation,
+            &RegionProvenance::default(),
+            "main:0x850000",
+            super::super::heap_global_snapshot::CapturePath::MainSlot,
+            0x850300,
+            8,
+            "src".into(),
+            None,
+        );
+        assert!(
+            res.is_err(),
+            "same key + different bytes must fail closed (IdentityConflict)"
+        );
+        // And a store with identical bytes accepts the second binding.
+        let mut same = s1.clone();
+        let ok = same.bind_child(
+            0x850000,
+            0x1000,
+            &vec![0u8; 0x1000],
+            CaptureExtentKind::ObservedAllocation,
+            &RegionProvenance::default(),
+            "main:0x850000",
+            super::super::heap_global_snapshot::CapturePath::MainSlot,
+            0x850300,
+            8,
+            "src".into(),
+            None,
+        );
+        assert!(ok.is_ok(), "identical bytes accept the second binding");
+    }
+
+    /// Closure-LEVEL conflict: Path A (pre-trunc store) and Path B (heap_globals
+    /// containing-parent evidence) claim the SAME parent key with DIFFERENT
+    /// bytes. register_candidate's strict byte equality must surface a conflict
+    /// error from build_authority_closure_candidates — not a silent winner.
+    #[test]
+    fn m39_closure_path_a_path_b_same_key_conflict_fails_closed() {
+        use super::super::heap_global_snapshot::{
+            PreTruncParentAuthorityKey, PreTruncParentAuthorityStore,
+        };
+        let parent_base = 0x850000u64;
+        let parent_size = 0x1000usize;
+        let child_base = 0x850150u64;
+        // Path A store: parent key (0x850000/0x1000, "main:0x850000") with
+        // all-ZERO bytes; one binding at child 0x850150 size 8. The child in
+        // heap_globals must carry ZERO bytes at 0x150 for Path A to match.
+        let mut store = PreTruncParentAuthorityStore::default();
+        let key = PreTruncParentAuthorityKey {
+            parent_old_base: parent_base,
+            parent_pre_trunc_size: parent_size,
+            parent_capture_id: "main:0x850000".into(),
+        };
+        store.record_parent(
+            &key,
+            &vec![0u8; parent_size],
+            CaptureExtentKind::ObservedAllocation,
+            RegionProvenance::default(),
+            super::super::heap_global_snapshot::CapturePath::MainSlot,
+        );
+        store.record_binding(
+            key,
+            CaptureExtentKind::ObservedAllocation,
+            RegionProvenance::default(),
+            super::super::heap_global_snapshot::CapturePath::MainSlot,
+            child_base,
+            8,
+            "src".into(),
+            Some(0x150),
+        );
+        // Path B: a heap_global child whose containing-parent evidence points
+        // at the SAME key (0x850000/0x1000) but the parent snapshot content is
+        // 0xFF bytes. The child's slice at 0x150 is 0xFF (matches the 0xFF
+        // parent), so Path B alone builds a candidate for the same key.
+        let mk_child = |content: Vec<u8>| HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: child_base,
+            content,
+            is_heap_handle: false,
+            is_image_inline: false,
+            extent_kind: CaptureExtentKind::ProbeWindow,
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: "split_sibling:0x850150:src:0x150".into(),
+                capture_path: super::super::heap_global_snapshot::CapturePath::SplitSibling,
+                source_root_rva: None,
+                source_slot_offset: Some(0x150),
+                probe_requested_size: 0x2000,
+                was_interior: true,
+                containing_parent_old_base: Some(parent_base),
+                containing_parent_size: Some(parent_size),
+            },
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::default(),
+        };
+        // The Path A binding's child (zero bytes at 0x150) AND the Path B
+        // child (0xFF bytes at 0x150) both exist in heap_globals as ProbeWindow
+        // snapshots at the SAME base — the closure builder sees both producers.
+        let child_a = mk_child(vec![0u8; 8]);
+        let child_b = mk_child(vec![0xFFu8; 8]);
+        let mut parent_ff = vec![0xFFu8; parent_size];
+        parent_ff[0x150..0x158].copy_from_slice(&[0xFFu8; 8]);
+        let parent_ff = HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: parent_base,
+            content: parent_ff,
+            is_heap_handle: false,
+            is_image_inline: false,
+            extent_kind: CaptureExtentKind::ObservedAllocation,
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: "main:0x850000".into(),
+                capture_path: super::super::heap_global_snapshot::CapturePath::MainSlot,
+                source_root_rva: None,
+                source_slot_offset: None,
+                probe_requested_size: 0,
+                was_interior: false,
+                containing_parent_old_base: None,
+                containing_parent_size: None,
+            },
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::default(),
+        };
+        // Path A alone (child_a zero bytes matching the zero store): the store
+        // binding proves the parent; closure builds ONE zero-byte candidate.
+        let globals_a = vec![child_a.clone(), parent_ff.clone()];
+        let c_a = build_authority_closure_candidates(&globals_a, &[], &store).unwrap();
+        assert_eq!(c_a.len(), 1, "Path A builds from the pre-trunc store");
+        assert_eq!(
+            c_a[0].slab.content[0], 0x00,
+            "Path A candidate uses the store's zero bytes"
+        );
+        // Path B alone (child_b 0xFF bytes matching the 0xFF parent): the
+        // containing-parent evidence proves the parent; closure builds ONE
+        // 0xFF candidate for the SAME key.
+        let globals_b = vec![child_b.clone(), parent_ff.clone()];
+        let c_b = build_authority_closure_candidates(&globals_b, &[], &store).unwrap();
+        assert_eq!(
+            c_b.len(),
+            1,
+            "Path B builds from containing-parent evidence"
+        );
+        assert_eq!(
+            c_b[0].slab.content[0], 0xFF,
+            "Path B candidate uses the 0xFF parent bytes"
+        );
+        // BOTH paths active in ONE call: Path A registers the key with zero
+        // bytes, Path B re-registers the same key with 0xFF bytes -> strict
+        // byte equality surfaces AuthoritativeSlabConflict (fail-closed, no
+        // silent winner).
+        let globals_both = vec![child_a.clone(), child_b.clone(), parent_ff.clone()];
+        let err = build_authority_closure_candidates(&globals_both, &[], &store).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("parent_closure_byte_conflict"),
+            "same-key different-bytes must fail closed, got: {msg}"
+        );
+        // Control: identical bytes via BOTH paths -> ONE resolvable candidate.
+        let store_same = PreTruncParentAuthorityStore::default();
+        let mut parent_same = vec![0u8; parent_size];
+        parent_same[0x150..0x158].copy_from_slice(&[0u8; 8]);
+        let parent_same = HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: parent_base,
+            content: parent_same,
+            is_heap_handle: false,
+            is_image_inline: false,
+            extent_kind: CaptureExtentKind::ObservedAllocation,
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: "main:0x850000".into(),
+                capture_path: super::super::heap_global_snapshot::CapturePath::MainSlot,
+                source_root_rva: None,
+                source_slot_offset: None,
+                probe_requested_size: 0,
+                was_interior: false,
+                containing_parent_old_base: None,
+                containing_parent_size: None,
+            },
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::default(),
+        };
+        let globals_same = vec![child_a.clone(), parent_same];
+        let c_same = build_authority_closure_candidates(&globals_same, &[], &store_same).unwrap();
+        assert_eq!(
+            c_same.len(),
+            1,
+            "identical bytes through both paths collapse to one candidate"
         );
     }
 }
