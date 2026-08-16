@@ -876,9 +876,17 @@ pub fn detect_heap_globals(
     dump_buf: &[u8],
     debugger: &mut dyn mida_core::DebuggerCore,
     policy: &DumpCapturePolicy,
-) -> (Vec<HeapGlobalSnapshot>, Vec<HeapSlab>) {
+) -> (
+    Vec<HeapGlobalSnapshot>,
+    Vec<HeapSlab>,
+    PreTruncParentAuthorityStore,
+) {
     if !pe.is_64bit {
-        return (Vec::new(), Vec::new());
+        return (
+            Vec::new(),
+            Vec::new(),
+            PreTruncParentAuthorityStore::default(),
+        );
     }
 
     // MIDA-SERIAL-15: identity-bound gate for sample-specific paths inside
@@ -922,7 +930,11 @@ pub fn detect_heap_globals(
         })
         .collect();
     if data_ranges.is_empty() {
-        return (Vec::new(), Vec::new());
+        return (
+            Vec::new(),
+            Vec::new(),
+            PreTruncParentAuthorityStore::default(),
+        );
     }
 
     let all_data: Vec<(u32, u32)> = data_ranges.iter().map(|&(lo, hi, _)| (lo, hi)).collect();
@@ -1037,7 +1049,11 @@ pub fn detect_heap_globals(
     }
 
     if candidate_scores.is_empty() {
-        return (Vec::new(), Vec::new());
+        return (
+            Vec::new(),
+            Vec::new(),
+            PreTruncParentAuthorityStore::default(),
+        );
     }
 
     // Order by code-xref hotness first (critical .data roots like 0x141bf0),
@@ -1489,10 +1505,17 @@ pub fn detect_heap_globals(
     // Oversized RPM probes often swallow neighbouring heap chunks. multi_fixup
     // then remaps freeable leaf pointers to *interior* addresses → HeapFree
     // c0000374 (e.g. path-string buffer inside a 2 KiB false parent).
+    // MIDA-SERIAL-35: the split producer also emits PRE-TRUNC parent authority
+    // evidence (full bytes) so the closure helper can build a closure authority
+    // from the real pre-trunc bytes after the parent is truncated.
+    // MIDA-SERIAL-37: the authority STORE owns the full pre-trunc bytes
+    // (one copy per parent identity); bindings carry only the key.
+    let mut pre_trunc_authority = PreTruncParentAuthorityStore::default();
     split_swallowed_siblings(
         &mut out,
         &mut total_bytes,
         &mut seen_heaps,
+        &mut pre_trunc_authority,
         image_base,
         image_end,
         dump_buf,
@@ -1577,7 +1600,9 @@ pub fn detect_heap_globals(
     // R0-E note: duplicate live_ptr reconciliation runs in dump_process AFTER
     // the raw slab is captured, so raw-slab coherence can be used as the
     // authoritative tiebreaker (the slab is the physical-memory ground truth).
-    (out, dedicated_slabs)
+    // MIDA-SERIAL-35: the pre-trunc authority evidence (full parent bytes)
+    // flows out of the production capture into build_authority_closure_candidates.
+    (out, dedicated_slabs, pre_trunc_authority)
 }
 
 /// Reconcile duplicate raw snapshots of the same physical heap allocation.
@@ -6113,11 +6138,28 @@ fn sanitize_refcounted_string_shell(content: &mut Vec<u8>) -> bool {
     true
 }
 
+/// MIDA-SERIAL-37: pure string-shell resolution. No shared-state mutation.
+struct StringShellResolution {
+    /// The content was recognized as a refcounted string shell.
+    is_shell: bool,
+    /// Buffer is already covered (exact live snapshot / seen heap): keep the
+    /// shell pointers, no new snapshot.
+    keep_pointers: bool,
+    /// Buffer bytes to admit as a new snapshot at commit (None when not
+    /// capturable / already covered).
+    buffer_child: Option<(u64, Vec<u8>)>, // (buf, body)
+}
+
 /// Admit the string buffer when possible. Always shrink the shell to the
 /// freeable 0x28 header so oversized probes do not swallow neighbours
 /// (HeapFree c0000374). Keep `buf` pointers when the buffer was snapshotted
 /// so multi_fixup remaps title/path wide strings; only null when the buffer
 /// cannot be captured.
+///
+/// MIDA-SERIAL-37: thin wrapper for the NON-transactional call sites (roots /
+/// first-hop / label entries / expand / dangling edges): resolve then apply
+/// immediately. The split path uses resolve + deferred apply so the admission
+/// stays atomic.
 fn handle_string_shell_on_capture(
     content: &mut Vec<u8>,
     out: &mut Vec<HeapGlobalSnapshot>,
@@ -6129,70 +6171,139 @@ fn handle_string_shell_on_capture(
     debugger: &mut dyn mida_core::DebuggerCore,
     slot_cap: usize,
 ) {
-    let Some((buf, _)) = parse_refcounted_string_shell(content) else {
-        return;
-    };
-    // R-GTO-UI r12: only an *exact* live_ptr match means the buffer is a
-    // freeable standalone snapshot. `range_contains` is wrong here — a large
-    // parent (e.g. 0x144358 @ 32KiB) can swallow path/title buffers as
-    // interior addresses; multi_fixup is exact-base only so those pointers
-    // stay stale OR get remapped to parent interiors, then HeapFree →
-    // c0000374 (WinMain path string release after MessageBox).
-    let covered = is_exact_live_ptr(out, buf) || seen_heaps.contains(&buf);
-    let admitted = covered
-        || admit_string_buffer_child(
-            content,
-            out,
-            total_bytes,
-            seen_heaps,
-            image_base,
-            image_end,
-            dump_buf,
-            debugger,
-            slot_cap,
-        );
-    // Exact freeable shell size — never leave multi-KiB false parent.
-    if content.len() > 0x28 {
-        content.truncate(0x28);
-    }
-    if admitted {
-        // Keep buf pointers; multi_fixup remaps them to the buffer snapshot.
-        return;
-    }
-    // Buffer unreachable — null so AHK dtor does not free a stale absolute.
-    content[0..16].fill(0);
+    let res = resolve_string_shell(
+        content,
+        out,
+        seen_heaps,
+        *total_bytes,
+        &[],
+        image_base,
+        image_end,
+        dump_buf,
+        debugger,
+        slot_cap,
+    );
+    apply_string_shell_resolution(content, &res, out, total_bytes, seen_heaps);
 }
 
-/// If `content` is a string shell, capture `buf` as a graph child **and keep**
-/// the buffer pointers so multi_fixup remaps them (do not null). Used on the
-/// hot gscript path where login-title strings must stay live.
-fn admit_string_buffer_child(
+/// Lightweight post-truncation geometry view over `out`: (live_ptr, len,
+/// exact_base_candidate). `truncations` override the length of parents that
+/// will be truncated at commit, so a buffer that lands at a swallowed
+/// parent's TAIL is judged against the POST-truncation geometry (it becomes
+/// exact-base / independently capturable) instead of being wrongly nulled.
+fn string_shell_geometry_view(
+    out: &[HeapGlobalSnapshot],
+    truncations: &[(u64, usize)],
+) -> Vec<(u64, usize, bool)> {
+    out.iter()
+        .map(|o| {
+            let len = truncations
+                .iter()
+                .find(|(b, _)| *b == o.live_ptr)
+                .map(|&(_, nl)| nl)
+                .unwrap_or(o.content.len());
+            (o.live_ptr, len, !o.is_heap_handle && !o.content.is_empty())
+        })
+        .collect()
+}
+
+/// is_exact_live_ptr over the geometry view.
+fn shell_view_exact_base(view: &[(u64, usize, bool)], addr: u64) -> bool {
+    view.iter().any(|(b, _, exact)| *exact && *b == addr)
+}
+
+/// Cap `size` so [base, base+size) does not overlap any view extent.
+/// checked arithmetic — a wrapping span is never a valid window.
+fn shrink_to_avoid_overlap_view(view: &[(u64, usize, bool)], base: u64, size: usize) -> usize {
+    let mut end = match base.checked_add(size as u64) {
+        Some(e) => e,
+        None => return 0,
+    };
+    for &(live, len, _) in view {
+        if len == 0 {
+            continue;
+        }
+        let Some(o_end) = live.checked_add(len as u64) else {
+            continue;
+        };
+        if live > base && live < end {
+            end = live;
+        }
+        if base >= live && base < o_end {
+            return 0; // interior of an existing extent
+        }
+    }
+    match end.checked_sub(base) {
+        Some(d) => d as usize,
+        None => 0,
+    }
+}
+
+fn truncate_to_avoid_overlap_view(
+    view: &[(u64, usize, bool)],
+    base: u64,
+    mut content: Vec<u8>,
+) -> Vec<u8> {
+    let new_len = shrink_to_avoid_overlap_view(view, base, content.len());
+    if new_len < content.len() {
+        content.truncate(new_len);
+    }
+    content
+}
+
+/// MIDA-SERIAL-37: pure string-shell resolver (no shared-state mutation).
+fn resolve_string_shell(
     content: &[u8],
-    out: &mut Vec<HeapGlobalSnapshot>,
-    total_bytes: &mut usize,
-    seen_heaps: &mut BTreeSet<u64>,
+    out: &[HeapGlobalSnapshot],
+    seen_heaps: &BTreeSet<u64>,
+    total_bytes: usize,
+    truncations: &[(u64, usize)],
     image_base: u64,
     image_end: u64,
     dump_buf: &[u8],
     debugger: &mut dyn mida_core::DebuggerCore,
     slot_cap: usize,
-) -> bool {
+) -> StringShellResolution {
     let Some((buf, want)) = parse_refcounted_string_shell(content) else {
-        return false;
+        return StringShellResolution {
+            is_shell: false,
+            keep_pointers: false,
+            buffer_child: None,
+        };
     };
+    let view = string_shell_geometry_view(out, truncations);
+    // R-GTO-UI r12: only an *exact* live_ptr match means the buffer is a
+    // freeable standalone snapshot. `range_contains` is wrong here — a large
+    // parent (e.g. 0x144358 @ 32KiB) can swallow path/title buffers as
+    // interior addresses; multi_fixup is exact-base only.
+    let covered = shell_view_exact_base(&view, buf) || seen_heaps.contains(&buf);
+    if covered {
+        return StringShellResolution {
+            is_shell: true,
+            keep_pointers: true,
+            buffer_child: None,
+        };
+    }
     if !is_heap_pointer(buf, image_base, image_end) || buf < MIN_GRAPH_CHILD_POINTER {
-        return false;
+        return StringShellResolution {
+            is_shell: true,
+            keep_pointers: false,
+            buffer_child: None,
+        };
     }
-    // Exact base only (see handle_string_shell_on_capture). Interior coverage
-    // of a large parent is NOT free-safe for AHK string dtors.
-    if seen_heaps.contains(&buf) || is_exact_live_ptr(out, buf) {
-        return true; // already covered — keep shell pointers for remap
-    }
-    if out.len() >= slot_cap || *total_bytes >= MAX_HEAP_GLOBAL_TOTAL_BYTES {
-        return false;
+    if out.len() >= slot_cap || total_bytes >= MAX_HEAP_GLOBAL_TOTAL_BYTES {
+        return StringShellResolution {
+            is_shell: true,
+            keep_pointers: false,
+            buffer_child: None,
+        };
     }
     if looks_like_heap_handle(debugger, buf) {
-        return false;
+        return StringShellResolution {
+            is_shell: true,
+            keep_pointers: false,
+            buffer_child: None,
+        };
     }
     let mut size = estimate_object_size(
         dump_buf,
@@ -6205,15 +6316,30 @@ fn admit_string_buffer_child(
     if size < 8 {
         size = want.min(0x1000);
         if !can_read(debugger, buf, size.min(0x40), 0x2000) {
-            return false;
+            return StringShellResolution {
+                is_shell: true,
+                keep_pointers: false,
+                buffer_child: None,
+            };
         }
     }
-    size = shrink_to_avoid_overlap(out, buf, size);
+    size = shrink_to_avoid_overlap_view(&view, buf, size);
     if size < 8 {
-        return false;
+        return StringShellResolution {
+            is_shell: true,
+            keep_pointers: false,
+            buffer_child: None,
+        };
     }
-    if total_bytes.saturating_add(size) > MAX_HEAP_GLOBAL_TOTAL_BYTES {
-        return false;
+    if total_bytes
+        .checked_add(size)
+        .map_or(true, |v| v > MAX_HEAP_GLOBAL_TOTAL_BYTES)
+    {
+        return StringShellResolution {
+            is_shell: true,
+            keep_pointers: false,
+            buffer_child: None,
+        };
     }
     let mut body = match alloc_capped(
         size,
@@ -6221,7 +6347,13 @@ fn admit_string_buffer_child(
         "string buffer child",
     ) {
         Ok(b) => b,
-        Err(_) => return false,
+        Err(_) => {
+            return StringShellResolution {
+                is_shell: true,
+                keep_pointers: false,
+                buffer_child: None,
+            };
+        }
     };
     match debugger.read_memory(buf as usize, &mut body) {
         Ok(n) if n >= 2 => {
@@ -6229,67 +6361,147 @@ fn admit_string_buffer_child(
                 body.truncate(n);
             }
         }
-        _ => return false,
+        _ => {
+            return StringShellResolution {
+                is_shell: true,
+                keep_pointers: false,
+                buffer_child: None,
+            };
+        }
     }
     body = trim_trailing_zero_pages(body);
-    body = truncate_to_avoid_overlap(out, buf, body);
+    body = truncate_to_avoid_overlap_view(&view, buf, body);
     if body.len() < 2 {
-        return false;
+        return StringShellResolution {
+            is_shell: true,
+            keep_pointers: false,
+            buffer_child: None,
+        };
     }
-    if !seen_heaps.insert(buf) {
-        return true;
+    StringShellResolution {
+        is_shell: true,
+        keep_pointers: false,
+        buffer_child: Some((buf, body)),
     }
-    info!(
-        heap = format_args!("{buf:#x}"),
-        size = body.len(),
-        "Captured string-buffer child (keep shell ptrs for multi_fixup)"
-    );
-    *total_bytes = total_bytes.saturating_add(body.len());
-    out.push(HeapGlobalSnapshot {
-        rva: 0,
-        live_ptr: buf,
-        content: body,
-        is_heap_handle: false,
-        is_image_inline: false,
-        extent_kind: CaptureExtentKind::default(),
-        extent_evidence: CaptureExtentEvidence {
-            capture_id: format!("string_buf:{buf:#x}"),
-            capture_path: CapturePath::MainSlot,
-            source_root_rva: None,
-            source_slot_offset: None,
-            probe_requested_size: 0,
-            was_interior: false,
-            containing_parent_old_base: None,
-            containing_parent_size: None,
-        },
-        transform_ids: Vec::new(),
-        provenance: RegionProvenance::default(),
-    });
-    true
+}
+
+/// MIDA-SERIAL-37: infallible commit of a resolved string shell.
+fn apply_string_shell_resolution(
+    content: &mut Vec<u8>,
+    res: &StringShellResolution,
+    out: &mut Vec<HeapGlobalSnapshot>,
+    total_bytes: &mut usize,
+    seen_heaps: &mut BTreeSet<u64>,
+) {
+    if !res.is_shell {
+        return;
+    }
+    if let Some((buf, body)) = &res.buffer_child {
+        if seen_heaps.insert(*buf) {
+            info!(
+                heap = format_args!("{buf:#x}"),
+                size = body.len(),
+                "Captured string-buffer child (keep shell ptrs for multi_fixup)"
+            );
+            // MIDA-SERIAL-40: the buffer byte add was PRE-VALIDATED by the
+            // caller's commit plan (total_bytes + buffer body cannot overflow).
+            // Infallible by construction — no failure branch after mutation.
+            debug_assert!(total_bytes.checked_add(body.len()).is_some());
+            *total_bytes += body.len();
+            out.push(HeapGlobalSnapshot {
+                rva: 0,
+                live_ptr: *buf,
+                content: body.clone(),
+                is_heap_handle: false,
+                is_image_inline: false,
+                extent_kind: CaptureExtentKind::default(),
+                extent_evidence: CaptureExtentEvidence {
+                    capture_id: format!("string_buf:{buf:#x}"),
+                    capture_path: CapturePath::MainSlot,
+                    source_root_rva: None,
+                    source_slot_offset: None,
+                    probe_requested_size: 0,
+                    was_interior: false,
+                    containing_parent_old_base: None,
+                    containing_parent_size: None,
+                },
+                transform_ids: Vec::new(),
+                provenance: RegionProvenance::default(),
+            });
+        }
+    }
+    // Exact freeable shell size — never leave multi-KiB false parent.
+    if content.len() > 0x28 {
+        content.truncate(0x28);
+    }
+    if res.keep_pointers || res.buffer_child.is_some() {
+        // Keep buf pointers; multi_fixup remaps them to the buffer snapshot.
+        return;
+    }
+    // Buffer unreachable — null so AHK dtor does not free a stale absolute.
+    content[0..16].fill(0);
 }
 
 /// Promote heap pointers that land *strictly inside* an existing capture to
 /// their own snapshot entries, and shrink the swallowing parent so multi_fixup
-/// remaps freeable leaves to exact `HeapAlloc` bases (not interiors).
+/// remaps freeable leaves to exact HeapAlloc bases (not interiors).
+///
+/// MIDA-SERIAL-34: every split child now carries REAL producer provenance:
+/// - capture_path = CapturePath::SplitSibling (never MainSlot);
+/// - capture_id = split_sibling:{value}:{source_snapshot_id}:{slot_off}
+///   (deterministic bind to producer + child base + source identity/slot);
+/// - source_slot_offset = the REAL qword-slot byte offset inside the source
+///   snapshot that referenced the child;
+/// - was_interior = true;
+/// - probe_requested_size = the actual probe cap requested for the child;
+/// - containing_parent_* = pre-trunc parent evidence ONLY when the parent is
+///   unique, strict (ObservedAllocation/BackingObject, non-SyntheticDerived)
+///   and its pre-trunc boundary is recorded before truncation. When the parent
+///   is ambiguous/heuristic/unprovable, the fields stay None (never fabricated
+///   to make a closure succeed).
 fn split_swallowed_siblings(
     out: &mut Vec<HeapGlobalSnapshot>,
     total_bytes: &mut usize,
     seen_heaps: &mut BTreeSet<u64>,
+    pre_trunc_authority: &mut PreTruncParentAuthorityStore,
     image_base: u64,
     image_end: u64,
     dump_buf: &[u8],
     debugger: &mut dyn mida_core::DebuggerCore,
-) {
+) -> Vec<SplitSiblingCandidateEvidence> {
+    // MIDA-SERIAL-37: returns the REAL admitted candidate evidence (including
+    // source_hit_count / parent_hit_count) so production-path tests can assert
+    // the producer's distinct-source / distinct-parent counts directly.
+    let mut admitted_evidence: Vec<SplitSiblingCandidateEvidence> = Vec::new();
     const MAX_SPLIT_ROUNDS: usize = 4;
     const MAX_SPLIT_PER_ROUND: usize = 24;
 
     let split_slot_cap = MAX_HEAP_GLOBAL_SLOTS.saturating_sub(HEAP_DANGLING_SLOT_RESERVE);
+
+    // MIDA-SERIAL-38: producer-lifetime ORIGINAL parent registry. Eligible
+    // strict parents (ObservedAllocation/BackingObject, non-SyntheticDerived,
+    // non-empty, non-handle) are FROZEN ONCE here, BEFORE any round truncates
+    // them. Every child of the same original parent binds the SAME frozen
+    // key/bytes regardless of round or child order. The producer NEVER
+    // re-derives "pre-trunc" from an already-truncated snapshot.
+    let frozen_parents: Vec<FrozenSplitParentIdentity> =
+        out.iter().filter_map(frozen_parent_from_snapshot).collect();
+    info!(
+        frozen = frozen_parents.len(),
+        total = out.len(),
+        "Frozen original split-parent registry (pre-truncation)"
+    );
+
     for round in 0..MAX_SPLIT_ROUNDS {
         if out.len() >= split_slot_cap || *total_bytes >= MAX_HEAP_GLOBAL_TOTAL_BYTES {
             break;
         }
 
-        let mut interiors: BTreeSet<u64> = BTreeSet::new();
+        // Candidate evidence keyed by child value. Replaces the lossy
+        // BTreeSet<u64>: preserves source snapshot, source slot offset,
+        // pre-trunc parent boundary, parent extent, parent identity, ambiguity.
+        let mut candidates: std::collections::BTreeMap<u64, SplitSiblingCandidateEvidence> =
+            std::collections::BTreeMap::new();
         for g in out.iter() {
             if g.is_heap_handle || g.content.len() < 16 {
                 continue;
@@ -6310,26 +6522,68 @@ fn split_swallowed_siblings(
                     continue;
                 }
                 // Strict interior of some capture range (not the base).
+                // MIDA-SERIAL-35: checked_add — an overflowing parent range
+                // cannot be a proven container.
                 let swallowed = out.iter().any(|o| {
                     if o.is_heap_handle || o.content.is_empty() {
                         return false;
                     }
-                    let end = o.live_ptr.saturating_add(o.content.len() as u64);
+                    let Some(end) = o.live_ptr.checked_add(o.content.len() as u64) else {
+                        return false;
+                    };
                     v > o.live_ptr && v < end
                 });
-                if swallowed {
-                    interiors.insert(v);
+                if !swallowed {
+                    continue;
+                }
+                // MIDA-SERIAL-34: record the REAL source slot offset (the byte
+                // offset of this qword within the source snapshot) and the source
+                // snapshot identity, plus how many distinct sources reference the
+                // child. source_slot_offset is never a fixed constant.
+                // MIDA-SERIAL-35 (P2): source_hit_count counts DISTINCT source
+                // capture identities (dedup by source identity), matching the
+                // field/comment semantics — never raw qword occurrences.
+                let slot_off = off - 8; // off was already advanced past this qword
+                let entry = candidates
+                    .entry(v)
+                    .or_insert_with(|| SplitSiblingCandidateEvidence {
+                        child_value: v,
+                        source_slot_offset: None,
+                        source_capture_id: None,
+                        source_capture_path: None,
+                        source_root_rva: None,
+                        source_identities: std::collections::BTreeSet::new(),
+                        source_hit_count: 0,
+                        parent_hit_count: 0,
+                        parent: None,
+                        was_interior: true,
+                        probe_requested_size: 0,
+                    });
+                // MIDA-SERIAL-36: distinct-source dedup — insert the source
+                // identity into the SET; source_hit_count is the set cardinality.
+                // Deterministic first-source-wins for slot/identity fields.
+                if entry
+                    .source_identities
+                    .insert(g.extent_evidence.capture_id.clone())
+                {
+                    if entry.source_capture_id.is_none() {
+                        entry.source_slot_offset = Some(slot_off);
+                        entry.source_capture_id = Some(g.extent_evidence.capture_id.clone());
+                        entry.source_capture_path = Some(g.extent_evidence.capture_path);
+                        entry.source_root_rva = g.extent_evidence.source_root_rva;
+                    }
+                    entry.source_hit_count = entry.source_identities.len();
                 }
             }
         }
 
-        if interiors.is_empty() {
+        if candidates.is_empty() {
             break;
         }
 
         // Prefer higher VAs so useful mid-heap leaves win over residual junk.
         let interiors_ordered: Vec<u64> = {
-            let mut v: Vec<u64> = interiors.into_iter().collect();
+            let mut v: Vec<u64> = candidates.keys().copied().collect();
             v.sort_by(|a, b| b.cmp(a));
             v
         };
@@ -6349,27 +6603,125 @@ fn split_swallowed_siblings(
                 continue;
             }
 
-            // Shrink every parent that swallowed this address *before* admitting
-            // the child, so ranges never overlap in the fixup map.
-            for g in out.iter_mut() {
-                if g.is_heap_handle || g.content.is_empty() {
-                    continue;
-                }
-                let end = g.live_ptr.saturating_add(g.content.len() as u64);
-                if value > g.live_ptr && value < end {
-                    let new_len = (value - g.live_ptr) as usize;
-                    if new_len >= 8 && new_len < g.content.len() {
-                        let dropped = g.content.len() - new_len;
-                        g.content.truncate(new_len);
-                        *total_bytes = total_bytes.saturating_sub(dropped);
+            // ============ PREPARE PHASE (no out/total_bytes/seen_heaps mutation) ============
+            //
+            // MIDA-SERIAL-38: resolve the ORIGINAL parent authority from the
+            // FROZEN registry (frozen before any truncation). A frozen parent
+            // qualifies when it strictly contains the child by its ORIGINAL
+            // span; the FULL qualifying identity (base, original size,
+            // capture_id, path, extent, provenance) comes from the frozen row
+            // — never a loose find(base,size) over the (possibly truncated)
+            // current out.
+            let frozen_matches: Vec<&FrozenSplitParentIdentity> = frozen_parents
+                .iter()
+                .filter(|f| {
+                    let Some(end) = f
+                        .key
+                        .parent_old_base
+                        .checked_add(f.key.parent_pre_trunc_size as u64)
+                    else {
+                        return false;
+                    };
+                    value > f.key.parent_old_base && value < end
+                })
+                .collect();
+            // MIDA-SERIAL-38/39: fail-closed on ambiguity — if two DIFFERENT
+            // frozen identities strictly contain the child, no authority is
+            // claimed (the child keeps parent=None and coverage decides).
+            //
+            // MIDA-SERIAL-39: same KEY is not enough. Two eligible frozen rows
+            // sharing base/size/capture_id but differing in full_bytes OR
+            // extent OR provenance OR capture_path are a CONFLICT (never
+            // first-wins). All rows with the same key must be byte/meta
+            // identical to be resolvable.
+            let unique_frozen: Option<&FrozenSplitParentIdentity> = {
+                if frozen_matches.is_empty() {
+                    None
+                } else {
+                    let first = frozen_matches[0];
+                    let all_identical = frozen_matches.iter().all(|f| {
+                        f.key == first.key
+                            && f.full_bytes.as_ref() == first.full_bytes.as_ref()
+                            && f.extent == first.extent
+                            && f.provenance == first.provenance
+                            && f.capture_path == first.capture_path
+                    });
+                    if all_identical {
+                        Some(first)
+                    } else {
+                        None
                     }
                 }
+            };
+            // parent_hit_count = DISTINCT frozen parent identities containing
+            // the child (original registry cardinality — never per-round
+            // occurrence, never truncated-prefix identities).
+            let parent_hit_count = {
+                let ids: std::collections::BTreeSet<PreTruncParentAuthorityKey> =
+                    frozen_matches.iter().map(|f| f.key.clone()).collect();
+                ids.len()
+            };
+            // The frozen authority row (bytes + full identity) for the unique
+            // parent, if any.
+            let pre_trunc_parent_full: Option<(
+                u64,
+                usize,
+                std::sync::Arc<[u8]>,
+                CaptureExtentKind,
+                RegionProvenance,
+                String,
+                CapturePath,
+            )> = unique_frozen.map(|f| {
+                (
+                    f.key.parent_old_base,
+                    f.key.parent_pre_trunc_size,
+                    f.full_bytes.clone(), // Arc handle clone — no byte copy
+                    f.extent,
+                    f.provenance.clone(),
+                    f.key.parent_capture_id.clone(),
+                    f.capture_path,
+                )
+            });
+            // MIDA-SERIAL-37/38: PREPARE the authority binding BEFORE any
+            // irreversible commit. An identity conflict or duplicate child
+            // binding REJECTS the candidate here — zero mutation.
+            let prepared_binding: Option<
+                Result<PreTruncParentAuthorityKey, PreTruncAuthorityError>,
+            > = pre_trunc_parent_full.as_ref().map(
+                |(pb, ps, full_bytes, ext, prov, cid, cpath)| {
+                    pre_trunc_authority.prepare_parent(
+                        *pb,
+                        *ps,
+                        full_bytes.as_ref(),
+                        *ext,
+                        prov,
+                        cid,
+                        *cpath,
+                    )
+                },
+            );
+            let parent_evidence: Option<SplitSiblingParentEvidence> = pre_trunc_parent_full
+                .as_ref()
+                .map(
+                    |(pb, ps, _b, ext, prov, cid, cpath)| SplitSiblingParentEvidence {
+                        pre_trunc_parent_old_base: Some(*pb),
+                        pre_trunc_parent_size: Some(*ps),
+                        pre_trunc_parent_extent: Some(*ext),
+                        pre_trunc_parent_provenance: Some(prov.clone()),
+                        pre_trunc_parent_capture_id: Some(cid.clone()),
+                        pre_trunc_parent_capture_path: Some(*cpath),
+                    },
+                );
+            if let Some(entry) = candidates.get_mut(&value) {
+                entry.parent = parent_evidence.clone();
+                entry.parent_hit_count = parent_hit_count;
             }
 
-            if !seen_heaps.insert(value) {
-                continue;
-            }
-
+            // Child size estimate / budget (no mutation on failure).
+            // MIDA-SERIAL-36: the overlap shrink runs against the POST-TRUNCATION
+            // view — the swallowing parents (which will be truncated at commit)
+            // are excluded, so an interior split child is not rejected by its own
+            // parent before commit.
             let mut size = estimate_object_size(
                 dump_buf,
                 usize::MAX,
@@ -6377,17 +6729,18 @@ fn split_swallowed_siblings(
                 debugger,
                 GRAPH_CHILD_SIZE_PROBE_CAP.min(MAX_HEAP_GLOBAL_BYTES),
             );
+            let probe_requested_size = GRAPH_CHILD_SIZE_PROBE_CAP.min(MAX_HEAP_GLOBAL_BYTES);
             if size < 8 {
-                seen_heaps.remove(&value);
                 continue;
             }
-            size = shrink_to_avoid_overlap(out, value, size);
+            size = shrink_split_child_avoid_overlap(out, value, size);
             if size < 8 {
-                seen_heaps.remove(&value);
                 continue;
             }
-            if total_bytes.saturating_add(size) > MAX_HEAP_GLOBAL_TOTAL_BYTES {
-                seen_heaps.remove(&value);
+            if total_bytes
+                .checked_add(size)
+                .map_or(true, |v| v > MAX_HEAP_GLOBAL_TOTAL_BYTES)
+            {
                 break;
             }
 
@@ -6397,10 +6750,7 @@ fn split_swallowed_siblings(
                 "heap split sibling",
             ) {
                 Ok(buf) => buf,
-                Err(_) => {
-                    seen_heaps.remove(&value);
-                    continue;
-                }
+                Err(_) => continue,
             };
             match debugger.read_memory(value as usize, &mut content) {
                 Ok(n) if n >= 8 => {
@@ -6408,56 +6758,351 @@ fn split_swallowed_siblings(
                         content.truncate(n);
                     }
                 }
-                _ => {
-                    seen_heaps.remove(&value);
-                    continue;
-                }
+                _ => continue, // read failure: NOTHING was mutated
             }
             content = trim_trailing_zero_pages(content);
-            content = truncate_to_avoid_overlap(out, value, content);
+            content = truncate_split_child_avoid_overlap(out, value, content);
             if content.len() < 8 {
-                seen_heaps.remove(&value);
-                continue;
+                continue; // post-trim failure: NOTHING was mutated
             }
-            handle_string_shell_on_capture(
-                &mut content,
+
+            // ============ COMMIT PHASE (atomic) ============
+            //
+            // MIDA-SERIAL-37: every conflict is detected in the PREPARE phase
+            // (identity conflict / duplicate child binding). The commit below is
+            // a single ordered sequence with NO failure branch between mutation
+            // steps: string-shell resolution was already computed; parent
+            // truncation, authority recording, counters, child push and seen
+            // insert happen together. Any rejected candidate left the shared
+            // state untouched.
+            let binding = match prepared_binding {
+                Some(Ok(key)) => Some(key),
+                Some(Err(e)) => {
+                    // Fail-closed: identity/bytes conflict REJECTS the split
+                    // candidate — parent untouched, child not admitted, no
+                    // evidence, no counters/seen residue.
+                    warn!(
+                        heap = format_args!("{value:#x}"),
+                        error = %e,
+                        "Split-sibling authority conflict: candidate rejected"
+                    );
+                    continue;
+                }
+                None => None,
+            };
+
+            // MIDA-SERIAL-39: resolve the string shell against the
+            // POST-TRUNCATION geometry (swallowing parents truncated at commit)
+            // so a buffer at a parent tail becomes exact-base / independently
+            // capturable. Pure — no shared-state mutation.
+            let truncations: Vec<(u64, usize)> = {
+                let mut t = Vec::new();
+                for g in out.iter() {
+                    if g.is_heap_handle || g.content.is_empty() {
+                        continue;
+                    }
+                    let Some(end) = g.live_ptr.checked_add(g.content.len() as u64) else {
+                        continue;
+                    };
+                    if value > g.live_ptr && value < end {
+                        let new_len = (value - g.live_ptr) as usize;
+                        if new_len >= 8 && new_len < g.content.len() {
+                            t.push((g.live_ptr, new_len));
+                        }
+                    }
+                }
+                t
+            };
+            let shell_res = resolve_string_shell(
+                &content,
                 out,
-                total_bytes,
                 seen_heaps,
+                *total_bytes,
+                &truncations,
                 image_base,
                 image_end,
                 dump_buf,
                 debugger,
                 split_slot_cap,
             );
-
-            info!(
-                heap = format_args!("{value:#x}"),
-                size = content.len(),
-                round = round + 1,
-                "Split swallowed heap sibling into own snapshot (free-safe base)"
+            debug_assert!(
+                !shell_res.is_shell || content.len() >= 0x28,
+                "string shell keeps >= 0x28 by construction"
             );
-            *total_bytes = total_bytes.saturating_add(content.len());
+
+            // ================================================================
+            // PHASE 1 — PREPARE: compute the FINAL child form and resolve the
+            // parent authority. No shared-state mutation.
+            // ================================================================
+            // Final child content length: a string shell's final form is the
+            // freeable 0x28 header; non-shell keeps its trimmed length. This
+            // value drives the duplicate gate, the budget AND the recorded
+            // binding — ONE formula.
+            let final_child_size: usize = if shell_res.is_shell {
+                content.len().min(0x28)
+            } else {
+                content.len()
+            };
+
+            // MIDA-SERIAL-40: same-key frozen registry ambiguity (two eligible
+            // rows with the same key but different bytes/meta) REJECTS the
+            // whole candidate at the producer — fail-closed, zero mutation.
+            // (unique_frozen == None when the registry is ambiguous.)
+            if unique_frozen.is_none() && !frozen_matches.is_empty() {
+                warn!(
+                    heap = format_args!("{value:#x}"),
+                    matches = frozen_matches.len(),
+                    "Split-sibling ambiguous frozen parent registry: candidate rejected"
+                );
+                continue;
+            }
+
+            // Duplicate-child production gate uses the FINAL child size.
+            if let Err(e) = pre_trunc_authority.prepare_child(value, final_child_size) {
+                warn!(
+                    heap = format_args!("{value:#x}"),
+                    error = %e,
+                    "Split-sibling duplicate child binding: candidate rejected"
+                );
+                continue;
+            }
+
+            // ================================================================
+            // PHASE 2 — IMMUTABLE COMMIT PLAN: ALL checked arithmetic, ALL
+            // validation, computed BEFORE any mutation. The commit below
+            // consumes ONLY this plan; it has no failure branches.
+            // ================================================================
+            // planned_slots = current + split child + optional buffer child.
+            // planned_bytes = current_total + final_child_bytes + optional
+            // buffer_bytes - parent truncation drops.
+            //
+            // Production invariant: total_bytes == sum(out content lengths).
+            // A truncation drop can therefore NEVER exceed the counted bytes;
+            // if the accounting is inconsistent, this is a HARD fail (never
+            // clamped into a "valid" budget).
+            let mut planned_slots: usize = out.len();
+            let mut trunc_drop: usize = 0;
+            // truncations has ONE entry per swallowing snapshot ROW; each row's
+            // drop is counted exactly once (no single-parent double-count).
+            for (pb, new_len) in truncations.iter() {
+                for g in out.iter() {
+                    if !g.is_heap_handle && !g.content.is_empty() && g.live_ptr == *pb {
+                        if *new_len < g.content.len() {
+                            match trunc_drop.checked_add(g.content.len() - *new_len) {
+                                Some(v) => trunc_drop = v,
+                                None => {
+                                    warn!(
+                                        heap = format_args!("{value:#x}"),
+                                        "Split-sibling truncation drop overflow: rejected"
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+            // HARD fail: an inconsistent drop (more removed than counted) is
+            // never clamped into a valid budget.
+            if trunc_drop > *total_bytes {
+                warn!(
+                    heap = format_args!("{value:#x}"),
+                    trunc_drop,
+                    total = *total_bytes,
+                    "Split-sibling truncation drop exceeds counted bytes: rejected"
+                );
+                continue;
+            }
+            let eff_drop = trunc_drop;
+            // planned slots (checked).
+            planned_slots = match planned_slots.checked_add(1) {
+                Some(v) => v, // split child
+                None => {
+                    warn!(heap = format_args!("{value:#x}"), "split slot overflow");
+                    continue;
+                }
+            };
+            let buffer_adds_slot = shell_res.buffer_child.is_some();
+            if buffer_adds_slot {
+                planned_slots = match planned_slots.checked_add(1) {
+                    Some(v) => v,
+                    None => {
+                        warn!(heap = format_args!("{value:#x}"), "split slot overflow");
+                        continue;
+                    }
+                };
+            }
+            // planned bytes (all checked).
+            let mut add_bytes: usize = final_child_size;
+            if let Some((_, body)) = &shell_res.buffer_child {
+                match add_bytes.checked_add(body.len()) {
+                    Some(v) => add_bytes = v,
+                    None => {
+                        warn!(
+                            heap = format_args!("{value:#x}"),
+                            "Split-sibling buffer byte overflow: rejected"
+                        );
+                        continue;
+                    }
+                }
+            }
+            let planned_bytes_checked = total_bytes
+                .checked_add(add_bytes)
+                .and_then(|b| b.checked_sub(eff_drop));
+            if planned_slots > split_slot_cap
+                || planned_bytes_checked.is_none()
+                || planned_bytes_checked.unwrap_or(usize::MAX) > MAX_HEAP_GLOBAL_TOTAL_BYTES
+            {
+                warn!(
+                    heap = format_args!("{value:#x}"),
+                    planned_slots,
+                    planned_bytes = planned_bytes_checked.unwrap_or(usize::MAX),
+                    cap_slots = split_slot_cap,
+                    cap_bytes = MAX_HEAP_GLOBAL_TOTAL_BYTES,
+                    "Split-sibling combined budget exceeded: candidate rejected"
+                );
+                continue;
+            }
+            // A string buffer whose base equals the split child base would
+            // produce two snapshots with the same live_ptr — reject.
+            if let Some((buf, _)) = &shell_res.buffer_child {
+                if *buf == value {
+                    warn!(
+                        heap = format_args!("{value:#x}"),
+                        "String buffer base equals split child base: rejected"
+                    );
+                    continue;
+                }
+            }
+            // The authority identity conflict was already checked in prepare
+            // (prepared_binding). The final child content length >= 8 is
+            // guaranteed by construction (shell >= 0x28; non-shell >= 8).
+            // The immutable plan is now COMPLETE. From here on, commit is
+            // infallible — no further checks, no failure branches.
+
+            // ================================================================
+            // PHASE 3 — INFALLIBLE COMMIT. Consumes only the validated plan.
+            // ================================================================
+            // 3a. Truncate swallowing parents: every drop is <= total_bytes
+            // (validated above); plain subtraction cannot underflow.
+            // Each truncations entry corresponds to ONE swallowing row. A
+            // duplicate row at the SAME base is a distinct snapshot that must
+            // also be truncated; do NOT break after the first match (the
+            // truncation is idempotent — a row already at new_len is skipped).
+            for (pb, new_len) in truncations.iter() {
+                for g in out.iter_mut() {
+                    if g.is_heap_handle || g.content.is_empty() {
+                        continue;
+                    }
+                    if g.live_ptr == *pb && *new_len < g.content.len() {
+                        let dropped = g.content.len() - *new_len;
+                        g.content.truncate(*new_len);
+                        debug_assert!(*total_bytes >= dropped);
+                        *total_bytes -= dropped;
+                    }
+                }
+            }
+            // 3b. Materialize the final child content form.
+            if shell_res.is_shell && content.len() > 0x28 {
+                content.truncate(0x28);
+            }
+            debug_assert!(content.len() >= 8, "string-shell truncation keeps >= 8");
+
+            let evidence =
+                candidates
+                    .get(&value)
+                    .cloned()
+                    .unwrap_or_else(|| SplitSiblingCandidateEvidence {
+                        child_value: value,
+                        source_slot_offset: None,
+                        source_capture_id: None,
+                        source_capture_path: None,
+                        source_root_rva: None,
+                        source_identities: std::collections::BTreeSet::new(),
+                        source_hit_count: 0,
+                        parent_hit_count,
+                        parent: parent_evidence.clone(),
+                        was_interior: true,
+                        probe_requested_size,
+                    });
+            let src_id = evidence
+                .source_capture_id
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
+            let slot_off = evidence.source_slot_offset.unwrap_or(usize::MAX);
+            let capture_id = format!("split_sibling:{value:#x}:{src_id}:{slot_off:#x}");
+            let parent_base = evidence
+                .parent
+                .as_ref()
+                .and_then(|p| p.pre_trunc_parent_old_base);
+            let parent_size = evidence
+                .parent
+                .as_ref()
+                .and_then(|p| p.pre_trunc_parent_size);
+            // 3c. Record the authority (Arc-shared bytes once) + one binding.
+            if let Some(key) = binding.as_ref() {
+                if let Some((_pb, _ps, full_bytes, ext, prov, _cid, cpath)) =
+                    pre_trunc_parent_full.as_ref()
+                {
+                    pre_trunc_authority.record_parent_arc(
+                        key,
+                        full_bytes.clone(), // Arc handle clone — no byte copy
+                        *ext,
+                        prov.clone(),
+                        *cpath,
+                    );
+                    pre_trunc_authority.record_binding(
+                        key.clone(),
+                        *ext,
+                        prov.clone(),
+                        *cpath,
+                        value,
+                        final_child_size,
+                        evidence.source_capture_id.clone().unwrap_or_default(),
+                        evidence.source_slot_offset,
+                    );
+                }
+            }
+            // 3d. String-shell buffer commit (pre-validated; infallible).
+            apply_string_shell_resolution(&mut content, &shell_res, out, total_bytes, seen_heaps);
+            // 3e. total_bytes add — pre-validated (checked_add in the plan);
+            // plain add cannot overflow.
+            debug_assert!(total_bytes.checked_add(final_child_size).is_some());
+            *total_bytes += final_child_size;
+            // 3f. Push the split child + seen_heaps + evidence.
             out.push(HeapGlobalSnapshot {
                 rva: 0,
                 live_ptr: value,
                 content,
                 is_heap_handle: false,
                 is_image_inline: false,
-                extent_kind: CaptureExtentKind::default(),
+                extent_kind: CaptureExtentKind::ProbeWindow,
                 extent_evidence: CaptureExtentEvidence {
-                    capture_id: format!("interior_subview:{value:#x}"),
-                    capture_path: CapturePath::MainSlot,
-                    source_root_rva: None,
-                    source_slot_offset: None,
-                    probe_requested_size: 0,
-                    was_interior: false,
-                    containing_parent_old_base: None,
-                    containing_parent_size: None,
+                    capture_id,
+                    capture_path: CapturePath::SplitSibling,
+                    source_root_rva: evidence.source_root_rva,
+                    source_slot_offset: evidence.source_slot_offset,
+                    probe_requested_size,
+                    was_interior: true,
+                    containing_parent_old_base: parent_base,
+                    containing_parent_size: parent_size,
                 },
                 transform_ids: Vec::new(),
                 provenance: RegionProvenance::default(),
             });
+            seen_heaps.insert(value);
+            admitted_evidence.push(evidence.clone());
+            info!(
+                heap = format_args!("{value:#x}"),
+                size = final_child_size,
+                round = round + 1,
+                source_slot_offset = slot_off,
+                source_hit_count = evidence.source_hit_count,
+                parent_hit_count,
+                has_strict_parent = parent_base.is_some(),
+                "Split swallowed heap sibling into own snapshot (free-safe base)"
+            );
             added += 1;
         }
 
@@ -6471,6 +7116,7 @@ fn split_swallowed_siblings(
             "Swallowed-sibling split round complete"
         );
     }
+    admitted_evidence
 }
 
 /// Final pass: walk every captured blob and admit still-external heap pointers
@@ -6704,6 +7350,40 @@ fn carve_parent_at_hot_base(out: &mut [HeapGlobalSnapshot], base: u64) -> bool {
 }
 
 /// Cap `size` so `[base, base+size)` does not overlap any existing capture.
+/// MIDA-SERIAL-36: shrink a SPLIT CHILD's proposed window against the
+/// POST-TRUNCATION view. The swallowing parents (strictly containing `base`)
+/// are excluded — they will be truncated to end at `base` at commit, so the
+/// child owns [base, ...) after commit. All OTHER snapshots still bound the
+/// child window (a later object base inside the proposed range cuts it; an
+/// earlier object whose range overlaps base non-swallowingly rejects it).
+fn shrink_split_child_avoid_overlap(out: &[HeapGlobalSnapshot], base: u64, size: usize) -> usize {
+    let mut end = match base.checked_add(size as u64) {
+        Some(e) => e,
+        None => return 0,
+    };
+    for o in out {
+        if o.is_heap_handle || o.content.is_empty() {
+            continue;
+        }
+        let Some(o_end) = o.live_ptr.checked_add(o.content.len() as u64) else {
+            continue;
+        };
+        if o.live_ptr < base && o_end > base {
+            continue;
+        }
+        if o.live_ptr > base && o.live_ptr < end {
+            end = o.live_ptr;
+        }
+        if base >= o.live_ptr && base < o_end {
+            return 0;
+        }
+    }
+    match end.checked_sub(base) {
+        Some(d) => d as usize,
+        None => 0,
+    }
+}
+
 fn shrink_to_avoid_overlap(out: &[HeapGlobalSnapshot], base: u64, size: usize) -> usize {
     let mut end = base.saturating_add(size as u64);
     for o in out {
@@ -6721,6 +7401,21 @@ fn shrink_to_avoid_overlap(out: &[HeapGlobalSnapshot], base: u64, size: usize) -
         let _ = o_end;
     }
     end.saturating_sub(base) as usize
+}
+
+/// MIDA-SERIAL-36: truncate a SPLIT CHILD's captured content against the
+/// POST-TRUNCATION view (swallowing parents excluded — see
+/// shrink_split_child_avoid_overlap).
+fn truncate_split_child_avoid_overlap(
+    out: &[HeapGlobalSnapshot],
+    base: u64,
+    mut content: Vec<u8>,
+) -> Vec<u8> {
+    let new_len = shrink_split_child_avoid_overlap(out, base, content.len());
+    if new_len < content.len() {
+        content.truncate(new_len);
+    }
+    content
 }
 
 fn truncate_to_avoid_overlap(

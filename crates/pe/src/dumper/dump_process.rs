@@ -1019,56 +1019,64 @@ pub fn dump_process_with_report(
     //   - GTO Route Z capture: the epoch is begun once (freeze=1) and ended once
     //     (unfreeze=1) before returning — all offline seed/transform/overlay work
     //     below runs AFTER `unfreeze`.
-    let ((mut containers, mut heap_globals, dedicated_slabs, main_slab), capture_tel) =
-        with_capture_epoch(debugger, epoch_needed, |live_dbg| {
-            // Detect SecurityCookie-encoded heap containers from the LIVE late image
-            // BEFORE rewinding `.data` to the early (pre-CRT) baseline.
-            let c = if stage_plan.detect_containers {
-                super::container_snapshot::detect_containers(&pe, &dump_buf, live_dbg)
-            } else {
-                Vec::new()
-            };
-            // Zero-raw .fill heap slots must be snapshotted from the LIVE late image
-            // before pointer scrub zeros process-local addresses.
-            let mut ds: Vec<super::heap_global_snapshot::HeapSlab> = Vec::new();
-            let hg = if stage_plan.detect_heap_globals {
-                // Route T R0-B: detect_heap_globals also returns dedicated
-                // authoritative slabs for each admitted dangling-edge allocation.
-                let (globals, dedicated) = super::heap_global_snapshot::detect_heap_globals(
+    let (
+        (mut containers, mut heap_globals, dedicated_slabs, main_slab, pre_trunc_authority),
+        capture_tel,
+    ) = with_capture_epoch(debugger, epoch_needed, |live_dbg| {
+        // Detect SecurityCookie-encoded heap containers from the LIVE late image
+        // BEFORE rewinding `.data` to the early (pre-CRT) baseline.
+        let c = if stage_plan.detect_containers {
+            super::container_snapshot::detect_containers(&pe, &dump_buf, live_dbg)
+        } else {
+            Vec::new()
+        };
+        // Zero-raw .fill heap slots must be snapshotted from the LIVE late image
+        // before pointer scrub zeros process-local addresses.
+        let mut ds: Vec<super::heap_global_snapshot::HeapSlab> = Vec::new();
+        let mut pre_trunc: super::heap_global_snapshot::PreTruncParentAuthorityStore =
+            super::heap_global_snapshot::PreTruncParentAuthorityStore::default();
+        let hg = if stage_plan.detect_heap_globals {
+            // Route T R0-B: detect_heap_globals also returns dedicated
+            // authoritative slabs for each admitted dangling-edge allocation.
+            // MIDA-SERIAL-35: it also returns the pre-trunc parent authority
+            // evidence (full bytes) recorded by split_swallowed_siblings.
+            let (globals, dedicated, pre_trunc_ev) =
+                super::heap_global_snapshot::detect_heap_globals(
                     &pe,
                     &dump_buf,
                     live_dbg,
                     &capture_policy,
                 );
-                ds = dedicated;
-                globals
+            ds = dedicated;
+            pre_trunc = pre_trunc_ev;
+            globals
+        } else {
+            Vec::new()
+        };
+        // ---- R0-C.1: capture the RAW heap slab and RAW children BEFORE transforms ----
+        // The slab must be captured from the same live state as the raw children so
+        // raw coherence can be proven, then the transformed bytes are overlaid onto
+        // a patched backing slab. Only when MIDA_GTO_NO_BYPASS=1.
+        // Route T R0 AF1 (TAF1-A/TAF1-F): the authoritative slab SET = the main
+        // heap slab (if capture_heap_slab yields one) + every dedicated dangling-edge
+        // slab. This single set flows through raw capture -> seed -> overlay ->
+        // runtime planner, so there is never an overlay-single / runtime-multi fork.
+        let ms: Option<super::heap_global_snapshot::HeapSlab> =
+            if no_bypass && stage_plan.detect_heap_globals {
+                // Route V R0 (V0-A): stage telemetry for the heap-slab capture.
+                let mut _stats = super::stage_timing::StageStats::default();
+                let mut _g = super::stage_timing::StageGuard::begin("capture_heap_slab");
+                let _s = super::heap_global_snapshot::capture_heap_slab(&hg, live_dbg);
+                if let Some(ref s) = _s {
+                    _stats.byte_count = s.content.len() as u64;
+                }
+                _g.with_stats(_stats); // attaches counts; exit emitted on drop
+                _s
             } else {
-                Vec::new()
+                None
             };
-            // ---- R0-C.1: capture the RAW heap slab and RAW children BEFORE transforms ----
-            // The slab must be captured from the same live state as the raw children so
-            // raw coherence can be proven, then the transformed bytes are overlaid onto
-            // a patched backing slab. Only when MIDA_GTO_NO_BYPASS=1.
-            // Route T R0 AF1 (TAF1-A/TAF1-F): the authoritative slab SET = the main
-            // heap slab (if capture_heap_slab yields one) + every dedicated dangling-edge
-            // slab. This single set flows through raw capture -> seed -> overlay ->
-            // runtime planner, so there is never an overlay-single / runtime-multi fork.
-            let ms: Option<super::heap_global_snapshot::HeapSlab> =
-                if no_bypass && stage_plan.detect_heap_globals {
-                    // Route V R0 (V0-A): stage telemetry for the heap-slab capture.
-                    let mut _stats = super::stage_timing::StageStats::default();
-                    let mut _g = super::stage_timing::StageGuard::begin("capture_heap_slab");
-                    let _s = super::heap_global_snapshot::capture_heap_slab(&hg, live_dbg);
-                    if let Some(ref s) = _s {
-                        _stats.byte_count = s.content.len() as u64;
-                    }
-                    _g.with_stats(_stats); // attaches counts; exit emitted on drop
-                    _s
-                } else {
-                    None
-                };
-            Ok((c, hg, ds, ms))
-        })?;
+        Ok((c, hg, ds, ms, pre_trunc))
+    })?;
     // Route Z R0 AF1: log the epoch outcome. All remaining work (slab normalize,
     // reconcile, seed, transforms, overlay, runtime plan, manifest) is OFFLINE and
     // runs while the target is NOT frozen.
