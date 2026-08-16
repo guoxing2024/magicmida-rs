@@ -19,6 +19,7 @@
 | `mida.antidebug-runtime-attestation/v1` | 注入后 runtime 身份与健康 attestation |
 | `mida.antidebug-observation/v1` | 单个 observation（probe 输入/输出/来源/置信度） |
 | `mida.antidebug-probe-result/v1` | 单个 probe 的 expected vs observed 对比 |
+| `mida.antidebug-expected-state/v1` | sample × surface 的 no-debugger 期望状态（ADR-2 引入；required 标记 + allowed_variance） |
 | `mida.antidebug-evidence/v1` | 一次 unpack 尝试的完整证据包（含 attestation 与 probes） |
 | `mida.antidebug-provenance/v1` | artifact provenance（见 CLEAN_ROOM_RULES §7） |
 
