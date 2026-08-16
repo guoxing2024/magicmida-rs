@@ -23,7 +23,10 @@ use sha2::{Digest, Sha256};
 
 use super::capture_policy::DumpCapturePolicy;
 use super::container_snapshot::ContainerSnapshot;
-use super::heap_global_snapshot::{HeapGlobalSnapshot, HeapSlab, RegionProvenance};
+use super::heap_global_snapshot::{
+    HeapGlobalSnapshot, HeapSlab, PreTruncParentAuthorityEvidence, PreTruncParentAuthorityKey,
+    PreTruncParentAuthorityStore, RegionProvenance,
+};
 use super::module_identity::ModuleIdentity;
 
 /// MIDA-SERIAL-14: reserved gate interface for sample-specific transforms.
@@ -2686,6 +2689,7 @@ pub fn validate_raw_coherence_capture_identities(
                 matches!(ext, CEK::ProbeWindow | CEK::InteriorSubview)
             }
             CP::StringBufferChild => ext == CEK::ProbeWindow,
+            CP::SplitSibling => ext == CEK::ProbeWindow && cap_prefix == "split_sibling",
             // ImageInline / Synthetic are not raw-coherence participants.
             CP::ImageInline | CP::Synthetic => false,
         };

@@ -206,6 +206,11 @@ pub enum CapturePath {
     StringBufferChild,
     /// Captured dangling edge (final walk).
     DanglingEdge,
+    /// MIDA-SERIAL-34: heap sibling promoted out of a swallowing parent by
+    /// `split_swallowed_siblings` (free-safe split). NOT MainSlot — MainSlot
+    /// semantically means an image/root slot read, and a split child is an
+    /// interior-discovered heap object with its own captured bytes.
+    SplitSibling,
     /// Image-inline object body (not a heap extent).
     ImageInline,
     /// Synthesized by an offline transform.
@@ -233,6 +238,404 @@ pub struct CaptureExtentEvidence {
     pub containing_parent_old_base: Option<u64>,
     /// Size of the containing parent, if any.
     pub containing_parent_size: Option<usize>,
+}
+
+/// MIDA-SERIAL-34: deterministic pre-trunc parent evidence captured by
+/// split_swallowed_siblings BEFORE the swallowing parent is truncated. This is
+/// the ONLY producer of containing_parent_old_base/size for split children.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SplitSiblingParentEvidence {
+    /// Pre-trunc old base of the swallowing parent (live allocation base).
+    pub pre_trunc_parent_old_base: Option<u64>,
+    /// Pre-trunc full size of the swallowing parent (before truncation).
+    pub pre_trunc_parent_size: Option<usize>,
+    /// Pre-trunc extent kind of the parent (must be ObservedAllocation /
+    /// BackingObject for a closure candidate; ProbeWindow / InteriorSubview /
+    /// SyntheticDerived never qualify).
+    pub pre_trunc_parent_extent: Option<CaptureExtentKind>,
+    /// Pre-trunc provenance of the parent (must not be SyntheticDerived).
+    pub pre_trunc_parent_provenance: Option<RegionProvenance>,
+    /// Parent capture identity (id + path) at pre-trunc time.
+    pub pre_trunc_parent_capture_id: Option<String>,
+    pub pre_trunc_parent_capture_path: Option<CapturePath>,
+}
+
+/// MIDA-SERIAL-34: the deterministic candidate-evidence record produced by
+/// split_swallowed_siblings for ONE split child. Replaces the lossy
+/// BTreeSet<u64> candidate set: every field needed to prove (or fail-closed)
+/// the split child's coverage is preserved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SplitSiblingCandidateEvidence {
+    /// The child value (heap address being split out).
+    pub child_value: u64,
+    /// Byte offset of the qword slot within the SOURCE snapshot that held
+    /// child_value (real slot offset — never a fixed constant).
+    pub source_slot_offset: Option<usize>,
+    /// Capture identity of the source snapshot that referenced the child.
+    pub source_capture_id: Option<String>,
+    /// Capture path of the source snapshot.
+    pub source_capture_path: Option<CapturePath>,
+    /// Source root RVA (when the source snapshot was image-rooted).
+    pub source_root_rva: Option<u32>,
+    /// MIDA-SERIAL-36: the set of DISTINCT source capture identities that
+    /// referenced this child (dedup by identity, never by occurrence).
+    pub source_identities: std::collections::BTreeSet<String>,
+    /// Number of distinct source snapshots whose qword slot referenced the
+    /// child (== source_identities.len()).
+    pub source_hit_count: usize,
+    /// Number of distinct parent snapshots (pre-trunc) that contained the child.
+    pub parent_hit_count: usize,
+    /// Pre-trunc parent evidence (present only when the parent is unique, strict
+    /// and its pre-trunc extent/provenance qualify).
+    pub parent: Option<SplitSiblingParentEvidence>,
+    /// Whether the child was interior to an already-captured object.
+    pub was_interior: bool,
+    /// The probe size requested for the child capture.
+    pub probe_requested_size: usize,
+}
+
+/// MIDA-SERIAL-35: a strict pre-trunc parent authority evidence record emitted
+/// by split_swallowed_siblings BEFORE the swallowing parent is truncated. This
+/// is the ONLY producer of full pre-trunc parent authority bytes. It flows out
+/// of the production capture (via detect_heap_globals) into
+/// build_authority_closure_candidates so a closure authority can be built from
+/// the REAL pre-trunc bytes — never from the truncated parent in the final
+/// heap_globals, never re-read, never guessed.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PreTruncParentAuthorityKey {
+    /// Pre-trunc old base of the strict parent (live allocation base).
+    pub parent_old_base: u64,
+    /// Pre-trunc full size of the strict parent.
+    pub parent_pre_trunc_size: usize,
+    /// Pre-trunc parent capture identity.
+    pub parent_capture_id: String,
+}
+
+/// MIDA-SERIAL-38: a producer-lifetime frozen identity of an eligible strict
+/// parent, captured ONCE before any split-round truncation. All children of the
+/// same original parent bind the SAME frozen key/bytes regardless of round or
+/// child processing order — the split producer never re-derives "pre-trunc"
+/// from an already-truncated snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrozenSplitParentIdentity {
+    /// Parent identity key (base + ORIGINAL pre-trunc size + capture id).
+    pub key: PreTruncParentAuthorityKey,
+    /// Original full pre-trunc bytes (immutable; frozen before any truncation).
+    /// MIDA-SERIAL-39: Arc-shared — ONE backing allocation; children clone the
+    /// Arc handle, never a full Vec.
+    pub full_bytes: std::sync::Arc<[u8]>,
+    /// Pre-trunc extent kind (must be ObservedAllocation / BackingObject).
+    pub extent: CaptureExtentKind,
+    /// Pre-trunc provenance (must not be SyntheticDerived).
+    pub provenance: RegionProvenance,
+    /// Pre-trunc capture path.
+    pub capture_path: CapturePath,
+    /// Whether the snapshot remains full (untruncated) at the current out view.
+    /// Starts true; cleared when a child splits it.
+    pub is_full: bool,
+}
+
+/// Resolve a snapshot as an eligible frozen parent using the FULL qualifying
+/// identity predicate (base, original size, capture_id, capture_path, extent,
+/// provenance) — never a loose find(base,size) that could select a
+/// ProbeWindow/SyntheticDerived twin with the same capture id.
+fn frozen_parent_from_snapshot(o: &HeapGlobalSnapshot) -> Option<FrozenSplitParentIdentity> {
+    if o.is_heap_handle || o.content.is_empty() {
+        return None;
+    }
+    if !matches!(
+        o.extent_kind,
+        CaptureExtentKind::ObservedAllocation | CaptureExtentKind::BackingObject
+    ) {
+        return None;
+    }
+    if matches!(o.provenance, RegionProvenance::SyntheticDerived { .. }) {
+        return None;
+    }
+    Some(FrozenSplitParentIdentity {
+        key: PreTruncParentAuthorityKey {
+            parent_old_base: o.live_ptr,
+            parent_pre_trunc_size: o.content.len(),
+            parent_capture_id: o.extent_evidence.capture_id.clone(),
+        },
+        // MIDA-SERIAL-39: ONE backing allocation from the snapshot content;
+        // all children share this Arc.
+        full_bytes: std::sync::Arc::from(o.content.as_slice()),
+        extent: o.extent_kind,
+        provenance: o.provenance.clone(),
+        capture_path: o.extent_evidence.capture_path,
+        is_full: true,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreTruncParentAuthorityEvidence {
+    /// Parent identity key into the authority store (resolves the shared bytes).
+    pub parent_key: PreTruncParentAuthorityKey,
+    /// Pre-trunc extent kind (must be ObservedAllocation / BackingObject).
+    pub parent_extent: CaptureExtentKind,
+    /// Pre-trunc provenance (must not be SyntheticDerived).
+    pub parent_provenance: RegionProvenance,
+    pub parent_capture_path: CapturePath,
+    /// The split child this parent authority binds to.
+    pub child_base: u64,
+    pub child_size: usize,
+    /// Producer/source binding: the source snapshot whose slot referenced the
+    /// child and the REAL slot byte offset.
+    pub source_capture_id: String,
+    pub source_slot_offset: Option<usize>,
+}
+
+/// MIDA-SERIAL-36: deduplicating store for pre-trunc parent authority bytes.
+///
+/// The same strict parent may back multiple split children. This store keeps
+/// ONE immutable copy of the parent's full pre-trunc bytes per distinct parent
+/// identity key (old_base, pre_trunc_size, capture_id), and produces one
+/// PreTruncParentAuthorityEvidence binding per child.
+///
+/// Rules:
+/// - same key + identical bytes -> reuse the stored bytes (dedup);
+/// - same key + DIFFERENT bytes -> fail-closed (never overwrite the first);
+/// - different capture identity at the same old_base -> SEPARATE entry
+///   (never merged by base alone).
+#[derive(Debug, Clone, Default)]
+pub struct PreTruncParentAuthorityStore {
+    /// key -> (bytes, extent, provenance, path). ONE byte copy per parent
+    /// identity (Arc-shared) — bindings and Path A hold no second Vec<u8>.
+    parents: std::collections::BTreeMap<
+        PreTruncParentAuthorityKey,
+        (
+            std::sync::Arc<[u8]>,
+            CaptureExtentKind,
+            RegionProvenance,
+            CapturePath,
+        ),
+    >,
+    /// Emitted child bindings (insertion order). Each holds only the key.
+    bindings: Vec<PreTruncParentAuthorityEvidence>,
+}
+
+/// MIDA-SERIAL-37: fail-closed conflict result of a bind/commit. A conflict is
+/// a HARD error: the split candidate must be REJECTED (child not admitted,
+/// parent not truncated, no evidence, no counters/seen residue) — never
+/// silently dropped.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PreTruncAuthorityError {
+    /// Same parent identity key recorded with DIFFERENT bytes/extent/provenance/path.
+    #[error(
+        "pre-trunc authority identity conflict: parent {parent_old_base:#x} size {parent_pre_trunc_size}          capture_id '{parent_capture_id}' bound with different bytes/extent/provenance/path"
+    )]
+    IdentityConflict {
+        parent_old_base: u64,
+        parent_pre_trunc_size: usize,
+        parent_capture_id: String,
+    },
+    /// Child binding recorded twice for the SAME (child_base, child_size).
+    #[error(
+        "pre-trunc authority child binding conflict: child {child_base:#x} size {child_size}          already bound (duplicate split child)"
+    )]
+    DuplicateChildBinding { child_base: u64, child_size: usize },
+}
+
+impl PreTruncParentAuthorityStore {
+    /// MIDA-SERIAL-37: prepare the parent identity (conflict check) BEFORE any
+    /// irreversible commit. Returns the key on success.
+    pub fn prepare_parent(
+        &self,
+        parent_old_base: u64,
+        parent_pre_trunc_size: usize,
+        parent_full_bytes: &[u8],
+        parent_extent: CaptureExtentKind,
+        parent_provenance: &RegionProvenance,
+        parent_capture_id: &str,
+        parent_capture_path: CapturePath,
+    ) -> Result<PreTruncParentAuthorityKey, PreTruncAuthorityError> {
+        let key = PreTruncParentAuthorityKey {
+            parent_old_base,
+            parent_pre_trunc_size,
+            parent_capture_id: parent_capture_id.to_string(),
+        };
+        if let Some((existing_bytes, eext, eprov, epath)) = self.parents.get(&key) {
+            if &existing_bytes[..] != parent_full_bytes
+                || *eext != parent_extent
+                || eprov != parent_provenance
+                || *epath != parent_capture_path
+            {
+                return Err(PreTruncAuthorityError::IdentityConflict {
+                    parent_old_base,
+                    parent_pre_trunc_size,
+                    parent_capture_id: parent_capture_id.to_string(),
+                });
+            }
+        }
+        Ok(key)
+    }
+
+    /// MIDA-SERIAL-37: prepare the CHILD binding (duplicate check).
+    pub fn prepare_child(
+        &self,
+        child_base: u64,
+        child_size: usize,
+    ) -> Result<(), PreTruncAuthorityError> {
+        if self
+            .bindings
+            .iter()
+            .any(|b| b.child_base == child_base && b.child_size == child_size)
+        {
+            return Err(PreTruncAuthorityError::DuplicateChildBinding {
+                child_base,
+                child_size,
+            });
+        }
+        Ok(())
+    }
+
+    /// MIDA-SERIAL-37: record ONE binding (parent must already be prepared).
+    pub fn record_binding(
+        &mut self,
+        key: PreTruncParentAuthorityKey,
+        parent_extent: CaptureExtentKind,
+        parent_provenance: RegionProvenance,
+        parent_capture_path: CapturePath,
+        child_base: u64,
+        child_size: usize,
+        source_capture_id: String,
+        source_slot_offset: Option<usize>,
+    ) -> PreTruncParentAuthorityEvidence {
+        let binding = PreTruncParentAuthorityEvidence {
+            parent_key: key,
+            parent_extent,
+            parent_provenance,
+            parent_capture_path,
+            child_base,
+            child_size,
+            source_capture_id,
+            source_slot_offset,
+        };
+        self.bindings.push(binding.clone());
+        binding
+    }
+
+    /// Record the parent's full bytes once (no-op when already recorded), from
+    /// an Arc — NO byte copy: the Arc is stored directly.
+    pub fn record_parent_arc(
+        &mut self,
+        key: &PreTruncParentAuthorityKey,
+        parent_full_bytes: std::sync::Arc<[u8]>,
+        parent_extent: CaptureExtentKind,
+        parent_provenance: RegionProvenance,
+        parent_capture_path: CapturePath,
+    ) {
+        self.parents.entry(key.clone()).or_insert_with(|| {
+            (
+                parent_full_bytes,
+                parent_extent,
+                parent_provenance,
+                parent_capture_path,
+            )
+        });
+    }
+
+    /// Resolve the shared Arc<[u8]> for a key — consumers can clone the Arc
+    /// without copying the bytes (Path A per-key single build).
+    pub fn lookup_arc(&self, key: &PreTruncParentAuthorityKey) -> Option<std::sync::Arc<[u8]>> {
+        self.parents.get(key).map(|(bytes, _, _, _)| bytes.clone())
+    }
+
+    /// Full metadata row for a key (extent, provenance, path).
+    pub fn parent_meta(
+        &self,
+        key: &PreTruncParentAuthorityKey,
+    ) -> Option<(CaptureExtentKind, RegionProvenance, CapturePath)> {
+        self.parents
+            .get(key)
+            .map(|(_, ext, prov, path)| (*ext, prov.clone(), *path))
+    }
+
+    /// Emitted child bindings, in insertion order.
+    pub fn bindings(&self) -> &[PreTruncParentAuthorityEvidence] {
+        &self.bindings
+    }
+}
+
+/// Test-only convenience accessors for [`PreTruncParentAuthorityStore`].
+/// Production paths use the Arc-based / prepare+record API; these helpers
+/// exist solely to make test assertions readable and are compiled out of
+/// non-test builds (no dead production surface).
+#[cfg(test)]
+impl PreTruncParentAuthorityStore {
+    /// Record the parent's full bytes once (no-op when already recorded). The
+    /// bytes are stored as ONE Arc<[u8]>; every later consumer shares it.
+    pub fn record_parent(
+        &mut self,
+        key: &PreTruncParentAuthorityKey,
+        parent_full_bytes: &[u8],
+        parent_extent: CaptureExtentKind,
+        parent_provenance: RegionProvenance,
+        parent_capture_path: CapturePath,
+    ) {
+        self.parents.entry(key.clone()).or_insert_with(|| {
+            (
+                std::sync::Arc::from(parent_full_bytes),
+                parent_extent,
+                parent_provenance,
+                parent_capture_path,
+            )
+        });
+    }
+
+    /// Resolve the FULL shared parent bytes for a key (Path A lookup).
+    pub fn lookup(&self, key: &PreTruncParentAuthorityKey) -> Option<&[u8]> {
+        self.parents.get(key).map(|(bytes, _, _, _)| bytes.as_ref())
+    }
+
+    /// Number of distinct parent identities (bytes stored once each).
+    pub fn parent_count(&self) -> usize {
+        self.parents.len()
+    }
+
+    /// Number of child bindings emitted.
+    pub fn binding_count(&self) -> usize {
+        self.bindings.len()
+    }
+
+    /// MIDA-SERIAL-37: ONE-call prepare + record. Err on conflict — the
+    /// caller MUST reject the candidate (fail-closed; never silently drop).
+    pub fn bind_child(
+        &mut self,
+        parent_old_base: u64,
+        parent_pre_trunc_size: usize,
+        parent_full_bytes: &[u8],
+        parent_extent: CaptureExtentKind,
+        parent_provenance: &RegionProvenance,
+        parent_capture_id: &str,
+        parent_capture_path: CapturePath,
+        child_base: u64,
+        child_size: usize,
+        source_capture_id: String,
+        source_slot_offset: Option<usize>,
+    ) -> Result<PreTruncParentAuthorityEvidence, PreTruncAuthorityError> {
+        let key = self.prepare_parent(
+            parent_old_base,
+            parent_pre_trunc_size,
+            parent_full_bytes,
+            parent_extent,
+            parent_provenance,
+            parent_capture_id,
+            parent_capture_path,
+        )?;
+        self.prepare_child(child_base, child_size)?;
+        Ok(self.record_binding(
+            key,
+            parent_extent,
+            parent_provenance.clone(),
+            parent_capture_path,
+            child_base,
+            child_size,
+            source_capture_id,
+            source_slot_offset,
+        ))
+    }
 }
 
 /// `old=live_ptr(=image_base+rva) → new=image_base+rva` so child edges that
@@ -2761,7 +3164,7 @@ pub fn synthetic_request_digest(req: &SyntheticRegionRequest) -> String {
     // Domain separation: a fixed marker distinguishes this encoding from any
     // other digest input.
     enc.extend_from_slice(b"mida.synthetic-request/v1\0");
-    let mut put_str = |s: &str, enc: &mut Vec<u8>| {
+    let put_str = |s: &str, enc: &mut Vec<u8>| {
         enc.extend_from_slice(&(s.len() as u64).to_le_bytes());
         enc.extend_from_slice(s.as_bytes());
     };
@@ -9514,8 +9917,8 @@ mod tests {
         use crate::dumper::heap_global_snapshot::HeapSlab;
         use crate::dumper::raw_slab_coherence::{self, RawChild, RawChildKind};
         use crate::dumper::runtime_rebase::{
-            self, build_runtime_rebase_plan, declared_slots_from_capture,
-            validate_runtime_rebase_plan, ExternalResolverTable, PointerClassification,
+            build_runtime_rebase_plan, declared_slots_from_capture, validate_runtime_rebase_plan,
+            ExternalResolverTable, PointerClassification,
         };
         let child_size = 0x70usize;
         let slab_base: u64 = 0x874000;

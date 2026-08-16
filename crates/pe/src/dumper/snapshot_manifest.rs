@@ -467,6 +467,7 @@ pub(crate) fn render_manifest_json(
                 "gscript_label_table_entry"
             }
             super::heap_global_snapshot::CapturePath::StringBufferChild => "string_buffer_child",
+            super::heap_global_snapshot::CapturePath::SplitSibling => "split_sibling",
             super::heap_global_snapshot::CapturePath::DanglingEdge => "dangling_edge",
             super::heap_global_snapshot::CapturePath::ImageInline => "image_inline",
             super::heap_global_snapshot::CapturePath::Synthetic => "synthetic",
