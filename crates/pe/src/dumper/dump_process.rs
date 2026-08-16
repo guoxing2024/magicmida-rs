@@ -1195,23 +1195,18 @@ pub fn dump_process_with_report(
         .iter()
         .map(|n| (n.slab.old_base, n.role, n.normalization))
         .collect();
-    // Reconcile duplicate captures against the FIRST (main) authoritative slab when
-    // present (the physical-memory ground truth), BEFORE snapshotting raw children.
-    // Runs on RAW snapshots before any transform.
-    if let Some(main) = main_slab.as_ref() {
-        // Route V R0 (V0-A): stage telemetry.
-        let _g = super::stage_timing::StageGuard::begin("reconcile_duplicate_heap_globals");
-        super::heap_global_snapshot::reconcile_duplicate_heap_globals(
-            &mut heap_globals,
-            Some(main),
-        );
-        // Route Y R1 GTO R1: retroactive pairwise window-overlap trim on RAW
-        // captures (before raw children / overlay are built). Adjacent heap
-        // objects admitted via different paths (child-link force-admit vs
-        // label-table exhaust) can have overlapping probe windows; the overlay
-        // would otherwise fail-closed on a transformed write conflict.
-        super::heap_global_snapshot::trim_overlapping_heap_global_windows(&mut heap_globals);
-        drop(_g);
+    // MIDA-SERIAL-34 invariant: the authoritative set and the normalization
+    // ledger must be EXACTLY one-to-one. Any drift fails closed here — never
+    // hidden by get(i).unwrap_or_default() at manifest time.
+    if authoritative_slabs.len() != slab_normalization_ledger.len() {
+        return Err(PeError::GtoStage {
+            stage: "capture_slab_normalize".into(),
+            error: format!(
+                "authoritative_slabs/ledger drift: {} slabs vs {} ledger entries",
+                authoritative_slabs.len(),
+                slab_normalization_ledger.len()
+            ),
+        });
     }
     let mut raw_capture: Option<super::raw_slab_coherence::RawSlabCapture> = None;
     if no_bypass && stage_plan.detect_heap_globals && !authoritative_slabs.is_empty() {
@@ -1704,6 +1699,23 @@ pub fn dump_process_with_report(
     }
     if !all_slabs.is_empty() {
         capture_transforms.push(("heap_slab_overlay", "capture"));
+    }
+    // MIDA-SERIAL-34/35 invariant: the patched (overlaid) slab set must be
+    // EXACTLY one-to-one with the authoritative slab set (same order, same
+    // identity). Any drift fails closed — never hidden by
+    // get(i).unwrap_or_default() at manifest time.
+    // MIDA-SERIAL-35 (P1-3): when a raw capture was established, the patched
+    // set MUST have the same cardinality — authoritative non-empty + all_slabs
+    // empty is a hard failure, never a silent sidecar.
+    if raw_capture.is_some() && (all_slabs.len() != authoritative_slabs.len()) {
+        return Err(PeError::GtoStage {
+            stage: "raw_slab_overlay".into(),
+            error: format!(
+                "patched/authoritative slab drift: {} patched vs {} authoritative (raw_capture established)",
+                all_slabs.len(),
+                authoritative_slabs.len()
+            ),
+        });
     }
     // NOTE: the probe/interior coverage gate (`capture_coverage_bind`) ran
     // IMMEDIATELY after `capture_identity_bind`, BEFORE any transform / overlay /
@@ -2409,13 +2421,30 @@ pub fn dump_process_with_report(
         }
     }
 
-    // Atomic-ish emit: write exclusive temp beside target, re-check alias on
-    // the temp identity path, then rename. Narrows check/write TOCTOU where
-    // a hard link can be planted after the alias probe (audit residual).
-    write_output_atomic(
-        &opts.output_path,
-        &out_data,
-        opts.executable_path.as_deref(),
+    // MIDA-SERIAL-36/37: PRE-EMIT slab bijection gate (helper: testable).
+    // When a raw capture was established, the FULL bijection
+    // (ledger/raw/patched cardinality + per-index base + content length +
+    // order) MUST hold BEFORE any output artifact is created. On failure: no
+    // output candidate, no transform manifest, no "Dump written successfully"
+    // — the dump aborts at stage pre_emit_slab_bijection.
+    // MIDA-SERIAL-38: gate + writer as one unit (writer runs ONLY after the
+    // gate passes). The writer is the atomic emit; the manifest write follows
+    // after, still fail-closed on cleanup.
+    pre_emit_then_write(
+        raw_capture.as_ref(),
+        &slab_normalization_ledger,
+        &authoritative_slabs,
+        &all_slabs,
+        || {
+            // Atomic-ish emit: write exclusive temp beside target, re-check
+            // alias on the temp identity path, then rename. Narrows check/write
+            // TOCTOU where a hard link can be planted after the alias probe.
+            write_output_atomic(
+                &opts.output_path,
+                &out_data,
+                opts.executable_path.as_deref(),
+            )
+        },
     )?;
 
     // Always emit a bound transform manifest (empty ledger for clean dumps) so
@@ -2454,49 +2483,62 @@ pub fn dump_process_with_report(
     // declared set are ONE shared set (TAF1-F). Each normalized slab's raw digest
     // comes from `authoritative_slabs` (pre-overlay), its patched digest from
     // `all_slabs` (post-overlay), aligned by sequence/index.
+    // MIDA-SERIAL-35 (P1-3): the manifest ledger is built ONLY when a raw
+    // capture was established (raw coherence provable). Without a raw capture,
+    // NO authority evidence is claimed — an empty ledger is the explicit
+    // no-raw/no-overlay manifest behavior. Empty digests / size=0 are never
+    // emitted as valid authority evidence.
     let authoritative_slab_ledger: Vec<super::snapshot_manifest::AuthoritativeSlabLedgerEntry> =
-        slab_normalization_ledger
-            .iter()
-            .enumerate()
-            .map(|(i, (base, role, norm))| {
-                let raw_digest = authoritative_slabs
-                    .get(i)
-                    .map(|s| {
-                        let mut h = sha2::Sha256::new();
-                        h.update(&s.content);
-                        format!("{:x}", h.finalize())
-                    })
-                    .unwrap_or_default();
-                let patched_digest = all_slabs
-                    .get(i)
-                    .map(|s| {
-                        let mut h = sha2::Sha256::new();
-                        h.update(&s.content);
-                        format!("{:x}", h.finalize())
-                    })
-                    .unwrap_or_default();
-                let normalization = match norm {
-                    super::raw_slab_coherence::SlabNormalization::Kept => "kept",
-                    super::raw_slab_coherence::SlabNormalization::Deduplicated => "deduplicated",
-                    super::raw_slab_coherence::SlabNormalization::ContainedExactAlias => {
-                        "contained_exact_alias"
+        if raw_capture.is_none() {
+            Vec::new()
+        } else {
+            // 1:1 cardinality + per-index base/size alignment re-verified AT THE
+            // MANIFEST BOUNDARY via the shared bijection validator so drift can
+            // never reach the sidecar (the invariants above already hold, but
+            // this is the last gate before writing).
+            super::raw_slab_coherence::validate_slab_bijection(
+                &slab_normalization_ledger,
+                &authoritative_slabs,
+                &all_slabs,
+            )
+            .map_err(|e| PeError::GtoStage {
+                stage: "manifest_construction".into(),
+                error: e,
+            })?;
+            slab_normalization_ledger
+                .iter()
+                .zip(authoritative_slabs.iter())
+                .zip(all_slabs.iter())
+                .enumerate()
+                .map(|(i, (((base, role, norm), raw_s), patched_s))| {
+                    let mut raw_h = sha2::Sha256::new();
+                    raw_h.update(&raw_s.content);
+                    let raw_digest = format!("{:x}", raw_h.finalize());
+                    let mut patched_h = sha2::Sha256::new();
+                    patched_h.update(&patched_s.content);
+                    let patched_digest = format!("{:x}", patched_h.finalize());
+                    let normalization = match norm {
+                        super::raw_slab_coherence::SlabNormalization::Kept => "kept",
+                        super::raw_slab_coherence::SlabNormalization::Deduplicated => {
+                            "deduplicated"
+                        }
+                        super::raw_slab_coherence::SlabNormalization::ContainedExactAlias => {
+                            "contained_exact_alias"
+                        }
+                    };
+                    super::snapshot_manifest::AuthoritativeSlabLedgerEntry {
+                        sequence: i,
+                        role,
+                        old_base: *base,
+                        size: raw_s.content.len(),
+                        raw_digest,
+                        patched_digest,
+                        normalization,
+                        source: role,
                     }
-                };
-                super::snapshot_manifest::AuthoritativeSlabLedgerEntry {
-                    sequence: i,
-                    role,
-                    old_base: *base,
-                    size: authoritative_slabs
-                        .get(i)
-                        .map(|s| s.content.len())
-                        .unwrap_or(0),
-                    raw_digest,
-                    patched_digest,
-                    normalization,
-                    source: role,
-                }
-            })
-            .collect();
+                })
+                .collect()
+        };
     // Route V R0 (V0-A): stage telemetry for manifest construction.
     let mut _ms = super::stage_timing::StageStats::default();
     _ms.item_count = authoritative_slab_ledger.len();
@@ -3271,6 +3313,62 @@ pub fn write_bound_transform_manifest(
         "wrote bound transform_manifest"
     );
     Ok(())
+}
+
+/// MIDA-SERIAL-37: the pre-emit slab bijection gate, extracted so a test can
+/// prove the writer is NOT called when the bijection drifts. When a raw capture
+/// was established, the FULL bijection (ledger/raw/patched cardinality +
+/// per-index base + content length + order) MUST hold BEFORE any output
+/// artifact is created. On failure: no output candidate, no transform
+/// manifest — the dump aborts at stage pre_emit_slab_bijection.
+pub(crate) fn pre_emit_slab_bijection_gate(
+    raw_capture: Option<&super::raw_slab_coherence::RawSlabCapture>,
+    slab_normalization_ledger: &[(
+        u64,
+        &'static str,
+        super::raw_slab_coherence::SlabNormalization,
+    )],
+    authoritative_slabs: &[super::heap_global_snapshot::HeapSlab],
+    all_slabs: &[super::heap_global_snapshot::HeapSlab],
+) -> Result<(), PeError> {
+    if raw_capture.is_some() {
+        super::raw_slab_coherence::validate_slab_bijection(
+            slab_normalization_ledger,
+            authoritative_slabs,
+            all_slabs,
+        )
+        .map_err(|e| PeError::GtoStage {
+            stage: "pre_emit_slab_bijection".into(),
+            error: e,
+        })?;
+    }
+    Ok(())
+}
+
+/// MIDA-SERIAL-38: pre-emit gate + writer in one testable unit. The writer is a
+/// closure invoked ONLY after the gate passes — a real call-count spy can prove
+/// the writer never runs when the bijection drifts.
+pub(crate) fn pre_emit_then_write<F>(
+    raw_capture: Option<&super::raw_slab_coherence::RawSlabCapture>,
+    slab_normalization_ledger: &[(
+        u64,
+        &'static str,
+        super::raw_slab_coherence::SlabNormalization,
+    )],
+    authoritative_slabs: &[super::heap_global_snapshot::HeapSlab],
+    all_slabs: &[super::heap_global_snapshot::HeapSlab],
+    writer: F,
+) -> Result<(), PeError>
+where
+    F: FnOnce() -> Result<(), PeError>,
+{
+    pre_emit_slab_bijection_gate(
+        raw_capture,
+        slab_normalization_ledger,
+        authoritative_slabs,
+        all_slabs,
+    )?;
+    writer()
 }
 
 fn write_output_atomic(output: &Path, data: &[u8], input: Option<&Path>) -> Result<(), PeError> {
@@ -4740,5 +4838,84 @@ mod transform_manifest_tests {
             .expect("manifest must be valid JSON");
         assert_eq!(parsed["schema_version"], "mida.transform-manifest/v0");
         assert_eq!(parsed["taxonomy_version"], "mida.transform-taxonomy/v1");
+    }
+
+    /// MIDA-SERIAL-37/38 (P2-1): pre-emit bijection drift must FAIL the gate AND
+    /// the writer callback must NOT be invoked — proven by a REAL call counter.
+    /// On drift: counter==0, output/manifest/temp absent. On clean bijection:
+    /// counter==1. The production call order (gate -> writer) is preserved by
+    /// pre_emit_then_write.
+    #[test]
+    fn pre_emit_bijection_drift_blocks_writer_no_output() {
+        use super::super::heap_global_snapshot::HeapSlab;
+        use super::super::raw_slab_coherence::{RawSlabCapture, SlabNormalization};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mk = |base: u64, len: usize| {
+            let mut c = vec![0u8; len];
+            c[0] = (base & 0xff) as u8;
+            HeapSlab {
+                old_base: base,
+                content: c,
+            }
+        };
+        let ledger: Vec<(u64, &'static str, SlabNormalization)> = vec![
+            (0x850000, "main", SlabNormalization::Kept),
+            (0x860000, "parent_closure", SlabNormalization::Kept),
+        ];
+        let authoritative = vec![mk(0x850000, 0x1000), mk(0x860000, 0x800)];
+        // Patched set drifts: same cardinality, swapped base order.
+        let all_slabs = vec![mk(0x860000, 0x800), mk(0x850000, 0x1000)];
+        let raw = RawSlabCapture {
+            slabs: authoritative.clone(),
+            children: Vec::new(),
+        };
+        let dir = temp("preemit");
+        let output = dir.join("candidate.exe");
+        let manifest = output.with_extension("transform_manifest.json");
+        // DRIFT: real writer callback counter must stay 0.
+        let calls = AtomicUsize::new(0);
+        let err = pre_emit_then_write(Some(&raw), &ledger, &authoritative, &all_slabs, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            std::fs::write(&output, b"candidate").map_err(PeError::Io)
+        })
+        .expect_err("bijection drift must fail before the writer");
+        let text = format!("{err}");
+        assert!(text.contains("pre_emit_slab_bijection"), "stage: {text}");
+        assert!(text.contains("base mismatch"), "drift reason: {text}");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "writer callback must NOT run on drift"
+        );
+        assert!(!output.exists(), "output must NOT exist");
+        assert!(!manifest.exists(), "manifest must NOT exist");
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("mida.tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no writer temp residuals: {leftovers:?}"
+        );
+        // CLEAN bijection: writer callback runs exactly once.
+        let ok_all = vec![mk(0x850000, 0x1000), mk(0x860000, 0x800)];
+        let calls2 = AtomicUsize::new(0);
+        pre_emit_then_write(Some(&raw), &ledger, &authoritative, &ok_all, || {
+            calls2.fetch_add(1, Ordering::SeqCst);
+            std::fs::write(&output, b"candidate").map_err(PeError::Io)
+        })
+        .expect("clean bijection passes and writes");
+        assert_eq!(calls2.load(Ordering::SeqCst), 1, "writer runs exactly once");
+        assert!(output.exists(), "clean path writes the output");
+        // No raw capture -> gate no-op, writer still runs (OreansClassic).
+        let calls3 = AtomicUsize::new(0);
+        pre_emit_then_write(None, &ledger, &authoritative, &all_slabs, || {
+            calls3.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .expect("no raw capture -> gate no-op, writer runs");
+        assert_eq!(calls3.load(Ordering::SeqCst), 1);
     }
 }

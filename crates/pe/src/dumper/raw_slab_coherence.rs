@@ -1035,7 +1035,7 @@ impl TransformPreimageBinding {
     /// ambiguity and fails closed before any binding resolution.
     pub fn validate_identity_consistency(&self) -> Result<(), OverlayError> {
         let id = &self.identity;
-        let mut mismatch = |field: &str, legacy: String, identity: String| {
+        let mismatch = |field: &str, legacy: String, identity: String| {
             OverlayError::BindingIdentityInconsistent {
                 child_old_base: self.child_old_base,
                 child_kind: self.child_kind,
@@ -4056,7 +4056,7 @@ pub fn build_patched_backing_slab(
             // Non-write drift runs (C[i]!=S[i] where T[i]==C[i]) are accepted:
             // the authoritative slab byte wins (B[i]=S[i]); record a drift run.
             let mut run_start: Option<usize> = None;
-            let mut flush = |start: usize, end: usize, drift_runs: &mut Vec<CaptureDriftRun>| {
+            let flush = |start: usize, end: usize, drift_runs: &mut Vec<CaptureDriftRun>| {
                 let child_off = start - slab_offset_us;
                 let len = end - start;
                 drift_runs.push(CaptureDriftRun {
@@ -5264,7 +5264,7 @@ pub fn build_patched_backing_slab_q0c(
             // change that byte). Recorded as NonWriteSlabAuthoritative; the slab
             // byte wins and is the backing seed.
             let mut run_start: Option<usize> = None;
-            let mut flush = |start: usize, end: usize, drift_runs: &mut Vec<CaptureDriftRun>| {
+            let flush = |start: usize, end: usize, drift_runs: &mut Vec<CaptureDriftRun>| {
                 let child_off = start - slab_offset_us;
                 let len = end - start;
                 drift_runs.push(CaptureDriftRun {
@@ -10034,6 +10034,51 @@ mod tests {
         // The ledger proves the runtime/overlay/manifest slab sets are consistent:
         // exactly one slab, whose raw and patched digests are both recorded.
         assert!(json.contains("\"authoritative_slab_ledger\""));
+    }
+
+    // T0.2 schema note: a parent_closure role survives the manifest roundtrip
+    // verbatim (producer -> JSON -> parser), so consumers can distinguish a
+    // pre-trunc parent-closure authority from main/dedicated slabs.
+    #[test]
+    fn manifest_roundtrip_preserves_parent_closure_role() {
+        use super::super::snapshot_manifest::AuthoritativeSlabLedgerEntry;
+        let slab_ledger = vec![AuthoritativeSlabLedgerEntry {
+            sequence: 0,
+            role: "parent_closure",
+            old_base: 0x850000,
+            size: 0x1000,
+            raw_digest: sha256_hex(&vec![0xABu8; 0x1000]),
+            patched_digest: String::new(), // not overlaid
+            normalization: "kept",
+            source: "parent_closure",
+        }];
+        let json = crate::dumper::snapshot_manifest::render_manifest_json(
+            std::path::Path::new("cand.exe"),
+            crate::dumper::types::DumpProfile::AhkGtoExperimental,
+            0x140000000,
+            0x70b0,
+            &[],
+            &[],
+            &crate::dumper::capture_policy::DumpCapturePolicy::ahk_gto_default(),
+            false,
+            None,
+            &[],
+            &[],
+            &[],
+            &TransformRunLedger::default(),
+            &[],
+            &[],
+            &slab_ledger,
+            &[],
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid manifest JSON");
+        let entry = &v["authoritative_slab_ledger"][0];
+        assert_eq!(entry["role"], "parent_closure");
+        assert_eq!(entry["source"], "parent_closure");
+        assert_eq!(entry["old_base"], "0x850000");
+        assert_eq!(entry["size"], 0x1000);
+        assert_eq!(entry["normalization"], "kept");
     }
 
     // ==================== Route T R0 Audit Fix 2 (TAF2) tests ====================

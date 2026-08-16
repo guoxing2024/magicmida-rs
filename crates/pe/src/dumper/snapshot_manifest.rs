@@ -24,14 +24,23 @@ pub(crate) const SCHEMA_VERSION_V0: &str = "mida.dump-snapshot-manifest/v0";
 
 /// Route T R0 AF2 (TAF2-E): a single authoritative-slab ledger entry. Records the
 /// slab's identity (base/size), its raw (captured) digest, its patched (after
-/// overlay) digest, its role (main / dedicated / alias), its normalization, and
-/// the source. This proves the runtime slab set == overlay slab set == manifest
-/// declared set (TAF1-F).
+/// overlay) digest, its role (main / dedicated / parent_closure), its
+/// normalization, and the source. This proves the runtime slab set == overlay
+/// slab set == manifest declared set (TAF1-F).
+///
+/// Schema note (producer -> manifest): `role` and `source` are the TRUE capture
+/// roles emitted by the pipeline — `"main"` (main heap slab), `"dedicated"`
+/// (dangling-edge slab) or `"parent_closure"` (pre-trunc parent authority
+/// closure slab derived by `build_authority_closure_candidates`). `"alias"` is
+/// a NORMALIZATION concept (a dropped input that was an exact duplicate /
+/// contained-same-bytes alias of a survivor) and is never emitted as a role;
+/// it appears only as `normalization_events[].relationship`. Consumers must
+/// accept exactly these three roles and fail closed on anything else.
 #[derive(Debug, Clone)]
 pub struct AuthoritativeSlabLedgerEntry {
     /// Sequence (index into the normalized slab set).
     pub sequence: usize,
-    /// Role: "main" | "dedicated" | "alias".
+    /// Role: "main" | "dedicated" | "parent_closure" (see struct note).
     pub role: &'static str,
     /// Old base of the slab.
     pub old_base: u64,
@@ -44,7 +53,7 @@ pub struct AuthoritativeSlabLedgerEntry {
     pub patched_digest: String,
     /// Normalization: kept | deduplicated | contained_exact_alias.
     pub normalization: &'static str,
-    /// Source: "main" | "dedicated".
+    /// Source: "main" | "dedicated" | "parent_closure" (same set as role).
     pub source: &'static str,
 }
 
