@@ -42,6 +42,12 @@ ADR-2 为每个 surface 增加四个 proof level（互斥，按证据强度从�
 **硬规则：** 禁止因为"导入了 API"就把它加入 required hooks。
 仅有 `presence_observed=true` 的 surface，action 只能是 `observe-only` 或 `defer`。
 
+### 2.1 required 两级语义（ADR-3 引入）
+
+- **hard_required**：必须安装 hook；缺失 → `AntiDebugRuntimePartialHooks`。只能来自 confirmed call site / confirmed runtime observation / confirmed decision semantics。
+- **required_candidate**：有初步证据（call-site presence 或同检测面强证据），值得在 controller/runtime 接线时验证；**不表示**已必须安装 hook。满足 `call_site_confirmed` / `runtime_observed` / `decision_semantics_confirmed` 之一后升级为 hard_required；升级必须产生 profile revision、promotion evidence、profile digest 变化、审计记录。验证失败则降 observe-only。
+- candidate 被误当 hard required 必须在 profile resolver 中拒绝（ADR-3 §3.2）。
+
 ## 3. 行为规范对象
 
 ### 3.1 AntiDebugObservation（`mida.antidebug-observation/v1`）

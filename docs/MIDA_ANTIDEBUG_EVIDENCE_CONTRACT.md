@@ -45,6 +45,7 @@
 
 - `expected_surfaces` 枚举目标实际检查的 surface（来自 MIDA-ADR-1 inventory，不由 ScyllaHide 支持集反推）。
 - `required_hooks` = profile 声明需要安装的 hook 总数；runtime attestation 必须满足 `hooks_installed == required_hooks`。
+- **required 两级（ADR-3 引入）**：`hard_required_surfaces`（必须安装；缺失 → `AntiDebugRuntimePartialHooks`）与 `required_candidate_surfaces`（接线时验证；满足 call_site_confirmed / runtime_observed / decision_semantics_confirmed 之一后升级 hard_required，升级产生 profile revision + promotion evidence + digest 变化 + 审计记录；失败降 observe-only）。
 - `fail_if_missing` 恒 true（第一阶段）。允许显式降级仅当 profile 修订记录证据（含差分对照），且 attestation 记录降级事实。
 - 每个 profile 有 `profile_digest`（规范化 JSON 的 SHA-256），runtime 编译期绑定；controller 校验一致。
 

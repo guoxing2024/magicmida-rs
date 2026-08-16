@@ -9,7 +9,9 @@
 
 - 每个样本独立 profile；**禁止**用一个共享 profile 覆盖两样本差异。
 - unknown surface 不进入 required。
-- required 只能来自 confirmed call site / confirmed runtime observation / confirmed decision semantics。
+- required 分为两级（ADR-3 引入，见 MIDA_ADR_3_CONTROLLER_RUNTIME_DESIGN.md §2）：
+  - **hard_required**：必须安装 hook；缺失 → `AntiDebugRuntimePartialHooks`。只能来自 confirmed call site / confirmed runtime observation / confirmed decision semantics。
+  - **required_candidate**：有初步证据，值得在 controller/runtime 接线时验证；**不表示**已必须安装 hook。满足 `call_site_confirmed` / `runtime_observed` / `decision_semantics_confirmed` 之一后升级为 hard_required（升级产生 profile revision + promotion evidence + digest 变化 + 审计记录）；验证失败则降 observe-only。
 - origin 结论不得复制到 lunlun（lunlun 原程序面不可见 → 保守）。
 
 ## 2. origin_macro_profile（`mida.antidebug-profile/v1`）
@@ -20,11 +22,13 @@
   "profile_id": "oreans_origin_x64_v1",
   "sample_id": "origin_macro",
   "architecture": "x86_64",
-  "required_surfaces": [
+  "hard_required_surfaces": [
     "AD-PROC-002",   // PEB.BeingDebugged — decision confirmed (live behavior)
-    "AD-PROC-003",   // PEB.pShimData — decision confirmed (live behavior)
-    "AD-PROC-001"    // IsDebuggerPresent — REQUIRED CANDIDATE (IAT presence + same detection plane;
-                     //   lock-in requires call_site_confirmed or decision_semantics_confirmed at ADR-3)
+    "AD-PROC-003"    // PEB.pShimData — decision confirmed (live behavior)
+  ],
+  "required_candidate_surfaces": [
+    "AD-PROC-001"    // IsDebuggerPresent — candidate only (IAT presence + same detection plane;
+                     //   lock-in requires call_site_confirmed or decision_semantics_confirmed at ADR-3 wiring)
   ],
   "observe_only_surfaces": [
     "AD-PROC-004", "AD-PROC-005", "AD-THR-001", "AD-THR-003",
@@ -55,10 +59,11 @@ AD-PROC-001 为 required 候选（保留项），锁定条件见 PROBE_CATALOG �
   "profile_id": "oreans_lunlun_x64_v1",
   "sample_id": "lunlun_software",
   "architecture": "x86_64",
-  "required_surfaces": [
+  "hard_required_surfaces": [
     "AD-PROC-002",   // PEB.BeingDebugged — decision confirmed (live behavior)
     "AD-PROC-003"    // PEB.pShimData — decision confirmed (live behavior)
   ],
+  "required_candidate_surfaces": [],
   "observe_only_surfaces": [
     "AD-PROC-001", "AD-PROC-004", "AD-PROC-005",
     "AD-THR-001", "AD-THR-003",
@@ -91,17 +96,19 @@ AD-PROC-001 为 required 候选（保留项），锁定条件见 PROBE_CATALOG �
 | 项 | origin_macro | lunlun_software |
 |---|---|---|
 | profile_id | oreans_origin_x64_v1 | oreans_lunlun_x64_v1 |
-| required | 3（含 AD-PROC-001 候选） | 2 |
+| hard_required | 2（AD-PROC-002/003） | 2（AD-PROC-002/003） |
+| required_candidate | 1（AD-PROC-001） | 0 |
 | observe-only | 15 | 16 |
 | deferred | 6 | 6 |
-| AD-PROC-001 | required 候选（IAT presence + 同检测面） | observe-only（IAT 未重建） |
+| AD-PROC-001 | required_candidate（IAT presence + 同检测面；ADR-3 接线时验证升级） | observe-only（IAT 未重建） |
 | AD-TIM-002/003/004、AD-EXC-001 | observe-only（IAT presence 仅） | defer（无 IAT 证据） |
 
 ## 5. 锁定条件（ADR-3 接线时执行，本任务不执行）
 
-- AD-PROC-001（origin）：受控动态验证 IsDebuggerPresent 调用点 → `call_site_confirmed` 或 `decision_semantics_confirmed` 后锁定 required；否则降 observe-only。
-- 任何 observe-only → required 升级：必须新增 call-site / runtime / decision 证据并更新本 profile 版本。
+- AD-PROC-001（origin）：受控动态验证 IsDebuggerPresent 调用点 → `call_site_confirmed` 或 `decision_semantics_confirmed` 后由 required_candidate 升级为 hard_required（产生 profile revision + promotion evidence + digest 变化 + 审计记录）；否则降 observe-only。
+- 任何 observe-only → required_candidate/hard_required 升级：必须新增 call-site / runtime / decision 证据并更新本 profile 版本。
 - 任何 defer → 激活：必须由独立任务（如 ADR-5 TLS、未来动态探针）提供证据。
+- required_candidate ≠ hard_required：candidate 在接线验证前不得安装为必需 hook。
 
 ## 6. Fail-closed 映射
 
