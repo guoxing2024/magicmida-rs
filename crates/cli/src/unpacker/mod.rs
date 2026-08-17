@@ -19,6 +19,7 @@
 //!    ??//!  dump to file ─??postprocess (data sections / shrink) ─??cleanup
 //! ```
 
+mod antidebug_controller;
 mod av_handler;
 mod av_query;
 pub mod bundle_assembler;
@@ -61,18 +62,14 @@ use mida_core::{
     ContinueStatus, CreateProcessOptions, DebugEvent, DebuggerCore, HwbpType, OepProvenance,
     PackerPlugin, PluginAdvice, PluginCtx, PreferredBase, UnpackPhase,
 };
-use mida_packers_themida::{
-    handle_nt_set_information_thread, init_pe_details, inject_scylla_hide, ScyllaHideConfig,
-    ThemidaState,
-};
+use mida_packers_themida::{handle_nt_set_information_thread, init_pe_details, ThemidaState};
 use mida_pe::{ContainerRestoreMode, DumpProfile, OepPolicy, PeHeader};
 
 use av_handler::{handle_access_violation, AvAction};
 use early_snapshots::capture_early_section_snapshots;
 use helpers::{
     dotnet_dump_and_dump_output, handle_hw_breakpoint, pe_section_name_remote_rva,
-    resolve_api_addrs, resolve_host_api, resolve_output_path, scylla_hook_path,
-    scylla_injector_path,
+    resolve_api_addrs, resolve_host_api, resolve_output_path,
 };
 use iat_trace::{handle_trace_step, TracePhase};
 use loop_state::LoopState;
@@ -586,7 +583,59 @@ pub fn unpack(
     // Observe the freely running primary thread, freeze it on its first
     // transfer into decrypted .text, then go straight to the dump phase.
     // Body: `post_attach::run_post_attach_path`.
+    //
+    // MIDA-ADR-3B: this path produces candidates, so it must NOT bypass the
+    // anti-debug controller gate. The post-attach launch has no debug port
+    // (debugger presence is structurally invisible), but we cannot assert
+    // the target performs no other anti-debug checks without a MIDA runtime.
+    // Until the runtime exists (ADR-4+), this path fails closed exactly like
+    // the CREATE_PROCESS path: AntiDebugRuntimeUnavailable, structured
+    // evidence, no candidate.
     if post_attach_mode {
+        let evidence_dir = output_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let mut ad_controller = antidebug_controller::AntidebugController::new(
+            antidebug_controller::AntidebugStageOptions {
+                sample_id: None,
+                target_pid: dbg.pid(),
+                evidence_dir: Some(evidence_dir.clone()),
+                oracle: None,
+            },
+        );
+        let outcome = ad_controller.run();
+        if let antidebug_controller::AntidebugOutcome::Failed {
+            state,
+            fail_code,
+            message,
+        } = outcome
+        {
+            let evidence = antidebug_controller::AntidebugFailureEvidence {
+                schema: antidebug_controller::ANTIDEBUG_EVIDENCE_SCHEMA.to_string(),
+                controller_state_before: "Unresolved".to_string(),
+                failure_state: format!("{state:?}"),
+                fail_code: fail_code.as_str().to_string(),
+                sample_id: None,
+                target_pid: Some(dbg.pid()),
+                runtime_identity: None,
+                profile_id: None,
+                profile_digest: None,
+                sequence: ad_controller.evidence().len() as u32,
+                cleanup_result: "drop-cleanup".to_string(),
+                candidate_created: false,
+            };
+            if let Err(ew) = antidebug_controller::write_failure_evidence(&evidence, &evidence_dir)
+            {
+                return Err(anyhow::anyhow!(
+                    "anti-debug failure evidence write failed: {ew:#}; original: {message}"
+                ));
+            }
+            return Err(anyhow::anyhow!(
+                "post-attach blocked by anti-debug lifecycle: {message} (state={state:?} fail_code={})",
+                fail_code.as_str(),
+            ));
+        }
         run_post_attach_path(
             &mut dbg,
             &mut state,
@@ -906,21 +955,74 @@ pub fn unpack(
                     // process ??valid in the target on x64).
                     let apis = resolve_api_addrs()?;
 
-                    // Apply ScyllaHide.  Capture hook_delay_ms BEFORE the move
-                    // into inject_scylla_hide so we can reuse it for the post-
-                    // injection settle sleep below.
-                    let injector_path = scylla_injector_path();
-                    let hook_delay_ms: u64 = 500;
-                    let scylla_config = ScyllaHideConfig {
-                        injector_cli_path: injector_path.display().to_string(),
-                        hook_library_path: scylla_hook_path().display().to_string(),
-                        ini_path: None,
-                        hook_delay_ms,
-                    };
-                    if let Err(e) = inject_scylla_hide(pid, &scylla_config) {
-                        warn!("ScyllaHide injection failed (non-fatal): {e}");
-                    } else {
-                        info!("ScyllaHide injected");
+                    // ---- MIDA-ADR-3B: anti-debug lifecycle (fail-closed) ----
+                    //
+                    // The self-owned MIDA anti-debug runtime does not exist yet
+                    // (ADR-4+). Until it does, the anti-debug runtime dependency
+                    // is *unavailable by definition*, so the controller
+                    // deterministically enters DependencyUnavailable and the
+                    // unpack must abort with AntiDebugRuntimeUnavailable.
+                    //
+                    // ScyllaHide is NOT a MIDA success proof. It is never used
+                    // as a silent fallback here; it may only run in explicit
+                    // oracle mode (future differential experiments, ADR-7).
+                    let evidence_dir = output_path
+                        .parent()
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_else(|| std::path::PathBuf::from("."));
+                    let mut ad_controller = antidebug_controller::AntidebugController::new(
+                        antidebug_controller::AntidebugStageOptions {
+                            sample_id: None, // case binding happens in preflight
+                            target_pid: pid,
+                            evidence_dir: Some(evidence_dir.clone()),
+                            oracle: None, // oracle mode is opt-in and never production
+                        },
+                    );
+                    let outcome = ad_controller.run();
+                    match outcome {
+                        antidebug_controller::AntidebugOutcome::Proceed { .. } => {
+                            // Only reachable once a real MIDA runtime exists.
+                            // Keep the success path explicit so ADR-4 wiring has
+                            // a deterministic seam.
+                            info!("anti-debug lifecycle: Proceed (MIDA runtime ready)");
+                        }
+                        antidebug_controller::AntidebugOutcome::Failed {
+                            state,
+                            fail_code,
+                            message,
+                        } => {
+                            // Structured evidence sidecar (atomic, schema'd).
+                            let evidence = antidebug_controller::AntidebugFailureEvidence {
+                                schema: antidebug_controller::ANTIDEBUG_EVIDENCE_SCHEMA.to_string(),
+                                controller_state_before: "Unresolved".to_string(),
+                                failure_state: format!("{state:?}"),
+                                fail_code: fail_code.as_str().to_string(),
+                                sample_id: None,
+                                target_pid: Some(pid),
+                                runtime_identity: None,
+                                profile_id: None,
+                                profile_digest: None,
+                                sequence: ad_controller.evidence().len() as u32,
+                                cleanup_result: "drop-cleanup".to_string(), // WindowsDebugger::Drop
+                                candidate_created: false,
+                            };
+                            if let Err(ew) = antidebug_controller::write_failure_evidence(
+                                &evidence,
+                                &evidence_dir,
+                            ) {
+                                // Evidence write failure must itself fail closed.
+                                return Err(anyhow::anyhow!(
+                                    "anti-debug failure evidence write failed: {ew:#}; original: {message}"
+                                ));
+                            }
+                            // Fail-closed: hard error, no candidate, no TLS/OEP
+                            // success evidence. Target cleanup happens via
+                            // WindowsDebugger::Drop (TerminateProcess + wait).
+                            return Err(anyhow::anyhow!(
+                                "anti-debug lifecycle failed: {message} (state={state:?} fail_code={})",
+                                fail_code.as_str(),
+                            ));
+                        }
                     }
 
                     // Store resolved APIs for later breakpoint comparisons.

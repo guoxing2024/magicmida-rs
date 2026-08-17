@@ -23,6 +23,7 @@ mida-disasm = { path = "../disasm" }
 mida-tracer = { path = "../tracer" }
 mida-packers-themida = { path = "../packers/themida" }
 mida-packers-ahk-gto = { path = "../packers/ahk_gto", default-features = false }
+mida-antidebug = { path = "../antidebug" }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

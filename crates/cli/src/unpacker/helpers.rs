@@ -25,11 +25,19 @@ const SCYLLA_HOOK_NAME: &str = "HookLibraryx64.dll";
 const SCYLLA_HOOK_NAME: &str = "HookLibraryx86.dll";
 
 /// Resolve the absolute path to the ScyllaHide injector binary.
+///
+/// ADR-3B: production no longer invokes ScyllaHide (fail-closed MIDA
+/// lifecycle). This stays as the explicit oracle-mode seam for future
+/// differential experiments (ADR-7); it is not dead production code.
+#[allow(dead_code)]
 pub(super) fn scylla_injector_path() -> PathBuf {
     exe_dir().join(SCYLLA_INJECTOR_NAME)
 }
 
 /// Resolve the absolute path to the ScyllaHide hook library DLL.
+///
+/// ADR-3B: oracle-mode seam only (see scylla_injector_path).
+#[allow(dead_code)]
 pub(super) fn scylla_hook_path() -> PathBuf {
     exe_dir().join(SCYLLA_HOOK_NAME)
 }
