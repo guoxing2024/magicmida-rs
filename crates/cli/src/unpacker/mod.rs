@@ -1016,54 +1016,63 @@ pub fn unpack(
                     // process initializer (ntdll loader lock) must finish
                     // before LoadLibraryW can succeed inside the target.
                     // Drain the early DLL-load events first (bounded).
-                    let mut drain = {
-                        // Drain loop: service debug events while the remote
-                        // thread is running. This is a strict Win32-level drain
-                        // (WaitForDebugEvent + ContinueDebugEvent) that keeps
-                        // the target unfrozen; events consumed here are the
-                        // early-process events (LOAD_DLL / CREATE_THREAD etc.)
-                        // that the main loop would have handled - acceptable in
-                        // the anti-debug window because the runtime install is
-                        // the only goal and the post-loop phases re-validate
-                        // everything from evidence.
-                        struct Drainer;
-                        impl Drainer {
-                            fn drain_once(&mut self) -> Option<u32> {
-                                use windows::Win32::Foundation::DBG_CONTINUE;
-                                use windows::Win32::System::Diagnostics::Debug::{
-                                    ContinueDebugEvent as CDE, WaitForDebugEvent as WFDE,
-                                    DEBUG_EVENT,
-                                };
-                                let mut ev = DEBUG_EVENT::default();
-                                // SAFETY: single-threaded debugger loop; the
-                                // event buffer is owned and zeroed.
-                                let ok = unsafe { WFDE(&mut ev, 100) };
-                                if ok.is_ok() {
-                                    let code = ev.dwDebugEventCode.0 as u32;
-                                    // SAFETY: identity from the delivered event.
-                                    let _ =
-                                        unsafe { CDE(ev.dwProcessId, ev.dwThreadId, DBG_CONTINUE) };
-                                    Some(code)
-                                } else {
-                                    None
-                                }
-                            }
-                        }
-                        let mut d = Drainer;
-                        move || d.drain_once()
-                    };
+                    // ADR-5B-R1: drain capability lives in the core debugger. Every
+                    // drained event passes through the unified lifecycle (pending
+                    // identity, sequence, exactly-once continue) and the full
+                    // bookkeeping (thread table register/remove, hFile close, DR
+                    // propagation, exception recording). No event bypasses the
+                    // debugger's bookkeeping anymore.
+                    // The process handle is Copy; extract it BEFORE the drain
+                    // closure so the closure can hold the only mutable borrow of
+                    // `dbg` while the loader still needs the target handle.
+                    let target_handle = dbg.process_handle();
+                    let mut drain = |timeout_ms: u32| -> Result<
+                        Option<mida_core::DrainReceipt>,
+                        mida_core::CoreError,
+                    > { dbg.drain_debug_event(timeout_ms) };
                     let mut warm_loaddll = 0u32;
                     let mut warm_iters = 0u32;
+                    let mut warm_receipts = Vec::new();
                     while warm_loaddll < 16 && warm_iters < 240 {
-                        if let Some(code) = drain() {
-                            if code == 6 {
-                                warm_loaddll += 1;
+                        match drain(100) {
+                            Ok(Some(receipt)) => {
+                                if receipt.event_code == 6 {
+                                    warm_loaddll += 1;
+                                }
+                                warm_receipts.push(receipt);
+                            }
+                            Ok(None) => {
+                                // No event within the poll budget: keep polling.
+                            }
+                            Err(e) => {
+                                log::log(LogType::Fatal, &format!("warm-up drain failed: {e:#}"));
+                                return Err(e.into());
                             }
                         }
                         warm_iters += 1;
                     }
+                    log::log(
+                        LogType::Info,
+                        &format!(
+                            "warm-up drain done: {} events, {} LOAD_DLL, receipts: {}",
+                            warm_receipts.len(),
+                            warm_loaddll,
+                            warm_receipts
+                                .iter()
+                                .map(|r| format!(
+                                    "seq={} code={} disp={:?} tid={} bk={}",
+                                    r.sequence,
+                                    r.event_code,
+                                    r.disposition,
+                                    r.thread_id,
+                                    r.bookkeeping
+                                ))
+                                .collect::<Vec<_>>()
+                                .join("; ")
+                        ),
+                    );
                     let loader_outcome = crate::unpacker::runtime_loader::run_runtime_loader(
-                        dbg.process_handle(),
+                        target_handle,
                         pid,
                         "oreans_origin_x64_v1",
                         "adr6-profile-digest",

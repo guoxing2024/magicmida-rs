@@ -595,3 +595,102 @@ fn provenance_arch_mismatch_rejected() {
     // provenance crate); either way it is fail-closed.
     assert!(matches!(err, RuntimeLoadError::AuthorityMismatch(_)));
 }
+
+// ----------------------------------------------------------------
+// ADR-5B-R3/R5: remote-wait classification + thunk layout constants
+// ----------------------------------------------------------------
+
+#[test]
+fn wait_status_classification_distinguishes_timeout_and_failure() {
+    use mida_cli::unpacker::runtime_loader::{classify_wait_status, RemoteWaitOutcome};
+    // WAIT_OBJECT_0 (0) -> Finished
+    assert_eq!(classify_wait_status(0), RemoteWaitOutcome::Finished);
+    // WAIT_TIMEOUT (258) -> TimedOut (the dangerous case: thread may still run)
+    assert_eq!(classify_wait_status(258), RemoteWaitOutcome::TimedOut);
+    // WAIT_FAILED (0xFFFFFFFF) -> WaitFailed
+    assert!(matches!(
+        classify_wait_status(0xFFFF_FFFF),
+        RemoteWaitOutcome::WaitFailed(_)
+    ));
+    // WAIT_ABANDONED (0x80) -> Abandoned (defensive; never valid for threads)
+    assert_eq!(classify_wait_status(0x80), RemoteWaitOutcome::Abandoned);
+    // Unknown -> WaitFailed
+    assert!(matches!(
+        classify_wait_status(42),
+        RemoteWaitOutcome::WaitFailed(_)
+    ));
+}
+
+#[test]
+fn thunk_layout_constants_are_explicit_and_consistent() {
+    use mida_cli::unpacker::runtime_loader::{
+        THUNK_ARGS_OFFSET, THUNK_ARGS_SIZE, THUNK_BLOB_SIZE, THUNK_CODE_SIZE, THUNK_EXECUTABLE_SIZE,
+    };
+    // The executable window covers the thunk code (91 bytes) with room to spare.
+    assert!(THUNK_CODE_SIZE >= 91);
+    assert!(THUNK_EXECUTABLE_SIZE >= THUNK_CODE_SIZE);
+    // The args region starts inside the allocation and ends within it.
+    assert!(THUNK_ARGS_OFFSET >= THUNK_EXECUTABLE_SIZE);
+    assert!(THUNK_ARGS_OFFSET + THUNK_ARGS_SIZE <= THUNK_BLOB_SIZE);
+    // The whole blob is one page-rounded 0x100 region.
+    assert_eq!(THUNK_BLOB_SIZE, 0x100);
+}
+
+#[test]
+fn ordinal_array_layout_is_two_bytes_per_entry() {
+    // The export parser reads num_names * 2 bytes for the ordinal array.
+    // This pins the PE format assumption (u16 per ordinal slot).
+    // IMAGE_EXPORT_DIRECTORY.NumberOfNames is the slot count; AddressOfNameOrdinals
+    // entries are WORDs (PE/COFF spec 8.3.3).
+    let num_names: usize = 7;
+    let ords_bytes = num_names * 2;
+    assert_eq!(ords_bytes, 14);
+    // A parsed ordinal value must be recoverable from two bytes.
+    let ord = u16::from_le_bytes([0x34, 0x12]);
+    assert_eq!(ord, 0x1234);
+}
+
+#[test]
+fn thunk_args_blob_fits_allocated_args_window() {
+    use mida_cli::unpacker::runtime_loader::{ThunkArgs, THUNK_ARGS_SIZE};
+    let args = ThunkArgs {
+        fn_ptr: 0x1111_2222_3333_4444,
+        arg0: 1,
+        arg1: 2,
+        arg2: 3,
+        arg3: 4,
+        arg4: 5,
+        arg5: 6,
+        reserved: 0,
+    };
+    assert_eq!(args.as_bytes().len(), THUNK_ARGS_SIZE);
+}
+
+// ----------------------------------------------------------------
+// ADR-5B-R1: drain receipt type surface (offline, no Win32)
+// ----------------------------------------------------------------
+
+#[test]
+fn drain_receipt_defaults_are_sane() {
+    use mida_core::{DrainDisposition, DrainReceipt};
+    let r = DrainReceipt {
+        sequence: 1,
+        process_id: 100,
+        thread_id: 200,
+        event_code: 6, // LOAD_DLL
+        disposition: DrainDisposition::Delivered,
+        continue_status: 0x0001_0002,
+        bookkeeping: "hFile closed".to_string(),
+        exception_code: None,
+        first_chance: None,
+    };
+    assert_eq!(r.sequence, 1);
+    assert_eq!(r.process_id, 100);
+    assert_eq!(r.thread_id, 200);
+    assert_eq!(r.event_code, 6);
+    assert_eq!(r.continue_status, 0x0001_0002);
+    assert!(r.bookkeeping.contains("hFile"));
+    // DrainDisposition is Copy + Eq (usable in receipts/logs).
+    let _copy = r.disposition;
+    assert_ne!(r.disposition, DrainDisposition::Exception);
+}

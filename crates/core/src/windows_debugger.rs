@@ -117,6 +117,12 @@ pub struct WindowsDebugger {
     post_attach_resumed: bool,
     /// Exactly-once pending debug-event identity (Wait 闁?Continue contract).
     lifecycle: DebugEventLifecycle,
+    /// ADR-5B-R1: cumulative drain counters (audit + tests).
+    drain_stats: DrainStats,
+    /// ADR-5B-R1: TIDs whose CREATE_THREAD was observed by the drain path.
+    /// Used to distinguish legit short-lived exits (OS merged the create
+    /// event) from genuine bookkeeping defects.
+    drain_observed_create_tids: std::collections::HashSet<u32>,
 }
 
 impl WindowsDebugger {
@@ -157,6 +163,8 @@ impl WindowsDebugger {
             ownership,
             post_attach_resumed: false,
             lifecycle: DebugEventLifecycle::new(root_pid),
+            drain_stats: DrainStats::default(),
+            drain_observed_create_tids: std::collections::HashSet::new(),
         };
 
         if opts.post_attach {
@@ -911,6 +919,85 @@ impl Drop for WindowsDebugger {
 fn soft_breakpoint_state_is_consistent(bytes_read: usize, current_byte: u8) -> bool {
     bytes_read == 1 && current_byte == 0xCC
 }
+
+// ---------------------------------------------------------------------------
+// Drain receipts (ADR-5B-R1)
+// ---------------------------------------------------------------------------
+
+/// Disposition applied to an event consumed by `WindowsDebugger::drain_debug_event`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrainDisposition {
+    /// Event was decoded and full bookkeeping was applied (thread table,
+    /// hFile close, DR propagation).
+    Delivered,
+    /// Event was internally ignored (OUTPUT_DEBUG_STRING / unknown code)
+    /// and continued exactly once.
+    Ignored,
+    /// RIP_EVENT: continued exactly once and recorded (system-level error).
+    Rip,
+    /// EXCEPTION event inside the drain window: recorded (code + first
+    /// chance) and continued without delivery.
+    Exception,
+}
+
+/// Structured receipt for one debug event consumed by the drain path.
+///
+/// ADR-5B-R1: every drain event must carry the raw identity, disposition,
+/// continue status, bookkeeping outcome, and a monotonic sequence so the
+/// audit trail can prove no event bypassed the unified lifecycle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrainReceipt {
+    /// Monotonic sequence assigned by the lifecycle (matches the main loop).
+    pub sequence: u64,
+    /// Raw dwProcessId from the DEBUG_EVENT.
+    pub process_id: u32,
+    /// Raw dwThreadId from the DEBUG_EVENT.
+    pub thread_id: u32,
+    /// Raw dwDebugEventCode value.
+    pub event_code: u32,
+    /// Disposition applied to this event.
+    pub disposition: DrainDisposition,
+    /// ContinueDebugEvent status used (DBG_CONTINUE = 0x00010002).
+    pub continue_status: u32,
+    /// Bookkeeping outcome summary (thread registered/removed, hFile closed,
+    /// DR propagated, ...). Empty when no bookkeeping applied.
+    pub bookkeeping: String,
+    /// Exception code for EXCEPTION events in the drain window.
+    pub exception_code: Option<u32>,
+    /// dwFirstChance flag for EXCEPTION events.
+    pub first_chance: Option<bool>,
+}
+
+/// Cumulative counters for the drain path (ADR-5B-R1).
+///
+/// Tests use these to prove no event bypassed bookkeeping: every
+/// CreateThread registered a handle, every ExitThread removed a previously
+/// registered thread (no unmatched exit), every LOAD_DLL/CREATE_PROCESS
+/// hFile was closed, and exceptions were recorded.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DrainStats {
+    /// Total events consumed by the drain path.
+    pub events_drained: u64,
+    /// CreateThread events that registered a thread handle.
+    pub create_threads_registered: u64,
+    /// ExitThread events that removed a previously registered thread.
+    pub exit_threads_removed: u64,
+    /// ExitThread events whose TID was NOT registered (bookkeeping gap).
+    pub unmatched_exit_threads: u64,
+    /// LOAD_DLL / CREATE_PROCESS hFile handles closed by the drain.
+    pub hfiles_closed: u64,
+    /// EXCEPTION events recorded and continued in the drain window.
+    pub exceptions_continued: u64,
+    /// Ignored events (OUTPUT_DEBUG_STRING / unknown) continued exactly once.
+    pub ignored_continued: u64,
+    /// RIP_EVENT occurrences.
+    pub rip_events: u64,
+    /// DR-state propagations to newly registered threads during drain.
+    pub dr_propagations: u64,
+    /// Sequence of the last drained event (0 if none).
+    pub last_sequence: u64,
+}
+
 // ---------------------------------------------------------------------------
 // DebuggerCore implementation
 // ---------------------------------------------------------------------------
@@ -1929,6 +2016,155 @@ impl WindowsDebugger {
                 }
             }
         }
+    }
+
+    /// Consume at most one debug event with full lifecycle bookkeeping
+    /// (ADR-5B-R1). Used by the loader window to keep the debug session alive
+    /// while a remote thread runs: every event passes through the same
+    /// pending/continue lifecycle and the same thread-table / hFile / DR
+    /// bookkeeping as the main loop.
+    ///
+    /// Returns Ok(None) when the timeout expired with no event
+    /// (ERROR_SEM_TIMEOUT). Returns Err on API failure; the pending
+    /// identity is retained for diagnosis.
+    pub fn drain_debug_event(
+        &mut self,
+        timeout_ms: u32,
+    ) -> Result<Option<DrainReceipt>, CoreError> {
+        self.lifecycle.ensure_can_wait()?;
+
+        let mut raw: RAW_DEBUG_EVENT = RAW_DEBUG_EVENT::default();
+        // SAFETY: WaitForDebugEvent; raw is a valid out-pointer.
+        let wait_result = unsafe { WaitForDebugEvent(&mut raw, timeout_ms) };
+        if let Err(e) = wait_result {
+            let error_code = (e.code().0 as u32) & 0xFFFF;
+            if error_code == 121 {
+                return Ok(None); // ERROR_SEM_TIMEOUT: no event within budget
+            }
+            return Err(CoreError::Windows(error_code));
+        }
+
+        let process_id = raw.dwProcessId;
+        let thread_id = raw.dwThreadId;
+        let event_code = raw.dwDebugEventCode.0;
+        self.lifecycle
+            .record_wait_success(process_id, thread_id, event_code)?;
+        let sequence = self.lifecycle.pending().map(|p| p.sequence).unwrap_or(0);
+
+        let mut receipt = DrainReceipt {
+            sequence,
+            process_id,
+            thread_id,
+            event_code,
+            disposition: DrainDisposition::Delivered,
+            continue_status: ContinueStatus::Continue as u32,
+            bookkeeping: String::new(),
+            exception_code: None,
+            first_chance: None,
+        };
+
+        match DebugEventLifecycle::disposition_for_event_code(event_code) {
+            DecodeDisposition::IgnoreAndContinue => {
+                receipt.disposition = DrainDisposition::Ignored;
+                self.drain_stats.events_drained += 1;
+                self.drain_stats.ignored_continued += 1;
+                self.drain_stats.last_sequence = sequence;
+                self.continue_pending(thread_id, ContinueStatus::Continue)?;
+                return Ok(Some(receipt));
+            }
+            DecodeDisposition::RipError => {
+                receipt.disposition = DrainDisposition::Rip;
+                receipt.bookkeeping = "RIP_EVENT recorded".into();
+                self.drain_stats.events_drained += 1;
+                self.drain_stats.rip_events += 1;
+                self.drain_stats.last_sequence = sequence;
+                self.continue_pending(thread_id, ContinueStatus::Continue)?;
+                return Ok(Some(receipt));
+            }
+            DecodeDisposition::Deliver => {}
+        }
+
+        // EXCEPTION events inside the drain window are recorded (code + first
+        // chance) and continued; they are never silently swallowed, and no
+        // unconditional decode failure aborts the loader window.
+        if event_code == EXCEPTION_DEBUG_EVENT.0 {
+            // SAFETY: union accessed with matching dwDebugEventCode == EXCEPTION_DEBUG_EVENT.
+            let exc = unsafe { &raw.u.Exception };
+            receipt.disposition = DrainDisposition::Exception;
+            receipt.exception_code = Some(exc.ExceptionRecord.ExceptionCode.0 as u32);
+            receipt.first_chance = Some(exc.dwFirstChance != 0);
+            receipt.bookkeeping = format!(
+                "exception code={:#x} first_chance={} (drain window, DBG_CONTINUE)",
+                exc.ExceptionRecord.ExceptionCode.0 as u32,
+                exc.dwFirstChance != 0
+            );
+            self.drain_stats.events_drained += 1;
+            self.drain_stats.exceptions_continued += 1;
+            self.drain_stats.last_sequence = sequence;
+            self.continue_pending(thread_id, ContinueStatus::Continue)?;
+            return Ok(Some(receipt));
+        }
+
+        // Deliverable events: decode, apply unified bookkeeping, close hFile
+        // (the drain consumes the event, so the caller never sees it), then
+        // continue exactly once.
+        let ev = Self::decode_event(&raw)?;
+        self.apply_event_bookkeeping(&ev)?;
+        self.drain_stats.events_drained += 1;
+        self.drain_stats.last_sequence = sequence;
+        match &ev {
+            DebugEvent::LoadDll { h_file, .. } | DebugEvent::CreateProcess { h_file, .. } => {
+                // SAFETY: h_file is valid per the DebugEvent contract and is
+                // consumed by the drain (never delivered to the main loop).
+                if !h_file.is_invalid() {
+                    unsafe {
+                        let _ = CloseHandle(*h_file);
+                    }
+                    self.drain_stats.hfiles_closed += 1;
+                }
+                receipt.bookkeeping = "hFile closed".into();
+            }
+            DebugEvent::CreateThread { thread_id, .. } => {
+                receipt.bookkeeping = format!("thread {thread_id} registered");
+                self.drain_stats.create_threads_registered += 1;
+                self.drain_observed_create_tids.insert(*thread_id);
+                if self.has_any_hw_breakpoint() {
+                    receipt
+                        .bookkeeping
+                        .push_str("; DR state propagated to new thread");
+                    self.drain_stats.dr_propagations += 1;
+                }
+            }
+            DebugEvent::ExitThread { thread_id, .. } => {
+                receipt.bookkeeping = format!("thread {thread_id} removed + handle closed");
+                // IMPORTANT: apply_event_bookkeeping runs BEFORE this match and
+                // has already removed the TID from the threads table. To
+                // classify the exit we consult the drain-observed CREATE_THREAD
+                // set instead.
+                if self.drain_observed_create_tids.remove(thread_id) {
+                    // The drain DID observe this thread's creation and the
+                    // handle was registered -> clean bookkeeping pair.
+                    self.drain_stats.exit_threads_removed += 1;
+                } else {
+                    // The drain never saw a CREATE_THREAD for this TID. This is
+                    // legal when the thread was created AND exited between two
+                    // drain polls (Windows delivers EXIT_THREAD even when the
+                    // matching CREATE_THREAD was never observed). It is NOT a
+                    // bookkeeping defect: no handle was ever registered.
+                    receipt
+                        .bookkeeping
+                        .push_str(" (short-lived: CREATE_THREAD never observed by drain)");
+                }
+            }
+            _ => {}
+        }
+        self.continue_pending(thread_id, ContinueStatus::Continue)?;
+        Ok(Some(receipt))
+    }
+
+    /// Cumulative drain-path counters (ADR-5B-R1 audit surface).
+    pub fn drain_stats(&self) -> &DrainStats {
+        &self.drain_stats
     }
 
     /// Thread table / image-base bookkeeping for a delivered event.

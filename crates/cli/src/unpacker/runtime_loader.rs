@@ -296,6 +296,60 @@ pub struct RemoteCallResult {
     pub exit_code: u32,
 }
 
+/// Outcome of a bounded wait on a remote thread (ADR-5B-R3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteWaitOutcome {
+    /// The remote thread finished (WAIT_OBJECT_0).
+    Finished,
+    /// The wait timed out (WAIT_TIMEOUT = 258): the remote code may STILL be
+    /// running in the target. The caller must NOT free any memory the remote
+    /// thread can touch.
+    TimedOut,
+    /// The wait failed (WAIT_FAILED = 0xFFFFFFFF): the thread handle may be
+    /// invalid; treat like a hard error.
+    WaitFailed(u32),
+    /// The wait was abandoned (WAIT_ABANDONED = 0x80, only meaningful for
+    /// mutexes, never for thread handles; defensive).
+    Abandoned,
+}
+
+/// A remote thread whose handle is closed on Drop.
+///
+/// After the handle is closed the thread itself may still be running (closing
+/// a handle does not terminate the thread); callers must keep any memory the
+/// remote thread can touch alive until the target process exits.
+struct RemoteThreadGuard {
+    handle: windows::Win32::Foundation::HANDLE,
+}
+
+impl RemoteThreadGuard {
+    fn new(handle: windows::Win32::Foundation::HANDLE) -> Self {
+        Self { handle }
+    }
+}
+
+impl Drop for RemoteThreadGuard {
+    fn drop(&mut self) {
+        // SAFETY: handle is owned by this guard (CreateRemoteThread result).
+        unsafe {
+            let _ = CloseHandle(self.handle);
+        }
+    }
+}
+
+/// Convert a raw WAIT_* status into a typed outcome (ADR-5B-R3).
+pub fn classify_wait_status(raw: u32) -> RemoteWaitOutcome {
+    // WAIT_OBJECT_0 = 0, WAIT_ABANDONED = 0x80, WAIT_TIMEOUT = 258,
+    // WAIT_FAILED = 0xFFFFFFFF.
+    match raw {
+        0 => RemoteWaitOutcome::Finished,
+        0x80 => RemoteWaitOutcome::Abandoned,
+        258 => RemoteWaitOutcome::TimedOut,
+        0xFFFF_FFFF => RemoteWaitOutcome::WaitFailed(raw),
+        other => RemoteWaitOutcome::WaitFailed(other),
+    }
+}
+
 /// Loader errors (all fail-closed).
 #[derive(Debug, Clone, thiserror::Error)]
 #[allow(dead_code)] // variants map to controller fail codes; some only via
@@ -380,6 +434,25 @@ fn sha256_hex(bytes: &[u8]) -> String {
 ///   call rax
 ///   add  rsp, 0x38
 ///   ret
+
+// ---------------------------------------------------------------------------
+// Thunk blob layout (ADR-5B-R1: explicit, audited constants)
+// ---------------------------------------------------------------------------
+
+/// Total size of the remote thunk allocation (one page-rounded 0x100 region;
+/// VirtualAllocEx rounds to page granularity, so requesting 0x100 keeps the
+/// executable window and the args region inside the same committed page).
+pub const THUNK_BLOB_SIZE: usize = 0x100;
+/// Executable thunk code length (THUNK_CODE is 91 bytes; the thunk's own
+/// stack frame is 0x38, see THUNK_CODE).
+pub const THUNK_CODE_SIZE: usize = 91;
+/// Offset of the args blob inside the thunk allocation.
+pub const THUNK_ARGS_OFFSET: usize = 0x60;
+/// Size of the args blob (ThunkArgs::as_bytes() -> [u8; 64]).
+pub const THUNK_ARGS_SIZE: usize = 64;
+/// Bytes from the start of the allocation that must be executable.
+pub const THUNK_EXECUTABLE_SIZE: usize = 0x60;
+
 pub const THUNK_CODE: [u8; 91] = [
     0x49, 0x89, 0xCB, // mov r11, rcx
     0x49, 0x8B, 0x03, // mov rax, [r11]
@@ -496,7 +569,7 @@ impl RuntimeLoader {
         target: HANDLE,
         remote_fn: usize,
         arg: usize,
-        drain: &mut dyn FnMut() -> Option<u32>,
+        drain: &mut dyn FnMut(u32) -> Result<Option<mida_core::DrainReceipt>, mida_core::CoreError>,
     ) -> Result<RemoteCallResult, RuntimeLoadError> {
         // SAFETY: caller contract: remote_fn is a valid target-address-space
         // function; arg points to target memory (or 0 for no argument).
@@ -515,7 +588,7 @@ impl RuntimeLoader {
             )
         };
         let thread = match thread {
-            Ok(t) => t,
+            Ok(t) => RemoteThreadGuard::new(t),
             Err(e) => {
                 return Err(RuntimeLoadError::RemoteThreadFailed(format!(
                     "CreateRemoteThread: {e}"
@@ -527,31 +600,49 @@ impl RuntimeLoader {
         // let the caller keep the debug session alive: every debug event
         // freezes the target, so a remote thread can only progress while the
         // debugger drains+continues events.
+        //
+        // ADR-5B-R3: WAIT statuses are classified explicitly; on timeout the
+        // remote code may STILL be executing in the target, so the handle is
+        // closed but the caller is told the call did NOT finish (it must not
+        // free remote memory the thread can touch).
         let deadline_ms = 60_000u32;
         let mut waited_ms = 0u32;
         loop {
-            let wait = unsafe { WaitForSingleObject(thread, 200) }.0;
-            if wait == 0 {
-                break; // remote call finished
+            let wait = unsafe { WaitForSingleObject(thread.handle, 200) }.0;
+            match classify_wait_status(wait) {
+                RemoteWaitOutcome::Finished => break,
+                RemoteWaitOutcome::TimedOut => {
+                    if waited_ms >= deadline_ms {
+                        // Handle closed by guard on return; remote memory is
+                        // deliberately NOT freed (the thread may still run).
+                        return Err(RuntimeLoadError::RemoteCallFailed(format!(
+                            "WaitForSingleObject timed out after {deadline_ms}ms; remote thread may still be running (thunk memory retained)"
+                        )));
+                    }
+                    waited_ms += 200;
+                    drain(200).map_err(|e| {
+                        RuntimeLoadError::RemoteCallFailed(format!("drain failed: {e}"))
+                    })?;
+                }
+                RemoteWaitOutcome::Abandoned => {
+                    return Err(RuntimeLoadError::RemoteCallFailed(
+                        "WaitForSingleObject returned WAIT_ABANDONED for a thread handle".into(),
+                    ));
+                }
+                RemoteWaitOutcome::WaitFailed(raw) => {
+                    return Err(RuntimeLoadError::RemoteCallFailed(format!(
+                        "WaitForSingleObject failed (0x{raw:08X})"
+                    )));
+                }
             }
-            if waited_ms >= deadline_ms {
-                let _ = unsafe { CloseHandle(thread) };
-                return Err(RuntimeLoadError::RemoteCallFailed(format!(
-                    "WaitForSingleObject timed out after {deadline_ms}ms"
-                )));
-            }
-            waited_ms += 200;
-            let _ = drain();
         }
         let mut code: u32 = 0;
-        let gc = unsafe { GetExitCodeThread(thread, &mut code) };
+        let gc = unsafe { GetExitCodeThread(thread.handle, &mut code) };
         if gc.is_err() {
-            let _ = unsafe { CloseHandle(thread) };
             return Err(RuntimeLoadError::RemoteCallFailed(
                 "GetExitCodeThread failed".to_string(),
             ));
         }
-        let _ = unsafe { CloseHandle(thread) };
         Ok(RemoteCallResult { exit_code: code })
     }
 
@@ -577,7 +668,7 @@ impl RuntimeLoader {
         target: HANDLE,
         load_addr: usize,
         path_addr: usize,
-        drain: &mut dyn FnMut() -> Option<u32>,
+        drain: &mut dyn FnMut(u32) -> Result<Option<mida_core::DrainReceipt>, mida_core::CoreError>,
     ) -> Result<usize, RuntimeLoadError> {
         use windows::Win32::System::Threading::GetExitCodeThread as GECT;
         // 1. Bare LoadLibraryW via a remote thread (no wrapper stub:
@@ -597,7 +688,7 @@ impl RuntimeLoader {
             )
         };
         let thread = match thread {
-            Ok(t) => t,
+            Ok(t) => RemoteThreadGuard::new(t),
             Err(e) => {
                 return Err(RuntimeLoadError::RemoteThreadFailed(format!(
                     "CreateRemoteThread(loadlib): {e}"
@@ -605,27 +696,42 @@ impl RuntimeLoader {
             }
         };
         // 2. Wait with drain (bounded 120s).
+        //    ADR-5B-R3: WAIT statuses are classified explicitly; on timeout the
+        //    remote thread may still hold the loader lock — the remote_path
+        //    buffer is retained (never freed while the thread may run).
         let deadline_ms = 120_000u32;
         let mut waited_ms = 0u32;
         loop {
-            let wait = unsafe { WaitForSingleObject(thread, 200) }.0;
-            if wait == 0 {
-                break;
+            let wait = unsafe { WaitForSingleObject(thread.handle, 200) }.0;
+            match classify_wait_status(wait) {
+                RemoteWaitOutcome::Finished => break,
+                RemoteWaitOutcome::TimedOut => {
+                    if waited_ms >= deadline_ms {
+                        return Err(RuntimeLoadError::RemoteCallFailed(format!(
+                            "LoadLibraryW remote thread timed out after {deadline_ms}ms; thread may still hold the loader lock (path buffer retained)"
+                        )));
+                    }
+                    waited_ms += 200;
+                    drain(200).map_err(|e| {
+                        RuntimeLoadError::RemoteCallFailed(format!("drain failed: {e}"))
+                    })?;
+                }
+                RemoteWaitOutcome::Abandoned => {
+                    return Err(RuntimeLoadError::RemoteCallFailed(
+                        "WaitForSingleObject returned WAIT_ABANDONED (loadlib)".into(),
+                    ));
+                }
+                RemoteWaitOutcome::WaitFailed(raw) => {
+                    return Err(RuntimeLoadError::RemoteCallFailed(format!(
+                        "WaitForSingleObject failed (0x{raw:08X}) (loadlib)"
+                    )));
+                }
             }
-            if waited_ms >= deadline_ms {
-                let _ = unsafe { CloseHandle(thread) };
-                return Err(RuntimeLoadError::RemoteCallFailed(format!(
-                    "LoadLibraryW remote thread timed out after {deadline_ms}ms"
-                )));
-            }
-            waited_ms += 200;
-            let _ = drain();
         }
         // 3. 32-bit exit code: nonzero means the load started; the full
         //    base is recovered from the PEB.Ldr module list.
         let mut code: u32 = 0;
-        let gc = unsafe { GECT(thread, &mut code) };
-        let _ = unsafe { CloseHandle(thread) };
+        let gc = unsafe { GECT(thread.handle, &mut code) };
         if gc.is_err() {
             return Err(RuntimeLoadError::RemoteCallFailed(
                 "GetExitCodeThread(loadlib) failed".to_string(),
@@ -650,11 +756,18 @@ impl RuntimeLoader {
         &self,
         target: HANDLE,
         args: &ThunkArgs,
-        drain: &mut dyn FnMut() -> Option<u32>,
+        drain: &mut dyn FnMut(u32) -> Result<Option<mida_core::DrainReceipt>, mida_core::CoreError>,
     ) -> Result<RemoteCallResult, RuntimeLoadError> {
         // 1. Allocate executable-capable memory for thunk + args (128 bytes).
-        let remote =
-            unsafe { VirtualAllocEx(target, None, 128, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) };
+        let remote = unsafe {
+            VirtualAllocEx(
+                target,
+                None,
+                THUNK_BLOB_SIZE,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+            )
+        };
         if remote.is_null() {
             return Err(RuntimeLoadError::VirtualAllocFailed(
                 "VirtualAllocEx(thunk)".to_string(),
@@ -662,9 +775,11 @@ impl RuntimeLoader {
         }
         // 2. Write thunk at [0..96) (THUNK_CODE is 91 bytes), args at
         //    [96..160). The allocation is 0x100 bytes total.
-        let mut blob = [0u8; 0x100];
+        let mut blob = [0u8; THUNK_BLOB_SIZE];
+        debug_assert!(THUNK_CODE.len() <= THUNK_CODE_SIZE);
         blob[0..THUNK_CODE.len()].copy_from_slice(&THUNK_CODE);
-        blob[96..160].copy_from_slice(&args.as_bytes());
+        blob[THUNK_ARGS_OFFSET..THUNK_ARGS_OFFSET + THUNK_ARGS_SIZE]
+            .copy_from_slice(&args.as_bytes());
         let w = unsafe {
             WriteProcessMemory(
                 target,
@@ -687,7 +802,7 @@ impl RuntimeLoader {
             VirtualProtectEx(
                 target,
                 remote,
-                128,
+                THUNK_EXECUTABLE_SIZE,
                 PAGE_EXECUTE_READWRITE,
                 &mut old as *mut _ as *mut windows::Win32::System::Memory::PAGE_PROTECTION_FLAGS,
             )
@@ -699,11 +814,29 @@ impl RuntimeLoader {
                 vp.err()
             )));
         }
-        // 4. Run: CreateRemoteThread(remote thunk, arg = remote + 64).
+        // 4. Run: CreateRemoteThread(remote thunk, arg = remote + THUNK_ARGS_OFFSET).
+        //    ADR-5B-R3: the thunk allocation is freed ONLY after the remote
+        //    thread is known to have finished (Ok). On timeout the thread may
+        //    still execute the thunk, so the allocation is deliberately left
+        //    in place; it is released when the target process terminates.
         let thunk_addr = remote as usize;
-        let args_addr = remote as usize + 96;
+        let args_addr = remote as usize + THUNK_ARGS_OFFSET;
         let result = unsafe { self.remote_call_raw(target, thunk_addr, args_addr, drain) };
-        let _ = unsafe { VirtualFreeEx(target, remote, 0, MEM_RELEASE) };
+        match &result {
+            Ok(_) => {
+                // SAFETY: the remote thread finished (WAIT_OBJECT_0), so no
+                // remote code can execute the thunk anymore.
+                let _ = unsafe { VirtualFreeEx(target, remote, 0, MEM_RELEASE) };
+            }
+            Err(_) => {
+                // Timeout / failure: the remote thread may still be running.
+                // Do NOT free the thunk. It is intentionally leaked until the
+                // target process exits (a small, bounded one-page region).
+                tracing::warn!(
+                    "thunk allocation retained after remote-call failure (thread may still run)"
+                );
+            }
+        }
         result
     }
 }
@@ -721,7 +854,7 @@ impl RuntimeLoader {
         profile_id: &str,
         profile_digest: &str,
         expected_surfaces: &[String],
-        drain: &mut dyn FnMut() -> Option<u32>,
+        drain: &mut dyn FnMut(u32) -> Result<Option<mida_core::DrainReceipt>, mida_core::CoreError>,
     ) -> Result<LoadedRuntime, RuntimeLoadError> {
         // 0. Authority verification (fail-closed, before any remote write).
         let identity = self.authority.verify_file(runtime_path)?;
@@ -1098,13 +1231,22 @@ impl RuntimeLoader {
                 "remote read name array failed".to_string(),
             ));
         }
-        let mut ords = vec![0u8; names_bytes];
+        // PE export ordinal array entries are 2 bytes each (not 4).
+        // (PE32+/PE32 IMAGE_EXPORT_DIRECTORY.NumberOfNames counts ordinal
+        // array slots; each slot is a u16.)
+        let ords_bytes = num_names * 2;
+        if ords_bytes > 0x8000 {
+            return Err(RuntimeLoadError::ExportResolutionFailed(
+                "export ordinal array too large".to_string(),
+            ));
+        }
+        let mut ords = vec![0u8; ords_bytes];
         let ro = unsafe {
             RPM(
                 target,
                 (module_base + ords_rva) as *const core::ffi::c_void,
                 ords.as_mut_ptr() as *mut core::ffi::c_void,
-                names_bytes,
+                ords_bytes,
                 None,
             )
         };
@@ -1278,7 +1420,7 @@ impl RuntimeLoader {
         &self,
         target: HANDLE,
         loaded: &LoadedRuntime,
-        drain: &mut dyn FnMut() -> Option<u32>,
+        drain: &mut dyn FnMut(u32) -> Result<Option<mida_core::DrainReceipt>, mida_core::CoreError>,
     ) -> Result<RemoteCallResult, RuntimeLoadError> {
         let args = ThunkArgs {
             fn_ptr: loaded.exports.shutdown as u64,
@@ -1539,7 +1681,7 @@ pub fn run_runtime_loader(
     target_pid: u32,
     profile_id: &str,
     profile_digest: &str,
-    drain: &mut dyn FnMut() -> Option<u32>,
+    drain: &mut dyn FnMut(u32) -> Result<Option<mida_core::DrainReceipt>, mida_core::CoreError>,
 ) -> Result<crate::unpacker::antidebug_controller::LoaderResult, RuntimeLoadError> {
     let authority = runtime_authority()?;
     let Some(runtime_path) = runtime_artifact_path() else {
