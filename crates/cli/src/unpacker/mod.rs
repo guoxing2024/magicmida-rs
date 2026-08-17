@@ -939,6 +939,10 @@ pub fn unpack(
                 // DebugActiveProcess froze the process), and ScyllaHide +
                 // API resolution were done in the pre-loop block above.
                 // Skip them here to avoid redundant work / double-inject.
+                // ADR-5B: when the anti-debug loader path runs, it continues
+                // the CREATE_PROCESS event itself (unfreeze) so its remote
+                // calls can complete; the handler-end continue is then skipped.
+                let mut ad_controller_may_skip_continue = false;
                 if post_attach_mode {
                     debug!(
                         "post-attach: CREATE_PROCESS ??PEB/ScyllaHide/APIs already done, skipping"
@@ -997,11 +1001,73 @@ pub fn unpack(
                     // controller-selected values (ADR-2 origin profile);
                     // the loader passes them to the runtime which echoes
                     // them in the attestation for cross-check.
+                    // ADR-5B: the CREATE_PROCESS debug event freezes every target
+                    // thread until ContinueDebugEvent, so a synchronous remote
+                    // call (CreateRemoteThread + wait) can NEVER complete inside
+                    // this window. Fix: continue the CREATE_PROCESS event FIRST
+                    // (unfreeze), then run the loader whose drain callback keeps
+                    // the debug session alive (WaitForDebugEvent + Continue)
+                    // while the remote thread makes progress. The handler-end
+                    // continue below is skipped once this path ran.
+                    dbg.continue_event(thread_id, ContinueStatus::Continue)?;
+                    ad_controller_may_skip_continue = true;
+                    // ADR-5B: warm-up drain BEFORE the loader runs. The
+                    // CREATE_PROCESS continue unfroze the target, but the
+                    // process initializer (ntdll loader lock) must finish
+                    // before LoadLibraryW can succeed inside the target.
+                    // Drain the early DLL-load events first (bounded).
+                    let mut drain = {
+                        // Drain loop: service debug events while the remote
+                        // thread is running. This is a strict Win32-level drain
+                        // (WaitForDebugEvent + ContinueDebugEvent) that keeps
+                        // the target unfrozen; events consumed here are the
+                        // early-process events (LOAD_DLL / CREATE_THREAD etc.)
+                        // that the main loop would have handled - acceptable in
+                        // the anti-debug window because the runtime install is
+                        // the only goal and the post-loop phases re-validate
+                        // everything from evidence.
+                        struct Drainer;
+                        impl Drainer {
+                            fn drain_once(&mut self) -> Option<u32> {
+                                use windows::Win32::Foundation::DBG_CONTINUE;
+                                use windows::Win32::System::Diagnostics::Debug::{
+                                    ContinueDebugEvent as CDE, WaitForDebugEvent as WFDE,
+                                    DEBUG_EVENT,
+                                };
+                                let mut ev = DEBUG_EVENT::default();
+                                // SAFETY: single-threaded debugger loop; the
+                                // event buffer is owned and zeroed.
+                                let ok = unsafe { WFDE(&mut ev, 100) };
+                                if ok.is_ok() {
+                                    let code = ev.dwDebugEventCode.0 as u32;
+                                    // SAFETY: identity from the delivered event.
+                                    let _ =
+                                        unsafe { CDE(ev.dwProcessId, ev.dwThreadId, DBG_CONTINUE) };
+                                    Some(code)
+                                } else {
+                                    None
+                                }
+                            }
+                        }
+                        let mut d = Drainer;
+                        move || d.drain_once()
+                    };
+                    let mut warm_loaddll = 0u32;
+                    let mut warm_iters = 0u32;
+                    while warm_loaddll < 16 && warm_iters < 240 {
+                        if let Some(code) = drain() {
+                            if code == 6 {
+                                warm_loaddll += 1;
+                            }
+                        }
+                        warm_iters += 1;
+                    }
                     let loader_outcome = crate::unpacker::runtime_loader::run_runtime_loader(
                         dbg.process_handle(),
                         pid,
                         "oreans_origin_x64_v1",
                         "adr6-profile-digest",
+                        &mut drain,
                     );
                     match loader_outcome {
                         Ok(loader_result) => {
@@ -1138,7 +1204,9 @@ pub fn unpack(
                     }
                 }
 
-                dbg.continue_event(thread_id, ContinueStatus::Continue)?;
+                if !ad_controller_may_skip_continue {
+                    dbg.continue_event(thread_id, ContinueStatus::Continue)?;
+                }
             }
 
             // ---------------------------------------------------------------

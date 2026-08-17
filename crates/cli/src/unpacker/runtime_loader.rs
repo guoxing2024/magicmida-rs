@@ -496,6 +496,7 @@ impl RuntimeLoader {
         target: HANDLE,
         remote_fn: usize,
         arg: usize,
+        drain: &mut dyn FnMut() -> Option<u32>,
     ) -> Result<RemoteCallResult, RuntimeLoadError> {
         // SAFETY: caller contract: remote_fn is a valid target-address-space
         // function; arg points to target memory (or 0 for no argument).
@@ -521,13 +522,26 @@ impl RuntimeLoader {
                 )));
             }
         };
-        // Bounded wait (10s) for the remote call to finish.
-        let wait = unsafe { WaitForSingleObject(thread, 10_000) }.0;
-        if wait != 0 {
-            let _ = unsafe { CloseHandle(thread) };
-            return Err(RuntimeLoadError::RemoteCallFailed(format!(
-                "WaitForSingleObject returned {wait:#x}"
-            )));
+        // Bounded wait for the remote call to finish. When a drain callback
+        // is supplied (debug-session context), poll with short timeouts and
+        // let the caller keep the debug session alive: every debug event
+        // freezes the target, so a remote thread can only progress while the
+        // debugger drains+continues events.
+        let deadline_ms = 60_000u32;
+        let mut waited_ms = 0u32;
+        loop {
+            let wait = unsafe { WaitForSingleObject(thread, 200) }.0;
+            if wait == 0 {
+                break; // remote call finished
+            }
+            if waited_ms >= deadline_ms {
+                let _ = unsafe { CloseHandle(thread) };
+                return Err(RuntimeLoadError::RemoteCallFailed(format!(
+                    "WaitForSingleObject timed out after {deadline_ms}ms"
+                )));
+            }
+            waited_ms += 200;
+            let _ = drain();
         }
         let mut code: u32 = 0;
         let gc = unsafe { GetExitCodeThread(thread, &mut code) };
@@ -546,10 +560,97 @@ impl RuntimeLoader {
     /// # Safety
     /// `target` must be a valid process handle; `args.fn_ptr` must be a
     /// valid code address in the target address space.
+    /// Remote LoadLibraryW (bare thread entry, 32-bit exit code only)
+    /// followed by a PEB.Ldr module-list walk to recover the full 64-bit
+    /// module base. ADR-5B: a wrapper stub (even with correct stack
+    /// alignment) is detected by the protected sample (endless exception
+    /// storm), while a bare LoadLibraryW thread works. The loader lock
+    /// is released only after the initializer chain finishes, so this
+    /// call may take a while; the drain callback keeps the debug
+    /// session alive during that window.
+    ///
+    /// # Safety
+    /// `target` must be a valid process handle; `path_addr` must point to a
+    /// NUL-terminated wide path written in the target.
+    unsafe fn loadlib_call(
+        &self,
+        target: HANDLE,
+        load_addr: usize,
+        path_addr: usize,
+        drain: &mut dyn FnMut() -> Option<u32>,
+    ) -> Result<usize, RuntimeLoadError> {
+        use windows::Win32::System::Threading::GetExitCodeThread as GECT;
+        // 1. Bare LoadLibraryW via a remote thread (no wrapper stub:
+        //    protected samples detect and stall wrapper code).
+        let thread = unsafe {
+            CreateRemoteThread(
+                target,
+                None,
+                0,
+                Some(std::mem::transmute::<
+                    usize,
+                    unsafe extern "system" fn(*mut c_void) -> u32,
+                >(load_addr)),
+                Some(path_addr as *const c_void),
+                0,
+                None,
+            )
+        };
+        let thread = match thread {
+            Ok(t) => t,
+            Err(e) => {
+                return Err(RuntimeLoadError::RemoteThreadFailed(format!(
+                    "CreateRemoteThread(loadlib): {e}"
+                )));
+            }
+        };
+        // 2. Wait with drain (bounded 120s).
+        let deadline_ms = 120_000u32;
+        let mut waited_ms = 0u32;
+        loop {
+            let wait = unsafe { WaitForSingleObject(thread, 200) }.0;
+            if wait == 0 {
+                break;
+            }
+            if waited_ms >= deadline_ms {
+                let _ = unsafe { CloseHandle(thread) };
+                return Err(RuntimeLoadError::RemoteCallFailed(format!(
+                    "LoadLibraryW remote thread timed out after {deadline_ms}ms"
+                )));
+            }
+            waited_ms += 200;
+            let _ = drain();
+        }
+        // 3. 32-bit exit code: nonzero means the load started; the full
+        //    base is recovered from the PEB.Ldr module list.
+        let mut code: u32 = 0;
+        let gc = unsafe { GECT(thread, &mut code) };
+        let _ = unsafe { CloseHandle(thread) };
+        if gc.is_err() {
+            return Err(RuntimeLoadError::RemoteCallFailed(
+                "GetExitCodeThread(loadlib) failed".to_string(),
+            ));
+        }
+        if code == 0 {
+            return Err(RuntimeLoadError::ModuleBaseNotFound(
+                "LoadLibraryW returned 0 (load failed in target)".to_string(),
+            ));
+        }
+        // 4. Walk the target PEB.Ldr InMemoryOrderModuleList to find the
+        //    full 64-bit base of the runtime DLL.
+        let base = unsafe { self.find_module_base_in_target(target, "mida_antidebug_runtime") }?;
+        if base == 0 {
+            return Err(RuntimeLoadError::ModuleBaseNotFound(
+                "runtime DLL not found in target module list".to_string(),
+            ));
+        }
+        Ok(base)
+    }
     unsafe fn thunk_call(
         &self,
         target: HANDLE,
         args: &ThunkArgs,
+        drain: &mut dyn FnMut() -> Option<u32>,
     ) -> Result<RemoteCallResult, RuntimeLoadError> {
         // 1. Allocate executable-capable memory for thunk + args (128 bytes).
         let remote =
@@ -559,10 +660,11 @@ impl RuntimeLoader {
                 "VirtualAllocEx(thunk)".to_string(),
             ));
         }
-        // 2. Write thunk at [0..64), args at [64..128).
-        let mut blob = [0u8; 128];
-        blob[0..64].copy_from_slice(&THUNK_CODE);
-        blob[64..128].copy_from_slice(&args.as_bytes());
+        // 2. Write thunk at [0..96) (THUNK_CODE is 91 bytes), args at
+        //    [96..160). The allocation is 0x100 bytes total.
+        let mut blob = [0u8; 0x100];
+        blob[0..THUNK_CODE.len()].copy_from_slice(&THUNK_CODE);
+        blob[96..160].copy_from_slice(&args.as_bytes());
         let w = unsafe {
             WriteProcessMemory(
                 target,
@@ -599,8 +701,8 @@ impl RuntimeLoader {
         }
         // 4. Run: CreateRemoteThread(remote thunk, arg = remote + 64).
         let thunk_addr = remote as usize;
-        let args_addr = remote as usize + 64;
-        let result = unsafe { self.remote_call_raw(target, thunk_addr, args_addr) };
+        let args_addr = remote as usize + 96;
+        let result = unsafe { self.remote_call_raw(target, thunk_addr, args_addr, drain) };
         let _ = unsafe { VirtualFreeEx(target, remote, 0, MEM_RELEASE) };
         result
     }
@@ -619,6 +721,7 @@ impl RuntimeLoader {
         profile_id: &str,
         profile_digest: &str,
         expected_surfaces: &[String],
+        drain: &mut dyn FnMut() -> Option<u32>,
     ) -> Result<LoadedRuntime, RuntimeLoadError> {
         // 0. Authority verification (fail-closed, before any remote write).
         let identity = self.authority.verify_file(runtime_path)?;
@@ -665,19 +768,17 @@ impl RuntimeLoader {
             )));
         }
 
-        // 2. LoadLibraryW via remote thread (x64: same kernel32 base).
+        // 2. LoadLibraryW via remote thread with a 64-bit result slot
+        // (ADR-5B: GetExitCodeThread returns only 32 bits, so the full
+        // HMODULE is written by the stub into target memory).
         let load_addr = Self::kernel32_load_library_w()?;
-        let load_result = unsafe { self.remote_call_raw(target, load_addr, remote_path as usize) }?;
-        let module_base = load_result.exit_code as usize;
-        if module_base == 0 {
-            let _ = unsafe { VirtualFreeEx(target, remote_path, 0, MEM_RELEASE) };
-            return Err(RuntimeLoadError::ModuleBaseNotFound(format!(
-                "LoadLibraryW returned 0 (load failed in target)"
-            )));
-        }
+        let module_base =
+            unsafe { self.loadlib_call(target, load_addr, remote_path as usize, drain) }?;
 
-        // 3. Resolve the MIDA exports.
-        let exports = self.resolve_mida_exports(module_base)?;
+        // 3. Resolve the MIDA exports from the TARGET process memory
+        // (ADR-5B: GetProcAddress in the debugger cannot see the runtime
+        // DLL loaded only in the target).
+        let exports = unsafe { self.resolve_mida_exports_remote(target, module_base) }?;
 
         // 4. Build MidaInitParams blob in target memory (self-contained).
         let remote_params = unsafe {
@@ -758,7 +859,7 @@ impl RuntimeLoader {
             arg5: att_written_addr as u64, // out_attestation_written
             reserved: 0,
         };
-        let init_result = unsafe { self.thunk_call(target, &init_args) }?;
+        let init_result = unsafe { self.thunk_call(target, &init_args, drain) }?;
         if init_result.exit_code != 0 {
             let _ = unsafe { VirtualFreeEx(target, remote_path, 0, MEM_RELEASE) };
             let _ = unsafe { VirtualFreeEx(target, remote_params, 0, MEM_RELEASE) };
@@ -851,29 +952,323 @@ impl RuntimeLoader {
     }
 }
 impl RuntimeLoader {
-    /// Resolve the MIDA C ABI exports from the loaded module.
-    fn resolve_mida_exports(&self, module_base: usize) -> Result<MidaExports, RuntimeLoadError> {
-        use windows::Win32::Foundation::HMODULE;
-        use windows::Win32::System::LibraryLoader::GetProcAddress;
-        let h = HMODULE(module_base as isize as *mut core::ffi::c_void);
-        let init = unsafe { GetProcAddress(h, PCSTR(b"MidaAntidebugInitialize\0".as_ptr())) };
-        let get = unsafe { GetProcAddress(h, PCSTR(b"MidaAntidebugGetAttestation\0".as_ptr())) };
-        let shut = unsafe { GetProcAddress(h, PCSTR(b"MidaAntidebugShutdown\0".as_ptr())) };
-        let (Some(init), Some(get), Some(shut)) = (init, get, shut) else {
+    /// Resolve the MIDA C ABI exports by parsing the PE export directory
+    /// from the TARGET process memory (ReadProcessMemory).
+    ///
+    /// ADR-5B: the runtime DLL is loaded only in the target process; the
+    /// debugger cannot use GetProcAddress for it. We parse the export
+    /// directory of the loaded image in target memory and return the RVA
+    /// of each named export (module_base + RVA = target address).
+    unsafe fn resolve_mida_exports_remote(
+        &self,
+        target: HANDLE,
+        module_base: usize,
+    ) -> Result<MidaExports, RuntimeLoadError> {
+        use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory as RPM;
+
+        // 1. DOS header -> e_lfanew.
+        let mut dos = [0u8; 0x40];
+        let rd = unsafe {
+            RPM(
+                target,
+                module_base as *const core::ffi::c_void,
+                dos.as_mut_ptr() as *mut core::ffi::c_void,
+                dos.len(),
+                None,
+            )
+        };
+        if rd.is_err() {
+            return Err(RuntimeLoadError::ExportResolutionFailed(
+                "remote read DOS header failed".to_string(),
+            ));
+        }
+        if &dos[0..2] != b"MZ" {
+            return Err(RuntimeLoadError::ExportResolutionFailed(
+                "remote image missing MZ".to_string(),
+            ));
+        }
+        let e_lfanew = u32::from_le_bytes([dos[0x3C], dos[0x3D], dos[0x3E], dos[0x3F]]) as usize;
+
+        // 2. PE header: read up to the data directories (0x98 bytes covers
+        //    signature + COFF + optional header + first data directory).
+        let pe_base = module_base + e_lfanew;
+        let mut pe = [0u8; 0x98];
+        let rd2 = unsafe {
+            RPM(
+                target,
+                pe_base as *const core::ffi::c_void,
+                pe.as_mut_ptr() as *mut core::ffi::c_void,
+                pe.len(),
+                None,
+            )
+        };
+        if rd2.is_err() {
+            return Err(RuntimeLoadError::ExportResolutionFailed(
+                "remote read PE header failed".to_string(),
+            ));
+        }
+        let magic = u16::from_le_bytes([pe[0x18], pe[0x19]]);
+        // pe[] starts at the PE signature; the optional header begins at
+        // pe+0x18, and the export data directory lives at optional+0x70
+        // (PE32+) / +0x60 (PE32).
+        let dd_off = if magic == 0x20B {
+            0x18 + 0x70
+        } else {
+            0x18 + 0x60
+        };
+        let exp_rva =
+            u32::from_le_bytes([pe[dd_off], pe[dd_off + 1], pe[dd_off + 2], pe[dd_off + 3]])
+                as usize;
+        let exp_size = u32::from_le_bytes([
+            pe[dd_off + 4],
+            pe[dd_off + 5],
+            pe[dd_off + 6],
+            pe[dd_off + 7],
+        ]) as usize;
+        if exp_rva == 0 || exp_size == 0 {
+            return Err(RuntimeLoadError::ExportResolutionFailed(
+                "remote image has no export directory".to_string(),
+            ));
+        }
+        // 3. Export directory: read a bounded window.
+        let win = exp_size.min(0x10000);
+        let mut ed = vec![0u8; win];
+        let rd3 = unsafe {
+            RPM(
+                target,
+                (module_base + exp_rva) as *const core::ffi::c_void,
+                ed.as_mut_ptr() as *mut core::ffi::c_void,
+                win,
+                None,
+            )
+        };
+        if rd3.is_err() {
+            return Err(RuntimeLoadError::ExportResolutionFailed(
+                "remote read export directory failed".to_string(),
+            ));
+        }
+        let num_funcs = u32::from_le_bytes([ed[0x14], ed[0x15], ed[0x16], ed[0x17]]) as usize;
+        let num_names = u32::from_le_bytes([ed[0x18], ed[0x19], ed[0x1A], ed[0x1B]]) as usize;
+        let funcs_rva = u32::from_le_bytes([ed[0x1C], ed[0x1D], ed[0x1E], ed[0x1F]]) as usize;
+        let names_rva = u32::from_le_bytes([ed[0x20], ed[0x21], ed[0x22], ed[0x23]]) as usize;
+        let ords_rva = u32::from_le_bytes([ed[0x24], ed[0x25], ed[0x26], ed[0x27]]) as usize;
+        if num_names == 0 || names_rva == 0 || funcs_rva == 0 || ords_rva == 0 {
+            return Err(RuntimeLoadError::ExportResolutionFailed(
+                "remote export directory incomplete".to_string(),
+            ));
+        }
+        // Helper: read a u32 from target at an absolute address.
+        fn rd_u32(target: HANDLE, addr: usize) -> Result<u32, RuntimeLoadError> {
+            let mut b = [0u8; 4];
+            let r = unsafe {
+                RPM(
+                    target,
+                    addr as *const core::ffi::c_void,
+                    b.as_mut_ptr() as *mut core::ffi::c_void,
+                    4,
+                    None,
+                )
+            };
+            if r.is_err() {
+                return Err(RuntimeLoadError::ExportResolutionFailed(
+                    "remote read u32 failed".to_string(),
+                ));
+            }
+            Ok(u32::from_le_bytes(b))
+        }
+        // Read the name-pointer array and ordinal array (bounded).
+        let names_bytes = num_names * 4;
+        if names_bytes > 0x10000 {
+            return Err(RuntimeLoadError::ExportResolutionFailed(
+                "export name array too large".to_string(),
+            ));
+        }
+        let mut names = vec![0u8; names_bytes];
+        let rn = unsafe {
+            RPM(
+                target,
+                (module_base + names_rva) as *const core::ffi::c_void,
+                names.as_mut_ptr() as *mut core::ffi::c_void,
+                names_bytes,
+                None,
+            )
+        };
+        if rn.is_err() {
+            return Err(RuntimeLoadError::ExportResolutionFailed(
+                "remote read name array failed".to_string(),
+            ));
+        }
+        let mut ords = vec![0u8; names_bytes];
+        let ro = unsafe {
+            RPM(
+                target,
+                (module_base + ords_rva) as *const core::ffi::c_void,
+                ords.as_mut_ptr() as *mut core::ffi::c_void,
+                names_bytes,
+                None,
+            )
+        };
+        if ro.is_err() {
+            return Err(RuntimeLoadError::ExportResolutionFailed(
+                "remote read ordinal array failed".to_string(),
+            ));
+        }
+        let mut found: [Option<usize>; 3] = [None, None, None];
+        let want: [&[u8]; 3] = [
+            b"MidaAntidebugInitialize",
+            b"MidaAntidebugGetAttestation",
+            b"MidaAntidebugShutdown",
+        ];
+        for i in 0..num_names {
+            let name_ptr_rva = u32::from_le_bytes([
+                names[i * 4],
+                names[i * 4 + 1],
+                names[i * 4 + 2],
+                names[i * 4 + 3],
+            ]) as usize;
+            if name_ptr_rva == 0 {
+                continue;
+            }
+            // Read the name string (bounded 64 chars).
+            let mut name = Vec::with_capacity(64);
+            for k in 0..64usize {
+                let mut ch = [0u8; 1];
+                let rc = unsafe {
+                    RPM(
+                        target,
+                        (module_base + name_ptr_rva + k) as *const core::ffi::c_void,
+                        ch.as_mut_ptr() as *mut core::ffi::c_void,
+                        1,
+                        None,
+                    )
+                };
+                if rc.is_err() {
+                    break;
+                }
+                if ch[0] == 0 {
+                    break;
+                }
+                name.push(ch[0]);
+            }
+            let ord = u16::from_le_bytes([ords[i * 2], ords[i * 2 + 1]]) as u32;
+            for (wi, w) in want.iter().enumerate() {
+                if found[wi].is_none() && name.as_slice() == *w {
+                    // The MSVC/Rust link.exe export ordinal array is 0-based
+                    // for #[no_mangle] exports even when Base=1: ord=0 maps to
+                    // AddressOfFunctions[0], ord=1 to [1], etc. Use the
+                    // ordinal directly as the function index.
+                    let func_idx = ord as usize;
+                    if func_idx < num_funcs {
+                        let func_rva = rd_u32(target, module_base + funcs_rva + func_idx * 4)?;
+                        if func_rva != 0 {
+                            found[wi] = Some(module_base + func_rva as usize);
+                        }
+                    }
+                }
+            }
+        }
+        let (Some(init), Some(get), Some(shut)) = (found[0], found[1], found[2]) else {
             return Err(RuntimeLoadError::ExportResolutionFailed(format!(
-                "missing export: init={} get={} shut={}",
-                init.is_some(),
-                get.is_some(),
-                shut.is_some()
+                "remote export missing: init={} get={} shut={}",
+                found[0].is_some(),
+                found[1].is_some(),
+                found[2].is_some()
             )));
         };
         Ok(MidaExports {
-            initialize: init as usize,
-            get_attestation: get as usize,
-            shutdown: shut as usize,
+            initialize: init,
+            get_attestation: get,
+            shutdown: shut,
         })
     }
 
+    /// Find the full 64-bit base address of a module by name substring
+    /// in the target process (PEB.Ldr InMemoryOrderModuleList walk).
+    ///
+    /// # Safety
+    /// `target` must be a valid process handle.
+    unsafe fn find_module_base_in_target(
+        &self,
+        target: HANDLE,
+        name_substr: &str,
+    ) -> Result<usize, RuntimeLoadError> {
+        use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory as RPM;
+        // PEB via NtQueryInformationProcess.
+        use windows::Wdk::System::Threading::PROCESSINFOCLASS;
+        use windows::Win32::System::Threading::PROCESS_BASIC_INFORMATION;
+        let mut pbi = PROCESS_BASIC_INFORMATION::default();
+        let mut ret_len: u32 = 0;
+        // SAFETY: valid handle + initialized struct.
+        let status = unsafe {
+            windows::Wdk::System::Threading::NtQueryInformationProcess(
+                target,
+                PROCESSINFOCLASS(0),
+                (&mut pbi as *mut PROCESS_BASIC_INFORMATION) as *mut core::ffi::c_void,
+                core::mem::size_of::<PROCESS_BASIC_INFORMATION>() as u32,
+                &mut ret_len,
+            )
+        };
+        if status != windows::Win32::Foundation::STATUS_SUCCESS {
+            return Err(RuntimeLoadError::ExportResolutionFailed(format!(
+                "NtQueryInformationProcess: {status:?}"
+            )));
+        }
+        let peb = pbi.PebBaseAddress as u64;
+        if peb == 0 {
+            return Err(RuntimeLoadError::ExportResolutionFailed(
+                "PEB null".to_string(),
+            ));
+        }
+        // PEB+0x18 = Ldr (PEB_LDR_DATA), +0x20 = InMemoryOrderModuleList.
+        let ldr_ptr = read_target_u64(target, peb + 0x18)?;
+        if ldr_ptr == 0 {
+            return Err(RuntimeLoadError::ExportResolutionFailed(
+                "Ldr null".to_string(),
+            ));
+        }
+        let list_head = ldr_ptr + 0x20;
+        let mut entry = read_target_u64(target, list_head)?;
+        let mut visited = 0u32;
+        while entry != 0 && entry != list_head && visited < 512 {
+            visited += 1;
+            // InMemoryOrderLinks is at +0x10 of LDR_DATA_TABLE_ENTRY; the
+            // entry pointer we hold points at the LIST_ENTRY, so:
+            //   DllBase = entry - 0x10 + 0x20 = entry + 0x10
+            //   FullDllName (UNICODE_STRING) = entry - 0x10 + 0x38 = entry + 0x28
+            // InMemoryOrderLinks lives at LDR_DATA_TABLE_ENTRY+0x10, so the
+            // LIST_ENTRY we hold points at entry_base+0x10:
+            //   DllBase      = entry_base + 0x30 = entry + 0x20
+            //   FullDllName  = entry_base + 0x48 (UNICODE_STRING) = entry + 0x38
+            let dll_base = read_target_u64(target, entry + 0x20)?;
+            let unicode_len = read_target_u16(target, entry + 0x38)? as usize;
+            let unicode_buf = read_target_u64(target, entry + 0x40)?;
+            if unicode_buf != 0 && unicode_len > 0 && unicode_len <= 1024 {
+                let mut bytes = vec![0u8; unicode_len];
+                let rd = unsafe {
+                    RPM(
+                        target,
+                        unicode_buf as *const core::ffi::c_void,
+                        bytes.as_mut_ptr() as *mut core::ffi::c_void,
+                        unicode_len,
+                        None,
+                    )
+                };
+                if rd.is_ok() {
+                    // FullDllName is UTF-16LE; decode to UTF-16 units then compare.
+                    let units: Vec<u16> = bytes
+                        .chunks_exact(2)
+                        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                        .collect();
+                    let lower: String = String::from_utf16_lossy(&units).to_lowercase();
+                    if lower.contains(name_substr) {
+                        return Ok(dll_base as usize);
+                    }
+                }
+            }
+            entry = read_target_u64(target, entry)?;
+        }
+        Ok(0)
+    }
     /// Remote MidaAntidebugShutdown (best-effort during cleanup).
     #[allow(dead_code)] // exercised by loader integration tests
     ///
@@ -883,6 +1278,7 @@ impl RuntimeLoader {
         &self,
         target: HANDLE,
         loaded: &LoadedRuntime,
+        drain: &mut dyn FnMut() -> Option<u32>,
     ) -> Result<RemoteCallResult, RuntimeLoadError> {
         let args = ThunkArgs {
             fn_ptr: loaded.exports.shutdown as u64,
@@ -894,7 +1290,7 @@ impl RuntimeLoader {
             arg5: 0,
             reserved: 0,
         };
-        unsafe { self.thunk_call(target, &args) }
+        unsafe { self.thunk_call(target, &args, drain) }
     }
 
     /// Free the remote allocations (path + params) after load.
@@ -910,6 +1306,54 @@ impl RuntimeLoader {
             let _ = unsafe { VirtualFreeEx(target, loaded.remote_params, 0, MEM_RELEASE) };
         }
     }
+}
+
+/// Read a u64 from the target process at an absolute address.
+///
+/// # Safety
+/// `target` must be a valid process handle; `addr` must be readable in the target.
+unsafe fn read_target_u64(target: HANDLE, addr: u64) -> Result<u64, RuntimeLoadError> {
+    use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory as RPM;
+    let mut b = [0u8; 8];
+    let r = unsafe {
+        RPM(
+            target,
+            addr as *const core::ffi::c_void,
+            b.as_mut_ptr() as *mut core::ffi::c_void,
+            8,
+            None,
+        )
+    };
+    if r.is_err() {
+        return Err(RuntimeLoadError::ExportResolutionFailed(format!(
+            "remote read u64 @ {addr:#x} failed"
+        )));
+    }
+    Ok(u64::from_le_bytes(b))
+}
+
+/// Read a u16 from the target process at an absolute address.
+///
+/// # Safety
+/// `target` must be a valid process handle; `addr` must be readable in the target.
+unsafe fn read_target_u16(target: HANDLE, addr: u64) -> Result<u16, RuntimeLoadError> {
+    use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory as RPM;
+    let mut b = [0u8; 2];
+    let r = unsafe {
+        RPM(
+            target,
+            addr as *const core::ffi::c_void,
+            b.as_mut_ptr() as *mut core::ffi::c_void,
+            2,
+            None,
+        )
+    };
+    if r.is_err() {
+        return Err(RuntimeLoadError::ExportResolutionFailed(format!(
+            "remote read u16 @ {addr:#x} failed"
+        )));
+    }
+    Ok(u16::from_le_bytes(b))
 }
 
 /// Build the raw bytes of a MidaInitParams blob for the target process.
@@ -1095,6 +1539,7 @@ pub fn run_runtime_loader(
     target_pid: u32,
     profile_id: &str,
     profile_digest: &str,
+    drain: &mut dyn FnMut() -> Option<u32>,
 ) -> Result<crate::unpacker::antidebug_controller::LoaderResult, RuntimeLoadError> {
     let authority = runtime_authority()?;
     let Some(runtime_path) = runtime_artifact_path() else {
@@ -1117,6 +1562,7 @@ pub fn run_runtime_loader(
             profile_id,
             profile_digest,
             &expected_surfaces,
+            drain,
         )
     }?;
     // Provenance binding: verify the runtime's provenance record against the
