@@ -9,11 +9,16 @@ use mida_antidebug_runtime::attestation::{
     AttestationError, HookFailure, HookInventory, RuntimeAttestation, ARCH_X86_64,
     ATTESTATION_SCHEMA,
 };
-use mida_antidebug_runtime::provenance::{Provenance, PROVENANCE_SCHEMA};
+use mida_antidebug_runtime::provenance::{
+    Provenance, ProvenanceError, KIND_RUNTIME_X64, PROVENANCE_SCHEMA,
+};
 use mida_antidebug_runtime::telemetry::{
     TelemetryChannel, TelemetryError, TelemetryMessage, TelemetryQuery, TelemetryState,
     TELEMETRY_SCHEMA,
 };
+
+const TEST_PID: u32 = 4242;
+const TEST_MODULE_BASE: u64 = 0x0000_7ff6_0000_0000;
 
 fn expected_surfaces() -> Vec<String> {
     vec![
@@ -28,6 +33,8 @@ fn foundation_attestation() -> RuntimeAttestation {
         "abc123".to_string(),
         "oreans_origin_x64_v1".to_string(),
         "deadbeef".to_string(),
+        TEST_PID,
+        TEST_MODULE_BASE,
         &expected_surfaces(),
         "v0.1.0".to_string(),
         "rustc".to_string(),
@@ -46,6 +53,9 @@ fn attestation_roundtrip_json() {
     assert_eq!(att, back);
     assert_eq!(back.schema, ATTESTATION_SCHEMA);
     assert_eq!(back.architecture, ARCH_X86_64);
+    // target identity survives round-trip
+    assert_eq!(back.target_pid, TEST_PID);
+    assert_eq!(back.module_base, TEST_MODULE_BASE);
 }
 
 #[test]
@@ -125,6 +135,61 @@ fn attestation_third_party_undeclared_rejected() {
 }
 
 #[test]
+fn attestation_target_pid_missing_rejected() {
+    let mut att = foundation_attestation();
+    att.target_pid = 0;
+    assert_eq!(att.validate(), Err(AttestationError::TargetPidMissing));
+}
+
+#[test]
+fn attestation_module_base_zero_rejected() {
+    let mut att = foundation_attestation();
+    att.module_base = 0;
+    assert_eq!(att.validate(), Err(AttestationError::ModuleBaseZero));
+}
+
+#[test]
+fn attestation_verify_identity_ok() {
+    let att = foundation_attestation();
+    assert!(att.verify_identity(TEST_PID, TEST_MODULE_BASE).is_ok());
+}
+
+#[test]
+fn attestation_verify_identity_pid_mismatch_rejected() {
+    let att = foundation_attestation();
+    let err = att
+        .verify_identity(TEST_PID + 1, TEST_MODULE_BASE)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        AttestationError::TargetPidMismatch {
+            expected: 4243,
+            got: TEST_PID
+        }
+    ));
+}
+
+#[test]
+fn attestation_verify_identity_module_base_mismatch_rejected() {
+    let att = foundation_attestation();
+    let err = att
+        .verify_identity(TEST_PID, TEST_MODULE_BASE + 0x1000)
+        .unwrap_err();
+    assert!(matches!(err, AttestationError::ModuleBaseMismatch { .. }));
+}
+
+#[test]
+fn attestation_verify_identity_zero_module_base_rejected() {
+    // Attestation claims module_base = 0 -> verify_identity must reject.
+    let mut att = foundation_attestation();
+    att.module_base = 0;
+    let err = att.verify_identity(TEST_PID, 0).unwrap_err();
+    assert_eq!(err, AttestationError::ModuleBaseZero);
+    // validate() rejects it too.
+    assert_eq!(att.validate(), Err(AttestationError::ModuleBaseZero));
+}
+
+#[test]
 fn attestation_hook_failures_rejected() {
     // Simulate a runtime that claims installed == expected but has failures.
     let mut att = foundation_attestation();
@@ -145,8 +210,31 @@ fn attestation_missing_fields_rejected_by_serde() {
     // Missing field in JSON -> deserialization error (no defaulting).
     let json = r#"{"schema":"mida.antidebug-runtime-attestation/v1"}"#;
     assert!(RuntimeAttestation::from_canonical_json(json).is_err());
-    // Unknown field -> also rejected (deny_unknown_fields semantics via serde
-    // default is permissive; assert at least missing fields are rejected).
+}
+
+#[test]
+fn attestation_unknown_field_rejected_by_serde() {
+    // deny_unknown_fields: an unknown field must be rejected, not ignored.
+    let att = foundation_attestation();
+    let mut json = att.to_canonical_json().unwrap();
+    // inject an unknown field before the closing brace
+    json.pop();
+    json.push_str(",\"spoofed_field\":\"x\"}");
+    assert!(RuntimeAttestation::from_canonical_json(&json).is_err());
+}
+
+#[test]
+fn attestation_hook_failure_unknown_field_rejected_by_serde() {
+    let att = foundation_attestation();
+    let mut json = att.to_canonical_json().unwrap();
+    // unknown field inside a hook_failure entry - use a targeted string edit
+    let marker = "\"hook_failures\":[";
+    let idx = json.find(marker).unwrap();
+    json.insert_str(
+        idx + marker.len(),
+        "{\"surface_id\":\"AD-PROC-001\",\"reason\":\"x\",\"evil\":true},",
+    );
+    assert!(RuntimeAttestation::from_canonical_json(&json).is_err());
 }
 
 #[test]
@@ -166,7 +254,7 @@ fn hook_inventory_completeness() {
 // ----------------------------------------------------------------
 
 #[test]
-fn provenance_roundtrip_and_third_party_none() {
+fn provenance_roundtrip_and_dependencies_declared() {
     let p = Provenance::current(
         "sha256hex".to_string(),
         12345,
@@ -177,7 +265,16 @@ fn provenance_roundtrip_and_third_party_none() {
     let back = Provenance::from_canonical_json(&json).unwrap();
     assert_eq!(p, back);
     assert_eq!(back.schema, PROVENANCE_SCHEMA);
-    assert_eq!(back.third_party, "none");
+    // kind present and correct for an x64 runtime
+    assert_eq!(back.kind, KIND_RUNTIME_X64);
+    // third_party is an honest declaration, not a bare "none"
+    assert_eq!(back.third_party, "build-and-serialization-only");
+    // every linked third-party crate is listed and auditable
+    let names: Vec<&str> = back.dependencies.iter().map(|d| d.name.as_str()).collect();
+    assert!(names.contains(&"serde"));
+    assert!(names.contains(&"serde_json"));
+    assert!(names.contains(&"thiserror"));
+    assert!(back.dependencies.iter().all(|d| !d.anti_debug));
     assert_eq!(back.architecture, ARCH_X86_64);
 }
 
@@ -187,8 +284,62 @@ fn provenance_third_party_undeclared_rejected() {
     p.third_party = String::new();
     assert!(matches!(
         p.validate(),
-        Err(mida_antidebug_runtime::provenance::ProvenanceError::ThirdPartyUndeclared)
+        Err(ProvenanceError::ThirdPartyUndeclared)
     ));
+}
+
+#[test]
+fn provenance_kind_missing_rejected() {
+    let mut p = Provenance::current("sha".to_string(), 1, "tc".to_string(), "rev".to_string());
+    p.kind = String::new();
+    assert!(matches!(p.validate(), Err(ProvenanceError::KindInvalid(_))));
+}
+
+#[test]
+fn provenance_kind_invalid_rejected() {
+    let mut p = Provenance::current("sha".to_string(), 1, "tc".to_string(), "rev".to_string());
+    p.kind = "runtime-arm64".to_string();
+    assert!(matches!(p.validate(), Err(ProvenanceError::KindInvalid(_))));
+}
+
+#[test]
+fn provenance_kind_architecture_mismatch_rejected() {
+    let mut p = Provenance::current("sha".to_string(), 1, "tc".to_string(), "rev".to_string());
+    // runtime-x64 kind with x86 architecture is inconsistent
+    p.architecture = "x86".to_string();
+    assert!(matches!(
+        p.validate(),
+        Err(ProvenanceError::KindArchitectureMismatch { .. })
+    ));
+}
+
+#[test]
+fn provenance_dependencies_undeclared_rejected() {
+    let mut p = Provenance::current("sha".to_string(), 1, "tc".to_string(), "rev".to_string());
+    p.dependencies = vec![];
+    assert!(matches!(
+        p.validate(),
+        Err(ProvenanceError::DependenciesUndeclared)
+    ));
+}
+
+#[test]
+fn provenance_dependency_anti_debug_rejected() {
+    let mut p = Provenance::current("sha".to_string(), 1, "tc".to_string(), "rev".to_string());
+    p.dependencies[0].anti_debug = true;
+    assert!(matches!(
+        p.validate(),
+        Err(ProvenanceError::DependencyAntiDebug(_))
+    ));
+}
+
+#[test]
+fn provenance_unknown_field_rejected_by_serde() {
+    let p = Provenance::current("sha".to_string(), 1, "tc".to_string(), "rev".to_string());
+    let mut json = p.to_canonical_json().unwrap();
+    json.pop();
+    json.push_str(",\"sneaky\":1}");
+    assert!(Provenance::from_canonical_json(&json).is_err());
 }
 
 // ----------------------------------------------------------------
@@ -196,7 +347,7 @@ fn provenance_third_party_undeclared_rejected() {
 // ----------------------------------------------------------------
 
 fn channel() -> TelemetryChannel {
-    let ch = TelemetryChannel::new("mida-adr4-test", 4242, "digest123");
+    let ch = TelemetryChannel::new("mida-adr4-test", TEST_PID, "digest123");
     ch.mark_ready().unwrap();
     ch
 }
@@ -206,7 +357,7 @@ fn telemetry_normal_request_response() {
     let ch = channel();
     let resp = ch.request(TelemetryQuery::Ping).unwrap();
     assert!(resp.ok);
-    assert_eq!(resp.target_pid, 4242);
+    assert_eq!(resp.target_pid, TEST_PID);
     assert_eq!(resp.channel_id, "mida-adr4-test");
     assert_eq!(resp.status, TelemetryState::Ready);
     // sequence monotonic across requests
@@ -319,6 +470,25 @@ fn telemetry_shutdown_report() {
         .messages
         .iter()
         .any(|m| matches!(m, TelemetryMessage::ShutdownStatus { clean: true, .. })));
+}
+
+#[test]
+fn telemetry_unknown_field_in_response_rejected_by_serde() {
+    // A response carrying an unknown field must fail to parse.
+    let ch = channel();
+    let resp = ch.request(TelemetryQuery::Ping).unwrap();
+    let json = serde_json::to_string(&resp).unwrap();
+    // round-trips
+    let back: mida_antidebug_runtime::telemetry::TelemetryResponse =
+        serde_json::from_str(&json).unwrap();
+    assert_eq!(back, resp);
+    // unknown field rejected
+    let mut bad = json.clone();
+    bad.pop();
+    bad.push_str(",\"unexpected\":true}");
+    let r: Result<mida_antidebug_runtime::telemetry::TelemetryResponse, _> =
+        serde_json::from_str(&bad);
+    assert!(r.is_err());
 }
 
 #[test]

@@ -1,8 +1,9 @@
 # MIDA-ADR-4 x64 Runtime Foundation 设计文档
 
 > **工作令：** MIDA-ADR-4 —— 设计并实现自有 x64 anti-debug runtime 基础层：加载、初始化、attestation、telemetry 与 fail-closed 生命周期。
-> **状态：** 实现完成（基础层；hook surface 未实现，诚实报告 unsupported）。
+> **状态：** 实现完成 + ADR-4-CORRECTION 修正完成（target identity 绑定、严格 schema、provenance kind、依赖声明、benign host 验证）。
 > **基线：** `ed42720428e87d1fbcf10ca091bec2bc31bf388c`（ADR-3B-CORRECTION 提交）。前置：ADR-0/1/2/3/3A/3B 全部完成。
+> **修正基线：** `53d4c76d9baca1f6951141f601964b865cf0a3d9`（ADR-4 提交）；ADR-4-CORRECTION 在其上追加。
 > **性质：** 自有 runtime 基础层。未实现 anti-debug hook surface（ADR-5+）；未实现 injector；未执行 protected sample；未执行 ScyllaHide。
 
 ## 1. 目标与范围
@@ -67,13 +68,15 @@ ABI 规则（ADR-4 §2）：
   "runtime_sha256": "...",
   "profile_id": "oreans_origin_x64_v1",
   "profile_digest": "...",
+  "target_pid": 1234,
+  "module_base": 140694538682368,
   "initialized": true,
   "hooks_expected": ["AD-PROC-001", "AD-PROC-002", "AD-PROC-003"],
   "hooks_installed": [],
   "hook_failures": [{"surface_id": "AD-PROC-001", "reason": "unsupported in ADR-4 foundation ..."}, ...],
   "telemetry_channel": "ready",
   "cleanup_handler_registered": true,
-  "third_party": "none",
+  "third_party": "build-and-serialization-only",
   "source_revision": "...",
   "toolchain": "..."
 }
@@ -90,12 +93,17 @@ ABI 规则（ADR-4 §2）：
 | cleanup_handler_registered != true | CleanupHandlerMissing |
 | profile_digest 为空 | ProfileDigestMissing |
 | third_party 为空 | ThirdPartyUndeclared |
+| target_pid == 0 | TargetPidMissing |
+| module_base == 0 | ModuleBaseZero |
+| verify_identity(pid, base) 不匹配 | TargetPidMismatch / ModuleBaseMismatch |
 | hooks_installed.len() != hooks_expected.len() | HookInventoryIncomplete |
 | hook_failures 非空 | HookFailures |
 
 **关键语义：**
 
 - runtime 只报告，不授权。sample_id/profile_id/profile_digest/target identity 由 controller 选择，runtime 不得修改；
+- **target identity 绑定（ADR-4-CORRECTION）**：attestation 携带 `target_pid` + `module_base`，controller 必须用 `verify_identity(expected_pid, expected_module_base)` 交叉校验后才能接受 attestation（防跨进程搬用）；
+- **严格 schema（ADR-4-CORRECTION）**：`RuntimeAttestation`/`HookFailure`/`HookInventory` 及 telemetry 全部 `#[serde(deny_unknown_fields)]`——未知字段在解析期即拒绝（ADR-0 契约：字段缺失/类型错误/未知 schema 字段 → 拒绝）；
 - `from_canonical_json` 是**传输解析**（不自动 validate），controller 读取 `hooks_installed`/`hook_failures` 后以 `validate()` 做决策 gate——诚实但不完整的 runtime 也能被解析并正确 fail-closed；
 - ADR-4 foundation 的 attestation 是**诚实的 unsupported**：`hooks_installed=[]`、`hook_failures` 列出全部 expected surface 为 unsupported。controller 将得到 `AntiDebugRuntimePartialHooks`——这是正确的 fail-closed 结果，不是失败；
 - 禁止：空 hooks_expected、虚报 hooks_installed、把 runtime loaded 当 hooks ready、把 candidate 当 hard hook、把 ScyllaHide 结果填进 MIDA attestation。
@@ -125,18 +133,24 @@ TelemetryMessage 至少报告：`RuntimeInitialized`、`AttestationReady`、`Hoo
 {
   "schema": "mida.antidebug-provenance/v1",
   "artifact_id": "mida-antidebug-runtime-x64",
+  "kind": "runtime-x64",
   "sha256": "...",
   "size_bytes": 0,
   "architecture": "x86_64",
   "toolchain": "...",
   "source_ref": "...",
-  "third_party": "none",
+  "third_party": "build-and-serialization-only",
+  "dependencies": [
+    {"name":"serde","version":"1.0.229","license":"MIT OR Apache-2.0","source":"crates.io","role":"serialization","anti_debug":false},
+    {"name":"serde_json","version":"1.0.151","license":"MIT OR Apache-2.0","source":"crates.io","role":"serialization","anti_debug":false},
+    {"name":"thiserror","version":"1.0.69","license":"MIT OR Apache-2.0","source":"crates.io","role":"error-definition","anti_debug":false}
+  ],
   "license": "GPL-3.0-only",
   "build_repro": "--locked offline build; out-of-tree target"
 }
 ```
 
-**third_party = "none"**：ADR-4 runtime 只依赖 serde/serde_json/thiserror（纯 Rust 库，无运行时注入/反调试逻辑）。任何未来外部 crate 必须在 provenance 如实声明；不得把第三方实现标为自研。
+**third_party 声明语义（ADR-4-CORRECTION）**：本 runtime 链接的 serde/serde_json/thiserror 是第三方 crate，因此**不写 "none"**（"none" 只允许在完全没有外部 crate 时使用）。声明为 `build-and-serialization-only` 并逐项列出依赖（名称/锁定版本/许可证/来源/角色/anti_debug=false）。这些 crate 只参与构建与序列化，不含任何 anti-debug 行为、不注入、不拦截；runtime 的 anti-debug 行为完全来自 `crates/antidebug-runtime` 自有代码。任何未来新增外部 crate 必须同步更新该声明。
 
 ## 7. 与 ADR-3B controller 的接线
 
@@ -152,25 +166,26 @@ hooks complete            == Proceed 前置条件之一
 
 ## 8. 测试覆盖
 
-`tests/attestation.rs`（25 tests，全部离线 rlib）：
+`tests/attestation.rs`（40 tests，全部离线 rlib；ADR-4-CORRECTION 后）：
 
-- **Attestation（10）**：JSON round-trip、foundation 诚实 unsupported、schema/arch/init/telemetry/cleanup/digest/third-party/hook-failures/missing-fields 拒绝、inventory completeness；
-- **Provenance（2）**：round-trip + third_party=none、third_party 未声明拒绝；
-- **Telemetry（13）**：正常 request/response、sequence 单调、PID/digest/channel-id mismatch、out-of-order、duplicate、not-ready、closed、shutdown report、repeated start/stop 无资源增长。
+- **Attestation（19）**：JSON round-trip（含 target identity 字段）、foundation 诚实 unsupported、schema/arch/init/telemetry/cleanup/digest/third-party/hook-failures/missing-fields 拒绝、inventory completeness、target_pid 缺失拒绝、module_base 零拒绝、verify_identity 正常/pid 不匹配/base 不匹配/base 零拒绝、unknown field 拒绝（attestation 与 HookFailure 两级）；
+- **Provenance（8）**：round-trip + kind=runtime-x64 + dependencies 声明、third_party 未声明拒绝、kind 缺失/非法拒绝、kind/architecture 不一致拒绝、dependencies 未声明拒绝、dependency anti_debug 拒绝、unknown field 拒绝；
+- **Telemetry（13）**：正常 request/response、sequence 单调、PID/digest/channel-id mismatch、out-of-order、duplicate、not-ready、closed、shutdown report、response unknown field 拒绝、repeated start/stop 无资源增长。
 
-**Host harness：** 无 protected sample 的 benign harness 通过 rlib API 直接驱动（初始化 → attestation → telemetry → shutdown）；FFI 单例由导出函数覆盖。不加载任何 protected sample，不执行 live differential。
+**Benign host harness（ADR-4-CORRECTION 补充验收）**：`tests/benign_host.rs`（源码入库；exe 编译在仓库外 `D:\tmp\magicmida-adr4c-target`，不入库）以纯动态加载（LoadLibraryW/GetProcAddress/FreeLibrary）驱动 runtime DLL，执行 5 轮完整生命周期：LoadLibrary → Initialize → GetAttestation×2 → Shutdown → 确认 post-shutdown 返回 AlreadyShutdown → FreeLibrary。每轮记录句柄数：round 0 首载 DLL +4（固定开销），后续轮 0 增长，终值较基线 +4 无持续泄漏。动态加载保证 FreeLibrary 真正卸载模块，每轮重新 Initialize 成功（证明模块级状态随卸载重置）。不加载任何 protected sample，不执行 live differential。
 
 ## 9. 验收命令结果
 
 ```text
 cargo fmt --all -- --check                        ✅
 cargo check --workspace --tests --offline        ✅
-cargo test -p mida-antidebug-runtime --offline   ✅ (25 passed)
+cargo test -p mida-antidebug-runtime --offline   ✅ (40 passed, ADR-4-CORRECTION)
 cargo test -p mida-antidebug --offline           ✅ (27 passed)
 cargo test -p mida-cli --offline                ✅ (310+ passed)
 cargo test --workspace --offline                ✅
 RUSTFLAGS=-D warnings cargo check --workspace --all-features --tests --offline  ✅
 git diff --check                                 ✅
+benign_host.exe 5-round load/unload cycle        ✅ (BENIGN_HOST_OK, no handle growth)
 ```
 
 ## 10. 审计声明
@@ -181,3 +196,11 @@ git diff --check                                 ✅
 - 无 DLL/EXE 入库（cdylib 构建产物在 `D:\tmp\magicmida-adr4-target`，仓库外）；
 - 未复制 ScyllaHide 任何内容；third_party=none 属实；
 - 109 个历史未跟踪文件 + ADR-3A 修正文档未触碰。
+
+**ADR-4-CORRECTION 审计声明：**
+
+- 四个阻塞项全部修复：target identity（target_pid + module_base + verify_identity）、严格 schema（deny_unknown_fields 全覆盖 + 真实断言）、provenance kind（runtime-x64 + 一致性校验）、依赖声明（dependencies 列表 + third_party 语义澄清）；
+- benign host 重复 load/unload 验证完成（5 轮，无资源增长，DLL/EXE 不入库）；
+- 未执行 protected sample；未执行 ScyllaHide；未做差分；
+- 未修改 `crates/cli/**`、`crates/antidebug/**`、`crates/pe/**`、`crates/acceptance/**`、`crates/packers/**`；
+- workspace 测试全绿；`RUSTFLAGS=-D warnings` 通过；`git diff --check` 通过。

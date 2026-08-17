@@ -23,7 +23,7 @@
 | `mida.antidebug-evidence/v1` | 一次 unpack 尝试的完整证据包（含 attestation 与 probes） |
 | `mida.antidebug-provenance/v1` | artifact provenance（见 CLEAN_ROOM_RULES §7） |
 
-所有 schema **fail-closed**：字段缺失、类型错误、未知 schema 版本 → 拒绝（不静默容忍）。
+所有 schema **fail-closed**：字段缺失、类型错误、未知 schema 版本 → 拒绝（不静默容忍）。**未知字段同样拒绝**：runtime attestation / provenance / telemetry 的所有结构化记录在解析期启用 `deny_unknown_fields`（ADR-4-CORRECTION 落实），不依赖"缺字段才失败"的宽松默认。
 
 `mida.antidebug-evidence/v1` 的 CLI 失败记录使用 `record_kind = "cli-failure"`（ADR-3B-CORRECTION 统一登记）：
 
@@ -86,8 +86,8 @@
 | `runtime_sha256` | 与 controller 期望的 runtime artifact hash 一致 |
 | `architecture` | 与目标架构一致（`x86_64` / `x86`） |
 | `profile_digest` | 与 controller 选择的 profile digest 一致 |
-| `target_pid` | 与本次启动的 target 一致（target identity 绑定） |
-| `module_base` | 非零；controller 在目标进程内可解析该模块 |
+| `target_pid` | 与本次启动的 target 一致（target identity 绑定）；controller 必须交叉校验（`verify_identity`），防跨进程搬用 attestation |
+| `module_base` | 非零；controller 在目标进程内可解析该模块；attestation 声称的 base 必须与 controller 解析值一致 |
 | `initialized` | 初始化函数已执行 |
 | `hooks_installed == hooks_expected` | 全部安装 |
 | `hook_failures` | 空数组 |
@@ -101,7 +101,7 @@
 | 错误 | 触发条件 |
 |---|---|
 | `AntiDebugRuntimeUnavailable` | runtime DLL/injector 缺失或不可读 |
-| `AntiDebugRuntimeIdentityMismatch` | runtime SHA-256 与期望不符 |
+| `AntiDebugRuntimeIdentityMismatch` | runtime SHA-256 与期望不符；attestation target_pid/module_base 与本次运行不符（跨进程搬用） |
 | `AntiDebugProfileMismatch` | profile 与 sample/architecture/digest 不匹配、unknown surface 出现在 hard_required、required_candidate 被误当 hard_required（ADR-3A 定案专用码） |
 | `AntiDebugRuntimeArchitectureMismatch` | runtime 架构与目标架构不符 |
 | `AntiDebugRuntimeInitializationFailed` | 初始化函数未执行 / initialized=false |
@@ -115,6 +115,7 @@
 不能只看 injector 返回码。controller 必须按序验证：
 
 1. **runtime module 已加载**：目标进程内能解析 module_base，且模块在目标内存中。
+1a. **target identity 交叉校验**：attestation.target_pid == 本次启动 PID；attestation.module_base == controller 解析值且非零（ADR-4-CORRECTION）。
 2. **module hash 正确**：运行时读回模块字节的 hash 与 `runtime_sha256` 一致（或等价：模块签名/绑定校验通过）。
 3. **初始化函数执行**：`initialized == true`。
 4. **profile digest 匹配**：`profile_digest` 与 controller 选择的 profile 一致。

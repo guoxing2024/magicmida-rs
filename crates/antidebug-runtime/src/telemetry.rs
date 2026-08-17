@@ -33,7 +33,7 @@ pub const TELEMETRY_SCHEMA: &str = "mida.antidebug-telemetry/v1";
 
 /// Channel state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum TelemetryState {
     Created,
     Ready,
@@ -42,7 +42,7 @@ pub enum TelemetryState {
 
 /// Telemetry message kinds the channel can report.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum TelemetryMessage {
     RuntimeInitialized,
     AttestationReady,
@@ -63,6 +63,7 @@ pub enum TelemetryMessage {
 
 /// A telemetry request from the controller.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TelemetryRequest {
     pub schema: String,
     pub channel_id: String,
@@ -75,7 +76,7 @@ pub struct TelemetryRequest {
 
 /// What the controller asks the runtime.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum TelemetryQuery {
     Ping,
     GetStatus,
@@ -85,6 +86,7 @@ pub enum TelemetryQuery {
 
 /// The runtime reply.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TelemetryResponse {
     pub schema: String,
     pub channel_id: String,

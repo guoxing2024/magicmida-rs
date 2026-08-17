@@ -84,15 +84,16 @@ ScyllaHide 只能作为**对照 oracle**，用于回答：
 |---|---|
 | `schema` | 固定 `mida.antidebug-provenance/v1` |
 | `artifact_id` | 内容寻址标识（SHA-256） |
-| `kind` | `runtime-x64` / `runtime-x86` / `controller` / `profile` / `attestation` / `evidence` |
+| `kind` | `runtime-x64` / `runtime-x86` / `controller` / `profile` / `attestation` / `evidence`；必填且必须在允许值内；kind/architecture 必须一致（x64 runtime 只能声明 `runtime-x64`，ADR-4-CORRECTION 落实校验） |
 | `sha256` | 文件级 SHA-256（runtime/controller/profile 为文件；attestation/evidence 为规范化 JSON 的 SHA-256） |
 | `size_bytes` | 文件大小 |
 | `architecture` | `x86_64` / `x86` |
 | `toolchain` | 构建工具链标识（如 rustc/msvc 版本） |
 | `source_ref` | 源码提交（`4fe2cc35…` 风格；runtime 发布时记录构建 revision） |
-| `third_party` | 第三方依赖声明：`none`，或 `{name, role: "oracle"|"reference-doc", license, source_url, sha256}` 列表（ScyllaHide 恒为 oracle） |
+| `third_party` | 第三方依赖声明：字面 `none` **仅当**完全没有外部 crate 时可用；否则必须写语义标签（如 `build-and-serialization-only`）并逐项列出 `dependencies`（名称/锁定版本/许可证/来源/角色/anti_debug 标志）。"纯 Rust"≠"无第三方"：只要链接了外部 crate（如 serde/serde_json/thiserror）就必须如实声明（ADR-4-CORRECTION）。ScyllaHide 恒为 oracle |
 | `license` | MIDA-ADR 自有代码许可证（仓库 GPL-3.0-only）；第三方 artifact 许可证**以实际源码和发布物为准**，不臆测 |
 | `build_repro` | 构建可复现性说明（`--locked` / 离线 / 环境） |
+| `dependencies` | 可选但 runtime 必填：外部 crate 逐项声明（`name`/`version`/`license`/`source`/`role`/`anti_debug`）；runtime 声明链接外部 crate 时此列表为空 → provenance 不完整（fail-closed） |
 
 **规则：** 许可证以实际源码和发布物为准；不得把“自编译第三方代码”标记为自研；`third_party` 字段缺失视为 provenance 不完整，attestation 拒绝（fail-closed）。
 

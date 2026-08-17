@@ -1,8 +1,15 @@
-//! Runtime attestation (`mida.antidebug-runtime-attestation/v1`).
+//! Runtime attestation ("mida.antidebug-runtime-attestation/v1").
 //!
 //! The runtime **reports**; the controller **authorizes**. This module
-//! defines the record shape, the fail-closed validation rules, and the
-//! canonical JSON encoding used for the attestation handshake.
+//! defines the record shape, the fail-closed validation rules, the
+//! target-identity binding, and the canonical JSON encoding used for
+//! the attestation handshake.
+//!
+//! Target-identity binding (ADR-4-CORRECTION, blocker 1): the attestation
+//! carries target_pid and module_base so it cannot be taken from one
+//! process and presented for another. The controller MUST cross-check
+//! both via [RuntimeAttestation::verify_identity] before treating the
+//! attestation as valid for the current run.
 
 use serde::{Deserialize, Serialize};
 
@@ -18,6 +25,7 @@ pub const RUNTIME_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Hook inventory: what the profile requires vs what is actually installed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HookInventory {
     /// Surface ids the profile requires (hard_required + candidates).
     pub hooks_expected: Vec<String>,
@@ -54,6 +62,7 @@ impl HookInventory {
 
 /// A hook installation failure.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HookFailure {
     pub surface_id: String,
     pub reason: String,
@@ -69,8 +78,14 @@ pub enum RuntimeStatus {
     Shutdown,
 }
 
-/// The runtime attestation record (`mida.antidebug-runtime-attestation/v1`).
+/// The runtime attestation record ("mida.antidebug-runtime-attestation/v1").
+///
+/// Unknown JSON fields are rejected at parse time
+/// (#[serde(deny_unknown_fields)]) so a schema drift can never be
+/// silently tolerated (ADR-0 evidence contract: missing field, wrong type
+/// and unknown schema field are all rejected).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeAttestation {
     pub schema: String,
     pub runtime_id: String,
@@ -80,13 +95,20 @@ pub struct RuntimeAttestation {
     pub runtime_sha256: String,
     pub profile_id: String,
     pub profile_digest: String,
+    /// Target process id this runtime instance is bound to (target identity
+    /// binding; must equal the launched target PID - ADR-4-CORRECTION).
+    pub target_pid: u32,
+    /// Base address of the loaded runtime module inside the target process
+    /// (non-zero; controller must be able to resolve it - ADR-4-CORRECTION).
+    pub module_base: u64,
     pub initialized: bool,
     pub hooks_expected: Vec<String>,
     pub hooks_installed: Vec<String>,
     pub hook_failures: Vec<HookFailure>,
     pub telemetry_channel: String,
     pub cleanup_handler_registered: bool,
-    /// Provenance of the runtime artifact (`mida.antidebug-provenance/v1`).
+    /// Provenance declaration of the runtime artifact
+    /// (mida.antidebug-provenance/v1 kind summary; full record separate).
     pub third_party: String,
     pub source_revision: String,
     pub toolchain: String,
@@ -99,6 +121,8 @@ impl RuntimeAttestation {
         runtime_sha256: String,
         profile_id: String,
         profile_digest: String,
+        target_pid: u32,
+        module_base: u64,
         expected_surfaces: &[String],
         source_revision: String,
         toolchain: String,
@@ -112,13 +136,15 @@ impl RuntimeAttestation {
             runtime_sha256,
             profile_id,
             profile_digest,
+            target_pid,
+            module_base,
             initialized: true,
             hooks_expected: inventory.hooks_expected,
             hooks_installed: inventory.hooks_installed,
             hook_failures: inventory.hook_failures,
             telemetry_channel: "ready".to_string(),
             cleanup_handler_registered: true,
-            third_party: "none".to_string(),
+            third_party: "build-and-serialization-only".to_string(),
             source_revision,
             toolchain,
         }
@@ -131,12 +157,45 @@ impl RuntimeAttestation {
 
     /// Parse from canonical JSON (transport: does NOT validate).
     ///
-    /// Validation is the controller's decision gate ([`Self::validate`]);
+    /// Validation is the controller decision gate ([Self::validate]);
     /// parsing must succeed even for an honest-but-incomplete runtime so the
-    /// controller can read `hooks_installed`/`hook_failures` and fail closed
-    /// with the correct code.
+    /// controller can read hooks_installed/hook_failures and fail closed
+    /// with the correct code. Unknown fields are rejected at parse time
+    /// (deny_unknown_fields), which is a transport-level fail-closed rule.
     pub fn from_canonical_json(s: &str) -> Result<Self, AttestationError> {
         serde_json::from_str(s).map_err(|e| AttestationError::Deserialization(e.to_string()))
+    }
+
+    /// Target-identity cross-check (controller side).
+    ///
+    /// The controller must call this before accepting the attestation:
+    /// - expected_pid = PID of the process the controller launched;
+    /// - expected_module_base = module base the controller resolved for
+    ///   the runtime module inside that process.
+    ///
+    /// Any mismatch is fail-closed ([AttestationError::TargetPidMismatch] /
+    /// [AttestationError::ModuleBaseMismatch]).
+    pub fn verify_identity(
+        &self,
+        expected_pid: u32,
+        expected_module_base: u64,
+    ) -> Result<(), AttestationError> {
+        if self.target_pid != expected_pid {
+            return Err(AttestationError::TargetPidMismatch {
+                expected: expected_pid,
+                got: self.target_pid,
+            });
+        }
+        if self.module_base == 0 {
+            return Err(AttestationError::ModuleBaseZero);
+        }
+        if self.module_base != expected_module_base {
+            return Err(AttestationError::ModuleBaseMismatch {
+                expected: expected_module_base,
+                got: self.module_base,
+            });
+        }
+        Ok(())
     }
 
     /// Fail-closed validation against the ADR-0 evidence contract rules.
@@ -150,6 +209,9 @@ impl RuntimeAttestation {
     /// - profile digest must be non-empty (controller cross-checks the value);
     /// - cleanup handler must be registered;
     /// - third_party must be declared (non-empty);
+    /// - target_pid must be non-zero and module_base must be non-zero
+    ///   (target identity binding; exact match is verified by
+    ///   [Self::verify_identity]);
     /// - unknown/missing fields are rejected by serde (no defaulting).
     pub fn validate(&self) -> Result<(), AttestationError> {
         if self.schema != ATTESTATION_SCHEMA {
@@ -176,6 +238,12 @@ impl RuntimeAttestation {
         }
         if self.third_party.is_empty() {
             return Err(AttestationError::ThirdPartyUndeclared);
+        }
+        if self.target_pid == 0 {
+            return Err(AttestationError::TargetPidMissing);
+        }
+        if self.module_base == 0 {
+            return Err(AttestationError::ModuleBaseZero);
         }
         if self.hooks_installed.len() != self.hooks_expected.len() {
             return Err(AttestationError::HookInventoryIncomplete {
@@ -207,6 +275,14 @@ pub enum AttestationError {
     ProfileDigestMissing,
     #[error("third_party provenance undeclared")]
     ThirdPartyUndeclared,
+    #[error("target pid missing (zero)")]
+    TargetPidMissing,
+    #[error("target pid mismatch: expected {expected}, got {got}")]
+    TargetPidMismatch { expected: u32, got: u32 },
+    #[error("module base is zero")]
+    ModuleBaseZero,
+    #[error("module base mismatch: expected {expected:#x}, got {got:#x}")]
+    ModuleBaseMismatch { expected: u64, got: u64 },
     #[error("hook inventory incomplete: expected {expected}, installed {installed}")]
     HookInventoryIncomplete { expected: usize, installed: usize },
     #[error("hook failures present: {0:?}")]

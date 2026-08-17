@@ -14,6 +14,8 @@
 //! - clear calling-thread constraint: all exports must be called from the
 //!   same thread that initialized the runtime (single-threaded protocol);
 //! - clear lifecycle: Initialize -> GetAttestation* -> Shutdown;
+//! - target identity: MidaInitParams carries target_pid + module_base; both
+//!   must be non-zero and are bound into the attestation (ADR-4-CORRECTION);
 //! - no dangling pointers: every output is copied into a caller-owned buffer;
 //! - panics are caught at the FFI boundary and converted to
 //!   [`MidaAntidebugError::InternalPanic`].
@@ -78,6 +80,9 @@ impl MidaAntidebugError {
 pub struct MidaInitParams {
     /// Target process id the runtime is bound to.
     pub target_pid: u32,
+    /// Base address of the loaded runtime module inside the target process
+    /// (resolved by the controller/injector; must be non-zero).
+    pub module_base: u64,
     /// Profile id chosen by the controller (runtime must not modify).
     pub profile_id: *const std::os::raw::c_char,
     /// Profile digest chosen by the controller (runtime must not modify).
@@ -104,6 +109,8 @@ pub fn build_attestation_json(
     runtime_sha256: String,
     profile_id: String,
     profile_digest: String,
+    target_pid: u32,
+    module_base: u64,
     expected_surfaces: &[String],
     source_revision: String,
     toolchain: String,
@@ -112,6 +119,8 @@ pub fn build_attestation_json(
         runtime_sha256,
         profile_id,
         profile_digest,
+        target_pid,
+        module_base,
         expected_surfaces,
         source_revision,
         toolchain,
@@ -169,6 +178,10 @@ fn initialize_inner(
     }
     // SAFETY: validated pointers above; caller contract requires valid strings.
     let p = unsafe { &*params };
+    if p.target_pid == 0 || p.module_base == 0 {
+        // Target identity binding: zero PID / module base is invalid.
+        return MidaAntidebugError::InvalidArgument.as_i32();
+    }
     let profile_id = unsafe { read_cstr(p.profile_id) }.unwrap_or_default();
     let profile_digest = unsafe { read_cstr(p.profile_digest) }.unwrap_or_default();
     let mut expected = Vec::new();
@@ -188,6 +201,8 @@ fn initialize_inner(
         runtime_sha256.clone(),
         profile_id.clone(),
         profile_digest.clone(),
+        p.target_pid,
+        p.module_base,
         &expected,
         source_revision,
         toolchain,
@@ -211,7 +226,8 @@ fn initialize_inner(
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_attestation_json, bytes.len()) };
     // SAFETY: validated output pointer.
     unsafe { *out_attestation_written = bytes.len() };
-    // Build the telemetry channel bound to PID + digest.
+    // Build the telemetry channel bound to PID + digest (attestation carries
+    // the same target_pid / module_base identity).
     let telemetry = TelemetryChannel::new(
         format!("mida-adr4-{}", p.target_pid),
         p.target_pid,
@@ -222,6 +238,8 @@ fn initialize_inner(
             runtime_sha256,
             profile_id,
             profile_digest,
+            p.target_pid,
+            p.module_base,
             &expected,
             env!("CARGO_PKG_VERSION").to_string(),
             "rustc".to_string(),
