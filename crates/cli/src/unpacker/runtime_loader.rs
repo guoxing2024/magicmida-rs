@@ -574,26 +574,13 @@ impl RuntimeLoader {
         Ok(addr as usize)
     }
 
-    /// Execute a function by address in the target via a remote thread.
+    /// Execute a function by address in the target via a remote thread, with
+    /// an explicit deadline in seconds (ADR-5B-R3).
     ///
     /// # Safety
     /// `remote_fn` must be a valid function pointer in the TARGET address
     /// space (x64: same base as debugger). `arg` is a pointer to argument
-    /// memory previously written into the target.
-    unsafe fn remote_call_raw(
-        &self,
-        target: HANDLE,
-        remote_fn: usize,
-        arg: usize,
-        drain: &mut dyn FnMut(u32) -> Result<Option<mida_core::DrainReceipt>, mida_core::CoreError>,
-    ) -> Result<RemoteCallResult, RuntimeLoadError> {
-        self.remote_call_raw_bounded(target, remote_fn, arg, 60, drain)
-    }
-
-    /// Bounded variant with an explicit deadline in seconds (ADR-5B-R3).
-    ///
-    /// # Safety
-    /// Same contract as [`Self::remote_call_raw`]; `deadline_secs` is the
+    /// memory previously written into the target. `deadline_secs` is the
     /// REAL wall-clock budget for the whole wait (never doubled by drain
     /// polling).
     unsafe fn remote_call_raw_bounded(
@@ -646,6 +633,10 @@ impl RuntimeLoader {
         let deadline = Instant::now() + Duration::from_secs(deadline_secs);
         loop {
             // REAL monotonic budget: total wall time never exceeds deadline.
+            // F-004: the wait budget and the drain budget are computed
+            // SEPARATELY — each blocking call re-derives the remaining time,
+            // so WaitForSingleObject(200ms) + drain(200ms) can never burn
+            // 400ms against a single 200ms budget slot.
             let Some(wait_ms) = compute_wait_budget(deadline, 200) else {
                 // Handle closed by guard on return; remote memory is
                 // deliberately NOT freed (the thread may still run).
@@ -659,7 +650,15 @@ impl RuntimeLoader {
             match classify_wait_status(wait) {
                 RemoteWaitOutcome::Finished => break,
                 RemoteWaitOutcome::TimedOut => {
-                    drain(wait_ms).map_err(|e| {
+                    // Recompute the drain budget from the CURRENT remaining
+                    // time (the wait above already consumed part of it).
+                    let Some(drain_ms) = compute_wait_budget(deadline, 200) else {
+                        return Err(RuntimeLoadError::RemoteCallFailed(format!(
+                            "WaitForSingleObject timed out after {}ms; remote thread may still be running (thunk memory retained)",
+                            deadline_secs * 1000
+                        )));
+                    };
+                    drain(drain_ms as u32).map_err(|e| {
                         RuntimeLoadError::RemoteCallFailed(format!("drain failed: {e}"))
                     })?;
                 }
@@ -742,6 +741,8 @@ impl RuntimeLoader {
         let deadline = Instant::now() + Duration::from_secs(120);
         loop {
             // REAL monotonic budget: total wall time never exceeds deadline.
+            // F-004: drain budget recomputed after the wait (see
+            // remote_call_raw for the same pattern).
             let Some(wait_ms) = compute_wait_budget(deadline, 200) else {
                 return Err(RuntimeLoadError::RemoteCallFailed(format!(
                     "LoadLibraryW remote thread timed out after 120000ms; thread may still hold the loader lock (path buffer retained)"
@@ -752,7 +753,12 @@ impl RuntimeLoader {
             match classify_wait_status(wait) {
                 RemoteWaitOutcome::Finished => break,
                 RemoteWaitOutcome::TimedOut => {
-                    drain(wait_ms).map_err(|e| {
+                    let Some(drain_ms) = compute_wait_budget(deadline, 200) else {
+                        return Err(RuntimeLoadError::RemoteCallFailed(format!(
+                            "LoadLibraryW remote thread timed out after 120000ms; thread may still hold the loader lock (path buffer retained)"
+                        )));
+                    };
+                    drain(drain_ms as u32).map_err(|e| {
                         RuntimeLoadError::RemoteCallFailed(format!("drain failed: {e}"))
                     })?;
                 }
@@ -798,6 +804,22 @@ impl RuntimeLoader {
         args: &ThunkArgs,
         drain: &mut dyn FnMut(u32) -> Result<Option<mida_core::DrainReceipt>, mida_core::CoreError>,
     ) -> Result<RemoteCallResult, RuntimeLoadError> {
+        self.thunk_call_tracked(target, args, 60, drain).0
+    }
+
+    /// [`Self::thunk_call`] plus the actual remote thunk address, so tests can
+    /// verify retention of the REAL allocation (audit F-005: a test that
+    /// allocates its own memory and checks THAT proves nothing about the
+    /// loader's thunk). Returns `(result, Some(remote_addr))`; the address is
+    /// the `VirtualAllocEx` result even when the call fails (retained on
+    /// timeout, freed on success/failure paths that free it).
+    unsafe fn thunk_call_tracked(
+        &self,
+        target: HANDLE,
+        args: &ThunkArgs,
+        deadline_secs: u64,
+        drain: &mut dyn FnMut(u32) -> Result<Option<mida_core::DrainReceipt>, mida_core::CoreError>,
+    ) -> (Result<RemoteCallResult, RuntimeLoadError>, Option<usize>) {
         // 1. Allocate executable-capable memory for thunk + args.
         //    THUNK_BLOB_SIZE = 0x100 (VirtualAllocEx rounds to page
         //    granularity, so the code window + args region share one
@@ -812,9 +834,12 @@ impl RuntimeLoader {
             )
         };
         if remote.is_null() {
-            return Err(RuntimeLoadError::VirtualAllocFailed(
-                "VirtualAllocEx(thunk)".to_string(),
-            ));
+            return (
+                Err(RuntimeLoadError::VirtualAllocFailed(
+                    "VirtualAllocEx(thunk)".to_string(),
+                )),
+                None,
+            );
         }
         // 2. Write thunk at [0..96) (THUNK_CODE is 91 bytes), args at
         //    [96..160). The allocation is 0x100 bytes total.
@@ -834,10 +859,13 @@ impl RuntimeLoader {
         };
         if w.is_err() {
             let _ = unsafe { VirtualFreeEx(target, remote, 0, MEM_RELEASE) };
-            return Err(RuntimeLoadError::WriteMemoryFailed(format!(
-                "WriteProcessMemory(thunk): {:?}",
-                w.err()
-            )));
+            return (
+                Err(RuntimeLoadError::WriteMemoryFailed(format!(
+                    "WriteProcessMemory(thunk): {:?}",
+                    w.err()
+                ))),
+                Some(remote as usize),
+            );
         }
         // 3. Make executable. THUNK_EXECUTABLE_SIZE (0x60) is the LOGICAL
         //    layout boundary (code window); Windows page protection applies
@@ -856,10 +884,13 @@ impl RuntimeLoader {
         };
         if vp.is_err() {
             let _ = unsafe { VirtualFreeEx(target, remote, 0, MEM_RELEASE) };
-            return Err(RuntimeLoadError::RemoteCallFailed(format!(
-                "VirtualProtectEx(thunk): {:?}",
-                vp.err()
-            )));
+            return (
+                Err(RuntimeLoadError::RemoteCallFailed(format!(
+                    "VirtualProtectEx(thunk): {:?}",
+                    vp.err()
+                ))),
+                Some(remote as usize),
+            );
         }
         // 4. Run: CreateRemoteThread(remote thunk, arg = remote + THUNK_ARGS_OFFSET).
         //    ADR-5B-R3: the thunk allocation is freed ONLY after the remote
@@ -868,7 +899,9 @@ impl RuntimeLoader {
         //    in place; it is released when the target process terminates.
         let thunk_addr = remote as usize;
         let args_addr = remote as usize + THUNK_ARGS_OFFSET;
-        let result = unsafe { self.remote_call_raw(target, thunk_addr, args_addr, drain) };
+        let result = unsafe {
+            self.remote_call_raw_bounded(target, thunk_addr, args_addr, deadline_secs, drain)
+        };
         match &result {
             Ok(_) => {
                 // SAFETY: the remote thread finished (WAIT_OBJECT_0), so no
@@ -884,7 +917,7 @@ impl RuntimeLoader {
                 );
             }
         }
-        result
+        (result, Some(remote as usize))
     }
 }
 impl RuntimeLoader {
@@ -1446,7 +1479,12 @@ impl RuntimeLoader {
                 }
                 // Forwarded export: the function RVA points INSIDE the export
                 // directory (the name is a forwarder string, not code).
-                if func_rva >= exp_rva && func_rva < exp_rva + exp_size {
+                // Checked range (audit R5): avoid overflow on exp_rva+exp_size.
+                if exp_size > 0
+                    && exp_rva <= exp_rva.saturating_add(exp_size)
+                    && func_rva >= exp_rva
+                    && func_rva < exp_rva.saturating_add(exp_size)
+                {
                     continue;
                 }
                 found[wi] = Some(module_base + func_rva as usize);
@@ -1877,8 +1915,7 @@ mod timeout_harness {
     use windows::core::{PCSTR, PCWSTR};
     use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
     use windows::Win32::System::Memory::{
-        VirtualAllocEx, VirtualFreeEx, VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT,
-        MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE,
+        VirtualFreeEx, VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_RELEASE,
     };
     use windows::Win32::System::Threading::GetCurrentProcess;
 
@@ -1908,39 +1945,32 @@ mod timeout_harness {
         let target = unsafe { GetCurrentProcess() };
         // The slow remote "function" is kernel32!Sleep(5000ms): a REAL slow
         // remote thread that outlives the 1s deadline and finishes on its
-        // own after ~5s.
+        // own after ~5s. ThunkArgs.fn_ptr is the function the thunk calls.
         let slow_fn = sleep_addr();
         let slow_ms = 5000u64;
-        // A thunk-like allocation to prove retention semantics (the loader
-        // must NOT free it while the remote thread may still be running).
-        // SAFETY: allocate memory in OUR process.
-        let thunk = unsafe {
-            VirtualAllocEx(
-                target,
-                None,
-                0x100,
-                MEM_COMMIT | MEM_RESERVE,
-                PAGE_EXECUTE_READWRITE,
-            )
+        let args = ThunkArgs {
+            fn_ptr: slow_fn as u64,
+            arg0: slow_ms,
+            arg1: 0,
+            arg2: 0,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+            reserved: 0,
         };
-        assert!(!thunk.is_null(), "VirtualAllocEx failed");
 
         let t0 = Instant::now();
-        // SAFETY: slow_fn points at Sleep in kernel32, valid in this process.
-        let result = unsafe {
-            loader.remote_call_raw_bounded(
-                target,
-                slow_fn,
-                slow_ms as usize,
-                1, // 1-second REAL deadline
-                &mut noop_drain,
-            )
-        };
+        // F-005: call the REAL thunk_call path (allocation + write + protect
+        // + remote thread + wait). The tracked variant reports the ACTUAL
+        // VirtualAllocEx address so we can probe the real thunk.
+        let (result, thunk_addr) =
+            unsafe { loader.thunk_call_tracked(target, &args, 1, &mut noop_drain) };
         let elapsed = t0.elapsed();
         assert!(
             matches!(result, Err(RuntimeLoadError::RemoteCallFailed(_))),
             "slow remote thread must time out: {result:?}"
         );
+        let thunk_addr = thunk_addr.expect("thunk_call_tracked must report the allocation");
         // REAL-clock enforcement: the wall time must be within [0.8s, 3s]
         // (a doubled deadline would exceed 2s by a wide margin; 1s deadline
         // with 200ms polls + slack stays well under 3s).
@@ -1950,14 +1980,15 @@ mod timeout_harness {
             "timeout must respect the REAL 1s deadline (got {ms}ms)"
         );
 
-        // The thunk-like allocation must STILL be committed (the remote
-        // thread may still be executing; the loader must NOT have freed it).
-        // SAFETY: VirtualQueryEx on our own valid allocation.
+        // The REAL thunk allocation must STILL be committed (the remote
+        // thread may still be executing it; thunk_call must NOT have freed
+        // it on timeout).
+        // SAFETY: thunk_addr is the loader's own valid allocation.
         let mut mbi = MEMORY_BASIC_INFORMATION::default();
         let vq = unsafe {
             VirtualQueryEx(
                 target,
-                Some(thunk),
+                Some(thunk_addr as *const core::ffi::c_void),
                 &mut mbi,
                 std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
             )
@@ -1965,15 +1996,15 @@ mod timeout_harness {
         assert!(vq > 0, "VirtualQueryEx failed");
         assert!(
             mbi.State == MEM_COMMIT,
-            "thunk memory must remain committed after timeout (State={:?})",
+            "REAL thunk must remain committed after timeout (State={:?})",
             mbi.State
         );
 
-        // Let the slow Sleep(5s) finish, then the allocation can be released
-        // safely (the remote thread is truly done).
+        // Let the slow Sleep(5s) finish, then the retained thunk can be
+        // released safely (the remote thread is truly done).
         std::thread::sleep(Duration::from_millis((slow_ms + 700) as u64));
         // SAFETY: thunk is still a valid committed allocation in our process.
-        let f = unsafe { VirtualFreeEx(target, thunk, 0, MEM_RELEASE) };
+        let f = unsafe { VirtualFreeEx(target, thunk_addr as *mut _, 0, MEM_RELEASE) };
         assert!(f.is_ok(), "VirtualFreeEx after thread finish failed");
     }
 

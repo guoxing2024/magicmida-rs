@@ -36,6 +36,31 @@ fn harness_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Real-constant binding test (audit F-001): the ContinueStatus values must
+/// match the Windows NTSTATUS constants EXACTLY. 0x40010001 is
+/// DBG_REPLY_LATER, NOT DBG_EXCEPTION_NOT_HANDLED (0x80010001) — a wrong
+/// value silently corrupts exception disposition in the drain window.
+#[test]
+fn continue_status_binds_real_win32_constants() {
+    use windows::Win32::Foundation::{DBG_CONTINUE, DBG_EXCEPTION_NOT_HANDLED};
+    assert_eq!(
+        ContinueStatus::Continue as u32,
+        DBG_CONTINUE.0 as u32,
+        "Continue must equal DBG_CONTINUE"
+    );
+    assert_eq!(
+        ContinueStatus::ExceptionNotHandled as u32,
+        DBG_EXCEPTION_NOT_HANDLED.0 as u32,
+        "ExceptionNotHandled must equal DBG_EXCEPTION_NOT_HANDLED (0x80010001), not DBG_REPLY_LATER (0x40010001)"
+    );
+    // Guard against the exact regression: 0x40010001 is DBG_REPLY_LATER.
+    assert_ne!(
+        ContinueStatus::ExceptionNotHandled as u32,
+        0x4001_0001,
+        "0x40010001 is DBG_REPLY_LATER, never use it for exception forwarding"
+    );
+}
+
 fn helper_bin() -> &'static str {
     option_env!("CARGO_BIN_EXE_capture_epoch_helper")
         .expect("helper not built (enable feature capture-epoch-harness)")
@@ -223,13 +248,23 @@ fn drain_propagates_debug_registers_to_new_threads() {
         "no live thread verified to actually hold the propagated DR0 (bp_addr={bp_addr:#x}): stats={stats:?}"
     );
 
-    dbg.clear_hw_breakpoint(0).expect("clear HW BP");
+    // Cleanup must NOT panic: a failed clear (Windows(5) = access denied on
+    // a thread that exited mid-drain) must not poison the global harness
+    // lock and cascade fake failures into the other tests (audit F-007).
+    if let Err(e) = dbg.clear_hw_breakpoint(0) {
+        eprintln!(
+            "drain_propagates_debug_registers_to_new_threads: clear HW BP failed (non-fatal): {e}"
+        );
+    }
+    drop(dbg);
     drop(_guard);
 }
 
 #[test]
 fn drain_receipt_exception_events_are_recorded_and_continued() {
-    let _guard = HARNESS_LOCK.lock().unwrap();
+    // Use poison-recovering harness_lock (audit F-007: a previous test's
+    // panic must not turn this test into a fake failure).
+    let _guard = harness_lock();
     let opts = helper_opts("exc");
     let mut dbg = WindowsDebugger::new(&opts).expect("WindowsDebugger::new");
 

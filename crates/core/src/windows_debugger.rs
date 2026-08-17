@@ -1028,20 +1028,23 @@ pub struct DrainStats {
 }
 
 /// Classification of one `ExitThread` event by the unified bookkeeping
-/// (ADR-5B-R1 F-002). The drain path uses this to distinguish genuine
-/// bookkeeping gaps from legal short-lived threads.
+/// (ADR-5B-R1 F-002/F-003). Classification is driven ENTIRELY by the drain's
+/// own observed state (thread table + observed CREATE set), never by probing
+/// the exited thread object (which cannot prove anything about whether the
+/// drain observed its creation).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitClassification {
     /// The thread handle was registered in the thread table and removed
     /// cleanly (the drain observed CREATE_THREAD and owned the handle).
     Registered,
-    /// No handle was registered (CREATE_THREAD never observed), but the
-    /// thread object no longer exists at exit time: genuinely short-lived,
-    /// created AND exited between two drain polls. Legal, not a defect.
+    /// The drain observed the matching CREATE_THREAD in the same window
+    /// (handle present in the drain-observed set) but the handle was already
+    /// removed by the time EXIT arrived: created AND exited between two
+    /// drain polls. Legal, not a defect.
     ShortLived,
-    /// No handle was registered AND the thread object still existed at exit
-    /// time: the drain was supposed to observe/register this thread but did
-    /// not. Bookkeeping gap, counted as unmatched.
+    /// No registered handle AND no drain-observed CREATE_THREAD: the drain
+    /// never saw this thread's creation. EXIT_THREAD arrived with zero
+    /// bookkeeping state. Bookkeeping gap, counted as unmatched.
     Unmatched,
 }
 
@@ -1058,6 +1061,9 @@ pub struct EventBookkeeping {
     /// Whether a LoadDll/CreateProcess hFile was closed by this event
     /// (None otherwise; Some(ok) = CloseHandle result).
     pub hfile_close: Option<bool>,
+    /// ExitThread arrived but no handle was registered (classification is
+    /// deferred to the drain path's observed-CREATE set; see F-003).
+    pub exit_handle_absent: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -2171,29 +2177,31 @@ impl WindowsDebugger {
             receipt.first_chance = Some(first_chance);
             self.drain_stats.events_drained += 1;
             self.drain_stats.last_sequence = sequence;
+            // Audit F-002: SECOND-CHANCE check comes FIRST, before the
+            // debugger-owned check. A second-chance breakpoint/single-step
+            // means the target's SEH already gave up on the fault — even if
+            // WE injected it, continuing would change process behavior and
+            // hide a real failure. Fail closed, never DBG_CONTINUE it.
+            if !first_chance {
+                self.drain_stats.exceptions_failed_closed += 1;
+                return Err(CoreError::DebugState(format!(
+                    "second-chance exception {code:#x} in drain window; refusing to continue (fail-closed, target SEH gave up)"
+                )));
+            }
             let debugger_owned =
                 code == EXCEPTION_BREAKPOINT.0 as u32 || code == EXCEPTION_SINGLE_STEP.0 as u32;
             if debugger_owned {
-                // Debugger-injected breakpoints / single-step traps: we own
-                // these faults, continue with DBG_CONTINUE.
+                // Debugger-injected breakpoints / single-step traps (first
+                // chance): we own these faults, continue with DBG_CONTINUE.
                 receipt.disposition = DrainDisposition::Exception;
                 receipt.bookkeeping = format!(
-                    "exception code={code:#x} first_chance={first_chance} (drain window, debugger-owned -> DBG_CONTINUE)"
+                    "exception code={code:#x} first_chance=true (drain window, debugger-owned -> DBG_CONTINUE)"
                 );
                 receipt.continue_status = ContinueStatus::Continue as u32;
                 self.drain_stats.exceptions_continued += 1;
                 self.continue_pending(thread_id, ContinueStatus::Continue)?;
                 self.drain_receipts.push(receipt.clone());
                 return Ok(Some(receipt));
-            }
-            if !first_chance {
-                // Second-chance: the target's SEH already gave up. Marking
-                // this handled would change process behavior (and hide a real
-                // failure). Fail closed instead of guessing.
-                self.drain_stats.exceptions_failed_closed += 1;
-                return Err(CoreError::DebugState(format!(
-                    "second-chance exception {code:#x} in drain window; refusing to continue (fail-closed, target SEH gave up)"
-                )));
             }
             // Unknown first-chance exception: forward to the target with
             // DBG_EXCEPTION_NOT_HANDLED so its own SEH decides.
@@ -2260,32 +2268,35 @@ impl WindowsDebugger {
                 }
             }
             DebugEvent::ExitThread { thread_id, .. } => {
+                // F-003: classification uses ONLY the drain's own observed
+                // state. `summary.exit_classification == Some(Registered)`
+                // means the handle was in the thread table (CREATE observed
+                // + handle registered). Otherwise the handle was absent; the
+                // drain-observed CREATE set decides ShortLived (create seen
+                // in this window) vs Unmatched (create never seen).
                 let removed_from_observed = self.drain_observed_create_tids.remove(thread_id);
-                match (summary.exit_classification, removed_from_observed) {
-                    (Some(ExitClassification::Registered), _) => {
+                match summary.exit_classification {
+                    Some(ExitClassification::Registered) => {
                         receipt.bookkeeping = format!("thread {thread_id} removed + handle closed");
                         self.drain_stats.exit_threads_removed += 1;
                     }
-                    (Some(ExitClassification::ShortLived), _) => {
+                    _ if removed_from_observed => {
+                        // The drain DID observe CREATE_THREAD for this TID
+                        // (create+exit between two drain polls; the handle
+                        // was registered then removed within the window).
                         receipt.bookkeeping = format!(
-                            "thread {thread_id} short-lived: CREATE_THREAD never observed by drain; object verified gone (legal)"
+                            "thread {thread_id} short-lived: CREATE_THREAD observed in window, EXIT before next poll (legal)"
                         );
                         self.drain_stats.exit_short_lived_without_create_observation += 1;
                     }
-                    (Some(ExitClassification::Unmatched), _) | (None, false) => {
+                    _ => {
+                        // No handle AND no observed CREATE: genuine
+                        // bookkeeping gap (the drain never saw this thread's
+                        // creation).
                         receipt.bookkeeping = format!(
-                            "thread {thread_id} UNMATCHED exit: no registered handle AND thread object still alive (bookkeeping gap)"
+                            "thread {thread_id} UNMATCHED exit: no registered handle AND no observed CREATE_THREAD (bookkeeping gap)"
                         );
                         self.drain_stats.unmatched_exit_threads += 1;
-                    }
-                    (None, true) => {
-                        // No handle was registered but the drain observed the
-                        // CREATE_THREAD: register happened in a previous drain
-                        // call whose handle was removed elsewhere; count as
-                        // removed (conservative, keeps the invariant honest).
-                        receipt.bookkeeping =
-                            format!("thread {thread_id} removed (observed create)");
-                        self.drain_stats.exit_threads_removed += 1;
                     }
                 }
             }
@@ -2356,11 +2367,16 @@ impl WindowsDebugger {
                     }
                     summary.exit_classification = Some(ExitClassification::Registered);
                 } else {
-                    // No handle was registered for this TID. Decide whether
-                    // the thread object is still alive (unmatched) or already
-                    // gone (short-lived, created+exited between drain polls).
-                    summary.exit_classification =
-                        Some(Self::classify_unregistered_exit(*thread_id));
+                    // No handle was registered for this TID. The final
+                    // classification (ShortLived vs Unmatched) is decided by
+                    // the drain path from `drain_observed_create_tids` — the
+                    // ONLY reliable evidence of whether the drain saw the
+                    // thread's creation. We never probe the exited thread
+                    // object here (audit F-003: an exited thread's object is
+                    // always signaled; probing cannot prove bookkeeping
+                    // intent).
+                    summary.exit_classification = None;
+                    summary.exit_handle_absent = true;
                 }
             }
             DebugEvent::CreateProcess {
@@ -2381,44 +2397,6 @@ impl WindowsDebugger {
             _ => {}
         }
         Ok(summary)
-    }
-
-    /// Classify an ExitThread whose TID was never registered: check whether
-    /// the thread object still exists in the target at exit time.
-    ///
-    /// Windows delivers EXIT_THREAD for threads created AND exited between
-    /// two debug polls; the thread object is already gone by then (the event
-    /// is delivered late). If the object still exists, the drain missed a
-    /// CREATE_THREAD it should have observed -> genuine bookkeeping gap.
-    fn classify_unregistered_exit(thread_id: u32) -> ExitClassification {
-        use windows::Win32::System::Threading::{OpenThread, THREAD_QUERY_INFORMATION};
-        // SAFETY: OpenThread with query rights; handle is scoped.
-        let h = unsafe { OpenThread(THREAD_QUERY_INFORMATION, false, thread_id) };
-        match h {
-            Ok(raw) => {
-                let guard = ScopedThreadHandle::new(raw);
-                // A live thread object returns WAIT_TIMEOUT from a 0ms wait;
-                // WAIT_OBJECT_0 means the thread has exited (object signaled).
-                // SAFETY: valid thread handle.
-                let status = unsafe {
-                    windows::Win32::System::Threading::WaitForSingleObject(guard.as_raw(), 0)
-                }
-                .0;
-                if status == 0 {
-                    // Signaled: the thread already exited; its handle was
-                    // never registered because the drain never saw CREATE.
-                    ExitClassification::ShortLived
-                } else {
-                    // Still running (or wait failed): object exists -> the
-                    // drain should have registered it. Bookkeeping gap.
-                    ExitClassification::Unmatched
-                }
-            }
-            Err(_) => {
-                // OpenThread failed: the thread object is gone.
-                ExitClassification::ShortLived
-            }
-        }
     }
 
     /// Read only the debug-register portion of the given thread's context.

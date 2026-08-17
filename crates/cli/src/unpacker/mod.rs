@@ -1117,6 +1117,27 @@ pub fn unpack(
                             drain_stats.last_sequence,
                         ),
                     );
+                    // F-006: log EVERY receipt's full content (sequence,
+                    // pid/tid, event code, disposition, continue status,
+                    // exception code/first-chance, bookkeeping) — a count
+                    // alone is not an audit trail.
+                    for r in &all_drain_receipts {
+                        log::log(
+                            LogType::Info,
+                            &format!(
+                                "drain receipt: seq={} pid={} tid={} code={} disp={:?} cont=0x{:08X} exc={:?} first={:?} bk={}",
+                                r.sequence,
+                                r.process_id,
+                                r.thread_id,
+                                r.event_code,
+                                r.disposition,
+                                r.continue_status,
+                                r.exception_code.map(|c| format!("{c:#x}")),
+                                r.first_chance,
+                                r.bookkeeping,
+                            ),
+                        );
+                    }
                     let outcome = ad_controller.run();
                     match &outcome {
                         antidebug_controller::AntidebugOutcome::Proceed { .. } => {

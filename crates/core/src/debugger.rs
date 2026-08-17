@@ -8,30 +8,33 @@
 
 use std::fmt;
 
-use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Foundation::{DBG_CONTINUE, DBG_EXCEPTION_NOT_HANDLED, HANDLE};
 use windows::Win32::System::Diagnostics::Debug::CONTEXT;
 
 use crate::error::CoreError;
 
 /// Status returned to Windows by `ContinueDebugEvent`.
 ///
-/// Corresponds to the `dwContinueStatus` parameter.
+/// Corresponds to the `dwContinueStatus` parameter. Values are bound to the
+/// `windows` crate NTSTATUS constants (never hand-written magic numbers):
+/// `DBG_CONTINUE` = `0x00010002`, `DBG_EXCEPTION_NOT_HANDLED` = `0x80010001`
+/// (audit F-001: `0x40010001` is `DBG_REPLY_LATER`, a different status).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum ContinueStatus {
-    /// Resume execution normally (`DBG_CONTINUE` = `0x00010002`).
-    Continue = 0x0001_0002,
+    /// Resume execution normally (`DBG_CONTINUE`).
+    Continue = DBG_CONTINUE.0 as u32,
     /// Signal end-of-debug-session (`DBG_CONTROL_BREAK` = `0x40010008`).
     ContinueNoStep = 0x4001_0008,
     /// Hand the exception back to the target's exception dispatcher
-    /// (`DBG_EXCEPTION_NOT_HANDLED` = `0x40010001`).
+    /// (`DBG_EXCEPTION_NOT_HANDLED`).
     ///
     /// ADR-5B-R1 (audit F-001): the drain window must NOT mark every
     /// exception as handled. Debugger-owned exceptions (breakpoint /
     /// single-step) are continued with `Continue`; unknown first-chance
     /// exceptions are forwarded to the target with this status so the
     /// target's own SEH disposition is preserved.
-    ExceptionNotHandled = 0x4001_0001,
+    ExceptionNotHandled = DBG_EXCEPTION_NOT_HANDLED.0 as u32,
 }
 
 // ---------------------------------------------------------------------------
