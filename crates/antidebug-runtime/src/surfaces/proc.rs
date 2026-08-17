@@ -1,16 +1,17 @@
 //! AD-PROC-002 / AD-PROC-003 PEB surfaces (ADR-5).
 //!
 //! AD-PROC-002: PEB.BeingDebugged (offset 0x02, BYTE)
-//! AD-PROC-003: PEB.pShimData   (offset 0x08, PVOID)
+//! AD-PROC-003: PEB.pShimData   (offset 0x2D8, PVOID; x64 authority layout from
+//!               crates/core/src/process.rs PEB_SHIM_DATA_OFFSET)
 //!
 //! ## x64-only contract
 //!
 //! - pointer_size must be 8; x86 / WOW64 / unknown widths are rejected.
 //! - All PEB address arithmetic uses checked_add / checked_sub; unchecked
 //!   pointer math is forbidden.
-//! - Field offsets are not hard-coded blindly: they are proven against the
-//!   public x64 Windows ABI layout (BeingDebugged at 0x02, pShimData at
-//!   0x08) and every access validates read/write accessibility first.
+//! - Field offsets follow the repository authority layout
+//!   (crates/core/src/process.rs): BeingDebugged at 0x02, pShimData at
+//!   0x2D8 on x64. Every access validates read/write accessibility first.
 //! - On any failure the surface reports a structured error and is NOT
 //!   reported as installed.
 //!
@@ -18,8 +19,9 @@
 //!
 //! - AD-PROC-002: zeroes BeingDebugged (or restores original if it was
 //!   already non-zero). original/effective/restoration are all recorded.
-//! - AD-PROC-003: pShimData is observation-only (no write); the pointer
-//!   value and its validity are recorded.
+//! - AD-PROC-003: pShimData is ZEROED when non-zero (hard-required;
+//!   ADR-2 probe catalog: pShimData must be 0), then read back to confirm
+//!   effective_value == 0; original value is restored on shutdown.
 //! - Restoration runs on shutdown and its result enters telemetry; a failed
 //!   restore is a fail-closed state (CleanupFailed path), never a silent
 //!   Drop side-effect.
@@ -31,7 +33,9 @@ pub const POINTER_SIZE_X64: usize = 8;
 
 /// x64 PEB field offsets (public x64 Windows ABI).
 pub const PEB_OFFSET_BEING_DEBUGGED: u64 = 0x02;
-pub const PEB_OFFSET_PSHIM_DATA: u64 = 0x08;
+/// x64 pShimData offset (authority: crates/core/src/process.rs
+/// PEB_SHIM_DATA_OFFSET = 0x2D8 for x86_64). 0x08 is NOT pShimData.
+pub const PEB_OFFSET_PSHIM_DATA: u64 = 0x2D8;
 
 /// Surface ids.
 pub const SURFACE_AD_PROC_002: &str = "AD-PROC-002";
@@ -247,6 +251,24 @@ impl PebView {
         v.copy_from_slice(&raw);
         Ok(u64::from_le_bytes(v))
     }
+
+    /// Write an 8-byte pointer field.
+    pub fn write_ptr(
+        &self,
+        mem: &dyn PebMemory,
+        offset: u64,
+        val: u64,
+    ) -> Result<(), SurfaceError> {
+        let addr = self.field_addr(offset, self.pointer_size)?;
+        if !mem.is_writable(addr, self.pointer_size) {
+            return Err(SurfaceError::PebNotWritable {
+                addr,
+                len: self.pointer_size,
+            });
+        }
+        mem.write_bytes(addr, &val.to_le_bytes())
+            .map_err(|e| SurfaceError::MemoryAccess(e))
+    }
 }
 /// AD-PROC-002 installation: observe, then zero BeingDebugged.
 pub fn install_proc_002(
@@ -286,7 +308,13 @@ pub fn install_proc_002(
     ))
 }
 
-/// AD-PROC-003 installation: observe pShimData (observation-only).
+/// AD-PROC-003 installation: read pShimData, validate, ZERO it, confirm.
+///
+/// Hard-required semantics (ADR-2 probe catalog): pShimData must be 0.
+/// - null original -> already clean, installed=true, effective=0;
+/// - non-null original -> validated (target readable), then written 0,
+///   then read back; effective must be 0 or the install FAILS;
+/// - invalid pointer (non-null but unreadable target) -> fail-closed.
 pub fn install_proc_003(
     view: &PebView,
     mem: &dyn PebMemory,
@@ -308,21 +336,50 @@ pub fn install_proc_003(
         });
     }
     let ptr = view.read_ptr(mem, PEB_OFFSET_PSHIM_DATA)?;
-    // Validate pointer: null is valid (no shim); non-null must be readable.
-    if ptr != 0 && !mem.is_readable(ptr, 1) {
+    let original = if ptr == 0 {
+        "0".to_string()
+    } else {
+        format!("{ptr:#x}")
+    };
+    if ptr == 0 {
+        // Already clean: pShimData == 0 satisfies the expected state.
+        return Ok(SurfaceInstallOutcome::success(
+            SURFACE_AD_PROC_003,
+            original.clone(),
+            "0".to_string(),
+            RestorationPolicy::RestoreOriginal,
+        ));
+    }
+    // Non-null: validate the target is readable before writing.
+    if !mem.is_readable(ptr, 1) {
         return Err(SurfaceError::ShimDataInvalid(format!(
             "ptr {ptr:#x} not readable"
         )));
     }
-    Ok(SurfaceInstallOutcome::observation(
+    // Verify the field is writable before writing.
+    {
+        let addr = view.field_addr(PEB_OFFSET_PSHIM_DATA, 8)?;
+        if !mem.is_writable(addr, 8) {
+            return Err(SurfaceError::PebNotWritable { addr, len: 8 });
+        }
+    }
+    // Write 0 into the pShimData field.
+    view.write_ptr(mem, PEB_OFFSET_PSHIM_DATA, 0)?;
+    // Read back and confirm effective value is 0.
+    let effective = view.read_ptr(mem, PEB_OFFSET_PSHIM_DATA)?;
+    if effective != 0 {
+        return Err(SurfaceError::ShimDataInvalid(format!(
+            "write-back verification failed: effective {effective:#x} != 0"
+        )));
+    }
+    Ok(SurfaceInstallOutcome::success(
         SURFACE_AD_PROC_003,
-        if ptr == 0 {
-            "null".to_string()
-        } else {
-            format!("{ptr:#x}")
-        },
+        original,
+        "0".to_string(),
+        RestorationPolicy::RestoreOriginal,
     ))
 }
+
 /// Restore AD-PROC-002 (and any other modified surfaces).
 pub fn restore_proc_002(
     view: &PebView,
@@ -346,6 +403,34 @@ pub fn restore_proc_002(
         })?;
     Ok(RestoreResult::Restored)
 }
+/// Restore AD-PROC-003: write back the original pShimData pointer.
+pub fn restore_proc_003(
+    view: &PebView,
+    mem: &dyn PebMemory,
+    original_value: Option<String>,
+) -> Result<RestoreResult, SurfaceError> {
+    let orig = match original_value {
+        Some(v) => v,
+        None => return Ok(RestoreResult::NotApplicable),
+    };
+    if orig == "0" {
+        // Original was already 0; nothing to restore.
+        return Ok(RestoreResult::NotApplicable);
+    }
+    let parsed = u64::from_str_radix(orig.trim_start_matches("0x"), 16).map_err(|e| {
+        SurfaceError::RestoreFailed {
+            surface: SURFACE_AD_PROC_003.to_string(),
+            reason: format!("cannot parse original {orig}: {e}"),
+        }
+    })?;
+    view.write_ptr(mem, PEB_OFFSET_PSHIM_DATA, parsed)
+        .map_err(|e| SurfaceError::RestoreFailed {
+            surface: SURFACE_AD_PROC_003.to_string(),
+            reason: e.to_string(),
+        })?;
+    Ok(RestoreResult::Restored)
+}
+
 /// Install both hard-required PEB surfaces (ADR-5).
 ///
 /// - Both succeed -> both in installed, no failures. (Order: 002, 003.)

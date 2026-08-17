@@ -13,8 +13,8 @@ pub mod proc;
 pub mod win32;
 
 pub use proc::{
-    install_proc_002, install_proc_003, install_proc_surfaces, restore_proc_002, PebMemory,
-    PebView, RestorationPolicy, RestoreResult, SurfaceError, SurfaceInstallOutcome,
+    install_proc_002, install_proc_003, install_proc_surfaces, restore_proc_002, restore_proc_003,
+    PebMemory, PebView, RestorationPolicy, RestoreResult, SurfaceError, SurfaceInstallOutcome,
     PEB_OFFSET_BEING_DEBUGGED, PEB_OFFSET_PSHIM_DATA, POINTER_SIZE_X64, SURFACE_AD_PROC_001,
     SURFACE_AD_PROC_002, SURFACE_AD_PROC_003,
 };

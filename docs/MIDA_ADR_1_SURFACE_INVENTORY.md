@@ -142,7 +142,7 @@ surface_id | surface | primitive | origin_macro | lunlun_software | origin_conf 
 ---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---
 AD-PROC-001 | IsDebuggerPresent 导入 | API（kernel32） | confirmed（IAT slot 92, rva 0x138C68） | unknown（IAT 未重建） | confirmed | unknown | OEP 后（原程序） | candidate IAT | 原程序/壳调用 IsDebuggerPresent 判断 PEB.BeingDebugged | PEB 被 patch → 返回 0 | PEB.BeingDebugged=1（patch 前） | 分支/退出（潜在） | iat_evidence slot 92 | emulate | oracle-only
 AD-PROC-002 | PEB.BeingDebugged | PEB 字段 | confirmed（行为：debugger patch "was 1"） | confirmed（行为） | confirmed | confirmed | loader | CREATE_PROCESS | 壳或原程序读 PEB+0x02 | 0 | 1（patch 前） | 分支/退出（潜在） | live logs | emulate | oracle-only
-AD-PROC-003 | PEB.pShimData | PEB 字段 | confirmed（行为：debugger 清除） | confirmed（行为） | confirmed | confirmed | loader | CREATE_PROCESS | 读 PEB+0x0C | 0 | 非 0 | apphelp 钩子 | live logs | emulate | oracle-only
+AD-PROC-003 | PEB.pShimData | PEB 字段 | confirmed（行为：debugger 清除） | confirmed（行为） | confirmed | confirmed | loader | CREATE_PROCESS | 读 PEB+0x2D8 | 0 | 非 0 | apphelp 钩子 | live logs | emulate | oracle-only
 AD-PROC-004 | CheckRemoteDebuggerPresent | API | 未发现 | 未发现 | unknown | unknown | - | - | - | - | - | - | 无 | observe-only | unrelated
 AD-PROC-005 | NtQueryInformationProcess (debug class) | NT syscall | 未发现静态；拦截器 0 命中 | 未发现静态；拦截器 0 命中 | unknown | unknown | 任意（壳直呼） | 加密载荷 | 查询 DebugPort/DebugFlags | 无 debugger | 有 debugger | 退出/分支 | live logs（0 命中） | emulate（防御性） | oracle-only
 AD-PROC-006 | debug object | NT | 无 | 无 | unknown | unknown | - | - | - | - | - | - | - | defer | unrelated

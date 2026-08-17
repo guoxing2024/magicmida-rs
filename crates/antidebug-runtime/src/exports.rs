@@ -112,6 +112,8 @@ pub struct RuntimeHandle {
     pub surface_details: Vec<SurfaceDetail>,
     /// Original BeingDebugged value for shutdown restoration (ADR-5).
     pub original_being_debugged: Option<String>,
+    /// Original pShimData value for shutdown restoration (ADR-5-CORRECTION).
+    pub original_shim_data: Option<String>,
 }
 
 /// Global runtime state (single instance, single thread).
@@ -278,6 +280,10 @@ fn initialize_inner(
         .iter()
         .find(|o| o.surface_id == SURFACE_AD_PROC_002)
         .and_then(|o| o.original_value.clone());
+    let original_shim: Option<String> = outcomes
+        .iter()
+        .find(|o| o.surface_id == SURFACE_AD_PROC_003)
+        .and_then(|o| o.original_value.clone());
     // expected set for attestation = hard-required surfaces only (002, 003);
     // AD-PROC-001 stays a candidate and is NOT part of hooks_expected.
     let expected_hard: Vec<String> = expected
@@ -338,6 +344,7 @@ fn initialize_inner(
         shutdown_requested: false,
         surface_details: Vec::new(),
         original_being_debugged: original_bd,
+        original_shim_data: original_shim,
     };
     // SAFETY: single-threaded init contract; set() fails only if already set
     // which we checked above.
@@ -430,6 +437,37 @@ fn shutdown_inner() -> i32 {
             Err(er) => {
                 let _ = handle.telemetry.report_surface_restore(
                     SURFACE_AD_PROC_002,
+                    "Failed",
+                    Some(er.to_string()),
+                );
+                return MidaAntidebugError::RestoreFailed.as_i32();
+            }
+        }
+    }
+    // ADR-5-CORRECTION: restore original pShimData before shutdown.
+    if let Some(orig) = &handle.original_shim_data {
+        let real_peb = crate::surfaces::Win32PebMemory::new(handle.attestation.target_pid);
+        match crate::surfaces::PebView::resolve(
+            &real_peb,
+            handle.attestation.target_pid,
+            crate::surfaces::POINTER_SIZE_X64,
+        ) {
+            Ok(view) => {
+                match crate::surfaces::restore_proc_003(&view, &real_peb, Some(orig.clone())) {
+                    Ok(_) => {}
+                    Err(er) => {
+                        let _ = handle.telemetry.report_surface_restore(
+                            SURFACE_AD_PROC_003,
+                            "Failed",
+                            Some(er.to_string()),
+                        );
+                        return MidaAntidebugError::RestoreFailed.as_i32();
+                    }
+                }
+            }
+            Err(er) => {
+                let _ = handle.telemetry.report_surface_restore(
+                    SURFACE_AD_PROC_003,
                     "Failed",
                     Some(er.to_string()),
                 );

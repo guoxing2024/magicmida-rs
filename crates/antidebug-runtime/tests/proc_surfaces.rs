@@ -4,9 +4,12 @@
 //! All tests use [FakePebMemory] - an in-memory PEB simulation - so no
 //! real process memory is touched and no protected sample is involved.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use mida_antidebug_runtime::surfaces::{
-    install_proc_002, install_proc_003, install_proc_surfaces, restore_proc_002, PebMemory,
-    PebView, RestorationPolicy, RestoreResult, SurfaceError, PEB_OFFSET_BEING_DEBUGGED,
+    install_proc_002, install_proc_003, install_proc_surfaces, restore_proc_002, restore_proc_003,
+    PebMemory, PebView, RestorationPolicy, RestoreResult, SurfaceError, PEB_OFFSET_BEING_DEBUGGED,
     PEB_OFFSET_PSHIM_DATA, POINTER_SIZE_X64, SURFACE_AD_PROC_001, SURFACE_AD_PROC_002,
     SURFACE_AD_PROC_003,
 };
@@ -18,40 +21,47 @@ const DIGEST: &str = "deadbeef";
 /// In-memory PEB simulation (synthetic fixture).
 #[derive(Clone)]
 struct FakePebMemory {
-    /// peb_base + offset -> byte.
-    bytes: Vec<u8>,
+    /// peb_base + offset -> byte (RefCell so write_bytes persists and
+    /// read-back verification is honest).
+    bytes: Rc<RefCell<Vec<u8>>>,
     base: u64,
     pid: u32,
     readable: bool,
     writable: bool,
+    /// false = writes are silently dropped (read-back fails closed).
+    write_sticks: bool,
     /// Pointer target region (for pShimData validity).
     shim_region: Option<(u64, Vec<u8>)>,
 }
 
 impl FakePebMemory {
     fn new() -> Self {
-        // 0x100 bytes of PEB.
-        let mut bytes = vec![0u8; 0x100];
+        // 0x300 bytes of PEB (covers x64 pShimData at 0x2D8+8).
+        let mut bytes = vec![0u8; 0x300];
         bytes[PEB_OFFSET_BEING_DEBUGGED as usize] = 0; // BeingDebugged = 0
                                                        // pShimData = null (default).
         Self {
-            bytes,
+            bytes: Rc::new(RefCell::new(bytes)),
             base: PEB_BASE,
             pid: PID,
             readable: true,
             writable: true,
+            write_sticks: true,
             shim_region: None,
         }
     }
 
-    fn with_being_debugged(mut self, v: u8) -> Self {
-        self.bytes[PEB_OFFSET_BEING_DEBUGGED as usize] = v;
+    fn with_being_debugged(self, v: u8) -> Self {
+        self.bytes.borrow_mut()[PEB_OFFSET_BEING_DEBUGGED as usize] = v;
         self
     }
 
     fn with_p_shim_data(mut self, ptr: u64) -> Self {
-        self.bytes[PEB_OFFSET_PSHIM_DATA as usize..PEB_OFFSET_PSHIM_DATA as usize + 8]
-            .copy_from_slice(&ptr.to_le_bytes());
+        {
+            let mut b = self.bytes.borrow_mut();
+            b[PEB_OFFSET_PSHIM_DATA as usize..PEB_OFFSET_PSHIM_DATA as usize + 8]
+                .copy_from_slice(&ptr.to_le_bytes());
+        }
         if ptr != 0 {
             self.shim_region = Some((ptr, vec![0xAB; 16]));
         }
@@ -61,8 +71,11 @@ impl FakePebMemory {
     fn with_p_shim_data_invalid(mut self, ptr: u64) -> Self {
         // Pointer value set but NO backing region registered: the pointer is
         // not readable -> must be rejected by the surface install.
-        self.bytes[PEB_OFFSET_PSHIM_DATA as usize..PEB_OFFSET_PSHIM_DATA as usize + 8]
-            .copy_from_slice(&ptr.to_le_bytes());
+        {
+            let mut b = self.bytes.borrow_mut();
+            b[PEB_OFFSET_PSHIM_DATA as usize..PEB_OFFSET_PSHIM_DATA as usize + 8]
+                .copy_from_slice(&ptr.to_le_bytes());
+        }
         self.shim_region = None;
         self
     }
@@ -76,6 +89,13 @@ impl FakePebMemory {
         self.writable = false;
         self
     }
+
+    /// Simulates a target where writes are accepted but do not persist
+    /// (read-back returns the original value).
+    fn write_does_not_stick(mut self) -> Self {
+        self.write_sticks = false;
+        self
+    }
 }
 
 impl PebMemory for FakePebMemory {
@@ -83,7 +103,8 @@ impl PebMemory for FakePebMemory {
         if !self.readable {
             return Err("not readable".to_string());
         }
-        if addr < self.base || addr + len as u64 > self.base + self.bytes.len() as u64 {
+        let blen = self.bytes.borrow().len();
+        if addr < self.base || addr + len as u64 > self.base + blen as u64 {
             // maybe in shim region?
             if let Some((sbase, sbytes)) = &self.shim_region {
                 if addr >= *sbase && addr + len as u64 <= *sbase + sbytes.len() as u64 {
@@ -94,23 +115,23 @@ impl PebMemory for FakePebMemory {
             return Err("out of range".to_string());
         }
         let off = (addr - self.base) as usize;
-        Ok(self.bytes[off..off + len].to_vec())
+        Ok(self.bytes.borrow()[off..off + len].to_vec())
     }
 
     fn write_bytes(&self, addr: u64, data: &[u8]) -> Result<(), String> {
         if !self.writable {
             return Err("not writable".to_string());
         }
-        if addr < self.base || addr + data.len() as u64 > self.base + self.bytes.len() as u64 {
+        let blen = self.bytes.borrow().len();
+        if addr < self.base || addr + data.len() as u64 > self.base + blen as u64 {
             return Err("out of range".to_string());
         }
         let off = (addr - self.base) as usize;
-        // FakePebMemory is &self; simulate write via interior mutability is
-        // avoided here - tests use the trait contract which only needs
-        // is_writable probe + write attempt. For read-back verification the
-        // tests check the returned outcome values instead.
-        let _ = off;
-        let _ = data;
+        if self.write_sticks {
+            self.bytes.borrow_mut()[off..off + data.len()].copy_from_slice(data);
+        }
+        // If write_sticks is false the write is silently dropped so the
+        // read-back verification sees the original value -> fail-closed.
         Ok(())
     }
 
@@ -118,7 +139,8 @@ impl PebMemory for FakePebMemory {
         if !self.readable {
             return false;
         }
-        if addr >= self.base && addr + len as u64 <= self.base + self.bytes.len() as u64 {
+        let blen = self.bytes.borrow().len();
+        if addr >= self.base && addr + len as u64 <= self.base + blen as u64 {
             return true;
         }
         if let Some((sbase, sbytes)) = &self.shim_region {
@@ -234,20 +256,30 @@ fn proc003_null_shim_data_ok() {
     let out = install_proc_003(&view(&mem), &mem, PID, PID, DIGEST, DIGEST).unwrap();
     assert!(out.installed);
     assert_eq!(out.surface_id, SURFACE_AD_PROC_003);
-    assert_eq!(out.original_value.as_deref(), Some("null"));
-    assert_eq!(out.restoration_policy, RestorationPolicy::ObserveOnly);
+    // pShimData already 0 -> clean; original/effective both "0".
+    assert_eq!(out.original_value.as_deref(), Some("0"));
+    assert_eq!(out.effective_value.as_deref(), Some("0"));
+    assert_eq!(out.restoration_policy, RestorationPolicy::RestoreOriginal);
 }
 
 #[test]
-fn proc003_valid_shim_pointer_ok() {
+fn proc003_nonzero_shim_is_zeroed() {
     let target = PEB_BASE + 0x2000;
     let mem = FakePebMemory::new().with_p_shim_data(target);
     let out = install_proc_003(&view(&mem), &mem, PID, PID, DIGEST, DIGEST).unwrap();
     assert!(out.installed);
+    assert_eq!(out.surface_id, SURFACE_AD_PROC_003);
+    // original recorded, effective must be 0 (zeroed + read back).
     assert_eq!(
         out.original_value.as_deref(),
         Some(format!("{target:#x}").as_str())
     );
+    assert_eq!(out.effective_value.as_deref(), Some("0"));
+    assert_eq!(out.restoration_policy, RestorationPolicy::RestoreOriginal);
+    // the field in memory is actually 0 now.
+    let v = view(&mem);
+    let reread = v.read_ptr(&mem, PEB_OFFSET_PSHIM_DATA).unwrap();
+    assert_eq!(reread, 0);
 }
 
 #[test]
@@ -263,6 +295,77 @@ fn proc003_pid_mismatch_rejected() {
     let mem = FakePebMemory::new();
     let err = install_proc_003(&view(&mem), &mem, PID, PID + 1, DIGEST, DIGEST).unwrap_err();
     assert!(matches!(err, SurfaceError::TargetPidMismatch { .. }));
+}
+
+#[test]
+fn proc003_write_back_verification_failure_fails_closed() {
+    // Writes are accepted but do not persist -> read-back != 0 -> fail.
+    let mem = FakePebMemory::new()
+        .with_p_shim_data(PEB_BASE + 0x2000)
+        .write_does_not_stick();
+    let err = install_proc_003(&view(&mem), &mem, PID, PID, DIGEST, DIGEST).unwrap_err();
+    assert!(matches!(err, SurfaceError::ShimDataInvalid(_)));
+}
+
+#[test]
+fn proc003_unwritable_peb_fails_closed_when_zeroing() {
+    // Non-null pShimData + unwritable PEB -> cannot zero -> fail.
+    let mem = FakePebMemory::new()
+        .with_p_shim_data(PEB_BASE + 0x2000)
+        .unwritable();
+    let err = install_proc_003(&view(&mem), &mem, PID, PID, DIGEST, DIGEST).unwrap_err();
+    assert!(matches!(err, SurfaceError::PebNotWritable { .. }));
+}
+
+#[test]
+fn proc003_restore_original_pointer() {
+    let target = PEB_BASE + 0x2000;
+    let mem = FakePebMemory::new().with_p_shim_data(target);
+    let out = install_proc_003(&view(&mem), &mem, PID, PID, DIGEST, DIGEST).unwrap();
+    assert_eq!(
+        out.original_value.as_deref(),
+        Some(format!("{target:#x}").as_str())
+    );
+    let v = view(&mem);
+    let rr = restore_proc_003(&v, &mem, out.original_value).unwrap();
+    assert_eq!(rr, RestoreResult::Restored);
+    // pointer is back.
+    let reread = v.read_ptr(&mem, PEB_OFFSET_PSHIM_DATA).unwrap();
+    assert_eq!(reread, target);
+}
+
+#[test]
+fn proc003_restore_zero_original_not_applicable() {
+    let mem = FakePebMemory::new();
+    let out = install_proc_003(&view(&mem), &mem, PID, PID, DIGEST, DIGEST).unwrap();
+    assert_eq!(out.original_value.as_deref(), Some("0"));
+    let v = view(&mem);
+    let rr = restore_proc_003(&v, &mem, out.original_value).unwrap();
+    assert_eq!(rr, RestoreResult::NotApplicable);
+}
+
+#[test]
+fn proc003_restore_failure_reported() {
+    let mem = FakePebMemory::new()
+        .with_p_shim_data(PEB_BASE + 0x2000)
+        .unwritable();
+    let v = view(&mem);
+    let err = restore_proc_003(&v, &mem, Some(format!("{:#x}", PEB_BASE + 0x2000))).unwrap_err();
+    assert!(matches!(err, SurfaceError::RestoreFailed { .. }));
+}
+
+#[test]
+fn proc003_offset_is_0x2d8_not_0x08() {
+    // Authority layout: x64 pShimData is PEB+0x2D8 (crates/core/src/process.rs
+    // PEB_SHIM_DATA_OFFSET). 0x08 must NOT be treated as pShimData.
+    assert_eq!(PEB_OFFSET_PSHIM_DATA, 0x2D8);
+    // Place a sentinel at 0x08: install must ignore it (reads 0x2D8).
+    let mem = FakePebMemory::new();
+    mem.bytes.borrow_mut()[0x08..0x10].copy_from_slice(&0x1111_2222_3333_4444u64.to_le_bytes());
+    let out = install_proc_003(&view(&mem), &mem, PID, PID, DIGEST, DIGEST).unwrap();
+    // 0x08 sentinel must NOT be seen as pShimData (0x2D8 region is zero).
+    assert_eq!(out.original_value.as_deref(), Some("0"));
+    assert_eq!(out.effective_value.as_deref(), Some("0"));
 }
 
 // ----------------------------------------------------------------

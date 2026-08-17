@@ -72,7 +72,7 @@
 
 ### AD-PROC-003 PEB.pShimData
 
-- 目标：壳/原程序读取 PEB+0x0C。
+- 目标：壳/原程序读取 PEB+0x2D8。
 - phase：loader。
 - expected no-debugger：{"p_shim_data": 0}；allowed_variance：[]。
 - current debugger：非 0（apphelp 钩子存在时）。
