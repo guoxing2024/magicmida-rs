@@ -982,7 +982,10 @@ pub fn unpack(
                             // ADR-6: audited runtime authority + artifact path.
                             // The loader result is injected below after the
                             // runtime is actually loaded into the target.
-                            runtime_authority: crate::unpacker::runtime_loader::runtime_authority(),
+                            // Manifest load failure fails closed at the
+                            // controller dependency stage.
+                            runtime_authority: crate::unpacker::runtime_loader::runtime_authority()
+                                .ok(),
                             runtime_path: crate::unpacker::runtime_loader::runtime_artifact_path(),
                             loader_result: None,
                         },

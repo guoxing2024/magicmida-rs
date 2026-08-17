@@ -5,11 +5,12 @@
 //! harness (out-of-tree); these tests pin the deterministic pieces.
 
 use mida_cli::unpacker::runtime_loader::{
-    build_init_params_bytes, RuntimeAuthority, RuntimeLoadError, ThunkArgs, THUNK_CODE,
+    build_init_params_bytes, verify_pe_x64, verify_runtime_provenance, RuntimeAuthorityManifest,
+    RuntimeFileIdentity, RuntimeLoadError, ThunkArgs, THUNK_CODE,
 };
 
 // ----------------------------------------------------------------
-// runtime authority
+// runtime authority (manifest-based, ADR-6-CORRECTION)
 // ----------------------------------------------------------------
 
 fn tmp_file(name: &str, content: &[u8]) -> std::path::PathBuf {
@@ -28,38 +29,48 @@ fn sha256_hex(bytes: &[u8]) -> String {
     d.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-#[test]
-fn authority_matches_ok() {
-    let content = b"fake runtime bytes for authority test";
-    let path = tmp_file("runtime_ok.dll", content);
-    let authority = RuntimeAuthority {
-        file_name: "runtime_ok.dll".to_string(),
-        sha256: sha256_hex(content),
-        size_bytes: content.len() as u64,
+/// Build a minimal valid x64 PE (MZ + PE sig + Machine=AMD64 + PE32+ magic).
+fn minimal_pe(machine: u16, magic: u16) -> Vec<u8> {
+    let mut b = vec![0u8; 0x100];
+    b[0] = b'M';
+    b[1] = b'Z';
+    b[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes()); // e_lfanew = 0x80
+    b[0x80..0x84].copy_from_slice(b"PE\0\0");
+    b[0x84..0x86].copy_from_slice(&machine.to_le_bytes()); // Machine
+    b[0x98..0x9A].copy_from_slice(&magic.to_le_bytes()); // Optional magic at pe+0x18
+    b
+}
+
+fn manifest(sha256: &str, size: u64) -> RuntimeAuthorityManifest {
+    RuntimeAuthorityManifest {
+        schema: "mida.antidebug-runtime-authority/v1".to_string(),
+        kind: "runtime-x64".to_string(),
+        artifact_id: "mida-antidebug-runtime-x64".to_string(),
+        sha256: sha256.to_string(),
+        size_bytes: size,
         architecture: "x86_64".to_string(),
-        source_revision: "test".to_string(),
-        provenance_schema: "mida.antidebug-provenance/v1".to_string(),
-    };
+        source_ref: "test-commit".to_string(),
+        provenance_ref: "provenance.json".to_string(),
+    }
+}
+
+#[test]
+fn authority_matches_ok_with_real_pe() {
+    let pe = minimal_pe(0x8664, 0x20B); // AMD64 + PE32+
+    let path = tmp_file("runtime_ok.dll", &pe);
+    let authority = manifest(&sha256_hex(&pe), pe.len() as u64);
     let id = authority.verify_file(&path).unwrap();
-    assert_eq!(id.sha256, sha256_hex(content));
-    assert_eq!(id.size_bytes, content.len() as u64);
+    assert_eq!(id.sha256, sha256_hex(&pe));
+    assert_eq!(id.size_bytes, pe.len() as u64);
     assert_eq!(id.architecture, "x86_64");
-    // canonical path
     assert!(id.path.is_absolute());
 }
 
 #[test]
 fn authority_wrong_hash_fails() {
-    let content = b"fake runtime bytes";
-    let path = tmp_file("runtime_badhash.dll", content);
-    let authority = RuntimeAuthority {
-        file_name: "runtime_badhash.dll".to_string(),
-        sha256: "00".repeat(32), // wrong
-        size_bytes: content.len() as u64,
-        architecture: "x86_64".to_string(),
-        source_revision: "test".to_string(),
-        provenance_schema: "mida.antidebug-provenance/v1".to_string(),
-    };
+    let pe = minimal_pe(0x8664, 0x20B);
+    let path = tmp_file("runtime_badhash.dll", &pe);
+    let authority = manifest(&"00".repeat(32), pe.len() as u64);
     let err = authority.verify_file(&path).unwrap_err();
     assert!(matches!(err, RuntimeLoadError::AuthorityMismatch(_)));
     assert!(err.to_string().contains("sha256"));
@@ -67,16 +78,9 @@ fn authority_wrong_hash_fails() {
 
 #[test]
 fn authority_wrong_size_fails() {
-    let content = b"fake runtime bytes";
-    let path = tmp_file("runtime_badsize.dll", content);
-    let authority = RuntimeAuthority {
-        file_name: "runtime_badsize.dll".to_string(),
-        sha256: sha256_hex(content),
-        size_bytes: content.len() as u64 + 1, // wrong
-        architecture: "x86_64".to_string(),
-        source_revision: "test".to_string(),
-        provenance_schema: "mida.antidebug-provenance/v1".to_string(),
-    };
+    let pe = minimal_pe(0x8664, 0x20B);
+    let path = tmp_file("runtime_badsize.dll", &pe);
+    let authority = manifest(&sha256_hex(&pe), pe.len() as u64 + 1);
     let err = authority.verify_file(&path).unwrap_err();
     assert!(matches!(err, RuntimeLoadError::AuthorityMismatch(_)));
     assert!(err.to_string().contains("size"));
@@ -84,18 +88,139 @@ fn authority_wrong_size_fails() {
 
 #[test]
 fn authority_missing_file_fails() {
-    let authority = RuntimeAuthority {
-        file_name: "nope.dll".to_string(),
-        sha256: "00".repeat(32),
-        size_bytes: 1,
-        architecture: "x86_64".to_string(),
-        source_revision: "test".to_string(),
-        provenance_schema: "mida.antidebug-provenance/v1".to_string(),
-    };
+    let authority = manifest(&"00".repeat(32), 1);
     let err = authority
         .verify_file(&std::path::Path::new("C:/definitely/not/here/nope.dll"))
         .unwrap_err();
     assert!(matches!(err, RuntimeLoadError::AuthorityUnavailable(..)));
+}
+#[test]
+fn pe_x86_machine_rejected() {
+    let pe = minimal_pe(0x14C, 0x20B); // I386 machine
+    let err = verify_pe_x64(&pe).unwrap_err();
+    assert!(matches!(err, RuntimeLoadError::ArchitectureUnsupported(_)));
+}
+
+#[test]
+fn pe_non_pe_rejected() {
+    let err = verify_pe_x64(b"not a pe at all").unwrap_err();
+    assert!(matches!(err, RuntimeLoadError::ArchitectureUnsupported(_)));
+    assert!(err.to_string().contains("MZ"));
+}
+
+#[test]
+fn pe_pe32_not_pe32plus_rejected() {
+    let pe = minimal_pe(0x8664, 0x10B); // AMD64 machine but PE32 optional header
+    let err = verify_pe_x64(&pe).unwrap_err();
+    assert!(matches!(err, RuntimeLoadError::ArchitectureUnsupported(_)));
+}
+
+#[test]
+fn pe_arm_machine_rejected() {
+    let pe = minimal_pe(0xAA64, 0x20B); // ARM64 machine
+    let err = verify_pe_x64(&pe).unwrap_err();
+    assert!(matches!(err, RuntimeLoadError::ArchitectureUnsupported(_)));
+}
+
+fn ok_provenance(sha256: &str, size: u64) -> serde_json::Value {
+    serde_json::json!({
+        "schema": "mida.antidebug-provenance/v1",
+        "artifact_id": "mida-antidebug-runtime-x64",
+        "kind": "runtime-x64",
+        "sha256": sha256,
+        "size_bytes": size,
+        "architecture": "x86_64",
+        "toolchain": "rustc",
+        "source_ref": "test-commit",
+        "third_party": "build-and-serialization-only",
+        "dependencies": [],
+        "license": "GPL-3.0-only",
+        "build_repro": "test",
+    })
+}
+
+#[test]
+fn provenance_hash_mismatch_rejected() {
+    let pe = minimal_pe(0x8664, 0x20B);
+    let runtime_path = tmp_file("runtime_prov.dll", &pe);
+    let mut authority = manifest(&sha256_hex(&pe), pe.len() as u64);
+    authority.provenance_ref = "prov_hash_mismatch.json".to_string();
+    let id = authority.verify_file(&runtime_path).unwrap();
+    let mut prov = ok_provenance(&id.sha256, id.size_bytes);
+    prov["sha256"] = serde_json::Value::String("00".repeat(32));
+    let dir = std::env::temp_dir().join("mida-adr6-test");
+    std::fs::write(dir.join("prov_hash_mismatch.json"), prov.to_string()).unwrap();
+    let err = verify_runtime_provenance(&authority, &dir, &id).unwrap_err();
+    assert!(matches!(err, RuntimeLoadError::AuthorityMismatch(_)));
+    assert!(err.to_string().contains("sha256"));
+}
+
+#[test]
+fn provenance_kind_mismatch_rejected() {
+    let pe = minimal_pe(0x8664, 0x20B);
+    let runtime_path = tmp_file("runtime_prov2.dll", &pe);
+    let mut authority = manifest(&sha256_hex(&pe), pe.len() as u64);
+    authority.provenance_ref = "prov_kind_mismatch.json".to_string();
+    let id = authority.verify_file(&runtime_path).unwrap();
+    let mut prov = ok_provenance(&id.sha256, id.size_bytes);
+    prov["kind"] = serde_json::Value::String("runtime-x86".to_string());
+    let dir = std::env::temp_dir().join("mida-adr6-test");
+    std::fs::write(dir.join("prov_kind_mismatch.json"), prov.to_string()).unwrap();
+    let err = verify_runtime_provenance(&authority, &dir, &id).unwrap_err();
+    assert!(matches!(err, RuntimeLoadError::AuthorityMismatch(_)));
+    assert!(err.to_string().contains("kind"));
+}
+
+#[test]
+fn provenance_missing_rejected() {
+    let pe = minimal_pe(0x8664, 0x20B);
+    let runtime_path = tmp_file("runtime_prov3.dll", &pe);
+    let authority = manifest(&sha256_hex(&pe), pe.len() as u64);
+    let id = authority.verify_file(&runtime_path).unwrap();
+    // No provenance.json in a fresh dir.
+    let dir = std::env::temp_dir().join("mida-adr6-test-empty");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let err = verify_runtime_provenance(&authority, &dir, &id).unwrap_err();
+    assert!(matches!(err, RuntimeLoadError::AuthorityMismatch(_)));
+}
+
+#[test]
+fn provenance_ok_passes() {
+    let pe = minimal_pe(0x8664, 0x20B);
+    let runtime_path = tmp_file("runtime_prov_ok.dll", &pe);
+    let mut authority = manifest(&sha256_hex(&pe), pe.len() as u64);
+    authority.provenance_ref = "prov_ok.json".to_string();
+    let id = authority.verify_file(&runtime_path).unwrap();
+    let dir = std::env::temp_dir().join("mida-adr6-test");
+    std::fs::write(
+        dir.join("prov_ok.json"),
+        ok_provenance(&id.sha256, id.size_bytes).to_string(),
+    )
+    .unwrap();
+    let prov = verify_runtime_provenance(&authority, &dir, &id).unwrap();
+    assert_eq!(prov["kind"], "runtime-x64");
+}
+
+#[test]
+fn env_cannot_authorize_arbitrary_runtime() {
+    // ADR-6-CORRECTION: a caller setting MIDA_RUNTIME_SHA256 must NOT be
+    // able to authorize an arbitrary runtime. The loader reads only the
+    // manifest path; expected hashes come from the compiled-in digest.
+    // Setting MIDA_RUNTIME_SHA256 must have no effect on authority.
+    // We prove this by checking that runtime_authority() ignores it: it
+    // fails because no manifest path is configured (or the manifest is
+    // missing) regardless of MIDA_RUNTIME_SHA256.
+    unsafe {
+        std::env::set_var("MIDA_RUNTIME_SHA256", "00".repeat(32));
+        std::env::remove_var("MIDA_RUNTIME_AUTHORITY");
+    }
+    let err = mida_cli::unpacker::runtime_loader::runtime_authority().unwrap_err();
+    assert!(matches!(err, RuntimeLoadError::AuthorityUnavailable(..)));
+    assert!(err.to_string().contains("MIDA_RUNTIME_AUTHORITY"));
+    unsafe {
+        std::env::remove_var("MIDA_RUNTIME_SHA256");
+    }
 }
 
 // ----------------------------------------------------------------
@@ -186,23 +311,15 @@ fn init_params_empty_surfaces_ok() {
 use mida_cli::unpacker::antidebug_controller::{
     AntidebugController, AntidebugOutcome, AntidebugStageOptions, LoaderResult,
 };
-use mida_cli::unpacker::runtime_loader::RuntimeFileIdentity;
 
 fn controller_with_loader_result(loader: Option<LoaderResult>) -> AntidebugController {
-    // A real temp file whose content matches the pinned authority digest.
-    let content = b"pinned-runtime-bytes";
+    // A real temp x64 PE file whose content matches the manifest digest.
+    let content = minimal_pe(0x8664, 0x20B);
     let dir = std::env::temp_dir().join("mida-adr6-test");
     let _ = std::fs::create_dir_all(&dir);
     let p = dir.join("r.dll");
-    std::fs::write(&p, content).unwrap();
-    let authority = RuntimeAuthority {
-        file_name: "r.dll".to_string(),
-        sha256: sha256_hex(content),
-        size_bytes: content.len() as u64,
-        architecture: "x86_64".to_string(),
-        source_revision: "t".to_string(),
-        provenance_schema: "mida.antidebug-provenance/v1".to_string(),
-    };
+    std::fs::write(&p, &content).unwrap();
+    let authority = manifest(&sha256_hex(&content), content.len() as u64);
     AntidebugController::new(AntidebugStageOptions {
         sample_id: Some("origin_macro".to_string()),
         target_pid: 1234,
@@ -328,20 +445,14 @@ fn controller_fails_closed_on_incomplete_attestation() {
 
 #[test]
 fn controller_authority_mismatch_fails_before_loader() {
-    // runtime file does not exist -> authority fails -> DependencyUnavailable.
-    let authority = RuntimeAuthority {
-        file_name: "r.dll".to_string(),
-        sha256: "cd".repeat(32), // wrong digest vs file
-        size_bytes: 10,
-        architecture: "x86_64".to_string(),
-        source_revision: "t".to_string(),
-        provenance_schema: "mida.antidebug-provenance/v1".to_string(),
-    };
-    // Write a real file whose content does NOT match the authority digest.
+    // The file is a real x64 PE but the manifest digest does not match it ->
+    // authority verification fails before any loader work.
+    let content = minimal_pe(0x8664, 0x20B);
     let dir = std::env::temp_dir().join("mida-adr6-test");
     let _ = std::fs::create_dir_all(&dir);
     let p = dir.join("mismatch.dll");
-    std::fs::write(&p, b"not the pinned bytes").unwrap();
+    std::fs::write(&p, &content).unwrap();
+    let authority = manifest(&"cd".repeat(32), content.len() as u64); // wrong digest
     let mut c = AntidebugController::new(AntidebugStageOptions {
         sample_id: Some("origin_macro".to_string()),
         target_pid: 1234,

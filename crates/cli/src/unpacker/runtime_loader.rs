@@ -52,28 +52,117 @@ use mida_antidebug_runtime::attestation::RuntimeAttestation;
 #[allow(dead_code)] // evidence binding; kept for provenance parity
 pub const RUNTIME_KIND: &str = "runtime-x64";
 
-/// The audited runtime artifact authority (ADR-6).
+/// The audited runtime authority MANIFEST (ADR-6-CORRECTION).
 ///
-/// This is the fixed, audited configuration the loader verifies against.
+/// This is an immutable, audited configuration file. The loader NEVER trusts
+/// caller-supplied hashes: the manifest itself is protected by a fixed
+/// digest compiled into the loader (MIDA_RUNTIME_AUTHORITY_DIGEST), and
+/// the environment is only allowed to select WHERE the manifest and the
+/// runtime artifact live, never WHAT they contain.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct RuntimeAuthority {
-    /// Expected file name (informational only; never trusted alone).
-    pub file_name: String,
-    /// Expected SHA-256 (hex, lowercase).
+#[serde(deny_unknown_fields)]
+pub struct RuntimeAuthorityManifest {
+    /// Manifest schema.
+    pub schema: String,
+    /// Authority kind (fixed: "runtime-x64").
+    pub kind: String,
+    /// Content-addressed artifact id.
+    pub artifact_id: String,
+    /// Expected runtime SHA-256 (hex, lowercase).
     pub sha256: String,
-    /// Expected size in bytes.
+    /// Expected runtime size in bytes.
     pub size_bytes: u64,
-    /// Expected architecture.
+    /// Expected architecture (must match actual PE machine).
     pub architecture: String,
-    /// Source revision the runtime was built from.
-    pub source_revision: String,
-    /// Provenance schema the runtime carries.
-    pub provenance_schema: String,
+    /// Git source revision the runtime was built from.
+    pub source_ref: String,
+    /// Path (relative to the manifest) of the provenance JSON.
+    pub provenance_ref: String,
 }
 
-impl RuntimeAuthority {
-    /// Verify a candidate runtime file against this authority.
-    /// Fail-closed: any mismatch is an error, never a warning.
+/// The compiled-in digest of the authority manifest. Set by the acceptance
+/// step (fixed at build time); an empty value means "authority disabled" and
+/// the loader fails closed.
+pub const MIDA_RUNTIME_AUTHORITY_DIGEST: &str = match option_env!("MIDA_RUNTIME_AUTHORITY_DIGEST") {
+    Some(v) => v,
+    None => "",
+};
+
+/// The compiled-in runtime source revision (Git commit). Populated by the
+/// build/acceptance step; never the crate version.
+pub const MIDA_RUNTIME_SOURCE_REF: &str = match option_env!("MIDA_RUNTIME_SOURCE_REF") {
+    Some(v) => v,
+    None => "",
+};
+
+impl RuntimeAuthorityManifest {
+    /// Load and verify the manifest from a path.
+    ///
+    /// The manifest digest is checked against the compiled-in
+    /// MIDA_RUNTIME_AUTHORITY_DIGEST: a caller cannot replace the
+    /// manifest (and therefore cannot authorize an arbitrary runtime) unless
+    /// they can also replace the loader binary itself.
+    pub fn load(path: &Path) -> Result<Self, RuntimeLoadError> {
+        if MIDA_RUNTIME_AUTHORITY_DIGEST.is_empty() {
+            return Err(RuntimeLoadError::AuthorityUnavailable(
+                "MIDA_RUNTIME_AUTHORITY_DIGEST not set at build time".to_string(),
+                "authority digest is empty; loader fails closed".to_string(),
+            ));
+        }
+        let canonical = path.canonicalize().map_err(|e| {
+            RuntimeLoadError::AuthorityUnavailable(path.display().to_string(), e.to_string())
+        })?;
+        let bytes = std::fs::read(&canonical).map_err(|e| {
+            RuntimeLoadError::AuthorityUnavailable(canonical.display().to_string(), e.to_string())
+        })?;
+        // The manifest bytes are hashed EXACTLY as stored on disk (canonical
+        // form for the authority file).
+        let digest = sha256_hex(&bytes);
+        if digest != MIDA_RUNTIME_AUTHORITY_DIGEST {
+            return Err(RuntimeLoadError::AuthorityMismatch(format!(
+                "manifest sha256 {digest} != compiled-in {MIDA_RUNTIME_AUTHORITY_DIGEST}"
+            )));
+        }
+        let manifest: RuntimeAuthorityManifest = serde_json::from_slice(&bytes)
+            .map_err(|e| RuntimeLoadError::AuthorityMismatch(format!("manifest parse: {e}")))?;
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    /// Structural validation of the manifest content (fail-closed).
+    fn validate(&self) -> Result<(), RuntimeLoadError> {
+        if self.schema != "mida.antidebug-runtime-authority/v1" {
+            return Err(RuntimeLoadError::AuthorityMismatch(format!(
+                "schema {} != mida.antidebug-runtime-authority/v1",
+                self.schema
+            )));
+        }
+        if self.kind != "runtime-x64" {
+            return Err(RuntimeLoadError::AuthorityMismatch(format!(
+                "kind {} != runtime-x64",
+                self.kind
+            )));
+        }
+        if self.architecture != "x86_64" {
+            return Err(RuntimeLoadError::ArchitectureUnsupported(
+                self.architecture.clone(),
+            ));
+        }
+        if self.artifact_id.is_empty() || self.sha256.is_empty() || self.source_ref.is_empty() {
+            return Err(RuntimeLoadError::AuthorityMismatch(
+                "manifest missing artifact_id/sha256/source_ref".to_string(),
+            ));
+        }
+        if self.size_bytes == 0 {
+            return Err(RuntimeLoadError::AuthorityMismatch(
+                "manifest size_bytes is zero".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Verify the candidate runtime file: hash, size, and REAL PE
+    /// architecture (MZ + PE + Machine=AMD64 + PE32+).
     pub fn verify_file(&self, path: &Path) -> Result<RuntimeFileIdentity, RuntimeLoadError> {
         let canonical = path.canonicalize().map_err(|e| {
             RuntimeLoadError::AuthorityUnavailable(path.display().to_string(), e.to_string())
@@ -100,17 +189,65 @@ impl RuntimeAuthority {
         let digest = sha256_hex(&bytes);
         if digest != self.sha256 {
             return Err(RuntimeLoadError::AuthorityMismatch(format!(
-                "sha256 {} != expected {}",
-                digest, self.sha256
+                "sha256 {digest} != expected {}",
+                self.sha256
             )));
         }
+        // Real PE architecture verification (not just the authority string).
+        verify_pe_x64(&bytes)?;
         Ok(RuntimeFileIdentity {
             path: canonical,
             sha256: digest,
             size_bytes: size,
-            architecture: self.architecture.clone(),
+            architecture: "x86_64".to_string(),
         })
     }
+}
+
+/// Verify that a buffer is a real x64 PE (MZ + PE signature + Machine=AMD64
+/// + PE32+ optional header magic 0x20B). Fail-closed on anything else.
+pub fn verify_pe_x64(bytes: &[u8]) -> Result<(), RuntimeLoadError> {
+    // DOS header: "MZ" at offset 0.
+    if bytes.len() < 0x40 || &bytes[0..2] != b"MZ" {
+        return Err(RuntimeLoadError::ArchitectureUnsupported(
+            "not a PE file (missing MZ)".to_string(),
+        ));
+    }
+    // e_lfanew at offset 0x3C (u32 LE).
+    let pe_off = u32::from_le_bytes(bytes[0x3C..0x40].try_into().map_err(|_| {
+        RuntimeLoadError::ArchitectureUnsupported("truncated DOS header".to_string())
+    })?) as usize;
+    if pe_off + 24 > bytes.len() || &bytes[pe_off..pe_off + 4] != b"PE\0\0" {
+        return Err(RuntimeLoadError::ArchitectureUnsupported(
+            "not a PE file (missing PE signature)".to_string(),
+        ));
+    }
+    // COFF header: Machine at pe_off+4 (u16 LE). AMD64 = 0x8664.
+    let machine =
+        u16::from_le_bytes(bytes[pe_off + 4..pe_off + 6].try_into().map_err(|_| {
+            RuntimeLoadError::ArchitectureUnsupported("truncated COFF".to_string())
+        })?);
+    if machine != 0x8664 {
+        return Err(RuntimeLoadError::ArchitectureUnsupported(format!(
+            "COFF machine {machine:#x} != AMD64 (0x8664)"
+        )));
+    }
+    // Optional header magic at pe_off+24 (u16 LE). PE32+ = 0x20B.
+    if pe_off + 24 + 2 > bytes.len() {
+        return Err(RuntimeLoadError::ArchitectureUnsupported(
+            "truncated optional header".to_string(),
+        ));
+    }
+    let magic =
+        u16::from_le_bytes(bytes[pe_off + 24..pe_off + 26].try_into().map_err(|_| {
+            RuntimeLoadError::ArchitectureUnsupported("truncated magic".to_string())
+        })?);
+    if magic != 0x20B {
+        return Err(RuntimeLoadError::ArchitectureUnsupported(format!(
+            "optional header magic {magic:#x} != PE32+ (0x20B)"
+        )));
+    }
+    Ok(())
 }
 
 /// Identity of a verified runtime file.
@@ -133,7 +270,7 @@ pub struct LoaderIdentity {
 /// The loader itself.
 #[derive(Debug, Clone)]
 pub struct RuntimeLoader {
-    pub authority: RuntimeAuthority,
+    pub authority: RuntimeAuthorityManifest,
     /// Loader identity (evidence binding).
     #[allow(dead_code)] // consumed by evidence bindings
     pub identity: LoaderIdentity,
@@ -300,8 +437,8 @@ pub struct LoadedRuntime {
 }
 
 impl RuntimeLoader {
-    /// Create the loader with the audited authority.
-    pub fn new(authority: RuntimeAuthority) -> Self {
+    /// Create the loader with the audited authority manifest.
+    pub fn new(authority: RuntimeAuthorityManifest) -> Self {
         Self {
             authority,
             identity: LoaderIdentity {
@@ -832,25 +969,22 @@ pub fn build_init_params_bytes(
     }
     Ok(out)
 }
-/// Resolve the audited runtime authority (ADR-6).
+/// Resolve the audited runtime authority (ADR-6-CORRECTION).
 ///
-/// The runtime artifact is built out-of-tree and its digest is pinned in
-/// the environment for the acceptance run. The loader never trusts a file
-/// name or caller-supplied hash.
-pub fn runtime_authority() -> Option<RuntimeAuthority> {
-    let sha256 = std::env::var("MIDA_RUNTIME_SHA256").ok()?;
-    let size = std::env::var("MIDA_RUNTIME_SIZE")
-        .ok()?
-        .parse::<u64>()
-        .ok()?;
-    Some(RuntimeAuthority {
-        file_name: "mida_antidebug_runtime.dll".to_string(),
-        sha256,
-        size_bytes: size,
-        architecture: "x86_64".to_string(),
-        source_revision: env!("CARGO_PKG_VERSION").to_string(),
-        provenance_schema: "mida.antidebug-provenance/v1".to_string(),
-    })
+/// The environment is ONLY allowed to select the manifest path
+/// (MIDA_RUNTIME_AUTHORITY) and the runtime artifact path
+/// (MIDA_RUNTIME_DLL). The manifest content is protected by the
+/// compiled-in digest (MIDA_RUNTIME_AUTHORITY_DIGEST); expected hashes,
+/// sizes, architecture and source revision can NEVER be supplied by the
+/// caller.
+pub fn runtime_authority() -> Result<RuntimeAuthorityManifest, RuntimeLoadError> {
+    let Some(manifest_path) = std::env::var("MIDA_RUNTIME_AUTHORITY").ok() else {
+        return Err(RuntimeLoadError::AuthorityUnavailable(
+            "MIDA_RUNTIME_AUTHORITY not set".to_string(),
+            "no authority manifest path configured".to_string(),
+        ));
+    };
+    RuntimeAuthorityManifest::load(std::path::Path::new(&manifest_path))
 }
 
 /// Resolve the runtime artifact path (out-of-tree build product).
@@ -859,6 +993,79 @@ pub fn runtime_artifact_path() -> Option<std::path::PathBuf> {
         .ok()
         .map(std::path::PathBuf::from)
 }
+
+/// Verify the runtime provenance against the manifest and the runtime file.
+///
+/// Provenance is read from provenance_ref (relative to the manifest
+/// directory). Checks are fail-closed:
+/// - provenance.sha256 == runtime file sha256
+/// - provenance.size_bytes == runtime file size
+/// - provenance.kind == runtime-x64
+/// - provenance.architecture == x86_64
+/// - provenance.source_ref non-empty
+/// - provenance.third_party valid (non-empty declared value)
+/// - no dependency declares anti_debug=true
+pub fn verify_runtime_provenance(
+    manifest: &RuntimeAuthorityManifest,
+    manifest_dir: &Path,
+    runtime_identity: &RuntimeFileIdentity,
+) -> Result<serde_json::Value, RuntimeLoadError> {
+    let prov_path = manifest_dir.join(&manifest.provenance_ref);
+    let prov_bytes = std::fs::read(&prov_path).map_err(|e| {
+        RuntimeLoadError::AuthorityMismatch(format!(
+            "provenance unreadable at {}: {e}",
+            prov_path.display()
+        ))
+    })?;
+    // deny_unknown_fields: parse into the strict runtime Provenance struct.
+    let prov: mida_antidebug_runtime::provenance::Provenance = serde_json::from_slice(&prov_bytes)
+        .map_err(|e| RuntimeLoadError::AuthorityMismatch(format!("provenance parse: {e}")))?;
+    if prov.sha256 != runtime_identity.sha256 {
+        return Err(RuntimeLoadError::AuthorityMismatch(format!(
+            "provenance sha256 {} != runtime {}",
+            prov.sha256, runtime_identity.sha256
+        )));
+    }
+    if prov.size_bytes != runtime_identity.size_bytes {
+        return Err(RuntimeLoadError::AuthorityMismatch(format!(
+            "provenance size {} != runtime {}",
+            prov.size_bytes, runtime_identity.size_bytes
+        )));
+    }
+    if prov.kind != "runtime-x64" {
+        return Err(RuntimeLoadError::AuthorityMismatch(format!(
+            "provenance kind {} != runtime-x64",
+            prov.kind
+        )));
+    }
+    if prov.architecture != "x86_64" {
+        return Err(RuntimeLoadError::ArchitectureUnsupported(
+            prov.architecture.clone(),
+        ));
+    }
+    if prov.source_ref.is_empty() {
+        return Err(RuntimeLoadError::AuthorityMismatch(
+            "provenance source_ref is empty".to_string(),
+        ));
+    }
+    if prov.third_party.is_empty() {
+        return Err(RuntimeLoadError::AuthorityMismatch(
+            "provenance third_party is empty".to_string(),
+        ));
+    }
+    for d in &prov.dependencies {
+        if d.anti_debug {
+            return Err(RuntimeLoadError::AuthorityMismatch(format!(
+                "provenance dependency {} declares anti_debug=true",
+                d.name
+            )));
+        }
+    }
+    // Return the raw JSON for evidence.
+    Ok(serde_json::from_slice(&prov_bytes)
+        .map_err(|e| RuntimeLoadError::AuthorityMismatch(format!("provenance re-parse: {e}")))?)
+}
+
 /// Run the full loader sequence against a suspended target and return the
 /// controller-facing result. Any failure is fail-closed (Err).
 pub fn run_runtime_loader(
@@ -867,12 +1074,7 @@ pub fn run_runtime_loader(
     profile_id: &str,
     profile_digest: &str,
 ) -> Result<crate::unpacker::antidebug_controller::LoaderResult, RuntimeLoadError> {
-    let Some(authority) = runtime_authority() else {
-        return Err(RuntimeLoadError::AuthorityUnavailable(
-            "MIDA_RUNTIME_SHA256 not set".to_string(),
-            "no runtime authority configured".to_string(),
-        ));
-    };
+    let authority = runtime_authority()?;
     let Some(runtime_path) = runtime_artifact_path() else {
         return Err(RuntimeLoadError::AuthorityUnavailable(
             "MIDA_RUNTIME_DLL not set".to_string(),
@@ -882,7 +1084,7 @@ pub fn run_runtime_loader(
     // Expected surfaces: the two hard-required PEB surfaces (ADR-5).
     // AD-PROC-001 stays a candidate and is NOT requested here.
     let expected_surfaces = vec!["AD-PROC-002".to_string(), "AD-PROC-003".to_string()];
-    let loader = RuntimeLoader::new(authority);
+    let loader = RuntimeLoader::new(authority.clone());
     // SAFETY: target is a valid process handle; the target main thread is
     // suspended (CREATE_PROCESS debug event window).
     let loaded = unsafe {
@@ -895,6 +1097,19 @@ pub fn run_runtime_loader(
             &expected_surfaces,
         )
     }?;
+    // Provenance binding: verify the runtime's provenance record against the
+    // manifest and the loaded file before reporting success.
+    let manifest_dir =
+        std::path::Path::new(&std::env::var("MIDA_RUNTIME_AUTHORITY").map_err(|_| {
+            RuntimeLoadError::AuthorityUnavailable(
+                "MIDA_RUNTIME_AUTHORITY unset".to_string(),
+                "cannot resolve manifest dir".to_string(),
+            )
+        })?)
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let _prov = verify_runtime_provenance(&authority, &manifest_dir, &loaded.file_identity)?;
     Ok(crate::unpacker::antidebug_controller::LoaderResult {
         module_base: loaded.module_base as u64,
         attestation_json: loaded.attestation_json,

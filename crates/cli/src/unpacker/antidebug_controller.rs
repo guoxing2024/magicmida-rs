@@ -56,7 +56,7 @@ use mida_antidebug::profile::Profile;
 use mida_antidebug::state::{transition, ControllerEvent, ControllerState, FailCode};
 
 use crate::log::{self, LogType};
-use crate::unpacker::runtime_loader::{RuntimeAuthority, RuntimeFileIdentity};
+use crate::unpacker::runtime_loader::{RuntimeAuthorityManifest, RuntimeFileIdentity};
 
 /// Registered anti-debug evidence schema (ADR-0 evidence contract).
 /// The CLI failure sidecar is a `record_kind = "cli-failure"` record of
@@ -208,9 +208,9 @@ pub struct AntidebugStageOptions {
     pub oracle: Option<OracleMode>,
     /// Cleanup backend (injectable for tests).
     pub cleanup_backend: Option<Box<dyn CleanupBackend>>,
-    /// Audited runtime authority (ADR-6). None keeps the old fail-closed
-    /// placeholder behaviour (DependencyUnavailable).
-    pub runtime_authority: Option<RuntimeAuthority>,
+    /// Audited runtime authority manifest (ADR-6-CORRECTION). None keeps
+    /// the old fail-closed placeholder behaviour (DependencyUnavailable).
+    pub runtime_authority: Option<RuntimeAuthorityManifest>,
     /// Path to the runtime DLL to verify + load.
     pub runtime_path: Option<std::path::PathBuf>,
     /// Loader result injected by the CREATE_PROCESS handler after it ran the

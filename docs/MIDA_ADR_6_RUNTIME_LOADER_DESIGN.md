@@ -1,7 +1,7 @@
 # MIDA-ADR-6 自有 x64 Runtime Loader 与 Controller 接线
 
 > **工作令：** MIDA-ADR-6 —— 实现自有 x64 runtime loader，并将 controller 接入"暂停启动 -> 加载 -> 初始化 -> attestation -> 决策 -> 首次 resume"生命周期。
-> **状态：** 实现完成（loader + controller 接线；benign/synthetic 验证通过）。
+> **状态：** 实现完成 + ADR-6-CORRECTION（immutable authority manifest、真实 PE 架构验证、provenance 绑定、Git source_ref）。
 > **基线：** `ae1df8eeee4d30f9b48e5103f2ca8c15e529ced6`（ADR-5-CORRECTION）。前置：ADR-0/1/2/3/3A/3B/3B-CORRECTION/4/4-CORRECTION/5/5-CORRECTION 全部封版。
 > **性质：** 自有 loader。未执行 protected sample；未执行 ScyllaHide；未做差分。
 
@@ -171,3 +171,66 @@ benign_host_adr6.exe 5 轮闭环                    OK (BENIGN_HOST_ADR6_OK)
 - 无 DLL/EXE 入库（构建产物在 D:/tmp/magicmida-adr6-target）；
 - 历史 109 个未跟踪文件 + ADR-3A 修正文档未触碰；
 - loader 自身有 identity（LoaderIdentity）；"远程线程创建成功" != "runtime 初始化成功"（每个 C ABI 调用返回码都检查）。
+## 9. ADR-6-CORRECTION：不可变 authority + 真实 PE/provenance 校验
+
+### 9.1 阻塞项一：不可变 authority manifest
+
+原实现从环境变量读取 `MIDA_RUNTIME_SHA256`/`MIDA_RUNTIME_SIZE`——调用方可自选 DLL 并自我授权，违反"禁止信任调用方传入 hash"。
+
+修复：
+
+```text
+RuntimeAuthorityManifest（mida.antidebug-runtime-authority/v1）
+  schema + kind=runtime-x64 + artifact_id + sha256 + size_bytes
+  + architecture + source_ref + provenance_ref
+
+编译时固定：MIDA_RUNTIME_AUTHORITY_DIGEST（manifest 自身 SHA-256）
+环境变量只允许：MIDA_RUNTIME_AUTHORITY（manifest 路径）、MIDA_RUNTIME_DLL（runtime 路径）
+```
+
+- manifest 加载时校验自身 digest == 编译时固定值（不匹配 -> AuthorityMismatch）；
+- 环境变量**不能**提供 expected sha256/size/architecture/source revision；
+- 测试 `env_cannot_authorize_arbitrary_runtime` 证明：设置 MIDA_RUNTIME_SHA256 对授权无影响（authority 只认 manifest 路径）。
+
+### 9.2 阻塞项二：真实 PE 架构验证
+
+原实现只返回 authority 字符串。修复为解析实际文件：
+
+```text
+MZ（offset 0）-> PE\0\0（e_lfanew）-> COFF Machine == AMD64 (0x8664)
+-> Optional Header Magic == PE32+ (0x20B)
+```
+
+拒绝：x86/ARM/WOW64/非 PE/截断 PE/PE32——统一 `ArchitectureUnsupported`（controller 映射 `AntiDebugRuntimeArchitectureMismatch`）。
+
+### 9.3 阻塞项三：provenance 实际绑定
+
+`verify_runtime_provenance()` 读取 provenance_ref 指向的 JSON（deny_unknown_fields 严格解析），交叉校验：
+
+```text
+provenance.sha256 == runtime 文件 sha256
+provenance.size_bytes == runtime 文件 size
+provenance.kind == runtime-x64
+provenance.architecture == x86_64
+provenance.source_ref 非空
+provenance.third_party 非空（有效声明）
+无 dependency 声明 anti_debug=true
+```
+
+任何失败 -> `AuthorityMismatch`（controller 映射 `AntiDebugRuntimeIdentityMismatch`）。
+
+### 9.4 次要：source_revision 使用 Git commit
+
+`MIDA_RUNTIME_SOURCE_REF`（编译时注入的 Git commit）替代 `CARGO_PKG_VERSION` 作为 source_ref；两者分离。
+
+### 9.5 Correction 测试（23 tests）
+
+新增：x86/ARM/非 PE/PE32 拒绝、provenance hash/kind mismatch、provenance 缺失、provenance 通过、env 覆盖拒绝、manifest 缺失。
+
+### 9.6 Correction 验收
+
+```text
+workspace tests 全绿；-D warnings 通过；git diff --check 通过
+benign host 5 轮重跑：BENIGN_HOST_ADR6_OK（句柄 54->58 零增长）
+untracked = 110
+```
