@@ -22,8 +22,11 @@
 
 use std::sync::OnceLock;
 
-use crate::attestation::RuntimeAttestation;
+use crate::attestation::{RuntimeAttestation, SurfaceDetail};
 use crate::provenance::Provenance;
+use crate::surfaces::{
+    install_proc_surfaces, restore_proc_002, SURFACE_AD_PROC_002, SURFACE_AD_PROC_003,
+};
 use crate::telemetry::TelemetryChannel;
 
 /// Attestation JSON buffer size for the FFI handshake.
@@ -52,6 +55,10 @@ pub enum MidaAntidebugError {
     InternalPanic = 7,
     /// Architecture mismatch (runtime built for another target).
     ArchitectureMismatch = 8,
+    /// One or more hard-required surfaces failed to install (ADR-5).
+    SurfaceInstallFailed = 9,
+    /// Surface restoration failed during shutdown (ADR-5).
+    RestoreFailed = 10,
 }
 
 impl MidaAntidebugError {
@@ -70,6 +77,8 @@ impl MidaAntidebugError {
             MidaAntidebugError::Serialization => "Serialization",
             MidaAntidebugError::InternalPanic => "InternalPanic",
             MidaAntidebugError::ArchitectureMismatch => "ArchitectureMismatch",
+            MidaAntidebugError::SurfaceInstallFailed => "SurfaceInstallFailed",
+            MidaAntidebugError::RestoreFailed => "RestoreFailed",
         }
     }
 }
@@ -99,6 +108,10 @@ pub struct RuntimeHandle {
     pub provenance: Provenance,
     pub telemetry: TelemetryChannel,
     pub shutdown_requested: bool,
+    /// Surface installation outcomes (ADR-5).
+    pub surface_details: Vec<SurfaceDetail>,
+    /// Original BeingDebugged value for shutdown restoration (ADR-5).
+    pub original_being_debugged: Option<String>,
 }
 
 /// Global runtime state (single instance, single thread).
@@ -127,6 +140,33 @@ pub fn build_attestation_json(
     );
     att.to_canonical_json()
         .map_err(|_| MidaAntidebugError::Serialization)
+}
+
+/// Build the attestation from surface outcomes (ADR-5).
+fn build_attestation_from_outcomes(
+    runtime_sha256: String,
+    profile_id: String,
+    profile_digest: String,
+    target_pid: u32,
+    module_base: u64,
+    expected_surfaces: &[String],
+    installed: &[String],
+    failures: &[(String, String)],
+    surface_details: Vec<SurfaceDetail>,
+) -> Result<RuntimeAttestation, MidaAntidebugError> {
+    Ok(RuntimeAttestation::from_surfaces(
+        runtime_sha256,
+        profile_id,
+        profile_digest,
+        target_pid,
+        module_base,
+        expected_surfaces,
+        installed,
+        failures,
+        surface_details,
+        env!("CARGO_PKG_VERSION").to_string(),
+        "rustc".to_string(),
+    ))
 }
 
 /// C ABI: initialize the runtime.
@@ -195,20 +235,73 @@ fn initialize_inner(
     // Runtime artifact identity (self-hash placeholder until build-time binding;
     // the controller re-verifies the loaded module hash independently).
     let runtime_sha256 = "adr4-foundation-unbound".to_string();
-    let source_revision = env!("CARGO_PKG_VERSION").to_string();
-    let toolchain = std::env::var("RUSTC").unwrap_or_else(|_| "unknown".to_string());
-    let att_json = match build_attestation_json(
+    // ADR-5: install hard-required PEB surfaces against the target process.
+    // The Win32PebMemory view reads the real PEB via gs:[0x60]; on failure
+    // the attestation reports the failure and the controller fails closed.
+    let real_peb = crate::surfaces::Win32PebMemory::new(p.target_pid);
+    let (outcomes, failures) = match install_proc_surfaces(
+        &real_peb,
+        crate::surfaces::POINTER_SIZE_X64,
+        p.target_pid,
+        p.target_pid,
+        &profile_digest,
+        &profile_digest,
+    ) {
+        Ok(v) => v,
+        Err(_) => {
+            // Surface-level fatal (e.g. wrong pointer size): fail closed.
+            return MidaAntidebugError::SurfaceInstallFailed.as_i32();
+        }
+    };
+    let installed: Vec<String> = outcomes
+        .iter()
+        .filter(|o| o.installed)
+        .map(|o| o.surface_id.clone())
+        .collect();
+    let fail_pairs: Vec<(String, String)> = failures
+        .iter()
+        .map(|f| (f.surface_id.clone(), f.error.clone().unwrap_or_default()))
+        .collect();
+    let details: Vec<SurfaceDetail> = outcomes
+        .iter()
+        .map(|o| SurfaceDetail {
+            surface_id: o.surface_id.clone(),
+            installed: o.installed,
+            original_value: o.original_value.clone(),
+            effective_value: o.effective_value.clone(),
+            restoration_policy: format!("{:?}", o.restoration_policy),
+            restore_result: format!("{:?}", o.restore_result),
+            error: o.error.clone(),
+        })
+        .collect();
+    let original_bd: Option<String> = outcomes
+        .iter()
+        .find(|o| o.surface_id == SURFACE_AD_PROC_002)
+        .and_then(|o| o.original_value.clone());
+    // expected set for attestation = hard-required surfaces only (002, 003);
+    // AD-PROC-001 stays a candidate and is NOT part of hooks_expected.
+    let expected_hard: Vec<String> = expected
+        .iter()
+        .filter(|s| s.as_str() == SURFACE_AD_PROC_002 || s.as_str() == SURFACE_AD_PROC_003)
+        .cloned()
+        .collect();
+    let att = match build_attestation_from_outcomes(
         runtime_sha256.clone(),
         profile_id.clone(),
         profile_digest.clone(),
         p.target_pid,
         p.module_base,
-        &expected,
-        source_revision,
-        toolchain,
+        &expected_hard,
+        &installed,
+        &fail_pairs,
+        details,
     ) {
-        Ok(j) => j,
+        Ok(a) => a,
         Err(e) => return e.as_i32(),
+    };
+    let att_json = match att.to_canonical_json() {
+        Ok(j) => j,
+        Err(_) => return MidaAntidebugError::Serialization.as_i32(),
     };
     if att_json.len() > out_attestation_len {
         return MidaAntidebugError::BufferTooSmall.as_i32();
@@ -234,24 +327,17 @@ fn initialize_inner(
         profile_digest.clone(),
     );
     let handle = RuntimeHandle {
-        attestation: RuntimeAttestation::foundation(
-            runtime_sha256,
-            profile_id,
-            profile_digest,
-            p.target_pid,
-            p.module_base,
-            &expected,
-            env!("CARGO_PKG_VERSION").to_string(),
-            "rustc".to_string(),
-        ),
+        attestation: att,
         provenance: Provenance::current(
-            "adr4-foundation-unbound".to_string(),
+            runtime_sha256,
             0,
             "rustc".to_string(),
             env!("CARGO_PKG_VERSION").to_string(),
         ),
         telemetry,
         shutdown_requested: false,
+        surface_details: Vec::new(),
+        original_being_debugged: original_bd,
     };
     // SAFETY: single-threaded init contract; set() fails only if already set
     // which we checked above.
@@ -321,6 +407,35 @@ fn shutdown_inner() -> i32 {
     };
     if handle.shutdown_requested {
         return MidaAntidebugError::AlreadyShutdown.as_i32();
+    }
+    // ADR-5: restore modified PEB surfaces before shutdown.
+    if let Some(orig) = &handle.original_being_debugged {
+        let real_peb = crate::surfaces::Win32PebMemory::new(handle.attestation.target_pid);
+        match crate::surfaces::PebView::resolve(
+            &real_peb,
+            handle.attestation.target_pid,
+            crate::surfaces::POINTER_SIZE_X64,
+        ) {
+            Ok(view) => match restore_proc_002(&view, &real_peb, Some(orig.clone())) {
+                Ok(_) => {}
+                Err(er) => {
+                    let _ = handle.telemetry.report_surface_restore(
+                        SURFACE_AD_PROC_002,
+                        "Failed",
+                        Some(er.to_string()),
+                    );
+                    return MidaAntidebugError::RestoreFailed.as_i32();
+                }
+            },
+            Err(er) => {
+                let _ = handle.telemetry.report_surface_restore(
+                    SURFACE_AD_PROC_002,
+                    "Failed",
+                    Some(er.to_string()),
+                );
+                return MidaAntidebugError::RestoreFailed.as_i32();
+            }
+        }
     }
     // Close telemetry channel.
     let _ = handle.telemetry.close();

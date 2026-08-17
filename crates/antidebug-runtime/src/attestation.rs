@@ -67,6 +67,23 @@ pub struct HookFailure {
     pub surface_id: String,
     pub reason: String,
 }
+/// Per-surface installation detail (ADR-5): full state record for each
+/// hard-required surface, including original/effective values and the
+/// restoration policy. Mirrors surfaces::SurfaceInstallOutcome in
+/// serialized form so the attestation is self-contained and auditable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SurfaceDetail {
+    pub surface_id: String,
+    pub installed: bool,
+    /// Raw value observed before any modification.
+    pub original_value: Option<String>,
+    /// Value in effect after install.
+    pub effective_value: Option<String>,
+    pub restoration_policy: String,
+    pub restore_result: String,
+    pub error: Option<String>,
+}
 
 /// Runtime telemetry channel state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,6 +122,8 @@ pub struct RuntimeAttestation {
     pub hooks_expected: Vec<String>,
     pub hooks_installed: Vec<String>,
     pub hook_failures: Vec<HookFailure>,
+    /// Per-surface detail records (ADR-5).
+    pub surface_details: Vec<SurfaceDetail>,
     pub telemetry_channel: String,
     pub cleanup_handler_registered: bool,
     /// Provenance declaration of the runtime artifact
@@ -142,6 +161,59 @@ impl RuntimeAttestation {
             hooks_expected: inventory.hooks_expected,
             hooks_installed: inventory.hooks_installed,
             hook_failures: inventory.hook_failures,
+            surface_details: Vec::new(),
+            telemetry_channel: "ready".to_string(),
+            cleanup_handler_registered: true,
+            third_party: "build-and-serialization-only".to_string(),
+            source_revision,
+            toolchain,
+        }
+    }
+
+    /// Build the ADR-5 attestation from actual surface installation results.
+    ///
+    /// Fail-closed contract:
+    /// - every successful surface is listed in hooks_installed (never a
+    ///   failed surface);
+    /// - every failed surface is listed in hook_failures (never hidden);
+    /// - hooks_installed must equal the expected set or the attestation
+    ///   will not validate;
+    /// - AD-PROC-001 is never installed here (candidate separation).
+    pub fn from_surfaces(
+        runtime_sha256: String,
+        profile_id: String,
+        profile_digest: String,
+        target_pid: u32,
+        module_base: u64,
+        expected_surfaces: &[String],
+        installed: &[String],
+        failures: &[(String, String)],
+        surface_details: Vec<SurfaceDetail>,
+        source_revision: String,
+        toolchain: String,
+    ) -> Self {
+        let hook_failures: Vec<HookFailure> = failures
+            .iter()
+            .map(|(id, reason)| HookFailure {
+                surface_id: id.clone(),
+                reason: reason.clone(),
+            })
+            .collect();
+        Self {
+            schema: ATTESTATION_SCHEMA.to_string(),
+            runtime_id: RUNTIME_ID.to_string(),
+            runtime_version: RUNTIME_VERSION.to_string(),
+            architecture: ARCH_X86_64.to_string(),
+            runtime_sha256,
+            profile_id,
+            profile_digest,
+            target_pid,
+            module_base,
+            initialized: true,
+            hooks_expected: expected_surfaces.to_vec(),
+            hooks_installed: installed.to_vec(),
+            hook_failures,
+            surface_details,
             telemetry_channel: "ready".to_string(),
             cleanup_handler_registered: true,
             third_party: "build-and-serialization-only".to_string(),
@@ -254,6 +326,27 @@ impl RuntimeAttestation {
         if !self.hook_failures.is_empty() {
             return Err(AttestationError::HookFailures(self.hook_failures.clone()));
         }
+        // surface_details consistency (ADR-5): every installed hook must have
+        // a matching installed surface detail, and every detail must agree
+        // with the installed list. A detail marked installed=false with a
+        // surface in hooks_installed is a contradiction -> fail-closed.
+        for detail in &self.surface_details {
+            let in_installed = self.hooks_installed.contains(&detail.surface_id);
+            let in_failures = self
+                .hook_failures
+                .iter()
+                .any(|f| f.surface_id == detail.surface_id);
+            if detail.installed && (in_failures || !in_installed) {
+                return Err(AttestationError::SurfaceDetailInconsistent(
+                    detail.surface_id.clone(),
+                ));
+            }
+            if !detail.installed && (in_installed || !in_failures) {
+                return Err(AttestationError::SurfaceDetailInconsistent(
+                    detail.surface_id.clone(),
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -287,6 +380,8 @@ pub enum AttestationError {
     HookInventoryIncomplete { expected: usize, installed: usize },
     #[error("hook failures present: {0:?}")]
     HookFailures(Vec<HookFailure>),
+    #[error("surface detail inconsistent: {0}")]
+    SurfaceDetailInconsistent(String),
     #[error("serialization error: {0}")]
     Serialization(String),
     #[error("deserialization error: {0}")]

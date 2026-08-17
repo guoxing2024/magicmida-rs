@@ -39,6 +39,7 @@
 pub mod attestation;
 pub mod exports;
 pub mod provenance;
+pub mod surfaces;
 pub mod telemetry;
 
 pub use attestation::{AttestationError, HookInventory, RuntimeAttestation, RuntimeStatus};
@@ -47,6 +48,11 @@ pub use exports::{
     MidaAntidebugShutdown, ATTESTATION_BUFFER_SIZE, MAX_ATTESTATION_BYTES,
 };
 pub use provenance::{Provenance, ProvenanceError};
+pub use surfaces::{
+    install_proc_002, install_proc_003, install_proc_surfaces, restore_proc_002, PebMemory,
+    PebView, RestorationPolicy, RestoreResult, SurfaceError, SurfaceInstallOutcome,
+    POINTER_SIZE_X64, SURFACE_AD_PROC_001, SURFACE_AD_PROC_002, SURFACE_AD_PROC_003,
+};
 pub use telemetry::{
     TelemetryChannel, TelemetryError, TelemetryMessage, TelemetryResponse, TelemetryState,
 };

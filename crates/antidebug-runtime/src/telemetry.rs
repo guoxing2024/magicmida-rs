@@ -55,6 +55,16 @@ pub enum TelemetryMessage {
         healthy: bool,
         detail: String,
     },
+    SurfaceInstall {
+        surface_id: String,
+        installed: bool,
+        error: Option<String>,
+    },
+    SurfaceRestore {
+        surface_id: String,
+        restore_result: String,
+        error: Option<String>,
+    },
     ShutdownStatus {
         clean: bool,
         detail: String,
@@ -329,6 +339,29 @@ impl TelemetryChannel {
                 expected: self.target_pid,
                 got: resp.target_pid,
             });
+        }
+        Ok(())
+    }
+
+    /// Report a surface restoration result (ADR-5). Fire-and-forget: the
+    /// result is recorded as a telemetry message; a channel failure here is
+    /// non-fatal for the restore path itself (the caller decides policy).
+    pub fn report_surface_restore(
+        &self,
+        surface_id: &str,
+        restore_result: &str,
+        error: Option<String>,
+    ) -> Result<(), TelemetryError> {
+        let msg = TelemetryMessage::SurfaceRestore {
+            surface_id: surface_id.to_string(),
+            restore_result: restore_result.to_string(),
+            error,
+        };
+        let resp = self.request(TelemetryQuery::Report(vec![msg]))?;
+        if !resp.ok {
+            return Err(TelemetryError::Malformed(
+                "restore report rejected".to_string(),
+            ));
         }
         Ok(())
     }
