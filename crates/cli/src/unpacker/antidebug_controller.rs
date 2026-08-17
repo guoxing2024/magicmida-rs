@@ -210,7 +210,7 @@ impl AntidebugController {
             log::log(
                 LogType::Info,
                 &format!(
-                    "anti-debug oracle mode requested (source={SCYLLAHIDE_ORACLE_SOURCE}); 
+                    "anti-debug oracle mode requested (source={SCYLLAHIDE_ORACLE_SOURCE});
                     oracle injector={} hook={} - not executed in ADR-3B (no live differential authorized)",
                     oracle.injector_path.display(),
                     oracle.hook_library_path.display(),
@@ -236,7 +236,7 @@ impl AntidebugController {
                 state: self.state,
                 fail_code: code,
                 message: format!(
-                    "anti-debug runtime dependency unavailable: {} not found; 
+                    "anti-debug runtime dependency unavailable: {} not found;
                     fail-closed (MIDA runtime ships in ADR-4+)",
                     MIDA_RUNTIME_ARTIFACT,
                 ),
