@@ -169,6 +169,7 @@ dependencies = [
  "anyhow",
  "mida-acceptance",
  "mida-antidebug",
+ "mida-antidebug-runtime",
  "mida-core",
  "mida-disasm",
  "mida-packers-ahk-gto",
