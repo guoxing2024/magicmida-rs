@@ -25,6 +25,14 @@
 
 所有 schema **fail-closed**：字段缺失、类型错误、未知 schema 版本 → 拒绝（不静默容忍）。
 
+`mida.antidebug-evidence/v1` 的 CLI 失败记录使用 `record_kind = "cli-failure"`（ADR-3B-CORRECTION 统一登记）：
+
+| record_kind | 用途 | 必填字段 |
+|---|---|---|
+| `cli-failure` | CLI 侧 anti-debug 生命周期失败 sidecar（runtime 缺失/身份/初始化/hook/telemetry/probe/cleanup 失败） | `decision=fail-closed`、`fail_code`、`failure_state`、`sequence`、`cleanup_result`、`candidate_created=false` |
+
+该 record_kind 只描述失败，不携带成功声明，不进入 T5/acceptance 成功证据链。
+
 ## 3. Profile schema（`mida.antidebug-profile/v1`）
 
 ```json

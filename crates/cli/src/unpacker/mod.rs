@@ -602,6 +602,9 @@ pub fn unpack(
                 target_pid: dbg.pid(),
                 evidence_dir: Some(evidence_dir.clone()),
                 oracle: None,
+                cleanup_backend: Some(Box::new(antidebug_controller::Win32CleanupBackend::new(
+                    dbg.process_handle(),
+                ))),
             },
         );
         let outcome = ad_controller.run();
@@ -609,22 +612,11 @@ pub fn unpack(
             state,
             fail_code,
             message,
-        } = outcome
+        } = &outcome
         {
-            let evidence = antidebug_controller::AntidebugFailureEvidence {
-                schema: antidebug_controller::ANTIDEBUG_EVIDENCE_SCHEMA.to_string(),
-                controller_state_before: "Unresolved".to_string(),
-                failure_state: format!("{state:?}"),
-                fail_code: fail_code.as_str().to_string(),
-                sample_id: None,
-                target_pid: Some(dbg.pid()),
-                runtime_identity: None,
-                profile_id: None,
-                profile_digest: None,
-                sequence: ad_controller.evidence().len() as u32,
-                cleanup_result: "drop-cleanup".to_string(),
-                candidate_created: false,
-            };
+            let evidence = ad_controller
+                .failure_evidence(&outcome)
+                .expect("failure outcome must produce evidence");
             if let Err(ew) = antidebug_controller::write_failure_evidence(&evidence, &evidence_dir)
             {
                 return Err(anyhow::anyhow!(
@@ -976,10 +968,15 @@ pub fn unpack(
                             target_pid: pid,
                             evidence_dir: Some(evidence_dir.clone()),
                             oracle: None, // oracle mode is opt-in and never production
+                            cleanup_backend: Some(Box::new(
+                                antidebug_controller::Win32CleanupBackend::new(
+                                    dbg.process_handle(),
+                                ),
+                            )),
                         },
                     );
                     let outcome = ad_controller.run();
-                    match outcome {
+                    match &outcome {
                         antidebug_controller::AntidebugOutcome::Proceed { .. } => {
                             // Only reachable once a real MIDA runtime exists.
                             // Keep the success path explicit so ADR-4 wiring has
@@ -991,21 +988,13 @@ pub fn unpack(
                             fail_code,
                             message,
                         } => {
-                            // Structured evidence sidecar (atomic, schema'd).
-                            let evidence = antidebug_controller::AntidebugFailureEvidence {
-                                schema: antidebug_controller::ANTIDEBUG_EVIDENCE_SCHEMA.to_string(),
-                                controller_state_before: "Unresolved".to_string(),
-                                failure_state: format!("{state:?}"),
-                                fail_code: fail_code.as_str().to_string(),
-                                sample_id: None,
-                                target_pid: Some(pid),
-                                runtime_identity: None,
-                                profile_id: None,
-                                profile_digest: None,
-                                sequence: ad_controller.evidence().len() as u32,
-                                cleanup_result: "drop-cleanup".to_string(), // WindowsDebugger::Drop
-                                candidate_created: false,
-                            };
+                            // Structured evidence sidecar (atomic, schema'd,
+                            // mida.antidebug-evidence/v1 record_kind=cli-failure).
+                            // cleanup_result reflects the explicit cleanup backend
+                            // outcome (ok / failed / not-run).
+                            let evidence = ad_controller
+                                .failure_evidence(&outcome)
+                                .expect("failure outcome must produce evidence");
                             if let Err(ew) = antidebug_controller::write_failure_evidence(
                                 &evidence,
                                 &evidence_dir,
@@ -1016,8 +1005,9 @@ pub fn unpack(
                                 ));
                             }
                             // Fail-closed: hard error, no candidate, no TLS/OEP
-                            // success evidence. Target cleanup happens via
-                            // WindowsDebugger::Drop (TerminateProcess + wait).
+                            // success evidence. Target cleanup was driven by the
+                            // explicit cleanup backend (CleanupFailed upgrade when
+                            // the backend failed).
                             return Err(anyhow::anyhow!(
                                 "anti-debug lifecycle failed: {message} (state={state:?} fail_code={})",
                                 fail_code.as_str(),

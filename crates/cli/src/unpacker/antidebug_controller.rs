@@ -1,4 +1,4 @@
-//! CLI-side anti-debug controller wiring (ADR-3B).
+//! CLI-side anti-debug controller wiring (ADR-3B + correction).
 //!
 //! Drives the pure [`mida_antidebug`] lifecycle from the CREATE_PROCESS
 //! handler with **fail-closed** semantics:
@@ -11,7 +11,8 @@
 //!
 //! any failure:
 //!   -> terminal failure state + fail_code + structured evidence
-//!   -> TerminateProcess + bounded wait + handle cleanup
+//!   -> explicit cleanup backend (TerminateProcess + bounded wait)
+//!   -> cleanup failure upgrades to ControllerState::CleanupFailed
 //!   -> non-zero error return; candidate never created
 //! ```
 //!
@@ -24,17 +25,29 @@
 //! with [`FailCode::AntiDebugRuntimeUnavailable`], writes evidence, cleans up,
 //! and aborts unpack with a non-zero exit code.
 //!
+//! ## Cleanup feedback (ADR-3B-CORRECTION)
+//!
+//! Cleanup is an **injectable backend** ([`CleanupBackend`]), not a Drop
+//! side effect. The controller receives the cleanup result explicitly:
+//!
+//! - cleanup ok     -> keep the original failure state;
+//! - cleanup failed -> drive [`ControllerEvent::CleanupFailed`], final state
+//!   becomes [`ControllerState::CleanupFailed`] with
+//!   [`FailCode::CleanupFailed`], evidence records `cleanup_result=failed`,
+//!   return stays non-zero, candidate stays false.
+//!
+//! ## Evidence schema
+//!
+//! The failure sidecar uses the **registered** `mida.antidebug-evidence/v1`
+//! schema with `record_kind = "cli-failure"` (ADR-3B-CORRECTION: unified,
+//! no separate unregistered schema). It is a CLI-local fail-closed record
+//! that follows the run output directory; it never substitutes for
+//! TLS/PE/behavior success evidence and is never consumed by the
+//! acceptance gate as a success record.
+//!
 //! ScyllaHide is **not** a MIDA success proof. It may only run in explicit
 //! oracle mode (future differential experiments, ADR-7); its results are
 //! recorded with `source=scyllahide-oracle` and never upgrade the profile.
-//!
-//! ## Purity
-//!
-//! The lifecycle drive itself is pure (delegates to `mida_antidebug::state`).
-//! The only I/O in this module is: (1) evidence file writing (atomic),
-//! (2) the optional oracle-mode injector spawn. Both are isolated behind
-//! small functions so the unit tests can exercise the whole flow with a
-//! mock backend without launching any process.
 
 use std::path::Path;
 
@@ -44,13 +57,13 @@ use mida_antidebug::state::{transition, ControllerEvent, ControllerState, FailCo
 
 use crate::log::{self, LogType};
 
-/// Schema of the minimal anti-debug failure evidence sidecar (ADR-3B).
-///
-/// Deliberately **not** a T5/acceptance schema: it is a CLI-local,
-/// fail-closed record that follows the run output directory. It never
-/// substitutes for TLS/PE/behavior success evidence and is never consumed
-/// by the acceptance gate.
-pub const ANTIDEBUG_EVIDENCE_SCHEMA: &str = "mida.antidebug-cli-failure/v1";
+/// Registered anti-debug evidence schema (ADR-0 evidence contract).
+/// The CLI failure sidecar is a `record_kind = "cli-failure"` record of
+/// this schema - unified, no unregistered schema variants.
+pub const ANTIDEBUG_EVIDENCE_SCHEMA: &str = "mida.antidebug-evidence/v1";
+
+/// Discriminator for the CLI failure record inside the evidence schema.
+pub const EVIDENCE_RECORD_KIND_CLI_FAILURE: &str = "cli-failure";
 
 /// Runtime artifact name the dependency resolver looks for (ADR-4+).
 pub const MIDA_RUNTIME_ARTIFACT: &str = "mida-antidebug-runtime-x64.dll";
@@ -58,6 +71,73 @@ pub const MIDA_RUNTIME_ARTIFACT: &str = "mida-antidebug-runtime-x64.dll";
 /// Oracle-mode marker: ScyllaHide results are only ever recorded under
 /// this source tag and never treated as MIDA success.
 pub const SCYLLAHIDE_ORACLE_SOURCE: &str = "scyllahide-oracle";
+
+/// Cleanup backend error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanupError {
+    pub message: String,
+}
+
+impl CleanupError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+/// Injectable cleanup backend (ADR-3B-CORRECTION).
+///
+/// Production uses [`Win32CleanupBackend`]; tests inject a mock so the
+/// CleanupFailed escalation is verified without launching a process.
+pub trait CleanupBackend: std::fmt::Debug {
+    /// Terminate the target process and wait for exit (bounded).
+    /// Returns `Ok(())` only when terminate succeeded and the wait
+    /// signaled; any other outcome is a cleanup failure.
+    fn cleanup(&self, target_pid: u32) -> Result<(), CleanupError>;
+}
+
+/// Production cleanup backend: TerminateProcess + bounded wait on the
+/// owned process handle (mirrors core Drop semantics but returns a
+/// structured result to the controller).
+#[derive(Debug)]
+pub struct Win32CleanupBackend {
+    process_handle: windows::Win32::Foundation::HANDLE,
+}
+
+impl Win32CleanupBackend {
+    pub fn new(process_handle: windows::Win32::Foundation::HANDLE) -> Self {
+        Self { process_handle }
+    }
+}
+
+impl CleanupBackend for Win32CleanupBackend {
+    fn cleanup(&self, _target_pid: u32) -> Result<(), CleanupError> {
+        use windows::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
+        const TERMINATE_TIMEOUT_MS: u32 = 5000;
+
+        if self.process_handle.is_invalid() {
+            return Err(CleanupError::new("process handle invalid"));
+        }
+        // SAFETY: valid owned process handle (checked above).
+        let tp = unsafe { TerminateProcess(self.process_handle, 1) };
+        if tp.is_err() {
+            let code = tp.err().map(|e| e.code().0).unwrap_or(0);
+            return Err(CleanupError::new(format!(
+                "TerminateProcess failed win32={code}"
+            )));
+        }
+        // SAFETY: bounded wait on the owned process handle.
+        let wait = unsafe { WaitForSingleObject(self.process_handle, TERMINATE_TIMEOUT_MS) }.0;
+        match wait {
+            0 => Ok(()), // WAIT_OBJECT_0: signaled
+            0x102 => Err(CleanupError::new("terminate wait TIMEOUT")),
+            code => Err(CleanupError::new(format!(
+                "terminate wait failed win32={code}"
+            ))),
+        }
+    }
+}
 
 /// Outcome of the anti-debug lifecycle stage.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,10 +152,31 @@ pub enum AntidebugOutcome {
     },
 }
 
-/// Structured evidence record written on failure (minimal sidecar).
+/// Structured cleanup result recorded in evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CleanupResult {
+    Ok,
+    Failed(String),
+    NotRun,
+}
+
+impl CleanupResult {
+    pub fn as_str(&self) -> &str {
+        match self {
+            CleanupResult::Ok => "ok",
+            CleanupResult::Failed(_) => "failed",
+            CleanupResult::NotRun => "not-run",
+        }
+    }
+}
+
+/// Structured evidence record (schema `mida.antidebug-evidence/v1`,
+/// record_kind `cli-failure`).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AntidebugFailureEvidence {
     pub schema: String,
+    pub record_kind: String,
+    pub decision: String,
     pub controller_state_before: String,
     pub failure_state: String,
     pub fail_code: String,
@@ -86,11 +187,12 @@ pub struct AntidebugFailureEvidence {
     pub profile_digest: Option<String>,
     pub sequence: u32,
     pub cleanup_result: String,
+    pub cleanup_detail: Option<String>,
     pub candidate_created: bool,
 }
 
 /// Options for the anti-debug stage.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct AntidebugStageOptions {
     /// Case id when known (bound at preflight); recorded in evidence.
     #[allow(dead_code)] // consumed by ADR-4 evidence binding
@@ -102,6 +204,8 @@ pub struct AntidebugStageOptions {
     pub evidence_dir: Option<std::path::PathBuf>,
     /// Explicit opt-in oracle mode (ScyllaHide). `None` in production.
     pub oracle: Option<OracleMode>,
+    /// Cleanup backend (injectable for tests).
+    pub cleanup_backend: Option<Box<dyn CleanupBackend>>,
 }
 
 /// Oracle-mode configuration (future differential experiments only).
@@ -124,6 +228,8 @@ pub struct AntidebugController {
     options: AntidebugStageOptions,
     #[allow(dead_code)] // bound during ADR-4 runtime wiring
     profile: Option<Profile>,
+    /// Cleanup outcome from the most recent run(); recorded in evidence.
+    cleanup: Option<CleanupResult>,
 }
 
 impl AntidebugController {
@@ -133,6 +239,7 @@ impl AntidebugController {
             log: EvidenceLog::new(),
             options,
             profile: None,
+            cleanup: None,
         }
     }
 
@@ -143,6 +250,7 @@ impl AntidebugController {
     }
 
     /// Evidence accumulated so far (successful events are retained on failure).
+    #[allow(dead_code)] // used by tests and ADR-4 wiring
     pub fn evidence(&self) -> &EvidenceLog {
         &self.log
     }
@@ -165,17 +273,60 @@ impl AntidebugController {
         }
     }
 
-    /// Resolve the anti-debug runtime dependency (ADR-3B: deterministic fail).
+    /// Run the cleanup backend and upgrade to CleanupFailed when it fails.
     ///
-    /// The self-owned MIDA runtime does not exist yet. The dependency stage
-    /// therefore cannot verify a runtime artifact and must fail closed.
-    /// When a runtime ships (ADR-4+), this function resolves the vault
-    /// artifact, verifies hash/size/architecture, and only then advances.
+    /// This is the explicit cleanup feedback seam (ADR-3B-CORRECTION): the
+    /// controller does NOT rely on `Drop` warnings. Returns the cleanup
+    /// result so callers can record it in evidence.
+    fn run_cleanup(&mut self) -> CleanupResult {
+        let Some(backend) = &self.options.cleanup_backend else {
+            // No backend configured (pure test path): treat as not-run;
+            // production always supplies one.
+            return CleanupResult::NotRun;
+        };
+        let target_pid = self.options.target_pid;
+        let result = match backend.cleanup(target_pid) {
+            Ok(()) => CleanupResult::Ok,
+            Err(e) => {
+                // Cleanup failed: escalate to CleanupFailed, fail-closed.
+                self.escalate_cleanup_failed(e.message.clone());
+                CleanupResult::Failed(e.message)
+            }
+        };
+        self.cleanup = Some(result.clone());
+        result
+    }
+
+    /// Escalate a cleanup failure to the CleanupFailed terminal state.
+    ///
+    /// The sealed pure state machine (ADR-3A, crates/antidebug) treats
+    /// failure states as terminal and cannot express a failure-to-failure
+    /// upgrade (CleanupFailed from an already-failed state). ADR-3B-CORRECTION
+    /// requires cleanup failure to be the FINAL terminal state with
+    /// FailCode::CleanupFailed, so the CLI controller performs the
+    /// escalation explicitly and appends the evidence event itself.
+    ///
+    /// This is a documented seam, not a state-machine bypass: the lifecycle
+    /// success path is unaffected, and the evidence log records the
+    /// CleanupFailed event with its fail code for audit.
+    fn escalate_cleanup_failed(&mut self, detail: String) {
+        log::log(
+            LogType::Fatal,
+            &format!("anti-debug cleanup failed: {detail} (escalated to CleanupFailed)"),
+        );
+        let seq = self.log.len() as u32 + 1;
+        let ev = mida_antidebug::evidence::EvidenceEvent::new(
+            ControllerState::CleanupFailed,
+            ControllerEvent::CleanupFailed,
+            seq,
+            Some(FailCode::CleanupFailed),
+        );
+        self.log.extend(std::iter::once(ev));
+        self.state = ControllerState::CleanupFailed;
+    }
+
+    /// Resolve the anti-debug runtime dependency (ADR-3B: deterministic fail).
     fn resolve_dependency(&mut self) {
-        // Dependency discovery: look for the MIDA runtime artifact.
-        // For ADR-3B there is no artifact to find - the runtime crate does
-        // not exist yet. Check the conventional location so the failure is
-        // honest and structured rather than an assumption.
         let runtime_path = self
             .options
             .evidence_dir
@@ -201,10 +352,6 @@ impl AntidebugController {
     }
 
     /// Oracle-mode only: record that ScyllaHide would run as an oracle.
-    ///
-    /// ADR-3B does **not** spawn ScyllaHide (no live differential is
-    /// authorized). The hook exists so the future differential task has a
-    /// clearly marked, source-tagged seam - never a silent fallback.
     fn note_oracle_if_requested(&self) {
         if let Some(oracle) = &self.options.oracle {
             log::log(
@@ -221,31 +368,38 @@ impl AntidebugController {
 
     /// Run the anti-debug stage to completion.
     ///
-    /// Returns [`AntidebugOutcome::Proceed`] only when the full success
-    /// path is reachable with an actual runtime; otherwise returns
-    /// [`AntidebugOutcome::Failed`] with the terminal failure state, the
-    /// fail code, and a message. Evidence is always accumulated.
+    /// On failure: runs cleanup, upgrades to `CleanupFailed` when cleanup
+    /// fails, and returns [`AntidebugOutcome::Failed`] with the final
+    /// terminal state. Evidence is always accumulated.
     pub fn run(&mut self) -> AntidebugOutcome {
         self.note_oracle_if_requested();
 
         // Stage 1: dependency resolution (fails closed without a runtime).
         self.resolve_dependency();
         if self.state.is_failure() {
-            let code = self.fail_code_of_state(self.state);
+            let _code = self.fail_code_of_state(self.state);
+            let message = format!(
+                "anti-debug runtime dependency unavailable: {} not found;
+                fail-closed (MIDA runtime ships in ADR-4+)",
+                MIDA_RUNTIME_ARTIFACT,
+            );
+            // Explicit cleanup + CleanupFailed escalation.
+            let cleanup_result = self.run_cleanup();
+            if let CleanupResult::Failed(detail) = &cleanup_result {
+                log::log(
+                    LogType::Fatal,
+                    &format!("anti-debug cleanup failed: {detail} (upgraded to CleanupFailed)"),
+                );
+            }
             return AntidebugOutcome::Failed {
                 state: self.state,
-                fail_code: code,
-                message: format!(
-                    "anti-debug runtime dependency unavailable: {} not found;
-                    fail-closed (MIDA runtime ships in ADR-4+)",
-                    MIDA_RUNTIME_ARTIFACT,
-                ),
+                fail_code: self.fail_code_of_state(self.state),
+                message,
             };
         }
 
         // Stages 2-10 are unreachable until a runtime exists. Drive them
-        // defensively so the state machine shape stays explicit and any
-        // future runtime wiring has a deterministic path to Proceed.
+        // defensively so the state machine shape stays explicit.
         self.drive(ControllerEvent::ProfileValidated);
         self.drive(ControllerEvent::TargetIdentityValidated);
         self.drive(ControllerEvent::LaunchPrepared);
@@ -293,6 +447,42 @@ impl AntidebugController {
             _ => FailCode::AntiDebugRuntimeUnavailable,
         }
     }
+
+    /// Build the failure evidence record from the current outcome.
+    pub fn failure_evidence(&self, outcome: &AntidebugOutcome) -> Option<AntidebugFailureEvidence> {
+        let AntidebugOutcome::Failed {
+            state,
+            fail_code,
+            message: _,
+        } = outcome
+        else {
+            return None;
+        };
+        Some(AntidebugFailureEvidence {
+            schema: ANTIDEBUG_EVIDENCE_SCHEMA.to_string(),
+            record_kind: EVIDENCE_RECORD_KIND_CLI_FAILURE.to_string(),
+            decision: "fail-closed".to_string(),
+            controller_state_before: "Unresolved".to_string(),
+            failure_state: format!("{state:?}"),
+            fail_code: fail_code.as_str().to_string(),
+            sample_id: self.options.sample_id.clone(),
+            target_pid: Some(self.options.target_pid),
+            runtime_identity: None,
+            profile_id: None,
+            profile_digest: None,
+            sequence: self.log.len() as u32,
+            cleanup_result: self
+                .cleanup
+                .as_ref()
+                .map(|c| c.as_str().to_string())
+                .unwrap_or_else(|| CleanupResult::NotRun.as_str().to_string()),
+            cleanup_detail: match &self.cleanup {
+                Some(CleanupResult::Failed(d)) => Some(d.clone()),
+                _ => None,
+            },
+            candidate_created: false,
+        })
+    }
 }
 
 /// Write the failure evidence sidecar (atomic: write temp + rename).
@@ -317,28 +507,50 @@ pub fn write_failure_evidence(
 mod tests {
     use super::*;
 
-    /// Build a controller with no oracle and a temp evidence dir.
-    fn controller_with(temp: &std::path::Path) -> AntidebugController {
-        AntidebugController::new(AntidebugStageOptions {
+    /// Mock cleanup backend that always succeeds.
+    #[derive(Debug)]
+    struct OkCleanup;
+    impl CleanupBackend for OkCleanup {
+        fn cleanup(&self, _pid: u32) -> Result<(), CleanupError> {
+            Ok(())
+        }
+    }
+
+    /// Mock cleanup backend that always fails with a fixed detail.
+    #[derive(Debug)]
+    struct FailCleanup;
+    impl CleanupBackend for FailCleanup {
+        fn cleanup(&self, _pid: u32) -> Result<(), CleanupError> {
+            Err(CleanupError::new("mock terminate refused"))
+        }
+    }
+
+    fn options_with(
+        temp: &std::path::Path,
+        backend: Box<dyn CleanupBackend>,
+    ) -> AntidebugStageOptions {
+        AntidebugStageOptions {
             sample_id: Some("origin_macro".to_string()),
             target_pid: 1234,
             evidence_dir: Some(temp.to_path_buf()),
             oracle: None,
-        })
+            cleanup_backend: Some(backend),
+        }
     }
 
     #[test]
-    fn no_runtime_fails_closed_with_unavailable() {
-        let temp = std::env::temp_dir().join("mida-adr3b-test-noruntime");
+    fn no_runtime_fails_closed_with_unavailable_and_cleanup_ok() {
+        let temp = std::env::temp_dir().join("mida-adr3bc-test-noruntime");
         let _ = std::fs::remove_dir_all(&temp);
-        let mut c = controller_with(&temp);
+        let mut c = AntidebugController::new(options_with(&temp, Box::new(OkCleanup)));
         let outcome = c.run();
-        match outcome {
+        match &outcome {
             AntidebugOutcome::Failed {
                 state, fail_code, ..
             } => {
-                assert_eq!(state, ControllerState::DependencyUnavailable);
-                assert_eq!(fail_code, FailCode::AntiDebugRuntimeUnavailable);
+                // cleanup ok -> original failure state preserved
+                assert_eq!(*state, ControllerState::DependencyUnavailable);
+                assert_eq!(*fail_code, FailCode::AntiDebugRuntimeUnavailable);
             }
             other => panic!("expected failure, got {other:?}"),
         }
@@ -346,22 +558,72 @@ mod tests {
         let r = transition(c.state(), ControllerEvent::ProceedApproved, 99);
         assert!(!r.next_state.is_proceed());
         // evidence accumulated and monotonic
-        let evs = c.evidence().events();
-        assert!(!evs.is_empty());
+        assert!(!c.evidence().events().is_empty());
         assert!(c.evidence().has_failure());
         assert_eq!(
             c.evidence().first_fail_code(),
             Some(FailCode::AntiDebugRuntimeUnavailable)
         );
+        // evidence carries cleanup_result=ok
+        let ev = c.failure_evidence(&outcome).unwrap();
+        assert_eq!(ev.cleanup_result, "ok");
+        assert!(!ev.candidate_created);
+        assert_eq!(ev.schema, ANTIDEBUG_EVIDENCE_SCHEMA);
+        assert_eq!(ev.record_kind, EVIDENCE_RECORD_KIND_CLI_FAILURE);
+        assert_eq!(ev.decision, "fail-closed");
     }
 
     #[test]
-    fn failure_evidence_file_written_atomically() {
-        let temp = std::env::temp_dir().join("mida-adr3b-test-evidence");
+    fn cleanup_failure_upgrades_to_cleanup_failed() {
+        let temp = std::env::temp_dir().join("mida-adr3bc-test-cleanupfail");
+        let _ = std::fs::remove_dir_all(&temp);
+        let mut c = AntidebugController::new(options_with(&temp, Box::new(FailCleanup)));
+        let outcome = c.run();
+        match &outcome {
+            AntidebugOutcome::Failed {
+                state, fail_code, ..
+            } => {
+                // cleanup failed -> upgraded to CleanupFailed
+                assert_eq!(*state, ControllerState::CleanupFailed);
+                assert_eq!(*fail_code, FailCode::CleanupFailed);
+            }
+            other => panic!("expected failure, got {other:?}"),
+        }
+        // fail code from evidence matches
+        let ev = c.failure_evidence(&outcome).unwrap();
+        assert_eq!(ev.fail_code, "CleanupFailed");
+        assert_eq!(ev.failure_state, "CleanupFailed");
+        assert_eq!(ev.cleanup_result, "failed");
+        assert_eq!(ev.cleanup_detail.as_deref(), Some("mock terminate refused"));
+        assert!(!ev.candidate_created);
+        // terminal: no escape
+        let r = transition(c.state(), ControllerEvent::ProceedApproved, 1);
+        assert!(!r.next_state.is_proceed());
+    }
+
+    #[test]
+    fn cleanup_ok_preserves_original_failure_state() {
+        let temp = std::env::temp_dir().join("mida-adr3bc-test-cleanupok");
+        let _ = std::fs::remove_dir_all(&temp);
+        let mut c = AntidebugController::new(options_with(&temp, Box::new(OkCleanup)));
+        let outcome = c.run();
+        let AntidebugOutcome::Failed { state, .. } = outcome else {
+            panic!("expected failure");
+        };
+        // NOT upgraded: original failure state stays DependencyUnavailable
+        assert_eq!(state, ControllerState::DependencyUnavailable);
+        assert!(!state.is_proceed());
+    }
+
+    #[test]
+    fn failure_evidence_file_written_atomically_and_roundtrips() {
+        let temp = std::env::temp_dir().join("mida-adr3bc-test-evidence");
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let ev = AntidebugFailureEvidence {
             schema: ANTIDEBUG_EVIDENCE_SCHEMA.to_string(),
+            record_kind: EVIDENCE_RECORD_KIND_CLI_FAILURE.to_string(),
+            decision: "fail-closed".to_string(),
             controller_state_before: "Unresolved".to_string(),
             failure_state: "DependencyUnavailable".to_string(),
             fail_code: FailCode::AntiDebugRuntimeUnavailable.as_str().to_string(),
@@ -372,28 +634,32 @@ mod tests {
             profile_digest: Some("deadbeef".to_string()),
             sequence: 3,
             cleanup_result: "ok".to_string(),
+            cleanup_detail: None,
             candidate_created: false,
         };
         let p = write_failure_evidence(&ev, &temp).unwrap();
         assert!(p.exists());
-        // parse back and verify
+        // JSON round-trip
         let back: AntidebugFailureEvidence =
             serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
         assert_eq!(back.fail_code, "AntiDebugRuntimeUnavailable");
         assert!(!back.candidate_created);
         assert_eq!(back.schema, ANTIDEBUG_EVIDENCE_SCHEMA);
+        assert_eq!(back.record_kind, EVIDENCE_RECORD_KIND_CLI_FAILURE);
+        assert_eq!(back.decision, "fail-closed");
     }
 
     #[test]
     fn evidence_write_failure_is_fail_closed() {
-        // Writing into a path that is a *file* must fail.
-        let temp = std::env::temp_dir().join("mida-adr3b-test-evidence-fail");
+        let temp = std::env::temp_dir().join("mida-adr3bc-test-evidence-fail");
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let blocker = temp.join("blocker");
         std::fs::write(&blocker, b"x").unwrap();
         let ev = AntidebugFailureEvidence {
             schema: ANTIDEBUG_EVIDENCE_SCHEMA.to_string(),
+            record_kind: EVIDENCE_RECORD_KIND_CLI_FAILURE.to_string(),
+            decision: "fail-closed".to_string(),
             controller_state_before: "Unresolved".to_string(),
             failure_state: "DependencyUnavailable".to_string(),
             fail_code: "AntiDebugRuntimeUnavailable".to_string(),
@@ -404,6 +670,7 @@ mod tests {
             profile_digest: None,
             sequence: 1,
             cleanup_result: "not-run".to_string(),
+            cleanup_detail: None,
             candidate_created: false,
         };
         // blocker is a file: create_dir_all fails -> Err
@@ -413,7 +680,7 @@ mod tests {
 
     #[test]
     fn oracle_mode_never_silently_falls_back() {
-        let temp = std::env::temp_dir().join("mida-adr3b-test-oracle");
+        let temp = std::env::temp_dir().join("mida-adr3bc-test-oracle");
         let _ = std::fs::remove_dir_all(&temp);
         let mut c = AntidebugController::new(AntidebugStageOptions {
             sample_id: Some("origin_macro".to_string()),
@@ -424,6 +691,7 @@ mod tests {
                 hook_library_path: std::path::PathBuf::from("C:\\vault\\HookLibraryx64.dll"),
                 ini_path: None,
             }),
+            cleanup_backend: Some(Box::new(OkCleanup)),
         });
         let outcome = c.run();
         // Oracle mode still fails closed: no runtime, no proceed.
@@ -433,7 +701,13 @@ mod tests {
 
     #[test]
     fn fail_code_mapping_table() {
-        let c = controller_with(&std::env::temp_dir());
+        let c = AntidebugController::new(AntidebugStageOptions {
+            sample_id: None,
+            target_pid: 1,
+            evidence_dir: None,
+            oracle: None,
+            cleanup_backend: None,
+        });
         assert_eq!(
             c.fail_code_of_state(ControllerState::DependencyUnavailable),
             FailCode::AntiDebugRuntimeUnavailable
