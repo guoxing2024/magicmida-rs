@@ -123,6 +123,7 @@ fn pe_arm_machine_rejected() {
 }
 
 fn ok_provenance(sha256: &str, size: u64) -> serde_json::Value {
+    // ADR-4 registered dependency declarations (versions match Cargo.lock).
     serde_json::json!({
         "schema": "mida.antidebug-provenance/v1",
         "artifact_id": "mida-antidebug-runtime-x64",
@@ -133,7 +134,14 @@ fn ok_provenance(sha256: &str, size: u64) -> serde_json::Value {
         "toolchain": "rustc",
         "source_ref": "test-commit",
         "third_party": "build-and-serialization-only",
-        "dependencies": [],
+        "dependencies": [
+            {"name": "serde", "version": "1.0.229", "license": "MIT OR Apache-2.0",
+             "source": "crates.io", "role": "serialization", "anti_debug": false},
+            {"name": "serde_json", "version": "1.0.151", "license": "MIT OR Apache-2.0",
+             "source": "crates.io", "role": "serialization", "anti_debug": false},
+            {"name": "thiserror", "version": "1.0.69", "license": "MIT OR Apache-2.0",
+             "source": "crates.io", "role": "error-definition", "anti_debug": false},
+        ],
         "license": "GPL-3.0-only",
         "build_repro": "test",
     })
@@ -199,7 +207,8 @@ fn provenance_ok_passes() {
     )
     .unwrap();
     let prov = verify_runtime_provenance(&authority, &dir, &id).unwrap();
-    assert_eq!(prov["kind"], "runtime-x64");
+    assert_eq!(prov.kind, "runtime-x64");
+    assert_eq!(prov.dependencies.len(), 3);
 }
 
 #[test]
@@ -465,4 +474,124 @@ fn controller_authority_mismatch_fails_before_loader() {
     });
     let outcome = c.run();
     assert!(matches!(outcome, AntidebugOutcome::Failed { .. }));
+}
+
+// ----------------------------------------------------------------
+// CORRECTION-2: source_ref chain + full provenance binding
+// ----------------------------------------------------------------
+
+#[test]
+fn provenance_artifact_id_mismatch_rejected() {
+    let pe = minimal_pe(0x8664, 0x20B);
+    let runtime_path = tmp_file("runtime_art.dll", &pe);
+    let mut authority = manifest(&sha256_hex(&pe), pe.len() as u64);
+    authority.provenance_ref = "prov_art_mismatch.json".to_string();
+    let id = authority.verify_file(&runtime_path).unwrap();
+    let mut prov = ok_provenance(&id.sha256, id.size_bytes);
+    prov["artifact_id"] = serde_json::Value::String("other-artifact".to_string());
+    let dir = std::env::temp_dir().join("mida-adr6-test");
+    std::fs::write(dir.join("prov_art_mismatch.json"), prov.to_string()).unwrap();
+    let err = verify_runtime_provenance(&authority, &dir, &id).unwrap_err();
+    assert!(matches!(err, RuntimeLoadError::AuthorityMismatch(_)));
+    assert!(err.to_string().contains("artifact_id"));
+}
+
+#[test]
+fn provenance_source_ref_mismatch_rejected() {
+    let pe = minimal_pe(0x8664, 0x20B);
+    let runtime_path = tmp_file("runtime_src.dll", &pe);
+    let mut authority = manifest(&sha256_hex(&pe), pe.len() as u64);
+    authority.provenance_ref = "prov_src_mismatch.json".to_string();
+    let id = authority.verify_file(&runtime_path).unwrap();
+    let mut prov = ok_provenance(&id.sha256, id.size_bytes);
+    prov["source_ref"] = serde_json::Value::String("other-commit".to_string());
+    let dir = std::env::temp_dir().join("mida-adr6-test");
+    std::fs::write(dir.join("prov_src_mismatch.json"), prov.to_string()).unwrap();
+    let err = verify_runtime_provenance(&authority, &dir, &id).unwrap_err();
+    assert!(matches!(err, RuntimeLoadError::AuthorityMismatch(_)));
+    assert!(err.to_string().contains("source_ref"));
+}
+
+#[test]
+fn provenance_empty_dependencies_rejected() {
+    let pe = minimal_pe(0x8664, 0x20B);
+    let runtime_path = tmp_file("runtime_dep.dll", &pe);
+    let mut authority = manifest(&sha256_hex(&pe), pe.len() as u64);
+    authority.provenance_ref = "prov_dep_empty.json".to_string();
+    let id = authority.verify_file(&runtime_path).unwrap();
+    let mut prov = ok_provenance(&id.sha256, id.size_bytes);
+    prov["dependencies"] = serde_json::Value::Array(vec![]);
+    let dir = std::env::temp_dir().join("mida-adr6-test");
+    std::fs::write(dir.join("prov_dep_empty.json"), prov.to_string()).unwrap();
+    // ADR-4: runtime links external crates but dependencies is empty ->
+    // DependenciesUndeclared -> fail-closed.
+    let err = verify_runtime_provenance(&authority, &dir, &id).unwrap_err();
+    assert!(matches!(err, RuntimeLoadError::AuthorityMismatch(_)));
+}
+
+#[test]
+fn provenance_dependency_empty_name_rejected() {
+    let pe = minimal_pe(0x8664, 0x20B);
+    let runtime_path = tmp_file("runtime_depname.dll", &pe);
+    let mut authority = manifest(&sha256_hex(&pe), pe.len() as u64);
+    authority.provenance_ref = "prov_dep_name.json".to_string();
+    let id = authority.verify_file(&runtime_path).unwrap();
+    let mut prov = ok_provenance(&id.sha256, id.size_bytes);
+    prov["dependencies"][0]["name"] = serde_json::Value::String(String::new());
+    let dir = std::env::temp_dir().join("mida-adr6-test");
+    std::fs::write(dir.join("prov_dep_name.json"), prov.to_string()).unwrap();
+    let err = verify_runtime_provenance(&authority, &dir, &id).unwrap_err();
+    assert!(matches!(err, RuntimeLoadError::AuthorityMismatch(_)));
+}
+
+#[test]
+fn provenance_dependency_anti_debug_rejected() {
+    let pe = minimal_pe(0x8664, 0x20B);
+    let runtime_path = tmp_file("runtime_depad.dll", &pe);
+    let mut authority = manifest(&sha256_hex(&pe), pe.len() as u64);
+    authority.provenance_ref = "prov_dep_ad.json".to_string();
+    let id = authority.verify_file(&runtime_path).unwrap();
+    let mut prov = ok_provenance(&id.sha256, id.size_bytes);
+    prov["dependencies"][0]["anti_debug"] = serde_json::Value::Bool(true);
+    let dir = std::env::temp_dir().join("mida-adr6-test");
+    std::fs::write(dir.join("prov_dep_ad.json"), prov.to_string()).unwrap();
+    let err = verify_runtime_provenance(&authority, &dir, &id).unwrap_err();
+    assert!(matches!(err, RuntimeLoadError::AuthorityMismatch(_)));
+}
+
+#[test]
+fn full_valid_provenance_chain_passes() {
+    let pe = minimal_pe(0x8664, 0x20B);
+    let runtime_path = tmp_file("runtime_chain.dll", &pe);
+    let mut authority = manifest(&sha256_hex(&pe), pe.len() as u64);
+    authority.provenance_ref = "prov_chain_ok.json".to_string();
+    let id = authority.verify_file(&runtime_path).unwrap();
+    let dir = std::env::temp_dir().join("mida-adr6-test");
+    std::fs::write(
+        dir.join("prov_chain_ok.json"),
+        ok_provenance(&id.sha256, id.size_bytes).to_string(),
+    )
+    .unwrap();
+    let prov = verify_runtime_provenance(&authority, &dir, &id).unwrap();
+    assert_eq!(prov.kind, "runtime-x64");
+    assert_eq!(prov.source_ref, authority.source_ref);
+    assert_eq!(prov.artifact_id, authority.artifact_id);
+    assert_eq!(prov.dependencies.len(), 3);
+}
+
+#[test]
+fn provenance_arch_mismatch_rejected() {
+    let pe = minimal_pe(0x8664, 0x20B);
+    let runtime_path = tmp_file("runtime_arch.dll", &pe);
+    let mut authority = manifest(&sha256_hex(&pe), pe.len() as u64);
+    authority.provenance_ref = "prov_arch.json".to_string();
+    let id = authority.verify_file(&runtime_path).unwrap();
+    let mut prov = ok_provenance(&id.sha256, id.size_bytes);
+    prov["architecture"] = serde_json::Value::String("x86".to_string());
+    let dir = std::env::temp_dir().join("mida-adr6-test");
+    std::fs::write(dir.join("prov_arch.json"), prov.to_string()).unwrap();
+    let err = verify_runtime_provenance(&authority, &dir, &id).unwrap_err();
+    // prov.validate() rejects x86 first (ArchitectureMismatch inside the
+    // provenance crate); either way it is fail-closed.
+    assert!(matches!(err, RuntimeLoadError::AuthorityMismatch(_)));
 }

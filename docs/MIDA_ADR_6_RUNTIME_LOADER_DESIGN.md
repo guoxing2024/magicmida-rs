@@ -1,7 +1,7 @@
 # MIDA-ADR-6 自有 x64 Runtime Loader 与 Controller 接线
 
 > **工作令：** MIDA-ADR-6 —— 实现自有 x64 runtime loader，并将 controller 接入"暂停启动 -> 加载 -> 初始化 -> attestation -> 决策 -> 首次 resume"生命周期。
-> **状态：** 实现完成 + ADR-6-CORRECTION（immutable authority manifest、真实 PE 架构验证、provenance 绑定、Git source_ref）。
+> **状态：** 实现完成 + ADR-6-CORRECTION + CORRECTION-2（source_ref 三方一致、完整 provenance validate、全字段交叉绑定）。
 > **基线：** `ae1df8eeee4d30f9b48e5103f2ca8c15e529ced6`（ADR-5-CORRECTION）。前置：ADR-0/1/2/3/3A/3B/3B-CORRECTION/4/4-CORRECTION/5/5-CORRECTION 全部封版。
 > **性质：** 自有 loader。未执行 protected sample；未执行 ScyllaHide；未做差分。
 
@@ -232,5 +232,56 @@ provenance.third_party 非空（有效声明）
 ```text
 workspace tests 全绿；-D warnings 通过；git diff --check 通过
 benign host 5 轮重跑：BENIGN_HOST_ADR6_OK（句柄 54->58 零增长）
+untracked = 110
+```
+## 10. ADR-6-CORRECTION-2：三方身份链闭合
+
+### 10.1 source_ref 三方严格一致
+
+```text
+MIDA_RUNTIME_SOURCE_REF（编译时注入的 Git commit）
+  == manifest.source_ref（load() 时校验，不匹配 -> AuthorityMismatch）
+  == provenance.source_ref（verify_runtime_provenance 交叉绑定）
+
+MIDA_RUNTIME_SOURCE_REF 为空 -> AuthorityUnavailable（fail-closed）
+```
+
+不再只检查"非空"——compiled/manifest/provenance 三方必须完全相等。
+
+### 10.2 完整 Provenance::validate()
+
+`verify_runtime_provenance()` 在交叉绑定前先调用 ADR-4 已封版的 `prov.validate()`：
+
+```text
+kind 合法 + kind/architecture 一致
+sha256/size 完整
+third_party 声明有效
+runtime dependencies 非空（DependenciesUndeclared 拒绝空列表）
+dependency name/version 完整
+dependency anti_debug=false
+```
+
+反序列化成功 != 语义有效——validate() 是必需 gate。
+
+### 10.3 manifest/provenance 全字段交叉绑定
+
+```text
+artifact_id / sha256 / size_bytes / kind / architecture / source_ref
+全部必须 manifest == provenance，且 sha256/size 同时绑定 runtime 文件
+```
+
+### 10.4 返回类型化 Provenance
+
+函数返回 `mida_antidebug_runtime::provenance::Provenance`（已验证类型），不再返回原始 JSON。
+
+### 10.5 CORRECTION-2 测试（30 tests）
+
+新增：provenance artifact_id/source_ref mismatch、empty dependencies 拒绝、dependency name 空/anti_debug=true 拒绝、full chain 通过、arch mismatch、env 不能覆盖 compiled source ref。合法 provenance 使用 ADR-4 登记的 serde/serde_json/thiserror 完整依赖声明（版本与 Cargo.lock 一致）。
+
+### 10.6 CORRECTION-2 验收
+
+```text
+workspace tests 全绿；-D warnings 通过；git diff --check 通过
+benign host 5 轮回归：BENIGN_HOST_ADR6_OK（句柄 +4 首载零增长）
 untracked = 110
 ```

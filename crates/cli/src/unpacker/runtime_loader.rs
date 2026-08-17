@@ -126,6 +126,20 @@ impl RuntimeAuthorityManifest {
         let manifest: RuntimeAuthorityManifest = serde_json::from_slice(&bytes)
             .map_err(|e| RuntimeLoadError::AuthorityMismatch(format!("manifest parse: {e}")))?;
         manifest.validate()?;
+        // CORRECTION-2: compiled source ref must be non-empty AND equal to
+        // the manifest source ref. A caller cannot pick an arbitrary commit.
+        if MIDA_RUNTIME_SOURCE_REF.is_empty() {
+            return Err(RuntimeLoadError::AuthorityUnavailable(
+                "MIDA_RUNTIME_SOURCE_REF not set at build time".to_string(),
+                "compiled source ref is empty; loader fails closed".to_string(),
+            ));
+        }
+        if manifest.source_ref != MIDA_RUNTIME_SOURCE_REF {
+            return Err(RuntimeLoadError::AuthorityMismatch(format!(
+                "manifest source_ref {} != compiled {}",
+                manifest.source_ref, MIDA_RUNTIME_SOURCE_REF
+            )));
+        }
         Ok(manifest)
     }
 
@@ -996,20 +1010,18 @@ pub fn runtime_artifact_path() -> Option<std::path::PathBuf> {
 
 /// Verify the runtime provenance against the manifest and the runtime file.
 ///
-/// Provenance is read from provenance_ref (relative to the manifest
-/// directory). Checks are fail-closed:
-/// - provenance.sha256 == runtime file sha256
-/// - provenance.size_bytes == runtime file size
-/// - provenance.kind == runtime-x64
-/// - provenance.architecture == x86_64
-/// - provenance.source_ref non-empty
-/// - provenance.third_party valid (non-empty declared value)
-/// - no dependency declares anti_debug=true
+/// Full binding (CORRECTION-2):
+/// 1. Parse with deny_unknown_fields (strict struct).
+/// 2. Run the complete ADR-4 Provenance::validate() (kind/arch/third_party/
+///    dependencies completeness/anti_debug flags).
+/// 3. Cross-bind every identity field against the manifest AND the runtime:
+///    artifact_id, sha256, size_bytes, kind, architecture, source_ref.
+/// Returns the validated, typed [Provenance] (never raw JSON).
 pub fn verify_runtime_provenance(
     manifest: &RuntimeAuthorityManifest,
     manifest_dir: &Path,
     runtime_identity: &RuntimeFileIdentity,
-) -> Result<serde_json::Value, RuntimeLoadError> {
+) -> Result<mida_antidebug_runtime::provenance::Provenance, RuntimeLoadError> {
     let prov_path = manifest_dir.join(&manifest.provenance_ref);
     let prov_bytes = std::fs::read(&prov_path).map_err(|e| {
         RuntimeLoadError::AuthorityMismatch(format!(
@@ -1017,9 +1029,13 @@ pub fn verify_runtime_provenance(
             prov_path.display()
         ))
     })?;
-    // deny_unknown_fields: parse into the strict runtime Provenance struct.
+    // 1. Strict parse (deny_unknown_fields on the struct).
     let prov: mida_antidebug_runtime::provenance::Provenance = serde_json::from_slice(&prov_bytes)
         .map_err(|e| RuntimeLoadError::AuthorityMismatch(format!("provenance parse: {e}")))?;
+    // 2. Full ADR-4 semantic validation (not just deserialization).
+    prov.validate()
+        .map_err(|e| RuntimeLoadError::AuthorityMismatch(format!("provenance validate: {e}")))?;
+    // 3. Cross-bind against the runtime file identity.
     if prov.sha256 != runtime_identity.sha256 {
         return Err(RuntimeLoadError::AuthorityMismatch(format!(
             "provenance sha256 {} != runtime {}",
@@ -1032,38 +1048,44 @@ pub fn verify_runtime_provenance(
             prov.size_bytes, runtime_identity.size_bytes
         )));
     }
-    if prov.kind != "runtime-x64" {
+    // 4. Cross-bind against the manifest (full identity chain).
+    if prov.artifact_id != manifest.artifact_id {
         return Err(RuntimeLoadError::AuthorityMismatch(format!(
-            "provenance kind {} != runtime-x64",
-            prov.kind
+            "provenance artifact_id {} != manifest {}",
+            prov.artifact_id, manifest.artifact_id
         )));
     }
-    if prov.architecture != "x86_64" {
-        return Err(RuntimeLoadError::ArchitectureUnsupported(
-            prov.architecture.clone(),
-        ));
+    if prov.sha256 != manifest.sha256 {
+        return Err(RuntimeLoadError::AuthorityMismatch(format!(
+            "provenance sha256 {} != manifest {}",
+            prov.sha256, manifest.sha256
+        )));
     }
-    if prov.source_ref.is_empty() {
-        return Err(RuntimeLoadError::AuthorityMismatch(
-            "provenance source_ref is empty".to_string(),
-        ));
+    if prov.size_bytes != manifest.size_bytes {
+        return Err(RuntimeLoadError::AuthorityMismatch(format!(
+            "provenance size {} != manifest {}",
+            prov.size_bytes, manifest.size_bytes
+        )));
     }
-    if prov.third_party.is_empty() {
-        return Err(RuntimeLoadError::AuthorityMismatch(
-            "provenance third_party is empty".to_string(),
-        ));
+    if prov.kind != manifest.kind {
+        return Err(RuntimeLoadError::AuthorityMismatch(format!(
+            "provenance kind {} != manifest {}",
+            prov.kind, manifest.kind
+        )));
     }
-    for d in &prov.dependencies {
-        if d.anti_debug {
-            return Err(RuntimeLoadError::AuthorityMismatch(format!(
-                "provenance dependency {} declares anti_debug=true",
-                d.name
-            )));
-        }
+    if prov.architecture != manifest.architecture {
+        return Err(RuntimeLoadError::ArchitectureUnsupported(format!(
+            "provenance arch {} != manifest {}",
+            prov.architecture, manifest.architecture
+        )));
     }
-    // Return the raw JSON for evidence.
-    Ok(serde_json::from_slice(&prov_bytes)
-        .map_err(|e| RuntimeLoadError::AuthorityMismatch(format!("provenance re-parse: {e}")))?)
+    if prov.source_ref != manifest.source_ref {
+        return Err(RuntimeLoadError::AuthorityMismatch(format!(
+            "provenance source_ref {} != manifest {}",
+            prov.source_ref, manifest.source_ref
+        )));
+    }
+    Ok(prov)
 }
 
 /// Run the full loader sequence against a suspended target and return the
