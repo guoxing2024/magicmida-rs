@@ -100,23 +100,46 @@ fn drain_lifecycle_thread_table_consistency() {
     let stats = dbg.drain_stats().clone();
     // No DEFECTIVE unmatched ExitThread: every exit whose thread object is
     // still alive must have had a registered handle. Short-lived exits
-    // between drain polls are legal and recorded separately.
+    // between drain polls are legal and recorded separately (verified via
+    // OpenThread + 0ms wait, not inferred).
     assert_eq!(
         stats.unmatched_exit_threads, 0,
         "drain observed unmatched ExitThread with thread still alive (bookkeeping gap): {stats:?}"
     );
-    // Every LOAD_DLL / CREATE_PROCESS hFile was closed.
+    // Every LOAD_DLL / CREATE_PROCESS hFile close was ATTEMPTED; every
+    // attempt must have SUCCEEDED (no leaked handles).
     let load_dll_count = receipts.iter().filter(|r| r.event_code == 6).count() as u64;
     let create_proc_count = receipts.iter().filter(|r| r.event_code == 3).count() as u64;
     assert_eq!(
-        stats.hfiles_closed,
+        stats.hfiles_close_attempted,
         load_dll_count + create_proc_count,
-        "drain did not close every hFile: stats={stats:?} receipts_loaded={load_dll_count} create_proc={create_proc_count}"
+        "drain did not attempt every hFile close: stats={stats:?} receipts_loaded={load_dll_count} create_proc={create_proc_count}"
+    );
+    assert_eq!(
+        stats.hfiles_close_failed, 0,
+        "some hFile CloseHandle FAILED (leaked handle): {stats:?}"
+    );
+    assert_eq!(
+        stats.hfiles_close_succeeded, stats.hfiles_close_attempted,
+        "hFile close succeeded count != attempted count: {stats:?}"
     );
     // The helper spawns threads; we should have seen at least one CreateThread.
     assert!(
         stats.create_threads_registered > 0,
         "drain saw no CreateThread in a 1.5s window (helper churn not observed): {stats:?}"
+    );
+    // Exit classification is EXHAUSTIVE: every ExitThread falls into exactly
+    // one of removed / short-lived / unmatched, and no exit can be silently
+    // dropped. (In a short drain window some spawned threads are still alive
+    // at the end, so we only assert the accounting invariant: the sum of the
+    // three classifications equals the number of ExitThread receipts.)
+    let exit_receipts = receipts.iter().filter(|r| r.event_code == 4).count() as u64;
+    let exit_classified = stats.exit_threads_removed
+        + stats.exit_short_lived_without_create_observation
+        + stats.unmatched_exit_threads;
+    assert_eq!(
+        exit_receipts, exit_classified,
+        "ExitThread receipts not exhaustively classified: receipts={exit_receipts} classified={exit_classified} stats={stats:?}"
     );
     // Sequences are monotonic and non-zero.
     let mut prev = 0u64;
@@ -162,11 +185,13 @@ fn drain_propagates_debug_registers_to_new_threads() {
     let window = Duration::from_millis(1200);
     let start = Instant::now();
     let mut created = 0u64;
+    let mut created_tids = Vec::new();
     while Instant::now() - start < window {
         match dbg.drain_debug_event(50) {
             Ok(Some(r)) => {
                 if r.event_code == 2 {
                     created += 1;
+                    created_tids.push(r.thread_id);
                 }
             }
             Ok(None) => {}
@@ -180,6 +205,23 @@ fn drain_propagates_debug_registers_to_new_threads() {
         "every drain-created thread must receive DR propagation: stats={stats:?} created={created}"
     );
     assert_eq!(stats.create_threads_registered, created);
+    // ADR-5B-R1 F-003: counter equality is NOT enough — verify the DR state
+    // actually landed by reading a live thread's debug-register context.
+    let mut verified = 0u64;
+    for tid in created_tids {
+        if let Ok(ctx) = dbg.get_thread_context_dbg(tid) {
+            // The helper threads are short-lived; a thread may exit between
+            // drain and probe. Any thread we CAN still query must show the
+            // propagated DR0 address (bp_addr).
+            if ctx.Dr0 == bp_addr as u64 {
+                verified += 1;
+            }
+        }
+    }
+    assert!(
+        verified > 0,
+        "no live thread verified to actually hold the propagated DR0 (bp_addr={bp_addr:#x}): stats={stats:?}"
+    );
 
     dbg.clear_hw_breakpoint(0).expect("clear HW BP");
     drop(_guard);
@@ -203,12 +245,39 @@ fn drain_receipt_exception_events_are_recorded_and_continued() {
     // (ntdll / CRT init raises breakpoints the debugger sees as exceptions).
     let window = Duration::from_millis(800);
     let start = Instant::now();
-    let mut exceptions_seen = 0u64;
+    let mut exceptions_continued = 0u64;
+    let mut exceptions_forwarded = 0u64;
     while Instant::now() - start < window {
         match dbg.drain_debug_event(50) {
             Ok(Some(r)) => {
-                if r.disposition == mida_core::DrainDisposition::Exception {
-                    exceptions_seen += 1;
+                match r.disposition {
+                    mida_core::DrainDisposition::Exception => {
+                        // Debugger-owned (breakpoint/single-step): DBG_CONTINUE.
+                        exceptions_continued += 1;
+                        assert!(
+                            r.continue_status == mida_core::ContinueStatus::Continue as u32,
+                            "debugger-owned exception must use DBG_CONTINUE: {r:?}"
+                        );
+                    }
+                    mida_core::DrainDisposition::ExceptionForwarded => {
+                        // Unknown first-chance: DBG_EXCEPTION_NOT_HANDLED.
+                        exceptions_forwarded += 1;
+                        assert!(
+                            r.continue_status
+                                == mida_core::ContinueStatus::ExceptionNotHandled as u32,
+                            "forwarded exception must use DBG_EXCEPTION_NOT_HANDLED: {r:?}"
+                        );
+                        assert_eq!(
+                            r.first_chance,
+                            Some(true),
+                            "forwarded must be first-chance: {r:?}"
+                        );
+                    }
+                    _ => {}
+                }
+                if r.disposition == mida_core::DrainDisposition::Exception
+                    || r.disposition == mida_core::DrainDisposition::ExceptionForwarded
+                {
                     assert!(r.exception_code.is_some(), "exception receipt missing code");
                     assert!(
                         r.first_chance.is_some(),
@@ -222,9 +291,72 @@ fn drain_receipt_exception_events_are_recorded_and_continued() {
     }
     let stats = dbg.drain_stats();
     assert_eq!(
-        stats.exceptions_continued, exceptions_seen,
-        "exception counter mismatch"
+        stats.exceptions_continued, exceptions_continued,
+        "exception continued counter mismatch"
     );
+    assert_eq!(
+        stats.exceptions_forwarded, exceptions_forwarded,
+        "exception forwarded counter mismatch"
+    );
+    // Second-chance / fail-closed must never fire for the benign helper.
+    assert_eq!(stats.exceptions_failed_closed, 0);
+
+    drop(_guard);
+}
+
+#[test]
+fn drain_receipts_are_retained_and_takeable() {
+    // ADR-5B-R1 F-005: the debugger must retain EVERY drain receipt so the
+    // loader window is fully auditable, and take_drain_receipts must hand
+    // them out exactly once.
+    let _guard = harness_lock();
+    let opts = helper_opts("rcpt");
+    let mut dbg = WindowsDebugger::new(&opts).expect("WindowsDebugger::new");
+
+    let first = dbg.wait_event().expect("wait_event");
+    assert!(matches!(first, DebugEvent::CreateProcess { .. }));
+    dbg.continue_event(
+        dbg.pending_event_thread_id().unwrap_or(0),
+        ContinueStatus::Continue,
+    )
+    .expect("continue CREATE_PROCESS");
+
+    // Drain a short window and collect BOTH the returned receipts and the
+    // retained copies.
+    let window = Duration::from_millis(400);
+    let start = Instant::now();
+    let mut returned = 0u64;
+    while Instant::now() - start < window {
+        match dbg.drain_debug_event(30) {
+            Ok(Some(_)) => returned += 1,
+            Ok(None) => {}
+            Err(e) => panic!("drain_debug_event failed: {e}"),
+        }
+    }
+    assert!(returned > 0, "no events drained in window");
+    let retained = dbg.retained_drain_receipt_count() as u64;
+    assert_eq!(
+        retained, returned,
+        "retained receipts != returned receipts (audit trail incomplete): retained={retained} returned={returned}"
+    );
+    // take_drain_receipts hands out exactly the retained set once.
+    let taken = dbg.take_drain_receipts();
+    assert_eq!(taken.len() as u64, retained, "take mismatch");
+    assert_eq!(
+        dbg.retained_drain_receipt_count(),
+        0,
+        "take_drain_receipts must clear the accumulator"
+    );
+    // Taken receipts are the same events, in order.
+    for (i, r) in taken.iter().enumerate() {
+        assert!(r.sequence > 0, "receipt {i} has zero sequence");
+        if i > 0 {
+            assert!(
+                r.sequence > taken[i - 1].sequence,
+                "receipts out of order at {i}"
+            );
+        }
+    }
 
     drop(_guard);
 }

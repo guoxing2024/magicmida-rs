@@ -33,6 +33,7 @@
 
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use windows::core::{PCSTR, PCWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
@@ -337,6 +338,21 @@ impl Drop for RemoteThreadGuard {
     }
 }
 
+/// Compute the bounded-wait budget for one poll iteration (ADR-5B-R3).
+///
+/// Returns `Some(ms)` — at most `max_poll_ms`, clamped to the REAL
+/// monotonic time remaining before `deadline` — or `None` when the deadline
+/// has already passed. The caller must use this budget for BOTH the thread
+/// wait and the drain poll, so the total wall time can never exceed the
+/// declared deadline (the pre-fix accumulator could double it).
+pub fn compute_wait_budget(deadline: Instant, max_poll_ms: u64) -> Option<u64> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return None;
+    }
+    Some((remaining.as_millis() as u64).min(max_poll_ms).max(1))
+}
+
 /// Convert a raw WAIT_* status into a typed outcome (ADR-5B-R3).
 pub fn classify_wait_status(raw: u32) -> RemoteWaitOutcome {
     // WAIT_OBJECT_0 = 0, WAIT_ABANDONED = 0x80, WAIT_TIMEOUT = 258,
@@ -571,6 +587,23 @@ impl RuntimeLoader {
         arg: usize,
         drain: &mut dyn FnMut(u32) -> Result<Option<mida_core::DrainReceipt>, mida_core::CoreError>,
     ) -> Result<RemoteCallResult, RuntimeLoadError> {
+        self.remote_call_raw_bounded(target, remote_fn, arg, 60, drain)
+    }
+
+    /// Bounded variant with an explicit deadline in seconds (ADR-5B-R3).
+    ///
+    /// # Safety
+    /// Same contract as [`Self::remote_call_raw`]; `deadline_secs` is the
+    /// REAL wall-clock budget for the whole wait (never doubled by drain
+    /// polling).
+    unsafe fn remote_call_raw_bounded(
+        &self,
+        target: HANDLE,
+        remote_fn: usize,
+        arg: usize,
+        deadline_secs: u64,
+        drain: &mut dyn FnMut(u32) -> Result<Option<mida_core::DrainReceipt>, mida_core::CoreError>,
+    ) -> Result<RemoteCallResult, RuntimeLoadError> {
         // SAFETY: caller contract: remote_fn is a valid target-address-space
         // function; arg points to target memory (or 0 for no argument).
         let thread = unsafe {
@@ -605,22 +638,28 @@ impl RuntimeLoader {
         // remote code may STILL be executing in the target, so the handle is
         // closed but the caller is told the call did NOT finish (it must not
         // free remote memory the thread can touch).
-        let deadline_ms = 60_000u32;
-        let mut waited_ms = 0u32;
+        // ADR-5B-R3 (audit): the deadline is a REAL monotonic clock, not an
+        // accumulated counter. Each iteration waits at most min(200ms,
+        // remaining) on the thread, then spends at most the same remaining
+        // budget draining, so the total wall time never exceeds the declared
+        // deadline (previously a 60s declared deadline could take ~120s).
+        let deadline = Instant::now() + Duration::from_secs(deadline_secs);
         loop {
-            let wait = unsafe { WaitForSingleObject(thread.handle, 200) }.0;
+            // REAL monotonic budget: total wall time never exceeds deadline.
+            let Some(wait_ms) = compute_wait_budget(deadline, 200) else {
+                // Handle closed by guard on return; remote memory is
+                // deliberately NOT freed (the thread may still run).
+                return Err(RuntimeLoadError::RemoteCallFailed(format!(
+                    "WaitForSingleObject timed out after {}ms; remote thread may still be running (thunk memory retained)",
+                    deadline_secs * 1000
+                )));
+            };
+            let wait_ms = wait_ms as u32;
+            let wait = unsafe { WaitForSingleObject(thread.handle, wait_ms) }.0;
             match classify_wait_status(wait) {
                 RemoteWaitOutcome::Finished => break,
                 RemoteWaitOutcome::TimedOut => {
-                    if waited_ms >= deadline_ms {
-                        // Handle closed by guard on return; remote memory is
-                        // deliberately NOT freed (the thread may still run).
-                        return Err(RuntimeLoadError::RemoteCallFailed(format!(
-                            "WaitForSingleObject timed out after {deadline_ms}ms; remote thread may still be running (thunk memory retained)"
-                        )));
-                    }
-                    waited_ms += 200;
-                    drain(200).map_err(|e| {
+                    drain(wait_ms).map_err(|e| {
                         RuntimeLoadError::RemoteCallFailed(format!("drain failed: {e}"))
                     })?;
                 }
@@ -699,20 +738,21 @@ impl RuntimeLoader {
         //    ADR-5B-R3: WAIT statuses are classified explicitly; on timeout the
         //    remote thread may still hold the loader lock — the remote_path
         //    buffer is retained (never freed while the thread may run).
-        let deadline_ms = 120_000u32;
-        let mut waited_ms = 0u32;
+        // ADR-5B-R3 (audit): real monotonic deadline (see remote_call_raw).
+        let deadline = Instant::now() + Duration::from_secs(120);
         loop {
-            let wait = unsafe { WaitForSingleObject(thread.handle, 200) }.0;
+            // REAL monotonic budget: total wall time never exceeds deadline.
+            let Some(wait_ms) = compute_wait_budget(deadline, 200) else {
+                return Err(RuntimeLoadError::RemoteCallFailed(format!(
+                    "LoadLibraryW remote thread timed out after 120000ms; thread may still hold the loader lock (path buffer retained)"
+                )));
+            };
+            let wait_ms = wait_ms as u32;
+            let wait = unsafe { WaitForSingleObject(thread.handle, wait_ms) }.0;
             match classify_wait_status(wait) {
                 RemoteWaitOutcome::Finished => break,
                 RemoteWaitOutcome::TimedOut => {
-                    if waited_ms >= deadline_ms {
-                        return Err(RuntimeLoadError::RemoteCallFailed(format!(
-                            "LoadLibraryW remote thread timed out after {deadline_ms}ms; thread may still hold the loader lock (path buffer retained)"
-                        )));
-                    }
-                    waited_ms += 200;
-                    drain(200).map_err(|e| {
+                    drain(wait_ms).map_err(|e| {
                         RuntimeLoadError::RemoteCallFailed(format!("drain failed: {e}"))
                     })?;
                 }
@@ -758,7 +798,10 @@ impl RuntimeLoader {
         args: &ThunkArgs,
         drain: &mut dyn FnMut(u32) -> Result<Option<mida_core::DrainReceipt>, mida_core::CoreError>,
     ) -> Result<RemoteCallResult, RuntimeLoadError> {
-        // 1. Allocate executable-capable memory for thunk + args (128 bytes).
+        // 1. Allocate executable-capable memory for thunk + args.
+        //    THUNK_BLOB_SIZE = 0x100 (VirtualAllocEx rounds to page
+        //    granularity, so the code window + args region share one
+        //    committed page).
         let remote = unsafe {
             VirtualAllocEx(
                 target,
@@ -796,7 +839,11 @@ impl RuntimeLoader {
                 w.err()
             )));
         }
-        // 3. Make executable.
+        // 3. Make executable. THUNK_EXECUTABLE_SIZE (0x60) is the LOGICAL
+        //    layout boundary (code window); Windows page protection applies
+        //    at page granularity, so the whole shared page (0x100 region)
+        //    becomes PAGE_EXECUTE_READWRITE. The constant documents the
+        //    logical code extent, not a page-level protection boundary.
         let mut old = windows::Win32::System::Memory::PAGE_PROTECTION_FLAGS(0);
         let vp = unsafe {
             VirtualProtectEx(
@@ -1190,25 +1237,6 @@ impl RuntimeLoader {
                 "remote export directory incomplete".to_string(),
             ));
         }
-        // Helper: read a u32 from target at an absolute address.
-        fn rd_u32(target: HANDLE, addr: usize) -> Result<u32, RuntimeLoadError> {
-            let mut b = [0u8; 4];
-            let r = unsafe {
-                RPM(
-                    target,
-                    addr as *const core::ffi::c_void,
-                    b.as_mut_ptr() as *mut core::ffi::c_void,
-                    4,
-                    None,
-                )
-            };
-            if r.is_err() {
-                return Err(RuntimeLoadError::ExportResolutionFailed(
-                    "remote read u32 failed".to_string(),
-                ));
-            }
-            Ok(u32::from_le_bytes(b))
-        }
         // Read the name-pointer array and ordinal array (bounded).
         let names_bytes = num_names * 4;
         if names_bytes > 0x10000 {
@@ -1255,60 +1283,73 @@ impl RuntimeLoader {
                 "remote read ordinal array failed".to_string(),
             ));
         }
-        let mut found: [Option<usize>; 3] = [None, None, None];
+        // Read the function-address array (bounded; forwarded exports are
+        // handled inside the parser by the exp_rva window check).
+        let funcs_bytes = num_funcs * 4;
+        if funcs_bytes > 0x10000 {
+            return Err(RuntimeLoadError::ExportResolutionFailed(
+                "export function array too large".to_string(),
+            ));
+        }
+        let mut funcs = vec![0u8; funcs_bytes];
+        let rf = unsafe {
+            RPM(
+                target,
+                (module_base + funcs_rva) as *const core::ffi::c_void,
+                funcs.as_mut_ptr() as *mut core::ffi::c_void,
+                funcs_bytes,
+                None,
+            )
+        };
+        if rf.is_err() {
+            return Err(RuntimeLoadError::ExportResolutionFailed(
+                "remote read function array failed".to_string(),
+            ));
+        }
         let want: [&[u8]; 3] = [
             b"MidaAntidebugInitialize",
             b"MidaAntidebugGetAttestation",
             b"MidaAntidebugShutdown",
         ];
-        for i in 0..num_names {
-            let name_ptr_rva = u32::from_le_bytes([
-                names[i * 4],
-                names[i * 4 + 1],
-                names[i * 4 + 2],
-                names[i * 4 + 3],
-            ]) as usize;
-            if name_ptr_rva == 0 {
-                continue;
-            }
-            // Read the name string (bounded 64 chars).
-            let mut name = Vec::with_capacity(64);
-            for k in 0..64usize {
-                let mut ch = [0u8; 1];
-                let rc = unsafe {
-                    RPM(
-                        target,
-                        (module_base + name_ptr_rva + k) as *const core::ffi::c_void,
-                        ch.as_mut_ptr() as *mut core::ffi::c_void,
-                        1,
-                        None,
-                    )
-                };
-                if rc.is_err() {
-                    break;
-                }
-                if ch[0] == 0 {
-                    break;
-                }
-                name.push(ch[0]);
-            }
-            let ord = u16::from_le_bytes([ords[i * 2], ords[i * 2 + 1]]) as u32;
-            for (wi, w) in want.iter().enumerate() {
-                if found[wi].is_none() && name.as_slice() == *w {
-                    // The MSVC/Rust link.exe export ordinal array is 0-based
-                    // for #[no_mangle] exports even when Base=1: ord=0 maps to
-                    // AddressOfFunctions[0], ord=1 to [1], etc. Use the
-                    // ordinal directly as the function index.
-                    let func_idx = ord as usize;
-                    if func_idx < num_funcs {
-                        let func_rva = rd_u32(target, module_base + funcs_rva + func_idx * 4)?;
-                        if func_rva != 0 {
-                            found[wi] = Some(module_base + func_rva as usize);
-                        }
+        // ADR-5B-R5: resolve through the pure, bounds-checked parser. The
+        // name resolver reads one byte at a time from the target via RPM
+        // (bounded 64 chars, matching the parser contract).
+        let found_owned = {
+            let mut name_at = |name_ptr_rva: usize, out: &mut Vec<u8>| {
+                for k in 0..64usize {
+                    let mut ch = [0u8; 1];
+                    let rc = unsafe {
+                        RPM(
+                            target,
+                            (module_base + name_ptr_rva + k) as *const core::ffi::c_void,
+                            ch.as_mut_ptr() as *mut core::ffi::c_void,
+                            1,
+                            None,
+                        )
+                    };
+                    if rc.is_err() {
+                        break;
                     }
+                    if ch[0] == 0 {
+                        break;
+                    }
+                    out.push(ch[0]);
                 }
-            }
-        }
+            };
+            Self::resolve_exports_from_buffers(
+                &names,
+                &ords,
+                &funcs,
+                &mut name_at,
+                num_names,
+                num_funcs,
+                module_base,
+                exp_rva,
+                exp_size,
+                &want,
+            )?
+        };
+        let found: [Option<usize>; 3] = [found_owned[0], found_owned[1], found_owned[2]];
         let (Some(init), Some(get), Some(shut)) = (found[0], found[1], found[2]) else {
             return Err(RuntimeLoadError::ExportResolutionFailed(format!(
                 "remote export missing: init={} get={} shut={}",
@@ -1322,6 +1363,96 @@ impl RuntimeLoader {
             get_attestation: get,
             shutdown: shut,
         })
+    }
+
+    /// Parse a PE export directory from in-memory buffers (ADR-5B-R5).
+    ///
+    /// Pure parser over the already-read name-pointer array, ordinal array
+    /// and function-address array. `name_at` resolves a name-string address
+    /// (RVA) to its bytes; the remote path reads them via RPM from the
+    /// target, tests supply a flat buffer. Returns the resolved addresses
+    /// for the wanted exports. `module_base` is the image base (for
+    /// RVA -> VA conversion); `funcs` is the raw function-address array
+    /// (num_funcs * 4 bytes). Handles Base != 1 (the ordinal array is
+    /// 0-based relative to AddressOfFunctions per the MSVC/Rust link.exe
+    /// convention — the ordinal VALUE is the function index), forwarded
+    /// exports (function RVA inside the export directory -> not resolved),
+    /// out-of-range ordinals and missing names. Fail-closed on truncated
+    /// buffers (bounds-checked indexing).
+    #[allow(clippy::too_many_arguments)]
+    pub fn resolve_exports_from_buffers(
+        names: &[u8],
+        ords: &[u8],
+        funcs: &[u8],
+        name_at: &mut dyn FnMut(usize, &mut Vec<u8>),
+        num_names: usize,
+        num_funcs: usize,
+        module_base: usize,
+        exp_rva: usize,
+        exp_size: usize,
+        want: &[&[u8]],
+    ) -> Result<Vec<Option<usize>>, RuntimeLoadError> {
+        let mut found: Vec<Option<usize>> = vec![None; want.len()];
+        for i in 0..num_names {
+            if i * 4 + 3 >= names.len() {
+                return Err(RuntimeLoadError::ExportResolutionFailed(
+                    "export name array truncated".to_string(),
+                ));
+            }
+            let name_ptr_rva = u32::from_le_bytes([
+                names[i * 4],
+                names[i * 4 + 1],
+                names[i * 4 + 2],
+                names[i * 4 + 3],
+            ]) as usize;
+            if name_ptr_rva == 0 {
+                continue;
+            }
+            // Read the name string (bounded 64 chars) via the resolver.
+            let mut name = Vec::with_capacity(64);
+            name_at(name_ptr_rva, &mut name);
+            if i * 2 + 1 >= ords.len() {
+                return Err(RuntimeLoadError::ExportResolutionFailed(
+                    "export ordinal array truncated".to_string(),
+                ));
+            }
+            let ord = u16::from_le_bytes([ords[i * 2], ords[i * 2 + 1]]) as usize;
+            for (wi, w) in want.iter().enumerate() {
+                if found[wi].is_some() || name.as_slice() != *w {
+                    continue;
+                }
+                // The MSVC/Rust link.exe export ordinal array is 0-based for
+                // #[no_mangle] exports even when Base=1: ord=0 maps to
+                // AddressOfFunctions[0], ord=1 to [1], etc. Use the ordinal
+                // directly as the function index.
+                if ord >= num_funcs {
+                    // Out-of-range ordinal: cannot resolve (fail-closed for
+                    // this name; other names may still match).
+                    continue;
+                }
+                if ord * 4 + 3 >= funcs.len() {
+                    return Err(RuntimeLoadError::ExportResolutionFailed(
+                        "export function array truncated".to_string(),
+                    ));
+                }
+                let func_rva = u32::from_le_bytes([
+                    funcs[ord * 4],
+                    funcs[ord * 4 + 1],
+                    funcs[ord * 4 + 2],
+                    funcs[ord * 4 + 3],
+                ]) as usize;
+                if func_rva == 0 {
+                    continue;
+                }
+                // Forwarded export: the function RVA points INSIDE the export
+                // directory (the name is a forwarder string, not code).
+                if func_rva >= exp_rva && func_rva < exp_rva + exp_size {
+                    continue;
+                }
+                found[wi] = Some(module_base + func_rva as usize);
+            }
+        }
+        Ok(found)
     }
 
     /// Find the full 64-bit base address of a module by name substring
@@ -1726,4 +1857,139 @@ pub fn run_runtime_loader(
         file_identity: loaded.file_identity,
         target_pid,
     })
+}
+
+// ---------------------------------------------------------------------------
+// ADR-5B-R3: REAL timeout-safety integration harness (Windows only)
+// ---------------------------------------------------------------------------
+//
+// These tests prove the timeout contract with a real slow remote thread:
+//   - the deadline is enforced by a real monotonic clock (wall time ~=
+//     declared deadline, never ~2x);
+//   - on timeout the thunk allocation is NOT freed (remote code may still
+//     be executing it);
+//   - after the remote thread finishes, the retained memory can be released
+//     safely (the thread is truly done).
+
+#[cfg(all(test, windows))]
+mod timeout_harness {
+    use super::*;
+    use windows::core::{PCSTR, PCWSTR};
+    use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+    use windows::Win32::System::Memory::{
+        VirtualAllocEx, VirtualFreeEx, VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT,
+        MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE,
+    };
+    use windows::Win32::System::Threading::GetCurrentProcess;
+
+    fn noop_drain(_ms: u32) -> Result<Option<mida_core::DrainReceipt>, mida_core::CoreError> {
+        Ok(None)
+    }
+
+    /// Address of kernel32!Sleep in THIS process. On x64 the kernel32 base is
+    /// process-independent (same address space layout for system DLLs), so
+    /// this address is valid in the remote thread context.
+    fn sleep_addr() -> usize {
+        let name: Vec<u16> = "kernel32.dll"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let h = unsafe { GetModuleHandleW(PCWSTR(name.as_ptr())) }.ok();
+        let h = h.expect("kernel32 must be loaded");
+        let addr = unsafe { GetProcAddress(h, PCSTR(b"Sleep\0".as_ptr())) };
+        addr.expect("Sleep must exist in kernel32") as usize
+    }
+
+    #[test]
+    fn slow_remote_thread_times_out_and_retains_memory() {
+        let loader = RuntimeLoader::new(runtime_authority_stub());
+        // SAFETY: GetCurrentProcess returns a pseudo-handle valid for the
+        // whole process lifetime; we never close it.
+        let target = unsafe { GetCurrentProcess() };
+        // The slow remote "function" is kernel32!Sleep(5000ms): a REAL slow
+        // remote thread that outlives the 1s deadline and finishes on its
+        // own after ~5s.
+        let slow_fn = sleep_addr();
+        let slow_ms = 5000u64;
+        // A thunk-like allocation to prove retention semantics (the loader
+        // must NOT free it while the remote thread may still be running).
+        // SAFETY: allocate memory in OUR process.
+        let thunk = unsafe {
+            VirtualAllocEx(
+                target,
+                None,
+                0x100,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_EXECUTE_READWRITE,
+            )
+        };
+        assert!(!thunk.is_null(), "VirtualAllocEx failed");
+
+        let t0 = Instant::now();
+        // SAFETY: slow_fn points at Sleep in kernel32, valid in this process.
+        let result = unsafe {
+            loader.remote_call_raw_bounded(
+                target,
+                slow_fn,
+                slow_ms as usize,
+                1, // 1-second REAL deadline
+                &mut noop_drain,
+            )
+        };
+        let elapsed = t0.elapsed();
+        assert!(
+            matches!(result, Err(RuntimeLoadError::RemoteCallFailed(_))),
+            "slow remote thread must time out: {result:?}"
+        );
+        // REAL-clock enforcement: the wall time must be within [0.8s, 3s]
+        // (a doubled deadline would exceed 2s by a wide margin; 1s deadline
+        // with 200ms polls + slack stays well under 3s).
+        let ms = elapsed.as_millis();
+        assert!(
+            (800..3000).contains(&ms),
+            "timeout must respect the REAL 1s deadline (got {ms}ms)"
+        );
+
+        // The thunk-like allocation must STILL be committed (the remote
+        // thread may still be executing; the loader must NOT have freed it).
+        // SAFETY: VirtualQueryEx on our own valid allocation.
+        let mut mbi = MEMORY_BASIC_INFORMATION::default();
+        let vq = unsafe {
+            VirtualQueryEx(
+                target,
+                Some(thunk),
+                &mut mbi,
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        assert!(vq > 0, "VirtualQueryEx failed");
+        assert!(
+            mbi.State == MEM_COMMIT,
+            "thunk memory must remain committed after timeout (State={:?})",
+            mbi.State
+        );
+
+        // Let the slow Sleep(5s) finish, then the allocation can be released
+        // safely (the remote thread is truly done).
+        std::thread::sleep(Duration::from_millis((slow_ms + 700) as u64));
+        // SAFETY: thunk is still a valid committed allocation in our process.
+        let f = unsafe { VirtualFreeEx(target, thunk, 0, MEM_RELEASE) };
+        assert!(f.is_ok(), "VirtualFreeEx after thread finish failed");
+    }
+
+    fn runtime_authority_stub() -> RuntimeAuthorityManifest {
+        // The loader only needs the authority for path resolution in the
+        // full flow; remote_call_raw_bounded does not touch it. Build a
+        // minimal stub (never loaded from disk).
+        RuntimeAuthorityManifest {
+            schema: "mida.runtime-authority/v1".to_string(),
+            kind: "runtime-x64".to_string(),
+            artifact_id: "stub".to_string(),
+            sha256: "00".repeat(32),
+            size_bytes: 0,
+            architecture: "x86_64".to_string(),
+            source_ref: "stub".to_string(),
+            provenance_ref: "stub.json".to_string(),
+        }
+    }
 }

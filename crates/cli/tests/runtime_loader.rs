@@ -624,7 +624,8 @@ fn wait_status_classification_distinguishes_timeout_and_failure() {
 #[test]
 fn thunk_layout_constants_are_explicit_and_consistent() {
     use mida_cli::unpacker::runtime_loader::{
-        THUNK_ARGS_OFFSET, THUNK_ARGS_SIZE, THUNK_BLOB_SIZE, THUNK_CODE_SIZE, THUNK_EXECUTABLE_SIZE,
+        THUNK_ARGS_OFFSET, THUNK_ARGS_SIZE, THUNK_BLOB_SIZE, THUNK_CODE, THUNK_CODE_SIZE,
+        THUNK_EXECUTABLE_SIZE,
     };
     // The executable window covers the thunk code (91 bytes) with room to spare.
     assert!(THUNK_CODE_SIZE >= 91);
@@ -634,6 +635,19 @@ fn thunk_layout_constants_are_explicit_and_consistent() {
     assert!(THUNK_ARGS_OFFSET + THUNK_ARGS_SIZE <= THUNK_BLOB_SIZE);
     // The whole blob is one page-rounded 0x100 region.
     assert_eq!(THUNK_BLOB_SIZE, 0x100);
+    // Byte-level layout proof: the actual thunk code must fit inside the
+    // declared code window, and the args window must not overlap it.
+    assert!(THUNK_CODE.len() <= THUNK_CODE_SIZE);
+    assert!(THUNK_CODE.len() <= THUNK_EXECUTABLE_SIZE);
+    assert!(THUNK_ARGS_OFFSET >= THUNK_CODE.len());
+    // The thunk's return (ret at the end) must land before the args window,
+    // otherwise the args blob could be executed as code.
+    let last_code_byte = THUNK_CODE.len();
+    assert!(
+        last_code_byte <= THUNK_ARGS_OFFSET,
+        "thunk code ({} bytes) must end at/before args offset {THUNK_ARGS_OFFSET}",
+        last_code_byte
+    );
 }
 
 #[test]
@@ -648,6 +662,240 @@ fn ordinal_array_layout_is_two_bytes_per_entry() {
     // A parsed ordinal value must be recoverable from two bytes.
     let ord = u16::from_le_bytes([0x34, 0x12]);
     assert_eq!(ord, 0x1234);
+}
+
+// ----------------------------------------------------------------
+// ADR-5B-R5: pure in-memory export parser (calls the real parser)
+// ----------------------------------------------------------------
+
+/// Minimal export-directory layout used by the pure parser tests.
+///
+/// Builds a flat "image" containing: name-pointer array (num_names * 4),
+/// ordinal array (num_names * 2), function-address array (num_funcs * 4),
+/// and NUL-terminated name strings. Offsets double as RVAs.
+struct ExportImage {
+    names: Vec<u8>,
+    ords: Vec<u8>,
+    funcs: Vec<u8>,
+    name_data: Vec<u8>,
+    num_names: usize,
+    num_funcs: usize,
+}
+
+impl ExportImage {
+    fn new(num_names: usize, num_funcs: usize) -> Self {
+        Self {
+            names: vec![0u8; num_names * 4],
+            ords: vec![0u8; num_names * 2],
+            funcs: vec![0u8; num_funcs * 4],
+            name_data: Vec::new(),
+            num_names,
+            num_funcs,
+        }
+    }
+
+    /// Append a name string; returns its RVA (offset into name_data).
+    /// RVAs are guaranteed non-zero (PE convention: RVA 0 = no name), so the
+    /// first name is placed at offset 1.
+    fn push_name(&mut self, name: &[u8]) -> usize {
+        if self.name_data.is_empty() {
+            self.name_data.push(0); // keep all real names at non-zero RVA
+        }
+        let rva = self.name_data.len();
+        self.name_data.extend_from_slice(name);
+        self.name_data.push(0);
+        rva
+    }
+
+    /// Set names[i] -> name, ords[i] -> ordinal.
+    fn set_name(&mut self, i: usize, name_rva: usize, ordinal: u16) {
+        self.names[i * 4..i * 4 + 4].copy_from_slice(&(name_rva as u32).to_le_bytes());
+        self.ords[i * 2..i * 2 + 2].copy_from_slice(&ordinal.to_le_bytes());
+    }
+
+    /// Set funcs[ordinal] -> rva.
+    fn set_func(&mut self, ordinal: usize, func_rva: usize) {
+        self.funcs[ordinal * 4..ordinal * 4 + 4].copy_from_slice(&(func_rva as u32).to_le_bytes());
+    }
+}
+
+/// Resolve the three MIDA exports through the REAL parser with a flat-buffer
+/// name resolver.
+fn resolve_via_parser(img: &ExportImage) -> Vec<Option<usize>> {
+    use mida_cli::unpacker::runtime_loader::RuntimeLoader;
+    let want: [&[u8]; 3] = [
+        b"MidaAntidebugInitialize",
+        b"MidaAntidebugGetAttestation",
+        b"MidaAntidebugShutdown",
+    ];
+    // module_base: 0x400000 (any); exp_rva/size: pick a window outside the
+    // function array so no export is treated as forwarded.
+    let module_base = 0x400000usize;
+    let exp_rva = 0x2000usize;
+    let exp_size = 0x100usize;
+    let mut name_at = |name_ptr_rva: usize, out: &mut Vec<u8>| {
+        let mut idx = name_ptr_rva;
+        for _ in 0..64 {
+            if idx >= img.name_data.len() {
+                break;
+            }
+            let ch = img.name_data[idx];
+            idx += 1;
+            if ch == 0 {
+                break;
+            }
+            out.push(ch);
+        }
+    };
+    RuntimeLoader::resolve_exports_from_buffers(
+        &img.names,
+        &img.ords,
+        &img.funcs,
+        &mut name_at,
+        img.num_names,
+        img.num_funcs,
+        module_base,
+        exp_rva,
+        exp_size,
+        &want,
+    )
+    .expect("parser must succeed")
+}
+
+#[test]
+fn export_parser_resolves_two_byte_ordinals_with_base_not_one() {
+    // The classic bug: ords_bytes = num_names * 4. With real 2-byte ordinal
+    // slots, a 4-byte stride misreads every slot. This test drives the REAL
+    // parser with a genuine PE-style ordinal array and asserts the resolved
+    // function addresses, so a regression to num_names*4 fails here.
+    let mut img = ExportImage::new(3, 8);
+    // Base != 1 exercise: use arbitrary ordinal values (0, 5, 7) that index
+    // AddressOfFunctions directly (MSVC/Rust link.exe convention).
+    let init_rva = img.push_name(b"MidaAntidebugInitialize");
+    let get_rva = img.push_name(b"MidaAntidebugGetAttestation");
+    let shut_rva = img.push_name(b"MidaAntidebugShutdown");
+    img.set_name(0, init_rva, 0);
+    img.set_name(1, get_rva, 5);
+    img.set_name(2, shut_rva, 7);
+    img.set_func(0, 0x1111);
+    img.set_func(5, 0x2222);
+    img.set_func(7, 0x3333);
+    // Fill the other slots with distinct junk to catch stride errors.
+    for i in 0..8 {
+        if i != 0 && i != 5 && i != 7 {
+            img.set_func(i, 0xDEAD + i);
+        }
+    }
+    let found = resolve_via_parser(&img);
+    assert_eq!(found[0], Some(0x400000 + 0x1111));
+    assert_eq!(found[1], Some(0x400000 + 0x2222));
+    assert_eq!(found[2], Some(0x400000 + 0x3333));
+}
+
+#[test]
+fn export_parser_skips_missing_and_out_of_range_ordinals() {
+    // A wanted export whose ordinal is out of range (>= num_funcs) must NOT
+    // resolve; a wanted export that is absent must stay None.
+    let mut img = ExportImage::new(3, 4);
+    let init_rva = img.push_name(b"MidaAntidebugInitialize");
+    let _get_rva = img.push_name(b"MidaAntidebugGetAttestation");
+    img.set_name(0, init_rva, 0); // resolves
+    img.set_name(1, 0, 1); // name_ptr 0 -> skipped entirely
+    img.set_name(2, 0, 9); // out-of-range ordinal, no name
+    img.set_func(0, 0x1111);
+    let found = resolve_via_parser(&img);
+    assert_eq!(found[0], Some(0x400000 + 0x1111));
+    assert_eq!(found[1], None, "GetAttestation missing must stay None");
+    assert_eq!(found[2], None, "Shutdown missing must stay None");
+}
+
+#[test]
+fn export_parser_skips_forwarded_exports() {
+    // A forwarded export has its function RVA INSIDE the export directory
+    // window (exp_rva..exp_rva+exp_size); the parser must not resolve it to
+    // a bogus code address.
+    let mut img = ExportImage::new(1, 4);
+    let init_rva = img.push_name(b"MidaAntidebugInitialize");
+    img.set_name(0, init_rva, 0);
+    // Function RVA points INSIDE the export directory window.
+    img.set_func(0, 0x2040); // exp_rva=0x2000, exp_size=0x100 -> inside
+    let found = resolve_via_parser(&img);
+    assert_eq!(
+        found[0], None,
+        "forwarded export must not resolve to a code address"
+    );
+}
+
+#[test]
+fn export_parser_fails_closed_on_truncated_buffers() {
+    use mida_cli::unpacker::runtime_loader::RuntimeLoader;
+    let want: [&[u8]; 1] = [b"MidaAntidebugInitialize"];
+    // Names that point at a REAL string (non-zero RVA) so the parser reaches
+    // the ordinal/function bounds checks instead of skipping on RVA 0.
+    let name_rva = 0x10usize;
+    let mut name_at = |rva: usize, out: &mut Vec<u8>| {
+        if rva == name_rva {
+            out.extend_from_slice(b"MidaAntidebugInitialize");
+        }
+    };
+    let mut names = vec![0u8; 8];
+    names[0..4].copy_from_slice(&(name_rva as u32).to_le_bytes());
+    names[4..8].copy_from_slice(&(name_rva as u32).to_le_bytes());
+    // Truncated ordinal array: num_names=2 but only 2 bytes provided.
+    let ords = vec![0u8; 2];
+    let funcs = vec![0u8; 16];
+    let err = RuntimeLoader::resolve_exports_from_buffers(
+        &names,
+        &ords,
+        &funcs,
+        &mut name_at,
+        2, // claims 2 names
+        4,
+        0x400000,
+        0x2000,
+        0x100,
+        &want,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, RuntimeLoadError::ExportResolutionFailed(_)),
+        "truncated ordinal array must fail closed: {err:?}"
+    );
+    // Truncated name-pointer array (2 names need 8 bytes, only 7 provided).
+    let names2 = vec![0u8; 7];
+    let err2 = RuntimeLoader::resolve_exports_from_buffers(
+        &names2,
+        &[0u8; 4],
+        &[0u8; 16],
+        &mut name_at,
+        2,
+        4,
+        0x400000,
+        0x2000,
+        0x100,
+        &want,
+    )
+    .unwrap_err();
+    assert!(matches!(err2, RuntimeLoadError::ExportResolutionFailed(_)));
+    // Truncated function array: name resolves, ordinal 3 indexes funcs but
+    // only 15 of 16 bytes exist for 4 funcs (funcs[12..16] missing).
+    let ords3 = vec![3u16.to_le_bytes()[0], 3u16.to_le_bytes()[1], 0, 0]; // ordinal 3, 0
+    let mut funcs3 = vec![0u8; 15]; // 4 funcs need 16 bytes
+    funcs3[0..12].copy_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    let err3 = RuntimeLoader::resolve_exports_from_buffers(
+        &names,
+        &ords3,
+        &funcs3,
+        &mut name_at,
+        2,
+        4,
+        0x400000,
+        0x2000,
+        0x100,
+        &want,
+    )
+    .unwrap_err();
+    assert!(matches!(err3, RuntimeLoadError::ExportResolutionFailed(_)));
 }
 
 #[test]

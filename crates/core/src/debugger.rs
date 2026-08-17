@@ -23,6 +23,15 @@ pub enum ContinueStatus {
     Continue = 0x0001_0002,
     /// Signal end-of-debug-session (`DBG_CONTROL_BREAK` = `0x40010008`).
     ContinueNoStep = 0x4001_0008,
+    /// Hand the exception back to the target's exception dispatcher
+    /// (`DBG_EXCEPTION_NOT_HANDLED` = `0x40010001`).
+    ///
+    /// ADR-5B-R1 (audit F-001): the drain window must NOT mark every
+    /// exception as handled. Debugger-owned exceptions (breakpoint /
+    /// single-step) are continued with `Continue`; unknown first-chance
+    /// exceptions are forwarded to the target with this status so the
+    /// target's own SEH disposition is preserved.
+    ExceptionNotHandled = 0x4001_0001,
 }
 
 // ---------------------------------------------------------------------------

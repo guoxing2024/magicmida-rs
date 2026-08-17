@@ -1089,6 +1089,34 @@ pub fn unpack(
                             );
                         }
                     }
+                    // ADR-5B-R1 F-005: the debugger retains EVERY drain receipt
+                    // (warm-up + LoadLibraryW wait + thunk initialize +
+                    // attestation). Pull them out and log the full window so the
+                    // loader's drain bookkeeping is auditable end-to-end, not
+                    // just the warm-up events.
+                    let all_drain_receipts = dbg.take_drain_receipts();
+                    let drain_stats = dbg.drain_stats();
+                    log::log(
+                        LogType::Info,
+                        &format!(
+                            "drain audit (full loader window): receipts={} events_drained={} create_threads={} exit_removed={} exit_short_lived={} exit_unmatched={} hfiles_attempted={} hfiles_ok={} hfiles_failed={} dr_ok={} dr_failed={} exceptions_continued={} exceptions_forwarded={} exceptions_failed_closed={} last_seq={}",
+                            all_drain_receipts.len(),
+                            drain_stats.events_drained,
+                            drain_stats.create_threads_registered,
+                            drain_stats.exit_threads_removed,
+                            drain_stats.exit_short_lived_without_create_observation,
+                            drain_stats.unmatched_exit_threads,
+                            drain_stats.hfiles_close_attempted,
+                            drain_stats.hfiles_close_succeeded,
+                            drain_stats.hfiles_close_failed,
+                            drain_stats.dr_propagations,
+                            drain_stats.dr_propagation_failures,
+                            drain_stats.exceptions_continued,
+                            drain_stats.exceptions_forwarded,
+                            drain_stats.exceptions_failed_closed,
+                            drain_stats.last_sequence,
+                        ),
+                    );
                     let outcome = ad_controller.run();
                     match &outcome {
                         antidebug_controller::AntidebugOutcome::Proceed { .. } => {
