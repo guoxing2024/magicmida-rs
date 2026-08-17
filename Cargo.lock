@@ -154,6 +154,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mida-antidebug-runtime"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "mida-cli"
 version = "0.1.0"
 dependencies = [

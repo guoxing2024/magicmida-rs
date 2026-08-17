@@ -9,6 +9,7 @@ members = [
     "crates/cli",
     "crates/acceptance",
     "crates/antidebug",
+    "crates/antidebug-runtime",
 ]
 # Research-only; own Cargo.toml pins (no workspace inherit). Build with a
 # separate research workspace or after moving out of tree — not via root members.
@@ -23,6 +24,7 @@ default-members = [
     "crates/cli",
     "crates/acceptance",
     "crates/antidebug",
+    "crates/antidebug-runtime",
 ]
 resolver = "2"
 
