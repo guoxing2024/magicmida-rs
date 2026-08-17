@@ -19,7 +19,7 @@
 //!    ??//!  dump to file ─??postprocess (data sections / shrink) ─??cleanup
 //! ```
 
-mod antidebug_controller;
+pub mod antidebug_controller;
 mod av_handler;
 mod av_query;
 pub mod bundle_assembler;
@@ -40,6 +40,7 @@ mod plugin_host;
 mod post_attach;
 mod post_loop;
 mod relocation_evidence;
+pub mod runtime_loader;
 mod section_rebuild_evidence;
 mod session;
 pub(crate) mod sidecar_io;
@@ -605,6 +606,11 @@ pub fn unpack(
                 cleanup_backend: Some(Box::new(antidebug_controller::Win32CleanupBackend::new(
                     dbg.process_handle(),
                 ))),
+                // ADR-6 plan A: post-attach has no runtime loader yet ->
+                // anti-debug stays fail-closed (no bypass).
+                runtime_authority: None,
+                runtime_path: None,
+                loader_result: None,
             },
         );
         let outcome = ad_controller.run();
@@ -973,8 +979,38 @@ pub fn unpack(
                                     dbg.process_handle(),
                                 ),
                             )),
+                            // ADR-6: audited runtime authority + artifact path.
+                            // The loader result is injected below after the
+                            // runtime is actually loaded into the target.
+                            runtime_authority: crate::unpacker::runtime_loader::runtime_authority(),
+                            runtime_path: crate::unpacker::runtime_loader::runtime_artifact_path(),
+                            loader_result: None,
                         },
                     );
+                    // ADR-6: run the self-owned loader (verify + load +
+                    // initialize + attestation) while the target is still
+                    // suspended; inject the result into the controller.
+                    // Profile binding: the profile id/digest are the
+                    // controller-selected values (ADR-2 origin profile);
+                    // the loader passes them to the runtime which echoes
+                    // them in the attestation for cross-check.
+                    let loader_outcome = crate::unpacker::runtime_loader::run_runtime_loader(
+                        dbg.process_handle(),
+                        pid,
+                        "oreans_origin_x64_v1",
+                        "adr6-profile-digest",
+                    );
+                    match loader_outcome {
+                        Ok(loader_result) => {
+                            ad_controller.set_loader_result(loader_result);
+                        }
+                        Err(e) => {
+                            log::log(
+                                LogType::Fatal,
+                                &format!("anti-debug runtime loader failed: {e:#}"),
+                            );
+                        }
+                    }
                     let outcome = ad_controller.run();
                     match &outcome {
                         antidebug_controller::AntidebugOutcome::Proceed { .. } => {

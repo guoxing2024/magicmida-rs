@@ -56,6 +56,7 @@ use mida_antidebug::profile::Profile;
 use mida_antidebug::state::{transition, ControllerEvent, ControllerState, FailCode};
 
 use crate::log::{self, LogType};
+use crate::unpacker::runtime_loader::{RuntimeAuthority, RuntimeFileIdentity};
 
 /// Registered anti-debug evidence schema (ADR-0 evidence contract).
 /// The CLI failure sidecar is a `record_kind = "cli-failure"` record of
@@ -201,11 +202,20 @@ pub struct AntidebugStageOptions {
     #[allow(dead_code)] // consumed by ADR-4 evidence binding
     pub target_pid: u32,
     /// Where to write the failure evidence sidecar (run output directory).
+    #[allow(dead_code)] // evidence binding (ADR-4); consumed by callers
     pub evidence_dir: Option<std::path::PathBuf>,
     /// Explicit opt-in oracle mode (ScyllaHide). `None` in production.
     pub oracle: Option<OracleMode>,
     /// Cleanup backend (injectable for tests).
     pub cleanup_backend: Option<Box<dyn CleanupBackend>>,
+    /// Audited runtime authority (ADR-6). None keeps the old fail-closed
+    /// placeholder behaviour (DependencyUnavailable).
+    pub runtime_authority: Option<RuntimeAuthority>,
+    /// Path to the runtime DLL to verify + load.
+    pub runtime_path: Option<std::path::PathBuf>,
+    /// Loader result injected by the CREATE_PROCESS handler after it ran the
+    /// real loader (attestation JSON + module base + identity).
+    pub loader_result: Option<LoaderResult>,
 }
 
 /// Oracle-mode configuration (future differential experiments only).
@@ -218,6 +228,21 @@ pub struct OracleMode {
     /// ScyllaHide `scylla_hide.ini` (external vault artifact; optional).
     #[allow(dead_code)] // future oracle seam (ADR-7)
     pub ini_path: Option<std::path::PathBuf>,
+}
+
+/// Result of a real loader execution, injected by the caller (the
+/// CREATE_PROCESS handler) so the controller can drive the lifecycle from
+/// actual runtime evidence (ADR-6).
+#[derive(Debug, Clone)]
+pub struct LoaderResult {
+    /// Module base in the target (evidence + controller cross-check).
+    #[allow(dead_code)] // consumed by evidence bindings
+    pub module_base: u64,
+    pub attestation_json: String,
+    /// Verified file identity (evidence).
+    #[allow(dead_code)] // consumed by evidence bindings
+    pub file_identity: RuntimeFileIdentity,
+    pub target_pid: u32,
 }
 
 /// The anti-debug lifecycle driver.
@@ -241,6 +266,12 @@ impl AntidebugController {
             profile: None,
             cleanup: None,
         }
+    }
+
+    /// Inject the loader result (ADR-6). Called by the CREATE_PROCESS
+    /// handler after the runtime loader ran against the suspended target.
+    pub fn set_loader_result(&mut self, result: LoaderResult) {
+        self.options.loader_result = Some(result);
     }
 
     /// Current lifecycle state.
@@ -325,30 +356,41 @@ impl AntidebugController {
         self.state = ControllerState::CleanupFailed;
     }
 
-    /// Resolve the anti-debug runtime dependency (ADR-3B: deterministic fail).
+    /// Resolve the anti-debug runtime dependency (ADR-6: real authority).
+    ///
+    /// Without an authority configured this stays fail-closed
+    /// (DependencyUnavailable), preserving the ADR-3B placeholder semantics
+    /// for tests and for configurations that do not ship a runtime.
     fn resolve_dependency(&mut self) {
-        let runtime_path = self
-            .options
-            .evidence_dir
-            .as_deref()
-            .map(|d| d.join(MIDA_RUNTIME_ARTIFACT));
-
-        let found = runtime_path
-            .as_deref()
-            .map(|p| p.exists() && p.is_file())
-            .unwrap_or(false);
-
-        if found {
-            // A runtime artifact exists: verify identity (hash/arch).
-            // ADR-3B has no trusted runtime to verify against, so even a
-            // present artifact is an identity mismatch until ADR-4 pins
-            // the expected digest.
-            self.drive(ControllerEvent::DependencyHashMismatch);
+        let Some(authority) = &self.options.runtime_authority else {
+            // No authority configured: dependency unavailable -> fail closed.
+            self.drive(ControllerEvent::DependenciesMissing);
             return;
+        };
+        let Some(runtime_path) = &self.options.runtime_path else {
+            self.drive(ControllerEvent::DependenciesMissing);
+            return;
+        };
+        match authority.verify_file(runtime_path) {
+            Ok(_identity) => {
+                // Identity verified: canonical path + size + sha256 + arch.
+                self.drive(ControllerEvent::DependenciesVerified);
+            }
+            Err(e) => {
+                log::log(
+                    LogType::Fatal,
+                    &format!("anti-debug runtime authority verification failed: {e}"),
+                );
+                let msg = e.to_string();
+                if msg.contains("sha256") || msg.contains("size") {
+                    self.drive(ControllerEvent::DependencyHashMismatch);
+                } else if msg.contains("x64 only") {
+                    self.drive(ControllerEvent::ArchitectureMismatch);
+                } else {
+                    self.drive(ControllerEvent::DependenciesMissing);
+                }
+            }
         }
-
-        // No MIDA runtime: dependency unavailable -> fail closed.
-        self.drive(ControllerEvent::DependenciesMissing);
     }
 
     /// Oracle-mode only: record that ScyllaHide would run as an oracle.
@@ -398,8 +440,71 @@ impl AntidebugController {
             };
         }
 
-        // Stages 2-10 are unreachable until a runtime exists. Drive them
-        // defensively so the state machine shape stays explicit.
+        // Stages 2-10: driven from the real loader result when present.
+        // ADR-6: the CREATE_PROCESS handler runs the loader and injects the
+        // attestation; the controller consumes it. Without a loader result
+        // the lifecycle fails closed at RuntimeLoadFailed (no blind Proceed).
+        let Some(loader) = self.options.loader_result.clone() else {
+            self.drive(ControllerEvent::RuntimeLoadFailed);
+            let message = format!(
+                "anti-debug runtime not loaded: no loader result injected (state={:?})",
+                self.state
+            );
+            let cleanup_result = self.run_cleanup();
+            if let CleanupResult::Failed(detail) = &cleanup_result {
+                log::log(
+                    LogType::Fatal,
+                    &format!("anti-debug cleanup failed: {detail} (upgraded to CleanupFailed)"),
+                );
+            }
+            return AntidebugOutcome::Failed {
+                state: self.state,
+                fail_code: self.fail_code_of_state(self.state),
+                message,
+            };
+        };
+
+        // Identity cross-checks against the loader result.
+        if loader.target_pid != self.options.target_pid {
+            self.drive(ControllerEvent::TargetIdentityRejected);
+            return AntidebugOutcome::Failed {
+                state: self.state,
+                fail_code: self.fail_code_of_state(self.state),
+                message: format!(
+                    "loader target pid {} != controller target pid {}",
+                    loader.target_pid, self.options.target_pid
+                ),
+            };
+        }
+
+        // Parse + validate the attestation (transport parse; validate is the
+        // decision gate).
+        let att = match mida_antidebug_runtime::attestation::RuntimeAttestation::from_canonical_json(
+            &loader.attestation_json,
+        ) {
+            Ok(a) => a,
+            Err(e) => {
+                self.drive(ControllerEvent::RuntimeInitFailed);
+                return AntidebugOutcome::Failed {
+                    state: self.state,
+                    fail_code: self.fail_code_of_state(self.state),
+                    message: format!("attestation parse failed: {e}"),
+                };
+            }
+        };
+        match att.validate() {
+            Ok(()) => {}
+            Err(e) => {
+                self.drive(ControllerEvent::HealthCheckFailed);
+                return AntidebugOutcome::Failed {
+                    state: self.state,
+                    fail_code: self.fail_code_of_state(self.state),
+                    message: format!("attestation validate failed: {e}"),
+                };
+            }
+        }
+
+        // Drive the success path.
         self.drive(ControllerEvent::ProfileValidated);
         self.drive(ControllerEvent::TargetIdentityValidated);
         self.drive(ControllerEvent::LaunchPrepared);
@@ -535,6 +640,9 @@ mod tests {
             evidence_dir: Some(temp.to_path_buf()),
             oracle: None,
             cleanup_backend: Some(backend),
+            runtime_authority: None,
+            runtime_path: None,
+            loader_result: None,
         }
     }
 
@@ -692,6 +800,9 @@ mod tests {
                 ini_path: None,
             }),
             cleanup_backend: Some(Box::new(OkCleanup)),
+            runtime_authority: None,
+            runtime_path: None,
+            loader_result: None,
         });
         let outcome = c.run();
         // Oracle mode still fails closed: no runtime, no proceed.
@@ -707,6 +818,9 @@ mod tests {
             evidence_dir: None,
             oracle: None,
             cleanup_backend: None,
+            runtime_authority: None,
+            runtime_path: None,
+            loader_result: None,
         });
         assert_eq!(
             c.fail_code_of_state(ControllerState::DependencyUnavailable),

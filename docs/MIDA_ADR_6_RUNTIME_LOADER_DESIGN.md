@@ -1,0 +1,173 @@
+# MIDA-ADR-6 自有 x64 Runtime Loader 与 Controller 接线
+
+> **工作令：** MIDA-ADR-6 —— 实现自有 x64 runtime loader，并将 controller 接入"暂停启动 -> 加载 -> 初始化 -> attestation -> 决策 -> 首次 resume"生命周期。
+> **状态：** 实现完成（loader + controller 接线；benign/synthetic 验证通过）。
+> **基线：** `ae1df8eeee4d30f9b48e5103f2ca8c15e529ced6`（ADR-5-CORRECTION）。前置：ADR-0/1/2/3/3A/3B/3B-CORRECTION/4/4-CORRECTION/5/5-CORRECTION 全部封版。
+> **性质：** 自有 loader。未执行 protected sample；未执行 ScyllaHide；未做差分。
+
+## 1. 目标与范围
+
+建立完全属于 MIDA 的 runtime loader/controller 接线，使 CLI 在目标首次执行前完成：
+
+```text
+CREATE_SUSPENDED
+  -> runtime artifact authority verification (SHA-256/size/arch)
+  -> target identity verification
+  -> load MIDA runtime into target (remote LoadLibraryW)
+  -> resolve runtime module base
+  -> MidaAntidebugInitialize (thunk, 6-arg, attestation out)
+  -> read attestation JSON
+  -> verify target_pid/module_base/profile_digest
+  -> attestation.validate()
+  -> controller decision
+  -> only on success: first resume
+```
+
+**明确不做：** x86 loader、post-attach runtime load（方案 A：fail-closed）、ScyllaHide、protected sample live、CLI production 之外的行为变更。
+
+## 2. 架构
+
+```text
+crates/cli/src/unpacker/
+├── runtime_loader.rs      loader：authority 验证 + 远程 LoadLibraryW +
+│                          thunk 远程调用 + attestation 读取 + identity 校验
+├── antidebug_controller.rs controller：resolve_dependency 真实化 +
+│                          loader_result 注入 + 全生命周期驱动
+└── mod.rs                 CREATE_PROCESS handler：调用 loader -> 注入结果 ->
+                           controller.run() -> Proceed 才首次 resume
+```
+
+### 2.1 Loader 机制选择：远程线程 + LoadLibraryW + x64 thunk
+
+**选择原因：**
+
+1. `CreateRemoteThread(kernel32!LoadLibraryW)` 是 Windows 公开、文档化的进程内 DLL 加载方式，x64 下 kernel32 基址跨进程一致（session.rs 已有同假设）；
+2. 无需手工 PE 映射（避免 loader stub 的复杂性和安全风险）；
+3. 完全自有：无第三方 injector、无 ScyllaHide 代码。
+
+**多参数远程调用**：`CreateRemoteThread` 只能传 1 个参数（lpParameter）。`MidaAntidebugInitialize` 有 6 个参数，因此使用**标准 x64 thunk**（VirtualAllocEx 可执行内存 + 参数块 + 间接调用）：
+
+```asm
+mov  r11, rcx          ; r11 = args base（跨调用保持）
+mov  rax, [r11]        ; fn_ptr
+mov  rcx, [r11+8]      ; arg0
+mov  rdx, [r11+16]     ; arg1
+mov  r8,  [r11+24]     ; arg2
+mov  r9,  [r11+32]     ; arg3
+sub  rsp, 0x38         ; shadow space (0x20) + 2 栈参数 + 对齐
+mov  r10, [r11+40]     ; arg4 -> [rsp+0x20]
+mov  r10, [r11+48]     ; arg5 -> [rsp+0x28]
+call rax
+add  rsp, 0x38
+ret
+```
+
+**时序保证：** 目标以 CREATE_SUSPENDED 创建（debug 事件窗口内主线程暂停），loader 在首次 resume 前完成全部远程操作。
+
+**修正记录（benign 验证发现）：** 初版 thunk 使用 `sub rsp, 0x28`，第 5 个栈参数写到 rsp+0x28（超出分配帧），远程线程执行时崩溃（0xC0000005）。修复为 `sub rsp, 0x38` 后 benign host 验证通过（完整 thunk 经 CreateThread 调用 GetCurrentProcessId 返回正确 PID）。
+
+## 3. Runtime Authority
+
+`RuntimeAuthority`（固定审计配置）：
+
+```text
+file_name (informational) + sha256 + size_bytes + architecture + source_revision + provenance_schema
+```
+
+- 验证流程：canonicalize -> is_file -> size 比对 -> SHA-256 比对 -> arch 比对；
+- 禁止信任：文件名、目录"最新 DLL"、调用方传入 hash、仅文件存在；
+- 失败映射：sha256/size -> `AntiDebugRuntimeIdentityMismatch`；x64 only -> `AntiDebugRuntimeArchitectureMismatch`；缺失 -> `AntiDebugRuntimeUnavailable`；
+- 运行时通过环境变量 `MIDA_RUNTIME_SHA256` / `MIDA_RUNTIME_SIZE` / `MIDA_RUNTIME_DLL` 注入（验收 harness 设置；不接受调用方直接传 hash）。
+
+## 4. Controller 接线
+
+### 4.1 resolve_dependency 真实化
+
+ADR-3B 的"runtime 永远不可用"占位改为：无 authority 配置 -> 保持 fail-closed（DependencyUnavailable）；有 authority -> `verify_file` 真实验证 -> `DependenciesVerified` 或对应失败状态。
+
+### 4.2 loader_result 注入
+
+CREATE_PROCESS handler 执行 loader 后，将 `LoaderResult { module_base, attestation_json, file_identity, target_pid }` 注入 controller。controller 的 `run()` 消费它：
+
+```text
+无 loader_result           -> RuntimeLoadFailed（不盲目 Proceed）
+target_pid 不匹配          -> TargetIdentityRejected
+attestation 解析失败        -> RuntimeInitFailed
+attestation.validate() 失败 -> HealthCheckFailed（partial hooks 等）
+全部通过                   -> ProfileValidated -> ... -> Proceed
+```
+
+### 4.3 Post-attach：方案 A（暂不支持）
+
+post-attach 路径不提供 runtime loader（无 CREATE_PROCESS handler 时机），controller 以 `runtime_authority: None` 保持 fail-closed（`AntiDebugRuntimeUnavailable`），**不绕过** anti-debug 阶段。
+## 5. 验证
+
+### 5.1 Synthetic（tests/runtime_loader.rs，14 tests）
+
+| 场景 | 测试 |
+|---|---|
+| authority 匹配 | authority_matches_ok |
+| authority hash 错误 | authority_wrong_hash_fails |
+| authority size 错误 | authority_wrong_size_fails |
+| authority 文件缺失 | authority_missing_file_fails |
+| thunk 字节良构（0x38 帧 + ret） | thunk_code_is_wellformed |
+| thunk 参数块序列化 | thunk_args_serialization_roundtrip |
+| init params 布局（repr(C) 对齐） | init_params_layout_matches_runtime_repr_c |
+| init params 空 surfaces | init_params_empty_surfaces_ok |
+| controller + 有效 loader result -> Proceed | controller_proceeds_with_valid_loader_result |
+| controller 无 loader result -> fail | controller_fails_closed_without_loader_result |
+| target pid mismatch -> fail | controller_fails_closed_on_target_pid_mismatch |
+| attestation 解析失败 -> fail | controller_fails_closed_on_bad_attestation |
+| attestation 不完整（partial hooks）-> fail | controller_fails_closed_on_incomplete_attestation |
+| authority mismatch -> fail（先于 loader） | controller_authority_mismatch_fails_before_loader |
+
+### 5.2 Benign host（5 轮，真实进程）
+
+benign_host_adr6.rs（仓库外 D:/tmp/magicmida-adr6-target）：
+
+```text
+ADR-6 benign host: baseline handles=54
+thunk selftest: full thunk GetCurrentProcessId = 13644 (expect 13644)
+round 0..4: load DLL -> Initialize -> attestation 981B (hooks 002+003, 001 absent)
+           -> Shutdown -> FreeLibrary; handles 58 (delta 4, 零增长)
+final handles=58 baseline=54 (delta 4)
+BENIGN_HOST_ADR6_OK
+```
+
+### 5.3 资源计数
+
+| 轮次 | 句柄 | delta |
+|---|---|---|
+| baseline | 54 | - |
+| round 0 | 58 | +4（DLL 首载固定开销） |
+| round 1-4 | 58 | 0 |
+| final | 58 | +4 总（无泄漏） |
+## 6. Evidence 要求
+
+loader/controller 失败生成 mida.antidebug-evidence/v1（record_kind=cli-failure）：decision=fail-closed、fail_code、controller state、target_pid、runtime artifact identity、module base、profile_id/digest、attestation、telemetry sequence、cleanup result、candidate_created=false。
+
+成功时 decision=proceed，但 benign host 的 Proceed 只代表 loader/controller/runtime 链路通过，不代表 protected sample gate 已通过。
+
+## 7. 验收命令结果
+
+```text
+cargo fmt --all -- --check                        OK
+cargo check --workspace --tests --offline        OK
+cargo test -p mida-antidebug-runtime --offline   OK (67)
+cargo test -p mida-antidebug --offline           OK
+cargo test -p mida-cli --offline                 OK (含 14 loader tests)
+cargo test --workspace --offline                 OK
+RUSTFLAGS=-D warnings cargo check --workspace --all-features --tests --offline  OK
+git diff --check                                 OK
+benign_host_adr6.exe 5 轮闭环                    OK (BENIGN_HOST_ADR6_OK)
+```
+
+## 8. 审计声明
+
+- 未执行 protected sample；未执行 ScyllaHide；未做差分；
+- 未实现禁止项（x86 loader、AD-PROC-001 promotion、post-attach runtime load）；
+- 未修改 crates/antidebug/**、crates/pe/**、crates/acceptance/**、crates/packers/**、crates/core/**；
+- runtime ABI 未修改（exports.rs 未动；thunk 是 loader 侧机制）；
+- 无 DLL/EXE 入库（构建产物在 D:/tmp/magicmida-adr6-target）；
+- 历史 109 个未跟踪文件 + ADR-3A 修正文档未触碰；
+- loader 自身有 identity（LoaderIdentity）；"远程线程创建成功" != "runtime 初始化成功"（每个 C ABI 调用返回码都检查）。
