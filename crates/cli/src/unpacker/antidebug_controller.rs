@@ -253,6 +253,9 @@ pub struct AntidebugFailureEvidence {
     /// Null when no exception receipt was captured (e.g. dependency-stage
     /// failures before any debug event).
     pub exception_code: Option<u32>,
+    /// ADR7-A1-CORRECTION-1: raw dwThreadId from the DEBUG_EVENT for the
+    /// captured exception. None when no exception receipt was captured.
+    pub exception_thread_id: Option<u32>,
     pub first_chance: Option<bool>,
     pub exception_address: Option<String>,
     pub instruction_pointer: Option<String>,
@@ -695,6 +698,7 @@ impl AntidebugController {
             },
             candidate_created: false,
             exception_code: self.capture_receipt.as_ref().and_then(|r| r.exception_code),
+            exception_thread_id: self.capture_receipt.as_ref().map(|r| r.thread_id),
             first_chance: self.capture_receipt.as_ref().and_then(|r| r.first_chance),
             exception_address: self
                 .capture_receipt
@@ -888,6 +892,7 @@ mod tests {
             cleanup_detail: None,
             candidate_created: false,
             exception_code: None,
+            exception_thread_id: Some(7777),
             first_chance: None,
             exception_address: None,
             instruction_pointer: None,
@@ -905,6 +910,7 @@ mod tests {
         assert_eq!(back.fail_code, "AntiDebugRuntimeUnavailable");
         assert!(!back.candidate_created);
         assert_eq!(back.schema, ANTIDEBUG_EVIDENCE_SCHEMA);
+        assert_eq!(back.exception_thread_id, Some(7777));
         assert_eq!(back.record_kind, EVIDENCE_RECORD_KIND_CLI_FAILURE);
         assert_eq!(back.decision, "fail-closed");
     }
@@ -933,6 +939,7 @@ mod tests {
             cleanup_detail: None,
             candidate_created: false,
             exception_code: None,
+            exception_thread_id: None,
             first_chance: None,
             exception_address: None,
             instruction_pointer: None,
