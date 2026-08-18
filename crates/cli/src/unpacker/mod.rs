@@ -613,6 +613,12 @@ pub fn unpack(
                 loader_result: None,
             },
         );
+        // R1-HARDENING-CLEANUP-2: exactly-once explicit cleanup (same as the
+        // CREATE_PROCESS path). terminate_and_wait() resolves any pending
+        // event (never DBG_CONTINUE for fail-closed), terminates once, and
+        // marks cleanup_done so Drop skips its fallback.
+        let cleanup_report = dbg.terminate_and_wait();
+        ad_controller.set_cleanup_report(&cleanup_report);
         let outcome = ad_controller.run();
         if let antidebug_controller::AntidebugOutcome::Failed {
             state,
@@ -1104,7 +1110,7 @@ pub fn unpack(
                             drain_stats.events_drained,
                             drain_stats.create_threads_registered,
                             drain_stats.exit_threads_removed,
-                            drain_stats.exit_short_lived_without_create_observation,
+                            drain_stats.exit_short_lived_with_create_observation,
                             drain_stats.unmatched_exit_threads,
                             drain_stats.hfiles_close_attempted,
                             drain_stats.hfiles_close_succeeded,
@@ -1138,6 +1144,25 @@ pub fn unpack(
                             ),
                         );
                     }
+                    // R1-HARDENING-CLEANUP-2: exactly-once explicit cleanup.
+                    // A fail-closed drain error (e.g. second-chance exception)
+                    // leaves a pending debug event UNCONTINUED, which freezes
+                    // the debuggee. terminate_and_wait() resolves the pending
+                    // event with DBG_EXCEPTION_NOT_HANDLED (never DBG_CONTINUE
+                    // for a fail-closed path), terminates the target ONCE,
+                    // waits for exit, and records cleanup_done so `Drop` skips
+                    // its fallback (no duplicate termination, no Drop cleanup
+                    // issue warning). The structured report is injected into
+                    // the controller for evidence.
+                    let cleanup_report = dbg.terminate_and_wait();
+                    ad_controller.set_cleanup_report(&cleanup_report);
+                    log::log(
+                        LogType::Info,
+                        &format!(
+                            "explicit cleanup (terminate_and_wait): {}",
+                            cleanup_report.summary()
+                        ),
+                    );
                     let outcome = ad_controller.run();
                     match &outcome {
                         antidebug_controller::AntidebugOutcome::Proceed { .. } => {

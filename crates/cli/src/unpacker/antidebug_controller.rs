@@ -114,22 +114,81 @@ impl Win32CleanupBackend {
 
 impl CleanupBackend for Win32CleanupBackend {
     fn cleanup(&self, _target_pid: u32) -> Result<(), CleanupError> {
-        use windows::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
+        use windows::Win32::System::Threading::{
+            OpenProcess, TerminateProcess, WaitForSingleObject, PROCESS_TERMINATE,
+        };
         const TERMINATE_TIMEOUT_MS: u32 = 5000;
 
         if self.process_handle.is_invalid() {
             return Err(CleanupError::new("process handle invalid"));
         }
-        // SAFETY: valid owned process handle (checked above).
-        let tp = unsafe { TerminateProcess(self.process_handle, 1) };
+        // R1-HARDENING-CLEANUP-1: a protected target may revoke/degrade the
+        // original CreateProcessW handle rights (observed: TerminateProcess ->
+        // ERROR_ACCESS_DENIED 0x80070005 against Themida targets). Re-open with
+        // PROCESS_TERMINATE | SYNCHRONIZE so termination is not hostage to the
+        // original handle's current rights.
+        let mut term_handle = self.process_handle;
+        let mut reopened = false;
+        // SAFETY: OpenProcess with the target pid and minimal rights.
+        let reopened_handle = unsafe {
+            OpenProcess(
+                PROCESS_TERMINATE | windows::Win32::System::Threading::PROCESS_SYNCHRONIZE,
+                false,
+                _target_pid,
+            )
+        };
+        if let Ok(h) = reopened_handle {
+            if !h.is_invalid() {
+                term_handle = h;
+                reopened = true;
+            }
+        }
+        // SAFETY: valid process handle (original or freshly re-opened).
+        let tp = unsafe { TerminateProcess(term_handle, 1) };
         if tp.is_err() {
             let code = tp.err().map(|e| e.code().0).unwrap_or(0);
+            // SAFETY: close the re-opened handle if we created one.
+            if reopened {
+                let _ = unsafe { windows::Win32::Foundation::CloseHandle(term_handle) };
+            }
             return Err(CleanupError::new(format!(
                 "TerminateProcess failed win32={code}"
             )));
         }
-        // SAFETY: bounded wait on the owned process handle.
-        let wait = unsafe { WaitForSingleObject(self.process_handle, TERMINATE_TIMEOUT_MS) }.0;
+        // SAFETY: bounded wait on the process handle.
+        let mut wait = unsafe { WaitForSingleObject(term_handle, TERMINATE_TIMEOUT_MS) }.0;
+        // R1-HARDENING-CLEANUP-1: while the debugger is still attached, the
+        // process handle does not become signaled even after the target exits
+        // (observed: terminate wait TIMEOUT against Themida targets whose
+        // process was already gone). Detach the debug session, then re-wait on
+        // a fresh handle so the wait reflects the real process state.
+        if wait == 0x102 {
+            // SAFETY: DebugActiveProcessStop with the target pid.
+            let _ = unsafe {
+                windows::Win32::System::Diagnostics::Debug::DebugActiveProcessStop(_target_pid)
+            };
+            // SAFETY: OpenProcess with minimal rights for the wait.
+            let fresh = unsafe {
+                OpenProcess(
+                    windows::Win32::System::Threading::PROCESS_SYNCHRONIZE,
+                    false,
+                    _target_pid,
+                )
+            };
+            if let Ok(fh) = fresh {
+                if !fh.is_invalid() {
+                    // SAFETY: bounded wait on the fresh handle.
+                    let r2 = unsafe { WaitForSingleObject(fh, TERMINATE_TIMEOUT_MS) }.0;
+                    wait = r2;
+                    // SAFETY: close the fresh handle.
+                    let _ = unsafe { windows::Win32::Foundation::CloseHandle(fh) };
+                }
+            }
+        }
+        // SAFETY: close the re-opened handle if we created one.
+        if reopened {
+            let _ = unsafe { windows::Win32::Foundation::CloseHandle(term_handle) };
+        }
         match wait {
             0 => Ok(()), // WAIT_OBJECT_0: signaled
             0x102 => Err(CleanupError::new("terminate wait TIMEOUT")),
@@ -274,6 +333,23 @@ impl AntidebugController {
         self.options.loader_result = Some(result);
     }
 
+    /// Inject the explicit cleanup outcome (R1-HARDENING-CLEANUP-2).
+    ///
+    /// The production path runs `WindowsDebugger::terminate_and_wait()`
+    /// ONCE (exactly-once ownership) and records the structured report
+    /// here. The controller does not run a second independent termination
+    /// backend: that produced duplicate cleanup (Drop cleanup issue) in
+    /// R4B 12/12.
+    pub fn set_cleanup_report(&mut self, report: &mida_core::cleanup::CleanupReport) {
+        if report.is_clean() {
+            self.cleanup = Some(CleanupResult::Ok);
+        } else {
+            let detail = report.summary();
+            self.cleanup = Some(CleanupResult::Failed(detail.clone()));
+            // Escalate to CleanupFailed when the explicit cleanup failed.
+            self.escalate_cleanup_failed(format!("explicit cleanup failed: {detail}"));
+        }
+    }
     /// Current lifecycle state.
     #[allow(dead_code)] // used by tests and ADR-4 wiring
     pub fn state(&self) -> ControllerState {
@@ -310,6 +386,13 @@ impl AntidebugController {
     /// controller does NOT rely on `Drop` warnings. Returns the cleanup
     /// result so callers can record it in evidence.
     fn run_cleanup(&mut self) -> CleanupResult {
+        // R1-HARDENING-CLEANUP-2: the production path injects the explicit
+        // cleanup report via set_cleanup_report() BEFORE run(). If a result
+        // is already recorded, reuse it and do NOT run a second independent
+        // termination backend (that produced duplicate cleanup in R4B).
+        if let Some(existing) = &self.cleanup {
+            return existing.clone();
+        }
         let Some(backend) = &self.options.cleanup_backend else {
             // No backend configured (pure test path): treat as not-run;
             // production always supplies one.

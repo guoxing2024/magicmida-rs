@@ -160,7 +160,7 @@ fn drain_lifecycle_thread_table_consistency() {
     // three classifications equals the number of ExitThread receipts.)
     let exit_receipts = receipts.iter().filter(|r| r.event_code == 4).count() as u64;
     let exit_classified = stats.exit_threads_removed
-        + stats.exit_short_lived_without_create_observation
+        + stats.exit_short_lived_with_create_observation
         + stats.unmatched_exit_threads;
     assert_eq!(
         exit_receipts, exit_classified,

@@ -127,6 +127,12 @@ pub struct WindowsDebugger {
     /// callers can audit the FULL loader window (warm-up + remote-call waits)
     /// instead of only the warm-up receipts. Reset by take_drain_receipts.
     drain_receipts: Vec<DrainReceipt>,
+    /// R1-HARDENING-CLEANUP-2: exactly-once explicit cleanup marker. Set by
+    /// [`Self::terminate_and_wait`] AFTER the target was terminated and the
+    /// wait signaled. `Drop` checks this flag and skips the terminate+wait
+    /// fallback so a successful explicit cleanup is never duplicated (no
+    /// second TerminateProcess, no Drop cleanup issue warning).
+    cleanup_done: bool,
 }
 
 impl WindowsDebugger {
@@ -170,6 +176,7 @@ impl WindowsDebugger {
             drain_stats: DrainStats::default(),
             drain_observed_create_tids: std::collections::HashSet::new(),
             drain_receipts: Vec::new(),
+            cleanup_done: false,
         };
 
         if opts.post_attach {
@@ -810,13 +817,26 @@ const DROP_TERMINATE_TIMEOUT_MS: u32 = 5000;
 
 impl Drop for WindowsDebugger {
     fn drop(&mut self) {
-        use windows::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
+        use windows::Win32::System::Diagnostics::Debug::DebugActiveProcessStop;
+        use windows::Win32::System::Threading::{
+            OpenProcess, TerminateProcess, WaitForSingleObject, PROCESS_TERMINATE,
+        };
 
         // A delivered debug event blocks the debuggee until ContinueDebugEvent.
         // Resolve it before termination so Drop never silently abandons a raw
         // pending event (especially ExitProcess, whose public enum omits TID).
+        // R1-HARDENING-CLEANUP-2: a pending EXCEPTION event (e.g. second-chance
+        // 0xc0000409 from the fail-closed drain path) MUST NOT be continued with
+        // DBG_CONTINUE - that would hide the fault. Forward it to the target
+        // dispatcher with DBG_EXCEPTION_NOT_HANDLED instead.
         if let Some(pending) = self.lifecycle.pending().copied() {
-            if let Err(error) = self.continue_pending(pending.thread_id, ContinueStatus::Continue) {
+            let status = if pending.debug_event_code == 1 {
+                // EXCEPTION_DEBUG_EVENT: never pretend the exception was handled.
+                ContinueStatus::ExceptionNotHandled
+            } else {
+                ContinueStatus::Continue
+            };
+            if let Err(error) = self.continue_pending(pending.thread_id, status) {
                 warn!(
                     pid = pending.process_id,
                     tid = pending.thread_id,
@@ -833,66 +853,140 @@ impl Drop for WindowsDebugger {
         // so `Drop` always performs `TerminateProcess` + bounded wait.  The
         // borrowed-attach / `DebugActiveProcessStop` detach path was removed:
         // it had no real caller and was dead code.
-        let report = match cleanup_action(self.ownership) {
-            CleanupAction::TerminateAndWait => {
-                if self.process.handle.is_invalid() {
-                    // Construction-midway-failure shape: handle not usable.
-                    let r = CleanupReport::for_construction_failure(self.ownership);
-                    warn!(
-                        pid = self.process.pid,
-                        summary = r.summary(),
-                        "Drop: process handle invalid 闁?cannot terminate owned target"
-                    );
-                    CleanupReport::for_terminate(
-                        self.ownership,
-                        false,
-                        None,
-                        WaitOutcome::Failed(6), // ERROR_INVALID_HANDLE
-                    )
-                } else {
-                    // SAFETY: TerminateProcess on a valid owned handle.
-                    let tp = unsafe { TerminateProcess(self.process.handle, 1) };
-                    let terminate_ok = tp.is_ok();
-                    let term_win32 = tp.err().map(|e| e.code().0 as u32);
-                    // SAFETY: bounded wait on the owned process handle.
-                    let wait_result = unsafe {
-                        WaitForSingleObject(self.process.handle, DROP_TERMINATE_TIMEOUT_MS)
-                    };
-                    let wait = match wait_result.0 {
-                        0 => WaitOutcome::Signaled,
-                        0x102 => WaitOutcome::Timeout, // WAIT_TIMEOUT
-                        _ => {
-                            // SAFETY: GetLastError for the failed wait.
-                            let code = unsafe { GetLastError() }.0;
-                            WaitOutcome::Failed(code)
-                        }
-                    };
-                    let report = CleanupReport::for_terminate(
-                        self.ownership,
-                        terminate_ok,
-                        term_win32,
-                        wait,
-                    );
-                    // Surface failures at warn! so they are not lost in a
-                    // debug!-only report.  Only full success uses debug!.
-                    if report.is_clean() {
-                        debug!(
-                            pid = self.process.pid,
-                            summary = report.summary(),
-                            "Drop: terminated owned target + bounded wait (clean)"
-                        );
-                    } else {
+        // R1-HARDENING-CLEANUP-2: a successful explicit cleanup (via
+        // terminate_and_wait) already terminated the target and waited for
+        // exit. Drop must NOT terminate again: that would produce a second
+        // TerminateProcess + a spurious Drop cleanup issue warning. Only
+        // close handles and delete the stub EXE below.
+        if !self.cleanup_done {
+            let report = match cleanup_action(self.ownership) {
+                CleanupAction::TerminateAndWait => {
+                    if self.process.handle.is_invalid() {
+                        // Construction-midway-failure shape: handle not usable.
+                        let r = CleanupReport::for_construction_failure(self.ownership);
                         warn!(
+                            pid = self.process.pid,
+                            summary = r.summary(),
+                            "Drop: process handle invalid 闁?cannot terminate owned target"
+                        );
+                        CleanupReport::for_terminate(
+                            self.ownership,
+                            false,
+                            None,
+                            WaitOutcome::Failed(6), // ERROR_INVALID_HANDLE
+                        )
+                    } else {
+                        // R1-HARDENING-CLEANUP-1: a protected target may revoke or
+                        // degrade the original CreateProcessW handle rights (observed:
+                        // TerminateProcess -> ERROR_ACCESS_DENIED 0x80070005 against
+                        // Themida targets). Re-open the process with PROCESS_TERMINATE
+                        // + SYNCHRONIZE so termination is not hostage to the original
+                        // handle's current rights.
+                        let mut term_handle = self.process.handle;
+                        let mut reopened = false;
+                        // SAFETY: OpenProcess with valid pid and minimal rights.
+                        let reopened_handle = unsafe {
+                            OpenProcess(
+                                PROCESS_TERMINATE
+                                    | windows::Win32::System::Threading::PROCESS_SYNCHRONIZE,
+                                false,
+                                self.process.pid,
+                            )
+                        };
+                        if let Ok(h) = reopened_handle {
+                            if !h.is_invalid() {
+                                term_handle = h;
+                                reopened = true;
+                            }
+                        }
+                        // SAFETY: TerminateProcess on a valid owned handle (or a
+                        // freshly re-opened handle with PROCESS_TERMINATE).
+                        let tp = unsafe { TerminateProcess(term_handle, 1) };
+                        let terminate_ok = tp.is_ok();
+                        let term_win32 = tp.err().map(|e| e.code().0 as u32);
+                        // If the re-opened handle worked, wait on it too; otherwise
+                        // fall back to the original handle (best effort).
+                        let wait_handle = if reopened {
+                            term_handle
+                        } else {
+                            self.process.handle
+                        };
+                        // SAFETY: bounded wait on the process handle.
+                        let wait_result =
+                            unsafe { WaitForSingleObject(wait_handle, DROP_TERMINATE_TIMEOUT_MS) };
+                        let mut wait = match wait_result.0 {
+                            0 => WaitOutcome::Signaled,
+                            0x102 => WaitOutcome::Timeout, // WAIT_TIMEOUT
+                            _ => {
+                                // SAFETY: GetLastError for the failed wait.
+                                let code = unsafe { GetLastError() }.0;
+                                WaitOutcome::Failed(code)
+                            }
+                        };
+                        // R1-HARDENING-CLEANUP-1: while the debugger is still
+                        // attached, the process handle does not become signaled even
+                        // after the target exits (observed: terminate wait TIMEOUT
+                        // against Themida targets whose process was already gone).
+                        // Detach the debug session, then re-wait on a fresh handle so
+                        // the wait reflects the real process state.
+                        if wait == WaitOutcome::Timeout {
+                            // SAFETY: DebugActiveProcessStop with our own pid.
+                            let _ = unsafe { DebugActiveProcessStop(self.process.pid) };
+                            // SAFETY: OpenProcess with minimal rights for the wait.
+                            let fresh = unsafe {
+                                OpenProcess(
+                                    windows::Win32::System::Threading::PROCESS_SYNCHRONIZE,
+                                    false,
+                                    self.process.pid,
+                                )
+                            };
+                            if let Ok(fh) = fresh {
+                                if !fh.is_invalid() {
+                                    // SAFETY: bounded wait on the fresh handle.
+                                    let r2 = unsafe {
+                                        WaitForSingleObject(fh, DROP_TERMINATE_TIMEOUT_MS)
+                                    };
+                                    wait = match r2.0 {
+                                        0 => WaitOutcome::Signaled,
+                                        0x102 => WaitOutcome::Timeout,
+                                        _ => WaitOutcome::Failed(unsafe { GetLastError() }.0),
+                                    };
+                                    // SAFETY: close the fresh handle.
+                                    let _ = unsafe { windows::Win32::Foundation::CloseHandle(fh) };
+                                }
+                            }
+                        }
+                        // SAFETY: close the re-opened handle if we created one.
+                        if reopened {
+                            let _ = unsafe { windows::Win32::Foundation::CloseHandle(term_handle) };
+                        }
+                        let report = CleanupReport::for_terminate(
+                            self.ownership,
+                            terminate_ok,
+                            term_win32,
+                            wait,
+                        );
+                        // Surface failures at warn! so they are not lost in a
+                        // debug!-only report.  Only full success uses debug!.
+                        if report.is_clean() {
+                            debug!(
+                                pid = self.process.pid,
+                                summary = report.summary(),
+                                "Drop: terminated owned target + bounded wait (clean)"
+                            );
+                        } else {
+                            warn!(
                             pid = self.process.pid,
                             summary = report.summary(),
                             "Drop: cleanup issue (terminate failed, wait timeout, or wait failed; on timeout the owned process may still be alive)"
                         );
+                        }
+                        report
                     }
-                    report
                 }
-            }
-        };
-        let _ = report; // diagnostics already emitted above.
+            };
+            let _ = report; // diagnostics already emitted above.
+        }
 
         // Close every registered thread handle EXCEPT the main thread.
         // The main-thread handle is owned by `self.process` and will be closed
@@ -947,6 +1041,10 @@ pub enum DrainDisposition {
     /// (ADR-5B-R1 F-001: unknown first-chance exceptions keep the target's
     /// own SEH disposition instead of being marked handled).
     ExceptionForwarded,
+    /// Second-chance exception in the drain window: fail-closed, NOT
+    /// continued with DBG_CONTINUE (the target's SEH gave up). The receipt
+    /// is retained for audit before the error is returned (F-009).
+    ExceptionFailedClosed,
 }
 
 /// Structured receipt for one debug event consumed by the drain path.
@@ -994,9 +1092,9 @@ pub struct DrainStats {
     /// ExitThread events whose TID was NOT registered AND the thread object
     /// still existed at exit time (bookkeeping gap; incremented for real).
     pub unmatched_exit_threads: u64,
-    /// ExitThread events that exited between two drain polls (created AND
-    /// exited without CREATE_THREAD observation; legal, verified short-lived).
-    pub exit_short_lived_without_create_observation: u64,
+    /// ExitThread events that exited between two drain polls (CREATE_THREAD
+    /// WAS observed in the drain window; legal, verified short-lived).
+    pub exit_short_lived_with_create_observation: u64,
     /// hFile close attempts (LOAD_DLL / CREATE_PROCESS).
     pub hfiles_close_attempted: u64,
     /// CloseHandle calls that succeeded.
@@ -2184,6 +2282,18 @@ impl WindowsDebugger {
             // hide a real failure. Fail closed, never DBG_CONTINUE it.
             if !first_chance {
                 self.drain_stats.exceptions_failed_closed += 1;
+                // F-009: retain the fail-closed receipt BEFORE returning the
+                // error so events_drained and receipts.len() stay
+                // explainable. The pending event is deliberately NOT
+                // continued here (never DBG_CONTINUE a second-chance); the
+                // caller resolves it via resolve_pending_for_cleanup() with
+                // DBG_EXCEPTION_NOT_HANDLED before terminating the target.
+                receipt.disposition = DrainDisposition::ExceptionFailedClosed;
+                receipt.continue_status = ContinueStatus::ExceptionNotHandled as u32;
+                receipt.bookkeeping = format!(
+                    "second-chance exception code={code:#x} first_chance=false (fail-closed, target SEH gave up; receipt retained, pending NOT continued)"
+                );
+                self.drain_receipts.push(receipt.clone());
                 return Err(CoreError::DebugState(format!(
                     "second-chance exception {code:#x} in drain window; refusing to continue (fail-closed, target SEH gave up)"
                 )));
@@ -2287,7 +2397,7 @@ impl WindowsDebugger {
                         receipt.bookkeeping = format!(
                             "thread {thread_id} short-lived: CREATE_THREAD observed in window, EXIT before next poll (legal)"
                         );
-                        self.drain_stats.exit_short_lived_without_create_observation += 1;
+                        self.drain_stats.exit_short_lived_with_create_observation += 1;
                     }
                     _ => {
                         // No handle AND no observed CREATE: genuine
@@ -2308,6 +2418,169 @@ impl WindowsDebugger {
     }
 
     /// Cumulative drain-path counters (ADR-5B-R1 audit surface).
+    /// Resolve a retained pending debug event before process termination
+    /// (R1-HARDENING-CLEANUP-1).
+    ///
+    /// A second-chance exception (or any other fail-closed drain error)
+    /// leaves the pending event UNCONTINUED: the debuggee is frozen by the
+    /// debugger until ContinueDebugEvent. Terminating a debuggee while a
+    /// pending event is not continued makes TerminateProcess/WaitForSingleObject
+    /// hang until the OS aborts the debug session. This method forwards the
+    /// pending event with DBG_EXCEPTION_NOT_HANDLED — never DBG_CONTINUE —
+    /// so the target's own (dying) disposition applies and the debug session
+    /// unwinds. Returns the pending thread id that was resolved, or None when
+    /// no pending event existed.
+    pub fn resolve_pending_for_cleanup(&mut self) -> Result<Option<u32>, CoreError> {
+        let Some(pending) = self.lifecycle.pending().copied() else {
+            return Ok(None);
+        };
+        // DBG_EXCEPTION_NOT_HANDLED: forward to the target's dispatcher
+        // instead of pretending the exception was handled (audit F-002/F-009
+        // forbid DBG_CONTINUE for second-chance / fail-closed paths).
+        self.continue_pending(pending.thread_id, ContinueStatus::ExceptionNotHandled)?;
+        Ok(Some(pending.thread_id))
+    }
+
+    /// R1-HARDENING-CLEANUP-2: explicit, exactly-once terminate + wait.
+    ///
+    /// Resolves any pending debug event (never DBG_CONTINUE for a
+    /// fail-closed second-chance path), terminates the owned target with a
+    /// freshly re-opened PROCESS_TERMINATE handle (immune to handle-right
+    /// revocation by the target), waits on a freshly re-opened
+    /// PROCESS_SYNCHRONIZE handle after detaching, and records the
+    /// structured result in a [`CleanupReport`].
+    ///
+    /// After a successful (clean) explicit cleanup, `Drop` observes
+    /// `cleanup_done == true` and skips the terminate+wait fallback: the
+    /// target is terminated exactly once. Returns the report so callers can
+    /// record cleanup_result in evidence.
+    pub fn terminate_and_wait(&mut self) -> CleanupReport {
+        use windows::Win32::System::Diagnostics::Debug::DebugActiveProcessStop;
+        use windows::Win32::System::Threading::{
+            OpenProcess, TerminateProcess, WaitForSingleObject, PROCESS_TERMINATE,
+        };
+
+        // Resolve a pending debug event first (never DBG_CONTINUE for a
+        // fail-closed / second-chance pending event).
+        if let Some(pending) = self.lifecycle.pending().copied() {
+            let status = if pending.debug_event_code == 1 {
+                // Second-chance or unknown exception: forward to the target
+                // dispatcher (F-002/F-009 forbid DBG_CONTINUE).
+                ContinueStatus::ExceptionNotHandled
+            } else {
+                ContinueStatus::Continue
+            };
+            if let Err(error) = self.continue_pending(pending.thread_id, status) {
+                warn!(
+                    pid = pending.process_id,
+                    tid = pending.thread_id,
+                    error = %error,
+                    "terminate_and_wait: failed to continue pending debug event; cleanup may leave debug port state"
+                );
+            }
+        }
+
+        let report = if self.process.handle.is_invalid() {
+            let r = CleanupReport::for_construction_failure(self.ownership);
+            warn!(
+                pid = self.process.pid,
+                summary = r.summary(),
+                "terminate_and_wait: process handle invalid - cannot terminate owned target"
+            );
+            r
+        } else {
+            // Re-open with PROCESS_TERMINATE | SYNCHRONIZE: immune to handle-
+            // right revocation by the protected target.
+            let mut term_handle = self.process.handle;
+            let mut reopened = false;
+            // SAFETY: OpenProcess with the target pid and minimal rights.
+            let reopened_handle = unsafe {
+                OpenProcess(
+                    PROCESS_TERMINATE | windows::Win32::System::Threading::PROCESS_SYNCHRONIZE,
+                    false,
+                    self.process.pid,
+                )
+            };
+            if let Ok(h) = reopened_handle {
+                if !h.is_invalid() {
+                    term_handle = h;
+                    reopened = true;
+                }
+            }
+            // SAFETY: TerminateProcess on a valid owned or freshly re-opened handle.
+            let tp = unsafe { TerminateProcess(term_handle, 1) };
+            let terminate_ok = tp.is_ok();
+            let term_win32 = tp.err().map(|e| e.code().0 as u32);
+            // Wait on the handle with terminate rights (re-opened or original).
+            let wait_handle = if reopened {
+                term_handle
+            } else {
+                self.process.handle
+            };
+            // SAFETY: bounded wait on the process handle.
+            let mut wait =
+                match unsafe { WaitForSingleObject(wait_handle, DROP_TERMINATE_TIMEOUT_MS) }.0 {
+                    0 => WaitOutcome::Signaled,
+                    0x102 => WaitOutcome::Timeout,
+                    _ => WaitOutcome::Failed(unsafe { GetLastError() }.0),
+                };
+            // While still attached the process handle may not signal even after
+            // exit; detach then re-wait on a fresh SYNCHRONIZE handle.
+            if wait == WaitOutcome::Timeout {
+                // SAFETY: DebugActiveProcessStop with our own pid.
+                let _ = unsafe { DebugActiveProcessStop(self.process.pid) };
+                // SAFETY: OpenProcess with minimal rights for the wait.
+                let fresh = unsafe {
+                    OpenProcess(
+                        windows::Win32::System::Threading::PROCESS_SYNCHRONIZE,
+                        false,
+                        self.process.pid,
+                    )
+                };
+                if let Ok(fh) = fresh {
+                    if !fh.is_invalid() {
+                        // SAFETY: bounded wait on the fresh handle.
+                        let r2 = unsafe { WaitForSingleObject(fh, DROP_TERMINATE_TIMEOUT_MS) };
+                        wait = match r2.0 {
+                            0 => WaitOutcome::Signaled,
+                            0x102 => WaitOutcome::Timeout,
+                            _ => WaitOutcome::Failed(unsafe { GetLastError() }.0),
+                        };
+                        // SAFETY: close the fresh handle.
+                        let _ = unsafe { windows::Win32::Foundation::CloseHandle(fh) };
+                    }
+                }
+            }
+            // SAFETY: close the re-opened handle if we created one.
+            if reopened {
+                let _ = unsafe { windows::Win32::Foundation::CloseHandle(term_handle) };
+            }
+            CleanupReport::for_terminate(self.ownership, terminate_ok, term_win32, wait)
+        };
+
+        if report.is_clean() {
+            self.cleanup_done = true;
+            debug!(
+                pid = self.process.pid,
+                summary = report.summary(),
+                "terminate_and_wait: terminated owned target + bounded wait (clean)"
+            );
+        } else {
+            warn!(
+                pid = self.process.pid,
+                summary = report.summary(),
+                "terminate_and_wait: cleanup issue (terminate failed, wait timeout, or wait failed; on timeout the owned process may still be alive)"
+            );
+        }
+        report
+    }
+
+    /// True after a clean explicit [`Self::terminate_and_wait`]. `Drop` uses
+    /// this to skip the terminate+wait fallback (exactly-once cleanup).
+    #[must_use]
+    pub fn cleanup_done(&self) -> bool {
+        self.cleanup_done
+    }
     pub fn drain_stats(&self) -> &DrainStats {
         &self.drain_stats
     }

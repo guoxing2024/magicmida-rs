@@ -327,6 +327,15 @@ impl RemoteThreadGuard {
     fn new(handle: windows::Win32::Foundation::HANDLE) -> Self {
         Self { handle }
     }
+
+    /// Take ownership of the raw handle out of the guard (F-011). The
+    /// caller becomes responsible for closing it; the guard forgets it so it
+    /// is not double-closed.
+    fn into_raw(self) -> windows::Win32::Foundation::HANDLE {
+        let h = self.handle;
+        std::mem::forget(self);
+        h
+    }
 }
 
 impl Drop for RemoteThreadGuard {
@@ -590,7 +599,10 @@ impl RuntimeLoader {
         arg: usize,
         deadline_secs: u64,
         drain: &mut dyn FnMut(u32) -> Result<Option<mida_core::DrainReceipt>, mida_core::CoreError>,
-    ) -> Result<RemoteCallResult, RuntimeLoadError> {
+    ) -> (
+        Result<RemoteCallResult, RuntimeLoadError>,
+        Option<windows::Win32::Foundation::HANDLE>,
+    ) {
         // SAFETY: caller contract: remote_fn is a valid target-address-space
         // function; arg points to target memory (or 0 for no argument).
         let thread = unsafe {
@@ -610,9 +622,12 @@ impl RuntimeLoader {
         let thread = match thread {
             Ok(t) => RemoteThreadGuard::new(t),
             Err(e) => {
-                return Err(RuntimeLoadError::RemoteThreadFailed(format!(
-                    "CreateRemoteThread: {e}"
-                )));
+                return (
+                    Err(RuntimeLoadError::RemoteThreadFailed(format!(
+                        "CreateRemoteThread: {e}"
+                    ))),
+                    None,
+                );
             }
         };
         // Bounded wait for the remote call to finish. When a drain callback
@@ -640,10 +655,16 @@ impl RuntimeLoader {
             let Some(wait_ms) = compute_wait_budget(deadline, 200) else {
                 // Handle closed by guard on return; remote memory is
                 // deliberately NOT freed (the thread may still run).
-                return Err(RuntimeLoadError::RemoteCallFailed(format!(
-                    "WaitForSingleObject timed out after {}ms; remote thread may still be running (thunk memory retained)",
-                    deadline_secs * 1000
-                )));
+                // F-011: the remote thread may still be running on timeout -
+                // hand the RAW handle back so the caller can wait for real
+                // completion before freeing retained memory.
+                return (
+                    Err(RuntimeLoadError::RemoteCallFailed(format!(
+                        "WaitForSingleObject timed out after {}ms; remote thread may still be running (thunk memory retained)",
+                        deadline_secs * 1000
+                    ))),
+                    Some(thread.into_raw()),
+                );
             };
             let wait_ms = wait_ms as u32;
             let wait = unsafe { WaitForSingleObject(thread.handle, wait_ms) }.0;
@@ -653,35 +674,58 @@ impl RuntimeLoader {
                     // Recompute the drain budget from the CURRENT remaining
                     // time (the wait above already consumed part of it).
                     let Some(drain_ms) = compute_wait_budget(deadline, 200) else {
-                        return Err(RuntimeLoadError::RemoteCallFailed(format!(
-                            "WaitForSingleObject timed out after {}ms; remote thread may still be running (thunk memory retained)",
-                            deadline_secs * 1000
-                        )));
+                        return (
+                            Err(RuntimeLoadError::RemoteCallFailed(format!(
+                                "WaitForSingleObject timed out after {}ms; remote thread may still be running (thunk memory retained)",
+                                deadline_secs * 1000
+                            ))),
+                            Some(thread.into_raw()),
+                        );
                     };
-                    drain(drain_ms as u32).map_err(|e| {
-                        RuntimeLoadError::RemoteCallFailed(format!("drain failed: {e}"))
-                    })?;
+                    if let Err(e) = drain(drain_ms as u32) {
+                        return (
+                            Err(RuntimeLoadError::RemoteCallFailed(format!(
+                                "drain failed: {e}"
+                            ))),
+                            Some(thread.into_raw()),
+                        );
+                    }
                 }
                 RemoteWaitOutcome::Abandoned => {
-                    return Err(RuntimeLoadError::RemoteCallFailed(
-                        "WaitForSingleObject returned WAIT_ABANDONED for a thread handle".into(),
-                    ));
+                    return (
+                        Err(RuntimeLoadError::RemoteCallFailed(
+                            "WaitForSingleObject returned WAIT_ABANDONED for a thread handle"
+                                .into(),
+                        )),
+                        Some(thread.into_raw()),
+                    );
                 }
                 RemoteWaitOutcome::WaitFailed(raw) => {
-                    return Err(RuntimeLoadError::RemoteCallFailed(format!(
-                        "WaitForSingleObject failed (0x{raw:08X})"
-                    )));
+                    return (
+                        Err(RuntimeLoadError::RemoteCallFailed(format!(
+                            "WaitForSingleObject failed (0x{raw:08X})"
+                        ))),
+                        Some(thread.into_raw()),
+                    );
                 }
             }
         }
         let mut code: u32 = 0;
         let gc = unsafe { GetExitCodeThread(thread.handle, &mut code) };
         if gc.is_err() {
-            return Err(RuntimeLoadError::RemoteCallFailed(
-                "GetExitCodeThread failed".to_string(),
-            ));
+            return (
+                Err(RuntimeLoadError::RemoteCallFailed(
+                    "GetExitCodeThread failed".to_string(),
+                )),
+                Some(thread.into_raw()),
+            );
         }
-        Ok(RemoteCallResult { exit_code: code })
+        // F-011: hand the RAW remote thread handle back to the caller so it
+        // can WaitForSingleObject(thread, INFINITE) to prove the thread truly
+        // finished before freeing retained memory. into_raw() transfers handle
+        // ownership to the caller (the guard forgets it, no double close).
+        let raw_handle = thread.into_raw();
+        (Ok(RemoteCallResult { exit_code: code }), Some(raw_handle))
     }
 
     /// Allocate executable memory in the target, write thunk + args, run.
@@ -804,7 +848,8 @@ impl RuntimeLoader {
         args: &ThunkArgs,
         drain: &mut dyn FnMut(u32) -> Result<Option<mida_core::DrainReceipt>, mida_core::CoreError>,
     ) -> Result<RemoteCallResult, RuntimeLoadError> {
-        self.thunk_call_tracked(target, args, 60, drain).0
+        self.thunk_call_tracked_with_handle(target, args, 60, drain)
+            .0
     }
 
     /// [`Self::thunk_call`] plus the actual remote thunk address, so tests can
@@ -813,6 +858,9 @@ impl RuntimeLoader {
     /// loader's thunk). Returns `(result, Some(remote_addr))`; the address is
     /// the `VirtualAllocEx` result even when the call fails (retained on
     /// timeout, freed on success/failure paths that free it).
+    /// Tracked variant without the raw thread handle (backward-compatible
+    /// wrapper). See [`Self::thunk_call_tracked_with_handle`].
+    #[allow(dead_code)]
     unsafe fn thunk_call_tracked(
         &self,
         target: HANDLE,
@@ -820,6 +868,27 @@ impl RuntimeLoader {
         deadline_secs: u64,
         drain: &mut dyn FnMut(u32) -> Result<Option<mida_core::DrainReceipt>, mida_core::CoreError>,
     ) -> (Result<RemoteCallResult, RuntimeLoadError>, Option<usize>) {
+        let (result, addr, handle) =
+            unsafe { self.thunk_call_tracked_with_handle(target, args, deadline_secs, drain) };
+        // Close the raw handle if one was returned (no double close: the
+        // guard was forgotten by into_raw).
+        if let Some(h) = handle {
+            // SAFETY: h is a valid owned handle from into_raw().
+            let _ = unsafe { windows::Win32::Foundation::CloseHandle(h) };
+        }
+        (result, addr)
+    }
+    unsafe fn thunk_call_tracked_with_handle(
+        &self,
+        target: HANDLE,
+        args: &ThunkArgs,
+        deadline_secs: u64,
+        drain: &mut dyn FnMut(u32) -> Result<Option<mida_core::DrainReceipt>, mida_core::CoreError>,
+    ) -> (
+        Result<RemoteCallResult, RuntimeLoadError>,
+        Option<usize>,
+        Option<windows::Win32::Foundation::HANDLE>,
+    ) {
         // 1. Allocate executable-capable memory for thunk + args.
         //    THUNK_BLOB_SIZE = 0x100 (VirtualAllocEx rounds to page
         //    granularity, so the code window + args region share one
@@ -838,6 +907,7 @@ impl RuntimeLoader {
                 Err(RuntimeLoadError::VirtualAllocFailed(
                     "VirtualAllocEx(thunk)".to_string(),
                 )),
+                None,
                 None,
             );
         }
@@ -865,6 +935,7 @@ impl RuntimeLoader {
                     w.err()
                 ))),
                 Some(remote as usize),
+                None,
             );
         }
         // 3. Make executable. THUNK_EXECUTABLE_SIZE (0x60) is the LOGICAL
@@ -890,6 +961,7 @@ impl RuntimeLoader {
                     vp.err()
                 ))),
                 Some(remote as usize),
+                None,
             );
         }
         // 4. Run: CreateRemoteThread(remote thunk, arg = remote + THUNK_ARGS_OFFSET).
@@ -899,7 +971,7 @@ impl RuntimeLoader {
         //    in place; it is released when the target process terminates.
         let thunk_addr = remote as usize;
         let args_addr = remote as usize + THUNK_ARGS_OFFSET;
-        let result = unsafe {
+        let (result, thread_handle) = unsafe {
             self.remote_call_raw_bounded(target, thunk_addr, args_addr, deadline_secs, drain)
         };
         match &result {
@@ -917,7 +989,9 @@ impl RuntimeLoader {
                 );
             }
         }
-        (result, Some(remote as usize))
+        // F-011: hand the RAW remote thread handle back so the caller can
+        // WaitForSingleObject(thread, INFINITE) before freeing retained memory.
+        (result, Some(remote as usize), thread_handle)
     }
 }
 impl RuntimeLoader {
@@ -1972,8 +2046,10 @@ mod timeout_harness {
         // F-005: call the REAL thunk_call path (allocation + write + protect
         // + remote thread + wait). The tracked variant reports the ACTUAL
         // VirtualAllocEx address so we can probe the real thunk.
-        let (result, thunk_addr) =
-            unsafe { loader.thunk_call_tracked(target, &args, 1, &mut noop_drain) };
+        // F-011: also return the RAW remote thread handle so completion can
+        // be proven with WaitForSingleObject instead of a sleep estimate.
+        let (result, thunk_addr, thread_handle) =
+            unsafe { loader.thunk_call_tracked_with_handle(target, &args, 1, &mut noop_drain) };
         let elapsed = t0.elapsed();
         assert!(
             matches!(result, Err(RuntimeLoadError::RemoteCallFailed(_))),
@@ -2009,9 +2085,18 @@ mod timeout_harness {
             mbi.State
         );
 
-        // Let the slow Sleep(5s) finish, then the retained thunk can be
-        // released safely (the remote thread is truly done).
-        std::thread::sleep(Duration::from_millis((slow_ms + 700) as u64));
+        // F-011: prove the remote thread truly finished by waiting on the
+        // REAL thread handle (replaces the previous sleep-based estimate).
+        let thread_handle = thread_handle.expect("with_handle must report the thread handle");
+        // SAFETY: thread_handle is the valid CreateRemoteThread result from
+        // thunk_call_tracked_with_handle; we only wait, then close it.
+        let wait = unsafe { WaitForSingleObject(thread_handle, u32::MAX) };
+        assert_eq!(
+            wait.0, 0,
+            "remote thread must signal after Sleep(5s) finishes"
+        );
+        // SAFETY: close the raw handle we own (into_raw transferred it).
+        let _ = unsafe { windows::Win32::Foundation::CloseHandle(thread_handle) };
 
         // ADR-5B-R3 (audit round 2): "thread returns safely" proof.
         // VirtualFreeEx on a page that a thread is STILL executing fails with
