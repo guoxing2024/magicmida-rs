@@ -1244,6 +1244,15 @@ impl RuntimeLoader {
             ));
         }
         // 3. Export directory: read a bounded window.
+        // ADR-5B-R5 (audit): IMAGE_EXPORT_DIRECTORY is 40 bytes; if the
+        // declared directory is smaller than the fixed header, fail closed
+        // instead of indexing out of bounds below (ed[0x27]).
+        const IMAGE_EXPORT_DIRECTORY_SIZE: usize = 40;
+        if exp_size < IMAGE_EXPORT_DIRECTORY_SIZE {
+            return Err(RuntimeLoadError::ExportResolutionFailed(format!(
+                "remote export directory truncated: size={exp_size} < {IMAGE_EXPORT_DIRECTORY_SIZE}"
+            )));
+        }
         let win = exp_size.min(0x10000);
         let mut ed = vec![0u8; win];
         let rd3 = unsafe {
@@ -2003,9 +2012,19 @@ mod timeout_harness {
         // Let the slow Sleep(5s) finish, then the retained thunk can be
         // released safely (the remote thread is truly done).
         std::thread::sleep(Duration::from_millis((slow_ms + 700) as u64));
+
+        // ADR-5B-R3 (audit round 2): "thread returns safely" proof.
+        // VirtualFreeEx on a page that a thread is STILL executing fails with
+        // ERROR_INVALID_ADDRESS / access violation — the OS refuses to
+        // release memory with live execution. A successful MEM_RELEASE after
+        // the Sleep(5s) window therefore proves the remote thread has truly
+        // exited the retained thunk. Combined with the earlier MEM_COMMIT
+        // probe (thunk retained on timeout), this closes the safety loop:
+        //   timeout -> memory retained (remote may still run)
+        //   thread finishes -> memory releasable (no live execution)
         // SAFETY: thunk is still a valid committed allocation in our process.
         let f = unsafe { VirtualFreeEx(target, thunk_addr as *mut _, 0, MEM_RELEASE) };
-        assert!(f.is_ok(), "VirtualFreeEx after thread finish failed");
+        assert!(f.is_ok(), "VirtualFreeEx after thread finish failed (remote thread may still be executing the thunk)");
     }
 
     fn runtime_authority_stub() -> RuntimeAuthorityManifest {

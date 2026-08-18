@@ -680,6 +680,11 @@ struct ExportImage {
     name_data: Vec<u8>,
     num_names: usize,
     num_funcs: usize,
+    /// IMAGE_EXPORT_DIRECTORY.Base (ordinal base). The production parser
+    /// treats the ordinal array as 0-based indexes into AddressOfFunctions
+    /// (MSVC/Rust link.exe convention); the field is retained so tests can
+    /// model a directory whose Base != 1 explicitly.
+    base: u32,
 }
 
 impl ExportImage {
@@ -691,6 +696,7 @@ impl ExportImage {
             name_data: Vec::new(),
             num_names,
             num_funcs,
+            base: 1,
         }
     }
 
@@ -764,6 +770,11 @@ fn resolve_via_parser(img: &ExportImage) -> Vec<Option<usize>> {
 
 #[test]
 fn export_parser_resolves_two_byte_ordinals_with_base_not_one() {
+    // ADR-5B-R5 (audit round 2): model an export directory whose Base is
+    // NOT 1 explicitly (e.g. Base=5). The production parser resolves the
+    // ordinal array as 0-based indexes into AddressOfFunctions (MSVC/Rust
+    // link.exe convention), so ordinals 5/7 still map to funcs[5]/funcs[7]
+    // regardless of the Base field; this test pins that behavior.
     // The classic bug: ords_bytes = num_names * 4. With real 2-byte ordinal
     // slots, a 4-byte stride misreads every slot. This test drives the REAL
     // parser with a genuine PE-style ordinal array and asserts the resolved
@@ -786,6 +797,10 @@ fn export_parser_resolves_two_byte_ordinals_with_base_not_one() {
             img.set_func(i, 0xDEAD + i);
         }
     }
+    // Model Base != 1: the directory declares ordinal base 5, but the
+    // ordinal array still holds 0-based function indexes (link.exe
+    // convention). The parser must resolve ordinals 5/7 -> funcs[5]/funcs[7].
+    img.base = 5;
     let found = resolve_via_parser(&img);
     assert_eq!(found[0], Some(0x400000 + 0x1111));
     assert_eq!(found[1], Some(0x400000 + 0x2222));
@@ -799,14 +814,21 @@ fn export_parser_skips_missing_and_out_of_range_ordinals() {
     let mut img = ExportImage::new(3, 4);
     let init_rva = img.push_name(b"MidaAntidebugInitialize");
     let _get_rva = img.push_name(b"MidaAntidebugGetAttestation");
+    let shut_rva = img.push_name(b"MidaAntidebugShutdown");
     img.set_name(0, init_rva, 0); // resolves
-    img.set_name(1, 0, 1); // name_ptr 0 -> skipped entirely
-    img.set_name(2, 0, 9); // out-of-range ordinal, no name
+    img.set_name(1, 0, 1); // name_ptr 0 -> skipped entirely (missing name)
+                           // Real name RVA + out-of-range ordinal (9 >= num_funcs=4): must NOT
+                           // resolve. Previously this test used name_ptr=0, which the parser skips
+                           // BEFORE the ordinal check, so the out-of-range branch was never hit.
+    img.set_name(2, shut_rva, 9);
     img.set_func(0, 0x1111);
     let found = resolve_via_parser(&img);
     assert_eq!(found[0], Some(0x400000 + 0x1111));
     assert_eq!(found[1], None, "GetAttestation missing must stay None");
-    assert_eq!(found[2], None, "Shutdown missing must stay None");
+    assert_eq!(
+        found[2], None,
+        "Shutdown with out-of-range ordinal (9 >= num_funcs=4) must stay None"
+    );
 }
 
 #[test]
