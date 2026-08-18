@@ -1131,7 +1131,7 @@ pub fn unpack(
                         log::log(
                             LogType::Info,
                             &format!(
-                                "drain receipt: seq={} pid={} tid={} code={} disp={:?} cont=0x{:08X} exc={:?} first={:?} bk={}",
+                                "drain receipt: seq={} pid={} tid={} code={} disp={:?} cont=0x{:08X} exc={:?} first={:?} exc_addr={:?} rip={:?} rsp={:?} module={:?} mod_base={:?} mod_rva={:?} ctx_err={:?} bk={}",
                                 r.sequence,
                                 r.process_id,
                                 r.thread_id,
@@ -1140,6 +1140,13 @@ pub fn unpack(
                                 r.continue_status,
                                 r.exception_code.map(|c| format!("{c:#x}")),
                                 r.first_chance,
+                                r.exception_address.map(|a| format!("{a:#x}")),
+                                r.instruction_pointer.map(|a| format!("{a:#x}")),
+                                r.stack_pointer.map(|a| format!("{a:#x}")),
+                                r.faulting_module.as_deref(),
+                                r.faulting_module_base.map(|b| format!("{b:#x}")),
+                                r.faulting_module_rva.map(|v| format!("{v:#x}")),
+                                r.context_capture_error.as_deref(),
                                 r.bookkeeping,
                             ),
                         );
@@ -1155,6 +1162,17 @@ pub fn unpack(
                     // issue warning). The structured report is injected into
                     // the controller for evidence.
                     let cleanup_report = dbg.terminate_and_wait();
+                    // ADR-7-A-CAPTURE-1: bind the last exception capture
+                    // receipt into the controller so the failure evidence
+                    // sidecar carries the full exception/module context
+                    // (address, RIP/RSP, module base/RVA) - not just stdout.
+                    if let Some(last_exc) = all_drain_receipts
+                        .iter()
+                        .rev()
+                        .find(|r| r.exception_address.is_some())
+                    {
+                        ad_controller.set_capture_receipt(last_exc.clone());
+                    }
                     ad_controller.set_cleanup_report(&cleanup_report);
                     log::log(
                         LogType::Info,

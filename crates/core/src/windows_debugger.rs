@@ -23,6 +23,8 @@ use windows::Win32::System::Diagnostics::Debug::{
 use windows::Win32::System::Diagnostics::Debug::{
     CONTEXT_ALL_X86, CONTEXT_CONTROL_X86, CONTEXT_DEBUG_REGISTERS_X86, CONTEXT_INTEGER_X86,
 };
+use windows::Win32::System::Memory::{VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_IMAGE};
+use windows::Win32::System::ProcessStatus::GetMappedFileNameW;
 use windows::Win32::System::Threading::INFINITE;
 
 use crate::breakpoint::{HwBreakpoint, HwbpType};
@@ -1073,6 +1075,29 @@ pub struct DrainReceipt {
     pub exception_code: Option<u32>,
     /// dwFirstChance flag for EXCEPTION events.
     pub first_chance: Option<bool>,
+    /// ADR-7-A-CAPTURE-1: address of the faulting instruction from
+    /// `EXCEPTION_RECORD.ExceptionAddress`. Captured for EXCEPTION events in
+    /// the drain window; None when the event was not an exception or capture
+    /// was not attempted.
+    pub exception_address: Option<u64>,
+    /// ADR-7-A-CAPTURE-1: RIP at the moment of the exception (x64), from the
+    /// real thread context. None when the event was not an exception or the
+    /// context capture failed.
+    pub instruction_pointer: Option<u64>,
+    /// ADR-7-A-CAPTURE-1: RSP at the moment of the exception (x64), from the
+    /// real thread context. None when the event was not an exception or the
+    /// context capture failed.
+    pub stack_pointer: Option<u64>,
+    /// ADR-7-A-CAPTURE-1: module that contains the exception address, resolved
+    /// via the target's mapped-module table. Formatted `name` (base file
+    /// name); None when unresolvable (e.g. JIT/unmapped memory).
+    pub faulting_module: Option<String>,
+    pub faulting_module_base: Option<u64>,
+    pub faulting_module_rva: Option<u64>,
+    /// ADR-7-A-CAPTURE-1: reason the exception context/module capture failed,
+    /// when it did. None means capture succeeded or was not attempted.
+    /// A capture failure NEVER drops the original exception receipt.
+    pub context_capture_error: Option<String>,
 }
 
 /// Cumulative counters for the drain path (ADR-5B-R1).
@@ -2189,6 +2214,97 @@ impl WindowsDebugger {
         }
     }
 
+    /// ADR-7-A-CAPTURE-1: resolve the mapped module that contains `address`
+    /// in the target. Uses `VirtualQueryEx` to find the allocation base, then
+    /// `GetMappedFileNameW` for the base file name. Returns None when the
+    /// address is not in a mapped image (JIT heap, guard page, unmapped).
+    /// A resolution failure NEVER aborts the caller: the error is surfaced as
+    /// a `context_capture_error` string, never as a hard failure.
+    fn resolve_module_for_address(&self, address: u64) -> Result<Option<(String, u64)>, String> {
+        if address == 0 {
+            return Ok(None);
+        }
+        let mut mbi = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: process handle is valid; mbi is a writable out-param.
+        let vq = unsafe {
+            VirtualQueryEx(
+                self.process.handle,
+                Some(address as *const core::ffi::c_void),
+                &mut mbi,
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>() as usize,
+            )
+        };
+        if vq == 0 {
+            return Err(format!("VirtualQueryEx failed for {address:#x}"));
+        }
+        // Only image-backed regions carry a module name; a committed private
+        // region (MEM_PRIVATE) is not a module.
+        if mbi.Type != MEM_IMAGE {
+            return Ok(None);
+        }
+        let base = mbi.AllocationBase as *const core::ffi::c_void;
+        let mut buf = [0u16; 512];
+        // SAFETY: process handle is valid; buf is a writable out-buffer.
+        let n = unsafe { GetMappedFileNameW(self.process.handle, base, &mut buf) };
+        if n == 0 {
+            return Err(format!("GetMappedFileNameW failed for base {base:p}"));
+        }
+        let name = String::from_utf16_lossy(&buf[..n as usize]);
+        // Normalize: keep the base file name (after the last backslash).
+        let parts: Vec<&str> = name.split('\\').collect();
+        let base_name = parts.last().copied().unwrap_or(&name);
+        Ok(Some((base_name.to_string(), base as u64)))
+    }
+
+    /// ADR-7-A-CAPTURE-1: capture the exception context for a TID: the raw
+    /// exception address, RIP/RSP from the real thread context, and the
+    /// faulting module. Failures are collected into `context_capture_error`
+    /// (never fatal); the caller always keeps the original exception receipt.
+    fn capture_exception_context(
+        &self,
+        thread_id: u32,
+        exception_address: u64,
+        receipt: &mut DrainReceipt,
+    ) {
+        receipt.exception_address = Some(exception_address);
+        // Thread context (RIP/RSP). Failures are recorded, never fatal.
+        match self.get_thread_context_control_integer(thread_id) {
+            Ok(ctx) => {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    receipt.instruction_pointer = Some(ctx.Rip as u64);
+                    receipt.stack_pointer = Some(ctx.Rsp as u64);
+                }
+                #[cfg(target_arch = "x86")]
+                {
+                    receipt.instruction_pointer = Some(ctx.Eip as u64);
+                    receipt.stack_pointer = Some(ctx.Esp as u64);
+                }
+            }
+            Err(e) => {
+                receipt.context_capture_error =
+                    Some(format!("GetThreadContext failed for tid {thread_id}: {e}"));
+            }
+        }
+        // Module resolution (best effort; failure recorded, never fatal).
+        match self.resolve_module_for_address(exception_address) {
+            Ok(Some((m, base_addr))) => {
+                receipt.faulting_module = Some(m);
+                receipt.faulting_module_base = Some(base_addr);
+                receipt.faulting_module_rva = exception_address.checked_sub(base_addr);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                let prev = receipt
+                    .context_capture_error
+                    .get_or_insert_with(String::new);
+                if !prev.is_empty() {
+                    prev.push_str("; ");
+                }
+                prev.push_str(&e);
+            }
+        }
+    }
     /// Consume at most one debug event with full lifecycle bookkeeping
     /// (ADR-5B-R1). Used by the loader window to keep the debug session alive
     /// while a remote thread runs: every event passes through the same
@@ -2232,6 +2348,13 @@ impl WindowsDebugger {
             bookkeeping: String::new(),
             exception_code: None,
             first_chance: None,
+            exception_address: None,
+            instruction_pointer: None,
+            stack_pointer: None,
+            faulting_module: None,
+            faulting_module_base: None,
+            faulting_module_rva: None,
+            context_capture_error: None,
         };
 
         match DebugEventLifecycle::disposition_for_event_code(event_code) {
@@ -2273,6 +2396,12 @@ impl WindowsDebugger {
             let first_chance = exc.dwFirstChance != 0;
             receipt.exception_code = Some(code);
             receipt.first_chance = Some(first_chance);
+            // ADR-7-A-CAPTURE-1: capture exception address + real thread
+            // context (RIP/RSP) + faulting module. Capture failures are
+            // recorded in context_capture_error, NEVER fatal, and NEVER drop
+            // the original exception receipt. Continuation policy unchanged.
+            let exception_address = exc.ExceptionRecord.ExceptionAddress as u64;
+            self.capture_exception_context(thread_id, exception_address, &mut receipt);
             self.drain_stats.events_drained += 1;
             self.drain_stats.last_sequence = sequence;
             // Audit F-002: SECOND-CHANCE check comes FIRST, before the
@@ -3032,5 +3161,271 @@ mod tests {
             classify_thread_wait(WAIT_ABANDONED),
             ThreadWaitClass::Unexpected
         );
+    }
+    // ------------------------------------------------------------------
+    // ADR-7-A-CAPTURE-1: synthetic capture tests (no real debug session).
+    // These exercise the module resolver and the exception-context capture
+    // against the CURRENT process, which is a real Windows process with
+    // mapped images (kernel32/ntdll) and a real current thread. They prove:
+    //   - module hit: exception address inside kernel32 resolves to a name;
+    //   - unknown module: unmapped address yields None (not an error);
+    //   - capture success: RIP/RSP are populated from a real context;
+    //   - capture failure: a bogus TID yields context_capture_error, and the
+    //     receipt still carries the exception address (never dropped);
+    //   - second-chance receipts retain the new fields end-to-end.
+    // ------------------------------------------------------------------
+    #[test]
+    fn module_resolver_hits_real_mapped_image() {
+        use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+        // kernel32!Sleep is inside a mapped image in this process.
+        let h = unsafe {
+            GetModuleHandleW(windows::core::PCWSTR(
+                "kernel32.dll\0".encode_utf16().collect::<Vec<_>>().as_ptr(),
+            ))
+        }
+        .expect("kernel32 must be loaded in this process");
+        let addr = unsafe { GetProcAddress(h, windows::core::PCSTR(b"Sleep\0".as_ptr())) }
+            .expect("Sleep must exist in kernel32") as u64;
+        assert!(addr != 0);
+        let target = TargetProcess {
+            handle: unsafe { windows::Win32::System::Threading::GetCurrentProcess() },
+            pid: std::process::id(),
+            main_thread_id: 0,
+            main_thread_handle: windows::Win32::Foundation::HANDLE::default(),
+            image_base: 0,
+            stub_exe: None,
+        };
+        let dbg = WindowsDebugger {
+            process: target,
+            hw_breakpoints: Default::default(),
+            soft_breakpoints: HashMap::new(),
+            threads: HashMap::new(),
+            ownership: ProcessOwnership::OwnedLaunch,
+            post_attach_resumed: false,
+            lifecycle: DebugEventLifecycle::new(0),
+            drain_stats: DrainStats::default(),
+            drain_observed_create_tids: std::collections::HashSet::new(),
+            drain_receipts: Vec::new(),
+            cleanup_done: false,
+        };
+        let resolved = dbg
+            .resolve_module_for_address(addr)
+            .expect("resolve must not fail");
+        let (name, base_addr) = resolved.expect("kernel32 address must resolve to a module");
+        assert!(
+            addr >= base_addr,
+            "exception address must be inside kernel32"
+        );
+        assert!(
+            name.to_ascii_lowercase().contains("kernel32"),
+            "expected kernel32, got {name}"
+        );
+    }
+
+    #[test]
+    fn module_resolver_unknown_address_returns_none() {
+        // 0x1 is unmapped (page 0) in any sane process: not a module.
+        let target = TargetProcess {
+            handle: unsafe { windows::Win32::System::Threading::GetCurrentProcess() },
+            pid: std::process::id(),
+            main_thread_id: 0,
+            main_thread_handle: windows::Win32::Foundation::HANDLE::default(),
+            image_base: 0,
+            stub_exe: None,
+        };
+        let dbg = WindowsDebugger {
+            process: target,
+            hw_breakpoints: Default::default(),
+            soft_breakpoints: HashMap::new(),
+            threads: HashMap::new(),
+            ownership: ProcessOwnership::OwnedLaunch,
+            post_attach_resumed: false,
+            lifecycle: DebugEventLifecycle::new(0),
+            drain_stats: DrainStats::default(),
+            drain_observed_create_tids: std::collections::HashSet::new(),
+            drain_receipts: Vec::new(),
+            cleanup_done: false,
+        };
+        let resolved = dbg
+            .resolve_module_for_address(0x1)
+            .expect("resolve must not fail");
+        assert!(
+            resolved.is_none(),
+            "address 0x1 must not resolve to a module"
+        );
+    }
+
+    #[test]
+    fn capture_success_populates_rip_rsp_and_module() {
+        use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+        use windows::Win32::System::Threading::GetCurrentThreadId;
+        let h = unsafe {
+            GetModuleHandleW(windows::core::PCWSTR(
+                "kernel32.dll\0".encode_utf16().collect::<Vec<_>>().as_ptr(),
+            ))
+        }
+        .expect("kernel32 must be loaded");
+        let addr = unsafe { GetProcAddress(h, windows::core::PCSTR(b"Sleep\0".as_ptr())) }
+            .expect("Sleep must exist") as u64;
+        let target = TargetProcess {
+            handle: unsafe { windows::Win32::System::Threading::GetCurrentProcess() },
+            pid: std::process::id(),
+            main_thread_id: 0,
+            main_thread_handle: windows::Win32::Foundation::HANDLE::default(),
+            image_base: 0,
+            stub_exe: None,
+        };
+        let dbg = WindowsDebugger {
+            process: target,
+            hw_breakpoints: Default::default(),
+            soft_breakpoints: HashMap::new(),
+            threads: HashMap::new(),
+            ownership: ProcessOwnership::OwnedLaunch,
+            post_attach_resumed: false,
+            lifecycle: DebugEventLifecycle::new(0),
+            drain_stats: DrainStats::default(),
+            drain_observed_create_tids: std::collections::HashSet::new(),
+            drain_receipts: Vec::new(),
+            cleanup_done: false,
+        };
+        let mut receipt = DrainReceipt {
+            sequence: 1,
+            process_id: 0,
+            thread_id: unsafe { GetCurrentThreadId() },
+            event_code: 1,
+            disposition: DrainDisposition::ExceptionFailedClosed,
+            continue_status: 0,
+            bookkeeping: String::new(),
+            exception_code: Some(0xc0000409),
+            first_chance: Some(false),
+            exception_address: None,
+            instruction_pointer: None,
+            stack_pointer: None,
+            faulting_module: None,
+            faulting_module_base: None,
+            faulting_module_rva: None,
+            context_capture_error: None,
+        };
+        dbg.capture_exception_context(receipt.thread_id, addr, &mut receipt);
+        assert_eq!(
+            receipt.exception_address,
+            Some(addr),
+            "exception address must be set"
+        );
+        assert!(
+            receipt.instruction_pointer.is_some(),
+            "RIP must be captured"
+        );
+        assert!(receipt.stack_pointer.is_some(), "RSP must be captured");
+        let m = receipt
+            .faulting_module
+            .as_deref()
+            .expect("module must resolve");
+        assert!(
+            m.to_ascii_lowercase().contains("kernel32"),
+            "expected kernel32, got {m}"
+        );
+        assert!(receipt.context_capture_error.is_none(), "no error expected");
+        assert!(
+            receipt.faulting_module_base.is_some(),
+            "module base must be captured"
+        );
+        assert!(
+            receipt.faulting_module_rva.is_some(),
+            "module RVA must be derived from exception address"
+        );
+        let base = receipt.faulting_module_base.expect("base");
+        assert!(addr >= base, "exception address must be inside the module");
+    }
+
+    #[test]
+    fn capture_failure_records_error_but_keeps_receipt() {
+        // A bogus TID (huge, never valid) makes GetThreadContext fail.
+        let target = TargetProcess {
+            handle: unsafe { windows::Win32::System::Threading::GetCurrentProcess() },
+            pid: std::process::id(),
+            main_thread_id: 0,
+            main_thread_handle: windows::Win32::Foundation::HANDLE::default(),
+            image_base: 0,
+            stub_exe: None,
+        };
+        let dbg = WindowsDebugger {
+            process: target,
+            hw_breakpoints: Default::default(),
+            soft_breakpoints: HashMap::new(),
+            threads: HashMap::new(),
+            ownership: ProcessOwnership::OwnedLaunch,
+            post_attach_resumed: false,
+            lifecycle: DebugEventLifecycle::new(0),
+            drain_stats: DrainStats::default(),
+            drain_observed_create_tids: std::collections::HashSet::new(),
+            drain_receipts: Vec::new(),
+            cleanup_done: false,
+        };
+        let mut receipt = DrainReceipt {
+            sequence: 2,
+            process_id: 0,
+            thread_id: 0xFFFF_FFFF, // invalid TID
+            event_code: 1,
+            disposition: DrainDisposition::ExceptionFailedClosed,
+            continue_status: 0,
+            bookkeeping: String::new(),
+            exception_code: Some(0xc0000005),
+            first_chance: Some(false),
+            exception_address: None,
+            instruction_pointer: None,
+            stack_pointer: None,
+            faulting_module: None,
+            faulting_module_base: None,
+            faulting_module_rva: None,
+            context_capture_error: None,
+        };
+        dbg.capture_exception_context(receipt.thread_id, 0x1, &mut receipt);
+        assert_eq!(
+            receipt.exception_address,
+            Some(0x1),
+            "exception address retained"
+        );
+        assert!(
+            receipt.context_capture_error.is_some(),
+            "capture failure must be recorded, not swallowed"
+        );
+        // The receipt is intact: the original fields are untouched.
+        assert_eq!(receipt.exception_code, Some(0xc0000005));
+        assert_eq!(receipt.first_chance, Some(false));
+    }
+
+    #[test]
+    fn second_chance_receipt_retains_capture_fields() {
+        // End-to-end shape: a second-chance receipt carries all capture
+        // fields without losing the original exception identity.
+        use windows::Win32::System::Threading::GetCurrentThreadId;
+        let tid = unsafe { GetCurrentThreadId() };
+        let receipt = DrainReceipt {
+            sequence: 3,
+            process_id: 0,
+            thread_id: tid,
+            event_code: 1,
+            disposition: DrainDisposition::ExceptionFailedClosed,
+            continue_status: ContinueStatus::ExceptionNotHandled as u32,
+            bookkeeping: "second-chance exception code=0xc0000409 first_chance=false (fail-closed)"
+                .to_string(),
+            exception_code: Some(0xc0000409),
+            first_chance: Some(false),
+            exception_address: Some(0x140001000),
+            instruction_pointer: Some(0x140001000),
+            stack_pointer: Some(0x1000),
+            faulting_module: Some("sample.exe".to_string()),
+            faulting_module_base: Some(0x140000000),
+            faulting_module_rva: Some(0x1000),
+            context_capture_error: None,
+        };
+        assert_eq!(receipt.disposition, DrainDisposition::ExceptionFailedClosed);
+        assert_eq!(receipt.exception_code, Some(0xc0000409));
+        assert_eq!(receipt.exception_address, Some(0x140001000));
+        assert_eq!(receipt.instruction_pointer, Some(0x140001000));
+        assert_eq!(receipt.stack_pointer, Some(0x1000));
+        assert_eq!(receipt.faulting_module.as_deref(), Some("sample.exe"));
+        assert!(receipt.context_capture_error.is_none());
     }
 }

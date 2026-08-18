@@ -953,6 +953,13 @@ fn drain_receipt_defaults_are_sane() {
         bookkeeping: "hFile closed".to_string(),
         exception_code: None,
         first_chance: None,
+        exception_address: None,
+        instruction_pointer: None,
+        stack_pointer: None,
+        faulting_module: None,
+        faulting_module_base: None,
+        faulting_module_rva: None,
+        context_capture_error: None,
     };
     assert_eq!(r.sequence, 1);
     assert_eq!(r.process_id, 100);

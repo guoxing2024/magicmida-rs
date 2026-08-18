@@ -249,6 +249,18 @@ pub struct AntidebugFailureEvidence {
     pub cleanup_result: String,
     pub cleanup_detail: Option<String>,
     pub candidate_created: bool,
+    /// ADR-7-A-CAPTURE-1: exception capture context from the drain window.
+    /// Null when no exception receipt was captured (e.g. dependency-stage
+    /// failures before any debug event).
+    pub exception_code: Option<u32>,
+    pub first_chance: Option<bool>,
+    pub exception_address: Option<String>,
+    pub instruction_pointer: Option<String>,
+    pub stack_pointer: Option<String>,
+    pub faulting_module: Option<String>,
+    pub faulting_module_base: Option<String>,
+    pub faulting_module_rva: Option<String>,
+    pub context_capture_error: Option<String>,
 }
 
 /// Options for the anti-debug stage.
@@ -314,6 +326,11 @@ pub struct AntidebugController {
     profile: Option<Profile>,
     /// Cleanup outcome from the most recent run(); recorded in evidence.
     cleanup: Option<CleanupResult>,
+    /// ADR-7-A-CAPTURE-1: last exception capture receipt from the drain
+    /// window (exception_address, RIP/RSP, module base/RVA). Recorded in
+    /// the failure evidence sidecar when present; None when no exception
+    /// receipt was captured.
+    capture_receipt: Option<mida_core::DrainReceipt>,
 }
 
 impl AntidebugController {
@@ -324,7 +341,15 @@ impl AntidebugController {
             options,
             profile: None,
             cleanup: None,
+            capture_receipt: None,
         }
+    }
+
+    /// ADR-7-A-CAPTURE-1: record the last exception capture receipt from
+    /// the drain window so the failure evidence sidecar can carry the
+    /// full exception/module context (address, RIP/RSP, module base/RVA).
+    pub fn set_capture_receipt(&mut self, receipt: mida_core::DrainReceipt) {
+        self.capture_receipt = Some(receipt);
     }
 
     /// Inject the loader result (ADR-6). Called by the CREATE_PROCESS
@@ -669,6 +694,41 @@ impl AntidebugController {
                 _ => None,
             },
             candidate_created: false,
+            exception_code: self.capture_receipt.as_ref().and_then(|r| r.exception_code),
+            first_chance: self.capture_receipt.as_ref().and_then(|r| r.first_chance),
+            exception_address: self
+                .capture_receipt
+                .as_ref()
+                .and_then(|r| r.exception_address)
+                .map(|a| format!("{a:#x}")),
+            instruction_pointer: self
+                .capture_receipt
+                .as_ref()
+                .and_then(|r| r.instruction_pointer)
+                .map(|a| format!("{a:#x}")),
+            stack_pointer: self
+                .capture_receipt
+                .as_ref()
+                .and_then(|r| r.stack_pointer)
+                .map(|a| format!("{a:#x}")),
+            faulting_module: self
+                .capture_receipt
+                .as_ref()
+                .and_then(|r| r.faulting_module.clone()),
+            faulting_module_base: self
+                .capture_receipt
+                .as_ref()
+                .and_then(|r| r.faulting_module_base)
+                .map(|b| format!("{b:#x}")),
+            faulting_module_rva: self
+                .capture_receipt
+                .as_ref()
+                .and_then(|r| r.faulting_module_rva)
+                .map(|v| format!("{v:#x}")),
+            context_capture_error: self
+                .capture_receipt
+                .as_ref()
+                .and_then(|r| r.context_capture_error.clone()),
         })
     }
 }
@@ -827,6 +887,15 @@ mod tests {
             cleanup_result: "ok".to_string(),
             cleanup_detail: None,
             candidate_created: false,
+            exception_code: None,
+            first_chance: None,
+            exception_address: None,
+            instruction_pointer: None,
+            stack_pointer: None,
+            faulting_module: None,
+            faulting_module_base: None,
+            faulting_module_rva: None,
+            context_capture_error: None,
         };
         let p = write_failure_evidence(&ev, &temp).unwrap();
         assert!(p.exists());
@@ -863,6 +932,15 @@ mod tests {
             cleanup_result: "not-run".to_string(),
             cleanup_detail: None,
             candidate_created: false,
+            exception_code: None,
+            first_chance: None,
+            exception_address: None,
+            instruction_pointer: None,
+            stack_pointer: None,
+            faulting_module: None,
+            faulting_module_base: None,
+            faulting_module_rva: None,
+            context_capture_error: None,
         };
         // blocker is a file: create_dir_all fails -> Err
         let r = write_failure_evidence(&ev, &blocker);
