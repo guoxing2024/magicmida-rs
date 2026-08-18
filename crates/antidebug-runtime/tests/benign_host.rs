@@ -70,7 +70,20 @@ fn handle_count() -> u32 {
 }
 
 fn main() {
-    let dll_path = wide("D:\\tmp\\magicmida-adr4c-target\\mida_antidebug_runtime.dll");
+    // ADR7-A0-EVIDENCE-CORRECTION-1: the runtime DLL path MUST come from the
+    // caller (argv[1], falling back to MIDA_RUNTIME_DLL env), never from a
+    // hard-coded stale build directory. The previous hard-coded
+    // "D:\tmp\magicmida-adr4c-target\..." pointed at an OLD runtime whose
+    // byte identity happened to match; that made the experiment's PATH
+    // provenance wrong even though the executed bytes were identical.
+    let dll_path_str = std::env::args()
+        .nth(1)
+        .or_else(|| std::env::var("MIDA_RUNTIME_DLL").ok())
+        .expect(
+            "usage: benign_host <path-to-mida_antidebug_runtime.dll> (or set MIDA_RUNTIME_DLL)",
+        );
+    eprintln!("BENIGN_HOST loading runtime DLL from: {dll_path_str}");
+    let dll_path = wide(&dll_path_str);
     let base_handles = handle_count();
     let base_tick = unsafe { GetTickCount64() };
     println!("baseline handles={}", base_handles);

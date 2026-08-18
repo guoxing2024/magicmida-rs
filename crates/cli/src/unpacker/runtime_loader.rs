@@ -848,13 +848,32 @@ impl RuntimeLoader {
         args: &ThunkArgs,
         drain: &mut dyn FnMut(u32) -> Result<Option<mida_core::DrainReceipt>, mida_core::CoreError>,
     ) -> Result<RemoteCallResult, RuntimeLoadError> {
+        // Production entry: fixed 60s deadline (R1-HARDENING-REMOTE-HANDLE-1).
+        unsafe { self.thunk_call_bounded(target, args, 60, drain) }
+    }
+
+    /// Bounded production-ownership seam (R1-HARDENING-REMOTE-HANDLE-TEST-1).
+    ///
+    /// The ONE wrapper that exercises the production destructure-and-close
+    /// contract: calls [`Self::thunk_call_tracked_with_handle`], then closes
+    /// the raw remote thread handle itself on every return path (success AND
+    /// failure). Tests MUST call this function (with a short deadline) and
+    /// MUST NOT close the handle themselves — otherwise they prove the test's
+    /// close pattern, not the production wrapper.
+    unsafe fn thunk_call_bounded(
+        &self,
+        target: HANDLE,
+        args: &ThunkArgs,
+        deadline_secs: u64,
+        drain: &mut dyn FnMut(u32) -> Result<Option<mida_core::DrainReceipt>, mida_core::CoreError>,
+    ) -> Result<RemoteCallResult, RuntimeLoadError> {
         // R1-HARDENING-REMOTE-HANDLE-1: NEVER drop the raw remote thread
         // handle. thunk_call_tracked_with_handle() transfers ownership via
         // into_raw() on EVERY return path (success AND failure), so the
         // production wrapper must destructure the tuple and close the handle
         // itself; otherwise each production thunk call leaks a kernel handle.
         let (result, _thunk_addr, thread_handle) =
-            unsafe { self.thunk_call_tracked_with_handle(target, args, 60, drain) };
+            unsafe { self.thunk_call_tracked_with_handle(target, args, deadline_secs, drain) };
         if let Some(h) = thread_handle {
             // SAFETY: h is a valid owned handle from into_raw(); no double
             // close (the guard was forgotten by into_raw).
@@ -2138,6 +2157,14 @@ mod timeout_harness {
     /// destructure-and-close pattern that thunk_call() now implements.
     #[test]
     fn production_thunk_call_does_not_leak_thread_handles() {
+        // R1-HARDENING-REMOTE-HANDLE-TEST-1: this test MUST exercise the
+        // PRODUCTION ownership wrapper (thunk_call_bounded) and MUST NOT
+        // close any handle itself. The wrapper destructures the tuple and
+        // closes the raw remote thread handle on every return path; if the
+        // production wrapper regresses to leaking the handle (e.g. calling
+        // thunk_call_tracked_with_handle().0 and dropping the raw handle),
+        // the process-wide handle count grows monotonically and this test
+        // FAILS.
         // SAFETY: GetCurrentProcess returns a pseudo-handle valid for the
         // whole process lifetime; we never close it.
         let target = unsafe { GetCurrentProcess() };
@@ -2156,32 +2183,25 @@ mod timeout_harness {
         let mut deltas = Vec::new();
         for _ in 0..3 {
             let before = unsafe { process_handle_count() };
-            let (result, _addr, handle) =
-                unsafe { loader.thunk_call_tracked_with_handle(target, &args, 1, &mut noop_drain) };
+            // PRODUCTION wrapper (1s deadline): internally closes the raw
+            // thread handle. NO test-side CloseHandle below.
+            let result = unsafe { loader.thunk_call_bounded(target, &args, 1, &mut noop_drain) };
             assert!(result.is_err(), "slow thunk must time out");
-            // The production wrapper closes the raw handle here — the exact
-            // code path added by R1-HARDENING-REMOTE-HANDLE-1.
-            if let Some(h) = handle {
-                // SAFETY: h is a valid owned handle from into_raw().
-                let _ = unsafe { windows::Win32::Foundation::CloseHandle(h) };
-            }
             // Let the slow Sleep thread finish so its own handle is gone
             // before counting (the remote thread itself is not our leak).
             std::thread::sleep(std::time::Duration::from_millis(5600));
             let after = unsafe { process_handle_count() };
             deltas.push(after.saturating_sub(before));
         }
-        // With correct closing the handle table does not grow across
-        // iterations (allow +1 for OS noise; a leak would be +1 per call
-        // and monotonic across all three probes).
+        // R1-HARDENING-REMOTE-HANDLE-TEST-1: with correct closing the
+        // process-wide handle count must NOT grow across iterations at all
+        // (deltas all 0). A leak shows +1 per call (monotonic); the previous
+        // "<= 1" allowance masked a +1-per-call leak as OS noise and made
+        // this test pass against the leaking wrapper — fixed to require 0.
         let max_delta = *deltas.iter().max().unwrap();
-        assert!(
-            max_delta <= 1,
-            "thunk_call-style wrapper leaks thread handles: deltas={deltas:?}"
-        );
         assert_eq!(
-            deltas[0], deltas[2],
-            "handle count must be stable across repeated timed-out thunk calls: deltas={deltas:?}"
+            max_delta, 0,
+            "thunk_call_bounded (production wrapper) leaks thread handles: deltas={deltas:?} (must be all 0)"
         );
     }
 
