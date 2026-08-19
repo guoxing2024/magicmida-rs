@@ -319,6 +319,7 @@ fn main() {
     let mut seq: u64 = 0;
     let mut dll_loads: u32 = 0;
     let mut exceptions_seen: u32 = 0;
+    let mut c0000409_seen: u32 = 0;
     let mut obs_hits: u32 = 0;
     let mut int29_hits: u32 = 0;
     let mut exit_seen = false;
@@ -346,6 +347,9 @@ fn main() {
                 let addr = unsafe { ev.u.exception.exception_record.exception_address } as u64;
                 let tid = ev.thread_id;
                 exceptions_seen += 1;
+                if code == 0xC0000409 {
+                    c0000409_seen += 1;
+                }
                 let (rip, rsp) = read_rip_rsp(proc_handle, tid);
                 // bound runtime sha256 AE42901E... image size 370,688 B
                 // (~0x5a800); only addresses within the module (0x100000
@@ -500,7 +504,7 @@ fn main() {
     json.push_str(&format!("  \"obs_hits\": {},\n", obs_hits));
     json.push_str(&format!("  \"int29_hits\": {},\n", int29_hits));
     json.push_str(&format!("  \"exceptions_0xc0000409\": {},\n",
-        exceptions_seen as u32)); // refined below
+        c0000409_seen));
     json.push_str("  \"records\": [\n");
     json.push_str(&events.join(",\n"));
     json.push_str("\n  ]\n}\n");
