@@ -492,6 +492,24 @@ pub fn unpack(
         &format!("Process created (PID: {})", dbg.pid()),
     );
 
+    // ADR7-B4: optional dynamic-instrumentation observer (debugger-side event
+    // recorder). Enabled only with MIDA_B4_OBSERVER=1; when disabled the
+    // debugger is behaviour-identical to before (zero perturbation).
+    let b4_observer: Option<std::sync::Arc<mida_core::adr7_b4_observer::Adr7B4Observer>> =
+        if mida_core::adr7_b4_observer::Adr7B4Observer::enabled() {
+            let obs = std::sync::Arc::new(
+                mida_core::adr7_b4_observer::Adr7B4Observer::new(),
+            );
+            dbg.attach_b4_observer(obs.clone());
+            log::log(
+                LogType::Info,
+                "ADR7-B4 observer enabled (MIDA_B4_OBSERVER=1)",
+            );
+            Some(obs)
+        } else {
+            None
+        };
+
     // Capture loader-initialized zero-raw data before the post-attach main
     // thread can execute CRT or application initializers. Start with the
     // minimal `.data` policy; later phases preserve decrypted code and IAT.
@@ -1100,6 +1118,22 @@ pub fn unpack(
                     // attestation). Pull them out and log the full window so the
                     // loader's drain bookkeeping is auditable end-to-end, not
                     // just the warm-up events.
+                    // ADR7-B4: write the observer timeline after the loader
+                    // window (before the main unpack loop continues).
+                    if let Some(obs) = &b4_observer {
+                        let timeline_path = std::env::var("MIDA_B4_TIMELINE")
+                            .unwrap_or_else(|_| "b4_timeline.json".to_string());
+                        match obs.write_timeline(std::path::Path::new(&timeline_path)) {
+                            Ok(()) => log::log(
+                                LogType::Info,
+                                &format!("ADR7-B4 timeline written to {timeline_path}"),
+                            ),
+                            Err(e) => log::log(
+                                LogType::Fatal,
+                                &format!("ADR7-B4 timeline write FAILED: {e}"),
+                            ),
+                        }
+                    }
                     let all_drain_receipts = dbg.take_drain_receipts();
                     let drain_stats = dbg.drain_stats();
                     log::log(
