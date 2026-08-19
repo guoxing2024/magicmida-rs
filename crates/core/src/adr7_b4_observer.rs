@@ -471,6 +471,8 @@ impl Adr7B4Observer {
                 out.push_str(&format!("        \"local_panic_count_counter\": {},\n", opt_u64(tls.local_panic_count_counter)));
                 out.push_str(&format!("        \"local_panic_count_flag\": {},\n", opt_u8(tls.local_panic_count_flag)));
                 out.push_str(&format!("        \"classification\": \"{}\",\n", tls.classification.as_str()));
+                out.push_str(&format!("        \"capture_trigger\": \"{}\",\n", tls.capture_trigger));
+                out.push_str(&format!("        \"capture_phase\": \"{}\",\n", tls.capture_phase));
                 out.push_str(&format!("        \"capture_error\": {}\n", opt_str(tls.capture_error.as_deref())));
                 out.push_str("      },\n");
             }

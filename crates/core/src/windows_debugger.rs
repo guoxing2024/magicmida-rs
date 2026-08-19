@@ -2395,8 +2395,18 @@ impl WindowsDebugger {
     /// pointer (array[index]), slot page state/protect (VirtualQueryEx), and
     /// the LOCAL_PANIC_COUNT fields (counter at slot+0x18, flag at slot+0x20).
     /// Failures are collected into the snapshot (never fatal).
+    ///
+    /// F-B5-002: trigger and phase describe WHEN the capture happened
+    /// (observed exception code and debug-event phase). The snapshot is
+    /// self-describing: a second_chance capture is a post-fault snapshot.
     #[cfg(target_arch = "x86_64")]
-    fn capture_tls_scene(&self, thread_id: u32, runtime_base: u64) -> crate::b5_tls_capture::TlsSnapshot {
+    fn capture_tls_scene(
+        &self,
+        thread_id: u32,
+        runtime_base: u64,
+        trigger: &str,
+        phase: &str,
+    ) -> crate::b5_tls_capture::TlsSnapshot {
         use crate::b5_tls_capture::{
             TlsClassification, TlsSnapshot, LOCAL_PANIC_COUNT_COUNTER_OFFSET,
             LOCAL_PANIC_COUNT_FLAG_OFFSET, TLS_ARRAY_TEB_OFFSET, TLS_INDEX_RVA,
@@ -2415,6 +2425,8 @@ impl WindowsDebugger {
             local_panic_count_counter: None,
             local_panic_count_flag: None,
             classification: TlsClassification::CaptureFailed,
+            capture_trigger: trigger.to_string(),
+            capture_phase: phase.to_string(),
             capture_error: None,
         };
 
@@ -2697,9 +2709,19 @@ impl WindowsDebugger {
                 let rsp = receipt.stack_pointer;
                 // ADR7-B5: capture the TLS scene for the faulting thread when
                 // the runtime is present. Best effort, never fatal.
+                // F-B5-002: the snapshot records the OBSERVED trigger (the
+                // exception code) and the debug-event phase. A second-chance
+                // capture is a post-fault snapshot and cannot describe the
+                // pre-fault TLS state.
                 let tls = if obs.runtime_observed() {
                     let rt_base = obs.runtime_base();
-                    let snap = self.capture_tls_scene(thread_id, rt_base);
+                    let trigger = format!("{code:#x}");
+                    let phase = if first_chance {
+                        "first_chance"
+                    } else {
+                        "second_chance"
+                    };
+                    let snap = self.capture_tls_scene(thread_id, rt_base, &trigger, phase);
                     if snap.capture_error.is_none() {
                         tracing::debug!(
                             tid = thread_id,

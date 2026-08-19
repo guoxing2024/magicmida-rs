@@ -91,14 +91,31 @@ pub struct TlsSnapshot {
     pub local_panic_count_flag: Option<u8>,
     /// Derived classification.
     pub classification: TlsClassification,
+    /// What triggered this capture: the exception code observed at the
+    /// capture point (e.g. "0xc0000005", "0xc0000409") or "control" for a
+    /// non-exception capture. F-B5-002: the trigger is recorded as observed,
+    /// never inferred.
+    pub capture_trigger: String,
+    /// Which debug-event phase the capture happened in:
+    /// "first_chance" | "second_chance" | "post_exception" | "control".
+    /// A second-chance capture is a POST-FAULT snapshot and can never
+    /// describe the pre-fault TLS state.
+    pub capture_phase: String,
     /// First capture error (never fatal).
     pub capture_error: Option<String>,
 }
 
 impl TlsSnapshot {
     /// Classify from the raw facts (pure; unit-testable).
+    ///
+    /// F-B5-001 (ADR7-B5-TLS-ROOT-CAUSE-ISOLATION-1): ANY capture error makes
+    /// the snapshot capture_failed — even when some fields (e.g. TEB) were
+    /// read successfully. A snapshot with a capture error must NEVER produce
+    /// an affirmative TLS classification (SlotAbsent / SlotInvalid /
+    /// CounterPointerCorrupted / SlotWritable / SlotReadOnly are all TLS
+    /// scene verdicts and are only valid when the full capture succeeded).
     pub fn classify(&mut self) {
-        self.classification = if self.capture_error.is_some() && self.teb_address.is_none() {
+        self.classification = if self.capture_error.is_some() {
             TlsClassification::CaptureFailed
         } else if self.teb_address.is_none()
             || self.tls_array_base == Some(0)
@@ -155,6 +172,8 @@ mod tests {
             local_panic_count_counter: None,
             local_panic_count_flag: None,
             classification: TlsClassification::CaptureFailed,
+            capture_trigger: "test".to_string(),
+            capture_phase: "control".to_string(),
             capture_error: None,
         };
         s.classify();
@@ -174,6 +193,8 @@ mod tests {
             local_panic_count_counter: Some(1),
             local_panic_count_flag: Some(0),
             classification: TlsClassification::CaptureFailed,
+            capture_trigger: "test".to_string(),
+            capture_phase: "control".to_string(),
             capture_error: None,
         };
         s.classify();
@@ -193,6 +214,8 @@ mod tests {
             local_panic_count_counter: Some(0),
             local_panic_count_flag: Some(0),
             classification: TlsClassification::CaptureFailed,
+            capture_trigger: "test".to_string(),
+            capture_phase: "control".to_string(),
             capture_error: None,
         };
         s.classify();
@@ -212,6 +235,8 @@ mod tests {
             local_panic_count_counter: None,
             local_panic_count_flag: None,
             classification: TlsClassification::CaptureFailed,
+            capture_trigger: "test".to_string(),
+            capture_phase: "control".to_string(),
             capture_error: None,
         };
         s.classify();
@@ -234,7 +259,146 @@ mod tests {
             local_panic_count_counter: None,
             local_panic_count_flag: None,
             classification: TlsClassification::CaptureFailed,
+            capture_trigger: "test".to_string(),
+            capture_phase: "control".to_string(),
             capture_error: Some("open thread failed".into()),
+        };
+        s.classify();
+        assert_eq!(s.classification, TlsClassification::CaptureFailed);
+    }
+
+    // F-B5-001 regression tests: ANY capture error (even with most fields
+    // read successfully) must classify CaptureFailed — a partial capture must
+    // never produce an affirmative TLS scene verdict.
+
+    #[test]
+    fn capture_failed_when_teb_ok_but_tls_array_failed() {
+        // TEB read OK, but the TLS array read failed => capture error present.
+        let mut s = TlsSnapshot {
+            tid: 1,
+            teb_address: Some(0x1000),
+            tls_array_base: None,
+            tls_index: None,
+            tls_slot_pointer: None,
+            slot_page_state: None,
+            slot_page_protect: None,
+            local_panic_count_counter: None,
+            local_panic_count_flag: None,
+            classification: TlsClassification::CaptureFailed,
+            capture_trigger: "test".to_string(),
+            capture_phase: "control".to_string(),
+            capture_error: Some("TLS array read failed".into()),
+        };
+        s.classify();
+        assert_eq!(s.classification, TlsClassification::CaptureFailed);
+    }
+
+    #[test]
+    fn capture_failed_when_tls_index_read_failed() {
+        // TEB + TLS array OK, but _tls_index read failed.
+        let mut s = TlsSnapshot {
+            tid: 1,
+            teb_address: Some(0x1000),
+            tls_array_base: Some(0x2000),
+            tls_index: None,
+            tls_slot_pointer: None,
+            slot_page_state: None,
+            slot_page_protect: None,
+            local_panic_count_counter: None,
+            local_panic_count_flag: None,
+            classification: TlsClassification::CaptureFailed,
+            capture_trigger: "test".to_string(),
+            capture_phase: "control".to_string(),
+            capture_error: Some("_tls_index read: error".into()),
+        };
+        s.classify();
+        assert_eq!(s.classification, TlsClassification::CaptureFailed);
+    }
+
+    #[test]
+    fn capture_failed_when_slot_read_failed() {
+        // TEB/TLS array/index OK, but the slot pointer could not be read.
+        let mut s = TlsSnapshot {
+            tid: 1,
+            teb_address: Some(0x1000),
+            tls_array_base: Some(0x2000),
+            tls_index: Some(2),
+            tls_slot_pointer: None,
+            slot_page_state: None,
+            slot_page_protect: None,
+            local_panic_count_counter: None,
+            local_panic_count_flag: None,
+            classification: TlsClassification::CaptureFailed,
+            capture_trigger: "test".to_string(),
+            capture_phase: "control".to_string(),
+            capture_error: Some("TLS slot pointer read failed".into()),
+        };
+        s.classify();
+        assert_eq!(s.classification, TlsClassification::CaptureFailed);
+    }
+
+    #[test]
+    fn capture_failed_when_counter_read_failed_with_teb_ok() {
+        // Everything up to the counter read OK, then the counter read failed.
+        // (Regression: old logic classified CounterPointerCorrupted here.)
+        let mut s = TlsSnapshot {
+            tid: 1,
+            teb_address: Some(0x1000),
+            tls_array_base: Some(0x2000),
+            tls_index: Some(2),
+            tls_slot_pointer: Some(0x3000),
+            slot_page_state: Some(0x1000),
+            slot_page_protect: Some(0x04),
+            local_panic_count_counter: None,
+            local_panic_count_flag: Some(0),
+            classification: TlsClassification::CaptureFailed,
+            capture_trigger: "test".to_string(),
+            capture_phase: "control".to_string(),
+            capture_error: Some("LOCAL_PANIC_COUNT counter unreadable".into()),
+        };
+        s.classify();
+        assert_eq!(s.classification, TlsClassification::CaptureFailed);
+    }
+
+    #[test]
+    fn capture_failed_when_page_query_failed() {
+        // All reads OK, but VirtualQueryEx failed => capture error present.
+        let mut s = TlsSnapshot {
+            tid: 1,
+            teb_address: Some(0x1000),
+            tls_array_base: Some(0x2000),
+            tls_index: Some(2),
+            tls_slot_pointer: Some(0x3000),
+            slot_page_state: None,
+            slot_page_protect: None,
+            local_panic_count_counter: Some(0),
+            local_panic_count_flag: Some(0),
+            classification: TlsClassification::CaptureFailed,
+            capture_trigger: "test".to_string(),
+            capture_phase: "control".to_string(),
+            capture_error: Some("VirtualQueryEx failed".into()),
+        };
+        s.classify();
+        assert_eq!(s.classification, TlsClassification::CaptureFailed);
+    }
+
+    #[test]
+    fn capture_failed_when_flag_read_failed() {
+        // Counter OK but flag read failed.
+        let mut s = TlsSnapshot {
+            tid: 1,
+            teb_address: Some(0x1000),
+            tls_array_base: Some(0x2000),
+            tls_index: Some(2),
+            tls_slot_pointer: Some(0x3000),
+            slot_page_state: Some(0x1000),
+            slot_page_protect: Some(0x04),
+            local_panic_count_counter: Some(0),
+            local_panic_count_flag: None,
+            classification: TlsClassification::CaptureFailed,
+            capture_trigger: "test".to_string(),
+            capture_phase: "control".to_string(),
+            capture_error: Some("LOCAL_PANIC_COUNT flag unreadable".into()),
         };
         s.classify();
         assert_eq!(s.classification, TlsClassification::CaptureFailed);
