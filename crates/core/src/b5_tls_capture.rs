@@ -125,8 +125,7 @@ impl TlsSnapshot {
         } else if self.tls_slot_pointer.is_none() {
             // Slot pointer could not be resolved (TLS array/index read failed).
             TlsClassification::SlotAbsent
-        } else if self.local_panic_count_counter.is_none()
-            || self.local_panic_count_flag.is_none()
+        } else if self.local_panic_count_counter.is_none() || self.local_panic_count_flag.is_none()
         {
             // Slot reads but the LOCAL_PANIC_COUNT fields do not.
             TlsClassification::CounterPointerCorrupted
@@ -240,10 +239,7 @@ mod tests {
             capture_error: None,
         };
         s.classify();
-        assert_eq!(
-            s.classification,
-            TlsClassification::CounterPointerCorrupted
-        );
+        assert_eq!(s.classification, TlsClassification::CounterPointerCorrupted);
     }
 
     #[test]

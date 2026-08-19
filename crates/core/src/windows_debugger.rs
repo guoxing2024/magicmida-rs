@@ -8,6 +8,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use tracing::{debug, info, trace, warn};
+#[cfg(target_arch = "x86_64")]
+use windows::Wdk::System::Threading::{NtQueryInformationThread, ThreadBasicInformation};
 use windows::Win32::Foundation::{
     CloseHandle, GetLastError, DBG_CONTINUE, DBG_EXCEPTION_NOT_HANDLED, EXCEPTION_ACCESS_VIOLATION,
     EXCEPTION_BREAKPOINT, EXCEPTION_SINGLE_STEP, HANDLE,
@@ -27,10 +29,6 @@ use windows::Win32::System::Diagnostics::Debug::{
 use windows::Win32::System::Memory::{VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_IMAGE};
 use windows::Win32::System::ProcessStatus::GetMappedFileNameW;
 use windows::Win32::System::Threading::INFINITE;
-#[cfg(target_arch = "x86_64")]
-use windows::Wdk::System::Threading::{
-    NtQueryInformationThread, ThreadBasicInformation,
-};
 
 use crate::adr7_b4_observer::{Adr7B4Observer, B4EventKind};
 use crate::breakpoint::{HwBreakpoint, HwbpType};
@@ -2411,8 +2409,8 @@ impl WindowsDebugger {
             TlsClassification, TlsSnapshot, LOCAL_PANIC_COUNT_COUNTER_OFFSET,
             LOCAL_PANIC_COUNT_FLAG_OFFSET, TLS_ARRAY_TEB_OFFSET, TLS_INDEX_RVA,
         };
-        use windows::Win32::System::Threading::{OpenThread, THREAD_QUERY_INFORMATION};
         use windows::Win32::System::Memory::{VirtualQueryEx, MEMORY_BASIC_INFORMATION};
+        use windows::Win32::System::Threading::{OpenThread, THREAD_QUERY_INFORMATION};
 
         let mut snap = TlsSnapshot {
             tid: thread_id,
