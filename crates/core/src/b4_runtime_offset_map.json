@@ -1,0 +1,54 @@
+{
+  "schema": "mida.adr7-b4-runtime-offset-map/v1",
+  "runtime_sha256": "AE42901EC940DFA95566DCF9E0787D1E2C9439D90E7C593ED3A803A4F9CDBB76",
+  "runtime_size_bytes": 370688,
+  "pdb_sha256": "B8165CF81B7E5469979FB61E7FE6B84E7376C14A09AF5FA9131DAE4DD86EED96",
+  "pdb_guid": "DDCD43FD-2CFF-4242-85BF-39DC0ADB09E0",
+  "pdb_age": 1,
+  "image_base": "0x180000000",
+  "source_ref": "7e65cf657029c8d3452bd9b595f8ca6f1cf79e18",
+  "extraction": {
+    "tool": "cdb (symbols) + dumpbin /DISASM /SECTION:.text",
+    "cdb": "C:\\Program Files (x86)\\Windows Kits\\10\\Debuggers\\x64\\cdb.exe",
+    "dumpbin": "C:\\Program Files\\Microsoft Visual Studio\\2022\\Professional\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\dumpbin.exe",
+    "method": "symbol entry RVAs from PDB via cdb 'x'; internal call-site and int29 sites via dumpbin disassembly; all int29 sites are CD 29 (FAST_FAIL_FATAL_APP_EXIT path)"
+  },
+  "panic_with_hook_entry": "0x2e604",
+  "panic_with_hook_callsite": "0x2e638",
+  "panic_count_increase_entry": "0x2eda0",
+  "panic_count_tls_check": "0x2edc6",
+  "int29_sites": [
+    "0x2bfc1",
+    "0x2c366",
+    "0x2c599",
+    "0x2c759",
+    "0x2d070",
+    "0x2e7e8",
+    "0x2e816",
+    "0x3f32c",
+    "0x3fab7"
+  ],
+  "observed_fault_rva": "0x2e816",
+  "obs_points": [
+    {
+      "rva": "0x2eda0",
+      "label": "panic_count::increase entry",
+      "slot": 0
+    },
+    {
+      "rva": "0x2edc6",
+      "label": "panic_count::increase+0x26 (TLS check jne)",
+      "slot": 1
+    },
+    {
+      "rva": "0x2e604",
+      "label": "panic_with_hook entry",
+      "slot": 2
+    },
+    {
+      "rva": "0x2e638",
+      "label": "panic_with_hook -> panic_count::increase call site",
+      "slot": 3
+    }
+  ]
+}

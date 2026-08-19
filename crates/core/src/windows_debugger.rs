@@ -2193,16 +2193,22 @@ impl WindowsDebugger {
                     match resolved {
                         Ok(Some((name, base))) if name == "mida_antidebug_runtime.dll" => {
                             obs.record_runtime_loaded(process_id, thread_id, base);
-                            let points = [
-                                (0x2ed90u64, 0usize),
-                                (0x2edb6u64, 1usize),
-                                (0x2e5f4u64, 2usize),
-                                (0x2e628u64, 3usize),
-                            ];
+                            // ADR7-B4-RUNTIME-BINDING-CORRECTION-1: observation
+                            // points come from the runtime-hash-bound table
+                            // (RUNTIME_OBS_POINTS), never hardcoded stale offsets.
+                            // active_breakpoints() fails closed on hash mismatch.
+                            let points: [(u64, usize); 4] = std::array::from_fn(|i| {
+                                let (rva, _name) = crate::adr7_b4_observer::RUNTIME_OBS_POINTS[i];
+                                (rva as u64, i)
+                            });
                             if Adr7B4Observer::active_breakpoints() {
                                 for (rva, slot) in points {
                                     let va = base + rva;
-                                    let _ = self.set_hw_breakpoint(slot, va as usize, HwbpType::Execute);
+                                    let _ = self.set_hw_breakpoint(
+                                        slot,
+                                        va as usize,
+                                        HwbpType::Execute,
+                                    );
                                 }
                             }
                         }
@@ -2601,20 +2607,21 @@ impl WindowsDebugger {
                 match resolved {
                     Ok(Some((name, base))) if name == "mida_antidebug_runtime.dll" => {
                         obs.record_runtime_loaded(process_id, thread_id, base);
-                        // Observation points: increase entry, fault RVA,
-                        // panic_with_hook entry, call site (slots 0-3).
+                        // ADR7-B4-RUNTIME-BINDING-CORRECTION-1: observation
+                        // points come from the runtime-hash-bound table
+                        // (RUNTIME_OBS_POINTS), never hardcoded stale offsets.
                         // Installed ONLY in active mode (MIDA_B4_OBSERVER=1);
                         // passive mode (2) records events without touching DRs.
+                        // active_breakpoints() fails closed on hash mismatch.
                         if Adr7B4Observer::active_breakpoints() {
-                            let points = [
-                                (0x2ed90u64, 0usize),
-                                (0x2edb6u64, 1usize),
-                                (0x2e5f4u64, 2usize),
-                                (0x2e628u64, 3usize),
-                            ];
+                            let points: [(u64, usize); 4] = std::array::from_fn(|i| {
+                                let (rva, _name) = crate::adr7_b4_observer::RUNTIME_OBS_POINTS[i];
+                                (rva as u64, i)
+                            });
                             for (rva, slot) in points {
                                 let va = base + rva;
-                                let _ = self.set_hw_breakpoint(slot, va as usize, HwbpType::Execute);
+                                let _ =
+                                    self.set_hw_breakpoint(slot, va as usize, HwbpType::Execute);
                             }
                         }
                     }

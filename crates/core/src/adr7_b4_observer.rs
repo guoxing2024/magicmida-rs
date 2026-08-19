@@ -24,21 +24,83 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-/// Static observation table derived from ADR7-B3 (verified against the
-/// committed runtime c22cb722 via dumpbin disassembly).
-pub const RUNTIME_OBS_POINTS: &[(u32, &str)] = &[
-    (0x2ed90, "panic_count::increase entry"),
-    (0x2edb6, "panic_count::increase+0x26 (B3 fault RVA)"),
-    (0x2e5f4, "panic_with_hook entry"),
-    (0x2e628, "panic_with_hook -> panic_count::increase call site"),
-];
+use crate::b4_runtime_offsets;
 
-/// Static int29 (__fastfail) sites from ADR7-B3, verified via dumpbin.
-/// All sites are `CD 29` with `mov ecx,7` (FAST_FAIL_FATAL_APP_EXIT).
-pub const INT29_SITES: &[u32] = &[
-    0x2bfb1, 0x2c356, 0x2c589, 0x2c749, 0x2d060, 0x2e7d8, 0x2e806, 0x3f31c,
-    0x3faa7,
-];
+/// Observation tables bound to the EXACT runtime artifact
+/// (ADR7-B4-RUNTIME-BINDING-CORRECTION-1).
+///
+/// The tables are generated from the authority offset map for runtime sha256
+/// AE42901E... (see b4_runtime_offset_map.json / b4_runtime_offsets.rs). They
+/// are NOT portable: any other runtime binary MUST be re-mapped before
+/// observation. The observer fails closed on a hash mismatch — no
+/// observation point is installed and no int29 match is claimed when the
+/// runtime actually loaded does not match RUNTIME_SHA256.
+pub const RUNTIME_SHA256: &str = b4_runtime_offsets::RUNTIME_SHA256;
+pub const RUNTIME_OBS_POINTS: &[(u32, &str)] = &b4_runtime_offsets::OBS_POINTS;
+pub const INT29_SITES: &[u32] = &b4_runtime_offsets::INT29_SITES;
+
+/// Result of the runtime binding verification (cached once per process).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeBinding {
+    /// The runtime file referenced by MIDA_RUNTIME_DLL was hashed and
+    /// matches the bound RUNTIME_SHA256: observation is authorized.
+    Verified,
+    /// The observer is disabled (MIDA_B4_OBSERVER unset): no observation.
+    Disabled,
+    /// MIDA_RUNTIME_DLL is not set in this process: cannot verify, fail closed.
+    NoRuntimeEnv,
+    /// The runtime file could not be read/hashed: fail closed.
+    Unreadable,
+    /// The runtime file hash does NOT match RUNTIME_SHA256: fail closed.
+    Mismatch { actual: String },
+}
+
+/// Cache for the once-per-process binding check.
+static RUNTIME_BINDING: std::sync::OnceLock<RuntimeBinding> = std::sync::OnceLock::new();
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    let out = h.finalize();
+    let mut s = String::with_capacity(64);
+    for b in out.iter() {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// Verify that the runtime artifact this process is loading (MIDA_RUNTIME_DLL)
+/// is exactly the artifact the observer is bound to. Fail-closed on any
+/// mismatch or inability to verify. Result is cached after the first call.
+pub fn runtime_binding() -> RuntimeBinding {
+    RUNTIME_BINDING
+        .get_or_init(|| {
+            if !Adr7B4Observer::enabled() {
+                return RuntimeBinding::Disabled;
+            }
+            let Some(path) = std::env::var_os("MIDA_RUNTIME_DLL").map(std::path::PathBuf::from)
+            else {
+                return RuntimeBinding::NoRuntimeEnv;
+            };
+            let Ok(bytes) = std::fs::read(&path) else {
+                return RuntimeBinding::Unreadable;
+            };
+            let actual = sha256_hex(&bytes);
+            if actual.eq_ignore_ascii_case(RUNTIME_SHA256) {
+                RuntimeBinding::Verified
+            } else {
+                RuntimeBinding::Mismatch { actual }
+            }
+        })
+        .clone()
+}
+
+/// Whether observation is authorized: the observer is enabled AND the runtime
+/// binding verified against the exact artifact. False => fail closed.
+pub fn observation_authorized() -> bool {
+    runtime_binding() == RuntimeBinding::Verified
+}
 
 /// Event kinds recorded by the observer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,8 +248,14 @@ impl Adr7B4Observer {
     }
 
     /// True when the observer installs observation-point breakpoints.
+    ///
+    /// Fail-closed (ADR7-B4-RUNTIME-BINDING-CORRECTION-1): even in active
+    /// mode, breakpoints are installed ONLY when the runtime binding was
+    /// verified against the exact artifact (RUNTIME_SHA256). A hash mismatch
+    /// or unverifiable runtime means NO observation point is armed — stale
+    /// offsets are never used silently.
     pub fn active_breakpoints() -> bool {
-        Self::mode() == Some(1)
+        Self::mode() == Some(1) && observation_authorized()
     }
 
     /// Record a debug event.
@@ -246,8 +314,18 @@ impl Adr7B4Observer {
     }
 
     /// Record the runtime module load (sets the base for RVA mapping).
+    ///
+    /// The timeline carries the runtime binding verdict so downstream audits
+    /// can distinguish a verified observation from a fail-closed one.
     pub fn record_runtime_loaded(&self, pid: u32, tid: u32, base: u64) {
         *self.runtime_base.lock().unwrap() = base;
+        let cont = match runtime_binding() {
+            RuntimeBinding::Verified => "continue (runtime binding verified)",
+            RuntimeBinding::Disabled => "continue (observer disabled)",
+            RuntimeBinding::NoRuntimeEnv => "fail-closed (MIDA_RUNTIME_DLL unset)",
+            RuntimeBinding::Unreadable => "fail-closed (runtime unreadable)",
+            RuntimeBinding::Mismatch { .. } => "fail-closed (runtime hash mismatch)",
+        };
         self.record(
             B4EventKind::RuntimeLoaded,
             pid,
@@ -255,7 +333,7 @@ impl Adr7B4Observer {
             Some(base),
             None,
             None,
-            Some("continue".to_string()),
+            Some(cont.to_string()),
             None,
             None,
         );
@@ -268,41 +346,99 @@ impl Adr7B4Observer {
         let mut out = String::new();
         out.push_str("{\n");
         out.push_str("  \"schema\": \"mida.adr7-b4-timeline/v1\",\n");
-        out.push_str("  \"runtime_sha256\": \"c22cb722ecae379d09ee372216d4697b13e371e0c280fb352d01a7fd1208a710\",\n");
+        out.push_str(&format!("  \"runtime_sha256\": \"{}\",\n", RUNTIME_SHA256));
+        out.push_str(&format!(
+            "  \"runtime_size_bytes\": {},\n",
+            b4_runtime_offsets::RUNTIME_SIZE_BYTES
+        ));
+        out.push_str(&format!(
+            "  \"pdb_sha256\": \"{}\",\n",
+            b4_runtime_offsets::PDB_SHA256
+        ));
+        out.push_str(&format!(
+            "  \"pdb_guid\": \"{}\",\n",
+            b4_runtime_offsets::PDB_GUID
+        ));
+        out.push_str(&format!(
+            "  \"pdb_age\": {},\n",
+            b4_runtime_offsets::PDB_AGE
+        ));
+        out.push_str(&format!(
+            "  \"runtime_binding\": \"{:?}\",\n",
+            runtime_binding()
+        ));
         out.push_str("  \"observer_points\": [");
         for (i, (rva, name)) in RUNTIME_OBS_POINTS.iter().enumerate() {
-            if i > 0 { out.push_str(", "); }
+            if i > 0 {
+                out.push_str(", ");
+            }
             out.push_str(&format!("\"{:#x} {}\"", rva, name.replace('\"', "'")));
         }
         out.push_str("],\n");
         out.push_str("  \"int29_sites\": [");
         for (i, rva) in INT29_SITES.iter().enumerate() {
-            if i > 0 { out.push_str(", "); }
+            if i > 0 {
+                out.push_str(", ");
+            }
             out.push_str(&format!("\"{:#x}\"", rva));
         }
         out.push_str("],\n");
         out.push_str("  \"records\": [\n");
         for (i, r) in records.iter().enumerate() {
-            if i > 0 { out.push_str(",\n"); }
+            if i > 0 {
+                out.push_str(",\n");
+            }
             out.push_str("    {\n");
             out.push_str(&format!("      \"ts_ms\": {},\n", r.ts_ms));
             out.push_str(&format!("      \"seq\": {},\n", r.seq));
             out.push_str(&format!("      \"kind\": \"{}\",\n", r.kind.as_str()));
             out.push_str(&format!("      \"pid\": {},\n", r.pid));
             out.push_str(&format!("      \"tid\": {},\n", r.tid));
-            out.push_str(&format!("      \"runtime_base\": \"{:#x}\",\n", r.runtime_base));
-            out.push_str(&format!("      \"runtime_rva\": {},\n", opt_hex(r.runtime_rva.map(|v| v as u64))));
-            out.push_str(&format!("      \"recorded_exception_address\": {},\n", opt_hex(r.recorded_exception_address)));
-            out.push_str(&format!("      \"breakpoint_hit_address\": {},\n", opt_hex(r.breakpoint_hit_address)));
-            out.push_str(&format!("      \"actual_int29_address\": {},\n", opt_hex(r.actual_int29_address)));
-            out.push_str(&format!("      \"post_exception_rip\": {},\n", opt_hex(r.post_exception_rip)));
-            out.push_str(&format!("      \"post_exception_rsp\": {},\n", opt_hex(r.post_exception_rsp)));
-            out.push_str(&format!("      \"exception_code\": {},\n", opt_hex(r.exception_code.map(|v| v as u64))));
-            out.push_str(&format!("      \"first_chance\": {},\n", opt_bool(r.first_chance)));
-            out.push_str(&format!("      \"continuation\": {},\n", opt_str(r.continuation.as_deref())));
+            out.push_str(&format!(
+                "      \"runtime_base\": \"{:#x}\",\n",
+                r.runtime_base
+            ));
+            out.push_str(&format!(
+                "      \"runtime_rva\": {},\n",
+                opt_hex(r.runtime_rva.map(|v| v as u64))
+            ));
+            out.push_str(&format!(
+                "      \"recorded_exception_address\": {},\n",
+                opt_hex(r.recorded_exception_address)
+            ));
+            out.push_str(&format!(
+                "      \"breakpoint_hit_address\": {},\n",
+                opt_hex(r.breakpoint_hit_address)
+            ));
+            out.push_str(&format!(
+                "      \"actual_int29_address\": {},\n",
+                opt_hex(r.actual_int29_address)
+            ));
+            out.push_str(&format!(
+                "      \"post_exception_rip\": {},\n",
+                opt_hex(r.post_exception_rip)
+            ));
+            out.push_str(&format!(
+                "      \"post_exception_rsp\": {},\n",
+                opt_hex(r.post_exception_rsp)
+            ));
+            out.push_str(&format!(
+                "      \"exception_code\": {},\n",
+                opt_hex(r.exception_code.map(|v| v as u64))
+            ));
+            out.push_str(&format!(
+                "      \"first_chance\": {},\n",
+                opt_bool(r.first_chance)
+            ));
+            out.push_str(&format!(
+                "      \"continuation\": {},\n",
+                opt_str(r.continuation.as_deref())
+            ));
             out.push_str("      \"call_stack\": [");
             for (j, v) in r.call_stack.iter().enumerate() {
-                if j > 0 { out.push_str(", "); }
+                if j > 0 {
+                    out.push_str(", ");
+                }
                 out.push_str(&format!("\"{:#x}\"", v));
             }
             out.push_str("]\n");
@@ -347,5 +483,73 @@ fn opt_str(v: Option<&str>) -> String {
     match v {
         Some(s) => format!("\"{}\"", s),
         None => "null".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bound_tables_are_nonempty_and_sorted() {
+        // The observation tables must be bound to the exact runtime artifact:
+        // non-empty, ordered by RVA, and the fault RVA must be a known int29.
+        assert!(!RUNTIME_OBS_POINTS.is_empty());
+        assert!(!INT29_SITES.is_empty());
+        // Observation points occupy distinct DR slots (0..3): no duplicates.
+        let mut rvas: Vec<u32> = RUNTIME_OBS_POINTS.iter().map(|(r, _)| *r).collect();
+        rvas.sort_unstable();
+        rvas.dedup();
+        assert_eq!(
+            rvas.len(),
+            RUNTIME_OBS_POINTS.len(),
+            "obs points must be distinct"
+        );
+        // int29 sites are sorted by RVA.
+        for w in INT29_SITES.windows(2) {
+            assert!(w[0] < w[1], "int29 sites must be sorted by RVA");
+        }
+        // The live-observed fault RVA is one of the bound int29 sites:
+        // this is the exact property that failed in the old binding (the
+        // fault 0x2e816 was NOT in the stale c22cb722 int29 table).
+        assert!(
+            INT29_SITES.contains(&b4_runtime_offsets::OBSERVED_FAULT_RVA),
+            "observed fault RVA must be in the bound int29 table"
+        );
+    }
+
+    #[test]
+    fn sha256_hex_matches_known_vector() {
+        // "abc" -> SHA-256 ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+        let hex = sha256_hex(b"abc");
+        assert_eq!(
+            hex,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn binding_hash_compare_is_case_insensitive() {
+        // The authority manifest stores lowercase; the generated offsets
+        // uppercase. Equality must be case-insensitive.
+        assert!("AE42901E...".eq_ignore_ascii_case("ae42901e..."));
+        let actual = "ae42901ec940dfa95566dcf9e0787d1e2c9439d90e7c593ed3a803a4f9cdbb76";
+        assert!(actual.eq_ignore_ascii_case(RUNTIME_SHA256));
+    }
+
+    #[test]
+    fn match_int29_uses_bound_table() {
+        let mut rec = B4Record::new(1, 1, B4EventKind::FirstChanceException, 1, 1);
+        rec.with_runtime_base(0x180000000);
+        rec.match_int29(0x180000000 + b4_runtime_offsets::OBSERVED_FAULT_RVA as u64);
+        assert_eq!(
+            rec.actual_int29_address,
+            Some(0x180000000 + b4_runtime_offsets::OBSERVED_FAULT_RVA as u64)
+        );
+        // An address OUTSIDE the bound int29 table must NOT be claimed.
+        let mut rec2 = B4Record::new(2, 1, B4EventKind::FirstChanceException, 1, 1);
+        rec2.with_runtime_base(0x180000000);
+        rec2.match_int29(0x180000000 + 0x2e806); // stale-c22 site, NOT in bound table
+        assert_eq!(rec2.actual_int29_address, None);
     }
 }

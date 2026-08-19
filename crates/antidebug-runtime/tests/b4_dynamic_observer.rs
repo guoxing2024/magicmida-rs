@@ -142,18 +142,19 @@ const CONTEXT_DEBUG_REGISTERS_AMD64: c_uint = 0x00000010;
 const CONTEXT_CONTROL_AMD64: c_uint = 0x00000001;
 const THREAD_GET_CONTEXT: c_uint = 0x0008;
 
-// ADR7-B3 static observation points (RVA within mida_antidebug_runtime.dll
-// c22cb722, verified via dumpbin).
+// ADR7-B4-RUNTIME-BINDING-CORRECTION-1: observation points bound to the
+// EXACT runtime artifact sha256 AE42901E... (mida_antidebug_runtime.dll,
+// 370,688 B; see crates/core/src/b4_runtime_offset_map.json).
+// Extracted via cdb (PDB symbols) + dumpbin (disassembly).
 const OBS_POINTS: [(u32, &str); 4] = [
-    (0x2ed90, "panic_count::increase entry"),
-    (0x2edb6, "panic_count::increase+0x26 (B3 fault RVA)"),
-    (0x2e5f4, "panic_with_hook entry"),
-    (0x2e628, "panic_with_hook -> increase call site"),
+    (0x2eda0, "panic_count::increase entry"),
+    (0x2edc6, "panic_count::increase+0x26 (TLS check jne)"),
+    (0x2e604, "panic_with_hook entry"),
+    (0x2e638, "panic_with_hook -> panic_count::increase call site"),
 ];
 
 const INT29_SITES: [u32; 9] = [
-    0x2bfb1, 0x2c356, 0x2c589, 0x2c749, 0x2d060, 0x2e7d8, 0x2e806, 0x3f31c,
-    0x3faa7,
+    0x2bfc1, 0x2c366, 0x2c599, 0x2c759, 0x2d070, 0x2e7e8, 0x2e816, 0x3f32c, 0x3fab7,
 ];
 
 #[link(name = "kernel32")]
@@ -346,8 +347,9 @@ fn main() {
                 let tid = ev.thread_id;
                 exceptions_seen += 1;
                 let (rip, rsp) = read_rip_rsp(proc_handle, tid);
-                // runtime c22cb722 image size ~0x5a800; only addresses
-                // within the module (0x100000 guard) are runtime RVAs.
+                // bound runtime sha256 AE42901E... image size 370,688 B
+                // (~0x5a800); only addresses within the module (0x100000
+                // guard) are runtime RVAs.
                 let rva = if runtime_base != 0 && addr >= runtime_base && addr - runtime_base < 0x100000 {
                     Some(addr - runtime_base)
                 } else {
