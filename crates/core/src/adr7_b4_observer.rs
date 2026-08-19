@@ -275,6 +275,37 @@ impl Adr7B4Observer {
         rip: Option<u64>,
         rsp: Option<u64>,
     ) -> B4Record {
+        let rec = self.record_inner(
+            kind,
+            pid,
+            tid,
+            addr,
+            exception_code,
+            first_chance,
+            continuation,
+            rip,
+            rsp,
+        );
+        self.records.lock().unwrap().push(rec.clone());
+        rec
+    }
+
+    /// Build a record (sequence, timestamp, base, RVA/int29 resolution)
+    /// WITHOUT pushing it. Callers push exactly once so TLS-attached records
+    /// are stored with their snapshot (F-B5: record_with_tls must persist
+    /// tls_snapshot in the timeline; pushing a pre-TLS clone lost it).
+    fn record_inner(
+        &self,
+        kind: B4EventKind,
+        pid: u32,
+        tid: u32,
+        addr: Option<u64>,
+        exception_code: Option<u32>,
+        first_chance: Option<bool>,
+        continuation: Option<String>,
+        rip: Option<u64>,
+        rsp: Option<u64>,
+    ) -> B4Record {
         let ts_ms = unsafe { windows::Win32::System::SystemInformation::GetTickCount64() };
         let mut seq = self.seq.lock().unwrap();
         *seq += 1;
@@ -294,11 +325,16 @@ impl Adr7B4Observer {
         rec.continuation = continuation;
         rec.post_exception_rip = rip;
         rec.post_exception_rsp = rsp;
-        self.records.lock().unwrap().push(rec.clone());
         rec
     }
 
     /// Record a debug event with an optional ADR7-B5 TLS scene snapshot.
+    ///
+    /// F-B5 (evidence persistence): the pushed record carries the TLS
+    /// snapshot; the timeline therefore serializes tls_snapshot for this
+    /// record. Previously the snapshot was attached only to the returned
+    /// copy after the snapshot-less clone was already stored, so timelines
+    /// always lost the TLS scene even when capture succeeded.
     pub fn record_with_tls(
         &self,
         kind: B4EventKind,
@@ -312,10 +348,19 @@ impl Adr7B4Observer {
         rsp: Option<u64>,
         tls: Option<crate::b5_tls_capture::TlsSnapshot>,
     ) -> B4Record {
-        let mut rec = self.record(
-            kind, pid, tid, addr, exception_code, first_chance, continuation, rip, rsp,
+        let mut rec = self.record_inner(
+            kind,
+            pid,
+            tid,
+            addr,
+            exception_code,
+            first_chance,
+            continuation,
+            rip,
+            rsp,
         );
         rec.tls_snapshot = tls;
+        self.records.lock().unwrap().push(rec.clone());
         rec
     }
 
@@ -462,18 +507,54 @@ impl Adr7B4Observer {
             if let Some(tls) = &r.tls_snapshot {
                 out.push_str(&format!("      \"tls_snapshot\": {{\n"));
                 out.push_str(&format!("        \"tid\": {},\n", tls.tid));
-                out.push_str(&format!("        \"teb_address\": {},\n", opt_hex(tls.teb_address)));
-                out.push_str(&format!("        \"tls_array_base\": {},\n", opt_hex(tls.tls_array_base)));
-                out.push_str(&format!("        \"tls_index\": {},\n", opt_u32(tls.tls_index)));
-                out.push_str(&format!("        \"tls_slot_pointer\": {},\n", opt_hex(tls.tls_slot_pointer)));
-                out.push_str(&format!("        \"slot_page_state\": {},\n", opt_u32(tls.slot_page_state)));
-                out.push_str(&format!("        \"slot_page_protect\": {},\n", opt_u32(tls.slot_page_protect)));
-                out.push_str(&format!("        \"local_panic_count_counter\": {},\n", opt_u64(tls.local_panic_count_counter)));
-                out.push_str(&format!("        \"local_panic_count_flag\": {},\n", opt_u8(tls.local_panic_count_flag)));
-                out.push_str(&format!("        \"classification\": \"{}\",\n", tls.classification.as_str()));
-                out.push_str(&format!("        \"capture_trigger\": \"{}\",\n", tls.capture_trigger));
-                out.push_str(&format!("        \"capture_phase\": \"{}\",\n", tls.capture_phase));
-                out.push_str(&format!("        \"capture_error\": {}\n", opt_str(tls.capture_error.as_deref())));
+                out.push_str(&format!(
+                    "        \"teb_address\": {},\n",
+                    opt_hex(tls.teb_address)
+                ));
+                out.push_str(&format!(
+                    "        \"tls_array_base\": {},\n",
+                    opt_hex(tls.tls_array_base)
+                ));
+                out.push_str(&format!(
+                    "        \"tls_index\": {},\n",
+                    opt_u32(tls.tls_index)
+                ));
+                out.push_str(&format!(
+                    "        \"tls_slot_pointer\": {},\n",
+                    opt_hex(tls.tls_slot_pointer)
+                ));
+                out.push_str(&format!(
+                    "        \"slot_page_state\": {},\n",
+                    opt_u32(tls.slot_page_state)
+                ));
+                out.push_str(&format!(
+                    "        \"slot_page_protect\": {},\n",
+                    opt_u32(tls.slot_page_protect)
+                ));
+                out.push_str(&format!(
+                    "        \"local_panic_count_counter\": {},\n",
+                    opt_u64(tls.local_panic_count_counter)
+                ));
+                out.push_str(&format!(
+                    "        \"local_panic_count_flag\": {},\n",
+                    opt_u8(tls.local_panic_count_flag)
+                ));
+                out.push_str(&format!(
+                    "        \"classification\": \"{}\",\n",
+                    tls.classification.as_str()
+                ));
+                out.push_str(&format!(
+                    "        \"capture_trigger\": \"{}\",\n",
+                    tls.capture_trigger
+                ));
+                out.push_str(&format!(
+                    "        \"capture_phase\": \"{}\",\n",
+                    tls.capture_phase
+                ));
+                out.push_str(&format!(
+                    "        \"capture_error\": {}\n",
+                    opt_str(tls.capture_error.as_deref())
+                ));
                 out.push_str("      },\n");
             }
             out.push_str("      \"call_stack\": [");
@@ -606,6 +687,77 @@ mod tests {
         assert!("AE42901E...".eq_ignore_ascii_case("ae42901e..."));
         let actual = "ae42901ec940dfa95566dcf9e0787d1e2c9439d90e7c593ed3a803a4f9cdbb76";
         assert!(actual.eq_ignore_ascii_case(RUNTIME_SHA256));
+    }
+
+    #[test]
+    fn record_with_tls_persists_snapshot_in_timeline() {
+        // F-B5 regression: the pushed record must carry the TLS snapshot so
+        // write_timeline serializes tls_snapshot. (Previously the snapshot
+        // was attached to the returned copy AFTER the snapshot-less clone
+        // was stored, so timelines always lost the TLS scene.)
+        use crate::b5_tls_capture::{TlsClassification, TlsSnapshot};
+        let obs = Adr7B4Observer::new();
+        // A runtime base is required for RVA resolution in the record path.
+        obs.record_runtime_loaded(1, 1, 0x180000000);
+        let snap = TlsSnapshot {
+            tid: 42,
+            teb_address: Some(0x7fff_0000_0000),
+            tls_array_base: Some(0x7fff_0000_0010),
+            tls_index: Some(64),
+            tls_slot_pointer: Some(0x7fff_0000_0100),
+            slot_page_state: Some(0x1000),
+            slot_page_protect: Some(4),
+            local_panic_count_counter: Some(1),
+            local_panic_count_flag: Some(1),
+            classification: TlsClassification::SlotWritable,
+            capture_trigger: "0xc0000409".to_string(),
+            capture_phase: "second_chance".to_string(),
+            capture_error: None,
+        };
+        let rec = obs.record_with_tls(
+            B4EventKind::SecondChanceException,
+            1,
+            42,
+            Some(0x180000000 + b4_runtime_offsets::OBSERVED_FAULT_RVA as u64),
+            Some(0xc0000409),
+            Some(false),
+            None,
+            None,
+            None,
+            Some(snap),
+        );
+        // The RETURNED record has the snapshot (API contract).
+        assert!(
+            rec.tls_snapshot.is_some(),
+            "returned record must carry tls_snapshot"
+        );
+        // The STORED record (what write_timeline serializes) must too.
+        let stored = obs.records.lock().unwrap().last().unwrap().clone();
+        assert!(
+            stored.tls_snapshot.is_some(),
+            "stored record must carry tls_snapshot (F-B5 persistence)"
+        );
+        assert_eq!(
+            stored.tls_snapshot.as_ref().unwrap().tid,
+            42,
+            "snapshot tid must survive storage"
+        );
+        assert_eq!(
+            stored.tls_snapshot.as_ref().unwrap().classification,
+            TlsClassification::SlotWritable
+        );
+        // write_timeline must serialize the snapshot key.
+        let dir = std::env::temp_dir().join("mida-b4-observer-test");
+        std::fs::create_dir_all(&dir).ok();
+        let tl = dir.join(format!("timeline_{}.json", std::process::id()));
+        obs.write_timeline(&tl).unwrap();
+        let json = std::fs::read_to_string(&tl).unwrap();
+        assert!(
+            json.contains("\"tls_snapshot\""),
+            "timeline JSON must contain tls_snapshot"
+        );
+        assert!(json.contains("\"classification\": \"tls_slot_writable\""));
+        let _ = std::fs::remove_file(&tl);
     }
 
     #[test]
