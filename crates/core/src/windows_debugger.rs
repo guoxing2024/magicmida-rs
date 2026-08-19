@@ -5,6 +5,7 @@
 //! higher-level [`DebugEvent`] enum consumed by the unpacker.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use tracing::{debug, info, trace, warn};
 use windows::Win32::Foundation::{
@@ -27,6 +28,7 @@ use windows::Win32::System::Memory::{VirtualQueryEx, MEMORY_BASIC_INFORMATION, M
 use windows::Win32::System::ProcessStatus::GetMappedFileNameW;
 use windows::Win32::System::Threading::INFINITE;
 
+use crate::adr7_b4_observer::{Adr7B4Observer, B4EventKind};
 use crate::breakpoint::{HwBreakpoint, HwbpType};
 use crate::cleanup::{cleanup_action, CleanupAction, CleanupReport, ProcessOwnership, WaitOutcome};
 use crate::debug_event_lifecycle::{ContinuePlan, DebugEventLifecycle, DecodeDisposition};
@@ -119,6 +121,9 @@ pub struct WindowsDebugger {
     post_attach_resumed: bool,
     /// Exactly-once pending debug-event identity (Wait 闁?Continue contract).
     lifecycle: DebugEventLifecycle,
+    /// ADR7-B4: optional dynamic-instrumentation observer (debugger-side
+    /// event recorder). None = B4 disabled (zero perturbation).
+    b4_observer: Option<Arc<Adr7B4Observer>>,
     /// ADR-5B-R1: cumulative drain counters (audit + tests).
     drain_stats: DrainStats,
     /// ADR-5B-R1: TIDs whose CREATE_THREAD was observed by the drain path.
@@ -175,6 +180,7 @@ impl WindowsDebugger {
             ownership,
             post_attach_resumed: false,
             lifecycle: DebugEventLifecycle::new(root_pid),
+            b4_observer: None,
             drain_stats: DrainStats::default(),
             drain_observed_create_tids: std::collections::HashSet::new(),
             drain_receipts: Vec::new(),
@@ -186,6 +192,13 @@ impl WindowsDebugger {
         }
 
         Ok(dbg)
+    }
+
+    /// Attach the ADR7-B4 dynamic-instrumentation observer.
+    /// The observer records runtime-load, breakpoint-hit and exception events
+    /// (debugger-side recorder; the target and the runtime DLL are untouched).
+    pub fn attach_b4_observer(&mut self, obs: Arc<Adr7B4Observer>) {
+        self.b4_observer = Some(obs);
     }
 
     /// Prepare post-attach observation while leaving the main thread suspended.
@@ -2169,6 +2182,66 @@ impl WindowsDebugger {
                 Err(e) => return Err(e),
             };
 
+            // ADR7-B4: debugger-side event recording (main loop path).
+            // Runtime DLL detection + observation-point installation happen
+            // in the drain path; here we record every decoded event and any
+            // breakpoint hit so the timeline covers the full session.
+            let b4_clone = self.b4_observer.clone();
+            if let Some(obs) = &b4_clone {
+                if let DebugEvent::LoadDll { base_address, .. } = &ev {
+                    let resolved = self.resolve_module_for_address(*base_address);
+                    match resolved {
+                        Ok(Some((name, base))) if name == "mida_antidebug_runtime.dll" => {
+                            obs.record_runtime_loaded(process_id, thread_id, base);
+                            let points = [
+                                (0x2ed90u64, 0usize),
+                                (0x2edb6u64, 1usize),
+                                (0x2e5f4u64, 2usize),
+                                (0x2e628u64, 3usize),
+                            ];
+                            if Adr7B4Observer::active_breakpoints() {
+                                for (rva, slot) in points {
+                                    let va = base + rva;
+                                    let _ = self.set_hw_breakpoint(slot, va as usize, HwbpType::Execute);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                match &ev {
+                    DebugEvent::Breakpoint { address, .. } => {
+                        let _ = obs.record_breakpoint(process_id, thread_id, *address);
+                    }
+                    DebugEvent::ExitProcess { exit_code } => {
+                        let _ = obs.record(
+                            B4EventKind::ProcessExit,
+                            process_id,
+                            thread_id,
+                            None,
+                            None,
+                            None,
+                            Some(format!("exit_code={exit_code}")),
+                            None,
+                            None,
+                        );
+                    }
+                    _ => {
+                        let _ = obs.record(
+                            B4EventKind::DebugEvent,
+                            process_id,
+                            thread_id,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                        );
+                    }
+                }
+            }
+
             // Main loop: side effects only; the summary counters belong to
             // the drain path (ADR-5B-R1 F-002/F-003/F-004).
             self.apply_event_bookkeeping(&ev)?;
@@ -2402,6 +2475,29 @@ impl WindowsDebugger {
             // the original exception receipt. Continuation policy unchanged.
             let exception_address = exc.ExceptionRecord.ExceptionAddress as u64;
             self.capture_exception_context(thread_id, exception_address, &mut receipt);
+            // ADR7-B4: record the exception event (debugger-side recorder).
+            // The continuation decision is filled in below per policy.
+            if let Some(obs) = &self.b4_observer {
+                let kind = if first_chance {
+                    B4EventKind::FirstChanceException
+                } else {
+                    B4EventKind::SecondChanceException
+                };
+                let rip = receipt.instruction_pointer;
+                let rsp = receipt.stack_pointer;
+                let rec = obs.record(
+                    kind,
+                    process_id,
+                    thread_id,
+                    Some(exception_address),
+                    Some(code),
+                    Some(first_chance),
+                    None,
+                    rip,
+                    rsp,
+                );
+                let _ = rec;
+            }
             self.drain_stats.events_drained += 1;
             self.drain_stats.last_sequence = sequence;
             // Audit F-002: SECOND-CHANCE check comes FIRST, before the
@@ -2430,6 +2526,40 @@ impl WindowsDebugger {
             let debugger_owned =
                 code == EXCEPTION_BREAKPOINT.0 as u32 || code == EXCEPTION_SINGLE_STEP.0 as u32;
             if debugger_owned {
+                // ADR7-B4: record the breakpoint/single-step hit.
+                if let Some(obs) = &self.b4_observer {
+                    let _ = obs.record_breakpoint(process_id, thread_id, exception_address);
+                }
+                // ADR7-B4 FIX: a hardware-breakpoint #DB must not re-fire on
+                // the same instruction. Set the Resume Flag (RF, bit 16) and
+                // clear DR6 so DBG_CONTINUE lets the instruction complete.
+                // This mirrors the main-loop Breakpoint handler; without it
+                // the drain window spins forever on the same DR hit.
+                if code == EXCEPTION_SINGLE_STEP.0 as u32 {
+                    let mut ctx = self.get_thread_context_control(thread_id).ok();
+                    if let Some(ctx_ref) = ctx.as_mut() {
+                        ctx_ref.EFlags |= 0x10000; // RF
+                        #[cfg(target_arch = "x86_64")]
+                        {
+                            ctx_ref.ContextFlags = windows::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_AMD64
+                                | windows::Win32::System::Diagnostics::Debug::CONTEXT_DEBUG_REGISTERS_AMD64;
+                        }
+                        #[cfg(target_arch = "x86")]
+                        {
+                            ctx_ref.ContextFlags = windows::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_X86
+                                | windows::Win32::System::Diagnostics::Debug::CONTEXT_DEBUG_REGISTERS_X86;
+                        }
+                        if let Ok(dbg_ctx) = self.get_thread_context_dbg(thread_id) {
+                            ctx_ref.Dr0 = dbg_ctx.Dr0;
+                            ctx_ref.Dr1 = dbg_ctx.Dr1;
+                            ctx_ref.Dr2 = dbg_ctx.Dr2;
+                            ctx_ref.Dr3 = dbg_ctx.Dr3;
+                            ctx_ref.Dr6 = 0; // clear -> prevent re-fire
+                            ctx_ref.Dr7 = dbg_ctx.Dr7;
+                        }
+                        let _ = self.set_thread_context(thread_id, ctx_ref);
+                    }
+                }
                 // Debugger-injected breakpoints / single-step traps (first
                 // chance): we own these faults, continue with DBG_CONTINUE.
                 receipt.disposition = DrainDisposition::Exception;
@@ -2462,6 +2592,36 @@ impl WindowsDebugger {
         // result) — a counter is never incremented from an assumption.
         let ev = Self::decode_event(&raw)?;
         let summary = self.apply_event_bookkeeping(&ev)?;
+        // ADR7-B4: detect the runtime DLL load, record the base, and install
+        // the observation-point hardware breakpoints (RVA -> VA).
+        let b4_clone = self.b4_observer.clone();
+        if let Some(obs) = &b4_clone {
+            if let DebugEvent::LoadDll { base_address, .. } = &ev {
+                let resolved = self.resolve_module_for_address(*base_address);
+                match resolved {
+                    Ok(Some((name, base))) if name == "mida_antidebug_runtime.dll" => {
+                        obs.record_runtime_loaded(process_id, thread_id, base);
+                        // Observation points: increase entry, fault RVA,
+                        // panic_with_hook entry, call site (slots 0-3).
+                        // Installed ONLY in active mode (MIDA_B4_OBSERVER=1);
+                        // passive mode (2) records events without touching DRs.
+                        if Adr7B4Observer::active_breakpoints() {
+                            let points = [
+                                (0x2ed90u64, 0usize),
+                                (0x2edb6u64, 1usize),
+                                (0x2e5f4u64, 2usize),
+                                (0x2e628u64, 3usize),
+                            ];
+                            for (rva, slot) in points {
+                                let va = base + rva;
+                                let _ = self.set_hw_breakpoint(slot, va as usize, HwbpType::Execute);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
         self.drain_stats.events_drained += 1;
         self.drain_stats.last_sequence = sequence;
         match &ev {
@@ -3203,6 +3363,7 @@ mod tests {
             ownership: ProcessOwnership::OwnedLaunch,
             post_attach_resumed: false,
             lifecycle: DebugEventLifecycle::new(0),
+            b4_observer: None,
             drain_stats: DrainStats::default(),
             drain_observed_create_tids: std::collections::HashSet::new(),
             drain_receipts: Vec::new(),
@@ -3241,6 +3402,7 @@ mod tests {
             ownership: ProcessOwnership::OwnedLaunch,
             post_attach_resumed: false,
             lifecycle: DebugEventLifecycle::new(0),
+            b4_observer: None,
             drain_stats: DrainStats::default(),
             drain_observed_create_tids: std::collections::HashSet::new(),
             drain_receipts: Vec::new(),
@@ -3283,6 +3445,7 @@ mod tests {
             ownership: ProcessOwnership::OwnedLaunch,
             post_attach_resumed: false,
             lifecycle: DebugEventLifecycle::new(0),
+            b4_observer: None,
             drain_stats: DrainStats::default(),
             drain_observed_create_tids: std::collections::HashSet::new(),
             drain_receipts: Vec::new(),
@@ -3357,6 +3520,7 @@ mod tests {
             ownership: ProcessOwnership::OwnedLaunch,
             post_attach_resumed: false,
             lifecycle: DebugEventLifecycle::new(0),
+            b4_observer: None,
             drain_stats: DrainStats::default(),
             drain_observed_create_tids: std::collections::HashSet::new(),
             drain_receipts: Vec::new(),

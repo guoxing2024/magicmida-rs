@@ -9,6 +9,7 @@
 //! R2 adds pure address newtypes ([`addr`]) so preferred ImageBase and ASLR
 //! runtime base are not mixed as raw `u64`.
 
+pub mod adr7_b4_observer;
 pub mod addr;
 pub mod breakpoint;
 pub mod capture_epoch;
