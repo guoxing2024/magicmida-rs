@@ -12,6 +12,7 @@
 pub mod addr;
 pub mod adr7_b4_observer;
 pub mod b4_runtime_offsets;
+pub mod b5_tls_capture;
 pub mod breakpoint;
 pub mod capture_epoch;
 pub mod cleanup;

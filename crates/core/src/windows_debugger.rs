@@ -27,6 +27,10 @@ use windows::Win32::System::Diagnostics::Debug::{
 use windows::Win32::System::Memory::{VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_IMAGE};
 use windows::Win32::System::ProcessStatus::GetMappedFileNameW;
 use windows::Win32::System::Threading::INFINITE;
+#[cfg(target_arch = "x86_64")]
+use windows::Wdk::System::Threading::{
+    NtQueryInformationThread, ThreadBasicInformation,
+};
 
 use crate::adr7_b4_observer::{Adr7B4Observer, B4EventKind};
 use crate::breakpoint::{HwBreakpoint, HwbpType};
@@ -2384,6 +2388,206 @@ impl WindowsDebugger {
             }
         }
     }
+
+    /// ADR7-B5: capture the TLS scene for a thread: TEB base (via
+    /// NtQueryInformationThread ThreadBasicInformation), TLS array pointer
+    /// (TEB+0x58), module _tls_index (read from the runtime image), TLS slot
+    /// pointer (array[index]), slot page state/protect (VirtualQueryEx), and
+    /// the LOCAL_PANIC_COUNT fields (counter at slot+0x18, flag at slot+0x20).
+    /// Failures are collected into the snapshot (never fatal).
+    #[cfg(target_arch = "x86_64")]
+    fn capture_tls_scene(&self, thread_id: u32, runtime_base: u64) -> crate::b5_tls_capture::TlsSnapshot {
+        use crate::b5_tls_capture::{
+            TlsClassification, TlsSnapshot, LOCAL_PANIC_COUNT_COUNTER_OFFSET,
+            LOCAL_PANIC_COUNT_FLAG_OFFSET, TLS_ARRAY_TEB_OFFSET, TLS_INDEX_RVA,
+        };
+        use windows::Win32::System::Threading::{OpenThread, THREAD_QUERY_INFORMATION};
+        use windows::Win32::System::Memory::{VirtualQueryEx, MEMORY_BASIC_INFORMATION};
+
+        let mut snap = TlsSnapshot {
+            tid: thread_id,
+            teb_address: None,
+            tls_array_base: None,
+            tls_index: None,
+            tls_slot_pointer: None,
+            slot_page_state: None,
+            slot_page_protect: None,
+            local_panic_count_counter: None,
+            local_panic_count_flag: None,
+            classification: TlsClassification::CaptureFailed,
+            capture_error: None,
+        };
+
+        // SAFETY: OpenThread with QUERY_INFORMATION; handle is fresh and owned.
+        let handle = unsafe { OpenThread(THREAD_QUERY_INFORMATION, false, thread_id) };
+        let Ok(handle) = handle else {
+            snap.capture_error = Some(format!("OpenThread failed for tid {thread_id}"));
+            snap.classify();
+            return snap;
+        };
+        let _guard = ScopedThreadHandle::new(handle);
+
+        // ThreadBasicInformation -> TebBaseAddress.
+        #[repr(C)]
+        struct ThreadBasicInfo {
+            exit_status: i32,
+            teb_base_address: *mut core::ffi::c_void,
+            unique_process: usize,
+            unique_thread: usize,
+            affinity_mask: usize,
+            priority: i32,
+            base_priority: i32,
+        }
+        let mut tbi = ThreadBasicInfo {
+            exit_status: 0,
+            teb_base_address: core::ptr::null_mut(),
+            unique_process: 0,
+            unique_thread: 0,
+            affinity_mask: 0,
+            priority: 0,
+            base_priority: 0,
+        };
+        let mut ret_len: u32 = 0;
+        // SAFETY: tbi is a valid out-buffer of the exact struct size.
+        let status = unsafe {
+            NtQueryInformationThread(
+                handle,
+                ThreadBasicInformation,
+                (&mut tbi as *mut ThreadBasicInfo).cast(),
+                std::mem::size_of::<ThreadBasicInfo>() as u32,
+                &mut ret_len,
+            )
+        };
+        if status.is_err() || tbi.teb_base_address.is_null() {
+            snap.capture_error = Some(format!(
+                "NtQueryInformationThread failed for tid {thread_id} status={status:?}"
+            ));
+            snap.classify();
+            return snap;
+        }
+        let teb = tbi.teb_base_address as u64;
+        snap.teb_address = Some(teb);
+
+        // Read closures over ReadProcessMemory / VirtualQueryEx.
+        let read = |addr: u64, buf: &mut [u8]| -> Result<usize, String> {
+            let mut bytes_read: usize = 0;
+            // SAFETY: valid process handle and out-buffer.
+            unsafe {
+                windows::Win32::System::Diagnostics::Debug::ReadProcessMemory(
+                    self.process.handle,
+                    addr as *const core::ffi::c_void,
+                    buf.as_mut_ptr() as *mut core::ffi::c_void,
+                    buf.len(),
+                    Some(&mut bytes_read),
+                )
+                .map_err(|e| format!("ReadProcessMemory {addr:#x}: {e:?}"))?;
+            }
+            Ok(bytes_read)
+        };
+        let query_page = |addr: u64| -> Option<(u32, u32)> {
+            let mut mbi = MEMORY_BASIC_INFORMATION::default();
+            // SAFETY: valid process handle; mbi out-param.
+            let n = unsafe {
+                VirtualQueryEx(
+                    self.process.handle,
+                    Some(addr as *const core::ffi::c_void),
+                    &mut mbi,
+                    std::mem::size_of::<MEMORY_BASIC_INFORMATION>() as usize,
+                )
+            };
+            if n == 0 {
+                return None;
+            }
+            Some((mbi.State.0, mbi.Protect.0))
+        };
+
+        // TLS array base from TEB+0x58.
+        let mut arr_buf = [0u8; 8];
+        match read(teb + TLS_ARRAY_TEB_OFFSET, &mut arr_buf) {
+            Ok(8) => {
+                let arr = u64::from_le_bytes(arr_buf);
+                snap.tls_array_base = Some(arr);
+                if arr == 0 {
+                    snap.classify();
+                    return snap;
+                }
+            }
+            Ok(n) => {
+                snap.capture_error = Some(format!("TLS array short read ({n}/8)"));
+                snap.classify();
+                return snap;
+            }
+            Err(e) => {
+                snap.capture_error = Some(format!("TLS array read: {e}"));
+                snap.classify();
+                return snap;
+            }
+        }
+
+        // Module _tls_index from the runtime image.
+        let mut idx_buf = [0u8; 4];
+        match read(runtime_base + u64::from(TLS_INDEX_RVA), &mut idx_buf) {
+            Ok(4) => {
+                snap.tls_index = Some(u32::from_le_bytes(idx_buf));
+            }
+            Ok(n) => {
+                snap.capture_error = Some(format!("_tls_index short read ({n}/4)"));
+                snap.classify();
+                return snap;
+            }
+            Err(e) => {
+                snap.capture_error = Some(format!("_tls_index read: {e}"));
+                snap.classify();
+                return snap;
+            }
+        }
+        let idx = snap.tls_index.unwrap_or(0);
+
+        // TLS slot pointer: array[ idx ] (8 bytes each).
+        let mut slot_buf = [0u8; 8];
+        let array_base = snap.tls_array_base.unwrap_or(0);
+        match read(array_base + u64::from(idx) * 8, &mut slot_buf) {
+            Ok(8) => {
+                let slot = u64::from_le_bytes(slot_buf);
+                snap.tls_slot_pointer = Some(slot);
+                if slot == 0 {
+                    snap.classify();
+                    return snap;
+                }
+            }
+            Ok(n) => {
+                snap.capture_error = Some(format!("TLS slot short read ({n}/8)"));
+                snap.classify();
+                return snap;
+            }
+            Err(e) => {
+                snap.capture_error = Some(format!("TLS slot read: {e}"));
+                snap.classify();
+                return snap;
+            }
+        }
+        let slot = snap.tls_slot_pointer.unwrap_or(0);
+
+        // Page state/protect for the slot.
+        snap.slot_page_state = query_page(slot).map(|(s, _)| s);
+        snap.slot_page_protect = query_page(slot).map(|(_, p)| p);
+
+        // LOCAL_PANIC_COUNT counter (+0x18) and flag (+0x20).
+        let mut cnt_buf = [0u8; 8];
+        match read(slot + LOCAL_PANIC_COUNT_COUNTER_OFFSET, &mut cnt_buf) {
+            Ok(8) => snap.local_panic_count_counter = Some(u64::from_le_bytes(cnt_buf)),
+            _ => snap.capture_error = Some("LOCAL_PANIC_COUNT counter unreadable".into()),
+        }
+        let mut flag_buf = [0u8; 1];
+        match read(slot + LOCAL_PANIC_COUNT_FLAG_OFFSET, &mut flag_buf) {
+            Ok(1) => snap.local_panic_count_flag = Some(flag_buf[0]),
+            _ => snap.capture_error = Some("LOCAL_PANIC_COUNT flag unreadable".into()),
+        }
+
+        snap.classify();
+        snap
+    }
+
     /// Consume at most one debug event with full lifecycle bookkeeping
     /// (ADR-5B-R1). Used by the loader window to keep the debug session alive
     /// while a remote thread runs: every event passes through the same
@@ -2491,7 +2695,23 @@ impl WindowsDebugger {
                 };
                 let rip = receipt.instruction_pointer;
                 let rsp = receipt.stack_pointer;
-                let rec = obs.record(
+                // ADR7-B5: capture the TLS scene for the faulting thread when
+                // the runtime is present. Best effort, never fatal.
+                let tls = if obs.runtime_observed() {
+                    let rt_base = obs.runtime_base();
+                    let snap = self.capture_tls_scene(thread_id, rt_base);
+                    if snap.capture_error.is_none() {
+                        tracing::debug!(
+                            tid = thread_id,
+                            classification = snap.classification.as_str(),
+                            "ADR7-B5 TLS scene captured"
+                        );
+                    }
+                    Some(snap)
+                } else {
+                    None
+                };
+                let rec = obs.record_with_tls(
                     kind,
                     process_id,
                     thread_id,
@@ -2501,6 +2721,7 @@ impl WindowsDebugger {
                     None,
                     rip,
                     rsp,
+                    tls,
                 );
                 let _ = rec;
             }

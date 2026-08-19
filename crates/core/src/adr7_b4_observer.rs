@@ -167,6 +167,9 @@ pub struct B4Record {
     pub continuation: Option<String>,
     /// Call-stack snapshot (raw return addresses; symbols resolved offline).
     pub call_stack: Vec<u64>,
+    /// ADR7-B5: TLS scene snapshot for the faulting thread (None when not
+    /// captured for this record).
+    pub tls_snapshot: Option<crate::b5_tls_capture::TlsSnapshot>,
 }
 
 impl B4Record {
@@ -188,6 +191,7 @@ impl B4Record {
             first_chance: None,
             continuation: None,
             call_stack: Vec::new(),
+            tls_snapshot: None,
         }
     }
 
@@ -291,6 +295,27 @@ impl Adr7B4Observer {
         rec.post_exception_rip = rip;
         rec.post_exception_rsp = rsp;
         self.records.lock().unwrap().push(rec.clone());
+        rec
+    }
+
+    /// Record a debug event with an optional ADR7-B5 TLS scene snapshot.
+    pub fn record_with_tls(
+        &self,
+        kind: B4EventKind,
+        pid: u32,
+        tid: u32,
+        addr: Option<u64>,
+        exception_code: Option<u32>,
+        first_chance: Option<bool>,
+        continuation: Option<String>,
+        rip: Option<u64>,
+        rsp: Option<u64>,
+        tls: Option<crate::b5_tls_capture::TlsSnapshot>,
+    ) -> B4Record {
+        let mut rec = self.record(
+            kind, pid, tid, addr, exception_code, first_chance, continuation, rip, rsp,
+        );
+        rec.tls_snapshot = tls;
         rec
     }
 
@@ -434,6 +459,21 @@ impl Adr7B4Observer {
                 "      \"continuation\": {},\n",
                 opt_str(r.continuation.as_deref())
             ));
+            if let Some(tls) = &r.tls_snapshot {
+                out.push_str(&format!("      \"tls_snapshot\": {{\n"));
+                out.push_str(&format!("        \"tid\": {},\n", tls.tid));
+                out.push_str(&format!("        \"teb_address\": {},\n", opt_hex(tls.teb_address)));
+                out.push_str(&format!("        \"tls_array_base\": {},\n", opt_hex(tls.tls_array_base)));
+                out.push_str(&format!("        \"tls_index\": {},\n", opt_u32(tls.tls_index)));
+                out.push_str(&format!("        \"tls_slot_pointer\": {},\n", opt_hex(tls.tls_slot_pointer)));
+                out.push_str(&format!("        \"slot_page_state\": {},\n", opt_u32(tls.slot_page_state)));
+                out.push_str(&format!("        \"slot_page_protect\": {},\n", opt_u32(tls.slot_page_protect)));
+                out.push_str(&format!("        \"local_panic_count_counter\": {},\n", opt_u64(tls.local_panic_count_counter)));
+                out.push_str(&format!("        \"local_panic_count_flag\": {},\n", opt_u8(tls.local_panic_count_flag)));
+                out.push_str(&format!("        \"classification\": \"{}\",\n", tls.classification.as_str()));
+                out.push_str(&format!("        \"capture_error\": {}\n", opt_str(tls.capture_error.as_deref())));
+                out.push_str("      },\n");
+            }
             out.push_str("      \"call_stack\": [");
             for (j, v) in r.call_stack.iter().enumerate() {
                 if j > 0 {
@@ -452,6 +492,11 @@ impl Adr7B4Observer {
     pub fn runtime_observed(&self) -> bool {
         *self.runtime_base.lock().unwrap() != 0
     }
+
+    /// The observed runtime module base (0 until the runtime DLL load is seen).
+    pub fn runtime_base(&self) -> u64 {
+        *self.runtime_base.lock().unwrap()
+    }
 }
 
 /// B4 observer state helper: static observation point labels (sorted).
@@ -460,6 +505,30 @@ pub fn obs_point_labels() -> BTreeMap<u32, String> {
         .iter()
         .map(|(rva, name)| (*rva, name.to_string()))
         .collect()
+}
+
+/// Format an Option<u32> as JSON.
+fn opt_u32(v: Option<u32>) -> String {
+    match v {
+        Some(x) => format!("{x}"),
+        None => "null".to_string(),
+    }
+}
+
+/// Format an Option<u64> as JSON.
+fn opt_u64(v: Option<u64>) -> String {
+    match v {
+        Some(x) => format!("{x}"),
+        None => "null".to_string(),
+    }
+}
+
+/// Format an Option<u8> as JSON.
+fn opt_u8(v: Option<u8>) -> String {
+    match v {
+        Some(x) => format!("{x}"),
+        None => "null".to_string(),
+    }
 }
 
 /// Format an Option<u64> as a JSON string literal or null.
