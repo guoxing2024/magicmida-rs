@@ -239,12 +239,15 @@ D:\MidaVault\lab\evidence\gto_cold_start_heap_rebase_1\H4D_exception_no_reloc\
 │   ├── runtime_exception_observation.schema.json
 │   ├── final_exception_decoder.schema.json
 │   ├── no_reloc_state.schema.json
-│   └── exception_evidence.schema.json   # final sidecar schema
+│   └── exception_evidence.schema.json   # final sidecar schema (正式 JSON Schema draft-07)
 ├── negative_tests/
-│   └── records.jsonl             # 每负例: id, construct, expected_blocker, actual_blocker, pass
-├── build_attestation_reference.json   # 指向 GTO CLI 构建 attestation (H4-D 实施时更新)
-├── layout_A/                     # live evidence 独立布局 (禁止共享 child.stderr.bin 等)
-│   ├── child.stderr.bin
+│   └── records.jsonl             # 每负例: id, construct, expected_blocker; stage=DESIGN,
+│                                 # validation_status=NOT_EXECUTED, pass=null (未跑 live 前禁止称"已验证")
+├── build_attestation_reference.json   # 如实记录: H4-D 尚无专用 build attestation;
+│                                 # status=PENDING_H4D_BUILD; H4-C 时代引用仅为环境参照, 不冒充
+├── layout_A/                     # 占位目录已落盘, 含 layout_status.json
+│   ├── layout_status.json        #   {schema, layout, status: "NOT_STARTED"}
+│   ├── child.stderr.bin          # live 时写入 (禁止跨布局共享)
 │   ├── child.stdout.bin
 │   ├── controller_run.json
 │   ├── capture_policy.json
@@ -252,10 +255,16 @@ D:\MidaVault\lab\evidence\gto_cold_start_heap_rebase_1\H4D_exception_no_reloc\
 └── layout_B/  layout_C/          # 同上, 每布局独立
 ```
 
+schemas/ 语义 (冻结): 4 个文件均为**正式 JSON Schema (draft-07)** — 含
+`$schema`/`$id`/`type`/`properties`/`required`/`additionalProperties`,
+可被 jsonschema Draft7Validator 直接执行 (check_schema 通过, 坏样本被拒)。
+它们不是"轻量字段描述"。
+
 live 证据规则 (冻结):
 - 每布局独立子目录, 禁止共享 child.stderr.bin / child.stdout.bin / controller_run.json
 - seal 工具放 evidence root 外 (沿用 H4-C Seal-2 纪律)
 - created_utc 用实际签封时间
+- layout_A/B/C 在 live 授权前保持 status=NOT_STARTED; 授权后运行才翻转
 
 ## 6. D6 — 设计验收门 (完成条件)
 
