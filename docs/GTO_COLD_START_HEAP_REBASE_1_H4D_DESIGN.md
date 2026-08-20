@@ -1,7 +1,7 @@
 # GTO-COLD-START-HEAP-REBASE-1 — H4-D Design: Exception/Unwind + No-Reloc
 
-> status: DESIGN PREPARATION (GTO-H4-D-DESIGN-1) — no live matrix, no loader smoke, no H5
-> authorization: 总指挥 2026-08-20 审核核验通过; H4-D live 解锁但未开始
+> status: DESIGN PREPARATION (GTO-H4-D-DESIGN-1 + CORRECTION-1/2) — no live matrix, no loader smoke, no H5
+> authorization: 总指挥 2026-08-20 审核 D1-D4 设计通过; GTO-H4-D-LIVE-AUTHORIZATION-1 NOT granted — live 未解锁
 > discipline: 静态审阅 + 设计 + 数据模型 + 负例矩阵; 不伪造 exception/unwind/relocation 数据
 > ADR7: FROZEN (17/17 PASS) — 本设计不改动任何 frozen evidence / verifier
 > 参照: H4-C 模式 (runtime observation -> candidate reparse -> independent decoder -> fail-closed writer)
