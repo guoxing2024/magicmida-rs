@@ -20,6 +20,7 @@ pub enum EvidenceMemberKind {
     Iat,
     Tls,
     Relocation,
+    Exception,
     SectionRebuild,
     /// PE evidence is produced via the acceptance binary; the CLI-side dispatch
     /// keeps the variant so the family->schema table is complete (the
@@ -34,6 +35,7 @@ pub mod unpack {
     pub const IAT: &str = "mida.unpack-iat-evidence/v1";
     pub const TLS: &str = "mida.unpack-tls-evidence/v1";
     pub const RELOCATION: &str = "mida.unpack-relocation-evidence/v1";
+    pub const EXCEPTION: &str = "mida.unpack-exception-evidence/v1";
     pub const SECTION_REBUILD: &str = "mida.unpack-section-rebuild-evidence/v1";
     pub const PE: &str = "mida.unpack-pe-evidence/v1";
 }
@@ -44,6 +46,7 @@ pub mod oreans {
     pub const IAT: &str = "mida.oreans-iat-evidence/v1";
     pub const TLS: &str = "mida.oreans-tls-evidence/v1";
     pub const RELOCATION: &str = "mida.oreans-relocation-evidence/v1";
+    pub const EXCEPTION: &str = "mida.oreans-exception-evidence/v1";
     pub const SECTION_REBUILD: &str = "mida.oreans-section-rebuild-evidence/v1";
     pub const PE: &str = "mida.oreans-pe-evidence/v1";
 }
@@ -73,6 +76,7 @@ fn oreans_schema(kind: EvidenceMemberKind) -> &'static str {
         EvidenceMemberKind::Iat => oreans::IAT,
         EvidenceMemberKind::Tls => oreans::TLS,
         EvidenceMemberKind::Relocation => oreans::RELOCATION,
+        EvidenceMemberKind::Exception => oreans::EXCEPTION,
         EvidenceMemberKind::SectionRebuild => oreans::SECTION_REBUILD,
         EvidenceMemberKind::Pe => oreans::PE,
     }
@@ -84,6 +88,7 @@ fn unpack_schema(kind: EvidenceMemberKind) -> &'static str {
         EvidenceMemberKind::Iat => unpack::IAT,
         EvidenceMemberKind::Tls => unpack::TLS,
         EvidenceMemberKind::Relocation => unpack::RELOCATION,
+        EvidenceMemberKind::Exception => unpack::EXCEPTION,
         EvidenceMemberKind::SectionRebuild => unpack::SECTION_REBUILD,
         EvidenceMemberKind::Pe => unpack::PE,
     }
@@ -148,6 +153,7 @@ mod tests {
             "iat_evidence" => Some(EvidenceMemberKind::Iat),
             "tls_evidence" => Some(EvidenceMemberKind::Tls),
             "relocation_evidence" => Some(EvidenceMemberKind::Relocation),
+            "exception_evidence" => Some(EvidenceMemberKind::Exception),
             "section_rebuild_evidence" => Some(EvidenceMemberKind::SectionRebuild),
             "pe_evidence" => Some(EvidenceMemberKind::Pe),
             "transform_manifest" => None, // shared, versioned; not in the dispatch enum

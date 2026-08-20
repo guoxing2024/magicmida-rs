@@ -23,6 +23,8 @@ pub mod byte_map;
 pub mod dll_exports;
 pub mod dumper;
 pub mod error;
+pub mod exception_final;
+pub mod exception_observation;
 pub mod exception_table;
 pub mod export_table;
 pub mod header;
@@ -54,6 +56,16 @@ pub use dumper::{
     PureRebuildParitySnapshot,
 };
 pub use error::PeError;
+pub use exception_final::{
+    compare_runtime_final, ExceptionFinalDecoder, ExceptionFinalReport,
+    ExceptionPreservationComparison,
+};
+pub use exception_observation::{
+    observe_exception_runtime, ExceptionDirectoryStatus, ExceptionObservationReport,
+    RuntimeFunctionObservation, RuntimeFunctionStatus, UnwindCodeObservation, UnwindCodeStatus,
+    UnwindInfoObservation, UnwindInfoStatus, MAX_EXCEPTION_DIRECTORY_BYTES,
+    UNWIND_INFO_HEADER_SIZE,
+};
 pub use exception_table::{
     minimal_x64_unwind_info, ExceptionTableBuilder, RuntimeFunction, RUNTIME_FUNCTION_SIZE,
 };

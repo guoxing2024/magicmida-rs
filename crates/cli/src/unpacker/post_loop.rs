@@ -430,6 +430,38 @@ pub(super) fn run_post_loop_phases(
         ),
     );
 
+    // GTO-H4-D: candidate-bound exception evidence (independent final decode
+    // + no-reloc state cross-check). Final relocation base state is derived
+    // from the candidate's own PE header (fresh reparse, never the dump
+    // object): if the on-disk image base differs from the runtime base, the
+    // D2.2-4 cross-check must fail closed.
+    let final_reloc_state = {
+        use mida_pe::header::PeHeader;
+        let candidate_bytes =
+            std::fs::read(output_path).context("read candidate for exception evidence")?;
+        let candidate_pe = PeHeader::from_bytes(&candidate_bytes)
+            .context("parse candidate PE for exception evidence")?;
+        super::exception_evidence::NoRelocFinalState {
+            image_base_changed: candidate_pe.image_base
+                != dump_report.relocation_report.runtime_image_base,
+        }
+    };
+    let exception_sidecar_path = super::exception_evidence::write_exception_evidence(
+        input,
+        output_path,
+        &dump_report,
+        family_id,
+        &final_reloc_state,
+    )
+    .context("write candidate-bound exception evidence sidecar")?;
+    log::log(
+        LogType::Info,
+        &format!(
+            "Exception evidence sidecar written: {}",
+            exception_sidecar_path.display()
+        ),
+    );
+
     let section_rebuild_sidecar_path =
         write_section_rebuild_evidence(input, output_path, family_id)
             .context("write candidate-bound section rebuild evidence sidecar")?;

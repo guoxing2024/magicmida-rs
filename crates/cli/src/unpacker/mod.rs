@@ -26,6 +26,7 @@ pub mod bundle_assembler;
 mod dump;
 mod early_snapshots;
 pub(crate) mod evidence_schema;
+mod exception_evidence;
 mod generic;
 pub mod generic_bundle_assembler;
 mod generic_gate;

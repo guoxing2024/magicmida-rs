@@ -203,6 +203,12 @@ pub struct DumpProcessReport {
     pub relocation_evidence_complete: bool,
     /// Immutable runtime base-relocation observation.
     pub relocation_report: crate::relocation_observation::RelocationObservationReport,
+    /// Immutable runtime exception-directory observation (GTO-H4-D).
+    pub exception_evidence_present: bool,
+    /// Whether the immutable runtime exception observation had no blocker.
+    pub exception_evidence_complete: bool,
+    /// Immutable runtime exception-directory observation captured before dump mutation.
+    pub exception_report: crate::exception_observation::ExceptionObservationReport,
     /// Number of bytes in the final candidate written to disk.
     pub output_size: usize,
 }

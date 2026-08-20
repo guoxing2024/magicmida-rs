@@ -431,6 +431,21 @@ pub fn dump_process_with_report(
                 .map_err(|error| error.to_string())
         },
     );
+    // Freeze exception-directory facts before header patching, shrinking, or
+    // rebuilding .pdata (GTO-H4-D D1). Runtime observation is the only truth
+    // for the exception directory; rebuilt bytes are never runtime proof.
+    let exception_report = crate::exception_observation::observe_exception_runtime(
+        &pe,
+        opts.image_base,
+        preferred_image_base,
+        |address, buffer| {
+            let native_address = usize::try_from(address)
+                .map_err(|_| format!("exception reader address {address:#x} does not fit usize"))?;
+            debugger
+                .read_memory(native_address, buffer)
+                .map_err(|error| error.to_string())
+        },
+    );
 
     // 1a. Validate and patch PE header fields
     validate_and_patch_pe_header(&mut pe, opts)?;
@@ -2633,6 +2648,9 @@ pub fn dump_process_with_report(
         relocation_evidence_present: relocation_report.directory_present,
         relocation_evidence_complete: relocation_report.is_complete(),
         relocation_report,
+        exception_evidence_present: exception_report.directory_present,
+        exception_evidence_complete: exception_report.is_complete(),
+        exception_report,
         output_size: out_data.len(),
     })
 }
