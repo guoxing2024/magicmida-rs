@@ -883,12 +883,36 @@ pub fn supplement_uncovered_probe_slabs(
             continue;
         }
         let is_probe = matches!(g.extent_kind, CEK::ProbeWindow | CEK::InteriorSubview);
-        if !is_probe {
+        // GTO-COLD-START-HEAP-REBASE-1 H2 (attempt_018 wall): an image-root /
+        // main-slot captured region (RawCaptured provenance, ObservedAllocation
+        // extent) can also sit outside every authoritative slab when the run
+        // has NO main slab (AHK multi-heap: process heap + private heaps +
+        // CRT heap; capture_heap_slab produced nothing, H2 supplemented 239
+        // probe dedicated slabs, but this MainSlot region 0x9f6f00 stayed
+        // uncovered). Unlike a ProbeWindow (heuristic read), an
+        // ObservedAllocation has a proven boundary from capture evidence, so
+        // surfacing it as its own dedicated slab is sound. All fail-closed
+        // guards below (conflicts, bad pointers, interior-with-parent) still
+        // apply unchanged.
+        if !is_probe
+            && !matches!(
+                (&g.provenance, g.extent_kind),
+                (
+                    RegionProvenance::RawCaptured { .. },
+                    CEK::ObservedAllocation
+                )
+            )
+        {
             continue;
         }
         // Interior children are covered by their containing parent's slab —
-        // re-surfacing them would create ambiguous multi-coverage.
-        if g.extent_evidence.was_interior || g.extent_evidence.containing_parent_old_base.is_some()
+        // re-surfacing them would create ambiguous multi-coverage. Exception
+        // (GTO-COLD-START-HEAP-REBASE-1 H2): a split-sibling interior child
+        // whose parent authority was LOST (containing_parent_old_base=None —
+        // heuristic/ambiguous parent per MIDA-SERIAL-34/39) has no slab to
+        // depend on; it must be supplemented itself or the coverage gate fails
+        // closed even though every byte was a valid live read.
+        if g.extent_evidence.was_interior && g.extent_evidence.containing_parent_old_base.is_some()
         {
             continue;
         }
@@ -9086,6 +9110,54 @@ mod tests {
         assert_eq!(added, 0, "interior child must not be re-surfaced");
     }
 
+    /// GTO-COLD-START-HEAP-REBASE-1 H2 regression: a split-sibling interior
+    /// child whose parent authority was LOST (containing_parent_old_base=None,
+    /// heuristic/ambiguous parent) has no slab to depend on. It must be
+    /// supplemented itself, otherwise capture_coverage_bind fails closed even
+    /// though every byte was a valid live read (attempt_012 wall:
+    /// split_sibling:0xb9febf0:graph_child:0xb9fea40:0x2b0).
+    #[test]
+    fn h2_interior_without_parent_evidence_gets_dedicated_slab() {
+        let main = HeapSlab {
+            old_base: 0x9000_0000,
+            content: vec![0u8; 0x1000],
+        };
+        let child = HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: 0x9000_2000,
+            content: vec![0x42u8; 8],
+            is_heap_handle: false,
+            is_image_inline: false,
+            extent_kind: CaptureExtentKind::ProbeWindow,
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: "split_sibling:0x9000_2000:graph_child:0x9000_1f00:0x2b0".into(),
+                capture_path: CapturePath::SplitSibling,
+                source_root_rva: None,
+                source_slot_offset: Some(0x2b0),
+                probe_requested_size: 0x2000,
+                was_interior: true,
+                containing_parent_old_base: None,
+                containing_parent_size: None,
+            },
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::default(),
+        };
+        let mut dedicated: Vec<HeapSlab> = Vec::new();
+        let added =
+            supplement_uncovered_probe_slabs(&[child.clone()], &[main.clone()], &mut dedicated);
+        assert_eq!(
+            added, 1,
+            "interior child WITHOUT parent evidence must be supplemented"
+        );
+        assert_eq!(dedicated.len(), 1);
+        assert_eq!(dedicated[0].old_base, 0x9000_2000);
+        assert_eq!(dedicated[0].content.len(), 8);
+        let slabs = vec![main, dedicated.remove(0)];
+        assert!(
+            super::super::raw_slab_coherence::validate_probe_coverage(&[child], &slabs).is_ok()
+        );
+    }
+
     /// A child partially overlapping an existing authority is NOT supplemented
     /// (adding a boundary over a conflicting authority would be a fabricated
     /// extent); the coverage gate still rejects it — fail-closed preserved.
@@ -9121,6 +9193,109 @@ mod tests {
         let mut dedicated: Vec<HeapSlab> = Vec::new();
         let added = supplement_uncovered_probe_slabs(&[low, empty], &[], &mut dedicated);
         assert_eq!(added, 0, "bad pointers must not become slabs");
+        assert!(dedicated.is_empty());
+    }
+
+    /// GTO-COLD-START-HEAP-REBASE-1 H2 (attempt_018 wall): an image-root /
+    /// main-slot captured region (RawCaptured + ObservedAllocation) with NO
+    /// main slab (AHK multi-heap) must be supplemented as its own dedicated
+    /// slab — otherwise transform_input_seed fails closed on a region that
+    /// was a proven allocation, not a heuristic window.
+    #[test]
+    fn h2_uncovered_observed_allocation_gets_dedicated_slab_without_main() {
+        let region = HeapGlobalSnapshot {
+            rva: 0x180880,
+            live_ptr: 0x9f6f00,
+            content: vec![0x33u8; 0x10c0],
+            is_heap_handle: false,
+            is_image_inline: false,
+            extent_kind: CaptureExtentKind::ObservedAllocation,
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: "main_slot:0x180880".into(),
+                capture_path: CapturePath::MainSlot,
+                source_root_rva: Some(0x180880),
+                source_slot_offset: Some(0),
+                probe_requested_size: 0,
+                was_interior: false,
+                containing_parent_old_base: None,
+                containing_parent_size: None,
+            },
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::RawCaptured {
+                raw_digest: "dummy".into(),
+            },
+        };
+        let mut dedicated: Vec<HeapSlab> = Vec::new();
+        // NO main slab (exactly the attempt_018 shape: "no main slab").
+        let added = supplement_uncovered_probe_slabs(&[region.clone()], &[], &mut dedicated);
+        assert_eq!(
+            added, 1,
+            "uncovered ObservedAllocation must be supplemented without a main slab"
+        );
+        assert_eq!(dedicated[0].old_base, 0x9f6f00);
+        assert_eq!(dedicated[0].content.len(), 0x10c0);
+        let slabs = vec![dedicated.remove(0)];
+        assert!(
+            super::super::raw_slab_coherence::validate_probe_coverage(&[region], &slabs).is_ok()
+        );
+    }
+
+    /// An ObservedAllocation already inside the main slab must NOT be
+    /// duplicated (exactly-one coverage preserved).
+    #[test]
+    fn h2_covered_observed_allocation_not_duplicated() {
+        let main = HeapSlab {
+            old_base: 0x9f6f00,
+            content: vec![0u8; 0x2000],
+        };
+        let region = HeapGlobalSnapshot {
+            rva: 0x180880,
+            live_ptr: 0x9f7000,
+            content: vec![0x33u8; 0x40],
+            is_heap_handle: false,
+            is_image_inline: false,
+            extent_kind: CaptureExtentKind::ObservedAllocation,
+            extent_evidence: CaptureExtentEvidence::default(),
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::RawCaptured {
+                raw_digest: "dummy".into(),
+            },
+        };
+        let mut dedicated: Vec<HeapSlab> = Vec::new();
+        let added =
+            supplement_uncovered_probe_slabs(&[region.clone()], &[main.clone()], &mut dedicated);
+        assert_eq!(
+            added, 0,
+            "covered ObservedAllocation must not be re-surfaced"
+        );
+        assert!(dedicated.is_empty());
+        assert!(
+            super::super::raw_slab_coherence::validate_probe_coverage(&[region], &[main]).is_ok()
+        );
+    }
+
+    /// A SyntheticDerived region is NOT raw-captured; it must never become a
+    /// dedicated slab even when uncovered (participant predicate excludes it).
+    #[test]
+    fn h2_synthetic_region_never_supplemented() {
+        let region = HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr: 0x9000_0000,
+            content: vec![0x44u8; 0x40],
+            is_heap_handle: false,
+            is_image_inline: false,
+            extent_kind: CaptureExtentKind::SyntheticDerived,
+            extent_evidence: CaptureExtentEvidence::default(),
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::SyntheticDerived {
+                transform_id: "t".into(),
+                source_anchor: "a".into(),
+                construction_digest: "d".into(),
+            },
+        };
+        let mut dedicated: Vec<HeapSlab> = Vec::new();
+        let added = supplement_uncovered_probe_slabs(&[region], &[], &mut dedicated);
+        assert_eq!(added, 0, "synthetic regions must not become slabs");
         assert!(dedicated.is_empty());
     }
 
