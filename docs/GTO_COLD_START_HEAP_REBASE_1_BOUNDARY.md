@@ -147,7 +147,8 @@ snapshots):
 | H2 rebasing primitives | DONE (plan layer; stub execution deferred to H4) | docs/GTO_COLD_START_HEAP_REBASE_1_H2_REPORT.md |
 | H3 cold-start wall | pending | (next) |
 | H4-A SMR (ViaStableBinding stub exec) | DESIGN+IMPL DONE; live validation pending | docs/GTO_COLD_START_HEAP_REBASE_1_H4A_SMR_DESIGN.md |
-| H4-B OEP / H4-C TLS / H4-D exception+no-reloc | pending | (next) |
+| H4-B OEP entry-chain evidence | COMPLETE (3 layouts, fail-closed semantics live) | docs/GTO_COLD_START_HEAP_REBASE_1_H4B_REPORT.md |
+| H4-C TLS / H4-D exception+no-reloc | pending | (next) |
 | H5 acceptance | pending | (next) |
 | H6 Oreans regression | pending | (next) |
 
