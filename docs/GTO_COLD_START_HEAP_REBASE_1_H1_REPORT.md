@@ -80,7 +80,42 @@ These are exactly the "which fields are base-relative / which regions are
 missing-or-delayed at cold start" questions H1 must answer before H2
 (rebasing primitives) can be generic.
 
-## 7. Non-claims
+## 7. Empirical verification — Option A post-attach runtime loader (2026-08-20)
+
+H1b identified a structural deadlock: GTO requires post-attach mode
+(plugin_host.rs), but post-attach had no runtime loader -> every no-bypass
+cold start died at AntiDebugRuntimeUnavailable before any heap observation.
+Landed Option A (commit 42a157a): post-attach path now mirrors the
+CREATE_PROCESS path (authority digest + source ref compiled in; runtime
+resolved via MIDA_RUNTIME_AUTHORITY/DLL; ADR-6 loader against suspended
+target; LoaderResult into antidebug controller; fail-closed preserved).
+
+Live re-measure (authorized immutable rev-2 sample, no-bypass env, controller
+attempts 1-4, evidence live_20260820-04_coldstart_option_a):
+
+| attempt | result |
+|---|---|
+| 1 | controller preflight stop: build_binary_path_mismatch (argv0="--" misuse; not a code defect) |
+| 2 | controller preflight stop: capture_policy_arg_missing (controller contract requires --capture-policy) |
+| 3 | spawned; loader failed: authority path was a DIRECTORY (os error 5, access denied) — env misconfiguration |
+| 4 | **spawned; runtime loaded + verified (manifest sha befd3867 == compiled digest); remote init triggered abi error -1073740791 (0xC0000409) inside target; cleanup escalated (terminate win32 2147942405 = ERROR_ACCESS_DENIED); exit 1** |
+
+Attempt-4 outcome (stderr archived: coldstart_option_a_attempt4.stderr.txt,
+sha 8b90c825...): the post-attach loader path is now REAL — manifest
+verification passed, remote LoadLibraryW + thunk init executed, and the
+runtime's InitializeAbiError fires 0xC0000409 fail-fast inside the GTO target.
+
+Interpretation: this is the SAME fail-fast class as ADR7-B4 int29 site
+(0xC0000409 on Oreans samples) — the protector actively fails closed on the
+injected runtime state. The cold-start wall is therefore NOT a missing-loader
+gap (closed by Option A) but the protector's anti-injection fail-fast,
+observed now directly in the post-attach lifecycle. Heap capture stages
+remain unreachable until this fail-fast is addressed — which is H3 territory
+(cold-start through the wall), not H1.
+
+No bypass used; target terminated; ADR7 evidence untouched.
+
+## 8. Non-claims
 
 - NOT product 1.0; NOT perfect unpack; NOT heap-rebasing wall closed
 - No sample bytes read; no target executed this stage; no bypass
