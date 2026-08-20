@@ -4,6 +4,7 @@
 > 审核人: 总指挥 (human)
 > 申请日期: 2026-08-20
 > 范围: H4-A (SMR), H4-B (OEP entry-chain), H4-C (TLS) — 三阶段成果联审
+> 审核结论: 总指挥 2026-08-20 已裁决 — 见下 "6. 审核裁决与处置"
 > 环境纪律: MIDA_GTO_NO_BYPASS=1, MIDA_GTO_OBSERVATION_ONLY=1, 无 bураs​s/语义修复, ADR7 冻结未动
 
 ## 1. 申请审核什么
@@ -37,6 +38,7 @@
   正式 seal/sign-off 未授予 (GTO-H4-LEDGER-CONSISTENCY-1 已记录)
 
 ### H4-C — TLS directory capture/rebuild/evidence
+- Seal-2 修正已完成 (GTO-H4-C-EVIDENCE-SEAL-2): verifier 移出 evidence root (tools/gto_h4c_seal/), created_utc=2026-08-20T19:42:00Z, manifest_self_hash 重算; verifier: 48/48 size+sha, 0 missing, 0 unexpected, self-hash MATCH, RESULT PASS
 - 设计: docs/GTO_COLD_START_HEAP_REBASE_1_H4C_TLS_DESIGN.md (commit 19ff1f6)
 - 实现: commit 87f38d2 前序
 - 验证: 3 ASLR 布局 evidence PASS
@@ -63,3 +65,13 @@
 
 > 注: 所有证据哈希可独立核验 (controller_attempt_*.json 含 stderr_sha256;
 > 布局差异属 ASLR 正常; 不变式 = unresolved_required=0 + Complete install)。
+
+## 6. 审核裁决与处置 (总指挥 2026-08-20)
+
+- H4-A: 技术签收; 证据正式签收暂缓 (raw evidence partial — 3 候选输出中 2 有完整 raw 日志, 1 仅摘要; H4A_smr_correction layout_A exit=1 不计; layout_B/layout_C exit=0 不能补回缺失 raw run)
+- H4-B: 接受替代证据为技术层结论; 不接受为完整 formal package (attempt_001 raw stderr 不可恢复; 保留摘要 + 2 完整布局)
+- H4-C: 当前 seal (SEAL-1) 驳回 — verifier FAIL (unexpected=1: verify_h4c_seal.py 在 evidence root 内; created_utc 未来时间)
+- H4-D: 暂不放行 live, 允许设计准备
+- H5: 暂不放行
+
+处置记录: docs/GTO_COLD_START_HEAP_REBASE_1_H4_REVIEW_DISPOSITION.md (GTO-H4-REVIEW-DISPOSITION-1, Seal-2 通过后补写)
