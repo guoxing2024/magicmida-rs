@@ -50,7 +50,7 @@
 //! NOT fabricated: they cannot be derived offline from the locked manifests
 //! (`origin_macro` exposes only a `legacy_oracle_candidate` for regression
 //! comparison; `lunlun_software` declares `oracle: none`) or from the plan docs
-//! (`docs/OREANS_TWO_SAMPLE_PERFECT_UNPACK_PLAN.md` lists "define the behavior
+//! (`archive/routes/OREANS_TWO_SAMPLE_PERFECT_UNPACK_PLAN.md` lists "define the behavior
 //! oracle" as an outstanding item). The verifier therefore accepts
 //! **contract-shaped** evidence (for offline tests) while the per-case business
 //! stimuli/observables remain a **P9-live blocker** (see
@@ -1208,7 +1208,7 @@ pub const BLOCKER_CASE_BUSINESS_DEFINITION: &str = concat!(
     "offline. The locked manifests expose: origin_macro has only a ",
     "legacy_oracle_candidate (use=regression_comparison_only, authority=",
     "historical_operator_report); lunlun_software declares oracle:none. ",
-    "docs/OREANS_TWO_SAMPLE_PERFECT_UNPACK_PLAN.md lists 'define the behavior ",
+    "archive/routes/OREANS_TWO_SAMPLE_PERFECT_UNPACK_PLAN.md lists 'define the behavior ",
     "oracle' (specify protected-vs-unpacked stimuli and observables for each ",
     "fixed sample) as an outstanding item, and docs/VNEXT_BEHAVIORAL_PATH.md ",
     "defers the live behavioral gate. To close: a named operator must define ",

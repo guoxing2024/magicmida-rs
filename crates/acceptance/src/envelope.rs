@@ -1,6 +1,6 @@
 //! CI signature envelope (verify-only; dumper must never self-sign).
 //!
-//! Schema: `mida.signature-envelope/v0` — see docs/TRANSFORM_TAXONOMY_V1.md §7.
+//! Schema: `mida.signature-envelope/v0` — see archive/routes/TRANSFORM_TAXONOMY_V1.md §7.
 //!
 //! Product authenticity path:
 //! 1. Parse envelope JSON

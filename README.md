@@ -77,7 +77,7 @@ The repository now has two explicit sample tracks:
   `lab/cases/v2/gto_launcher.json`.
 - **Active regression gate:** `origin_macro` + `lunlun_software`, with fixed
   identities and fail-closed gates documented in
-  [docs/OREANS_TWO_SAMPLE_PERFECT_UNPACK_PLAN.md](docs/OREANS_TWO_SAMPLE_PERFECT_UNPACK_PLAN.md).
+  [archive/routes/OREANS_TWO_SAMPLE_PERFECT_UNPACK_PLAN.md](archive/routes/OREANS_TWO_SAMPLE_PERFECT_UNPACK_PLAN.md).
 
 A structural `Accepted`, historical oracle match, Shiguang server/icon patch,
 GTO holdout result, or retry-selected replay is not proof of perfect unpacking

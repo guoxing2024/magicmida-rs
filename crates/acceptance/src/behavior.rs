@@ -15,7 +15,7 @@ use crate::verdict::Verdict;
 
 pub const BEHAVIOR_EVIDENCE_SCHEMA_VERSION: &str = "mida.behavior-evidence/v0";
 
-/// Dump/acceptance transform taxonomy version (see docs/TRANSFORM_TAXONOMY_V1.md).
+/// Dump/acceptance transform taxonomy version (see archive/routes/TRANSFORM_TAXONOMY_V1.md).
 /// Future signature envelopes must carry this string.
 pub const TRANSFORM_TAXONOMY_VERSION: &str = "mida.transform-taxonomy/v1";
 
@@ -425,7 +425,7 @@ fn reference_supports_product_accept(reference: &BehaviorReference) -> bool {
 
 /// Registered `(transform_id, kind, rule_id)` triples — not free-form strings.
 /// A rule only unlocks the **matching** transform id+kind.
-/// Must stay aligned with docs/TRANSFORM_TAXONOMY_V1.md §5.
+/// Must stay aligned with archive/routes/TRANSFORM_TAXONOMY_V1.md §5.
 /// GTO `sample_bypass` ids are intentionally **absent** (diagnostic only).
 const REGISTERED_TRANSFORM_RULES: &[(&str, &str, &str)] = &[
     ("iat_rebuild", "pe_repair", "pe_iat_rebuild_v0"),

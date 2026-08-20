@@ -52,7 +52,7 @@ them are superseded on that point, and none of them claimed product 1.0. This
 update does **not** reopen any sealed route or ledger — it only re-states the
 repository-level priority: GTO is the main line, Oreans is the regression gate.
 
-## Goal (binding): docs/PROJECT_GOAL_20260725.md
+## Goal (binding): archive/routes/PROJECT_GOAL_20260725.md
 
 Perfect unpack of exactly two samples (the Oreans regression gate).
 
@@ -88,21 +88,21 @@ Perfect unpack of exactly two samples (the Oreans regression gate).
 
 ### Expert ruling on §6 E battlefield (2026-07-29)
 
-**§6 E field = REJECTED / NOT OPENED** (expert ruling 2026-07-29, second pass). C-1 (operational takeover) accepted; E battlefield not opened; R1B capture trench remains FROZEN. Re-entry bar = `docs/GTO_RESEARCH_CHARTER_20260728.md` §4.4 (2026-07-29 amendment) + immutable seal at `4c2b545:docs/GTO_R1A_RESIDUAL_STOP_SEAL_20260728.md` §4. No code change to bwhook / gto_host / `_r1b_transient_epoch_trap.py` authorized by this handoff. **Operator must name `R1B re-entry`; "continue" / "proceed" do not satisfy §4.4.**
+**§6 E field = REJECTED / NOT OPENED** (expert ruling 2026-07-29, second pass). C-1 (operational takeover) accepted; E battlefield not opened; R1B capture trench remains FROZEN. Re-entry bar = `archive/routes/GTO_RESEARCH_CHARTER_20260728.md` §4.4 (2026-07-29 amendment) + immutable seal at `4c2b545:docs/GTO_R1A_RESIDUAL_STOP_SEAL_20260728.md` §4. No code change to bwhook / gto_host / `_r1b_transient_epoch_trap.py` authorized by this handoff. **Operator must name `R1B re-entry`; "continue" / "proceed" do not satisfy §4.4.**
 
 ### Baseline vs research
 
 - **baseline** = P0 fail-closed + origin-safe path only (no BootWatch mega-diff in tree)
 - **research/gto-bootwatch-20260728** = GTO host residual + R1B capture harness (`crates/bwhook` + `tools/_r1b_transient_epoch_trap.py`); `crates/bwhook` remains workspace-`exclude`
 - Set C committed: `validation_summary.json` status=superseded; BB writer no longer re-certifies product Accepted via load_no_crash
-- GTO charter: `docs/GTO_RESEARCH_CHARTER_20260728.md` — current status **Residual-stop after R1A** (per §0); re-entry only per charter §4.4 / seal `4c2b545:docs/GTO_R1A_RESIDUAL_STOP_SEAL_20260728.md` §4. **"execute charter Round 0" alone is not admissible** under Residual-stop — operator must name **R1B re-entry** and produce evidence per §4.4.
+- GTO charter: `archive/routes/GTO_RESEARCH_CHARTER_20260728.md` — current status **Residual-stop after R1A** (per §0); re-entry only per charter §4.4 / seal `4c2b545:docs/GTO_R1A_RESIDUAL_STOP_SEAL_20260728.md` §4. **"execute charter Round 0" alone is not admissible** under Residual-stop — operator must name **R1B re-entry** and produce evidence per §4.4.
 
 ### Open discipline notes (2026-07-29 — corrected 2026-07-29 per expert review)
 
 - **WITHDRAWN — prior claim about CONTEXT_FLAGS fix was wrong.** Earlier draft described "OR in `CONTEXT_AMD64`" as a one-line fix for `GetThreadContext` returning `ERROR_INVALID_PARAMETER`. That claim is **incorrect**: `0x100013` already encodes the architecture bit (the high `0x100000` is set inside both `CONTEXT_DEBUG_REGISTERS_AMD64 (0x100010)` and `CONTEXT_CONTROL_INTEGER_AMD64 (0x100003)`). OR-ing `CONTEXT_AMD64` again is a no-op and does not fix anything. The actual root cause of the `GetThreadContext` Err in the R1B smoke is **not established** — candidates remain: (i) non-standard flag combination behavior on this Win10/11 build; (ii) suspend-count / handle race (earlier session observed `SuspendThread(prev=0)` while host had skipped its own suspend); (iii) thread-state precondition not actually met at the moment of DLL arming. **No "one-line fix" is to be trusted or committed without empirical `ERROR_INVALID_PARAMETER` reproduction under controlled flags, and without showing the flag value Windows actually accepted.**
 - bwhook diagnostic log path: `D:\MidaVault\scratch\r1b_smoke_log\` (vault only, not committed)
 - Race note observed earlier in this session: `SuspendThread(prev=0)` showed up while BootWatch had already frozen the RIP — handled by host's `if frozen_rip.is_none() && bootwatch_vm_enter_rip.is_none()` gate, but worth a hygiene pass if R1B is reopened.
-- **R1B trench remains FROZEN** per expert 2026-07-29 ruling (third pass, 2026-07-29); re-entry bar = charter §4.4 + §4.5 dormant (third-pass 2026-07-29) + immutable seal `4c2b545:docs/GTO_R1A_RESIDUAL_STOP_SEAL_20260728.md` §4. Per-round fix budget = ≤2 (per `docs/COURSE_CORRECTION_WORK_ORDER.md` §3 — workspace-auditable). **Budget exhausted, ledger 2026-07-29:** R1A = 1 round consumed (host instrument, closed 2026-07-28, see `4c2b545:docs/GTO_POINTEE_EPOCH_R1A_20260728.md` §1); **R1B = 1 round already consumed** (commit `4be4ee5` on `research/gto-bootwatch-20260728` — bwhook + gto_host + runner +1342 lines + 4× live smoke at `D:\MidaVault\lab\evidence\_r1b_transient_epoch_trap\`); E2 = **0 remaining**, **forbidden** under current charter. **used=2 / cap=2 / remaining=0.** The earlier "operator pre-declaration" policy was withdrawn on third-pass: declaration expresses intent only; the ledger is determined by actual Rust/Python diff + clean tree + rebuild + re-measure. **Only separate governance** (charter amendment or new expert ruling recorded here) can re-open budget — `R1B re-entry` / `E2 implementation` instructions do **not** themselves expand budget.
+- **R1B trench remains FROZEN** per expert 2026-07-29 ruling (third pass, 2026-07-29); re-entry bar = charter §4.4 + §4.5 dormant (third-pass 2026-07-29) + immutable seal `4c2b545:docs/GTO_R1A_RESIDUAL_STOP_SEAL_20260728.md` §4. Per-round fix budget = ≤2 (per `archive/routes/COURSE_CORRECTION_WORK_ORDER.md` §3 — workspace-auditable). **Budget exhausted, ledger 2026-07-29:** R1A = 1 round consumed (host instrument, closed 2026-07-28, see `4c2b545:docs/GTO_POINTEE_EPOCH_R1A_20260728.md` §1); **R1B = 1 round already consumed** (commit `4be4ee5` on `research/gto-bootwatch-20260728` — bwhook + gto_host + runner +1342 lines + 4× live smoke at `D:\MidaVault\lab\evidence\_r1b_transient_epoch_trap\`); E2 = **0 remaining**, **forbidden** under current charter. **used=2 / cap=2 / remaining=0.** The earlier "operator pre-declaration" policy was withdrawn on third-pass: declaration expresses intent only; the ledger is determined by actual Rust/Python diff + clean tree + rebuild + re-measure. **Only separate governance** (charter amendment or new expert ruling recorded here) can re-open budget — `R1B re-entry` / `E2 implementation` instructions do **not** themselves expand budget.
 
 ## GTO-PRODUCT-RECOVERY proposal filed (2026-07-29) — NOT a re-entry authorization
 
@@ -111,8 +111,8 @@ Perfect unpack of exactly two samples (the Oreans regression gate).
 **Status (proposal only, no action authorized):**
 
 - This is a **read-only governance proposal** — a docs-only artifact that **proposes** opening a **new** battlefield `GTO-PRODUCT-RECOVERY` with a **proposed** ledger namespace. It does **not** open the battlefield; it does **not** allocate budget; it does **not** authorize any code change.
-- The use of a separate ID is for bookkeeping clarity; it does **not** bypass, weaken, or reopen `docs/GTO_RESEARCH_CHARTER_20260728.md` §4.4 or §4.5. The §4.4 re-entry bar still applies to anything that names `R1B re-entry` literally; §4.5 (E2) remains dormant.
-- **Phase 0 of the proposal consumed 0 fix rounds** (docs-only; not a budget round per `docs/GTO_RESEARCH_CHARTER_20260728.md` §4.4 budget-burn rule).
+- The use of a separate ID is for bookkeeping clarity; it does **not** bypass, weaken, or reopen `archive/routes/GTO_RESEARCH_CHARTER_20260728.md` §4.4 or §4.5. The §4.4 re-entry bar still applies to anything that names `R1B re-entry` literally; §4.5 (E2) remains dormant.
+- **Phase 0 of the proposal consumed 0 fix rounds** (docs-only; not a budget round per `archive/routes/GTO_RESEARCH_CHARTER_20260728.md` §4.4 budget-burn rule).
 - **`GTO-POINTEE-EPOCH` ledger is UNCHANGED** (used=2 / cap=2 / remaining=0). The proposal explicitly does **not** request expansion of that ledger, does **not** re-open parked R1B (`4be4ee5`), does **not** activate dormant E2 (§4.5).
 - **`R-GTO-UI` peel-series ledger is UNCHANGED** (closed r1 → r25b; deepest progress r23b `ZhuChuangKou` class).
 - **No code change.** No live runs. No push.
@@ -123,7 +123,7 @@ Perfect unpack of exactly two samples (the Oreans regression gate).
 2. **New expert ruling OR charter amendment** recorded in this handoff that **explicitly allocates** rounds in the `GTO-PRODUCT-RECOVERY` ledger namespace (the allocation is **not** inherited from the proposal; only separate governance can grant it).
 3. The expert ruling must **explicitly state** the chosen Route X and its evidence bar (charter §6.4 / §6.1 / §6.2 / §6.3 as appropriate).
 
-**Non-automatic fallback note (third-pass 2026-07-29):** the proposal's §6.5 step 3 ("if Route A residual-stops → Route B") is **not** an automatic fallback. After any Route A residual-stop, the worker must **stop and write residual** per the analog of `docs/GTO_RESEARCH_CHARTER_20260728.md` §4.3. Route B requires its **own** governance ruling (operator-named, with explicit round allocation) and does **not** auto-start from the proposal's recommendation alone.
+**Non-automatic fallback note (third-pass 2026-07-29):** the proposal's §6.5 step 3 ("if Route A residual-stops → Route B") is **not** an automatic fallback. After any Route A residual-stop, the worker must **stop and write residual** per the analog of `archive/routes/GTO_RESEARCH_CHARTER_20260728.md` §4.3. Route B requires its **own** governance ruling (operator-named, with explicit round allocation) and does **not** auto-start from the proposal's recommendation alone.
 
 **What this entry is NOT:** this is a "proposal filed" record, **not** an authorization to act. No code change, no live GTO unpack / R1B / E2 / restore, no `sample_bypass`, no push. `WORKER_HANDOFF.md` is not the governance artifact for Phase 1 of this proposal; the new expert ruling or charter amendment (recorded in `WORKER_HANDOFF.md` when it lands) would be.
 
@@ -141,7 +141,7 @@ Perfect unpack of exactly two samples (the Oreans regression gate).
 **Status (read-only audit only, no action authorized):**
 
 - This is a **Phase 0.5 read-only debug-context audit** under `archive/gto-20260730/docs/GTO_PRODUCT_RECOVERY_CHARTER_20260729.md` §6.4 Route D. **Not** Phase 1. **Not** R1B re-entry. **Not** E2 activation. **Not** a live run. **Not** a source-code edit. **Not** push.
-- **Budget consumed = 0** (docs-only; no Rust/Python diff, no rebuild, no re-measure; per `docs/GTO_RESEARCH_CHARTER_20260728.md` §4.4 step 4 budget-burn rule, **investigation that does not produce Rust/Python diff + rebuild + re-measure is not a budget round**).
+- **Budget consumed = 0** (docs-only; no Rust/Python diff, no rebuild, no re-measure; per `archive/routes/GTO_RESEARCH_CHARTER_20260728.md` §4.4 step 4 budget-burn rule, **investigation that does not produce Rust/Python diff + rebuild + re-measure is not a budget round**).
 - **`GTO-POINTEE-EPOCH` ledger is UNCHANGED** (used=2 / cap=2 / remaining=0).
 - **`GTO-PRODUCT-RECOVERY` ledger namespace is UNCHANGED** (Phase 0.5 = 0 rounds; Phase 1 still requires separate governance per charter §3.3 + §6.5 third-pass 2026-07-29).
 - **No code change.** No live runs. No push. No vault writes.
@@ -507,7 +507,7 @@ used=2 / cap=2 / remaining=0 (final Route C round; no R3)
 **Status (proposal only, no action authorized):**
 - This is a **read-only governance proposal** — a docs-only artifact that **proposes** opening a **new** battlefield `GTO-PRODUCT-RECOVERY Route D` with a **proposed** ledger namespace. It does **not** open the battlefield; it does **not** allocate budget; it does **not** authorize any code change.
 - The use of a separate ID is for bookkeeping clarity; it does **not** bypass, weaken, or reopen previous Route C ledger.
-- **Phase 0 of the proposal consumed 0 fix rounds** (docs-only; not a budget round per `docs/GTO_RESEARCH_CHARTER_20260728.md` §4.4 budget-burn rule).
+- **Phase 0 of the proposal consumed 0 fix rounds** (docs-only; not a budget round per `archive/routes/GTO_RESEARCH_CHARTER_20260728.md` §4.4 budget-burn rule).
 - **`GTO-POINTEE-EPOCH` UNCHANGED** (used=2/cap=2/remaining=0, FROZEN). **R1B FROZEN. E2 dormant. Route C exhausted.**
 - **`R-GTO-UI` peel-series ledger is UNCHANGED** (closed r1 → r25b; deepest progress r23b `ZhuChuangKou` class).
 - **No code change.** No live runs. No push.

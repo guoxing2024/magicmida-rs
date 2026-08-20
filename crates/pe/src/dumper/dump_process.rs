@@ -3261,7 +3261,7 @@ pub fn write_bound_transform_manifest(
     transforms: &[(&str, &str)],
     input: Option<&Path>,
 ) -> Result<(), PeError> {
-    // Taxonomy: docs/TRANSFORM_TAXONOMY_V1.md ?empty entries = standard
+    // Taxonomy: archive/routes/TRANSFORM_TAXONOMY_V1.md ?empty entries = standard
     // reconstruction only; sample_bypass ids must appear when GTO bypass runs.
     const TAXONOMY: &str = "mida.transform-taxonomy/v1";
     let sha = candidate_sha256_hex(candidate_bytes);

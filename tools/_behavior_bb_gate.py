@@ -313,7 +313,7 @@ def write_validation_summary(batch_dir: Path, results: list[dict], all_ok: bool)
         "artifacts": [
             "docs/VNEXT_BEHAVIOEAL_PATH.md",
             "docs/ACCEPTANCE_CONTEACT.md",
-            "docs/AUDIT_SELF_COEEECTION_20260727.md",
+            "archive/routes/AUDIT_SELF_CORRECTION_20260727.md",
             "tools/_behavior_bb_gate.py",
             "tools/_behavior_probe.py",
             str(batch_dir),
