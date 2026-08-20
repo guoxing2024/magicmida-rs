@@ -613,6 +613,47 @@ pub fn unpack(
             .parent()
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| std::path::PathBuf::from("."));
+        // ADR-6: run the self-owned runtime loader exactly like the
+        // CREATE_PROCESS path. The post-attach launch has no debug port
+        // (debugger presence is structurally invisible), so there are no
+        // debug events to drain; the loader's drain callback is only invoked
+        // on remote-call wait timeouts to keep a debug session alive, and a
+        // no-op drain is the correct post-attach analogue (pure bounded
+        // wait).
+        let mut noop_drain =
+            |_timeout_ms: u32| -> Result<Option<mida_core::DrainReceipt>, mida_core::CoreError> {
+                Ok(None)
+            };
+        // Suspend the primary thread while the loader's remote LoadLibraryW
+        // runs, so the freely running main thread cannot race the remote
+        // thread on the loader lock. Resume unconditionally afterwards; the
+        // controller's fail-closed cleanup owns termination on failure.
+        let main_tid = dbg.main_thread_id();
+        let h_thread = dbg
+            .thread_handle(main_tid)
+            .map_err(|e| anyhow!("thread_handle for post-attach loader: {e}"))?;
+        let _ = unsafe { SuspendThread(h_thread) };
+        let loader_outcome = crate::unpacker::runtime_loader::run_runtime_loader(
+            dbg.process_handle(),
+            dbg.pid(),
+            "ahk_gto_x64_v1",
+            "adr6-profile-digest",
+            &mut noop_drain,
+        );
+        let _ = unsafe { ResumeThread(h_thread) };
+        match &loader_outcome {
+            Ok(loader_result) => log::log(
+                LogType::Info,
+                &format!(
+                    "post-attach runtime loader: module_base={:#x} target_pid={}",
+                    loader_result.module_base, loader_result.target_pid
+                ),
+            ),
+            Err(e) => log::log(
+                LogType::Fatal,
+                &format!("post-attach runtime loader failed: {e:#}"),
+            ),
+        }
         let mut ad_controller = antidebug_controller::AntidebugController::new(
             antidebug_controller::AntidebugStageOptions {
                 sample_id: None,
@@ -622,13 +663,17 @@ pub fn unpack(
                 cleanup_backend: Some(Box::new(antidebug_controller::Win32CleanupBackend::new(
                     dbg.process_handle(),
                 ))),
-                // ADR-6 plan A: post-attach has no runtime loader yet ->
-                // anti-debug stays fail-closed (no bypass).
-                runtime_authority: None,
-                runtime_path: None,
+                // ADR-6: runtime authority/path are now wired like the
+                // CREATE_PROCESS path; loader_result carries the post-attach
+                // loader outcome (None -> fail-closed DependencyUnavailable).
+                runtime_authority: crate::unpacker::runtime_loader::runtime_authority().ok(),
+                runtime_path: crate::unpacker::runtime_loader::runtime_artifact_path(),
                 loader_result: None,
             },
         );
+        if let Ok(loader_result) = loader_outcome {
+            ad_controller.set_loader_result(loader_result);
+        }
         // R1-HARDENING-CLEANUP-2: exactly-once explicit cleanup (same as the
         // CREATE_PROCESS path). terminate_and_wait() resolves any pending
         // event (never DBG_CONTINUE for fail-closed), terminates once, and
