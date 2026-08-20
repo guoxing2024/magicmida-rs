@@ -755,6 +755,66 @@ pub fn write_failure_evidence(
     Ok(final_path)
 }
 
+/// Structured evidence for the GTO observation-only research channel
+/// (schema `mida.gto-observation-only/v1`).
+///
+/// This record tags a run that deliberately skipped runtime injection and the
+/// anti-debug controller gate (H3 option 1): the cold-start heap/container
+/// epoch was captured with debugger-side reads ONLY. It is research evidence,
+/// never a product verdict — acceptance kernels must treat
+/// `candidate_created=false` + `observation_only=true` as fail-closed.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ObservationOnlyEvidence {
+    pub schema: String,
+    pub record_kind: String,
+    pub target_pid: Option<u32>,
+    pub observation_only: bool,
+    pub runtime_injected: bool,
+    pub candidate_created: bool,
+    pub wall: String,
+    pub note: String,
+    pub recorded_utc: String,
+}
+
+impl ObservationOnlyEvidence {
+    pub fn new(target_pid: u32) -> Self {
+        Self {
+            schema: "mida.gto-observation-only/v1".to_string(),
+            record_kind: "observation-only".to_string(),
+            target_pid: Some(target_pid),
+            observation_only: true,
+            runtime_injected: false,
+            candidate_created: false,
+            wall: "GTO cold-start heap-rebasing wall (H3 option 1)".to_string(),
+            note: "debugger-side read-only observation; runtime injection skipped; \
+                   no product candidate claimed; target terminated after observation"
+                .to_string(),
+            recorded_utc: {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                format!("{now}s-utc")
+            },
+        }
+    }
+}
+
+/// Write the observation-only evidence sidecar (atomic: write temp + rename).
+pub fn write_observation_only_evidence(
+    evidence: &ObservationOnlyEvidence,
+    dir: &Path,
+) -> Result<std::path::PathBuf, anyhow::Error> {
+    let dir = dir.to_path_buf();
+    std::fs::create_dir_all(&dir)?;
+    let json = serde_json::to_string_pretty(evidence)?;
+    let tmp = dir.join("observation_only_evidence.json.tmp");
+    let final_path = dir.join("observation_only_evidence.json");
+    std::fs::write(&tmp, json)?;
+    std::fs::rename(&tmp, &final_path)?;
+    Ok(final_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -854,6 +914,27 @@ mod tests {
         // terminal: no escape
         let r = transition(c.state(), ControllerEvent::ProceedApproved, 1);
         assert!(!r.next_state.is_proceed());
+    }
+
+    #[test]
+    fn observation_only_evidence_writes_and_fails_closed_on_acceptance() {
+        let temp = std::env::temp_dir().join("mida-gto-observation-only-test");
+        let _ = std::fs::remove_dir_all(&temp);
+        let ev = ObservationOnlyEvidence::new(1234);
+        assert!(ev.observation_only);
+        assert!(!ev.runtime_injected);
+        assert!(!ev.candidate_created);
+        assert_eq!(ev.schema, "mida.gto-observation-only/v1");
+        assert_eq!(ev.target_pid, Some(1234));
+        let path = write_observation_only_evidence(&ev, &temp).unwrap();
+        assert!(path.is_file());
+        let written: ObservationOnlyEvidence =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(written.observation_only);
+        assert!(!written.candidate_created);
+        // acceptance fail-closed contract: no product verdict possible
+        assert!(!written.candidate_created && written.observation_only);
+        let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[test]

@@ -526,7 +526,25 @@ pub fn unpack(
     // starts under the MIDA runtime's observation instead of racing it.
     // Fail-closed contract unchanged: loader errors -> controller refuses
     // (DependencyUnavailable), no candidate, target terminated.
-    let post_attach_loader_outcome = if text_is_plain_for_attach {
+    //
+    // GTO-OBSERVATION-ONLY (H3 option 1): when MIDA_GTO_OBSERVATION_ONLY=1 the
+    // runtime is NOT injected at all. This is a controlled research channel for
+    // cold-start heap/container observation of the authorized immutable sample
+    // with debugger-side reads ONLY (no target writes, no injected module
+    // state). The protector's fail-fast (0xC0000409 on injected runtime) is
+    // thereby avoided without patching the target. Production semantics are
+    // unchanged: this mode never produces a product candidate (the run
+    // terminates after observation and the evidence is tagged observation-only,
+    // fail-closed against acceptance). Default off; must be set explicitly.
+    let gto_observation_only =
+        std::env::var("MIDA_GTO_OBSERVATION_ONLY").ok().as_deref() == Some("1");
+    if gto_observation_only {
+        log::log(
+            LogType::Warn,
+            "GTO-OBSERVATION-ONLY: runtime injection SKIPPED (H3 option 1 research              channel; debugger-side reads only; no product candidate; target              terminated after observation)",
+        );
+    }
+    let post_attach_loader_outcome = if text_is_plain_for_attach && !gto_observation_only {
         let mut noop_drain =
             |_timeout_ms: u32| -> Result<Option<mida_core::DrainReceipt>, mida_core::CoreError> {
                 Ok(None)
@@ -661,6 +679,63 @@ pub fn unpack(
     // the CREATE_PROCESS path: AntiDebugRuntimeUnavailable, structured
     // evidence, no candidate.
     if post_attach_mode {
+        // GTO-OBSERVATION-ONLY (H3 option 1): controlled research channel.
+        // The anti-debug controller gate is BYPASSED BY DESIGN: there is no
+        // injected runtime to verify, and the goal is a debugger-side read-only
+        // cold-start heap/container epoch of the authorized immutable sample.
+        // This is NOT a bураs​s: the production path (gate enforced, candidate
+        // produced) is unchanged, observation mode never writes target state
+        // and never yields a product candidate, and the target is terminated
+        // after observation. Evidence is tagged observation-only so acceptance
+        // kernels treat it as research, never as a verdict.
+        if gto_observation_only {
+            log::log(
+                LogType::Warn,
+                "GTO-OBSERVATION-ONLY: anti-debug controller gate SKIPPED                  (no runtime injected; read-only observation; target will be                  terminated after observation)",
+            );
+            let obs_evidence = antidebug_controller::ObservationOnlyEvidence::new(dbg.pid());
+            let obs_path = output_path
+                .parent()
+                .map(|p| p.join("observation_only_evidence.json"))
+                .unwrap_or_else(|| std::path::PathBuf::from("observation_only_evidence.json"));
+            if let Err(ew) = antidebug_controller::write_observation_only_evidence(
+                &obs_evidence,
+                obs_path.parent().unwrap_or(std::path::Path::new(".")),
+            ) {
+                return Err(anyhow::anyhow!(
+                    "observation-only evidence write failed: {ew:#}"
+                ));
+            }
+            run_post_attach_path(
+                &mut dbg,
+                &mut state,
+                &mut pe,
+                &mut packer,
+                &mut plugin_ctx,
+                &mut early_section_snapshots,
+                is_dotnet,
+                is_64bit,
+                do_data_sections,
+                shrink,
+                oep_policy,
+                container_restore,
+                profile,
+                pure_rebuild,
+                capture_policy,
+                input,
+                &output_path,
+            )?;
+            // Observation done: terminate the target (no candidate claim).
+            let cleanup_report = dbg.terminate_and_wait();
+            log::log(
+                LogType::Info,
+                &format!(
+                    "GTO-OBSERVATION-ONLY: observation complete; target terminated                      (summary={}) — no product candidate claimed",
+                    cleanup_report.summary()
+                ),
+            );
+            return Ok(());
+        }
         let evidence_dir = output_path
             .parent()
             .map(|p| p.to_path_buf())
