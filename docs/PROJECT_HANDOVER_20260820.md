@@ -55,15 +55,24 @@ powershell -File tools/verify_workspace_hygiene.ps1   # 工件卫生
   **不影响 B4/B5 闭环**（B4 是独立 observer 验证，fault RVA 0x2e806）。
   若需找回：检查 `D:\MidaVault\lab\evidence\adr7b_b3\` 或原始来源。
 
-## 5. B4 / B5 状态（截至 2026-08-20，用户独立 spot-check）
+## 5. ADR7 closeout 状态（截至 2026-08-20，冻结终态）
 
 | 项 | 状态 |
 |---|---|
-| B4 | **FORMAL PASS**（用户独立复核：helper 基线已切换 release、seal 链 115 文件 0 mismatch、attempt 语义一致；vault: `adr7b_b4/`） |
-| B5 | **UNLOCKED**（B4 通过后解除 gate），TLS isolation evidence **COMPLETE**（6/6），但 **B5 自身尚未独立 formal seal/sign-off**，不得写成 `B5 FORMAL PASS`（vault: `adr7b_b5/`） |
+| B4 | **FORMAL PASS**（seal 115 文件 0 mismatch；vault: `adr7b_b4_binding_correction/`） |
+| B5 | **FORMAL PASS**（sign-off: `ADR7_B5_FORMAL_SIGNOFF.json`，seal 87 文件 0 mismatch；vault: `adr7b_b5/`） |
+| B5 TLS isolation evidence | **COMPLETE**（6/6 target + 6/6 controls） |
+| 证据链 | root/final/seal 全部验证通过（B4 115 文件 / B5 87 文件） |
 
-Helper 二进制基线（release，已 seal）：
-`b1_benign_host_full.exe 473E0FC8...` / `b2_debugger_attach.exe 49015F84...` / `b4_dynamic_observer.exe A47995BB...`
+Closeout 资产（`D:\MidaVault\lab\evidence\`）：
+- `ADR7_CLOSEOUT_INDEX.json` — 总账本（B4/B5 全部哈希 + sign-off + seal + 依赖关系）
+- `ADR7_CLOSEOUT_REPORT.md` — 收口报告（结论 / 已关闭问题 / residual risk / 交接 / 下一阶段）
+- `ADR7_FREEZE_FINGERPRINTS_20260820.json` — 四路径冻结指纹
+- 验证入口：`pwsh tools/verify_adr7_closeout.ps1`（只读，RESULT: PASS）
+
+Helper 基线（记录于 closeout index）：
+- B4（release）：`b1 473E0FC8...` / `b2 49015F84...` / `b4 A47995BB...`
+- B5（自有 profile，方案 A 接受）：`b1 58E3EB17...` / `b2 6A1092A6...` / `b4 00BFADCE...`
 
 ## 6. 维护规则（防再乱）
 
