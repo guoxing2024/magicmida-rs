@@ -780,6 +780,13 @@ pub enum DeclarationKind {
     /// process has its own stacks, so the old stack VA cannot be rebased and
     /// is excluded with high-confidence address-space evidence.
     StackEphemeral,
+    /// Module boundary cache slot: the value equals a loaded module's end
+    /// (base + SizeOfImage) or a small fixed delta past it (end + 0x2a4 /
+    /// end + 0x1000), or the fixed module-zone base 0x7ff800000000. AHK caches
+    /// module address-range boundaries for classification; they are NOT
+    /// rebaseable pointers (the cold-start process has its own module
+    /// layout) and are excluded with deterministic boundary evidence.
+    ModuleBoundaryCache,
     /// Allocator metadata (HEAP_ENTRY header / freelist link) — excluded only
     /// with allocation-layout evidence.
     /// Reserved classification: never constructed by the current pipeline,
@@ -815,6 +822,7 @@ impl DeclarationKind {
             DeclarationKind::SmallScalar => "small_scalar",
             DeclarationKind::InlineText => "inline_text",
             DeclarationKind::StackEphemeral => "stack_ephemeral",
+            DeclarationKind::ModuleBoundaryCache => "module_boundary_cache",
             DeclarationKind::AllocatorMetadata => "allocator_metadata",
             DeclarationKind::Unknown => "unknown",
             DeclarationKind::DuplicateSameSemantics => "duplicate_same_semantics",
@@ -845,6 +853,7 @@ impl DeclarationKind {
                 | DeclarationKind::SmallScalar
                 | DeclarationKind::InlineText
                 | DeclarationKind::StackEphemeral
+                | DeclarationKind::ModuleBoundaryCache
                 | DeclarationKind::AllocatorMetadata
         )
     }
@@ -1033,6 +1042,30 @@ pub fn declare_pointer_slots_structural(
     .unwrap_or_default()
 }
 
+/// Whether `val` matches a loaded module boundary cache slot:
+/// exactly a module end (base + SizeOfImage), a small fixed delta past it
+/// (0x2a4 / 0x1000 — observed on every enumerated module in the GTO sample),
+/// or the fixed canonical module-zone base 0x7ff800000000. AHK caches these
+/// for address-range classification; they are not rebaseable pointers.
+fn is_module_boundary_cache(val: u64, module_ranges: &[(u64, u64)]) -> bool {
+    const MODULE_ZONE_BASE: u64 = 0x0000_7ff8_0000_0000;
+    const END_DELTAS: [u64; 2] = [0x2a4, 0x1000];
+    if val == MODULE_ZONE_BASE {
+        return true;
+    }
+    module_ranges.iter().any(|&(b, e)| {
+        if e <= b {
+            return false;
+        }
+        if val == e {
+            return true;
+        }
+        END_DELTAS
+            .iter()
+            .any(|d| e.checked_add(*d).map_or(false, |t| val == t))
+    })
+}
+
 fn declare_pointer_slots_structural_checked(
     containers: &[ContainerSnapshot],
     heap_globals: &[HeapGlobalSnapshot],
@@ -1190,6 +1223,14 @@ fn declare_pointer_slots_structural_checked(
                         "value {val:#x} inside verified enumerated module range AND slot has                          structural provenance (source {label}) — module-relative candidate;                          resolver deferred to later work order"
                     ),
                     "medium",
+                )
+        } else if is_module_boundary_cache(val, &module_ranges) {
+            (
+                    DeclarationKind::ModuleBoundaryCache,
+                    format!(
+                        "value {val:#x} matches a loaded module boundary (end / end+0x2a4 /                          end+0x1000 / module-zone base) — AHK module-range cache                          slot; excluded with deterministic boundary evidence                          (source {label})"
+                    ),
+                    "high",
                 )
         } else if val >= STACK_RESERVED_BASE && val <= 0x0000_7fff_ffff_ffff {
             (
@@ -6972,6 +7013,59 @@ mod tests {
             &0x7ff0_1234_0000u64.to_le_bytes(),
             "unknown qword untouched by rebase"
         );
+    }
+
+    /// GTO-COLD-START-HEAP-REBASE-1 H2 (attempt_019 wall): AHK caches
+    /// module address-range boundaries (end / end+0x2a4 / end+0x1000 /
+    /// module-zone base 0x7ff800000000) for classification. These are
+    /// NOT rebaseable pointers — the cold-start process has its own
+    /// module layout. They must be evidence-excluded, not
+    /// unresolved-required.
+    #[test]
+    fn h2_module_boundary_cache_excluded() {
+        let ntdll_base = 0x7ff8c53a0000u64;
+        let ntdll_end = ntdll_base + 0x266000;
+        let mut bytes = vec![0u8; 0x1000];
+        // Four boundary slots: end, end+0x2a4, end+0x1000, zone base.
+        bytes[0x00..0x08].copy_from_slice(&ntdll_end.to_le_bytes());
+        bytes[0x08..0x10].copy_from_slice(&(ntdll_end + 0x2a4).to_le_bytes());
+        bytes[0x10..0x18].copy_from_slice(&(ntdll_end + 0x1000).to_le_bytes());
+        bytes[0x18..0x20].copy_from_slice(&0x7ff800000000u64.to_le_bytes());
+        let slab = HeapSlab {
+            old_base: 0x9000_0000,
+            content: bytes,
+        };
+        let modules = vec![("ntdll.dll".to_string(), ntdll_base, ntdll_end)];
+        let slots =
+            declare_pointer_slots_fallible(&[], &[], &[slab.clone()], &[(ntdll_base, ntdll_end)])
+                .unwrap();
+        assert!(!slots.has_conflict);
+        assert!(
+            slots.declared.is_empty(),
+            "module boundary cache slots must not be declared required"
+        );
+        // All four are ledger records with ModuleBoundaryCache kind.
+        let bc: Vec<_> = slots
+            .ledger
+            .iter()
+            .filter(|r| r.kind == DeclarationKind::ModuleBoundaryCache)
+            .collect();
+        assert_eq!(bc.len(), 4, "all four boundary slots excluded");
+        // Plan completes without unresolved-required (with module ranges so
+        // the boundary cache is recognized).
+        let plan = build_runtime_rebase_plan(
+            &[],
+            &[],
+            &[slab],
+            &slots.declared,
+            &ExternalResolverTable::new(),
+            &modules,
+            OLD_IB,
+            NEW_IB,
+        )
+        .expect("plan")
+        .expect("Some");
+        validate_runtime_rebase_plan(&plan).unwrap();
     }
 
     /// GTO-COLD-START-HEAP-REBASE-1 H2 (attempt_015 wall): a value inside
