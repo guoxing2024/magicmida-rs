@@ -148,7 +148,8 @@ snapshots):
 | H3 cold-start wall | pending | (next) |
 | H4-A SMR (ViaStableBinding stub exec) | DESIGN+IMPL DONE; live validation pending | docs/GTO_COLD_START_HEAP_REBASE_1_H4A_SMR_DESIGN.md |
 | H4-B OEP entry-chain evidence | COMPLETE (3 layouts, fail-closed semantics live) | docs/GTO_COLD_START_HEAP_REBASE_1_H4B_REPORT.md |
-| H4-C TLS / H4-D exception+no-reloc | pending | (next) |
+| H4-C TLS directory+evidence | COMPLETE (3 layouts, gate #7 pass) | docs/GTO_COLD_START_HEAP_REBASE_1_H4C_TLS_DESIGN.md, docs/GTO_COLD_START_HEAP_REBASE_1_H4C_REPORT.md |
+| H4-D exception+no-reloc | pending | (next) |
 | H5 acceptance | pending | (next) |
 | H6 Oreans regression | pending | (next) |
 
