@@ -7120,7 +7120,11 @@ mod tests {
         // NOT in declared. The REAL module pointer (ntdll+0x1234, a raw-slab
         // observation without structural provenance) stays unknown+required
         // (fail-closed: membership-only collision is never dropped).
-        assert_eq!(slots.declared.len(), 1, "only the real module ptr stays required");
+        assert_eq!(
+            slots.declared.len(),
+            1,
+            "only the real module ptr stays required"
+        );
         // Hole value excluded as boundary cache; real module pointer NOT excluded.
         let bc: Vec<_> = slots
             .ledger
