@@ -146,9 +146,9 @@ snapshots):
 | H1 cold-start failure timeline | DONE (obs. report) | docs/GTO_COLD_START_HEAP_REBASE_1_H1_REPORT.md |
 | H2 rebasing primitives | DONE (plan layer; stub execution deferred to H4) | docs/GTO_COLD_START_HEAP_REBASE_1_H2_REPORT.md |
 | H3 cold-start wall | pending | (next) |
-| H4-A SMR (ViaStableBinding stub exec) | DESIGN+IMPL DONE; live validation pending | docs/GTO_COLD_START_HEAP_REBASE_1_H4A_SMR_DESIGN.md |
-| H4-B OEP entry-chain evidence | COMPLETE (3 layouts, fail-closed semantics live) | docs/GTO_COLD_START_HEAP_REBASE_1_H4B_REPORT.md |
-| H4-C TLS directory+evidence | COMPLETE (3 layouts, gate #7 pass) | docs/GTO_COLD_START_HEAP_REBASE_1_H4C_TLS_DESIGN.md, docs/GTO_COLD_START_HEAP_REBASE_1_H4C_REPORT.md |
+| H4-A SMR (ViaStableBinding stub exec) | TECHNICAL PASS + LIVE EVIDENCE (3 ASLR layouts, exit 0, unresolved_required=0/0/0) | docs/GTO_COLD_START_HEAP_REBASE_1_H4A_SMR_DESIGN.md, docs/GTO_COLD_START_HEAP_REBASE_1_H4A_REPORT.md; evidence H4A_smr/ + H4A_smr/layout_B/ |
+| H4-B OEP entry-chain evidence | TECHNICAL PASS; evidence package PARTIAL (attempt_001 raw log unrecoverable; formal seal/sign-off NOT granted — see GTO-H4-LEDGER-CONSISTENCY-1) | docs/GTO_COLD_START_HEAP_REBASE_1_H4B_REPORT.md |
+| H4-C TLS directory+evidence | TECHNICAL PASS + 3-layout evidence PASS; formal evidence seal PENDING (GTO-H4-C-EVIDENCE-SEAL-1); sign-off PENDING | docs/GTO_COLD_START_HEAP_REBASE_1_H4C_TLS_DESIGN.md, docs/GTO_COLD_START_HEAP_REBASE_1_H4C_REPORT.md; evidence H4C_tls/ |
 | H4-D exception+no-reloc | pending | (next) |
 | H5 acceptance | pending | (next) |
 | H6 Oreans regression | pending | (next) |
