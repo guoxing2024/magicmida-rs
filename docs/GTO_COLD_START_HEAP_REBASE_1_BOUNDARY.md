@@ -144,7 +144,7 @@ snapshots):
 |---|---|---|
 | H0 boundary | ACTIVE (this doc) | docs/GTO_COLD_START_HEAP_REBASE_1_BOUNDARY.md |
 | H1 cold-start failure timeline | DONE (obs. report) | docs/GTO_COLD_START_HEAP_REBASE_1_H1_REPORT.md |
-| H2 rebasing primitives | pending | (next) |
+| H2 rebasing primitives | DONE (plan layer; stub execution deferred to H4) | docs/GTO_COLD_START_HEAP_REBASE_1_H2_REPORT.md |
 | H3 cold-start wall | pending | (next) |
 | H4 OEP/IAT/TLS/dump | pending | (next) |
 | H5 acceptance | pending | (next) |
