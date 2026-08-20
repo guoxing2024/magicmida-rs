@@ -965,3 +965,14 @@ used=2 / cap=2 / remaining=0 (final Route C round; no R3)
 - P2: `detect_heap_globals` full debugger pipeline test gap;
 - P2: `sample_transform_allowed`/`policy_for_generic_path` unused reserved interfaces;
 - P2: fixed-RVA generalization still requires an independent governance work order.
+
+---
+
+## J. Repository cleanup 2026-08-20 (handover entry)
+
+- Commits: `0405595` (docs archived to `archive/routes/`, refs updated) + `3645d61` (cargo fmt B1/B2/B4 test sources + cli unpacker mod.rs; formatting-only).
+- Workspace-only removals (not in git): root debug dumps (cdb/disasm/dumpbin/meta/stub/sym), `gto_launcher/` + `crates/cli/gto_launcher/` snapshot.bin, empty `MidaVaultlabevidenceadr7_a4/` (0-byte), `.hermes/`, `lab/authority_reviews/`, empty `crates/bwhook/` + `crates/cli/src/bin/`, 6 abandoned worktrees (`.claude/worktrees/*`, ~5.3 GB) + their branches, `.claude/` (local settings).
+- Untracked generated artifacts `dependency_boundary.json` / `validation_summary.json`; `crates/core/Cargo.toml` CRLF pseudo-change normalized.
+- **Known loss (honest record):** `MidaVaultlabevidenceadr7b_b3B3_RVA_EXACT_LOCATION_REPORT.md` was deleted during cleanup after vault archive copy failed (file was never in git, unrecoverable). Content = ADR7-B3 RVA localization (fault RVA 0x2edb6); does NOT affect B4/B5 closure (B4 fault RVA 0x2e806, independent observer validation). Recovery source: `D:\MidaVault\lab\evidence\adr7b_b3\` or original.
+- **B4 = FORMAL PASS** (user independent spot-check; seal 115 files / 0 mismatch; vault `adr7b_b4/`). **B5 = UNLOCKED** (gate released by B4), TLS isolation evidence COMPLETE 6/6, but **B5 NOT independently FORMAL-PASS sealed** — do not label `B5 FORMAL PASS` without its own seal/sign-off (vault `adr7b_b5/`).
+- Handover doc: `docs/PROJECT_HANDOVER_20260820.md` (layout, commands, cleanup record, maintenance rules).
