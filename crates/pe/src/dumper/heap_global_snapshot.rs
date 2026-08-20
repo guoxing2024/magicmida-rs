@@ -832,6 +832,111 @@ pub fn capture_heap_slab(
     })
 }
 
+/// GTO-COLD-START-HEAP-REBASE-1 H2: close the first-hop coverage gap on AHK's
+/// multi-heap layout (process heap + private heaps + CRT heap).
+///
+/// `exhaust_gscript_first_hop` / `expand_hot_root_children` / `expand_heap_graph`
+/// all admit ProbeWindow children that can sit OUTSIDE the single main-slab
+/// span computed by [`compute_heap_slab_span`]. The `capture_coverage_bind`
+/// gate (`validate_probe_coverage`) then fails closed with
+/// `ProbeCoverageMissing` even though every admitted child was a valid live
+/// read — the capture MODEL was incomplete, not the gate.
+///
+/// Mirror the Route T R0-B dangling-edge pattern: a NON-interior
+/// ProbeWindow/InteriorSubview child (already an authoritative read from the
+/// debuggee at capture time) that is not covered by any existing authoritative
+/// slab (main or dedicated) is surfaced as its own DEDICATED authoritative
+/// slab covering exactly `[live_ptr, live_ptr+content.len())`. The coverage
+/// gate stays unchanged: such a child then has exactly one covering slab.
+///
+/// Fail-closed semantics preserved:
+/// - children already covered by a slab are NOT duplicated (would otherwise
+///   flip coverage to ambiguous);
+/// - interior children (containing_parent recorded) are NOT re-surfaced —
+///   their containing parent's slab provides coverage;
+/// - children outside `[MIN_USER_POINTER, MAX_USER_POINTER]` or with empty
+///   content stay uncovered and still fail closed at the gate.
+///
+/// Pure offline: no debugger reads, no target writes. Returns the number of
+/// dedicated slabs added (for stage telemetry / audit).
+#[must_use]
+pub fn supplement_uncovered_probe_slabs(
+    heap_globals: &[HeapGlobalSnapshot],
+    existing_slabs: &[HeapSlab],
+    dedicated_slabs: &mut Vec<HeapSlab>,
+) -> usize {
+    use CaptureExtentKind as CEK;
+    // Existing covering ranges (main + dedicated + any prior supplement).
+    let mut ranges: Vec<(u64, u64)> = existing_slabs
+        .iter()
+        .chain(dedicated_slabs.iter())
+        .filter(|s| !s.content.is_empty() && s.old_base != 0)
+        .filter_map(|s| {
+            s.old_base
+                .checked_add(s.content.len() as u64)
+                .map(|end| (s.old_base, end))
+        })
+        .collect();
+    let mut added = 0usize;
+    for g in heap_globals {
+        if !g.is_raw_coherence_participant() {
+            continue;
+        }
+        let is_probe = matches!(g.extent_kind, CEK::ProbeWindow | CEK::InteriorSubview);
+        if !is_probe {
+            continue;
+        }
+        // Interior children are covered by their containing parent's slab —
+        // re-surfacing them would create ambiguous multi-coverage.
+        if g.extent_evidence.was_interior || g.extent_evidence.containing_parent_old_base.is_some()
+        {
+            continue;
+        }
+        if g.live_ptr < MIN_USER_POINTER || g.live_ptr > MAX_USER_POINTER {
+            continue;
+        }
+        if g.content.is_empty() {
+            continue;
+        }
+        let child_end = match g.live_ptr.checked_add(g.content.len() as u64) {
+            Some(e) => e,
+            None => continue,
+        };
+        // Count existing covering ranges (before adding ours).
+        let covered = ranges
+            .iter()
+            .any(|&(sb, se)| g.live_ptr >= sb && child_end <= se);
+        if covered {
+            continue;
+        }
+        // Any existing range that PARTIALLY overlaps this child would make the
+        // child ambiguous if we add a dedicated slab — fail closed by skipping
+        // (the gate still rejects the child as uncovered; we never fabricate a
+        // boundary over a conflicting authority).
+        let conflicts = ranges.iter().any(|&(sb, se)| {
+            (g.live_ptr < se && child_end > sb) // ranges intersect
+                && !(g.live_ptr >= sb && child_end <= se) // but not contained
+        });
+        if conflicts {
+            continue;
+        }
+        dedicated_slabs.push(HeapSlab {
+            old_base: g.live_ptr,
+            content: g.content.clone(),
+        });
+        ranges.push((g.live_ptr, child_end));
+        added += 1;
+    }
+    if added > 0 {
+        info!(
+            added,
+            total_dedicated = dedicated_slabs.len(),
+            "Supplemented dedicated slabs for uncovered first-hop probe children (H2)"
+        );
+    }
+    added
+}
+
 pub fn ensure_plant_target_sections_writable(
     pe: &mut PeHeader,
     heap_globals: &[HeapGlobalSnapshot],
@@ -1380,6 +1485,7 @@ pub fn detect_heap_globals(
     // noise while scrub zeroed +0x10..+0xf8 (packed has 32 live edges).
     exhaust_gscript_first_hop(
         &mut out,
+        &mut dedicated_slabs,
         &mut total_bytes,
         &mut seen_heaps,
         image_base,
@@ -2353,6 +2459,7 @@ fn process_heaps_or_handle(debugger: &mut dyn mida_core::DebuggerCore, value: u6
 /// frees gscript and leaves `0x149d50=0` (p21 runtime).
 fn exhaust_gscript_first_hop(
     out: &mut Vec<HeapGlobalSnapshot>,
+    dedicated_slabs: &mut Vec<HeapSlab>,
     total_bytes: &mut usize,
     seen_heaps: &mut BTreeSet<u64>,
     image_base: u64,
@@ -2541,6 +2648,26 @@ fn exhaust_gscript_first_hop(
         } else {
             CaptureExtentKind::ProbeWindow
         };
+        // GTO-COLD-START-HEAP-REBASE-1 H2: first-hop children on AHK's
+        // multi-heap layout (process heap + private heaps + CRT heap) often sit
+        // OUTSIDE the single main-slab span, so the capture_coverage_bind gate
+        // failed closed (ProbeCoverageMissing) even though every child was a
+        // valid live read. Mirror the Route T R0-B dangling-edge pattern: a
+        // non-interior first-hop child is itself an authoritative read from the
+        // debuggee, so surface it as its own DEDICATED authoritative slab
+        // covering exactly [value, value+len). The coverage gate stays
+        // unchanged — the child is then contained in exactly one slab.
+        // Interior children are NOT re-surfaced here: their containing parent
+        // capture already provides coverage (adding a duplicate slab would
+        // trigger the ambiguous multi-coverage failure).
+        let slab_for_child: Option<HeapSlab> = if was_interior || child.is_empty() {
+            None
+        } else {
+            Some(HeapSlab {
+                old_base: value,
+                content: child.clone(),
+            })
+        };
         out.push(HeapGlobalSnapshot {
             rva: 0,
             live_ptr: value,
@@ -2561,6 +2688,9 @@ fn exhaust_gscript_first_hop(
             provenance: RegionProvenance::default(),
             transform_ids: Vec::new(),
         });
+        if let Some(slab) = slab_for_child {
+            dedicated_slabs.push(slab);
+        }
         added += 1;
     }
 
@@ -8858,6 +8988,140 @@ mod tests {
         let ahk_g = globals.iter().find(|g| g.rva == 0x141bf0).unwrap();
         assert_eq!(ahk_g.content.len(), 0x180);
         assert!(ahk_g.content.iter().all(|&b| b == 0));
+    }
+
+    // =====================================================================
+    // GTO-COLD-START-HEAP-REBASE-1 H2 — first-hop dedicated-slab supplement
+    // =====================================================================
+
+    fn h2_probe_child(live_ptr: u64, len: usize, interior: bool) -> HeapGlobalSnapshot {
+        HeapGlobalSnapshot {
+            rva: 0,
+            live_ptr,
+            content: vec![0x41u8; len],
+            is_heap_handle: false,
+            is_image_inline: false,
+            extent_kind: if interior {
+                CaptureExtentKind::InteriorSubview
+            } else {
+                CaptureExtentKind::ProbeWindow
+            },
+            extent_evidence: CaptureExtentEvidence {
+                capture_id: format!("graph_child:{live_ptr:#x}"),
+                capture_path: CapturePath::GscriptFirstHop,
+                source_root_rva: None,
+                source_slot_offset: None,
+                probe_requested_size: 0,
+                was_interior: interior,
+                containing_parent_old_base: if interior {
+                    Some(live_ptr - 0x100)
+                } else {
+                    None
+                },
+                containing_parent_size: if interior { Some(0x200) } else { None },
+            },
+            transform_ids: Vec::new(),
+            provenance: RegionProvenance::default(),
+        }
+    }
+
+    /// An uncovered non-interior first-hop probe child outside the main slab
+    /// gets its own dedicated slab (the exact H3 attempt_006/007 wall:
+    /// `capture_coverage_bind` ProbeCoverageMissing on graph_child:GscriptFirstHop).
+    #[test]
+    fn h2_uncovered_probe_child_gets_dedicated_slab() {
+        let main = HeapSlab {
+            old_base: 0x1000_0000,
+            content: vec![0u8; 0x1000],
+        };
+        // Child OUTSIDE the main span (AHK multi-heap: private heap region).
+        let child = h2_probe_child(0x9000_0000, 0x70, false);
+        let mut dedicated: Vec<HeapSlab> = Vec::new();
+        let added =
+            supplement_uncovered_probe_slabs(&[child.clone()], &[main.clone()], &mut dedicated);
+        assert_eq!(
+            added, 1,
+            "uncovered non-interior probe must be supplemented"
+        );
+        assert_eq!(dedicated.len(), 1);
+        assert_eq!(dedicated[0].old_base, 0x9000_0000);
+        assert_eq!(dedicated[0].content.len(), 0x70);
+        // The child is now covered by exactly one slab (its dedicated one).
+        let slabs = vec![main, dedicated.remove(0)];
+        assert!(
+            super::super::raw_slab_coherence::validate_probe_coverage(&[child], &slabs).is_ok()
+        );
+    }
+
+    /// A child already inside the main slab must NOT be duplicated (that would
+    /// flip exactly-one coverage into ambiguous).
+    #[test]
+    fn h2_covered_probe_child_not_duplicated() {
+        let main = HeapSlab {
+            old_base: 0x9000_0000,
+            content: vec![0u8; 0x1000],
+        };
+        let child = h2_probe_child(0x9000_0100, 0x70, false);
+        let mut dedicated: Vec<HeapSlab> = Vec::new();
+        let added =
+            supplement_uncovered_probe_slabs(&[child.clone()], &[main.clone()], &mut dedicated);
+        assert_eq!(added, 0, "covered child must not be re-surfaced");
+        assert!(dedicated.is_empty());
+        assert!(
+            super::super::raw_slab_coherence::validate_probe_coverage(&[child], &[main]).is_ok()
+        );
+    }
+
+    /// Interior children are covered by their containing parent; re-surfacing
+    /// them would create ambiguous coverage.
+    #[test]
+    fn h2_interior_probe_child_not_duplicated() {
+        let main = HeapSlab {
+            old_base: 0x9000_0000,
+            content: vec![0u8; 0x1000],
+        };
+        let child = h2_probe_child(0x9000_0100, 0x70, true);
+        let mut dedicated: Vec<HeapSlab> = Vec::new();
+        let added = supplement_uncovered_probe_slabs(&[child], &[main], &mut dedicated);
+        assert_eq!(added, 0, "interior child must not be re-surfaced");
+    }
+
+    /// A child partially overlapping an existing authority is NOT supplemented
+    /// (adding a boundary over a conflicting authority would be a fabricated
+    /// extent); the coverage gate still rejects it — fail-closed preserved.
+    #[test]
+    fn h2_conflicting_partial_overlap_not_supplemented() {
+        let main = HeapSlab {
+            old_base: 0x9000_0000,
+            content: vec![0u8; 0x100],
+        };
+        // Child starts inside the main slab but extends past its end.
+        let child = h2_probe_child(0x9000_0080, 0x100, false);
+        let mut dedicated: Vec<HeapSlab> = Vec::new();
+        let added =
+            supplement_uncovered_probe_slabs(&[child.clone()], &[main.clone()], &mut dedicated);
+        assert_eq!(
+            added, 0,
+            "conflicting overlap must fail closed, not fabricate"
+        );
+        assert!(
+            super::super::raw_slab_coherence::validate_probe_coverage(&[child], &[main]).is_err()
+        );
+    }
+
+    /// Bad pointers (outside user range) and empty children stay uncovered:
+    /// they are not heap extents, they are bad pointers.
+    #[test]
+    fn h2_bad_pointer_stays_uncovered() {
+        let low = h2_probe_child(0x1000, 0x70, false); // below MIN_USER_POINTER
+        let empty = HeapGlobalSnapshot {
+            content: Vec::new(),
+            ..h2_probe_child(0x9000_0000, 0x70, false)
+        };
+        let mut dedicated: Vec<HeapSlab> = Vec::new();
+        let added = supplement_uncovered_probe_slabs(&[low, empty], &[], &mut dedicated);
+        assert_eq!(added, 0, "bad pointers must not become slabs");
+        assert!(dedicated.is_empty());
     }
 
     /// Route F / r27: pre-object gap `0x846898` must fall interior to the slab

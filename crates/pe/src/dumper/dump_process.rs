@@ -1020,7 +1020,7 @@ pub fn dump_process_with_report(
     //     (unfreeze=1) before returning — all offline seed/transform/overlay work
     //     below runs AFTER `unfreeze`.
     let (
-        (mut containers, mut heap_globals, dedicated_slabs, main_slab, pre_trunc_authority),
+        (mut containers, mut heap_globals, mut dedicated_slabs, main_slab, pre_trunc_authority),
         capture_tel,
     ) = with_capture_epoch(debugger, epoch_needed, |live_dbg| {
         // Detect SecurityCookie-encoded heap containers from the LIVE late image
@@ -1138,6 +1138,47 @@ pub fn dump_process_with_report(
             slab: s.clone(),
             role: "main",
         });
+    }
+    for d in dedicated_slabs.iter() {
+        slab_candidates.push(super::raw_slab_coherence::AuthoritativeSlabCandidate {
+            slab: d.clone(),
+            role: "dedicated",
+        });
+    }
+    // GTO-COLD-START-HEAP-REBASE-1 H2: close the first-hop coverage gap.
+    // ProbeWindow children admitted by exhaust_gscript_first_hop /
+    // expand_hot_root_children / expand_heap_graph can sit outside the single
+    // main-slab span on AHK's multi-heap layout; the capture_coverage_bind
+    // gate then fails closed (ProbeCoverageMissing) even though every child
+    // was a valid live read. Supplement dedicated slabs for exactly those
+    // non-interior probe children that no existing authority covers — mirror
+    // of the Route T R0-B dangling-edge pattern. The gate stays unchanged;
+    // children that are bad pointers still fail closed below.
+    if let Some(m) = main_slab.as_ref() {
+        let supplement_main = [m.clone()];
+        let _supplemented = super::heap_global_snapshot::supplement_uncovered_probe_slabs(
+            &heap_globals,
+            &supplement_main,
+            &mut dedicated_slabs,
+        );
+        if _supplemented > 0 {
+            info!(
+                added = _supplemented,
+                "H2: supplemented dedicated slabs beyond main slab"
+            );
+        }
+    } else {
+        let _supplemented = super::heap_global_snapshot::supplement_uncovered_probe_slabs(
+            &heap_globals,
+            &[],
+            &mut dedicated_slabs,
+        );
+        if _supplemented > 0 {
+            info!(
+                added = _supplemented,
+                "H2: supplemented dedicated slabs (no main slab)"
+            );
+        }
     }
     for d in dedicated_slabs.iter() {
         slab_candidates.push(super::raw_slab_coherence::AuthoritativeSlabCandidate {
