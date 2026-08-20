@@ -114,6 +114,65 @@ impl Mem {
     #[allow(dead_code)]
     #[allow(dead_code)]
     #[allow(dead_code)]
+    pub fn rsi(disp: i64) -> Self {
+        Mem {
+            base: 6,
+            index: None,
+            scale: 1,
+            disp,
+        }
+    }
+    #[allow(dead_code)]
+    pub fn rdi(disp: i64) -> Self {
+        Mem {
+            base: 7,
+            index: None,
+            scale: 1,
+            disp,
+        }
+    }
+    #[allow(dead_code)]
+    pub fn r8(disp: i64) -> Self {
+        Mem {
+            base: 8,
+            index: None,
+            scale: 1,
+            disp,
+        }
+    }
+    pub fn r9(disp: i64) -> Self {
+        Mem {
+            base: 9,
+            index: None,
+            scale: 1,
+            disp,
+        }
+    }
+    pub fn r10_index(index: u8, scale: u8) -> Self {
+        Mem {
+            base: 10,
+            index: Some(index),
+            scale,
+            disp: 0,
+        }
+    }
+    pub fn rsi_index(index: u8, scale: u8) -> Self {
+        Mem {
+            base: 6,
+            index: Some(index),
+            scale,
+            disp: 0,
+        }
+    }
+    #[allow(dead_code)]
+    pub fn rdi_index(index: u8, scale: u8) -> Self {
+        Mem {
+            base: 7,
+            index: Some(index),
+            scale,
+            disp: 0,
+        }
+    }
     pub fn rcx_index(index: u8) -> Self {
         Mem {
             base: 1,
@@ -359,6 +418,47 @@ pub fn cmp_r8b_imm8(out: &mut Vec<u8>, reg: u8, imm: u8) {
     out.push(0x80);
     out.push(0xf8 + (reg & 7));
     out.push(imm);
+}
+
+/// Emit `or r32, imm8`.
+pub fn or_r32_imm8(out: &mut Vec<u8>, reg: u8, imm: u8) {
+    let rex_b = reg >= 8;
+    out.push(rex_prefix(false, false, false, rex_b));
+    out.push(0x83);
+    out.push(0xc8 + (reg & 7));
+    out.push(imm);
+}
+
+/// Emit `cmp r64, r64`.
+pub fn cmp_r64_r64(out: &mut Vec<u8>, a: u8, b: u8) {
+    let rex_r = b >= 8;
+    let rex_b = a >= 8;
+    out.push(rex_prefix(true, rex_r, false, rex_b));
+    out.push(0x39);
+    let modrm = (0b11 << 6) | ((b & 7) << 3) | (a & 7);
+    out.push(modrm);
+}
+
+/// Emit `cmp r32, r32`.
+pub fn cmp_r32_r32(out: &mut Vec<u8>, a: u8, b: u8) {
+    let rex_r = b >= 8;
+    let rex_b = a >= 8;
+    out.push(rex_prefix(false, rex_r, false, rex_b));
+    out.push(0x39);
+    let modrm = (0b11 << 6) | ((b & 7) << 3) | (a & 7);
+    out.push(modrm);
+}
+
+/// Emit `movzx r32, word ptr [mem]`.
+pub fn movzx_r32_word_mem(out: &mut Vec<u8>, dest: u8, mem: &Mem) {
+    let rex_r = dest >= 8;
+    let mut rex_x = false;
+    let mut rex_b = false;
+    out.push(0);
+    let rpos = out.len() - 1;
+    out.extend_from_slice(&[0x0f, 0xb7]);
+    encode_mem(out, mem, rex_r, dest, &mut rex_x, &mut rex_b);
+    out[rpos] = rex_prefix(false, rex_r, rex_x, rex_b);
 }
 
 /// Emit `test r32, r32`.
@@ -648,6 +748,55 @@ mod tests {
         assert_eq!(insn.mnemonic(), Mnemonic::Mov);
         assert_eq!(insn.memory_base(), Register::R10);
         assert_eq!(insn.memory_size(), MemorySize::UInt32);
+    }
+
+    #[test]
+    fn cmp_r64_r64_decodes() {
+        let mut s = Vec::new();
+        cmp_r64_r64(&mut s, 9, 11); // cmp r9, r11
+        let insn = &dec(&s)[0];
+        assert_eq!(insn.mnemonic(), Mnemonic::Cmp);
+        assert_eq!(insn.op0_register(), Register::R9);
+        assert_eq!(insn.op1_register(), Register::R11);
+        assert_eq!(insn.memory_size(), MemorySize::UInt64, "r64 compare");
+    }
+
+    #[test]
+    fn cmp_r32_r32_decodes() {
+        let mut s = Vec::new();
+        cmp_r32_r32(&mut s, 8, 13); // cmp r8d, r13d
+        let insn = &dec(&s)[0];
+        assert_eq!(insn.mnemonic(), Mnemonic::Cmp);
+        assert_eq!(insn.op0_register(), Register::R8D);
+        assert_eq!(insn.op1_register(), Register::R13D);
+    }
+
+    #[test]
+    fn movzx_word_mem_decodes() {
+        let mut s = Vec::new();
+        movzx_r32_word_mem(&mut s, 8, &Mem::rsi_index(7, 2)); // movzx r8d, word [rsi+rdi*2]
+        let insn = &dec(&s)[0];
+        assert_eq!(insn.mnemonic(), Mnemonic::Movzx);
+        assert_eq!(insn.memory_base(), Register::RSI);
+        assert_eq!(insn.memory_index(), Register::RDI);
+        assert_eq!(insn.memory_size(), MemorySize::UInt16, "word load");
+        // high regs: r9 base + r10 index
+        let mut s2 = Vec::new();
+        movzx_r32_word_mem(&mut s2, 0, &Mem::r10_index(7, 2)); // movzx eax, word [r10+rdi*2]
+        let insn2 = &dec(&s2)[0];
+        assert_eq!(insn2.memory_base(), Register::R10);
+        assert_eq!(insn2.memory_index(), Register::RDI);
+        assert_eq!(insn2.memory_size(), MemorySize::UInt16);
+    }
+
+    #[test]
+    fn or_r32_imm8_decodes() {
+        let mut s = Vec::new();
+        or_r32_imm8(&mut s, 8, 0x20); // or r8d, 0x20
+        let insn = &dec(&s)[0];
+        assert_eq!(insn.mnemonic(), Mnemonic::Or);
+        assert_eq!(insn.op0_register(), Register::R8D);
+        assert_eq!(insn.immediate(1), 0x20u64);
     }
 
     #[test]

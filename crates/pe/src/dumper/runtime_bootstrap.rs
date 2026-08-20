@@ -44,7 +44,7 @@ const META_MAGIC: u32 = 0x3142_5052; // "RBP1"
 const PLAN_HEADER_SIZE: usize = 0x40;
 const REGION_META_SIZE: usize = 0x30; // 48
 const FIXUP_META_SIZE: usize = 0x30; // 48
-const RESOLVER_META_SIZE: usize = 0x20; // 32
+const RESOLVER_META_SIZE: usize = 0x30; // 48 (H4-A SMR: + module_name_rva)
 /// Completion cookie slot is a 4-byte dword (mov dword [r10], 1).
 const COOKIE_SLOT_SIZE: usize = 4;
 
@@ -164,6 +164,8 @@ pub struct BootMetadata {
     pub regions: Vec<BootRegion>,
     pub fixups: Vec<BootFixup>,
     pub resolvers: Vec<BootResolver>,
+    /// H4-A SMR: NUL-terminated module-name string table (concatenated).
+    pub name_table: Vec<u8>,
     pub payload: Vec<u8>,
     pub image_base: u64,
     pub original_oep_rva: u32,
@@ -201,6 +203,9 @@ pub struct BootResolver {
     pub module_rva: u64,
     pub iat_rva: u32,
     pub resolution_kind: u32,
+    /// H4-A SMR: offset of the NUL-terminated module name within the
+    /// metadata name table (0 for ViaIat / ViaExportMap resolvers).
+    pub module_name_rva: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -376,6 +381,33 @@ pub fn encode_plan_metadata(plan: &RuntimeRebasePlan) -> Result<BootMetadata, He
         })
         .collect();
 
+    // H4-A SMR: build the module-name table. ViaStableBinding resolvers carry
+    // a UTF-16LE NUL-terminated module name (identity) the cold-start stub
+    // matches against its own PEB Ldr module list; ViaIat/ViaExportMap
+    // resolvers do not need a name (module_name_rva = 0). Names are deduped
+    // deterministically (sorted) so identical identities share one row.
+    let mut name_table: Vec<u8> = Vec::new();
+    let mut name_offsets: std::collections::BTreeMap<String, u32> =
+        std::collections::BTreeMap::new();
+    for t in &plan.external_targets {
+        if t.resolution_kind != ExternalResolutionKind::ViaStableBinding {
+            continue;
+        }
+        if name_offsets.contains_key(&t.module_identity) {
+            continue;
+        }
+        let off = u32::try_from(name_table.len())
+            .map_err(|_| HeapBootstrapError::Codegen("name table too large".into()))?;
+        name_offsets.insert(t.module_identity.clone(), off);
+        // H4-A: names are stored UTF-16LE to match the Ldr BaseDllName
+        // UNICODE_STRING representation directly in the stub walk.
+        for b in t.module_identity.as_bytes() {
+            name_table.push(*b);
+            name_table.push(0);
+        }
+        name_table.push(0);
+        name_table.push(0);
+    }
     let resolvers: Vec<BootResolver> = plan
         .external_targets
         .iter()
@@ -383,24 +415,13 @@ pub fn encode_plan_metadata(plan: &RuntimeRebasePlan) -> Result<BootMetadata, He
             module_rva: t.module_rva,
             iat_rva: t.iat_rva.unwrap_or(0),
             resolution_kind: resolver_kind_u8(t.resolution_kind),
+            module_name_rva: if t.resolution_kind == ExternalResolutionKind::ViaStableBinding {
+                name_offsets.get(&t.module_identity).copied().unwrap_or(0)
+            } else {
+                0
+            },
         })
         .collect();
-    // GTO-COLD-START-HEAP-REBASE-1 H2 boundary: the plan may now contain
-    // ViaStableBinding resolvers (module-attributed pointers without an IAT
-    // resolver — the old_module_base -> new_module_base primitive). The
-    // two-phase stub currently implements ONLY ViaIat; emitting a
-    // ViaStableBinding resolver here would silently produce a wrong fixup at
-    // cold start (iat_rva=0 read). Fail closed with an explicit H4 marker
-    // instead of encoding a broken stub.
-    if resolvers
-        .iter()
-        .any(|r| r.resolution_kind == resolver_kind_u8(ExternalResolutionKind::ViaStableBinding))
-    {
-        return Err(HeapBootstrapError::UnresolvedRequired(
-            "ViaStableBinding resolver present — cold-start module re-base (H4) not yet              implemented in the two-phase stub; refusing to emit a broken fixup"
-                .to_string(),
-        ));
-    }
 
     // Build the payload region (all region bytes, 8-aligned each, in region
     // order) and compute data offsets.
@@ -419,6 +440,7 @@ pub fn encode_plan_metadata(plan: &RuntimeRebasePlan) -> Result<BootMetadata, He
         regions: regions_out,
         fixups,
         resolvers,
+        name_table,
         payload,
         image_base: plan.new_image_base,
         original_oep_rva: 0,      // set at install
@@ -457,6 +479,9 @@ pub fn decode_plan_metadata(
     let fixup_off = get_u32(h, 0x14) as usize;
     let resolver_off = get_u32(h, 0x18) as usize;
     let payload_off = get_u32(h, 0x1c) as usize;
+    // H4-A SMR: name table offset + length.
+    let name_table_off = get_u32(h, 0x34) as usize;
+    let name_table_len = get_u32(h, 0x38) as usize;
 
     // Region table.
     let need_regions = region_off
@@ -533,7 +558,37 @@ pub fn decode_plan_metadata(
             module_rva: get_u64(b, 0x00),
             iat_rva: get_u32(b, 0x08),
             resolution_kind: get_u32(b, 0x0c),
+            module_name_rva: get_u32(b, 0x10),
         });
+    }
+
+    // H4-A SMR: name table read + bounds validation. Every
+    // ViaStableBinding resolver's module_name_rva must land inside the table
+    // at a NUL terminator; a dangling reference fails closed.
+    let mut name_table: Vec<u8> = Vec::new();
+    if name_table_len > 0 {
+        let nt_end = name_table_off
+            .checked_add(name_table_len)
+            .ok_or_else(|| HeapBootstrapError::Codegen("name table offset overflow".into()))?;
+        if nt_end > blob.len() {
+            return Err(HeapBootstrapError::Codegen("name table truncated".into()));
+        }
+        name_table = blob[name_table_off..nt_end].to_vec();
+        if name_table.len() < 2 || name_table[name_table.len() - 2..] != [0, 0] {
+            return Err(HeapBootstrapError::Codegen(
+                "name table not UTF-16 NUL-terminated".into(),
+            ));
+        }
+    }
+    for r in &resolvers {
+        if r.resolution_kind == resolver_kind_u8(ExternalResolutionKind::ViaStableBinding) {
+            if name_table.is_empty() || r.module_name_rva as usize >= name_table.len() {
+                return Err(HeapBootstrapError::Codegen(format!(
+                    "ViaStableBinding resolver {} rva {:#x} has no valid module name",
+                    r.module_name_rva, r.module_rva
+                )));
+            }
+        }
     }
 
     // The payload length = max(region.data_offset + region.size). This excludes
@@ -559,6 +614,7 @@ pub fn decode_plan_metadata(
         regions,
         fixups,
         resolvers,
+        name_table,
         payload,
         image_base,
         original_oep_rva,
@@ -579,6 +635,8 @@ pub(crate) struct BootLayout {
     pub(crate) region_off: usize,
     pub(crate) fixup_off: usize,
     pub(crate) resolver_off: usize,
+    /// H4-A SMR: offset where the module-name table begins.
+    pub(crate) name_table_off: usize,
     pub(crate) payload_off: usize,
     pub(crate) map_off: usize,
     pub(crate) cookie_off: usize,
@@ -590,7 +648,10 @@ fn metadata_layout(meta: &BootMetadata, code_len: usize) -> (usize, BootLayout) 
     let region_off = header_off + PLAN_HEADER_SIZE;
     let fixup_off = region_off + meta.regions.len() * REGION_META_SIZE;
     let resolver_off = fixup_off + meta.fixups.len() * FIXUP_META_SIZE;
-    let payload_off = resolver_off + meta.resolvers.len() * RESOLVER_META_SIZE;
+    // H4-A SMR: the name table sits between the resolver table and the
+    // payload; resolvers reference it by offset (module_name_rva).
+    let name_table_off = resolver_off + meta.resolvers.len() * RESOLVER_META_SIZE;
+    let payload_off = name_table_off + meta.name_table.len();
     let payload_end = payload_off + meta.payload.len();
     let map_off = align8(payload_end);
     let map_end = map_off + meta.regions.len() * 8;
@@ -603,6 +664,7 @@ fn metadata_layout(meta: &BootMetadata, code_len: usize) -> (usize, BootLayout) 
             region_off,
             fixup_off,
             resolver_off,
+            name_table_off,
             payload_off,
             map_off,
             cookie_off,
@@ -618,6 +680,7 @@ fn serialize_metadata_into(
     meta_offset: usize,
     original_oep_rva: u32,
     completion_cookie_rva: u32,
+    name_table_off: usize,
 ) -> Result<(), HeapBootstrapError> {
     let h = &mut blob[meta_offset..meta_offset + PLAN_HEADER_SIZE];
     put_u32(h, 0, META_MAGIC);
@@ -650,6 +713,9 @@ fn serialize_metadata_into(
     put_u64(h, 0x20, meta.image_base);
     put_u32(h, 0x28, original_oep_rva);
     put_u32(h, 0x30, completion_cookie_rva);
+    // H4-A SMR: name table offset (absolute within .boot) + byte length.
+    put_u32(h, 0x34, name_table_off as u32);
+    put_u32(h, 0x38, meta.name_table.len() as u32);
 
     // Region table.
     for (i, r) in meta.regions.iter().enumerate() {
@@ -698,14 +764,29 @@ fn serialize_metadata_into(
         put_u64(b, 0x00, r.module_rva);
         put_u32(b, 0x08, r.iat_rva);
         put_u32(b, 0x0c, r.resolution_kind);
+        put_u32(b, 0x10, r.module_name_rva);
     }
 
-    // Payload.
+    // H4-A SMR: name table (NUL-terminated module names, concatenated).
+    if !meta.name_table.is_empty() {
+        let nt_end = name_table_off
+            .checked_add(meta.name_table.len())
+            .ok_or_else(|| HeapBootstrapError::Codegen("name table offset overflow".into()))?;
+        if nt_end > blob.len() {
+            return Err(HeapBootstrapError::Codegen(
+                "name table exceeds .boot".into(),
+            ));
+        }
+        blob[name_table_off..nt_end].copy_from_slice(&meta.name_table);
+    }
+
+    // Payload (after the name table).
     let payload_off = meta_offset
         + PLAN_HEADER_SIZE
         + meta.regions.len() * REGION_META_SIZE
         + meta.fixups.len() * FIXUP_META_SIZE
-        + meta.resolvers.len() * RESOLVER_META_SIZE;
+        + meta.resolvers.len() * RESOLVER_META_SIZE
+        + meta.name_table.len();
     if payload_off + meta.payload.len() > blob.len() {
         return Err(HeapBootstrapError::Codegen("payload exceeds .boot".into()));
     }
@@ -780,6 +861,7 @@ pub fn build_runtime_bootstrap(
         meta_offset,
         original_entry_point,
         cookie_rva,
+        layout.name_table_off,
     )?;
 
     // Patch the two lea displacements (meta base, alloc map base).
@@ -1038,6 +1120,14 @@ fn emit_two_phase_code(
     a::mov_r32_mem(&mut s, 1, &a::Mem::r12(0x1c));
     a::imul_r64_r64_imm32(&mut s, 1, 1, 0x20); // imul rcx, rcx, 0x20
     a::add_r64_r64(&mut s, 1, 9); // add rcx, r9 (resolver entry)
+                                  // H4-A SMR: branch on resolution_kind ([rcx+0x0c]).
+                                  //   0 (ViaIat)  -> existing IAT-slot read
+                                  //   2 (ViaStableBinding) -> call smr_resolve (PEB Ldr module walk)
+                                  //   1 (ViaExportMap) -> p2_unresolved (fail-closed, no stub)
+    a::mov_r32_mem(&mut s, 8, &a::Mem::rcx(0x0c)); // mov r8d, [rcx+0xc] (kind)
+    a::cmp_r32_r32(&mut s, 8, 0); // cmp r8d, 0
+    a::jcc_rel32(&mut s, 0x85, 0); // jne not_iat
+    let p2_jne_iat = s.len() - 4;
     a::mov_r32_mem(&mut s, 8, &a::Mem::rcx(8)); // mov r8d, [rcx+8] (iat_rva)
                                                 // r10 = image_base + iat_rva ; rdx = [r10]
     a::mov_r64_r64(&mut s, 10, 5); // mov r10, rbp (loaded image base)
@@ -1046,11 +1136,23 @@ fn emit_two_phase_code(
     a::jmp_rel32(&mut s, 0); // jmp p2_write
     let p2_jmp_write3 = s.len() - 4;
 
+    // ---- not_iat: ViaStableBinding (kind 2) -> call smr_resolve ----
+    let p2_not_iat = s.len();
+    patch_rel32(&mut s, p2_jne_iat, p2_not_iat)?;
+    a::cmp_r32_r32(&mut s, 8, 2); // cmp r8d, 2
+    a::jcc_rel32(&mut s, 0x85, 0); // jne p2_unresolved (kind 1 not stubbed)
+    let p2_jne_smr = s.len() - 4;
+    a::call_rel32(&mut s, 0); // call smr_resolve (patched at helper)
+    let p2_call_smr = s.len() - 4;
+    a::jmp_rel32(&mut s, 0); // jmp p2_write
+    let p2_jmp_write4 = s.len() - 4;
+
     // p2_write: [src] = rdx
     let p2_write = s.len();
     patch_rel32(&mut s, p2_jmp_write, p2_write)?;
     patch_rel32(&mut s, p2_jmp_write2, p2_write)?;
     patch_rel32(&mut s, p2_jmp_write3, p2_write)?;
+    patch_rel32(&mut s, p2_jmp_write4, p2_write)?;
     a::mov_mem_r64(&mut s, &a::Mem::rax(0), 2); // mov [rax], rdx
 
     // p2_next
@@ -1059,6 +1161,7 @@ fn emit_two_phase_code(
     patch_rel32(&mut s, p2_jz_tag, p2_next)?;
     let p2_unresolved = s.len();
     patch_rel32(&mut s, p2_jne_ext, p2_unresolved)?;
+    patch_rel32(&mut s, p2_jne_smr, p2_unresolved)?;
     a::inc_r32(&mut s, 11);
     a::add_r64_imm32(&mut s, 12, 0x30);
     a::dec_r32(&mut s, 13);
@@ -1106,6 +1209,119 @@ fn emit_two_phase_code(
     a::rep_movsb(&mut s);
     a::pop_r64(&mut s, 6);
     a::pop_r64(&mut s, 7);
+    a::ret(&mut s);
+
+    // ===================== smr_resolve helper (H4-A) =====================
+    // Resolves a ViaStableBinding resolver at cold start by walking the
+    // target process's OWN PEB Ldr InLoadOrderModuleList:
+    //
+    //   gs:[0x60] -> PEB ; PEB+0x18 -> Ldr ; Ldr+0x10 -> list head
+    //   entry+0x30 = DllBase ; entry+0x58/0x60 = BaseDllName (UNICODE_STRING)
+    //
+    // Input : rcx = resolver entry (module_rva @ +0x00, module_name_rva @ +0x10)
+    //         r15 = meta base ; rbp = loaded image base (unused here)
+    // Output: rdx = new_base + module_rva
+    // Fail  : infinite loop (module not found / Ldr absent) — the completion
+    //         cookie stays 0 and OEP is never reached (fail-closed, same
+    //         class as Phase-1 allocation failure).
+    //
+    // Clobbers rax, rcx, rdx, r8, r9, r10, r11, rsi, rdi, r13 (callee-saved
+    // rsi/rdi/r13 are pushed/popped; r11 is loop scratch only inside).
+    let smr_start = s.len();
+    patch_call_rel(&mut s, p2_call_smr, smr_start)?;
+    a::push_r64(&mut s, 13); // r13
+    a::push_r64(&mut s, 7); // rdi
+    a::push_r64(&mut s, 6); // rsi
+
+    // rsi = name ptr = r15 + [rcx+0x10]
+    a::mov_r32_mem(&mut s, 6, &a::Mem::rcx(0x10));
+    a::add_r64_r64(&mut s, 6, 15); // rsi = r15 + name_off
+                                   // rdi = name char count (UTF-16 units until [0,0])
+    a::xor_r32_r32(&mut s, 7, 7); // xor edi, edi
+    let smr_count_loop = s.len();
+    a::movzx_r32_word_mem(&mut s, 8, &a::Mem::rsi_index(7, 2)); // r8d = [rsi + rdi*2]
+    a::test_r32_r32(&mut s, 8, 8);
+    a::jcc_rel32(&mut s, 0x84, 0); // jz count_done
+    let smr_count_done = s.len() - 4;
+    a::inc_r32(&mut s, 7);
+    a::jmp_rel32(&mut s, 0); // jmp count_loop
+    let smr_count_back = s.len() - 4;
+    let smr_count_done_label = s.len();
+    patch_rel32(&mut s, smr_count_back, smr_count_loop)?;
+    patch_rel32(&mut s, smr_count_done, smr_count_done_label)?;
+    // r13 = name bytes = rdi * 2
+    a::mov_r64_r64(&mut s, 13, 7); // mov r13, rdi
+    a::add_r64_r64(&mut s, 13, 13); // r13 *= 2
+
+    // PEB -> Ldr -> list head
+    a::mov_r64_gs_disp32(&mut s, 0, 0x60); // mov rax, gs:[0x60] (PEB)
+    a::mov_r64_mem(&mut s, 0, &a::Mem::rax(0x18)); // mov rax, [rax+0x18] (Ldr)
+    a::mov_r64_mem(&mut s, 0, &a::Mem::rax(0x10)); // mov rax, [rax+0x10] (head)
+    a::mov_r64_mem(&mut s, 9, &a::Mem::rax(0)); // mov r9, [rax] (first entry)
+    a::mov_r64_r64(&mut s, 11, 0); // mov r11, rax (head sentinel)
+
+    // walk loop: r9 = current entry
+    a::cmp_r64_r64(&mut s, 9, 11); // cmp r9, r11
+    a::jcc_rel32(&mut s, 0x84, 0); // je fail
+    let smr_walk_jz_fail = s.len() - 4;
+    // Length check: BaseDllName.Length ([r9+0x58], bytes) == r13
+    a::movzx_r32_word_mem(&mut s, 8, &a::Mem::r9(0x58));
+    a::cmp_r32_r32(&mut s, 8, 13); // cmp r8d, r13d
+    a::jcc_rel32(&mut s, 0x85, 0); // jne next_entry
+    let smr_jne_next = s.len() - 4;
+    // r10 = BaseDllName.Buffer ([r9+0x60])
+    a::mov_r64_mem(&mut s, 10, &a::Mem::r9(0x60));
+    // Compare loop: for i in 0..rdi: name[i] vs buffer[i] (case-insensitive
+    // ASCII fold: (c | 0x20) — module names are ASCII).
+    a::xor_r32_r32(&mut s, 7, 7); // xor edi, edi (i = 0)
+    a::cmp_r32_r32(&mut s, 7, 13); // cmp edi, r13d (i vs name_bytes)
+    a::jcc_rel32(&mut s, 0x84, 0); // je match
+    let smr_cmp_jz_match = s.len() - 4;
+    a::movzx_r32_word_mem(&mut s, 8, &a::Mem::rsi_index(7, 1)); // r8d = word [rsi+rdi] (byte offset)
+    a::movzx_r32_word_mem(&mut s, 0, &a::Mem::r10_index(7, 1)); // eax = word [r10+rdi]
+    a::or_r32_imm8(&mut s, 8, 0x20); // r8d |= 0x20
+    a::or_r32_imm8(&mut s, 0, 0x20); // eax |= 0x20
+    a::cmp_r32_r32(&mut s, 8, 0); // cmp r8d, eax
+    a::jcc_rel32(&mut s, 0x85, 0); // jne next_entry
+    let smr_jne_next2 = s.len() - 4;
+    a::inc_r32(&mut s, 7); // rdi += 1
+    a::inc_r32(&mut s, 7); // rdi += 1 (byte offset, 2 bytes per UTF-16 unit)
+    a::jmp_rel32(&mut s, 0); // jmp cmp_loop
+    let smr_cmp_back = s.len() - 4;
+    let smr_cmp_loop2 = s.len();
+    patch_rel32(&mut s, smr_cmp_back, smr_cmp_loop2)?;
+    a::jcc_rel32(&mut s, 0x84, 0); // jz match (patch)
+    let smr_cmp_jz_match2 = s.len() - 4;
+    let smr_match = s.len();
+    patch_rel32(&mut s, smr_cmp_jz_match, smr_match)?;
+    patch_rel32(&mut s, smr_cmp_jz_match2, smr_match)?;
+    // rdx = [r9+0x30] (DllBase) + [rcx+0x00] (module_rva)
+    a::mov_r64_mem(&mut s, 2, &a::Mem::r9(0x30));
+    a::mov_r64_mem(&mut s, 8, &a::Mem::rcx(0));
+    a::add_r64_r64(&mut s, 2, 8); // rdx += module_rva
+    a::jmp_rel32(&mut s, 0); // jmp done
+    let smr_jmp_done = s.len() - 4;
+    // next_entry
+    let smr_next = s.len();
+    patch_rel32(&mut s, smr_jne_next, smr_next)?;
+    patch_rel32(&mut s, smr_jne_next2, smr_next)?;
+    a::mov_r64_mem(&mut s, 9, &a::Mem::r9(0)); // r9 = [r9] (Flink)
+    a::jmp_rel32(&mut s, 0); // jmp walk
+    let smr_jmp_walk = s.len() - 4;
+    let smr_walk2 = s.len();
+    patch_rel32(&mut s, smr_jmp_walk, smr_walk2)?;
+    a::jcc_rel32(&mut s, 0x84, 0); // jz fail (patch)
+    let smr_walk_jz_fail2 = s.len() - 4;
+    let smr_fail = s.len();
+    patch_rel32(&mut s, smr_walk_jz_fail, smr_fail)?;
+    patch_rel32(&mut s, smr_walk_jz_fail2, smr_fail)?;
+    a::infinite_loop(&mut s);
+    // done
+    let smr_done = s.len();
+    patch_rel32(&mut s, smr_jmp_done, smr_done)?;
+    a::pop_r64(&mut s, 6);
+    a::pop_r64(&mut s, 7);
+    a::pop_r64(&mut s, 13);
     a::ret(&mut s);
 
     Ok((
@@ -1170,6 +1386,7 @@ pub fn simulate_runtime_rebase(
     allocation_bases: &[u64],
     loaded_image_base: u64,
     iat_contents: &std::collections::HashMap<u64, u64>,
+    module_bases: &std::collections::HashMap<String, u64>,
 ) -> Result<Vec<Vec<u8>>, HeapBootstrapError> {
     if meta.regions.len() != allocation_bases.len() {
         return Err(HeapBootstrapError::Codegen(format!(
@@ -1230,20 +1447,61 @@ pub fn simulate_runtime_rebase(
                     )));
                 }
                 let resolver = &meta.resolvers[idx];
-                if resolver.iat_rva == 0 {
+                if resolver.resolution_kind == resolver_kind_u8(ExternalResolutionKind::ViaIat) {
+                    if resolver.iat_rva == 0 {
+                        return Err(HeapBootstrapError::UnresolvedRequired(format!(
+                            "external resolver {idx} has no IAT slot"
+                        )));
+                    }
+                    // The stub reads memory[iat_slot_va] to obtain the resolved API
+                    // address (ASLR-safe, loader-filled IAT). The simulator does the
+                    // same via `iat_contents`. A missing IAT entry fails closed.
+                    let iat_slot_va = loaded_image_base.wrapping_add(resolver.iat_rva as u64);
+                    iat_contents.get(&iat_slot_va).copied().ok_or_else(|| {
+                        HeapBootstrapError::UnresolvedRequired(format!(
+                            "external resolver {idx} IAT slot {iat_slot_va:#x} has no content"
+                        ))
+                    })?
+                } else if resolver.resolution_kind
+                    == resolver_kind_u8(ExternalResolutionKind::ViaStableBinding)
+                {
+                    // H4-A SMR: resolve (module identity, module_rva) through the
+                    // cold-start module map. The simulator mirrors the stub's PEB
+                    // Ldr walk with `module_bases`. A missing module fails closed
+                    // exactly like a stub walk failure.
+                    let name_off = resolver.module_name_rva as usize;
+                    if name_off >= meta.name_table.len() {
+                        return Err(HeapBootstrapError::UnresolvedRequired(format!(
+                            "external resolver {idx} module name offset out of range"
+                        )));
+                    }
+                    let end = meta.name_table[name_off..]
+                        .chunks_exact(2)
+                        .position(|c| c == [0, 0])
+                        .map(|p| name_off + p * 2)
+                        .ok_or_else(|| {
+                            HeapBootstrapError::UnresolvedRequired(format!(
+                                "external resolver {idx} module name not UTF-16 NUL-terminated"
+                            ))
+                        })?;
+                    let raw = &meta.name_table[name_off..end];
+                    let name = String::from_utf16_lossy(
+                        &raw.chunks_exact(2)
+                            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                            .collect::<Vec<u16>>(),
+                    );
+                    let base = module_bases.get(name.as_str()).copied().ok_or_else(|| {
+                        HeapBootstrapError::UnresolvedRequired(format!(
+                            "ViaStableBinding resolver {idx} module {name} not in cold-start module map"
+                        ))
+                    })?;
+                    base.wrapping_add(resolver.module_rva)
+                } else {
                     return Err(HeapBootstrapError::UnresolvedRequired(format!(
-                        "external resolver {idx} has no IAT slot"
+                        "external resolver {idx} kind {} has no stub execution (ViaExportMap not implemented)",
+                        resolver.resolution_kind
                     )));
                 }
-                // The stub reads memory[iat_slot_va] to obtain the resolved API
-                // address (ASLR-safe, loader-filled IAT). The simulator does the
-                // same via `iat_contents`. A missing IAT entry fails closed.
-                let iat_slot_va = loaded_image_base.wrapping_add(resolver.iat_rva as u64);
-                iat_contents.get(&iat_slot_va).copied().ok_or_else(|| {
-                    HeapBootstrapError::UnresolvedRequired(format!(
-                        "external resolver {idx} IAT slot {iat_slot_va:#x} has no content"
-                    ))
-                })?
             }
             PointerClassification::ExternalCandidate
             | PointerClassification::Unmapped
@@ -1331,7 +1589,12 @@ mod tests {
         let meta = meta_of(&plan);
         let (meta_off, layout) = metadata_layout(&meta, 0x100);
         let mut blob = vec![0u8; layout.total];
-        serialize_metadata_into(&mut blob, &meta, meta_off, 0x5a10, 0x2f00).unwrap();
+        let nt_off = meta_off
+            + PLAN_HEADER_SIZE
+            + meta.regions.len() * REGION_META_SIZE
+            + meta.fixups.len() * FIXUP_META_SIZE
+            + meta.resolvers.len() * RESOLVER_META_SIZE;
+        serialize_metadata_into(&mut blob, &meta, meta_off, 0x5a10, 0x2f00, nt_off).unwrap();
         let decoded = decode_plan_metadata(&blob, meta_off).unwrap();
         assert_eq!(decoded.regions, meta.regions);
         assert_eq!(decoded.fixups, meta.fixups);
@@ -1360,7 +1623,14 @@ mod tests {
         let plan = plan_from(&[a, b]);
         let meta = meta_of(&plan);
         let bases = [0x900000u64, 0xa00000];
-        let patched = simulate_runtime_rebase(&meta, &bases, NEW_IB, &Default::default()).unwrap();
+        let patched = simulate_runtime_rebase(
+            &meta,
+            &bases,
+            NEW_IB,
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
         let a_slot = u64::from_le_bytes(patched[0][0..8].try_into().unwrap());
         assert_eq!(a_slot, 0xa00000);
         validate_rebased_snapshots(
@@ -1377,7 +1647,14 @@ mod tests {
         let plan = plan_from(&[c]);
         let meta = meta_of(&plan);
         let bases = [0x900000u64];
-        let patched = simulate_runtime_rebase(&meta, &bases, NEW_IB, &Default::default()).unwrap();
+        let patched = simulate_runtime_rebase(
+            &meta,
+            &bases,
+            NEW_IB,
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
         let slot = u64::from_le_bytes(patched[0][0x10..0x18].try_into().unwrap());
         assert_eq!(slot, 0x900000 + 0x20);
     }
@@ -1393,8 +1670,14 @@ mod tests {
         );
         let plan = plan_from(&[c]);
         let meta = meta_of(&plan);
-        let patched =
-            simulate_runtime_rebase(&meta, &[0x900000], NEW_IB, &Default::default()).unwrap();
+        let patched = simulate_runtime_rebase(
+            &meta,
+            &[0x900000],
+            NEW_IB,
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
         let slot = u64::from_le_bytes(patched[0][0..8].try_into().unwrap());
         assert_eq!(slot, 0x900000);
     }
@@ -1418,7 +1701,14 @@ mod tests {
         let plan = plan_from(&[a, b]);
         let meta = meta_of(&plan);
         let bases = [0x900000u64, 0xa00000];
-        let patched = simulate_runtime_rebase(&meta, &bases, NEW_IB, &Default::default()).unwrap();
+        let patched = simulate_runtime_rebase(
+            &meta,
+            &bases,
+            NEW_IB,
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
         assert_eq!(
             u64::from_le_bytes(patched[0][0..8].try_into().unwrap()),
             0xa00000
@@ -1436,8 +1726,14 @@ mod tests {
         let plan = plan_from(&[c]);
         let meta = meta_of(&plan);
         let loaded_base = 0x140_0000_00u64;
-        let patched =
-            simulate_runtime_rebase(&meta, &[0x900000], loaded_base, &Default::default()).unwrap();
+        let patched = simulate_runtime_rebase(
+            &meta,
+            &[0x900000],
+            loaded_base,
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
         assert_eq!(
             u64::from_le_bytes(patched[0][0..8].try_into().unwrap()),
             loaded_base + 0x1234
@@ -1516,8 +1812,14 @@ mod tests {
         let iat_slot = loaded_base + 0xf0100;
         let mut iat_contents = std::collections::HashMap::new();
         iat_contents.insert(iat_slot, api_va);
-        let patched =
-            simulate_runtime_rebase(&meta, &[0x900000], loaded_base, &iat_contents).unwrap();
+        let patched = simulate_runtime_rebase(
+            &meta,
+            &[0x900000],
+            loaded_base,
+            &iat_contents,
+            &Default::default(),
+        )
+        .unwrap();
         let slot = u64::from_le_bytes(patched[0][0..8].try_into().unwrap());
         // Must be the resolved API address (not the slot address).
         assert_eq!(slot, api_va, "must write resolved API VA, not iat_slot");
@@ -1529,14 +1831,189 @@ mod tests {
         let iat_slot2 = loaded_base2 + 0xf0100;
         let mut iat2 = std::collections::HashMap::new();
         iat2.insert(iat_slot2, api_va);
-        let patched2 = simulate_runtime_rebase(&meta, &[0x900000], loaded_base2, &iat2).unwrap();
+        let patched2 =
+            simulate_runtime_rebase(&meta, &[0x900000], loaded_base2, &iat2, &Default::default())
+                .unwrap();
         let slot2 = u64::from_le_bytes(patched2[0][0..8].try_into().unwrap());
         assert_eq!(slot2, api_va, "ASLR: resolution follows new IAT content");
 
         // Missing IAT content must fail closed.
-        let err = simulate_runtime_rebase(&meta, &[0x900000], loaded_base, &Default::default())
-            .unwrap_err();
+        let err = simulate_runtime_rebase(
+            &meta,
+            &[0x900000],
+            loaded_base,
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap_err();
         assert!(matches!(err, HeapBootstrapError::UnresolvedRequired(_)));
+    }
+
+    #[test]
+    fn h4a_stable_binding_resolution_roundtrip() {
+        // A module-attributed pointer WITHOUT an IAT resolver: ViaStableBinding.
+        let api_rva = 0x12340u64;
+        let old_base = 0x7ff9_1000_0000u64;
+        let api_va = old_base + api_rva;
+        let modules = vec![("ntdll.dll".to_string(), old_base, old_base + 0x200000)];
+        let mut resolvers = crate::dumper::runtime_rebase::ExternalResolverTable::new();
+        resolvers
+            .insert(ExternalTarget {
+                module_identity: "ntdll.dll".to_string(),
+                module_rva: api_rva,
+                import_dll: "ntdll.dll".to_string(),
+                import_name_or_ordinal: format!("#{api_rva:x}"),
+                iat_rva: None,
+                resolution_kind: ExternalResolutionKind::ViaStableBinding,
+            })
+            .unwrap();
+        let c = container(
+            0x1000,
+            0x500000,
+            0x500010,
+            0x500020,
+            region_bytes(0x10, &[(0, api_va)]),
+        );
+        let slots = declared_slots_from_capture(&[c.clone()], &[], &[]);
+        let plan =
+            build_runtime_rebase_plan(&[c], &[], &[], &slots, &resolvers, &modules, OLD_IB, NEW_IB)
+                .unwrap()
+                .unwrap();
+        // H4-A: encode no longer fails closed on ViaStableBinding.
+        let meta = meta_of(&plan);
+        assert_eq!(meta.resolvers.len(), 1);
+        assert_eq!(
+            meta.resolvers[0].resolution_kind,
+            resolver_kind_u8(ExternalResolutionKind::ViaStableBinding)
+        );
+        // The first name in the table has offset 0; the resolver must carry
+        // that offset (which is valid, not "absent").
+        assert_eq!(
+            meta.resolvers[0].module_name_rva, 0,
+            "single-name table: resolver offset must point at the name"
+        );
+        // Name table holds the UTF-16LE NUL-terminated identity.
+        let mut expected: Vec<u8> = Vec::new();
+        for b in b"ntdll.dll" {
+            expected.push(*b);
+            expected.push(0);
+        }
+        expected.extend_from_slice(&[0, 0]);
+        assert_eq!(&meta.name_table, &expected);
+
+        // Serialize -> decode round-trip preserves the resolver + name table.
+        let (meta_off, layout) = metadata_layout(&meta, 0x100);
+        let mut blob = vec![0u8; layout.total];
+        serialize_metadata_into(
+            &mut blob,
+            &meta,
+            meta_off,
+            0x5a10,
+            0x2f00,
+            layout.name_table_off,
+        )
+        .unwrap();
+        let decoded = decode_plan_metadata(&blob, meta_off).unwrap();
+        assert_eq!(decoded.resolvers, meta.resolvers);
+        assert_eq!(decoded.name_table, meta.name_table);
+
+        // Cold-start module map resolves (module, rva) -> new_base + rva.
+        let new_base = 0x7ff8_5000_0000u64;
+        let mut module_bases = std::collections::HashMap::new();
+        module_bases.insert("ntdll.dll".to_string(), new_base);
+        let patched = simulate_runtime_rebase(
+            &decoded,
+            &[0x900000],
+            NEW_IB,
+            &Default::default(),
+            &module_bases,
+        )
+        .unwrap();
+        let slot = u64::from_le_bytes(patched[0][0..8].try_into().unwrap());
+        assert_eq!(
+            slot,
+            new_base + api_rva,
+            "SMR must rebase to new module base"
+        );
+        assert_ne!(slot, api_va, "must never write the dump-time API VA");
+    }
+
+    #[test]
+    fn h4a_stable_binding_missing_module_fails_closed() {
+        let api_rva = 0x12340u64;
+        let old_base = 0x7ff9_1000_0000u64;
+        let modules = vec![("ntdll.dll".to_string(), old_base, old_base + 0x200000)];
+        let mut resolvers = crate::dumper::runtime_rebase::ExternalResolverTable::new();
+        resolvers
+            .insert(ExternalTarget {
+                module_identity: "ntdll.dll".to_string(),
+                module_rva: api_rva,
+                import_dll: "ntdll.dll".to_string(),
+                import_name_or_ordinal: format!("#{api_rva:x}"),
+                iat_rva: None,
+                resolution_kind: ExternalResolutionKind::ViaStableBinding,
+            })
+            .unwrap();
+        let c = container(
+            0x1000,
+            0x500000,
+            0x500010,
+            0x500020,
+            region_bytes(0x10, &[(0, old_base + api_rva)]),
+        );
+        let slots = declared_slots_from_capture(&[c.clone()], &[], &[]);
+        let plan =
+            build_runtime_rebase_plan(&[c], &[], &[], &slots, &resolvers, &modules, OLD_IB, NEW_IB)
+                .unwrap()
+                .unwrap();
+        let meta = meta_of(&plan);
+        // Cold-start module map WITHOUT the module: the stub walk fails, the
+        // simulator fails closed with UnresolvedRequired.
+        let err = simulate_runtime_rebase(
+            &meta,
+            &[0x900000],
+            NEW_IB,
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, HeapBootstrapError::UnresolvedRequired(_)),
+            "missing cold-start module must fail closed: {err}"
+        );
+    }
+
+    #[test]
+    fn h4a_name_table_bounds_fail_closed() {
+        // A resolver referencing a name offset beyond the table must fail decode.
+        let meta = BootMetadata {
+            regions: Vec::new(),
+            fixups: Vec::new(),
+            resolvers: vec![BootResolver {
+                module_rva: 0x1234,
+                iat_rva: 0,
+                resolution_kind: resolver_kind_u8(ExternalResolutionKind::ViaStableBinding),
+                module_name_rva: 0x1000, // beyond the (empty) table
+            }],
+            name_table: Vec::new(),
+            payload: Vec::new(),
+            image_base: 0x140_0000_00,
+            original_oep_rva: 0,
+            completion_cookie_rva: 0,
+        };
+        let (meta_off, layout) = metadata_layout(&meta, 0x40);
+        let mut blob = vec![0u8; layout.total];
+        serialize_metadata_into(
+            &mut blob,
+            &meta,
+            meta_off,
+            0x1000,
+            0x2000,
+            layout.name_table_off,
+        )
+        .unwrap();
+        let err = decode_plan_metadata(&blob, meta_off).unwrap_err();
+        assert!(matches!(err, HeapBootstrapError::Codegen(_)));
     }
 
     #[test]
@@ -1558,7 +2035,14 @@ mod tests {
         let plan = plan_from(&[a, b]);
         let meta = meta_of(&plan);
         let bases = [0x900000u64, 0xa00000];
-        let patched = simulate_runtime_rebase(&meta, &bases, NEW_IB, &Default::default()).unwrap();
+        let patched = simulate_runtime_rebase(
+            &meta,
+            &bases,
+            NEW_IB,
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
         let payloads: Vec<&[u8]> = patched.iter().map(|v| v.as_slice()).collect();
         validate_rebased_snapshots(&plan, &payloads).unwrap();
     }
@@ -1662,6 +2146,81 @@ mod machine_code_tests {
             emit_two_phase_code(0x2000, &meta, 0x2100, 0x2108, 0x5a10, 0x2f00, NEW_IB)
                 .expect("emit");
         code
+    }
+
+    /// H4-A SMR: a ViaStableBinding plan emits stub code that (a) encodes a
+    /// SMR walk — a gs:[0x60] PEB load + Ldr dereference + a word-length
+    /// compare at entry+0x58 (BaseDllName.Length) — and (b) still terminates
+    /// with the OEP jmp. The fail-closed marker is gone.
+    #[test]
+    fn h4a_stub_emits_smr_walk_for_stable_binding() {
+        let api_rva = 0x12340u64;
+        let old_base = 0x7ff9_1000_0000u64;
+        let modules = vec![("ntdll.dll".to_string(), old_base, old_base + 0x200000)];
+        let mut resolvers = crate::dumper::runtime_rebase::ExternalResolverTable::new();
+        resolvers
+            .insert(ExternalTarget {
+                module_identity: "ntdll.dll".to_string(),
+                module_rva: api_rva,
+                import_dll: "ntdll.dll".to_string(),
+                import_name_or_ordinal: format!("#{api_rva:x}"),
+                iat_rva: None,
+                resolution_kind: ExternalResolutionKind::ViaStableBinding,
+            })
+            .unwrap();
+        let c = container(
+            0x1000,
+            0x500000,
+            0x500010,
+            0x500020,
+            region_bytes(0x10, &[(0, old_base + api_rva)]),
+        );
+        let slots = declared_slots_from_capture(&[c.clone()], &[], &[]);
+        let plan =
+            build_runtime_rebase_plan(&[c], &[], &[], &slots, &resolvers, &modules, OLD_IB, NEW_IB)
+                .unwrap()
+                .unwrap();
+        let code = stub_code(&plan);
+        let insns = decode_all(&code);
+
+        // gs:[0x60] PEB load present (SMR walk entry): the stub's PEB
+        // prologue already loads gs:[0x60] once; the SMR helper adds a second
+        // (absolute, GS-segmented) load with the same displacement.
+        let peb_load = insns.iter().find(|i| {
+            i.mnemonic() == Mnemonic::Mov
+                && i.memory_segment() == Register::GS
+                && i.memory_base() == Register::None
+                && i.memory_displacement64() == 0x60
+        });
+        assert!(peb_load.is_some(), "SMR walk must load PEB via gs:[0x60]");
+
+        // BaseDllName.Length word compare: movzx r32, word [r9+0x58].
+        let len_load = insns.iter().find(|i| {
+            i.mnemonic() == Mnemonic::Movzx
+                && i.memory_base() == Register::R9
+                && i.memory_displacement64() == 0x58
+                && i.memory_size() == iced_x86::MemorySize::UInt16
+        });
+        assert!(len_load.is_some(), "SMR walk must read BaseDllName.Length");
+
+        // DllBase read at [r9+0x30].
+        let dll_load = insns.iter().find(|i| {
+            i.mnemonic() == Mnemonic::Mov
+                && i.memory_base() == Register::R9
+                && i.memory_displacement64() == 0x30
+                && i.memory_size() == iced_x86::MemorySize::UInt64
+        });
+        assert!(
+            dll_load.is_some(),
+            "SMR walk must read DllBase at [r9+0x30]"
+        );
+
+        // OEP jmp still present (0xe9 near jump byte) — the SMR helper adds
+        // its own internal jmps, so assert the transfer byte exists.
+        assert!(
+            code.iter().any(|&b| b == 0xe9),
+            "OEP near jump must survive the SMR walk"
+        );
     }
 
     /// Test requirement #2: every `[r12+offset]` memory operand must have base
@@ -1947,7 +2506,12 @@ mod machine_code_tests {
         // is NOT payload with sentinels, then serialize metadata (which writes
         // real header/tables/payload over the sentinels). The point: after
         // serialization + decode, payload must equal the original.
-        serialize_metadata_into(&mut blob, &meta, meta_off, 0x5a10, 0x2f00).unwrap();
+        let nt_off = meta_off
+            + PLAN_HEADER_SIZE
+            + meta.regions.len() * REGION_META_SIZE
+            + meta.fixups.len() * FIXUP_META_SIZE
+            + meta.resolvers.len() * RESOLVER_META_SIZE;
+        serialize_metadata_into(&mut blob, &meta, meta_off, 0x5a10, 0x2f00, nt_off).unwrap();
         let decoded = decode_plan_metadata(&blob, meta_off).unwrap();
         assert_eq!(
             decoded.payload, meta.payload,
@@ -2110,8 +2674,12 @@ mod machine_code_tests {
                     rsp += insn.immediate(1) as i64;
                 }
                 Mnemonic::Jmp => {
-                    // Record RSP at the OEP transfer (the near jmp at the end).
-                    oep_jmp_rsp = Some(rsp);
+                    // Record RSP at the OEP transfer: the near jmp whose
+                    // target is the OEP (0x5a10). SMR helper jmps are internal
+                    // and must not be confused with the transfer.
+                    if insn.near_branch_target() == 0x5a10 {
+                        oep_jmp_rsp = Some(rsp);
+                    }
                 }
                 _ => {}
             }
@@ -2326,8 +2894,14 @@ mod machine_code_tests {
             );
         }
 
-        // 7. OEP rel32 target correct: the final near jmp targets 0x5a10.
-        let oep_jmp = insns.iter().rev().find(|i| i.mnemonic() == Mnemonic::Jmp);
+        // 7. OEP rel32 target correct: the near jmp that targets the OEP
+        // (0x5a10) — the SMR helper adds internal jmps after the OEP jmp, so
+        // "last jmp" is no longer the OEP transfer. The OEP jmp is the one
+        // whose target is outside the .boot stub.
+        let oep_jmp = insns
+            .iter()
+            .rev()
+            .find(|i| i.mnemonic() == Mnemonic::Jmp && i.near_branch_target() == 0x5a10);
         let oep_jmp = oep_jmp.expect("OEP near jmp");
         assert_eq!(oep_jmp.near_branch_target(), 0x5a10, "OEP rel32 patched");
     }
@@ -2390,7 +2964,8 @@ mod machine_code_tests {
         let iat_slot = loaded_base + 0xf0100;
         let mut iat = std::collections::HashMap::new();
         iat.insert(iat_slot, api_va);
-        let patched = simulate_runtime_rebase(&meta, &bases, loaded_base, &iat).unwrap();
+        let patched =
+            simulate_runtime_rebase(&meta, &bases, loaded_base, &iat, &Default::default()).unwrap();
         // Region 0 slot 0 -> region 1 new base; slot 1 -> resolved API VA.
         assert_eq!(
             u64::from_le_bytes(patched[0][0..8].try_into().unwrap()),
@@ -2464,7 +3039,9 @@ mod machine_code_tests {
             region_bytes(0x10, &[(0, 0x500000)]),
         )]);
         let meta = meta_of(&plan);
-        let err = simulate_runtime_rebase(&meta, &[], NEW_IB, &Default::default()).unwrap_err();
+        let err =
+            simulate_runtime_rebase(&meta, &[], NEW_IB, &Default::default(), &Default::default())
+                .unwrap_err();
         assert!(matches!(err, HeapBootstrapError::Codegen(_)));
     }
 
@@ -2484,8 +3061,14 @@ mod machine_code_tests {
         if let Some(f) = meta.fixups.iter_mut().find(|f| f.classification != 0) {
             f.source_offset = usize::MAX;
         }
-        let err =
-            simulate_runtime_rebase(&meta, &[0x900000], NEW_IB, &Default::default()).unwrap_err();
+        let err = simulate_runtime_rebase(
+            &meta,
+            &[0x900000],
+            NEW_IB,
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap_err();
         assert!(matches!(err, HeapBootstrapError::Codegen(_)));
     }
 }

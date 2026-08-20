@@ -5268,9 +5268,14 @@ mod tests {
         let new_base: u64 = 0x8_0000_0000;
         let bases: Vec<u64> = meta.regions.iter().map(|_| new_base).collect();
         let iat = std::collections::HashMap::new();
-        let payloads =
-            super::super::runtime_bootstrap::simulate_runtime_rebase(&meta, &bases, new_base, &iat)
-                .unwrap();
+        let payloads = super::super::runtime_bootstrap::simulate_runtime_rebase(
+            &meta,
+            &bases,
+            new_base,
+            &iat,
+            &Default::default(),
+        )
+        .unwrap();
         assert_eq!(payloads.len(), meta.regions.len());
         // every InCapturedRegion fixup target within payload bounds.
         for f in &meta.fixups {
@@ -5832,9 +5837,14 @@ mod tests {
             .map(|i| 0x5000_0000 + i * 0x100000)
             .collect();
         let iat = std::collections::HashMap::new();
-        let payloads =
-            super::super::runtime_bootstrap::simulate_runtime_rebase(&meta, &bases, NEW_IB, &iat)
-                .unwrap();
+        let payloads = super::super::runtime_bootstrap::simulate_runtime_rebase(
+            &meta,
+            &bases,
+            NEW_IB,
+            &iat,
+            &Default::default(),
+        )
+        .unwrap();
         // Locate the gscript region's payload and read +0xbd0/+0xbd8.
         let gscript_rva = 0x149d50u32;
         let gscript_idx = plan
