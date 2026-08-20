@@ -8,6 +8,7 @@ use tracing::{debug, info, warn};
 
 use mida_core::DebuggerCore;
 use mida_disasm::Disassembler;
+use std::collections::HashSet;
 
 use super::fix::is_likely_api_address;
 use super::{MAX_IAT_SCAN_INSTR, MAX_IAT_SIZE};
@@ -298,6 +299,16 @@ pub(super) fn find_earliest_iat_ref(
 ///
 /// A `ret` instruction stops the search in the current function (unless
 /// `ignore_boundary` is `true`, in which case we keep scanning linearly).
+/// Maximum recursion depth for following internal `call rel32` chains.
+///
+/// Without this bound, a call graph that contains a cycle (self-recursive
+/// functions, switch-dispatch loops, tail-call loops) drives
+/// `find_iat_ref_from_address` into unbounded recursion and overflows the
+/// stack.  The bound is fail-closed: exceeding it abandons the current
+/// search path (returns Ok(0)) so the caller falls through to the next
+/// discovery strategy instead of crashing.
+const MAX_IAT_RECURSE_DEPTH: usize = 64;
+
 pub(super) fn find_iat_ref_from_address(
     debugger: &dyn DebuggerCore,
     text: &[u8],
@@ -307,6 +318,48 @@ pub(super) fn find_iat_ref_from_address(
     ignore_boundary: bool,
     max_instructions: usize,
 ) -> Result<usize, ThemidaError> {
+    let mut visited = HashSet::new();
+    find_iat_ref_from_address_impl(
+        debugger,
+        text,
+        text_base,
+        start_addr,
+        code_size,
+        ignore_boundary,
+        max_instructions,
+        &mut visited,
+        0,
+    )
+}
+
+/// Implementation of `find_iat_ref_from_address` with global visited-set and
+/// depth guards. `visited` is a GLOBAL set (not a DFS path set): every address
+/// is scanned at most once across the whole search because the scan of a
+/// given start address is deterministic - re-visiting it can never produce a
+/// different result. This bounds the search to O(text) instructions even on
+/// dense call graphs (switch-dispatch loops), which a path-only set would
+/// explode exponentially on.
+fn find_iat_ref_from_address_impl(
+    debugger: &dyn DebuggerCore,
+    text: &[u8],
+    text_base: usize,
+    start_addr: usize,
+    code_size: usize,
+    ignore_boundary: bool,
+    max_instructions: usize,
+    visited: &mut HashSet<usize>,
+    depth: usize,
+) -> Result<usize, ThemidaError> {
+    if depth > MAX_IAT_RECURSE_DEPTH {
+        warn!(
+            "IAT scan recursion depth exceeded ({MAX_IAT_RECURSE_DEPTH}) at {start_addr:#x} —              abandoning this search path (fail-closed)"
+        );
+        return Ok(0);
+    }
+    if !visited.insert(start_addr) {
+        // Already scanned (global set) — deterministic result, skip re-entry.
+        return Ok(0);
+    }
     let bitness = if std::mem::size_of::<usize>() == 8 {
         64
     } else {
@@ -427,8 +480,8 @@ pub(super) fn find_iat_ref_from_address(
             let target = (ip as i64 + 5 + rel32 as i64) as usize;
 
             if target >= text_base && target < text_base + code_size {
-                // Recurse into the callee.
-                let result = find_iat_ref_from_address(
+                // Recurse into the callee (cycle/depth guarded).
+                let result = find_iat_ref_from_address_impl(
                     debugger,
                     text,
                     text_base,
@@ -436,6 +489,8 @@ pub(super) fn find_iat_ref_from_address(
                     code_size,
                     false,
                     max_instructions,
+                    visited,
+                    depth + 1,
                 )?;
                 if result != 0 {
                     return Ok(result);
@@ -462,7 +517,6 @@ pub(super) fn find_iat_ref_from_address(
 
         num_insn += 1;
     }
-
     Ok(0)
 }
 
@@ -745,4 +799,119 @@ pub(super) fn find_iat_via_data_heuristic(
     }
 
     Ok(best_start)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mida_core::ContinueStatus;
+    use mida_core::CoreError;
+    use mida_core::DebugEvent;
+    use mida_core::DebuggerCore;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Diagnostics::Debug::CONTEXT;
+
+    /// Minimal DebuggerCore that fails every memory access — the cycle/
+    /// depth regression tests never reach the FF 15/25 branch, so read/
+    /// write failures are fine.
+    struct NoMem {
+        base: u64,
+    }
+
+    impl DebuggerCore for NoMem {
+        fn process_handle(&self) -> HANDLE {
+            HANDLE::default()
+        }
+        fn pid(&self) -> u32 {
+            1
+        }
+        fn image_base(&self) -> u64 {
+            self.base
+        }
+        fn wait_event(&mut self) -> Result<DebugEvent, CoreError> {
+            Err(CoreError::DebugState("no events".into()))
+        }
+        fn continue_event(&mut self, _tid: u32, _status: ContinueStatus) -> Result<(), CoreError> {
+            Ok(())
+        }
+        fn read_memory(&self, _addr: usize, _buf: &mut [u8]) -> Result<usize, CoreError> {
+            Err(CoreError::DebugState("no mem".into()))
+        }
+        fn write_memory(&mut self, _addr: usize, _data: &[u8]) -> Result<usize, CoreError> {
+            Err(CoreError::DebugState("no mem".into()))
+        }
+        fn get_thread_context(&self, _tid: u32) -> Result<CONTEXT, CoreError> {
+            Err(CoreError::DebugState("no ctx".into()))
+        }
+        fn set_thread_context(&self, _tid: u32, _ctx: &CONTEXT) -> Result<(), CoreError> {
+            Ok(())
+        }
+    }
+
+    /// A .text image where A calls B, B calls A (call cycle). The scan
+    /// must terminate without a stack overflow.
+    fn cycle_text() -> Vec<u8> {
+        let mut t = vec![0x90u8; 0x100]; // NOP padding
+        let b_off = 0x40usize;
+        let c_off = 0x60usize;
+        // A at 0x00: call B (rel = B - 5), then call C (rel = C - 13)
+        t[0] = 0xE8;
+        let rel_b = (b_off as i64 - 5) as i32;
+        t[1..5].copy_from_slice(&rel_b.to_le_bytes());
+        t[8] = 0xE8;
+        let rel_c = (c_off as i64 - 13) as i32;
+        t[9..13].copy_from_slice(&rel_c.to_le_bytes());
+        // B at 0x40: call A (back-edge rel = 0 - (0x40+5)) then ret
+        t[b_off] = 0xE8;
+        let rel_a = (0x00i64 - (b_off as i64 + 5)) as i32;
+        t[b_off + 1..b_off + 5].copy_from_slice(&rel_a.to_le_bytes());
+        t[b_off + 5] = 0xC3; // ret
+                             // C at 0x60: ret (scan stops here)
+        t[c_off] = 0xC3;
+        t
+    }
+
+    #[test]
+    fn call_cycle_terminates_without_stack_overflow() {
+        let text_base = 0x140001000usize;
+        let text = cycle_text();
+        let dbg = NoMem {
+            base: text_base as u64,
+        };
+        let result =
+            find_iat_ref_from_address(&dbg, &text, text_base, text_base, text.len(), false, 200);
+        assert!(
+            result.is_ok(),
+            "cycle must terminate without stack overflow: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn deep_call_chain_respects_depth_cap() {
+        let text_base = 0x140001000usize;
+        let mut text = vec![0x90u8; 0x4000];
+        // Chain of 1000 links >> MAX_IAT_RECURSE_DEPTH (64); last one rets.
+        for i in 0..1000usize {
+            let off = i * 0x10;
+            if i + 1 < 1000 {
+                text[off] = 0xE8;
+                let next_off = (i + 1) * 0x10;
+                let rel = (next_off as i64 - (off as i64 + 5)) as i32;
+                text[off + 1..off + 5].copy_from_slice(&rel.to_le_bytes());
+            } else {
+                text[off] = 0xC3; // ret at chain end
+            }
+        }
+        let dbg = NoMem {
+            base: text_base as u64,
+        };
+        let result =
+            find_iat_ref_from_address(&dbg, &text, text_base, text_base, text.len(), false, 200);
+        assert!(
+            result.is_ok(),
+            "deep chain must terminate (depth cap): {:?}",
+            result.err()
+        );
+    }
 }
