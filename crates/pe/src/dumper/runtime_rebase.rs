@@ -1898,8 +1898,20 @@ pub fn build_runtime_rebase_plan(
     }
 
     // --- Deterministic external resolver table (dedup, key order) ---
+    // Includes ViaStableBinding targets synthesized by the classifier for
+    // module-attributed pointers without an IAT resolver (H2
+    // old_module_base -> new_module_base primitive).
     let mut external_targets: Vec<ExternalTarget> = external_resolvers.iter().cloned().collect();
+    for p in &pointers {
+        if let Some(t) = &p.external_target {
+            if t.resolution_kind == ExternalResolutionKind::ViaStableBinding {
+                external_targets.push(t.clone());
+            }
+        }
+    }
     external_targets.sort_by_key(|t| (t.module_identity.clone(), t.module_rva));
+    external_targets
+        .dedup_by(|a, b| a.module_identity == b.module_identity && a.module_rva == b.module_rva);
 
     let mut plan = RuntimeRebasePlan {
         regions,
@@ -2336,17 +2348,35 @@ fn classify_declared_slot(
                         external_target: Some(resolver.clone()),
                         provenance,
                     }),
-                    None => Ok(RebasePointer {
-                        source_region: ri,
-                        source_offset: off,
-                        original_value: val,
-                        classification: PointerClassification::ExternalCandidate,
-                        target_region: None,
-                        target_offset: None,
-                        image_rva: None,
-                        external_target: None,
-                        provenance,
-                    }),
+                    None => {
+                        // GTO-COLD-START-HEAP-REBASE-1 H2 (attempt_015 wall):
+                        // a value inside a VERIFIED enumerated module range
+                        // with no IAT resolver is still a module-relative
+                        // pointer (module base + stable rva). The
+                        // old_module_base -> new_module_base rebasing
+                        // primitive resolves it via a stable binding:
+                        // module identity + rva, re-based at cold start.
+                        // It is NOT an unresolved candidate.
+                        let stable = ExternalTarget {
+                            module_identity: att.module_identity.clone(),
+                            module_rva: att.module_rva,
+                            import_dll: att.module_identity.clone(),
+                            import_name_or_ordinal: format!("#{:#x}", att.module_rva),
+                            iat_rva: None,
+                            resolution_kind: ExternalResolutionKind::ViaStableBinding,
+                        };
+                        Ok(RebasePointer {
+                            source_region: ri,
+                            source_offset: off,
+                            original_value: val,
+                            classification: PointerClassification::ExternalModule,
+                            target_region: None,
+                            target_offset: None,
+                            image_rva: None,
+                            external_target: Some(stable),
+                            provenance,
+                        })
+                    }
                 },
                 None => Ok(RebasePointer {
                     source_region: ri,
@@ -3862,8 +3892,11 @@ mod tests {
     // 9b. External pointer with module identity but no resolver -> unresolved.
     #[test]
     fn external_candidate_with_identity_no_resolver() {
-        // Pointer is attributed to kernel32 via module map, but no resolver
-        // exists for that (module, rva).
+        // Pointer is attributed to kernel32 via module map, but no IAT
+        // resolver exists for that (module, rva). H2 semantics: a value inside
+        // a VERIFIED module range is a module-relative pointer resolved by the
+        // old_module_base -> new_module_base primitive (ViaStableBinding) —
+        // NOT an unresolved external candidate.
         let content = region_bytes(0x10, &[(0, 0x7ff9_1000_2000)]);
         let modules = vec![(
             "kernel32.dll".to_string(),
@@ -3882,10 +3915,19 @@ mod tests {
         let p = plan
             .pointers
             .iter()
-            .find(|p| p.classification == PointerClassification::ExternalCandidate)
-            .expect("external candidate with module identity");
-        assert_eq!(p.external_target, None);
-        assert!(validate_runtime_rebase_plan(&plan).is_err());
+            .find(|p| p.source_offset == 0)
+            .expect("module-attributed pointer slot");
+        assert_eq!(
+            p.classification,
+            PointerClassification::ExternalModule,
+            "module identity + verified range => ExternalModule (stable binding)"
+        );
+        let t = p.external_target.as_ref().expect("stable resolver");
+        assert_eq!(t.module_identity, "kernel32.dll");
+        assert_eq!(t.module_rva, 0x2000);
+        assert_eq!(t.resolution_kind, ExternalResolutionKind::ViaStableBinding);
+        assert!(plan.plan_complete, "plan must complete");
+        validate_runtime_rebase_plan(&plan).expect("valid plan");
     }
 
     // 9c. IAT-bound external pointer with a resolver -> resolved ExternalModule.
@@ -6930,6 +6972,61 @@ mod tests {
             &0x7ff0_1234_0000u64.to_le_bytes(),
             "unknown qword untouched by rebase"
         );
+    }
+
+    /// GTO-COLD-START-HEAP-REBASE-1 H2 (attempt_015 wall): a value inside
+    /// a VERIFIED enumerated module range (e.g. ntdll rva 0x1d3070 stored
+    /// in an AHK heap slab at 0x9600f0+0x1d8) with no IAT resolver is a
+    /// module-relative pointer, not an unresolved candidate. The plan
+    /// resolves it via the old_module_base -> new_module_base primitive
+    /// (ViaStableBinding: module identity + rva) and completes.
+    #[test]
+    fn h2_module_attributed_pointer_stable_binding() {
+        let mut bytes = vec![0u8; 0x1000];
+        // ntdll base 0x7ff8c53a0000, pointer at rva 0x1d3070.
+        let ntdll_base = 0x7ff8c53a0000u64;
+        bytes[0x1d8..0x1e0].copy_from_slice(&(ntdll_base + 0x1d3070).to_le_bytes());
+        let slab = HeapSlab {
+            old_base: 0x9600f0,
+            content: bytes,
+        };
+        // No IAT resolver table.
+        let slots = declared_slots_from_capture(&[], &[], &[slab.clone()]);
+        let plan = build_runtime_rebase_plan(
+            &[],
+            &[],
+            &[slab],
+            &slots,
+            &ExternalResolverTable::new(),
+            &[("ntdll.dll".to_string(), ntdll_base, ntdll_base + 0x300000)],
+            OLD_IB,
+            NEW_IB,
+        )
+        .expect("plan")
+        .expect("Some");
+        let p = plan
+            .pointers
+            .iter()
+            .find(|p| p.source_offset == 0x1d8)
+            .expect("the module pointer slot");
+        assert_eq!(
+            p.classification,
+            PointerClassification::ExternalModule,
+            "module-attributed pointer must be ExternalModule, not Candidate"
+        );
+        let t = p.external_target.as_ref().expect("resolver");
+        assert_eq!(t.module_identity, "ntdll.dll");
+        assert_eq!(t.module_rva, 0x1d3070);
+        assert_eq!(t.resolution_kind, ExternalResolutionKind::ViaStableBinding);
+        assert!(
+            plan.plan_complete,
+            "plan must complete (no unresolved-required)"
+        );
+        // The stable binding is in the plan resolver table.
+        assert!(plan
+            .external_targets
+            .iter()
+            .any(|t| t.module_identity == "ntdll.dll" && t.module_rva == 0x1d3070));
     }
 
     #[test]

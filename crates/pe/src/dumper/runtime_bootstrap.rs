@@ -385,6 +385,22 @@ pub fn encode_plan_metadata(plan: &RuntimeRebasePlan) -> Result<BootMetadata, He
             resolution_kind: resolver_kind_u8(t.resolution_kind),
         })
         .collect();
+    // GTO-COLD-START-HEAP-REBASE-1 H2 boundary: the plan may now contain
+    // ViaStableBinding resolvers (module-attributed pointers without an IAT
+    // resolver — the old_module_base -> new_module_base primitive). The
+    // two-phase stub currently implements ONLY ViaIat; emitting a
+    // ViaStableBinding resolver here would silently produce a wrong fixup at
+    // cold start (iat_rva=0 read). Fail closed with an explicit H4 marker
+    // instead of encoding a broken stub.
+    if resolvers
+        .iter()
+        .any(|r| r.resolution_kind == resolver_kind_u8(ExternalResolutionKind::ViaStableBinding))
+    {
+        return Err(HeapBootstrapError::UnresolvedRequired(
+            "ViaStableBinding resolver present — cold-start module re-base (H4) not yet              implemented in the two-phase stub; refusing to emit a broken fixup"
+                .to_string(),
+        ));
+    }
 
     // Build the payload region (all region bytes, 8-aligned each, in region
     // order) and compute data offsets.
