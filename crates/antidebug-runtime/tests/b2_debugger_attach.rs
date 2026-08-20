@@ -75,16 +75,21 @@ fn main() {
         .get(1)
         .and_then(|s| s.parse().ok())
         .expect("usage: b2_debugger_attach <pid> [window_ms]");
-    let window_ms: u32 = args
-        .get(2)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(5000);
+    let window_ms: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(5000);
 
-    println!("B2_ATTACH_START pid={} window_ms={} debugger_pid={}", pid, window_ms, unsafe { GetCurrentProcessId() });
+    println!(
+        "B2_ATTACH_START pid={} window_ms={} debugger_pid={}",
+        pid,
+        window_ms,
+        unsafe { GetCurrentProcessId() }
+    );
 
     let rc = unsafe { DebugActiveProcess(pid as c_ulong) };
     if rc == 0 {
-        println!("B2_ATTACH_FAILED pid={} err=DebugActiveProcess returned 0", pid);
+        println!(
+            "B2_ATTACH_FAILED pid={} err=DebugActiveProcess returned 0",
+            pid
+        );
         std::process::exit(1);
     }
     println!("B2_ATTACHED pid={}", pid);
@@ -102,7 +107,9 @@ fn main() {
             break;
         }
         let mut ev: DebugEvent = unsafe { std::mem::zeroed() };
-        let wait = (window_ms as u64).saturating_sub(now.wrapping_sub(start)).min(500) as c_ulong;
+        let wait = (window_ms as u64)
+            .saturating_sub(now.wrapping_sub(start))
+            .min(500) as c_ulong;
         let wr = unsafe { WaitForDebugEvent(&mut ev, wait) };
         if wr == 0 {
             continue;
@@ -116,18 +123,28 @@ fn main() {
                 let tid = ev.thread_id;
                 println!(
                     "B2_EXCEPTION pid={} tid={} code=0x{:08x} first_chance={} address=0x{:x}",
-                    ev.process_id, tid, code, if first != 0 { 1 } else { 0 }, addr
+                    ev.process_id,
+                    tid,
+                    code,
+                    if first != 0 { 1 } else { 0 },
+                    addr
                 );
                 exceptions.push(format!(
                     r#"{{"code":"0x{:08x}","first_chance":{},"address":"0x{:x}","thread_id":{}}}"#,
-                    code, if first != 0 { 1 } else { 0 }, addr, tid
+                    code,
+                    if first != 0 { 1 } else { 0 },
+                    addr,
+                    tid
                 ));
                 unsafe {
                     ContinueDebugEvent(ev.process_id, ev.thread_id, DBG_EXCEPTION_NOT_HANDLED);
                 }
             }
             CREATE_PROCESS_DEBUG_EVENT => {
-                println!("B2_CREATE_PROCESS pid={} tid={}", ev.process_id, ev.thread_id);
+                println!(
+                    "B2_CREATE_PROCESS pid={} tid={}",
+                    ev.process_id, ev.thread_id
+                );
                 unsafe { ContinueDebugEvent(ev.process_id, ev.thread_id, DBG_CONTINUE) };
             }
             CREATE_THREAD_DEBUG_EVENT => {
@@ -159,7 +176,12 @@ fn main() {
     let elapsed = unsafe { GetTickCount64() }.wrapping_sub(start);
     println!(
         "B2_DETACH pid={} rc={} elapsed_ms={} events={} dll_loads={} exit_seen={}",
-        pid, drc, elapsed, events, dll_loads, if exit_seen { 1 } else { 0 }
+        pid,
+        drc,
+        elapsed,
+        events,
+        dll_loads,
+        if exit_seen { 1 } else { 0 }
     );
 
     let exception_0xc0000409 = exceptions.iter().any(|e| e.contains("0xc0000409"));
@@ -169,8 +191,14 @@ fn main() {
     json.push_str(&format!(r#", "elapsed_ms": {}"#, elapsed));
     json.push_str(&format!(r#", "events": {}"#, events));
     json.push_str(&format!(r#", "dll_loads": {}"#, dll_loads));
-    json.push_str(&format!(r#", "exit_seen": {}"#, if exit_seen { 1 } else { 0 }));
-    json.push_str(&format!(r#", "exception_0xc0000409": {}"#, if exception_0xc0000409 { 1 } else { 0 }));
+    json.push_str(&format!(
+        r#", "exit_seen": {}"#,
+        if exit_seen { 1 } else { 0 }
+    ));
+    json.push_str(&format!(
+        r#", "exception_0xc0000409": {}"#,
+        if exception_0xc0000409 { 1 } else { 0 }
+    ));
     json.push_str(&format!(r#", "exceptions": [{}] }}"#, exceptions.join(",")));
     println!("B2_JSON={}", json);
     println!("B2_END");

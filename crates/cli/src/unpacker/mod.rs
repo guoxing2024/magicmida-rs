@@ -497,9 +497,7 @@ pub fn unpack(
     // debugger is behaviour-identical to before (zero perturbation).
     let b4_observer: Option<std::sync::Arc<mida_core::adr7_b4_observer::Adr7B4Observer>> =
         if mida_core::adr7_b4_observer::Adr7B4Observer::enabled() {
-            let obs = std::sync::Arc::new(
-                mida_core::adr7_b4_observer::Adr7B4Observer::new(),
-            );
+            let obs = std::sync::Arc::new(mida_core::adr7_b4_observer::Adr7B4Observer::new());
             dbg.attach_b4_observer(obs.clone());
             log::log(
                 LogType::Info,

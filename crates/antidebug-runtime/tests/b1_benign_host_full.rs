@@ -92,8 +92,13 @@ fn main() {
     // B1: single full-initialization round with observation window.
     const ROUNDS: u32 = 1;
     let observation_ms: u32 = std::env::var("MIDA_OBSERVATION_MS")
-        .ok().and_then(|v| v.parse().ok()).unwrap_or(5000);
-    println!("B1_START dll={} profile=oreans_origin_x64_v1 obs_ms={} base_handles={}", dll_path_str, observation_ms, base_handles);
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5000);
+    println!(
+        "B1_START dll={} profile=oreans_origin_x64_v1 obs_ms={} base_handles={}",
+        dll_path_str, observation_ms, base_handles
+    );
     let mut prev_handles = base_handles;
     for round in 0..ROUNDS {
         // Dynamic load - this is the ONLY reference to the DLL.
@@ -192,7 +197,10 @@ fn main() {
             att_ok = false;
             att_reasons.push("profile_digest".to_string());
         }
-        println!("B1_ATTESTATION_VALIDATION ok={} reasons={:?}", att_ok, att_reasons);
+        println!(
+            "B1_ATTESTATION_VALIDATION ok={} reasons={:?}",
+            att_ok, att_reasons
+        );
         if !att_ok {
             panic!("B1 attestation validation failed: {:?}", att_reasons);
         }
@@ -245,6 +253,10 @@ fn main() {
             base_handles, final_handles
         );
     }
-    println!("B1_RESULT verdict=PASS rounds={} elapsed_ms={}", ROUNDS, unsafe { GetTickCount64() } - base_tick);
+    println!(
+        "B1_RESULT verdict=PASS rounds={} elapsed_ms={}",
+        ROUNDS,
+        unsafe { GetTickCount64() } - base_tick
+    );
     println!("B1_END");
 }

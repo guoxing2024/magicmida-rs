@@ -150,7 +150,10 @@ const OBS_POINTS: [(u32, &str); 4] = [
     (0x2eda0, "panic_count::increase entry"),
     (0x2edc6, "panic_count::increase+0x26 (TLS check jne)"),
     (0x2e604, "panic_with_hook entry"),
-    (0x2e638, "panic_with_hook -> panic_count::increase call site"),
+    (
+        0x2e638,
+        "panic_with_hook -> panic_count::increase call site",
+    ),
 ];
 
 const INT29_SITES: [u32; 9] = [
@@ -283,11 +286,11 @@ fn main() {
         .get(1)
         .and_then(|s| s.parse().ok())
         .expect("usage: b4_dynamic_observer <pid> [window_ms] [timeline_out]");
-    let window_ms: u32 = args
-        .get(2)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(8000);
-    let timeline_out = args.get(3).cloned().unwrap_or_else(|| "b4_timeline.json".to_string());
+    let window_ms: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(8000);
+    let timeline_out = args
+        .get(3)
+        .cloned()
+        .unwrap_or_else(|| "b4_timeline.json".to_string());
 
     println!(
         "B4_OBS_START pid={} window_ms={} debugger_pid={} timeline={}",
@@ -331,7 +334,9 @@ fn main() {
             break;
         }
         let mut ev: DebugEvent = unsafe { std::mem::zeroed() };
-        let wait = (window_ms as u64).saturating_sub(now.wrapping_sub(start)).min(500) as c_ulong;
+        let wait = (window_ms as u64)
+            .saturating_sub(now.wrapping_sub(start))
+            .min(500) as c_ulong;
         let wr = unsafe { WaitForDebugEvent(&mut ev, wait) };
         if wr == 0 {
             continue;
@@ -354,7 +359,10 @@ fn main() {
                 // bound runtime sha256 AE42901E... image size 370,688 B
                 // (~0x5a800); only addresses within the module (0x100000
                 // guard) are runtime RVAs.
-                let rva = if runtime_base != 0 && addr >= runtime_base && addr - runtime_base < 0x100000 {
+                let rva = if runtime_base != 0
+                    && addr >= runtime_base
+                    && addr - runtime_base < 0x100000
+                {
                     Some(addr - runtime_base)
                 } else {
                     None
@@ -389,11 +397,19 @@ fn main() {
                 );
                 event_json = format!(
                     r#"{{"seq":{},"ts_ms":{},"kind":"exception","tid":{},"code":"0x{:08x}","first_chance":{},"address":"0x{:x}","rva":{},"int29":{},"rip":{},"rsp":{},"continuation":{}}}"#,
-                    seq, ts, tid, code, if first { 1 } else { 0 }, addr,
-                    rva.map(|r| format!("\"0x{:x}\"", r)).unwrap_or_else(|| "null".into()),
+                    seq,
+                    ts,
+                    tid,
+                    code,
+                    if first { 1 } else { 0 },
+                    addr,
+                    rva.map(|r| format!("\"0x{:x}\"", r))
+                        .unwrap_or_else(|| "null".into()),
                     if int29 { 1 } else { 0 },
-                    rip.map(|r| format!("\"0x{:x}\"", r)).unwrap_or_else(|| "null".into()),
-                    rsp.map(|r| format!("\"0x{:x}\"", r)).unwrap_or_else(|| "null".into()),
+                    rip.map(|r| format!("\"0x{:x}\"", r))
+                        .unwrap_or_else(|| "null".into()),
+                    rsp.map(|r| format!("\"0x{:x}\"", r))
+                        .unwrap_or_else(|| "null".into()),
                     continuation
                 );
             }
@@ -431,20 +447,22 @@ fn main() {
                 }
                 println!(
                     "B4_LOAD_DLL base=0x{:x} name={:?} is_runtime={}",
-                    base, name, if is_runtime { 1 } else { 0 }
+                    base,
+                    name,
+                    if is_runtime { 1 } else { 0 }
                 );
                 event_json = format!(
                     r#"{{"seq":{},"ts_ms":{},"kind":"load_dll","base":"0x{:x}","name":{},"is_runtime":{}}}"#,
-                    seq, ts, base,
-                    name.map(|n| format!("\"{}\"", n)).unwrap_or_else(|| "null".into()),
+                    seq,
+                    ts,
+                    base,
+                    name.map(|n| format!("\"{}\"", n))
+                        .unwrap_or_else(|| "null".into()),
                     if is_runtime { 1 } else { 0 }
                 );
             }
             UNLOAD_DLL_DEBUG_EVENT => {
-                event_json = format!(
-                    r#"{{"seq":{},"ts_ms":{},"kind":"unload_dll"}}"#,
-                    seq, ts
-                );
+                event_json = format!(r#"{{"seq":{},"ts_ms":{},"kind":"unload_dll"}}"#, seq, ts);
             }
             EXIT_PROCESS_DEBUG_EVENT => {
                 exit_seen = true;
@@ -455,16 +473,10 @@ fn main() {
                 );
             }
             OUTPUT_DEBUG_STRING_EVENT | RIP_EVENT => {
-                event_json = format!(
-                    r#"{{"seq":{},"ts_ms":{},"kind":"other"}}"#,
-                    seq, ts
-                );
+                event_json = format!(r#"{{"seq":{},"ts_ms":{},"kind":"other"}}"#, seq, ts);
             }
             _ => {
-                event_json = format!(
-                    r#"{{"seq":{},"ts_ms":{},"kind":"other"}}"#,
-                    seq, ts
-                );
+                event_json = format!(r#"{{"seq":{},"ts_ms":{},"kind":"other"}}"#, seq, ts);
             }
         }
         events.push(event_json);
@@ -491,20 +503,26 @@ fn main() {
     json.push_str(&format!("  \"runtime_base\": \"0x{:x}\",\n", runtime_base));
     json.push_str("  \"observer_points\": [");
     for (i, (rva, name)) in OBS_POINTS.iter().enumerate() {
-        if i > 0 { json.push_str(", "); }
+        if i > 0 {
+            json.push_str(", ");
+        }
         json.push_str(&format!("\"0x{:x} {}\"", rva, name));
     }
     json.push_str("],\n");
     json.push_str("  \"int29_sites\": [");
     for (i, rva) in INT29_SITES.iter().enumerate() {
-        if i > 0 { json.push_str(", "); }
+        if i > 0 {
+            json.push_str(", ");
+        }
         json.push_str(&format!("\"0x{:x}\"", rva));
     }
     json.push_str("],\n");
     json.push_str(&format!("  \"obs_hits\": {},\n", obs_hits));
     json.push_str(&format!("  \"int29_hits\": {},\n", int29_hits));
-    json.push_str(&format!("  \"exceptions_0xc0000409\": {},\n",
-        c0000409_seen));
+    json.push_str(&format!(
+        "  \"exceptions_0xc0000409\": {},\n",
+        c0000409_seen
+    ));
     json.push_str("  \"records\": [\n");
     json.push_str(&events.join(",\n"));
     json.push_str("\n  ]\n}\n");
