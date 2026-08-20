@@ -72,7 +72,7 @@ Environment for every live run:
 - [x] boundary doc written (this file)
 - [x] manifest/vault identity verified via resolver (resolve_20260808 evidence
       lineage; re-verify in H1 evidence dir)
-- [ ] CLI/helper hashes recorded in H1 evidence (first build)
+- [x] CLI/helper hashes recorded in H1 evidence (H1 report §2)
 - [x] ADR7 untouched; Oreans gate untouched (verified at each commit)
 
 ### H1 — heap/container model recovery. DONE when all six deliverables exist
@@ -143,7 +143,7 @@ snapshots):
 | Stage | Status | Evidence |
 |---|---|---|
 | H0 boundary | ACTIVE (this doc) | docs/GTO_COLD_START_HEAP_REBASE_1_BOUNDARY.md |
-| H1 heap/container model | pending | (next) |
+| H1 cold-start failure timeline | DONE (obs. report) | docs/GTO_COLD_START_HEAP_REBASE_1_H1_REPORT.md |
 | H2 rebasing primitives | pending | (next) |
 | H3 cold-start wall | pending | (next) |
 | H4 OEP/IAT/TLS/dump | pending | (next) |
@@ -157,3 +157,4 @@ snapshots):
 - NOT reusing prior process state; NOT bypass patches
 - NOT extending Route A–H ledgers; this is a new ledger
 - No push unless separately authorized
+
