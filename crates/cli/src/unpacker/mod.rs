@@ -517,6 +517,58 @@ pub fn unpack(
         Vec::new()
     };
 
+    // ---- GTO-H3: pre-resume runtime loader (cold-start wall) ----
+    // Inject + initialize the MIDA anti-debug runtime while the main thread
+    // is STILL suspended (no protector code has executed yet). This closes
+    // the H1b finding: loading the runtime AFTER resume lets the protector
+    // arm first and fail-fast (0xC0000409) on the injected DLL. With the
+    // runtime in place before the first resumed instruction, the protector
+    // starts under the MIDA runtime's observation instead of racing it.
+    // Fail-closed contract unchanged: loader errors -> controller refuses
+    // (DependencyUnavailable), no candidate, target terminated.
+    let post_attach_loader_outcome = if text_is_plain_for_attach {
+        let mut noop_drain =
+            |_timeout_ms: u32| -> Result<Option<mida_core::DrainReceipt>, mida_core::CoreError> {
+                Ok(None)
+            };
+        let main_tid = dbg.main_thread_id();
+        let h_thread = dbg
+            .thread_handle(main_tid)
+            .map_err(|e| anyhow!("thread_handle for post-attach loader: {e}"))?;
+        // Main thread is suspended from CREATE_SUSPENDED; keep it that way
+        // while the loader's remote LoadLibraryW + init run.
+        let _ = unsafe { SuspendThread(h_thread) };
+        let outcome = crate::unpacker::runtime_loader::run_runtime_loader(
+            dbg.process_handle(),
+            dbg.pid(),
+            "ahk_gto_x64_v1",
+            "adr6-profile-digest",
+            &mut noop_drain,
+        );
+        let _ = unsafe { ResumeThread(h_thread) };
+        match &outcome {
+            Ok(loader_result) => log::log(
+                LogType::Info,
+                &format!(
+                    "post-attach runtime loader (pre-resume): module_base={:#x} target_pid={}",
+                    loader_result.module_base, loader_result.target_pid
+                ),
+            ),
+            Err(e) => log::log(
+                LogType::Fatal,
+                &format!("post-attach runtime loader (pre-resume) failed: {e:#}"),
+            ),
+        }
+        outcome
+    } else {
+        Err(
+            crate::unpacker::runtime_loader::RuntimeLoadError::AuthorityUnavailable(
+                "post-attach".to_string(),
+                "loader skipped (not post-attach mode)".to_string(),
+            ),
+        )
+    };
+
     if text_is_plain_for_attach {
         dbg.resume_post_attach_main_thread()
             .context("Failed to resume post-attach main thread")?;
@@ -613,47 +665,10 @@ pub fn unpack(
             .parent()
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| std::path::PathBuf::from("."));
-        // ADR-6: run the self-owned runtime loader exactly like the
-        // CREATE_PROCESS path. The post-attach launch has no debug port
-        // (debugger presence is structurally invisible), so there are no
-        // debug events to drain; the loader's drain callback is only invoked
-        // on remote-call wait timeouts to keep a debug session alive, and a
-        // no-op drain is the correct post-attach analogue (pure bounded
-        // wait).
-        let mut noop_drain =
-            |_timeout_ms: u32| -> Result<Option<mida_core::DrainReceipt>, mida_core::CoreError> {
-                Ok(None)
-            };
-        // Suspend the primary thread while the loader's remote LoadLibraryW
-        // runs, so the freely running main thread cannot race the remote
-        // thread on the loader lock. Resume unconditionally afterwards; the
-        // controller's fail-closed cleanup owns termination on failure.
-        let main_tid = dbg.main_thread_id();
-        let h_thread = dbg
-            .thread_handle(main_tid)
-            .map_err(|e| anyhow!("thread_handle for post-attach loader: {e}"))?;
-        let _ = unsafe { SuspendThread(h_thread) };
-        let loader_outcome = crate::unpacker::runtime_loader::run_runtime_loader(
-            dbg.process_handle(),
-            dbg.pid(),
-            "ahk_gto_x64_v1",
-            "adr6-profile-digest",
-            &mut noop_drain,
-        );
-        let _ = unsafe { ResumeThread(h_thread) };
-        match &loader_outcome {
-            Ok(loader_result) => log::log(
-                LogType::Info,
-                &format!(
-                    "post-attach runtime loader: module_base={:#x} target_pid={}",
-                    loader_result.module_base, loader_result.target_pid
-                ),
-            ),
-            Err(e) => log::log(
-                LogType::Fatal,
-                &format!("post-attach runtime loader failed: {e:#}"),
-            ),
-        }
+        // GTO-H3: the runtime loader already ran pre-resume (hoisted above);
+        // its outcome is consumed by the controller below. No second loader
+        // run here — the protector must never see a post-resume injection.
+        let loader_outcome = post_attach_loader_outcome;
         let mut ad_controller = antidebug_controller::AntidebugController::new(
             antidebug_controller::AntidebugStageOptions {
                 sample_id: None,
