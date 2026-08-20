@@ -173,6 +173,7 @@ impl Mem {
             disp: 0,
         }
     }
+    #[allow(dead_code)]
     pub fn rcx_index(index: u8) -> Self {
         Mem {
             base: 1,
