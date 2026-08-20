@@ -2,7 +2,7 @@
 
 > status: H2 DONE — plan builds complete; wall moved to bootstrap_install (H4 marker)
 > input: pinned manifest rev 2 sample (11473d2e…), immutable authorized GTO
-> evidence: D:\MidaVault\lab\evidence\gto_cold_start_heap_rebase_1\H3_observation_first\attempt_006..021
+> evidence: D:\MidaVault\lab\evidence\gto_cold_start_heap_rebase_1\H3_observation_first\attempt_006..021 (pre-fix walls) + H2_cross_layout_correction_1\layout_A, layout_B (post-fix cross-layout)
 > env: MIDA_GTO_NO_BYPASS=1, MIDA_GTO_OBSERVATION_ONLY=1, no bypass/semantic-repair
 > gate: capture_coverage_bind fail-closed, unchanged throughout
 
@@ -13,7 +13,7 @@
 | old_heap_base -> new_heap_base primitive | DONE (ViaCapturedRegion, plan/alias model) |
 | old_module_base -> new_module_base primitive | DONE (ViaStableBinding, plan layer) |
 | classification-driven (PointerClassification) | DONE (InImage/InCapturedRegion/ExternalModule/StackEphemeral/ModuleBoundaryCache) |
-| two different ASLR layouts rebuild same logical graph | VERIFIED (attempt_006/007 two layouts; deterministic walls identical) |
+| two different ASLR layouts rebuild same logical graph | VERIFIED (post-fix cross-layout: attempt_021 + H2_cross_layout_correction_1/layout_A + layout_B — regions_total=319/319/319, unresolved_required=0/0/0) |
 | unknown fields fail closed | PRESERVED (empty module_ranges; ambiguous; conflicts) |
 | classification provenance recorded per slot | DONE (ledger, kind_counts, reason, confidence) |
 
@@ -54,7 +54,18 @@ name table) is H4 work.
 
 - attempts 006-021: D:\MidaVault\lab\evidence\gto_cold_start_heap_rebase_1\H3_observation_first\
 - plan_research.json (attempt_019): full 158-value unresolved analysis
-- commits: 5226aff b3441b4 3bba2ff 03a5533 457caf1 d1bc465 cce8407 b883691
+- commits: 5226aff b3441b4 3bba2ff 03a5533 457caf1 d1bc465 cce8407 b883691 (implementation), 4b8f8fb (report)
+- CROSS-LAYOUT post-fix evidence (GTO-H2-AUDIT-CORRECTION-1 / 派单 B):
+  - H2_cross_layout_correction_1/layout_A/  (pid 18808)
+  - H2_cross_layout_correction_1/layout_B/  (pid 8196)
+  - H2_cross_layout_correction_1/cross_layout_acceptance.json
+  - 3 layouts (attempt_021 + A + B): regions_total=319/319/319, regions_required=319/319/319,
+    unresolved_required=0/0/0, IAT 562/562 each, terminal bootstrap_install fail-closed
+    (ViaStableBinding resolver present — H4 marker, expected)
+- NOTE attempt_006/007: PRE-FIX deterministic capture_coverage_bind failures (exit 1,
+  ProbeCoverageMissing). They are NOT post-fix two-layout rebuild evidence; they
+  document the deterministic pre-fix wall (2 different ASLR layouts, same failure
+  class). Post-fix cross-layout evidence is attempt_021 + layout_A + layout_B.
 
 ## 5. Non-claims
 
