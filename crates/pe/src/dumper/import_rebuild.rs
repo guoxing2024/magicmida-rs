@@ -697,6 +697,7 @@ mod tests {
             RemoteModule {
                 base: 0x1000,
                 end_off: 0x2000,
+                size_of_image: 0x1000,
                 name: "kernel32.dll".into(),
                 exports: std::collections::HashMap::from([(0x1100, "First".into())]),
                 forwards: Vec::new(),
@@ -704,6 +705,7 @@ mod tests {
             RemoteModule {
                 base: 0x2000,
                 end_off: 0x3000,
+                size_of_image: 0x1000,
                 name: "user32.dll".into(),
                 exports: std::collections::HashMap::from([(0x2100, "Second".into())]),
                 forwards: Vec::new(),

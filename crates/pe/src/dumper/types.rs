@@ -361,6 +361,10 @@ pub struct RemoteModule {
     pub(crate) base: u64,
     /// End of the module (`base + size`).
     pub(crate) end_off: u64,
+    /// Exact PE SizeOfImage (authoritative image span). Toolhelp modBaseSize
+    /// can under-report the trailing section alignment page; PE SizeOfImage is
+    /// the loader-truth end for module attribution.
+    pub(crate) size_of_image: u64,
     /// Module name (lowercase, e.g. `"kernel32.dll"`).
     pub(crate) name: String,
     /// Export table: address ??function name (or `"#ordinal"`).

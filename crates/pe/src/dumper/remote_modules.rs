@@ -131,10 +131,16 @@ pub fn take_module_snapshot(
                 );
 
                 match gather_module_exports_from_remote(process_handle, base, is_64bit) {
-                    Ok((exports, forwards)) => {
+                    Ok((exports, forwards, size_of_image)) => {
+                        let end_off = if size_of_image != 0 {
+                            base.saturating_add(size_of_image)
+                        } else {
+                            end
+                        };
                         modules.push(RemoteModule {
                             base,
-                            end_off: end,
+                            end_off,
+                            size_of_image,
                             name,
                             exports,
                             forwards,
@@ -186,7 +192,14 @@ pub(crate) fn gather_module_exports_from_remote(
     process_handle: HANDLE,
     module_base: u64,
     _is_64bit: bool,
-) -> Result<(std::collections::HashMap<u64, String>, Vec<(String, u64)>), PeError> {
+) -> Result<
+    (
+        std::collections::HashMap<u64, String>,
+        Vec<(String, u64)>,
+        u64,
+    ),
+    PeError,
+> {
     // Helper: read memory from the target process.
     fn read_remote(handle: HANDLE, addr: u64, buf: &mut [u8]) -> Result<usize, PeError> {
         let mut bytes: usize = 0;
@@ -269,7 +282,12 @@ pub(crate) fn gather_module_exports_from_remote(
 
     if exp_va == 0 || exp_size < 40 {
         // No exports in this module
-        return Ok((std::collections::HashMap::new(), Vec::new()));
+        let size_of_image: u64 = if magic == 0x20B {
+            read_u32_le(&nt_buf, 136 + 56)?.into()
+        } else {
+            read_u32_le(&nt_buf, 120 + 60)?.into()
+        };
+        return Ok((std::collections::HashMap::new(), Vec::new(), size_of_image));
     }
 
     // 3. Read the export directory (capped — size is attacker-controlled in
@@ -423,7 +441,12 @@ pub(crate) fn gather_module_exports_from_remote(
         exports.insert(module_base + func_rva as u64, format!("#{ordinal}"));
     }
 
-    Ok((exports, forwards))
+    let size_of_image: u64 = if magic == 0x20B {
+        read_u32_le(&nt_buf, 136 + 56)?.into()
+    } else {
+        read_u32_le(&nt_buf, 120 + 60)?.into()
+    };
+    Ok((exports, forwards, size_of_image))
 }
 
 // MAX_IAT_SLOTS is used in import_rebuild.rs, not here.

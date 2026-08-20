@@ -1498,7 +1498,12 @@ pub fn dump_process_with_report(
     )
     .unwrap_or_default()
     .into_iter()
-    .map(|m| (m.name.clone(), m.base, m.end_off))
+    .map(|m| {
+        // PE SizeOfImage end is authoritative for attribution (Toolhelp
+        // modBaseSize can under-report the trailing alignment page).
+        let _ = m.size_of_image;
+        (m.name.clone(), m.base, m.end_off)
+    })
     .collect();
     if !synthetic_requests.is_empty() {
         // Authority ranges the synthetic allocator must avoid.
