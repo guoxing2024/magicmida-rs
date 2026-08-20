@@ -1051,7 +1051,18 @@ pub fn declare_pointer_slots_structural(
 /// they are not rebaseable pointers (the cold-start process has its own
 /// module layout).
 fn is_module_boundary_cache(val: u64, module_ranges: &[(u64, u64)]) -> bool {
-    const MODULE_ZONE_BASE: u64 = 0x0000_7ff8_0000_0000;
+    // GTO-COLD-START-HEAP-REBASE-1 H4-A correction (layout_A wall): the module
+    // zone lower bound must match the declaration layer's `in_module`
+    // threshold (0x7ff0_0000_0000). A value in 0x7ff0..0x7ff8 that is NOT
+    // inside any verified enumerated module range is a module-zone hole
+    // (reserved/unmapped gap below every real DLL base — observed module
+    // bases all sit >= 0x7ff8_0000_0000), not a rebaseable pointer. Treating
+    // it as unknown+required made the plan fail closed on ASLR layouts whose
+    // heap happens to hold such a hole value (heap slab garbage / cached
+    // zone boundaries). Exclusion remains evidence-gated: module_ranges must
+    // be non-empty, and any value INSIDE a verified range still classifies
+    // via module attribution (never excluded here).
+    const MODULE_ZONE_BASE: u64 = 0x0000_7ff0_0000_0000;
     if val < MODULE_ZONE_BASE || val >= STACK_RESERVED_BASE {
         return false;
     }
@@ -7067,6 +7078,56 @@ mod tests {
         assert_eq!(bc.len(), 6, "all boundary slots excluded");
         // Plan completes without unresolved-required (with module ranges so
         // the boundary cache is recognized).
+        let plan = build_runtime_rebase_plan(
+            &[],
+            &[],
+            &[slab],
+            &slots.declared,
+            &ExternalResolverTable::new(),
+            &modules,
+            OLD_IB,
+            NEW_IB,
+        )
+        .expect("plan")
+        .expect("Some");
+        validate_runtime_rebase_plan(&plan).unwrap();
+    }
+
+    /// H4-A correction (layout_A wall): a heap slab value in the module-zone
+    /// hole 0x7ff0_0000_0000..0x7ff8_0000_0000 (below every real DLL base,
+    /// outside every verified enumerated module range) is a boundary-cache
+    /// slot, not an unresolved-required pointer: the plan completes.
+    #[test]
+    fn h4a_module_zone_hole_value_not_required() {
+        let ntdll_base = 0x7ff8c53a0000u64;
+        let ntdll_end = ntdll_base + 0x266000;
+        let mut bytes = vec![0u8; 0x1000];
+        // The exact failure value: 0x7ff100000000 (module-zone hole below
+        // 0x7ff8_0000_0000, not inside any module range).
+        bytes[0x00..0x08].copy_from_slice(&0x7ff100000000u64.to_le_bytes());
+        // A REAL module pointer inside ntdll must STILL be module-attributed.
+        bytes[0x08..0x10].copy_from_slice(&(ntdll_base + 0x1234).to_le_bytes());
+        let slab = HeapSlab {
+            old_base: 0x9000_0000,
+            content: bytes,
+        };
+        let modules = vec![("ntdll.dll".to_string(), ntdll_base, ntdll_end)];
+        let slots =
+            declare_pointer_slots_fallible(&[], &[], &[slab.clone()], &[(ntdll_base, ntdll_end)])
+                .unwrap();
+        assert!(!slots.has_conflict);
+        // The HOLE value (0x7ff100000000) is excluded as boundary cache and is
+        // NOT in declared. The REAL module pointer (ntdll+0x1234, a raw-slab
+        // observation without structural provenance) stays unknown+required
+        // (fail-closed: membership-only collision is never dropped).
+        assert_eq!(slots.declared.len(), 1, "only the real module ptr stays required");
+        // Hole value excluded as boundary cache; real module pointer NOT excluded.
+        let bc: Vec<_> = slots
+            .ledger
+            .iter()
+            .filter(|r| r.kind == DeclarationKind::ModuleBoundaryCache)
+            .collect();
+        assert_eq!(bc.len(), 1, "hole value excluded as boundary cache");
         let plan = build_runtime_rebase_plan(
             &[],
             &[],
