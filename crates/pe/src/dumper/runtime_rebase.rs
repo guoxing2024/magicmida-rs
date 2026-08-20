@@ -54,6 +54,14 @@ pub const POINTER_WIDTH: usize = 8;
 /// Tagged small-integer ceiling: values below this are treated as tags/counts,
 /// never as pointers (prevents an arbitrary small qword from being rebased).
 pub const SMALL_TAG_CEILING: u64 = 0x1_0000;
+
+/// Canonical user-mode stack/TEB reserved region base on x64.
+/// Above this ceiling the address space belongs to per-process
+/// ephemeral state (thread stacks, TEBs) — NOT the DLL load zone
+/// (0x7ff0_0000_0000..0x7fff_ff00_0000). A pointer into this region
+/// cannot survive cold-start rebasing (the new process has its own
+/// stacks) and is never a persistent object-graph edge.
+pub const STACK_RESERVED_BASE: u64 = 0x0000_7fff_ff00_0000;
 /// Hard ceiling for one rebased region's captured payload (matches dumper caps).
 const MAX_REGION_BYTES: usize = 64 * 1024 * 1024;
 
@@ -767,6 +775,11 @@ pub enum DeclarationKind {
     SmallScalar,
     /// Inline UTF-16 text packed into a qword — excluded with shape evidence.
     InlineText,
+    /// Pointer into the canonical user-mode stack/TEB reserved region
+    /// (>= STACK_RESERVED_BASE). Ephemeral per-process state: the cold-start
+    /// process has its own stacks, so the old stack VA cannot be rebased and
+    /// is excluded with high-confidence address-space evidence.
+    StackEphemeral,
     /// Allocator metadata (HEAP_ENTRY header / freelist link) — excluded only
     /// with allocation-layout evidence.
     /// Reserved classification: never constructed by the current pipeline,
@@ -801,6 +814,7 @@ impl DeclarationKind {
             DeclarationKind::TaggedScalar => "tagged_scalar",
             DeclarationKind::SmallScalar => "small_scalar",
             DeclarationKind::InlineText => "inline_text",
+            DeclarationKind::StackEphemeral => "stack_ephemeral",
             DeclarationKind::AllocatorMetadata => "allocator_metadata",
             DeclarationKind::Unknown => "unknown",
             DeclarationKind::DuplicateSameSemantics => "duplicate_same_semantics",
@@ -830,6 +844,7 @@ impl DeclarationKind {
             DeclarationKind::TaggedScalar
                 | DeclarationKind::SmallScalar
                 | DeclarationKind::InlineText
+                | DeclarationKind::StackEphemeral
                 | DeclarationKind::AllocatorMetadata
         )
     }
@@ -1066,7 +1081,9 @@ fn declare_pointer_slots_structural_checked(
         for i in 0..n {
             let off = i * POINTER_WIDTH;
             let val = u64::from_le_bytes(payload[off..off + 8].try_into().unwrap_or([0; 8]));
-            if val >= SMALL_TAG_CEILING && val <= 0x0000_7fff_ffff_ffff {
+            // Stack/TEB reserved region is ephemeral process state, not a
+            // persistent object-graph edge — never scanned as a pointer target.
+            if val >= SMALL_TAG_CEILING && val < STACK_RESERVED_BASE {
                 scanned.push((old_base, off, val, structural, label));
             }
         }
@@ -1137,7 +1154,9 @@ fn declare_pointer_slots_structural_checked(
         //   structural_provenance_present == true
         //   target_membership_or_resolver_evidence == true
         // Otherwise: unknown + required=true (never dropped, never optional).
-        let in_module = val >= 0x7ff0_0000_0000;
+        // Module address space = DLL load zone only; the stack/TEB reserved
+        // region above STACK_RESERVED_BASE is NOT module space.
+        let in_module = val >= 0x7ff0_0000_0000 && val < STACK_RESERVED_BASE;
         let inside = regions.iter().any(|&(b, e)| val >= b && val < e);
         // threshold-only: value in module address space but NOT in any verified
         // enumerated module range (no module identity / RVA / PE section).
@@ -1171,6 +1190,14 @@ fn declare_pointer_slots_structural_checked(
                         "value {val:#x} inside verified enumerated module range AND slot has                          structural provenance (source {label}) — module-relative candidate;                          resolver deferred to later work order"
                     ),
                     "medium",
+                )
+        } else if val >= STACK_RESERVED_BASE && val <= 0x0000_7fff_ffff_ffff {
+            (
+                    DeclarationKind::StackEphemeral,
+                    format!(
+                        "value {val:#x} in canonical user stack/TEB reserved region\n                          (>= STACK_RESERVED_BASE) — ephemeral per-process state;\n                          excluded with address-space evidence (source {label})"
+                    ),
+                    "high",
                 )
         } else if threshold_only {
             (
@@ -2386,13 +2413,22 @@ fn classify_value(
         return ClassResult::InImage;
     }
 
-    // External module / API region (high canonical user VA, far above heaps).
-    // Note: this only marks the value as an *external candidate*; whether it is
-    // *resolved* is decided later via the resolver table / module map.
-    let in_external = canonical && val >= 0x0000_7ff0_0000_0000;
+    // External module / API region (DLL load zone above heaps, below the
+    // stack/TEB reserved region). Note: this only marks the value as an
+    // *external candidate*; whether it is *resolved* is decided later via the
+    // resolver table / module map.
+    let in_external = canonical && val >= 0x0000_7ff0_0000_0000 && val < STACK_RESERVED_BASE;
     if in_external {
         return ClassResult::External;
     }
+    // Stack/TEB reserved region: ephemeral per-process state. The cold-start
+    // process has its own stacks; the old stack VA cannot be rebased. It is
+    // not a mapped persistent target, so it classifies Unmapped-like — but
+    // Unmapped is required; instead it is NOT a pointer edge at all. We
+    // return External only for the module zone; stack addresses fall through
+    // to the region sweep and end up Unmapped (kept required by the plan),
+    // which is fail-closed but wrong for ephemeral edges — handled earlier at
+    // the declaration layer (StackEphemeral).
 
     // Captured region: interior membership. If it hits exactly one region,
     // that's a unique target. If it hits more than one, ambiguous (fail-closed).
@@ -6022,6 +6058,45 @@ mod tests {
             OLD_IB,
             NEW_IB,
         )
+    }
+
+    /// GTO-COLD-START-HEAP-REBASE-1 H2 (attempt_014 wall): a dangling
+    /// heap slab whose payload contains a stack/TEB-reserved pointer
+    /// (0x7ffffffdefff, refs=24) must classify StackEphemeral — NOT
+    /// ExternalCandidate/Unknown — so the rebase plan no longer fails
+    /// closed on an ephemeral per-process edge that cannot survive
+    /// cold-start (the new process has its own stacks).
+    #[test]
+    fn h2_stack_ephemeral_slot_not_required() {
+        // Slab at 0x850060 with a stack pointer at offset 0x68.
+        let mut bytes = vec![0u8; 0x80];
+        bytes[0x68..0x70].copy_from_slice(&0x7ffffffdefffu64.to_le_bytes());
+        let slab = HeapSlab {
+            old_base: 0x850060,
+            content: bytes,
+        };
+        // The slab blob has no per-field provenance; the stack pointer is in
+        // the stack/TEB reserved region and is never scanned as a pointer
+        // target (ephemeral per-process state) — no ledger record, nothing
+        // declared.
+        let slots = declare_pointer_slots_fallible(&[], &[], &[slab.clone()], &[]).unwrap();
+        assert!(!slots.has_conflict);
+        let stack_records: Vec<_> = slots
+            .ledger
+            .iter()
+            .filter(|r| r.raw_value == 0x7ffffffdefff)
+            .collect();
+        assert!(
+            stack_records.is_empty(),
+            "stack/TEB-reserved value must not be scanned as a pointer target"
+        );
+        assert!(
+            slots.declared.is_empty(),
+            "ephemeral stack edge must not be declared"
+        );
+        // And the plan builds without unresolved-required.
+        let plan = build_plan_slabs(&[], &[], &[slab]).unwrap().unwrap();
+        validate_runtime_rebase_plan(&plan).unwrap();
     }
 
     fn probe_global_pe(live_ptr: u64, size: usize) -> HeapGlobalSnapshot {
