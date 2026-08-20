@@ -38,8 +38,27 @@ struct OepEvidenceSidecar {
     application_oep: bool,
     bootstrap_or_ambiguous: bool,
     entry_rva_matches_provenance: bool,
+    // H4-B: cold-start entry chain. A cold-start candidate's PE EP is the
+    // .boot stub (final_entry_rva = boot_rva); the stub epilogue jmps to the
+    // observed OEP. The chain fields record the DECODED machine-code proof.
+    // They are emitted only for generic families (e.g. ahk_gto); the Oreans
+    // family sidecar stays byte-compatible with the frozen acceptance schema
+    // (all three are skipped when None/false-default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    entry_chain: Option<EntryChain>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    chain_decoded: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    chain_oep_matches_provenance: Option<bool>,
     prerequisite_passes: bool,
     blocker: Option<String>,
+}
+
+/// H4-B: decoded cold-start entry chain (PE EP .boot -> stub jmp OEP).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct EntryChain {
+    boot_rva: u32,
+    oep_target_rva: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,13 +110,36 @@ pub(super) fn write_oep_evidence(
     ensure_sidecar_is_safe(&sidecar, protected_input, candidate)?;
 
     let entry_rva_matches_provenance = provenance.rva == Some(final_entry_rva);
+    // H4-B: decode the cold-start entry chain from candidate bytes. If the
+    // candidate's PE EP is a .boot stub whose epilogue jmps to the provenance
+    // RVA, the chain is accepted as the entry evidence (machine-code proof).
+    // Generic families (e.g. ahk_gto) get the chain fields; the Oreans
+    // family sidecar stays byte-compatible with the frozen acceptance schema.
+    let chain = if mida_core::runner_config::packer_family::is_generic_family(family) {
+        decode_boot_entry_chain(&candidate_bytes, final_entry_rva)
+    } else {
+        None
+    };
+    let chain_decoded = chain.is_some();
+    let chain_oep_matches_provenance =
+        chain_decoded && provenance.rva == chain.as_ref().map(|c| c.oep_target_rva);
+    // Oreans family: chain fields are None so the serialized sidecar stays
+    // byte-compatible with the frozen acceptance schema.
+    let (chain_decoded_field, chain_matches_field) =
+        if mida_core::runner_config::packer_family::is_generic_family(family) {
+            (Some(chain_decoded), Some(chain_oep_matches_provenance))
+        } else {
+            (None, None)
+        };
     let core_passes = provenance.application_oep_prerequisite_passes();
-    let prerequisite_passes = core_passes && entry_rva_matches_provenance;
+    let prerequisite_passes =
+        core_passes && (entry_rva_matches_provenance || chain_oep_matches_provenance);
     let blocker = stable_blocker(
         provenance,
         final_entry_rva,
         entry_rva_matches_provenance,
         prerequisite_passes,
+        chain_oep_matches_provenance,
     );
 
     let sidecar_value = OepEvidenceSidecar {
@@ -112,6 +154,9 @@ pub(super) fn write_oep_evidence(
         application_oep: provenance.application_oep,
         bootstrap_or_ambiguous: provenance.bootstrap_or_ambiguous,
         entry_rva_matches_provenance,
+        entry_chain: chain,
+        chain_decoded: chain_decoded_field,
+        chain_oep_matches_provenance: chain_matches_field,
         prerequisite_passes,
         blocker,
     };
@@ -121,6 +166,107 @@ pub(super) fn write_oep_evidence(
 
     atomic_write(&sidecar, &json)?;
     Ok(sidecar)
+}
+
+/// H4-B: decode the cold-start entry chain from candidate bytes.
+///
+/// A cold-start candidate's PE EP is the .boot stub RVA. The stub epilogue
+/// (deterministic emit_two_phase_code shape) is:
+///
+///   add rsp, 0x28            ; 48 83 C4 28
+///   pop r15                  ; 41 5F
+///   pop r14                  ; 41 5E
+///   pop r13                  ; 41 5D
+///   pop r12                  ; 41 5C
+///   pop rdi                  ; 5F
+///   pop rsi                  ; 5E
+///   pop rbp                  ; 5D
+///   pop rbx                  ; 5B
+///   jmp rel32                ; E9 xx xx xx xx  (patched to original OEP)
+///
+/// The function locates the .boot section (by name; falls back to the
+/// section containing final_entry_rva), scans for the exact epilogue byte
+/// sequence, and decodes the rel32 to recover oep_target_rva. Fail closed:
+/// no .boot section / no epilogue -> None.
+fn decode_boot_entry_chain(candidate_bytes: &[u8], final_entry_rva: u32) -> Option<EntryChain> {
+    let pe = PeHeader::from_bytes(candidate_bytes).ok()?;
+    // Locate the .boot section; fall back to the section containing the EP.
+    let boot = pe.sections.iter().find(|s| s.name == ".boot").or_else(|| {
+        pe.sections.iter().find(|s| {
+            final_entry_rva >= s.virtual_address
+                && final_entry_rva
+                    < s.virtual_address
+                        .saturating_add(s.virtual_size.max(s.raw_size))
+        })
+    })?;
+    if boot.raw_size == 0 || boot.raw_offset as usize >= candidate_bytes.len() {
+        return None;
+    }
+    let raw_end = (boot.raw_offset as usize)
+        .saturating_add(boot.raw_size as usize)
+        .min(candidate_bytes.len());
+    let raw = &candidate_bytes[boot.raw_offset as usize..raw_end];
+
+    if raw.len() < 5 {
+        return None;
+    }
+    // Epilogue signature: 48 83 C4 28 41 5F 41 5E 41 5D 41 5C 5F 5E 5D 5B E9
+    const EPILOGUE: &[u8] = &[
+        0x48, 0x83, 0xc4, 0x28, // add rsp, 0x28
+        0x41, 0x5f, // pop r15
+        0x41, 0x5e, // pop r14
+        0x41, 0x5d, // pop r13
+        0x41, 0x5c, // pop r12
+        0x5f, // pop rdi
+        0x5e, // pop rsi
+        0x5d, // pop rbp
+        0x5b, // pop rbx
+        0xe9, // jmp rel32
+    ];
+    let sig_len = EPILOGUE.len(); // 19
+    let mut pos = 0usize;
+    let mut found: Option<usize> = None;
+    while pos + sig_len <= raw.len() {
+        if &raw[pos..pos + sig_len] == EPILOGUE {
+            found = Some(pos);
+            // Prefer the LAST match (the epilogue is the final jmp before
+            // the helpers; earlier incidental matches are impossible for
+            // this exact 19-byte signature but last-match is safest).
+        }
+        pos += 1;
+    }
+    let jmp_at = found?;
+    if jmp_at + sig_len + 4 > raw.len() {
+        return None;
+    }
+    let rel32 = i32::from_le_bytes([
+        raw[jmp_at + sig_len],
+        raw[jmp_at + sig_len + 1],
+        raw[jmp_at + sig_len + 2],
+        raw[jmp_at + sig_len + 3],
+    ]);
+    // The rel32 is relative to the address after the 5-byte jmp.
+    // E9 sits at EPILOGUE index 16 (4 + 8 + 4), i.e. sig_len - 1.
+    let jmp_insn_at = jmp_at + sig_len - 1; // E9 position
+    let jmp_end_rva = boot.virtual_address + (jmp_insn_at + 5) as u32;
+    let oep_target_rva = jmp_end_rva.wrapping_add(rel32 as u32);
+    // Sanity: the target must land inside the image's virtual range — fail
+    // closed on garbage. (Per-section checks are too strict: the observed
+    // OEP may sit in any code section, e.g. .text after the fixture's small
+    // dummy range.)
+    let image_size = pe.sections.iter().fold(0u32, |acc, s| {
+        acc.max(
+            s.virtual_address
+                .saturating_add(s.virtual_size.max(s.raw_size)),
+        )
+    });
+    if oep_target_rva >= image_size {
+        return None;
+    }
+    Some(EntryChain {
+        boot_rva: boot.virtual_address,
+        oep_target_rva,
+    })
 }
 
 fn sidecar_path(candidate: &Path) -> anyhow::Result<PathBuf> {
@@ -136,6 +282,7 @@ fn stable_blocker(
     final_entry_rva: u32,
     entry_rva_matches_provenance: bool,
     prerequisite_passes: bool,
+    chain_oep_matches_provenance: bool,
 ) -> Option<String> {
     if prerequisite_passes {
         return None;
@@ -145,10 +292,10 @@ fn stable_blocker(
     if let Some(reason) = provenance.application_oep_blocker() {
         reasons.push(reason.to_string());
     }
-    if !entry_rva_matches_provenance {
+    if !entry_rva_matches_provenance && !chain_oep_matches_provenance {
         reasons.push(match provenance.rva {
             Some(rva) => format!(
-                "final candidate entry RVA {final_entry_rva:#x} does not match provenance RVA {rva:#x}"
+                "final candidate entry RVA {final_entry_rva:#x} does not match provenance RVA {rva:#x} (chain match: {chain_oep_matches_provenance})"
             ),
             None => "provenance RVA is missing; final candidate entry cannot be bound".to_string(),
         });
@@ -443,9 +590,49 @@ mod tests {
     fn write_fixture(dir: &Path, entry_rva: u32) -> (PathBuf, PathBuf) {
         let input = dir.join("protected.exe");
         let candidate = dir.join("candidate.exe");
-        fs::write(&input, b"protected bytes\0\x90").expect("input");
+        fs::write(&input, b"protected bytes\x00\x90").expect("input");
         fs::write(&candidate, minimal_pe64(entry_rva)).expect("candidate");
         (input, candidate)
+    }
+
+    /// Build a minimal PE64 with a .boot section whose raw bytes carry the
+    /// H4-B epilogue signature: add rsp,0x28 + 8 pops + jmp rel32 to OEP.
+    fn boot_chain_fixture(dir: &Path, boot_rva: u32, oep_target: u32) -> (PathBuf, PathBuf) {
+        let mut candidate = minimal_pe64(boot_rva);
+        // Second section .boot at boot_rva with raw data.
+        let sh = 0x40 + 24 + 0xF0 + 0x28; // after first section header (0x1A0)
+        candidate.resize(sh + 0x28, 0);
+        candidate[sh..sh + 5].copy_from_slice(b".boot");
+        candidate[sh + 8..sh + 12].copy_from_slice(&0x1000u32.to_le_bytes()); // virtual_size
+        candidate[sh + 12..sh + 16].copy_from_slice(&boot_rva.to_le_bytes()); // virtual_address
+        candidate[sh + 16..sh + 20].copy_from_slice(&0x60u32.to_le_bytes()); // size_of_raw_data (stub_len)
+        candidate[sh + 20..sh + 24].copy_from_slice(&(sh as u32 + 0x28).to_le_bytes()); // pointer_to_raw_data
+        candidate[sh + 36..sh + 40].copy_from_slice(&0xE0_0000_20u32.to_le_bytes());
+        // 3rd section header must exist for the count (16 -> bump to 3)
+        let fh = 0x40 + 4;
+        let count_off = fh + 2;
+        candidate[count_off..count_off + 2].copy_from_slice(&3u16.to_le_bytes());
+        // Stub: fill with 0xcc then epilogue at raw end.
+        let raw_off = (sh + 0x28) as usize;
+        let stub_len = 0x60usize;
+        candidate.resize(raw_off + stub_len, 0);
+        // epilogue at raw_off + 0x40
+        let ep = raw_off + 0x40;
+        candidate[ep..ep + 4].copy_from_slice(&[0x48, 0x83, 0xc4, 0x28]);
+        candidate[ep + 4..ep + 12]
+            .copy_from_slice(&[0x41, 0x5f, 0x41, 0x5e, 0x41, 0x5d, 0x41, 0x5c]);
+        candidate[ep + 12..ep + 16].copy_from_slice(&[0x5f, 0x5e, 0x5d, 0x5b]);
+        candidate[ep + 16] = 0xe9;
+        // rel32: jmp_end_rva = boot_rva + 0x40 + 16 + 5 ; target = oep_target
+        let jmp_insn_at = (0x40 + 16) as u32;
+        let jmp_end = boot_rva + jmp_insn_at + 5;
+        let rel = (oep_target as i64 - jmp_end as i64) as i32;
+        candidate[ep + 17..ep + 21].copy_from_slice(&rel.to_le_bytes());
+        let input = dir.join("protected.exe");
+        let out = dir.join("candidate.exe");
+        fs::write(&input, b"protected bytes\x00\x90").expect("input");
+        fs::write(&out, &candidate).expect("candidate");
+        (input, out)
     }
 
     fn pass_provenance(rva: u32) -> OepProvenance {
@@ -526,6 +713,130 @@ mod tests {
             .as_str()
             .expect("blocker")
             .contains("scan fallback"));
+        cleanup(dir);
+    }
+
+    #[test]
+    fn h4b_chain_decoder_recovers_oep_target() {
+        let dir = temp_dir("h4b-dec");
+        let (_, candidate) = boot_chain_fixture(&dir, 0x2d2_1000, 0x8f054);
+        let bytes = fs::read(&candidate).expect("bytes");
+        let chain = decode_boot_entry_chain(&bytes, 0x2d2_1000);
+        let chain = chain.expect("chain decoded");
+        assert_eq!(chain.boot_rva, 0x2d2_1000);
+        assert_eq!(chain.oep_target_rva, 0x8f054);
+        cleanup(dir);
+    }
+
+    #[test]
+    fn h4b_chain_decoder_fails_closed_without_epilogue() {
+        let dir = temp_dir("h4b-nodec");
+        let (_input, candidate) = write_fixture(&dir, 0x1234); // .text only, no epilogue
+        let bytes = fs::read(&candidate).expect("bytes");
+        assert!(
+            decode_boot_entry_chain(&bytes, 0x1234).is_none(),
+            "no .boot -> None"
+        );
+        cleanup(dir);
+    }
+
+    #[test]
+    fn h4b_runtime_rip_chain_match_passes() {
+        let dir = temp_dir("h4b-pass");
+        let (input, candidate) = boot_chain_fixture(&dir, 0x2d2_1000, 0x8f054);
+        let provenance =
+            OepProvenance::runtime_rip(0x1400_8f054, "frozen RIP captured application OEP")
+                .with_rva(Some(0x8f054));
+        let sidecar =
+            write_oep_evidence(&input, &candidate, &provenance, "ahk_gto").expect("write");
+        let value = read_sidecar(&sidecar);
+        assert_eq!(value["source"], "runtime_rip");
+        assert_eq!(value["chain_decoded"], true);
+        assert_eq!(value["chain_oep_matches_provenance"], true);
+        assert_eq!(
+            value["prerequisite_passes"], true,
+            "chain match must pass with runtime_rip"
+        );
+        assert_eq!(value["blocker"], serde_json::Value::Null);
+        cleanup(dir);
+    }
+
+    #[test]
+    fn h4b_runtime_rip_chain_mismatch_fails_closed() {
+        let dir = temp_dir("h4b-mismatch");
+        let (input, candidate) = boot_chain_fixture(&dir, 0x2d2_1000, 0x8f054);
+        // Provenance claims a DIFFERENT OEP than the decoded chain.
+        let provenance =
+            OepProvenance::runtime_rip(0x1400_a550, "frozen RIP captured application OEP")
+                .with_rva(Some(0xa550));
+        let sidecar =
+            write_oep_evidence(&input, &candidate, &provenance, "ahk_gto").expect("write");
+        let value = read_sidecar(&sidecar);
+        assert_eq!(value["chain_decoded"], true);
+        assert_eq!(
+            value
+                .get("chain_oep_matches_provenance")
+                .and_then(|v| v.as_bool()),
+            Some(false),
+            "chain mismatch must record chain_oep_matches_provenance=false"
+        );
+        assert_eq!(
+            value["prerequisite_passes"], false,
+            "chain mismatch must fail closed"
+        );
+        assert!(value["blocker"]
+            .as_str()
+            .expect("blocker")
+            .contains("chain match: false"));
+        cleanup(dir);
+    }
+
+    #[test]
+    fn h4b_scan_fallback_chain_match_still_fails_closed() {
+        let dir = temp_dir("h4b-scan");
+        let (input, candidate) = boot_chain_fixture(&dir, 0x2d2_1000, 0x8f054);
+        // Even with a decoded chain, scan_fallback provenance must NOT pass.
+        let provenance =
+            OepProvenance::scan_fallback(0x1400_8f054, "scan fallback").with_rva(Some(0x8f054));
+        let sidecar =
+            write_oep_evidence(&input, &candidate, &provenance, "ahk_gto").expect("write");
+        let value = read_sidecar(&sidecar);
+        assert_eq!(value["chain_decoded"], true);
+        assert_eq!(value["chain_oep_matches_provenance"], true);
+        assert_eq!(
+            value["prerequisite_passes"], false,
+            "scan_fallback must stay fail-closed"
+        );
+        assert!(value["blocker"]
+            .as_str()
+            .expect("blocker")
+            .contains("scan fallback"));
+        cleanup(dir);
+    }
+
+    #[test]
+    fn h4b_sidecar_without_chain_fields_parses_backcompat() {
+        // Old sidecar JSON (no chain fields) must parse with defaults.
+        let dir = temp_dir("h4b-compat");
+        let (input, candidate) = write_fixture(&dir, 0x1234);
+        let provenance = pass_provenance(0x1234);
+        let sidecar =
+            write_oep_evidence(&input, &candidate, &provenance, "oreans_themida").expect("write");
+        let bytes = fs::read(&sidecar).expect("sidecar bytes");
+        // Strip chain fields and re-parse as the struct.
+        let mut v: serde_json::Value = serde_json::from_slice(&bytes).expect("parse");
+        for k in [
+            "entry_chain",
+            "chain_decoded",
+            "chain_oep_matches_provenance",
+        ] {
+            v.as_object_mut().expect("obj").remove(k);
+        }
+        let reparsed: OepEvidenceSidecar =
+            serde_json::from_value(v).expect("reparse without chain fields");
+        assert_eq!(reparsed.chain_decoded, None);
+        assert_eq!(reparsed.chain_oep_matches_provenance, None);
+        assert!(reparsed.entry_chain.is_none());
         cleanup(dir);
     }
 
