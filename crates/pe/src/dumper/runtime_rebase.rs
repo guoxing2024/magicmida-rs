@@ -1042,28 +1042,29 @@ pub fn declare_pointer_slots_structural(
     .unwrap_or_default()
 }
 
-/// Whether `val` matches a loaded module boundary cache slot:
-/// exactly a module end (base + SizeOfImage), a small fixed delta past it
-/// (0x2a4 / 0x1000 — observed on every enumerated module in the GTO sample),
-/// or the fixed canonical module-zone base 0x7ff800000000. AHK caches these
-/// for address-range classification; they are not rebaseable pointers.
+/// Whether `val` matches a loaded module boundary cache slot: any value in
+/// the canonical module zone (0x7ff800000000 .. STACK_RESERVED_BASE) that is
+/// NOT inside a verified enumerated module range. attempt_019 exposed 158
+/// unresolved-required and ALL were module-zone boundary values: module ends,
+/// end+0x2a4 / end+0x1000, module-zone base + small offsets, and module-gap
+/// pages. AHK caches module address-range boundaries for classification;
+/// they are not rebaseable pointers (the cold-start process has its own
+/// module layout).
 fn is_module_boundary_cache(val: u64, module_ranges: &[(u64, u64)]) -> bool {
     const MODULE_ZONE_BASE: u64 = 0x0000_7ff8_0000_0000;
-    const END_DELTAS: [u64; 2] = [0x2a4, 0x1000];
-    if val == MODULE_ZONE_BASE {
-        return true;
+    if val < MODULE_ZONE_BASE || val >= STACK_RESERVED_BASE {
+        return false;
     }
-    module_ranges.iter().any(|&(b, e)| {
-        if e <= b {
-            return false;
-        }
-        if val == e {
-            return true;
-        }
-        END_DELTAS
-            .iter()
-            .any(|d| e.checked_add(*d).map_or(false, |t| val == t))
-    })
+    // No verified module ranges -> no boundary evidence; fail closed (the
+    // value stays unknown+required rather than being silently dropped).
+    if module_ranges.is_empty() {
+        return false;
+    }
+    // Inside a verified module range -> a real module pointer (handled by
+    // module attribution). Outside every range -> boundary cache slot.
+    !module_ranges
+        .iter()
+        .any(|&(b, e)| e > b && val >= b && val < e)
 }
 
 fn declare_pointer_slots_structural_checked(
@@ -7026,11 +7027,14 @@ mod tests {
         let ntdll_base = 0x7ff8c53a0000u64;
         let ntdll_end = ntdll_base + 0x266000;
         let mut bytes = vec![0u8; 0x1000];
-        // Four boundary slots: end, end+0x2a4, end+0x1000, zone base.
+        // Boundary slots: end, end+0x2a4, end+0x1000, zone base, zone gap
+        // page (after module end, not in any module range), zone base+small.
         bytes[0x00..0x08].copy_from_slice(&ntdll_end.to_le_bytes());
         bytes[0x08..0x10].copy_from_slice(&(ntdll_end + 0x2a4).to_le_bytes());
         bytes[0x10..0x18].copy_from_slice(&(ntdll_end + 0x1000).to_le_bytes());
         bytes[0x18..0x20].copy_from_slice(&0x7ff800000000u64.to_le_bytes());
+        bytes[0x20..0x28].copy_from_slice(&(ntdll_end + 0xb000).to_le_bytes());
+        bytes[0x28..0x30].copy_from_slice(&0x7ff800000005u64.to_le_bytes());
         let slab = HeapSlab {
             old_base: 0x9000_0000,
             content: bytes,
@@ -7050,7 +7054,7 @@ mod tests {
             .iter()
             .filter(|r| r.kind == DeclarationKind::ModuleBoundaryCache)
             .collect();
-        assert_eq!(bc.len(), 4, "all four boundary slots excluded");
+        assert_eq!(bc.len(), 6, "all boundary slots excluded");
         // Plan completes without unresolved-required (with module ranges so
         // the boundary cache is recognized).
         let plan = build_runtime_rebase_plan(
