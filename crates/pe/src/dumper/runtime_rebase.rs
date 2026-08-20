@@ -6668,4 +6668,158 @@ mod tests {
             .iter()
             .all(|slot| slot.region_old_base != u64::MAX));
     }
+
+    // === GTO-H2 exit-criteria: two different ASLR/heap layouts rebuild the
+    // same logical object graph; unknown fields fail closed ================
+
+    /// Shared logical object graph for H2:
+    ///   region A (0x60): [0]=ptr->B [1]=ptr->C [2]=ptr->A(cycle) [3]=tag
+    ///   region B (0x40): [0]=ptr->A [1]=ptr->C
+    ///   region C (0x20): [0]=ptr->B [1]=unmapped-unknown
+    fn h2_graph_snapshots(base_a: u64, base_b: u64, base_c: u64) -> Vec<HeapGlobalSnapshot> {
+        let mut a = vec![0u8; 0x60];
+        a[0..8].copy_from_slice(&base_b.to_le_bytes());
+        a[8..16].copy_from_slice(&base_c.to_le_bytes());
+        a[16..24].copy_from_slice(&base_a.to_le_bytes());
+        a[24..32].copy_from_slice(&(0x1000u64).to_le_bytes()); // tag/count
+        let mut b = vec![0u8; 0x40];
+        b[0..8].copy_from_slice(&base_a.to_le_bytes());
+        b[8..16].copy_from_slice(&base_c.to_le_bytes());
+        let mut c = vec![0u8; 0x20];
+        c[0..8].copy_from_slice(&base_b.to_le_bytes());
+        c[8..16].copy_from_slice(&0x7ff0_1234_0000u64.to_le_bytes()); // external candidate, NO resolver
+        vec![
+            global(0x1000, base_a, a, false),
+            global(0x2000, base_b, b, false),
+            global(0x3000, base_c, c, false),
+        ]
+    }
+
+    /// Extract the normalized logical pointer-edge set of a plan:
+    /// (region_index, slot_offset, target_region_index | image_marker, is_image).
+    fn h2_logical_edges(plan: &RuntimeRebasePlan) -> Vec<(usize, usize, usize, bool)> {
+        let mut edges: Vec<(usize, usize, usize, bool)> = Vec::new();
+        for p in &plan.pointers {
+            if let Some(t) = p.target_region {
+                edges.push((p.source_region, p.source_offset, t, false));
+            } else if let Some(rva) = p.image_rva {
+                edges.push((p.source_region, p.source_offset, rva as usize, true));
+            }
+        }
+        edges.sort();
+        edges
+    }
+
+    #[test]
+    fn h2_two_layouts_same_logical_graph() {
+        // Layout 1: heap at 0x400000/0x401000/0x402000, image at OLD_IB.
+        let g1 = h2_graph_snapshots(0x40_0000, 0x40_1000, 0x40_2000);
+        // Layout 2: entirely different ASLR + heap layout.
+        let g2 = h2_graph_snapshots(0x9f00_0000, 0x9f00_4000, 0x9f01_0000);
+        let p1 = build_plan(&[], &g1, None)
+            .expect("layout1 plan")
+            .expect("Some");
+        let p2 = build_plan(&[], &g2, None)
+            .expect("layout2 plan")
+            .expect("Some");
+        assert!(p1.plan_complete, "layout1 fully resolved");
+        assert!(p2.plan_complete, "layout2 fully resolved");
+        // Same logical regions.
+        assert_eq!(p1.regions.len(), p2.regions.len());
+        for (a, b) in p1.regions.iter().zip(p2.regions.iter()) {
+            assert_eq!(a.size, b.size);
+            assert_eq!(a.required, b.required);
+            assert_eq!(a.alignment, b.alignment);
+            assert_eq!(a.image_inline_rva, b.image_inline_rva);
+            assert_eq!(a.provenance, b.provenance);
+        }
+        // Same logical pointer edges (graph isomorphism over region ids).
+        let e1 = h2_logical_edges(&p1);
+        let e2 = h2_logical_edges(&p2);
+        assert_eq!(e1, e2, "same logical pointer edges across layouts");
+        // Physical digests differ (bases differ) — expected, not a failure.
+        assert_ne!(p1.plan_digest, p2.plan_digest, "physical digests differ");
+    }
+
+    #[test]
+    fn h2_unknown_field_fails_closed_never_delta() {
+        // C contains an unmapped high value: the plan must fail closed
+        // (unresolved_required > 0) instead of silently rebasing it.
+        let g = h2_graph_snapshots(0x40_0000, 0x40_1000, 0x40_2000);
+        let p = build_plan(&[], &g, None)
+            .expect("plan built")
+            .expect("Some");
+        // Fail-closed: the external-candidate slot is unresolved-required,
+        // so the summary cannot be Complete/Prepared (status Incomplete).
+        let unresolved_required = p
+            .pointers
+            .iter()
+            .filter(|x| x.classification.is_unresolved_required())
+            .count();
+        assert!(
+            unresolved_required > 0,
+            "external candidate without resolver must be unresolved-required (fail closed)"
+        );
+        let summary = summarize_plan(&p, Some(0x1000), 0x1000, Some(0x2000), "test", true);
+        assert!(
+            !matches!(
+                summary.recovery_status,
+                RebaseStatus::Complete | RebaseStatus::Prepared
+            ),
+            "plan with unresolved-required must not be Complete/Prepared"
+        );
+        // The metadata encoder itself must REJECT an unresolved-required
+        // pointer — that is the hard fail-closed boundary (no silent rebase,
+        // no partial patch list). Assert the rejection is specifically the
+        // UnresolvedRequired class.
+        let err = super::super::runtime_bootstrap::encode_plan_metadata(&p).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unresolved-required"),
+            "encoder must reject unresolved-required pointers, got: {msg}"
+        );
+        // And the unknown qword is untouched in the captured payload: the
+        // plan never rewrote it (original bytes preserved in the region).
+        let c_idx = p
+            .regions
+            .iter()
+            .position(|r| r.old_base == 0x40_2000)
+            .expect("region C");
+        assert_eq!(
+            &p.regions[c_idx].bytes[8..16],
+            &0x7ff0_1234_0000u64.to_le_bytes(),
+            "unknown qword untouched by rebase"
+        );
+    }
+
+    #[test]
+    fn h2_module_base_change_rebases_image_pointers() {
+        // Old image base 0x140000000 -> new image base 0x180000000:
+        // an in-image pointer slot must be rebased by the delta, not left stale.
+        let old_ib = 0x140_0000_00u64;
+        let new_ib = 0x180_0000_00u64;
+        let mut a = vec![0u8; 0x40];
+        a[0..8].copy_from_slice(&(old_ib + 0x1234).to_le_bytes());
+        let g = vec![global(0x1000, 0x40_0000, a, false)];
+        let slots = declared_slots_from_capture(&[], &g, &[]);
+        let plan = build_runtime_rebase_plan(
+            &[],
+            &g,
+            &[],
+            &slots,
+            &ExternalResolverTable::new(),
+            &[],
+            old_ib,
+            new_ib,
+        )
+        .expect("plan")
+        .expect("Some");
+        let slot = plan
+            .pointers
+            .iter()
+            .find(|s| s.source_offset == 0 && s.source_region == 0)
+            .expect("slot");
+        assert_eq!(slot.classification, PointerClassification::InImage);
+        assert!(plan.plan_complete);
+    }
 }
