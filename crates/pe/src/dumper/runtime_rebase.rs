@@ -1543,6 +1543,16 @@ pub fn build_external_resolvers_from_imports(
             let Some(att) = attribute_external(live, module_map) else {
                 continue;
             };
+            // GTO-COLD-START-HEAP-REBASE-1 H2 (attempt_013 wall): two import
+            // thunks can resolve to the SAME (module, export rva) — forwarder
+            // DLLs (e.g. wsock32 forwarding to ws2_32) and alias imports both
+            // reference one underlying export. That is one resolver, not a
+            // conflict: dedup by (module, rva), keep the first thunk's IAT
+            // slot (any slot resolves the same export at cold start).
+            let key = (att.module_identity.clone(), att.module_rva);
+            if table.get(&key.0, key.1).is_some() {
+                continue;
+            }
             let target = ExternalTarget {
                 module_identity: att.module_identity.clone(),
                 module_rva: att.module_rva,
@@ -3460,6 +3470,61 @@ mod tests {
         CaptureExtentEvidence, CaptureExtentKind, CapturePath,
     };
     use super::*;
+
+    /// GTO-COLD-START-HEAP-REBASE-1 H2 (attempt_013 wall): two import
+    /// thunks whose live IAT values land in the SAME (module, export rva)
+    /// — forwarder DLLs (wsock32 -> ws2_32) and alias imports — must dedup
+    /// to ONE resolver instead of failing the rebase plan.
+    #[test]
+    fn h2_duplicate_external_resolver_dedups() {
+        use crate::import_table::{ImportModule, ImportTableBuilder, ImportThunk};
+        let imports = ImportTableBuilder {
+            modules: vec![ImportModule {
+                name: "wsock32.dll".to_string(),
+                thunks: vec![
+                    ImportThunk {
+                        iat_address: 0x12c000,
+                        function_name: Some("socket".to_string()),
+                        ordinal: None,
+                        is_64bit: true,
+                    },
+                    ImportThunk {
+                        iat_address: 0x12c008,
+                        function_name: Some("accept".to_string()),
+                        ordinal: None,
+                        is_64bit: true,
+                    },
+                ],
+            }],
+            is_64bit: true,
+        };
+        // Both live values land in ws2_32.dll at the SAME export rva
+        // (forwarder aliases both point to one underlying export).
+        let module_map = vec![
+            (
+                "wsock32.dll".to_string(),
+                0x7ff8_1000_0000u64,
+                0x7ff8_1000_3000u64,
+            ),
+            (
+                "ws2_32.dll".to_string(),
+                0x7ff8_2000_0000u64,
+                0x7ff8_2000_40000u64,
+            ),
+        ];
+        let ws2_export = 0x7ff8_2000_0000u64 + 0x25770;
+        let table = build_external_resolvers_from_imports(&imports, &module_map, &|slot| {
+            if slot == 0x12c000 || slot == 0x12c008 {
+                Some(ws2_export)
+            } else {
+                None
+            }
+        })
+        .expect("forwarder-alias duplicate must dedup, not fail");
+        assert_eq!(table.len(), 1, "one resolver for the shared export");
+        let r = table.get("ws2_32.dll", 0x25770);
+        assert!(r.is_some(), "resolver keyed by (module, rva)");
+    }
 
     fn container(rva: u32, begin: u64, end: u64, cap: u64, content: Vec<u8>) -> ContainerSnapshot {
         ContainerSnapshot {
