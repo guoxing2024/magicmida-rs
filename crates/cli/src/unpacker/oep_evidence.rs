@@ -113,24 +113,23 @@ pub(super) fn write_oep_evidence(
     // H4-B: decode the cold-start entry chain from candidate bytes. If the
     // candidate's PE EP is a .boot stub whose epilogue jmps to the provenance
     // RVA, the chain is accepted as the entry evidence (machine-code proof).
-    // Generic families (e.g. ahk_gto) get the chain fields; the Oreans
-    // family sidecar stays byte-compatible with the frozen acceptance schema.
-    let chain = if mida_core::runner_config::packer_family::is_generic_family(family) {
-        decode_boot_entry_chain(&candidate_bytes, final_entry_rva)
-    } else {
-        None
-    };
+    // H4-B: the chain fields are structural — a cold-start candidate's PE EP
+    // is a .boot stub whose epilogue jmps to the observed OEP. Decode is
+    // attempted for every family; the fields are serialized only when a chain
+    // was actually decoded (skip_serializing_if None), so the Oreans family
+    // sidecar stays byte-compatible with the frozen acceptance schema (no
+    // .boot candidate -> no chain fields).
+    let chain = decode_boot_entry_chain(&candidate_bytes, final_entry_rva);
     let chain_decoded = chain.is_some();
     let chain_oep_matches_provenance =
         chain_decoded && provenance.rva == chain.as_ref().map(|c| c.oep_target_rva);
-    // Oreans family: chain fields are None so the serialized sidecar stays
-    // byte-compatible with the frozen acceptance schema.
-    let (chain_decoded_field, chain_matches_field) =
-        if mida_core::runner_config::packer_family::is_generic_family(family) {
-            (Some(chain_decoded), Some(chain_oep_matches_provenance))
-        } else {
-            (None, None)
-        };
+    // Chain fields are emitted only when a chain was actually decoded; a
+    // candidate without .boot (e.g. Oreans) gets no chain fields, keeping the
+    // Oreans family sidecar byte-compatible with the frozen acceptance schema.
+    let (chain_decoded_field, chain_matches_field) = match &chain {
+        Some(_) => (Some(chain_decoded), Some(chain_oep_matches_provenance)),
+        None => (None, None),
+    };
     let core_passes = provenance.application_oep_prerequisite_passes();
     let prerequisite_passes =
         core_passes && (entry_rva_matches_provenance || chain_oep_matches_provenance);
@@ -190,6 +189,13 @@ pub(super) fn write_oep_evidence(
 /// no .boot section / no epilogue -> None.
 fn decode_boot_entry_chain(candidate_bytes: &[u8], final_entry_rva: u32) -> Option<EntryChain> {
     let pe = PeHeader::from_bytes(candidate_bytes).ok()?;
+    eprintln!(
+        "H4B-DBG sections={:?}",
+        pe.sections
+            .iter()
+            .map(|s| (s.name.as_str(), s.virtual_address, s.raw_offset, s.raw_size))
+            .collect::<Vec<_>>()
+    );
     // Locate the .boot section; fall back to the section containing the EP.
     let boot = pe.sections.iter().find(|s| s.name == ".boot").or_else(|| {
         pe.sections.iter().find(|s| {
