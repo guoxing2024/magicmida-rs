@@ -1,0 +1,136 @@
+# GTO-H5-LIVE-3 覆盖率测量设计说明（WO-701）
+
+**依据**: GTO-H5-LIVE-AUTHORIZATION-3 §二.3 + 批次 7 工单 WO-701
+**性质**: 离线设计（零代码）；WO-702 实现须先获本设计批准
+**执行**: 唯一 worker · 2026-08-22
+**状态**: DESIGN — 待总指挥批准
+
+---
+
+## 一、目标与定义
+
+将"执行驱动解密"从定性假设变为**量化事实**：测量 .rdata0/.rdata2/.pdata 的页面级解密覆盖率（B 相空间扫描），据此判定 dump 式路线天花板。
+
+**覆盖率定义**（授权 §二.3）：B 相扫描中**熵 < 6.5** 的条带占比（分节统计）。
+**阈值依据**：R1/R2 实测密文熵 7.4-7.9；解密后代码/数据 < 6.5（Round 2 C1 判据同口径）。
+
+## 二、条带扫描实现口径（64KB 步长 × 4KB 样本）
+
+### 2.1 偏移表（确定性生成，写入实现）
+
+对每节 virtual_size，条带 i 的采样 RVA = section_va + i × 64KB，采样长度 = min(4KB, 剩余)，i = 0..⌈vsize/64KB⌉-1：
+
+| 节 | vsize (B) | 条带数 | 采样点 RVA 范围 |
+|---|---|---|---|
+| .rdata2 | 24,607,744 | **376** | 0x15a3000 + i×0x10000, i∈[0,376) |
+| .rdata0 | 21,026,845 | **321** | 0x191000 + i×0x10000, i∈[0,321) |
+| .pdata | 43,524 | **11** | 0x185000 + i×0x1000, i∈[0,11)（全量 4KB） |
+
+采样 VA = image_base(0x140000000) + RVA。偏移表在实现中为**确定性生成**（纯函数，见 §七 T2），不硬编码。
+
+### 2.2 RPM 读失败页处理（unreadable）
+
+**选择：计入分母，不计入分子（即视为未解密）**。论证：
+- 读失败（ERROR_PARTIAL_COPY / 页未提交）意味着该页**不可读** → 不可能含已解密代码（解密后页必可读）→ 归类未解密是保守且正确的
+- 若不计入分母会**人为抬高覆盖率**（删掉最难读的页），违背 fail-closed 原则
+- 记录 `unreadable` 计数供审计；若 unreadable 占比 >20% 触发 fail-closed（§六 F2）
+
+### 2.3 每次扫描预计耗时预算
+
+| 节 | 条带数 | 每带 RPM 耗时(估) | 小计 |
+|---|---|---|---|
+| .rdata2 | 376 | ~1ms | ~0.4s |
+| .rdata0 | 321 | ~1ms | ~0.3s |
+| .pdata | 11 | ~1ms | ~0.01s |
+| **合计** | 708 | | **< 1s**（预算上限 5s，超时 fail-closed） |
+
+## 三、扫描时点触发器
+
+| 时点 | 触发条件 | 动作 |
+|---|---|---|
+| t0 | 进程就绪（CreateProcess 后主线程恢复 + 500ms settle） | 首次 B 相全扫 + A 相锚点采样 |
+| 主窗口出现 | UI-window watch 复用：`process_has_window_class(pid, "NewClassName")` 变 true（gto_host.rs 既有） | B 相全扫（带时间戳） |
+| +60s | 主窗口出现后 60s | B 相全扫 |
+| +180s | 主窗口出现后 180s | B 相全扫 |
+| 观察结束 | 末次扫描后 +5s 或 300s 硬上限 | 最终 B 相全扫 + 决策 |
+
+**A 相锚点连续流**：t0 起每 500ms 对 .rdata0/.rdata2/.pdata 节首 4KB 采样熵（沿用 R2 口径），形成时间动态基线（与 B 相空间数据互补）。
+
+## 四、交互协议（窗口激活/前台化）
+
+允许（Win32 消息级）：
+- 被动等待窗口出现（EnumWindows/FindWindow 只读）
+- `SetForegroundWindow` / `BringWindowToTop` / `ShowWindow`（前台化，无内容注入）
+- `PostMessage(hwnd, WM_ACTIVATE)` 等消息级操作（仅激活，不携带数据）
+
+禁止（重申授权 §四）：
+- ❌ 向控件注入内容（SetWindowText/SendMessage with data）
+- ❌ 凭据尝试（无键盘/鼠标合成）
+- ❌ 任何目标内存写入（WriteProcessMemory 等）
+- ❌ DRx/VEH/注入/bypass/semantic repair
+
+## 五、dump 决策规则（≥60% 判定的精确算式）
+
+**决策输入**：末次 B 相扫描（观察结束时点）数据。
+
+**精确算式**：
+```
+cover_r2 = decrypted_strips_r2 / total_strips_r2
+其中：total_strips_r2 = 376（固定）
+      decrypted_strips_r2 = #{i : entropy(strip_i) < 6.5}
+      unreadable 计入分母、不计入分子（§二.2）
+锚点条件 = (entropy(.rdata0_anchor) < 6.5) AND (entropy(.rdata2_anchor) < 6.5)
+决策 = (cover_r2 >= 0.60) AND 锚点条件
+```
+
+**数据来源**：B 相末次扫描（.rdata2 376 条带熵数组 + 锚点采样）；A 相时间线仅作动态佐证。
+
+**决策三分支**：
+| 分支 | 条件 | 动作 |
+|---|---|---|
+| DUMP | cover_r2 ≥ 60% 且锚点 <6.5 | 同轮 dump + loader smoke N≥3 |
+| STOP（数据即交付） | 覆盖率 < 60% 或锚点未解密 | 如实记录覆盖率后停止 |
+| FAIL-CLOSED | 见 §六 | 不 dump、不决策、记录原因 |
+
+## 六、fail-closed 表
+
+| # | 条件 | 动作 |
+|---|---|---|
+| F1 | 身份预检 mismatch | 即停，不耗轮 |
+| F2 | unreadable 占比 >20% | 中止扫描（数据不可信），记录原因 |
+| F3 | 单次扫描耗时 >5s | 中止（观察窗被饿死风险） |
+| F4 | 主窗口 300s 内未出现 | 以 t0/60s/180s 数据收尾，按现有数据决策（窗口未现 = 交互不足，如实记录） |
+| F5 | RPM 连续 5 次失败 | 等价 F2 |
+| F6 | 授权变量缺席 | CLI 拒绝（与 LIVE-2 同机制） |
+
+## 七、离线单测方案
+
+| # | 测试 | 验证点 |
+|---|---|---|
+| T1 | 覆盖率纯函数 | 给定熵数组 → cover_r2 精确计算；unreadable 计入分母 |
+| T2 | 条带偏移生成确定性 | 相同输入 → 相同偏移表（376/321/11 条带断言） |
+| T3 | 决策规则三分支 | 构造 ≥60%+锚点 → DUMP；<60% → STOP；unreadable>20% → FAIL |
+| T4 | unreadable 边界 | 0% / 20% / 21% 三种情况的计数与决策 |
+| T5 | 扫描耗时预算 | 静态断言条带数 × 预算上限（<5s 可达成性） |
+| T6 | 熵 API 复用 | shannon_entropy_bits 与 R2 同口径（确定性） |
+
+全部离线（无真实样本），复用 mida-pe 测试基建。
+
+## 八、实现落点（WO-702 预告，不在本单实现）
+
+- 新模块 `crates/pe/src/dumper/coverage_measure.rs`（条带表生成 + B 相扫描 + 覆盖率纯函数）
+- `dump_process` 分支：dump_timing 扩展或新增 `--coverage-measure` 开关（设计批准后定）
+- CLI 授权门：`MIDA_GTO_LIVE3_AUTHORIZED=1`（沿用 LIVE-2 模式，manifest 记审计凭证）
+- 侧车：`coverage_timeline.json`（A 相时间线 + 各时点 B 相覆盖率表 + 空间分布）— **无论结局全量落盘（A2 惯例）**
+
+## 九、与 R1/R2 的关键区别（授权原文）
+
+- R1/R2 只在节首采样 4KB，回答"是否解密"；
+- 本轮 B 相空间扫描（.rdata2 每 64KB 取点 ≈376 点）回答"多少页解密、什么空间分布、随时间怎么长"；
+- 这才是判定 dump 式天花板的数据。
+
+## 十、非声明
+
+- 本设计零代码；实现须另批（WO-702）
+- 覆盖率高低均为有效交付（数据即交付）
+- 不声称 perfect unpack/product 1.0/墙已破
