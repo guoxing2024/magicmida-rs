@@ -61,10 +61,10 @@ pub use exception_final::{
     ExceptionPreservationComparison,
 };
 pub use exception_observation::{
-    observe_exception_runtime, ExceptionDirectoryStatus, ExceptionObservationReport,
-    RuntimeFunctionObservation, RuntimeFunctionStatus, UnwindCodeObservation, UnwindCodeStatus,
-    UnwindInfoObservation, UnwindInfoStatus, MAX_EXCEPTION_DIRECTORY_BYTES,
-    UNWIND_INFO_HEADER_SIZE,
+    observe_exception_runtime, ChainInfoObservation, ChainInfoStatus, ExceptionDirectoryStatus,
+    ExceptionObservationReport, RuntimeFunctionObservation, RuntimeFunctionStatus,
+    UnwindCodeObservation, UnwindCodeStatus, UnwindInfoObservation, UnwindInfoStatus,
+    MAX_EXCEPTION_DIRECTORY_BYTES, UNWIND_INFO_HEADER_SIZE,
 };
 pub use exception_table::{
     minimal_x64_unwind_info, ExceptionTableBuilder, RuntimeFunction, RUNTIME_FUNCTION_SIZE,

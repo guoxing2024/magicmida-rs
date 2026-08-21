@@ -50,6 +50,15 @@ pub(crate) struct UnwindCodeEvidence {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct ChainInfoEvidence {
+    pub begin_address: u32,
+    pub end_address: u32,
+    pub unwind_info_address: u32,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct UnwindInfoEvidence {
     pub function_index: u32,
     pub version: u8,
@@ -60,6 +69,7 @@ pub(crate) struct UnwindInfoEvidence {
     pub frame_offset: u8,
     pub codes: Vec<UnwindCodeEvidence>,
     pub handler_rva: Option<u32>,
+    pub chain: Option<ChainInfoEvidence>,
     pub status: String,
 }
 
@@ -204,6 +214,12 @@ fn unwind_to_evidence(u: &mida_pe::UnwindInfoObservation) -> UnwindInfoEvidence 
             })
             .collect(),
         handler_rva: u.handler_rva,
+        chain: u.chain.as_ref().map(|c| ChainInfoEvidence {
+            begin_address: c.begin_address,
+            end_address: c.end_address,
+            unwind_info_address: c.unwind_info_address,
+            status: c.status.to_string(),
+        }),
         status: u.status.to_string(),
     }
 }

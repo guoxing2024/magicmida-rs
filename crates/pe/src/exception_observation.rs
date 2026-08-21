@@ -158,6 +158,29 @@ pub struct UnwindCodeObservation {
     pub slot_status: UnwindCodeStatus,
 }
 
+/// Classification of one chained RUNTIME_FUNCTION (UNW_FLAG_CHAININFO tail).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainInfoStatus {
+    Valid,
+    /// Begin/End/UnwindInfoAddress outside SizeOfImage — blocker.
+    OutOfRange,
+    /// BeginAddress >= EndAddress — blocker.
+    BeginNotLessEnd,
+    /// chained 12-byte tuple could not be fully read — blocker.
+    ShortRead,
+}
+
+impl fmt::Display for ChainInfoStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Valid => "Valid",
+            Self::OutOfRange => "OutOfRange",
+            Self::BeginNotLessEnd => "BeginNotLessEnd",
+            Self::ShortRead => "ShortRead",
+        })
+    }
+}
+
 /// One UNWIND_INFO structure observation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnwindInfoObservation {
@@ -169,9 +192,22 @@ pub struct UnwindInfoObservation {
     pub frame_register: u8,
     pub frame_offset: u8,
     pub codes: Vec<UnwindCodeObservation>,
-    /// Chained/exception handler RVA (UNW_FLAG_EHANDLER|UHANDLER|CHAININFO).
+    /// Exception handler RVA (UNW_FLAG_EHANDLER|UHANDLER only).
     pub handler_rva: Option<u32>,
+    /// Full chained RUNTIME_FUNCTION (UNW_FLAG_CHAININFO only) — a complete
+    /// 12-byte tuple; never derived from/reusing handler_rva (P5).
+    pub chain: Option<ChainInfoObservation>,
     pub status: UnwindInfoStatus,
+}
+
+/// The chained RUNTIME_FUNCTION tuple (BeginAddress/EndAddress/
+/// UnwindInfoAddress) parsed from the UNW_FLAG_CHAININFO optional tail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainInfoObservation {
+    pub begin_address: u32,
+    pub end_address: u32,
+    pub unwind_info_address: u32,
+    pub status: ChainInfoStatus,
 }
 
 /// Complete runtime exception observation captured at the dump boundary.
@@ -505,6 +541,7 @@ fn observe_unwind_info<F, E>(
             frame_offset: 0,
             codes: Vec::new(),
             handler_rva: None,
+            chain: None,
             status: UnwindInfoStatus::ShortRead,
         });
         report
@@ -523,6 +560,7 @@ fn observe_unwind_info<F, E>(
             frame_offset: 0,
             codes: Vec::new(),
             handler_rva: None,
+            chain: None,
             status: UnwindInfoStatus::ShortRead,
         });
         report.blockers.push(format!(
@@ -554,6 +592,7 @@ fn observe_unwind_info<F, E>(
             frame_offset: 0,
             codes: Vec::new(),
             handler_rva: None,
+            chain: None,
             status: UnwindInfoStatus::ShortRead,
         });
         return;
@@ -582,9 +621,20 @@ fn observe_unwind_info<F, E>(
     // SizeOfImage (E8); read codes within the image, then validate the bound.
     let code_bytes = u32::from(count_of_codes) * 2;
     let padded_bytes = align_up_4(code_bytes);
-    let total = UNWIND_INFO_HEADER_SIZE as u32 + padded_bytes;
+    // P5: the optional tail must be counted in the span: EHANDLER/UHANDLER
+    // add 4 bytes (handler RVA); CHAININFO adds a full 12-byte RUNTIME_FUNCTION.
+    let mut total = UNWIND_INFO_HEADER_SIZE as u32 + padded_bytes;
+    if flags & (UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER) != 0 {
+        total = total.checked_add(4).unwrap_or(u32::MAX);
+    }
+    if flags & UNW_FLAG_CHAININFO != 0 {
+        total = total
+            .checked_add(RUNTIME_FUNCTION_SIZE as u32)
+            .unwrap_or(u32::MAX);
+    }
     let mut codes = Vec::with_capacity(usize::from(count_of_codes));
     let mut handler_rva: Option<u32> = None;
+    let mut chain: Option<ChainInfoObservation> = None;
     let mut codes_valid = true;
     if u64::from(unwind_info_rva) + u64::from(total) > u64::from(size_of_image) {
         status = UnwindInfoStatus::CodesOutOfBounds;
@@ -610,16 +660,52 @@ fn observe_unwind_info<F, E>(
                 slot_status: UnwindCodeStatus::Valid,
             });
         }
-        // Handler slot after the codes, on the 4-byte-aligned boundary
+        // Optional tail after the codes, on the 4-byte-aligned boundary
         // (GTO-H4-D: the slot is at header + align_up(code_bytes, 4), NOT
         // header + code_bytes — odd count_of_codes leaves 1 padding byte).
-        if flags & (UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER | UNW_FLAG_CHAININFO) != 0 {
-            let handler_addr = addr
-                .checked_add(UNWIND_INFO_HEADER_SIZE as u64 + padded_bytes as u64)
-                .unwrap_or(u64::MAX);
+        // P5: EHANDLER/UHANDLER read a 4-byte handler RVA; CHAININFO reads a
+        // full 12-byte RUNTIME_FUNCTION (Begin/End/UnwindInfoAddress) — the
+        // chain tuple is NEVER treated as a handler RVA.
+        let tail_addr = addr
+            .checked_add(UNWIND_INFO_HEADER_SIZE as u64 + padded_bytes as u64)
+            .unwrap_or(u64::MAX);
+        if flags & (UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER) != 0 {
             let mut hbuf = [0u8; 4];
-            if reader(handler_addr, &mut hbuf).is_ok_and(|n| n == 4) {
+            if reader(tail_addr, &mut hbuf).is_ok_and(|n| n == 4) {
                 handler_rva = Some(u32::from_le_bytes([hbuf[0], hbuf[1], hbuf[2], hbuf[3]]));
+            }
+        }
+        if flags & UNW_FLAG_CHAININFO != 0 {
+            let mut cbuf = [0u8; RUNTIME_FUNCTION_SIZE];
+            let read_ok = reader(tail_addr, &mut cbuf).is_ok_and(|n| n == RUNTIME_FUNCTION_SIZE);
+            if read_ok {
+                let begin_address = u32::from_le_bytes([cbuf[0], cbuf[1], cbuf[2], cbuf[3]]);
+                let end_address = u32::from_le_bytes([cbuf[4], cbuf[5], cbuf[6], cbuf[7]]);
+                let unwind_info_address =
+                    u32::from_le_bytes([cbuf[8], cbuf[9], cbuf[10], cbuf[11]]);
+                let mut cstatus = ChainInfoStatus::Valid;
+                if begin_address >= size_of_image
+                    || end_address > size_of_image
+                    || unwind_info_address >= size_of_image
+                {
+                    cstatus = ChainInfoStatus::OutOfRange;
+                }
+                if cstatus == ChainInfoStatus::Valid && begin_address >= end_address {
+                    cstatus = ChainInfoStatus::BeginNotLessEnd;
+                }
+                chain = Some(ChainInfoObservation {
+                    begin_address,
+                    end_address,
+                    unwind_info_address,
+                    status: cstatus,
+                });
+            } else {
+                chain = Some(ChainInfoObservation {
+                    begin_address: 0,
+                    end_address: 0,
+                    unwind_info_address: 0,
+                    status: ChainInfoStatus::ShortRead,
+                });
             }
         }
     }
@@ -627,12 +713,14 @@ fn observe_unwind_info<F, E>(
         status = UnwindInfoStatus::CodesOutOfBounds;
     }
 
-    // E11: CHAININFO chained unwind RVA inside the image.
-    if status == UnwindInfoStatus::Valid
-        && flags & UNW_FLAG_CHAININFO != 0
-        && handler_rva.is_some_and(|h| h >= size_of_image)
-    {
-        status = UnwindInfoStatus::InvalidChain;
+    // E11: CHAININFO chain tuple fully valid (read, in-image, Begin<End).
+    if status == UnwindInfoStatus::Valid && flags & UNW_FLAG_CHAININFO != 0 {
+        let bad = !chain
+            .as_ref()
+            .is_some_and(|c| c.status == ChainInfoStatus::Valid);
+        if bad {
+            status = UnwindInfoStatus::InvalidChain;
+        }
     }
     // E12: EHANDLER/UHANDLER handler inside executable sections.
     if status == UnwindInfoStatus::Valid && flags & (UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER) != 0 {
@@ -648,6 +736,7 @@ fn observe_unwind_info<F, E>(
                 frame_offset,
                 codes,
                 handler_rva,
+                chain,
                 status: UnwindInfoStatus::HandlerOutsideExec,
             });
             return;
@@ -668,6 +757,7 @@ fn observe_unwind_info<F, E>(
         frame_offset,
         codes,
         handler_rva,
+        chain,
         status,
     });
 }
@@ -1217,6 +1307,178 @@ mod tests {
             .unwind_infos
             .iter()
             .any(|u| u.status == UnwindInfoStatus::InvalidFlags));
+    }
+
+    // GTO-H4-D-P5: UNWIND_CODE field order must be byte[0]=CodeOffset,
+    // byte[1] low nibble=UnwindOp, byte[1] high nibble=OpInfo.
+    #[test]
+    fn p5_unwind_code_field_order() {
+        let pe = test_pe(0x1000, 12, 0x4000);
+        let mut mem = vec![0u8; 0x5000];
+        mem[0x1000..0x100c].copy_from_slice(&valid_table_1());
+        mem[0x2000..0x2004].copy_from_slice(&[0x00, 0x10, 0x01, 0x00]); // 1 code
+                                                                        // slot: byte[0]=0x05 (CodeOffset), byte[1]=0x42 (UnwindOp=2, OpInfo=4)
+        mem[0x2004] = 0x05;
+        mem[0x2005] = 0x42;
+        let report = observe_exception_runtime(
+            &pe,
+            0x140000000,
+            0x140000000,
+            memory_reader(&mem, 0x140000000),
+        );
+        assert!(report.is_complete(), "{}", report.failure_summary());
+        let c = &report.unwind_infos[0].codes[0];
+        assert_eq!(c.code_offset, 0x05, "CodeOffset = byte[0]");
+        assert_eq!(c.unwind_op, 0x02, "UnwindOp = byte[1] low nibble");
+        assert_eq!(c.op_info, 0x04, "OpInfo = byte[1] high nibble");
+    }
+
+    // GTO-H4-D-P5: CHAININFO parses a full 12-byte RUNTIME_FUNCTION tail.
+    #[test]
+    fn p5_chaininfo_full_12_byte_tuple() {
+        let pe = test_pe(0x1000, 12, 0x4000);
+        let mut mem = vec![0u8; 0x5000];
+        mem[0x1000..0x100c].copy_from_slice(&valid_table_1());
+        mem[0x2000] = 0x04 << 3; // flags=CHAININFO
+        mem[0x2001] = 0x10;
+        mem[0x2002] = 0x00; // 0 codes
+        mem[0x2003] = 0x00;
+        // 12-byte chain tuple @0x2004
+        mem[0x2004..0x2008].copy_from_slice(&0x1000u32.to_le_bytes()); // Begin
+        mem[0x2008..0x200c].copy_from_slice(&0x1100u32.to_le_bytes()); // End
+        mem[0x200c..0x2010].copy_from_slice(&0x2000u32.to_le_bytes()); // UnwindInfoAddress
+        let report = observe_exception_runtime(
+            &pe,
+            0x140000000,
+            0x140000000,
+            memory_reader(&mem, 0x140000000),
+        );
+        assert!(report.is_complete(), "{}", report.failure_summary());
+        let u = &report.unwind_infos[0];
+        assert_eq!(u.status, UnwindInfoStatus::Valid);
+        let c = u.chain.as_ref().expect("chain parsed");
+        assert_eq!(c.status, ChainInfoStatus::Valid);
+        assert_eq!(c.begin_address, 0x1000);
+        assert_eq!(c.end_address, 0x1100);
+        assert_eq!(c.unwind_info_address, 0x2000);
+        assert_eq!(u.handler_rva, None, "chain must not populate handler_rva");
+    }
+
+    // GTO-H4-D-P5: CHAININFO tail truncated (12B -> 4B) is fail-closed.
+    #[test]
+    fn p5_chaininfo_tail_truncated_fails_closed() {
+        let pe = test_pe(0x1000, 12, 0x4000);
+        let mut mem = vec![0xccu8; 0x5000];
+        mem[0x1000..0x100c].copy_from_slice(&valid_table_1());
+        mem[0x2000] = 0x04 << 3; // flags=CHAININFO
+        mem[0x2001] = 0x10;
+        mem[0x2002] = 0x00;
+        mem[0x2003] = 0x00;
+        // Only 4 bytes of the 12-byte tail exist (rest is beyond SizeOfImage
+        // boundary at 0x4000) — memory_reader fails on the full 12-byte read.
+        let report = observe_exception_runtime(
+            &pe,
+            0x140000000,
+            0x140000000,
+            memory_reader(&mem, 0x140000000),
+        );
+        assert!(!report.is_complete(), "truncated chain must fail closed");
+        assert!(report
+            .unwind_infos
+            .iter()
+            .any(|u| u.status == UnwindInfoStatus::InvalidChain));
+    }
+
+    // GTO-H4-D-P5: CHAININFO Begin >= End is fail-closed.
+    #[test]
+    fn p5_chaininfo_begin_not_less_end_fails_closed() {
+        let pe = test_pe(0x1000, 12, 0x4000);
+        let mut mem = vec![0u8; 0x5000];
+        mem[0x1000..0x100c].copy_from_slice(&valid_table_1());
+        mem[0x2000] = 0x04 << 3;
+        mem[0x2001] = 0x10;
+        mem[0x2002] = 0x00;
+        mem[0x2003] = 0x00;
+        mem[0x2004..0x2008].copy_from_slice(&0x1100u32.to_le_bytes()); // Begin >= End
+        mem[0x2008..0x200c].copy_from_slice(&0x1100u32.to_le_bytes());
+        mem[0x200c..0x2010].copy_from_slice(&0x2000u32.to_le_bytes());
+        let report = observe_exception_runtime(
+            &pe,
+            0x140000000,
+            0x140000000,
+            memory_reader(&mem, 0x140000000),
+        );
+        assert!(!report.is_complete(), "Begin>=End chain must fail closed");
+        assert!(report
+            .unwind_infos
+            .iter()
+            .any(|u| u.status == UnwindInfoStatus::InvalidChain));
+    }
+
+    // GTO-H4-D-P5: CHAININFO RVA out of image is fail-closed.
+    #[test]
+    fn p5_chaininfo_rva_out_of_image_fails_closed() {
+        let pe = test_pe(0x1000, 12, 0x4000);
+        let mut mem = vec![0u8; 0x5000];
+        mem[0x1000..0x100c].copy_from_slice(&valid_table_1());
+        mem[0x2000] = 0x04 << 3;
+        mem[0x2001] = 0x10;
+        mem[0x2002] = 0x00;
+        mem[0x2003] = 0x00;
+        mem[0x2004..0x2008].copy_from_slice(&0x1000u32.to_le_bytes());
+        mem[0x2008..0x200c].copy_from_slice(&0x1100u32.to_le_bytes());
+        mem[0x200c..0x2010].copy_from_slice(&0x8000u32.to_le_bytes()); // out of image
+        let report = observe_exception_runtime(
+            &pe,
+            0x140000000,
+            0x140000000,
+            memory_reader(&mem, 0x140000000),
+        );
+        assert!(!report.is_complete(), "out-of-image chain must fail closed");
+        assert!(report
+            .unwind_infos
+            .iter()
+            .any(|u| u.status == UnwindInfoStatus::InvalidChain));
+    }
+
+    // GTO-H4-D-P5: EHANDLER tail truncated (4B beyond image) is fail-closed.
+    #[test]
+    fn p5_eh_handler_tail_truncated_fails_closed() {
+        let pe2 = test_pe(0x1000, 12, 0x4000);
+        let mut mem = vec![0xccu8; 0x4000];
+        // unwind at 0x3ffc: header + 4-byte handler crosses SizeOfImage.
+        mem[0x3ffc] = 0x01 << 3;
+        mem[0x3ffd] = 0x10;
+        mem[0x3ffe] = 0x00;
+        mem[0x3fff] = 0x00;
+        let pe2 = test_pe(0x1000, 12, 0x4000);
+        let mut t = Vec::new();
+        t.extend_from_slice(&0x1000u32.to_le_bytes());
+        t.extend_from_slice(&0x1100u32.to_le_bytes());
+        t.extend_from_slice(&0x3ffcu32.to_le_bytes());
+        mem[0x1000..0x100c].copy_from_slice(&t);
+        let report = observe_exception_runtime(
+            &pe2,
+            0x140000000,
+            0x140000000,
+            memory_reader(&mem, 0x140000000),
+        );
+        assert!(
+            !report.is_complete(),
+            "truncated EH handler must fail closed"
+        );
+        assert!(report
+            .unwind_infos
+            .iter()
+            .any(|u| u.status == UnwindInfoStatus::CodesOutOfBounds));
+    }
+
+    fn valid_table_1() -> Vec<u8> {
+        let mut t = Vec::new();
+        t.extend_from_slice(&0x1000u32.to_le_bytes());
+        t.extend_from_slice(&0x1100u32.to_le_bytes());
+        t.extend_from_slice(&0x2000u32.to_le_bytes());
+        t
     }
 
     #[test]
