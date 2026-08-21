@@ -135,7 +135,7 @@ snapshots):
   previous stage evidence); new stages create new versioned dirs
 - Commits: docs-only for boundary/report; code changes must pass
   cargo fmt --all -- --check, cargo test --workspace --offline (baseline
-  1885 passed / 0 failed / 2 ignored), git diff --check, hygiene script
+  2248 passed / 0 failed / 1 ignored / 1 doctest failed (b5_tls_capture.rs:17, ADR7-era legacy), full workspace, re-verified 2026-08-21 under vcvars64 MSVC env; WO-C subset count 1271; prior ledger 1885 stale — see docs/GTO_WORKSPACE_VERIFICATION_2026-08-21.md), git diff --check, hygiene script
 - No samples/binaries committed to git; vault paths recorded logically
 
 ## 8. Ledger
@@ -145,12 +145,12 @@ snapshots):
 | H0 boundary | ACTIVE (this doc) | docs/GTO_COLD_START_HEAP_REBASE_1_BOUNDARY.md |
 | H1 cold-start failure timeline | DONE (obs. report) | docs/GTO_COLD_START_HEAP_REBASE_1_H1_REPORT.md |
 | H2 rebasing primitives | DONE (plan layer; stub execution deferred to H4) | docs/GTO_COLD_START_HEAP_REBASE_1_H2_REPORT.md |
-| H3 cold-start wall | pending | (next) |
+| H3 cold-start wall | **absorbed into H4** (cold-start wall crossed via H4 live runs: 3 ASLR layouts reached bootstrap_install fail-closed boundary; H3 exit criteria folded into H4 stage gates — documented per WO-001) | docs/GTO_COLD_START_HEAP_REBASE_1_H1_REPORT.md (obs. timeline), H4 stage evidence |
 | H4-A SMR (ViaStableBinding stub exec) | TECHNICAL PASS + LIVE EVIDENCE (3 ASLR layouts, exit 0, unresolved_required=0/0/0) | docs/GTO_COLD_START_HEAP_REBASE_1_H4A_SMR_DESIGN.md, docs/GTO_COLD_START_HEAP_REBASE_1_H4A_REPORT.md; evidence H4A_smr/ + H4A_smr/layout_B/ |
-| H4-B OEP entry-chain evidence | TECHNICAL PASS; evidence package PARTIAL (attempt_001 raw log unrecoverable; formal seal/sign-off NOT granted — see GTO-H4-LEDGER-CONSISTENCY-1) | docs/GTO_COLD_START_HEAP_REBASE_1_H4B_REPORT.md |
+| H4-B OEP entry-chain evidence | TECHNICAL PASS; evidence package PARTIAL (attempt_001 raw log unrecoverable); **formal seal/sign-off NOT GRANTED** — see GTO-H4-LEDGER-CONSISTENCY-1 | docs/GTO_COLD_START_HEAP_REBASE_1_H4B_REPORT.md |
 | H4-C TLS directory+evidence | TECHNICAL PASS + 3-layout evidence PASS; Seal-2 verifier PASS (48/48 size+sha, 0 missing, 0 unexpected, self-hash MATCH); formal sign-off PENDING review disposition | docs/GTO_COLD_START_HEAP_REBASE_1_H4C_TLS_DESIGN.md, docs/GTO_COLD_START_HEAP_REBASE_1_H4C_REPORT.md; evidence H4C_tls/ (seal GTO-H4-C-EVIDENCE-SEAL-2); verifier tools/gto_h4c_seal/ |
-| H4-D exception+no-reloc | DESIGN COMPLETE (GTO-H4-D-DESIGN-1: D1-D6 frozen); live NOT started; 待 GTO-H4-D-LIVE-AUTHORIZATION-1 | docs/GTO_COLD_START_HEAP_REBASE_1_H4D_DESIGN.md; evidence H4D_exception_no_reloc/ (design_metadata + schemas + negative_tests records) |
-| H5 acceptance | pending | (next) |
+| H4-D exception+no-reloc | DESIGN COMPLETE (GTO-H4-D-DESIGN-1); **LIVE RUNS COMPLETED** (H4-D P6 3/3 ASLR layouts via observation channel, no-reloc preserved); **FORMAL PASS granted (owner 行国胜 signed 2026-08-21T05:43:00.962Z; GTO-H4-D-P6-FORMAL-SIGNOFF.json); H5 ADMIN UNLOCK — live matrix NOT authorized** | docs/GTO_COLD_START_HEAP_REBASE_1_H4D_DESIGN.md; evidence H4D_exception_no_reloc/, H4D_P6_corrected_final/, H4D_P6_validation/ |
+| H5 acceptance | **BLOCKED_AT_LOADER_SMOKE** (loader smoke 9/9 exit 0xC0000005; bounded behavior INCONCLUSIVE; R0B static + negative controls PASS; H5 NOT signing; GTO-H5-LIVE-AUTHORIZATION-2 NOT granted; root cause PENDING — r9 encrypted-region boundary) | docs/GTO_H5_LOADER_WALL_ROOT_CAUSE.md, docs/GTO_H5_STARTUP_ORDER_ATTRIBUTION_REPORT.md, docs/GTO_H5_R9_ORIGIN_CAUSAL_PROOF_REPORT.md; evidence H5_acceptance_1/, H5_crash_attribution_A/, H5_resolver_causal_proof/, H5_r9_origin_proof/ |
 | H6 Oreans regression | pending | (next) |
 
 ## 9. Non-claims (binding)
