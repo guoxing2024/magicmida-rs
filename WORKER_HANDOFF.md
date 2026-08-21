@@ -976,3 +976,34 @@ used=2 / cap=2 / remaining=0 (final Route C round; no R3)
 - **Known loss (honest record):** `MidaVaultlabevidenceadr7b_b3B3_RVA_EXACT_LOCATION_REPORT.md` was deleted during cleanup after vault archive copy failed (file was never in git, unrecoverable). Content = ADR7-B3 RVA localization (fault RVA 0x2edb6); does NOT affect B4/B5 closure (B4 fault RVA 0x2e806, independent observer validation). Recovery source: `D:\MidaVault\lab\evidence\adr7b_b3\` or original.
 - **B4 = FORMAL PASS** (user independent spot-check; seal 115 files / 0 mismatch; vault `adr7b_b4/`). **B5 = FORMAL PASS** (2026-08-20, ADR7-B5-FORMAL-SIGNOFF-1; vault `adr7b_b5/`; overlay sign-off registered in `D:\MidaVault\lab\evidence\ADR7_CLOSEOUT_INDEX.json`). Closeout: `docs/ADR7_CLOSEOUT_REPORT.md`, verifier `tools/verify_adr7_closeout.ps1`.
 - Handover doc: `docs/PROJECT_HANDOVER_20260820.md` (layout, commands, cleanup record, maintenance rules).
+---
+
+## K. Batch 2/3 acceptance record (2026-08-21)
+
+### Commits (local only, no push)
+
+- `ee392b3` docs(gto): WO-001 audit corrections — honest stage states
+- `16fc51b` docs(gto): WO-002 rdata root cause + WO-004 verification record
+- `5d6f7d0` docs(gto): WO-102 H5 loader fix path design — path (d) selected, fail-closed R1-R4, design only
+- `5fbacc8` chore(gto): WO-103 workspace hygiene — doctest fence fix, clippy mechanical fixes (144/820), residue cleanup, verification notes
+- Batch 3 (WO-201/WO-202/WO-203): see git log (committed after verification).
+
+### Test baseline
+
+- `cargo test --workspace --offline` (vcvars64 MSVC): **2257 passed / 0 failed / 2 ignored / 0 doctest fail**.
+- CI dual lane (`cargo check --workspace --tests` / `--all-features --tests`, RUSTFLAGS=-D warnings): 0 error 0 warning.
+
+### Clippy decision (WO-202 freeze)
+
+- Actual scale: 820 warnings (WO-C said 15; superseded). 144 mechanically fixed (semantically equivalent, 52 files).
+- Remaining 676 **frozen**: CI has no clippy gate; behavior-sensitive refactors not offline-provable; bulk in H5 unauthorized area.
+- Future cleanup requires a dedicated order + H5 authorization.
+
+### Push status
+
+- Repository has **no remote** (`git remote -v` empty). Push pending owner-configured remote; then `git push -u origin oreans/two-sample-mainline`.
+
+### H5 status
+
+- `BLOCKED_AT_LOADER_SMOKE` unchanged; no CLOSED/DELIVERED claims.
+- PostSelfDecrypt implemented as skeleton only; live use requires GTO-H5-LIVE-AUTHORIZATION-2 (owner named sign-off).

@@ -66,3 +66,30 @@
 ### 6. 结论
 - WO-103 的 doctest、残留目录、CI 双 lane 复验：**完成**
 - clippy 清零：**部分完成**（144/820 机械修复；676 剩余需指示——前提"15 个"与现实 820 个不符）
+
+---
+
+## 五、WO-202 治理裁决（2026-08-21）
+
+### 1. clippy 676 剩余警告 — 冻结裁决
+
+总指挥裁决（批次 3 工单 WO-202 落账）：
+
+- **理由 1（CI 口径）**：CI 用 `RUSTFLAGS=-D warnings` 的 `cargo check`/`cargo test`（rustc 层），**不含 clippy**——clippy 非 CI 门，不阻断主线。
+- **理由 2（行为风险）**：剩余 676 个警告的主体（result_large_err 79、cloned_ref_to_slice_refs 52、too_many_arguments 90+、manual_saturating_arithmetic 15 等）属行为敏感重构，离线不可证等价。
+- **理由 3（授权边界）**：主体在 H5 核心未授权区（dumper/themida），修码冻结对生产路径有效。
+- **处置**：**冻结**——不做任何改动；未来清理需专单 + H5 授权。
+- 已完成的 144 个机械修复（WO-103）保持（语义等价、全量测试绿）。
+
+### 2. 仓库 remote 状态
+
+- `git remote -v` **为空**（仓库无 remote）。
+- push 待 owner 配置 remote 后，由 worker 执行 `git push -u origin oreans/two-sample-mainline`。
+- 当前所有提交均为本地提交（批次 2：ee392b3/16fc51b/5d6f7d0/5fbacc8；批次 3：见 git log）。
+
+### 3. 批次 2/3 验收摘要（详见 WORKER_HANDOFF.md）
+
+- 基线：2257 passed / 0 failed / 2 ignored / 0 doctest fail（WO-103 doctest 修复后）。
+- WO-102 设计文档：`docs/GTO_H5_LOADER_FIX_PATH_DESIGN.md`（路径 d + fail-closed R1-R4）。
+- WO-201 实现：DumpTiming/R1/R2/CLI 骨架（本批次）。
+- H5 状态不变：`BLOCKED_AT_LOADER_SMOKE`；无 CLOSED/DELIVERED 声称。
