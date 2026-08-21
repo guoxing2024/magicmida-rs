@@ -90,7 +90,7 @@ fn authority_wrong_size_fails() {
 fn authority_missing_file_fails() {
     let authority = manifest(&"00".repeat(32), 1);
     let err = authority
-        .verify_file(&std::path::Path::new("C:/definitely/not/here/nope.dll"))
+        .verify_file(std::path::Path::new("C:/definitely/not/here/nope.dll"))
         .unwrap_err();
     assert!(matches!(err, RuntimeLoadError::AuthorityUnavailable(..)));
 }

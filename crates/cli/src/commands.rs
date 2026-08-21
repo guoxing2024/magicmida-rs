@@ -1235,7 +1235,7 @@ mod tests {
             gto_staged.display()
         );
         assert!(
-            !gto_staged.starts_with(&snapshot_root(root.as_path())),
+            !gto_staged.starts_with(snapshot_root(root.as_path())),
             "GTO staged input must NOT be under the default output-dir/sample-snapshots"
         );
         // The Oreans staged inputs remain their caller sources (not snapshotted).

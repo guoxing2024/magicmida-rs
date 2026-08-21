@@ -760,8 +760,8 @@ fn synthetic_provider(
         protected_input_size_bytes: lunlun_size,
     };
     move |case_id| match case_id {
-        "origin_macro" => Some(origin.clone()),
-        "lunlun_software" => Some(lunlun.clone()),
+        "origin_macro" => Some(origin),
+        "lunlun_software" => Some(lunlun),
         _ => None,
     }
 }

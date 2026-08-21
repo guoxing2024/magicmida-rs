@@ -928,7 +928,7 @@ fn run_acceptance_on_envelope(
         dir.join("lunlun_candidate.exe").display().to_string(),
     ];
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    Command::new(&acceptance_bin())
+    Command::new(acceptance_bin())
         .args(&arg_refs)
         .output()
         .expect("spawn acceptance binary")
@@ -1094,7 +1094,7 @@ fn identity_swap_envelopes_are_pairwise_distinct_after_canonicalization() {
         case_entry_with_policy("origin_macro", ORIGIN_SHA, ORIGIN_SIZE, false),
     ]);
 
-    let docs = vec![
+    let docs = [
         ("baseline", baseline),
         ("case_id-only", case_id_only),
         ("protected_input-only", protected_input_only),

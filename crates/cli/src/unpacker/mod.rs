@@ -1408,7 +1408,7 @@ pub fn unpack(
                         if dbg.read_memory(remote_addr, &mut name_byte).is_ok()
                             && name_byte[0] == b'i'
                         {
-                            let patch = [b'p'];
+                            let patch = *b"p";
                             if dbg.write_memory(remote_addr, &patch).is_ok() {
                                 info!(
                                     addr = format_args!("{remote_addr:#x}"),

@@ -30,12 +30,12 @@ use super::session::ProcessSession;
 /// Caller has already created the process, captured early snapshots, resumed
 /// the main thread, and applied plugin session defaults.
 pub(super) fn run_post_attach_path(
-    mut dbg: &mut ProcessSession,
-    mut state: &mut ThemidaState,
-    mut pe: &mut PeHeader,
-    mut packer: &mut SelectedPacker,
-    mut plugin_ctx: &mut PluginCtx,
-    mut early_section_snapshots: &mut Vec<EarlySectionSnapshot>,
+    dbg: &mut ProcessSession,
+    state: &mut ThemidaState,
+    pe: &mut PeHeader,
+    packer: &mut SelectedPacker,
+    plugin_ctx: &mut PluginCtx,
+    early_section_snapshots: &mut Vec<EarlySectionSnapshot>,
     is_dotnet: bool,
     is_64bit: bool,
     do_data_sections: bool,
@@ -220,7 +220,7 @@ pub(super) fn run_post_attach_path(
                         break;
                     }
                 } else {
-                    update_pre_text_snapshots(&dbg, &mut early_section_snapshots, rip)?;
+                    update_pre_text_snapshots(dbg, early_section_snapshots, rip)?;
                 }
             }
             let _ = unsafe { ResumeThread(h_thread) };
@@ -247,13 +247,9 @@ pub(super) fn run_post_attach_path(
         ),
     );
 
-    refresh_early_snapshots_after_loader(&dbg, &mut early_section_snapshots)?;
-    merge_reinitializable_data_state(
-        &dbg,
-        &mut early_section_snapshots,
-        pe.size_of_image() as usize,
-    )?;
-    log_snapshot_summary(&early_section_snapshots, "selected pre-.text baseline");
+    refresh_early_snapshots_after_loader(dbg, early_section_snapshots)?;
+    merge_reinitializable_data_state(dbg, early_section_snapshots, pe.size_of_image() as usize)?;
+    log_snapshot_summary(early_section_snapshots, "selected pre-.text baseline");
 
     // Verify .text is decrypted.
     let mut sample = [0u8; 16];
@@ -323,7 +319,7 @@ pub(super) fn run_post_attach_path(
     plugin_ctx.ensure_runtime_base(image_base_usize as u64);
     let provenance = post_attach_oep_provenance(frozen_rip, oep_addr, fallback_evidence);
     packer.note_oep_accepted(
-        &mut plugin_ctx,
+        plugin_ctx,
         oep_addr as u64,
         frozen_rip.is_none(), // scan / PE-EP when RIP was outside .text
     );
@@ -337,17 +333,14 @@ pub(super) fn run_post_attach_path(
         plugin_ctx.oep_provenance.rva,
         plugin_ctx.oep_rva.map(|rva| rva.get()),
     );
-    let post_attach_advice = enter_dump_phase(
-        &mut packer,
-        &mut plugin_ctx,
-        "PackerPlugin dump_advice (post-attach)",
-    );
+    let post_attach_advice =
+        enter_dump_phase(packer, plugin_ctx, "PackerPlugin dump_advice (post-attach)");
 
     // Go straight to post-loop phases (IAT repair, dump, postprocess).
     run_post_loop_phases(
-        &mut dbg,
-        &mut state,
-        &mut pe,
+        dbg,
+        state,
+        pe,
         Some(oep_addr),
         is_dotnet,
         is_64bit,
@@ -363,16 +356,16 @@ pub(super) fn run_post_attach_path(
         profile,
         pure_rebuild,
         capture_policy,
-        &early_section_snapshots,
+        early_section_snapshots,
         input,
-        &output_path,
+        output_path,
         plugin_ctx.oep_rva,
         &plugin_ctx.oep_provenance,
         post_attach_advice,
     )?;
 
     log::log(LogType::Good, "Done.");
-    return Ok(());
+    Ok(())
 }
 
 /// AHK/GTO variant of the shared post-attach skeleton (G1).
@@ -462,18 +455,18 @@ fn run_gto_post_attach(
         "GTO post-attach observation selected OEP VA {oep_addr:#x}"
     ));
     let provenance = post_attach_oep_provenance(frozen_rip, oep_addr, fallback_evidence);
-    packer.note_oep_accepted(&mut plugin_ctx, oep_addr as u64, frozen_rip.is_none());
+    packer.note_oep_accepted(plugin_ctx, oep_addr as u64, frozen_rip.is_none());
     plugin_ctx.record_oep_provenance(provenance);
     let post_attach_advice = enter_dump_phase(
-        &mut packer,
-        &mut plugin_ctx,
+        packer,
+        plugin_ctx,
         "PackerPlugin dump_advice (GTO post-attach)",
     );
 
     run_post_loop_phases(
-        &mut dbg,
-        &mut state,
-        &mut pe,
+        dbg,
+        state,
+        pe,
         Some(oep_addr),
         is_dotnet,
         is_64bit,

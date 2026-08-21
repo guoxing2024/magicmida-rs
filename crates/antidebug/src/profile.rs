@@ -217,12 +217,11 @@ pub fn validate_hard_required(
     known_surfaces: &[&str],
 ) -> Result<(), ProfileError> {
     for s in &profile.surfaces {
-        if s.class == SurfaceClass::HardRequired {
-            if !known_surfaces.contains(&s.surface_id.as_str()) {
-                return Err(ProfileError::UnknownSurfaceInHardRequired(
-                    s.surface_id.clone(),
-                ));
-            }
+        if s.class == SurfaceClass::HardRequired && !known_surfaces.contains(&s.surface_id.as_str())
+        {
+            return Err(ProfileError::UnknownSurfaceInHardRequired(
+                s.surface_id.clone(),
+            ));
         }
     }
     Ok(())

@@ -189,7 +189,7 @@ pub fn transition(
         fail_code: code,
     };
 
-    let ret = match (state, event) {
+    match (state, event) {
         // ---------------- success path ----------------
         (S::Unresolved, E::DependenciesVerified) => {
             mk(S::DependencyVerified, E::DependenciesVerified, None)
@@ -313,8 +313,7 @@ pub fn transition(
             evidence_events: vec![EvidenceEvent::new(s, e, sequence, None)],
             fail_code: None,
         },
-    };
-    ret
+    }
 }
 
 /// Drive a full success path from `Unresolved` to `Proceed`.

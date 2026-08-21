@@ -1870,20 +1870,20 @@ mod tests {
 
         // Select the size-100 one exactly (by full (sha, size) key).
         let dec_100 = reject_decision(&d, &sha, 100);
-        let out = apply_decision(&d, &dec_100, &root_of(&d), &Path::new("gto_launcher.json"))
+        let out = apply_decision(&d, &dec_100, &root_of(&d), Path::new("gto_launcher.json"))
             .expect("decision must select the size-100 revision by (sha,size)");
         assert_eq!(out, DecisionOutcome::RejectRevision);
 
         // Select the size-200 one exactly.
         let dec_200 = reject_decision(&d, &sha, 200);
-        let out = apply_decision(&d, &dec_200, &root_of(&d), &Path::new("gto_launcher.json"))
+        let out = apply_decision(&d, &dec_200, &root_of(&d), Path::new("gto_launcher.json"))
             .expect("decision must select the size-200 revision by (sha,size)");
         assert_eq!(out, DecisionOutcome::RejectRevision);
 
         // A nonexistent size fails closed (not ambiguous).
         let dec_300 = reject_decision(&d, &sha, 300);
-        let err = apply_decision(&d, &dec_300, &root_of(&d), &Path::new("gto_launcher.json"))
-            .unwrap_err();
+        let err =
+            apply_decision(&d, &dec_300, &root_of(&d), Path::new("gto_launcher.json")).unwrap_err();
         assert!(
             err.contains("not in the dossier"),
             "nonexistent size fails closed: {err}"
@@ -1931,7 +1931,7 @@ mod tests {
             ],
         };
         let err =
-            apply_decision(&d, &dec, &root_of(&d), &Path::new("gto_launcher.json")).unwrap_err();
+            apply_decision(&d, &dec, &root_of(&d), Path::new("gto_launcher.json")).unwrap_err();
         assert!(
             err.contains("not canonical lowercase"),
             "non-canonical sha: {err}"

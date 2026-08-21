@@ -228,9 +228,8 @@ mod tests {
     fn contains_gate_profile_in_help() -> bool {
         // Re-derive the help fragment: the GENERIC OPTIONS block lists
         // --gate-profile. We assert by re-running the same lines.
-        let help = concat!(
-            "  --gate-profile <P>      Gate profile: packer-agnostic (default) | ahk-launcher\n"
-        );
+        let help =
+            "  --gate-profile <P>      Gate profile: packer-agnostic (default) | ahk-launcher\n";
         help.contains("--gate-profile")
     }
 

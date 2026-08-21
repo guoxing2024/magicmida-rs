@@ -416,12 +416,7 @@ fn semantic_reject_wrapper_targets(
 /// Returns `Some` only when the full `[off, off+len)` slice is present.
 /// Truncated call bodies (e.g. sentinel-only tail) or truncated jmp prologues
 /// must not satisfy semantic checks via a partial window.
-fn target_window<'a>(
-    text_bytes: &'a [u8],
-    text_rva: u32,
-    target_rva: u32,
-    len: usize,
-) -> Option<&'a [u8]> {
+fn target_window(text_bytes: &[u8], text_rva: u32, target_rva: u32, len: usize) -> Option<&[u8]> {
     if target_rva < text_rva {
         return None;
     }

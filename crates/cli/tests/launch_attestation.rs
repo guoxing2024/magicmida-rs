@@ -381,7 +381,7 @@ fn launch_unpack_with_verifier(
         Some(v) => cli_with_verifier(dir, v),
         None => real_cli_bin(),
     };
-    let args = vec![
+    let args = [
         "/unpack".to_string(),
         input.to_str().unwrap().to_string(),
         "--output".to_string(),
@@ -973,7 +973,7 @@ fn schema_drift_rejected_by_runner_and_acceptance() {
             cases[1].1.display().to_string(),
             cases[1].2.display().to_string(),
         ];
-        let direct = Command::new(&acceptance_bin())
+        let direct = Command::new(acceptance_bin())
             .args(&verifier_args)
             .output()
             .expect("spawn acceptance binary");

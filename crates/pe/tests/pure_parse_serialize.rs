@@ -31,7 +31,7 @@ fn build_minimal_pe(kind: PeKind) -> Vec<u8> {
 
     let nt_size = 4usize + 20 + opt_size as usize;
     let headers_end = e_lfanew as usize + nt_size + 40; // one section
-    let size_of_headers = ((headers_end as u32 + FA - 1) / FA) * FA;
+    let size_of_headers = (headers_end as u32).div_ceil(FA) * FA;
     let text_raw = FA;
     let total = size_of_headers + text_raw;
     let mut buf = vec![0u8; total as usize];

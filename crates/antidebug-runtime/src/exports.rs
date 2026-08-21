@@ -404,8 +404,7 @@ fn get_attestation_inner(out_buf: *mut u8, buf_len: usize, out_written: *mut usi
 /// - No pointer arguments; safe to call once from the initializing thread.
 #[no_mangle]
 pub unsafe extern "C" fn MidaAntidebugShutdown() -> i32 {
-    std::panic::catch_unwind(|| shutdown_inner())
-        .unwrap_or(MidaAntidebugError::InternalPanic.as_i32())
+    std::panic::catch_unwind(shutdown_inner).unwrap_or(MidaAntidebugError::InternalPanic.as_i32())
 }
 
 fn shutdown_inner() -> i32 {

@@ -62,14 +62,14 @@ fn gate_vectors_match_rust_implementation() {
         let profile = profile_from_str(&v.profile);
         let r = validate_generic_dump(inputs, profile);
         assert_eq!(r.pass, v.expected_pass, "vector {} pass mismatch", v.name);
-        let got_failures: Vec<&str> = r.failures.iter().copied().collect();
+        let got_failures: Vec<&str> = r.failures.to_vec();
         let want_failures: Vec<&str> = v.expected_failures.iter().map(|s| s.as_str()).collect();
         assert_eq!(
             got_failures, want_failures,
             "vector {} failures mismatch",
             v.name
         );
-        let got_warnings: Vec<&str> = r.warnings.iter().copied().collect();
+        let got_warnings: Vec<&str> = r.warnings.to_vec();
         let want_warnings: Vec<&str> = v.expected_warnings.iter().map(|s| s.as_str()).collect();
         assert_eq!(
             got_warnings, want_warnings,

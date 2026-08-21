@@ -1716,11 +1716,12 @@ fn freeze_process_threads_impl(
             te.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
             if Thread32First(snap, &mut te).is_ok() {
                 loop {
-                    if te.th32OwnerProcessID == pid && te.th32ThreadID != current {
-                        if !seen.contains(&te.th32ThreadID) {
-                            seen.insert(te.th32ThreadID);
-                            new_this_round.push(te.th32ThreadID);
-                        }
+                    if te.th32OwnerProcessID == pid
+                        && te.th32ThreadID != current
+                        && !seen.contains(&te.th32ThreadID)
+                    {
+                        seen.insert(te.th32ThreadID);
+                        new_this_round.push(te.th32ThreadID);
                     }
                     if Thread32Next(snap, &mut te).is_err() {
                         break;
@@ -2169,20 +2170,13 @@ impl WindowsDebugger {
                     // Unified lifecycle: continue once on pending identity, then
                     // surface an error (do not continue inside decode).
                     let cont = self.continue_pending(thread_id, ContinueStatus::Continue);
-                    if let Err(e) = cont {
-                        return Err(e);
-                    }
+                    cont?;
                     return Err(CoreError::Windows(0));
                 }
                 DecodeDisposition::Deliver => {}
             }
 
-            let ev = match Self::decode_event(&raw) {
-                Ok(event) => event,
-                // Unhandled exception codes still leave the event pending for
-                // the outer loop / continue path; surface the error as-is.
-                Err(e) => return Err(e),
-            };
+            let ev = Self::decode_event(&raw)?;
 
             // ADR7-B4: debugger-side event recording (main loop path).
             // Runtime DLL detection + observation-point installation happen
@@ -2353,8 +2347,8 @@ impl WindowsDebugger {
             Ok(ctx) => {
                 #[cfg(target_arch = "x86_64")]
                 {
-                    receipt.instruction_pointer = Some(ctx.Rip as u64);
-                    receipt.stack_pointer = Some(ctx.Rsp as u64);
+                    receipt.instruction_pointer = Some(ctx.Rip);
+                    receipt.stack_pointer = Some(ctx.Rsp);
                 }
                 #[cfg(target_arch = "x86")]
                 {
@@ -3433,7 +3427,7 @@ mod tests {
         // Use a pseudo-handle sentinel that CloseHandle will reject 闁?we never
         // actually drop the guard in this test, so no kernel handle is
         // released.  This isolates the as_raw behaviour from the Drop path.
-        let sentinel = HANDLE(-1 as isize as *mut std::ffi::c_void);
+        let sentinel = HANDLE(-1_isize as *mut std::ffi::c_void);
         let g = ScopedThreadHandle::new(sentinel);
         assert_eq!(
             g.as_raw(),

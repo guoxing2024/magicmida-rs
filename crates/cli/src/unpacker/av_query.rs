@@ -154,6 +154,6 @@ impl AvOepQuery for AvQueryCtx<'_> {
             .map_err(|e| e.to_string())?;
         ctx.Rip = rip;
         ctx.Rsp = ctx.Rsp.wrapping_add(rsp_delta);
-        set_thread_context_control(&mut *self.dbg, thread_id, &ctx).map_err(|e| e.to_string())
+        set_thread_context_control(&*self.dbg, thread_id, &ctx).map_err(|e| e.to_string())
     }
 }

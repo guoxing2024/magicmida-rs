@@ -348,10 +348,9 @@ pub fn resolve_security_init_cookie(
             func_rva,
             site.cookie_rva,
             site.complement_rva,
-        ) {
-            if !candidates.contains(&func_rva) {
-                candidates.push(func_rva);
-            }
+        ) && !candidates.contains(&func_rva)
+        {
+            candidates.push(func_rva);
         }
     }
 

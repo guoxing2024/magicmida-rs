@@ -68,7 +68,7 @@ pub const AHK_EXPORT_NAMES: &[&str] = &["AhkExec", "AHKEXEC", "AddScript", "ADDS
 /// matching semantics.
 #[must_use]
 pub fn is_ahk_export_name(name: &str) -> bool {
-    AHK_EXPORT_NAMES.iter().any(|n| *n == name)
+    AHK_EXPORT_NAMES.contains(&name)
 }
 
 /// Which set of hard gates to enforce.

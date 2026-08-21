@@ -190,7 +190,7 @@ impl DebugEventLifecycle {
             // Known deliverable event codes:
             // EXCEPTION=1 CREATE_THREAD=2 CREATE_PROCESS=3 EXIT_THREAD=4
             // EXIT_PROCESS=5 LOAD_DLL=6 UNLOAD_DLL=7
-            1 | 2 | 3 | 4 | 5 | 6 | 7 => DecodeDisposition::Deliver,
+            1..=7 => DecodeDisposition::Deliver,
             _ => DecodeDisposition::IgnoreAndContinue, // unknown → ignore + continue
         }
     }

@@ -1838,7 +1838,7 @@ mod tests {
         let snap_root = root.join("snapshots");
         let dir = snap_root
             .join("gto_launcher")
-            .join(&sha256_hex(b"ATOMIC-CONTENT"));
+            .join(sha256_hex(b"ATOMIC-CONTENT"));
         fs::create_dir_all(&dir).unwrap();
         let temp = dir.join(".capturing-1-1-1.tmp");
         let target = dir.join(SNAPSHOT_FILENAME);
@@ -1873,7 +1873,7 @@ mod tests {
         let snap_root = root.join("snapshots");
         let dir = snap_root
             .join("gto_launcher")
-            .join(&sha256_hex(b"RACE-ADDRESS"));
+            .join(sha256_hex(b"RACE-ADDRESS"));
         fs::create_dir_all(&dir).unwrap();
         let target = dir.join(SNAPSHOT_FILENAME);
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(12));
@@ -2356,11 +2356,11 @@ mod tests {
         )
         .unwrap();
         // Replace root/gto_launcher with a junction to outside/gto_launcher.
-        std::fs::remove_dir_all(&root.join("gto_launcher")).unwrap();
+        std::fs::remove_dir_all(root.join("gto_launcher")).unwrap();
         let mklink = std::process::Command::new("cmd")
             .args(["/C", "mklink", "/J"])
-            .arg(&root.join("gto_launcher"))
-            .arg(&outside.join("gto_launcher"))
+            .arg(root.join("gto_launcher"))
+            .arg(outside.join("gto_launcher"))
             .output()
             .expect("mklink must be invocable");
         assert!(
@@ -2399,10 +2399,10 @@ mod tests {
         std::fs::create_dir_all(&outside).unwrap();
         std::fs::write(outside.join(SNAPSHOT_FILENAME), b"HASH-JUNCTION-CONTENT").unwrap();
         // Replace root/gto_launcher/<sha> with a junction to outside.
-        std::fs::remove_dir_all(&root.join("gto_launcher").join(&sha)).unwrap();
+        std::fs::remove_dir_all(root.join("gto_launcher").join(&sha)).unwrap();
         let mklink = std::process::Command::new("cmd")
             .args(["/C", "mklink", "/J"])
-            .arg(&root.join("gto_launcher").join(&sha))
+            .arg(root.join("gto_launcher").join(&sha))
             .arg(&outside)
             .output()
             .expect("mklink must be invocable");

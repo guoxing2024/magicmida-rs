@@ -1280,7 +1280,7 @@ mod tests {
                 .memory
                 .iter()
                 .find(|(start, data)| address >= **start && address < **start + data.len() as u64)
-                .ok_or_else(|| CoreError::MemoryRead {
+                .ok_or(CoreError::MemoryRead {
                     address,
                     requested: buf.len(),
                 })?;

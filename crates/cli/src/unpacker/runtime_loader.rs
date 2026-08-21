@@ -788,9 +788,7 @@ impl RuntimeLoader {
             // F-004: drain budget recomputed after the wait (see
             // remote_call_raw for the same pattern).
             let Some(wait_ms) = compute_wait_budget(deadline, 200) else {
-                return Err(RuntimeLoadError::RemoteCallFailed(format!(
-                    "LoadLibraryW remote thread timed out after 120000ms; thread may still hold the loader lock (path buffer retained)"
-                )));
+                return Err(RuntimeLoadError::RemoteCallFailed("LoadLibraryW remote thread timed out after 120000ms; thread may still hold the loader lock (path buffer retained)".to_string()));
             };
             let wait_ms = wait_ms as u32;
             let wait = unsafe { WaitForSingleObject(thread.handle, wait_ms) }.0;
@@ -798,9 +796,7 @@ impl RuntimeLoader {
                 RemoteWaitOutcome::Finished => break,
                 RemoteWaitOutcome::TimedOut => {
                     let Some(drain_ms) = compute_wait_budget(deadline, 200) else {
-                        return Err(RuntimeLoadError::RemoteCallFailed(format!(
-                            "LoadLibraryW remote thread timed out after 120000ms; thread may still hold the loader lock (path buffer retained)"
-                        )));
+                        return Err(RuntimeLoadError::RemoteCallFailed("LoadLibraryW remote thread timed out after 120000ms; thread may still hold the loader lock (path buffer retained)".to_string()));
                     };
                     drain(drain_ms as u32).map_err(|e| {
                         RuntimeLoadError::RemoteCallFailed(format!("drain failed: {e}"))
@@ -1600,7 +1596,7 @@ impl RuntimeLoader {
                 {
                     continue;
                 }
-                found[wi] = Some(module_base + func_rva as usize);
+                found[wi] = Some(module_base + func_rva);
             }
         }
         Ok(found)

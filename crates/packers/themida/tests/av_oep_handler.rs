@@ -105,7 +105,6 @@ impl AvOepQuery for ScriptedQuery {
         _exc_type: u8,
     ) -> Result<GuardAccessResult, String> {
         self.guarded
-            .clone()
             .ok_or_else(|| "no scripted guard result".to_string())
     }
     fn read_ret_addr(&mut self, _thread: u32) -> Option<u64> {
@@ -117,9 +116,7 @@ impl AvOepQuery for ScriptedQuery {
         _tls_total: u32,
         _tls_counter: &mut u32,
     ) -> Result<TlsCallbackResult, String> {
-        self.tls
-            .clone()
-            .ok_or_else(|| "no scripted tls result".to_string())
+        self.tls.ok_or_else(|| "no scripted tls result".to_string())
     }
     fn try_find_correct_oep(
         &mut self,

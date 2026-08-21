@@ -376,13 +376,13 @@ fn parse_final_candidate(bytes: &[u8]) -> anyhow::Result<FinalRelocationEvidence
         }
         let page_rva = read_u32(directory_bytes, cursor).unwrap();
         let block_size = read_u32(directory_bytes, cursor + 4).unwrap();
-        if block_size < 8 || block_size % 2 != 0 || block_size as usize > remaining {
+        if block_size < 8 || !block_size.is_multiple_of(2) || block_size as usize > remaining {
             evidence
                 .blockers
                 .push(format!("invalid base relocation block size {block_size}"));
             break;
         }
-        if page_rva >= evidence.size_of_image || page_rva % 0x1000 != 0 {
+        if page_rva >= evidence.size_of_image || !page_rva.is_multiple_of(0x1000) {
             evidence
                 .blockers
                 .push(format!("invalid base relocation page RVA {page_rva:#x}"));
@@ -572,7 +572,7 @@ fn simulate_aslr(final_candidate: &FinalRelocationEvidence) -> AslrSimulationEvi
         if new_base == preferred {
             case_blockers.push("simulated base is not different from preferred base".to_string());
         }
-        if final_candidate.pe32_plus == false
+        if !final_candidate.pe32_plus
             && new_base
                 .checked_add(u64::from(final_candidate.size_of_image))
                 .is_none()
@@ -758,7 +758,7 @@ fn same_file(left: &Path, right: &Path) -> anyhow::Result<bool> {
                 (u64::from(info.index_high) << 32) | u64::from(info.index_low),
             ))
         };
-        return Ok(identity(left)? == identity(right)?);
+        Ok(identity(left)? == identity(right)?)
     }
     #[cfg(unix)]
     {

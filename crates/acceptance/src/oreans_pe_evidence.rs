@@ -497,7 +497,7 @@ fn parse_tls(
     let start = read_u64_or_u32(image, directory_rva, image.optional.is_pe32_plus)?;
     let end = read_u64_or_u32(
         image,
-        add_rva(directory_rva, pointer_size as u32, "TLS end")?,
+        add_rva(directory_rva, pointer_size, "TLS end")?,
         image.optional.is_pe32_plus,
     )?;
     let index_offset = if image.optional.is_pe32_plus { 16 } else { 8 };
@@ -691,7 +691,7 @@ fn parse_exceptions(
             "x64 exception directory requires AMD64 PE32+",
         ));
     }
-    if directory_size == 0 || directory_size % 12 != 0 {
+    if directory_size == 0 || !directory_size.is_multiple_of(12) {
         return Err(err(
             "exception_size_invalid",
             "x64 exception directory size must be a non-zero multiple of 12",

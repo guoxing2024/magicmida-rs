@@ -888,7 +888,7 @@ fn cmd_check_with_behavior(args: &[String]) -> Result<i32, String> {
     // Note: `evidence` from CLI parse is used for *unsigned* paths only.
     // Signed path seals evidence from hashed JSON inside verify_bundle (audit P0).
     let mut envelope_file: Option<File> = None;
-    let mut report = if let (Some(ref env_path), Some(ref man_bytes), Some(_)) = (
+    let mut report = if let (Some(env_path), Some(man_bytes), Some(_)) = (
         resolved_envelope.as_ref(),
         manifest_bytes.as_ref(),
         managed.as_ref(),
@@ -1002,7 +1002,7 @@ fn cmd_check_with_behavior(args: &[String]) -> Result<i32, String> {
 
 fn hex_decode_key(s: &str) -> Result<Vec<u8>, String> {
     let t = s.trim();
-    if t.is_empty() || t.len() % 2 != 0 || !t.chars().all(|c| c.is_ascii_hexdigit()) {
+    if t.is_empty() || !t.len().is_multiple_of(2) || !t.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err("envelope HMAC key must be non-empty even-length hex".into());
     }
     let mut out = Vec::with_capacity(t.len() / 2);

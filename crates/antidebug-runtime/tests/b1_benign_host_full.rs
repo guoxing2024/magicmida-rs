@@ -128,7 +128,7 @@ fn main() {
         // Initialize.
         let profile_id = cstr("oreans_origin_x64_v1");
         let profile_digest = cstr("adr6-profile-digest-oreans_origin_x64_v1");
-        let expected = vec![
+        let expected = [
             cstr("AD-PROC-001"),
             cstr("AD-PROC-002"),
             cstr("AD-PROC-003"),

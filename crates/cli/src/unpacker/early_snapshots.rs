@@ -143,7 +143,7 @@ pub(super) fn refresh_early_snapshots_after_loader(
         // longer a safe BSS baseline — keep zeros.
         let polluted = candidate.chunks_exact(8).any(|chunk| {
             let v = u64::from_le_bytes(chunk.try_into().unwrap_or_default());
-            v >= 0x1_0000 && v <= 0xffff_ffff && (v & 7) == 0
+            (0x1_0000..=0xffff_ffff).contains(&v) && (v & 7) == 0
         });
         if polluted {
             log::log(

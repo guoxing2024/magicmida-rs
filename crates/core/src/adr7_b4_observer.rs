@@ -505,7 +505,7 @@ impl Adr7B4Observer {
                 opt_str(r.continuation.as_deref())
             ));
             if let Some(tls) = &r.tls_snapshot {
-                out.push_str(&format!("      \"tls_snapshot\": {{\n"));
+                out.push_str("      \"tls_snapshot\": {\n");
                 out.push_str(&format!("        \"tid\": {},\n", tls.tid));
                 out.push_str(&format!(
                     "        \"teb_address\": {},\n",

@@ -144,11 +144,8 @@ fn build_section_rebuild_evidence(
     let mut raw_ranges = Vec::new();
     for section in &pe.sections {
         let virtual_end = u64::from(section.virtual_address)
-            .checked_add(u64::from(section.virtual_size.max(section.raw_size)))
-            .unwrap_or(u64::MAX);
-        let raw_end = u64::from(section.raw_offset)
-            .checked_add(u64::from(section.raw_size))
-            .unwrap_or(u64::MAX);
+            .saturating_add(u64::from(section.virtual_size.max(section.raw_size)));
+        let raw_end = u64::from(section.raw_offset).saturating_add(u64::from(section.raw_size));
         if (section.characteristics & 0x2000_0000) != 0 {
             executable_sections.push(section.name.clone());
         }
@@ -256,7 +253,7 @@ fn build_section_rebuild_evidence(
         blockers.push("SizeOfImage is not section-aligned".to_string());
     }
     if sections.iter().any(|section| {
-        section.raw_end > candidate.size_bytes as u64
+        section.raw_end > candidate.size_bytes
             || (section.raw_size != 0
                 && (section.raw_offset % optional.file_alignment.max(1) != 0
                     || section.raw_size % optional.file_alignment.max(1) != 0))
@@ -460,7 +457,7 @@ fn same_file(left: &Path, right: &Path) -> anyhow::Result<bool> {
             }
             Ok((i.v, (u64::from(i.h) << 32) | u64::from(i.i)))
         };
-        return Ok(id(left)? == id(right)?);
+        Ok(id(left)? == id(right)?)
     }
     #[cfg(unix)]
     {

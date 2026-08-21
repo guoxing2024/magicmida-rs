@@ -422,10 +422,10 @@ fn file_identity(path: &Path) -> io::Result<Option<FileIdentity>> {
             return Err(io::Error::last_os_error());
         }
         let file_index = (u64::from(info.file_index_high) << 32) | u64::from(info.file_index_low);
-        return Ok(Some(FileIdentity {
+        Ok(Some(FileIdentity {
             volume_serial: info.volume_serial_number,
             file_index,
-        }));
+        }))
     }
     #[cfg(unix)]
     {
@@ -619,7 +619,7 @@ mod tests {
         let count_off = fh + 2;
         candidate[count_off..count_off + 2].copy_from_slice(&3u16.to_le_bytes());
         // Stub: fill with 0xcc then epilogue at raw end.
-        let raw_off = (sh + 0x28) as usize;
+        let raw_off = (sh + 0x28);
         let stub_len = 0x60usize;
         candidate.resize(raw_off + stub_len, 0);
         // epilogue at raw_off + 0x40

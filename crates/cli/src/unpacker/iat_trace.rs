@@ -68,7 +68,7 @@ impl IatTraceQuery for IatQueryCtx<'_> {
     }
 
     fn is_at_themida_vm(&mut self, ip: usize) -> bool {
-        mida_packers_themida::trace_imports::is_at_themida_vm(&mut *self.dbg, ip)
+        mida_packers_themida::trace_imports::is_at_themida_vm(&*self.dbg, ip)
     }
 
     fn resolve_exit_process(&mut self) -> Result<usize, String> {

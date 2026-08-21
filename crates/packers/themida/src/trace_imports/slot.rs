@@ -212,11 +212,7 @@ pub(crate) fn trace_one_slot(
                     address,
                     thread_id: _,
                 }
-                | DebugEvent::AccessViolation {
-                    address,
-                    thread_id: _,
-                    ..
-                } => {
+                | DebugEvent::AccessViolation { address, .. } => {
                     let desc = match &ev {
                         DebugEvent::Breakpoint { .. } => {
                             format!("unexpected breakpoint at {address:#x}")

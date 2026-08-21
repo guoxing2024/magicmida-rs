@@ -480,7 +480,7 @@ pub(crate) fn same_file(left: &Path, right: &Path) -> anyhow::Result<bool> {
     }
     #[cfg(windows)]
     {
-        return Ok(windows_file_identity(left)? == windows_file_identity(right)?);
+        Ok(windows_file_identity(left)? == windows_file_identity(right)?)
     }
     #[cfg(unix)]
     {

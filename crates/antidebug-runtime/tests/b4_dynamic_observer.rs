@@ -367,7 +367,7 @@ fn main() {
                 } else {
                     None
                 };
-                let int29 = rva.map_or(false, |r| INT29_SITES.contains(&(r as u32)));
+                let int29 = rva.is_some_and(|r| INT29_SITES.contains(&(r as u32)));
                 if int29 {
                     int29_hits += 1;
                 }

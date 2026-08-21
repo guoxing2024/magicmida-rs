@@ -320,7 +320,7 @@ impl SignatureEnvelope {
                 .value_hex
                 .chars()
                 .all(|c| c.is_ascii_hexdigit())
-            || env.signature.value_hex.len() % 2 != 0
+            || !env.signature.value_hex.len().is_multiple_of(2)
         {
             return Err(EnvelopeError::BadSignatureHex);
         }
@@ -561,7 +561,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn hex_decode(s: &str) -> Result<Vec<u8>, EnvelopeError> {
-    if s.len() % 2 != 0 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
+    if !s.len().is_multiple_of(2) || !s.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(EnvelopeError::BadSignatureHex);
     }
     let mut out = Vec::with_capacity(s.len() / 2);
@@ -606,7 +606,7 @@ fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
     let inner_hash = inner.finalize();
     let mut outer = Sha256::new();
     outer.update(opad);
-    outer.update(&inner_hash);
+    outer.update(inner_hash);
     let out = outer.finalize();
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&out);

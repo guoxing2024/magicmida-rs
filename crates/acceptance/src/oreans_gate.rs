@@ -841,7 +841,11 @@ fn validate_pe_evidence(
     if evidence.size_of_headers == 0 {
         failures.push("structured PE evidence size_of_headers is zero".to_string());
     }
-    if evidence.file_alignment != 0 && evidence.size_of_headers % evidence.file_alignment != 0 {
+    if evidence.file_alignment != 0
+        && !evidence
+            .size_of_headers
+            .is_multiple_of(evidence.file_alignment)
+    {
         failures.push("structured PE evidence size_of_headers is not file-aligned".to_string());
     }
     if evidence.size_of_headers as u64 > candidate.size_bytes {
@@ -850,7 +854,11 @@ fn validate_pe_evidence(
     if evidence.size_of_headers > evidence.size_of_image {
         failures.push("structured PE evidence size_of_headers exceeds size_of_image".to_string());
     }
-    if evidence.section_alignment != 0 && evidence.size_of_image % evidence.section_alignment != 0 {
+    if evidence.section_alignment != 0
+        && !evidence
+            .size_of_image
+            .is_multiple_of(evidence.section_alignment)
+    {
         failures.push("structured PE evidence size_of_image is not section-aligned".to_string());
     }
     if evidence.entry_rva >= evidence.size_of_image {
@@ -1558,7 +1566,7 @@ fn validate_iat_report(report: &OreansIatReportEvidence, pe32_plus: bool) -> Vec
     if report.requested_bytes == 0 {
         failures.push("requested_bytes must be nonzero".to_string());
     }
-    if report.slot_size == 0 || report.requested_bytes % report.slot_size != 0 {
+    if report.slot_size == 0 || !report.requested_bytes.is_multiple_of(report.slot_size) {
         failures.push("requested_bytes is not slot-aligned".to_string());
     }
     if report.bytes_read != report.requested_bytes {
@@ -2623,7 +2631,7 @@ fn validate_relocation_evidence(
     if !sorted_unique_u8(&final_candidate.observed_types) {
         failures.push("final relocation observed_types must be sorted and unique".to_string());
     }
-    if final_candidate.dynamic_base == false {
+    if !final_candidate.dynamic_base {
         failures.push("final relocation DYNAMIC_BASE is not set".to_string());
     }
     if final_candidate.relocs_stripped {
@@ -2700,7 +2708,7 @@ fn validate_relocation_evidence(
             || detail.entry_count != final_candidate.entry_count
             || detail.non_absolute_entry_count != final_candidate.non_absolute_entry_count
             || detail.observed_types != final_candidate.observed_types
-            || detail.all_targets_in_image == false
+            || !detail.all_targets_in_image
             || detail.dynamic_base != final_candidate.dynamic_base
             || detail.relocs_stripped != final_candidate.relocs_stripped
         {
@@ -2810,7 +2818,10 @@ fn validate_section_rebuild_evidence(
     }
     if evidence.size_of_headers == 0
         || u64::from(evidence.size_of_headers) > candidate.size_bytes
-        || (evidence.file_alignment != 0 && evidence.size_of_headers % evidence.file_alignment != 0)
+        || (evidence.file_alignment != 0
+            && !evidence
+                .size_of_headers
+                .is_multiple_of(evidence.file_alignment))
     {
         failures.push("SizeOfHeaders is not aligned or does not fit candidate".to_string());
     }

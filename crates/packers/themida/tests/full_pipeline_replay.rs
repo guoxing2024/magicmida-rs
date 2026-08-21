@@ -110,9 +110,7 @@ impl AvOepQuery for AvScript {
         _tls_total: u32,
         _tls_counter: &mut u32,
     ) -> Result<TlsCallbackResult, String> {
-        self.tls
-            .clone()
-            .ok_or_else(|| "no scripted tls".to_string())
+        self.tls.ok_or_else(|| "no scripted tls".to_string())
     }
     fn try_find_correct_oep(
         &mut self,
@@ -305,7 +303,7 @@ fn host_actions_map_to_exactly_one_continue() {
     // is exactly {continue-with-trap, continue-with-context, trace-slot,
     // finished}. Count per action kind: 4 distinct actions, each executed
     // once by the host.
-    let actions = vec![
+    let actions = [
         IatTraceAction::ContinueWithTrap,
         IatTraceAction::ContinueWithContext {
             rip: 0x1000,
@@ -322,7 +320,7 @@ fn host_actions_map_to_exactly_one_continue() {
     ];
     assert_eq!(actions.len(), 4, "exactly four action variants");
     // AV side likewise: three action variants.
-    let av_actions = vec![
+    let av_actions = [
         AvOepAction::Continue,
         AvOepAction::Break {
             oep: OEP,

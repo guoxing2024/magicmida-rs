@@ -14,12 +14,14 @@
 //! panic_count::increase (entry RVA 0x2eda0) reads its per-thread state from
 //! the module TLS slot:
 //!
-//!     TEB + 0x58                    -> TLS array pointer (ThreadLocalStoragePointer)
-//!     TLS array[ tls_index ]        -> module TLS slot pointer (rdx at 0x2edbf)
-//!     slot + 0x18                   -> LOCAL_PANIC_COUNT counter (u64)
-//!     slot + 0x20                   -> LOCAL_PANIC_COUNT in-panic flag (u8)
-//!     _tls_index (RVA 0x575b4)      -> module TLS index (mov eax,[_tls_index]
-//!                                      at 0x2edaa, verified via cdb symbol x)
+//! ```text
+//! TEB + 0x58                    -> TLS array pointer (ThreadLocalStoragePointer)
+//! TLS array[ tls_index ]        -> module TLS slot pointer (rdx at 0x2edbf)
+//! slot + 0x18                   -> LOCAL_PANIC_COUNT counter (u64)
+//! slot + 0x20                   -> LOCAL_PANIC_COUNT in-panic flag (u8)
+//! _tls_index (RVA 0x575b4)      -> module TLS index (mov eax,[_tls_index]
+//!                                  at 0x2edaa, verified via cdb symbol x)
+//! ```
 //!
 //! The fault site observed in the B4 active matrix (0xc0000005 @ 0x2edcf =
 //! the counter increment) indicates the counter write faulted; the

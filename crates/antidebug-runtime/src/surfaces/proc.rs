@@ -221,7 +221,7 @@ impl PebView {
         }
         let b = mem
             .read_bytes(addr, 1)
-            .map_err(|e| SurfaceError::MemoryAccess(e))?;
+            .map_err(SurfaceError::MemoryAccess)?;
         Ok(b[0])
     }
 
@@ -232,7 +232,7 @@ impl PebView {
             return Err(SurfaceError::PebNotWritable { addr, len: 1 });
         }
         mem.write_bytes(addr, &[val])
-            .map_err(|e| SurfaceError::MemoryAccess(e))
+            .map_err(SurfaceError::MemoryAccess)
     }
 
     /// Read an 8-byte pointer field.
@@ -246,7 +246,7 @@ impl PebView {
         }
         let raw = mem
             .read_bytes(addr, self.pointer_size)
-            .map_err(|e| SurfaceError::MemoryAccess(e))?;
+            .map_err(SurfaceError::MemoryAccess)?;
         let mut v = [0u8; 8];
         v.copy_from_slice(&raw);
         Ok(u64::from_le_bytes(v))
@@ -267,7 +267,7 @@ impl PebView {
             });
         }
         mem.write_bytes(addr, &val.to_le_bytes())
-            .map_err(|e| SurfaceError::MemoryAccess(e))
+            .map_err(SurfaceError::MemoryAccess)
     }
 }
 /// AD-PROC-002 installation: observe, then zero BeingDebugged.

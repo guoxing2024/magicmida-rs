@@ -863,8 +863,8 @@ mod tests {
         };
         let fixed_provider = move |case_id: &str| -> Option<OreansSampleManifestLock> {
             match case_id {
-                "origin_macro" => Some(origin_expected.clone()),
-                "lunlun_software" => Some(lunlun_expected.clone()),
+                "origin_macro" => Some(origin_expected),
+                "lunlun_software" => Some(lunlun_expected),
                 _ => None,
             }
         };

@@ -934,10 +934,10 @@ fn acceptance_junction_escape_of_logical_dir_identity_ok_false() {
     // Copy the real snapshot into the outside structure.
     std::fs::copy(&snap_path, sha_dir.join("snapshot.bin")).unwrap();
     // Remove the real gto_launcher dir and junction it to outside/gto_launcher.
-    std::fs::remove_dir_all(&snap_root.join("gto_launcher")).unwrap();
+    std::fs::remove_dir_all(snap_root.join("gto_launcher")).unwrap();
     let mklink = std::process::Command::new("cmd")
         .args(["/C", "mklink", "/J"])
-        .arg(&snap_root.join("gto_launcher"))
+        .arg(snap_root.join("gto_launcher"))
         .arg(&outside_gto)
         .output()
         .expect("mklink must be invocable");

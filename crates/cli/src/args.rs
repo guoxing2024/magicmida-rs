@@ -568,7 +568,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let input = dir.join("input.exe");
         std::fs::write(&input, b"x").unwrap();
-        let cmd = parse_unpack(&vec![
+        let cmd = parse_unpack(&[
             "mida-cli".to_string(),
             "/unpack".to_string(),
             input.display().to_string(),
@@ -596,7 +596,7 @@ mod tests {
             _ => panic!("expected Unpack"),
         }
         // Without --snapshot-root, snapshot_root is None (default applies).
-        let cmd2 = parse_unpack(&vec![
+        let cmd2 = parse_unpack(&[
             "mida-cli".to_string(),
             "/unpack".to_string(),
             input.display().to_string(),

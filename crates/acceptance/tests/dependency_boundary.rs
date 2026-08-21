@@ -113,12 +113,10 @@ fn assert_boundary(stdout: &[u8], workspace_root: &std::path::Path) {
         if dep_names
             .iter()
             .any(|n| n == forbid || n.starts_with("mida-packers-"))
+            && (FORBIDDEN.contains(&dep_names.iter().find(|n| *n == forbid).unwrap().as_str())
+                || dep_names.iter().any(|n| n.starts_with("mida-packers-")))
         {
-            if FORBIDDEN.contains(&dep_names.iter().find(|n| *n == forbid).unwrap().as_str())
-                || dep_names.iter().any(|n| n.starts_with("mida-packers-"))
-            {
-                // refined below
-            }
+            // refined below
         }
         if dep_names.contains(*forbid) {
             violations.push((*forbid).to_string());

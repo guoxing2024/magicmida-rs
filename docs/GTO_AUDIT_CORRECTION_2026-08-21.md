@@ -39,7 +39,7 @@
 |---|---|---|---|
 | 测试 | 1885 passed | **1271 passed / 0 failed / 2 ignored** | 账本 §7 更新；WO-004 补完整解释 |
 | fmt | — | PASS | 记录 |
-| clippy | — | 15 warnings | WO-005 待清理 |
+| clippy | — | 15 warnings（WO-C 口径，已过时；实测 `cargo clippy --workspace --all-targets` = 820，见 WO-103 附记） | WO-103 部分清理（144/820 机械修复，676 待指示） |
 | ADR7 | 17/17 | 17/17 PASS | 一致 |
 
 ## 三、后续工作单

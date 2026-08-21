@@ -219,8 +219,7 @@ pub fn generic_unpack(
             result.warnings,
         ),
     );
-    check_generic_dump(&out_pe, gate_profile, has_ahk_export)
-        .map_err(|e| anyhow::Error::from(e))?;
+    check_generic_dump(&out_pe, gate_profile, has_ahk_export).map_err(anyhow::Error::from)?;
 
     log::log(
         LogType::Good,

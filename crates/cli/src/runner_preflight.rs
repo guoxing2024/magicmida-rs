@@ -383,14 +383,14 @@ impl RunnerConfigEnvelope {
                         ));
                     }
                 }
-            } else if FIXED_CASE_IDS.contains(&c.case_id.as_str()) {
-                if c.protected_input_path.is_some() {
-                    return Some(format!(
-                        "Oreans fixed case {} must NOT carry a protected_input_path \
+            } else if FIXED_CASE_IDS.contains(&c.case_id.as_str())
+                && c.protected_input_path.is_some()
+            {
+                return Some(format!(
+                    "Oreans fixed case {} must NOT carry a protected_input_path \
                          (live-input lane) (fail-closed)",
-                        c.case_id
-                    ));
-                }
+                    c.case_id
+                ));
             }
             // Lane <-> family binding: an Oreans fixed case must be Oreans; the
             // GTO lane case must be ahk_gto. Cross-lane reuse fails closed.
@@ -701,13 +701,13 @@ pub(crate) const TEST_LAUNCH_STOP_TOKEN: &str = "TEST_LAUNCH_STOP_SENTINEL";
 #[cfg(test)]
 thread_local! {
     static TEST_VERIFIER_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
-        std::cell::RefCell::new(None);
+        const { std::cell::RefCell::new(None) };
     static TEST_RECORDED_VERIFIER_ARGS: std::cell::RefCell<Vec<String>> =
-        std::cell::RefCell::new(Vec::new());
+        const { std::cell::RefCell::new(Vec::new()) };
     static TEST_RECORDED_SNAPSHOT_ROOTS: std::cell::RefCell<Vec<String>> =
-        std::cell::RefCell::new(Vec::new());
-    static TEST_LAUNCH_STOP_ENABLED: std::cell::Cell<bool> = std::cell::Cell::new(false);
-    static TEST_SAMPLE_LAUNCH_ATTEMPTED: std::cell::Cell<u32> = std::cell::Cell::new(0);
+        const { std::cell::RefCell::new(Vec::new()) };
+    static TEST_LAUNCH_STOP_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static TEST_SAMPLE_LAUNCH_ATTEMPTED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// Read the current thread's injected verifier override (if any).
@@ -2593,7 +2593,7 @@ mod tests {
         // the GTO lane is a SEPARATE case id and is never folded into it.
         assert_eq!(FIXED_CASE_IDS, ["origin_macro", "lunlun_software"]);
         assert!(
-            !FIXED_CASE_IDS.iter().any(|id| *id == "gto_launcher"),
+            !FIXED_CASE_IDS.contains(&"gto_launcher"),
             "the GTO lane must never be folded into the Oreans fixed regression gate"
         );
         assert_eq!(GTO_CASE_ID, "gto_launcher");
@@ -3402,7 +3402,7 @@ mod tests {
             // structural unit check below.
             let outside = root.join("outside_real");
             std::fs::create_dir_all(&outside).unwrap();
-            std::fs::write(&outside.join("snapshot.bin"), b"G3-R3-R1-SNAPSHOT-PAYLOAD").unwrap();
+            std::fs::write(outside.join("snapshot.bin"), b"G3-R3-R1-SNAPSHOT-PAYLOAD").unwrap();
             let link = root.join("escape_link");
             let mklink = std::process::Command::new("cmd")
                 .args(["/C", "mklink", "/J"])
@@ -3947,7 +3947,7 @@ mod tests {
             "cases": vec![
                 serde_json::json!({"case_id":"origin_macro","identity_ok":true,"reasons":[],"protected_input":{"sha256":"1af62999cf5be0b2f21abc39034c122a42aa46cfbfdb546faa184de37ac09ac7","size_bytes":5232656},"protected_input_path":"","manifest_path":real_manifest("origin_macro").display().to_string(),"candidate_output":dir.join("origin_candidate.exe").display().to_string(),"runner_config_digest":oreans_digest}),
                 serde_json::json!({"case_id":"lunlun_software","identity_ok":true,"reasons":[],"protected_input":{"sha256":"8a0118d04e03752728999c845536c29215d2a626ac65845c22e3f1149de0db07","size_bytes":4976144},"protected_input_path":"","manifest_path":real_manifest("lunlun_software").display().to_string(),"candidate_output":dir.join("lunlun_candidate.exe").display().to_string(),"runner_config_digest":oreans_digest}),
-                serde_json::json!({"case_id":"gto_launcher","identity_ok":true,"reasons":[],"protected_input":{"sha256":gto_sha,"size_bytes":gto_size},"protected_input_path":sealed_snap.display().to_string(),"manifest_path":manifest.display().to_string(),"candidate_output":crate::runner_preflight::canonicalize_loose(&candidate_output).display().to_string(),"runner_config_digest":gto_digest}),
+                serde_json::json!({"case_id":"gto_launcher","identity_ok":true,"reasons":[],"protected_input":{"sha256":gto_sha,"size_bytes":gto_size},"protected_input_path":sealed_snap.display().to_string(),"manifest_path":manifest.display().to_string(),"candidate_output":crate::runner_preflight::canonicalize_loose(candidate_output).display().to_string(),"runner_config_digest":gto_digest}),
             ],
         });
         std::fs::write(

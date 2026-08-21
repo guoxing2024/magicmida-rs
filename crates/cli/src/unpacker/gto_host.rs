@@ -71,8 +71,7 @@ fn gto_iat_hint_from_live_span(
         let offset = slot * 8;
         let value = u64::from_le_bytes(bytes[offset..offset + 8].try_into().ok()?) as usize;
         let is_api = value >= 0x7FF0_0000_0000
-            || (value >= 0x1800_0000
-                && value < 0x7FFF_FFFF_FFFF
+            || ((0x1800_0000..0x7FFF_FFFF_FFFF).contains(&value)
                 && !(value >= image_base && value < image_base.saturating_add(0x1000_0000)));
         if is_api {
             if first_api.is_none() {
@@ -100,8 +99,7 @@ fn gto_iat_hint_from_live_span(
         size = GTO_R4C_IAT_SIZE;
     }
     if size == 0
-        || size < GTO_MIN_IAT_SIZE
-        || size > GTO_R4C_IAT_SIZE
+        || !(GTO_MIN_IAT_SIZE..=GTO_R4C_IAT_SIZE).contains(&size)
         || size > bytes.len()
         || !size.is_multiple_of(8)
     {
@@ -279,7 +277,7 @@ pub(super) fn observe_gto(
         if val >= image_base && val < image_base.saturating_add(0x1000_0000) {
             return false;
         }
-        val >= 0x7FF0_0000_0000 || (val >= 0x1800_0000 && val < 0x7FFF_FFFF_FFFF)
+        val >= 0x7FF0_0000_0000 || (0x1800_0000..0x7FFF_FFFF_FFFF).contains(&val)
     };
 
     loop {
@@ -347,17 +345,18 @@ pub(super) fn observe_gto(
 
         // R-GTO-UI: dump shortly after product login window appears so heap
         // capture includes post-GUI gscript / title roots.
-        if iat_resolved_at.is_some() && ui_seen_at.is_none() {
-            if process_has_window_class(target_pid, GTO_UI_WINDOW_CLASS) {
-                ui_seen_at = Some(std::time::Instant::now());
-                log::log(
+        if iat_resolved_at.is_some()
+            && ui_seen_at.is_none()
+            && process_has_window_class(target_pid, GTO_UI_WINDOW_CLASS)
+        {
+            ui_seen_at = Some(std::time::Instant::now());
+            log::log(
                     LogType::Good,
                     &format!(
                         "GTO observation: product window class {GTO_UI_WINDOW_CLASS} seen (after {} ms) — short settle",
                         poll_start.elapsed().as_millis()
                     ),
                 );
-            }
         }
         if let Some(ui_t) = ui_seen_at {
             let ui_settle = if no_bypass {
@@ -405,7 +404,7 @@ pub(super) fn observe_gto(
         // Route H / no-bypass: suspend less often so the UI thread can paint
         // NewClassName before we freeze/dump.
         let do_suspend = if no_bypass && iat_resolved_at.is_some() && ui_seen_at.is_none() {
-            loop_count % 4 == 0
+            loop_count.is_multiple_of(4)
         } else {
             true
         };

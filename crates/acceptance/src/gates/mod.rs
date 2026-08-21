@@ -672,7 +672,7 @@ fn read_c_string_ok(bytes: &[u8], off: usize, max: usize) -> bool {
         return false;
     }
     let end = (off + max).min(bytes.len());
-    bytes[off..end].iter().any(|&b| b == 0)
+    bytes[off..end].contains(&0)
 }
 
 fn check_export(ctx: &mut GateCtx<'_>, image: &PeImage<'_>) {
@@ -903,7 +903,7 @@ fn check_reloc(ctx: &mut GateCtx<'_>, image: &PeImage<'_>) {
         }
         // entries are u16
         let entries_bytes = block_size - 8;
-        if entries_bytes % 2 != 0 {
+        if !entries_bytes.is_multiple_of(2) {
             ctx.fail(
                 "reloc_directory",
                 "reloc_entries_odd",
@@ -939,17 +939,15 @@ fn check_exception(ctx: &mut GateCtx<'_>, image: &PeImage<'_>) {
         return;
     }
     // PE32+ RUNTIME_FUNCTION is 12 bytes; PE32 rarely uses this directory the same way
-    if image.optional.is_pe32_plus {
-        if dir.size % 12 != 0 {
-            ctx.fail(
-                "exception_directory",
-                "exception_size_alignment",
-                format!(
-                    "exception directory size 0x{:x} not multiple of 12",
-                    dir.size
-                ),
-            );
-        }
+    if image.optional.is_pe32_plus && dir.size % 12 != 0 {
+        ctx.fail(
+            "exception_directory",
+            "exception_size_alignment",
+            format!(
+                "exception directory size 0x{:x} not multiple of 12",
+                dir.size
+            ),
+        );
     }
     if !image.directory_has_raw_backing(dir.virtual_address, dir.size) {
         ctx.fail(
@@ -1004,18 +1002,17 @@ fn check_directories_bounds(ctx: &mut GateCtx<'_>, image: &PeImage<'_>) {
         if d.virtual_address == 0 && d.size == 0 {
             continue;
         }
-        if d.size != 0 {
-            if (d.virtual_address as u64)
+        if d.size != 0
+            && (d.virtual_address as u64)
                 .checked_add(d.size as u64)
                 .is_none()
-            {
-                ctx.fail(
-                    "directories_bounds",
-                    "directory_rva_size_overflow",
-                    format!("data directory {i}: RVA+size overflow"),
-                );
-                continue;
-            }
+        {
+            ctx.fail(
+                "directories_bounds",
+                "directory_rva_size_overflow",
+                format!("data directory {i}: RVA+size overflow"),
+            );
+            continue;
         }
         if !image.directory_in_image(d.virtual_address, d.size) {
             ctx.fail(
