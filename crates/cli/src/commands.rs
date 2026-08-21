@@ -22,13 +22,18 @@ pub fn run_command(cmd: Command) -> Result<(), anyhow::Error> {
             dump_timing,
             verbose: _,
         } => {
-            // WO-201: PostSelfDecrypt is reserved. Fail-closed at the dispatch
-            // boundary without GTO-H5-LIVE-AUTHORIZATION-2.
-            if dump_timing == mida_pe::DumpTiming::PostSelfDecrypt {
+            // WO-401A P0-2: explicit authorization gate for PostSelfDecrypt.
+            // The CLI hard-rejects unless MIDA_GTO_LIVE2_AUTHORIZED=1 is set
+            // (the only unlock). Variable absent => behaviour identical to
+            // WO-201 (fail-closed). The manifest records live2_authorized=true
+            // for audit (see unpacker::unpack).
+            if dump_timing == mida_pe::DumpTiming::PostSelfDecrypt
+                && std::env::var("MIDA_GTO_LIVE2_AUTHORIZED").ok().as_deref() != Some("1")
+            {
                 return Err(anyhow::anyhow!(
-                    "--dump-timing=post-self-decrypt requires GTO-H5-LIVE-AUTHORIZATION-2; "
+                    "--dump-timing=post-self-decrypt requires MIDA_GTO_LIVE2_AUTHORIZED=1 "
                         .to_string()
-                        + "not granted -- refusing to run"
+                        + "(GTO-H5-LIVE-AUTHORIZATION-2 Round 2 written gate); not set -- refusing to run"
                 ));
             }
             crate::unpacker::unpack(

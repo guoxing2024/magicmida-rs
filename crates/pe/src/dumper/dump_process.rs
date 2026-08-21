@@ -369,6 +369,34 @@ use super::types::{DumpOptions, DumpProcessReport, EarlySectionSnapshot};
 ///
 /// Returns [`PeError::Parse`] if the PE headers in the target are corrupt,
 /// or [`PeError::Io`] if the output file cannot be written.
+/// Persist the PostSelfDecrypt entropy timeline sidecar (A2: primary
+/// deliverable, all outcomes). Best-effort: never fails the dump.
+fn persist_post_self_decrypt_timeline(
+    opts: &DumpOptions,
+    obs: &super::post_self_decrypt::PostSelfDecryptObservation,
+) {
+    let timeline_path = opts
+        .output_path
+        .with_extension("post_self_decrypt_timeline.json");
+    match serde_json::to_string_pretty(obs) {
+        Ok(text) => {
+            if let Err(e) = std::fs::write(&timeline_path, text) {
+                warn!(
+                    path = %timeline_path.display(),
+                    error = %e,
+                    "failed to write PostSelfDecrypt timeline sidecar"
+                );
+            } else {
+                info!(
+                    path = %timeline_path.display(),
+                    "PostSelfDecrypt entropy timeline persisted"
+                );
+            }
+        }
+        Err(e) => warn!(error = %e, "PostSelfDecrypt timeline serialization failed"),
+    }
+}
+
 pub fn dump_process(
     debugger: &mut dyn mida_core::DebuggerCore,
     opts: &DumpOptions,
@@ -401,6 +429,10 @@ pub fn dump_process_with_report(
     // window BEFORE any dump-side mutation. The entropy timeline is the
     // primary deliverable (A2); candidate output is refused on C3 timeout
     // (fail-closed). Zero-write: only read_memory/wait_event/continue/get_context.
+    // A2 (WO-401A P0-1): the entropy timeline is the PRIMARY deliverable and
+    // must be persisted REGARDLESS of outcome - including the C3-timeout
+    // lazy-decrypt case. Persist immediately after the window returns,
+    // BEFORE any candidate_refused early return.
     let post_self_decrypt_obs =
         if opts.dump_timing == crate::dumper::types::DumpTiming::PostSelfDecrypt {
             let obs = super::post_self_decrypt::run_post_self_decrypt_window(
@@ -408,6 +440,8 @@ pub fn dump_process_with_report(
                 opts.image_base,
                 &pe.sections,
             )?;
+            // Persist the timeline sidecar NOW (A2: all outcomes, incl. C3).
+            persist_post_self_decrypt_timeline(opts, &obs);
             if obs.candidate_refused {
                 return Err(PeError::Parse(format!(
                     "PostSelfDecrypt C3: {}",
@@ -2480,6 +2514,14 @@ pub fn dump_process_with_report(
         ]);
     }
 
+    // WO-401A P0-2: audit the explicit Round-2 authorization gate.
+    // When MIDA_GTO_LIVE2_AUTHORIZED=1 was honored by the CLI dispatch,
+    // the manifest records live2_authorized=true so the run is
+    // attributable. Absent variable => no entry (default path unchanged).
+    if std::env::var("MIDA_GTO_LIVE2_AUTHORIZED").ok().as_deref() == Some("1") {
+        applied_transforms.push(("live2_authorized", "authorization_gate"));
+    }
+
     // DEBUG: Verify section 1 characteristics
     debug_section_chars(&out_data, "Before fix_hardcoded_addresses");
 
@@ -2566,32 +2608,10 @@ pub fn dump_process_with_report(
         "Dump written successfully"
     );
 
-    // WO-401 A2: persist the PostSelfDecrypt entropy timeline (primary
-    // deliverable) as a sidecar regardless of outcome. Best-effort: never
-    // fails the dump. Written only when the observation window ran.
-    if let Some(obs) = &post_self_decrypt_obs {
-        let timeline_path = opts
-            .output_path
-            .with_extension("post_self_decrypt_timeline.json");
-        let json = serde_json::to_string_pretty(obs);
-        match json {
-            Ok(text) => {
-                if let Err(e) = std::fs::write(&timeline_path, text) {
-                    warn!(
-                        path = %timeline_path.display(),
-                        error = %e,
-                        "failed to write PostSelfDecrypt timeline sidecar"
-                    );
-                } else {
-                    info!(
-                        path = %timeline_path.display(),
-                        "PostSelfDecrypt entropy timeline persisted"
-                    );
-                }
-            }
-            Err(e) => warn!(error = %e, "PostSelfDecrypt timeline serialization failed"),
-        }
-    }
+    // (WO-401A P0-1) Timeline persistence moved BEFORE candidate_refused
+    // handling; see persist_post_self_decrypt_timeline above. Nothing
+    // to do here (post_self_decrypt_obs kept for audit visibility).
+    let _ = &post_self_decrypt_obs;
 
     // Observable capture contract (best-effort sidecar). Never fails the dump.
     // `capture_policy` is the resolved policy used for heap capture above.
