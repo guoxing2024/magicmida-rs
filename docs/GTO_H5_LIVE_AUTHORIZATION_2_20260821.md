@@ -7,7 +7,7 @@
 ## 一、新账本命名空间
 
 - Namespace: **`GTO-H5-LIVE-2`**
-- Cap: **2 rounds** · Used: 0 · Remaining: 2
+- Cap: **2 rounds** · Used: **1** (Round 1 COMPLETE 2026-08-21, see docs/GTO_H5_LIVE2_R1_REPORT.md) · Remaining: 1
 - 每轮 = Rust/Python diff + rebuild + 实弹运行 + 报告(沿用 §4.4 口径);docs-only 不消耗轮次。
 
 ## 二、Round 1(强制先行):再基线 + 测量
