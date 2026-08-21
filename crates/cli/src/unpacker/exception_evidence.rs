@@ -305,6 +305,13 @@ fn no_reloc_state(
     if reloc.directory_present != !final_reloc.directory_absent {
         blockers.push("runtime/final base-reloc directory mismatch".to_string());
     }
+    // D2.2-4 (empty-directory axis): a runtime "present but empty" directory
+    // must match the final candidate's "present but empty" fact. The final
+    // side re-parses the on-disk candidate, so a fabricated/cleared empty
+    // directory (or a size flipped to non-zero) fails closed here.
+    if present_but_empty != final_reloc.directory_present_but_empty {
+        blockers.push("runtime/final empty base-reloc directory mismatch".to_string());
+    }
     if reloc.dynamic_base != final_reloc.dynamic_base {
         blockers.push("runtime/final DYNAMIC_BASE mismatch".to_string());
     }
@@ -698,7 +705,7 @@ mod tests {
 
     #[test]
     fn no_reloc_absent_state_uses_frozen_wording() {
-        let runtime = ExceptionObservationReport {
+        let _runtime = ExceptionObservationReport {
             directory_present: false,
             directory_rva: 0,
             directory_size: 0,
@@ -756,8 +763,55 @@ mod tests {
     }
 
     #[test]
+    fn empty_directory_mismatch_fails_closed() {
+        // Runtime observed "directory present but empty"; the final candidate
+        // claims the directory is absent (fabricated/cleared). The D2.2-4
+        // empty-directory axis must fail closed.
+        let reloc = mida_pe::relocation_observation::RelocationObservationReport {
+            directory_present: true,
+            pe32_plus: true,
+            pointer_size: 8,
+            runtime_image_base: 0x7ff600000000,
+            preferred_image_base: 0x140000000,
+            size_of_image: 0x1000,
+            directory_rva: 0x2000,
+            directory_size: 0,
+            directory_bytes_read: 0,
+            dynamic_base: false,
+            relocs_stripped: false,
+            block_count: 0,
+            entry_count: 0,
+            non_absolute_entry_count: 0,
+            observed_types: Vec::new(),
+            targets: Vec::new(),
+            blockers: Vec::new(),
+        };
+        let final_reloc = NoRelocFinalState {
+            image_base_changed: false,
+            directory_absent: true, // final says absent; runtime says present-but-empty
+            directory_present_but_empty: false,
+            relocs_stripped: reloc.relocs_stripped,
+            dynamic_base: reloc.dynamic_base,
+            runtime_image_base: reloc.runtime_image_base,
+            preferred_image_base: reloc.preferred_image_base,
+        };
+        let nrs = no_reloc_state(&reloc, &final_reloc);
+        assert!(
+            nrs.blockers
+                .iter()
+                .any(|b| b.contains("empty base-reloc directory mismatch")),
+            "empty-directory axis must fail closed: {:?}",
+            nrs.blockers
+        );
+        assert!(
+            nrs.state_text.contains("NOT preserved"),
+            "state text must be fail-closed wording"
+        );
+    }
+
+    #[test]
     fn dynamic_base_without_relocation_is_blocker() {
-        let runtime = ExceptionObservationReport {
+        let _runtime = ExceptionObservationReport {
             directory_present: false,
             directory_rva: 0,
             directory_size: 0,

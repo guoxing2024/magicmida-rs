@@ -1444,7 +1444,7 @@ mod tests {
     // GTO-H4-D-P5: EHANDLER tail truncated (4B beyond image) is fail-closed.
     #[test]
     fn p5_eh_handler_tail_truncated_fails_closed() {
-        let pe2 = test_pe(0x1000, 12, 0x4000);
+        let _pe2 = test_pe(0x1000, 12, 0x4000);
         let mut mem = vec![0xccu8; 0x4000];
         // unwind at 0x3ffc: header + 4-byte handler crosses SizeOfImage.
         mem[0x3ffc] = 0x01 << 3;
