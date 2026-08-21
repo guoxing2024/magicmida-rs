@@ -324,8 +324,10 @@ fn parse_dump_timing(s: &str) -> Result<DumpTiming, String> {
         // WO-102 path (d) skeleton: reserved. The unpack dispatch
         // fail-closes here without GTO-H5-LIVE-AUTHORIZATION-2.
         "post-self-decrypt" => Ok(DumpTiming::PostSelfDecrypt),
+        // WO-702: coverage measurement (GTO-H5-LIVE-3).
+        "coverage-measure" => Ok(DumpTiming::CoverageMeasure),
         other => Err(format!(
-            "Unknown --dump-timing value '{other}' (immediate|post-self-decrypt)"
+            "Unknown --dump-timing value '{other}' (immediate|post-self-decrypt|coverage-measure)"
         )),
     }
 }

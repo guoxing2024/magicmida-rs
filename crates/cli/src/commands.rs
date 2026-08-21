@@ -36,6 +36,16 @@ pub fn run_command(cmd: Command) -> Result<(), anyhow::Error> {
                         + "(GTO-H5-LIVE-AUTHORIZATION-2 Round 2 written gate); not set -- refusing to run"
                 ));
             }
+            // WO-702: coverage-measure requires MIDA_GTO_LIVE3_AUTHORIZED=1.
+            if dump_timing == mida_pe::DumpTiming::CoverageMeasure
+                && std::env::var("MIDA_GTO_LIVE3_AUTHORIZED").ok().as_deref() != Some("1")
+            {
+                return Err(anyhow::anyhow!(
+                    "--dump-timing=coverage-measure requires MIDA_GTO_LIVE3_AUTHORIZED=1 "
+                        .to_string()
+                        + "(GTO-H5-LIVE-AUTHORIZATION-3 written gate); not set -- refusing to run"
+                ));
+            }
             crate::unpacker::unpack(
                 &input,
                 output.as_deref(),

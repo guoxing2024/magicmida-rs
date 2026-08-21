@@ -29,6 +29,7 @@ mod capture_epoch;
 mod capture_policy;
 mod container_bootstrap;
 mod container_snapshot;
+mod coverage_measure;
 mod data_reinit;
 mod data_snapshot;
 mod dump_process;

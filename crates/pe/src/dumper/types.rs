@@ -67,6 +67,11 @@ pub enum DumpTiming {
     /// Reserved: capture after observing the target's self-decryption.
     /// Requires `GTO-H5-LIVE-AUTHORIZATION-2`; CLI rejects without it.
     PostSelfDecrypt,
+    /// Coverage measurement (WO-702, GTO-H5-LIVE-3): dual-phase scan
+    /// (A anchors + B spatial strips) to quantify execution-driven decrypt
+    /// coverage; dump decision per 60% economic gate. Requires
+    /// `MIDA_GTO_LIVE3_AUTHORIZED=1`; CLI rejects without it.
+    CoverageMeasure,
 }
 // -----------------------------------------------------------------------
 // Dump profile (GTO/AHK experimental isolation)

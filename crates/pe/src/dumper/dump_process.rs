@@ -397,6 +397,30 @@ fn persist_post_self_decrypt_timeline(
     }
 }
 
+/// Persist the coverage observation timeline sidecar (any outcome).
+fn persist_coverage_timeline(
+    opts: &DumpOptions,
+    obs: &super::coverage_measure::CoverageObservation,
+) {
+    let path = opts.output_path.with_extension("coverage_timeline.json");
+    match serde_json::to_string_pretty(obs) {
+        Ok(text) => {
+            if let Err(e) = std::fs::write(&path, text) {
+                warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "failed to write coverage timeline sidecar"
+                );
+            } else {
+                info!(
+                    path = %path.display(),
+                    "coverage timeline persisted"
+                );
+            }
+        }
+        Err(e) => warn!(error = %e, "coverage timeline serialization failed"),
+    }
+}
 pub fn dump_process(
     debugger: &mut dyn mida_core::DebuggerCore,
     opts: &DumpOptions,
@@ -452,6 +476,32 @@ pub fn dump_process_with_report(
         } else {
             None
         };
+
+    // WO-702: CoverageMeasure observation (GTO-H5-LIVE-3).
+    // Dual-phase: A anchors + B spatial strip scans; decision per 60%
+    // economic gate. Persist the coverage timeline REGARDLESS of outcome.
+    let _coverage_obs = if opts.dump_timing == crate::dumper::types::DumpTiming::CoverageMeasure {
+        let b_sections = super::coverage_measure::default_b_sections();
+        let triggers = ["t0", "window", "+60s", "+180s", "end"];
+        let obs = super::coverage_measure::run_coverage_observation(
+            debugger,
+            opts.image_base,
+            &b_sections,
+            &triggers,
+            300_000,
+        )?;
+        persist_coverage_timeline(opts, &obs);
+        if obs.decision != "dump" {
+            return Err(PeError::Parse(format!(
+                "CoverageMeasure decision={} ({}); data is the deliverable",
+                obs.decision,
+                obs.reason.as_deref().unwrap_or("no reason")
+            )));
+        }
+        Some(obs)
+    } else {
+        None
+    };
 
     // Capture immutable runtime TLS evidence before any header patch, shrink,
     // sanitize, or section reconstruction changes the parsed PE semantics.
@@ -2520,6 +2570,10 @@ pub fn dump_process_with_report(
     // attributable. Absent variable => no entry (default path unchanged).
     if std::env::var("MIDA_GTO_LIVE2_AUTHORIZED").ok().as_deref() == Some("1") {
         applied_transforms.push(("live2_authorized", "authorization_gate"));
+    }
+    // WO-702: LIVE-3 authorization audit entry (coverage-measure mode).
+    if std::env::var("MIDA_GTO_LIVE3_AUTHORIZED").ok().as_deref() == Some("1") {
+        applied_transforms.push(("live3_authorized", "authorization_gate"));
     }
 
     // DEBUG: Verify section 1 characteristics
