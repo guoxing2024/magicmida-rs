@@ -41,6 +41,11 @@ pub struct PureRebuildEmitOptions {
     /// typed builders (import/IAT/TLS/export content carry).
     pub carry_host_data_directories: bool,
     pub max_slice_bytes: usize,
+
+    /// R1 opt-in content-consistency baseline (WO-102). When `Some`, EXECUTE
+    /// sections whose live plan content differs from the reference fail with
+    /// `PeError::DumpContentMismatch`. `None` (default) disables the check.
+    pub section_content_reference: Option<crate::dumper::SectionContentReference>,
 }
 
 impl Default for PureRebuildEmitOptions {
@@ -54,6 +59,7 @@ impl Default for PureRebuildEmitOptions {
             preserve_section_vas: true,
             carry_host_data_directories: true,
             max_slice_bytes: 64 * 1024 * 1024,
+            section_content_reference: None,
         }
     }
 }
@@ -360,6 +366,23 @@ pub fn emit_pure_rebuild(
     opts: &PureRebuildEmitOptions,
 ) -> Result<Vec<u8>, PeError> {
     let plan = plan_from_host_dump(pe, dump_buf, opts)?;
+    // R1 (WO-102, opt-in): content-consistency check for EXECUTE sections.
+    // Only runs when the caller explicitly provided a baseline; production
+    // paths never pass one, so legal unpacking cannot trip this.
+    if let Some(ref r1_ref) = opts.section_content_reference {
+        for s in plan.sections.iter() {
+            if s.characteristics & 0x2000_0000 == 0 {
+                continue;
+            }
+            if let Some((off, len)) = r1_ref.first_diff(&s.name, &s.data) {
+                return Err(PeError::DumpContentMismatch {
+                    section: s.name.clone(),
+                    offset: off,
+                    length: len,
+                });
+            }
+        }
+    }
     let meta = rebuild_pe_image_with_meta(&plan)?;
     info!(
         size = meta.image.len(),
@@ -463,6 +486,7 @@ mod tests {
             preserve_section_vas: true,
             carry_host_data_directories: true,
             max_slice_bytes: 16 * 1024 * 1024,
+            section_content_reference: None,
         }
     }
 
@@ -725,6 +749,8 @@ mod tests {
             security_cookie_rva: None,
             security_cookie_complement_rva: None,
             pure_rebuild: false,
+            dump_timing: crate::DumpTiming::Immediate,
+            section_content_reference: None,
             capture_policy: crate::DumpCapturePolicy::default(),
         };
         let mut pe_legacy = pe.clone();

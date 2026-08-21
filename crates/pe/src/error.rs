@@ -136,6 +136,23 @@ pub enum PeError {
         /// Configured maximum in bytes.
         max: usize,
     },
+
+    /// R1 opt-in content-consistency failure (WO-102 design).
+    ///
+    /// Raised only when a caller explicitly provided a section content
+    /// baseline (`DumpOptions::section_content_reference`) and the live
+    /// EXECUTE section content diverged from it. Fail-closed: the dump is
+    /// refused instead of silently emitting a candidate whose code section
+    /// does not match the reference (e.g. an undecrypted runtime snapshot).
+    #[error("DumpContentMismatch: section {section} differs from reference at offset {offset:#x} (run length {length} bytes)")]
+    DumpContentMismatch {
+        /// Section name that diverged.
+        section: String,
+        /// First differing byte offset within the section.
+        offset: usize,
+        /// Length of the differing run (>= 1).
+        length: usize,
+    },
 }
 
 #[cfg(test)]

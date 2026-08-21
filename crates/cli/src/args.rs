@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use mida_pe::{ContainerRestoreMode, DumpCapturePolicy, DumpProfile, OepPolicy};
+use mida_pe::{ContainerRestoreMode, DumpCapturePolicy, DumpProfile, DumpTiming, OepPolicy};
 
 use crate::unpacker::GenericGateProfile;
 
@@ -38,6 +38,10 @@ pub enum Command {
         /// `<preflight_dir>/sample-snapshots` is used. Never derived from the
         /// sealed path.
         snapshot_root: Option<PathBuf>,
+        /// Dump timing (WO-102 path (d) skeleton). Default Immediate.
+        /// PostSelfDecrypt is reserved and fail-closes without
+        /// GTO-H5-LIVE-AUTHORIZATION-2.
+        dump_timing: DumpTiming,
         verbose: bool,
     },
     /// Packer-agnostic full dump (no Themida shrink).
@@ -141,6 +145,7 @@ fn parse_unpack(args: &[String]) -> Result<Command, String> {
     let mut capture_policy_path: Option<PathBuf> = None;
     let mut preflight_dir: Option<PathBuf> = None;
     let mut snapshot_root: Option<PathBuf> = None;
+    let mut dump_timing = DumpTiming::Immediate;
 
     let mut i = 3;
     while i < args.len() {
@@ -168,6 +173,21 @@ fn parse_unpack(args: &[String]) -> Result<Command, String> {
                     return Err("Missing directory after --snapshot-root.".into());
                 }
                 snapshot_root = Some(PathBuf::from(&args[i]));
+            }
+            // WO-201: --dump-timing skeleton. Only Immediate is usable now;
+            // PostSelfDecrypt is reserved and fail-closes without
+            // GTO-H5-LIVE-AUTHORIZATION-2 (checked in the unpack dispatch).
+            other if other.starts_with("--dump-timing=") => {
+                dump_timing = parse_dump_timing(&other["--dump-timing=".len()..])?;
+            }
+            "--dump-timing" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err(
+                        "Missing value after --dump-timing (immediate|post-self-decrypt).".into(),
+                    );
+                }
+                dump_timing = parse_dump_timing(&args[i])?;
             }
             // P6.3.2: the verifier is never caller-selectable in production.
             // Both forms are forbidden and fail closed (no hidden flag, no
@@ -293,8 +313,21 @@ fn parse_unpack(args: &[String]) -> Result<Command, String> {
         capture_policy_digest,
         preflight_dir,
         snapshot_root,
+        dump_timing,
         verbose,
     })
+}
+
+fn parse_dump_timing(s: &str) -> Result<DumpTiming, String> {
+    match s {
+        "immediate" => Ok(DumpTiming::Immediate),
+        // WO-102 path (d) skeleton: reserved. The unpack dispatch
+        // fail-closes here without GTO-H5-LIVE-AUTHORIZATION-2.
+        "post-self-decrypt" => Ok(DumpTiming::PostSelfDecrypt),
+        other => Err(format!(
+            "Unknown --dump-timing value '{other}' (immediate|post-self-decrypt)"
+        )),
+    }
 }
 
 fn parse_generic(args: &[String]) -> Result<Command, String> {

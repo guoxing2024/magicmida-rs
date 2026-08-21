@@ -19,21 +19,33 @@ pub fn run_command(cmd: Command) -> Result<(), anyhow::Error> {
             capture_policy_digest,
             preflight_dir,
             snapshot_root,
+            dump_timing,
             verbose: _,
-        } => crate::unpacker::unpack(
-            &input,
-            output.as_deref(),
-            create_data_sections,
-            shrink,
-            oep_policy,
-            container_restore,
-            profile,
-            pure_rebuild,
-            capture_policy,
-            &capture_policy_digest,
-            preflight_dir.as_deref(),
-            snapshot_root.as_deref(),
-        ),
+        } => {
+            // WO-201: PostSelfDecrypt is reserved. Fail-closed at the dispatch
+            // boundary without GTO-H5-LIVE-AUTHORIZATION-2.
+            if dump_timing == mida_pe::DumpTiming::PostSelfDecrypt {
+                return Err(anyhow::anyhow!(
+                    "--dump-timing=post-self-decrypt requires GTO-H5-LIVE-AUTHORIZATION-2; "
+                        .to_string()
+                        + "not granted -- refusing to run"
+                ));
+            }
+            crate::unpacker::unpack(
+                &input,
+                output.as_deref(),
+                create_data_sections,
+                shrink,
+                oep_policy,
+                container_restore,
+                profile,
+                pure_rebuild,
+                capture_policy,
+                &capture_policy_digest,
+                preflight_dir.as_deref(),
+                snapshot_root.as_deref(),
+            )
+        }
         Command::GenericUnpack {
             input,
             output,

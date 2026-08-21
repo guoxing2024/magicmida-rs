@@ -16,6 +16,7 @@ use super::heap_global_snapshot::{
     HeapGlobalSnapshot, SyntheticAssignment, SyntheticRegionRequest,
 };
 use super::runtime_rebase::RuntimeRebaseSummary;
+use super::section_reference::EncryptedRegionObservation;
 use super::types::DumpProfile;
 
 pub(crate) const SCHEMA_VERSION: &str = "mida.dump-snapshot-manifest/v1";
@@ -88,6 +89,7 @@ pub(crate) fn write_dump_snapshot_manifest(
     synthetic_assignment_ledger: &[SyntheticAssignment],
     authoritative_slab_ledger: &[AuthoritativeSlabLedgerEntry],
     normalization_events: &[super::raw_slab_coherence::NormalizationEvent],
+    r2_observations: &[EncryptedRegionObservation],
 ) {
     let path = manifest_path_for_output(output_path);
     match render_manifest_json(
@@ -108,6 +110,7 @@ pub(crate) fn write_dump_snapshot_manifest(
         synthetic_assignment_ledger,
         authoritative_slab_ledger,
         normalization_events,
+        r2_observations,
     ) {
         Ok(json) => match fs::File::create(&path).and_then(|mut f| f.write_all(json.as_bytes())) {
             Ok(()) => {
@@ -195,6 +198,7 @@ pub(crate) fn render_manifest_json(
     synthetic_assignment_ledger: &[SyntheticAssignment],
     authoritative_slab_ledger: &[AuthoritativeSlabLedgerEntry],
     normalization_events: &[super::raw_slab_coherence::NormalizationEvent],
+    r2_observations: &[EncryptedRegionObservation],
 ) -> Result<String, String> {
     let container_payload: u64 = containers.iter().map(|c| c.heap_content.len() as u64).sum();
     let heap_payload: u64 = heap_globals
@@ -855,6 +859,22 @@ pub(crate) fn render_manifest_json(
         buf.push('\n');
     }
     buf.push_str("  ],\n");
+    // R2 (WO-102): encrypted-region suspect observations (EXECUTE + high entropy).
+    // Pure observation: never modifies bytes; consumers must treat as advisory.
+    buf.push_str("  \"r2_encrypted_region_observations\": [\n");
+    for (i, obs) in r2_observations.iter().enumerate() {
+        if i > 0 {
+            buf.push_str(",\n");
+        }
+        buf.push_str(&format!(
+            "    {{\"section_index\": {}, \"section_name\": \"{}\", \"suspect\": {}, \"entropy_bits\": {}}}"
+            , obs.section_index
+            , json_escape(&obs.section_name)
+            , obs.suspect
+            , obs.entropy_bits
+        ));
+    }
+    buf.push_str("\n  ],\n");
     buf.push_str(&format!(
         "  \"synthetic_assignment_algorithm_version\": {}\n",
         synthetic_assignment_algorithm_version()
@@ -903,6 +923,7 @@ mod tests {
             &[],
             &[],
             &super::super::raw_slab_coherence::TransformRunLedger::default(),
+            &[],
             &[],
             &[],
             &[],
@@ -970,6 +991,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
         )
         .unwrap();
         assert!(json.contains("0x145710"));
@@ -1022,6 +1044,7 @@ mod tests {
             &[],
             &[],
             &super::super::raw_slab_coherence::TransformRunLedger::default(),
+            &[],
             &[],
             &[],
             &[],
@@ -1151,6 +1174,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
         )
         .unwrap();
         // The JSON must parse (valid) and contain all three ledgers.
@@ -1215,6 +1239,7 @@ mod tests {
             &super::super::raw_slab_coherence::TransformRunLedger::default(),
             &[req.clone()],
             &assigned,
+            &[],
             &[],
             &[],
         )
@@ -1321,6 +1346,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
         )
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).expect("valid manifest JSON");
@@ -1409,6 +1435,7 @@ mod tests {
             &[],
             &[],
             &ledger,
+            &[],
             &[],
             &[],
             &[],
@@ -1549,6 +1576,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
         )
         .unwrap();
         assert!(json.contains(SCHEMA_VERSION));
@@ -1576,6 +1604,7 @@ mod tests {
             &[],
             &[],
             &super::super::raw_slab_coherence::TransformRunLedger::default(),
+            &[],
             &[],
             &[],
             &[],

@@ -8253,6 +8253,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
         )
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).expect("valid manifest JSON");
@@ -10029,6 +10030,7 @@ mod tests {
             &[],
             &slab_ledger,
             &[],
+            &[],
         )
         .unwrap();
         // Parse and verify the slab ledger.
@@ -10084,6 +10086,7 @@ mod tests {
             &[],
             &[],
             &slab_ledger,
+            &[],
             &[],
         )
         .unwrap();
@@ -10484,6 +10487,7 @@ mod tests {
             &[],
             &slab_ledger,
             &events,
+            &[],
         )
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).expect("valid manifest JSON");
@@ -10714,6 +10718,7 @@ mod tests {
             &[],
             &slab_ledger,
             &events,
+            &[],
         )
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).expect("valid manifest JSON");

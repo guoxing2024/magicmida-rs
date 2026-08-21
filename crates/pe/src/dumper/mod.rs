@@ -48,6 +48,7 @@ mod raw_slab_coherence;
 mod remote_modules;
 mod runtime_bootstrap;
 mod runtime_rebase;
+mod section_reference;
 mod sections;
 mod serialize;
 mod snapshot_manifest;
@@ -87,8 +88,12 @@ pub use self::runtime_rebase::{
     PreparedRuntimeRebase, RebaseError, RebaseRegion, RebaseStatus, RuntimeRebasePlan,
     RuntimeRebaseSummary, SlotProvenance,
 };
+pub use self::section_reference::{
+    observe_encrypted_regions, shannon_entropy_bits, EncryptedRegionObservation,
+    SectionContentReference, ENCRYPTED_REGION_ENTROPY_THRESHOLD, R2_SAMPLE_BYTES,
+};
 pub use self::snapshot_manifest::manifest_path_for_output;
 pub use self::types::{
     ContainerRestoreMode, DumpOptions, DumpProcessReport, DumpProfile, DumpProfileCapabilities,
-    EarlySectionSnapshot, ExperimentalStagePlan, OepPolicy, RemoteModule,
+    DumpTiming, EarlySectionSnapshot, ExperimentalStagePlan, OepPolicy, RemoteModule,
 };

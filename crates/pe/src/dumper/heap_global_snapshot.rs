@@ -10547,6 +10547,7 @@ mod tests {
             &assigned,
             &[],
             &[],
+            &[],
         )
         .unwrap();
         // The manifest must NOT claim the rewrite happened just because the
@@ -10589,6 +10590,7 @@ mod tests {
             &super::super::raw_slab_coherence::TransformRunLedger::default(),
             &reqs,
             &ledgers,
+            &[],
             &[],
             &[],
         )
@@ -11721,6 +11723,7 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                &[],
             )
             .unwrap();
             let mv: serde_json::Value =
@@ -11845,6 +11848,7 @@ mod tests {
                 &[],
                 &bindings,
                 &write_ledger,
+                &[],
                 &[],
                 &[],
                 &[],

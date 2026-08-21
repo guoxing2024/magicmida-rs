@@ -4023,6 +4023,7 @@ mod tests {
             capture_policy_digest: String::new(),
             preflight_dir: Some(dir.clone()),
             snapshot_root: Some(custom_root.clone()),
+            dump_timing: mida_pe::DumpTiming::Immediate,
             verbose: false,
         };
         let err = match crate::commands::run_command(cmd) {
@@ -4106,6 +4107,7 @@ mod tests {
             capture_policy_digest: String::new(),
             preflight_dir: Some(dir.clone()),
             snapshot_root: None,
+            dump_timing: mida_pe::DumpTiming::Immediate,
             verbose: false,
         };
         let err = match crate::commands::run_command(cmd) {
@@ -4186,6 +4188,7 @@ mod tests {
             capture_policy_digest: String::new(),
             preflight_dir: Some(dir.clone()),
             snapshot_root: None,
+            dump_timing: mida_pe::DumpTiming::Immediate,
             verbose: false,
         };
         let err = crate::commands::run_command(cmd).unwrap_err();
@@ -4261,6 +4264,7 @@ mod tests {
             capture_policy_digest: String::new(),
             preflight_dir: Some(dir.clone()),
             snapshot_root: Some(custom_root.clone()),
+            dump_timing: mida_pe::DumpTiming::Immediate,
             verbose: false,
         };
         let err = match crate::commands::run_command(cmd) {

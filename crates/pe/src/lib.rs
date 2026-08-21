@@ -49,11 +49,13 @@ pub use byte_map::{
 };
 pub use dumper::{
     dump_dotnet_with_source, dump_process, dump_process_with_report, emit_pure_rebuild,
-    emit_pure_rebuild_with_parity, get_original_imports, is_dotnet, plan_from_host_dump,
-    rebuild_import_table, rebuild_import_table_with_report, ContainerRestoreMode,
-    DumpCapturePolicy, DumpOptions, DumpProcessReport, DumpProfile, DumpProfileCapabilities,
-    EarlySectionSnapshot, ExperimentalStagePlan, OepPolicy, PureRebuildEmitOptions,
-    PureRebuildParitySnapshot,
+    emit_pure_rebuild_with_parity, get_original_imports, is_dotnet, observe_encrypted_regions,
+    plan_from_host_dump, rebuild_import_table, rebuild_import_table_with_report,
+    shannon_entropy_bits, ContainerRestoreMode, DumpCapturePolicy, DumpOptions, DumpProcessReport,
+    DumpProfile, DumpProfileCapabilities, DumpTiming, EarlySectionSnapshot,
+    EncryptedRegionObservation, ExperimentalStagePlan, OepPolicy, PureRebuildEmitOptions,
+    PureRebuildParitySnapshot, SectionContentReference, ENCRYPTED_REGION_ENTROPY_THRESHOLD,
+    R2_SAMPLE_BYTES,
 };
 pub use error::PeError;
 pub use exception_final::{

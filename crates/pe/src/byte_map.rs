@@ -52,6 +52,14 @@ pub struct ByteMapPlanOptions {
     pub drop_discardable: bool,
     /// Cap for directory / section slices (hostile-size guard).
     pub max_slice_bytes: usize,
+
+    /// R1 opt-in content-consistency baseline (WO-102). When `Some`, EXECUTE
+    /// sections whose live content differs from the reference fail with
+    /// `PeError::DumpContentMismatch` instead of being emitted. `None`
+    /// (default) disables the check - production paths never pass a baseline
+    /// implicitly, so legal unpacking (`.text` differs from disk by design)
+    /// cannot trip it.
+    pub section_content_reference: Option<crate::dumper::SectionContentReference>,
 }
 
 impl Default for ByteMapPlanOptions {
@@ -64,6 +72,7 @@ impl Default for ByteMapPlanOptions {
             prefer_aslr_when_relocs: true,
             drop_discardable: false,
             max_slice_bytes: 64 * 1024 * 1024,
+            section_content_reference: None,
         }
     }
 }
@@ -413,10 +422,23 @@ pub fn plan_from_memory_image(
     // Carry host data directories for content-only import/IAT/TLS/etc.
     plan.fallback_data_directories = Some(pe.nt_headers.optional_header.data_directory);
 
-    if plan.sections.is_empty() && plan.exceptions.is_none() && plan.relocations.is_empty() {
-        return Err(PeError::Parse(
-            "byte map produced empty rebuild plan (no sections)".into(),
-        ));
+    // R1 (WO-102, opt-in): content-consistency check for EXECUTE sections.
+    // Only runs when the caller explicitly provided a baseline; production
+    // paths never pass one, so legal unpacking (runtime .text differs
+    // from disk by design) cannot trip this. Fail-closed on divergence.
+    if let Some(ref r1_ref) = opts.section_content_reference {
+        for s in plan.sections.iter() {
+            if s.characteristics & 0x2000_0000 == 0 {
+                continue; // not EXECUTE: no check
+            }
+            if let Some((off, len)) = r1_ref.first_diff(&s.name, &s.data) {
+                return Err(PeError::DumpContentMismatch {
+                    section: s.name.clone(),
+                    offset: off,
+                    length: len,
+                });
+            }
+        }
     }
 
     Ok(plan)

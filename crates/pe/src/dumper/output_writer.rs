@@ -639,6 +639,8 @@ mod tests {
             security_cookie_rva: None,
             security_cookie_complement_rva: None,
             pure_rebuild: false,
+            dump_timing: crate::DumpTiming::Immediate,
+            section_content_reference: None,
             capture_policy: crate::DumpCapturePolicy::default(),
         }
     }

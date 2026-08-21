@@ -49,6 +49,26 @@ pub enum ContainerRestoreMode {
 }
 
 // -----------------------------------------------------------------------
+// Dump timing (WO-102 design path (d): observe post-self-decrypt)
+// -----------------------------------------------------------------------
+
+/// When the dump capture happens relative to the target's own unpacking.
+///
+/// Default is `Immediate` (current behaviour, zero change). `PostSelfDecrypt`
+/// is reserved for the WO-102 path (d) design: dump after observing the
+/// protector's own self-decryption, so `.rdata*` content is post-decrypt
+/// state. It is **not authorized** for live use without
+/// `GTO-H5-LIVE-AUTHORIZATION-2`; CLI parsing fail-closes before any run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DumpTiming {
+    /// Capture immediately at attach (current production behaviour).
+    #[default]
+    Immediate,
+    /// Reserved: capture after observing the target's self-decryption.
+    /// Requires `GTO-H5-LIVE-AUTHORIZATION-2`; CLI rejects without it.
+    PostSelfDecrypt,
+}
+// -----------------------------------------------------------------------
 // Dump profile (GTO/AHK experimental isolation)
 // -----------------------------------------------------------------------
 
@@ -285,6 +305,22 @@ pub struct DumpOptions {
     /// R1-E preserves host section VAs and carries host data directories
     /// (import/IAT/TLS content). Typed import rebind is still not in this path.
     pub pure_rebuild: bool,
+
+    /// Dump capture timing (WO-102 path (d)). Default `Immediate` keeps
+    /// current behaviour; `PostSelfDecrypt` is reserved and requires
+    /// `GTO-H5-LIVE-AUTHORIZATION-2` (CLI fail-closes before any run).
+    pub dump_timing: DumpTiming,
+
+    /// R1 opt-in content-consistency baseline (WO-102 design).
+    ///
+    /// When `Some`, the emitter compares EXECUTE-characteristic section
+    /// content against this reference and fails with `DumpContentMismatch`
+    /// on divergence (first-diff offset/length in the error). When `None`
+    /// (default), R1 is **disabled** — production paths never pass a
+    /// baseline implicitly, so legal unpacking (where `.text` differs from
+    /// disk by design) cannot trip the check.
+    pub section_content_reference:
+        Option<crate::dumper::section_reference::SectionContentReference>,
 
     /// Heap-global / hot-root capture policy. Empty + [`DumpProfile::AhkGtoExperimental`]
     /// resolves to built-in AHK/GTO defaults; OreansClassic leaves capture empty

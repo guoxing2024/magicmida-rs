@@ -192,6 +192,9 @@ pub fn generic_unpack(
         security_cookie_rva: None,
         security_cookie_complement_rva: None,
         pure_rebuild: false,
+        // WO-201 defaults: Immediate timing, no R1 baseline (zero change).
+        dump_timing: mida_pe::DumpTiming::Immediate,
+        section_content_reference: None,
         capture_policy: mida_pe::DumpCapturePolicy::default(),
     };
 

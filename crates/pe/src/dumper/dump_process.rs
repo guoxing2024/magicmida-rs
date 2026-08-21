@@ -2396,6 +2396,9 @@ pub fn dump_process_with_report(
             preserve_section_vas: true,
             carry_host_data_directories: true,
             max_slice_bytes: super::helpers::MAX_IMAGE_DUMP_BYTES,
+            // R1 (WO-102): opt-in baseline — only when the caller explicitly
+            // provided one. Production paths leave it None (no implicit baseline).
+            section_content_reference: opts.section_content_reference.clone(),
         };
         super::pure_rebuild_adapter::emit_pure_rebuild(&pe, &dump_buf, &pure_opts)?
     } else {
@@ -2610,6 +2613,13 @@ pub fn dump_process_with_report(
     if let Some(note) = &policy_gate_note {
         info!(note = %note, "policy gate decision recorded for manifest");
     }
+    let r2_observations = super::section_reference::observe_encrypted_regions(
+        &pe.sections
+            .iter()
+            .map(|s| (s.name.clone(), s.virtual_address, s.virtual_size))
+            .collect::<Vec<_>>(),
+        &dump_buf,
+    );
     super::snapshot_manifest::write_dump_snapshot_manifest(
         &opts.output_path,
         opts.profile,
@@ -2628,6 +2638,7 @@ pub fn dump_process_with_report(
         &synthetic_assignment_ledger,
         &authoritative_slab_ledger,
         &normalization_events,
+        &r2_observations,
     );
     _mg.with_stats(_ms);
 
@@ -4591,6 +4602,8 @@ mod edata_relocation_tests {
             security_cookie_rva: None,
             security_cookie_complement_rva: None,
             pure_rebuild: false,
+            dump_timing: crate::DumpTiming::Immediate,
+            section_content_reference: None,
             capture_policy: crate::DumpCapturePolicy::default(),
         };
         let out_data = write_output_file(

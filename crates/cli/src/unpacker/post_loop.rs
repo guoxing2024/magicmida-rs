@@ -393,6 +393,9 @@ pub(super) fn run_post_loop_phases(
             None
         },
         pure_rebuild,
+        // WO-201 defaults: Immediate timing, no R1 baseline (zero change).
+        dump_timing: mida_pe::DumpTiming::Immediate,
+        section_content_reference: None,
         capture_policy,
     };
 
