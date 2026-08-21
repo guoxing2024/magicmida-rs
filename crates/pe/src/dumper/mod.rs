@@ -43,6 +43,7 @@ mod import_section;
 mod module_identity;
 mod original_imports;
 mod output_writer;
+mod post_self_decrypt;
 mod pure_rebuild_adapter;
 mod raw_slab_coherence;
 mod remote_modules;

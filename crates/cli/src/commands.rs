@@ -40,6 +40,7 @@ pub fn run_command(cmd: Command) -> Result<(), anyhow::Error> {
                 container_restore,
                 profile,
                 pure_rebuild,
+                dump_timing,
                 capture_policy,
                 &capture_policy_digest,
                 preflight_dir.as_deref(),

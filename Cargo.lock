@@ -239,6 +239,7 @@ dependencies = [
  "mida-core",
  "mida-disasm",
  "pelite",
+ "serde",
  "serde_json",
  "sha2",
  "thiserror",

@@ -59,6 +59,7 @@ pub(super) fn run_post_loop_phases(
     container_restore: ContainerRestoreMode,
     profile: DumpProfile,
     pure_rebuild: bool,
+    dump_timing: mida_pe::DumpTiming,
     // CLI / case-manifest capture policy (may be empty).
     cli_capture_policy: DumpCapturePolicy,
     early_section_snapshots: &[EarlySectionSnapshot],
@@ -394,7 +395,7 @@ pub(super) fn run_post_loop_phases(
         },
         pure_rebuild,
         // WO-201 defaults: Immediate timing, no R1 baseline (zero change).
-        dump_timing: mida_pe::DumpTiming::Immediate,
+        dump_timing,
         section_content_reference: None,
         capture_policy,
     };
