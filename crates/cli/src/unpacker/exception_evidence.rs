@@ -276,9 +276,26 @@ fn no_reloc_state(
     {
         blockers.push("dynamic base without relocation".to_string());
     }
-    // D2.2-4: runtime/final consistency.
+    // D2.2-4: runtime/final consistency (GTO-H4-D: the final axis is
+    // re-parsed from the candidate PE, not the dump object).
     if final_reloc.image_base_changed {
         blockers.push("runtime/final base mismatch".to_string());
+    }
+    // D2 no-reloc preservation: a stripped+absent candidate MUST keep the
+    // stripped flag and absent directory. Clearing either is fabrication.
+    if reloc.relocs_stripped != final_reloc.relocs_stripped {
+        blockers.push("runtime/final RELOCS_STRIPPED mismatch".to_string());
+    }
+    if reloc.directory_present != !final_reloc.directory_absent {
+        blockers.push("runtime/final base-reloc directory mismatch".to_string());
+    }
+    if reloc.dynamic_base != final_reloc.dynamic_base {
+        blockers.push("runtime/final DYNAMIC_BASE mismatch".to_string());
+    }
+    if reloc.runtime_image_base != final_reloc.runtime_image_base
+        || reloc.preferred_image_base != final_reloc.preferred_image_base
+    {
+        blockers.push("runtime/final image base metadata mismatch".to_string());
     }
     let state_text = if blockers.is_empty() {
         if directory_absent {
@@ -303,9 +320,19 @@ fn no_reloc_state(
     }
 }
 
-/// Minimal final relocation facts needed for the D2.2-4 cross-check.
+/// Final relocation facts re-parsed from the candidate's own PE header
+/// (GTO-H4-D: never trust the dump object; the D2.2-4 cross-check must use
+/// the on-disk candidate). `image_base_changed` alone is insufficient — a
+/// no-reloc candidate keeps RELOCS_STRIPPED and an absent directory even
+/// when its image base equals the runtime base.
 pub(crate) struct NoRelocFinalState {
     pub image_base_changed: bool,
+    pub directory_absent: bool,
+    pub directory_present_but_empty: bool,
+    pub relocs_stripped: bool,
+    pub dynamic_base: bool,
+    pub runtime_image_base: u64,
+    pub preferred_image_base: u64,
 }
 
 pub(crate) fn write_exception_evidence(
@@ -693,6 +720,12 @@ mod tests {
         };
         let final_reloc = NoRelocFinalState {
             image_base_changed: false,
+            directory_absent: true,
+            directory_present_but_empty: false,
+            relocs_stripped: reloc.relocs_stripped,
+            dynamic_base: reloc.dynamic_base,
+            runtime_image_base: reloc.runtime_image_base,
+            preferred_image_base: reloc.preferred_image_base,
         };
         let nrs = no_reloc_state(&reloc, &final_reloc);
         assert_eq!(
@@ -746,6 +779,12 @@ mod tests {
         };
         let final_reloc = NoRelocFinalState {
             image_base_changed: false,
+            directory_absent: true,
+            directory_present_but_empty: false,
+            relocs_stripped: reloc.relocs_stripped,
+            dynamic_base: reloc.dynamic_base,
+            runtime_image_base: reloc.runtime_image_base,
+            preferred_image_base: reloc.preferred_image_base,
         };
         let nrs = no_reloc_state(&reloc, &final_reloc);
         assert!(!nrs.blockers.is_empty());

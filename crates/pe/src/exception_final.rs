@@ -270,12 +270,17 @@ impl ExceptionFinalDecoder {
         if version > 2 {
             status = UnwindInfoStatus::InvalidVersion;
         }
-        if !matches!(flags, 0x00 | 0x01 | 0x02 | 0x03 | 0x04 | 0x05 | 0x06 | 0x07) {
+        // GTO-H4-D: only {0,1,2,3,4} are allowed; CHAININFO+handler combos
+        // (0x05/0x06/0x07) are invalid on x64 and must fail closed.
+        if !matches!(flags, 0x00 | 0x01 | 0x02 | 0x03 | 0x04) {
             status = UnwindInfoStatus::InvalidFlags;
         }
 
         let code_bytes = u32::from(count_of_codes) * 2;
-        let total = UNWIND_INFO_HEADER_SIZE as u32 + code_bytes;
+        // GTO-H4-D: the handler slot sits on the 4-byte-aligned boundary
+        // after the codes (odd count_of_codes leaves 1 padding byte).
+        let padded_bytes = (code_bytes + 3) & !3;
+        let total = UNWIND_INFO_HEADER_SIZE as u32 + padded_bytes;
         let mut codes = Vec::with_capacity(usize::from(count_of_codes));
         let mut handler_rva: Option<u32> = None;
         if u64::from(unwind_info_rva) + u64::from(total) > u64::from(size_of_image) {
@@ -297,9 +302,9 @@ impl ExceptionFinalDecoder {
             } else {
                 status = UnwindInfoStatus::CodesOutOfBounds;
             }
-            // Handler slot after the codes (only when a flag demands it).
+            // Handler slot after the codes, 4-byte-aligned (GTO-H4-D).
             if flags & (UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER | UNW_FLAG_CHAININFO) != 0 {
-                let h_off = codes_off + code_bytes as usize;
+                let h_off = codes_off + padded_bytes as usize;
                 if let Some(hb) = self.bytes.get(h_off..h_off + 4) {
                     handler_rva = Some(u32::from_le_bytes([hb[0], hb[1], hb[2], hb[3]]));
                 }
@@ -441,4 +446,124 @@ pub fn compare_runtime_final(
     }
     c.all_preserved = c.blockers.is_empty();
     c
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pe_with_pdata(
+        pdata_rva: u32,
+        pdata_size: u32,
+        func_begin: u32,
+        func_end: u32,
+        unwind_rva: u32,
+        text_begin: u32,
+        text_end: u32,
+    ) -> Vec<u8> {
+        let mut b = vec![0u8; 0x6000];
+        b[0] = b'M';
+        b[1] = b'Z';
+        b[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        b[0x80..0x84].copy_from_slice(b"PE\0\0");
+        b[0x84..0x86].copy_from_slice(&0x8664u16.to_le_bytes());
+        b[0x86..0x88].copy_from_slice(&2u16.to_le_bytes());
+        b[0x94..0x96].copy_from_slice(&240u16.to_le_bytes());
+        b[0x98..0x9a].copy_from_slice(&0x020Bu16.to_le_bytes());
+        b[0xa0..0xa8].copy_from_slice(&0x140000000u64.to_le_bytes());
+        b[0xd0..0xd4].copy_from_slice(&0x8000u32.to_le_bytes());
+        let dd_off = 0x98 + 112 + 8 * 3;
+        b[dd_off..dd_off + 4].copy_from_slice(&pdata_rva.to_le_bytes());
+        b[dd_off + 4..dd_off + 8].copy_from_slice(&pdata_size.to_le_bytes());
+        let sec = 0x98 + 112 + 8 * 16;
+        b[sec..sec + 8].copy_from_slice(b".text\0\0\0");
+        b[sec + 8..sec + 12].copy_from_slice(&(text_end - text_begin).to_le_bytes());
+        b[sec + 12..sec + 16].copy_from_slice(&text_begin.to_le_bytes());
+        b[sec + 16..sec + 20].copy_from_slice(&(text_end - text_begin).to_le_bytes());
+        b[sec + 20..sec + 24].copy_from_slice(&text_begin.to_le_bytes());
+        b[sec + 36..sec + 40].copy_from_slice(&0x6000_0020u32.to_le_bytes());
+        let sec2 = sec + 40;
+        b[sec2..sec2 + 8].copy_from_slice(b".pdata\0\0");
+        b[sec2 + 8..sec2 + 12].copy_from_slice(&pdata_size.to_le_bytes());
+        b[sec2 + 12..sec2 + 16].copy_from_slice(&pdata_rva.to_le_bytes());
+        b[sec2 + 16..sec2 + 20].copy_from_slice(&pdata_size.to_le_bytes());
+        b[sec2 + 20..sec2 + 24].copy_from_slice(&pdata_rva.to_le_bytes());
+        b[sec2 + 36..sec2 + 40].copy_from_slice(&0x4000_0040u32.to_le_bytes());
+        let rf = pdata_rva as usize;
+        b[rf..rf + 4].copy_from_slice(&func_begin.to_le_bytes());
+        b[rf + 4..rf + 8].copy_from_slice(&func_end.to_le_bytes());
+        b[rf + 8..rf + 12].copy_from_slice(&unwind_rva.to_le_bytes());
+        b
+    }
+
+    fn decode_unwind(bytes: &[u8]) -> ExceptionFinalReport {
+        ExceptionFinalDecoder::from_candidate_bytes(bytes)
+            .expect("candidate parses")
+            .decode()
+    }
+
+    #[test]
+    fn h4d_final_odd_count_of_codes_handler_alignment() {
+        let mut b = pe_with_pdata(0x2000, 12, 0x1000, 0x1100, 0x3000, 0x1000, 0x4000);
+        b[0x3000] = 0x08;
+        b[0x3001] = 0x10;
+        b[0x3002] = 13;
+        b[0x3003] = 0x00;
+        for i in 0..13u32 {
+            b[(0x3004 + i * 2) as usize] = (i & 0xff) as u8;
+            b[(0x3004 + i * 2 + 1) as usize] = 0x00;
+        }
+        b[0x301e] = 0xcc;
+        b[0x301f] = 0x00;
+        b[0x3020..0x3024].copy_from_slice(&0x2000u32.to_le_bytes());
+        let r = decode_unwind(&b);
+        assert!(r.is_complete(), "{}", r.blockers.join("; "));
+        assert_eq!(r.unwind_infos[0].handler_rva, Some(0x2000));
+        assert_eq!(r.unwind_infos[0].status, UnwindInfoStatus::Valid);
+    }
+
+    #[test]
+    fn h4d_final_even_count_of_codes_handler_no_padding() {
+        let mut b = pe_with_pdata(0x2000, 12, 0x1000, 0x1100, 0x3000, 0x1000, 0x4000);
+        b[0x3000] = 0x08;
+        b[0x3001] = 0x10;
+        b[0x3002] = 4;
+        b[0x3003] = 0x00;
+        for i in 0..4u32 {
+            b[(0x3004 + i * 2) as usize] = (i & 0xff) as u8;
+            b[(0x3004 + i * 2 + 1) as usize] = 0x00;
+        }
+        b[0x300c..0x3010].copy_from_slice(&0x2000u32.to_le_bytes());
+        let r = decode_unwind(&b);
+        assert!(r.is_complete(), "{}", r.blockers.join("; "));
+        assert_eq!(r.unwind_infos[0].handler_rva, Some(0x2000));
+        assert_eq!(r.unwind_infos[0].status, UnwindInfoStatus::Valid);
+    }
+
+    #[test]
+    fn h4d_final_chaininfo_with_handler_is_invalid_flags() {
+        let mut b = pe_with_pdata(0x2000, 12, 0x1000, 0x1100, 0x3000, 0x1000, 0x4000);
+        b[0x3000] = 0x29;
+        b[0x3001] = 0x10;
+        b[0x3002] = 0;
+        b[0x3003] = 0;
+        let r = decode_unwind(&b);
+        assert!(!r.is_complete());
+        assert!(r
+            .unwind_infos
+            .iter()
+            .any(|u| u.status == UnwindInfoStatus::InvalidFlags));
+    }
+
+    #[test]
+    fn h4d_final_runtime_function_12_byte_tuple() {
+        let b = pe_with_pdata(0x2000, 12, 0x1000, 0x1100, 0x3000, 0x1000, 0x4000);
+        let r = decode_unwind(&b);
+        assert!(r.is_complete(), "{}", r.blockers.join("; "));
+        assert_eq!(r.function_count, 1);
+        assert_eq!(r.functions[0].begin_rva, 0x1000);
+        assert_eq!(r.functions[0].end_rva, 0x1100);
+        assert_eq!(r.functions[0].unwind_info_rva, 0x3000);
+        assert_eq!(r.functions[0].status, RuntimeFunctionStatus::Valid);
+    }
 }

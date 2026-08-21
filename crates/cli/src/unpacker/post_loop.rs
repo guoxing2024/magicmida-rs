@@ -441,9 +441,23 @@ pub(super) fn run_post_loop_phases(
             std::fs::read(output_path).context("read candidate for exception evidence")?;
         let candidate_pe = PeHeader::from_bytes(&candidate_bytes)
             .context("parse candidate PE for exception evidence")?;
+        let ch = candidate_pe.nt_headers.file_header.characteristics;
+        let dc = candidate_pe.nt_headers.optional_header.dll_characteristics;
+        // IMAGE_DIRECTORY_ENTRY_BASERELOC == 5;
+        // IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE == 0x0040 (mida_pe keeps both
+        // crate-private; literal here with a comment, pinned by the acceptance
+        // sidecar tests).
+        let reloc_dd = candidate_pe.nt_headers.optional_header.data_directory[5];
+        let dynamic_base_bit: u16 = 0x0040;
         super::exception_evidence::NoRelocFinalState {
             image_base_changed: candidate_pe.image_base
                 != dump_report.relocation_report.runtime_image_base,
+            directory_absent: reloc_dd.virtual_address == 0 && reloc_dd.size == 0,
+            directory_present_but_empty: reloc_dd.virtual_address != 0 && reloc_dd.size == 0,
+            relocs_stripped: ch & 0x0001 != 0,
+            dynamic_base: dc & dynamic_base_bit != 0,
+            runtime_image_base: dump_report.relocation_report.runtime_image_base,
+            preferred_image_base: candidate_pe.image_base,
         }
     };
     let exception_sidecar_path = super::exception_evidence::write_exception_evidence(

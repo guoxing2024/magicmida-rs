@@ -79,12 +79,22 @@ pub(crate) fn validate_and_patch_pe_header(
             }
         }
     }
-    // Dump path rebuilds base relocations (`.reloc`). Carrying
-    // IMAGE_FILE_RELOCS_STRIPPED from the protected disk PE makes R0B
-    // aslr_reloc_consistency fail with relocs_stripped_but_present.
-    if pe.nt_headers.file_header.characteristics & IMAGE_FILE_RELOCS_STRIPPED != 0 {
-        pe.nt_headers.file_header.characteristics &= !IMAGE_FILE_RELOCS_STRIPPED;
-        debug!("cleared FileHeader.IMAGE_FILE_RELOCS_STRIPPED for dump emit");
+    // GTO-H4-D: RELOCS_STRIPPED handling must match what the dump actually
+    // emits. The shrink path rebuilds a full `.reloc` directory (the live
+    // image has relocations), so carrying the stripped flag would make the
+    // candidate self-contradictory (relocs_stripped_but_present) and R0B
+    // aslr_reloc_consistency fails. The NO-SHRINK path does NOT rebuild
+    // `.reloc` — a protected input with RELOCS_STRIPPED=true and an absent
+    // base-reloc directory is a genuine no-reloc state and MUST be preserved
+    // (clearing it would fabricate relocation capability the candidate does
+    // not have, breaking D2 no-reloc preservation).
+    if opts.shrink {
+        if pe.nt_headers.file_header.characteristics & IMAGE_FILE_RELOCS_STRIPPED != 0 {
+            pe.nt_headers.file_header.characteristics &= !IMAGE_FILE_RELOCS_STRIPPED;
+            debug!("cleared FileHeader.IMAGE_FILE_RELOCS_STRIPPED (shrink rebuilds .reloc)");
+        }
+    } else {
+        debug!("kept FileHeader.IMAGE_FILE_RELOCS_STRIPPED (no-shrink preserves no-reloc state)");
     }
     Ok(())
 }

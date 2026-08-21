@@ -22,6 +22,13 @@ pub const RUNTIME_FUNCTION_SIZE: usize = 12;
 pub const UNWIND_INFO_HEADER_SIZE: usize = 4;
 /// Maximum exception directory bytes observed (64 MiB) — E2 cap.
 pub const MAX_EXCEPTION_DIRECTORY_BYTES: usize = 64 * 1024 * 1024;
+
+/// x64 UNWIND_INFO: the optional handler/chain slot is placed on a 4-byte
+/// boundary after the unwind codes (count_of_codes*2 bytes, padded to 4).
+#[inline]
+pub(crate) fn align_up_4(v: u32) -> u32 {
+    (v + 3) & !3
+}
 /// IMAGE_SCN_MEM_EXECUTE.
 const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 /// UNW_FLAG_* bits.
@@ -29,15 +36,15 @@ const UNW_FLAG_EHANDLER: u8 = 0x01;
 const UNW_FLAG_UHANDLER: u8 = 0x02;
 const UNW_FLAG_CHAININFO: u8 = 0x04;
 /// Allowed flag combinations (KNONFLAGS | EHANDLER | UHANDLER | CHAININFO).
-const ALLOWED_UNWIND_FLAGS: [u8; 8] = [
+// GTO-H4-D: allowed flag combinations are ONLY {0,1,2,3,4}. CHAININFO
+// (0x04) combined with EHANDLER/UHANDLER (0x05/0x06/0x07) is invalid on x64
+// (a chain entry must not also carry its own handler) and must fail closed.
+const ALLOWED_UNWIND_FLAGS: [u8; 5] = [
     0x00, // KNONFLAGS
     0x01, // EHANDLER
     0x02, // UHANDLER
     0x03, // EHANDLER|UHANDLER
     0x04, // CHAININFO
-    0x05, // CHAININFO|EHANDLER
-    0x06, // CHAININFO|UHANDLER
-    0x07, // CHAININFO|EHANDLER|UHANDLER
 ];
 
 /// Classification of the exception data-directory tuple.
@@ -568,10 +575,14 @@ fn observe_unwind_info<F, E>(
         status = UnwindInfoStatus::InvalidFlags;
     }
 
-    // E13: count_of_codes * 2 + 4 <= unwind info span. The span is bounded by
+    // E13: the unwind info span covers header + codes + 4-byte-aligned
+    // padding (the optional handler slot sits on a 4-byte boundary after the
+    // codes). count_of_codes is ODD for EHANDLER/UHANDLER/CHAININFO entries
+    // (1 padding byte), EVEN for plain entries. The span is bounded by
     // SizeOfImage (E8); read codes within the image, then validate the bound.
     let code_bytes = u32::from(count_of_codes) * 2;
-    let total = UNWIND_INFO_HEADER_SIZE as u32 + code_bytes;
+    let padded_bytes = align_up_4(code_bytes);
+    let total = UNWIND_INFO_HEADER_SIZE as u32 + padded_bytes;
     let mut codes = Vec::with_capacity(usize::from(count_of_codes));
     let mut handler_rva: Option<u32> = None;
     let mut codes_valid = true;
@@ -599,10 +610,12 @@ fn observe_unwind_info<F, E>(
                 slot_status: UnwindCodeStatus::Valid,
             });
         }
-        // Handler slot after the codes (only when EHANDLER/UHANDLER/CHAININFO).
+        // Handler slot after the codes, on the 4-byte-aligned boundary
+        // (GTO-H4-D: the slot is at header + align_up(code_bytes, 4), NOT
+        // header + code_bytes — odd count_of_codes leaves 1 padding byte).
         if flags & (UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER | UNW_FLAG_CHAININFO) != 0 {
             let handler_addr = addr
-                .checked_add(UNWIND_INFO_HEADER_SIZE as u64 + code_bytes as u64)
+                .checked_add(UNWIND_INFO_HEADER_SIZE as u64 + padded_bytes as u64)
                 .unwrap_or(u64::MAX);
             let mut hbuf = [0u8; 4];
             if reader(handler_addr, &mut hbuf).is_ok_and(|n| n == 4) {
@@ -1029,6 +1042,181 @@ mod tests {
         assert!(report.no_overlap);
         assert!(report.handlers_in_executable);
         assert!(report.blockers.is_empty());
+    }
+
+    // GTO-H4-D P4: fn78 regression — odd count_of_codes (13) places the
+    // handler slot at header + align_up(26,4)=+28 (i.e. byte 32), NOT at
+    // header+26 (byte 30). The defect read 0x6ee80000 (misaligned garbage);
+    // the fixed parser reads 0x00106ee8 (executable-section handler).
+    #[test]
+    fn h4d_odd_count_of_codes_handler_alignment_fn78_regression() {
+        // PE with one executable .text section (0x1000..0x5000).
+        let bytes = {
+            let mut b = vec![0u8; 0x400];
+            b[0] = b'M';
+            b[1] = b'Z';
+            b[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+            b[0x80..0x84].copy_from_slice(b"PE  ");
+            b[0x84..0x86].copy_from_slice(&0x8664u16.to_le_bytes());
+            b[0x86..0x88].copy_from_slice(&1u16.to_le_bytes());
+            b[0x94..0x96].copy_from_slice(&240u16.to_le_bytes());
+            b[0x98..0x9a].copy_from_slice(&0x020Bu16.to_le_bytes());
+            b[0xd0..0xd4].copy_from_slice(&0x6000u32.to_le_bytes());
+            let dd_off = 0x98 + 112 + 8 * 3;
+            b[dd_off..dd_off + 4].copy_from_slice(&0x1000u32.to_le_bytes());
+            b[dd_off + 4..dd_off + 8].copy_from_slice(&12u32.to_le_bytes());
+            let sec = 0x98 + 112 + 8 * 16;
+            b[sec..sec + 8].copy_from_slice(b".text   ");
+            b[sec + 8..sec + 12].copy_from_slice(&0x4000u32.to_le_bytes());
+            b[sec + 12..sec + 16].copy_from_slice(&0x1000u32.to_le_bytes());
+            b[sec + 16..sec + 20].copy_from_slice(&0x4000u32.to_le_bytes());
+            b[sec + 20..sec + 24].copy_from_slice(&0x200u32.to_le_bytes());
+            b[sec + 36..sec + 40].copy_from_slice(&0x6000_0020u32.to_le_bytes());
+            b
+        };
+        let pe = PeHeader::from_bytes(&bytes).expect("test PE parses");
+        let mut mem = vec![0u8; 0x6000];
+        mem[0x1000..0x100c].copy_from_slice(&{
+            let mut t = Vec::new();
+            t.extend_from_slice(&0x1000u32.to_le_bytes());
+            t.extend_from_slice(&0x1100u32.to_le_bytes());
+            t.extend_from_slice(&0x2000u32.to_le_bytes());
+            t
+        });
+        // unwind @0x2000: flags=EHANDLER (0x08 in the version/flags byte),
+        // count_of_codes=13 (odd) — the exact fn78 shape.
+        mem[0x2000] = 0x08; // version=0, flags=EHANDLER
+        mem[0x2001] = 0x10; // size_of_prolog
+        mem[0x2002] = 13; // count_of_codes = 13 (odd)
+        mem[0x2003] = 0x00; // frame
+                            // 13 unwind codes = 26 bytes at 0x2004..0x201e, then 2 padding
+                            // bytes 0x201e..0x2020, then the handler slot at 0x2020..0x2024.
+        for i in 0..13u32 {
+            mem[(0x2004 + i * 2) as usize] = (i & 0xff) as u8;
+            mem[(0x2004 + i * 2 + 1) as usize] = 0x00;
+        }
+        // Padding bytes 0x201e..0x2020 are part of the codes span, NOT the
+        // handler. The pre-fix parser read the handler at 0x201e..0x2022
+        // (header+26): those bytes are 0xcc 0x00 0x00 0x00 -> garbage
+        // 0x000000cc. The fixed parser reads the aligned slot at 0x2020.
+        mem[0x201e] = 0xcc;
+        mem[0x201f] = 0x00;
+        // handler slot @0x2020 = 0x0000_3000 (inside .text 0x1000..0x5000)
+        mem[0x2020..0x2024].copy_from_slice(&0x0000_3000u32.to_le_bytes());
+        let report = observe_exception_runtime(
+            &pe,
+            0x140000000,
+            0x140000000,
+            memory_reader(&mem, 0x140000000),
+        );
+        assert!(
+            report.is_complete(),
+            "{} statuses={:?}",
+            report.failure_summary(),
+            report
+                .unwind_infos
+                .iter()
+                .map(|u| u.status)
+                .collect::<Vec<_>>()
+        );
+        let u = &report.unwind_infos[0];
+        assert_eq!(
+            u.handler_rva,
+            Some(0x0000_3000),
+            "handler must be the aligned slot"
+        );
+        assert_eq!(u.status, UnwindInfoStatus::Valid);
+        assert!(report.handlers_in_executable);
+    }
+
+    // GTO-H4-D P4: even count_of_codes has NO padding — the handler slot
+    // sits directly after the codes (header + align_up(2n,4) == header+2n).
+    #[test]
+    fn h4d_even_count_of_codes_handler_no_padding() {
+        // PE with one executable .text section (0x1000..0x5000).
+        let bytes = {
+            let mut b = vec![0u8; 0x400];
+            b[0] = b'M';
+            b[1] = b'Z';
+            b[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+            b[0x80..0x84].copy_from_slice(b"PE  ");
+            b[0x84..0x86].copy_from_slice(&0x8664u16.to_le_bytes());
+            b[0x86..0x88].copy_from_slice(&1u16.to_le_bytes());
+            b[0x94..0x96].copy_from_slice(&240u16.to_le_bytes());
+            b[0x98..0x9a].copy_from_slice(&0x020Bu16.to_le_bytes());
+            b[0xd0..0xd4].copy_from_slice(&0x6000u32.to_le_bytes());
+            let dd_off = 0x98 + 112 + 8 * 3;
+            b[dd_off..dd_off + 4].copy_from_slice(&0x1000u32.to_le_bytes());
+            b[dd_off + 4..dd_off + 8].copy_from_slice(&12u32.to_le_bytes());
+            let sec = 0x98 + 112 + 8 * 16;
+            b[sec..sec + 8].copy_from_slice(b".text   ");
+            b[sec + 8..sec + 12].copy_from_slice(&0x4000u32.to_le_bytes());
+            b[sec + 12..sec + 16].copy_from_slice(&0x1000u32.to_le_bytes());
+            b[sec + 16..sec + 20].copy_from_slice(&0x4000u32.to_le_bytes());
+            b[sec + 20..sec + 24].copy_from_slice(&0x200u32.to_le_bytes());
+            b[sec + 36..sec + 40].copy_from_slice(&0x6000_0020u32.to_le_bytes());
+            b
+        };
+        let pe = PeHeader::from_bytes(&bytes).expect("test PE parses");
+        let mut mem = vec![0u8; 0x6000];
+        mem[0x1000..0x100c].copy_from_slice(&{
+            let mut t = Vec::new();
+            t.extend_from_slice(&0x1000u32.to_le_bytes());
+            t.extend_from_slice(&0x1100u32.to_le_bytes());
+            t.extend_from_slice(&0x2000u32.to_le_bytes());
+            t
+        });
+        // unwind @0x2000: flags=EHANDLER, count=4 (even) — handler at
+        // header+align_up(8,4)=header+8 = 0x200c (NO padding).
+        mem[0x2000] = 0x08;
+        mem[0x2001] = 0x10;
+        mem[0x2002] = 4;
+        mem[0x2003] = 0x00;
+        for i in 0..4u32 {
+            mem[(0x2004 + i * 2) as usize] = (i & 0xff) as u8;
+            mem[(0x2004 + i * 2 + 1) as usize] = 0x00;
+        }
+        // handler slot @0x200c (4 codes * 2 = 8 bytes, aligned is 8)
+        mem[0x200c..0x2010].copy_from_slice(&0x2000u32.to_le_bytes());
+        let report = observe_exception_runtime(
+            &pe,
+            0x140000000,
+            0x140000000,
+            memory_reader(&mem, 0x140000000),
+        );
+        assert!(report.is_complete(), "{}", report.failure_summary());
+        assert_eq!(report.unwind_infos[0].handler_rva, Some(0x2000));
+        assert!(report.handlers_in_executable);
+    }
+
+    #[test]
+    fn h4d_chaininfo_with_handler_is_invalid_flags() {
+        let pe = test_pe(0x1000, 12, 0x4000);
+        let mut mem = vec![0u8; 0x5000];
+        mem[0x1000..0x100c].copy_from_slice(&{
+            let mut t = Vec::new();
+            t.extend_from_slice(&0x1000u32.to_le_bytes());
+            t.extend_from_slice(&0x1100u32.to_le_bytes());
+            t.extend_from_slice(&0x2000u32.to_le_bytes());
+            t
+        });
+        // version=1 (low 3 bits), flags=CHAININFO|EHANDLER=0x05 (bits 3..5)
+        // => header[0] = (0x05 << 3) | 0x01 = 0x29.
+        mem[0x2000] = 0x29; // version=1, flags=0x05 (CHAININFO|EHANDLER)
+        mem[0x2001] = 0x10;
+        mem[0x2002] = 0;
+        mem[0x2003] = 0;
+        let report = observe_exception_runtime(
+            &pe,
+            0x140000000,
+            0x140000000,
+            memory_reader(&mem, 0x140000000),
+        );
+        assert!(!report.is_complete());
+        assert!(report
+            .unwind_infos
+            .iter()
+            .any(|u| u.status == UnwindInfoStatus::InvalidFlags));
     }
 
     #[test]
