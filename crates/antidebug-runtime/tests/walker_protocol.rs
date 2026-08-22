@@ -1,4 +1,4 @@
-//! WO-1501 walker wire protocol v2 — offline tests (part A: params).
+﻿//! WO-1501 walker wire protocol v2 — offline tests (part A: params).
 //!
 //! These tests run fully offline: no Windows API, no target process.
 //! They verify layout constants, checked encode/decode/validate, fixed
@@ -213,11 +213,13 @@ fn params_candidate_count_limits() {
     let cands2: Vec<u64> = (0..MAX_CANDIDATE_COUNT + 1)
         .map(|i| 0x0000_0001_0000_0000u64 + i as u64 * 0x1000)
         .collect();
-    let res = over.to_blob_bytes(&cands2).and_then(|b| {
-        let (d, c) = WalkerParamsV2::from_blob_bytes(&b).unwrap();
-        d.validate(&c)
-    });
-    assert!(matches!(res, Err(ProtocolError::CountTooLarge { .. })));
+    // Hardened decode rejects the over-limit count BEFORE any allocation;
+    // to_blob_bytes itself is an encoder and does not enforce the cap.
+    let blob2 = over.to_blob_bytes(&cands2).unwrap();
+    assert!(matches!(
+        WalkerParamsV2::from_blob_bytes(&blob2),
+        Err(ProtocolError::CountTooLarge { .. })
+    ));
 }
 
 /// Fixed fields: mutate the decoded header struct directly so decode

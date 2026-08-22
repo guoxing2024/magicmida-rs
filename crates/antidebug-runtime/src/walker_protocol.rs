@@ -1,4 +1,4 @@
-//! Walker wire protocol v2 (WO-1501).
+﻿//! Walker wire protocol v2 (WO-1501).
 //!
 //! Pure-offline, dependency-light binary contract for the Walker IPC:
 //!
@@ -482,21 +482,63 @@ impl WalkerParamsV2 {
             });
         }
         let hdr = Self::from_bytes(&bytes[0..PARAMS_HEADER_BYTES])?;
+        // --- Validation phase (no allocation) ---
+        if hdr.magic != PARAMS_MAGIC {
+            return Err(ProtocolError::BadMagic { got: hdr.magic });
+        }
+        if hdr.version != PROTOCOL_VERSION {
+            return Err(ProtocolError::BadVersion {
+                got: hdr.version,
+                expected: PROTOCOL_VERSION,
+            });
+        }
+        if hdr.header_bytes != PARAMS_HEADER_BYTES as u16 {
+            return Err(ProtocolError::BadHeaderBytes {
+                got: hdr.header_bytes,
+                expected: PARAMS_HEADER_BYTES as u16,
+            });
+        }
+        if hdr.candidate_off != CANDIDATE_OFF as u32 {
+            return Err(ProtocolError::BadCandidateOff {
+                got: hdr.candidate_off,
+                expected: CANDIDATE_OFF as u32,
+            });
+        }
+        if hdr.candidate_stride != CANDIDATE_STRIDE as u16 {
+            return Err(ProtocolError::BadCandidateStride {
+                got: hdr.candidate_stride,
+                expected: CANDIDATE_STRIDE as u16,
+            });
+        }
+        if hdr.candidate_count > MAX_CANDIDATE_COUNT {
+            return Err(ProtocolError::CountTooLarge {
+                got: hdr.candidate_count as u64,
+                max: MAX_CANDIDATE_COUNT as u64,
+            });
+        }
         if bytes.len() as u64 != hdr.blob_total_bytes {
             return Err(ProtocolError::BadBlobTotalBytes {
                 got: bytes.len() as u64,
             });
         }
+        let arr_len = (hdr.candidate_count as u64)
+            .checked_mul(CANDIDATE_STRIDE as u64)
+            .ok_or(ProtocolError::Overflow)?;
+        let end = (hdr.candidate_off as u64)
+            .checked_add(arr_len)
+            .ok_or(ProtocolError::Overflow)?;
+        if end > hdr.blob_total_bytes {
+            return Err(ProtocolError::OutOfBounds {
+                start: hdr.candidate_off as u64,
+                end,
+                total: hdr.blob_total_bytes,
+            });
+        }
+        // --- Allocation phase (bounds already proven) ---
         let mut candidates = Vec::with_capacity(hdr.candidate_count as usize);
         let mut pos = hdr.candidate_off as usize;
         for _ in 0..hdr.candidate_count {
-            if pos + CANDIDATE_STRIDE > bytes.len() {
-                return Err(ProtocolError::OutOfBounds {
-                    start: pos as u64,
-                    end: (pos + CANDIDATE_STRIDE) as u64,
-                    total: bytes.len() as u64,
-                });
-            }
+            // Slice in-bounds: pos+8 <= end <= blob_total_bytes == bytes.len().
             candidates.push(u64::from_le_bytes(
                 bytes[pos..pos + CANDIDATE_STRIDE].try_into().unwrap(),
             ));
@@ -1145,6 +1187,45 @@ pub fn encode_section(
     header: &ResultSectionHeaderV2,
     results: &[ProbeResultV2],
 ) -> Result<Vec<u8>, ProtocolError> {
+    // Entry validation: never emit a section that violates the frozen wire
+    // contract, and never allocate from an untrusted section_bytes.
+    // section_bytes is a CAPACITY: MIN_SECTION_HEADER_BYTES + n*40 for some
+    // n in [0, MAX_CANDIDATE_COUNT]; result_count <= n.
+    if header.section_bytes > MAX_RESULT_SECTION_BYTES {
+        return Err(ProtocolError::CountTooLarge {
+            got: header.section_bytes,
+            max: MAX_RESULT_SECTION_BYTES,
+        });
+    }
+    if header.section_bytes < MIN_SECTION_HEADER_BYTES as u64 {
+        return Err(ProtocolError::BadSectionBytes {
+            got: header.section_bytes,
+        });
+    }
+    let capacity_n = header.section_bytes - MIN_SECTION_HEADER_BYTES as u64;
+    if capacity_n % PROBE_RESULT_BYTES as u64 != 0 {
+        return Err(ProtocolError::BadSectionBytes {
+            got: header.section_bytes,
+        });
+    }
+    let capacity = (capacity_n / PROBE_RESULT_BYTES as u64) as u32;
+    if capacity > MAX_CANDIDATE_COUNT {
+        return Err(ProtocolError::CountTooLarge {
+            got: header.section_bytes,
+            max: MAX_RESULT_SECTION_BYTES,
+        });
+    }
+    if header.section_bytes != identity.section_bytes {
+        return Err(ProtocolError::BadSectionBytes {
+            got: header.section_bytes,
+        });
+    }
+    if header.result_count > capacity {
+        return Err(ProtocolError::ResultCountExceedsCapacity {
+            got: header.result_count,
+            capacity,
+        });
+    }
     if results.len() != header.result_count as usize {
         return Err(ProtocolError::ResultCountExceedsCapacity {
             got: results.len() as u32,
@@ -1219,16 +1300,43 @@ pub fn parse_section(
     let header = ResultSectionHeaderV2::from_bytes(
         &bytes[IDENTITY_HEADER_BYTES..IDENTITY_HEADER_BYTES + RESULT_HEADER_BYTES],
     )?;
+    // --- Validation phase (no allocation) ---
+    // Fixed fields + closed sets + completed_flag/status consistency.
+    header.validate_layout()?;
+    if header.section_bytes != identity.section_bytes {
+        return Err(ProtocolError::BadSectionBytes {
+            got: header.section_bytes,
+        });
+    }
     if bytes.len() as u64 != header.section_bytes {
         return Err(ProtocolError::BadSectionBytes {
             got: bytes.len() as u64,
         });
     }
+    if header.section_bytes > MAX_RESULT_SECTION_BYTES {
+        return Err(ProtocolError::CountTooLarge {
+            got: header.section_bytes,
+            max: MAX_RESULT_SECTION_BYTES,
+        });
+    }
+    if header.result_count > MAX_CANDIDATE_COUNT {
+        return Err(ProtocolError::CountTooLarge {
+            got: header.result_count as u64,
+            max: MAX_CANDIDATE_COUNT as u64,
+        });
+    }
     if header.completed_flag == COMPLETED_FLAG_PENDING {
+        if header.result_count != 0 {
+            return Err(ProtocolError::InconsistentPendingCount {
+                got: header.result_count,
+            });
+        }
         return Ok((identity, header, Vec::new()));
     }
+    // result_stride is validated by validate_layout() == PROBE_RESULT_BYTES,
+    // so count*stride is count*40 with count <= 4096: no overflow possible.
     let payload_len = (header.result_count as u64)
-        .checked_mul(header.result_stride as u64)
+        .checked_mul(PROBE_RESULT_BYTES as u64)
         .ok_or(ProtocolError::Overflow)?;
     let end = (header.results_off as u64)
         .checked_add(payload_len)
@@ -1240,10 +1348,14 @@ pub fn parse_section(
             total: header.section_bytes,
         });
     }
+    // --- Allocation phase (bounds already proven) ---
     let mut results = Vec::with_capacity(header.result_count as usize);
     let mut pos = header.results_off as usize;
     for _ in 0..header.result_count {
-        results.push(ProbeResultV2::from_bytes(&bytes[pos..pos + PROBE_RESULT_BYTES])?);
+        // Slice in-bounds: pos+40 <= end <= section_bytes == bytes.len().
+        results.push(ProbeResultV2::from_bytes(
+            &bytes[pos..pos + PROBE_RESULT_BYTES],
+        )?);
         pos += PROBE_RESULT_BYTES;
     }
     Ok((identity, header, results))
@@ -1293,6 +1405,22 @@ pub fn validate_section(
         return Err(ProtocolError::ResultCountExceedsCapacity {
             got: results.len() as u32,
             capacity: header.result_count,
+        });
+    }
+    // --- Self-contained payload bounds (does not rely on the caller) ---
+    // results.len() <= result_capacity <= MAX_CANDIDATE_COUNT, so the
+    // multiplication below cannot overflow; checked anyway for the contract.
+    let payload_len = (results.len() as u64)
+        .checked_mul(PROBE_RESULT_BYTES as u64)
+        .ok_or(ProtocolError::Overflow)?;
+    let payload_end = (header.results_off as u64)
+        .checked_add(payload_len)
+        .ok_or(ProtocolError::Overflow)?;
+    if payload_end > header.section_bytes {
+        return Err(ProtocolError::OutOfBounds {
+            start: header.results_off as u64,
+            end: payload_end,
+            total: header.section_bytes,
         });
     }
     // Payload CRC covers [results_off, results_off + count * stride).

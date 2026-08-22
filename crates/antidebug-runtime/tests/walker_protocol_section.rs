@@ -1,10 +1,10 @@
-//! WO-1501 walker wire protocol v2 — offline tests (part B: result section
+﻿//! WO-1501 walker wire protocol v2 — offline tests (part B: result section
 //! and mapping identity). Pure offline; no Windows API.
 
 use mida_antidebug_runtime::walker_protocol::{
     derive_session_id, encode_section, parse_section, validate_section, IdentityExpectation,
     MappingIdentityHeaderV2, ProbeResultV2, ProtocolError, ResultSectionHeaderV2,
-    CLASSIFICATION_TYPE_C, COMPLETED_FLAG_ABORT, COMPLETED_FLAG_DONE,
+    WalkerParamsV2, CLASSIFICATION_TYPE_C, COMPLETED_FLAG_ABORT, COMPLETED_FLAG_DONE,
     COMPLETED_FLAG_PENDING, PROBE_RESULT_BYTES, RESULT_FLAG_GUARD_SEEN, RESULT_FLAG_NONE,
     WALKER_STATUS_ERROR_MAP_FAILED, WALKER_STATUS_ERROR_PROBE_ABORTED,
     WALKER_STATUS_OK,
@@ -122,10 +122,11 @@ fn section_status_flag_consistency() {
     hdr.completed_flag = COMPLETED_FLAG_DONE;
     hdr.walker_status = WALKER_STATUS_ERROR_PROBE_ABORTED; // inconsistent
     let r = make_probe(0x1000, CLASSIFICATION_TYPE_C, RESULT_FLAG_NONE, 0, 0);
-    let res = encode_section(&ident, &hdr, &[r]).and_then(|b| {
-        let (i, h, r2) = parse_section(&b).unwrap();
-        validate_section(&i, &h, &r2, &sample_expectation(), cap)
-    });
+    // The hardened parse_section validates status/flag consistency at parse
+    // time, so the inconsistent combination is rejected there (before any
+    // consumer can observe a half-valid section).
+    let encoded = encode_section(&ident, &hdr, &[r]).unwrap();
+    let res = parse_section(&encoded);
     assert!(matches!(res, Err(ProtocolError::BadStatusForState { .. })));
 }
 
@@ -325,4 +326,200 @@ fn header_closed_sets_rejected() {
     let mut h = hdr;
     h.results_off = 100; // not 8-aligned
     assert!(matches!(h.validate_layout(), Err(ProtocolError::ResultsOffUnaligned { .. })));
+}
+
+// =========================================================================
+// WO-1601: hostile-input hardening tests.
+// Every hostile buffer must be rejected with an Err, never a panic, and
+// never an untrusted-size allocation. catch_unwind proves panic-freedom.
+// =========================================================================
+
+/// from_blob_bytes with candidate_count = u32::MAX must be rejected without
+/// allocating (previously Vec::with_capacity(u32::MAX) -> OOM).
+#[test]
+fn hostile_params_count_max_no_alloc() {
+    let mut blob = vec![0u8; 0x40 + 8];
+    blob[0..4].copy_from_slice(b"WALK");
+    blob[4..6].copy_from_slice(&2u16.to_le_bytes());
+    blob[6..8].copy_from_slice(&0x40u16.to_le_bytes());
+    blob[8..16].copy_from_slice(&((0x40 + 8) as u64).to_le_bytes());
+    blob[16..24].copy_from_slice(&0x400000u64.to_le_bytes());
+    blob[24..28].copy_from_slice(&0x40u32.to_le_bytes());
+    blob[28..32].copy_from_slice(&u32::MAX.to_le_bytes()); // hostile count
+    blob[32..34].copy_from_slice(&8u16.to_le_bytes());
+    blob[34..36].copy_from_slice(&16u16.to_le_bytes());
+    blob[40..48].copy_from_slice(&1u64.to_le_bytes()); // nonce
+    let r = std::panic::catch_unwind(|| {
+        WalkerParamsV2::from_blob_bytes(&blob)
+    });
+    assert!(r.is_ok(), "from_blob_bytes panicked on hostile count");
+    assert!(matches!(
+        r.unwrap(),
+        Err(ProtocolError::CountTooLarge { .. })
+    ));
+}
+
+/// from_blob_bytes with candidate_off / stride violations must be rejected.
+#[test]
+fn hostile_params_fixed_field_reject_no_panic() {
+    let mut blob = vec![0u8; 0x40 + 8];
+    blob[0..4].copy_from_slice(b"WALK");
+    blob[4..6].copy_from_slice(&2u16.to_le_bytes());
+    blob[6..8].copy_from_slice(&0x40u16.to_le_bytes());
+    blob[8..16].copy_from_slice(&((0x40 + 8) as u64).to_le_bytes());
+    blob[24..28].copy_from_slice(&0x50u32.to_le_bytes()); // hostile off
+    blob[28..32].copy_from_slice(&1u32.to_le_bytes());
+    blob[32..34].copy_from_slice(&8u16.to_le_bytes());
+    blob[34..36].copy_from_slice(&16u16.to_le_bytes());
+    blob[40..48].copy_from_slice(&1u64.to_le_bytes());
+    let r = std::panic::catch_unwind(|| WalkerParamsV2::from_blob_bytes(&blob));
+    assert!(r.is_ok());
+    assert!(matches!(r.unwrap(), Err(ProtocolError::BadCandidateOff { .. })));
+
+    let mut blob = vec![0u8; 0x40 + 8];
+    blob[0..4].copy_from_slice(b"WALK");
+    blob[4..6].copy_from_slice(&2u16.to_le_bytes());
+    blob[6..8].copy_from_slice(&0x40u16.to_le_bytes());
+    blob[8..16].copy_from_slice(&((0x40 + 8) as u64).to_le_bytes());
+    blob[24..28].copy_from_slice(&0x40u32.to_le_bytes());
+    blob[28..32].copy_from_slice(&1u32.to_le_bytes());
+    blob[32..34].copy_from_slice(&1u16.to_le_bytes()); // hostile stride
+    blob[34..36].copy_from_slice(&16u16.to_le_bytes());
+    blob[40..48].copy_from_slice(&1u64.to_le_bytes());
+    let r = std::panic::catch_unwind(|| WalkerParamsV2::from_blob_bytes(&blob));
+    assert!(r.is_ok());
+    assert!(matches!(r.unwrap(), Err(ProtocolError::BadCandidateStride { .. })));
+}
+
+/// parse_section with result_count = u32::MAX (or over cap) must reject
+/// without allocating; stride = 0 / stride = 1 must reject at layout.
+#[test]
+fn hostile_section_count_stride_reject_no_panic() {
+    let cap = 1u32;
+    let section_bytes = 96 + cap as u64 * PROBE_RESULT_BYTES as u64;
+    // Build a well-formed identity header (CRC computed by encode_section).
+    let ident = MappingIdentityHeaderV2::new(
+        section_bytes,
+        4242,
+        1234,
+        0x0123_4567_89AB_CDEF,
+        derive_session_id(0x0123_4567_89AB_CDEF, 0x0000_0000_0040_0000, 1),
+    );
+    let hdr = ResultSectionHeaderV2::new(section_bytes, cap).unwrap();
+    let bytes = encode_section(&ident, &hdr, &[]).unwrap();
+    let _ = &bytes; // well-formed baseline used for corruption offsets below
+
+    // Corrupt the header in place: result_count = u32::MAX.
+    let mut hostile = bytes.clone();
+    let hoff = 0x38 + 0x10; // identity(0x38) + result_count offset(0x10)
+    hostile[hoff..hoff + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+    let r = std::panic::catch_unwind(|| parse_section(&hostile));
+    assert!(r.is_ok(), "parse_section panicked on hostile count");
+    assert!(matches!(
+        r.unwrap(),
+        Err(ProtocolError::CountTooLarge { .. })
+    ));
+
+    // result_stride = 0 -> BadResultStride at validate_layout.
+    let mut hostile = bytes.clone();
+    let soff = 0x38 + 0x14;
+    hostile[soff..soff + 4].copy_from_slice(&0u32.to_le_bytes());
+    let r = std::panic::catch_unwind(|| parse_section(&hostile));
+    assert!(r.is_ok());
+    assert!(matches!(r.unwrap(), Err(ProtocolError::BadResultStride { .. })));
+
+    // result_stride = 1 -> BadResultStride.
+    let mut hostile = bytes.clone();
+    hostile[soff..soff + 4].copy_from_slice(&1u32.to_le_bytes());
+    let r = std::panic::catch_unwind(|| parse_section(&hostile));
+    assert!(r.is_ok());
+    assert!(matches!(r.unwrap(), Err(ProtocolError::BadResultStride { .. })));
+}
+
+/// parse_section with section_bytes beyond the hard cap must reject, and
+/// encode_section must refuse to emit a section whose section_bytes exceeds
+/// the frozen cap (never allocate from an untrusted size).
+#[test]
+fn hostile_section_bytes_max_reject_no_panic() {
+    let big: u64 = 0x7FFF_FFFF_FFFF_FFFF; // absurd section size
+
+    // 1) encode_section must reject at entry (no allocation).
+    let ident = MappingIdentityHeaderV2::new(
+        big,
+        4242,
+        1234,
+        0x0123_4567_89AB_CDEF,
+        derive_session_id(0x0123_4567_89AB_CDEF, 0x0000_0000_0040_0000, 1),
+    );
+    let hdr = ResultSectionHeaderV2::new(96 + 1 * PROBE_RESULT_BYTES as u64, 1).unwrap();
+    let mut hostile_hdr = hdr;
+    hostile_hdr.section_bytes = big;
+    let r = std::panic::catch_unwind(|| encode_section(&ident, &hostile_hdr, &[]));
+    assert!(r.is_ok(), "encode_section panicked on hostile section_bytes");
+    assert!(matches!(
+        r.unwrap(),
+        Err(ProtocolError::CountTooLarge { .. }) | Err(ProtocolError::BadSectionBytes { .. })
+    ));
+
+    // 2) parse_section with a manually crafted hostile buffer (identity and
+    //    header both claim section_bytes = big while the buffer is small).
+    let mut small = vec![0u8; 96 + 40];
+    small[0..4].copy_from_slice(b"MIDA");
+    small[4..6].copy_from_slice(&2u16.to_le_bytes());
+    small[8..16].copy_from_slice(&big.to_le_bytes()); // hostile section_bytes
+    small[16..20].copy_from_slice(&4242u32.to_le_bytes());
+    small[20..24].copy_from_slice(&1234u32.to_le_bytes());
+    small[24..32].copy_from_slice(&0x0123_4567_89AB_CDEFu64.to_le_bytes());
+    small[32..48].copy_from_slice(&derive_session_id(
+        0x0123_4567_89AB_CDEF,
+        0x0000_0000_0040_0000,
+        1,
+    ));
+    small[0x38..0x3C].copy_from_slice(b"WRES");
+    small[0x3C..0x3E].copy_from_slice(&2u16.to_le_bytes());
+    small[0x40..0x48].copy_from_slice(&big.to_le_bytes());
+    small[0x48..0x4C].copy_from_slice(&1u32.to_le_bytes()); // result_count=1
+    small[0x4C..0x50].copy_from_slice(&40u32.to_le_bytes()); // stride
+    small[0x50..0x54].copy_from_slice(&96u32.to_le_bytes()); // results_off
+    small[0x54..0x58].copy_from_slice(&0u32.to_le_bytes()); // status OK
+    small[0x5C..0x60].copy_from_slice(&1u32.to_le_bytes()); // completed DONE
+    let r = std::panic::catch_unwind(|| parse_section(&small));
+    assert!(r.is_ok(), "parse_section panicked on hostile section_bytes");
+    let res = r.unwrap();
+    assert!(res.is_err(), "hostile section_bytes must be rejected");
+    // Either BadSectionBytes (len mismatch) or CountTooLarge (cap) is correct.
+    assert!(matches!(
+        res,
+        Err(ProtocolError::BadSectionBytes { .. }) | Err(ProtocolError::CountTooLarge { .. })
+    ));
+}
+
+/// parse_section with truncated buffers (every cut) must never panic.
+#[test]
+fn hostile_truncated_never_panics() {
+    let cap = 1u32;
+    let section_bytes = 96 + cap as u64 * PROBE_RESULT_BYTES as u64;
+    let ident = MappingIdentityHeaderV2::new(
+        section_bytes,
+        4242,
+        1234,
+        0x0123_4567_89AB_CDEF,
+        derive_session_id(0x0123_4567_89AB_CDEF, 0x0000_0000_0040_0000, 1),
+    );
+    let mut hdr = ResultSectionHeaderV2::new(section_bytes, cap).unwrap();
+    hdr.result_count = 1;
+    hdr.completed_flag = COMPLETED_FLAG_DONE;
+    let mut pr = ProbeResultV2::new(
+        0x1000,
+        mida_antidebug_runtime::walker_protocol::CLASSIFICATION_TYPE_C,
+        0,
+        0,
+        [0xAA; 16],
+    );
+    pr.set_probe_span(16);
+    let bytes = encode_section(&ident, &hdr, &[pr]).unwrap();
+    for cut in 0..bytes.len() {
+        let r = std::panic::catch_unwind(|| parse_section(&bytes[..cut]));
+        assert!(r.is_ok(), "parse_section panicked at cut={cut}");
+    }
 }
