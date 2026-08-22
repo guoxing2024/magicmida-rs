@@ -311,7 +311,8 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
 //   seq != 局部期望 → abort；flags & UNKNOWN 或 unknown_code != 0 → abort；
 //   否则按 flags 位（GUARD/AV）+ status_slot 分类（Type A/B/C）。
 // 下一候选 begin 的前置检查（mida_tls_begin_check）捕获 stale flags/unknown_code
-// 残留 → abort（fail-closed，WO-2101 §4.4a/b；fixture: WO-1901）。
+// 残留与 stale token_va 残留（WO-2201）→ abort（fail-closed，WO-1702 §4.4a/b；
+// fixture: WO-1901）。
 ~~~
 
 **SEH 收口帧（唯一机制：MSVC C __try/__except shim，WO-1702 §1.1/§2.2 冻结）**：
@@ -334,8 +335,9 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
   且违反 fail-closed。
 - **即使保护器 CONTINUE_EXECUTION 重放成功（行 6）**，只要 TLS.unknown_code != 0 仍 abort：
   未知异常不因"重放成功"而变为可接受。
-- **TLS 生命周期（WO-1702 §5.2 + WO-2101 §4.4a）**：每候选 begin 先执行前置检查
-  （stale flags/unknown_code 残留 → abort）再置零 flags/unknown_code，候选间零状态继承；
+- **TLS 生命周期（WO-1702 §5.2 + WO-2201 §4.4a）**：每候选 begin 先执行前置检查
+  （stale flags/unknown_code 残留、stale token_va 残留 → abort）再置零
+  flags/unknown_code/token_va，候选间零状态继承；
   walker_inner 退出前清空全部字段并卸载 VEH（VehGuard RAII）。
 #### 3.3.3 归属规则（faulting RIP / 线程 / active phase）
 

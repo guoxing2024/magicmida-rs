@@ -14,6 +14,7 @@
 #define MIDA_INIT_PARAMS_V2_MAGIC 0x003250324144494DuLL /* "MIDA2P2\0" LE */
 #define MIDA_PARAMS_MIN_BYTES 0x48u
 #define MIDA_DIGEST_LEN 64u
+#define MAX_EXPECTED_HOOKS 256u /* WO-2202 frozen bound */
 
 typedef struct MidaInitParamsV2 {
     uint32_t target_pid;              /* 0x00 */
@@ -92,8 +93,7 @@ static int mida_is_canonical_user_va(uint64_t va) {
 static uint32_t mida_v2_envelope_check(EnvelopeInput in) {
     int ovf = 0;
     uint64_t end;
-    const unsigned char* p;
-    unsigned int i;
+    uint64_t i;   /* WO-2202: iteration width == expected_hooks width */
     if (in.params == 0 || in.params_bytes < MIDA_PARAMS_MIN_BYTES) return 1;
     if (in.blob != (const unsigned char*)in.params) return 12; /* same allocation */
     if (!in.header_readable) return 14;                        /* header fault */
@@ -107,7 +107,10 @@ static uint32_t mida_v2_envelope_check(EnvelopeInput in) {
     if (ovf) return 4;
     if (end > in.params_bytes) return 5;
     if (in.params->digest_len != MIDA_DIGEST_LEN) return 6;
-    /* surfaces: hooks==0 => off must be 0; entries validated per row */
+    /* surfaces: hooks==0 => off must be 0; entries validated per row.
+     * WO-2202: expected_hooks is FROZEN to a bounded maximum; iteration uses
+     * checked size_t semantics (see MAX_EXPECTED_HOOKS below). */
+    if (in.params->expected_hooks > MAX_EXPECTED_HOOKS) return 6;
     if (in.params->expected_hooks == 0 && in.params->expected_surfaces_off != 0) return 6;
     if (in.params->expected_hooks != 0) {
         uint64_t need;
@@ -121,30 +124,49 @@ static uint32_t mida_v2_envelope_check(EnvelopeInput in) {
         if (end > in.params_bytes) return 5;
         entries = (const uint64_t*)(in.blob + (size_t)in.params->expected_surfaces_off);
         for (i = 0; i < in.params->expected_hooks; i++) {
-            /* each entry is a TARGET-LOCAL VA of a surface string; canonical
-             * user VA and non-zero; provenance = within the same blob allocation
-             * (surface strings live inside the envelope, sec.5.3e). */
-            if (!mida_is_canonical_user_va(entries[i])) return 11;
-            if (entries[i] < in.expected_blob_base_va ||
-                entries[i] >= in.expected_blob_base_va + in.params_bytes) return 11;
+            /* each entry is the ONLY explicit absolute-VA exception: a
+             * TARGET-LOCAL VA of a surface string inside the same envelope.
+             * WO-2202: canonical/nonzero + provenance within the blob +
+             * per-entry string NUL scan (bounded by params_bytes). */
+            uint64_t sva = entries[i];
+            uint64_t soff;
+            uint64_t k;
+            if (!mida_is_canonical_user_va(sva)) return 11;
+            if (sva < in.expected_blob_base_va ||
+                sva >= in.expected_blob_base_va + in.params_bytes) return 11;
+            soff = sva - in.expected_blob_base_va;
+            for (k = 0; k < 65; k++) {
+                if (soff + k >= in.params_bytes) return 10;
+                if (in.blob[(size_t)(soff + k)] == 0) break;
+            }
+            if (k >= 65) return 10;
         }
     }
-    /* profile_id string: NUL within envelope, bounded scan <= 65 */
+    /* profile_id string: NUL within envelope; bounds checked BEFORE every read
+     * (WO-2202: off + i < params_bytes must be proven before p[i]). */
     if (in.params->profile_id_off < MIDA_PARAMS_MIN_BYTES) return 5;
     if (in.params->profile_id_off >= in.params_bytes) return 5;
-    p = in.blob + (size_t)in.params->profile_id_off;
-    for (i = 0; i < 65 && (uint64_t)(p - in.blob) < in.params_bytes; i++) {
-        if (p[i] == 0) break;
+    {
+        uint64_t off = in.params->profile_id_off;
+        uint64_t k;
+        for (k = 0; k < 65; k++) {
+            if (off + k >= in.params_bytes) return 10;
+            if (in.blob[(size_t)(off + k)] == 0) break;
+        }
+        if (k >= 65) return 10;
     }
-    if (i >= 65 || (uint64_t)(p + i - in.blob) >= in.params_bytes) return 10; /* no NUL */
-    /* profile_digest string: same bounded NUL scan */
+    /* profile_digest string: same bounds-checked NUL scan */
     if (in.params->profile_digest_off < MIDA_PARAMS_MIN_BYTES) return 5;
     if (in.params->profile_digest_off >= in.params_bytes) return 5;
-    p = in.blob + (size_t)in.params->profile_digest_off;
-    for (i = 0; i < 65 && (uint64_t)(p - in.blob) < in.params_bytes; i++) {
-        if (p[i] == 0) break;
+    {
+        uint64_t off = in.params->profile_digest_off;
+        uint64_t k;
+        for (k = 0; k < 65; k++) {
+            if (off + k >= in.params_bytes) return 10;
+            if (in.blob[(size_t)(off + k)] == 0) break;
+        }
+        if (k >= 65) return 10;
     }
-    if (i >= 65 || (uint64_t)(p + i - in.blob) >= in.params_bytes) return 10;
     /* digest string scan (within proven 65-byte region): exactly 64 hex + NUL */
     {
         const unsigned char* d = in.blob + (size_t)in.params->digest_off;

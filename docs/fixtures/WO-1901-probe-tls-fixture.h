@@ -70,20 +70,29 @@ static uint32_t mida_attr_classify(AttrInput in) {
     return ATTR_FAULT;
 }
 
-/* Begin-side pre-write stale detection (WO-2101 sec.4.4a/sec.4.4b) -- the REACHABLE
+/* Begin-side pre-write stale detection (WO-2201 sec.4.4a/sec.4.4b) -- the REACHABLE
  * stale check. Runs inside mida_probe_tls_begin BEFORE any field is written:
  *   - slot corrupted  (magic != 0 && magic != MIDA_TLS_MAGIC) -> ABORT
  *   - re-entry        (active != 0)                           -> ABORT
  *   - stale marks     (active == 0 && (flags != 0 ||
  *                       unknown_code != 0))                   -> ABORT (fail-closed)
+ *   - stale token     (active == 0 && token_va != 0)          -> ABORT (fail-closed)
+ *     WO-2201: a previous candidate that faulted out with a partially failed
+ *     clear (e.g. exception path skipped clear, or clear wrote flags/unknown_code
+ *     to zero but token_va survived) must NOT be silently overwritten. Without
+ *     this check the next begin would accept the old token and lose the
+ *     fail-closed guarantee (stale token could be attributed to the new probe).
+ *     token_va must be 0 before begin writes the new candidate token.
  * Only when this returns ATTR_OK does begin write
  * magic/active=1/flags=0/unknown_code=0/token_va/seq.
  */
 static uint32_t mida_tls_begin_check(uint32_t magic, uint32_t active,
-                                     uint32_t flags, uint64_t unknown_code) {
+                                     uint32_t flags, uint64_t unknown_code,
+                                     uint64_t token_va) {
     if (magic != 0 && magic != MIDA_TLS_MAGIC) return ATTR_ABORT; /* corrupted */
     if (active != 0) return ATTR_ABORT;                            /* re-entry */
     if (flags != 0 || unknown_code != 0) return ATTR_ABORT;        /* stale mark */
+    if (token_va != 0) return ATTR_ABORT;                          /* stale token */
     return ATTR_OK;
 }
 

@@ -383,6 +383,60 @@ const _: () = {
 | arg6 | out_attestation_written_va（第 7 参走栈，ABI 规则） |
 | reserved | 0 |
 
+**7-arg thunk 完整 ABI（WO-2202 冻结：机器码/栈布局/shadow space/对齐/清理）**：
+
+~~~text
+THUNK_CODE_7ARG（13 字节，与现有 6 参 thunk 同风格；实现工单原样落地）：
+  mov   r11, rcx          ; 48 8B CB    保存 fn_ptr（volatile rcx 会被参数覆盖）
+  mov   rcx, [r11+8]      ; 49 8B 4B 08 arg0 -> rcx（第 1 参）
+  mov   rdx, [r11+16]     ; 49 8B 53 10 arg1 -> rdx（第 2 参）
+  mov   r8,  [r11+24]     ; 4D 8B 43 18 arg2 -> r8（第 3 参）
+  mov   r9,  [r11+32]     ; 4D 8B 4B 20 arg3 -> r9（第 4 参）
+  mov   rax, [r11+40]     ; 49 8B 43 28 arg4 -> rax（暂存，第 5 参）
+  mov   r10, [r11+48]     ; 4D 8B 53 30 arg5 -> r10（暂存，第 6 参）
+  mov   [rsp+0x28], rax   ; 48 89 44 24 28 arg4 -> 栈槽 40（第 5 参 home）
+  mov   [rsp+0x30], r10   ; 4C 89 54 24 30 arg5 -> 栈槽 48（第 6 参 home）
+  mov   rax, [r11+56]     ; 49 8B 43 38 arg6 -> rax（暂存，第 7 参）
+  mov   [rsp+0x38], rax   ; 48 89 44 24 38 arg6 -> 栈槽 56（第 7 参 home）
+  call  qword ptr [r11]   ; FF 53 00    call fn_ptr（[r11] = 目标函数地址）
+  ret                     ; C3
+~~~
+
+**Windows x64 调用约定（7 参跨寄存器/栈，冻结）**：
+- 第 1-4 参：rcx/rdx/r8/r9（寄存器）；第 5-7 参：栈 home 槽
+  [rsp+0x28]/[rsp+0x30]/[rsp+0x38]（相对**调用方** rsp，call 前已由调用方
+  分配 32 字节 shadow space + 3 个参数槽 = 56 字节，见下）。
+- **shadow space**：调用方必须提供 32 字节（rsp+0x00..0x1F 归被调方使用）；
+  第 5-7 参槽在 shadow 之后：rsp+0x20（未用）、rsp+0x28（arg4）、rsp+0x30（arg5）、
+  rsp+0x38（arg6）→ 调用方栈帧 = 32 + 24 = 56 字节（0x38 对齐 8 的倍数）。
+- **栈对齐**：call 前 rsp 必须 16 字节对齐（Windows x64 ABI：call 指令使返回后
+  rsp ≡ 8 mod 16；调用方在 call 前保证 rsp ≡ 0 mod 16）。
+- **callee cleanup**：Windows x64 是 **caller-cleanup**（被调函数不弹栈）；
+  thunk 的 ret 返回调用方，调用方负责释放 56 字节栈帧。
+- **volatile 寄存器**：rcx/rdx/r8/r9/r10/r11/rax 均可被被调函数破坏；
+  thunk 在 call 前完成全部参数搬运，call 后只 ret（不依赖任何 volatile）。
+
+**ThunkArgs7（9 槽 72B，target 内一次性 WPM 写入）**：
+
+| 槽 | 偏移 | 值 |
+|----|------|----|
+| fn_ptr | 0x00 | module_base + MidaAntidebugInitializeV2 RVA |
+| arg0 | 0x08 | params_v2_blob_va |
+| arg1 | 0x10 | params_bytes |
+| arg2 | 0x18 | out_runtime_sha256_va |
+| arg3 | 0x20 | 64 |
+| arg4 | 0x28 | out_attestation_json_va |
+| arg5 | 0x30 | ATTESTATION_BUFFER_SIZE |
+| arg6 | 0x38 | out_attestation_written_va |
+| reserved | 0x40 | 0（8 字节，保持 72B 总长） |
+
+- THUNK_CODE_7ARG 与 ThunkArgs7 均为**实现工单新增**；现有 6 参 thunk（THUNK_CODE/
+  ThunkArgs 64B）**不改**。
+- 寄存器搬运顺序冻结（先 rcx/rdx/r8/r9，再栈槽 40/48/56），避免 r11 被覆盖；
+  fn_ptr 保存在 r11（thunk 内不调用其它函数，r11 不会被破坏）。
+- 入口断言：CreateRemoteThread start == module_base + MidaAntidebugInitializeV2 RVA
+  （allowlist，§4.2）。
+
 ### 5.3d fallback 门禁（唯一，WO-1902 冻结）
 
 **digest 需求定义**（可检查的唯一条件）：
@@ -440,19 +494,28 @@ const _: () = {
      未知字节 → 拒收（UnknownExtension，fail-closed）。**不存在**"允许未知尾部"
      的宽松语义；v3 必须新增 entry（MidaAntidebugInitializeV3）+ 新 magic +
      新版本化结构，不猜版本、不读未知区。
-- **header trust boundary（WO-2102 新增，关闭审计 §4.3）**：
-  1. `params_bytes` 由 controller 从 `VirtualAllocEx` 分配大小**同一来源**提供，
-     runtime 不信任调用方自报长度之外的任何可读性；
-  2. `params` 指针必须 == controller 记录的 `blob_base_va`（target-local），
-     runtime 在入口断言 params == blob_base_va（记录于加载证据）；
-  3. header 可读性假设：params 指向的 0x48 字节在**同一 allocation** 内
-     （controller 保证分配 >= params_bytes >= 0x48 且已提交 PAGE_READWRITE）；
-     runtime 按"blob 已提交"假设读取——该假设由 controller 的分配/写入顺序
-     （alloc → WPM 全量写入 → 才创建远程线程）保证，任何违反 → 拒收；
-  4. 目标进程内 provenance：params 只能来自 controller 在本进程创建的 blob
-     （blob_base_va 记录 + nonce/CRC 校验），不接受其它来源指针；
-  5. header fault（读取时 AV/guard）→ fail-closed：不尝试恢复，直接返回
-     ShortBlob/InvalidArgument 类错误码，attestation 不生成。
+- **header trust boundary（WO-2202 修订：唯一可执行方案，禁止外部布尔冒充能力）**：
+  **唯一方案**：header 可读性是**硬信任边界**——runtime 不自行验证 provenance，
+  也不依赖 fixture 的 `expected_blob_base_va`/`header_readable` 外部输入
+  （这些仅存在于离线 fixture 以驱动纯逻辑测试，**不进入 7 参 ABI**）。
+  具体合同：
+  1. **分配同源**：`params` 与 `params_bytes` 均由 controller 从同一次
+     `VirtualAllocEx` 提供（params == blob_base_va，params_bytes == 分配大小）；
+     该不变式由 controller 的调用序列保证（alloc → WPM 全量写入 → 才创建远程线程
+     调 V2 entry），runtime 侧**无法也不尝试**复核分配归属。
+  2. **坏指针行为 = 进程终止，而非返回错误码**：若 params 指向未提交/非本进程内存，
+     runtime 读取 header 时触发 AV → 该异常沿链传播 → 进程终止。**不捕获、不恢复、
+     不返回 HeaderFault**——HeaderFault 错误码**不存在**于 V2 出口（区别于 fixture
+     的 14 号拒绝码，后者仅用于离线纯逻辑测试）。
+  3. **provenance 的 enforcement 点在 controller**：controller 在 CreateRemoteThread
+     前后记录 blob_base_va，并在结果/attestation 消费时复核；runtime 只依赖
+     "blob 已由 controller 提交"这一信任前提。
+  4. **fixture 定位**：`expected_blob_base_va`/`header_readable` 是 EnvelopeInput
+     的纯逻辑测试输入（模拟"已信任的 blob"），用于离线验证边界/拒收逻辑正确性；
+     **不得**被实现工单当作 runtime 入口参数或运行时能力。
+  5. 所有在边界证明后可读的区域（digest/surfaces/profile 字符串）由 §5.3e 的
+     checked 边界证明保护；边界证明失败 → 返回错误码（fixture 4/5/6/10/11/13），
+     与 header 自身可读性假设无关。
 - **v1 fallback（不变）**：v1 entry（MidaAntidebugInitialize）只读 0x30 内字段，
   永不读取 0x30 之后；digest 需求（WO-1902 §5.3d 三条件）时 V2 必选，
   V2 校验失败**禁止降级 v1**。

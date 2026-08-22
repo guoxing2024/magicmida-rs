@@ -301,8 +301,9 @@ Rust 侧绝不直接访问 TLS 槽（不声明同名 thread_local），只经导
 **生命周期时序（冻结）**：
 1. 探针线程创建后、首候选前：TLS 零初始化（active=0, magic=0）→ 首调用 begin 写入 magic；
 2. 每候选：seq += 1（Rust 局部）→ begin(va, seq)：**先执行前置检查**
-   （magic 首写/损坏、active==0 防重入、stale flags/unknown_code 残留，见 §4.4a；
-   任一失败返回非 0 = abort）；通过后写入 active=1/flags=0/unknown_code=0/token_va=va/seq；
+   （magic 首写/损坏、active==0 防重入、stale flags/unknown_code 残留、stale token_va
+   残留（WO-2201），见 §4.4a；任一失败返回非 0 = abort）；通过后写入
+   active=1/flags=0/unknown_code=0/token_va=va/seq；
 3. mida_probe_read 执行（异常可能发生：VEH 观测 → filter 读 TLS → handler 写 status_slot）；
 4. 返回后：Rust 读 snapshot（active/seq/token_va）→ clear（active=0, token_va=0）；
 5. 探针线程退出前：clear + 线程终止（OS 回收 TLS）；
@@ -343,20 +344,41 @@ filter 若达（不可能）→ ABORT。无需额外线程 ID 存储。
 | token_va | 0x10 | C shim | begin | VEH（归属）、filter（归属） | 每候选 clear |
 | unknown_code | 0x18 | C shim | mida_probe_tls_mark（unknown 时） | Rust 主路径（abort 判定） | 每候选 begin 前置零 |
 
-**accessor 契约（WO-2101 修订：begin 先 stale 检测、后写入，顺序冻结）**：
+**accessor 契约（WO-2201 修订：begin 先 stale 检测（含 token_va）、后写入，顺序冻结）**：
 - mida_probe_tls_begin(va, seq)：**先于任何写入**执行前置检查（fixture:
-  mida_tls_begin_check）：
+  mida_tls_begin_check，含 token_va 参数）：
   1. magic != 0 且 != MIDA_TLS_MAGIC → 槽损坏 → 返回非 0 → abort；
   2. active != 0 → 重入 → 返回非 0 → abort；
   3. active == 0 且 (flags != 0 || unknown_code != 0) → **stale mark 残留**
-     （上一候选异常迟到写入、或 clear 未执行）→ 返回非 0 → abort（fail-closed）。
+     （上一候选异常迟到写入、或 clear 未执行）→ 返回非 0 → abort（fail-closed）；
+  4. active == 0 且 token_va != 0 → **stale token 残留**（WO-2201 新增：
+     上一候选异常退出/clear 部分失败，flags/unknown_code 恰好为零但旧 token_va
+     幸存）→ 返回非 0 → abort（fail-closed，禁止静默覆盖旧 token）。
   全部通过后才写入：magic（首写）、flags=0、unknown_code=0、active=1、token_va=va、
   seq=seq；返回 0。
 - mida_probe_tls_mark(code)：仅 VEH 调用；按 code 置 flags 位（unknown 时同时写 unknown_code）；
-- mida_probe_tls_snapshot()：返回当前线程槽指针（只读）；
+- mida_probe_tls_snapshot()：返回当前线程槽指针（只读）；**指针有效期 = 当前线程存活期间**；
+  调用方必须在 clear() 之前完成读取，clear 后指针仍指向槽但内容为清零态（不得假定保留）；
 - mida_probe_tls_clear()：active=0、token_va=0、flags=0、unknown_code=0（magic/seq 保留）。
+  **clear 是"全清零"原语**：不允许部分清理；若实现观察到部分状态（如 flags 已清但
+  token_va 幸存），按"clear 失败"处理——下一 begin 的 stale 检测（第 4 条）拒收。
 
 **Rust 侧禁止**：声明同名 thread_local、直接访问槽字段、绕过 accessor 写状态。
+
+### 4.4a1 accessor 与异常上下文边界（WO-2201 冻结，显式未验证项单列）
+
+| 边界 | 合同 | 状态 |
+|------|------|------|
+| C accessor 不可失败/不可重入 | begin/clear/snapshot/mark 均为普通 C 函数；**不调用任何可 fault 的 API**（无分配、无锁、无 I/O）；mark 仅位运算写槽 | design-only，待 V10 验证 |
+| snapshot 指针有效期 | 指向当前线程 __declspec(thread) 槽；**仅当前线程存活期间有效**；clear 后内容归零态；跨线程/跨 DLL unload 使用 = 未定义 | design-only |
+| VEH 中 accessor 调用 | 允许调用 snapshot/mark（两者均无 fault 路径）；**禁止**在 VEH 内调用 begin/clear（会破坏主路径状态机）；VEH 自身 fault（如 TLS 槽未初始化）→ 二次异常沿链，归属失败 → CONTINUE_SEARCH | design-only，待 V10 |
+| SEH filter 直接读槽 | filter 在异常分派上下文**直接读** C TLS（编译器生成的 TLS 访问序列，无函数调用）；只读 magic/active/token_va/访问地址 | design-only，待 V10 |
+| 线程退出 | 线程退出前主路径必须 clear（active=0）；若线程因异常终止，OS 回收 TLS；**不存在跨线程续用** | design-only |
+| DLL unload | FreeLibrary 前必须确认探针线程已终止（§6.2 wait-before-free）；卸载后 TLS 槽失效，任何 accessor 调用 = 未定义 | design-only |
+| accessor 本身 fault | 若 accessor 执行中发生 fault（槽未提交等），不恢复：异常沿链，fail-closed（walker abort 或进程终止由目标环境决定） | design-only，待 V10 |
+| TLS 初始化失败 | __declspec(thread) 槽由 OS 零初始化；首 begin 写 magic；若编译器 TLS 访问序列异常（_tls_index 缺失）→ 构建/加载期失败，非运行时恢复 | design-only，待 V10 |
+
+以上各项**不得**以 C11 fixture 编译替代验证；实现工单必须在 Windows V10/LIVE-4 阶段逐一实测。
 
 ### 4.4b seq attribution 闭环（WO-2001 冻结）
 
@@ -368,8 +390,10 @@ filter 若达（不可能）→ ABORT。无需额外线程 ID 存储。
 - **旧 fault / 迟到异常**：上一候选的异常已在上一候选的 clear 中被清（flags/unknown_code=0）；
   若 VEH 在本候选 begin 前被调用（不可能：VEH 只在探针 load 时触发）→ active==0 → 不观测；
   若异常迟到达（handler 已返回但 VEH 后写）→ 本候选 clear 后 flags 归零；下一候选
-  **begin 的前置检查**（mida_tls_begin_check，先于任何写入）检测到
-  active==0 且 flags/unknown_code != 0 → 返回非 0 → abort（stale mark 检测，fail-closed）。
+  **begin 的前置检查**（mida_tls_begin_check，先于任何写入）检测到：
+  - active==0 且 flags/unknown_code != 0 → 返回非 0 → abort（**stale mark** 检测，fail-closed）；
+  - active==0 且 token_va != 0 → 返回非 0 → abort（**stale token** 检测，WO-2201：
+    clear 部分失败/异常路径跳过 clear 时旧 token 幸存，禁止静默覆盖）。
   该检查在 begin 内、写入前执行，**可达**（不存在被 active==0 短路遮蔽的不可达分支）。
 - **fixture**：mida_attr_classify（filter/VEH 路径，无 stale 分支）与
   mida_tls_begin_check（begin 前置路径，含 stale 分支）两个纯函数分离；
