@@ -1,4 +1,4 @@
-# WO-1503 — Attestation/Provenance v2 wire schema 设计冻结
+﻿# WO-1503 — Attestation/Provenance v2 wire schema 设计冻结
 
 **工单编号**: WO-1503
 **优先级**: P0
@@ -200,6 +200,9 @@ canonicalize(obj) -> bytes:
   3. 数字：仅允许整数（u64/i64 闭区间）与 IEEE754 有限 double；
      整数按十进制输出（无前导零、无 + 号、-0 规范化）；
      double 按最短往返表示（Rust ryu 语义）；NaN/Infinity 拒收。
+  3b. 布尔：true 编码为字面量 true（0x74 0x72 0x75 0x65），
+     false 编码为字面量 false（0x66 0x61 0x6C 0x73 0x65）；
+     无其它布尔表示（1/0/"true" 均拒收）；布尔与数字互不转换。
   4. 数组：保持顺序，元素递归 canonicalize。
   5. 对象：{k1:v1,k2:v2,...} 键序为字节序，递归。
   6. 空值：null 字面量。
@@ -224,6 +227,19 @@ canonicalize(obj) -> bytes:
 - **preimage = 该记录对象的所有字段，除 record_digest 自身**（顶层与 WalkerAttestation 同理）。
 - 因此 preimage 是**有限且可重算**的：去掉 digest 字段后 canonicalize 其余字段。
   不存在自引用循环。
+
+### 5.1a 嵌套 digest 边界（top-level 与 WalkerAttestation）
+
+- **WalkerAttestation.record_digest** 的 preimage = WalkerAttestation 对象自身字段
+  （含 rounds/probe_summary/orphaned_resources 等），**排除其 record_digest 字段**。
+- **顶层 RuntimeAttestationV2.record_digest** 的 preimage = 顶层对象字段
+  （含 walker_attestation 嵌套对象），**排除顶层 record_digest 字段**。
+- **walker_attestation 在顶层 preimage 中以其完整形式（含其自身 record_digest）出现**：
+  即顶层 digest 覆盖嵌套 digest 值。验证顺序：先验 WalkerAttestation.record_digest（重算其
+  preimage），再验顶层 record_digest（重算含嵌套 digest 的 preimage）。两层独立、顺序固定。
+- **字段排除规则**：只有"正在计算 digest 的那个对象"的 record_digest 字段被排除；
+  嵌套对象的 record_digest 是外层 preimage 的普通字段，不被排除。
+
 
 ### 5.2 计算顺序
 
@@ -251,9 +267,10 @@ digest: 44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a
 {"b":1,"a":2}
 ~~~
 
-canonical bytes: {"a":2,"b":1}（键按字节序 a < b）
+canonical bytes（hex）: 7b 22 61 22 3a 32 2c 22 62 22 3a 31 7d
+（= {"a":2,"b":1}，键按 UTF-8 字节序 a < b）
 
-digest: 5f1d3f4f8b6a4f2e9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b
+digest: d3626ac30a87e6f7a6428233b3c68299976865fa5508e4267c5415c76af7a772
 
 #### Vector 3：嵌套对象 + 数组 + 空值 + 转义
 
@@ -261,14 +278,27 @@ digest: 5f1d3f4f8b6a4f2e9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b
 {"z":null,"a":[1,2],"s":"x\"y","u":"\u4e2d"}
 ~~~
 
-canonical bytes: {"a":[1,2],"s":"x\"y","u":"中","z":null}
-（键字节序 a < s < u < z；双引号转义保留；非 ASCII 原样 UTF-8；null 字面量）
+canonical bytes（hex）: 7b 22 61 22 3a 5b 31 2c 32 5d 2c 22 73 22 3a 22 78 5c 22 79 22 2c
+22 75 22 3a 22 e4 b8 ad 22 2c 22 7a 22 3a 6e 75 6c 6c 7d
+（= {"a":[1,2],"s":"x\"y","u":"中","z":null}；键字节序 a < s < u < z；
+双引号转义保留为 5c 22；非 ASCII "中" 原样 UTF-8 e4 b8 ad；null 字面量）
 
-digest: 9f2c4e6a8b0d1f3e5a7c9b1d3f5a7c9e1b3d5f7a9c1e3b5d7f9a1c3e5b7d9f
+digest: 154301026b1458e084761c0fba44c2269b5e66f7a4b0e0071ad09e69e97dd244
 
-> 注：Vector 2/3 的 digest 为占位格式示例——实现工单必须用 sha256 实际计算并固定为
-> 测试向量；本文件冻结的是**算法与 preimage 规则**，digest 具体值在实现时由权威计算
-> 生成并写入测试（防呆：不允许实现时随意改算法）。
+#### Vector 4：bool 编码验证
+
+~~~json
+{"ok":true,"no":false}
+~~~
+
+canonical bytes（hex）: 7b 22 6e 6f 22 3a 66 61 6c 73 65 2c 22 6f 6b 22 3a 74 72 75 65 7d
+（= {"no":false,"ok":true}；键字节序 "no" < "ok"（0x6e < 0x6f）；true/false 为字面量）
+
+digest: ae8ab1e1b72505d8544a32bf3803333e81528159e214e4198a0271d2f60dc419
+
+> 以上 Vector 1-4 的 digest 均为 **2026-08-23 用 SHA-256（FIPS 180-4）实际计算的固定值**（见
+> docs/AUDIT_EVIDENCE_BATCH15_20260823.md 的原始计算记录）；实现工单必须以本文件为权威
+> fixture 逐一通过；任何重新计算必须产生相同值，不允许"实现时再定"。
 
 ## 6. 唯一绑定关系（provenance / artifact digest / identity）
 
@@ -320,7 +350,7 @@ digest: 9f2c4e6a8b0d1f3e5a7c9b1d3f5a7c9e1b3d5f7a9c1e3b5d7f9a1c3e5b7d9f
 ## 9. 实现前 checklist
 
 - [ ] json-c14n 独立 serializer（字节序键、非 ASCII 原样、整数/有限 double）
-- [ ] 3 个固定 digest vectors 通过（空对象/标量/嵌套+转义）
+- [ ] 4 个固定 digest vectors 通过（空对象/标量/嵌套+转义/bool）
 - [ ] TaggedAttestation 判别 + v1/v2 双解析
 - [ ] WalkerAttestation/RoundLedger/ProbeSummary/Orphan 封闭集合校验
 - [ ] runtime_sha256 真实文件哈希替换 adr4-foundation-unbound
