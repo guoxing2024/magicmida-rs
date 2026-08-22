@@ -278,15 +278,15 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
     let rip = ctx.Rip;
 
     // 归属过滤（WO-1802）：只观测"探针线程 + active phase + 访问地址匹配
-    // TLS.call_token.va（或 va+8）"的异常。任何非探针线程 / 非 active phase /
+    // TLS 槽 MidaProbeTls.token_va.va（或 va+8）"的异常。任何非探针线程 / 非 active phase /
     // 访问地址不匹配的异常一律 CONTINUE_SEARCH，不触碰、不吞掉（保护器链完整观测权）。
     if !probe_thread_guard() || !PROBE_TLS.with(|t| t.active.get()) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
     // 无 RIP window：归属用 faulting 访问地址（ExceptionInformation[1]）匹配
-    // 当前探针的 call_token（WO-1702 §4.3），不依赖任何代码布局。
+    // 当前探针的 token_va（WO-1702 §4.3），不依赖任何代码布局。
     let acc = access_address(info);  // ExceptionInformation[1]
-    if acc != PROBE_TLS.with(|t| t.call_token.va) && acc != PROBE_TLS.with(|t| t.call_token.va + 8) {
+    if acc != PROBE_TLS.with(|t| t.MidaProbeTls.token_va) && acc != PROBE_TLS.with(|t| t.MidaProbeTls.token_va + 8) {
         return EXCEPTION_CONTINUE_SEARCH;   // 非本探针的 fault，交回链
     }
 
@@ -328,7 +328,7 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
 |-----|------|------|
 | 线程 | VEH 只在 walker 创建的探针线程上 active；其它线程异常一律 CONTINUE_SEARCH | VEH 是进程级，不过滤会吞掉 target 自身异常 |
 | 阶段 | PROBE_TLS.active 仅在探针循环内为 true；装载/卸载/解析阶段为 false | 防止 walker 自己的普通代码 fault 被误收口 |
-| 访问地址 | 仅 faulting 访问地址 ∈ {call_token.va, call_token.va+8} 的 guard/AV 被视为"探针 fault"；其它一律 CONTINUE_SEARCH（无 RIP window，WO-1702 §4.3） | 防止把保护器/其它模块的 fault 误判为探针结果 |
+| 访问地址 | 仅 faulting 访问地址 ∈ {MidaProbeTls.token_va, MidaProbeTls.token_va+8} 的 guard/AV 被视为"探针 fault"；其它一律 CONTINUE_SEARCH（无 RIP window，WO-1702 §4.3） | 防止把保护器/其它模块的 fault 误判为探针结果 |
 | 嵌套 | VEH 内不触发任何 faulting 操作（TLS 访问是已提交页）；若嵌套异常发生，内核会二次调用 VEH，此时 active 仍为 true 但访问地址归属失败 → CONTINUE_SEARCH | 嵌套异常沿链走，不重复收口；shim 帧是最后防线 |
 
 #### 3.3.4 handler 注册与链语义（WO-1702 冻结：链首观测 + 恒 CONTINUE_SEARCH）
@@ -375,7 +375,7 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
    │                                                                │
    │                                                                ▼
    │                                            walker VEH（First=TRUE 链首，观测-only）
-   │                                              │ 归属过滤（线程/active/访问地址==call_token）
+   │                                              │ 归属过滤（线程/active/访问地址==token_va）
    │                                              ├─ 非探针异常 → CONTINUE_SEARCH
    │                                              └─ 探针异常 → TLS 标记(guard/AV/unknown)
    │                                                      │ → CONTINUE_SEARCH（不截断）

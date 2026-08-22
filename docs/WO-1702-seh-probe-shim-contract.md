@@ -63,19 +63,26 @@ enum MidaProbeStatus {
     MIDA_PROBE_ABORT = 2,
 };
 
-/* Call token for probe-fault attribution (WO-1802).
- * The walker VEH attributes a probe fault by matching BOTH:
- *   (a) the faulting thread is the probe thread, and
- *   (b) the faulting access address (ExceptionRecord->ExceptionInformation[1])
- *       equals the va of the CURRENT probe call, carried in TLS.call_token.
- * No RIP window is used: mida_probe_read_end is NOT defined and the shim
- * body layout is NOT part of the attribution contract (compiler/linker
- * may place the function anywhere).
+/* Probe TLS record (WO-1901 frozen shared storage).
+ * OWNER: the C shim. Declared as a __declspec(thread) static in
+ * probe_shim.c; the compiler generates the x64 TLS access sequence
+ * (TEB+0x58 ThreadLocalStoragePointer -> tls_array[_tls_index] -> +offset)
+ * for EVERY access, including inside the SEH filter. Thread-locality of
+ * the storage IS the thread-attribution filter: a fault on a non-probe
+ * thread reads that thread's TLS where active==0.
+ * Rust writes/reads ONLY through the exported accessors below; it never
+ * touches the TLS slot directly (single owner = C).
  */
-typedef struct MidaProbeCallToken {
-    const void* va;      /* target VA of the current probe */
-    uint32_t    seq;     /* per-candidate monotonic probe sequence (TLS) */
-} MidaProbeCallToken;
+typedef struct MidaProbeTls {
+    uint32_t magic;     /* +0x00 MIDA_TLS_MAGIC (0x4D504354 "MPCT") */
+    uint32_t active;    /* +0x04 1 while a probe is in flight, else 0 */
+    uint32_t seq;       /* +0x08 per-candidate monotonic probe sequence */
+    uint32_t reserved;  /* +0x0C must be 0 */
+    uint64_t token_va;  /* +0x10 current probe VA (8-aligned) */
+} MidaProbeTls;         /* size 0x18, align 8 */
+
+_Static_assert(sizeof(MidaProbeTls) == 0x18, "MidaProbeTls size");
+_Static_assert(offsetof(MidaProbeTls, token_va) == 0x10, "token_va offset");
 
 /* Reads exactly 16 bytes at va into out16. va may fault (guard/AV).
  * Returns the status and stores it into *status_slot.
@@ -89,12 +96,25 @@ typedef struct MidaProbeCallToken {
 __declspec(dllexport) uint32_t mida_probe_read(
     const void* va, void* out16, uint32_t* status_slot);
 
-/* Publishes the call-token layout contract (no runtime data needed;
- * the struct is defined above and the fields are plain integers/pointers).
- * Kept as a compile-time contract anchor: returns a static token with
- * va=NULL, seq=0 so the size/layout is verified at link time.
+/* ---- TLS accessors (Rust side uses ONLY these; owner = C) ---- */
+
+/* Begin a probe: writes magic/active=1/seq/token_va into the current
+ * thread's TLS. Returns 0 on success, non-zero if the TLS slot was
+ * already active (re-entry) or magic was corrupted -> caller must ABORT.
  */
-__declspec(dllexport) const MidaProbeCallToken* mida_probe_call_token_layout(void);
+__declspec(dllexport) uint32_t mida_probe_tls_begin(uint64_t va, uint32_t seq);
+
+/* Clear the current thread's TLS (active=0, token_va=0, seq unchanged
+ * is allowed; magic preserved). Called after mida_probe_read returns and
+ * before the next candidate.
+ */
+__declspec(dllexport) void mida_probe_tls_clear(void);
+
+/* Snapshot the current thread's TLS (read-only pointer into the TLS
+ * slot; valid only while the probe thread lives). Used by the walker to
+ * read seq/active after a probe and by tests to inspect state.
+ */
+__declspec(dllexport) const MidaProbeTls* mida_probe_tls_snapshot(void);
 ~~~
 
 ### 2.2 shim 实现约束（WO-1802 冻结）
@@ -112,42 +132,52 @@ __declspec(dllexport) const MidaProbeCallToken* mida_probe_call_token_layout(voi
   **禁止 __movsb / rep movsb / 单条 16 字节 load（movups）**：movups 是单指令跨 8 字节
   边界，fault 归属与部分写入语义模糊；两条 8 字节 load 的 faulting 访问地址（AV 的
   ExceptionInformation[1]）分别精确等于 va 与 va+8，归属无歧义。
-- **调用点写入 TLS.call_token**：探针循环在调用前把 (va, seq) 写入 TLS
-  （call_token.va = va；call_token.seq = 本候选的单调序号）；返回后清零。
+- **调用点写入 TLS.token_va**：探针循环在调用前把 (va, seq) 写入 TLS
+  （token_va.va = va；token_va.seq = 本候选的单调序号）；返回后清零。
 - **过滤器必须对到达本帧的任意异常返回 EXCEPTION_EXECUTE_HANDLER**（本帧是探针线程的
   最后防线；返回 CONTINUE_SEARCH 会把异常泄漏到未处理路径 = 进程终止 = walker 永久失联）。
 - **过滤器判别（WO-1802 新增）**：
   1. 读 ExceptionRecord：code、Rip、ExceptionInformation[0]（Write/Data）、[1]（访问地址）。
   2. **非 probe fault 必须 ABORT**：若 Rip 不在本函数 __try 体内（编译器报告的函数地址
      范围由 __C_specific_handler 表驱动，帧本身只接受本函数异常）→ 不可能发生
-     （该帧只包裹本函数）；若访问地址 != TLS.call_token.va 且 != va+8（load 2）→
+     （该帧只包裹本函数）；若访问地址 != MidaProbeTls.token_va 且 != token_va+8（load 2）→
      说明 fault 不是当前探针的读取 → status_slot = ABORT（fail-closed，不静默分类）。
-  3. 访问地址 == call_token.va 或 va+8 且码为 guard/AV → FAULT。
+  3. 访问地址 == token_va.va 或 va+8 且码为 guard/AV → FAULT。
   4. 其它码（breakpoint 等）→ ABORT（沿用 §4.2 行 5/6）。
 - handler 按异常码分派：STATUS_GUARD_PAGE_VIOLATION (0x80000001) / STATUS_ACCESS_VIOLATION
   (0xC0000005) 且访问地址匹配 → *status_slot = MIDA_PROBE_FAULT；其它 → MIDA_PROBE_ABORT。
-- 过滤器只读 ExceptionRecord 与 TLS.call_token（已提交页），不调用任何函数、不做分配。
+- 过滤器只读 ExceptionRecord 与 TLS.token_va（已提交页），不调用任何函数、不做分配。
 - **无 RIP window 合同**：mida_probe_read_end 符号**不存在**；不依赖任何函数地址排序/
-  linker section。归属 = 线程 + call_token 访问地址匹配（§4.3）。
+  linker section。归属 = 线程 + token_va 访问地址匹配（§4.3）。
 ### 2.3 Rust FFI 调用转换（fixture，实现工单照抄）
 
 ~~~rust
-// walker 侧 FFI 声明（探针循环所在模块）
+// walker 侧 FFI 声明（探针循环所在模块；WO-1901 冻结）
 #[repr(C)]
-struct MidaProbeCallToken { va: *const u8, seq: u32 }
+struct MidaProbeTls {
+    magic: u32,
+    active: u32,
+    seq: u32,
+    reserved: u32,
+    token_va: u64,
+}
 
 extern "C" {
     fn mida_probe_read(va: *const u8, out16: *mut u8, status_slot: *mut u32) -> u32;
-    fn mida_probe_call_token_layout() -> *const MidaProbeCallToken;
+    fn mida_probe_tls_begin(va: u64, seq: u32) -> u32;   // 0 ok, !=0 re-entry -> ABORT
+    fn mida_probe_tls_clear();
+    fn mida_probe_tls_snapshot() -> *const MidaProbeTls;
 }
 
 // 调用点合同（探针循环内，每候选一次）：
 //   status_slot 为探针线程栈上的 32 位槽（8 字节对齐，初值 0xFF）；
 //   out16 为探针线程栈上的 [u8; 16]；
-//   调用前：TLS.call_token = (va, seq)；seq 每候选递增（归属匹配用）；
-//   调用后：TLS.call_token 清零；
-//   status = mida_probe_read(va, out16, &mut slot);
-//   status != 0 时不得使用 out16 内容；分类一律读 TLS 标记（§5）。
+//   1. seq += 1（探针循环局部计数器）；
+//   2. rc = mida_probe_tls_begin(va as u64, seq)；rc != 0 → abort（重入/损坏）；
+//   3. status = mida_probe_read(va, out16, &mut slot);
+//   4. tls = *mida_probe_tls_snapshot()（读 active/seq/token_va，仅探针线程）；
+//   5. mida_probe_tls_clear();
+//   6. status != OK 时不得使用 out16 内容；分类按 status + TLS 标记（§4.2/§5）。
 ~~~
 ### 2.4 volatile 寄存器与 shadow space
 
@@ -192,10 +222,10 @@ walker VEH 用 AddVectoredExceptionHandler(First=TRUE) 注册（链首），但*
 | 4 | AV fault，保护器未处理 | av_seen=1 → CS | CS / 无 | shim → FAULT | FAULT | **AV**；重试 1 次后仍 AV → **Type A** |
 | 5 | 未知异常码（如 breakpoint/illegal instr） | unknown_code=code → CS | CS / 无 | shim → ABORT | ABORT | **walker abort**（fail-closed，WALKER_ERROR_PROBE_ABORTED） |
 | 6 | 未知异常码，保护器 CE（重放成功） | unknown_code=code → CS | CE | 无 | OK | **仍 abort**：unknown_code != 0 即 fail-closed，不因重放成功而继续 |
-| 7 | 非探针线程 / 非 active / 访问地址 ≠ call_token.va(va+8) 的异常 | 不观测，CS | 照常 | 不达 shim（若达：filter 判访问地址不匹配 → ABORT） | — | 与 walker 无关；保护器链与其它 handler 观测权完整 |
+| 7 | 非探针线程 / 非 active / 访问地址 ≠ token_va.va(va+8) 的异常 | 不观测，CS | 照常 | 不达 shim（若达：filter 判访问地址不匹配 → ABORT） | — | 与 walker 无关；保护器链与其它 handler 观测权完整 |
 | 8 | 探针 fault 但 walker VEH 未被调用（保护器后注册覆盖链首） | 未观测（TLS 无标记） | CE 解密 / CS | CS 时达 shim → FAULT | OK / FAULT | 未观测 + OK → **Type C**（诚实：无 guard 证据）；未观测 + FAULT → guard/AV 按 shim 结果 |
 
-**不变量**：active 阶段内、探针线程上、访问地址匹配 call_token 的异常，要么被保护器解密重放（行 1/3），
+**不变量**：active 阶段内、探针线程上、访问地址匹配 token_va 的异常，要么被保护器解密重放（行 1/3），
 要么被 shim 帧收口（行 2/4/5）；不存在“未处理异常 → 进程终止”路径。unknown_code 置位
 （行 5/6）→ 无条件 abort。
 
@@ -205,7 +235,7 @@ walker VEH 用 AddVectoredExceptionHandler(First=TRUE) 注册（链首），但*
 1. **线程**：faulting 线程 == 探针线程（TLS 线程身份匹配）；
 2. **阶段**：TLS.active == true（探针循环阶段内）；
 3. **访问地址**：ExceptionRecord.ExceptionInformation[1]（AV/guard 的 faulting 访问地址）
-   ∈ { TLS.call_token.va, TLS.call_token.va + 8 }（两条 8 字节 load 的唯一可能访问地址）。
+   ∈ { MidaProbeTls.token_va, MidaProbeTls.token_va + 8 }（两条 8 字节 load 的唯一可能访问地址）。
 
 - **无 RIP window**：不定义 mida_probe_read_end；不依赖函数地址排序、linker section、
   或任何代码布局假设。编译器/链接器可任意重排/内联/优化 shim 而不影响归属。
@@ -218,6 +248,49 @@ walker VEH 用 AddVectoredExceptionHandler(First=TRUE) 注册（链首），但*
 - **C 可离线审查 fixture（§7.1）**：纯函数归属判定（thread_ok && active && addr_match）
   与状态转换（表 §4.2 行 1-8）可脱离 Windows 用单元测试验证（输入为模拟的
   ExceptionRecord/TLS 值）；这不构成 Windows 行为已验证（V10 仍待 LIVE-4）。
+### 4.4 TLS 共享存储与生命周期（WO-1901 冻结，owner = C shim）
+
+**owner 裁定**：TLS 槽（MidaProbeTls，__declspec(thread) static）**唯一属主为 C shim**；
+Rust 侧绝不直接访问 TLS 槽（不声明同名 thread_local），只经导出 accessor
+（mida_probe_tls_begin/clear/snapshot）。SEH filter 在异常分派上下文内**直接读同一槽**
+（编译器生成的 TLS 访问序列，无函数调用）——这就是 filter 读取"当前探针 token"的真实 ABI。
+
+**x64 TLS 表示**（编译器生成，冻结假设）：
+- __declspec(thread) static → TEB+0x58（ThreadLocalStoragePointer）→
+  tls_array[_tls_index]（tls_index 由链接器分配）→ +slot offset；
+- 访问序列对 begin/clear/snapshot/filter 一致；MSVC 保证同一 DLL 内 thread-local
+  访问通过同一 _tls_index；禁止 /Gs 之外的 TLS 相关开关改动。
+
+**生命周期时序（冻结）**：
+1. 探针线程创建后、首候选前：TLS 零初始化（active=0, magic=0）→ 首调用 begin 写入 magic；
+2. 每候选：seq += 1（Rust 局部）→ begin(va, seq)：校验 magic 非 0（首写）或 ==MIDA_TLS_MAGIC，
+   且 active==0（否则返回 1 = 重入）；写入 active=1/token_va=va/seq；
+3. mida_probe_read 执行（异常可能发生：VEH 观测 → filter 读 TLS → handler 写 status_slot）；
+4. 返回后：Rust 读 snapshot（active/seq/token_va）→ clear（active=0, token_va=0）；
+5. 探针线程退出前：clear + 线程终止（OS 回收 TLS）；
+6. 异常返回路径：handler 只写 status_slot，**不**改 TLS（VEH 已写标记；TLS 由主路径 clear）；
+7. 嵌套/重入：begin 返回非 0 → 探针循环 abort（fail-closed）；filter 若在 begin 前
+   被调（不可能：filter 只被本函数 __try 触发）→ active==0 → ABORT。
+
+**stale-token 防护**：候选间 clear 保证下一候选 begin 前 active==0、token_va==0；
+任何"旧 token 残留"场景（begin 失败、异常后未 clear）都在下一步 begin 时被检测 → abort。
+
+**线程身份**：TLS 天然线程局部——非探针线程读到的 active==0，归属失败 → VEH 不观测、
+filter 若达（不可能）→ ABORT。无需额外线程 ID 存储。
+
+**fail-closed 判定矩阵（filter 内，WO-1901）**：
+
+| 条件 | 结果 |
+|------|------|
+| active==0（本线程无探针） | ABORT（若达本帧即异常异常路径；VEH 侧则 CONTINUE_SEARCH） |
+| magic != MIDA_TLS_MAGIC | ABORT（槽损坏） |
+| token_va==0 | ABORT（未 begin 却 fault） |
+| 访问地址 == token_va 或 token_va+8，码为 guard/AV | FAULT |
+| 访问地址 == 其它值 | ABORT（out16/status_slot 故障或非本探针 fault） |
+| 码为未知（非 guard/AV） | ABORT |
+| seq 与调用方期望不符（VEH 侧记录，主路径比对） | abort（分类时检测） |
+| 地址溢出（token_va+8 回绕） | begin 时拒绝：token_va 必须 canonical 且 token_va <= MAX-8 → 否则 begin 返回非 0 |
+
 ## 5. TLS 生命周期与候选绑定（关闭 P1-1602-3）
 
 ### 5.1 字段（探针线程 TLS，单线程独占）
@@ -233,7 +306,7 @@ walker VEH 用 AddVectoredExceptionHandler(First=TRUE) 注册（链首），但*
 
 1. **候选入口清零**：每个候选在调用 mida_probe_read 之前，walker 清零 guard_seen/
    av_seen/unknown_code——候选之间零状态继承（防 stale state 污染下一候选）。
-2. **置位**：仅 walker VEH 在“active && 探针线程 && 访问地址匹配 TLS.call_token.va（或 va+8）”时置位；任何其它条件不写 TLS。
+2. **置位**：仅 walker VEH 在“active && 探针线程 && 访问地址匹配 MidaProbeTls.token_va（或 token_va+8）”时置位；任何其它条件不写 TLS。
 3. **读取时序**：mida_probe_read 返回后、进入下一候选前，walker 一次性读取三个标记并
    据此分类（§4.2）；unknown_code != 0 → abort（行 5/6）。
 4. **清理**：walker_inner 退出（成功/失败/abort）前清空全部字段并卸载 VEH（VehGuard RAII，
@@ -268,14 +341,15 @@ walker VEH 用 AddVectoredExceptionHandler(First=TRUE) 注册（链首），但*
 
 ### 7.1 可离线审查的 C header / 状态转换 fixture（WO-1802 交付）
 
-- **归属判定纯函数**（fixture，实现工单照抄）：
+- **归属判定纯函数**（fixture，实现工单照抄；完整文件见
+  docs/fixtures/WO-1901-probe-tls-fixture.h，含 MidaProbeTls 布局 static_assert）：
   ~~~c
-  /* attribution_contract.h — WO-1802 */
+  /* attribution_contract.h — WO-1802/WO-1901 */
   typedef struct AttrInput {
       int    probe_thread;      /* faulting thread == probe thread ? */
       int    active;            /* TLS.active */
       uint64_t access_addr;     /* ExceptionInformation[1] */
-      uint64_t token_va;        /* TLS.call_token.va */
+      uint64_t token_va;        /* TLS.token_va.va */
       uint32_t code;            /* exception code */
   } AttrInput;
   typedef enum { ATTR_NONE, ATTR_PROBE_FAULT, ATTR_PROBE_ABORT } AttrResult;
@@ -297,11 +371,11 @@ walker VEH 用 AddVectoredExceptionHandler(First=TRUE) 注册（链首），但*
 ## 8. 实现前 checklist
 
 - [ ] build.rs 集成：cc crate 编译 probe_shim.c（cl.exe /O2），失败即构建失败
-- [ ] probe_shim.h/2.1 原样落地；符号 mida_probe_read / mida_probe_call_token_layout 导出检查
+- [ ] probe_shim.h/2.1 原样落地；符号 mida_probe_read / mida_probe_tls_begin / mida_probe_tls_clear / mida_probe_tls_snapshot 导出检查
 - [ ] 协议收紧：WalkerParamsV2::validate 要求 probe_span == 16（§3，单独实现单）
-- [ ] Rust FFI（2.3）与调用点合同落地；探针循环不跨调用保存 volatile 状态
-- [ ] VEH：First=TRUE 注册、观测-only、恒 CS；归属过滤（线程/active/访问地址==call_token.va 或 va+8）
-- [ ] TLS 生命周期（§5.2 五项）单测：候选清零、stale 防护、unknown abort
+- [ ] Rust FFI（2.3）与调用点合同落地；TLS 仅经 accessor（begin/clear/snapshot）访问；探针循环不跨调用保存 volatile 状态
+- [ ] VEH：First=TRUE 注册、观测-only、恒 CS；归属过滤（线程/active/访问地址==token_va.va 或 va+8）
+- [ ] TLS 生命周期（§4.4 + §5.2）单测：begin/clear 时序、重入 abort、stale 防护、unknown abort、filter 判定矩阵逐行
 - [ ] 状态表 §4.2 行 1-8 逐行单测/仿真（离线：VEH+shim 逻辑；实弹：LIVE-4）
 - [ ] 卸载顺序（§6.2）接入既有 wait-before-free 规则并回归
 - [ ] WO-1301A-IMPL §3 与本文件一致（本单已同步）
