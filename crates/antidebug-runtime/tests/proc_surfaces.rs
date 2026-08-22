@@ -526,3 +526,133 @@ fn attestation_candidate_never_in_expected() {
     );
     assert!(att.validate().is_err()); // incomplete -> fail-closed
 }
+
+// ===========================================================================
+// WO-1001: AD-PROC-004 (NtGlobalFlag) + AD-PROC-005 (heap ForceFlags)
+// ===========================================================================
+
+/// Fixture: PEB with NtGlobalFlag at 0xBC set to a value.
+fn peb_with_nt_global_flag(v: u32) -> FakePebMemory {
+    let mut f = FakePebMemory::new();
+    {
+        let mut b = f.bytes.borrow_mut();
+        b[0xBC..0xC0].copy_from_slice(&v.to_le_bytes());
+    }
+    f
+}
+
+/// Fixture: PEB with ProcessHeap pointer at 0x30 and heap header at heap+0x40/0x44.
+/// The heap header lives INSIDE the PEB bytes (heap_ptr = PEB_BASE + 0x100,
+/// heap+0x44 = PEB_BASE + 0x144 < PEB 0x300) so FakePebMemory read/write both work.
+fn peb_with_heap(heap_ptr: u64, flags: u32, force_flags: u32) -> FakePebMemory {
+    let mut f = FakePebMemory::new();
+    {
+        let mut b = f.bytes.borrow_mut();
+        b[0x30..0x38].copy_from_slice(&heap_ptr.to_le_bytes());
+        // heap header at heap_ptr + 0x40 (Flags) and +0x44 (ForceFlags)
+        let heap_off = (heap_ptr - PEB_BASE) as usize;
+        b[heap_off + 0x40..heap_off + 0x44].copy_from_slice(&flags.to_le_bytes());
+        b[heap_off + 0x44..heap_off + 0x48].copy_from_slice(&force_flags.to_le_bytes());
+    }
+    f
+}
+
+/// PEB layout authority: NtGlobalFlag offset 0xBC, ProcessHeap 0x30,
+/// heap Flags 0x40 / ForceFlags 0x44 on x64.
+#[test]
+fn proc004_layout_offsets_authority() {
+    use mida_antidebug_runtime::surfaces::{
+        HEAP_OFFSET_FLAGS, HEAP_OFFSET_FORCE_FLAGS, PEB_OFFSET_NT_GLOBAL_FLAG,
+        PEB_OFFSET_PROCESS_HEAP,
+    };
+    assert_eq!(PEB_OFFSET_NT_GLOBAL_FLAG, 0xBC);
+    assert_eq!(PEB_OFFSET_PROCESS_HEAP, 0x30);
+    assert_eq!(HEAP_OFFSET_FLAGS, 0x40);
+    assert_eq!(HEAP_OFFSET_FORCE_FLAGS, 0x44);
+}
+
+/// AD-PROC-004: debugger gflags (0x70) is cleared to 0 with read-back confirm.
+#[test]
+fn proc004_clears_debugger_nt_global_flag() {
+    use mida_antidebug_runtime::surfaces::install_proc_004;
+    let mem = peb_with_nt_global_flag(0x70);
+    let view = PebView::resolve(&mem, PID, POINTER_SIZE_X64).unwrap();
+    let out = install_proc_004(&view, &mem, PID, PID, DIGEST, DIGEST).unwrap();
+    assert!(out.installed, "install must succeed");
+    assert_eq!(out.surface_id, "AD-PROC-004");
+    assert_eq!(out.original_value.as_deref(), Some("0x00000070"));
+    assert_eq!(out.effective_value.as_deref(), Some("0x00000000"));
+    // Read-back: field is now 0.
+    assert_eq!(mem.bytes.borrow()[0xBC..0xC0], [0u8; 4]);
+}
+
+/// AD-PROC-004: already-clean NtGlobalFlag (0) stays clean.
+#[test]
+fn proc004_clean_flag_unchanged() {
+    use mida_antidebug_runtime::surfaces::install_proc_004;
+    let mem = peb_with_nt_global_flag(0x0);
+    let view = PebView::resolve(&mem, PID, POINTER_SIZE_X64).unwrap();
+    let out = install_proc_004(&view, &mem, PID, PID, DIGEST, DIGEST).unwrap();
+    assert!(out.installed);
+    assert_eq!(out.original_value.as_deref(), Some("0x00000000"));
+    assert_eq!(out.effective_value.as_deref(), Some("0x00000000"));
+}
+
+/// AD-PROC-004: write-back failure is fail-closed (writes silently dropped).
+#[test]
+fn proc004_write_back_failure_fails_closed() {
+    use mida_antidebug_runtime::surfaces::install_proc_004;
+    let mut mem = peb_with_nt_global_flag(0x70);
+    mem.write_sticks = false;
+    let view = PebView::resolve(&mem, PID, POINTER_SIZE_X64).unwrap();
+    let r = install_proc_004(&view, &mem, PID, PID, DIGEST, DIGEST);
+    assert!(r.is_err(), "write-back verification must fail closed");
+}
+
+/// AD-PROC-005: debugger ForceFlags (0x40000060) is cleared with read-back.
+#[test]
+fn proc005_clears_debugger_force_flags() {
+    use mida_antidebug_runtime::surfaces::install_proc_005;
+    let heap_ptr = PEB_BASE + 0x100;
+    let mem = peb_with_heap(heap_ptr, 0x50000062, 0x40000060);
+    let view = PebView::resolve(&mem, PID, POINTER_SIZE_X64).unwrap();
+    let out = install_proc_005(&view, &mem, PID, PID, DIGEST, DIGEST).unwrap();
+    assert!(out.installed);
+    assert_eq!(out.surface_id, "AD-PROC-005");
+    assert!(out
+        .original_value
+        .as_deref()
+        .unwrap()
+        .contains("force=0x40000060"));
+    assert!(out
+        .effective_value
+        .as_deref()
+        .unwrap()
+        .contains("force=0x00000000"));
+}
+
+/// AD-PROC-005: clean ForceFlags (0) stays clean.
+#[test]
+fn proc005_clean_force_flags_unchanged() {
+    use mida_antidebug_runtime::surfaces::install_proc_005;
+    let heap_ptr = PEB_BASE + 0x150;
+    let mem = peb_with_heap(heap_ptr, 0x50000062, 0x0);
+    let view = PebView::resolve(&mem, PID, POINTER_SIZE_X64).unwrap();
+    let out = install_proc_005(&view, &mem, PID, PID, DIGEST, DIGEST).unwrap();
+    assert!(out.installed);
+    assert!(out
+        .effective_value
+        .as_deref()
+        .unwrap()
+        .contains("force=0x00000000"));
+}
+
+/// AD-PROC-005: null ProcessHeap is fail-closed.
+#[test]
+fn proc005_null_heap_fails_closed() {
+    use mida_antidebug_runtime::surfaces::install_proc_005;
+    let mem = FakePebMemory::new(); // ProcessHeap stays 0
+    let view = PebView::resolve(&mem, PID, POINTER_SIZE_X64).unwrap();
+    let r = install_proc_005(&view, &mem, PID, PID, DIGEST, DIGEST);
+    assert!(r.is_err(), "null ProcessHeap must fail closed");
+}

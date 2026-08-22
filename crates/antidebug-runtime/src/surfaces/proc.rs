@@ -380,6 +380,181 @@ pub fn install_proc_003(
     ))
 }
 
+/// x64 PEB.NtGlobalFlag offset (public x64 Windows ABI; gflags u32).
+pub const PEB_OFFSET_NT_GLOBAL_FLAG: u64 = 0xBC;
+/// x64 PEB.ProcessHeap pointer offset (public x64 Windows ABI).
+pub const PEB_OFFSET_PROCESS_HEAP: u64 = 0x30;
+/// x64 heap header Flags offset (relative to ProcessHeap base).
+pub const HEAP_OFFSET_FLAGS: u64 = 0x40;
+/// x64 heap header ForceFlags offset (relative to ProcessHeap base).
+pub const HEAP_OFFSET_FORCE_FLAGS: u64 = 0x44;
+
+/// Surface ids.
+pub const SURFACE_AD_PROC_004: &str = "AD-PROC-004";
+pub const SURFACE_AD_PROC_005: &str = "AD-PROC-005";
+
+/// Non-debugger baseline for NtGlobalFlag: 0 (no gflags).
+pub const NT_GLOBAL_FLAG_CLEAN: u32 = 0x0;
+/// Debugger-present gflags value (0x70 = HEAP_ENABLE_TAIL_CHECK |
+/// HEAP_ENABLE_FREE_CHECK | HEAP_VALIDATE_PARAMETERS) — what we clear.
+pub const NT_GLOBAL_FLAG_DEBUGGER: u32 = 0x70;
+
+/// AD-PROC-004 installation: observe, then clear PEB.NtGlobalFlag.
+///
+/// Debugger presence sets NtGlobalFlag to 0x70 (heap validation bits).
+/// Clean baseline is 0x0. We record original, zero it, and confirm.
+pub fn install_proc_004(
+    view: &PebView,
+    mem: &dyn PebMemory,
+    expected_pid: u32,
+    pid: u32,
+    expected_profile_digest: &str,
+    profile_digest: &str,
+) -> Result<SurfaceInstallOutcome, SurfaceError> {
+    if pid != expected_pid {
+        return Err(SurfaceError::TargetPidMismatch {
+            expected: expected_pid,
+            got: pid,
+        });
+    }
+    if profile_digest != expected_profile_digest {
+        return Err(SurfaceError::ProfileDigestMismatch {
+            expected: expected_profile_digest.to_string(),
+            got: profile_digest.to_string(),
+        });
+    }
+    let addr = view.field_addr(PEB_OFFSET_NT_GLOBAL_FLAG, 4)?;
+    if !mem.is_readable(addr, 4) {
+        return Err(SurfaceError::PebNotReadable { addr, len: 4 });
+    }
+    let raw = mem
+        .read_bytes(addr, 4)
+        .map_err(SurfaceError::MemoryAccess)?;
+    let original = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+    let effective = if original != NT_GLOBAL_FLAG_CLEAN {
+        // Debugger gflags (0x70) or any non-zero: clear to clean baseline.
+        if !mem.is_writable(addr, 4) {
+            return Err(SurfaceError::PebNotWritable { addr, len: 4 });
+        }
+        mem.write_bytes(addr, &NT_GLOBAL_FLAG_CLEAN.to_le_bytes())
+            .map_err(SurfaceError::MemoryAccess)?;
+        // Read back and confirm.
+        let rb = mem
+            .read_bytes(addr, 4)
+            .map_err(SurfaceError::MemoryAccess)?;
+        let effective = u32::from_le_bytes([rb[0], rb[1], rb[2], rb[3]]);
+        if effective != NT_GLOBAL_FLAG_CLEAN {
+            return Err(SurfaceError::MemoryAccess(format!(
+                "NtGlobalFlag write-back verification failed: effective {effective:#x} != 0"
+            )));
+        }
+        effective
+    } else {
+        // Already clean.
+        original
+    };
+    Ok(SurfaceInstallOutcome::success(
+        SURFACE_AD_PROC_004,
+        format!("0x{original:08x}"),
+        format!("0x{effective:08x}"),
+        RestorationPolicy::RestoreOriginal,
+    ))
+}
+
+/// AD-PROC-005 installation: observe, then clear heap ForceFlags.
+///
+/// Debugger presence sets ProcessHeap->ForceFlags (e.g. 0x40000060).
+/// Clean baseline: ForceFlags=0. We zero ForceFlags (the debugger
+/// signature) and record the Flags field for the three-state record.
+pub fn install_proc_005(
+    view: &PebView,
+    mem: &dyn PebMemory,
+    expected_pid: u32,
+    pid: u32,
+    expected_profile_digest: &str,
+    profile_digest: &str,
+) -> Result<SurfaceInstallOutcome, SurfaceError> {
+    if pid != expected_pid {
+        return Err(SurfaceError::TargetPidMismatch {
+            expected: expected_pid,
+            got: pid,
+        });
+    }
+    if profile_digest != expected_profile_digest {
+        return Err(SurfaceError::ProfileDigestMismatch {
+            expected: expected_profile_digest.to_string(),
+            got: profile_digest.to_string(),
+        });
+    }
+    // Resolve ProcessHeap pointer from PEB.
+    let heap_ptr = view.read_ptr(mem, PEB_OFFSET_PROCESS_HEAP)?;
+    if heap_ptr == 0 {
+        return Err(SurfaceError::ShimDataInvalid(
+            "ProcessHeap pointer is null".into(),
+        ));
+    }
+    // ForceFlags at heap+0x44 (x64): zero it (debugger signature).
+    let force_addr = heap_ptr
+        .checked_add(HEAP_OFFSET_FORCE_FLAGS)
+        .ok_or_else(|| SurfaceError::PebBaseOverflow(format!("heap {heap_ptr:#x} + force")))?;
+    if !mem.is_readable(force_addr, 4) {
+        return Err(SurfaceError::PebNotReadable {
+            addr: force_addr,
+            len: 4,
+        });
+    }
+    let raw = mem
+        .read_bytes(force_addr, 4)
+        .map_err(SurfaceError::MemoryAccess)?;
+    let original_force = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+
+    // Record also the Flags field (heap+0x40) for the three-state record.
+    let flags_addr = heap_ptr
+        .checked_add(HEAP_OFFSET_FLAGS)
+        .ok_or_else(|| SurfaceError::PebBaseOverflow(format!("heap {heap_ptr:#x} + flags")))?;
+    let flags_original = if mem.is_readable(flags_addr, 4) {
+        let fr = mem
+            .read_bytes(flags_addr, 4)
+            .map_err(SurfaceError::MemoryAccess)?;
+        Some(u32::from_le_bytes([fr[0], fr[1], fr[2], fr[3]]))
+    } else {
+        None
+    };
+
+    let effective = if original_force != 0 {
+        // Debugger ForceFlags signature: zero it.
+        if !mem.is_writable(force_addr, 4) {
+            return Err(SurfaceError::PebNotWritable {
+                addr: force_addr,
+                len: 4,
+            });
+        }
+        mem.write_bytes(force_addr, &0u32.to_le_bytes())
+            .map_err(SurfaceError::MemoryAccess)?;
+        let rb = mem
+            .read_bytes(force_addr, 4)
+            .map_err(SurfaceError::MemoryAccess)?;
+        let effective = u32::from_le_bytes([rb[0], rb[1], rb[2], rb[3]]);
+        if effective != 0 {
+            return Err(SurfaceError::MemoryAccess(format!(
+                "ForceFlags write-back verification failed: effective {effective:#x} != 0"
+            )));
+        }
+        effective
+    } else {
+        // Already clean.
+        original_force
+    };
+    let original_desc = format!("force=0x{original_force:08x}")
+        + &flags_original.map_or(String::new(), |f| format!(" flags=0x{f:08x}"));
+    Ok(SurfaceInstallOutcome::success(
+        SURFACE_AD_PROC_005,
+        original_desc,
+        format!("force=0x{effective:08x}"),
+        RestorationPolicy::RestoreOriginal,
+    ))
+}
+
 /// Restore AD-PROC-002 (and any other modified surfaces).
 pub fn restore_proc_002(
     view: &PebView,
