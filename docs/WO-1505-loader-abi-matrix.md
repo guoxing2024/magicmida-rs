@@ -199,6 +199,172 @@ runtime 导出数、artifact digest），且"复用"被写成"已支持"。本�
    禁止 controller 侧地址；runtime 以 raw pointer 解引用（与 profile_id/profile_digest 同模式）。
    可读性/NUL 校验：读取前先按 len==64 检查目标缓冲区边界（64 hex + NUL = 65 字节，
    分配由 controller 保证）；任何越界/非 hex/非 NUL 结尾 → InvalidArgument，fail-closed。
+### 5.3a Layout golden bytes（WO-1902 冻结：C/Rust 双侧 repr(C) 对位）
+
+**MidaInitParams v1（0x30）**——C 与 Rust 侧必须完全一致：
+
+| offset | size | 字段 | C 类型 | Rust 类型 |
+|--------|------|------|--------|-----------|
+| 0x00 | 4 | target_pid | uint32_t | u32 |
+| 0x04 | 4 | _pad0 | — | (padding) |
+| 0x08 | 8 | module_base | uint64_t | u64 |
+| 0x10 | 8 | profile_id | const char* | *const c_char |
+| 0x18 | 8 | profile_digest | const char* | *const c_char |
+| 0x20 | 8 | expected_hooks | size_t | usize |
+| 0x28 | 8 | expected_surfaces | const char* const* | *const *const c_char |
+| 0x30 | — | 结束 | | |
+
+golden bytes（fixture，字段值：target_pid=0x11223344, module_base=0x400000,
+profile_id_ptr=0x401000, profile_digest_ptr=0x402000, expected_hooks=2,
+expected_surfaces_ptr=0x403000）：
+
+~~~text
+00: 44 33 22 11 00 00 00 00     target_pid(LE) + _pad0
+08: 00 00 40 00 00 00 00 00     module_base(LE) = 0x400000
+10: 00 10 40 00 00 00 00 00     profile_id_ptr(LE) = 0x401000
+18: 00 20 40 00 00 00 00 00     profile_digest_ptr(LE) = 0x402000
+20: 02 00 00 00 00 00 00 00     expected_hooks(LE) = 2
+28: 00 30 40 00 00 00 00 00     expected_surfaces_ptr(LE) = 0x403000
+总长 0x30
+~~~
+
+**MidaInitParamsV2（0x48）**——v1 字段 + v2 追加：
+
+| offset | size | 字段 | C 类型 | Rust 类型 |
+|--------|------|------|--------|-----------|
+| 0x00..0x30 | 0x30 | （v1 全部字段，逐字节一致） | 同 v1 | 同 v1 |
+| 0x30 | 8 | magic_v2 | uint64_t | u64 |
+| 0x38 | 8 | expected_runtime_sha256 | const char* | *const c_char |
+| 0x40 | 8 | expected_runtime_sha256_len | uint64_t | u64 |
+| 0x48 | — | 结束 | | |
+
+golden bytes（追加段，magic_v2 = "MIDA2P2\0" LE = 0x003250324144494D,
+digest_ptr = 0x404000, len = 64）：
+
+~~~text
+30: 4D 49 44 41 32 50 32 00     magic_v2(LE) = "MIDA2P2\0" 字节序
+38: 00 40 40 00 00 00 00 00     expected_runtime_sha256_ptr(LE) = 0x404000
+40: 40 00 00 00 00 00 00 00     expected_runtime_sha256_len(LE) = 64
+总长 0x48
+~~~
+
+**C 侧 static_assert 合同（实现工单必须原样落地）**：
+
+~~~c
+_Static_assert(sizeof(MidaInitParams) == 0x30, "v1 size");
+_Static_assert(sizeof(MidaInitParamsV2) == 0x48, "v2 size");
+_Static_assert(offsetof(MidaInitParams, target_pid) == 0x00, "v1 target_pid");
+_Static_assert(offsetof(MidaInitParams, module_base) == 0x08, "v1 module_base");
+_Static_assert(offsetof(MidaInitParamsV2, magic_v2) == 0x30, "v2 magic");
+_Static_assert(offsetof(MidaInitParamsV2, expected_runtime_sha256) == 0x38, "v2 digest ptr");
+_Static_assert(offsetof(MidaInitParamsV2, expected_runtime_sha256_len) == 0x40, "v2 digest len");
+~~~
+
+**Rust 侧 static_assert 等价（实现工单必须）**：
+
+~~~rust
+const _: () = {
+    assert!(std::mem::size_of::<MidaInitParams>() == 0x30);
+    assert!(std::mem::size_of::<MidaInitParamsV2>() == 0x48);
+    assert!(std::mem::offset_of!(MidaInitParamsV2, magic_v2) == 0x30);
+    assert!(std::mem::offset_of!(MidaInitParamsV2, expected_runtime_sha256) == 0x38);
+};
+~~~
+
+**endian test vector（实现单测）**：encode/decode 双向断言——读 8 字节 LE 于 0x30 得到
+0x003250324144494D 且字节 == [4D 49 44 41 32 50 32 00]；写同值再读回一致。
+
+### 5.3b V2 指针安全合同（WO-1902 冻结）
+
+**target-local 判定**：V2 结构内全部指针（profile_id、profile_digest、expected_surfaces、
+expected_runtime_sha256）必须是 target 进程地址空间内的 VA。运行时判定规则：
+- 指针值必须落在**本 params blob 分配范围内**（controller 在 target 内 VirtualAllocEx
+  分配，blob 基址 + 长度已知）；runtime 在 initialize 时按"blob 范围"检查所有指针，
+  不在范围内 → InvalidArgument（fail-closed）。
+- 检查顺序：先判指针 == 0 → 拒收；再判指针 < blob_base || 指针 >= blob_base + blob_size
+  → 拒收；再判目标区域可读（NUL 扫描 65 字节上限，见下）。
+- **不依赖 ReadProcessMemory/SEH**：所有指针指向的字节在本进程地址空间内
+  （同一 target 进程 = runtime 自身进程），直接解引用；范围检查在解引用前完成。
+
+**65-byte digest 可读性**：
+- expected_runtime_sha256 指向 64 hex 字符 + 1 NUL = 65 字节区域；
+- 读取协议：len 字段必须 == 64；从 ptr 起最多读 65 字节，遇 NUL 停止；
+  - 读到 64 字节且第 65 字节 != NUL → 拒收（BufferOverrun，fail-closed）；
+  - 64 字节内遇 NUL（提前终止）→ 拒收（TruncatedDigest）；
+  - 65 字节内有任意非 hex 字符（0-9a-fA-F）→ 拒收（BadHex）；
+- **hex 规则**：只接受 lowercase（0-9a-f）；大写拒收（规范化：digest 一律 lowercase）。
+- **NUL 位置**：必须恰好在第 65 字节（offset 64）为 0x00；其余位置 NUL → 拒收。
+
+**错误码与 fail-closed 路径**：
+
+| 条件 | 错误 | 路径 |
+|------|------|------|
+| 指针 == 0 | InvalidArgument | 返回错误码，attestation 不生成 |
+| 指针越界（blob 范围外） | InvalidArgument | 同上 |
+| len != 64 | InvalidArgument | 同上 |
+| 提前 NUL / 超 65 无 NUL | InvalidArgument（Truncated/BufferOverrun） | 同上 |
+| 非 lowercase hex | InvalidArgument（BadHex） | 同上 |
+| 任一失败 | — | controller 侧：out_runtime_sha256 未写入；attestation.runtime_sha256 保持未绑定；acceptance 拒收（§5.4） |
+
+**cleanup**：V2 params blob（含 digest 字符串）由 controller 的 wait-before-free 铁律管理：
+远程线程确认终止后才 VirtualFreeEx；runtime 侧不分配、不释放任何 digest 内存（只读）。
+
+### 5.3c 导出解析闭环（WO-1902 冻结）
+
+**wanted 列表（5 项，全部必选）**：
+
+| # | 导出名 | 用途 |
+|---|--------|------|
+| 1 | MidaAntidebugInitialize | v1 入口（无 digest 场景 fallback） |
+| 2 | MidaAntidebugGetAttestation | 证据读取 |
+| 3 | MidaAntidebugShutdown | 清理 |
+| 4 | MidaAntidebugInitializeV2 | v2 入口（digest 绑定场景，唯一） |
+| 5 | WalkerExecute | walker 探针入口（allowlist 断言对象） |
+
+**MidaExports 五字段**：initialize、get_attestation、shutdown、initialize_v2、walker_execute。
+
+**解析规则（resolve_exports_from_buffers 泛化后）**：
+- 任一缺失 → ExportResolutionFailed（fail-closed，不部分放行）；
+- **重复导出**（同名多次出现）→ 拒收（AmbiguousExport）；
+- **forwarded export**（函数 RVA 落在导出目录内）→ 拒收（ForwardedExportUnsupported，
+  沿用既有解析器行为）；
+- **out-of-module export**（RVA >= image size 或指向其它模块）→ 拒收；
+- **入口 allowlist 证据**：CreateRemoteThread 的 start 必须 == module_base +
+  WalkerExecute RVA（解析结果）；controller 记录 module_base、rva、解析出的 VA 三项，
+  写入 walker 实现工单的证据要求。
+
+**V2 thunk 六参数对位**（复用现有 6 参 thunk）：
+
+| thunk 槽 | 值 |
+|----------|----|
+| fn_ptr | module_base + MidaAntidebugInitializeV2 RVA |
+| arg0 | params_v2_blob_va（target-local） |
+| arg1 | out_runtime_sha256_va |
+| arg2 | 64（out_runtime_sha256_len） |
+| arg3 | out_attestation_json_va |
+| arg4 | ATTESTATION_BUFFER_SIZE |
+| arg5 | out_attestation_written_va |
+| reserved | 0 |
+
+### 5.3d fallback 门禁（唯一，WO-1902 冻结）
+
+**digest 需求定义**（可检查的唯一条件）：
+
+> 当且仅当以下任一为真时，本次初始化**要求 digest 绑定**：
+> 1. 本次会话启用 Walker 探针（WalkerExecute 将被调用）；或
+> 2. 需要生成 v2 attestation（schema_version == 2，含 walker_attestation 容器）；或
+> 3. acceptance 配置了 digest-bound 校验（runtime_module_sha256 绑定）。
+
+**门禁规则**：
+- digest 需求为真 → **必须**调用 MidaAntidebugInitializeV2；调用 v1 → controller 拒收
+  （RuntimeLoadError::DigestBindingRequired），不进入 walker；
+- digest 需求为假 → 允许 v1（无绑定路径合法）；
+- **adr4-foundation-unbound 不得进入可接受证据**：任何 attestation 中
+  runtime_sha256 == "adr4-foundation-unbound" 且 digest 需求为真 → acceptance 拒收
+  （EvidenceInsufficient / DigestUnbound）；
+- **不存在第三条路径**：不允许"调用 v1 但期望 digest"或"调用 V2 但 len 无效"的混合状态
+  （V2 入口任何校验失败即 fail-closed，不降级 v1）。
+
 ### 5.4 controller 复核（fail-closed）
 
 - authority.verify_file（L181）通过 ≠ digest 绑定通过：verify_file 校验 manifest 身份，
@@ -217,6 +383,7 @@ runtime 导出数、artifact digest），且"复用"被写成"已支持"。本�
 - [ ] controller 侧 digest 复核（attestation.runtime_sha256 == digest_controller == out_runtime_sha256 回显）
 - [ ] resolve_exports_from_buffers 测试补 4 项 wanted 用例
 - [ ] 回归：现有 3 导出解析测试不破坏
+- [ ] 实现后必须新增测试（WO-1902）：v1/v2 golden bytes 双向 encode/decode；endian vector；static_assert（C+Rust）；指针越界/提前 NUL/超长/非 hex 拒收矩阵；5 项 wanted 解析（含缺失/重复/forwarded/out-of-module）；V2 thunk 参数对位；fallback 门禁（digest 需求真假两分支）；未绑定 digest 拒收（adr4-foundation-unbound）
 
 ## 7. 状态
 
