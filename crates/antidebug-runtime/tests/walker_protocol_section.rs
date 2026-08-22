@@ -1,10 +1,11 @@
-﻿//! WO-1501 walker wire protocol v2 — offline tests (part B: result section
+//! WO-1501 walker wire protocol v2 — offline tests (part B: result section
 //! and mapping identity). Pure offline; no Windows API.
 
 use mida_antidebug_runtime::walker_protocol::{
     derive_session_id, encode_section, parse_section, validate_section, IdentityExpectation,
     MappingIdentityHeaderV2, ProbeResultV2, ProtocolError, ResultSectionHeaderV2,
-    WalkerParamsV2, CLASSIFICATION_TYPE_C, COMPLETED_FLAG_ABORT, COMPLETED_FLAG_DONE,
+    WalkerParamsV2, CLASSIFICATION_TYPE_B, CLASSIFICATION_TYPE_C, COMPLETED_FLAG_ABORT,
+    COMPLETED_FLAG_DONE,
     COMPLETED_FLAG_PENDING, PROBE_RESULT_BYTES, RESULT_FLAG_GUARD_SEEN, RESULT_FLAG_NONE,
     WALKER_STATUS_ERROR_MAP_FAILED, WALKER_STATUS_ERROR_PROBE_ABORTED,
     WALKER_STATUS_OK,
@@ -75,11 +76,12 @@ fn section_states_and_payload() {
     // Done: payload with 3 records round-trips.
     let mut results = Vec::new();
     for (i, va) in [0x1000u64, 0x2000, 0x3000].iter().enumerate() {
+        // retry_count must stay within the frozen contract cap [0, 1].
         let mut r = make_probe(
             *va,
             CLASSIFICATION_TYPE_C,
             RESULT_FLAG_GUARD_SEEN,
-            i as u8,
+            (i as u8) & 1,
             0xCC,
         );
         r.set_latency_us(42 + i as u32);
@@ -122,11 +124,21 @@ fn section_status_flag_consistency() {
     hdr.completed_flag = COMPLETED_FLAG_DONE;
     hdr.walker_status = WALKER_STATUS_ERROR_PROBE_ABORTED; // inconsistent
     let r = make_probe(0x1000, CLASSIFICATION_TYPE_C, RESULT_FLAG_NONE, 0, 0);
-    // The hardened parse_section validates status/flag consistency at parse
-    // time, so the inconsistent combination is rejected there (before any
-    // consumer can observe a half-valid section).
-    let encoded = encode_section(&ident, &hdr, &[r]).unwrap();
-    let res = parse_section(&encoded);
+    // The validated constructor (WO-1701) rejects the inconsistent
+    // combination at ENCODE time, so no half-valid section can ever be
+    // emitted; parse_section additionally rejects it if a hostile writer
+    // crafts one on the wire.
+    let res = encode_section(&ident, &hdr, &[r]);
+    assert!(matches!(res, Err(ProtocolError::BadStatusForState { .. })));
+    // Hostile wire: build a VALID done section, then corrupt the status byte
+    // on the wire so encode cannot be blamed; parse must reject it.
+    let mut hdr_ok = ResultSectionHeaderV2::new(section_bytes, cap).unwrap();
+    hdr_ok.result_count = 1;
+    hdr_ok.completed_flag = COMPLETED_FLAG_DONE;
+    let mut bytes = encode_section(&ident, &hdr_ok, &[r]).unwrap();
+    let soff = 0x38 + 0x1C; // identity(0x38) + walker_status offset(0x1C)
+    bytes[soff..soff + 4].copy_from_slice(&WALKER_STATUS_ERROR_PROBE_ABORTED.to_le_bytes());
+    let res = parse_section(&bytes);
     assert!(matches!(res, Err(ProtocolError::BadStatusForState { .. })));
 }
 
@@ -141,8 +153,10 @@ fn section_payload_crc_detected() {
     hdr.completed_flag = COMPLETED_FLAG_DONE;
     let r = make_probe(0x1000, CLASSIFICATION_TYPE_C, RESULT_FLAG_NONE, 0, 0xAA);
     let mut bytes = encode_section(&ident, &hdr, &[r]).unwrap();
-    let last = bytes.len() - 1;
-    bytes[last] ^= 0xFF;
+    // Corrupt a byte INSIDE the payload region (results_off = 0x60, record
+    // size 0x28): the trailing zero-fill is outside payload CRC coverage.
+    let payload_off = 0x60usize;
+    bytes[payload_off] ^= 0xFF;
     let res = parse_section(&bytes).and_then(|(i, h, r2)| {
         validate_section(&i, &h, &r2, &sample_expectation(), cap)
     });
@@ -522,4 +536,213 @@ fn hostile_truncated_never_panics() {
         let r = std::panic::catch_unwind(|| parse_section(&bytes[..cut]));
         assert!(r.is_ok(), "parse_section panicked at cut={cut}");
     }
+}
+
+// =========================================================================
+// WO-1701: encode_section validated-constructor tests.
+// encode_section must reject every input combination that validate_section /
+// parse_section would later reject: never emit an invalid wire record.
+// =========================================================================
+
+/// Identity with wrong magic must be rejected at encode time.
+#[test]
+fn encode_invalid_identity_magic_rejected() {
+    let cap = 1u32;
+    let section_bytes = 96 + cap as u64 * PROBE_RESULT_BYTES as u64;
+    let mut ident = make_ident(section_bytes);
+    ident.magic = 0xDEAD_BEEF;
+    let hdr = ResultSectionHeaderV2::new(section_bytes, cap).unwrap();
+    let res = encode_section(&ident, &hdr, &[]);
+    assert!(matches!(res, Err(ProtocolError::BadMagic { .. })));
+}
+
+/// Identity with wrong version must be rejected at encode time.
+#[test]
+fn encode_invalid_identity_version_rejected() {
+    let cap = 1u32;
+    let section_bytes = 96 + cap as u64 * PROBE_RESULT_BYTES as u64;
+    let mut ident = make_ident(section_bytes);
+    ident.version = 1;
+    let hdr = ResultSectionHeaderV2::new(section_bytes, cap).unwrap();
+    let res = encode_section(&ident, &hdr, &[]);
+    assert!(matches!(res, Err(ProtocolError::BadVersion { .. })));
+}
+
+/// Identity with non-zero reserved must be rejected at encode time.
+#[test]
+fn encode_invalid_identity_reserved_rejected() {
+    let cap = 1u32;
+    let section_bytes = 96 + cap as u64 * PROBE_RESULT_BYTES as u64;
+    let mut ident = make_ident(section_bytes);
+    ident._reserved = 0x1234;
+    let hdr = ResultSectionHeaderV2::new(section_bytes, cap).unwrap();
+    let res = encode_section(&ident, &hdr, &[]);
+    assert!(matches!(res, Err(ProtocolError::BadReserved { .. })));
+}
+
+/// Header magic corruption must be rejected at encode time.
+#[test]
+fn encode_invalid_header_magic_rejected() {
+    let cap = 1u32;
+    let section_bytes = 96 + cap as u64 * PROBE_RESULT_BYTES as u64;
+    let ident = make_ident(section_bytes);
+    let mut hdr = ResultSectionHeaderV2::new(section_bytes, cap).unwrap();
+    hdr.magic = 0;
+    let res = encode_section(&ident, &hdr, &[]);
+    assert!(matches!(res, Err(ProtocolError::BadMagic { .. })));
+}
+
+/// Header with wrong stride must be rejected at encode time.
+#[test]
+fn encode_invalid_header_stride_rejected() {
+    let cap = 1u32;
+    let section_bytes = 96 + cap as u64 * PROBE_RESULT_BYTES as u64;
+    let ident = make_ident(section_bytes);
+    let mut hdr = ResultSectionHeaderV2::new(section_bytes, cap).unwrap();
+    hdr.result_stride = 8;
+    let res = encode_section(&ident, &hdr, &[]);
+    assert!(matches!(res, Err(ProtocolError::BadResultStride { .. })));
+}
+
+/// Header with results_off below minimum / unaligned must be rejected.
+#[test]
+fn encode_invalid_results_off_rejected() {
+    let cap = 1u32;
+    let section_bytes = 96 + cap as u64 * PROBE_RESULT_BYTES as u64;
+    let ident = make_ident(section_bytes);
+    let mut hdr = ResultSectionHeaderV2::new(section_bytes, cap).unwrap();
+    hdr.results_off = 8; // below MIN_SECTION_HEADER_BYTES
+    let res = encode_section(&ident, &hdr, &[]);
+    assert!(matches!(res, Err(ProtocolError::ResultsOffTooSmall { .. })));
+
+    let mut hdr = ResultSectionHeaderV2::new(section_bytes, cap).unwrap();
+    hdr.results_off = 100; // not 8-aligned
+    let res = encode_section(&ident, &hdr, &[]);
+    assert!(matches!(res, Err(ProtocolError::ResultsOffUnaligned { .. })));
+}
+
+/// Header with invalid completed_flag / status consistency must be rejected
+/// at encode time (previously only rejected at parse/validate time).
+#[test]
+fn encode_invalid_completed_flag_rejected() {
+    let cap = 1u32;
+    let section_bytes = 96 + cap as u64 * PROBE_RESULT_BYTES as u64;
+    let ident = make_ident(section_bytes);
+    let mut hdr = ResultSectionHeaderV2::new(section_bytes, cap).unwrap();
+    hdr.completed_flag = 0x1234_5678;
+    let res = encode_section(&ident, &hdr, &[]);
+    assert!(matches!(res, Err(ProtocolError::BadCompletedFlag { .. })));
+
+    // done flag + non-OK status: inconsistent
+    let mut hdr = ResultSectionHeaderV2::new(section_bytes, cap).unwrap();
+    hdr.result_count = 1;
+    hdr.completed_flag = COMPLETED_FLAG_DONE;
+    hdr.walker_status = WALKER_STATUS_ERROR_MAP_FAILED;
+    let r = make_probe(0x1000, CLASSIFICATION_TYPE_C, RESULT_FLAG_NONE, 0, 0);
+    let res = encode_section(&ident, &hdr, &[r]);
+    assert!(matches!(res, Err(ProtocolError::BadStatusForState { .. })));
+}
+
+/// Section size / identity size mismatch must be rejected at encode time.
+#[test]
+fn encode_invalid_section_bytes_mismatch_rejected() {
+    let cap = 1u32;
+    let section_bytes = 96 + cap as u64 * PROBE_RESULT_BYTES as u64;
+    let mut ident = make_ident(section_bytes);
+    ident.section_bytes = section_bytes + 8; // identity disagrees with header
+    let hdr = ResultSectionHeaderV2::new(section_bytes, cap).unwrap();
+    let res = encode_section(&ident, &hdr, &[]);
+    assert!(matches!(res, Err(ProtocolError::BadSectionBytes { .. })));
+}
+
+/// ProbeResult with retry_count above the contract cap must be rejected.
+#[test]
+fn encode_invalid_retry_count_rejected() {
+    let cap = 1u32;
+    let section_bytes = 96 + cap as u64 * PROBE_RESULT_BYTES as u64;
+    let ident = make_ident(section_bytes);
+    let mut hdr = ResultSectionHeaderV2::new(section_bytes, cap).unwrap();
+    hdr.result_count = 1;
+    hdr.completed_flag = COMPLETED_FLAG_DONE;
+    let mut r = make_probe(0x1000, CLASSIFICATION_TYPE_C, RESULT_FLAG_NONE, 2, 0);
+    r.retry_count = 2; // contract cap is 1
+    let res = encode_section(&ident, &hdr, &[r]);
+    assert!(matches!(res, Err(ProtocolError::BadRetryCount { .. })));
+}
+
+/// ProbeResult with non-zero reserved must be rejected at encode time.
+#[test]
+fn encode_invalid_reserved_rejected() {
+    let cap = 1u32;
+    let section_bytes = 96 + cap as u64 * PROBE_RESULT_BYTES as u64;
+    let ident = make_ident(section_bytes);
+    let mut hdr = ResultSectionHeaderV2::new(section_bytes, cap).unwrap();
+    hdr.result_count = 1;
+    hdr.completed_flag = COMPLETED_FLAG_DONE;
+    let mut r = make_probe(0x1000, CLASSIFICATION_TYPE_C, RESULT_FLAG_NONE, 0, 0);
+    r._reserved = 0xDEAD_BEEF;
+    let res = encode_section(&ident, &hdr, &[r]);
+    assert!(matches!(res, Err(ProtocolError::BadReserved { .. })));
+}
+
+/// ProbeResult with bad classification / unknown flags / bad span must be
+/// rejected at encode time.
+#[test]
+fn encode_invalid_probe_fields_rejected() {
+    let cap = 1u32;
+    let section_bytes = 96 + cap as u64 * PROBE_RESULT_BYTES as u64;
+    let ident = make_ident(section_bytes);
+    let mut hdr = ResultSectionHeaderV2::new(section_bytes, cap).unwrap();
+    hdr.result_count = 1;
+    hdr.completed_flag = COMPLETED_FLAG_DONE;
+
+    let mut r = make_probe(0x1000, CLASSIFICATION_TYPE_C, RESULT_FLAG_NONE, 0, 0);
+    r.classification = 99;
+    assert!(matches!(
+        encode_section(&ident, &hdr, &[r]),
+        Err(ProtocolError::BadClassification { .. })
+    ));
+
+    let mut r = make_probe(0x1000, CLASSIFICATION_TYPE_C, RESULT_FLAG_NONE, 0, 0);
+    r.flags = 0x80;
+    assert!(matches!(
+        encode_section(&ident, &hdr, &[r]),
+        Err(ProtocolError::UnknownResultFlags { .. })
+    ));
+
+    let mut r = make_probe(0x1000, CLASSIFICATION_TYPE_C, RESULT_FLAG_NONE, 0, 0);
+    r.set_probe_span(0);
+    assert!(matches!(
+        encode_section(&ident, &hdr, &[r]),
+        Err(ProtocolError::BadProbeSpan { .. })
+    ));
+
+    // Non-canonical probe VA must be rejected.
+    let r = make_probe(0xFFFF_8000_0000_0000, CLASSIFICATION_TYPE_C, RESULT_FLAG_NONE, 0, 0);
+    assert!(matches!(
+        encode_section(&ident, &hdr, &[r]),
+        Err(ProtocolError::NonCanonicalVa { .. })
+    ));
+}
+
+/// encode_section never emits a trailing-byte / oversized buffer: the encoded
+/// length is exactly section_bytes and parse_section round-trips it.
+#[test]
+fn encode_exact_section_bytes_round_trip() {
+    let cap = 3u32;
+    let section_bytes = 96 + cap as u64 * PROBE_RESULT_BYTES as u64;
+    let ident = make_ident(section_bytes);
+    let mut hdr = ResultSectionHeaderV2::new(section_bytes, cap).unwrap();
+    hdr.result_count = 2;
+    hdr.completed_flag = COMPLETED_FLAG_DONE;
+    let results = vec![
+        make_probe(0x1000, CLASSIFICATION_TYPE_C, RESULT_FLAG_NONE, 0, 0xAA),
+        make_probe(0x2000, CLASSIFICATION_TYPE_B, RESULT_FLAG_GUARD_SEEN, 1, 0xBB),
+    ];
+    let bytes = encode_section(&ident, &hdr, &results).unwrap();
+    assert_eq!(bytes.len(), section_bytes as usize);
+    let (i2, h2, r2) = parse_section(&bytes).unwrap();
+    assert_eq!(i2.section_bytes, section_bytes);
+    assert_eq!(h2.result_count, 2);
+    assert_eq!(r2, results);
 }

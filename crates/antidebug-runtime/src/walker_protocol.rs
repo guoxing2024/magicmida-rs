@@ -1,4 +1,4 @@
-﻿//! Walker wire protocol v2 (WO-1501).
+//! Walker wire protocol v2 (WO-1501).
 //!
 //! Pure-offline, dependency-light binary contract for the Walker IPC:
 //!
@@ -249,6 +249,12 @@ pub enum ProtocolError {
     InconsistentPendingCount {
         got: u32,
     },
+    BadRetryCount {
+        got: u8,
+    },
+    BadReserved {
+        got: u32,
+    },
 }
 
 impl fmt::Display for ProtocolError {
@@ -322,6 +328,8 @@ impl fmt::Display for ProtocolError {
             Self::InconsistentPendingCount { got } => {
                 write!(f, "pending section must have result_count 0, got {got}")
             }
+            Self::BadRetryCount { got } => write!(f, "retry_count {got} exceeds contract maximum 1"),
+            Self::BadReserved { got } => write!(f, "reserved field must be zero, got 0x{got:08X}"),
         }
     }
 }
@@ -514,6 +522,12 @@ impl WalkerParamsV2 {
             return Err(ProtocolError::CountTooLarge {
                 got: hdr.candidate_count as u64,
                 max: MAX_CANDIDATE_COUNT as u64,
+            });
+        }
+        if hdr.blob_total_bytes > MAX_BLOB_BYTES as u64 {
+            return Err(ProtocolError::CountTooLarge {
+                got: hdr.blob_total_bytes,
+                max: MAX_BLOB_BYTES as u64,
             });
         }
         if bytes.len() as u64 != hdr.blob_total_bytes {
@@ -1176,6 +1190,14 @@ impl ProbeResultV2 {
                 max: MAX_PROBE_SPAN,
             });
         }
+        if self.retry_count > 1 {
+            return Err(ProtocolError::BadRetryCount { got: self.retry_count });
+        }
+        if self._reserved != 0 {
+            return Err(ProtocolError::BadReserved {
+                got: self._reserved,
+            });
+        }
         Ok(())
     }
 }
@@ -1187,8 +1209,29 @@ pub fn encode_section(
     header: &ResultSectionHeaderV2,
     results: &[ProbeResultV2],
 ) -> Result<Vec<u8>, ProtocolError> {
-    // Entry validation: never emit a section that violates the frozen wire
-    // contract, and never allocate from an untrusted section_bytes.
+    // Entry validation: encode_section is a VALIDATED CONSTRUCTOR. Every
+    // field that validate_section / parse_section would reject later must be
+    // rejected here, so the API can never emit a section that the frozen wire
+    // contract rejects, and never allocate from an untrusted section_bytes.
+    //
+    // Identity: magic/version/reserved, section_bytes consistency (checked
+    // against header below), CRC over [0, 48) is recomputed at encode time.
+    if identity.magic != IDENTITY_MAGIC {
+        return Err(ProtocolError::BadMagic { got: identity.magic });
+    }
+    if identity.version != PROTOCOL_VERSION {
+        return Err(ProtocolError::BadVersion {
+            got: identity.version,
+            expected: PROTOCOL_VERSION,
+        });
+    }
+    if identity._reserved != 0 {
+        return Err(ProtocolError::BadReserved {
+            got: identity._reserved as u32,
+        });
+    }
+    // Header: closed sets and layout (magic/version/stride/status/flag/offs).
+    header.validate_layout()?;
     // section_bytes is a CAPACITY: MIN_SECTION_HEADER_BYTES + n*40 for some
     // n in [0, MAX_CANDIDATE_COUNT]; result_count <= n.
     if header.section_bytes > MAX_RESULT_SECTION_BYTES {
@@ -1244,6 +1287,12 @@ pub fn encode_section(
             end,
             total: header.section_bytes,
         });
+    }
+    // Every result record must itself satisfy the frozen per-record contract
+    // (canonical VA, classification/flags closed sets, span range, retry cap,
+    // reserved zero) BEFORE it is serialized.
+    for r in results {
+        r.validate()?;
     }
     let mut out = Vec::with_capacity(header.section_bytes as usize);
     // Identity header with CRC computed over [0, 48).
