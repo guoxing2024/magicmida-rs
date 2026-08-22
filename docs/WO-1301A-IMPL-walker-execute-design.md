@@ -277,24 +277,28 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
     let code = rec.ExceptionCode.0 as u32;
     let rip = ctx.Rip;
 
-    // 归属过滤（WO-1802）：只观测"探针线程 + active phase + 访问地址匹配
-    // TLS 槽 MidaProbeTls.token_va.va（或 va+8）"的异常。任何非探针线程 / 非 active phase /
-    // 访问地址不匹配的异常一律 CONTINUE_SEARCH，不触碰、不吞掉（保护器链完整观测权）。
-    if !probe_thread_guard() || !PROBE_TLS.with(|t| t.active.get()) {
+    // 归属过滤（WO-2001）：单一来源 = C-owned TLS 槽（MidaProbeTls）。
+    // 只观测"active phase + 访问地址匹配 TLS 槽 token_va（或 va+8）"的异常。
+    // 线程归属由 TLS 的线程局部性天然完成（非探针线程读到 active==0）。
+    // 任何非 active phase / 访问地址不匹配的异常一律 CONTINUE_SEARCH，
+    // 不触碰、不吞掉（保护器链完整观测权）。
+    let tls = unsafe { &*mida_probe_tls_snapshot() };  // C accessor，非 Rust thread_local
+    if tls.active == 0 || tls.magic != MIDA_TLS_MAGIC {
         return EXCEPTION_CONTINUE_SEARCH;
     }
     // 无 RIP window：归属用 faulting 访问地址（ExceptionInformation[1]）匹配
-    // 当前探针的 token_va（WO-1702 §4.3），不依赖任何代码布局。
+    // 当前探针的 TLS 槽 token_va（WO-1702 §4.3），不依赖任何代码布局。
     let acc = access_address(info);  // ExceptionInformation[1]
-    if acc != PROBE_TLS.with(|t| t.MidaProbeTls.token_va) && acc != PROBE_TLS.with(|t| t.MidaProbeTls.token_va + 8) {
+    if acc != tls.token_va && acc != tls.token_va.wrapping_add(8) {
         return EXCEPTION_CONTINUE_SEARCH;   // 非本探针的 fault，交回链
     }
 
     // 只读观测 + 标记，然后交回链（保护器随后获得同一异常）：
+    // 标记写入经 C accessor mida_probe_tls_mark(code)（单 owner = C；见 WO-1702 §4.4）。
     match code {
-        STATUS_GUARD_PAGE_VIOLATION => { PROBE_TLS.with(|t| t.guard_seen.set(true)); }
-        STATUS_ACCESS_VIOLATION => { PROBE_TLS.with(|t| t.av_seen.set(true)); }
-        other => { PROBE_TLS.with(|t| t.unknown_code.set(other)); }
+        STATUS_GUARD_PAGE_VIOLATION => { mida_probe_tls_mark(MIDA_TLS_MARK_GUARD); }
+        STATUS_ACCESS_VIOLATION => { mida_probe_tls_mark(MIDA_TLS_MARK_AV); }
+        other => { mida_probe_tls_mark(other); }  // unknown code -> walker abort 路径
     }
     EXCEPTION_CONTINUE_SEARCH   // 收口在 shim 的 __except 帧
 }
@@ -327,7 +331,7 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
 | 维度 | 规则 | 理由 |
 |-----|------|------|
 | 线程 | VEH 只在 walker 创建的探针线程上 active；其它线程异常一律 CONTINUE_SEARCH | VEH 是进程级，不过滤会吞掉 target 自身异常 |
-| 阶段 | PROBE_TLS.active 仅在探针循环内为 true；装载/卸载/解析阶段为 false | 防止 walker 自己的普通代码 fault 被误收口 |
+| 阶段 | MidaProbeTls.active（C TLS 槽）仅在探针循环内为 true；装载/卸载/解析阶段为 false | 防止 walker 自己的普通代码 fault 被误收口 |
 | 访问地址 | 仅 faulting 访问地址 ∈ {MidaProbeTls.token_va, MidaProbeTls.token_va+8} 的 guard/AV 被视为"探针 fault"；其它一律 CONTINUE_SEARCH（无 RIP window，WO-1702 §4.3） | 防止把保护器/其它模块的 fault 误判为探针结果 |
 | 嵌套 | VEH 内不触发任何 faulting 操作（TLS 访问是已提交页）；若嵌套异常发生，内核会二次调用 VEH，此时 active 仍为 true 但访问地址归属失败 → CONTINUE_SEARCH | 嵌套异常沿链走，不重复收口；shim 帧是最后防线 |
 

@@ -15,15 +15,21 @@ typedef struct MidaProbeTls {
     uint32_t magic;     /* +0x00 */
     uint32_t active;    /* +0x04 */
     uint32_t seq;       /* +0x08 */
-    uint32_t reserved;  /* +0x0C must be 0 */
+    uint32_t flags;     /* +0x0C mark bits: 1=guard, 2=av, 0x80000000=unknown */
     uint64_t token_va;  /* +0x10 */
-} MidaProbeTls;         /* 0x18 */
+    uint64_t unknown_code; /* +0x18 */
+} MidaProbeTls;         /* 0x20 */
 
-_Static_assert(sizeof(MidaProbeTls) == 0x18, "MidaProbeTls size");
+#define MIDA_TLS_MARK_GUARD   0x00000001u
+#define MIDA_TLS_MARK_AV      0x00000002u
+#define MIDA_TLS_MARK_UNKNOWN 0x80000000u
+
+_Static_assert(sizeof(MidaProbeTls) == 0x20, "MidaProbeTls size");
 _Static_assert(offsetof(MidaProbeTls, magic) == 0x00, "magic offset");
 _Static_assert(offsetof(MidaProbeTls, active) == 0x04, "active offset");
 _Static_assert(offsetof(MidaProbeTls, seq) == 0x08, "seq offset");
 _Static_assert(offsetof(MidaProbeTls, token_va) == 0x10, "token_va offset");
+_Static_assert(offsetof(MidaProbeTls, unknown_code) == 0x18, "unknown_code offset");
 
 /* Reference implementation of the filter-side classification (pure logic).
  * Returns:
@@ -40,6 +46,10 @@ typedef struct AttrInput {
     uint64_t token_va;        /* TLS slot value */
     uint32_t active;          /* TLS slot value */
     uint32_t magic;           /* TLS slot value */
+    uint32_t flags;           /* TLS slot value (stale-mark detection) */
+    uint32_t seq;             /* TLS slot value */
+    uint32_t expected_seq;    /* caller-side expected seq (WO-2001 §4.4b) */
+    int      seq_checked;     /* 1 = compare seq, 0 = skip (filter path) */
 } AttrInput;
 
 static uint32_t mida_attr_classify(AttrInput in) {
@@ -50,6 +60,12 @@ static uint32_t mida_attr_classify(AttrInput in) {
     if (in.access_addr != in.token_va &&
         in.access_addr != in.token_va + 8) return ATTR_ABORT;
     if (in.code != 0x80000001u && in.code != 0xC0000005u) return ATTR_ABORT;
+    /* stale-mark detection (main-path check before begin): any pre-set
+     * mark with active==0 means the previous candidate was not cleared. */
+    if (in.active == 0 && in.flags != 0) return ATTR_ABORT;
+    /* seq closure (main-path check, not filter): expected_seq mismatch
+     * means re-entry or a late exception from an earlier candidate. */
+    if (in.seq_checked && in.seq != in.expected_seq) return ATTR_ABORT;
     return ATTR_FAULT;
 }
 
