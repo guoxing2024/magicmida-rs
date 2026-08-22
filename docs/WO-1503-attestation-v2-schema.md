@@ -1,4 +1,4 @@
-﻿# WO-1503 — Attestation/Provenance v2 wire schema 设计冻结
+# WO-1503 — Attestation/Provenance v2 wire schema 设计冻结
 
 **工单编号**: WO-1503
 **优先级**: P0
@@ -317,8 +317,9 @@ digest: ae8ab1e1b72505d8544a32bf3803333e81528159e214e4198a0271d2f60dc419
 
 - runtime_module_sha256 的**权威来源**：controller 在 load_and_initialize 之前对 runtime
   DLL 文件字节计算 sha256（authority.verify_file 同一文件）。**不写入 MidaInitParams**
-  （MidaInitParams 保持不扩展，见 WO-1505 §5.3）：digest 经 target 内独立内存槽（与 params
-  blob 同生命周期）下发给 runtime，runtime 读取后回显到 attestation。
+  （MidaInitParams 版本化扩展，见 WO-1505 §5.3 / WO-1703）：digest 经 MidaInitParams v2
+  输入通道（expected_runtime_sha256_ptr/len，target-local 指针指向 blob 内 64 字节 hex 串）
+  下发给 runtime，runtime 读取后回显到 attestation；v1（0x30）路径保持 digest 占位。
 - **当前占位值 adr4-foundation-unbound（exports.rs:237-239）不是 digest evidence**：
   它只是字符串占位；实现工单必须改为真实文件哈希，且 v2 顶层与 WalkerAttestation 两处一致。
 - controller 校验：attestation.runtime_sha256 == controller 计算的 runtime digest；

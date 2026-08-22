@@ -1,4 +1,4 @@
-﻿# WO-1505 — Loader/ABI 对位清单
+# WO-1505 — Loader/ABI 对位清单
 
 **工单编号**: WO-1505
 **优先级**: P1
@@ -113,37 +113,55 @@ runtime 导出数、artifact digest），且"复用"被写成"已支持"。本�
    （如 runtime.sha256 或 authority manifest 条目）。
 3. controller 加载前：authority.verify_file(runtime_path)（L181）校验文件身份，
    并计算 digest_controller = sha256(runtime.dll 文件字节)。
-4. controller 将 digest_controller 通过**初始化参数通道**下发 target（见 5.3）。
-5. runtime 在 initialize 时把收到的 digest 回显进 attestation.runtime_sha256
-   （不做自算、不读自身文件）。
+4. controller 将 digest_controller 通过 **MidaInitParams v2 输入通道**（expected_runtime_sha256_ptr/len，见 5.3）下发 target。
+5. runtime 在 initialize 时把收到的 digest 用于 attestation.runtime_sha256 并经
+   out_runtime_sha256 回显（不做自算、不读自身文件）。
 6. controller 校验：attestation.runtime_sha256 == digest_controller；不一致 → 拒收。
 ~~~
 
-### 5.3 MidaInitParams 冲突解决（不扩展 MidaInitParams）
+### 5.3 MidaInitParams 冲突解决（WO-1703 冻结：版本化扩展，真实 ABI 可达）
 
-上一版冲突：WO-1503 §6.2 要求"digest 写入 init params 下发"，而 WO-1505 规定
-"MidaInitParams 不扩展"，且真实 MidaInitParams（exports.rs L89）无 digest 字段。
+上一版（Batch 16）的"独立内存槽"方案被审计拒绝（P0-1605-1）：真实
+MidaAntidebugInitialize 只有一个 *const MidaInitParams 输入参数，out_runtime_sha256 是
+**输出**缓冲（exports.rs:184-185, 316-320），不是输入通道；runtime 没有任何方式知道
+"独立 slot"在哪里。**禁止再用"分配一个独立内存槽"代替可调用 ABI。**
 
-**裁决：digest 经 MidaInitParams 之外的独立参数槽下发**，两全其美：
+**冻结方案：版本化扩展 MidaInitParams（v1 保持字节兼容，v2 新增 digest 输入通道）。**
 
-- **方案 A（推荐）**：MidaInitParams 保持不扩展；WalkerExecute 的 params blob
-  （WalkerParamsV2，见 WO-1501）头部新增可选字段 runtime_sha256_expected（或复用
-  result_nonce 旁路）——但 walker 与 initialize 是两个入口，digest 绑定发生在
-  **initialize 阶段**（attestation 生成时）。
-- **方案 B（更简单）**：digest 作为 MidaAntidebugInitialize 的**附加出参/入参**传递：
-  initialize 已接收 out_runtime_sha256 输出缓冲（exports.rs L184-185）；controller
-  在调用 initialize 前把期望 digest 写入 target 内独立分配的小块（params blob 旁），
-  initialize 读取该值回显。不改 MidaInitParams 结构。
-- **方案 C（最简，冻结推荐）**：digest 完全由 controller 权威持有——attestation 的
-  runtime_sha256 由 controller 在读取 attestation 后**用本地计算的 digest 覆写校验**，
-  runtime 侧保持占位"unbound"仅表示"未绑定"，acceptance 以 controller digest 为准。
-  但此方案弱化 target 内 evidence（runtime 不自证），仅作为过渡，不进入正式合同。
-
-**本设计采用方案 B 作为冻结合同**：不扩展 MidaInitParams；initialize 的期望 digest
-由 controller 写入 target 内独立内存槽（与 params blob 同生命周期），runtime 读取后
-回显到 attestation；attestation.runtime_sha256 == controller 本地计算 digest 是
-acceptance 硬校验。方案 C 的"controller 覆写"仅允许在实现前过渡期使用，正式版禁用。
-
+1. MidaInitParams 拆为 v1（现有 0x30 布局不变）+ v2（v1 字段 + 尾部追加字段）：
+   ~~~text
+   // MidaInitParams v2 = v1 布局（0x30）+ 追加（总大小 0x48）：
+   //   0x30 u64  magic_v2            = 0x4D494441325032 ("MIDA2P2" LE)
+   //   0x38 u64  expected_runtime_sha256_ptr  target-local 指针，指向 64 字节
+   //                                       hex 字符串 + NUL（controller 写入）
+   //   0x40 u64  expected_runtime_sha256_len = 64（固定，hex lowercase）
+   //   0x48 结束
+   // v1 调用方传 0x30 大小的 blob：magic_v2 区不存在 -> 按 v1 路径（digest 占位）。
+   ~~~
+2. 判定规则：params blob 大小 >= 0x48 且 magic_v2 == "MIDA2P2" → v2 路径；
+   否则 v1 路径（向后兼容，现有 loader 的 build_init_params_bytes 输出 0x30，行为不变）。
+3. v2 路径下 runtime 必须：
+   - 校验 expected_runtime_sha256_ptr 非空、可读（ReadProcessMemory 之外：target 内
+     直接解引用，指向同一 target 进程地址空间——blob 由 controller 经 VirtualAllocEx +
+     WriteProcessMemory 写入 target，与 params blob 同生命周期）；
+   - 校验 len == 64 且为合法 hex lowercase；否则 InvalidArgument，fail-closed；
+   - 用该值构建 attestation 的 runtime_sha256（替换 adr4-foundation-unbound 占位）；
+   - 仍经 out_runtime_sha256 输出回显同一值（输出通道语义不变）。
+4. loader 侧（runtime_loader.rs）：
+   - build_init_params_bytes（L1792）新增 v2 变体 build_init_params_bytes_v2：追加
+     magic_v2 + digest 指针 + len；digest 字符串紧随 blob 尾部（remote_blob_base + off）；
+   - load_and_initialize（L1029）在步骤 0（authority.verify_file，L1040）之后、步骤 4
+     （写 params，L1097）之前计算 digest_controller = sha256(runtime.dll 文件字节)；
+     传入 v2 构造器；步骤 4 后校验 out_runtime_sha256 == digest_controller（fail-closed）。
+   - 既有 v1 测试 fixture 不变（0x30 路径回归）。
+5. 槽的生命周期：digest 字符串随 params blob 一起 VirtualAllocEx + WriteProcessMemory
+   （同一分配、同生命周期），与 blob 同回收；DLL 卸载前由 wait-before-free 规则保证
+   （远程线程终止后才释放）。权限：PAGE_READWRITE（既有 blob 权限，无新增权限面）。
+   完整性：digest 值本身由 controller 计算并写入，runtime 只读不写；attestation 回显
+   由 controller 复核（§5.4），任何不一致拒收。
+6. target-local 地址语义：digest 指针必须是 target 进程地址空间内的 VA（blob 内相对
+   基址），禁止 controller 侧地址；runtime 侧以 raw pointer 解引用（与 profile_id/
+   profile_digest 同模式）。
 ### 5.4 controller 复核（fail-closed）
 
 - authority.verify_file（L181）通过 ≠ digest 绑定通过：verify_file 校验 manifest 身份，
@@ -158,8 +176,8 @@ acceptance 硬校验。方案 C 的"controller 覆写"仅允许在实现前过�
 - [ ] loader wanted 4 项 + MidaExports 4 字段 + 解析泛化
 - [ ] 入口地址 allowlist 断言（== module_base + rva）
 - [ ] thunk 适配（复用 6 参或新增 1 参）
-- [ ] runtime_sha256 真实文件哈希（外部 manifest 权威；独立内存槽下发；替换 adr4-foundation-unbound）
-- [ ] controller 侧 digest 复核（attestation.runtime_sha256 == 本地计算）
+- [ ] runtime_sha256 真实文件哈希（外部 manifest 权威；MidaInitParams v2 通道下发；替换 adr4-foundation-unbound）
+- [ ] controller 侧 digest 复核（attestation.runtime_sha256 == digest_controller == out_runtime_sha256 回显）
 - [ ] resolve_exports_from_buffers 测试补 4 项 wanted 用例
 - [ ] 回归：现有 3 导出解析测试不破坏
 
