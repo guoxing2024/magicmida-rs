@@ -483,12 +483,14 @@ pub fn dump_process_with_report(
     let _coverage_obs = if opts.dump_timing == crate::dumper::types::DumpTiming::CoverageMeasure {
         let b_sections = super::coverage_measure::default_b_sections();
         let triggers = ["t0", "window", "+60s", "+180s", "end"];
+        let target_pid = debugger.pid();
         let obs = super::coverage_measure::run_coverage_observation(
             debugger,
             opts.image_base,
             &b_sections,
             &triggers,
             300_000,
+            target_pid,
         )?;
         persist_coverage_timeline(opts, &obs);
         if obs.decision != "dump" {

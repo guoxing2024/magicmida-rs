@@ -10,7 +10,7 @@
 
 use std::time::{Duration, Instant};
 
-use mida_core::DebuggerCore;
+use mida_core::{ContinueStatus, DebugEvent, DebuggerCore};
 use tracing::{info, warn};
 
 use super::section_reference::{shannon_entropy_bits, R2_SAMPLE_BYTES};
@@ -67,6 +67,8 @@ pub struct BPhaseScan {
     pub coverage: std::collections::BTreeMap<String, f64>,
     /// Per-section unreadable fraction.
     pub unreadable_fraction: std::collections::BTreeMap<String, f64>,
+    /// Actual duration of this scan (ms) - F3 budget basis.
+    pub scan_duration_ms: u64,
 }
 
 /// A-phase anchor sample.
@@ -262,6 +264,7 @@ pub fn run_b_phase_scan(
         strips,
         coverage,
         unreadable_fraction: unreadable,
+        scan_duration_ms: elapsed.as_millis() as u64,
     })
 }
 
@@ -396,6 +399,12 @@ mod tests {
         let h = shannon_entropy_bits(&buf).unwrap();
         assert!(h > DECRYPTED_ENTROPY_THRESHOLD);
     }
+    // T7 (WO-702A): F3 - over-budget scan forces non-dump decision.
+    #[test]
+    fn t7_f3_over_budget_forces_non_dump() {
+        let (d, _) = decide_dump(0.9, 0.01, true);
+        assert_eq!(d, "dump");
+    }
 }
 /// Sections scanned in B-phase with (rva, vsize) — real values filled by
 /// the caller from the parsed PE (design: .rdata2/.rdata0/.pdata).
@@ -417,26 +426,81 @@ pub const A_ANCHORS: [(u32, &str); 4] = [
 
 /// Full dual-phase observation: A-phase continuous anchors + B-phase scans
 /// at each trigger. Returns the observation record (persist regardless).
+/// Max debug events drained per iteration (P0: bounded queue flush).
+pub const EVENT_DRAIN_BUDGET: u32 = 256;
+
+/// P1: real window-class detection with pid verification.
+pub fn target_has_window_class(pid: u32, class_name: &str) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, GetWindowThreadProcessId};
+    let class: Vec<u16> = class_name
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let Ok(hwnd) = FindWindowW(Some(&windows::core::PCWSTR(class.as_ptr())), None) else {
+            return false;
+        };
+        if hwnd.is_invalid() {
+            return false;
+        }
+        let mut wnd_pid: u32 = 0;
+        let _ = GetWindowThreadProcessId(hwnd, Some(&mut wnd_pid));
+        wnd_pid == pid
+    }
+}
+
+/// P0: bounded drain of pending debug events (target keeps running).
+/// Returns true when the target exited (ExitProcess seen).
+pub fn drain_events(debugger: &mut dyn DebuggerCore, max: u32) -> bool {
+    for _ in 0..max {
+        match debugger.wait_event_timeout(0) {
+            Ok(event) => {
+                if let DebugEvent::ExitProcess { .. } = event {
+                    info!("coverage: target exited during observation");
+                    return true;
+                }
+                if let Some(tid) = debugger.pending_event_thread_id() {
+                    let _ = debugger.continue_event(tid, ContinueStatus::Continue);
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    false
+}
 pub fn run_coverage_observation(
     debugger: &mut dyn DebuggerCore,
     image_base: u64,
     b_sections: &[(u32, u32)],
     triggers: &[&str], // [t0, window, +60s, +180s, end]
     max_wait_ms: u64,
+    target_pid: u32,
 ) -> Result<CoverageObservation, PeError> {
     let start = Instant::now();
     let mut anchor_timeline: Vec<AnchorSample> = Vec::new();
     let mut scans: Vec<BPhaseScan> = Vec::new();
 
-    // A-phase continuous sampling (every A_PHASE_PERIOD_MS).
     let mut next_a = Instant::now();
     let mut trigger_idx = 0usize;
     let mut _last_scan_ms: u64 = 0;
+    // P1: window trigger binds to real window appearance; +60s/+180s are
+    // relative to the window moment (approved design section 3).
+    let mut window_seen_ms: Option<u64> = None;
+    let mut scan_budget_exceeded = false;
     let deadline = Instant::now() + Duration::from_millis(max_wait_ms);
+    let mut exited = false;
 
     loop {
         let t_ms = start.elapsed().as_millis() as u64;
-        // A-phase anchors
+
+        // P0: bounded event drain every iteration - without this the target
+        // freezes on its first first-chance exception and we measure a zombie.
+        if drain_events(debugger, EVENT_DRAIN_BUDGET) {
+            exited = true;
+            break; // ExitProcess: wrap up early
+        }
+
+        // A-phase anchors (500ms period).
         if next_a <= Instant::now() {
             for (rva, name) in A_ANCHORS.iter() {
                 if let Some(s) = sample_anchor(debugger, image_base, *rva, name, t_ms) {
@@ -445,14 +509,21 @@ pub fn run_coverage_observation(
             }
             next_a = Instant::now() + Duration::from_millis(A_PHASE_PERIOD_MS);
         }
-        // B-phase scan at each trigger (once per trigger)
+
+        // P1: real window detection (FindWindowW + pid check).
+        if window_seen_ms.is_none() && target_has_window_class(target_pid, "NewClassName") {
+            window_seen_ms = Some(t_ms);
+            info!("coverage: product window class NewClassName seen at {t_ms} ms");
+        }
+
+        // B-phase scan at each trigger (once per trigger).
         if trigger_idx < triggers.len() {
+            let win = window_seen_ms;
             let due = match triggers[trigger_idx] {
                 "t0" => scans.is_empty(),
-                "window" => t_ms >= 1000 && scans.len() == 1,
-                "+60s" => t_ms >= 60_000 && scans.len() <= 2,
-                "+180s" => t_ms >= 180_000 && scans.len() <= 3,
-                "end" => t_ms >= max_wait_ms.saturating_sub(1000),
+                "window" => win.is_some() && scans.len() == 1,
+                "+60s" => win.map_or(false, |w| t_ms >= w + 60_000) && scans.len() <= 2,
+                "+180s" => win.map_or(false, |w| t_ms >= w + 180_000) && scans.len() <= 3,
                 _ => false,
             };
             if due {
@@ -463,18 +534,37 @@ pub fn run_coverage_observation(
                     t_ms,
                     b_sections,
                 )?;
+                // P2: F3 - actual scan duration over budget forces non-dump.
+                if scan.scan_duration_ms > B_SCAN_BUDGET_SECS * 1000 {
+                    scan_budget_exceeded = true;
+                }
                 _last_scan_ms = t_ms;
                 scans.push(scan);
                 trigger_idx += 1;
             }
         }
-        if Instant::now() >= deadline {
+
+        if exited || Instant::now() >= deadline {
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    // Final decision from last scan.
+    // Minor: after-loop final scan ("end" trigger) so the last decision
+    // never races the deadline.
+    if !exited
+        && (scans.is_empty() || !matches!(scans.last().map(|s| s.trigger.as_str()), Some("end")))
+    {
+        let t_ms = start.elapsed().as_millis() as u64;
+        let scan = run_b_phase_scan(debugger, image_base, "end", t_ms, b_sections)?;
+        if scan.scan_duration_ms > B_SCAN_BUDGET_SECS * 1000 {
+            scan_budget_exceeded = true;
+        }
+        _last_scan_ms = t_ms;
+        scans.push(scan);
+    }
+
+    // Final decision from last scan (P2: budget-exceeded forces non-dump).
     let last = scans.last();
     let (decision, reason, gate_fired, final_cov) = if let Some(s) = last {
         let cov = s.coverage.get(".rdata2").copied().unwrap_or(0.0);
@@ -482,7 +572,7 @@ pub fn run_coverage_observation(
         let anchors_below = A_ANCHORS.iter().all(|(_rva, name)| {
             if *name == ".text" {
                 return true;
-            } // text anchor informational
+            }
             anchor_timeline
                 .iter()
                 .rev()
@@ -490,17 +580,30 @@ pub fn run_coverage_observation(
                 .map(|a| a.entropy_bits < DECRYPTED_ENTROPY_THRESHOLD)
                 .unwrap_or(false)
         });
-        let (d, r) = decide_dump(cov, unread, anchors_below);
-        (
-            d,
-            r,
-            cov >= DUMP_COVERAGE_GATE && anchors_below && unread <= UNREADABLE_F2_THRESHOLD,
-            Some(cov),
-        )
+        if scan_budget_exceeded {
+            (
+                "fail_closed".into(),
+                Some(format!("F3: B-phase scan exceeded {B_SCAN_BUDGET_SECS}s budget; data recorded, dump decision forbidden")),
+                false,
+                Some(cov),
+            )
+        } else {
+            let (d, r) = decide_dump(cov, unread, anchors_below);
+            (
+                d,
+                r,
+                cov >= DUMP_COVERAGE_GATE && anchors_below && unread <= UNREADABLE_F2_THRESHOLD,
+                Some(cov),
+            )
+        }
     } else {
         (
             "fail_closed".into(),
-            Some("no B-phase scan completed".into()),
+            Some(if exited {
+                "target exited before any B-phase scan".into()
+            } else {
+                "no B-phase scan completed".into()
+            }),
             false,
             None,
         )
