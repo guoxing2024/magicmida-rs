@@ -35,12 +35,14 @@
 mod handlers;
 mod kifast;
 mod scyllahide;
+pub mod config;
 
 #[cfg(test)]
 mod tests;
 pub mod timings;
 
 // Re-export the public API so `crate::antiantidebug::*` works unchanged.
+pub use config::{current_mode, initialize_mode, set_mode, AntidebugMode};
 pub use handlers::{
     handle_check_remote_debugger_present, handle_nt_query_information_process,
     handle_nt_query_object, handle_nt_set_information_thread, handle_output_debug_string,
