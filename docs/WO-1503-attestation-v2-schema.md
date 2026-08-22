@@ -316,8 +316,9 @@ digest: ae8ab1e1b72505d8544a32bf3803333e81528159e214e4198a0271d2f60dc419
 ### 6.2 权威来源与时机
 
 - runtime_module_sha256 的**权威来源**：controller 在 load_and_initialize 之前对 runtime
-  DLL 文件字节计算 sha256（authority.verify_file 同一文件），并写入 init params 下发给 runtime；
-  runtime 在 attestation 中回显。
+  DLL 文件字节计算 sha256（authority.verify_file 同一文件）。**不写入 MidaInitParams**
+  （MidaInitParams 保持不扩展，见 WO-1505 §5.3）：digest 经 target 内独立内存槽（与 params
+  blob 同生命周期）下发给 runtime，runtime 读取后回显到 attestation。
 - **当前占位值 adr4-foundation-unbound（exports.rs:237-239）不是 digest evidence**：
   它只是字符串占位；实现工单必须改为真实文件哈希，且 v2 顶层与 WalkerAttestation 两处一致。
 - controller 校验：attestation.runtime_sha256 == controller 计算的 runtime digest；
