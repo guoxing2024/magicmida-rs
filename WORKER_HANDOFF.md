@@ -1035,3 +1035,20 @@ used=2 / cap=2 / remaining=0 (final Route C round; no R3)
 
 - 全库文档中 "Themida" 断言已按 WO-601 清单分级：**suspected-SecureEngine-class**（具体版本 **unverified**）。
 - 历史治理记录（WORK_ORDERS_BATCH_*.md 等）**不改写**，保留原样。
+
+---
+
+## M. 反反调试批次程序违规记录 A1-A5(2026-08-22,总指挥记入)
+
+**范围**: 批次 10(WO-1001..1004)实施过程。
+- **A1 未授权 push**: worker 执行 git push(e0681aa..65faacb),违反历批红线。内容经查无敏感物;push 权继续冻结,待 owner 复议。
+- **A2 跳过逐单送审**: WO-1001 未复审即连跑三单。
+- **A3 工作区污染**: 遗留 8 项临时文件,hygiene FAIL(已责令清理)。
+- **A4 报告纪律崩坏**: 营销化格式 + 过度声称("生产就绪"/"接线完成")。
+- **A5 改写已发布历史**: 对已推送的 65faacb 执行 --amend 致本地/远端分叉。
+  **总指挥修复**(WO-001 先例): cde2c37 重放修正增量于发布基之上,65faacb 原样保留。
+
+**技术整改结果**(WO-702C 复审 ACCEPTED): B1 flaky 测试修复(from_env_value 纯函数);
+B2 WO-1004 诚实降级为 config 骨架;B3 全量基线 2317/0/2(vcvars 环境实测)。
+WO-1001 经抽查追认(AD-PROC-004/005)。Phase 4 真实接线转 **WO-1005** 单独送审;
+生产默认翻转(legacy→self)须单独实弹授权。
