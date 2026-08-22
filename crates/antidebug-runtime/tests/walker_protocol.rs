@@ -1,0 +1,321 @@
+//! WO-1501 walker wire protocol v2 — offline tests (part A: params).
+//!
+//! These tests run fully offline: no Windows API, no target process.
+//! They verify layout constants, checked encode/decode/validate, fixed
+//! fixtures and reject rules. They do NOT verify any Windows behaviour.
+
+use mida_antidebug_runtime::walker_protocol::{
+    crc32, derive_session_id, is_canonical_user_va, page_span_fits,
+    MappingIdentityHeaderV2, ProbeResultV2, ProtocolError, ResultSectionHeaderV2,
+    WalkerParamsV2, DEFAULT_PROBE_SPAN, MAX_CANDIDATE_COUNT, MIN_SECTION_HEADER_BYTES,
+    OPTION_NONE, PROBE_RESULT_BYTES,
+};
+
+fn sample_nonce() -> u64 {
+    0x0123_4567_89AB_CDEF
+}
+
+fn sample_candidates() -> Vec<u64> {
+    // All page-start-aligned user VAs so span 16 never crosses a page.
+    vec![
+        0x0000_0000_0001_0000,
+        0x0000_0000_0002_0000,
+        0x0000_0000_0003_0000,
+    ]
+}
+
+fn sample_params() -> WalkerParamsV2 {
+    let cands = sample_candidates();
+    let capacity = (cands.len() as u64)
+        .checked_mul(PROBE_RESULT_BYTES as u64)
+        .and_then(|v| v.checked_add(MIN_SECTION_HEADER_BYTES as u64))
+        .unwrap();
+    WalkerParamsV2::new(
+        0x0000_0000_0040_0000,
+        cands.len() as u32,
+        OPTION_NONE,
+        DEFAULT_PROBE_SPAN,
+        sample_nonce(),
+        capacity,
+    )
+}
+
+
+/// Standard CRC-32 check value.
+#[test]
+fn crc32_known_vector() {
+    assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+    assert_eq!(crc32(b""), 0);
+}
+
+/// Layout contract: the structs must be exactly the documented sizes.
+#[test]
+fn layout_constants_hold() {
+    assert_eq!(std::mem::size_of::<WalkerParamsV2>(), 0x40);
+    assert_eq!(std::mem::size_of::<MappingIdentityHeaderV2>(), 0x38);
+    assert_eq!(std::mem::size_of::<ResultSectionHeaderV2>(), 0x28);
+    assert_eq!(std::mem::size_of::<ProbeResultV2>(), 0x28);
+    assert_eq!(MIN_SECTION_HEADER_BYTES, 0x60);
+}
+
+/// Params blob round-trip: encode -> decode -> validate.
+/// The decoded header carries the computed blob_total_bytes / header_crc32
+/// (the new() placeholder zeroes are filled at encode time).
+#[test]
+fn params_round_trip_valid() {
+    let p = sample_params();
+    let cands = sample_candidates();
+    let blob = p.to_blob_bytes(&cands).unwrap();
+    assert_eq!(blob.len(), 0x40 + 3 * 8);
+    let (decoded, decoded_cands) = WalkerParamsV2::from_blob_bytes(&blob).unwrap();
+    // Round-trip identity on every field except the two computed ones.
+    assert_eq!(decoded.magic, p.magic);
+    assert_eq!(decoded.version, p.version);
+    assert_eq!(decoded.header_bytes, p.header_bytes);
+    assert_eq!(decoded.blob_base_va, p.blob_base_va);
+    assert_eq!(decoded.candidate_off, p.candidate_off);
+    assert_eq!(decoded.candidate_count, p.candidate_count);
+    assert_eq!(decoded.candidate_stride, p.candidate_stride);
+    assert_eq!(decoded.options_flags, p.options_flags);
+    assert_eq!(decoded.probe_span, p.probe_span);
+    assert_eq!(decoded.result_nonce, p.result_nonce);
+    assert_eq!(decoded.result_bytes, p.result_bytes);
+    assert_eq!(decoded.blob_total_bytes, blob.len() as u64);
+    assert_ne!(decoded.header_crc32, 0);
+    assert_eq!(decoded_cands, cands);
+    decoded.validate(&decoded_cands).unwrap();
+}
+
+/// A header byte corrupted inside the CRC-covered range is rejected.
+/// 0x3C (reserved2) is OUTSIDE the CRC range but still decoded; corrupting
+/// 0x0C (inside blob_total_bytes) is rejected at decode (also fail-closed).
+#[test]
+fn params_crc_mismatch_rejected() {
+    let p = sample_params();
+    let cands = sample_candidates();
+    let mut blob = p.to_blob_bytes(&cands).unwrap();
+    blob[0x0C] ^= 0xFF; // inside blob_total_bytes -> decode rejects
+    assert!(WalkerParamsV2::from_blob_bytes(&blob).is_err());
+
+    // Corrupt a byte inside the CRC range but outside the decode-critical
+    // fields: header_crc32 slot itself (offset 0x38).
+    let mut blob = p.to_blob_bytes(&cands).unwrap();
+    blob[0x38] ^= 0xFF;
+    let (decoded, decoded_cands) = WalkerParamsV2::from_blob_bytes(&blob).unwrap();
+    assert!(matches!(
+        decoded.validate(&decoded_cands),
+        Err(ProtocolError::CrcMismatch { .. })
+    ));
+}
+
+/// Non-canonical / zero candidates must be rejected.
+#[test]
+fn params_non_canonical_candidate_rejected() {
+    let p = WalkerParamsV2::new(
+        0x0000_0000_0040_0000,
+        1,
+        OPTION_NONE,
+        16,
+        sample_nonce(),
+        96 + 1 * PROBE_RESULT_BYTES as u64,
+    );
+    let cands = vec![0xFFFF_8000_0000_0000]; // kernel canonical, not user
+    let res = p.to_blob_bytes(&cands).and_then(|b| {
+        let (d, c) = WalkerParamsV2::from_blob_bytes(&b).unwrap();
+        d.validate(&c)
+    });
+    assert!(matches!(res, Err(ProtocolError::NonCanonicalVa { .. })));
+}
+
+/// Page-crossing probe spans must be rejected.
+#[test]
+fn params_page_cross_rejected() {
+    let p = WalkerParamsV2::new(
+        0x0000_0000_0040_0000,
+        1,
+        OPTION_NONE,
+        32,
+        sample_nonce(),
+        96 + 1 * PROBE_RESULT_BYTES as u64,
+    );
+    let cands = vec![0x0000_0000_0001_1FF0];
+    let res = p.to_blob_bytes(&cands).and_then(|b| {
+        let (d, c) = WalkerParamsV2::from_blob_bytes(&b).unwrap();
+        d.validate(&c)
+    });
+    assert!(matches!(res, Err(ProtocolError::PageCross { .. })));
+}
+
+/// Unknown option bits must be rejected.
+#[test]
+fn params_unknown_option_rejected() {
+    let p = WalkerParamsV2::new(
+        0x0000_0000_0040_0000,
+        1,
+        0x8000, // unknown bit
+        16,
+        sample_nonce(),
+        96 + 1 * PROBE_RESULT_BYTES as u64,
+    );
+    let cands = vec![0x0000_0000_0001_0000];
+    let res = p.to_blob_bytes(&cands).and_then(|b| {
+        let (d, c) = WalkerParamsV2::from_blob_bytes(&b).unwrap();
+        d.validate(&c)
+    });
+    assert!(matches!(res, Err(ProtocolError::UnknownOptionFlags { .. })));
+}
+
+/// Zero nonce must be rejected.
+#[test]
+fn params_zero_nonce_rejected() {
+    let p = WalkerParamsV2::new(
+        0x0000_0000_0040_0000,
+        1,
+        OPTION_NONE,
+        16,
+        0, // nonce
+        96 + 1 * PROBE_RESULT_BYTES as u64,
+    );
+    let cands = vec![0x0000_0000_0001_0000];
+    let res = p.to_blob_bytes(&cands).and_then(|b| {
+        let (d, c) = WalkerParamsV2::from_blob_bytes(&b).unwrap();
+        d.validate(&c)
+    });
+    assert!(matches!(res, Err(ProtocolError::ZeroNonce)));
+}
+
+/// Max candidate count accepted; one over is rejected.
+#[test]
+fn params_candidate_count_limits() {
+    let p = WalkerParamsV2::new(
+        0x0000_0000_0040_0000,
+        MAX_CANDIDATE_COUNT,
+        OPTION_NONE,
+        16,
+        sample_nonce(),
+        96 + MAX_CANDIDATE_COUNT as u64 * PROBE_RESULT_BYTES as u64,
+    );
+    let cands: Vec<u64> = (0..MAX_CANDIDATE_COUNT)
+        .map(|i| 0x0000_0001_0000_0000u64 + i as u64 * 0x1000)
+        .collect();
+    let blob = p.to_blob_bytes(&cands).unwrap();
+    let (d, c) = WalkerParamsV2::from_blob_bytes(&blob).unwrap();
+    d.validate(&c).unwrap();
+
+    let over = WalkerParamsV2::new(
+        0x0000_0000_0040_0000,
+        MAX_CANDIDATE_COUNT + 1,
+        OPTION_NONE,
+        16,
+        sample_nonce(),
+        0,
+    );
+    let cands2: Vec<u64> = (0..MAX_CANDIDATE_COUNT + 1)
+        .map(|i| 0x0000_0001_0000_0000u64 + i as u64 * 0x1000)
+        .collect();
+    let res = over.to_blob_bytes(&cands2).and_then(|b| {
+        let (d, c) = WalkerParamsV2::from_blob_bytes(&b).unwrap();
+        d.validate(&c)
+    });
+    assert!(matches!(res, Err(ProtocolError::CountTooLarge { .. })));
+}
+
+/// Fixed fields: mutate the decoded header struct directly so decode
+/// succeeds and validate is what rejects (mirrors a hostile writer).
+#[test]
+fn params_fixed_fields_rejected() {
+    let p = sample_params();
+    let cands = sample_candidates();
+    let blob = p.to_blob_bytes(&cands).unwrap();
+    let (mut d, c) = WalkerParamsV2::from_blob_bytes(&blob).unwrap();
+
+    d.magic = 0;
+    assert!(matches!(d.validate(&c), Err(ProtocolError::BadMagic { .. })));
+    let (d2, _) = WalkerParamsV2::from_blob_bytes(&blob).unwrap();
+    let mut d2 = d2;
+    d2.version = 1;
+    assert!(matches!(d2.validate(&c), Err(ProtocolError::BadVersion { .. })));
+    let (d3, _) = WalkerParamsV2::from_blob_bytes(&blob).unwrap();
+    let mut d3 = d3;
+    d3.header_bytes = 0x20;
+    assert!(matches!(d3.validate(&c), Err(ProtocolError::BadHeaderBytes { .. })));
+    let (d4, _) = WalkerParamsV2::from_blob_bytes(&blob).unwrap();
+    let mut d4 = d4;
+    d4.candidate_off = 0x50;
+    assert!(matches!(
+        d4.validate(&c),
+        Err(ProtocolError::BadCandidateOff { .. })
+    ));
+    let (d5, _) = WalkerParamsV2::from_blob_bytes(&blob).unwrap();
+    let mut d5 = d5;
+    d5.candidate_stride = 16;
+    assert!(matches!(
+        d5.validate(&c),
+        Err(ProtocolError::BadCandidateStride { .. })
+    ));
+
+    // A truncated blob is rejected at decode.
+    assert!(WalkerParamsV2::from_blob_bytes(&blob[..blob.len() - 1]).is_err());
+}
+
+/// Deterministic fixtures: golden bytes for a fixed params blob.
+#[test]
+fn params_golden_fixture() {
+    let p = WalkerParamsV2::new(
+        0x0000_0000_0040_0000,
+        1,
+        OPTION_NONE,
+        16,
+        0x0102_0304_0506_0708,
+        96 + 1 * PROBE_RESULT_BYTES as u64,
+    );
+    let cands = vec![0x0000_0000_0000_1000];
+    let blob = p.to_blob_bytes(&cands).unwrap();
+    assert_eq!(&blob[0..4], b"WALK");
+    assert_eq!(u16::from_le_bytes([blob[4], blob[5]]), 2);
+    assert_eq!(u16::from_le_bytes([blob[6], blob[7]]), 0x40);
+    assert_eq!(u64::from_le_bytes(blob[8..16].try_into().unwrap()), 0x48);
+    assert_eq!(
+        u64::from_le_bytes(blob[16..24].try_into().unwrap()),
+        0x40_0000
+    );
+    assert_eq!(u32::from_le_bytes(blob[24..28].try_into().unwrap()), 0x40);
+    assert_eq!(u32::from_le_bytes(blob[28..32].try_into().unwrap()), 1);
+    assert_eq!(u16::from_le_bytes([blob[32], blob[33]]), 8);
+    assert_eq!(u16::from_le_bytes([blob[36], blob[37]]), 16);
+    assert_eq!(
+        u64::from_le_bytes(blob[40..48].try_into().unwrap()),
+        0x0102_0304_0506_0708
+    );
+    assert_eq!(u64::from_le_bytes(blob[48..56].try_into().unwrap()), 0x88);
+    assert_eq!(u64::from_le_bytes(blob[0x40..0x48].try_into().unwrap()), 0x1000);
+    let crc = u32::from_le_bytes(blob[56..60].try_into().unwrap());
+    assert_ne!(crc, 0);
+    let again = p.to_blob_bytes(&cands).unwrap();
+    assert_eq!(blob, again);
+}
+
+/// Session id derivation is deterministic and distinct for different
+/// nonces / bases / counts.
+#[test]
+fn session_id_derivation() {
+    let a = derive_session_id(1, 0x400000, 3);
+    let b = derive_session_id(2, 0x400000, 3);
+    let c = derive_session_id(1, 0x500000, 3);
+    let d = derive_session_id(1, 0x400000, 4);
+    assert_ne!(a, b);
+    assert_ne!(a, c);
+    assert_ne!(a, d);
+    let e = derive_session_id(1, 0x400000, 3);
+    assert_eq!(a, e);
+}
+
+/// VA helper sanity.
+#[test]
+fn va_helpers_sane() {
+    assert!(is_canonical_user_va(0x0000_0000_0040_0000));
+    assert!(!is_canonical_user_va(0));
+    assert!(!is_canonical_user_va(0xFFFF_8000_0000_0000));
+    assert!(page_span_fits(0x0000_0000_0001_0000, 16));
+    assert!(!page_span_fits(0x0000_0000_0001_1FF0, 32));
+}

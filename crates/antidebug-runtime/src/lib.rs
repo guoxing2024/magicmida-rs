@@ -41,6 +41,7 @@ pub mod exports;
 pub mod provenance;
 pub mod surfaces;
 pub mod telemetry;
+pub mod walker_protocol;
 
 pub use attestation::{AttestationError, HookInventory, RuntimeAttestation, RuntimeStatus};
 pub use exports::{
@@ -55,4 +56,10 @@ pub use surfaces::{
 };
 pub use telemetry::{
     TelemetryChannel, TelemetryError, TelemetryMessage, TelemetryResponse, TelemetryState,
+};
+pub use walker_protocol::{
+    crc32, derive_session_id, encode_section, is_canonical_user_va, is_canonical_x64,
+    page_span_fits, parse_section, validate_section, IdentityExpectation,
+    MappingIdentityHeaderV2, ProbeResultV2, ProtocolError, ResultSectionHeaderV2,
+    WalkerParamsV2,
 };
