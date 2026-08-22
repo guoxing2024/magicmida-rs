@@ -55,3 +55,14 @@
 
 ---
 （WO-2203 交付，绑定 cce7e23）
+## 6. 提交后绑定补充（Batch 22 交付提交）
+
+- Batch 22 交付提交：`7b06cb4`（docs(gto): WO-2201 TLS stale-token + WO-2202 hostile
+  fixture ASan fix + WO-2203/2204/2205 final-tree audits），8 文件 +396/-46。
+- 生产代码（crates/）自 `cce7e23` 起**零修改**（本提交仅 docs/fixtures），
+  因此 test/check/diffcheck 证据（绑定 cce7e23 树）对提交后树仍然有效。
+- 提交后 HEAD：`7b06cb4440476ddc5329bd78eb2bc97f8054ba5a`。
+- 提交后 `git diff --check cce7e23..7b06cb4`：EXIT=0（无 whitespace 错误）。
+
+---
+（WO-2203 补充，提交后绑定 7b06cb4 / 证据树 cce7e23）
