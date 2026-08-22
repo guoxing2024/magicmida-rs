@@ -82,4 +82,3 @@ package check 0。本批新增代码零 warning。
 
 证据树绑定已校正：旧 evidence_*_1804.txt 明确标注 de12e4c code tree；
 新 evidence_*_1903.txt 绑定 3e6c50d；三层分离保持；commander 独立验证保持 BLOCKED。
-

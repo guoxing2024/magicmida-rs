@@ -90,4 +90,3 @@ rg 结果：validate_section_rebuild_evidence 仅存在于 crates/acceptance/src
 当前仓库：协议层 validated API 已冻结（span=16 等），但**无任何生产调用方**——协议
 模块处于"已实现未接线"状态。不存在绕过 validation 的生产路径（因为不存在生产路径）。
 Walker runtime 实现派发时必须以 §5 入口断言为验收条件。
-

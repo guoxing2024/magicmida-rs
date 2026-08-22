@@ -79,4 +79,3 @@ V2 required、Walker attestation、record digest、EvidenceInsufficient 与 orph
 
 readiness：✅ 条件接收；schema implemented / acceptance allowed：❌ 均未达成。
 本审计不派生产实现；后续 schema 实现工单须以 §4 三状态矩阵的验收条件为准。
-
