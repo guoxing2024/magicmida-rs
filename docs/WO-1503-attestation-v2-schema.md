@@ -180,7 +180,7 @@ Orphan {
   created_ts: string,
   timeout_ts: string | null,
   state: string,                // created | timed_out | target_exit_observed |
-                                 // os_reclaimed | unconfirmed（封闭集合）
+                                 // os_reclaimed | completed | unconfirmed（封闭集合）
   reclaim_note: string | null,  // os_reclaimed 时记录观察方式
 }
 ~~~

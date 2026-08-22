@@ -1,4 +1,4 @@
-# WO-1504 — Timeout/orphan 生命周期合同
+﻿# WO-1504 — Timeout/orphan 生命周期合同
 
 **工单编号**: WO-1504
 **优先级**: P1
@@ -21,7 +21,7 @@ P1-D 审计要求：TimedOut 后"由 target 进程退出回收"没有 controller
 ~~~text
 created
   │
-  ├─(wait Finished 且 completed_flag ∈ {1, 0xDEAD****}) → reclaimed（正常路径：
+  ├─(wait Finished 且 completed_flag ∈ {1, 0xDEAD****}) → completed（正常路径：
   │    读取结果 → 记录 → 释放 blob/section → ledger 关闭）
   ├─(wait TimedOut / WaitFailed) → timed_out
   │       │
@@ -38,6 +38,7 @@ created
 | 状态 | 含义 | 允许释放远程资源？ | 退出条件 |
 |------|------|------------------|---------|
 | created | 资源已创建，线程未启动或等待中 | 否（线程可能已启动） | Finished + flag 校验通过 |
+| completed | 正常完成：远程线程 Finished 且 completed_flag ∈ {1, 0xDEAD****} 已读取/记录 | 是（唯一安全释放条件，§1.2） | 关闭 ledger |
 | timed_out | wait 超时，线程状态未知（可能仍运行） | **否** | target exit 观察 |
 | target_exit_observed | 已确认 target 进程退出（WaitForSingleObject(target_handle) 或进程枚举消失） | **仍否**：OS 回收是异步的，且我们不知道 kernel 何时完成地址空间销毁；仅当有额外证据（如 handle 关闭回调）才可 | os_reclaimed 或 unconfirmed |
 | os_reclaimed | 有明确观察证据表明 OS 已回收（如 NtQueryInformationProcess 失败 + 句柄失效，或专用回收观察器确认） | 是（仅作记账；不主动 VirtualFreeEx——进程已死，调用本身无意义且可能失败） | 关闭 ledger |
@@ -79,7 +80,7 @@ unconfirmed）一律禁止释放——这是 §5.4 铁律的持久化版本。
 
 ### 2.2 写时机
 
-- created：会话开始时写入（非孤儿也写，正常完成时标记 reclaimed 并保留 N 天审计）。
+- created：会话开始时写入（非孤儿也写，正常完成时标记 completed 并保留 N 天审计）。
 - timed_out：wait 超时**立即**写（不能依赖 target 返回 attestation——超时恰恰是拿不到返回）。
 - target_exit_observed / os_reclaimed / unconfirmed：观察事件发生时更新。
 
@@ -112,7 +113,7 @@ unconfirmed）一律禁止释放——这是 §5.4 铁律的持久化版本。
 
 ### 4.2 重复 PID 处理
 
-- 新会话 target_pid 与 ledger 中 os_reclaimed / reclaimed 记录相同：允许（进程已死，PID 可能
+- 新会话 target_pid 与 ledger 中 os_reclaimed / completed 记录相同：允许（进程已死，PID 可能
   被复用），但 session_id（含 nonce）不同，证据链不受影响。
 - 新会话 target_pid 与 ledger 中 timed_out / unconfirmed 记录相同：**拒绝启动**（禁止重入），
   除非人工复核并显式关闭旧记录。
