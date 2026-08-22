@@ -191,8 +191,8 @@ runtime 导出数、artifact digest），且"复用"被写成"已支持"。本�
    - **endian test vector**：encode("MIDA2P2\0") 的 LE 字节 = 4D 49 44 41 32 50 32 00；
      u64 数值 0x003250324144494D；两个方向都必须在实现单测中断言。
 4. v2 路径下 runtime 必须（fail-closed）：
-   - 校验 expected_runtime_sha256 非空且为 target-local（与 profile_id 同模式）；
-   - 校验 expected_runtime_sha256_len == 64 且为合法 hex lowercase；否则 InvalidArgument；
+   - 校验 digest_off 非 0 且为 self-relative 边界内（与 profile_id_off 同模式）；
+   - 校验 digest_len == 64 且 digest 区域为 64 个 lowercase hex + NUL；否则 InvalidArgument；
    - 用该值构建 attestation 的 runtime_sha256（替换 adr4-foundation-unbound 占位）；
    - 仍经 out_runtime_sha256 输出回显同一值（输出通道语义不变）。
 5. loader 侧（runtime_loader.rs）：
@@ -240,46 +240,70 @@ expected_surfaces_ptr=0x403000）：
 总长 0x30
 ~~~
 
-**MidaInitParamsV2（0x48）**——v1 字段 + v2 追加：
+**MidaInitParamsV2（0x48）——WO-2102 唯一权威 layout（self-relative offsets，7 字段）**：
+
+> **WO-2102 修订**：删除旧"v1 字段 + 绝对指针（expected_runtime_sha256: const char*）"的
+> V2 扩展。V2 是**独立 0x48 结构**，全部引用字段为 self-relative offsets；本表是唯一
+> 权威 layout（与 docs/fixtures/WO-2002-v2-envelope-fixture.h 逐字节一致）。
+> 旧 WO-1902-initparams-layout-fixture.h 的 V2 绝对指针扩展**已废弃**（v1 部分保留）。
 
 | offset | size | 字段 | C 类型 | Rust 类型 |
 |--------|------|------|--------|-----------|
-| 0x00..0x30 | 0x30 | （v1 全部字段，逐字节一致） | 同 v1 | 同 v1 |
+| 0x00 | 4 | target_pid | uint32_t | u32 |
+| 0x04 | 4 | _pad0 | — | (padding) |
+| 0x08 | 8 | module_base | uint64_t | u64 |
+| 0x10 | 8 | profile_id_off | uint64_t（self-relative） | u64 |
+| 0x18 | 8 | profile_digest_off | uint64_t（self-relative） | u64 |
+| 0x20 | 8 | expected_hooks | uint64_t | u64 |
+| 0x28 | 8 | expected_surfaces_off | uint64_t（self-relative） | u64 |
 | 0x30 | 8 | magic_v2 | uint64_t | u64 |
-| 0x38 | 8 | expected_runtime_sha256 | const char* | *const c_char |
-| 0x40 | 8 | expected_runtime_sha256_len | uint64_t | u64 |
+| 0x38 | 8 | digest_off | uint64_t（self-relative） | u64 |
+| 0x40 | 8 | digest_len | uint64_t（== 64） | u64 |
 | 0x48 | — | 结束 | | |
 
-golden bytes（追加段，magic_v2 = "MIDA2P2\0" LE = 0x003250324144494D,
-digest_ptr = 0x404000, len = 64）：
+golden bytes（fixture 字段值：target_pid=0x11223344, module_base=0x400000,
+profile_id_off=0x48, profile_digest_off=0x68, expected_hooks=2,
+expected_surfaces_off=0x78, magic_v2="MIDA2P2\0" LE, digest_off=0x88, digest_len=64）：
 
 ~~~text
-30: 4D 49 44 41 32 50 32 00     magic_v2(LE) = "MIDA2P2\0" 字节序
-38: 00 40 40 00 00 00 00 00     expected_runtime_sha256_ptr(LE) = 0x404000
-40: 40 00 00 00 00 00 00 00     expected_runtime_sha256_len(LE) = 64
+00: 44 33 22 11 00 00 00 00     target_pid(LE) + _pad0
+08: 00 00 40 00 00 00 00 00     module_base(LE) = 0x400000
+10: 48 00 00 00 00 00 00 00     profile_id_off(LE) = 0x48
+18: 68 00 00 00 00 00 00 00     profile_digest_off(LE) = 0x68
+20: 02 00 00 00 00 00 00 00     expected_hooks(LE) = 2
+28: 78 00 00 00 00 00 00 00     expected_surfaces_off(LE) = 0x78
+30: 4D 49 44 41 32 50 32 00     magic_v2(LE) = "MIDA2P2\0" 字节序 = 0x003250324144494D
+38: 88 00 00 00 00 00 00 00     digest_off(LE) = 0x88
+40: 40 00 00 00 00 00 00 00     digest_len(LE) = 64
 总长 0x48
 ~~~
 
 **C 侧 static_assert 合同（实现工单必须原样落地）**：
 
 ~~~c
-_Static_assert(sizeof(MidaInitParams) == 0x30, "v1 size");
 _Static_assert(sizeof(MidaInitParamsV2) == 0x48, "v2 size");
-_Static_assert(offsetof(MidaInitParams, target_pid) == 0x00, "v1 target_pid");
-_Static_assert(offsetof(MidaInitParams, module_base) == 0x08, "v1 module_base");
+_Static_assert(offsetof(MidaInitParamsV2, target_pid) == 0x00, "v2 target_pid");
+_Static_assert(offsetof(MidaInitParamsV2, module_base) == 0x08, "v2 module_base");
+_Static_assert(offsetof(MidaInitParamsV2, profile_id_off) == 0x10, "v2 profile_id_off");
+_Static_assert(offsetof(MidaInitParamsV2, profile_digest_off) == 0x18, "v2 profile_digest_off");
+_Static_assert(offsetof(MidaInitParamsV2, expected_hooks) == 0x20, "v2 expected_hooks");
+_Static_assert(offsetof(MidaInitParamsV2, expected_surfaces_off) == 0x28, "v2 surfaces_off");
 _Static_assert(offsetof(MidaInitParamsV2, magic_v2) == 0x30, "v2 magic");
-_Static_assert(offsetof(MidaInitParamsV2, expected_runtime_sha256) == 0x38, "v2 digest ptr");
-_Static_assert(offsetof(MidaInitParamsV2, expected_runtime_sha256_len) == 0x40, "v2 digest len");
+_Static_assert(offsetof(MidaInitParamsV2, digest_off) == 0x38, "v2 digest_off");
+_Static_assert(offsetof(MidaInitParamsV2, digest_len) == 0x40, "v2 digest_len");
 ~~~
 
 **Rust 侧 static_assert 等价（实现工单必须）**：
 
 ~~~rust
 const _: () = {
-    assert!(std::mem::size_of::<MidaInitParams>() == 0x30);
     assert!(std::mem::size_of::<MidaInitParamsV2>() == 0x48);
+    assert!(std::mem::offset_of!(MidaInitParamsV2, profile_id_off) == 0x10);
+    assert!(std::mem::offset_of!(MidaInitParamsV2, profile_digest_off) == 0x18);
+    assert!(std::mem::offset_of!(MidaInitParamsV2, expected_surfaces_off) == 0x28);
     assert!(std::mem::offset_of!(MidaInitParamsV2, magic_v2) == 0x30);
-    assert!(std::mem::offset_of!(MidaInitParamsV2, expected_runtime_sha256) == 0x38);
+    assert!(std::mem::offset_of!(MidaInitParamsV2, digest_off) == 0x38);
+    assert!(std::mem::offset_of!(MidaInitParamsV2, digest_len) == 0x40);
 };
 ~~~
 
@@ -298,8 +322,8 @@ const _: () = {
 - 检查顺序：边界 → NUL/长度/hex 校验 → 内容使用；任何失败 → fail-closed 错误码。
 
 **65-byte digest 可读性**：
-- expected_runtime_sha256 指向 64 hex 字符 + 1 NUL = 65 字节区域；
-- 读取协议：len 字段必须 == 64；从 ptr 起最多读 65 字节，遇 NUL 停止；
+- digest_off 指向（self-relative）64 hex 字符 + 1 NUL = 65 字节区域；
+- 读取协议：digest_len 字段必须 == 64；从 blob_base + digest_off 起最多读 65 字节，遇 NUL 停止；
   - 读到 64 字节且第 65 字节 != NUL → 拒收（BufferOverrun，fail-closed）；
   - 64 字节内遇 NUL（提前终止）→ 拒收（TruncatedDigest）；
   - 65 字节内有任意非 hex 字符（0-9a-fA-F）→ 拒收（BadHex）；
@@ -403,7 +427,7 @@ const _: () = {
 - **canonical VA 规则**：envelope 内的**绝对地址**（surface 数组条目）必须是
   canonical user VA 且非 0；self-relative offsets 无 VA 语义，只做边界检查。
 
-### 5.3f version negotiation（WO-2002 冻结）
+### 5.3f version negotiation（WO-2102 修订：严格拒绝未知扩展，语义单义）
 
 - **判定顺序（入口，先于任何字段读取）**：
   1. params == NULL || params_bytes < 0x48 → 拒收（ShortBlob）；
@@ -411,9 +435,24 @@ const _: () = {
      - == 0x003250324144494D（"MIDA2P2\0"）→ v2 路径；
      - == 0 且 params_bytes >= 0x30 且调用方声称 v2 → 拒收（MissingMagic）；
      - 其它值 → 拒收（UnknownMagic）；
-  3. **未知版本**：magic_v2 匹配但结构有扩展（params_bytes > 0x48 的未知尾部）→
-     允许（envelope 尾部由 params_bytes 界定，扩展区不读取）；若未来 v3 需
-     新 magic + 新 entry（MidaAntidebugInitializeV3），不猜版本。
+  3. **未知版本/未知扩展：严格拒绝，无兼容尾部**。magic_v2 匹配但
+     params_bytes > 0x48 且存在任何超出已声明区段（envelope 表 §5.3e 之外）的
+     未知字节 → 拒收（UnknownExtension，fail-closed）。**不存在**"允许未知尾部"
+     的宽松语义；v3 必须新增 entry（MidaAntidebugInitializeV3）+ 新 magic +
+     新版本化结构，不猜版本、不读未知区。
+- **header trust boundary（WO-2102 新增，关闭审计 §4.3）**：
+  1. `params_bytes` 由 controller 从 `VirtualAllocEx` 分配大小**同一来源**提供，
+     runtime 不信任调用方自报长度之外的任何可读性；
+  2. `params` 指针必须 == controller 记录的 `blob_base_va`（target-local），
+     runtime 在入口断言 params == blob_base_va（记录于加载证据）；
+  3. header 可读性假设：params 指向的 0x48 字节在**同一 allocation** 内
+     （controller 保证分配 >= params_bytes >= 0x48 且已提交 PAGE_READWRITE）；
+     runtime 按"blob 已提交"假设读取——该假设由 controller 的分配/写入顺序
+     （alloc → WPM 全量写入 → 才创建远程线程）保证，任何违反 → 拒收；
+  4. 目标进程内 provenance：params 只能来自 controller 在本进程创建的 blob
+     （blob_base_va 记录 + nonce/CRC 校验），不接受其它来源指针；
+  5. header fault（读取时 AV/guard）→ fail-closed：不尝试恢复，直接返回
+     ShortBlob/InvalidArgument 类错误码，attestation 不生成。
 - **v1 fallback（不变）**：v1 entry（MidaAntidebugInitialize）只读 0x30 内字段，
   永不读取 0x30 之后；digest 需求（WO-1902 §5.3d 三条件）时 V2 必选，
   V2 校验失败**禁止降级 v1**。
@@ -438,6 +477,10 @@ const _: () = {
 | 14 | expected_hooks == 0 但 surfaces_off != 0 | InvalidArgument 拒收 |
 | 15 | surface 数组条目非 canonical 或为 0 | NonCanonicalVa 拒收 |
 | 16 | 未知 magic + params_bytes == 0x48 | UnknownMagic 拒收 |
+| 17 | magic 匹配但 params_bytes > 0x48 且存在未声明区段（未知尾部） | UnknownExtension 拒收 |
+| 18 | params != controller 记录 blob_base_va（外来指针） | ProvenanceReject 拒收 |
+| 19 | header 读取 fault（blob 未提交/被篡改） | HeaderFault 拒收（fail-closed，不恢复） |
+| 20 | profile_id_off 指向区域无 NUL（超 65 字节扫描） | TruncatedString 拒收 |
 ### 5.4 controller 复核（fail-closed）
 
 - authority.verify_file（L181）通过 ≠ digest 绑定通过：verify_file 校验 manifest 身份，

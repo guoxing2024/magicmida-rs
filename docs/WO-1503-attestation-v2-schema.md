@@ -317,10 +317,10 @@ digest: ae8ab1e1b72505d8544a32bf3803333e81528159e214e4198a0271d2f60dc419
 
 - runtime_module_sha256 的**权威来源**：controller 在 load_and_initialize 之前对 runtime
   DLL 文件字节计算 sha256（authority.verify_file 同一文件）。**不写入 MidaInitParams**
-  （独立 versioned entry，见 WO-1505 §5.3 / WO-1803）：digest 经
-  MidaAntidebugInitializeV2 的 expected_runtime_sha256/len 字段下发（target-local 指针
-  指向 blob 内 64 hex + NUL），runtime 读取后回显到 attestation；v1 路径（MidaAntidebugInitialize）
-  保持 digest 占位，永不读取 0x30 之后字节。
+  （独立 versioned entry，见 WO-1505 §5.3 / WO-1803 / WO-2102）：digest 经
+  MidaAntidebugInitializeV2 的 **digest_off / digest_len 字段下发（self-relative offset，
+  指向同一 params blob 内 64 hex + NUL；无绝对指针）**，runtime 读取后回显到 attestation；
+  v1 路径（MidaAntidebugInitialize）保持 digest 占位，永不读取 0x30 之后字节。
 - **当前占位值 adr4-foundation-unbound（exports.rs:237-239）不是 digest evidence**：
   它只是字符串占位；实现工单必须改为真实文件哈希，且 v2 顶层与 WalkerAttestation 两处一致。
 - controller 校验：attestation.runtime_sha256 == controller 计算的 runtime digest；

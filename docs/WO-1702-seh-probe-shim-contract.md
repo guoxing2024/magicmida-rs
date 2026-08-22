@@ -169,21 +169,37 @@ __declspec(dllexport) void mida_probe_tls_mark(uint32_t code);
 ### 2.3 Rust FFI 调用转换（fixture，实现工单照抄）
 
 ~~~rust
-// walker 侧 FFI 声明（探针循环所在模块；WO-1901 冻结）
+// walker 侧 FFI 声明（探针循环所在模块；WO-2101 冻结）
+// 与 C MidaProbeTls（WO-1702 §2.1 / WO-1901 fixture）逐字节一致：repr(C) 0x20。
+// 六个字段：magic/active/seq/flags/token_va/unknown_code；不存在 reserved、不存在
+// 0x18 旧布局、不存在任何旧绝对指针式访问。C 侧 layout 是本合同的唯一权威。
 #[repr(C)]
 struct MidaProbeTls {
-    magic: u32,
-    active: u32,
-    seq: u32,
-    reserved: u32,
-    token_va: u64,
-}
+    magic: u32,          /* +0x00 MIDA_TLS_MAGIC (0x4D504354 "MPCT") */
+    active: u32,         /* +0x04 1 while a probe is in flight, else 0 */
+    seq: u32,            /* +0x08 per-candidate monotonic probe sequence */
+    flags: u32,          /* +0x0C mark bits: 1=guard, 2=av, 0x80000000=unknown */
+    token_va: u64,       /* +0x10 current probe VA (8-aligned) */
+    unknown_code: u64,   /* +0x18 unknown exception code (0 = none) */
+}                        /* size 0x20, align 8 */
+
+const _: () = {
+    // Rust 侧 static_assert 等价（实现工单必须保留）：
+    assert!(std::mem::size_of::<MidaProbeTls>() == 0x20);
+    assert!(std::mem::offset_of!(MidaProbeTls, magic) == 0x00);
+    assert!(std::mem::offset_of!(MidaProbeTls, active) == 0x04);
+    assert!(std::mem::offset_of!(MidaProbeTls, seq) == 0x08);
+    assert!(std::mem::offset_of!(MidaProbeTls, flags) == 0x0C);
+    assert!(std::mem::offset_of!(MidaProbeTls, token_va) == 0x10);
+    assert!(std::mem::offset_of!(MidaProbeTls, unknown_code) == 0x18);
+};
 
 extern "C" {
     fn mida_probe_read(va: *const u8, out16: *mut u8, status_slot: *mut u32) -> u32;
     fn mida_probe_tls_begin(va: u64, seq: u32) -> u32;   // 0 ok, !=0 re-entry -> ABORT
     fn mida_probe_tls_clear();
     fn mida_probe_tls_snapshot() -> *const MidaProbeTls;
+    fn mida_probe_tls_mark(code: u32);  // VEH 内调用；按 code 置 flags 位（§4.4a）
 }
 
 // 调用点合同（探针循环内，每候选一次）：
@@ -191,10 +207,14 @@ extern "C" {
 //   out16 为探针线程栈上的 [u8; 16]；
 //   1. seq += 1（探针循环局部计数器）；
 //   2. rc = mida_probe_tls_begin(va as u64, seq)；rc != 0 → abort（重入/损坏）；
+//      注意：begin 内部执行"先于置位"的 stale 检测（上一候选遗留的 flags!=0 且
+//      active==0 → 返回非 0 → abort），并完成 flags=0/unknown_code=0 置零（§4.4a）；
 //   3. status = mida_probe_read(va, out16, &mut slot);
-//   4. tls = *mida_probe_tls_snapshot()（读 active/seq/token_va，仅探针线程）；
+//   4. tls = *mida_probe_tls_snapshot()（读 active/seq/flags/unknown_code，仅探针线程）；
 //   5. mida_probe_tls_clear();
-//   6. status != OK 时不得使用 out16 内容；分类按 status + TLS 标记（§4.2/§5）。
+//   6. status != OK 时不得使用 out16 内容；分类按 status + TLS 标记（§4.2/§5）；
+//      flags.UNKNOWN 或 unknown_code != 0 → abort（fail-closed，行 5/6）。
+//   Rust 侧禁止：声明 thread_local、直接访问槽字段、绕过 accessor 写状态（§4.4a）。
 ~~~
 ### 2.4 volatile 寄存器与 shadow space
 
@@ -280,8 +300,9 @@ Rust 侧绝不直接访问 TLS 槽（不声明同名 thread_local），只经导
 
 **生命周期时序（冻结）**：
 1. 探针线程创建后、首候选前：TLS 零初始化（active=0, magic=0）→ 首调用 begin 写入 magic；
-2. 每候选：seq += 1（Rust 局部）→ begin(va, seq)：校验 magic 非 0（首写）或 ==MIDA_TLS_MAGIC，
-   且 active==0（否则返回 1 = 重入）；写入 active=1/token_va=va/seq；
+2. 每候选：seq += 1（Rust 局部）→ begin(va, seq)：**先执行前置检查**
+   （magic 首写/损坏、active==0 防重入、stale flags/unknown_code 残留，见 §4.4a；
+   任一失败返回非 0 = abort）；通过后写入 active=1/flags=0/unknown_code=0/token_va=va/seq；
 3. mida_probe_read 执行（异常可能发生：VEH 观测 → filter 读 TLS → handler 写 status_slot）；
 4. 返回后：Rust 读 snapshot（active/seq/token_va）→ clear（active=0, token_va=0）；
 5. 探针线程退出前：clear + 线程终止（OS 回收 TLS）；
@@ -322,9 +343,15 @@ filter 若达（不可能）→ ABORT。无需额外线程 ID 存储。
 | token_va | 0x10 | C shim | begin | VEH（归属）、filter（归属） | 每候选 clear |
 | unknown_code | 0x18 | C shim | mida_probe_tls_mark（unknown 时） | Rust 主路径（abort 判定） | 每候选 begin 前置零 |
 
-**accessor 契约**：
-- mida_probe_tls_begin(va, seq)：校验 magic（首写或 ==MIDA_TLS_MAGIC）与 active==0；
-  置 flags=0、unknown_code=0、active=1、token_va=va、seq=seq；返回 0 或错误码；
+**accessor 契约（WO-2101 修订：begin 先 stale 检测、后写入，顺序冻结）**：
+- mida_probe_tls_begin(va, seq)：**先于任何写入**执行前置检查（fixture:
+  mida_tls_begin_check）：
+  1. magic != 0 且 != MIDA_TLS_MAGIC → 槽损坏 → 返回非 0 → abort；
+  2. active != 0 → 重入 → 返回非 0 → abort；
+  3. active == 0 且 (flags != 0 || unknown_code != 0) → **stale mark 残留**
+     （上一候选异常迟到写入、或 clear 未执行）→ 返回非 0 → abort（fail-closed）。
+  全部通过后才写入：magic（首写）、flags=0、unknown_code=0、active=1、token_va=va、
+  seq=seq；返回 0。
 - mida_probe_tls_mark(code)：仅 VEH 调用；按 code 置 flags 位（unknown 时同时写 unknown_code）；
 - mida_probe_tls_snapshot()：返回当前线程槽指针（只读）；
 - mida_probe_tls_clear()：active=0、token_va=0、flags=0、unknown_code=0（magic/seq 保留）。
@@ -340,10 +367,13 @@ filter 若达（不可能）→ ABORT。无需额外线程 ID 存储。
   - seq 不符 → abort（WALKER_ERROR_PROBE_ABORTED）——证明"当前调用被另一探针/重入污染"；
 - **旧 fault / 迟到异常**：上一候选的异常已在上一候选的 clear 中被清（flags/unknown_code=0）；
   若 VEH 在本候选 begin 前被调用（不可能：VEH 只在探针 load 时触发）→ active==0 → 不观测；
-  若异常迟到达（handler 已返回但 VEH 后写）→ 本候选 clear 后 flags 归零，下一候选 begin
-  前检测 flags!=0 → abort（stale mark 检测，fail-closed）；
-- **fixture**：mida_attr_classify 增加 seq 输入与 expected_seq 比较断言（见
-  docs/fixtures/WO-1901-probe-tls-fixture.h 更新后版本）。
+  若异常迟到达（handler 已返回但 VEH 后写）→ 本候选 clear 后 flags 归零；下一候选
+  **begin 的前置检查**（mida_tls_begin_check，先于任何写入）检测到
+  active==0 且 flags/unknown_code != 0 → 返回非 0 → abort（stale mark 检测，fail-closed）。
+  该检查在 begin 内、写入前执行，**可达**（不存在被 active==0 短路遮蔽的不可达分支）。
+- **fixture**：mida_attr_classify（filter/VEH 路径，无 stale 分支）与
+  mida_tls_begin_check（begin 前置路径，含 stale 分支）两个纯函数分离；
+  seq 输入与 expected_seq 比较断言见 docs/fixtures/WO-1901-probe-tls-fixture.h 更新后版本。
 
 ## 5. TLS 生命周期与候选绑定（关闭 P1-1602-3）
 

@@ -277,11 +277,13 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
     let code = rec.ExceptionCode.0 as u32;
     let rip = ctx.Rip;
 
-    // 归属过滤（WO-2001）：单一来源 = C-owned TLS 槽（MidaProbeTls）。
+    // 归属过滤（WO-2101）：单一来源 = C-owned TLS 槽（MidaProbeTls，repr(C) 0x20）。
     // 只观测"active phase + 访问地址匹配 TLS 槽 token_va（或 va+8）"的异常。
     // 线程归属由 TLS 的线程局部性天然完成（非探针线程读到 active==0）。
     // 任何非 active phase / 访问地址不匹配的异常一律 CONTINUE_SEARCH，
     // 不触碰、不吞掉（保护器链完整观测权）。
+    // Rust 侧结构 = WO-1702 §2.3 冻结的 0x20 六字段布局（magic/active/seq/flags/
+    // token_va/unknown_code）；仅经 C accessor 读取，无 Rust thread_local、无第二份存储。
     let tls = unsafe { &*mida_probe_tls_snapshot() };  // C accessor，非 Rust thread_local
     if tls.active == 0 || tls.magic != MIDA_TLS_MAGIC {
         return EXCEPTION_CONTINUE_SEARCH;
@@ -294,7 +296,9 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
     }
 
     // 只读观测 + 标记，然后交回链（保护器随后获得同一异常）：
-    // 标记写入经 C accessor mida_probe_tls_mark(code)（单 owner = C；见 WO-1702 §4.4）。
+    // 标记写入经 C accessor mida_probe_tls_mark(code)（单 owner = C；见 WO-1702 §4.4a）。
+    // 该 accessor 只写 flags 位（guard=0x1 / av=0x2 / unknown=0x80000000），unknown 时
+    // 同时写 unknown_code=code；Rust 侧从不直接写槽。
     match code {
         STATUS_GUARD_PAGE_VIOLATION => { mida_probe_tls_mark(MIDA_TLS_MARK_GUARD); }
         STATUS_ACCESS_VIOLATION => { mida_probe_tls_mark(MIDA_TLS_MARK_AV); }
@@ -302,6 +306,12 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
     }
     EXCEPTION_CONTINUE_SEARCH   // 收口在 shim 的 __except 帧
 }
+// 主路径分类（探针循环，read 返回后、clear 前，WO-1702 §4.4b）：
+//   tls = *mida_probe_tls_snapshot()；读 (active, seq, flags, unknown_code)；
+//   seq != 局部期望 → abort；flags & UNKNOWN 或 unknown_code != 0 → abort；
+//   否则按 flags 位（GUARD/AV）+ status_slot 分类（Type A/B/C）。
+// 下一候选 begin 的前置检查（mida_tls_begin_check）捕获 stale flags/unknown_code
+// 残留 → abort（fail-closed，WO-2101 §4.4a/b；fixture: WO-1901）。
 ~~~
 
 **SEH 收口帧（唯一机制：MSVC C __try/__except shim，WO-1702 §1.1/§2.2 冻结）**：
@@ -324,8 +334,9 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
   且违反 fail-closed。
 - **即使保护器 CONTINUE_EXECUTION 重放成功（行 6）**，只要 TLS.unknown_code != 0 仍 abort：
   未知异常不因"重放成功"而变为可接受。
-- **TLS 生命周期（WO-1702 §5.2）**：每候选入口清零 guard_seen/av_seen/unknown_code，
-  候选间零状态继承；walker_inner 退出前清空全部字段并卸载 VEH（VehGuard RAII）。
+- **TLS 生命周期（WO-1702 §5.2 + WO-2101 §4.4a）**：每候选 begin 先执行前置检查
+  （stale flags/unknown_code 残留 → abort）再置零 flags/unknown_code，候选间零状态继承；
+  walker_inner 退出前清空全部字段并卸载 VEH（VehGuard RAII）。
 #### 3.3.3 归属规则（faulting RIP / 线程 / active phase）
 
 | 维度 | 规则 | 理由 |
@@ -361,9 +372,10 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
 
 ### 3.4 重试与不可恢复判定（有界）
 
-- **guard 重试**：guard_seen=true 时，探针循环等待 1 个保护器处理窗口（50ms）后**重读一次**
+- **guard 重试**：guard_seen=true（= TLS.flags 位 0，MidaProbeTls 0x20 槽内；WO-2101）
+  时，探针循环等待 1 个保护器处理窗口（50ms）后**重读一次**
   （最多 1 次）。重读成功 → Type B（解密完成）；仍 guard/AV → Type A。
-- **AV 重试**：同一候选首次 AV → 记录 av_seen，重读一次；仍 AV → Type A，跳过。
+- **AV 重试**：同一候选首次 AV → 记录 av_seen（= TLS.flags 位 1，0x20 槽内），重读一次；仍 AV → Type A，跳过。
 - **不可恢复即 abort**：连续 10 次非 guard AV（跨候选累计）→ 触发 §6.3 止损，
   walker_status=PROBE_ABORTED，fail-closed。
 - **禁止对同一 faulting load 无条件 EXCEPTION_CONTINUE_EXECUTION**（死循环风险，撤回）：
@@ -646,7 +658,7 @@ params blob（`candidate[]`），target 内经 `candidate_off`/`candidate_count`
 | V7 | 2 rounds × 60min 账本（#6） | round 账本字段完整；断言 `auto_retry == false` | 待验证 |
 | V8 | Provenance/Attestation v2 迁移（#7） | v1→v2 兼容测 + v2 round-trip；旧消费者不 panic | 待验证 |
 | V9 | 假说：目标内触碰触发保护器解密 | LIVE-4 Phase 1 PoC（≥3/5 guard 命中，熵<6.0） | 待验证（需 LIVE-4 授权） |
-| V10 | P0-A 闭环：探针 fault 永不落未处理路径 | 受保护读取单测（mida_probe_read + status_slot + __except 收口路径）；VEH 观测单测（guard/AV → CONTINUE_SEARCH；unknown → abort）；SEH 收口帧单测；非探针 RIP/线程 → CONTINUE_SEARCH | 待验证 |
+| V10 | P0-A 闭环：探针 fault 永不落未处理路径 | 受保护读取单测（mida_probe_read + status_slot + __except 收口路径）；VEH 观测单测（guard/AV → CONTINUE_SEARCH；unknown → abort）；SEH 收口帧单测；非探针 RIP/线程 → CONTINUE_SEARCH；begin 前置 stale 检测（mida_tls_begin_check：损坏/重入/残留 → abort） | 待验证 |
 
 ### 9.1 前置门（离线，须先过）
 
