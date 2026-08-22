@@ -1660,9 +1660,29 @@ pub fn unpack(
                 )?;
 
                 // Handle anti-debug calls detected via breakpoint.
-                if let Ok(handled) = handle_nt_set_information_thread(&dbg, thread_id) {
-                    if handled {
-                        debug!("NtSetInformationThread bypassed");
+                // WO-1006: Phase 1-3 dispatcher (gated by MIDA_ANTIDEBUG_MODE).
+                use mida_packers_themida::current_mode;
+                if current_mode() == mida_packers_themida::AntidebugMode::SelfDeveloped {
+                    // Phase 1: ThreadHideFromDebugger bypass
+                    if let Ok(handled) = handle_nt_set_information_thread(&dbg, thread_id) {
+                        if handled {
+                            debug!("Phase 1: NtSetInformationThread bypassed");
+                        }
+                    }
+                    // Phase 1: NtQueryInformationProcess forgery (debug port/flags)
+                    // TODO: detect ProcessInformationClass from breakpoint context
+                    // Phase 1: CheckRemoteDebuggerPresent forgery
+                    // TODO: detect output pointer from breakpoint context
+                    // Phase 2: NtQueryObject (debug object detection)
+                    // TODO: detect ObjectInformationClass from breakpoint context
+                    // Phase 3: Timing normalization (RDTSC / QueryPerformanceCounter)
+                    // TODO: per-thread TimingProbeState + instruction detection
+                } else {
+                    // Legacy mode: only ThreadHideFromDebugger (existing behavior)
+                    if let Ok(handled) = handle_nt_set_information_thread(&dbg, thread_id) {
+                        if handled {
+                            debug!("NtSetInformationThread bypassed");
+                        }
                     }
                 }
 
