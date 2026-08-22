@@ -257,3 +257,78 @@ fn timing_state_benign_probe_closes_window() {
     let returned = state.handle_probe(6100);
     assert_eq!(returned, 6100, "benign probe should close window and return real tick");
 }
+
+// ---------------------------------------------------------------------------
+// WO-1003: Phase 3 纵深防御测试
+// ---------------------------------------------------------------------------
+
+#[test]
+fn nt_query_object_intercepts_type_info() {
+    let mut dbg = MockDebugger::new(400);
+    const OBJECT_TYPE_INFO: u32 = 2;
+
+    let result = handlers::handle_nt_query_object(&mut dbg, 400, OBJECT_TYPE_INFO);
+    assert!(result.is_ok());
+    assert!(result.unwrap(), "should intercept ObjectTypeInformation query");
+}
+
+#[test]
+fn nt_query_object_intercepts_name_info() {
+    let mut dbg = MockDebugger::new(401);
+    const OBJECT_NAME_INFO: u32 = 1;
+
+    let result = handlers::handle_nt_query_object(&mut dbg, 401, OBJECT_NAME_INFO);
+    assert!(result.is_ok());
+    assert!(result.unwrap(), "should intercept ObjectNameInformation query");
+}
+
+#[test]
+fn nt_query_object_ignores_other_classes() {
+    let mut dbg = MockDebugger::new(402);
+    const OTHER_INFO_CLASS: u32 = 99;
+
+    let result = handlers::handle_nt_query_object(&mut dbg, 402, OTHER_INFO_CLASS);
+    assert!(result.is_ok());
+    assert!(!result.unwrap(), "should not intercept unknown info class");
+}
+
+#[test]
+fn output_debug_string_ansi_is_intercepted() {
+    let mut dbg = MockDebugger::new(500);
+    let result = handlers::handle_output_debug_string(&mut dbg, 500, false);
+    assert!(result.is_ok(), "should intercept OutputDebugStringA");
+}
+
+#[test]
+fn output_debug_string_wide_is_intercepted() {
+    let mut dbg = MockDebugger::new(501);
+    let result = handlers::handle_output_debug_string(&mut dbg, 501, true);
+    assert!(result.is_ok(), "should intercept OutputDebugStringW");
+}
+
+#[test]
+fn driver_blacklist_contains_common_debuggers() {
+    let blacklist = handlers::DebuggerDriverBlacklist::default();
+    assert!(blacklist.is_blacklisted("PROCEXP152.SYS"));
+    assert!(blacklist.is_blacklisted("procexp152.sys")); // 不区分大小写
+    assert!(blacklist.is_blacklisted("SICE.SYS"));
+    assert!(!blacklist.is_blacklisted("NTDLL.SYS"));
+}
+
+#[test]
+fn driver_blacklist_filters_drivers() {
+    let blacklist = handlers::DebuggerDriverBlacklist::default();
+    let drivers = vec![
+        "NTOSKRNL.EXE".to_string(),
+        "PROCEXP152.SYS".to_string(),
+        "WIN32K.SYS".to_string(),
+        "SICE.SYS".to_string(),
+    ];
+
+    let filtered = blacklist.filter_drivers(drivers);
+    assert_eq!(filtered.len(), 2);
+    assert!(filtered.contains(&"NTOSKRNL.EXE".to_string()));
+    assert!(filtered.contains(&"WIN32K.SYS".to_string()));
+    assert!(!filtered.contains(&"PROCEXP152.SYS".to_string()));
+    assert!(!filtered.contains(&"SICE.SYS".to_string()));
+}

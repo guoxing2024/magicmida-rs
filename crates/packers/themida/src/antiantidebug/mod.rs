@@ -43,8 +43,8 @@ pub mod timings;
 // Re-export the public API so `crate::antiantidebug::*` works unchanged.
 pub use handlers::{
     handle_check_remote_debugger_present, handle_nt_query_information_process,
-    handle_nt_set_information_thread, handle_query_performance_counter, handle_rdtsc,
-    TimingProbeState,
+    handle_nt_query_object, handle_nt_set_information_thread, handle_output_debug_string,
+    handle_query_performance_counter, handle_rdtsc, DebuggerDriverBlacklist, TimingProbeState,
 };
 pub use scyllahide::{inject_scylla_hide, ScyllaHideConfig};
 

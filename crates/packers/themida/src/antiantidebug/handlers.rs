@@ -600,3 +600,173 @@ pub fn handle_query_performance_counter(
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// WO-1003: Phase 3 纵深防御 (NtQueryObject / OutputDebugString / 驱动名)
+// ---------------------------------------------------------------------------
+
+/// 处理 NtQueryObject 调用拦截
+///
+/// ## 工作原理
+///
+/// NtQueryObject 可以查询对象类型、名称等信息。调试器会创建特殊的
+/// 调试对象，攻击者通过查询对象名称来检测调试器。
+///
+/// ## 对抗策略
+///
+/// 常见的两类查询：
+/// 1. ObjectTypeInformation (2) - 查询对象类型
+/// 2. ObjectNameInformation (1) - 查询对象名称
+///
+/// 我们拦截并返回 STATUS_INVALID_HANDLE 或空名称，使调试对象查询失败。
+///
+/// ## 参数
+///
+/// - `info_class`: ObjectInformationClass 枚举值
+pub fn handle_nt_query_object(
+    debugger: &mut dyn DebuggerCore,
+    thread_id: u32,
+    info_class: u32,
+) -> Result<bool, ThemidaError> {
+    // ObjectTypeInformation = 2, ObjectNameInformation = 1
+    const OBJECT_TYPE_INFO: u32 = 2;
+    const OBJECT_NAME_INFO: u32 = 1;
+
+    if info_class != OBJECT_TYPE_INFO && info_class != OBJECT_NAME_INFO {
+        // 不是我们关心的查询类型，正常执行
+        return Ok(false);
+    }
+
+    // 拦截：跳过调用，返回 STATUS_INVALID_HANDLE
+    let mut ctx = debugger
+        .get_thread_context(thread_id)
+        .map_err(|e| ThemidaError::Debugger(format!("get_thread_context: {e}")))?;
+
+    let sp = ctx_arch::stack_ptr(&ctx);
+    let ret_addr = {
+        let mut buf = [0u8; 8];
+        let _ = debugger.read_memory(sp as usize, &mut buf);
+        u64::from_le_bytes(buf)
+    };
+
+    // NtQueryObject 有 5 个参数：Handle, InfoClass, Info, InfoLen, ReturnLen
+    // 跳过 5 个参数 + 返回地址 (6 * PTR_SIZE)
+    let new_sp = sp + 6 * PTR_SIZE;
+    ctx_arch::set_stack_ptr(&mut ctx, new_sp);
+    ctx_arch::set_instr_ptr(&mut ctx, ret_addr as usize);
+
+    // STATUS_INVALID_HANDLE = 0xC0000008
+    ctx_arch::set_ret_val(&mut ctx, 0xC000_0008u32);
+
+    debugger
+        .set_thread_context(thread_id, &ctx)
+        .map_err(|e| ThemidaError::Debugger(format!("set_thread_context: {e}")))?;
+
+    info!(
+        thread_id,
+        info_class,
+        "Intercepted NtQueryObject and returned STATUS_INVALID_HANDLE"
+    );
+
+    Ok(true)
+}
+
+/// 处理 OutputDebugStringA/W 调用拦截
+///
+/// ## 工作原理
+///
+/// OutputDebugString 会触发调试事件（OUTPUT_DEBUG_STRING_EVENT）。
+/// 如果没有调试器，该调用会被内核忽略；如果有调试器，会产生事件。
+/// 攻击者通过检测是否产生事件来判断调试器存在。
+///
+/// ## 对抗策略
+///
+/// 拦截调用，直接跳过，设置返回值为 void（无返回值），
+/// 使调用"成功"但不产生调试事件。
+///
+/// ## 参数
+///
+/// - `is_wide`: true = OutputDebugStringW (Unicode), false = OutputDebugStringA (ANSI)
+pub fn handle_output_debug_string(
+    debugger: &mut dyn DebuggerCore,
+    thread_id: u32,
+    is_wide: bool,
+) -> Result<(), ThemidaError> {
+    let mut ctx = debugger
+        .get_thread_context(thread_id)
+        .map_err(|e| ThemidaError::Debugger(format!("get_thread_context: {e}")))?;
+
+    let sp = ctx_arch::stack_ptr(&ctx);
+    let ret_addr = {
+        let mut buf = [0u8; 8];
+        let _ = debugger.read_memory(sp as usize, &mut buf);
+        u64::from_le_bytes(buf)
+    };
+
+    // OutputDebugString 有 1 个参数：lpOutputString
+    // 跳过 1 个参数 + 返回地址 (2 * PTR_SIZE)
+    let new_sp = sp + 2 * PTR_SIZE;
+    ctx_arch::set_stack_ptr(&mut ctx, new_sp);
+    ctx_arch::set_instr_ptr(&mut ctx, ret_addr as usize);
+    // void 函数，不需要设置返回值
+
+    debugger
+        .set_thread_context(thread_id, &ctx)
+        .map_err(|e| ThemidaError::Debugger(format!("set_thread_context: {e}")))?;
+
+    trace!(
+        thread_id,
+        is_wide,
+        "Intercepted OutputDebugString and skipped"
+    );
+
+    Ok(())
+}
+
+/// 驱动名枚举对抗状态
+///
+/// ## 工作原理
+///
+/// 一些调试器（如 OllyDbg、x64dbg）会加载特定的驱动程序。
+/// 攻击者通过枚举已加载的驱动来检测这些驱动名称。
+///
+/// ## 对抗策略
+///
+/// 我们不直接拦截驱动枚举（过于底层），而是提供一个"已知调试器驱动名"
+/// 黑名单。调用者可以在驱动枚举后过滤结果，隐藏黑名单中的驱动。
+///
+/// 这是"应用层对抗"而非"内核层拦截"。
+pub struct DebuggerDriverBlacklist {
+    names: Vec<String>,
+}
+
+impl DebuggerDriverBlacklist {
+    /// 创建默认黑名单（常见调试器驱动）
+    pub fn default() -> Self {
+        Self {
+            names: vec![
+                "PROCEXP152.SYS".to_string(),    // Process Explorer
+                "PROCEXP.SYS".to_string(),
+                "SYSDBG.SYS".to_string(),        // 一些调试器
+                "DBGV.SYS".to_string(),
+                "SYSER.SYS".to_string(),         // Syser Debugger
+                "SICE.SYS".to_string(),          // SoftICE (legacy)
+                "NTICE.SYS".to_string(),
+            ],
+        }
+    }
+
+    /// 检查给定驱动名是否在黑名单中（不区分大小写）
+    pub fn is_blacklisted(&self, driver_name: &str) -> bool {
+        let name_upper = driver_name.to_uppercase();
+        self.names.iter().any(|n| n.to_uppercase() == name_upper)
+    }
+
+    /// 过滤驱动名列表，移除黑名单中的项
+    pub fn filter_drivers(&self, drivers: Vec<String>) -> Vec<String> {
+        drivers
+            .into_iter()
+            .filter(|name| !self.is_blacklisted(name))
+            .collect()
+    }
+}
