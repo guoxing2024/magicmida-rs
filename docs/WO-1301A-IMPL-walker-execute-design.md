@@ -1,4 +1,4 @@
-﻿# WO-1301A-IMPL：WalkerExecute 实施设计（返工版 R1，WO-1401-R1）
+# WO-1301A-IMPL：WalkerExecute 实施设计（返工版 R1，WO-1401-R1）
 
 **工单编号**: WO-1401-R1（WO-1301A-IMPL 返工）
 **优先级**: P0
@@ -178,8 +178,14 @@ controller 读取时：先校验 `magic`/`version`，确认 `completed_flag==1`�
    两条路都不回到 walker 的常规指令流。
 
 **本版采用闭环模型：每个探针在 target 内通过"受保护读取"原语执行；walker VEH 只观测不截断
-（CONTINUE_SEARCH 交回保护器链），保护器未处理时由探针循环的 SEH 收口帧跳转恢复桩，
+（CONTINUE_SEARCH 交回保护器链），保护器未处理时由探针循环的 SEH 收口帧完成收口，
 把"异常已发生 + 分类"写入状态槽/TLS 并返回 walker 探针循环。**
+
+> **机制唯一性（WO-1702 冻结）**：SEH 收口帧的唯一实现机制是 **MSVC x64 C __try/__except
+> shim（probe_shim.c，见 docs/WO-1702-seh-probe-shim-contract.md）**。本 §3 不再保留
+> RtlInstallFunctionTableCallback / 内联汇编 / "等价 FFI 边界" 等候选；伪结构内的
+> unimplemented!() 已删除。探针 ABI 读取宽度恒为 16 字节（probe_span == 16 冻结，§3.3.1）。
+
 任何 guard/AV 都不允许 CONTINUE_SEARCH 泄漏到未处理路径，因为未处理路径 = 进程终止 =
 walker 永久失联。
 
@@ -215,49 +221,54 @@ walker 一旦对探针 fault 直接 CONTINUE_EXECUTION 跳恢复桩，保护器 
 
 **本版选定唯一顺序：保护器 VEH 先于 walker 获得异常。**
 
-- walker 用 AddVectoredExceptionHandler(first=0)（默认尾部注册），保证**保护器已有 handler**
+- walker 用 AddVectoredExceptionHandler(First=TRUE)（链首注册），但**只观测、永不处理**（WO-1702 §4.1）
   （保护器进程几乎必然已注册）先被内核调用。
 - walker VEH 对探针 fault 只做**只读观测 + TLS 标记**，然后 EXCEPTION_CONTINUE_SEARCH 交回链；
   绝不直接 CONTINUE_EXECUTION（跳恢复桩由 SEH 收口完成，见 3.3.2）。
 - 若保护器处理该异常（CONTINUE_EXECUTION 完成解密），faulting load 重放成功 → 探针读到明文
   → Type B；walker VEH 要么没被调用，要么只观测到一次 guard。
 - 若保护器未处理（CONTINUE_SEARCH 或保护器根本没有该异常的 handler），异常继续沿链 → 最终
-  落到 walker 的 **SEH 收口帧**（__try/__except 或等价 FFI 边界，见 3.3.2），由 SEH 把控制流
+  落到 walker 的 **SEH 收口帧**（唯一机制：probe_shim.c 的 __try/__except，见 3.3.2 / WO-1702），由 SEH 把控制流
   转回探针循环。**未处理异常路径（进程终止）依然不存在**：walker SEH 帧是探针线程最后的防线。
 
 #### 3.3.1 原语：probe_read（受保护读取）+ 明确的返回槽 ABI
 
-每个探针 = 一次"受保护读取"：从目标 VA 读取 probe_span（16 字节默认）到 walker 本地缓冲区。
-读取指令为单条 x64 load（movups / 两个 mov），其 faulting 指令地址（RIP）是探针循环中唯一
-允许进入异常路径的地址。
+每个探针 = 一次"受保护读取"：从目标 VA 读取 **恒 16 字节**（probe_span == 16 冻结，
+见 WO-1702 §3）到 walker 本地缓冲区。读取由 **MSVC C shim** 内的两条 8 字节 load 完成；
+其 faulting 指令地址（RIP）是探针循环中唯一允许进入异常路径的地址（窗口归属见
+WO-1702 §2.1/§5）。
 
-**ABI 合同（WO-1602 修正，废除 mov al,0 判断）**：
+**ABI 合同（WO-1702 冻结，废除 resume_stub/RIP 改写与 mov al,0 判断）**：
 
 ~~~text
-probe_read(va: rcx, out: rdx, status_slot: r8) -> status in [status_slot]
-  entry:
-    mov rax, [rcx]        ; 可能 fault 的 load 1（16 字节分两条 mov）
-    mov [rdx], rax
-    mov rax, [rcx+8]      ; 可能 fault 的 load 2
-    mov [rdx+8], rax
-    mov dword ptr [r8], 0 ; 成功：向专用状态槽写 0（完整 32 位，非 al）
-    ret
-  resume_stub:            ; SEH 收口帧将 RIP 改到这里
-    mov dword ptr [r8], 1 ; 异常：状态槽写 1
-    ret
+// C shim（probe_shim.c，MSVC __try/__except；WO-1702 §2）
+uint32_t mida_probe_read(const void* va, void* out16, uint32_t* status_slot)
+  __try  { 两条 8 字节 load -> out16 }
+  __except(filter) {
+      guard/AV -> *status_slot = MIDA_PROBE_FAULT
+      其它     -> *status_slot = MIDA_PROBE_ABORT
+  }
+  无异常路径：*status_slot = MIDA_PROBE_OK
+
+// Rust 调用点（探针循环，每候选一次）
+let status = mida_probe_read(va, out16, &mut status_slot);
 ~~~
 
-- **成功/异常判定不使用 RAX**：RAX 是 volatile 且被 load 改写，mov al,0 只清低 8 位；
-  判定一律读专用状态槽 [status_slot]（walker 在探针循环栈上分配，8 字节对齐）。
-- **RIP 修改**：异常路径把 ContextRecord.Rip 改为 resume_stub 地址；resume_stub 立即 ret，
-  回到探针循环，不重放 faulting load（消除无条件 CONTINUE_EXECUTION 死循环）。
+- **成功/异常判定**：专用 32 位状态槽 [status_slot]（探针循环栈上，8 字节对齐）+ 返回值，
+  不使用 RAX；mov al,0 判断已废除。
+- **无 RIP 改写**：__except 块执行后控制流自然从 __try 块之后继续（__leave 语义）；
+  不重放 faulting load，不存在 CONTINUE_EXECUTION 死循环。
 - **volatile 寄存器**：按 Windows x64 ABI，rcx/rdx/r8/r9/r10/r11/rax 为 volatile，探针循环
-  不得在这些寄存器中保存跨 probe_read 调用的状态；状态一律走栈/状态槽。
-- **shadow space**：probe_read 是裸汇编（无自身栈帧），若后续需要调用任何函数必须预留 32 字节
-  shadow space；本设计探针循环纯汇编 + TLS 访问，不调用外部函数，故不需要。
-- **输出缓冲区**：out 指向探针循环栈上的 16 字节缓冲；probe_span < 16 时仅前 probe_span 字节有效。
-
+  不得在这些寄存器中保存跨 mida_probe_read 调用的状态；状态一律走栈/状态槽/TLS。
+- **shadow space**：Rust extern "C" 调用自动提供 32 字节 shadow space（WO-1702 §2.4）。
+- **输出缓冲区**：out16 指向探针循环栈上的 16 字节缓冲；status != OK 时内容无效（不得使用）。
 #### 3.3.2 VEH 回调：观测 + CONTINUE_SEARCH；SEH 帧负责收口
+
+walker VEH 以 **AddVectoredExceptionHandler(First=TRUE)（链首）注册，但只观测、永不处理**
+（WO-1702 §4.1 冻结）：对探针 fault 只写 TLS 标记，一律返回 EXCEPTION_CONTINUE_SEARCH；
+从不返回 EXCEPTION_CONTINUE_EXECUTION、从不吞异常。保护器因此**永远在 walker 之后仍获得
+同一异常**（保护器是否注册、注册先后均不影响其机会）。链首注册仅保证 Type B 可观测性：
+保护器解密前先记录 guard_seen。
 
 ~~~rust
 unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
@@ -266,61 +277,48 @@ unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
     let code = rec.ExceptionCode.0 as u32;
     let rip = ctx.Rip;
 
-    // 归属过滤：只观测"探针线程 + walker active phase + faulting RIP 属于 probe_read"的异常。
-    // 任何非探针线程 / 非 active phase / 非 probe_read RIP 的异常一律 CONTINUE_SEARCH，
+    // 归属过滤：只观测"探针线程 + walker active phase + RIP ∈ probe 窗口"的异常。
+    // 任何非探针线程 / 非 active phase / RIP 不在窗口的异常一律 CONTINUE_SEARCH，
     // 不触碰、不吞掉（保护器链和其它 handler 保留完整观测权）。
     if !probe_thread_guard() || !PROBE_TLS.with(|t| t.active.get()) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
-    if !probe_rip_belongs(rip) {
+    if !probe_rip_belongs(rip) {   // RIP ∈ [mida_probe_read, mida_probe_read_end)
         return EXCEPTION_CONTINUE_SEARCH;   // 非本探针的 fault，交回链
     }
 
-    // 只读观测 + 标记，然后交回链（保护器先处理）：
+    // 只读观测 + 标记，然后交回链（保护器随后获得同一异常）：
     match code {
-        STATUS_GUARD_PAGE_VIOLATION => {
-            PROBE_TLS.with(|t| t.guard_seen.set(true));
-        }
-        STATUS_ACCESS_VIOLATION => {
-            PROBE_TLS.with(|t| t.av_seen.set(true));
-        }
-        other => {
-            // 未知/非预期异常：只记录，不在这里收口；控制流交给 SEH 帧裁决。
-            PROBE_TLS.with(|t| t.unknown_code.set(code));
-        }
+        STATUS_GUARD_PAGE_VIOLATION => { PROBE_TLS.with(|t| t.guard_seen.set(true)); }
+        STATUS_ACCESS_VIOLATION => { PROBE_TLS.with(|t| t.av_seen.set(true)); }
+        other => { PROBE_TLS.with(|t| t.unknown_code.set(other)); }
     }
-    EXCEPTION_CONTINUE_SEARCH   // 交回保护器链；收口在 SEH 帧
+    EXCEPTION_CONTINUE_SEARCH   // 收口在 shim 的 __except 帧
 }
 ~~~
 
-**SEH 收口帧（探针循环内的 __try/__except，或等价 FFI 边界）**：
+**SEH 收口帧（唯一机制：MSVC C __try/__except shim，WO-1702 §1.1/§2.2 冻结）**：
 
-~~~rust
-// 伪结构：探针循环包裹在 SEH 帧内；异常到达这里时（保护器未处理）
-// 由 except 块做最终收口。
-fn probe_loop_candidate(va: u64, status_slot: &mut u32) {
-    // 等价于 __try { probe_read(va, out, status_slot) } __except(...) {
-    //     if TLS.unknown_code != 0 -> walker abort (fail-closed)
-    //     else -> *status_slot = 1;  // 收口：guard/AV 观测
-    // }
-    // 实际实现用 Rust 无法直接写 __try/__except，需 C shim 或 ntdll 的
-    // RtlInstallFunctionTableCallback + 自定义 SEH 展开，或最小内联汇编帧。
-    // 本设计只冻结行为合同：
-    //   - 保护器处理后重放成功 -> probe_read 正常返回，status_slot = 0；
-    //   - 保护器未处理 -> SEH 帧捕获，status_slot = 1（或 abort，见未知异常规则）。
-    unimplemented!()  // 实现工单：C shim 或汇编 SEH 帧
-}
-~~~
-
-**未知/非预期异常规则（WO-1602 修正：fail-closed abort，不静默继续）**：
+- 收口帧是 **probe_shim.c 中 mida_probe_read 的 __try/__except 帧**（不是 Rust 代码内的
+  伪结构；Rust 无法直接写 __try/__except，且 catch_unwind 只捕 panic——见 §3.1）。
+- 过滤器对到达本帧的任意异常返回 EXCEPTION_EXECUTE_HANDLER（本帧是探针线程的最后防线）；
+  handler 按异常码分派：guard/AV → status_slot = FAULT；其它码 → status_slot = ABORT。
+- 控制流：__except 块执行后自然回到探针循环（__leave 语义），**无 RIP 改写、无 resume_stub**。
+- walker 在探针循环主路径按状态槽 + TLS 标记分类（WO-1702 §4.2 状态表行 1-8）；
+  ABORT 或 TLS.unknown_code != 0 → walker abort（fail-closed）。
+- 完整 ABI/过滤器/continuation/unwind metadata/生命周期合同见 docs/WO-1702-seh-probe-shim-contract.md。
+**未知/非预期异常规则（WO-1702 §4.2 行 5/6 冻结：fail-closed abort，不静默继续）**：
 
 - VEH 观测到未知异常码（非 guard/AV）→ 写 TLS.unknown_code，CONTINUE_SEARCH；
-- 若保护器也未处理，异常到达 SEH 帧 → except 块检查 TLS.unknown_code != 0 → **walker 立即
-  abort**：写 walker_status=PROBE_ABORTED（或 UNEXPECTED_EXCEPTION），completed_flag=0xDEAD0001，
-  卸载 VEH，返回错误码。未知异常可能是 breakpoint / illegal instruction / stack fault，
-  继续探针没有意义且违反 fail-closed。
-- 若保护器处理了该未知异常（不太可能但允许），探针循环不感知，继续下一候选。
-
+- 若保护器也未处理，异常到达 shim 帧 → handler 写 status_slot = ABORT；探针循环主路径
+  见 status == ABORT 或 TLS.unknown_code != 0 → **walker 立即 abort**：写
+  walker_status=PROBE_ABORTED，completed_flag=0xDEAD0001，卸载 VEH，返回错误码。
+  未知异常可能是 breakpoint / illegal instruction / stack fault，继续探针没有意义
+  且违反 fail-closed。
+- **即使保护器 CONTINUE_EXECUTION 重放成功（行 6）**，只要 TLS.unknown_code != 0 仍 abort：
+  未知异常不因"重放成功"而变为可接受。
+- **TLS 生命周期（WO-1702 §5.2）**：每候选入口清零 guard_seen/av_seen/unknown_code，
+  候选间零状态继承；walker_inner 退出前清空全部字段并卸载 VEH（VehGuard RAII）。
 #### 3.3.3 归属规则（faulting RIP / 线程 / active phase）
 
 | 维度 | 规则 | 理由 |
@@ -330,18 +328,20 @@ fn probe_loop_candidate(va: u64, status_slot: &mut u32) {
 | RIP | 仅 probe_read 的两条 load 地址被视为"探针 fault"；其它 RIP 一律 CONTINUE_SEARCH | 防止把保护器/其它模块的 fault 误判为探针结果 |
 | 嵌套 | VEH 内不触发任何 faulting 操作（TLS 访问是已提交页）；若嵌套异常发生，内核会二次调用 VEH，此时 active 仍为 true 但 RIP 归属失败 → CONTINUE_SEARCH | 嵌套异常沿链走，不重复收口；SEH 帧是最后防线 |
 
-#### 3.3.4 handler 注册与链语义（WO-1602 修正）
+#### 3.3.4 handler 注册与链语义（WO-1702 冻结：链首观测 + 恒 CONTINUE_SEARCH）
 
-- **注册**：AddVectoredExceptionHandler(first=0)，walker VEH 在链尾部。保护器（若注册了 VEH）
-  先于 walker 被调用。
-- **观测不截断**：walker VEH 对探针 fault 只标记 + CONTINUE_SEARCH；对非探针异常一律
-  CONTINUE_SEARCH。walker 从不吞掉任何异常。
-- **收口在 SEH**：保护器未处理时，异常沿链进入探针循环的 SEH 帧；except 块把控制流转回
-  probe 循环（status_slot=1）或 abort（未知异常）。
+- **注册**：AddVectoredExceptionHandler(First=TRUE)，walker VEH 在**链首**，但**只观测、
+  永不处理**（WO-1702 §4.1）。对探针 fault 只写 TLS 标记后一律 CONTINUE_SEARCH；
+  从不 CONTINUE_EXECUTION、从不吞异常。
+- **保护器顺序不受影响**：walker 不截断 ⇒ 保护器（无论注册先后）永远在 walker 之后仍获得
+  同一异常；链首注册仅保证 Type B 可观测性（保护器解密前先记录 guard_seen）。
+- **收口在 SEH**：保护器未处理时，异常沿链进入 probe_shim.c 的 __try/__except 帧
+  （WO-1702 §2.2）；handler 把 status_slot 写为 FAULT（guard/AV）或 ABORT（未知码），
+  控制流自然回到探针循环（__leave 语义）。
 - **为什么这样闭环**：链上只有两种情况——保护器处理（重放成功，Type B）或保护器未处理
-  （SEH 帧收口，Type A/guard/unknown-abort）。不存在"无 handler → 进程终止"，因为 SEH 帧
+  （shim 帧收口，Type A/guard/unknown-abort）。不存在"无 handler → 进程终止"，因为 shim 帧
   是探针线程的最终防线。
-
+- **完整状态表**（8 行）：WO-1702 §4.2。
 #### 3.3.5 卸载与失败语义
 
 - walker_inner 退出前（成功/失败/abort）必须 RemoveVectoredExceptionHandler(handle)，并清 TLS。
@@ -362,45 +362,45 @@ fn probe_loop_candidate(va: u64, status_slot: &mut u32) {
 - **禁止对同一 faulting load 无条件 EXCEPTION_CONTINUE_EXECUTION**（死循环风险，撤回）：
   恢复桩跳过的正是 faulting load，重试是"重新执行 probe_read 的 entry"，不是重放 faulting 指令。
 
-### 3.5 异常控制流总图（闭环证明，WO-1602 修订版）
+### 3.5 异常控制流总图（闭环证明，WO-1702 修订版）
 
 ~~~text
-探针循环 ──probe_read(va, out, status_slot)──► faulting load（可能 fault）
-   ▲                                              │
-   │                                              ├─ 无异常 → status_slot=0 → Type C
-   │                                              └─ CPU 异常 → 内核分发
-   │                                                      │
-   │                                                      ▼
-   │                                            walker VEH（first=0，尾部注册）
-   │                                              │ 归属过滤（线程/phase/RIP）
+探针循环 ──mida_probe_read(va, out16, status_slot)──► C shim 内 16B 读取（可能 fault）
+   ▲                                                        │
+   │                                                        ├─ 无异常 → status_slot=OK → Type C
+   │                                                        └─ CPU 异常 → 内核分发
+   │                                                                │
+   │                                                                ▼
+   │                                            walker VEH（First=TRUE 链首，观测-only）
+   │                                              │ 归属过滤（线程/active/RIP∈窗口）
    │                                              ├─ 非探针异常 → CONTINUE_SEARCH
    │                                              └─ 探针异常 → TLS 标记(guard/AV/unknown)
-   │                                                      │ → CONTINUE_SEARCH
+   │                                                      │ → CONTINUE_SEARCH（不截断）
    │                                                      ▼
-   │                                            保护器 VEH（若有，先于 walker 被调用）
+   │                                            保护器 VEH（walker 之后仍获得同一异常）
    │                                                      │
    │                        ┌─────────────────────────────┴──────────────┐
    │                        │ CONTINUE_EXECUTION（解密）                  │  CONTINUE_SEARCH / 无保护器
    │                        └─────────────────────────────┬──────────────┘          │
    │                              faulting load 重放成功                            ▼
-   │                              → status_slot=0 读到明文 → Type B     探针循环 SEH 收口帧
-   │                                                                      （保护器未处理）
-   │                                                                      ├─ unknown_code!=0
+   │                              → status_slot=OK 读到明文              probe_shim __try/__except 帧
+   │                              → Type B（guard_seen && OK）             （保护器未处理，唯一收口）
+   │                                                                      ├─ unknown_code!=0 或
+   │                                                                      │   status_slot=ABORT
    │                                                                      │   → walker abort
    │                                                                      │     (fail-closed)
    │                                                                      └─ guard/AV
-   │                                                                          → Rip=resume_stub,
-   │                                                                            status_slot=1
-   │                                                                                    │
-   └──────────────────────────────────────────── 探针循环继续 ◄─────────────────────────┘
-                                        （status_slot=1 → 按 TLS 分类 → Type A / guard）
+   │                                                                          → status_slot=FAULT
+   │                                      （__leave 语义：无 RIP 改写，无 resume_stub）
+   └──────────────────────────────────────────── 探针循环继续 ◄─────────────────────────────┘
+                                        （status_slot=FAULT → 按 TLS 标记 → Type A / guard）
 ~~~
 
-**闭环不变量**：active phase 内，探针线程上、probe_read RIP 处的任何异常要么被保护器解密重放
-（Type B），要么经 walker VEH 观测 + SEH 收口帧回到探针循环（Type A/guard），未知异常触发
-fail-closed abort；**不存在"未处理异常 → 进程终止"路径**。非探针线程 / 非探针 RIP / 非 active
-phase 的异常则 100% 交回链（CONTINUE_SEARCH），保护器链观测权完整。
-
+**闭环不变量**：active phase 内，探针线程上、窗口 RIP 处的任何异常要么被保护器解密重放
+（Type B），要么经 walker VEH 观测 + shim __except 帧回到探针循环（Type A/guard），
+未知异常触发 fail-closed abort；**不存在"未处理异常 → 进程终止"路径**。非探针线程 /
+非探针 RIP / 非 active phase 的异常则 100% 交回链（CONTINUE_SEARCH），保护器链观测权完整。
+完整 8 行状态表见 WO-1702 §4.2。
 ## 4. Loader 对位（关闭 #4：删除全部 todo!() 伪闭环）
 
 原设计的 `get_runtime_module_base()` 与 `get_export_rva()` 是 `todo!()` 桩，且**函数不存在于仓库**。
@@ -639,7 +639,7 @@ params blob（`candidate[]`），target 内经 `candidate_off`/`candidate_count`
 | V7 | 2 rounds × 60min 账本（#6） | round 账本字段完整；断言 `auto_retry == false` | 待验证 |
 | V8 | Provenance/Attestation v2 迁移（#7） | v1→v2 兼容测 + v2 round-trip；旧消费者不 panic | 待验证 |
 | V9 | 假说：目标内触碰触发保护器解密 | LIVE-4 Phase 1 PoC（≥3/5 guard 命中，熵<6.0） | 待验证（需 LIVE-4 授权） |
-| V10 | P0-A 闭环：探针 fault 永不落未处理路径 | 受保护读取单测（probe_read + status_slot + resume_stub 跳转）；VEH 观测单测（guard/AV → CONTINUE_SEARCH；unknown → abort）；SEH 收口帧单测；非探针 RIP/线程 → CONTINUE_SEARCH | 待验证 |
+| V10 | P0-A 闭环：探针 fault 永不落未处理路径 | 受保护读取单测（mida_probe_read + status_slot + __except 收口路径）；VEH 观测单测（guard/AV → CONTINUE_SEARCH；unknown → abort）；SEH 收口帧单测；非探针 RIP/线程 → CONTINUE_SEARCH | 待验证 |
 
 ### 9.1 前置门（离线，须先过）
 
