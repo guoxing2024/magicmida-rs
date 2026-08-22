@@ -725,6 +725,60 @@ fn encode_invalid_probe_fields_rejected() {
     ));
 }
 
+/// WO-1801: ProbeResultV2.probe_span is FROZEN to exactly 16; 1/15/17/64
+/// must be rejected by validate() and therefore by encode_section.
+#[test]
+fn probe_result_span_frozen_rejects_non_16() {
+    let cap = 1u32;
+    let section_bytes = 96 + cap as u64 * PROBE_RESULT_BYTES as u64;
+    let ident = make_ident(section_bytes);
+    let mut hdr = ResultSectionHeaderV2::new(section_bytes, cap).unwrap();
+    hdr.result_count = 1;
+    hdr.completed_flag = COMPLETED_FLAG_DONE;
+    for span in [1u16, 15, 17, 64] {
+        let mut r = make_probe(0x1000, CLASSIFICATION_TYPE_C, RESULT_FLAG_NONE, 0, 0);
+        r.set_probe_span(span);
+        let res = encode_section(&ident, &hdr, &[r]);
+        assert!(
+            matches!(res, Err(ProtocolError::BadProbeSpan { .. })),
+            "span {span} must be rejected by encode_section"
+        );
+    }
+    // Span 16 passes and round-trips.
+    let mut r = make_probe(0x1000, CLASSIFICATION_TYPE_C, RESULT_FLAG_NONE, 0, 0);
+    r.set_probe_span(16);
+    let bytes = encode_section(&ident, &hdr, &[r]).unwrap();
+    let (_i, h2, r2) = parse_section(&bytes).unwrap();
+    assert_eq!(h2.result_count, 1);
+    assert_eq!(r2[0].probe_span, 16);
+}
+
+/// WO-1801: hostile wire record with probe_span != 16 is rejected at parse.
+#[test]
+fn probe_result_span_hostile_wire_rejected() {
+    let cap = 1u32;
+    let section_bytes = 96 + cap as u64 * PROBE_RESULT_BYTES as u64;
+    let ident = make_ident(section_bytes);
+    let mut hdr = ResultSectionHeaderV2::new(section_bytes, cap).unwrap();
+    hdr.result_count = 1;
+    hdr.completed_flag = COMPLETED_FLAG_DONE;
+    let r = make_probe(0x1000, CLASSIFICATION_TYPE_C, RESULT_FLAG_NONE, 0, 0);
+    let bytes = encode_section(&ident, &hdr, &[r]).unwrap();
+    // Corrupt the record's probe_span field: record starts at 0x60, span at +14.
+    let span_off = 0x60usize + 14;
+    for span in [1u16, 15, 17, 64] {
+        let mut hostile = bytes.clone();
+        hostile[span_off..span_off + 2].copy_from_slice(&span.to_le_bytes());
+        let res = parse_section(&hostile).and_then(|(i, h, r2)| {
+            validate_section(&i, &h, &r2, &sample_expectation(), cap)
+        });
+        assert!(
+            matches!(res, Err(ProtocolError::BadProbeSpan { .. })),
+            "hostile span {span} must be rejected"
+        );
+    }
+}
+
 /// encode_section never emits a trailing-byte / oversized buffer: the encoded
 /// length is exactly section_bytes and parse_section round-trips it.
 #[test]

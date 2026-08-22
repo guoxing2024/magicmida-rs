@@ -63,12 +63,17 @@ pub const MIN_SECTION_HEADER_BYTES: usize = IDENTITY_HEADER_BYTES + RESULT_HEADE
 /// Fixed per-probe result record size.
 pub const PROBE_RESULT_BYTES: usize = 0x28;
 
-/// Probe span bounds (bytes read per probe).
-pub const MIN_PROBE_SPAN: u16 = 1;
-/// Default probe span (WO-1301A design default).
+/// Probe span (bytes read per probe), FROZEN to exactly 16 (WO-1801).
+///
+/// The probe ABI (docs/WO-1702-seh-probe-shim-contract.md §3) reads exactly
+/// 16 bytes per probe: two 8-byte loads inside the MSVC C shim. The wire
+/// span is therefore a closed singleton set {16}; any other value is
+/// rejected by validate (params) and ProbeResultV2::validate (results).
+pub const MIN_PROBE_SPAN: u16 = 16;
+/// Default probe span (== frozen probe width).
 pub const DEFAULT_PROBE_SPAN: u16 = 16;
-/// Absolute maximum probe span.
-pub const MAX_PROBE_SPAN: u16 = 64;
+/// Absolute maximum probe span (== frozen probe width).
+pub const MAX_PROBE_SPAN: u16 = 16;
 
 /// Maximum candidate count per walker round.
 pub const MAX_CANDIDATE_COUNT: u32 = 4096;
@@ -395,7 +400,7 @@ pub fn derive_session_id(nonce: u64, blob_base_va: u64, candidate_count: u32) ->
 /// 0x1C candidate_count u32 <= 4096
 /// 0x20 candidate_stride u16 8
 /// 0x22 options_flags u16 closed set
-/// 0x24 probe_span u16 [1, 64]
+/// 0x24 probe_span u16 == 16 (frozen, WO-1801)
 /// 0x26 _reserved u16 0
 /// 0x28 result_nonce u64 non-zero (section identity)
 /// 0x30 result_bytes u64 result section size
@@ -636,7 +641,7 @@ impl WalkerParamsV2 {
                 expected: CANDIDATE_STRIDE as u16,
             });
         }
-        if self.probe_span < MIN_PROBE_SPAN || self.probe_span > MAX_PROBE_SPAN {
+        if self.probe_span != DEFAULT_PROBE_SPAN {
             return Err(ProtocolError::BadProbeSpan {
                 got: self.probe_span,
                 min: MIN_PROBE_SPAN,
@@ -1183,7 +1188,7 @@ impl ProbeResultV2 {
         if self.flags & !RESULT_FLAG_KNOWN_MASK != 0 {
             return Err(ProtocolError::UnknownResultFlags { got: self.flags });
         }
-        if self.probe_span < MIN_PROBE_SPAN || self.probe_span > MAX_PROBE_SPAN {
+        if self.probe_span != DEFAULT_PROBE_SPAN {
             return Err(ProtocolError::BadProbeSpan {
                 got: self.probe_span,
                 min: MIN_PROBE_SPAN,

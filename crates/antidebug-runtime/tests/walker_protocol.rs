@@ -1,4 +1,4 @@
-﻿//! WO-1501 walker wire protocol v2 — offline tests (part A: params).
+//! WO-1501 walker wire protocol v2 — offline tests (part A: params).
 //!
 //! These tests run fully offline: no Windows API, no target process.
 //! They verify layout constants, checked encode/decode/validate, fixed
@@ -8,7 +8,7 @@ use mida_antidebug_runtime::walker_protocol::{
     crc32, derive_session_id, is_canonical_user_va, page_span_fits,
     MappingIdentityHeaderV2, ProbeResultV2, ProtocolError, ResultSectionHeaderV2,
     WalkerParamsV2, DEFAULT_PROBE_SPAN, MAX_CANDIDATE_COUNT, MIN_SECTION_HEADER_BYTES,
-    OPTION_NONE, PROBE_RESULT_BYTES,
+    OPTION_NONE, PARAMS_CRC_RANGE_END, PROBE_RESULT_BYTES,
 };
 
 fn sample_nonce() -> u64 {
@@ -127,23 +127,32 @@ fn params_non_canonical_candidate_rejected() {
     assert!(matches!(res, Err(ProtocolError::NonCanonicalVa { .. })));
 }
 
-/// Page-crossing probe spans must be rejected.
+/// Page-crossing probe spans must be rejected (span frozen to 16, so a VA
+/// within 16 bytes of a page end crosses).
 #[test]
 fn params_page_cross_rejected() {
     let p = WalkerParamsV2::new(
         0x0000_0000_0040_0000,
         1,
         OPTION_NONE,
-        32,
+        16,
         sample_nonce(),
         96 + 1 * PROBE_RESULT_BYTES as u64,
     );
-    let cands = vec![0x0000_0000_0001_1FF0];
+    // Page offset 0xFF8: 16 bytes reads [0xFF8, 0x1008) -> crosses the 4KiB page.
+    let cands = vec![0x0000_0000_0001_0FF8];
     let res = p.to_blob_bytes(&cands).and_then(|b| {
         let (d, c) = WalkerParamsV2::from_blob_bytes(&b).unwrap();
         d.validate(&c)
     });
     assert!(matches!(res, Err(ProtocolError::PageCross { .. })));
+    // A VA safely inside the page passes.
+    let cands = vec![0x0000_0000_0001_0FF0];
+    let res = p.to_blob_bytes(&cands).and_then(|b| {
+        let (d, c) = WalkerParamsV2::from_blob_bytes(&b).unwrap();
+        d.validate(&c)
+    });
+    assert!(res.is_ok());
 }
 
 /// Unknown option bits must be rejected.
@@ -320,4 +329,70 @@ fn va_helpers_sane() {
     assert!(!is_canonical_user_va(0xFFFF_8000_0000_0000));
     assert!(page_span_fits(0x0000_0000_0001_0000, 16));
     assert!(!page_span_fits(0x0000_0000_0001_1FF0, 32));
+}
+
+/// WO-1801: probe span is FROZEN to exactly 16. Spans 1/15/17/64 must be
+/// rejected by validate; span 16 must pass. (params side)
+#[test]
+fn params_probe_span_frozen_rejects_non_16() {
+    let cands = sample_candidates();
+    for span in [1u16, 15, 17, 64] {
+        let p = WalkerParamsV2::new(
+            0x0000_0000_0040_0000,
+            cands.len() as u32,
+            OPTION_NONE,
+            span,
+            sample_nonce(),
+            96 + cands.len() as u64 * PROBE_RESULT_BYTES as u64,
+        );
+        let blob = p.to_blob_bytes(&cands).unwrap();
+        let (d, c) = WalkerParamsV2::from_blob_bytes(&blob).unwrap();
+        let res = d.validate(&c);
+        assert!(
+            matches!(res, Err(ProtocolError::BadProbeSpan { .. })),
+            "span {span} must be rejected"
+        );
+    }
+    // Span 16 still passes.
+    let p = WalkerParamsV2::new(
+        0x0000_0000_0040_0000,
+        cands.len() as u32,
+        OPTION_NONE,
+        16,
+        sample_nonce(),
+        96 + cands.len() as u64 * PROBE_RESULT_BYTES as u64,
+    );
+    let blob = p.to_blob_bytes(&cands).unwrap();
+    let (d, c) = WalkerParamsV2::from_blob_bytes(&blob).unwrap();
+    d.validate(&c).unwrap();
+}
+
+/// WO-1801: span 1/15/17/64 rejected at DECODE time too when the wire blob
+/// carries a non-16 span (hostile writer): from_blob_bytes -> validate.
+#[test]
+fn params_probe_span_hostile_wire_rejected() {
+    let cands = sample_candidates();
+    for span in [1u16, 15, 17, 64] {
+        // Build a valid blob then corrupt the span field at 0x24.
+        let p = WalkerParamsV2::new(
+            0x0000_0000_0040_0000,
+            cands.len() as u32,
+            OPTION_NONE,
+            16,
+            sample_nonce(),
+            96 + cands.len() as u64 * PROBE_RESULT_BYTES as u64,
+        );
+        let mut blob = p.to_blob_bytes(&cands).unwrap();
+        blob[0x24..0x26].copy_from_slice(&span.to_le_bytes());
+        // Recompute the header CRC so validate reaches the span check itself.
+        let crc = crc32(&blob[0..PARAMS_CRC_RANGE_END]);
+        blob[0x38..0x3C].copy_from_slice(&crc.to_le_bytes());
+        let r = std::panic::catch_unwind(|| WalkerParamsV2::from_blob_bytes(&blob));
+        assert!(r.is_ok(), "from_blob_bytes panicked on hostile span");
+        let (d, c) = r.unwrap().unwrap();
+        assert!(
+            matches!(d.validate(&c), Err(ProtocolError::BadProbeSpan { .. })),
+            "hostile span {span} must be rejected by validate"
+        );
+    }
 }
