@@ -38,9 +38,14 @@ mod scyllahide;
 
 #[cfg(test)]
 mod tests;
+pub mod timings;
 
 // Re-export the public API so `crate::antiantidebug::*` works unchanged.
-pub use handlers::{handle_nt_query_information_process, handle_nt_set_information_thread};
+pub use handlers::{
+    handle_check_remote_debugger_present, handle_nt_query_information_process,
+    handle_nt_set_information_thread, handle_query_performance_counter, handle_rdtsc,
+    TimingProbeState,
+};
 pub use scyllahide::{inject_scylla_hide, ScyllaHideConfig};
 
 #[cfg(target_arch = "x86")]

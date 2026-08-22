@@ -306,3 +306,297 @@ pub fn handle_nt_query_information_process(
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// WO-1002: CheckRemoteDebuggerPresent (CRDP) counteraction
+// ---------------------------------------------------------------------------
+
+/// Handle a call to `CheckRemoteDebuggerPresent(hProcess, &pbDebuggerPresent)`.
+///
+/// ## What protected code does
+///
+/// A common auxiliary probe: calls CRDP with the current process handle and
+/// a BOOL output pointer; a debugger present makes it write TRUE.
+///
+/// ## How we counteract (forged-false model)
+///
+/// When the debug loop detects execution at the CRDP address, we:
+/// 1. Read the output pointer (2nd stack arg, PTR_SIZE-aligned).
+/// 2. Write FALSE (0) to that output pointer in the target.
+/// 3. Skip the call (ESP past 3 args + ret) and set RAX = STATUS_SUCCESS.
+///
+/// This is the "forged return" model from WO-902 Phase 2 — behaviour-level
+/// parity with the public ScyllaHide technique list, no source reference.
+///
+/// ## Return value
+///
+/// Ok(()) when intercepted and forged; Err otherwise (caller should not
+/// treat a failure as a successful counteraction).
+pub fn handle_check_remote_debugger_present(
+    debugger: &mut dyn DebuggerCore,
+    thread_id: u32,
+    output_ptr: u64,
+) -> Result<(), ThemidaError> {
+    // 1. Forge FALSE into the output pointer (target memory write is part of
+    //    the counteraction contract, allowed by core debugger semantics).
+    let false_val = 0u32.to_le_bytes();
+    let _ = debugger.write_memory(output_ptr as usize, &false_val);
+    // 2. Read the full context to skip the call.
+    let mut ctx = debugger
+        .get_thread_context(thread_id)
+        .map_err(|e| ThemidaError::Debugger(format!("get_thread_context: {e}")))?;
+    let sp = ctx_arch::stack_ptr(&ctx);
+    let ret_addr = {
+        let mut buf = [0u8; 8];
+        let _ = debugger.read_memory(sp as usize, &mut buf);
+        u64::from_le_bytes(buf)
+    };
+    // 3. Skip 3 args + return address (4 * PTR_SIZE), set RAX = 0.
+    let new_sp = sp + 4 * PTR_SIZE;
+    ctx_arch::set_stack_ptr(&mut ctx, new_sp);
+    ctx_arch::set_instr_ptr(&mut ctx, ret_addr as usize);
+    ctx_arch::set_ret_val(&mut ctx, 0u32);
+    debugger
+        .set_thread_context(thread_id, &ctx)
+        .map_err(|e| ThemidaError::Debugger(format!("set_thread_context: {e}")))?;
+    info!(
+        thread_id,
+        output_ptr = format_args!("{output_ptr:#x}"),
+        "Forged CheckRemoteDebuggerPresent (FALSE)"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// WO-1002: Timing probe interception (RDTSC / QueryPerformanceCounter)
+// ---------------------------------------------------------------------------
+
+use super::timings::{classify_probe, masked_delta, ProbeClass};
+
+/// 时序探测状态（每个线程独立跟踪）
+pub struct TimingProbeState {
+    last_tick: u64,
+    consecutive_suspicious: usize,
+    window_open: bool,
+    probes_masked_in_window: usize,
+}
+
+impl TimingProbeState {
+    pub fn new() -> Self {
+        Self {
+            last_tick: 0,
+            consecutive_suspicious: 0,
+            window_open: false,
+            probes_masked_in_window: 0,
+        }
+    }
+
+    /// 处理一次时序探测，返回应该返回给调用者的 tick 值
+    pub fn handle_probe(&mut self, real_tick: u64) -> u64 {
+        // 如果这是第一次探测，直接返回真实值
+        if self.last_tick == 0 {
+            self.last_tick = real_tick;
+            return real_tick;
+        }
+
+        let delta = real_tick.saturating_sub(self.last_tick);
+        let classification = classify_probe(delta);
+
+        match classification {
+            ProbeClass::Suspicious => {
+                self.consecutive_suspicious += 1;
+
+                // 打开或维持补丁窗口
+                if !self.window_open && self.consecutive_suspicious <= super::timings::TIMING_PATCH_WINDOW {
+                    self.window_open = true;
+                    self.probes_masked_in_window = 0;
+                }
+
+                // 在窗口内，返回掩码值
+                if self.window_open && self.probes_masked_in_window < super::timings::TIMING_PATCH_WINDOW {
+                    self.probes_masked_in_window += 1;
+                    let masked = masked_delta(self.probes_masked_in_window - 1);
+                    trace!(
+                        real_tick,
+                        masked,
+                        consecutive = self.consecutive_suspicious,
+                        "Masked suspicious timing probe"
+                    );
+                    // 返回掩码值（累加到上次tick）
+                    let forged = self.last_tick + masked;
+                    self.last_tick = forged;
+                    return forged;
+                } else {
+                    // 窗口已满，关闭窗口，重置状态
+                    self.window_open = false;
+                    self.consecutive_suspicious = 0;
+                    self.probes_masked_in_window = 0;
+                }
+            }
+            ProbeClass::Benign => {
+                // 良性探测，重置可疑计数
+                self.consecutive_suspicious = 0;
+                if self.window_open {
+                    self.window_open = false;
+                    self.probes_masked_in_window = 0;
+                }
+            }
+        }
+
+        // 返回真实值
+        self.last_tick = real_tick;
+        real_tick
+    }
+}
+
+/// 处理 RDTSC 指令拦截
+///
+/// ## 工作原理
+///
+/// RDTSC 返回 CPU 时间戳计数器（EDX:EAX 存储 64 位值）。时序攻击通过
+/// 连续调用 RDTSC 并测量 delta 来检测调试器开销。
+///
+/// ## 对抗策略
+///
+/// 1. 读取真实的 TSC 值
+/// 2. 通过 `TimingProbeState` 分类（可疑/良性）
+/// 3. 如果在补丁窗口内，伪造返回值（掩码 delta）
+/// 4. 写入 EDX:EAX 并继续执行
+///
+/// ## 返回值
+///
+/// Ok(true) = 已拦截并伪造；Ok(false) = 未拦截（正常执行）
+pub fn handle_rdtsc(
+    debugger: &mut dyn DebuggerCore,
+    thread_id: u32,
+    state: &mut TimingProbeState,
+) -> Result<bool, ThemidaError> {
+    // 读取真实 TSC（通过 __rdtsc intrinsic）
+    #[cfg(target_arch = "x86_64")]
+    let real_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+
+    #[cfg(target_arch = "x86")]
+    let real_tsc = unsafe { core::arch::x86::_rdtsc() };
+
+    // 通过状态机决定返回值
+    let returned_tsc = state.handle_probe(real_tsc);
+
+    // 如果返回值被掩码，修改线程上下文
+    if returned_tsc != real_tsc {
+        let mut ctx = debugger
+            .get_thread_context(thread_id)
+            .map_err(|e| ThemidaError::Debugger(format!("get_thread_context: {e}")))?;
+
+        // RDTSC 结果：EDX = 高32位，EAX = 低32位
+        let low = (returned_tsc & 0xFFFF_FFFF) as u32;
+        let high = (returned_tsc >> 32) as u32;
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            ctx.Rax = low as u64;
+            ctx.Rdx = high as u64;
+            // 跳过 RDTSC 指令（2 字节：0x0F 0x31）
+            ctx.Rip += 2;
+        }
+
+        #[cfg(target_arch = "x86")]
+        {
+            ctx.Eax = low;
+            ctx.Edx = high;
+            // 跳过 RDTSC 指令（2 字节）
+            ctx.Eip += 2;
+        }
+
+        debugger
+            .set_thread_context(thread_id, &ctx)
+            .map_err(|e| ThemidaError::Debugger(format!("set_thread_context: {e}")))?;
+
+        trace!(
+            thread_id,
+            real_tsc,
+            returned_tsc,
+            "Intercepted RDTSC and forged result"
+        );
+        return Ok(true);
+    }
+
+    // 未掩码，正常执行
+    Ok(false)
+}
+
+/// 处理 QueryPerformanceCounter 调用拦截
+///
+/// ## 工作原理
+///
+/// QPC 是 Windows 高精度计时 API，原型：
+/// ```c
+/// BOOL QueryPerformanceCounter(LARGE_INTEGER *lpPerformanceCount);
+/// ```
+///
+/// ## 对抗策略
+///
+/// 1. 读取真实的 QPC 值（通过 QueryPerformanceCounter）
+/// 2. 通过 `TimingProbeState` 分类
+/// 3. 如果在补丁窗口内，伪造输出指针的值
+/// 4. 跳过调用，设置返回值为 TRUE
+///
+/// ## 参数
+///
+/// - `output_ptr`: lpPerformanceCount 参数（栈上第一个参数）
+pub fn handle_query_performance_counter(
+    debugger: &mut dyn DebuggerCore,
+    thread_id: u32,
+    output_ptr: u64,
+    state: &mut TimingProbeState,
+) -> Result<(), ThemidaError> {
+    // 读取真实的 QPC 值
+    let real_qpc = {
+        use windows::Win32::System::Performance::QueryPerformanceCounter;
+        let mut counter = 0i64;
+        unsafe {
+            let _ = QueryPerformanceCounter(&mut counter);
+        }
+        counter as u64
+    };
+
+    // 通过状态机决定返回值
+    let returned_qpc = state.handle_probe(real_qpc);
+
+    // 写入（可能掩码的）值到输出指针
+    let qpc_bytes = returned_qpc.to_le_bytes();
+    let _ = debugger.write_memory(output_ptr as usize, &qpc_bytes);
+
+    // 跳过调用，设置返回值为 TRUE (1)
+    let mut ctx = debugger
+        .get_thread_context(thread_id)
+        .map_err(|e| ThemidaError::Debugger(format!("get_thread_context: {e}")))?;
+
+    let sp = ctx_arch::stack_ptr(&ctx);
+    let ret_addr = {
+        let mut buf = [0u8; 8];
+        let _ = debugger.read_memory(sp as usize, &mut buf);
+        u64::from_le_bytes(buf)
+    };
+
+    // 跳过 1 个参数 + 返回地址 (2 * PTR_SIZE)
+    let new_sp = sp + 2 * PTR_SIZE;
+    ctx_arch::set_stack_ptr(&mut ctx, new_sp);
+    ctx_arch::set_instr_ptr(&mut ctx, ret_addr as usize);
+    ctx_arch::set_ret_val(&mut ctx, 1u32); // TRUE
+
+    debugger
+        .set_thread_context(thread_id, &ctx)
+        .map_err(|e| ThemidaError::Debugger(format!("set_thread_context: {e}")))?;
+
+    if returned_qpc != real_qpc {
+        trace!(
+            thread_id,
+            output_ptr = format_args!("{output_ptr:#x}"),
+            real_qpc,
+            returned_qpc,
+            "Intercepted QueryPerformanceCounter and forged result"
+        );
+    }
+
+    Ok(())
+}
