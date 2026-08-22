@@ -130,28 +130,40 @@ runtime 导出数、artifact digest），且"复用"被写成"已支持"。本�
 **冻结方案：独立 versioned entry point（MidaAntidebugInitializeV2）+ 独立参数结构。**
 不修改 MidaAntidebugInitialize 的 ABI；v1 caller 与 v1 blob 完全不变。
 
-1. **新导出（设计意图，待实现）**：
+1. **新导出（WO-2002 修订：显式 params_bytes + self-relative offsets + 7 参 thunk）**：
    ~~~c
-   /* MidaInitParamsV2 — 独立结构，与 v1 无布局依赖 */
+   /* MidaInitParamsV2 — 独立结构；全部引用字段为 **self-relative offsets**
+    * （相对 params blob 基址 = entry 的 params 指针），非绝对指针。
+    * 理由：runtime 只有 *params，没有 controller 的 VirtualAllocEx 知识；
+    * offsets + params_bytes 使"先于解引用验证边界"可执行。 */
    typedef struct MidaInitParamsV2 {
-       /* ---- 与 v1 相同的前 0x30 语义字段（独立拷贝，无偏移复用） ---- */
-       uint32_t target_pid;
-       uint32_t _pad0;
-       uint64_t module_base;
-       const char* profile_id;        /* target-local */
-       const char* profile_digest;    /* target-local */
-       uint64_t expected_hooks;
-       const char* const* expected_surfaces; /* target-local */
-       /* ---- v2 追加字段（0x30 起，总大小 0x48） ---- */
-       uint64_t magic_v2;             /* 见下 endian fixture */
-       const char* expected_runtime_sha256; /* target-local，64 hex + NUL */
-       uint64_t expected_runtime_sha256_len; /* == 64 */
-   } MidaInitParamsV2;  /* size == 0x48 */
+       uint32_t target_pid;                 /* +0x00 */
+       uint32_t _pad0;                      /* +0x04 */
+       uint64_t module_base;                /* +0x08 */
+       uint64_t profile_id_off;             /* +0x10 self-relative */
+       uint64_t profile_digest_off;         /* +0x18 self-relative */
+       uint64_t expected_hooks;             /* +0x20 */
+       uint64_t expected_surfaces_off;      /* +0x28 self-relative（指针数组） */
+       uint64_t magic_v2;                   /* +0x30 "MIDA2P2\0" LE */
+       uint64_t digest_off;                 /* +0x38 self-relative（64 hex + NUL） */
+       uint64_t digest_len;                 /* +0x40 == 64 */
+   } MidaInitParamsV2;                      /* size == 0x48 */
+
+   /* V2 entry：params_bytes = controller 实际分配的 blob 总字节数
+    * （params blob = 结构 + 全部被引用字符串/数组，见 §5.3e envelope）。
+    * runtime 在解引用任何 offset 之前必须验证：
+    *   params != NULL && params_bytes >= 0x48 &&
+    *   0 <= off && off + need <= params_bytes
+    * 7 参签名 → 新增 7 参 thunk 变体（THUNK_CODE_7ARG + ThunkArgs7 9 槽 72B，
+    * 实现工单新增，不改现有 6 参 thunk/ThunkArgs）。 */
    __declspec(dllexport) int32_t MidaAntidebugInitializeV2(
-       const MidaInitParamsV2* params,     /* 有明确类型，size 由结构定义 */
-       uint8_t* out_runtime_sha256, size_t out_runtime_sha256_len,
-       uint8_t* out_attestation_json, size_t out_attestation_len,
-       size_t* out_attestation_written);
+       const MidaInitParamsV2* params,      /* arg0 */
+       uint64_t params_bytes,               /* arg1  blob 总大小（新增） */
+       uint8_t* out_runtime_sha256,         /* arg2 */
+       size_t out_runtime_sha256_len,       /* arg3 */
+       uint8_t* out_attestation_json,       /* arg4 */
+       size_t out_attestation_len,          /* arg5 */
+       size_t* out_attestation_written);    /* arg6（栈上第 7 参） */
    ~~~
 2. **版本协商（安全，无越界）**：
    - v1 caller：调用 MidaAntidebugInitialize（原符号）→ 只读 0x30 范围内的字段；
@@ -274,17 +286,16 @@ const _: () = {
 **endian test vector（实现单测）**：encode/decode 双向断言——读 8 字节 LE 于 0x30 得到
 0x003250324144494D 且字节 == [4D 49 44 41 32 50 32 00]；写同值再读回一致。
 
-### 5.3b V2 指针安全合同（WO-1902 冻结）
+### 5.3b V2 指针安全合同（WO-2002 修订：self-relative offsets + params_bytes）
 
-**target-local 判定**：V2 结构内全部指针（profile_id、profile_digest、expected_surfaces、
-expected_runtime_sha256）必须是 target 进程地址空间内的 VA。运行时判定规则：
-- 指针值必须落在**本 params blob 分配范围内**（controller 在 target 内 VirtualAllocEx
-  分配，blob 基址 + 长度已知）；runtime 在 initialize 时按"blob 范围"检查所有指针，
-  不在范围内 → InvalidArgument（fail-closed）。
-- 检查顺序：先判指针 == 0 → 拒收；再判指针 < blob_base || 指针 >= blob_base + blob_size
-  → 拒收；再判目标区域可读（NUL 扫描 65 字节上限，见下）。
-- **不依赖 ReadProcessMemory/SEH**：所有指针指向的字节在本进程地址空间内
-  （同一 target 进程 = runtime 自身进程），直接解引用；范围检查在解引用前完成。
+**target-local 判定（修订）**：V2 结构内全部引用字段改为 **self-relative offsets**
+（相对 params 指针；§5.3e），不再使用绝对指针。runtime 判定规则（全部先于解引用）：
+- 入口先验证 params != NULL && params_bytes >= 0x48（ShortBlob 拒收）；
+- 对每个 off 字段：off == 0 仅当该字段可选且声明为空（digest_off/surfaces_off 允许
+  0 的场合按 §5.3f 判定）；off != 0 时 off >= 0x48 && off + need <= params_bytes；
+- 目标区域可读性：need 按类型确定（digest = 65 字节、字符串 ≤ 65、数组 = 8×N），
+  在边界证明后直接解引用（同一 target 进程 = runtime 自身进程；无 RPM/SEH 依赖）；
+- 检查顺序：边界 → NUL/长度/hex 校验 → 内容使用；任何失败 → fail-closed 错误码。
 
 **65-byte digest 可读性**：
 - expected_runtime_sha256 指向 64 hex 字符 + 1 NUL = 65 字节区域；
@@ -333,17 +344,19 @@ expected_runtime_sha256）必须是 target 进程地址空间内的 VA。运行�
   WalkerExecute RVA（解析结果）；controller 记录 module_base、rva、解析出的 VA 三项，
   写入 walker 实现工单的证据要求。
 
-**V2 thunk 六参数对位**（复用现有 6 参 thunk）：
+**V2 thunk 七参数对位**（WO-2002：新增 THUNK_CODE_7ARG 变体 + ThunkArgs7 9 槽 72B；
+现有 6 参 thunk 不动）：
 
 | thunk 槽 | 值 |
 |----------|----|
 | fn_ptr | module_base + MidaAntidebugInitializeV2 RVA |
 | arg0 | params_v2_blob_va（target-local） |
-| arg1 | out_runtime_sha256_va |
-| arg2 | 64（out_runtime_sha256_len） |
-| arg3 | out_attestation_json_va |
-| arg4 | ATTESTATION_BUFFER_SIZE |
-| arg5 | out_attestation_written_va |
+| arg1 | params_bytes（blob 总大小；controller 已知 VirtualAllocEx 大小） |
+| arg2 | out_runtime_sha256_va |
+| arg3 | 64（out_runtime_sha256_len） |
+| arg4 | out_attestation_json_va |
+| arg5 | ATTESTATION_BUFFER_SIZE |
+| arg6 | out_attestation_written_va（第 7 参走栈，ABI 规则） |
 | reserved | 0 |
 
 ### 5.3d fallback 门禁（唯一，WO-1902 冻结）
@@ -365,6 +378,66 @@ expected_runtime_sha256）必须是 target 进程地址空间内的 VA。运行�
 - **不存在第三条路径**：不允许"调用 v1 但期望 digest"或"调用 V2 但 len 无效"的混合状态
   （V2 入口任何校验失败即 fail-closed，不降级 v1）。
 
+### 5.3e V2 envelope layout（WO-2002 冻结：blob 自包含，offsets 全部 self-relative）
+
+**envelope = params blob 全部内容**（controller 在 target 内一次性 VirtualAllocEx+WPM）：
+
+| 段 | 相对偏移 | 内容 | 归属 |
+|----|---------|------|------|
+| 0x00 | 0 | MidaInitParamsV2 结构（0x48） | 固定 |
+| 0x48 | 0x48 | profile_id 字符串（NUL 结尾） | 结构内 profile_id_off 指向 |
+| — | 0x48+len1+1 | profile_digest 字符串（NUL 结尾） | profile_digest_off 指向 |
+| — | … | expected_surfaces 字符串各 + NUL | 字符串区 |
+| — | … | expected_surfaces 指针数组（8×N，target-local 绝对地址） | expected_surfaces_off 指向 |
+| — | … | digest 字符串（64 hex + NUL = 65 字节） | digest_off 指向 |
+| 末 | params_bytes | 结束（blob 总大小 = 结构 + 全部区段） | params_bytes 参数 |
+
+**包含关系证明（runtime 侧，先于解引用）**：
+- 对所有 off 字段：off >= 0x48 && off + need <= params_bytes（need 按字段类型：
+  字符串 ≤ 65 字节扫描上限、指针数组 = 8×expected_hooks、digest = 65）；
+- expected_hooks == 0 时 expected_surfaces_off 可省略（=0 合法，但 off==0 时必须
+  与 expected_hooks==0 同时成立，否则拒收）；
+- **integer overflow 规则**：所有 off + need 用 checked_add 计算；溢出 → 拒收（fail-closed）；
+- **page boundary 规则**：跨页允许（runtime 自身进程可读完整已提交 blob）；
+  不适用 probe 的 page-cross 规则（这是本地 params 读取，不是远程探针）；
+- **canonical VA 规则**：envelope 内的**绝对地址**（surface 数组条目）必须是
+  canonical user VA 且非 0；self-relative offsets 无 VA 语义，只做边界检查。
+
+### 5.3f version negotiation（WO-2002 冻结）
+
+- **判定顺序（入口，先于任何字段读取）**：
+  1. params == NULL || params_bytes < 0x48 → 拒收（ShortBlob）；
+  2. 读 params->magic_v2（offset 0x30，8 字节 LE）：
+     - == 0x003250324144494D（"MIDA2P2\0"）→ v2 路径；
+     - == 0 且 params_bytes >= 0x30 且调用方声称 v2 → 拒收（MissingMagic）；
+     - 其它值 → 拒收（UnknownMagic）；
+  3. **未知版本**：magic_v2 匹配但结构有扩展（params_bytes > 0x48 的未知尾部）→
+     允许（envelope 尾部由 params_bytes 界定，扩展区不读取）；若未来 v3 需
+     新 magic + 新 entry（MidaAntidebugInitializeV3），不猜版本。
+- **v1 fallback（不变）**：v1 entry（MidaAntidebugInitialize）只读 0x30 内字段，
+  永不读取 0x30 之后；digest 需求（WO-1902 §5.3d 三条件）时 V2 必选，
+  V2 校验失败**禁止降级 v1**。
+
+### 5.3g 离线拒收矩阵（WO-2002 交付，fixture 逐行断言）
+
+| # | 输入 | 期望 |
+|---|------|------|
+| 1 | params == NULL | ShortBlob 拒收 |
+| 2 | params_bytes < 0x48 | ShortBlob 拒收 |
+| 3 | params_bytes == 0x30（v1 blob 传给 V2 entry） | ShortBlob 拒收 |
+| 4 | magic_v2 == 0（v1 结构经 V2 传入） | MissingMagic 拒收 |
+| 5 | magic_v2 == 0xDEAD | UnknownMagic 拒收 |
+| 6 | 完整 V2 envelope（0x48 + 全部区段） | 通过 |
+| 7 | params_bytes 溢出（u64::MAX） | Overflow 拒收 |
+| 8 | profile_id_off 越界（off + len > params_bytes） | OutOfBounds 拒收 |
+| 9 | digest_off 越界 | OutOfBounds 拒收 |
+| 10 | digest_len != 64 | InvalidArgument 拒收 |
+| 11 | digest 提前 NUL（< 64 字节） | TruncatedDigest 拒收 |
+| 12 | digest 无 NUL（第 65 字节非 0） | BufferOverrun 拒收 |
+| 13 | digest 含大写 hex（如 "AB"） | BadHex 拒收 |
+| 14 | expected_hooks == 0 但 surfaces_off != 0 | InvalidArgument 拒收 |
+| 15 | surface 数组条目非 canonical 或为 0 | NonCanonicalVa 拒收 |
+| 16 | 未知 magic + params_bytes == 0x48 | UnknownMagic 拒收 |
 ### 5.4 controller 复核（fail-closed）
 
 - authority.verify_file（L181）通过 ≠ digest 绑定通过：verify_file 校验 manifest 身份，
