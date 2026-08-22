@@ -20,27 +20,47 @@ pub enum AntidebugMode {
 }
 
 impl AntidebugMode {
-    /// 从环境变量读取配置
+    /// 从环境变量值解析模式（纯函数，可测试）
+    ///
+    /// ## 参数
+    /// - `value`: 环境变量值，None 表示未设置
+    ///
+    /// ## 返回
+    /// - "self" → SelfDeveloped
+    /// - "legacy" / "" / None → Legacy
+    /// - 其他值 → Legacy (fail-safe)
+    pub fn from_env_value(value: Option<&str>) -> Self {
+        match value {
+            Some(val) => match val.to_lowercase().as_str() {
+                "self" => AntidebugMode::SelfDeveloped,
+                "legacy" | "" => AntidebugMode::Legacy,
+                _ => AntidebugMode::Legacy, // fail-safe
+            },
+            None => AntidebugMode::Legacy, // 未设置，默认 legacy
+        }
+    }
+
+    /// 从环境变量读取配置（调用纯函数 from_env_value）
     ///
     /// 读取 `MIDA_ANTIDEBUG_MODE` 环境变量：
     /// - "legacy" 或未设置 → Legacy
     /// - "self" → SelfDeveloped
     /// - 其他值 → Legacy (fail-safe)
     pub fn from_env() -> Self {
-        match std::env::var("MIDA_ANTIDEBUG_MODE") {
-            Ok(val) => match val.to_lowercase().as_str() {
-                "self" => AntidebugMode::SelfDeveloped,
-                "legacy" | "" => AntidebugMode::Legacy,
-                _ => {
-                    tracing::warn!(
-                        value = val,
-                        "Unknown MIDA_ANTIDEBUG_MODE value, defaulting to legacy"
-                    );
-                    AntidebugMode::Legacy
-                }
-            },
-            Err(_) => AntidebugMode::Legacy, // 未设置，默认 legacy
+        let value = std::env::var("MIDA_ANTIDEBUG_MODE").ok();
+        let mode = Self::from_env_value(value.as_deref());
+
+        // 只在非标准值时记录 warning
+        if let Some(val) = value {
+            if val != "self" && val != "legacy" && !val.is_empty() {
+                tracing::warn!(
+                    value = val,
+                    "Unknown MIDA_ANTIDEBUG_MODE value, defaulting to legacy"
+                );
+            }
         }
+
+        mode
     }
 
     /// 转换为 u8（用于原子操作）
@@ -94,44 +114,52 @@ pub fn set_mode(mode: AntidebugMode) {
 mod tests {
     use super::*;
 
+    // 测试纯函数 from_env_value，避免操作真实进程环境变量
+
     #[test]
-    fn mode_from_env_defaults_to_legacy() {
-        // 如果环境变量未设置，应该默认为 Legacy
-        std::env::remove_var("MIDA_ANTIDEBUG_MODE");
-        let mode = AntidebugMode::from_env();
+    fn from_env_value_none_defaults_to_legacy() {
+        let mode = AntidebugMode::from_env_value(None);
         assert_eq!(mode, AntidebugMode::Legacy);
     }
 
     #[test]
-    fn mode_from_env_recognizes_self() {
-        std::env::set_var("MIDA_ANTIDEBUG_MODE", "self");
-        let mode = AntidebugMode::from_env();
+    fn from_env_value_recognizes_self() {
+        let mode = AntidebugMode::from_env_value(Some("self"));
         assert_eq!(mode, AntidebugMode::SelfDeveloped);
-        std::env::remove_var("MIDA_ANTIDEBUG_MODE");
     }
 
     #[test]
-    fn mode_from_env_recognizes_legacy() {
-        std::env::set_var("MIDA_ANTIDEBUG_MODE", "legacy");
-        let mode = AntidebugMode::from_env();
+    fn from_env_value_recognizes_legacy() {
+        let mode = AntidebugMode::from_env_value(Some("legacy"));
         assert_eq!(mode, AntidebugMode::Legacy);
-        std::env::remove_var("MIDA_ANTIDEBUG_MODE");
     }
 
     #[test]
-    fn mode_from_env_is_case_insensitive() {
-        std::env::set_var("MIDA_ANTIDEBUG_MODE", "SELF");
-        let mode = AntidebugMode::from_env();
-        assert_eq!(mode, AntidebugMode::SelfDeveloped);
-        std::env::remove_var("MIDA_ANTIDEBUG_MODE");
+    fn from_env_value_is_case_insensitive() {
+        assert_eq!(
+            AntidebugMode::from_env_value(Some("SELF")),
+            AntidebugMode::SelfDeveloped
+        );
+        assert_eq!(
+            AntidebugMode::from_env_value(Some("Self")),
+            AntidebugMode::SelfDeveloped
+        );
+        assert_eq!(
+            AntidebugMode::from_env_value(Some("LEGACY")),
+            AntidebugMode::Legacy
+        );
     }
 
     #[test]
-    fn mode_from_env_unknown_defaults_to_legacy() {
-        std::env::set_var("MIDA_ANTIDEBUG_MODE", "unknown");
-        let mode = AntidebugMode::from_env();
+    fn from_env_value_unknown_defaults_to_legacy() {
+        let mode = AntidebugMode::from_env_value(Some("unknown"));
         assert_eq!(mode, AntidebugMode::Legacy);
-        std::env::remove_var("MIDA_ANTIDEBUG_MODE");
+    }
+
+    #[test]
+    fn from_env_value_empty_string_is_legacy() {
+        let mode = AntidebugMode::from_env_value(Some(""));
+        assert_eq!(mode, AntidebugMode::Legacy);
     }
 
     #[test]
@@ -146,10 +174,21 @@ mod tests {
         );
     }
 
+    // 全局状态测试：使用独立测试避免竞态
     #[test]
-    fn global_mode_can_be_changed() {
-        initialize_mode(); // 初始化为默认值
-        let initial = current_mode();
+    fn global_mode_initialize_and_read() {
+        // 注意：此测试假设其他测试不会并发修改 GLOBAL_MODE
+        // 如果需要完全隔离，应使用 #[serial] 或单独进程
+        initialize_mode();
+        let mode = current_mode();
+        // 只验证能读取，不假设具体值（取决于环境变量）
+        assert!(mode == AntidebugMode::Legacy || mode == AntidebugMode::SelfDeveloped);
+    }
+
+    #[test]
+    fn global_mode_can_be_set() {
+        // 测试 set_mode 能修改全局状态
+        let before = current_mode();
 
         set_mode(AntidebugMode::SelfDeveloped);
         assert_eq!(current_mode(), AntidebugMode::SelfDeveloped);
@@ -157,7 +196,7 @@ mod tests {
         set_mode(AntidebugMode::Legacy);
         assert_eq!(current_mode(), AntidebugMode::Legacy);
 
-        // 恢复初始状态
-        set_mode(initial);
+        // 恢复原状态
+        set_mode(before);
     }
 }
