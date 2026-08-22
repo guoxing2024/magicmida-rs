@@ -41,8 +41,9 @@ pub use antiantidebug::{
     get_nt_qip_syscall_number, handle_kifast_syscall, install_kifast_syscall_hook,
 };
 pub use antiantidebug::{
-    handle_nt_query_information_process, handle_nt_set_information_thread, inject_scylla_hide,
-    ScyllaHideConfig,
+    activate_antidebug, current_mode, handle_nt_query_information_process,
+    handle_nt_set_information_thread, initialize_mode, inject_scylla_hide, set_mode,
+    AntidebugMode, ScyllaHideConfig,
 };
 pub use binaries::{expected_hook_hash, expected_injector_hash, verify_sha256};
 pub use common::ThemidaState;

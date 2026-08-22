@@ -1,0 +1,95 @@
+diff --git a/crates/packers/themida/src/antiantidebug/mod.rs b/crates/packers/themida/src/antiantidebug/mod.rs
+index d8fca98..12d5eb8 100644
+--- a/crates/packers/themida/src/antiantidebug/mod.rs
++++ b/crates/packers/themida/src/antiantidebug/mod.rs
+@@ -50,6 +50,74 @@ pub use handlers::{
+ };
+ pub use scyllahide::{inject_scylla_hide, ScyllaHideConfig};
+ 
++// ---------------------------------------------------------------------------
++// WO-1005: Dual-track anti-debug activation
++// ---------------------------------------------------------------------------
++
++/// 双轨反调试激活入口
++///
++/// 根据 `current_mode()` 决定激活路径：
++/// - `Legacy` (默认): 调用 ScyllaHide 注入（Oreans 原有行为）
++/// - `SelfDeveloped`: 激活 Phase 1-3 自研处理器栈
++///
++/// ## 设计边界
++///
++/// - Legacy 路径逐字节保持不变（调用 `inject_scylla_hide`）
++/// - Self 路径返回 Ok(())，实际处理器激活由调用者在调试循环中完成
++/// - 默认模式为 Legacy（环境变量未设置或 `MIDA_ANTIDEBUG_MODE=legacy`）
++/// - 回滚开关：运行时可调用 `set_mode(AntidebugMode::Legacy)` 回退
++///
++/// ## 参数
++///
++/// - `pid`: 目标进程 ID
++/// - `config`: ScyllaHide 配置（Legacy 模式使用）
++///
++/// ## 返回
++///
++/// - `Ok(())`: 激活成功
++/// - `Err(ThemidaError)`: Legacy 模式下 ScyllaHide 注入失败
++///
++/// ## 使用示例
++///
++/// ```rust,ignore
++/// // 初始化模式（启动时调用一次）
++/// initialize_mode();
++///
++/// // 双轨激活
++/// activate_antidebug(pid, &scylla_config)?;
++///
++/// // 调试循环中根据 current_mode() 选择处理器
++/// match current_mode() {
++///     AntidebugMode::Legacy => {
++///         // ScyllaHide 已激活，无需额外处理
++///     }
++///     AntidebugMode::SelfDeveloped => {
++///         // 激活 Phase 1-3 处理器
++///         // handle_nt_set_information_thread(...)?;
++///         // handle_check_remote_debugger_present(...)?;
++///         // ...
++///     }
++/// }
++/// ```
++pub fn activate_antidebug(
++    pid: u32,
++    config: &ScyllaHideConfig,
++) -> Result<(), crate::error::ThemidaError> {
++    match current_mode() {
++        AntidebugMode::Legacy => {
++            // Legacy 路径：ScyllaHide 注入（逐字节不变）
++            tracing::info!(pid, mode = "Legacy", "Activating ScyllaHide injection");
++            inject_scylla_hide(pid, config)
++        }
++        AntidebugMode::SelfDeveloped => {
++            // Self 路径：Phase 1-3 处理器栈
++            // 实际激活由调试循环完成，此处仅记录模式
++            tracing::info!(pid, mode = "SelfDeveloped", "Self-developed handlers ready");
++            Ok(())
++        }
++    }
++}
++
+ #[cfg(target_arch = "x86")]
+ pub use kifast::{get_nt_qip_syscall_number, handle_kifast_syscall, install_kifast_syscall_hook};
+ 
+diff --git a/crates/packers/themida/src/lib.rs b/crates/packers/themida/src/lib.rs
+index 7817732..26f73f1 100644
+--- a/crates/packers/themida/src/lib.rs
++++ b/crates/packers/themida/src/lib.rs
+@@ -41,8 +41,9 @@ pub use antiantidebug::{
+     get_nt_qip_syscall_number, handle_kifast_syscall, install_kifast_syscall_hook,
+ };
+ pub use antiantidebug::{
+-    handle_nt_query_information_process, handle_nt_set_information_thread, inject_scylla_hide,
+-    ScyllaHideConfig,
++    activate_antidebug, current_mode, handle_nt_query_information_process,
++    handle_nt_set_information_thread, initialize_mode, inject_scylla_hide, set_mode,
++    AntidebugMode, ScyllaHideConfig,
+ };
+ pub use binaries::{expected_hook_hash, expected_injector_hash, verify_sha256};
+ pub use common::ThemidaState;
