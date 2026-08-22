@@ -221,6 +221,27 @@ The verifier checks schema semantics, object size/hash, forbidden legacy path
 references, and self-certifying language. Dynamic execution remains forbidden
 unless a case explicitly authorizes a fixed digest under an isolated runner.
 
+
+
+## GTO launcher line status (terminal closeout 2026-08-22)
+
+**GTO dump-route: TERMINAL (structural ceiling).** After the LIVE-2/LIVE-3
+quantified experiments (docs/GTO_TERMINAL_CHARACTERIZATION_20260822.md):
+
+- suspected-SecureEngine-class protection performs **execution-driven
+  per-page decryption**: passive waiting (LIVE-2 R2, 60s) and real execution
+  (LIVE-3 R1, 300s) both produced **zero new decrypted pages**;
+- coverage 4.26% constant (16/376 strips are on-disk raw data, not decrypt
+  products), unreadable=0, 60% economic gate missed by 14x;
+- structural argument: per-page lazy decryption implies any independently
+  re-run must touch ciphertext pages => dump-based perfect unpacking is
+  **structurally unreachable**; "the protector owns execution" is the
+  dump-route terminal state.
+
+This is NOT a claim of perfect/universal unpacking — see Release rule below.
+The GTO line remains an experimental research line with honest graded
+wording (suspected-SecureEngine-class, Themida version unverified).
+
 ## Long-term plan
 
 1. Make `gto_launcher` a first-class product path with a dedicated replay and

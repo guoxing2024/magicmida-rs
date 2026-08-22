@@ -150,7 +150,7 @@ snapshots):
 | H4-B OEP entry-chain evidence | TECHNICAL PASS; evidence package PARTIAL (attempt_001 raw log unrecoverable — permanent documented reservation; run2 `81d44e2` authoritative); **FORMAL SIGN-OFF GRANTED-WITH-RESERVATION 2026-08-22 (delegated authority)** | docs/GTO_H4_ABC_FORMAL_SIGNOFF_20260821.md; docs/GTO_COLD_START_HEAP_REBASE_1_H4B_REPORT.md |
 | H4-C TLS directory+evidence | TECHNICAL PASS + 3-layout evidence PASS; Seal-2 verifier PASS (48/48 size+sha, 0 missing, 0 unexpected, self-hash MATCH); **FORMAL SIGN-OFF GRANTED 2026-08-22 (delegated authority; Seal-2 correction_note accepted; no Seal-3 required)** | docs/GTO_H4_ABC_FORMAL_SIGNOFF_20260821.md; docs/GTO_COLD_START_HEAP_REBASE_1_H4C_TLS_DESIGN.md, docs/GTO_COLD_START_HEAP_REBASE_1_H4C_REPORT.md; evidence H4C_tls/ (seal GTO-H4-C-EVIDENCE-SEAL-2); verifier tools/gto_h4c_seal/ |
 | H4-D exception+no-reloc | DESIGN COMPLETE (GTO-H4-D-DESIGN-1); **LIVE RUNS COMPLETED** (H4-D P6 3/3 ASLR layouts via observation channel, no-reloc preserved); **FORMAL PASS granted (owner 行国胜 signed 2026-08-21T05:43:00.962Z; GTO-H4-D-P6-FORMAL-SIGNOFF.json); H5 ADMIN UNLOCK — live matrix NOT authorized** | docs/GTO_COLD_START_HEAP_REBASE_1_H4D_DESIGN.md; evidence H4D_exception_no_reloc/, H4D_P6_corrected_final/, H4D_P6_validation/ |
-| H5 acceptance | **BLOCKED_AT_LOADER_SMOKE; LIVE-2 EXPERIMENTAL ARC COMPLETE** (GTO-H5-LIVE-2 used=2/2 remaining=0: R1 immediate dump = ciphertext + smoke AV 3/3 repro; R2 PostSelfDecrypt 60s passive window = **zero decryption activity, entropy flat 7.426/7.878/7.896 across 360 samples → lazy/per-page EXECUTION-DRIVEN decrypt CONFIRMED, eager bulk decrypt REFUTED**; passive strategies exhausted; next lever = execution-driven coverage, requires new governance) | docs/GTO_H5_LIVE_AUTHORIZATION_2_20260821.md; docs/GTO_H5_LIVE2_R1_REPORT.md, docs/GTO_H5_LIVE2_R2_REPORT.md; evidence H5_LIVE2_R1/, H5_LIVE2_R2/ |
+| H5 acceptance | **TERMINAL (dump-route)** — 结构天花板：suspected-SecureEngine-class 保护 + 执行驱动按页解密 ⇒ dump 式完美脱壳结构性不可达；保护器拥有执行为 dump 路线终态（WO-801）。LIVE-2 used=2/2 (R1 密文+smoke AV 3/3; R2 60s 被动零解密→惰性解密确认)；LIVE-3 used=1/2 remaining=1 **deliberately unspent** (R1 双相: 300s 真实运行零新增解密页, unreadable=0, 覆盖 4.26% 恒定=磁盘态 raw 非解密产物, 60% 门差距 14x)。| docs/GTO_TERMINAL_CHARACTERIZATION_20260822.md; docs/GTO_H5_LIVE3_R1_REPORT.md; docs/GTO_PACKER_ATTRIBUTION_REPORT.md; 前证同左 |
 | H6 Oreans regression | pending | (next) |
 
 ## 9. Non-claims (binding)
@@ -160,4 +160,3 @@ snapshots):
 - NOT reusing prior process state; NOT bypass patches
 - NOT extending Route A–H ledgers; this is a new ledger
 - No push unless separately authorized
-

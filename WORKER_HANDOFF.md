@@ -1007,3 +1007,31 @@ used=2 / cap=2 / remaining=0 (final Route C round; no R3)
 
 - `BLOCKED_AT_LOADER_SMOKE` unchanged; no CLOSED/DELIVERED claims.
 - PostSelfDecrypt implemented as skeleton only; live use requires GTO-H5-LIVE-AUTHORIZATION-2 (owner named sign-off).
+
+---
+
+## L. GTO 线终局条目（WO-803, 2026-08-22）
+
+### 全弧线摘要（r27 → 终局）
+
+- **r27 → Routes A–H → H0–H6**: GTO 冷启动堆重定基主线；H4-A/B/C 三阶段正式签核；H5 停在 loader smoke 墙。
+- **WO-002/102/103**: H5 根因链闭合（.rdata 内容 = 加密区快照）；修复路径设计（路径 d）。
+- **LIVE-2（2/2 轮）**: R1 密文确证 + smoke AV 3/3 复现；R2 60s 被动窗口零解密 → **惰性/按页解密假设成立**。
+- **WO-601**: 壳归因分级 — confirmed 受保护 / suspected-SecureEngine-class / unverified Themida V3。
+- **LIVE-3（1/2 轮）**: R1 双相量化 — 300s 真实运行**零新增解密页**、unreadable=0、覆盖 4.26% 恒定（=磁盘态 raw 非解密产物）、60% 门差距 14x。
+
+### 战略裁决（binding）
+
+- WO-703 ACCEPTED（数据即交付，纪律无瑕疵）。
+- **Round 2 不授予**：三重证据闭合（被动零解密 + 运行零新增页 + 按页惰性 ⇒ 独立重跑必踩密文页）；花最后一轮属好奇心消费，违反 ROI 纪律。LIVE-3 以 **used=1/2, remaining=1 (deliberately unspent)** 终结。
+- **选项 B 收官生效**：终局命题 = suspected-SecureEngine-class 保护 + 执行驱动按页解密 ⇒ **dump 式完美脱壳结构性不可达；保护器拥有执行为 dump 路线终态**（docs/GTO_TERMINAL_CHARACTERIZATION_20260822.md）。
+
+### 重启需新治理声明
+
+- 若未来以新工具/新思路重启 GTO 脱壳：**走新治理授权**，不以 GTO-H5-LIVE-2/3 账本余轮为据（LIVE-3 remaining=1 已刻意保留不花，视为干净的终局记录）。
+- 本条目不改变任何历史治理记录（历史条目仅加编者注，见 WO-802）。
+
+### 编者注（WO-802 措辞分级）
+
+- 全库文档中 "Themida" 断言已按 WO-601 清单分级：**suspected-SecureEngine-class**（具体版本 **unverified**）。
+- 历史治理记录（WORK_ORDERS_BATCH_*.md 等）**不改写**，保留原样。

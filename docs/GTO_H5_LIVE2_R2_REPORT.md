@@ -1,5 +1,9 @@
 # GTO-H5-LIVE-2 Round 2 — PostSelfDecrypt 实弹报告（WO-402）
 
+
+> **编者注（WO-802, 2026-08-22）**: 本文中 "Themida" 均为未经厂商确证的启发式称谓。" 按壳归因结论（docs/GTO_PACKER_ATTRIBUTION_REPORT.md），正确分级为 **suspected-SecureEngine-class**（具体版本 **unverified**）。历史叙事事实不改写，仅断言强度分级。
+
+
 **签发依据**: GTO-H5-LIVE-AUTHORIZATION-2 §三 + WO-402 书面放行（批次 6）
 **账本**: GTO-H5-LIVE-2 · Round 2 · used=2/2 · remaining=0
 **执行**: 唯一 worker · 2026-08-21T19:10Z

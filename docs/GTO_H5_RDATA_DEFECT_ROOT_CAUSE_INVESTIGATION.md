@@ -1,5 +1,9 @@
 # GTO-H5 .rdata 段特性根因调查（WO-002）
 
+
+> **编者注（WO-802, 2026-08-22）**: 本文中 "Themida" 均为未经厂商确证的启发式称谓。" 按壳归因结论（docs/GTO_PACKER_ATTRIBUTION_REPORT.md），正确分级为 **suspected-SecureEngine-class**（具体版本 **unverified**）。历史叙事事实不改写，仅断言强度分级。
+
+
 **依据**: WORK_ORDERS_CORRECTION.md WO-002（手动代码审查，规避安全护栏）  
 **状态**: COMPLETE — 根因链条定位到代码级
 

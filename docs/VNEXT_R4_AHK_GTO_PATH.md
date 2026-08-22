@@ -1,5 +1,9 @@
 # VNEXT-R4 AHK/GTO Path
 
+
+> **编者注（WO-802, 2026-08-22）**: 本文中 "Themida" 均为未经厂商确证的启发式称谓。" 按壳归因结论（docs/GTO_PACKER_ATTRIBUTION_REPORT.md），正确分级为 **suspected-SecureEngine-class**（具体版本 **unverified**）。历史叙事事实不改写，仅断言强度分级。
+
+
 Status: **R4 structural gate CLOSED** (2026-07-23, R4-C) under the
 **narrow** close criteria in this file (identify plugin + experimental live
 R0B + Oreans regression + no auto GTO stages + `validation_summary` VNEXT-R4).
