@@ -7,7 +7,7 @@
 ## 一、新账本命名空间
 
 - Namespace: **`GTO-H5-LIVE-3`**
-- Cap: **2 rounds** · Used: 0 · Remaining: 2(docs-only 设计不耗轮)
+- Cap: **2 rounds** · Used: **1** (Round 1 COMPLETE 2026-08-22, see docs/GTO_H5_LIVE3_R1_REPORT.md) · Remaining: 1
 
 ## 二、Round 1:执行驱动覆盖率测量
 
