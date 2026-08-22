@@ -113,55 +113,92 @@ runtime 导出数、artifact digest），且"复用"被写成"已支持"。本�
    （如 runtime.sha256 或 authority manifest 条目）。
 3. controller 加载前：authority.verify_file(runtime_path)（L181）校验文件身份，
    并计算 digest_controller = sha256(runtime.dll 文件字节)。
-4. controller 将 digest_controller 通过 **MidaInitParams v2 输入通道**（expected_runtime_sha256_ptr/len，见 5.3）下发 target。
+4. controller 将 digest_controller 通过 **MidaAntidebugInitializeV2 输入通道**（expected_runtime_sha256/len，见 5.3）下发 target。
 5. runtime 在 initialize 时把收到的 digest 用于 attestation.runtime_sha256 并经
    out_runtime_sha256 回显（不做自算、不读自身文件）。
 6. controller 校验：attestation.runtime_sha256 == digest_controller；不一致 → 拒收。
 ~~~
 
-### 5.3 MidaInitParams 冲突解决（WO-1703 冻结：版本化扩展，真实 ABI 可达）
+### 5.3 MidaInitParams 冲突解决（WO-1803 冻结：独立 versioned entry，安全协商）
 
-上一版（Batch 16）的"独立内存槽"方案被审计拒绝（P0-1605-1）：真实
-MidaAntidebugInitialize 只有一个 *const MidaInitParams 输入参数，out_runtime_sha256 是
-**输出**缓冲（exports.rs:184-185, 316-320），不是输入通道；runtime 没有任何方式知道
-"独立 slot"在哪里。**禁止再用"分配一个独立内存槽"代替可调用 ABI。**
+上一版（WO-1703）"v1 尾部追加 magic"方案被审计拒绝（P0-1703-1/P0-1703-2）：
+- MidaAntidebugInitialize 只有 *const MidaInitParams 参数、**没有 blob length/size 参数**；
+  v1 caller 只保证 0x30 字节，runtime 读 offset 0x30 之后的 magic 属于**越界读/UB**；
+- 上一版 magic_v2 = 0x4D494441325032 的 little-endian 字节是 32 50 32 41 44 49 4D 00
+  （= "2P2ADIM\0"），不是 ASCII "MIDA2P2\0"，endian 标注错误。
 
-**冻结方案：版本化扩展 MidaInitParams（v1 保持字节兼容，v2 新增 digest 输入通道）。**
+**冻结方案：独立 versioned entry point（MidaAntidebugInitializeV2）+ 独立参数结构。**
+不修改 MidaAntidebugInitialize 的 ABI；v1 caller 与 v1 blob 完全不变。
 
-1. MidaInitParams 拆为 v1（现有 0x30 布局不变）+ v2（v1 字段 + 尾部追加字段）：
-   ~~~text
-   // MidaInitParams v2 = v1 布局（0x30）+ 追加（总大小 0x48）：
-   //   0x30 u64  magic_v2            = 0x4D494441325032 ("MIDA2P2" LE)
-   //   0x38 u64  expected_runtime_sha256_ptr  target-local 指针，指向 64 字节
-   //                                       hex 字符串 + NUL（controller 写入）
-   //   0x40 u64  expected_runtime_sha256_len = 64（固定，hex lowercase）
-   //   0x48 结束
-   // v1 调用方传 0x30 大小的 blob：magic_v2 区不存在 -> 按 v1 路径（digest 占位）。
+1. **新导出（设计意图，待实现）**：
+   ~~~c
+   /* MidaInitParamsV2 — 独立结构，与 v1 无布局依赖 */
+   typedef struct MidaInitParamsV2 {
+       /* ---- 与 v1 相同的前 0x30 语义字段（独立拷贝，无偏移复用） ---- */
+       uint32_t target_pid;
+       uint32_t _pad0;
+       uint64_t module_base;
+       const char* profile_id;        /* target-local */
+       const char* profile_digest;    /* target-local */
+       uint64_t expected_hooks;
+       const char* const* expected_surfaces; /* target-local */
+       /* ---- v2 追加字段（0x30 起，总大小 0x48） ---- */
+       uint64_t magic_v2;             /* 见下 endian fixture */
+       const char* expected_runtime_sha256; /* target-local，64 hex + NUL */
+       uint64_t expected_runtime_sha256_len; /* == 64 */
+   } MidaInitParamsV2;  /* size == 0x48 */
+   __declspec(dllexport) int32_t MidaAntidebugInitializeV2(
+       const MidaInitParamsV2* params,     /* 有明确类型，size 由结构定义 */
+       uint8_t* out_runtime_sha256, size_t out_runtime_sha256_len,
+       uint8_t* out_attestation_json, size_t out_attestation_len,
+       size_t* out_attestation_written);
    ~~~
-2. 判定规则：params blob 大小 >= 0x48 且 magic_v2 == "MIDA2P2" → v2 路径；
-   否则 v1 路径（向后兼容，现有 loader 的 build_init_params_bytes 输出 0x30，行为不变）。
-3. v2 路径下 runtime 必须：
-   - 校验 expected_runtime_sha256_ptr 非空、可读（ReadProcessMemory 之外：target 内
-     直接解引用，指向同一 target 进程地址空间——blob 由 controller 经 VirtualAllocEx +
-     WriteProcessMemory 写入 target，与 params blob 同生命周期）；
-   - 校验 len == 64 且为合法 hex lowercase；否则 InvalidArgument，fail-closed；
+2. **版本协商（安全，无越界）**：
+   - v1 caller：调用 MidaAntidebugInitialize（原符号）→ 只读 0x30 范围内的字段；
+     该函数**永不读取 offset 0x30 之后**——不存在 magic 探测。
+   - v2 caller：调用 MidaAntidebugInitializeV2 → 结构 size 0x48 由类型系统/编译期保证，
+     runtime 在入口校验 params 非空 + 全部 target-local 指针有效后读取全字段。
+   - **未知版本**：不存在 v3 调用路径；若未来需 v3，新增 MidaAntidebugInitializeV3 导出
+     （版本号入符号名，不依赖结构内 magic 猜测）。任何"用 magic 猜版本"的方式禁用。
+   - v1 fallback：loader 无 digest 需求（未启用 walker 绑定）时继续调用 v1 入口，
+     runtime_sha256 保持占位（未绑定状态）；有 digest 需求时调用 V2 入口。
+3. **magic_v2 endian fixture（WO-1803 修正）**：
+   - 目标字节序列（内存布局，little-endian 写入）：4D 49 44 41 32 50 32 00
+     （= ASCII "MIDA2P2\0"，8 字节）。
+   - 对应的 u64 数值 = 0x00_32_50_32_41_44_49_4D（按 LE 字节序解读：
+     最低有效字节在前 → 数值 = 0x003250324144494D）。
+   - **decoder 伪代码**：
+     ~~~text
+     fn read_magic_v2(p: *const u8) -> u64:
+         # 读 8 字节 LE
+         bytes = [p[0], p[1], ..., p[7]]
+         return u64::from_le_bytes(bytes)
+         # 校验：read_magic_v2(ptr) == 0x003250324144494D
+         # 且 bytes 必须 == [0x4D, 0x49, 0x44, 0x41, 0x32, 0x50, 0x32, 0x00]
+     ~~~
+   - **endian test vector**：encode("MIDA2P2\0") 的 LE 字节 = 4D 49 44 41 32 50 32 00；
+     u64 数值 0x003250324144494D；两个方向都必须在实现单测中断言。
+4. v2 路径下 runtime 必须（fail-closed）：
+   - 校验 expected_runtime_sha256 非空且为 target-local（与 profile_id 同模式）；
+   - 校验 expected_runtime_sha256_len == 64 且为合法 hex lowercase；否则 InvalidArgument；
    - 用该值构建 attestation 的 runtime_sha256（替换 adr4-foundation-unbound 占位）；
    - 仍经 out_runtime_sha256 输出回显同一值（输出通道语义不变）。
-4. loader 侧（runtime_loader.rs）：
-   - build_init_params_bytes（L1792）新增 v2 变体 build_init_params_bytes_v2：追加
-     magic_v2 + digest 指针 + len；digest 字符串紧随 blob 尾部（remote_blob_base + off）；
-   - load_and_initialize（L1029）在步骤 0（authority.verify_file，L1040）之后、步骤 4
-     （写 params，L1097）之前计算 digest_controller = sha256(runtime.dll 文件字节)；
-     传入 v2 构造器；步骤 4 后校验 out_runtime_sha256 == digest_controller（fail-closed）。
+5. loader 侧（runtime_loader.rs）：
+   - wanted 列表 += "MidaAntidebugInitializeV2"（与 WalkerExecute 同批）；
+     MidaExports 增加 initialize_v2 字段（5 字段）；
+   - build_init_params_bytes_v2（新函数）构造 0x48 结构 + 尾部 digest 字符串
+     （remote_blob_base + off 指针）；
+   - load_and_initialize 在步骤 0（authority.verify_file，L1040）之后计算
+     digest_controller = sha256(runtime.dll 文件字节)；walker 绑定场景调用 V2 入口，
+     其余场景保持 V1 入口（零行为变化）；步骤 4 后校验 out_runtime_sha256 == digest_controller。
    - 既有 v1 测试 fixture 不变（0x30 路径回归）。
-5. 槽的生命周期：digest 字符串随 params blob 一起 VirtualAllocEx + WriteProcessMemory
-   （同一分配、同生命周期），与 blob 同回收；DLL 卸载前由 wait-before-free 规则保证
-   （远程线程终止后才释放）。权限：PAGE_READWRITE（既有 blob 权限，无新增权限面）。
-   完整性：digest 值本身由 controller 计算并写入，runtime 只读不写；attestation 回显
-   由 controller 复核（§5.4），任何不一致拒收。
-6. target-local 地址语义：digest 指针必须是 target 进程地址空间内的 VA（blob 内相对
-   基址），禁止 controller 侧地址；runtime 侧以 raw pointer 解引用（与 profile_id/
-   profile_digest 同模式）。
+6. 槽的生命周期/权限/完整性：digest 字符串随 params blob 同一 VirtualAllocEx 分配、
+   同生命周期、同回收（wait-before-free 铁律）；权限 PAGE_READWRITE（无新增权限面）；
+   runtime 只读不写；attestation 回显由 controller 复核（§5.4），不一致拒收。
+7. target-local 地址语义：digest 指针必须是 target 进程地址空间内 VA（blob 内相对基址），
+   禁止 controller 侧地址；runtime 以 raw pointer 解引用（与 profile_id/profile_digest 同模式）。
+   可读性/NUL 校验：读取前先按 len==64 检查目标缓冲区边界（64 hex + NUL = 65 字节，
+   分配由 controller 保证）；任何越界/非 hex/非 NUL 结尾 → InvalidArgument，fail-closed。
 ### 5.4 controller 复核（fail-closed）
 
 - authority.verify_file（L181）通过 ≠ digest 绑定通过：verify_file 校验 manifest 身份，
@@ -173,10 +210,10 @@ MidaAntidebugInitialize 只有一个 *const MidaInitParams 输入参数，out_ru
 ## 6. 实现前 checklist（全部通过才可派发实现）
 
 - [ ] runtime 新增 WalkerExecute 导出（catch_unwind 防火墙 + walker_inner）
-- [ ] loader wanted 4 项 + MidaExports 4 字段 + 解析泛化
+- [ ] loader wanted 5 项（+MidaAntidebugInitializeV2 +WalkerExecute）+ MidaExports 5 字段 + 解析泛化
 - [ ] 入口地址 allowlist 断言（== module_base + rva）
 - [ ] thunk 适配（复用 6 参或新增 1 参）
-- [ ] runtime_sha256 真实文件哈希（外部 manifest 权威；MidaInitParams v2 通道下发；替换 adr4-foundation-unbound）
+- [ ] runtime_sha256 真实文件哈希（外部 manifest 权威；MidaAntidebugInitializeV2 通道下发；替换 adr4-foundation-unbound）
 - [ ] controller 侧 digest 复核（attestation.runtime_sha256 == digest_controller == out_runtime_sha256 回显）
 - [ ] resolve_exports_from_buffers 测试补 4 项 wanted 用例
 - [ ] 回归：现有 3 导出解析测试不破坏
