@@ -1,4 +1,4 @@
-# WO-1301A-IMPL：WalkerExecute 实施设计（返工版 R1，WO-1401-R1）
+﻿# WO-1301A-IMPL：WalkerExecute 实施设计（返工版 R1，WO-1401-R1）
 
 **工单编号**: WO-1401-R1（WO-1301A-IMPL 返工）
 **优先级**: P0
@@ -28,7 +28,7 @@
 |---|---------|---------|------|
 | 1 | 跨进程裸指针 | 候选数组改为 target-local mapping + offset/length，全程禁止裸指针跨进程 | §2.4 |
 | 2 | 原始 HANDLE 直传 target | 命名 section + nonce + target 侧 `OpenFileMappingW`，不传 HANDLE 数值 | §2.5 |
-| 3 | `catch_unwind` 捕获 AV 的错误论断 | 撤回；AV/guard 由 VEH 处理，`catch_unwind` 仅作 FFI panic 防火墙 | §3 |
+| 3 | `catch_unwind` 捕获 AV 的错误论断 | 撤回；`catch_unwind` 仅作 FFI panic 防火墙；AV/guard 由闭环 VEH + 恢复桩处理（P0-A） | §3 |
 | 4 | `todo!()` 伪闭环 | 全删；loader 对位复用真实 `resolve_mida_exports_remote`（module_base+RVA） | §4 |
 | 5 | 超时/异常/线程仍运行时 cleanup 缺口 | fail-closed 失败状态机；`TimedOut` 下禁止释放远程可触碰内存 | §5 |
 | 6 | `120min` 单总时限 | 改为 `cap = 2 rounds × 60min`，每轮独立账本，禁止自动重试/无限延长 | §6 |
@@ -71,6 +71,9 @@ WalkerExecute **必须**作为现有 `mida_antidebug_runtime` DLL 的一个 C AB
 ---
 
 ## 2. IPC 协议（关闭 #1 跨进程裸指针、#2 原始 HANDLE 直传）
+
+> **权威合同**：本节的偏移/长度/校验/身份规则以 WO-1501（crates/antidebug-runtime/src/walker_protocol.rs，纯离线实现 + 21 项测试）为可执行权威；本节保留为设计意图叙述。字段布局、上限、CRC 覆盖、mapping identity 回显与拒收规则如有出入，以 WO-1501 为准。
+
 
 ### 2.1 方案选择
 
@@ -160,85 +163,187 @@ controller 读取时：先校验 `magic`/`version`，确认 `completed_flag==1`�
 
 ---
 
-## 3. 异常处理（关闭 #3：撤回 catch_unwind 捕获 AV 的错误论断）
+## 3. 异常处理（关闭 #3 与 P0-A：闭环异常控制流）
 
-### 3.1 明确撤回
+### 3.0 P0-A 闭合要求（本版重写的目标）
 
-原设计声称 `std::panic::catch_unwind(|| read_volatile(ptr))` 能把 `STATUS_ACCESS_VIOLATION` 转成
-`Err`，并以 panic 表示"未恢复的 AV"。**此论断错误，予以撤回**：
+原设计（R1）的 §3.3–§3.4 对 guard/AV 一律 EXCEPTION_CONTINUE_SEARCH 并交给"后续 handler"，
+但**没有定义异常之后控制流如何回到 walker**。这构成 P0-A 阻断：
 
-- Rust 标准库**不会**把 Windows 结构化异常（`STATUS_ACCESS_VIOLATION` = 0xC0000005 /
-  `STATUS_GUARD_PAGE_VIOLATION` = 0x80000001）自动转换为 panic 或 `Result`。
-- `catch_unwind` 只捕获 **Rust panic 的 unwind**；一条 faulting load 触发的是 CPU 异常，
-  经内核分发到 **SEH / VEH**，不经过 Rust 的 panic 机制。默认 `read_volatile` 命中无效页时，
-  未被 SEH/VEH 处理则进程直接崩溃，`catch_unwind` 的 `Ok/Err` 分支根本不会执行到"AV 分支"。
-- 因此"SEH + read_volatile 正确触发保护器 VEH"是**未验证且当前代码模型不成立**的结论，撤回。
+1. 若保护器 VEH 未处理 guard，异常继续走未处理路径，进程终止，walker_inner 永远没有机会读取
+   guard_seen 并重试。
+2. 若真实 AV 无更后置 handler，进程终止；walker_inner 没有机会"跳过该候选"。
+3. "设置 TLS 后由上层决定"不成立：VEH 回调返回后内核要么继续执行 faulting 指令
+   （EXCEPTION_CONTINUE_EXECUTION），要么沿链搜索下一个 handler（EXCEPTION_CONTINUE_SEARCH），
+   两条路都不回到 walker 的常规指令流。
+
+**本版采用闭环模型：每个探针在 target 内通过"受保护读取"原语执行，异常被 VEH 捕获后
+必须无条件 EXCEPTION_CONTINUE_EXECUTION 并跳转到专用恢复桩（probe resume stub），
+由恢复桩把"异常已发生 + 分类"写入 TLS 并返回 walker 探针循环。**
+任何 guard/AV 都不允许 CONTINUE_SEARCH 泄漏到未处理路径，因为未处理路径 = 进程终止 =
+walker 永久失联。
+
+### 3.1 为什么 catch_unwind 不能用于捕获 AV（保留撤回声明）
+
+- Rust 标准库**不会**把 Windows 结构化异常（STATUS_ACCESS_VIOLATION = 0xC0000005 /
+  STATUS_GUARD_PAGE_VIOLATION = 0x80000001）自动转换为 panic 或 Result。
+- catch_unwind 只捕获 Rust panic；faulting load 触发的是 CPU 异常，经内核分发到
+  **SEH / VEH**，不经过 Rust 的 panic 机制。
+- 因此"SEH + read_volatile 正确触发保护器 VEH"是未验证且当前代码模型不成立的结论，撤回。
 
 ### 3.2 catch_unwind 的唯一合法用途：FFI panic 防火墙
 
-保留 `catch_unwind`，但**仅用于**导出边界防止 Rust panic 跨 FFI 展开（UB），与 AV 无关——
-这与现有 `MidaAntidebugInitialize` 一致（`exports.rs:190`，panic → `InternalPanic` 错误码）：
+保留 catch_unwind，但**仅用于**导出边界防止 Rust panic 跨 FFI 展开（UB），与 AV 无关——
+这与现有 MidaAntidebugInitialize 一致（exports.rs:190，panic → InternalPanic 错误码）：
 
-```rust
+~~~rust
 // WalkerExecute 导出边界：catch_unwind 只挡 Rust panic，不挡 CPU 异常
 #[no_mangle]
 pub unsafe extern "C" fn WalkerExecute(params_va: usize) -> u32 {
     std::panic::catch_unwind(|| walker_inner(params_va))
         .unwrap_or(WALKER_ERROR_INTERNAL_PANIC)  // 仅 Rust panic 落这里
 }
-```
+~~~
 
-### 3.3 真实机制：VEH（AddVectoredExceptionHandler）+ 上下文修正
+### 3.3 闭环模型：受保护读取 + VEH 分类 + 恢复桩
 
-target 内探针的异常处理**唯一机制**为 VEH，理由与责任边界：
+#### 3.3.1 原语：probe_read（受保护读取）
 
-1. **谁装 handler**：walker 在 target 内调用 `AddVectoredExceptionHandler(first=1, veh_callback)`，
-   进程级、优先于 SEH 帧展开被调用。**walker 的 VEH 只做分类与决策，不冒充保护器解密。**
-2. **保护器 VEH 的位置**：解密由**保护器自己的 VEH**完成（Route α 假说核心）。walker 的读取触发
-   guard/AV，先经内核分发；若保护器 handler 完成解密并 `EXCEPTION_CONTINUE_EXECUTION`，读取重试即得明文。
-   walker VEH 仅在保护器未处理时兜底分类，**不修改目标内存、不逆向解密算法**。
-3. **handler 顺序 / 链保留**：`AddVectoredExceptionHandler` 返回 handle，`RemoveVectoredExceptionHandler`
-   卸载；walker 装/卸成对，`first=1` 确保早于既有 handler 观测，但**分类为 guard/保护器相关时一律
-   `EXCEPTION_CONTINUE_SEARCH`**，把控制权交回保护器链，绝不截断。
-4. **线程局部状态**：探针地址、guard_triggered 标志、重试计数存 TLS（`#[thread_local]`），
-   避免多线程竞争；walker 探针**单线程串行**执行以简化状态机。
+每个探针 = 一次"受保护读取"：从目标 VA 读取 probe_span（16 字节默认）到 walker 本地缓冲区。
+读取指令为单条 x64 load（movups / 两个 mov），其 **faulting 指令地址（RIP）** 是探针循环中
+唯一允许进入 VEH 的地址。实现形态（target 内，walker 自己编译进 DLL）：
 
-### 3.4 分类与"不可恢复即 abort"规则
+~~~text
+probe_read(va, out):
+  entry:
+    mov rax, [va]          ; 可能 fault 的 load（两条 mov 覆盖 16 字节）
+    mov [out], rax
+    mov rax, [va+8]
+    mov [out+8], rax
+    mov al, 0              ; OK 标志
+    ret
+  resume_stub:             ; 恢复桩（VEH 将 RIP 改到这里）
+    mov al, 1              ; 异常标志
+    ret
+~~~
 
-```rust
+- resume_stub 是 probe_read 的**固定后续地址**；VEH 修改 EXCEPTION_POINTERS.ContextRecord
+  的 Rip 为 resume_stub，并把 Rax 置 1（异常标志）。
+- 恢复桩立即 ret 回到探针循环，**不重放 faulting load**——这正是"禁止无条件
+  CONTINUE_EXECUTION 死循环"的落地方式：恢复桩跳过了 faulting 指令。
+- 探针循环检查 Rax==0（读取成功，Type C 或解密后成功）或 Rax==1（异常，分类在 TLS）。
+
+#### 3.3.2 VEH 回调：只分类 + 跳恢复桩，永不 CONTINUE_SEARCH
+
+~~~rust
 unsafe extern "system" fn veh_callback(info: *mut EXCEPTION_POINTERS) -> i32 {
     let rec = (*(*info).ExceptionRecord);
+    let ctx = (*(*info).ContextRecord);
     let code = rec.ExceptionCode.0 as u32;
+    let rip = ctx.Rip;
+
+    // 归属过滤：只处理"探针线程 + walker active phase + faulting RIP 属于 probe_read"的异常。
+    // 任何非探针线程 / 非 active phase / 非 probe_read RIP 的异常一律 CONTINUE_SEARCH，
+    // 不触碰、不吞掉（保护器链和其它 handler 必须保留完整观测权）。
+    if !probe_thread_guard() || !PROBE_TLS.with(|t| t.active.get()) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    if !probe_rip_belongs(rip) {
+        return EXCEPTION_CONTINUE_SEARCH;   // 非本探针的 fault，交回链
+    }
+
+    // 只有探针自己的 fault 才在这里收口（闭合）：
     match code {
         STATUS_GUARD_PAGE_VIOLATION => {
-            // 保护器可能正在解密；把机会让回保护器链，不自行 CONTINUE_EXECUTION。
             PROBE_TLS.with(|t| t.guard_seen.set(true));
-            EXCEPTION_CONTINUE_SEARCH        // 交回保护器 VEH
+            // 保护器链已经有先于我们的机会处理（first=1 语义见 3.3.4）；
+            // 若保护器选择 CONTINUE_EXECUTION 完成解密，此 VEH 根本不会被调用。
+            // 走到这里 = 保护器未处理 → 收口为"guard 观测"，跳恢复桩继续 walker 循环。
         }
         STATUS_ACCESS_VIOLATION => {
-            // 真实 AV（加密态或无效地址）：记录一次，交回链；由 walker_inner 决定跳过该候选。
             PROBE_TLS.with(|t| t.av_seen.set(true));
-            EXCEPTION_CONTINUE_SEARCH
         }
-        _ => EXCEPTION_CONTINUE_SEARCH,
+        other => {
+            // 未知异常码：记录 + 收口，不泄漏（否则探针线程可能被终止）。
+            PROBE_TLS.with(|t| t.unknown_seen.set(true));
+        }
     }
+    ctx.Rip = resume_stub_addr as u64;
+    ctx.Rax = 1;
+    EXCEPTION_CONTINUE_EXECUTION   // 从恢复桩继续，闭环完成
 }
-```
+~~~
 
-**重试条件（有界）**：同一候选地址，仅当 `guard_seen` 由保护器清除（读取成功）才算解密完成；
-否则每候选**最多重试 1 次**。**不可恢复即 abort 规则**：
+#### 3.3.3 归属规则（faulting RIP / 线程 / active phase）
 
-- 同一 faulting 地址连续 2 次仍为 AV（非 guard）→ 判该候选为 Type A（加密/无效），**跳过**，不再重读。
-- **禁止对同一 faulting load 无条件 `EXCEPTION_CONTINUE_EXECUTION`**（原设计的死循环风险，撤回）。
-- 若 VEH 装载失败、TLS 不可用、或探针线程收到非预期异常码 → walker 立即写 `walker_status=abort`、
-  `completed_flag=0xDEAD0001`，返回错误码，**fail-closed**（§5）。
+| 维度 | 规则 | 理由 |
+|-----|------|------|
+| 线程 | VEH 只在 walker 创建的探针线程上 active；其它线程异常一律 CONTINUE_SEARCH | VEH 是进程级，不过滤会吞掉 target 自身异常 |
+| 阶段 | PROBE_TLS.active 仅在探针循环内为 true；装载/卸载/解析阶段为 false | 防止 walker 自己的普通代码 fault 被误收口 |
+| RIP | 仅 probe_read 的两条 load 地址被视为"探针 fault"；其它 RIP 一律 CONTINUE_SEARCH | 防止把保护器/其它模块的 fault 误判为探针结果 |
+| 嵌套 | VEH 内不触发任何 faulting 操作（TLS 访问是已提交页）；若嵌套异常发生，内核会二次调用 VEH，此时 active 仍为 true 但 RIP 归属失败 → CONTINUE_SEARCH | 嵌套异常沿链走，不重复收口 |
 
-### 3.5 卸载时机
+#### 3.3.4 handler 顺序：先观测、后收口（first=1 的再定义）
 
-walker_inner 退出前（无论成功/失败）必须 `RemoveVectoredExceptionHandler`，并清空 TLS。
-卸载是 RAII（`VehGuard::drop`），panic 路径由 §3.2 的 `catch_unwind` 兜住后仍会析构本地 guard。
+- AddVectoredExceptionHandler(first=1) 使 walker VEH 最先被调用。**但"最先"不代表"吞掉"**：
+  回调里只做**只读观测 + 标记**，然后按 3.3.2 决定收口或交回。
+- 关键时序：如果保护器 VEH 在 walker 之后被调用并 EXCEPTION_CONTINUE_EXECUTION（完成解密），
+  则**探针的 faulting load 会被内核重放成功**，walker VEH 根本不会被调用或在保护器之前观测到
+  一次 guard；探针循环下一次读取即得明文。这与 Route α 假说（读取触发解密）兼容。
+- 若保护器**没有**处理该异常（未继续执行），内核按链继续 → 回到 walker VEH（如果链上只有 walker，
+  即保护器从未安装 VEH，则 walker 是唯一 handler）→ 收口跳恢复桩。**两条路径都闭环**：
+  - 路径 A（保护器解密成功）：faulting load 重放成功 → 探针循环读到明文 → Type B。
+  - 路径 B（保护器未处理）：walker VEH 收口 → 恢复桩返回异常标志 → Type A/guard 记录。
+- **无论哪条路径，异常都不会到达未处理异常路径（进程终止）**，因为 walker VEH 永远在场（active
+  phase 内）且对探针 RIP 收口。
 
----
+#### 3.3.5 卸载与失败语义
+
+- walker_inner 退出前（成功/失败/abort）必须 RemoveVectoredExceptionHandler(handle)，并清 TLS。
+  卸载是 RAII（VehGuard::drop），panic 路径由 §3.2 的 catch_unwind 兜住后仍会析构本地 guard。
+- **handler 卸载失败**（RemoveVectoredExceptionHandler 返回 FALSE）：进程即将退出（walker 线程
+  结束），但为 fail-closed，walker 把 walker_status=VEH_UNLOAD_FAILED（新码，见 §5.3 扩展）写入
+  结果 header，controller 收到后按 abort 处置；**绝不静默忽略卸载失败**。
+- **handler 安装失败**（AddVectoredExceptionHandler 返回 NULL）：探针无法收口 → 直接
+  walker_status=VEH_FAILED，completed_flag=0xDEAD0001，返回错误码，不执行任何探针。
+
+### 3.4 重试与不可恢复判定（有界）
+
+- **guard 重试**：guard_seen=true 时，探针循环等待 1 个保护器处理窗口（50ms）后**重读一次**
+  （最多 1 次）。重读成功 → Type B（解密完成）；仍 guard/AV → Type A。
+- **AV 重试**：同一候选首次 AV → 记录 av_seen，重读一次；仍 AV → Type A，跳过。
+- **不可恢复即 abort**：连续 10 次非 guard AV（跨候选累计）→ 触发 §6.3 止损，
+  walker_status=PROBE_ABORTED，fail-closed。
+- **禁止对同一 faulting load 无条件 EXCEPTION_CONTINUE_EXECUTION**（死循环风险，撤回）：
+  恢复桩跳过的正是 faulting load，重试是"重新执行 probe_read 的 entry"，不是重放 faulting 指令。
+
+### 3.5 异常控制流总图（闭环证明）
+
+~~~text
+探针循环 ──probe_read(va)──► faulting load（可能 fault）
+   ▲                              │
+   │                              ├─ 无异常 → RAX=0 → Type C
+   │                              └─ CPU 异常 → 内核分发
+   │                                      │
+   │                                      ▼
+   │                              保护器 VEH（若有）
+   │                                      │
+   │                        ┌─────────────┴─────────────┐
+   │                        │ CONTINUE_EXECUTION（解密） │  CONTINUE_SEARCH / 无保护器
+   │                        └─────────────┬─────────────┘          │
+   │                              faulting load 重放成功           ▼
+   │                              → 探针循环读到明文 → Type B   walker VEH（探针 RIP 收口）
+   │                                                              │
+   │                                                              ├─ 写 TLS 分类
+   │                                                              └─ Rip=resume_stub, RAX=1
+   │                                                                      │
+   └────────────────────────────── 探针循环继续 ◄─────────────────────────┘
+                                    （RAX=1 → 按 TLS 分类 → guard/AV/unknown）
+~~~
+
+**闭环不变量**：active phase 内，探针线程上、probe_read RIP 处的任何异常要么被保护器解密重放，
+要么被 walker VEH 收口到恢复桩；**不存在"未处理异常 → 进程终止"路径**。非探针线程 / 非探针 RIP /
+非 active phase 的异常则 100% 交回链（CONTINUE_SEARCH），保护器链观测权完整。
 
 ## 4. Loader 对位（关闭 #4：删除全部 todo!() 伪闭环）
 
@@ -333,6 +438,7 @@ WALKER_ERROR_MAP_FAILED      = 2   // OpenFileMappingW/MapViewOfFile 失败
 WALKER_ERROR_VEH_FAILED      = 3   // AddVectoredExceptionHandler 失败
 WALKER_ERROR_PROBE_ABORTED   = 4   // 止损触发（§6.3）
 WALKER_ERROR_INTERNAL_PANIC  = 5   // catch_unwind 捕获 Rust panic（§3.2）
+WALKER_ERROR_VEH_UNLOAD_FAILED = 6 // RemoveVectoredExceptionHandler 失败（§3.3.5）
 ```
 
 ### 5.4 悬挂内存处置（TimedOut / WaitFailed 的核心 fail-closed）
@@ -477,6 +583,7 @@ params blob（`candidate[]`），target 内经 `candidate_off`/`candidate_count`
 | V7 | 2 rounds × 60min 账本（#6） | round 账本字段完整；断言 `auto_retry == false` | 待验证 |
 | V8 | Provenance/Attestation v2 迁移（#7） | v1→v2 兼容测 + v2 round-trip；旧消费者不 panic | 待验证 |
 | V9 | 假说：目标内触碰触发保护器解密 | LIVE-4 Phase 1 PoC（≥3/5 guard 命中，熵<6.0） | 待验证（需 LIVE-4 授权） |
+| V10 | P0-A 闭环：探针 fault 永不落未处理路径 | 受保护读取单测（probe_read + resume_stub 跳转）；VEH 分类单测（guard/AV/unknown → 恢复桩）；非探针 RIP/线程 → CONTINUE_SEARCH | 待验证 |
 
 ### 9.1 前置门（离线，须先过）
 
@@ -511,4 +618,3 @@ params blob（`candidate[]`），target 内经 `candidate_off`/`candidate_count`
 |-----|------|------|
 | v0.1 | 2026-08-22 | 原实施设计（REJECTED，P0-1..P0-4 + P1） |
 | **R1 (WO-1401-R1)** | 2026-08-22 | 关闭 8 项返工要求；全文改设计草案 + 待验证 |
-
