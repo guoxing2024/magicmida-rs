@@ -171,6 +171,30 @@ pub fn decide_dump(
     )
 }
 /// Run a B-phase strip scan of one section (read-only).
+/// Pure decision finalization (WO-702B): extracted from the observation
+/// loop so the F3/dump/stop branches are offline-testable.
+///
+/// Returns (decision, reason, gate_fired). decision in {dump, stop, fail_closed}.
+pub fn finalize_decision(
+    cov: f64,
+    unread: f64,
+    anchors_below: bool,
+    scan_budget_exceeded: bool,
+) -> (String, Option<String>, bool) {
+    if scan_budget_exceeded {
+        // P2 (A-2 spirit): data recorded fully, but over-budget round
+        // must NOT drive a dump decision.
+        return (
+            "fail_closed".into(),
+            Some(format!("F3: B-phase scan exceeded {B_SCAN_BUDGET_SECS}s budget; data recorded, dump decision forbidden")),
+            false,
+        );
+    }
+    let (d, r) = decide_dump(cov, unread, anchors_below);
+    let gate_fired =
+        cov >= DUMP_COVERAGE_GATE && anchors_below && unread <= UNREADABLE_F2_THRESHOLD;
+    (d, r, gate_fired)
+}
 pub fn scan_section(
     debugger: &mut dyn DebuggerCore,
     image_base: u64,
@@ -399,11 +423,26 @@ mod tests {
         let h = shannon_entropy_bits(&buf).unwrap();
         assert!(h > DECRYPTED_ENTROPY_THRESHOLD);
     }
-    // T7 (WO-702A): F3 - over-budget scan forces non-dump decision.
+
+    // T7 (WO-702B): finalize_decision — F3 forces fail_closed; gate fires
+    // on high coverage + anchors; stop on low coverage.
     #[test]
-    fn t7_f3_over_budget_forces_non_dump() {
-        let (d, _) = decide_dump(0.9, 0.01, true);
-        assert_eq!(d, "dump");
+    fn t7_finalize_decision_three_branches() {
+        // budget_exceeded=true -> fail_closed regardless of coverage.
+        let (d1, r1, g1) = finalize_decision(0.9, 0.01, true, true);
+        assert_eq!(d1, "fail_closed", "budget exceeded must fail closed");
+        assert!(r1.unwrap().contains("F3"), "reason must cite F3");
+        assert!(!g1, "gate must not fire on F3");
+
+        // budget=false + high coverage + anchors below -> dump (economic gate).
+        let (d2, _, g2) = finalize_decision(0.9, 0.01, true, false);
+        assert_eq!(d2, "dump", "high coverage + anchors must fire dump");
+        assert!(g2, "gate fired");
+
+        // budget=false + low coverage -> stop (data is the deliverable).
+        let (d3, _, g3) = finalize_decision(0.3, 0.01, true, false);
+        assert_eq!(d3, "stop", "low coverage must stop");
+        assert!(!g3, "gate not fired on low coverage");
     }
 }
 /// Sections scanned in B-phase with (rva, vsize) — real values filled by
@@ -564,7 +603,7 @@ pub fn run_coverage_observation(
         scans.push(scan);
     }
 
-    // Final decision from last scan (P2: budget-exceeded forces non-dump).
+    // Final decision from last scan (WO-702B: via pure finalize_decision).
     let last = scans.last();
     let (decision, reason, gate_fired, final_cov) = if let Some(s) = last {
         let cov = s.coverage.get(".rdata2").copied().unwrap_or(0.0);
@@ -580,22 +619,8 @@ pub fn run_coverage_observation(
                 .map(|a| a.entropy_bits < DECRYPTED_ENTROPY_THRESHOLD)
                 .unwrap_or(false)
         });
-        if scan_budget_exceeded {
-            (
-                "fail_closed".into(),
-                Some(format!("F3: B-phase scan exceeded {B_SCAN_BUDGET_SECS}s budget; data recorded, dump decision forbidden")),
-                false,
-                Some(cov),
-            )
-        } else {
-            let (d, r) = decide_dump(cov, unread, anchors_below);
-            (
-                d,
-                r,
-                cov >= DUMP_COVERAGE_GATE && anchors_below && unread <= UNREADABLE_F2_THRESHOLD,
-                Some(cov),
-            )
-        }
+        let (d, r, g) = finalize_decision(cov, unread, anchors_below, scan_budget_exceeded);
+        (d, r, g, Some(cov))
     } else {
         (
             "fail_closed".into(),
