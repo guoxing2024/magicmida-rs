@@ -62,3 +62,14 @@
 
 ---
 （WO-2103 交付，绑定 381507e）
+## 7. 提交后绑定补充（Batch 21 交付提交）
+
+- Batch 21 交付提交：`301ac70`（docs(gto): WO-2101 TLS ABI single-source + WO-2102 V2 envelope contract (P0)），
+  9 文件 +590/-65。
+- 生产代码（crates/）自 `381507e` 起**零修改**（本提交仅 docs/fixtures），
+  因此 test/check/diffcheck 证据（绑定 381507e 树）对提交后树仍然有效。
+- 提交后 `git diff --check 381507e..301ac70`：EXIT=0（无 whitespace 错误）。
+- 提交后 HEAD：`301ac70df8af9ac60937ce8d1ca12f2040158838`。
+
+---
+（WO-2103 补充，提交后绑定 301ac70 / 证据树 381507e）
