@@ -692,3 +692,76 @@
 ---
 
 （WO-3101 + WO-3102 交付，绑定 9d7010e / 证据树 9d7010e）
+
+
+---
+
+# WO-3101 post-commit 补充 — 最终 HEAD 证据重绑定（ea1ca8d）
+
+**审计运行日期**：2026-08-23（worker 机器，14:26）
+**最终绑定 HEAD**：`ea1ca8dcd15229e111cdbb1739b66e1992205eee`（`ea1ca8d`，Batch 31 交付提交后）
+**性质**：只读证据审计；不修改生产代码；不宣称 commander PASS
+
+## 1. 绑定关系（更新）
+
+| 树 | 绑定 | 证据文件 | 状态 |
+|----|------|---------|------|
+| ...（历史树同 WO-3101 章节） | | | |
+| Batch 31 主交付 | `9d7010e` | evidence_*_3101.txt | 旧树，保留并标注（WO-3101） |
+| **Batch 31 最终树** | `ea1ca8d` | **evidence_*_3101b.txt（本文件）** | **当前有效（干净树生成）** |
+
+## 2. Batch 31 最终范围（git 实测，ea1ca8d 干净树）
+
+- `9d7010e..ea1ca8d`：**1 commit、5 unique paths、+130/-13**（git diff --stat，
+  见 evidence_stat_3101b.txt / evidence_stat_3101b_summary.txt）。
+- crates/ diff lines = 0（生产代码零修改）。
+- **tracked workspace clean 确认**：tracked 修改数 = 0（evidence_workspace_3101b.txt）。
+
+## 3. 最终 HEAD 证据文件清单（绑定 ea1ca8d，干净树生成）
+
+| 文件 | 大小 | SHA-256 | 命令 | 退出码 |
+|------|------|---------|------|--------|
+| D:\Temp\evidence_head_3101b.txt | 42B | ADAB6A57722443CF5739C27BADD3ED71252F54A2F214AEF3CA1454F016F79E50 | git rev-parse HEAD | 0 |
+| D:\Temp\evidence_range_3101b.txt | 210B | B5D552AE82700392FA9E3B8503097018E1D5728DBCC98C510D7B8A8942DAE20F | git log 9d7010e..ea1ca8d | 0 |
+| D:\Temp\evidence_stat_3101b.txt | 246B | 5CDDD2C12112F6072216785EEE28EAFC510ACE6BF7C4289C5B452FE8D41247B1 | git diff --numstat 9d7010e..ea1ca8d | 0 |
+| D:\Temp\evidence_stat_3101b_summary.txt | 375B | E114E25121AC462EFA899CC7B48E1AFF579CE581FCDE8ECB4C2E3BF8E6D0DB44 | git diff --stat 9d7010e..ea1ca8d | 0 |
+| D:\Temp\evidence_names_3101b.txt | 224B | 29CE7921417EE31110EA73677D00E7A33BEA33451F4ABD7DD021D230BC8E0DC4 | git diff --name-only 9d7010e..ea1ca8d | 0 |
+| D:\Temp\evidence_diffcheck_3101b.txt | 0B | E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855 | git diff --check 9d7010e..ea1ca8d | 0 |
+| D:\Temp\evidence_worktree_3101b.txt | 0B | E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855 | git diff --check ea1ca8d（工作树） | 0 |
+| D:\Temp\evidence_workspace_3101b.txt | 1398B | EEBABDE879EA102B2020249A961188869C19021BC25290BD6D252F9F6C49FFB6 | git status --porcelain（tracked 修改数 = 0） | 0 |
+
+**范围统计实测**：
+
+```
+ docs/AUDIT_EVIDENCE_BATCH25_20260823.md          | 121 ++++++++++++++++++++++-
+ docs/AUDIT_PROTOCOL_CALLERS_BATCH25.md           |   6 +-
+ docs/AUDIT_SCHEMA_ACCEPTANCE_BATCH25_20260823.md |   6 +-
+ docs/AUDIT_V2_ARITHMETIC_BATCH25_20260823.md     |   6 +-
+ docs/WO-2601-thunk7-probe-closure_20260823.md    |   4 +-
+ 5 files changed, 130 insertions(+), 13 deletions(-)
+```
+
+## 4. workspace 全量测试证据（carry-forward 关系）
+
+- `evidence_workspace_test_3101.txt`（200846B，SHA `216C146D80EC30A921322DCE6B9C6440C0CBAB35E59D1262D21338C25A822C3A`）：
+  cargo test --workspace --offline 原始 stdout，2026-08-23 14:22:41 → 14:24:22，**执行树 = 9d7010e**，EXIT=0。
+  **carry-forward 说明**：9d7010e..ea1ca8d 仅 docs/fixtures 变更（crates/ 零修改），
+  测试结论对 ea1ca8d 树继续成立（56 个 test result 行全部 ok、0 failed）。
+- `evidence_workspace_check_3101.txt`（673B，SHA `A903AB28...`）：cargo check --workspace --offline，执行树 9d7010e，EXIT=0。
+- **warning 口径（如实保留）**：mida-packers-themida thread_id、antidebug-runtime proc_surfaces unused_mut ×2、
+  mida-cli dump_timing——结论：**tests passed; existing warnings present**（非 zero warnings）。
+
+## 5. 验收门自检（更新）
+
+| 门 | 结果 |
+|----|------|
+| manifest 绑定 ea1ca8d | ✅ head 证据 = ea1ca8dcd15229e111cdbb1739b66e1992205eee |
+| 1 commit / 5 unique paths / +130/-13 | ✅ git 实测（evidence_stat_3101b.txt） |
+| tracked workspace clean | ✅ tracked 修改数 = 0 |
+| workspace 全量测试 carry-forward 明确 | ✅ 执行树 9d7010e，9d7010e..ea1ca8d docs-only，结论 carry-forward |
+| warning 口径如实 | ✅ tests passed; existing warnings present |
+| 不宣称 commander PASS | ✅ BLOCKED 保持 |
+
+---
+
+（WO-3101 post-commit 补充，绑定 ea1ca8d / 证据树 ea1ca8d）
