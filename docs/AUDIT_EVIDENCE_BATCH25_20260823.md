@@ -765,3 +765,61 @@
 ---
 
 （WO-3101 post-commit 补充，绑定 ea1ca8d / 证据树 ea1ca8d）
+
+
+---
+
+# WO-3106 收口补充 — 最终 HEAD（f3f97bd）
+
+**审计运行日期**：2026-08-23（worker 机器，14:27）
+**最终绑定 HEAD**：`f3f97bd70d3deee8f9591c173ee503b6d92b1a3c`（`f3f97bd`，Batch 31 最终 HEAD = WO-3106 一致性收口）
+**性质**：只读证据审计；不修改生产代码；不宣称 commander PASS
+
+## 1. 绑定关系（最终）
+
+| 树 | 绑定 | 证据文件 | 状态 |
+|----|------|---------|------|
+| ...（全部历史树同前章节） | | | |
+| Batch 31 主交付 | `ea1ca8d` | evidence_*_3101b.txt | 旧树，保留并标注 |
+| Batch 31 post-commit | `8a302a1` | （WO-3101b 补充） | 旧提交，保留并标注 |
+| **Batch 31 最终树** | `f3f97bd` | **evidence_*_3101c.txt（本文件）** | **当前有效（干净树生成）** |
+
+## 2. 最终范围（git 实测，f3f97bd 干净树）
+
+- `8a302a1..f3f97bd`：**1 commit、1 unique path、+1/-1**（WO-3106 一致性收口：
+  将 9d7010e 从"当前有效"改为"旧树"，唯一当前有效 = ea1ca8d）。
+- crates/ diff lines = 0。tracked workspace clean（修改数 = 0）。
+
+## 3. 最终 HEAD 证据文件清单（绑定 f3f97bd）
+
+| 文件 | 大小 | SHA-256 | 命令 | 退出码 |
+|------|------|---------|------|--------|
+| D:\Temp\evidence_head_3101c.txt | 42B | 8143119D67EB9A1E6ADF2E01082BA767FD8887451F7549652A314CAFE71E503A | git rev-parse HEAD | 0 |
+| D:\Temp\evidence_range_3101c.txt | 78B | 71D1255FFB55D17ECBBA2F94D00CC3949A55EA1A3B8A0F1A1D0505373D0F6483 | git log 8a302a1..f3f97bd | 0 |
+| D:\Temp\evidence_stat_3101c.txt | 45B | D6E1A91F78B58718ECE2C77D7CF874159668D42E898E49330BE69D34BE1D023B | git diff --numstat 8a302a1..f3f97bd | 0 |
+| D:\Temp\evidence_diffcheck_3101c.txt | 0B | E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855 | git diff --check 8a302a1..f3f97bd | 0 |
+| D:\Temp\evidence_worktree_3101c.txt | 0B | E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855 | git diff --check f3f97bd（工作树） | 0 |
+| D:\Temp\evidence_workspace_3101c.txt | 1398B | EEBABDE879EA102B2020249A961188869C19021BC25290BD6D252F9F6C49FFB6 | git status --porcelain（tracked 修改数 = 0） | 0 |
+
+## 4. workspace 全量测试（carry-forward，最终关系）
+
+- `evidence_workspace_test_3101.txt`（SHA `216C146D...`）：cargo test --workspace --offline，
+  **执行树 = 9d7010e**（2026-08-23 14:22:41 → 14:24:22，EXIT=0，56 行 test result 全 ok、0 failed）。
+- 9d7010e → f3f97bd 全程 docs/fixtures 变更（crates/ 零修改），结论 **carry-forward** 成立。
+- **warning 口径**：tests passed; existing warnings present（mida-packers-themida thread_id、
+  antidebug-runtime proc_surfaces unused_mut ×2、mida-cli dump_timing）——非 zero warnings。
+
+## 5. 验收门自检（最终）
+
+| 门 | 结果 |
+|----|------|
+| manifest 绑定 f3f97bd | ✅ head 证据 = f3f97bd70d3deee8f9591c173ee503b6d92b1a3c |
+| 全部历史树标注旧树 | ✅ 62ed608→639eee3→97d6914→928047f→dea085b→9589fd1→ecd77ae→1e0ebeb→9d7010e→ea1ca8d→8a302a1 全部标注 |
+| tracked workspace clean | ✅ 修改数 = 0 |
+| workspace test carry-forward 明确 | ✅ 执行树 9d7010e，docs-only 后续树 carry-forward |
+| warning 口径如实 | ✅ tests passed; existing warnings present |
+| 不宣称 commander PASS | ✅ BLOCKED 保持 |
+
+---
+
+（WO-3106 收口交付，绑定 f3f97bd / 证据树 f3f97bd）
