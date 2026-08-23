@@ -591,7 +591,7 @@
 |----|------|---------|------|
 | ...（历史树同 WO-3001/3001b 章节） | | | |
 | Batch 30 主交付 | `1e0ebeb` | evidence_*_3001b.txt | 旧树，保留并标注（WO-3001 post-commit） |
-| **Batch 31 最终树** | `9d7010e` | **evidence_*_3101.txt（本文件）** | **当前有效（干净树生成）** |
+| Batch 31 最终树 | `9d7010e` | evidence_*_3101.txt | 当时有效（WO-3101 交付时）；现为旧树，保留并标注（WO-3101b 起当前有效 = ea1ca8d） |
 
 - 生产代码（crates/）自 `62ed608` 起**零修改**；Batch 30 完整范围（ecd77ae..9d7010e）
   = 2 commits、5 unique paths、+202/-12，全部 docs/fixtures。
