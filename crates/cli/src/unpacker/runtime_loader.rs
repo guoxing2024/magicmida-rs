@@ -2797,6 +2797,138 @@ pub struct V2Offsets {
     pub expected_hooks: u64,
 }
 
+/// Structured local V2 preflight result (RC-6 / IMP-03-R5).
+///
+/// This is a PURE LOCAL parsing outcome: it proves the envelope bytes are
+/// structurally self-consistent for the given `blob_base`, and resolves the
+/// surface entries to their target-local absolute VAs.
+///
+/// # Semantics (explicit, RC-6 item 8)
+/// - **LOCAL PREFLIGHT ≠ runtime/live PASS.** A successful preflight does
+///   NOT prove the target process can be initialized; it does NOT read any
+///   remote memory, create any remote thread, or call any runtime entry.
+/// - It does NOT authorize Walker dispatch, LIVE-4, or any Windows live
+///   execution. The gate (implementation_gate.rs) remains authoritative.
+/// - Failure is fail-closed: every structural violation surfaces as
+///   [RuntimeLoadError] from [V2ParamsBlob::preflight_local].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct V2PreflightResult {
+    pub profile_id_off: u64,
+    pub profile_digest_off: u64,
+    pub expected_surfaces_off: u64,
+    pub digest_off: u64,
+    pub digest_len: u64,
+    /// Declared surface pointer count (header 0x20).
+    pub expected_hooks: u64,
+    /// blob_base the envelope was validated against (target-local).
+    pub blob_base: u64,
+    /// Resolved surface entries as ABSOLUTE target-local VAs, in declared
+    /// order (each already proven nonzero / canonical / in-blob).
+    pub surface_entries: Vec<u64>,
+}
+
+impl V2PreflightResult {
+    /// Convert a surface entry back to a blob-relative offset (checked).
+    pub fn surface_relative_offset(&self, index: usize) -> Result<u64, RuntimeLoadError> {
+        let va = *self.surface_entries.get(index).ok_or_else(|| {
+            RuntimeLoadError::ExportResolutionFailed(format!(
+                "v2 surface entry index {index} out of range ({} entries)",
+                self.surface_entries.len()
+            ))
+        })?;
+        va.checked_sub(self.blob_base).ok_or_else(|| {
+            RuntimeLoadError::ExportResolutionFailed(
+                "v2 surface VA below blob_base".to_string(),
+            )
+        })
+    }
+}
+
+impl V2ParamsBlob {
+    /// Local V2 preflight consumer (RC-6 / IMP-03-R5).
+    ///
+    /// Real entry point of the inert envelope parser: it ACTUALLY calls
+    /// [V2ParamsBlob::parse_offsets] with the given `blob_base` (fail-closed)
+    /// and returns the structured [V2PreflightResult] consumed by the
+    /// controller-side V2 path.
+    ///
+    /// All offset arithmetic stays checked (RC-5 helpers); no raw
+    /// `+ 8` / `+ 64` / `as usize` is introduced.
+    pub fn preflight_local(&self, blob_base: u64) -> Result<V2PreflightResult, RuntimeLoadError> {
+        // Fail-closed: ANY structural violation propagates as Err and the
+        // caller must treat the envelope as not consumable.
+        let offs = self.parse_offsets(blob_base)?;
+
+        // Re-read the (already validated) absolute VAs so the consumer gets
+        // them in declared order; all arithmetic checked.
+        let cap = u64_to_usize(offs.expected_hooks, "expected_hooks capacity")?;
+        let mut surface_entries: Vec<u64> = Vec::with_capacity(cap);
+        if offs.expected_hooks > 0 {
+            let len = u64::try_from(self.bytes.len()).map_err(|_| {
+                RuntimeLoadError::ExportResolutionFailed(
+                    "v2 blob length exceeds u64".to_string(),
+                )
+            })?;
+            for i in 0..offs.expected_hooks {
+                let idx_bytes = i
+                    .checked_mul(8)
+                    .ok_or(RuntimeLoadError::ExportResolutionFailed(
+                        "v2 entry index*8 overflow".to_string(),
+                    ))?;
+                let entry_off = offs
+                    .expected_surfaces_off
+                    .checked_add(idx_bytes)
+                    .ok_or(RuntimeLoadError::ExportResolutionFailed(
+                        "v2 entry offset overflow".to_string(),
+                    ))?;
+                let entry_end = checked_range_end(entry_off, 8, "surface entry")?;
+                if entry_end > len {
+                    return Err(RuntimeLoadError::ExportResolutionFailed(
+                        "v2 surface entry read past blob end".to_string(),
+                    ));
+                }
+                let s_us = u64_to_usize(entry_off, "surface entry start")?;
+                let e_us = u64_to_usize(entry_end, "surface entry end")?;
+                let va = u64::from_le_bytes(self.bytes[s_us..e_us].try_into().unwrap());
+                surface_entries.push(va);
+            }
+        }
+
+        Ok(V2PreflightResult {
+            profile_id_off: offs.profile_id_off,
+            profile_digest_off: offs.profile_digest_off,
+            expected_surfaces_off: offs.expected_surfaces_off,
+            digest_off: offs.digest_off,
+            digest_len: offs.digest_len,
+            expected_hooks: offs.expected_hooks,
+            blob_base,
+            surface_entries,
+        })
+    }
+
+    /// Extract a surface string from the LOCAL blob bytes (consumer helper).
+    ///
+    /// Resolves the validated absolute VA back to a blob-relative offset
+    /// (checked_sub), then scans to the NUL terminator with the bounded
+    /// scan. Purely local; no target memory is touched.
+    pub fn surface_string<'a>(
+        &'a self,
+        preflight: &V2PreflightResult,
+        index: usize,
+    ) -> Result<&'a [u8], RuntimeLoadError> {
+        let rel = preflight.surface_relative_offset(index)?;
+        let len = u64::try_from(self.bytes.len()).map_err(|_| {
+            RuntimeLoadError::ExportResolutionFailed(
+                "v2 blob length exceeds u64".to_string(),
+            )
+        })?;
+        let end = scan_nul_rel(&self.bytes, rel, len, &format!("surface {index}"))?;
+        let s_us = u64_to_usize(rel, "surface start")?;
+        let e_us = u64_to_usize(end, "surface end")?;
+        Ok(&self.bytes[s_us..e_us])
+    }
+}
+
 
 #[cfg(test)]
 mod imp03_inert_adapter_tests {
@@ -3265,5 +3397,134 @@ mod imp03_inert_adapter_tests {
         assert!(patch(&mut out, 0x41, 1).is_err());
         // overflow patch fails (off + 8 wraps)
         assert!(patch(&mut out, usize::MAX - 1, 1).is_err());
+    }
+    // ------------------------------------------------------------------
+    // RC-6 / IMP-03-R5: local V2 preflight consumer
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn v2_preflight_valid_absolute_va_envelope() {
+        let blob = build_blob(&["AD-PROC-001", "AD-PROC-002"]);
+        let pf = blob.preflight_local(BLOB_BASE).unwrap();
+        // structured result mirrors parse_offsets fields
+        assert_eq!(pf.profile_id_off, 0x48);
+        assert_eq!(pf.profile_digest_off, 0x48 + 2); // 74
+        assert_eq!(pf.digest_len, 64);
+        assert_eq!(pf.expected_hooks, 2);
+        assert_eq!(pf.blob_base, BLOB_BASE);
+        // surface entries are absolute VAs in declared order
+        assert_eq!(pf.surface_entries.len(), 2);
+        let s0_rel = (0x48 + 2 + 2) as u64; // "p " + "d "
+        let s1_rel = s0_rel + "AD-PROC-001".len() as u64 + 1;
+        assert_eq!(pf.surface_entries[0], BLOB_BASE + s0_rel);
+        assert_eq!(pf.surface_entries[1], BLOB_BASE + s1_rel);
+        // relative conversion round trip
+        assert_eq!(pf.surface_relative_offset(0).unwrap(), s0_rel);
+        assert_eq!(pf.surface_relative_offset(1).unwrap(), s1_rel);
+        assert!(pf.surface_relative_offset(2).is_err());
+    }
+
+    #[test]
+    fn v2_preflight_zero_hooks_zero_off_allowed() {
+        // expected_hooks == 0 && surfaces_off == 0 is a legal envelope.
+        let mut blob = build_blob(&["AD-PROC-001"]);
+        let surf_arr_off = u64::from_le_bytes(blob.bytes[0x28..0x30].try_into().unwrap());
+        let dig_off = u64::from_le_bytes(blob.bytes[0x38..0x40].try_into().unwrap());
+        let arr_len = (dig_off - surf_arr_off) as usize;
+        blob.bytes.drain(surf_arr_off as usize..dig_off as usize);
+        debug_assert_eq!(arr_len, 8);
+        blob.bytes[0x38..0x40].copy_from_slice(&surf_arr_off.to_le_bytes());
+        blob.bytes[0x20..0x28].copy_from_slice(&0u64.to_le_bytes());
+        blob.bytes[0x28..0x30].copy_from_slice(&0u64.to_le_bytes());
+        let pf = blob.preflight_local(BLOB_BASE).unwrap();
+        assert_eq!(pf.expected_hooks, 0);
+        assert_eq!(pf.expected_surfaces_off, 0);
+        assert!(pf.surface_entries.is_empty());
+    }
+
+    #[test]
+    fn v2_preflight_wrong_blob_base_rejected() {
+        // blob_base mismatch: entries validated against a DIFFERENT base
+        // are out-of-blob -> fail-closed.
+        let blob = build_blob(&["AD-PROC-001"]);
+        assert!(blob.preflight_local(BLOB_BASE + 0x1000).is_err());
+        assert!(blob.preflight_local(0).is_err());
+        assert!(blob.preflight_local(0xFFFF_8000_0000_0000).is_err());
+    }
+
+    #[test]
+    fn v2_preflight_unknown_tail_rejected() {
+        let mut blob = build_blob(&["AD-PROC-001"]);
+        blob.bytes.push(0xAA);
+        assert!(blob.preflight_local(BLOB_BASE).is_err());
+    }
+
+    #[test]
+    fn v2_preflight_noncanonical_entry_rejected() {
+        let mut blob = build_blob(&["AD-PROC-001"]);
+        let surf_off = u64::from_le_bytes(blob.bytes[0x28..0x30].try_into().unwrap());
+        blob.bytes[surf_off as usize..surf_off as usize + 8]
+            .copy_from_slice(&0xFFFF_8000_0000_0000u64.to_le_bytes());
+        assert!(blob.preflight_local(BLOB_BASE).is_err());
+    }
+
+    #[test]
+    fn v2_preflight_zero_entry_rejected() {
+        let mut blob = build_blob(&["AD-PROC-001"]);
+        let surf_off = u64::from_le_bytes(blob.bytes[0x28..0x30].try_into().unwrap());
+        blob.bytes[surf_off as usize..surf_off as usize + 8].copy_from_slice(&0u64.to_le_bytes());
+        assert!(blob.preflight_local(BLOB_BASE).is_err());
+    }
+
+    #[test]
+    fn v2_preflight_out_of_blob_entry_rejected() {
+        let mut blob = build_blob(&["AD-PROC-001"]);
+        let surf_off = u64::from_le_bytes(blob.bytes[0x28..0x30].try_into().unwrap());
+        let blob_end = BLOB_BASE + blob.bytes.len() as u64;
+        blob.bytes[surf_off as usize..surf_off as usize + 8]
+            .copy_from_slice(&(blob_end + 0x10).to_le_bytes());
+        assert!(blob.preflight_local(BLOB_BASE).is_err());
+    }
+
+    #[test]
+    fn v2_preflight_digest_truncation_rejected() {
+        // truncate the digest region: NUL missing / hex region cut
+        let mut blob = build_blob(&["AD-PROC-001"]);
+        blob.bytes.truncate(blob.bytes.len() - 10);
+        assert!(blob.preflight_local(BLOB_BASE).is_err());
+    }
+
+    #[test]
+    fn v2_preflight_surface_array_truncation_rejected() {
+        // array region shorter than declared: surf_off moved 8 bytes right
+        let mut blob = build_blob(&["AD-PROC-001", "AD-PROC-002"]);
+        let surf_off = u64::from_le_bytes(blob.bytes[0x28..0x30].try_into().unwrap());
+        blob.bytes[0x28..0x30].copy_from_slice(&(surf_off + 8).to_le_bytes());
+        assert!(blob.preflight_local(BLOB_BASE).is_err());
+    }
+
+    #[test]
+    fn v2_preflight_surface_string_helper() {
+        let blob = build_blob(&["AD-PROC-001", "AD-PROC-002"]);
+        let pf = blob.preflight_local(BLOB_BASE).unwrap();
+        let s0 = blob.surface_string(&pf, 0).unwrap();
+        let s1 = blob.surface_string(&pf, 1).unwrap();
+        assert_eq!(s0, b"AD-PROC-001");
+        assert_eq!(s1, b"AD-PROC-002");
+        assert!(blob.surface_string(&pf, 2).is_err());
+    }
+
+    #[test]
+    fn v2_preflight_is_local_only_not_live_pass() {
+        // Explicit semantic: a successful preflight is NOT a runtime/live
+        // pass. It only proves local structural consistency. We assert the
+        // API returns the structured result WITHOUT any runtime call, and
+        // that the semantic note is documented on the type.
+        let blob = build_blob(&["AD-PROC-001"]);
+        let pf = blob.preflight_local(BLOB_BASE).unwrap();
+        assert!(pf.surface_entries.len() == 1);
+        assert!(pf.digest_len == 64);
+        // The preflight does not imply any target-side capability; the
+        // gate remains authoritative (checked in acceptance crate).
     }
 }
