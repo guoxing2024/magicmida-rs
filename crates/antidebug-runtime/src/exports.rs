@@ -59,6 +59,12 @@ pub enum MidaAntidebugError {
     SurfaceInstallFailed = 9,
     /// Surface restoration failed during shutdown (ADR-5).
     RestoreFailed = 10,
+    /// V2 params blob is malformed (bad magic, offsets, digest, or bounds).
+    InvalidV2Blob = 11,
+    /// V2 digest echo buffer too small for the 64-hex digest.
+    EchoBufferTooSmall = 12,
+    /// Export exists but the production path is not yet implemented (IMP-09).
+    NotImplemented = 13,
 }
 
 impl MidaAntidebugError {
@@ -79,6 +85,9 @@ impl MidaAntidebugError {
             MidaAntidebugError::ArchitectureMismatch => "ArchitectureMismatch",
             MidaAntidebugError::SurfaceInstallFailed => "SurfaceInstallFailed",
             MidaAntidebugError::RestoreFailed => "RestoreFailed",
+            MidaAntidebugError::InvalidV2Blob => "InvalidV2Blob",
+            MidaAntidebugError::EchoBufferTooSmall => "EchoBufferTooSmall",
+            MidaAntidebugError::NotImplemented => "NotImplemented",
         }
     }
 }
@@ -485,6 +494,397 @@ fn shutdown_inner() -> i32 {
     MidaAntidebugError::Ok.as_i32()
 }
 
+
+// ============================================================================
+// IMP-08: MidaAntidebugInitializeV2 (7-arg ABI, digest channel)
+// ============================================================================
+//
+// Frozen ABI (WO-1505 §5.3 / IMPLEMENTATION_PHASE04A_READINESS):
+//
+//   MidaAntidebugInitializeV2(
+//       const uint8_t* params,        // v2 params blob (self-relative layout)
+//       size_t         params_bytes,  // blob length (bounded)
+//       uint8_t*       out_runtime_sha256,    // 64-hex digest echo
+//       size_t         out_runtime_sha256_len,// capacity (>= 64)
+//       uint8_t*       out_attestation_json,  // attestation output
+//       size_t         out_attestation_len,   // capacity
+//       size_t*        out_attestation_written)
+//
+// The params blob uses the SAME frozen layout as loader-side
+// V2ParamsBlob::build (WO-1505 §5.3a/§5.3e, RC-4):
+//   [0x10] profile_id_off        self-relative
+//   [0x18] profile_digest_off    self-relative
+//   [0x20] expected_hooks        u64
+//   [0x28] expected_surfaces_off self-relative (pointer array start)
+//   [0x30] magic_v2              0x003250324144494D ("MIDA2P2\0" LE)
+//   [0x38] digest_off            self-relative (64 hex + NUL)
+//   [0x40] digest_len            field value MUST be 64
+//
+// All offsets are relative to the blob start; all arithmetic is checked;
+// all string scans are bounded NUL scans (fail-closed). The digest is
+// validated (64 lowercase hex) and becomes the attestation
+// runtime_sha256 (replacing the v1 placeholder), then the SAME digest is
+// echoed through out_runtime_sha256 for the controller to verify
+// (echo == attestation.runtime_sha256 == digest_controller).
+
+/// V2 params blob header magic ("MIDA2P2\0" LE) - matches loader side.
+pub const V2_ENVELOPE_MAGIC: u64 = 0x0032_5032_4144_494D;
+/// V2 params blob fixed header size.
+pub const V2_HEADER_BYTES: usize = 0x48;
+/// V2 digest_len field value (64 hex chars; frozen ABI).
+pub const V2_DIGEST_LEN: u64 = 64;
+/// V2 digest wire region bytes (64 hex + NUL).
+pub const V2_DIGEST_REGION_BYTES: u64 = 65;
+/// Max surface count (frozen ABI; builder rejects > 256).
+pub const V2_MAX_HOOKS: u64 = 256;
+
+/// Checked u64 addition used by the v2 blob parser (fail-closed).
+fn v2_checked_add(a: usize, b: usize, what: &str) -> Result<usize, MidaAntidebugError> {
+    a.checked_add(b).ok_or_else(|| {
+        let _ = what;
+        MidaAntidebugError::InvalidV2Blob
+    })
+}
+
+/// Bounded NUL-terminated string read from a blob slice (fail-closed).
+fn v2_read_cstr_blob(blob: &[u8], off: usize, what: &str) -> Result<String, MidaAntidebugError> {
+    if off >= blob.len() {
+        return Err(MidaAntidebugError::InvalidV2Blob);
+    }
+    let mut end = off;
+    while end < blob.len() && blob[end] != 0 {
+        end += 1;
+        if end - off > 4096 {
+            return Err(MidaAntidebugError::InvalidV2Blob); // unbounded scan
+        }
+    }
+    if end >= blob.len() || blob[end] != 0 {
+        return Err(MidaAntidebugError::InvalidV2Blob); // missing NUL
+    }
+    let s = std::str::from_utf8(&blob[off..end])
+        .map_err(|_| MidaAntidebugError::InvalidV2Blob)?;
+    let _ = what;
+    Ok(s.to_string())
+}
+
+/// C ABI: initialize the runtime with a v2 params blob (7-arg).
+///
+/// # Safety
+/// - `params` must be valid for `params_bytes` readable bytes;
+/// - output pointers must be valid for their lengths;
+/// - must be called once from a single thread;
+/// - panics are caught and reported as [`MidaAntidebugError::InternalPanic`].
+#[no_mangle]
+pub unsafe extern "C" fn MidaAntidebugInitializeV2(
+    params: *const u8,
+    params_bytes: usize,
+    out_runtime_sha256: *mut u8,
+    out_runtime_sha256_len: usize,
+    out_attestation_json: *mut u8,
+    out_attestation_len: usize,
+    out_attestation_written: *mut usize,
+) -> i32 {
+    std::panic::catch_unwind(|| {
+        initialize_v2_inner(
+            params,
+            params_bytes,
+            out_runtime_sha256,
+            out_runtime_sha256_len,
+            out_attestation_json,
+            out_attestation_len,
+            out_attestation_written,
+        )
+    })
+    .unwrap_or(MidaAntidebugError::InternalPanic.as_i32())
+}
+
+fn initialize_v2_inner(
+    params: *const u8,
+    params_bytes: usize,
+    out_runtime_sha256: *mut u8,
+    out_runtime_sha256_len: usize,
+    out_attestation_json: *mut u8,
+    out_attestation_len: usize,
+    out_attestation_written: *mut usize,
+) -> i32 {
+    if RUNTIME.get().is_some() {
+        return MidaAntidebugError::AlreadyInitialized.as_i32();
+    }
+    if params.is_null()
+        || out_attestation_json.is_null()
+        || out_attestation_written.is_null()
+        || out_attestation_len == 0
+        || params_bytes < V2_HEADER_BYTES
+    {
+        return MidaAntidebugError::InvalidArgument.as_i32();
+    }
+    // SAFETY: validated above; blob is readable for params_bytes.
+    let blob = unsafe { std::slice::from_raw_parts(params, params_bytes) };
+
+    // ---- header validation (fail-closed) ----
+    let rd = |off: usize| -> Result<u64, MidaAntidebugError> {
+        let end = v2_checked_add(off, 8, "v2 header field")?;
+        if end > blob.len() {
+            return Err(MidaAntidebugError::InvalidV2Blob);
+        }
+        Ok(u64::from_le_bytes(blob[off..end].try_into().unwrap()))
+    };
+    let magic = match rd(0x30) { Ok(v) => v, Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32() };
+    if magic != V2_ENVELOPE_MAGIC {
+        return MidaAntidebugError::InvalidV2Blob.as_i32();
+    }
+    let pid_off_u = match rd(0x10) { Ok(v) => v, Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32() };
+    let pd_off_u = match rd(0x18) { Ok(v) => v, Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32() };
+    let expected_hooks = match rd(0x20) { Ok(v) => v, Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32() };
+    let surf_off_u = match rd(0x28) { Ok(v) => v, Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32() };
+    let dig_off_u = match rd(0x38) { Ok(v) => v, Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32() };
+    let dig_len_field = match rd(0x40) { Ok(v) => v, Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32() };
+    if dig_len_field != V2_DIGEST_LEN {
+        return MidaAntidebugError::InvalidV2Blob.as_i32();
+    }
+    if expected_hooks == 0 || expected_hooks > V2_MAX_HOOKS {
+        return MidaAntidebugError::InvalidV2Blob.as_i32();
+    }
+    if surf_off_u == 0 {
+        return MidaAntidebugError::InvalidV2Blob.as_i32();
+    }
+    let pid_off = match usize::try_from(pid_off_u) {
+        Ok(v) => v,
+        Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32(),
+    };
+    let pd_off = match usize::try_from(pd_off_u) {
+        Ok(v) => v,
+        Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32(),
+    };
+    let surf_off = match usize::try_from(surf_off_u) {
+        Ok(v) => v,
+        Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32(),
+    };
+    let dig_off = match usize::try_from(dig_off_u) {
+        Ok(v) => v,
+        Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32(),
+    };
+    for (name, off) in [("profile_id", pid_off), ("profile_digest", pd_off), ("digest", dig_off)] {
+        if off < V2_HEADER_BYTES || off >= blob.len() {
+            let _ = name;
+            return MidaAntidebugError::InvalidV2Blob.as_i32();
+        }
+    }
+
+    // ---- bounded string reads ----
+    let profile_id = match v2_read_cstr_blob(blob, pid_off, "profile_id") {
+        Ok(s) => s,
+        Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32(),
+    };
+    let profile_digest = match v2_read_cstr_blob(blob, pd_off, "profile_digest") {
+        Ok(s) => s,
+        Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32(),
+    };
+    let digest = match v2_read_cstr_blob(blob, dig_off, "digest") {
+        Ok(s) => s,
+        Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32(),
+    };
+    if digest.len() != 64 {
+        return MidaAntidebugError::InvalidV2Blob.as_i32();
+    }
+    if !digest.bytes().all(|b| b.is_ascii_digit() || (b.is_ascii_lowercase() && b <= b'f')) {
+        return MidaAntidebugError::InvalidV2Blob.as_i32();
+    }
+
+    // ---- surfaces array (absolute VAs in the target == runtime process) ----
+    let array_bytes = match (expected_hooks as usize).checked_mul(8) {
+        Some(v) => v,
+        None => return MidaAntidebugError::InvalidV2Blob.as_i32(),
+    };
+    let array_end = match surf_off.checked_add(array_bytes) {
+        Some(v) if v <= blob.len() => v,
+        _ => return MidaAntidebugError::InvalidV2Blob.as_i32(),
+    };
+    if array_end != dig_off {
+        return MidaAntidebugError::InvalidV2Blob.as_i32();
+    }
+    let mut expected = Vec::with_capacity(expected_hooks as usize);
+    for i in 0..expected_hooks as usize {
+        let entry_off = match surf_off.checked_add(i * 8) {
+            Some(v) => v,
+            _ => return MidaAntidebugError::InvalidV2Blob.as_i32(),
+        };
+        // Entry is an ABSOLUTE target VA (RC-4): inside the runtime process
+        // this is a direct pointer into the blob (blob_base + relative).
+        let abs_va = u64::from_le_bytes(blob[entry_off..entry_off + 8].try_into().unwrap());
+        if abs_va == 0 {
+            return MidaAntidebugError::InvalidV2Blob.as_i32();
+        }
+        // Canonical user VA check (kernel high-half rejected).
+        if abs_va > 0x0000_7FFF_FFFF_FFFF {
+            return MidaAntidebugError::InvalidV2Blob.as_i32();
+        }
+        // SAFETY: abs_va points into the same blob (target-local absolute);
+        // the loader wrote it as blob_base + relative. Read the surface id.
+        let sp = abs_va as *const std::os::raw::c_char;
+        expected.push(unsafe { read_cstr(sp) }.unwrap_or_default());
+    }
+
+    // ---- target identity (frozen header fields +0x00 / +0x08) ----
+    let target_pid = u32::from_le_bytes(blob[0x00..0x04].try_into().unwrap());
+    let module_base = match rd(0x08) { Ok(v) => v, Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32() };
+    if target_pid == 0 || module_base == 0 {
+        // Target identity binding: zero PID / module base is invalid.
+        return MidaAntidebugError::InvalidArgument.as_i32();
+    }
+
+    // ---- digest becomes the runtime identity (replaces v1 placeholder) ----
+    let runtime_sha256 = digest;
+
+    // ---- ADR-5: install hard-required PEB surfaces (same as v1 path) ----
+    let real_peb = crate::surfaces::Win32PebMemory::new(target_pid);
+    let (outcomes, failures) = match install_proc_surfaces(
+        &real_peb,
+        crate::surfaces::POINTER_SIZE_X64,
+        target_pid,
+        target_pid,
+        &profile_digest,
+        &profile_digest,
+    ) {
+        Ok(v) => v,
+        Err(_) => {
+            // Surface-level fatal (e.g. wrong pointer size): fail closed.
+            return MidaAntidebugError::SurfaceInstallFailed.as_i32();
+        }
+    };
+    let installed: Vec<String> = outcomes
+        .iter()
+        .filter(|o| o.installed)
+        .map(|o| o.surface_id.clone())
+        .collect();
+    let fail_pairs: Vec<(String, String)> = failures
+        .iter()
+        .map(|f| (f.surface_id.clone(), f.error.clone().unwrap_or_default()))
+        .collect();
+    let details: Vec<SurfaceDetail> = outcomes
+        .iter()
+        .map(|o| SurfaceDetail {
+            surface_id: o.surface_id.clone(),
+            installed: o.installed,
+            original_value: o.original_value.clone(),
+            effective_value: o.effective_value.clone(),
+            restoration_policy: format!("{:?}", o.restoration_policy),
+            restore_result: format!("{:?}", o.restore_result),
+            error: o.error.clone(),
+        })
+        .collect();
+    let original_bd: Option<String> = outcomes
+        .iter()
+        .find(|o| o.surface_id == SURFACE_AD_PROC_002)
+        .and_then(|o| o.original_value.clone());
+    let original_shim: Option<String> = outcomes
+        .iter()
+        .find(|o| o.surface_id == SURFACE_AD_PROC_003)
+        .and_then(|o| o.original_value.clone());
+    // expected set for attestation = hard-required surfaces only (002, 003);
+    // AD-PROC-001 stays a candidate and is NOT part of hooks_expected.
+    let expected_hard: Vec<String> = expected
+        .iter()
+        .filter(|s| s.as_str() == SURFACE_AD_PROC_002 || s.as_str() == SURFACE_AD_PROC_003)
+        .cloned()
+        .collect();
+    let att = match build_attestation_from_outcomes(
+        runtime_sha256.clone(),
+        profile_id.clone(),
+        profile_digest.clone(),
+        target_pid,
+        module_base,
+        &expected_hard,
+        &installed,
+        &fail_pairs,
+        details,
+    ) {
+        Ok(a) => a,
+        Err(e) => return e.as_i32(),
+    };
+    let att_json = match att.to_canonical_json() {
+        Ok(j) => j,
+        Err(_) => return MidaAntidebugError::Serialization.as_i32(),
+    };
+    if att_json.len() > out_attestation_len {
+        return MidaAntidebugError::BufferTooSmall.as_i32();
+    }
+    // Copy runtime sha256 (digest echo: MUST be the full 64 hex + no truncation).
+    if out_runtime_sha256.is_null() || out_runtime_sha256_len < runtime_sha256.len() {
+        return MidaAntidebugError::EchoBufferTooSmall.as_i32();
+    }
+    let bytes = runtime_sha256.as_bytes();
+    // SAFETY: validated output buffer; capacity checked above.
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_runtime_sha256, bytes.len()) };
+    // Copy attestation JSON
+    let bytes = att_json.as_bytes();
+    // SAFETY: validated output buffer; size checked above.
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_attestation_json, bytes.len()) };
+    // SAFETY: validated output pointer.
+    unsafe { *out_attestation_written = bytes.len() };
+    // Build the telemetry channel bound to PID + digest (attestation carries
+    // the same target_pid / module_base identity).
+    let telemetry = TelemetryChannel::new(
+        format!("mida-adr4-{}", target_pid),
+        target_pid,
+        profile_digest.clone(),
+    );
+    let handle = RuntimeHandle {
+        attestation: att,
+        provenance: Provenance::current(
+            runtime_sha256,
+            0,
+            "rustc".to_string(),
+            env!("CARGO_PKG_VERSION").to_string(),
+        ),
+        telemetry,
+        shutdown_requested: false,
+        surface_details: Vec::new(),
+        original_being_debugged: original_bd,
+        original_shim_data: original_shim,
+    };
+    // SAFETY: single-threaded init contract; set() fails only if already set
+    // which we checked above.
+    let _ = RUNTIME.set(handle);
+    // SAFETY: set succeeded; get() is Some.
+    RUNTIME
+        .get()
+        .expect("runtime set above")
+        .telemetry
+        .mark_ready()
+        .expect("telemetry mark ready");
+    MidaAntidebugError::Ok.as_i32()
+}
+/// C ABI: Walker protocol entry (IMP-08 export surface only).
+///
+/// IMP-08-R1 scope: the export must EXIST in the runtime DLL so the loader's
+/// 5-item wanted set can resolve it (fail-closed on missing). The Walker
+/// production caller/state machine is IMP-09 (LOCKED). Until IMP-09 lands,
+/// this entry is fail-closed: it validates that `params_va` is a
+/// canonical user VA and returns [`MidaAntidebugError::NotImplemented`]
+/// (13) - it NEVER dispatches a walker, NEVER writes process memory, and
+/// NEVER executes remote code. This is an honest NOT_IMPLEMENTED export,
+/// not an inert stub masquerading as production.
+///
+/// # Safety
+/// - No pointer is dereferenced in this function; `params_va` is
+///   only validated as a canonical user-mode VA.
+#[no_mangle]
+pub unsafe extern "C" fn WalkerExecute(params_va: u64) -> i32 {
+    std::panic::catch_unwind(|| walker_execute_inner(params_va))
+        .unwrap_or(MidaAntidebugError::InternalPanic.as_i32())
+}
+
+fn walker_execute_inner(params_va: u64) -> i32 {
+    // Fail-closed validation: the VA must be a nonzero canonical user VA
+    // (kernel high-half rejected) before any IMP-09 caller may use it.
+    if params_va == 0 || params_va > 0x0000_7FFF_FFFF_FFFF {
+        return MidaAntidebugError::InvalidArgument.as_i32();
+    }
+    // IMP-09 not implemented: honest NOT_IMPLEMENTED, never fake success.
+    MidaAntidebugError::NotImplemented.as_i32()
+}
+
 /// Internal: read a NUL-terminated C string (bounded).
 unsafe fn read_cstr(p: *const std::os::raw::c_char) -> Option<String> {
     if p.is_null() {
@@ -507,4 +907,70 @@ pub fn reset_for_test() {
     // the FFI singleton. This function exists so the FFI tests can document
     // that the global is single-instance by design.
     let _ = RUNTIME.get();
+}
+
+#[cfg(test)]
+mod imp08_v2_tests {
+    use super::*;
+
+    #[test]
+    fn v2_magic_bytes_match_frozen_fixture() {
+        // WO-1803 fixture: LE bytes = 4D 49 44 41 32 50 32 00 ("MIDA2P2\0").
+        let bytes = 0x0032_5032_4144_494Du64.to_le_bytes();
+        assert_eq!(bytes, [0x4D, 0x49, 0x44, 0x41, 0x32, 0x50, 0x32, 0x00]);
+        assert_eq!(u64::from_le_bytes(bytes), V2_ENVELOPE_MAGIC);
+    }
+
+    #[test]
+    fn v2_read_cstr_blob_ok_and_bounds() {
+        let blob = b"MIDA\0tail";
+        assert_eq!(v2_read_cstr_blob(blob, 0, "x").unwrap(), "MIDA");
+        assert!(v2_read_cstr_blob(blob, 9, "x").is_err());
+        assert!(v2_read_cstr_blob(b"abcdef", 0, "x").is_err());
+    }
+
+    #[test]
+    fn v2_checked_add_rejects_overflow() {
+        assert_eq!(v2_checked_add(1, 2, "x").unwrap(), 3);
+        assert!(v2_checked_add(usize::MAX, 1, "x").is_err());
+    }
+
+    #[test]
+    fn walker_execute_rejects_invalid_va_fail_closed() {
+        unsafe {
+            assert_eq!(WalkerExecute(0), MidaAntidebugError::InvalidArgument.as_i32());
+            assert_eq!(
+                WalkerExecute(0xFFFF_8000_0000_0000),
+                MidaAntidebugError::InvalidArgument.as_i32()
+            );
+        }
+    }
+
+    #[test]
+    fn walker_execute_honest_not_implemented() {
+        unsafe {
+            assert_eq!(
+                WalkerExecute(0x0000_1000_0000),
+                MidaAntidebugError::NotImplemented.as_i32()
+            );
+        }
+    }
+
+    #[test]
+    fn error_codes_stable_abi() {
+        assert_eq!(MidaAntidebugError::Ok.as_i32(), 0);
+        assert_eq!(MidaAntidebugError::AlreadyInitialized.as_i32(), 1);
+        assert_eq!(MidaAntidebugError::NotInitialized.as_i32(), 2);
+        assert_eq!(MidaAntidebugError::InvalidArgument.as_i32(), 3);
+        assert_eq!(MidaAntidebugError::BufferTooSmall.as_i32(), 4);
+        assert_eq!(MidaAntidebugError::AlreadyShutdown.as_i32(), 5);
+        assert_eq!(MidaAntidebugError::Serialization.as_i32(), 6);
+        assert_eq!(MidaAntidebugError::InternalPanic.as_i32(), 7);
+        assert_eq!(MidaAntidebugError::ArchitectureMismatch.as_i32(), 8);
+        assert_eq!(MidaAntidebugError::SurfaceInstallFailed.as_i32(), 9);
+        assert_eq!(MidaAntidebugError::RestoreFailed.as_i32(), 10);
+        assert_eq!(MidaAntidebugError::InvalidV2Blob.as_i32(), 11);
+        assert_eq!(MidaAntidebugError::EchoBufferTooSmall.as_i32(), 12);
+        assert_eq!(MidaAntidebugError::NotImplemented.as_i32(), 13);
+    }
 }

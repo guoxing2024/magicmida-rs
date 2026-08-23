@@ -52,7 +52,9 @@ pub use attestation::{
 };
 pub use exports::{
     MidaAntidebugError, MidaAntidebugGetAttestation, MidaAntidebugInitialize,
-    MidaAntidebugShutdown, ATTESTATION_BUFFER_SIZE, MAX_ATTESTATION_BYTES,
+    MidaAntidebugInitializeV2, MidaAntidebugShutdown, WalkerExecute,
+    ATTESTATION_BUFFER_SIZE, MAX_ATTESTATION_BYTES, V2_DIGEST_LEN,
+    V2_ENVELOPE_MAGIC, V2_HEADER_BYTES, V2_MAX_HOOKS,
 };
 pub use provenance::{Provenance, ProvenanceError};
 pub use surfaces::{
