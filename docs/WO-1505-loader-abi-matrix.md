@@ -386,8 +386,9 @@ const _: () = {
 **7-arg thunk 完整 ABI（WO-2202 冻结：机器码/栈布局/shadow space/对齐/清理）**：
 ~~~text
 THUNK_CODE_7ARG（60 字节 = 0x3C；WO-2401 修订：栈对齐重算；
-经 ml64 + dumpbin 逐字节实测 + 本机 ABI 回传测试（thunk7_abi_test.c /
-thunk7_rsp_test.c）验证：7 参数完整到达 + call 前 rsp ≡ 0 mod 16；
+经 ml64 + dumpbin 逐字节实测 + 本机 ABI 组合测试（thunk7_final_full.asm /
+thunk7_final_test.c，fixture-exact 字节）验证：7 参数完整到达 + callee entry
+rsp ≡ 8 mod 16 + call 前 rsp ≡ 0 mod 16；
 与现有 6-arg thunk（runtime_loader.rs THUNK_CODE L481-503）风格一致：
 mov r11,rcx 用 49 89 CB、间接 call 用 call rax（FF D0）、sub/add rsp 自建帧）：
 
@@ -441,8 +442,8 @@ mov r11,rcx 用 49 89 CB、间接 call 用 call rax（FF D0）、sub/add rsp 自
   rsp+0x28（arg5/第 6 参）、rsp+0x30（arg6/第 7 参）。
 - **栈对齐（WO-2401 推导）**：thunk 入口 rsp ≡ 8 mod 16（caller 压入返回地址）；
   `sub rsp,0x38`（≡ 8 mod 16）→ **call 前 rsp ≡ 0 mod 16**（ABI 要求）；
-  `call rax` → 被调 fn 入口 rsp ≡ 8 mod 16 ✓。本机实测（thunk7_rsp_test.c）：
-  call 前 rsp mod 16 = 0。
+  `call rax` → 被调 fn 入口 rsp ≡ 8 mod 16 ✓。本机实测（thunk7_final_test.c，
+  asm stub 入口首指令记录）：callee entry rsp mod 16 = 8、call 前 rsp mod 16 = 0。
 - **callee cleanup**：Windows x64 是 **caller-cleanup**（被调函数不弹栈）；
   thunk 自己 add rsp,0x38 后 ret，返回调用方。
 - **volatile 寄存器**：rcx/rdx/r8/r9/r10/r11/rax 均可被被调函数破坏；

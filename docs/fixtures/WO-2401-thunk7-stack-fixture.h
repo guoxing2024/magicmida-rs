@@ -1,8 +1,7 @@
 /* WO-2401 fixture -- 7-arg thunk STACK layout / alignment contract.
  * DESIGN FIXTURE for offline review; not a compiled implementation.
  * Verified by: ml64+dumpbin (bytes) and LOCAL ABI tests
- *   thunk7_abi_test.c (7 args intact at callee) and
- *   thunk7_rsp_test.c (call pre-rsp mod 16 == 0, probed in-thunk).
+ *   thunk7_final_test.c + thunk7_final_full.asm (fixture-exact bytes):
  * These are LOCAL x64 checks on the worker machine; NOT remote target,
  * NOT Windows live verification, NOT LIVE-4.
  */

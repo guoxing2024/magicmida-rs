@@ -1,7 +1,8 @@
 /* WO-2301 fixture -- 7-arg thunk machine-code / stack ABI contract (WO-2401 rev).
  * DESIGN FIXTURE for offline review; not a compiled implementation.
  * Byte table verified with ml64 + dumpbin (MSVC x64); stack alignment verified
- * by LOCAL ABI round-trip tests (thunk7_abi_test.c / thunk7_rsp_test.c):
+ * by LOCAL ABI round-trip tests (thunk7_final_test.c + thunk7_final_full.asm,
+ * fixture-exact bytes; supersedes the voided thunk7_abi/rsp tests):
  *   - all 7 args arrive intact at the callee;
  *   - call pre-rsp mod 16 == 0 (probed inside the thunk before call rax).
  * Stack model (WO-2401):

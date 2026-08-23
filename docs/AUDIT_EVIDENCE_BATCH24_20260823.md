@@ -42,6 +42,15 @@
 | thunk7_v2.obj | C0B2E32A40C086EF46F1EDB16DC5FC8CF27E4782EE354803347D2AAFBEDBB0D4 | ml64 产物 |
 | hostile_asan_detail.txt | 7AFE1FA521B5155D8E832B8004CA175035E1D9EE7930ACFCA52A3DE0E6EC4AC4 | ASan 16/16 逐用例 EXIT=0 |
 
+
+| thunk7_final_test.c | 7ECFB5593A0781016C887F91516C3E6D71E7233A151247CE4ACD9A851CE896CC | 最终测试 C 驱动（fixture-exact 65B） |
+| thunk7_final_full.asm | 94552912E0C2DBEBCAC87A2C63C6D87EAFFFD8247EBEDF24630D3A2244A72894 | 最终 thunk+entry-stub 汇编 |
+| thunk7_final_stdout.txt | 34629AAE017FD563F3ABF7B20A05C76B7BEC8F0796D8F8569A211E38944BCE71 | THUNK7 FINAL PASS EXIT=0 |
+| thunk7_final_full.obj | BE1042DA3AA6947F539503E6655B90126E57292F1B7F3D97359DE6070C171A20 | ml64 产物（49 89 CB 逐指令确认） |
+
+**自检修正（Batch 25 追加）**：thunk7_v2 系列使用 ml64 自由编码（4C 8B D9）而非 fixture
+冻结的 49 89 CB——虽语义等价但违反"机器码与文字一致"原则；本批以 thunk7_final 系列
+（fixture-exact 字节）为唯一验证来源。
 **更正说明**：Batch 24 的 thunk7_abi_stdout.txt（ABI ROUND-TRIP FAIL）与
 thunk7_rsp_stdout.txt（错误 opcode 4D 89 63 48）**作废**，本批以 thunk7_v2 系列为准
 （entry 对齐由 asm stub 入口首指令记录，opcode 49 89 63 48 经 ml64 反汇编确认）。
