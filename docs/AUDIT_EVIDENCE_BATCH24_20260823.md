@@ -57,9 +57,12 @@
 = WO-2301 fixture THUNK7_CODE（60B）+ probe（49 89 63 48 @0x35）扩展，
 **fixture 字节表 = obj 实际字节 = 测试执行字节，三者完全一致**。
 
-**自检修正（Batch 25 追加）**：thunk7_v2 系列使用 ml64 自由编码（4C 8B D9）而非 fixture
-冻结的 49 89 CB——虽语义等价但违反"机器码与文字一致"原则；本批以 thunk7_final 系列
-（fixture-exact 字节）为唯一验证来源。
+**自检修正（Batch 25 追加，Batch 26 再修正）**：thunk7_v2 系列使用 ml64 自由编码
+（4C 8B D9）而非 fixture 冻结的 49 89 CB——已标注为**过渡**；且 Batch 25 的
+thunk7_final_test.c 存在 Args10 布局缺陷（rsp_probe 在 +0x40 而探针写 +0x48，假阳性）。
+**当前唯一验证来源 = WO-2601 的 thunk7_threecheck 系列**（ThunkArgs7Probe 0x50 布局 +
+sentinel 0xDEADBEEFCAFEBABE 真实覆盖证明 + production 60B/test 64B 分离），见
+WO-2601-thunk7-probe-closure_20260823.md。
 **更正说明**：Batch 24 的 thunk7_abi_stdout.txt（ABI ROUND-TRIP FAIL）与
 thunk7_rsp_stdout.txt（错误 opcode 4D 89 63 48）**作废**，本批以 thunk7_v2 系列为准
 （entry 对齐由 asm stub 入口首指令记录，opcode 49 89 63 48 经 ml64 反汇编确认）。
@@ -69,7 +72,7 @@ thunk7_rsp_stdout.txt（错误 opcode 4D 89 63 48）**作废**，本批以 thunk
 | 层 | 状态 |
 |----|------|
 | worker stdout（cargo test/check/diffcheck） | 本文件证据（可复核 hash） |
-| 本机 thunk ABI 验证 | thunk7_v2 系列（LOCAL，非远程） |
+| 本机 thunk ABI 验证 | thunk7_threecheck 系列（WO-2601，LOCAL，非远程） |
 | ASan hostile | hostile_asan_detail.txt（逐用例） |
 | commander independent verification | **BLOCKED**（总指挥机 rustup shim 阻断；不升级 PASS） |
 | Windows/live evidence | **absent**（LIVE-4 NOT AUTHORIZED） |

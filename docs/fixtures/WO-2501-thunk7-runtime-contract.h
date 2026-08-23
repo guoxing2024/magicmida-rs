@@ -1,16 +1,17 @@
 /* WO-2501 fixture -- 7-arg thunk RUNTIME contract (local x64 verified).
  * DESIGN FIXTURE + local runtime evidence; not a production implementation.
  *
- * Three independent checks (thunk7_v2_test, LOCAL x64 on worker machine;
- * NOT remote target, NOT Windows live, NOT LIVE-4):
+ * Three independent checks (thunk7_final_test.c + thunk7_final_full.asm,
+ * LOCAL x64 on worker machine; NOT remote target, NOT Windows live, NOT LIVE-4):
  *   1) arg pass-through : slot[0..6] == thunk args arg0..arg6 (all intact)
  *   2) callee ENTRY     : rsp mod 16 == 8, recorded by asm stub BEFORE any
  *                         prologue (no _AddressOfReturnAddress interference)
  *   3) call pre-rsp     : thunk writes rsp to args+0x48 with the verified
  *                         opcode 49 89 63 48 (mov [r11+0x48], rsp)
  *                         -> mod 16 == 0
- * Evidence: D:\Temp\thunk7_v2_stdout.txt (THUNK7 COMBINED PASS, EXIT=0),
- * hashes in AUDIT_EVIDENCE_BATCH24_20260823.md.
+ * Evidence: D:\Temp\thunk7_threecheck_stdout.txt (THUNK7 THREE-CHECK PASS,
+ * EXIT=0, sentinel-verified), hashes in AUDIT_EVIDENCE_BATCH24_20260823.md
+ * and WO-2601-thunk7-probe-closure_20260823.md.
  */
 #ifndef WO2501_THUNK7_RUNTIME_CONTRACT_H
 #define WO2501_THUNK7_RUNTIME_CONTRACT_H
