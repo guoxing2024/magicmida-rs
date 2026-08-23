@@ -2411,15 +2411,25 @@ impl V2ParamsBlob {
         expected_surfaces: &[String],
         digest: &str,
     ) -> Result<Self, RuntimeLoadError> {
+        // digest: exactly 64 LOWERCASE hex chars (0-9a-f only; WO-1505 §5.3b).
         if digest.len() != 64 {
+            return Err(RuntimeLoadError::ExportResolutionFailed(format!(
+                "v2 digest must be 64 hex chars, got {}",
+                digest.len()
+            )));
+        }
+        if !digest.bytes().all(|b| b.is_ascii_digit() || (b.is_ascii_lowercase() && b <= b'f')) {
             return Err(RuntimeLoadError::ExportResolutionFailed(
-                "v2 digest must be 64 hex chars".to_string(),
+                "v2 digest must be lowercase hex (0-9a-f only)".to_string(),
             ));
         }
+        let expected_hooks = expected_surfaces.len() as u64;
         let mut out: Vec<u8> = Vec::new();
         out.resize(V2_HEADER_BYTES, 0u8);
         // magic
         out[0x30..0x38].copy_from_slice(&V2_ENVELOPE_MAGIC.to_le_bytes());
+        // expected_hooks at 0x20 (frozen layout: usize/u64)
+        out[0x20..0x28].copy_from_slice(&expected_hooks.to_le_bytes());
         // digest_len
         out[0x40..0x48].copy_from_slice(&V2_DIGEST_LEN.to_le_bytes());
         // profile_id string
@@ -2472,6 +2482,8 @@ impl V2ParamsBlob {
         }
         let pid_off = u64::from_le_bytes(self.bytes[0x10..0x18].try_into().unwrap());
         let pd_off = u64::from_le_bytes(self.bytes[0x18..0x20].try_into().unwrap());
+        // expected_hooks at 0x20 (frozen layout: u64 count of surface pointers)
+        let expected_hooks = u64::from_le_bytes(self.bytes[0x20..0x28].try_into().unwrap());
         let surf_off = u64::from_le_bytes(self.bytes[0x28..0x30].try_into().unwrap());
         let dig_off = u64::from_le_bytes(self.bytes[0x38..0x40].try_into().unwrap());
         let dig_len_field = u64::from_le_bytes(self.bytes[0x40..0x48].try_into().unwrap());
@@ -2480,6 +2492,18 @@ impl V2ParamsBlob {
             return Err(RuntimeLoadError::ExportResolutionFailed(format!(
                 "v2 digest_len field must be 64, got {}",
                 dig_len_field
+            )));
+        }
+        // expected_hooks must be nonzero and bounded (fail-closed).
+        if expected_hooks == 0 {
+            return Err(RuntimeLoadError::ExportResolutionFailed(
+                "v2 expected_hooks must be nonzero".to_string(),
+            ));
+        }
+        if expected_hooks > 256 {
+            return Err(RuntimeLoadError::ExportResolutionFailed(format!(
+                "v2 expected_hooks exceeds max 256, got {}",
+                expected_hooks
             )));
         }
         let len = self.bytes.len() as u64;
@@ -2511,7 +2535,7 @@ impl V2ParamsBlob {
         let _pd_end = scan_nul(pd_off, "profile_digest")?;
         let _dig_end = scan_nul(dig_off, "digest")?;
 
-        // digest region: 64 hex chars + NUL = 65 bytes must fit
+        // digest region: 64 LOWERCASE hex chars + NUL = 65 bytes.
         let dig_region_end = dig_off
             .checked_add(V2_DIGEST_REGION_BYTES)
             .ok_or(RuntimeLoadError::ExportResolutionFailed(
@@ -2524,9 +2548,10 @@ impl V2ParamsBlob {
         }
         for i in dig_off..dig_off + 64 {
             let c = self.bytes[i as usize];
-            if !c.is_ascii_hexdigit() {
+            let is_lower_hex = c.is_ascii_digit() || (c.is_ascii_lowercase() && c <= b'f');
+            if !is_lower_hex {
                 return Err(RuntimeLoadError::ExportResolutionFailed(
-                    "v2 digest contains non-hex char".to_string(),
+                    "v2 digest must be lowercase hex (0-9a-f); uppercase rejected".to_string(),
                 ));
             }
         }
@@ -2536,17 +2561,51 @@ impl V2ParamsBlob {
             ));
         }
 
-        if surf_off >= dig_off {
-            return Err(RuntimeLoadError::ExportResolutionFailed(
-                "v2 surfaces array must precede digest".to_string(),
-            ));
+        // surfaces array: length MUST be exactly expected_hooks * 8 (checked),
+        // positioned immediately before the digest region.
+        let array_bytes = expected_hooks
+            .checked_mul(8)
+            .ok_or(RuntimeLoadError::ExportResolutionFailed(
+                "v2 expected_hooks*8 overflow".to_string(),
+            ))?;
+        let array_end = surf_off
+            .checked_add(array_bytes)
+            .ok_or(RuntimeLoadError::ExportResolutionFailed(
+                "v2 surfaces array end overflow".to_string(),
+            ))?;
+        if array_end != dig_off {
+            let actual = dig_off.checked_sub(surf_off).unwrap_or(u64::MAX);
+            return Err(RuntimeLoadError::ExportResolutionFailed(format!(
+                "v2 surfaces array length mismatch: declared {expected_hooks} entries -> {array_bytes}B, actual region {actual}B"
+            )));
         }
-        let array_bytes = dig_off - surf_off;
-        if array_bytes % 8 != 0 {
-            return Err(RuntimeLoadError::ExportResolutionFailed(
-                "v2 surfaces array size not multiple of 8".to_string(),
-            ));
+
+        // Per-entry checks (WO-1505 §5.3e): each entry is a self-relative
+        // offset to the surface string; must be nonzero, canonical user VA
+        // shape (offset < blob len is required; canonical VA is a controller
+        // concern once the blob is mapped), in-bounds, and the string at
+        // that offset must be NUL-terminated within bounds.
+        for i in 0..expected_hooks {
+            let entry_off = surf_off + i * 8;
+            let entry = u64::from_le_bytes(
+                self.bytes[entry_off as usize..entry_off as usize + 8]
+                    .try_into()
+                    .unwrap(),
+            );
+            if entry == 0 {
+                return Err(RuntimeLoadError::ExportResolutionFailed(format!(
+                    "v2 surface entry {i} is zero"
+                )));
+            }
+            if entry < V2_HEADER_BYTES as u64 || entry >= surf_off {
+                return Err(RuntimeLoadError::ExportResolutionFailed(format!(
+                    "v2 surface entry {i} offset out of bounds: {entry:#x}"
+                )));
+            }
+            // surface string bounded NUL scan
+            scan_nul(entry, "surface")?;
         }
+
         if dig_region_end != len {
             return Err(RuntimeLoadError::ExportResolutionFailed(
                 "v2 unknown tail after digest region".to_string(),
@@ -2559,6 +2618,7 @@ impl V2ParamsBlob {
             expected_surfaces_off: surf_off,
             digest_off: dig_off,
             digest_len: dig_len_field,
+            expected_hooks,
         })
     }
 }
@@ -2571,6 +2631,8 @@ pub struct V2Offsets {
     pub expected_surfaces_off: u64,
     pub digest_off: u64,
     pub digest_len: u64,
+    /// Declared surface pointer count (header 0x20).
+    pub expected_hooks: u64,
 }
 
 
@@ -2712,9 +2774,9 @@ mod imp03_inert_adapter_tests {
     #[test]
     fn v2_params_blob_rejects_non_hex_digest() {
         let surfaces = vec!["AD-PROC-001".to_string()];
-        let digest = "z".repeat(64);
-        let blob = V2ParamsBlob::build("p", "d", &surfaces, &digest).unwrap();
-        assert!(blob.parse_offsets().is_err());
+        let digest = "z".repeat(64); // z is not hex
+        // build() rejects non-hex immediately (fail-closed at construction)
+        assert!(V2ParamsBlob::build("p", "d", &surfaces, &digest).is_err());
     }
 
     #[test]
@@ -2735,6 +2797,100 @@ mod imp03_inert_adapter_tests {
         // patch surfaces_off AFTER digest_off -> surfaces array must precede digest
         let dig_off = u64::from_le_bytes(blob.bytes[0x38..0x40].try_into().unwrap());
         blob.bytes[0x28..0x30].copy_from_slice(&(dig_off + 8).to_le_bytes());
+        assert!(blob.parse_offsets().is_err());
+    }
+
+    #[test]
+    fn v2_params_blob_build_writes_expected_hooks() {
+        let surfaces = vec!["AD-PROC-001".to_string(), "AD-PROC-002".to_string()];
+        let digest = "a".repeat(64);
+        let blob = V2ParamsBlob::build("p", "d", &surfaces, &digest).unwrap();
+        // expected_hooks at 0x20 = 2
+        let hooks = u64::from_le_bytes(blob.bytes[0x20..0x28].try_into().unwrap());
+        assert_eq!(hooks, 2);
+        let offs = blob.parse_offsets().unwrap();
+        assert_eq!(offs.expected_hooks, 2);
+    }
+
+    #[test]
+    fn v2_params_blob_rejects_uppercase_digest() {
+        let surfaces = vec!["AD-PROC-001".to_string()];
+        // uppercase hex must be rejected (WO-1505 §5.3b: 0-9a-f only)
+        let digest_upper = "A".repeat(64);
+        assert!(V2ParamsBlob::build("p", "d", &surfaces, &digest_upper).is_err());
+        // mixed case also rejected
+        let digest_mixed = "a".repeat(63) + "F";
+        assert!(V2ParamsBlob::build("p", "d", &surfaces, &digest_mixed).is_err());
+        // lowercase accepted
+        let digest_lower = "a".repeat(64);
+        assert!(V2ParamsBlob::build("p", "d", &surfaces, &digest_lower).is_ok());
+    }
+
+    #[test]
+    fn v2_params_blob_parse_rejects_uppercase_digest_on_wire() {
+        let surfaces = vec!["AD-PROC-001".to_string()];
+        let digest = "a".repeat(64);
+        let mut blob = V2ParamsBlob::build("p", "d", &surfaces, &digest).unwrap();
+        // patch a digest char to uppercase on the wire
+        let dig_off = u64::from_le_bytes(blob.bytes[0x38..0x40].try_into().unwrap());
+        blob.bytes[dig_off as usize] = b'A';
+        assert!(blob.parse_offsets().is_err());
+    }
+
+    #[test]
+    fn v2_params_blob_rejects_zero_expected_hooks() {
+        let surfaces = vec!["AD-PROC-001".to_string()];
+        let digest = "a".repeat(64);
+        let mut blob = V2ParamsBlob::build("p", "d", &surfaces, &digest).unwrap();
+        // patch expected_hooks to 0
+        blob.bytes[0x20..0x28].copy_from_slice(&0u64.to_le_bytes());
+        assert!(blob.parse_offsets().is_err());
+    }
+
+    #[test]
+    fn v2_params_blob_rejects_array_length_mismatch() {
+        let surfaces = vec!["AD-PROC-001".to_string()];
+        let digest = "a".repeat(64);
+        let mut blob = V2ParamsBlob::build("p", "d", &surfaces, &digest).unwrap();
+        // declared 1 hook but patch to 2 -> array length mismatch
+        blob.bytes[0x20..0x28].copy_from_slice(&2u64.to_le_bytes());
+        assert!(blob.parse_offsets().is_err());
+    }
+
+    #[test]
+    fn v2_params_blob_rejects_zero_surface_entry() {
+        let surfaces = vec!["AD-PROC-001".to_string()];
+        let digest = "a".repeat(64);
+        let mut blob = V2ParamsBlob::build("p", "d", &surfaces, &digest).unwrap();
+        // zero the first surface pointer entry
+        let surf_off = u64::from_le_bytes(blob.bytes[0x28..0x30].try_into().unwrap());
+        blob.bytes[surf_off as usize..surf_off as usize + 8].copy_from_slice(&0u64.to_le_bytes());
+        assert!(blob.parse_offsets().is_err());
+    }
+
+    #[test]
+    fn v2_params_blob_rejects_surface_entry_out_of_bounds() {
+        let surfaces = vec!["AD-PROC-001".to_string()];
+        let digest = "a".repeat(64);
+        let mut blob = V2ParamsBlob::build("p", "d", &surfaces, &digest).unwrap();
+        let surf_off = u64::from_le_bytes(blob.bytes[0x28..0x30].try_into().unwrap());
+        // entry points past blob end
+        let bad = blob.bytes.len() as u64 + 999;
+        blob.bytes[surf_off as usize..surf_off as usize + 8].copy_from_slice(&bad.to_le_bytes());
+        assert!(blob.parse_offsets().is_err());
+    }
+
+    #[test]
+    fn v2_params_blob_rejects_surface_string_unterminated() {
+        let surfaces = vec!["AD-PROC-001".to_string()];
+        let digest = "a".repeat(64);
+        let mut blob = V2ParamsBlob::build("p", "d", &surfaces, &digest).unwrap();
+        let surf_off = u64::from_le_bytes(blob.bytes[0x28..0x30].try_into().unwrap());
+        let entry = u64::from_le_bytes(blob.bytes[surf_off as usize..surf_off as usize + 8].try_into().unwrap());
+        // wipe ALL bytes from the surface string start to blob end with non-zero
+        for i in entry as usize..blob.bytes.len() {
+            blob.bytes[i] = 0x58; // 'X'
+        }
         assert!(blob.parse_offsets().is_err());
     }
 

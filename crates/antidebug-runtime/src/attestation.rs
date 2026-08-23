@@ -445,6 +445,10 @@ pub enum AttestationError {
     WalkerEntryVaMissing,
     #[error("round sequence gap: expected {expected}, got {got}")]
     RoundSeqGap { expected: u8, got: u8 },
+    #[error("walker entry va overflow (module_base + rva)")]
+    WalkerEntryOverflow,
+    #[error("walker entry va mismatch: expected {expected:#x}, got {got:#x}")]
+    WalkerEntryMismatch { expected: u64, got: u64 },
 }
 
 
@@ -878,7 +882,12 @@ impl WalkerAttestation {
     }
 
     /// Verify the frozen binding matrix (WO-1503 §6.1) plus digest.
-    pub fn validate(&self, top_level_pid: u32, top_level_runtime_sha256: &str) -> Result<(), AttestationError> {
+    pub fn validate(
+        &self,
+        top_level_pid: u32,
+        top_level_runtime_sha256: &str,
+        top_level_module_base: u64,
+    ) -> Result<(), AttestationError> {
         if self.schema_version != ATTESTATION_SCHEMA_VERSION_V2 {
             return Err(AttestationError::SchemaVersionMismatch {
                 got: self.schema_version,
@@ -904,10 +913,22 @@ impl WalkerAttestation {
         if self.walker_export_rva == 0 {
             return Err(AttestationError::WalkerExportRvaMissing);
         }
-        // entry_va == module_base + rva is a controller-side assertion
-        // (module_base lives at top level); here we require entry_va != 0.
         if self.walker_entry_va == 0 {
             return Err(AttestationError::WalkerEntryVaMissing);
+        }
+        if self.walker_export_rva == 0 {
+            return Err(AttestationError::WalkerExportRvaMissing);
+        }
+        // WO-1503 §6.1 binding: walker_entry_va == module_base + walker_export_rva.
+        // Overflow must fail closed; any mismatch is rejected.
+        let expected_entry = top_level_module_base
+            .checked_add(self.walker_export_rva)
+            .ok_or(AttestationError::WalkerEntryOverflow)?;
+        if expected_entry != self.walker_entry_va {
+            return Err(AttestationError::WalkerEntryMismatch {
+                expected: expected_entry,
+                got: self.walker_entry_va,
+            });
         }
         if self.record_digest.is_empty() {
             return Err(AttestationError::RecordDigestMissing);
@@ -1043,7 +1064,7 @@ impl RuntimeAttestationV2 {
         }
         // Nested walker digest verified BEFORE top-level digest (WO-1503 §5.1a).
         if let Some(w) = &self.walker_attestation {
-            w.validate(self.target_pid, &self.runtime_sha256)?;
+            w.validate(self.target_pid, &self.runtime_sha256, self.module_base)?;
         }
         let recomputed = self.compute_digest();
         if recomputed != self.record_digest {

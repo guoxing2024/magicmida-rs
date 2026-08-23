@@ -882,19 +882,19 @@ fn sample_walker_attestation() -> WalkerAttestation {
 #[test]
 fn walker_attestation_binding_and_digest() {
     let w = sample_walker_attestation();
-    w.validate(TEST_PID, &"a".repeat(64)).unwrap();
+    w.validate(TEST_PID, &"a".repeat(64), TEST_MODULE_BASE).unwrap();
     // tamper -> digest mismatch
     let mut w2 = w.clone();
     w2.probe_summary.av_count = 99;
     assert!(matches!(
-        w2.validate(TEST_PID, &"a".repeat(64)),
+        w2.validate(TEST_PID, &"a".repeat(64), TEST_MODULE_BASE),
         Err(mida_antidebug_runtime::attestation::AttestationError::RecordDigestMismatch { .. })
     ));
     // pid mismatch -> reject
     let mut w3 = w.clone();
     w3.target_pid = TEST_PID + 1;
     assert!(matches!(
-        w3.validate(TEST_PID, &"a".repeat(64)),
+        w3.validate(TEST_PID, &"a".repeat(64), TEST_MODULE_BASE),
         Err(mida_antidebug_runtime::attestation::AttestationError::WalkerPidMismatch { .. })
     ));
 }
@@ -906,7 +906,7 @@ fn walker_attestation_round_sequence_checked() {
     w.rounds.remove(0);
     w.record_digest = w.compute_digest();
     assert!(matches!(
-        w.validate(TEST_PID, &"a".repeat(64)),
+        w.validate(TEST_PID, &"a".repeat(64), TEST_MODULE_BASE),
         Err(mida_antidebug_runtime::attestation::AttestationError::RoundSeqGap { expected: 1, got: 2 })
     ));
 }
@@ -993,4 +993,50 @@ fn v2_top_level_walker_digest_tamper_rejected() {
     let parsed = RuntimeAttestationV2::from_canonical_json(&tampered).unwrap();
     // nested digest mismatch detected before top-level
     assert!(parsed.validate().is_err());
+}
+
+
+// ---- IMP-01-R2: walker entry VA binding (WO-1503 §6.1) ----
+
+#[test]
+fn walker_entry_va_binding_valid() {
+    let w = sample_walker_attestation();
+    // valid: walker_entry_va == module_base + rva
+    w.validate(TEST_PID, &"a".repeat(64), TEST_MODULE_BASE).unwrap();
+}
+
+#[test]
+fn walker_entry_va_binding_mismatch_rejected() {
+    let mut w = sample_walker_attestation();
+    w.walker_entry_va = TEST_MODULE_BASE + 0x1234 + 1; // off by one
+    w.record_digest = w.compute_digest(); // digest valid; binding must still reject
+    assert!(matches!(
+        w.validate(TEST_PID, &"a".repeat(64), TEST_MODULE_BASE),
+        Err(mida_antidebug_runtime::attestation::AttestationError::WalkerEntryMismatch { .. })
+    ));
+}
+
+#[test]
+fn walker_entry_va_binding_overflow_fail_closed() {
+    let mut w = sample_walker_attestation();
+    // module_base near u64::MAX + rva -> overflow must fail closed
+    let huge_base = u64::MAX - 10;
+    w.walker_entry_va = 0x1000; // nonzero
+    w.record_digest = w.compute_digest();
+    assert!(matches!(
+        w.validate(TEST_PID, &"a".repeat(64), huge_base),
+        Err(mida_antidebug_runtime::attestation::AttestationError::WalkerEntryOverflow)
+    ));
+}
+
+#[test]
+fn walker_zero_rva_still_rejected() {
+    let mut w = sample_walker_attestation();
+    w.walker_export_rva = 0;
+    w.walker_entry_va = TEST_MODULE_BASE; // equals base + 0
+    w.record_digest = w.compute_digest();
+    assert!(matches!(
+        w.validate(TEST_PID, &"a".repeat(64), TEST_MODULE_BASE),
+        Err(mida_antidebug_runtime::attestation::AttestationError::WalkerExportRvaMissing)
+    ));
 }
