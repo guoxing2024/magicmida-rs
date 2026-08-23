@@ -68,3 +68,15 @@
 
 ---
 （WO-2602 交付，绑定 639eee3）
+## 7. 提交后绑定补充（Batch 26 交付提交）
+
+- Batch 26 交付提交：`97d6914`（docs(gto): WO-2601 thunk7 probe layout closure +
+  WO-2602/2603/2604/2605 final-head audits + WO-2606 stale-claim scrub），
+  7 文件 +393/-8。
+- 生产代码（crates/）自 `639eee3` 起**零修改**（本提交仅 docs/fixtures），
+  因此 test/check/diffcheck 证据（绑定 639eee3 树）对提交后树仍然有效。
+- 提交后 HEAD：`97d6914d53c3743c48576193252484f342231584`。
+- 提交后 `git diff --check 639eee3..97d6914`：EXIT=0（无 whitespace 错误）。
+
+---
+（WO-2602 补充，提交后绑定 97d6914 / 证据树 639eee3）
