@@ -2381,37 +2381,76 @@ impl Thunk7Fixture {
     }
 }
 
-/// v2 params blob serialization (pure memory; self-relative offsets).
+/// v2 params blob serialization (pure memory; envelope layout).
 ///
-/// MidaInitParamsV2 envelope layout (0x48 header + referenced strings):
-///   0x10 profile_id_off       (self-relative)
-///   0x18 profile_digest_off   (self-relative)
-///   0x28 expected_surfaces_off (self-relative)
-///   0x30 magic_v2             (0x003250324144494D = "MIDA2P2\0" LE)
-///   0x38 digest_off           (self-relative)
-///   0x40 digest_len
+/// MidaInitParamsV2 envelope (WO-1505 §5.3e):
+///   0x10 profile_id_off         (self-relative)
+///   0x18 profile_digest_off     (self-relative)
+///   0x20 expected_hooks         (u64 count of surface pointers)
+///   0x28 expected_surfaces_off  (self-relative to pointer array)
+///   0x30 magic_v2               (0x003250324144494D = "MIDA2P2\0" LE)
+///   0x38 digest_off             (self-relative; 64 hex + NUL)
+///   0x40 digest_len             (must be 64)
+///
+/// Surface array entries are TARGET-LOCAL ABSOLUTE VAs (WO-1505 §5.3e):
+/// the array holds absolute target addresses, not self-relative offsets.
+/// All arithmetic is checked (fail-closed); no unchecked add/mul survives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct V2ParamsBlob {
     pub bytes: Vec<u8>,
 }
 
-pub const V2_ENVELOPE_MAGIC: u64 = 0x0032_5032_4144_494D; // "MIDA2P2 " LE
+pub const V2_ENVELOPE_MAGIC: u64 = 0x0032_5032_4144_494D; // "MIDA2P2\0" LE
 pub const V2_HEADER_BYTES: usize = 0x48;
 /// digest_len field value: 64 (hex chars only; frozen ABI).
 /// The wire region is 64 hex + 1 NUL = 65 bytes; the FIELD is 64.
 pub const V2_DIGEST_LEN: u64 = 64;
 /// Wire region bytes: 64 hex chars + NUL terminator.
 pub const V2_DIGEST_REGION_BYTES: u64 = 65;
+/// Max surface count (WO-1505 §5.3e / RC-4: builder rejects > 256).
+pub const V2_MAX_HOOKS: u64 = 256;
+
+/// Canonical x64 user-mode VA predicate (kernel high-half is not canonical
+/// user VA; see WO-1505 §5.3e canonical rule: absolute addresses in the
+/// envelope must be canonical user VAs and nonzero).
+pub fn v2_is_canonical_user_va(va: u64) -> bool {
+    // x64 canonical user addresses: 0x0000_0000_0000_0000 ..= 0x0000_7FFF_FFFF_FFFF
+    // (bits 48..63 zero); kernel addresses (bit 47 set) are not user VAs.
+    va <= 0x0000_7FFF_FFFF_FFFF
+}
 
 impl V2ParamsBlob {
-    /// Serialize a v2 params envelope with self-relative offsets.
+    /// Serialize a v2 params envelope.
+    ///
+    /// Layout (WO-1505 §5.3a golden bytes / RC-4):
+    ///   [0x00 .. 0x48) header; strings follow in this order:
+    ///   profile_id, profile_digest, surface strings, then the pointer array
+    ///   (entries = absolute VAs of the surface strings), then the digest.
+    /// All offsets written into the header are SELF-RELATIVE (offset from
+    /// blob start). The pointer array itself holds ABSOLUTE VAs (RC-4).
+    ///
+    /// Rejection rules:
+    ///   - digest must be exactly 64 lowercase hex chars (0-9a-f only).
+    ///   - expected_hooks (surface count) must be in 1..=256; builder
+    ///     rejects zero and > 256 (RC-4 item 6/10).
+    ///   - surface strings must be nonempty.
     pub fn build(
         profile_id: &str,
         profile_digest: &str,
         expected_surfaces: &[String],
         digest: &str,
+        blob_base: u64,
     ) -> Result<Self, RuntimeLoadError> {
-        // digest: exactly 64 LOWERCASE hex chars (0-9a-f only; WO-1505 §5.3b).
+        if !v2_is_canonical_user_va(blob_base) {
+            return Err(RuntimeLoadError::ExportResolutionFailed(format!(
+                "v2 blob_base must be a canonical user VA, got {blob_base:#x}"
+            )));
+        }
+        if blob_base == 0 {
+            return Err(RuntimeLoadError::ExportResolutionFailed(
+                "v2 blob_base must be nonzero".to_string(),
+            ));
+        }
         if digest.len() != 64 {
             return Err(RuntimeLoadError::ExportResolutionFailed(format!(
                 "v2 digest must be 64 hex chars, got {}",
@@ -2424,6 +2463,24 @@ impl V2ParamsBlob {
             ));
         }
         let expected_hooks = expected_surfaces.len() as u64;
+        if expected_hooks == 0 {
+            return Err(RuntimeLoadError::ExportResolutionFailed(
+                "v2 expected_hooks must be in 1..=256".to_string(),
+            ));
+        }
+        if expected_hooks > V2_MAX_HOOKS {
+            return Err(RuntimeLoadError::ExportResolutionFailed(format!(
+                "v2 expected_hooks exceeds max 256, got {}",
+                expected_hooks
+            )));
+        }
+        for s in expected_surfaces {
+            if s.is_empty() {
+                return Err(RuntimeLoadError::ExportResolutionFailed(
+                    "v2 surface string must be nonempty".to_string(),
+                ));
+            }
+        }
         let mut out: Vec<u8> = Vec::new();
         out.resize(V2_HEADER_BYTES, 0u8);
         // magic
@@ -2440,14 +2497,26 @@ impl V2ParamsBlob {
         let pd_off = out.len() as u64;
         out.extend_from_slice(profile_digest.as_bytes());
         out.push(0);
-        // surface strings then pointer array
+        // surface strings
         let mut surf_addrs: Vec<u64> = Vec::with_capacity(expected_surfaces.len());
         for s in expected_surfaces {
             let off = out.len() as u64;
             out.extend_from_slice(s.as_bytes());
             out.push(0);
-            surf_addrs.push(off);
+            // ABSOLUTE target VA (RC-4 item 2): blob_base + relative offset.
+            let abs = blob_base.checked_add(off).ok_or_else(|| {
+                RuntimeLoadError::ExportResolutionFailed(format!(
+                    "v2 surface entry absolute VA overflow at {off:#x}"
+                ))
+            })?;
+            if !v2_is_canonical_user_va(abs) {
+                return Err(RuntimeLoadError::ExportResolutionFailed(format!(
+                    "v2 surface entry absolute VA noncanonical: {abs:#x}"
+                )));
+            }
+            surf_addrs.push(abs);
         }
+        // pointer array (absolute VAs)
         let surf_arr_off = out.len() as u64;
         for a in surf_addrs {
             out.extend_from_slice(&a.to_le_bytes());
@@ -2468,12 +2537,38 @@ impl V2ParamsBlob {
     }
 
     /// Offline re-parse of the serialized blob (no pointer dereference).
-    pub fn parse_offsets(&self) -> Result<V2Offsets, RuntimeLoadError> {
+    ///
+    /// Verifies, in order (fail-closed on every check):
+    ///   1. header size / magic / digest_len field
+    ///   2. expected_hooks semantics: zero-hooks + zero-surfaces_off is the
+    ///      ONLY legal zero case (RC-4 item 6); zero-hooks + nonzero
+    ///      surfaces_off rejected; nonzero-hooks + zero surfaces_off rejected.
+    ///   3. self-relative header offsets in-bounds, strings bounded NUL
+    ///   4. surfaces array: length == expected_hooks * 8 (checked), array
+    ///      end == digest_off exactly (no unknown tail / truncation)
+    ///   5. digest region: 65 bytes, lowercase hex, NUL at +64
+    ///   6. per-entry: nonzero, canonical user VA, in [blob_base, blob_end)
+    ///      (RC-4 item 5) — entries are ABSOLUTE VAs; converted to relative
+    ///      index before reading (checked).
+    ///   7. blob_base + params_bytes checked (RC-4 item 4).
+    pub fn parse_offsets(&self, blob_base: u64) -> Result<V2Offsets, RuntimeLoadError> {
         if self.bytes.len() < V2_HEADER_BYTES {
             return Err(RuntimeLoadError::ExportResolutionFailed(
                 "v2 blob shorter than header".to_string(),
             ));
         }
+        if !v2_is_canonical_user_va(blob_base) || blob_base == 0 {
+            return Err(RuntimeLoadError::ExportResolutionFailed(format!(
+                "v2 blob_base invalid: {blob_base:#x}"
+            )));
+        }
+        let len = self.bytes.len() as u64;
+        // RC-4 item 4: blob_base + params_bytes checked.
+        let blob_end = blob_base.checked_add(len).ok_or_else(|| {
+            RuntimeLoadError::ExportResolutionFailed(format!(
+                "v2 blob_base + params_bytes overflow: {blob_base:#x} + {len:#x}"
+            ))
+        })?;
         let magic = u64::from_le_bytes(self.bytes[0x30..0x38].try_into().unwrap());
         if magic != V2_ENVELOPE_MAGIC {
             return Err(RuntimeLoadError::ExportResolutionFailed(
@@ -2494,23 +2589,27 @@ impl V2ParamsBlob {
                 dig_len_field
             )));
         }
-        // expected_hooks must be nonzero and bounded (fail-closed).
-        if expected_hooks == 0 {
+        // RC-4 items 6/7/8: zero-hooks semantics.
+        if expected_hooks == 0 && surf_off != 0 {
             return Err(RuntimeLoadError::ExportResolutionFailed(
-                "v2 expected_hooks must be nonzero".to_string(),
+                "v2 zero hooks with nonzero surfaces_off rejected".to_string(),
             ));
         }
-        if expected_hooks > 256 {
+        if expected_hooks > 0 && surf_off == 0 {
+            return Err(RuntimeLoadError::ExportResolutionFailed(
+                "v2 nonzero hooks with zero surfaces_off rejected".to_string(),
+            ));
+        }
+        if expected_hooks > V2_MAX_HOOKS {
             return Err(RuntimeLoadError::ExportResolutionFailed(format!(
                 "v2 expected_hooks exceeds max 256, got {}",
                 expected_hooks
             )));
         }
-        let len = self.bytes.len() as u64;
+        // self-relative header offsets must be in [0x48, len) (when nonzero).
         for (name, off) in [
             ("profile_id", pid_off),
             ("profile_digest", pd_off),
-            ("surfaces", surf_off),
             ("digest", dig_off),
         ] {
             if off < V2_HEADER_BYTES as u64 || off >= len {
@@ -2519,21 +2618,10 @@ impl V2ParamsBlob {
                 )));
             }
         }
-        let scan_nul = |off: u64, name: &str| -> Result<u64, RuntimeLoadError> {
-            let mut i = off;
-            while i < len {
-                if self.bytes[i as usize] == 0 {
-                    return Ok(i);
-                }
-                i += 1;
-            }
-            Err(RuntimeLoadError::ExportResolutionFailed(format!(
-                "v2 {name} string unterminated"
-            )))
-        };
-        let _pid_end = scan_nul(pid_off, "profile_id")?;
-        let _pd_end = scan_nul(pd_off, "profile_digest")?;
-        let _dig_end = scan_nul(dig_off, "digest")?;
+        // Bounded NUL scans for the referenced strings (fail-closed).
+        scan_nul_rel(&self.bytes, pid_off, len, "profile_id")?;
+        scan_nul_rel(&self.bytes, pd_off, len, "profile_digest")?;
+        scan_nul_rel(&self.bytes, dig_off, len, "digest")?;
 
         // digest region: 64 LOWERCASE hex chars + NUL = 65 bytes.
         let dig_region_end = dig_off
@@ -2560,7 +2648,6 @@ impl V2ParamsBlob {
                 "v2 digest region NUL missing".to_string(),
             ));
         }
-
         // surfaces array: length MUST be exactly expected_hooks * 8 (checked),
         // positioned immediately before the digest region.
         let array_bytes = expected_hooks
@@ -2568,50 +2655,74 @@ impl V2ParamsBlob {
             .ok_or(RuntimeLoadError::ExportResolutionFailed(
                 "v2 expected_hooks*8 overflow".to_string(),
             ))?;
-        let array_end = surf_off
-            .checked_add(array_bytes)
-            .ok_or(RuntimeLoadError::ExportResolutionFailed(
-                "v2 surfaces array end overflow".to_string(),
-            ))?;
-        if array_end != dig_off {
-            let actual = dig_off.checked_sub(surf_off).unwrap_or(u64::MAX);
-            return Err(RuntimeLoadError::ExportResolutionFailed(format!(
-                "v2 surfaces array length mismatch: declared {expected_hooks} entries -> {array_bytes}B, actual region {actual}B"
-            )));
-        }
-
-        // Per-entry checks (WO-1505 §5.3e): each entry is a self-relative
-        // offset to the surface string; must be nonzero, canonical user VA
-        // shape (offset < blob len is required; canonical VA is a controller
-        // concern once the blob is mapped), in-bounds, and the string at
-        // that offset must be NUL-terminated within bounds.
-        for i in 0..expected_hooks {
-            let entry_off = surf_off + i * 8;
-            let entry = u64::from_le_bytes(
-                self.bytes[entry_off as usize..entry_off as usize + 8]
-                    .try_into()
-                    .unwrap(),
-            );
-            if entry == 0 {
+        if expected_hooks > 0 {
+            let array_end = surf_off
+                .checked_add(array_bytes)
+                .ok_or(RuntimeLoadError::ExportResolutionFailed(
+                    "v2 surfaces array end overflow".to_string(),
+                ))?;
+            if array_end != dig_off {
+                let actual = dig_off.checked_sub(surf_off).unwrap_or(u64::MAX);
                 return Err(RuntimeLoadError::ExportResolutionFailed(format!(
-                    "v2 surface entry {i} is zero"
+                    "v2 surfaces array length mismatch: declared {expected_hooks} entries -> {array_bytes}B, actual region {actual}B"
                 )));
             }
-            if entry < V2_HEADER_BYTES as u64 || entry >= surf_off {
-                return Err(RuntimeLoadError::ExportResolutionFailed(format!(
-                    "v2 surface entry {i} offset out of bounds: {entry:#x}"
-                )));
+            // Per-entry checks (WO-1505 §5.3e + RC-4 item 5): each entry is an
+            // ABSOLUTE target VA: nonzero, canonical user VA, in
+            // [blob_base, blob_end); convert to relative index (checked)
+            // before reading the surface string.
+            for i in 0..expected_hooks {
+                // RC-4 P0-4: entry arithmetic fully checked.
+                let entry_off = surf_off
+                    .checked_add(
+                        i.checked_mul(8)
+                            .ok_or(RuntimeLoadError::ExportResolutionFailed(
+                                "v2 entry index*8 overflow".to_string(),
+                            ))?,
+                    )
+                    .ok_or(RuntimeLoadError::ExportResolutionFailed(
+                        "v2 entry offset overflow".to_string(),
+                    ))?;
+                if entry_off + 8 > len {
+                    return Err(RuntimeLoadError::ExportResolutionFailed(
+                        "v2 surface entry read past blob end".to_string(),
+                    ));
+                }
+                let entry = u64::from_le_bytes(
+                    self.bytes[entry_off as usize..entry_off as usize + 8]
+                        .try_into()
+                        .unwrap(),
+                );
+                if entry == 0 {
+                    return Err(RuntimeLoadError::ExportResolutionFailed(format!(
+                        "v2 surface entry {i} is zero"
+                    )));
+                }
+                if !v2_is_canonical_user_va(entry) {
+                    return Err(RuntimeLoadError::ExportResolutionFailed(format!(
+                        "v2 surface entry {i} noncanonical VA: {entry:#x}"
+                    )));
+                }
+                if entry < blob_base || entry >= blob_end {
+                    return Err(RuntimeLoadError::ExportResolutionFailed(format!(
+                        "v2 surface entry {i} VA outside blob: {entry:#x} not in [{blob_base:#x}, {blob_end:#x})"
+                    )));
+                }
+                let rel = entry
+                    .checked_sub(blob_base)
+                    .ok_or(RuntimeLoadError::ExportResolutionFailed(
+                        "v2 surface entry below blob_base".to_string(),
+                    ))?;
+                // surface string bounded NUL scan (within blob)
+                scan_nul_rel(&self.bytes, rel, len, &format!("surface {i}"))?;
             }
-            // surface string bounded NUL scan
-            scan_nul(entry, "surface")?;
         }
-
+        // digest region must be the tail: unknown tail rejected (RC-4 item 12).
         if dig_region_end != len {
             return Err(RuntimeLoadError::ExportResolutionFailed(
                 "v2 unknown tail after digest region".to_string(),
             ));
         }
-
         Ok(V2Offsets {
             profile_id_off: pid_off,
             profile_digest_off: pd_off,
@@ -2623,7 +2734,25 @@ impl V2ParamsBlob {
     }
 }
 
-/// Parsed v2 self-relative offsets (controller-side view).
+/// Bounded NUL scan over a relative offset inside a blob (fail-closed).
+fn scan_nul_rel(bytes: &[u8], off: u64, len: u64, name: &str) -> Result<u64, RuntimeLoadError> {
+    let mut i = off;
+    while i < len {
+        if bytes[i as usize] == 0 {
+            return Ok(i);
+        }
+        i = i
+            .checked_add(1)
+            .ok_or(RuntimeLoadError::ExportResolutionFailed(
+                "v2 NUL scan overflow".to_string(),
+            ))?;
+    }
+    Err(RuntimeLoadError::ExportResolutionFailed(format!(
+        "v2 {name} string unterminated"
+    )))
+}
+
+/// Parsed v2 offsets (controller-side view).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct V2Offsets {
     pub profile_id_off: u64,
@@ -2639,6 +2768,18 @@ pub struct V2Offsets {
 #[cfg(test)]
 mod imp03_inert_adapter_tests {
     use super::*;
+
+    /// Canonical user VA used as the fake target-local blob base in tests.
+    const BLOB_BASE: u64 = 0x0000_1000_0000;
+
+    fn dig64() -> String {
+        "a".repeat(64)
+    }
+
+    fn build_blob(surfaces: &[&str]) -> V2ParamsBlob {
+        let ss: Vec<String> = surfaces.iter().map(|s| s.to_string()).collect();
+        V2ParamsBlob::build("p", "d", &ss, &dig64(), BLOB_BASE).unwrap()
+    }
 
     #[test]
     fn wanted_exports_v2_has_three_symbols() {
@@ -2681,10 +2822,8 @@ mod imp03_inert_adapter_tests {
     #[test]
     fn thunk7_fixture_structural_offsets() {
         let fx = Thunk7Fixture::build();
-        // production: call@0x35, ret@0x3B
         assert_eq!(&fx.production[0x35..0x37], &[0xFF, 0xD0]);
         assert_eq!(fx.production[0x3B], 0xC3);
-        // test: probe@0x35, call@0x39, ret@0x3F
         assert_eq!(&fx.test_with_probe[0x35..0x39], &[0x49, 0x89, 0x63, 0x48]);
         assert_eq!(&fx.test_with_probe[0x39..0x3B], &[0xFF, 0xD0]);
         assert_eq!(fx.test_with_probe[0x3F], 0xC3);
@@ -2692,7 +2831,6 @@ mod imp03_inert_adapter_tests {
 
     #[test]
     fn thunk7_fixture_matches_known_hashes() {
-        // production SHA-256 = 9B6F4A7A... (documented closure)
         use sha2::{Digest, Sha256};
         let fx = Thunk7Fixture::build();
         let prod_sha = {
@@ -2717,181 +2855,292 @@ mod imp03_inert_adapter_tests {
         );
     }
 
+    // ------------------------------------------------------------------
+    // V2ParamsBlob: build / parse (RC-4 absolute-VA envelope)
+    // ------------------------------------------------------------------
+
     #[test]
     fn v2_params_blob_roundtrip_offsets() {
-        let surfaces = vec!["AD-PROC-001".to_string(), "AD-PROC-002".to_string()];
-        let digest = "a".repeat(64);
-        let blob = V2ParamsBlob::build("profile-x", "digest-y", &surfaces, &digest).unwrap();
-        // header + strings + pointers + digest
+        let blob = build_blob(&["AD-PROC-001", "AD-PROC-002"]);
         assert!(blob.bytes.len() > V2_HEADER_BYTES);
-        let offs = blob.parse_offsets().unwrap();
+        let offs = blob.parse_offsets(BLOB_BASE).unwrap();
         assert_eq!(offs.profile_id_off, 0x48);
         assert_eq!(offs.digest_len, 64);
-        // magic check inside parse_offsets passed
+        assert_eq!(offs.expected_hooks, 2);
     }
 
     #[test]
     fn v2_params_blob_rejects_bad_digest_len() {
-        let surfaces = vec!["AD-PROC-001".to_string()];
-        assert!(V2ParamsBlob::build("p", "d", &surfaces, "short").is_err());
+        let ss = vec!["AD-PROC-001".to_string()];
+        assert!(V2ParamsBlob::build("p", "d", &ss, "short", BLOB_BASE).is_err());
     }
 
     #[test]
     fn v2_params_blob_parse_rejects_truncated() {
         let blob = V2ParamsBlob { bytes: vec![0u8; 16] };
-        assert!(blob.parse_offsets().is_err());
+        assert!(blob.parse_offsets(BLOB_BASE).is_err());
     }
+
     #[test]
     fn v2_params_blob_digest_len_field_is_64() {
-        let surfaces = vec!["AD-PROC-001".to_string()];
-        let digest = "a".repeat(64);
-        let blob = V2ParamsBlob::build("p", "d", &surfaces, &digest).unwrap();
+        let blob = build_blob(&["AD-PROC-001"]);
         let field = u64::from_le_bytes(blob.bytes[0x40..0x48].try_into().unwrap());
         assert_eq!(field, 64);
-        let offs = blob.parse_offsets().unwrap();
+        let offs = blob.parse_offsets(BLOB_BASE).unwrap();
         assert_eq!(offs.digest_len, 64);
         assert_eq!(offs.digest_off + 65, blob.bytes.len() as u64);
     }
 
     #[test]
     fn v2_params_blob_rejects_wrong_digest_len_field() {
-        let surfaces = vec!["AD-PROC-001".to_string()];
-        let digest = "a".repeat(64);
-        let mut blob = V2ParamsBlob::build("p", "d", &surfaces, &digest).unwrap();
+        let mut blob = build_blob(&["AD-PROC-001"]);
         blob.bytes[0x40..0x48].copy_from_slice(&65u64.to_le_bytes());
-        assert!(blob.parse_offsets().is_err());
+        assert!(blob.parse_offsets(BLOB_BASE).is_err());
     }
 
     #[test]
     fn v2_params_blob_rejects_unknown_tail() {
-        let surfaces = vec!["AD-PROC-001".to_string()];
-        let digest = "a".repeat(64);
-        let mut blob = V2ParamsBlob::build("p", "d", &surfaces, &digest).unwrap();
+        let mut blob = build_blob(&["AD-PROC-001"]);
         blob.bytes.push(0xAA);
-        assert!(blob.parse_offsets().is_err());
+        assert!(blob.parse_offsets(BLOB_BASE).is_err());
     }
 
     #[test]
     fn v2_params_blob_rejects_non_hex_digest() {
-        let surfaces = vec!["AD-PROC-001".to_string()];
-        let digest = "z".repeat(64); // z is not hex
-        // build() rejects non-hex immediately (fail-closed at construction)
-        assert!(V2ParamsBlob::build("p", "d", &surfaces, &digest).is_err());
+        let ss = vec!["AD-PROC-001".to_string()];
+        assert!(V2ParamsBlob::build("p", "d", &ss, &"z".repeat(64), BLOB_BASE).is_err());
     }
 
     #[test]
     fn v2_params_blob_rejects_offset_out_of_bounds() {
-        let surfaces = vec!["AD-PROC-001".to_string()];
-        let digest = "a".repeat(64);
-        let mut blob = V2ParamsBlob::build("p", "d", &surfaces, &digest).unwrap();
+        let mut blob = build_blob(&["AD-PROC-001"]);
         let len = blob.bytes.len() as u64;
         blob.bytes[0x10..0x18].copy_from_slice(&(len + 100).to_le_bytes());
-        assert!(blob.parse_offsets().is_err());
+        assert!(blob.parse_offsets(BLOB_BASE).is_err());
     }
 
     #[test]
     fn v2_params_blob_rejects_underflow_surface_region() {
-        let surfaces = vec!["AD-PROC-001".to_string()];
-        let digest = "a".repeat(64);
-        let mut blob = V2ParamsBlob::build("p", "d", &surfaces, &digest).unwrap();
-        // patch surfaces_off AFTER digest_off -> surfaces array must precede digest
+        let mut blob = build_blob(&["AD-PROC-001"]);
         let dig_off = u64::from_le_bytes(blob.bytes[0x38..0x40].try_into().unwrap());
         blob.bytes[0x28..0x30].copy_from_slice(&(dig_off + 8).to_le_bytes());
-        assert!(blob.parse_offsets().is_err());
+        assert!(blob.parse_offsets(BLOB_BASE).is_err());
     }
 
     #[test]
     fn v2_params_blob_build_writes_expected_hooks() {
-        let surfaces = vec!["AD-PROC-001".to_string(), "AD-PROC-002".to_string()];
-        let digest = "a".repeat(64);
-        let blob = V2ParamsBlob::build("p", "d", &surfaces, &digest).unwrap();
-        // expected_hooks at 0x20 = 2
-        let hooks = u64::from_le_bytes(blob.bytes[0x20..0x28].try_into().unwrap());
-        assert_eq!(hooks, 2);
-        let offs = blob.parse_offsets().unwrap();
+        let blob = build_blob(&["AD-PROC-001", "AD-PROC-002"]);
+        let h = u64::from_le_bytes(blob.bytes[0x20..0x28].try_into().unwrap());
+        assert_eq!(h, 2);
+        let offs = blob.parse_offsets(BLOB_BASE).unwrap();
         assert_eq!(offs.expected_hooks, 2);
     }
 
     #[test]
     fn v2_params_blob_rejects_uppercase_digest() {
-        let surfaces = vec!["AD-PROC-001".to_string()];
-        // uppercase hex must be rejected (WO-1505 §5.3b: 0-9a-f only)
-        let digest_upper = "A".repeat(64);
-        assert!(V2ParamsBlob::build("p", "d", &surfaces, &digest_upper).is_err());
-        // mixed case also rejected
-        let digest_mixed = "a".repeat(63) + "F";
-        assert!(V2ParamsBlob::build("p", "d", &surfaces, &digest_mixed).is_err());
-        // lowercase accepted
-        let digest_lower = "a".repeat(64);
-        assert!(V2ParamsBlob::build("p", "d", &surfaces, &digest_lower).is_ok());
+        let ss = vec!["AD-PROC-001".to_string()];
+        assert!(V2ParamsBlob::build("p", "d", &ss, &"A".repeat(64), BLOB_BASE).is_err());
+        assert!(V2ParamsBlob::build("p", "d", &ss, &("a".repeat(63) + "F"), BLOB_BASE).is_err());
+        assert!(V2ParamsBlob::build("p", "d", &ss, &dig64(), BLOB_BASE).is_ok());
     }
 
     #[test]
     fn v2_params_blob_parse_rejects_uppercase_digest_on_wire() {
-        let surfaces = vec!["AD-PROC-001".to_string()];
-        let digest = "a".repeat(64);
-        let mut blob = V2ParamsBlob::build("p", "d", &surfaces, &digest).unwrap();
-        // patch a digest char to uppercase on the wire
+        let mut blob = build_blob(&["AD-PROC-001"]);
         let dig_off = u64::from_le_bytes(blob.bytes[0x38..0x40].try_into().unwrap());
         blob.bytes[dig_off as usize] = b'A';
-        assert!(blob.parse_offsets().is_err());
+        assert!(blob.parse_offsets(BLOB_BASE).is_err());
     }
 
     #[test]
     fn v2_params_blob_rejects_zero_expected_hooks() {
-        let surfaces = vec!["AD-PROC-001".to_string()];
-        let digest = "a".repeat(64);
-        let mut blob = V2ParamsBlob::build("p", "d", &surfaces, &digest).unwrap();
-        // patch expected_hooks to 0
+        // zero hooks + NONZERO surfaces_off must be rejected (RC-4 item 7).
+        let mut blob = build_blob(&["AD-PROC-001"]);
         blob.bytes[0x20..0x28].copy_from_slice(&0u64.to_le_bytes());
-        assert!(blob.parse_offsets().is_err());
+        assert!(blob.parse_offsets(BLOB_BASE).is_err());
+    }
+
+    #[test]
+    fn v2_params_blob_zero_hooks_zero_off_allowed() {
+        // RC-4 item 6: expected_hooks == 0 && surf_off == 0 is legal.
+        let mut blob = build_blob(&["AD-PROC-001"]);
+        // remove the pointer array region so the envelope has no array bytes;
+        // digest shifts left by the array size, so digest_off must be updated.
+        let surf_arr_off = u64::from_le_bytes(blob.bytes[0x28..0x30].try_into().unwrap());
+        let dig_off = u64::from_le_bytes(blob.bytes[0x38..0x40].try_into().unwrap());
+        let arr_len = (dig_off - surf_arr_off) as usize;
+        blob.bytes.drain(surf_arr_off as usize..dig_off as usize);
+        debug_assert_eq!(arr_len, 8);
+        blob.bytes[0x38..0x40].copy_from_slice(&surf_arr_off.to_le_bytes());
+        // zero hooks + zero surfaces_off
+        blob.bytes[0x20..0x28].copy_from_slice(&0u64.to_le_bytes());
+        blob.bytes[0x28..0x30].copy_from_slice(&0u64.to_le_bytes());
+        let offs = blob.parse_offsets(BLOB_BASE).unwrap();
+        assert_eq!(offs.expected_hooks, 0);
+        assert_eq!(offs.expected_surfaces_off, 0);
+    }
+
+    #[test]
+    fn v2_params_blob_rejects_nonzero_hooks_zero_off() {
+        // RC-4 item 8: nonzero hooks + zero surfaces_off must be rejected.
+        let mut blob = build_blob(&["AD-PROC-001"]);
+        blob.bytes[0x28..0x30].copy_from_slice(&0u64.to_le_bytes());
+        assert!(blob.parse_offsets(BLOB_BASE).is_err());
     }
 
     #[test]
     fn v2_params_blob_rejects_array_length_mismatch() {
-        let surfaces = vec!["AD-PROC-001".to_string()];
-        let digest = "a".repeat(64);
-        let mut blob = V2ParamsBlob::build("p", "d", &surfaces, &digest).unwrap();
-        // declared 1 hook but patch to 2 -> array length mismatch
+        let mut blob = build_blob(&["AD-PROC-001"]);
         blob.bytes[0x20..0x28].copy_from_slice(&2u64.to_le_bytes());
-        assert!(blob.parse_offsets().is_err());
+        assert!(blob.parse_offsets(BLOB_BASE).is_err());
+    }
+
+    #[test]
+    fn v2_params_blob_rejects_array_truncation() {
+        // array region shorter than declared: surf_off moved 8 bytes right.
+        let mut blob = build_blob(&["AD-PROC-001", "AD-PROC-002"]);
+        let surf_off = u64::from_le_bytes(blob.bytes[0x28..0x30].try_into().unwrap());
+        blob.bytes[0x28..0x30].copy_from_slice(&(surf_off + 8).to_le_bytes());
+        assert!(blob.parse_offsets(BLOB_BASE).is_err());
     }
 
     #[test]
     fn v2_params_blob_rejects_zero_surface_entry() {
-        let surfaces = vec!["AD-PROC-001".to_string()];
-        let digest = "a".repeat(64);
-        let mut blob = V2ParamsBlob::build("p", "d", &surfaces, &digest).unwrap();
-        // zero the first surface pointer entry
+        let mut blob = build_blob(&["AD-PROC-001"]);
         let surf_off = u64::from_le_bytes(blob.bytes[0x28..0x30].try_into().unwrap());
         blob.bytes[surf_off as usize..surf_off as usize + 8].copy_from_slice(&0u64.to_le_bytes());
-        assert!(blob.parse_offsets().is_err());
+        assert!(blob.parse_offsets(BLOB_BASE).is_err());
     }
 
     #[test]
-    fn v2_params_blob_rejects_surface_entry_out_of_bounds() {
-        let surfaces = vec!["AD-PROC-001".to_string()];
-        let digest = "a".repeat(64);
-        let mut blob = V2ParamsBlob::build("p", "d", &surfaces, &digest).unwrap();
+    fn v2_params_blob_rejects_relative_surface_entry() {
+        // RC-4 item 11: a self-relative-style small offset is NOT a valid
+        // absolute VA (it is outside [blob_base, blob_end)).
+        let mut blob = build_blob(&["AD-PROC-001"]);
         let surf_off = u64::from_le_bytes(blob.bytes[0x28..0x30].try_into().unwrap());
-        // entry points past blob end
-        let bad = blob.bytes.len() as u64 + 999;
-        blob.bytes[surf_off as usize..surf_off as usize + 8].copy_from_slice(&bad.to_le_bytes());
-        assert!(blob.parse_offsets().is_err());
+        blob.bytes[surf_off as usize..surf_off as usize + 8]
+            .copy_from_slice(&0x48u64.to_le_bytes());
+        assert!(blob.parse_offsets(BLOB_BASE).is_err());
+    }
+
+    #[test]
+    fn v2_params_blob_rejects_noncanonical_surface_entry() {
+        // RC-4 item 12: kernel-high-half VA (bit 47 set) is noncanonical user.
+        let mut blob = build_blob(&["AD-PROC-001"]);
+        let surf_off = u64::from_le_bytes(blob.bytes[0x28..0x30].try_into().unwrap());
+        blob.bytes[surf_off as usize..surf_off as usize + 8]
+            .copy_from_slice(&0xFFFF_8000_0000_0000u64.to_le_bytes());
+        assert!(blob.parse_offsets(BLOB_BASE).is_err());
+    }
+
+    #[test]
+    fn v2_params_blob_rejects_entry_outside_blob() {
+        // absolute VA beyond blob_end must be rejected.
+        let mut blob = build_blob(&["AD-PROC-001"]);
+        let surf_off = u64::from_le_bytes(blob.bytes[0x28..0x30].try_into().unwrap());
+        let blob_end = BLOB_BASE + blob.bytes.len() as u64;
+        blob.bytes[surf_off as usize..surf_off as usize + 8]
+            .copy_from_slice(&(blob_end + 0x10).to_le_bytes());
+        assert!(blob.parse_offsets(BLOB_BASE).is_err());
     }
 
     #[test]
     fn v2_params_blob_rejects_surface_string_unterminated() {
-        let surfaces = vec!["AD-PROC-001".to_string()];
-        let digest = "a".repeat(64);
-        let mut blob = V2ParamsBlob::build("p", "d", &surfaces, &digest).unwrap();
+        let mut blob = build_blob(&["AD-PROC-001"]);
         let surf_off = u64::from_le_bytes(blob.bytes[0x28..0x30].try_into().unwrap());
         let entry = u64::from_le_bytes(blob.bytes[surf_off as usize..surf_off as usize + 8].try_into().unwrap());
+        let rel = (entry - BLOB_BASE) as usize;
         // wipe ALL bytes from the surface string start to blob end with non-zero
-        for i in entry as usize..blob.bytes.len() {
+        for i in rel..blob.bytes.len() {
             blob.bytes[i] = 0x58; // 'X'
         }
-        assert!(blob.parse_offsets().is_err());
+        assert!(blob.parse_offsets(BLOB_BASE).is_err());
     }
 
+    #[test]
+    fn v2_params_blob_builder_rejects_zero_hooks() {
+        let empty: Vec<String> = vec![];
+        assert!(V2ParamsBlob::build("p", "d", &empty, &dig64(), BLOB_BASE).is_err());
+    }
+
+    #[test]
+    fn v2_params_blob_builder_rejects_over_256() {
+        // RC-4 item 10: builder rejects > 256 surfaces.
+        let many: Vec<String> = (0..257).map(|i| format!("SURF-{i}")).collect();
+        assert!(V2ParamsBlob::build("p", "d", &many, &dig64(), BLOB_BASE).is_err());
+        // exactly 256 is allowed at build; parse requires matching array.
+        let at256: Vec<String> = (0..256).map(|i| format!("SURF-{i}")).collect();
+        let blob = V2ParamsBlob::build("p", "d", &at256, &dig64(), BLOB_BASE).unwrap();
+        assert_eq!(
+            u64::from_le_bytes(blob.bytes[0x20..0x28].try_into().unwrap()),
+            256
+        );
+        assert!(blob.parse_offsets(BLOB_BASE).is_ok());
+    }
+
+    #[test]
+    fn v2_params_blob_builder_rejects_empty_surface_string() {
+        let ss = vec!["".to_string()];
+        assert!(V2ParamsBlob::build("p", "d", &ss, &dig64(), BLOB_BASE).is_err());
+    }
+
+    #[test]
+    fn v2_params_blob_builder_rejects_noncanonical_blob_base() {
+        let ss = vec!["AD-PROC-001".to_string()];
+        // kernel high half: noncanonical user VA
+        assert!(V2ParamsBlob::build("p", "d", &ss, &dig64(), 0xFFFF_8000_0000_0000).is_err());
+        // zero blob base rejected
+        assert!(V2ParamsBlob::build("p", "d", &ss, &dig64(), 0).is_err());
+    }
+
+    #[test]
+    fn v2_params_blob_build_writes_absolute_surface_vars() {
+        // RC-4 item 2: array entries are ABSOLUTE target VAs (blob_base + rel).
+        let blob = build_blob(&["AD-PROC-001", "AD-PROC-002"]);
+        let surf_off = u64::from_le_bytes(blob.bytes[0x28..0x30].try_into().unwrap());
+        let e0 = u64::from_le_bytes(blob.bytes[surf_off as usize..surf_off as usize + 8].try_into().unwrap());
+        let e1 = u64::from_le_bytes(blob.bytes[surf_off as usize + 8..surf_off as usize + 16].try_into().unwrap());
+        // first surface string starts at 0x48 + len("p")+1 + len("d")+1
+        let s0_rel = (0x48 + 2 + 2) as u64;
+        let s1_rel = s0_rel + "AD-PROC-001".len() as u64 + 1;
+        assert_eq!(e0, BLOB_BASE + s0_rel);
+        assert_eq!(e1, BLOB_BASE + s1_rel);
+        assert!(e0 > BLOB_BASE && e1 > e0);
+        let offs = blob.parse_offsets(BLOB_BASE).unwrap();
+        assert_eq!(offs.expected_hooks, 2);
+    }
+
+    #[test]
+    fn v2_params_blob_build_rejects_absolute_va_overflow() {
+        // blob_base at top of canonical user range + long strings -> the
+        // absolute entry VA overflows u64 (checked_add fail-closed).
+        let ss = vec!["AD-PROC-001".to_string()];
+        let base = 0x0000_7FFF_FFFF_FFFFu64;
+        // build must fail because abs = base + rel overflows
+        assert!(V2ParamsBlob::build("p", "d", &ss, &dig64(), base).is_err());
+    }
+
+    #[test]
+    fn v2_params_blob_parse_rejects_bad_blob_base() {
+        let blob = build_blob(&["AD-PROC-001"]);
+        // zero blob base
+        assert!(blob.parse_offsets(0).is_err());
+        // noncanonical blob base
+        assert!(blob.parse_offsets(0xFFFF_8000_0000_0000).is_err());
+        // blob_base + params_bytes overflow (defensive; canonical check
+        // already rejects noncanonical base first)
+        assert!(blob.parse_offsets(0x0000_7000_0000_0000).is_err());
+    }
+
+    #[test]
+    fn v2_params_blob_parse_rejects_entry_arithmetic_underflow() {
+        // entry arithmetic is fully checked (RC-4 P0-4): a crafted entry
+        // below blob_base (but canonical) is rejected before any read.
+        let mut blob = build_blob(&["AD-PROC-001"]);
+        let surf_off = u64::from_le_bytes(blob.bytes[0x28..0x30].try_into().unwrap());
+        let below = BLOB_BASE - 0x1000;
+        blob.bytes[surf_off as usize..surf_off as usize + 8]
+            .copy_from_slice(&below.to_le_bytes());
+        assert!(blob.parse_offsets(BLOB_BASE).is_err());
+    }
 }
