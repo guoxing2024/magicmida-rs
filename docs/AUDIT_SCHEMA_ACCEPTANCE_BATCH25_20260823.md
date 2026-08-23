@@ -1,7 +1,7 @@
 # AUDIT — Schema Acceptance Gate — 最终 HEAD（Batch 26 / WO-2604）
 
 **审计运行日期**：2026-08-23
-**审计基线**：`928047face61cc343137938d5e5610c05a73a8a1`（`928047f`，Batch 27 最终 HEAD）
+**审计基线**：`dea085b62a179535ff73194c036d7ea0bfcb70bb`（`dea085b`，Batch 28 最终 HEAD）
 **前版基线**：`639eee362d69c1cbb3fc0852438bb6e461d506c9`（Batch 25 最终 HEAD，WO-2604）；`62ed608`（WO-2504）
 **前版基线**：`62ed608`（WO-2504，AUDIT_SCHEMA_ACCEPTANCE_BATCH24_20260823.md）
 **性质**：readiness/acceptance 只读审计；不实现 v2 schema/digest/consumer
@@ -12,7 +12,7 @@
   crates/ 零修改（git 字符数实测 = 0）。
 - 本文件以 `639eee3` 为唯一最终树基线重新登记。
 
-## 1. 最终 HEAD 事实表（928047f；自 639eee3 起 crates/ 零修改，行号事实同源）
+## 1. 最终 HEAD 事实表（dea085b；自 639eee3 起 crates/ 零修改，行号事实同源）
 
 ### 1.1 crates/antidebug-runtime/src/exports.rs
 
@@ -81,4 +81,4 @@
 - implementation gate 继续 HOLD。
 
 ---
-（WO-2604 交付，绑定 639eee3；WO-2704 最终头重绑定，绑定 928047f）
+（WO-2604 交付，绑定 639eee3；WO-2704 绑定 928047f；WO-2804 最终头重绑定，绑定 dea085b）

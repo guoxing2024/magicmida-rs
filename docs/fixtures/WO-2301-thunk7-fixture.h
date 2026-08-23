@@ -3,7 +3,8 @@
  *
  * ---- PRODUCTION byte table (this header) ----
  * THUNK7_CODE below is the PRODUCTION 60-byte thunk (no instrumentation):
- * 0x35 = FF D0 (call rax) directly; 0x37 add rsp,0x38; 0x3B ret.
+ * PRODUCTION offsets: call rax @0x35 (FF D0); add rsp,0x38 @0x37; ret @0x3B.
+ * (TEST-only probe variant shifts these: probe @0x35..0x38, call @0x39, add @0x3B, ret @0x3F.)
  * Verified byte-exact vs thunk7_final_full.obj .text$mn extraction:
  *   production = obj[0x00..0x35) || obj[0x39..0x40) = 53B + 7B = 60B
  *   SHA-256 = 9B6F4A7A138B3C4C5523CEDD047745C96AA83CA01614BEB703E4994DA2E1F017
@@ -63,7 +64,7 @@ static const unsigned char THUNK7_CODE[THUNK7_CODE_SIZE] = {
 
 _Static_assert(sizeof(THUNK7_CODE) == THUNK7_CODE_SIZE, "thunk7 size 60");
 
-/* Instruction boundaries (dumpbin verified):
+/* PRODUCTION instruction boundaries (dumpbin verified, 60B thunk):
  * 0x00 mov r11,rcx (3) | 0x03 mov rax,[r11] (3) | 0x06 mov rcx,[r11+8] (4)
  * 0x0A mov rdx,[r11+16] (4) | 0x0E mov r8,[r11+24] (4) | 0x12 mov r9,[r11+32] (4)
  * 0x16 sub rsp,0x38 (4) | 0x1A mov r10,[r11+40] (4) | 0x1E mov [rsp+0x20],r10 (5)

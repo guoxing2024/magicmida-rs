@@ -1,6 +1,6 @@
 # WO-2601 交付 — thunk7 probe runtime layout + exact-byte closure
 
-**审计基线**：`928047face61cc343137938d5e5610c05a73a8a1`（`928047f`，Batch 27 最终 HEAD；WO-2601 原始交付绑定 `639eee3`，WO-2701 修正绑定 928047f）
+**审计基线**：`dea085b62a179535ff73194c036d7ea0bfcb70bb`（`dea085b`，Batch 28 最终 HEAD；WO-2601 原始交付绑定 `639eee3`，WO-2701 修正绑定 928047f，WO-2802 文字修正绑定 dea085b）
 **性质**：local x64 runtime + design fixture；不实现生产 thunk；不运行远程
 
 ## 1. 修复的缺陷（Batch 25 审计）
@@ -46,7 +46,7 @@ _Static_assert(offsetof(ThunkArgs7Probe, rsp_probe) == 0x48);
 
 - call rax (FF D0) 位于 **0x35**
 - SHA-256：`9B6F4A7A138B3C4C5523CEDD047745C96AA83CA01614BEB703E4994DA2E1F017`
-- 验证：fixture 数组提取 SHA == obj .text$mn 前 60B 重构 SHA == 上述值（三者一致）
+- 验证：fixture 数组提取 SHA == obj .text$mn 非连续 production slices 提取 SHA（obj[0x00..0x35) || obj[0x39..0x40)，非连续切片，不是前 60B 连续字节）== 上述值（三者一致）
 
 ### 3.2 test extension（64B，probe @0x35-0x38，call rax @0x39）
 
@@ -104,15 +104,33 @@ EXIT=0
   | test 64B | 01DC2017D8825EFD7E1C3FBE186C2FACF36FB22F2338C493C422E659476E17AE | probe @0x35、call @0x39 |
 
 - 关键区别：production[0x35..0x36] = FF D0（call rax 直接）；test[0x35..0x39] = 49 89 63 48（probe），test[0x39..0x3B] = FF D0（call）。
-- **.text$mn 原始字节（127B）**：
+- **.text$mn 完整原始字节（127B，COFF rawptr=140 / rawsize=127 提取）**：
 
   ```
-  49 89 CB 49 8B 03 49 8B 4B 08 49 8B 53 10 4D 8B 43 18 4D 8B 4B 20
-  48 83 EC 38 4D 8B 53 28 4C 89 54 24 20 4D 8B 53 30 4C 89 54 24 28
-  4D 8B 53 38 4C 89 54 24 30 49 89 63 48 FF D0 48 83 C4 38 C3
+  0000: 49 89 CB 49 8B 03 49 8B 4B 08 49 8B 53 10 4D 8B
+  0010: 43 18 4D 8B 4B 20 48 83 EC 38 4D 8B 53 28 4C 89
+  0020: 54 24 20 4D 8B 53 30 4C 89 54 24 28 4D 8B 53 38
+  0030: 4C 89 54 24 30 49 89 63 48 FF D0 48 83 C4 38 C3
+  0040: 48 8B C4 48 83 E0 0F 4C 8B 15 00 00 00 00 49 89
+  0050: 42 38 49 89 0A 49 89 52 08 4D 89 42 10 4D 89 4A
+  0060: 18 48 8B 44 24 28 49 89 42 20 48 8B 44 24 30 49
+  0070: 89 42 28 48 8B 44 24 38 49 89 42 30 33 C0 C3
   ```
 
-  偏移：0x00 mov r11,rcx；0x35 = probe(test) / call(prod)；0x39 = call(test)；0x3B ret。
+  前 0x40（64B）= thunk + probe（test 形态）；0x40..0x7F（63B）= callee entry-stub
+  （入口记录 rsp：mov rax,rsp / and rax,0Fh；slot 写回：mov [r11+0x38],rax 等）。
+
+- **双流偏移分离（production / test）**：
+
+  | 指令 | production（60B） | test（64B） |
+  |------|-------------------|-------------|
+  | call rax | **0x35**（FF D0） | **0x39**（FF D0） |
+  | add rsp,0x38 | 0x37 | 0x3B |
+  | ret | 0x3B | 0x3F |
+  | probe（49 89 63 48） | —（不包含） | 0x35..0x38 |
+
+  production 结束于 0x3B（ret，60B）；test 结束于 0x3F（ret，64B）。
+  偏移起点：0x00 mov r11,rcx。
 
 ## 6. 边界声明
 
