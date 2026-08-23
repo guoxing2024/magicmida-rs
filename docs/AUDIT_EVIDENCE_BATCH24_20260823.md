@@ -69,3 +69,15 @@ thunk7_rsp_stdout.txt（错误 opcode 4D 89 63 48）**作废**，本批以 thunk
 
 ---
 （WO-2503 交付，绑定 62ed608）
+## 7. 提交后绑定补充（Batch 25 交付提交）
+
+- Batch 25 交付提交：`2b3e680`（docs(gto): WO-2501 thunk7 local runtime three-check
+  PASS + WO-2502 arithmetic independent audit + WO-2503/2504/2505 final-tree audits），
+  6 文件 +403。
+- 生产代码（crates/）自 `62ed608` 起**零修改**（本提交仅 docs/fixtures），
+  因此 test/check/diffcheck 证据（绑定 62ed608 树）对提交后树仍然有效。
+- 提交后 HEAD：`2b3e680d3144994cf777725ccf075286955b0859`。
+- 提交后 `git diff --check 62ed608..2b3e680`：EXIT=0（无 whitespace 错误）。
+
+---
+（WO-2503 补充，提交后绑定 2b3e680 / 证据树 62ed608）
