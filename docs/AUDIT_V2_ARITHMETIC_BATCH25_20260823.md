@@ -1,7 +1,8 @@
 # AUDIT — V2 arithmetic final-head audit（Batch 26 / WO-2603）
 
 **审计运行日期**：2026-08-23
-**审计基线**：`639eee362d69c1cbb3fc0852438bb6e461d506c9`（Batch 25 最终 HEAD）
+**审计基线**：`928047face61cc343137938d5e5610c05a73a8a1`（`928047f`，Batch 27 最终 HEAD）
+**前版基线**：`639eee362d69c1cbb3fc0852438bb6e461d506c9`（Batch 25 最终 HEAD，WO-2603）；`62ed608`（WO-2503）
 **性质**：只读 arithmetic 审计；不实现 V2 runtime
 
 ## 1. ASan fixture 结果（条件接收范围）
@@ -11,7 +12,7 @@
 - **范围**：仅证明纯逻辑 fixture 无已知 hostile 越界；**不构成 V2 runtime 实现**
   （exports.rs/runtime_loader.rs 零修改，无 MidaAntidebugInitializeV2）
 
-## 2. checked-add 代码审查（639eee3 树）
+## 2. checked-add 代码审查（928047f 树；自 639eee3 起 crates/ 零修改，事实同源）
 
 | 位置 | 表达式 | checked-add | 拒收码 |
 |------|--------|-------------|--------|
@@ -48,4 +49,4 @@
 - V2 runtime 未实现，implementation gate 继续由 placeholder digest / V2 缺失阻断。
 
 ---
-（WO-2603 交付，绑定 639eee3）
+（WO-2603 交付，绑定 639eee3；WO-2703 最终头重绑定，绑定 928047f）

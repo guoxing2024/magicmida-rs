@@ -1,7 +1,8 @@
 # AUDIT — Protocol Caller 最终 HEAD（Batch 26 / WO-2605）
 
 **审计运行日期**：2026-08-23
-**审计基线**：`639eee362d69c1cbb3fc0852438bb6e461d506c9`（Batch 25 最终 HEAD）
+**审计基线**：`928047face61cc343137938d5e5610c05a73a8a1`（`928047f`，Batch 27 最终 HEAD）
+**前版基线**：`639eee362d69c1cbb3fc0852438bb6e461d506c9`（Batch 25 最终 HEAD，WO-2605）；`62ed608`（WO-2505）
 **前版基线**：`62ed608`（WO-2505，AUDIT_PROTOCOL_CALLERS_BATCH24.md）
 **性质**：纯离线源码审计；不修改协议生产代码；不实现 Walker runtime
 
@@ -10,7 +11,7 @@
 - `62ed608..639eee3` 仅 docs/fixtures 提交，生产代码零修改。
 - 本文件以 `639eee3` 为唯一最终树基线重做全仓搜索。
 
-## 1. 全仓源码搜索（639eee3，grep walker_protocol|WalkerParamsV2|ProbeResultV2|
+## 1. 全仓源码搜索（928047f，grep walker_protocol|WalkerParamsV2|ProbeResultV2|
    ResultSectionHeaderV2|MappingIdentityHeaderV2|encode_section|from_blob_bytes）
 
 | 文件 | 命中 | 类别 |
@@ -72,4 +73,4 @@
 - Walker runtime/CLI：**NOT DISPATCHED**；Windows live test：**NOT AUTHORIZED**；LIVE-4：**NOT AUTHORIZED**。
 
 ---
-（WO-2605 交付，绑定 639eee3）
+（WO-2605 交付，绑定 639eee3；WO-2705 最终头重绑定，绑定 928047f）

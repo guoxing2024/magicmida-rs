@@ -1,10 +1,29 @@
 /* WO-2301 fixture -- 7-arg thunk machine-code / stack ABI contract (WO-2401 rev).
  * DESIGN FIXTURE for offline review; not a compiled implementation.
- * Byte table verified with ml64 + dumpbin (MSVC x64); stack alignment verified
- * by LOCAL ABI round-trip tests (thunk7_final_test.c + thunk7_final_full.asm,
- * fixture-exact bytes; supersedes the voided thunk7_abi/rsp tests):
+ *
+ * ---- PRODUCTION byte table (this header) ----
+ * THUNK7_CODE below is the PRODUCTION 60-byte thunk (no instrumentation):
+ * 0x35 = FF D0 (call rax) directly; 0x37 add rsp,0x38; 0x3B ret.
+ * Verified byte-exact vs thunk7_final_full.obj .text$mn extraction:
+ *   production = obj[0x00..0x35) || obj[0x39..0x40) = 53B + 7B = 60B
+ *   SHA-256 = 9B6F4A7A138B3C4C5523CEDD047745C96AA83CA01614BEB703E4994DA2E1F017
+ *
+ * ---- TEST-ONLY probe extension (NOT in this header) ----
+ * The rsp probe (49 89 63 48 = mov [r11+0x48], rsp, +4 bytes at offset 0x35,
+ * shifting call rax to 0x39) is a TEST-ONLY extension used by the local ABI
+ * runtime (thunk7_final_full.asm + thunk7_final_test.c); it MUST NOT be
+ * compiled into the production thunk. Test 64B = obj[0x00..0x40),
+ * SHA-256 = 01DC2017D8825EFD7E1C3FBE186C2FACF36FB22F2338C493C422E659476E17AE.
+ * The probe extends ThunkArgs7 by one slot (+0x48 rsp_probe, size 0x50) -
+ * see WO-2501-thunk7-runtime-contract.h.
+ *
+ * ---- Local ABI verification (thunk7_threecheck series, WO-2601) ----
  *   - all 7 args arrive intact at the callee;
- *   - call pre-rsp mod 16 == 0 (probed inside the thunk before call rax).
+ *   - callee entry rsp mod 16 == 8 (asm stub first-instruction measurement);
+ *   - call pre-rsp mod 16 == 0 (sentinel 0xDEADBEEFCAFEBABE overwritten proof).
+ * Supersedes the voided thunk7_abi / thunk7_rsp tests and the transitional
+ * thunk7_v2 series (see AUDIT_EVIDENCE_BATCH24_20260823.md).
+ *
  * Stack model (WO-2401):
  *   thunk entry rsp = R (caller call pushed 8-byte return addr: R mod 16 = 8)
  *   sub rsp, 0x38  -> R-0x38 mod 16 = 0  (call pre-rsp aligned)

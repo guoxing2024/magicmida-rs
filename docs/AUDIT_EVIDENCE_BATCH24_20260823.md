@@ -36,26 +36,30 @@
 
 | 文件 | SHA-256 | 说明 |
 |------|---------|------|
-| thunk7_v2_test.c | F77DFDD63E5B4481F42B85D95C157B7ECAA6B2792C917F77A2BCD08E780E8358 | 组合测试 C 驱动 |
-| thunk7_v2.asm | 9F950B6CF9E4A47E3FEFFA6B3B2099FEF9B8CD2074536F912E5C7FBB8A9ED349 | thunk+entry-stub 汇编 |
-| thunk7_v2_stdout.txt | DC6D1485BB0E86FE722126A5A3DDB4469702D02B07A9FF7B46284532754475AD | THUNK7 COMBINED PASS EXIT=0 |
-| thunk7_v2.obj | C0B2E32A40C086EF46F1EDB16DC5FC8CF27E4782EE354803347D2AAFBEDBB0D4 | ml64 产物 |
+| thunk7_v2_test.c | F77DFDD63E5B4481F42B85D95C157B7ECAA6B2792C917F77A2BCD08E780E8358 | ~~组合测试 C 驱动~~ **SUPERSEDED / INVALID EVIDENCE**（过渡系列，ml64 自由编码 4C 8B D9；有效来源 = thunk7_threecheck 系列） |
+| thunk7_v2.asm | 9F950B6CF9E4A47E3FEFFA6B3B2099FEF9B8CD2074536F912E5C7FBB8A9ED349 | ~~thunk+entry-stub 汇编~~ **SUPERSEDED / INVALID EVIDENCE**（过渡系列，同上） |
+| thunk7_v2_stdout.txt | DC6D1485BB0E86FE722126A5A3DDB4469702D02B07A9FF7B46284532754475AD | ~~THUNK7 COMBINED PASS EXIT=0~~ **SUPERSEDED / INVALID EVIDENCE**（过渡系列 PASS 不作数；有效来源 = thunk7_threecheck） |
+| thunk7_v2.obj | C0B2E32A40C086EF46F1EDB16DC5FC8CF27E4782EE354803347D2AAFBEDBB0D4 | ~~ml64 产物~~ **SUPERSEDED / INVALID EVIDENCE**（过渡系列，同上） |
 | hostile_asan_detail.txt | 7AFE1FA521B5155D8E832B8004CA175035E1D9EE7930ACFCA52A3DE0E6EC4AC4 | ASan 16/16 逐用例 EXIT=0 |
 
 
-| thunk7_final_test.c | 7ECFB5593A0781016C887F91516C3E6D71E7233A151247CE4ACD9A851CE896CC | 最终测试 C 驱动（fixture-exact 65B） |
+| thunk7_final_test.c | 7ECFB5593A0781016C887F91516C3E6D71E7233A151247CE4ACD9A851CE896CC | ~~最终测试 C 驱动（fixture-exact 65B）~~ **SUPERSEDED / INVALID EVIDENCE**（见下：Args10 布局缺陷，rsp_probe 在 +0x40 而探针写 +0x48，假阳性；有效来源 = thunk7_threecheck 系列） |
 | thunk7_final_full.asm | 94552912E0C2DBEBCAC87A2C63C6D87EAFFFD8247EBEDF24630D3A2244A72894 | 最终 thunk+entry-stub 汇编 |
-| thunk7_final_stdout.txt | 34629AAE017FD563F3ABF7B20A05C76B7BEC8F0796D8F8569A211E38944BCE71 | THUNK7 FINAL PASS EXIT=0 |
-| thunk7_final_full.obj | BE1042DA3AA6947F539503E6655B90126E57292F1B7F3D97359DE6070C171A20 | ml64 产物（49 89 CB 逐指令确认） |
+| thunk7_final_stdout.txt | 34629AAE017FD563F3ABF7B20A05C76B7BEC8F0796D8F8569A211E38944BCE71 | ~~THUNK7 FINAL PASS EXIT=0~~ **SUPERSEDED / INVALID EVIDENCE**（Args10 布局缺陷同系列，见上；有效来源 = thunk7_threecheck 系列） |
+| thunk7_final_full.obj | BE1042DA3AA6947F539503E6655B90126E57292F1B7F3D97359DE6070C171A20 | ~~ml64 产物（49 89 CB 逐指令确认）~~ **SUPERSEDED / INVALID EVIDENCE**（Args10 布局缺陷同系列；有效 obj = 9D76E5E0D0A66924987DE47CC5995417112BA60076F9AC21951966C8A3629B30，thunk7_threecheck 系列） |
 
 
-**obj 原始字节验证（自检追加）**：从 thunk7_final_full.obj 的 .text$mn section
-（COFF rawptr=140, rawsize=127）直接提取前 60 字节：
-`49 89 CB 49 8B 03 49 8B 4B 08 49 8B 53 10 4D 8B 43 18 4D 8B 4B 20`
-`48 83 EC 38 4D 8B 53 28 4C 89 54 24 20 4D 8B 53 30 4C 89 54 24 28`
-`4D 8B 53 38 4C 89 54 24 30 49 89 63 48 FF D0 48 ...`
-= WO-2301 fixture THUNK7_CODE（60B）+ probe（49 89 63 48 @0x35）扩展，
-**fixture 字节表 = obj 实际字节 = 测试执行字节，三者完全一致**。
+**obj 原始字节验证（自检追加，SUPERSEDED / INVALID EVIDENCE）**：
+> ~~从 thunk7_final_full.obj 提取前 64 字节（dumpbin 逐指令确认）：~~
+> ~~48 83 EC 38 4D 8B 53 28 4C 89 54 24 20 4D 8B 53 30 4C 89 54 24 28~~
+> ~~4D 8B 53 38 4C 89 54 24 30 49 89 63 48 FF D0 48 ...~~
+> ~~= WO-2301 fixture THUNK7_CODE（60B）+ probe（49 89 63 48 @0x35）扩展，~~
+> ~~fixture 字节表 = obj 实际字节 = 测试执行字节，三者完全一致~~。
+**作废原因**：旧公式“前 60 字节 = fixture + probe”错误——fixture THUNK7_CODE 60B 是纯 production
+（0x35 处 FF D0 直接 call）；probe 是 test-only 扩展（49 89 63 48 @0x35，call 移至 0x39）。
+正确提取公式见 WO-2601-thunk7-probe-closure_20260823.md（WO-2701 修正）：
+production = obj[0x00..0x35) || obj[0x39..0x40) = 60B；test = obj[0x00..0x40) = 64B。
+**当前有效来源 = thunk7_threecheck 系列**（WO-2601，ThunkArgs7Probe 0x50 + sentinel）。
 
 **自检修正（Batch 25 追加，Batch 26 再修正）**：thunk7_v2 系列使用 ml64 自由编码
 （4C 8B D9）而非 fixture 冻结的 49 89 CB——已标注为**过渡**；且 Batch 25 的
@@ -63,9 +67,12 @@ thunk7_final_test.c 存在 Args10 布局缺陷（rsp_probe 在 +0x40 而探针�
 **当前唯一验证来源 = WO-2601 的 thunk7_threecheck 系列**（ThunkArgs7Probe 0x50 布局 +
 sentinel 0xDEADBEEFCAFEBABE 真实覆盖证明 + production 60B/test 64B 分离），见
 WO-2601-thunk7-probe-closure_20260823.md。
-**更正说明**：Batch 24 的 thunk7_abi_stdout.txt（ABI ROUND-TRIP FAIL）与
-thunk7_rsp_stdout.txt（错误 opcode 4D 89 63 48）**作废**，本批以 thunk7_v2 系列为准
-（entry 对齐由 asm stub 入口首指令记录，opcode 49 89 63 48 经 ml64 反汇编确认）。
+**更正说明（SUPERSEDED / INVALID EVIDENCE 补充）**：Batch 24 的 thunk7_abi_stdout.txt
+（ABI ROUND-TRIP FAIL）与 thunk7_rsp_stdout.txt（错误 opcode 4D 89 63 48）**作废**；
+thunk7_v2 系列（ml64 自由编码 4C 8B D9）也已标注为**过渡 / INVALID**，不再是当前有效来源。
+**当前唯一有效来源 = thunk7_threecheck 系列**（WO-2601，ThunkArgs7Probe 0x50 布局 +
+sentinel 0xDEADBEEFCAFEBABE 真实覆盖证明 + production 60B/test 64B 分离），见
+WO-2601-thunk7-probe-closure_20260823.md。
 
 ## 5. 分层登记
 

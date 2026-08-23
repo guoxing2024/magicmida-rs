@@ -1,6 +1,6 @@
 # WO-2601 交付 — thunk7 probe runtime layout + exact-byte closure
 
-**审计基线**：`639eee3`（Batch 25 最终 HEAD）
+**审计基线**：`928047face61cc343137938d5e5610c05a73a8a1`（`928047f`，Batch 27 最终 HEAD；WO-2601 原始交付绑定 `639eee3`，WO-2701 修正绑定 928047f）
 **性质**：local x64 runtime + design fixture；不实现生产 thunk；不运行远程
 
 ## 1. 修复的缺陷（Batch 25 审计）
@@ -85,12 +85,34 @@ EXIT=0
 （如 0x000000d758d7f6a0）——证明 `49 89 63 48` 确实写入了 +0x48，非零值读取
 （非清零假阳性）。
 
-## 5. obj 字节证明
+## 5. obj 字节证明（exact-byte 提取，WO-2701 修正）
 
-- thunk7_final_full.obj：.text$mn rawptr=140, rawsize=127，OBJ_HASH `9D76E5E0...`
-- test 64B = obj 前 64 字节（dumpbin 逐指令确认 probe @0x35、call @0x39）
-- production 60B = obj 前 56B + FF D0 + obj[60..63]（add+ret），SHA `9B6F4A7A...`
-  == fixture THUNK7_CODE SHA（三者闭环）
+- 被测对象：thunk7_final_full.obj（OBJ_HASH 9D76E5E0D0A66924987DE47CC5995417112BA60076F9AC21951966C8A3629B30）
+  .text$mn：COFF rawptr=140, rawsize=127（实测解析 COFF section table 得到）。
+- **提取公式（WO-2701 修正，替代旧公式“前 56B + FF D0 + obj[60..63]”）**：
+
+  | 切片 | 范围 | 长度 | 内容 |
+  |------|------|------|------|
+  | production | obj[0x00..0x35) || obj[0x39..0x40) | 53B + 7B = 60B | 0x35..0x38 为 test-only probe 区，production 不含；0x39 起为 add rsp,0x38 + ret |
+  | test | obj[0x00..0x40) | 64B | 含 probe @0x35..0x38，call 移至 0x39 |
+
+- **逐字节验证**（本机对 obj 实际切片，SHA-256）：
+
+  | 切片 | SHA-256 | 说明 |
+  |------|---------|------|
+  | production 60B | 9B6F4A7A138B3C4C5523CEDD047745C96AA83CA01614BEB703E4994DA2E1F017 | == fixture THUNK7_CODE SHA（三者闭环：fixture 字节表 == obj 提取 == SHA） |
+  | test 64B | 01DC2017D8825EFD7E1C3FBE186C2FACF36FB22F2338C493C422E659476E17AE | probe @0x35、call @0x39 |
+
+- 关键区别：production[0x35..0x36] = FF D0（call rax 直接）；test[0x35..0x39] = 49 89 63 48（probe），test[0x39..0x3B] = FF D0（call）。
+- **.text$mn 原始字节（127B）**：
+
+  ```
+  49 89 CB 49 8B 03 49 8B 4B 08 49 8B 53 10 4D 8B 43 18 4D 8B 4B 20
+  48 83 EC 38 4D 8B 53 28 4C 89 54 24 20 4D 8B 53 30 4C 89 54 24 28
+  4D 8B 53 38 4C 89 54 24 30 49 89 63 48 FF D0 48 83 C4 38 C3
+  ```
+
+  偏移：0x00 mov r11,rcx；0x35 = probe(test) / call(prod)；0x39 = call(test)；0x3B ret。
 
 ## 6. 边界声明
 
@@ -99,4 +121,4 @@ EXIT=0
 - 未修改 crates/ 生产代码。
 
 ---
-（WO-2601 交付，绑定 639eee3）
+（WO-2601 交付，绑定 639eee3；WO-2701 exact-byte 提取公式修正，绑定 928047f）
