@@ -498,3 +498,80 @@
 ---
 
 （WO-3001 + WO-3002 交付，绑定 ecd77ae / 证据树 ecd77ae）
+
+
+---
+
+# WO-3001 post-commit 补充 — 最终 HEAD 证据重绑定（1e0ebeb）
+
+**审计运行日期**：2026-08-23（worker 机器，14:03）
+**最终绑定 HEAD**：`1e0ebeb9b174692035124f3729d7755c47113b26`（`1e0ebeb`，Batch 30 交付提交后）
+**性质**：只读证据审计；不修改生产代码；不宣称 commander PASS
+
+## 1. 绑定关系（多棵树分层，更新）
+
+| 树 | 绑定 | 证据文件 | 状态 |
+|----|------|---------|------|
+| ...（历史树同 WO-3001 章节） | | | |
+| Batch 29 交付后 | `ecd77ae` | evidence_*_3001.txt | 旧树，保留并标注（WO-3001） |
+| **Batch 30 最终树** | `1e0ebeb` | **evidence_*_3001b.txt（本文件）** | **当前有效（干净树生成）** |
+
+- 生产代码（crates/）自 `62ed608` 起**零修改**；Batch 30 范围（ecd77ae..1e0ebeb）
+  5 个 unique paths 全部为 docs/ 或 docs/fixtures/。
+
+## 2. Batch 30 最终范围（git 实测，1e0ebeb 干净树）
+
+- `ecd77ae..1e0ebeb`：**1 commit、5 unique paths、+125/-12**（git diff --stat，
+  见 evidence_stat_3001b.txt / evidence_stat_3001b_summary.txt）。
+- commit：`1e0ebeb`（Batch 30 交付，docs/fixtures only）。
+- crates/ diff lines = 0（生产代码零修改）。
+- **tracked workspace clean 确认**：git status --porcelain 中 tracked 修改数 = 0
+  （evidence_workspace_3001b.txt，仅 commander untracked 文件）。
+
+## 3. 最终 HEAD 证据文件清单（绑定 1e0ebeb，干净树生成）
+
+| 文件 | 大小 | SHA-256 | 命令 | 退出码 |
+|------|------|---------|------|--------|
+| D:\Temp\evidence_head_3001b.txt | 42B | 3B8C65741A0403F99042E7883A77DC42163805021588E58583CBF3F232ED0F2D | git rev-parse HEAD | 0 |
+| D:\Temp\evidence_range_3001b.txt | 204B | 9CE0AACDB53E2BB7E03096A0BE2828B3374AB9B257DBFD9CBCFC6CB848F1BAED | git log ecd77ae..1e0ebeb | 0 |
+| D:\Temp\evidence_stat_3001b.txt | 246B | A69A3F91812F22C31BC556AE9792F45A32082F9B04C8A300670EB8613B37ED1A | git diff --numstat ecd77ae..1e0ebeb | 0 |
+| D:\Temp\evidence_stat_3001b_summary.txt | 375B | C9359F008A6F678898E1EBAAEBF3CA75BA1F093C2E5A8D569250B8C919E8223A | git diff --stat ecd77ae..1e0ebeb | 0 |
+| D:\Temp\evidence_names_3001b.txt | 224B | 29CE7921417EE31110EA73677D00E7A33BEA33451F4ABD7DD021D230BC8E0DC4 | git diff --name-only ecd77ae..1e0ebeb | 0 |
+| D:\Temp\evidence_diffcheck_3001b.txt | 0B | E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855 | git diff --check ecd77ae..1e0ebeb | 0 |
+| D:\Temp\evidence_worktree_3001b.txt | 0B | E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855 | git diff --check 1e0ebeb（工作树） | 0 |
+| D:\Temp\evidence_workspace_3001b.txt | 1326B | 6EC308930D304A3DAD0205102E3816E2A7C5E943085703EA3BF23DDAB655E753 | git status --porcelain（tracked 修改数 = 0） | 0 |
+
+**范围统计实测**：
+
+```
+ docs/AUDIT_EVIDENCE_BATCH25_20260823.md          | 115 ++++++++++++++++++++++-
+ docs/AUDIT_PROTOCOL_CALLERS_BATCH25.md           |   6 +-
+ docs/AUDIT_SCHEMA_ACCEPTANCE_BATCH25_20260823.md |   6 +-
+ docs/AUDIT_V2_ARITHMETIC_BATCH25_20260823.md     |   6 +-
+ docs/WO-2601-thunk7-probe-closure_20260823.md    |   4 +-
+ 5 files changed, 125 insertions(+), 12 deletions(-)
+```
+
+## 4. workspace 全量测试证据（绑定 1e0ebeb 树，ecd77ae 树生成、1e0ebeb 仅 docs/fixtures 变更）
+
+- `evidence_workspace_test_3001.txt`（200672B，SHA `1A810D003380F7CAB243DA7A636D7DD49EA88DD84AF832C9541A3EFAECB04E5C`）：
+  cargo test --workspace --offline 原始 stdout，2026-08-23 13:58:39 → 14:00:07，HEAD=ecd77ae，EXIT=0。
+  **crates/ 自 62ed608 起零修改**，1e0ebeb 仅 docs/fixtures，测试结论对 1e0ebeb 树仍然成立。
+- `evidence_workspace_check_3001.txt`（514B，SHA `4B83B9B0A86B2838F9F60909007C4FB21F48F0A3B2104CF37213E738FC459ED3`）：
+  cargo check --workspace --offline，2026-08-23 13:59:24，HEAD=ecd77ae，EXIT=0。
+- package test/check（evidence_pkg_test_3001.txt / evidence_pkg_check_3001.txt）同 WO-3001 章节登记。
+
+## 5. 验收门自检（更新）
+
+| 门 | 结果 |
+|----|------|
+| manifest 绑定 1e0ebeb | ✅ head 证据 = 1e0ebeb9b174692035124f3729d7755c47113b26 |
+| 1 commit / 5 unique paths / +125/-12 | ✅ git 实测（evidence_stat_3001b.txt） |
+| tracked workspace clean | ✅ tracked 修改数 = 0 |
+| workspace 全量测试原始证据 | ✅ evidence_workspace_test_3001.txt（真实 stdout） |
+| 旧树证据保留并标注 | ✅ 62ed608/639eee3/97d6914/928047f/dea085b/9589fd1/ecd77ae 全部保留并标注旧树 |
+| 不宣称 commander PASS | ✅ BLOCKED 保持 |
+
+---
+
+（WO-3001 post-commit 补充，绑定 1e0ebeb / 证据树 1e0ebeb）
