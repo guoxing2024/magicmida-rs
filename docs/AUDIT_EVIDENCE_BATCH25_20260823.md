@@ -405,7 +405,7 @@
 | Batch 26 补充后 | `928047f` | evidence_*_2702.txt | 旧树，保留并标注（WO-2702） |
 | Batch 27 交付后 | `dea085b` | evidence_*_2801.txt | 旧树，保留并标注（WO-2801） |
 | Batch 28 交付后 | `9589fd1` | evidence_*_2901.txt | **旧树 + 旧 dirty-workspace 证据**（WO-2901 生成时工作树含未提交 tracked 修改，见 evidence_workspace_2901.txt 首行 "M docs/WO-2601..."；仅作历史记录，不作为 ecd77ae 树 manifest） |
-| **Batch 30 最终树** | `ecd77ae` | **evidence_*_3001.txt（本文件）** | **当前有效（干净树生成）** |
+| Batch 30 最终树 | `ecd77ae` | evidence_*_3001.txt | 当时有效（WO-3001 交付时）；现为旧树，保留并标注（WO-3101 起当前有效 = 9d7010e） |
 
 - 生产代码（crates/）自 `62ed608` 起**零修改**；Batch 29 范围（9589fd1..ecd77ae）
   5 个 unique paths 全部为 docs/ 或 docs/fixtures/。
@@ -514,7 +514,7 @@
 |----|------|---------|------|
 | ...（历史树同 WO-3001 章节） | | | |
 | Batch 29 交付后 | `ecd77ae` | evidence_*_3001.txt | 旧树，保留并标注（WO-3001） |
-| **Batch 30 最终树** | `1e0ebeb` | **evidence_*_3001b.txt（本文件）** | **当前有效（干净树生成）** |
+| Batch 30 最终树 | `1e0ebeb` | evidence_*_3001b.txt | 当时有效（WO-3001b 交付时）；现为旧树，保留并标注（WO-3101 起当前有效 = 9d7010e） |
 
 - 生产代码（crates/）自 `62ed608` 起**零修改**；Batch 30 范围（ecd77ae..1e0ebeb）
   5 个 unique paths 全部为 docs/ 或 docs/fixtures/。
@@ -575,3 +575,120 @@
 ---
 
 （WO-3001 post-commit 补充，绑定 1e0ebeb / 证据树 1e0ebeb）
+
+
+---
+
+# WO-3101 补充 — 最终 HEAD 证据重绑定（9d7010e）
+
+**审计运行日期**：2026-08-23（worker 机器，14:22-14:24 生成）
+**最终绑定 HEAD**：`9d7010e8112541167447e2aaaea109e63100cb7f`（`9d7010e`，Batch 30 最终 HEAD = post-commit binding supplement）
+**性质**：只读证据审计；不修改生产代码；不宣称 commander PASS
+
+## 1. 绑定关系（多棵树分层，更新）
+
+| 树 | 绑定 | 证据文件 | 状态 |
+|----|------|---------|------|
+| ...（历史树同 WO-3001/3001b 章节） | | | |
+| Batch 30 主交付 | `1e0ebeb` | evidence_*_3001b.txt | 旧树，保留并标注（WO-3001 post-commit） |
+| **Batch 31 最终树** | `9d7010e` | **evidence_*_3101.txt（本文件）** | **当前有效（干净树生成）** |
+
+- 生产代码（crates/）自 `62ed608` 起**零修改**；Batch 30 完整范围（ecd77ae..9d7010e）
+  = 2 commits、5 unique paths、+202/-12，全部 docs/fixtures。
+
+## 2. Batch 30 最终范围（git 实测，9d7010e 干净树）
+
+- `ecd77ae..1e0ebeb`：1 commit、5 paths、+125/-12（Batch 30 主交付）。
+- `1e0ebeb..9d7010e`：1 commit、1 path、+77/-0（post-commit binding supplement）。
+- **累计**：`ecd77ae..9d7010e` = **2 commits、5 unique paths、+202/-12**。
+- crates/ diff lines = 0（生产代码零修改）。
+- **tracked workspace clean 确认**：git status --porcelain 中 tracked 修改数 = 0
+  （evidence_workspace_3101.txt，仅 commander untracked 文件）。
+
+## 3. 最终 HEAD 证据文件清单（绑定 9d7010e，干净树生成）
+
+| 文件 | 大小 | SHA-256 | 命令 | 退出码 |
+|------|------|---------|------|--------|
+| D:\Temp\evidence_head_3101.txt | 42B | 8ACA0376C248C9FCB38F44A21A8A5E0EE8ABF5500DD18741D9AE8C736876A09C | git rev-parse HEAD | 0 |
+| D:\Temp\evidence_range_3101.txt | 69B | 5F6AEBC6B330B527C17299CFD3132AD19397C285E3861C53D83687C244C5A9F9 | git log 1e0ebeb..9d7010e | 0 |
+| D:\Temp\evidence_stat_3101.txt | 46B | 5AA10D4AFC711186B8F811F47DE51A2C8C8526F1E1B08BE652772B2E222265F5 | git diff --numstat 1e0ebeb..9d7010e | 0 |
+| D:\Temp\evidence_stat_3101_summary.txt | 116B | 94A693AA809FA6FAC64363406B5161DBFB64F41A9C0EED87BC6EDF35C3CE5CB2 | git diff --stat 1e0ebeb..9d7010e | 0 |
+| D:\Temp\evidence_names_3101.txt | 41B | DE98E2FD61B59498CE2E15C4FA49C27CB455E252B870A9C570607E93200B944B | git diff --name-only 1e0ebeb..9d7010e | 0 |
+| D:\Temp\evidence_diffcheck_3101.txt | 0B | E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855 | git diff --check 1e0ebeb..9d7010e | 0 |
+| D:\Temp\evidence_worktree_3101.txt | 0B | E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855 | git diff --check 9d7010e（工作树） | 0 |
+| D:\Temp\evidence_workspace_3101.txt | 1326B | 6EC308930D304A3DAD0205102E3816E2A7C5E943085703EA3BF23DDAB655E753 | git status --porcelain（tracked 修改数 = 0） | 0 |
+
+**范围统计实测（1e0ebeb..9d7010e）**：
+
+```
+ docs/AUDIT_EVIDENCE_BATCH25_20260823.md | 77 +++++++++++++++++++++++++++++++++
+ 1 file changed, 77 insertions(+)
+```
+
+**累计（ecd77ae..9d7010e）**：
+
+```
+ docs/AUDIT_EVIDENCE_BATCH25_20260823.md          | 192 ++++++++++++++++++++++-
+ docs/AUDIT_PROTOCOL_CALLERS_BATCH25.md           |   6 +-
+ docs/AUDIT_SCHEMA_ACCEPTANCE_BATCH25_20260823.md |   6 +-
+ docs/AUDIT_V2_ARITHMETIC_BATCH25_20260823.md     |   6 +-
+ docs/WO-2601-thunk7-probe-closure_20260823.md    |   4 +-
+ 5 files changed, 202 insertions(+), 12 deletions(-)
+```
+
+## 4. WO-3102 workspace 全量测试证据（9d7010e 树补跑，真实原始 stdout）
+
+| 文件 | 大小 | SHA-256 | 命令 | 退出码 |
+|------|------|---------|------|--------|
+| D:\Temp\evidence_workspace_test_3101.txt | 200846B | 216C146D80EC30A921322DCE6B9C6440C0CBAB35E59D1262D21338C25A822C3A | cargo test --workspace --offline（原始 stdout，2026-08-23 14:22:41 → 14:24:22，HEAD=9d7010e） | 0 |
+| D:\Temp\evidence_workspace_check_3101.txt | 673B | A903AB28A53EB549609FFDE485E007DD001E0E2304148A983EB57E18F3BEEF7A | cargo check --workspace --offline（2026-08-23 14:22:42，HEAD=9d7010e） | 0 |
+
+**workspace test 结果汇总（56 个 test result 行，全部 ok）**：
+- 各套件 0 failed：含 243/322/1008 passed 大套件（1008 passed 用时 9.33s）
+- 真实运行时长：14:22:41 → 14:24:22（101 秒）
+- FAILED 行数：0
+- **warning 口径（如实保留，非 zero warnings）**：
+  - mida-packers-themida：field `thread_id` is never read（1 warning）
+  - mida-antidebug-runtime（proc_surfaces test）：unused_mut ×2（2 warnings）
+  - mida-cli（lib）：unused variable `dump_timing`（1 warning）
+  - 结论口径：**tests passed; existing warnings present**
+
+**carry-forward 关系说明**：
+- `evidence_workspace_test_3001.txt`（ecd77ae 树，200672B，SHA `1A810D00...`）为**旧树证据**，保留并标注。
+- 本次 `evidence_workspace_test_3101.txt`（9d7010e 树，200846B，SHA `216C146D...`）为**当前树补跑**，9d7010e 仅 docs/fixtures 变更（crates/ 零修改），两树测试结论一致（0 failed）。
+
+**package test/check 分层（9d7010e 树）**：
+
+| 文件 | SHA-256 | 命令 | 退出码 |
+|------|---------|------|--------|
+| evidence_pkg_test_3001.txt | 7C9A19182C510E40B782AA2D763D0E2641000CA6C83B937866A49E2F06924945 | cargo test -p mida-antidebug-runtime --offline（ecd77ae 树，116 通过 0 failed） | 0 |
+| evidence_pkg_check_3001.txt | DAB4E4707B2E6FDBDEAD361B4487BE475974A047EDEA846DD92BAC44F319F872 | cargo check -p mida-antidebug-runtime --offline | 0 |
+
+**threecheck source/stdout/obj/hash（local-only）**：同 WO-3001 章节登记（1196A360/94552912/5D84C68F/9D76E5E0）。
+
+## 5. 分层登记（更新）
+
+| 层 | 状态 |
+|----|------|
+| worker stdout（workspace test/check 9d7010e 树 + pkg test/check） | 本文件证据（可复核 hash，真实原始 stdout） |
+| 本机 thunk ABI 验证 | thunk7_threecheck 系列（LOCAL，非远程） |
+| ASan hostile | hostile_asan_detail.txt（16/16 逐用例） |
+| commander independent verification | **BLOCKED**（总指挥机 rustup shim 阻断；不升级 PASS） |
+| Windows/live evidence | **absent**（LIVE-4 NOT AUTHORIZED） |
+
+## 6. 验收门自检（更新）
+
+| 门 | 结果 |
+|----|------|
+| manifest 绑定 9d7010e | ✅ head 证据 = 9d7010e8112541167447e2aaaea109e63100cb7f |
+| 2 commits / 5 unique paths / +202/-12（累计） | ✅ git 实测（evidence_stat_3101.txt + 3001 系列） |
+| tracked workspace clean | ✅ tracked 修改数 = 0 |
+| workspace 全量测试原始证据（9d7010e 树补跑） | ✅ evidence_workspace_test_3101.txt（200846B，56 行 test result 全 ok，101s 真实运行） |
+| carry-forward 关系明确 | ✅ ecd77ae 旧 stdout 标注旧树；9d7010e 补跑为当前树 |
+| warning 口径如实 | ✅ tests passed; existing warnings present（非 zero warnings） |
+| 旧树证据保留并标注 | ✅ 62ed608/639eee3/97d6914/928047f/dea085b/9589fd1/ecd77ae/1e0ebeb 全部保留并标注旧树 |
+| 不宣称 commander PASS | ✅ BLOCKED 保持 |
+
+---
+
+（WO-3101 + WO-3102 交付，绑定 9d7010e / 证据树 9d7010e）
