@@ -44,9 +44,11 @@ pub mod telemetry;
 pub mod walker_protocol;
 
 pub use attestation::{
-    json_c14n, sha256_hex, AttestationError, HookInventory, Orphan, ProbeSummary, RoundLedger,
-    RuntimeAttestation, RuntimeStatus, WalkerAttestation, ROUND_LEDGER_SCHEMA,
-    WALKER_ATTESTATION_SCHEMA,
+    json_c14n, json_c14n_bytes, parse_attestation, sha256_hex, AbortState, AttestationError,
+    HookInventory, Orphan, OrphanKind, OrphanState, ProbeSummary, RoundLedger, RuntimeAttestation,
+    RuntimeAttestationV2, RuntimeStatus, TaggedAttestation, WalkerAttestation,
+    ATTESTATION_SCHEMA_V2, ATTESTATION_SCHEMA_VERSION_V2, C14N_VECTOR_1_DIGEST,
+    C14N_VECTOR_2_DIGEST, C14N_VECTOR_3_DIGEST, C14N_VECTOR_4_DIGEST, WALKER_CANONICAL_ENCODING,
 };
 pub use exports::{
     MidaAntidebugError, MidaAntidebugGetAttestation, MidaAntidebugInitialize,

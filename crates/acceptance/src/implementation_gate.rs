@@ -53,6 +53,15 @@ pub struct ImplementationFacts {
     pub has_v2_consumer: bool,
     /// Whether Walker runtime/CLI is dispatched.
     pub walker_dispatched: bool,
+    /// Whether LIVE-4 (or any live/Windows runtime) authorization exists.
+    /// NEVER true in this phase; a true value without evidence is a lie.
+    pub live_authorized: bool,
+    /// Whether the Windows runtime path has been verified with real
+    /// evidence (WPM/CRT/SEH/VEH observations). False in this phase.
+    pub windows_runtime_verified: bool,
+    /// Whether evidence is sufficient for acceptance (per-layer sufficiency
+    /// check). False without live evidence.
+    pub evidence_sufficient: bool,
 }
 
 /// Implementation gate verdict.
@@ -126,11 +135,26 @@ pub fn evaluate_implementation_gate(facts: &ImplementationFacts) -> Implementati
         ImplGateStatus::Ready // readiness only
     };
 
-    // acceptance allowed
+    // acceptance allowed — HARD GATES (RC-2):
+    // walker_dispatched alone can NEVER grant acceptance. All three of
+    // live_authorized, windows_runtime_verified and evidence_sufficient
+    // must be true, and each requires its own evidence layer (LIVE-4).
     let mut allowed_ok = implemented_ok;
     if !facts.walker_dispatched {
         allowed_ok = false;
         reasons.push("acceptance_allowed=NOT: Walker runtime/CLI not dispatched".to_string());
+    }
+    if !facts.live_authorized {
+        allowed_ok = false;
+        reasons.push("acceptance_allowed=NOT: live authorization missing (LIVE-4 NOT AUTHORIZED)".to_string());
+    }
+    if !facts.windows_runtime_verified {
+        allowed_ok = false;
+        reasons.push("acceptance_allowed=NOT: windows runtime not verified (no live evidence)".to_string());
+    }
+    if !facts.evidence_sufficient {
+        allowed_ok = false;
+        reasons.push("acceptance_allowed=NOT: evidence insufficient for acceptance".to_string());
     }
     let acceptance_allowed = if allowed_ok {
         ImplGateStatus::AcceptanceAllowed
@@ -171,6 +195,9 @@ mod tests {
             has_walker_caller: false,
             has_v2_consumer: false,
             walker_dispatched: false,
+            live_authorized: false,
+            windows_runtime_verified: false,
+            evidence_sufficient: false,
         }
     }
 
@@ -230,7 +257,9 @@ mod tests {
     }
 
     #[test]
-    fn fully_implemented_and_dispatched_passes() {
+    fn fully_implemented_without_live_authorization_is_hold() {
+        // Even fully implemented + dispatched, WITHOUT live authorization
+        // the gate must NOT pass (RC-2 hard gate: no LIVE-4 -> no acceptance).
         let f = ImplementationFacts {
             digest_value: "a".repeat(64),
             has_initialize_v2: true,
@@ -238,11 +267,62 @@ mod tests {
             has_walker_caller: true,
             has_v2_consumer: true,
             walker_dispatched: true,
+            live_authorized: false,
+            windows_runtime_verified: false,
+            evidence_sufficient: false,
         };
         let v = evaluate_implementation_gate(&f);
         assert_eq!(v.implemented, ImplGateStatus::Implemented);
-        assert_eq!(v.acceptance_allowed, ImplGateStatus::AcceptanceAllowed);
-        assert_eq!(v.gate, ImplGateResult::Pass);
+        assert_eq!(v.acceptance_allowed, ImplGateStatus::Ready); // NOT Allowed
+        assert_eq!(v.gate, ImplGateResult::Hold);
+    }
+
+    #[test]
+    fn acceptance_requires_all_hard_gates() {
+        let mut f = ImplementationFacts {
+            digest_value: "a".repeat(64),
+            has_initialize_v2: true,
+            has_production_thunk_wired: true,
+            has_walker_caller: true,
+            has_v2_consumer: true,
+            walker_dispatched: true,
+            live_authorized: true,
+            windows_runtime_verified: false,
+            evidence_sufficient: false,
+        };
+        // windows_runtime_verified=false -> NOT allowed
+        let v = evaluate_implementation_gate(&f);
+        assert_eq!(v.acceptance_allowed, ImplGateStatus::Ready);
+        assert_eq!(v.gate, ImplGateResult::Hold);
+
+        f.windows_runtime_verified = true;
+        // evidence_sufficient=false -> NOT allowed
+        let v2 = evaluate_implementation_gate(&f);
+        assert_eq!(v2.acceptance_allowed, ImplGateStatus::Ready);
+        assert_eq!(v2.gate, ImplGateResult::Hold);
+
+        f.evidence_sufficient = true;
+        let v3 = evaluate_implementation_gate(&f);
+        assert_eq!(v3.acceptance_allowed, ImplGateStatus::AcceptanceAllowed);
+        assert_eq!(v3.gate, ImplGateResult::Pass);
+    }
+
+    #[test]
+    fn walker_dispatched_alone_cannot_pass() {
+        let f = ImplementationFacts {
+            digest_value: "a".repeat(64),
+            has_initialize_v2: true,
+            has_production_thunk_wired: true,
+            has_walker_caller: true,
+            has_v2_consumer: true,
+            walker_dispatched: true,
+            live_authorized: false,
+            windows_runtime_verified: false,
+            evidence_sufficient: false,
+        };
+        let v = evaluate_implementation_gate(&f);
+        assert_ne!(v.gate, ImplGateResult::Pass);
+        assert!(v.reasons.iter().any(|r| r.contains("live authorization")));
     }
 
     #[test]

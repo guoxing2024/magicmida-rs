@@ -2397,7 +2397,11 @@ pub struct V2ParamsBlob {
 
 pub const V2_ENVELOPE_MAGIC: u64 = 0x0032_5032_4144_494D; // "MIDA2P2 " LE
 pub const V2_HEADER_BYTES: usize = 0x48;
-pub const V2_DIGEST_LEN: u64 = 65; // hex digest + NUL (wire contract)
+/// digest_len field value: 64 (hex chars only; frozen ABI).
+/// The wire region is 64 hex + 1 NUL = 65 bytes; the FIELD is 64.
+pub const V2_DIGEST_LEN: u64 = 64;
+/// Wire region bytes: 64 hex chars + NUL terminator.
+pub const V2_DIGEST_REGION_BYTES: u64 = 65;
 
 impl V2ParamsBlob {
     /// Serialize a v2 params envelope with self-relative offsets.
@@ -2470,22 +2474,91 @@ impl V2ParamsBlob {
         let pd_off = u64::from_le_bytes(self.bytes[0x18..0x20].try_into().unwrap());
         let surf_off = u64::from_le_bytes(self.bytes[0x28..0x30].try_into().unwrap());
         let dig_off = u64::from_le_bytes(self.bytes[0x38..0x40].try_into().unwrap());
-        let dig_len = u64::from_le_bytes(self.bytes[0x40..0x48].try_into().unwrap());
-        // bounds sanity (self-relative offsets must be inside the blob)
+        let dig_len_field = u64::from_le_bytes(self.bytes[0x40..0x48].try_into().unwrap());
+        // digest_len field MUST be 64 (frozen ABI).
+        if dig_len_field != V2_DIGEST_LEN {
+            return Err(RuntimeLoadError::ExportResolutionFailed(format!(
+                "v2 digest_len field must be 64, got {}",
+                dig_len_field
+            )));
+        }
         let len = self.bytes.len() as u64;
-        for (name, off) in [("profile_id", pid_off), ("profile_digest", pd_off), ("surfaces", surf_off), ("digest", dig_off)] {
-            if off >= len {
+        for (name, off) in [
+            ("profile_id", pid_off),
+            ("profile_digest", pd_off),
+            ("surfaces", surf_off),
+            ("digest", dig_off),
+        ] {
+            if off < V2_HEADER_BYTES as u64 || off >= len {
                 return Err(RuntimeLoadError::ExportResolutionFailed(format!(
-                    "v2 {name} offset out of bounds"
+                    "v2 {name} offset out of bounds: {off:#x}"
                 )));
             }
         }
+        let scan_nul = |off: u64, name: &str| -> Result<u64, RuntimeLoadError> {
+            let mut i = off;
+            while i < len {
+                if self.bytes[i as usize] == 0 {
+                    return Ok(i);
+                }
+                i += 1;
+            }
+            Err(RuntimeLoadError::ExportResolutionFailed(format!(
+                "v2 {name} string unterminated"
+            )))
+        };
+        let _pid_end = scan_nul(pid_off, "profile_id")?;
+        let _pd_end = scan_nul(pd_off, "profile_digest")?;
+        let _dig_end = scan_nul(dig_off, "digest")?;
+
+        // digest region: 64 hex chars + NUL = 65 bytes must fit
+        let dig_region_end = dig_off
+            .checked_add(V2_DIGEST_REGION_BYTES)
+            .ok_or(RuntimeLoadError::ExportResolutionFailed(
+                "v2 digest region overflow".to_string(),
+            ))?;
+        if dig_region_end > len {
+            return Err(RuntimeLoadError::ExportResolutionFailed(
+                "v2 digest region truncated".to_string(),
+            ));
+        }
+        for i in dig_off..dig_off + 64 {
+            let c = self.bytes[i as usize];
+            if !c.is_ascii_hexdigit() {
+                return Err(RuntimeLoadError::ExportResolutionFailed(
+                    "v2 digest contains non-hex char".to_string(),
+                ));
+            }
+        }
+        if self.bytes[(dig_off + 64) as usize] != 0 {
+            return Err(RuntimeLoadError::ExportResolutionFailed(
+                "v2 digest region NUL missing".to_string(),
+            ));
+        }
+
+        if surf_off >= dig_off {
+            return Err(RuntimeLoadError::ExportResolutionFailed(
+                "v2 surfaces array must precede digest".to_string(),
+            ));
+        }
+        let array_bytes = dig_off - surf_off;
+        if array_bytes % 8 != 0 {
+            return Err(RuntimeLoadError::ExportResolutionFailed(
+                "v2 surfaces array size not multiple of 8".to_string(),
+            ));
+        }
+        if dig_region_end != len {
+            return Err(RuntimeLoadError::ExportResolutionFailed(
+                "v2 unknown tail after digest region".to_string(),
+            ));
+        }
+
         Ok(V2Offsets {
             profile_id_off: pid_off,
             profile_digest_off: pd_off,
             expected_surfaces_off: surf_off,
             digest_off: dig_off,
-            digest_len: dig_len,
+            digest_len: dig_len_field,
         })
     }
 }
@@ -2591,7 +2664,7 @@ mod imp03_inert_adapter_tests {
         assert!(blob.bytes.len() > V2_HEADER_BYTES);
         let offs = blob.parse_offsets().unwrap();
         assert_eq!(offs.profile_id_off, 0x48);
-        assert_eq!(offs.digest_len, 65);
+        assert_eq!(offs.digest_len, 64);
         // magic check inside parse_offsets passed
     }
 
@@ -2606,4 +2679,63 @@ mod imp03_inert_adapter_tests {
         let blob = V2ParamsBlob { bytes: vec![0u8; 16] };
         assert!(blob.parse_offsets().is_err());
     }
+    #[test]
+    fn v2_params_blob_digest_len_field_is_64() {
+        let surfaces = vec!["AD-PROC-001".to_string()];
+        let digest = "a".repeat(64);
+        let blob = V2ParamsBlob::build("p", "d", &surfaces, &digest).unwrap();
+        let field = u64::from_le_bytes(blob.bytes[0x40..0x48].try_into().unwrap());
+        assert_eq!(field, 64);
+        let offs = blob.parse_offsets().unwrap();
+        assert_eq!(offs.digest_len, 64);
+        assert_eq!(offs.digest_off + 65, blob.bytes.len() as u64);
+    }
+
+    #[test]
+    fn v2_params_blob_rejects_wrong_digest_len_field() {
+        let surfaces = vec!["AD-PROC-001".to_string()];
+        let digest = "a".repeat(64);
+        let mut blob = V2ParamsBlob::build("p", "d", &surfaces, &digest).unwrap();
+        blob.bytes[0x40..0x48].copy_from_slice(&65u64.to_le_bytes());
+        assert!(blob.parse_offsets().is_err());
+    }
+
+    #[test]
+    fn v2_params_blob_rejects_unknown_tail() {
+        let surfaces = vec!["AD-PROC-001".to_string()];
+        let digest = "a".repeat(64);
+        let mut blob = V2ParamsBlob::build("p", "d", &surfaces, &digest).unwrap();
+        blob.bytes.push(0xAA);
+        assert!(blob.parse_offsets().is_err());
+    }
+
+    #[test]
+    fn v2_params_blob_rejects_non_hex_digest() {
+        let surfaces = vec!["AD-PROC-001".to_string()];
+        let digest = "z".repeat(64);
+        let blob = V2ParamsBlob::build("p", "d", &surfaces, &digest).unwrap();
+        assert!(blob.parse_offsets().is_err());
+    }
+
+    #[test]
+    fn v2_params_blob_rejects_offset_out_of_bounds() {
+        let surfaces = vec!["AD-PROC-001".to_string()];
+        let digest = "a".repeat(64);
+        let mut blob = V2ParamsBlob::build("p", "d", &surfaces, &digest).unwrap();
+        let len = blob.bytes.len() as u64;
+        blob.bytes[0x10..0x18].copy_from_slice(&(len + 100).to_le_bytes());
+        assert!(blob.parse_offsets().is_err());
+    }
+
+    #[test]
+    fn v2_params_blob_rejects_underflow_surface_region() {
+        let surfaces = vec!["AD-PROC-001".to_string()];
+        let digest = "a".repeat(64);
+        let mut blob = V2ParamsBlob::build("p", "d", &surfaces, &digest).unwrap();
+        // patch surfaces_off AFTER digest_off -> surfaces array must precede digest
+        let dig_off = u64::from_le_bytes(blob.bytes[0x38..0x40].try_into().unwrap());
+        blob.bytes[0x28..0x30].copy_from_slice(&(dig_off + 8).to_le_bytes());
+        assert!(blob.parse_offsets().is_err());
+    }
+
 }

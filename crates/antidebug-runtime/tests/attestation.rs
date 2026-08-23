@@ -552,169 +552,445 @@ impl TelemetryRequestTemplate {
 }
 
 
+
+
 // ----------------------------------------------------------------
-// IMP-01: walker attestation v2 (pure local, offline)
+// IMP-01-R1: attestation v2 (WO-1503 frozen contract)
 // ----------------------------------------------------------------
 
 use mida_antidebug_runtime::attestation::{
-    json_c14n, sha256_hex, Orphan, ProbeSummary, RoundLedger, WalkerAttestation,
-    ROUND_LEDGER_SCHEMA, WALKER_ATTESTATION_SCHEMA,
+    json_c14n, json_c14n_bytes, parse_attestation, sha256_hex, AbortState, Orphan, OrphanKind,
+    OrphanState, ProbeSummary, RoundLedger, RuntimeAttestationV2, TaggedAttestation,
+    WalkerAttestation, ATTESTATION_SCHEMA_V2, ATTESTATION_SCHEMA_VERSION_V2, C14N_VECTOR_1_DIGEST,
+    C14N_VECTOR_2_DIGEST, C14N_VECTOR_3_DIGEST, C14N_VECTOR_4_DIGEST, WALKER_CANONICAL_ENCODING,
 };
 
-const TEST_SESSION: &str = "sess-impl01-test-0001";
+// ---- WO-1503 §5.3 fixed digest vectors ----
 
-fn sample_round(seq: u64) -> ProbeSummary {
-    ProbeSummary {
-        round_seq: seq,
-        span: 16,
-        page_count: 4,
-        guard_pages_touched: 1,
-        accepted: 4,
-        rejected: 0,
-        round_digest: format!("round-digest-{seq}"),
+#[test]
+fn c14n_vector_1_empty_object() {
+    let v = serde_json::json!({});
+    let bytes = json_c14n_bytes(&v).unwrap();
+    assert_eq!(bytes, vec![0x7b, 0x7d]);
+    let digest = sha256_hex(&bytes);
+    assert_eq!(digest, C14N_VECTOR_1_DIGEST);
+}
+
+#[test]
+fn c14n_vector_2_scalar_key_order() {
+    let v = serde_json::json!({"b": 1, "a": 2});
+    let bytes = json_c14n_bytes(&v).unwrap();
+    assert_eq!(
+        bytes,
+        vec![0x7b, 0x22, 0x61, 0x22, 0x3a, 0x32, 0x2c, 0x22, 0x62, 0x22, 0x3a, 0x31, 0x7d]
+    );
+    let digest = sha256_hex(&bytes);
+    assert_eq!(digest, C14N_VECTOR_2_DIGEST);
+}
+
+#[test]
+fn c14n_vector_3_nested_escape_unicode() {
+    let v = serde_json::json!({"z": null, "a": [1, 2], "s": "x\"y", "u": "中"});
+    let bytes = json_c14n_bytes(&v).unwrap();
+    let hex: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+    assert_eq!(
+        hex,
+        "7b2261223a5b312c325d2c2273223a22785c2279222c2275223a22e4b8ad222c227a223a6e756c6c7d"
+    );
+    let digest = sha256_hex(&bytes);
+    assert_eq!(digest, C14N_VECTOR_3_DIGEST);
+}
+
+#[test]
+fn c14n_vector_4_bool_literals() {
+    let v = serde_json::json!({"ok": true, "no": false});
+    let bytes = json_c14n_bytes(&v).unwrap();
+    let hex: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+    assert_eq!(hex, "7b226e6f223a66616c73652c226f6b223a747275657d");
+    let digest = sha256_hex(&bytes);
+    assert_eq!(digest, C14N_VECTOR_4_DIGEST);
+}
+
+#[test]
+fn c14n_top_level_non_object_rejected() {
+    assert!(json_c14n_bytes(&serde_json::json!([1, 2])).is_err());
+    assert!(json_c14n_bytes(&serde_json::json!(42)).is_err());
+    assert!(json_c14n_bytes(&serde_json::json!("x")).is_err());
+}
+
+// ---- WO-1503 §1 tagged dispatch ----
+
+#[test]
+fn tagged_dispatch_v2_accepts_and_validates() {
+    // Build a minimal valid v2 attestation with no walker (null allowed).
+    let mut att = RuntimeAttestationV2 {
+        schema: ATTESTATION_SCHEMA_V2.to_string(),
+        schema_version: ATTESTATION_SCHEMA_VERSION_V2,
+        runtime_id: "mida-antidebug-runtime-x64".to_string(),
+        runtime_version: "0.1.0".to_string(),
+        architecture: "x86_64".to_string(),
+        runtime_sha256: "a".repeat(64),
+        profile_id: "p1".to_string(),
+        profile_digest: "deadbeef".to_string(),
+        target_pid: TEST_PID,
+        module_base: TEST_MODULE_BASE,
+        initialized: true,
+        hooks_expected: expected_surfaces(),
+        hooks_installed: expected_surfaces(),
+        hook_failures: Vec::new(),
+        surface_details: Vec::new(),
+        telemetry_channel: "ready".to_string(),
+        cleanup_handler_registered: true,
+        third_party: "build-and-serialization-only".to_string(),
+        source_revision: "v0.1.0".to_string(),
+        toolchain: "rustc".to_string(),
+        walker_attestation: None,
+        record_digest: String::new(),
+    };
+    att.record_digest = att.compute_digest();
+    assert!(!att.record_digest.is_empty());
+    let json = att.to_canonical_json().unwrap();
+    match parse_attestation(&json).unwrap() {
+        TaggedAttestation::V2(v2) => {
+            v2.validate().unwrap();
+            assert_eq!(v2.schema_version, 2);
+        }
+        _ => panic!("expected V2"),
     }
 }
 
 #[test]
-fn walker_attestation_v2_schema_constants() {
-    assert_eq!(WALKER_ATTESTATION_SCHEMA, "mida.antidebug-runtime-attestation/walker-v2");
-    assert_eq!(ROUND_LEDGER_SCHEMA, "mida.antidebug-runtime-attestation/round-v2");
-}
-
-#[test]
-fn walker_attestation_v2_roundtrip_json() {
-    let mut att = WalkerAttestation::new(
-        TEST_SESSION,
-        "oreans_origin_x64_v1",
-        "deadbeef",
-        TEST_PID,
-        "abc123",
-    );
-    let mut ledger = RoundLedger::new(TEST_SESSION, "oreans_origin_x64_v1");
-    ledger.push_round(sample_round(0));
-    ledger.push_round(sample_round(1));
-    att.anchor_ledger(&ledger);
-    assert_eq!(att.round_count, 2);
-    assert_eq!(att.total_pages_probed, 8);
-    assert_eq!(att.total_guard_pages_touched, 2);
-    assert!(!att.ledger_digest.is_empty());
-
+fn tagged_dispatch_v1_preserved() {
+    let att = foundation_attestation();
     let json = att.to_canonical_json().unwrap();
-    let back = WalkerAttestation::from_canonical_json(&json).unwrap();
-    assert_eq!(att, back);
-    assert_eq!(back.schema, WALKER_ATTESTATION_SCHEMA);
+    match parse_attestation(&json).unwrap() {
+        TaggedAttestation::V1(v1) => {
+            v1.validate().is_err(); // foundation is honest-unsupported -> hook inventory incomplete
+            assert_eq!(v1.schema, ATTESTATION_SCHEMA);
+        }
+        _ => panic!("expected V1"),
+    }
 }
 
 #[test]
-fn round_ledger_digest_is_deterministic() {
-    let mut l1 = RoundLedger::new(TEST_SESSION, "p1");
-    l1.push_round(sample_round(0));
-    l1.push_round(sample_round(1));
-    let mut l2 = RoundLedger::new(TEST_SESSION, "p1");
-    l2.push_round(sample_round(0));
-    l2.push_round(sample_round(1));
-    // identical ledgers -> identical digests
-    assert_eq!(l1.record_digest, l2.record_digest);
-    // digest is 64 lowercase hex chars
-    assert_eq!(l1.record_digest.len(), 64);
-    assert!(l1.record_digest.chars().all(|c| c.is_ascii_hexdigit()));
-    // validate passes
-    assert_eq!(l1.validate(), Ok(()));
-}
-
-#[test]
-fn round_ledger_digest_tamper_detected() {
-    let mut l1 = RoundLedger::new(TEST_SESSION, "p1");
-    l1.push_round(sample_round(0));
-    l1.push_round(sample_round(1));
-    let good = l1.record_digest.clone();
-    // tamper: change a round field, keep old digest
-    l1.rounds[1].guard_pages_touched = 99;
+fn tagged_dispatch_schema_version_mismatch_rejected() {
+    // v2 schema with schema_version=1 -> SchemaVersionMismatch
+    let json = r#"{"schema":"mida.antidebug-runtime-attestation/v2","schema_version":1}"#;
     assert!(matches!(
-        l1.validate(),
+        parse_attestation(json),
+        Err(mida_antidebug_runtime::attestation::AttestationError::SchemaVersionMismatch { .. })
+    ));
+}
+
+#[test]
+fn tagged_dispatch_unknown_schema_rejected() {
+    let json = r#"{"schema":"mida.wrong/v9"}"#;
+    assert!(matches!(
+        parse_attestation(json),
+        Err(mida_antidebug_runtime::attestation::AttestationError::SchemaUnsupported(_))
+    ));
+}
+
+#[test]
+fn tagged_dispatch_v2_unknown_field_rejected() {
+    let json = r#"{"schema":"mida.antidebug-runtime-attestation/v2","schema_version":2,"bogus":1}"#;
+    assert!(parse_attestation(json).is_err());
+}
+
+// ---- WO-1503 §3.2 RoundLedger ----
+
+fn sample_round(index: u8) -> RoundLedger {
+    let mut r = RoundLedger::new(index).unwrap();
+    r.entry_ts = "2026-08-23T00:00:00Z".to_string();
+    r.exit_ts = "2026-08-23T00:01:00Z".to_string();
+    r.wall_budget_ms = 3_600_000;
+    r.wall_spent_ms = 60_000;
+    r.candidates_probed = 16;
+    r.abort_state = AbortState::None;
+    r.auto_retry = false;
+    r.next_round_authorized = index == 1;
+    r
+}
+
+#[test]
+fn round_ledger_valid_rounds() {
+    let r1 = sample_round(1);
+    let r2 = sample_round(2);
+    r1.validate().unwrap();
+    r2.validate().unwrap();
+}
+
+#[test]
+fn round_ledger_rejects_bad_index() {
+    assert!(RoundLedger::new(0).is_err());
+    assert!(RoundLedger::new(3).is_err());
+    let mut r = sample_round(1);
+    r.round_index = 7;
+    assert!(matches!(
+        r.validate(),
+        Err(mida_antidebug_runtime::attestation::AttestationError::RoundIndexInvalid(7))
+    ));
+}
+
+#[test]
+fn round_ledger_rejects_budget_exceeded() {
+    let mut r = sample_round(1);
+    r.wall_spent_ms = r.wall_budget_ms + 1;
+    assert!(matches!(
+        r.validate(),
+        Err(mida_antidebug_runtime::attestation::AttestationError::WallBudgetExceeded { .. })
+    ));
+}
+
+#[test]
+fn round_ledger_rejects_auto_retry() {
+    let mut r = sample_round(1);
+    r.auto_retry = true;
+    assert_eq!(
+        r.validate(),
+        Err(mida_antidebug_runtime::attestation::AttestationError::AutoRetryForbidden)
+    );
+}
+
+// ---- WO-1503 §3.3 ProbeSummary ----
+
+#[test]
+fn probe_summary_consistency_valid() {
+    let s = ProbeSummary {
+        candidates_total: 16,
+        type_a_count: 8,
+        type_b_count: 5,
+        type_c_count: 3,
+        av_count: 2,
+        guard_count: 1,
+        retry_count: 0,
+        total_latency_us: 1000,
+    };
+    s.validate().unwrap();
+}
+
+#[test]
+fn probe_summary_type_sum_mismatch_rejected() {
+    let s = ProbeSummary {
+        candidates_total: 16,
+        type_a_count: 8,
+        type_b_count: 5,
+        type_c_count: 4, // 8+5+4=17 != 16
+        av_count: 0,
+        guard_count: 0,
+        retry_count: 0,
+        total_latency_us: 0,
+    };
+    assert!(matches!(
+        s.validate(),
+        Err(mida_antidebug_runtime::attestation::AttestationError::ProbeSummaryTypeSumMismatch { .. })
+    ));
+}
+
+#[test]
+fn probe_summary_guard_exceeds_rejected() {
+    let s = ProbeSummary {
+        candidates_total: 16,
+        type_a_count: 16,
+        type_b_count: 0,
+        type_c_count: 0,
+        av_count: 0,
+        guard_count: 17, // > total
+        retry_count: 0,
+        total_latency_us: 0,
+    };
+    assert!(s.validate().is_err());
+}
+
+// ---- WO-1503 §3.4 Orphan ----
+
+#[test]
+fn orphan_valid_and_invalid_states() {
+    let ok = Orphan {
+        kind: OrphanKind::ParamsBlob,
+        target_pid: TEST_PID,
+        blob_base_va: Some(0x7ff6_0000_1000),
+        section_name: None,
+        created_ts: "2026-08-23T00:00:00Z".to_string(),
+        timeout_ts: None,
+        state: OrphanState::Created,
+        reclaim_note: None,
+    };
+    ok.validate().unwrap();
+
+    let bad = Orphan {
+        kind: OrphanKind::ParamsBlob,
+        target_pid: TEST_PID,
+        blob_base_va: None, // params_blob requires VA
+        section_name: None,
+        created_ts: "2026-08-23T00:00:00Z".to_string(),
+        timeout_ts: None,
+        state: OrphanState::Created,
+        reclaim_note: None,
+    };
+    assert!(matches!(
+        bad.validate(),
+        Err(mida_antidebug_runtime::attestation::AttestationError::OrphanKindVaInconsistent)
+    ));
+}
+
+#[test]
+fn orphan_unconfirmed_no_reclaim_note() {
+    let o = Orphan {
+        kind: OrphanKind::ResultSection,
+        target_pid: TEST_PID,
+        blob_base_va: None,
+        section_name: Some("WALKER_RESULT_1".to_string()),
+        created_ts: "2026-08-23T00:00:00Z".to_string(),
+        timeout_ts: None,
+        state: OrphanState::Unconfirmed,
+        reclaim_note: Some("observed via handle query".to_string()), // forbidden
+    };
+    assert!(matches!(
+        o.validate(),
+        Err(mida_antidebug_runtime::attestation::AttestationError::OrphanReclaimNoteUnconfirmed)
+    ));
+}
+
+// ---- WO-1503 §3.1 WalkerAttestation binding + digest ----
+
+fn sample_walker_attestation() -> WalkerAttestation {
+    let summary = ProbeSummary {
+        candidates_total: 16,
+        type_a_count: 8,
+        type_b_count: 5,
+        type_c_count: 3,
+        av_count: 2,
+        guard_count: 1,
+        retry_count: 0,
+        total_latency_us: 1000,
+    };
+    let mut w = WalkerAttestation::new(
+        TEST_PID,
+        "target-image-digest",
+        "a".repeat(64),
+        0x1234,
+        TEST_MODULE_BASE + 0x1234,
+        summary,
+    );
+    w.rounds.push(sample_round(1));
+    w.rounds.push(sample_round(2));
+    w.record_digest = w.compute_digest();
+    w
+}
+
+#[test]
+fn walker_attestation_binding_and_digest() {
+    let w = sample_walker_attestation();
+    w.validate(TEST_PID, &"a".repeat(64)).unwrap();
+    // tamper -> digest mismatch
+    let mut w2 = w.clone();
+    w2.probe_summary.av_count = 99;
+    assert!(matches!(
+        w2.validate(TEST_PID, &"a".repeat(64)),
         Err(mida_antidebug_runtime::attestation::AttestationError::RecordDigestMismatch { .. })
     ));
-    // re-anchor fixes it
-    l1.record_digest = l1.compute_digest();
-    assert_eq!(l1.validate(), Ok(()));
-    assert_ne!(good, l1.record_digest);
-}
-
-#[test]
-fn round_ledger_seq_gap_rejected() {
-    let mut l1 = RoundLedger::new(TEST_SESSION, "p1");
-    l1.push_round(sample_round(0));
-    l1.push_round(sample_round(2)); // gap: 1 missing
+    // pid mismatch -> reject
+    let mut w3 = w.clone();
+    w3.target_pid = TEST_PID + 1;
     assert!(matches!(
-        l1.validate(),
-        Err(mida_antidebug_runtime::attestation::AttestationError::RoundSeqGap {
-            expected: 1,
-            got: 2
-        })
+        w3.validate(TEST_PID, &"a".repeat(64)),
+        Err(mida_antidebug_runtime::attestation::AttestationError::WalkerPidMismatch { .. })
     ));
 }
 
 #[test]
-fn round_ledger_digest_preimage_excludes_session_fields() {
-    // Two ledgers differing only in session/profile must have the SAME
-    // record digest (preimage covers rounds+orphans only).
-    let mut l1 = RoundLedger::new("session-a", "profile-a");
-    l1.push_round(sample_round(0));
-    let mut l2 = RoundLedger::new("session-b", "profile-b");
-    l2.push_round(sample_round(0));
-    assert_eq!(l1.record_digest, l2.record_digest);
-}
-
-#[test]
-fn orphan_records_roundtrip_and_anchor() {
-    let mut ledger = RoundLedger::new(TEST_SESSION, "p1");
-    ledger.push_round(sample_round(0));
-    ledger.push_orphan(Orphan {
-        identity_va: 0x7ff6_0000_1000,
-        section_digest: "section-digest-abc".to_string(),
-        reason: "no matching round ledger entry".to_string(),
-    });
-    assert_eq!(ledger.orphans.len(), 1);
-    assert_eq!(ledger.validate(), Ok(()));
-    // orphan participates in the digest
-    let without_orphan = RoundLedger::new(TEST_SESSION, "p1");
-    let d1 = ledger.record_digest.clone();
-    let d2 = without_orphan.record_digest;
-    assert_ne!(d1, d2);
-}
-
-#[test]
-fn json_c14n_sorts_keys_and_strips_whitespace() {
-    let v = serde_json::json!({"b": 1, "a": [3, 1, 2], "c": {"z": 1, "y": 2}});
-    let canon = json_c14n(&v).unwrap();
-    // keys sorted: a, b, c; nested c keys sorted: y, z
-    assert_eq!(canon, r#"{"a":[3,1,2],"b":1,"c":{"y":2,"z":1}}"#);
-}
-
-#[test]
-fn sha256_hex_matches_known_vector() {
-    // sha256("abc") = ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
-    assert_eq!(
-        sha256_hex(b"abc"),
-        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-    );
-}
-
-#[test]
-fn walker_attestation_validate_fail_closed() {
-    let att = WalkerAttestation::new("", "p1", "digest", 0, "abc");
-    // empty session + zero pid -> fail closed
-    assert!(att.validate().is_err());
-}
-
-#[test]
-fn walker_attestation_counts_inconsistent_rejected() {
-    let mut att = WalkerAttestation::new(TEST_SESSION, "p1", "digest", TEST_PID, "abc");
-    att.ledger_digest = "x".repeat(64); // pass digest check
-    att.round_count = 3; // claims rounds
-    att.total_pages_probed = 0; // but no pages
+fn walker_attestation_round_sequence_checked() {
+    let mut w = sample_walker_attestation();
+    // remove round 1 -> sequence starts at 2 -> gap
+    w.rounds.remove(0);
+    w.record_digest = w.compute_digest();
     assert!(matches!(
-        att.validate(),
-        Err(mida_antidebug_runtime::attestation::AttestationError::CountsInconsistent)
+        w.validate(TEST_PID, &"a".repeat(64)),
+        Err(mida_antidebug_runtime::attestation::AttestationError::RoundSeqGap { expected: 1, got: 2 })
     ));
+}
+
+#[test]
+fn walker_attestation_digest_preimage_excludes_only_self() {
+    let w = sample_walker_attestation();
+    // The digest must be deterministic and 64 hex lowercase.
+    assert_eq!(w.record_digest.len(), 64);
+    assert!(w.record_digest.chars().all(|c| c.is_ascii_hexdigit()));
+    // recompute equals stored
+    assert_eq!(w.compute_digest(), w.record_digest);
+}
+
+// ---- v2 top-level with walker ----
+
+#[test]
+fn v2_top_level_with_walker_roundtrip() {
+    let w = sample_walker_attestation();
+    let mut att = RuntimeAttestationV2 {
+        schema: ATTESTATION_SCHEMA_V2.to_string(),
+        schema_version: ATTESTATION_SCHEMA_VERSION_V2,
+        runtime_id: "mida-antidebug-runtime-x64".to_string(),
+        runtime_version: "0.1.0".to_string(),
+        architecture: "x86_64".to_string(),
+        runtime_sha256: "a".repeat(64),
+        profile_id: "p1".to_string(),
+        profile_digest: "deadbeef".to_string(),
+        target_pid: TEST_PID,
+        module_base: TEST_MODULE_BASE,
+        initialized: true,
+        hooks_expected: expected_surfaces(),
+        hooks_installed: expected_surfaces(),
+        hook_failures: Vec::new(),
+        surface_details: Vec::new(),
+        telemetry_channel: "ready".to_string(),
+        cleanup_handler_registered: true,
+        third_party: "build-and-serialization-only".to_string(),
+        source_revision: "v0.1.0".to_string(),
+        toolchain: "rustc".to_string(),
+        walker_attestation: Some(w),
+        record_digest: String::new(),
+    };
+    att.record_digest = att.compute_digest();
+    att.validate().unwrap();
+    let json = att.to_canonical_json().unwrap();
+    let back = RuntimeAttestationV2::from_canonical_json(&json).unwrap();
+    assert_eq!(back, att);
+}
+
+#[test]
+fn v2_top_level_walker_digest_tamper_rejected() {
+    let w = sample_walker_attestation();
+    let mut att = RuntimeAttestationV2 {
+        schema: ATTESTATION_SCHEMA_V2.to_string(),
+        schema_version: ATTESTATION_SCHEMA_VERSION_V2,
+        runtime_id: "mida-antidebug-runtime-x64".to_string(),
+        runtime_version: "0.1.0".to_string(),
+        architecture: "x86_64".to_string(),
+        runtime_sha256: "a".repeat(64),
+        profile_id: "p1".to_string(),
+        profile_digest: "deadbeef".to_string(),
+        target_pid: TEST_PID,
+        module_base: TEST_MODULE_BASE,
+        initialized: true,
+        hooks_expected: expected_surfaces(),
+        hooks_installed: expected_surfaces(),
+        hook_failures: Vec::new(),
+        surface_details: Vec::new(),
+        telemetry_channel: "ready".to_string(),
+        cleanup_handler_registered: true,
+        third_party: "build-and-serialization-only".to_string(),
+        source_revision: "v0.1.0".to_string(),
+        toolchain: "rustc".to_string(),
+        walker_attestation: Some(w),
+        record_digest: String::new(),
+    };
+    att.record_digest = att.compute_digest();
+    // tamper the nested walker digest AFTER top-level digest computed
+    let json = att.to_canonical_json().unwrap();
+    let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    value["walker_attestation"]["record_digest"] = serde_json::json!("0".repeat(64));
+    let tampered = value.to_string();
+    let parsed = RuntimeAttestationV2::from_canonical_json(&tampered).unwrap();
+    // nested digest mismatch detected before top-level
+    assert!(parsed.validate().is_err());
 }

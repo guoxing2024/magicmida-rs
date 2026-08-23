@@ -557,3 +557,68 @@ fn controller_read_section_rejects_crc_tamper() {
     let err = controller_read_section(&tampered, &expected, 1).unwrap_err();
     assert!(matches!(err, ProtocolError::CrcMismatch { .. }));
 }
+
+
+// ----------------------------------------------------------------
+// IMP-02-R1: CRC-first order hostile tests
+// ----------------------------------------------------------------
+
+#[test]
+fn controller_crc_first_rejects_tampered_payload_before_parse() {
+    // Build a valid DONE section with 1 result.
+    let results = vec![sample_result()];
+    let section = encode_done_section(&results);
+    let expected = sample_identity_expectation(section.len() as u64);
+    // Tamper the FIRST payload byte (record probe_va LSB).
+    let mut tampered = section.clone();
+    tampered[MIN_SECTION_HEADER_BYTES] ^= 0xFF;
+    // Raw CRC check fires before record parsing -> CrcMismatch.
+    assert!(matches!(
+        controller_read_section(&tampered, &expected, 1),
+        Err(ProtocolError::CrcMismatch { .. })
+    ));
+}
+
+#[test]
+fn controller_crc_first_rejects_malformed_record_region() {
+    // The validated constructor rejects a record with classification out of
+    // the closed set BEFORE any bytes are produced (encode_section is a
+    // validated constructor), so a malformed record can never reach the
+    // controller buffer. This proves the fail-closed chain:
+    // constructor gate -> wire CRC -> record parse.
+    let mut results = vec![sample_result()];
+    results[0].classification = 99; // out of closed set (max = 5)
+    let cap = results.len() as u32;
+    let section_bytes = MIN_SECTION_HEADER_BYTES as u64 + cap as u64 * PROBE_RESULT_BYTES as u64;
+    let ident = MappingIdentityHeaderV2::new(
+        section_bytes,
+        4242,
+        1337,
+        sample_nonce(),
+        derive_session_id(sample_nonce(), 0x0000_0000_0040_0000, 3),
+    );
+    let mut hdr = ResultSectionHeaderV2::new(section_bytes, cap).unwrap();
+    hdr.result_count = cap;
+    hdr.completed_flag = COMPLETED_FLAG_DONE;
+    assert!(encode_section(&ident, &hdr, &results).is_err());
+}
+
+#[test]
+fn controller_crc_first_proves_order_via_roundtrip_field() {
+    // A field that round-trips (e.g. latency_us) can be changed without
+    // breaking record parsing, but the raw CRC must catch it.
+    let results = vec![sample_result()];
+    let section = encode_done_section(&results);
+    let expected = sample_identity_expectation(section.len() as u64);
+    // Find latency_us offset within the record payload: ProbeResultV2 layout
+    // has probe_va(8) + classification(4) + flags(1) + retry(1) + span(2)
+    // + observed(16) = 32, then latency_us(4) at record offset 0x20.
+    let latency_off = MIN_SECTION_HEADER_BYTES + 0x20;
+    let mut tampered = section.clone();
+    tampered[latency_off] ^= 0x01; // latency_us LSB flip
+    // Raw CRC mismatch (CRC-first) -> reject before any field semantics.
+    assert!(matches!(
+        controller_read_section(&tampered, &expected, 1),
+        Err(ProtocolError::CrcMismatch { .. })
+    ));
+}

@@ -1583,17 +1583,12 @@ pub fn controller_read_section<'a>(
     }
     let payload = &section[payload_start..payload_end];
 
-    let mut results = Vec::with_capacity(declared_count);
-    for i in 0..declared_count {
-        let off = i * PROBE_RESULT_BYTES;
-        let rec = ProbeResultV2::from_bytes(&payload[off..off + PROBE_RESULT_BYTES])?;
-        rec.validate()?;
-        results.push(rec);
-    }
-
-    // Raw payload CRC check FIRST: the parsed records may re-serialize
-    // identically even when the raw buffer was tampered (e.g. a byte in a
-    // field that round-trips), so CRC must cover the raw payload bytes.
+    // --- RAW PAYLOAD CRC FIRST (RC-2 contract) ---
+    // The CRC covers the raw wire bytes of the payload region, BEFORE any
+    // record parsing or business validation. This guarantees a tampered
+    // buffer is rejected on the wire before any field is interpreted:
+    // even a mutation that round-trips through ProbeResultV2 ser/de cannot
+    // survive the raw CRC gate.
     let computed_raw = crc32(payload);
     if computed_raw != header.payload_crc32 {
         return Err(ProtocolError::CrcMismatch {
@@ -1602,8 +1597,18 @@ pub fn controller_read_section<'a>(
         });
     }
 
+    // --- then parse + validate records (business validation) ---
+    let mut results = Vec::with_capacity(declared_count);
+    for i in 0..declared_count {
+        let off = i * PROBE_RESULT_BYTES;
+        let rec = ProbeResultV2::from_bytes(&payload[off..off + PROBE_RESULT_BYTES])?;
+        rec.validate()?;
+        results.push(rec);
+    }
+
     // Full validation (identity binding + header layout + section bytes +
-    // count consistency + payload CRC).
+    // count consistency). The payload CRC was already verified above on the
+    // raw bytes; validate_section re-checks it as a redundant cross-check.
     validate_section(&identity, &header, &results, expected, result_capacity)?;
 
     Ok(ControllerSectionView {
