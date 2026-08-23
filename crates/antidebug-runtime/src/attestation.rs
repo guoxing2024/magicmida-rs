@@ -382,8 +382,323 @@ pub enum AttestationError {
     HookFailures(Vec<HookFailure>),
     #[error("surface detail inconsistent: {0}")]
     SurfaceDetailInconsistent(String),
+    #[error("session id missing")]
+    SessionIdMissing,
+    #[error("record digest missing")]
+    RecordDigestMissing,
+    #[error("record digest mismatch: expected {expected}, got {got}")]
+    RecordDigestMismatch { expected: String, got: String },
+    #[error("round sequence gap: expected {expected}, got {got}")]
+    RoundSeqGap { expected: u64, got: u64 },
+    #[error("attestation counts inconsistent (rounds>0 but pages==0)")]
+    CountsInconsistent,
     #[error("serialization error: {0}")]
     Serialization(String),
     #[error("deserialization error: {0}")]
     Deserialization(String),
+}
+
+
+// ============================================================================
+// Walker attestation v2 (IMP-01, Protocol Reset phase)
+// ============================================================================
+//
+// Pure-local, offline implementation phase types. These records describe a
+// walker session's probe rounds for controller-side audit. They do NOT
+// execute anything: no process memory is probed here; the probe results are
+// supplied by the caller (the future Walker runtime) and merely shaped,
+// validated and digest-anchored.
+//
+// Schema ids:
+//   - "mida.antidebug-runtime-attestation/walker-v2"   (WalkerAttestation)
+//   - "mida.antidebug-runtime-attestation/round-v2"    (RoundLedger)
+//
+// Digest anchor (record_digest): canonical JSON (sorted keys, no
+// insignificant whitespace) of the *ledger* fields only, then sha256.
+// The digest excludes session-level fields that are bound by the envelope,
+// so a ledger can be re-anchored into a different envelope without changing
+// its digest preimage.
+
+/// Walker attestation schema id (v2).
+pub const WALKER_ATTESTATION_SCHEMA: &str = "mida.antidebug-runtime-attestation/walker-v2";
+
+/// Round ledger schema id (v2).
+pub const ROUND_LEDGER_SCHEMA: &str = "mida.antidebug-runtime-attestation/round-v2";
+
+/// Canonical JSON: sorted object keys, no insignificant whitespace.
+///
+/// serde_json preserves insertion order for structs; to guarantee the
+/// canonical form used by digest preimages we re-serialize through a
+/// BTreeMap-backed representation. For structs whose field order is
+/// stable (Rust structs), serde_json output is already canonical for the
+/// same binary; the BTreeMap pass guards against future field-order drift.
+pub fn json_c14n(value: &serde_json::Value) -> Result<String, AttestationError> {
+    fn sort(v: serde_json::Value) -> serde_json::Value {
+        match v {
+            serde_json::Value::Object(map) => {
+                let mut sorted = serde_json::Map::new();
+                let mut keys: Vec<String> = map.keys().cloned().collect();
+                keys.sort();
+                for k in keys {
+                    if let Some(val) = map.get(&k) {
+                        sorted.insert(k, sort(val.clone()));
+                    }
+                }
+                serde_json::Value::Object(sorted)
+            }
+            serde_json::Value::Array(items) => {
+                serde_json::Value::Array(items.into_iter().map(sort).collect())
+            }
+            other => other,
+        }
+    }
+    let sorted = sort(value.clone());
+    serde_json::to_string(&sorted)
+        .map_err(|e| AttestationError::Serialization(e.to_string()))
+}
+
+/// SHA-256 hex (lowercase) helper shared by v2 digest anchoring.
+pub fn sha256_hex(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    let out = hasher.finalize();
+    let mut hex = String::with_capacity(64);
+    for b in out {
+        hex.push_str(&format!("{:02x}", b));
+    }
+    hex
+}
+
+/// One probe round's result summary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProbeSummary {
+    /// Monotonic round sequence within the session.
+    pub round_seq: u64,
+    /// Probe span in bytes (frozen contract: 16).
+    pub span: u64,
+    /// Number of pages covered by this round.
+    pub page_count: u64,
+    /// Guard pages touched (decrypt-triggered) in this round.
+    pub guard_pages_touched: u64,
+    /// Number of ProbeResultV2 records accepted into the section.
+    pub accepted: u64,
+    /// Number of records rejected by validation.
+    pub rejected: u64,
+    /// Round digest (sha256 hex of canonical ledger preimage for this round).
+    pub round_digest: String,
+}
+
+/// An orphaned probe result: accepted into a section whose identity could
+/// not be confirmed (no matching round ledger entry at audit time).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Orphan {
+    /// The mapping identity the orphan claims.
+    pub identity_va: u64,
+    /// The section header bytes digest (sha256 hex) that referenced it.
+    pub section_digest: String,
+    /// Why the orphan could not be confirmed (controller-side classification).
+    pub reason: String,
+}
+
+/// Round ledger: the controller-side audit record for one walker session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoundLedger {
+    pub schema: String,
+    /// Walker session id (derived, matches walker_protocol session id).
+    pub session_id: String,
+    /// Envelope profile id (from the params blob).
+    pub profile_id: String,
+    /// Rounds in execution order.
+    pub rounds: Vec<ProbeSummary>,
+    /// Orphans observed by the controller.
+    pub orphans: Vec<Orphan>,
+    /// Ledger digest over the canonical JSON of rounds+orphans (record_digest
+    /// preimage; session fields excluded so the ledger can be re-anchored).
+    pub record_digest: String,
+}
+
+impl RoundLedger {
+    pub fn new(session_id: impl Into<String>, profile_id: impl Into<String>) -> Self {
+        Self {
+            schema: ROUND_LEDGER_SCHEMA.to_string(),
+            session_id: session_id.into(),
+            profile_id: profile_id.into(),
+            rounds: Vec::new(),
+            orphans: Vec::new(),
+            record_digest: String::new(),
+        }
+    }
+
+    /// Append a round summary and re-anchor the digest.
+    pub fn push_round(&mut self, round: ProbeSummary) {
+        self.rounds.push(round);
+        self.record_digest = self.compute_digest();
+    }
+
+    /// Append an orphan and re-anchor the digest.
+    pub fn push_orphan(&mut self, orphan: Orphan) {
+        self.orphans.push(orphan);
+        self.record_digest = self.compute_digest();
+    }
+
+    /// record_digest preimage: canonical JSON of {rounds, orphans} only.
+    pub fn digest_preimage(&self) -> Result<String, AttestationError> {
+        let value = serde_json::json!({
+            "rounds": self.rounds,
+            "orphans": self.orphans,
+        });
+        json_c14n(&value)
+    }
+
+    /// Compute the record digest (sha256 of the canonical preimage).
+    pub fn compute_digest(&self) -> String {
+        match self.digest_preimage() {
+            Ok(pre) => sha256_hex(pre.as_bytes()),
+            Err(_) => String::new(), // fail-closed: empty digest never validates
+        }
+    }
+
+    /// Fail-closed validation.
+    pub fn validate(&self) -> Result<(), AttestationError> {
+        if self.schema != ROUND_LEDGER_SCHEMA {
+            return Err(AttestationError::SchemaMismatch(self.schema.clone()));
+        }
+        if self.session_id.is_empty() {
+            return Err(AttestationError::SessionIdMissing);
+        }
+        if self.record_digest.is_empty() {
+            return Err(AttestationError::RecordDigestMissing);
+        }
+        // digest must match a recomputation over the current rounds+orphans.
+        let recomputed = self.compute_digest();
+        if recomputed != self.record_digest {
+            return Err(AttestationError::RecordDigestMismatch {
+                expected: recomputed,
+                got: self.record_digest.clone(),
+            });
+        }
+        // round_seq must be strictly increasing and gap-free.
+        let mut last: Option<u64> = None;
+        for r in &self.rounds {
+            match last {
+                None => last = Some(r.round_seq),
+                Some(prev) => {
+                    if r.round_seq != prev + 1 {
+                        return Err(AttestationError::RoundSeqGap {
+                            expected: prev + 1,
+                            got: r.round_seq,
+                        });
+                    }
+                    last = Some(r.round_seq);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Canonical JSON (transport).
+    pub fn to_canonical_json(&self) -> Result<String, AttestationError> {
+        serde_json::to_string(self).map_err(|e| AttestationError::Serialization(e.to_string()))
+    }
+
+    /// Parse from canonical JSON (transport: does NOT validate; call
+    /// [Self::validate] on the controller side).
+    pub fn from_canonical_json(s: &str) -> Result<Self, AttestationError> {
+        serde_json::from_str(s).map_err(|e| AttestationError::Deserialization(e.to_string()))
+    }
+}
+
+/// Walker session attestation (v2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WalkerAttestation {
+    pub schema: String,
+    /// Walker session id (derived via walker_protocol::derive_session_id).
+    pub session_id: String,
+    /// Envelope profile id.
+    pub profile_id: String,
+    /// Profile digest from the envelope (controller cross-checks).
+    pub profile_digest: String,
+    /// Target pid the walker session is bound to.
+    pub target_pid: u32,
+    /// Number of completed probe rounds.
+    pub round_count: u64,
+    /// Total pages probed across all rounds.
+    pub total_pages_probed: u64,
+    /// Total guard pages touched.
+    pub total_guard_pages_touched: u64,
+    /// Ledger digest (anchors the full RoundLedger record).
+    pub ledger_digest: String,
+    /// Runtime artifact sha256 (same value as v1 runtime_sha256).
+    pub runtime_sha256: String,
+}
+
+impl WalkerAttestation {
+    pub fn new(
+        session_id: impl Into<String>,
+        profile_id: impl Into<String>,
+        profile_digest: impl Into<String>,
+        target_pid: u32,
+        runtime_sha256: impl Into<String>,
+    ) -> Self {
+        Self {
+            schema: WALKER_ATTESTATION_SCHEMA.to_string(),
+            session_id: session_id.into(),
+            profile_id: profile_id.into(),
+            profile_digest: profile_digest.into(),
+            target_pid,
+            round_count: 0,
+            total_pages_probed: 0,
+            total_guard_pages_touched: 0,
+            ledger_digest: String::new(),
+            runtime_sha256: runtime_sha256.into(),
+        }
+    }
+
+    /// Anchor to a ledger: copy counts and bind ledger_digest.
+    pub fn anchor_ledger(&mut self, ledger: &RoundLedger) {
+        self.round_count = ledger.rounds.len() as u64;
+        self.total_pages_probed = ledger.rounds.iter().map(|r| r.page_count).sum();
+        self.total_guard_pages_touched = ledger.rounds.iter().map(|r| r.guard_pages_touched).sum();
+        self.ledger_digest = ledger.record_digest.clone();
+    }
+
+    /// Fail-closed validation.
+    pub fn validate(&self) -> Result<(), AttestationError> {
+        if self.schema != WALKER_ATTESTATION_SCHEMA {
+            return Err(AttestationError::SchemaMismatch(self.schema.clone()));
+        }
+        if self.session_id.is_empty() {
+            return Err(AttestationError::SessionIdMissing);
+        }
+        if self.profile_digest.is_empty() {
+            return Err(AttestationError::ProfileDigestMissing);
+        }
+        if self.ledger_digest.is_empty() {
+            return Err(AttestationError::RecordDigestMissing);
+        }
+        if self.target_pid == 0 {
+            return Err(AttestationError::TargetPidMissing);
+        }
+        // counts must be consistent with a ledger that has rounds.
+        if self.round_count > 0 && self.total_pages_probed == 0 {
+            return Err(AttestationError::CountsInconsistent);
+        }
+        Ok(())
+    }
+
+    /// Canonical JSON (transport).
+    pub fn to_canonical_json(&self) -> Result<String, AttestationError> {
+        serde_json::to_string(self).map_err(|e| AttestationError::Serialization(e.to_string()))
+    }
+
+    /// Parse from canonical JSON (transport: does NOT validate; call
+    /// [Self::validate] on the controller side).
+    pub fn from_canonical_json(s: &str) -> Result<Self, AttestationError> {
+        serde_json::from_str(s).map_err(|e| AttestationError::Deserialization(e.to_string()))
+    }
 }

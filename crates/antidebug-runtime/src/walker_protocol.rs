@@ -1492,3 +1492,140 @@ pub fn validate_section(
     }
     Ok(())
 }
+
+// ============================================================================
+// Validated controller API (IMP-02, Protocol Reset phase)
+// ============================================================================
+//
+// Pure offline, fail-closed controller-side gates for the Walker protocol:
+//
+//   validated-entry           params blob -> validated WalkerParamsV2
+//   validated-result          section (identity+header+payload) -> validated
+//   validated-controller-read read result records from a buffer, fail-closed
+//
+// Nothing here performs WPM/RPM/CreateRemoteThread or touches any process.
+// All operations are on caller-supplied byte buffers.
+
+/// Result of a validated controller read: the validated header pair plus
+/// the parsed result records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControllerSectionView<'a> {
+    pub identity: MappingIdentityHeaderV2,
+    pub header: ResultSectionHeaderV2,
+    pub results: Vec<ProbeResultV2>,
+    /// Borrowed payload slice (results region) for CRC re-check by callers
+    /// that need the raw bytes.
+    pub payload: &'a [u8],
+}
+
+/// Controller entry gate: validate a params blob and extract the candidate
+/// list. Fail-closed on every inconsistency.
+pub fn controller_validate_entry(
+    blob: &[u8],
+) -> Result<(WalkerParamsV2, Vec<u64>), ProtocolError> {
+    let (params, candidates) = WalkerParamsV2::from_blob_bytes(blob)?;
+    params.validate(&candidates)?;
+    // candidate count must match the declared count exactly (the decoder
+    // enforces length; re-check here for the controller gate contract).
+    if candidates.len() != params.candidate_count as usize {
+        return Err(ProtocolError::CandidateCountMismatch {
+            got: candidates.len(),
+            declared: params.candidate_count,
+        });
+    }
+    Ok((params, candidates))
+}
+
+/// Result gate: validate a full result section (identity + header + payload)
+/// against the controller's expectations, then expose the records.
+///
+/// This is the single validated-controller-read entry point: it performs
+/// validated-result first (identity binding, layout, CRC, closed sets) and
+/// only then hands out the parsed records.
+pub fn controller_read_section<'a>(
+    section: &'a [u8],
+    expected: &IdentityExpectation,
+    result_capacity: u32,
+) -> Result<ControllerSectionView<'a>, ProtocolError> {
+    // --- validated-entry: identity + header bounds ---
+    if section.len() < MIN_SECTION_HEADER_BYTES {
+        return Err(ProtocolError::BufferTooShort {
+            need: MIN_SECTION_HEADER_BYTES,
+            got: section.len(),
+        });
+    }
+    let identity = MappingIdentityHeaderV2::from_bytes(&section[0..IDENTITY_HEADER_BYTES])?;
+    let header =
+        ResultSectionHeaderV2::from_bytes(&section[IDENTITY_HEADER_BYTES..MIN_SECTION_HEADER_BYTES])?;
+
+    // --- validated-result: full section validation ---
+    // Rebuild the result records from the payload slice with bounded reads.
+    let declared_count = header.result_count as usize;
+    if declared_count > result_capacity as usize {
+        return Err(ProtocolError::ResultCountExceedsCapacity {
+            got: header.result_count,
+            capacity: result_capacity,
+        });
+    }
+    let payload_start = header.results_off as usize;
+    let payload_len = declared_count
+        .checked_mul(PROBE_RESULT_BYTES)
+        .ok_or(ProtocolError::Overflow)?;
+    let payload_end = payload_start
+        .checked_add(payload_len)
+        .ok_or(ProtocolError::Overflow)?;
+    if payload_end > section.len() {
+        return Err(ProtocolError::OutOfBounds {
+            start: header.results_off as u64,
+            end: payload_end as u64,
+            total: section.len() as u64,
+        });
+    }
+    let payload = &section[payload_start..payload_end];
+
+    let mut results = Vec::with_capacity(declared_count);
+    for i in 0..declared_count {
+        let off = i * PROBE_RESULT_BYTES;
+        let rec = ProbeResultV2::from_bytes(&payload[off..off + PROBE_RESULT_BYTES])?;
+        rec.validate()?;
+        results.push(rec);
+    }
+
+    // Raw payload CRC check FIRST: the parsed records may re-serialize
+    // identically even when the raw buffer was tampered (e.g. a byte in a
+    // field that round-trips), so CRC must cover the raw payload bytes.
+    let computed_raw = crc32(payload);
+    if computed_raw != header.payload_crc32 {
+        return Err(ProtocolError::CrcMismatch {
+            stored: header.payload_crc32,
+            computed: computed_raw,
+        });
+    }
+
+    // Full validation (identity binding + header layout + section bytes +
+    // count consistency + payload CRC).
+    validate_section(&identity, &header, &results, expected, result_capacity)?;
+
+    Ok(ControllerSectionView {
+        identity,
+        header,
+        results,
+        payload,
+    })
+}
+
+/// Convenience: read only when the section is completed (done/abort);
+/// returns InconsistentPendingCount for a still-pending section.
+pub fn controller_read_completed_section<'a>(
+    section: &'a [u8],
+    expected: &IdentityExpectation,
+    result_capacity: u32,
+) -> Result<ControllerSectionView<'a>, ProtocolError> {
+    let view = controller_read_section(section, expected, result_capacity)?;
+    if view.header.completed_flag == COMPLETED_FLAG_PENDING {
+        return Err(ProtocolError::InconsistentPendingCount {
+            got: view.header.result_count,
+        });
+    }
+    Ok(view)
+}

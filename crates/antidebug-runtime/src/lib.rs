@@ -43,7 +43,11 @@ pub mod surfaces;
 pub mod telemetry;
 pub mod walker_protocol;
 
-pub use attestation::{AttestationError, HookInventory, RuntimeAttestation, RuntimeStatus};
+pub use attestation::{
+    json_c14n, sha256_hex, AttestationError, HookInventory, Orphan, ProbeSummary, RoundLedger,
+    RuntimeAttestation, RuntimeStatus, WalkerAttestation, ROUND_LEDGER_SCHEMA,
+    WALKER_ATTESTATION_SCHEMA,
+};
 pub use exports::{
     MidaAntidebugError, MidaAntidebugGetAttestation, MidaAntidebugInitialize,
     MidaAntidebugShutdown, ATTESTATION_BUFFER_SIZE, MAX_ATTESTATION_BYTES,
@@ -58,8 +62,9 @@ pub use telemetry::{
     TelemetryChannel, TelemetryError, TelemetryMessage, TelemetryResponse, TelemetryState,
 };
 pub use walker_protocol::{
+    controller_read_completed_section, controller_read_section, controller_validate_entry,
     crc32, derive_session_id, encode_section, is_canonical_user_va, is_canonical_x64,
-    page_span_fits, parse_section, validate_section, IdentityExpectation,
-    MappingIdentityHeaderV2, ProbeResultV2, ProtocolError, ResultSectionHeaderV2,
-    WalkerParamsV2,
+    page_span_fits, parse_section, validate_section, ControllerSectionView,
+    IdentityExpectation, MappingIdentityHeaderV2, ProbeResultV2, ProtocolError,
+    ResultSectionHeaderV2, WalkerParamsV2,
 };

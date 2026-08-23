@@ -376,7 +376,7 @@ pub fn classify_wait_status(raw: u32) -> RemoteWaitOutcome {
 }
 
 /// Loader errors (all fail-closed).
-#[derive(Debug, Clone, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[allow(dead_code)] // variants map to controller fail codes; some only via
                     // cleanup/evidence paths not yet exercised by the current wiring
 pub enum RuntimeLoadError {
@@ -2231,5 +2231,379 @@ mod timeout_harness {
             source_ref: "stub".to_string(),
             provenance_ref: "stub.json".to_string(),
         }
+    }
+}
+
+
+// ============================================================================
+// IMP-03: Loader/ABI inert adapter (v2, offline)
+// ============================================================================
+//
+// Pure-offline additions for the v2 entry contract. Nothing here executes a
+// thunk, writes process memory, or loads a remote module: it only:
+//   - declares the v2 wanted-export set (MidaAntidebugInitializeV2 +
+//     GetAttestation + Shutdown);
+//   - parses a THUNK7 byte fixture (60B production / 64B test-with-probe)
+//     without executing it;
+//   - serializes a v2 params blob (self-relative offsets, no pointers).
+// All paths are fail-closed and feature-gated behind #[cfg(test)] where a
+// runtime consumer would otherwise be needed.
+
+/// v2 wanted export names (7-arg initialize entry).
+pub const WANTED_EXPORTS_V2: &[&str] = &[
+    "MidaAntidebugInitializeV2",
+    "MidaAntidebugGetAttestation",
+    "MidaAntidebugShutdown",
+];
+
+/// v2 export resolution result (inert: addresses are placeholder values
+/// supplied by the caller; nothing is dereferenced here).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MidaExportsV2 {
+    pub initialize_v2: Option<usize>,
+    pub get_attestation: Option<usize>,
+    pub shutdown: Option<usize>,
+}
+
+impl MidaExportsV2 {
+    /// Fail-closed: v2 entry is REQUIRED for the v2 contract.
+    pub fn require_complete(&self) -> Result<(), RuntimeLoadError> {
+        if self.initialize_v2.is_none() {
+            return Err(RuntimeLoadError::ExportResolutionFailed(
+                "MidaAntidebugInitializeV2 missing".to_string(),
+            ));
+        }
+        if self.get_attestation.is_none() {
+            return Err(RuntimeLoadError::ExportResolutionFailed(
+                "MidaAntidebugGetAttestation missing".to_string(),
+            ));
+        }
+        if self.shutdown.is_none() {
+            return Err(RuntimeLoadError::ExportResolutionFailed(
+                "MidaAntidebugShutdown missing".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Parsed THUNK7 byte fixture (production 60B / test 64B) - PARSER ONLY.
+/// The parser verifies structural invariants (call position, ret position,
+/// probe position for the test variant) but never executes the bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Thunk7Fixture {
+    pub production: Vec<u8>,
+    pub test_with_probe: Vec<u8>,
+}
+
+/// Production THUNK7_CODE (60B) as declared in WO-2301 fixture, with
+/// call rax at 0x35 (FF D0), add rsp,0x38 at 0x37, ret at 0x3B.
+pub const THUNK7_PRODUCTION: [u8; 60] = [
+    0x49, 0x89, 0xCB, // 0000 mov r11, rcx
+    0x49, 0x8B, 0x03, // 0003 mov rax, [r11]
+    0x49, 0x8B, 0x4B, 0x08, // 0006 mov rcx, [r11+8]
+    0x49, 0x8B, 0x53, 0x10, // 000A mov rdx, [r11+16]
+    0x4D, 0x8B, 0x43, 0x18, // 000E mov r8,  [r11+24]
+    0x4D, 0x8B, 0x4B, 0x20, // 0012 mov r9,  [r11+32]
+    0x48, 0x83, 0xEC, 0x38, // 0016 sub rsp, 0x38
+    0x4D, 0x8B, 0x53, 0x28, // 001A mov r10, [r11+40]
+    0x4C, 0x89, 0x54, 0x24, 0x20, // 001E mov [rsp+0x20], r10
+    0x4D, 0x8B, 0x53, 0x30, // 0023 mov r10, [r11+48]
+    0x4C, 0x89, 0x54, 0x24, 0x28, // 0027 mov [rsp+0x28], r10
+    0x4D, 0x8B, 0x53, 0x38, // 002C mov r10, [r11+56]
+    0x4C, 0x89, 0x54, 0x24, 0x30, // 0030 mov [rsp+0x30], r10
+    0xFF, 0xD0, // 0035 call rax
+    0x48, 0x83, 0xC4, 0x38, // 0037 add rsp, 0x38
+    0xC3, // 003B ret
+];
+
+/// Test-only 64B variant: probe (49 89 63 48) at 0x35..0x38, call at 0x39.
+pub fn thunk7_test_with_probe() -> [u8; 64] {
+    let mut out = [0u8; 64];
+    out[0..0x35].copy_from_slice(&THUNK7_PRODUCTION[0..0x35]);
+    out[0x35..0x39].copy_from_slice(&[0x49, 0x89, 0x63, 0x48]); // probe
+    out[0x39..0x3B].copy_from_slice(&[0xFF, 0xD0]); // call rax
+    out[0x3B..0x3F].copy_from_slice(&[0x48, 0x83, 0xC4, 0x38]); // add rsp,0x38
+    out[0x3F] = 0xC3; // ret
+    out
+}
+
+impl Thunk7Fixture {
+    /// Build the canonical fixture pair.
+    pub fn build() -> Self {
+        Self {
+            production: THUNK7_PRODUCTION.to_vec(),
+            test_with_probe: thunk7_test_with_probe().to_vec(),
+        }
+    }
+
+    /// Parser-only structural validation (never executes the bytes).
+    pub fn validate_structure(&self) -> Result<(), RuntimeLoadError> {
+        if self.production.len() != 60 {
+            return Err(RuntimeLoadError::ExportResolutionFailed(
+                "thunk7 production must be 60B".to_string(),
+            ));
+        }
+        if self.test_with_probe.len() != 64 {
+            return Err(RuntimeLoadError::ExportResolutionFailed(
+                "thunk7 test variant must be 64B".to_string(),
+            ));
+        }
+        // production: call rax (FF D0) at 0x35
+        if self.production[0x35] != 0xFF || self.production[0x36] != 0xD0 {
+            return Err(RuntimeLoadError::ExportResolutionFailed(
+                "thunk7 production call rax must be at 0x35".to_string(),
+            ));
+        }
+        // production: ret at 0x3B
+        if self.production[0x3B] != 0xC3 {
+            return Err(RuntimeLoadError::ExportResolutionFailed(
+                "thunk7 production ret must be at 0x3B".to_string(),
+            ));
+        }
+        // test: probe (49 89 63 48) at 0x35, call at 0x39, ret at 0x3F
+        if self.test_with_probe[0x35..0x39] != [0x49, 0x89, 0x63, 0x48] {
+            return Err(RuntimeLoadError::ExportResolutionFailed(
+                "thunk7 test probe must be at 0x35".to_string(),
+            ));
+        }
+        if self.test_with_probe[0x39] != 0xFF || self.test_with_probe[0x3A] != 0xD0 {
+            return Err(RuntimeLoadError::ExportResolutionFailed(
+                "thunk7 test call rax must be at 0x39".to_string(),
+            ));
+        }
+        if self.test_with_probe[0x3F] != 0xC3 {
+            return Err(RuntimeLoadError::ExportResolutionFailed(
+                "thunk7 test ret must be at 0x3F".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// v2 params blob serialization (pure memory; self-relative offsets).
+///
+/// MidaInitParamsV2 envelope layout (0x48 header + referenced strings):
+///   0x10 profile_id_off       (self-relative)
+///   0x18 profile_digest_off   (self-relative)
+///   0x28 expected_surfaces_off (self-relative)
+///   0x30 magic_v2             (0x003250324144494D = "MIDA2P2\0" LE)
+///   0x38 digest_off           (self-relative)
+///   0x40 digest_len
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct V2ParamsBlob {
+    pub bytes: Vec<u8>,
+}
+
+pub const V2_ENVELOPE_MAGIC: u64 = 0x0032_5032_4144_494D; // "MIDA2P2 " LE
+pub const V2_HEADER_BYTES: usize = 0x48;
+pub const V2_DIGEST_LEN: u64 = 65; // hex digest + NUL (wire contract)
+
+impl V2ParamsBlob {
+    /// Serialize a v2 params envelope with self-relative offsets.
+    pub fn build(
+        profile_id: &str,
+        profile_digest: &str,
+        expected_surfaces: &[String],
+        digest: &str,
+    ) -> Result<Self, RuntimeLoadError> {
+        if digest.len() != 64 {
+            return Err(RuntimeLoadError::ExportResolutionFailed(
+                "v2 digest must be 64 hex chars".to_string(),
+            ));
+        }
+        let mut out: Vec<u8> = Vec::new();
+        out.resize(V2_HEADER_BYTES, 0u8);
+        // magic
+        out[0x30..0x38].copy_from_slice(&V2_ENVELOPE_MAGIC.to_le_bytes());
+        // digest_len
+        out[0x40..0x48].copy_from_slice(&V2_DIGEST_LEN.to_le_bytes());
+        // profile_id string
+        let pid_off = out.len() as u64;
+        out.extend_from_slice(profile_id.as_bytes());
+        out.push(0);
+        // profile_digest string
+        let pd_off = out.len() as u64;
+        out.extend_from_slice(profile_digest.as_bytes());
+        out.push(0);
+        // surface strings then pointer array
+        let mut surf_addrs: Vec<u64> = Vec::with_capacity(expected_surfaces.len());
+        for s in expected_surfaces {
+            let off = out.len() as u64;
+            out.extend_from_slice(s.as_bytes());
+            out.push(0);
+            surf_addrs.push(off);
+        }
+        let surf_arr_off = out.len() as u64;
+        for a in surf_addrs {
+            out.extend_from_slice(&a.to_le_bytes());
+        }
+        // digest string (self-relative)
+        let dig_off = out.len() as u64;
+        out.extend_from_slice(digest.as_bytes());
+        out.push(0);
+        // patch offsets (self-relative: absolute offset in the blob)
+        let patch = |out: &mut Vec<u8>, off: usize, val: u64| {
+            out[off..off + 8].copy_from_slice(&val.to_le_bytes());
+        };
+        patch(&mut out, 0x10, pid_off);
+        patch(&mut out, 0x18, pd_off);
+        patch(&mut out, 0x28, surf_arr_off);
+        patch(&mut out, 0x38, dig_off);
+        Ok(Self { bytes: out })
+    }
+
+    /// Offline re-parse of the serialized blob (no pointer dereference).
+    pub fn parse_offsets(&self) -> Result<V2Offsets, RuntimeLoadError> {
+        if self.bytes.len() < V2_HEADER_BYTES {
+            return Err(RuntimeLoadError::ExportResolutionFailed(
+                "v2 blob shorter than header".to_string(),
+            ));
+        }
+        let magic = u64::from_le_bytes(self.bytes[0x30..0x38].try_into().unwrap());
+        if magic != V2_ENVELOPE_MAGIC {
+            return Err(RuntimeLoadError::ExportResolutionFailed(
+                "v2 magic mismatch".to_string(),
+            ));
+        }
+        let pid_off = u64::from_le_bytes(self.bytes[0x10..0x18].try_into().unwrap());
+        let pd_off = u64::from_le_bytes(self.bytes[0x18..0x20].try_into().unwrap());
+        let surf_off = u64::from_le_bytes(self.bytes[0x28..0x30].try_into().unwrap());
+        let dig_off = u64::from_le_bytes(self.bytes[0x38..0x40].try_into().unwrap());
+        let dig_len = u64::from_le_bytes(self.bytes[0x40..0x48].try_into().unwrap());
+        // bounds sanity (self-relative offsets must be inside the blob)
+        let len = self.bytes.len() as u64;
+        for (name, off) in [("profile_id", pid_off), ("profile_digest", pd_off), ("surfaces", surf_off), ("digest", dig_off)] {
+            if off >= len {
+                return Err(RuntimeLoadError::ExportResolutionFailed(format!(
+                    "v2 {name} offset out of bounds"
+                )));
+            }
+        }
+        Ok(V2Offsets {
+            profile_id_off: pid_off,
+            profile_digest_off: pd_off,
+            expected_surfaces_off: surf_off,
+            digest_off: dig_off,
+            digest_len: dig_len,
+        })
+    }
+}
+
+/// Parsed v2 self-relative offsets (controller-side view).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct V2Offsets {
+    pub profile_id_off: u64,
+    pub profile_digest_off: u64,
+    pub expected_surfaces_off: u64,
+    pub digest_off: u64,
+    pub digest_len: u64,
+}
+
+
+#[cfg(test)]
+mod imp03_inert_adapter_tests {
+    use super::*;
+
+    #[test]
+    fn wanted_exports_v2_has_three_symbols() {
+        assert_eq!(WANTED_EXPORTS_V2.len(), 3);
+        assert_eq!(WANTED_EXPORTS_V2[0], "MidaAntidebugInitializeV2");
+        assert_eq!(WANTED_EXPORTS_V2[1], "MidaAntidebugGetAttestation");
+        assert_eq!(WANTED_EXPORTS_V2[2], "MidaAntidebugShutdown");
+    }
+
+    #[test]
+    fn mida_exports_v2_require_complete_fail_closed() {
+        let e = MidaExportsV2 {
+            initialize_v2: None,
+            get_attestation: None,
+            shutdown: None,
+        };
+        assert!(e.require_complete().is_err());
+        let e2 = MidaExportsV2 {
+            initialize_v2: Some(0x1000),
+            get_attestation: Some(0x2000),
+            shutdown: None,
+        };
+        assert!(e2.require_complete().is_err());
+        let e3 = MidaExportsV2 {
+            initialize_v2: Some(0x1000),
+            get_attestation: Some(0x2000),
+            shutdown: Some(0x3000),
+        };
+        assert_eq!(e3.require_complete(), Ok(()));
+    }
+
+    #[test]
+    fn thunk7_fixture_production_is_60b() {
+        let fx = Thunk7Fixture::build();
+        assert_eq!(fx.production.len(), 60);
+        assert_eq!(fx.test_with_probe.len(), 64);
+        fx.validate_structure().unwrap();
+    }
+
+    #[test]
+    fn thunk7_fixture_structural_offsets() {
+        let fx = Thunk7Fixture::build();
+        // production: call@0x35, ret@0x3B
+        assert_eq!(&fx.production[0x35..0x37], &[0xFF, 0xD0]);
+        assert_eq!(fx.production[0x3B], 0xC3);
+        // test: probe@0x35, call@0x39, ret@0x3F
+        assert_eq!(&fx.test_with_probe[0x35..0x39], &[0x49, 0x89, 0x63, 0x48]);
+        assert_eq!(&fx.test_with_probe[0x39..0x3B], &[0xFF, 0xD0]);
+        assert_eq!(fx.test_with_probe[0x3F], 0xC3);
+    }
+
+    #[test]
+    fn thunk7_fixture_matches_known_hashes() {
+        // production SHA-256 = 9B6F4A7A... (documented closure)
+        use sha2::{Digest, Sha256};
+        let fx = Thunk7Fixture::build();
+        let prod_sha = {
+            let mut h = Sha256::new();
+            h.update(&fx.production);
+            let out = h.finalize();
+            out.iter().map(|b| format!("{:02X}", b)).collect::<String>()
+        };
+        assert_eq!(
+            prod_sha,
+            "9B6F4A7A138B3C4C5523CEDD047745C96AA83CA01614BEB703E4994DA2E1F017"
+        );
+        let test_sha = {
+            let mut h = Sha256::new();
+            h.update(&fx.test_with_probe);
+            let out = h.finalize();
+            out.iter().map(|b| format!("{:02X}", b)).collect::<String>()
+        };
+        assert_eq!(
+            test_sha,
+            "01DC2017D8825EFD7E1C3FBE186C2FACF36FB22F2338C493C422E659476E17AE"
+        );
+    }
+
+    #[test]
+    fn v2_params_blob_roundtrip_offsets() {
+        let surfaces = vec!["AD-PROC-001".to_string(), "AD-PROC-002".to_string()];
+        let digest = "a".repeat(64);
+        let blob = V2ParamsBlob::build("profile-x", "digest-y", &surfaces, &digest).unwrap();
+        // header + strings + pointers + digest
+        assert!(blob.bytes.len() > V2_HEADER_BYTES);
+        let offs = blob.parse_offsets().unwrap();
+        assert_eq!(offs.profile_id_off, 0x48);
+        assert_eq!(offs.digest_len, 65);
+        // magic check inside parse_offsets passed
+    }
+
+    #[test]
+    fn v2_params_blob_rejects_bad_digest_len() {
+        let surfaces = vec!["AD-PROC-001".to_string()];
+        assert!(V2ParamsBlob::build("p", "d", &surfaces, "short").is_err());
+    }
+
+    #[test]
+    fn v2_params_blob_parse_rejects_truncated() {
+        let blob = V2ParamsBlob { bytes: vec![0u8; 16] };
+        assert!(blob.parse_offsets().is_err());
     }
 }

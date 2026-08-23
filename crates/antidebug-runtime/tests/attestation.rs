@@ -550,3 +550,171 @@ impl TelemetryRequestTemplate {
         }
     }
 }
+
+
+// ----------------------------------------------------------------
+// IMP-01: walker attestation v2 (pure local, offline)
+// ----------------------------------------------------------------
+
+use mida_antidebug_runtime::attestation::{
+    json_c14n, sha256_hex, Orphan, ProbeSummary, RoundLedger, WalkerAttestation,
+    ROUND_LEDGER_SCHEMA, WALKER_ATTESTATION_SCHEMA,
+};
+
+const TEST_SESSION: &str = "sess-impl01-test-0001";
+
+fn sample_round(seq: u64) -> ProbeSummary {
+    ProbeSummary {
+        round_seq: seq,
+        span: 16,
+        page_count: 4,
+        guard_pages_touched: 1,
+        accepted: 4,
+        rejected: 0,
+        round_digest: format!("round-digest-{seq}"),
+    }
+}
+
+#[test]
+fn walker_attestation_v2_schema_constants() {
+    assert_eq!(WALKER_ATTESTATION_SCHEMA, "mida.antidebug-runtime-attestation/walker-v2");
+    assert_eq!(ROUND_LEDGER_SCHEMA, "mida.antidebug-runtime-attestation/round-v2");
+}
+
+#[test]
+fn walker_attestation_v2_roundtrip_json() {
+    let mut att = WalkerAttestation::new(
+        TEST_SESSION,
+        "oreans_origin_x64_v1",
+        "deadbeef",
+        TEST_PID,
+        "abc123",
+    );
+    let mut ledger = RoundLedger::new(TEST_SESSION, "oreans_origin_x64_v1");
+    ledger.push_round(sample_round(0));
+    ledger.push_round(sample_round(1));
+    att.anchor_ledger(&ledger);
+    assert_eq!(att.round_count, 2);
+    assert_eq!(att.total_pages_probed, 8);
+    assert_eq!(att.total_guard_pages_touched, 2);
+    assert!(!att.ledger_digest.is_empty());
+
+    let json = att.to_canonical_json().unwrap();
+    let back = WalkerAttestation::from_canonical_json(&json).unwrap();
+    assert_eq!(att, back);
+    assert_eq!(back.schema, WALKER_ATTESTATION_SCHEMA);
+}
+
+#[test]
+fn round_ledger_digest_is_deterministic() {
+    let mut l1 = RoundLedger::new(TEST_SESSION, "p1");
+    l1.push_round(sample_round(0));
+    l1.push_round(sample_round(1));
+    let mut l2 = RoundLedger::new(TEST_SESSION, "p1");
+    l2.push_round(sample_round(0));
+    l2.push_round(sample_round(1));
+    // identical ledgers -> identical digests
+    assert_eq!(l1.record_digest, l2.record_digest);
+    // digest is 64 lowercase hex chars
+    assert_eq!(l1.record_digest.len(), 64);
+    assert!(l1.record_digest.chars().all(|c| c.is_ascii_hexdigit()));
+    // validate passes
+    assert_eq!(l1.validate(), Ok(()));
+}
+
+#[test]
+fn round_ledger_digest_tamper_detected() {
+    let mut l1 = RoundLedger::new(TEST_SESSION, "p1");
+    l1.push_round(sample_round(0));
+    l1.push_round(sample_round(1));
+    let good = l1.record_digest.clone();
+    // tamper: change a round field, keep old digest
+    l1.rounds[1].guard_pages_touched = 99;
+    assert!(matches!(
+        l1.validate(),
+        Err(mida_antidebug_runtime::attestation::AttestationError::RecordDigestMismatch { .. })
+    ));
+    // re-anchor fixes it
+    l1.record_digest = l1.compute_digest();
+    assert_eq!(l1.validate(), Ok(()));
+    assert_ne!(good, l1.record_digest);
+}
+
+#[test]
+fn round_ledger_seq_gap_rejected() {
+    let mut l1 = RoundLedger::new(TEST_SESSION, "p1");
+    l1.push_round(sample_round(0));
+    l1.push_round(sample_round(2)); // gap: 1 missing
+    assert!(matches!(
+        l1.validate(),
+        Err(mida_antidebug_runtime::attestation::AttestationError::RoundSeqGap {
+            expected: 1,
+            got: 2
+        })
+    ));
+}
+
+#[test]
+fn round_ledger_digest_preimage_excludes_session_fields() {
+    // Two ledgers differing only in session/profile must have the SAME
+    // record digest (preimage covers rounds+orphans only).
+    let mut l1 = RoundLedger::new("session-a", "profile-a");
+    l1.push_round(sample_round(0));
+    let mut l2 = RoundLedger::new("session-b", "profile-b");
+    l2.push_round(sample_round(0));
+    assert_eq!(l1.record_digest, l2.record_digest);
+}
+
+#[test]
+fn orphan_records_roundtrip_and_anchor() {
+    let mut ledger = RoundLedger::new(TEST_SESSION, "p1");
+    ledger.push_round(sample_round(0));
+    ledger.push_orphan(Orphan {
+        identity_va: 0x7ff6_0000_1000,
+        section_digest: "section-digest-abc".to_string(),
+        reason: "no matching round ledger entry".to_string(),
+    });
+    assert_eq!(ledger.orphans.len(), 1);
+    assert_eq!(ledger.validate(), Ok(()));
+    // orphan participates in the digest
+    let without_orphan = RoundLedger::new(TEST_SESSION, "p1");
+    let d1 = ledger.record_digest.clone();
+    let d2 = without_orphan.record_digest;
+    assert_ne!(d1, d2);
+}
+
+#[test]
+fn json_c14n_sorts_keys_and_strips_whitespace() {
+    let v = serde_json::json!({"b": 1, "a": [3, 1, 2], "c": {"z": 1, "y": 2}});
+    let canon = json_c14n(&v).unwrap();
+    // keys sorted: a, b, c; nested c keys sorted: y, z
+    assert_eq!(canon, r#"{"a":[3,1,2],"b":1,"c":{"y":2,"z":1}}"#);
+}
+
+#[test]
+fn sha256_hex_matches_known_vector() {
+    // sha256("abc") = ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+    assert_eq!(
+        sha256_hex(b"abc"),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+}
+
+#[test]
+fn walker_attestation_validate_fail_closed() {
+    let att = WalkerAttestation::new("", "p1", "digest", 0, "abc");
+    // empty session + zero pid -> fail closed
+    assert!(att.validate().is_err());
+}
+
+#[test]
+fn walker_attestation_counts_inconsistent_rejected() {
+    let mut att = WalkerAttestation::new(TEST_SESSION, "p1", "digest", TEST_PID, "abc");
+    att.ledger_digest = "x".repeat(64); // pass digest check
+    att.round_count = 3; // claims rounds
+    att.total_pages_probed = 0; // but no pages
+    assert!(matches!(
+        att.validate(),
+        Err(mida_antidebug_runtime::attestation::AttestationError::CountsInconsistent)
+    ));
+}

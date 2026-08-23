@@ -396,3 +396,164 @@ fn params_probe_span_hostile_wire_rejected() {
         );
     }
 }
+
+
+// ----------------------------------------------------------------
+// IMP-02: validated controller API (pure offline)
+// ----------------------------------------------------------------
+
+use mida_antidebug_runtime::walker_protocol::{
+    controller_read_completed_section, controller_read_section, controller_validate_entry,
+    encode_section, IdentityExpectation, COMPLETED_FLAG_DONE,
+};
+
+fn sample_identity_expectation(section_bytes: u64) -> IdentityExpectation {
+    IdentityExpectation {
+        nonce: sample_nonce(),
+        target_pid: 4242,
+        owner_pid: 1337,
+        session_id: derive_session_id(sample_nonce(), 0x0000_0000_0040_0000, 3),
+        section_bytes,
+    }
+}
+
+fn sample_result() -> ProbeResultV2 {
+    let mut r = ProbeResultV2::new(
+        0x0000_0000_0001_0000,
+        4, // CLASSIFICATION_GUARD
+        1, // RESULT_FLAG_GUARD_SEEN
+        0,
+        [0u8; 16],
+    );
+    r.set_probe_span(16);
+    r.set_latency_us(10);
+    r
+}
+
+fn encode_done_section(results: &[ProbeResultV2]) -> Vec<u8> {
+    let cap = results.len() as u32;
+    let section_bytes = MIN_SECTION_HEADER_BYTES as u64 + cap as u64 * PROBE_RESULT_BYTES as u64;
+    let ident = MappingIdentityHeaderV2::new(
+        section_bytes,
+        4242,
+        1337,
+        sample_nonce(),
+        derive_session_id(sample_nonce(), 0x0000_0000_0040_0000, 3),
+    );
+    let mut hdr = ResultSectionHeaderV2::new(section_bytes, cap).unwrap();
+    hdr.result_count = cap;
+    hdr.completed_flag = COMPLETED_FLAG_DONE;
+    encode_section(&ident, &hdr, results).unwrap()
+}
+
+fn encode_pending_section(cap: u32) -> Vec<u8> {
+    let section_bytes = MIN_SECTION_HEADER_BYTES as u64 + cap as u64 * PROBE_RESULT_BYTES as u64;
+    let ident = MappingIdentityHeaderV2::new(
+        section_bytes,
+        4242,
+        1337,
+        sample_nonce(),
+        derive_session_id(sample_nonce(), 0x0000_0000_0040_0000, 3),
+    );
+    let hdr = ResultSectionHeaderV2::new(section_bytes, cap).unwrap();
+    encode_section(&ident, &hdr, &[]).unwrap()
+}
+
+#[test]
+fn controller_validate_entry_accepts_good_params() {
+    let p = sample_params();
+    let cands = sample_candidates();
+    let blob = p.to_blob_bytes(&cands).unwrap();
+    let (params, decoded_cands) = controller_validate_entry(&blob).unwrap();
+    assert_eq!(params.candidate_count as usize, decoded_cands.len());
+    assert_eq!(decoded_cands, cands);
+}
+
+#[test]
+fn controller_validate_entry_rejects_corrupt_blob() {
+    let p = sample_params();
+    let cands = sample_candidates();
+    let mut blob = p.to_blob_bytes(&cands).unwrap();
+    blob[0x0C] ^= 0xFF; // corrupt blob_total_bytes -> decode rejects
+    assert!(controller_validate_entry(&blob).is_err());
+}
+
+#[test]
+fn controller_validate_entry_rejects_count_mismatch() {
+    // Build a blob whose candidate_count does not match the array length.
+    // to_blob_bytes itself rejects the mismatch (validated constructor).
+    let mut p = sample_params();
+    p.candidate_count = 99; // declared count != actual 3
+    let cands = sample_candidates();
+    assert!(p.to_blob_bytes(&cands).is_err());
+    // Also: hand-craft a blob with matching encode but conflicting header
+    // count by encoding with 3 then patching the header count byte.
+    let p2 = sample_params();
+    let mut blob = p2.to_blob_bytes(&cands).unwrap();
+    blob[0x1C] = 99; // candidate_count field
+    assert!(controller_validate_entry(&blob).is_err());
+}
+
+#[test]
+fn controller_read_section_valid_flow() {
+    let results = vec![sample_result()];
+    let section = encode_done_section(&results);
+    let expected = sample_identity_expectation(section.len() as u64);
+    let view = controller_read_section(&section, &expected, 1).unwrap();
+    assert_eq!(view.results.len(), 1);
+    assert_eq!(view.header.completed_flag, COMPLETED_FLAG_DONE);
+    assert_eq!(view.results[0].probe_va, sample_result().probe_va);
+    assert_eq!(view.results[0].classification, 4);
+}
+
+#[test]
+fn controller_read_completed_rejects_pending() {
+    let section = encode_pending_section(1);
+    let expected = sample_identity_expectation(section.len() as u64);
+    // read_completed rejects a pending section
+    assert!(matches!(
+        controller_read_completed_section(&section, &expected, 1),
+        Err(ProtocolError::InconsistentPendingCount { .. })
+    ));
+    // raw read succeeds (pending sections are readable, count must be 0)
+    let view = controller_read_section(&section, &expected, 1).unwrap();
+    assert_eq!(view.results.len(), 0);
+}
+
+#[test]
+fn controller_read_section_rejects_identity_mismatch() {
+    let results = vec![sample_result()];
+    let section = encode_done_section(&results);
+    // wrong nonce expectation -> fail closed
+    let mut expected = sample_identity_expectation(section.len() as u64);
+    expected.nonce ^= 1;
+    assert!(controller_read_section(&section, &expected, 1).is_err());
+}
+
+#[test]
+fn controller_read_section_rejects_truncated_buffer() {
+    let results = vec![sample_result()];
+    let section = encode_done_section(&results);
+    let expected = sample_identity_expectation(section.len() as u64);
+    // truncate below MIN_SECTION_HEADER_BYTES
+    let truncated = &section[..MIN_SECTION_HEADER_BYTES - 1];
+    assert!(matches!(
+        controller_read_section(truncated, &expected, 1),
+        Err(ProtocolError::BufferTooShort { .. })
+    ));
+}
+
+#[test]
+fn controller_read_section_rejects_crc_tamper() {
+    let results = vec![sample_result()];
+    let section = encode_done_section(&results);
+    let expected = sample_identity_expectation(section.len() as u64);
+    // tamper a payload byte INSIDE the results region -> CRC mismatch.
+    // The payload starts at MIN_SECTION_HEADER_BYTES (0x60); the last
+    // probe record byte is section.len()-1 which belongs to the record.
+    let mut tampered = section.clone();
+    let payload_byte = MIN_SECTION_HEADER_BYTES; // first payload byte
+    tampered[payload_byte] ^= 0xFF;
+    let err = controller_read_section(&tampered, &expected, 1).unwrap_err();
+    assert!(matches!(err, ProtocolError::CrcMismatch { .. }));
+}
