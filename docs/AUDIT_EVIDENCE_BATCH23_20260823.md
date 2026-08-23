@@ -61,3 +61,15 @@
 
 ---
 （WO-2403 交付，绑定 221ef33）
+## 6. 提交后绑定补充（Batch 24 交付提交）
+
+- Batch 24 交付提交：`a664f92`（docs(gto): WO-2401 thunk stack ABI realigned +
+  WO-2402 offset-wrap hardening + WO-2403/2404/2405 final-tree audits），
+  7 文件 +403/-64。
+- 生产代码（crates/）自 `221ef33` 起**零修改**（本提交仅 docs/fixtures），
+  因此 test/check/diffcheck 证据（绑定 221ef33 树）对提交后树仍然有效。
+- 提交后 HEAD：`a664f9247dca935023e77f598560715a3ea8f898`。
+- 提交后 `git diff --check 221ef33..a664f92`：EXIT=0（无 whitespace 错误）。
+
+---
+（WO-2403 补充，提交后绑定 a664f92 / 证据树 221ef33）
