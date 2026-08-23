@@ -198,7 +198,7 @@
 | Batch 25 最终树 | `639eee3` | evidence_*_2602.txt | 旧树，保留并标注 |
 | Batch 26 主交付 | `97d6914` | （WO-2602 补充） | 旧提交，保留并标注 |
 | Batch 26 补充后 | `928047f` | evidence_*_2702.txt | 旧树，保留并标注（WO-2702） |
-| **Batch 28 最终树** | `dea085b` | **evidence_*_2801.txt（本文件）** | **当前有效** |
+| Batch 28 最终树 | `dea085b` | evidence_*_2801.txt | 当时有效（WO-2801 交付时）；现为旧树，保留并标注（WO-2901 起当前有效 = 9589fd1） |
 
 - 生产代码（crates/）自 `62ed608` 起**零修改**；Batch 27 范围（928047f..dea085b）
   7 个 unique paths 全部为 docs/ 或 docs/fixtures/。
@@ -296,3 +296,92 @@
 ---
 
 （WO-2801 交付，绑定 dea085b / 证据树 dea085b）
+
+
+---
+
+# WO-2901 补充 — 最终 HEAD 证据重绑定（9589fd1）
+
+**审计运行日期**：2026-08-23（worker 机器）
+**最终绑定 HEAD**：`9589fd13f8e45e7612b212335bcae4c0b1ede23e`（`9589fd1`，Batch 28 交付提交后）
+**性质**：只读证据审计；不修改生产代码；不宣称 commander PASS
+
+## 1. 绑定关系（多棵树分层，更新）
+
+| 树 | 绑定 | 证据文件 | 状态 |
+|----|------|---------|------|
+| Batch 24 最终树 | `62ed608` | evidence_*_2503.txt | 旧树，保留并标注 |
+| Batch 25 最终树 | `639eee3` | evidence_*_2602.txt | 旧树，保留并标注 |
+| Batch 26 主交付 | `97d6914` | （WO-2602 补充） | 旧提交，保留并标注 |
+| Batch 26 补充后 | `928047f` | evidence_*_2702.txt | 旧树，保留并标注（WO-2702） |
+| Batch 27 交付后 | `dea085b` | evidence_*_2801.txt | 旧树，保留并标注（WO-2801） |
+| **Batch 29 最终树** | `9589fd1` | **evidence_*_2901.txt（本文件）** | **当前有效** |
+
+- 生产代码（crates/）自 `62ed608` 起**零修改**；Batch 28 范围（dea085b..9589fd1）
+  6 个 unique paths 全部为 docs/ 或 docs/fixtures/。
+
+## 2. Batch 28 最终范围（git 实测，9589fd1）
+
+- `dea085b..9589fd1`：**1 commit、6 unique paths、+154/-19**（git diff --stat，
+  见 evidence_stat_2901.txt / evidence_stat_2901_summary.txt）。
+- commit：`9589fd1`（Batch 28 交付，docs/fixtures only）。
+- crates/ diff lines = 0（生产代码零修改）。
+
+## 3. 最终 HEAD 证据文件清单（绑定 9589fd1）
+
+| 文件 | 大小 | SHA-256 | 命令 | 退出码 |
+|------|------|---------|------|--------|
+| D:\Temp\evidence_head_2901.txt | 42B | 60869B138D5512E4B1E93CBD2A7A60F35B496564272E5F520A831AA486527EC4 | git rev-parse HEAD | 0 |
+| D:\Temp\evidence_range_2901.txt | 194B | 60C977A964025957FACC3F201F6261FEE51F231414F986CA30DE5134460DBC8E | git log dea085b..9589fd1 | 0 |
+| D:\Temp\evidence_stat_2901.txt | 291B | 39594581A208245AC10E2CDEDC1DAD34732C9EB97B13E20F17F44DB127DE0EDB | git diff --numstat dea085b..9589fd1 | 0 |
+| D:\Temp\evidence_stat_2901_summary.txt | 439B | 29B276099EB801B05049499BBA8785B13FB3794B4FAA20EF7801AF7C33B1C1E7 | git diff --stat dea085b..9589fd1 | 0 |
+| D:\Temp\evidence_names_2901.txt | 264B | CB5A96292CE9B542DE5E2671431AA5E8D101271301E0D80E8782EEEBA246BA52 | git diff --name-only dea085b..9589fd1 | 0 |
+| D:\Temp\evidence_diffcheck_2901.txt | 0B | E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855 | git diff --check dea085b..9589fd1 | 0 |
+| D:\Temp\evidence_worktree_2901.txt | 0B | E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855 | git diff --check 9589fd1（工作树） | 0 |
+| D:\Temp\evidence_workspace_2901.txt | 1304B | A1BFE4F06F9DD83590A05335012A22037026CFD93DF54A4608F1F6062294E83A | git status --porcelain（commander 未跟踪文件区分） | 0 |
+| D:\Temp\evidence_test_2901.txt | — | 71CE67BD6DCB10FAFA664DCDBAF01A08A78C6B5E22C9763DBE549A9C34AC60F6 | cargo test -p mida-antidebug-runtime --offline（9589fd1 树） | 0 |
+| D:\Temp\evidence_check_2901.txt | — | 77EF1ACE51FE60885FAAB87E6E90DAB26C9CB01755E1B739A33D66FFB8C77E1E | cargo check -p mida-antidebug-runtime --offline（9589fd1 树） | 0 |
+| D:\Temp\evidence_check_pkg_2901.txt | — | AE145AFFC375E82CA5F2C514ED1A820778E79A087B081816E3B5593D03C2EA9B | cargo check -p mida-cli --offline（9589fd1 树） | 0 |
+
+**范围统计实测**：
+
+```
+ docs/AUDIT_EVIDENCE_BATCH25_20260823.md          | 118 ++++++++++++++++++++++-
+ docs/AUDIT_PROTOCOL_CALLERS_BATCH25.md           |   6 +-
+ docs/AUDIT_SCHEMA_ACCEPTANCE_BATCH25_20260823.md |   6 +-
+ docs/AUDIT_V2_ARITHMETIC_BATCH25_20260823.md     |   6 +-
+ docs/WO-2601-thunk7-probe-closure_20260823.md    |  32 ++++--
+ docs/fixtures/WO-2301-thunk7-fixture.h           |   5 +-
+ 6 files changed, 154 insertions(+), 19 deletions(-)
+```
+
+## 4. workspace 状态说明
+
+- tracked tree：9589fd1 干净（git diff --check 9589fd1 EXIT=0）。
+- untracked：commander 审计文件（WORK_ORDERS_BATCH_*.md、docs/AUDIT_BATCH*.md）
+  保持未跟踪状态，属 commander 工作区，不纳入本次证据树。
+
+## 5. 分层登记（更新）
+
+| 层 | 状态 |
+|----|------|
+| worker stdout（cargo test/check/diffcheck/stat） | 本文件证据（可复核 hash） |
+| 本机 thunk ABI 验证 | thunk7_threecheck 系列（LOCAL，非远程） |
+| ASan hostile | hostile_asan_detail.txt（16/16 逐用例） |
+| commander independent verification | **BLOCKED**（总指挥机 rustup shim 阻断；不升级 PASS） |
+| Windows/live evidence | **absent**（LIVE-4 NOT AUTHORIZED） |
+
+## 6. 验收门自检（更新）
+
+| 门 | 结果 |
+|----|------|
+| manifest 绑定 9589fd1 | ✅ head 证据 = 9589fd13f8e45e7612b212335bcae4c0b1ede23e |
+| 1 commit / 6 unique paths / +154/-19 | ✅ git 实测（evidence_stat_2901.txt） |
+| dea085b..9589fd1 与 9589fd1 工作树 diffcheck 分开登记 | ✅ 两文件独立 |
+| 旧树证据保留并标注 | ✅ 62ed608/639eee3/97d6914/928047f/dea085b 全部保留并标注旧树 |
+| 时间/退出码/哈希可复核 | ✅ 上表完整 |
+| 不宣称 commander PASS | ✅ BLOCKED 保持 |
+
+---
+
+（WO-2901 交付，绑定 9589fd1 / 证据树 9589fd1）

@@ -1,6 +1,6 @@
 # WO-2601 交付 — thunk7 probe runtime layout + exact-byte closure
 
-**审计基线**：`dea085b62a179535ff73194c036d7ea0bfcb70bb`（`dea085b`，Batch 28 最终 HEAD；WO-2601 原始交付绑定 `639eee3`，WO-2701 修正绑定 928047f，WO-2802 文字修正绑定 dea085b）
+**审计基线**：`9589fd13f8e45e7612b212335bcae4c0b1ede23e`（`9589fd1`，Batch 29 最终 HEAD；历史绑定链：639eee3（原始交付）→ 928047f（WO-2701）→ dea085b（WO-2802）→ 9589fd1（WO-2902））
 **性质**：local x64 runtime + design fixture；不实现生产 thunk；不运行远程
 
 ## 1. 修复的缺陷（Batch 25 审计）
@@ -103,7 +103,7 @@ EXIT=0
   | production 60B | 9B6F4A7A138B3C4C5523CEDD047745C96AA83CA01614BEB703E4994DA2E1F017 | == fixture THUNK7_CODE SHA（三者闭环：fixture 字节表 == obj 提取 == SHA） |
   | test 64B | 01DC2017D8825EFD7E1C3FBE186C2FACF36FB22F2338C493C422E659476E17AE | probe @0x35、call @0x39 |
 
-- 关键区别：production[0x35..0x36] = FF D0（call rax 直接）；test[0x35..0x39] = 49 89 63 48（probe），test[0x39..0x3B] = FF D0（call）。
+- 关键区别（指令占位，闭区间含端点）：production 字节 0x35..0x36（2B）= FF D0（call rax 直接）；test 字节 0x35..0x38（4B）= 49 89 63 48（probe），test 字节 0x39..0x3A（2B）= FF D0（call）。
 - **.text$mn 完整原始字节（127B，COFF rawptr=140 / rawsize=127 提取）**：
 
   ```
@@ -117,7 +117,7 @@ EXIT=0
   0070: 89 42 28 48 8B 44 24 38 49 89 42 30 33 C0 C3
   ```
 
-  前 0x40（64B）= thunk + probe（test 形态）；0x40..0x7F（63B）= callee entry-stub
+  前 obj[0x00..0x40)（64B）= thunk + probe（test 形态）；obj[0x40..0x7F)（半开区间，63B）= callee entry-stub（0x40..0x7E inclusive = 63B）
   （入口记录 rsp：mov rax,rsp / and rax,0Fh；slot 写回：mov [r11+0x38],rax 等）。
 
 - **双流偏移分离（production / test）**：
@@ -139,4 +139,4 @@ EXIT=0
 - 未修改 crates/ 生产代码。
 
 ---
-（WO-2601 交付，绑定 639eee3；WO-2701 exact-byte 提取公式修正，绑定 928047f）
+（WO-2601 原始交付绑定 639eee3；WO-2701 提取公式修正绑定 928047f；WO-2802 文字修正绑定 dea085b；WO-2902 元数据收口绑定 9589fd1 —— 历史绑定链保留，当前树绑定 9589fd1）
