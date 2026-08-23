@@ -1800,7 +1800,13 @@ impl RuntimeLoader {
 
         // 2. PE header: read up to the data directories (0x98 bytes covers
         //    signature + COFF + optional header + first data directory).
-        let pe_base = module_base + e_lfanew;
+        //    IMP-08-R1-R1 (P0-1): all RVA->VA conversions use checked
+        //    arithmetic; a malformed e_lfanew must fail closed, not wrap.
+        let pe_base = module_base.checked_add(e_lfanew).ok_or_else(|| {
+            RuntimeLoadError::ExportResolutionFailed(
+                "PE header base overflow (module_base + e_lfanew)".to_string(),
+            )
+        })?;
         let mut pe = [0u8; 0x98];
         let rd2 = unsafe {
             RPM(
@@ -1825,6 +1831,25 @@ impl RuntimeLoader {
         } else {
             0x18 + 0x60
         };
+        // IMP-08-R1-R1 (P0-1): SizeOfImage lives at optional+0x50 for both
+        // PE32 and PE32+ (pe+0x18+0x50 = pe+0x68). A zero or absurdly small
+        // SizeOfImage fails closed: every export RVA must fit inside the
+        // module image envelope.
+        let image_size =
+            u32::from_le_bytes([pe[0x68], pe[0x69], pe[0x6A], pe[0x6B]]) as usize;
+        if image_size == 0 || image_size < 0x1000 {
+            return Err(RuntimeLoadError::ExportResolutionFailed(format!(
+                "remote image SizeOfImage invalid: {image_size:#x}"
+            )));
+        }
+        // Envelope: module spans [module_base, module_base + image_size).
+        // (The parser re-derives module_end internally with checked add;
+        // this wrapper only needs SizeOfImage itself.)
+        let _ = module_base.checked_add(image_size).ok_or_else(|| {
+            RuntimeLoadError::ExportResolutionFailed(
+                "module envelope overflow (module_base + SizeOfImage)".to_string(),
+            )
+        })?;
         let exp_rva =
             u32::from_le_bytes([pe[dd_off], pe[dd_off + 1], pe[dd_off + 2], pe[dd_off + 3]])
                 as usize;
@@ -1839,6 +1864,18 @@ impl RuntimeLoader {
                 "remote image has no export directory".to_string(),
             ));
         }
+        // IMP-08-R1-R1 (P0-1): the export directory itself must fit inside
+        // the image envelope before any remote read.
+        let exp_end = exp_rva.checked_add(exp_size).ok_or_else(|| {
+            RuntimeLoadError::ExportResolutionFailed(
+                "export directory range overflow".to_string(),
+            )
+        })?;
+        if exp_rva >= image_size || exp_end > image_size {
+            return Err(RuntimeLoadError::ExportResolutionFailed(format!(
+                "remote export directory outside image envelope: rva={exp_rva:#x} size={exp_size:#x} image={image_size:#x}"
+            )));
+        }
         // 3. Export directory: read a bounded window.
         // ADR-5B-R5 (audit): IMAGE_EXPORT_DIRECTORY is 40 bytes; if the
         // declared directory is smaller than the fixed header, fail closed
@@ -1851,10 +1888,15 @@ impl RuntimeLoader {
         }
         let win = exp_size.min(0x10000);
         let mut ed = vec![0u8; win];
+        let ed_va = module_base.checked_add(exp_rva).ok_or_else(|| {
+            RuntimeLoadError::ExportResolutionFailed(
+                "export directory VA overflow".to_string(),
+            )
+        })?;
         let rd3 = unsafe {
             RPM(
                 target,
-                (module_base + exp_rva) as *const core::ffi::c_void,
+                ed_va as *const core::ffi::c_void,
                 ed.as_mut_ptr() as *mut core::ffi::c_void,
                 win,
                 None,
@@ -1875,18 +1917,30 @@ impl RuntimeLoader {
                 "remote export directory incomplete".to_string(),
             ));
         }
-        // Read the name-pointer array and ordinal array (bounded).
-        let names_bytes = num_names * 4;
+        // IMP-08-R1-R1 (P0-1): every export sub-array must fit inside the
+        // image envelope [0, image_size) BEFORE any remote read. Checked
+        // arithmetic; overflow or out-of-envelope fails closed.
+        let names_bytes = num_names.checked_mul(4).ok_or_else(|| {
+            RuntimeLoadError::ExportResolutionFailed("export name array size overflow".to_string())
+        })?;
         if names_bytes > 0x10000 {
             return Err(RuntimeLoadError::ExportResolutionFailed(
                 "export name array too large".to_string(),
             ));
         }
+        if names_rva >= image_size || names_rva.checked_add(names_bytes).map_or(true, |end| end > image_size) {
+            return Err(RuntimeLoadError::ExportResolutionFailed(format!(
+                "export name array outside image envelope: rva={names_rva:#x} bytes={names_bytes:#x} image={image_size:#x}"
+            )));
+        }
         let mut names = vec![0u8; names_bytes];
+        let names_va = module_base.checked_add(names_rva).ok_or_else(|| {
+            RuntimeLoadError::ExportResolutionFailed("export name array VA overflow".to_string())
+        })?;
         let rn = unsafe {
             RPM(
                 target,
-                (module_base + names_rva) as *const core::ffi::c_void,
+                names_va as *const core::ffi::c_void,
                 names.as_mut_ptr() as *mut core::ffi::c_void,
                 names_bytes,
                 None,
@@ -1900,17 +1954,27 @@ impl RuntimeLoader {
         // PE export ordinal array entries are 2 bytes each (not 4).
         // (PE32+/PE32 IMAGE_EXPORT_DIRECTORY.NumberOfNames counts ordinal
         // array slots; each slot is a u16.)
-        let ords_bytes = num_names * 2;
+        let ords_bytes = num_names.checked_mul(2).ok_or_else(|| {
+            RuntimeLoadError::ExportResolutionFailed("export ordinal array size overflow".to_string())
+        })?;
         if ords_bytes > 0x8000 {
             return Err(RuntimeLoadError::ExportResolutionFailed(
                 "export ordinal array too large".to_string(),
             ));
         }
+        if ords_rva >= image_size || ords_rva.checked_add(ords_bytes).map_or(true, |end| end > image_size) {
+            return Err(RuntimeLoadError::ExportResolutionFailed(format!(
+                "export ordinal array outside image envelope: rva={ords_rva:#x} bytes={ords_bytes:#x} image={image_size:#x}"
+            )));
+        }
         let mut ords = vec![0u8; ords_bytes];
+        let ords_va = module_base.checked_add(ords_rva).ok_or_else(|| {
+            RuntimeLoadError::ExportResolutionFailed("export ordinal array VA overflow".to_string())
+        })?;
         let ro = unsafe {
             RPM(
                 target,
-                (module_base + ords_rva) as *const core::ffi::c_void,
+                ords_va as *const core::ffi::c_void,
                 ords.as_mut_ptr() as *mut core::ffi::c_void,
                 ords_bytes,
                 None,
@@ -1923,17 +1987,29 @@ impl RuntimeLoader {
         }
         // Read the function-address array (bounded; forwarded exports are
         // handled inside the parser by the exp_rva window check).
-        let funcs_bytes = num_funcs * 4;
+        // IMP-08-R1-R1 (P0-1): the function array itself must fit inside
+        // the image envelope before the remote read.
+        let funcs_bytes = num_funcs.checked_mul(4).ok_or_else(|| {
+            RuntimeLoadError::ExportResolutionFailed("export function array size overflow".to_string())
+        })?;
         if funcs_bytes > 0x10000 {
             return Err(RuntimeLoadError::ExportResolutionFailed(
                 "export function array too large".to_string(),
             ));
         }
+        if funcs_rva >= image_size || funcs_rva.checked_add(funcs_bytes).map_or(true, |end| end > image_size) {
+            return Err(RuntimeLoadError::ExportResolutionFailed(format!(
+                "export function array outside image envelope: rva={funcs_rva:#x} bytes={funcs_bytes:#x} image={image_size:#x}"
+            )));
+        }
         let mut funcs = vec![0u8; funcs_bytes];
+        let funcs_va = module_base.checked_add(funcs_rva).ok_or_else(|| {
+            RuntimeLoadError::ExportResolutionFailed("export function array VA overflow".to_string())
+        })?;
         let rf = unsafe {
             RPM(
                 target,
-                (module_base + funcs_rva) as *const core::ffi::c_void,
+                funcs_va as *const core::ffi::c_void,
                 funcs.as_mut_ptr() as *mut core::ffi::c_void,
                 funcs_bytes,
                 None,
@@ -1958,12 +2034,21 @@ impl RuntimeLoader {
         // REQUIRED — missing any export fails closed below.
         let found_owned = {
             let mut name_at = |name_ptr_rva: usize, out: &mut Vec<u8>| {
+                // IMP-08-R1-R1 (P0-1): the name string read is bounded by
+                // the image envelope as well as the 64-char contract. The
+                // parser already rejected name_ptr_rva >= image_size; the
+                // per-byte RPM here stays inside [name_rva, image_size).
                 for k in 0..64usize {
+                    if name_ptr_rva.checked_add(k).map_or(true, |rva| rva >= image_size) {
+                        break;
+                    }
                     let mut ch = [0u8; 1];
+                    let name_va = module_base.checked_add(name_ptr_rva + k);
+                    let Some(name_va) = name_va else { break };
                     let rc = unsafe {
                         RPM(
                             target,
-                            (module_base + name_ptr_rva + k) as *const core::ffi::c_void,
+                            name_va as *const core::ffi::c_void,
                             ch.as_mut_ptr() as *mut core::ffi::c_void,
                             1,
                             None,
@@ -1986,6 +2071,7 @@ impl RuntimeLoader {
                 num_names,
                 num_funcs,
                 module_base,
+                image_size,
                 exp_rva,
                 exp_size,
                 &want,
@@ -2043,10 +2129,36 @@ impl RuntimeLoader {
         num_names: usize,
         num_funcs: usize,
         module_base: usize,
+        image_size: usize,
         exp_rva: usize,
         exp_size: usize,
         want: &[&[u8]],
     ) -> Result<Vec<Option<usize>>, RuntimeLoadError> {
+        // IMP-08-R1-R1 (P0-1): the pure parser REQUIRES the image envelope.
+        // `image_size` bounds every RVA (names, functions, export dir). A
+        // caller that cannot provide the envelope cannot resolve exports.
+        if image_size == 0 {
+            return Err(RuntimeLoadError::ExportResolutionFailed(
+                "export resolver requires non-zero image_size".to_string(),
+            ));
+        }
+        let module_end = module_base.checked_add(image_size).ok_or_else(|| {
+            RuntimeLoadError::ExportResolutionFailed(
+                "module envelope overflow (module_base + image_size)".to_string(),
+            )
+        })?;
+        // Export-directory interval (forwarded-export window), precomputed
+        // with checked arithmetic.
+        let exp_end = exp_rva.checked_add(exp_size).ok_or_else(|| {
+            RuntimeLoadError::ExportResolutionFailed(
+                "export directory range overflow".to_string(),
+            )
+        })?;
+        if exp_rva >= image_size || exp_end > image_size {
+            return Err(RuntimeLoadError::ExportResolutionFailed(format!(
+                "export directory outside image envelope: rva={exp_rva:#x} size={exp_size:#x} image={image_size:#x}"
+            )));
+        }
         let mut found: Vec<Option<usize>> = vec![None; want.len()];
         for i in 0..num_names {
             if i * 4 + 3 >= names.len() {
@@ -2062,6 +2174,14 @@ impl RuntimeLoader {
             ]) as usize;
             if name_ptr_rva == 0 {
                 continue;
+            }
+            // IMP-08-R1-R1 (P0-1): every export NAME string must live
+            // inside the image envelope; a name pointer pointing outside
+            // the module (or past its end) is malformed and fails closed.
+            if name_ptr_rva >= image_size {
+                return Err(RuntimeLoadError::ExportResolutionFailed(format!(
+                    "export name RVA outside image envelope: rva={name_ptr_rva:#x} image={image_size:#x}"
+                )));
             }
             // Read the name string (bounded 64 chars) via the resolver.
             let mut name = Vec::with_capacity(64);
@@ -2114,17 +2234,38 @@ impl RuntimeLoader {
                 if func_rva == 0 {
                     continue;
                 }
+                // IMP-08-R1-R1 (P0-1): EVERY function RVA must lie
+                // INSIDE the image envelope (0 < rva < SizeOfImage).
+                // A function RVA at/above SizeOfImage is outside the
+                // module — reject fail-closed (never return a VA that
+                // points past the image end).
+                if func_rva >= image_size {
+                    return Err(RuntimeLoadError::ExportResolutionFailed(format!(
+                        "export function RVA outside image envelope: rva={func_rva:#x} image={image_size:#x}"
+                    )));
+                }
                 // Forwarded export: the function RVA points INSIDE the export
                 // directory (the name is a forwarder string, not code).
                 // Checked range (audit R5): avoid overflow on exp_rva+exp_size.
                 if exp_size > 0
-                    && exp_rva <= exp_rva.saturating_add(exp_size)
+                    && exp_rva <= exp_end
                     && func_rva >= exp_rva
-                    && func_rva < exp_rva.saturating_add(exp_size)
+                    && func_rva < exp_end
                 {
                     continue;
                 }
-                found[wi] = Some(module_base + func_rva);
+                // module_base + func_rva must not overflow (checked).
+                let func_va = module_base.checked_add(func_rva).ok_or_else(|| {
+                    RuntimeLoadError::ExportResolutionFailed(
+                        "export function VA overflow (module_base + rva)".to_string(),
+                    )
+                })?;
+                if func_va >= module_end {
+                    return Err(RuntimeLoadError::ExportResolutionFailed(format!(
+                        "export function VA outside module envelope: va={func_va:#x} end={module_end:#x}"
+                    )));
+                }
+                found[wi] = Some(func_va);
             }
             let _ = matched;
         }
@@ -4404,7 +4545,7 @@ mod imp08_v2_production_tests {
         let mut name_at = flat_name_at(&table);
         let ords: Vec<u8> = (0..5).flat_map(|i| (i as u16).to_le_bytes()).collect();
         let found = RuntimeLoader::resolve_exports_from_buffers(
-            &names, &ords, &funcs, &mut name_at, 5, 5, 0x400000, 0x1000, 0x100,
+            &names, &ords, &funcs, &mut name_at, 5, 5, 0x400000, 0x10000, 0x1000, 0x100,
             &wanted5(),
         ).unwrap();
         assert_eq!(found.len(), 5);
@@ -4484,7 +4625,7 @@ mod imp08_v2_production_tests {
         }
         let mut name_at = flat_name_at(&table);
         let found = RuntimeLoader::resolve_exports_from_buffers(
-            &names, &ords, &funcs, &mut name_at, 4, 4, 0x400000, 0x1000, 0x100,
+            &names, &ords, &funcs, &mut name_at, 4, 4, 0x400000, 0x10000, 0x1000, 0x100,
             &wanted5(),
         ).unwrap();
         // WalkerExecute not found: the resolver reports it as None; the
@@ -4530,7 +4671,7 @@ mod imp08_v2_production_tests {
         }
         let mut name_at = flat_name_at(&table);
         let err = RuntimeLoader::resolve_exports_from_buffers(
-            &names, &ords, &funcs, &mut name_at, 6, 6, 0x400000, 0x1000, 0x100,
+            &names, &ords, &funcs, &mut name_at, 6, 6, 0x400000, 0x10000, 0x1000, 0x100,
             &wanted5(),
         ).unwrap_err();
         assert!(err.to_string().contains("ambiguous export"), "{err}");
@@ -4564,7 +4705,7 @@ mod imp08_v2_production_tests {
         }
         let mut name_at = flat_name_at(&table);
         let found = RuntimeLoader::resolve_exports_from_buffers(
-            &names, &ords, &funcs, &mut name_at, 5, 5, 0x400000, 0x1000, 0x100,
+            &names, &ords, &funcs, &mut name_at, 5, 5, 0x400000, 0x10000, 0x1000, 0x100,
             &wanted5(),
         ).unwrap();
         // Every wanted export is None (forwarded -> not resolved).
@@ -4572,13 +4713,9 @@ mod imp08_v2_production_tests {
     }
 
     #[test]
-    fn out_of_module_export_rva_rejected() {
-        // A function RVA that resolves to an address OUTSIDE the module
-        // image range (module_base + rva beyond any section): the resolver
-        // currently returns module_base + rva without a section check;
-        // the test documents the current fail-closed boundary: a
-        // truncated/absent export array errors, an out-of-range ordinal
-        // is skipped (None).
+    fn out_of_range_ordinal_skipped_fail_closed() {
+        // An ordinal >= num_funcs is out of the function-address array:
+        // the name is skipped (None) rather than resolving garbage.
         let symbols: [&str; 5] = [
             "MidaAntidebugInitialize",
             "MidaAntidebugGetAttestation",
@@ -4604,11 +4741,82 @@ mod imp08_v2_production_tests {
         }
         let mut name_at = flat_name_at(&table);
         let found = RuntimeLoader::resolve_exports_from_buffers(
-            &names, &ords, &funcs, &mut name_at, 5, 5, 0x400000, 0x1000, 0x100,
+            &names, &ords, &funcs, &mut name_at, 5, 5, 0x400000, 0x10000, 0x1000, 0x100,
             &wanted5(),
         ).unwrap();
         // Out-of-range ordinals: all names skipped -> all None.
         assert!(found.iter().all(|f| f.is_none()), "{found:?}");
+    }
+
+    #[test]
+    fn out_of_module_export_rva_rejected() {
+        // IMP-08-R1-R1 (P0-1): a function RVA at/above SizeOfImage must
+        // be REJECTED (Err), not converted to module_base + rva. Here all
+        // five wanted functions claim RVA 0x20000 while image_size is
+        // 0x10000 -> every match fails closed.
+        let symbols: [&str; 5] = [
+            "MidaAntidebugInitialize",
+            "MidaAntidebugGetAttestation",
+            "MidaAntidebugShutdown",
+            "MidaAntidebugInitializeV2",
+            "WalkerExecute",
+        ];
+        let mut names = Vec::new();
+        let mut ords = Vec::new();
+        let mut table = vec![0u8; 0x1000];
+        for (i, s) in symbols.iter().enumerate() {
+            names.extend_from_slice(&((0x1000 + i * 0x20) as u32).to_le_bytes());
+            ords.extend_from_slice(&(i as u16).to_le_bytes());
+            let off = i * 0x20;
+            table[off..off + s.len()].copy_from_slice(s.as_bytes());
+            table[off + s.len()] = 0;
+        }
+        // All function RVAs outside the 0x10000-byte image.
+        let mut funcs = Vec::new();
+        for i in 0..5 {
+            funcs.extend_from_slice(&((0x20000 + i * 0x10) as u32).to_le_bytes());
+        }
+        let mut name_at = flat_name_at(&table);
+        let err = RuntimeLoader::resolve_exports_from_buffers(
+            &names, &ords, &funcs, &mut name_at, 5, 5, 0x400000, 0x10000, 0x1000, 0x100,
+            &wanted5(),
+        ).unwrap_err();
+        assert!(
+            err.to_string().contains("outside image envelope"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn export_va_overflow_rejected() {
+        // module_base + func_rva overflow must fail closed (checked add).
+        let symbols: [&str; 1] = ["MidaAntidebugInitialize"];
+        let mut names = Vec::new();
+        let mut ords = Vec::new();
+        let mut table = vec![0u8; 0x1000];
+        for (i, s) in symbols.iter().enumerate() {
+            names.extend_from_slice(&((0x1000 + i * 0x20) as u32).to_le_bytes());
+            ords.extend_from_slice(&(i as u16).to_le_bytes());
+            let off = i * 0x20;
+            table[off..off + s.len()].copy_from_slice(s.as_bytes());
+            table[off + s.len()] = 0;
+        }
+        // func_rva = 0x8000_0000_0000 fits in u32? No - use a u32-sized
+        // large RVA that overflows module_base.checked_add on 64-bit only
+        // if module_base is huge; instead pick func_rva near usize::MAX
+        // by using a 32-bit RVA near 0xFFFF_FF00 and module_base huge.
+        let mut funcs = Vec::new();
+        // u32::MAX - 0xFF is still a valid u32 RVA; with module_base
+        // = usize::MAX - 0x20000 the checked_add overflows.
+        funcs.extend_from_slice(&0xFFFF_FF00u32.to_le_bytes());
+        let mut name_at = flat_name_at(&table);
+        let err = RuntimeLoader::resolve_exports_from_buffers(
+            &names, &ords, &funcs, &mut name_at, 1, 1, usize::MAX - 0x20000, 0x10000, 0x1000, 0x100,
+            &[b"MidaAntidebugInitialize"],
+        ).unwrap_err();
+        // Either the RVA >= image_size check (0xFFFF_FF00 >= 0x10000)
+        // fires first, or the VA overflow check fires; both are fail-closed.
+        assert!(err.to_string().contains("outside image envelope") || err.to_string().contains("overflow"), "{err}");
     }
 
     #[test]

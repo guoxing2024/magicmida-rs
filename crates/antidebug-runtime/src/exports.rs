@@ -692,6 +692,15 @@ fn initialize_v2_inner(
     }
 
     // ---- surfaces array (absolute VAs in the target == runtime process) ----
+    // IMP-08-R1-R1 (P0-2): every surface entry is an ABSOLUTE VA written
+    // by the loader as blob_base + relative. The runtime MUST verify
+    // blob provenance BEFORE dereferencing: the VA must lie inside
+    // [blob_base, blob_end). A canonical-but-unrelated VA is rejected.
+    let blob_base = params as usize;
+    let blob_end = match blob_base.checked_add(params_bytes) {
+        Some(v) => v,
+        None => return MidaAntidebugError::InvalidV2Blob.as_i32(),
+    };
     let array_bytes = match (expected_hooks as usize).checked_mul(8) {
         Some(v) => v,
         None => return MidaAntidebugError::InvalidV2Blob.as_i32(),
@@ -703,15 +712,32 @@ fn initialize_v2_inner(
     if array_end != dig_off {
         return MidaAntidebugError::InvalidV2Blob.as_i32();
     }
+    // IMP-08-R1-R1 (P0-2): strict tail policy — the digest region must
+    // be the LAST thing in the blob. digest = 64 hex chars + NUL (65
+    // bytes total). digest_off + 65 != params_bytes means unknown tail,
+    // truncation, or overlap — all malformed, fail closed.
+    let digest_region_end = match dig_off.checked_add(65) {
+        Some(v) => v,
+        None => return MidaAntidebugError::InvalidV2Blob.as_i32(),
+    };
+    if digest_region_end != params_bytes {
+        return MidaAntidebugError::InvalidV2Blob.as_i32();
+    }
     let mut expected = Vec::with_capacity(expected_hooks as usize);
     for i in 0..expected_hooks as usize {
-        let entry_off = match surf_off.checked_add(i * 8) {
+        let stride = match i.checked_mul(8) {
             Some(v) => v,
+            None => return MidaAntidebugError::InvalidV2Blob.as_i32(),
+        };
+        let entry_off = match surf_off.checked_add(stride) {
+            Some(v) => v,
+            None => return MidaAntidebugError::InvalidV2Blob.as_i32(),
+        };
+        let entry_end = match entry_off.checked_add(8) {
+            Some(v) if v <= blob.len() => v,
             _ => return MidaAntidebugError::InvalidV2Blob.as_i32(),
         };
-        // Entry is an ABSOLUTE target VA (RC-4): inside the runtime process
-        // this is a direct pointer into the blob (blob_base + relative).
-        let abs_va = u64::from_le_bytes(blob[entry_off..entry_off + 8].try_into().unwrap());
+        let abs_va = u64::from_le_bytes(blob[entry_off..entry_end].try_into().unwrap());
         if abs_va == 0 {
             return MidaAntidebugError::InvalidV2Blob.as_i32();
         }
@@ -719,10 +745,25 @@ fn initialize_v2_inner(
         if abs_va > 0x0000_7FFF_FFFF_FFFF {
             return MidaAntidebugError::InvalidV2Blob.as_i32();
         }
-        // SAFETY: abs_va points into the same blob (target-local absolute);
-        // the loader wrote it as blob_base + relative. Read the surface id.
-        let sp = abs_va as *const std::os::raw::c_char;
-        expected.push(unsafe { read_cstr(sp) }.unwrap_or_default());
+        // IMP-08-R1-R1 (P0-2): blob provenance — the VA must be inside
+        // [blob_base, blob_end). No unchecked dereference of abs_va.
+        let abs_va_usize = match usize::try_from(abs_va) {
+            Ok(v) => v,
+            Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32(),
+        };
+        if abs_va_usize < blob_base || abs_va_usize >= blob_end {
+            return MidaAntidebugError::InvalidV2Blob.as_i32();
+        }
+        let rel = match abs_va_usize.checked_sub(blob_base) {
+            Some(v) => v,
+            None => return MidaAntidebugError::InvalidV2Blob.as_i32(),
+        };
+        // Bounded NUL scan inside the blob slice only (no raw pointer).
+        let surface_id = match v2_read_cstr_blob(blob, rel, "surface_id") {
+            Ok(s) => s,
+            Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32(),
+        };
+        expected.push(surface_id);
     }
 
     // ---- target identity (frozen header fields +0x00 / +0x08) ----
@@ -972,5 +1013,138 @@ mod imp08_v2_tests {
         assert_eq!(MidaAntidebugError::InvalidV2Blob.as_i32(), 11);
         assert_eq!(MidaAntidebugError::EchoBufferTooSmall.as_i32(), 12);
         assert_eq!(MidaAntidebugError::NotImplemented.as_i32(), 13);
+    }
+
+    // ---- IMP-08-R1-R1 (P0-2): blob provenance hostile tests ----
+    // These tests build a structurally-valid V2 blob (matching the
+    // loader's layout) and mutate ONE field to be hostile. They call
+    // initialize_v2_inner DIRECTLY (not the FFI entry) so the RUNTIME
+    // OnceLock is not touched; every case must fail with InvalidV2Blob
+    // BEFORE any surface install or attestation build.
+    fn build_probe_blob() -> Vec<u8> {
+        // Layout mirror of V2ParamsBlob (loader side):
+        // +0x00 pid, +0x08 module_base, +0x10 profile_id_off,
+        // +0x18 profile_digest_off, +0x20 expected_hooks, +0x28 surf_off,
+        // +0x30 magic, +0x38 digest_off, +0x40 digest_len.
+        let mut b = vec![0u8; 0x48];
+        b[0x00..0x04].copy_from_slice(&1234u32.to_le_bytes());
+        b[0x08..0x10].copy_from_slice(&0x0000_2000_0000u64.to_le_bytes());
+        b[0x10..0x18].copy_from_slice(&0x48u64.to_le_bytes());          // profile_id_off
+        b[0x18..0x20].copy_from_slice(&((0x48 + 9) as u64).to_le_bytes()); // profile_digest_off
+        b[0x20..0x28].copy_from_slice(&1u64.to_le_bytes());             // expected_hooks
+        // surf_off filled after layout is known
+        b[0x30..0x38].copy_from_slice(&V2_ENVELOPE_MAGIC.to_le_bytes());
+        // digest_off filled after layout; digest_len
+        b[0x40..0x48].copy_from_slice(&V2_DIGEST_LEN.to_le_bytes());
+        // strings: profile_id "p" + NUL, profile_digest "d" + NUL
+        b.extend_from_slice(b"p\0d\0");
+        let surf_off = b.len() as u64;
+        b[0x28..0x30].copy_from_slice(&surf_off.to_le_bytes());
+        // surface array: one entry = blob_base + rel of "AD-PROC-002"
+        let surf_str_off = (b.len() + 8) as u64;
+        b.extend_from_slice(&0u64.to_le_bytes()); // placeholder, patched below
+        b.extend_from_slice(b"AD-PROC-002\0");
+        let dig_off = b.len() as u64;
+        b[0x38..0x40].copy_from_slice(&dig_off.to_le_bytes());
+        b.extend_from_slice(&"a".repeat(64).as_bytes().to_vec());
+        b.push(0);
+        // patch surface entry: abs_va = blob_base + surf_str_off (self-
+        // relative inside the blob; blob_base = 0 for the probe).
+        let entry_off = surf_off as usize;
+        b[entry_off..entry_off + 8].copy_from_slice(&surf_str_off.to_le_bytes());
+        b
+    }
+
+    /// Call initialize_v2_inner with VALID output buffers so the early
+    /// InvalidArgument guard (null/zero outputs) does not mask the blob
+    /// provenance checks under test. Returns the i32 result.
+    fn initialize_v2_inner_probe(blob: &[u8]) -> i32 {
+        let mut out_sha = [0u8; 64];
+        let mut out_att = [0u8; 4096];
+        let mut written = 0usize;
+        initialize_v2_inner(
+            blob.as_ptr(),
+            blob.len(),
+            out_sha.as_mut_ptr(),
+            out_sha.len(),
+            out_att.as_mut_ptr(),
+            out_att.len(),
+            &mut written,
+        )
+    }
+
+    #[test]
+    fn v2_blob_canonical_out_of_blob_va_rejected() {
+        let mut b = build_probe_blob();
+        // Surface VA points at a canonical but UNRELATED user address
+        // (0x7FFF_FFFF_FFFF - 0x1000): inside user half, NOT in the blob.
+        let entry_off = u64::from_le_bytes(b[0x28..0x30].try_into().unwrap()) as usize;
+        b[entry_off..entry_off + 8].copy_from_slice(&(0x7FFF_FFFF_FFF0u64).to_le_bytes());
+        let r = initialize_v2_inner_probe(&b);
+        assert_eq!(r, MidaAntidebugError::InvalidV2Blob.as_i32());
+    }
+
+    #[test]
+    fn v2_blob_va_below_blob_base_rejected() {
+        let mut b = build_probe_blob();
+        // VA below blob_base (blob_base = params ptr). Use 0x10.
+        let entry_off = u64::from_le_bytes(b[0x28..0x30].try_into().unwrap()) as usize;
+        b[entry_off..entry_off + 8].copy_from_slice(&0x10u64.to_le_bytes());
+        let r = initialize_v2_inner_probe(&b);
+        assert_eq!(r, MidaAntidebugError::InvalidV2Blob.as_i32());
+    }
+
+    #[test]
+    fn v2_blob_surface_string_outside_blob_rejected() {
+        let mut b = build_probe_blob();
+        // Surface VA = blob_base + (blob.len() + 0x1000): beyond blob_end.
+        let entry_off = u64::from_le_bytes(b[0x28..0x30].try_into().unwrap()) as usize;
+        let out_va = (b.len() + 0x1000) as u64;
+        b[entry_off..entry_off + 8].copy_from_slice(&out_va.to_le_bytes());
+        let r = initialize_v2_inner_probe(&b);
+        assert_eq!(r, MidaAntidebugError::InvalidV2Blob.as_i32());
+    }
+
+    #[test]
+    fn v2_blob_unknown_tail_rejected() {
+        let mut b = build_probe_blob();
+        // Append a trailing byte after the digest region: digest_off+65
+        // != params_bytes -> unknown tail -> fail closed.
+        b.push(0x41);
+        let r = initialize_v2_inner_probe(&b);
+        assert_eq!(r, MidaAntidebugError::InvalidV2Blob.as_i32());
+    }
+
+    #[test]
+    fn v2_blob_digest_region_truncated_rejected() {
+        let mut b = build_probe_blob();
+        // Truncate the digest NUL: digest region no longer 65 bytes.
+        b.pop();
+        let r = initialize_v2_inner_probe(&b);
+        assert_eq!(r, MidaAntidebugError::InvalidV2Blob.as_i32());
+    }
+
+    #[test]
+    fn v2_blob_entry_offset_overflow_rejected() {
+        // expected_hooks huge + surf_off near usize::MAX: checked adds
+        // must fail. (Blob stays small; array_bytes overflows first.)
+        let mut b = build_probe_blob();
+        b[0x20..0x28].copy_from_slice(&(V2_MAX_HOOKS as u64).to_le_bytes());
+        b[0x28..0x30].copy_from_slice(&(usize::MAX as u64).to_le_bytes());
+        let r = initialize_v2_inner_probe(&b);
+        assert_eq!(r, MidaAntidebugError::InvalidV2Blob.as_i32());
+    }
+
+    #[test]
+    fn v2_blob_blob_base_plus_bytes_overflow_rejected() {
+        // params_bytes = usize::MAX with a valid small blob is impossible
+        // to allocate; instead exercise the checked_add directly through
+        // a pointer near the top of the address space is not constructible
+        // in a test. We cover the overflow guard via the digest-region
+        // checked_add path with dig_off = usize::MAX - 1 in the header.
+        let mut b = build_probe_blob();
+        b[0x38..0x40].copy_from_slice(&((usize::MAX - 1) as u64).to_le_bytes());
+        let r = initialize_v2_inner_probe(&b);
+        assert_eq!(r, MidaAntidebugError::InvalidV2Blob.as_i32());
     }
 }

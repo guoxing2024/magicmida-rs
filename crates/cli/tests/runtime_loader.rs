@@ -571,9 +571,12 @@ fn resolve_via_parser(img: &ExportImage) -> Vec<Option<usize>> {
         b"MidaAntidebugGetAttestation",
         b"MidaAntidebugShutdown",
     ];
-    // module_base: 0x400000 (any); exp_rva/size: pick a window outside the
-    // function array so no export is treated as forwarded.
+    // module_base: 0x400000 (any); image_size: 0x10000 (all test RVAs
+    // including func RVAs 0x1111..0x3333 and junk 0xDEAD+i fit inside);
+    // exp_rva/size: pick a window outside the function array so no export
+    // is treated as forwarded.
     let module_base = 0x400000usize;
+    let image_size = 0x10000usize;
     let exp_rva = 0x2000usize;
     let exp_size = 0x100usize;
     let mut name_at = |name_ptr_rva: usize, out: &mut Vec<u8>| {
@@ -598,6 +601,7 @@ fn resolve_via_parser(img: &ExportImage) -> Vec<Option<usize>> {
         img.num_names,
         img.num_funcs,
         module_base,
+        image_size,
         exp_rva,
         exp_size,
         &want,
@@ -711,6 +715,7 @@ fn export_parser_fails_closed_on_truncated_buffers() {
         2, // claims 2 names
         4,
         0x400000,
+        0x10000,
         0x2000,
         0x100,
         &want,
@@ -730,6 +735,7 @@ fn export_parser_fails_closed_on_truncated_buffers() {
         2,
         4,
         0x400000,
+        0x10000,
         0x2000,
         0x100,
         &want,
@@ -749,6 +755,7 @@ fn export_parser_fails_closed_on_truncated_buffers() {
         2,
         4,
         0x400000,
+        0x10000,
         0x2000,
         0x100,
         &want,
