@@ -58,3 +58,15 @@
 
 ---
 （WO-2303 交付，绑定 ea79518）
+## 6. 提交后绑定补充（Batch 23 交付提交）
+
+- Batch 23 交付提交：`0ebfff4`（docs(gto): WO-2301 thunk7 machine-code ABI verified +
+  WO-2302 surface arithmetic hardening + WO-2303/2304/2305 final-tree audits），
+  6 文件 +376/-28。
+- 生产代码（crates/）自 `ea79518` 起**零修改**（本提交仅 docs/fixtures），
+  因此 test/check/diffcheck 证据（绑定 ea79518 树）对提交后树仍然有效。
+- 提交后 HEAD：`0ebfff403330fce91c69cd9cdcee21a4fb4fa4e3`。
+- 提交后 `git diff --check ea79518..0ebfff4`：EXIT=0（无 whitespace 错误）。
+
+---
+（WO-2303 补充，提交后绑定 0ebfff4 / 证据树 ea79518）
