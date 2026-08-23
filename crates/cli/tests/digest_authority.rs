@@ -1,18 +1,32 @@
-//! IMP-06-R1 — Digest Authority Production Boundary tests.
+//! IMP-06-R2 — Digest Authority Provenance Sealing tests.
 //!
-//! Covers the production `RuntimeDigestAuthority` object, the placeholder
-//! fail-closed blocking, the digest mismatch comparison API, and the proof
-//! that `RuntimeAuthorityManifest::verify_file()` is the SINGLE runtime file
-//! hash computation point (no duplicate hash path).
+//! Covers the public digest gates (`is_valid_digest_hex` /
+//! `validate_digest_hex`), the placeholder fail-closed blocking, and the
+//! REAL `verify_file()` path against a real minimal x64 PE.
 //!
-//! These are offline tests only. They prove the local authority logic and
-//! the comparison API; they do NOT prove any runtime echo is wired
-//! (`runtime echo consumer = NOT WIRED` — no V2 runtime export exists yet).
+//! These are offline tests only. They prove the local authority logic; they
+//! do NOT prove any runtime echo is wired (`runtime echo consumer = NOT
+//! WIRED` — no V2 runtime export exists yet).
+//!
+//! # Provenance sealing
+//!
+//! The authority/identity types under test are SEALED by Rust visibility,
+//! not by test comments:
+//! - `RuntimeFileIdentity` has no public fields, no public constructor and
+//!   no `Deserialize` — a raw literal is a COMPILE ERROR outside the
+//!   defining module;
+//! - `RuntimeDigestAuthority` has no public fields and its only constructor
+//!   is `pub(crate)` — a raw literal or an external constructor call is a
+//!   COMPILE ERROR outside the crate.
+//!
+//! Integration tests therefore exercise only the public surface:
+//! `verify_file()` (which returns the sealed identity) and the pure digest
+//! gates. Construction of the digest authority from the verified identity is
+//! exercised by in-crate unit tests (same module as the type).
 
 use mida_cli::unpacker::runtime_loader::{
-    is_valid_digest_hex, validate_digest_hex, DigestValidationError,
-    PLACEHOLDER_RUNTIME_DIGEST, RuntimeAuthorityManifest, RuntimeDigestAuthority,
-    RuntimeFileIdentity, RuntimeLoadError, DIGEST_HEX_LEN,
+    is_valid_digest_hex, validate_digest_hex, DigestValidationError, PLACEHOLDER_RUNTIME_DIGEST,
+    RuntimeAuthorityManifest, RuntimeLoadError, DIGEST_HEX_LEN,
 };
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -25,23 +39,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 fn valid_digest() -> String {
     "a".repeat(64)
-}
-
-fn identity_with(sha256: &str) -> RuntimeFileIdentity {
-    RuntimeFileIdentity {
-        path: std::path::PathBuf::from("C:/tmp/verified_runtime.dll"),
-        sha256: sha256.to_string(),
-        size_bytes: 1234,
-        architecture: "x86_64".to_string(),
-    }
-}
-
-fn authority_with(sha256: &str) -> RuntimeDigestAuthority {
-    RuntimeDigestAuthority::from_verified_identity(
-        &identity_with(sha256),
-        "mida-antidebug-runtime-x64",
-    )
-    .expect("test digest must be a valid 64-lowercase-hex digest")
 }
 
 /// Build a minimal valid x64 PE (MZ + PE sig + Machine=AMD64 + PE32+ magic).
@@ -86,12 +83,7 @@ fn valid_64_char_lowercase_digest_accepted() {
     let d = valid_digest();
     assert!(is_valid_digest_hex(&d));
     assert_eq!(validate_digest_hex(&d), Ok(()));
-    let auth = authority_with(&d);
-    assert_eq!(auth.digest_value, d);
-    assert_eq!(auth.size_bytes, 1234);
-    assert_eq!(auth.architecture, "x86_64");
-    assert_eq!(auth.manifest_artifact_id, "mida-antidebug-runtime-x64");
-    assert!(auth.canonical_path.is_absolute());
+    assert_eq!(d.len(), DIGEST_HEX_LEN);
 }
 
 #[test]
@@ -102,13 +94,13 @@ fn placeholder_digest_rejected_everywhere() {
         validate_digest_hex(PLACEHOLDER_RUNTIME_DIGEST),
         Err(DigestValidationError::Placeholder)
     );
-    // The placeholder can NEVER be wrapped into a verified authority.
-    let err = RuntimeDigestAuthority::from_verified_identity(
-        &identity_with(PLACEHOLDER_RUNTIME_DIGEST),
-        "mida-antidebug-runtime-x64",
-    )
-    .unwrap_err();
-    assert_eq!(err, DigestValidationError::Placeholder);
+    // The placeholder can NEVER pass verify_file(): the manifest digest
+    // check rejects it before any identity exists.
+    let pe = minimal_pe();
+    let path = tmp_file("imp06_placeholder.dll", &pe);
+    let authority = manifest(PLACEHOLDER_RUNTIME_DIGEST, pe.len() as u64);
+    let err = authority.verify_file(&path).unwrap_err();
+    assert!(matches!(err, RuntimeLoadError::AuthorityMismatch(_)));
 }
 
 #[test]
@@ -125,12 +117,12 @@ fn uppercase_hex_rejected() {
         validate_digest_hex(&mixed),
         Err(DigestValidationError::NotLowercaseHex)
     );
-    // Construction from an uppercase identity fails closed too.
-    assert!(RuntimeDigestAuthority::from_verified_identity(
-        &identity_with(&"A".repeat(64)),
-        "mida-antidebug-runtime-x64",
-    )
-    .is_err());
+    // A manifest with an uppercase digest cannot verify any file: the
+    // computed file digest is lowercase and will never match.
+    let pe = minimal_pe();
+    let path = tmp_file("imp06_uppercase.dll", &pe);
+    let authority = manifest(&"A".repeat(64), pe.len() as u64);
+    assert!(authority.verify_file(&path).is_err());
 }
 
 #[test]
@@ -200,133 +192,57 @@ fn nul_and_trailing_bytes_rejected() {
 }
 
 // ---------------------------------------------------------------------------
-// authority vs runtime echo comparison (fail-closed)
+// verify_file() path (public surface)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn runtime_echo_missing_rejected() {
-    let auth = authority_with(&valid_digest());
-    assert_eq!(
-        auth.verify_runtime_echo(""),
-        Err(DigestValidationError::Missing)
-    );
-}
-
-#[test]
-fn runtime_echo_placeholder_rejected() {
-    let auth = authority_with(&valid_digest());
-    assert_eq!(
-        auth.verify_runtime_echo(PLACEHOLDER_RUNTIME_DIGEST),
-        Err(DigestValidationError::Placeholder)
-    );
-}
-
-#[test]
-fn runtime_echo_bad_shapes_rejected() {
-    let auth = authority_with(&valid_digest());
-    // wrong length
-    assert!(matches!(
-        auth.verify_runtime_echo(&"b".repeat(63)),
-        Err(DigestValidationError::WrongLength { .. })
-    ));
-    // uppercase
-    assert!(matches!(
-        auth.verify_runtime_echo(&"B".repeat(64)),
-        Err(DigestValidationError::NotLowercaseHex)
-    ));
-    // non-hex
-    assert!(matches!(
-        auth.verify_runtime_echo(&"z".repeat(64)),
-        Err(DigestValidationError::NotLowercaseHex)
-    ));
-    // NUL terminator carried over the wire
-    let nul = format!("{}\0", "b".repeat(64));
-    assert!(matches!(
-        auth.verify_runtime_echo(&nul),
-        Err(DigestValidationError::WrongLength { .. })
-    ));
-}
-
-#[test]
-fn authority_runtime_echo_mismatch_rejected() {
-    let auth = authority_with(&valid_digest());
-    let other = "b".repeat(64);
-    assert_eq!(
-        auth.verify_runtime_echo(&other),
-        Err(DigestValidationError::EchoMismatch {
-            expected: valid_digest(),
-            got: other.clone(),
-        })
-    );
-}
-
-#[test]
-fn correct_lowercase_echo_accepted() {
-    let d = valid_digest();
-    let auth = authority_with(&d);
-    assert_eq!(auth.verify_runtime_echo(&d), Ok(()));
-    // A DIFFERENT valid digest from the same authority still mismatches.
-    assert!(auth.verify_runtime_echo(&"c".repeat(64)).is_err());
-}
-
-// ---------------------------------------------------------------------------
-// single hash authority point proof
-// ---------------------------------------------------------------------------
-
-#[test]
-fn verify_file_is_the_only_runtime_hash_point() {
-    // 1. verify_file() computes the digest from the FILE BYTES (the single
-    //    authoritative hash point).
+fn verify_file_produces_sealed_identity() {
     let pe = minimal_pe();
-    let path = tmp_file("imp06_runtime_ok.dll", &pe);
+    let path = tmp_file("imp06_verify_ok.dll", &pe);
     let expected = sha256_hex(&pe);
     let authority = manifest(&expected, pe.len() as u64);
     let id = authority.verify_file(&path).unwrap();
-    assert_eq!(id.sha256, expected);
-
-    // 2. The digest authority is derived from THAT identity WITHOUT any
-    //    re-read of the DLL (no second hash path): from_verified_identity
-    //    takes only the identity struct; the file is never touched again.
-    let da = RuntimeDigestAuthority::from_verified_identity(&id, &authority.artifact_id)
-        .expect("verified identity must build a valid authority");
-    assert_eq!(da.digest_value, id.sha256);
-    assert_eq!(da.digest_value, expected);
-    assert_eq!(da.size_bytes, id.size_bytes);
-    assert_eq!(da.manifest_artifact_id, authority.artifact_id);
-    // The canonical path is the verify_file() result path.
-    assert_eq!(da.canonical_path, id.path);
+    assert_eq!(id.sha256(), expected);
+    assert_eq!(id.size_bytes(), pe.len() as u64);
+    assert_eq!(id.architecture(), "x86_64");
+    assert!(id.path().is_absolute());
 }
 
 #[test]
-fn manifest_digest_and_verified_file_digest_mismatch_rejected() {
+fn verify_file_rejects_digest_mismatch() {
     let pe = minimal_pe();
-    let path = tmp_file("imp06_runtime_mismatch.dll", &pe);
-    let real = sha256_hex(&pe);
-    let wrong = "00".repeat(32);
-    let authority = manifest(&wrong, pe.len() as u64);
-    // verify_file() fails closed when the manifest digest does not match the
-    // computed file digest -> the loader path never proceeds.
+    let path = tmp_file("imp06_verify_mismatch.dll", &pe);
+    let authority = manifest(&"00".repeat(32), pe.len() as u64);
     let err = authority.verify_file(&path).unwrap_err();
     assert!(matches!(err, RuntimeLoadError::AuthorityMismatch(_)));
     assert!(err.to_string().contains("sha256"));
-    // The computed real digest can never enter the authority through this
-    // path because verify_file() is the ONLY constructor input and it failed.
-    let _ = real;
 }
 
 #[test]
-fn no_duplicate_hash_authority_path() {
-    // RuntimeDigestAuthority carries NO file-reading capability: its only
-    // constructor consumes an already-verified identity. A second hash
-    // authority would require either a new file read or a public field
-    // constructor; the public surface has neither.
-    //
-    // Proof by construction: from_verified_identity rejects every invalid
-    // digest shape, so an authority can only be produced from a verify_file()
-    // identity. There is no other `pub fn` on the type that accepts raw file
-    // bytes or a path and hashes them.
-    let identity = identity_with(&valid_digest());
-    let auth = RuntimeDigestAuthority::from_verified_identity(&identity, "id").unwrap();
-    assert_eq!(auth.digest_value.len(), DIGEST_HEX_LEN);
-    assert!(auth.digest_value.chars().all(|c| c.is_ascii_hexdigit()));
+fn verify_file_rejects_size_mismatch() {
+    let pe = minimal_pe();
+    let path = tmp_file("imp06_verify_sizemismatch.dll", &pe);
+    let authority = manifest(&sha256_hex(&pe), pe.len() as u64 + 1);
+    let err = authority.verify_file(&path).unwrap_err();
+    assert!(matches!(err, RuntimeLoadError::AuthorityMismatch(_)));
+    assert!(err.to_string().contains("size"));
+}
+
+#[test]
+fn verify_file_rejects_invalid_manifest_digests() {
+    for (label, bad) in [
+        ("placeholder", PLACEHOLDER_RUNTIME_DIGEST.to_string()),
+        ("uppercase", "A".repeat(64)),
+        ("non-hex", "z".repeat(64)),
+        ("short", "a".repeat(32)),
+    ] {
+        let pe = minimal_pe();
+        let path = tmp_file(&format!("imp06_bad_{label}.dll"), &pe);
+        let authority = manifest(&bad, pe.len() as u64);
+        let err = authority.verify_file(&path).unwrap_err();
+        assert!(
+            matches!(err, RuntimeLoadError::AuthorityMismatch(_)),
+            "{label}: verify_file must fail closed, got {err:?}"
+        );
+    }
 }

@@ -571,7 +571,7 @@ pub fn unpack(
                 LogType::Info,
                 &format!(
                     "post-attach runtime loader (pre-resume): module_base={:#x} target_pid={}",
-                    loader_result.module_base, loader_result.target_pid
+                    loader_result.module_base(), loader_result.target_pid()
                 ),
             ),
             Err(e) => log::log(

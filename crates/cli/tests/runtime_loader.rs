@@ -6,7 +6,7 @@
 
 use mida_cli::unpacker::runtime_loader::{
     build_init_params_bytes, verify_pe_x64, verify_runtime_provenance, RuntimeAuthorityManifest,
-    RuntimeDigestAuthority, RuntimeFileIdentity, RuntimeLoadError, ThunkArgs, THUNK_CODE,
+    RuntimeLoadError, ThunkArgs, THUNK_CODE,
 };
 
 // ----------------------------------------------------------------
@@ -60,10 +60,10 @@ fn authority_matches_ok_with_real_pe() {
     let path = tmp_file("runtime_ok.dll", &pe);
     let authority = manifest(&sha256_hex(&pe), pe.len() as u64);
     let id = authority.verify_file(&path).unwrap();
-    assert_eq!(id.sha256, sha256_hex(&pe));
-    assert_eq!(id.size_bytes, pe.len() as u64);
-    assert_eq!(id.architecture, "x86_64");
-    assert!(id.path.is_absolute());
+    assert_eq!(id.sha256(), sha256_hex(&pe));
+    assert_eq!(id.size_bytes(), pe.len() as u64);
+    assert_eq!(id.architecture(), "x86_64");
+    assert!(id.path().is_absolute());
 }
 
 #[test]
@@ -154,7 +154,7 @@ fn provenance_hash_mismatch_rejected() {
     let mut authority = manifest(&sha256_hex(&pe), pe.len() as u64);
     authority.provenance_ref = "prov_hash_mismatch.json".to_string();
     let id = authority.verify_file(&runtime_path).unwrap();
-    let mut prov = ok_provenance(&id.sha256, id.size_bytes);
+    let mut prov = ok_provenance(&id.sha256(), id.size_bytes());
     prov["sha256"] = serde_json::Value::String("00".repeat(32));
     let dir = std::env::temp_dir().join("mida-adr6-test");
     std::fs::write(dir.join("prov_hash_mismatch.json"), prov.to_string()).unwrap();
@@ -170,7 +170,7 @@ fn provenance_kind_mismatch_rejected() {
     let mut authority = manifest(&sha256_hex(&pe), pe.len() as u64);
     authority.provenance_ref = "prov_kind_mismatch.json".to_string();
     let id = authority.verify_file(&runtime_path).unwrap();
-    let mut prov = ok_provenance(&id.sha256, id.size_bytes);
+    let mut prov = ok_provenance(&id.sha256(), id.size_bytes());
     prov["kind"] = serde_json::Value::String("runtime-x86".to_string());
     let dir = std::env::temp_dir().join("mida-adr6-test");
     std::fs::write(dir.join("prov_kind_mismatch.json"), prov.to_string()).unwrap();
@@ -203,7 +203,7 @@ fn provenance_ok_passes() {
     let dir = std::env::temp_dir().join("mida-adr6-test");
     std::fs::write(
         dir.join("prov_ok.json"),
-        ok_provenance(&id.sha256, id.size_bytes).to_string(),
+        ok_provenance(&id.sha256(), id.size_bytes()).to_string(),
     )
     .unwrap();
     let prov = verify_runtime_provenance(&authority, &dir, &id).unwrap();
@@ -314,176 +314,6 @@ fn init_params_empty_surfaces_ok() {
 }
 
 // ----------------------------------------------------------------
-// controller lifecycle with loader result (offline)
-// ----------------------------------------------------------------
-
-use mida_cli::unpacker::antidebug_controller::{
-    AntidebugController, AntidebugOutcome, AntidebugStageOptions, LoaderResult,
-};
-
-fn controller_with_loader_result(loader: Option<LoaderResult>) -> AntidebugController {
-    // A real temp x64 PE file whose content matches the manifest digest.
-    let content = minimal_pe(0x8664, 0x20B);
-    let dir = std::env::temp_dir().join("mida-adr6-test");
-    let _ = std::fs::create_dir_all(&dir);
-    let p = dir.join("r.dll");
-    std::fs::write(&p, &content).unwrap();
-    let authority = manifest(&sha256_hex(&content), content.len() as u64);
-    AntidebugController::new(AntidebugStageOptions {
-        sample_id: Some("origin_macro".to_string()),
-        target_pid: 1234,
-        evidence_dir: None,
-        oracle: None,
-        cleanup_backend: None,
-        runtime_authority: Some(authority),
-        runtime_path: Some(p),
-        loader_result: loader,
-    })
-}
-
-fn fake_loader_result() -> LoaderResult {
-    LoaderResult {
-        module_base: 0x7000,
-        attestation_json: serde_json::json!({
-            "schema": "mida.antidebug-runtime-attestation/v1",
-            "runtime_id": "mida-antidebug-runtime-x64",
-            "runtime_version": "0.1.0",
-            "architecture": "x86_64",
-            "runtime_sha256": "ab".repeat(32),
-            "profile_id": "oreans_origin_x64_v1",
-            "profile_digest": "adr6-profile-digest",
-            "target_pid": 1234,
-            "module_base": 0x7000,
-            "initialized": true,
-            "hooks_expected": ["AD-PROC-002", "AD-PROC-003"],
-            "hooks_installed": ["AD-PROC-002", "AD-PROC-003"],
-            "hook_failures": [],
-            "surface_details": [],
-            "telemetry_channel": "ready",
-            "cleanup_handler_registered": true,
-            "third_party": "build-and-serialization-only",
-            "source_revision": "0.1.0",
-            "toolchain": "rustc",
-        })
-        .to_string(),
-        file_identity: RuntimeFileIdentity {
-            path: std::path::PathBuf::from("C:/tmp/r.dll"),
-            sha256: "ab".repeat(32),
-            size_bytes: 10,
-            architecture: "x86_64".to_string(),
-        },
-        digest_authority: RuntimeDigestAuthority {
-            digest_value: "ab".repeat(32),
-            size_bytes: 10,
-            canonical_path: std::path::PathBuf::from("C:/tmp/r.dll"),
-            manifest_artifact_id: "mida-antidebug-runtime-x64".to_string(),
-            architecture: "x86_64".to_string(),
-        },
-        target_pid: 1234,
-    }
-}
-
-#[test]
-fn controller_proceeds_with_valid_loader_result() {
-    let mut c = controller_with_loader_result(Some(fake_loader_result()));
-    let outcome = c.run();
-    if !matches!(outcome, AntidebugOutcome::Proceed { .. }) {
-        if let AntidebugOutcome::Failed {
-            state,
-            fail_code,
-            message,
-        } = &outcome
-        {
-            panic!(
-                "expected Proceed, got Failed state={state:?} code={} msg={message}",
-                fail_code.as_str()
-            );
-        }
-    }
-    assert!(matches!(outcome, AntidebugOutcome::Proceed { .. }));
-}
-
-#[test]
-fn controller_fails_closed_without_loader_result() {
-    let mut c = controller_with_loader_result(None);
-    let outcome = c.run();
-    assert!(matches!(outcome, AntidebugOutcome::Failed { .. }));
-}
-
-#[test]
-fn controller_fails_closed_on_target_pid_mismatch() {
-    let mut loader = fake_loader_result();
-    loader.target_pid = 9999;
-    let mut c = controller_with_loader_result(Some(loader));
-    let outcome = c.run();
-    assert!(matches!(outcome, AntidebugOutcome::Failed { .. }));
-}
-
-#[test]
-fn controller_fails_closed_on_bad_attestation() {
-    let mut loader = fake_loader_result();
-    loader.attestation_json = "{ not json".to_string();
-    let mut c = controller_with_loader_result(Some(loader));
-    let outcome = c.run();
-    assert!(matches!(outcome, AntidebugOutcome::Failed { .. }));
-}
-
-#[test]
-fn controller_fails_closed_on_incomplete_attestation() {
-    // hooks_installed missing AD-PROC-003 -> validate fails -> PartialHooks.
-    let mut loader = fake_loader_result();
-    loader.attestation_json = serde_json::json!({
-        "schema": "mida.antidebug-runtime-attestation/v1",
-        "runtime_id": "mida-antidebug-runtime-x64",
-        "runtime_version": "0.1.0",
-        "architecture": "x86_64",
-        "runtime_sha256": "ab".repeat(32),
-        "profile_id": "oreans_origin_x64_v1",
-        "profile_digest": "adr6-profile-digest",
-        "target_pid": 1234,
-        "module_base": 0x7000,
-        "initialized": true,
-        "hooks_expected": ["AD-PROC-002", "AD-PROC-003"],
-        "hooks_installed": ["AD-PROC-002"],
-        "hook_failures": [{"surface_id": "AD-PROC-003", "reason": "failed"}],
-        "surface_details": [],
-        "telemetry_channel": "ready",
-        "cleanup_handler_registered": true,
-        "third_party": "build-and-serialization-only",
-        "source_revision": "0.1.0",
-        "toolchain": "rustc",
-    })
-    .to_string();
-    let mut c = controller_with_loader_result(Some(loader));
-    let outcome = c.run();
-    assert!(matches!(outcome, AntidebugOutcome::Failed { .. }));
-}
-
-#[test]
-fn controller_authority_mismatch_fails_before_loader() {
-    // The file is a real x64 PE but the manifest digest does not match it ->
-    // authority verification fails before any loader work.
-    let content = minimal_pe(0x8664, 0x20B);
-    let dir = std::env::temp_dir().join("mida-adr6-test");
-    let _ = std::fs::create_dir_all(&dir);
-    let p = dir.join("mismatch.dll");
-    std::fs::write(&p, &content).unwrap();
-    let authority = manifest(&"cd".repeat(32), content.len() as u64); // wrong digest
-    let mut c = AntidebugController::new(AntidebugStageOptions {
-        sample_id: Some("origin_macro".to_string()),
-        target_pid: 1234,
-        evidence_dir: None,
-        oracle: None,
-        cleanup_backend: None,
-        runtime_authority: Some(authority),
-        runtime_path: Some(p),
-        loader_result: Some(fake_loader_result()),
-    });
-    let outcome = c.run();
-    assert!(matches!(outcome, AntidebugOutcome::Failed { .. }));
-}
-
-// ----------------------------------------------------------------
 // CORRECTION-2: source_ref chain + full provenance binding
 // ----------------------------------------------------------------
 
@@ -494,7 +324,7 @@ fn provenance_artifact_id_mismatch_rejected() {
     let mut authority = manifest(&sha256_hex(&pe), pe.len() as u64);
     authority.provenance_ref = "prov_art_mismatch.json".to_string();
     let id = authority.verify_file(&runtime_path).unwrap();
-    let mut prov = ok_provenance(&id.sha256, id.size_bytes);
+    let mut prov = ok_provenance(&id.sha256(), id.size_bytes());
     prov["artifact_id"] = serde_json::Value::String("other-artifact".to_string());
     let dir = std::env::temp_dir().join("mida-adr6-test");
     std::fs::write(dir.join("prov_art_mismatch.json"), prov.to_string()).unwrap();
@@ -510,7 +340,7 @@ fn provenance_source_ref_mismatch_rejected() {
     let mut authority = manifest(&sha256_hex(&pe), pe.len() as u64);
     authority.provenance_ref = "prov_src_mismatch.json".to_string();
     let id = authority.verify_file(&runtime_path).unwrap();
-    let mut prov = ok_provenance(&id.sha256, id.size_bytes);
+    let mut prov = ok_provenance(&id.sha256(), id.size_bytes());
     prov["source_ref"] = serde_json::Value::String("other-commit".to_string());
     let dir = std::env::temp_dir().join("mida-adr6-test");
     std::fs::write(dir.join("prov_src_mismatch.json"), prov.to_string()).unwrap();
@@ -526,7 +356,7 @@ fn provenance_empty_dependencies_rejected() {
     let mut authority = manifest(&sha256_hex(&pe), pe.len() as u64);
     authority.provenance_ref = "prov_dep_empty.json".to_string();
     let id = authority.verify_file(&runtime_path).unwrap();
-    let mut prov = ok_provenance(&id.sha256, id.size_bytes);
+    let mut prov = ok_provenance(&id.sha256(), id.size_bytes());
     prov["dependencies"] = serde_json::Value::Array(vec![]);
     let dir = std::env::temp_dir().join("mida-adr6-test");
     std::fs::write(dir.join("prov_dep_empty.json"), prov.to_string()).unwrap();
@@ -543,7 +373,7 @@ fn provenance_dependency_empty_name_rejected() {
     let mut authority = manifest(&sha256_hex(&pe), pe.len() as u64);
     authority.provenance_ref = "prov_dep_name.json".to_string();
     let id = authority.verify_file(&runtime_path).unwrap();
-    let mut prov = ok_provenance(&id.sha256, id.size_bytes);
+    let mut prov = ok_provenance(&id.sha256(), id.size_bytes());
     prov["dependencies"][0]["name"] = serde_json::Value::String(String::new());
     let dir = std::env::temp_dir().join("mida-adr6-test");
     std::fs::write(dir.join("prov_dep_name.json"), prov.to_string()).unwrap();
@@ -558,7 +388,7 @@ fn provenance_dependency_anti_debug_rejected() {
     let mut authority = manifest(&sha256_hex(&pe), pe.len() as u64);
     authority.provenance_ref = "prov_dep_ad.json".to_string();
     let id = authority.verify_file(&runtime_path).unwrap();
-    let mut prov = ok_provenance(&id.sha256, id.size_bytes);
+    let mut prov = ok_provenance(&id.sha256(), id.size_bytes());
     prov["dependencies"][0]["anti_debug"] = serde_json::Value::Bool(true);
     let dir = std::env::temp_dir().join("mida-adr6-test");
     std::fs::write(dir.join("prov_dep_ad.json"), prov.to_string()).unwrap();
@@ -576,7 +406,7 @@ fn full_valid_provenance_chain_passes() {
     let dir = std::env::temp_dir().join("mida-adr6-test");
     std::fs::write(
         dir.join("prov_chain_ok.json"),
-        ok_provenance(&id.sha256, id.size_bytes).to_string(),
+        ok_provenance(&id.sha256(), id.size_bytes()).to_string(),
     )
     .unwrap();
     let prov = verify_runtime_provenance(&authority, &dir, &id).unwrap();
@@ -593,7 +423,7 @@ fn provenance_arch_mismatch_rejected() {
     let mut authority = manifest(&sha256_hex(&pe), pe.len() as u64);
     authority.provenance_ref = "prov_arch.json".to_string();
     let id = authority.verify_file(&runtime_path).unwrap();
-    let mut prov = ok_provenance(&id.sha256, id.size_bytes);
+    let mut prov = ok_provenance(&id.sha256(), id.size_bytes());
     prov["architecture"] = serde_json::Value::String("x86".to_string());
     let dir = std::env::temp_dir().join("mida-adr6-test");
     std::fs::write(dir.join("prov_arch.json"), prov.to_string()).unwrap();

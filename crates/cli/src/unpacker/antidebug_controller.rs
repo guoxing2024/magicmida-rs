@@ -313,11 +313,11 @@ pub struct OracleMode {
 pub struct LoaderResult {
     /// Module base in the target (evidence + controller cross-check).
     #[allow(dead_code)] // consumed by evidence bindings
-    pub module_base: u64,
-    pub attestation_json: String,
+    module_base: u64,
+    attestation_json: String,
     /// Verified file identity (evidence).
     #[allow(dead_code)] // consumed by evidence bindings
-    pub file_identity: RuntimeFileIdentity,
+    file_identity: RuntimeFileIdentity,
     /// Production digest authority (IMP-06-R1): the verified runtime file
     /// digest + identity. Constructed by the loader from verify_file()'s
     /// identity; the placeholder can never appear here (fail-closed).
@@ -328,8 +328,54 @@ pub struct LoaderResult {
     /// `RuntimeDigestAuthority::verify_runtime_echo`; it is exercised only
     /// by unit/integration tests until the IMP-08 V2 wiring order lands.
     #[allow(dead_code)] // echo comparison wired in IMP-08 (NOT WIRED today)
-    pub digest_authority: RuntimeDigestAuthority,
-    pub target_pid: u32,
+    digest_authority: RuntimeDigestAuthority,
+    target_pid: u32,
+}
+
+impl LoaderResult {
+    /// Sealed constructor (IMP-06-R2): the loader (`run_runtime_loader`)
+    /// is the only producer. Fields are private so a forged result cannot be
+    /// assembled from fake identity/authority values.
+    pub(crate) fn new(
+        module_base: u64,
+        attestation_json: String,
+        file_identity: RuntimeFileIdentity,
+        digest_authority: RuntimeDigestAuthority,
+        target_pid: u32,
+    ) -> Self {
+        Self {
+            module_base,
+            attestation_json,
+            file_identity,
+            digest_authority,
+            target_pid,
+        }
+    }
+
+    /// Target process id the runtime was loaded into.
+    pub fn target_pid(&self) -> u32 {
+        self.target_pid
+    }
+
+    /// Attestation JSON returned by the runtime (evidence).
+    pub fn attestation_json(&self) -> &str {
+        &self.attestation_json
+    }
+
+    /// Verified runtime file identity (evidence; produced by verify_file()).
+    pub fn file_identity(&self) -> &RuntimeFileIdentity {
+        &self.file_identity
+    }
+
+    /// Production digest authority (never a placeholder).
+    pub fn digest_authority(&self) -> &RuntimeDigestAuthority {
+        &self.digest_authority
+    }
+
+    /// Module base in the target (evidence + controller cross-check).
+    pub fn module_base(&self) -> u64 {
+        self.module_base
+    }
 }
 
 /// The anti-debug lifecycle driver.
@@ -589,14 +635,14 @@ impl AntidebugController {
         };
 
         // Identity cross-checks against the loader result.
-        if loader.target_pid != self.options.target_pid {
+        if loader.target_pid() != self.options.target_pid {
             self.drive(ControllerEvent::TargetIdentityRejected);
             return AntidebugOutcome::Failed {
                 state: self.state,
                 fail_code: self.fail_code_of_state(self.state),
                 message: format!(
                     "loader target pid {} != controller target pid {}",
-                    loader.target_pid, self.options.target_pid
+                    loader.target_pid(), self.options.target_pid
                 ),
             };
         }
@@ -604,7 +650,7 @@ impl AntidebugController {
         // Parse + validate the attestation (transport parse; validate is the
         // decision gate).
         let att = match mida_antidebug_runtime::attestation::RuntimeAttestation::from_canonical_json(
-            &loader.attestation_json,
+            loader.attestation_json(),
         ) {
             Ok(a) => a,
             Err(e) => {
@@ -1120,5 +1166,213 @@ mod tests {
             c.fail_code_of_state(ControllerState::CleanupFailed),
             FailCode::CleanupFailed
         );
+    }
+
+    // ---------------------------------------------------------------
+    // IMP-06-R2: loader-result lifecycle tests (identity + authority
+    // produced ONLY via the real verify_file() path — sealed types)
+    // ---------------------------------------------------------------
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(bytes);
+        let d = h.finalize();
+        d.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Minimal valid x64 PE (MZ + PE sig + Machine=AMD64 + PE32+ magic).
+    fn minimal_pe() -> Vec<u8> {
+        let mut b = vec![0u8; 0x100];
+        b[0] = b'M';
+        b[1] = b'Z';
+        b[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes()); // e_lfanew
+        b[0x80..0x84].copy_from_slice(b"PE\0\0");
+        b[0x84..0x86].copy_from_slice(&0x8664u16.to_le_bytes()); // AMD64
+        b[0x98..0x9A].copy_from_slice(&0x20Bu16.to_le_bytes()); // PE32+
+        b
+    }
+
+    fn manifest(sha256: &str, size: u64) -> RuntimeAuthorityManifest {
+        RuntimeAuthorityManifest {
+            schema: "mida.antidebug-runtime-authority/v1".to_string(),
+            kind: "runtime-x64".to_string(),
+            artifact_id: "mida-antidebug-runtime-x64".to_string(),
+            sha256: sha256.to_string(),
+            size_bytes: size,
+            architecture: "x86_64".to_string(),
+            source_ref: "test-commit".to_string(),
+            provenance_ref: "provenance.json".to_string(),
+        }
+    }
+
+    fn default_attestation_json() -> String {
+        serde_json::json!({
+            "schema": "mida.antidebug-runtime-attestation/v1",
+            "runtime_id": "mida-antidebug-runtime-x64",
+            "runtime_version": "0.1.0",
+            "architecture": "x86_64",
+            "runtime_sha256": "ab".repeat(32),
+            "profile_id": "oreans_origin_x64_v1",
+            "profile_digest": "adr6-profile-digest",
+            "target_pid": 1234,
+            "module_base": 0x7000,
+            "initialized": true,
+            "hooks_expected": ["AD-PROC-002", "AD-PROC-003"],
+            "hooks_installed": ["AD-PROC-002", "AD-PROC-003"],
+            "hook_failures": [],
+            "surface_details": [],
+            "telemetry_channel": "ready",
+            "cleanup_handler_registered": true,
+            "third_party": "build-and-serialization-only",
+            "source_revision": "0.1.0",
+            "toolchain": "rustc",
+        })
+        .to_string()
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static FILE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    fn next_file(name: &str) -> std::path::PathBuf {
+        let n = FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir()
+            .join("mida-adr6-test")
+            .join(format!("{name}_{}_{n}.dll", std::process::id()))
+    }
+
+    fn loader_result_with(target_pid: u32, attestation_json: String) -> LoaderResult {
+        // IMP-06-R2: the identity + authority MUST come from the real
+        // verify_file() path (no forged literals):
+        //   real PE file -> manifest -> verify_file() -> identity -> authority.
+        let content = minimal_pe();
+        let _ = std::fs::create_dir_all(std::env::temp_dir().join("mida-adr6-test"));
+        let p = next_file("loader_runtime");
+        std::fs::write(&p, &content).unwrap();
+        let authority = manifest(&sha256_hex(&content), content.len() as u64);
+        let identity = authority.verify_file(&p).unwrap();
+        let digest_authority = RuntimeDigestAuthority::from_verified_identity(
+            &identity,
+            &authority.artifact_id,
+        )
+        .expect("verified identity must build a valid authority");
+        LoaderResult::new(0x7000, attestation_json, identity, digest_authority, target_pid)
+    }
+
+    fn controller_with_loader_result(loader: Option<LoaderResult>) -> AntidebugController {
+        let content = minimal_pe();
+        let _ = std::fs::create_dir_all(std::env::temp_dir().join("mida-adr6-test"));
+        let p = next_file("r");
+        std::fs::write(&p, &content).unwrap();
+        let authority = manifest(&sha256_hex(&content), content.len() as u64);
+        AntidebugController::new(AntidebugStageOptions {
+            sample_id: Some("origin_macro".to_string()),
+            target_pid: 1234,
+            evidence_dir: None,
+            oracle: None,
+            cleanup_backend: None,
+            runtime_authority: Some(authority),
+            runtime_path: Some(p),
+            loader_result: loader,
+        })
+    }
+
+    #[test]
+    fn imp06_controller_proceeds_with_valid_loader_result() {
+        let mut c = controller_with_loader_result(Some(loader_result_with(
+            1234,
+            default_attestation_json(),
+        )));
+        let outcome = c.run();
+        match &outcome {
+            AntidebugOutcome::Failed {
+                state,
+                fail_code,
+                message,
+            } => panic!(
+                "expected Proceed, got Failed state={state:?} code={} msg={message}",
+                fail_code.as_str()
+            ),
+            _ => {}
+        }
+        assert!(matches!(outcome, AntidebugOutcome::Proceed { .. }));
+    }
+
+    #[test]
+    fn imp06_controller_fails_closed_without_loader_result() {
+        let mut c = controller_with_loader_result(None);
+        let outcome = c.run();
+        assert!(matches!(outcome, AntidebugOutcome::Failed { .. }));
+    }
+
+    #[test]
+    fn imp06_controller_fails_closed_on_target_pid_mismatch() {
+        let loader = loader_result_with(9999, default_attestation_json());
+        let mut c = controller_with_loader_result(Some(loader));
+        let outcome = c.run();
+        assert!(matches!(outcome, AntidebugOutcome::Failed { .. }));
+    }
+
+    #[test]
+    fn imp06_controller_fails_closed_on_bad_attestation() {
+        let loader = loader_result_with(1234, "{ not json".to_string());
+        let mut c = controller_with_loader_result(Some(loader));
+        let outcome = c.run();
+        assert!(matches!(outcome, AntidebugOutcome::Failed { .. }));
+    }
+
+    #[test]
+    fn imp06_controller_fails_closed_on_incomplete_attestation() {
+        // hooks_installed missing AD-PROC-003 -> validate fails -> PartialHooks.
+        let loader = loader_result_with(
+            1234,
+            serde_json::json!({
+                "schema": "mida.antidebug-runtime-attestation/v1",
+                "runtime_id": "mida-antidebug-runtime-x64",
+                "runtime_version": "0.1.0",
+                "architecture": "x86_64",
+                "runtime_sha256": "ab".repeat(32),
+                "profile_id": "oreans_origin_x64_v1",
+                "profile_digest": "adr6-profile-digest",
+                "target_pid": 1234,
+                "module_base": 0x7000,
+                "initialized": true,
+                "hooks_expected": ["AD-PROC-002", "AD-PROC-003"],
+                "hooks_installed": ["AD-PROC-002"],
+                "hook_failures": [{"surface_id": "AD-PROC-003", "reason": "failed"}],
+                "surface_details": [],
+                "telemetry_channel": "ready",
+                "cleanup_handler_registered": true,
+                "third_party": "build-and-serialization-only",
+                "source_revision": "0.1.0",
+                "toolchain": "rustc",
+            })
+            .to_string(),
+        );
+        let mut c = controller_with_loader_result(Some(loader));
+        let outcome = c.run();
+        assert!(matches!(outcome, AntidebugOutcome::Failed { .. }));
+    }
+
+    #[test]
+    fn imp06_controller_authority_mismatch_fails_before_loader() {
+        let content = minimal_pe();
+        let dir = std::env::temp_dir().join("mida-adr6-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let p = next_file("mismatch");
+        std::fs::write(&p, &content).unwrap();
+        let authority = manifest(&"cd".repeat(32), content.len() as u64); // wrong digest
+        let mut c = AntidebugController::new(AntidebugStageOptions {
+            sample_id: Some("origin_macro".to_string()),
+            target_pid: 1234,
+            evidence_dir: None,
+            oracle: None,
+            cleanup_backend: None,
+            runtime_authority: Some(authority),
+            runtime_path: Some(p),
+            loader_result: Some(loader_result_with(1234, default_attestation_json())),
+        });
+        let outcome = c.run();
+        assert!(matches!(outcome, AntidebugOutcome::Failed { .. }));
     }
 }

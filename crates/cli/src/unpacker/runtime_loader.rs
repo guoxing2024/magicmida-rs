@@ -210,12 +210,45 @@ impl RuntimeAuthorityManifest {
         }
         // Real PE architecture verification (not just the authority string).
         verify_pe_x64(&bytes)?;
-        Ok(RuntimeFileIdentity {
-            path: canonical,
-            sha256: digest,
-            size_bytes: size,
-            architecture: "x86_64".to_string(),
-        })
+        Ok(RuntimeFileIdentity::from_verified(
+            canonical,
+            digest,
+            size,
+            "x86_64".to_string(),
+        ))
+    }
+
+    /// Sealed manifest-bound authority constructor (IMP-06-R2).
+    ///
+    /// The ONLY path that turns a [`RuntimeFileIdentity`] into a
+    /// [`RuntimeDigestAuthority`]: it binds the identity to THIS manifest's
+    /// artifact id and re-validates the digest (fail-closed; the placeholder
+    /// is always rejected). Module-private because the authority must only
+    /// ever be produced from a `verify_file()` identity inside this module.
+    fn digest_authority_for(
+        &self,
+        identity: &RuntimeFileIdentity,
+    ) -> Result<RuntimeDigestAuthority, RuntimeLoadError> {
+        Ok(RuntimeDigestAuthority::from_verified_identity(
+            identity,
+            &self.artifact_id,
+        )?)
+    }
+}
+
+impl RuntimeFileIdentity {
+    /// Private sealed constructor: ONLY reachable from `verify_file()` (same
+    /// module). Every identity value therefore provably passed the manifest
+    /// digest/size/architecture checks — the type cannot be forged outside
+    /// this module (no public fields, no public constructor, no
+    /// Deserialize).
+    fn from_verified(path: PathBuf, sha256: String, size_bytes: u64, architecture: String) -> Self {
+        Self {
+            path,
+            sha256,
+            size_bytes,
+            architecture,
+        }
     }
 }
 
@@ -265,13 +298,43 @@ pub fn verify_pe_x64(bytes: &[u8]) -> Result<(), RuntimeLoadError> {
     Ok(())
 }
 
-/// Identity of a verified runtime file.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+/// Identity of a verified runtime file (IMP-06-R2: provenance-sealed).
+///
+/// This type is the ONLY carrier of a `verify_file()`-verified runtime file
+/// identity. All fields are private and the type has NO public constructor:
+/// the sole production path is
+/// [`RuntimeAuthorityManifest::verify_file`], which computes and checks the
+/// SHA-256 against the audited manifest before construction. Plain
+/// `#[derive(Deserialize)]` is deliberately absent so a serde payload can
+/// never be deserialized into a "verified" identity.
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct RuntimeFileIdentity {
-    pub path: PathBuf,
-    pub sha256: String,
-    pub size_bytes: u64,
-    pub architecture: String,
+    path: PathBuf,
+    sha256: String,
+    size_bytes: u64,
+    architecture: String,
+}
+
+impl RuntimeFileIdentity {
+    /// Canonical path of the verified runtime DLL.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Verified runtime file SHA-256 (64 lowercase hex chars).
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    /// Verified runtime file size in bytes.
+    pub fn size_bytes(&self) -> u64 {
+        self.size_bytes
+    }
+
+    /// Verified runtime architecture ("x86_64").
+    pub fn architecture(&self) -> &str {
+        &self.architecture
+    }
 }
 /// Canonical runtime digest length: exactly 64 lowercase hex characters.
 ///
@@ -373,22 +436,26 @@ pub fn validate_digest_hex(value: &str) -> Result<(), DigestValidationError> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeDigestAuthority {
     /// Verified runtime file digest (64 lowercase hex, no NUL).
-    pub digest_value: String,
+    digest_value: String,
     /// Verified runtime file size in bytes.
-    pub size_bytes: u64,
+    size_bytes: u64,
     /// Canonical path of the verified runtime DLL.
-    pub canonical_path: PathBuf,
+    canonical_path: PathBuf,
     /// Manifest artifact id the runtime was bound to.
-    pub manifest_artifact_id: String,
+    manifest_artifact_id: String,
     /// Verified architecture ("x86_64").
-    pub architecture: String,
+    architecture: String,
 }
 
 impl RuntimeDigestAuthority {
     /// Build the production digest authority from an ALREADY-VERIFIED file
     /// identity (the digest was computed by `verify_file()`). Fail-closed on
     /// any invalid digest; the placeholder is always rejected.
-    pub fn from_verified_identity(
+    ///
+    /// IMP-06-R2: `pub(crate)` — the authority must only ever be built from
+    /// a [`RuntimeFileIdentity`] produced by `verify_file()`, never from
+    /// caller-supplied raw strings. External crates/tests cannot call this.
+    pub(crate) fn from_verified_identity(
         identity: &RuntimeFileIdentity,
         manifest_artifact_id: &str,
     ) -> Result<Self, DigestValidationError> {
@@ -423,6 +490,31 @@ impl RuntimeDigestAuthority {
             });
         }
         Ok(())
+    }
+
+    /// Verified runtime file digest (64 lowercase hex, no NUL).
+    pub fn digest_value(&self) -> &str {
+        &self.digest_value
+    }
+
+    /// Verified runtime file size in bytes.
+    pub fn size_bytes(&self) -> u64 {
+        self.size_bytes
+    }
+
+    /// Canonical path of the verified runtime DLL.
+    pub fn canonical_path(&self) -> &Path {
+        &self.canonical_path
+    }
+
+    /// Manifest artifact id the runtime was bound to.
+    pub fn manifest_artifact_id(&self) -> &str {
+        &self.manifest_artifact_id
+    }
+
+    /// Verified runtime architecture ("x86_64").
+    pub fn architecture(&self) -> &str {
+        &self.architecture
     }
 }
 
@@ -1197,14 +1289,14 @@ impl RuntimeLoader {
     ) -> Result<LoadedRuntime, RuntimeLoadError> {
         // 0. Authority verification (fail-closed, before any remote write).
         let identity = self.authority.verify_file(runtime_path)?;
-        if identity.architecture != "x86_64" {
+        if identity.architecture() != "x86_64" {
             return Err(RuntimeLoadError::ArchitectureUnsupported(
-                identity.architecture,
+                identity.architecture().to_string(),
             ));
         }
 
         // 1. Write the DLL path into the target.
-        let path_str = identity.path.to_str().ok_or_else(|| {
+        let path_str = identity.path().to_str().ok_or_else(|| {
             RuntimeLoadError::WriteMemoryFailed("path not UTF-16-able".to_string())
         })?;
         let path_wide: Vec<u16> = path_str.encode_utf16().chain(std::iter::once(0)).collect();
@@ -1416,9 +1508,13 @@ impl RuntimeLoader {
         // IMP-06-R1: the digest authority is derived from the SAME identity
         // produced by verify_file() — the single runtime file hash point. The
         // digest is never recomputed and the placeholder is rejected here.
-        let digest_authority = RuntimeDigestAuthority::from_verified_identity(
+        //
+        // IMP-06-R2: the authority is built via the sealed manifest
+        // constructor, which binds the identity to THIS manifest (artifact id
+        // + digest + size + architecture) and re-validates the digest.
+        let digest_authority = RuntimeAuthorityManifest::digest_authority_for(
+            &self.authority,
             &identity,
-            &self.authority.artifact_id,
         )?;
         Ok(LoadedRuntime {
             module_base,
@@ -2067,13 +2163,13 @@ pub fn verify_runtime_provenance(
     prov.validate()
         .map_err(|e| RuntimeLoadError::AuthorityMismatch(format!("provenance validate: {e}")))?;
     // 3. Cross-bind against the runtime file identity.
-    if prov.sha256 != runtime_identity.sha256 {
+    if prov.sha256 != runtime_identity.sha256() {
         return Err(RuntimeLoadError::AuthorityMismatch(format!(
             "provenance sha256 {} != runtime {}",
             prov.sha256, runtime_identity.sha256
         )));
     }
-    if prov.size_bytes != runtime_identity.size_bytes {
+    if prov.size_bytes != runtime_identity.size_bytes() {
         return Err(RuntimeLoadError::AuthorityMismatch(format!(
             "provenance size {} != runtime {}",
             prov.size_bytes, runtime_identity.size_bytes
@@ -2165,13 +2261,13 @@ pub fn run_runtime_loader(
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     let _prov = verify_runtime_provenance(&authority, &manifest_dir, &loaded.file_identity)?;
-    Ok(crate::unpacker::antidebug_controller::LoaderResult {
-        module_base: loaded.module_base as u64,
-        attestation_json: loaded.attestation_json,
-        file_identity: loaded.file_identity,
-        digest_authority: loaded.digest_authority,
+    Ok(crate::unpacker::antidebug_controller::LoaderResult::new(
+        loaded.module_base as u64,
+        loaded.attestation_json,
+        loaded.file_identity,
+        loaded.digest_authority,
         target_pid,
-    })
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -3582,7 +3678,7 @@ mod imp03_inert_adapter_tests {
         assert_eq!(pf.blob_base, BLOB_BASE);
         // surface entries are absolute VAs in declared order
         assert_eq!(pf.surface_entries.len(), 2);
-        let s0_rel = (0x48 + 2 + 2) as u64; // "p " + "d "
+        let s0_rel = (0x48 + 2 + 2) as u64; // "p\x00" + "d\x00"
         let s1_rel = s0_rel + "AD-PROC-001".len() as u64 + 1;
         assert_eq!(pf.surface_entries[0], BLOB_BASE + s0_rel);
         assert_eq!(pf.surface_entries[1], BLOB_BASE + s1_rel);
@@ -3694,5 +3790,173 @@ mod imp03_inert_adapter_tests {
         assert!(pf.digest_len == 64);
         // The preflight does not imply any target-side capability; the
         // gate remains authoritative (checked in acceptance crate).
+    }
+}
+
+#[cfg(test)]
+mod imp06_sealed_authority_tests {
+    use super::*;
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(bytes);
+        let d = h.finalize();
+        d.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn minimal_pe() -> Vec<u8> {
+        let mut b = vec![0u8; 0x100];
+        b[0] = b'M';
+        b[1] = b'Z';
+        b[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes()); // e_lfanew = 0x80
+        b[0x80..0x84].copy_from_slice(b"PE\0\0");
+        b[0x84..0x86].copy_from_slice(&0x8664u16.to_le_bytes()); // AMD64
+        b[0x98..0x9A].copy_from_slice(&0x20Bu16.to_le_bytes()); // PE32+
+        b
+    }
+
+    fn manifest(sha256: &str, size: u64) -> RuntimeAuthorityManifest {
+        RuntimeAuthorityManifest {
+            schema: "mida.antidebug-runtime-authority/v1".to_string(),
+            kind: "runtime-x64".to_string(),
+            artifact_id: "mida-antidebug-runtime-x64".to_string(),
+            sha256: sha256.to_string(),
+            size_bytes: size,
+            architecture: "x86_64".to_string(),
+            source_ref: "test-commit".to_string(),
+            provenance_ref: "provenance.json".to_string(),
+        }
+    }
+
+    fn tmp_file(name: &str, content: &[u8]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join("mida-imp06-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join(name);
+        std::fs::write(&p, content).unwrap();
+        p
+    }
+
+    /// The ONLY legitimate construction path: real PE file -> real
+    /// verify_file() -> verified identity -> digest authority.
+    fn verified_authority() -> RuntimeDigestAuthority {
+        let pe = minimal_pe();
+        let path = tmp_file("imp06_verified_runtime.dll", &pe);
+        let expected = sha256_hex(&pe);
+        let authority = manifest(&expected, pe.len() as u64);
+        let id = authority.verify_file(&path).unwrap();
+        RuntimeDigestAuthority::from_verified_identity(&id, &authority.artifact_id)
+            .expect("verified identity must build a valid authority")
+    }
+
+    #[test]
+    fn sealed_authority_getters_reflect_verified_identity() {
+        let pe = minimal_pe();
+        let path = tmp_file("imp06_getters.dll", &pe);
+        let expected = sha256_hex(&pe);
+        let authority = manifest(&expected, pe.len() as u64);
+        let id = authority.verify_file(&path).unwrap();
+        let da = RuntimeDigestAuthority::from_verified_identity(&id, &authority.artifact_id)
+            .expect("verified identity must build a valid authority");
+        assert_eq!(da.digest_value(), expected);
+        assert_eq!(da.size_bytes(), pe.len() as u64);
+        assert_eq!(da.architecture(), "x86_64");
+        assert_eq!(da.manifest_artifact_id(), authority.artifact_id);
+        assert_eq!(da.canonical_path(), id.path());
+        // Read-only surface: no public field access, no public constructor.
+        let _: &Path = da.canonical_path();
+        let _: &str = da.digest_value();
+        let _: u64 = da.size_bytes();
+        let _: &str = da.manifest_artifact_id();
+        let _: &str = da.architecture();
+    }
+
+    #[test]
+    fn sealed_authority_echo_checks_are_fail_closed() {
+        let auth = verified_authority();
+        // Missing / placeholder / bad shapes all rejected.
+        assert_eq!(
+            auth.verify_runtime_echo(""),
+            Err(DigestValidationError::Missing)
+        );
+        assert_eq!(
+            auth.verify_runtime_echo(PLACEHOLDER_RUNTIME_DIGEST),
+            Err(DigestValidationError::Placeholder)
+        );
+        assert!(matches!(
+            auth.verify_runtime_echo(&"b".repeat(63)),
+            Err(DigestValidationError::WrongLength { .. })
+        ));
+        assert!(matches!(
+            auth.verify_runtime_echo(&"B".repeat(64)),
+            Err(DigestValidationError::NotLowercaseHex)
+        ));
+        assert!(matches!(
+            auth.verify_runtime_echo(&"z".repeat(64)),
+            Err(DigestValidationError::NotLowercaseHex)
+        ));
+        // Correct digest accepted; different valid digest rejected.
+        let d = auth.digest_value().to_string();
+        assert_eq!(auth.verify_runtime_echo(&d), Ok(()));
+        assert!(matches!(
+            auth.verify_runtime_echo(&"c".repeat(64)),
+            Err(DigestValidationError::EchoMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn sealed_authority_is_single_hash_point() {
+        let pe = minimal_pe();
+        let path = tmp_file("imp06_hashpoint.dll", &pe);
+        let expected = sha256_hex(&pe);
+        let authority = manifest(&expected, pe.len() as u64);
+        let id = authority.verify_file(&path).unwrap();
+        assert_eq!(id.sha256(), expected);
+        // The authority digest is copied from the verified identity — no
+        // second file read, no second hash computation.
+        let da = RuntimeDigestAuthority::from_verified_identity(&id, &authority.artifact_id)
+            .expect("verified identity must build a valid authority");
+        assert_eq!(da.digest_value(), id.sha256());
+        assert_eq!(da.digest_value(), expected);
+        assert_eq!(da.size_bytes(), id.size_bytes());
+        assert_eq!(da.manifest_artifact_id(), authority.artifact_id);
+        assert_eq!(da.canonical_path(), id.path());
+    }
+
+    #[test]
+    fn from_verified_identity_rejects_invalid_digest() {
+        // The lexical gates are the same code path used by the production
+        // authority; a forged identity (impossible outside this module) with
+        // an invalid digest must be rejected here too.
+        let id = RuntimeFileIdentity::from_verified(
+            std::path::PathBuf::from("C:/tmp/x.dll"),
+            PLACEHOLDER_RUNTIME_DIGEST.to_string(),
+            10,
+            "x86_64".to_string(),
+        );
+        assert!(matches!(
+            RuntimeDigestAuthority::from_verified_identity(&id, "mida-antidebug-runtime-x64"),
+            Err(DigestValidationError::Placeholder)
+        ));
+        let id2 = RuntimeFileIdentity::from_verified(
+            std::path::PathBuf::from("C:/tmp/x.dll"),
+            "A".repeat(64),
+            10,
+            "x86_64".to_string(),
+        );
+        assert!(matches!(
+            RuntimeDigestAuthority::from_verified_identity(&id2, "mida-antidebug-runtime-x64"),
+            Err(DigestValidationError::NotLowercaseHex)
+        ));
+        let id3 = RuntimeFileIdentity::from_verified(
+            std::path::PathBuf::from("C:/tmp/x.dll"),
+            "a".repeat(32),
+            10,
+            "x86_64".to_string(),
+        );
+        assert!(matches!(
+            RuntimeDigestAuthority::from_verified_identity(&id3, "mida-antidebug-runtime-x64"),
+            Err(DigestValidationError::WrongLength { .. })
+        ));
     }
 }
