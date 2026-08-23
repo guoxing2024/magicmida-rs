@@ -142,8 +142,11 @@ static uint32_t mida_v2_envelope_check(EnvelopeInput in) {
             if (sva < in.expected_blob_base_va || sva >= blob_end) return 11;
             soff = sva - in.expected_blob_base_va;
             for (k = 0; k < 65; k++) {
-                if (soff + k >= in.params_bytes) return 10;
-                if (in.blob[(size_t)(soff + k)] == 0) break;
+                int ovf4 = 0;
+                uint64_t scan_off = mida_checked_add(soff, k, &ovf4);
+                if (ovf4) return 10;              /* soff+k wraps (WO-2402) */
+                if (scan_off >= in.params_bytes) return 10;
+                if (in.blob[(size_t)scan_off] == 0) break;
             }
             if (k >= 65) return 10;
         }
@@ -156,8 +159,11 @@ static uint32_t mida_v2_envelope_check(EnvelopeInput in) {
         uint64_t off = in.params->profile_id_off;
         uint64_t k;
         for (k = 0; k < 65; k++) {
-            if (off + k >= in.params_bytes) return 10;
-            if (in.blob[(size_t)(off + k)] == 0) break;
+            int ovf4 = 0;
+            uint64_t scan_off = mida_checked_add(off, k, &ovf4);
+            if (ovf4) return 10;                  /* off+k wraps (WO-2402) */
+            if (scan_off >= in.params_bytes) return 10;
+            if (in.blob[(size_t)scan_off] == 0) break;
         }
         if (k >= 65) return 10;
     }
@@ -168,8 +174,11 @@ static uint32_t mida_v2_envelope_check(EnvelopeInput in) {
         uint64_t off = in.params->profile_digest_off;
         uint64_t k;
         for (k = 0; k < 65; k++) {
-            if (off + k >= in.params_bytes) return 10;
-            if (in.blob[(size_t)(off + k)] == 0) break;
+            int ovf4 = 0;
+            uint64_t scan_off = mida_checked_add(off, k, &ovf4);
+            if (ovf4) return 10;                  /* off+k wraps (WO-2402) */
+            if (scan_off >= in.params_bytes) return 10;
+            if (in.blob[(size_t)scan_off] == 0) break;
         }
         if (k >= 65) return 10;
     }

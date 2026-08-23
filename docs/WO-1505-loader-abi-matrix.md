@@ -385,7 +385,9 @@ const _: () = {
 
 **7-arg thunk 完整 ABI（WO-2202 冻结：机器码/栈布局/shadow space/对齐/清理）**：
 ~~~text
-THUNK_CODE_7ARG（60 字节 = 0x3C；WO-2301 修订：经 ml64 + dumpbin 逐字节实测验证；
+THUNK_CODE_7ARG（60 字节 = 0x3C；WO-2401 修订：栈对齐重算；
+经 ml64 + dumpbin 逐字节实测 + 本机 ABI 回传测试（thunk7_abi_test.c /
+thunk7_rsp_test.c）验证：7 参数完整到达 + call 前 rsp ≡ 0 mod 16；
 与现有 6-arg thunk（runtime_loader.rs THUNK_CODE L481-503）风格一致：
 mov r11,rcx 用 49 89 CB、间接 call 用 call rax（FF D0）、sub/add rsp 自建帧）：
 
@@ -396,35 +398,53 @@ mov r11,rcx 用 49 89 CB、间接 call 用 call rax（FF D0）、sub/add rsp 自
 000A: 49 8B 53 10            mov rdx, [r11+16]       ; arg1 -> rdx（第 2 参）
 000E: 4D 8B 43 18            mov r8,  [r11+24]       ; arg2 -> r8（第 3 参）
 0012: 4D 8B 4B 20            mov r9,  [r11+32]       ; arg3 -> r9（第 4 参）
-0016: 48 83 EC 40            sub rsp, 0x40           ; 帧 = shadow 32 + 3 home 24 = 56（对齐 8）
+0016: 48 83 EC 38            sub rsp, 0x38           ; 帧 = shadow 32 + 3 outgoing 24 = 56
 001A: 4D 8B 53 28            mov r10, [r11+40]       ; arg4 -> r10（暂存）
-001E: 4C 89 54 24 28         mov [rsp+0x28], r10     ; arg4 home（第 5 参，栈槽 40）
+001E: 4C 89 54 24 20         mov [rsp+0x20], r10     ; arg4 outgoing（第 5 参）
 0023: 4D 8B 53 30            mov r10, [r11+48]       ; arg5 -> r10（暂存）
-0027: 4C 89 54 24 30         mov [rsp+0x30], r10     ; arg5 home（第 6 参，栈槽 48）
+0027: 4C 89 54 24 28         mov [rsp+0x28], r10     ; arg5 outgoing（第 6 参）
 002C: 4D 8B 53 38            mov r10, [r11+56]       ; arg6 -> r10（暂存）
-0030: 4C 89 54 24 38         mov [rsp+0x38], r10     ; arg6 home（第 7 参，栈槽 56）
+0030: 4C 89 54 24 30         mov [rsp+0x30], r10     ; arg6 outgoing（第 7 参）
 0035: FF D0                  call rax                ; 间接调用 fn_ptr（与 6-arg thunk 同编码）
-0037: 48 83 C4 40            add rsp, 0x40           ; 恢复栈
+0037: 48 83 C4 38            add rsp, 0x38           ; 恢复栈
 003B: C3                     ret
 
 总长 = 0x3C = 60 字节（3+3+4+4+4+4+4+4+5+4+5+4+5+2+4+1）
+
+**栈对齐推导（WO-2401，冻结）**：
+- thunk 由 caller 的 call 进入 → 入口 rsp ≡ 8 (mod 16)（8 字节返回地址）；
+- `sub rsp, 0x38`（0x38 = 56 ≡ 8 mod 16）→ call 前 rsp ≡ 8-8 ≡ 0 (mod 16) ✓
+  （Windows x64 要求：call 指令执行前 rsp ≡ 0 mod 16）；
+- `call rax` → 被调函数入口 rsp ≡ 8 (mod 16) ✓（ABI 要求）；
+- `add rsp, 0x38` → 恢复入口 rsp；`ret` 弹返回地址。
+- **旧方案 `sub rsp,0x40`（16 的倍数）错误**：入口 8 mod 16 不变，call 前仍
+  8 mod 16，被调函数入口错位（0 mod 16）——违反 ABI，已废弃。
+
+**shadow space 与 outgoing arguments 的区别（WO-2401，冻结）**：
+- **shadow space**（rsp+0x00..0x1F，32 字节）：调用方为被调函数预留的
+  home 区，被调函数可自由使用（含保存寄存器参数）；**不是参数传递区**。
+- **outgoing arguments**（rsp+0x20 起）：第 5 参数起在 call 前由调用方写入
+  的栈参数区。thunk 的第 5-7 参写 [rsp+0x20]/[rsp+0x28]/[rsp+0x30]。
+- 两者术语不可混用；"home 槽"仅指 shadow space 语义，参数槽是 outgoing。
 ~~~
 
-**Windows x64 调用约定（7 参跨寄存器/栈，WO-2301 修订冻结）**：
-- 第 1-4 参：rcx/rdx/r8/r9（寄存器）；第 5-7 参：栈 home 槽
-  [rsp+0x28]/[rsp+0x30]/[rsp+0x38]（相对 **sub rsp,0x40 之后的 rsp**）。
+**Windows x64 调用约定（7 参跨寄存器/栈，WO-2401 修订冻结）**：
+- 第 1-4 参：rcx/rdx/r8/r9（寄存器）；第 5-7 参：**outgoing arguments**
+  [rsp+0x20]/[rsp+0x28]/[rsp+0x30]（相对 **sub rsp,0x38 之后的 rsp**）。
 - **thunk 自建帧（与现有 6-arg thunk 一致）**：thunk 入口先
-  `sub rsp, 0x40`（帧 = 32 字节 shadow space + 3 个 home 槽 24 字节 + 8 字节
-  对齐冗余），call 后 `add rsp, 0x40` 恢复。**调用方不需要预分配参数槽**；
-  调用方只需按普通 call 约定提供 32 字节 shadow space（thunk 自身帧覆盖之）。
-- **shadow space**：被调函数可自由使用 rsp+0x00..0x1F（32 字节）；
-  第 5-7 参 home 槽在 shadow 之后：rsp+0x28（arg4）、rsp+0x30（arg5）、
-  rsp+0x38（arg6）；rsp+0x20 未使用（保持 8 对齐间隔）。
-- **栈对齐**：thunk 入口（来自调用方的 call）rsp ≡ 8 mod 16；`sub rsp,0x40`
-  （0x40 是 16 的倍数）后 call 前 rsp ≡ 8 mod 16 —— 被调 fn 入口
-  rsp ≡ 8 mod 16，满足 Windows x64 ABI 约定。
+  `sub rsp, 0x38`（帧 = 32 字节 shadow space + 3 个 outgoing 槽 24 字节 = 56，
+  8 mod 16 → 修正 call 前对齐），call 后 `add rsp, 0x38` 恢复。
+  **调用方不需要预分配参数槽**；调用方只需按普通 call 约定执行 call（thunk
+  自身帧覆盖 shadow + outgoing）。
+- **shadow space**：被调函数可自由使用 rsp+0x00..0x1F（32 字节），
+  **不承载参数**；outgoing 参数槽在 shadow 之后：rsp+0x20（arg4/第 5 参）、
+  rsp+0x28（arg5/第 6 参）、rsp+0x30（arg6/第 7 参）。
+- **栈对齐（WO-2401 推导）**：thunk 入口 rsp ≡ 8 mod 16（caller 压入返回地址）；
+  `sub rsp,0x38`（≡ 8 mod 16）→ **call 前 rsp ≡ 0 mod 16**（ABI 要求）；
+  `call rax` → 被调 fn 入口 rsp ≡ 8 mod 16 ✓。本机实测（thunk7_rsp_test.c）：
+  call 前 rsp mod 16 = 0。
 - **callee cleanup**：Windows x64 是 **caller-cleanup**（被调函数不弹栈）；
-  thunk 自己 add rsp,0x40 后 ret，返回调用方。
+  thunk 自己 add rsp,0x38 后 ret，返回调用方。
 - **volatile 寄存器**：rcx/rdx/r8/r9/r10/r11/rax 均可被被调函数破坏；
   thunk 在 call 前完成全部参数搬运，call 后只 add rsp + ret（不依赖任何 volatile）。
 - **fn_ptr 保存**：fn_ptr 在 [r11] 读取到 rax，随后 call rax（FF D0）；
