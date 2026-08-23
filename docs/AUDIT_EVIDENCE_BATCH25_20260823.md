@@ -823,3 +823,24 @@
 ---
 
 （WO-3106 收口交付，绑定 f3f97bd / 证据树 f3f97bd）
+
+
+---
+
+# 最终 HEAD 证据登记（b496b29）
+
+**审计运行日期**：2026-08-23（worker 机器，14:28）
+**最终 HEAD**：`b496b2973359ec19b6280af2cf0cd6961a48f68a`（`b496b29`）
+**说明**：f3f97bd..b496b29 仅追加本证据登记章节（1 commit、1 path、+58/-0），
+不改变任何事实结论；证据树 = f3f97bd（此前章节），最终 HEAD = b496b29。
+
+| 文件 | 大小 | SHA-256 | 命令 | 退出码 |
+|------|------|---------|------|--------|
+| D:\Temp\evidence_head_final.txt | 42B | 3813A21D0D902BC8D8DCBB2112756CC5C880775384CF638B21F37851281B3FF8 | git rev-parse HEAD | 0 |
+| D:\Temp\evidence_range_final.txt | 60B | 342999968ED709ED0C487A6C7517EE43B1966FA7ACB43561191B9CA545DBB737 | git log f3f97bd..b496b29 | 0 |
+| D:\Temp\evidence_stat_final.txt | 46B | 5F5B6BC9E2CB3A070F032FC4F807833E2CF412DAC578AF53C08006747FE24B38 | git diff --numstat f3f97bd..b496b29 | 0 |
+| D:\Temp\evidence_diffcheck_final.txt | 0B | E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855 | git diff --check f3f97bd..b496b29 | 0 |
+| D:\Temp\evidence_worktree_final.txt | 0B | E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855 | git diff --check b496b29（工作树） | 0 |
+
+**Batch 31 最终交付链**：`ea1ca8d`（主交付）→ `8a302a1`（post-commit 补充）→ `f3f97bd`（WO-3106 一致性收口）→ `b496b29`（最终证据登记）。
+**最终 HEAD = `b496b29`**；证据树 = `f3f97bd`；workspace test 执行树 = `9d7010e`（carry-forward）。
