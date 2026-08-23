@@ -1,6 +1,6 @@
 # WO-2601 交付 — thunk7 probe runtime layout + exact-byte closure
 
-**审计基线**：`9589fd13f8e45e7612b212335bcae4c0b1ede23e`（`9589fd1`，Batch 29 最终 HEAD；历史绑定链：639eee3（原始交付）→ 928047f（WO-2701）→ dea085b（WO-2802）→ 9589fd1（WO-2902））
+**审计基线**：`ecd77aee1990f23f3044f293afe7446464ac2deb`（`ecd77ae`，Batch 30 最终 HEAD；历史绑定链：639eee3（原始交付）→ 928047f（WO-2701）→ dea085b（WO-2802）→ 9589fd1（WO-2902）→ ecd77ae（WO-3001））
 **性质**：local x64 runtime + design fixture；不实现生产 thunk；不运行远程
 
 ## 1. 修复的缺陷（Batch 25 审计）
@@ -139,4 +139,4 @@ EXIT=0
 - 未修改 crates/ 生产代码。
 
 ---
-（WO-2601 原始交付绑定 639eee3；WO-2701 提取公式修正绑定 928047f；WO-2802 文字修正绑定 dea085b；WO-2902 元数据收口绑定 9589fd1 —— 历史绑定链保留，当前树绑定 9589fd1）
+（WO-2601 原始交付绑定 639eee3；WO-2701 提取公式修正绑定 928047f；WO-2802 文字修正绑定 dea085b；WO-2902 元数据收口绑定 9589fd1；WO-3001 最终头重绑定 ecd77ae —— 历史绑定链保留，当前树绑定 ecd77ae）
