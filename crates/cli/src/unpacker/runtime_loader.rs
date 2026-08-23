@@ -2525,14 +2525,25 @@ impl V2ParamsBlob {
         let dig_off = out.len() as u64;
         out.extend_from_slice(digest.as_bytes());
         out.push(0);
-        // patch offsets (self-relative: absolute offset in the blob)
-        let patch = |out: &mut Vec<u8>, off: usize, val: u64| {
-            out[off..off + 8].copy_from_slice(&val.to_le_bytes());
+        // patch offsets (self-relative: absolute offset in the blob).
+        // RC-5: header slots are fixed constants but still use checked
+        // arithmetic for uniformity (no bare + 8 anywhere in this path).
+        let patch = |out: &mut Vec<u8>, off: usize, val: u64| -> Result<(), RuntimeLoadError> {
+            let end = off.checked_add(8).ok_or_else(|| {
+                RuntimeLoadError::ExportResolutionFailed("v2 header patch overflow".to_string())
+            })?;
+            if end > out.len() {
+                return Err(RuntimeLoadError::ExportResolutionFailed(
+                    "v2 header patch out of bounds".to_string(),
+                ));
+            }
+            out[off..end].copy_from_slice(&val.to_le_bytes());
+            Ok(())
         };
-        patch(&mut out, 0x10, pid_off);
-        patch(&mut out, 0x18, pd_off);
-        patch(&mut out, 0x28, surf_arr_off);
-        patch(&mut out, 0x38, dig_off);
+        patch(&mut out, 0x10, pid_off)?;
+        patch(&mut out, 0x18, pd_off)?;
+        patch(&mut out, 0x28, surf_arr_off)?;
+        patch(&mut out, 0x38, dig_off)?;
         Ok(Self { bytes: out })
     }
 
@@ -2562,7 +2573,11 @@ impl V2ParamsBlob {
                 "v2 blob_base invalid: {blob_base:#x}"
             )));
         }
-        let len = self.bytes.len() as u64;
+        let len = u64::try_from(self.bytes.len()).map_err(|_| {
+            RuntimeLoadError::ExportResolutionFailed(
+                "v2 blob length exceeds u64".to_string(),
+            )
+        })?;
         // RC-4 item 4: blob_base + params_bytes checked.
         let blob_end = blob_base.checked_add(len).ok_or_else(|| {
             RuntimeLoadError::ExportResolutionFailed(format!(
@@ -2624,26 +2639,28 @@ impl V2ParamsBlob {
         scan_nul_rel(&self.bytes, dig_off, len, "digest")?;
 
         // digest region: 64 LOWERCASE hex chars + NUL = 65 bytes.
-        let dig_region_end = dig_off
-            .checked_add(V2_DIGEST_REGION_BYTES)
-            .ok_or(RuntimeLoadError::ExportResolutionFailed(
-                "v2 digest region overflow".to_string(),
-            ))?;
+        // RC-5: every end is computed with checked_range_end; no raw + 64.
+        let dig_hex_end = checked_range_end(dig_off, V2_DIGEST_LEN, "digest hex")?;
+        let dig_region_end = checked_range_end(dig_off, V2_DIGEST_REGION_BYTES, "digest region")?;
         if dig_region_end > len {
             return Err(RuntimeLoadError::ExportResolutionFailed(
                 "v2 digest region truncated".to_string(),
             ));
         }
-        for i in dig_off..dig_off + 64 {
-            let c = self.bytes[i as usize];
+        // RC-5: explicit checked u64 -> usize conversions before slicing.
+        let dig_hex_start_us = u64_to_usize(dig_off, "digest start")?;
+        let dig_hex_end_us = u64_to_usize(dig_hex_end, "digest hex end")?;
+        for (i, &c) in self.bytes[dig_hex_start_us..dig_hex_end_us].iter().enumerate() {
             let is_lower_hex = c.is_ascii_digit() || (c.is_ascii_lowercase() && c <= b'f');
             if !is_lower_hex {
-                return Err(RuntimeLoadError::ExportResolutionFailed(
-                    "v2 digest must be lowercase hex (0-9a-f); uppercase rejected".to_string(),
-                ));
+                return Err(RuntimeLoadError::ExportResolutionFailed(format!(
+                    "v2 digest must be lowercase hex (0-9a-f) at {i}; uppercase rejected"
+                )));
             }
         }
-        if self.bytes[(dig_off + 64) as usize] != 0 {
+        // NUL terminator at dig_hex_end (== dig_off + 64, computed checked).
+        let dig_nul_us = u64_to_usize(dig_hex_end, "digest NUL")?;
+        if self.bytes[dig_nul_us] != 0 {
             return Err(RuntimeLoadError::ExportResolutionFailed(
                 "v2 digest region NUL missing".to_string(),
             ));
@@ -2656,11 +2673,7 @@ impl V2ParamsBlob {
                 "v2 expected_hooks*8 overflow".to_string(),
             ))?;
         if expected_hooks > 0 {
-            let array_end = surf_off
-                .checked_add(array_bytes)
-                .ok_or(RuntimeLoadError::ExportResolutionFailed(
-                    "v2 surfaces array end overflow".to_string(),
-                ))?;
+            let array_end = checked_range_end(surf_off, array_bytes, "surfaces array")?;
             if array_end != dig_off {
                 let actual = dig_off.checked_sub(surf_off).unwrap_or(u64::MAX);
                 return Err(RuntimeLoadError::ExportResolutionFailed(format!(
@@ -2683,13 +2696,18 @@ impl V2ParamsBlob {
                     .ok_or(RuntimeLoadError::ExportResolutionFailed(
                         "v2 entry offset overflow".to_string(),
                     ))?;
-                if entry_off + 8 > len {
+                // RC-5: entry end via checked_range_end, then explicit
+                // u64 -> usize conversions; no raw + 8 / as usize.
+                let entry_end = checked_range_end(entry_off, 8, "surface entry")?;
+                if entry_end > len {
                     return Err(RuntimeLoadError::ExportResolutionFailed(
                         "v2 surface entry read past blob end".to_string(),
                     ));
                 }
+                let entry_start_us = u64_to_usize(entry_off, "surface entry start")?;
+                let entry_end_us = u64_to_usize(entry_end, "surface entry end")?;
                 let entry = u64::from_le_bytes(
-                    self.bytes[entry_off as usize..entry_off as usize + 8]
+                    self.bytes[entry_start_us..entry_end_us]
                         .try_into()
                         .unwrap(),
                 );
@@ -2738,7 +2756,8 @@ impl V2ParamsBlob {
 fn scan_nul_rel(bytes: &[u8], off: u64, len: u64, name: &str) -> Result<u64, RuntimeLoadError> {
     let mut i = off;
     while i < len {
-        if bytes[i as usize] == 0 {
+        let i_us = u64_to_usize(i, "NUL scan index")?;
+        if bytes[i_us] == 0 {
             return Ok(i);
         }
         i = i
@@ -2750,6 +2769,20 @@ fn scan_nul_rel(bytes: &[u8], off: u64, len: u64, name: &str) -> Result<u64, Run
     Err(RuntimeLoadError::ExportResolutionFailed(format!(
         "v2 {name} string unterminated"
     )))
+}
+
+/// Checked off + k (RC-5: all offset arithmetic fail-closed, no wrap).
+fn checked_range_end(off: u64, k: u64, what: &str) -> Result<u64, RuntimeLoadError> {
+    off.checked_add(k).ok_or_else(|| {
+        RuntimeLoadError::ExportResolutionFailed(format!("v2 {what} range end overflow"))
+    })
+}
+
+/// Explicit checked u64 -> usize (RC-5: no silent narrowing anywhere).
+fn u64_to_usize(v: u64, what: &str) -> Result<usize, RuntimeLoadError> {
+    usize::try_from(v).map_err(|_| {
+        RuntimeLoadError::ExportResolutionFailed(format!("v2 {what} exceeds usize"))
+    })
 }
 
 /// Parsed v2 offsets (controller-side view).
@@ -3142,5 +3175,95 @@ mod imp03_inert_adapter_tests {
         blob.bytes[surf_off as usize..surf_off as usize + 8]
             .copy_from_slice(&below.to_le_bytes());
         assert!(blob.parse_offsets(BLOB_BASE).is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // RC-5: checked helper / overflow branch unit tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn v2_checked_range_end_ok() {
+        assert_eq!(checked_range_end(0x48, 65, "digest region").unwrap(), 0x48 + 65);
+        assert_eq!(checked_range_end(0x100, 0, "zero").unwrap(), 0x100);
+    }
+
+    #[test]
+    fn v2_checked_range_end_overflow_fails_closed() {
+        // u64::MAX + 1 must fail (no wrap).
+        assert!(checked_range_end(u64::MAX, 1, "wrap").is_err());
+        assert!(checked_range_end(u64::MAX, 8, "entry").is_err());
+        assert!(checked_range_end(u64::MAX - 1, 2, "tail").is_err());
+        // u64::MAX + 0 is fine (no overflow).
+        assert_eq!(checked_range_end(u64::MAX, 0, "zero").unwrap(), u64::MAX);
+    }
+
+    #[test]
+    fn v2_u64_to_usize_ok() {
+        assert_eq!(u64_to_usize(0, "zero").unwrap(), 0usize);
+        assert_eq!(u64_to_usize(0x48, "header").unwrap(), 0x48usize);
+    }
+
+    #[test]
+    fn v2_u64_to_usize_overflow_fails_closed() {
+        // On 32-bit targets a value above usize::MAX fails; on 64-bit the
+        // conversion always succeeds, but the helper must never panic.
+        let r = u64_to_usize(u64::MAX, "max");
+        if usize::BITS < 64 {
+            assert!(r.is_err());
+        } else {
+            assert_eq!(r.unwrap(), usize::MAX);
+        }
+    }
+
+    #[test]
+    fn v2_parse_offsets_rejects_digest_region_overflow_on_wire() {
+        // digest_off = u64::MAX - 10: checked_range_end fails before any read.
+        let mut blob = build_blob(&["AD-PROC-001"]);
+        blob.bytes[0x38..0x40].copy_from_slice(&(u64::MAX - 10).to_le_bytes());
+        assert!(blob.parse_offsets(BLOB_BASE).is_err());
+    }
+
+    #[test]
+    fn v2_parse_offsets_rejects_surfaces_end_overflow_on_wire() {
+        // surf_off = u64::MAX - 10 with expected_hooks=1: array_end overflows.
+        let mut blob = build_blob(&["AD-PROC-001"]);
+        blob.bytes[0x28..0x30].copy_from_slice(&(u64::MAX - 10).to_le_bytes());
+        assert!(blob.parse_offsets(BLOB_BASE).is_err());
+    }
+
+    #[test]
+    fn v2_parse_offsets_rejects_entry_offset_overflow_on_wire() {
+        // surf_off = u64::MAX - 10, expected_hooks=2: second entry offset
+        // (surf_off + 8) overflows and must fail-closed.
+        let mut blob = build_blob(&["AD-PROC-001", "AD-PROC-002"]);
+        blob.bytes[0x20..0x28].copy_from_slice(&2u64.to_le_bytes());
+        blob.bytes[0x28..0x30].copy_from_slice(&(u64::MAX - 10).to_le_bytes());
+        assert!(blob.parse_offsets(BLOB_BASE).is_err());
+    }
+
+    #[test]
+    fn v2_build_patch_closure_is_checked() {
+        // The patch helper rejects out-of-range writes.
+        let mut out = vec![0u8; 0x48];
+        let patch = |out: &mut Vec<u8>, off: usize, val: u64| -> Result<(), RuntimeLoadError> {
+            let end = off.checked_add(8).ok_or_else(|| {
+                RuntimeLoadError::ExportResolutionFailed("v2 header patch overflow".to_string())
+            })?;
+            if end > out.len() {
+                return Err(RuntimeLoadError::ExportResolutionFailed(
+                    "v2 header patch out of bounds".to_string(),
+                ));
+            }
+            out[off..end].copy_from_slice(&val.to_le_bytes());
+            Ok(())
+        };
+        // valid patch
+        assert!(patch(&mut out, 0x10, 0x48).is_ok());
+        assert_eq!(&out[0x10..0x18], &0x48u64.to_le_bytes());
+        // OOB patch fails (0x48 + 8 exceeds the 0x48-byte buffer)
+        assert!(patch(&mut out, 0x48, 1).is_err());
+        assert!(patch(&mut out, 0x41, 1).is_err());
+        // overflow patch fails (off + 8 wraps)
+        assert!(patch(&mut out, usize::MAX - 1, 1).is_err());
     }
 }
