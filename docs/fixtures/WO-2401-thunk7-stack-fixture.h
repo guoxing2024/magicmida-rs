@@ -66,4 +66,12 @@ _Static_assert(THUNK7_OUT_ARG6_OFF + 8u <= THUNK7_FRAME_SIZE, "slots in frame");
 
 _Static_assert(THUNK7_BLOB_ARG6_OFF + 8u == 0x40u, "blob slot end");
 
+
+/* ---- rsp-probe opcode (WO-2501 verification note) ----
+ * To observe call-pre-rsp in a runtime harness, the thunk must write rsp
+ * with the verified encoding:
+ *   49 89 63 48   =  mov qword ptr [r11+48h], rsp
+ * The previously used 4D 89 63 48 is mov [r11+48h], r12 (REX.R=1) and
+ * must NOT be used. See WO-2501-thunk7-runtime-contract.h.
+ */
 #endif /* WO2401_THUNK7_STACK_FIXTURE_H */

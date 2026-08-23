@@ -1,0 +1,71 @@
+# AUDIT — Evidence 最终 HEAD 重绑定（Batch 25 / WO-2503）
+
+**审计运行日期**：2026-08-23
+**绑定 HEAD**：`62ed608`（Batch 24 最终树）
+**前版**：evidence_*_2403.txt 绑定 `221ef33`（Batch 23 树，WO-2403）；现按 WO-2503 重生成
+**性质**：只读证据审计；不修改生产代码；不宣称 commander PASS
+
+## 1. 绑定说明（多棵树证据分层）
+
+- **Batch 23 code tree evidence = 221ef33**：`evidence_*_2403.txt`（WO-2403 交付）。
+- **Batch 24 code tree evidence = 62ed608**：本文件证据（`evidence_*_2503.txt`），
+  并登记 a664f92/62ed608 两个提交的 diffcheck。
+- 生产代码（crates/）自 221ef33 起**零修改**；Batch 24 的 7 个 unique paths 全部为
+  docs/ 或 docs/fixtures/。
+
+## 2. Batch 24 统计更正（WO-2503 要求）
+
+- 交付报告曾写 `+416/-65`；**git 实测为 `+415/-64`**（git diff --stat 221ef33..62ed608，
+  原始命令输出：7 files changed, 415 insertions(+), 64 deletions(-)）。
+- 更正：Batch 24 = **2 commits、7 unique paths、+415/-64**。
+
+## 3. 证据文件清单（绑定 62ed608）
+
+| 文件 | 大小 | SHA-256 | 命令 | 退出码 |
+|------|------|---------|------|--------|
+| D:\Temp\evidence_head_2503.txt | 113B | F9E89F5C14F1B15012BAB3E5D4EF8E074BAF925F1C0A8F27B1142D41D74648D1 | git rev-parse HEAD | 0 |
+| D:\Temp\evidence_test_2503.txt | 9307B | 43BAEB1539B383E616341008FD9906DAF2A5D8B93762253FB3FB322416D74C33 | cargo test -p mida-antidebug-runtime --offline | 0 |
+| D:\Temp\evidence_check_2503.txt | 394B | F24683A72E72103E29051DA64E37BBBFBC172D71976307918957BE0EEA88D93B | cargo check -p mida-antidebug-runtime --offline | 0 |
+| D:\Temp\evidence_check_pkg_2503.txt | 2836B | C76E79B3BD27252FF8FD2888910B2AAC2BE37A7193872D5A5B4E850027A11804 | cargo check -p mida-cli --offline | 0 |
+| D:\Temp\evidence_diffcheck_2503.txt | 8B | CC258D839E50D5E0CF220528399D5C29A6BCC5C3A9EE2616A915627E0363D91D | git diff --check 221ef33..62ed608 | 0 |
+| D:\Temp\evidence_worktree_2503.txt | 8B | CC258D839E50D5E0CF220528399D5C29A6BCC5C3A9EE2616A915627E0363D91D | git diff --check 62ed608（工作树） | 0 |
+
+**生成时间**：2026-08-23（worker 机器）。
+
+## 4. Batch 25 本机/离线测试证据（D:\Temp）
+
+| 文件 | SHA-256 | 说明 |
+|------|---------|------|
+| thunk7_v2_test.c | F77DFDD63E5B4481F42B85D95C157B7ECAA6B2792C917F77A2BCD08E780E8358 | 组合测试 C 驱动 |
+| thunk7_v2.asm | 9F950B6CF9E4A47E3FEFFA6B3B2099FEF9B8CD2074536F912E5C7FBB8A9ED349 | thunk+entry-stub 汇编 |
+| thunk7_v2_stdout.txt | DC6D1485BB0E86FE722126A5A3DDB4469702D02B07A9FF7B46284532754475AD | THUNK7 COMBINED PASS EXIT=0 |
+| thunk7_v2.obj | C0B2E32A40C086EF46F1EDB16DC5FC8CF27E4782EE354803347D2AAFBEDBB0D4 | ml64 产物 |
+| hostile_asan_detail.txt | 7AFE1FA521B5155D8E832B8004CA175035E1D9EE7930ACFCA52A3DE0E6EC4AC4 | ASan 16/16 逐用例 EXIT=0 |
+
+**更正说明**：Batch 24 的 thunk7_abi_stdout.txt（ABI ROUND-TRIP FAIL）与
+thunk7_rsp_stdout.txt（错误 opcode 4D 89 63 48）**作废**，本批以 thunk7_v2 系列为准
+（entry 对齐由 asm stub 入口首指令记录，opcode 49 89 63 48 经 ml64 反汇编确认）。
+
+## 5. 分层登记
+
+| 层 | 状态 |
+|----|------|
+| worker stdout（cargo test/check/diffcheck） | 本文件证据（可复核 hash） |
+| 本机 thunk ABI 验证 | thunk7_v2 系列（LOCAL，非远程） |
+| ASan hostile | hostile_asan_detail.txt（逐用例） |
+| commander independent verification | **BLOCKED**（总指挥机 rustup shim 阻断；不升级 PASS） |
+| Windows/live evidence | **absent**（LIVE-4 NOT AUTHORIZED） |
+
+## 6. 验收门自检
+
+| 门 | 结果 |
+|----|------|
+| manifest 绑定 62ed608 | ✅ head 证据 = 62ed608 |
+| a664f92/62ed608 两提交 diffcheck 登记 | ✅ evidence_diffcheck_2503.txt |
+| 7 unique paths / +415/-64 口径 | ✅ git 实测并更正 |
+| 旧树证据保留并标注 | ✅ evidence_*_2403.txt（221ef33）保留；作废文件已标注 |
+| 时间/退出码/哈希可复核 | ✅ 上表完整 |
+| 不宣称 commander PASS | ✅ BLOCKED 保持 |
+
+---
+（WO-2503 交付，绑定 62ed608）
