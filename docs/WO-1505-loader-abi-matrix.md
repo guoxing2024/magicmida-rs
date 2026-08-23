@@ -467,7 +467,8 @@ mov r11,rcx 用 49 89 CB、间接 call 用 call rax（FF D0）、sub/add rsp 自
 
 - THUNK_CODE_7ARG 与 ThunkArgs7 均为**实现工单新增**；现有 6 参 thunk（THUNK_CODE/
   ThunkArgs 64B）**不改**。
-- 寄存器搬运顺序冻结（先 rcx/rdx/r8/r9，再栈槽 40/48/56），避免 r11 被覆盖；
+- 寄存器搬运顺序冻结（先 rcx/rdx/r8/r9，再 outgoing 栈槽 0x20/0x28/0x30 = 32/40/48），
+  避免 r11 被覆盖；
   fn_ptr 保存在 r11（thunk 内不调用其它函数，r11 不会被破坏）。
 - 入口断言：CreateRemoteThread start == module_base + MidaAntidebugInitializeV2 RVA
   （allowlist，§4.2）。

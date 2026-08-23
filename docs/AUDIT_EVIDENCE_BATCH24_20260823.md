@@ -48,6 +48,15 @@
 | thunk7_final_stdout.txt | 34629AAE017FD563F3ABF7B20A05C76B7BEC8F0796D8F8569A211E38944BCE71 | THUNK7 FINAL PASS EXIT=0 |
 | thunk7_final_full.obj | BE1042DA3AA6947F539503E6655B90126E57292F1B7F3D97359DE6070C171A20 | ml64 产物（49 89 CB 逐指令确认） |
 
+
+**obj 原始字节验证（自检追加）**：从 thunk7_final_full.obj 的 .text$mn section
+（COFF rawptr=140, rawsize=127）直接提取前 60 字节：
+`49 89 CB 49 8B 03 49 8B 4B 08 49 8B 53 10 4D 8B 43 18 4D 8B 4B 20`
+`48 83 EC 38 4D 8B 53 28 4C 89 54 24 20 4D 8B 53 30 4C 89 54 24 28`
+`4D 8B 53 38 4C 89 54 24 30 49 89 63 48 FF D0 48 ...`
+= WO-2301 fixture THUNK7_CODE（60B）+ probe（49 89 63 48 @0x35）扩展，
+**fixture 字节表 = obj 实际字节 = 测试执行字节，三者完全一致**。
+
 **自检修正（Batch 25 追加）**：thunk7_v2 系列使用 ml64 自由编码（4C 8B D9）而非 fixture
 冻结的 49 89 CB——虽语义等价但违反"机器码与文字一致"原则；本批以 thunk7_final 系列
 （fixture-exact 字节）为唯一验证来源。
