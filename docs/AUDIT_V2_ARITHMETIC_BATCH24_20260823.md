@@ -65,3 +65,18 @@ NUL 边界（2/9/15）、strict extension（7）。
 
 ---
 （WO-2502 交付，绑定 62ed608）
+## 6. off+k 回绕可达性分析（WO-2502 追加自检）
+
+checked-add 回绕分支（ovf4 → return 10）在"读取必须先通过边界检查"的约束下：
+
+| 场景 | 路径 |
+|------|------|
+| off >= params_bytes（含 off=UINT64_MAX，用例 14） | 循环前提前拒收 5，不进入循环 |
+| off < params_bytes 且 params_bytes 为真实分配大小（<< UINT64_MAX） | off+k 最大 ≈ params_bytes-1+64，**不会回绕** |
+| params_bytes 本身接近 UINT64_MAX 且 off 也接近 | blob 读取必然越界（ASan 抓）→ checked-add 回绕拦截**先于**读取 = 正确的纵深防御顺序 |
+
+**结论**：回绕分支是防御性编程（defense-in-depth），在合法输入下不可达但必须存在；
+checked-add 保证"即使边界检查被绕过/推理错误，也绝不在回绕值上继续读"。
+用例 14 验证了提前拒收路径；回绕路径本身由代码审查保证（mida_checked_add 在
+任何 blob 读取前执行）。不添加"构造 params_bytes≈UINT64_MAX 的越界读取"测试——
+那会人为制造 ASan 越界而非验证拒收。

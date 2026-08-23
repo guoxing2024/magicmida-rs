@@ -93,6 +93,13 @@ _Static_assert(offsetof(ThunkArgs7, reserved) == 0x40, "reserved");
  *   blob arg6 (+0x38) -> [rsp+0x30] (7th param)
  * These are OUTGOING ARGUMENTS (caller-allocated area), distinct from the
  * callee-visible shadow space [rsp+0x00..0x1F].
+ *
+ * NOTE: THUNK7_CODE above is the PRODUCTION 60-byte thunk (no instrumentation).
+ * The rsp probe (49 89 63 48, +5 bytes at offset 0x35 before call rax) is a
+ * TEST-ONLY extension used by the local ABI harness (thunk7_final_full.asm);
+ * it MUST NOT be compiled into the production thunk. The probe extends
+ * ThunkArgs7 by one slot (+0x48 rsp_probe, size 0x50) - see
+ * WO-2501-thunk7-runtime-contract.h.
  */
 
 #endif /* WO2301_THUNK7_FIXTURE_H */
