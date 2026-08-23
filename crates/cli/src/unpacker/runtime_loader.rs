@@ -273,6 +273,158 @@ pub struct RuntimeFileIdentity {
     pub size_bytes: u64,
     pub architecture: String,
 }
+/// Canonical runtime digest length: exactly 64 lowercase hex characters.
+///
+/// The frozen wire layout (WO-1505 §5.3e) stores the digest as a 64-hex
+/// region plus a SEPARATE 65th NUL terminator. `digest_value` itself NEVER
+/// carries the NUL: it is exactly 64 hex chars and nothing else.
+pub const DIGEST_HEX_LEN: usize = 64;
+
+/// The placeholder digest value that blocks production digest authority
+/// (mirrors `crates/acceptance/src/implementation_gate.rs::PLACEHOLDER_DIGEST`;
+/// duplicated here so mida-cli production code does not depend on
+/// mida-acceptance — the acceptance boundary is one-way).
+///
+/// The runtime attestation still writes this placeholder at
+/// `crates/antidebug-runtime/src/exports.rs:239` ("adr4-foundation-unbound").
+/// It is NOT a valid digest authority and MUST NOT be wrapped into a
+/// "verified" state: IMP-06-R1 only adds the fail-closed rejection path; the
+/// placeholder itself is replaced by a later implementation order (V2 digest
+/// ingress + runtime echo + controller echo verification).
+pub const PLACEHOLDER_RUNTIME_DIGEST: &str = "adr4-foundation-unbound";
+
+/// Digest validation errors (all fail-closed, never a warning).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DigestValidationError {
+    #[error("digest is empty or missing")]
+    Missing,
+    #[error("digest length must be {DIGEST_HEX_LEN} hex chars, got {got}")]
+    WrongLength { got: usize },
+    #[error("digest must be lowercase hex (0-9a-f only); uppercase or non-hex rejected")]
+    NotLowercaseHex,
+    #[error("digest is the placeholder value '{PLACEHOLDER_RUNTIME_DIGEST}' which is not a valid authority")]
+    Placeholder,
+    #[error("digest contains trailing data or a NUL terminator; the value must be exactly {DIGEST_HEX_LEN} hex chars")]
+    TrailingData,
+    #[error("runtime echo mismatch: expected {expected}, got {got}")]
+    EchoMismatch { expected: String, got: String },
+}
+
+/// True when `value` is exactly 64 lowercase hex characters and is not the
+/// placeholder. Used as the single lexical gate for every digest accepted as
+/// an authority or compared against a runtime echo.
+pub fn is_valid_digest_hex(value: &str) -> bool {
+    value.len() == DIGEST_HEX_LEN
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b.is_ascii_lowercase() && b <= b'f'))
+        && value != PLACEHOLDER_RUNTIME_DIGEST
+}
+
+/// Validate a digest string with a structured, fail-closed error.
+pub fn validate_digest_hex(value: &str) -> Result<(), DigestValidationError> {
+    if value.is_empty() {
+        return Err(DigestValidationError::Missing);
+    }
+    if value == PLACEHOLDER_RUNTIME_DIGEST {
+        return Err(DigestValidationError::Placeholder);
+    }
+    if value.len() != DIGEST_HEX_LEN {
+        return Err(DigestValidationError::WrongLength { got: value.len() });
+    }
+    // A NUL inside a Rust &str is a valid UTF-8 character; a wire digest that
+    // carried its 65th NUL terminator would surface here as a NUL byte. Reject
+    // it EXPLICITLY as trailing data BEFORE the hex gate so the intent is
+    // unambiguous (a NUL is not a hex char, but "trailing NUL" is the wire
+    // case we must name).
+    if value.as_bytes().contains(&0) {
+        return Err(DigestValidationError::TrailingData);
+    }
+    if !value
+        .bytes()
+        .all(|b| b.is_ascii_digit() || (b.is_ascii_lowercase() && b <= b'f'))
+    {
+        return Err(DigestValidationError::NotLowercaseHex);
+    }
+    Ok(())
+}
+
+/// The production runtime digest authority (IMP-06-R1).
+///
+/// This is the ONLY object that carries the verified runtime file digest for
+/// controller-side use. It is constructed exclusively from a
+/// [`RuntimeFileIdentity`] that [`RuntimeAuthorityManifest::verify_file`] has
+/// already computed and verified — it NEVER re-reads the runtime DLL and NEVER
+/// recomputes SHA-256 (no second hash authority path).
+///
+/// - `digest_value`   : sha256 hex produced by `verify_file()` (exactly 64
+///                      lowercase hex chars; the 65th wire NUL is not part of
+///                      it).
+/// - `size_bytes`     : verified file size.
+/// - `canonical_path` : canonicalized runtime DLL path from `verify_file()`.
+/// - `manifest_artifact_id` / `architecture` : manifest-bound identity.
+///
+/// # Fail-closed rules
+/// - Construction from a placeholder or any invalid digest FAILS CLOSED:
+///   the placeholder can never be wrapped into a "verified" authority.
+/// - `verify_runtime_echo` is the comparison API for a future V2 runtime
+///   echo; **it is NOT yet wired to any runtime call** (the runtime has no
+///   V2 export today — `runtime echo consumer = NOT WIRED`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeDigestAuthority {
+    /// Verified runtime file digest (64 lowercase hex, no NUL).
+    pub digest_value: String,
+    /// Verified runtime file size in bytes.
+    pub size_bytes: u64,
+    /// Canonical path of the verified runtime DLL.
+    pub canonical_path: PathBuf,
+    /// Manifest artifact id the runtime was bound to.
+    pub manifest_artifact_id: String,
+    /// Verified architecture ("x86_64").
+    pub architecture: String,
+}
+
+impl RuntimeDigestAuthority {
+    /// Build the production digest authority from an ALREADY-VERIFIED file
+    /// identity (the digest was computed by `verify_file()`). Fail-closed on
+    /// any invalid digest; the placeholder is always rejected.
+    pub fn from_verified_identity(
+        identity: &RuntimeFileIdentity,
+        manifest_artifact_id: &str,
+    ) -> Result<Self, DigestValidationError> {
+        validate_digest_hex(&identity.sha256)?;
+        Ok(Self {
+            digest_value: identity.sha256.clone(),
+            size_bytes: identity.size_bytes,
+            canonical_path: identity.path.clone(),
+            manifest_artifact_id: manifest_artifact_id.to_string(),
+            architecture: identity.architecture.clone(),
+        })
+    }
+
+    /// Compare a runtime-returned digest against this authority
+    /// (IMP-06-R1 §3). Every failure is fail-closed with a structured error.
+    ///
+    /// Coverage: wrong length, uppercase hex, non-hex, NUL/trailing data,
+    /// placeholder, empty/missing, and plain authority-vs-echo mismatch.
+    ///
+    /// # Wiring status
+    /// This is the comparison seam for the future V2 runtime echo
+    /// (`out_runtime_sha256` + `attestation.runtime_sha256`). **There is no
+    /// production caller today**: the runtime has no V2 export, so no echo is
+    /// ever read. `runtime echo consumer = NOT WIRED` until the IMP-08/V2
+    /// implementation order lands.
+    pub fn verify_runtime_echo(&self, runtime_returned: &str) -> Result<(), DigestValidationError> {
+        validate_digest_hex(runtime_returned)?;
+        if runtime_returned != self.digest_value {
+            return Err(DigestValidationError::EchoMismatch {
+                expected: self.digest_value.clone(),
+                got: runtime_returned.to_string(),
+            });
+        }
+        Ok(())
+    }
+}
 
 /// Loader identity (for evidence).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -418,6 +570,10 @@ pub enum RuntimeLoadError {
     ProfileDigestMismatch { expected: String, got: String },
     #[error("cleanup failed: {0}")]
     CleanupFailed(String),
+    #[error("digest authority invalid: {0}")]
+    DigestAuthorityInvalid(#[from] DigestValidationError),
+    #[error("runtime digest echo mismatch: {0}")]
+    DigestEchoMismatch(String),
 }
 
 /// SHA-256 hex helper (sha2 is already a cli dependency).
@@ -546,6 +702,9 @@ pub struct LoadedRuntime {
     pub exports: MidaExports,
     pub attestation_json: String,
     pub file_identity: RuntimeFileIdentity,
+    /// Production digest authority derived from the verified file identity
+    /// (IMP-06-R1). Never a placeholder; fail-closed at construction.
+    pub digest_authority: RuntimeDigestAuthority,
 }
 
 impl RuntimeLoader {
@@ -1254,6 +1413,13 @@ impl RuntimeLoader {
             });
         }
 
+        // IMP-06-R1: the digest authority is derived from the SAME identity
+        // produced by verify_file() — the single runtime file hash point. The
+        // digest is never recomputed and the placeholder is rejected here.
+        let digest_authority = RuntimeDigestAuthority::from_verified_identity(
+            &identity,
+            &self.authority.artifact_id,
+        )?;
         Ok(LoadedRuntime {
             module_base,
             remote_path,
@@ -1261,6 +1427,7 @@ impl RuntimeLoader {
             exports,
             attestation_json: att,
             file_identity: identity,
+            digest_authority,
         })
     }
 }
@@ -2002,6 +2169,7 @@ pub fn run_runtime_loader(
         module_base: loaded.module_base as u64,
         attestation_json: loaded.attestation_json,
         file_identity: loaded.file_identity,
+        digest_authority: loaded.digest_authority,
         target_pid,
     })
 }

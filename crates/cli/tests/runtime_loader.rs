@@ -6,7 +6,7 @@
 
 use mida_cli::unpacker::runtime_loader::{
     build_init_params_bytes, verify_pe_x64, verify_runtime_provenance, RuntimeAuthorityManifest,
-    RuntimeFileIdentity, RuntimeLoadError, ThunkArgs, THUNK_CODE,
+    RuntimeDigestAuthority, RuntimeFileIdentity, RuntimeLoadError, ThunkArgs, THUNK_CODE,
 };
 
 // ----------------------------------------------------------------
@@ -370,6 +370,13 @@ fn fake_loader_result() -> LoaderResult {
             path: std::path::PathBuf::from("C:/tmp/r.dll"),
             sha256: "ab".repeat(32),
             size_bytes: 10,
+            architecture: "x86_64".to_string(),
+        },
+        digest_authority: RuntimeDigestAuthority {
+            digest_value: "ab".repeat(32),
+            size_bytes: 10,
+            canonical_path: std::path::PathBuf::from("C:/tmp/r.dll"),
+            manifest_artifact_id: "mida-antidebug-runtime-x64".to_string(),
             architecture: "x86_64".to_string(),
         },
         target_pid: 1234,

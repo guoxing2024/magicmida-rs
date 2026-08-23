@@ -56,7 +56,9 @@ use mida_antidebug::profile::Profile;
 use mida_antidebug::state::{transition, ControllerEvent, ControllerState, FailCode};
 
 use crate::log::{self, LogType};
-use crate::unpacker::runtime_loader::{RuntimeAuthorityManifest, RuntimeFileIdentity};
+use crate::unpacker::runtime_loader::{
+    RuntimeAuthorityManifest, RuntimeDigestAuthority, RuntimeFileIdentity,
+};
 
 /// Registered anti-debug evidence schema (ADR-0 evidence contract).
 /// The CLI failure sidecar is a `record_kind = "cli-failure"` record of
@@ -316,6 +318,17 @@ pub struct LoaderResult {
     /// Verified file identity (evidence).
     #[allow(dead_code)] // consumed by evidence bindings
     pub file_identity: RuntimeFileIdentity,
+    /// Production digest authority (IMP-06-R1): the verified runtime file
+    /// digest + identity. Constructed by the loader from verify_file()'s
+    /// identity; the placeholder can never appear here (fail-closed).
+    ///
+    /// `runtime echo consumer = NOT WIRED`: no V2 runtime export exists yet,
+    /// so no runtime-returned digest is compared against this authority in
+    /// any production path. The comparison API is
+    /// `RuntimeDigestAuthority::verify_runtime_echo`; it is exercised only
+    /// by unit/integration tests until the IMP-08 V2 wiring order lands.
+    #[allow(dead_code)] // echo comparison wired in IMP-08 (NOT WIRED today)
+    pub digest_authority: RuntimeDigestAuthority,
     pub target_pid: u32,
 }
 
