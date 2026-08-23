@@ -131,9 +131,15 @@ static uint32_t mida_v2_envelope_check(EnvelopeInput in) {
             uint64_t sva = entries[i];
             uint64_t soff;
             uint64_t k;
+            int ovf3 = 0;
+            uint64_t blob_end;
             if (!mida_is_canonical_user_va(sva)) return 11;
-            if (sva < in.expected_blob_base_va ||
-                sva >= in.expected_blob_base_va + in.params_bytes) return 11;
+            /* WO-2302: base + size must be checked-added BEFORE comparison
+             * (expected_blob_base_va near UINT64_MAX would wrap and wrongly
+             * accept out-of-blob VAs). */
+            blob_end = mida_checked_add(in.expected_blob_base_va, in.params_bytes, &ovf3);
+            if (ovf3) return 12;  /* base+size wraps: provenance unprovable */
+            if (sva < in.expected_blob_base_va || sva >= blob_end) return 11;
             soff = sva - in.expected_blob_base_va;
             for (k = 0; k < 65; k++) {
                 if (soff + k >= in.params_bytes) return 10;
