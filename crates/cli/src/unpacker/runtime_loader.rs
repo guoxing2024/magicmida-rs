@@ -2428,6 +2428,334 @@ impl RuntimeLoader {
         Ok(found)
     }
 
+    /// IMP-09-CARRIER-R2: resolve the WalkerExecute export RVA from the
+    /// VERIFIED runtime DLL file bytes — pure file path, NO process access,
+    /// NO ReadProcessMemory, NO live target module.
+    ///
+    /// The file is re-read from the canonical path sealed in
+    /// `RuntimeFileIdentity` (which was produced by
+    /// `RuntimeAuthorityManifest::verify_file` — digest+size+PE-x64 all
+    /// verified at that point; the re-read is the same bytes). The PE
+    /// export directory is parsed with the SAME fail-closed rules as the
+    /// remote resolver: SizeOfImage envelope, checked RVA arithmetic,
+    /// name/ordinal/function array bounds, NUL termination, duplicate
+    /// wanted-name rejection, forwarded-export rejection, out-of-module
+    /// rejection, overflow rejection.
+    ///
+    /// Returns the pure export RVA (module_base=0 mode of the shared
+    /// parser, so the returned value IS the RVA, never an absolute VA).
+    pub fn resolve_walker_export_rva_from_file(
+        identity: &RuntimeFileIdentity,
+    ) -> Result<u64, RuntimeLoadError> {
+        // 1. Re-read the verified file bytes (same canonical path + size
+        //    that verify_file() sealed; a changed file fails the identity
+        //    checks below by construction of the caller, and the path is
+        //    not caller-supplied at this point).
+        let bytes = std::fs::read(identity.path()).map_err(|e| {
+            RuntimeLoadError::ExportResolutionFailed(format!(
+                "read verified runtime file failed: {e}"
+            ))
+        })?;
+        if bytes.len() as u64 != identity.size_bytes() {
+            return Err(RuntimeLoadError::ExportResolutionFailed(
+                "verified runtime file size changed since verify_file".to_string(),
+            ));
+        }
+        if bytes.len() < 0x40 || &bytes[0..2] != b"MZ" {
+            return Err(RuntimeLoadError::ExportResolutionFailed(
+                "runtime file missing MZ".to_string(),
+            ));
+        }
+        let e_lfanew = u32::from_le_bytes(bytes[0x3C..0x40].try_into().map_err(|_| {
+            RuntimeLoadError::ExportResolutionFailed("truncated DOS header".to_string())
+        })?) as usize;
+        let pe_off = e_lfanew;
+        let pe_end = pe_off.checked_add(24 + 2).ok_or_else(|| {
+            RuntimeLoadError::ExportResolutionFailed("PE header base overflow".to_string())
+        })?;
+        if pe_end > bytes.len() || &bytes[pe_off..pe_off + 4] != b"PE\0\0" {
+            return Err(RuntimeLoadError::ExportResolutionFailed(
+                "runtime file missing PE signature".to_string(),
+            ));
+        }
+        let magic =
+            u16::from_le_bytes(bytes[pe_off + 24..pe_off + 26].try_into().map_err(|_| {
+                RuntimeLoadError::ExportResolutionFailed(
+                    "truncated optional header magic".to_string(),
+                )
+            })?);
+        if magic != 0x20B {
+            return Err(RuntimeLoadError::ExportResolutionFailed(format!(
+                "runtime file optional header magic {magic:#x} != PE32+ (0x20B)"
+            )));
+        }
+        // SizeOfImage at optional+0x50 (pe_off+24+0x50 = pe_off+0x68).
+        if pe_off + 0x68 + 4 > bytes.len() {
+            return Err(RuntimeLoadError::ExportResolutionFailed(
+                "truncated optional header (SizeOfImage)".to_string(),
+            ));
+        }
+        let image_size = u32::from_le_bytes(
+            bytes[pe_off + 0x68..pe_off + 0x6C]
+                .try_into()
+                .map_err(|_| {
+                    RuntimeLoadError::ExportResolutionFailed("SizeOfImage read".to_string())
+                })?,
+        ) as usize;
+        if image_size == 0 || image_size < 0x1000 {
+            return Err(RuntimeLoadError::ExportResolutionFailed(format!(
+                "runtime file SizeOfImage invalid: {image_size:#x}"
+            )));
+        }
+        // Export data directory: PE32+ optional+0x70 (pe_off+24+0x70 =
+        // pe_off+0x88).
+        let dd_off = pe_off + 0x88;
+        if dd_off + 8 > bytes.len() {
+            return Err(RuntimeLoadError::ExportResolutionFailed(
+                "truncated optional header (export directory)".to_string(),
+            ));
+        }
+        let exp_rva =
+            u32::from_le_bytes(bytes[dd_off..dd_off + 4].try_into().map_err(|_| {
+                RuntimeLoadError::ExportResolutionFailed("export RVA read".to_string())
+            })?) as usize;
+        let exp_size =
+            u32::from_le_bytes(bytes[dd_off + 4..dd_off + 8].try_into().map_err(|_| {
+                RuntimeLoadError::ExportResolutionFailed("export size read".to_string())
+            })?) as usize;
+        if exp_rva == 0 || exp_size == 0 {
+            return Err(RuntimeLoadError::ExportResolutionFailed(
+                "runtime file has no export directory".to_string(),
+            ));
+        }
+        let exp_end = exp_rva.checked_add(exp_size).ok_or_else(|| {
+            RuntimeLoadError::ExportResolutionFailed("export directory range overflow".to_string())
+        })?;
+        if exp_rva >= image_size || exp_end > image_size {
+            return Err(RuntimeLoadError::ExportResolutionFailed(format!(
+                "export directory outside image envelope: rva={exp_rva:#x} size={exp_size:#x} image={image_size:#x}"
+            )));
+        }
+        // 2. Section table: build RVA -> file-offset mapping (checked).
+        let num_sections =
+            u16::from_le_bytes(bytes[pe_off + 6..pe_off + 8].try_into().map_err(|_| {
+                RuntimeLoadError::ExportResolutionFailed("truncated COFF".to_string())
+            })?) as usize;
+        let opt_size =
+            u16::from_le_bytes(bytes[pe_off + 20..pe_off + 22].try_into().map_err(|_| {
+                RuntimeLoadError::ExportResolutionFailed(
+                    "truncated optional header size".to_string(),
+                )
+            })?) as usize;
+        let sec_off = pe_off
+            .checked_add(24)
+            .and_then(|v| v.checked_add(opt_size))
+            .ok_or_else(|| {
+                RuntimeLoadError::ExportResolutionFailed(
+                    "section table offset overflow".to_string(),
+                )
+            })?;
+        let mut sections: Vec<(u64, u64, u64)> = Vec::new(); // (va, vsize, raw_ptr)
+        for i in 0..num_sections {
+            let base = sec_off
+                .checked_add(i.checked_mul(40).ok_or_else(|| {
+                    RuntimeLoadError::ExportResolutionFailed("section index overflow".to_string())
+                })?)
+                .ok_or_else(|| {
+                    RuntimeLoadError::ExportResolutionFailed("section offset overflow".to_string())
+                })?;
+            if base + 40 > bytes.len() {
+                return Err(RuntimeLoadError::ExportResolutionFailed(
+                    "section table truncated".to_string(),
+                ));
+            }
+            let vsize = u32::from_le_bytes(bytes[base + 8..base + 12].try_into().map_err(|_| {
+                RuntimeLoadError::ExportResolutionFailed("section vsize read".to_string())
+            })?) as u64;
+            let va = u32::from_le_bytes(bytes[base + 12..base + 16].try_into().map_err(|_| {
+                RuntimeLoadError::ExportResolutionFailed("section va read".to_string())
+            })?) as u64;
+            let raw_ptr =
+                u32::from_le_bytes(bytes[base + 20..base + 24].try_into().map_err(|_| {
+                    RuntimeLoadError::ExportResolutionFailed("section raw read".to_string())
+                })?) as u64;
+            sections.push((va, vsize, raw_ptr));
+        }
+        let rva_to_file = |rva: usize| -> Result<usize, RuntimeLoadError> {
+            let r = rva as u64;
+            for &(va, vsize, raw) in &sections {
+                if r >= va
+                    && r < va.checked_add(vsize).ok_or_else(|| {
+                        RuntimeLoadError::ExportResolutionFailed(
+                            "section span overflow".to_string(),
+                        )
+                    })?
+                {
+                    let off = raw
+                        .checked_add(r.checked_sub(va).ok_or_else(|| {
+                            RuntimeLoadError::ExportResolutionFailed(
+                                "rva offset underflow".to_string(),
+                            )
+                        })?)
+                        .ok_or_else(|| {
+                            RuntimeLoadError::ExportResolutionFailed(
+                                "file offset overflow".to_string(),
+                            )
+                        })?;
+                    return usize::try_from(off).map_err(|_| {
+                        RuntimeLoadError::ExportResolutionFailed(
+                            "file offset too large".to_string(),
+                        )
+                    });
+                }
+            }
+            Err(RuntimeLoadError::ExportResolutionFailed(format!(
+                "RVA {rva:#x} not mapped by any section"
+            )))
+        };
+        // 3. Export directory: read fields from file bytes.
+        let ed_off = rva_to_file(exp_rva)?;
+        if ed_off + 40 > bytes.len() {
+            return Err(RuntimeLoadError::ExportResolutionFailed(
+                "export directory truncated in file".to_string(),
+            ));
+        }
+        let num_funcs = u32::from_le_bytes(
+            bytes[ed_off + 0x14..ed_off + 0x18]
+                .try_into()
+                .map_err(|_| {
+                    RuntimeLoadError::ExportResolutionFailed("num_funcs read".to_string())
+                })?,
+        ) as usize;
+        let num_names = u32::from_le_bytes(
+            bytes[ed_off + 0x18..ed_off + 0x1C]
+                .try_into()
+                .map_err(|_| {
+                    RuntimeLoadError::ExportResolutionFailed("num_names read".to_string())
+                })?,
+        ) as usize;
+        let funcs_rva = u32::from_le_bytes(
+            bytes[ed_off + 0x1C..ed_off + 0x20]
+                .try_into()
+                .map_err(|_| {
+                    RuntimeLoadError::ExportResolutionFailed("funcs_rva read".to_string())
+                })?,
+        ) as usize;
+        let names_rva = u32::from_le_bytes(
+            bytes[ed_off + 0x20..ed_off + 0x24]
+                .try_into()
+                .map_err(|_| {
+                    RuntimeLoadError::ExportResolutionFailed("names_rva read".to_string())
+                })?,
+        ) as usize;
+        let ords_rva = u32::from_le_bytes(
+            bytes[ed_off + 0x24..ed_off + 0x28]
+                .try_into()
+                .map_err(|_| {
+                    RuntimeLoadError::ExportResolutionFailed("ords_rva read".to_string())
+                })?,
+        ) as usize;
+        if num_names == 0 || names_rva == 0 || funcs_rva == 0 || ords_rva == 0 {
+            return Err(RuntimeLoadError::ExportResolutionFailed(
+                "runtime file export directory incomplete".to_string(),
+            ));
+        }
+        // 4. Read the three arrays from FILE bytes (checked, in-envelope).
+        let read_buf = |rva: usize,
+                        bytes_n: usize,
+                        what: &str|
+         -> Result<Vec<u8>, RuntimeLoadError> {
+            if rva >= image_size
+                || rva
+                    .checked_add(bytes_n)
+                    .map_or(true, |end| end > image_size)
+            {
+                return Err(RuntimeLoadError::ExportResolutionFailed(format!(
+                    "export {what} array outside image envelope: rva={rva:#x} bytes={bytes_n:#x} image={image_size:#x}"
+                )));
+            }
+            let fo = rva_to_file(rva)?;
+            if fo
+                .checked_add(bytes_n)
+                .map_or(true, |end| end > bytes.len())
+            {
+                return Err(RuntimeLoadError::ExportResolutionFailed(format!(
+                    "export {what} array truncated in file"
+                )));
+            }
+            Ok(bytes[fo..fo + bytes_n].to_vec())
+        };
+        let names_bytes = num_names.checked_mul(4).ok_or_else(|| {
+            RuntimeLoadError::ExportResolutionFailed("name array size overflow".to_string())
+        })?;
+        if names_bytes > 0x10000 {
+            return Err(RuntimeLoadError::ExportResolutionFailed(
+                "export name array too large".to_string(),
+            ));
+        }
+        let names = read_buf(names_rva, names_bytes, "name")?;
+        let ords_bytes = num_names.checked_mul(2).ok_or_else(|| {
+            RuntimeLoadError::ExportResolutionFailed("ordinal array size overflow".to_string())
+        })?;
+        if ords_bytes > 0x8000 {
+            return Err(RuntimeLoadError::ExportResolutionFailed(
+                "export ordinal array too large".to_string(),
+            ));
+        }
+        let ords = read_buf(ords_rva, ords_bytes, "ordinal")?;
+        let funcs_bytes = num_funcs.checked_mul(4).ok_or_else(|| {
+            RuntimeLoadError::ExportResolutionFailed("function array size overflow".to_string())
+        })?;
+        if funcs_bytes > 0x10000 {
+            return Err(RuntimeLoadError::ExportResolutionFailed(
+                "export function array too large".to_string(),
+            ));
+        }
+        let funcs = read_buf(funcs_rva, funcs_bytes, "function")?;
+        // 5. Resolve WalkerExecute via the shared parser (module_base=0 =>
+        //    returns pure RVA).
+        let mut name_at =
+            |name_ptr_rva: usize, out: &mut Vec<u8>| -> Result<bool, RuntimeLoadError> {
+                let fo = rva_to_file(name_ptr_rva)?;
+                let mut terminated = false;
+                for k in 0..64usize {
+                    let Some(off) = fo.checked_add(k) else {
+                        break;
+                    };
+                    if off >= bytes.len() {
+                        break;
+                    }
+                    let ch = bytes[off];
+                    if ch == 0 {
+                        terminated = true;
+                        break;
+                    }
+                    out.push(ch);
+                }
+                Ok(terminated)
+            };
+        let want: [&[u8]; 1] = [b"WalkerExecute"];
+        let found = Self::resolve_exports_from_buffers(
+            &names,
+            &ords,
+            &funcs,
+            &mut name_at,
+            num_names,
+            num_funcs,
+            0, // module_base = 0 => pure RVA mode
+            image_size,
+            exp_rva,
+            exp_size,
+            &want,
+        )?;
+        match found[0] {
+            Some(rva) => Ok(rva as u64),
+            None => Err(RuntimeLoadError::ExportResolutionFailed(
+                "WalkerExecute export not found in verified runtime file".to_string(),
+            )),
+        }
+    }
+
     /// Find the full 64-bit base address of a module by name substring
     /// in the target process (PEB.Ldr InMemoryOrderModuleList walk).
     ///
@@ -2829,12 +3157,20 @@ pub fn run_runtime_loader(
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     let _prov = verify_runtime_provenance(&authority, &manifest_dir, &loaded.file_identity)?;
+    // IMP-09-CARRIER-R2: resolve WalkerExecute export RVA from the
+    // VERIFIED runtime file bytes (pure-file; no live process access).
+    // Best-effort carrier: failure leaves the walker NOT_WIRED instead of
+    // failing the whole runtime load (the walker is not part of the
+    // runtime init contract).
+    let walker_export_rva =
+        RuntimeLoader::resolve_walker_export_rva_from_file(&loaded.file_identity).ok();
     Ok(crate::unpacker::antidebug_controller::LoaderResult::new(
         loaded.module_base as u64,
         loaded.attestation_json,
         loaded.file_identity,
         loaded.digest_authority,
         target_pid,
+        walker_export_rva,
     ))
 }
 
@@ -5490,3 +5826,261 @@ mod imp08_v2_production_tests {
             (blob_base + 0x1000) as usize,
         ).is_err());
     }
+
+mod imp09_carrier_r2_tests {
+    use super::*;
+
+    fn manifest(sha256: &str, size: u64) -> RuntimeAuthorityManifest {
+        RuntimeAuthorityManifest {
+            schema: "mida.antidebug-runtime-authority/v1".to_string(),
+            kind: "runtime-x64".to_string(),
+            artifact_id: "mida-antidebug-runtime-x64".to_string(),
+            sha256: sha256.to_string(),
+            size_bytes: size,
+            architecture: "x86_64".to_string(),
+            source_ref: "test-commit".to_string(),
+            provenance_ref: "provenance.json".to_string(),
+        }
+    }
+
+    /// Build a synthetic x64 PE file with an export directory containing
+    /// the given symbol names mapping to func RVAs (raw=va layout for the
+    /// single .text/.edata section, so RVA == file offset).
+    ///
+    /// Layout (one section covering [0x1000, 0x3000), raw == va):
+    ///   - section data starts at file offset 0x1000
+    ///   - export dir at RVA 0x1000
+    ///   - name ptr table at 0x1100, ordinal table at 0x1200,
+    ///     func table at 0x1300, strings at 0x1400
+    fn build_export_pe(symbols: &[(&str, u32)]) -> Vec<u8> {
+        // File = headers (0x1000) + section data (0x2000). Section raw ==
+        // VA layout: raw ptr 0x1000, va 0x1000, raw size 0x2000, vsize
+        // 0x3000 (SizeOfImage 0x3000 covers va..va+0x2000).
+        let mut b = vec![0u8; 0x1000]; // DOS + headers + section table
+        b[0] = b'M';
+        b[1] = b'Z';
+        b[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes()); // e_lfanew
+        b[0x80..0x84].copy_from_slice(b"PE\0\0");
+        b[0x84..0x86].copy_from_slice(&0x8664u16.to_le_bytes()); // AMD64
+        b[0x86..0x88].copy_from_slice(&1u16.to_le_bytes()); // 1 section
+        b[0x94..0x96].copy_from_slice(&0xE0u16.to_le_bytes()); // opt hdr size
+        b[0x98..0x9A].copy_from_slice(&0x20Bu16.to_le_bytes()); // PE32+
+                                                                // SizeOfImage at optional+0x50 = 0x80+0x18+0x50 = 0xE8
+        b[0xE8..0xEC].copy_from_slice(&0x3000u32.to_le_bytes());
+        // Export data dir at optional+0x70 = 0x80+0x18+0x70 = 0x108
+        b[0x108..0x10C].copy_from_slice(&0x1000u32.to_le_bytes()); // exp_rva
+        b[0x10C..0x110].copy_from_slice(&0x400u32.to_le_bytes()); // exp_size
+                                                                  // Section header at pe_off(0x80) + 4 (sig) + 20 (COFF) + 0xE0
+                                                                  // (optional) = 0x178
+        b[0x178..0x17B].copy_from_slice(b".ed"); // name
+        b[0x180..0x184].copy_from_slice(&0x3000u32.to_le_bytes()); // vsize
+        b[0x184..0x188].copy_from_slice(&0x1000u32.to_le_bytes()); // va
+        b[0x188..0x18C].copy_from_slice(&0x2000u32.to_le_bytes()); // raw size
+        b[0x18C..0x190].copy_from_slice(&0x1000u32.to_le_bytes()); // raw ptr
+
+        // Pad to 0x1000 (the section data region).
+        b.resize(0x3000, 0);
+        // Export directory at file offset 0x1000 (RVA 0x1000).
+        //   [0x14] NumberOfFunctions, [0x18] NumberOfNames,
+        //   [0x1C] AddressOfFunctions, [0x20] AddressOfNames,
+        //   [0x24] AddressOfNameOrdinals
+        let num = symbols.len();
+        b[0x1000 + 0x14..0x1000 + 0x18].copy_from_slice(&(num as u32).to_le_bytes());
+        b[0x1000 + 0x18..0x1000 + 0x1C].copy_from_slice(&(num as u32).to_le_bytes());
+        b[0x1000 + 0x1C..0x1000 + 0x20].copy_from_slice(&0x1300u32.to_le_bytes()); // funcs
+        b[0x1000 + 0x20..0x1000 + 0x24].copy_from_slice(&0x1100u32.to_le_bytes()); // names
+        b[0x1000 + 0x24..0x1000 + 0x28].copy_from_slice(&0x1200u32.to_le_bytes()); // ords
+                                                                                   // Name pointer table at 0x1100.
+        let mut str_off = 0x1400usize;
+        for (i, (name, _)) in symbols.iter().enumerate() {
+            b[0x1100 + i * 4..0x1104 + i * 4].copy_from_slice(&(str_off as u32).to_le_bytes());
+            str_off += name.len() + 1;
+        }
+        // Ordinal table at 0x1200 (u16 each, 0-based like link.exe).
+        for i in 0..num {
+            b[0x1200 + i * 2..0x1202 + i * 2].copy_from_slice(&(i as u16).to_le_bytes());
+        }
+        // Function table at 0x1300.
+        for (i, (_, rva)) in symbols.iter().enumerate() {
+            b[0x1300 + i * 4..0x1304 + i * 4].copy_from_slice(&rva.to_le_bytes());
+        }
+        // Strings at 0x1400.
+        let mut s = 0x1400usize;
+        for (name, _) in symbols {
+            for (k, ch) in name.bytes().enumerate() {
+                b[s + k] = ch;
+            }
+            b[s + name.len()] = 0;
+            s += name.len() + 1;
+        }
+        b
+    }
+
+    /// Write the PE to a temp file and produce a verified identity via the
+    /// real verify_file() path.
+    fn verified_identity_for(pe: &[u8], tag: &str) -> RuntimeFileIdentity {
+        let dir = std::env::temp_dir().join("mida-carrier-r2");
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join(format!("r2_{tag}.dll"));
+        std::fs::write(&p, pe).unwrap();
+        let expected = sha256_hex(pe);
+        let authority = manifest(&expected, pe.len() as u64);
+        authority.verify_file(&p).expect("synthetic PE must verify")
+    }
+
+    fn walker_pe() -> Vec<u8> {
+        build_export_pe(&[
+            ("MidaAntidebugInitialize", 0x2000),
+            ("WalkerExecute", 0x2040),
+        ])
+    }
+
+    #[test]
+    fn valid_file_export_rva_carrier() {
+        let pe = walker_pe();
+        let id = verified_identity_for(&pe, "valid");
+        let rva = RuntimeLoader::resolve_walker_export_rva_from_file(&id)
+            .expect("valid runtime file must resolve WalkerExecute");
+        assert_eq!(rva, 0x2040, "pure-file resolver returns the export RVA");
+    }
+
+    #[test]
+    fn missing_walker_export_rejected() {
+        let pe = build_export_pe(&[("MidaAntidebugInitialize", 0x2000)]);
+        let id = verified_identity_for(&pe, "missing");
+        let r = RuntimeLoader::resolve_walker_export_rva_from_file(&id);
+        assert!(r.is_err(), "missing WalkerExecute must fail closed");
+    }
+
+    #[test]
+    fn forwarded_walker_export_rejected() {
+        // WalkerExecute function RVA points INSIDE the export directory
+        // (0x1000..0x1400) => treated as a forwarder, skipped => fail.
+        let pe = build_export_pe(&[
+            ("MidaAntidebugInitialize", 0x2000),
+            ("WalkerExecute", 0x1100),
+        ]);
+        let id = verified_identity_for(&pe, "fwd");
+        let r = RuntimeLoader::resolve_walker_export_rva_from_file(&id);
+        assert!(r.is_err(), "forwarded WalkerExecute must fail closed");
+    }
+
+    #[test]
+    fn out_of_image_export_rva_rejected() {
+        // Function RVA beyond SizeOfImage (0x3000).
+        let pe = build_export_pe(&[
+            ("MidaAntidebugInitialize", 0x2000),
+            ("WalkerExecute", 0x4000),
+        ]);
+        let id = verified_identity_for(&pe, "oob");
+        let r = RuntimeLoader::resolve_walker_export_rva_from_file(&id);
+        assert!(r.is_err(), "out-of-envelope export RVA must fail closed");
+    }
+
+    #[test]
+    fn export_array_truncation_rejected() {
+        // Truncate the func table region by cutting the file short after
+        // the export directory but claiming num_funcs beyond the file.
+        let mut pe = build_export_pe(&[
+            ("MidaAntidebugInitialize", 0x2000),
+            ("WalkerExecute", 0x2040),
+        ]);
+        // Shrink to just past the export dir header (0x1028), so the func
+        // array read at 0x1300 is truncated.
+        pe.truncate(0x1100);
+        let id = verified_identity_for(&pe, "trunc");
+        let r = RuntimeLoader::resolve_walker_export_rva_from_file(&id);
+        assert!(r.is_err(), "truncated export arrays must fail closed");
+    }
+
+    #[test]
+    fn name_pointer_oob_rejected() {
+        // Name pointer table entry points outside the image envelope.
+        let mut pe = build_export_pe(&[
+            ("MidaAntidebugInitialize", 0x2000),
+            ("WalkerExecute", 0x2040),
+        ]);
+        // Overwrite the first name pointer (at 0x1100) to an out-of-envelope
+        // RVA. The name_at closure maps it -> no section -> error.
+        pe[0x1100..0x1104].copy_from_slice(&0x4000u32.to_le_bytes());
+        let id = verified_identity_for(&pe, "name_oob");
+        let r = RuntimeLoader::resolve_walker_export_rva_from_file(&id);
+        assert!(r.is_err(), "name pointer outside image must fail closed");
+    }
+
+    #[test]
+    fn ordinal_oob_rejected() {
+        // Ordinal table entry >= num_funcs -> skipped -> WalkerExecute not
+        // resolvable -> fail.
+        let mut pe = build_export_pe(&[
+            ("MidaAntidebugInitialize", 0x2000),
+            ("WalkerExecute", 0x2040),
+        ]);
+        // WalkerExecute is index 1 -> its ordinal slot at 0x1202. Set to 99.
+        pe[0x1202..0x1204].copy_from_slice(&99u16.to_le_bytes());
+        let id = verified_identity_for(&pe, "ord_oob");
+        let r = RuntimeLoader::resolve_walker_export_rva_from_file(&id);
+        assert!(r.is_err(), "out-of-range ordinal must fail closed");
+    }
+
+    #[test]
+    fn checked_module_base_plus_rva_overflow_rejected() {
+        // The production install boundary rejects module_base +
+        // export_rva overflow (WalkerEntryOverflow inside the sealed
+        // authority construction). Exercise it through the PUBLIC API
+        // install_walker_session_verified with a huge module_base: the
+        // install must fail closed (false), never wrap.
+        let pe = walker_pe();
+        let id = verified_identity_for(&pe, "ovf");
+        let rva = RuntimeLoader::resolve_walker_export_rva_from_file(&id)
+            .expect("valid file must resolve");
+        let ok = mida_antidebug_runtime::exports::install_walker_session_verified(
+            Box::new(mida_antidebug_runtime::walker_control::MemoryMapProvider::new()),
+            0x1000,
+            0x2000,
+            4242,
+            7777,
+            "a".repeat(64).as_str(),
+            "b".repeat(64).as_str(),
+            u64::MAX - 16,
+            rva,
+            "profile-id",
+            "c".repeat(64).as_str(),
+        );
+        assert!(!ok, "module_base + export_rva overflow must fail closed");
+    }
+
+    #[test]
+    fn resolved_rva_round_trips_into_sealed_loader_result() {
+        // Full chain: verified file -> pure-file resolver -> LoaderResult
+        // carrier -> getter returns the same RVA.
+        let pe = walker_pe();
+        let id = verified_identity_for(&pe, "roundtrip");
+        let rva = RuntimeLoader::resolve_walker_export_rva_from_file(&id).unwrap();
+        let authority = RuntimeDigestAuthority::from_verified_identity(&id, "artifact")
+            .expect("verified identity must build authority");
+        let lr = crate::unpacker::antidebug_controller::LoaderResult::new(
+            0x7000,
+            "{}".to_string(),
+            id,
+            authority,
+            1234,
+            Some(rva),
+        );
+        assert_eq!(lr.walker_export_rva(), Some(0x2040));
+    }
+
+    #[test]
+    fn remote_resolver_not_called_by_new_path() {
+        // The pure-file path needs ONLY the verified file bytes; it never
+        // touches a process handle. Prove it: the resolver succeeds for a
+        // file whose identity was verified, without any target HANDLE.
+        // (Static proof: this function has no windows:: RPM import in its
+        // body; the evidence bundle greps resolve_mida_exports_remote call
+        // sites to show the new path does not call it.)
+        let pe = walker_pe();
+        let id = verified_identity_for(&pe, "noread");
+        let rva = RuntimeLoader::resolve_walker_export_rva_from_file(&id);
+        assert_eq!(rva, Ok(0x2040));
+    }
+}

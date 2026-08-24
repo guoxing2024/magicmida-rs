@@ -330,6 +330,13 @@ pub struct LoaderResult {
     #[allow(dead_code)] // echo comparison wired in IMP-08 (NOT WIRED today)
     digest_authority: RuntimeDigestAuthority,
     target_pid: u32,
+    /// IMP-09-CARRIER-R2: WalkerExecute export RVA resolved from the
+    /// VERIFIED runtime DLL file bytes (pure-file resolver; NO live
+    /// process access). Some() only after a fully validated pure-file
+    /// resolution; None when the runtime file has no resolvable
+    /// WalkerExecute export (loader itself still succeeds — the walker
+    /// carrier is simply absent and binding fails closed).
+    walker_export_rva: Option<u64>,
 }
 
 impl LoaderResult {
@@ -342,6 +349,7 @@ impl LoaderResult {
         file_identity: RuntimeFileIdentity,
         digest_authority: RuntimeDigestAuthority,
         target_pid: u32,
+        walker_export_rva: Option<u64>,
     ) -> Self {
         Self {
             module_base,
@@ -349,6 +357,7 @@ impl LoaderResult {
             file_identity,
             digest_authority,
             target_pid,
+            walker_export_rva,
         }
     }
 
@@ -375,6 +384,17 @@ impl LoaderResult {
     /// Module base in the target (evidence + controller cross-check).
     pub fn module_base(&self) -> u64 {
         self.module_base
+    }
+
+    /// IMP-09-CARRIER-R2: sealed WalkerExecute export-RVA carrier.
+    ///
+    /// None when the verified runtime file has no resolvable
+    /// WalkerExecute export; the controller MUST keep refusing to bind
+    /// (fail-closed) in that case. The value (when present) was resolved
+    /// by the pure-file export resolver over the verified runtime DLL
+    /// bytes — never from a live process, never from a raw string.
+    pub fn walker_export_rva(&self) -> Option<u64> {
+        self.walker_export_rva
     }
 }
 
@@ -520,11 +540,12 @@ impl AntidebugController {
         None
     }
 
-    /// R4: resolved WalkerExecute export RVA from a verified PE envelope.
-    /// None today (no resolver carrier) — refuse rather than hard-code
-    /// 0x1234.
+    /// IMP-09-CARRIER-R2: WalkerExecute export RVA from the SEALED
+    /// LoaderResult carrier (pure-file resolver over the verified runtime
+    /// DLL bytes; no live process access, no raw string, no magic
+    /// constant). None -> bind must fail closed (never hard-code).
     fn resolved_walker_export_rva(&self) -> Option<u64> {
-        None
+        self.options.loader_result.as_ref()?.walker_export_rva()
     }
 
     /// Inject the explicit cleanup outcome (R1-HARDENING-CLEANUP-2).
@@ -1374,12 +1395,17 @@ mod tests {
         std::fs::write(&p, &content).unwrap();
         let authority = manifest(&sha256_hex(&content), content.len() as u64);
         let identity = authority.verify_file(&p).unwrap();
-        let digest_authority = RuntimeDigestAuthority::from_verified_identity(
-            &identity,
-            &authority.artifact_id,
+        let digest_authority =
+            RuntimeDigestAuthority::from_verified_identity(&identity, &authority.artifact_id)
+                .expect("verified identity must build a valid authority");
+        LoaderResult::new(
+            0x7000,
+            attestation_json,
+            identity,
+            digest_authority,
+            target_pid,
+            None,
         )
-        .expect("verified identity must build a valid authority");
-        LoaderResult::new(0x7000, attestation_json, identity, digest_authority, target_pid)
     }
 
     fn controller_with_loader_result(loader: Option<LoaderResult>) -> AntidebugController {
