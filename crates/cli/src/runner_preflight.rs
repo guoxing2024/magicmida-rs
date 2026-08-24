@@ -1187,6 +1187,75 @@ pub struct LaunchAttestationContext<'a> {
 /// [`complete_run_evidence`] take it BY VALUE, so a single attestation can
 /// authorize exactly one bundle: a second use is a compile error (there is
 /// no way to duplicate or reconstruct the value).
+/// IMP-09-CARRIER-R3: sealed verified TARGET-SAMPLE identity.
+///
+/// Produced ONLY by `attest_ready_before_launch` after the full
+/// preflight + independent-verifier re-run chain passes (the input
+/// identity is re-computed from disk, matched exactly once against the
+/// preflight case, and re-confirmed by the fresh report). Private
+/// fields; NOT Serialize/Deserialize — there is no disk/JSON form that
+/// can forge this carrier. Distinct from the runtime DLL identity
+/// (runtime_module_sha256) by construction: this is the protected input
+/// (sample) identity from the attested preflight case.
+#[derive(Debug, Clone)]
+pub struct VerifiedTargetIdentity {
+    case_id: String,
+    sha256: String,
+    size_bytes: u64,
+    architecture: String,
+}
+
+impl VerifiedTargetIdentity {
+    /// Sealed constructor — reachable only from crate-internal attested
+    /// code (the attestation) and crate unit tests. Rejects malformed
+    /// input: sha256 must be canonical 64-lowercase-hex, size non-zero,
+    /// case_id and architecture non-empty.
+    pub(crate) fn from_attested(
+        case_id: &str,
+        gate: &FileIdentityGate,
+        architecture: &str,
+    ) -> Result<Self, String> {
+        if case_id.trim().is_empty() {
+            return Err("VerifiedTargetIdentity case_id must be non-empty".to_string());
+        }
+        let sha = crate::sample_snapshot::canonical_hash(&gate.sha256);
+        crate::sample_snapshot::validate_hash(&sha)
+            .map_err(|e| format!("VerifiedTargetIdentity sha256 invalid: {e}"))?;
+        if gate.size_bytes == 0 {
+            return Err("VerifiedTargetIdentity size_bytes must be non-zero".to_string());
+        }
+        if architecture.trim().is_empty() {
+            return Err("VerifiedTargetIdentity architecture must be non-empty".to_string());
+        }
+        Ok(Self {
+            case_id: case_id.to_string(),
+            sha256: sha,
+            size_bytes: gate.size_bytes,
+            architecture: architecture.to_string(),
+        })
+    }
+
+    /// Attested case id (e.g. `origin_macro`).
+    pub fn case_id(&self) -> &str {
+        &self.case_id
+    }
+
+    /// Verified target sample SHA-256 (64 lowercase hex).
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    /// Verified target sample size in bytes.
+    pub fn size_bytes(&self) -> u64 {
+        self.size_bytes
+    }
+
+    /// Verified target architecture (e.g. `x86_64`).
+    pub fn architecture(&self) -> &str {
+        &self.architecture
+    }
+}
+
 #[derive(Debug)]
 pub struct RunEvidenceContext {
     case_id: String,
@@ -1199,6 +1268,9 @@ pub struct RunEvidenceContext {
     /// Packer family this run belongs to (`oreans_themida` or `ahk_gto`).
     /// Drives the evidence-contract family dispatch.
     packer_family: String,
+    /// IMP-09-CARRIER-R3: sealed verified target-sample identity (private,
+    /// non-deserializable). Bound by the attestation only.
+    target_identity: VerifiedTargetIdentity,
 }
 
 impl RunEvidenceContext {
@@ -1217,6 +1289,7 @@ impl RunEvidenceContext {
         protected_input: PathBuf,
         candidate: PathBuf,
         cli_binary_sha256: String,
+        target_identity: VerifiedTargetIdentity,
     ) -> anyhow::Result<RunEvidenceContext> {
         Self::new_with_family(
             mida_core::runner_config::packer_family::OREANS.to_string(),
@@ -1227,6 +1300,7 @@ impl RunEvidenceContext {
             protected_input,
             candidate,
             cli_binary_sha256,
+            target_identity,
         )
     }
 
@@ -1243,6 +1317,7 @@ impl RunEvidenceContext {
         protected_input: PathBuf,
         candidate: PathBuf,
         cli_binary_sha256: String,
+        target_identity: VerifiedTargetIdentity,
     ) -> anyhow::Result<RunEvidenceContext> {
         if packer_family.trim().is_empty() {
             bail!("RunEvidenceContext packer_family must be non-empty");
@@ -1271,12 +1346,18 @@ impl RunEvidenceContext {
             candidate,
             cli_binary_sha256: cli_binary_sha256.to_lowercase(),
             packer_family,
+            target_identity,
         })
     }
 
     /// The attested packer family (Oreans-compat default when unbound).
     pub fn packer_family(&self) -> &str {
         &self.packer_family
+    }
+
+    /// IMP-09-CARRIER-R3: the sealed verified target identity.
+    pub fn target_identity(&self) -> &VerifiedTargetIdentity {
+        &self.target_identity
     }
 
     /// The attested case id.
@@ -1328,6 +1409,47 @@ pub fn file_identity(path: &Path) -> anyhow::Result<FileIdentityGate> {
         sha256: sha,
         size_bytes: data.len() as u64,
     })
+}
+
+/// IMP-09-CARRIER-R3: single-read verified file identity + architecture.
+///
+/// One read of the protected input returns the identity gate AND the PE
+/// architecture parsed from the SAME bytes, so the attested target
+/// identity is bound to exactly the bytes that were hash-verified (no
+/// second-read TOCTOU for the architecture field).
+pub(crate) fn file_identity_with_architecture(
+    path: &Path,
+) -> anyhow::Result<(FileIdentityGate, String)> {
+    let data = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let sha = sha256_hex(&data);
+    let architecture = pe_architecture_of(&data);
+    Ok((
+        FileIdentityGate {
+            sha256: sha,
+            size_bytes: data.len() as u64,
+        },
+        architecture,
+    ))
+}
+
+/// PE architecture label for the given bytes ("x86_64" / "x86" /
+/// "unknown"). Non-PE bytes still yield an identity (hash/size are
+/// authoritative); architecture is best-effort evidence metadata.
+fn pe_architecture_of(bytes: &[u8]) -> String {
+    use mida_pe::PeHeader;
+    match PeHeader::from_bytes(bytes) {
+        Ok(h) => {
+            let magic = h.nt_headers.optional_header.magic;
+            if magic == 0x20b {
+                "x86_64".to_string()
+            } else if magic == 0x10b {
+                "x86".to_string()
+            } else {
+                "unknown".to_string()
+            }
+        }
+        Err(_) => "unknown".to_string(),
+    }
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -1549,7 +1671,7 @@ pub fn attest_ready_before_launch(
     // the UNIQUE case the current input belongs to. The input identity is
     // computed first (it drives both the per-case config selection here and
     // the report case matching below).
-    let current_identity = file_identity(ctx.input)?;
+    let (current_identity, target_architecture) = file_identity_with_architecture(ctx.input)?;
     bind_actual_config_to_envelope(output_dir, ctx.runner_config, &current_identity)?;
 
     // Current CLI identity (attack: binary A staged, binary B launched).
@@ -1724,6 +1846,16 @@ pub fn attest_ready_before_launch(
     // the live input for Oreans. For GTO the sealed envelope path is the
     // authority and equals ctx.input canonical (already enforced).
     let evidence_input = protected_input_for_evidence(&target_case_id, selected_case, ctx.input);
+    // IMP-09-CARRIER-R3: seal the verified target identity. The input
+    // identity was re-computed from disk, matched EXACTLY once against
+    // the preflight case, and re-confirmed by the fresh report; this is
+    // the only construction site (private fields, no Deserialize).
+    let sealed_target_identity = VerifiedTargetIdentity::from_attested(
+        &target_case_id,
+        &current_identity,
+        &target_architecture,
+    )
+    .map_err(|e| anyhow::anyhow!("target identity seal failed: {e}"))?;
     let context = RunEvidenceContext::new_with_family(
         attested_family,
         target_case_id,
@@ -1733,6 +1865,7 @@ pub fn attest_ready_before_launch(
         evidence_input,
         current_output,
         current_cli_sha,
+        sealed_target_identity,
     )?;
     Ok(context)
 }
@@ -2969,6 +3102,15 @@ mod tests {
             members.push((name.to_string(), path));
         }
 
+        let test_target_identity = VerifiedTargetIdentity::from_attested(
+            "gto_launcher",
+            &FileIdentityGate {
+                sha256: "ab12".repeat(16),
+                size_bytes: 4096,
+            },
+            "x86_64",
+        )
+        .expect("test target identity seals");
         let context = RunEvidenceContext::new_with_family(
             mida_core::runner_config::packer_family::AHK_GTO.to_string(),
             "gto_launcher".to_string(),
@@ -2978,6 +3120,7 @@ mod tests {
             protected_path,
             candidate_path.clone(),
             "ef56".repeat(16),
+            test_target_identity,
         )
         .expect("GTO evidence context builds");
 
@@ -4629,5 +4772,270 @@ mod tests {
             .expect_err("pinning the pre-replacement sha after replacement must fail (hash drift)");
         assert!(err.to_string().contains("hash drift"), "{err}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A GTO runner config matching the envelope fabricated by
+    /// fabricate_gto_unpack_state (real CLI sha, family ahk_gto) — the same
+    /// config unpack() builds for the GTO lane.
+    fn attest_gto_config() -> mida_core::runner_config::RunnerConfig {
+        use mida_core::runner_config::packer_family;
+        let cli_binary_sha256 =
+            crate::runner_preflight::sha256_file(&std::env::current_exe().unwrap()).unwrap();
+        crate::run_spec::runner_config_from_unpack_args_family(
+            packer_family::AHK_GTO,
+            mida_pe::OepPolicy::Captured,
+            mida_pe::ContainerRestoreMode::Off,
+            mida_pe::DumpProfile::OreansClassic,
+            true,
+            false,
+            false,
+            "",
+            "rev",
+            &cli_binary_sha256,
+        )
+    }
+
+    // ---- IMP-09-CARRIER-R3: sealed verified target identity ----
+
+    #[test]
+    fn imp09_target_identity_from_attested_rejects_placeholder_digest() {
+        let err = VerifiedTargetIdentity::from_attested(
+            "origin_macro",
+            &FileIdentityGate {
+                sha256: "adr6-profile-digest".to_string(),
+                size_bytes: 4096,
+            },
+            "x86_64",
+        )
+        .expect_err("placeholder digest must not seal");
+        assert!(err.contains("sha256 invalid"), "{err}");
+    }
+
+    #[test]
+    fn imp09_target_identity_from_attested_rejects_uppercase_digest() {
+        let id = VerifiedTargetIdentity::from_attested(
+            "origin_macro",
+            &FileIdentityGate {
+                sha256: "AB12".repeat(16).to_uppercase(),
+                size_bytes: 4096,
+            },
+            "x86_64",
+        )
+        .expect("canonicalizable uppercase digest seals");
+        assert_eq!(id.sha256(), "ab12".repeat(16));
+        assert_eq!(id.case_id(), "origin_macro");
+        assert_eq!(id.size_bytes(), 4096);
+        assert_eq!(id.architecture(), "x86_64");
+
+        let err = VerifiedTargetIdentity::from_attested(
+            "origin_macro",
+            &FileIdentityGate {
+                sha256: "z".repeat(64),
+                size_bytes: 4096,
+            },
+            "x86_64",
+        )
+        .expect_err("non-hex digest must not seal");
+        assert!(err.contains("sha256 invalid"), "{err}");
+    }
+
+    #[test]
+    fn imp09_target_identity_rejects_empty_case_and_zero_size() {
+        let err = VerifiedTargetIdentity::from_attested(
+            "  ",
+            &FileIdentityGate {
+                sha256: "ab12".repeat(16),
+                size_bytes: 4096,
+            },
+            "x86_64",
+        )
+        .expect_err("empty case id must not seal");
+        assert!(err.contains("case_id"), "{err}");
+
+        let err = VerifiedTargetIdentity::from_attested(
+            "origin_macro",
+            &FileIdentityGate {
+                sha256: "ab12".repeat(16),
+                size_bytes: 0,
+            },
+            "x86_64",
+        )
+        .expect_err("zero size must not seal");
+        assert!(err.contains("size_bytes"), "{err}");
+
+        let err = VerifiedTargetIdentity::from_attested(
+            "origin_macro",
+            &FileIdentityGate {
+                sha256: "ab12".repeat(16),
+                size_bytes: 4096,
+            },
+            " ",
+        )
+        .expect_err("empty architecture must not seal");
+        assert!(err.contains("architecture"), "{err}");
+    }
+
+    #[test]
+    fn imp09_target_identity_cannot_be_externally_constructed() {
+        // Fields are private; the ONLY constructor is the sealed
+        // from_attested. External struct-literal construction is a compile
+        // error. Round-trip proves the sealed path carries attested values.
+        let id = VerifiedTargetIdentity::from_attested(
+            "origin_macro",
+            &FileIdentityGate {
+                sha256: "ab12".repeat(16),
+                size_bytes: 777,
+            },
+            "x86_64",
+        )
+        .expect("sealed construction");
+        assert_eq!(id.case_id(), "origin_macro");
+        assert_eq!(id.sha256(), "ab12".repeat(16));
+        assert_eq!(id.size_bytes(), 777);
+        assert_eq!(id.architecture(), "x86_64");
+    }
+
+    #[test]
+    fn imp09_target_identity_cannot_be_deserialized() {
+        // VerifiedTargetIdentity has NO Serialize/Deserialize: no JSON/disk
+        // form can forge it. The report's FileIdentityGate IS serializable
+        // (preflight report schema) but is a DIFFERENT type — the sealed
+        // carrier only flows by value from the attestation.
+        let gate = FileIdentityGate {
+            sha256: "ab12".repeat(16),
+            size_bytes: 777,
+        };
+        let roundtrip: FileIdentityGate =
+            serde_json::from_value(serde_json::to_value(&gate).unwrap()).unwrap();
+        assert_eq!(roundtrip, gate, "report gate is serializable by design");
+        let id = VerifiedTargetIdentity::from_attested("origin_macro", &gate, "x86_64")
+            .expect("sealed from the SAME gate values");
+        assert_eq!(id.sha256(), gate.sha256);
+    }
+
+    #[test]
+    fn imp09_attestation_seals_verified_target_identity() {
+        let _lock = TEST_DISPATCH_LOCK.lock().unwrap();
+        let root = temp_dir("attest_seal");
+        let dir = root.join("preflight");
+        std::fs::create_dir_all(&dir).unwrap();
+        let gto_bytes = b"ATTEST-SEAL-GTO-BYTES-0123456789";
+        let gto_sha = sha256_hex(gto_bytes);
+        let manifest = gto_synthetic_manifest(&dir, &gto_sha, gto_bytes.len() as u64);
+        let candidate = dir.join("gto_candidate.exe");
+        let (sealed_snap, _envelope, _report) = fabricate_gto_unpack_state(
+            &dir,
+            &root,
+            gto_bytes,
+            &manifest,
+            &candidate,
+            mida_pe::OepPolicy::Captured,
+            mida_pe::ContainerRestoreMode::Off,
+            mida_pe::DumpProfile::OreansClassic,
+            true,
+        );
+        let (_verifier, _dispatch_guard) = arm_dispatch_guard(&dir);
+        let gto_cfg = attest_gto_config();
+        let cli_bin = std::env::current_exe().expect("test binary");
+        let ctx = LaunchAttestationContext {
+            input: &sealed_snap,
+            output: &candidate,
+            cli_binary: &cli_bin,
+            runner_config: &gto_cfg,
+            snapshot_root: &root,
+        };
+        let context = attest_ready_before_launch(&dir, &ctx).expect("attestation Ready");
+        let identity = context.target_identity();
+        assert_eq!(identity.case_id(), "gto_launcher");
+        assert_eq!(identity.sha256(), &gto_sha);
+        assert_eq!(identity.size_bytes(), gto_bytes.len() as u64);
+        assert_eq!(identity.architecture(), "unknown"); // non-PE bytes
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn imp09_attestation_rejects_same_size_replaced_input() {
+        let _lock = TEST_DISPATCH_LOCK.lock().unwrap();
+        let root = temp_dir("attest_replace");
+        let dir = root.join("preflight");
+        std::fs::create_dir_all(&dir).unwrap();
+        let gto_bytes = b"ATTEST-REPLACE-AAAAAAAAAAAAAAA";
+        let gto_sha = sha256_hex(gto_bytes);
+        let manifest = gto_synthetic_manifest(&dir, &gto_sha, gto_bytes.len() as u64);
+        let candidate = dir.join("gto_candidate.exe");
+        let (sealed_snap, _envelope, _report) = fabricate_gto_unpack_state(
+            &dir,
+            &root,
+            gto_bytes,
+            &manifest,
+            &candidate,
+            mida_pe::OepPolicy::Captured,
+            mida_pe::ContainerRestoreMode::Off,
+            mida_pe::DumpProfile::OreansClassic,
+            true,
+        );
+        let (_verifier, _dispatch_guard) = arm_dispatch_guard(&dir);
+        let replaced: Vec<u8> = gto_bytes.iter().map(|b| b.wrapping_add(1)).collect();
+        assert_eq!(replaced.len(), gto_bytes.len(), "same size");
+        assert_ne!(sha256_hex(&replaced), gto_sha, "different content");
+        std::fs::write(&sealed_snap, &replaced).unwrap();
+        let gto_cfg = attest_gto_config();
+        let cli_bin = std::env::current_exe().expect("test binary");
+        let ctx = LaunchAttestationContext {
+            input: &sealed_snap,
+            output: &candidate,
+            cli_binary: &cli_bin,
+            runner_config: &gto_cfg,
+            snapshot_root: &root,
+        };
+        let err = attest_ready_before_launch(&dir, &ctx)
+            .expect_err("same-size replacement must be rejected");
+        assert!(
+            err.to_string().contains("identity") || err.to_string().contains("case"),
+            "{err}"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn imp09_attestation_rejects_wrong_target_artifact() {
+        let _lock = TEST_DISPATCH_LOCK.lock().unwrap();
+        let root = temp_dir("attest_wrong");
+        let dir = root.join("preflight");
+        std::fs::create_dir_all(&dir).unwrap();
+        let gto_bytes = b"ATTEST-WRONG-AAAAAAAAAAAAAAA";
+        let gto_sha = sha256_hex(gto_bytes);
+        let manifest = gto_synthetic_manifest(&dir, &gto_sha, gto_bytes.len() as u64);
+        let candidate = dir.join("gto_candidate.exe");
+        let (_sealed_snap, _envelope, _report) = fabricate_gto_unpack_state(
+            &dir,
+            &root,
+            gto_bytes,
+            &manifest,
+            &candidate,
+            mida_pe::OepPolicy::Captured,
+            mida_pe::ContainerRestoreMode::Off,
+            mida_pe::DumpProfile::OreansClassic,
+            true,
+        );
+        let (_verifier, _dispatch_guard) = arm_dispatch_guard(&dir);
+        let foreign = dir.join("foreign_input.bin");
+        std::fs::write(&foreign, b"FOREIGN-UNSTAGED-INPUT-BYTES").unwrap();
+        let gto_cfg = attest_gto_config();
+        let cli_bin = std::env::current_exe().expect("test binary");
+        let ctx = LaunchAttestationContext {
+            input: &foreign,
+            output: &candidate,
+            cli_binary: &cli_bin,
+            runner_config: &gto_cfg,
+            snapshot_root: &root,
+        };
+        let err = attest_ready_before_launch(&dir, &ctx)
+            .expect_err("wrong unstaged artifact must be rejected");
+        assert!(
+            err.to_string().contains("matches") || err.to_string().contains("case"),
+            "{err}"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

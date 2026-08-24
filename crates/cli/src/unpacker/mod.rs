@@ -762,6 +762,11 @@ pub fn unpack(
                 runtime_authority: crate::unpacker::runtime_loader::runtime_authority().ok(),
                 runtime_path: crate::unpacker::runtime_loader::runtime_artifact_path(),
                 loader_result: None,
+                // IMP-09-CARRIER-R3: sealed verified target identity from the
+                // launch attestation (None without preflight -> fail closed).
+                target_identity: evidence_ctx
+                    .as_ref()
+                    .map(|ctx| ctx.target_identity().clone()),
             },
         );
         if let Ok(loader_result) = loader_outcome {
@@ -1153,6 +1158,13 @@ pub fn unpack(
                                 .ok(),
                             runtime_path: crate::unpacker::runtime_loader::runtime_artifact_path(),
                             loader_result: None,
+                            // IMP-09-CARRIER-R3: the sealed verified target
+                            // identity flows from the launch attestation into
+                            // the controller. None when no preflight ran —
+                            // the controller then fails closed (UNBOUND).
+                            target_identity: evidence_ctx
+                                .as_ref()
+                                .map(|ctx| ctx.target_identity().clone()),
                         },
                     );
                     // ADR-6: run the self-owned loader (verify + load +

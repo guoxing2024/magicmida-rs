@@ -600,6 +600,15 @@ mod tests {
             run.protected.clone(),
             run.candidate.clone(),
             "cd34".repeat(16),
+            crate::runner_preflight::VerifiedTargetIdentity::from_attested(
+                "origin_macro",
+                &crate::runner_preflight::FileIdentityGate {
+                    sha256: "ab12".repeat(16),
+                    size_bytes: 4096,
+                },
+                "x86_64",
+            )
+            .expect("test target identity seals"),
         )
         .expect("build evidence context")
     }
@@ -767,6 +776,15 @@ mod tests {
                 run.protected.clone(),
                 run.candidate.clone(),
                 "cd34".repeat(16),
+                crate::runner_preflight::VerifiedTargetIdentity::from_attested(
+                    "origin_macro",
+                    &crate::runner_preflight::FileIdentityGate {
+                        sha256: "ab12".repeat(16),
+                        size_bytes: 4096,
+                    },
+                    "x86_64",
+                )
+                .expect("test target identity seals"),
             )
             .is_err(),
             "malformed digest must be rejected at context construction"
@@ -782,6 +800,15 @@ mod tests {
             run.protected.clone(),
             run.candidate.clone(),
             "cd34".repeat(16),
+            crate::runner_preflight::VerifiedTargetIdentity::from_attested(
+                "origin_macro",
+                &crate::runner_preflight::FileIdentityGate {
+                    sha256: "ab12".repeat(16),
+                    size_bytes: 4096,
+                },
+                "x86_64",
+            )
+            .expect("test target identity seals"),
         )
         .expect("separator case id passes the constructor");
         let err = assemble_evidence_bundle(&request(&run, &output), bad)

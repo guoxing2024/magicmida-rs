@@ -2501,7 +2501,7 @@ impl RuntimeLoader {
             ));
         }
         let e_lfanew = u32::from_le_bytes(bytes[0x3C..0x40].try_into().map_err(|_| {
-            RuntimeLoadError::ExportResolutionFailed("truncated Deni4l-of-svc header".to_string())
+            RuntimeLoadError::ExportResolutionFailed("truncated DOS header".to_string())
         })?) as usize;
         let pe_off = e_lfanew;
         let (sig_s, sig_e) = range(pe_off, 0, 4, "PE signature")?;

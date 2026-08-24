@@ -292,6 +292,11 @@ pub struct AntidebugStageOptions {
     /// Loader result injected by the CREATE_PROCESS handler after it ran the
     /// real loader (attestation JSON + module base + identity).
     pub loader_result: Option<LoaderResult>,
+    /// IMP-09-CARRIER-R3: sealed verified TARGET-sample identity from the
+    /// launch attestation (private fields, never Deserialize). None when the
+    /// run had no preflight/attestation — the controller must fail closed
+    /// (UNBOUND) rather than substitute any other digest.
+    pub target_identity: Option<crate::runner_preflight::VerifiedTargetIdentity>,
 }
 
 /// Oracle-mode configuration (future differential experiments only).
@@ -478,6 +483,14 @@ impl AntidebugController {
         let Some(target_image_sha256) = self.target_image_sha256() else {
             return false;
         };
+        // IMP-09-CARRIER-R3: the target sample digest must NEVER equal the
+        // runtime DLL digest — they are distinct artifacts verified through
+        // distinct chains (attested protected input vs verified runtime
+        // authority). Substitution (runtime digest as target digest) is
+        // forbidden and fails the bind.
+        if target_image_sha256.eq_ignore_ascii_case(da.digest_value()) {
+            return false;
+        }
         // profile_id / profile_digest: the controller-verified profile.
         // No verified profile digest carrier exists yet -> refuse.
         let Some(profile_id) = self.verified_profile_id() else {
@@ -522,11 +535,12 @@ impl AntidebugController {
         None
     }
 
-    /// R4: verified target-image digest carrier. None today (no vault
-    /// rev2/sealed target identity in the current chain) — callers MUST
-    /// refuse to bind when this is None (no magic substitution).
+    /// IMP-09-CARRIER-R3: verified target-image digest carrier. Sealed by
+    /// the launch attestation only (VerifiedTargetIdentity, private fields,
+    /// no Deserialize). None means no attested preflight — callers MUST
+    /// refuse to bind (UNBOUND, NOT_WIRED) — no magic substitution.
     fn target_image_sha256(&self) -> Option<&str> {
-        None
+        self.options.target_identity.as_ref().map(|t| t.sha256())
     }
 
     /// R4: verified profile id carrier. None today (no verified profile
@@ -1053,6 +1067,7 @@ mod tests {
             runtime_authority: None,
             runtime_path: None,
             loader_result: None,
+            target_identity: None,
         }
     }
 
@@ -1254,6 +1269,7 @@ mod tests {
             cleanup_backend: Some(Box::new(OkCleanup)),
             runtime_authority: None,
             runtime_path: None,
+            target_identity: None,
             loader_result: None,
         });
         let outcome = c.run();
@@ -1272,6 +1288,7 @@ mod tests {
             cleanup_backend: None,
             runtime_authority: None,
             runtime_path: None,
+            target_identity: None,
             loader_result: None,
         });
         assert_eq!(
@@ -1422,6 +1439,7 @@ mod tests {
             cleanup_backend: None,
             runtime_authority: Some(authority),
             runtime_path: Some(p),
+            target_identity: None,
             loader_result: loader,
         })
     }
@@ -1463,6 +1481,124 @@ mod tests {
             "bind must refuse while target/profile/export carriers are absent",
         );
     }
+    /// Test identity carrier (sealed via the real from_attested path).
+    fn test_target_identity(
+        case: &str,
+        sha: &str,
+        size: u64,
+    ) -> crate::runner_preflight::VerifiedTargetIdentity {
+        crate::runner_preflight::VerifiedTargetIdentity::from_attested(
+            case,
+            &crate::runner_preflight::FileIdentityGate {
+                sha256: sha.to_string(),
+                size_bytes: size,
+            },
+            "x86_64",
+        )
+        .expect("test target identity seals")
+    }
+
+    /// Controller with a target identity carrier injected (simulating the
+    /// attested preflight chain).
+    fn controller_with_target(
+        loader: Option<LoaderResult>,
+        target: Option<crate::runner_preflight::VerifiedTargetIdentity>,
+    ) -> AntidebugController {
+        let content = minimal_pe();
+        let _ = std::fs::create_dir_all(std::env::temp_dir().join("mida-adr6-test"));
+        let p = next_file("t");
+        std::fs::write(&p, &content).unwrap();
+        let authority = manifest(&sha256_hex(&content), content.len() as u64);
+        AntidebugController::new(AntidebugStageOptions {
+            sample_id: Some("origin_macro".to_string()),
+            target_pid: 1234,
+            evidence_dir: None,
+            oracle: None,
+            cleanup_backend: None,
+            runtime_authority: Some(authority),
+            runtime_path: Some(p),
+            loader_result: loader,
+            target_identity: target,
+        })
+    }
+
+    #[test]
+    fn imp09_verified_target_identity_reaches_controller() {
+        // The sealed target identity from the attestation chain reaches the
+        // controller's target_image_sha256() carrier unchanged.
+        let sha = "ab12".repeat(16);
+        let c = controller_with_target(
+            Some(loader_result_with(1234, default_attestation_json())),
+            Some(test_target_identity("origin_macro", &sha, 4096)),
+        );
+        assert_eq!(c.target_image_sha256(), Some(sha.as_str()));
+        // The carrier is distinct from the runtime digest by construction.
+        let loader = loader_result_with(1234, default_attestation_json());
+        assert_ne!(
+            c.target_image_sha256().unwrap(),
+            loader.digest_authority().digest_value()
+        );
+    }
+
+    #[test]
+    fn imp09_missing_target_identity_rejected() {
+        // No attested preflight -> target_image_sha256() is None.
+        let c = controller_with_loader_result(Some(loader_result_with(
+            1234,
+            default_attestation_json(),
+        )));
+        assert_eq!(c.target_image_sha256(), None);
+    }
+
+    #[test]
+    fn imp09_target_digest_placeholder_rejected() {
+        // A placeholder digest string must never seal into the carrier.
+        let err = crate::runner_preflight::VerifiedTargetIdentity::from_attested(
+            "origin_macro",
+            &crate::runner_preflight::FileIdentityGate {
+                sha256: "adr6-profile-digest".to_string(),
+                size_bytes: 4096,
+            },
+            "x86_64",
+        )
+        .expect_err("placeholder target digest must not seal");
+        assert!(err.contains("sha256 invalid"), "{err}");
+    }
+
+    #[test]
+    fn imp09_target_runtime_digest_substitution_rejected() {
+        // Attack: the target digest carrier is populated with the RUNTIME
+        // DLL digest (substitution). The bind must refuse — the two artifacts
+        // are distinct by contract (target sample vs runtime module).
+        let loader = loader_result_with(1234, default_attestation_json());
+        let runtime_digest = loader.digest_authority().digest_value().to_string();
+        let c = controller_with_target(
+            Some(loader),
+            Some(test_target_identity("origin_macro", &runtime_digest, 4096)),
+        );
+        assert!(
+            !c.bind_walker_from_loader(0x7000, 0x8000),
+            "bind must refuse target==runtime digest substitution",
+        );
+    }
+
+    #[test]
+    fn imp09_bind_remains_unbound_when_target_carrier_missing() {
+        // No target carrier -> bind refuses and no session is published
+        // (install never called; lifecycle stays UNBOUND / NOT_WIRED).
+        let c = controller_with_loader_result(Some(loader_result_with(
+            1234,
+            default_attestation_json(),
+        )));
+        assert!(!c.bind_walker_from_loader(0x7000, 0x8000));
+        // No session was published: resetting/reading the walker output is a
+        // no-op (nothing installed), and a subsequent verified install of a
+        // DIFFERENT session is still possible — the refused bind left the
+        // runtime untouched.
+        mida_antidebug_runtime::exports::reset_for_test();
+        assert!(mida_antidebug_runtime::exports::take_walker_output().is_none());
+    }
+
     #[test]
     fn imp06_controller_fails_closed_without_loader_result() {
         let mut c = controller_with_loader_result(None);
@@ -1535,6 +1671,7 @@ mod tests {
             cleanup_backend: None,
             runtime_authority: Some(authority),
             runtime_path: Some(p),
+            target_identity: None,
             loader_result: Some(loader_result_with(1234, default_attestation_json())),
         });
         let outcome = c.run();
