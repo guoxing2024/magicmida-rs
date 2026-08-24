@@ -28,6 +28,11 @@ use crate::surfaces::{
     install_proc_surfaces, restore_proc_002, SURFACE_AD_PROC_002, SURFACE_AD_PROC_003,
 };
 use crate::telemetry::TelemetryChannel;
+use crate::walker_control::{WalkerDriver, WalkerIoError, WalkerMemoryProvider, WalkerPhase};
+use crate::walker_protocol::{
+    PROBE_RESULT_BYTES, WALKER_STATUS_ERROR_BAD_PARAMS, WALKER_STATUS_ERROR_MAP_FAILED,
+    WALKER_STATUS_ERROR_PROBE_ABORTED, WALKER_STATUS_OK,
+};
 
 /// Attestation JSON buffer size for the FFI handshake.
 pub const ATTESTATION_BUFFER_SIZE: usize = 8192;
@@ -901,20 +906,79 @@ fn initialize_v2_inner(
         .expect("telemetry mark ready");
     MidaAntidebugError::Ok.as_i32()
 }
-/// C ABI: Walker protocol entry (IMP-08 export surface only).
+/// Local walker session binding (controller -> runtime, in-process).
 ///
-/// IMP-08-R1 scope: the export must EXIST in the runtime DLL so the loader's
-/// 5-item wanted set can resolve it (fail-closed on missing). The Walker
-/// production caller/state machine is IMP-09 (LOCKED). Until IMP-09 lands,
-/// this entry is fail-closed: it validates that `params_va` is a
-/// canonical user VA and returns [`MidaAntidebugError::NotImplemented`]
-/// (13) - it NEVER dispatches a walker, NEVER writes process memory, and
-/// NEVER executes remote code. This is an honest NOT_IMPLEMENTED export,
-/// not an inert stub masquerading as production.
+/// The controller registers the params VA and the result section VA so the
+/// runtime export can drive the walker through the injected provider
+/// WITHOUT any live Windows memory access. All reads go through the
+/// provider; the export itself never dereferences a raw pointer.
+#[derive(Debug, Clone, Copy)]
+pub struct WalkerSessionBinding {
+    /// VA of the params blob (the argument passed to WalkerExecute).
+    pub params_va: u64,
+    /// VA of round-1 result section (round 2 sits at section_va + section_bytes).
+    pub section1_va: u64,
+    /// Target process id (must match the section identity).
+    pub target_pid: u32,
+    /// Controller/owner process id (must match the section identity).
+    pub owner_pid: u32,
+}
+
+static WALKER_PROVIDER: std::sync::RwLock<Option<Box<dyn WalkerMemoryProvider + Send + Sync>>> =
+    std::sync::RwLock::new(None);
+static WALKER_SESSION: std::sync::RwLock<Option<WalkerSessionBinding>> = std::sync::RwLock::new(None);
+
+/// Register/replace the local memory provider (in-process controller).
+pub fn set_walker_provider(p: Box<dyn WalkerMemoryProvider + Send + Sync>) -> bool {
+    match WALKER_PROVIDER.write() {
+        Ok(mut slot) => {
+            *slot = Some(p);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Register/replace the local session binding (in-process controller).
+pub fn bind_walker_session(b: WalkerSessionBinding) -> bool {
+    match WALKER_SESSION.write() {
+        Ok(mut slot) => {
+            *slot = Some(b);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Test-only reset of the provider + session singletons.
+#[cfg(test)]
+pub fn reset_walker_bindings() {
+    if let Ok(mut slot) = WALKER_PROVIDER.write() {
+        *slot = None;
+    }
+    if let Ok(mut slot) = WALKER_SESSION.write() {
+        *slot = None;
+    }
+}
+
+/// C ABI: Walker protocol entry (IMP-09-R1 production caller).
+///
+/// IMP-09-R1: this export is the PRODUCTION caller of the local walker
+/// state machine (`WalkerDriver`). When a provider + session binding are
+/// registered (local orchestration), it:
+///   1. validates the params VA (canonical user VA, nonzero);
+///   2. reads the params blob through the injected provider;
+///   3. runs `WalkerDriver` (controller_validate_entry ->
+///      controller_read_completed_section x2 -> COMPLETED/ABORTED);
+///   4. returns 0 (Ok) on COMPLETED or the protocol walker_status code
+///      (1..=5) on ABORTED.
+/// Without a provider/session it returns `NotImplemented` (13) — the
+/// honest fail-closed contract for the live-not-authorized path. It NEVER
+/// dereferences memory itself and NEVER fakes success.
 ///
 /// # Safety
-/// - No pointer is dereferenced in this function; `params_va` is
-///   only validated as a canonical user-mode VA.
+/// - No pointer is dereferenced in this function; all reads go through
+///   the injected provider.
 #[no_mangle]
 pub unsafe extern "C" fn WalkerExecute(params_va: u64) -> i32 {
     std::panic::catch_unwind(|| walker_execute_inner(params_va))
@@ -923,14 +987,120 @@ pub unsafe extern "C" fn WalkerExecute(params_va: u64) -> i32 {
 
 fn walker_execute_inner(params_va: u64) -> i32 {
     // Fail-closed validation: the VA must be a nonzero canonical user VA
-    // (kernel high-half rejected) before any IMP-09 caller may use it.
+    // (kernel high-half rejected).
     if params_va == 0 || params_va > 0x0000_7FFF_FFFF_FFFF {
         return MidaAntidebugError::InvalidArgument.as_i32();
     }
-    // IMP-09 not implemented: honest NOT_IMPLEMENTED, never fake success.
-    MidaAntidebugError::NotImplemented.as_i32()
+    let provider_guard = match WALKER_PROVIDER.read() {
+        Ok(g) => g,
+        Err(_) => return MidaAntidebugError::NotImplemented.as_i32(),
+    };
+    let Some(provider) = provider_guard.as_ref() else {
+        return MidaAntidebugError::NotImplemented.as_i32();
+    };
+    let binding_guard = match WALKER_SESSION.read() {
+        Ok(g) => g,
+        Err(_) => return MidaAntidebugError::NotImplemented.as_i32(),
+    };
+    let Some(binding_ref) = binding_guard.as_ref() else {
+        return MidaAntidebugError::NotImplemented.as_i32();
+    };
+    let binding = *binding_ref;
+    if binding.params_va != params_va {
+        return MidaAntidebugError::NotImplemented.as_i32();
+    }
+    // Read the params blob through the provider (bounded).
+    let mut header = [0u8; 0x40];
+    if provider.read(params_va, &mut header).is_err() {
+        return WALKER_STATUS_ERROR_MAP_FAILED as i32;
+    }
+    let blob_total = match usize::try_from(u32::from_le_bytes(
+        header[0x08..0x0C].try_into().unwrap(),
+    )) {
+        Ok(v) => v,
+        Err(_) => return WALKER_STATUS_ERROR_BAD_PARAMS as i32,
+    };
+    if blob_total < 0x40 || blob_total > 0x40 + 4096 * 8 {
+        return WALKER_STATUS_ERROR_BAD_PARAMS as i32;
+    }
+    let mut blob = vec![0u8; blob_total];
+    if provider.read(params_va, &mut blob).is_err() {
+        return WALKER_STATUS_ERROR_MAP_FAILED as i32;
+    }
+    // Build the driver (controller_validate_entry inside).
+    let mut driver = match WalkerDriver::new(
+        LocalExportProvider { inner: provider },
+        &blob,
+        binding.target_pid,
+        binding.owner_pid,
+    ) {
+        Ok(d) => d,
+        Err(_) => return WALKER_STATUS_ERROR_BAD_PARAMS as i32,
+    };
+    // Two full rounds: read section1 at section1_va, section2 at
+    // section1_va + section_bytes (the local layout declared by the
+    // binding). All reads through the provider; any failure aborts.
+    let sec_bytes = driver.session().section_bytes;
+    let cap = driver.session().result_capacity;
+    let round1_size = match (cap as u64)
+        .checked_mul(PROBE_RESULT_BYTES as u64)
+        .and_then(|v| v.checked_add(96))
+    {
+        Some(v) => v,
+        None => return WALKER_STATUS_ERROR_BAD_PARAMS as i32,
+    };
+    let round1_size_usize = match usize::try_from(round1_size) {
+        Ok(v) => v,
+        Err(_) => return WALKER_STATUS_ERROR_BAD_PARAMS as i32,
+    };
+    if driver.begin_round(1, 1000).is_err() {
+        return WALKER_STATUS_ERROR_BAD_PARAMS as i32;
+    }
+    let mut sec1 = vec![0u8; round1_size_usize];
+    if provider.read(binding.section1_va, &mut sec1).is_err() {
+        return WALKER_STATUS_ERROR_MAP_FAILED as i32;
+    }
+    if driver.consume_section(&sec1).is_err() {
+        return abort_status(&driver);
+    }
+    if driver.begin_round(2, 1000).is_err() {
+        return abort_status(&driver);
+    }
+    let sec2_va = match binding.section1_va.checked_add(sec_bytes) {
+        Some(v) => v,
+        None => return WALKER_STATUS_ERROR_BAD_PARAMS as i32,
+    };
+    let mut sec2 = vec![0u8; round1_size_usize];
+    if provider.read(sec2_va, &mut sec2).is_err() {
+        return WALKER_STATUS_ERROR_MAP_FAILED as i32;
+    }
+    if driver.consume_section(&sec2).is_err() {
+        return abort_status(&driver);
+    }
+    if driver.session().phase != WalkerPhase::Completed {
+        return abort_status(&driver);
+    }
+    WALKER_STATUS_OK as i32
 }
 
+/// Map the driver's abort reason to the protocol status code.
+fn abort_status(driver: &WalkerDriver<LocalExportProvider<'_>>) -> i32 {
+    match driver.session().abort_reason {
+        Some(r) => r.status_code() as i32,
+        None => WALKER_STATUS_ERROR_PROBE_ABORTED as i32,
+    }
+}
+
+/// Provider adapter that borrows the runtime's singleton provider.
+struct LocalExportProvider<'a> {
+    inner: &'a (dyn WalkerMemoryProvider + Send + Sync),
+}
+
+impl WalkerMemoryProvider for LocalExportProvider<'_> {
+    fn read(&self, va: u64, buf: &mut [u8]) -> Result<(), WalkerIoError> {
+        self.inner.read(va, buf)
+    }
+}
 /// Internal: read a NUL-terminated C string (bounded).
 unsafe fn read_cstr(p: *const std::os::raw::c_char) -> Option<String> {
     if p.is_null() {
@@ -1166,5 +1336,179 @@ mod imp08_v2_tests {
         assert_eq!(checked_blob_end(0, 0).unwrap(), 0);
         assert_eq!(checked_blob_end(0x1000, 0x100).unwrap(), 0x1100);
         assert_eq!(checked_blob_end(1, 1).unwrap(), 2);
+    }
+
+}
+
+
+#[cfg(test)]
+mod imp09_walker_export_tests {
+    use super::*;
+    use crate::walker_control::MemoryMapProvider;
+    /// Serializes tests that touch the global provider/session bindings.
+    static IMP09_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use crate::walker_protocol::{
+        encode_section, derive_session_id, MappingIdentityHeaderV2, ProbeResultV2,
+        ResultSectionHeaderV2, WalkerParamsV2, CLASSIFICATION_TYPE_C, RESULT_FLAG_GUARD_SEEN,
+        COMPLETED_FLAG_DONE, PROBE_RESULT_BYTES, WALKER_STATUS_ERROR_INTERNAL_PANIC,
+    };
+
+    fn nonce() -> u64 {
+        0x1122_3344_5566_7788
+    }
+
+    fn base() -> u64 {
+        0x0000_0040_0000
+    }
+
+    fn cand() -> Vec<u64> {
+        vec![0x1000, 0x2000, 0x3000]
+    }
+
+    fn params_blob(blob_base: u64, c: &[u64], result_bytes: u64) -> Vec<u8> {
+        let p = WalkerParamsV2::new(blob_base, c.len() as u32, 0, 16, nonce(), result_bytes);
+        p.to_blob_bytes(c).unwrap()
+    }
+
+    fn section_bytes_for(cap: u32) -> u64 {
+        96 + cap as u64 * PROBE_RESULT_BYTES as u64
+    }
+
+    fn make_section(blob_base: u64, target_pid: u32, owner_pid: u32, cap: u32) -> Vec<u8> {
+        let section_bytes = section_bytes_for(cap);
+        let ident = MappingIdentityHeaderV2::new(
+            section_bytes,
+            target_pid,
+            owner_pid,
+            nonce(),
+            derive_session_id(nonce(), blob_base, cap),
+        );
+        let mut hdr = ResultSectionHeaderV2::new(section_bytes, cap).unwrap();
+        hdr.completed_flag = COMPLETED_FLAG_DONE;
+        hdr.result_count = cap;
+        let results: Vec<ProbeResultV2> = (0..cap)
+            .map(|i| {
+                let mut r = ProbeResultV2::new(
+                    0x1000 + i as u64 * 0x1000,
+                    CLASSIFICATION_TYPE_C,
+                    RESULT_FLAG_GUARD_SEEN,
+                    (i % 2) as u8,
+                    [0xBB; 16],
+                );
+                r.set_probe_span(16);
+                r
+            })
+            .collect();
+        encode_section(&ident, &hdr, &results).unwrap()
+    }
+
+    fn setup_valid() -> (MemoryMapProvider, u64, u64) {
+        let blob_base = base();
+        let target_pid = 4242u32;
+        let owner_pid = 1234u32;
+        let c = cand();
+        let cap = c.len() as u32;
+        let sec_bytes = section_bytes_for(cap);
+        let blob = params_blob(blob_base, &c, sec_bytes);
+        let s1 = make_section(blob_base, target_pid, owner_pid, cap);
+        let s2 = make_section(blob_base, target_pid, owner_pid, cap);
+        let mut prov = MemoryMapProvider::new();
+        prov.insert(blob_base, blob);
+        prov.insert(blob_base + 0x1000, s1);
+        prov.insert(blob_base + 0x1000 + sec_bytes, s2);
+        (prov, blob_base, blob_base + 0x1000)
+    }
+
+    #[test]
+    fn walker_export_completes_two_rounds_local() {
+        let _guard = IMP09_TEST_LOCK.lock().unwrap();
+        reset_walker_bindings();
+        // Provider-backed: the export drives the full 2-round state machine.
+        let (prov, params_va, section1_va) = setup_valid();
+        assert!(set_walker_provider(Box::new(prov)));
+        assert!(bind_walker_session(WalkerSessionBinding {
+            params_va,
+            section1_va,
+            target_pid: 4242,
+            owner_pid: 1234,
+        }));
+        unsafe {
+            assert_eq!(WalkerExecute(params_va), WALKER_STATUS_OK as i32);
+        }
+    }
+
+    #[test]
+    fn walker_export_no_provider_is_not_implemented() {
+        let _guard = IMP09_TEST_LOCK.lock().unwrap();
+        reset_walker_bindings();
+        // Frozen contract: without a provider the export is honest NOT_IMPLEMENTED.
+        unsafe {
+            assert_eq!(WalkerExecute(0x0000_1000_0000), MidaAntidebugError::NotImplemented.as_i32());
+        }
+    }
+
+    #[test]
+    fn walker_export_bad_va_is_invalid_argument() {
+        unsafe {
+            assert_eq!(WalkerExecute(0), MidaAntidebugError::InvalidArgument.as_i32());
+            assert_eq!(WalkerExecute(0xFFFF_8000_0000_0000), MidaAntidebugError::InvalidArgument.as_i32());
+        }
+    }
+
+    #[test]
+    fn walker_export_aborted_on_section_tamper() {
+        let _guard = IMP09_TEST_LOCK.lock().unwrap();
+        reset_walker_bindings();
+        let (_, params_va, section1_va) = setup_valid();
+        // Tamper the section1 payload so CRC fails -> ABORTED status.
+        let cap = cand().len() as u32;
+        let sec_bytes = section_bytes_for(cap);
+        let mut prov = MemoryMapProvider::new();
+        let c = cand();
+        let blob = params_blob(base(), &c, sec_bytes);
+        prov.insert(base(), blob);
+        let mut sec = make_section(base(), 4242, 1234, cap);
+        let n = sec.len();
+        sec[n - 1] ^= 0xFF;
+        prov.insert(base() + 0x1000, sec);
+        assert!(set_walker_provider(Box::new(prov)));
+        assert!(bind_walker_session(WalkerSessionBinding {
+            params_va,
+            section1_va,
+            target_pid: 4242,
+            owner_pid: 1234,
+        }));
+        unsafe {
+            let r = WalkerExecute(params_va);
+            assert!(r != WALKER_STATUS_OK as i32, "got {r}");
+            assert!(r >= WALKER_STATUS_ERROR_BAD_PARAMS as i32 && r <= WALKER_STATUS_ERROR_INTERNAL_PANIC as i32, "got {r}");
+        }
+    }
+
+    #[test]
+    fn walker_export_aborted_on_identity_mismatch() {
+        let _guard = IMP09_TEST_LOCK.lock().unwrap();
+        reset_walker_bindings();
+        let (_, params_va, section1_va) = setup_valid();
+        let cap = cand().len() as u32;
+        let sec_bytes = section_bytes_for(cap);
+        let c = cand();
+        let blob = params_blob(base(), &c, sec_bytes);
+        let mut prov = MemoryMapProvider::new();
+        prov.insert(base(), blob);
+        // Wrong target_pid in section identity.
+        let sec = make_section(base(), 9999, 1234, cap);
+        prov.insert(base() + 0x1000, sec);
+        assert!(set_walker_provider(Box::new(prov)));
+        assert!(bind_walker_session(WalkerSessionBinding {
+            params_va,
+            section1_va,
+            target_pid: 4242,
+            owner_pid: 1234,
+        }));
+        unsafe {
+            let r = WalkerExecute(params_va);
+            assert!(r != WALKER_STATUS_OK as i32, "got {r}");
+        }
     }
 }
