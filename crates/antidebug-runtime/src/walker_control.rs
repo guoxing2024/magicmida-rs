@@ -110,6 +110,13 @@ pub struct WalkerDigestAuthority {
 }
 
 
+/// Lowercase-only hex check (R3): digests are 64 lowercase `0-9a-f`.
+/// Uppercase `A-F` is REJECTED (matches the sealed CLI authority which
+/// always emits lowercase; a forged uppercase digest cannot pass).
+fn is_lowercase_hex64(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 impl WalkerDigestAuthority {
     /// Build + validate the sealed authority (fail-closed).
     ///
@@ -126,10 +133,10 @@ impl WalkerDigestAuthority {
     ) -> Result<Self, WalkerControlError> {
         let t = target_image_sha256.trim();
         let r = runtime_module_sha256.trim();
-        if t.len() != 64 || !t.bytes().all(|b| b.is_ascii_hexdigit()) {
+        if !is_lowercase_hex64(t) {
             return Err(WalkerControlError::MissingDigest);
         }
-        if r.len() != 64 || !r.bytes().all(|b| b.is_ascii_hexdigit()) {
+        if !is_lowercase_hex64(r) {
             return Err(WalkerControlError::MissingDigest);
         }
         if module_base == 0 || walker_export_rva == 0 {
@@ -142,7 +149,7 @@ impl WalkerDigestAuthority {
             ))?;
         let pid = profile_id.trim();
         let pd = profile_digest.trim();
-        if pid.is_empty() || pd.len() != 64 || !pd.bytes().all(|b| b.is_ascii_hexdigit()) {
+        if pid.is_empty() || !is_lowercase_hex64(pd) {
             return Err(WalkerControlError::MissingDigest);
         }
         Ok(Self {

@@ -968,10 +968,11 @@ static WALKER_SESSION: PoisonSafe<Option<WalkerSessionBinding>> = PoisonSafe::ne
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalkerSessionLifecycle {
     Unbound = 0,
-    Ready = 1,
-    Running = 2,
-    Completed = 3,
-    Aborted = 4,
+    Binding = 1,
+    Ready = 2,
+    Running = 3,
+    Completed = 4,
+    Aborted = 5,
 }
 
 static WALKER_SESSION_LIFECYCLE: std::sync::atomic::AtomicU8 =
@@ -980,9 +981,10 @@ static WALKER_SESSION_LIFECYCLE: std::sync::atomic::AtomicU8 =
 fn lifecycle_get() -> WalkerSessionLifecycle {
     match WALKER_SESSION_LIFECYCLE.load(std::sync::atomic::Ordering::SeqCst) {
         0 => WalkerSessionLifecycle::Unbound,
-        1 => WalkerSessionLifecycle::Ready,
-        2 => WalkerSessionLifecycle::Running,
-        3 => WalkerSessionLifecycle::Completed,
+        1 => WalkerSessionLifecycle::Binding,
+        2 => WalkerSessionLifecycle::Ready,
+        3 => WalkerSessionLifecycle::Running,
+        4 => WalkerSessionLifecycle::Completed,
         _ => WalkerSessionLifecycle::Aborted,
     }
 }
@@ -998,6 +1000,18 @@ fn lifecycle_claim() -> bool {
         .compare_exchange(
             WalkerSessionLifecycle::Ready as u8,
             WalkerSessionLifecycle::Running as u8,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_ok()
+}
+
+/// R3: atomically claim UNBOUND -> BINDING (the ONLY bind entry).
+fn lifecycle_claim_bind() -> bool {
+    WALKER_SESSION_LIFECYCLE
+        .compare_exchange(
+            WalkerSessionLifecycle::Unbound as u8,
+            WalkerSessionLifecycle::Binding as u8,
             std::sync::atomic::Ordering::SeqCst,
             std::sync::atomic::Ordering::SeqCst,
         )
@@ -1021,13 +1035,15 @@ pub fn set_walker_provider(p: Box<dyn WalkerMemoryProvider + Send + Sync>) -> bo
 /// session stays consumed until [`reset_walker_bindings`] (test-only) or
 /// an explicit fresh lifecycle.
 pub fn bind_walker_session(b: WalkerSessionBinding) -> bool {
-    // R2: refuse to re-bind over a consumed (terminal) session.
-    match lifecycle_get() {
-        WalkerSessionLifecycle::Completed | WalkerSessionLifecycle::Aborted => return false,
-        _ => {}
+    // R3: atomically claim UNBOUND -> BINDING. READY/RUNNING/COMPLETED/
+    // ABORTED all reject a bind (no overwriting a live or consumed
+    // session; no bind-vs-execute race).
+    if !lifecycle_claim_bind() {
+        return false;
     }
     let mut slot = WALKER_SESSION.write();
     *slot = Some(b);
+    // Publish READY only after the binding is fully installed.
     lifecycle_set(WalkerSessionLifecycle::Ready);
     true
 }
@@ -1089,12 +1105,20 @@ pub fn reset_walker_bindings() {
     let mut slot2 = WALKER_SESSION.write();
     *slot2 = None;
     lifecycle_set(WalkerSessionLifecycle::Unbound);
+    #[cfg(test)]
+    IMP09_OUTPUT_SINK_FAIL.store(false, std::sync::atomic::Ordering::SeqCst);
     match WALKER_OUTPUT.write() {
         Ok(mut slot) => *slot = None,
         Err(p) => *p.into_inner() = None,
     }
 }
 
+/// Test-only injectable output-sink failure (R3): when set, the output
+/// channel write reports a failure WITHOUT permanently poisoning the
+/// shared static. Each test gets a fresh state via reset_walker_bindings();
+/// no cross-test contamination, no early-return masking.
+#[cfg(test)]
+static IMP09_OUTPUT_SINK_FAIL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Poison-safe explicit state container (R2 P1-1).
 ///
 /// std RwLock poisons permanently on panic; this wrapper RECOVERS the
@@ -1150,8 +1174,17 @@ impl<T> PoisonSafe<T> {
 ///   the injected provider.
 #[no_mangle]
 pub unsafe extern "C" fn WalkerExecute(params_va: u64) -> i32 {
-    std::panic::catch_unwind(|| walker_execute_inner(params_va))
-        .unwrap_or(MidaAntidebugError::InternalPanic.as_i32())
+    match std::panic::catch_unwind(|| walker_execute_inner(params_va)) {
+        Ok(status) => status,
+        Err(_) => {
+            // R3 P1-1: a panic anywhere in the production path (provider
+            // read, Drop, ...) must terminate the session: any error ->
+            // ABORTED. The atomic claim already moved the lifecycle to
+            // RUNNING; without this the module would stay RUNNING forever.
+            lifecycle_set(WalkerSessionLifecycle::Aborted);
+            MidaAntidebugError::InternalPanic.as_i32()
+        }
+    }
 }
 
 fn walker_execute_inner(params_va: u64) -> i32 {
@@ -1292,6 +1325,14 @@ fn walker_execute_inner(params_va: u64) -> i32 {
         }
     };
     // Output channel (P0-1/P1-2): the write MUST succeed before success.
+    #[cfg(test)]
+    if IMP09_OUTPUT_SINK_FAIL.load(std::sync::atomic::Ordering::SeqCst) {
+        driver.fail_abort(WalkerControlError::Io(WalkerIoError::Missing {
+            va: 0,
+        }));
+        lifecycle_set(WalkerSessionLifecycle::Aborted);
+        return WALKER_STATUS_ERROR_INTERNAL_PANIC as i32;
+    }
     match WALKER_OUTPUT.write() {
         Ok(mut slot) => {
             *slot = Some(anchored);
@@ -1609,10 +1650,6 @@ mod imp09_walker_export_tests {
     use crate::walker_control::MemoryMapProvider;
     /// Serializes tests that touch the global provider/session bindings.
     static IMP09_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-/// Set by the hostile poison tests; all other IMP-09 tests skip once the
-/// shared statics have been intentionally poisoned (they cannot be
-/// un-poisoned, so they are ordered last by self-serialization).
-static IMP09_POISON_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     use crate::walker_protocol::{
         encode_section, derive_session_id, MappingIdentityHeaderV2, ProbeResultV2,
         ResultSectionHeaderV2, WalkerParamsV2, CLASSIFICATION_TYPE_C, RESULT_FLAG_GUARD_SEEN,
@@ -1710,12 +1747,7 @@ static IMP09_POISON_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
     #[test]
     fn walker_export_completes_two_rounds_local() {
         let _guard = IMP09_TEST_LOCK.lock().unwrap();
-        if IMP09_POISON_DONE.load(std::sync::atomic::Ordering::SeqCst) {
-            return;
-        }
-
         reset_walker_bindings();
-        // Provider-backed: the export drives the full 2-round state machine.
         let (prov, params_va, section1_va) = setup_valid();
         assert!(set_walker_provider(Box::new(prov)));
         assert!(bind_walker_session(binding(params_va, section1_va)));
@@ -1727,12 +1759,7 @@ static IMP09_POISON_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
     #[test]
     fn walker_export_no_provider_is_not_implemented() {
         let _guard = IMP09_TEST_LOCK.lock().unwrap();
-        if IMP09_POISON_DONE.load(std::sync::atomic::Ordering::SeqCst) {
-            return;
-        }
-
         reset_walker_bindings();
-        // Frozen contract: without a provider the export is honest NOT_IMPLEMENTED.
         unsafe {
             assert_eq!(WalkerExecute(0x0000_1000_0000), MidaAntidebugError::NotImplemented.as_i32());
         }
@@ -1749,13 +1776,9 @@ static IMP09_POISON_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
     #[test]
     fn walker_export_aborted_on_section_tamper() {
         let _guard = IMP09_TEST_LOCK.lock().unwrap();
-        if IMP09_POISON_DONE.load(std::sync::atomic::Ordering::SeqCst) {
-            return;
-        }
-
         reset_walker_bindings();
-        let (_, params_va, section1_va) = setup_valid();
-        // Tamper the section1 payload so CRC fails -> ABORTED status.
+        let params_va = base();
+        let section1_va = base() + 0x1000;
         let cap = cand().len() as u32;
         let sec_bytes = section_bytes_for(cap);
         let mut prov = MemoryMapProvider::new();
@@ -1778,12 +1801,9 @@ static IMP09_POISON_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
     #[test]
     fn walker_export_aborted_on_identity_mismatch() {
         let _guard = IMP09_TEST_LOCK.lock().unwrap();
-        if IMP09_POISON_DONE.load(std::sync::atomic::Ordering::SeqCst) {
-            return;
-        }
-
         reset_walker_bindings();
-        let (_, params_va, section1_va) = setup_valid();
+        let params_va = base();
+        let section1_va = base() + 0x1000;
         let cap = cand().len() as u32;
         let sec_bytes = section_bytes_for(cap);
         let c = cand();
@@ -1804,12 +1824,7 @@ static IMP09_POISON_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
     #[test]
     fn walker_export_terminal_state_rejects_second_call() {
         let _guard = IMP09_TEST_LOCK.lock().unwrap();
-        if IMP09_POISON_DONE.load(std::sync::atomic::Ordering::SeqCst) {
-            return;
-        }
-
         reset_walker_bindings();
-        // P1-3: after COMPLETED the binding is consumed; a second call rejects.
         let (prov, params_va, section1_va) = setup_valid();
         assert!(set_walker_provider(Box::new(prov)));
         assert!(bind_walker_session(binding(params_va, section1_va)));
@@ -1826,13 +1841,9 @@ static IMP09_POISON_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
     #[test]
     fn walker_export_aborted_state_rejects_second_call() {
         let _guard = IMP09_TEST_LOCK.lock().unwrap();
-        if IMP09_POISON_DONE.load(std::sync::atomic::Ordering::SeqCst) {
-            return;
-        }
-
         reset_walker_bindings();
-        // P1-3: after ABORTED the binding is consumed; a second call rejects.
-        let (_, params_va, section1_va) = setup_valid();
+        let params_va = base();
+        let section1_va = base() + 0x1000;
         let cap = cand().len() as u32;
         let sec_bytes = section_bytes_for(cap);
         let c = cand();
@@ -1858,12 +1869,7 @@ static IMP09_POISON_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
     #[test]
     fn walker_export_produces_anchored_attestation_output() {
         let _guard = IMP09_TEST_LOCK.lock().unwrap();
-        if IMP09_POISON_DONE.load(std::sync::atomic::Ordering::SeqCst) {
-            return;
-        }
-
         reset_walker_bindings();
-        // P0-1: completed run must produce a validated v2 attestation output.
         let (prov, params_va, section1_va) = setup_valid();
         assert!(set_walker_provider(Box::new(prov)));
         assert!(bind_walker_session(binding(params_va, section1_va)));
@@ -1884,13 +1890,7 @@ static IMP09_POISON_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
     #[test]
     fn walker_export_rejects_high_32bit_blob_total() {
         let _guard = IMP09_TEST_LOCK.lock().unwrap();
-        if IMP09_POISON_DONE.load(std::sync::atomic::Ordering::SeqCst) {
-            return;
-        }
-
         reset_walker_bindings();
-        // #6: blob_total_bytes is a u64 field; a high 32-bit set must be
-        // rejected BEFORE allocation (checked u64->usize + range).
         let (mut prov, params_va, section1_va) = setup_valid();
         // Patch the params blob: set blob_total_bytes high bit.
         let mut blob = vec![0u8; 0x40 + cand().len() * 8];
@@ -1915,9 +1915,6 @@ static IMP09_POISON_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
         // the atomic READY->RUNNING claim guarantees at most one enters the
         // walk (the loser gets NotImplemented).
         let _guard = IMP09_TEST_LOCK.lock().unwrap();
-        if IMP09_POISON_DONE.load(std::sync::atomic::Ordering::SeqCst) {
-            return;
-        }
 
         reset_walker_bindings();
         let (prov, params_va, section1_va) = setup_valid();
@@ -1952,22 +1949,15 @@ static IMP09_POISON_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
         );
     }
     #[test]
-    fn walker_export_output_lock_poison_fails_closed() {
-        // R2 P1-2: if the output channel write fails (poisoned lock), the
-        // execution MUST NOT return WALKER_STATUS_OK; lifecycle -> ABORTED.
+    fn walker_export_output_sink_failure_fails_closed() {
+        // R3: output sink failure (injectable, no permanent poisoning) must
+        // NOT return WALKER_STATUS_OK; lifecycle -> ABORTED; no output.
         let _guard = IMP09_TEST_LOCK.lock().unwrap();
-        IMP09_POISON_DONE.store(true, std::sync::atomic::Ordering::SeqCst);
         reset_walker_bindings();
         let (prov, params_va, section1_va) = setup_valid();
         assert!(set_walker_provider(Box::new(prov)));
         assert!(bind_walker_session(binding(params_va, section1_va)));
-        // Poison WALKER_OUTPUT from a helper thread so IMP09_TEST_LOCK
-        // (held here) is NOT poisoned by the panic.
-        let h = std::thread::spawn(|| {
-            let _hold = WALKER_OUTPUT.write().unwrap();
-            panic!("poison output lock");
-        });
-        assert!(h.join().is_err(), "helper must panic");
+        IMP09_OUTPUT_SINK_FAIL.store(true, std::sync::atomic::Ordering::SeqCst);
         unsafe {
             let r = WalkerExecute(params_va);
             assert_eq!(
@@ -1979,10 +1969,23 @@ static IMP09_POISON_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
         assert_eq!(
             lifecycle_get(),
             WalkerSessionLifecycle::Aborted,
-            "output write failure must abort the session",
+            "output sink failure must abort the session",
         );
+        assert!(
+            take_walker_output().is_none(),
+            "failed run must not leave an output",
+        );
+        // A second call must be rejected (terminal).
+        unsafe {
+            let r2 = WalkerExecute(params_va);
+            assert_eq!(
+                r2,
+                MidaAntidebugError::NotImplemented.as_i32(),
+                "got {r2}",
+            );
+        }
+        IMP09_OUTPUT_SINK_FAIL.store(false, std::sync::atomic::Ordering::SeqCst);
     }
-
     #[test]
     fn walker_export_provider_lock_poison_recovers() {
         // R2 P1-1: provider state uses a PoisonSafe container (the audit's
@@ -1990,9 +1993,6 @@ static IMP09_POISON_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
         // holding the provider lock must NOT wedge the module: the next
         // access recovers and a fresh walk still runs.
         let _guard = IMP09_TEST_LOCK.lock().unwrap();
-        if IMP09_POISON_DONE.load(std::sync::atomic::Ordering::SeqCst) {
-            return;
-        }
 
         reset_walker_bindings();
         let (prov, params_va, section1_va) = setup_valid();
@@ -2021,9 +2021,6 @@ static IMP09_POISON_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
         // R2 P1-1: session state uses a PoisonSafe container. A panic while
         // holding the session lock must NOT wedge the module.
         let _guard = IMP09_TEST_LOCK.lock().unwrap();
-        if IMP09_POISON_DONE.load(std::sync::atomic::Ordering::SeqCst) {
-            return;
-        }
 
         reset_walker_bindings();
         let (prov, params_va, section1_va) = setup_valid();
@@ -2049,14 +2046,140 @@ static IMP09_POISON_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
         );
     }
     #[test]
+    fn walker_export_provider_read_panic_aborts() {
+        // R3 P1-1: a panic inside the provider's read() (production path)
+        // must leave lifecycle ABORTED, return non-OK, reject a second
+        // call, and produce no output.
+        let _guard = IMP09_TEST_LOCK.lock().unwrap();
+        reset_walker_bindings();
+        let (mut prov, params_va, section1_va) = setup_valid();
+        // Replace the provider with one whose read() panics.
+        struct PanicProvider;
+        impl WalkerMemoryProvider for PanicProvider {
+            fn read(&self, _va: u64, _buf: &mut [u8]) -> Result<(), WalkerIoError> {
+                panic!("provider read panic");
+            }
+        }
+        assert!(set_walker_provider(Box::new(PanicProvider)));
+        assert!(bind_walker_session(binding(params_va, section1_va)));
+        unsafe {
+            let r = WalkerExecute(params_va);
+            assert_eq!(
+                r,
+                MidaAntidebugError::InternalPanic.as_i32(),
+                "got {r}",
+            );
+        }
+        assert_eq!(
+            lifecycle_get(),
+            WalkerSessionLifecycle::Aborted,
+            "provider panic must abort the session",
+        );
+        assert!(
+            take_walker_output().is_none(),
+            "panicked run must not produce output",
+        );
+        unsafe {
+            let r2 = WalkerExecute(params_va);
+            assert_eq!(
+                r2,
+                MidaAntidebugError::NotImplemented.as_i32(),
+                "got {r2}",
+            );
+        }
+    }
+
+    #[test]
+    fn walker_export_bind_vs_execute_one_wins() {
+        // R3 P0-2: bind vs WalkerExecute — the atomic state machine allows
+        // at most one session to be published and executed. A concurrent
+        // bind during RUNNING must fail (no overwrite).
+        let _guard = IMP09_TEST_LOCK.lock().unwrap();
+        reset_walker_bindings();
+        let (prov, params_va, section1_va) = setup_valid();
+        assert!(set_walker_provider(Box::new(prov)));
+        // Bind once (UNBOUND -> BINDING -> READY).
+        assert!(bind_walker_session(binding(params_va, section1_va)));
+        // A second bind on READY must be refused (cannot overwrite).
+        assert!(!bind_walker_session(binding(params_va, section1_va)));
+        // Execute (READY -> RUNNING).
+        unsafe {
+            let r = WalkerExecute(params_va);
+            assert_eq!(r, WALKER_STATUS_OK as i32, "got {r}");
+        }
+        assert_eq!(
+            lifecycle_get(),
+            WalkerSessionLifecycle::Completed,
+            "execution must complete",
+        );
+        // Bind after COMPLETED must fail (terminal).
+        assert!(!bind_walker_session(binding(params_va, section1_va)));
+    }
+
+    #[test]
+    fn walker_export_bind_vs_bind_one_wins() {
+        // R3 P0-2: two concurrent binds — only ONE may win the
+        // UNBOUND -> BINDING claim.
+        let _guard = IMP09_TEST_LOCK.lock().unwrap();
+        reset_walker_bindings();
+        let (prov, params_va, section1_va) = setup_valid();
+        assert!(set_walker_provider(Box::new(prov)));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let b1 = std::sync::Arc::clone(&barrier);
+        let b2 = std::sync::Arc::clone(&barrier);
+        let bnd = binding(params_va, section1_va);
+        let bnd2 = bnd.clone();
+        let h1 = std::thread::spawn(move || {
+            b1.wait();
+            bind_walker_session(bnd2)
+        });
+        let h2 = std::thread::spawn(move || {
+            b2.wait();
+            bind_walker_session(bnd)
+        });
+        barrier.wait();
+        let r1 = h1.join().expect("thread 1");
+        let r2 = h2.join().expect("thread 2");
+        let wins = [r1, r2].iter().filter(|&&b| b).count();
+        assert_eq!(
+            wins, 1,
+            "exactly one concurrent bind must win (r1={r1}, r2={r2})",
+        );
+    }
+
+    #[test]
+    fn walker_export_uppercase_digest_rejected() {
+        // R3: lowercase-only digest enforcement — uppercase A-F must be
+        // rejected by the bind gate.
+        let _guard = IMP09_TEST_LOCK.lock().unwrap();
+        reset_walker_bindings();
+        let (prov, params_va, section1_va) = setup_valid();
+        assert!(set_walker_provider(Box::new(prov)));
+        let upper = "A".repeat(64);
+        let ok = bind_walker_session_verified(
+            params_va,
+            section1_va,
+            4242,
+            1234,
+            &upper,
+            &"b".repeat(64),
+            base(),
+            0x1234,
+            "walker-local",
+            &"c".repeat(64),
+        );
+        assert!(!ok, "uppercase digest must be rejected");
+        assert_eq!(
+            lifecycle_get(),
+            WalkerSessionLifecycle::Unbound,
+            "rejected bind must roll back to UNBOUND",
+        );
+    }
+    #[test]
     fn walker_export_bind_after_terminal_rejected() {
         // R2 P0-2: bind_walker_session must NOT silently reset a consumed
         // terminal session.
         let _guard = IMP09_TEST_LOCK.lock().unwrap();
-        if IMP09_POISON_DONE.load(std::sync::atomic::Ordering::SeqCst) {
-            return;
-        }
-
         reset_walker_bindings();
         let (prov, params_va, section1_va) = setup_valid();
         assert!(set_walker_provider(Box::new(prov)));
