@@ -558,11 +558,16 @@ pub fn unpack(
         // Main thread is suspended from CREATE_SUSPENDED; keep it that way
         // while the loader's remote LoadLibraryW + init run.
         let _ = unsafe { SuspendThread(h_thread) };
+        // IMP-09-PROFILE-SOURCE-R1: profile id/digest come from the sealed
+        // verified carrier (attestation-bound). No preflight/profile ->
+        // None -> the loader fails closed (no bare-string substitution).
+        let profile_carrier = evidence_ctx
+            .as_ref()
+            .and_then(|ctx| ctx.profile_identity());
         let outcome = crate::unpacker::runtime_loader::run_runtime_loader(
             dbg.process_handle(),
             dbg.pid(),
-            "ahk_gto_x64_v1",
-            "adr6-profile-digest",
+            profile_carrier,
             &mut noop_drain,
         );
         let _ = unsafe { ResumeThread(h_thread) };
@@ -767,6 +772,12 @@ pub fn unpack(
                 target_identity: evidence_ctx
                     .as_ref()
                     .map(|ctx| ctx.target_identity().clone()),
+                // IMP-09-PROFILE-SOURCE-R1: sealed verified profile identity
+                // from the launch attestation (None without preflight or for
+                // cases with no profile object -> fail closed).
+                profile_identity: evidence_ctx
+                    .as_ref()
+                    .and_then(|ctx| ctx.profile_identity().cloned()),
             },
         );
         if let Ok(loader_result) = loader_outcome {
@@ -1165,6 +1176,14 @@ pub fn unpack(
                             target_identity: evidence_ctx
                                 .as_ref()
                                 .map(|ctx| ctx.target_identity().clone()),
+                            // IMP-09-PROFILE-SOURCE-R1: the sealed verified
+                            // profile identity flows from the launch
+                            // attestation into the controller (same source
+                            // object as the target identity; None when no
+                            // preflight or no profile object — fail closed).
+                            profile_identity: evidence_ctx
+                                .as_ref()
+                                .and_then(|ctx| ctx.profile_identity().cloned()),
                         },
                     );
                     // ADR-6: run the self-owned loader (verify + load +
@@ -1244,11 +1263,15 @@ pub fn unpack(
                                 .join("; ")
                         ),
                     );
+                    // IMP-09-PROFILE-SOURCE-R1: profile id/digest come from the
+                    // sealed verified carrier (attestation-bound). None ->
+                    // the loader fails closed (no bare-string substitution).
                     let loader_outcome = crate::unpacker::runtime_loader::run_runtime_loader(
                         target_handle,
                         pid,
-                        "oreans_origin_x64_v1",
-                        "adr6-profile-digest",
+                        evidence_ctx
+                            .as_ref()
+                            .and_then(|ctx| ctx.profile_identity()),
                         &mut drain,
                     );
                     match loader_outcome {

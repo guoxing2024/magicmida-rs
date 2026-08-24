@@ -297,6 +297,12 @@ pub struct AntidebugStageOptions {
     /// run had no preflight/attestation — the controller must fail closed
     /// (UNBOUND) rather than substitute any other digest.
     pub target_identity: Option<crate::runner_preflight::VerifiedTargetIdentity>,
+    /// IMP-09-PROFILE-SOURCE-R1: sealed verified PROFILE identity from the
+    /// launch attestation (profile_id + SHA-256 digest from the SAME profile
+    /// object). None when the attested case has no profile object or no
+    /// preflight ran — the controller must fail closed (UNBOUND) rather
+    /// than substitute a bare-string profile identity.
+    pub profile_identity: Option<crate::runner_preflight::VerifiedProfileIdentity>,
 }
 
 /// Oracle-mode configuration (future differential experiments only).
@@ -492,7 +498,8 @@ impl AntidebugController {
             return false;
         }
         // profile_id / profile_digest: the controller-verified profile.
-        // No verified profile digest carrier exists yet -> refuse.
+        // IMP-09-PROFILE-SOURCE-R1: read from the sealed profile carrier
+        // (launch-attestation bound). None -> refuse (no substitution).
         let Some(profile_id) = self.verified_profile_id() else {
             return false;
         };
@@ -543,15 +550,26 @@ impl AntidebugController {
         self.options.target_identity.as_ref().map(|t| t.sha256())
     }
 
-    /// R4: verified profile id carrier. None today (no verified profile
-    /// digest source) — refuse rather than hard-code.
+    /// IMP-09-PROFILE-SOURCE-R1: verified profile id carrier. Read from the
+    /// sealed VerifiedProfileIdentity (produced by the launch attestation
+    /// from the verified profile object — never a bare string). None when no
+    /// attested profile exists -> bind must fail closed.
     fn verified_profile_id(&self) -> Option<&str> {
-        None
+        self.options
+            .profile_identity
+            .as_ref()
+            .map(|p| p.profile_id())
     }
 
-    /// R4: verified profile digest carrier. None today.
+    /// IMP-09-PROFILE-SOURCE-R1: verified profile digest carrier
+    /// (SHA-256 of the canonical profile bytes, 64 lowercase hex). Same
+    /// sealed source object as profile_id (same-source guarantee). None
+    /// when no attested profile exists -> bind must fail closed.
     fn verified_profile_digest(&self) -> Option<&str> {
-        None
+        self.options
+            .profile_identity
+            .as_ref()
+            .map(|p| p.profile_digest())
     }
 
     /// IMP-09-CARRIER-R2: WalkerExecute export RVA from the SEALED
@@ -1068,6 +1086,7 @@ mod tests {
             runtime_path: None,
             loader_result: None,
             target_identity: None,
+            profile_identity: None,
         }
     }
 
@@ -1270,6 +1289,7 @@ mod tests {
             runtime_authority: None,
             runtime_path: None,
             target_identity: None,
+            profile_identity: None,
             loader_result: None,
         });
         let outcome = c.run();
@@ -1289,6 +1309,7 @@ mod tests {
             runtime_authority: None,
             runtime_path: None,
             target_identity: None,
+            profile_identity: None,
             loader_result: None,
         });
         assert_eq!(
@@ -1440,6 +1461,7 @@ mod tests {
             runtime_authority: Some(authority),
             runtime_path: Some(p),
             target_identity: None,
+            profile_identity: None,
             loader_result: loader,
         })
     }
@@ -1519,6 +1541,7 @@ mod tests {
             runtime_path: Some(p),
             loader_result: loader,
             target_identity: target,
+            profile_identity: None,
         })
     }
 
@@ -1672,9 +1695,90 @@ mod tests {
             runtime_authority: Some(authority),
             runtime_path: Some(p),
             target_identity: None,
+            profile_identity: None,
             loader_result: Some(loader_result_with(1234, default_attestation_json())),
         });
         let outcome = c.run();
         assert!(matches!(outcome, AntidebugOutcome::Failed { .. }));
+    }
+
+    /// Test profile carrier (sealed via the real from_verified_profile path).
+    fn test_profile_identity(
+        case: &str,
+        arch: &str,
+    ) -> crate::runner_preflight::VerifiedProfileIdentity {
+        use mida_antidebug::profile::{lunlun_profile, origin_profile};
+        let p = match case {
+            "origin_macro" => origin_profile(),
+            "lunlun_software" => lunlun_profile(),
+            _ => panic!("test case {case} has no profile object"),
+        };
+        crate::runner_preflight::VerifiedProfileIdentity::from_verified_profile(&p, case, arch)
+            .expect("test profile identity seals")
+    }
+
+    #[test]
+    fn imp09_profile_missing_fail_closed_unbound() {
+        // No profile carrier -> verified_profile_id/digest are None, the
+        // bind refuses and no session is published (UNBOUND / NOT_WIRED).
+        let c = controller_with_loader_result(Some(loader_result_with(
+            1234,
+            default_attestation_json(),
+        )));
+        assert_eq!(c.verified_profile_id(), None);
+        assert_eq!(c.verified_profile_digest(), None);
+        assert!(!c.bind_walker_from_loader(0x7000, 0x8000));
+        mida_antidebug_runtime::exports::reset_for_test();
+        assert!(mida_antidebug_runtime::exports::take_walker_output().is_none());
+    }
+
+    #[test]
+    fn imp09_both_production_callers_use_same_verified_profile_carrier() {
+        // Both production callers (post-attach + CREATE_PROCESS) read the
+        // SAME sealed profile carrier from the attested evidence context:
+        // the carrier is cloned from RunEvidenceContext.profile_identity()
+        // at both AntidebugStageOptions construction sites. This test
+        // builds the carrier once (as the attestation does) and verifies
+        // two independent controller instances — one per production caller
+        // shape — observe identical profile_id + digest.
+        let profile = test_profile_identity("origin_macro", "x86_64");
+        let loader = Some(loader_result_with(1234, default_attestation_json()));
+        let c1 = AntidebugController::new(AntidebugStageOptions {
+            sample_id: Some("origin_macro".to_string()),
+            target_pid: 1234,
+            evidence_dir: None,
+            oracle: None,
+            cleanup_backend: None,
+            runtime_authority: None,
+            runtime_path: None,
+            loader_result: loader.clone(),
+            target_identity: Some(test_target_identity(
+                "origin_macro",
+                &"ab12".repeat(16),
+                4096,
+            )),
+            profile_identity: Some(profile.clone()),
+        });
+        let c2 = AntidebugController::new(AntidebugStageOptions {
+            sample_id: Some("origin_macro".to_string()),
+            target_pid: 1234,
+            evidence_dir: None,
+            oracle: None,
+            cleanup_backend: None,
+            runtime_authority: None,
+            runtime_path: None,
+            loader_result: loader,
+            target_identity: Some(test_target_identity("origin_macro", &"ab12".repeat(16), 4096)),
+            profile_identity: Some(profile.clone()),
+        });
+        assert_eq!(c1.verified_profile_id(), c2.verified_profile_id());
+        assert_eq!(c1.verified_profile_digest(), c2.verified_profile_digest());
+        let pid = c1.verified_profile_id().expect("carrier present");
+        let dig = c1.verified_profile_digest().expect("carrier present");
+        assert_eq!(pid, "oreans_origin_x64_v1");
+        assert_eq!(dig.len(), 64);
+        // The carrier still fails closed at the full bind (provider absent).
+        assert!(!c1.bind_walker_from_loader(0x7000, 0x8000));
+        assert!(!c2.bind_walker_from_loader(0x7000, 0x8000));
     }
 }

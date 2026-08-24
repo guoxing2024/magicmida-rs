@@ -626,6 +626,8 @@ pub fn classify_wait_status(raw: u32) -> RemoteWaitOutcome {
 pub enum RuntimeLoadError {
     #[error("runtime authority unavailable: {0}: {1}")]
     AuthorityUnavailable(String, String),
+    #[error("verified profile carrier unavailable: no attested profile identity (fail-closed, no bare-string substitution)")]
+    ProfileCarrierUnavailable,
     #[error("runtime authority mismatch: {0}")]
     AuthorityMismatch(String),
     #[error("architecture unsupported: {0} (x64 only)")]
@@ -3105,10 +3107,16 @@ pub fn verify_runtime_provenance(
 pub fn run_runtime_loader(
     target: HANDLE,
     target_pid: u32,
-    profile_id: &str,
-    profile_digest: &str,
+    profile: Option<&crate::runner_preflight::VerifiedProfileIdentity>,
     drain: &mut dyn FnMut(u32) -> Result<Option<mida_core::DrainReceipt>, mida_core::CoreError>,
 ) -> Result<crate::unpacker::antidebug_controller::LoaderResult, RuntimeLoadError> {
+    // IMP-09-PROFILE-SOURCE-R1: the profile id/digest MUST come from the
+    // sealed carrier. None -> fail closed (no bare-string substitution).
+    let Some(profile) = profile else {
+        return Err(RuntimeLoadError::ProfileCarrierUnavailable);
+    };
+    let profile_id = profile.profile_id();
+    let profile_digest = profile.profile_digest();
     let authority = runtime_authority()?;
     let Some(runtime_path) = runtime_artifact_path() else {
         return Err(RuntimeLoadError::AuthorityUnavailable(

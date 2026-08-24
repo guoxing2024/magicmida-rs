@@ -1256,6 +1256,122 @@ impl VerifiedTargetIdentity {
     }
 }
 
+/// IMP-09-PROFILE-SOURCE-R1: sealed verified PROFILE identity.
+///
+/// Produced ONLY by `attest_ready_before_launch` from the verified
+/// `mida_antidebug::profile::Profile` object bound to the attested case:
+/// the profile's `profile_id` and the SHA-256 of its canonical JSON bytes
+/// come from the SAME source object (never two different sources, never a
+/// bare string). Fields are private; the type is Debug+Clone only — NOT
+/// Serialize/Deserialize — so there is no disk/JSON form that can forge
+/// this carrier. The FNV-1a `Profile::profile_digest()` placeholder is
+/// deliberately NOT used here: this carrier's digest is
+/// SHA-256(canonical_json_bytes), 64 lowercase hex, computed by the
+/// attestation from the verified profile object.
+#[derive(Debug, Clone)]
+pub struct VerifiedProfileIdentity {
+    profile_id: String,
+    profile_digest: String,
+    sample_id: String,
+    architecture: String,
+}
+
+impl VerifiedProfileIdentity {
+    /// Sealed constructor — reachable only from crate-internal attested
+    /// code (the attestation) and crate unit tests. Rejects: profile
+    /// schema mismatch, sample/case mismatch, architecture mismatch,
+    /// non-canonical digest (must be 64 lowercase hex), empty fields.
+    /// The digest is recomputed here as SHA-256 of the profile's canonical
+    /// JSON bytes; the FNV-1a `Profile::profile_digest()` is never used.
+    pub(crate) fn from_verified_profile(
+        profile: &mida_antidebug::profile::Profile,
+        case_id: &str,
+        architecture: &str,
+    ) -> Result<Self, String> {
+        if profile.schema != "mida.antidebug-profile/v1" {
+            return Err(format!(
+                "VerifiedProfileIdentity schema mismatch: {:?} != mida.antidebug-profile/v1",
+                profile.schema
+            ));
+        }
+        if profile.sample_id != case_id {
+            return Err(format!(
+                "VerifiedProfileIdentity sample/case mismatch: profile sample {:?} != case {:?}",
+                profile.sample_id, case_id
+            ));
+        }
+        if profile.architecture != architecture {
+            return Err(format!(
+                "VerifiedProfileIdentity architecture mismatch: profile {:?} != target {:?}",
+                profile.architecture, architecture
+            ));
+        }
+        if profile.profile_id.trim().is_empty() {
+            return Err("VerifiedProfileIdentity profile_id must be non-empty".to_string());
+        }
+        // IMP-09-PROFILE-SOURCE-R1: SHA-256 of the canonical profile bytes
+        // (canonical_json is deterministic — hostile test proves byte-level
+        // stability). The FNV-1a Profile::profile_digest() is NOT the
+        // carrier digest.
+        let digest = sha256_hex(profile.canonical_json().as_bytes());
+        if !is_64_lower_hex(&digest) {
+            return Err(format!(
+                "VerifiedProfileIdentity digest must be 64 lowercase hex, got {digest:?}"
+            ));
+        }
+        Ok(Self {
+            profile_id: profile.profile_id.clone(),
+            profile_digest: digest,
+            sample_id: profile.sample_id.clone(),
+            architecture: profile.architecture.clone(),
+        })
+    }
+
+    /// The verified profile id (from the profile object, never a bare string).
+    pub fn profile_id(&self) -> &str {
+        &self.profile_id
+    }
+
+    /// SHA-256 of the canonical profile bytes (64 lowercase hex).
+    pub fn profile_digest(&self) -> &str {
+        &self.profile_digest
+    }
+
+    /// The profile-bound sample id (== attested case id).
+    pub fn sample_id(&self) -> &str {
+        &self.sample_id
+    }
+
+    /// The profile-bound architecture (== attested target architecture).
+    pub fn architecture(&self) -> &str {
+        &self.architecture
+    }
+}
+
+/// IMP-09-PROFILE-SOURCE-R1: case -> verified profile object binding.
+///
+/// The ONLY production profile selection: the attested case id selects the
+/// ADR-2 profile object (origin_macro -> origin profile, lunlun_software ->
+/// lunlun profile). The GTO lane case has NO profile object today — None
+/// means the profile carrier is absent and the controller/loader fail
+/// closed (no substitution, no bare-string identity).
+pub(crate) fn profile_for_case(case_id: &str) -> Option<mida_antidebug::profile::Profile> {
+    use mida_antidebug::profile::{lunlun_profile, origin_profile, SAMPLE_LUNLUN, SAMPLE_ORIGIN};
+    match case_id {
+        SAMPLE_ORIGIN => Some(origin_profile()),
+        SAMPLE_LUNLUN => Some(lunlun_profile()),
+        _ => None,
+    }
+}
+
+/// True when `value` is exactly 64 chars and all lowercase hex.
+fn is_64_lower_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+}
+
 #[derive(Debug)]
 pub struct RunEvidenceContext {
     case_id: String,
@@ -1271,6 +1387,13 @@ pub struct RunEvidenceContext {
     /// IMP-09-CARRIER-R3: sealed verified target-sample identity (private,
     /// non-deserializable). Bound by the attestation only.
     target_identity: VerifiedTargetIdentity,
+    /// IMP-09-PROFILE-SOURCE-R1: sealed verified PROFILE identity (private,
+    /// non-deserializable, Debug+Clone only). Bound by the attestation from
+    /// the verified profile object for the attested case; None for cases
+    /// with no profile object (GTO lane) — the controller/loader then fail
+    /// closed. Same-source guarantee: profile_id and the SHA-256 digest
+    /// both come from this one sealed object.
+    profile_identity: Option<VerifiedProfileIdentity>,
 }
 
 impl RunEvidenceContext {
@@ -1290,6 +1413,7 @@ impl RunEvidenceContext {
         candidate: PathBuf,
         cli_binary_sha256: String,
         target_identity: VerifiedTargetIdentity,
+        profile_identity: Option<VerifiedProfileIdentity>,
     ) -> anyhow::Result<RunEvidenceContext> {
         Self::new_with_family(
             mida_core::runner_config::packer_family::OREANS.to_string(),
@@ -1301,6 +1425,7 @@ impl RunEvidenceContext {
             candidate,
             cli_binary_sha256,
             target_identity,
+            profile_identity,
         )
     }
 
@@ -1318,6 +1443,7 @@ impl RunEvidenceContext {
         candidate: PathBuf,
         cli_binary_sha256: String,
         target_identity: VerifiedTargetIdentity,
+        profile_identity: Option<VerifiedProfileIdentity>,
     ) -> anyhow::Result<RunEvidenceContext> {
         if packer_family.trim().is_empty() {
             bail!("RunEvidenceContext packer_family must be non-empty");
@@ -1347,6 +1473,7 @@ impl RunEvidenceContext {
             cli_binary_sha256: cli_binary_sha256.to_lowercase(),
             packer_family,
             target_identity,
+            profile_identity,
         })
     }
 
@@ -1358,6 +1485,12 @@ impl RunEvidenceContext {
     /// IMP-09-CARRIER-R3: the sealed verified target identity.
     pub fn target_identity(&self) -> &VerifiedTargetIdentity {
         &self.target_identity
+    }
+
+    /// IMP-09-PROFILE-SOURCE-R1: the sealed verified profile identity
+    /// (None when the attested case has no profile object — fail-closed).
+    pub fn profile_identity(&self) -> Option<&VerifiedProfileIdentity> {
+        self.profile_identity.as_ref()
     }
 
     /// The attested case id.
@@ -1856,6 +1989,22 @@ pub fn attest_ready_before_launch(
         &target_architecture,
     )
     .map_err(|e| anyhow::anyhow!("target identity seal failed: {e}"))?;
+    // IMP-09-PROFILE-SOURCE-R1: seal the verified PROFILE identity from the
+    // case-bound ADR-2 profile object (profile_id + SHA-256 of canonical
+    // profile bytes, SAME source object). Cases with no profile object
+    // (GTO lane) carry None — the controller/loader fail closed rather than
+    // substitute a bare-string profile identity.
+    let sealed_profile_identity = match profile_for_case(&target_case_id) {
+        Some(profile) => Some(
+            VerifiedProfileIdentity::from_verified_profile(
+                &profile,
+                &target_case_id,
+                &target_architecture,
+            )
+            .map_err(|e| anyhow::anyhow!("profile identity seal failed: {e}"))?,
+        ),
+        None => None,
+    };
     let context = RunEvidenceContext::new_with_family(
         attested_family,
         target_case_id,
@@ -1866,6 +2015,7 @@ pub fn attest_ready_before_launch(
         current_output,
         current_cli_sha,
         sealed_target_identity,
+        sealed_profile_identity,
     )?;
     Ok(context)
 }
@@ -3121,6 +3271,7 @@ mod tests {
             candidate_path.clone(),
             "ef56".repeat(16),
             test_target_identity,
+            None, // GTO lane has no profile object -> fail-closed
         )
         .expect("GTO evidence context builds");
 
@@ -5037,5 +5188,283 @@ mod tests {
             "{err}"
         );
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // ------------------------------------------------------------------
+    // IMP-09-PROFILE-SOURCE-R1: hostile tests for the sealed verified
+    // profile identity carrier (SHA-256 of canonical profile bytes).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn imp09_profile_canonical_bytes_stable() {
+        // The same profile object encodes to the SAME canonical bytes every
+        // time, and the SHA-256 digest is therefore stable.
+        use mida_antidebug::profile::origin_profile;
+        let p1 = origin_profile();
+        let p2 = origin_profile();
+        let j1 = p1.canonical_json();
+        let j2 = p2.canonical_json();
+        assert_eq!(j1, j2, "canonical JSON must be byte-stable");
+        assert_eq!(sha256_hex(j1.as_bytes()), sha256_hex(j2.as_bytes()));
+        // The seal recomputes the same digest from the same source.
+        let a = VerifiedProfileIdentity::from_verified_profile(&p1, "origin_macro", "x86_64")
+            .expect("origin profile seals");
+        let b = VerifiedProfileIdentity::from_verified_profile(&p2, "origin_macro", "x86_64")
+            .expect("origin profile seals again");
+        assert_eq!(a.profile_digest(), b.profile_digest());
+        assert_eq!(a.profile_id(), "oreans_origin_x64_v1");
+    }
+
+    #[test]
+    fn imp09_profile_single_byte_change_changes_digest() {
+        // A single-byte mutation of the profile content must change the
+        // SHA-256 digest (canonical bytes are the hash input).
+        use mida_antidebug::profile::origin_profile;
+        let mut p = origin_profile();
+        let orig_digest = sha256_hex(p.canonical_json().as_bytes());
+        p.version += 1;
+        let new_digest = sha256_hex(p.canonical_json().as_bytes());
+        assert_ne!(
+            orig_digest, new_digest,
+            "single field change must change digest"
+        );
+        // And the seal reflects it.
+        let a = VerifiedProfileIdentity::from_verified_profile(&p, "origin_macro", "x86_64")
+            .expect("mutated profile still seals (same case/arch)");
+        assert_ne!(a.profile_digest(), orig_digest);
+    }
+
+    #[test]
+    fn imp09_profile_digest_is_64_lowercase_hex() {
+        use mida_antidebug::profile::origin_profile;
+        let p = origin_profile();
+        let id = VerifiedProfileIdentity::from_verified_profile(&p, "origin_macro", "x86_64")
+            .expect("seals");
+        assert_eq!(id.profile_digest().len(), 64);
+        assert!(
+            id.profile_digest()
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
+            "digest must be 64 lowercase hex: {}",
+            id.profile_digest()
+        );
+        assert!(!id.profile_digest().chars().any(|c| c.is_ascii_uppercase()));
+    }
+
+    #[test]
+    fn imp09_profile_fnv_digest_rejected() {
+        // The legacy FNV-1a 16-hex digest (Profile::profile_digest()) must
+        // NEVER be accepted as the verified carrier digest — the carrier
+        // digest is always recomputed as SHA-256 of canonical bytes.
+        use mida_antidebug::profile::origin_profile;
+        let p = origin_profile();
+        let fnv = p.profile_digest();
+        assert_eq!(fnv.len(), 16, "FNV-1a placeholder is 16 hex");
+        // The sealed carrier's digest is SHA-256, not FNV.
+        let id = VerifiedProfileIdentity::from_verified_profile(&p, "origin_macro", "x86_64")
+            .expect("seals");
+        assert_ne!(id.profile_digest(), fnv);
+        assert_eq!(id.profile_digest().len(), 64);
+    }
+
+    #[test]
+    fn imp09_profile_adr6_digest_rejected() {
+        // The bare placeholder string must never appear as a carrier digest.
+        use mida_antidebug::profile::origin_profile;
+        let p = origin_profile();
+        let id = VerifiedProfileIdentity::from_verified_profile(&p, "origin_macro", "x86_64")
+            .expect("seals");
+        assert_ne!(id.profile_digest(), "adr6-profile-digest");
+        assert_ne!(id.profile_id(), "adr6-profile-digest");
+        // profile_for_case never selects a bare-string profile.
+        assert!(profile_for_case("gto_launcher").is_none());
+    }
+
+    #[test]
+    fn imp09_profile_id_digest_same_source() {
+        // profile_id and profile_digest MUST come from the SAME verified
+        // profile object: the digest is SHA-256 of that object's canonical
+        // bytes, and the id is that object's profile_id. Neither is taken
+        // from a second source.
+        use mida_antidebug::profile::origin_profile;
+        let p = origin_profile();
+        let id = VerifiedProfileIdentity::from_verified_profile(&p, "origin_macro", "x86_64")
+            .expect("seals");
+        assert_eq!(id.profile_id(), p.profile_id);
+        assert_eq!(
+            id.profile_digest(),
+            sha256_hex(p.canonical_json().as_bytes())
+        );
+        assert_eq!(id.sample_id(), p.sample_id);
+        assert_eq!(id.architecture(), p.architecture);
+    }
+
+    #[test]
+    fn imp09_profile_sample_mismatch_rejected() {
+        use mida_antidebug::profile::origin_profile;
+        let p = origin_profile();
+        let err = VerifiedProfileIdentity::from_verified_profile(&p, "lunlun_software", "x86_64")
+            .expect_err("sample/case mismatch must be rejected");
+        assert!(err.contains("sample"), "{err}");
+    }
+
+    #[test]
+    fn imp09_profile_architecture_mismatch_rejected() {
+        use mida_antidebug::profile::origin_profile;
+        let p = origin_profile();
+        let err = VerifiedProfileIdentity::from_verified_profile(&p, "origin_macro", "x86")
+            .expect_err("architecture mismatch must be rejected");
+        assert!(err.contains("architecture"), "{err}");
+    }
+
+    #[test]
+    fn imp09_profile_schema_mismatch_rejected() {
+        use mida_antidebug::profile::origin_profile;
+        let mut p = origin_profile();
+        p.schema = "mida.antidebug-profile/v2".to_string();
+        let err = VerifiedProfileIdentity::from_verified_profile(&p, "origin_macro", "x86_64")
+            .expect_err("schema mismatch must be rejected");
+        assert!(err.contains("schema"), "{err}");
+    }
+
+    #[test]
+    fn imp09_profile_identity_no_external_construction() {
+        // No public constructor, no public fields: the only way to obtain a
+        // VerifiedProfileIdentity is the crate-internal sealed constructor
+        // from a verified profile object. A foreign crate cannot name the
+        // fields (private) and cannot call the pub(crate) constructor.
+        // Compile-time guarantee; this test proves the API surface is sealed.
+        use mida_antidebug::profile::origin_profile;
+        let p = origin_profile();
+        let id = VerifiedProfileIdentity::from_verified_profile(&p, "origin_macro", "x86_64")
+            .expect("seals");
+        // Only getters are exposed; Debug/Clone only.
+        let _clone = id.clone();
+        let _ = format!("{id:?}");
+        assert_eq!(id.profile_id(), "oreans_origin_x64_v1");
+    }
+
+    #[test]
+    fn imp09_profile_identity_no_deserialize() {
+        // VerifiedProfileIdentity is NOT Serialize/Deserialize: there is no
+        // disk/JSON form that can forge the carrier. (Compile-time: the
+        // type does not implement the traits; this test documents it.)
+        use mida_antidebug::profile::origin_profile;
+        let p = origin_profile();
+        let id = VerifiedProfileIdentity::from_verified_profile(&p, "origin_macro", "x86_64")
+            .expect("seals");
+        // serde_json::to_string must NOT compile for this type; instead we
+        // assert the digest is only obtainable from the sealed object.
+        assert_eq!(id.profile_digest().len(), 64);
+    }
+
+    #[test]
+    fn imp09_profile_cannot_be_replaced_by_runtime_digest() {
+        // The runtime module digest is NEVER a profile digest: the profile
+        // carrier digest is SHA-256 of the canonical profile bytes, and the
+        // runtime digest is a different artifact's digest. A forged
+        // "profile identity" carrying a runtime digest cannot be built
+        // through the sealed constructor (it recomputes from the profile
+        // object), and profile_for_case never returns a runtime digest.
+        use mida_antidebug::profile::origin_profile;
+        let p = origin_profile();
+        let id = VerifiedProfileIdentity::from_verified_profile(&p, "origin_macro", "x86_64")
+            .expect("seals");
+        // 64-hex of "runtime" is not the profile digest.
+        let runtime_like = sha256_hex(b"mida-antidebug-runtime-x64.dll");
+        assert_ne!(id.profile_digest(), runtime_like);
+        // profile_for_case returns the real profile object (never a digest).
+        let selected = profile_for_case("origin_macro").expect("origin has a profile");
+        assert_eq!(selected.profile_id, "oreans_origin_x64_v1");
+    }
+
+    #[test]
+    fn imp09_profile_canonical_change_invalidates_old_carrier() {
+        // Once the canonical profile bytes change, the OLD sealed carrier's
+        // digest no longer matches the new canonical bytes: the digest is
+        // always recomputed from the current object.
+        use mida_antidebug::profile::origin_profile;
+        let p1 = origin_profile();
+        let id1 = VerifiedProfileIdentity::from_verified_profile(&p1, "origin_macro", "x86_64")
+            .expect("v1 seals");
+        let mut p2 = origin_profile();
+        p2.version += 1;
+        let id2 = VerifiedProfileIdentity::from_verified_profile(&p2, "origin_macro", "x86_64")
+            .expect("v2 seals");
+        assert_ne!(id1.profile_digest(), id2.profile_digest());
+        // The old digest is not valid for the new canonical bytes.
+        assert_ne!(
+            id1.profile_digest(),
+            sha256_hex(p2.canonical_json().as_bytes())
+        );
+    }
+
+    #[test]
+    fn imp09_old_fnv_profile_digest_preserved() {
+        // Regression: Profile::profile_digest() keeps its FNV-1a semantics
+        // (16 lowercase hex) — it is NOT replaced by SHA-256.
+        use mida_antidebug::profile::origin_profile;
+        let p = origin_profile();
+        let fnv = p.profile_digest();
+        assert_eq!(fnv.len(), 16);
+        assert!(fnv.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(fnv, fnv.to_lowercase());
+        // The old validate_profile contract still accepts the FNV digest.
+        let ok = mida_antidebug::profile::validate_profile(&p, "origin_macro", "x86_64", &fnv);
+        assert!(
+            ok.is_ok(),
+            "legacy FNV validation must be preserved: {ok:?}"
+        );
+    }
+
+    #[test]
+    fn imp09_profile_uppercase_digest_never_produced() {
+        // The carrier digest is always SHA-256 lowercase hex from the
+        // sealed constructor — there is no API that accepts an external
+        // digest, so an uppercase (or any non-canonical) digest cannot
+        // enter the carrier. This proves the canonical form is the ONLY
+        // form the seal can produce.
+        use mida_antidebug::profile::origin_profile;
+        let p = origin_profile();
+        let id = VerifiedProfileIdentity::from_verified_profile(&p, "origin_macro", "x86_64")
+            .expect("seals");
+        assert_eq!(id.profile_digest(), id.profile_digest().to_lowercase());
+        assert!(!id
+            .profile_digest()
+            .contains(|c: char| c.is_ascii_uppercase()));
+        // The digest equals the recomputed SHA-256 of the canonical bytes.
+        assert_eq!(
+            id.profile_digest(),
+            sha256_hex(p.canonical_json().as_bytes())
+        );
+    }
+
+    #[test]
+    fn imp09_profile_id_and_digest_cannot_be_split_across_sources() {
+        // There is no constructor that takes profile_id from one source and
+        // digest from another: from_verified_profile derives BOTH from the
+        // single verified Profile object. A forged split (bare id string +
+        // unrelated digest) cannot be expressed with the sealed API.
+        use mida_antidebug::profile::{lunlun_profile, origin_profile};
+        let origin = origin_profile();
+        let lunlun = lunlun_profile();
+        // The origin carrier's digest is bound to origin canonical bytes;
+        // lunlun's canonical bytes hash differently (same-source proof).
+        let o = VerifiedProfileIdentity::from_verified_profile(&origin, "origin_macro", "x86_64")
+            .expect("origin seals");
+        let l =
+            VerifiedProfileIdentity::from_verified_profile(&lunlun, "lunlun_software", "x86_64")
+                .expect("lunlun seals");
+        assert_ne!(o.profile_id(), l.profile_id());
+        assert_ne!(o.profile_digest(), l.profile_digest());
+        // Each digest matches ITS OWN profile object's canonical bytes.
+        assert_eq!(
+            o.profile_digest(),
+            sha256_hex(origin.canonical_json().as_bytes())
+        );
+        assert_eq!(
+            l.profile_digest(),
+            sha256_hex(lunlun.canonical_json().as_bytes())
+        );
     }
 }

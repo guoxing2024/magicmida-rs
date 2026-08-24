@@ -418,6 +418,7 @@ mod tests {
                 "x86_64",
             )
             .expect("test target identity seals"),
+            None,
         )
         .expect("build evidence context")
     }

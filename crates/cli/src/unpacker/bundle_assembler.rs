@@ -609,6 +609,7 @@ mod tests {
                 "x86_64",
             )
             .expect("test target identity seals"),
+            None, // profile carrier not exercised by bundle assembler tests
         )
         .expect("build evidence context")
     }
@@ -785,6 +786,7 @@ mod tests {
                     "x86_64",
                 )
                 .expect("test target identity seals"),
+                None,
             )
             .is_err(),
             "malformed digest must be rejected at context construction"
@@ -809,6 +811,7 @@ mod tests {
                 "x86_64",
             )
             .expect("test target identity seals"),
+            None,
         )
         .expect("separator case id passes the constructor");
         let err = assemble_evidence_bundle(&request(&run, &output), bad)
