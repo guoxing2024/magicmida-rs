@@ -2033,36 +2033,49 @@ impl RuntimeLoader {
         // IMP-08-R1: the 5-item frozen wanted set (WO-1505 §5.3c) is
         // REQUIRED — missing any export fails closed below.
         let found_owned = {
-            let mut name_at = |name_ptr_rva: usize, out: &mut Vec<u8>| {
-                // IMP-08-R1-R1 (P0-1): the name string read is bounded by
-                // the image envelope as well as the 64-char contract. The
-                // parser already rejected name_ptr_rva >= image_size; the
-                // per-byte RPM here stays inside [name_rva, image_size).
-                for k in 0..64usize {
-                    if name_ptr_rva.checked_add(k).map_or(true, |rva| rva >= image_size) {
-                        break;
+            // IMP-08-R1-R2 (P1-2): the name resolver reports termination
+            // status. Ok(true) = NUL-terminated; Ok(false) = no NUL inside
+            // the bounded window (64 bytes / image envelope) — the parser
+            // fails closed; Err = the remote read failed — also fail-closed.
+            let mut name_at =
+                |name_ptr_rva: usize, out: &mut Vec<u8>| -> Result<bool, RuntimeLoadError> {
+                    let mut terminated = false;
+                    for k in 0..64usize {
+                        let Some(rva) = name_ptr_rva.checked_add(k) else {
+                            break;
+                        };
+                        // The parser already rejected name_ptr_rva >=
+                        // image_size; per-byte reads stay inside the
+                        // envelope window as well.
+                        if rva >= image_size {
+                            break;
+                        }
+                        let Some(name_va) = module_base.checked_add(rva) else {
+                            break;
+                        };
+                        let mut ch = [0u8; 1];
+                        let rc = unsafe {
+                            RPM(
+                                target,
+                                name_va as *const core::ffi::c_void,
+                                ch.as_mut_ptr() as *mut core::ffi::c_void,
+                                1,
+                                None,
+                            )
+                        };
+                        if rc.is_err() {
+                            return Err(RuntimeLoadError::ExportResolutionFailed(
+                                format!("remote read export name failed: rva={rva:#x}"),
+                            ));
+                        }
+                        if ch[0] == 0 {
+                            terminated = true;
+                            break;
+                        }
+                        out.push(ch[0]);
                     }
-                    let mut ch = [0u8; 1];
-                    let name_va = module_base.checked_add(name_ptr_rva + k);
-                    let Some(name_va) = name_va else { break };
-                    let rc = unsafe {
-                        RPM(
-                            target,
-                            name_va as *const core::ffi::c_void,
-                            ch.as_mut_ptr() as *mut core::ffi::c_void,
-                            1,
-                            None,
-                        )
-                    };
-                    if rc.is_err() {
-                        break;
-                    }
-                    if ch[0] == 0 {
-                        break;
-                    }
-                    out.push(ch[0]);
-                }
-            };
+                    Ok(terminated)
+                };
             Self::resolve_exports_from_buffers(
                 &names,
                 &ords,
@@ -2110,22 +2123,31 @@ impl RuntimeLoader {
     ///
     /// Pure parser over the already-read name-pointer array, ordinal array
     /// and function-address array. `name_at` resolves a name-string address
-    /// (RVA) to its bytes; the remote path reads them via RPM from the
-    /// target, tests supply a flat buffer. Returns the resolved addresses
-    /// for the wanted exports. `module_base` is the image base (for
-    /// RVA -> VA conversion); `funcs` is the raw function-address array
-    /// (num_funcs * 4 bytes). Handles Base != 1 (the ordinal array is
-    /// 0-based relative to AddressOfFunctions per the MSVC/Rust link.exe
-    /// convention — the ordinal VALUE is the function index), forwarded
-    /// exports (function RVA inside the export directory -> not resolved),
-    /// out-of-range ordinals and missing names. Fail-closed on truncated
-    /// buffers (bounds-checked indexing).
+    /// (RVA) to its bytes AND reports termination: `Ok(true)` means the
+    /// bytes are NUL-terminated, `Ok(false)` means no NUL was found inside
+    /// the bounded read, `Err` means the read failed — both non-terminated
+    /// cases fail closed in this parser. The remote path reads via RPM from
+    /// the target, tests supply a flat buffer. Returns the resolved
+    /// addresses for the wanted exports; `module_base` is the image base
+    /// (for RVA -> VA conversion) and `image_size` is the module envelope
+    /// ([module_base, module_base + image_size)) that bounds every RVA.
+    /// `funcs` is the raw function-address array (num_funcs * 4 bytes).
+    /// Handles Base != 1 (the ordinal array is 0-based relative to
+    /// AddressOfFunctions per the MSVC/Rust link.exe convention — the
+    /// ordinal VALUE is the function index), forwarded exports (function
+    /// RVA inside the export directory -> not resolved), out-of-range
+    /// ordinals and missing names. Duplicate wanted names are ALWAYS
+    /// ambiguous (fail-closed), even when the first occurrence was skipped
+    /// (forwarded / out-of-range ordinal / null function RVA). Fail-closed
+    /// on truncated buffers; every index is derived with checked_mul /
+    /// checked_add and validated against the buffer length before use.
+    ///
     #[allow(clippy::too_many_arguments)]
     pub fn resolve_exports_from_buffers(
         names: &[u8],
         ords: &[u8],
         funcs: &[u8],
-        name_at: &mut dyn FnMut(usize, &mut Vec<u8>),
+        name_at: &mut dyn FnMut(usize, &mut Vec<u8>) -> Result<bool, RuntimeLoadError>,
         num_names: usize,
         num_funcs: usize,
         module_base: usize,
@@ -2160,17 +2182,37 @@ impl RuntimeLoader {
             )));
         }
         let mut found: Vec<Option<usize>> = vec![None; want.len()];
+        // IMP-08-R1-R2 (P1-1): `seen` records EVERY occurrence of a wanted
+        // name, independently of `found` (which only records successful
+        // resolutions). A duplicate wanted name is ambiguous even when the
+        // first occurrence was skipped (forwarded, out-of-range ordinal,
+        // null function RVA): the second occurrence must fail closed
+        // instead of silently becoming "the" export.
+        let mut seen: Vec<bool> = vec![false; want.len()];
         for i in 0..num_names {
-            if i * 4 + 3 >= names.len() {
+            // IMP-08-R1-R2 (P1-3): no bare index arithmetic — every offset
+            // is derived with checked_mul/checked_add and validated against
+            // the buffer length before any element access.
+            let name_off = i.checked_mul(4).ok_or_else(|| {
+                RuntimeLoadError::ExportResolutionFailed(
+                    "export name index overflow".to_string(),
+                )
+            })?;
+            let name_end = name_off.checked_add(4).ok_or_else(|| {
+                RuntimeLoadError::ExportResolutionFailed(
+                    "export name slot overflow".to_string(),
+                )
+            })?;
+            if name_end > names.len() {
                 return Err(RuntimeLoadError::ExportResolutionFailed(
                     "export name array truncated".to_string(),
                 ));
             }
             let name_ptr_rva = u32::from_le_bytes([
-                names[i * 4],
-                names[i * 4 + 1],
-                names[i * 4 + 2],
-                names[i * 4 + 3],
+                names[name_off],
+                names[name_off + 1],
+                names[name_off + 2],
+                names[name_off + 3],
             ]) as usize;
             if name_ptr_rva == 0 {
                 continue;
@@ -2183,53 +2225,79 @@ impl RuntimeLoader {
                     "export name RVA outside image envelope: rva={name_ptr_rva:#x} image={image_size:#x}"
                 )));
             }
-            // Read the name string (bounded 64 chars) via the resolver.
+            // IMP-08-R1-R2 (P1-2): the name resolver must report whether
+            // the string is NUL-terminated. Ok(false) (no NUL inside the
+            // bounded window) and Err (read failure) both fail closed —
+            // an unterminated name can never participate in matching.
             let mut name = Vec::with_capacity(64);
-            name_at(name_ptr_rva, &mut name);
-            if i * 2 + 1 >= ords.len() {
+            let terminated = name_at(name_ptr_rva, &mut name)?;
+            if !terminated {
+                return Err(RuntimeLoadError::ExportResolutionFailed(format!(
+                    "export name not NUL-terminated: rva={name_ptr_rva:#x}"
+                )));
+            }
+            let ord_off = i.checked_mul(2).ok_or_else(|| {
+                RuntimeLoadError::ExportResolutionFailed(
+                    "export ordinal index overflow".to_string(),
+                )
+            })?;
+            let ord_end = ord_off.checked_add(2).ok_or_else(|| {
+                RuntimeLoadError::ExportResolutionFailed(
+                    "export ordinal slot overflow".to_string(),
+                )
+            })?;
+            if ord_end > ords.len() {
                 return Err(RuntimeLoadError::ExportResolutionFailed(
                     "export ordinal array truncated".to_string(),
                 ));
             }
-            let ord = u16::from_le_bytes([ords[i * 2], ords[i * 2 + 1]]) as usize;
+            let ord = u16::from_le_bytes([ords[ord_off], ords[ord_off + 1]]) as usize;
             // IMP-08-R1: duplicate export names are AMBIGUOUS and must be
-            // rejected fail-closed (WO-1505 §5.3c). The previous behavior
-            // silently skipped a name once found; that masked a duplicate
-            // entry pointing at a different (possibly malicious) RVA.
-            let mut matched = false;
+            // rejected fail-closed (WO-1505 §5.3c).
             for (wi, w) in want.iter().enumerate() {
                 if name.as_slice() != *w {
                     continue;
                 }
-                if found[wi].is_some() {
+                if seen[wi] {
                     // Duplicate name in the export table: two entries claim
                     // the same wanted symbol. Refuse to guess which one is
-                    // real (AmbiguousExport, fail-closed).
+                    // real — even if the first occurrence was skipped
+                    // (AmbiguousExport, fail-closed).
                     return Err(RuntimeLoadError::ExportResolutionFailed(format!(
                         "ambiguous export: duplicate name '{}' in export table",
                         String::from_utf8_lossy(&name)
                     )));
                 }
-                matched = true;
+                seen[wi] = true;
                 // The MSVC/Rust link.exe export ordinal array is 0-based for
                 // #[no_mangle] exports even when Base=1: ord=0 maps to
                 // AddressOfFunctions[0], ord=1 to [1], etc. Use the ordinal
                 // directly as the function index.
                 if ord >= num_funcs {
-                    // Out-of-range ordinal: cannot resolve (fail-closed for
-                    // this name; other names may still match).
+                    // Out-of-range ordinal: this occurrence cannot resolve
+                    // (fail-closed; a later duplicate is still ambiguous).
                     continue;
                 }
-                if ord * 4 + 3 >= funcs.len() {
+                let func_off = ord.checked_mul(4).ok_or_else(|| {
+                    RuntimeLoadError::ExportResolutionFailed(
+                        "export function index overflow".to_string(),
+                    )
+                })?;
+                let func_end = func_off.checked_add(4).ok_or_else(|| {
+                    RuntimeLoadError::ExportResolutionFailed(
+                        "export function slot overflow".to_string(),
+                    )
+                })?;
+                if func_end > funcs.len() {
                     return Err(RuntimeLoadError::ExportResolutionFailed(
                         "export function array truncated".to_string(),
                     ));
                 }
                 let func_rva = u32::from_le_bytes([
-                    funcs[ord * 4],
-                    funcs[ord * 4 + 1],
-                    funcs[ord * 4 + 2],
-                    funcs[ord * 4 + 3],
+                    funcs[func_off],
+                    funcs[func_off + 1],
+                    funcs[func_off + 2],
+                    funcs[func_off + 3],
                 ]) as usize;
                 if func_rva == 0 {
                     continue;
@@ -2247,11 +2315,7 @@ impl RuntimeLoader {
                 // Forwarded export: the function RVA points INSIDE the export
                 // directory (the name is a forwarder string, not code).
                 // Checked range (audit R5): avoid overflow on exp_rva+exp_size.
-                if exp_size > 0
-                    && exp_rva <= exp_end
-                    && func_rva >= exp_rva
-                    && func_rva < exp_end
-                {
+                if exp_size > 0 && func_rva >= exp_rva && func_rva < exp_end {
                     continue;
                 }
                 // module_base + func_rva must not overflow (checked).
@@ -2267,7 +2331,6 @@ impl RuntimeLoader {
                 }
                 found[wi] = Some(func_va);
             }
-            let _ = matched;
         }
         Ok(found)
     }
@@ -4472,18 +4535,25 @@ mod imp08_v2_production_tests {
     use super::*;
 
     /// Minimal name_at resolver backed by a flat string table.
-    fn flat_name_at(table: &[u8]) -> impl FnMut(usize, &mut Vec<u8>) + '_ {
+    /// Returns Ok(true) when a NUL terminator was found inside the table.
+    fn flat_name_at(
+        table: &[u8],
+    ) -> impl FnMut(usize, &mut Vec<u8>) -> Result<bool, RuntimeLoadError> + '_ {
         move |rva, out| {
             let off = rva - 0x1000;
-            for &b in &table[off..] {
-                if b == 0 {
-                    break;
+            let mut terminated = false;
+            if off < table.len() {
+                for &b in &table[off..] {
+                    if b == 0 {
+                        terminated = true;
+                        break;
+                    }
+                    out.push(b);
                 }
-                out.push(b);
             }
+            Ok(terminated)
         }
     }
-
     fn wanted5() -> [&'static [u8]; 5] {
         [
             b"MidaAntidebugInitialize",
@@ -4872,5 +4942,159 @@ mod imp08_v2_production_tests {
         // a [u8; 60] const, so `thunk_call_v2` cannot receive the probe.
         assert_eq!(THUNK7_PRODUCTION.len(), 60);
         assert_ne!(thunk7_test_with_probe().len(), 60);
+    }
+
+    /// Build names/ords/string-table for the given symbol list (names at
+    /// RVA 0x1000 + i*0x20, ordinals 0..n). All names NUL-terminated.
+    fn table_for(symbols: &[&str]) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let mut names = Vec::new();
+        let mut ords = Vec::new();
+        let mut table = vec![0u8; 0x1000];
+        for (i, s) in symbols.iter().enumerate() {
+            names.extend_from_slice(&((0x1000 + i * 0x20) as u32).to_le_bytes());
+            ords.extend_from_slice(&(i as u16).to_le_bytes());
+            let off = i * 0x20;
+            table[off..off + s.len()].copy_from_slice(s.as_bytes());
+            table[off + s.len()] = 0;
+        }
+        (names, ords, table)
+    }
+
+    #[test]
+    fn duplicate_after_forwarded_rejected_ambiguous() {
+        // IMP-08-R1-R2 (P1-1): the FIRST duplicate entry is a forwarded
+        // export (skipped), the SECOND is a valid in-module function.
+        // found[] is still None after entry 0 — the old duplicate check
+        // missed this; seen[] must reject fail-closed.
+        let (names, ords, table) =
+            table_for(&["MidaAntidebugInitialize", "MidaAntidebugInitialize"]);
+        let mut funcs = Vec::new();
+        funcs.extend_from_slice(&0x1040u32.to_le_bytes()); // forwarded (exp dir)
+        funcs.extend_from_slice(&0x2000u32.to_le_bytes()); // valid
+        let mut name_at = flat_name_at(&table);
+        let err = RuntimeLoader::resolve_exports_from_buffers(
+            &names, &ords, &funcs, &mut name_at, 2, 2, 0x400000, 0x10000, 0x1000, 0x100,
+            &[b"MidaAntidebugInitialize"],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("ambiguous export"), "{err}");
+    }
+
+    #[test]
+    fn duplicate_after_invalid_ordinal_rejected_ambiguous() {
+        // IMP-08-R1-R2 (P1-1): the FIRST duplicate entry has an
+        // out-of-range ordinal (7 >= num_funcs=2) and is skipped; the
+        // SECOND is valid. seen[] must still reject the duplicate.
+        let (mut names, mut ords, table) =
+            table_for(&["MidaAntidebugInitialize", "MidaAntidebugInitialize"]);
+        let _ = &mut names;
+        ords[0..2].copy_from_slice(&7u16.to_le_bytes());
+        let mut funcs = Vec::new();
+        funcs.extend_from_slice(&0x2000u32.to_le_bytes());
+        funcs.extend_from_slice(&0x2010u32.to_le_bytes());
+        let mut name_at = flat_name_at(&table);
+        let err = RuntimeLoader::resolve_exports_from_buffers(
+            &names, &ords, &funcs, &mut name_at, 2, 2, 0x400000, 0x10000, 0x1000, 0x100,
+            &[b"MidaAntidebugInitialize"],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("ambiguous export"), "{err}");
+    }
+
+    #[test]
+    fn duplicate_after_null_func_rva_rejected_ambiguous() {
+        // IMP-08-R1-R2 (P1-1): the FIRST duplicate entry has a null
+        // function RVA (skipped); the SECOND is valid. Still ambiguous.
+        let (names, ords, table) =
+            table_for(&["MidaAntidebugInitialize", "MidaAntidebugInitialize"]);
+        let mut funcs = Vec::new();
+        funcs.extend_from_slice(&0u32.to_le_bytes()); // null func RVA
+        funcs.extend_from_slice(&0x2000u32.to_le_bytes()); // valid
+        let mut name_at = flat_name_at(&table);
+        let err = RuntimeLoader::resolve_exports_from_buffers(
+            &names, &ords, &funcs, &mut name_at, 2, 2, 0x400000, 0x10000, 0x1000, 0x100,
+            &[b"MidaAntidebugInitialize"],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("ambiguous export"), "{err}");
+    }
+
+    #[test]
+    fn unterminated_wanted_name_rejected() {
+        // IMP-08-R1-R2 (P1-2): a name string WITHOUT a NUL anywhere in
+        // the bounded window. The resolver reports Ok(false) and the
+        // parser fails closed — even though the bytes would have matched
+        // a wanted name if they had been terminated.
+        let mut table = vec![b'X'; 0x1000];
+        table[0..b"MidaAntidebugInitialize".len()]
+            .copy_from_slice(b"MidaAntidebugInitialize");
+        let names: Vec<u8> = 0x1000u32.to_le_bytes().to_vec();
+        let ords: Vec<u8> = 0u16.to_le_bytes().to_vec();
+        let funcs: Vec<u8> = 0x2000u32.to_le_bytes().to_vec();
+        let mut name_at = flat_name_at(&table);
+        let err = RuntimeLoader::resolve_exports_from_buffers(
+            &names, &ords, &funcs, &mut name_at, 1, 1, 0x400000, 0x10000, 0x1000, 0x100,
+            &[b"MidaAntidebugInitialize"],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("NUL-terminated"), "{err}");
+    }
+
+    #[test]
+    fn name_read_failure_propagates_fail_closed() {
+        // IMP-08-R1-R2 (P1-2): a resolver read failure (RPM failure in
+        // production) must propagate as Err — never silently skip.
+        let names: Vec<u8> = 0x1000u32.to_le_bytes().to_vec();
+        let ords: Vec<u8> = 0u16.to_le_bytes().to_vec();
+        let funcs: Vec<u8> = 0x2000u32.to_le_bytes().to_vec();
+        let mut name_at =
+            |_rva: usize, _out: &mut Vec<u8>| -> Result<bool, RuntimeLoadError> {
+                Err(RuntimeLoadError::ExportResolutionFailed(
+                    "remote read export name failed".to_string(),
+                ))
+            };
+        let err = RuntimeLoader::resolve_exports_from_buffers(
+            &names, &ords, &funcs, &mut name_at, 1, 1, 0x400000, 0x10000, 0x1000, 0x100,
+            &[b"MidaAntidebugInitialize"],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("remote read"), "{err}");
+    }
+
+    #[test]
+    fn adversarial_name_count_fails_closed_immediately() {
+        // IMP-08-R1-R2 (P1-3): num_names = usize::MAX with a tiny names
+        // buffer must fail closed on the first out-of-bounds iteration
+        // instead of looping forever or overflowing index arithmetic.
+        let names: Vec<u8> = 0x1000u32.to_le_bytes().to_vec();
+        let ords: Vec<u8> = 0u16.to_le_bytes().to_vec();
+        let funcs: Vec<u8> = 0u32.to_le_bytes().to_vec();
+        let mut table = vec![0u8; 0x1000];
+        table[0..4].copy_from_slice(b"Mida");
+        let mut name_at = flat_name_at(&table);
+        let err = RuntimeLoader::resolve_exports_from_buffers(
+            &names, &ords, &funcs, &mut name_at, usize::MAX, 1, 0x400000, 0x10000, 0x1000, 0x100,
+            &[b"Mida"],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("truncated"), "{err}");
+    }
+
+    #[test]
+    fn truncated_function_array_fails_closed() {
+        // IMP-08-R1-R2 (P1-3): num_funcs=2 but only 1 function slot
+        // exists — the checked func range must reject the truncation.
+        let (names, ords, table) = table_for(&[
+            "MidaAntidebugInitialize",
+            "MidaAntidebugGetAttestation",
+        ]);
+        let funcs: Vec<u8> = 0x2000u32.to_le_bytes().to_vec();
+        let mut name_at = flat_name_at(&table);
+        let err = RuntimeLoader::resolve_exports_from_buffers(
+            &names, &ords, &funcs, &mut name_at, 2, 2, 0x400000, 0x10000, 0x1000, 0x100,
+            &[b"MidaAntidebugInitialize", b"MidaAntidebugGetAttestation"],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("truncated"), "{err}");
     }
 }

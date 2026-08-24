@@ -579,8 +579,9 @@ fn resolve_via_parser(img: &ExportImage) -> Vec<Option<usize>> {
     let image_size = 0x10000usize;
     let exp_rva = 0x2000usize;
     let exp_size = 0x100usize;
-    let mut name_at = |name_ptr_rva: usize, out: &mut Vec<u8>| {
+    let mut name_at = |name_ptr_rva: usize, out: &mut Vec<u8>| -> Result<bool, RuntimeLoadError> {
         let mut idx = name_ptr_rva;
+        let mut terminated = false;
         for _ in 0..64 {
             if idx >= img.name_data.len() {
                 break;
@@ -588,10 +589,12 @@ fn resolve_via_parser(img: &ExportImage) -> Vec<Option<usize>> {
             let ch = img.name_data[idx];
             idx += 1;
             if ch == 0 {
+                terminated = true;
                 break;
             }
             out.push(ch);
         }
+        Ok(terminated)
     };
     RuntimeLoader::resolve_exports_from_buffers(
         &img.names,
@@ -696,10 +699,12 @@ fn export_parser_fails_closed_on_truncated_buffers() {
     // Names that point at a REAL string (non-zero RVA) so the parser reaches
     // the ordinal/function bounds checks instead of skipping on RVA 0.
     let name_rva = 0x10usize;
-    let mut name_at = |rva: usize, out: &mut Vec<u8>| {
+    let mut name_at = |rva: usize, out: &mut Vec<u8>| -> Result<bool, RuntimeLoadError> {
         if rva == name_rva {
             out.extend_from_slice(b"MidaAntidebugInitialize");
+            return Ok(true);
         }
+        Ok(false)
     };
     let mut names = vec![0u8; 8];
     names[0..4].copy_from_slice(&(name_rva as u32).to_le_bytes());
