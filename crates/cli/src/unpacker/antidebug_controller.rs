@@ -444,22 +444,69 @@ impl AntidebugController {
     ///   -> WalkerDigestAuthority (walker_control.rs)
     /// ```
     pub fn bind_walker_from_loader(&self, params_va: u64, section1_va: u64) -> bool {
+        // IMP-09-R1-R4: EXACT authority source matrix. Every field must
+        // come from its sealed source; substitution is FORBIDDEN.
         let Some(loader) = self.options.loader_result.as_ref() else {
             return false;
         };
         let da = loader.digest_authority();
+        // target_image_sha256: the verified TARGET SAMPLE digest. The
+        // current production chain has NO sealed carrier for it (the
+        // loader verifies the runtime DLL, not the unpacked sample).
+        // Without it we MUST refuse — never substitute the runtime digest.
+        let Some(target_image_sha256) = self.target_image_sha256() else {
+            return false;
+        };
+        // profile_id / profile_digest: the controller-verified profile.
+        // No verified profile digest carrier exists yet -> refuse.
+        let Some(profile_id) = self.verified_profile_id() else {
+            return false;
+        };
+        let Some(profile_digest) = self.verified_profile_digest() else {
+            return false;
+        };
+        // walker_export_rva: resolved from the PE export table through a
+        // verified envelope. No resolver carrier exists yet -> refuse.
+        let Some(walker_export_rva) = self.resolved_walker_export_rva() else {
+            return false;
+        };
         mida_antidebug_runtime::exports::bind_walker_session_verified(
             params_va,
             section1_va,
             loader.target_pid(),
-            self.options.target_pid,
-            da.digest_value(),
+            std::process::id(), // owner_pid: REAL controller PID
+            target_image_sha256,
             da.digest_value(),
             loader.module_base(),
-            0x1234, // walker export RVA (local boundary; see IMP-09 contract)
-            "walker-local",
-            da.digest_value(),
+            walker_export_rva,
+            profile_id,
+            profile_digest,
         )
+    }
+
+    /// R4: verified target-image digest carrier. None today (no vault
+    /// rev2/sealed target identity in the current chain) — callers MUST
+    /// refuse to bind when this is None (no magic substitution).
+    fn target_image_sha256(&self) -> Option<&str> {
+        None
+    }
+
+    /// R4: verified profile id carrier. None today (no verified profile
+    /// digest source) — refuse rather than hard-code.
+    fn verified_profile_id(&self) -> Option<&str> {
+        None
+    }
+
+    /// R4: verified profile digest carrier. None today.
+    fn verified_profile_digest(&self) -> Option<&str> {
+        None
+    }
+
+    /// R4: resolved WalkerExecute export RVA from a verified PE envelope.
+    /// None today (no resolver carrier) — refuse rather than hard-code
+    /// 0x1234.
+    fn resolved_walker_export_rva(&self) -> Option<u64> {
+        None
     }
 
     /// Inject the explicit cleanup outcome (R1-HARDENING-CLEANUP-2).
@@ -727,19 +774,17 @@ impl AntidebugController {
         self.drive(ControllerEvent::ProbeSetPassed);
         self.drive(ControllerEvent::ProceedApproved);
 
-        // IMP-09-R1-R3 provenance caller: bind the walker session from the
-        // sealed loader digest authority (verify_file -> identity ->
-        // authority -> LoaderResult). Local/static boundary only; the live
-        // walk (WalkerExecute against a real target) remains NOT_AUTHORIZED.
-        // The bind is a WIRING seam, not a Proceed gate: a failed bind must
-        // not block the separately-audited controller lifecycle (the walker
-        // feature itself stays NOT_PROVEN until the live path is authorized).
-        if !self.bind_walker_from_loader(0x7000, 0x8000) {
-            log::log(
-                LogType::Warn,
-                "walker session bind skipped: no verified loader authority or busy lifecycle",
-            );
-        }
+        // IMP-09-R1-R4: WALKER_BINDING = NOT_WIRED.
+        //
+        // The production controller does NOT bind a walker session here:
+        // there is no complete local context (no verified target-image
+        // digest carrier, no resolved WalkerExecute export RVA, no prepared
+        // params/result section VAs, no production memory provider).
+        // Binding with magic values would publish READY for an unexecutable
+        // session and block later legitimate wiring — FORBIDDEN (R4-3).
+        // The lifecycle stays UNBOUND; the walker feature remains
+        // NOT_WIRED until a real carrier exists (IMP-09 live path still
+        // NOT_AUTHORIZED).
 
         if self.state.is_proceed() {
             AntidebugOutcome::Proceed {
@@ -1355,25 +1400,20 @@ mod tests {
     }
 
     #[test]
-    fn imp09_bind_walker_from_loader_uses_verified_authority() {
-        // IMP-09-R1-R3 provenance caller: the walker session is bound from
-        // the SEALED loader digest authority (verify_file -> identity ->
-        // authority -> LoaderResult). The bind must succeed when the
-        // lifecycle is free and must never panic. The runtime's shared
-        // static may be busy from a prior test in this process, so the
-        // assertion is: call is safe and, when free, binds successfully.
+    fn imp09_bind_walker_from_loader_refuses_without_carriers() {
+        // IMP-09-R1-R4: the EXACT authority matrix has no sealed carriers
+        // for target_image_sha256 / profile / resolved export RVA in the
+        // current chain, so the bind MUST deterministically refuse and
+        // MUST NOT publish a session (no magic substitution).
         let c = controller_with_loader_result(Some(loader_result_with(
             1234,
             default_attestation_json(),
         )));
         let r = c.bind_walker_from_loader(0x7000, 0x8000);
-        // true = bound from the verified authority; false = lifecycle busy
-        // (another test in this process already consumed the shared runtime
-        // static). Either way the provenance path executed without panic;
-        // the deterministic contract is exercised by the runtime-side tests
-        // (walker_export_* bind semantics) and by the controller proceeds
-        // path which reaches this same call.
-        let _ = r;
+        assert!(
+            !r,
+            "bind must refuse while target/profile/export carriers are absent",
+        );
     }
     #[test]
     fn imp06_controller_fails_closed_without_loader_result() {
