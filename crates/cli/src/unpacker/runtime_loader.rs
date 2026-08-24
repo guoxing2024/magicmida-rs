@@ -2433,24 +2433,29 @@ impl RuntimeLoader {
     /// NO ReadProcessMemory, NO live target module.
     ///
     /// The file is re-read from the canonical path sealed in
-    /// `RuntimeFileIdentity` (which was produced by
-    /// `RuntimeAuthorityManifest::verify_file` — digest+size+PE-x64 all
-    /// verified at that point; the re-read is the same bytes). The PE
-    /// export directory is parsed with the SAME fail-closed rules as the
-    /// remote resolver: SizeOfImage envelope, checked RVA arithmetic,
-    /// name/ordinal/function array bounds, NUL termination, duplicate
-    /// wanted-name rejection, forwarded-export rejection, out-of-module
-    /// rejection, overflow rejection.
+    /// `RuntimeFileIdentity` (produced by
+    /// `RuntimeAuthorityManifest::verify_file`). The re-read is RE-BOUND
+    /// to the sealed identity: size MUST match AND the recomputed SHA-256
+    /// of the re-read bytes MUST equal `identity.sha256()`. A same-size
+    /// content swap on disk fails closed — the carrier is
+    /// path + size + content-digest bound. The PE export directory is then
+    /// parsed with the SAME fail-closed rules as the remote resolver:
+    /// SizeOfImage envelope, checked RVA arithmetic, name/ordinal/function
+    /// array bounds, NUL termination, duplicate wanted-name rejection,
+    /// forwarded-export rejection, out-of-module rejection, overflow
+    /// rejection. Every offset into the file is computed with
+    /// checked_add/checked_mul and re-validated against the file length
+    /// before slicing (no naked offset arithmetic).
     ///
     /// Returns the pure export RVA (module_base=0 mode of the shared
     /// parser, so the returned value IS the RVA, never an absolute VA).
     pub fn resolve_walker_export_rva_from_file(
         identity: &RuntimeFileIdentity,
     ) -> Result<u64, RuntimeLoadError> {
-        // 1. Re-read the verified file bytes (same canonical path + size
-        //    that verify_file() sealed; a changed file fails the identity
-        //    checks below by construction of the caller, and the path is
-        //    not caller-supplied at this point).
+        // 1. Re-read the verified file bytes from the sealed canonical
+        //    path, then RE-BIND the content: size AND recomputed SHA-256
+        //    must equal the sealed identity. Same-size replacement on
+        //    disk is rejected here — never parsed.
         let bytes = std::fs::read(identity.path()).map_err(|e| {
             RuntimeLoadError::ExportResolutionFailed(format!(
                 "read verified runtime file failed: {e}"
@@ -2461,47 +2466,64 @@ impl RuntimeLoader {
                 "verified runtime file size changed since verify_file".to_string(),
             ));
         }
+        let digest = sha256_hex(&bytes);
+        if digest != identity.sha256() {
+            return Err(RuntimeLoadError::ExportResolutionFailed(
+                "verified runtime file content digest changed since verify_file".to_string(),
+            ));
+        }
+        // 2. Checked offset/range helper: every PE offset below is
+        //    computed with checked_add and the end is re-validated
+        //    against the file length BEFORE slicing; slices always reuse
+        //    the validated end. No naked `base + n` / `off + n`.
+        let range = |base: usize,
+                     delta: usize,
+                     n: usize,
+                     what: &str|
+         -> Result<(usize, usize), RuntimeLoadError> {
+            let start = base.checked_add(delta).ok_or_else(|| {
+                RuntimeLoadError::ExportResolutionFailed(format!("{what} offset overflow"))
+            })?;
+            let end = start.checked_add(n).ok_or_else(|| {
+                RuntimeLoadError::ExportResolutionFailed(format!("{what} range end overflow"))
+            })?;
+            if end > bytes.len() {
+                return Err(RuntimeLoadError::ExportResolutionFailed(format!(
+                    "{what} out of file bounds (end={end:#x} file_len={:#x})",
+                    bytes.len()
+                )));
+            }
+            Ok((start, end))
+        };
         if bytes.len() < 0x40 || &bytes[0..2] != b"MZ" {
             return Err(RuntimeLoadError::ExportResolutionFailed(
                 "runtime file missing MZ".to_string(),
             ));
         }
         let e_lfanew = u32::from_le_bytes(bytes[0x3C..0x40].try_into().map_err(|_| {
-            RuntimeLoadError::ExportResolutionFailed("truncated DOS header".to_string())
+            RuntimeLoadError::ExportResolutionFailed("truncated Deni4l-of-svc header".to_string())
         })?) as usize;
         let pe_off = e_lfanew;
-        let pe_end = pe_off.checked_add(24 + 2).ok_or_else(|| {
-            RuntimeLoadError::ExportResolutionFailed("PE header base overflow".to_string())
-        })?;
-        if pe_end > bytes.len() || &bytes[pe_off..pe_off + 4] != b"PE\0\0" {
+        let (sig_s, sig_e) = range(pe_off, 0, 4, "PE signature")?;
+        if &bytes[sig_s..sig_e] != b"PE\0\0" {
             return Err(RuntimeLoadError::ExportResolutionFailed(
                 "runtime file missing PE signature".to_string(),
             ));
         }
-        let magic =
-            u16::from_le_bytes(bytes[pe_off + 24..pe_off + 26].try_into().map_err(|_| {
-                RuntimeLoadError::ExportResolutionFailed(
-                    "truncated optional header magic".to_string(),
-                )
-            })?);
+        let (magic_s, magic_e) = range(pe_off, 24, 2, "optional header magic")?;
+        let magic = u16::from_le_bytes(bytes[magic_s..magic_e].try_into().map_err(|_| {
+            RuntimeLoadError::ExportResolutionFailed("truncated optional header magic".to_string())
+        })?);
         if magic != 0x20B {
             return Err(RuntimeLoadError::ExportResolutionFailed(format!(
                 "runtime file optional header magic {magic:#x} != PE32+ (0x20B)"
             )));
         }
         // SizeOfImage at optional+0x50 (pe_off+24+0x50 = pe_off+0x68).
-        if pe_off + 0x68 + 4 > bytes.len() {
-            return Err(RuntimeLoadError::ExportResolutionFailed(
-                "truncated optional header (SizeOfImage)".to_string(),
-            ));
-        }
-        let image_size = u32::from_le_bytes(
-            bytes[pe_off + 0x68..pe_off + 0x6C]
-                .try_into()
-                .map_err(|_| {
-                    RuntimeLoadError::ExportResolutionFailed("SizeOfImage read".to_string())
-                })?,
-        ) as usize;
+        let (img_s, img_e) = range(pe_off, 0x68, 4, "SizeOfImage")?;
+        let image_size = u32::from_le_bytes(bytes[img_s..img_e].try_into().map_err(|_| {
+            RuntimeLoadError::ExportResolutionFailed("SizeOfImage read".to_string())
+        })?) as usize;
         if image_size == 0 || image_size < 0x1000 {
             return Err(RuntimeLoadError::ExportResolutionFailed(format!(
                 "runtime file SizeOfImage invalid: {image_size:#x}"
@@ -2509,20 +2531,15 @@ impl RuntimeLoader {
         }
         // Export data directory: PE32+ optional+0x70 (pe_off+24+0x70 =
         // pe_off+0x88).
-        let dd_off = pe_off + 0x88;
-        if dd_off + 8 > bytes.len() {
-            return Err(RuntimeLoadError::ExportResolutionFailed(
-                "truncated optional header (export directory)".to_string(),
-            ));
-        }
+        let (er_s, er_e) = range(pe_off, 0x88, 4, "export RVA")?;
         let exp_rva =
-            u32::from_le_bytes(bytes[dd_off..dd_off + 4].try_into().map_err(|_| {
+            u32::from_le_bytes(bytes[er_s..er_e].try_into().map_err(|_| {
                 RuntimeLoadError::ExportResolutionFailed("export RVA read".to_string())
             })?) as usize;
-        let exp_size =
-            u32::from_le_bytes(bytes[dd_off + 4..dd_off + 8].try_into().map_err(|_| {
-                RuntimeLoadError::ExportResolutionFailed("export size read".to_string())
-            })?) as usize;
+        let (es_s, es_e) = range(pe_off, 0x8C, 4, "export size")?;
+        let exp_size = u32::from_le_bytes(bytes[es_s..es_e].try_into().map_err(|_| {
+            RuntimeLoadError::ExportResolutionFailed("export size read".to_string())
+        })?) as usize;
         if exp_rva == 0 || exp_size == 0 {
             return Err(RuntimeLoadError::ExportResolutionFailed(
                 "runtime file has no export directory".to_string(),
@@ -2536,17 +2553,16 @@ impl RuntimeLoader {
                 "export directory outside image envelope: rva={exp_rva:#x} size={exp_size:#x} image={image_size:#x}"
             )));
         }
-        // 2. Section table: build RVA -> file-offset mapping (checked).
+        // 3. Section table: build RVA -> file-offset mapping (checked).
+        let (ns_s, ns_e) = range(pe_off, 6, 2, "num_sections")?;
         let num_sections =
-            u16::from_le_bytes(bytes[pe_off + 6..pe_off + 8].try_into().map_err(|_| {
+            u16::from_le_bytes(bytes[ns_s..ns_e].try_into().map_err(|_| {
                 RuntimeLoadError::ExportResolutionFailed("truncated COFF".to_string())
             })?) as usize;
-        let opt_size =
-            u16::from_le_bytes(bytes[pe_off + 20..pe_off + 22].try_into().map_err(|_| {
-                RuntimeLoadError::ExportResolutionFailed(
-                    "truncated optional header size".to_string(),
-                )
-            })?) as usize;
+        let (os_s, os_e) = range(pe_off, 20, 2, "optional header size")?;
+        let opt_size = u16::from_le_bytes(bytes[os_s..os_e].try_into().map_err(|_| {
+            RuntimeLoadError::ExportResolutionFailed("truncated optional header size".to_string())
+        })?) as usize;
         let sec_off = pe_off
             .checked_add(24)
             .and_then(|v| v.checked_add(opt_size))
@@ -2557,28 +2573,22 @@ impl RuntimeLoader {
             })?;
         let mut sections: Vec<(u64, u64, u64)> = Vec::new(); // (va, vsize, raw_ptr)
         for i in 0..num_sections {
-            let base = sec_off
-                .checked_add(i.checked_mul(40).ok_or_else(|| {
-                    RuntimeLoadError::ExportResolutionFailed("section index overflow".to_string())
-                })?)
-                .ok_or_else(|| {
-                    RuntimeLoadError::ExportResolutionFailed("section offset overflow".to_string())
-                })?;
-            if base + 40 > bytes.len() {
-                return Err(RuntimeLoadError::ExportResolutionFailed(
-                    "section table truncated".to_string(),
-                ));
-            }
-            let vsize = u32::from_le_bytes(bytes[base + 8..base + 12].try_into().map_err(|_| {
+            let slot = i.checked_mul(40).ok_or_else(|| {
+                RuntimeLoadError::ExportResolutionFailed("section index overflow".to_string())
+            })?;
+            let (base_s, _base_e) = range(sec_off, slot, 40, "section header")?;
+            let (vs_s, vs_e) = range(base_s, 8, 4, "section vsize")?;
+            let vsize = u32::from_le_bytes(bytes[vs_s..vs_e].try_into().map_err(|_| {
                 RuntimeLoadError::ExportResolutionFailed("section vsize read".to_string())
             })?) as u64;
-            let va = u32::from_le_bytes(bytes[base + 12..base + 16].try_into().map_err(|_| {
+            let (va_s, va_e) = range(base_s, 12, 4, "section va")?;
+            let va = u32::from_le_bytes(bytes[va_s..va_e].try_into().map_err(|_| {
                 RuntimeLoadError::ExportResolutionFailed("section va read".to_string())
             })?) as u64;
-            let raw_ptr =
-                u32::from_le_bytes(bytes[base + 20..base + 24].try_into().map_err(|_| {
-                    RuntimeLoadError::ExportResolutionFailed("section raw read".to_string())
-                })?) as u64;
+            let (rp_s, rp_e) = range(base_s, 20, 4, "section raw pointer")?;
+            let raw_ptr = u32::from_le_bytes(bytes[rp_s..rp_e].try_into().map_err(|_| {
+                RuntimeLoadError::ExportResolutionFailed("section raw read".to_string())
+            })?) as u64;
             sections.push((va, vsize, raw_ptr));
         }
         let rva_to_file = |rva: usize| -> Result<usize, RuntimeLoadError> {
@@ -2613,54 +2623,40 @@ impl RuntimeLoader {
                 "RVA {rva:#x} not mapped by any section"
             )))
         };
-        // 3. Export directory: read fields from file bytes.
+        // 4. Export directory: read fields from file bytes (checked).
         let ed_off = rva_to_file(exp_rva)?;
-        if ed_off + 40 > bytes.len() {
-            return Err(RuntimeLoadError::ExportResolutionFailed(
-                "export directory truncated in file".to_string(),
-            ));
-        }
-        let num_funcs = u32::from_le_bytes(
-            bytes[ed_off + 0x14..ed_off + 0x18]
-                .try_into()
-                .map_err(|_| {
-                    RuntimeLoadError::ExportResolutionFailed("num_funcs read".to_string())
-                })?,
-        ) as usize;
-        let num_names = u32::from_le_bytes(
-            bytes[ed_off + 0x18..ed_off + 0x1C]
-                .try_into()
-                .map_err(|_| {
-                    RuntimeLoadError::ExportResolutionFailed("num_names read".to_string())
-                })?,
-        ) as usize;
-        let funcs_rva = u32::from_le_bytes(
-            bytes[ed_off + 0x1C..ed_off + 0x20]
-                .try_into()
-                .map_err(|_| {
-                    RuntimeLoadError::ExportResolutionFailed("funcs_rva read".to_string())
-                })?,
-        ) as usize;
-        let names_rva = u32::from_le_bytes(
-            bytes[ed_off + 0x20..ed_off + 0x24]
-                .try_into()
-                .map_err(|_| {
-                    RuntimeLoadError::ExportResolutionFailed("names_rva read".to_string())
-                })?,
-        ) as usize;
-        let ords_rva = u32::from_le_bytes(
-            bytes[ed_off + 0x24..ed_off + 0x28]
-                .try_into()
-                .map_err(|_| {
-                    RuntimeLoadError::ExportResolutionFailed("ords_rva read".to_string())
-                })?,
-        ) as usize;
+        let (_ed_s, _ed_e) = range(ed_off, 0, 40, "export directory")?;
+        let (nf_s, nf_e) = range(ed_off, 0x14, 4, "num_funcs")?;
+        let num_funcs =
+            u32::from_le_bytes(bytes[nf_s..nf_e].try_into().map_err(|_| {
+                RuntimeLoadError::ExportResolutionFailed("num_funcs read".to_string())
+            })?) as usize;
+        let (nn_s, nn_e) = range(ed_off, 0x18, 4, "num_names")?;
+        let num_names =
+            u32::from_le_bytes(bytes[nn_s..nn_e].try_into().map_err(|_| {
+                RuntimeLoadError::ExportResolutionFailed("num_names read".to_string())
+            })?) as usize;
+        let (fr_s, fr_e) = range(ed_off, 0x1C, 4, "funcs_rva")?;
+        let funcs_rva =
+            u32::from_le_bytes(bytes[fr_s..fr_e].try_into().map_err(|_| {
+                RuntimeLoadError::ExportResolutionFailed("funcs_rva read".to_string())
+            })?) as usize;
+        let (nr_s, nr_e) = range(ed_off, 0x20, 4, "names_rva")?;
+        let names_rva =
+            u32::from_le_bytes(bytes[nr_s..nr_e].try_into().map_err(|_| {
+                RuntimeLoadError::ExportResolutionFailed("names_rva read".to_string())
+            })?) as usize;
+        let (or_s, or_e) = range(ed_off, 0x24, 4, "ords_rva")?;
+        let ords_rva =
+            u32::from_le_bytes(bytes[or_s..or_e].try_into().map_err(|_| {
+                RuntimeLoadError::ExportResolutionFailed("ords_rva read".to_string())
+            })?) as usize;
         if num_names == 0 || names_rva == 0 || funcs_rva == 0 || ords_rva == 0 {
             return Err(RuntimeLoadError::ExportResolutionFailed(
                 "runtime file export directory incomplete".to_string(),
             ));
         }
-        // 4. Read the three arrays from FILE bytes (checked, in-envelope).
+        // 5. Read the three arrays from FILE bytes (checked, in-envelope).
         let read_buf = |rva: usize,
                         bytes_n: usize,
                         what: &str|
@@ -2675,15 +2671,8 @@ impl RuntimeLoader {
                 )));
             }
             let fo = rva_to_file(rva)?;
-            if fo
-                .checked_add(bytes_n)
-                .map_or(true, |end| end > bytes.len())
-            {
-                return Err(RuntimeLoadError::ExportResolutionFailed(format!(
-                    "export {what} array truncated in file"
-                )));
-            }
-            Ok(bytes[fo..fo + bytes_n].to_vec())
+            let (arr_s, arr_e) = range(fo, 0, bytes_n, what)?;
+            Ok(bytes[arr_s..arr_e].to_vec())
         };
         let names_bytes = num_names.checked_mul(4).ok_or_else(|| {
             RuntimeLoadError::ExportResolutionFailed("name array size overflow".to_string())
@@ -2712,7 +2701,7 @@ impl RuntimeLoader {
             ));
         }
         let funcs = read_buf(funcs_rva, funcs_bytes, "function")?;
-        // 5. Resolve WalkerExecute via the shared parser (module_base=0 =>
+        // 6. Resolve WalkerExecute via the shared parser (module_base=0 =>
         //    returns pure RVA).
         let mut name_at =
             |name_ptr_rva: usize, out: &mut Vec<u8>| -> Result<bool, RuntimeLoadError> {
@@ -6082,5 +6071,31 @@ mod imp09_carrier_r2_tests {
         let id = verified_identity_for(&pe, "noread");
         let rva = RuntimeLoader::resolve_walker_export_rva_from_file(&id);
         assert_eq!(rva, Ok(0x2040));
+    }
+
+    #[test]
+    fn same_size_verified_file_replacement_rejected() {
+        // P1 (R2-R1): verify_file(A) seals identity(A); the file on disk
+        // is then replaced with SAME-SIZE different-content B. The
+        // resolver must fail closed — path+size binding is NOT enough;
+        // the recomputed content digest must equal identity.sha256().
+        let pe_a = walker_pe();
+        let id = verified_identity_for(&pe_a, "swap_same_size");
+        let mut pe_b = pe_a.clone();
+        // Same length, different content: flip the last section-data byte.
+        let last = pe_b.len() - 1;
+        pe_b[last] ^= 0xFF;
+        assert_eq!(pe_a.len(), pe_b.len(), "test premise: same size");
+        assert_ne!(
+            sha256_hex(&pe_a),
+            sha256_hex(&pe_b),
+            "test premise: different content"
+        );
+        std::fs::write(id.path(), &pe_b).expect("replace file on disk");
+        let r = RuntimeLoader::resolve_walker_export_rva_from_file(&id);
+        assert!(
+            r.is_err(),
+            "same-size replacement must fail closed on digest mismatch"
+        );
     }
 }
