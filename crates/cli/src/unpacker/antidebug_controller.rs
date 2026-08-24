@@ -420,11 +420,11 @@ impl AntidebugController {
         self.options.loader_result = Some(result);
     }
 
-    /// IMP-09-R1-R3: bind the walker session from the SEALED loader digest
-    /// authority (provenance caller).
+    /// IMP-09-R4-R2: install the walker session from the SEALED loader
+    /// digest authority (provenance caller).
     ///
     /// The ONLY production caller of
-    /// `mida_antidebug_runtime::exports::bind_walker_session_verified`:
+    /// `mida_antidebug_runtime::exports::install_walker_session_verified`:
     /// the digest values come from [`LoaderResult::digest_authority`]
     /// which is constructed exclusively by
     /// [`RuntimeDigestAuthority::from_verified_identity`] from a
@@ -440,7 +440,8 @@ impl AntidebugController {
     ///   -> RuntimeDigestAuthority::from_verified_identity (sealed)
     ///   -> LoaderResult (sealed ctor)
     ///   -> AntidebugController::bind_walker_from_loader (THIS method)
-    ///   -> bind_walker_session_verified (exports.rs)
+    ///   -> install_walker_session_verified (exports.rs)
+    ///   -> install_walker_session (pub(crate), transactional)
     ///   -> WalkerDigestAuthority (walker_control.rs)
     /// ```
     pub fn bind_walker_from_loader(&self, params_va: u64, section1_va: u64) -> bool {

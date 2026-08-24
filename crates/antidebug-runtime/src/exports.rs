@@ -960,10 +960,16 @@ impl WalkerSessionBinding {
 static WALKER_PROVIDER: PoisonSafe<Option<Box<dyn WalkerMemoryProvider + Send + Sync>>> =
     PoisonSafe::new(None);
 static WALKER_SESSION: PoisonSafe<Option<WalkerSessionBinding>> = PoisonSafe::new(None);
-/// Atomic session lifecycle (R2 P0-2):
-/// UNBOUND(0) -> READY(1) -> RUNNING(2) -> COMPLETED(3) / ABORTED(4).
-/// WalkerExecute atomically claims READY->RUNNING; any other state rejects
-/// (no second execution, no re-entry while running).
+/// Atomic session lifecycle (R2 P0-2, R3 BINDING, R4-R2 docs):
+/// UNBOUND(0) -> BINDING(1) -> READY(2) -> RUNNING(3) -> COMPLETED(4) / ABORTED(5).
+/// - bind/install CAS-claims UNBOUND->BINDING; READY published only after
+///   provider+session+output are fully installed; failure rolls back to
+///   UNBOUND.
+/// - WalkerExecute atomically claims READY->RUNNING; any other state
+///   rejects (no second execution, no re-entry while running).
+/// - During BINDING the provider may already be installed internally;
+///   session and output are NOT published and lifecycle is NOT READY,
+///   so no observable half-state exists.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalkerSessionLifecycle {
@@ -1039,22 +1045,6 @@ pub fn set_walker_provider(p: Box<dyn WalkerMemoryProvider + Send + Sync>) -> bo
     true
 }
 
-/// R4 transactional installer: provider + session + output as ONE
-/// UNBOUND -> BINDING -> READY transaction.
-///
-/// Steps:
-/// 1. CAS UNBOUND -> BINDING (only entry; READY/RUNNING/COMPLETED/ABORTED
-///    reject).
-/// 2. Validate all authority fields (caller supplies them; the sealed
-///    authority is built in-crate).
-/// 3. Install provider.
-/// 4. Install session binding.
-/// 5. Clear stale output (tied to THIS installation).
-/// 6. Publish READY.
-///
-/// Any failure rolls back: provider cleared, session cleared, output
-/// cleared, lifecycle -> UNBOUND. Returns false with no partial state.
-
 /// R4 rollback: clear provider, session and output; lifecycle -> UNBOUND.
 fn rollback_walker_install() {
     let mut p = WALKER_PROVIDER.write();
@@ -1073,7 +1063,28 @@ fn rollback_walker_install() {
     }
     lifecycle_set(WalkerSessionLifecycle::Unbound);
 }
-pub fn install_walker_session(
+/// R4 transactional installer: provider + session + output as ONE
+/// UNBOUND -> BINDING -> READY transaction.
+///
+/// Steps:
+/// 1. CAS UNBOUND -> BINDING (only entry; READY/RUNNING/COMPLETED/ABORTED
+///    reject).
+/// 2. Validate all authority fields (caller supplies them; the sealed
+///    authority is built in-crate).
+/// 3. Install provider.
+/// 4. Install session binding.
+/// 5. Clear stale output (tied to THIS installation).
+/// 6. Publish READY.
+///
+/// Any failure rolls back: provider cleared, session cleared, output
+/// cleared, lifecycle -> UNBOUND. Returns false with no partial state.
+///
+/// R4-R2: crate-private transactional installer. The ONLY public
+/// production install API is `install_walker_session_verified` — this raw
+/// binding/installer must not be callable from outside the crate, so
+/// external code cannot bypass raw-input validation or the provenance
+/// caller boundary.
+pub(crate) fn install_walker_session(
     provider: Box<dyn WalkerMemoryProvider + Send + Sync>,
     b: WalkerSessionBinding,
 ) -> bool {
@@ -1095,9 +1106,16 @@ pub fn install_walker_session(
     }
     // R4-R1 controlled pause: holds the installer inside the BINDING
     // window so a test can exercise WalkerExecute mid-installation.
+    // R4-R2: bounded wait with fail-closed escape — if the release is
+    // never signalled (e.g. a prior test panicked with the flag set),
+    // the installer clears the flag after a deadline and proceeds,
+    // so a stale flag can never wedge later tests forever.
     #[cfg(test)]
     if IMP09_BINDING_PAUSE.load(std::sync::atomic::Ordering::SeqCst) {
-        while !IMP09_BINDING_PAUSE_RELEASE.load(std::sync::atomic::Ordering::SeqCst) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !IMP09_BINDING_PAUSE_RELEASE.load(std::sync::atomic::Ordering::SeqCst)
+            && std::time::Instant::now() < deadline
+        {
             std::thread::yield_now();
         }
         IMP09_BINDING_PAUSE_RELEASE.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -1168,11 +1186,11 @@ pub fn install_walker_session_verified(
     install_walker_session(provider, binding)
 }
 
-/// Register/replace the local session binding (in-process controller).
+/// TEST-ONLY (R4-R2): raw session-only binder for unit tests.
 ///
-/// R2: does NOT clear a consumed terminal state — a COMPLETED/ABORTED
-/// session stays consumed until [`reset_walker_bindings`] (test-only) or
-/// an explicit fresh lifecycle.
+/// NOT a production path - requires a provider already installed and
+/// cannot clear output or enforce the verified authority matrix. Production
+/// wiring must use [`install_walker_session_verified`].
 #[cfg(test)]
 pub fn bind_walker_session(b: WalkerSessionBinding) -> bool {
     // R4: session-only bind (used by tests + verified path) requires a
@@ -1190,14 +1208,14 @@ pub fn bind_walker_session(b: WalkerSessionBinding) -> bool {
     true
 }
 
-/// Register a session from VERIFIED manifest inputs (R2 authority source).
+/// TEST-ONLY (R4-R2): session-only verified binder retained for unit tests.
 ///
-/// This is the ONLY production path that creates the sealed digest
-/// authority: the controller supplies the digest values it obtained from
-/// the verified manifest (verify_file -> RuntimeAuthorityManifest), and the
-/// authority is constructed + validated INSIDE the crate. External callers
-/// cannot forge an authority object — they can only pass raw verified
-/// inputs through this gate.
+/// NOT a production path. The production boundary is
+/// [`install_walker_session_verified`], which additionally installs the
+/// provider and clears output in the SAME transaction. This test helper
+/// constructs the sealed digest authority from raw verified inputs, but
+/// it must never be used for production wiring (it cannot carry a
+/// provider and cannot bypass the transactional installer).
 #[cfg(test)]
 pub fn bind_walker_session_verified(
     params_va: u64,
@@ -1250,6 +1268,14 @@ pub fn reset_walker_bindings() {
     lifecycle_set(WalkerSessionLifecycle::Unbound);
     #[cfg(test)]
     IMP09_OUTPUT_SINK_FAIL.store(false, std::sync::atomic::Ordering::SeqCst);
+    #[cfg(test)]
+    IMP09_SESSION_INSTALL_FAIL.store(false, std::sync::atomic::Ordering::SeqCst);
+    #[cfg(test)]
+    IMP09_BINDING_PAUSE.store(false, std::sync::atomic::Ordering::SeqCst);
+    #[cfg(test)]
+    IMP09_BINDING_PAUSE_RELEASE.store(true, std::sync::atomic::Ordering::SeqCst);
+    #[cfg(test)]
+    IMP09_BINDING_PAUSE_RELEASE.store(false, std::sync::atomic::Ordering::SeqCst);
     match WALKER_OUTPUT.write() {
         Ok(mut slot) => *slot = None,
         Err(p) => *p.into_inner() = None,
@@ -2736,6 +2762,17 @@ mod imp09_walker_export_tests {
         }
     }
 
+    /// R4-R2: panic-safe release of the BINDING pause. If any assertion in
+    /// the controlled-window test panics, this guard releases the paused
+    /// installer on unwind so later tests can never hang on a stale flag.
+    struct BindingPauseGuard;
+    impl Drop for BindingPauseGuard {
+        fn drop(&mut self) {
+            IMP09_BINDING_PAUSE.store(false, std::sync::atomic::Ordering::SeqCst);
+            IMP09_BINDING_PAUSE_RELEASE.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     #[test]
     fn walker_export_r4_binding_window_execute_rejected_controlled() {
         // R4-R1-2: CONTROLLED pause inside UNBOUND->BINDING. The installer
@@ -2749,6 +2786,7 @@ mod imp09_walker_export_tests {
         let (prov, params_va, section1_va) = setup_valid();
         IMP09_BINDING_PAUSE.store(true, std::sync::atomic::Ordering::SeqCst);
         IMP09_BINDING_PAUSE_RELEASE.store(false, std::sync::atomic::Ordering::SeqCst);
+        let _pause_guard = BindingPauseGuard; // releases on panic (R4-R2)
         let installer = std::thread::spawn(move || {
             install_walker_session(Box::new(prov), binding(params_va, section1_va))
         });
