@@ -1365,11 +1365,11 @@ pub(crate) fn profile_for_case(case_id: &str) -> Option<mida_antidebug::profile:
 }
 
 /// True when `value` is exactly 64 chars and all lowercase hex.
+/// Strict canonical SHA-256 lowercase-hex contract: exactly 64 chars,
+/// each in `[0-9a-f]`. Any other lowercase letter (`g-z`), uppercase
+/// letter, non-hex digit, or wrong length is rejected.
 fn is_64_lower_hex(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    value.len() == 64 && value.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))
 }
 
 #[derive(Debug)]
@@ -5418,16 +5418,19 @@ mod tests {
     }
 
     #[test]
-    fn imp09_profile_uppercase_digest_never_produced() {
-        // The carrier digest is always SHA-256 lowercase hex from the
-        // sealed constructor — there is no API that accepts an external
-        // digest, so an uppercase (or any non-canonical) digest cannot
-        // enter the carrier. This proves the canonical form is the ONLY
-        // form the seal can produce.
+    fn imp09_profile_uppercase_digest_cannot_be_injected() {
+        // SOURCE-ACCURATE wording (P2-2 correction): the sealed constructor
+        // accepts NO external digest at all — from_verified_profile always
+        // recomputes SHA-256(canonical_json bytes). Therefore an uppercase
+        // (or any non-canonical) digest can never be INJECTED into the
+        // carrier; there is no input path that could carry one in. The
+        // strict [0-9a-f]{64} contract is enforced at the checker level
+        // (is_64_lower_hex, tested separately).
         use mida_antidebug::profile::origin_profile;
         let p = origin_profile();
         let id = VerifiedProfileIdentity::from_verified_profile(&p, "origin_macro", "x86_64")
             .expect("seals");
+        // Produced digest is canonical lowercase hex (never uppercase).
         assert_eq!(id.profile_digest(), id.profile_digest().to_lowercase());
         assert!(!id
             .profile_digest()
@@ -5437,6 +5440,49 @@ mod tests {
             id.profile_digest(),
             sha256_hex(p.canonical_json().as_bytes())
         );
+        // And the strict checker rejects the hostile forms outright.
+        assert!(!is_64_lower_hex(&id.profile_digest().to_uppercase()));
+        assert!(!is_64_lower_hex(&format!(
+            "{}g",
+            &id.profile_digest()[..63]
+        )));
+        assert!(!is_64_lower_hex(&format!(
+            "{}z",
+            &id.profile_digest()[..63]
+        )));
+        assert!(!is_64_lower_hex(&id.profile_digest()[..63]));
+    }
+
+    #[test]
+    fn imp09_strict_lowercase_hex_checker_rejects_hostile_forms() {
+        // P2-1 correction: the checker enforces exactly [0-9a-f]{64} —
+        // 'g'..='z' lowercase letters, uppercase letters, wrong length, and
+        // non-hex characters are all rejected.
+        let valid = "ab12cd34ef56ab12cd34ef56ab12cd34ef56ab12cd34ef56ab12cd34ef56ab12";
+        assert!(is_64_lower_hex(valid));
+        // lowercase letters outside [0-9a-f]
+        let mut with_g = valid.to_string();
+        with_g.replace_range(0..1, "g");
+        assert!(!is_64_lower_hex(&with_g), "g must be rejected");
+        let mut with_z = valid.to_string();
+        with_z.replace_range(63..64, "z");
+        assert!(!is_64_lower_hex(&with_z), "z must be rejected");
+        // uppercase
+        assert!(!is_64_lower_hex(&valid.to_uppercase()));
+        let mut with_a = valid.to_string();
+        with_a.replace_range(0..1, "A");
+        assert!(!is_64_lower_hex(&with_a), "uppercase A must be rejected");
+        // wrong length
+        assert!(!is_64_lower_hex(&valid[..63]));
+        assert!(!is_64_lower_hex(&format!("{valid}0")));
+        assert!(!is_64_lower_hex(""));
+        // non-hex
+        assert!(!is_64_lower_hex(&format!("{valid}x")));
+        // FNV-1a 16-hex is not 64
+        assert!(!is_64_lower_hex("2b01482a3681d838"));
+        // real SHA-256 output passes (contract preserved)
+        let real = sha256_hex(b"mida");
+        assert!(is_64_lower_hex(&real));
     }
 
     #[test]
