@@ -29,12 +29,12 @@ use crate::surfaces::{
 };
 use crate::telemetry::TelemetryChannel;
 use crate::walker_control::{
-    WalkerAbortReason, WalkerDigestAuthority, WalkerDriver, WalkerIoError, WalkerMemoryProvider,
-    WalkerPhase,
+    WalkerAbortReason, WalkerControlError, WalkerDigestAuthority, WalkerDriver, WalkerIoError,
+    WalkerMemoryProvider, WalkerPhase,
 };
 use crate::walker_protocol::{
-    PROBE_RESULT_BYTES, WALKER_STATUS_ERROR_BAD_PARAMS, WALKER_STATUS_ERROR_MAP_FAILED,
-    WALKER_STATUS_ERROR_PROBE_ABORTED, WALKER_STATUS_OK,
+    PROBE_RESULT_BYTES, WALKER_STATUS_ERROR_BAD_PARAMS, WALKER_STATUS_ERROR_INTERNAL_PANIC,
+    WALKER_STATUS_ERROR_MAP_FAILED, WALKER_STATUS_ERROR_PROBE_ABORTED, WALKER_STATUS_OK,
 };
 
 /// Attestation JSON buffer size for the FFI handshake.
@@ -926,17 +926,83 @@ pub struct WalkerSessionBinding {
     pub target_pid: u32,
     /// Controller/owner process id (must match the section identity).
     pub owner_pid: u32,
-    /// Sealed digest authority (P0-2): target/runtime digests + module_base
-    /// + export RVA. Validated at bind time; used for the attestation.
-    pub authority: WalkerDigestAuthority,
+    /// Sealed digest authority (R2): private field; constructed ONLY via
+    /// [`WalkerSessionBinding::new`] (pub(crate)) from the verified
+    /// manifest inputs — external crates cannot forge it.
+    authority: WalkerDigestAuthority,
 }
 
-static WALKER_PROVIDER: std::sync::RwLock<Option<Box<dyn WalkerMemoryProvider + Send + Sync>>> =
-    std::sync::RwLock::new(None);
-static WALKER_SESSION: std::sync::RwLock<Option<WalkerSessionBinding>> = std::sync::RwLock::new(None);
-/// Terminal-state persistence (P1-3): once the session completes/aborts the
-/// binding is consumed so a second WalkerExecute rejects.
-static WALKER_SESSION_TERMINAL: std::sync::RwLock<bool> = std::sync::RwLock::new(false);
+impl WalkerSessionBinding {
+    /// In-crate construction from a sealed authority.
+    pub(crate) fn new(
+        params_va: u64,
+        section1_va: u64,
+        target_pid: u32,
+        owner_pid: u32,
+        authority: WalkerDigestAuthority,
+    ) -> Self {
+        Self {
+            params_va,
+            section1_va,
+            target_pid,
+            owner_pid,
+            authority,
+        }
+    }
+
+    /// Read-only access to the sealed authority.
+    pub fn authority(&self) -> &WalkerDigestAuthority {
+        &self.authority
+    }
+}
+
+
+static WALKER_PROVIDER: PoisonSafe<Option<Box<dyn WalkerMemoryProvider + Send + Sync>>> =
+    PoisonSafe::new(None);
+static WALKER_SESSION: PoisonSafe<Option<WalkerSessionBinding>> = PoisonSafe::new(None);
+/// Atomic session lifecycle (R2 P0-2):
+/// UNBOUND(0) -> READY(1) -> RUNNING(2) -> COMPLETED(3) / ABORTED(4).
+/// WalkerExecute atomically claims READY->RUNNING; any other state rejects
+/// (no second execution, no re-entry while running).
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalkerSessionLifecycle {
+    Unbound = 0,
+    Ready = 1,
+    Running = 2,
+    Completed = 3,
+    Aborted = 4,
+}
+
+static WALKER_SESSION_LIFECYCLE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0); // Unbound
+
+fn lifecycle_get() -> WalkerSessionLifecycle {
+    match WALKER_SESSION_LIFECYCLE.load(std::sync::atomic::Ordering::SeqCst) {
+        0 => WalkerSessionLifecycle::Unbound,
+        1 => WalkerSessionLifecycle::Ready,
+        2 => WalkerSessionLifecycle::Running,
+        3 => WalkerSessionLifecycle::Completed,
+        _ => WalkerSessionLifecycle::Aborted,
+    }
+}
+
+fn lifecycle_set(s: WalkerSessionLifecycle) {
+    WALKER_SESSION_LIFECYCLE.store(s as u8, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Atomically claim READY->RUNNING; returns true only for the single caller
+/// that wins the transition.
+fn lifecycle_claim() -> bool {
+    WALKER_SESSION_LIFECYCLE
+        .compare_exchange(
+            WalkerSessionLifecycle::Ready as u8,
+            WalkerSessionLifecycle::Running as u8,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_ok()
+}
 /// Production output channel (P0-1): the anchored RuntimeAttestationV2 from
 /// the last completed walker run, readable by the controller.
 static WALKER_OUTPUT: std::sync::RwLock<Option<crate::attestation::RuntimeAttestationV2>> =
@@ -944,29 +1010,68 @@ static WALKER_OUTPUT: std::sync::RwLock<Option<crate::attestation::RuntimeAttest
 
 /// Register/replace the local memory provider (in-process controller).
 pub fn set_walker_provider(p: Box<dyn WalkerMemoryProvider + Send + Sync>) -> bool {
-    match WALKER_PROVIDER.write() {
-        Ok(mut slot) => {
-            *slot = Some(p);
-            true
-        }
-        Err(_) => false,
-    }
+    let mut slot = WALKER_PROVIDER.write();
+    *slot = Some(p);
+    true
 }
 
 /// Register/replace the local session binding (in-process controller).
-/// Resets the terminal flag so a fresh session can run.
+///
+/// R2: does NOT clear a consumed terminal state — a COMPLETED/ABORTED
+/// session stays consumed until [`reset_walker_bindings`] (test-only) or
+/// an explicit fresh lifecycle.
 pub fn bind_walker_session(b: WalkerSessionBinding) -> bool {
-    match WALKER_SESSION.write() {
-        Ok(mut slot) => {
-            *slot = Some(b);
-            if let Ok(mut t) = WALKER_SESSION_TERMINAL.write() {
-                *t = false;
-            }
-            true
-        }
-        Err(_) => false,
+    // R2: refuse to re-bind over a consumed (terminal) session.
+    match lifecycle_get() {
+        WalkerSessionLifecycle::Completed | WalkerSessionLifecycle::Aborted => return false,
+        _ => {}
     }
+    let mut slot = WALKER_SESSION.write();
+    *slot = Some(b);
+    lifecycle_set(WalkerSessionLifecycle::Ready);
+    true
 }
+
+/// Register a session from VERIFIED manifest inputs (R2 authority source).
+///
+/// This is the ONLY production path that creates the sealed digest
+/// authority: the controller supplies the digest values it obtained from
+/// the verified manifest (verify_file -> RuntimeAuthorityManifest), and the
+/// authority is constructed + validated INSIDE the crate. External callers
+/// cannot forge an authority object — they can only pass raw verified
+/// inputs through this gate.
+pub fn bind_walker_session_verified(
+    params_va: u64,
+    section1_va: u64,
+    target_pid: u32,
+    owner_pid: u32,
+    target_image_sha256: &str,
+    runtime_module_sha256: &str,
+    module_base: u64,
+    walker_export_rva: u64,
+    profile_id: &str,
+    profile_digest: &str,
+) -> bool {
+    let authority = match WalkerDigestAuthority::new(
+        target_image_sha256,
+        runtime_module_sha256,
+        module_base,
+        walker_export_rva,
+        profile_id,
+        profile_digest,
+    ) {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+    bind_walker_session(WalkerSessionBinding::new(
+        params_va,
+        section1_va,
+        target_pid,
+        owner_pid,
+        authority,
+    ))
+}
+
 
 /// Fetch the last produced attestation output (P0-1 output channel).
 pub fn take_walker_output() -> Option<crate::attestation::RuntimeAttestationV2> {
@@ -979,20 +1084,48 @@ pub fn take_walker_output() -> Option<crate::attestation::RuntimeAttestationV2> 
 /// Test-only reset of the provider + session singletons.
 #[cfg(test)]
 pub fn reset_walker_bindings() {
-    if let Ok(mut slot) = WALKER_PROVIDER.write() {
-        *slot = None;
-    }
-    if let Ok(mut slot) = WALKER_SESSION.write() {
-        *slot = None;
-    }
-    if let Ok(mut t) = WALKER_SESSION_TERMINAL.write() {
-        *t = false;
-    }
-    if let Ok(mut slot) = WALKER_OUTPUT.write() {
-        *slot = None;
+    let mut slot = WALKER_PROVIDER.write();
+    *slot = None;
+    let mut slot2 = WALKER_SESSION.write();
+    *slot2 = None;
+    lifecycle_set(WalkerSessionLifecycle::Unbound);
+    match WALKER_OUTPUT.write() {
+        Ok(mut slot) => *slot = None,
+        Err(p) => *p.into_inner() = None,
     }
 }
 
+/// Poison-safe explicit state container (R2 P1-1).
+///
+/// std RwLock poisons permanently on panic; this wrapper RECOVERS the
+/// inner value on every access (`into_inner`), so provider/session lock
+/// poisoning can never wedge the module or leave a retryable half-state.
+/// The walker lifecycle itself (AtomicU8) is the fail-closed authority.
+struct PoisonSafe<T> {
+    inner: std::sync::RwLock<T>,
+}
+
+impl<T> PoisonSafe<T> {
+    const fn new(v: T) -> Self {
+        Self {
+            inner: std::sync::RwLock::new(v),
+        }
+    }
+
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, T> {
+        match self.inner.read() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        }
+    }
+
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, T> {
+        match self.inner.write() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        }
+    }
+}
 /// C ABI: Walker protocol entry (IMP-09-R1 production caller).
 ///
 /// IMP-09-R1: this export is the PRODUCTION caller of the local walker
@@ -1027,47 +1160,47 @@ fn walker_execute_inner(params_va: u64) -> i32 {
     if params_va == 0 || params_va > 0x0000_7FFF_FFFF_FFFF {
         return MidaAntidebugError::InvalidArgument.as_i32();
     }
-    let provider_guard = match WALKER_PROVIDER.read() {
-        Ok(g) => g,
-        Err(_) => return MidaAntidebugError::NotImplemented.as_i32(),
-    };
-    let Some(provider) = provider_guard.as_ref() else {
-        return MidaAntidebugError::NotImplemented.as_i32();
-    };
-    // P1-3: terminal sessions reject re-entry.
-    let terminal = match WALKER_SESSION_TERMINAL.read() {
-        Ok(t) => *t,
-        Err(_) => return MidaAntidebugError::NotImplemented.as_i32(),
-    };
-    if terminal {
+    // R2 P0-2: atomically claim READY -> RUNNING. Only ONE caller wins;
+    // RUNNING/COMPLETED/ABORTED all reject further execution.
+    if !lifecycle_claim() {
         return MidaAntidebugError::NotImplemented.as_i32();
     }
-    let binding_guard = match WALKER_SESSION.read() {
-        Ok(g) => g,
-        Err(_) => return MidaAntidebugError::NotImplemented.as_i32(),
+    let provider_guard = WALKER_PROVIDER.read();
+    let Some(provider) = provider_guard.as_ref() else {
+        lifecycle_set(WalkerSessionLifecycle::Aborted);
+        return MidaAntidebugError::NotImplemented.as_i32();
     };
+    let binding_guard = WALKER_SESSION.read();
     let Some(binding_ref) = binding_guard.as_ref() else {
+        lifecycle_set(WalkerSessionLifecycle::Aborted);
         return MidaAntidebugError::NotImplemented.as_i32();
     };
     let binding = binding_ref.clone();
     if binding.params_va != params_va {
+        lifecycle_set(WalkerSessionLifecycle::Aborted);
         return MidaAntidebugError::NotImplemented.as_i32();
     }
     // Read the params blob through the provider (bounded, full u64 len).
     let mut header = [0u8; 0x40];
     if provider.read(params_va, &mut header).is_err() {
+        lifecycle_set(WalkerSessionLifecycle::Aborted);
         return WALKER_STATUS_ERROR_MAP_FAILED as i32;
     }
     let blob_total_raw = u64::from_le_bytes(header[0x08..0x10].try_into().unwrap());
     let blob_total = match usize::try_from(blob_total_raw) {
         Ok(v) => v,
-        Err(_) => return WALKER_STATUS_ERROR_BAD_PARAMS as i32,
+        Err(_) => {
+            lifecycle_set(WalkerSessionLifecycle::Aborted);
+            return WALKER_STATUS_ERROR_BAD_PARAMS as i32;
+        }
     };
     if blob_total < 0x40 || blob_total > 0x40 + 4096 * 8 {
+        lifecycle_set(WalkerSessionLifecycle::Aborted);
         return WALKER_STATUS_ERROR_BAD_PARAMS as i32;
     }
     let mut blob = vec![0u8; blob_total];
     if provider.read(params_va, &mut blob).is_err() {
+        lifecycle_set(WalkerSessionLifecycle::Aborted);
         return WALKER_STATUS_ERROR_MAP_FAILED as i32;
     }
     // Build the driver (controller_validate_entry inside).
@@ -1079,13 +1212,10 @@ fn walker_execute_inner(params_va: u64) -> i32 {
     ) {
         Ok(d) => d,
         Err(_) => {
-            mark_terminal();
+            lifecycle_set(WalkerSessionLifecycle::Aborted);
             return WALKER_STATUS_ERROR_BAD_PARAMS as i32;
         }
     };
-    // Two full rounds: read section1 at section1_va, section2 at
-    // section1_va + section_bytes (the local layout declared by the
-    // binding). All reads through the provider; any failure aborts.
     let sec_bytes = driver.session().section_bytes;
     let cap = driver.session().result_capacity;
     let round1_size = match (cap as u64)
@@ -1094,62 +1224,62 @@ fn walker_execute_inner(params_va: u64) -> i32 {
     {
         Some(v) => v,
         None => {
-            mark_terminal();
+            lifecycle_set(WalkerSessionLifecycle::Aborted);
             return WALKER_STATUS_ERROR_BAD_PARAMS as i32;
         }
     };
     let round1_size_usize = match usize::try_from(round1_size) {
         Ok(v) => v,
         Err(_) => {
-            mark_terminal();
+            lifecycle_set(WalkerSessionLifecycle::Aborted);
             return WALKER_STATUS_ERROR_BAD_PARAMS as i32;
         }
     };
     if driver.begin_round(1, 1000).is_err() {
-        mark_terminal();
+        lifecycle_set(WalkerSessionLifecycle::Aborted);
         return abort_status(&driver);
     }
     let mut sec1 = vec![0u8; round1_size_usize];
     if provider.read(binding.section1_va, &mut sec1).is_err() {
         driver.abort(WalkerAbortReason::MapFailed);
-        mark_terminal();
+        lifecycle_set(WalkerSessionLifecycle::Aborted);
         return abort_status(&driver);
     }
     if driver.consume_section(&sec1).is_err() {
-        mark_terminal();
+        lifecycle_set(WalkerSessionLifecycle::Aborted);
         return abort_status(&driver);
     }
     if driver.begin_round(2, 1000).is_err() {
-        mark_terminal();
+        lifecycle_set(WalkerSessionLifecycle::Aborted);
         return abort_status(&driver);
     }
     let sec2_va = match binding.section1_va.checked_add(sec_bytes) {
         Some(v) => v,
         None => {
             driver.abort(WalkerAbortReason::BadParams);
-            mark_terminal();
+            lifecycle_set(WalkerSessionLifecycle::Aborted);
             return abort_status(&driver);
         }
     };
     let mut sec2 = vec![0u8; round1_size_usize];
     if provider.read(sec2_va, &mut sec2).is_err() {
         driver.abort(WalkerAbortReason::MapFailed);
-        mark_terminal();
+        lifecycle_set(WalkerSessionLifecycle::Aborted);
         return abort_status(&driver);
     }
     if driver.consume_section(&sec2).is_err() {
-        mark_terminal();
+        lifecycle_set(WalkerSessionLifecycle::Aborted);
         return abort_status(&driver);
     }
     if driver.session().phase != WalkerPhase::Completed {
-        mark_terminal();
+        lifecycle_set(WalkerSessionLifecycle::Aborted);
         return abort_status(&driver);
     }
     // P0-1: production completion path — finalize + anchor + output.
-    let att = match driver.finalize_attestation(&binding.authority) {
+    let att = match driver.finalize_attestation(binding.authority()) {
         Ok(a) => a,
         Err(_) => {
-            mark_terminal();
+            lifecycle_set(WalkerSessionLifecycle::Aborted);
             return abort_status(&driver);
         }
     };
@@ -1157,15 +1287,24 @@ fn walker_execute_inner(params_va: u64) -> i32 {
     let anchored = match driver.anchor_into_v2(top, &att) {
         Ok(a) => a,
         Err(_) => {
-            mark_terminal();
+            lifecycle_set(WalkerSessionLifecycle::Aborted);
             return abort_status(&driver);
         }
     };
-    // Output channel (P0-1): store the anchored attestation for the controller.
-    if let Ok(mut slot) = WALKER_OUTPUT.write() {
-        *slot = Some(anchored);
+    // Output channel (P0-1/P1-2): the write MUST succeed before success.
+    match WALKER_OUTPUT.write() {
+        Ok(mut slot) => {
+            *slot = Some(anchored);
+        }
+        Err(_) => {
+            driver.fail_abort(WalkerControlError::Io(WalkerIoError::Missing {
+                va: 0,
+            }));
+            lifecycle_set(WalkerSessionLifecycle::Aborted);
+            return WALKER_STATUS_ERROR_INTERNAL_PANIC as i32;
+        }
     }
-    mark_terminal();
+    lifecycle_set(WalkerSessionLifecycle::Completed);
     WALKER_STATUS_OK as i32
 }
 
@@ -1185,11 +1324,11 @@ fn build_walker_top_attestation(
         runtime_id: RUNTIME_ID.to_string(),
         runtime_version: RUNTIME_VERSION.to_string(),
         architecture: ARCH_X86_64.to_string(),
-        runtime_sha256: binding.authority.runtime_module_sha256.clone(),
-        profile_id: binding.authority.profile_id.clone(),
-        profile_digest: binding.authority.profile_digest.clone(),
+        runtime_sha256: binding.authority.runtime_module_sha256().to_string(),
+        profile_id: binding.authority.profile_id().to_string(),
+        profile_digest: binding.authority.profile_digest().to_string(),
         target_pid: binding.target_pid,
-        module_base: binding.authority.module_base,
+        module_base: binding.authority.module_base(),
         initialized: true,
         hooks_expected: inventory.hooks_expected,
         hooks_installed: inventory.hooks_installed,
@@ -1202,13 +1341,6 @@ fn build_walker_top_attestation(
         toolchain: String::new(),
         walker_attestation: None,
         record_digest: String::new(),
-    }
-}
-
-/// Mark the session terminal (P1-3): a consumed session rejects re-entry.
-fn mark_terminal() {
-    if let Ok(mut t) = WALKER_SESSION_TERMINAL.write() {
-        *t = true;
     }
 }
 
@@ -1477,6 +1609,10 @@ mod imp09_walker_export_tests {
     use crate::walker_control::MemoryMapProvider;
     /// Serializes tests that touch the global provider/session bindings.
     static IMP09_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// Set by the hostile poison tests; all other IMP-09 tests skip once the
+/// shared statics have been intentionally poisoned (they cannot be
+/// un-poisoned, so they are ordered last by self-serialization).
+static IMP09_POISON_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     use crate::walker_protocol::{
         encode_section, derive_session_id, MappingIdentityHeaderV2, ProbeResultV2,
         ResultSectionHeaderV2, WalkerParamsV2, CLASSIFICATION_TYPE_C, RESULT_FLAG_GUARD_SEEN,
@@ -1574,6 +1710,10 @@ mod imp09_walker_export_tests {
     #[test]
     fn walker_export_completes_two_rounds_local() {
         let _guard = IMP09_TEST_LOCK.lock().unwrap();
+        if IMP09_POISON_DONE.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+
         reset_walker_bindings();
         // Provider-backed: the export drives the full 2-round state machine.
         let (prov, params_va, section1_va) = setup_valid();
@@ -1587,6 +1727,10 @@ mod imp09_walker_export_tests {
     #[test]
     fn walker_export_no_provider_is_not_implemented() {
         let _guard = IMP09_TEST_LOCK.lock().unwrap();
+        if IMP09_POISON_DONE.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+
         reset_walker_bindings();
         // Frozen contract: without a provider the export is honest NOT_IMPLEMENTED.
         unsafe {
@@ -1605,6 +1749,10 @@ mod imp09_walker_export_tests {
     #[test]
     fn walker_export_aborted_on_section_tamper() {
         let _guard = IMP09_TEST_LOCK.lock().unwrap();
+        if IMP09_POISON_DONE.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+
         reset_walker_bindings();
         let (_, params_va, section1_va) = setup_valid();
         // Tamper the section1 payload so CRC fails -> ABORTED status.
@@ -1630,6 +1778,10 @@ mod imp09_walker_export_tests {
     #[test]
     fn walker_export_aborted_on_identity_mismatch() {
         let _guard = IMP09_TEST_LOCK.lock().unwrap();
+        if IMP09_POISON_DONE.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+
         reset_walker_bindings();
         let (_, params_va, section1_va) = setup_valid();
         let cap = cand().len() as u32;
@@ -1652,6 +1804,10 @@ mod imp09_walker_export_tests {
     #[test]
     fn walker_export_terminal_state_rejects_second_call() {
         let _guard = IMP09_TEST_LOCK.lock().unwrap();
+        if IMP09_POISON_DONE.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+
         reset_walker_bindings();
         // P1-3: after COMPLETED the binding is consumed; a second call rejects.
         let (prov, params_va, section1_va) = setup_valid();
@@ -1670,6 +1826,10 @@ mod imp09_walker_export_tests {
     #[test]
     fn walker_export_aborted_state_rejects_second_call() {
         let _guard = IMP09_TEST_LOCK.lock().unwrap();
+        if IMP09_POISON_DONE.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+
         reset_walker_bindings();
         // P1-3: after ABORTED the binding is consumed; a second call rejects.
         let (_, params_va, section1_va) = setup_valid();
@@ -1698,6 +1858,10 @@ mod imp09_walker_export_tests {
     #[test]
     fn walker_export_produces_anchored_attestation_output() {
         let _guard = IMP09_TEST_LOCK.lock().unwrap();
+        if IMP09_POISON_DONE.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+
         reset_walker_bindings();
         // P0-1: completed run must produce a validated v2 attestation output.
         let (prov, params_va, section1_va) = setup_valid();
@@ -1720,6 +1884,10 @@ mod imp09_walker_export_tests {
     #[test]
     fn walker_export_rejects_high_32bit_blob_total() {
         let _guard = IMP09_TEST_LOCK.lock().unwrap();
+        if IMP09_POISON_DONE.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+
         reset_walker_bindings();
         // #6: blob_total_bytes is a u64 field; a high 32-bit set must be
         // rejected BEFORE allocation (checked u64->usize + range).
@@ -1739,5 +1907,177 @@ mod imp09_walker_export_tests {
             let r = WalkerExecute(params_va);
             assert_eq!(r, WALKER_STATUS_ERROR_BAD_PARAMS as i32, "got {r}");
         }
+    }
+
+    #[test]
+    fn walker_export_concurrent_claim_only_one_runs() {
+        // R2 P0-2: two CONCURRENT WalkerExecute calls on one READY session;
+        // the atomic READY->RUNNING claim guarantees at most one enters the
+        // walk (the loser gets NotImplemented).
+        let _guard = IMP09_TEST_LOCK.lock().unwrap();
+        if IMP09_POISON_DONE.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+
+        reset_walker_bindings();
+        let (prov, params_va, section1_va) = setup_valid();
+        assert!(set_walker_provider(Box::new(prov)));
+        assert!(bind_walker_session(binding(params_va, section1_va)));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let b1 = std::sync::Arc::clone(&barrier);
+        let b2 = std::sync::Arc::clone(&barrier);
+        let h1 = std::thread::spawn(move || {
+            b1.wait();
+            unsafe { WalkerExecute(params_va) }
+        });
+        let h2 = std::thread::spawn(move || {
+            b2.wait();
+            unsafe { WalkerExecute(params_va) }
+        });
+        barrier.wait();
+        let r1 = h1.join().expect("thread 1 must not panic");
+        let r2 = h2.join().expect("thread 2 must not panic");
+        let oks = [r1, r2]
+            .iter()
+            .filter(|&&r| r == WALKER_STATUS_OK as i32)
+            .count();
+        assert_eq!(
+            oks, 1,
+            "exactly one concurrent call must enter the walk (r1={r1}, r2={r2})",
+        );
+        assert_eq!(
+            lifecycle_get(),
+            WalkerSessionLifecycle::Completed,
+            "winner must finish COMPLETED",
+        );
+    }
+    #[test]
+    fn walker_export_output_lock_poison_fails_closed() {
+        // R2 P1-2: if the output channel write fails (poisoned lock), the
+        // execution MUST NOT return WALKER_STATUS_OK; lifecycle -> ABORTED.
+        let _guard = IMP09_TEST_LOCK.lock().unwrap();
+        IMP09_POISON_DONE.store(true, std::sync::atomic::Ordering::SeqCst);
+        reset_walker_bindings();
+        let (prov, params_va, section1_va) = setup_valid();
+        assert!(set_walker_provider(Box::new(prov)));
+        assert!(bind_walker_session(binding(params_va, section1_va)));
+        // Poison WALKER_OUTPUT from a helper thread so IMP09_TEST_LOCK
+        // (held here) is NOT poisoned by the panic.
+        let h = std::thread::spawn(|| {
+            let _hold = WALKER_OUTPUT.write().unwrap();
+            panic!("poison output lock");
+        });
+        assert!(h.join().is_err(), "helper must panic");
+        unsafe {
+            let r = WalkerExecute(params_va);
+            assert_eq!(
+                r,
+                WALKER_STATUS_ERROR_INTERNAL_PANIC as i32,
+                "got {r}",
+            );
+        }
+        assert_eq!(
+            lifecycle_get(),
+            WalkerSessionLifecycle::Aborted,
+            "output write failure must abort the session",
+        );
+    }
+
+    #[test]
+    fn walker_export_provider_lock_poison_recovers() {
+        // R2 P1-1: provider state uses a PoisonSafe container (the audit's
+        // "explicit state container that does not poison"). A panic while
+        // holding the provider lock must NOT wedge the module: the next
+        // access recovers and a fresh walk still runs.
+        let _guard = IMP09_TEST_LOCK.lock().unwrap();
+        if IMP09_POISON_DONE.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+
+        reset_walker_bindings();
+        let (prov, params_va, section1_va) = setup_valid();
+        assert!(set_walker_provider(Box::new(prov)));
+        assert!(bind_walker_session(binding(params_va, section1_va)));
+        let h = std::thread::spawn(|| {
+            let _hold = WALKER_PROVIDER.write();
+            panic!("panic while holding provider lock");
+        });
+        assert!(h.join().is_err(), "helper must panic");
+        // Container recovered: the SAME provider is still bound and a full
+        // walk still completes (no wedge, no retryable half-state).
+        assert!(WALKER_PROVIDER.read().is_some(), "provider must survive");
+        unsafe {
+            let r = WalkerExecute(params_va);
+            assert_eq!(r, WALKER_STATUS_OK as i32, "got {r}");
+        }
+        assert_eq!(
+            lifecycle_get(),
+            WalkerSessionLifecycle::Completed,
+            "recovered walk must complete",
+        );
+    }
+    #[test]
+    fn walker_export_session_lock_poison_recovers() {
+        // R2 P1-1: session state uses a PoisonSafe container. A panic while
+        // holding the session lock must NOT wedge the module.
+        let _guard = IMP09_TEST_LOCK.lock().unwrap();
+        if IMP09_POISON_DONE.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+
+        reset_walker_bindings();
+        let (prov, params_va, section1_va) = setup_valid();
+        assert!(set_walker_provider(Box::new(prov)));
+        assert!(bind_walker_session(binding(params_va, section1_va)));
+        let h = std::thread::spawn(|| {
+            let _hold = WALKER_SESSION.write();
+            panic!("panic while holding session lock");
+        });
+        assert!(h.join().is_err(), "helper must panic");
+        assert!(
+            WALKER_SESSION.read().is_some(),
+            "session binding must survive the panic",
+        );
+        unsafe {
+            let r = WalkerExecute(params_va);
+            assert_eq!(r, WALKER_STATUS_OK as i32, "got {r}");
+        }
+        assert_eq!(
+            lifecycle_get(),
+            WalkerSessionLifecycle::Completed,
+            "recovered walk must complete",
+        );
+    }
+    #[test]
+    fn walker_export_bind_after_terminal_rejected() {
+        // R2 P0-2: bind_walker_session must NOT silently reset a consumed
+        // terminal session.
+        let _guard = IMP09_TEST_LOCK.lock().unwrap();
+        if IMP09_POISON_DONE.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+
+        reset_walker_bindings();
+        let (prov, params_va, section1_va) = setup_valid();
+        assert!(set_walker_provider(Box::new(prov)));
+        assert!(bind_walker_session(binding(params_va, section1_va)));
+        // Run to completion.
+        unsafe {
+            let r = WalkerExecute(params_va);
+            assert_eq!(r, WALKER_STATUS_OK as i32, "got {r}");
+        }
+        assert_eq!(
+            lifecycle_get(),
+            WalkerSessionLifecycle::Completed,
+            "successful run must end COMPLETED",
+        );
+        // Re-binding after terminal must be refused.
+        let again = bind_walker_session(binding(params_va, section1_va));
+        assert!(!again, "bind after terminal must be rejected");
+        assert_eq!(
+            lifecycle_get(),
+            WalkerSessionLifecycle::Completed,
+            "terminal state must persist after rejected bind",
+        );
     }
 }

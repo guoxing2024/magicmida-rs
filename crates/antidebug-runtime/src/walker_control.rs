@@ -87,24 +87,36 @@ impl WalkerAbortReason {
 /// Strings come from the controller's verified manifest (digest authority),
 /// NOT from an open caller-provided string at attestation time.
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Sealed digest authority (R2): fields are PRIVATE.
+///
+/// The ONLY construction path is [`WalkerDigestAuthority::new`] which is
+/// `pub(crate)` — external crates cannot forge an authority. The production
+/// caller graph proves the values originate from the verified manifest
+/// (digest authority) bound by the in-crate controller, not from arbitrary
+/// caller strings.
 pub struct WalkerDigestAuthority {
     /// SHA-256 of the target image (64 lowercase hex).
-    pub target_image_sha256: String,
+    target_image_sha256: String,
     /// SHA-256 of the runtime module (64 lowercase hex).
-    pub runtime_module_sha256: String,
+    runtime_module_sha256: String,
     /// Target module base VA (== attestation module_base).
-    pub module_base: u64,
+    module_base: u64,
     /// WalkerExecute export RVA within the runtime module.
-    pub walker_export_rva: u64,
+    walker_export_rva: u64,
     /// Profile id (attestation profile binding).
-    pub profile_id: String,
+    profile_id: String,
     /// Profile digest (attestation profile binding; non-empty required by v2).
-    pub profile_digest: String,
+    profile_digest: String,
 }
+
 
 impl WalkerDigestAuthority {
     /// Build + validate the sealed authority (fail-closed).
-    pub fn new(
+    ///
+    /// `pub(crate)` — the only construction path. External crates
+    /// must receive a fully-formed authority through the in-crate binding
+    /// API; they cannot forge fields.
+    pub(crate) fn new(
         target_image_sha256: &str,
         runtime_module_sha256: &str,
         module_base: u64,
@@ -147,7 +159,38 @@ impl WalkerDigestAuthority {
     pub fn walker_entry_va(&self) -> u64 {
         self.module_base + self.walker_export_rva
     }
+
+    /// Target image digest (read-only accessor).
+    pub fn target_image_sha256(&self) -> &str {
+        &self.target_image_sha256
+    }
+
+    /// Runtime module digest (read-only accessor).
+    pub fn runtime_module_sha256(&self) -> &str {
+        &self.runtime_module_sha256
+    }
+
+    /// Target module base VA (read-only accessor).
+    pub fn module_base(&self) -> u64 {
+        self.module_base
+    }
+
+    /// Walker export RVA (read-only accessor).
+    pub fn walker_export_rva(&self) -> u64 {
+        self.walker_export_rva
+    }
+
+    /// Profile id (read-only accessor).
+    pub fn profile_id(&self) -> &str {
+        &self.profile_id
+    }
+
+    /// Profile digest (read-only accessor).
+    pub fn profile_digest(&self) -> &str {
+        &self.profile_digest
+    }
 }
+
 
 /// Provider I/O error (closed set).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
