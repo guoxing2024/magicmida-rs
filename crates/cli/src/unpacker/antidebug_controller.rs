@@ -470,7 +470,14 @@ impl AntidebugController {
         let Some(walker_export_rva) = self.resolved_walker_export_rva() else {
             return false;
         };
-        mida_antidebug_runtime::exports::bind_walker_session_verified(
+        // provider: the production memory provider carrier. None today
+        // (no prepared params/result mappings) -> refuse. A verified
+        // install MUST include the provider in the SAME transaction.
+        let Some(provider) = self.walker_provider() else {
+            return false;
+        };
+        mida_antidebug_runtime::exports::install_walker_session_verified(
+            provider,
             params_va,
             section1_va,
             loader.target_pid(),
@@ -482,6 +489,16 @@ impl AntidebugController {
             profile_id,
             profile_digest,
         )
+    }
+
+    /// R4-R1: production walker memory provider carrier. None today — no
+    /// prepared params/result section mappings exist in the current chain,
+    /// so the verified transactional install deterministically refuses.
+    fn walker_provider(
+        &self,
+    ) -> Option<Box<dyn mida_antidebug_runtime::walker_control::WalkerMemoryProvider + Send + Sync>>
+    {
+        None
     }
 
     /// R4: verified target-image digest carrier. None today (no vault
@@ -785,6 +802,10 @@ impl AntidebugController {
         // The lifecycle stays UNBOUND; the walker feature remains
         // NOT_WIRED until a real carrier exists (IMP-09 live path still
         // NOT_AUTHORIZED).
+        log::log(
+            LogType::Info,
+            "IMP-09: WALKER_BINDING=NOT_WIRED (no verified authority/provider carriers); lifecycle stays UNBOUND",
+        );
 
         if self.state.is_proceed() {
             AntidebugOutcome::Proceed {

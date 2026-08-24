@@ -1085,6 +1085,23 @@ pub fn install_walker_session(
     let mut pslot = WALKER_PROVIDER.write();
     *pslot = Some(provider);
     drop(pslot);
+    // R4-R1 failpoint: session-install failure AFTER provider install.
+    // A failure here must roll back the provider and leave UNBOUND —
+    // no half-state, no READY.
+    #[cfg(test)]
+    if IMP09_SESSION_INSTALL_FAIL.load(std::sync::atomic::Ordering::SeqCst) {
+        rollback_walker_install();
+        return false;
+    }
+    // R4-R1 controlled pause: holds the installer inside the BINDING
+    // window so a test can exercise WalkerExecute mid-installation.
+    #[cfg(test)]
+    if IMP09_BINDING_PAUSE.load(std::sync::atomic::Ordering::SeqCst) {
+        while !IMP09_BINDING_PAUSE_RELEASE.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        IMP09_BINDING_PAUSE_RELEASE.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
     // Step 4: session.
     let mut sslot = WALKER_SESSION.write();
     *sslot = Some(b);
@@ -1112,11 +1129,51 @@ pub fn install_walker_session(
     true
 }
 
+/// THE single verified transactional production API (R4-R1-3).
+///
+/// Validates raw verified inputs, constructs the sealed authority and
+/// binding, then atomically installs provider + session + output reset
+/// in ONE transaction (install_walker_session). Future production wiring
+/// MUST go through this API — the session-only verified binder is now
+/// test-only and cannot be used to wire a provider-less READY session.
+pub fn install_walker_session_verified(
+    provider: Box<dyn WalkerMemoryProvider + Send + Sync>,
+    params_va: u64,
+    section1_va: u64,
+    target_pid: u32,
+    owner_pid: u32,
+    target_image_sha256: &str,
+    runtime_module_sha256: &str,
+    module_base: u64,
+    walker_export_rva: u64,
+    profile_id: &str,
+    profile_digest: &str,
+) -> bool {
+    // 1. validate raw inputs (format gate, lowercase 0-9a-f only).
+    let authority = match WalkerDigestAuthority::new(
+        target_image_sha256,
+        runtime_module_sha256,
+        module_base,
+        walker_export_rva,
+        profile_id,
+        profile_digest,
+    ) {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+    // 2. construct binding.
+    let binding =
+        WalkerSessionBinding::new(params_va, section1_va, target_pid, owner_pid, authority);
+    // 3. transactional install (provider+session+output) -> READY.
+    install_walker_session(provider, binding)
+}
+
 /// Register/replace the local session binding (in-process controller).
 ///
 /// R2: does NOT clear a consumed terminal state — a COMPLETED/ABORTED
 /// session stays consumed until [`reset_walker_bindings`] (test-only) or
 /// an explicit fresh lifecycle.
+#[cfg(test)]
 pub fn bind_walker_session(b: WalkerSessionBinding) -> bool {
     // R4: session-only bind (used by tests + verified path) requires a
     // provider to already be installed — a READY session without a
@@ -1141,6 +1198,7 @@ pub fn bind_walker_session(b: WalkerSessionBinding) -> bool {
 /// authority is constructed + validated INSIDE the crate. External callers
 /// cannot forge an authority object — they can only pass raw verified
 /// inputs through this gate.
+#[cfg(test)]
 pub fn bind_walker_session_verified(
     params_va: u64,
     section1_va: u64,
@@ -1204,6 +1262,20 @@ pub fn reset_walker_bindings() {
 /// no cross-test contamination, no early-return masking.
 #[cfg(test)]
 static IMP09_OUTPUT_SINK_FAIL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// R4-R1: failpoint AFTER provider install, BEFORE session install —
+/// exercises the session-install rollback path (distinct from output-
+/// reset failure). Test-only.
+#[cfg(test)]
+static IMP09_SESSION_INSTALL_FAIL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// R4-R1: controlled pause INSIDE the UNBOUND->BINDING window so a test
+/// can observe WalkerExecute while installation is incomplete. Test-only.
+#[cfg(test)]
+static IMP09_BINDING_PAUSE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static IMP09_BINDING_PAUSE_RELEASE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 /// Poison-safe explicit state container (R2 P1-1).
 ///
 /// std RwLock poisons permanently on panic; this wrapper RECOVERS the
@@ -2375,18 +2447,18 @@ mod imp09_walker_export_tests {
     }
 
     #[test]
-    fn walker_export_r4_owner_pid_is_controller_pid() {
-        // R4-4 #4: owner_pid must be the controller PID, NOT the target
-        // PID. owner_pid == target_pid must be REJECTED (or corrected).
+    fn walker_export_r4_owner_pid_mismatch_fails_closed() {
+        // R4-4 #4 (renamed R4-R1-5): owner_pid must not be the target PID.
+        // Feeding owner==target into the verified install produces a
+        // session whose identity (derived from owner_pid) does not match
+        // the prepared section (owner 1234) -> the run fails closed:
+        // ABORTED, no output. (Production source uses std::process::id();
+        // the pass-through of the caller-provided value is proven by the
+        // companion construction test below.)
         let _guard = IMP09_TEST_LOCK.lock().unwrap();
         reset_walker_bindings();
         let (prov, params_va, section1_va) = setup_valid();
         assert!(set_walker_provider(Box::new(prov)));
-        // owner_pid == target_pid (4242 == 4242): the binding is created
-        // via the public API with a wrong owner — WalkerDriver validates
-        // identity headers; here we assert the session carries the values
-        // and the run still aborts cleanly when the section identity does
-        // not match the owner (hostile substitution must fail closed).
         let ok = bind_walker_session_verified(
             params_va,
             section1_va,
@@ -2420,6 +2492,38 @@ mod imp09_walker_export_tests {
             take_walker_output().is_none(),
             "no output from aborted run",
         );
+    }
+
+    #[test]
+    fn walker_export_r4_owner_pid_passthrough_from_caller() {
+        // R4-R1-5: the verified transactional install passes the caller's
+        // owner_pid through to the binding unchanged. Production passes
+        // std::process::id(); this proves the field is NOT re-derived from
+        // target_pid inside the runtime.
+        let _guard = IMP09_TEST_LOCK.lock().unwrap();
+        reset_walker_bindings();
+        let (prov, params_va, section1_va) = setup_valid();
+        let ok = install_walker_session_verified(
+            Box::new(prov),
+            params_va,
+            section1_va,
+            4242,
+            7777, // distinct owner_pid
+            &"a".repeat(64),
+            &"b".repeat(64),
+            base(),
+            0x1234,
+            "profile-x",
+            &"e".repeat(64),
+        );
+        assert!(ok, "verified transactional install");
+        let sess = WALKER_SESSION.read();
+        let s = sess.as_ref().expect("session");
+        assert_eq!(s.owner_pid, 7777, "owner_pid passes through from caller");
+        assert_eq!(s.target_pid, 4242);
+        assert_ne!(s.owner_pid, s.target_pid, "owner != target");
+        drop(sess);
+        reset_walker_bindings();
     }
 
     #[test]
@@ -2476,28 +2580,37 @@ mod imp09_walker_export_tests {
     }
 
     #[test]
-    fn walker_export_r4_install_provider_then_session_fail_rolls_back() {
-        // R4-4 #7: provider installed, then session install fails -> the
-        // provider is rolled back (install_walker_session is one
-        // transaction; failure anywhere reverts to UNBOUND with NO
-        // partial state).
+    fn walker_export_r4_session_install_failure_rolls_back() {
+        // R4-R1-1: REAL session-install failure. The failpoint sits AFTER
+        // provider install and BEFORE session install, so this test proves
+        // provider rollback on session failure — NOT output-reset failure.
         let _guard = IMP09_TEST_LOCK.lock().unwrap();
         reset_walker_bindings();
-        // Directly drive the transactional API with a session that the
-        // authority rejects is impossible (binding is sealed) — so we
-        // simulate rollback via the output-write failure path: install
-        // with IMP09_OUTPUT_SINK_FAIL is not the rollback trigger; instead
-        // the rollback path is exercised by install_walker_session's
-        // output-write failure branch. We poison the OUTPUT lock and
-        // assert the install returns false and nothing remains.
         let (prov, params_va, section1_va) = setup_valid();
-        // Inject an output-reset failure (R4-4 #8): the transactional
-        // installer must roll back provider + session and stay UNBOUND.
-        IMP09_OUTPUT_SINK_FAIL.store(true, std::sync::atomic::Ordering::SeqCst);
-        let ok = install_walker_session(
-            Box::new(prov),
-            binding(params_va, section1_va),
+        IMP09_SESSION_INSTALL_FAIL.store(true, std::sync::atomic::Ordering::SeqCst);
+        let ok = install_walker_session(Box::new(prov), binding(params_va, section1_va));
+        IMP09_SESSION_INSTALL_FAIL.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(!ok, "install with session-install failure must fail");
+        assert_eq!(
+            lifecycle_get(),
+            WalkerSessionLifecycle::Unbound,
+            "rollback leaves UNBOUND",
         );
+        assert!(WALKER_PROVIDER.read().is_none(), "provider rolled back");
+        assert!(WALKER_SESSION.read().is_none(), "session rolled back");
+        assert!(take_walker_output().is_none(), "no stale output");
+    }
+
+    #[test]
+    fn walker_export_r4_output_reset_failure_rolls_back() {
+        // R4-R1-1: DISTINCT output-reset failure (kept separately). The
+        // transactional installer must roll back provider + session and
+        // stay UNBOUND when clearing stale output fails.
+        let _guard = IMP09_TEST_LOCK.lock().unwrap();
+        reset_walker_bindings();
+        let (prov, params_va, section1_va) = setup_valid();
+        IMP09_OUTPUT_SINK_FAIL.store(true, std::sync::atomic::Ordering::SeqCst);
+        let ok = install_walker_session(Box::new(prov), binding(params_va, section1_va));
         IMP09_OUTPUT_SINK_FAIL.store(false, std::sync::atomic::Ordering::SeqCst);
         assert!(!ok, "install with output-reset failure must fail");
         assert_eq!(
@@ -2505,18 +2618,9 @@ mod imp09_walker_export_tests {
             WalkerSessionLifecycle::Unbound,
             "rollback leaves UNBOUND",
         );
-        assert!(
-            WALKER_PROVIDER.read().is_none(),
-            "provider rolled back",
-        );
-        assert!(
-            WALKER_SESSION.read().is_none(),
-            "session rolled back",
-        );
-        assert!(
-            take_walker_output().is_none(),
-            "no stale output",
-        );
+        assert!(WALKER_PROVIDER.read().is_none(), "provider rolled back");
+        assert!(WALKER_SESSION.read().is_none(), "session rolled back");
+        assert!(take_walker_output().is_none(), "no stale output");
     }
 
     #[test]
@@ -2582,16 +2686,13 @@ mod imp09_walker_export_tests {
     fn walker_export_r4_genuine_bind_vs_execute_concurrency() {
         // R4-4 #12: REAL bind-vs-execute concurrency with two threads and
         // a Barrier. Exactly one of (bind wins then execute runs) or
-        // (execute wins first, bind then rejected) — but NEVER both bind
-        // success AND execute success from the same UNBOUND start, and
-        // never an interleaved half-state.
+        // (execute wins first, bind then rejected) — never both, never a
+        // half-state. NO tautological assertions.
         let _guard = IMP09_TEST_LOCK.lock().unwrap();
         reset_walker_bindings();
         // Fresh provider for the execute thread.
         let (prov, params_va, section1_va) = setup_valid();
         assert!(set_walker_provider(Box::new(prov)));
-        // reset again? No — set_walker_provider worked (UNBOUND).
-        // Now lifecycle is UNBOUND with a provider installed.
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
         let b1 = std::sync::Arc::clone(&barrier);
         let b2 = std::sync::Arc::clone(&barrier);
@@ -2607,49 +2708,105 @@ mod imp09_walker_export_tests {
         barrier.wait();
         let bind_r = h_bind.join().expect("bind thread");
         let exec_r = h_exec.join().expect("exec thread");
-        // Executing before any bind: WalkerExecute on UNBOUND rejects.
-        // Binding while RUNNING/COMPLETED rejects. At most one session
-        // may be published/run: if bind won, exec must run OK; if exec
-        // couldn't claim (UNBOUND) it returns non-OK and bind wins.
         let exec_ok = exec_r == WALKER_STATUS_OK as i32;
-        if bind_r {
-            // Bind published READY (possibly after exec failed on
-            // UNBOUND). The exec thread may have already returned non-OK.
-            assert!(exec_ok || !exec_ok, "consistent");
-        }
-        // The invariant that matters: the module is never left in a
-        // half-state and a second execute is either OK (if this exec
-        // won) or rejected.
-        let lc = lifecycle_get();
-        assert!(
-            lc == WalkerSessionLifecycle::Completed
-                || lc == WalkerSessionLifecycle::Aborted
-                || lc == WalkerSessionLifecycle::Ready
-                || lc == WalkerSessionLifecycle::Unbound,
-            "no half-state: got {lc:?}",
-        );
-        // At most one session published: if both threads claimed, that's
-        // a violation. bind_r && exec_ok means bind installed READY and
-        // exec ran it — legal. bind_r && !exec_ok: bind won after exec
-        // rejected on UNBOUND — legal. !bind_r && exec_ok: impossible
-        // (exec cannot run without a session). !bind_r && !exec_ok: exec
-        // rejected on UNBOUND, bind lost to... nothing — exec thread only
-        // runs after claim, so !bind_r && !exec_ok means exec saw UNBOUND
-        // and bind failed on a busy lifecycle — but bind had the provider
-        // installed, so if exec claimed RUNNING first, bind fails and
-        // exec completes: exec_ok true. So !bind_r && !exec_ok would be a
-        // violation (no session ran, bind failed for no reason).
+        // Case analysis (no tautology):
+        //  - bind_r &&  exec_ok: bind installed READY, exec ran it. Legal.
+        //  - bind_r && !exec_ok: exec rejected (UNBOUND) before bind
+        //    finished, then bind published READY. Legal.
+        //  - !bind_r &&  exec_ok: exec claimed RUNNING first, bind CAS
+        //    failed. Legal.
+        //  - !bind_r && !exec_ok: exec saw UNBOUND (no session), bind
+        //    failed although lifecycle was free — would be a lost update.
+        //    FORBIDDEN.
         assert!(
             bind_r || exec_ok,
-            "at least one of bind or execute must win cleanly",
+            "lost update: neither bind nor execute won (bind_r={bind_r}, exec_ok={exec_ok})",
         );
-        // And at most one session was published: if bind succeeded, the
-        // session is the bound one; if not, no session.
-        let sess = WALKER_SESSION.read();
-        if bind_r {
-            assert!(sess.is_some(), "bind published a session");
+        assert!(
+            !(bind_r && exec_ok) || lifecycle_get() == WalkerSessionLifecycle::Completed,
+            "if both won, the session must have run to completion",
+        );
+        // If the bind lost, no session may be visible.
+        if !bind_r {
+            let sess = WALKER_SESSION.read();
+            assert!(
+                sess.is_none() || lifecycle_get() == WalkerSessionLifecycle::Completed,
+                "losing bind must not leave a half-published session",
+            );
         }
-        drop(sess);
+    }
+
+    #[test]
+    fn walker_export_r4_binding_window_execute_rejected_controlled() {
+        // R4-R1-2: CONTROLLED pause inside UNBOUND->BINDING. The installer
+        // thread parks after CAS BINDING + provider install (before session
+        // install); the executor runs and MUST see BINDING (rejected with
+        // NotImplemented), must not observe a READY session, provider or
+        // output; then the installer resumes, publishes READY, and a
+        // SECOND WalkerExecute completes successfully.
+        let _guard = IMP09_TEST_LOCK.lock().unwrap();
+        reset_walker_bindings();
+        let (prov, params_va, section1_va) = setup_valid();
+        IMP09_BINDING_PAUSE.store(true, std::sync::atomic::Ordering::SeqCst);
+        IMP09_BINDING_PAUSE_RELEASE.store(false, std::sync::atomic::Ordering::SeqCst);
+        let installer = std::thread::spawn(move || {
+            install_walker_session(Box::new(prov), binding(params_va, section1_va))
+        });
+        // Wait until the installer has claimed BINDING (lifecycle read).
+        let mut saw_binding = false;
+        for _ in 0..10_000 {
+            if lifecycle_get() == WalkerSessionLifecycle::Binding {
+                saw_binding = true;
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(saw_binding, "installer must reach BINDING");
+        // Executor during BINDING window:
+        unsafe {
+            let r = WalkerExecute(params_va);
+            assert_eq!(
+                r,
+                MidaAntidebugError::NotImplemented.as_i32(),
+                "execute during BINDING must be rejected (got {r})",
+            );
+        }
+        // No observable half-state while BINDING:
+        assert_eq!(
+            lifecycle_get(),
+            WalkerSessionLifecycle::Binding,
+            "execute must not move lifecycle away from BINDING",
+        );
+        assert!(
+            WALKER_SESSION.read().is_none(),
+            "no session visible during BINDING",
+        );
+        assert!(
+            WALKER_PROVIDER.read().is_some(),
+            "provider installed during BINDING is transactional state (session not yet published)",
+        );
+        assert!(take_walker_output().is_none(), "no output during BINDING");
+        // Resume the installer; it publishes READY.
+        IMP09_BINDING_PAUSE_RELEASE.store(true, std::sync::atomic::Ordering::SeqCst);
+        let ok = installer.join().expect("installer thread");
+        assert!(ok, "installer must complete after resume");
+        assert_eq!(
+            lifecycle_get(),
+            WalkerSessionLifecycle::Ready,
+            "install publishes READY after resume",
+        );
+        // Second execute after READY completes per the fixture.
+        unsafe {
+            let r = WalkerExecute(params_va);
+            assert_eq!(r, WALKER_STATUS_OK as i32, "got {r}");
+        }
+        assert_eq!(
+            lifecycle_get(),
+            WalkerSessionLifecycle::Completed,
+            "post-resume execute completes",
+        );
+        IMP09_BINDING_PAUSE.store(false, std::sync::atomic::Ordering::SeqCst);
+        IMP09_BINDING_PAUSE_RELEASE.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     #[test]
@@ -2668,15 +2825,8 @@ mod imp09_walker_export_tests {
             section1_va,
             4242,
             1234,
-            WalkerDigestAuthority::new(
-                &target,
-                &runtime,
-                base(),
-                0x1234,
-                "profile-x",
-                &profile,
-            )
-            .expect("authority"),
+            WalkerDigestAuthority::new(&target, &runtime, base(), 0x1234, "profile-x", &profile)
+                .expect("authority"),
         );
         let ok = install_walker_session(Box::new(prov), b);
         assert!(ok, "transactional install");
@@ -2734,9 +2884,6 @@ mod imp09_walker_export_tests {
             take_walker_output().is_none(),
             "no stale output after failed install",
         );
-        assert_eq!(
-            lifecycle_get(),
-            WalkerSessionLifecycle::Unbound,
-        );
+        assert_eq!(lifecycle_get(), WalkerSessionLifecycle::Unbound);
     }
 }
