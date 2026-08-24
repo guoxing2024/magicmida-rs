@@ -42,6 +42,7 @@ mod post_attach;
 mod post_loop;
 mod relocation_evidence;
 pub mod runtime_loader;
+pub mod walker_session;
 mod section_rebuild_evidence;
 mod session;
 pub(crate) mod sidecar_io;

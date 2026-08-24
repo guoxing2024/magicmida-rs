@@ -54,6 +54,8 @@ use std::path::Path;
 use mida_antidebug::evidence::EvidenceLog;
 use mida_antidebug::profile::Profile;
 use mida_antidebug::state::{transition, ControllerEvent, ControllerState, FailCode};
+use mida_antidebug_runtime::walker_protocol::WALKER_SESSION_ID_BYTES;
+use windows::Win32::Foundation::HANDLE;
 
 use crate::log::{self, LogType};
 use crate::unpacker::runtime_loader::{
@@ -424,6 +426,11 @@ pub struct AntidebugController {
     /// the failure evidence sidecar when present; None when no exception
     /// receipt was captured.
     capture_receipt: Option<mida_core::DrainReceipt>,
+    /// IMP-09-CARRIER-R5: the live walker session memory owner (params +
+    /// section allocations in the target). Held until teardown, then freed
+    /// via [`WalkerSessionMemory::cleanup`]. None when no session is
+    /// installed (UNBOUND / NOT_WIRED).
+    walker_mem: Option<crate::unpacker::walker_session::WalkerSessionMemory>,
 }
 
 impl AntidebugController {
@@ -435,6 +442,7 @@ impl AntidebugController {
             profile: None,
             cleanup: None,
             capture_receipt: None,
+            walker_mem: None,
         }
     }
 
@@ -475,71 +483,77 @@ impl AntidebugController {
     ///   -> install_walker_session (pub(crate), transactional)
     ///   -> WalkerDigestAuthority (walker_control.rs)
     /// ```
-    pub fn bind_walker_from_loader(&self, params_va: u64, section1_va: u64) -> bool {
+    pub fn bind_walker_from_loader(
+        &mut self,
+        target: HANDLE,
+        candidates: &[u64],
+        result_nonce: u64,
+    ) -> bool {
+        use crate::unpacker::walker_session::install_walker_session_production;
         // IMP-09-R1-R4: EXACT authority source matrix. Every field must
         // come from its sealed source; substitution is FORBIDDEN.
         let Some(loader) = self.options.loader_result.as_ref() else {
             return false;
         };
         let da = loader.digest_authority();
-        // target_image_sha256: the verified TARGET SAMPLE digest. The
-        // current production chain has NO sealed carrier for it (the
-        // loader verifies the runtime DLL, not the unpacked sample).
-        // Without it we MUST refuse — never substitute the runtime digest.
+        // target_image_sha256: the verified TARGET SAMPLE digest. Without
+        // it we MUST refuse — never substitute the runtime digest.
         let Some(target_image_sha256) = self.target_image_sha256() else {
             return false;
         };
-        // IMP-09-CARRIER-R3: the target sample digest must NEVER equal the
-        // runtime DLL digest — they are distinct artifacts verified through
-        // distinct chains (attested protected input vs verified runtime
-        // authority). Substitution (runtime digest as target digest) is
-        // forbidden and fails the bind.
+        // IMP-09-CARRIER-R3: target digest must NEVER equal the runtime
+        // DLL digest (distinct artifacts, distinct chains).
         if target_image_sha256.eq_ignore_ascii_case(da.digest_value()) {
             return false;
         }
-        // profile_id / profile_digest: the controller-verified profile.
-        // IMP-09-PROFILE-SOURCE-R1: read from the sealed profile carrier
-        // (launch-attestation bound). None -> refuse (no substitution).
+        // profile_id / profile_digest from the sealed profile carrier.
         let Some(profile_id) = self.verified_profile_id() else {
             return false;
         };
         let Some(profile_digest) = self.verified_profile_digest() else {
             return false;
         };
-        // walker_export_rva: resolved from the PE export table through a
-        // verified envelope. No resolver carrier exists yet -> refuse.
+        // walker_export_rva from the sealed pure-file resolver carrier.
         let Some(walker_export_rva) = self.resolved_walker_export_rva() else {
             return false;
         };
-        // provider: the production memory provider carrier. None today
-        // (no prepared params/result mappings) -> refuse. A verified
-        // install MUST include the provider in the SAME transaction.
-        let Some(provider) = self.walker_provider() else {
+        // Candidates must be non-empty and bounded (protocol: 1..=4096).
+        if candidates.is_empty() || candidates.len() > 4096 {
             return false;
-        };
-        mida_antidebug_runtime::exports::install_walker_session_verified(
-            provider,
-            params_va,
-            section1_va,
+        }
+        // Production carriers: allocate + write + provider + install in
+        // one transaction; any failure frees both allocations (no READY).
+        let Some(mem) = install_walker_session_production(
+            target,
             loader.target_pid(),
             std::process::id(), // owner_pid: REAL controller PID
+            candidates,
+            result_nonce,
+            0,  // options_flags: none (frozen default)
+            16, // probe_span: FROZEN protocol width
+            [0u8; WALKER_SESSION_ID_BYTES],
             target_image_sha256,
             da.digest_value(),
             loader.module_base(),
             walker_export_rva,
             profile_id,
             profile_digest,
-        )
+        ) else {
+            return false;
+        };
+        // Retain the owner: allocations live exactly as long as the
+        // controller-held session. Teardown frees them (see
+        // teardown_walker_session).
+        self.walker_mem = Some(mem);
+        true
     }
-
-    /// R4-R1: production walker memory provider carrier. None today — no
-    /// prepared params/result section mappings exist in the current chain,
-    /// so the verified transactional install deterministically refuses.
-    fn walker_provider(
-        &self,
-    ) -> Option<Box<dyn mida_antidebug_runtime::walker_control::WalkerMemoryProvider + Send + Sync>>
-    {
-        None
+    /// IMP-09-CARRIER-R5: teardown the walker session memory (free both
+    /// target allocations). Idempotent; safe when no session is installed.
+    pub fn teardown_walker_session(&mut self, target: HANDLE) {
+        if let Some(mem) = self.walker_mem.take() {
+            let mut mem = mem;
+            mem.cleanup(target);
+        }
     }
 
     /// IMP-09-CARRIER-R3: verified target-image digest carrier. Sealed by
@@ -1052,6 +1066,10 @@ pub fn write_observation_only_evidence(
 
 #[cfg(test)]
 mod tests {
+
+    fn self_handle() -> windows::Win32::Foundation::HANDLE {
+        unsafe { windows::Win32::System::Threading::GetCurrentProcess() }
+    }
     use super::*;
 
     /// Mock cleanup backend that always succeeds.
@@ -1493,11 +1511,11 @@ mod tests {
         // for target_image_sha256 / profile / resolved export RVA in the
         // current chain, so the bind MUST deterministically refuse and
         // MUST NOT publish a session (no magic substitution).
-        let c = controller_with_loader_result(Some(loader_result_with(
+        let mut c = controller_with_loader_result(Some(loader_result_with(
             1234,
             default_attestation_json(),
         )));
-        let r = c.bind_walker_from_loader(0x7000, 0x8000);
+        let r = c.bind_walker_from_loader(self_handle(), &[0x400000], 0x99);
         assert!(
             !r,
             "bind must refuse while target/profile/export carriers are absent",
@@ -1595,12 +1613,12 @@ mod tests {
         // are distinct by contract (target sample vs runtime module).
         let loader = loader_result_with(1234, default_attestation_json());
         let runtime_digest = loader.digest_authority().digest_value().to_string();
-        let c = controller_with_target(
+        let mut c = controller_with_target(
             Some(loader),
             Some(test_target_identity("origin_macro", &runtime_digest, 4096)),
         );
         assert!(
-            !c.bind_walker_from_loader(0x7000, 0x8000),
+            !c.bind_walker_from_loader(self_handle(), &[0x400000], 0x99),
             "bind must refuse target==runtime digest substitution",
         );
     }
@@ -1609,11 +1627,11 @@ mod tests {
     fn imp09_bind_remains_unbound_when_target_carrier_missing() {
         // No target carrier -> bind refuses and no session is published
         // (install never called; lifecycle stays UNBOUND / NOT_WIRED).
-        let c = controller_with_loader_result(Some(loader_result_with(
+        let mut c = controller_with_loader_result(Some(loader_result_with(
             1234,
             default_attestation_json(),
         )));
-        assert!(!c.bind_walker_from_loader(0x7000, 0x8000));
+        assert!(!c.bind_walker_from_loader(self_handle(), &[0x400000], 0x99));
         // No session was published: resetting/reading the walker output is a
         // no-op (nothing installed), and a subsequent verified install of a
         // DIFFERENT session is still possible — the refused bind left the
@@ -1721,13 +1739,13 @@ mod tests {
     fn imp09_profile_missing_fail_closed_unbound() {
         // No profile carrier -> verified_profile_id/digest are None, the
         // bind refuses and no session is published (UNBOUND / NOT_WIRED).
-        let c = controller_with_loader_result(Some(loader_result_with(
+        let mut c = controller_with_loader_result(Some(loader_result_with(
             1234,
             default_attestation_json(),
         )));
         assert_eq!(c.verified_profile_id(), None);
         assert_eq!(c.verified_profile_digest(), None);
-        assert!(!c.bind_walker_from_loader(0x7000, 0x8000));
+        assert!(!c.bind_walker_from_loader(self_handle(), &[0x400000], 0x99));
         mida_antidebug_runtime::exports::reset_for_test();
         assert!(mida_antidebug_runtime::exports::take_walker_output().is_none());
     }
@@ -1743,7 +1761,7 @@ mod tests {
         // shape — observe identical profile_id + digest.
         let profile = test_profile_identity("origin_macro", "x86_64");
         let loader = Some(loader_result_with(1234, default_attestation_json()));
-        let c1 = AntidebugController::new(AntidebugStageOptions {
+        let mut c1 = AntidebugController::new(AntidebugStageOptions {
             sample_id: Some("origin_macro".to_string()),
             target_pid: 1234,
             evidence_dir: None,
@@ -1759,7 +1777,7 @@ mod tests {
             )),
             profile_identity: Some(profile.clone()),
         });
-        let c2 = AntidebugController::new(AntidebugStageOptions {
+        let mut c2 = AntidebugController::new(AntidebugStageOptions {
             sample_id: Some("origin_macro".to_string()),
             target_pid: 1234,
             evidence_dir: None,
@@ -1778,7 +1796,7 @@ mod tests {
         assert_eq!(pid, "oreans_origin_x64_v1");
         assert_eq!(dig.len(), 64);
         // The carrier still fails closed at the full bind (provider absent).
-        assert!(!c1.bind_walker_from_loader(0x7000, 0x8000));
-        assert!(!c2.bind_walker_from_loader(0x7000, 0x8000));
+        assert!(!c1.bind_walker_from_loader(self_handle(), &[0x400000], 0x99));
+        assert!(!c2.bind_walker_from_loader(self_handle(), &[0x400000], 0x99));
     }
 }
