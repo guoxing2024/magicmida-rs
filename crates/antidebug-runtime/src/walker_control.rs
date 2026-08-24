@@ -26,9 +26,9 @@
 
 use crate::attestation::{AbortState, AttestationError, ProbeSummary, RoundLedger, WalkerAttestation};
 use crate::walker_protocol::{
-    controller_read_completed_section, controller_validate_entry, derive_session_id,
-    is_canonical_user_va, ControllerSectionView, IdentityExpectation, ProtocolError,
-    WalkerParamsV2, COMPLETED_FLAG_ABORT, COMPLETED_FLAG_DONE,
+    controller_read_completed_section, controller_read_section, controller_validate_entry,
+    derive_session_id, is_canonical_user_va, ControllerSectionView, IdentityExpectation,
+    ProtocolError, WalkerParamsV2, COMPLETED_FLAG_ABORT, COMPLETED_FLAG_DONE,
     WALKER_STATUS_ERROR_BAD_PARAMS, WALKER_STATUS_ERROR_INTERNAL_PANIC, WALKER_STATUS_ERROR_MAP_FAILED,
     WALKER_STATUS_ERROR_PROBE_ABORTED, WALKER_STATUS_ERROR_VEH_FAILED, WALKER_STATUS_OK,
 };
@@ -76,6 +76,76 @@ impl WalkerAbortReason {
             Self::ProbeAborted => AbortState::WalkerAbort,
             Self::InternalPanic => AbortState::WalkerAbort,
         }
+    }
+}
+
+/// Sealed digest authority for the walker completion path (P0-2).
+///
+/// Carries the identity/digest binding that the production caller MUST use
+/// when building the WalkerAttestation. Values are validated at bind time
+/// (64-hex digests, nonzero VAs, checked module_base+export_rva entry).
+/// Strings come from the controller's verified manifest (digest authority),
+/// NOT from an open caller-provided string at attestation time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalkerDigestAuthority {
+    /// SHA-256 of the target image (64 lowercase hex).
+    pub target_image_sha256: String,
+    /// SHA-256 of the runtime module (64 lowercase hex).
+    pub runtime_module_sha256: String,
+    /// Target module base VA (== attestation module_base).
+    pub module_base: u64,
+    /// WalkerExecute export RVA within the runtime module.
+    pub walker_export_rva: u64,
+    /// Profile id (attestation profile binding).
+    pub profile_id: String,
+    /// Profile digest (attestation profile binding; non-empty required by v2).
+    pub profile_digest: String,
+}
+
+impl WalkerDigestAuthority {
+    /// Build + validate the sealed authority (fail-closed).
+    pub fn new(
+        target_image_sha256: &str,
+        runtime_module_sha256: &str,
+        module_base: u64,
+        walker_export_rva: u64,
+        profile_id: &str,
+        profile_digest: &str,
+    ) -> Result<Self, WalkerControlError> {
+        let t = target_image_sha256.trim();
+        let r = runtime_module_sha256.trim();
+        if t.len() != 64 || !t.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(WalkerControlError::MissingDigest);
+        }
+        if r.len() != 64 || !r.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(WalkerControlError::MissingDigest);
+        }
+        if module_base == 0 || walker_export_rva == 0 {
+            return Err(WalkerControlError::MissingIdentity);
+        }
+        module_base
+            .checked_add(walker_export_rva)
+            .ok_or(WalkerControlError::Attestation(
+                AttestationError::WalkerEntryOverflow,
+            ))?;
+        let pid = profile_id.trim();
+        let pd = profile_digest.trim();
+        if pid.is_empty() || pd.len() != 64 || !pd.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(WalkerControlError::MissingDigest);
+        }
+        Ok(Self {
+            target_image_sha256: t.to_string(),
+            runtime_module_sha256: r.to_string(),
+            module_base,
+            walker_export_rva,
+            profile_id: pid.to_string(),
+            profile_digest: pd.to_string(),
+        })
+    }
+
+    /// Entry VA = module_base + export_rva (checked at construction).
+    pub fn walker_entry_va(&self) -> u64 {
+        self.module_base + self.walker_export_rva
     }
 }
 
@@ -264,6 +334,12 @@ impl WalkerSession {
         self.abort_reason = Some(reason);
         self.phase = WalkerPhase::Aborted;
     }
+
+    /// Terminal sessions (Completed or Aborted) reject any further action
+    /// (P1-3: one-shot consumption).
+    pub fn is_terminal(&self) -> bool {
+        matches!(self.phase, WalkerPhase::Completed | WalkerPhase::Aborted)
+    }
 }
 
 /// Production walker driver (provider-injected).
@@ -330,7 +406,7 @@ impl<P: WalkerMemoryProvider> WalkerDriver<P> {
                 });
             }
         };
-        if self.session.phase == WalkerPhase::Aborted {
+        if self.session.is_terminal() {
             return Err(WalkerControlError::AlreadyAborted);
         }
         // Sequence: round1 requires Validated; round2 requires Round1Done.
@@ -360,7 +436,7 @@ impl<P: WalkerMemoryProvider> WalkerDriver<P> {
         &mut self,
         section: &'a [u8],
     ) -> Result<ControllerSectionView<'a>, WalkerControlError> {
-        if self.session.phase == WalkerPhase::Aborted {
+        if self.session.is_terminal() {
             return Err(WalkerControlError::AlreadyAborted);
         }
         if self.session.phase != WalkerPhase::Round1 && self.session.phase != WalkerPhase::Round2 {
@@ -375,7 +451,27 @@ impl<P: WalkerMemoryProvider> WalkerDriver<P> {
             session_id: self.session.session_id,
             section_bytes: self.session.section_bytes,
         };
-        // REAL production call: the protocol gate.
+        // REAL production call #1: controller_read_section — identity + header
+        // pre-validation. The returned view's identity/header are consumed
+        // (nonce/pid/session/section_bytes/status/flag) below via the
+        // completed gate; this is the direct production caller (P1-1).
+        let pre = match controller_read_section(section, &expected, self.session.result_capacity) {
+            Ok(v) => v,
+            Err(e) => {
+                self.session.abort(WalkerAbortReason::ProbeAborted);
+                return Err(WalkerControlError::Protocol(e));
+            }
+        };
+        if pre.identity.section_bytes != expected.section_bytes
+            || pre.identity.nonce != expected.nonce
+            || pre.identity.target_pid != expected.target_pid
+            || pre.identity.owner_pid != expected.owner_pid
+            || pre.identity.session_id != expected.session_id
+        {
+            self.session.abort(WalkerAbortReason::ProbeAborted);
+            return Err(WalkerControlError::MissingIdentity);
+        }
+        // REAL production call #2: the completed gate (P1-1 continued).
         let view = match controller_read_completed_section(section, &expected, self.session.result_capacity) {
             Ok(v) => v,
             Err(e) => {
@@ -507,40 +603,45 @@ impl<P: WalkerMemoryProvider> WalkerDriver<P> {
         self.session.abort(reason);
     }
 
+    /// Fail-closed abort entry (P1-2): marks the session ABORTED and
+    /// returns the driver error. Every production error path funnels here so
+    /// the terminal-state invariant holds across the whole caller.
+    pub fn fail_abort(&mut self, e: WalkerControlError) -> WalkerControlError {
+        // Force terminal: even a Completed session that fails attestation
+        // anchoring must end ABORTED (P1-2 fail-closed invariant).
+        self.session.abort_reason = Some(WalkerAbortReason::ProbeAborted);
+        self.session.phase = WalkerPhase::Aborted;
+        e
+    }
+
     /// Build the final WalkerAttestation (record_digest + anchor binding).
-    /// Only valid from Completed; any other phase is a hard error.
+    ///
+    /// Only valid from Completed; ANY failure (including validation) marks
+    /// the session ABORTED (P1-2). The digest/identity inputs come from the
+    /// sealed [`WalkerDigestAuthority`] — never from an open caller string.
     pub fn finalize_attestation(
-        &self,
-        target_image_sha256: &str,
-        runtime_module_sha256: &str,
-        walker_export_rva: u64,
-        module_base: u64,
+        &mut self,
+        authority: &WalkerDigestAuthority,
     ) -> Result<WalkerAttestation, WalkerControlError> {
-        let walker_entry_va = match module_base.checked_add(walker_export_rva) {
-            Some(v) => v,
-            None => {
-                return Err(WalkerControlError::Attestation(
-                    AttestationError::WalkerEntryOverflow,
-                ))
-            }
-        };
         if self.session.phase != WalkerPhase::Completed {
-            return Err(WalkerControlError::NotCompleted);
+            return Err(self.fail_abort(WalkerControlError::NotCompleted));
         }
         if self.session.rounds.len() != 2 {
-            return Err(WalkerControlError::MissingRounds);
+            return Err(self.fail_abort(WalkerControlError::MissingRounds));
         }
         if self.session.summary.candidates_total == 0 {
-            return Err(WalkerControlError::CountMismatch {
+            return Err(self.fail_abort(WalkerControlError::CountMismatch {
                 got: 0,
                 expected: self.session.result_capacity,
-            });
+            }));
         }
+        let module_base = authority.module_base;
+        let walker_entry_va = authority.walker_entry_va();
         let mut att = WalkerAttestation::new(
             self.session.target_pid,
-            target_image_sha256,
-            runtime_module_sha256,
-            walker_export_rva,
+            authority.target_image_sha256.clone(),
+            authority.runtime_module_sha256.clone(),
+            authority.walker_export_rva,
             walker_entry_va,
             self.session.summary,
         );
@@ -548,26 +649,35 @@ impl<P: WalkerMemoryProvider> WalkerDriver<P> {
         att.orphaned_resources = Vec::new();
         att.record_digest = att.compute_digest();
         if att.record_digest.is_empty() {
-            return Err(WalkerControlError::MissingDigest);
+            return Err(self.fail_abort(WalkerControlError::MissingDigest));
         }
         // Anchor binding: validate the matrix + digest BEFORE returning.
-        att.validate(self.session.target_pid, runtime_module_sha256, module_base)?;
+        if let Err(e) = att.validate(
+            self.session.target_pid,
+            &authority.runtime_module_sha256,
+            module_base,
+        ) {
+            return Err(self.fail_abort(WalkerControlError::Attestation(e)));
+        }
         Ok(att)
     }
 
     /// Anchor the walker attestation into a v2 top-level attestation
     /// (production write point: walker_attestation + record_digest).
+    /// Any failure marks the session ABORTED (P1-2).
     pub fn anchor_into_v2(
-        &self,
+        &mut self,
         mut top: crate::attestation::RuntimeAttestationV2,
         att: &WalkerAttestation,
     ) -> Result<crate::attestation::RuntimeAttestationV2, WalkerControlError> {
         top.walker_attestation = Some(att.clone());
         top.record_digest = top.compute_digest();
         if top.record_digest.is_empty() {
-            return Err(WalkerControlError::MissingDigest);
+            return Err(self.fail_abort(WalkerControlError::MissingDigest));
         }
-        top.validate()?;
+        if let Err(e) = top.validate() {
+            return Err(self.fail_abort(WalkerControlError::Attestation(e)));
+        }
         Ok(top)
     }
 
@@ -670,6 +780,18 @@ mod tests {
         p.to_blob_bytes(cand).unwrap()
     }
 
+    fn authority() -> WalkerDigestAuthority {
+        WalkerDigestAuthority::new(
+            &"a".repeat(64),
+            &"b".repeat(64),
+            base(),
+            0x1234,
+            "walker-local",
+            &"c".repeat(64),
+        )
+        .unwrap()
+    }
+
     fn section_bytes_for(cap: u32) -> u64 {
         96 + cap as u64 * PROBE_RESULT_BYTES as u64
     }
@@ -755,12 +877,7 @@ mod tests {
         assert!(!d.session().rounds[0].auto_retry);
         assert!(!d.session().rounds[1].auto_retry);
         let att = d
-            .finalize_attestation(
-                &"a".repeat(64),
-                &"b".repeat(64),
-                0x1234,
-                base(),
-            )
+            .finalize_attestation(&authority())
             .unwrap();
         assert_eq!(att.rounds.len(), 2);
         assert_eq!(att.record_digest.len(), 64);
@@ -799,7 +916,7 @@ mod tests {
         let s2 = prov3.read_region(base() + 0x2000);
         d.consume_section(&s2).unwrap();
         let mut att = d
-            .finalize_attestation(&"a".repeat(64), &"b".repeat(64), 0x1234, base())
+            .finalize_attestation(&authority())
             .unwrap();
         att.record_digest = "0".repeat(64);
         assert!(att.validate(4242, &"b".repeat(64), base()).is_err());
@@ -890,9 +1007,11 @@ mod tests {
 
     #[test]
     fn invalid_transition_aborts() {
-        let (_, d) = full_two_round_flow();
-        assert!(d.finalize_attestation(&"a".repeat(64), "b", 1, 2).is_err());
-        assert_eq!(d.session().phase, WalkerPhase::Validated);
+        let (_, mut d) = full_two_round_flow();
+        // finalize before completing: fail_abort must move the session to
+        // ABORTED (P1-2: every attestation error is terminal).
+        assert!(d.finalize_attestation(&authority()).is_err());
+        assert_eq!(d.session().phase, WalkerPhase::Aborted);
     }
 
     #[test]
@@ -922,7 +1041,7 @@ mod tests {
         let s2 = prov3.read_region(base() + 0x2000);
         d.consume_section(&s2).unwrap();
         let att = d
-            .finalize_attestation(&"a".repeat(64), &"b".repeat(64), 0x1234, base())
+            .finalize_attestation(&authority())
             .unwrap();
         assert_eq!(att.compute_digest(), att.record_digest);
         let mut bad = att.clone();
@@ -942,7 +1061,7 @@ mod tests {
         let s2 = prov3.read_region(base() + 0x2000);
         d.consume_section(&s2).unwrap();
         let att = d
-            .finalize_attestation(&"a".repeat(64), &"b".repeat(64), 0x1234, base())
+            .finalize_attestation(&authority())
             .unwrap();
         let top = crate::attestation::RuntimeAttestationV2 {
             schema: crate::attestation::ATTESTATION_SCHEMA_V2.to_string(),
@@ -977,6 +1096,86 @@ mod tests {
             w.rounds[0].candidates_probed = 0;
         }
         assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn anchor_failure_aborts_session() {
+        // P1-2: anchor_into_v2 failure must transition the session to ABORTED.
+        let (_, mut d) = full_two_round_flow();
+        d.begin_round(1, 1000).unwrap();
+        let (prov2, _) = full_two_round_flow();
+        let s1 = prov2.read_region(base() + 0x1000);
+        d.consume_section(&s1).unwrap();
+        d.begin_round(2, 1000).unwrap();
+        let (prov3, _) = full_two_round_flow();
+        let s2 = prov3.read_region(base() + 0x2000);
+        d.consume_section(&s2).unwrap();
+        assert_eq!(d.session().phase, WalkerPhase::Completed);
+        let att = d.finalize_attestation(&authority()).unwrap();
+        // Broken top frame: empty profile_digest -> v2 validate fails -> abort.
+        let top = crate::attestation::RuntimeAttestationV2 {
+            schema: crate::attestation::ATTESTATION_SCHEMA_V2.to_string(),
+            schema_version: crate::attestation::ATTESTATION_SCHEMA_VERSION_V2,
+            runtime_id: "mida-antidebug-runtime-x64".to_string(),
+            runtime_version: "0.1.0".to_string(),
+            architecture: "x86_64".to_string(),
+            runtime_sha256: "b".repeat(64),
+            profile_id: "walker-local".to_string(),
+            profile_digest: String::new(),
+            target_pid: 4242,
+            module_base: base(),
+            initialized: true,
+            hooks_expected: vec![],
+            hooks_installed: vec![],
+            hook_failures: vec![],
+            surface_details: vec![],
+            telemetry_channel: "ready".to_string(),
+            cleanup_handler_registered: true,
+            third_party: "walker-local".to_string(),
+            source_revision: String::new(),
+            toolchain: String::new(),
+            walker_attestation: None,
+            record_digest: String::new(),
+        };
+        assert!(d.anchor_into_v2(top, &att).is_err());
+        assert_eq!(d.session().phase, WalkerPhase::Aborted);
+    }
+
+    #[test]
+    fn authority_validation_rejects_bad_digests() {
+        // P0-2: the sealed authority rejects non-64-hex digests / zero VAs /
+        // entry overflow at bind time.
+        assert!(WalkerDigestAuthority::new(
+            "zz", "b", 1, 1, "p", "c"
+        )
+        .is_err());
+        assert!(WalkerDigestAuthority::new(
+            &"a".repeat(64),
+            &"b".repeat(64),
+            0,
+            0x1234,
+            "p",
+            &"c".repeat(64),
+        )
+        .is_err());
+        assert!(WalkerDigestAuthority::new(
+            &"a".repeat(64),
+            &"b".repeat(64),
+            u64::MAX,
+            2,
+            "p",
+            &"c".repeat(64),
+        )
+        .is_err());
+        assert!(WalkerDigestAuthority::new(
+            &"a".repeat(64),
+            &"b".repeat(64),
+            base(),
+            0x1234,
+            "p",
+            &"c".repeat(64),
+        )
+        .is_ok());
     }
 
     #[test]

@@ -67,8 +67,8 @@ pub use telemetry::{
     TelemetryChannel, TelemetryError, TelemetryMessage, TelemetryResponse, TelemetryState,
 };
 pub use walker_control::{
-    MemoryMapProvider, WalkerAbortReason, WalkerControlError, WalkerDriver, WalkerIoError,
-    WalkerMemoryProvider, WalkerPhase, WalkerSession,
+    MemoryMapProvider, WalkerAbortReason, WalkerControlError, WalkerDigestAuthority,
+    WalkerDriver, WalkerIoError, WalkerMemoryProvider, WalkerPhase, WalkerSession,
 };
 pub use walker_protocol::{
     controller_read_completed_section, controller_read_section, controller_validate_entry,

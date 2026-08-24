@@ -28,7 +28,10 @@ use crate::surfaces::{
     install_proc_surfaces, restore_proc_002, SURFACE_AD_PROC_002, SURFACE_AD_PROC_003,
 };
 use crate::telemetry::TelemetryChannel;
-use crate::walker_control::{WalkerDriver, WalkerIoError, WalkerMemoryProvider, WalkerPhase};
+use crate::walker_control::{
+    WalkerAbortReason, WalkerDigestAuthority, WalkerDriver, WalkerIoError, WalkerMemoryProvider,
+    WalkerPhase,
+};
 use crate::walker_protocol::{
     PROBE_RESULT_BYTES, WALKER_STATUS_ERROR_BAD_PARAMS, WALKER_STATUS_ERROR_MAP_FAILED,
     WALKER_STATUS_ERROR_PROBE_ABORTED, WALKER_STATUS_OK,
@@ -908,11 +911,12 @@ fn initialize_v2_inner(
 }
 /// Local walker session binding (controller -> runtime, in-process).
 ///
-/// The controller registers the params VA and the result section VA so the
-/// runtime export can drive the walker through the injected provider
-/// WITHOUT any live Windows memory access. All reads go through the
-/// provider; the export itself never dereferences a raw pointer.
-#[derive(Debug, Clone, Copy)]
+/// The controller registers the params VA, the result section VA, the
+/// target/owner PID pair AND the sealed digest authority so the runtime
+/// export can drive the walker through the injected provider WITHOUT any
+/// live Windows memory access. All reads go through the provider; the
+/// export itself never dereferences a raw pointer.
+#[derive(Debug, Clone)]
 pub struct WalkerSessionBinding {
     /// VA of the params blob (the argument passed to WalkerExecute).
     pub params_va: u64,
@@ -922,11 +926,21 @@ pub struct WalkerSessionBinding {
     pub target_pid: u32,
     /// Controller/owner process id (must match the section identity).
     pub owner_pid: u32,
+    /// Sealed digest authority (P0-2): target/runtime digests + module_base
+    /// + export RVA. Validated at bind time; used for the attestation.
+    pub authority: WalkerDigestAuthority,
 }
 
 static WALKER_PROVIDER: std::sync::RwLock<Option<Box<dyn WalkerMemoryProvider + Send + Sync>>> =
     std::sync::RwLock::new(None);
 static WALKER_SESSION: std::sync::RwLock<Option<WalkerSessionBinding>> = std::sync::RwLock::new(None);
+/// Terminal-state persistence (P1-3): once the session completes/aborts the
+/// binding is consumed so a second WalkerExecute rejects.
+static WALKER_SESSION_TERMINAL: std::sync::RwLock<bool> = std::sync::RwLock::new(false);
+/// Production output channel (P0-1): the anchored RuntimeAttestationV2 from
+/// the last completed walker run, readable by the controller.
+static WALKER_OUTPUT: std::sync::RwLock<Option<crate::attestation::RuntimeAttestationV2>> =
+    std::sync::RwLock::new(None);
 
 /// Register/replace the local memory provider (in-process controller).
 pub fn set_walker_provider(p: Box<dyn WalkerMemoryProvider + Send + Sync>) -> bool {
@@ -940,13 +954,25 @@ pub fn set_walker_provider(p: Box<dyn WalkerMemoryProvider + Send + Sync>) -> bo
 }
 
 /// Register/replace the local session binding (in-process controller).
+/// Resets the terminal flag so a fresh session can run.
 pub fn bind_walker_session(b: WalkerSessionBinding) -> bool {
     match WALKER_SESSION.write() {
         Ok(mut slot) => {
             *slot = Some(b);
+            if let Ok(mut t) = WALKER_SESSION_TERMINAL.write() {
+                *t = false;
+            }
             true
         }
         Err(_) => false,
+    }
+}
+
+/// Fetch the last produced attestation output (P0-1 output channel).
+pub fn take_walker_output() -> Option<crate::attestation::RuntimeAttestationV2> {
+    match WALKER_OUTPUT.write() {
+        Ok(mut slot) => slot.take(),
+        Err(_) => None,
     }
 }
 
@@ -959,6 +985,12 @@ pub fn reset_walker_bindings() {
     if let Ok(mut slot) = WALKER_SESSION.write() {
         *slot = None;
     }
+    if let Ok(mut t) = WALKER_SESSION_TERMINAL.write() {
+        *t = false;
+    }
+    if let Ok(mut slot) = WALKER_OUTPUT.write() {
+        *slot = None;
+    }
 }
 
 /// C ABI: Walker protocol entry (IMP-09-R1 production caller).
@@ -967,11 +999,15 @@ pub fn reset_walker_bindings() {
 /// state machine (`WalkerDriver`). When a provider + session binding are
 /// registered (local orchestration), it:
 ///   1. validates the params VA (canonical user VA, nonzero);
-///   2. reads the params blob through the injected provider;
+///   2. reads the params blob through the injected provider (full u64 len);
 ///   3. runs `WalkerDriver` (controller_validate_entry ->
-///      controller_read_completed_section x2 -> COMPLETED/ABORTED);
-///   4. returns 0 (Ok) on COMPLETED or the protocol walker_status code
-///      (1..=5) on ABORTED.
+///      controller_read_section + controller_read_completed_section x2 ->
+///      COMPLETED/ABORTED);
+///   4. on COMPLETED: finalize_attestation(authority) +
+///      anchor_into_v2 -> stores output in the output channel, marks the
+///      session terminal, returns 0 (Ok);
+///   5. on ANY error: marks the session terminal, returns the protocol
+///      walker_status code (1..=5).
 /// Without a provider/session it returns `NotImplemented` (13) — the
 /// honest fail-closed contract for the live-not-authorized path. It NEVER
 /// dereferences memory itself and NEVER fakes success.
@@ -998,6 +1034,14 @@ fn walker_execute_inner(params_va: u64) -> i32 {
     let Some(provider) = provider_guard.as_ref() else {
         return MidaAntidebugError::NotImplemented.as_i32();
     };
+    // P1-3: terminal sessions reject re-entry.
+    let terminal = match WALKER_SESSION_TERMINAL.read() {
+        Ok(t) => *t,
+        Err(_) => return MidaAntidebugError::NotImplemented.as_i32(),
+    };
+    if terminal {
+        return MidaAntidebugError::NotImplemented.as_i32();
+    }
     let binding_guard = match WALKER_SESSION.read() {
         Ok(g) => g,
         Err(_) => return MidaAntidebugError::NotImplemented.as_i32(),
@@ -1005,18 +1049,17 @@ fn walker_execute_inner(params_va: u64) -> i32 {
     let Some(binding_ref) = binding_guard.as_ref() else {
         return MidaAntidebugError::NotImplemented.as_i32();
     };
-    let binding = *binding_ref;
+    let binding = binding_ref.clone();
     if binding.params_va != params_va {
         return MidaAntidebugError::NotImplemented.as_i32();
     }
-    // Read the params blob through the provider (bounded).
+    // Read the params blob through the provider (bounded, full u64 len).
     let mut header = [0u8; 0x40];
     if provider.read(params_va, &mut header).is_err() {
         return WALKER_STATUS_ERROR_MAP_FAILED as i32;
     }
-    let blob_total = match usize::try_from(u32::from_le_bytes(
-        header[0x08..0x0C].try_into().unwrap(),
-    )) {
+    let blob_total_raw = u64::from_le_bytes(header[0x08..0x10].try_into().unwrap());
+    let blob_total = match usize::try_from(blob_total_raw) {
         Ok(v) => v,
         Err(_) => return WALKER_STATUS_ERROR_BAD_PARAMS as i32,
     };
@@ -1035,7 +1078,10 @@ fn walker_execute_inner(params_va: u64) -> i32 {
         binding.owner_pid,
     ) {
         Ok(d) => d,
-        Err(_) => return WALKER_STATUS_ERROR_BAD_PARAMS as i32,
+        Err(_) => {
+            mark_terminal();
+            return WALKER_STATUS_ERROR_BAD_PARAMS as i32;
+        }
     };
     // Two full rounds: read section1 at section1_va, section2 at
     // section1_va + section_bytes (the local layout declared by the
@@ -1047,40 +1093,123 @@ fn walker_execute_inner(params_va: u64) -> i32 {
         .and_then(|v| v.checked_add(96))
     {
         Some(v) => v,
-        None => return WALKER_STATUS_ERROR_BAD_PARAMS as i32,
+        None => {
+            mark_terminal();
+            return WALKER_STATUS_ERROR_BAD_PARAMS as i32;
+        }
     };
     let round1_size_usize = match usize::try_from(round1_size) {
         Ok(v) => v,
-        Err(_) => return WALKER_STATUS_ERROR_BAD_PARAMS as i32,
+        Err(_) => {
+            mark_terminal();
+            return WALKER_STATUS_ERROR_BAD_PARAMS as i32;
+        }
     };
     if driver.begin_round(1, 1000).is_err() {
-        return WALKER_STATUS_ERROR_BAD_PARAMS as i32;
+        mark_terminal();
+        return abort_status(&driver);
     }
     let mut sec1 = vec![0u8; round1_size_usize];
     if provider.read(binding.section1_va, &mut sec1).is_err() {
-        return WALKER_STATUS_ERROR_MAP_FAILED as i32;
+        driver.abort(WalkerAbortReason::MapFailed);
+        mark_terminal();
+        return abort_status(&driver);
     }
     if driver.consume_section(&sec1).is_err() {
+        mark_terminal();
         return abort_status(&driver);
     }
     if driver.begin_round(2, 1000).is_err() {
+        mark_terminal();
         return abort_status(&driver);
     }
     let sec2_va = match binding.section1_va.checked_add(sec_bytes) {
         Some(v) => v,
-        None => return WALKER_STATUS_ERROR_BAD_PARAMS as i32,
+        None => {
+            driver.abort(WalkerAbortReason::BadParams);
+            mark_terminal();
+            return abort_status(&driver);
+        }
     };
     let mut sec2 = vec![0u8; round1_size_usize];
     if provider.read(sec2_va, &mut sec2).is_err() {
-        return WALKER_STATUS_ERROR_MAP_FAILED as i32;
+        driver.abort(WalkerAbortReason::MapFailed);
+        mark_terminal();
+        return abort_status(&driver);
     }
     if driver.consume_section(&sec2).is_err() {
+        mark_terminal();
         return abort_status(&driver);
     }
     if driver.session().phase != WalkerPhase::Completed {
+        mark_terminal();
         return abort_status(&driver);
     }
+    // P0-1: production completion path — finalize + anchor + output.
+    let att = match driver.finalize_attestation(&binding.authority) {
+        Ok(a) => a,
+        Err(_) => {
+            mark_terminal();
+            return abort_status(&driver);
+        }
+    };
+    let top = build_walker_top_attestation(&binding, &att);
+    let anchored = match driver.anchor_into_v2(top, &att) {
+        Ok(a) => a,
+        Err(_) => {
+            mark_terminal();
+            return abort_status(&driver);
+        }
+    };
+    // Output channel (P0-1): store the anchored attestation for the controller.
+    if let Ok(mut slot) = WALKER_OUTPUT.write() {
+        *slot = Some(anchored);
+    }
+    mark_terminal();
     WALKER_STATUS_OK as i32
+}
+
+/// Build the v2 top-level attestation frame bound to the session authority.
+fn build_walker_top_attestation(
+    binding: &WalkerSessionBinding,
+    _att: &crate::attestation::WalkerAttestation,
+) -> crate::attestation::RuntimeAttestationV2 {
+    use crate::attestation::{
+        HookInventory, RuntimeAttestationV2, ATTESTATION_SCHEMA_V2,
+        ATTESTATION_SCHEMA_VERSION_V2, ARCH_X86_64, RUNTIME_ID, RUNTIME_VERSION,
+    };
+    let inventory = HookInventory::unsupported(&[]);
+    RuntimeAttestationV2 {
+        schema: ATTESTATION_SCHEMA_V2.to_string(),
+        schema_version: ATTESTATION_SCHEMA_VERSION_V2,
+        runtime_id: RUNTIME_ID.to_string(),
+        runtime_version: RUNTIME_VERSION.to_string(),
+        architecture: ARCH_X86_64.to_string(),
+        runtime_sha256: binding.authority.runtime_module_sha256.clone(),
+        profile_id: binding.authority.profile_id.clone(),
+        profile_digest: binding.authority.profile_digest.clone(),
+        target_pid: binding.target_pid,
+        module_base: binding.authority.module_base,
+        initialized: true,
+        hooks_expected: inventory.hooks_expected,
+        hooks_installed: inventory.hooks_installed,
+        hook_failures: inventory.hook_failures,
+        surface_details: Vec::new(),
+        telemetry_channel: "ready".to_string(),
+        cleanup_handler_registered: true,
+        third_party: "walker-local".to_string(),
+        source_revision: String::new(),
+        toolchain: String::new(),
+        walker_attestation: None,
+        record_digest: String::new(),
+    }
+}
+
+/// Mark the session terminal (P1-3): a consumed session rejects re-entry.
+fn mark_terminal() {
+    if let Ok(mut t) = WALKER_SESSION_TERMINAL.write() {
+        *t = true;
+    }
 }
 
 /// Map the driver's abort reason to the protocol status code.
@@ -1101,6 +1230,7 @@ impl WalkerMemoryProvider for LocalExportProvider<'_> {
         self.inner.read(va, buf)
     }
 }
+
 /// Internal: read a NUL-terminated C string (bounded).
 unsafe fn read_cstr(p: *const std::os::raw::c_char) -> Option<String> {
     if p.is_null() {
@@ -1402,6 +1532,28 @@ mod imp09_walker_export_tests {
         encode_section(&ident, &hdr, &results).unwrap()
     }
 
+    fn authority() -> crate::walker_control::WalkerDigestAuthority {
+        crate::walker_control::WalkerDigestAuthority::new(
+            &"a".repeat(64),
+            &"b".repeat(64),
+            base(),
+            0x1234,
+            "walker-local",
+            &"c".repeat(64),
+        )
+        .unwrap()
+    }
+
+    fn binding(params_va: u64, section1_va: u64) -> WalkerSessionBinding {
+        WalkerSessionBinding {
+            params_va,
+            section1_va,
+            target_pid: 4242,
+            owner_pid: 1234,
+            authority: authority(),
+        }
+    }
+
     fn setup_valid() -> (MemoryMapProvider, u64, u64) {
         let blob_base = base();
         let target_pid = 4242u32;
@@ -1426,12 +1578,7 @@ mod imp09_walker_export_tests {
         // Provider-backed: the export drives the full 2-round state machine.
         let (prov, params_va, section1_va) = setup_valid();
         assert!(set_walker_provider(Box::new(prov)));
-        assert!(bind_walker_session(WalkerSessionBinding {
-            params_va,
-            section1_va,
-            target_pid: 4242,
-            owner_pid: 1234,
-        }));
+        assert!(bind_walker_session(binding(params_va, section1_va)));
         unsafe {
             assert_eq!(WalkerExecute(params_va), WALKER_STATUS_OK as i32);
         }
@@ -1472,12 +1619,7 @@ mod imp09_walker_export_tests {
         sec[n - 1] ^= 0xFF;
         prov.insert(base() + 0x1000, sec);
         assert!(set_walker_provider(Box::new(prov)));
-        assert!(bind_walker_session(WalkerSessionBinding {
-            params_va,
-            section1_va,
-            target_pid: 4242,
-            owner_pid: 1234,
-        }));
+        assert!(bind_walker_session(binding(params_va, section1_va)));
         unsafe {
             let r = WalkerExecute(params_va);
             assert!(r != WALKER_STATUS_OK as i32, "got {r}");
@@ -1500,15 +1642,102 @@ mod imp09_walker_export_tests {
         let sec = make_section(base(), 9999, 1234, cap);
         prov.insert(base() + 0x1000, sec);
         assert!(set_walker_provider(Box::new(prov)));
-        assert!(bind_walker_session(WalkerSessionBinding {
-            params_va,
-            section1_va,
-            target_pid: 4242,
-            owner_pid: 1234,
-        }));
+        assert!(bind_walker_session(binding(params_va, section1_va)));
         unsafe {
             let r = WalkerExecute(params_va);
             assert!(r != WALKER_STATUS_OK as i32, "got {r}");
+        }
+    }
+
+    #[test]
+    fn walker_export_terminal_state_rejects_second_call() {
+        let _guard = IMP09_TEST_LOCK.lock().unwrap();
+        reset_walker_bindings();
+        // P1-3: after COMPLETED the binding is consumed; a second call rejects.
+        let (prov, params_va, section1_va) = setup_valid();
+        assert!(set_walker_provider(Box::new(prov)));
+        assert!(bind_walker_session(binding(params_va, section1_va)));
+        unsafe {
+            assert_eq!(WalkerExecute(params_va), WALKER_STATUS_OK as i32);
+        }
+        unsafe {
+            let r = WalkerExecute(params_va);
+            assert_ne!(r, WALKER_STATUS_OK as i32, "second call must reject");
+            assert_eq!(r, MidaAntidebugError::NotImplemented.as_i32(), "terminal session");
+        }
+    }
+
+    #[test]
+    fn walker_export_aborted_state_rejects_second_call() {
+        let _guard = IMP09_TEST_LOCK.lock().unwrap();
+        reset_walker_bindings();
+        // P1-3: after ABORTED the binding is consumed; a second call rejects.
+        let (_, params_va, section1_va) = setup_valid();
+        let cap = cand().len() as u32;
+        let sec_bytes = section_bytes_for(cap);
+        let c = cand();
+        let blob = params_blob(base(), &c, sec_bytes);
+        let mut prov = MemoryMapProvider::new();
+        prov.insert(base(), blob);
+        let mut sec = make_section(base(), 4242, 1234, cap);
+        let n = sec.len();
+        sec[n - 1] ^= 0xFF; // CRC tamper -> ABORTED
+        prov.insert(base() + 0x1000, sec);
+        assert!(set_walker_provider(Box::new(prov)));
+        assert!(bind_walker_session(binding(params_va, section1_va)));
+        unsafe {
+            let r = WalkerExecute(params_va);
+            assert_ne!(r, WALKER_STATUS_OK as i32);
+        }
+        unsafe {
+            let r = WalkerExecute(params_va);
+            assert_eq!(r, MidaAntidebugError::NotImplemented.as_i32(), "terminal after abort");
+        }
+    }
+
+    #[test]
+    fn walker_export_produces_anchored_attestation_output() {
+        let _guard = IMP09_TEST_LOCK.lock().unwrap();
+        reset_walker_bindings();
+        // P0-1: completed run must produce a validated v2 attestation output.
+        let (prov, params_va, section1_va) = setup_valid();
+        assert!(set_walker_provider(Box::new(prov)));
+        assert!(bind_walker_session(binding(params_va, section1_va)));
+        unsafe {
+            assert_eq!(WalkerExecute(params_va), WALKER_STATUS_OK as i32);
+        }
+        let out = take_walker_output().expect("output channel must hold attestation");
+        out.validate().expect("anchored attestation must validate");
+        let w = out.walker_attestation.as_ref().expect("walker attestation present");
+        assert_eq!(w.rounds.len(), 2);
+        assert_eq!(w.record_digest.len(), 64);
+        assert_eq!(w.target_pid, 4242);
+        assert_eq!(w.runtime_module_sha256, "b".repeat(64));
+        assert_eq!(w.walker_entry_va, base() + 0x1234);
+        assert_eq!(w.probe_summary.candidates_total, 6);
+    }
+
+    #[test]
+    fn walker_export_rejects_high_32bit_blob_total() {
+        let _guard = IMP09_TEST_LOCK.lock().unwrap();
+        reset_walker_bindings();
+        // #6: blob_total_bytes is a u64 field; a high 32-bit set must be
+        // rejected BEFORE allocation (checked u64->usize + range).
+        let (mut prov, params_va, section1_va) = setup_valid();
+        // Patch the params blob: set blob_total_bytes high bit.
+        let mut blob = vec![0u8; 0x40 + cand().len() * 8];
+        prov.read_from(base(), &mut blob).unwrap();
+        blob[0x08..0x10].copy_from_slice(&(0x0000_0001_0000_0000u64).to_le_bytes());
+        prov = MemoryMapProvider::new();
+        prov.insert(base(), blob);
+        let cap = cand().len() as u32;
+        let _sec_bytes = section_bytes_for(cap);
+        prov.insert(base() + 0x1000, make_section(base(), 4242, 1234, cap));
+        assert!(set_walker_provider(Box::new(prov)));
+        assert!(bind_walker_session(binding(params_va, section1_va)));
+        unsafe {
+            let r = WalkerExecute(params_va);
+            assert_eq!(r, WALKER_STATUS_ERROR_BAD_PARAMS as i32, "got {r}");
         }
     }
 }
