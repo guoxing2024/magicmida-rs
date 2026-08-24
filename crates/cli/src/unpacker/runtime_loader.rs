@@ -2190,9 +2190,10 @@ impl RuntimeLoader {
         // instead of silently becoming "the" export.
         let mut seen: Vec<bool> = vec![false; want.len()];
         for i in 0..num_names {
-            // IMP-08-R1-R2 (P1-3): no bare index arithmetic — every offset
-            // is derived with checked_mul/checked_add and validated against
-            // the buffer length before any element access.
+            // IMP-08-R1-R2/R3 (P1-3): every offset is derived with
+            // checked_mul/checked_add, validated against the buffer length
+            // (name_end > names.len() etc.), and every element read is a
+            // slice of the validated range (no off+N element indexing).
             let name_off = i.checked_mul(4).ok_or_else(|| {
                 RuntimeLoadError::ExportResolutionFailed(
                     "export name index overflow".to_string(),
@@ -2208,12 +2209,16 @@ impl RuntimeLoader {
                     "export name array truncated".to_string(),
                 ));
             }
-            let name_ptr_rva = u32::from_le_bytes([
-                names[name_off],
-                names[name_off + 1],
-                names[name_off + 2],
-                names[name_off + 3],
-            ]) as usize;
+            let name_slot = &names[name_off..name_end];
+            let name_ptr_rva = u32::from_le_bytes(
+                name_slot
+                    .try_into()
+                    .map_err(|_| {
+                        RuntimeLoadError::ExportResolutionFailed(
+                            "export name slot size".to_string(),
+                        )
+                    })?,
+            ) as usize;
             if name_ptr_rva == 0 {
                 continue;
             }
@@ -2251,7 +2256,16 @@ impl RuntimeLoader {
                     "export ordinal array truncated".to_string(),
                 ));
             }
-            let ord = u16::from_le_bytes([ords[ord_off], ords[ord_off + 1]]) as usize;
+            let ord_slot = &ords[ord_off..ord_end];
+            let ord = u16::from_le_bytes(
+                ord_slot
+                    .try_into()
+                    .map_err(|_| {
+                        RuntimeLoadError::ExportResolutionFailed(
+                            "export ordinal slot size".to_string(),
+                        )
+                    })?,
+            ) as usize;
             // IMP-08-R1: duplicate export names are AMBIGUOUS and must be
             // rejected fail-closed (WO-1505 §5.3c).
             for (wi, w) in want.iter().enumerate() {
@@ -2293,12 +2307,16 @@ impl RuntimeLoader {
                         "export function array truncated".to_string(),
                     ));
                 }
-                let func_rva = u32::from_le_bytes([
-                    funcs[func_off],
-                    funcs[func_off + 1],
-                    funcs[func_off + 2],
-                    funcs[func_off + 3],
-                ]) as usize;
+                let func_slot = &funcs[func_off..func_end];
+                let func_rva = u32::from_le_bytes(
+                    func_slot
+                        .try_into()
+                        .map_err(|_| {
+                            RuntimeLoadError::ExportResolutionFailed(
+                                "export function slot size".to_string(),
+                            )
+                        })?,
+                ) as usize;
                 if func_rva == 0 {
                     continue;
                 }

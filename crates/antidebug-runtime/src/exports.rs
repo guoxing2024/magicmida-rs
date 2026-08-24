@@ -546,6 +546,11 @@ fn v2_checked_add(a: usize, b: usize, what: &str) -> Result<usize, MidaAntidebug
     })
 }
 
+/// Checked blob end (blob_base + params_bytes), fail-closed.
+fn checked_blob_end(blob_base: usize, params_bytes: usize) -> Result<usize, MidaAntidebugError> {
+    blob_base.checked_add(params_bytes).ok_or(MidaAntidebugError::InvalidV2Blob)
+}
+
 /// Bounded NUL-terminated string read from a blob slice (fail-closed).
 fn v2_read_cstr_blob(blob: &[u8], off: usize, what: &str) -> Result<String, MidaAntidebugError> {
     if off >= blob.len() {
@@ -697,9 +702,9 @@ fn initialize_v2_inner(
     // blob provenance BEFORE dereferencing: the VA must lie inside
     // [blob_base, blob_end). A canonical-but-unrelated VA is rejected.
     let blob_base = params as usize;
-    let blob_end = match blob_base.checked_add(params_bytes) {
-        Some(v) => v,
-        None => return MidaAntidebugError::InvalidV2Blob.as_i32(),
+    let blob_end = match checked_blob_end(blob_base, params_bytes) {
+        Ok(v) => v,
+        Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32(),
     };
     let array_bytes = match (expected_hooks as usize).checked_mul(8) {
         Some(v) => v,
@@ -1136,15 +1141,30 @@ mod imp08_v2_tests {
     }
 
     #[test]
-    fn v2_blob_blob_base_plus_bytes_overflow_rejected() {
-        // params_bytes = usize::MAX with a valid small blob is impossible
-        // to allocate; instead exercise the checked_add directly through
-        // a pointer near the top of the address space is not constructible
-        // in a test. We cover the overflow guard via the digest-region
-        // checked_add path with dig_off = usize::MAX - 1 in the header.
+    fn v2_blob_digest_region_checked_add_overflow_rejected() {
+        // dig_off = usize::MAX - 1: digest_off + 65 overflows the
+        // checked_add guard (exports.rs:719-722). Named for the REAL
+        // path it covers — the digest-region checked-add overflow.
         let mut b = build_probe_blob();
         b[0x38..0x40].copy_from_slice(&((usize::MAX - 1) as u64).to_le_bytes());
         let r = initialize_v2_inner_probe(&b);
         assert_eq!(r, MidaAntidebugError::InvalidV2Blob.as_i32());
+    }
+
+    #[test]
+    fn v2_blob_blob_base_plus_bytes_overflow_rejected() {
+        // The REAL blob-base overflow guard is checked_blob_end()
+        // (exports.rs:701-705), the exact function the production
+        // parser calls at initialize_v2_inner entry. A real
+        // initialize_v2_inner call cannot overflow blob_base +
+        // params_bytes (params points at a real small blob), so the
+        // guard is exercised directly with adversarial inputs.
+        assert!(checked_blob_end(usize::MAX, 1).is_err());
+        assert!(checked_blob_end(1, usize::MAX).is_err());
+        assert!(checked_blob_end(usize::MAX - 1, 2).is_err());
+        assert!(checked_blob_end(usize::MAX, usize::MAX).is_err());
+        assert_eq!(checked_blob_end(0, 0).unwrap(), 0);
+        assert_eq!(checked_blob_end(0x1000, 0x100).unwrap(), 0x1100);
+        assert_eq!(checked_blob_end(1, 1).unwrap(), 2);
     }
 }
