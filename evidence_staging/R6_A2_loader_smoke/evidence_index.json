@@ -1,0 +1,51 @@
+{
+  "experiment": "GTO-R6-A2 LOADER SMOKE (DIAGNOSTIC - NOT acceptance evidence)",
+  "work_order": "WORK_ORDER_GTO-R6-A2-LOADER-SMOKE_20260825.md",
+  "date": "2026-08-25",
+  "target": {
+    "path": "D:\\MidaVault\\lab\\evidence\\gto_cold_start_heap_rebase_1\\R6_A1_dd_restore\\layout_A\\gto_unpacked.dd_restored.exe",
+    "staging_copy": "D:\\Claude project\\magicmida-rs\\evidence_staging\\R6_A1_dd_restore\\layout_A\\gto_unpacked.dd_restored.exe",
+    "sha256": "c4a1a94e367c0f555243d3408446df0320c04d2262cc039a2fd436a064e01637",
+    "hash_pre_run_verified": true,
+    "hash_post_run_verified": true,
+    "size_bytes": 48563200,
+    "arch": "x64",
+    "image_base": "0x140000000",
+    "disguised_module": "vcomp140.dll (Themida)"
+  },
+  "breakpoints": {
+    "tls0": "0x141728972",
+    "resolver": "0x1417223b2",
+    "entry": "0x1416fb532"
+  },
+  "attempts": [
+    {
+      "id": "001",
+      "protocol_defect": "cdb -g: breakpoints set after TLS chain executed; chain hits not recorded",
+      "outcome": "second-chance AV @ 0x142934089 (.rdata2) read 0x9fd548 - matches H5 candidate crash",
+      "files": ["cdb_run.log", "cdb_console_001.txt", "cdb_script_001.txt", "crash_scene.json"]
+    },
+    {
+      "id": "002",
+      "protocol": "cdb no -g, initial breakpoint, native bp x3, sxe av first=record+gn second=record+kill",
+      "outcome": "TLS0 HIT -> RESOLVER HIT -> first-chance AV @ 0x1412f2f40 (.rdata0) read 0xa83000 -> second-chance AV -> terminated. ENTRY never hit.",
+      "elapsed_ms": 691,
+      "files": ["cdb_run.log", "cdb_run_002.log", "cdb_script_002.txt", "hit_timeline.json", "target.pid"]
+    },
+    {
+      "id": "003",
+      "protocol": "same as 002 (replication)",
+      "outcome": "TLS0 HIT -> RESOLVER HIT -> first-chance AV @ 0x1412f2f40 (.rdata0) read 0xa06000 -> second-chance AV -> terminated. ENTRY never hit.",
+      "elapsed_ms": 281,
+      "files": ["cdb_run.log", "cdb_console_003.txt", "hit_timeline.json"]
+    }
+  ],
+  "verdict": "A2-FAIL",
+  "verdict_criteria": {
+    "resolver_returned_to_entry": false,
+    "entry_hit": false,
+    "second_chance_exception": true,
+    "timeout": false
+  },
+  "vault_note": "Vault path D:\\MidaVault\\lab\\evidence\\gto_cold_start_heap_rebase_1\\R6_A2_loader_smoke\\ could NOT be written (sandbox denied, no approval channel). Evidence staged at D:\\Claude project\\magicmida-rs\\evidence_staging\\R6_A2_loader_smoke\\ for audit transfer."
+}

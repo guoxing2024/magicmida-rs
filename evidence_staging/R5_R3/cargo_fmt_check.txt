@@ -1,0 +1,3365 @@
+link.exe -> C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Tools\MSVC\14.51.36231\bin\HostX64\x64\link.exe
+LIB -> C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Tools\MSVC\14.51.36231\lib\x64;C:\Program Files (x86)\Windows Kits\10\lib\10.0.26100.0\ucrt\x64;C:\Program Files (x86)\Windows Kits\10\\lib\10.0.26100.0\\um\x64
+Diff in \\?\D:\Claude project\magicmida-rs\crates\acceptance\src\implementation_gate.rs:102:
+ 
+     // readiness
+     let readiness = ImplGateStatus::Ready;
+[31m-    reasons.push("readiness=ready: v1 foundation + v2 protocol contracts present in frozen tree".to_string());
+[0m[32m+    reasons.push(
+[0m[32m+        "readiness=ready: v1 foundation + v2 protocol contracts present in frozen tree".to_string(),
+[0m[32m+    );
+[0m 
+     // implemented
+     let mut implemented_ok = true;
+Diff in \\?\D:\Claude project\magicmida-rs\crates\acceptance\src\implementation_gate.rs:146:
+     }
+     if !facts.live_authorized {
+         allowed_ok = false;
+[31m-        reasons.push("acceptance_allowed=NOT: live authorization missing (LIVE-4 NOT AUTHORIZED)".to_string());
+[0m[32m+        reasons.push(
+[0m[32m+            "acceptance_allowed=NOT: live authorization missing (LIVE-4 NOT AUTHORIZED)"
+[0m[32m+                .to_string(),
+[0m[32m+        );
+[0m     }
+     if !facts.windows_runtime_verified {
+         allowed_ok = false;
+Diff in \\?\D:\Claude project\magicmida-rs\crates\acceptance\src\implementation_gate.rs:153:
+[31m-        reasons.push("acceptance_allowed=NOT: windows runtime not verified (no live evidence)".to_string());
+[0m[32m+        reasons.push(
+[0m[32m+            "acceptance_allowed=NOT: windows runtime not verified (no live evidence)".to_string(),
+[0m[32m+        );
+[0m     }
+     if !facts.evidence_sufficient {
+         allowed_ok = false;
+Diff in \\?\D:\Claude project\magicmida-rs\crates\acceptance\src\implementation_gate.rs:180:
+     }
+ }
+ 
+[31m-
+[0m #[cfg(test)]
+ mod tests {
+     use super::*;
+Diff in \\?\D:\Claude project\magicmida-rs\crates\acceptance\src\implementation_gate.rs:238:
+         let v = evaluate_implementation_gate(&f);
+         assert_eq!(v.implemented, ImplGateStatus::Ready);
+         assert_eq!(v.gate, ImplGateResult::Fail);
+[31m-        assert!(v.reasons.iter().any(|r| r.contains("Walker protocol production caller")));
+[0m[32m+        assert!(v
+[0m[32m+            .reasons
+[0m[32m+            .iter()
+[0m[32m+            .any(|r| r.contains("Walker protocol production caller")));
+[0m     }
+ 
+     #[test]
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\attestation.rs:430:
+     #[error("probe summary type sum mismatch: sum {sum}, total {total}")]
+     ProbeSummaryTypeSumMismatch { sum: u32, total: u32 },
+     #[error("probe summary count exceeds: {field} {got} > total {total}")]
+[31m-    ProbeSummaryCountExceeds { field: &'static str, got: u32, total: u32 },
+[0m[32m+    ProbeSummaryCountExceeds {
+[0m[32m+        field: &'static str,
+[0m[32m+        got: u32,
+[0m[32m+        total: u32,
+[0m[32m+    },
+[0m     #[error("counts overflow (checked add)")]
+     CountsOverflow,
+     #[error("walker pid mismatch: expected {expected}, got {got}")]
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\attestation.rs:451:
+     WalkerEntryMismatch { expected: u64, got: u64 },
+ }
+ 
+[31m-
+[0m // ============================================================================
+ // Attestation v2 (WO-1503 frozen contract, IMP-01-R1)
+ // ============================================================================
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\attestation.rs:581:
+ 
+ /// Fixed digest vectors (WO-1503 §5.3) — authoritative fixtures.
+ pub const C14N_VECTOR_1_HEX: &str = "7b7d";
+[31m-pub const C14N_VECTOR_1_DIGEST: &str = "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
+[0m[32m+pub const C14N_VECTOR_1_DIGEST: &str =
+[0m[32m+    "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
+[0m pub const C14N_VECTOR_2_HEX: &str = "7b2261223a322c2262223a317d";
+[31m-pub const C14N_VECTOR_2_DIGEST: &str = "d3626ac30a87e6f7a6428233b3c68299976865fa5508e4267c5415c76af7a772";
+[0m[31m-pub const C14N_VECTOR_3_HEX: &str = "7b2261223a5b312c325d2c2273223a22785c2279222c2275223a22e4b8ad222c227a223a6e756c6c7d";
+[0m[31m-pub const C14N_VECTOR_3_DIGEST: &str = "154301026b1458e084761c0fba44c2269b5e66f7a4b0e0071ad09e69e97dd244";
+[0m[32m+pub const C14N_VECTOR_2_DIGEST: &str =
+[0m[32m+    "d3626ac30a87e6f7a6428233b3c68299976865fa5508e4267c5415c76af7a772";
+[0m[32m+pub const C14N_VECTOR_3_HEX: &str =
+[0m[32m+    "7b2261223a5b312c325d2c2273223a22785c2279222c2275223a22e4b8ad222c227a223a6e756c6c7d";
+[0m[32m+pub const C14N_VECTOR_3_DIGEST: &str =
+[0m[32m+    "154301026b1458e084761c0fba44c2269b5e66f7a4b0e0071ad09e69e97dd244";
+[0m pub const C14N_VECTOR_4_HEX: &str = "7b226e6f223a66616c73652c226f6b223a747275657d";
+[31m-pub const C14N_VECTOR_4_DIGEST: &str = "ae8ab1e1b72505d8544a32bf3803333e81528159e214e4198a0271d2f60dc419";
+[0m[32m+pub const C14N_VECTOR_4_DIGEST: &str =
+[0m[32m+    "ae8ab1e1b72505d8544a32bf3803333e81528159e214e4198a0271d2f60dc419";
+[0m 
+ /// SHA-256 hex (lowercase).
+ pub fn sha256_hex(data: &[u8]) -> String {
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\exports.rs:502:
+     MidaAntidebugError::Ok.as_i32()
+ }
+ 
+[31m-
+[0m // ============================================================================
+ // IMP-08: MidaAntidebugInitializeV2 (7-arg ABI, digest channel)
+ // ============================================================================
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\exports.rs:556:
+ 
+ /// Checked blob end (blob_base + params_bytes), fail-closed.
+ fn checked_blob_end(blob_base: usize, params_bytes: usize) -> Result<usize, MidaAntidebugError> {
+[31m-    blob_base.checked_add(params_bytes).ok_or(MidaAntidebugError::InvalidV2Blob)
+[0m[32m+    blob_base
+[0m[32m+        .checked_add(params_bytes)
+[0m[32m+        .ok_or(MidaAntidebugError::InvalidV2Blob)
+[0m }
+ 
+ /// Bounded NUL-terminated string read from a blob slice (fail-closed).
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\exports.rs:574:
+     if end >= blob.len() || blob[end] != 0 {
+         return Err(MidaAntidebugError::InvalidV2Blob); // missing NUL
+     }
+[31m-    let s = std::str::from_utf8(&blob[off..end])
+[0m[31m-        .map_err(|_| MidaAntidebugError::InvalidV2Blob)?;
+[0m[32m+    let s = std::str::from_utf8(&blob[off..end]).map_err(|_| MidaAntidebugError::InvalidV2Blob)?;
+[0m     let _ = what;
+     Ok(s.to_string())
+ }
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\exports.rs:642:
+         }
+         Ok(u64::from_le_bytes(blob[off..end].try_into().unwrap()))
+     };
+[31m-    let magic = match rd(0x30) { Ok(v) => v, Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32() };
+[0m[32m+    let magic = match rd(0x30) {
+[0m[32m+        Ok(v) => v,
+[0m[32m+        Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32(),
+[0m[32m+    };
+[0m     if magic != V2_ENVELOPE_MAGIC {
+         return MidaAntidebugError::InvalidV2Blob.as_i32();
+     }
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\exports.rs:649:
+[31m-    let pid_off_u = match rd(0x10) { Ok(v) => v, Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32() };
+[0m[31m-    let pd_off_u = match rd(0x18) { Ok(v) => v, Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32() };
+[0m[31m-    let expected_hooks = match rd(0x20) { Ok(v) => v, Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32() };
+[0m[31m-    let surf_off_u = match rd(0x28) { Ok(v) => v, Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32() };
+[0m[31m-    let dig_off_u = match rd(0x38) { Ok(v) => v, Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32() };
+[0m[31m-    let dig_len_field = match rd(0x40) { Ok(v) => v, Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32() };
+[0m[32m+    let pid_off_u = match rd(0x10) {
+[0m[32m+        Ok(v) => v,
+[0m[32m+        Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32(),
+[0m[32m+    };
+[0m[32m+    let pd_off_u = match rd(0x18) {
+[0m[32m+        Ok(v) => v,
+[0m[32m+        Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32(),
+[0m[32m+    };
+[0m[32m+    let expected_hooks = match rd(0x20) {
+[0m[32m+        Ok(v) => v,
+[0m[32m+        Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32(),
+[0m[32m+    };
+[0m[32m+    let surf_off_u = match rd(0x28) {
+[0m[32m+        Ok(v) => v,
+[0m[32m+        Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32(),
+[0m[32m+    };
+[0m[32m+    let dig_off_u = match rd(0x38) {
+[0m[32m+        Ok(v) => v,
+[0m[32m+        Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32(),
+[0m[32m+    };
+[0m[32m+    let dig_len_field = match rd(0x40) {
+[0m[32m+        Ok(v) => v,
+[0m[32m+        Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32(),
+[0m[32m+    };
+[0m     if dig_len_field != V2_DIGEST_LEN {
+         return MidaAntidebugError::InvalidV2Blob.as_i32();
+     }
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\exports.rs:677:
+         Ok(v) => v,
+         Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32(),
+     };
+[31m-    for (name, off) in [("profile_id", pid_off), ("profile_digest", pd_off), ("digest", dig_off)] {
+[0m[32m+    for (name, off) in [
+[0m[32m+        ("profile_id", pid_off),
+[0m[32m+        ("profile_digest", pd_off),
+[0m[32m+        ("digest", dig_off),
+[0m[32m+    ] {
+[0m         if off < V2_HEADER_BYTES || off >= blob.len() {
+             let _ = name;
+             return MidaAntidebugError::InvalidV2Blob.as_i32();
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\exports.rs:700:
+     if digest.len() != 64 {
+         return MidaAntidebugError::InvalidV2Blob.as_i32();
+     }
+[31m-    if !digest.bytes().all(|b| b.is_ascii_digit() || (b.is_ascii_lowercase() && b <= b'f')) {
+[0m[32m+    if !digest
+[0m[32m+        .bytes()
+[0m[32m+        .all(|b| b.is_ascii_digit() || (b.is_ascii_lowercase() && b <= b'f'))
+[0m[32m+    {
+[0m         return MidaAntidebugError::InvalidV2Blob.as_i32();
+     }
+ 
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\exports.rs:781:
+ 
+     // ---- target identity (frozen header fields +0x00 / +0x08) ----
+     let target_pid = u32::from_le_bytes(blob[0x00..0x04].try_into().unwrap());
+[31m-    let module_base = match rd(0x08) { Ok(v) => v, Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32() };
+[0m[32m+    let module_base = match rd(0x08) {
+[0m[32m+        Ok(v) => v,
+[0m[32m+        Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32(),
+[0m[32m+    };
+[0m     if target_pid == 0 || module_base == 0 {
+         // Target identity binding: zero PID / module base is invalid.
+         return MidaAntidebugError::InvalidArgument.as_i32();
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\exports.rs:956:
+     }
+ }
+ 
+[31m-
+[0m static WALKER_PROVIDER: PoisonSafe<Option<Box<dyn WalkerMemoryProvider + Send + Sync>>> =
+     PoisonSafe::new(None);
+ static WALKER_SESSION: PoisonSafe<Option<WalkerSessionBinding>> = PoisonSafe::new(None);
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\exports.rs:981:
+     Aborted = 5,
+ }
+ 
+[31m-static WALKER_SESSION_LIFECYCLE: std::sync::atomic::AtomicU8 =
+[0m[31m-    std::sync::atomic::AtomicU8::new(0); // Unbound
+[0m[32m+static WALKER_SESSION_LIFECYCLE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0); // Unbound
+[0m 
+ #[cfg(test)]
+ fn lifecycle_get() -> WalkerSessionLifecycle {
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\exports.rs:1249:
+     ))
+ }
+ 
+[31m-
+[0m /// Fetch the last produced attestation output (P0-1 output channel).
+ pub fn take_walker_output() -> Option<crate::attestation::RuntimeAttestationV2> {
+     match WALKER_OUTPUT.write() {
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\exports.rs:1294:
+ /// shared static. Each test gets a fresh state via reset_walker_bindings();
+ /// no cross-test contamination, no early-return masking.
+ #[cfg(test)]
+[31m-static IMP09_OUTPUT_SINK_FAIL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+[0m[32m+static IMP09_OUTPUT_SINK_FAIL: std::sync::atomic::AtomicBool =
+[0m[32m+    std::sync::atomic::AtomicBool::new(false);
+[0m /// R4-R1: failpoint AFTER provider install, BEFORE session install —
+ /// exercises the session-install rollback path (distinct from output-
+ /// reset failure). Test-only.
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\exports.rs:1517:
+     // Output channel (P0-1/P1-2): the write MUST succeed before success.
+     #[cfg(test)]
+     if IMP09_OUTPUT_SINK_FAIL.load(std::sync::atomic::Ordering::SeqCst) {
+[31m-        driver.fail_abort(WalkerControlError::Io(WalkerIoError::Missing {
+[0m[31m-            va: 0,
+[0m[31m-        }));
+[0m[32m+        driver.fail_abort(WalkerControlError::Io(WalkerIoError::Missing { va: 0 }));
+[0m         lifecycle_set(WalkerSessionLifecycle::Aborted);
+         return WALKER_STATUS_ERROR_INTERNAL_PANIC as i32;
+     }
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\exports.rs:1528:
+             *slot = Some(anchored);
+         }
+         Err(_) => {
+[31m-            driver.fail_abort(WalkerControlError::Io(WalkerIoError::Missing {
+[0m[31m-                va: 0,
+[0m[31m-            }));
+[0m[32m+            driver.fail_abort(WalkerControlError::Io(WalkerIoError::Missing { va: 0 }));
+[0m             lifecycle_set(WalkerSessionLifecycle::Aborted);
+             return WALKER_STATUS_ERROR_INTERNAL_PANIC as i32;
+         }
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\exports.rs:1545:
+     _att: &crate::attestation::WalkerAttestation,
+ ) -> crate::attestation::RuntimeAttestationV2 {
+     use crate::attestation::{
+[31m-        HookInventory, RuntimeAttestationV2, ATTESTATION_SCHEMA_V2,
+[0m[31m-        ATTESTATION_SCHEMA_VERSION_V2, ARCH_X86_64, RUNTIME_ID, RUNTIME_VERSION,
+[0m[32m+        HookInventory, RuntimeAttestationV2, ARCH_X86_64, ATTESTATION_SCHEMA_V2,
+[0m[32m+        ATTESTATION_SCHEMA_VERSION_V2, RUNTIME_ID, RUNTIME_VERSION,
+[0m     };
+     let inventory = HookInventory::unsupported(&[]);
+     RuntimeAttestationV2 {
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\exports.rs:1647:
+     #[test]
+     fn walker_execute_rejects_invalid_va_fail_closed() {
+         unsafe {
+[31m-            assert_eq!(WalkerExecute(0), MidaAntidebugError::InvalidArgument.as_i32());
+[0m             assert_eq!(
+[32m+                WalkerExecute(0),
+[0m[32m+                MidaAntidebugError::InvalidArgument.as_i32()
+[0m[32m+            );
+[0m[32m+            assert_eq!(
+[0m                 WalkerExecute(0xFFFF_8000_0000_0000),
+                 MidaAntidebugError::InvalidArgument.as_i32()
+             );
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\exports.rs:1697:
+         let mut b = vec![0u8; 0x48];
+         b[0x00..0x04].copy_from_slice(&1234u32.to_le_bytes());
+         b[0x08..0x10].copy_from_slice(&0x0000_2000_0000u64.to_le_bytes());
+[31m-        b[0x10..0x18].copy_from_slice(&0x48u64.to_le_bytes());          // profile_id_off
+[0m[32m+        b[0x10..0x18].copy_from_slice(&0x48u64.to_le_bytes()); // profile_id_off
+[0m         b[0x18..0x20].copy_from_slice(&((0x48 + 9) as u64).to_le_bytes()); // profile_digest_off
+[31m-        b[0x20..0x28].copy_from_slice(&1u64.to_le_bytes());             // expected_hooks
+[0m[31m-        // surf_off filled after layout is known
+[0m[32m+        b[0x20..0x28].copy_from_slice(&1u64.to_le_bytes()); // expected_hooks
+[0m[32m+                                                            // surf_off filled after layout is known
+[0m         b[0x30..0x38].copy_from_slice(&V2_ENVELOPE_MAGIC.to_le_bytes());
+         // digest_off filled after layout; digest_len
+         b[0x40..0x48].copy_from_slice(&V2_DIGEST_LEN.to_le_bytes());
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\exports.rs:1830:
+         assert_eq!(checked_blob_end(0x1000, 0x100).unwrap(), 0x1100);
+         assert_eq!(checked_blob_end(1, 1).unwrap(), 2);
+     }
+[31m-
+[0m }
+ 
+[31m-
+[0m #[cfg(test)]
+ mod imp09_walker_export_tests {
+     use super::*;
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\exports.rs:1841:
+     /// Serializes tests that touch the global provider/session bindings.
+     static IMP09_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+     use crate::walker_protocol::{
+[31m-        encode_section, derive_session_id, MappingIdentityHeaderV2, ProbeResultV2,
+[0m[31m-        ResultSectionHeaderV2, WalkerParamsV2, CLASSIFICATION_TYPE_C, RESULT_FLAG_GUARD_SEEN,
+[0m[31m-        COMPLETED_FLAG_DONE, PROBE_RESULT_BYTES, WALKER_STATUS_ERROR_INTERNAL_PANIC,
+[0m[32m+        derive_session_id, encode_section, MappingIdentityHeaderV2, ProbeResultV2,
+[0m[32m+        ResultSectionHeaderV2, WalkerParamsV2, CLASSIFICATION_TYPE_C, COMPLETED_FLAG_DONE,
+[0m[32m+        PROBE_RESULT_BYTES, RESULT_FLAG_GUARD_SEEN, WALKER_STATUS_ERROR_INTERNAL_PANIC,
+[0m     };
+ 
+     fn nonce() -> u64 {
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\exports.rs:1951:
+         let _guard = IMP09_TEST_LOCK.lock().unwrap();
+         reset_walker_bindings();
+         unsafe {
+[31m-            assert_eq!(WalkerExecute(0x0000_1000_0000), MidaAntidebugError::NotImplemented.as_i32());
+[0m[32m+            assert_eq!(
+[0m[32m+                WalkerExecute(0x0000_1000_0000),
+[0m[32m+                MidaAntidebugError::NotImplemented.as_i32()
+[0m[32m+            );
+[0m         }
+     }
+ 
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\exports.rs:1958:
+     #[test]
+     fn walker_export_bad_va_is_invalid_argument() {
+         unsafe {
+[31m-            assert_eq!(WalkerExecute(0), MidaAntidebugError::InvalidArgument.as_i32());
+[0m[31m-            assert_eq!(WalkerExecute(0xFFFF_8000_0000_0000), MidaAntidebugError::InvalidArgument.as_i32());
+[0m[32m+            assert_eq!(
+[0m[32m+                WalkerExecute(0),
+[0m[32m+                MidaAntidebugError::InvalidArgument.as_i32()
+[0m[32m+            );
+[0m[32m+            assert_eq!(
+[0m[32m+                WalkerExecute(0xFFFF_8000_0000_0000),
+[0m[32m+                MidaAntidebugError::InvalidArgument.as_i32()
+[0m[32m+            );
+[0m         }
+     }
+ 
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\exports.rs:1984:
+         unsafe {
+             let r = WalkerExecute(params_va);
+             assert!(r != WALKER_STATUS_OK as i32, "got {r}");
+[31m-            assert!(r >= WALKER_STATUS_ERROR_BAD_PARAMS as i32 && r <= WALKER_STATUS_ERROR_INTERNAL_PANIC as i32, "got {r}");
+[0m[32m+            assert!(
+[0m[32m+                r >= WALKER_STATUS_ERROR_BAD_PARAMS as i32
+[0m[32m+                    && r <= WALKER_STATUS_ERROR_INTERNAL_PANIC as i32,
+[0m[32m+                "got {r}"
+[0m[32m+            );
+[0m         }
+     }
+ 
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\exports.rs:2024:
+         unsafe {
+             let r = WalkerExecute(params_va);
+             assert_ne!(r, WALKER_STATUS_OK as i32, "second call must reject");
+[31m-            assert_eq!(r, MidaAntidebugError::NotImplemented.as_i32(), "terminal session");
+[0m[32m+            assert_eq!(
+[0m[32m+                r,
+[0m[32m+                MidaAntidebugError::NotImplemented.as_i32(),
+[0m[32m+                "terminal session"
+[0m[32m+            );
+[0m         }
+     }
+ 
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\exports.rs:2052:
+         }
+         unsafe {
+             let r = WalkerExecute(params_va);
+[31m-            assert_eq!(r, MidaAntidebugError::NotImplemented.as_i32(), "terminal after abort");
+[0m[32m+            assert_eq!(
+[0m[32m+                r,
+[0m[32m+                MidaAntidebugError::NotImplemented.as_i32(),
+[0m[32m+                "terminal after abort"
+[0m[32m+            );
+[0m         }
+     }
+ 
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\exports.rs:2068:
+         }
+         let out = take_walker_output().expect("output channel must hold attestation");
+         out.validate().expect("anchored attestation must validate");
+[31m-        let w = out.walker_attestation.as_ref().expect("walker attestation present");
+[0m[32m+        let w = out
+[0m[32m+            .walker_attestation
+[0m[32m+            .as_ref()
+[0m[32m+            .expect("walker attestation present");
+[0m         assert_eq!(w.rounds.len(), 2);
+         assert_eq!(w.record_digest.len(), 64);
+         assert_eq!(w.target_pid, 4242);
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\exports.rs:2150:
+         IMP09_OUTPUT_SINK_FAIL.store(true, std::sync::atomic::Ordering::SeqCst);
+         unsafe {
+             let r = WalkerExecute(params_va);
+[31m-            assert_eq!(
+[0m[31m-                r,
+[0m[31m-                WALKER_STATUS_ERROR_INTERNAL_PANIC as i32,
+[0m[31m-                "got {r}",
+[0m[31m-            );
+[0m[32m+            assert_eq!(r, WALKER_STATUS_ERROR_INTERNAL_PANIC as i32, "got {r}",);
+[0m         }
+         assert_eq!(
+             lifecycle_get(),
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\exports.rs:2168:
+         // A second call must be rejected (terminal).
+         unsafe {
+             let r2 = WalkerExecute(params_va);
+[31m-            assert_eq!(
+[0m[31m-                r2,
+[0m[31m-                MidaAntidebugError::NotImplemented.as_i32(),
+[0m[31m-                "got {r2}",
+[0m[31m-            );
+[0m[32m+            assert_eq!(r2, MidaAntidebugError::NotImplemented.as_i32(), "got {r2}",);
+[0m         }
+         IMP09_OUTPUT_SINK_FAIL.store(false, std::sync::atomic::Ordering::SeqCst);
+     }
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\exports.rs:2254:
+         assert!(bind_walker_session(binding(params_va, section1_va)));
+         unsafe {
+             let r = WalkerExecute(params_va);
+[31m-            assert_eq!(
+[0m[31m-                r,
+[0m[31m-                MidaAntidebugError::InternalPanic.as_i32(),
+[0m[31m-                "got {r}",
+[0m[31m-            );
+[0m[32m+            assert_eq!(r, MidaAntidebugError::InternalPanic.as_i32(), "got {r}",);
+[0m         }
+         assert_eq!(
+             lifecycle_get(),
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\exports.rs:2271:
+         );
+         unsafe {
+             let r2 = WalkerExecute(params_va);
+[31m-            assert_eq!(
+[0m[31m-                r2,
+[0m[31m-                MidaAntidebugError::NotImplemented.as_i32(),
+[0m[31m-                "got {r2}",
+[0m[31m-            );
+[0m[32m+            assert_eq!(r2, MidaAntidebugError::NotImplemented.as_i32(), "got {r2}",);
+[0m         }
+     }
+ 
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\exports.rs:2521:
+             WalkerSessionLifecycle::Aborted,
+             "owner==target must fail closed",
+         );
+[31m-        assert!(
+[0m[31m-            take_walker_output().is_none(),
+[0m[31m-            "no output from aborted run",
+[0m[31m-        );
+[0m[32m+        assert!(take_walker_output().is_none(), "no output from aborted run",);
+[0m     }
+ 
+     #[test]
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\exports.rs:2586:
+             WalkerSessionLifecycle::Unbound,
+             "failed install leaves UNBOUND",
+         );
+[31m-        assert!(
+[0m[31m-            WALKER_SESSION.read().is_none(),
+[0m[31m-            "no session published",
+[0m[31m-        );
+[0m[32m+        assert!(WALKER_SESSION.read().is_none(), "no session published",);
+[0m     }
+ 
+     #[test]
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\exports.rs:2606:
+             WalkerSessionLifecycle::Unbound,
+             "no READY without provider",
+         );
+[31m-        assert!(
+[0m[31m-            WALKER_SESSION.read().is_none(),
+[0m[31m-            "no session published",
+[0m[31m-        );
+[0m[32m+        assert!(WALKER_SESSION.read().is_none(), "no session published",);
+[0m     }
+ 
+     #[test]
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\exports.rs:2664:
+         let (prov, params_va, section1_va) = setup_valid();
+         assert!(set_walker_provider(Box::new(prov)));
+         assert!(bind_walker_session(binding(params_va, section1_va)));
+[31m-        assert_eq!(
+[0m[31m-            lifecycle_get(),
+[0m[31m-            WalkerSessionLifecycle::Ready,
+[0m[31m-        );
+[0m[32m+        assert_eq!(lifecycle_get(), WalkerSessionLifecycle::Ready,);
+[0m         // Attempt replacement: must fail (lifecycle != UNBOUND).
+         let (prov2, _, _) = setup_valid();
+         assert!(!set_walker_provider(Box::new(prov2)), "READY rejects");
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\exports.rs:2684:
+         assert!(bind_walker_session(binding(params_va, section1_va)));
+         // Manually claim READY->RUNNING (as WalkerExecute would).
+         assert!(lifecycle_claim(), "claim to RUNNING");
+[31m-        assert_eq!(
+[0m[31m-            lifecycle_get(),
+[0m[31m-            WalkerSessionLifecycle::Running,
+[0m[31m-        );
+[0m[32m+        assert_eq!(lifecycle_get(), WalkerSessionLifecycle::Running,);
+[0m         let (prov2, _, _) = setup_valid();
+         assert!(!set_walker_provider(Box::new(prov2)), "RUNNING rejects");
+         // Restore for other tests.
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\exports.rs:2707:
+             let r = WalkerExecute(params_va);
+             assert_eq!(r, WALKER_STATUS_OK as i32, "got {r}");
+         }
+[31m-        assert_eq!(
+[0m[31m-            lifecycle_get(),
+[0m[31m-            WalkerSessionLifecycle::Completed,
+[0m[31m-        );
+[0m[32m+        assert_eq!(lifecycle_get(), WalkerSessionLifecycle::Completed,);
+[0m         let (prov2, _, _) = setup_valid();
+         assert!(!set_walker_provider(Box::new(prov2)), "terminal rejects");
+     }
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\lib.rs:55:
+ };
+ pub use exports::{
+     MidaAntidebugError, MidaAntidebugGetAttestation, MidaAntidebugInitialize,
+[31m-    MidaAntidebugInitializeV2, MidaAntidebugShutdown, WalkerExecute,
+[0m[31m-    ATTESTATION_BUFFER_SIZE, MAX_ATTESTATION_BYTES, V2_DIGEST_LEN,
+[0m[31m-    V2_ENVELOPE_MAGIC, V2_HEADER_BYTES, V2_MAX_HOOKS,
+[0m[32m+    MidaAntidebugInitializeV2, MidaAntidebugShutdown, WalkerExecute, ATTESTATION_BUFFER_SIZE,
+[0m[32m+    MAX_ATTESTATION_BYTES, V2_DIGEST_LEN, V2_ENVELOPE_MAGIC, V2_HEADER_BYTES, V2_MAX_HOOKS,
+[0m };
+ pub use provenance::{Provenance, ProvenanceError};
+ pub use surfaces::{
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\lib.rs:73:
+     ConsumedOutput, ConsumedRound, ConsumerFailure, ConsumerVerdict,
+ };
+ pub use walker_control::{
+[31m-    MemoryMapProvider, WalkerAbortReason, WalkerControlError, WalkerDigestAuthority,
+[0m[31m-    WalkerDriver, WalkerIoError, WalkerMemoryProvider, WalkerPhase, WalkerSession,
+[0m[32m+    MemoryMapProvider, WalkerAbortReason, WalkerControlError, WalkerDigestAuthority, WalkerDriver,
+[0m[32m+    WalkerIoError, WalkerMemoryProvider, WalkerPhase, WalkerSession,
+[0m };
+[31m-pub use walker_producer::{
+[0m[31m-    ProducedRound, ProducerError, ProducerPhase, SectionProducer,
+[0m[31m-};
+[0m[32m+pub use walker_producer::{ProducedRound, ProducerError, ProducerPhase, SectionProducer};
+[0m pub use walker_protocol::{
+[31m-    controller_read_completed_section, controller_read_section, controller_validate_entry,
+[0m[31m-    crc32, derive_session_id, encode_section, is_canonical_user_va, is_canonical_x64,
+[0m[31m-    page_span_fits, parse_section, validate_section, ControllerSectionView,
+[0m[31m-    IdentityExpectation, MappingIdentityHeaderV2, ProbeResultV2, ProtocolError,
+[0m[31m-    ResultSectionHeaderV2, WalkerParamsV2, ROUND1_DONE, ROUND2_DONE, ROUND_FLAGS_KNOWN,
+[0m[31m-    RESULT_HEADER_ROUND_FLAGS_OFF,
+[0m[32m+    controller_read_completed_section, controller_read_section, controller_validate_entry, crc32,
+[0m[32m+    derive_session_id, encode_section, is_canonical_user_va, is_canonical_x64, page_span_fits,
+[0m[32m+    parse_section, validate_section, ControllerSectionView, IdentityExpectation,
+[0m[32m+    MappingIdentityHeaderV2, ProbeResultV2, ProtocolError, ResultSectionHeaderV2, WalkerParamsV2,
+[0m[32m+    RESULT_HEADER_ROUND_FLAGS_OFF, ROUND1_DONE, ROUND2_DONE, ROUND_FLAGS_KNOWN,
+[0m };
+[32m+
+[0mDiff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_consumer.rs:43:
+     Protocol(ProtocolError),
+     Io(WalkerIoError),
+     Attestation(AttestationError),
+[31m-    RoundSequence { expected: u8, got: u8 },
+[0m[31m-    CountMismatch { got: usize, expected: u32 },
+[0m[31m-    CompletedFlag { got: u32 },
+[0m[31m-    RoundFlags { got: u16, expected: u16 },
+[0m[31m-    DigestMismatch { what: String, expected: String, got: String },
+[0m[32m+    RoundSequence {
+[0m[32m+        expected: u8,
+[0m[32m+        got: u8,
+[0m[32m+    },
+[0m[32m+    CountMismatch {
+[0m[32m+        got: usize,
+[0m[32m+        expected: u32,
+[0m[32m+    },
+[0m[32m+    CompletedFlag {
+[0m[32m+        got: u32,
+[0m[32m+    },
+[0m[32m+    RoundFlags {
+[0m[32m+        got: u16,
+[0m[32m+        expected: u16,
+[0m[32m+    },
+[0m[32m+    DigestMismatch {
+[0m[32m+        what: String,
+[0m[32m+        expected: String,
+[0m[32m+        got: String,
+[0m[32m+    },
+[0m     OutputMissing,
+     OutputDuplicate,
+[31m-    OutputTruncated { got: usize, expected: usize },
+[0m[32m+    OutputTruncated {
+[0m[32m+        got: usize,
+[0m[32m+        expected: usize,
+[0m[32m+    },
+[0m     OutputOutOfOrder,
+[31m-    RawStatus { got: u32 },
+[0m[32m+    RawStatus {
+[0m[32m+        got: u32,
+[0m[32m+    },
+[0m     NoWalkerAttestation,
+     NotV2,
+ }
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_consumer.rs:73:
+             Self::RoundFlags { got, expected } => {
+                 write!(f, "round flags 0x{got:04X} != expected 0x{expected:04X}")
+             }
+[31m-            Self::DigestMismatch { what, expected, got } => {
+[0m[32m+            Self::DigestMismatch {
+[0m[32m+                what,
+[0m[32m+                expected,
+[0m[32m+                got,
+[0m[32m+            } => {
+[0m                 write!(f, "digest mismatch ({what}): expected {expected} got {got}")
+             }
+             Self::OutputMissing => write!(f, "walker output missing"),
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_consumer.rs:147:
+     attestation_json: &str,
+ ) -> Result<ConsumedOutput, ConsumerFailure> {
+     // --- Gate: section bounds ---
+[31m-    let sec_end = section1_va
+[0m[31m-        .checked_add(section_bytes)
+[0m[31m-        .ok_or(ConsumerFailure::OutputTruncated {
+[0m[31m-            got: 0,
+[0m[31m-            expected: section_bytes as usize,
+[0m[31m-        })?;
+[0m[32m+    let sec_end =
+[0m[32m+        section1_va
+[0m[32m+            .checked_add(section_bytes)
+[0m[32m+            .ok_or(ConsumerFailure::OutputTruncated {
+[0m[32m+                got: 0,
+[0m[32m+                expected: section_bytes as usize,
+[0m[32m+            })?;
+[0m     if sec_end < section1_va {
+         return Err(ConsumerFailure::OutputTruncated {
+             got: 0,
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_consumer.rs:261:
+         });
+     }
+     // Payload digest gate: recompute CRC over the raw payload region.
+[31m-    let payload = &slot
+[0m[31m-        [crate::walker_protocol::IDENTITY_HEADER_BYTES
+[0m[31m-            + crate::walker_protocol::RESULT_HEADER_BYTES..];
+[0m[32m+    let payload = &slot[crate::walker_protocol::IDENTITY_HEADER_BYTES
+[0m[32m+        + crate::walker_protocol::RESULT_HEADER_BYTES..];
+[0m     let computed = crate::walker_protocol::crc32(payload);
+     if computed != header.payload_crc32 {
+         return Err(ConsumerFailure::DigestMismatch {
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_consumer.rs:392:
+         // digests recompute (mirrors the production anchor path).
+         use crate::attestation::{
+             AbortState, HookInventory, ProbeSummary, RoundLedger, RuntimeAttestationV2,
+[31m-            WalkerAttestation, ATTESTATION_SCHEMA_V2, ATTESTATION_SCHEMA_VERSION_V2, ARCH_X86_64,
+[0m[32m+            WalkerAttestation, ARCH_X86_64, ATTESTATION_SCHEMA_V2, ATTESTATION_SCHEMA_VERSION_V2,
+[0m         };
+         let mut r1 = RoundLedger::new(1).unwrap();
+         r1.entry_ts = "t1".to_string();
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_consumer.rs:462:
+     }
+ 
+     fn produce_full() -> (MemoryMapProvider, u64, u64) {
+[31m-        let mut p = SectionProducer::new(identity(), expectation(), cap(), base() + 0x1000)
+[0m[31m-            .unwrap();
+[0m[32m+        let mut p =
+[0m[32m+            SectionProducer::new(identity(), expectation(), cap(), base() + 0x1000).unwrap();
+[0m         p.publish_pending_header().unwrap();
+         p.publish_round1_done(&results()).unwrap();
+         p.publish_round2_done(&results()).unwrap();
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_consumer.rs:597:
+         )
+         .unwrap_err();
+         assert!(
+[31m-            matches!(err, ConsumerFailure::Protocol(ProtocolError::CrcMismatch { .. })),
+[0m[32m+            matches!(
+[0m[32m+                err,
+[0m[32m+                ConsumerFailure::Protocol(ProtocolError::CrcMismatch { .. })
+[0m[32m+            ),
+[0m             "expected CrcMismatch, got {err:?}"
+         );
+     }
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_consumer.rs:605:
+     #[test]
+     fn consumer_output_missing_fails() {
+         let (prov, s1, _s2) = produce_full();
+[31m-        let err = consume_produced_sections(
+[0m[31m-            &prov,
+[0m[31m-            s1,
+[0m[31m-            sec_bytes(),
+[0m[31m-            &expectation(),
+[0m[31m-            cap(),
+[0m[31m-            "",
+[0m[31m-        )
+[0m[31m-        .unwrap_err();
+[0m[32m+        let err = consume_produced_sections(&prov, s1, sec_bytes(), &expectation(), cap(), "")
+[0m[32m+            .unwrap_err();
+[0m         assert!(matches!(err, ConsumerFailure::OutputMissing));
+     }
+ 
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_consumer.rs:626:
+         let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+         v["profile_digest"] = serde_json::Value::String("dd".repeat(32));
+         let tampered = serde_json::to_string(&v).unwrap();
+[31m-        let err = consume_produced_sections(
+[0m[31m-            &prov,
+[0m[31m-            s1,
+[0m[31m-            sec_bytes(),
+[0m[31m-            &expectation(),
+[0m[31m-            cap(),
+[0m[31m-            &tampered,
+[0m[31m-        )
+[0m[31m-        .unwrap_err();
+[0m[32m+        let err =
+[0m[32m+            consume_produced_sections(&prov, s1, sec_bytes(), &expectation(), cap(), &tampered)
+[0m[32m+                .unwrap_err();
+[0m         assert!(
+             matches!(
+                 err,
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_consumer.rs:655:
+         // (encode rejects the inconsistent state, the wire can still carry it).
+         let mut slot1 = encode_section(&ident, &header, &results()).unwrap();
+         let status_off = crate::walker_protocol::IDENTITY_HEADER_BYTES + 0x1C;
+[31m-        slot1[status_off..status_off + 4]
+[0m[31m-            .copy_from_slice(&crate::walker_protocol::WALKER_STATUS_ERROR_PROBE_ABORTED.to_le_bytes());
+[0m[32m+        slot1[status_off..status_off + 4].copy_from_slice(
+[0m[32m+            &crate::walker_protocol::WALKER_STATUS_ERROR_PROBE_ABORTED.to_le_bytes(),
+[0m[32m+        );
+[0m         let mut prov = MemoryMapProvider::new();
+         prov.insert(base() + 0x1000, slot1);
+         let mut h2 = ResultSectionHeaderV2::new(sec_bytes(), cap()).unwrap();
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_control.rs:24:
+ //!   called by THIS module — the production caller — never only from
+ //!   `#[cfg(test)]`.
+ 
+[31m-use crate::attestation::{AbortState, AttestationError, ProbeSummary, RoundLedger, WalkerAttestation};
+[0m[32m+use crate::attestation::{
+[0m[32m+    AbortState, AttestationError, ProbeSummary, RoundLedger, WalkerAttestation,
+[0m[32m+};
+[0m use crate::walker_protocol::{
+     controller_read_completed_section, controller_read_section, controller_validate_entry,
+     derive_session_id, is_canonical_user_va, ControllerSectionView, IdentityExpectation,
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_control.rs:31:
+     ProtocolError, WalkerParamsV2, COMPLETED_FLAG_ABORT, COMPLETED_FLAG_DONE,
+[31m-    WALKER_STATUS_ERROR_BAD_PARAMS, WALKER_STATUS_ERROR_INTERNAL_PANIC, WALKER_STATUS_ERROR_MAP_FAILED,
+[0m[31m-    WALKER_STATUS_ERROR_PROBE_ABORTED, WALKER_STATUS_ERROR_VEH_FAILED, WALKER_STATUS_OK,
+[0m[32m+    WALKER_STATUS_ERROR_BAD_PARAMS, WALKER_STATUS_ERROR_INTERNAL_PANIC,
+[0m[32m+    WALKER_STATUS_ERROR_MAP_FAILED, WALKER_STATUS_ERROR_PROBE_ABORTED,
+[0m[32m+    WALKER_STATUS_ERROR_VEH_FAILED, WALKER_STATUS_OK,
+[0m };
+ 
+ /// Session lifecycle phases (closed set).
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_control.rs:109:
+     profile_digest: String,
+ }
+ 
+[31m-
+[0m /// Lowercase-only hex check (R3): digests are 64 lowercase `0-9a-f`.
+ /// Uppercase `A-F` is REJECTED (matches the sealed CLI authority which
+ /// always emits lowercase; a forged uppercase digest cannot pass).
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_control.rs:116:
+ fn is_lowercase_hex64(s: &str) -> bool {
+[31m-    s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+[0m[32m+    s.len() == 64
+[0m[32m+        && s.bytes()
+[0m[32m+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+[0m }
+ 
+ impl WalkerDigestAuthority {
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_control.rs:198:
+     }
+ }
+ 
+[31m-
+[0m /// Provider I/O error (closed set).
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub enum WalkerIoError {
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_control.rs:239:
+     Protocol(ProtocolError),
+     Attestation(AttestationError),
+     Io(WalkerIoError),
+[31m-    RoundSequence { expected: u8, got: u8 },
+[0m[31m-    CountMismatch { got: usize, expected: u32 },
+[0m[31m-    CompletedFlag { got: u32 },
+[0m[32m+    RoundSequence {
+[0m[32m+        expected: u8,
+[0m[32m+        got: u8,
+[0m[32m+    },
+[0m[32m+    CountMismatch {
+[0m[32m+        got: usize,
+[0m[32m+        expected: u32,
+[0m[32m+    },
+[0m[32m+    CompletedFlag {
+[0m[32m+        got: u32,
+[0m[32m+    },
+[0m     MissingSection,
+     MissingRounds,
+     MissingIdentity,
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_control.rs:248:
+     MissingDigest,
+     NotCompleted,
+     AlreadyAborted,
+[31m-    BlobBaseMismatch { expected: u64, got: u64 },
+[0m[32m+    BlobBaseMismatch {
+[0m[32m+        expected: u64,
+[0m[32m+        got: u64,
+[0m[32m+    },
+[0m     /// R5-R3: production consumer gate failure (round DONE audit or V2
+     /// attestation digest verification). Original error preserved.
+     Consumer(crate::walker_consumer::ConsumerFailure),
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_control.rs:328:
+ }
+ 
+ impl WalkerSession {
+[31m-    fn new(
+[0m[31m-        params: WalkerParamsV2,
+[0m[31m-        candidates: Vec<u64>,
+[0m[31m-        target_pid: u32,
+[0m[31m-        owner_pid: u32,
+[0m[31m-    ) -> Self {
+[0m[32m+    fn new(params: WalkerParamsV2, candidates: Vec<u64>, target_pid: u32, owner_pid: u32) -> Self {
+[0m         let nonce = params.result_nonce;
+         let session_id = derive_session_id(nonce, params.blob_base_va, params.candidate_count);
+         let result_capacity = params.candidate_count;
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_control.rs:448:
+     }
+ 
+     /// Begin a round (1 or 2). Any error aborts the session.
+[31m-    pub fn begin_round(&mut self, round_index: u8, wall_budget_ms: u64) -> Result<(), WalkerControlError> {
+[0m[32m+    pub fn begin_round(
+[0m[32m+        &mut self,
+[0m[32m+        round_index: u8,
+[0m[32m+        wall_budget_ms: u64,
+[0m[32m+    ) -> Result<(), WalkerControlError> {
+[0m         let expected = match round_index {
+             1 => WalkerPhase::Round1,
+             2 => WalkerPhase::Round2,
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_control.rs:497:
+             self.session.abort(WalkerAbortReason::BadParams);
+             return Err(WalkerControlError::Phase(self.session.phase));
+         }
+[31m-        let round_index = if self.session.phase == WalkerPhase::Round1 { 1 } else { 2 };
+[0m[32m+        let round_index = if self.session.phase == WalkerPhase::Round1 {
+[0m[32m+            1
+[0m[32m+        } else {
+[0m[32m+            2
+[0m[32m+        };
+[0m         let expected = IdentityExpectation {
+             nonce: self.session.nonce,
+             target_pid: self.session.target_pid,
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_control.rs:526:
+             return Err(WalkerControlError::MissingIdentity);
+         }
+         // REAL production call #2: the completed gate (P1-1 continued).
+[31m-        let view = match controller_read_completed_section(section, &expected, self.session.result_capacity) {
+[0m[32m+        let view = match controller_read_completed_section(
+[0m[32m+            section,
+[0m[32m+            &expected,
+[0m[32m+            self.session.result_capacity,
+[0m[32m+        ) {
+[0m             Ok(v) => v,
+             Err(e) => {
+                 self.session.abort(WalkerAbortReason::ProbeAborted);
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_control.rs:835:
+         };
+         let got = bytes.len().saturating_sub(off);
+         if got < want {
+[31m-            return Err(WalkerIoError::OutOfBounds {
+[0m[31m-                va,
+[0m[31m-                want,
+[0m[31m-                got,
+[0m[31m-            });
+[0m[32m+            return Err(WalkerIoError::OutOfBounds { va, want, got });
+[0m         }
+         buf.copy_from_slice(&bytes[off..off + want]);
+         Ok(())
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_control.rs:854:
+     use crate::attestation::{Orphan, OrphanKind, OrphanState};
+     use crate::walker_protocol::{
+         encode_section, MappingIdentityHeaderV2, ProbeResultV2, ResultSectionHeaderV2,
+[31m-        WalkerParamsV2, CLASSIFICATION_TYPE_C, RESULT_FLAG_GUARD_SEEN,
+[0m[31m-        COMPLETED_FLAG_DONE, PROBE_RESULT_BYTES,
+[0m[32m+        WalkerParamsV2, CLASSIFICATION_TYPE_C, COMPLETED_FLAG_DONE, PROBE_RESULT_BYTES,
+[0m[32m+        RESULT_FLAG_GUARD_SEEN,
+[0m     };
+ 
+     fn nonce() -> u64 {
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_control.rs:871:
+     }
+ 
+     fn params_blob(blob_base: u64, cand: &[u64], result_bytes: u64) -> Vec<u8> {
+[31m-        let p = WalkerParamsV2::new(
+[0m[31m-            blob_base,
+[0m[31m-            cand.len() as u32,
+[0m[31m-            0,
+[0m[31m-            16,
+[0m[31m-            nonce(),
+[0m[31m-            result_bytes,
+[0m[31m-        );
+[0m[32m+        let p = WalkerParamsV2::new(blob_base, cand.len() as u32, 0, 16, nonce(), result_bytes);
+[0m         p.to_blob_bytes(cand).unwrap()
+     }
+ 
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_control.rs:951:
+         prov.insert(blob_base, blob);
+         prov.insert(blob_base + 0x1000, s1);
+         prov.insert(blob_base + 0x2000, s2);
+[31m-        let driver = WalkerDriver::new(prov.clone(), &prov.regions[&blob_base], target_pid, owner_pid).unwrap();
+[0m[32m+        let driver = WalkerDriver::new(
+[0m[32m+            prov.clone(),
+[0m[32m+            &prov.regions[&blob_base],
+[0m[32m+            target_pid,
+[0m[32m+            owner_pid,
+[0m[32m+        )
+[0m[32m+        .unwrap();
+[0m         (prov, driver)
+     }
+ 
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_control.rs:978:
+         assert_eq!(d.session().rounds[1].round_index, 2);
+         assert!(!d.session().rounds[0].auto_retry);
+         assert!(!d.session().rounds[1].auto_retry);
+[31m-        let att = d
+[0m[31m-            .finalize_attestation(&authority())
+[0m[31m-            .unwrap();
+[0m[32m+        let att = d.finalize_attestation(&authority()).unwrap();
+[0m         assert_eq!(att.rounds.len(), 2);
+         assert_eq!(att.record_digest.len(), 64);
+         assert_eq!(att.compute_digest(), att.record_digest);
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_control.rs:1010:
+             session_id: sid,
+             section_bytes: sec_bytes,
+         };
+[31m-        let mut prod =
+[0m[31m-            SectionProducer::new(ident, expectation, cap, blob_base + 0x1000).unwrap();
+[0m[32m+        let mut prod = SectionProducer::new(ident, expectation, cap, blob_base + 0x1000).unwrap();
+[0m         prod.publish_pending_header().unwrap();
+         let results: Vec<ProbeResultV2> = cand
+             .iter()
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_control.rs:1033:
+         let mut prov = MemoryMapProvider::new();
+         prov.insert(blob_base, blob);
+         prov.insert(blob_base + 0x1000, prod.slot(1).unwrap().to_vec());
+[31m-        prov.insert(blob_base + 0x1000 + sec_bytes, prod.slot(2).unwrap().to_vec());
+[0m[32m+        prov.insert(
+[0m[32m+            blob_base + 0x1000 + sec_bytes,
+[0m[32m+            prod.slot(2).unwrap().to_vec(),
+[0m[32m+        );
+[0m         let mut d = WalkerDriver::new(
+             prov.clone(),
+             &prov.regions[&blob_base],
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_control.rs:1051:
+         d.begin_round(2, 1000).unwrap();
+         // Build a valid v2 attestation (reuse the consumer test helper shape).
+         let json = build_v2_attestation_for(sec_bytes, cap, target_pid, base());
+[31m-        let out = d.consume_production_output(blob_base + 0x1000, &json).unwrap();
+[0m[32m+        let out = d
+[0m[32m+            .consume_production_output(blob_base + 0x1000, &json)
+[0m[32m+            .unwrap();
+[0m         assert_eq!(out.rounds.len(), 2);
+         assert_eq!(out.rounds[0].round_index, 1);
+         assert_eq!(out.rounds[1].round_index, 2);
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_control.rs:1061:
+ 
+     /// Build a valid v2 attestation JSON for the driver test (mirrors the
+     /// production anchor path: walker_attestation + record_digest).
+[31m-    fn build_v2_attestation_for(sec_bytes: u64, cap: u32, target_pid: u32, module_base: u64) -> String {
+[0m[32m+    fn build_v2_attestation_for(
+[0m[32m+        sec_bytes: u64,
+[0m[32m+        cap: u32,
+[0m[32m+        target_pid: u32,
+[0m[32m+        module_base: u64,
+[0m[32m+    ) -> String {
+[0m         use crate::attestation::{
+             AbortState, HookInventory, ProbeSummary, RoundLedger, RuntimeAttestationV2,
+[31m-            WalkerAttestation, ATTESTATION_SCHEMA_V2, ATTESTATION_SCHEMA_VERSION_V2, ARCH_X86_64,
+[0m[32m+            WalkerAttestation, ARCH_X86_64, ATTESTATION_SCHEMA_V2, ATTESTATION_SCHEMA_VERSION_V2,
+[0m         };
+         let mut r1 = RoundLedger::new(1).unwrap();
+         r1.entry_ts = "t1".into();
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_control.rs:1159:
+         let (prov3, _) = full_two_round_flow();
+         let s2 = prov3.read_region(base() + 0x2000);
+         d.consume_section(&s2).unwrap();
+[31m-        let mut att = d
+[0m[31m-            .finalize_attestation(&authority())
+[0m[31m-            .unwrap();
+[0m[32m+        let mut att = d.finalize_attestation(&authority()).unwrap();
+[0m         att.record_digest = "0".repeat(64);
+         assert!(att.validate(4242, &"b".repeat(64), base()).is_err());
+     }
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_control.rs:1284:
+         let (prov3, _) = full_two_round_flow();
+         let s2 = prov3.read_region(base() + 0x2000);
+         d.consume_section(&s2).unwrap();
+[31m-        let att = d
+[0m[31m-            .finalize_attestation(&authority())
+[0m[31m-            .unwrap();
+[0m[32m+        let att = d.finalize_attestation(&authority()).unwrap();
+[0m         assert_eq!(att.compute_digest(), att.record_digest);
+         let mut bad = att.clone();
+         bad.record_digest = format!("{:064x}", 0xDEADBEEFu64);
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_control.rs:1304:
+         let (prov3, _) = full_two_round_flow();
+         let s2 = prov3.read_region(base() + 0x2000);
+         d.consume_section(&s2).unwrap();
+[31m-        let att = d
+[0m[31m-            .finalize_attestation(&authority())
+[0m[31m-            .unwrap();
+[0m[32m+        let att = d.finalize_attestation(&authority()).unwrap();
+[0m         let top = crate::attestation::RuntimeAttestationV2 {
+             schema: crate::attestation::ATTESTATION_SCHEMA_V2.to_string(),
+             schema_version: crate::attestation::ATTESTATION_SCHEMA_VERSION_V2,
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_control.rs:1389:
+     fn authority_validation_rejects_bad_digests() {
+         // P0-2: the sealed authority rejects non-64-hex digests / zero VAs /
+         // entry overflow at bind time.
+[31m-        assert!(WalkerDigestAuthority::new(
+[0m[31m-            "zz", "b", 1, 1, "p", "c"
+[0m[31m-        )
+[0m[31m-        .is_err());
+[0m[32m+        assert!(WalkerDigestAuthority::new("zz", "b", 1, 1, "p", "c").is_err());
+[0m         assert!(WalkerDigestAuthority::new(
+             &"a".repeat(64),
+             &"b".repeat(64),
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_producer.rs:43:
+ use crate::walker_protocol::{
+     crc32, encode_section, parse_section, validate_section, IdentityExpectation,
+     MappingIdentityHeaderV2, ProbeResultV2, ProtocolError, ResultSectionHeaderV2,
+[31m-    COMPLETED_FLAG_DONE, COMPLETED_FLAG_PENDING, IDENTITY_HEADER_BYTES,
+[0m[31m-    MAX_RESULT_SECTION_BYTES, MIN_SECTION_HEADER_BYTES, PROBE_RESULT_BYTES, RESULT_HEADER_BYTES,
+[0m[31m-    ROUND1_DONE, ROUND2_DONE,
+[0m[32m+    COMPLETED_FLAG_DONE, COMPLETED_FLAG_PENDING, IDENTITY_HEADER_BYTES, MAX_RESULT_SECTION_BYTES,
+[0m[32m+    MIN_SECTION_HEADER_BYTES, PROBE_RESULT_BYTES, RESULT_HEADER_BYTES, ROUND1_DONE, ROUND2_DONE,
+[0m };
+ 
+ /// Producer phase (closed set; mirrors the R5-R3 state machine).
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_producer.rs:148:
+                 write!(f, "round sequence mismatch: expected {expected} got {got}")
+             }
+             Self::DigestMismatch { expected, got } => {
+[31m-                write!(f, "payload digest mismatch: expected {expected:#010x} got {got:#010x}")
+[0m[32m+                write!(
+[0m[32m+                    f,
+[0m[32m+                    "payload digest mismatch: expected {expected:#010x} got {got:#010x}"
+[0m[32m+                )
+[0m             }
+             Self::Bounds { start, end, total } => {
+[31m-                write!(f, "bounds violation [{start:#x}, {end:#x}) vs total {total:#x}")
+[0m[32m+                write!(
+[0m[32m+                    f,
+[0m[32m+                    "bounds violation [{start:#x}, {end:#x}) vs total {total:#x}"
+[0m[32m+                )
+[0m             }
+             Self::AlreadyFailed => write!(f, "producer already failed; no further DONE"),
+         }
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_producer.rs:266:
+             return Err(ProducerError::BadState);
+         }
+         // Round-1 slot: PENDING identity + header, zero payload.
+[31m-        let header = ResultSectionHeaderV2::new(self.section_bytes, self.capacity)
+[0m[31m-            .map_err(|e| {
+[0m[32m+        let header =
+[0m[32m+            ResultSectionHeaderV2::new(self.section_bytes, self.capacity).map_err(|e| {
+[0m                 self.fail(ProducerError::Protocol(e.clone()));
+                 ProducerError::Protocol(e)
+             })?;
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_producer.rs:309:
+     /// records). The DONE header + payload are encoded, then the slot is
+     /// re-parsed and re-validated (identity binding, layout, CRC, round
+     /// flags) BEFORE the DONE is considered published.
+[31m-    pub fn publish_round1_done(
+[0m[31m-        &mut self,
+[0m[31m-        results: &[ProbeResultV2],
+[0m[31m-    ) -> Result<(), ProducerError> {
+[0m[32m+    pub fn publish_round1_done(&mut self, results: &[ProbeResultV2]) -> Result<(), ProducerError> {
+[0m         if self.failure.is_some() {
+             return Err(ProducerError::AlreadyFailed);
+         }
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_producer.rs:366:
+     ///
+     /// Only reachable after round-1 DONE. Same full audit as round 1, plus
+     /// the round-flags audit requires BOTH bits.
+[31m-    pub fn publish_round2_done(
+[0m[31m-        &mut self,
+[0m[31m-        results: &[ProbeResultV2],
+[0m[31m-    ) -> Result<(), ProducerError> {
+[0m[32m+    pub fn publish_round2_done(&mut self, results: &[ProbeResultV2]) -> Result<(), ProducerError> {
+[0m         if self.failure.is_some() {
+             return Err(ProducerError::AlreadyFailed);
+         }
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_producer.rs:508:
+ }
+ 
+ /// Re-export the wire constants used by the producer/consumer protocol.
+[31m-pub use crate::walker_protocol::{ROUND_FLAGS_KNOWN as PRODUCER_ROUND_FLAGS_KNOWN};
+[0m[32m+pub use crate::walker_protocol::ROUND_FLAGS_KNOWN as PRODUCER_ROUND_FLAGS_KNOWN;
+[0m 
+ #[cfg(test)]
+ mod tests {
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_producer.rs:590:
+         assert_eq!(rounds.len(), 3); // pending + round1 + round2
+         assert_eq!(rounds[1].round_index, 1);
+         assert_eq!(rounds[1].done_published, true);
+[31m-        assert_eq!(rounds[1].raw_status, COMPLETED_FLAG_DONE | ROUND1_DONE as u32);
+[0m[32m+        assert_eq!(
+[0m[32m+            rounds[1].raw_status,
+[0m[32m+            COMPLETED_FLAG_DONE | ROUND1_DONE as u32
+[0m[32m+        );
+[0m         assert_eq!(rounds[2].round_index, 2);
+         assert_eq!(rounds[2].done_published, true);
+         assert_eq!(
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_producer.rs:597:
+             rounds[2].raw_status,
+             COMPLETED_FLAG_DONE | (ROUND1_DONE | ROUND2_DONE) as u32
+         );
+[31m-        assert!(rounds[2].sequence > rounds[1].sequence, "monotonic sequence");
+[0m[32m+        assert!(
+[0m[32m+            rounds[2].sequence > rounds[1].sequence,
+[0m[32m+            "monotonic sequence"
+[0m[32m+        );
+[0m         assert_eq!(rounds[2].slot_va, p.slot_va(2).unwrap());
+     }
+ 
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_producer.rs:672:
+     fn bad_identity_section_bytes_rejected_at_new() {
+         let mut ident = identity();
+         ident.section_bytes = section_bytes() + 40;
+[31m-        let err = SectionProducer::new(ident, expectation(), capacity(), base() + 0x2000)
+[0m[31m-            .unwrap_err();
+[0m[32m+        let err =
+[0m[32m+            SectionProducer::new(ident, expectation(), capacity(), base() + 0x2000).unwrap_err();
+[0m         assert!(matches!(err, ProducerError::Bounds { .. }));
+     }
+ 
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_protocol.rs:323:
+             Self::Overflow => write!(f, "integer overflow in offset arithmetic"),
+             Self::CountTooLarge { got, max } => write!(f, "count {got} exceeds maximum {max}"),
+             Self::OutOfBounds { start, end, total } => {
+[31m-                write!(f, "region [{start:#x}, {end:#x}) out of bounds for total {total:#x}")
+[0m[32m+                write!(
+[0m[32m+                    f,
+[0m[32m+                    "region [{start:#x}, {end:#x}) out of bounds for total {total:#x}"
+[0m[32m+                )
+[0m             }
+             Self::NonCanonicalVa { va } => write!(f, "non-canonical x64 VA 0x{va:016X}"),
+             Self::ZeroVa { va } => write!(f, "VA 0x{va:016X} must not be zero"),
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_protocol.rs:337:
+             Self::ZeroNonce => write!(f, "nonce must not be zero"),
+             Self::BadResultBytes { got } => write!(f, "result_bytes {got} inconsistent"),
+             Self::BadBlobTotalBytes { got } => {
+[31m-                write!(f, "blob_total_bytes {got} inconsistent with header+candidates")
+[0m[32m+                write!(
+[0m[32m+                    f,
+[0m[32m+                    "blob_total_bytes {got} inconsistent with header+candidates"
+[0m[32m+                )
+[0m             }
+             Self::CrcMismatch { stored, computed } => {
+[31m-                write!(f, "header crc mismatch: stored 0x{stored:08X} computed 0x{computed:08X}")
+[0m[32m+                write!(
+[0m[32m+                    f,
+[0m[32m+                    "header crc mismatch: stored 0x{stored:08X} computed 0x{computed:08X}"
+[0m[32m+                )
+[0m             }
+             Self::UnknownOptionFlags { got } => write!(f, "unknown options flags 0x{got:04X}"),
+             Self::UnknownResultFlags { got } => write!(f, "unknown result flags 0x{got:02X}"),
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_protocol.rs:359:
+             ),
+             Self::UnknownWalkerStatus { got } => write!(f, "unknown walker_status {got}"),
+             Self::BadSectionBytes { got } => write!(f, "section_bytes {got} inconsistent"),
+[31m-            Self::IdentityMismatch { what, expected, got } => {
+[0m[31m-                write!(f, "identity mismatch: {what} expected 0x{expected:X} got 0x{got:X}")
+[0m[32m+            Self::IdentityMismatch {
+[0m[32m+                what,
+[0m[32m+                expected,
+[0m[32m+                got,
+[0m[32m+            } => {
+[0m[32m+                write!(
+[0m[32m+                    f,
+[0m[32m+                    "identity mismatch: {what} expected 0x{expected:X} got 0x{got:X}"
+[0m[32m+                )
+[0m             }
+             Self::SessionIdMismatch => write!(f, "session id mismatch"),
+             Self::CandidateCountMismatch { got, declared } => {
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_protocol.rs:367:
+[31m-                write!(f, "candidate count {got} does not match declared {declared}")
+[0m[32m+                write!(
+[0m[32m+                    f,
+[0m[32m+                    "candidate count {got} does not match declared {declared}"
+[0m[32m+                )
+[0m             }
+             Self::ResultCountExceedsCapacity { got, capacity } => {
+                 write!(f, "result count {got} exceeds capacity {capacity}")
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_protocol.rs:372:
+             Self::InconsistentPendingCount { got } => {
+                 write!(f, "pending section must have result_count 0, got {got}")
+             }
+[31m-            Self::BadRetryCount { got } => write!(f, "retry_count {got} exceeds contract maximum 1"),
+[0m[32m+            Self::BadRetryCount { got } => {
+[0m[32m+                write!(f, "retry_count {got} exceeds contract maximum 1")
+[0m[32m+            }
+[0m             Self::BadReserved { got } => write!(f, "reserved field must be zero, got 0x{got:08X}"),
+         }
+     }
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_protocol.rs:1274:
+ 
+     pub fn validate(&self) -> Result<(), ProtocolError> {
+         if !is_canonical_user_va(self.probe_va) {
+[31m-            return Err(ProtocolError::NonCanonicalVa {
+[0m[31m-                va: self.probe_va,
+[0m[31m-            });
+[0m[32m+            return Err(ProtocolError::NonCanonicalVa { va: self.probe_va });
+[0m         }
+         if self.classification > CLASSIFICATION_MAX {
+             return Err(ProtocolError::BadClassification {
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_protocol.rs:1294:
+             });
+         }
+         if self.retry_count > 1 {
+[31m-            return Err(ProtocolError::BadRetryCount { got: self.retry_count });
+[0m[32m+            return Err(ProtocolError::BadRetryCount {
+[0m[32m+                got: self.retry_count,
+[0m[32m+            });
+[0m         }
+         if self._reserved != 0 {
+             return Err(ProtocolError::BadReserved {
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_protocol.rs:1320:
+     // Identity: magic/version/reserved, section_bytes consistency (checked
+     // against header below), CRC over [0, 48) is recomputed at encode time.
+     if identity.magic != IDENTITY_MAGIC {
+[31m-        return Err(ProtocolError::BadMagic { got: identity.magic });
+[0m[32m+        return Err(ProtocolError::BadMagic {
+[0m[32m+            got: identity.magic,
+[0m[32m+        });
+[0m     }
+     if identity.version != PROTOCOL_VERSION {
+         return Err(ProtocolError::BadVersion {
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_protocol.rs:1618:
+ 
+ /// Controller entry gate: validate a params blob and extract the candidate
+ /// list. Fail-closed on every inconsistency.
+[31m-pub fn controller_validate_entry(
+[0m[31m-    blob: &[u8],
+[0m[31m-) -> Result<(WalkerParamsV2, Vec<u64>), ProtocolError> {
+[0m[32m+pub fn controller_validate_entry(blob: &[u8]) -> Result<(WalkerParamsV2, Vec<u64>), ProtocolError> {
+[0m     let (params, candidates) = WalkerParamsV2::from_blob_bytes(blob)?;
+     params.validate(&candidates)?;
+     // candidate count must match the declared count exactly (the decoder
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\src\walker_protocol.rs:1653:
+         });
+     }
+     let identity = MappingIdentityHeaderV2::from_bytes(&section[0..IDENTITY_HEADER_BYTES])?;
+[31m-    let header =
+[0m[31m-        ResultSectionHeaderV2::from_bytes(&section[IDENTITY_HEADER_BYTES..MIN_SECTION_HEADER_BYTES])?;
+[0m[32m+    let header = ResultSectionHeaderV2::from_bytes(
+[0m[32m+        &section[IDENTITY_HEADER_BYTES..MIN_SECTION_HEADER_BYTES],
+[0m[32m+    )?;
+[0m 
+     // --- validated-result: full section validation ---
+     // Rebuild the result records from the payload slice with bounded reads.
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\tests\attestation.rs:551:
+     }
+ }
+ 
+[31m-
+[0m[31m-
+[0m[31m-
+[0m // ----------------------------------------------------------------
+ // IMP-01-R1: attestation v2 (WO-1503 frozen contract)
+ // ----------------------------------------------------------------
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\tests\attestation.rs:783:
+     };
+     assert!(matches!(
+         s.validate(),
+[31m-        Err(mida_antidebug_runtime::attestation::AttestationError::ProbeSummaryTypeSumMismatch { .. })
+[0m[32m+        Err(
+[0m[32m+            mida_antidebug_runtime::attestation::AttestationError::ProbeSummaryTypeSumMismatch { .. }
+[0m[32m+        )
+[0m     ));
+ }
+ 
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\tests\attestation.rs:882:
+ #[test]
+ fn walker_attestation_binding_and_digest() {
+     let w = sample_walker_attestation();
+[31m-    w.validate(TEST_PID, &"a".repeat(64), TEST_MODULE_BASE).unwrap();
+[0m[32m+    w.validate(TEST_PID, &"a".repeat(64), TEST_MODULE_BASE)
+[0m[32m+        .unwrap();
+[0m     // tamper -> digest mismatch
+     let mut w2 = w.clone();
+     w2.probe_summary.av_count = 99;
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\tests\attestation.rs:907:
+     w.record_digest = w.compute_digest();
+     assert!(matches!(
+         w.validate(TEST_PID, &"a".repeat(64), TEST_MODULE_BASE),
+[31m-        Err(mida_antidebug_runtime::attestation::AttestationError::RoundSeqGap { expected: 1, got: 2 })
+[0m[32m+        Err(
+[0m[32m+            mida_antidebug_runtime::attestation::AttestationError::RoundSeqGap {
+[0m[32m+                expected: 1,
+[0m[32m+                got: 2
+[0m[32m+            }
+[0m[32m+        )
+[0m     ));
+ }
+ 
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\tests\attestation.rs:995:
+     assert!(parsed.validate().is_err());
+ }
+ 
+[31m-
+[0m // ---- IMP-01-R2: walker entry VA binding (WO-1503 §6.1) ----
+ 
+ #[test]
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\tests\attestation.rs:1002:
+ fn walker_entry_va_binding_valid() {
+     let w = sample_walker_attestation();
+     // valid: walker_entry_va == module_base + rva
+[31m-    w.validate(TEST_PID, &"a".repeat(64), TEST_MODULE_BASE).unwrap();
+[0m[32m+    w.validate(TEST_PID, &"a".repeat(64), TEST_MODULE_BASE)
+[0m[32m+        .unwrap();
+[0m }
+ 
+ #[test]
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\tests\walker_protocol.rs:5:
+ //! fixtures and reject rules. They do NOT verify any Windows behaviour.
+ 
+ use mida_antidebug_runtime::walker_protocol::{
+[31m-    crc32, derive_session_id, is_canonical_user_va, page_span_fits,
+[0m[31m-    MappingIdentityHeaderV2, ProbeResultV2, ProtocolError, ResultSectionHeaderV2,
+[0m[31m-    WalkerParamsV2, DEFAULT_PROBE_SPAN, MAX_CANDIDATE_COUNT, MIN_SECTION_HEADER_BYTES,
+[0m[31m-    OPTION_NONE, PARAMS_CRC_RANGE_END, PROBE_RESULT_BYTES,
+[0m[32m+    crc32, derive_session_id, is_canonical_user_va, page_span_fits, MappingIdentityHeaderV2,
+[0m[32m+    ProbeResultV2, ProtocolError, ResultSectionHeaderV2, WalkerParamsV2, DEFAULT_PROBE_SPAN,
+[0m[32m+    MAX_CANDIDATE_COUNT, MIN_SECTION_HEADER_BYTES, OPTION_NONE, PARAMS_CRC_RANGE_END,
+[0m[32m+    PROBE_RESULT_BYTES,
+[0m };
+ 
+ fn sample_nonce() -> u64 {
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\tests\walker_protocol.rs:40:
+     )
+ }
+ 
+[31m-
+[0m /// Standard CRC-32 check value.
+ #[test]
+ fn crc32_known_vector() {
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\tests\walker_protocol.rs:241:
+     let (mut d, c) = WalkerParamsV2::from_blob_bytes(&blob).unwrap();
+ 
+     d.magic = 0;
+[31m-    assert!(matches!(d.validate(&c), Err(ProtocolError::BadMagic { .. })));
+[0m[32m+    assert!(matches!(
+[0m[32m+        d.validate(&c),
+[0m[32m+        Err(ProtocolError::BadMagic { .. })
+[0m[32m+    ));
+[0m     let (d2, _) = WalkerParamsV2::from_blob_bytes(&blob).unwrap();
+     let mut d2 = d2;
+     d2.version = 1;
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\tests\walker_protocol.rs:248:
+[31m-    assert!(matches!(d2.validate(&c), Err(ProtocolError::BadVersion { .. })));
+[0m[32m+    assert!(matches!(
+[0m[32m+        d2.validate(&c),
+[0m[32m+        Err(ProtocolError::BadVersion { .. })
+[0m[32m+    ));
+[0m     let (d3, _) = WalkerParamsV2::from_blob_bytes(&blob).unwrap();
+     let mut d3 = d3;
+     d3.header_bytes = 0x20;
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\tests\walker_protocol.rs:252:
+[31m-    assert!(matches!(d3.validate(&c), Err(ProtocolError::BadHeaderBytes { .. })));
+[0m[32m+    assert!(matches!(
+[0m[32m+        d3.validate(&c),
+[0m[32m+        Err(ProtocolError::BadHeaderBytes { .. })
+[0m[32m+    ));
+[0m     let (d4, _) = WalkerParamsV2::from_blob_bytes(&blob).unwrap();
+     let mut d4 = d4;
+     d4.candidate_off = 0x50;
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\tests\walker_protocol.rs:299:
+         0x0102_0304_0506_0708
+     );
+     assert_eq!(u64::from_le_bytes(blob[48..56].try_into().unwrap()), 0x88);
+[31m-    assert_eq!(u64::from_le_bytes(blob[0x40..0x48].try_into().unwrap()), 0x1000);
+[0m[32m+    assert_eq!(
+[0m[32m+        u64::from_le_bytes(blob[0x40..0x48].try_into().unwrap()),
+[0m[32m+        0x1000
+[0m[32m+    );
+[0m     let crc = u32::from_le_bytes(blob[56..60].try_into().unwrap());
+     assert_ne!(crc, 0);
+     let again = p.to_blob_bytes(&cands).unwrap();
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\tests\walker_protocol.rs:397:
+     }
+ }
+ 
+[31m-
+[0m // ----------------------------------------------------------------
+ // IMP-02: validated controller API (pure offline)
+ // ----------------------------------------------------------------
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\tests\walker_protocol.rs:558:
+     assert!(matches!(err, ProtocolError::CrcMismatch { .. }));
+ }
+ 
+[31m-
+[0m // ----------------------------------------------------------------
+ // IMP-02-R1: CRC-first order hostile tests
+ // ----------------------------------------------------------------
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\tests\walker_protocol.rs:616:
+     let latency_off = MIN_SECTION_HEADER_BYTES + 0x20;
+     let mut tampered = section.clone();
+     tampered[latency_off] ^= 0x01; // latency_us LSB flip
+[31m-    // Raw CRC mismatch (CRC-first) -> reject before any field semantics.
+[0m[32m+                                   // Raw CRC mismatch (CRC-first) -> reject before any field semantics.
+[0m     assert!(matches!(
+         controller_read_section(&tampered, &expected, 1),
+         Err(ProtocolError::CrcMismatch { .. })
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\tests\walker_protocol_section.rs:3:
+ 
+ use mida_antidebug_runtime::walker_protocol::{
+     derive_session_id, encode_section, parse_section, validate_section, IdentityExpectation,
+[31m-    MappingIdentityHeaderV2, ProbeResultV2, ProtocolError, ResultSectionHeaderV2,
+[0m[31m-    WalkerParamsV2, CLASSIFICATION_TYPE_B, CLASSIFICATION_TYPE_C, COMPLETED_FLAG_ABORT,
+[0m[31m-    COMPLETED_FLAG_DONE,
+[0m[32m+    MappingIdentityHeaderV2, ProbeResultV2, ProtocolError, ResultSectionHeaderV2, WalkerParamsV2,
+[0m[32m+    CLASSIFICATION_TYPE_B, CLASSIFICATION_TYPE_C, COMPLETED_FLAG_ABORT, COMPLETED_FLAG_DONE,
+[0m     COMPLETED_FLAG_PENDING, PROBE_RESULT_BYTES, RESULT_FLAG_GUARD_SEEN, RESULT_FLAG_NONE,
+[31m-    WALKER_STATUS_ERROR_MAP_FAILED, WALKER_STATUS_ERROR_PROBE_ABORTED,
+[0m[31m-    WALKER_STATUS_OK,
+[0m[32m+    WALKER_STATUS_ERROR_MAP_FAILED, WALKER_STATUS_ERROR_PROBE_ABORTED, WALKER_STATUS_OK,
+[0m };
+ 
+ fn sample_nonce() -> u64 {
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\tests\walker_protocol_section.rs:157:
+     // size 0x28): the trailing zero-fill is outside payload CRC coverage.
+     let payload_off = 0x60usize;
+     bytes[payload_off] ^= 0xFF;
+[31m-    let res = parse_section(&bytes).and_then(|(i, h, r2)| {
+[0m[31m-        validate_section(&i, &h, &r2, &sample_expectation(), cap)
+[0m[31m-    });
+[0m[32m+    let res = parse_section(&bytes)
+[0m[32m+        .and_then(|(i, h, r2)| validate_section(&i, &h, &r2, &sample_expectation(), cap));
+[0m     assert!(matches!(res, Err(ProtocolError::CrcMismatch { .. })));
+ }
+ 
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\tests\walker_protocol_section.rs:279:
+         0,
+     );
+     let res = p.to_blob_bytes(&[]).and_then(|b| {
+[31m-        let (d, c) = mida_antidebug_runtime::walker_protocol::WalkerParamsV2::from_blob_bytes(&b)
+[0m[31m-            .unwrap();
+[0m[32m+        let (d, c) =
+[0m[32m+            mida_antidebug_runtime::walker_protocol::WalkerParamsV2::from_blob_bytes(&b).unwrap();
+[0m         d.validate(&c)
+     });
+     assert!(res.is_err());
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\tests\walker_protocol_section.rs:313:
+ 
+     let mut h = hdr;
+     h.completed_flag = 0x1234_5678;
+[31m-    assert!(matches!(h.validate_layout(), Err(ProtocolError::BadCompletedFlag { .. })));
+[0m[32m+    assert!(matches!(
+[0m[32m+        h.validate_layout(),
+[0m[32m+        Err(ProtocolError::BadCompletedFlag { .. })
+[0m[32m+    ));
+[0m 
+     let mut h = hdr;
+     h.completed_flag = COMPLETED_FLAG_ABORT;
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\tests\walker_protocol_section.rs:320:
+     h.walker_status = WALKER_STATUS_OK; // abort requires non-OK status
+[31m-    assert!(matches!(h.validate_layout(), Err(ProtocolError::BadStatusForState { .. })));
+[0m[32m+    assert!(matches!(
+[0m[32m+        h.validate_layout(),
+[0m[32m+        Err(ProtocolError::BadStatusForState { .. })
+[0m[32m+    ));
+[0m 
+     let mut h = hdr;
+     h.completed_flag = COMPLETED_FLAG_PENDING;
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\tests\walker_protocol_section.rs:325:
+     h.walker_status = WALKER_STATUS_ERROR_MAP_FAILED;
+[31m-    assert!(matches!(h.validate_layout(), Err(ProtocolError::BadStatusForState { .. })));
+[0m[32m+    assert!(matches!(
+[0m[32m+        h.validate_layout(),
+[0m[32m+        Err(ProtocolError::BadStatusForState { .. })
+[0m[32m+    ));
+[0m 
+     let mut h = hdr;
+     h.walker_status = 99;
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\tests\walker_protocol_section.rs:330:
+[31m-    assert!(matches!(h.validate_layout(), Err(ProtocolError::UnknownWalkerStatus { .. })));
+[0m[32m+    assert!(matches!(
+[0m[32m+        h.validate_layout(),
+[0m[32m+        Err(ProtocolError::UnknownWalkerStatus { .. })
+[0m[32m+    ));
+[0m 
+     let mut h = hdr;
+     h.result_stride = 8;
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\tests\walker_protocol_section.rs:334:
+[31m-    assert!(matches!(h.validate_layout(), Err(ProtocolError::BadResultStride { .. })));
+[0m[32m+    assert!(matches!(
+[0m[32m+        h.validate_layout(),
+[0m[32m+        Err(ProtocolError::BadResultStride { .. })
+[0m[32m+    ));
+[0m 
+     let mut h = hdr;
+     h.results_off = 8;
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\tests\walker_protocol_section.rs:338:
+[31m-    assert!(matches!(h.validate_layout(), Err(ProtocolError::ResultsOffTooSmall { .. })));
+[0m[32m+    assert!(matches!(
+[0m[32m+        h.validate_layout(),
+[0m[32m+        Err(ProtocolError::ResultsOffTooSmall { .. })
+[0m[32m+    ));
+[0m 
+     let mut h = hdr;
+     h.results_off = 100; // not 8-aligned
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\tests\walker_protocol_section.rs:342:
+[31m-    assert!(matches!(h.validate_layout(), Err(ProtocolError::ResultsOffUnaligned { .. })));
+[0m[32m+    assert!(matches!(
+[0m[32m+        h.validate_layout(),
+[0m[32m+        Err(ProtocolError::ResultsOffUnaligned { .. })
+[0m[32m+    ));
+[0m }
+ 
+ // =========================================================================
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\tests\walker_protocol_section.rs:363:
+     blob[32..34].copy_from_slice(&8u16.to_le_bytes());
+     blob[34..36].copy_from_slice(&16u16.to_le_bytes());
+     blob[40..48].copy_from_slice(&1u64.to_le_bytes()); // nonce
+[31m-    let r = std::panic::catch_unwind(|| {
+[0m[31m-        WalkerParamsV2::from_blob_bytes(&blob)
+[0m[31m-    });
+[0m[32m+    let r = std::panic::catch_unwind(|| WalkerParamsV2::from_blob_bytes(&blob));
+[0m     assert!(r.is_ok(), "from_blob_bytes panicked on hostile count");
+     assert!(matches!(
+         r.unwrap(),
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\tests\walker_protocol_section.rs:388:
+     blob[40..48].copy_from_slice(&1u64.to_le_bytes());
+     let r = std::panic::catch_unwind(|| WalkerParamsV2::from_blob_bytes(&blob));
+     assert!(r.is_ok());
+[31m-    assert!(matches!(r.unwrap(), Err(ProtocolError::BadCandidateOff { .. })));
+[0m[32m+    assert!(matches!(
+[0m[32m+        r.unwrap(),
+[0m[32m+        Err(ProtocolError::BadCandidateOff { .. })
+[0m[32m+    ));
+[0m 
+     let mut blob = vec![0u8; 0x40 + 8];
+     blob[0..4].copy_from_slice(b"WALK");
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\tests\walker_protocol_section.rs:402:
+     blob[40..48].copy_from_slice(&1u64.to_le_bytes());
+     let r = std::panic::catch_unwind(|| WalkerParamsV2::from_blob_bytes(&blob));
+     assert!(r.is_ok());
+[31m-    assert!(matches!(r.unwrap(), Err(ProtocolError::BadCandidateStride { .. })));
+[0m[32m+    assert!(matches!(
+[0m[32m+        r.unwrap(),
+[0m[32m+        Err(ProtocolError::BadCandidateStride { .. })
+[0m[32m+    ));
+[0m }
+ 
+ /// parse_section with result_count = u32::MAX (or over cap) must reject
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\tests\walker_protocol_section.rs:440:
+     hostile[soff..soff + 4].copy_from_slice(&0u32.to_le_bytes());
+     let r = std::panic::catch_unwind(|| parse_section(&hostile));
+     assert!(r.is_ok());
+[31m-    assert!(matches!(r.unwrap(), Err(ProtocolError::BadResultStride { .. })));
+[0m[32m+    assert!(matches!(
+[0m[32m+        r.unwrap(),
+[0m[32m+        Err(ProtocolError::BadResultStride { .. })
+[0m[32m+    ));
+[0m 
+     // result_stride = 1 -> BadResultStride.
+     let mut hostile = bytes.clone();
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\tests\walker_protocol_section.rs:447:
+     hostile[soff..soff + 4].copy_from_slice(&1u32.to_le_bytes());
+     let r = std::panic::catch_unwind(|| parse_section(&hostile));
+     assert!(r.is_ok());
+[31m-    assert!(matches!(r.unwrap(), Err(ProtocolError::BadResultStride { .. })));
+[0m[32m+    assert!(matches!(
+[0m[32m+        r.unwrap(),
+[0m[32m+        Err(ProtocolError::BadResultStride { .. })
+[0m[32m+    ));
+[0m }
+ 
+ /// parse_section with section_bytes beyond the hard cap must reject, and
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\tests\walker_protocol_section.rs:469:
+     let mut hostile_hdr = hdr;
+     hostile_hdr.section_bytes = big;
+     let r = std::panic::catch_unwind(|| encode_section(&ident, &hostile_hdr, &[]));
+[31m-    assert!(r.is_ok(), "encode_section panicked on hostile section_bytes");
+[0m[32m+    assert!(
+[0m[32m+        r.is_ok(),
+[0m[32m+        "encode_section panicked on hostile section_bytes"
+[0m[32m+    );
+[0m     assert!(matches!(
+         r.unwrap(),
+         Err(ProtocolError::CountTooLarge { .. }) | Err(ProtocolError::BadSectionBytes { .. })
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\tests\walker_protocol_section.rs:618:
+     let mut hdr = ResultSectionHeaderV2::new(section_bytes, cap).unwrap();
+     hdr.results_off = 100; // not 8-aligned
+     let res = encode_section(&ident, &hdr, &[]);
+[31m-    assert!(matches!(res, Err(ProtocolError::ResultsOffUnaligned { .. })));
+[0m[32m+    assert!(matches!(
+[0m[32m+        res,
+[0m[32m+        Err(ProtocolError::ResultsOffUnaligned { .. })
+[0m[32m+    ));
+[0m }
+ 
+ /// Header with invalid completed_flag / status consistency must be rejected
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\tests\walker_protocol_section.rs:718:
+     ));
+ 
+     // Non-canonical probe VA must be rejected.
+[31m-    let r = make_probe(0xFFFF_8000_0000_0000, CLASSIFICATION_TYPE_C, RESULT_FLAG_NONE, 0, 0);
+[0m[32m+    let r = make_probe(
+[0m[32m+        0xFFFF_8000_0000_0000,
+[0m[32m+        CLASSIFICATION_TYPE_C,
+[0m[32m+        RESULT_FLAG_NONE,
+[0m[32m+        0,
+[0m[32m+        0,
+[0m[32m+    );
+[0m     assert!(matches!(
+         encode_section(&ident, &hdr, &[r]),
+         Err(ProtocolError::NonCanonicalVa { .. })
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\tests\walker_protocol_section.rs:769:
+     for span in [1u16, 15, 17, 64] {
+         let mut hostile = bytes.clone();
+         hostile[span_off..span_off + 2].copy_from_slice(&span.to_le_bytes());
+[31m-        let res = parse_section(&hostile).and_then(|(i, h, r2)| {
+[0m[31m-            validate_section(&i, &h, &r2, &sample_expectation(), cap)
+[0m[31m-        });
+[0m[32m+        let res = parse_section(&hostile)
+[0m[32m+            .and_then(|(i, h, r2)| validate_section(&i, &h, &r2, &sample_expectation(), cap));
+[0m         assert!(
+             matches!(res, Err(ProtocolError::BadProbeSpan { .. })),
+             "hostile span {span} must be rejected"
+Diff in \\?\D:\Claude project\magicmida-rs\crates\antidebug-runtime\tests\walker_protocol_section.rs:791:
+     hdr.completed_flag = COMPLETED_FLAG_DONE;
+     let results = vec![
+         make_probe(0x1000, CLASSIFICATION_TYPE_C, RESULT_FLAG_NONE, 0, 0xAA),
+[31m-        make_probe(0x2000, CLASSIFICATION_TYPE_B, RESULT_FLAG_GUARD_SEEN, 1, 0xBB),
+[0m[32m+        make_probe(
+[0m[32m+            0x2000,
+[0m[32m+            CLASSIFICATION_TYPE_B,
+[0m[32m+            RESULT_FLAG_GUARD_SEEN,
+[0m[32m+            1,
+[0m[32m+            0xBB,
+[0m[32m+        ),
+[0m     ];
+     let bytes = encode_section(&ident, &hdr, &results).unwrap();
+     assert_eq!(bytes.len(), section_bytes as usize);
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\antidebug_controller.rs:1341:
+         };
+         self.record_walker_event(
+             "execute_exit",
+[31m-            Some(format!("outcome={}", execute_outcome_name(&execute_outcome))),
+[0m[32m+            Some(format!(
+[0m[32m+                "outcome={}",
+[0m[32m+                execute_outcome_name(&execute_outcome)
+[0m[32m+            )),
+[0m             raw_status,
+         );
+         log::log(
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\mod.rs:42:
+ mod post_loop;
+ mod relocation_evidence;
+ pub mod runtime_loader;
+[31m-pub mod walker_session;
+[0m mod section_rebuild_evidence;
+ mod session;
+ pub(crate) mod sidecar_io;
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\mod.rs:49:
+ mod tls_evidence;
+ mod verify;
+[32m+pub mod walker_session;
+[0m 
+ #[cfg(test)]
+ mod production_e2e;
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\mod.rs:562:
+         // IMP-09-PROFILE-SOURCE-R1: profile id/digest come from the sealed
+         // verified carrier (attestation-bound). No preflight/profile ->
+         // None -> the loader fails closed (no bare-string substitution).
+[31m-        let profile_carrier = evidence_ctx
+[0m[31m-            .as_ref()
+[0m[31m-            .and_then(|ctx| ctx.profile_identity());
+[0m[32m+        let profile_carrier = evidence_ctx.as_ref().and_then(|ctx| ctx.profile_identity());
+[0m         let outcome = crate::unpacker::runtime_loader::run_runtime_loader(
+             dbg.process_handle(),
+             dbg.pid(),
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\mod.rs:577:
+                 LogType::Info,
+                 &format!(
+                     "post-attach runtime loader (pre-resume): module_base={:#x} target_pid={}",
+[31m-                    loader_result.module_base(), loader_result.target_pid()
+[0m[32m+                    loader_result.module_base(),
+[0m[32m+                    loader_result.target_pid()
+[0m                 ),
+             ),
+             Err(e) => log::log(
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\mod.rs:1314:
+                     let loader_outcome = crate::unpacker::runtime_loader::run_runtime_loader(
+                         target_handle,
+                         pid,
+[31m-                        evidence_ctx
+[0m[31m-                            .as_ref()
+[0m[31m-                            .and_then(|ctx| ctx.profile_identity()),
+[0m[32m+                        evidence_ctx.as_ref().and_then(|ctx| ctx.profile_identity()),
+[0m                         &mut drain,
+                     );
+                     match loader_outcome {
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:290:
+         return 0;
+     }
+     // PE32+ optional header: SizeOfImage at optional+0x50 = pe_off+0x68.
+[31m-    let size_of_image =
+[0m[31m-        u32::from_le_bytes(bytes[pe_off + 0x68..pe_off + 0x6C].try_into().unwrap_or([0u8; 4]));
+[0m[32m+    let size_of_image = u32::from_le_bytes(
+[0m[32m+        bytes[pe_off + 0x68..pe_off + 0x6C]
+[0m[32m+            .try_into()
+[0m[32m+            .unwrap_or([0u8; 4]),
+[0m[32m+    );
+[0m     if size_of_image < 0x1000 {
+         return 0;
+     }
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:1216:
+             )));
+         }
+         // Fixed 60s production deadline (same as thunk_call).
+[31m-        let (result, _addr, thread_handle) = unsafe {
+[0m[31m-            self.thunk_call_tracked_with_handle_code(target, args, 60, drain, &thunk)
+[0m[31m-        };
+[0m[32m+        let (result, _addr, thread_handle) =
+[0m[32m+            unsafe { self.thunk_call_tracked_with_handle_code(target, args, 60, drain, &thunk) };
+[0m         if let Some(h) = thread_handle {
+             // SAFETY: h is a valid owned handle from into_raw(); no double
+             // close (the guard was forgotten by into_raw).
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:1708:
+         let init_args = if require_digest {
+             ThunkArgs {
+                 fn_ptr: exports.initialize_v2.unwrap_or(0) as u64,
+[31m-                arg0: remote_params as u64,      // params
+[0m[31m-                arg1: params_bytes.len() as u64, // params_bytes
+[0m[31m-                arg2: echo_addr as u64,          // out_runtime_sha256
+[0m[31m-                arg3: 64,                        // out_runtime_sha256_len
+[0m[31m-                arg4: remote_att as u64,         // out_attestation_json
+[0m[31m-                arg5: att_buf_len as u64,        // out_attestation_len
+[0m[32m+                arg0: remote_params as u64,        // params
+[0m[32m+                arg1: params_bytes.len() as u64,   // params_bytes
+[0m[32m+                arg2: echo_addr as u64,            // out_runtime_sha256
+[0m[32m+                arg3: 64,                          // out_runtime_sha256_len
+[0m[32m+                arg4: remote_att as u64,           // out_attestation_json
+[0m[32m+                arg5: att_buf_len as u64,          // out_attestation_len
+[0m                 reserved: att_written_addr as u64, // out_attestation_written (7th arg)
+             }
+         } else {
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:1720:
+             ThunkArgs {
+                 fn_ptr: exports.initialize.unwrap_or(0) as u64,
+                 arg0: remote_params as u64,
+[31m-                arg1: remote_att as u64,  // out_runtime_sha256 (unused by loader)
+[0m[31m-                arg2: 64,                 // out_runtime_sha256_len
+[0m[31m-                arg3: remote_att as u64,  // out_attestation_json
+[0m[32m+                arg1: remote_att as u64, // out_runtime_sha256 (unused by loader)
+[0m[32m+                arg2: 64,                // out_runtime_sha256_len
+[0m[32m+                arg3: remote_att as u64, // out_attestation_json
+[0m                 arg4: att_buf_len as u64, // out_attestation_len
+                 arg5: att_written_addr as u64, // out_attestation_written
+                 reserved: 0,
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:1855:
+         // IMP-06-R2: the authority is built via the sealed manifest
+         // constructor, which binds the identity to THIS manifest (artifact id
+         // + digest + size + architecture) and re-validates the digest.
+[31m-        let digest_authority = RuntimeAuthorityManifest::digest_authority_for(
+[0m[31m-            &self.authority,
+[0m[31m-            &identity,
+[0m[31m-        )?;
+[0m[32m+        let digest_authority =
+[0m[32m+            RuntimeAuthorityManifest::digest_authority_for(&self.authority, &identity)?;
+[0m 
+         // IMP-08-R1 requirement 9: the production path MUST verify the
+         // runtime echo against the digest authority. The three-way check:
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:1872:
+                     "digest echo missing in digest-required mode".to_string(),
+                 )
+             })?;
+[31m-            digest_authority.verify_runtime_echo(echo).map_err(|e| {
+[0m[31m-                RuntimeLoadError::DigestEchoMismatch(e.to_string())
+[0m[31m-            })?;
+[0m[32m+            digest_authority
+[0m[32m+                .verify_runtime_echo(echo)
+[0m[32m+                .map_err(|e| RuntimeLoadError::DigestEchoMismatch(e.to_string()))?;
+[0m             if parsed.runtime_sha256 != digest_authority.digest_value() {
+                 return Err(RuntimeLoadError::DigestEchoMismatch(format!(
+                     "attestation.runtime_sha256 {} != digest {}",
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:1969:
+         // PE32 and PE32+ (pe+0x18+0x50 = pe+0x68). A zero or absurdly small
+         // SizeOfImage fails closed: every export RVA must fit inside the
+         // module image envelope.
+[31m-        let image_size =
+[0m[31m-            u32::from_le_bytes([pe[0x68], pe[0x69], pe[0x6A], pe[0x6B]]) as usize;
+[0m[32m+        let image_size = u32::from_le_bytes([pe[0x68], pe[0x69], pe[0x6A], pe[0x6B]]) as usize;
+[0m         if image_size == 0 || image_size < 0x1000 {
+             return Err(RuntimeLoadError::ExportResolutionFailed(format!(
+                 "remote image SizeOfImage invalid: {image_size:#x}"
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:2001:
+         // IMP-08-R1-R1 (P0-1): the export directory itself must fit inside
+         // the image envelope before any remote read.
+         let exp_end = exp_rva.checked_add(exp_size).ok_or_else(|| {
+[31m-            RuntimeLoadError::ExportResolutionFailed(
+[0m[31m-                "export directory range overflow".to_string(),
+[0m[31m-            )
+[0m[32m+            RuntimeLoadError::ExportResolutionFailed("export directory range overflow".to_string())
+[0m         })?;
+         if exp_rva >= image_size || exp_end > image_size {
+             return Err(RuntimeLoadError::ExportResolutionFailed(format!(
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:2023:
+         let win = exp_size.min(0x10000);
+         let mut ed = vec![0u8; win];
+         let ed_va = module_base.checked_add(exp_rva).ok_or_else(|| {
+[31m-            RuntimeLoadError::ExportResolutionFailed(
+[0m[31m-                "export directory VA overflow".to_string(),
+[0m[31m-            )
+[0m[32m+            RuntimeLoadError::ExportResolutionFailed("export directory VA overflow".to_string())
+[0m         })?;
+         let rd3 = unsafe {
+             RPM(
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:2062:
+                 "export name array too large".to_string(),
+             ));
+         }
+[31m-        if names_rva >= image_size || names_rva.checked_add(names_bytes).map_or(true, |end| end > image_size) {
+[0m[32m+        if names_rva >= image_size
+[0m[32m+            || names_rva
+[0m[32m+                .checked_add(names_bytes)
+[0m[32m+                .map_or(true, |end| end > image_size)
+[0m[32m+        {
+[0m             return Err(RuntimeLoadError::ExportResolutionFailed(format!(
+                 "export name array outside image envelope: rva={names_rva:#x} bytes={names_bytes:#x} image={image_size:#x}"
+             )));
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:2089:
+         // (PE32+/PE32 IMAGE_EXPORT_DIRECTORY.NumberOfNames counts ordinal
+         // array slots; each slot is a u16.)
+         let ords_bytes = num_names.checked_mul(2).ok_or_else(|| {
+[31m-            RuntimeLoadError::ExportResolutionFailed("export ordinal array size overflow".to_string())
+[0m[32m+            RuntimeLoadError::ExportResolutionFailed(
+[0m[32m+                "export ordinal array size overflow".to_string(),
+[0m[32m+            )
+[0m         })?;
+         if ords_bytes > 0x8000 {
+             return Err(RuntimeLoadError::ExportResolutionFailed(
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:2096:
+                 "export ordinal array too large".to_string(),
+             ));
+         }
+[31m-        if ords_rva >= image_size || ords_rva.checked_add(ords_bytes).map_or(true, |end| end > image_size) {
+[0m[32m+        if ords_rva >= image_size
+[0m[32m+            || ords_rva
+[0m[32m+                .checked_add(ords_bytes)
+[0m[32m+                .map_or(true, |end| end > image_size)
+[0m[32m+        {
+[0m             return Err(RuntimeLoadError::ExportResolutionFailed(format!(
+                 "export ordinal array outside image envelope: rva={ords_rva:#x} bytes={ords_bytes:#x} image={image_size:#x}"
+             )));
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:2124:
+         // IMP-08-R1-R1 (P0-1): the function array itself must fit inside
+         // the image envelope before the remote read.
+         let funcs_bytes = num_funcs.checked_mul(4).ok_or_else(|| {
+[31m-            RuntimeLoadError::ExportResolutionFailed("export function array size overflow".to_string())
+[0m[32m+            RuntimeLoadError::ExportResolutionFailed(
+[0m[32m+                "export function array size overflow".to_string(),
+[0m[32m+            )
+[0m         })?;
+         if funcs_bytes > 0x10000 {
+             return Err(RuntimeLoadError::ExportResolutionFailed(
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:2131:
+                 "export function array too large".to_string(),
+             ));
+         }
+[31m-        if funcs_rva >= image_size || funcs_rva.checked_add(funcs_bytes).map_or(true, |end| end > image_size) {
+[0m[32m+        if funcs_rva >= image_size
+[0m[32m+            || funcs_rva
+[0m[32m+                .checked_add(funcs_bytes)
+[0m[32m+                .map_or(true, |end| end > image_size)
+[0m[32m+        {
+[0m             return Err(RuntimeLoadError::ExportResolutionFailed(format!(
+                 "export function array outside image envelope: rva={funcs_rva:#x} bytes={funcs_bytes:#x} image={image_size:#x}"
+             )));
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:2138:
+         }
+         let mut funcs = vec![0u8; funcs_bytes];
+         let funcs_va = module_base.checked_add(funcs_rva).ok_or_else(|| {
+[31m-            RuntimeLoadError::ExportResolutionFailed("export function array VA overflow".to_string())
+[0m[32m+            RuntimeLoadError::ExportResolutionFailed(
+[0m[32m+                "export function array VA overflow".to_string(),
+[0m[32m+            )
+[0m         })?;
+         let rf = unsafe {
+             RPM(
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:2198:
+                             )
+                         };
+                         if rc.is_err() {
+[31m-                            return Err(RuntimeLoadError::ExportResolutionFailed(
+[0m[31m-                                format!("remote read export name failed: rva={rva:#x}"),
+[0m[31m-                            ));
+[0m[32m+                            return Err(RuntimeLoadError::ExportResolutionFailed(format!(
+[0m[32m+                                "remote read export name failed: rva={rva:#x}"
+[0m[32m+                            )));
+[0m                         }
+                         if ch[0] == 0 {
+                             terminated = true;
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:2306:
+         // Export-directory interval (forwarded-export window), precomputed
+         // with checked arithmetic.
+         let exp_end = exp_rva.checked_add(exp_size).ok_or_else(|| {
+[31m-            RuntimeLoadError::ExportResolutionFailed(
+[0m[31m-                "export directory range overflow".to_string(),
+[0m[31m-            )
+[0m[32m+            RuntimeLoadError::ExportResolutionFailed("export directory range overflow".to_string())
+[0m         })?;
+         if exp_rva >= image_size || exp_end > image_size {
+             return Err(RuntimeLoadError::ExportResolutionFailed(format!(
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:2329:
+             // (name_end > names.len() etc.), and every element read is a
+             // slice of the validated range (no off+N element indexing).
+             let name_off = i.checked_mul(4).ok_or_else(|| {
+[31m-                RuntimeLoadError::ExportResolutionFailed(
+[0m[31m-                    "export name index overflow".to_string(),
+[0m[31m-                )
+[0m[32m+                RuntimeLoadError::ExportResolutionFailed("export name index overflow".to_string())
+[0m             })?;
+             let name_end = name_off.checked_add(4).ok_or_else(|| {
+[31m-                RuntimeLoadError::ExportResolutionFailed(
+[0m[31m-                    "export name slot overflow".to_string(),
+[0m[31m-                )
+[0m[32m+                RuntimeLoadError::ExportResolutionFailed("export name slot overflow".to_string())
+[0m             })?;
+             if name_end > names.len() {
+                 return Err(RuntimeLoadError::ExportResolutionFailed(
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:2344:
+                 ));
+             }
+             let name_slot = &names[name_off..name_end];
+[31m-            let name_ptr_rva = u32::from_le_bytes(
+[0m[31m-                name_slot
+[0m[31m-                    .try_into()
+[0m[31m-                    .map_err(|_| {
+[0m[31m-                        RuntimeLoadError::ExportResolutionFailed(
+[0m[31m-                            "export name slot size".to_string(),
+[0m[31m-                        )
+[0m[31m-                    })?,
+[0m[31m-            ) as usize;
+[0m[32m+            let name_ptr_rva = u32::from_le_bytes(name_slot.try_into().map_err(|_| {
+[0m[32m+                RuntimeLoadError::ExportResolutionFailed("export name slot size".to_string())
+[0m[32m+            })?) as usize;
+[0m             if name_ptr_rva == 0 {
+                 continue;
+             }
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:2381:
+                 )
+             })?;
+             let ord_end = ord_off.checked_add(2).ok_or_else(|| {
+[31m-                RuntimeLoadError::ExportResolutionFailed(
+[0m[31m-                    "export ordinal slot overflow".to_string(),
+[0m[31m-                )
+[0m[32m+                RuntimeLoadError::ExportResolutionFailed("export ordinal slot overflow".to_string())
+[0m             })?;
+             if ord_end > ords.len() {
+                 return Err(RuntimeLoadError::ExportResolutionFailed(
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:2391:
+                 ));
+             }
+             let ord_slot = &ords[ord_off..ord_end];
+[31m-            let ord = u16::from_le_bytes(
+[0m[31m-                ord_slot
+[0m[31m-                    .try_into()
+[0m[31m-                    .map_err(|_| {
+[0m[31m-                        RuntimeLoadError::ExportResolutionFailed(
+[0m[31m-                            "export ordinal slot size".to_string(),
+[0m[31m-                        )
+[0m[31m-                    })?,
+[0m[31m-            ) as usize;
+[0m[32m+            let ord = u16::from_le_bytes(ord_slot.try_into().map_err(|_| {
+[0m[32m+                RuntimeLoadError::ExportResolutionFailed("export ordinal slot size".to_string())
+[0m[32m+            })?) as usize;
+[0m             // IMP-08-R1: duplicate export names are AMBIGUOUS and must be
+             // rejected fail-closed (WO-1505 §5.3c).
+             for (wi, w) in want.iter().enumerate() {
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:2442:
+                     ));
+                 }
+                 let func_slot = &funcs[func_off..func_end];
+[31m-                let func_rva = u32::from_le_bytes(
+[0m[31m-                    func_slot
+[0m[31m-                        .try_into()
+[0m[31m-                        .map_err(|_| {
+[0m[31m-                            RuntimeLoadError::ExportResolutionFailed(
+[0m[31m-                                "export function slot size".to_string(),
+[0m[31m-                            )
+[0m[31m-                        })?,
+[0m[31m-                ) as usize;
+[0m[32m+                let func_rva = u32::from_le_bytes(func_slot.try_into().map_err(|_| {
+[0m[32m+                    RuntimeLoadError::ExportResolutionFailed(
+[0m[32m+                        "export function slot size".to_string(),
+[0m[32m+                    )
+[0m[32m+                })?) as usize;
+[0m                 if func_rva == 0 {
+                     continue;
+                 }
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:2903:
+         drain: &mut dyn FnMut(u32) -> Result<Option<mida_core::DrainReceipt>, mida_core::CoreError>,
+     ) -> Result<RemoteCallResult, RuntimeLoadError> {
+         let shutdown_addr = loaded.exports.shutdown.ok_or_else(|| {
+[31m-            RuntimeLoadError::ExportResolutionFailed(
+[0m[31m-                "MidaAntidebugShutdown missing".to_string(),
+[0m[31m-            )
+[0m[32m+            RuntimeLoadError::ExportResolutionFailed("MidaAntidebugShutdown missing".to_string())
+[0m         })?;
+         let args = ThunkArgs {
+             fn_ptr: shutdown_addr as u64,
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:3456:
+     }
+ }
+ 
+[31m-
+[0m // ============================================================================
+ // IMP-03: Loader/ABI inert adapter (v2, offline)
+ // ============================================================================
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:3755:
+                 digest.len()
+             )));
+         }
+[31m-        if !digest.bytes().all(|b| b.is_ascii_digit() || (b.is_ascii_lowercase() && b <= b'f')) {
+[0m[32m+        if !digest
+[0m[32m+            .bytes()
+[0m[32m+            .all(|b| b.is_ascii_digit() || (b.is_ascii_lowercase() && b <= b'f'))
+[0m[32m+        {
+[0m             return Err(RuntimeLoadError::ExportResolutionFailed(
+                 "v2 digest must be lowercase hex (0-9a-f only)".to_string(),
+             ));
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:3876:
+             )));
+         }
+         let len = u64::try_from(self.bytes.len()).map_err(|_| {
+[31m-            RuntimeLoadError::ExportResolutionFailed(
+[0m[31m-                "v2 blob length exceeds u64".to_string(),
+[0m[31m-            )
+[0m[32m+            RuntimeLoadError::ExportResolutionFailed("v2 blob length exceeds u64".to_string())
+[0m         })?;
+         // RC-4 item 4: blob_base + params_bytes checked.
+         let blob_end = blob_base.checked_add(len).ok_or_else(|| {
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:3952:
+         // RC-5: explicit checked u64 -> usize conversions before slicing.
+         let dig_hex_start_us = u64_to_usize(dig_off, "digest start")?;
+         let dig_hex_end_us = u64_to_usize(dig_hex_end, "digest hex end")?;
+[31m-        for (i, &c) in self.bytes[dig_hex_start_us..dig_hex_end_us].iter().enumerate() {
+[0m[32m+        for (i, &c) in self.bytes[dig_hex_start_us..dig_hex_end_us]
+[0m[32m+            .iter()
+[0m[32m+            .enumerate()
+[0m[32m+        {
+[0m             let is_lower_hex = c.is_ascii_digit() || (c.is_ascii_lowercase() && c <= b'f');
+             if !is_lower_hex {
+                 return Err(RuntimeLoadError::ExportResolutionFailed(format!(
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:3969:
+         }
+         // surfaces array: length MUST be exactly expected_hooks * 8 (checked),
+         // positioned immediately before the digest region.
+[31m-        let array_bytes = expected_hooks
+[0m[31m-            .checked_mul(8)
+[0m[31m-            .ok_or(RuntimeLoadError::ExportResolutionFailed(
+[0m[31m-                "v2 expected_hooks*8 overflow".to_string(),
+[0m[31m-            ))?;
+[0m[32m+        let array_bytes =
+[0m[32m+            expected_hooks
+[0m[32m+                .checked_mul(8)
+[0m[32m+                .ok_or(RuntimeLoadError::ExportResolutionFailed(
+[0m[32m+                    "v2 expected_hooks*8 overflow".to_string(),
+[0m[32m+                ))?;
+[0m         if expected_hooks > 0 {
+             let array_end = checked_range_end(surf_off, array_bytes, "surfaces array")?;
+             if array_end != dig_off {
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:3989:
+             for i in 0..expected_hooks {
+                 // RC-4 P0-4: entry arithmetic fully checked.
+                 let entry_off = surf_off
+[31m-                    .checked_add(
+[0m[31m-                        i.checked_mul(8)
+[0m[31m-                            .ok_or(RuntimeLoadError::ExportResolutionFailed(
+[0m[31m-                                "v2 entry index*8 overflow".to_string(),
+[0m[31m-                            ))?,
+[0m[31m-                    )
+[0m[32m+                    .checked_add(i.checked_mul(8).ok_or(
+[0m[32m+                        RuntimeLoadError::ExportResolutionFailed(
+[0m[32m+                            "v2 entry index*8 overflow".to_string(),
+[0m[32m+                        ),
+[0m[32m+                    )?)
+[0m                     .ok_or(RuntimeLoadError::ExportResolutionFailed(
+                         "v2 entry offset overflow".to_string(),
+                     ))?;
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:4009:
+                 let entry_start_us = u64_to_usize(entry_off, "surface entry start")?;
+                 let entry_end_us = u64_to_usize(entry_end, "surface entry end")?;
+                 let entry = u64::from_le_bytes(
+[31m-                    self.bytes[entry_start_us..entry_end_us]
+[0m[31m-                        .try_into()
+[0m[31m-                        .unwrap(),
+[0m[32m+                    self.bytes[entry_start_us..entry_end_us].try_into().unwrap(),
+[0m                 );
+                 if entry == 0 {
+                     return Err(RuntimeLoadError::ExportResolutionFailed(format!(
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:4028:
+                         "v2 surface entry {i} VA outside blob: {entry:#x} not in [{blob_base:#x}, {blob_end:#x})"
+                     )));
+                 }
+[31m-                let rel = entry
+[0m[31m-                    .checked_sub(blob_base)
+[0m[31m-                    .ok_or(RuntimeLoadError::ExportResolutionFailed(
+[0m[32m+                let rel = entry.checked_sub(blob_base).ok_or(
+[0m[32m+                    RuntimeLoadError::ExportResolutionFailed(
+[0m                         "v2 surface entry below blob_base".to_string(),
+[31m-                    ))?;
+[0m[32m+                    ),
+[0m[32m+                )?;
+[0m                 // surface string bounded NUL scan (within blob)
+                 scan_nul_rel(&self.bytes, rel, len, &format!("surface {i}"))?;
+             }
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:4082:
+ 
+ /// Explicit checked u64 -> usize (RC-5: no silent narrowing anywhere).
+ fn u64_to_usize(v: u64, what: &str) -> Result<usize, RuntimeLoadError> {
+[31m-    usize::try_from(v).map_err(|_| {
+[0m[31m-        RuntimeLoadError::ExportResolutionFailed(format!("v2 {what} exceeds usize"))
+[0m[31m-    })
+[0m[32m+    usize::try_from(v)
+[0m[32m+        .map_err(|_| RuntimeLoadError::ExportResolutionFailed(format!("v2 {what} exceeds usize")))
+[0m }
+ 
+ /// Parsed v2 offsets (controller-side view).
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:4139:
+             ))
+         })?;
+         va.checked_sub(self.blob_base).ok_or_else(|| {
+[31m-            RuntimeLoadError::ExportResolutionFailed(
+[0m[31m-                "v2 surface VA below blob_base".to_string(),
+[0m[31m-            )
+[0m[32m+            RuntimeLoadError::ExportResolutionFailed("v2 surface VA below blob_base".to_string())
+[0m         })
+     }
+ }
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:4177:
+     if preflight.blob_base != params_bytes as u64 {
+         return Err(RuntimeLoadError::ExportResolutionFailed(format!(
+             "v2 preflight blob_base mismatch: {:#x} != remote_params {:#x}",
+[31m-            preflight.blob_base,
+[0m[31m-            params_bytes
+[0m[32m+            preflight.blob_base, params_bytes
+[0m         )));
+     }
+     if preflight.digest_len != V2_DIGEST_LEN {
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:4191:
+     if preflight.expected_hooks != expected_hooks {
+         return Err(RuntimeLoadError::ExportResolutionFailed(format!(
+             "v2 preflight expected_hooks mismatch: {} != expected {}",
+[31m-            preflight.expected_hooks,
+[0m[31m-            expected_hooks
+[0m[32m+            preflight.expected_hooks, expected_hooks
+[0m         )));
+     }
+     if preflight.surface_entries.len() != expected_surfaces.len() {
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:4254:
+         let preflight = blob.preflight_local(blob_base)?;
+         let _ = validate_preflight_result(&blob, &preflight, expected_surfaces, params_bytes)?;
+         let blob_len = u64::try_from(blob.bytes.len()).map_err(|_| {
+[31m-            RuntimeLoadError::ExportResolutionFailed(
+[0m[31m-                "v2 blob length exceeds u64".to_string(),
+[0m[31m-            )
+[0m[32m+            RuntimeLoadError::ExportResolutionFailed("v2 blob length exceeds u64".to_string())
+[0m         })?;
+         // blob_base + params_bytes checked (RC-4 item 4), redundant with
+         // parse_offsets but explicit here for the write path.
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:4292:
+         let mut surface_entries: Vec<u64> = Vec::with_capacity(cap);
+         if offs.expected_hooks > 0 {
+             let len = u64::try_from(self.bytes.len()).map_err(|_| {
+[31m-                RuntimeLoadError::ExportResolutionFailed(
+[0m[31m-                    "v2 blob length exceeds u64".to_string(),
+[0m[31m-                )
+[0m[32m+                RuntimeLoadError::ExportResolutionFailed("v2 blob length exceeds u64".to_string())
+[0m             })?;
+             for i in 0..offs.expected_hooks {
+[31m-                let idx_bytes = i
+[0m[31m-                    .checked_mul(8)
+[0m[31m-                    .ok_or(RuntimeLoadError::ExportResolutionFailed(
+[0m[31m-                        "v2 entry index*8 overflow".to_string(),
+[0m[31m-                    ))?;
+[0m[31m-                let entry_off = offs
+[0m[31m-                    .expected_surfaces_off
+[0m[31m-                    .checked_add(idx_bytes)
+[0m[31m-                    .ok_or(RuntimeLoadError::ExportResolutionFailed(
+[0m[32m+                let idx_bytes =
+[0m[32m+                    i.checked_mul(8)
+[0m[32m+                        .ok_or(RuntimeLoadError::ExportResolutionFailed(
+[0m[32m+                            "v2 entry index*8 overflow".to_string(),
+[0m[32m+                        ))?;
+[0m[32m+                let entry_off = offs.expected_surfaces_off.checked_add(idx_bytes).ok_or(
+[0m[32m+                    RuntimeLoadError::ExportResolutionFailed(
+[0m                         "v2 entry offset overflow".to_string(),
+[31m-                    ))?;
+[0m[32m+                    ),
+[0m[32m+                )?;
+[0m                 let entry_end = checked_range_end(entry_off, 8, "surface entry")?;
+                 if entry_end > len {
+                     return Err(RuntimeLoadError::ExportResolutionFailed(
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:4345:
+     ) -> Result<&'a [u8], RuntimeLoadError> {
+         let rel = preflight.surface_relative_offset(index)?;
+         let len = u64::try_from(self.bytes.len()).map_err(|_| {
+[31m-            RuntimeLoadError::ExportResolutionFailed(
+[0m[31m-                "v2 blob length exceeds u64".to_string(),
+[0m[31m-            )
+[0m[32m+            RuntimeLoadError::ExportResolutionFailed("v2 blob length exceeds u64".to_string())
+[0m         })?;
+         let end = scan_nul_rel(&self.bytes, rel, len, &format!("surface {index}"))?;
+         let s_us = u64_to_usize(rel, "surface start")?;
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:4356:
+     }
+ }
+ 
+[31m-
+[0m #[cfg(test)]
+ mod imp03_inert_adapter_tests {
+     use super::*;
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:4491:
+ 
+     #[test]
+     fn v2_params_blob_parse_rejects_truncated() {
+[31m-        let blob = V2ParamsBlob { bytes: vec![0u8; 16] };
+[0m[32m+        let blob = V2ParamsBlob {
+[0m[32m+            bytes: vec![0u8; 16],
+[0m[32m+        };
+[0m         assert!(blob.parse_offsets(BLOB_BASE).is_err());
+     }
+ 
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:4662:
+     fn v2_params_blob_rejects_surface_string_unterminated() {
+         let mut blob = build_blob(&["AD-PROC-001"]);
+         let surf_off = u64::from_le_bytes(blob.bytes[0x28..0x30].try_into().unwrap());
+[31m-        let entry = u64::from_le_bytes(blob.bytes[surf_off as usize..surf_off as usize + 8].try_into().unwrap());
+[0m[32m+        let entry = u64::from_le_bytes(
+[0m[32m+            blob.bytes[surf_off as usize..surf_off as usize + 8]
+[0m[32m+                .try_into()
+[0m[32m+                .unwrap(),
+[0m[32m+        );
+[0m         let rel = (entry - BLOB_BASE) as usize;
+         // wipe ALL bytes from the surface string start to blob end with non-zero
+         for i in rel..blob.bytes.len() {
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:4712:
+         // RC-4 item 2: array entries are ABSOLUTE target VAs (blob_base + rel).
+         let blob = build_blob(&["AD-PROC-001", "AD-PROC-002"]);
+         let surf_off = u64::from_le_bytes(blob.bytes[0x28..0x30].try_into().unwrap());
+[31m-        let e0 = u64::from_le_bytes(blob.bytes[surf_off as usize..surf_off as usize + 8].try_into().unwrap());
+[0m[31m-        let e1 = u64::from_le_bytes(blob.bytes[surf_off as usize + 8..surf_off as usize + 16].try_into().unwrap());
+[0m[32m+        let e0 = u64::from_le_bytes(
+[0m[32m+            blob.bytes[surf_off as usize..surf_off as usize + 8]
+[0m[32m+                .try_into()
+[0m[32m+                .unwrap(),
+[0m[32m+        );
+[0m[32m+        let e1 = u64::from_le_bytes(
+[0m[32m+            blob.bytes[surf_off as usize + 8..surf_off as usize + 16]
+[0m[32m+                .try_into()
+[0m[32m+                .unwrap(),
+[0m[32m+        );
+[0m         // first surface string starts at 0x48 + len("p")+1 + len("d")+1
+         let s0_rel = (0x48 + 2 + 2) as u64;
+         let s1_rel = s0_rel + "AD-PROC-001".len() as u64 + 1;
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:4753:
+         let mut blob = build_blob(&["AD-PROC-001"]);
+         let surf_off = u64::from_le_bytes(blob.bytes[0x28..0x30].try_into().unwrap());
+         let below = BLOB_BASE - 0x1000;
+[31m-        blob.bytes[surf_off as usize..surf_off as usize + 8]
+[0m[31m-            .copy_from_slice(&below.to_le_bytes());
+[0m[32m+        blob.bytes[surf_off as usize..surf_off as usize + 8].copy_from_slice(&below.to_le_bytes());
+[0m         assert!(blob.parse_offsets(BLOB_BASE).is_err());
+     }
+ 
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:4764:
+ 
+     #[test]
+     fn v2_checked_range_end_ok() {
+[31m-        assert_eq!(checked_range_end(0x48, 65, "digest region").unwrap(), 0x48 + 65);
+[0m[32m+        assert_eq!(
+[0m[32m+            checked_range_end(0x48, 65, "digest region").unwrap(),
+[0m[32m+            0x48 + 65
+[0m[32m+        );
+[0m         assert_eq!(checked_range_end(0x100, 0, "zero").unwrap(), 0x100);
+     }
+ 
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:5219:
+     #[test]
+     fn wanted_set_is_frozen_five() {
+         assert_eq!(WANTED_EXPORTS_V2.len(), 5);
+[31m-        assert_eq!(WANTED_EXPORTS_V2, &[
+[0m[31m-            "MidaAntidebugInitialize",
+[0m[31m-            "MidaAntidebugGetAttestation",
+[0m[31m-            "MidaAntidebugShutdown",
+[0m[31m-            "MidaAntidebugInitializeV2",
+[0m[31m-            "WalkerExecute",
+[0m[31m-        ]);
+[0m[32m+        assert_eq!(
+[0m[32m+            WANTED_EXPORTS_V2,
+[0m[32m+            &[
+[0m[32m+                "MidaAntidebugInitialize",
+[0m[32m+                "MidaAntidebugGetAttestation",
+[0m[32m+                "MidaAntidebugShutdown",
+[0m[32m+                "MidaAntidebugInitializeV2",
+[0m[32m+                "WalkerExecute",
+[0m[32m+            ]
+[0m[32m+        );
+[0m     }
+ 
+     #[test]
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:5234:
+         let mut name_at = flat_name_at(&table);
+         let ords: Vec<u8> = (0..5).flat_map(|i| (i as u16).to_le_bytes()).collect();
+         let found = RuntimeLoader::resolve_exports_from_buffers(
+[31m-            &names, &ords, &funcs, &mut name_at, 5, 5, 0x400000, 0x10000, 0x1000, 0x100,
+[0m[32m+            &names,
+[0m[32m+            &ords,
+[0m[32m+            &funcs,
+[0m[32m+            &mut name_at,
+[0m[32m+            5,
+[0m[32m+            5,
+[0m[32m+            0x400000,
+[0m[32m+            0x10000,
+[0m[32m+            0x1000,
+[0m[32m+            0x100,
+[0m             &wanted5(),
+[31m-        ).unwrap();
+[0m[32m+        )
+[0m[32m+        .unwrap();
+[0m         assert_eq!(found.len(), 5);
+         for (i, f) in found.iter().enumerate() {
+             assert_eq!(*f, Some(0x400000 + 0x2000 + i * 0x10));
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:5314:
+         }
+         let mut name_at = flat_name_at(&table);
+         let found = RuntimeLoader::resolve_exports_from_buffers(
+[31m-            &names, &ords, &funcs, &mut name_at, 4, 4, 0x400000, 0x10000, 0x1000, 0x100,
+[0m[32m+            &names,
+[0m[32m+            &ords,
+[0m[32m+            &funcs,
+[0m[32m+            &mut name_at,
+[0m[32m+            4,
+[0m[32m+            4,
+[0m[32m+            0x400000,
+[0m[32m+            0x10000,
+[0m[32m+            0x1000,
+[0m[32m+            0x100,
+[0m             &wanted5(),
+[31m-        ).unwrap();
+[0m[32m+        )
+[0m[32m+        .unwrap();
+[0m         // WalkerExecute not found: the resolver reports it as None; the
+         // caller-level require_complete() rejects the incomplete set.
+         assert!(found[0].is_some() && found[1].is_some() && found[2].is_some());
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:5360:
+         }
+         let mut name_at = flat_name_at(&table);
+         let err = RuntimeLoader::resolve_exports_from_buffers(
+[31m-            &names, &ords, &funcs, &mut name_at, 6, 6, 0x400000, 0x10000, 0x1000, 0x100,
+[0m[32m+            &names,
+[0m[32m+            &ords,
+[0m[32m+            &funcs,
+[0m[32m+            &mut name_at,
+[0m[32m+            6,
+[0m[32m+            6,
+[0m[32m+            0x400000,
+[0m[32m+            0x10000,
+[0m[32m+            0x1000,
+[0m[32m+            0x100,
+[0m             &wanted5(),
+[31m-        ).unwrap_err();
+[0m[32m+        )
+[0m[32m+        .unwrap_err();
+[0m         assert!(err.to_string().contains("ambiguous export"), "{err}");
+     }
+ 
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:5394:
+         }
+         let mut name_at = flat_name_at(&table);
+         let found = RuntimeLoader::resolve_exports_from_buffers(
+[31m-            &names, &ords, &funcs, &mut name_at, 5, 5, 0x400000, 0x10000, 0x1000, 0x100,
+[0m[32m+            &names,
+[0m[32m+            &ords,
+[0m[32m+            &funcs,
+[0m[32m+            &mut name_at,
+[0m[32m+            5,
+[0m[32m+            5,
+[0m[32m+            0x400000,
+[0m[32m+            0x10000,
+[0m[32m+            0x1000,
+[0m[32m+            0x100,
+[0m             &wanted5(),
+[31m-        ).unwrap();
+[0m[32m+        )
+[0m[32m+        .unwrap();
+[0m         // Every wanted export is None (forwarded -> not resolved).
+         assert!(found.iter().all(|f| f.is_none()), "{found:?}");
+     }
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:5423:
+             table[off + s.len()] = 0;
+         }
+         // ord=7 points past the 5-entry function array (num_funcs=5).
+[31m-        let ords = (0..5).map(|_| 7u16.to_le_bytes()).collect::<Vec<_>>().concat();
+[0m[32m+        let ords = (0..5)
+[0m[32m+            .map(|_| 7u16.to_le_bytes())
+[0m[32m+            .collect::<Vec<_>>()
+[0m[32m+            .concat();
+[0m         let mut funcs = Vec::new();
+         for i in 0..5 {
+             funcs.extend_from_slice(&((0x2000 + i * 0x10) as u32).to_le_bytes());
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:5430:
+         }
+         let mut name_at = flat_name_at(&table);
+         let found = RuntimeLoader::resolve_exports_from_buffers(
+[31m-            &names, &ords, &funcs, &mut name_at, 5, 5, 0x400000, 0x10000, 0x1000, 0x100,
+[0m[32m+            &names,
+[0m[32m+            &ords,
+[0m[32m+            &funcs,
+[0m[32m+            &mut name_at,
+[0m[32m+            5,
+[0m[32m+            5,
+[0m[32m+            0x400000,
+[0m[32m+            0x10000,
+[0m[32m+            0x1000,
+[0m[32m+            0x100,
+[0m             &wanted5(),
+[31m-        ).unwrap();
+[0m[32m+        )
+[0m[32m+        .unwrap();
+[0m         // Out-of-range ordinals: all names skipped -> all None.
+         assert!(found.iter().all(|f| f.is_none()), "{found:?}");
+     }
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:5467:
+         }
+         let mut name_at = flat_name_at(&table);
+         let err = RuntimeLoader::resolve_exports_from_buffers(
+[31m-            &names, &ords, &funcs, &mut name_at, 5, 5, 0x400000, 0x10000, 0x1000, 0x100,
+[0m[32m+            &names,
+[0m[32m+            &ords,
+[0m[32m+            &funcs,
+[0m[32m+            &mut name_at,
+[0m[32m+            5,
+[0m[32m+            5,
+[0m[32m+            0x400000,
+[0m[32m+            0x10000,
+[0m[32m+            0x1000,
+[0m[32m+            0x100,
+[0m             &wanted5(),
+[31m-        ).unwrap_err();
+[0m[31m-        assert!(
+[0m[31m-            err.to_string().contains("outside image envelope"),
+[0m[31m-            "{err}"
+[0m[31m-        );
+[0m[32m+        )
+[0m[32m+        .unwrap_err();
+[0m[32m+        assert!(err.to_string().contains("outside image envelope"), "{err}");
+[0m     }
+ 
+     #[test]
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:5500:
+         funcs.extend_from_slice(&0xFFFF_FF00u32.to_le_bytes());
+         let mut name_at = flat_name_at(&table);
+         let err = RuntimeLoader::resolve_exports_from_buffers(
+[31m-            &names, &ords, &funcs, &mut name_at, 1, 1, usize::MAX - 0x20000, 0x10000, 0x1000, 0x100,
+[0m[32m+            &names,
+[0m[32m+            &ords,
+[0m[32m+            &funcs,
+[0m[32m+            &mut name_at,
+[0m[32m+            1,
+[0m[32m+            1,
+[0m[32m+            usize::MAX - 0x20000,
+[0m[32m+            0x10000,
+[0m[32m+            0x1000,
+[0m[32m+            0x100,
+[0m             &[b"MidaAntidebugInitialize"],
+[31m-        ).unwrap_err();
+[0m[32m+        )
+[0m[32m+        .unwrap_err();
+[0m         // Either the RVA >= image_size check (0xFFFF_FF00 >= 0x10000)
+         // fires first, or the VA overflow check fires; both are fail-closed.
+[31m-        assert!(err.to_string().contains("outside image envelope") || err.to_string().contains("overflow"), "{err}");
+[0m[32m+        assert!(
+[0m[32m+            err.to_string().contains("outside image envelope")
+[0m[32m+                || err.to_string().contains("overflow"),
+[0m[32m+            "{err}"
+[0m[32m+        );
+[0m     }
+ 
+     #[test]
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:5513:
+         let ss: Vec<String> = vec!["AD-PROC-002".to_string(), "AD-PROC-003".to_string()];
+         let digest = "a".repeat(64);
+         let blob = V2ParamsBlob::build_with_identity(
+[31m-            "p", "d", &ss, &digest, 0x0000_1000_0000, 1234, 0x0000_2000_0000,
+[0m[31m-        ).unwrap();
+[0m[32m+            "p",
+[0m[32m+            "d",
+[0m[32m+            &ss,
+[0m[32m+            &digest,
+[0m[32m+            0x0000_1000_0000,
+[0m[32m+            1234,
+[0m[32m+            0x0000_2000_0000,
+[0m[32m+        )
+[0m[32m+        .unwrap();
+[0m         // header identity slots
+[31m-        assert_eq!(u32::from_le_bytes(blob.bytes[0x00..0x04].try_into().unwrap()), 1234);
+[0m[31m-        assert_eq!(u64::from_le_bytes(blob.bytes[0x08..0x10].try_into().unwrap()), 0x0000_2000_0000);
+[0m[32m+        assert_eq!(
+[0m[32m+            u32::from_le_bytes(blob.bytes[0x00..0x04].try_into().unwrap()),
+[0m[32m+            1234
+[0m[32m+        );
+[0m[32m+        assert_eq!(
+[0m[32m+            u64::from_le_bytes(blob.bytes[0x08..0x10].try_into().unwrap()),
+[0m[32m+            0x0000_2000_0000
+[0m[32m+        );
+[0m         // magic + digest_len
+[31m-        assert_eq!(u64::from_le_bytes(blob.bytes[0x30..0x38].try_into().unwrap()), V2_ENVELOPE_MAGIC);
+[0m[31m-        assert_eq!(u64::from_le_bytes(blob.bytes[0x40..0x48].try_into().unwrap()), 64);
+[0m[32m+        assert_eq!(
+[0m[32m+            u64::from_le_bytes(blob.bytes[0x30..0x38].try_into().unwrap()),
+[0m[32m+            V2_ENVELOPE_MAGIC
+[0m[32m+        );
+[0m[32m+        assert_eq!(
+[0m[32m+            u64::from_le_bytes(blob.bytes[0x40..0x48].try_into().unwrap()),
+[0m[32m+            64
+[0m[32m+        );
+[0m         // parse_offsets must accept the identity-bound blob
+         blob.parse_offsets(0x0000_1000_0000).unwrap();
+     }
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:5532:
+         // One of target_pid/module_base zero with the other nonzero:
+         // fail-closed (identity must be bound or unbound together).
+         assert!(V2ParamsBlob::build_with_identity(
+[31m-            "p", "d", &ss, &digest, 0x0000_1000_0000, 1234, 0,
+[0m[31m-        ).is_err());
+[0m[32m+            "p",
+[0m[32m+            "d",
+[0m[32m+            &ss,
+[0m[32m+            &digest,
+[0m[32m+            0x0000_1000_0000,
+[0m[32m+            1234,
+[0m[32m+            0,
+[0m[32m+        )
+[0m[32m+        .is_err());
+[0m         assert!(V2ParamsBlob::build_with_identity(
+[31m-            "p", "d", &ss, &digest, 0x0000_1000_0000, 0, 0x0000_2000_0000,
+[0m[31m-        ).is_err());
+[0m[32m+            "p",
+[0m[32m+            "d",
+[0m[32m+            &ss,
+[0m[32m+            &digest,
+[0m[32m+            0x0000_1000_0000,
+[0m[32m+            0,
+[0m[32m+            0x0000_2000_0000,
+[0m[32m+        )
+[0m[32m+        .is_err());
+[0m     }
+ 
+     #[test]
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:5592:
+         funcs.extend_from_slice(&0x2000u32.to_le_bytes()); // valid
+         let mut name_at = flat_name_at(&table);
+         let err = RuntimeLoader::resolve_exports_from_buffers(
+[31m-            &names, &ords, &funcs, &mut name_at, 2, 2, 0x400000, 0x10000, 0x1000, 0x100,
+[0m[32m+            &names,
+[0m[32m+            &ords,
+[0m[32m+            &funcs,
+[0m[32m+            &mut name_at,
+[0m[32m+            2,
+[0m[32m+            2,
+[0m[32m+            0x400000,
+[0m[32m+            0x10000,
+[0m[32m+            0x1000,
+[0m[32m+            0x100,
+[0m             &[b"MidaAntidebugInitialize"],
+         )
+         .unwrap_err();
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:5613:
+         funcs.extend_from_slice(&0x2010u32.to_le_bytes());
+         let mut name_at = flat_name_at(&table);
+         let err = RuntimeLoader::resolve_exports_from_buffers(
+[31m-            &names, &ords, &funcs, &mut name_at, 2, 2, 0x400000, 0x10000, 0x1000, 0x100,
+[0m[32m+            &names,
+[0m[32m+            &ords,
+[0m[32m+            &funcs,
+[0m[32m+            &mut name_at,
+[0m[32m+            2,
+[0m[32m+            2,
+[0m[32m+            0x400000,
+[0m[32m+            0x10000,
+[0m[32m+            0x1000,
+[0m[32m+            0x100,
+[0m             &[b"MidaAntidebugInitialize"],
+         )
+         .unwrap_err();
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:5631:
+         funcs.extend_from_slice(&0x2000u32.to_le_bytes()); // valid
+         let mut name_at = flat_name_at(&table);
+         let err = RuntimeLoader::resolve_exports_from_buffers(
+[31m-            &names, &ords, &funcs, &mut name_at, 2, 2, 0x400000, 0x10000, 0x1000, 0x100,
+[0m[32m+            &names,
+[0m[32m+            &ords,
+[0m[32m+            &funcs,
+[0m[32m+            &mut name_at,
+[0m[32m+            2,
+[0m[32m+            2,
+[0m[32m+            0x400000,
+[0m[32m+            0x10000,
+[0m[32m+            0x1000,
+[0m[32m+            0x100,
+[0m             &[b"MidaAntidebugInitialize"],
+         )
+         .unwrap_err();
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:5645:
+         // parser fails closed — even though the bytes would have matched
+         // a wanted name if they had been terminated.
+         let mut table = vec![b'X'; 0x1000];
+[31m-        table[0..b"MidaAntidebugInitialize".len()]
+[0m[31m-            .copy_from_slice(b"MidaAntidebugInitialize");
+[0m[32m+        table[0..b"MidaAntidebugInitialize".len()].copy_from_slice(b"MidaAntidebugInitialize");
+[0m         let names: Vec<u8> = 0x1000u32.to_le_bytes().to_vec();
+         let ords: Vec<u8> = 0u16.to_le_bytes().to_vec();
+         let funcs: Vec<u8> = 0x2000u32.to_le_bytes().to_vec();
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:5653:
+         let mut name_at = flat_name_at(&table);
+         let err = RuntimeLoader::resolve_exports_from_buffers(
+[31m-            &names, &ords, &funcs, &mut name_at, 1, 1, 0x400000, 0x10000, 0x1000, 0x100,
+[0m[32m+            &names,
+[0m[32m+            &ords,
+[0m[32m+            &funcs,
+[0m[32m+            &mut name_at,
+[0m[32m+            1,
+[0m[32m+            1,
+[0m[32m+            0x400000,
+[0m[32m+            0x10000,
+[0m[32m+            0x1000,
+[0m[32m+            0x100,
+[0m             &[b"MidaAntidebugInitialize"],
+         )
+         .unwrap_err();
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:5666:
+         let names: Vec<u8> = 0x1000u32.to_le_bytes().to_vec();
+         let ords: Vec<u8> = 0u16.to_le_bytes().to_vec();
+         let funcs: Vec<u8> = 0x2000u32.to_le_bytes().to_vec();
+[31m-        let mut name_at =
+[0m[31m-            |_rva: usize, _out: &mut Vec<u8>| -> Result<bool, RuntimeLoadError> {
+[0m[31m-                Err(RuntimeLoadError::ExportResolutionFailed(
+[0m[31m-                    "remote read export name failed".to_string(),
+[0m[31m-                ))
+[0m[31m-            };
+[0m[32m+        let mut name_at = |_rva: usize, _out: &mut Vec<u8>| -> Result<bool, RuntimeLoadError> {
+[0m[32m+            Err(RuntimeLoadError::ExportResolutionFailed(
+[0m[32m+                "remote read export name failed".to_string(),
+[0m[32m+            ))
+[0m[32m+        };
+[0m         let err = RuntimeLoader::resolve_exports_from_buffers(
+[31m-            &names, &ords, &funcs, &mut name_at, 1, 1, 0x400000, 0x10000, 0x1000, 0x100,
+[0m[32m+            &names,
+[0m[32m+            &ords,
+[0m[32m+            &funcs,
+[0m[32m+            &mut name_at,
+[0m[32m+            1,
+[0m[32m+            1,
+[0m[32m+            0x400000,
+[0m[32m+            0x10000,
+[0m[32m+            0x1000,
+[0m[32m+            0x100,
+[0m             &[b"MidaAntidebugInitialize"],
+         )
+         .unwrap_err();
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:5692:
+         table[0..4].copy_from_slice(b"Mida");
+         let mut name_at = flat_name_at(&table);
+         let err = RuntimeLoader::resolve_exports_from_buffers(
+[31m-            &names, &ords, &funcs, &mut name_at, usize::MAX, 1, 0x400000, 0x10000, 0x1000, 0x100,
+[0m[32m+            &names,
+[0m[32m+            &ords,
+[0m[32m+            &funcs,
+[0m[32m+            &mut name_at,
+[0m[32m+            usize::MAX,
+[0m[32m+            1,
+[0m[32m+            0x400000,
+[0m[32m+            0x10000,
+[0m[32m+            0x1000,
+[0m[32m+            0x100,
+[0m             &[b"Mida"],
+         )
+         .unwrap_err();
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:5703:
+     fn truncated_function_array_fails_closed() {
+         // IMP-08-R1-R2 (P1-3): num_funcs=2 but only 1 function slot
+         // exists — the checked func range must reject the truncation.
+[31m-        let (names, ords, table) = table_for(&[
+[0m[31m-            "MidaAntidebugInitialize",
+[0m[31m-            "MidaAntidebugGetAttestation",
+[0m[31m-        ]);
+[0m[32m+        let (names, ords, table) =
+[0m[32m+            table_for(&["MidaAntidebugInitialize", "MidaAntidebugGetAttestation"]);
+[0m         let funcs: Vec<u8> = 0x2000u32.to_le_bytes().to_vec();
+         let mut name_at = flat_name_at(&table);
+         let err = RuntimeLoader::resolve_exports_from_buffers(
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:5713:
+[31m-            &names, &ords, &funcs, &mut name_at, 2, 2, 0x400000, 0x10000, 0x1000, 0x100,
+[0m[32m+            &names,
+[0m[32m+            &ords,
+[0m[32m+            &funcs,
+[0m[32m+            &mut name_at,
+[0m[32m+            2,
+[0m[32m+            2,
+[0m[32m+            0x400000,
+[0m[32m+            0x10000,
+[0m[32m+            0x1000,
+[0m[32m+            0x100,
+[0m             &[b"MidaAntidebugInitialize", b"MidaAntidebugGetAttestation"],
+         )
+         .unwrap_err();
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\src\unpacker\runtime_loader.rs:5718:
+     }
+ }
+ 
+[31m-    // ------------------------------------------------------------------
+[0m[31m-    // IMP-07-R1: production V2 preflight consumer (offline seam)
+[0m[31m-    // ------------------------------------------------------------------
+[0m[32m+// ------------------------------------------------------------------
+[0m[32m+// IMP-07-R1: production V2 preflight consumer (offline seam)
+[0m[32m+// ------------------------------------------------------------------
+[0m 
+[31m-    /// Minimal authority manifest (same shape as production). The digest
+[0m[31m-    /// here is bound to a REAL PE via verify_file() (see imp06 helpers),
+[0m[31m-    /// so the loader seam tests use a REAL verified identity — no
+[0m[31m-    /// caller-constructed digest authorities.
+[0m[31m-    fn imp07_manifest(sha256: &str, size: u64) -> RuntimeAuthorityManifest {
+[0m[31m-        RuntimeAuthorityManifest {
+[0m[31m-            schema: "mida.antidebug-runtime-authority/v1".to_string(),
+[0m[31m-            kind: "runtime-x64".to_string(),
+[0m[31m-            artifact_id: "mida-antidebug-runtime-x64".to_string(),
+[0m[31m-            sha256: sha256.to_string(),
+[0m[31m-            size_bytes: size,
+[0m[31m-            architecture: "x86_64".to_string(),
+[0m[31m-            source_ref: "test-commit".to_string(),
+[0m[31m-            provenance_ref: "provenance.json".to_string(),
+[0m[31m-        }
+[0m[32m+/// Minimal authority manifest (same shape as production). The digest
+[0m[32m+/// here is bound to a REAL PE via verify_file() (see imp06 helpers),
+[0m[32m+/// so the loader seam tests use a REAL verified identity — no
+[0m[32m+/// caller-constructed digest authorities.
+[0m[32m+fn imp07_manifest(sha256: &str, size: u64) -> RuntimeAuthorityManifest {
+[0m[32m+    RuntimeAuthorityManifest {
+[0m[32m+        schema: "mida.antidebug-runtime-authority/v1".to_string(),
+[0m[32m+        kind: "runtime-x64".to_string(),
+[0m[32m+        artifact_id: "mida-antidebug-runtime-x64".to_string(),
+[0m[32m+        sha256: sha256.to_string(),
+[0m[32m+        size_bytes: size,
+[0m[32m+        architecture: "x86_64".to_string(),
+[0m[32m+        source_ref: "test-commit".to_string(),
+[0m[32m+        provenance_ref: "provenance.json".to_string(),
+[0m     }
+[32m+}
+[0m 
+[31m-    fn imp07_minimal_pe() -> Vec<u8> {
+[0m[31m-        let mut b = vec![0u8; 0x100];
+[0m[31m-        b[0] = b'M';
+[0m[31m-        b[1] = b'Z';
+[0m[31m-        b[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+[0m[31m-        b[0x80..0x84].copy_from_slice(b"PE\0\0");
+[0m[31m-        b[0x84..0x86].copy_from_slice(&0x8664u16.to_le_bytes());
+[0m[31m-        b[0x98..0x9A].copy_from_slice(&0x20Bu16.to_le_bytes());
+[0m[31m-        b
+[0m[31m-    }
+[0m[32m+fn imp07_minimal_pe() -> Vec<u8> {
+[0m[32m+    let mut b = vec![0u8; 0x100];
+[0m[32m+    b[0] = b'M';
+[0m[32m+    b[1] = b'Z';
+[0m[32m+    b[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+[0m[32m+    b[0x80..0x84].copy_from_slice(b"PE\0\0");
+[0m[32m+    b[0x84..0x86].copy_from_slice(&0x8664u16.to_le_bytes());
+[0m[32m+    b[0x98..0x9A].copy_from_slice(&0x20Bu16.to_le_bytes());
+[0m[32m+    b
+[0m[32m+}
+[0m 
+[31m-    fn imp07_tmp_file(content: &[u8]) -> std::path::PathBuf {
+[0m[31m-        use std::sync::atomic::{AtomicU64, Ordering};
+[0m[31m-        static SEQ: AtomicU64 = AtomicU64::new(0);
+[0m[31m-        let dir = std::env::temp_dir().join("mida-imp07-test");
+[0m[31m-        let _ = std::fs::create_dir_all(&dir);
+[0m[31m-        let p = dir.join(format!(
+[0m[31m-            "imp07_runtime_{}_{}.dll",
+[0m[31m-            std::process::id(),
+[0m[31m-            SEQ.fetch_add(1, Ordering::Relaxed)
+[0m[31m-        ));
+[0m[31m-        std::fs::write(&p, content).unwrap();
+[0m[31m-        p
+[0m[31m-    }
+[0m[32m+fn imp07_tmp_file(content: &[u8]) -> std::path::PathBuf {
+[0m[32m+    use std::sync::atomic::{AtomicU64, Ordering};
+[0m[32m+    static SEQ: AtomicU64 = AtomicU64::new(0);
+[0m[32m+    let dir = std::env::temp_dir().join("mida-imp07-test");
+[0m[32m+    let _ = std::fs::create_dir_all(&dir);
+[0m[32m+    let p = dir.join(format!(
+[0m[32m+        "imp07_runtime_{}_{}.dll",
+[0m[32m+        std::process::id(),
+[0m[32m+        SEQ.fetch_add(1, Ordering::Relaxed)
+[0m[32m+    ));
+[0m[32m+    std::fs::write(&p, content).unwrap();
+[0m[32m+    p
+[0m[32m+}
+[0m 
+[31m-    /// Build a REAL verified authority (digest of a real PE) so the seam
+[0m[31m-    /// can be exercised exactly like production (verify_file -> digest_authority).
+[0m[31m-    fn imp07_verified_digest() -> String {
+[0m[31m-        let pe = imp07_minimal_pe();
+[0m[31m-        let path = imp07_tmp_file(&pe);
+[0m[31m-        let expected = sha256_hex(&pe);
+[0m[31m-        let m = imp07_manifest(&expected, pe.len() as u64);
+[0m[31m-        let id = m.verify_file(&path).unwrap();
+[0m[31m-        RuntimeDigestAuthority::from_verified_identity(&id, &m.artifact_id)
+[0m[31m-            .expect("verified identity must build a valid authority")
+[0m[31m-            .digest_value()
+[0m[31m-            .to_string()
+[0m[31m-    }
+[0m[32m+/// Build a REAL verified authority (digest of a real PE) so the seam
+[0m[32m+/// can be exercised exactly like production (verify_file -> digest_authority).
+[0m[32m+fn imp07_verified_digest() -> String {
+[0m[32m+    let pe = imp07_minimal_pe();
+[0m[32m+    let path = imp07_tmp_file(&pe);
+[0m[32m+    let expected = sha256_hex(&pe);
+[0m[32m+    let m = imp07_manifest(&expected, pe.len() as u64);
+[0m[32m+    let id = m.verify_file(&path).unwrap();
+[0m[32m+    RuntimeDigestAuthority::from_verified_identity(&id, &m.artifact_id)
+[0m[32m+        .expect("verified identity must build a valid authority")
+[0m[32m+        .digest_value()
+[0m[32m+        .to_string()
+[0m[32m+}
+[0m 
+[31m-    #[test]
+[0m[31m-    fn imp07_prepare_seam_binds_authority_digest_into_blob() {
+[0m[31m-        // The seam must use the digest AUTHORITY (from verify_file), never a
+[0m[31m-        // test-provided digest. Build the blob through the production seam.
+[0m[31m-        let digest = imp07_verified_digest();
+[0m[31m-        let ss: Vec<String> = vec!["AD-PROC-002".to_string()];
+[0m[31m-        let blob_base = 0x0000_1000_0000u64;
+[0m[31m-        let prepared = V2ParamsBlob::build_preflight_and_validate(
+[0m[31m-            "p", "d", &ss, &digest, blob_base, 1234, 0x0000_2000_0000,
+[0m[31m-            blob_base as usize,
+[0m[31m-        ).unwrap();
+[0m[31m-        // digest field in the blob == authority digest
+[0m[31m-        let dig_off = u64::from_le_bytes(prepared.bytes[0x38..0x40].try_into().unwrap()) as usize;
+[0m[31m-        let hex = String::from_utf8(prepared.bytes[dig_off..dig_off + 64].to_vec()).unwrap();
+[0m[31m-        assert_eq!(hex, digest);
+[0m[31m-        // preflight consumed and consistent
+[0m[31m-        assert_eq!(prepared.preflight.blob_base, blob_base);
+[0m[31m-        assert_eq!(prepared.preflight.digest_len, 64);
+[0m[31m-        assert_eq!(prepared.preflight.expected_hooks, 1);
+[0m[31m-        assert_eq!(prepared.preflight.surface_entries.len(), 1);
+[0m[31m-    }
+[0m[32m+#[test]
+[0m[32m+fn imp07_prepare_seam_binds_authority_digest_into_blob() {
+[0m[32m+    // The seam must use the digest AUTHORITY (from verify_file), never a
+[0m[32m+    // test-provided digest. Build the blob through the production seam.
+[0m[32m+    let digest = imp07_verified_digest();
+[0m[32m+    let ss: Vec<String> = vec!["AD-PROC-002".to_string()];
+[0m[32m+    let blob_base = 0x0000_1000_0000u64;
+[0m[32m+    let prepared = V2ParamsBlob::build_preflight_and_validate(
+[0m[32m+        "p",
+[0m[32m+        "d",
+[0m[32m+        &ss,
+[0m[32m+        &digest,
+[0m[32m+        blob_base,
+[0m[32m+        1234,
+[0m[32m+        0x0000_2000_0000,
+[0m[32m+        blob_base as usize,
+[0m[32m+    )
+[0m[32m+    .unwrap();
+[0m[32m+    // digest field in the blob == authority digest
+[0m[32m+    let dig_off = u64::from_le_bytes(prepared.bytes[0x38..0x40].try_into().unwrap()) as usize;
+[0m[32m+    let hex = String::from_utf8(prepared.bytes[dig_off..dig_off + 64].to_vec()).unwrap();
+[0m[32m+    assert_eq!(hex, digest);
+[0m[32m+    // preflight consumed and consistent
+[0m[32m+    assert_eq!(prepared.preflight.blob_base, blob_base);
+[0m[32m+    assert_eq!(prepared.preflight.digest_len, 64);
+[0m[32m+    assert_eq!(prepared.preflight.expected_hooks, 1);
+[0m[32m+    assert_eq!(prepared.preflight.surface_entries.len(), 1);
+[0m[32m+}
+[0m 
+[31m-    #[test]
+[0m[31m-    fn imp07_prepare_seam_rejects_wrong_blob_base() {
+[0m[31m-        let digest = imp07_verified_digest();
+[0m[31m-        let ss: Vec<String> = vec!["AD-PROC-002".to_string()];
+[0m[31m-        // blob_base = 0x1000_0000 but params_bytes (remote VA) = 0x2000_0000:
+[0m[31m-        // build_preflight_and_validate validates against the WRITE address.
+[0m[31m-        let r = V2ParamsBlob::build_preflight_and_validate(
+[0m[31m-            "p", "d", &ss, &digest, 0x0000_1000_0000, 1234, 0x0000_2000_0000,
+[0m[31m-            0x0000_2000_0000usize,
+[0m[31m-        );
+[0m[31m-        assert!(r.is_err());
+[0m[31m-    }
+[0m[32m+#[test]
+[0m[32m+fn imp07_prepare_seam_rejects_wrong_blob_base() {
+[0m[32m+    let digest = imp07_verified_digest();
+[0m[32m+    let ss: Vec<String> = vec!["AD-PROC-002".to_string()];
+[0m[32m+    // blob_base = 0x1000_0000 but params_bytes (remote VA) = 0x2000_0000:
+[0m[32m+    // build_preflight_and_validate validates against the WRITE address.
+[0m[32m+    let r = V2ParamsBlob::build_preflight_and_validate(
+[0m[32m+        "p",
+[0m[32m+        "d",
+[0m[32m+        &ss,
+[0m[32m+        &digest,
+[0m[32m+        0x0000_1000_0000,
+[0m[32m+        1234,
+[0m[32m+        0x0000_2000_0000,
+[0m[32m+        0x0000_2000_0000usize,
+[0m[32m+    );
+[0m[32m+    assert!(r.is_err());
+[0m[32m+}
+[0m 
+[31m-    #[test]
+[0m[31m-    fn imp07_prepare_seam_rejects_surface_count_mismatch() {
+[0m[31m-        let digest = imp07_verified_digest();
+[0m[31m-        let ss: Vec<String> = vec!["AD-PROC-002".to_string(), "AD-PROC-003".to_string()];
+[0m[31m-        let blob_base = 0x0000_1000_0000u64;
+[0m[31m-        // Build with 2 surfaces but validate against an expectation of 1.
+[0m[31m-        let blob = V2ParamsBlob::build_with_identity(
+[0m[31m-            "p", "d", &ss, &digest, blob_base, 1234, 0x0000_2000_0000,
+[0m[31m-        ).unwrap();
+[0m[31m-        let preflight = blob.preflight_local(blob_base).unwrap();
+[0m[31m-        let want: Vec<String> = vec!["AD-PROC-002".to_string()];
+[0m[31m-        let r = validate_preflight_result(&blob, &preflight, &want, blob_base as usize);
+[0m[31m-        assert!(r.is_err());
+[0m[31m-    }
+[0m[32m+#[test]
+[0m[32m+fn imp07_prepare_seam_rejects_surface_count_mismatch() {
+[0m[32m+    let digest = imp07_verified_digest();
+[0m[32m+    let ss: Vec<String> = vec!["AD-PROC-002".to_string(), "AD-PROC-003".to_string()];
+[0m[32m+    let blob_base = 0x0000_1000_0000u64;
+[0m[32m+    // Build with 2 surfaces but validate against an expectation of 1.
+[0m[32m+    let blob = V2ParamsBlob::build_with_identity(
+[0m[32m+        "p",
+[0m[32m+        "d",
+[0m[32m+        &ss,
+[0m[32m+        &digest,
+[0m[32m+        blob_base,
+[0m[32m+        1234,
+[0m[32m+        0x0000_2000_0000,
+[0m[32m+    )
+[0m[32m+    .unwrap();
+[0m[32m+    let preflight = blob.preflight_local(blob_base).unwrap();
+[0m[32m+    let want: Vec<String> = vec!["AD-PROC-002".to_string()];
+[0m[32m+    let r = validate_preflight_result(&blob, &preflight, &want, blob_base as usize);
+[0m[32m+    assert!(r.is_err());
+[0m[32m+}
+[0m 
+[31m-    #[test]
+[0m[31m-    fn imp07_prepare_seam_rejects_surface_content_mismatch() {
+[0m[31m-        let digest = imp07_verified_digest();
+[0m[31m-        let ss: Vec<String> = vec!["AD-PROC-002".to_string()];
+[0m[31m-        let blob_base = 0x0000_1000_0000u64;
+[0m[31m-        let blob = V2ParamsBlob::build_with_identity(
+[0m[31m-            "p", "d", &ss, &digest, blob_base, 1234, 0x0000_2000_0000,
+[0m[31m-        ).unwrap();
+[0m[31m-        let preflight = blob.preflight_local(blob_base).unwrap();
+[0m[31m-        let want: Vec<String> = vec!["AD-PROC-009".to_string()];
+[0m[31m-        let r = validate_preflight_result(&blob, &preflight, &want, blob_base as usize);
+[0m[31m-        assert!(r.is_err());
+[0m[31m-    }
+[0m[32m+#[test]
+[0m[32m+fn imp07_prepare_seam_rejects_surface_content_mismatch() {
+[0m[32m+    let digest = imp07_verified_digest();
+[0m[32m+    let ss: Vec<String> = vec!["AD-PROC-002".to_string()];
+[0m[32m+    let blob_base = 0x0000_1000_0000u64;
+[0m[32m+    let blob = V2ParamsBlob::build_with_identity(
+[0m[32m+        "p",
+[0m[32m+        "d",
+[0m[32m+        &ss,
+[0m[32m+        &digest,
+[0m[32m+        blob_base,
+[0m[32m+        1234,
+[0m[32m+        0x0000_2000_0000,
+[0m[32m+    )
+[0m[32m+    .unwrap();
+[0m[32m+    let preflight = blob.preflight_local(blob_base).unwrap();
+[0m[32m+    let want: Vec<String> = vec!["AD-PROC-009".to_string()];
+[0m[32m+    let r = validate_preflight_result(&blob, &preflight, &want, blob_base as usize);
+[0m[32m+    assert!(r.is_err());
+[0m[32m+}
+[0m 
+[31m-    #[test]
+[0m[31m-    fn imp07_prepare_seam_rejects_surface_order_mismatch() {
+[0m[31m-        let digest = imp07_verified_digest();
+[0m[31m-        let ss: Vec<String> = vec!["AD-PROC-002".to_string(), "AD-PROC-003".to_string()];
+[0m[31m-        let blob_base = 0x0000_1000_0000u64;
+[0m[31m-        let blob = V2ParamsBlob::build_with_identity(
+[0m[31m-            "p", "d", &ss, &digest, blob_base, 1234, 0x0000_2000_0000,
+[0m[31m-        ).unwrap();
+[0m[31m-        let preflight = blob.preflight_local(blob_base).unwrap();
+[0m[31m-        let want: Vec<String> = vec!["AD-PROC-003".to_string(), "AD-PROC-002".to_string()];
+[0m[31m-        let r = validate_preflight_result(&blob, &preflight, &want, blob_base as usize);
+[0m[31m-        assert!(r.is_err());
+[0m[31m-    }
+[0m[32m+#[test]
+[0m[32m+fn imp07_prepare_seam_rejects_surface_order_mismatch() {
+[0m[32m+    let digest = imp07_verified_digest();
+[0m[32m+    let ss: Vec<String> = vec!["AD-PROC-002".to_string(), "AD-PROC-003".to_string()];
+[0m[32m+    let blob_base = 0x0000_1000_0000u64;
+[0m[32m+    let blob = V2ParamsBlob::build_with_identity(
+[0m[32m+        "p",
+[0m[32m+        "d",
+[0m[32m+        &ss,
+[0m[32m+        &digest,
+[0m[32m+        blob_base,
+[0m[32m+        1234,
+[0m[32m+        0x0000_2000_0000,
+[0m[32m+    )
+[0m[32m+    .unwrap();
+[0m[32m+    let preflight = blob.preflight_local(blob_base).unwrap();
+[0m[32m+    let want: Vec<String> = vec!["AD-PROC-003".to_string(), "AD-PROC-002".to_string()];
+[0m[32m+    let r = validate_preflight_result(&blob, &preflight, &want, blob_base as usize);
+[0m[32m+    assert!(r.is_err());
+[0m[32m+}
+[0m 
+[31m-    #[test]
+[0m[31m-    fn imp07_production_caller_graph_is_real() {
+[0m[31m-        // The production caller (load_and_initialize_inner, require_digest=true)
+[0m[31m-        // must call build_preflight_and_validate -> preflight_local ->
+[0m[31m-        // validate_preflight_result before ANY WriteProcessMemory. We cannot
+[0m[31m-        // execute the live path; instead we PROVE the seam is called by the
+[0m[31m-        // production code with a static source-level assertion: the caller
+[0m[31m-        // body contains the seam call (grep-verified in evidence).
+[0m[31m-        // Here we also assert the seam is NOT #[cfg(test)]-only by checking
+[0m[31m-        // it exists in the non-test binary path: this test merely documents
+[0m[31m-        // the contract; the real proof is the source wiring + build.
+[0m[31m-        let digest = imp07_verified_digest();
+[0m[31m-        let ss: Vec<String> = vec!["AD-PROC-002".to_string()];
+[0m[31m-        let blob_base = 0x0000_1000_0000u64;
+[0m[31m-        // Exercise the exact seam the production caller uses.
+[0m[31m-        let prepared = V2ParamsBlob::build_preflight_and_validate(
+[0m[31m-            "p", "d", &ss, &digest, blob_base, 1234, 0x0000_2000_0000,
+[0m[31m-            blob_base as usize,
+[0m[31m-        ).unwrap();
+[0m[31m-        assert_eq!(prepared.bytes.len() > 0x48, true);
+[0m[31m-        assert_eq!(prepared.preflight.surface_entries.len(), 1);
+[0m[31m-        // Wrong base must fail BEFORE any bytes could be returned.
+[0m[31m-        assert!(V2ParamsBlob::build_preflight_and_validate(
+[0m[31m-            "p", "d", &ss, &digest, blob_base, 1234, 0x0000_2000_0000,
+[0m[31m-            (blob_base + 0x1000) as usize,
+[0m[31m-        ).is_err());
+[0m[31m-    }
+[0m[32m+#[test]
+[0m[32m+fn imp07_production_caller_graph_is_real() {
+[0m[32m+    // The production caller (load_and_initialize_inner, require_digest=true)
+[0m[32m+    // must call build_preflight_and_validate -> preflight_local ->
+[0m[32m+    // validate_preflight_result before ANY WriteProcessMemory. We cannot
+[0m[32m+    // execute the live path; instead we PROVE the seam is called by the
+[0m[32m+    // production code with a static source-level assertion: the caller
+[0m[32m+    // body contains the seam call (grep-verified in evidence).
+[0m[32m+    // Here we also assert the seam is NOT #[cfg(test)]-only by checking
+[0m[32m+    // it exists in the non-test binary path: this test merely documents
+[0m[32m+    // the contract; the real proof is the source wiring + build.
+[0m[32m+    let digest = imp07_verified_digest();
+[0m[32m+    let ss: Vec<String> = vec!["AD-PROC-002".to_string()];
+[0m[32m+    let blob_base = 0x0000_1000_0000u64;
+[0m[32m+    // Exercise the exact seam the production caller uses.
+[0m[32m+    let prepared = V2ParamsBlob::build_preflight_and_validate(
+[0m[32m+        "p",
+[0m[32m+        "d",
+[0m[32m+        &ss,
+[0m[32m+        &digest,
+[0m[32m+        blob_base,
+[0m[32m+        1234,
+[0m[32m+        0x0000_2000_0000,
+[0m[32m+        blob_base as usize,
+[0m[32m+    )
+[0m[32m+    .unwrap();
+[0m[32m+    assert_eq!(prepared.bytes.len() > 0x48, true);
+[0m[32m+    assert_eq!(prepared.preflight.surface_entries.len(), 1);
+[0m[32m+    // Wrong base must fail BEFORE any bytes could be returned.
+[0m[32m+    assert!(V2ParamsBlob::build_preflight_and_validate(
+[0m[32m+        "p",
+[0m[32m+        "d",
+[0m[32m+        &ss,
+[0m[32m+        &digest,
+[0m[32m+        blob_base,
+[0m[32m+        1234,
+[0m[32m+        0x0000_2000_0000,
+[0m[32m+        (blob_base + 0x1000) as usize,
+[0m[32m+    )
+[0m[32m+    .is_err());
+[0m[32m+}
+[0m 
+ mod imp09_carrier_r2_tests {
+     use super::*;
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\tests\digest_authority.rs:25:
+ //! exercised by in-crate unit tests (same module as the type).
+ 
+ use mida_cli::unpacker::runtime_loader::{
+[31m-    is_valid_digest_hex, validate_digest_hex, DigestValidationError, PLACEHOLDER_RUNTIME_DIGEST,
+[0m[31m-    RuntimeAuthorityManifest, RuntimeLoadError, DIGEST_HEX_LEN,
+[0m[32m+    is_valid_digest_hex, validate_digest_hex, DigestValidationError, RuntimeAuthorityManifest,
+[0m[32m+    RuntimeLoadError, DIGEST_HEX_LEN, PLACEHOLDER_RUNTIME_DIGEST,
+[0m };
+ 
+ fn sha256_hex(bytes: &[u8]) -> String {
+Diff in \\?\D:\Claude project\magicmida-rs\crates\cli\tests\digest_authority.rs:149:
+         "a".repeat(65),
+         "a".repeat(32),
+     ] {
+[31m-        assert!(!is_valid_digest_hex(&bad), "len {} must be rejected", bad.len());
+[0m[32m+        assert!(
+[0m[32m+            !is_valid_digest_hex(&bad),
+[0m[32m+            "len {} must be rejected",
+[0m[32m+            bad.len()
+[0m[32m+        );
+[0m     }
+[31m-    assert_eq!(
+[0m[31m-        validate_digest_hex(""),
+[0m[31m-        Err(DigestValidationError::Missing)
+[0m[31m-    );
+[0m[32m+    assert_eq!(validate_digest_hex(""), Err(DigestValidationError::Missing));
+[0m     assert_eq!(
+         validate_digest_hex(&"a".repeat(63)),
+         Err(DigestValidationError::WrongLength { got: 63 })
+Diff in \\?\D:\Claude project\magicmida-rs\crates\packers\themida\src\antiantidebug\handlers.rs:407:
+                 self.consecutive_suspicious += 1;
+ 
+                 // 打开或维持补丁窗口
+[31m-                if !self.window_open && self.consecutive_suspicious <= super::timings::TIMING_PATCH_WINDOW {
+[0m[32m+                if !self.window_open
+[0m[32m+                    && self.consecutive_suspicious <= super::timings::TIMING_PATCH_WINDOW
+[0m[32m+                {
+[0m                     self.window_open = true;
+                     self.probes_masked_in_window = 0;
+                 }
+Diff in \\?\D:\Claude project\magicmida-rs\crates\packers\themida\src\antiantidebug\handlers.rs:414:
+ 
+                 // 在窗口内，返回掩码值
+[31m-                if self.window_open && self.probes_masked_in_window < super::timings::TIMING_PATCH_WINDOW {
+[0m[32m+                if self.window_open
+[0m[32m+                    && self.probes_masked_in_window < super::timings::TIMING_PATCH_WINDOW
+[0m[32m+                {
+[0m                     self.probes_masked_in_window += 1;
+                     let masked = masked_delta(self.probes_masked_in_window - 1);
+                     trace!(
+Diff in \\?\D:\Claude project\magicmida-rs\crates\packers\themida\src\antiantidebug\handlers.rs:664:
+ 
+     info!(
+         thread_id,
+[31m-        info_class,
+[0m[31m-        "Intercepted NtQueryObject and returned STATUS_INVALID_HANDLE"
+[0m[32m+        info_class, "Intercepted NtQueryObject and returned STATUS_INVALID_HANDLE"
+[0m     );
+ 
+     Ok(true)
+Diff in \\?\D:\Claude project\magicmida-rs\crates\packers\themida\src\antiantidebug\handlers.rs:745:
+     pub fn default() -> Self {
+         Self {
+             names: vec![
+[31m-                "PROCEXP152.SYS".to_string(),    // Process Explorer
+[0m[32m+                "PROCEXP152.SYS".to_string(), // Process Explorer
+[0m                 "PROCEXP.SYS".to_string(),
+[31m-                "SYSDBG.SYS".to_string(),        // 一些调试器
+[0m[32m+                "SYSDBG.SYS".to_string(), // 一些调试器
+[0m                 "DBGV.SYS".to_string(),
+[31m-                "SYSER.SYS".to_string(),         // Syser Debugger
+[0m[31m-                "SICE.SYS".to_string(),          // SoftICE (legacy)
+[0m[32m+                "SYSER.SYS".to_string(), // Syser Debugger
+[0m[32m+                "SICE.SYS".to_string(),  // SoftICE (legacy)
+[0m                 "NTICE.SYS".to_string(),
+             ],
+         }
+Diff in \\?\D:\Claude project\magicmida-rs\crates\packers\themida\src\antiantidebug\mod.rs:32:
+ //! - x64 targets **must** use ScyllaHide (Themida64 has no fallback for
+ //!   manual anti-anti-debug).
+ 
+[32m+pub mod config;
+[0m mod handlers;
+ mod kifast;
+ mod scyllahide;
+Diff in \\?\D:\Claude project\magicmida-rs\crates\packers\themida\src\antiantidebug\mod.rs:38:
+[31m-pub mod config;
+[0m 
+ #[cfg(test)]
+ mod tests;
+Diff in \\?\D:\Claude project\magicmida-rs\crates\packers\themida\src\antiantidebug\tests.rs:1:
+ //! Tests for anti-anti-debug constants and helpers.
+ 
+ use super::*;
+[31m-use mida_core::{DebugEvent, DebuggerCore, ContinueStatus};
+[0m[31m-use windows::Win32::{Foundation::HANDLE, System::Diagnostics::Debug::CONTEXT};
+[0m[32m+use mida_core::{ContinueStatus, DebugEvent, DebuggerCore};
+[0m use std::collections::HashMap;
+[32m+use windows::Win32::{Foundation::HANDLE, System::Diagnostics::Debug::CONTEXT};
+[0m 
+ #[test]
+ fn ptr_from_bytes_x86() {
+Diff in \\?\D:\Claude project\magicmida-rs\crates\packers\themida\src\antiantidebug\tests.rs:91:
+         unimplemented!("mock debugger: wait_event")
+     }
+ 
+[31m-    fn continue_event(&mut self, _thread_id: u32, _status: ContinueStatus)
+[0m[31m-        -> Result<(), mida_core::CoreError> {
+[0m[32m+    fn continue_event(
+[0m[32m+        &mut self,
+[0m[32m+        _thread_id: u32,
+[0m[32m+        _status: ContinueStatus,
+[0m[32m+    ) -> Result<(), mida_core::CoreError> {
+[0m         Ok(())
+     }
+ 
+Diff in \\?\D:\Claude project\magicmida-rs\crates\packers\themida\src\antiantidebug\tests.rs:115:
+         Ok(self.context)
+     }
+ 
+[31m-    fn set_thread_context(&self, _thread_id: u32, ctx: &CONTEXT) -> Result<(), mida_core::CoreError> {
+[0m[32m+    fn set_thread_context(
+[0m[32m+        &self,
+[0m[32m+        _thread_id: u32,
+[0m[32m+        ctx: &CONTEXT,
+[0m[32m+    ) -> Result<(), mida_core::CoreError> {
+[0m         // 在真实场景中这里会修改 self.context，但因为需要 &mut self
+         // 我们在测试中通过检查返回值来验证
+         let _ = ctx;
+Diff in \\?\D:\Claude project\magicmida-rs\crates\packers\themida\src\antiantidebug\tests.rs:133:
+     let output_ptr = 0x7fff_0000u64;
+ 
+     // 执行 CRDP 处理器
+[31m-    let result = handlers::handle_check_remote_debugger_present(
+[0m[31m-        &mut dbg,
+[0m[31m-        100,
+[0m[31m-        output_ptr,
+[0m[31m-    );
+[0m[32m+    let result = handlers::handle_check_remote_debugger_present(&mut dbg, 100, output_ptr);
+[0m 
+     assert!(result.is_ok(), "CRDP handler should succeed");
+ 
+Diff in \\?\D:\Claude project\magicmida-rs\crates\packers\themida\src\antiantidebug\tests.rs:144:
+     // 验证写入了 FALSE (0)
+[31m-    let written = dbg.read_written(output_ptr as usize, 4)
+[0m[32m+    let written = dbg
+[0m[32m+        .read_written(output_ptr as usize, 4)
+[0m         .expect("output pointer should be written");
+[31m-    assert_eq!(written, [0, 0, 0, 0], "should write FALSE (0) to output pointer");
+[0m[32m+    assert_eq!(
+[0m[32m+        written,
+[0m[32m+        [0, 0, 0, 0],
+[0m[32m+        "should write FALSE (0) to output pointer"
+[0m[32m+    );
+[0m }
+ 
+ #[test]
+Diff in \\?\D:\Claude project\magicmida-rs\crates\packers\themida\src\antiantidebug\tests.rs:170:
+         dbg.context.Eip = 0x7700_0000; // CRDP 地址
+     }
+ 
+[31m-    let result = handlers::handle_check_remote_debugger_present(
+[0m[31m-        &mut dbg,
+[0m[31m-        200,
+[0m[31m-        output_ptr,
+[0m[31m-    );
+[0m[32m+    let result = handlers::handle_check_remote_debugger_present(&mut dbg, 200, output_ptr);
+[0m 
+     assert!(result.is_ok(), "CRDP handler should succeed");
+     // 注意：因为 MockDebugger::set_thread_context 的限制，
+Diff in \\?\D:\Claude project\magicmida-rs\crates\packers\themida\src\antiantidebug\tests.rs:239:
+     // 发送 TIMING_PATCH_WINDOW 个可疑探测
+     for i in 0..TIMING_PATCH_WINDOW {
+         let returned = state.handle_probe(1000 + (i as u64 + 1) * 100);
+[31m-        assert_ne!(returned, 1000 + (i as u64 + 1) * 100, "probe {} should be masked", i);
+[0m[32m+        assert_ne!(
+[0m[32m+            returned,
+[0m[32m+            1000 + (i as u64 + 1) * 100,
+[0m[32m+            "probe {} should be masked",
+[0m[32m+            i
+[0m[32m+        );
+[0m     }
+ 
+     // 第 TIMING_PATCH_WINDOW+1 个可疑探测应该关闭窗口，返回真实值
+Diff in \\?\D:\Claude project\magicmida-rs\crates\packers\themida\src\antiantidebug\tests.rs:246:
+     let returned = state.handle_probe(2000);
+[31m-    assert_eq!(returned, 2000, "window should close after {} probes", TIMING_PATCH_WINDOW);
+[0m[32m+    assert_eq!(
+[0m[32m+        returned, 2000,
+[0m[32m+        "window should close after {} probes",
+[0m[32m+        TIMING_PATCH_WINDOW
+[0m[32m+    );
+[0m }
+ 
+ #[test]
+Diff in \\?\D:\Claude project\magicmida-rs\crates\packers\themida\src\antiantidebug\tests.rs:255:
+     let _ = state.handle_probe(1100);
+     // 一个良性探测（delta = 5000）
+     let returned = state.handle_probe(6100);
+[31m-    assert_eq!(returned, 6100, "benign probe should close window and return real tick");
+[0m[32m+    assert_eq!(
+[0m[32m+        returned, 6100,
+[0m[32m+        "benign probe should close window and return real tick"
+[0m[32m+    );
+[0m }
+ 
+ // ---------------------------------------------------------------------------
+Diff in \\?\D:\Claude project\magicmida-rs\crates\packers\themida\src\antiantidebug\tests.rs:269:
+ 
+     let result = handlers::handle_nt_query_object(&mut dbg, 400, OBJECT_TYPE_INFO);
+     assert!(result.is_ok());
+[31m-    assert!(result.unwrap(), "should intercept ObjectTypeInformation query");
+[0m[32m+    assert!(
+[0m[32m+        result.unwrap(),
+[0m[32m+        "should intercept ObjectTypeInformation query"
+[0m[32m+    );
+[0m }
+ 
+ #[test]
+Diff in \\?\D:\Claude project\magicmida-rs\crates\packers\themida\src\antiantidebug\tests.rs:279:
+ 
+     let result = handlers::handle_nt_query_object(&mut dbg, 401, OBJECT_NAME_INFO);
+     assert!(result.is_ok());
+[31m-    assert!(result.unwrap(), "should intercept ObjectNameInformation query");
+[0m[32m+    assert!(
+[0m[32m+        result.unwrap(),
+[0m[32m+        "should intercept ObjectNameInformation query"
+[0m[32m+    );
+[0m }
+ 
+ #[test]
+Diff in \\?\D:\Claude project\magicmida-rs\crates\packers\themida\src\antiantidebug\timings.rs:88:
+         assert!(PROBE_SPACING_TICKS > 0);
+     }
+ }
+[32m+
+[0mDiff in \\?\D:\Claude project\magicmida-rs\crates\packers\themida\src\lib.rs:36:
+ pub mod version;
+ 
+ // Re-export the primary types so callers can do `use mida_packers_themida::…`
+[31m-#[cfg(target_arch = "x86")]
+[0m pub use antiantidebug::{
+[31m-    get_nt_qip_syscall_number, handle_kifast_syscall, install_kifast_syscall_hook,
+[0m[31m-};
+[0m[31m-pub use antiantidebug::{
+[0m     current_mode, handle_check_remote_debugger_present, handle_nt_query_information_process,
+     handle_nt_query_object, handle_nt_set_information_thread, handle_output_debug_string,
+     handle_query_performance_counter, handle_rdtsc, initialize_mode, inject_scylla_hide, set_mode,
+Diff in \\?\D:\Claude project\magicmida-rs\crates\packers\themida\src\lib.rs:47:
+     AntidebugMode, DebuggerDriverBlacklist, ScyllaHideConfig, TimingProbeState,
+[32m+};
+[0m[32m+#[cfg(target_arch = "x86")]
+[0m[32m+pub use antiantidebug::{
+[0m[32m+    get_nt_qip_syscall_number, handle_kifast_syscall, install_kifast_syscall_hook,
+[0m };
+ pub use binaries::{expected_hook_hash, expected_injector_hash, verify_sha256};
+ pub use common::ThemidaState;

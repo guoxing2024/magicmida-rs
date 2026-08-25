@@ -1,0 +1,98 @@
+{
+  "work_order": "WORK_ORDER_GTO-R6-A1-DD-RESTORE_20260825.md",
+  "status": "PASS",
+  "input": {
+    "path": "D:\\MidaVault\\lab\\evidence\\gto_cold_start_heap_rebase_1\\H4D_P6_validation\\layout_A\\candidate\\gto_unpacked.exe",
+    "size_bytes": 48563200,
+    "sha256": "9d41a1fd49609a14e3b820b68a04f7c4c811eb847d863fa7054dad6a7b3ef1c3",
+    "sha256_pinned_in_work_order": "9d41a1fd49609a14e3b820b68a04f7c4c811eb847d863fa7054dad6a7b3ef1c3"
+  },
+  "protected_reference": {
+    "path": "D:\\MidaVault\\vault\\sha256\\11\\11473d2e6b00d8a7f079e0e2d7eff9cfd0c7134af3c6bd3ca2e600b637895c86\\artifact.exe",
+    "size_bytes": 24636416,
+    "sha256": "11473d2e6b00d8a7f079e0e2d7eff9cfd0c7134af3c6bd3ca2e600b637895c86"
+  },
+  "output": {
+    "path": "D:\\Claude project\\magicmida-rs\\evidence_staging\\R6_A1_dd_restore\\layout_A\\gto_unpacked.dd_restored.exe",
+    "size_bytes": 48563200,
+    "sha256": "c4a1a94e367c0f555243d3408446df0320c04d2262cc039a2fd436a064e01637"
+  },
+  "changed_byte_ranges_count": 15,
+  "expected_changed_byte_ranges_count_work_order_literal": "literal-contract conflict: work-order text 'entry 8B + each dir 8B' (32B) vs field-level targets §3 (15B) — resolved in favor of §3 field-level targets; see doc §冲突裁决",
+  "expected_byte_count_note": "work-order §3 field-level targets change only the 4 RVA/entry fields (15 bytes on this layout); the 'entry 8B + each dir 8B' literal contract is superseded by the field-level targets — see report doc, §冲突裁决",
+  "changed_byte_ranges": [
+    {
+      "start": "0xa8",
+      "end": "0xac",
+      "length": 4
+    },
+    {
+      "start": "0x108",
+      "end": "0x10c",
+      "length": 4
+    },
+    {
+      "start": "0x110",
+      "end": "0x114",
+      "length": 4
+    },
+    {
+      "start": "0x169",
+      "end": "0x16c",
+      "length": 3
+    }
+  ],
+  "fields": [
+    {
+      "field": "AddressOfEntryPoint",
+      "offset": "0xa8",
+      "old": "0x2d21000",
+      "new": "0x16fb532"
+    },
+    {
+      "field": "DataDirectory[0] Export.RVA",
+      "offset": "0x108",
+      "old": "0x2e51000",
+      "new": "0x17f13e8"
+    },
+    {
+      "field": "DataDirectory[1] Import.RVA",
+      "offset": "0x110",
+      "old": "0x2d1e000",
+      "new": "0x17dc3e8"
+    },
+    {
+      "field": "DataDirectory[12] IAT.RVA",
+      "offset": "0x168",
+      "old": "0x12c000",
+      "new": "0x159f000"
+    },
+    {
+      "field": "DataDirectory[0] Export.Size",
+      "offset": "0x10c",
+      "old": "0x1ae",
+      "new": "0x1ae",
+      "note": "unchanged (matches protected reference)"
+    },
+    {
+      "field": "DataDirectory[1] Import.Size",
+      "offset": "0x114",
+      "old": "0x154",
+      "new": "0x154",
+      "note": "unchanged (matches protected reference)"
+    },
+    {
+      "field": "DataDirectory[12] IAT.Size",
+      "offset": "0x16c",
+      "old": "0x1190",
+      "new": "0x1190",
+      "note": "unchanged (matches protected reference)"
+    }
+  ],
+  "assertions": {
+    "full_file_diff_byte_count": 15,
+    "full_file_identical_outside_target_ranges": true,
+    "all_non_target_fields_match_reference": true
+  },
+  "output_dir": "D:\\Claude project\\magicmida-rs\\evidence_staging\\R6_A1_dd_restore"
+}

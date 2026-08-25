@@ -63,6 +63,45 @@ pub const MIN_SECTION_HEADER_BYTES: usize = IDENTITY_HEADER_BYTES + RESULT_HEADE
 /// Fixed per-probe result record size.
 pub const PROBE_RESULT_BYTES: usize = 0x28;
 
+// ---------------------------------------------------------------------------
+// R5-R3: round-1 / round-2 DONE publication extension (versioned, frozen
+// v2 layout untouched).
+//
+// The 0x28-byte ResultSectionHeaderV2 has NO spare DONE field: every word
+// is frozen (magic/version/reserved/section_bytes/result_count/stride/
+// results_off/walker_status/payload_crc32/completed_flag). R5-R3 adds the
+// per-round DONE state WITHOUT touching PROTOCOL_VERSION, the completed_flag
+// semantics or any CRC coverage, by using the result header's `_reserved`
+// u16 (result-header bytes 0x06..0x08 == section bytes 0x3E..0x40) as a
+// round-flags word. That word is REQUIRED zero by nothing: no frozen
+// validator (validate_layout / parse_section / encode_section) reads it,
+// and no producer has ever written it.
+//
+// Layout (little-endian), R5-R3:
+//   result header 0x06..0x08 round_flags u16  closed bit set:
+//                           bit0 ROUND1_DONE, bit1 ROUND2_DONE
+//
+// State rules (fail-closed, audited by the R5-R3 producer/consumer):
+//   - PENDING                       -> round_flags == 0
+//   - DONE published for round 1    -> round_flags == ROUND1_DONE
+//   - DONE published for round 2    -> round_flags == ROUND1_DONE|ROUND2_DONE
+//   - ABORT                          -> round_flags == 0
+//   - unknown bits (mask 0xFFFC) rejected by the R5-R3 gates.
+// The word is not CRC-covered (the frozen CRCs cover the identity header
+// and the payload only); a hostile mutation is caught by the closed-set
+// audit and by the round-order audit (round 2 REQUIRES both bits, so a
+// forged round-2 DONE without round-1 DONE is impossible).
+// ---------------------------------------------------------------------------
+/// R5-R3 round flags word: round 1 completed (DONE published).
+pub const ROUND1_DONE: u16 = 0x0001;
+/// R5-R3 round flags word: round 2 completed (DONE published).
+pub const ROUND2_DONE: u16 = 0x0002;
+/// R5-R3 round flags word: known bits (closed set).
+pub const ROUND_FLAGS_KNOWN: u16 = ROUND1_DONE | ROUND2_DONE;
+/// Byte offset of the round-flags word inside the RESULT header
+/// (0x06..0x08; section offset == IDENTITY_HEADER_BYTES + 0x06).
+pub const RESULT_HEADER_ROUND_FLAGS_OFF: usize = 0x06;
+
 /// Probe span (bytes read per probe), FROZEN to exactly 16 (WO-1801).
 ///
 /// The probe ABI (docs/WO-1702-seh-probe-shim-contract.md §3) reads exactly
@@ -284,7 +323,10 @@ impl fmt::Display for ProtocolError {
             Self::Overflow => write!(f, "integer overflow in offset arithmetic"),
             Self::CountTooLarge { got, max } => write!(f, "count {got} exceeds maximum {max}"),
             Self::OutOfBounds { start, end, total } => {
-                write!(f, "region [{start:#x}, {end:#x}) out of bounds for total {total:#x}")
+                write!(
+                    f,
+                    "region [{start:#x}, {end:#x}) out of bounds for total {total:#x}"
+                )
             }
             Self::NonCanonicalVa { va } => write!(f, "non-canonical x64 VA 0x{va:016X}"),
             Self::ZeroVa { va } => write!(f, "VA 0x{va:016X} must not be zero"),
@@ -298,10 +340,16 @@ impl fmt::Display for ProtocolError {
             Self::ZeroNonce => write!(f, "nonce must not be zero"),
             Self::BadResultBytes { got } => write!(f, "result_bytes {got} inconsistent"),
             Self::BadBlobTotalBytes { got } => {
-                write!(f, "blob_total_bytes {got} inconsistent with header+candidates")
+                write!(
+                    f,
+                    "blob_total_bytes {got} inconsistent with header+candidates"
+                )
             }
             Self::CrcMismatch { stored, computed } => {
-                write!(f, "header crc mismatch: stored 0x{stored:08X} computed 0x{computed:08X}")
+                write!(
+                    f,
+                    "header crc mismatch: stored 0x{stored:08X} computed 0x{computed:08X}"
+                )
             }
             Self::UnknownOptionFlags { got } => write!(f, "unknown options flags 0x{got:04X}"),
             Self::UnknownResultFlags { got } => write!(f, "unknown result flags 0x{got:02X}"),
@@ -320,12 +368,22 @@ impl fmt::Display for ProtocolError {
             ),
             Self::UnknownWalkerStatus { got } => write!(f, "unknown walker_status {got}"),
             Self::BadSectionBytes { got } => write!(f, "section_bytes {got} inconsistent"),
-            Self::IdentityMismatch { what, expected, got } => {
-                write!(f, "identity mismatch: {what} expected 0x{expected:X} got 0x{got:X}")
+            Self::IdentityMismatch {
+                what,
+                expected,
+                got,
+            } => {
+                write!(
+                    f,
+                    "identity mismatch: {what} expected 0x{expected:X} got 0x{got:X}"
+                )
             }
             Self::SessionIdMismatch => write!(f, "session id mismatch"),
             Self::CandidateCountMismatch { got, declared } => {
-                write!(f, "candidate count {got} does not match declared {declared}")
+                write!(
+                    f,
+                    "candidate count {got} does not match declared {declared}"
+                )
             }
             Self::ResultCountExceedsCapacity { got, capacity } => {
                 write!(f, "result count {got} exceeds capacity {capacity}")
@@ -333,7 +391,9 @@ impl fmt::Display for ProtocolError {
             Self::InconsistentPendingCount { got } => {
                 write!(f, "pending section must have result_count 0, got {got}")
             }
-            Self::BadRetryCount { got } => write!(f, "retry_count {got} exceeds contract maximum 1"),
+            Self::BadRetryCount { got } => {
+                write!(f, "retry_count {got} exceeds contract maximum 1")
+            }
             Self::BadReserved { got } => write!(f, "reserved field must be zero, got 0x{got:08X}"),
         }
     }
@@ -1082,6 +1142,65 @@ impl ResultSectionHeaderV2 {
         }
         Ok(())
     }
+
+    // --- R5-R3: round DONE flags (versioned extension, see module docs) ---
+
+    /// Set the round flags word (R5-R3) inside the `_reserved` u16 slot.
+    /// Unknown bits are rejected.
+    pub fn set_round_flags(&mut self, flags: u16) -> Result<(), ProtocolError> {
+        if flags & !ROUND_FLAGS_KNOWN != 0 {
+            return Err(ProtocolError::UnknownResultFlags { got: flags as u8 });
+        }
+        self._reserved = flags;
+        Ok(())
+    }
+
+    /// Get the round flags word (R5-R3).
+    pub fn round_flags(&self) -> u16 {
+        self._reserved
+    }
+
+    /// Fail-closed audit of the round DONE flags (R5-R3):
+    /// - unknown bits rejected (closed set);
+    /// - PENDING must carry round_flags == 0;
+    /// - ABORT must carry round_flags == 0;
+    /// - DONE must carry exactly the round-1 bit for round 1, and BOTH
+    ///   bits for round 2 (round 2 can never be published without round 1).
+    pub fn validate_round_flags(&self, round_index: u8) -> Result<(), ProtocolError> {
+        if self._reserved & !ROUND_FLAGS_KNOWN != 0 {
+            return Err(ProtocolError::UnknownResultFlags {
+                got: self._reserved as u8,
+            });
+        }
+        match self.completed_flag {
+            COMPLETED_FLAG_PENDING | COMPLETED_FLAG_ABORT => {
+                if self._reserved != 0 {
+                    return Err(ProtocolError::BadReserved {
+                        got: self._reserved as u32,
+                    });
+                }
+                Ok(())
+            }
+            COMPLETED_FLAG_DONE => {
+                let expect = match round_index {
+                    1 => ROUND1_DONE,
+                    2 => ROUND1_DONE | ROUND2_DONE,
+                    _ => {
+                        return Err(ProtocolError::BadCompletedFlag {
+                            got: self.completed_flag,
+                        })
+                    }
+                };
+                if self._reserved != expect {
+                    return Err(ProtocolError::BadReserved {
+                        got: self._reserved as u32,
+                    });
+                }
+                Ok(())
+            }
+            other => Err(ProtocolError::BadCompletedFlag { got: other }),
+        }
+    }
 }
 
 /// Fixed-layout per-candidate probe record (0x28 bytes, no embedded pointers).
@@ -1176,9 +1295,7 @@ impl ProbeResultV2 {
 
     pub fn validate(&self) -> Result<(), ProtocolError> {
         if !is_canonical_user_va(self.probe_va) {
-            return Err(ProtocolError::NonCanonicalVa {
-                va: self.probe_va,
-            });
+            return Err(ProtocolError::NonCanonicalVa { va: self.probe_va });
         }
         if self.classification > CLASSIFICATION_MAX {
             return Err(ProtocolError::BadClassification {
@@ -1196,7 +1313,9 @@ impl ProbeResultV2 {
             });
         }
         if self.retry_count > 1 {
-            return Err(ProtocolError::BadRetryCount { got: self.retry_count });
+            return Err(ProtocolError::BadRetryCount {
+                got: self.retry_count,
+            });
         }
         if self._reserved != 0 {
             return Err(ProtocolError::BadReserved {
@@ -1222,7 +1341,9 @@ pub fn encode_section(
     // Identity: magic/version/reserved, section_bytes consistency (checked
     // against header below), CRC over [0, 48) is recomputed at encode time.
     if identity.magic != IDENTITY_MAGIC {
-        return Err(ProtocolError::BadMagic { got: identity.magic });
+        return Err(ProtocolError::BadMagic {
+            got: identity.magic,
+        });
     }
     if identity.version != PROTOCOL_VERSION {
         return Err(ProtocolError::BadVersion {
@@ -1520,9 +1641,7 @@ pub struct ControllerSectionView<'a> {
 
 /// Controller entry gate: validate a params blob and extract the candidate
 /// list. Fail-closed on every inconsistency.
-pub fn controller_validate_entry(
-    blob: &[u8],
-) -> Result<(WalkerParamsV2, Vec<u64>), ProtocolError> {
+pub fn controller_validate_entry(blob: &[u8]) -> Result<(WalkerParamsV2, Vec<u64>), ProtocolError> {
     let (params, candidates) = WalkerParamsV2::from_blob_bytes(blob)?;
     params.validate(&candidates)?;
     // candidate count must match the declared count exactly (the decoder
@@ -1555,8 +1674,9 @@ pub fn controller_read_section<'a>(
         });
     }
     let identity = MappingIdentityHeaderV2::from_bytes(&section[0..IDENTITY_HEADER_BYTES])?;
-    let header =
-        ResultSectionHeaderV2::from_bytes(&section[IDENTITY_HEADER_BYTES..MIN_SECTION_HEADER_BYTES])?;
+    let header = ResultSectionHeaderV2::from_bytes(
+        &section[IDENTITY_HEADER_BYTES..MIN_SECTION_HEADER_BYTES],
+    )?;
 
     // --- validated-result: full section validation ---
     // Rebuild the result records from the payload slice with bounded reads.

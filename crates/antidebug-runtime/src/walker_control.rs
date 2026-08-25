@@ -24,13 +24,16 @@
 //!   called by THIS module — the production caller — never only from
 //!   `#[cfg(test)]`.
 
-use crate::attestation::{AbortState, AttestationError, ProbeSummary, RoundLedger, WalkerAttestation};
+use crate::attestation::{
+    AbortState, AttestationError, ProbeSummary, RoundLedger, WalkerAttestation,
+};
 use crate::walker_protocol::{
     controller_read_completed_section, controller_read_section, controller_validate_entry,
     derive_session_id, is_canonical_user_va, ControllerSectionView, IdentityExpectation,
     ProtocolError, WalkerParamsV2, COMPLETED_FLAG_ABORT, COMPLETED_FLAG_DONE,
-    WALKER_STATUS_ERROR_BAD_PARAMS, WALKER_STATUS_ERROR_INTERNAL_PANIC, WALKER_STATUS_ERROR_MAP_FAILED,
-    WALKER_STATUS_ERROR_PROBE_ABORTED, WALKER_STATUS_ERROR_VEH_FAILED, WALKER_STATUS_OK,
+    WALKER_STATUS_ERROR_BAD_PARAMS, WALKER_STATUS_ERROR_INTERNAL_PANIC,
+    WALKER_STATUS_ERROR_MAP_FAILED, WALKER_STATUS_ERROR_PROBE_ABORTED,
+    WALKER_STATUS_ERROR_VEH_FAILED, WALKER_STATUS_OK,
 };
 
 /// Session lifecycle phases (closed set).
@@ -109,12 +112,13 @@ pub struct WalkerDigestAuthority {
     profile_digest: String,
 }
 
-
 /// Lowercase-only hex check (R3): digests are 64 lowercase `0-9a-f`.
 /// Uppercase `A-F` is REJECTED (matches the sealed CLI authority which
 /// always emits lowercase; a forged uppercase digest cannot pass).
 fn is_lowercase_hex64(s: &str) -> bool {
-    s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 impl WalkerDigestAuthority {
@@ -198,7 +202,6 @@ impl WalkerDigestAuthority {
     }
 }
 
-
 /// Provider I/O error (closed set).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalkerIoError {
@@ -239,16 +242,30 @@ pub enum WalkerControlError {
     Protocol(ProtocolError),
     Attestation(AttestationError),
     Io(WalkerIoError),
-    RoundSequence { expected: u8, got: u8 },
-    CountMismatch { got: usize, expected: u32 },
-    CompletedFlag { got: u32 },
+    RoundSequence {
+        expected: u8,
+        got: u8,
+    },
+    CountMismatch {
+        got: usize,
+        expected: u32,
+    },
+    CompletedFlag {
+        got: u32,
+    },
     MissingSection,
     MissingRounds,
     MissingIdentity,
     MissingDigest,
     NotCompleted,
     AlreadyAborted,
-    BlobBaseMismatch { expected: u64, got: u64 },
+    BlobBaseMismatch {
+        expected: u64,
+        got: u64,
+    },
+    /// R5-R3: production consumer gate failure (round DONE audit or V2
+    /// attestation digest verification). Original error preserved.
+    Consumer(crate::walker_consumer::ConsumerFailure),
 }
 
 impl std::fmt::Display for WalkerControlError {
@@ -274,6 +291,7 @@ impl std::fmt::Display for WalkerControlError {
             Self::BlobBaseMismatch { expected, got } => {
                 write!(f, "blob_base mismatch: expected {expected:#x} got {got:#x}")
             }
+            Self::Consumer(e) => write!(f, "consumer gate: {e}"),
         }
     }
 }
@@ -324,12 +342,7 @@ pub struct WalkerSession {
 }
 
 impl WalkerSession {
-    fn new(
-        params: WalkerParamsV2,
-        candidates: Vec<u64>,
-        target_pid: u32,
-        owner_pid: u32,
-    ) -> Self {
+    fn new(params: WalkerParamsV2, candidates: Vec<u64>, target_pid: u32, owner_pid: u32) -> Self {
         let nonce = params.result_nonce;
         let session_id = derive_session_id(nonce, params.blob_base_va, params.candidate_count);
         let result_capacity = params.candidate_count;
@@ -444,7 +457,11 @@ impl<P: WalkerMemoryProvider> WalkerDriver<P> {
     }
 
     /// Begin a round (1 or 2). Any error aborts the session.
-    pub fn begin_round(&mut self, round_index: u8, wall_budget_ms: u64) -> Result<(), WalkerControlError> {
+    pub fn begin_round(
+        &mut self,
+        round_index: u8,
+        wall_budget_ms: u64,
+    ) -> Result<(), WalkerControlError> {
         let expected = match round_index {
             1 => WalkerPhase::Round1,
             2 => WalkerPhase::Round2,
@@ -493,7 +510,11 @@ impl<P: WalkerMemoryProvider> WalkerDriver<P> {
             self.session.abort(WalkerAbortReason::BadParams);
             return Err(WalkerControlError::Phase(self.session.phase));
         }
-        let round_index = if self.session.phase == WalkerPhase::Round1 { 1 } else { 2 };
+        let round_index = if self.session.phase == WalkerPhase::Round1 {
+            1
+        } else {
+            2
+        };
         let expected = IdentityExpectation {
             nonce: self.session.nonce,
             target_pid: self.session.target_pid,
@@ -522,7 +543,11 @@ impl<P: WalkerMemoryProvider> WalkerDriver<P> {
             return Err(WalkerControlError::MissingIdentity);
         }
         // REAL production call #2: the completed gate (P1-1 continued).
-        let view = match controller_read_completed_section(section, &expected, self.session.result_capacity) {
+        let view = match controller_read_completed_section(
+            section,
+            &expected,
+            self.session.result_capacity,
+        ) {
             Ok(v) => v,
             Err(e) => {
                 self.session.abort(WalkerAbortReason::ProbeAborted);
@@ -741,6 +766,54 @@ impl<P: WalkerMemoryProvider> WalkerDriver<P> {
             section_bytes: self.session.section_bytes,
         }
     }
+
+    /// R5-R3 production consumer: verify BOTH produced round slots through
+    /// the provider, then verify the V2 attestation digest closure.
+    ///
+    /// Real production caller of the R5-R3 consumer gates:
+    /// [`crate::walker_consumer::verify_round_slot`] (round DONE + flags +
+    /// digest) and [`crate::walker_consumer::verify_v2_attestation_digest`]
+    /// (V2 record digest). Any failure aborts the session (fail-closed,
+    /// P1-2) and returns the ORIGINAL error — never swallowed.
+    pub fn consume_production_output(
+        &mut self,
+        section1_va: u64,
+        attestation_json: &str,
+    ) -> Result<crate::walker_consumer::ConsumedOutput, WalkerControlError> {
+        if self.session.is_terminal() {
+            return Err(self.fail_abort(WalkerControlError::AlreadyAborted));
+        }
+        if self.session.phase != WalkerPhase::Round2 {
+            return Err(self.fail_abort(WalkerControlError::Phase(self.session.phase)));
+        }
+        let expectation = self.identity_expectation();
+        let capacity = self.session.result_capacity;
+        let section_bytes = self.session.section_bytes;
+        match crate::walker_consumer::consume_produced_sections(
+            &self.provider,
+            section1_va,
+            section_bytes,
+            &expectation,
+            capacity,
+            attestation_json,
+        ) {
+            Ok(out) => {
+                self.session.transition(WalkerPhase::Completed)?;
+                Ok(out)
+            }
+            Err(e) => Err(self.fail_abort(WalkerControlError::Consumer(e))),
+        }
+    }
+
+    /// R5-R3 standalone V2 attestation digest gate (production helper used
+    /// by the controller before accepting walker output).
+    pub fn verify_walker_output_v2(
+        &self,
+        attestation_json: &str,
+    ) -> Result<String, WalkerControlError> {
+        crate::walker_consumer::verify_v2_attestation_digest(attestation_json)
+            .map_err(WalkerControlError::Consumer)
+    }
 }
 
 /// In-memory provider for LOCAL orchestration (tests + local controller).
@@ -783,11 +856,7 @@ impl WalkerMemoryProvider for MemoryMapProvider {
         };
         let got = bytes.len().saturating_sub(off);
         if got < want {
-            return Err(WalkerIoError::OutOfBounds {
-                va,
-                want,
-                got,
-            });
+            return Err(WalkerIoError::OutOfBounds { va, want, got });
         }
         buf.copy_from_slice(&bytes[off..off + want]);
         Ok(())
@@ -802,8 +871,8 @@ mod tests {
     use crate::attestation::{Orphan, OrphanKind, OrphanState};
     use crate::walker_protocol::{
         encode_section, MappingIdentityHeaderV2, ProbeResultV2, ResultSectionHeaderV2,
-        WalkerParamsV2, CLASSIFICATION_TYPE_C, RESULT_FLAG_GUARD_SEEN,
-        COMPLETED_FLAG_DONE, PROBE_RESULT_BYTES,
+        WalkerParamsV2, CLASSIFICATION_TYPE_C, COMPLETED_FLAG_DONE, PROBE_RESULT_BYTES,
+        RESULT_FLAG_GUARD_SEEN,
     };
 
     fn nonce() -> u64 {
@@ -819,14 +888,7 @@ mod tests {
     }
 
     fn params_blob(blob_base: u64, cand: &[u64], result_bytes: u64) -> Vec<u8> {
-        let p = WalkerParamsV2::new(
-            blob_base,
-            cand.len() as u32,
-            0,
-            16,
-            nonce(),
-            result_bytes,
-        );
+        let p = WalkerParamsV2::new(blob_base, cand.len() as u32, 0, 16, nonce(), result_bytes);
         p.to_blob_bytes(cand).unwrap()
     }
 
@@ -899,7 +961,13 @@ mod tests {
         prov.insert(blob_base, blob);
         prov.insert(blob_base + 0x1000, s1);
         prov.insert(blob_base + 0x2000, s2);
-        let driver = WalkerDriver::new(prov.clone(), &prov.regions[&blob_base], target_pid, owner_pid).unwrap();
+        let driver = WalkerDriver::new(
+            prov.clone(),
+            &prov.regions[&blob_base],
+            target_pid,
+            owner_pid,
+        )
+        .unwrap();
         (prov, driver)
     }
 
@@ -926,13 +994,162 @@ mod tests {
         assert_eq!(d.session().rounds[1].round_index, 2);
         assert!(!d.session().rounds[0].auto_retry);
         assert!(!d.session().rounds[1].auto_retry);
-        let att = d
-            .finalize_attestation(&authority())
-            .unwrap();
+        let att = d.finalize_attestation(&authority()).unwrap();
         assert_eq!(att.rounds.len(), 2);
         assert_eq!(att.record_digest.len(), 64);
         assert_eq!(att.compute_digest(), att.record_digest);
         att.validate(4242, &"b".repeat(64), base()).unwrap();
+    }
+
+    /// R5-R3: the production consumer (round DONE audit + V2 attestation
+    /// digest) driven through the driver. Round flags published by the
+    /// producer; the driver consumes via consume_production_output.
+    #[test]
+    fn production_consumer_v2_digest_closure_passes() {
+        use crate::walker_producer::SectionProducer;
+        let blob_base = base();
+        let target_pid = 4242u32;
+        let owner_pid = 1234u32;
+        let cand = candidates();
+        let cap = cand.len() as u32;
+        let sec_bytes = section_bytes_for(cap);
+        let blob = params_blob(blob_base, &cand, sec_bytes);
+        let nonce_v = nonce();
+        let sid = derive_session_id(nonce_v, blob_base, cap);
+        let ident = MappingIdentityHeaderV2::new(sec_bytes, target_pid, owner_pid, nonce_v, sid);
+        let expectation = IdentityExpectation {
+            nonce: nonce_v,
+            target_pid,
+            owner_pid,
+            session_id: sid,
+            section_bytes: sec_bytes,
+        };
+        let mut prod = SectionProducer::new(ident, expectation, cap, blob_base + 0x1000).unwrap();
+        prod.publish_pending_header().unwrap();
+        let results: Vec<ProbeResultV2> = cand
+            .iter()
+            .enumerate()
+            .map(|(i, va)| {
+                let mut r = ProbeResultV2::new(
+                    *va,
+                    CLASSIFICATION_TYPE_C,
+                    RESULT_FLAG_GUARD_SEEN,
+                    (i % 2) as u8,
+                    [0xAA; 16],
+                );
+                r.set_probe_span(16);
+                r
+            })
+            .collect();
+        prod.publish_round1_done(&results).unwrap();
+        prod.publish_round2_done(&results).unwrap();
+        let mut prov = MemoryMapProvider::new();
+        prov.insert(blob_base, blob);
+        prov.insert(blob_base + 0x1000, prod.slot(1).unwrap().to_vec());
+        prov.insert(
+            blob_base + 0x1000 + sec_bytes,
+            prod.slot(2).unwrap().to_vec(),
+        );
+        let mut d = WalkerDriver::new(
+            prov.clone(),
+            &prov.regions[&blob_base],
+            target_pid,
+            owner_pid,
+        )
+        .unwrap();
+        // The driver is not required to run begin_round/consume_section for
+        // the consumer path; the consumer is a standalone verification of the
+        // produced sections + attestation. But the phase gate requires Round2:
+        // drive the session to Round2 first via the standard path.
+        d.begin_round(1, 1000).unwrap();
+        let s1 = prov.read_region(base() + 0x1000);
+        d.consume_section(&s1).unwrap();
+        d.begin_round(2, 1000).unwrap();
+        // Build a valid v2 attestation (reuse the consumer test helper shape).
+        let json = build_v2_attestation_for(sec_bytes, cap, target_pid, base());
+        let out = d
+            .consume_production_output(blob_base + 0x1000, &json)
+            .unwrap();
+        assert_eq!(out.rounds.len(), 2);
+        assert_eq!(out.rounds[0].round_index, 1);
+        assert_eq!(out.rounds[1].round_index, 2);
+        assert_eq!(out.verified_record_digest, out.attestation.record_digest);
+        assert_eq!(d.session().phase, WalkerPhase::Completed);
+    }
+
+    /// Build a valid v2 attestation JSON for the driver test (mirrors the
+    /// production anchor path: walker_attestation + record_digest).
+    fn build_v2_attestation_for(
+        sec_bytes: u64,
+        cap: u32,
+        target_pid: u32,
+        module_base: u64,
+    ) -> String {
+        use crate::attestation::{
+            AbortState, HookInventory, ProbeSummary, RoundLedger, RuntimeAttestationV2,
+            WalkerAttestation, ARCH_X86_64, ATTESTATION_SCHEMA_V2, ATTESTATION_SCHEMA_VERSION_V2,
+        };
+        let mut r1 = RoundLedger::new(1).unwrap();
+        r1.entry_ts = "t1".into();
+        r1.exit_ts = "t2".into();
+        r1.wall_budget_ms = 1000;
+        r1.wall_spent_ms = 1;
+        r1.candidates_probed = cap;
+        r1.next_round_authorized = true;
+        let mut r2 = RoundLedger::new(2).unwrap();
+        r2.entry_ts = "t3".into();
+        r2.exit_ts = "t4".into();
+        r2.wall_budget_ms = 1000;
+        r2.wall_spent_ms = 1;
+        r2.candidates_probed = cap;
+        let summary = ProbeSummary {
+            candidates_total: cap * 2,
+            type_a_count: 0,
+            type_b_count: 0,
+            type_c_count: cap * 2,
+            av_count: 0,
+            guard_count: cap * 2,
+            retry_count: cap,
+            total_latency_us: 10,
+        };
+        summary.validate().unwrap();
+        let mut walker = WalkerAttestation::new(
+            target_pid,
+            "aa".repeat(32),
+            "bb".repeat(32),
+            0x2040,
+            module_base + 0x2040,
+            summary,
+        );
+        walker.rounds = vec![r1, r2];
+        walker.record_digest = walker.compute_digest();
+        let inventory = HookInventory::unsupported(&[]);
+        let mut top = RuntimeAttestationV2 {
+            schema: ATTESTATION_SCHEMA_V2.to_string(),
+            schema_version: ATTESTATION_SCHEMA_VERSION_V2,
+            runtime_id: "mida-antidebug-runtime-x64".to_string(),
+            runtime_version: "0.1.0".to_string(),
+            architecture: ARCH_X86_64.to_string(),
+            runtime_sha256: "bb".repeat(32),
+            profile_id: "p".to_string(),
+            profile_digest: "cc".repeat(32),
+            target_pid,
+            module_base,
+            initialized: true,
+            hooks_expected: inventory.hooks_expected,
+            hooks_installed: inventory.hooks_installed,
+            hook_failures: inventory.hook_failures,
+            surface_details: vec![],
+            telemetry_channel: "ready".to_string(),
+            cleanup_handler_registered: true,
+            third_party: "test".to_string(),
+            source_revision: "test".to_string(),
+            toolchain: "rustc".to_string(),
+            walker_attestation: Some(walker),
+            record_digest: String::new(),
+        };
+        top.record_digest = top.compute_digest();
+        top.to_canonical_json().unwrap()
     }
 
     #[test]
@@ -965,9 +1182,7 @@ mod tests {
         let (prov3, _) = full_two_round_flow();
         let s2 = prov3.read_region(base() + 0x2000);
         d.consume_section(&s2).unwrap();
-        let mut att = d
-            .finalize_attestation(&authority())
-            .unwrap();
+        let mut att = d.finalize_attestation(&authority()).unwrap();
         att.record_digest = "0".repeat(64);
         assert!(att.validate(4242, &"b".repeat(64), base()).is_err());
     }
@@ -1090,9 +1305,7 @@ mod tests {
         let (prov3, _) = full_two_round_flow();
         let s2 = prov3.read_region(base() + 0x2000);
         d.consume_section(&s2).unwrap();
-        let att = d
-            .finalize_attestation(&authority())
-            .unwrap();
+        let att = d.finalize_attestation(&authority()).unwrap();
         assert_eq!(att.compute_digest(), att.record_digest);
         let mut bad = att.clone();
         bad.record_digest = format!("{:064x}", 0xDEADBEEFu64);
@@ -1110,9 +1323,7 @@ mod tests {
         let (prov3, _) = full_two_round_flow();
         let s2 = prov3.read_region(base() + 0x2000);
         d.consume_section(&s2).unwrap();
-        let att = d
-            .finalize_attestation(&authority())
-            .unwrap();
+        let att = d.finalize_attestation(&authority()).unwrap();
         let top = crate::attestation::RuntimeAttestationV2 {
             schema: crate::attestation::ATTESTATION_SCHEMA_V2.to_string(),
             schema_version: crate::attestation::ATTESTATION_SCHEMA_VERSION_V2,
@@ -1195,10 +1406,7 @@ mod tests {
     fn authority_validation_rejects_bad_digests() {
         // P0-2: the sealed authority rejects non-64-hex digests / zero VAs /
         // entry overflow at bind time.
-        assert!(WalkerDigestAuthority::new(
-            "zz", "b", 1, 1, "p", "c"
-        )
-        .is_err());
+        assert!(WalkerDigestAuthority::new("zz", "b", 1, 1, "p", "c").is_err());
         assert!(WalkerDigestAuthority::new(
             &"a".repeat(64),
             &"b".repeat(64),

@@ -41,7 +41,9 @@ pub mod exports;
 pub mod provenance;
 pub mod surfaces;
 pub mod telemetry;
+pub mod walker_consumer;
 pub mod walker_control;
+pub mod walker_producer;
 pub mod walker_protocol;
 
 pub use attestation::{
@@ -53,9 +55,8 @@ pub use attestation::{
 };
 pub use exports::{
     MidaAntidebugError, MidaAntidebugGetAttestation, MidaAntidebugInitialize,
-    MidaAntidebugInitializeV2, MidaAntidebugShutdown, WalkerExecute,
-    ATTESTATION_BUFFER_SIZE, MAX_ATTESTATION_BYTES, V2_DIGEST_LEN,
-    V2_ENVELOPE_MAGIC, V2_HEADER_BYTES, V2_MAX_HOOKS,
+    MidaAntidebugInitializeV2, MidaAntidebugShutdown, WalkerExecute, ATTESTATION_BUFFER_SIZE,
+    MAX_ATTESTATION_BYTES, V2_DIGEST_LEN, V2_ENVELOPE_MAGIC, V2_HEADER_BYTES, V2_MAX_HOOKS,
 };
 pub use provenance::{Provenance, ProvenanceError};
 pub use surfaces::{
@@ -66,14 +67,19 @@ pub use surfaces::{
 pub use telemetry::{
     TelemetryChannel, TelemetryError, TelemetryMessage, TelemetryResponse, TelemetryState,
 };
-pub use walker_control::{
-    MemoryMapProvider, WalkerAbortReason, WalkerControlError, WalkerDigestAuthority,
-    WalkerDriver, WalkerIoError, WalkerMemoryProvider, WalkerPhase, WalkerSession,
+pub use walker_consumer::{
+    consume_produced_sections, round_sequence_of, verify_round_slot, verify_v2_attestation_digest,
+    ConsumedOutput, ConsumedRound, ConsumerFailure, ConsumerVerdict,
 };
+pub use walker_control::{
+    MemoryMapProvider, WalkerAbortReason, WalkerControlError, WalkerDigestAuthority, WalkerDriver,
+    WalkerIoError, WalkerMemoryProvider, WalkerPhase, WalkerSession,
+};
+pub use walker_producer::{ProducedRound, ProducerError, ProducerPhase, SectionProducer};
 pub use walker_protocol::{
-    controller_read_completed_section, controller_read_section, controller_validate_entry,
-    crc32, derive_session_id, encode_section, is_canonical_user_va, is_canonical_x64,
-    page_span_fits, parse_section, validate_section, ControllerSectionView,
-    IdentityExpectation, MappingIdentityHeaderV2, ProbeResultV2, ProtocolError,
-    ResultSectionHeaderV2, WalkerParamsV2,
+    controller_read_completed_section, controller_read_section, controller_validate_entry, crc32,
+    derive_session_id, encode_section, is_canonical_user_va, is_canonical_x64, page_span_fits,
+    parse_section, validate_section, ControllerSectionView, IdentityExpectation,
+    MappingIdentityHeaderV2, ProbeResultV2, ProtocolError, ResultSectionHeaderV2, WalkerParamsV2,
+    RESULT_HEADER_ROUND_FLAGS_OFF, ROUND1_DONE, ROUND2_DONE, ROUND_FLAGS_KNOWN,
 };

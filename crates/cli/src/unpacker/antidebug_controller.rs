@@ -364,11 +364,14 @@ pub struct WalkerEvidenceRecord {
 }
 
 /// Outcome of the production walker execute gate (R5-R2-4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WalkerExecuteOutcome {
     /// Authorized target-side dispatch bridge returned WALKER_STATUS_OK and
-    /// the marshaled output was present.
-    Success,
+    /// the marshaled V2 output was present. The output attestation is
+    /// carried so the R5-R3 consumer gate can verify its digest closure.
+    Success {
+        output: mida_antidebug_runtime::attestation::RuntimeAttestationV2,
+    },
     /// No authorized target-side dispatch bridge: NOT_IMPLEMENTED
     /// (fail-closed; in-process exports::WalkerExecute is engineering-only).
     NotImplemented,
@@ -376,6 +379,16 @@ pub enum WalkerExecuteOutcome {
     NonOk { raw_status: i32 },
     /// Dispatch returned OK but no walker output was marshaled back.
     OutputMissing,
+}
+
+/// Short stable name for an execute outcome (evidence/event detail).
+fn execute_outcome_name(o: &WalkerExecuteOutcome) -> &'static str {
+    match o {
+        WalkerExecuteOutcome::Success { .. } => "Success",
+        WalkerExecuteOutcome::NotImplemented => "NotImplemented",
+        WalkerExecuteOutcome::NonOk { .. } => "NonOk",
+        WalkerExecuteOutcome::OutputMissing => "OutputMissing",
+    }
 }
 
 /// Options for the anti-debug stage.
@@ -800,8 +813,41 @@ impl AntidebugController {
             return WalkerExecuteOutcome::NonOk { raw_status };
         }
         match output {
-            Some(_att) => WalkerExecuteOutcome::Success,
+            Some(att) => WalkerExecuteOutcome::Success { output: att },
             None => WalkerExecuteOutcome::OutputMissing,
+        }
+    }
+
+    /// IMP-09-CARRIER-R5-R3: production consumer gate — V2 attestation
+    /// digest closure over the marshaled walker output.
+    ///
+    /// Real production caller of
+    /// [`mida_antidebug_runtime::walker_consumer::verify_v2_attestation_digest`]:
+    /// the output attestation is serialized to canonical JSON (the same
+    /// encoding the runtime writes) and the digest is recomputed; schema,
+    /// binding matrix and digest MUST all validate, else Proceed is
+    /// blocked with the original failure preserved (fail-closed, R3-3/R3-4).
+    fn verify_walker_output_v2(
+        &self,
+        output: &mida_antidebug_runtime::attestation::RuntimeAttestationV2,
+    ) -> Result<String, AntidebugOutcome> {
+        let json = match output.to_canonical_json() {
+            Ok(j) => j,
+            Err(e) => {
+                return Err(AntidebugOutcome::Failed {
+                    state: self.state,
+                    fail_code: FailCode::ProbeInconsistent,
+                    message: format!("walker output attestation serialization failed: {e}"),
+                })
+            }
+        };
+        match mida_antidebug_runtime::walker_consumer::verify_v2_attestation_digest(&json) {
+            Ok(digest) => Ok(digest),
+            Err(e) => Err(AntidebugOutcome::Failed {
+                state: self.state,
+                fail_code: FailCode::ProbeInconsistent,
+                message: format!("walker output V2 attestation digest gate failed: {e}"),
+            }),
         }
     }
 
@@ -1286,24 +1332,47 @@ impl AntidebugController {
             None,
         );
         let execute_outcome = self.execute_walker_production();
-        let raw_status = match execute_outcome {
-            WalkerExecuteOutcome::Success => {
+        let raw_status = match &execute_outcome {
+            WalkerExecuteOutcome::Success { .. } => {
                 Some(mida_antidebug_runtime::walker_protocol::WALKER_STATUS_OK as i32)
             }
-            WalkerExecuteOutcome::NonOk { raw_status } => Some(raw_status),
+            WalkerExecuteOutcome::NonOk { raw_status } => Some(*raw_status),
             WalkerExecuteOutcome::NotImplemented | WalkerExecuteOutcome::OutputMissing => None,
         };
         self.record_walker_event(
             "execute_exit",
-            Some(format!("outcome={execute_outcome:?}")),
+            Some(format!(
+                "outcome={}",
+                execute_outcome_name(&execute_outcome)
+            )),
             raw_status,
         );
         log::log(
             LogType::Info,
-            &format!("IMP-09: WALKER_EXECUTE={execute_outcome:?} (production dispatch gate)"),
+            &format!(
+                "IMP-09: WALKER_EXECUTE={} (production dispatch gate)",
+                execute_outcome_name(&execute_outcome)
+            ),
         );
         match execute_outcome {
-            WalkerExecuteOutcome::Success => {}
+            WalkerExecuteOutcome::Success { output } => {
+                // IMP-09-CARRIER-R5-R3: V2 attestation digest closure gate.
+                // The marshaled output MUST be a valid v2 attestation whose
+                // record digest recomputes (schema/binding matrix checked
+                // inside verify_v2_attestation_digest). Any failure blocks
+                // Proceed with the ORIGINAL error preserved (R3-3/R3-4).
+                let _verified = match self.verify_walker_output_v2(&output) {
+                    Ok(d) => d,
+                    Err(fail) => {
+                        self.record_walker_event(
+                            "output_verify_fail",
+                            Some("V2 attestation digest gate failed; Proceed blocked".to_string()),
+                            None,
+                        );
+                        return fail;
+                    }
+                };
+            }
             WalkerExecuteOutcome::NotImplemented => {
                 // R5-R2-4: no authorized target-side dispatch bridge.
                 return AntidebugOutcome::Failed {
@@ -2546,11 +2615,27 @@ mod tests {
     // ---------- IMP-09-CARRIER-R5-R2: walker execute gate ----------
 
     /// Mock authorized dispatch bridge (offline gate tests only; a mock
-    /// is never a live Windows PASS).
+    /// is never a live Windows PASS). Output is a REAL v2 attestation with
+    /// recomputable digest (the R5-R3 consumer gate verifies it).
     #[derive(Debug)]
     struct TestDispatchBridge {
         status: i32,
         output: bool,
+        /// When true the marshaled output is a v2 attestation whose digest
+        /// does NOT recompute (R5-R3 digest gate must block Proceed).
+        tampered_digest: bool,
+        /// When true the output attestation carries no walker_attestation.
+        no_walker: bool,
+    }
+    impl TestDispatchBridge {
+        fn ok() -> Self {
+            Self {
+                status: 0,
+                output: true,
+                tampered_digest: false,
+                no_walker: false,
+            }
+        }
     }
     impl WalkerDispatchBridge for TestDispatchBridge {
         fn dispatch(
@@ -2560,16 +2645,60 @@ mod tests {
             i32,
             Option<mida_antidebug_runtime::attestation::RuntimeAttestationV2>,
         ) {
-            if self.output {
-                (self.status, Some(mock_attestation_v2()))
-            } else {
-                (self.status, None)
+            if !self.output {
+                return (self.status, None);
             }
+            let mut att = mock_attestation_v2();
+            if self.tampered_digest {
+                att.record_digest = "0".repeat(64);
+            }
+            if self.no_walker {
+                att.walker_attestation = None;
+            }
+            (self.status, Some(att))
         }
     }
 
     fn mock_attestation_v2() -> mida_antidebug_runtime::attestation::RuntimeAttestationV2 {
-        mida_antidebug_runtime::attestation::RuntimeAttestationV2 {
+        use mida_antidebug_runtime::attestation::{
+            AbortState, HookInventory, ProbeSummary, RoundLedger, WalkerAttestation,
+        };
+        let mut r1 = RoundLedger::new(1).unwrap();
+        r1.entry_ts = "t1".to_string();
+        r1.exit_ts = "t2".to_string();
+        r1.wall_budget_ms = 1000;
+        r1.wall_spent_ms = 1;
+        r1.candidates_probed = 3;
+        r1.next_round_authorized = true;
+        let mut r2 = RoundLedger::new(2).unwrap();
+        r2.entry_ts = "t3".to_string();
+        r2.exit_ts = "t4".to_string();
+        r2.wall_budget_ms = 1000;
+        r2.wall_spent_ms = 1;
+        r2.candidates_probed = 3;
+        let summary = ProbeSummary {
+            candidates_total: 6,
+            type_a_count: 0,
+            type_b_count: 0,
+            type_c_count: 6,
+            av_count: 0,
+            guard_count: 6,
+            retry_count: 3,
+            total_latency_us: 10,
+        };
+        summary.validate().unwrap();
+        let mut walker = WalkerAttestation::new(
+            std::process::id(),
+            "ab".repeat(32),
+            "ab".repeat(32),
+            0x2040,
+            0x7000 + 0x2040,
+            summary,
+        );
+        walker.rounds = vec![r1, r2];
+        walker.record_digest = walker.compute_digest();
+        let inventory = HookInventory::unsupported(&[]);
+        let mut att = mida_antidebug_runtime::attestation::RuntimeAttestationV2 {
             schema: "mida.antidebug-runtime-attestation/v2".to_string(),
             schema_version: 2,
             runtime_id: "mida-antidebug-runtime-x64".to_string(),
@@ -2581,18 +2710,20 @@ mod tests {
             target_pid: std::process::id(),
             module_base: 0x7000,
             initialized: true,
-            hooks_expected: vec!["AD-PROC-002".to_string()],
-            hooks_installed: vec!["AD-PROC-002".to_string()],
-            hook_failures: vec![],
+            hooks_expected: inventory.hooks_expected,
+            hooks_installed: inventory.hooks_installed,
+            hook_failures: inventory.hook_failures,
             surface_details: vec![],
             telemetry_channel: "ready".to_string(),
             cleanup_handler_registered: true,
             third_party: "test".to_string(),
             source_revision: "test".to_string(),
             toolchain: "rustc".to_string(),
-            walker_attestation: None,
-            record_digest: "aa".repeat(32),
-        }
+            walker_attestation: Some(walker),
+            record_digest: String::new(),
+        };
+        att.record_digest = att.compute_digest();
+        att
     }
 
     #[test]
@@ -2600,10 +2731,7 @@ mod tests {
         let _walker_guard = WALKER_TEST_LOCK.lock().unwrap();
         mida_antidebug_runtime::exports::reset_walker_bindings();
         let (mut c, _region) = controller_with_full_carriers(std::process::id());
-        c.options.walker_dispatch = Some(Box::new(TestDispatchBridge {
-            status: 0,
-            output: true,
-        }));
+        c.options.walker_dispatch = Some(Box::new(TestDispatchBridge::ok()));
         let outcome = c.run();
         assert!(
             matches!(outcome, AntidebugOutcome::Proceed { .. }),
@@ -2633,6 +2761,8 @@ mod tests {
         c.options.walker_dispatch = Some(Box::new(TestDispatchBridge {
             status: 2,
             output: true,
+            tampered_digest: false,
+            no_walker: false,
         }));
         let outcome = c.run();
         assert!(
@@ -2654,6 +2784,8 @@ mod tests {
         c.options.walker_dispatch = Some(Box::new(TestDispatchBridge {
             status: 0,
             output: false,
+            tampered_digest: false,
+            no_walker: false,
         }));
         let outcome = c.run();
         assert!(
@@ -2686,6 +2818,8 @@ mod tests {
         c.options.walker_dispatch = Some(Box::new(TestDispatchBridge {
             status: 0,
             output: true,
+            tampered_digest: false,
+            no_walker: false,
         }));
         let _ = c.run();
         c.record_terminate_enter();
@@ -2732,5 +2866,75 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
         assert_eq!(back.events[0].phase, "terminate_enter");
         let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    // ---------- IMP-09-CARRIER-R5-R3: V2 attestation digest gate ----------
+
+    #[test]
+    fn imp09_r5r3_output_tampered_digest_blocks_proceed() {
+        // R3-3: the marshaled output's record_digest does NOT recompute ->
+        // the consumer digest gate must fail closed and block Proceed.
+        let _walker_guard = WALKER_TEST_LOCK.lock().unwrap();
+        mida_antidebug_runtime::exports::reset_walker_bindings();
+        let (mut c, _region) = controller_with_full_carriers(std::process::id());
+        c.options.walker_dispatch = Some(Box::new(TestDispatchBridge {
+            status: 0,
+            output: true,
+            tampered_digest: true,
+            no_walker: false,
+        }));
+        let outcome = c.run();
+        assert!(
+            matches!(outcome, AntidebugOutcome::Failed { .. }),
+            "tampered V2 digest must fail closed, got {outcome:?}"
+        );
+        assert!(!c.state().is_proceed());
+        let last = c.walker_events().last().unwrap();
+        assert_eq!(last.phase, "output_verify_fail");
+        mida_antidebug_runtime::exports::reset_walker_bindings();
+    }
+
+    #[test]
+    fn imp09_r5r3_output_missing_walker_attestation_blocks_proceed() {
+        // R3-3: v2 attestation without a walker_attestation must fail closed.
+        let _walker_guard = WALKER_TEST_LOCK.lock().unwrap();
+        mida_antidebug_runtime::exports::reset_walker_bindings();
+        let (mut c, _region) = controller_with_full_carriers(std::process::id());
+        c.options.walker_dispatch = Some(Box::new(TestDispatchBridge {
+            status: 0,
+            output: true,
+            tampered_digest: false,
+            no_walker: true,
+        }));
+        let outcome = c.run();
+        assert!(
+            matches!(outcome, AntidebugOutcome::Failed { .. }),
+            "missing walker_attestation must fail closed, got {outcome:?}"
+        );
+        assert!(!c.state().is_proceed());
+        let last = c.walker_events().last().unwrap();
+        assert_eq!(last.phase, "output_verify_fail");
+        mida_antidebug_runtime::exports::reset_walker_bindings();
+    }
+
+    #[test]
+    fn imp09_r5r3_ok_bridge_passes_v2_digest_gate_and_reaches_proceed() {
+        // Positive R5-R3: a genuine v2 attestation (digest recomputes) passes
+        // the consumer gate and reaches Proceed.
+        let _walker_guard = WALKER_TEST_LOCK.lock().unwrap();
+        mida_antidebug_runtime::exports::reset_walker_bindings();
+        let (mut c, _region) = controller_with_full_carriers(std::process::id());
+        c.options.walker_dispatch = Some(Box::new(TestDispatchBridge::ok()));
+        let outcome = c.run();
+        assert!(
+            matches!(outcome, AntidebugOutcome::Proceed { .. }),
+            "valid V2 output must pass the digest gate, got {outcome:?}"
+        );
+        let phases: Vec<&str> = c.walker_events().iter().map(|e| e.phase.as_str()).collect();
+        assert!(
+            !phases.contains(&"output_verify_fail"),
+            "no verify failure expected: {phases:?}"
+        );
+        mida_antidebug_runtime::exports::reset_walker_bindings();
     }
 }

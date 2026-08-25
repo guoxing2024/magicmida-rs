@@ -1,0 +1,20 @@
+$$ GTO-R6-A2 LOADER SMOKE - attempt_002 - cdb protocol (H5-style, no -g)
+$$ Target: gto_unpacked.dd_restored.exe (SHA256 c4a1a94e367c0f555243d3408446df0320c04d2262cc039a2fd436a064e01637)
+$$ Protocol: WORK_ORDER_GTO-R6-A2-LOADER-SMOKE_20260825.md section 3
+.echo ============ R6-A2 ATTEMPT 002 START ============
+.symfix
+.sympath+
+.echo [phase] module base of target
+lm m vcomp140*
+.echo [phase] setting breakpoints TLS0/resolver/entry
+bp 0x141728972 ".echo *** HIT TLS0 0x141728972 ***; r; g"
+bp 0x1417223b2 ".echo *** HIT RESOLVER 0x1417223b2 ***; r; g"
+bp 0x1416fb532 ".echo *** HIT ENTRY 0x1416fb532 ***; r; g"
+bl
+.echo [phase] exception handling: first-chance av -> record + gn; second-chance av -> record + terminate
+sxe -c ".echo *** FIRST-CHANCE AV ***; .exr -1; ~*k; gn" -c2 ".echo *** SECOND-CHANCE AV ***; .exr -1; r; .ecxr; ~*k; .echo *** SECOND-CHANCE RECORDED - TERMINATING ***; q" av
+sx
+.echo [phase] go
+g
+.echo [phase] debuggee stopped or exited - closing
+q

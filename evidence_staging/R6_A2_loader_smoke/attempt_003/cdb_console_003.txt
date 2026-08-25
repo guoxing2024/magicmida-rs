@@ -1,0 +1,298 @@
+
+************* Preparing the environment for Debugger Extensions Gallery repositories **************
+   ExtensionRepository : Implicit
+   UseExperimentalFeatureForNugetShare : true
+   AllowNugetExeUpdate : true
+   NonInteractiveNuget : true
+   AllowNugetMSCredentialProviderInstall : true
+   AllowParallelInitializationOfLocalRepositories : true
+
+   EnableRedirectToV8JsProvider : false
+
+   -- Configuring repositories
+      ----> Repository : LocalInstalled, Enabled: true
+      ----> Repository : UserExtensions, Enabled: true
+
+>>>>>>>>>>>>> Preparing the environment for Debugger Extensions Gallery repositories completed, duration 0.000 seconds
+
+************* Waiting for Debugger Extensions Gallery to Initialize **************
+
+>>>>>>>>>>>>> Waiting for Debugger Extensions Gallery to Initialize completed, duration 0.016 seconds
+   ----> Repository : UserExtensions, Enabled: true, Packages count: 0
+   ----> Repository : LocalInstalled, Enabled: true, Packages count: 30
+
+Microsoft (R) Windows Debugger Version 10.0.26100.8249 AMD64
+Copyright (c) Microsoft Corporation. All rights reserved.
+
+CommandLine: "D:\Claude project\magicmida-rs\evidence_staging\R6_A1_dd_restore\layout_A\gto_unpacked.dd_restored.exe"
+
+************* Path validation summary **************
+Response                         Time (ms)     Location
+Deferred                                       SRV*C:\symbols*https://msdl.microsoft.com/download/symbols
+
+************* Path validation summary **************
+Response                         Time (ms)     Location
+Deferred                                       SRV*C:\symbols*https://msdl.microsoft.com/download/symbols
+Symbol search path is: SRV*C:\symbols*https://msdl.microsoft.com/download/symbols
+Executable search path is: 
+
++------------------------------------------------------------------------+
+| This target supports Hardware-enforced Stack Protection. A HW based    |
+| "Shadow Stack" may be available to assist in debugging and analysis.   |
+| See aka.ms/userhsp for more info.                                      |
+|                                                                        |
+| dps @ssp                                                               |
+|                                                                        |
++------------------------------------------------------------------------+
+
+ModLoad: 00000001`40000000 00000001`42e52000   vcomp140.dll
+ModLoad: 00007ff9`68940000 00007ff9`68ba6000   ntdll.dll
+ModLoad: 00007ff9`67dd0000 00007ff9`67e99000   C:\WINDOWS\System32\KERNEL32.DLL
+ModLoad: 00007ff9`66260000 00007ff9`6665f000   C:\WINDOWS\System32\KERNELBASE.dll
+ModLoad: 00007ff9`66010000 00007ff9`6618e000   C:\WINDOWS\System32\CRYPT32.dll
+ModLoad: 00007ff9`65b50000 00007ff9`65c9c000   C:\WINDOWS\System32\ucrtbase.dll
+ModLoad: 00007ff9`67840000 00007ff9`678a6000   C:\WINDOWS\System32\SHLWAPI.dll
+ModLoad: 00007ff9`52c70000 00007ff9`52ca6000   C:\WINDOWS\SYSTEM32\WINMM.dll
+ModLoad: 00007ff9`48070000 00007ff9`4807a000   C:\WINDOWS\SYSTEM32\WSOCK32.dll
+ModLoad: 00007ff9`5f0c0000 00007ff9`5f0cb000   C:\WINDOWS\SYSTEM32\VERSION.dll
+ModLoad: 00007ff9`68440000 00007ff9`68606000   C:\WINDOWS\System32\USER32.dll
+ModLoad: 00007ff9`666e0000 00007ff9`66789000   C:\WINDOWS\System32\msvcrt.dll
+ModLoad: 00000000`01600000 00000000`016a9000   C:\WINDOWS\System32\msvcrt.dll
+ModLoad: 00007ff9`52d60000 00007ff9`52ff1000   C:\WINDOWS\WinSxS\amd64_microsoft.windows.common-controls_6595b64144ccf1df_6.0.26100.8972_none_3e0da176e32f9d4b\COMCTL32.dll
+ModLoad: 00007ff9`65ea0000 00007ff9`65ec7000   C:\WINDOWS\System32\win32u.dll
+ModLoad: 00007ff9`669e0000 00007ff9`66a62000   C:\WINDOWS\System32\WS2_32.dll
+ModLoad: 00007ff9`67810000 00007ff9`6783b000   C:\WINDOWS\System32\GDI32.dll
+ModLoad: 00000000`00170000 00000000`0019b000   C:\WINDOWS\System32\GDI32.dll
+ModLoad: 00007ff9`65cb0000 00007ff9`65dd9000   C:\WINDOWS\System32\gdi32full.dll
+ModLoad: 00007ff9`67970000 00007ff9`67a88000   C:\WINDOWS\System32\RPCRT4.dll
+ModLoad: 00007ff9`51fe0000 00007ff9`52275000   C:\WINDOWS\SYSTEM32\WININET.dll
+ModLoad: 00007ff9`66910000 00007ff9`669cc000   C:\WINDOWS\System32\ADVAPI32.dll
+ModLoad: 00007ff9`65ed0000 00007ff9`65f73000   C:\WINDOWS\System32\msvcp_win.dll
+ModLoad: 00007ff9`68850000 00007ff9`688fa000   C:\WINDOWS\System32\sechost.dll
+ModLoad: 00007ff9`61770000 00007ff9`61818000   C:\WINDOWS\SYSTEM32\UxTheme.dll
+ModLoad: 00007ff9`61e50000 00007ff9`61e7f000   C:\WINDOWS\SYSTEM32\dwmapi.dll
+ModLoad: 00007ff9`66fa0000 00007ff9`67728000   C:\WINDOWS\System32\SHELL32.dll
+ModLoad: 00000000`01600000 00000000`01985000   C:\WINDOWS\System32\combase.dll
+ModLoad: 00007ff9`66a70000 00007ff9`66df5000   C:\WINDOWS\System32\combase.dll
+ModLoad: 00007ff9`66e00000 00007ff9`66f99000   C:\WINDOWS\System32\ole32.dll
+ModLoad: 00007ff9`67730000 00007ff9`67809000   C:\WINDOWS\System32\OLEAUT32.dll
+(6ad4.438c): Break instruction exception - code 80000003 (first chance)
+ntdll!LdrpDoDebuggerBreak+0x35:
+00007ff9`68a5d78d cc              int     3
+0:000> $$ GTO-R6-A2 LOADER SMOKE - attempt_002 - cdb protocol (H5-style, no -g)
+0:000> $$ Target: gto_unpacked.dd_restored.exe (SHA256 c4a1a94e367c0f555243d3408446df0320c04d2262cc039a2fd436a064e01637)
+0:000> $$ Protocol: WORK_ORDER_GTO-R6-A2-LOADER-SMOKE_20260825.md section 3
+0:000> .echo ============ R6-A2 ATTEMPT 002 START ============
+============ R6-A2 ATTEMPT 002 START ============
+0:000> .symfix
+0:000> .sympath+
+Symbol search path is: srv*
+Expanded Symbol search path is: cache*;SRV*https://msdl.microsoft.com/download/symbols
+
+************* Path validation summary **************
+Response                         Time (ms)     Location
+Deferred                                       srv*
+0:000> .echo [phase] module base of target
+[phase] module base of target
+0:000> lm m vcomp140*
+start             end                 module name
+00000001`40000000 00000001`42e52000   vcomp140   (deferred)             
+0:000> .echo [phase] setting breakpoints TLS0/resolver/entry
+[phase] setting breakpoints TLS0/resolver/entry
+0:000> bp 0x141728972 ".echo *** HIT TLS0 0x141728972 ***; r; g"
+0:000> bp 0x1417223b2 ".echo *** HIT RESOLVER 0x1417223b2 ***; r; g"
+0:000> bp 0x1416fb532 ".echo *** HIT ENTRY 0x1416fb532 ***; r; g"
+0:000> bl
+ 0 e 00000001`41728972     0001 (0001)  0:**** *** WARNING: Unable to verify checksum for vcomp140.dll
+vcomp140!IID_IObjectComCompatible+0x15f0ab2 ".echo *** HIT TLS0 0x141728972 ***; r; g"
+ 1 e 00000001`417223b2     0001 (0001)  0:**** vcomp140!IID_IObjectComCompatible+0x15ea4f2 ".echo *** HIT RESOLVER 0x1417223b2 ***; r; g"
+ 2 e 00000001`416fb532     0001 (0001)  0:**** vcomp140!IID_IObjectComCompatible+0x15c3672 ".echo *** HIT ENTRY 0x1416fb532 ***; r; g"
+0:000> .echo [phase] exception handling: first-chance av -> record + gn; second-chance av -> record + terminate
+[phase] exception handling: first-chance av -> record + gn
+Couldn't resolve error at 'econd-chance av -> record + terminate'
+0:000> sxe -c ".echo *** FIRST-CHANCE AV ***; .exr -1; ~*k; gn" -c2 ".echo *** SECOND-CHANCE AV ***; .exr -1; r; .ecxr; ~*k; .echo *** SECOND-CHANCE RECORDED - TERMINATING ***; q" av
+0:000> sx
+  ct - Create thread - ignore
+  et - Exit thread - ignore
+ cpr - Create process - ignore
+ epr - Exit process - break
+  ld - Load module - output
+  ud - Unload module - ignore
+ ser - System error - ignore
+ ibp - Initial breakpoint - break
+ iml - Initial module load - ignore
+ out - Debuggee output - output
+
+  av - Access violation - break - not handled
+       Command: ".echo *** FIRST-CHANCE AV ***; .exr -1; ~*k; gn"
+       Second command: ".echo *** SECOND-CHANCE AV ***; .exr -1; r; .ecxr; ~*k; .echo *** SECOND-CHANCE RECORDED - TERMINATING ***; q"
+asrt - Assertion failure - break - not handled
+ aph - Application hang - break - not handled
+ bpe - Break instruction exception - break
+bpec - Break instruction exception continue - handled
+  eh - C++ EH exception - second-chance break - not handled
+ clr - CLR exception - second-chance break - not handled
+clrn - CLR notification exception - second-chance break - handled
+ cce - Control-Break exception - break
+  cc - Control-Break exception continue - handled
+ cce - Control-C exception - break
+  cc - Control-C exception continue - handled
+  dm - Data misaligned - break - not handled
+dbce - Debugger command exception - ignore - handled
+  gp - Guard page violation - break - not handled
+  ii - Illegal instruction - second-chance break - not handled
+  ip - In-page I/O error - break - not handled
+  dz - Integer divide-by-zero - break - not handled
+ iov - Integer overflow - break - not handled
+  ch - Invalid handle - break
+  hc - Invalid handle continue - not handled
+ lsq - Invalid lock sequence - break - not handled
+ isc - Invalid system call - break - not handled
+  3c - Port disconnected - second-chance break - not handled
+ svh - Service hang - break - not handled
+ sse - Single step exception - break
+ssec - Single step exception continue - handled
+ sbo - Security check failure or stack buffer overrun - break - not handled
+ sov - Stack overflow - break - not handled
+  vs - Verifier stop - break - not handled
+vcpp - Visual C++ exception - ignore - handled
+ wkd - Wake debugger - break - not handled
+ rto - Windows Runtime Originate Error - second-chance break - not handled
+ rtt - Windows Runtime Transform Error - second-chance break - not handled
+ wob - WOW64 breakpoint - break - handled
+ wos - WOW64 single step exception - break - handled
+
+   * - Other exception - second-chance break - not handled
+0:000> .echo [phase] go
+[phase] go
+0:000> g
+ModLoad: 00007ff9`67a90000 00007ff9`67ac2000   C:\WINDOWS\System32\IMM32.DLL
+*** HIT TLS0 0x141728972 ***
+rax=0000000141728972 rbx=000000007ffe0384 rcx=0000000140000000
+rdx=0000000000000001 rsi=0000000141728972 rdi=00007ff968a24700
+rip=0000000141728972 rsp=00000000007ff178 rbp=0000000000000000
+ r8=0000000000000000  r9=0000000141728972 r10=0000000140000000
+r11=00007ff968a24700 r12=000000007ffe0385 r13=0000000000000000
+r14=0000000000000001 r15=0000000140000000
+iopl=0         nv up ei pl zr na po nc
+cs=0033  ss=002b  ds=002b  es=002b  fs=0053  gs=002b             efl=00000246
+vcomp140!IID_IObjectComCompatible+0x15f0ab2:
+00000001`41728972 81fa01000000    cmp     edx,1
+*** HIT RESOLVER 0x1417223b2 ***
+rax=0000000141728972 rbx=000000007ffe0384 rcx=0000000140000000
+rdx=0000000000000001 rsi=0000000141728972 rdi=00007ff968a24700
+rip=00000001417223b2 rsp=00000000007ff130 rbp=0000000000000000
+ r8=0000000000000000  r9=0000000141728972 r10=0000000140000000
+r11=00007ff968a24700 r12=000000007ffe0385 r13=0000000000000000
+r14=0000000000000001 r15=0000000140000000
+iopl=0         nv up ei pl nz na po nc
+cs=0033  ss=002b  ds=002b  es=002b  fs=0053  gs=002b             efl=00000206
+vcomp140!IID_IObjectComCompatible+0x15ea4f2:
+00000001`417223b2 52              push    rdx
+(6ad4.438c): Access violation - code c0000005 (first chance)
+*** FIRST-CHANCE AV ***
+ExceptionAddress: 0000000142934089 (vcomp140!IID_IObjectComCompatible+0x00000000027fc1c9)
+   ExceptionCode: c0000005 (Access violation)
+  ExceptionFlags: 00000000
+NumberParameters: 2
+   Parameter[0]: 0000000000000000
+   Parameter[1]: 00000000009fd548
+Attempt to read from address 00000000009fd548
+
+.  0  Id: 6ad4.438c Suspend: 1 Teb: 00000000`00281000 Unfrozen
+Child-SP          RetAddr               Call Site
+00000000`007fe3b8 00000000`00000048     vcomp140!IID_IObjectComCompatible+0x27fc1c9
+00000000`00000000 00000000`00000000     0x48
+
+   1  Id: 6ad4.67e4 Suspend: 1 Teb: 00000000`00283000 Unfrozen
+Child-SP          RetAddr               Call Site
+00000000`00dffbf8 00007ff9`6899064e     ntdll!ZwWaitForWorkViaWorkerFactory+0x14
+00000000`00dffc00 00007ff9`67dfccb7     ntdll!RtlSetThreadSubProcessTag+0x1aee
+00000000`00dfff60 00007ff9`689ead6c     KERNEL32!BaseThreadInitThunk+0x17
+00000000`00dfff90 00000000`00000000     ntdll!RtlUserThreadStart+0x2c
+
+   2  Id: 6ad4.6f8c Suspend: 1 Teb: 00000000`00285000 Unfrozen
+Child-SP          RetAddr               Call Site
+00000000`011ffbf8 00007ff9`6899064e     ntdll!ZwWaitForWorkViaWorkerFactory+0x14
+00000000`011ffc00 00007ff9`67dfccb7     ntdll!RtlSetThreadSubProcessTag+0x1aee
+00000000`011fff60 00007ff9`689ead6c     KERNEL32!BaseThreadInitThunk+0x17
+00000000`011fff90 00000000`00000000     ntdll!RtlUserThreadStart+0x2c
+
+   3  Id: 6ad4.7458 Suspend: 1 Teb: 00000000`00287000 Unfrozen
+Child-SP          RetAddr               Call Site
+00000000`015ffbf8 00007ff9`6899064e     ntdll!ZwWaitForWorkViaWorkerFactory+0x14
+00000000`015ffc00 00007ff9`67dfccb7     ntdll!RtlSetThreadSubProcessTag+0x1aee
+00000000`015fff60 00007ff9`689ead6c     KERNEL32!BaseThreadInitThunk+0x17
+00000000`015fff90 00000000`00000000     ntdll!RtlUserThreadStart+0x2c
+(6ad4.438c): Access violation - code c0000005 (!!! second chance !!!)
+*** SECOND-CHANCE AV ***
+ExceptionAddress: 0000000142934089 (vcomp140!IID_IObjectComCompatible+0x00000000027fc1c9)
+   ExceptionCode: c0000005 (Access violation)
+  ExceptionFlags: 00000000
+NumberParameters: 2
+   Parameter[0]: 0000000000000000
+   Parameter[1]: 00000000009fd548
+Attempt to read from address 00000000009fd548
+rax=07fffffffeb8cc40 rbx=001b6fb377300045 rcx=00000000ffa37e01
+rdx=0000000000500000 rsi=00000001416f4404 rdi=0000000142ac10ff
+rip=0000000142934089 rsp=00000000007fe3b8 rbp=ffffffffffff6df9
+ r8=00000000a91c52d3  r9=00000000007fe5f8 r10=000000014011eb62
+r11=00000000009fd548 r12=000000007ffe0385 r13=0000000000000000
+r14=0000000000000001 r15=0000000140000000
+iopl=0         nv up ei pl nz ac pe nc
+cs=0033  ss=002b  ds=002b  es=002b  fs=0053  gs=002b             efl=00010210
+vcomp140!IID_IObjectComCompatible+0x27fc1c9:
+00000001`42934089 418b8cab1c480200 mov     ecx,dword ptr [r11+rbp*4+2481Ch] ds:00000000`009fd548=????????
+Unable to get exception context, HRESULT 0x8000FFFF
+
+.  0  Id: 6ad4.438c Suspend: 1 Teb: 00000000`00281000 Unfrozen
+Child-SP          RetAddr               Call Site
+00000000`007fe3b8 00000001`401a3d79     vcomp140!IID_IObjectComCompatible+0x27fc1c9
+00000000`007fe630 00000001`428d1c11     vcomp140!IID_IObjectComCompatible+0x6beb9
+00000000`007ff120 00000001`41728972     vcomp140!IID_IObjectComCompatible+0x2799d51
+00000000`007ff128 00000000`00000010     vcomp140!IID_IObjectComCompatible+0x15f0ab2
+00000000`007ff130 00000000`007ff148     0x10
+00000000`007ff138 ffffffff`ff800edf     0x7ff148
+00000000`007ff140 00000000`007ff120     0xffffffff`ff800edf
+00000000`007ff148 00000001`4172898a     0x7ff120
+00000000`007ff150 00000000`0091f3d0     vcomp140!IID_IObjectComCompatible+0x15f0aca
+00000000`007ff158 00007ff9`68993a10     0x91f3d0
+00000000`007ff160 00007ff9`689622e8     ntdll!RtlFreeHeap+0x620
+00000000`007ff250 00007ff9`6899a0d9     ntdll!RtlSizeHeap+0x12e8
+00000000`007ff2b0 00007ff9`68993a10     ntdll!RtlCreateUnicodeString+0x5689
+00000000`007ff400 00000001`40000000     ntdll!RtlFreeHeap+0x620
+00000000`007ff4f0 00000000`00000000     vcomp140
+
+   1  Id: 6ad4.67e4 Suspend: 1 Teb: 00000000`00283000 Unfrozen
+Child-SP          RetAddr               Call Site
+00000000`00dffbf8 00007ff9`6899064e     ntdll!ZwWaitForWorkViaWorkerFactory+0x14
+00000000`00dffc00 00007ff9`67dfccb7     ntdll!RtlSetThreadSubProcessTag+0x1aee
+00000000`00dfff60 00007ff9`689ead6c     KERNEL32!BaseThreadInitThunk+0x17
+00000000`00dfff90 00000000`00000000     ntdll!RtlUserThreadStart+0x2c
+
+   2  Id: 6ad4.6f8c Suspend: 1 Teb: 00000000`00285000 Unfrozen
+Child-SP          RetAddr               Call Site
+00000000`011ffbf8 00007ff9`6899064e     ntdll!ZwWaitForWorkViaWorkerFactory+0x14
+00000000`011ffc00 00007ff9`67dfccb7     ntdll!RtlSetThreadSubProcessTag+0x1aee
+00000000`011fff60 00007ff9`689ead6c     KERNEL32!BaseThreadInitThunk+0x17
+00000000`011fff90 00000000`00000000     ntdll!RtlUserThreadStart+0x2c
+
+   3  Id: 6ad4.7458 Suspend: 1 Teb: 00000000`00287000 Unfrozen
+Child-SP          RetAddr               Call Site
+00000000`015ffbf8 00007ff9`6899064e     ntdll!ZwWaitForWorkViaWorkerFactory+0x14
+00000000`015ffc00 00007ff9`67dfccb7     ntdll!RtlSetThreadSubProcessTag+0x1aee
+00000000`015fff60 00007ff9`689ead6c     KERNEL32!BaseThreadInitThunk+0x17
+00000000`015fff90 00000000`00000000     ntdll!RtlUserThreadStart+0x2c
+*** SECOND-CHANCE RECORDED - TERMINATING ***
+quit:
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\atlmfc.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\ObjectiveC.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\concurrency.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\cpp_rest.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\stl.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Data.Json.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Devices.Geolocation.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Devices.Sensors.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Media.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\windows.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\winrt.natvis'

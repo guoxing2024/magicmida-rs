@@ -1,0 +1,14 @@
+{
+  "attempt": "001",
+  "protocol": "WORK_ORDER_GTO-R6-A2-LOADER-SMOKE_20260825.md section 3 (cdb with -g: breakpoints set AFTER TLS chain already executed - protocol defect; second-chance scene still captured)",
+  "target": "gto_unpacked.dd_restored.exe (layout_A, SHA256 c4a1a94e367c0f555243d3408446df0320c04d2262cc039a2fd436a064e01637)",
+  "module": "vcomp140.dll (Themida disguised name), base 0x140000000 size 0x2e52000",
+  "elapsed_ms": 354,
+  "hard_timeout_ms": 120000,
+  "timeout": false,
+  "defect": "cdb -g suppresses initial breakpoint; -cf script runs at first-chance AV (TLS chain already executed); TLS0/resolver/entry breakpoints set too late, never hit",
+  "evidence_of_chain": "second-chance stack shows return addr 0x14172898a (TLS0+0x18) on stack - execution passed through TLS0 before breakpoints active",
+  "second_chance_exception": true,
+  "crash_point": {"va": "0x142934089", "symbol": "vcomp140!IID_IObjectComCompatible+0x27fc1c9", "rva": "0x2934089", "section": ".rdata2", "faulting_address": "0x9fd548", "regs": {"rip": "0x142934089", "rax": "0x7ffffffeb8cc40", "rbx": "0x1b6fb377300045", "rcx": "0xffa37e01", "rdx": "0x500000", "rsp": "0x7fe3b8", "rbp": "0xffffffffffff6df9", "rsi": "0x1416f4404", "rdi": "0x142ac10ff"}, "disasm": "mov ecx,dword ptr [r11+rbp*4+2481Ch]", "note": "identical to H5 candidate crash point 0x142934089 read 0x9fd548"},
+  "verdict": "A2-FAIL (second-chance AV; breakpoint timeline incomplete due to -g defect - superseded by attempt_002/003 with corrected protocol)"
+}
