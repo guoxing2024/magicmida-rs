@@ -554,12 +554,27 @@ walker_dispatch: {
   `remote_va == module_base + file_rva` 不一致 -> BAD_PARAMS，门开也不能
   跳过权威链）；
   gate 开 + 任一载体缺失 -> `None`（fail-closed）。
-- **载体缺口（如实记录）**: 两处构造点作用域内当前没有远程 `MidaExportsV2`
-  载体（`run_runtime_loader` 内部 `resolve_mida_exports_remote` 的结果未随
-  `LoaderResult` 传出）。因此本单接线后运行期两处实际仍为 `None`（exports
-  传 None）——gate 与接线形态已就位、T13-T16 用 sealed 载体对验证构造路径
-  全绿，但生产桥要真正构造还需一个载体通道（如 `LoaderResult` 增加 exports
-  字段，属新实现卡范围，本单不实施）。
+- **WIRING-2（2026-08-26，commit 645459c 之上）— 缺口 closed**: 由
+  `WORK_ORDER_IMP-09-DISPATCH-WIRING-2_20260826.md` 补全载体通道：
+  `LoaderResult` 增加密封字段 `walker_exports: Option<MidaExportsV2>`
+  + `pub fn walker_exports() -> Option<&MidaExportsV2>` accessor；
+  `run_runtime_loader` 尾部在 `load_and_initialize` 成功（`require_complete`
+  已通过）后将 `Some(loaded.exports)` 写入该字段随 `LoaderResult` 返回；
+  mod.rs post-attach 构造点把 `exports` 参数从 `None` 改为
+  `loader_outcome.as_ref().ok().and_then(|l| l.walker_exports())`——
+  通道可达、运行期该处可真正构造桥。
+  T17（载体一致）+ T18（门开消费通道）验证：
+  - T17: 走 pub(crate) sealed ctor 构造带 `walker_exports` 的 `LoaderResult`，
+    验证 `walker_execute == module_base + file_rva`（双 sealed 交叉一致），
+    且未带通道的 bare `LoaderResult` 仍为 `None`（fail-closed）；
+  - T18: gate 开 + 通道载体完整 -> `try_build_live_dispatch_bridge_boxed`
+    返回 `Some(bridge)` 且 `cross_check` 通过；通道缺失/loader 缺失 ->
+    `None`。
+  **CREATE_PROCESS 构造点仍然 `None`**：该构造点在 runtime loader 运行**之前**
+  完成，loader_result 此刻尚不可及；按"缺载体保持 None + 报告说明"护栏，
+  该处保持 `None`（fail-closed）；如需该处也接入 WIRING-2 通道需引入
+  `AntidebugController` 的 deferred/rebuild seam（属新工单，本单不实施）。
+  R5-R2/R3/R4 冻结语义、`runner_preflight.rs`、桥与门控语义均未触碰。
 
 ---
 

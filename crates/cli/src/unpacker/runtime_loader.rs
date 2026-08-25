@@ -3218,6 +3218,13 @@ pub fn run_runtime_loader(
     // runtime init contract).
     let walker_export_rva =
         RuntimeLoader::resolve_walker_export_rva_from_file(&loaded.file_identity).ok();
+    // WIRING-2: carry the REMOTE-side sealed exports carrier out of the
+    // loader. `loaded.exports` is the MidaExportsV2 resolved from the
+    // TARGET process memory (module_base + export RVA per wanted export),
+    // and load_and_initialize_inner already ran require_complete() (all 5
+    // wanted exports present) before returning Ok — so when this point is
+    // reached the exports set is complete. None is never substituted; the
+    // field carries the exact resolved set (fail-closed consumers).
     Ok(crate::unpacker::antidebug_controller::LoaderResult::new(
         loaded.module_base as u64,
         loaded.attestation_json,
@@ -3225,6 +3232,7 @@ pub fn run_runtime_loader(
         loaded.digest_authority,
         target_pid,
         walker_export_rva,
+        Some(loaded.exports),
     ))
 }
 
@@ -6123,6 +6131,7 @@ mod imp09_carrier_r2_tests {
             authority,
             1234,
             Some(rva),
+            None, // walker_exports: not needed by this test
         );
         assert_eq!(lr.walker_export_rva(), Some(0x2040));
     }

@@ -792,16 +792,15 @@ pub fn unpack(
                 // Gate open -> construct via the sealed dual-carrier path;
                 // missing carriers -> None (fail-closed). The file-side
                 // loader carrier is in scope (loader_outcome); the
-                // remote-side MidaExportsV2 carrier is NOT reachable from
-                // this construction site (resolve_mida_exports_remote runs
-                // inside run_runtime_loader and is not carried on
-                // LoaderResult) -> exports stays None here, so the bridge
-                // stays None until a carrier channel exists (reported in
-                // docs/IMP09_DISPATCH_WIRING_REPORT_20260826.md).
+                // WIRING-2: the remote-side MidaExportsV2 carrier now
+                // travels on LoaderResult.walker_exports (set by
+                // run_runtime_loader from resolve_mida_exports_remote).
+                // Gate open + both sealed carriers present -> bridge
+                // constructs; any missing -> None (fail-closed).
                 walker_dispatch: walker_dispatch::try_build_live_dispatch_bridge_boxed(
                     dbg.process_handle(),
                     loader_outcome.as_ref().ok(),
-                    None, // remote MidaExportsV2 carrier not in scope
+                    loader_outcome.as_ref().ok().and_then(|l| l.walker_exports()),
                 ),
                 // IMP-09-CARRIER-R5-R2-1: the debugger drives termination
                 // AFTER the controller gate (alive window); run() must not
@@ -1242,13 +1241,17 @@ pub fn unpack(
                             // execute gate, Proceed blocked — unchanged).
                             // Gate open -> construct via the sealed
                             // dual-carrier path; missing carriers -> None.
-                            // This construction site runs BEFORE the
-                            // runtime loader (loader_outcome is produced
-                            // later in this handler) and the remote
-                            // MidaExportsV2 carrier is not in scope, so
-                            // both carriers are None here -> bridge stays
-                            // None (fail-closed; reported in
-                            // docs/IMP09_DISPATCH_WIRING_REPORT_20260826.md).
+                            // WIRING-2 note: this construction site runs
+                            // BEFORE the runtime loader (loader_outcome is
+                            // produced later in this handler, after the
+                            // AntidebugController is constructed), so both
+                            // carriers are structurally unavailable here ->
+                            // bridge stays None (fail-closed). The
+                            // post-attach construction site carries the
+                            // full WIRING-2 channel; this site would need
+                            // a deferred/rebuild seam to ever construct
+                            // (out of scope; reported in
+                            // docs/IMP09_DISPATCH_WIRING2_REPORT_20260826.md).
                             walker_dispatch: walker_dispatch::try_build_live_dispatch_bridge_boxed(
                                 dbg.process_handle(),
                                 None, // loader outcome not yet produced

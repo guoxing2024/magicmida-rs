@@ -58,7 +58,7 @@ use windows::Win32::Foundation::HANDLE;
 
 use crate::log::{self, LogType};
 use crate::unpacker::runtime_loader::{
-    RuntimeAuthorityManifest, RuntimeDigestAuthority, RuntimeFileIdentity,
+    MidaExportsV2, RuntimeAuthorityManifest, RuntimeDigestAuthority, RuntimeFileIdentity,
 };
 use crate::unpacker::walker_session::{
     probe_process_liveness, prove_candidate_mappings, CandidateMappingProofSet, LivenessProbe,
@@ -540,6 +540,15 @@ pub struct LoaderResult {
     /// WalkerExecute export (loader itself still succeeds — the walker
     /// carrier is simply absent and binding fails closed).
     walker_export_rva: Option<u64>,
+    /// IMP-09-CARRIER-R2 / WIRING-2: the REMOTE-side sealed carrier — the
+    /// full MidaExportsV2 set resolved from the TARGET process memory by
+    /// `resolve_mida_exports_remote` inside the runtime loader (module_base
+    /// + export RVA for each of the frozen 5 wanted exports). This is the
+    /// live-process half of the dual-sealed cross-check consumed by the
+    /// dispatch bridge; it is Some only when the loader successfully
+    /// resolved AND `require_complete()` passed (all 5 wanted exports
+    /// present). None -> the bridge stays absent (fail-closed).
+    walker_exports: Option<MidaExportsV2>,
 }
 
 impl LoaderResult {
@@ -553,6 +562,7 @@ impl LoaderResult {
         digest_authority: RuntimeDigestAuthority,
         target_pid: u32,
         walker_export_rva: Option<u64>,
+        walker_exports: Option<MidaExportsV2>,
     ) -> Self {
         Self {
             module_base,
@@ -561,6 +571,7 @@ impl LoaderResult {
             digest_authority,
             target_pid,
             walker_export_rva,
+            walker_exports,
         }
     }
 
@@ -598,6 +609,14 @@ impl LoaderResult {
     /// bytes — never from a live process, never from a raw string.
     pub fn walker_export_rva(&self) -> Option<u64> {
         self.walker_export_rva
+    }
+
+    /// WIRING-2: sealed REMOTE-side walker exports carrier (MidaExportsV2
+    /// resolved from the target process memory by the loader). None when
+    /// the loader did not resolve the full 5-item set; the dispatch bridge
+    /// must stay absent (fail-closed) in that case.
+    pub fn walker_exports(&self) -> Option<&MidaExportsV2> {
+        self.walker_exports.as_ref()
     }
 }
 
@@ -2123,6 +2142,7 @@ mod tests {
             digest_authority,
             target_pid,
             None,
+            None, // walker_exports: not needed by this test
         )
     }
 
@@ -2266,6 +2286,7 @@ mod tests {
             digest_authority,
             target_pid,
             Some(0x2040), // sealed pure-file WalkerExecute export RVA
+            None, // walker_exports: not needed by this test
         )
     }
 

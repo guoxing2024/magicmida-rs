@@ -557,6 +557,7 @@ mod imp09_dispatch_bridge_tests {
             digest_authority,
             std::process::id(),
             Some(file_rva),
+            None, // walker_exports: set explicitly by WIRING-2 tests
         )
     }
 
@@ -1015,5 +1016,113 @@ mod imp09_dispatch_bridge_tests {
         assert!(!live_dispatch_gate());
         unsafe { std::env::remove_var("MIDA_GTO_LIVE_AUTHORIZED") };
         assert!(!live_dispatch_gate());
+    }
+
+    // -------------------------------------------------------------------
+    // T17-T18 (WIRING-2): remote exports carrier channel.
+    //
+    // The channel: run_runtime_loader now carries the REMOTE-side sealed
+    // MidaExportsV2 on LoaderResult.walker_exports (the same set resolved
+    // from the TARGET process memory by resolve_mida_exports_remote, with
+    // require_complete() already passed inside the loader). T17 proves the
+    // carrier round-trips through the sealed ctor and that the remote VA
+    // agrees with the file-side RVA (module_base + file_rva) — the
+    // dual-sealed cross-check input. T18 proves the production wiring seam
+    // consumes the channel: gate open + channel carriers -> Some(bridge);
+    // channel missing (walker_exports None) -> None (fail-closed).
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn t17_loader_result_carries_remote_exports_consistent_with_file_rva() {
+        // Build a sealed LoaderResult whose walker_exports channel carries
+        // the remote-side set (test stand-in for run_runtime_loader output;
+        // the loader itself sets Some(loaded.exports) at runtime_loader.rs).
+        let (mut loader, exports) = carrier_pair(0x7FF600000000, 0x2040);
+        // Simulate the WIRING-2 loader channel: attach the remote exports
+        // set to the LoaderResult. The channel is a separate sealed field;
+        // we rebuild through the same pub(crate) sealed ctor used by the
+        // production loader so the test exercises the real carrier path.
+        loader = LoaderResult::new(
+            loader.module_base(),
+            "{}".to_string(),
+            loader.file_identity().clone(),
+            loader.digest_authority().clone(),
+            loader.target_pid(),
+            loader.walker_export_rva(),
+            Some(exports.clone()),
+        );
+        let carried = loader
+            .walker_exports()
+            .expect("WIRING-2 channel must carry the remote exports set");
+        let remote_va = carried
+            .walker_execute
+            .expect("complete exports set has walker_execute");
+        // Dual-sealed cross-check input consistency: remote VA ==
+        // module_base + file_rva (both sealed chains agree).
+        let file_rva = loader
+            .walker_export_rva()
+            .expect("file-side RVA carrier present");
+        assert_eq!(remote_va as u64, loader.module_base() + file_rva);
+        assert_eq!(remote_va as u64, 0x7FF600000000 + 0x2040);
+        // And the channel is Some only when the loader succeeded; a
+        // bare LoaderResult without the channel stays None (fail-closed).
+        let (bare, _) = carrier_pair(0x7FF600000000, 0x2040);
+        assert!(bare.walker_exports().is_none());
+    }
+
+    #[test]
+    fn t18_gate_open_consumes_channel_bridge_builds_otherwise_none() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        set_gate_env(Some("1"), Some("1"));
+        assert!(live_dispatch_gate());
+
+        // Channel present (T17 carrier) -> bridge constructs.
+        let (mut loader, exports) = carrier_pair(0x7FF600000000, 0x2040);
+        loader = LoaderResult::new(
+            loader.module_base(),
+            "{}".to_string(),
+            loader.file_identity().clone(),
+            loader.digest_authority().clone(),
+            loader.target_pid(),
+            loader.walker_export_rva(),
+            Some(exports.clone()),
+        );
+        // Concrete return: lets us assert carriers_complete / cross_check.
+        let bridge = try_build_live_dispatch_bridge(
+            self_handle(),
+            Some(&loader),
+            loader.walker_exports(),
+        )
+        .expect("gate open + channel carriers must build the bridge");
+        assert!(bridge.carriers_complete());
+        assert!(bridge.cross_check_passes(0x7FF600000000 + 0x2040));
+        // Boxed variant (production slot type) also yields Some.
+        assert!(
+            try_build_live_dispatch_bridge_boxed(
+                self_handle(),
+                Some(&loader),
+                loader.walker_exports(),
+            )
+            .is_some()
+        );
+
+        // Channel missing (loader.walker_exports None) -> None.
+        let (bare, _) = carrier_pair(0x7FF600000000, 0x2040);
+        assert!(try_build_live_dispatch_bridge_boxed(
+            self_handle(),
+            Some(&bare),
+            bare.walker_exports(),
+        )
+        .is_none());
+
+        // Loader missing entirely -> None.
+        assert!(try_build_live_dispatch_bridge_boxed(
+            self_handle(),
+            None,
+            None,
+        )
+        .is_none());
+
+        clear_gate_env();
     }
 }

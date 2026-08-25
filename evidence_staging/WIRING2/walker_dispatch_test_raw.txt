@@ -1,0 +1,58 @@
+RC=0
+
+running 18 tests
+test unpacker::walker_dispatch::imp09_dispatch_bridge_tests::t01_thunk_bytes_frozen_identical_to_production ... ok
+test unpacker::walker_dispatch::imp09_dispatch_bridge_tests::t02_thunk_args_layout_matches_runtime_loader ... ok
+test unpacker::walker_dispatch::imp09_dispatch_bridge_tests::t03_cross_check_passes_on_matching_carriers ... ok
+test unpacker::walker_dispatch::imp09_dispatch_bridge_tests::t04_cross_check_fails_closed_on_mismatch ... ok
+test unpacker::walker_dispatch::imp09_dispatch_bridge_tests::t05_cross_check_fails_closed_on_missing_walker_execute_export ... ok
+test unpacker::walker_dispatch::imp09_dispatch_bridge_tests::t06_cross_check_fails_closed_on_overflow ... ok
+test unpacker::walker_dispatch::imp09_dispatch_bridge_tests::t07_dispatch_fails_closed_on_cross_check_mismatch ... ok
+test unpacker::walker_dispatch::imp09_dispatch_bridge_tests::t08_dispatch_fails_closed_on_noncanonical_params_va ... ok
+test unpacker::walker_dispatch::imp09_dispatch_bridge_tests::t09_dispatch_marshal_blob_carries_only_authorized_target ... ok
+test unpacker::walker_dispatch::imp09_dispatch_bridge_tests::t10_dispatch_fails_closed_when_args_pointer_diverges ... ok
+test unpacker::walker_dispatch::imp09_dispatch_bridge_tests::t11_bridge_carrier_contract_requires_both_sealed_sources ... ok
+test unpacker::walker_dispatch::imp09_dispatch_bridge_tests::t12_thunk_args_serialization_roundtrip_consistent ... ok
+test unpacker::walker_dispatch::imp09_dispatch_bridge_tests::t13_gate_closed_returns_none_bridge ... ok
+test unpacker::walker_dispatch::imp09_dispatch_bridge_tests::t14_gate_open_with_complete_carriers_builds_bridge ... ok
+test unpacker::walker_dispatch::imp09_dispatch_bridge_tests::t15_gate_open_cannot_bypass_cross_check_mismatch ... ok
+test unpacker::walker_dispatch::imp09_dispatch_bridge_tests::t16_env_tests_serialized_and_reproducible ... ok
+test unpacker::walker_dispatch::imp09_dispatch_bridge_tests::t17_loader_result_carries_remote_exports_consistent_with_file_rva ... ok
+test unpacker::walker_dispatch::imp09_dispatch_bridge_tests::t18_gate_open_consumes_channel_bridge_builds_otherwise_none ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 528 filtered out; finished in 0.01s
+
+
+---STDERR---
+warning: unused import: `AbortState`
+    --> crates\cli\src\unpacker\antidebug_controller.rs:2760:13
+     |
+2760 |             AbortState, HookInventory, ProbeSummary, RoundLedger, WalkerAttestation,
+     |             ^^^^^^^^^^
+     |
+     = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unnecessary parentheses around assigned value
+   --> crates\cli\src\unpacker\oep_evidence.rs:622:23
+    |
+622 |         let raw_off = (sh + 0x28);
+    |                       ^         ^
+    |
+    = note: `#[warn(unused_parens)]` (part of `#[warn(unused)]`) on by default
+help: remove these parentheses
+    |
+622 -         let raw_off = (sh + 0x28);
+622 +         let raw_off = sh + 0x28;
+    |
+
+warning: unused variable: `dump_timing`
+   --> crates\cli\src\unpacker\post_attach.rs:400:5
+    |
+400 |     dump_timing: mida_pe::DumpTiming,
+    |     ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_dump_timing`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `mida-cli` (lib test) generated 3 warnings (run `cargo fix --lib -p mida-cli --tests` to apply 3 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.09s
+     Running unittests src\lib.rs (target\debug\deps\mida_cli-a3c6e38d657a42e8.exe)
