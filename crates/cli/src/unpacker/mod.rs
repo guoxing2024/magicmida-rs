@@ -42,12 +42,13 @@ mod post_attach;
 mod post_loop;
 mod relocation_evidence;
 pub mod runtime_loader;
-pub mod walker_session;
 mod section_rebuild_evidence;
 mod session;
 pub(crate) mod sidecar_io;
 mod tls_evidence;
 mod verify;
+pub mod walker_session;
+pub mod walker_teardown;
 
 #[cfg(test)]
 mod production_e2e;
@@ -562,9 +563,7 @@ pub fn unpack(
         // IMP-09-PROFILE-SOURCE-R1: profile id/digest come from the sealed
         // verified carrier (attestation-bound). No preflight/profile ->
         // None -> the loader fails closed (no bare-string substitution).
-        let profile_carrier = evidence_ctx
-            .as_ref()
-            .and_then(|ctx| ctx.profile_identity());
+        let profile_carrier = evidence_ctx.as_ref().and_then(|ctx| ctx.profile_identity());
         let outcome = crate::unpacker::runtime_loader::run_runtime_loader(
             dbg.process_handle(),
             dbg.pid(),
@@ -577,7 +576,8 @@ pub fn unpack(
                 LogType::Info,
                 &format!(
                     "post-attach runtime loader (pre-resume): module_base={:#x} target_pid={}",
-                    loader_result.module_base(), loader_result.target_pid()
+                    loader_result.module_base(),
+                    loader_result.target_pid()
                 ),
             ),
             Err(e) => log::log(
@@ -1314,9 +1314,7 @@ pub fn unpack(
                     let loader_outcome = crate::unpacker::runtime_loader::run_runtime_loader(
                         target_handle,
                         pid,
-                        evidence_ctx
-                            .as_ref()
-                            .and_then(|ctx| ctx.profile_identity()),
+                        evidence_ctx.as_ref().and_then(|ctx| ctx.profile_identity()),
                         &mut drain,
                     );
                     match loader_outcome {

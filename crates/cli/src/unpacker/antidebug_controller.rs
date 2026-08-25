@@ -107,13 +107,24 @@ impl CleanupError {
 /// release the remote memory exactly once (cleanup is idempotent).
 ///
 /// # Safety
-/// Holds a raw pointer to the controller's `walker_mem` field. The
-/// guard is a local of run() and drops before the controller is ever
-/// dropped; no other thread can touch the field (single-threaded
-/// lifecycle). The pointer is only used through `Option::take`, so
-/// the field becomes None after the first drop (idempotent).
+/// Holds raw pointers to the controller's `walker_mem` and
+/// `teardown_report` fields. The guard is a local of run() and drops
+/// before the controller is ever dropped; no other thread can touch
+/// the fields (single-threaded lifecycle). Each pointer is only used
+/// through `Option::take`, so each field becomes None after the first
+/// drop (idempotent).
+///
+/// R5-R4: the teardown is now STRUCTURED — the guard derives the
+/// teardown ledger from the R5-R2 allocation accounting (params first,
+/// then section), frees through the real `VirtualFreeEx` backend, and
+/// stashes the exportable [`WalkerTeardownReport`] on the controller so
+/// the walker evidence sidecar carries the outcome + event ledger. A
+/// teardown failure NEVER changes run()'s verdict (T1 separation) —
+/// the report is recorded alongside, and the walker output remains
+/// consumable.
 struct WalkerTeardownGuard {
     mem_ptr: *mut Option<crate::unpacker::walker_session::WalkerSessionMemory>,
+    report_ptr: *mut Option<crate::unpacker::walker_teardown::WalkerTeardownReport>,
     handle: Option<HANDLE>,
 }
 
@@ -121,22 +132,53 @@ impl WalkerTeardownGuard {
     fn new(c: &mut AntidebugController) -> Self {
         let mem_ptr =
             &mut c.walker_mem as *mut Option<crate::unpacker::walker_session::WalkerSessionMemory>;
+        let report_ptr = &mut c.teardown_report
+            as *mut Option<crate::unpacker::walker_teardown::WalkerTeardownReport>;
         let handle = c.options.target_handle;
-        Self { mem_ptr, handle }
+        Self {
+            mem_ptr,
+            report_ptr,
+            handle,
+        }
     }
 }
 
 impl Drop for WalkerTeardownGuard {
     fn drop(&mut self) {
         // SAFETY: see struct docs. The controller outlives the guard;
-        // the field access is exclusive (single-threaded lifecycle).
+        // the field accesses are exclusive (single-threaded lifecycle).
         unsafe {
-            if let Some(mem) = (*self.mem_ptr).take() {
-                if let Some(h) = self.handle {
-                    let mut mem = mem;
-                    mem.cleanup(h);
+            let report = match (*self.mem_ptr).take() {
+                Some(mem) => {
+                    if let Some(h) = self.handle {
+                        // R5-R4 structured teardown: real VirtualFreeEx
+                        // sequence over the R5-R2 allocation accounting;
+                        // outcome + event ledger stashed for evidence.
+                        let report =
+                            crate::unpacker::walker_teardown::teardown_walker_session_report(
+                                &mem, h,
+                            );
+                        // The session owner drops here:
+                        // WalkerSessionMemory's Drop runs its frozen
+                        // idempotent cleanup() (params/section already
+                        // released by the ledger) — a no-op release
+                        // attempt on the freed regions (safe, unchanged
+                        // R5-R2 behavior).
+                        drop(mem);
+                        report
+                    } else {
+                        // No target handle: nothing can be freed
+                        // remotely. Record the no-session report.
+                        drop(mem);
+                        crate::unpacker::walker_teardown::WalkerTeardownReport::no_session()
+                    }
                 }
-            }
+                // No session was installed (early failure / unwind before
+                // bind): record the no-session report so evidence is
+                // complete on EVERY exit path (T5).
+                None => crate::unpacker::walker_teardown::WalkerTeardownReport::no_session(),
+            };
+            (*self.report_ptr) = Some(report);
         }
     }
 }
@@ -361,6 +403,12 @@ pub struct WalkerEvidenceRecord {
     pub execute_liveness: Option<String>,
     pub candidate_mapping: Option<CandidateMappingProofSet>,
     pub events: Vec<WalkerRawEvent>,
+    /// IMP-09-CARRIER-R5-R4: structured teardown report of the session
+    /// allocations (outcome + per-step free events + double-free
+    /// refusals). None when run() never reached the guard (e.g. the
+    /// record is built before teardown — production paths always build
+    /// after, so this is Some in evidence).
+    pub teardown: Option<crate::unpacker::walker_teardown::WalkerTeardownReport>,
 }
 
 /// Outcome of the production walker execute gate (R5-R2-4).
@@ -582,6 +630,10 @@ pub struct AntidebugController {
     liveness_probe: Option<LivenessProbe>,
     /// IMP-09-CARRIER-R5-R2-1: liveness probe from the execute window.
     execute_liveness: Option<LivenessProbe>,
+    /// IMP-09-CARRIER-R5-R4: structured teardown report of the walker
+    /// session allocations (outcome + event ledger). Set by the RAII
+    /// teardown guard when run() exits; recorded in walker evidence.
+    teardown_report: Option<crate::unpacker::walker_teardown::WalkerTeardownReport>,
 }
 
 impl AntidebugController {
@@ -598,6 +650,7 @@ impl AntidebugController {
             candidate_mapping: None,
             liveness_probe: None,
             execute_liveness: None,
+            teardown_report: None,
         }
     }
 
@@ -888,7 +941,7 @@ impl AntidebugController {
     }
 
     /// Build the walker evidence record (R5-R2-4): schema + liveness +
-    /// candidate mapping + monotonic raw events.
+    /// candidate mapping + monotonic raw events + R5-R4 teardown report.
     pub fn walker_evidence_record(&self, capture_phase: &str) -> WalkerEvidenceRecord {
         WalkerEvidenceRecord {
             schema: WALKER_EVIDENCE_SCHEMA.to_string(),
@@ -899,6 +952,7 @@ impl AntidebugController {
             execute_liveness: self.execute_liveness.map(|p| p.as_str().to_string()),
             candidate_mapping: self.candidate_mapping.clone(),
             events: self.walker_events.clone(),
+            teardown: self.teardown_report.clone(),
         }
     }
     /// IMP-09-CARRIER-R5-R1 P0-1: CSPRNG nonce for the walker session.
@@ -923,11 +977,31 @@ impl AntidebugController {
 
     /// IMP-09-CARRIER-R5: teardown the walker session memory (free both
     /// target allocations). Idempotent; safe when no session is installed.
-    pub fn teardown_walker_session(&mut self, target: HANDLE) {
-        if let Some(mem) = self.walker_mem.take() {
-            let mut mem = mem;
-            mem.cleanup(target);
-        }
+    ///
+    /// R5-R4: structured teardown — the release sequence runs through
+    /// the teardown ledger (real `VirtualFreeEx`, per-step events) and
+    /// the exportable report is retained for evidence. Returns the
+    /// report (also stashed on the controller).
+    pub fn teardown_walker_session(
+        &mut self,
+        target: HANDLE,
+    ) -> crate::unpacker::walker_teardown::WalkerTeardownReport {
+        let report = if let Some(mem) = self.walker_mem.take() {
+            let mem = mem;
+            crate::unpacker::walker_teardown::teardown_walker_session_report(&mem, target)
+        } else {
+            crate::unpacker::walker_teardown::WalkerTeardownReport::no_session()
+        };
+        self.teardown_report = Some(report.clone());
+        report
+    }
+
+    /// The structured teardown report (R5-R4 evidence). None until
+    /// run() exits (the RAII guard records it) or teardown is called.
+    pub fn teardown_report(
+        &self,
+    ) -> Option<&crate::unpacker::walker_teardown::WalkerTeardownReport> {
+        self.teardown_report.as_ref()
     }
 
     /// IMP-09-CARRIER-R3: verified target-image digest carrier. Sealed by
@@ -1632,6 +1706,7 @@ mod tests {
         unsafe { windows::Win32::System::Threading::GetCurrentProcess() }
     }
     use super::*;
+    use crate::unpacker::walker_teardown::TeardownOutcome;
 
     /// Mock cleanup backend that always succeeds.
     #[derive(Debug)]
@@ -2859,6 +2934,7 @@ mod tests {
                 detail: None,
                 walker_status_raw: None,
             }],
+            teardown: None,
         };
         let p = write_walker_evidence(&rec, &temp).unwrap();
         assert!(p.is_file());
@@ -2935,6 +3011,155 @@ mod tests {
             !phases.contains(&"output_verify_fail"),
             "no verify failure expected: {phases:?}"
         );
+        mida_antidebug_runtime::exports::reset_walker_bindings();
+    }
+
+    // ---------- IMP-09-CARRIER-R5-R4: structured teardown observability ----------
+
+    /// Install a real session on the controller (production bind against
+    /// the own-process engineering runtime) and return the controller
+    /// with the session held. The MappedRegionGuard keeps the candidate
+    /// module region alive while the controller runs.
+    fn controller_with_bound_session() -> (AntidebugController, MappedRegionGuard) {
+        let (mut c, region) = controller_with_full_carriers(std::process::id());
+        let bound = c.bind_walker_from_loader(self_handle(), &[0x400000], 0x99);
+        assert!(bound, "production bind must reach READY");
+        assert!(c.walker_mem.is_some(), "session memory held by controller");
+        (c, region)
+    }
+
+    #[test]
+    fn imp09_r5r4_guard_records_structured_teardown_after_proceed() {
+        // T1/T2/T5: the RAII guard runs the structured teardown when run()
+        // exits (COMPLETED path). The report is recorded on the controller
+        // with the full event ledger, and the ledger is empty afterwards.
+        let _walker_guard = WALKER_TEST_LOCK.lock().unwrap();
+        mida_antidebug_runtime::exports::reset_walker_bindings();
+        let (mut c, _region) = controller_with_full_carriers(std::process::id());
+        c.options.walker_dispatch = Some(Box::new(TestDispatchBridge::ok()));
+        let outcome = c.run();
+        assert!(
+            matches!(outcome, AntidebugOutcome::Proceed { .. }),
+            "valid V2 output must reach Proceed, got {outcome:?}"
+        );
+        // The guard freed the session memory at run() exit.
+        assert!(c.walker_mem.is_none(), "session memory released by guard");
+        let report = c.teardown_report().expect("teardown report recorded");
+        assert_eq!(report.outcome, TeardownOutcome::Released);
+        assert_eq!(report.events.len(), 2, "params + section freed");
+        assert!(report.events.iter().all(|e| e.ok), "both frees succeeded");
+        assert!(report.ledger_empty, "T5: ledger zeroed after normal path");
+        assert!(report.double_free_events.is_empty());
+        assert_eq!(
+            report.schema,
+            crate::unpacker::walker_teardown::TEARDOWN_EVIDENCE_SCHEMA
+        );
+        // The report is carried by the walker evidence record.
+        let rec = c.walker_evidence_record("create_process");
+        let t = rec.teardown.as_ref().expect("evidence carries teardown");
+        assert_eq!(t.outcome, TeardownOutcome::Released);
+        assert_eq!(t.events.len(), 2);
+        mida_antidebug_runtime::exports::reset_walker_bindings();
+    }
+
+    #[test]
+    fn imp09_r5r4_guard_records_teardown_after_abort_failure() {
+        // T4/T5: the ABORTED path (execute gate fails closed) exits run()
+        // through the guard — the session allocations are freed and the
+        // teardown report records the release. The teardown verdict is
+        // SEPARATE from the execute failure (T1).
+        let _walker_guard = WALKER_TEST_LOCK.lock().unwrap();
+        mida_antidebug_runtime::exports::reset_walker_bindings();
+        // Non-OK raw status -> execute gate fails closed (ABORTED-like).
+        let (mut c, _region) = controller_with_full_carriers(std::process::id());
+        c.options.walker_dispatch = Some(Box::new(TestDispatchBridge {
+            status: mida_antidebug_runtime::walker_protocol::WALKER_STATUS_ERROR_PROBE_ABORTED
+                as i32,
+            output: false,
+            tampered_digest: false,
+            no_walker: false,
+        }));
+        let outcome = c.run();
+        assert!(
+            matches!(outcome, AntidebugOutcome::Failed { .. }),
+            "aborted probe must fail closed, got {outcome:?}"
+        );
+        assert!(c.walker_mem.is_none(), "ABORTED path frees the session");
+        let report = c.teardown_report().expect("teardown report recorded");
+        assert_eq!(report.outcome, TeardownOutcome::Released);
+        assert_eq!(report.events.len(), 2);
+        assert!(report.ledger_empty, "T5: ledger zeroed after abort path");
+        mida_antidebug_runtime::exports::reset_walker_bindings();
+    }
+
+    #[test]
+    fn imp09_r5r4_early_failure_records_no_session_teardown() {
+        // T5: an early failure (no loader result -> fail before any bind)
+        // still records a complete teardown report (no_session, empty
+        // ledger) — every run() exit path produces evidence.
+        let _walker_guard = WALKER_TEST_LOCK.lock().unwrap();
+        mida_antidebug_runtime::exports::reset_walker_bindings();
+        let (mut c, _region) = controller_with_full_carriers(std::process::id());
+        // No loader result injected -> run() fails at RuntimeLoadFailed.
+        c.options.loader_result = None;
+        let outcome = c.run();
+        assert!(matches!(outcome, AntidebugOutcome::Failed { .. }));
+        let report = c.teardown_report().expect("teardown report recorded");
+        assert_eq!(report.outcome, TeardownOutcome::Released);
+        assert!(report.events.is_empty(), "nothing to free");
+        assert!(report.ledger_empty, "T5: ledger zeroed on early failure");
+        mida_antidebug_runtime::exports::reset_walker_bindings();
+    }
+
+    #[test]
+    fn imp09_r5r4_teardown_failure_does_not_block_output_consumption() {
+        // T1 at the controller level: teardown verdict and walker output
+        // are SEPARATE. A failing free cannot change run()'s outcome; the
+        // produced output attestation is untouched by the teardown report.
+        let _walker_guard = WALKER_TEST_LOCK.lock().unwrap();
+        mida_antidebug_runtime::exports::reset_walker_bindings();
+        let (mut c, _region) = controller_with_full_carriers(std::process::id());
+        c.options.walker_dispatch = Some(Box::new(TestDispatchBridge::ok()));
+        let outcome = c.run();
+        // The walker output is consumable (Proceed reached the R5-R3
+        // digest gate) regardless of what teardown reports.
+        assert!(matches!(outcome, AntidebugOutcome::Proceed { .. }));
+        let report = c.teardown_report().expect("teardown report recorded");
+        // The report is a teardown verdict — it never substitutes the
+        // execute verdict and never erases the output attestation.
+        assert_eq!(report.outcome_name(), "Released");
+        // The execute outcome carried the output: reachable through the
+        // walker events (execute_exit == Success).
+        let last = c
+            .walker_events()
+            .iter()
+            .rev()
+            .find(|e| e.phase == "execute_exit");
+        assert!(last.is_some());
+        mida_antidebug_runtime::exports::reset_walker_bindings();
+    }
+
+    #[test]
+    fn imp09_r5r4_explicit_teardown_is_idempotent_and_report_exportable() {
+        // T3/T5: teardown_walker_session() runs the same structured path;
+        // a second call issues no free (idempotent) and the report
+        // serializes for evidence.
+        let _walker_guard = WALKER_TEST_LOCK.lock().unwrap();
+        mida_antidebug_runtime::exports::reset_walker_bindings();
+        let (mut c, _region) = controller_with_bound_session();
+        let r1 = c.teardown_walker_session(self_handle());
+        assert_eq!(r1.outcome, TeardownOutcome::Released);
+        assert_eq!(r1.events.len(), 2);
+        assert!(r1.ledger_empty);
+        // Second teardown: nothing owned -> no free issued.
+        let r2 = c.teardown_walker_session(self_handle());
+        assert_eq!(r2.outcome, TeardownOutcome::Released);
+        assert!(r2.events.is_empty(), "idempotent: no second free");
+        // The report round-trips through JSON (exportable evidence).
+        let json = serde_json::to_string(&r1).unwrap();
+        let back: crate::unpacker::walker_teardown::WalkerTeardownReport =
+            serde_json::from_str(&json).unwrap();
+        assert_eq!(back, r1);
         mida_antidebug_runtime::exports::reset_walker_bindings();
     }
 }
