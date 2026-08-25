@@ -47,6 +47,7 @@ mod session;
 pub(crate) mod sidecar_io;
 mod tls_evidence;
 mod verify;
+pub mod walker_dispatch;
 pub mod walker_session;
 pub mod walker_teardown;
 

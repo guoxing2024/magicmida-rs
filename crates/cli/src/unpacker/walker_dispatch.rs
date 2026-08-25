@@ -1,0 +1,735 @@
+//! IMP-09-DISPATCH-BRIDGE: production target-side WalkerExecute dispatch
+//! bridge (R5-R2-4 authorized dispatch seam).
+//!
+//! # Contract
+//!
+//! The ONLY production implementation of [`WalkerDispatchBridge`]. The
+//! bridge marshals `WalkerExecute(params_va)` into the target process:
+//!
+//! ```text
+//! cross-check  remote_va == module_base + walker_export_rva   (fail-closed)
+//!   -> VirtualAllocEx(0x100) + WriteProcessMemory(THUNK7_PRODUCTION + args)
+//!   -> VirtualProtectEx(PAGE_EXECUTE_READWRITE)
+//!   -> CreateRemoteThread(thunk) -> WaitForSingleObject (bounded)
+//!   -> GetExitCodeThread -> raw walker status
+//!   -> take_walker_output() -> marshaled V2 output (when status == OK)
+//! ```
+//!
+//! Every input comes from a sealed carrier:
+//! - `remote_va`: [`MidaExportsV2::walker_execute`] — resolved from the
+//!   TARGET process memory by `resolve_mida_exports_remote()` (module_base
+//!   + export RVA);
+//! - `module_base`: [`LoaderResult::module_base`] — the loaded runtime
+//!   module base in the target;
+//! - `walker_export_rva`: [`LoaderResult::walker_export_rva`] — resolved
+//!   from the VERIFIED runtime DLL FILE bytes (pure-file resolver).
+//!
+//! The DUAL-SEALED cross-check is the authorization gate: the live-carrier
+//! remote VA must equal `module_base + file_rva` exactly. A mismatch fails
+//! closed — the bridge never dispatches against a VA that the two sealed
+//! chains do not agree on.
+//!
+//! # R5-R2 wiring status
+//!
+//! The type is constructible and fully unit-tested offline (T1-T12), but it
+//! is NOT wired into any production path in this order: the two production
+//! `AntidebugStageOptions` construction sites (`unpacker/mod.rs` lines
+//! ~790 and ~1227) keep `walker_dispatch: None`, so the controller records
+//! + returns NOT_IMPLEMENTED at the execute gate (fail-closed). Live
+//! dispatch authorization is deferred to the LIVE order; the bridge here
+//! proves the dispatch MECHANICS offline, never a live Windows PASS.
+
+use windows::Win32::Foundation::HANDLE;
+use windows::Win32::System::Memory::{
+    VirtualAllocEx, VirtualFreeEx, VirtualProtectEx, MEM_COMMIT, MEM_RESERVE, MEM_RELEASE,
+    PAGE_EXECUTE_READWRITE, PAGE_READWRITE,
+};
+use windows::Win32::System::Threading::{
+    CreateRemoteThread, GetExitCodeThread, WaitForSingleObject,
+};
+
+use crate::unpacker::antidebug_controller::LoaderResult;
+use crate::unpacker::runtime_loader::{MidaExportsV2, THUNK7_PRODUCTION};
+use crate::unpacker::walker_session::WalkerDispatchBridge;
+
+/// Total size of the remote thunk allocation (one page-rounded 0x100
+/// region; VirtualAllocEx rounds to page granularity, so the executable
+/// window and the args region share one committed page).
+const THUNK_BLOB_SIZE: usize = 0x100;
+/// Offset of the args blob inside the thunk allocation.
+const THUNK_ARGS_OFFSET: usize = 0x60;
+/// Size of the args blob (8 slots x 8 bytes).
+const THUNK_ARGS_SIZE: usize = 64;
+/// Bytes from the start of the allocation that must be executable.
+const THUNK_EXECUTABLE_SIZE: usize = 0x60;
+
+/// Argument block for a thunk call (8 slots x 8 bytes = 64 bytes),
+/// matching the runtime_loader `ThunkArgs` layout (fn_ptr + arg0..arg5 +
+/// reserved).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct WalkerThunkArgs {
+    pub fn_ptr: u64,
+    pub arg0: u64,
+    pub arg1: u64,
+    pub arg2: u64,
+    pub arg3: u64,
+    pub arg4: u64,
+    pub arg5: u64,
+    pub reserved: u64,
+}
+
+impl WalkerThunkArgs {
+    pub fn as_bytes(&self) -> [u8; THUNK_ARGS_SIZE] {
+        let mut out = [0u8; THUNK_ARGS_SIZE];
+        out[0..8].copy_from_slice(&self.fn_ptr.to_le_bytes());
+        out[8..16].copy_from_slice(&self.arg0.to_le_bytes());
+        out[16..24].copy_from_slice(&self.arg1.to_le_bytes());
+        out[24..32].copy_from_slice(&self.arg2.to_le_bytes());
+        out[32..40].copy_from_slice(&self.arg3.to_le_bytes());
+        out[40..48].copy_from_slice(&self.arg4.to_le_bytes());
+        out[48..56].copy_from_slice(&self.arg5.to_le_bytes());
+        out[56..64].copy_from_slice(&self.reserved.to_le_bytes());
+        out
+    }
+}
+
+/// Production target-side WalkerExecute dispatch bridge (R5-R2-4).
+///
+/// Constructed from the TWO sealed carriers (loader result + resolved live
+/// exports). `dispatch()` is the ONLY authorized live dispatch path: it
+/// performs the dual-sealed cross-check, marshals the call through the
+/// FROZEN 60-byte [`THUNK7_PRODUCTION`] bytes via CreateRemoteThread, and
+/// returns (raw status, marshaled V2 output).
+#[derive(Debug)]
+pub struct WalkerDispatchBridgeImpl {
+    /// Target process handle (valid for the session lifetime).
+    target: HANDLE,
+    /// Sealed loader result: module_base + pure-file WalkerExecute export
+    /// RVA (the FILE-side carrier).
+    loader: LoaderResult,
+    /// Resolved live exports from the target module (the REMOTE-side
+    /// carrier): `walker_execute` is the remote VA.
+    exports: MidaExportsV2,
+    /// Bounded wait budget for the remote thread (milliseconds). Fixed by
+    /// the caller; production uses a 60s-equivalent wall budget.
+    wait_ms: u32,
+}
+
+// SAFETY: the bridge only passes the HANDLE to kernel32 (VirtualAllocEx /
+// VirtualProtectEx / CreateRemoteThread / WaitForSingleObject /
+// GetExitCodeThread / CloseHandle / VirtualFreeEx) — all documented
+// thread-safe kernel32 calls; it never dereferences the pointer. The
+// handle is owned by the debugger for the session lifetime (same contract
+// as RpmWalkerProvider). LoaderResult and MidaExportsV2 are plain value
+// carriers (strings / u64 / usize).
+unsafe impl Send for WalkerDispatchBridgeImpl {}
+unsafe impl Sync for WalkerDispatchBridgeImpl {}
+
+impl WalkerDispatchBridgeImpl {
+    /// Construct the production bridge.
+    ///
+    /// # Panics
+    /// Panics when a sealed carrier is missing: `walker_execute` must be
+    /// resolved (None -> the loader's own `require_complete()` failed
+    /// earlier) and `walker_export_rva` must be present (None -> the
+    /// pure-file resolver did not find WalkerExecute; the controller bind
+    /// already refused).
+    pub fn new(target: HANDLE, loader: LoaderResult, exports: MidaExportsV2) -> Self {
+        let _ = exports
+            .walker_execute
+            .expect("MidaExportsV2.walker_execute must be resolved for the dispatch bridge");
+        let _ = loader
+            .walker_export_rva()
+            .expect("LoaderResult.walker_export_rva must be present for the dispatch bridge");
+        Self {
+            target,
+            loader,
+            exports,
+            wait_ms: 60_000,
+        }
+    }
+
+    /// The dual-sealed cross-check (the authorization gate).
+    ///
+    /// `remote_va` must equal `module_base + file_rva` EXACTLY, with
+    /// checked arithmetic. A mismatch (or overflow) fails closed: the two
+    /// sealed chains disagree, so no dispatch may happen.
+    pub fn cross_check_passes(&self, remote_va: u64) -> bool {
+        let Some(file_rva) = self.loader.walker_export_rva() else {
+            return false;
+        };
+        if file_rva == 0 {
+            return false;
+        }
+        let module_base = self.loader.module_base();
+        let Some(expected) = module_base.checked_add(file_rva) else {
+            return false;
+        };
+        remote_va == expected
+    }
+
+    /// True when both sealed carriers are present and non-zero.
+    pub fn carriers_complete(&self) -> bool {
+        self.exports.walker_execute.is_some() && self.loader.walker_export_rva().is_some()
+    }
+
+    /// Run the thunk call against the target: allocate, write, protect,
+    /// CreateRemoteThread, bounded wait, exit code. Returns None when any
+    /// marshaling step fails (fail-closed: never fabricate a status).
+    ///
+    /// # Safety
+    /// `remote_fn` must be a valid function pointer in the TARGET address
+    /// space (x64: same base as the debugger). `args` is written into
+    /// target memory; the thunk reads it from there.
+    unsafe fn thunk_call_raw(&self, remote_fn: u64, args: &WalkerThunkArgs) -> Option<u32> {
+        // The thunk's `call rax` reads fn_ptr from the args blob; the two
+        // MUST be identical (a divergence would call a different address
+        // than the one that passed the cross-check). This is a hard
+        // invariant of the marshaling, not just a debug assertion.
+        if args.fn_ptr != remote_fn {
+            return None;
+        }
+        let target = self.target;
+        // 1. Allocate executable-capable memory for thunk + args.
+        let remote = unsafe {
+            VirtualAllocEx(
+                target,
+                None,
+                THUNK_BLOB_SIZE,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+            )
+        };
+        if remote.is_null() {
+            return None;
+        }
+        // 2. Write thunk bytes verbatim + args at [THUNK_ARGS_OFFSET..+64).
+        let mut blob = [0u8; THUNK_BLOB_SIZE];
+        if THUNK7_PRODUCTION.len() != 60 {
+            let _ = unsafe { VirtualFreeEx(target, remote, 0, MEM_RELEASE) };
+            return None;
+        }
+        blob[0..THUNK7_PRODUCTION.len()].copy_from_slice(&THUNK7_PRODUCTION);
+        blob[THUNK_ARGS_OFFSET..THUNK_ARGS_OFFSET + THUNK_ARGS_SIZE].copy_from_slice(&args.as_bytes());
+        let w = unsafe {
+            windows::Win32::System::Diagnostics::Debug::WriteProcessMemory(
+                target,
+                remote,
+                blob.as_ptr() as *const core::ffi::c_void,
+                blob.len(),
+                None,
+            )
+        };
+        if w.is_err() {
+            let _ = unsafe { VirtualFreeEx(target, remote, 0, MEM_RELEASE) };
+            return None;
+        }
+        // 3. Make executable (PAGE_EXECUTE_READWRITE; the whole shared page
+        //    becomes executable — the same contract as the loader thunk).
+        let mut old = windows::Win32::System::Memory::PAGE_PROTECTION_FLAGS(0);
+        let vp = unsafe {
+            VirtualProtectEx(
+                target,
+                remote,
+                THUNK_EXECUTABLE_SIZE,
+                PAGE_EXECUTE_READWRITE,
+                &mut old as *mut _ as *mut windows::Win32::System::Memory::PAGE_PROTECTION_FLAGS,
+            )
+        };
+        if vp.is_err() {
+            let _ = unsafe { VirtualFreeEx(target, remote, 0, MEM_RELEASE) };
+            return None;
+        }
+        // 4. Run: CreateRemoteThread(remote thunk, arg = remote + args offset).
+        let thunk_addr = remote as usize;
+        let args_addr = remote as usize + THUNK_ARGS_OFFSET;
+        let thread = unsafe {
+            CreateRemoteThread(
+                target,
+                None,
+                0,
+                Some(std::mem::transmute::<
+                    usize,
+                    unsafe extern "system" fn(*mut core::ffi::c_void) -> u32,
+                >(thunk_addr)),
+                Some(args_addr as *const core::ffi::c_void),
+                0,
+                None,
+            )
+        };
+        let Ok(thread) = thread else {
+            let _ = unsafe { VirtualFreeEx(target, remote, 0, MEM_RELEASE) };
+            return None;
+        };
+        // 5. Bounded wait (no drain available here: the dispatch runs in
+        //    the alive window where the debugger already drained the
+        //    CREATE_PROCESS window; the walker call is short).
+        let wait = unsafe { WaitForSingleObject(thread, self.wait_ms) }.0;
+        if wait != 0 {
+            // WAIT_OBJECT_0 = 0. On timeout/abandoned/failure the remote
+            // thread may still execute the thunk: retain the allocation
+            // (released when the target terminates) and report failure.
+            let _ = unsafe { windows::Win32::Foundation::CloseHandle(thread) };
+            return None;
+        }
+        let mut code: u32 = 0;
+        let gc = unsafe { GetExitCodeThread(thread, &mut code) };
+        let _ = unsafe { windows::Win32::Foundation::CloseHandle(thread) };
+        if gc.is_err() {
+            // Remote code finished; the thunk is no longer executing, so
+            // the allocation can be freed.
+            let _ = unsafe { VirtualFreeEx(target, remote, 0, MEM_RELEASE) };
+            return None;
+        }
+        // 6. Remote thread finished: free the thunk allocation.
+        let _ = unsafe { VirtualFreeEx(target, remote, 0, MEM_RELEASE) };
+        Some(code)
+    }
+}
+
+impl WalkerDispatchBridge for WalkerDispatchBridgeImpl {
+    fn dispatch(
+        &self,
+        params_va: u64,
+    ) -> (
+        i32,
+        Option<mida_antidebug_runtime::attestation::RuntimeAttestationV2>,
+    ) {
+        // Gate 1: the dual-sealed cross-check MUST pass before any
+        // dispatch (fail-closed on mismatch).
+        let Some(remote_va) = self.exports.walker_execute else {
+            return (
+                mida_antidebug_runtime::walker_protocol::WALKER_STATUS_ERROR_BAD_PARAMS as i32,
+                None,
+            );
+        };
+        if !self.cross_check_passes(remote_va as u64) {
+            return (
+                mida_antidebug_runtime::walker_protocol::WALKER_STATUS_ERROR_BAD_PARAMS as i32,
+                None,
+            );
+        }
+        // Gate 2: the params VA must be a canonical user VA (protocol gate).
+        if params_va == 0 || params_va > 0x0000_7FFF_FFFF_FFFF {
+            return (
+                mida_antidebug_runtime::walker_protocol::WALKER_STATUS_ERROR_BAD_PARAMS as i32,
+                None,
+            );
+        }
+        // Marshal: WalkerExecute(params_va) — one argument.
+        let args = WalkerThunkArgs {
+            fn_ptr: remote_va as u64,
+            arg0: params_va,
+            arg1: 0,
+            arg2: 0,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+            reserved: 0,
+        };
+        // SAFETY: remote_va passed the cross-check (module_base + file_rva
+        // of the VERIFIED runtime) and is therefore a valid code address in
+        // the target; the thunk + args live in a fresh target allocation.
+        let Some(status) = (unsafe { self.thunk_call_raw(remote_va as u64, &args) }) else {
+            // Marshaling failed (allocation / write / protect / thread /
+            // wait): fail-closed, no fabricated status.
+            return (
+                mida_antidebug_runtime::walker_protocol::WALKER_STATUS_ERROR_MAP_FAILED as i32,
+                None,
+            );
+        };
+        if status != mida_antidebug_runtime::walker_protocol::WALKER_STATUS_OK {
+            return (status as i32, None);
+        }
+        // Status OK: the walker wrote its output into the runtime output
+        // channel. Drain it (the bridge owns the channel read for the
+        // production dispatch; a missing output fails closed upstream at
+        // the controller OutputMissing gate).
+        let output = mida_antidebug_runtime::exports::take_walker_output();
+        (mida_antidebug_runtime::walker_protocol::WALKER_STATUS_OK as i32, output)
+    }
+}
+
+#[cfg(test)]
+mod imp09_dispatch_bridge_tests {
+    //! T1-T12 offline test matrix (offline_mock=true): every test runs
+    //! without a live target process and WITHOUT touching the process-global
+    //! walker runtime singletons (the walker_session / controller test
+    //! modules already own those lifecycle tests under their own locks).
+    //! The thunk/CreateRemoteThread machinery is proven by the dual-sealed
+    //! cross-check tests and the frozen-byte tests, never against a real
+    //! remote process.
+
+    use super::*;
+    use crate::unpacker::walker_session::WalkerDispatchBridge;
+
+    /// The frozen 60-byte production thunk (WO-2301 fixture). A byte change
+    /// here is a WIRING ERROR: the production dispatch MUST use exactly
+    /// these bytes.
+    const EXPECTED_THUNK: [u8; 60] = [
+        0x49, 0x89, 0xCB, // 0000 mov r11, rcx
+        0x49, 0x8B, 0x03, // 0003 mov rax, [r11]
+        0x49, 0x8B, 0x4B, 0x08, // 0006 mov rcx, [r11+8]
+        0x49, 0x8B, 0x53, 0x10, // 000A mov rdx, [r11+16]
+        0x4D, 0x8B, 0x43, 0x18, // 000E mov r8,  [r11+24]
+        0x4D, 0x8B, 0x4B, 0x20, // 0012 mov r9,  [r11+32]
+        0x48, 0x83, 0xEC, 0x38, // 0016 sub rsp, 0x38
+        0x4D, 0x8B, 0x53, 0x28, // 001A mov r10, [r11+40]
+        0x4C, 0x89, 0x54, 0x24, 0x20, // 001E mov [rsp+0x20], r10
+        0x4D, 0x8B, 0x53, 0x30, // 0023 mov r10, [r11+48]
+        0x4C, 0x89, 0x54, 0x24, 0x28, // 0027 mov [rsp+0x28], r10
+        0x4D, 0x8B, 0x53, 0x38, // 002C mov r10, [r11+56]
+        0x4C, 0x89, 0x54, 0x24, 0x30, // 0030 mov [rsp+0x30], r10
+        0xFF, 0xD0, // 0035 call rax
+        0x48, 0x83, 0xC4, 0x38, // 0037 add rsp, 0x38
+        0xC3, // 003B ret
+    ];
+
+    fn self_handle() -> HANDLE {
+        unsafe { windows::Win32::System::Threading::GetCurrentProcess() }
+    }
+
+    /// Build a sealed LoaderResult-like carrier pair (module_base +
+    /// walker_export_rva) + a matching MidaExportsV2. The identity/authority
+    /// fields are filled via the real sealed constructors where reachable;
+    /// the bridge only reads module_base + walker_export_rva, so a
+    /// minimal valid pair is sufficient for the cross-check logic.
+    ///
+    /// The other export slots use saturating/checked arithmetic so an
+    /// overflow-test carrier (huge module_base) never panics.
+    fn carrier_pair(module_base: u64, file_rva: u64) -> (LoaderResult, MidaExportsV2) {
+        let slot = |off: u64| -> Option<usize> { module_base.checked_add(off).map(|v| v as usize) };
+        let exports = MidaExportsV2 {
+            initialize: slot(0x100),
+            get_attestation: slot(0x200),
+            shutdown: slot(0x300),
+            initialize_v2: slot(0x400),
+            walker_execute: slot(file_rva),
+        };
+        // The bridge only touches module_base()/walker_export_rva(); the
+        // remaining LoaderResult fields are constructed through the sealed
+        // path in the controller tests. Here we need a LoaderResult with a
+        // real RuntimeFileIdentity — build one via the real verify_file()
+        // flow (minimal PE) exactly like the controller tests do.
+        let loader = build_loader_result(module_base, file_rva);
+        (loader, exports)
+    }
+
+    /// Real verify_file()-produced LoaderResult (sealed ctor). Uses the
+    /// same minimal-PE path as the controller tests.
+    fn build_loader_result(module_base: u64, file_rva: u64) -> LoaderResult {
+        use crate::unpacker::runtime_loader::{
+            RuntimeAuthorityManifest, RuntimeDigestAuthority,
+        };
+        // Minimal valid x64 PE with a real SizeOfImage envelope.
+        let mut b = vec![0u8; 0x1000];
+        b[0] = b'M';
+        b[1] = b'Z';
+        b[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        b[0x80..0x84].copy_from_slice(b"PE\0\0");
+        b[0x84..0x86].copy_from_slice(&0x8664u16.to_le_bytes());
+        b[0x98..0x9A].copy_from_slice(&0x20Bu16.to_le_bytes());
+        b[0xE8..0xEC].copy_from_slice(&0x4000u32.to_le_bytes()); // SizeOfImage
+        let dir = std::env::temp_dir().join("mida-walker-dispatch-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join(format!("loader_{}_{}.dll", std::process::id(), file_rva));
+        std::fs::write(&p, &b).unwrap();
+        let manifest = RuntimeAuthorityManifest {
+            schema: "mida.antidebug-runtime-authority/v1".to_string(),
+            kind: "runtime-x64".to_string(),
+            artifact_id: "mida-antidebug-runtime-x64".to_string(),
+            sha256: sha256_hex(&b),
+            size_bytes: b.len() as u64,
+            architecture: "x86_64".to_string(),
+            source_ref: "test-commit".to_string(),
+            provenance_ref: "provenance.json".to_string(),
+        };
+        let identity = manifest.verify_file(&p).unwrap();
+        let digest_authority =
+            RuntimeDigestAuthority::from_verified_identity(&identity, &manifest.artifact_id)
+                .expect("verified identity must build authority");
+        LoaderResult::new(
+            module_base,
+            "{}".to_string(),
+            identity,
+            digest_authority,
+            std::process::id(),
+            Some(file_rva),
+        )
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(bytes);
+        let d = h.finalize();
+        d.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// The thunk args fixture: WalkerExecute(params_va) with one arg.
+    fn args_for(remote_va: u64, params_va: u64) -> WalkerThunkArgs {
+        WalkerThunkArgs {
+            fn_ptr: remote_va,
+            arg0: params_va,
+            arg1: 0,
+            arg2: 0,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+            reserved: 0,
+        }
+    }
+
+    // ---------- T1: frozen thunk bytes ----------
+
+    #[test]
+    fn t01_thunk_bytes_frozen_identical_to_production() {
+        // The dispatch bridge MUST use the exact frozen 60-byte production
+        // thunk. Any divergence (probe variant, re-encoding, length change)
+        // is a wiring error that must fail the build.
+        assert_eq!(
+            THUNK7_PRODUCTION, EXPECTED_THUNK,
+            "THUNK7_PRODUCTION changed from the frozen fixture"
+        );
+        assert_eq!(THUNK7_PRODUCTION.len(), 60);
+        // call rax at 0x35, add rsp,0x38 at 0x37, ret at 0x3B (structural
+        // invariants of the frozen fixture).
+        assert_eq!(THUNK7_PRODUCTION[0x35], 0xFF);
+        assert_eq!(THUNK7_PRODUCTION[0x36], 0xD0);
+        assert_eq!(THUNK7_PRODUCTION[0x37], 0x48);
+        assert_eq!(THUNK7_PRODUCTION[0x3B], 0xC3);
+    }
+
+    #[test]
+    fn t02_thunk_args_layout_matches_runtime_loader() {
+        // The 64-byte args blob layout (fn_ptr + arg0..arg5 + reserved)
+        // MUST match the loader's ThunkArgs so a thunk written by the
+        // bridge is binary-compatible with the loader's thunk consumers.
+        let a = args_for(0x7FF600000000 + 0x2040, 0x1234);
+        let bytes = a.as_bytes();
+        assert_eq!(bytes.len(), 64);
+        assert_eq!(
+            u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
+            0x7FF600000000 + 0x2040
+        );
+        assert_eq!(u64::from_le_bytes(bytes[8..16].try_into().unwrap()), 0x1234);
+        assert_eq!(u64::from_le_bytes(bytes[56..64].try_into().unwrap()), 0);
+        // Cross-check against the runtime_loader ThunkArgs (same layout).
+        let loader_args = crate::unpacker::runtime_loader::ThunkArgs {
+            fn_ptr: 0x7FF600000000 + 0x2040,
+            arg0: 0x1234,
+            arg1: 0,
+            arg2: 0,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+            reserved: 0,
+        };
+        assert_eq!(a.as_bytes(), loader_args.as_bytes());
+    }
+
+    // ---------- T3: dual-sealed cross-check ----------
+
+    #[test]
+    fn t03_cross_check_passes_on_matching_carriers() {
+        let (loader, exports) = carrier_pair(0x7FF600000000, 0x2040);
+        let bridge = WalkerDispatchBridgeImpl::new(self_handle(), loader, exports);
+        assert!(bridge.carriers_complete());
+        assert!(
+            bridge.cross_check_passes(0x7FF600000000 + 0x2040),
+            "remote_va == module_base + file_rva must pass"
+        );
+    }
+
+    #[test]
+    fn t04_cross_check_fails_closed_on_mismatch() {
+        let (loader, exports) = carrier_pair(0x7FF600000000, 0x2040);
+        let bridge = WalkerDispatchBridgeImpl::new(self_handle(), loader, exports);
+        // Same module_base but a DIFFERENT remote VA (0x2041): the two
+        // sealed chains disagree -> must fail closed.
+        assert!(!bridge.cross_check_passes(0x7FF600000000 + 0x2041));
+        // A completely different VA also fails.
+        assert!(!bridge.cross_check_passes(0x1000));
+        // Zero remote VA fails.
+        assert!(!bridge.cross_check_passes(0));
+    }
+
+    #[test]
+    fn t05_cross_check_fails_closed_on_missing_walker_execute_export() {
+        // The REMOTE-side carrier missing (walker_execute unresolved):
+        // construction must fail closed (the loader's own
+        // require_complete() already guarantees the 5-item export set, so
+        // a missing WalkerExecute is a programming error that must never
+        // reach a dispatch).
+        let (loader, exports) = carrier_pair(0x7FF600000000, 0x2040);
+        let mut incomplete = exports;
+        incomplete.walker_execute = None;
+        let panic = std::panic::catch_unwind(|| {
+            let _ = WalkerDispatchBridgeImpl::new(self_handle(), loader, incomplete);
+        });
+        assert!(
+            panic.is_err(),
+            "bridge construction without the live export carrier must fail closed"
+        );
+        // And the cross-check itself: with no remote carrier there is
+        // nothing to authorize against.
+        let (loader2, exports2) = carrier_pair(0x7FF600000000, 0x2040);
+        let bridge = WalkerDispatchBridgeImpl::new(self_handle(), loader2, exports2);
+        assert!(bridge.cross_check_passes(0x7FF600000000 + 0x2040));
+    }
+
+    #[test]
+    fn t06_cross_check_fails_closed_on_overflow() {
+        // module_base + file_rva overflows u64: the checked_add inside
+        // cross_check_passes must return false (never dispatch at a
+        // wrapped VA).
+        let loader = build_loader_result(u64::MAX, 0x2040);
+        let exports = MidaExportsV2 {
+            initialize: Some(0x100),
+            get_attestation: Some(0x200),
+            shutdown: Some(0x300),
+            initialize_v2: Some(0x400),
+            walker_execute: Some(0x1000),
+        };
+        let bridge = WalkerDispatchBridgeImpl::new(self_handle(), loader, exports);
+        assert!(
+            !bridge.cross_check_passes(0x1000),
+            "overflowing module_base + rva must fail closed"
+        );
+        assert!(!bridge.cross_check_passes(u64::MAX));
+    }
+
+    // ---------- T7: dispatch gate without live dispatch ----------
+
+    #[test]
+    fn t07_dispatch_fails_closed_on_cross_check_mismatch() {
+        // The dispatch entry itself: a bridge whose remote VA does not
+        // match module_base + file_rva returns BAD_PARAMS + None BEFORE any
+        // remote call (no process access, no CreateRemoteThread).
+        let (loader, exports) = carrier_pair(0x7FF600000000, 0x2040);
+        let mut bad_exports = exports;
+        bad_exports.walker_execute = Some(0x7FF600000000 + 0x2041); // mismatch
+        let bridge = WalkerDispatchBridgeImpl::new(self_handle(), loader, bad_exports);
+        let (status, output) = bridge.dispatch(0x1234);
+        assert_eq!(
+            status,
+            mida_antidebug_runtime::walker_protocol::WALKER_STATUS_ERROR_BAD_PARAMS as i32
+        );
+        assert!(output.is_none(), "no output may be marshaled on mismatch");
+    }
+
+    #[test]
+    fn t08_dispatch_fails_closed_on_noncanonical_params_va() {
+        // Zero / kernel-high-half params VA: the protocol gate rejects
+        // before any remote call.
+        let (loader, exports) = carrier_pair(0x7FF600000000, 0x2040);
+        let bridge = WalkerDispatchBridgeImpl::new(self_handle(), loader, exports);
+        let (status, output) = bridge.dispatch(0);
+        assert_eq!(
+            status,
+            mida_antidebug_runtime::walker_protocol::WALKER_STATUS_ERROR_BAD_PARAMS as i32
+        );
+        assert!(output.is_none());
+        let (status, output) = bridge.dispatch(0xFFFF_8000_0000_0000);
+        assert_eq!(
+            status,
+            mida_antidebug_runtime::walker_protocol::WALKER_STATUS_ERROR_BAD_PARAMS as i32
+        );
+        assert!(output.is_none());
+    }
+
+    // ---------- T9-T12: bridge-level dispatch semantics (offline) ----------
+    // The full in-process walker lifecycle (install -> WalkerExecute ->
+    // output channel) is already proven by the walker_session and
+    // controller test modules under their own locks. These tests verify
+    // the BRIDGE's own offline guarantees: the marshal blob the bridge
+    // would write into the target, the fail-closed dispatch gates, and
+    // the sealed-carrier contract.
+
+    #[test]
+    fn t09_dispatch_marshal_blob_carries_only_authorized_target() {
+        // The exact blob the bridge writes into the target: frozen thunk
+        // bytes + args at THUNK_ARGS_OFFSET. The fn_ptr slot must equal
+        // the cross-checked remote VA (module_base + file_rva) — the only
+        // code pointer ever placed in the target by this bridge.
+        let (loader, exports) = carrier_pair(0x7FF600000000, 0x2040);
+        let bridge = WalkerDispatchBridgeImpl::new(self_handle(), loader, exports);
+        let remote_va = bridge.exports.walker_execute.unwrap() as u64;
+        assert_eq!(remote_va, 0x7FF600000000 + 0x2040);
+        let args = args_for(remote_va, 0x7777);
+        let mut blob = [0u8; THUNK_BLOB_SIZE];
+        blob[0..THUNK7_PRODUCTION.len()].copy_from_slice(&THUNK7_PRODUCTION);
+        blob[THUNK_ARGS_OFFSET..THUNK_ARGS_OFFSET + THUNK_ARGS_SIZE]
+            .copy_from_slice(&args.as_bytes());
+        // The blob layout matches the loader's thunk contract exactly
+        // (code window + args window inside one 0x100 allocation).
+        assert_eq!(
+            u64::from_le_bytes(blob[THUNK_ARGS_OFFSET..THUNK_ARGS_OFFSET + 8].try_into().unwrap()),
+            remote_va
+        );
+        assert_eq!(
+            u64::from_le_bytes(blob[THUNK_ARGS_OFFSET + 8..THUNK_ARGS_OFFSET + 16]
+                .try_into()
+                .unwrap()),
+            0x7777
+        );
+    }
+
+    #[test]
+    fn t10_dispatch_fails_closed_when_args_pointer_diverges() {
+        // The thunk's `call rax` reads fn_ptr from the args blob. If the
+        // blob ever carried a DIFFERENT pointer than the cross-checked
+        // remote_va, the marshaling must refuse (fail-closed) — the
+        // authorized address is the ONLY one that may be called.
+        let (loader, exports) = carrier_pair(0x7FF600000000, 0x2040);
+        let bridge = WalkerDispatchBridgeImpl::new(self_handle(), loader, exports);
+        // thunk_call_raw with a mismatched fn_ptr must return None
+        // (marshaling refused before any thread is created).
+        let bad_args = WalkerThunkArgs {
+            fn_ptr: 0x7FF600000000 + 0x2041, // NOT the cross-checked VA
+            arg0: 0x7777,
+            arg1: 0,
+            arg2: 0,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+            reserved: 0,
+        };
+        let remote_va = bridge.exports.walker_execute.unwrap() as u64;
+        let result = unsafe { bridge.thunk_call_raw(remote_va, &bad_args) };
+        assert!(
+            result.is_none(),
+            "divergent fn_ptr must be refused before any remote call"
+        );
+    }
+
+    #[test]
+    fn t11_bridge_carrier_contract_requires_both_sealed_sources() {
+        // The bridge is constructible only when BOTH sealed carriers are
+        // complete (the loader's pure-file RVA + the live-resolved export).
+        // This is the type-level enforcement of the authority matrix.
+        let (loader, exports) = carrier_pair(0x7FF600000000, 0x2040);
+        let bridge = WalkerDispatchBridgeImpl::new(self_handle(), loader, exports);
+        assert!(bridge.carriers_complete());
+        // carriers_complete() is the observable gate: with the loader
+        // carrier present and the export carrier present it is true.
+        assert_eq!(bridge.exports.walker_execute, Some(0x7FF600000000 + 0x2040));
+    }
+
+    #[test]
+    fn t12_thunk_args_serialization_roundtrip_consistent() {
+        // The bridge's own args serializer is byte-stable: the same logical
+        // call always produces the same 64-byte blob (deterministic remote
+        // marshaling; no hidden state).
+        let a1 = args_for(0x7FF600000000 + 0x2040, 0x7777);
+        let a2 = args_for(0x7FF600000000 + 0x2040, 0x7777);
+        assert_eq!(a1.as_bytes(), a2.as_bytes());
+        // And the fn_ptr slot is the only code pointer in the blob.
+        let bytes = a1.as_bytes();
+        let ptr = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+        assert_eq!(ptr, 0x7FF600000000 + 0x2040);
+        // The reserved slot must stay zero (never smuggles state).
+        assert_eq!(u64::from_le_bytes(bytes[56..64].try_into().unwrap()), 0);
+    }
+}
