@@ -511,7 +511,9 @@ pub struct WalkerEvidenceRecord {
 }
 ```
 
-### §D. controller 侧接线草案（仅 LIVE-4 授权后；本单不实施）
+### §D. controller 侧接线（IMP-09-DISPATCH-WIRING：wired behind env gate）
+
+**接线现状（2026-08-26 实测）**: 由 `WORK_ORDER_IMP-09-DISPATCH-WIRING_20260826.md` 实施，两处生产构造点（`crates/cli/src/unpacker/mod.rs` CREATE_PROCESS ~L1228 / post-attach ~L791）已从恒 `None` 改为经集中式门控函数接线。
 
 ```rust
 // mod.rs:1227 / 790 两处，从:
@@ -535,6 +537,29 @@ walker_dispatch: {
 // Arc<WalkerSessionMemory> 或桥接在 bind 成功后构造并持有 clone。
 // 该改动属实现卡范围，本单只钉死契约。
 ```
+
+**门控语义（IMP-09-DISPATCH-WIRING 实测）**:
+
+- 集中式门控 `walker_dispatch::live_dispatch_gate()`：仅当
+  `MIDA_GTO_NO_BYPASS == "1"` **且** `MIDA_GTO_LIVE_DISPATCH == "1"` 才返回
+  true；任一缺失/其他值 -> false（fail-closed）。`MIDA_GTO_LIVE_AUTHORIZED`
+  已废弃（历史名，从未有读取点），不再使用。
+- 接线点写法（两处同款）：
+  `walker_dispatch: walker_dispatch::try_build_live_dispatch_bridge_boxed(`
+  `dbg.process_handle(), loader_outcome.as_ref().ok(), exports)`；
+  gate 关 -> `None`（offline 默认，与基线字节级等价，控制器仍走
+  NOT_IMPLEMENTED fail-closed 分支）；
+  gate 开 + 双 sealed 载体完整 -> `Some(WalkerDispatchBridgeImpl)`（构造经
+  `WalkerDispatchBridgeImpl::new` 双 sealed 交叉校验；dispatch 时
+  `remote_va == module_base + file_rva` 不一致 -> BAD_PARAMS，门开也不能
+  跳过权威链）；
+  gate 开 + 任一载体缺失 -> `None`（fail-closed）。
+- **载体缺口（如实记录）**: 两处构造点作用域内当前没有远程 `MidaExportsV2`
+  载体（`run_runtime_loader` 内部 `resolve_mida_exports_remote` 的结果未随
+  `LoaderResult` 传出）。因此本单接线后运行期两处实际仍为 `None`（exports
+  传 None）——gate 与接线形态已就位、T13-T16 用 sealed 载体对验证构造路径
+  全绿，但生产桥要真正构造还需一个载体通道（如 `LoaderResult` 增加 exports
+  字段，属新实现卡范围，本单不实施）。
 
 ---
 

@@ -1,0 +1,238 @@
+RC= 0
+OUT_TAIL: .. ok
+test iat_completeness::tests::missing_reason_is_never_reported_as_unknown ... ok
+test iat_completeness::tests::missing_slot_fails_closed_even_when_bytes_read_is_exact ... ok
+test iat_completeness::tests::ordinal_is_first_class_and_zero_separator_is_not_resolved ... ok
+test iat_completeness::tests::pending_live_confirmation_is_separate_from_unknown ... ok
+test iat_completeness::tests::reason_as_str_is_stable_and_round_trips ... ok
+test iat_completeness::tests::reason_counts_are_stable_and_unknown_is_never_folded ... ok
+test iat_completeness::tests::zero_terminator_is_not_a_thunk_failure ... ok
+test import_table::tests::empty_builder_produces_valid_section ... ok
+test import_table::tests::iat_slot_size_respects_arch ... ok
+test import_table::tests::no_iat_builder_preserves_original_slot_rvas ... ok
+test import_table::tests::no_iat_every_descriptor_oft_zero_firstthunk_nonzero ... ok
+test import_table::tests::no_iat_ordinal_and_hint_name_slots ... ok
+test import_table::tests::ordinal_import_sets_flag ... ok
+test import_table::tests::single_module_with_name_import ... ok
+test postprocess::tests::fix_hardcoded_addresses_reads_and_writes_pe32_plus_values ... ok
+test postprocess::tests::fix_hardcoded_addresses_reads_and_writes_pe32_values ... ok
+test postprocess::tests::fix_hardcoded_addresses_rejects_overflowing_runtime_range ... ok
+test rebuild::tests::duplicate_section_names_get_deterministic_unique_suffixes ... ok
+test rebuild::tests::eight_byte_truncation_collision_is_deduplicated ... ok
+test rebuild::tests::emitted_sections_are_unique_dirs_preserved_size_of_image_aligned ... ok
+test rebuild::tests::empty_and_whitespace_names_do_not_collide ... ok
+test rebuild::tests::more_than_nine_duplicates_all_get_unique_names ... ok
+test rebuild::tests::naming_is_deterministic_across_runs ... ok
+test rebuild::tests::rebuild_empty_plan_errors ... ok
+test rebuild::tests::rebuild_exceptions_unsorted_errors ... ok
+test rebuild::tests::rebuild_fallback_data_directories_for_content_imports ... ok
+test rebuild::tests::rebuild_fixed_section_va_preserved ... ok
+test rebuild::tests::rebuild_headers_size_covers_section_table ... ok
+test rebuild::tests::rebuild_import_arch_mismatch_errors ... ok
+test rebuild::tests::rebuild_minimal_pe32_plus_round_trips ... ok
+test rebuild::tests::rebuild_rejects_fixed_section_virtual_end_overflow ... ok
+test rebuild::tests::rebuild_tls_arch_mismatch_errors ... ok
+test rebuild::tests::rebuild_typed_import_wins_over_fallback ... ok
+test rebuild::tests::rebuild_with_exceptions_sets_directory ... ok
+test rebuild::tests::rebuild_with_exports_sets_directory ... ok
+test rebuild::tests::rebuild_with_imports_sets_directories ... ok
+test rebuild::tests::rebuild_with_relocs_sets_basereloc_directory ... ok
+test rebuild::tests::rebuild_with_tls_sets_directory ... ok
+test rebuild::tests::same_prefix_and_existing_suffix_collision_resolve ... ok
+test relocation::tests::test_relocation_builder ... ok
+test relocation::tests::test_scan_relocations ... ok
+test relocation_observation::tests::normalizes_runtime_value_before_mutation ... ok
+test section::tests::test_create_section ... ok
+test section::tests::test_create_section_empty_table_is_rejected_without_panic ... ok
+test section::tests::test_delete_section ... ok
+test section::tests::test_delete_section_zero_is_rejected_without_panic ... ok
+test section::tests::test_rename_section ... ok
+test section::tests::test_rename_truncates_at_8 ... ok
+test section::tests::test_sanitize ... ok
+test section::tests::test_section_rename_method ... ok
+test section::tests::test_trim_huge_sections_no_op ... ok
+test tls::tests::tls32_minimal_empty_template ... ok
+test tls::tests::tls64_directory_fields_and_callback ... ok
+test tls_observation::tests::absent_tls_is_complete_negative_observation ... ok
+test tls_observation::tests::callback_array_cap_requires_terminator ... ok
+test tls_observation::tests::callback_short_read_is_blocked ... ok
+test tls_observation::tests::callback_slot_exact_range_at_image_tail_does_not_call_reader ... ok
+test tls_observation::tests::directory_declared_size_short_is_blocked ... ok
+test tls_observation::tests::directory_range_at_image_tail_does_not_call_reader ... ok
+test tls_observation::tests::directory_short_read_is_blocked ... ok
+test tls_observation::tests::index_exact_range_at_image_tail_does_not_call_reader ... ok
+test tls_observation::tests::index_short_read_is_blocked ... ok
+test tls_observation::tests::invalid_va_raw_range_and_non_executable_callback_are_blocked ... ok
+test tls_observation::tests::out_of_image_index_and_callback_are_blocked ... ok
+test tls_observation::tests::partial_tls_directory_tuple_is_blocked_without_read ... ok
+test tls_observation::tests::pe32_layout_and_callbacks_zero ... ok
+test tls_observation::tests::pe32_plus_complete_resolved_callback_and_null ... ok
+test tls_observation::tests::raw_range_out_of_image_and_low_va_are_blocked ... ok
+test tls_observation::tests::reader_over_report_is_invalid_byte_count ... ok
+test utils::tests::test_align_up_alignment_one ... ok
+test utils::tests::test_align_up_already_aligned ... ok
+test utils::tests::test_align_up_needs_padding ... ok
+test utils::tests::test_align_up_zero ... ok
+test utils::tests::test_align_up_zero_alignment ... ok
+test utils::tests::test_has_force_integrity ... ok
+test utils::tests::test_is_dll_false ... ok
+test utils::tests::test_is_dll_true ... ok
+
+test result: ok. 1008 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 55.37s
+
+
+running 7 tests
+test invalid_inputs_reject_cleanly ... ok
+test overflow_hostile_section_ranges_do_not_wrap_match ... ok
+test parse_pe32_and_pe32_plus_from_bytes ... ok
+test rva_offset_round_trip_and_bounds ... ok
+test serialize_headers_is_deterministic ... ok
+test serialize_headers_round_trip_pe32 ... ok
+test serialize_headers_round_trip_pe32_plus ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 2 tests
+test pure_module_list_is_non_empty_and_under_src ... ok
+test pure_pe_modules_exclude_live_and_win32_surfaces ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+
+
+running 11 tests
+test tracer::tests::limit_zero_maps_to_default_not_zero ... ok
+test tracer::tests::predicate_runs_on_the_limit_hit_instruction ... ok
+test tracer::tests::thread_id_of_access_violation_returns_thread_id ... ok
+test tracer::tests::thread_id_of_breakpoint_returns_thread_id ... ok
+test tracer::tests::thread_id_of_exit_process_uses_fallback_zero_without_backend_identity ... ok
+test tracer::tests::trace_limit_one_executes_exactly_one_instruction ... ok
+test tracer::tests::trace_limit_reached_count_equals_limit ... ok
+test tracer::tests::trace_limit_two_executes_exactly_two_instructions ... ok
+test tracer::tests::trace_limit_zero_uses_default_and_predicate_stops ... ok
+test tracer::tests::trace_stops_on_predicate_before_limit ... ok
+test tracer::tests::tracer_creation ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 3 tests
+test crates\disasm\src\pattern.rs - pattern::BytePattern (line 14) ... ok
+test crates\disasm\src\pattern.rs - pattern::find_dynamic (line 137) ... ok
+test crates\disasm\src\pattern.rs - pattern::find_static (line 153) ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.55s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 3 tests
+test crates\packers\themida\src\version\mod.rs - version::check_virtualized_oep (line 162) ... ok
+test crates\packers\themida\src\version\mod.rs - version::detect_version (line 76) ... ok
+test crates\packers\themida\src\version\mod.rs - version::is_themida_section (line 245) ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.10s
+
+
+running 4 tests
+test crates\pe\src\postprocess.rs - postprocess::postprocess_image (line 27) ... ignored
+test crates\pe\src\utils.rs - utils::align_up (line 9) ... ok
+test crates\pe\src\utils.rs - utils::has_force_integrity (line 48) ... ok
+test crates\pe\src\utils.rs - utils::is_dll (line 32) ... ok
+
+test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.53s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+ERR_TAIL: 0.10.4
+   Compiling digest v0.10.7
+   Compiling sha2 v0.10.9
+   Compiling thiserror-impl v1.0.69
+   Compiling serde_derive v1.0.229
+   Compiling mida-acceptance v0.1.0 (D:\Claude project\magicmida-rs\crates\acceptance)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 17.26s
+     Running tests\preflight_boundary.rs (target\debug\deps\preflight_boundary-6cfb3495c32d5ed5.exe)
+   Compiling proc-macro2 v1.0.106
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.46
+   Compiling version_check v0.9.5
+   Compiling typenum v1.20.1
+   Compiling serde_core v1.0.229
+   Compiling zmij v1.0.23
+   Compiling serde_json v1.0.151
+   Compiling serde v1.0.229
+   Compiling thiserror v1.0.69
+   Compiling itoa v1.0.18
+   Compiling cpufeatures v0.2.17
+   Compiling cfg-if v1.0.4
+   Compiling memchr v2.8.2
+   Compiling generic-array v0.14.7
+   Compiling syn v2.0.118
+   Compiling syn v3.0.2
+   Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+   Compiling digest v0.10.7
+   Compiling sha2 v0.10.9
+   Compiling thiserror-impl v1.0.69
+   Compiling serde_derive v1.0.229
+   Compiling mida-acceptance v0.1.0 (D:\Claude project\magicmida-rs\crates\acceptance)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 14.08s
+     Running tests\runner_config_digest_crosscheck.rs (target\debug\deps\runner_config_digest_crosscheck-a9adf19c75ea922f.exe)
+     Running tests\runtime_loader.rs (target\debug\deps\runtime_loader-7d83e31b4d2fb2c4.exe)
+     Running unittests src\lib.rs (target\debug\deps\mida_core-9152f8811af956da.exe)
+     Running tests\capture_epoch_harness.rs (target\debug\deps\capture_epoch_harness-07a5966b975e7924.exe)
+     Running tests\drain_lifecycle_harness.rs (target\debug\deps\drain_lifecycle_harness-e357be4704304de5.exe)
+     Running unittests src\lib.rs (target\debug\deps\mida_disasm-df718bf3559697d3.exe)
+     Running unittests src\lib.rs (target\debug\deps\mida_packers_ahk_gto-1f2c241204bb8fb4.exe)
+     Running unittests src\lib.rs (target\debug\deps\mida_packers_themida-042fda4c1f10fb16.exe)
+     Running tests\av_oep_handler.rs (target\debug\deps\av_oep_handler-337d0fd404ae0819.exe)
+     Running tests\full_pipeline_replay.rs (target\debug\deps\full_pipeline_replay-58d7a84d23dbabc0.exe)
+     Running tests\iat_trace_handler.rs (target\debug\deps\iat_trace_handler-acb44d1a8f459521.exe)
+     Running unittests src\lib.rs (target\debug\deps\mida_pe-f43a0fbdef6ef9c3.exe)
+     Running tests\pure_parse_serialize.rs (target\debug\deps\pure_parse_serialize-a6082f97497b0425.exe)
+     Running tests\purity_boundary.rs (target\debug\deps\purity_boundary-2bac905062f04b56.exe)
+     Running unittests src\lib.rs (target\debug\deps\mida_tracer-f8e6ac1f2730123d.exe)
+   Doc-tests mida_acceptance
+   Doc-tests mida_antidebug
+   Doc-tests mida_antidebug_runtime
+   Doc-tests mida_cli
+   Doc-tests mida_core
+   Doc-tests mida_disasm
+   Doc-tests mida_packers_ahk_gto
+   Doc-tests mida_packers_themida
+   Doc-tests mida_pe
+   Doc-tests mida_tracer
+
+DONE rc=0

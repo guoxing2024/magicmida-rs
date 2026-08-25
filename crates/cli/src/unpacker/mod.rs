@@ -783,12 +783,26 @@ pub fn unpack(
                 profile_identity: evidence_ctx
                     .as_ref()
                     .and_then(|ctx| ctx.profile_identity().cloned()),
-                // IMP-09-CARRIER-R5-R2-4: NO authorized target-side
-                // dispatch bridge ships in R5-R2 (live authorization
-                // deferred to R5-R3/R5-R4); the controller records +
-                // returns NOT_IMPLEMENTED at the execute gate and Proceed
-                // stays blocked (fail-closed).
-                walker_dispatch: None,
+                // IMP-09-DISPATCH-WIRING: env-gated live dispatch bridge.
+                // Gate contract: MIDA_GTO_NO_BYPASS=1 AND
+                // MIDA_GTO_LIVE_DISPATCH=1 (live_dispatch_gate in
+                // walker_dispatch.rs). Gate closed -> None (offline
+                // default, byte-identical to baseline: controller records
+                // NOT_IMPLEMENTED at the execute gate, Proceed blocked).
+                // Gate open -> construct via the sealed dual-carrier path;
+                // missing carriers -> None (fail-closed). The file-side
+                // loader carrier is in scope (loader_outcome); the
+                // remote-side MidaExportsV2 carrier is NOT reachable from
+                // this construction site (resolve_mida_exports_remote runs
+                // inside run_runtime_loader and is not carried on
+                // LoaderResult) -> exports stays None here, so the bridge
+                // stays None until a carrier channel exists (reported in
+                // docs/IMP09_DISPATCH_WIRING_REPORT_20260826.md).
+                walker_dispatch: walker_dispatch::try_build_live_dispatch_bridge_boxed(
+                    dbg.process_handle(),
+                    loader_outcome.as_ref().ok(),
+                    None, // remote MidaExportsV2 carrier not in scope
+                ),
                 // IMP-09-CARRIER-R5-R2-1: the debugger drives termination
                 // AFTER the controller gate (alive window); run() must not
                 // fire the termination backend.
@@ -1219,13 +1233,27 @@ pub fn unpack(
                             profile_identity: evidence_ctx
                                 .as_ref()
                                 .and_then(|ctx| ctx.profile_identity().cloned()),
-                            // IMP-09-CARRIER-R5-R2-4: NO authorized
-                            // target-side dispatch bridge ships in R5-R2
-                            // (live authorization deferred to R5-R3/R5-R4).
-                            // The controller therefore records + returns
-                            // NOT_IMPLEMENTED at the execute gate and
-                            // Proceed stays blocked (fail-closed).
-                            walker_dispatch: None,
+                            // IMP-09-DISPATCH-WIRING: env-gated live
+                            // dispatch bridge. Gate contract:
+                            // MIDA_GTO_NO_BYPASS=1 AND
+                            // MIDA_GTO_LIVE_DISPATCH=1 (live_dispatch_gate
+                            // in walker_dispatch.rs). Gate closed -> None
+                            // (offline default: NOT_IMPLEMENTED at the
+                            // execute gate, Proceed blocked — unchanged).
+                            // Gate open -> construct via the sealed
+                            // dual-carrier path; missing carriers -> None.
+                            // This construction site runs BEFORE the
+                            // runtime loader (loader_outcome is produced
+                            // later in this handler) and the remote
+                            // MidaExportsV2 carrier is not in scope, so
+                            // both carriers are None here -> bridge stays
+                            // None (fail-closed; reported in
+                            // docs/IMP09_DISPATCH_WIRING_REPORT_20260826.md).
+                            walker_dispatch: walker_dispatch::try_build_live_dispatch_bridge_boxed(
+                                dbg.process_handle(),
+                                None, // loader outcome not yet produced
+                                None, // remote MidaExportsV2 not in scope
+                            ),
                             // IMP-09-CARRIER-R5-R2-1: the debugger drives
                             // termination AFTER the controller gate (alive
                             // window); run() must not fire the backend.

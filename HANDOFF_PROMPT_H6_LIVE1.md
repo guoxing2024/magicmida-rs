@@ -37,7 +37,7 @@
 ## 3. 执行硬约束
 
 - 样本只认 vault 锚定对象（preflight revision_match=true 才继续）；
-- `MIDA_GTO_NO_BYPASS=1` 全程；`MIDA_GTO_LIVE_AUTHORIZED=1` 仅单命令窗口
+- `MIDA_GTO_NO_BYPASS=1` 全程；`MIDA_GTO_LIVE_DISPATCH=1` 仅单命令窗口
   设置+清除并留证据（沿用 H5-LIVE-2 先例）;
 - dispatch 必须经 `crates/cli/src/unpacker/walker_dispatch.rs` 桥接
   （双 sealed 交叉校验），禁止手工构造 VA;

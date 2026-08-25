@@ -351,6 +351,107 @@ impl WalkerDispatchBridge for WalkerDispatchBridgeImpl {
     }
 }
 
+// ---------------------------------------------------------------------------
+// IMP-09-DISPATCH-WIRING: centralized LIVE dispatch gate (env-controlled).
+//
+// Contract (work order IMP-09-DISPATCH-WIRING section 2):
+//   - live_dispatch_gate() returns true ONLY when BOTH
+//       MIDA_GTO_NO_BYPASS == "1"    (observation discipline on)
+//       MIDA_GTO_LIVE_DISPATCH == "1" (explicit live unlock, set by the
+//         signed LIVE work order execution window, cleared after)
+//     are set to exactly "1". Any missing / any other value -> false.
+//   - MIDA_GTO_LIVE_AUTHORIZED is RETIRED (historical name, never had a
+//     read point) and is NOT consulted.
+//
+// try_build_live_dispatch_bridge is the single production wiring seam:
+// gate closed -> None (offline default, byte-identical to baseline);
+// gate open + ALL sealed carriers present -> Some(Box<WalkerDispatchBridgeImpl>)
+// (dual-sealed cross-check path); any carrier missing -> None (fail-closed,
+// the existing NotImplemented branch at the controller execute gate is
+// preserved). It NEVER fabricates a carrier and NEVER relaxes the authority
+// chain: the caller hands in the carriers it already holds in scope
+// (loader_result / resolve results); missing carriers simply keep the
+// bridge absent.
+// ---------------------------------------------------------------------------
+
+/// Name of the observation-discipline environment variable. MUST be "1" for
+/// the live dispatch gate to open (same contract as the live-route
+/// controller environment preflight).
+pub const GTO_ENV_NO_BYPASS: &str = "MIDA_GTO_NO_BYPASS";
+
+/// Name of the explicit live-dispatch unlock environment variable (replaces
+/// the retired `MIDA_GTO_LIVE_AUTHORIZED`). Set only inside the signed LIVE
+/// work order single-command execution window, cleared immediately after.
+pub const GTO_ENV_LIVE_DISPATCH: &str = "MIDA_GTO_LIVE_DISPATCH";
+
+/// Centralized LIVE dispatch gate.
+///
+/// Returns true only when MIDA_GTO_NO_BYPASS == "1" AND
+/// MIDA_GTO_LIVE_DISPATCH == "1". Any missing variable or any value other
+/// than exactly "1" fails closed to false. The retired
+/// MIDA_GTO_LIVE_AUTHORIZED is deliberately NOT consulted.
+pub fn live_dispatch_gate() -> bool {
+    std::env::var(GTO_ENV_NO_BYPASS).ok().as_deref() == Some("1")
+        && std::env::var(GTO_ENV_LIVE_DISPATCH).ok().as_deref() == Some("1")
+}
+
+/// Production wiring seam for the env-gated live dispatch bridge.
+///
+/// Gate closed -> None (offline default; the controller keeps the
+/// NOT_IMPLEMENTED fail-closed branch).
+///
+/// Gate open -> construct WalkerDispatchBridgeImpl through its sealed
+/// dual-carrier constructor, but ONLY when every required carrier is
+/// present:
+///   - loader (file-side sealed carrier: module_base + pure-file
+///     walker_export_rva) -- missing -> None;
+///   - exports (remote-side sealed carrier: MidaExportsV2.walker_execute
+///     target VA from resolve_mida_exports_remote) -- missing -> None.
+///
+/// The bridge constructor itself performs the dual-sealed cross-check at
+/// dispatch time (remote_va == module_base + file_rva); construction here
+/// additionally fails closed on incomplete carriers so a missing export can
+/// never reach expect().
+pub fn try_build_live_dispatch_bridge(
+    target: HANDLE,
+    loader: Option<&LoaderResult>,
+    exports: Option<&MidaExportsV2>,
+) -> Option<WalkerDispatchBridgeImpl> {
+    if !live_dispatch_gate() {
+        return None;
+    }
+    let loader = loader?;
+    let exports = exports?;
+    if loader.walker_export_rva().is_none() {
+        return None;
+    }
+    if exports.walker_execute.is_none() {
+        return None;
+    }
+    // SAFETY of the sealed constructor: new panics only when a carrier is
+    // missing; both required carriers were verified present above, so the
+    // panic path is unreachable (fail-closed already returned None).
+    Some(WalkerDispatchBridgeImpl::new(
+        target,
+        loader.clone(),
+        exports.clone(),
+    ))
+}
+
+/// Boxed variant for the production `AntidebugStageOptions.walker_dispatch`
+/// slot (which is `Option<Box<dyn WalkerDispatchBridge>>`). Same gate and
+/// carrier contract as [`try_build_live_dispatch_bridge`]; the concrete
+/// bridge is boxed only after a successful construction (never a forged
+/// trait object).
+pub fn try_build_live_dispatch_bridge_boxed(
+    target: HANDLE,
+    loader: Option<&LoaderResult>,
+    exports: Option<&MidaExportsV2>,
+) -> Option<Box<dyn WalkerDispatchBridge>> {
+    try_build_live_dispatch_bridge(target, loader, exports)
+        .map(|b| Box::new(b) as Box<dyn WalkerDispatchBridge>)
+}
+
 #[cfg(test)]
 mod imp09_dispatch_bridge_tests {
     //! T1-T12 offline test matrix (offline_mock=true): every test runs
@@ -731,5 +832,188 @@ mod imp09_dispatch_bridge_tests {
         assert_eq!(ptr, 0x7FF600000000 + 0x2040);
         // The reserved slot must stay zero (never smuggles state).
         assert_eq!(u64::from_le_bytes(bytes[56..64].try_into().unwrap()), 0);
+    }
+
+    // -------------------------------------------------------------------
+    // T13-T16 (IMP-09-DISPATCH-WIRING): env-gated live dispatch bridge.
+    //
+    // These tests exercise live_dispatch_gate() +
+    // try_build_live_dispatch_bridge() fully offline. Every env mutation is
+    // serialized under ENV_LOCK (same pattern as walker_session
+    // INSTALL_LOCK) so parallel test threads can never observe a foreign
+    // env state. The carrier pair is built through the REAL sealed
+    // constructors (build_loader_result / carrier_pair) exactly like
+    // T3-T12; a "complete carriers" pair passes the dual-sealed
+    // cross-check, and a mismatch pair must fail closed even with the gate
+    // open (T15).
+    // -------------------------------------------------------------------
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Set env vars for the gate under the serial lock; returns the previous
+    /// values (None = absent) for restore by drop_env_state().
+    fn set_gate_env(no_bypass: Option<&str>, live_dispatch: Option<&str>) {
+        set_env_opt(GTO_ENV_NO_BYPASS, no_bypass);
+        set_env_opt(GTO_ENV_LIVE_DISPATCH, live_dispatch);
+    }
+
+    fn set_env_opt(key: &str, val: Option<&str>) {
+        match val {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
+
+    /// Remove both gate vars (restore the offline default).
+    fn clear_gate_env() {
+        unsafe {
+            std::env::remove_var(GTO_ENV_NO_BYPASS);
+            std::env::remove_var(GTO_ENV_LIVE_DISPATCH);
+        }
+    }
+
+    #[test]
+    fn t13_gate_closed_returns_none_bridge() {
+        // Gate closed (missing / partial env) -> construction path yields
+        // None even with complete carriers (offline default preserved).
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (loader, exports) = carrier_pair(0x7FF600000000, 0x2040);
+
+        // Both vars missing.
+        clear_gate_env();
+        assert!(!live_dispatch_gate());
+        assert!(try_build_live_dispatch_bridge(
+            self_handle(),
+            Some(&loader),
+            Some(&exports)
+        )
+        .is_none());
+
+        // Only NO_BYPASS set.
+        set_gate_env(Some("1"), None);
+        assert!(!live_dispatch_gate());
+        assert!(try_build_live_dispatch_bridge(
+            self_handle(),
+            Some(&loader),
+            Some(&exports)
+        )
+        .is_none());
+
+        // Only LIVE_DISPATCH set.
+        set_gate_env(None, Some("1"));
+        assert!(!live_dispatch_gate());
+        assert!(try_build_live_dispatch_bridge(
+            self_handle(),
+            Some(&loader),
+            Some(&exports)
+        )
+        .is_none());
+
+        // Wrong value ("0").
+        set_gate_env(Some("0"), Some("1"));
+        assert!(!live_dispatch_gate());
+        assert!(try_build_live_dispatch_bridge(
+            self_handle(),
+            Some(&loader),
+            Some(&exports)
+        )
+        .is_none());
+
+        clear_gate_env();
+    }
+
+    #[test]
+    fn t14_gate_open_with_complete_carriers_builds_bridge() {
+        // Gate open + complete sealed carriers -> Some(bridge) whose
+        // dual-sealed cross-check passes.
+        let _lock = ENV_LOCK.lock().unwrap();
+        set_gate_env(Some("1"), Some("1"));
+        assert!(live_dispatch_gate());
+
+        let (loader, exports) = carrier_pair(0x7FF600000000, 0x2040);
+        let bridge = try_build_live_dispatch_bridge(
+            self_handle(),
+            Some(&loader),
+            Some(&exports),
+        );
+        let bridge = bridge.expect("gate open + complete carriers must build");
+        assert!(bridge.carriers_complete());
+        // Offline discipline (same as T3-T12): never CreateRemoteThread against
+        // a real process. The dual-sealed cross-check is the observable proof
+        // that the authority chain accepted the remote VA.
+        assert!(bridge.cross_check_passes(0x7FF600000000 + 0x2040));
+        assert!(!bridge.cross_check_passes(0x7FF600000000 + 0x2041));
+
+        // Carrier missing -> None even with the gate open (fail-closed).
+        assert!(try_build_live_dispatch_bridge(
+            self_handle(),
+            None,
+            Some(&exports)
+        )
+        .is_none());
+        assert!(try_build_live_dispatch_bridge(
+            self_handle(),
+            Some(&loader),
+            None,
+        )
+        .is_none());
+
+        clear_gate_env();
+    }
+
+    #[test]
+    fn t15_gate_open_cannot_bypass_cross_check_mismatch() {
+        // Gate open + a mismatch carrier pair (remote VA != module_base +
+        // file_rva) must fail the authority chain: dispatch returns
+        // BAD_PARAMS (never dispatches against a VA the two sealed chains
+        // disagree on).
+        let _lock = ENV_LOCK.lock().unwrap();
+        set_gate_env(Some("1"), Some("1"));
+        assert!(live_dispatch_gate());
+
+        let (loader, exports) = carrier_pair(0x7FF600000000, 0x2040);
+        let mut bad_exports = exports.clone();
+        bad_exports.walker_execute = Some(0x7FF600000000 + 0x2041); // mismatch
+        let bridge = try_build_live_dispatch_bridge(
+            self_handle(),
+            Some(&loader),
+            Some(&bad_exports),
+        )
+        .expect("gate open + carriers present constructs; mismatch is caught at dispatch");
+        let (status, output) = bridge.dispatch(0x7777);
+        assert_eq!(
+            status,
+            mida_antidebug_runtime::walker_protocol::WALKER_STATUS_ERROR_BAD_PARAMS as i32
+        );
+        assert!(output.is_none(), "no output may be marshaled on mismatch");
+
+        clear_gate_env();
+    }
+
+    #[test]
+    fn t16_env_tests_serialized_and_reproducible() {
+        // T16: prove the env-lock discipline. Run the same gate logic twice
+        // under the lock; both runs agree (deterministic, no cross-test
+        // pollution) and the env is restored to the offline default at the
+        // end so the whole suite stays reproducible.
+        let _lock = ENV_LOCK.lock().unwrap();
+
+        for _ in 0..2 {
+            clear_gate_env();
+            assert!(!live_dispatch_gate());
+            set_gate_env(Some("1"), Some("1"));
+            assert!(live_dispatch_gate());
+            set_gate_env(Some("1"), None);
+            assert!(!live_dispatch_gate());
+            clear_gate_env();
+            assert!(!live_dispatch_gate());
+        }
+
+        // Also verify the retired variable is not consulted: setting only
+        // MIDA_GTO_LIVE_AUTHORIZED=1 (with both new vars absent) stays closed.
+        unsafe { std::env::set_var("MIDA_GTO_LIVE_AUTHORIZED", "1") };
+        assert!(!live_dispatch_gate());
+        unsafe { std::env::remove_var("MIDA_GTO_LIVE_AUTHORIZED") };
+        assert!(!live_dispatch_gate());
     }
 }
