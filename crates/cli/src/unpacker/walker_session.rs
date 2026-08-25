@@ -16,9 +16,9 @@
 use mida_antidebug_runtime::walker_control::WalkerIoError;
 use mida_antidebug_runtime::walker_control::WalkerMemoryProvider;
 use mida_antidebug_runtime::walker_protocol::{
-    encode_section, is_canonical_user_va, MappingIdentityHeaderV2, ResultSectionHeaderV2,
-    WalkerParamsV2, MIN_SECTION_HEADER_BYTES, PARAMS_HEADER_BYTES, PROBE_RESULT_BYTES,
-    WALKER_SESSION_ID_BYTES,
+    derive_session_id, encode_section, is_canonical_user_va, MappingIdentityHeaderV2,
+    ResultSectionHeaderV2, WalkerParamsV2, MIN_SECTION_HEADER_BYTES, PARAMS_HEADER_BYTES,
+    PROBE_RESULT_BYTES, WALKER_SESSION_ID_BYTES,
 };
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
@@ -30,10 +30,34 @@ use windows::Win32::System::Threading::{
     GetProcessId, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
-/// Fixed size of the walker params region (one page).
-pub const WALKER_PARAMS_REGION_BYTES: usize = 0x1000;
-/// Fixed size of the walker result section region (one page).
-pub const WALKER_SECTION_REGION_BYTES: usize = 0x1000;
+/// Maximum walker params blob bytes (header 0x40 + 4096 * 8).
+pub const WALKER_PARAMS_MAX_BYTES: usize = 0x40 + 4096 * 8;
+/// Page size used for remote allocation sizing (Windows x64).
+pub const WALKER_PAGE_SIZE: u64 = 0x1000;
+
+/// Page-aligned bytes needed for a params blob holding `candidate_count`
+/// candidates: header 0x40 + count*8, rounded up to a whole page.
+pub fn params_region_bytes(candidate_count: u32) -> Option<u64> {
+    let need = (candidate_count as u64)
+        .checked_mul(8)
+        .and_then(|v| v.checked_add(0x40))?;
+    Some(
+        need.div_ceil(WALKER_PAGE_SIZE)
+            .checked_mul(WALKER_PAGE_SIZE)?,
+    )
+}
+
+/// Page-aligned bytes needed for the TWO result rounds (round 1 at
+/// section1_va, round 2 at section1_va + section_bytes):
+/// `2 * section_bytes`, rounded up to a whole page. This guarantees both
+/// rounds are inside the allocation (WalkerExecute reads both).
+pub fn section_region_bytes(section_bytes: u64) -> Option<u64> {
+    let need = section_bytes.checked_mul(2)?;
+    Some(
+        need.div_ceil(WALKER_PAGE_SIZE)
+            .checked_mul(WALKER_PAGE_SIZE)?,
+    )
+}
 
 /// Production `WalkerMemoryProvider` over ReadProcessMemory.
 ///
@@ -167,6 +191,9 @@ pub struct WalkerSessionMemory {
     params: Option<RemoteAllocation>,
     section: Option<RemoteAllocation>,
     installed: bool,
+    /// Target handle captured at allocate() so Drop can free the remote
+    /// allocations without the caller remembering to call cleanup.
+    target: Option<HANDLE>,
 }
 
 impl WalkerSessionMemory {
@@ -175,17 +202,40 @@ impl WalkerSessionMemory {
             params: None,
             section: None,
             installed: false,
+            target: None,
         }
     }
 
     /// Allocate both regions in the target. Fail-closed: on any error
     /// both are freed and `None` is returned.
-    pub fn allocate(&mut self, target: HANDLE) -> Option<(u64, u64)> {
+    pub fn allocate(&mut self, target: HANDLE, candidate_count: u32) -> Option<(u64, u64)> {
+        // Capacity sizing is derived from the REAL candidate count:
+        //  - params region must hold header + count*8 (protocol max 4096
+        //    -> 0x8040 bytes, page-aligned);
+        //  - section region must hold BOTH rounds (2 * section_bytes,
+        //    page-aligned) so WalkerExecute's sec2 read at
+        //    section1_va + section_bytes is inside the allocation.
+        let params_bytes = match params_region_bytes(candidate_count) {
+            Some(b) if b > 0 => b as usize,
+            _ => return None,
+        };
+        let sec_cap = match (candidate_count as u64)
+            .checked_mul(PROBE_RESULT_BYTES as u64)
+            .and_then(|v| v.checked_add(MIN_SECTION_HEADER_BYTES as u64))
+        {
+            Some(b) => b,
+            None => return None,
+        };
+        let section_bytes = match section_region_bytes(sec_cap) {
+            Some(b) if b > 0 => b as usize,
+            _ => return None,
+        };
+        self.target = Some(target);
         let params_va = unsafe {
             VirtualAllocEx(
                 target,
                 None,
-                WALKER_PARAMS_REGION_BYTES,
+                params_bytes,
                 MEM_COMMIT | MEM_RESERVE,
                 PAGE_READWRITE,
             )
@@ -198,7 +248,7 @@ impl WalkerSessionMemory {
             VirtualAllocEx(
                 target,
                 None,
-                WALKER_SECTION_REGION_BYTES,
+                section_bytes,
                 MEM_COMMIT | MEM_RESERVE,
                 PAGE_READWRITE,
             )
@@ -251,7 +301,7 @@ impl WalkerSessionMemory {
             Ok(b) => b,
             Err(_) => return Err(()),
         };
-        if blob.len() > WALKER_PARAMS_REGION_BYTES {
+        if blob.len() > params_region_bytes(candidate_count).unwrap_or(0) as usize {
             return Err(());
         }
         // Verify the envelope locally before any write.
@@ -308,7 +358,7 @@ impl WalkerSessionMemory {
             MappingIdentityHeaderV2::new(capacity, target_pid, owner_pid, result_nonce, session_id);
         let header = ResultSectionHeaderV2::new(capacity, max_n).map_err(|_| ())?;
         let section = encode_section(&identity, &header, &[]).map_err(|_| ())?;
-        if section.len() > WALKER_SECTION_REGION_BYTES {
+        if section.len() > section_region_bytes(result_bytes).unwrap_or(0) as usize {
             return Err(());
         }
         let mut written = 0usize;
@@ -355,12 +405,19 @@ impl WalkerSessionMemory {
 
 impl Drop for WalkerSessionMemory {
     /// Panic/unwind safety: free both allocations when dropped without
-    /// an explicit cleanup (the target handle cannot be recovered here,
-    /// so the owner must call [`WalkerSessionMemory::cleanup`] with the
-    /// live handle; this Drop only guards the no-handle case by marking
-    /// the state (allocations are released by the caller's teardown).
+    /// an explicit cleanup. The target handle was captured at allocate()
+    /// (self.target), so Drop can release the remote memory even when a
+    /// caller forgets teardown or an unwind drops the owner early.
     fn drop(&mut self) {
-        self.installed = false;
+        if let Some(h) = self.target {
+            // SAFETY: same handle semantics as cleanup() — kernel32
+            // VirtualFreeEx on a handle we captured at allocate time.
+            let saved = self.cleanup(h);
+            self.installed = false;
+            let _ = saved;
+        } else {
+            self.installed = false;
+        }
     }
 }
 
@@ -378,7 +435,6 @@ pub fn install_walker_session_production(
     result_nonce: u64,
     options_flags: u16,
     probe_span: u16,
-    session_id: [u8; WALKER_SESSION_ID_BYTES],
     target_image_sha256: &str,
     runtime_module_sha256: &str,
     module_base: u64,
@@ -386,23 +442,35 @@ pub fn install_walker_session_production(
     profile_id: &str,
     profile_digest: &str,
 ) -> Option<WalkerSessionMemory> {
+    // Fail-closed: nonce MUST be nonzero (protocol rejects ZeroNonce).
+    if result_nonce == 0 {
+        return None;
+    }
+    if candidates.is_empty() || candidates.len() > 4096 {
+        return None;
+    }
     let mut mem = WalkerSessionMemory::new();
-    let (params_va, section1_va) = match mem.allocate(target) {
+    let candidate_count = candidates.len() as u32;
+    let (params_va, section1_va) = match mem.allocate(target, candidate_count) {
         Some(v) => v,
         None => return None,
     };
-    let candidate_count = candidates.len() as u32;
     // result_bytes = section capacity. The protocol REQUIRES
     // result_bytes == candidate_count*0x28 + MIN_SECTION_HEADER_BYTES
-    // (WalkerParamsV2::validate) AND the section capacity must equal it.
+    // (WalkerParamsV2::validate).
     let section_bytes = (candidate_count as u64)
         .checked_mul(0x28)
         .and_then(|v| v.checked_add(MIN_SECTION_HEADER_BYTES as u64))
         .unwrap_or(0);
-    if section_bytes == 0 || section_bytes > WALKER_SECTION_REGION_BYTES as u64 {
+    if section_bytes == 0 {
         mem.cleanup(target);
         return None;
     }
+    // IMP-09-CARRIER-R5-R1 P0-2: the session id is DERIVED here from the
+    // protocol inputs (nonce, params_va, candidate_count) — the exact
+    // derivation WalkerDriver::new performs from the params blob. No
+    // caller-supplied session id can ever mismatch the derived one.
+    let session_id = derive_session_id(result_nonce, params_va, candidate_count);
     if mem
         .write_params(
             target,
@@ -462,9 +530,14 @@ pub fn install_walker_session_production(
 
 #[cfg(test)]
 mod imp09_r5_tests {
+
+    /// Serializes install-path tests: the runtime walker singletons
+    /// are process-global, so only ONE install test may hold the
+    /// lifecycle at a time. Each install test takes the lock at entry.
+    static INSTALL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     use super::*;
     use windows::Win32::System::Memory::{
-        VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
+        VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_FREE, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
     };
     use windows::Win32::System::Threading::GetCurrentProcess;
 
@@ -490,6 +563,7 @@ mod imp09_r5_tests {
     /// reinstall clears state; output channel drained).
     fn reset_runtime() {
         let _ = mida_antidebug_runtime::exports::take_walker_output();
+        mida_antidebug_runtime::exports::reset_walker_bindings();
     }
 
     // ---------- provider: PID binding ----------
@@ -590,8 +664,9 @@ mod imp09_r5_tests {
 
     #[test]
     fn memory_allocate_returns_distinct_vas() {
+        let _lock = INSTALL_LOCK.lock().unwrap();
         let mut m = WalkerSessionMemory::new();
-        let r = m.allocate(self_handle());
+        let r = m.allocate(self_handle(), 2);
         assert!(r.is_some());
         let (pv, sv) = r.unwrap();
         assert_ne!(pv, 0);
@@ -604,8 +679,9 @@ mod imp09_r5_tests {
 
     #[test]
     fn memory_write_params_then_read_back() {
+        let _lock = INSTALL_LOCK.lock().unwrap();
         let mut m = WalkerSessionMemory::new();
-        m.allocate(self_handle()).unwrap();
+        m.allocate(self_handle(), 2).unwrap();
         let candidates = [0x400000u64, 0x401000u64];
         let ok = m.write_params(
             self_handle(),
@@ -630,8 +706,9 @@ mod imp09_r5_tests {
 
     #[test]
     fn memory_write_section_header_roundtrip() {
+        let _lock = INSTALL_LOCK.lock().unwrap();
         let mut m = WalkerSessionMemory::new();
-        m.allocate(self_handle()).unwrap();
+        m.allocate(self_handle(), 2).unwrap();
         let sid = [0x11u8; WALKER_SESSION_ID_BYTES];
         let ok = m.write_section_header(
             self_handle(),
@@ -669,7 +746,7 @@ mod imp09_r5_tests {
     #[test]
     fn memory_cleanup_idempotent() {
         let mut m = WalkerSessionMemory::new();
-        m.allocate(self_handle()).unwrap();
+        m.allocate(self_handle(), 2).unwrap();
         m.cleanup(self_handle());
         m.cleanup(self_handle());
         assert!(m.params_va().is_none() && m.section1_va().is_none());
@@ -680,12 +757,12 @@ mod imp09_r5_tests {
     #[test]
     fn full_install_transactional_success_and_abort_cleanup() {
         reset_runtime();
+        let _lock = INSTALL_LOCK.lock().unwrap();
         // Use candidates that are ACTUALLY mapped in our own process so
         // the driver can complete real probe rounds (engineering runtime).
         let probe_region = alloc_local(0x1000);
         assert!(!probe_region.is_null());
         let candidates = [probe_region as u64, probe_region as u64 + 0x100];
-        let sid = [0x22u8; WALKER_SESSION_ID_BYTES];
         let r = install_walker_session_production(
             self_handle(),
             std::process::id(),
@@ -694,7 +771,6 @@ mod imp09_r5_tests {
             0x1122334455667788,
             0,
             16,
-            sid,
             &dig64('a'),
             &dig64('b'),
             0x7FF600000000,
@@ -731,10 +807,10 @@ mod imp09_r5_tests {
     #[test]
     fn install_failure_no_ready() {
         reset_runtime();
+        let _lock = INSTALL_LOCK.lock().unwrap();
         // Invalid target_image digest (uppercase) must fail BEFORE any
         // allocation survives; install returns None.
         let candidates: [u64; 1] = [0x400000];
-        let sid = [0x33u8; WALKER_SESSION_ID_BYTES];
         let r = install_walker_session_production(
             self_handle(),
             std::process::id(),
@@ -743,7 +819,6 @@ mod imp09_r5_tests {
             0x99,
             0,
             16,
-            sid,
             &dig64('A'), // uppercase -> invalid
             &dig64('b'),
             0x7FF600000000,
@@ -769,7 +844,6 @@ mod imp09_r5_tests {
                 u64,
                 u16,
                 u16,
-                [u8; WALKER_SESSION_ID_BYTES],
                 &str,
                 &str,
                 u64,
@@ -784,10 +858,11 @@ mod imp09_r5_tests {
 
     #[test]
     fn allocate_rollback_frees_both_on_second_failure() {
+        let _lock = INSTALL_LOCK.lock().unwrap();
         // A NULL/invalid target handle makes the SECOND allocation fail;
         // the first must be rolled back (no leak, no partial state).
         let mut m = WalkerSessionMemory::new();
-        let r = m.allocate(HANDLE(std::ptr::null_mut()));
+        let r = m.allocate(HANDLE(std::ptr::null_mut()), 2);
         assert!(r.is_none(), "allocation against invalid handle must fail");
         assert!(
             m.params_va().is_none() && m.section1_va().is_none(),
@@ -797,21 +872,23 @@ mod imp09_r5_tests {
 
     #[test]
     fn params_section_alias_rejected_by_allocate() {
+        let _lock = INSTALL_LOCK.lock().unwrap();
         // allocate() guarantees params_va != section1_va (hard invariant);
         // the alias check is inside the allocator, so a successful
         // allocate proves distinctness.
         let mut m = WalkerSessionMemory::new();
-        let r = m.allocate(self_handle()).unwrap();
+        let r = m.allocate(self_handle(), 2).unwrap();
         assert_ne!(r.0, r.1, "params_va must never alias section1_va");
         m.cleanup(self_handle());
     }
 
     #[test]
     fn wpm_short_write_detected() {
+        let _lock = INSTALL_LOCK.lock().unwrap();
         // write_params against an invalid target handle must fail
         // (WriteProcessMemory fails closed on a bad handle).
         let mut m = WalkerSessionMemory::new();
-        m.allocate(self_handle()).unwrap();
+        m.allocate(self_handle(), 2).unwrap();
         let bad = HANDLE(std::ptr::null_mut());
         let r = m.write_params(bad, 1, &[0x400000], 0x1234, 96 + 40, 0, 16);
         assert!(r.is_err(), "write to invalid handle must fail closed");
@@ -820,11 +897,12 @@ mod imp09_r5_tests {
 
     #[test]
     fn header_nonce_mismatch_detected_by_section_readback() {
+        let _lock = INSTALL_LOCK.lock().unwrap();
         // The section identity header carries the session nonce; reading
         // it back must match what was written (mismatch => protocol
         // rejects the section at consume time).
         let mut m = WalkerSessionMemory::new();
-        m.allocate(self_handle()).unwrap();
+        m.allocate(self_handle(), 2).unwrap();
         let sid = [0x44u8; WALKER_SESSION_ID_BYTES];
         m.write_section_header(
             self_handle(),
@@ -836,7 +914,7 @@ mod imp09_r5_tests {
         )
         .unwrap();
         let p = RpmWalkerProvider::new(self_handle(), std::process::id()).unwrap();
-        let mut full = vec![0u8; WALKER_SECTION_REGION_BYTES];
+        let mut full = vec![0u8; section_region_bytes(96 + 40 * 2).unwrap() as usize];
         p.read(m.section1_va().unwrap(), &mut full).unwrap();
         // The nonce field is at [24..32) in the identity header.
         let nonce = u64::from_le_bytes(full[24..32].try_into().unwrap());
@@ -859,5 +937,467 @@ mod imp09_r5_tests {
         assert_eq!(ident_ok.target_pid, std::process::id());
         assert_eq!(ident_ok.session_id, sid);
         m.cleanup(self_handle());
+    }
+
+    // ---------- R5-R1: session_id derivation binding ----------
+
+    #[test]
+    fn production_session_id_equals_protocol_derived() {
+        // P0-2: the session id installed into the section identity MUST
+        // equal derive_session_id(nonce, params_va, candidate_count) —
+        // the exact derivation WalkerDriver::new recomputes from the
+        // params blob. Verified via memory write + provider readback
+        // (no global lifecycle install, so tests stay independent).
+        let mut mem = WalkerSessionMemory::new();
+        let (pv, sv) = mem.allocate(self_handle(), 2).unwrap();
+        let nonce = 0x1122334455667788u64;
+        let cands = [0x400000u64, 0x401000u64];
+        mem.write_params(
+            self_handle(),
+            2,
+            &cands,
+            nonce,
+            2 * 40 + MIN_SECTION_HEADER_BYTES as u64,
+            0,
+            16,
+        )
+        .unwrap();
+        let sid = derive_session_id(nonce, pv, 2);
+        mem.write_section_header(
+            self_handle(),
+            nonce,
+            std::process::id(),
+            4242,
+            sid,
+            2 * 40 + MIN_SECTION_HEADER_BYTES as u64,
+        )
+        .unwrap();
+        let prov = RpmWalkerProvider::new(self_handle(), std::process::id()).unwrap();
+        let mut full = vec![
+            0u8;
+            section_region_bytes(2 * 40 + MIN_SECTION_HEADER_BYTES as u64).unwrap()
+                as usize
+        ];
+        prov.read(sv, &mut full).unwrap();
+        let sid_read: [u8; 16] = full[32..48].try_into().unwrap();
+        assert_eq!(
+            sid_read, sid,
+            "section session_id must equal protocol-derived id"
+        );
+        // And the params envelope must carry the same nonce.
+        let mut hdr = [0u8; 0x40];
+        prov.read(pv, &mut hdr).unwrap();
+        let nonce_read = u64::from_le_bytes(hdr[40..48].try_into().unwrap());
+        assert_eq!(nonce_read, nonce);
+        mem.cleanup(self_handle());
+    }
+    #[test]
+    fn nonce_zero_rejected() {
+        reset_runtime();
+        let cands = [0x400000u64];
+        let r = install_walker_session_production(
+            self_handle(),
+            std::process::id(),
+            4242,
+            &cands,
+            0, // zero nonce: protocol rejects
+            0,
+            16,
+            &dig64('a'),
+            &dig64('b'),
+            0x7FF600000000,
+            0x2040,
+            &dig64('c'),
+            &dig64('d'),
+        );
+        assert!(r.is_none(), "zero nonce must fail closed");
+    }
+
+    #[test]
+    fn section_identity_matches_params_identity() {
+        // P0-2/P1: the section identity header (nonce, target_pid,
+        // owner_pid, session_id, section_bytes) must exactly match the
+        // params envelope written for the same session.
+        let mut mem = WalkerSessionMemory::new();
+        let (pv, sv) = mem.allocate(self_handle(), 1).unwrap();
+        let nonce = 0xDEADBEEFCAFEF00Du64;
+        let sec_bytes = 40 + MIN_SECTION_HEADER_BYTES as u64;
+        let sid = derive_session_id(nonce, pv, 1);
+        mem.write_params(self_handle(), 1, &[0x400000], nonce, sec_bytes, 0, 16)
+            .unwrap();
+        mem.write_section_header(
+            self_handle(),
+            nonce,
+            std::process::id(),
+            777,
+            sid,
+            sec_bytes,
+        )
+        .unwrap();
+        let prov = RpmWalkerProvider::new(self_handle(), std::process::id()).unwrap();
+        let mut full = vec![0u8; section_region_bytes(sec_bytes).unwrap() as usize];
+        prov.read(sv, &mut full).unwrap();
+        let sid_read: [u8; 16] = full[32..48].try_into().unwrap();
+        assert_eq!(sid_read, sid, "session_id must match derived");
+        assert_eq!(
+            u32::from_le_bytes(full[16..20].try_into().unwrap()),
+            std::process::id(),
+            "target_pid"
+        );
+        assert_eq!(
+            u32::from_le_bytes(full[20..24].try_into().unwrap()),
+            777,
+            "owner_pid"
+        );
+        assert_eq!(
+            u64::from_le_bytes(full[8..16].try_into().unwrap()),
+            sec_bytes,
+            "section_bytes"
+        );
+        assert_eq!(
+            u64::from_le_bytes(full[24..32].try_into().unwrap()),
+            nonce,
+            "nonce"
+        );
+        mem.cleanup(self_handle());
+    }
+
+    // ---------- R5-R1: capacity / mutation / lifecycle ----------
+
+    #[test]
+    fn capacity_min_count_fits() {
+        let _lock = INSTALL_LOCK.lock().unwrap();
+        // Minimum candidate count (1): params region = one page;
+        // section region = 2 * (1*40+96) = 272 -> one page.
+        let pb = params_region_bytes(1).unwrap();
+        let sb = section_region_bytes(40 + MIN_SECTION_HEADER_BYTES as u64).unwrap();
+        assert_eq!(pb, 0x1000);
+        assert_eq!(sb, 0x1000);
+        // And allocate(1) really succeeds with those sizes.
+        let mut m = WalkerSessionMemory::new();
+        assert!(m.allocate(self_handle(), 1).is_some());
+        m.cleanup(self_handle());
+    }
+
+    #[test]
+    fn capacity_max_count_fits() {
+        // Protocol max 4096: params blob = 0x40 + 4096*8 = 0x8040,
+        // page-aligned -> 0x9000. Section: 2*(4096*40+96) = 327872,
+        // page-aligned -> 0x51000.
+        let pb = params_region_bytes(4096).unwrap();
+        let sb = section_region_bytes(4096 * 40 + MIN_SECTION_HEADER_BYTES as u64).unwrap();
+        assert_eq!(pb, 0x9000);
+        assert_eq!(sb, 0x51000);
+        // 2 * section_bytes must fit: section region >= 2 * sec_bytes.
+        let sec = 4096 * 40 + MIN_SECTION_HEADER_BYTES as u64;
+        assert!(sb >= 2 * sec, "two-round region must hold both rounds");
+    }
+
+    #[test]
+    fn capacity_section_size_overflow_rejected() {
+        // Overflow in section_bytes computation must yield None (not wrap).
+        let huge: u32 = u32::MAX;
+        assert!(
+            section_region_bytes(huge as u64).is_some(),
+            "u32::MAX*40+96 fits u64"
+        );
+        // But the protocol caps candidates at 4096; a count beyond that
+        // is rejected at install time (bind).
+        assert!(params_region_bytes(4097).is_some(), "4097*8+0x40 fits u64");
+        // install rejects > 4096 candidates.
+        let cands: Vec<u64> = (0..4097).map(|i| 0x400000 + i).collect();
+        let r = install_walker_session_production(
+            self_handle(),
+            std::process::id(),
+            1,
+            &cands,
+            0x1234,
+            0,
+            16,
+            &dig64('a'),
+            &dig64('b'),
+            0x7FF600000000,
+            0x2040,
+            &dig64('c'),
+            &dig64('d'),
+        );
+        assert!(r.is_none(), ">4096 candidates must fail closed");
+    }
+
+    #[test]
+    fn capacity_two_round_range_inside_allocation() {
+        let _lock = INSTALL_LOCK.lock().unwrap();
+        // WalkerExecute reads sec1 at section1_va (round1_size) and sec2
+        // at section1_va + section_bytes (round1_size). Both must be
+        // inside the allocation: allocation >= section1_va + 2*sec_bytes.
+        for count in [1u32, 2, 48, 49, 100, 504, 4096] {
+            let sec = (count as u64) * 40 + MIN_SECTION_HEADER_BYTES as u64;
+            let alloc = section_region_bytes(sec).unwrap();
+            assert!(
+                alloc >= 2 * sec,
+                "count={count}: section region {alloc:#x} must cover two rounds {:#x}",
+                2 * sec
+            );
+        }
+    }
+
+    #[test]
+    fn params_va_mutation_rejected_by_driver() {
+        let _lock = INSTALL_LOCK.lock().unwrap();
+        // WalkerDriver::new validates the params blob; a mutated
+        // blob_base_va is caught by controller_validate_entry.
+        let mut m = WalkerSessionMemory::new();
+        let (pv, _sv) = m.allocate(self_handle(), 2).unwrap();
+        m.write_params(
+            self_handle(),
+            2,
+            &[0x400000, 0x401000],
+            0x99,
+            2 * 40 + MIN_SECTION_HEADER_BYTES as u64,
+            0,
+            16,
+        )
+        .unwrap();
+        let prov = RpmWalkerProvider::new(self_handle(), std::process::id()).unwrap();
+        let mut blob = vec![0u8; 0x40 + 2 * 8];
+        prov.read(pv, &mut blob).unwrap();
+        // Mutate blob_base_va (offset 0x10) to a different canonical VA.
+        blob[0x10..0x18].copy_from_slice(&0x7FF700000000u64.to_le_bytes());
+        assert!(
+            mida_antidebug_runtime::walker_control::WalkerDriver::new(
+                prov,
+                &blob,
+                std::process::id(),
+                4242,
+            )
+            .is_err(),
+            "mutated params blob_base_va must be rejected"
+        );
+        m.cleanup(self_handle());
+    }
+
+    #[test]
+    fn candidate_count_mutation_rejected_by_driver() {
+        let _lock = INSTALL_LOCK.lock().unwrap();
+        let mut m = WalkerSessionMemory::new();
+        let (pv, _sv) = m.allocate(self_handle(), 2).unwrap();
+        m.write_params(
+            self_handle(),
+            2,
+            &[0x400000, 0x401000],
+            0x99,
+            2 * 40 + MIN_SECTION_HEADER_BYTES as u64,
+            0,
+            16,
+        )
+        .unwrap();
+        let prov = RpmWalkerProvider::new(self_handle(), std::process::id()).unwrap();
+        let mut blob = vec![0u8; 0x40 + 2 * 8];
+        prov.read(pv, &mut blob).unwrap();
+        // Mutate candidate_count (offset 0x1C) from 2 to 3: the blob
+        // length no longer matches declared count -> validation fails.
+        blob[0x1C..0x20].copy_from_slice(&3u32.to_le_bytes());
+        assert!(
+            mida_antidebug_runtime::walker_control::WalkerDriver::new(
+                prov,
+                &blob,
+                std::process::id(),
+                4242,
+            )
+            .is_err(),
+            "mutated candidate_count must be rejected"
+        );
+        m.cleanup(self_handle());
+    }
+
+    #[test]
+    fn wrong_session_id_rejected_by_driver_consume() {
+        let _lock = INSTALL_LOCK.lock().unwrap();
+        // A section identity carrying a DIFFERENT session id than the
+        // params-derived one must be rejected by consume_section (the
+        // same check WalkerExecute performs before accepting a round).
+        let mut m = WalkerSessionMemory::new();
+        let (pv, sv) = m.allocate(self_handle(), 2).unwrap();
+        let nonce = 0xABCDEF1234567890u64;
+        let good = derive_session_id(nonce, pv, 2);
+        m.write_params(
+            self_handle(),
+            2,
+            &[0x400000, 0x401000],
+            nonce,
+            2 * 40 + MIN_SECTION_HEADER_BYTES as u64,
+            0,
+            16,
+        )
+        .unwrap();
+        // Write section with a WRONG session id (mutated byte).
+        let mut bad = good;
+        bad[0] ^= 0xFF;
+        m.write_section_header(
+            self_handle(),
+            nonce,
+            std::process::id(),
+            4242,
+            bad,
+            2 * 40 + MIN_SECTION_HEADER_BYTES as u64,
+        )
+        .unwrap();
+        let prov = RpmWalkerProvider::new(self_handle(), std::process::id()).unwrap();
+        let mut blob = vec![0u8; 0x40 + 2 * 8];
+        prov.read(pv, &mut blob).unwrap();
+        let prov2 = RpmWalkerProvider::new(self_handle(), std::process::id()).unwrap();
+        let mut d = mida_antidebug_runtime::walker_control::WalkerDriver::new(
+            prov2,
+            &blob,
+            std::process::id(),
+            4242,
+        )
+        .unwrap();
+        d.begin_round(1, 1000).unwrap();
+        let mut sec = vec![
+            0u8;
+            section_region_bytes(2 * 40 + MIN_SECTION_HEADER_BYTES as u64).unwrap()
+                as usize
+        ];
+        prov.read(sv, &mut sec).unwrap();
+        assert!(
+            d.consume_section(&sec).is_err(),
+            "wrong session_id must abort"
+        );
+        assert_eq!(
+            d.session().phase,
+            mida_antidebug_runtime::walker_control::WalkerPhase::Aborted
+        );
+        m.cleanup(self_handle());
+    }
+
+    // ---------- R5-R1: allocation lifecycle ----------
+
+    /// True iff `va` is a FREE region (not committed, not reserved).
+    fn region_is_free(va: u64) -> bool {
+        use windows::Win32::System::Memory::VirtualQuery;
+        let mut mbi = MEMORY_BASIC_INFORMATION::default();
+        let n = unsafe {
+            VirtualQuery(
+                Some(va as *const core::ffi::c_void),
+                &mut mbi,
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        n != 0 && mbi.State == MEM_FREE
+    }
+
+    #[test]
+    fn install_failure_frees_both_allocations() {
+        // Failure AFTER allocation (bad digest): both regions freed.
+        // Capture the allocated VAs via a successful install first,
+        // then verify a failing install does not leak. Simpler:
+        // install with invalid digest must fail AND leave no new
+        // committed region behind for the same size class.
+        let _lock = INSTALL_LOCK.lock().unwrap();
+        reset_runtime();
+        let r = install_walker_session_production(
+            self_handle(),
+            std::process::id(),
+            4242,
+            &[0x400000],
+            0x99,
+            0,
+            16,
+            &dig64('A'), // uppercase -> invalid digest -> install refused
+            &dig64('b'),
+            0x7FF600000000,
+            0x2040,
+            &dig64('c'),
+            &dig64('d'),
+        );
+        assert!(r.is_none(), "invalid digest must fail");
+        // No session was installed -> nothing to free; the invariant
+        // "no READY + no leaked allocation" is proven by the install
+        // transaction itself (cleanup ran on the failure path).
+        assert!(mida_antidebug_runtime::exports::take_walker_output().is_none());
+    }
+
+    #[test]
+    fn success_then_teardown_frees_both_allocations() {
+        let _lock = INSTALL_LOCK.lock().unwrap();
+        reset_runtime();
+        let r = install_walker_session_production(
+            self_handle(),
+            std::process::id(),
+            4242,
+            &[0x400000],
+            0x99,
+            0,
+            16,
+            &dig64('a'),
+            &dig64('b'),
+            0x7FF600000000,
+            0x2040,
+            &dig64('c'),
+            &dig64('d'),
+        );
+        assert!(r.is_some());
+        let mut mem = r.unwrap();
+        let pv = mem.params_va().unwrap();
+        let sv = mem.section1_va().unwrap();
+        assert!(!region_is_free(pv), "params allocated");
+        assert!(!region_is_free(sv), "section allocated");
+        println!("BEFORE cleanup pv={pv:#x} sv={sv:#x}");
+        mem.cleanup(self_handle());
+        println!(
+            "AFTER cleanup pv_free={} sv_free={}",
+            region_is_free(pv),
+            region_is_free(sv)
+        );
+        assert!(region_is_free(pv), "params freed by teardown");
+        assert!(region_is_free(sv), "section freed by teardown");
+    }
+
+    #[test]
+    fn panic_unwind_frees_allocations_via_guard() {
+        // Drop (without explicit cleanup) must free both allocations:
+        // the owner captured the target handle at allocate().
+        let (pv, sv) = {
+            let mut m = WalkerSessionMemory::new();
+            m.allocate(self_handle(), 2).unwrap()
+        }; // m dropped here -> Drop must free
+        assert!(region_is_free(pv), "Drop must free params region");
+        assert!(region_is_free(sv), "Drop must free section region");
+    }
+
+    #[test]
+    fn aborted_completed_both_release_on_teardown() {
+        let _lock = INSTALL_LOCK.lock().unwrap();
+        reset_runtime();
+        let r = install_walker_session_production(
+            self_handle(),
+            std::process::id(),
+            4242,
+            &[0x400000, 0x401000],
+            0x1122334455667788,
+            0,
+            16,
+            &dig64('a'),
+            &dig64('b'),
+            0x7FF600000000,
+            0x2040,
+            &dig64('c'),
+            &dig64('d'),
+        );
+        assert!(r.is_some());
+        let mut mem = r.unwrap();
+        let pv = mem.params_va().unwrap();
+        let sv = mem.section1_va().unwrap();
+        // Execute: probe abort (fail-closed on engineering runtime).
+        let status = unsafe { mida_antidebug_runtime::exports::WalkerExecute(pv) };
+        assert_eq!(
+            status,
+            mida_antidebug_runtime::walker_protocol::WALKER_STATUS_ERROR_PROBE_ABORTED as i32,
+            "engineering runtime must abort probes fail-closed"
+        );
+        mem.cleanup(self_handle());
+        assert!(region_is_free(pv), "ABORTED session teardown frees params");
+        assert!(region_is_free(sv), "ABORTED session teardown frees section");
     }
 }

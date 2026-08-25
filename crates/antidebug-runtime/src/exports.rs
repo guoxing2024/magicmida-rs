@@ -1258,8 +1258,15 @@ pub fn take_walker_output() -> Option<crate::attestation::RuntimeAttestationV2> 
     }
 }
 
-/// Test-only reset of the provider + session singletons.
-#[cfg(test)]
+/// TEST-SUPPORT reset of the provider + session singletons.
+///
+/// # Policy
+/// Test/engineering-support seam only: it can tear down a live walker
+/// session and MUST NOT be referenced by any production path. It is
+/// non-cfg(test) so downstream crates' offline tests can re-arm the
+/// walker singleton between install tests; production wiring never
+/// calls it.
+#[doc(hidden)]
 pub fn reset_walker_bindings() {
     let mut slot = WALKER_PROVIDER.write();
     *slot = None;

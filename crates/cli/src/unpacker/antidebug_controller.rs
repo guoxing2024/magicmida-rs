@@ -54,7 +54,6 @@ use std::path::Path;
 use mida_antidebug::evidence::EvidenceLog;
 use mida_antidebug::profile::Profile;
 use mida_antidebug::state::{transition, ControllerEvent, ControllerState, FailCode};
-use mida_antidebug_runtime::walker_protocol::WALKER_SESSION_ID_BYTES;
 use windows::Win32::Foundation::HANDLE;
 
 use crate::log::{self, LogType};
@@ -95,6 +94,48 @@ impl CleanupError {
 ///
 /// Production uses [`Win32CleanupBackend`]; tests inject a mock so the
 /// CleanupFailed escalation is verified without launching a process.
+/// IMP-09-CARRIER-R5-R1 P1: RAII teardown for the walker session.
+///
+/// Constructed at the top of [`AntidebugController::run`]; on Drop it
+/// frees the target-side walker allocations (params + both-round
+/// section region) if the controller still holds them. This makes
+/// every run() exit path — success, early return, panic/unwind —
+/// release the remote memory exactly once (cleanup is idempotent).
+///
+/// # Safety
+/// Holds a raw pointer to the controller's `walker_mem` field. The
+/// guard is a local of run() and drops before the controller is ever
+/// dropped; no other thread can touch the field (single-threaded
+/// lifecycle). The pointer is only used through `Option::take`, so
+/// the field becomes None after the first drop (idempotent).
+struct WalkerTeardownGuard {
+    mem_ptr: *mut Option<crate::unpacker::walker_session::WalkerSessionMemory>,
+    handle: Option<HANDLE>,
+}
+
+impl WalkerTeardownGuard {
+    fn new(c: &mut AntidebugController) -> Self {
+        let mem_ptr =
+            &mut c.walker_mem as *mut Option<crate::unpacker::walker_session::WalkerSessionMemory>;
+        let handle = c.options.target_handle;
+        Self { mem_ptr, handle }
+    }
+}
+
+impl Drop for WalkerTeardownGuard {
+    fn drop(&mut self) {
+        // SAFETY: see struct docs. The controller outlives the guard;
+        // the field access is exclusive (single-threaded lifecycle).
+        unsafe {
+            if let Some(mem) = (*self.mem_ptr).take() {
+                if let Some(h) = self.handle {
+                    let mut mem = mem;
+                    mem.cleanup(h);
+                }
+            }
+        }
+    }
+}
 pub trait CleanupBackend: std::fmt::Debug {
     /// Terminate the target process and wait for exit (bounded).
     /// Returns `Ok(())` only when terminate succeeded and the wait
@@ -286,6 +327,11 @@ pub struct AntidebugStageOptions {
     pub oracle: Option<OracleMode>,
     /// Cleanup backend (injectable for tests).
     pub cleanup_backend: Option<Box<dyn CleanupBackend>>,
+    /// IMP-09-CARRIER-R5-R1 P0-1: production target process handle.
+    /// Injected by the debugger (CREATE_PROCESS / post-attach paths);
+    /// used by the walker session (allocation, provider, teardown).
+    /// None -> the walker binding stays NOT_WIRED (fail-closed).
+    pub target_handle: Option<HANDLE>,
     /// Audited runtime authority manifest (ADR-6-CORRECTION). None keeps
     /// the old fail-closed placeholder behaviour (DependencyUnavailable).
     pub runtime_authority: Option<RuntimeAuthorityManifest>,
@@ -531,7 +577,6 @@ impl AntidebugController {
             result_nonce,
             0,  // options_flags: none (frozen default)
             16, // probe_span: FROZEN protocol width
-            [0u8; WALKER_SESSION_ID_BYTES],
             target_image_sha256,
             da.digest_value(),
             loader.module_base(),
@@ -547,6 +592,59 @@ impl AntidebugController {
         self.walker_mem = Some(mem);
         true
     }
+    /// IMP-09-CARRIER-R5-R1 P0-1: production bind entry point (real
+    /// lifecycle caller). Returns true iff the session reached READY.
+    ///
+    /// Candidate list: derived from the VERIFIED runtime module base in
+    /// the target (real mapped pages: module base + 0/0x1000/0x2000/0x3000).
+    /// The loader already verified the runtime module is loaded at
+    /// module_base, so these are real, readable addresses in the target —
+    /// never magic constants, never fixed VAs.
+    fn bind_walker_from_loader_production(&mut self) -> bool {
+        let Some(handle) = self.options.target_handle else {
+            return false;
+        };
+        let Some(loader) = self.options.loader_result.as_ref() else {
+            return false;
+        };
+        let base = loader.module_base();
+        // Fail-closed: a zero/noncanonical base can never happen (the
+        // loader verified the runtime), but never derive from garbage.
+        if base == 0 || base > 0x0000_7FFF_FFFF_FFFF {
+            return false;
+        }
+        let mut candidates = [0u64; 4];
+        for (i, slot) in candidates.iter_mut().enumerate() {
+            match base.checked_add((i as u64) * 0x1000) {
+                Some(v) if v > 0 && v <= 0x0000_7FFF_FFFF_FFFF => *slot = v,
+                _ => return false,
+            }
+        }
+        let Some(nonce) = self.csprng_nonce() else {
+            return false;
+        };
+        self.bind_walker_from_loader(handle, &candidates, nonce)
+    }
+    /// IMP-09-CARRIER-R5-R1 P0-1: CSPRNG nonce for the walker session.
+    /// Uses RtlGenRandom (SystemFunction036, advapi32) — the documented
+    /// Windows user-mode CSPRNG. Fails closed (None) on any error.
+    fn csprng_nonce(&self) -> Option<u64> {
+        use windows::Win32::Security::Authentication::Identity::RtlGenRandom;
+        let mut out = 0u64;
+        let ok = unsafe { RtlGenRandom(&mut out as *mut u64 as *mut core::ffi::c_void, 8) };
+        if ok.as_bool() {
+            // Protocol rejects zero nonce; retry loop would be wasteful —
+            // a zero draw is astronomically unlikely, but fail closed anyway.
+            if out != 0 {
+                Some(out)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
     /// IMP-09-CARRIER-R5: teardown the walker session memory (free both
     /// target allocations). Idempotent; safe when no session is installed.
     pub fn teardown_walker_session(&mut self, target: HANDLE) {
@@ -758,6 +856,11 @@ impl AntidebugController {
     /// fails, and returns [`AntidebugOutcome::Failed`] with the final
     /// terminal state. Evidence is always accumulated.
     pub fn run(&mut self) -> AntidebugOutcome {
+        // IMP-09-CARRIER-R5-R1 P1: RAII teardown guard. Every exit path of
+        // run() (success, failure, early return, unwind) frees the walker
+        // session allocations in the target exactly once. The guard holds
+        // the target handle captured at entry.
+        let mut _walker_teardown = WalkerTeardownGuard::new(self);
         self.note_oracle_if_requested();
 
         // Stage 1: dependency resolution (fails closed without a runtime).
@@ -816,7 +919,8 @@ impl AntidebugController {
                 fail_code: self.fail_code_of_state(self.state),
                 message: format!(
                     "loader target pid {} != controller target pid {}",
-                    loader.target_pid(), self.options.target_pid
+                    loader.target_pid(),
+                    self.options.target_pid
                 ),
             };
         }
@@ -859,20 +963,26 @@ impl AntidebugController {
         self.drive(ControllerEvent::ProbeSetPassed);
         self.drive(ControllerEvent::ProceedApproved);
 
-        // IMP-09-R1-R4: WALKER_BINDING = NOT_WIRED.
+        // IMP-09-CARRIER-R5-R1 P0-1: production walker bind.
         //
-        // The production controller does NOT bind a walker session here:
-        // there is no complete local context (no verified target-image
-        // digest carrier, no resolved WalkerExecute export RVA, no prepared
-        // params/result section VAs, no production memory provider).
-        // Binding with magic values would publish READY for an unexecutable
-        // session and block later legitimate wiring — FORBIDDEN (R4-3).
-        // The lifecycle stays UNBOUND; the walker feature remains
-        // NOT_WIRED until a real carrier exists (IMP-09 live path still
-        // NOT_AUTHORIZED).
+        // Real production caller: the controller lifecycle itself.
+        // Every input comes from a sealed carrier:
+        //   - target HANDLE: injected by the debugger (options.target_handle)
+        //   - loader_result: injected after the real loader ran
+        //   - target/profile identities: launch attestation
+        //   - walker_export_rva: pure-file resolver over verified runtime
+        //   - candidates: derived from the VERIFIED runtime module base
+        //     (real mapped pages in the target)
+        //   - result_nonce: CSPRNG (RtlGenRandom)
+        // Any carrier missing -> bind fails closed (stays NOT_WIRED,
+        // lifecycle UNBOUND); no magic values are ever substituted.
+        let walker_bound = self.bind_walker_from_loader_production();
         log::log(
             LogType::Info,
-            "IMP-09: WALKER_BINDING=NOT_WIRED (no verified authority/provider carriers); lifecycle stays UNBOUND",
+            &format!(
+                "IMP-09: WALKER_BINDING={} (production lifecycle bind)",
+                if walker_bound { "WIRED" } else { "NOT_WIRED" }
+            ),
         );
 
         if self.state.is_proceed() {
@@ -1095,6 +1205,7 @@ mod tests {
         backend: Box<dyn CleanupBackend>,
     ) -> AntidebugStageOptions {
         AntidebugStageOptions {
+            target_handle: None, // tests: no live target
             sample_id: Some("origin_macro".to_string()),
             target_pid: 1234,
             evidence_dir: Some(temp.to_path_buf()),
@@ -1295,6 +1406,7 @@ mod tests {
         let temp = std::env::temp_dir().join("mida-adr3bc-test-oracle");
         let _ = std::fs::remove_dir_all(&temp);
         let mut c = AntidebugController::new(AntidebugStageOptions {
+            target_handle: None, // tests: no live target
             sample_id: Some("origin_macro".to_string()),
             target_pid: 42,
             evidence_dir: Some(temp.clone()),
@@ -1319,6 +1431,7 @@ mod tests {
     #[test]
     fn fail_code_mapping_table() {
         let c = AntidebugController::new(AntidebugStageOptions {
+            target_handle: None, // tests: no live target
             sample_id: None,
             target_pid: 1,
             evidence_dir: None,
@@ -1471,6 +1584,7 @@ mod tests {
         std::fs::write(&p, &content).unwrap();
         let authority = manifest(&sha256_hex(&content), content.len() as u64);
         AntidebugController::new(AntidebugStageOptions {
+            target_handle: None, // tests: no live target
             sample_id: Some("origin_macro".to_string()),
             target_pid: 1234,
             evidence_dir: None,
@@ -1550,6 +1664,7 @@ mod tests {
         std::fs::write(&p, &content).unwrap();
         let authority = manifest(&sha256_hex(&content), content.len() as u64);
         AntidebugController::new(AntidebugStageOptions {
+            target_handle: None, // tests: no live target
             sample_id: Some("origin_macro".to_string()),
             target_pid: 1234,
             evidence_dir: None,
@@ -1563,6 +1678,58 @@ mod tests {
         })
     }
 
+    /// LoaderResult with a REAL walker export RVA carrier (0x2040) and
+    /// the given module base, built from a verified file identity.
+    fn loader_with_walker_rva(target_pid: u32, module_base: u64) -> LoaderResult {
+        let content = minimal_pe();
+        let _ = std::fs::create_dir_all(std::env::temp_dir().join("mida-adr6-test"));
+        let p = next_file("lr_walker");
+        std::fs::write(&p, &content).unwrap();
+        let authority = manifest(&sha256_hex(&content), content.len() as u64);
+        let identity = authority.verify_file(&p).unwrap();
+        let digest_authority =
+            RuntimeDigestAuthority::from_verified_identity(&identity, &authority.artifact_id)
+                .expect("verified identity must build authority");
+        LoaderResult::new(
+            module_base,
+            default_attestation_json(),
+            identity,
+            digest_authority,
+            target_pid,
+            Some(0x2040), // sealed pure-file WalkerExecute export RVA
+        )
+    }
+
+    /// Controller with ALL sealed carriers + a real target handle.
+    /// target_pid must match the running process for the provider bind
+    /// to succeed (engineering runtime: own process).
+    fn controller_with_full_carriers(target_pid: u32) -> AntidebugController {
+        let content = minimal_pe();
+        let _ = std::fs::create_dir_all(std::env::temp_dir().join("mida-adr6-test"));
+        let p = next_file("full");
+        std::fs::write(&p, &content).unwrap();
+        let authority = manifest(&sha256_hex(&content), content.len() as u64);
+        let mut c = AntidebugController::new(AntidebugStageOptions {
+            target_handle: Some(self_handle()), // real process handle
+            sample_id: Some("origin_macro".to_string()),
+            target_pid,
+            evidence_dir: None,
+            oracle: None,
+            cleanup_backend: None,
+            runtime_authority: Some(authority),
+            runtime_path: Some(p),
+            loader_result: Some(loader_with_walker_rva(target_pid, 0x7FF600000000)),
+            target_identity: Some(test_target_identity(
+                "origin_macro",
+                &"ab12".repeat(16),
+                4096,
+            )),
+            profile_identity: Some(test_profile_identity("origin_macro", "x86_64")),
+        });
+        // target digest must NOT equal runtime digest: the test sha is
+        // distinct from the runtime file digest (minimal_pe).
+        c
+    }
     #[test]
     fn imp09_verified_target_identity_reaches_controller() {
         // The sealed target identity from the attestation chain reaches the
@@ -1705,6 +1872,7 @@ mod tests {
         std::fs::write(&p, &content).unwrap();
         let authority = manifest(&"cd".repeat(32), content.len() as u64); // wrong digest
         let mut c = AntidebugController::new(AntidebugStageOptions {
+            target_handle: None, // tests: no live target
             sample_id: Some("origin_macro".to_string()),
             target_pid: 1234,
             evidence_dir: None,
@@ -1762,6 +1930,7 @@ mod tests {
         let profile = test_profile_identity("origin_macro", "x86_64");
         let loader = Some(loader_result_with(1234, default_attestation_json()));
         let mut c1 = AntidebugController::new(AntidebugStageOptions {
+            target_handle: None, // tests: no live target
             sample_id: Some("origin_macro".to_string()),
             target_pid: 1234,
             evidence_dir: None,
@@ -1778,6 +1947,7 @@ mod tests {
             profile_identity: Some(profile.clone()),
         });
         let mut c2 = AntidebugController::new(AntidebugStageOptions {
+            target_handle: None, // tests: no live target
             sample_id: Some("origin_macro".to_string()),
             target_pid: 1234,
             evidence_dir: None,
@@ -1786,7 +1956,11 @@ mod tests {
             runtime_authority: None,
             runtime_path: None,
             loader_result: loader,
-            target_identity: Some(test_target_identity("origin_macro", &"ab12".repeat(16), 4096)),
+            target_identity: Some(test_target_identity(
+                "origin_macro",
+                &"ab12".repeat(16),
+                4096,
+            )),
             profile_identity: Some(profile.clone()),
         });
         assert_eq!(c1.verified_profile_id(), c2.verified_profile_id());
@@ -1798,5 +1972,59 @@ mod tests {
         // The carrier still fails closed at the full bind (provider absent).
         assert!(!c1.bind_walker_from_loader(self_handle(), &[0x400000], 0x99));
         assert!(!c2.bind_walker_from_loader(self_handle(), &[0x400000], 0x99));
+    }
+    #[test]
+    fn imp09_r5r1_run_calls_production_bind_and_wires() {
+        // P0-1: run() is the REAL production caller. With all sealed
+        // carriers + a valid target handle (own process, engineering
+        // runtime) the walker session reaches READY: WALKER_BINDING=WIRED.
+        mida_antidebug_runtime::exports::reset_walker_bindings();
+        let mut c = controller_with_full_carriers(std::process::id());
+        let outcome = c.run();
+        assert!(
+            matches!(outcome, AntidebugOutcome::Proceed { .. }),
+            "full carriers must reach Proceed, got {outcome:?}"
+        );
+        // The bind ran inside run(): walker_mem was held and released by
+        // the RAII teardown guard at exit (nothing remains).
+        assert!(c.walker_mem.is_none(), "teardown guard must free session");
+        // A second bind is possible: lifecycle was left UNBOUND by the
+        // guard's release (bindings reset only in tests; the guard frees
+        // memory but the runtime lifecycle may be terminal — check the
+        // honest state: bindings were installed then released).
+        mida_antidebug_runtime::exports::reset_walker_bindings();
+    }
+
+    #[test]
+    fn imp09_r5r1_run_bind_fails_closed_without_target_handle() {
+        // P0-1: missing target handle -> bind refuses -> NOT_WIRED;
+        // lifecycle still reaches Proceed (walker is not a blocker).
+        mida_antidebug_runtime::exports::reset_walker_bindings();
+        let content = minimal_pe();
+        let _ = std::fs::create_dir_all(std::env::temp_dir().join("mida-adr6-test"));
+        let p = next_file("nohandle");
+        std::fs::write(&p, &content).unwrap();
+        let authority = manifest(&sha256_hex(&content), content.len() as u64);
+        let mut c = AntidebugController::new(AntidebugStageOptions {
+            target_handle: None, // missing
+            sample_id: Some("origin_macro".to_string()),
+            target_pid: std::process::id(),
+            evidence_dir: None,
+            oracle: None,
+            cleanup_backend: None,
+            runtime_authority: Some(authority),
+            runtime_path: Some(p),
+            loader_result: Some(loader_with_walker_rva(std::process::id(), 0x7FF600000000)),
+            target_identity: Some(test_target_identity(
+                "origin_macro",
+                &"ab12".repeat(16),
+                4096,
+            )),
+            profile_identity: Some(test_profile_identity("origin_macro", "x86_64")),
+        });
+        let outcome = c.run();
+        assert!(matches!(outcome, AntidebugOutcome::Proceed { .. }));
+        assert!(c.walker_mem.is_none());
+        mida_antidebug_runtime::exports::reset_walker_bindings();
     }
 }

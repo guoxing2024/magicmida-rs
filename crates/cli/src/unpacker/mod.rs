@@ -762,6 +762,9 @@ pub fn unpack(
                 cleanup_backend: Some(Box::new(antidebug_controller::Win32CleanupBackend::new(
                     dbg.process_handle(),
                 ))),
+                // IMP-09-CARRIER-R5-R1 P0-1: production walker target handle
+                // (same debugger handle used for cleanup).
+                target_handle: Some(dbg.process_handle()),
                 // ADR-6: runtime authority/path are now wired like the
                 // CREATE_PROCESS path; loader_result carries the post-attach
                 // loader outcome (None -> fail-closed DependencyUnavailable).
@@ -1161,6 +1164,9 @@ pub fn unpack(
                                     dbg.process_handle(),
                                 ),
                             )),
+                            // IMP-09-CARRIER-R5-R1 P0-1: production walker
+                            // target handle (same debugger handle).
+                            target_handle: Some(dbg.process_handle()),
                             // ADR-6: audited runtime authority + artifact path.
                             // The loader result is injected below after the
                             // runtime is actually loaded into the target.
