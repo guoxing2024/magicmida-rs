@@ -38,11 +38,16 @@ IMP-09 walker/V2 runtime 链已具备:
 
 ## 三、前置条件（签发前必须全部满足）
 
-- [ ] R5-R4 teardown PASS 并经独立审计;
-- [ ] 全 workspace `cargo test` 绿（含 R5-R4 新增测试）;
-- [ ] target-side dispatch 桥接设计文档 + caller graph 经总审计签收;
-- [ ] Oreans 回归门 ADR7 17/17 复验 PASS;
-- [ ] 样本 preflight resolver dry-run MATCH。
+- [x] R5-R4 teardown PASS 并经独立审计（commit c33401a, 2026-08-25）;
+- [x] 全 workspace `cargo test` 绿：**2714 passed / 0 failed**（单线程全量，
+      2026-08-25 复验，含 dispatch 桥 T1-T12）;
+- [x] target-side dispatch 桥设计文档 + caller graph 经总审计签收
+      （docs/IMP09_DISPATCH_BRIDGE_DESIGN_20260825.md，commit a33664b）;
+- [x] 生产实现已交付并审计通过（walker_dispatch.rs, commit 9b05abc；
+      T1-T12 12/12；LIVE 门保持关闭——两处生产接线恒 None）;
+- [x] Oreans 回归门 ADR7 17/17 复验 PASS（2026-08-25 总审计独立重跑）;
+- [x] 样本 preflight resolver dry-run MATCH（revision_match=true,
+      2026-08-25 只读复验）。
 
 ## 四、风险与边界
 
