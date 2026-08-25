@@ -1,0 +1,130 @@
+{
+  "schema": "mida.antidebug-walker/v1",
+  "record_kind": "cli-walker",
+  "target_pid": 17088,
+  "capture_phase": "create_process",
+  "liveness_probe": "alive",
+  "execute_liveness": "alive",
+  "candidate_mapping": {
+    "module_base": 1681483366400,
+    "verified_size_of_image": 16384,
+    "probe_span": 16,
+    "all_passed": true,
+    "items": [
+      {
+        "candidate_va": 1681483366400,
+        "canonical_va": true,
+        "page_span_fits": true,
+        "in_image_envelope": true,
+        "envelope_base": 1681483366400,
+        "envelope_end": 1681483382784,
+        "query_ok": true,
+        "state": 4096,
+        "mem_committed": true,
+        "region_base": 1681483366400,
+        "region_size": 16384,
+        "region_type": 131072,
+        "probe_contained_in_region": true,
+        "protection": 4,
+        "readable_protection": true,
+        "passed": true,
+        "fail_reason": null
+      },
+      {
+        "candidate_va": 1681483370496,
+        "canonical_va": true,
+        "page_span_fits": true,
+        "in_image_envelope": true,
+        "envelope_base": 1681483366400,
+        "envelope_end": 1681483382784,
+        "query_ok": true,
+        "state": 4096,
+        "mem_committed": true,
+        "region_base": 1681483370496,
+        "region_size": 12288,
+        "region_type": 131072,
+        "probe_contained_in_region": true,
+        "protection": 4,
+        "readable_protection": true,
+        "passed": true,
+        "fail_reason": null
+      },
+      {
+        "candidate_va": 1681483374592,
+        "canonical_va": true,
+        "page_span_fits": true,
+        "in_image_envelope": true,
+        "envelope_base": 1681483366400,
+        "envelope_end": 1681483382784,
+        "query_ok": true,
+        "state": 4096,
+        "mem_committed": true,
+        "region_base": 1681483374592,
+        "region_size": 8192,
+        "region_type": 131072,
+        "probe_contained_in_region": true,
+        "protection": 4,
+        "readable_protection": true,
+        "passed": true,
+        "fail_reason": null
+      },
+      {
+        "candidate_va": 1681483378688,
+        "canonical_va": true,
+        "page_span_fits": true,
+        "in_image_envelope": true,
+        "envelope_base": 1681483366400,
+        "envelope_end": 1681483382784,
+        "query_ok": true,
+        "state": 4096,
+        "mem_committed": true,
+        "region_base": 1681483378688,
+        "region_size": 4096,
+        "region_type": 131072,
+        "probe_contained_in_region": true,
+        "protection": 4,
+        "readable_protection": true,
+        "passed": true,
+        "fail_reason": null
+      }
+    ]
+  },
+  "events": [
+    {
+      "sequence": 1,
+      "phase": "loader_complete",
+      "detail": "target_pid=17088 module_base=0x18780380000",
+      "walker_status_raw": null
+    },
+    {
+      "sequence": 2,
+      "phase": "bind_enter",
+      "detail": "module_base=0x18780380000 image_size=0x4000",
+      "walker_status_raw": null
+    },
+    {
+      "sequence": 3,
+      "phase": "bind_exit",
+      "detail": "WIRED",
+      "walker_status_raw": null
+    },
+    {
+      "sequence": 4,
+      "phase": "execute_enter",
+      "detail": "authorized target-side dispatch",
+      "walker_status_raw": null
+    },
+    {
+      "sequence": 5,
+      "phase": "execute_exit",
+      "detail": "outcome=Success",
+      "walker_status_raw": 0
+    },
+    {
+      "sequence": 6,
+      "phase": "terminate_enter",
+      "detail": null,
+      "walker_status_raw": null
+    }
+  ]
+}

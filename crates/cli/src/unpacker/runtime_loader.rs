@@ -210,11 +210,18 @@ impl RuntimeAuthorityManifest {
         }
         // Real PE architecture verification (not just the authority string).
         verify_pe_x64(&bytes)?;
+        // IMP-09-CARRIER-R5-R2: seal the PE32+ SizeOfImage from the SAME
+        // verified bytes so the walker mapping envelope
+        // [module_base, module_base + verified_size_of_image) is provably
+        // derived from the verified artifact (never from a live-process
+        // header that could have been replaced after verification).
+        let verified_size_of_image = pe32_size_of_image(&bytes);
         Ok(RuntimeFileIdentity::from_verified(
             canonical,
             digest,
             size,
             "x86_64".to_string(),
+            verified_size_of_image,
         ))
     }
 
@@ -242,14 +249,53 @@ impl RuntimeFileIdentity {
     /// digest/size/architecture checks — the type cannot be forged outside
     /// this module (no public fields, no public constructor, no
     /// Deserialize).
-    fn from_verified(path: PathBuf, sha256: String, size_bytes: u64, architecture: String) -> Self {
+    fn from_verified(
+        path: PathBuf,
+        sha256: String,
+        size_bytes: u64,
+        architecture: String,
+        verified_size_of_image: u64,
+    ) -> Self {
         Self {
             path,
             sha256,
             size_bytes,
             architecture,
+            verified_size_of_image,
         }
     }
+}
+
+/// Read the PE32+ SizeOfImage from verified file bytes (pure, checked).
+///
+/// Returns 0 (fail-closed) for any non-PE32+ / truncated / absurdly small
+/// image — the caller must refuse to derive a mapping envelope when this
+/// returns 0. The caller is expected to have already run `verify_pe_x64`
+/// on the same buffer, but the helper is defensive and self-contained.
+pub fn pe32_size_of_image(bytes: &[u8]) -> u64 {
+    if bytes.len() < 0x40 || &bytes[0..2] != b"MZ" {
+        return 0;
+    }
+    let pe_off = u32::from_le_bytes(bytes[0x3C..0x40].try_into().unwrap_or([0u8; 4])) as usize;
+    if pe_off + 0x6C > bytes.len() || &bytes[pe_off..pe_off + 4] != b"PE\0\0" {
+        return 0;
+    }
+    let machine = u16::from_le_bytes([bytes[pe_off + 4], bytes[pe_off + 5]]);
+    if machine != 0x8664 {
+        return 0;
+    }
+    let magic = u16::from_le_bytes([bytes[pe_off + 0x18], bytes[pe_off + 0x19]]);
+    if magic != 0x20B {
+        // PE32 (0x10B) has no 64-bit SizeOfImage layout; fail closed.
+        return 0;
+    }
+    // PE32+ optional header: SizeOfImage at optional+0x50 = pe_off+0x68.
+    let size_of_image =
+        u32::from_le_bytes(bytes[pe_off + 0x68..pe_off + 0x6C].try_into().unwrap_or([0u8; 4]));
+    if size_of_image < 0x1000 {
+        return 0;
+    }
+    size_of_image as u64
 }
 
 /// Verify that a buffer is a real x64 PE (MZ + PE signature + Machine=AMD64
@@ -313,6 +359,10 @@ pub struct RuntimeFileIdentity {
     sha256: String,
     size_bytes: u64,
     architecture: String,
+    /// IMP-09-CARRIER-R5-R2: PE32+ SizeOfImage sealed from the SAME
+    /// verified bytes (pure-file, never a live-process header). 0 means
+    /// the artifact has no resolvable PE32+ image envelope (fail-closed).
+    verified_size_of_image: u64,
 }
 
 impl RuntimeFileIdentity {
@@ -334,6 +384,13 @@ impl RuntimeFileIdentity {
     /// Verified runtime architecture ("x86_64").
     pub fn architecture(&self) -> &str {
         &self.architecture
+    }
+
+    /// IMP-09-CARRIER-R5-R2: PE32+ SizeOfImage from the verified file
+    /// bytes. 0 when the artifact is not a PE32+ image with a sane
+    /// envelope — the walker mapping gate must fail closed on 0.
+    pub fn verified_size_of_image(&self) -> u64 {
+        self.verified_size_of_image
     }
 }
 /// Canonical runtime digest length: exactly 64 lowercase hex characters.
@@ -5061,6 +5118,7 @@ mod imp06_sealed_authority_tests {
             PLACEHOLDER_RUNTIME_DIGEST.to_string(),
             10,
             "x86_64".to_string(),
+            0x1000,
         );
         assert!(matches!(
             RuntimeDigestAuthority::from_verified_identity(&id, "mida-antidebug-runtime-x64"),
@@ -5071,6 +5129,7 @@ mod imp06_sealed_authority_tests {
             "A".repeat(64),
             10,
             "x86_64".to_string(),
+            0x1000,
         );
         assert!(matches!(
             RuntimeDigestAuthority::from_verified_identity(&id2, "mida-antidebug-runtime-x64"),
@@ -5081,6 +5140,7 @@ mod imp06_sealed_authority_tests {
             "a".repeat(32),
             10,
             "x86_64".to_string(),
+            0x1000,
         );
         assert!(matches!(
             RuntimeDigestAuthority::from_verified_identity(&id3, "mida-antidebug-runtime-x64"),

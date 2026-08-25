@@ -174,6 +174,300 @@ impl WalkerMemoryProvider for RpmWalkerProvider {
 unsafe impl Send for RpmWalkerProvider {}
 unsafe impl Sync for RpmWalkerProvider {}
 
+/// Liveness probe outcome for the walker window (R5-R2-1).
+///
+/// The production path MUST prove the target is still alive before bind /
+/// execute and MUST never run either after `terminate_and_wait()`. The
+/// probe uses GetExitCodeProcess: Ok + STILL_ACTIVE => alive; Ok + any other
+/// code => dead; Err => unknown (fail-closed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum LivenessProbe {
+    Alive,
+    Dead,
+    Unknown,
+}
+
+impl LivenessProbe {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LivenessProbe::Alive => "alive",
+            LivenessProbe::Dead => "dead",
+            LivenessProbe::Unknown => "unknown",
+        }
+    }
+}
+
+/// Probe whether `handle` still refers to a live process.
+///
+/// - Ok + exit code == STILL_ACTIVE  => `Alive`
+/// - Ok + any other exit code        => `Dead`
+/// - Err (invalid handle / no query right) => `Unknown` (fail-closed:
+///   the caller must NOT bind/execute on Unknown).
+pub fn probe_process_liveness(handle: HANDLE) -> LivenessProbe {
+    use windows::Win32::Foundation::STILL_ACTIVE;
+    let mut exit_code: u32 = 0;
+    match unsafe { windows::Win32::System::Threading::GetExitCodeProcess(handle, &mut exit_code) } {
+        Ok(()) => {
+            if exit_code == STILL_ACTIVE.0 as u32 {
+                LivenessProbe::Alive
+            } else {
+                LivenessProbe::Dead
+            }
+        }
+        Err(_) => LivenessProbe::Unknown,
+    }
+}
+
+/// Per-candidate mapping proof (R5-R2-3), recorded verbatim for evidence.
+///
+/// Every candidate the controller binds MUST be proven, item by item,
+/// BEFORE `install_walker_session_production()` is called:
+/// 1. canonical user VA (protocol gate),
+/// 2. inside the verified image envelope
+///    `[module_base, module_base + verified_size_of_image)`,
+/// 3. `VirtualQueryEx` succeeds and the region is MEM_COMMIT,
+/// 4. the probe-span interval `[va, va + probe_span)` stays inside that
+///    region (no region-boundary crossing) AND inside one page
+///    (protocol page-span gate),
+/// 5. the region protection is readable (not NOACCESS / GUARD / execute-only),
+/// 6. the region allocation `Type` (MEM_PRIVATE / MEM_IMAGE / MEM_MAPPED)
+///    is recorded raw for evidence.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CandidateMappingProof {
+    pub candidate_va: u64,
+    pub canonical_va: bool,
+    pub page_span_fits: bool,
+    pub in_image_envelope: bool,
+    pub envelope_base: u64,
+    pub envelope_end: u64,
+    pub query_ok: bool,
+    pub state: u32,
+    pub mem_committed: bool,
+    pub region_base: u64,
+    pub region_size: u64,
+    /// Raw MEMORY_BASIC_INFORMATION.Type (MEM_PRIVATE=0x20000,
+    /// MEM_IMAGE=0x1000000, MEM_MAPPED=0x40000). Recorded verbatim for
+    /// evidence; not itself a gate (the envelope + commit + span + protection
+    /// checks carry the authorization).
+    pub region_type: u32,
+    pub probe_contained_in_region: bool,
+    pub protection: u32,
+    pub readable_protection: bool,
+    pub passed: bool,
+    pub fail_reason: Option<String>,
+}
+
+/// The full candidate mapping proof set for one bind attempt.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CandidateMappingProofSet {
+    pub module_base: u64,
+    pub verified_size_of_image: u64,
+    pub probe_span: u16,
+    pub all_passed: bool,
+    pub items: Vec<CandidateMappingProof>,
+}
+
+/// True when a region protection is readable (never NOACCESS, never GUARD,
+/// never execute-only PAGE_EXECUTE). The protection argument is the raw
+/// u32 from MEMORY_BASIC_INFORMATION (PAGE_PROTECTION_FLAGS is a newtype;
+/// we compare against raw flag values).
+fn protection_readable(protect: u32) -> bool {
+    const PAGE_GUARD_RAW: u32 = 0x100;
+    const PAGE_NOACCESS_RAW: u32 = 0x01;
+    const PAGE_READONLY_RAW: u32 = 0x02;
+    const PAGE_READWRITE_RAW: u32 = 0x04;
+    const PAGE_WRITECOPY_RAW: u32 = 0x08;
+    const PAGE_EXECUTE_READ_RAW: u32 = 0x20;
+    const PAGE_EXECUTE_READWRITE_RAW: u32 = 0x40;
+    const PAGE_EXECUTE_WRITECOPY_RAW: u32 = 0x80;
+    if protect & PAGE_GUARD_RAW != 0 {
+        return false;
+    }
+    if protect & PAGE_NOACCESS_RAW != 0 {
+        return false;
+    }
+    const READABLE: u32 = PAGE_READONLY_RAW
+        | PAGE_READWRITE_RAW
+        | PAGE_WRITECOPY_RAW
+        | PAGE_EXECUTE_READ_RAW
+        | PAGE_EXECUTE_READWRITE_RAW
+        | PAGE_EXECUTE_WRITECOPY_RAW;
+    // PAGE_EXECUTE alone (0x10) is execute-only: not readable.
+    protect & READABLE != 0
+}
+
+/// Prove one candidate VA against the verified image envelope + live region.
+///
+/// Pure evidence builder: every check result is recorded in the returned
+/// struct; `passed` is the AND of all gates. Never panics; a failed
+/// VirtualQueryEx is recorded as `query_ok=false` (fail-closed).
+pub fn prove_candidate_mapping(
+    handle: HANDLE,
+    candidate: u64,
+    module_base: u64,
+    verified_size_of_image: u64,
+    probe_span: u16,
+) -> CandidateMappingProof {
+    use windows::Win32::System::Memory::MEM_FREE;
+    let mut p = CandidateMappingProof {
+        candidate_va: candidate,
+        canonical_va: is_canonical_user_va(candidate),
+        page_span_fits: mida_antidebug_runtime::walker_protocol::page_span_fits(
+            candidate, probe_span,
+        ),
+        in_image_envelope: false,
+        envelope_base: module_base,
+        envelope_end: 0,
+        query_ok: false,
+        state: MEM_FREE.0,
+        mem_committed: false,
+        region_base: 0,
+        region_size: 0,
+        region_type: 0,
+        probe_contained_in_region: false,
+        protection: 0,
+        readable_protection: false,
+        passed: false,
+        fail_reason: None,
+    };
+    // Envelope: [module_base, module_base + verified_size_of_image).
+    let envelope_end = match module_base.checked_add(verified_size_of_image) {
+        Some(end) if verified_size_of_image > 0 && end > module_base => end,
+        _ => {
+            p.fail_reason = Some("image envelope invalid or empty".to_string());
+            return p;
+        }
+    };
+    p.envelope_end = envelope_end;
+    p.in_image_envelope = candidate >= module_base && candidate < envelope_end;
+    if !p.in_image_envelope {
+        p.fail_reason = Some("candidate outside verified image envelope".to_string());
+        return p;
+    }
+    let probe_end = match candidate.checked_add(probe_span as u64) {
+        Some(v) => v,
+        None => {
+            p.fail_reason = Some("probe span overflow".to_string());
+            return p;
+        }
+    };
+    if probe_end > envelope_end {
+        p.fail_reason = Some("probe span crosses image envelope end".to_string());
+        // Keep the item recorded with all fields; passed stays false.
+        p.query_ok = false;
+        p.passed = false;
+        return p;
+    }
+    if !p.page_span_fits {
+        p.fail_reason = Some("probe span crosses a page boundary (protocol gate)".to_string());
+        return p;
+    }
+    let mut mbi = MEMORY_BASIC_INFORMATION::default();
+    let qr = unsafe {
+        VirtualQueryEx(
+            handle,
+            Some(candidate as *const core::ffi::c_void),
+            &mut mbi,
+            std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+        )
+    };
+    if qr == 0 {
+        p.fail_reason = Some("VirtualQueryEx failed (unmapped or no query right)".to_string());
+        return p;
+    }
+    p.query_ok = true;
+    p.state = mbi.State.0;
+    p.mem_committed = mbi.State == MEM_COMMIT;
+    p.region_base = mbi.BaseAddress as u64;
+    p.region_size = mbi.RegionSize as u64;
+    p.region_type = mbi.Type.0;
+    p.protection = mbi.Protect.0;
+    let region_end = match p.region_base.checked_add(p.region_size) {
+        Some(v) => v,
+        None => {
+            p.fail_reason = Some("region end overflow".to_string());
+            return p;
+        }
+    };
+    p.probe_contained_in_region = probe_end <= region_end;
+    p.readable_protection = protection_readable(mbi.Protect.0);
+    p.passed = p.canonical_va
+        && p.page_span_fits
+        && p.in_image_envelope
+        && p.query_ok
+        && p.mem_committed
+        && p.probe_contained_in_region
+        && p.readable_protection;
+    if !p.passed {
+        let mut why = Vec::new();
+        if !p.canonical_va {
+            why.push("non-canonical");
+        }
+        if !p.page_span_fits {
+            why.push("page-cross");
+        }
+        if !p.mem_committed {
+            why.push("not committed");
+        }
+        if !p.probe_contained_in_region {
+            why.push("crosses region");
+        }
+        if !p.readable_protection {
+            why.push("unreadable protection");
+        }
+        p.fail_reason = Some(why.join(","));
+    }
+    p
+}
+
+/// Prove the whole candidate set (R5-R2-2): per-item proofs + all_passed.
+pub fn prove_candidate_mappings(
+    handle: HANDLE,
+    candidates: &[u64],
+    module_base: u64,
+    verified_size_of_image: u64,
+    probe_span: u16,
+) -> CandidateMappingProofSet {
+    let items = candidates
+        .iter()
+        .map(|&c| {
+            prove_candidate_mapping(handle, c, module_base, verified_size_of_image, probe_span)
+        })
+        .collect::<Vec<_>>();
+    let all_passed = items.iter().all(|p| p.passed);
+    CandidateMappingProofSet {
+        module_base,
+        verified_size_of_image,
+        probe_span,
+        all_passed,
+        items,
+    }
+}
+
+/// Authorized target-side WalkerExecute dispatch bridge (R5-R2-4).
+///
+/// Production dispatch is the ONLY path that may claim a live walker run:
+/// calling the CLI-linked `exports::WalkerExecute` directly is the
+/// ENGINEERING runtime (in-process provider) and MUST NOT be treated as
+/// production dispatch. An authorized bridge marshals the dispatch into the
+/// target and returns the RAW walker status plus the marshaled V2 output.
+///
+/// R5-R2 ships NO production bridge (live authorization is deferred to
+/// R5-R3/R5-R4): production wiring always passes None and the controller
+/// therefore records + returns NOT_IMPLEMENTED (fail-closed). The trait
+/// exists as the typed seam so the gate logic is testable offline.
+pub trait WalkerDispatchBridge: std::fmt::Debug + Send + Sync {
+    /// Dispatch WalkerExecute(params_va) through the authorized target-side
+    /// bridge. Returns (raw walker status i32, marshaled V2 output).
+    fn dispatch(
+        &self,
+        params_va: u64,
+    ) -> (
+        i32,
+        Option<mida_antidebug_runtime::attestation::RuntimeAttestationV2>,
+    );
+}
+
 /// Owned remote allocation in the target (params or section).
 #[derive(Debug)]
 struct RemoteAllocation {
@@ -1399,5 +1693,169 @@ mod imp09_r5_tests {
         mem.cleanup(self_handle());
         assert!(region_is_free(pv), "ABORTED session teardown frees params");
         assert!(region_is_free(sv), "ABORTED session teardown frees section");
+    }
+    // ---------- IMP-09-CARRIER-R5-R2: liveness + mapping proof ----------
+
+    #[test]
+    fn r5r2_liveness_alive_for_own_process() {
+        assert_eq!(probe_process_liveness(self_handle()), LivenessProbe::Alive);
+    }
+
+    #[test]
+    fn r5r2_liveness_unknown_for_invalid_handle() {
+        let invalid = HANDLE(std::ptr::null_mut());
+        assert_eq!(probe_process_liveness(invalid), LivenessProbe::Unknown);
+    }
+
+    #[test]
+    fn r5r2_mapping_proof_rejects_mem_free() {
+        let p = prove_candidate_mapping(self_handle(), 0x1000, 0x1000, 0x4000, 16);
+        assert!(!p.passed, "MEM_FREE region must fail closed");
+        assert!(p.fail_reason.is_some());
+    }
+
+    #[test]
+    fn r5r2_mapping_proof_rejects_outside_envelope() {
+        let p = prove_candidate_mapping(self_handle(), 0x1000, 0x2000, 0x4000, 16);
+        assert!(!p.in_image_envelope);
+        assert!(!p.passed);
+    }
+
+    #[test]
+    fn r5r2_mapping_proof_rejects_page_cross() {
+        let p = prove_candidate_mapping(self_handle(), 0xFFF, 0, 0x4000, 16);
+        assert!(!p.page_span_fits);
+        assert!(!p.passed);
+    }
+
+    #[test]
+    fn r5r2_mapping_proof_ok_for_real_allocation() {
+        let region = alloc_local(0x4000);
+        let base = region as u64;
+        let set = prove_candidate_mappings(
+            self_handle(),
+            &[base, base + 0x1000, base + 0x2000, base + 0x3000],
+            base,
+            0x4000,
+            16,
+        );
+        assert!(set.all_passed, "real committed allocation must prove");
+        assert_eq!(set.items.len(), 4);
+        for item in &set.items {
+            assert!(item.canonical_va);
+            assert!(item.in_image_envelope);
+            assert!(item.mem_committed);
+            assert!(item.probe_contained_in_region);
+            assert!(item.readable_protection);
+            assert_eq!(
+                item.region_type, 0x20000,
+                "VirtualAlloc region must record MEM_PRIVATE"
+            );
+            assert!(item.passed);
+        }
+        free_local(region);
+    }
+    #[test]
+    fn r5r2_mapping_proof_set_fails_when_any_item_fails() {
+        let region = alloc_local(0x4000);
+        let base = region as u64;
+        let set = prove_candidate_mappings(
+            self_handle(),
+            &[base, base + 0x1000, base + 0x2000, base + 0x3000],
+            base,
+            0x3000,
+            16,
+        );
+        assert!(!set.all_passed);
+        assert!(!set.items[3].in_image_envelope);
+        assert!(!set.items[3].passed);
+        free_local(region);
+    }
+
+    #[test]
+    fn r5r2_mapping_proof_requires_verified_image_size() {
+        let p = prove_candidate_mapping(self_handle(), 0x1000, 0x1000, 0, 16);
+        assert!(!p.passed);
+        assert_eq!(
+            p.fail_reason.as_deref(),
+            Some("image envelope invalid or empty")
+        );
+    }
+
+    // A mock authorized dispatch bridge for offline gate tests.
+    #[derive(Debug)]
+    struct MockBridge {
+        status: i32,
+        output: bool,
+    }
+    fn mock_attestation_output() -> mida_antidebug_runtime::attestation::RuntimeAttestationV2 {
+        mida_antidebug_runtime::attestation::RuntimeAttestationV2 {
+            schema: "mida.antidebug-runtime-attestation/v2".to_string(),
+            schema_version: 2,
+            runtime_id: "mida-antidebug-runtime-x64".to_string(),
+            runtime_version: "0.1.0".to_string(),
+            architecture: "x86_64".to_string(),
+            runtime_sha256: "ab".repeat(32),
+            profile_id: "oreans_origin_x64_v1".to_string(),
+            profile_digest: "cd".repeat(32),
+            target_pid: std::process::id(),
+            module_base: 0x7000,
+            initialized: true,
+            hooks_expected: vec!["AD-PROC-002".to_string()],
+            hooks_installed: vec!["AD-PROC-002".to_string()],
+            hook_failures: vec![],
+            surface_details: vec![],
+            telemetry_channel: "ready".to_string(),
+            cleanup_handler_registered: true,
+            third_party: "test".to_string(),
+            source_revision: "test".to_string(),
+            toolchain: "rustc".to_string(),
+            walker_attestation: None,
+            record_digest: "aa".repeat(32),
+        }
+    }
+
+    impl WalkerDispatchBridge for MockBridge {
+        fn dispatch(
+            &self,
+            _params_va: u64,
+        ) -> (
+            i32,
+            Option<mida_antidebug_runtime::attestation::RuntimeAttestationV2>,
+        ) {
+            if self.output {
+                (self.status, Some(mock_attestation_output()))
+            } else {
+                (self.status, None)
+            }
+        }
+    }
+
+    #[test]
+    fn r5r2_dispatch_bridge_returns_raw_status_and_output() {
+        let b = MockBridge {
+            status: 0,
+            output: true,
+        };
+        let (s, o) = b.dispatch(0x1234);
+        assert_eq!(s, 0);
+        assert!(o.is_some());
+        let b2 = MockBridge {
+            status: 2,
+            output: true,
+        };
+        let (s2, _) = b2.dispatch(0x1234);
+        assert_eq!(s2, 2);
+    }
+
+    #[test]
+    fn r5r2_dispatch_bridge_output_missing_fail_closed() {
+        let b = MockBridge {
+            status: 0,
+            output: false,
+        };
+        let (s, o) = b.dispatch(0x1234);
+        assert_eq!(s, 0);
+        assert!(o.is_none());
     }
 }

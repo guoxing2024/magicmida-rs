@@ -1,0 +1,495 @@
+   Compiling mida-antidebug-runtime v0.1.0 (D:\Claude project\magicmida-rs\crates\antidebug-runtime)
+warning: variable does not need to be mutable
+   --> crates\antidebug-runtime\tests\proc_surfaces.rs:536:9
+    |
+536 |     let mut f = FakePebMemory::new();
+    |         ----^
+    |         |
+    |         help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> crates\antidebug-runtime\tests\proc_surfaces.rs:548:9
+    |
+548 |     let mut f = FakePebMemory::new();
+    |         ----^
+    |         |
+    |         help: remove this `mut`
+
+warning: unused imports: `WALKER_CANONICAL_ENCODING` and `json_c14n`
+   --> crates\antidebug-runtime\tests\attestation.rs:562:5
+    |
+562 |     json_c14n, json_c14n_bytes, parse_attestation, sha256_hex, AbortState, Orphan, OrphanKind,
+    |     ^^^^^^^^^
+...
+565 |     C14N_VECTOR_2_DIGEST, C14N_VECTOR_3_DIGEST, C14N_VECTOR_4_DIGEST, WALKER_CANONICAL_ENCODING,
+    |                                                                       ^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused return value of `Result::<T, E>::is_err` that must be used
+   --> crates\antidebug-runtime\tests\attestation.rs:668:13
+    |
+668 |             v1.validate().is_err(); // foundation is honest-unsupported -> hook inventory incomplete
+    |             ^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: if you intended to assert that this is err, consider `.unwrap_err()` instead
+    = note: `#[warn(unused_must_use)]` (part of `#[warn(unused)]`) on by default
+help: use `let _ = ...` to ignore the resulting value
+    |
+668 |             let _ = v1.validate().is_err(); // foundation is honest-unsupported -> hook inventory incomplete
+    |             +++++++
+
+warning: `mida-antidebug-runtime` (test "proc_surfaces") generated 2 warnings (run `cargo fix --test "proc_surfaces" -p mida-antidebug-runtime` to apply 2 suggestions)
+warning: `mida-antidebug-runtime` (test "attestation") generated 2 warnings (run `cargo fix --test "attestation" -p mida-antidebug-runtime` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.50s
+     Running unittests src\lib.rs (target\debug\deps\mida_antidebug-408067b370c374a6.exe)
+
+running 2 tests
+test evidence::tests::failure_keeps_prior_events ... ok
+test evidence::tests::sequence_is_monotonic ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\state_machine.rs (target\debug\deps\state_machine-9dfd2982744607a2.exe)
+
+running 25 tests
+test candidate_misused_as_hard_rejected ... ok
+test empty_profile_rejected ... ok
+test demote_only_works_on_candidates ... ok
+test cleanup_failure_is_terminal ... ok
+test each_failure_transition_is_terminal_with_code ... ok
+test demote_candidate_to_observe_only ... ok
+test duplicate_surface_rejected ... ok
+test failure_evidence_retains_prior_successes ... ok
+test illegal_event_rejected_deterministically ... ok
+test lunlun_profile_shapes ... ok
+test no_direct_jumps_to_proceed ... ok
+test full_success_path_reaches_proceed ... ok
+test origin_profile_shapes ... ok
+test proceed_unreachable_from_failure_states ... ok
+test profile_arch_mismatch_rejected ... ok
+test profile_digest_mismatch_rejected ... ok
+test origin_lunlun_profiles_are_independent ... ok
+test profile_sample_mismatch_rejected ... ok
+test promote_non_candidate_fails ... ok
+test promote_with_insufficient_proof_fails ... ok
+test profile_validation_pass ... ok
+test promote_with_missing_evidence_fails ... ok
+test same_input_same_output ... ok
+test promote_candidate_with_sufficient_proof ... ok
+test unknown_surface_in_hard_required_rejected ... ok
+
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (target\debug\deps\mida_antidebug_runtime-51153ee7a14e99e4.exe)
+
+running 65 tests
+test exports::imp08_v2_tests::error_codes_stable_abi ... ok
+test exports::imp08_v2_tests::v2_blob_digest_region_truncated_rejected ... ok
+test exports::imp08_v2_tests::v2_blob_canonical_out_of_blob_va_rejected ... ok
+test exports::imp08_v2_tests::v2_blob_digest_region_checked_add_overflow_rejected ... ok
+test exports::imp08_v2_tests::v2_blob_entry_offset_overflow_rejected ... ok
+test exports::imp08_v2_tests::v2_blob_surface_string_outside_blob_rejected ... ok
+test exports::imp08_v2_tests::v2_checked_add_rejects_overflow ... ok
+test exports::imp08_v2_tests::v2_read_cstr_blob_ok_and_bounds ... ok
+test exports::imp08_v2_tests::v2_blob_unknown_tail_rejected ... ok
+test exports::imp08_v2_tests::v2_blob_blob_base_plus_bytes_overflow_rejected ... ok
+test exports::imp08_v2_tests::v2_blob_va_below_blob_base_rejected ... ok
+test exports::imp08_v2_tests::walker_execute_honest_not_implemented ... ok
+test exports::imp08_v2_tests::v2_magic_bytes_match_frozen_fixture ... ok
+test exports::imp08_v2_tests::walker_execute_rejects_invalid_va_fail_closed ... ok
+test exports::imp09_walker_export_tests::walker_export_aborted_on_identity_mismatch ... ok
+test exports::imp09_walker_export_tests::walker_export_bad_va_is_invalid_argument ... ok
+test exports::imp09_walker_export_tests::walker_export_aborted_on_section_tamper ... ok
+test exports::imp09_walker_export_tests::walker_export_aborted_state_rejects_second_call ... ok
+test exports::imp09_walker_export_tests::walker_export_bind_after_terminal_rejected ... ok
+test exports::imp09_walker_export_tests::walker_export_r4_binding_window_execute_rejected_controlled ... ok
+test exports::imp09_walker_export_tests::walker_export_bind_vs_execute_one_wins ... ok
+test exports::imp09_walker_export_tests::walker_export_concurrent_claim_only_one_runs ... ok
+test exports::imp09_walker_export_tests::walker_export_no_provider_is_not_implemented ... ok
+test exports::imp09_walker_export_tests::walker_export_completes_two_rounds_local ... ok
+test exports::imp09_walker_export_tests::walker_export_output_sink_failure_fails_closed ... ok
+test exports::imp09_walker_export_tests::walker_export_produces_anchored_attestation_output ... ok
+test exports::imp09_walker_export_tests::walker_export_provider_lock_poison_recovers ... ok
+test exports::imp09_walker_export_tests::walker_export_provider_read_panic_aborts ... ok
+test exports::imp09_walker_export_tests::walker_export_r4_authority_matrix_distinct_fields ... ok
+test exports::imp09_walker_export_tests::walker_export_bind_vs_bind_one_wins ... ok
+test exports::imp09_walker_export_tests::walker_export_r4_export_rva_comes_from_resolver_carrier ... ok
+test exports::imp09_walker_export_tests::walker_export_r4_failed_install_leaves_no_stale_output ... ok
+test exports::imp09_walker_export_tests::walker_export_r4_genuine_bind_vs_execute_concurrency ... ok
+test exports::imp09_walker_export_tests::walker_export_r4_install_missing_target_digest_stays_unbound ... ok
+test exports::imp09_walker_export_tests::walker_export_r4_install_without_provider_no_ready ... ok
+test exports::imp09_walker_export_tests::walker_export_r4_output_reset_failure_rolls_back ... ok
+test exports::imp09_walker_export_tests::walker_export_r4_owner_pid_mismatch_fails_closed ... ok
+test exports::imp09_walker_export_tests::walker_export_r4_owner_pid_passthrough_from_caller ... ok
+test exports::imp09_walker_export_tests::walker_export_r4_ready_rejects_provider_replacement ... ok
+test exports::imp09_walker_export_tests::walker_export_r4_running_rejects_provider_replacement ... ok
+test walker_control::tests::authority_validation_rejects_bad_digests ... ok
+test exports::imp09_walker_export_tests::walker_export_r4_session_install_failure_rolls_back ... ok
+test walker_control::tests::crc_mismatch_aborts ... ok
+test walker_control::tests::budget_overflow_aborts ... ok
+test walker_control::tests::entry_identity_mismatch_aborts ... ok
+test walker_control::tests::duplicate_round_aborts ... ok
+test walker_control::tests::invalid_transition_aborts ... ok
+test walker_control::tests::anchor_failure_aborts_session ... ok
+test walker_control::tests::orphan_contract_violation_aborts ... ok
+test walker_control::tests::no_automatic_retry ... ok
+test walker_control::tests::out_of_order_aborts ... ok
+test walker_control::tests::digest_mismatch_rejected_in_attestation ... ok
+test walker_control::tests::pending_completed_section_aborts ... ok
+test exports::imp09_walker_export_tests::walker_export_r4_successful_install_completes_and_output_matches ... ok
+test walker_control::tests::round_gap_aborts ... ok
+test walker_control::tests::production_caller_not_test_only ... ok
+test walker_control::tests::truncated_payload_aborts ... ok
+test exports::imp09_walker_export_tests::walker_export_r4_terminal_rejects_provider_replacement ... ok
+test exports::imp09_walker_export_tests::walker_export_rejects_high_32bit_blob_total ... ok
+test walker_control::tests::tampered_record_digest_rejected ... ok
+test walker_control::tests::two_rounds_complete_with_ledger_and_digest ... ok
+test walker_control::tests::tampered_anchor_ledger_rejected ... ok
+test exports::imp09_walker_export_tests::walker_export_session_lock_poison_recovers ... ok
+test exports::imp09_walker_export_tests::walker_export_terminal_state_rejects_second_call ... ok
+test exports::imp09_walker_export_tests::walker_export_uppercase_digest_rejected ... ok
+
+test result: ok. 65 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests\attestation.rs (target\debug\deps\attestation-8ee9ef98d8512674.exe)
+
+running 68 tests
+test attestation_architecture_mismatch_rejected ... ok
+test attestation_foundation_is_honest_unsupported ... ok
+test attestation_hook_failures_rejected ... ok
+test attestation_module_base_zero_rejected ... ok
+test attestation_missing_fields_rejected_by_serde ... ok
+test attestation_cleanup_handler_missing_rejected ... ok
+test attestation_not_initialized_rejected ... ok
+test attestation_profile_digest_missing_rejected ... ok
+test attestation_schema_mismatch_rejected ... ok
+test attestation_hook_failure_unknown_field_rejected_by_serde ... ok
+test attestation_target_pid_missing_rejected ... ok
+test attestation_roundtrip_json ... ok
+test attestation_third_party_undeclared_rejected ... ok
+test attestation_telemetry_not_ready_rejected ... ok
+test attestation_verify_identity_module_base_mismatch_rejected ... ok
+test attestation_verify_identity_ok ... ok
+test attestation_verify_identity_pid_mismatch_rejected ... ok
+test attestation_unknown_field_rejected_by_serde ... ok
+test attestation_verify_identity_zero_module_base_rejected ... ok
+test c14n_top_level_non_object_rejected ... ok
+test c14n_vector_1_empty_object ... ok
+test c14n_vector_2_scalar_key_order ... ok
+test c14n_vector_3_nested_escape_unicode ... ok
+test c14n_vector_4_bool_literals ... ok
+test hook_inventory_completeness ... ok
+test orphan_unconfirmed_no_reclaim_note ... ok
+test orphan_valid_and_invalid_states ... ok
+test probe_summary_consistency_valid ... ok
+test probe_summary_guard_exceeds_rejected ... ok
+test probe_summary_type_sum_mismatch_rejected ... ok
+test provenance_dependencies_undeclared_rejected ... ok
+test provenance_dependency_anti_debug_rejected ... ok
+test provenance_kind_architecture_mismatch_rejected ... ok
+test provenance_kind_invalid_rejected ... ok
+test provenance_kind_missing_rejected ... ok
+test provenance_third_party_undeclared_rejected ... ok
+test provenance_roundtrip_and_dependencies_declared ... ok
+test round_ledger_rejects_auto_retry ... ok
+test round_ledger_rejects_bad_index ... ok
+test provenance_unknown_field_rejected_by_serde ... ok
+test round_ledger_rejects_budget_exceeded ... ok
+test round_ledger_valid_rounds ... ok
+test tagged_dispatch_schema_version_mismatch_rejected ... ok
+test tagged_dispatch_unknown_schema_rejected ... ok
+test tagged_dispatch_v1_preserved ... ok
+test tagged_dispatch_v2_unknown_field_rejected ... ok
+test tagged_dispatch_v2_accepts_and_validates ... ok
+test telemetry_channel_id_mismatch_fails_closed ... ok
+test telemetry_closed_fails_closed ... ok
+test telemetry_digest_mismatch_fails_closed ... ok
+test telemetry_duplicate_response_rejected ... ok
+test telemetry_normal_request_response ... ok
+test telemetry_not_ready_fails_closed ... ok
+test telemetry_out_of_order_rejected ... ok
+test telemetry_pid_mismatch_fails_closed ... ok
+test telemetry_sequence_monotonic ... ok
+test telemetry_shutdown_report ... ok
+test telemetry_repeated_start_stop_no_resource_growth ... ok
+test telemetry_unknown_field_in_response_rejected_by_serde ... ok
+test walker_attestation_digest_preimage_excludes_only_self ... ok
+test walker_attestation_binding_and_digest ... ok
+test walker_attestation_round_sequence_checked ... ok
+test walker_entry_va_binding_mismatch_rejected ... ok
+test walker_zero_rva_still_rejected ... ok
+test walker_entry_va_binding_overflow_fail_closed ... ok
+test walker_entry_va_binding_valid ... ok
+test v2_top_level_with_walker_roundtrip ... ok
+test v2_top_level_walker_digest_tamper_rejected ... ok
+
+test result: ok. 68 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests\b1_benign_host_full.rs (target\debug\deps\b1_benign_host_full-f90732be9bc403d6.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\b2_debugger_attach.rs (target\debug\deps\b2_debugger_attach-b29a8db6da240c91.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\b4_dynamic_observer.rs (target\debug\deps\b4_dynamic_observer-4d4e48973996a9df.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\benign_host.rs (target\debug\deps\benign_host-03217c2ee21aa76e.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\proc_surfaces.rs (target\debug\deps\proc_surfaces-2b046f14bc4d62bb.exe)
+
+running 34 tests
+test attestation_candidate_never_in_expected ... ok
+test aggregate_both_installed ... ok
+test aggregate_peb_unresolvable_fails_closed ... ok
+test aggregate_wrong_pid_fails_closed ... ok
+test aggregate_partial_failure_reports_failures ... ok
+test attestation_from_surfaces_full_success_validates ... ok
+test proc002_being_debugged_set_is_zeroed ... ok
+test proc002_normal_clean_peb ... ok
+test proc002_profile_digest_mismatch_rejected ... ok
+test proc002_restore_failure_reported ... ok
+test proc002_restore_not_applicable_when_none ... ok
+test proc002_restore_original ... ok
+test proc002_target_pid_mismatch_rejected ... ok
+test proc002_unreadable_peb_rejected ... ok
+test proc002_unwritable_peb_rejected_when_modifying ... ok
+test proc003_invalid_shim_pointer_rejected ... ok
+test proc003_nonzero_shim_is_zeroed ... ok
+test proc003_null_shim_data_ok ... ok
+test proc003_offset_is_0x2d8_not_0x08 ... ok
+test proc003_pid_mismatch_rejected ... ok
+test proc003_restore_failure_reported ... ok
+test proc003_restore_original_pointer ... ok
+test proc003_restore_zero_original_not_applicable ... ok
+test proc003_unwritable_peb_fails_closed_when_zeroing ... ok
+test proc003_write_back_verification_failure_fails_closed ... ok
+test proc004_clean_flag_unchanged ... ok
+test proc004_clears_debugger_nt_global_flag ... ok
+test proc004_layout_offsets_authority ... ok
+test proc004_write_back_failure_fails_closed ... ok
+test proc005_clean_force_flags_unchanged ... ok
+test proc005_clears_debugger_force_flags ... ok
+test proc005_null_heap_fails_closed ... ok
+test telemetry_sequence_error_still_fails_closed ... ok
+test wrong_pointer_size_rejected ... ok
+
+test result: ok. 34 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests\walker_protocol.rs (target\debug\deps\walker_protocol-ba9e073959b931d6.exe)
+
+running 26 tests
+test controller_crc_first_rejects_malformed_record_region ... ok
+test controller_crc_first_proves_order_via_roundtrip_field ... ok
+test controller_crc_first_rejects_tampered_payload_before_parse ... ok
+test controller_read_completed_rejects_pending ... ok
+test controller_read_section_rejects_crc_tamper ... ok
+test controller_read_section_rejects_identity_mismatch ... ok
+test controller_read_section_rejects_truncated_buffer ... ok
+test controller_read_section_valid_flow ... ok
+test controller_validate_entry_accepts_good_params ... ok
+test controller_validate_entry_rejects_corrupt_blob ... ok
+test crc32_known_vector ... ok
+test controller_validate_entry_rejects_count_mismatch ... ok
+test layout_constants_hold ... ok
+test params_crc_mismatch_rejected ... ok
+test params_fixed_fields_rejected ... ok
+test params_golden_fixture ... ok
+test params_non_canonical_candidate_rejected ... ok
+test params_page_cross_rejected ... ok
+test params_probe_span_frozen_rejects_non_16 ... ok
+test params_candidate_count_limits ... ok
+test params_probe_span_hostile_wire_rejected ... ok
+test params_round_trip_valid ... ok
+test params_unknown_option_rejected ... ok
+test params_zero_nonce_rejected ... ok
+test session_id_derivation ... ok
+test va_helpers_sane ... ok
+
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\walker_protocol_section.rs (target\debug\deps\walker_protocol_section-741b09b29e43dd35.exe)
+
+running 27 tests
+test encode_invalid_header_stride_rejected ... ok
+test encode_exact_section_bytes_round_trip ... ok
+test encode_invalid_completed_flag_rejected ... ok
+test encode_invalid_identity_reserved_rejected ... ok
+test encode_invalid_reserved_rejected ... ok
+test encode_invalid_header_magic_rejected ... ok
+test encode_invalid_probe_fields_rejected ... ok
+test encode_invalid_results_off_rejected ... ok
+test encode_invalid_retry_count_rejected ... ok
+test encode_invalid_section_bytes_mismatch_rejected ... ok
+test encode_invalid_identity_version_rejected ... ok
+test encode_invalid_identity_magic_rejected ... ok
+test header_closed_sets_rejected ... ok
+test hostile_counts_rejected ... ok
+test hostile_params_count_max_no_alloc ... ok
+test hostile_params_fixed_field_reject_no_panic ... ok
+test hostile_section_bytes_max_reject_no_panic ... ok
+test hostile_section_count_stride_reject_no_panic ... ok
+test hostile_truncated_never_panics ... ok
+test identity_echo_rejected ... ok
+test identity_target_side_rejected ... ok
+test probe_result_span_frozen_rejects_non_16 ... ok
+test probe_result_span_hostile_wire_rejected ... ok
+test section_payload_crc_detected ... ok
+test section_states_and_payload ... ok
+test section_status_flag_consistency ... ok
+test truncated_buffers_rejected ... ok
+
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (target\debug\deps\mida_core-36aaf85cd3e07d25.exe)
+
+running 100 tests
+test addr::tests::rebase_runtime_pointer_to_preferred_layout ... ok
+test addr::tests::file_offset_is_plain_newtype ... ok
+test addr::tests::preferred_and_runtime_are_distinct_for_emit ... ok
+test adr7_b4_observer::tests::bound_tables_are_nonempty_and_sorted ... ok
+test addr::tests::to_rva_rejects_below_base ... ok
+test adr7_b4_observer::tests::binding_hash_compare_is_case_insensitive ... ok
+test adr7_b4_observer::tests::match_int29_uses_bound_table ... ok
+test addr::tests::live_map_roundtrip ... ok
+test addr::tests::to_rva_rejects_overflow_u32 ... ok
+test addr::tests::preferred_map_roundtrip ... ok
+test adr7_b4_observer::tests::sha256_hex_matches_known_vector ... ok
+test b5_tls_capture::tests::absent_when_null_slot ... ok
+test b5_tls_capture::tests::capture_failed_when_counter_read_failed_with_teb_ok ... ok
+test b5_tls_capture::tests::capture_failed_when_error_and_no_teb ... ok
+test b5_tls_capture::tests::capture_failed_when_flag_read_failed ... ok
+test b5_tls_capture::tests::capture_failed_when_page_query_failed ... ok
+test b5_tls_capture::tests::capture_failed_when_slot_read_failed ... ok
+test b5_tls_capture::tests::capture_failed_when_teb_ok_but_tls_array_failed ... ok
+test b5_tls_capture::tests::capture_failed_when_tls_index_read_failed ... ok
+test b5_tls_capture::tests::corrupted_when_counter_unreadable ... ok
+test b5_tls_capture::tests::readonly_when_protect_not_writeable ... ok
+test b5_tls_capture::tests::writable_when_all_reads_ok ... ok
+test cleanup::tests::owned_launch_terminates_and_waits ... ok
+test cleanup::tests::owned_post_attach_terminates_and_waits ... ok
+test cleanup::tests::ownership_action_invariant ... ok
+test cleanup::tests::report_for_construction_failure_claims_no_success ... ok
+test cleanup::tests::report_for_terminate_failure_records_win32 ... ok
+test adr7_b4_observer::tests::record_with_tls_persists_snapshot_in_timeline ... ok
+test cleanup::tests::report_for_terminate_success ... ok
+test cleanup::tests::report_for_terminate_wait_timeout ... ok
+test debug_event_lifecycle::tests::continue_failure_retains_pending ... ok
+test debug_event_lifecycle::tests::continue_ok_clears_pending ... ok
+test debug_event_lifecycle::tests::double_continue_rejected ... ok
+test debug_event_lifecycle::tests::exc_type_0_is_read_not_write ... ok
+test debug_event_lifecycle::tests::hresult_0x80070057_maps_to_win32_87 ... ok
+test debug_event_lifecycle::tests::ignored_event_exactly_once_continue_flow ... ok
+test debug_event_lifecycle::tests::matching_tid_uses_pending_pid ... ok
+test debug_event_lifecycle::tests::output_debug_string_is_ignore_and_continue ... ok
+test debug_event_lifecycle::tests::pending_event_recorded_on_wait_success ... ok
+test debug_event_lifecycle::tests::rip_event_disposition ... ok
+test debug_event_lifecycle::tests::tid_mismatch_rejects_before_winapi ... ok
+test debug_event_lifecycle::tests::unknown_event_is_ignore_and_continue ... ok
+test debug_event_lifecycle::tests::wait_while_pending_rejected ... ok
+test error::tests::hresult_0x80070057_parses_win32_87 ... ok
+test plugin::tests::dyn_plugin_object_safe ... ok
+test plugin::tests::milestone_helpers_advance_phase ... ok
+test plugin::tests::note_iat_trace_skipped_sets_skip_and_leave ... ok
+test plugin::tests::null_plugin_never_matches_always_continues ... ok
+test plugin::tests::oep_va_to_rva_prefers_runtime_base ... ok
+test plugin::tests::oep_via_scan_requests_leave ... ok
+test plugin::tests::plugin_ctx_session_hints_default_off ... ok
+test plugin::tests::record_oep_provenance_derives_rva_and_keeps_runtime_identity ... ok
+test plugin::tests::record_oep_provenance_requires_runtime_base_for_rva ... ok
+test plugin::tests::refresh_loop_policy_iat_complete_leaves ... ok
+test plugin::tests::record_oep_provenance_scan_fallback_is_preserved_not_overwritten ... ok
+test plugin::tests::refresh_loop_policy_short_wait_and_close_handle ... ok
+test process::tests::pe_read_unaligned_accepts_odd_offset ... ok
+test process::tests::pe_read_unaligned_bounds ... ok
+test process::tests::pe_write_unaligned_roundtrip ... ok
+test runner_config::tests::packer_family_registry_distinguishes_generic_and_oreans ... ok
+test runner_config::tests::packer_family_distinguishes_oreans_and_gto_digests ... ok
+test runner_config::tests::runner_config_validate_fails_closed ... ok
+test runner_config::tests::familyless_wire_json_defaults_to_oreans ... ok
+test process::tests::pe_inspect_missing_file ... ok
+test runtime_engine::tests::capability_parity_replay_vs_live_adapter ... ok
+test runtime_engine::tests::continue_failure_retains_engine_pending ... ok
+test runner_config::tests::runner_digest_rejects_unknown_and_missing_fields ... ok
+test runner_config::tests::runner_digest_changes_with_any_valid_field ... ok
+test runner_config::tests::runner_digest_is_stable_and_encoding_canonical ... ok
+test runtime_engine::tests::continue_thread_rejects_thread_id_mismatch_and_keeps_pending ... ok
+test runtime_engine::tests::debugger_core_engine_pairs_wait_continue ... ok
+test runtime_engine::tests::debugger_core_engine_rejects_wait_while_pending ... ok
+test runner_config::tests::runner_digest_is_injective_against_separator_collisions ... ok
+test runtime_engine::tests::live_adapter_and_replay_deliver_identical_sequences ... ok
+test runtime_engine::tests::live_adapter_matches_replay_guard_oep_phases ... ok
+test runtime_engine::tests::live_context_rmw_preserves_untouched_registers ... ok
+test runtime_engine::tests::replay_breakpoint_slot_validation_fails_closed ... ok
+test runtime_engine::tests::replay_capability_log_records_sequence_and_thread ... ok
+test runtime_engine::tests::replay_context_fail_closed_for_unseeded_thread ... ok
+test runtime_engine::tests::replay_delivers_in_order_with_sequences ... ok
+test runtime_engine::tests::replay_rejects_double_continue ... ok
+test runtime_engine::tests::replay_rejects_wait_while_pending ... ok
+test runtime_engine::tests::replay_unmapped_read_fails_closed_and_is_recorded ... ok
+test runtime_engine::tests::slice4_guard_oep_with_memory_and_plugin_milestones ... ok
+test runtime_engine::tests::slice4_replay_memory_read_write ... ok
+test runtime_engine::tests::slice4_wait_timeout_on_exhausted_stream ... ok
+test runtime_engine::tests::synthetic_guard_oep_skeleton_events ... ok
+test windows_debugger::tests::capture_failure_records_error_but_keeps_receipt ... ok
+test windows_debugger::tests::capture_success_populates_rip_rsp_and_module ... ok
+test windows_debugger::tests::classify_thread_wait_maps_all_outcomes ... ok
+test windows_debugger::tests::existing_soft_breakpoint_mismatch_is_not_considered_installed ... ok
+test windows_debugger::tests::generic_rollback_error_is_fail_closed ... ok
+test windows_debugger::tests::module_resolver_hits_real_mapped_image ... ok
+test windows_debugger::tests::module_resolver_unknown_address_returns_none ... ok
+test windows_debugger::tests::restore_failure_records_phase_and_thread ... ok
+test windows_debugger::tests::scoped_thread_handle_as_raw_roundtrips ... ok
+test windows_debugger::tests::scoped_thread_handle_drop_invalid_handle_is_noop ... ok
+test windows_debugger::tests::scoped_thread_handle_drops_real_handle ... ok
+test windows_debugger::tests::second_chance_receipt_retains_capture_fields ... ok
+test windows_debugger::tests::successful_rollback_returns_plain_freeze_error ... ok
+
+test result: ok. 100 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests\capture_epoch_harness.rs (target\debug\deps\capture_epoch_harness-040b1893b6748d14.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\drain_lifecycle_harness.rs (target\debug\deps\drain_lifecycle_harness-186b15560fce55e7.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests mida_antidebug
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests mida_antidebug_runtime
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests mida_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

@@ -782,18 +782,45 @@ pub fn unpack(
                 profile_identity: evidence_ctx
                     .as_ref()
                     .and_then(|ctx| ctx.profile_identity().cloned()),
+                // IMP-09-CARRIER-R5-R2-4: NO authorized target-side
+                // dispatch bridge ships in R5-R2 (live authorization
+                // deferred to R5-R3/R5-R4); the controller records +
+                // returns NOT_IMPLEMENTED at the execute gate and Proceed
+                // stays blocked (fail-closed).
+                walker_dispatch: None,
+                // IMP-09-CARRIER-R5-R2-1: the debugger drives termination
+                // AFTER the controller gate (alive window); run() must not
+                // fire the termination backend.
+                defer_cleanup_to_caller: true,
             },
         );
         if let Ok(loader_result) = loader_outcome {
             ad_controller.set_loader_result(loader_result);
         }
+        // IMP-09-CARRIER-R5-R2-1: the controller gate (walker bind +
+        // execute) runs HERE, in the provably-alive window, BEFORE
+        // terminate_and_wait(). The deferred-cleanup flag keeps run() from
+        // firing the termination backend; the debugger drives exactly-once
+        // termination below.
+        let outcome = ad_controller.run();
+        // R5-R2-4: record terminate_enter into the monotonic walker event
+        // record BEFORE the debugger termination, so the sequence proves
+        // bind/execute ran alive.
+        ad_controller.record_terminate_enter();
         // R1-HARDENING-CLEANUP-2: exactly-once explicit cleanup (same as the
         // CREATE_PROCESS path). terminate_and_wait() resolves any pending
         // event (never DBG_CONTINUE for fail-closed), terminates once, and
         // marks cleanup_done so Drop skips its fallback.
         let cleanup_report = dbg.terminate_and_wait();
         ad_controller.set_cleanup_report(&cleanup_report);
-        let outcome = ad_controller.run();
+        // IMP-09-CARRIER-R5-R2-4: write the walker evidence sidecar with
+        // the monotonic raw event sequence + liveness + mapping proof.
+        if let Err(ew) = antidebug_controller::write_walker_evidence(
+            &ad_controller.walker_evidence_record("post_attach"),
+            &evidence_dir,
+        ) {
+            return Err(anyhow::anyhow!("walker evidence write failed: {ew:#}"));
+        }
         if let antidebug_controller::AntidebugOutcome::Failed {
             state,
             fail_code,
@@ -1191,6 +1218,17 @@ pub fn unpack(
                             profile_identity: evidence_ctx
                                 .as_ref()
                                 .and_then(|ctx| ctx.profile_identity().cloned()),
+                            // IMP-09-CARRIER-R5-R2-4: NO authorized
+                            // target-side dispatch bridge ships in R5-R2
+                            // (live authorization deferred to R5-R3/R5-R4).
+                            // The controller therefore records + returns
+                            // NOT_IMPLEMENTED at the execute gate and
+                            // Proceed stays blocked (fail-closed).
+                            walker_dispatch: None,
+                            // IMP-09-CARRIER-R5-R2-1: the debugger drives
+                            // termination AFTER the controller gate (alive
+                            // window); run() must not fire the backend.
+                            defer_cleanup_to_caller: true,
                         },
                     );
                     // ADR-6: run the self-owned loader (verify + load +
@@ -1364,17 +1402,6 @@ pub fn unpack(
                             ),
                         );
                     }
-                    // R1-HARDENING-CLEANUP-2: exactly-once explicit cleanup.
-                    // A fail-closed drain error (e.g. second-chance exception)
-                    // leaves a pending debug event UNCONTINUED, which freezes
-                    // the debuggee. terminate_and_wait() resolves the pending
-                    // event with DBG_EXCEPTION_NOT_HANDLED (never DBG_CONTINUE
-                    // for a fail-closed path), terminates the target ONCE,
-                    // waits for exit, and records cleanup_done so `Drop` skips
-                    // its fallback (no duplicate termination, no Drop cleanup
-                    // issue warning). The structured report is injected into
-                    // the controller for evidence.
-                    let cleanup_report = dbg.terminate_and_wait();
                     // ADR-7-A-CAPTURE-1: bind the last exception capture
                     // receipt into the controller so the failure evidence
                     // sidecar carries the full exception/module context
@@ -1386,6 +1413,28 @@ pub fn unpack(
                     {
                         ad_controller.set_capture_receipt(last_exc.clone());
                     }
+                    // IMP-09-CARRIER-R5-R2-1: the controller gate (walker
+                    // bind + execute) runs HERE, in the provably-alive
+                    // window, BEFORE terminate_and_wait(). R5-R2 forbids
+                    // bind/execute after termination. The deferred-cleanup
+                    // flag keeps run() from firing the termination backend;
+                    // the debugger drives exactly-once termination below.
+                    let outcome = ad_controller.run();
+                    // R5-R2-4: record terminate_enter into the monotonic
+                    // walker event record BEFORE the debugger termination,
+                    // so the sequence proves bind/execute ran alive.
+                    ad_controller.record_terminate_enter();
+                    // R1-HARDENING-CLEANUP-2: exactly-once explicit cleanup.
+                    // A fail-closed drain error (e.g. second-chance exception)
+                    // leaves a pending debug event UNCONTINUED, which freezes
+                    // the debuggee. terminate_and_wait() resolves the pending
+                    // event with DBG_EXCEPTION_NOT_HANDLED (never DBG_CONTINUE
+                    // for a fail-closed path), terminates the target ONCE,
+                    // waits for exit, and records cleanup_done so the Drop
+                    // fallback is skipped (no duplicate termination). The
+                    // structured report is injected into the controller for
+                    // evidence.
+                    let cleanup_report = dbg.terminate_and_wait();
                     ad_controller.set_cleanup_report(&cleanup_report);
                     log::log(
                         LogType::Info,
@@ -1394,7 +1443,19 @@ pub fn unpack(
                             cleanup_report.summary()
                         ),
                     );
-                    let outcome = ad_controller.run();
+                    // IMP-09-CARRIER-R5-R2-4: write the walker evidence
+                    // sidecar (schema mida.antidebug-walker/v1) with the
+                    // monotonic raw event sequence (loader_complete,
+                    // bind_enter, bind_exit, execute_enter, execute_exit,
+                    // terminate_enter), the liveness probe and the
+                    // per-candidate mapping proof. A write failure fails
+                    // closed: never proceed without the raw record.
+                    if let Err(ew) = antidebug_controller::write_walker_evidence(
+                        &ad_controller.walker_evidence_record("create_process"),
+                        &evidence_dir,
+                    ) {
+                        return Err(anyhow::anyhow!("walker evidence write failed: {ew:#}"));
+                    }
                     match &outcome {
                         antidebug_controller::AntidebugOutcome::Proceed { .. } => {
                             // Only reachable once a real MIDA runtime exists.

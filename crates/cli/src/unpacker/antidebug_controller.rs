@@ -60,6 +60,10 @@ use crate::log::{self, LogType};
 use crate::unpacker::runtime_loader::{
     RuntimeAuthorityManifest, RuntimeDigestAuthority, RuntimeFileIdentity,
 };
+use crate::unpacker::walker_session::{
+    probe_process_liveness, prove_candidate_mappings, CandidateMappingProofSet, LivenessProbe,
+    WalkerDispatchBridge,
+};
 
 /// Registered anti-debug evidence schema (ADR-0 evidence contract).
 /// The CLI failure sidecar is a `record_kind = "cli-failure"` record of
@@ -309,6 +313,69 @@ pub struct AntidebugFailureEvidence {
     pub faulting_module_base: Option<String>,
     pub faulting_module_rva: Option<String>,
     pub context_capture_error: Option<String>,
+    /// IMP-09-CARRIER-R5-R2-4: monotonic raw walker event sequence
+    /// (loader_complete, bind_enter, bind_exit, execute_enter,
+    /// execute_exit, terminate_enter) with the raw WalkerExecute status.
+    pub walker_events: Vec<WalkerRawEvent>,
+    /// IMP-09-CARRIER-R5-R2-3: per-candidate pre-bind mapping proof
+    /// (canonical VA, image envelope, MEM_COMMIT, region bounds, page
+    /// span, readable protection). None when no proof was attempted.
+    pub candidate_mapping: Option<CandidateMappingProofSet>,
+    /// IMP-09-CARRIER-R5-R2-1: liveness probe result from the bind window.
+    pub liveness_probe: Option<String>,
+}
+
+/// IMP-09-CARRIER-R5-R2-4: one raw walker lifecycle event.
+///
+/// The production path records a monotonic sequence (1-based) covering the
+/// provably-alive window AND the termination window:
+/// `loader_complete` -> `bind_enter` -> `bind_exit` ->
+/// `execute_enter` -> `execute_exit` -> `terminate_enter`.
+/// `walker_status_raw` carries the RAW i32 returned by the target-side
+/// dispatch (never a boolean); non-OK statuses fail closed.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WalkerRawEvent {
+    pub sequence: u32,
+    pub phase: String,
+    pub detail: Option<String>,
+    pub walker_status_raw: Option<i32>,
+}
+
+/// Registered walker evidence schema (R5-R2 evidence contract).
+pub const WALKER_EVIDENCE_SCHEMA: &str = "mida.antidebug-walker/v1";
+
+/// Structured walker evidence record written by the production paths
+/// (CREATE_PROCESS + post-attach) after the controller gate, covering the
+/// alive-window bind/execute plus the termination entry.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WalkerEvidenceRecord {
+    pub schema: String,
+    pub record_kind: String,
+    pub target_pid: Option<u32>,
+    /// Which production path captured this record: create_process or
+    /// post_attach (R5-R2-2 capture_phase).
+    pub capture_phase: String,
+    /// Liveness probe result from the BIND window (R5-R2-1).
+    pub liveness_probe: Option<String>,
+    /// Liveness probe result from the EXECUTE window (R5-R2-1).
+    pub execute_liveness: Option<String>,
+    pub candidate_mapping: Option<CandidateMappingProofSet>,
+    pub events: Vec<WalkerRawEvent>,
+}
+
+/// Outcome of the production walker execute gate (R5-R2-4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalkerExecuteOutcome {
+    /// Authorized target-side dispatch bridge returned WALKER_STATUS_OK and
+    /// the marshaled output was present.
+    Success,
+    /// No authorized target-side dispatch bridge: NOT_IMPLEMENTED
+    /// (fail-closed; in-process exports::WalkerExecute is engineering-only).
+    NotImplemented,
+    /// Dispatch returned a raw non-OK walker status.
+    NonOk { raw_status: i32 },
+    /// Dispatch returned OK but no walker output was marshaled back.
+    OutputMissing,
 }
 
 /// Options for the anti-debug stage.
@@ -351,6 +418,22 @@ pub struct AntidebugStageOptions {
     /// preflight ran — the controller must fail closed (UNBOUND) rather
     /// than substitute a bare-string profile identity.
     pub profile_identity: Option<crate::runner_preflight::VerifiedProfileIdentity>,
+    /// IMP-09-CARRIER-R5-R2-4: AUTHORIZED target-side WalkerExecute
+    /// dispatch bridge. Production wiring in R5-R2 ALWAYS passes None
+    /// (live authorization is deferred to R5-R3/R5-R4): the controller
+    /// then records + returns NOT_IMPLEMENTED (fail-closed) instead of
+    /// calling the in-process engineering runtime. Tests inject a mock
+    /// bridge to exercise the gate logic offline; a mock is never a
+    /// live Windows PASS.
+    pub walker_dispatch: Option<Box<dyn WalkerDispatchBridge>>,
+    /// IMP-09-CARRIER-R5-R2-1: when true, run() MUST NOT fire the cleanup
+    /// backend on failure — the caller drives the debugger termination
+    /// (terminate_and_wait) after run() and injects the cleanup report.
+    /// Production paths (CREATE_PROCESS + post-attach) set this so the
+    /// walker bind/execute run in the provably-alive window BEFORE
+    /// terminate_and_wait and the exactly-once cleanup evidence comes
+    /// from the debugger report.
+    pub defer_cleanup_to_caller: bool,
 }
 
 /// Oracle-mode configuration (future differential experiments only).
@@ -474,9 +557,18 @@ pub struct AntidebugController {
     capture_receipt: Option<mida_core::DrainReceipt>,
     /// IMP-09-CARRIER-R5: the live walker session memory owner (params +
     /// section allocations in the target). Held until teardown, then freed
-    /// via [`WalkerSessionMemory::cleanup`]. None when no session is
+    /// via `WalkerSessionMemory::cleanup`. None when no session is
     /// installed (UNBOUND / NOT_WIRED).
     walker_mem: Option<crate::unpacker::walker_session::WalkerSessionMemory>,
+    /// IMP-09-CARRIER-R5-R2-4: monotonic raw walker event record.
+    walker_events: Vec<WalkerRawEvent>,
+    /// IMP-09-CARRIER-R5-R2-3: last candidate mapping proof set (kept even
+    /// on failure for evidence).
+    candidate_mapping: Option<CandidateMappingProofSet>,
+    /// IMP-09-CARRIER-R5-R2-1: liveness probe from the bind window.
+    liveness_probe: Option<LivenessProbe>,
+    /// IMP-09-CARRIER-R5-R2-1: liveness probe from the execute window.
+    execute_liveness: Option<LivenessProbe>,
 }
 
 impl AntidebugController {
@@ -489,6 +581,10 @@ impl AntidebugController {
             cleanup: None,
             capture_receipt: None,
             walker_mem: None,
+            walker_events: Vec::new(),
+            candidate_mapping: None,
+            liveness_probe: None,
+            execute_liveness: None,
         }
     }
 
@@ -592,38 +688,172 @@ impl AntidebugController {
         self.walker_mem = Some(mem);
         true
     }
-    /// IMP-09-CARRIER-R5-R1 P0-1: production bind entry point (real
-    /// lifecycle caller). Returns true iff the session reached READY.
+    /// IMP-09-CARRIER-R5-R1 P0-1 / R5-R2: production bind entry point
+    /// (real lifecycle caller). Returns true iff the session reached READY.
     ///
     /// Candidate list: derived from the VERIFIED runtime module base in
-    /// the target (real mapped pages: module base + 0/0x1000/0x2000/0x3000).
-    /// The loader already verified the runtime module is loaded at
-    /// module_base, so these are real, readable addresses in the target —
-    /// never magic constants, never fixed VAs.
+    /// the target (real mapped pages: module base + 0/0x1000/0x2000/0x3000),
+    /// restricted to the VERIFIED image envelope
+    /// [module_base, module_base + verified_size_of_image).
+    ///
+    /// R5-R2-1: the target must be provably ALIVE (GetExitCodeProcess ==
+    /// STILL_ACTIVE) before any bind — unknown/dead fails closed.
+    /// R5-R2-2/3: every candidate gets a per-item VirtualQueryEx mapping
+    /// proof (canonical VA, envelope, MEM_COMMIT, region bounds, page
+    /// span, readable protection) BEFORE
+    /// `install_walker_session_production()`; any item failing rejects
+    /// the whole candidate set. The proof set is retained on the
+    /// controller for evidence even when the bind fails.
     fn bind_walker_from_loader_production(&mut self) -> bool {
         let Some(handle) = self.options.target_handle else {
+            self.liveness_probe = Some(LivenessProbe::Unknown);
             return false;
         };
         let Some(loader) = self.options.loader_result.as_ref() else {
+            self.liveness_probe = Some(LivenessProbe::Unknown);
             return false;
         };
+        // R5-R2-1: liveness window proof. Never bind a dead/unknown target.
+        let liveness = probe_process_liveness(handle);
+        self.liveness_probe = Some(liveness);
+        if liveness != LivenessProbe::Alive {
+            return false;
+        }
         let base = loader.module_base();
         // Fail-closed: a zero/noncanonical base can never happen (the
         // loader verified the runtime), but never derive from garbage.
         if base == 0 || base > 0x0000_7FFF_FFFF_FFFF {
             return false;
         }
-        let mut candidates = [0u64; 4];
-        for (i, slot) in candidates.iter_mut().enumerate() {
-            match base.checked_add((i as u64) * 0x1000) {
-                Some(v) if v > 0 && v <= 0x0000_7FFF_FFFF_FFFF => *slot = v,
-                _ => return false,
+        // R5-R2-3: the image envelope MUST come from the VERIFIED file
+        // identity (sealed at verify_file time), never from a live-process
+        // header. 0 / missing -> no envelope -> fail closed.
+        let image_size = loader.file_identity().verified_size_of_image();
+        if image_size < 0x1000 {
+            return false;
+        }
+        let envelope_end = match base.checked_add(image_size) {
+            Some(v) if v > base => v,
+            _ => return false,
+        };
+        // Candidates: base + k*0x1000 for k in 0..4, all inside envelope.
+        let mut candidates: Vec<u64> = Vec::with_capacity(4);
+        for i in 0..4u64 {
+            match base.checked_add(i * 0x1000) {
+                Some(v) if v > 0 && v < envelope_end => candidates.push(v),
+                _ => break,
             }
+        }
+        if candidates.is_empty() || candidates.len() > 4096 {
+            return false;
+        }
+        // R5-R2-2: per-item mapping proof BEFORE install. Any failure
+        // rejects the whole set (fail-closed; no partial bind).
+        let proof = prove_candidate_mappings(handle, &candidates, base, image_size, 16);
+        self.candidate_mapping = Some(proof.clone());
+        if !proof.all_passed {
+            return false;
         }
         let Some(nonce) = self.csprng_nonce() else {
             return false;
         };
         self.bind_walker_from_loader(handle, &candidates, nonce)
+    }
+
+    /// IMP-09-CARRIER-R5-R2-4: production walker execute gate.
+    ///
+    /// Returns the execute outcome WITHOUT forging success:
+    /// - no walker session / no params VA        -> NotImplemented (fail-closed)
+    /// - no AUTHORIZED target-side dispatch bridge -> NotImplemented
+    ///   (calling the CLI-linked `exports::WalkerExecute` in-process is
+    ///   the ENGINEERING runtime only and is NOT production dispatch)
+    /// - bridge dispatch raw status != OK        -> NonOk { raw_status }
+    /// - status OK but no marshaled output       -> OutputMissing
+    /// - status OK + output present              -> Success
+    ///
+    /// Raw statuses are recorded verbatim in the walker event record; the
+    /// caller must gate Proceed on the outcome.
+    fn execute_walker_production(&mut self) -> WalkerExecuteOutcome {
+        let Some(mem) = self.walker_mem.as_ref() else {
+            return WalkerExecuteOutcome::NotImplemented;
+        };
+        let Some(params_va) = mem.params_va() else {
+            return WalkerExecuteOutcome::NotImplemented;
+        };
+        // R5-R2-1: the EXECUTE window also needs a provable liveness
+        // probe. A dead/unknown target fails closed BEFORE dispatch.
+        let Some(handle) = self.options.target_handle else {
+            self.execute_liveness = Some(LivenessProbe::Unknown);
+            return WalkerExecuteOutcome::NotImplemented;
+        };
+        let execute_liveness = probe_process_liveness(handle);
+        self.execute_liveness = Some(execute_liveness);
+        if execute_liveness != LivenessProbe::Alive {
+            return WalkerExecuteOutcome::NotImplemented;
+        }
+        let Some(bridge) = self.options.walker_dispatch.as_ref() else {
+            // R5-R2-4: no authorized target-side dispatch bridge.
+            return WalkerExecuteOutcome::NotImplemented;
+        };
+        let (raw_status, output) = bridge.dispatch(params_va);
+        if raw_status != mida_antidebug_runtime::walker_protocol::WALKER_STATUS_OK as i32 {
+            return WalkerExecuteOutcome::NonOk { raw_status };
+        }
+        match output {
+            Some(_att) => WalkerExecuteOutcome::Success,
+            None => WalkerExecuteOutcome::OutputMissing,
+        }
+    }
+
+    /// IMP-09-CARRIER-R5-R2-4: record one raw walker lifecycle event
+    /// (monotonic 1-based sequence). `walker_status_raw` is the raw i32
+    /// from the target-side dispatch (None for non-execute phases).
+    pub fn record_walker_event(&mut self, phase: &str, detail: Option<String>, raw: Option<i32>) {
+        let sequence = self.walker_events.len() as u32 + 1;
+        self.walker_events.push(WalkerRawEvent {
+            sequence,
+            phase: phase.to_string(),
+            detail,
+            walker_status_raw: raw,
+        });
+    }
+
+    /// Record the `terminate_enter` event. Called by the production
+    /// paths immediately before `terminate_and_wait()` so the monotonic
+    /// record proves bind/execute ran in the alive window (before any
+    /// termination).
+    pub fn record_terminate_enter(&mut self) {
+        self.record_walker_event("terminate_enter", None, None);
+    }
+
+    /// The monotonic raw walker event record (evidence).
+    pub fn walker_events(&self) -> &[WalkerRawEvent] {
+        &self.walker_events
+    }
+
+    /// The last candidate mapping proof set (evidence; kept on failure).
+    pub fn candidate_mapping(&self) -> Option<&CandidateMappingProofSet> {
+        self.candidate_mapping.as_ref()
+    }
+
+    /// The liveness probe from the bind window (evidence).
+    pub fn liveness_probe(&self) -> Option<LivenessProbe> {
+        self.liveness_probe
+    }
+
+    /// Build the walker evidence record (R5-R2-4): schema + liveness +
+    /// candidate mapping + monotonic raw events.
+    pub fn walker_evidence_record(&self, capture_phase: &str) -> WalkerEvidenceRecord {
+        WalkerEvidenceRecord {
+            schema: WALKER_EVIDENCE_SCHEMA.to_string(),
+            record_kind: "cli-walker".to_string(),
+            target_pid: Some(self.options.target_pid),
+            capture_phase: capture_phase.to_string(),
+            liveness_probe: self.liveness_probe.map(|p| p.as_str().to_string()),
+            execute_liveness: self.execute_liveness.map(|p| p.as_str().to_string()),
+            candidate_mapping: self.candidate_mapping.clone(),
+            events: self.walker_events.clone(),
+        }
     }
     /// IMP-09-CARRIER-R5-R1 P0-1: CSPRNG nonce for the walker session.
     /// Uses RtlGenRandom (SystemFunction036, advapi32) — the documented
@@ -746,11 +976,22 @@ impl AntidebugController {
     /// result so callers can record it in evidence.
     fn run_cleanup(&mut self) -> CleanupResult {
         // R1-HARDENING-CLEANUP-2: the production path injects the explicit
-        // cleanup report via set_cleanup_report() BEFORE run(). If a result
-        // is already recorded, reuse it and do NOT run a second independent
+        // cleanup report via set_cleanup_report(). If a result is already
+        // recorded, reuse it and do NOT run a second independent
         // termination backend (that produced duplicate cleanup in R4B).
         if let Some(existing) = &self.cleanup {
             return existing.clone();
+        }
+        // IMP-09-CARRIER-R5-R2-1: when the caller drives the debugger
+        // termination itself (CREATE_PROCESS + post-attach run the
+        // controller gate BEFORE terminate_and_wait, in the alive
+        // window), run() must NOT fire the termination backend — the
+        // backend would TerminateProcess the live target and then the
+        // caller's terminate_and_wait would mis-report cleanup. Deferred
+        // cleanup returns NotRun; the caller injects the real report via
+        // set_cleanup_report() immediately after terminate_and_wait.
+        if self.options.defer_cleanup_to_caller {
+            return CleanupResult::NotRun;
         }
         let Some(backend) = &self.options.cleanup_backend else {
             // No backend configured (pure test path): treat as not-run;
@@ -952,7 +1193,22 @@ impl AntidebugController {
             }
         }
 
-        // Drive the success path.
+        // R5-R2-4: the verified loader result is the first raw walker
+        // event of the monotonic production sequence.
+        self.record_walker_event(
+            "loader_complete",
+            Some(format!(
+                "target_pid={} module_base={:#x}",
+                loader.target_pid(),
+                loader.module_base()
+            )),
+            None,
+        );
+
+        // Drive the success path. ProceedApproved is deliberately NOT
+        // driven yet: R5-R2 gates Proceed on the walker bind + execute
+        // gates below (bind failure / execute non-OK / missing output
+        // MUST block Proceed).
         self.drive(ControllerEvent::ProfileValidated);
         self.drive(ControllerEvent::TargetIdentityValidated);
         self.drive(ControllerEvent::LaunchPrepared);
@@ -961,9 +1217,8 @@ impl AntidebugController {
         self.drive(ControllerEvent::HealthCheckStarted);
         self.drive(ControllerEvent::HealthCheckPassed);
         self.drive(ControllerEvent::ProbeSetPassed);
-        self.drive(ControllerEvent::ProceedApproved);
 
-        // IMP-09-CARRIER-R5-R1 P0-1: production walker bind.
+        // IMP-09-CARRIER-R5-R1 P0-1 / R5-R2: production walker bind.
         //
         // Real production caller: the controller lifecycle itself.
         // Every input comes from a sealed carrier:
@@ -972,11 +1227,38 @@ impl AntidebugController {
         //   - target/profile identities: launch attestation
         //   - walker_export_rva: pure-file resolver over verified runtime
         //   - candidates: derived from the VERIFIED runtime module base
-        //     (real mapped pages in the target)
+        //     (real mapped pages in the target), proven per-item BEFORE
+        //     install (VirtualQueryEx mapping proof)
         //   - result_nonce: CSPRNG (RtlGenRandom)
-        // Any carrier missing -> bind fails closed (stays NOT_WIRED,
-        // lifecycle UNBOUND); no magic values are ever substituted.
+        // Any carrier missing / proof failure / liveness unknown-or-dead
+        // -> bind fails closed (NOT_WIRED, UNBOUND); no magic values are
+        // ever substituted.
+        self.record_walker_event(
+            "bind_enter",
+            Some(format!(
+                "module_base={:#x} image_size={:#x}",
+                loader.module_base(),
+                loader.file_identity().verified_size_of_image()
+            )),
+            None,
+        );
         let walker_bound = self.bind_walker_from_loader_production();
+        self.record_walker_event(
+            "bind_exit",
+            Some(if walker_bound {
+                "WIRED".to_string()
+            } else {
+                format!(
+                    "NOT_WIRED liveness={:?} proof={}",
+                    self.liveness_probe,
+                    self.candidate_mapping
+                        .as_ref()
+                        .map(|p| p.all_passed)
+                        .unwrap_or(false)
+                )
+            }),
+            None,
+        );
         log::log(
             LogType::Info,
             &format!(
@@ -984,7 +1266,75 @@ impl AntidebugController {
                 if walker_bound { "WIRED" } else { "NOT_WIRED" }
             ),
         );
+        // R5-R2-3: bind failure MUST block Proceed (fail-closed).
+        if !walker_bound {
+            return AntidebugOutcome::Failed {
+                state: self.state,
+                fail_code: FailCode::AntiDebugRuntimeUnavailable,
+                message:
+                    "walker bind failed closed (liveness/mapping/install gate); Proceed blocked"
+                        .to_string(),
+            };
+        }
 
+        // IMP-09-CARRIER-R5-R2-4: production walker execute gate. The raw
+        // status is recorded verbatim; any non-OK status, missing output,
+        // or absent authorized dispatch bridge blocks Proceed.
+        self.record_walker_event(
+            "execute_enter",
+            Some("authorized target-side dispatch".to_string()),
+            None,
+        );
+        let execute_outcome = self.execute_walker_production();
+        let raw_status = match execute_outcome {
+            WalkerExecuteOutcome::Success => {
+                Some(mida_antidebug_runtime::walker_protocol::WALKER_STATUS_OK as i32)
+            }
+            WalkerExecuteOutcome::NonOk { raw_status } => Some(raw_status),
+            WalkerExecuteOutcome::NotImplemented | WalkerExecuteOutcome::OutputMissing => None,
+        };
+        self.record_walker_event(
+            "execute_exit",
+            Some(format!("outcome={execute_outcome:?}")),
+            raw_status,
+        );
+        log::log(
+            LogType::Info,
+            &format!("IMP-09: WALKER_EXECUTE={execute_outcome:?} (production dispatch gate)"),
+        );
+        match execute_outcome {
+            WalkerExecuteOutcome::Success => {}
+            WalkerExecuteOutcome::NotImplemented => {
+                // R5-R2-4: no authorized target-side dispatch bridge.
+                return AntidebugOutcome::Failed {
+                    state: self.state,
+                    fail_code: FailCode::AntiDebugRuntimeUnavailable,
+                    message: "walker execute NOT_IMPLEMENTED: no authorized target-side dispatch bridge; Proceed blocked"
+                        .to_string(),
+                };
+            }
+            WalkerExecuteOutcome::NonOk { raw_status } => {
+                return AntidebugOutcome::Failed {
+                    state: self.state,
+                    fail_code: FailCode::ProbeInconsistent,
+                    message: format!(
+                        "walker execute returned non-OK raw status {raw_status}; Proceed blocked"
+                    ),
+                };
+            }
+            WalkerExecuteOutcome::OutputMissing => {
+                return AntidebugOutcome::Failed {
+                    state: self.state,
+                    fail_code: FailCode::ProbeInconsistent,
+                    message:
+                        "walker execute returned OK but output channel was empty; Proceed blocked"
+                            .to_string(),
+                };
+            }
+        }
+
+        // All walker gates passed: approve Proceed.
+        self.drive(ControllerEvent::ProceedApproved);
         if self.state.is_proceed() {
             AntidebugOutcome::Proceed {
                 final_state: self.state,
@@ -1092,8 +1442,32 @@ impl AntidebugController {
                 .capture_receipt
                 .as_ref()
                 .and_then(|r| r.context_capture_error.clone()),
+            walker_events: self.walker_events.clone(),
+            candidate_mapping: self.candidate_mapping.clone(),
+            liveness_probe: self.liveness_probe.map(|p| p.as_str().to_string()),
         })
     }
+}
+
+/// Write the walker evidence sidecar (atomic: write temp + rename).
+///
+/// R5-R2-4: the production paths write this after the controller gate —
+/// after recording `terminate_enter` — so the file carries the full
+/// monotonic raw event sequence (loader_complete, bind_enter, bind_exit,
+/// execute_enter, execute_exit, terminate_enter) plus the liveness probe
+/// and the per-candidate mapping proof. Fail-closed on write error.
+pub fn write_walker_evidence(
+    record: &WalkerEvidenceRecord,
+    dir: &Path,
+) -> Result<std::path::PathBuf, anyhow::Error> {
+    let dir = dir.to_path_buf();
+    std::fs::create_dir_all(&dir)?;
+    let json = serde_json::to_string_pretty(record)?;
+    let tmp = dir.join("mida_antidebug_walker.evidence.json.tmp");
+    let final_path = dir.join("mida_antidebug_walker.evidence.json");
+    std::fs::write(&tmp, json)?;
+    std::fs::rename(&tmp, &final_path)?;
+    Ok(final_path)
 }
 
 /// Write the failure evidence sidecar (atomic: write temp + rename).
@@ -1177,6 +1551,14 @@ pub fn write_observation_only_evidence(
 #[cfg(test)]
 mod tests {
 
+    /// Serializes tests that touch the process-global walker runtime
+    /// singletons (the runtime walker session is process-global, so only
+    /// one install/bind test may hold the lifecycle at a time; the
+    /// walker_session tests use their own INSTALL_LOCK, and the cargo
+    /// test harness runs tests in parallel — the controller R5-R2 gate
+    /// tests take this lock to avoid cross-test singleton interference).
+    static WALKER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn self_handle() -> windows::Win32::Foundation::HANDLE {
         unsafe { windows::Win32::System::Threading::GetCurrentProcess() }
     }
@@ -1216,6 +1598,8 @@ mod tests {
             loader_result: None,
             target_identity: None,
             profile_identity: None,
+            walker_dispatch: None,
+            defer_cleanup_to_caller: false,
         }
     }
 
@@ -1348,6 +1732,9 @@ mod tests {
             faulting_module_base: None,
             faulting_module_rva: None,
             context_capture_error: None,
+            walker_events: vec![],
+            candidate_mapping: None,
+            liveness_probe: None,
         };
         let p = write_failure_evidence(&ev, &temp).unwrap();
         assert!(p.exists());
@@ -1395,6 +1782,9 @@ mod tests {
             faulting_module_base: None,
             faulting_module_rva: None,
             context_capture_error: None,
+            walker_events: vec![],
+            candidate_mapping: None,
+            liveness_probe: None,
         };
         // blocker is a file: create_dir_all fails -> Err
         let r = write_failure_evidence(&ev, &blocker);
@@ -1421,6 +1811,8 @@ mod tests {
             target_identity: None,
             profile_identity: None,
             loader_result: None,
+            walker_dispatch: None,
+            defer_cleanup_to_caller: false,
         });
         let outcome = c.run();
         // Oracle mode still fails closed: no runtime, no proceed.
@@ -1442,6 +1834,8 @@ mod tests {
             target_identity: None,
             profile_identity: None,
             loader_result: None,
+            walker_dispatch: None,
+            defer_cleanup_to_caller: false,
         });
         assert_eq!(
             c.fail_code_of_state(ControllerState::DependencyUnavailable),
@@ -1503,6 +1897,17 @@ mod tests {
         b[0x80..0x84].copy_from_slice(b"PE\0\0");
         b[0x84..0x86].copy_from_slice(&0x8664u16.to_le_bytes()); // AMD64
         b[0x98..0x9A].copy_from_slice(&0x20Bu16.to_le_bytes()); // PE32+
+        b
+    }
+
+    /// Synthetic x64 PE with a real SizeOfImage (0x4000) so the R5-R2
+    /// image-envelope gate can be exercised: verified_size_of_image()
+    /// derives 0x4000 from these bytes (never a live-process header).
+    fn r5r2_pe_with_image_size() -> Vec<u8> {
+        let mut b = minimal_pe();
+        b.resize(0x1000, 0);
+        // SizeOfImage at optional+0x50 = 0x80+0x18+0x50 = 0xE8
+        b[0xE8..0xEC].copy_from_slice(&0x4000u32.to_le_bytes());
         b
     }
 
@@ -1595,28 +2000,41 @@ mod tests {
             target_identity: None,
             profile_identity: None,
             loader_result: loader,
+            walker_dispatch: None,
+            defer_cleanup_to_caller: false,
         })
     }
 
     #[test]
     fn imp06_controller_proceeds_with_valid_loader_result() {
+        // IMP-06 baseline: a valid loader result drives the lifecycle to
+        // ProbeSetPassed. IMP-09-CARRIER-R5-R2 then adds the walker gates:
+        // without a target handle / walker carrier / dispatch bridge the
+        // production bind fails closed and Proceed is BLOCKED — this is the
+        // R5-R2 fail-closed contract, not an IMP-06 regression.
         let mut c = controller_with_loader_result(Some(loader_result_with(
             1234,
             default_attestation_json(),
         )));
         let outcome = c.run();
-        match &outcome {
-            AntidebugOutcome::Failed {
-                state,
-                fail_code,
-                message,
-            } => panic!(
-                "expected Proceed, got Failed state={state:?} code={} msg={message}",
-                fail_code.as_str()
-            ),
-            _ => {}
-        }
-        assert!(matches!(outcome, AntidebugOutcome::Proceed { .. }));
+        assert!(
+            matches!(outcome, AntidebugOutcome::Failed { .. }),
+            "R5-R2: missing walker carrier must fail closed, got {outcome:?}"
+        );
+        assert!(!c.state().is_proceed());
+        // The raw event record proves the gate was reached and stopped at
+        // the bind: loader_complete, bind_enter, bind_exit (NOT_WIRED).
+        let phases: Vec<&str> = c.walker_events().iter().map(|e| e.phase.as_str()).collect();
+        assert_eq!(
+            phases,
+            vec!["loader_complete", "bind_enter", "bind_exit"],
+            "expected bind fail-closed sequence, got {phases:?}"
+        );
+        assert!(c.walker_events()[2]
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("NOT_WIRED"));
     }
 
     #[test]
@@ -1675,18 +2093,25 @@ mod tests {
             loader_result: loader,
             target_identity: target,
             profile_identity: None,
+            walker_dispatch: None,
+            defer_cleanup_to_caller: false,
         })
     }
 
     /// LoaderResult with a REAL walker export RVA carrier (0x2040) and
     /// the given module base, built from a verified file identity.
     fn loader_with_walker_rva(target_pid: u32, module_base: u64) -> LoaderResult {
-        let content = minimal_pe();
+        // IMP-09-CARRIER-R5-R2: the verified identity must carry a REAL
+        // SizeOfImage envelope (0x4000) so the image-envelope gate can be
+        // exercised; minimal_pe() has NO SizeOfImage and would fail closed
+        // by design. The identity still comes ONLY from verify_file().
+        let content = r5r2_pe_with_image_size();
         let _ = std::fs::create_dir_all(std::env::temp_dir().join("mida-adr6-test"));
         let p = next_file("lr_walker");
         std::fs::write(&p, &content).unwrap();
         let authority = manifest(&sha256_hex(&content), content.len() as u64);
         let identity = authority.verify_file(&p).unwrap();
+        assert_eq!(identity.verified_size_of_image(), 0x4000);
         let digest_authority =
             RuntimeDigestAuthority::from_verified_identity(&identity, &authority.artifact_id)
                 .expect("verified identity must build authority");
@@ -1700,16 +2125,48 @@ mod tests {
         )
     }
 
+    /// Reserve a real committed region in the CURRENT process and return
+    /// (base, guard). The guard frees it on drop. Used so the R5-R2
+    /// mapping proof sees real MEM_COMMIT pages (never a fake VA).
+    struct MappedRegionGuard {
+        base: u64,
+    }
+    impl Drop for MappedRegionGuard {
+        fn drop(&mut self) {
+            use windows::Win32::System::Memory::{VirtualFree, MEM_RELEASE};
+            unsafe {
+                let _ = VirtualFree(self.base as *mut core::ffi::c_void, 0, MEM_RELEASE);
+            }
+        }
+    }
+    fn alloc_mapped_region(size: usize) -> MappedRegionGuard {
+        use windows::Win32::System::Memory::{
+            VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE,
+        };
+        let p = unsafe { VirtualAlloc(None, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) };
+        assert!(!p.is_null(), "VirtualAlloc failed");
+        MappedRegionGuard { base: p as u64 }
+    }
+
     /// Controller with ALL sealed carriers + a real target handle.
     /// target_pid must match the running process for the provider bind
     /// to succeed (engineering runtime: own process).
-    fn controller_with_full_carriers(target_pid: u32) -> AntidebugController {
-        let content = minimal_pe();
+    ///
+    /// R5-R2: module_base is a REAL committed 0x4000-byte region in this
+    /// process (VirtualAlloc), and the verified identity carries
+    /// SizeOfImage=0x4000, so the mapping proof passes: candidates
+    /// base..base+0x3000 are committed, in-envelope, readable.
+    /// Returns (controller, region guard) — the caller MUST keep the
+    /// guard alive while the controller runs.
+    fn controller_with_full_carriers(target_pid: u32) -> (AntidebugController, MappedRegionGuard) {
+        let content = r5r2_pe_with_image_size();
         let _ = std::fs::create_dir_all(std::env::temp_dir().join("mida-adr6-test"));
         let p = next_file("full");
         std::fs::write(&p, &content).unwrap();
         let authority = manifest(&sha256_hex(&content), content.len() as u64);
-        let mut c = AntidebugController::new(AntidebugStageOptions {
+        let region = alloc_mapped_region(0x4000);
+        let base = region.base;
+        let c = AntidebugController::new(AntidebugStageOptions {
             target_handle: Some(self_handle()), // real process handle
             sample_id: Some("origin_macro".to_string()),
             target_pid,
@@ -1718,17 +2175,19 @@ mod tests {
             cleanup_backend: None,
             runtime_authority: Some(authority),
             runtime_path: Some(p),
-            loader_result: Some(loader_with_walker_rva(target_pid, 0x7FF600000000)),
+            loader_result: Some(loader_with_walker_rva(target_pid, base)),
             target_identity: Some(test_target_identity(
                 "origin_macro",
                 &"ab12".repeat(16),
                 4096,
             )),
             profile_identity: Some(test_profile_identity("origin_macro", "x86_64")),
+            walker_dispatch: None,
+            defer_cleanup_to_caller: false,
         });
         // target digest must NOT equal runtime digest: the test sha is
-        // distinct from the runtime file digest (minimal_pe).
-        c
+        // distinct from the runtime file digest (r5r2_pe_with_image_size).
+        (c, region)
     }
     #[test]
     fn imp09_verified_target_identity_reaches_controller() {
@@ -1883,6 +2342,8 @@ mod tests {
             target_identity: None,
             profile_identity: None,
             loader_result: Some(loader_result_with(1234, default_attestation_json())),
+            walker_dispatch: None,
+            defer_cleanup_to_caller: false,
         });
         let outcome = c.run();
         assert!(matches!(outcome, AntidebugOutcome::Failed { .. }));
@@ -1945,6 +2406,8 @@ mod tests {
                 4096,
             )),
             profile_identity: Some(profile.clone()),
+            walker_dispatch: None,
+            defer_cleanup_to_caller: false,
         });
         let mut c2 = AntidebugController::new(AntidebugStageOptions {
             target_handle: None, // tests: no live target
@@ -1962,6 +2425,8 @@ mod tests {
                 4096,
             )),
             profile_identity: Some(profile.clone()),
+            walker_dispatch: None,
+            defer_cleanup_to_caller: false,
         });
         assert_eq!(c1.verified_profile_id(), c2.verified_profile_id());
         assert_eq!(c1.verified_profile_digest(), c2.verified_profile_digest());
@@ -1978,16 +2443,45 @@ mod tests {
         // P0-1: run() is the REAL production caller. With all sealed
         // carriers + a valid target handle (own process, engineering
         // runtime) the walker session reaches READY: WALKER_BINDING=WIRED.
+        let _walker_guard = WALKER_TEST_LOCK.lock().unwrap();
         mida_antidebug_runtime::exports::reset_walker_bindings();
-        let mut c = controller_with_full_carriers(std::process::id());
+        let (mut c, _region) = controller_with_full_carriers(std::process::id());
+        // R5-R2-4: with NO authorized dispatch bridge the execute gate
+        // records NOT_IMPLEMENTED and Proceed is BLOCKED (fail-closed).
         let outcome = c.run();
         assert!(
-            matches!(outcome, AntidebugOutcome::Proceed { .. }),
-            "full carriers must reach Proceed, got {outcome:?}"
+            matches!(outcome, AntidebugOutcome::Failed { .. }),
+            "R5-R2 without dispatch bridge must fail closed, got {outcome:?}"
         );
-        // The bind ran inside run(): walker_mem was held and released by
-        // the RAII teardown guard at exit (nothing remains).
+        assert!(!c.state().is_proceed());
+        // The bind DID run inside run() (liveness + mapping proved, session
+        // installed): walker_mem was held and released by the RAII teardown
+        // guard at exit (nothing remains).
         assert!(c.walker_mem.is_none(), "teardown guard must free session");
+        // The raw event sequence proves the alive window: loader_complete,
+        // bind_enter, bind_exit (WIRED), execute_enter, execute_exit
+        // (NOT_IMPLEMENTED) — no terminate_enter (that is recorded by the
+        // production path, not run()).
+        let phases: Vec<&str> = c.walker_events().iter().map(|e| e.phase.as_str()).collect();
+        assert_eq!(
+            phases,
+            vec![
+                "loader_complete",
+                "bind_enter",
+                "bind_exit",
+                "execute_enter",
+                "execute_exit"
+            ],
+            "monotonic raw event sequence mismatch: {phases:?}"
+        );
+        // bind_exit must report WIRED: the session reached READY before
+        // the execute gate.
+        assert_eq!(c.walker_events()[2].detail.as_deref(), Some("WIRED"));
+        // Liveness + mapping proof were recorded for evidence.
+        assert_eq!(c.liveness_probe(), Some(LivenessProbe::Alive));
+        let proof = c.candidate_mapping().expect("mapping proof recorded");
+        assert!(proof.all_passed);
+        assert_eq!(proof.items.len(), 4);
         // A second bind is possible: lifecycle was left UNBOUND by the
         // guard's release (bindings reset only in tests; the guard frees
         // memory but the runtime lifecycle may be terminal — check the
@@ -1997,10 +2491,11 @@ mod tests {
 
     #[test]
     fn imp09_r5r1_run_bind_fails_closed_without_target_handle() {
-        // P0-1: missing target handle -> bind refuses -> NOT_WIRED;
-        // lifecycle still reaches Proceed (walker is not a blocker).
+        // R5-R2-1/2/3: missing target handle -> liveness Unknown -> bind
+        // refuses -> NOT_WIRED -> Proceed is BLOCKED (fail-closed).
+        let _walker_guard = WALKER_TEST_LOCK.lock().unwrap();
         mida_antidebug_runtime::exports::reset_walker_bindings();
-        let content = minimal_pe();
+        let content = r5r2_pe_with_image_size();
         let _ = std::fs::create_dir_all(std::env::temp_dir().join("mida-adr6-test"));
         let p = next_file("nohandle");
         std::fs::write(&p, &content).unwrap();
@@ -2021,10 +2516,221 @@ mod tests {
                 4096,
             )),
             profile_identity: Some(test_profile_identity("origin_macro", "x86_64")),
+            walker_dispatch: None,
+            defer_cleanup_to_caller: false,
         });
         let outcome = c.run();
-        assert!(matches!(outcome, AntidebugOutcome::Proceed { .. }));
+        assert!(
+            matches!(outcome, AntidebugOutcome::Failed { .. }),
+            "missing target handle must fail closed, got {outcome:?}"
+        );
+        assert!(!c.state().is_proceed());
         assert!(c.walker_mem.is_none());
+        // Liveness was recorded as Unknown (fail-closed) + bind_exit
+        // NOT_WIRED with liveness=Unknown in the detail.
+        assert_eq!(c.liveness_probe(), Some(LivenessProbe::Unknown));
+        let phases: Vec<&str> = c.walker_events().iter().map(|e| e.phase.as_str()).collect();
+        assert_eq!(
+            phases,
+            vec!["loader_complete", "bind_enter", "bind_exit"],
+            "expected bind fail-closed sequence, got {phases:?}"
+        );
+        assert!(c.walker_events()[2]
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("NOT_WIRED"));
         mida_antidebug_runtime::exports::reset_walker_bindings();
+    }
+
+    // ---------- IMP-09-CARRIER-R5-R2: walker execute gate ----------
+
+    /// Mock authorized dispatch bridge (offline gate tests only; a mock
+    /// is never a live Windows PASS).
+    #[derive(Debug)]
+    struct TestDispatchBridge {
+        status: i32,
+        output: bool,
+    }
+    impl WalkerDispatchBridge for TestDispatchBridge {
+        fn dispatch(
+            &self,
+            _params_va: u64,
+        ) -> (
+            i32,
+            Option<mida_antidebug_runtime::attestation::RuntimeAttestationV2>,
+        ) {
+            if self.output {
+                (self.status, Some(mock_attestation_v2()))
+            } else {
+                (self.status, None)
+            }
+        }
+    }
+
+    fn mock_attestation_v2() -> mida_antidebug_runtime::attestation::RuntimeAttestationV2 {
+        mida_antidebug_runtime::attestation::RuntimeAttestationV2 {
+            schema: "mida.antidebug-runtime-attestation/v2".to_string(),
+            schema_version: 2,
+            runtime_id: "mida-antidebug-runtime-x64".to_string(),
+            runtime_version: "0.1.0".to_string(),
+            architecture: "x86_64".to_string(),
+            runtime_sha256: "ab".repeat(32),
+            profile_id: "oreans_origin_x64_v1".to_string(),
+            profile_digest: "cd".repeat(32),
+            target_pid: std::process::id(),
+            module_base: 0x7000,
+            initialized: true,
+            hooks_expected: vec!["AD-PROC-002".to_string()],
+            hooks_installed: vec!["AD-PROC-002".to_string()],
+            hook_failures: vec![],
+            surface_details: vec![],
+            telemetry_channel: "ready".to_string(),
+            cleanup_handler_registered: true,
+            third_party: "test".to_string(),
+            source_revision: "test".to_string(),
+            toolchain: "rustc".to_string(),
+            walker_attestation: None,
+            record_digest: "aa".repeat(32),
+        }
+    }
+
+    #[test]
+    fn imp09_r5r2_execute_gate_ok_with_bridge_reaches_proceed() {
+        let _walker_guard = WALKER_TEST_LOCK.lock().unwrap();
+        mida_antidebug_runtime::exports::reset_walker_bindings();
+        let (mut c, _region) = controller_with_full_carriers(std::process::id());
+        c.options.walker_dispatch = Some(Box::new(TestDispatchBridge {
+            status: 0,
+            output: true,
+        }));
+        let outcome = c.run();
+        assert!(
+            matches!(outcome, AntidebugOutcome::Proceed { .. }),
+            "authorized bridge OK + output must reach Proceed, got {outcome:?}"
+        );
+        let phases: Vec<&str> = c.walker_events().iter().map(|e| e.phase.as_str()).collect();
+        assert_eq!(
+            phases,
+            vec![
+                "loader_complete",
+                "bind_enter",
+                "bind_exit",
+                "execute_enter",
+                "execute_exit"
+            ],
+            "sequence mismatch: {phases:?}"
+        );
+        assert_eq!(c.walker_events()[4].walker_status_raw, Some(0));
+        mida_antidebug_runtime::exports::reset_walker_bindings();
+    }
+
+    #[test]
+    fn imp09_r5r2_execute_gate_non_ok_status_blocks_proceed() {
+        let _walker_guard = WALKER_TEST_LOCK.lock().unwrap();
+        mida_antidebug_runtime::exports::reset_walker_bindings();
+        let (mut c, _region) = controller_with_full_carriers(std::process::id());
+        c.options.walker_dispatch = Some(Box::new(TestDispatchBridge {
+            status: 2,
+            output: true,
+        }));
+        let outcome = c.run();
+        assert!(
+            matches!(outcome, AntidebugOutcome::Failed { .. }),
+            "non-OK raw status must fail closed, got {outcome:?}"
+        );
+        assert!(!c.state().is_proceed());
+        let last = c.walker_events().last().unwrap();
+        assert_eq!(last.phase, "execute_exit");
+        assert_eq!(last.walker_status_raw, Some(2));
+        mida_antidebug_runtime::exports::reset_walker_bindings();
+    }
+
+    #[test]
+    fn imp09_r5r2_execute_gate_missing_output_blocks_proceed() {
+        let _walker_guard = WALKER_TEST_LOCK.lock().unwrap();
+        mida_antidebug_runtime::exports::reset_walker_bindings();
+        let (mut c, _region) = controller_with_full_carriers(std::process::id());
+        c.options.walker_dispatch = Some(Box::new(TestDispatchBridge {
+            status: 0,
+            output: false,
+        }));
+        let outcome = c.run();
+        assert!(
+            matches!(outcome, AntidebugOutcome::Failed { .. }),
+            "OK status without output must fail closed, got {outcome:?}"
+        );
+        assert!(!c.state().is_proceed());
+        mida_antidebug_runtime::exports::reset_walker_bindings();
+    }
+
+    #[test]
+    fn imp09_r5r2_no_bridge_records_not_implemented_raw() {
+        let _walker_guard = WALKER_TEST_LOCK.lock().unwrap();
+        mida_antidebug_runtime::exports::reset_walker_bindings();
+        let (mut c, _region) = controller_with_full_carriers(std::process::id());
+        let outcome = c.run();
+        assert!(matches!(outcome, AntidebugOutcome::Failed { .. }));
+        let last = c.walker_events().last().unwrap();
+        assert_eq!(last.phase, "execute_exit");
+        assert_eq!(last.walker_status_raw, None);
+        assert!(last.detail.as_deref().unwrap().contains("NotImplemented"));
+        mida_antidebug_runtime::exports::reset_walker_bindings();
+    }
+
+    #[test]
+    fn imp09_r5r2_walker_evidence_record_roundtrips() {
+        let _walker_guard = WALKER_TEST_LOCK.lock().unwrap();
+        mida_antidebug_runtime::exports::reset_walker_bindings();
+        let (mut c, _region) = controller_with_full_carriers(std::process::id());
+        c.options.walker_dispatch = Some(Box::new(TestDispatchBridge {
+            status: 0,
+            output: true,
+        }));
+        let _ = c.run();
+        c.record_terminate_enter();
+        let rec = c.walker_evidence_record("create_process");
+        assert_eq!(rec.schema, WALKER_EVIDENCE_SCHEMA);
+        assert_eq!(rec.events.len(), 6);
+        assert_eq!(rec.events[0].phase, "loader_complete");
+        assert_eq!(rec.events[5].phase, "terminate_enter");
+        for (i, e) in rec.events.iter().enumerate() {
+            assert_eq!(e.sequence as usize, i + 1, "monotonic sequence");
+        }
+        assert_eq!(rec.liveness_probe.as_deref(), Some("alive"));
+        let proof = rec.candidate_mapping.as_ref().expect("proof recorded");
+        assert!(proof.all_passed);
+        let json = serde_json::to_string_pretty(&rec).unwrap();
+        let back: WalkerEvidenceRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.events.len(), 6);
+        mida_antidebug_runtime::exports::reset_walker_bindings();
+    }
+
+    #[test]
+    fn imp09_r5r2_write_walker_evidence_atomic_roundtrip() {
+        let temp = std::env::temp_dir().join("mida-r5r2-walker-evidence");
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let rec = WalkerEvidenceRecord {
+            schema: WALKER_EVIDENCE_SCHEMA.to_string(),
+            record_kind: "cli-walker".to_string(),
+            target_pid: Some(1),
+            capture_phase: "post_attach".to_string(),
+            liveness_probe: Some("alive".to_string()),
+            execute_liveness: Some("alive".to_string()),
+            candidate_mapping: None,
+            events: vec![WalkerRawEvent {
+                sequence: 1,
+                phase: "terminate_enter".to_string(),
+                detail: None,
+                walker_status_raw: None,
+            }],
+        };
+        let p = write_walker_evidence(&rec, &temp).unwrap();
+        assert!(p.is_file());
+        let back: WalkerEvidenceRecord =
+            serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(back.events[0].phase, "terminate_enter");
+        let _ = std::fs::remove_dir_all(&temp);
     }
 }
