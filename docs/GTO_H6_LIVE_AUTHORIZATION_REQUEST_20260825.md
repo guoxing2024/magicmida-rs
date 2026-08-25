@@ -59,7 +59,12 @@ IMP-09 walker/V2 runtime 链已具备:
 ## 五、签发栏
 
 ```
-owner 签名/日期: ________________
-生效条件: 第三节前置条件逐项打勾后由 owner 书面放行
-账本: GTO-H6-LIVE · Round 0 · used=0/2
+owner 签名/日期: owner (chat 授权) 2026-08-25
+生效条件: 第三节前置条件逐项打勾后由 owner 书面放行 —— 已满足（6/6，见 §三）
+账本: GTO-H6-LIVE · Round 0 · used=0/2 → **SIGNED, Round 1 开放**
 ```
+
+> **签署记录**：owner 于 2026-08-25 在 Hermes 会话中书面指示
+> "签署 docs/GTO_H6_LIVE_AUTHORIZATION_REQUEST_20260825.md（第五节签发栏）"，
+> 视为 §五 生效所需的书面放行。总审计据此可起草 GTO-H6-LIVE-1 执行工单。
+> 约束不变：attempt ≤2、FAIL 记账不重试超限、崩现场按 DIAGNOSTIC class 处理。
