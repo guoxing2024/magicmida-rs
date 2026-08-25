@@ -1,5 +1,7 @@
 # git status --porcelain=v1 --untracked-files=all (C3 baseline capture)
-# tracked_changes=0 untracked_entries=56
+# tracked_changes=0 untracked_entries=56 (capture-time baseline, taken BEFORE C3 artifact files were created;
+# the list therefore does not include itself. After the C3 commit, live untracked = 55 = 56 - 1
+# (this list file moved to tracked).)
 .serena/.gitignore
 .serena/project.yml
 WORK_ORDERS_BATCH_14_20260822.md
