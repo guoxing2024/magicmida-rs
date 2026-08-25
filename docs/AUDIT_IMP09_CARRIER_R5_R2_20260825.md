@@ -172,7 +172,7 @@ liveness_probe="unknown" — Outcome: FAILED (AntiDebugRuntimeUnavailable). Proc
 
 ```text
 BASE HEAD: 9cd2e4dffa9c8de3031c78bf8d670688afdd7c78 (IMP-09-CARRIER-R5-R1)
-CORRECTION HEAD: branch codex/imp09-carrier-r5-r2, commit titled 'IMP-09-CARRIER-R5-R2-CORRECTION' (hash: 0d25260fe296d42e9fdbb44da00e106aaf8243a0)
+CORRECTION HEAD: 7c0dc8decce897a9a11cce9e1856831dc6e27ca6 (IMP-09-CARRIER-R5-R2-CORRECTION)
 toolchain: 1.97.1-x86_64-pc-windows-msvc (rust-toolchain.toml pin)
 
 $ export PATH='/c/Program Files/Microsoft Visual Studio/2022/Professional/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64':$PATH
