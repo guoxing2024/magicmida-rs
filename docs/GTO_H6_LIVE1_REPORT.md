@@ -1,69 +1,86 @@
-# GTO-H6-LIVE-1 — 执行报告（attempt_002）
+# GTO-H6-LIVE-1 — 执行报告（终版，attempt_002 实弹）
 
-**签发依据**: WORK_ORDER_GTO-H6-LIVE-1_20260825.md（基于 GTO-H6-LIVE-AUTHORIZATION-1，commit e7767d7，owner 已签署）
-**执行**: 唯一 worker · 2026-08-25/26 会话
-**基线 HEAD**: a9e310f0094cc68cff3d0ec367f7877f01e1409a（分支 codex/imp09-carrier-r5-r2，tracked 改动为零）
-**账本**: GTO-H6-LIVE · used=1/2（attempt_001 已消耗，attempt_002 **未消耗**）
-**状态**: **NOT EXECUTED — BLOCKING STRUCTURAL GAP（结构性硬冲突，按工单 §"遇到无法满足的判据停下来报告冲突，不要猜"停止）**
+**签发依据**: WORK_ORDER_GTO-H6-LIVE-1-R2_20260826.md（基于 GTO-H6-LIVE-AUTHORIZATION-1，commit e7767d7，owner 已签署）
+**取代**: 上一版 NOT_EXECUTED 冲突报告（commit ba6ab40 归档）
+**执行**: 唯一 worker · 2026-08-26
+**基线 HEAD**: c8acd77（WIRING-2 sealed exports carrier channel，audited PROVEN；R2 工单在 fccf032 提交，实弹基线按工单 §1 为 c8acd77）
+**构建**: cargo build -p mida-cli --features gto-product-recovery（SHA 9df90ecfa28710dbce50f8c2c4740a572694a9e8d859d16cc87534f4ca9d9031 锚定入 build attestation）
+**账本**: GTO-H6-LIVE · used=2/2（**已收口**；后续任何实弹需新授权书）
+**状态**: **LIVE-FAIL — STRUCTURAL_PRECONDITION_MISSING（child 实弹运行 828ms 后在 runtime 注入前置 fail-closed，dispatch 未发生）**
 
 ---
 
 ## 1. 结论（一句话）
 
-**attempt_002 未执行**：在当前基线 a9e310f 上，生产 walker dispatch 桥接**根本没有接入生产路径**（两处 AntidebugStageOptions 构造点均传 `walker_dispatch: None`），控制器 execute 门必然返回 NotImplemented，工单步⑥"dispatch 实弹"**无法到达**；接线属于代码语义修改，attempt_002 仅允许参数级修正，故按护栏停止并报告冲突。
+**attempt_002 已实弹消耗（spawned=true, exit_code=1）**：gate 正确打开（NO_BYPASS=1 + LIVE_DISPATCH=1 同窗口）、preflight 全过（build attestation / capture policy / env contract / revision_match）、vault 样本正确创建进程（PID 1360）；但 post-attach runtime loader 在 pre-resume 前 fail-closed——**profile carrier 缺失（unpack argv 无 --preflight-dir → evidence_ctx=None → profile_identity=None）**，随后 **runtime DLL 不可达（MIDA_RUNTIME_AUTHORITY_DIGEST 编译时为空 + MIDA_RUNTIME_AUTHORITY/MIDA_RUNTIME_DLL env 未提供）**。步④ runtime 注入未完成 → LoaderResult 未产生 → 步④断言（walker_exports().is_some()）不可评估 → 步⑥ dispatch **未发生**（桥从未构造）。按原工单 §3 "任何步失败 → LIVE-FAIL + DIAGNOSTIC 归档"，判定 **LIVE-FAIL**。
 
-## 2. 冲突事实链（全部已核实，非猜测）
+## 2. 执行事实链（全部已核实，非猜测）
 
-| # | 事实 | 证据位置 |
+| # | 事实 | 证据位 |
 |---|---|---|
-| 1 | 生产桥接实现存在（`WalkerDispatchBridgeImpl`，T1-T12 离线测试全绿） | `crates/cli/src/unpacker/walker_dispatch.rs`（commit 9b05abc） |
-| 2 | 但两处生产构造点均传 `walker_dispatch: None` | `crates/cli/src/unpacker/mod.rs` ~L791（CREATE_PROCESS 路径）、~L1227（post-attach 路径） |
-| 3 | 控制器 execute 门：`options.walker_dispatch` 为 None → `WalkerExecuteOutcome::NotImplemented` → Proceed 被阻（fail-closed） | `crates/cli/src/unpacker/antidebug_controller.rs` `execute_walker_production()` |
-| 4 | 设计文档明确承认此状态："NOT wired into any production path… walker_dispatch: None… NOT_IMPLEMENTED (fail-closed)… Live dispatch authorization is deferred to the LIVE order" | `docs/IMP09_DISPATCH_BRIDGE_DESIGN_20260825.md` |
-| 5 | `MIDA_GTO_LIVE_AUTHORIZED=1` 在全部 crates/、docs/、tools/ 中**无任何代码读取点**（grep 仅命中工单文本自身）——即使设置该变量也无法解锁 dispatch | grep 结果 |
-| 6 | attempt_001 是在 `MIDA_GTO_OBSERVATION_ONLY=1`（观察模式，无 runtime 注入、无 walker、无 dispatch）下运行的，其日志明确打印 "GTO-OBSERVATION-ONLY: runtime injection SKIPPED" → 它**从未到达步⑥** | `evidence_staging/H6_LIVE1_R1/attempt_001/child.stderr.txt` |
-| 7 | loader 能力（runtime 注入、远程 exports 解析 `resolve_mida_exports_remote`、纯文件 export RVA）**全部存在**；唯一缺口是桥接的生产接线（一行 `Some(bridge)`） | `crates/cli/src/unpacker/runtime_loader.rs` |
+| 1 | preflight 步①: resolve_gto_source_revision revision_match=true（authorized_vault 模式，vault 对象验证通过，SHA 11473d2e…） | `attempt_002/resolved_source.json` |
+| 2 | 构建认证: mida-cli --features gto-product-recovery 构建成功，SHA 锚定 build attestation（baseline_commit=c8acd77），controller W0-D 校验 ok | `evidence_staging/H6_LIVE1_R1/gto_cli_build_attestation.json` + `attempt_002/controller_run.json` build_capability_preflight.ok=true |
+| 3 | 授权窗口: MIDA_GTO_NO_BYPASS=1 且 MIDA_GTO_LIVE_DISPATCH=1 同一 driver 进程设置，child 通过 allowlist 获得（effective_env_contract.ok=true, no_bypass_verified=true）；MIDA_GTO_OBSERVATION_ONLY **未设置**（正确，非观察模式） | `attempt_002/controller_run.json` effective_env_contract + auth_window.json |
+| 4 | AUTH_CLEARED: 两变量在 child 退出后立即从 driver 进程清除（no_bypass_after=<unset>, live_dispatch_after=<unset>），双清除证据落盘 | `attempt_002/auth_window.json` |
+| 5 | 样本正确创建（PID 1360, image_base 0x140000000, .text section → text_is_plain_for_attach=true → post-attach 路径） | `attempt_002/child.stderr.txt` |
+| 6 | **fail-closed 点 1**: post-attach runtime loader (pre-resume) failed: verified profile carrier unavailable: no attested profile identity | 同上 |
+| 7 | **fail-closed 点 2**: anti-debug controller failure: DependencyUnavailable (AntiDebugRuntimeUnavailable): mida-antidebug-runtime-x64.dll not found | 同上 |
+| 8 | 目标终止干净（terminate_and_wait: ownership=OwnedPostAttach, terminate=ok, wait=signaled），无残留进程 | 同上 |
+| 9 | dispatch 步⑥: **未发生**（loader 未完成 → LoaderResult 未产生 → post-attach 构造点无法取到 walker_exports → 桥未构造 → execute gate 未达） | `attempt_002/child.stderr.txt`（无任何 dispatch 日志） |
+| 10 | 120s 上限未触碰（elapsed=828ms），无超时 kill | `attempt_002/controller_run.json` timed_out=false |
 
 ## 3. 工单 §3 判据对照表（二值）
 
 | 判据 | 要求 | 实际 | 判定 |
 |---|---|---|---|
-| LIVE-PASS | 步⑥ raw status==0 且 步⑦ 两轮 DONE + digest MATCH 且 步⑧ Released+账本空 | **无法到达步⑥**（execute 门 NotImplemented） | **NOT EVALUATED** |
-| LIVE-FAIL | 执行 attempt 后目标退出/异常 → DIAGNOSTIC 归档 + used+1 | **未执行 attempt**（无子进程、无崩溃现场） | **NOT DECLARED** |
-| 账本收口 | used=2/2 | used=1/2（attempt_002 未消耗） | **未收口（冲突暂停）** |
-| 出口门 OREANS_GATE_RECHECK | 17/17 | **未跑**（无执行活动，无需复验；按实弹后必跑） | **NOT RUN** |
+| LIVE-PASS | 步⑥ raw status==0 且 步⑦ 两轮 DONE + digest MATCH 且 步⑧ Released+账本空 | 步⑥ 未达（dispatch 未发生），无 raw status | **NOT MET** |
+| LIVE-FAIL | 任何步失败/崩溃/超时 → DIAGNOSTIC 归档 + used+1 | child exit=1 fail-closed（步④ runtime 注入前置缺失），已归档 | **DECLARED — LIVE-FAIL** |
+| 账本收口 | used=2/2，后续需新授权书 | used=2/2 **已收口** | **CLOSED** |
 
-> 说明：按工单"FAIL 即归档现场、不重试设计变更；遇到无法满足的判据停下来报告冲突"，本报告**不**声明 LIVE-PASS 也不声明 LIVE-FAIL；唯一如实状态是 **NOT EXECUTED / BLOCKED（结构性缺口）**。
+> 说明：本 FAIL 是**结构性前置缺失**（工单 argv 未含 --preflight-dir；runtime 编译时 digest 未注入构建；runtime env 未进 allowlist），不是 dispatch 机制失败（T1-T18 离线全绿已证明桥与通道正确）。按工单 §3 "FAIL 不自动重试设计变更；attempt_002 仅允许总审计分析后的参数级修正"——**本次不重试**，交总审计决策。
 
 ## 4. 账本与轮次
 
-- GTO-H6-LIVE: used=1/2（attempt_001 消耗于观察模式退出），attempt_002 **未消耗**（预检/未 spawn，不记账）。
-- 建议：总审计收到本冲突后，走新卡（或同工单的显式"接线授权"修正）补齐桥接接线，再重发 attempt_002 执行。
+- GTO-H6-LIVE: used=1/2（attempt_001 观察模式退出）→ attempt_002 实弹消耗第 2 格 → **used=2/2 收口**。
+- **后续任何实弹（含参数级修正后的 attempt_003）需新授权书**（R2 工单 §3）。
+- attempt_002 账本消耗成立（child 实际 spawn 并运行了 828ms，非 preflight 拒绝——preflight 全过才 spawn）。
 
 ## 5. 出口门 ini（实测值）
 
 ```ini
-GTO_H6_LIVE1 = NOT_EXECUTED   ; 未执行（结构性冲突，非 PASS/FAIL）
-LEDGER_USED = 1/2             ; attempt_002 未消耗
-AUTH_CLEARED = true           ; 无授权窗口被设置（MIDA_GTO_LIVE_AUTHORIZED 未被设置过——代码无消费点，故无窗口可清除；如实记录）
-NO_BYPASS_HONORED = true      ; MIDA_GTO_NO_BYPASS=1 全程未被触碰；未运行任何 child（无 spawn）
-TEARDOWN_CLEAN = true         ; 无 session 建立、无分配，无 teardown 需要（账本空）
-OREANS_GATE_RECHECK = NOT_RUN ; 无实弹活动，无需事后复验（按工单"事后必跑"仅对已执行 attempt）
+LIVE_VERDICT = LIVE-FAIL
+VERDICT_CLASS = STRUCTURAL_PRECONDITION_MISSING
+LEDGER_USED = 2/2             ; CLOSED - further live shots require a new authorization
+AUTH_CLEARED = true           ; both MIDA_GTO_NO_BYPASS and MIDA_GTO_LIVE_DISPATCH set+cleared in single window, dual clear records in auth_window.json
+NO_BYPASS_HONORED = true      ; MIDA_GTO_NO_BYPASS=1 verified in effective_env_contract; no bypass/semantic-repair vars
+GATE_OPEN_VERIFIED = true     ; live_dispatch_gate() inputs both = "1" in child env (no_bypass=1, live_dispatch=1)
+DISPATCH_REACHED = false      ; step 6 not reached - loader fail-closed pre-resume
+STEP4_ASSERT = NOT_EVALUATABLE; no LoaderResult produced (loader failed before exports resolution)
+TEARDOWN_CLEAN = true         ; target terminated cleanly (terminate=ok, wait=signaled); no session established
+OREANS_GATE_RECHECK = 17/17   ; tools/verify_adr7_closeout.ps1 PASS (17 checks, 0 warnings)
 ```
 
-## 6. 交付物清单
+## 6. 交付物清单（evidence_staging/H6_LIVE1_R1/attempt_002/ 全量）
 
-- 证据: `evidence_staging/H6_LIVE1_R1/attempt_002/conflict_analysis.json`（vault 写不进去——D:\MidaVault\lab\evidence\gto_cold_start_heap_rebase_1\H6_LIVE1_R1 不存在，按工单 §5 留 staging 由总审计转移）
-- 报告: 本文件 `docs/GTO_H6_LIVE1_REPORT.md`
-- 未执行: 无 child 日志、无 controller_run.json、无 candidate（如实）
+- `resolved_source.json` — preflight 步①（revision_match=true）
+- `auth_window.json` — 授权窗口设置 + 双变量 AUTH_CLEARED 证据
+- `env_snapshot.json` — 现场 env 快照（child effective env + 缺失前置清单）
+- `child.stderr.bin/.txt` — 权威 stderr raw（含两个 FATAL fail-closed 点）
+- `child.stdout.bin/.txt` — stdout raw
+- `controller_run.json` + `controller_attempt_002.json` — controller 生命周期（preflight 全过、spawned=true、exit=1、elapsed=828ms、timed_out=false）
+- `capture_policy.json` — capture policy（与 attempt_001 相同）
+- `attempt_002_diagnostic.json` — DIAGNOSTIC 归档（判定、根因、证据索引）
+- `candidate/` — 空（loader 未完成，无候选产物，fail-closed 正确）
 
 ## 7. AUTH_CLEARED / NO_BYPASS / teardown 证据指针
 
-- **AUTH_CLEARED**: 无授权窗口被设置（`MIDA_GTO_LIVE_AUTHORIZED` 从未设置、代码无消费点）。证据: 本报告 + conflict_analysis.json。**未产生 auth_evidence.json**（无窗口即无清除记录——如实说明）。
-- **NO_BYPASS 验证结果**: 环境全程 `MIDA_GTO_NO_BYPASS=1`；未运行任何 child，故无 controller_run.json 的 env_contract 记录（如实）。grep 确认 bypass/semantic-repair 变量未在环境/代码路径出现。
-- **teardown 账本**: 空（无 session 建立，无分配需释放）；`WalkerTeardownReport` 未产生（无 run）。
+- **AUTH_CLEARED**: `attempt_002/auth_window.json` — no_bypass=1 + live_dispatch=1 于 19:08:02.724Z 设置，19:08:03.617Z 清除；两变量 after 均 `<unset>`（双清除记录）。禁止入全局/profile 环境已满足（变量仅存在于 driver 子进程 env，bash 外层未泄漏——`echo $MIDA_GTO_LIVE_DISPATCH` 为空）。
+- **NO_BYPASS 验证**: `controller_run.json` effective_env_contract: no_bypass_present=true, no_bypass_value="1", no_bypass_verified=true, bypass_absent=true, semantic_repair_absent=true（ok=true）。
+- **teardown**: 无 session 建立（loader fail-closed），无分配需释放；目标进程由 mida-cli 自身 terminate_and_wait 干净终止（terminate=ok, wait=signaled, summary=OwnedPostAttach）→ TEARDOWN_CLEAN=true。
 
-## 8. 冲突消除所需（供总审计决策）
+## 8. 冲突消除所需（供总审计决策，需新授权书）
 
-1. 新工单/修正授权：将 `WalkerDispatchBridgeImpl` 接线进两处生产 `AntidebugStageOptions`（或引入显式 `MIDA_GTO_LIVE_AUTHORIZED` 门控接线），并配套审计；
-2. 重发 attempt_002（同一 9 步序列），届时方可产生真实的 dispatch 证据与二值判定。
+1. **unpack argv 增加 `--preflight-dir=<dir>`**：先运行 `/offline-preflight` 生成 GTO case（gto_launcher）的 envelope + Ready 报告（含 snapshot capture、verifier 独立校验），使 `evidence_ctx.profile_identity()` 有值（loader 步④前置 1）。
+2. **构建时注入 `MIDA_RUNTIME_AUTHORITY_DIGEST` + `MIDA_RUNTIME_SOURCE_REF`**：用 vault 中 adr7b_b4/b5 权威 manifest 的 SHA-256 与 source_ref（7e65cf65…）编译进 mida-cli（build_gto_live_cli.ps1 需扩展或在构建命令前设 env），并重新锚定 build attestation（loader 步④前置 2）。
+3. **child allowlist 增加 `MIDA_RUNTIME_AUTHORITY` + `MIDA_RUNTIME_DLL`**：指向 vault 权威 manifest 与 runtime DLL（D:/MidaVault/lab/evidence/adr7b_b4_binding_correction/runtime/mida_antidebug_runtime.dll）（loader 步④前置 3）。
+4. 以上均为**参数/准备级修正**（无代码语义修改），但按 R2 工单 §3 需**新授权书**后方可执行 attempt_003。

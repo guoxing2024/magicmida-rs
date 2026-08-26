@@ -1,0 +1,24 @@
+{
+  "schema": "mida.antidebug-walker/v1",
+  "record_kind": "cli-walker",
+  "target_pid": 1360,
+  "capture_phase": "post_attach",
+  "liveness_probe": null,
+  "execute_liveness": null,
+  "candidate_mapping": null,
+  "events": [
+    {
+      "sequence": 1,
+      "phase": "terminate_enter",
+      "detail": null,
+      "walker_status_raw": null
+    }
+  ],
+  "teardown": {
+    "schema": "mida.antidebug-walker-teardown/v1",
+    "outcome": "Released",
+    "events": [],
+    "double_free_events": [],
+    "ledger_empty": true
+  }
+}
