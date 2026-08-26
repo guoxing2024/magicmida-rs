@@ -274,8 +274,8 @@ def write_validation_summary(batch_dir: Path, results: list[dict], all_ok: bool)
         "status": "lab_batch",
         "title": "Behavioral lab gate — load survival / E0B (NOT product certificate)",
         "package": "mida-acceptance / mida-cli / tools/_behavior_bb_gate.py",
-        "verdict_contract": "docs/ACCEPTANCE_CONTEACT.md",
-        "roadmap": "docs/VNEXT_BEHAVIOEAL_PATH.md",
+        "verdict_contract": "docs/ACCEPTANCE_CONTRACT.md",
+        "roadmap": "docs/VNEXT_BEHAVIORAL_PATH.md",
         "checks": {
             "bb_behavioral_gate": "lab_pass" if all_ok else "lab_fail",
             "probe_id": "load_no_crash_v0",
@@ -311,8 +311,8 @@ def write_validation_summary(batch_dir: Path, results: list[dict], all_ok: bool)
             for r in results
         ],
         "artifacts": [
-            "docs/VNEXT_BEHAVIOEAL_PATH.md",
-            "docs/ACCEPTANCE_CONTEACT.md",
+            "docs/VNEXT_BEHAVIORAL_PATH.md",
+            "docs/ACCEPTANCE_CONTRACT.md",
             "archive/routes/AUDIT_SELF_CORRECTION_20260727.md",
             "tools/_behavior_bb_gate.py",
             "tools/_behavior_probe.py",
