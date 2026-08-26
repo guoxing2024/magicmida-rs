@@ -19,12 +19,6 @@
 //! - Container restoration handles heap-backed data separately
 //! - This avoids missing any critical variables
 
-use tracing::{debug, info, warn};
-
-use crate::header::PeHeader;
-
-use super::helpers::{alloc_capped, MAX_SECTION_READ_BYTES};
-
 /// Snapshot of the complete .data section from the live process.
 #[derive(Debug, Clone)]
 pub struct DataSectionSnapshot {
@@ -49,98 +43,6 @@ pub struct SkipRegion {
     /// Size of region to skip
     #[allow(dead_code)]
     pub size: u32,
-}
-
-/// Capture the complete .data section from the live process.
-///
-/// This function reads the entire .data section at runtime, preserving
-/// all initialized values. Container regions are identified so they
-/// can be skipped during restoration.
-#[allow(dead_code)] // legacy .data capture path
-pub fn capture_data_section(
-    pe: &PeHeader,
-    debugger: &mut dyn mida_core::DebuggerCore,
-    container_rvas: &[u32],
-) -> Option<DataSectionSnapshot> {
-    // Find .data section
-    let data_section = pe.sections.iter().find(|s| s.name == ".data")?;
-
-    let data_rva = data_section.virtual_address;
-    let data_size = data_section.virtual_size;
-
-    if data_size == 0 || data_size as usize > MAX_SECTION_READ_BYTES {
-        warn!(
-            data_rva = format_args!("{:#x}", data_rva),
-            data_size = format_args!("{:#x}", data_size),
-            ".data section size is invalid or too large"
-        );
-        return None;
-    }
-
-    // Read entire .data section from live process
-    let image_base = pe.nt_headers.optional_header.image_base;
-    let data_va = image_base + data_rva as u64;
-
-    let mut data_content =
-        match alloc_capped(data_size as usize, MAX_SECTION_READ_BYTES, ".data section") {
-            Ok(buf) => buf,
-            Err(e) => {
-                warn!(error = %e, "Rejected .data section allocation");
-                return None;
-            }
-        };
-    match debugger.read_memory(data_va as usize, &mut data_content) {
-        Ok(bytes_read) => {
-            if bytes_read < data_size as usize {
-                warn!(
-                    expected = data_size,
-                    actual = bytes_read,
-                    "Short read on .data section"
-                );
-                data_content.truncate(bytes_read);
-            }
-        }
-        Err(e) => {
-            warn!(
-                data_va = format_args!("{:#x}", data_va),
-                error = %e,
-                "Failed to read .data section from live process"
-            );
-            return None;
-        }
-    }
-
-    // Build skip regions for container metadata (24 bytes per container: 3x u64 pointers)
-    let mut skip_regions = Vec::new();
-    for &container_rva in container_rvas {
-        if container_rva >= data_rva && container_rva < data_rva + data_size {
-            let offset = container_rva - data_rva;
-            skip_regions.push(SkipRegion {
-                offset,
-                size: 24, // sizeof(begin, end, capacity)
-            });
-
-            debug!(
-                container_rva = format_args!("{:#x}", container_rva),
-                offset = offset,
-                "Added skip region for container metadata"
-            );
-        }
-    }
-
-    info!(
-        data_rva = format_args!("{:#x}", data_rva),
-        data_size = format_args!("{:#x}", data_size),
-        skip_regions = skip_regions.len(),
-        "Captured complete .data section snapshot"
-    );
-
-    Some(DataSectionSnapshot {
-        data_rva,
-        data_size,
-        data_content,
-        skip_regions,
-    })
 }
 
 /// Generate x64 assembly code to restore the .data section.

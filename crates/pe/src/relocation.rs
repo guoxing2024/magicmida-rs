@@ -16,14 +16,6 @@ pub struct RelocationEntry {
     pub typ: u16,
 }
 
-/// Base relocation block for a 4KB page
-#[derive(Debug)]
-#[allow(dead_code)]
-struct RelocationBlock {
-    page_rva: u32,
-    entries: Vec<RelocationEntry>,
-}
-
 /// Builder for the Base Relocation Table
 pub struct RelocationTableBuilder {
     /// Relocations grouped by page (4KB blocks)

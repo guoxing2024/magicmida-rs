@@ -33,7 +33,6 @@ mod coverage_measure;
 mod data_reinit;
 mod data_snapshot;
 mod dump_process;
-mod global_vars;
 mod header_patch;
 mod heap_bootstrap;
 mod heap_global_snapshot;

@@ -27,3 +27,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 # R1-E dual-path corpus only: pure emit candidates judged by independent R0B gates.
 # Production `mida-pe` must not depend on `mida-acceptance` (boundary is one-way).
 mida-acceptance = { path = "../acceptance" }
+
+# Inherit the workspace clippy policy (see root Cargo.toml).
+[lints]
+workspace = true

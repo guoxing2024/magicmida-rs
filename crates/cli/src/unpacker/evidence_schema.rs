@@ -12,6 +12,21 @@
 //! to it.
 
 use mida_core::runner_config::packer_family;
+use serde::{Deserialize, Serialize};
+
+/// Shared artifact identity block used by every evidence sidecar
+/// (`path` + `sha256` + `size_bytes`).
+///
+/// Consolidated 2026-08: six evidence producers previously carried
+/// byte-identical private copies of this type; they now all reference this
+/// single definition so identity semantics cannot drift between sidecars.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ArtifactIdentity {
+    pub path: String,
+    pub sha256: String,
+    pub size_bytes: u64,
+}
 
 /// Which evidence member's schema is being resolved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

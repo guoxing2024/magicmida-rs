@@ -17,13 +17,7 @@ const RELOC_DIRECTORY_INDEX: usize = 5;
 const IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE: u16 = 0x0040;
 const IMAGE_FILE_RELOCS_STRIPPED: u16 = 0x0001;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ArtifactIdentity {
-    pub path: String,
-    pub sha256: String,
-    pub size_bytes: u64,
-}
+use super::evidence_schema::ArtifactIdentity;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]

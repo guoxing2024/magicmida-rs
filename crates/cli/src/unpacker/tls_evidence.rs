@@ -13,18 +13,12 @@ use mida_pe::{PeHeader, TlsCallbackStatus, TlsObservationReport, MAX_TLS_CALLBAC
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-#[allow(dead_code)] // legacy Oreans schema id; production uses evidence_schema dispatch
+#[cfg(test)] // used by schema-shape assertions below; production uses evidence_schema dispatch
 pub(crate) const SCHEMA_VERSION: &str = "mida.oreans-tls-evidence/v1";
 const TLS_DIRECTORY_INDEX: usize = 9;
 const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ArtifactIdentity {
-    pub path: String,
-    pub sha256: String,
-    pub size_bytes: u64,
-}
+use super::evidence_schema::ArtifactIdentity;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]

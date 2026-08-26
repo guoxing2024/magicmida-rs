@@ -49,3 +49,7 @@ mida-acceptance = { path = "../acceptance" }
 name = "mida-verifier-stub"
 path = "tests/bin/verifier_stub.rs"
 test = false
+
+# Inherit the workspace clippy policy (see root Cargo.toml).
+[lints]
+workspace = true

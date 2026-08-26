@@ -18,16 +18,7 @@ use mida_pe::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-#[allow(dead_code)] // legacy Oreans schema id; production uses evidence_schema dispatch
-pub(crate) const SCHEMA_VERSION: &str = "mida.oreans-exception-evidence/v1";
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ArtifactIdentity {
-    pub path: String,
-    pub sha256: String,
-    pub size_bytes: u64,
-}
+use super::evidence_schema::ArtifactIdentity;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]

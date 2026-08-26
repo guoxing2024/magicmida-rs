@@ -11,21 +11,6 @@ members = [
     "crates/antidebug",
     "crates/antidebug-runtime",
 ]
-# Research-only; own Cargo.toml pins (no workspace inherit). Build with a
-# separate research workspace or after moving out of tree — not via root members.
-exclude = ["crates/bwhook"]
-default-members = [
-    "crates/core",
-    "crates/pe",
-    "crates/disasm",
-    "crates/tracer",
-    "crates/packers/themida",
-    "crates/packers/ahk_gto",
-    "crates/cli",
-    "crates/acceptance",
-    "crates/antidebug",
-    "crates/antidebug-runtime",
-]
 resolver = "2"
 
 [workspace.package]
@@ -62,4 +47,17 @@ windows = { version = "0.58", features = [
     "Win32_System_SystemServices",
     "Win32_UI_WindowsAndMessaging",
     "Wdk_System_Threading",
+    "Wdk_System_Threading",
 ] }
+
+# Clippy policy (2026-08 purification). Member crates inherit via
+# `[lints] workspace = true`. Deliberately clippy-only: CI builds with
+# RUSTFLAGS=-D warnings, so rustc-level lint changes could break `-D warnings`
+# builds before the codebase is clean; clippy lints only fire under
+# `cargo clippy`, which is not yet a CI gate.
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+print_stdout = "deny"
+dbg_macro = "deny"
+manual_let_else = "warn"

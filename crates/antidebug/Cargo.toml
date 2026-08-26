@@ -12,3 +12,7 @@ serde_json = "1"
 thiserror = "1"
 
 [dev-dependencies]
+
+# Inherit the workspace clippy policy (see root Cargo.toml).
+[lints]
+workspace = true

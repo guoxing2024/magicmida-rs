@@ -12,3 +12,7 @@ publish.workspace = true
 iced-x86 = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+# Inherit the workspace clippy policy (see root Cargo.toml).
+[lints]
+workspace = true

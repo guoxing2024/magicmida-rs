@@ -14,3 +14,7 @@ mida-disasm = { path = "../disasm" }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 windows = { workspace = true }
+
+# Inherit the workspace clippy policy (see root Cargo.toml).
+[lints]
+workspace = true

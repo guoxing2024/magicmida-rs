@@ -20,3 +20,7 @@ gto-product-recovery = []
 [dependencies]
 mida-core = { path = "../../core" }
 tracing = "0.1"
+
+# Inherit the workspace clippy policy (see root Cargo.toml).
+[lints]
+workspace = true

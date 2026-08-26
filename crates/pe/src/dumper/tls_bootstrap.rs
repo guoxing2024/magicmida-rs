@@ -75,7 +75,6 @@ const TLS_CALLBACK_ARRAY_SIZE: usize = 16; // 1 callback + NULL terminator
 pub(crate) fn install_tls_callback_bootstrap(
     pe: &mut PeHeader,
     containers: &[ContainerSnapshot],
-    _global_vars: &[super::global_vars::GlobalVarSnapshot],
     get_process_heap_iat_rva: u32,
     heap_alloc_iat_rva: u32,
     heap_global_rva: Option<u32>,

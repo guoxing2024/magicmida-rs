@@ -15,15 +15,10 @@ use mida_pe::PeHeader;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-#[allow(dead_code)] // legacy Oreans schema id; production uses evidence_schema dispatch
+#[cfg(test)] // used by schema-shape assertions below; production uses evidence_schema dispatch
 const SCHEMA_VERSION: &str = "mida.oreans-oep-evidence/v1";
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct ArtifactIdentity {
-    path: String,
-    sha256: String,
-    size_bytes: u64,
-}
+use super::evidence_schema::ArtifactIdentity;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct OepEvidenceSidecar {

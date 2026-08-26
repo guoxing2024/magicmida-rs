@@ -31,3 +31,7 @@ capture-epoch-harness = []
 name = "capture_epoch_helper"
 path = "src/bin/capture_epoch_helper.rs"
 required-features = ["capture-epoch-harness"]
+
+# Inherit the workspace clippy policy (see root Cargo.toml).
+[lints]
+workspace = true
