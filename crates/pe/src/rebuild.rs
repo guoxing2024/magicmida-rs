@@ -39,6 +39,9 @@ pub const DIR_TLS: usize = 9;
 pub const DIR_LOAD_CONFIG: usize = 10;
 pub const DIR_IAT: usize = 12;
 
+/// GTO-TR T2 Phase B: observed-surface assembly from carved components.
+pub mod tr_surface;
+
 /// One section payload in a rebuild plan.
 #[derive(Debug, Clone)]
 pub struct PlannedSection {
