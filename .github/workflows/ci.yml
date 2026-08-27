@@ -80,7 +80,7 @@ jobs:
   #   phase 0:  -D clippy::dbg_macro  (deny-level in workspace lints; 0)
   #   phase 1:  + -D clippy::unwrap_used  [ACTIVE since 2026-08-27, WO-10/12]
   #   phase 2:  + -D clippy::expect_used  [ACTIVE since 2026-08-27, WO-12]
-  #   phase 3 (next): + -D clippy::manual_let_else  (WO-15 batch)
+  #   phase 3:  + -D clippy::manual_let_else  [ACTIVE since 2026-08-27, WO-15]
   #   later phases: any lint promoted to deny in [workspace.lints.clippy]
   #     is mirrored here once the batch for it is fully paid down.
   #
@@ -110,12 +110,13 @@ jobs:
         with:
           components: clippy
 
-      # Phases 0-2 gate: dbg_macro everywhere; unwrap_used/expect_used on
-      # production targets only (test targets stay warn-level per WO-14).
-      - name: Clippy (workspace, all targets) — phases 0-2
+      # Phases 0-3 gate: dbg_macro everywhere; unwrap_used/expect_used/
+      # manual_let_else on production targets only (test targets stay
+      # warn-level per WO-14).
+      - name: Clippy (workspace, all targets) — phases 0-3
         run: |
           cargo clippy --workspace --all-targets -- -D clippy::dbg_macro
-          cargo clippy --workspace --lib --bins -- -D clippy::unwrap_used -D clippy::expect_used
+          cargo clippy --workspace --lib --bins -- -D clippy::unwrap_used -D clippy::expect_used -D clippy::manual_let_else
 
   cargo-deny:
     runs-on: ubuntu-latest
