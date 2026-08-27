@@ -449,16 +449,19 @@ pub fn unpack(
     // post-attach: when section 0 is plain .text (not a Themida
     // virtualized section) and the target is not .NET, create the
     // process WITHOUT DEBUG_ONLY_THIS_PROCESS.
-    // Name-erasure fallback: Themida/WinLicense wipes section names to
-    // spaces ("        ") while the code section remains the first
-    // executable section. Treat an all-blank-named first executable
-    // section the same as plain ".text" so the no-debug-port attach path
-    // (which avoids the Themida DebugPort stall entirely) is used.
+    //
+    // XX-2 correction: the earlier name-erasure fallback (trim().is_empty()
+    // => plain) pushed Oreans/WinLicense builds whose first section name is
+    // blank onto the post-attach path, where the frozen CREATE_SUSPENDED
+    // target cannot accept a ScyllaHide remote-thread injection, so their
+    // anti-debug checks raced ahead and self-terminated (0xc0000005). Restore
+    // the exact .text match so those builds take the CREATE_PROCESS path
+    // (classic ScyllaHide injection, rev1-proven success route).
     let section0_plain_name = state
         .pe_info
         .pe_sections
         .first()
-        .is_some_and(|s| s.name == ".text" || s.name.trim().is_empty());
+        .is_some_and(|s| s.name == ".text");
     let text_is_plain_for_attach = section0_plain_name && !is_dotnet;
     if packer.uses_gto_observation() {
         validate_gto_route(profile, text_is_plain_for_attach)
