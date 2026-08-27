@@ -464,6 +464,15 @@ mod imp09_dispatch_bridge_tests {
 
     use super::*;
     use crate::unpacker::walker_session::WalkerDispatchBridge;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Process-unique sequence for the loader fixture file name. Multiple
+    /// tests in this module build a carrier pair with the same `file_rva`
+    /// (e.g. t11/t12 both use 0x2040) and may run concurrently in the same
+    /// process; a `{pid}_{rva}` name alone lets a concurrent test truncate/
+    /// overwrite the fixture between `write` and `verify_file`, causing
+    /// intermittent `AuthorityMismatch` (empty-file SHA-256) failures.
+    static SEQ: AtomicU64 = AtomicU64::new(0);
 
     /// The frozen 60-byte production thunk (WO-2301 fixture). A byte change
     /// here is a WIRING ERROR: the production dispatch MUST use exactly
@@ -534,7 +543,12 @@ mod imp09_dispatch_bridge_tests {
         b[0xE8..0xEC].copy_from_slice(&0x4000u32.to_le_bytes()); // SizeOfImage
         let dir = std::env::temp_dir().join("mida-walker-dispatch-test");
         let _ = std::fs::create_dir_all(&dir);
-        let p = dir.join(format!("loader_{}_{}.dll", std::process::id(), file_rva));
+        let p = dir.join(format!(
+            "loader_{}_{}_{}.dll",
+            std::process::id(),
+            file_rva,
+            SEQ.fetch_add(1, Ordering::SeqCst)
+        ));
         std::fs::write(&p, &b).unwrap();
         let manifest = RuntimeAuthorityManifest {
             schema: "mida.antidebug-runtime-authority/v1".to_string(),
@@ -547,6 +561,10 @@ mod imp09_dispatch_bridge_tests {
             provenance_ref: "provenance.json".to_string(),
         };
         let identity = manifest.verify_file(&p).unwrap();
+        // WO-11: fixtures are process-unique (SEQ) and temp-only; remove the
+        // file right after verification so `temp/mida-walker-dispatch-test/`
+        // never accumulates orphaned unique-named DLLs across runs.
+        let _ = std::fs::remove_file(&p);
         let digest_authority =
             RuntimeDigestAuthority::from_verified_identity(&identity, &manifest.artifact_id)
                 .expect("verified identity must build authority");
