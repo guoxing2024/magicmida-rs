@@ -3,7 +3,8 @@
 //!
 //! Production `.unwrap()`s are invariants: `min()` runs only after a
 //! `parents.is_empty()` early return (WO-10). Test unwraps are assertions.
-#![allow(clippy::unwrap_used)]//! slots (typically `.fill` gaps left by removed Themida sections).
+#![allow(clippy::unwrap_used)]
+//! slots (typically `.fill` gaps left by removed Themida sections).
 //!
 //! These slots are not SecurityCookie-encoded triples: they hold plain heap
 //! pointers. Early overlay / pointer scrub zeros them, and zero-raw sections
@@ -926,9 +927,8 @@ pub fn supplement_uncovered_probe_slabs(
         if g.content.is_empty() {
             continue;
         }
-        let child_end = match g.live_ptr.checked_add(g.content.len() as u64) {
-            Some(e) => e,
-            None => continue,
+        let Some(child_end) = g.live_ptr.checked_add(g.content.len() as u64) else {
+            continue;
         };
         // Count existing covering ranges (before adding ours).
         let covered = ranges
@@ -2103,9 +2103,8 @@ fn capture_image_inline_gscript(
         return;
     }
 
-    let mut content = match alloc_capped(size, cap, "gscript image-inline") {
-        Ok(b) => b,
-        Err(_) => return,
+    let Ok(mut content) = alloc_capped(size, cap, "gscript image-inline") else {
+        return;
     };
     let mut got = 0usize;
     match debugger.read_memory(live_va as usize, &mut content) {
@@ -2392,13 +2391,12 @@ fn ensure_hot_root_slots(
             );
             continue;
         }
-        let mut content = match alloc_capped(
+        let Ok(mut content) = alloc_capped(
             size,
             MAX_HEAP_GLOBAL_BYTES.min(MAX_HEAP_CONTAINER_BYTES),
             "hot root ensure",
-        ) {
-            Ok(buf) => buf,
-            Err(_) => continue,
+        ) else {
+            continue;
         };
         match debugger.read_memory(value as usize, &mut content) {
             Ok(n) if n >= 8 => {
@@ -2597,17 +2595,14 @@ fn exhaust_gscript_first_hop(
             skipped += 1;
             break;
         }
-        let mut child = match alloc_capped(
+        let Ok(mut child) = alloc_capped(
             size,
             policy.first_hop_probe().min(MAX_HEAP_CONTAINER_BYTES),
             "gscript first-hop child",
-        ) {
-            Ok(buf) => buf,
-            Err(_) => {
-                seen_heaps.remove(&value);
-                skipped += 1;
-                continue;
-            }
+        ) else {
+            seen_heaps.remove(&value);
+            skipped += 1;
+            continue;
         };
         match debugger.read_memory(value as usize, &mut child) {
             Ok(n) if n >= 8 => {
@@ -2824,17 +2819,14 @@ pub(crate) fn exhaust_gscript_child_link_fields(
                 skipped += 1;
                 break;
             }
-            let mut child = match alloc_capped(
+            let Ok(mut child) = alloc_capped(
                 size,
                 policy.first_hop_probe().min(MAX_HEAP_CONTAINER_BYTES),
                 "gscript child link",
-            ) {
-                Ok(buf) => buf,
-                Err(_) => {
-                    seen_heaps.remove(&value);
-                    skipped += 1;
-                    continue;
-                }
+            ) else {
+                seen_heaps.remove(&value);
+                skipped += 1;
+                continue;
             };
             match debugger.read_memory(value as usize, &mut child) {
                 Ok(n) if n >= 8 => {
@@ -4342,17 +4334,14 @@ pub(crate) fn exhaust_gscript_label_table_entries(
             skipped += 1;
             break;
         }
-        let mut child = match alloc_capped(
+        let Ok(mut child) = alloc_capped(
             size,
             policy.first_hop_probe().min(MAX_HEAP_CONTAINER_BYTES),
             "gscript label entry",
-        ) {
-            Ok(buf) => buf,
-            Err(_) => {
-                seen_heaps.remove(&value);
-                skipped += 1;
-                continue;
-            }
+        ) else {
+            seen_heaps.remove(&value);
+            skipped += 1;
+            continue;
         };
         match debugger.read_memory(value as usize, &mut child) {
             Ok(n) if n >= 8 => {
@@ -4981,9 +4970,8 @@ fn normalize_cmd_table_capture(
     if !can_read(debugger, live, want, HOT_XREF_SIZE_PROBE_CAP) {
         return;
     }
-    let mut buf = match alloc_capped(want, HOT_XREF_SIZE_PROBE_CAP, "cmd table normalize") {
-        Ok(b) => b,
-        Err(_) => return,
+    let Ok(mut buf) = alloc_capped(want, HOT_XREF_SIZE_PROBE_CAP, "cmd table normalize") else {
+        return;
     };
     match debugger.read_memory(live as usize, &mut buf) {
         Ok(got) if got >= 8 => {
@@ -5520,16 +5508,13 @@ fn exhaust_pointer_table_first_hop_span(
             skipped += 1;
             continue;
         }
-        let mut child = match alloc_capped(
+        let Ok(mut child) = alloc_capped(
             size,
             probe.min(MAX_HEAP_CONTAINER_BYTES),
             "pointer-table first-hop child",
-        ) {
-            Ok(b) => b,
-            Err(_) => {
-                skipped += 1;
-                continue;
-            }
+        ) else {
+            skipped += 1;
+            continue;
         };
         match debugger.read_memory(value as usize, &mut child) {
             Ok(n) if n >= 8 => {
@@ -5769,16 +5754,13 @@ fn expand_hot_root_children(
                 seen_heaps.remove(&value);
                 break;
             }
-            let mut content = match alloc_capped(
+            let Ok(mut content) = alloc_capped(
                 size,
                 HOT_CHILD_PROBE.min(MAX_HEAP_CONTAINER_BYTES),
                 "heap hot-root child",
-            ) {
-                Ok(buf) => buf,
-                Err(_) => {
-                    seen_heaps.remove(&value);
-                    continue;
-                }
+            ) else {
+                seen_heaps.remove(&value);
+                continue;
             };
             match debugger.read_memory(value as usize, &mut content) {
                 Ok(n) if n >= 8 => {
@@ -6018,16 +6000,13 @@ fn expand_heap_graph(
                 break;
             }
 
-            let mut content = match alloc_capped(
+            let Ok(mut content) = alloc_capped(
                 size,
                 GRAPH_CHILD_SIZE_PROBE_CAP.min(MAX_HEAP_CONTAINER_BYTES),
                 "heap graph",
-            ) {
-                Ok(buf) => buf,
-                Err(_) => {
-                    seen_heaps.remove(&value);
-                    continue;
-                }
+            ) else {
+                seen_heaps.remove(&value);
+                continue;
             };
             match debugger.read_memory(value as usize, &mut content) {
                 Ok(n) if n >= 8 => {
@@ -6377,9 +6356,8 @@ fn shell_view_exact_base(view: &[(u64, usize, bool)], addr: u64) -> bool {
 /// Cap `size` so [base, base+size) does not overlap any view extent.
 /// checked arithmetic — a wrapping span is never a valid window.
 fn shrink_to_avoid_overlap_view(view: &[(u64, usize, bool)], base: u64, size: usize) -> usize {
-    let mut end = match base.checked_add(size as u64) {
-        Some(e) => e,
-        None => return 0,
+    let Some(mut end) = base.checked_add(size as u64) else {
+        return 0;
     };
     for &(live, len, _) in view {
         if len == 0 {
@@ -6503,19 +6481,16 @@ fn resolve_string_shell(
             buffer_child: None,
         };
     }
-    let mut body = match alloc_capped(
+    let Ok(mut body) = alloc_capped(
         size,
         GRAPH_CHILD_SIZE_PROBE_CAP.min(MAX_HEAP_CONTAINER_BYTES),
         "string buffer child",
-    ) {
-        Ok(b) => b,
-        Err(_) => {
-            return StringShellResolution {
-                is_shell: true,
-                keep_pointers: false,
-                buffer_child: None,
-            };
-        }
+    ) else {
+        return StringShellResolution {
+            is_shell: true,
+            keep_pointers: false,
+            buffer_child: None,
+        };
     };
     match debugger.read_memory(buf as usize, &mut body) {
         Ok(n) if n >= 2 => {
@@ -6906,13 +6881,12 @@ fn split_swallowed_siblings(
                 break;
             }
 
-            let mut content = match alloc_capped(
+            let Ok(mut content) = alloc_capped(
                 size,
                 GRAPH_CHILD_SIZE_PROBE_CAP.min(MAX_HEAP_CONTAINER_BYTES),
                 "heap split sibling",
-            ) {
-                Ok(buf) => buf,
-                Err(_) => continue,
+            ) else {
+                continue;
             };
             match debugger.read_memory(value as usize, &mut content) {
                 Ok(n) if n >= 8 => {
@@ -7380,16 +7354,13 @@ fn capture_dangling_edges(
             break;
         }
 
-        let mut content = match alloc_capped(
+        let Ok(mut content) = alloc_capped(
             size,
             DANGLING_PROBE_CAP.min(MAX_HEAP_CONTAINER_BYTES),
             "heap dangling edge",
-        ) {
-            Ok(buf) => buf,
-            Err(_) => {
-                seen_heaps.remove(&value);
-                continue;
-            }
+        ) else {
+            seen_heaps.remove(&value);
+            continue;
         };
         match debugger.read_memory(value as usize, &mut content) {
             Ok(n) if n >= 8 => {
@@ -7519,9 +7490,8 @@ fn carve_parent_at_hot_base(out: &mut [HeapGlobalSnapshot], base: u64) -> bool {
 /// child window (a later object base inside the proposed range cuts it; an
 /// earlier object whose range overlaps base non-swallowingly rejects it).
 fn shrink_split_child_avoid_overlap(out: &[HeapGlobalSnapshot], base: u64, size: usize) -> usize {
-    let mut end = match base.checked_add(size as u64) {
-        Some(e) => e,
-        None => return 0,
+    let Some(mut end) = base.checked_add(size as u64) else {
+        return 0;
     };
     for o in out {
         if o.is_heap_handle || o.content.is_empty() {
@@ -7966,17 +7936,14 @@ fn parse_canonical_gscript_child_link_capture_id(
         }
         u64::from_str_radix(h, 16).ok()
     };
-    let parent = match parse_hex(parts[0]) {
-        Some(v) => v,
-        None => return false,
+    let Some(parent) = parse_hex(parts[0]) else {
+        return false;
     };
-    let loff = match parse_hex(parts[1]) {
-        Some(v) => v,
-        None => return false,
+    let Some(loff) = parse_hex(parts[1]) else {
+        return false;
     };
-    let base = match parse_hex(parts[2]) {
-        Some(v) => v,
-        None => return false,
+    let Some(base) = parse_hex(parts[2]) else {
+        return false;
     };
     let probe: usize = match parts[3].parse() {
         Ok(v) => v,
@@ -8863,9 +8830,8 @@ fn can_read(
     size: usize,
     cap: usize,
 ) -> bool {
-    let mut buf = match alloc_capped(size, cap.max(size), "heap global probe") {
-        Ok(b) => b,
-        Err(_) => return false,
+    let Ok(mut buf) = alloc_capped(size, cap.max(size), "heap global probe") else {
+        return false;
     };
     match debugger.read_memory(addr as usize, &mut buf) {
         Ok(n) => n == size,

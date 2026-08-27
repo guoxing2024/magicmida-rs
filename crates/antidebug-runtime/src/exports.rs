@@ -265,19 +265,16 @@ fn initialize_inner(
     // The Win32PebMemory view reads the real PEB via gs:[0x60]; on failure
     // the attestation reports the failure and the controller fails closed.
     let real_peb = crate::surfaces::Win32PebMemory::new(p.target_pid);
-    let (outcomes, failures) = match install_proc_surfaces(
+    let Ok((outcomes, failures)) = install_proc_surfaces(
         &real_peb,
         crate::surfaces::POINTER_SIZE_X64,
         p.target_pid,
         p.target_pid,
         &profile_digest,
         &profile_digest,
-    ) {
-        Ok(v) => v,
-        Err(_) => {
-            // Surface-level fatal (e.g. wrong pointer size): fail closed.
-            return MidaAntidebugError::SurfaceInstallFailed.as_i32();
-        }
+    ) else {
+        // Surface-level fatal (e.g. wrong pointer size): fail closed.
+        return MidaAntidebugError::SurfaceInstallFailed.as_i32();
     };
     let installed: Vec<String> = outcomes
         .iter()
@@ -329,9 +326,8 @@ fn initialize_inner(
         Ok(a) => a,
         Err(e) => return e.as_i32(),
     };
-    let att_json = match att.to_canonical_json() {
-        Ok(j) => j,
-        Err(_) => return MidaAntidebugError::Serialization.as_i32(),
+    let Ok(att_json) = att.to_canonical_json() else {
+        return MidaAntidebugError::Serialization.as_i32();
     };
     if att_json.len() > out_attestation_len {
         return MidaAntidebugError::BufferTooSmall.as_i32();
@@ -407,9 +403,8 @@ fn get_attestation_inner(out_buf: *mut u8, buf_len: usize, out_written: *mut usi
     if out_buf.is_null() || out_written.is_null() || buf_len == 0 {
         return MidaAntidebugError::InvalidArgument.as_i32();
     }
-    let json = match handle.attestation.to_canonical_json() {
-        Ok(j) => j,
-        Err(_) => return MidaAntidebugError::Serialization.as_i32(),
+    let Ok(json) = handle.attestation.to_canonical_json() else {
+        return MidaAntidebugError::Serialization.as_i32();
     };
     if json.len() > buf_len {
         return MidaAntidebugError::BufferTooSmall.as_i32();
@@ -509,7 +504,6 @@ fn shutdown_inner() -> i32 {
     MidaAntidebugError::Ok.as_i32()
 }
 
-
 // ============================================================================
 // IMP-08: MidaAntidebugInitializeV2 (7-arg ABI, digest channel)
 // ============================================================================
@@ -563,7 +557,9 @@ fn v2_checked_add(a: usize, b: usize, what: &str) -> Result<usize, MidaAntidebug
 
 /// Checked blob end (blob_base + params_bytes), fail-closed.
 fn checked_blob_end(blob_base: usize, params_bytes: usize) -> Result<usize, MidaAntidebugError> {
-    blob_base.checked_add(params_bytes).ok_or(MidaAntidebugError::InvalidV2Blob)
+    blob_base
+        .checked_add(params_bytes)
+        .ok_or(MidaAntidebugError::InvalidV2Blob)
 }
 
 /// Bounded NUL-terminated string read from a blob slice (fail-closed).
@@ -581,8 +577,7 @@ fn v2_read_cstr_blob(blob: &[u8], off: usize, what: &str) -> Result<String, Mida
     if end >= blob.len() || blob[end] != 0 {
         return Err(MidaAntidebugError::InvalidV2Blob); // missing NUL
     }
-    let s = std::str::from_utf8(&blob[off..end])
-        .map_err(|_| MidaAntidebugError::InvalidV2Blob)?;
+    let s = std::str::from_utf8(&blob[off..end]).map_err(|_| MidaAntidebugError::InvalidV2Blob)?;
     let _ = what;
     Ok(s.to_string())
 }
@@ -649,16 +644,30 @@ fn initialize_v2_inner(
         }
         Ok(u64::from_le_bytes(blob[off..end].try_into().unwrap()))
     };
-    let magic = match rd(0x30) { Ok(v) => v, Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32() };
+    let Ok(magic) = rd(0x30) else {
+        return MidaAntidebugError::InvalidV2Blob.as_i32();
+    };
     if magic != V2_ENVELOPE_MAGIC {
         return MidaAntidebugError::InvalidV2Blob.as_i32();
     }
-    let pid_off_u = match rd(0x10) { Ok(v) => v, Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32() };
-    let pd_off_u = match rd(0x18) { Ok(v) => v, Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32() };
-    let expected_hooks = match rd(0x20) { Ok(v) => v, Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32() };
-    let surf_off_u = match rd(0x28) { Ok(v) => v, Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32() };
-    let dig_off_u = match rd(0x38) { Ok(v) => v, Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32() };
-    let dig_len_field = match rd(0x40) { Ok(v) => v, Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32() };
+    let Ok(pid_off_u) = rd(0x10) else {
+        return MidaAntidebugError::InvalidV2Blob.as_i32();
+    };
+    let Ok(pd_off_u) = rd(0x18) else {
+        return MidaAntidebugError::InvalidV2Blob.as_i32();
+    };
+    let Ok(expected_hooks) = rd(0x20) else {
+        return MidaAntidebugError::InvalidV2Blob.as_i32();
+    };
+    let Ok(surf_off_u) = rd(0x28) else {
+        return MidaAntidebugError::InvalidV2Blob.as_i32();
+    };
+    let Ok(dig_off_u) = rd(0x38) else {
+        return MidaAntidebugError::InvalidV2Blob.as_i32();
+    };
+    let Ok(dig_len_field) = rd(0x40) else {
+        return MidaAntidebugError::InvalidV2Blob.as_i32();
+    };
     if dig_len_field != V2_DIGEST_LEN {
         return MidaAntidebugError::InvalidV2Blob.as_i32();
     }
@@ -668,23 +677,23 @@ fn initialize_v2_inner(
     if surf_off_u == 0 {
         return MidaAntidebugError::InvalidV2Blob.as_i32();
     }
-    let pid_off = match usize::try_from(pid_off_u) {
-        Ok(v) => v,
-        Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32(),
+    let Ok(pid_off) = usize::try_from(pid_off_u) else {
+        return MidaAntidebugError::InvalidV2Blob.as_i32();
     };
-    let pd_off = match usize::try_from(pd_off_u) {
-        Ok(v) => v,
-        Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32(),
+    let Ok(pd_off) = usize::try_from(pd_off_u) else {
+        return MidaAntidebugError::InvalidV2Blob.as_i32();
     };
-    let surf_off = match usize::try_from(surf_off_u) {
-        Ok(v) => v,
-        Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32(),
+    let Ok(surf_off) = usize::try_from(surf_off_u) else {
+        return MidaAntidebugError::InvalidV2Blob.as_i32();
     };
-    let dig_off = match usize::try_from(dig_off_u) {
-        Ok(v) => v,
-        Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32(),
+    let Ok(dig_off) = usize::try_from(dig_off_u) else {
+        return MidaAntidebugError::InvalidV2Blob.as_i32();
     };
-    for (name, off) in [("profile_id", pid_off), ("profile_digest", pd_off), ("digest", dig_off)] {
+    for (name, off) in [
+        ("profile_id", pid_off),
+        ("profile_digest", pd_off),
+        ("digest", dig_off),
+    ] {
         if off < V2_HEADER_BYTES || off >= blob.len() {
             let _ = name;
             return MidaAntidebugError::InvalidV2Blob.as_i32();
@@ -692,22 +701,22 @@ fn initialize_v2_inner(
     }
 
     // ---- bounded string reads ----
-    let profile_id = match v2_read_cstr_blob(blob, pid_off, "profile_id") {
-        Ok(s) => s,
-        Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32(),
+    let Ok(profile_id) = v2_read_cstr_blob(blob, pid_off, "profile_id") else {
+        return MidaAntidebugError::InvalidV2Blob.as_i32();
     };
-    let profile_digest = match v2_read_cstr_blob(blob, pd_off, "profile_digest") {
-        Ok(s) => s,
-        Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32(),
+    let Ok(profile_digest) = v2_read_cstr_blob(blob, pd_off, "profile_digest") else {
+        return MidaAntidebugError::InvalidV2Blob.as_i32();
     };
-    let digest = match v2_read_cstr_blob(blob, dig_off, "digest") {
-        Ok(s) => s,
-        Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32(),
+    let Ok(digest) = v2_read_cstr_blob(blob, dig_off, "digest") else {
+        return MidaAntidebugError::InvalidV2Blob.as_i32();
     };
     if digest.len() != 64 {
         return MidaAntidebugError::InvalidV2Blob.as_i32();
     }
-    if !digest.bytes().all(|b| b.is_ascii_digit() || (b.is_ascii_lowercase() && b <= b'f')) {
+    if !digest
+        .bytes()
+        .all(|b| b.is_ascii_digit() || (b.is_ascii_lowercase() && b <= b'f'))
+    {
         return MidaAntidebugError::InvalidV2Blob.as_i32();
     }
 
@@ -717,13 +726,11 @@ fn initialize_v2_inner(
     // blob provenance BEFORE dereferencing: the VA must lie inside
     // [blob_base, blob_end). A canonical-but-unrelated VA is rejected.
     let blob_base = params as usize;
-    let blob_end = match checked_blob_end(blob_base, params_bytes) {
-        Ok(v) => v,
-        Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32(),
+    let Ok(blob_end) = checked_blob_end(blob_base, params_bytes) else {
+        return MidaAntidebugError::InvalidV2Blob.as_i32();
     };
-    let array_bytes = match (expected_hooks as usize).checked_mul(8) {
-        Some(v) => v,
-        None => return MidaAntidebugError::InvalidV2Blob.as_i32(),
+    let Some(array_bytes) = (expected_hooks as usize).checked_mul(8) else {
+        return MidaAntidebugError::InvalidV2Blob.as_i32();
     };
     let array_end = match surf_off.checked_add(array_bytes) {
         Some(v) if v <= blob.len() => v,
@@ -736,22 +743,19 @@ fn initialize_v2_inner(
     // be the LAST thing in the blob. digest = 64 hex chars + NUL (65
     // bytes total). digest_off + 65 != params_bytes means unknown tail,
     // truncation, or overlap — all malformed, fail closed.
-    let digest_region_end = match dig_off.checked_add(65) {
-        Some(v) => v,
-        None => return MidaAntidebugError::InvalidV2Blob.as_i32(),
+    let Some(digest_region_end) = dig_off.checked_add(65) else {
+        return MidaAntidebugError::InvalidV2Blob.as_i32();
     };
     if digest_region_end != params_bytes {
         return MidaAntidebugError::InvalidV2Blob.as_i32();
     }
     let mut expected = Vec::with_capacity(expected_hooks as usize);
     for i in 0..expected_hooks as usize {
-        let stride = match i.checked_mul(8) {
-            Some(v) => v,
-            None => return MidaAntidebugError::InvalidV2Blob.as_i32(),
+        let Some(stride) = i.checked_mul(8) else {
+            return MidaAntidebugError::InvalidV2Blob.as_i32();
         };
-        let entry_off = match surf_off.checked_add(stride) {
-            Some(v) => v,
-            None => return MidaAntidebugError::InvalidV2Blob.as_i32(),
+        let Some(entry_off) = surf_off.checked_add(stride) else {
+            return MidaAntidebugError::InvalidV2Blob.as_i32();
         };
         let entry_end = match entry_off.checked_add(8) {
             Some(v) if v <= blob.len() => v,
@@ -767,28 +771,27 @@ fn initialize_v2_inner(
         }
         // IMP-08-R1-R1 (P0-2): blob provenance — the VA must be inside
         // [blob_base, blob_end). No unchecked dereference of abs_va.
-        let abs_va_usize = match usize::try_from(abs_va) {
-            Ok(v) => v,
-            Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32(),
+        let Ok(abs_va_usize) = usize::try_from(abs_va) else {
+            return MidaAntidebugError::InvalidV2Blob.as_i32();
         };
         if abs_va_usize < blob_base || abs_va_usize >= blob_end {
             return MidaAntidebugError::InvalidV2Blob.as_i32();
         }
-        let rel = match abs_va_usize.checked_sub(blob_base) {
-            Some(v) => v,
-            None => return MidaAntidebugError::InvalidV2Blob.as_i32(),
+        let Some(rel) = abs_va_usize.checked_sub(blob_base) else {
+            return MidaAntidebugError::InvalidV2Blob.as_i32();
         };
         // Bounded NUL scan inside the blob slice only (no raw pointer).
-        let surface_id = match v2_read_cstr_blob(blob, rel, "surface_id") {
-            Ok(s) => s,
-            Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32(),
+        let Ok(surface_id) = v2_read_cstr_blob(blob, rel, "surface_id") else {
+            return MidaAntidebugError::InvalidV2Blob.as_i32();
         };
         expected.push(surface_id);
     }
 
     // ---- target identity (frozen header fields +0x00 / +0x08) ----
     let target_pid = u32::from_le_bytes(blob[0x00..0x04].try_into().unwrap());
-    let module_base = match rd(0x08) { Ok(v) => v, Err(_) => return MidaAntidebugError::InvalidV2Blob.as_i32() };
+    let Ok(module_base) = rd(0x08) else {
+        return MidaAntidebugError::InvalidV2Blob.as_i32();
+    };
     if target_pid == 0 || module_base == 0 {
         // Target identity binding: zero PID / module base is invalid.
         return MidaAntidebugError::InvalidArgument.as_i32();
@@ -799,19 +802,16 @@ fn initialize_v2_inner(
 
     // ---- ADR-5: install hard-required PEB surfaces (same as v1 path) ----
     let real_peb = crate::surfaces::Win32PebMemory::new(target_pid);
-    let (outcomes, failures) = match install_proc_surfaces(
+    let Ok((outcomes, failures)) = install_proc_surfaces(
         &real_peb,
         crate::surfaces::POINTER_SIZE_X64,
         target_pid,
         target_pid,
         &profile_digest,
         &profile_digest,
-    ) {
-        Ok(v) => v,
-        Err(_) => {
-            // Surface-level fatal (e.g. wrong pointer size): fail closed.
-            return MidaAntidebugError::SurfaceInstallFailed.as_i32();
-        }
+    ) else {
+        // Surface-level fatal (e.g. wrong pointer size): fail closed.
+        return MidaAntidebugError::SurfaceInstallFailed.as_i32();
     };
     let installed: Vec<String> = outcomes
         .iter()
@@ -863,9 +863,8 @@ fn initialize_v2_inner(
         Ok(a) => a,
         Err(e) => return e.as_i32(),
     };
-    let att_json = match att.to_canonical_json() {
-        Ok(j) => j,
-        Err(_) => return MidaAntidebugError::Serialization.as_i32(),
+    let Ok(att_json) = att.to_canonical_json() else {
+        return MidaAntidebugError::Serialization.as_i32();
     };
     if att_json.len() > out_attestation_len {
         return MidaAntidebugError::BufferTooSmall.as_i32();
@@ -963,7 +962,6 @@ impl WalkerSessionBinding {
     }
 }
 
-
 static WALKER_PROVIDER: PoisonSafe<Option<Box<dyn WalkerMemoryProvider + Send + Sync>>> =
     PoisonSafe::new(None);
 static WALKER_SESSION: PoisonSafe<Option<WalkerSessionBinding>> = PoisonSafe::new(None);
@@ -988,8 +986,7 @@ pub enum WalkerSessionLifecycle {
     Aborted = 5,
 }
 
-static WALKER_SESSION_LIFECYCLE: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(0); // Unbound
+static WALKER_SESSION_LIFECYCLE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0); // Unbound
 
 #[cfg(test)]
 fn lifecycle_get() -> WalkerSessionLifecycle {
@@ -1175,16 +1172,15 @@ pub fn install_walker_session_verified(
     profile_digest: &str,
 ) -> bool {
     // 1. validate raw inputs (format gate, lowercase 0-9a-f only).
-    let authority = match WalkerDigestAuthority::new(
+    let Ok(authority) = WalkerDigestAuthority::new(
         target_image_sha256,
         runtime_module_sha256,
         module_base,
         walker_export_rva,
         profile_id,
         profile_digest,
-    ) {
-        Ok(a) => a,
-        Err(_) => return false,
+    ) else {
+        return false;
     };
     // 2. construct binding.
     let binding =
@@ -1236,16 +1232,15 @@ pub fn bind_walker_session_verified(
     profile_id: &str,
     profile_digest: &str,
 ) -> bool {
-    let authority = match WalkerDigestAuthority::new(
+    let Ok(authority) = WalkerDigestAuthority::new(
         target_image_sha256,
         runtime_module_sha256,
         module_base,
         walker_export_rva,
         profile_id,
         profile_digest,
-    ) {
-        Ok(a) => a,
-        Err(_) => return false,
+    ) else {
+        return false;
     };
     bind_walker_session(WalkerSessionBinding::new(
         params_va,
@@ -1255,7 +1250,6 @@ pub fn bind_walker_session_verified(
         authority,
     ))
 }
-
 
 /// Fetch the last produced attestation output (P0-1 output channel).
 pub fn take_walker_output() -> Option<crate::attestation::RuntimeAttestationV2> {
@@ -1301,7 +1295,8 @@ pub fn reset_walker_bindings() {
 /// shared static. Each test gets a fresh state via reset_walker_bindings();
 /// no cross-test contamination, no early-return masking.
 #[cfg(test)]
-static IMP09_OUTPUT_SINK_FAIL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static IMP09_OUTPUT_SINK_FAIL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 /// R4-R1: failpoint AFTER provider install, BEFORE session install —
 /// exercises the session-install rollback path (distinct from output-
 /// reset failure). Test-only.
@@ -1417,12 +1412,9 @@ fn walker_execute_inner(params_va: u64) -> i32 {
         return WALKER_STATUS_ERROR_MAP_FAILED as i32;
     }
     let blob_total_raw = u64::from_le_bytes(header[0x08..0x10].try_into().unwrap());
-    let blob_total = match usize::try_from(blob_total_raw) {
-        Ok(v) => v,
-        Err(_) => {
-            lifecycle_set(WalkerSessionLifecycle::Aborted);
-            return WALKER_STATUS_ERROR_BAD_PARAMS as i32;
-        }
+    let Ok(blob_total) = usize::try_from(blob_total_raw) else {
+        lifecycle_set(WalkerSessionLifecycle::Aborted);
+        return WALKER_STATUS_ERROR_BAD_PARAMS as i32;
     };
     if blob_total < 0x40 || blob_total > 0x40 + 4096 * 8 {
         lifecycle_set(WalkerSessionLifecycle::Aborted);
@@ -1434,36 +1426,27 @@ fn walker_execute_inner(params_va: u64) -> i32 {
         return WALKER_STATUS_ERROR_MAP_FAILED as i32;
     }
     // Build the driver (controller_validate_entry inside).
-    let mut driver = match WalkerDriver::new(
+    let Ok(mut driver) = WalkerDriver::new(
         LocalExportProvider { inner: provider },
         &blob,
         binding.target_pid,
         binding.owner_pid,
-    ) {
-        Ok(d) => d,
-        Err(_) => {
-            lifecycle_set(WalkerSessionLifecycle::Aborted);
-            return WALKER_STATUS_ERROR_BAD_PARAMS as i32;
-        }
+    ) else {
+        lifecycle_set(WalkerSessionLifecycle::Aborted);
+        return WALKER_STATUS_ERROR_BAD_PARAMS as i32;
     };
     let sec_bytes = driver.session().section_bytes;
     let cap = driver.session().result_capacity;
-    let round1_size = match (cap as u64)
+    let Some(round1_size) = (cap as u64)
         .checked_mul(PROBE_RESULT_BYTES as u64)
         .and_then(|v| v.checked_add(96))
-    {
-        Some(v) => v,
-        None => {
-            lifecycle_set(WalkerSessionLifecycle::Aborted);
-            return WALKER_STATUS_ERROR_BAD_PARAMS as i32;
-        }
+    else {
+        lifecycle_set(WalkerSessionLifecycle::Aborted);
+        return WALKER_STATUS_ERROR_BAD_PARAMS as i32;
     };
-    let round1_size_usize = match usize::try_from(round1_size) {
-        Ok(v) => v,
-        Err(_) => {
-            lifecycle_set(WalkerSessionLifecycle::Aborted);
-            return WALKER_STATUS_ERROR_BAD_PARAMS as i32;
-        }
+    let Ok(round1_size_usize) = usize::try_from(round1_size) else {
+        lifecycle_set(WalkerSessionLifecycle::Aborted);
+        return WALKER_STATUS_ERROR_BAD_PARAMS as i32;
     };
     if driver.begin_round(1, 1000).is_err() {
         lifecycle_set(WalkerSessionLifecycle::Aborted);
@@ -1483,13 +1466,10 @@ fn walker_execute_inner(params_va: u64) -> i32 {
         lifecycle_set(WalkerSessionLifecycle::Aborted);
         return abort_status(&driver);
     }
-    let sec2_va = match binding.section1_va.checked_add(sec_bytes) {
-        Some(v) => v,
-        None => {
-            driver.abort(WalkerAbortReason::BadParams);
-            lifecycle_set(WalkerSessionLifecycle::Aborted);
-            return abort_status(&driver);
-        }
+    let Some(sec2_va) = binding.section1_va.checked_add(sec_bytes) else {
+        driver.abort(WalkerAbortReason::BadParams);
+        lifecycle_set(WalkerSessionLifecycle::Aborted);
+        return abort_status(&driver);
     };
     let mut sec2 = vec![0u8; round1_size_usize];
     if provider.read(sec2_va, &mut sec2).is_err() {
@@ -1506,27 +1486,19 @@ fn walker_execute_inner(params_va: u64) -> i32 {
         return abort_status(&driver);
     }
     // P0-1: production completion path — finalize + anchor + output.
-    let att = match driver.finalize_attestation(binding.authority()) {
-        Ok(a) => a,
-        Err(_) => {
-            lifecycle_set(WalkerSessionLifecycle::Aborted);
-            return abort_status(&driver);
-        }
+    let Ok(att) = driver.finalize_attestation(binding.authority()) else {
+        lifecycle_set(WalkerSessionLifecycle::Aborted);
+        return abort_status(&driver);
     };
     let top = build_walker_top_attestation(&binding, &att);
-    let anchored = match driver.anchor_into_v2(top, &att) {
-        Ok(a) => a,
-        Err(_) => {
-            lifecycle_set(WalkerSessionLifecycle::Aborted);
-            return abort_status(&driver);
-        }
+    let Ok(anchored) = driver.anchor_into_v2(top, &att) else {
+        lifecycle_set(WalkerSessionLifecycle::Aborted);
+        return abort_status(&driver);
     };
     // Output channel (P0-1/P1-2): the write MUST succeed before success.
     #[cfg(test)]
     if IMP09_OUTPUT_SINK_FAIL.load(std::sync::atomic::Ordering::SeqCst) {
-        driver.fail_abort(WalkerControlError::Io(WalkerIoError::Missing {
-            va: 0,
-        }));
+        driver.fail_abort(WalkerControlError::Io(WalkerIoError::Missing { va: 0 }));
         lifecycle_set(WalkerSessionLifecycle::Aborted);
         return WALKER_STATUS_ERROR_INTERNAL_PANIC as i32;
     }
@@ -1535,9 +1507,7 @@ fn walker_execute_inner(params_va: u64) -> i32 {
             *slot = Some(anchored);
         }
         Err(_) => {
-            driver.fail_abort(WalkerControlError::Io(WalkerIoError::Missing {
-                va: 0,
-            }));
+            driver.fail_abort(WalkerControlError::Io(WalkerIoError::Missing { va: 0 }));
             lifecycle_set(WalkerSessionLifecycle::Aborted);
             return WALKER_STATUS_ERROR_INTERNAL_PANIC as i32;
         }
@@ -1552,8 +1522,8 @@ fn build_walker_top_attestation(
     _att: &crate::attestation::WalkerAttestation,
 ) -> crate::attestation::RuntimeAttestationV2 {
     use crate::attestation::{
-        HookInventory, RuntimeAttestationV2, ATTESTATION_SCHEMA_V2,
-        ATTESTATION_SCHEMA_VERSION_V2, ARCH_X86_64, RUNTIME_ID, RUNTIME_VERSION,
+        HookInventory, RuntimeAttestationV2, ARCH_X86_64, ATTESTATION_SCHEMA_V2,
+        ATTESTATION_SCHEMA_VERSION_V2, RUNTIME_ID, RUNTIME_VERSION,
     };
     let inventory = HookInventory::unsupported(&[]);
     RuntimeAttestationV2 {
@@ -1654,7 +1624,10 @@ mod imp08_v2_tests {
     #[test]
     fn walker_execute_rejects_invalid_va_fail_closed() {
         unsafe {
-            assert_eq!(WalkerExecute(0), MidaAntidebugError::InvalidArgument.as_i32());
+            assert_eq!(
+                WalkerExecute(0),
+                MidaAntidebugError::InvalidArgument.as_i32()
+            );
             assert_eq!(
                 WalkerExecute(0xFFFF_8000_0000_0000),
                 MidaAntidebugError::InvalidArgument.as_i32()
@@ -1704,10 +1677,10 @@ mod imp08_v2_tests {
         let mut b = vec![0u8; 0x48];
         b[0x00..0x04].copy_from_slice(&1234u32.to_le_bytes());
         b[0x08..0x10].copy_from_slice(&0x0000_2000_0000u64.to_le_bytes());
-        b[0x10..0x18].copy_from_slice(&0x48u64.to_le_bytes());          // profile_id_off
+        b[0x10..0x18].copy_from_slice(&0x48u64.to_le_bytes()); // profile_id_off
         b[0x18..0x20].copy_from_slice(&((0x48 + 9) as u64).to_le_bytes()); // profile_digest_off
-        b[0x20..0x28].copy_from_slice(&1u64.to_le_bytes());             // expected_hooks
-        // surf_off filled after layout is known
+        b[0x20..0x28].copy_from_slice(&1u64.to_le_bytes()); // expected_hooks
+                                                            // surf_off filled after layout is known
         b[0x30..0x38].copy_from_slice(&V2_ENVELOPE_MAGIC.to_le_bytes());
         // digest_off filled after layout; digest_len
         b[0x40..0x48].copy_from_slice(&V2_DIGEST_LEN.to_le_bytes());
@@ -1837,9 +1810,7 @@ mod imp08_v2_tests {
         assert_eq!(checked_blob_end(0x1000, 0x100).unwrap(), 0x1100);
         assert_eq!(checked_blob_end(1, 1).unwrap(), 2);
     }
-
 }
-
 
 #[cfg(test)]
 mod imp09_walker_export_tests {
@@ -1848,9 +1819,9 @@ mod imp09_walker_export_tests {
     /// Serializes tests that touch the global provider/session bindings.
     static IMP09_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     use crate::walker_protocol::{
-        encode_section, derive_session_id, MappingIdentityHeaderV2, ProbeResultV2,
-        ResultSectionHeaderV2, WalkerParamsV2, CLASSIFICATION_TYPE_C, RESULT_FLAG_GUARD_SEEN,
-        COMPLETED_FLAG_DONE, PROBE_RESULT_BYTES, WALKER_STATUS_ERROR_INTERNAL_PANIC,
+        derive_session_id, encode_section, MappingIdentityHeaderV2, ProbeResultV2,
+        ResultSectionHeaderV2, WalkerParamsV2, CLASSIFICATION_TYPE_C, COMPLETED_FLAG_DONE,
+        PROBE_RESULT_BYTES, RESULT_FLAG_GUARD_SEEN, WALKER_STATUS_ERROR_INTERNAL_PANIC,
     };
 
     fn nonce() -> u64 {
@@ -1958,15 +1929,24 @@ mod imp09_walker_export_tests {
         let _guard = IMP09_TEST_LOCK.lock().unwrap();
         reset_walker_bindings();
         unsafe {
-            assert_eq!(WalkerExecute(0x0000_1000_0000), MidaAntidebugError::NotImplemented.as_i32());
+            assert_eq!(
+                WalkerExecute(0x0000_1000_0000),
+                MidaAntidebugError::NotImplemented.as_i32()
+            );
         }
     }
 
     #[test]
     fn walker_export_bad_va_is_invalid_argument() {
         unsafe {
-            assert_eq!(WalkerExecute(0), MidaAntidebugError::InvalidArgument.as_i32());
-            assert_eq!(WalkerExecute(0xFFFF_8000_0000_0000), MidaAntidebugError::InvalidArgument.as_i32());
+            assert_eq!(
+                WalkerExecute(0),
+                MidaAntidebugError::InvalidArgument.as_i32()
+            );
+            assert_eq!(
+                WalkerExecute(0xFFFF_8000_0000_0000),
+                MidaAntidebugError::InvalidArgument.as_i32()
+            );
         }
     }
 
@@ -1991,7 +1971,11 @@ mod imp09_walker_export_tests {
         unsafe {
             let r = WalkerExecute(params_va);
             assert!(r != WALKER_STATUS_OK as i32, "got {r}");
-            assert!(r >= WALKER_STATUS_ERROR_BAD_PARAMS as i32 && r <= WALKER_STATUS_ERROR_INTERNAL_PANIC as i32, "got {r}");
+            assert!(
+                r >= WALKER_STATUS_ERROR_BAD_PARAMS as i32
+                    && r <= WALKER_STATUS_ERROR_INTERNAL_PANIC as i32,
+                "got {r}"
+            );
         }
     }
 
@@ -2031,7 +2015,11 @@ mod imp09_walker_export_tests {
         unsafe {
             let r = WalkerExecute(params_va);
             assert_ne!(r, WALKER_STATUS_OK as i32, "second call must reject");
-            assert_eq!(r, MidaAntidebugError::NotImplemented.as_i32(), "terminal session");
+            assert_eq!(
+                r,
+                MidaAntidebugError::NotImplemented.as_i32(),
+                "terminal session"
+            );
         }
     }
 
@@ -2059,7 +2047,11 @@ mod imp09_walker_export_tests {
         }
         unsafe {
             let r = WalkerExecute(params_va);
-            assert_eq!(r, MidaAntidebugError::NotImplemented.as_i32(), "terminal after abort");
+            assert_eq!(
+                r,
+                MidaAntidebugError::NotImplemented.as_i32(),
+                "terminal after abort"
+            );
         }
     }
 
@@ -2075,7 +2067,10 @@ mod imp09_walker_export_tests {
         }
         let out = take_walker_output().expect("output channel must hold attestation");
         out.validate().expect("anchored attestation must validate");
-        let w = out.walker_attestation.as_ref().expect("walker attestation present");
+        let w = out
+            .walker_attestation
+            .as_ref()
+            .expect("walker attestation present");
         assert_eq!(w.rounds.len(), 2);
         assert_eq!(w.record_digest.len(), 64);
         assert_eq!(w.target_pid, 4242);
@@ -2157,11 +2152,7 @@ mod imp09_walker_export_tests {
         IMP09_OUTPUT_SINK_FAIL.store(true, std::sync::atomic::Ordering::SeqCst);
         unsafe {
             let r = WalkerExecute(params_va);
-            assert_eq!(
-                r,
-                WALKER_STATUS_ERROR_INTERNAL_PANIC as i32,
-                "got {r}",
-            );
+            assert_eq!(r, WALKER_STATUS_ERROR_INTERNAL_PANIC as i32, "got {r}",);
         }
         assert_eq!(
             lifecycle_get(),
@@ -2175,11 +2166,7 @@ mod imp09_walker_export_tests {
         // A second call must be rejected (terminal).
         unsafe {
             let r2 = WalkerExecute(params_va);
-            assert_eq!(
-                r2,
-                MidaAntidebugError::NotImplemented.as_i32(),
-                "got {r2}",
-            );
+            assert_eq!(r2, MidaAntidebugError::NotImplemented.as_i32(), "got {r2}",);
         }
         IMP09_OUTPUT_SINK_FAIL.store(false, std::sync::atomic::Ordering::SeqCst);
     }
@@ -2261,11 +2248,7 @@ mod imp09_walker_export_tests {
         assert!(bind_walker_session(binding(params_va, section1_va)));
         unsafe {
             let r = WalkerExecute(params_va);
-            assert_eq!(
-                r,
-                MidaAntidebugError::InternalPanic.as_i32(),
-                "got {r}",
-            );
+            assert_eq!(r, MidaAntidebugError::InternalPanic.as_i32(), "got {r}",);
         }
         assert_eq!(
             lifecycle_get(),
@@ -2278,11 +2261,7 @@ mod imp09_walker_export_tests {
         );
         unsafe {
             let r2 = WalkerExecute(params_va);
-            assert_eq!(
-                r2,
-                MidaAntidebugError::NotImplemented.as_i32(),
-                "got {r2}",
-            );
+            assert_eq!(r2, MidaAntidebugError::NotImplemented.as_i32(), "got {r2}",);
         }
     }
 
@@ -2528,10 +2507,7 @@ mod imp09_walker_export_tests {
             WalkerSessionLifecycle::Aborted,
             "owner==target must fail closed",
         );
-        assert!(
-            take_walker_output().is_none(),
-            "no output from aborted run",
-        );
+        assert!(take_walker_output().is_none(), "no output from aborted run",);
     }
 
     #[test]
@@ -2593,10 +2569,7 @@ mod imp09_walker_export_tests {
             WalkerSessionLifecycle::Unbound,
             "failed install leaves UNBOUND",
         );
-        assert!(
-            WALKER_SESSION.read().is_none(),
-            "no session published",
-        );
+        assert!(WALKER_SESSION.read().is_none(), "no session published",);
     }
 
     #[test]
@@ -2613,10 +2586,7 @@ mod imp09_walker_export_tests {
             WalkerSessionLifecycle::Unbound,
             "no READY without provider",
         );
-        assert!(
-            WALKER_SESSION.read().is_none(),
-            "no session published",
-        );
+        assert!(WALKER_SESSION.read().is_none(), "no session published",);
     }
 
     #[test]
@@ -2671,10 +2641,7 @@ mod imp09_walker_export_tests {
         let (prov, params_va, section1_va) = setup_valid();
         assert!(set_walker_provider(Box::new(prov)));
         assert!(bind_walker_session(binding(params_va, section1_va)));
-        assert_eq!(
-            lifecycle_get(),
-            WalkerSessionLifecycle::Ready,
-        );
+        assert_eq!(lifecycle_get(), WalkerSessionLifecycle::Ready,);
         // Attempt replacement: must fail (lifecycle != UNBOUND).
         let (prov2, _, _) = setup_valid();
         assert!(!set_walker_provider(Box::new(prov2)), "READY rejects");
@@ -2691,10 +2658,7 @@ mod imp09_walker_export_tests {
         assert!(bind_walker_session(binding(params_va, section1_va)));
         // Manually claim READY->RUNNING (as WalkerExecute would).
         assert!(lifecycle_claim(), "claim to RUNNING");
-        assert_eq!(
-            lifecycle_get(),
-            WalkerSessionLifecycle::Running,
-        );
+        assert_eq!(lifecycle_get(), WalkerSessionLifecycle::Running,);
         let (prov2, _, _) = setup_valid();
         assert!(!set_walker_provider(Box::new(prov2)), "RUNNING rejects");
         // Restore for other tests.
@@ -2714,10 +2678,7 @@ mod imp09_walker_export_tests {
             let r = WalkerExecute(params_va);
             assert_eq!(r, WALKER_STATUS_OK as i32, "got {r}");
         }
-        assert_eq!(
-            lifecycle_get(),
-            WalkerSessionLifecycle::Completed,
-        );
+        assert_eq!(lifecycle_get(), WalkerSessionLifecycle::Completed,);
         let (prov2, _, _) = setup_valid();
         assert!(!set_walker_provider(Box::new(prov2)), "terminal rejects");
     }

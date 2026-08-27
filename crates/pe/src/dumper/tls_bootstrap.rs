@@ -113,7 +113,7 @@ pub(crate) fn install_tls_callback_bootstrap(
     // Note: We use a dummy OEP for bootstrap since it won't jump anywhere
     // (TLS callbacks just return)
     // TODO: global_vars are detected but not yet used - need to implement global var restoration
-    let boot_stub = match super::container_bootstrap::build_tls_bootstrap_stub(
+    let Some(boot_stub) = super::container_bootstrap::build_tls_bootstrap_stub(
         boot_rva,
         get_process_heap_iat_rva,
         heap_alloc_iat_rva,
@@ -123,23 +123,20 @@ pub(crate) fn install_tls_callback_bootstrap(
         data_section_rva,
         heap_global_rva,
         None, // cookie_rva: TLS path uses metadata cookie fallback
-    ) {
-        Some(stub) => stub,
-        None => {
-            pe.sections.remove(boot_section_idx);
-            pe.nt_headers.optional_header.size_of_image = pe
-                .sections
-                .last()
-                .map(|section| {
-                    crate::utils::align_up(
-                        section.virtual_address.saturating_add(section.virtual_size),
-                        pe.nt_headers.optional_header.section_alignment,
-                    )
-                })
-                .unwrap_or(pe.nt_headers.optional_header.size_of_headers);
-            warn!("TLS bootstrap targets are outside the x64 relative-address range");
-            return None;
-        }
+    ) else {
+        pe.sections.remove(boot_section_idx);
+        pe.nt_headers.optional_header.size_of_image = pe
+            .sections
+            .last()
+            .map(|section| {
+                crate::utils::align_up(
+                    section.virtual_address.saturating_add(section.virtual_size),
+                    pe.nt_headers.optional_header.section_alignment,
+                )
+            })
+            .unwrap_or(pe.nt_headers.optional_header.size_of_headers);
+        warn!("TLS bootstrap targets are outside the x64 relative-address range");
+        return None;
     };
 
     let boot_len = boot_stub.len();

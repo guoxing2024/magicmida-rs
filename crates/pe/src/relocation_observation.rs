@@ -252,14 +252,11 @@ where
                 continue;
             }
             report.non_absolute_entry_count = report.non_absolute_entry_count.saturating_add(1);
-            let target_rva = match page_rva.checked_add(offset) {
-                Some(value) => value,
-                None => {
-                    report
-                        .blockers
-                        .push("relocation target RVA overflow".to_string());
-                    continue;
-                }
+            let Some(target_rva) = page_rva.checked_add(offset) else {
+                report
+                    .blockers
+                    .push("relocation target RVA overflow".to_string());
+                continue;
             };
             let valid_target =
                 valid_image_range(target_rva, pointer_size as u32, pe.size_of_image());
@@ -346,16 +343,13 @@ where
                 report.targets.push(target);
                 continue;
             }
-            let normalized = match pe.image_base.checked_add(runtime_value - load_base) {
-                Some(value) => value,
-                None => {
-                    target.status = RelocationTargetStatus::ValueOutsideImage;
-                    report
-                        .blockers
-                        .push("normalized relocation value overflow".to_string());
-                    report.targets.push(target);
-                    continue;
-                }
+            let Some(normalized) = pe.image_base.checked_add(runtime_value - load_base) else {
+                target.status = RelocationTargetStatus::ValueOutsideImage;
+                report
+                    .blockers
+                    .push("normalized relocation value overflow".to_string());
+                report.targets.push(target);
+                continue;
             };
             target.normalized_value = Some(normalized);
             report.targets.push(target);

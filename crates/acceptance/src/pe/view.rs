@@ -106,9 +106,9 @@ impl ParseIssue {
 /// Attempt to parse a PE image. Returns the image and any non-fatal notes, or
 /// a fatal issue if headers cannot be established.
 #[allow(clippy::unwrap_used)] // every unwrap below follows an explicit
-// in_bounds/checked length guard; the safe u16_le/u32_le/u64_le helpers can
-// only return None on a short buffer, and the guards make that unreachable.
-// These are parse invariants, not fallible error paths (WO-10).
+                              // in_bounds/checked length guard; the safe u16_le/u32_le/u64_le helpers can
+                              // only return None on a short buffer, and the guards make that unreachable.
+                              // These are parse invariants, not fallible error paths (WO-10).
 pub fn try_parse(bytes: &[u8]) -> Result<PeImage<'_>, ParseIssue> {
     if bytes.len() < 0x40 {
         return Err(ParseIssue::new(
@@ -371,9 +371,8 @@ impl<'a> PeImage<'a> {
         if size == 0 {
             return rva == 0 || rva < self.optional.size_of_image;
         }
-        let end = match (rva as u64).checked_add(size as u64) {
-            Some(e) => e,
-            None => return false,
+        let Some(end) = (rva as u64).checked_add(size as u64) else {
+            return false;
         };
         end <= self.optional.size_of_image as u64
     }
@@ -383,18 +382,16 @@ impl<'a> PeImage<'a> {
         if size == 0 {
             return true;
         }
-        let end = match rva.checked_add(size) {
-            Some(e) => e,
-            None => return false,
+        let Some(end) = rva.checked_add(size) else {
+            return false;
         };
         // Walk in steps; for small dirs checking endpoints + mid is enough for section spans
         // Full check: every page-equivalent byte maps; for MVP require start and last byte map
         // and no cross-section gap without raw.
         let mut cursor = rva;
         while cursor < end {
-            let off = match self.rva_to_offset(cursor) {
-                Some(o) => o,
-                None => return false,
+            let Some(off) = self.rva_to_offset(cursor) else {
+                return false;
             };
             if off >= self.bytes.len() {
                 return false;
@@ -406,9 +403,8 @@ impl<'a> PeImage<'a> {
                     continue;
                 }
                 let va = s.virtual_address;
-                let raw_end_rva = match va.checked_add(s.size_of_raw_data) {
-                    Some(v) => v,
-                    None => continue,
+                let Some(raw_end_rva) = va.checked_add(s.size_of_raw_data) else {
+                    continue;
                 };
                 if cursor >= va && cursor < raw_end_rva {
                     cursor = raw_end_rva.min(end);

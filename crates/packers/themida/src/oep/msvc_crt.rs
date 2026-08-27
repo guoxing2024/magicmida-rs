@@ -871,9 +871,8 @@ fn function_contains_sentinel(text_bytes: &[u8], text_rva: u32, func_rva: u32) -
         return false;
     }
     let off = (func_rva - text_rva) as usize;
-    let window = match text_bytes.get(off..text_bytes.len().min(off + 0x200)) {
-        Some(w) => w,
-        None => return false,
+    let Some(window) = text_bytes.get(off..text_bytes.len().min(off + 0x200)) else {
+        return false;
     };
     let sent = DEFAULT_SECURITY_COOKIE.to_le_bytes();
     window.windows(8).any(|w| w == sent)

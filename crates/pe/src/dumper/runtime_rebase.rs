@@ -4,7 +4,8 @@
 //! Production `.unwrap()`s are invariants: `position(is_structural)` runs only
 //! after the `n_struct == 0` early-continue, so a structural record exists
 //! (WO-10). Test unwraps are assertions.
-#![allow(clippy::unwrap_used)]//!
+#![allow(clippy::unwrap_used)]
+//!
 //! GTO R0 (heap/runtime rebase): a cold-start unpacked PE must not carry
 //! pointers into the original process's heap / private allocations. Those
 //! addresses die with the live process. This module turns the *captured*
@@ -1935,13 +1936,10 @@ pub fn build_runtime_rebase_plan(
         if p.classification != PointerClassification::InCapturedRegion {
             continue;
         }
-        let (region, offset) = match (p.target_region, p.target_offset) {
-            (Some(r), Some(o)) => (r, o),
-            _ => {
-                return Err(RebaseError::Plan(
-                    "InCapturedRegion pointer missing target mapping".into(),
-                ));
-            }
+        let (Some(region), Some(offset)) = (p.target_region, p.target_offset) else {
+            return Err(RebaseError::Plan(
+                "InCapturedRegion pointer missing target mapping".into(),
+            ));
         };
         let target_region = &regions[region];
         let old_target = target_region.old_base;
@@ -3507,7 +3505,7 @@ pub fn prepare_runtime_rebase_for_dump(
     original_oep_rva: u32,
     require_capture: bool,
 ) -> Result<PreparedRuntimeRebase, RebaseError> {
-    let plan = match build_runtime_rebase_plan(
+    let Some(plan) = build_runtime_rebase_plan(
         containers,
         heap_globals,
         heap_slabs,
@@ -3516,30 +3514,28 @@ pub fn prepare_runtime_rebase_for_dump(
         module_map,
         old_image_base,
         new_image_base,
-    )? {
-        Some(plan) => plan,
-        None => {
-            if require_capture {
-                return Err(RebaseError::RequiredRuntimeCaptureMissing);
-            }
-            // No plan and not required: produce an empty Prepared (no regions).
-            let empty = RuntimeRebasePlan {
-                regions: Vec::new(),
-                pointers: Vec::new(),
-                external_targets: Vec::new(),
-                candidates: Vec::new(),
-                aliases: Vec::new(),
-                old_image_base,
-                new_image_base,
-                plan_complete: true,
-                plan_digest: String::new(),
-            };
-            let summary = summarize_plan(&empty, None, original_oep_rva, None, "none", false);
-            return Ok(PreparedRuntimeRebase {
-                plan: empty,
-                summary,
-            });
+    )?
+    else {
+        if require_capture {
+            return Err(RebaseError::RequiredRuntimeCaptureMissing);
         }
+        // No plan and not required: produce an empty Prepared (no regions).
+        let empty = RuntimeRebasePlan {
+            regions: Vec::new(),
+            pointers: Vec::new(),
+            external_targets: Vec::new(),
+            candidates: Vec::new(),
+            aliases: Vec::new(),
+            old_image_base,
+            new_image_base,
+            plan_complete: true,
+            plan_digest: String::new(),
+        };
+        let summary = summarize_plan(&empty, None, original_oep_rva, None, "none", false);
+        return Ok(PreparedRuntimeRebase {
+            plan: empty,
+            summary,
+        });
     };
 
     // Offline validation before the runtime contract can be trusted. An

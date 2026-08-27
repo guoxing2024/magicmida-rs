@@ -547,18 +547,15 @@ fn pass2_vote(
             }
         }
 
-        let winner_mi = match winner_idx {
-            Some(mi) => mi,
-            None => {
-                for slot in &mut slots[group_start..=group_end] {
-                    if !slot.is_zero {
-                        slot.status = IatSlotStatus::Unresolved;
-                    }
+        let Some(winner_mi) = winner_idx else {
+            for slot in &mut slots[group_start..=group_end] {
+                if !slot.is_zero {
+                    slot.status = IatSlotStatus::Unresolved;
                 }
-                debug!(group_start, group_end, "IAT group has no valid candidates");
-                i = group_end + 1;
-                continue;
             }
+            debug!(group_start, group_end, "IAT group has no valid candidates");
+            i = group_end + 1;
+            continue;
         };
 
         // Pin each slot to the winner module's candidate
@@ -590,24 +587,21 @@ fn pass2_vote(
         let mut thunks: Vec<ImportThunk> = Vec::new();
 
         for j in group_start..=group_end {
-            let chosen = match slots[j]
+            let Some(chosen) = slots[j]
                 .chosen
                 .and_then(|candidate| slots[j].candidates.get(candidate))
                 .cloned()
-            {
-                Some(chosen) => chosen,
-                None => {
-                    slots[j].chosen = None;
-                    slots[j].rebuilt_value = None;
-                    if slots[j].status == IatSlotStatus::Resolved {
-                        slots[j].status = IatSlotStatus::Unresolved;
-                    }
-                    warn!(
-                        iat_va = format!("{:#x}", iat_address + (j * ptr_size) as u64),
-                        "IAT slot has no candidate for winning module"
-                    );
-                    continue;
+            else {
+                slots[j].chosen = None;
+                slots[j].rebuilt_value = None;
+                if slots[j].status == IatSlotStatus::Resolved {
+                    slots[j].status = IatSlotStatus::Unresolved;
                 }
+                warn!(
+                    iat_va = format!("{:#x}", iat_address + (j * ptr_size) as u64),
+                    "IAT slot has no candidate for winning module"
+                );
+                continue;
             };
 
             let Some(module) = modules.get(chosen.module_index) else {

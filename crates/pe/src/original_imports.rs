@@ -51,12 +51,9 @@ pub fn read_original_import_table(path: &Path) -> Vec<(String, Vec<String>)> {
         import_rva >= sec_start && import_rva < sec_end
     });
 
-    let section = match section {
-        Some(s) => s,
-        None => {
-            warn!("Import directory RVA {import_rva:#x} not found in any section");
-            return Vec::new();
-        }
+    let Some(section) = section else {
+        warn!("Import directory RVA {import_rva:#x} not found in any section");
+        return Vec::new();
     };
 
     let mut result: Vec<(String, Vec<String>)> = Vec::new();
@@ -141,10 +138,7 @@ pub fn read_original_import_table(path: &Path) -> Vec<(String, Vec<String>)> {
                 let end = start + s.virtual_size as usize;
                 thunk_rva >= start && thunk_rva < end
             });
-            let thunk_sec = match thunk_sec {
-                Some(s) => s,
-                None => break,
-            };
+            let Some(thunk_sec) = thunk_sec else { break };
             let thunk_off =
                 thunk_rva - thunk_sec.virtual_address as usize + thunk_sec.raw_offset as usize;
             if thunk_off + thunk_size > bytes.len() {
@@ -490,10 +484,7 @@ pub fn read_original_import_table_with_rvas(path: &Path) -> Vec<(String, u32, Ve
                 let end = start + s.virtual_size as usize;
                 thunk_rva_cur >= start && thunk_rva_cur < end
             });
-            let thunk_sec = match thunk_sec {
-                Some(s) => s,
-                None => break,
-            };
+            let Some(thunk_sec) = thunk_sec else { break };
             let thunk_off =
                 thunk_rva_cur - thunk_sec.virtual_address as usize + thunk_sec.raw_offset as usize;
             if thunk_off + thunk_size > bytes.len() {

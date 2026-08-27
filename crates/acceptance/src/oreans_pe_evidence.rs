@@ -923,9 +923,8 @@ fn raw_backed_range(image: &PeImage<'_>, rva: u32, size: u32) -> bool {
 fn rva_in_executable_section(image: &PeImage<'_>, rva: u32) -> bool {
     image.sections.iter().any(|section| {
         let start = section.virtual_address;
-        let end = match start.checked_add(section.virtual_extent() as u32) {
-            Some(end) => end,
-            None => return false,
+        let Some(end) = start.checked_add(section.virtual_extent() as u32) else {
+            return false;
         };
         rva >= start && rva < end && section.is_executable()
     })

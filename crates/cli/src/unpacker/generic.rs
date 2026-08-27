@@ -258,9 +258,8 @@ fn exports_contain_ahk(pe: &PeHeader, path: &Path) -> bool {
         return false;
     }
     // Read the export directory from the file at its raw offset.
-    let data = match std::fs::read(path) {
-        Ok(d) => d,
-        Err(_) => return false,
+    let Ok(data) = std::fs::read(path) else {
+        return false;
     };
     let dir_off = match pe.rva_to_offset(dir.virtual_address) {
         Some(o) => o as usize,

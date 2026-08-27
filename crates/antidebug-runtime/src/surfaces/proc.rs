@@ -561,9 +561,8 @@ pub fn restore_proc_002(
     mem: &dyn PebMemory,
     original_value: Option<String>,
 ) -> Result<RestoreResult, SurfaceError> {
-    let orig = match original_value {
-        Some(v) => v,
-        None => return Ok(RestoreResult::NotApplicable),
+    let Some(orig) = original_value else {
+        return Ok(RestoreResult::NotApplicable);
     };
     let parsed = u8::from_str_radix(orig.trim_start_matches("0x"), 16).map_err(|e| {
         SurfaceError::RestoreFailed {
@@ -584,9 +583,8 @@ pub fn restore_proc_003(
     mem: &dyn PebMemory,
     original_value: Option<String>,
 ) -> Result<RestoreResult, SurfaceError> {
-    let orig = match original_value {
-        Some(v) => v,
-        None => return Ok(RestoreResult::NotApplicable),
+    let Some(orig) = original_value else {
+        return Ok(RestoreResult::NotApplicable);
     };
     if orig == "0" {
         // Original was already 0; nothing to restore.

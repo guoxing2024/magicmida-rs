@@ -1044,9 +1044,8 @@ mod cookie_tests {
 /// MSVC x64 PE entry: `sub rsp, 28h; call __security_init_cookie; add rsp,28h; jmp scrt`
 fn is_crt_entry_wrapper(dump_buf: &[u8], ep_rva: u32) -> bool {
     let off = ep_rva as usize;
-    let bytes = match dump_buf.get(off..off.saturating_add(16)) {
-        Some(b) => b,
-        None => return false,
+    let Some(bytes) = dump_buf.get(off..off.saturating_add(16)) else {
+        return false;
     };
     bytes.len() >= 14
         && bytes[0..4] == [0x48, 0x83, 0xec, 0x28]

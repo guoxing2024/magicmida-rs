@@ -669,15 +669,12 @@ pub fn parse_toolchain_channel(content: &str) -> Result<Option<String>, String> 
         let key = line[..eq].trim();
         let value_rest = &line[eq + 1..];
         // Strip a trailing comment that is outside any string literal.
-        let value_text = match strip_trailing_comment(value_rest) {
-            Some(v) => v,
-            None => {
-                return Err(format!(
-                    "line {}: unterminated string in value {:?}",
-                    lineno + 1,
-                    line
-                ))
-            }
+        let Some(value_text) = strip_trailing_comment(value_rest) else {
+            return Err(format!(
+                "line {}: unterminated string in value {:?}",
+                lineno + 1,
+                line
+            ));
         };
         let value = value_text.trim();
         if value.is_empty() {

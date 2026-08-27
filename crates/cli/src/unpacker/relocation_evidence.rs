@@ -419,14 +419,11 @@ fn parse_final_candidate(bytes: &[u8]) -> anyhow::Result<FinalRelocationEvidence
             }
             evidence.has_non_absolute_entry = true;
             evidence.non_absolute_entry_count = evidence.non_absolute_entry_count.saturating_add(1);
-            let target_rva = match page_rva.checked_add(u32::from(word & 0x0fff)) {
-                Some(value) => value,
-                None => {
-                    evidence
-                        .blockers
-                        .push("relocation target RVA overflow".to_string());
-                    continue;
-                }
+            let Some(target_rva) = page_rva.checked_add(u32::from(word & 0x0fff)) else {
+                evidence
+                    .blockers
+                    .push("relocation target RVA overflow".to_string());
+                continue;
             };
             let raw_offset = raw_span(&pe, bytes, target_rva, width).map(|value| value as u64);
             let raw_backed = raw_offset.is_some();

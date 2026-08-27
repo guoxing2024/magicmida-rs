@@ -68,3 +68,9 @@ expect_used = "warn"
 print_stdout = "deny"
 dbg_macro = "deny"
 manual_let_else = "warn"
+# rustc lints shared by all member crates (WO-15): linker_messages is the
+# MSVC cdylib link noise (creating .lib/.exp) which is not a code defect;
+# suppress once here so member crates only need `[lints] workspace = true`.
+[workspace.lints.rust]
+linker_messages = "allow"
+

@@ -1,3 +1,6 @@
+// Integration-test stdout is the harness's visible progress/result
+// output (WO-15); print_stdout deny is for production crates only.
+#![allow(clippy::print_stdout)]
 // ADR7-B2 debugger-attach harness.
 // Attaches to a target process (DebugActiveProcess), observes for a fixed
 // window, records every exception event (code / first-chance / address /

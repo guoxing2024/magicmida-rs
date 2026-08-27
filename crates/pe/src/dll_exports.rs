@@ -116,12 +116,9 @@ pub fn read_dll_exports(dll_path: &Path) -> HashMap<u16, String> {
         }
     }
 
-    let export_file_offset = match export_file_offset {
-        Some(o) => o,
-        None => {
-            warn!("Export directory RVA not found in any section");
-            return result;
-        }
+    let Some(export_file_offset) = export_file_offset else {
+        warn!("Export directory RVA not found in any section");
+        return result;
     };
 
     if export_file_offset + 40 > bytes.len() {
@@ -172,14 +169,12 @@ pub fn read_dll_exports(dll_path: &Path) -> HashMap<u16, String> {
         }
     };
 
-    let names_offset = match rva_to_offset(names_rva) {
-        Some(o) => o,
-        None => return result,
+    let Some(names_offset) = rva_to_offset(names_rva) else {
+        return result;
     };
 
-    let ordinals_offset = match rva_to_offset(ordinals_rva) {
-        Some(o) => o,
-        None => return result,
+    let Some(ordinals_offset) = rva_to_offset(ordinals_rva) else {
+        return result;
     };
 
     // Read name/ordinal pairs
@@ -201,9 +196,8 @@ pub fn read_dll_exports(dll_path: &Path) -> HashMap<u16, String> {
         let ordinal =
             u16::from_le_bytes([bytes[ordinal_idx_offset], bytes[ordinal_idx_offset + 1]]);
 
-        let name_offset = match rva_to_offset(name_rva) {
-            Some(o) => o,
-            None => continue,
+        let Some(name_offset) = rva_to_offset(name_rva) else {
+            continue;
         };
 
         if name_offset >= bytes.len() {

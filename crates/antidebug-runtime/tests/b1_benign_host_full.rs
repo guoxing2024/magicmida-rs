@@ -1,3 +1,6 @@
+// Integration-test stdout is the harness's visible progress/result
+// output (WO-15); print_stdout deny is for production crates only.
+#![allow(clippy::print_stdout)]
 // ADR7-B B1 runtime-only full initialization harness (benign host).
 // MIDA anti-debug runtime DLL with Initialize -> GetAttestation -> Shutdown
 // per cycle. Verifies no resource growth (handles) and a clean lifecycle.

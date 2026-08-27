@@ -850,9 +850,8 @@ impl WalkerMemoryProvider for MemoryMapProvider {
         };
         let (base, bytes) = region;
         // va >= base holds by construction (range(..=va).next_back + guard).
-        let off = match usize::try_from(va - base) {
-            Ok(v) => v,
-            Err(_) => return Err(WalkerIoError::OutOfBounds { va, want, got: 0 }),
+        let Ok(off) = usize::try_from(va - base) else {
+            return Err(WalkerIoError::OutOfBounds { va, want, got: 0 });
         };
         let got = bytes.len().saturating_sub(off);
         if got < want {

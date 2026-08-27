@@ -369,9 +369,8 @@ pub(crate) fn gather_module_exports_from_remote(
             _ => break,
         };
 
-        let name_rva = match read_exp_u32(name_off) {
-            Ok(v) => v,
-            Err(_) => continue,
+        let Ok(name_rva) = read_exp_u32(name_off) else {
+            continue;
         };
         let func_index = match read_exp_u16(ord_off) {
             Ok(v) => v as usize,
@@ -382,9 +381,8 @@ pub(crate) fn gather_module_exports_from_remote(
             Some(off) if off + 4 <= exp_buf.len() => off,
             _ => continue,
         };
-        let func_rva = match read_exp_u32(fn_off) {
-            Ok(v) => v,
-            Err(_) => continue,
+        let Ok(func_rva) = read_exp_u32(fn_off) else {
+            continue;
         };
 
         // Read the name string
@@ -433,9 +431,8 @@ pub(crate) fn gather_module_exports_from_remote(
             Some(off) if off + 4 <= exp_buf.len() => off,
             _ => continue,
         };
-        let func_rva = match read_exp_u32(fn_off) {
-            Ok(v) => v,
-            Err(_) => continue,
+        let Ok(func_rva) = read_exp_u32(fn_off) else {
+            continue;
         };
         let ordinal = ordinal_base + i as u32;
         exports.insert(module_base + func_rva as u64, format!("#{ordinal}"));

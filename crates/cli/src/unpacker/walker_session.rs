@@ -17,8 +17,8 @@ use mida_antidebug_runtime::walker_control::WalkerIoError;
 use mida_antidebug_runtime::walker_control::WalkerMemoryProvider;
 use mida_antidebug_runtime::walker_protocol::{
     derive_session_id, encode_section, is_canonical_user_va, MappingIdentityHeaderV2,
-    ResultSectionHeaderV2, WalkerParamsV2, MIN_SECTION_HEADER_BYTES,
-    PROBE_RESULT_BYTES, WALKER_SESSION_ID_BYTES,
+    ResultSectionHeaderV2, WalkerParamsV2, MIN_SECTION_HEADER_BYTES, PROBE_RESULT_BYTES,
+    WALKER_SESSION_ID_BYTES,
 };
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
@@ -78,11 +78,11 @@ impl RpmWalkerProvider {
     /// invalid handle, or query failure returns `None` (fail-closed).
     pub fn new(handle: HANDLE, target_pid: u32) -> Option<Self> {
         // Cross-check: open a fresh query handle and compare PIDs.
-        let probe =
-            match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, target_pid) } {
-                Ok(h) => h,
-                Err(_) => return None,
-            };
+        let Ok(probe) =
+            (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, target_pid) })
+        else {
+            return None;
+        };
         let probe_pid = unsafe { GetProcessId(probe) };
         unsafe {
             let _ = CloseHandle(probe);
@@ -115,9 +115,8 @@ impl WalkerMemoryProvider for RpmWalkerProvider {
             return Err(WalkerIoError::Missing { va });
         }
         // 2. overflow check (fail-closed).
-        let end = match va.checked_add(want as u64) {
-            Some(v) => v,
-            None => return Err(WalkerIoError::OutOfBounds { va, want, got: 0 }),
+        let Some(end) = va.checked_add(want as u64) else {
+            return Err(WalkerIoError::OutOfBounds { va, want, got: 0 });
         };
         // 3. mapped + committed + readable range check.
         let mut mbi = MEMORY_BASIC_INFORMATION::default();
@@ -135,9 +134,8 @@ impl WalkerMemoryProvider for RpmWalkerProvider {
         if mbi.State != MEM_COMMIT {
             return Err(WalkerIoError::Missing { va });
         }
-        let region_end = match (mbi.BaseAddress as u64).checked_add(mbi.RegionSize as u64) {
-            Some(v) => v,
-            None => return Err(WalkerIoError::OutOfBounds { va, want, got: 0 }),
+        let Some(region_end) = (mbi.BaseAddress as u64).checked_add(mbi.RegionSize as u64) else {
+            return Err(WalkerIoError::OutOfBounds { va, want, got: 0 });
         };
         if end > region_end {
             return Err(WalkerIoError::OutOfBounds { va, want, got: 0 });
@@ -344,12 +342,9 @@ pub fn prove_candidate_mapping(
         p.fail_reason = Some("candidate outside verified image envelope".to_string());
         return p;
     }
-    let probe_end = match candidate.checked_add(probe_span as u64) {
-        Some(v) => v,
-        None => {
-            p.fail_reason = Some("probe span overflow".to_string());
-            return p;
-        }
+    let Some(probe_end) = candidate.checked_add(probe_span as u64) else {
+        p.fail_reason = Some("probe span overflow".to_string());
+        return p;
     };
     if probe_end > envelope_end {
         p.fail_reason = Some("probe span crosses image envelope end".to_string());
@@ -382,12 +377,9 @@ pub fn prove_candidate_mapping(
     p.region_size = mbi.RegionSize as u64;
     p.region_type = mbi.Type.0;
     p.protection = mbi.Protect.0;
-    let region_end = match p.region_base.checked_add(p.region_size) {
-        Some(v) => v,
-        None => {
-            p.fail_reason = Some("region end overflow".to_string());
-            return p;
-        }
+    let Some(region_end) = p.region_base.checked_add(p.region_size) else {
+        p.fail_reason = Some("region end overflow".to_string());
+        return p;
     };
     p.probe_contained_in_region = probe_end <= region_end;
     p.readable_protection = protection_readable(mbi.Protect.0);
@@ -513,12 +505,11 @@ impl WalkerSessionMemory {
             Some(b) if b > 0 => b as usize,
             _ => return None,
         };
-        let sec_cap = match (candidate_count as u64)
+        let Some(sec_cap) = (candidate_count as u64)
             .checked_mul(PROBE_RESULT_BYTES as u64)
             .and_then(|v| v.checked_add(MIN_SECTION_HEADER_BYTES as u64))
-        {
-            Some(b) => b,
-            None => return None,
+        else {
+            return None;
         };
         let section_bytes = match section_region_bytes(sec_cap) {
             Some(b) if b > 0 => b as usize,
@@ -591,19 +582,18 @@ impl WalkerSessionMemory {
             result_nonce,
             result_bytes,
         );
-        let blob = match params.to_blob_bytes(candidates) {
-            Ok(b) => b,
-            Err(_) => return Err(()),
+        let Ok(blob) = params.to_blob_bytes(candidates) else {
+            return Err(());
         };
         if blob.len() > params_region_bytes(candidate_count).unwrap_or(0) as usize {
             return Err(());
         }
         // Verify the envelope locally before any write.
-        let (parsed, cands) =
-            match mida_antidebug_runtime::walker_protocol::controller_validate_entry(&blob) {
-                Ok(v) => v,
-                Err(_) => return Err(()),
-            };
+        let Ok((parsed, cands)) =
+            mida_antidebug_runtime::walker_protocol::controller_validate_entry(&blob)
+        else {
+            return Err(());
+        };
         if parsed.candidate_count != candidate_count || cands.len() != candidate_count as usize {
             return Err(());
         }
@@ -745,9 +735,8 @@ pub fn install_walker_session_production(
     }
     let mut mem = WalkerSessionMemory::new();
     let candidate_count = candidates.len() as u32;
-    let (params_va, section1_va) = match mem.allocate(target, candidate_count) {
-        Some(v) => v,
-        None => return None,
+    let Some((params_va, section1_va)) = mem.allocate(target, candidate_count) else {
+        return None;
     };
     // result_bytes = section capacity. The protocol REQUIRES
     // result_bytes == candidate_count*0x28 + MIN_SECTION_HEADER_BYTES
@@ -794,12 +783,9 @@ pub fn install_walker_session_production(
         mem.cleanup(target);
         return None;
     }
-    let provider = match RpmWalkerProvider::new(target, target_pid) {
-        Some(p) => p,
-        None => {
-            mem.cleanup(target);
-            return None;
-        }
+    let Some(provider) = RpmWalkerProvider::new(target, target_pid) else {
+        mem.cleanup(target);
+        return None;
     };
     let ok = mida_antidebug_runtime::exports::install_walker_session_verified(
         Box::new(provider),

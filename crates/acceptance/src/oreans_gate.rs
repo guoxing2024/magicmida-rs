@@ -891,15 +891,12 @@ fn validate_pe_evidence(
             continue;
         }
         let virtual_start = u64::from(section.virtual_address);
-        let virtual_end = match virtual_start.checked_add(extent) {
-            Some(end) => end,
-            None => {
-                failures.push(format!(
-                    "structured PE evidence section '{}' virtual range overflows",
-                    section.name
-                ));
-                continue;
-            }
+        let Some(virtual_end) = virtual_start.checked_add(extent) else {
+            failures.push(format!(
+                "structured PE evidence section '{}' virtual range overflows",
+                section.name
+            ));
+            continue;
         };
         if evidence.section_alignment != 0
             && section.virtual_address % evidence.section_alignment != 0
@@ -923,15 +920,12 @@ fn validate_pe_evidence(
         }
         if section.raw_size != 0 {
             let raw_start = u64::from(section.raw_offset);
-            let raw_end = match raw_start.checked_add(u64::from(section.raw_size)) {
-                Some(end) => end,
-                None => {
-                    failures.push(format!(
-                        "structured PE evidence section '{}' raw range overflows",
-                        section.name
-                    ));
-                    continue;
-                }
+            let Some(raw_end) = raw_start.checked_add(u64::from(section.raw_size)) else {
+                failures.push(format!(
+                    "structured PE evidence section '{}' raw range overflows",
+                    section.name
+                ));
+                continue;
             };
             raw_ranges.push((raw_start, raw_end, section.name.as_str()));
             if evidence.file_alignment != 0 && section.raw_offset % evidence.file_alignment != 0 {
@@ -1149,14 +1143,11 @@ fn validate_directory_coverage(
             "structured PE evidence {name} coverage has zero size"
         ));
     }
-    let end = match coverage.rva.checked_add(coverage.size) {
-        Some(end) => end,
-        None => {
-            failures.push(format!(
-                "structured PE evidence {name} coverage range overflows"
-            ));
-            return failures;
-        }
+    let Some(end) = coverage.rva.checked_add(coverage.size) else {
+        failures.push(format!(
+            "structured PE evidence {name} coverage range overflows"
+        ));
+        return failures;
     };
     if end > size_of_image {
         failures.push(format!(

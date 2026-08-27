@@ -4935,23 +4935,17 @@ pub fn build_patched_backing_slab_q0c(
                 }
                 let off = r.child_offset;
                 let len = r.length;
-                let end = match off.checked_add(len) {
-                    Some(e) => e,
-                    None => {
-                        return Err(OverlayError::TransformRunLedgerInvalid {
-                            run_index: ri,
-                            child_capture_id: r.child_capture_id.clone(),
-                            child_old_base: child_base,
-                            child_size: r.child_size,
-                            child_offset: off,
-                            length: len,
-                            transform_id: r.transform_id.clone(),
-                            reason: format!(
-                                "prior run length overflow for old_base {:#x}",
-                                child_base
-                            ),
-                        });
-                    }
+                let Some(end) = off.checked_add(len) else {
+                    return Err(OverlayError::TransformRunLedgerInvalid {
+                        run_index: ri,
+                        child_capture_id: r.child_capture_id.clone(),
+                        child_old_base: child_base,
+                        child_size: r.child_size,
+                        child_offset: off,
+                        length: len,
+                        transform_id: r.transform_id.clone(),
+                        reason: format!("prior run length overflow for old_base {:#x}", child_base),
+                    });
                 };
                 if end > current.len() || len == 0 {
                     return Err(OverlayError::TransformRunLedgerInvalid {

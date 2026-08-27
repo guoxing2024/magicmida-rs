@@ -4,7 +4,8 @@
 //! Production `.unwrap()`s are invariants: `next()` runs only after
 //! `near.len() == 1` / `strong.len() == 1` guards (WO-10). Test unwraps are
 //! assertions.
-#![allow(clippy::unwrap_used)]//!
+#![allow(clippy::unwrap_used)]
+//!
 //! Fail-closed for `--oep=crt`:
 //! - bare `sub rsp, imm8` is never an accepted PE entry
 //! - `__scrt_common_main_seh` body alone is never an accepted PE entry
@@ -224,18 +225,15 @@ fn try_match_strong_wrapper(
         return Err(None);
     }
 
-    let cand_rva = match text_rva.checked_add(off as u32) {
-        Some(r) => r,
-        None => {
-            return Err(Some(CrtCandidate {
-                rva: text_rva,
-                rule: "msvc_x64_pe_entry_wrapper",
-                confidence: CrtConfidence::WeakDiagnostic,
-                call_target_rva: None,
-                jmp_target_rva: None,
-                rejection: Some("candidate_rva_overflow"),
-            }));
-        }
+    let Some(cand_rva) = text_rva.checked_add(off as u32) else {
+        return Err(Some(CrtCandidate {
+            rva: text_rva,
+            rule: "msvc_x64_pe_entry_wrapper",
+            confidence: CrtConfidence::WeakDiagnostic,
+            call_target_rva: None,
+            jmp_target_rva: None,
+            rejection: Some("candidate_rva_overflow"),
+        }));
     };
 
     // Reasonable function boundary: start of buffer, or prior byte is INT3/NOP/null/ret-pad.
@@ -252,34 +250,28 @@ fn try_match_strong_wrapper(
 
     // call target: next_ip = cand_rva + 9, rel32 at b[5..9]
     let call_rel = i32::from_le_bytes([b[5], b[6], b[7], b[8]]);
-    let call_target = match checked_rel32_target(cand_rva.wrapping_add(9), call_rel) {
-        Some(t) => t,
-        None => {
-            return Err(Some(CrtCandidate {
-                rva: cand_rva,
-                rule: "msvc_x64_pe_entry_wrapper",
-                confidence: CrtConfidence::WeakDiagnostic,
-                call_target_rva: None,
-                jmp_target_rva: None,
-                rejection: Some("call_rel32_overflow"),
-            }));
-        }
+    let Some(call_target) = checked_rel32_target(cand_rva.wrapping_add(9), call_rel) else {
+        return Err(Some(CrtCandidate {
+            rva: cand_rva,
+            rule: "msvc_x64_pe_entry_wrapper",
+            confidence: CrtConfidence::WeakDiagnostic,
+            call_target_rva: None,
+            jmp_target_rva: None,
+            rejection: Some("call_rel32_overflow"),
+        }));
     };
 
     // jmp target: next_ip = cand_rva + 18, rel32 at b[14..18]
     let jmp_rel = i32::from_le_bytes([b[14], b[15], b[16], b[17]]);
-    let jmp_target = match checked_rel32_target(cand_rva.wrapping_add(18), jmp_rel) {
-        Some(t) => t,
-        None => {
-            return Err(Some(CrtCandidate {
-                rva: cand_rva,
-                rule: "msvc_x64_pe_entry_wrapper",
-                confidence: CrtConfidence::WeakDiagnostic,
-                call_target_rva: Some(call_target),
-                jmp_target_rva: None,
-                rejection: Some("jmp_rel32_overflow"),
-            }));
-        }
+    let Some(jmp_target) = checked_rel32_target(cand_rva.wrapping_add(18), jmp_rel) else {
+        return Err(Some(CrtCandidate {
+            rva: cand_rva,
+            rule: "msvc_x64_pe_entry_wrapper",
+            confidence: CrtConfidence::WeakDiagnostic,
+            call_target_rva: Some(call_target),
+            jmp_target_rva: None,
+            rejection: Some("jmp_rel32_overflow"),
+        }));
     };
 
     if !rva_in_any(call_target, executable_ranges) {
@@ -579,12 +571,9 @@ pub(super) fn scan_live_memory_for_real_oep(
     };
 
     let text_rva = text_sec.virtual_address;
-    let text_base_va = match image_base.checked_add(text_rva as usize) {
-        Some(v) => v,
-        None => {
-            warn!("CRT OEP scan: text_base_va overflow");
-            return Ok(None);
-        }
+    let Some(text_base_va) = image_base.checked_add(text_rva as usize) else {
+        warn!("CRT OEP scan: text_base_va overflow");
+        return Ok(None);
     };
 
     // Prefer full virtual size; optional BaseOfData clamp only when it expands nothing harmful.

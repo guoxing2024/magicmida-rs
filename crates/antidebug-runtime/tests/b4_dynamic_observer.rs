@@ -1,3 +1,6 @@
+// Integration-test stdout is the harness's visible progress/result
+// output (WO-15); print_stdout deny is for production crates only.
+#![allow(clippy::print_stdout)]
 // ADR7-B4 dynamic-instrumentation observer harness (debugger-side recorder).
 //
 // Attaches to a target process (DebugActiveProcess), observes the debug

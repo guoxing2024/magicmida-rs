@@ -20,9 +20,7 @@ thiserror = "1"
 
 [dev-dependencies]
 
-# The MSVC linker emits its normal stdout (creating .lib/.exp) in the
-# process locale; rustc's linker_messages lint surfaces that noise as a
-# warning on every cdylib link. It is not a code defect. Suppress at the
-# crate level so the workspace build is warning-free (P6 gate 4).
-[lints.rust]
-linker_messages = "allow"
+# Inherit workspace lint policy (WO-15): clippy unwrap/expect/let-else
+# hygiene plus rustc linker_messages (MSVC cdylib link noise, not a defect).
+[lints]
+workspace = true

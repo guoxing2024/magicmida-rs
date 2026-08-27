@@ -4,7 +4,8 @@
 //! Production `.unwrap()`s are parse invariants: `patch_crt_wrapper_jmp_to_stub`
 //! slices only after `get_mut(off..off+18).ok_or(...)?` guarantees 18 bytes
 //! (WO-10). Test unwraps are assertions.
-#![allow(clippy::unwrap_used)]//!
+#![allow(clippy::unwrap_used)]
+//!
 //! The stub embedded in `.boot`:
 //!
 //! 1. Calls GetProcessHeap
@@ -377,23 +378,20 @@ fn install_container_section(
         cookie_mirror,
     );
 
-    let stub = match stub_result {
-        Some(stub) => stub,
-        None => {
-            pe.sections.remove(section_idx);
-            pe.nt_headers.optional_header.size_of_image = pe
-                .sections
-                .last()
-                .map(|section| {
-                    crate::utils::align_up(
-                        section.virtual_address.saturating_add(section.virtual_size),
-                        pe.nt_headers.optional_header.section_alignment,
-                    )
-                })
-                .unwrap_or(pe.nt_headers.optional_header.size_of_headers);
-            warn!("Container bootstrap targets are outside the x64 relative-address range");
-            return None;
-        }
+    let Some(stub) = stub_result else {
+        pe.sections.remove(section_idx);
+        pe.nt_headers.optional_header.size_of_image = pe
+            .sections
+            .last()
+            .map(|section| {
+                crate::utils::align_up(
+                    section.virtual_address.saturating_add(section.virtual_size),
+                    pe.nt_headers.optional_header.section_alignment,
+                )
+            })
+            .unwrap_or(pe.nt_headers.optional_header.size_of_headers);
+        warn!("Container bootstrap targets are outside the x64 relative-address range");
+        return None;
     };
 
     let stub_len = stub.len();

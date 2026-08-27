@@ -4,7 +4,8 @@
 //! Production `.unwrap()`s are parse invariants: the `triple` window is always
 //! `POINTER_TRIPLE_SIZE` (24) bytes and the loop bound guarantees it is in
 //! bounds (WO-10). Test unwraps are assertions.
-#![allow(clippy::unwrap_used)]//!
+#![allow(clippy::unwrap_used)]
+//!
 //! When a protected sample stores application-critical objects in SecurityCookie-encoded
 //! containers within zero-raw sections, simply zeroing them during reconstruction prevents
 //! crashes but leaves the application uninitialized. This module captures the semantic
@@ -76,9 +77,8 @@ pub fn detect_containers(
         return Vec::new();
     }
 
-    let data = match pe.sections.iter().find(|s| s.name == ".data") {
-        Some(section) => section,
-        None => return Vec::new(),
+    let Some(data) = pe.sections.iter().find(|s| s.name == ".data") else {
+        return Vec::new();
     };
 
     let start = data.virtual_address as usize;
