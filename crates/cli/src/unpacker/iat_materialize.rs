@@ -28,25 +28,33 @@ pub(super) enum MaterializeStep {
 /// Per-anchor budget for the materialization wait (seconds).
 pub(super) const IAT_MATERIALIZE_TIMEOUT_SECS: u64 = 30;
 
-/// XX-5: consecutive identical `(exc, target)` AVs during the materialization
-/// wait beyond this count mean execution is not advancing (WinLicense trapped
-/// in a loop after detecting the breakpoint). Triggers the storm escape.
-pub(super) const IAT_MATERIALIZE_AV_STORM_THRESHOLD: u32 = 64;
+/// XX-6 (L'): consecutive identical `(code, address, params)` AVs during the
+/// materialization wait beyond this count mean the VM is deadlocked (zero
+/// evolution of the exception tuple). Distinct from the 30s timeout, which
+/// bounds a *progressing* VM that simply never reaches the FF15 anchor.
+pub(super) const IAT_MATERIALIZE_AV_DEADLOCK_THRESHOLD: u32 = 256;
 
-/// XX-5: log one line per this many repeated identical AVs (throttle).
+/// XX-6: log every AV up to this streak, then throttle (telemetry for the
+/// "is the VM progressing?" classification).
+pub(super) const IAT_MATERIALIZE_AV_TELEMETRY_FULL: u32 = 16;
+
+/// XX-6: after the full-telemetry window, log one line per this many repeats.
 pub(super) const IAT_MATERIALIZE_AV_LOG_INTERVAL: u32 = 100_000;
 
-/// XX-5: decide whether a same-address AV streak triggers the storm escape.
+/// XX-6: decide whether an identical-AV streak is a VM deadlock (zero
+/// evolution) warranting escape with `VmExceptionDeadlock`.
 ///
 /// Pure so the threshold is unit-tested without a live debuggee.
-pub(super) fn av_storm_triggered(streak: u32) -> bool {
-    streak >= IAT_MATERIALIZE_AV_STORM_THRESHOLD
+pub(super) fn av_deadlock_triggered(streak: u32) -> bool {
+    streak >= IAT_MATERIALIZE_AV_DEADLOCK_THRESHOLD
 }
 
-/// XX-5: decide whether to log this AV (first one, then throttled to the
-/// interval). `streak` is 1-based (first occurrence of a new pair = 1).
+/// XX-6: decide whether to log this AV. Full telemetry for the first
+/// `IAT_MATERIALIZE_AV_TELEMETRY_FULL` occurrences, then throttled to the
+/// interval. `streak` is 1-based (first occurrence of a new pair = 1).
 pub(super) fn should_log_materialize_av(streak: u32) -> bool {
-    streak <= 1 || streak.is_multiple_of(IAT_MATERIALIZE_AV_LOG_INTERVAL)
+    streak <= IAT_MATERIALIZE_AV_TELEMETRY_FULL
+        || streak.is_multiple_of(IAT_MATERIALIZE_AV_LOG_INTERVAL)
 }
 
 /// Decide the initial anchor after `.text` is stable and RIP is not in `.text`.
@@ -174,19 +182,20 @@ mod tests {
     }
 
     #[test]
-    fn av_storm_triggers_at_threshold_not_before() {
-        assert!(!av_storm_triggered(63));
-        assert!(av_storm_triggered(64));
-        assert!(av_storm_triggered(65));
-        assert!(!av_storm_triggered(0));
+    fn av_deadlock_triggers_at_threshold_not_before() {
+        assert!(!av_deadlock_triggered(255));
+        assert!(av_deadlock_triggered(256));
+        assert!(av_deadlock_triggered(257));
+        assert!(!av_deadlock_triggered(0));
     }
 
     #[test]
-    fn av_log_throttle_first_then_interval() {
-        // First occurrence always logs.
+    fn av_log_full_telemetry_then_throttle() {
+        // Full telemetry window (first 16 occurrences).
         assert!(should_log_materialize_av(1));
-        // Below the throttle interval: suppressed.
-        assert!(!should_log_materialize_av(2));
+        assert!(should_log_materialize_av(16));
+        // Below the throttle interval after the window: suppressed.
+        assert!(!should_log_materialize_av(17));
         assert!(!should_log_materialize_av(99_999));
         // At the interval and its multiples: logged.
         assert!(should_log_materialize_av(100_000));

@@ -672,7 +672,10 @@ pub fn unpack(
         iat_materialize_start: None,
         iat_materialize_last_av_exc: None,
         iat_materialize_last_av_target: None,
+        iat_materialize_last_av_exc_type: None,
         iat_materialize_av_streak: 0,
+        iat_materialize_last_av_rip: None,
+        iat_materialize_arm_pending: false,
         text_reguarded: false,
         oep: None,
         oep_provenance: OepProvenance::default(),
@@ -1007,41 +1010,27 @@ pub fn unpack(
                                         LogType::Info,
                                         &format!(
                                             "IAT materialize: FF15 site not hit in 30s — \
-                                             falling back to OEP {oep_va:#x}"
+                                             falling back to OEP {oep_va:#x} \
+                                             (arming deferred to next event stop)"
                                         ),
                                     );
-                                    let main_tid = dbg.main_thread_id();
-                                    let h_thread = dbg
-                                        .thread_handle(main_tid)
-                                        .map_err(|e| anyhow!("thread_handle for OEP fallback: {e}"))?;
-                                    let _ = unsafe { SuspendThread(h_thread) };
-                                    // XX-5: clear the DR2 site anchor, arm DR3 OEP.
+                                    // XX-6 (L'): clear the site anchor (DR2) now —
+                                    // clearing is a no-op on a non-suspended thread
+                                    // and safe — but defer arming DR3 to the next
+                                    // natural debug-event stop.
                                     if let Err(e) = dbg.clear_hw_breakpoint(2) {
                                         warn!("clear site HW breakpoint failed (non-fatal): {e}");
                                     }
-                                    match dbg.set_hw_breakpoint(3, oep_va, mida_core::HwbpType::Execute) {
-                                        Ok(()) => {
-                                            ls.iat_materialize_site = Some(oep_va);
-                                            ls.iat_materialize_fallback = true;
-                                            ls.iat_materialize_start = Some(std::time::Instant::now());
-                                            // Reset the AV-storm streak: a fresh anchor.
-                                            ls.iat_materialize_av_streak = 0;
-                                            ls.iat_materialize_last_av_exc = None;
-                                            ls.iat_materialize_last_av_target = None;
-                                            let _ = unsafe { ResumeThread(h_thread) };
-                                        }
-                                        Err(e) => {
-                                            warn!("arm OEP fallback breakpoint failed: {e}");
-                                            ls.iat_materialize_wait = false;
-                                            // Freeze + dump (fail-closed IAT).
-                                            log::log(
-                                                LogType::Warn,
-                                                "OEP fallback breakpoint arm failed — \
-                                                 freezing for fail-closed dump",
-                                            );
-                                            break;
-                                        }
-                                    }
+                                    ls.iat_materialize_site = Some(oep_va);
+                                    ls.iat_materialize_arm_pending = true;
+                                    ls.iat_materialize_fallback = true;
+                                    ls.iat_materialize_start = Some(std::time::Instant::now());
+                                    // Reset the AV streak: a fresh anchor.
+                                    ls.iat_materialize_av_streak = 0;
+                                    ls.iat_materialize_last_av_exc = None;
+                                    ls.iat_materialize_last_av_target = None;
+                                    ls.iat_materialize_last_av_exc_type = None;
+                                    ls.iat_materialize_last_av_rip = None;
                                 }
                                 iat_materialize::MaterializeStep::FreezeAndDump => {
                                     log::log(
@@ -1049,11 +1038,8 @@ pub fn unpack(
                                         "IAT materialize: anchors never hit — \
                                          freezing for fail-closed dump",
                                     );
-                                    let main_tid = dbg.main_thread_id();
-                                    if let Ok(h) = dbg.thread_handle(main_tid) {
-                                        let _ = unsafe { SuspendThread(h) };
-                                    }
-                                    // XX-5: clear any armed HW anchors (DR2/DR3).
+                                    // XX-6 (L'): clear any armed HW anchors (DR2/DR3)
+                                    // without self-owned suspend/resume.
                                     let _ = dbg.clear_hw_breakpoint(2);
                                     let _ = dbg.clear_hw_breakpoint(3);
                                     ls.iat_materialize_wait = false;
@@ -1287,49 +1273,43 @@ pub fn unpack(
                                         log::log(
                                             LogType::Info,
                                             &format!(
-                                                "IAT materialize: arming FF15 site {site_va:#x} — \
-                                                 continuing to materialize lazy IAT"
+                                                "IAT materialize: FF15 site {site_va:#x} \
+                                                 computed — arming deferred to next \
+                                                 debug-event stop (L')"
                                             ),
                                         );
-                                        // XX-5: hardware execute breakpoint (DR2) — a
-                                        // 0xCC software breakpoint is detected by
-                                        // WinLicense's VM integrity check and traps
-                                        // the process in an AV storm (XX-4).
-                                        dbg.set_hw_breakpoint(
-                                            2,
-                                            site_va,
-                                            mida_core::HwbpType::Execute,
-                                        )?;
+                                        // XX-6 (L'): do NOT arm here and do NOT
+                                        // self-owned Suspend/Resume. The poll
+                                        // branch already suspended the thread to
+                                        // read RIP; arming now + ResumeThread makes
+                                        // the VM resume from inside ntdll's
+                                        // exception dispatcher (XX-5 deadlock).
+                                        // Instead record the anchor and let the
+                                        // thread run; the HW breakpoint is written
+                                        // on the next natural debug-event stop.
                                         ls.iat_materialize_site = Some(site_va);
+                                        ls.iat_materialize_arm_pending = true;
                                         ls.iat_materialize_wait = true;
                                         ls.iat_materialize_fallback = false;
                                         ls.iat_materialize_start =
                                             Some(std::time::Instant::now());
-                                        // Continue execution from the suspended
-                                        // (poll) state so the breakpoint can fire.
-                                        let _ = unsafe { ResumeThread(h_thread) };
                                     }
                                     iat_materialize::MaterializeStep::ArmOep(oep_va) => {
                                         log::log(
                                             LogType::Info,
                                             &format!(
-                                                "IAT materialize: no FF15 site — arming OEP \
-                                                 {oep_va:#x} as fallback"
+                                                "IAT materialize: no FF15 site — OEP \
+                                                 {oep_va:#x} as fallback (arming \
+                                                 deferred to next event stop)"
                                             ),
                                         );
-                                        // XX-5: hardware execute breakpoint (DR3) for the
-                                        // OEP fallback anchor.
-                                        dbg.set_hw_breakpoint(
-                                            3,
-                                            oep_va,
-                                            mida_core::HwbpType::Execute,
-                                        )?;
+                                        // XX-6 (L'): same deferred arming as above.
                                         ls.iat_materialize_site = Some(oep_va);
+                                        ls.iat_materialize_arm_pending = true;
                                         ls.iat_materialize_wait = true;
                                         ls.iat_materialize_fallback = true;
                                         ls.iat_materialize_start =
                                             Some(std::time::Instant::now());
-                                        let _ = unsafe { ResumeThread(h_thread) };
                                     }
                                     iat_materialize::MaterializeStep::FreezeAndDump => {
                                         // No anchor at all: keep frozen, fail-closed.
@@ -1343,8 +1323,12 @@ pub fn unpack(
                                 }
                                 log::log(
                                     LogType::Info,
-                                    "Process frozen decision: IAT-materialization wait armed",
+                                    "IAT-materialization wait armed (deferred arming)",
                                 );
+                                // Resume the thread (poll-branch resume) so the VM
+                                // continues to its next natural event, where the
+                                // anchor HW breakpoint is armed.
+                                let _ = unsafe { ResumeThread(h_thread) };
                             }
                         } else {
                             log::log(
@@ -1378,6 +1362,45 @@ pub fn unpack(
                      IAT-materialization wait armed"
                 ),
             );
+        }
+
+        // XX-6 (L'): arm the deferred HW anchor at this natural event stop.
+        // The debugger has already suspended the faulting thread for this
+        // event, so writing DR0/DR1 here does NOT self-own a suspend/resume
+        // and does not break WinLicense's exception-driven VM timing.
+        if ls.iat_materialize_arm_pending {
+            if let Some(site) = ls.iat_materialize_site {
+                // XX-5/XX-6: DR2 for the FF15 site anchor, DR3 for the OEP
+                // fallback anchor (slots 0/1 are reserved for the CloseHandle /
+                // NtProtectVirtualMemory HW-BP chains on non-text-poll targets).
+                let slot = if ls.iat_materialize_fallback { 3 } else { 2 };
+                match dbg.set_hw_breakpoint(slot, site, mida_core::HwbpType::Execute) {
+                    Ok(()) => {
+                        log::log(
+                            LogType::Info,
+                            &format!(
+                                "IAT materialize: HW anchor armed at event stop \
+                                 (slot={slot}, site={site:#x})"
+                            ),
+                        );
+                        ls.iat_materialize_arm_pending = false;
+                    }
+                    Err(e) => {
+                        warn!("arm deferred HW anchor failed: {e}");
+                        ls.iat_materialize_arm_pending = false;
+                        ls.iat_materialize_wait = false;
+                        // Freeze + dump (fail-closed IAT).
+                        log::log(
+                            LogType::Warn,
+                            "deferred HW anchor arm failed — \
+                             freezing for fail-closed dump",
+                        );
+                        break;
+                    }
+                }
+            } else {
+                ls.iat_materialize_arm_pending = false;
+            }
         }
 
         match event {
@@ -2139,55 +2162,69 @@ pub fn unpack(
                 target_address,
                 exc_type,
             } => {
-                // XX-5 (B'): storm guard during the IAT-materialization wait.
-                // WinLicense traps in an identical-AV loop when it detects the
-                // anchor breakpoint. Count identical `(exc, target)` pairs and
-                // escape once they exceed the threshold — otherwise the wait
-                // loop spins forever (XX-4 logged 2.5M identical AVs).
+                // XX-6 (L'): deadlock guard during the IAT-materialization wait.
+                // WinLicense's exception-driven VM advances by evolving its AV
+                // parameters. A streak of *identical* `(exc_type, exc, target)`
+                // tuples means zero evolution (deadlock); a changing tuple means
+                // the VM is progressing. Full telemetry for the first 16, then
+                // throttled.
                 if ls.iat_materialize_wait {
-                    let same_pair = ls.iat_materialize_last_av_exc == Some(exception_addr)
-                        && ls.iat_materialize_last_av_target == Some(target_address);
-                    if same_pair {
+                    let same_tuple = ls.iat_materialize_last_av_exc == Some(exception_addr)
+                        && ls.iat_materialize_last_av_target == Some(target_address)
+                        && ls.iat_materialize_last_av_exc_type == Some(exc_type);
+                    if same_tuple {
                         ls.iat_materialize_av_streak =
                             ls.iat_materialize_av_streak.saturating_add(1);
                     } else {
                         ls.iat_materialize_av_streak = 1;
                         ls.iat_materialize_last_av_exc = Some(exception_addr);
                         ls.iat_materialize_last_av_target = Some(target_address);
+                        ls.iat_materialize_last_av_exc_type = Some(exc_type);
                     }
 
-                    // XX-5: throttled logging — first + every N-th occurrence.
+                    // XX-6: sample the faulting RIP for the telemetry window.
+                    let rip_now = dbg
+                        .get_thread_context_control(thread_id)
+                        .ok()
+                        .map(|c| c.Rip);
+                    let rip_moved = rip_now.is_some()
+                        && rip_now != ls.iat_materialize_last_av_rip;
+                    ls.iat_materialize_last_av_rip = rip_now;
+
                     if iat_materialize::should_log_materialize_av(
                         ls.iat_materialize_av_streak,
                     ) {
                         log::log(
                             LogType::Info,
                             &format!(
-                                "IAT materialize AV (streak {}): exc={exception_addr:#x}, \
-                                 target={target_address:#x}, thread={thread_id}",
-                                ls.iat_materialize_av_streak
+                                "IAT materialize AV (streak {}, rip={}, rip_moved={rip_moved}): \
+                                 exc={exception_addr:#x}, target={target_address:#x}, \
+                                 exc_type={exc_type}, thread={thread_id}",
+                                ls.iat_materialize_av_streak,
+                                rip_now
+                                    .map(|r| format!("{r:#x}"))
+                                    .unwrap_or_else(|| "?".into()),
                             ),
                         );
                     }
 
-                    if iat_materialize::av_storm_triggered(ls.iat_materialize_av_streak) {
+                    if iat_materialize::av_deadlock_triggered(ls.iat_materialize_av_streak) {
                         log::log(
                             LogType::Warn,
                             &format!(
-                                "IAT materialize: AV storm ({} identical AVs) — \
-                                 execution not advancing; aborting wait \
-                                 (MaterializeWaitAvStorm)",
+                                "IAT materialize: VM exception deadlock ({} identical \
+                                 AV tuples, rip_moved={rip_moved}) — zero evolution; \
+                                 aborting wait (VmExceptionDeadlock)",
                                 ls.iat_materialize_av_streak
                             ),
                         );
-                        // Freeze, disarm anchors, leave for fail-closed dump.
-                        let main_tid = dbg.main_thread_id();
-                        if let Ok(h) = dbg.thread_handle(main_tid) {
-                            let _ = unsafe { SuspendThread(h) };
-                        }
+                        // The faulting thread is already suspended by the AV
+                        // debug event — no self-owned suspend. Disarm anchors
+                        // and leave for fail-closed dump.
                         let _ = dbg.clear_hw_breakpoint(2);
                         let _ = dbg.clear_hw_breakpoint(3);
                         ls.iat_materialize_wait = false;
+                        ls.iat_materialize_arm_pending = false;
                         break;
                     }
                 }
@@ -2262,15 +2299,14 @@ pub fn unpack(
                              materialized, freezing for dump"
                         ),
                     );
-                    let main_tid = dbg.main_thread_id();
-                    if let Ok(h) = dbg.thread_handle(main_tid) {
-                        let _ = unsafe { SuspendThread(h) };
-                    }
-                    // XX-5: disarm the HW anchors (DR2/DR3).
+                    // XX-6 (L'): the faulting thread is already suspended by the
+                    // #DB debug event — no self-owned suspend needed. Disarm the
+                    // HW anchors (DR2/DR3).
                     let _ = dbg.clear_hw_breakpoint(2);
                     let _ = dbg.clear_hw_breakpoint(3);
                     ls.iat_materialize_wait = false;
                     ls.iat_materialize_site = None;
+                    ls.iat_materialize_arm_pending = false;
                     break;
                 }
                 // Not our anchor: fall through to the normal single-step path.

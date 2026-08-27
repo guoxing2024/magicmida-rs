@@ -40,9 +40,21 @@ pub(super) struct LoopState {
     /// XX-5: the target address of the last unrelated AV seen during the
     /// materialization wait (pair key with `iat_materialize_last_av_exc`).
     pub(super) iat_materialize_last_av_target: Option<u64>,
-    /// XX-5: consecutive count of the identical `(exc, target)` AV pair seen
-    /// during the materialization wait. Reset when the pair changes.
+    /// XX-6: the access type (ExceptionInformation[0]) of the last AV seen
+    /// during the materialization wait (deadlock key component).
+    pub(super) iat_materialize_last_av_exc_type: Option<u8>,
+    /// XX-6: consecutive count of the identical `(exc_type, exc, target)` AV
+    /// tuple seen during the materialization wait. Reset when the tuple
+    /// changes (which indicates the VM is progressing).
     pub(super) iat_materialize_av_streak: u32,
+    /// XX-6 (L'): when the faulting-thread RIP at the last telemetry-sampled
+    /// AV (to distinguish "same exception, moving RIP" from a true deadlock).
+    pub(super) iat_materialize_last_av_rip: Option<u64>,
+    /// XX-6 (L'): an anchor address has been computed but the HW breakpoint is
+    /// not yet armed. Arming is deferred to the next natural debug-event stop
+    /// (thread already suspended by the event) instead of a self-owned
+    /// Suspend/Resume, which breaks WinLicense's exception-driven VM timing.
+    pub(super) iat_materialize_arm_pending: bool,
     /// .text poll: re-guard done, waiting for AV at OEP
     pub(super) text_reguarded: bool,
     pub(super) oep: Option<usize>,
