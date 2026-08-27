@@ -957,12 +957,24 @@ pub fn unpack(
 
         // Slice 3b-3/3b-6: recompute flags; leave via shared helper.
         refresh_plugin_loop_policy(&mut packer, &mut plugin_ctx, &ls);
+        // XX-4: the IAT-materialization wait keeps the loop alive past the
+        // plugin's frozen-dump leave request; the breakpoint handler (or the
+        // per-anchor timeout) is what actually ends the wait.
         if let Some(reason) = plugin_leave_reason(&plugin_ctx) {
+            if !ls.iat_materialize_wait {
+                log::log(
+                    LogType::Info,
+                    &format!("PackerPlugin leave_debug_loop before wait ({reason})"),
+                );
+                break;
+            }
             log::log(
                 LogType::Info,
-                &format!("PackerPlugin leave_debug_loop before wait ({reason})"),
+                &format!(
+                    "PackerPlugin leave_debug_loop ({reason}) suppressed — \
+                     IAT-materialization wait armed"
+                ),
             );
-            break;
         }
 
         // Prefer finite wait while plugin says so (text-poll); else blocking.
@@ -1330,11 +1342,20 @@ pub fn unpack(
         // Frozen-dump / leave decisions from plugin (e.g. OEP via scan).
         refresh_plugin_loop_policy(&mut packer, &mut plugin_ctx, &ls);
         if let Some(reason) = plugin_leave_reason(&plugin_ctx) {
+            if !ls.iat_materialize_wait {
+                log::log(
+                    LogType::Info,
+                    &format!("PackerPlugin leave_debug_loop ({reason})"),
+                );
+                break;
+            }
             log::log(
                 LogType::Info,
-                &format!("PackerPlugin leave_debug_loop ({reason})"),
+                &format!(
+                    "PackerPlugin leave_debug_loop ({reason}) suppressed — \
+                     IAT-materialization wait armed"
+                ),
             );
-            break;
         }
 
         match event {
