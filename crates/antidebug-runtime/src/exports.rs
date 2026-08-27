@@ -200,6 +200,8 @@ fn build_attestation_from_outcomes(
 /// # Safety
 /// - `profile_id` / `profile_digest` must be valid NUL-terminated UTF-8 strings;
 /// - `expected_surfaces` must point to `expected_hooks` valid string pointers;
+///   `expected_hooks` MUST be <= 64 (H-1 bound; a larger value is rejected
+///   with `InvalidArgument`, never walked);
 /// - must be called once from a single thread;
 /// - panics are caught and reported as [`MidaAntidebugError::InternalPanic`].
 #[no_mangle]
@@ -250,9 +252,26 @@ fn initialize_inner(
     }
     let profile_id = unsafe { read_cstr(p.profile_id) }.unwrap_or_default();
     let profile_digest = unsafe { read_cstr(p.profile_digest) }.unwrap_or_default();
+    // H-1 (TEAM_AUDIT_REPORT): v1 entry had an UNBOUNDED loop over
+    // `expected_hooks`, dereferencing `expected_surfaces.add(i)` per item with
+    // no upper bound — a hostile count made the array walk read arbitrary
+    // memory. Fail closed instead: cap the count (a legit init never lists
+    // more than a handful of hard-required surfaces) and require the array
+    // pointer when a positive count is claimed. ABI unchanged; the V2 path
+    // already enforces the same shape via V2_MAX_HOOKS.
+    const V1_MAX_HOOKS: usize = 64;
+    if p.expected_hooks > V1_MAX_HOOKS {
+        return MidaAntidebugError::InvalidArgument.as_i32();
+    }
+    if p.expected_hooks > 0 && p.expected_surfaces.is_null() {
+        return MidaAntidebugError::InvalidArgument.as_i32();
+    }
     let mut expected = Vec::new();
     if !p.expected_surfaces.is_null() && p.expected_hooks > 0 {
-        // SAFETY: caller contract guarantees expected_hooks valid pointers.
+        // SAFETY: p.expected_hooks <= 64 (checked above) and the caller
+        // contract (H-1, tightened) requires `expected_surfaces` to point to
+        // that many valid NUL-terminated string pointers; read_cstr bounds
+        // each string read at 4096 bytes + NUL.
         for i in 0..p.expected_hooks {
             let sp = unsafe { *p.expected_surfaces.add(i) };
             expected.push(unsafe { read_cstr(sp) }.unwrap_or_default());
@@ -1809,6 +1828,118 @@ mod imp08_v2_tests {
         assert_eq!(checked_blob_end(0, 0).unwrap(), 0);
         assert_eq!(checked_blob_end(0x1000, 0x100).unwrap(), 0x1100);
         assert_eq!(checked_blob_end(1, 1).unwrap(), 2);
+    }
+}
+
+#[cfg(test)]
+mod imp08_v1_tests {
+    use super::*;
+
+    /// Call initialize_inner with VALID output buffers so the early
+    /// InvalidArgument guard (null/zero outputs) does not mask the v1
+    /// expected_hooks provenance checks under test.
+    fn initialize_v1_inner_probe(p: &MidaInitParams) -> i32 {
+        let mut out_sha = [0u8; 64];
+        let mut out_att = [0u8; 4096];
+        let mut written = 0usize;
+        initialize_inner(
+            p as *const MidaInitParams,
+            out_sha.as_mut_ptr(),
+            out_sha.len(),
+            out_att.as_mut_ptr(),
+            out_att.len(),
+            &mut written,
+        )
+    }
+
+    fn base_params() -> MidaInitParams {
+        // Static NUL-terminated byte strings keep the pointers valid for the
+        // whole test (b"..\0" embeds the terminator; c-strings are not
+        // available on this rustc).
+        static PROFILE_ID: [u8; 7] = *b"prof-1\0";
+        static PROFILE_DIGEST: [u8; 6] = *b"dig-1\0";
+        MidaInitParams {
+            target_pid: 0x1234,
+            module_base: 0x7FF6_0000_0000,
+            profile_id: PROFILE_ID.as_ptr() as *const std::os::raw::c_char,
+            profile_digest: PROFILE_DIGEST.as_ptr() as *const std::os::raw::c_char,
+            expected_hooks: 0,
+            expected_surfaces: std::ptr::null(),
+        }
+    }
+
+    /// A valid expected_surfaces array of `n` C strings. Returns the owning
+    /// CStrings alongside the pointer array so the pointers stay valid for
+    /// the caller's scope.
+    fn surf_array(names: &[&str]) -> (Vec<std::ffi::CString>, Vec<*const std::os::raw::c_char>) {
+        let cstrings: Vec<std::ffi::CString> = names
+            .iter()
+            .map(|s| std::ffi::CString::new(*s).unwrap())
+            .collect();
+        let ptrs = cstrings.iter().map(|c| c.as_ptr()).collect();
+        (cstrings, ptrs)
+    }
+
+    #[test]
+    fn v1_legit_hooks_pass() {
+        let names = ["ad_proc_002", "ad_proc_003"];
+        let (_keep, arr) = surf_array(&names);
+        let mut p = base_params();
+        p.expected_hooks = 2;
+        p.expected_surfaces = arr.as_ptr();
+        // Legit init: hooks in bounds; the runtime then fails later on the
+        // PEB surface install (no real target) — but must NOT hit
+        // InvalidArgument from the hooks provenance check. The first check
+        // after hooks is surface install, so we assert we got past it.
+        let rc = initialize_v1_inner_probe(&p);
+        assert_ne!(
+            rc,
+            MidaAntidebugError::InvalidArgument.as_i32(),
+            "legit hooks must not be rejected by provenance"
+        );
+        // Either SurfaceInstallFailed (no real PEB) or a later code path;
+        // InvalidArgument (code 3) specifically must not come from hooks.
+    }
+
+    #[test]
+    fn v1_oversized_hooks_rejected() {
+        let names = ["ad_proc_002"];
+        let (_keep, arr) = surf_array(&names);
+        let mut p = base_params();
+        p.expected_hooks = 65; // > V1_MAX_HOOKS
+        p.expected_surfaces = arr.as_ptr();
+        let rc = initialize_v1_inner_probe(&p);
+        assert_eq!(
+            rc,
+            MidaAntidebugError::InvalidArgument.as_i32(),
+            "expected_hooks > 64 must fail closed"
+        );
+    }
+
+    #[test]
+    fn v1_huge_hooks_rejected() {
+        let mut p = base_params();
+        p.expected_hooks = usize::MAX / 2;
+        p.expected_surfaces = std::ptr::NonNull::<*const i8>::dangling().as_ptr();
+        let rc = initialize_v1_inner_probe(&p);
+        assert_eq!(
+            rc,
+            MidaAntidebugError::InvalidArgument.as_i32(),
+            "hostile count must fail closed before any array walk"
+        );
+    }
+
+    #[test]
+    fn v1_positive_hooks_with_null_array_rejected() {
+        let mut p = base_params();
+        p.expected_hooks = 3;
+        p.expected_surfaces = std::ptr::null();
+        let rc = initialize_v1_inner_probe(&p);
+        assert_eq!(
+            rc,
+            MidaAntidebugError::InvalidArgument.as_i32(),
+            "positive hooks with null array must fail closed"
+        );
     }
 }
 
