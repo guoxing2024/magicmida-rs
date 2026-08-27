@@ -439,12 +439,17 @@ pub fn unpack(
     // post-attach: when section 0 is plain .text (not a Themida
     // virtualized section) and the target is not .NET, create the
     // process WITHOUT DEBUG_ONLY_THIS_PROCESS.
-    let text_is_plain_for_attach = state
+    // Name-erasure fallback: Themida/WinLicense wipes section names to
+    // spaces ("        ") while the code section remains the first
+    // executable section. Treat an all-blank-named first executable
+    // section the same as plain ".text" so the no-debug-port attach path
+    // (which avoids the Themida DebugPort stall entirely) is used.
+    let section0_plain_name = state
         .pe_info
         .pe_sections
         .first()
-        .is_some_and(|s| s.name == ".text")
-        && !is_dotnet;
+        .is_some_and(|s| s.name == ".text" || s.name.trim().is_empty());
+    let text_is_plain_for_attach = section0_plain_name && !is_dotnet;
     if packer.uses_gto_observation() {
         validate_gto_route(profile, text_is_plain_for_attach)
             .map_err(|reason| anyhow!("GTO preflight blocked before process creation: {reason}"))?;
@@ -629,7 +634,7 @@ pub fn unpack(
         .pe_info
         .pe_sections
         .first()
-        .is_some_and(|s| s.name == ".text");
+        .is_some_and(|s| s.name == ".text" || s.name.trim().is_empty());
     let mut plugin_ctx = PluginCtx {
         preferred_base: Some(PreferredBase(pe.image_base)),
         is_dotnet,
@@ -744,6 +749,42 @@ pub fn unpack(
                     cleanup_report.summary()
                 ),
             );
+            return Ok(());
+        }
+        // LEGACY ESCAPE HATCH (post-attach branch, same contract as the
+        // CREATE_PROCESS branch): MIDA_LEGACY_ANTIDEBUG=1 skips the
+        // ADR-3B controller gate and runs the classic post-attach path
+        // (no debug port, direct text-poll + dump). Default stays
+        // fail-closed.
+        if std::env::var("MIDA_LEGACY_ANTIDEBUG").ok().as_deref() == Some("1") {
+            log::log(
+                LogType::Warn,
+                "MIDA_LEGACY_ANTIDEBUG=1: ADR-3B anti-debug controller gate SKIPPED                   (legacy post-attach path; no MIDA runtime attestation)",
+            );
+            run_post_attach_path(
+                &mut dbg,
+                &mut state,
+                &mut pe,
+                &mut packer,
+                &mut plugin_ctx,
+                &mut early_section_snapshots,
+                is_dotnet,
+                is_64bit,
+                do_data_sections,
+                shrink,
+                oep_policy,
+                container_restore,
+                profile,
+                pure_rebuild,
+                dump_timing,
+                capture_policy,
+                input,
+                &output_path,
+            )?;
+            if let Some(ctx) = evidence_ctx.take() {
+                crate::runner_preflight::complete_run_evidence(ctx, &output_path)
+                    .map_err(|e| anyhow!("evidence bundle assembly failed after a legacy run: {e:#}"))?;
+            }
             return Ok(());
         }
         let evidence_dir = output_path
@@ -1190,7 +1231,39 @@ pub fn unpack(
                     // ScyllaHide is NOT a MIDA success proof. It is never used
                     // as a silent fallback here; it may only run in explicit
                     // oracle mode (future differential experiments, ADR-7).
-                    let evidence_dir = output_path
+                    //
+                    // LEGACY ESCAPE HATCH (operator opt-in only): setting
+                    // MIDA_LEGACY_ANTIDEBUG=1 restores the pre-ADR-3B Oreans
+                    // behaviour — ScyllaHide injection + the classic debug
+                    // loop — and skips the controller gate entirely. This is
+                    // for local RE workflows on unprotected/self-owned
+                    // samples; the default (unset) remains fail-closed.
+                    let legacy_antidebug =
+                        std::env::var("MIDA_LEGACY_ANTIDEBUG").ok().as_deref() == Some("1");
+                    if legacy_antidebug {
+                        // Pre-ADR-3B ScyllaHide injection (Oreans legacy path).
+                        // Injector missing -> warn (non-fatal), matching the
+                        // pre-gate behaviour; the debug loop still runs.
+                        let injector_path = helpers::scylla_injector_path();
+                        let hook_delay_ms: u64 = 500;
+                        let scylla_config = mida_packers_themida::ScyllaHideConfig {
+                            injector_cli_path: injector_path.display().to_string(),
+                            hook_library_path: helpers::scylla_hook_path().display().to_string(),
+                            ini_path: None,
+                            hook_delay_ms,
+                        };
+                        if let Err(e) = mida_packers_themida::inject_scylla_hide(
+                            pid,
+                            &scylla_config,
+                        ) {
+                            warn!("ScyllaHide injection failed (non-fatal): {e}");
+                        } else {
+                            info!("ScyllaHide injected (legacy escape hatch)");
+                        }
+                        // Store resolved APIs for later breakpoint comparisons.
+                        dbg.apis = Some(apis);
+                    } else {
+                        let evidence_dir = output_path
                         .parent()
                         .map(|p| p.to_path_buf())
                         .unwrap_or_else(|| std::path::PathBuf::from("."));
@@ -1527,6 +1600,7 @@ pub fn unpack(
 
                     // Store resolved APIs for later breakpoint comparisons.
                     dbg.apis = Some(apis);
+                    } // legacy_antidebug else (MIDA-ADR-3B fail-closed controller)
                 }
 
                 // Fix PE header anti-dump: Themida corrupts the first byte

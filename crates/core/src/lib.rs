@@ -49,4 +49,6 @@ pub use runtime_engine::{
     guard_oep_event_script, CapabilityOp, CapabilityRecord, DebuggerCoreEngine, EngineEvent,
     ReplayMemory, ReplayRuntimeEngine, RuntimeEngine, ThreadContextSnapshot,
 };
-pub use windows_debugger::{DrainDisposition, DrainReceipt, DrainStats, WindowsDebugger};
+pub use windows_debugger::{
+    enumerate_process_threads, DrainDisposition, DrainReceipt, DrainStats, WindowsDebugger,
+};

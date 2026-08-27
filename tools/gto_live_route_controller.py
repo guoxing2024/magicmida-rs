@@ -43,6 +43,25 @@ GTO_ENV_BYPASS = "MIDA_GTO_BYPASS"
 GTO_ENV_SEMANTIC_REPAIR = "MIDA_GTO_SEMANTIC_REPAIR"
 GTO_ENV_CONTRACT_VALUE = "1"
 
+# IMP-09-LIVE-PREP (P3): runtime-authority pass-through allowlist additions.
+# The post-attach runtime loader (crates/cli/src/unpacker/runtime_loader.rs)
+# resolves MIDA_RUNTIME_AUTHORITY (authority manifest PATH) and MIDA_RUNTIME_DLL
+# (runtime artifact PATH) from the CHILD env; unset -> loader fails closed.
+# These keys authorize PASS-THROUGH ONLY: build_env copies them into the child
+# env when (and only when) they are both allowlisted and set on the parent;
+# absence is RECORDED as the loader's fail-closed posture (never fabricated).
+# MIDA_RUNTIME_AUTHORITY_DIGEST is a compile-time option_env! constant that no
+# runtime code reads from the child env — it is allowlisted for symmetric
+# documentation-level pass-through only.
+GTO_ENV_RUNTIME_AUTHORITY = "MIDA_RUNTIME_AUTHORITY"
+GTO_ENV_RUNTIME_AUTHORITY_DIGEST = "MIDA_RUNTIME_AUTHORITY_DIGEST"
+GTO_ENV_RUNTIME_DLL = "MIDA_RUNTIME_DLL"
+GTO_ENV_RUNTIME_AUTHORITY_VARS = (
+    GTO_ENV_RUNTIME_AUTHORITY,
+    GTO_ENV_RUNTIME_AUTHORITY_DIGEST,
+    GTO_ENV_RUNTIME_DLL,
+)
+
 
 def find_capture_policy_path(argv: List[str]) -> Optional[str]:
     """Extract the ``--capture-policy=<path>`` value from the child argv, if any."""
@@ -237,12 +256,36 @@ def validate_authorized_env(env: Dict[str, str], allowlist: List[str]) -> Dict[s
     when the effective env does not explicitly set MIDA_GTO_NO_BYPASS=1, or when a
     bypass / semantic-repair escape hatch is present. The caller MUST NOT spawn when
     ``ok`` is False (protected_spawn stays 0).
+
+    IMP-09-LIVE-PREP (P3): additionally RECORDS the runtime-authority
+    pass-through posture under ``runtime_authority_pass_through`` (per-var
+    ``in_allowlist`` / ``present_in_effective_env`` / ``path_exists``). This is
+    recording-only evidence: it NEVER changes ``ok``, so observation-only runs
+    without the runtime vars stay valid while an armed run's missing runtime
+    authority is visible in the effective-env evidence instead of silently
+    failing deep inside the loader.
     """
     allowlist_has_no_bypass = GTO_ENV_NO_BYPASS in allowlist
     no_bypass_value = env.get(GTO_ENV_NO_BYPASS)
     no_bypass_ok = no_bypass_value == GTO_ENV_CONTRACT_VALUE
     bypass_present = GTO_ENV_BYPASS in env
     semantic_repair_present = GTO_ENV_SEMANTIC_REPAIR in env
+    # IMP-09-LIVE-PREP (P3): record-only runtime-authority pass-through posture.
+    runtime_authority: Dict[str, Any] = {}
+    for _var in GTO_ENV_RUNTIME_AUTHORITY_VARS:
+        _entry: Dict[str, Any] = {
+            "in_allowlist": _var in allowlist,
+            "present_in_effective_env": _var in env,
+        }
+        if _var in env:
+            _value = env[_var]
+            if _var == GTO_ENV_RUNTIME_AUTHORITY_DIGEST:
+                # Compile-time constant mirrored for evidence only; never a
+                # runtime credential.
+                _entry["recorded_as"] = "compile_time_option_env_mirror"
+            else:
+                _entry["path_exists"] = Path(_value).exists()
+        runtime_authority[_var] = _entry
     ok = allowlist_has_no_bypass and no_bypass_ok and not bypass_present and not semantic_repair_present
     evidence = {
         "ok": ok,
@@ -255,6 +298,10 @@ def validate_authorized_env(env: Dict[str, str], allowlist: List[str]) -> Dict[s
         "bypass_absent": not bypass_present,
         "semantic_repair_present": semantic_repair_present,
         "semantic_repair_absent": not semantic_repair_present,
+        "runtime_authority_pass_through": runtime_authority,
+        "runtime_authority_all_allowlisted": all(
+            entry["in_allowlist"] for entry in runtime_authority.values()
+        ),
     }
     if not ok:
         reasons = []

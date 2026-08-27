@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context};
 
 use mida_core::{CreateProcessOptions, DebuggerCore, WindowsDebugger};
-use mida_pe::{ContainerRestoreMode, DumpOptions, DumpProfile, PeHeader};
+use mida_pe::{ContainerRestoreMode, DumpOptions, DumpProfile, OepPolicy, PeHeader};
 
 use super::generic_gate::{
     check_generic_dump, gate_inputs_from_pe, is_ahk_export_name, validate_generic_dump,
@@ -63,6 +63,8 @@ pub fn generic_unpack(
     wait_sec: u64,
     stable_needed: u32,
     gate_profile: GenericGateProfile,
+    iat_location: Option<(usize, usize)>,
+    oep_policy: Option<OepPolicy>,
 ) -> Result<(), anyhow::Error> {
     let pe = PeHeader::from_file(input).map_err(|e| anyhow!("parse PE failed: {e}"))?;
     let output_path = resolve_output_path(input, output);
@@ -178,13 +180,19 @@ pub fn generic_unpack(
 
     let dump_opts = DumpOptions {
         image_base: dbg.image_base(),
-        entry_point: pe.entry_point,
+        // Apply --oep=rva=N override when provided; otherwise preserve the
+        // runtime-observed entry point (which for packed samples may still
+        // point at the packer stub).
+        entry_point: match oep_policy {
+            Some(OepPolicy::Fixed(rva)) => rva,
+            _ => pe.entry_point,
+        },
         fix_imports: true,
         create_data_sections: true,
         shrink: false,
         output_path: output_path.clone(),
         executable_path: Some(input.to_path_buf()),
-        iat_location: None,
+        iat_location,
         additional_iat_locations: Vec::new(),
         early_section_snapshots: Vec::new(),
         container_restore: ContainerRestoreMode::Off,

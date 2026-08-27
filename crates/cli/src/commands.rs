@@ -68,6 +68,8 @@ pub fn run_command(cmd: Command) -> Result<(), anyhow::Error> {
             wait_sec,
             stable,
             gate_profile,
+            iat_location,
+            oep_policy,
             verbose: _,
         } => crate::unpacker::generic_unpack(
             &input,
@@ -75,6 +77,8 @@ pub fn run_command(cmd: Command) -> Result<(), anyhow::Error> {
             wait_sec,
             stable,
             gate_profile,
+            iat_location,
+            oep_policy,
         ),
         Command::DumpProcess { pid, unpacked_file } => {
             crate::unpacker::dump_process_code(pid, &unpacked_file)

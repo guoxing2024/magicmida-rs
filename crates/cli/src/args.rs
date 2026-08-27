@@ -52,6 +52,13 @@ pub enum Command {
         stable: u32,
         /// Which hard-gate profile to enforce on the dumped PE.
         gate_profile: GenericGateProfile,
+        /// Optional (absolute virtual address, byte size) of the runtime
+        /// IAT table. Overrides the target PE header's IAT data directory,
+        /// which packers such as Themida wipe (zero) both on disk and in the
+        /// live image while leaving the IMPORT directory intact.
+        iat_location: Option<(usize, usize)>,
+        /// Optional OEP override (rva=N) for the dumped PE entry point.
+        oep_policy: Option<OepPolicy>,
         verbose: bool,
     },
     DumpProcess {
@@ -347,6 +354,8 @@ fn parse_generic(args: &[String]) -> Result<Command, String> {
     let mut wait_sec = 60u64;
     let mut stable = 2u32;
     let mut gate_profile = GenericGateProfile::PackerAgnostic;
+    let mut iat_location: Option<(usize, usize)> = None;
+    let mut oep_policy: Option<OepPolicy> = None;
     let mut verbose = false;
     let mut i = 3;
     while i < args.len() {
@@ -397,6 +406,30 @@ fn parse_generic(args: &[String]) -> Result<Command, String> {
                 }
                 gate_profile = parse_gate_profile(&args[i])?;
             }
+            // Optional runtime IAT override: absolute virtual address, size.
+            // Format: --iat-location=0x14013F1E8,0x200 or "140013F1E8,512".
+            other if other.starts_with("--iat-location=") => {
+                let v = &other["--iat-location=".len()..];
+                iat_location = Some(parse_iat_location(v)?);
+            }
+            "--iat-location" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("Missing value after --iat-location (VA,size).".into());
+                }
+                iat_location = Some(parse_iat_location(&args[i])?);
+            }
+            // Optional OEP override (generic path): --oep=rva=0x1010
+            other if other.starts_with("--oep=") => {
+                oep_policy = Some(parse_oep_policy(&other["--oep=".len()..])?);
+            }
+            "--oep" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("Missing value after --oep (crt|captured|rva=N).".into());
+                }
+                oep_policy = Some(parse_oep_policy(&args[i])?);
+            }
             other if other.starts_with('-') => return Err(format!("Unknown option: {}", other)),
             other => {
                 if output.is_none() {
@@ -414,8 +447,31 @@ fn parse_generic(args: &[String]) -> Result<Command, String> {
         wait_sec,
         stable,
         gate_profile,
+        iat_location,
+        oep_policy,
         verbose,
     })
+}
+
+/// Parse `--iat-location=VA,size` (absolute virtual address, byte size).
+/// Accepts decimal or 0x-prefixed hex for both fields.
+fn parse_iat_location(s: &str) -> Result<(usize, usize), String> {
+    let (va_s, size_s) = s.split_once(',').ok_or_else(|| {
+        format!("invalid --iat-location '{s}' (expected VA,size e.g. 0x14013F1E8,0x200)")
+    })?;
+    let parse_num = |v: &str| -> Result<usize, String> {
+        if let Some(hex) = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
+            usize::from_str_radix(hex, 16).map_err(|_| format!("invalid hex number '{v}'"))
+        } else {
+            v.parse::<usize>().map_err(|_| format!("invalid number '{v}'"))
+        }
+    };
+    let va = parse_num(va_s.trim())?;
+    let size = parse_num(size_s.trim())?;
+    if va == 0 || size == 0 {
+        return Err("--iat-location VA and size must be non-zero".into());
+    }
+    Ok((va, size))
 }
 
 fn parse_dump_process(args: &[String]) -> Result<Command, String> {

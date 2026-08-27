@@ -20,12 +20,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let prov = Path::new(PROVENANCE);
     let out = Path::new(OUT);
 
-    let (plan, meta) = mida_pe::rebuild::tr_surface::build_tr_surface_plan(comps, prov)?;
+    // --entry <hex>: 可选 EP 覆盖(H4B 记录 original_oep_rva=0x90176)
+    let entry: Option<u32> = std::env::args()
+        .nth(1)
+        .map(|a| u32::from_str_radix(a.trim_start_matches("0x"), 16))
+        .transpose()?;
+
+    let (plan, meta) =
+        mida_pe::rebuild::tr_surface::build_tr_surface_plan(comps, prov, entry)?;
     println!(
-        "plan: {} sections | image_base={:#x} | size_of_image={:#x} | ep_tbd={} | deferred={:?}",
+        "plan: {} sections | image_base={:#x} | size_of_image={:#x} | entry={:#x} (tbd={}) | deferred={:?}",
         meta.sections.len(),
         meta.image_base,
         meta.size_of_image,
+        meta.entry_point_rva,
         meta.entry_point_tbd,
         meta.deferred_directories
     );

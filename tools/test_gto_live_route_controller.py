@@ -190,6 +190,91 @@ def test_semantic_repair_absent(ctrl):
           not ev2["ok"] and "semantic_repair_var_present" in ev2.get("failure_reasons", []))
 
 
+# IMP-09-LIVE-PREP (P3): runtime-authority vars PASS THROUGH when allowlisted
+# and set on the parent (build_env copies them; contract records presence).
+def test_runtime_authority_pass_through_when_allowlisted_and_set(ctrl):
+    ws = Path(tempfile.mkdtemp(prefix="liveprep_rt_pass_"))
+    manifest = ws / "manifest.json"
+    dll = ws / "mida_antidebug_runtime.dll"
+    manifest.write_text("{}", encoding="utf-8")
+    dll.write_bytes(b"MZ")
+    saved = {k: os.environ.get(k) for k in ctrl.GTO_ENV_RUNTIME_AUTHORITY_VARS}
+    try:
+        os.environ["MIDA_GTO_NO_BYPASS"] = "1"
+        os.environ[ctrl.GTO_ENV_RUNTIME_AUTHORITY] = str(manifest)
+        os.environ[ctrl.GTO_ENV_RUNTIME_AUTHORITY_DIGEST] = "a" * 64
+        os.environ[ctrl.GTO_ENV_RUNTIME_DLL] = str(dll)
+        allowlist = ["MIDA_GTO_NO_BYPASS"] + list(ctrl.GTO_ENV_RUNTIME_AUTHORITY_VARS)
+        env = ctrl.build_env(allowlist)
+        ev = ctrl.validate_authorized_env(env, allowlist)
+        pt = ev.get("runtime_authority_pass_through", {})
+        ok = (
+            ev["ok"] is True
+            and ev.get("runtime_authority_all_allowlisted") is True
+            and pt.get(ctrl.GTO_ENV_RUNTIME_AUTHORITY, {}).get("in_allowlist") is True
+            and pt.get(ctrl.GTO_ENV_RUNTIME_AUTHORITY, {}).get("present_in_effective_env") is True
+            and pt.get(ctrl.GTO_ENV_RUNTIME_AUTHORITY, {}).get("path_exists") is True
+            and env.get(ctrl.GTO_ENV_RUNTIME_AUTHORITY) == str(manifest)
+            and pt.get(ctrl.GTO_ENV_RUNTIME_DLL, {}).get("in_allowlist") is True
+            and pt.get(ctrl.GTO_ENV_RUNTIME_DLL, {}).get("present_in_effective_env") is True
+            and pt.get(ctrl.GTO_ENV_RUNTIME_DLL, {}).get("path_exists") is True
+            and env.get(ctrl.GTO_ENV_RUNTIME_DLL) == str(dll)
+            and pt.get(ctrl.GTO_ENV_RUNTIME_AUTHORITY_DIGEST, {}).get("present_in_effective_env") is True
+            and pt.get(ctrl.GTO_ENV_RUNTIME_AUTHORITY_DIGEST, {}).get("recorded_as")
+                == "compile_time_option_env_mirror"
+        )
+        check("live_prep_p3_runtime_authority_pass_through_when_allowlisted_and_set",
+              ok, f"pt={json.dumps(pt, sort_keys=True)}")
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+# IMP-09-LIVE-PREP (P3): DEFAULT (vars unset on parent) -> absent from the
+# effective child env and RECORDED as fail-closed posture — never fabricated.
+# U0-B ok-semantics are unchanged (an unset runtime authority must not block
+# observation-only runs; the loader itself fails closed at run time).
+def test_runtime_authority_default_fail_closed_absent_not_fabricated(ctrl):
+    saved = {k: os.environ.get(k) for k in ctrl.GTO_ENV_RUNTIME_AUTHORITY_VARS}
+    try:
+        for k in ctrl.GTO_ENV_RUNTIME_AUTHORITY_VARS:
+            os.environ.pop(k, None)
+        os.environ["MIDA_GTO_NO_BYPASS"] = "1"
+        allowlist = ["MIDA_GTO_NO_BYPASS"] + list(ctrl.GTO_ENV_RUNTIME_AUTHORITY_VARS)
+        env = ctrl.build_env(allowlist)
+        ev = ctrl.validate_authorized_env(env, allowlist)
+        pt = ev.get("runtime_authority_pass_through", {})
+        ok = (
+            ev["ok"] is True  # U0-B semantics unchanged by P3
+            and all(not pt[v]["present_in_effective_env"] for v in ctrl.GTO_ENV_RUNTIME_AUTHORITY_VARS)
+            and all(pt[v]["in_allowlist"] for v in ctrl.GTO_ENV_RUNTIME_AUTHORITY_VARS)
+            and all("path_exists" not in pt[v] for v in ctrl.GTO_ENV_RUNTIME_AUTHORITY_VARS)
+            and ctrl.GTO_ENV_RUNTIME_AUTHORITY not in env
+            and ctrl.GTO_ENV_RUNTIME_DLL not in env
+        )
+        check("live_prep_p3_runtime_authority_default_fail_closed_absent_not_fabricated",
+              ok, f"pt={json.dumps(pt, sort_keys=True)}")
+        # Complement: parent HAS the vars but the caller's allowlist does not
+        # carry them -> build_env must NOT leak them into the child env.
+        os.environ[ctrl.GTO_ENV_RUNTIME_AUTHORITY] = r"C:\nonexistent\manifest.json"
+        os.environ[ctrl.GTO_ENV_RUNTIME_DLL] = r"C:\nonexistent\runtime.dll"
+        env_leak = ctrl.build_env(["MIDA_GTO_NO_BYPASS"])
+        check("live_prep_p3_runtime_authority_not_leaked_without_allowlist",
+              ctrl.GTO_ENV_RUNTIME_AUTHORITY not in env_leak
+              and ctrl.GTO_ENV_RUNTIME_DLL not in env_leak,
+              f"leaked_auth={ctrl.GTO_ENV_RUNTIME_AUTHORITY in env_leak} "
+              f"leaked_dll={ctrl.GTO_ENV_RUNTIME_DLL in env_leak}")
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
 # U0-D: effective env matches the authorized contract.
 def test_effective_env_matches_authorized_contract(ctrl):
     env = {"MIDA_GTO_NO_BYPASS": "1"}
@@ -963,6 +1048,9 @@ def main():
     test_no_bypass_propagates_to_child(ctrl)
     test_bypass_vars_absent(ctrl)
     test_semantic_repair_absent(ctrl)
+    # IMP-09-LIVE-PREP (P3)
+    test_runtime_authority_pass_through_when_allowlisted_and_set(ctrl)
+    test_runtime_authority_default_fail_closed_absent_not_fabricated(ctrl)
     test_effective_env_matches_authorized_contract(ctrl)
     test_capture_policy_arg_missing_fails_before_spawn(ctrl)
     test_capture_policy_file_missing_fails_before_spawn(ctrl)

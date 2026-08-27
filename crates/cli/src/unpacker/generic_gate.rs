@@ -181,10 +181,23 @@ pub fn validate_generic_dump(
 #[must_use]
 pub fn gate_inputs_from_pe(pe: &PeHeader, has_ahk_export: bool) -> GenericGateInputs {
     const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
+    const IMAGE_SCN_CNT_CODE: u32 = 0x0000_0020;
     let is_exec = |s: &mida_pe::PeSection| (s.characteristics & IMAGE_SCN_MEM_EXECUTE) != 0;
     let is_large_rx = |s: &mida_pe::PeSection| is_exec(s) && s.virtual_size >= 0x100000;
 
-    let text = pe.sections.iter().find(|s| s.name.starts_with(".text"));
+    // .text detection with a name-erasure fallback: packers such as
+    // Themida/WinLicense wipe section names to spaces ("        ") while the
+    // code section stays the first executable section with the CODE flag.
+    // Treat an all-blank-named executable section as the code section so the
+    // gate does not reject a structurally valid dump.
+    let text = pe.sections.iter().find(|s| s.name.starts_with(".text")).or_else(|| {
+        pe.sections.iter().find(|s| {
+            s.name.trim().is_empty()
+                && is_exec(s)
+                && (s.characteristics & IMAGE_SCN_CNT_CODE) != 0
+                && s.virtual_size > 0
+        })
+    });
     let text_present = text.is_some();
     let text_has_raw = text.is_some_and(|s| s.raw_size > 0);
 

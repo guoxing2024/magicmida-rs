@@ -19,7 +19,6 @@ use mida_pe::{ContainerRestoreMode, DumpProfile, EarlySectionSnapshot, OepPolicy
 
 use super::early_snapshots::{
     log_snapshot_summary, merge_reinitializable_data_state, refresh_early_snapshots_after_loader,
-    update_pre_text_snapshots,
 };
 use super::plugin_host::{enter_dump_phase, SelectedPacker};
 use super::post_loop::run_post_loop_phases;
@@ -102,7 +101,13 @@ pub(super) fn run_post_attach_path(
     );
 
     let poll_start = std::time::Instant::now();
-    let max_wait = std::time::Duration::from_secs(60);
+    // MIDA-LEGACY-ATTACH: Themida/WinLicense samples with multi-threaded
+    // initializers can take 2-3 minutes before any thread transfers into
+    // decrypted .text. The historic 60s cap caused a wrong OEP
+    // (".text base + 0x10") to be picked by the scan fallback, producing
+    // non-runnable candidates. 300s matches the observed worst case while
+    // keeping a hard backstop.
+    let max_wait = std::time::Duration::from_secs(300);
     let main_tid = dbg.main_thread_id();
     let h_thread = dbg
         .thread_handle(main_tid)
@@ -122,7 +127,7 @@ pub(super) fn run_post_attach_path(
         if poll_start.elapsed() > max_wait {
             log::log(
                 LogType::Warn,
-                "post-attach: OEP observation timeout after 60s - proceeding with scan",
+                "post-attach: OEP observation timeout - proceeding with scan",
             );
             break;
         }
@@ -144,11 +149,11 @@ pub(super) fn run_post_attach_path(
             Err(e) => {
                 // GetExitCodeProcess can fail with insufficient rights or if the
                 // process handle was never granted PROCESS_QUERY_LIMITED_INFORMATION.
-                // Don't assume the process is dead 鈥?log and keep polling; the
-                // outer 60s timeout is the real backstop.
+                // Don't assume the process is dead — log and keep polling; the
+                // outer timeout is the real backstop.
                 log::log(
             LogType::Warn,
-            &format!("post-attach: GetExitCodeProcess failed: {e} (exit_code={:#x}) 鈥?assuming still alive", exit_code),
+            &format!("post-attach: GetExitCodeProcess failed: {e} (exit_code={:#x}) — assuming still alive", exit_code),
         );
                 true
             }
@@ -180,55 +185,65 @@ pub(super) fn run_post_attach_path(
             }
         }
 
-        let previous = unsafe { SuspendThread(h_thread) };
-        if loop_count <= 3 {
-            eprintln!("[TRACE] SuspendThread returned: {}", previous);
+        // MIDA-LEGACY-ATTACH: sample EVERY thread (not just the primary).
+        // Multi-threaded Themida stubs decrypt .text from worker threads and
+        // the primary thread may stay in the VM wrapper forever; a 1s primary-
+        // only poll misses the transfer entirely. Use a 100ms multi-thread
+        // scan so the first decrypted .text execution is captured.
+        let mut found_rip: Option<usize> = None;
+        let thread_ids = mida_core::enumerate_process_threads(dbg.pid()).unwrap_or_default();
+        let mut scan_ids = thread_ids.clone();
+        if !scan_ids.contains(&main_tid) {
+            scan_ids.push(main_tid);
         }
-
-        if previous != u32::MAX {
-            if let Ok(ctx) = dbg.get_thread_context_control(main_tid) {
-                let rip = ctx.Rip as usize;
-
-                if loop_count <= 3 {
-                    eprintln!(
-                        "[TRACE] RIP=0x{:X}, text_start=0x{:X}, text_end=0x{:X}, in_range={}",
-                        rip,
-                        text_start,
-                        text_end,
-                        rip >= text_start && rip < text_end
+        for &tid in &scan_ids {
+            let Ok(h) = dbg.thread_handle(tid) else { continue };
+            let prev = unsafe { SuspendThread(h) };
+            if prev == u32::MAX {
+                continue;
+            }
+            let mut rip = 0usize;
+            if let Ok(ctx) = dbg.get_thread_context_control(tid) {
+                rip = ctx.Rip as usize;
+            }
+            let _ = unsafe { ResumeThread(h) };
+            if loop_count <= 3 && tid == main_tid {
+                eprintln!(
+                    "[TRACE] RIP=0x{:X}, text_start=0x{:X}, text_end=0x{:X}, in_range={}",
+                    rip,
+                    text_start,
+                    text_end,
+                    rip >= text_start && rip < text_end
+                );
+            }
+            if rip >= text_start && rip < text_end {
+                let mut code = [0u8; 16];
+                let decrypted = dbg
+                    .read_memory(rip, &mut code)
+                    .is_ok_and(|read| read >= 8 && code.iter().any(|&byte| byte != 0));
+                if decrypted {
+                    found_rip = Some(rip);
+                    log::log(
+                        LogType::Good,
+                        &format!(
+                            "post-attach: first decrypted .text execution captured at {rip:#x} (tid={tid}) after {} ms",
+                            poll_start.elapsed().as_millis()
+                        ),
                     );
-                }
-
-                if rip >= text_start && rip < text_end {
-                    let mut code = [0u8; 16];
-                    let decrypted = dbg
-                        .read_memory(rip, &mut code)
-                        .is_ok_and(|read| read >= 8 && code.iter().any(|&byte| byte != 0));
-                    if decrypted {
-                        frozen_rip = Some(rip);
-                        log::log(
-                            LogType::Good,
-                            &format!(
-                                "post-attach: first decrypted .text execution captured at {rip:#x} after {} ms",
-                                poll_start.elapsed().as_millis()
-                            ),
-                        );
-
-                        // FINAL PUSH: Try 750ms (between 500ms and 1000ms)
-                        log::log(LogType::Info, "FINAL PUSH: Waiting 1000ms...");
-                        let _ = unsafe { ResumeThread(h_thread) };
-                        std::thread::sleep(std::time::Duration::from_millis(1000));
-
-                        break;
-                    }
-                } else {
-                    update_pre_text_snapshots(dbg, early_section_snapshots, rip)?;
+                    break;
                 }
             }
-            let _ = unsafe { ResumeThread(h_thread) };
         }
 
-        std::thread::sleep(std::time::Duration::from_millis(1000));
+        if let Some(rip) = found_rip {
+            frozen_rip = Some(rip);
+            // FINAL PUSH: Try 750ms (between 500ms and 1000ms)
+            log::log(LogType::Info, "FINAL PUSH: Waiting 1000ms...");
+            std::thread::sleep(std::time::Duration::from_millis(1000));
+            break;
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 
     // If observation timed out, freeze the thread before scanning/dumping.
@@ -428,6 +443,7 @@ fn run_gto_post_attach(
             container_restore,
             profile,
             pure_rebuild,
+            dump_timing,
             capture_policy,
             input,
             output_path,
