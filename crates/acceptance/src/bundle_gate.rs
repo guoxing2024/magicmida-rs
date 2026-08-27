@@ -132,9 +132,13 @@ fn parse_member<T: serde::de::DeserializeOwned>(
     name: &str,
     files: &BTreeMap<String, Vec<u8>>,
 ) -> Result<T, BundleGateError> {
-    let bytes = files
-        .get(name)
-        .expect("required member verified present by bundle validation");
+    let bytes = files.get(name).ok_or_else(|| {
+        // WO-12: validate_evidence_bundle only flags a missing member when it
+        // is not declared in bundle.members; a member declared there but with
+        // no bytes in the files map silently passes validation, so this
+        // .expect() was a reachable panic. Surface it as an error instead.
+        BundleGateError::SidecarParse(name.to_string(), "member declared but no bytes in envelope".to_string())
+    })?;
     serde_json::from_slice(bytes)
         .map_err(|e| BundleGateError::SidecarParse(name.to_string(), e.to_string()))
 }

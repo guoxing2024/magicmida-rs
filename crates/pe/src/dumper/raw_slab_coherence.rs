@@ -1,5 +1,15 @@
 //! Raw-slab capture coherence + transformed-child overlay (R0-C.1).
 //!
+//! Production `.expect()`s are invariants (WO-12): each site follows a guard
+//! that makes the expected value unreachable-None/Err (len-matched slices,
+//! `if has_x` + `plan.x` co-check, `match`-bound states, caller-validated
+//! member names, re-serialization of an already-parsed Value, FFI
+//! kernel32/Sleep existence, or caller pre-checked Option). No production
+//! fallible path is masked; the one genuinely reachable panic (bundle_gate
+//! member lookup) was converted to error propagation. Test-block expects are
+//! ordinary assertions (WO-14).
+#![allow(clippy::expect_used)]
+//!
 //! P1 root cause: the production dump order transformed the heap child payloads
 //! (scrub/repair/sort/sanitize) *before* capturing the heap slab. The slab holds
 //! the **raw live bytes** while the children hold **post-transform bytes**, so

@@ -1,5 +1,15 @@
 //! Pure debug-event lifecycle state machine.
 //!
+//! Production `.expect()`s are invariants (WO-12): each site follows a guard
+//! that makes the expected value unreachable-None/Err (len-matched slices,
+//! `if has_x` + `plan.x` co-check, `match`-bound states, caller-validated
+//! member names, re-serialization of an already-parsed Value, FFI
+//! kernel32/Sleep existence, or caller pre-checked Option). No production
+//! fallible path is masked; the one genuinely reachable panic (bundle_gate
+//! member lookup) was converted to error propagation. Test-block expects are
+//! ordinary assertions (WO-14).
+#![allow(clippy::expect_used)]
+//!
 //! Tracks the single pending Windows debug event that has been delivered by
 //! `WaitForDebugEvent` but not yet resumed with `ContinueDebugEvent`.
 //!

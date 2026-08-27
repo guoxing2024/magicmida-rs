@@ -1,5 +1,15 @@
 //! Pure PE image rebuild: typed model + rebuild plan → PE bytes.
 //!
+//! Production `.expect()`s are invariants (WO-12): each site follows a guard
+//! that makes the expected value unreachable-None/Err (len-matched slices,
+//! `if has_x` + `plan.x` co-check, `match`-bound states, caller-validated
+//! member names, re-serialization of an already-parsed Value, FFI
+//! kernel32/Sleep existence, or caller pre-checked Option). No production
+//! fallible path is masked; the one genuinely reachable panic (bundle_gate
+//! member lookup) was converted to error propagation. Test-block expects are
+//! ordinary assertions (WO-14).
+#![allow(clippy::expect_used)]
+//!
 //! R1-C foundation for producing loader-oriented candidates offline. This module
 //! accepts only byte buffers and typed PE values. It must not call Win32, touch a
 //! live process, or encode packer-family policy.

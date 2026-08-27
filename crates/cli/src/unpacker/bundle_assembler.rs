@@ -1,4 +1,14 @@
 //! Atomic evidence-bundle assembler — producer side of
+//!
+//! Production `.expect()`s are invariants (WO-12): each site follows a guard
+//! that makes the expected value unreachable-None/Err (len-matched slices,
+//! `if has_x` + `plan.x` co-check, `match`-bound states, caller-validated
+//! member names, re-serialization of an already-parsed Value, FFI
+//! kernel32/Sleep existence, or caller pre-checked Option). No production
+//! fallible path is masked; the one genuinely reachable panic (bundle_gate
+//! member lookup) was converted to error propagation. Test-block expects are
+//! ordinary assertions (WO-14).
+#![allow(clippy::expect_used)]
 //! `mida.oreans-evidence-bundle/v2` (see `docs/VNEXT_EVIDENCE_BUNDLE_V1.md`).
 //!
 //! Aggregates the transform manifest, the structured PE evidence and the five
