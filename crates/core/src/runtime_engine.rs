@@ -290,6 +290,7 @@ pub fn guard_oep_event_script(base: u64, oep_rva: u32, main_tid: u32) -> Vec<Deb
             is_write: false,
             target_address: text_va,
             exc_type: 8, // execute AV (guard)
+            first_chance: true,
         },
         DebugEvent::Breakpoint {
             thread_id: main_tid,
@@ -1038,6 +1039,7 @@ mod tests {
                 is_write: false,
                 target_address: base + 0x1000,
                 exc_type: 8,
+                first_chance: true,
             },
             DebugEvent::Breakpoint {
                 thread_id: 2,
@@ -1435,6 +1437,7 @@ mod tests {
                     is_write: false,
                     target_address: base + 0x1000,
                     exc_type: 8,
+                    first_chance: true,
                 },
                 DebugEvent::Breakpoint {
                     thread_id: 2,
@@ -1715,6 +1718,7 @@ mod tests {
                     is_write: false,
                     target_address: base + 0x1000,
                     exc_type: 8,
+                    first_chance: true,
                 },
                 DebugEvent::ExitProcess { exit_code: 0 },
             ]

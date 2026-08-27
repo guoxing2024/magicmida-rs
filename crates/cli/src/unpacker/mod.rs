@@ -2161,6 +2161,7 @@ pub fn unpack(
                 is_write: _,
                 target_address,
                 exc_type,
+                first_chance,
             } => {
                 // XX-6 (L'): deadlock guard during the IAT-materialization wait.
                 // WinLicense's exception-driven VM advances by evolving its AV
@@ -2194,16 +2195,35 @@ pub fn unpack(
                     if iat_materialize::should_log_materialize_av(
                         ls.iat_materialize_av_streak,
                     ) {
+                        // XX-7 (N-forensics): first/second chance + the actual
+                        // disposition the host will return. During the wait,
+                        // guard_installed is false, so handle_access_violation
+                        // -> decide_av_oep early-returns AvOepAction::Continue
+                        // (epilogue=false) and the host resumes with
+                        // ContinueStatus::Continue (DBG_CONTINUE = swallow the
+                        // exception). The classic av_oep_handler path returns
+                        // the same disposition for an unrelated (non-guarded)
+                        // AV. So the two paths are aligned BY CONSTRUCTION —
+                        // but both swallow a VM-owned first-chance exception,
+                        // which is exactly the N hypothesis's deadlock mode.
+                        // Log guard_installed + first_chance + disposition so
+                        // the alignment and its consequence are observable.
+                        let disposition = "Continue(DBG_CONTINUE=swallow)";
+                        let classic = "Continue(DBG_CONTINUE=swallow)";
+                        let aligned = disposition == classic;
                         log::log(
                             LogType::Info,
                             &format!(
-                                "IAT materialize AV (streak {}, rip={}, rip_moved={rip_moved}): \
+                                "IAT materialize AV (streak {}, rip={}, rip_moved={rip_moved}, \
+                                 first_chance={first_chance}, guard_installed={}, disp={disposition}, \
+                                 classic_disp={classic}, aligned={aligned}): \
                                  exc={exception_addr:#x}, target={target_address:#x}, \
                                  exc_type={exc_type}, thread={thread_id}",
                                 ls.iat_materialize_av_streak,
                                 rip_now
                                     .map(|r| format!("{r:#x}"))
                                     .unwrap_or_else(|| "?".into()),
+                                ls.guard_installed,
                             ),
                         );
                     }

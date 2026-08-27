@@ -3265,12 +3265,14 @@ impl WindowsDebugger {
                         } else {
                             0
                         };
+                        let first_chance = exc.dwFirstChance != 0;
                         DebugEvent::AccessViolation {
                             thread_id: raw.dwThreadId,
                             address: addr,
                             is_write,
                             target_address: target,
                             exc_type,
+                            first_chance,
                         }
                     }
                     other => {

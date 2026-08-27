@@ -513,6 +513,7 @@ mod tests {
             is_write: true,
             target_address: 0x3000,
             exc_type: 1,
+            first_chance: true,
         };
         assert_eq!(thread_id_of(&ev), 99);
     }

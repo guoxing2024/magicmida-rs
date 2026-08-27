@@ -82,6 +82,12 @@ pub enum DebugEvent {
         /// mode (matching `Themida64.pas`'s
         /// `ExcRecord.ExceptionInformation[0] = 8` check).
         exc_type: u8,
+        /// `dwFirstChance` from `EXCEPTION_DEBUG_EVENT` — `true` when the
+        /// debugger sees the exception before the target's SEH does (first
+        /// chance), `false` when the target's SEH already gave up (second
+        /// chance). Materialization-wait telemetry uses this to classify the
+        /// VM exception loop (XX-7 N-forensics).
+        first_chance: bool,
     },
 
     /// The target process has been created and the initial breakpoint was hit.
@@ -177,6 +183,7 @@ impl fmt::Debug for DebugEvent {
                 is_write,
                 target_address,
                 exc_type,
+                first_chance,
             } => f
                 .debug_struct("AccessViolation")
                 .field("thread_id", thread_id)
@@ -184,6 +191,7 @@ impl fmt::Debug for DebugEvent {
                 .field("is_write", is_write)
                 .field("target_address", &format_args!("{target_address:#x}"))
                 .field("exc_type", &format_args!("{exc_type}"))
+                .field("first_chance", first_chance)
                 .finish(),
             Self::CreateProcess {
                 process_id,
