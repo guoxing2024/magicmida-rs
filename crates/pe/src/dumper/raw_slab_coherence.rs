@@ -112,11 +112,11 @@ impl FullCaptureIdentity {
     pub fn from_raw_child(c: &RawChild) -> Self {
         Self {
             kind: c.kind,
-            capture_id: c.capture_id.clone(),
+            capture_id: c.capture_id.clone().into(),
             old_base: c.old_base,
             size: c.size,
-            extent_kind: c.extent_kind,
-            capture_path: c.capture_path,
+            extent_kind: c.extent_kind.into(),
+            capture_path: c.capture_path.into(),
             source_root_rva: c.source_root_rva,
             source_slot_offset: c.source_slot_offset,
             probe_requested_size: c.requested_probe_size,
@@ -130,11 +130,11 @@ impl FullCaptureIdentity {
     pub fn from_heap_global(g: &HeapGlobalSnapshot) -> Self {
         Self {
             kind: RawChildKind::HeapGlobal,
-            capture_id: g.extent_evidence.capture_id.clone(),
+            capture_id: g.extent_evidence.capture_id.clone().into(),
             old_base: g.live_ptr,
             size: g.content.len(),
-            extent_kind: g.extent_kind,
-            capture_path: g.extent_evidence.capture_path,
+            extent_kind: g.extent_kind.into(),
+            capture_path: g.extent_evidence.capture_path.into(),
             source_root_rva: g.extent_evidence.source_root_rva,
             source_slot_offset: g.extent_evidence.source_slot_offset,
             probe_requested_size: g.extent_evidence.probe_requested_size,
@@ -153,7 +153,7 @@ impl FullCaptureIdentity {
             .unwrap_or(0);
         Self {
             kind: RawChildKind::Container,
-            capture_id: container_capture_id(c.decoded_begin),
+            capture_id: container_capture_id(c.decoded_begin).into(),
             old_base: c.decoded_begin,
             size,
             extent_kind: super::heap_global_snapshot::CaptureExtentKind::ObservedAllocation,
@@ -425,12 +425,12 @@ fn covering_slab_for_child<'a>(
             child_kind,
             child_base: child_old_base,
             child_size,
-            extent_kind: String::new(),
+            extent_kind: String::new().into(),
             candidate_slab_count: raw_capture.slabs.len(),
             nearest_authority: None,
             nearest_authority_gap: 0,
-            child_capture_id: String::new(),
-            child_capture_path: String::new(),
+            child_capture_id: String::new().into(),
+            child_capture_path: String::new().into(),
             source_root_rva: None,
             source_slot_offset: None,
             probe_requested_size: 0,
@@ -451,15 +451,15 @@ fn covering_slab_for_child<'a>(
                 child_kind,
                 child_base: child_old_base,
                 child_size,
-                extent_kind: String::new(),
+                extent_kind: String::new().into(),
                 candidate_slab_count: raw_capture.slabs.len(),
                 nearest_authority: Some((
                     covering[0].1,
                     covering[0].1.saturating_add(covering[0].2 as u64),
                 )),
                 nearest_authority_gap: 0,
-                child_capture_id: String::new(),
-                child_capture_path: String::new(),
+                child_capture_id: String::new().into(),
+                child_capture_path: String::new().into(),
                 source_root_rva: None,
                 source_slot_offset: None,
                 probe_requested_size: 0,
@@ -1029,10 +1029,10 @@ impl TransformPreimageBinding {
     ) -> Self {
         Self {
             child_kind: identity.kind,
-            capture_id: identity.capture_id.clone(),
+            capture_id: identity.capture_id.clone().into(),
             child_old_base: identity.old_base,
             child_size: identity.size,
-            extent_kind: identity.extent_kind,
+            extent_kind: identity.extent_kind.into(),
             identity,
             slab_old_base,
             slab_size,
@@ -1056,9 +1056,9 @@ impl TransformPreimageBinding {
             OverlayError::BindingIdentityInconsistent {
                 child_old_base: self.child_old_base,
                 child_kind: self.child_kind,
-                field: field.to_string(),
-                legacy,
-                identity,
+                field: field.to_string().into(),
+                legacy: legacy.into(),
+                identity: identity.into(),
             }
         };
         if self.child_kind != id.kind {
@@ -1265,16 +1265,16 @@ pub fn resolve_declared_size_reinit_spec(
         1 => Ok(Some(declared_size_reinit(&matching_ids[0], child_rva).unwrap())),
         n => Err(OverlayError::TransformRunLedgerInvalid {
             run_index: 0,
-            child_capture_id: child_capture_id.to_string(),
+            child_capture_id: child_capture_id.to_string().into(),
             child_old_base,
             child_size,
             child_offset: 0,
             length: 0,
-            transform_id: matching_ids.join(","),
+            transform_id: matching_ids.join(",").into(),
             reason: format!(
                 "ambiguous declared size reinit: child rva {child_rva:#x} matched {n} transform id(s) [{}]",
                 matching_ids.join(", ")
-            ),
+            ).into(),
         }),
     }
 }
@@ -1347,16 +1347,16 @@ pub fn validate_declared_size_reinit_fields(
     if after_rva != spec.child_rva {
         return Err(OverlayError::TransformRunLedgerInvalid {
             run_index,
-            child_capture_id: after_capture_id.to_string(),
+            child_capture_id: after_capture_id.to_string().into(),
             child_old_base: after_live_ptr,
             child_size: after_content.len(),
             child_offset: 0,
             length: 0,
-            transform_id: spec.transform_id.to_string(),
+            transform_id: spec.transform_id.to_string().into(),
             reason: format!(
                 "declared size reinit child rva {:#x} != expected {:#x} for old_base {:#x}",
                 after_rva, spec.child_rva, after_live_ptr
-            ),
+            ).into(),
         });
     }
     let old_ok = before_len
@@ -1371,48 +1371,48 @@ pub fn validate_declared_size_reinit_fields(
     if !old_ok {
         return Err(OverlayError::TransformRunLedgerInvalid {
             run_index,
-            child_capture_id: after_capture_id.to_string(),
+            child_capture_id: after_capture_id.to_string().into(),
             child_old_base: after_live_ptr,
             child_size: after_content.len(),
             child_offset: 0,
             length: 0,
-            transform_id: spec.transform_id.to_string(),
+            transform_id: spec.transform_id.to_string().into(),
             reason: format!(
                 "declared size reinit old size {} outside tolerance {} of expected {} for old_base {:#x}",
                 before_len, spec.old_size_tolerance, spec.old_size, after_live_ptr
-            ),
+            ).into(),
         });
     }
     if after_content.len() != spec.new_size {
         return Err(OverlayError::TransformRunLedgerInvalid {
             run_index,
-            child_capture_id: after_capture_id.to_string(),
+            child_capture_id: after_capture_id.to_string().into(),
             child_old_base: after_live_ptr,
             child_size: after_content.len(),
             child_offset: 0,
             length: 0,
-            transform_id: spec.transform_id.to_string(),
+            transform_id: spec.transform_id.to_string().into(),
             reason: format!(
                 "declared size reinit new size {} != expected {} for old_base {:#x}",
                 after_content.len(),
                 spec.new_size,
                 after_live_ptr
-            ),
+            ).into(),
         });
     }
     if spec.zero_filled && after_content.iter().any(|&b| b != 0) {
         return Err(OverlayError::TransformRunLedgerInvalid {
             run_index,
-            child_capture_id: after_capture_id.to_string(),
+            child_capture_id: after_capture_id.to_string().into(),
             child_old_base: after_live_ptr,
             child_size: after_content.len(),
             child_offset: 0,
             length: 0,
-            transform_id: spec.transform_id.to_string(),
+            transform_id: spec.transform_id.to_string().into(),
             reason: format!(
                 "declared size reinit content not zero-filled for old_base {:#x}",
                 after_live_ptr
-            ),
+            ).into(),
         });
     }
     Ok(())
@@ -1432,13 +1432,13 @@ pub fn validate_raw_identity_across_transform(
 ) -> Result<(), OverlayError> {
     let err = |reason: String| OverlayError::TransformRunLedgerInvalid {
         run_index,
-        child_capture_id: a.extent_evidence.capture_id.clone(),
+        child_capture_id: a.extent_evidence.capture_id.clone().into(),
         child_old_base: a.live_ptr,
         child_size: a.content.len(),
         child_offset: 0,
         length: 0,
-        transform_id: transform_id.to_string(),
-        reason,
+        transform_id: transform_id.to_string().into(),
+        reason: reason.into(),
     };
     // Route Y R1 A6 AF3 AF2 (P1-3): the FULL capture identity (including every
     // source-evidence field) must be structurally identical across a transform,
@@ -1521,18 +1521,18 @@ pub fn validate_raw_identity_across_transform(
             None => {
                 return Err(OverlayError::TransformRunLedgerInvalid {
                     run_index,
-                    child_capture_id: a.extent_evidence.capture_id.clone(),
+                    child_capture_id: a.extent_evidence.capture_id.clone().into(),
                     child_old_base: a.live_ptr,
                     child_size: a.content.len(),
                     child_offset: 0,
                     length: 0,
-                    transform_id: transform_id.to_string(),
+                    transform_id: transform_id.to_string().into(),
                     reason: format!(
                         "undeclared raw identity drift on content.len for old_base {:#x}: {} -> {}",
                         a.live_ptr,
                         b.content.len(),
                         a.content.len()
-                    ),
+                    ).into(),
                 });
             }
         }
@@ -1590,16 +1590,16 @@ pub fn diff_transform_write_runs(
             if map.insert(g.live_ptr, g).is_some() {
                 return Err(OverlayError::TransformRunLedgerInvalid {
                     run_index: 0,
-                    child_capture_id: g.extent_evidence.capture_id.clone(),
+                    child_capture_id: g.extent_evidence.capture_id.clone().into(),
                     child_old_base: g.live_ptr,
                     child_size: g.content.len(),
                     child_offset: 0,
                     length: 0,
-                    transform_id: transform_id.to_string(),
+                    transform_id: transform_id.to_string().into(),
                     reason: format!(
                         "duplicate raw participant identity at old_base {:#x}",
                         g.live_ptr
-                    ),
+                    ).into(),
                 });
             }
         }
@@ -1618,15 +1618,15 @@ pub fn diff_transform_write_runs(
             let g = before_map[base];
             return Err(OverlayError::TransformRunLedgerInvalid {
                 run_index,
-                child_capture_id: g.extent_evidence.capture_id.clone(),
+                child_capture_id: g.extent_evidence.capture_id.clone().into(),
                 child_old_base: *base,
                 child_size: g.content.len(),
                 child_offset: 0,
                 length: 0,
-                transform_id: transform_id.to_string(),
+                transform_id: transform_id.to_string().into(),
                 reason: format!(
                     "participant set change: raw participant old_base {base:#x} missing from after"
-                ),
+                ).into(),
             });
         }
     }
@@ -1635,15 +1635,15 @@ pub fn diff_transform_write_runs(
             let g = after_map[base];
             return Err(OverlayError::TransformRunLedgerInvalid {
                 run_index,
-                child_capture_id: g.extent_evidence.capture_id.clone(),
+                child_capture_id: g.extent_evidence.capture_id.clone().into(),
                 child_old_base: *base,
                 child_size: g.content.len(),
                 child_offset: 0,
                 length: 0,
-                transform_id: transform_id.to_string(),
+                transform_id: transform_id.to_string().into(),
                 reason: format!(
                     "participant set change: raw participant old_base {base:#x} missing from before"
-                ),
+                ).into(),
             });
         }
     }
@@ -1671,13 +1671,13 @@ pub fn diff_transform_write_runs(
         if capture_id.is_empty() {
             return Err(OverlayError::TransformRunLedgerInvalid {
                 run_index,
-                child_capture_id: String::new(),
+                child_capture_id: String::new().into(),
                 child_old_base: *base,
                 child_size: a.content.len(),
                 child_offset: 0,
                 length: 0,
-                transform_id: transform_id.to_string(),
-                reason: format!("empty raw capture id for changed participant old_base {base:#x}"),
+                transform_id: transform_id.to_string().into(),
+                reason: format!("empty raw capture id for changed participant old_base {base:#x}").into(),
             });
         }
         // Route Y R0 (Y0-A): `child_size` is the TRANSFORMED (after) size — the
@@ -1720,12 +1720,12 @@ pub fn diff_transform_write_runs(
             let before_digest = sha256_hex(&before_bytes);
             let after_digest = sha256_hex(&after_bytes);
             runs.push(TransformWriteRun {
-                child_capture_id: capture_id.clone(),
+                child_capture_id: capture_id.clone().into(),
                 child_old_base: *base,
                 child_size,
                 child_offset: off,
                 length: len,
-                transform_id: transform_id.to_string(),
+                transform_id: transform_id.to_string().into(),
                 before_digest,
                 after_digest,
                 first_before_byte: before_bytes[0],
@@ -1873,13 +1873,13 @@ pub fn validate_run_ledger_shape(run_ledger: &TransformRunLedger) -> Result<(), 
         if let Some(reason) = reason {
             return Err(OverlayError::TransformRunLedgerInvalid {
                 run_index: idx,
-                child_capture_id: r.child_capture_id.clone(),
+                child_capture_id: r.child_capture_id.clone().into(),
                 child_old_base: r.child_old_base,
                 child_size: r.child_size,
                 child_offset: r.child_offset,
                 length: r.length,
-                transform_id: r.transform_id.clone(),
-                reason,
+                transform_id: r.transform_id.clone().into(),
+                reason: reason.into(),
             });
         }
     }
@@ -1915,16 +1915,16 @@ pub fn validate_run_membership(
         if participants.insert(key, g.content.len()).is_some() {
             return Err(OverlayError::TransformRunLedgerInvalid {
                 run_index: 0,
-                child_capture_id: g.extent_evidence.capture_id.clone(),
+                child_capture_id: g.extent_evidence.capture_id.clone().into(),
                 child_old_base: g.live_ptr,
                 child_size: g.content.len(),
                 child_offset: 0,
                 length: 0,
-                transform_id: String::new(),
+                transform_id: String::new().into(),
                 reason: format!(
                     "duplicate canonical participant (capture_id, old_base) = ({:?}, {:#x})",
                     g.extent_evidence.capture_id, g.live_ptr
-                ),
+                ).into(),
             });
         }
     }
@@ -1935,16 +1935,16 @@ pub fn validate_run_membership(
         if !raw_keys.insert(key) {
             return Err(OverlayError::TransformRunLedgerInvalid {
                 run_index: 0,
-                child_capture_id: c.capture_id.clone(),
+                child_capture_id: c.capture_id.clone().into(),
                 child_old_base: c.old_base,
                 child_size: c.size,
                 child_offset: 0,
                 length: 0,
-                transform_id: String::new(),
+                transform_id: String::new().into(),
                 reason: format!(
                     "duplicate raw child (capture_id, old_base) = ({:?}, {:#x})",
                     c.capture_id, c.old_base
-                ),
+                ).into(),
             });
         }
     }
@@ -1979,28 +1979,28 @@ pub fn validate_run_membership(
         if matches.is_empty() {
             return Err(OverlayError::TransformRunLedgerInvalid {
                 run_index: idx,
-                child_capture_id: r.child_capture_id.clone(),
+                child_capture_id: r.child_capture_id.clone().into(),
                 child_old_base: r.child_old_base,
                 child_size: r.child_size,
                 child_offset: r.child_offset,
                 length: r.length,
-                transform_id: r.transform_id.clone(),
-                reason: format!("run has no matching raw child by (capture_id, old_base, size)"),
+                transform_id: r.transform_id.clone().into(),
+                reason: format!("run has no matching raw child by (capture_id, old_base, size)").into(),
             });
         }
         if matches.len() > 1 {
             return Err(OverlayError::TransformRunLedgerInvalid {
                 run_index: idx,
-                child_capture_id: r.child_capture_id.clone(),
+                child_capture_id: r.child_capture_id.clone().into(),
                 child_old_base: r.child_old_base,
                 child_size: r.child_size,
                 child_offset: r.child_offset,
                 length: r.length,
-                transform_id: r.transform_id.clone(),
+                transform_id: r.transform_id.clone().into(),
                 reason: format!(
                     "run resolves to {} raw children by (capture_id, old_base, size); expected exactly one",
                     matches.len()
-                ),
+                ).into(),
             });
         }
         // 2. The run's child must belong to the canonical participant set.
@@ -2046,47 +2046,47 @@ pub fn validate_run_membership(
                     if !ok {
                         return Err(OverlayError::TransformRunLedgerInvalid {
                             run_index: idx,
-                            child_capture_id: r.child_capture_id.clone(),
+                            child_capture_id: r.child_capture_id.clone().into(),
                             child_old_base: r.child_old_base,
                             child_size: r.child_size,
                             child_offset: r.child_offset,
                             length: r.length,
-                            transform_id: r.transform_id.clone(),
+                            transform_id: r.transform_id.clone().into(),
                             reason: format!(
                                 "declared reinit child run size {} not in (raw {:?}, new {:?})",
                                 r.child_size, raw_size, new_size
-                            ),
+                            ).into(),
                         });
                     }
                 } else if participant_size != r.child_size {
                     return Err(OverlayError::TransformRunLedgerInvalid {
                         run_index: idx,
-                        child_capture_id: r.child_capture_id.clone(),
+                        child_capture_id: r.child_capture_id.clone().into(),
                         child_old_base: r.child_old_base,
                         child_size: r.child_size,
                         child_offset: r.child_offset,
                         length: r.length,
-                        transform_id: r.transform_id.clone(),
+                        transform_id: r.transform_id.clone().into(),
                         reason: format!(
                             "run child size {} != canonical participant size {}",
                             r.child_size, participant_size
-                        ),
+                        ).into(),
                     });
                 }
             }
             None => {
                 return Err(OverlayError::TransformRunLedgerInvalid {
                     run_index: idx,
-                    child_capture_id: r.child_capture_id.clone(),
+                    child_capture_id: r.child_capture_id.clone().into(),
                     child_old_base: r.child_old_base,
                     child_size: r.child_size,
                     child_offset: r.child_offset,
                     length: r.length,
-                    transform_id: r.transform_id.clone(),
+                    transform_id: r.transform_id.clone().into(),
                     reason: format!(
                         "run child (capture_id, old_base) = ({:?}, {:#x}) not in canonical participant set",
                         r.child_capture_id, r.child_old_base
-                    ),
+                    ).into(),
                 });
             }
         }
@@ -2150,14 +2150,14 @@ pub enum OverlayError {
         slab_size: usize,
         slab_offset: usize,
         first_mismatch_offset: usize,
-        raw_child_digest: String,
-        raw_slab_slice_digest: String,
+        raw_child_digest: Box<str>,
+        raw_slab_slice_digest: Box<str>,
         /// Route Z R0 AF1: bounded hex excerpt of the raw child bytes around the
         /// first mismatch (diagnostic; never the whole heap object).
-        raw_child_excerpt: String,
+        raw_child_excerpt: Box<str>,
         /// Route Z R0 AF1: bounded hex excerpt of the slab slice bytes around the
         /// first mismatch (diagnostic; never the whole slab).
-        raw_slab_slice_excerpt: String,
+        raw_slab_slice_excerpt: Box<str>,
     },
     /// Two overlays conflict (partial overlap or same range different bytes).
     /// GTO R0-F: now carries the ACTUAL applied peer (not the current child
@@ -2241,11 +2241,11 @@ pub enum OverlayError {
         /// size of the child.
         child_size: usize,
         /// the offending capture id (empty when missing).
-        capture_id: String,
+        capture_id: Box<str>,
         /// the capture path.
-        capture_path: String,
+        capture_path: Box<str>,
         /// the extent kind.
-        extent_kind: String,
+        extent_kind: Box<str>,
     },
     /// Route S R0-C: the Q0-C exact binding could not be resolved because there
     /// is NO binding for this child.
@@ -2253,8 +2253,8 @@ pub enum OverlayError {
         child_kind: RawChildKind,
         child_old_base: u64,
         child_size: usize,
-        capture_id: String,
-        extent_kind: String,
+        capture_id: Box<str>,
+        extent_kind: Box<str>,
         slab_old_base: u64,
         slab_offset: usize,
     },
@@ -2263,8 +2263,8 @@ pub enum OverlayError {
         child_kind: RawChildKind,
         child_old_base: u64,
         child_size: usize,
-        capture_id: String,
-        extent_kind: String,
+        capture_id: Box<str>,
+        extent_kind: Box<str>,
         slab_old_base: u64,
         slab_offset: usize,
         match_count: usize,
@@ -2275,24 +2275,24 @@ pub enum OverlayError {
         child_kind: RawChildKind,
         child_old_base: u64,
         child_size: usize,
-        capture_id: String,
-        extent_kind: String,
+        capture_id: Box<str>,
+        extent_kind: Box<str>,
         slab_old_base: u64,
         slab_offset: usize,
-        reason: String,
+        reason: Box<str>,
     },
     /// Route S R0-D: the global run-ledger shape validator found a malformed run.
     /// Carries the EXACT run index + identity + reason (not the currently-walked
     /// child's TransformPreimageDrift).
     TransformRunLedgerInvalid {
         run_index: usize,
-        child_capture_id: String,
+        child_capture_id: Box<str>,
         child_old_base: u64,
         child_size: usize,
         child_offset: usize,
         length: usize,
-        transform_id: String,
-        reason: String,
+        transform_id: Box<str>,
+        reason: Box<str>,
     },
     /// Route T R0-C: a ProbeWindow / InteriorSubview has no authoritative slab
     /// coverage. Detected at the `capture_coverage_bind` gate (before overlay /
@@ -2306,7 +2306,7 @@ pub enum OverlayError {
         /// Size of the uncovered child.
         child_size: usize,
         /// Extent kind (ProbeWindow / InteriorSubview).
-        extent_kind: String,
+        extent_kind: Box<str>,
         /// Number of candidate authoritative slabs considered.
         candidate_slab_count: usize,
         /// The nearest candidate slab authority range, if any `(base, end)`.
@@ -2314,9 +2314,9 @@ pub enum OverlayError {
         /// Distance from the child base to the nearest authority range, in bytes.
         nearest_authority_gap: u64,
         /// Deterministic capture id of the uncovered child.
-        child_capture_id: String,
+        child_capture_id: Box<str>,
         /// Capture path that produced the uncovered child.
-        child_capture_path: String,
+        child_capture_path: Box<str>,
         /// Root image RVA that led to the child capture, if known.
         source_root_rva: Option<u32>,
         /// Byte offset of the source slot within the root, if known.
@@ -2355,9 +2355,9 @@ pub enum OverlayError {
     BindingIdentityInconsistent {
         child_old_base: u64,
         child_kind: RawChildKind,
-        field: String,
-        legacy: String,
-        identity: String,
+        field: Box<str>,
+        legacy: Box<str>,
+        identity: Box<str>,
     },
 }
 
@@ -2742,9 +2742,9 @@ pub fn validate_raw_coherence_capture_identities(
                 child_kind: RawChildKind::HeapGlobal,
                 child_old_base: g.live_ptr,
                 child_size: g.content.len(),
-                capture_id: String::new(),
-                capture_path: format!("{:?}", path),
-                extent_kind: format!("{:?}", ext),
+                capture_id: String::new().into(),
+                capture_path: format!("{:?}", path).into(),
+                extent_kind: format!("{:?}", ext).into(),
             });
         }
         // Route S R0-AuditFix1 (P1-2): enforce the identity matrix.
@@ -2776,9 +2776,9 @@ pub fn validate_raw_coherence_capture_identities(
                 child_kind: RawChildKind::HeapGlobal,
                 child_old_base: g.live_ptr,
                 child_size: g.content.len(),
-                capture_id: cap.clone(),
-                capture_path: format!("{:?}", path),
-                extent_kind: format!("{:?}", ext),
+                capture_id: cap.clone().into(),
+                capture_path: format!("{:?}", path).into(),
+                extent_kind: format!("{:?}", ext).into(),
             });
         }
         // A capture_id prefix that claims a role must be consistent with the path.
@@ -2788,9 +2788,9 @@ pub fn validate_raw_coherence_capture_identities(
                 child_kind: RawChildKind::HeapGlobal,
                 child_old_base: g.live_ptr,
                 child_size: g.content.len(),
-                capture_id: cap.clone(),
-                capture_path: format!("{:?}", path),
-                extent_kind: format!("{:?}", ext),
+                capture_id: cap.clone().into(),
+                capture_path: format!("{:?}", path).into(),
+                extent_kind: format!("{:?}", ext).into(),
             });
         }
         if cap_prefix == "mainslot" && path != CP::MainSlot {
@@ -2798,9 +2798,9 @@ pub fn validate_raw_coherence_capture_identities(
                 child_kind: RawChildKind::HeapGlobal,
                 child_old_base: g.live_ptr,
                 child_size: g.content.len(),
-                capture_id: cap.clone(),
-                capture_path: format!("{:?}", path),
-                extent_kind: format!("{:?}", ext),
+                capture_id: cap.clone().into(),
+                capture_path: format!("{:?}", path).into(),
+                extent_kind: format!("{:?}", ext).into(),
             });
         }
         // Route S R0-AuditFix1 (P1-3): duplicate capture id — same base is only
@@ -2813,9 +2813,9 @@ pub fn validate_raw_coherence_capture_identities(
                     child_kind: RawChildKind::HeapGlobal,
                     child_old_base: g.live_ptr,
                     child_size: g.content.len(),
-                    capture_id: cap.clone(),
-                    capture_path: format!("{:?}", path),
-                    extent_kind: format!("{:?}", ext),
+                    capture_id: cap.clone().into(),
+                    capture_path: format!("{:?}", path).into(),
+                    extent_kind: format!("{:?}", ext).into(),
                 });
             }
         } else {
@@ -2838,7 +2838,7 @@ pub fn validate_raw_coherence_capture_identities(
                 child_kind: RawChildKind::Container,
                 child_old_base: c.decoded_begin,
                 child_size: size,
-                capture_id: String::new(),
+                capture_id: String::new().into(),
                 capture_path: "MainSlot".into(),
                 extent_kind: "ObservedAllocation".into(),
             });
@@ -3340,12 +3340,12 @@ pub fn validate_probe_coverage(
                 child_kind: RawChildKind::HeapGlobal,
                 child_base: g.live_ptr,
                 child_size: g.content.len(),
-                extent_kind: format!("{:?}", g.extent_kind),
+                extent_kind: format!("{:?}", g.extent_kind).into(),
                 candidate_slab_count: slab_ranges.len(),
                 nearest_authority: covering,
                 nearest_authority_gap: 0,
-                child_capture_id: g.extent_evidence.capture_id.clone(),
-                child_capture_path: format!("{:?}", g.extent_evidence.capture_path),
+                child_capture_id: g.extent_evidence.capture_id.clone().into(),
+                child_capture_path: format!("{:?}", g.extent_evidence.capture_path).into(),
                 source_root_rva: g.extent_evidence.source_root_rva,
                 source_slot_offset: g.extent_evidence.source_slot_offset,
                 probe_requested_size: g.extent_evidence.probe_requested_size,
@@ -3373,7 +3373,7 @@ pub fn validate_probe_coverage(
             child_kind: RawChildKind::HeapGlobal,
             child_base: g.live_ptr,
             child_size: g.content.len(),
-            extent_kind: format!("{:?}", g.extent_kind),
+            extent_kind: format!("{:?}", g.extent_kind).into(),
             candidate_slab_count: slab_ranges.len(),
             nearest_authority: if slab_ranges.is_empty() {
                 None
@@ -3381,8 +3381,8 @@ pub fn validate_probe_coverage(
                 Some((n_base, n_end))
             },
             nearest_authority_gap: n_gap,
-            child_capture_id: g.extent_evidence.capture_id.clone(),
-            child_capture_path: format!("{:?}", g.extent_evidence.capture_path),
+            child_capture_id: g.extent_evidence.capture_id.clone().into(),
+            child_capture_path: format!("{:?}", g.extent_evidence.capture_path).into(),
             source_root_rva: g.extent_evidence.source_root_rva,
             source_slot_offset: g.extent_evidence.source_slot_offset,
             probe_requested_size: g.extent_evidence.probe_requested_size,
@@ -3418,7 +3418,7 @@ pub fn raw_children_from_capture(
             size,
             raw_bytes: raw,
             kind: RawChildKind::Container,
-            capture_id: container_capture_id(c.decoded_begin),
+            capture_id: container_capture_id(c.decoded_begin).into(),
             capture_path: crate::dumper::heap_global_snapshot::CapturePath::MainSlot,
             extent_kind: crate::dumper::heap_global_snapshot::CaptureExtentKind::ObservedAllocation,
             source_slot_offset: None,
@@ -3438,9 +3438,9 @@ pub fn raw_children_from_capture(
             size: g.content.len(),
             raw_bytes: g.content.clone(),
             kind: RawChildKind::HeapGlobal,
-            capture_id: g.extent_evidence.capture_id.clone(),
-            capture_path: g.extent_evidence.capture_path,
-            extent_kind: g.extent_kind,
+            capture_id: g.extent_evidence.capture_id.clone().into(),
+            capture_path: g.extent_evidence.capture_path.into(),
+            extent_kind: g.extent_kind.into(),
             source_slot_offset: g.extent_evidence.source_slot_offset,
             requested_probe_size: g.extent_evidence.probe_requested_size,
             source_root_rva: g.extent_evidence.source_root_rva,
@@ -3685,10 +3685,10 @@ fn raw_capture_drift_error(
         slab_size,
         slab_offset,
         first_mismatch_offset,
-        raw_child_digest: sha256_hex(raw_child),
-        raw_slab_slice_digest: sha256_hex(slab_slice),
-        raw_child_excerpt,
-        raw_slab_slice_excerpt,
+        raw_child_digest: sha256_hex(raw_child).into(),
+        raw_slab_slice_digest: sha256_hex(slab_slice).into(),
+        raw_child_excerpt: raw_child_excerpt.into(),
+        raw_slab_slice_excerpt: raw_slab_slice_excerpt.into(),
     }
 }
 
@@ -3733,12 +3733,12 @@ pub fn build_patched_backing_slab(
             child_kind: RawChildKind::HeapGlobal,
             child_base: 0,
             child_size: 0,
-            extent_kind: String::new(),
+            extent_kind: String::new().into(),
             candidate_slab_count: 0,
             nearest_authority: None,
             nearest_authority_gap: 0,
-            child_capture_id: String::new(),
-            child_capture_path: String::new(),
+            child_capture_id: String::new().into(),
+            child_capture_path: String::new().into(),
             source_root_rva: None,
             source_slot_offset: None,
             probe_requested_size: 0,
@@ -3865,8 +3865,8 @@ pub fn build_patched_backing_slab(
                 child_old_base: child_base,
                 child_size,
                 slab_offset: 0,
-                raw_child_digest: String::new(),
-                raw_slab_slice_digest: String::new(),
+                raw_child_digest: String::new().into(),
+                raw_slab_slice_digest: String::new().into(),
                 transformed_child_digest: t_digest,
                 transform_ids: vec![transform_id.clone()],
                 overlay_applied: false,
@@ -3972,20 +3972,20 @@ pub fn build_patched_backing_slab(
                 slab_size: slab.content.len(),
                 slab_offset: slab_offset_us,
                 first_mismatch_offset: raw_child_bytes.len().min(child_size),
-                raw_child_digest: sha256_hex(raw_child_bytes),
-                raw_slab_slice_digest: sha256_hex(&slab.content[slab_offset_us..child_end]),
+                raw_child_digest: sha256_hex(raw_child_bytes).into(),
+                raw_slab_slice_digest: sha256_hex(&slab.content[slab_offset_us..child_end]).into(),
                 raw_child_excerpt: drift_excerpt(
                     raw_child_bytes,
                     raw_child_bytes.len().min(child_size),
                     16,
                     64,
-                ),
+                ).into(),
                 raw_slab_slice_excerpt: drift_excerpt(
                     &slab.content[slab_offset_us..child_end],
                     raw_child_bytes.len().min(child_size),
                     16,
                     64,
-                ),
+                ).into(),
             });
         }
         // GTO R0-G three-way reconciliation: C = raw child capture (t1), S = raw
@@ -4021,10 +4021,10 @@ pub fn build_patched_backing_slab(
                     slab_size: slab.content.len(),
                     slab_offset: slab_offset_us,
                     first_mismatch_offset: first_mismatch,
-                    raw_child_digest: sha256_hex(raw_child_bytes),
-                    raw_slab_slice_digest: sha256_hex(raw_slab_slice),
-                    raw_child_excerpt: drift_excerpt(raw_child_bytes, first_mismatch, 16, 64),
-                    raw_slab_slice_excerpt: drift_excerpt(raw_slab_slice, first_mismatch, 16, 64),
+                    raw_child_digest: sha256_hex(raw_child_bytes).into(),
+                    raw_slab_slice_digest: sha256_hex(raw_slab_slice).into(),
+                    raw_child_excerpt: drift_excerpt(raw_child_bytes, first_mismatch, 16, 64).into(),
+                    raw_slab_slice_excerpt: drift_excerpt(raw_slab_slice, first_mismatch, 16, 64).into(),
                 });
             }
         }
@@ -4087,7 +4087,7 @@ pub fn build_patched_backing_slab(
                 let child_off = start - slab_offset_us;
                 let len = end - start;
                 drift_runs.push(CaptureDriftRun {
-                    child_capture_id: capture_id.clone(),
+                    child_capture_id: capture_id.clone().into(),
                     child_old_base: child_base,
                     child_offset: child_off,
                     slab_offset: start,
@@ -4205,8 +4205,8 @@ pub fn build_patched_backing_slab(
             child_old_base: child_base,
             child_size,
             slab_offset: slab_offset_us,
-            raw_child_digest: sha256_hex(raw_child_bytes),
-            raw_slab_slice_digest: sha256_hex(raw_slab_slice),
+            raw_child_digest: sha256_hex(raw_child_bytes).into(),
+            raw_slab_slice_digest: sha256_hex(raw_slab_slice).into(),
             transformed_child_digest: t_digest,
             transform_ids: child_transform_ids,
             overlay_applied: true,
@@ -4470,8 +4470,8 @@ pub fn build_patched_backing_slab_q0c(
                 child_old_base: child_base,
                 child_size,
                 slab_offset: 0,
-                raw_child_digest: String::new(),
-                raw_slab_slice_digest: String::new(),
+                raw_child_digest: String::new().into(),
+                raw_slab_slice_digest: String::new().into(),
                 transformed_child_digest: t_digest,
                 transform_ids: vec![transform_id.clone()],
                 overlay_applied: false,
@@ -4534,20 +4534,20 @@ pub fn build_patched_backing_slab_q0c(
                 slab_size,
                 slab_offset: slab_offset_us,
                 first_mismatch_offset: raw_child_bytes.len().min(child_size),
-                raw_child_digest: sha256_hex(raw_child_bytes),
-                raw_slab_slice_digest: sha256_hex(&slab_bytes[slab_offset_us..child_end]),
+                raw_child_digest: sha256_hex(raw_child_bytes).into(),
+                raw_slab_slice_digest: sha256_hex(&slab_bytes[slab_offset_us..child_end]).into(),
                 raw_child_excerpt: drift_excerpt(
                     raw_child_bytes,
                     raw_child_bytes.len().min(child_size),
                     16,
                     64,
-                ),
+                ).into(),
                 raw_slab_slice_excerpt: drift_excerpt(
                     &slab_bytes[slab_offset_us..child_end],
                     raw_child_bytes.len().min(child_size),
                     16,
                     64,
-                ),
+                ).into(),
             });
         }
         let raw_slab_slice = &slab_bytes[slab_offset_us..child_end];
@@ -4574,8 +4574,8 @@ pub fn build_patched_backing_slab_q0c(
                 child_kind: kind,
                 child_old_base: child_base,
                 child_size,
-                capture_id,
-                extent_kind: format!("{:?}", extent_kind),
+                capture_id: capture_id.into(),
+                extent_kind: format!("{:?}", extent_kind).into(),
                 slab_old_base,
                 slab_offset: slab_offset_us,
             });
@@ -4635,11 +4635,11 @@ pub fn build_patched_backing_slab_q0c(
                 child_kind: kind,
                 child_old_base: child_base,
                 child_size,
-                capture_id,
-                extent_kind: format!("{:?}", extent_kind),
+                capture_id: capture_id.into(),
+                extent_kind: format!("{:?}", extent_kind).into(),
                 slab_old_base,
                 slab_offset: slab_offset_us,
-                reason,
+                reason: reason.into(),
             });
         }
         if exact.len() > 1 {
@@ -4648,8 +4648,8 @@ pub fn build_patched_backing_slab_q0c(
                 child_kind: kind,
                 child_old_base: child_base,
                 child_size,
-                capture_id,
-                extent_kind: format!("{:?}", extent_kind),
+                capture_id: capture_id.into(),
+                extent_kind: format!("{:?}", extent_kind).into(),
                 slab_old_base,
                 slab_offset: slab_offset_us,
                 match_count: exact.len(),
@@ -4697,10 +4697,10 @@ pub fn build_patched_backing_slab_q0c(
                 slab_size,
                 slab_offset: slab_offset_us,
                 first_mismatch_offset: 0,
-                raw_child_digest,
-                raw_slab_slice_digest,
-                raw_child_excerpt: drift_excerpt(raw_child_bytes, 0, 16, 64),
-                raw_slab_slice_excerpt: drift_excerpt(raw_slab_slice, 0, 16, 64),
+                raw_child_digest: raw_child_digest.into(),
+                raw_slab_slice_digest: raw_slab_slice_digest.into(),
+                raw_child_excerpt: drift_excerpt(raw_child_bytes, 0, 16, 64).into(),
+                raw_slab_slice_excerpt: drift_excerpt(raw_slab_slice, 0, 16, 64).into(),
             });
         }
         if binding.raw_slab_slice_digest != raw_slab_slice_digest {
@@ -4712,10 +4712,10 @@ pub fn build_patched_backing_slab_q0c(
                 slab_size,
                 slab_offset: slab_offset_us,
                 first_mismatch_offset: 0,
-                raw_child_digest,
-                raw_slab_slice_digest,
-                raw_child_excerpt: drift_excerpt(raw_child_bytes, 0, 16, 64),
-                raw_slab_slice_excerpt: drift_excerpt(raw_slab_slice, 0, 16, 64),
+                 raw_child_digest: raw_child_digest.into(),
+                 raw_slab_slice_digest: raw_slab_slice_digest.into(),
+                raw_child_excerpt: drift_excerpt(raw_child_bytes, 0, 16, 64).into(),
+                raw_slab_slice_excerpt: drift_excerpt(raw_slab_slice, 0, 16, 64).into(),
             });
         }
 
@@ -4772,15 +4772,15 @@ pub fn build_patched_backing_slab_q0c(
                         slab_size,
                         slab_offset: slab_offset_us,
                         first_mismatch_offset: first_mismatch,
-                        raw_child_digest: raw_child_digest.clone(),
-                        raw_slab_slice_digest: raw_slab_slice_digest.clone(),
-                        raw_child_excerpt: drift_excerpt(raw_child_bytes, first_mismatch, 16, 64),
+                        raw_child_digest: raw_child_digest.clone().into(),
+                        raw_slab_slice_digest: raw_slab_slice_digest.clone().into(),
+                        raw_child_excerpt: drift_excerpt(raw_child_bytes, first_mismatch, 16, 64).into(),
                         raw_slab_slice_excerpt: drift_excerpt(
                             raw_slab_slice,
                             first_mismatch,
                             16,
                             64,
-                        ),
+                        ).into(),
                     });
                 }
                 // seeded_from_slab must be false for a strict child.
@@ -4867,12 +4867,12 @@ pub fn build_patched_backing_slab_q0c(
             if transition_idxs.len() != 1 {
                 return Err(OverlayError::TransformRunLedgerInvalid {
                     run_index: 0,
-                    child_capture_id: capture_id.clone(),
+                    child_capture_id: capture_id.clone().into(),
                     child_old_base: child_base,
                     child_size: transformed_bytes.len(),
                     child_offset: 0,
                     length: 0,
-                    transform_id: spec.transform_id.to_string(),
+                    transform_id: spec.transform_id.to_string().into(),
                     reason: format!(
                         "declared size reinit for old_base {:#x} must have EXACTLY ONE ledger run \
                          for transition identity (transform={:?} capture={:?}); found {}",
@@ -4880,7 +4880,7 @@ pub fn build_patched_backing_slab_q0c(
                         spec.transform_id,
                         capture_id,
                         transition_idxs.len()
-                    ),
+                    ).into(),
                 });
             }
             let t_idx = transition_idxs[0];
@@ -4890,32 +4890,32 @@ pub fn build_patched_backing_slab_q0c(
             if ev.child_size != new_size || ev.child_offset != 0 || ev.length != new_size {
                 return Err(OverlayError::TransformRunLedgerInvalid {
                     run_index: t_idx,
-                    child_capture_id: capture_id.clone(),
+                    child_capture_id: capture_id.clone().into(),
                     child_old_base: child_base,
                     child_size: ev.child_size,
                     child_offset: ev.child_offset,
                     length: ev.length,
-                    transform_id: spec.transform_id.to_string(),
+                    transform_id: spec.transform_id.to_string().into(),
                     reason: format!(
                         "declared size reinit run shape invalid for old_base {:#x}: \
                          child_size={:#x} offset={:#x} length={:#x}, expected {:#x} [0,{:#x})",
                         child_base, ev.child_size, ev.child_offset, ev.length, new_size, new_size
-                    ),
+                    ).into(),
                 });
             }
             if ev.child_capture_id.is_empty() || ev.transform_id.is_empty() {
                 return Err(OverlayError::TransformRunLedgerInvalid {
                     run_index: t_idx,
-                    child_capture_id: ev.child_capture_id.clone(),
+                    child_capture_id: ev.child_capture_id.clone().into(),
                     child_old_base: child_base,
                     child_size: new_size,
                     child_offset: 0,
                     length: 0,
-                    transform_id: spec.transform_id.to_string(),
+                    transform_id: spec.transform_id.to_string().into(),
                     reason: format!(
                         "declared size reinit run has empty identity for old_base {:#x}",
                         child_base
-                    ),
+                    ).into(),
                 });
             }
             // (P1-3 rev 3 / Audit P1-3) The transition's BEFORE evidence is the
@@ -4938,28 +4938,28 @@ pub fn build_patched_backing_slab_q0c(
                 let Some(end) = off.checked_add(len) else {
                     return Err(OverlayError::TransformRunLedgerInvalid {
                         run_index: ri,
-                        child_capture_id: r.child_capture_id.clone(),
+                        child_capture_id: r.child_capture_id.clone().into(),
                         child_old_base: child_base,
                         child_size: r.child_size,
                         child_offset: off,
                         length: len,
-                        transform_id: r.transform_id.clone(),
-                        reason: format!("prior run length overflow for old_base {:#x}", child_base),
+                        transform_id: r.transform_id.clone().into(),
+                        reason: format!("prior run length overflow for old_base {:#x}", child_base).into(),
                     });
                 };
                 if end > current.len() || len == 0 {
                     return Err(OverlayError::TransformRunLedgerInvalid {
                         run_index: ri,
-                        child_capture_id: r.child_capture_id.clone(),
+                        child_capture_id: r.child_capture_id.clone().into(),
                         child_old_base: child_base,
                         child_size: r.child_size,
                         child_offset: off,
                         length: len,
-                        transform_id: r.transform_id.clone(),
+                        transform_id: r.transform_id.clone().into(),
                         reason: format!(
                             "prior run out of preimage bounds for old_base {:#x}",
                             child_base
-                        ),
+                        ).into(),
                     });
                 }
                 // Self-consistency of the prior run's digest pair.
@@ -4972,32 +4972,32 @@ pub fn build_patched_backing_slab_q0c(
                 {
                     return Err(OverlayError::TransformRunLedgerInvalid {
                         run_index: ri,
-                        child_capture_id: r.child_capture_id.clone(),
+                        child_capture_id: r.child_capture_id.clone().into(),
                         child_old_base: child_base,
                         child_size: r.child_size,
                         child_offset: off,
                         length: len,
-                        transform_id: r.transform_id.clone(),
+                        transform_id: r.transform_id.clone().into(),
                         reason: format!(
                             "prior run digest/byte inconsistency for old_base {:#x}",
                             child_base
-                        ),
+                        ).into(),
                     });
                 }
                 // before == current state at [off, off+len).
                 if current[off..end] != r.before_bytes {
                     return Err(OverlayError::TransformRunLedgerInvalid {
                         run_index: ri,
-                        child_capture_id: r.child_capture_id.clone(),
+                        child_capture_id: r.child_capture_id.clone().into(),
                         child_old_base: child_base,
                         child_size: r.child_size,
                         child_offset: off,
                         length: len,
-                        transform_id: r.transform_id.clone(),
+                        transform_id: r.transform_id.clone().into(),
                         reason: format!(
                             "prior run before mismatch at old_base {:#x} (prior-writer chain broken)",
                             child_base
-                        ),
+                        ).into(),
                     });
                 }
                 current[off..end].copy_from_slice(&r.after_bytes);
@@ -5007,17 +5007,17 @@ pub fn build_patched_backing_slab_q0c(
             if current.len() < new_size || current[0..new_size] != ev.before_bytes {
                 return Err(OverlayError::TransformRunLedgerInvalid {
                     run_index: t_idx,
-                    child_capture_id: capture_id.clone(),
+                    child_capture_id: capture_id.clone().into(),
                     child_old_base: child_base,
                     child_size: new_size,
                     child_offset: 0,
                     length: 0,
-                    transform_id: spec.transform_id.to_string(),
+                    transform_id: spec.transform_id.to_string().into(),
                     reason: format!(
                         "declared size reinit before mismatch for old_base {:#x} (must equal \
                          prior-writer-replayed current state, not the raw prefix)",
                         child_base
-                    ),
+                    ).into(),
                 });
             }
             // The transition's after bytes must be exactly the transformed new-size
@@ -5028,16 +5028,16 @@ pub fn build_patched_backing_slab_q0c(
             {
                 return Err(OverlayError::TransformRunLedgerInvalid {
                     run_index: t_idx,
-                    child_capture_id: capture_id.clone(),
+                    child_capture_id: capture_id.clone().into(),
                     child_old_base: child_base,
                     child_size: new_size,
                     child_offset: 0,
                     length: 0,
-                    transform_id: spec.transform_id.to_string(),
+                    transform_id: spec.transform_id.to_string().into(),
                     reason: format!(
                         "declared size reinit after mismatch for old_base {:#x}",
                         child_base
-                    ),
+                    ).into(),
                 });
             }
             // Every child run must be consumed: nothing may follow the terminal
@@ -5045,17 +5045,17 @@ pub fn build_patched_backing_slab_q0c(
             if child_run_idxs.iter().any(|&ri| ri > t_idx) {
                 return Err(OverlayError::TransformRunLedgerInvalid {
                     run_index: 0,
-                    child_capture_id: capture_id.clone(),
+                    child_capture_id: capture_id.clone().into(),
                     child_old_base: child_base,
                     child_size: new_size,
                     child_offset: 0,
                     length: 0,
-                    transform_id: spec.transform_id.to_string(),
+                    transform_id: spec.transform_id.to_string().into(),
                     reason: format!(
                         "declared size reinit for old_base {:#x} must be the LAST run for \
                          its capture; orphan post-transition run present",
                         child_base
-                    ),
+                    ).into(),
                 });
             }
             // (P1-2) Bounds: the new-size region must stay inside the covering slab.
@@ -5119,8 +5119,8 @@ pub fn build_patched_backing_slab_q0c(
                 child_old_base: child_base,
                 child_size: new_size,
                 slab_offset: slab_offset_us,
-                raw_child_digest: sha256_hex(raw_child_bytes),
-                raw_slab_slice_digest: sha256_hex(raw_slab_slice),
+                raw_child_digest: sha256_hex(raw_child_bytes).into(),
+                raw_slab_slice_digest: sha256_hex(raw_slab_slice).into(),
                 transformed_child_digest: sha256_hex(&transformed_bytes[0..new_size]),
                 transform_ids: child_transform_ids.clone(),
                 overlay_applied: true,
@@ -5289,7 +5289,7 @@ pub fn build_patched_backing_slab_q0c(
                 let child_off = start - slab_offset_us;
                 let len = end - start;
                 drift_runs.push(CaptureDriftRun {
-                    child_capture_id: capture_id.clone(),
+                    child_capture_id: capture_id.clone().into(),
                     child_old_base: child_base,
                     child_offset: child_off,
                     slab_offset: start,
@@ -5323,7 +5323,7 @@ pub fn build_patched_backing_slab_q0c(
             for &(so, len, ref bytes) in &write_runs {
                 let child_off = so - slab_offset_us;
                 let dr = CaptureDriftRun {
-                    child_capture_id: capture_id.clone(),
+                    child_capture_id: capture_id.clone().into(),
                     child_old_base: child_base,
                     child_offset: child_off,
                     slab_offset: so,
@@ -5418,8 +5418,8 @@ pub fn build_patched_backing_slab_q0c(
             child_old_base: child_base,
             child_size,
             slab_offset: slab_offset_us,
-            raw_child_digest: sha256_hex(raw_child_bytes),
-            raw_slab_slice_digest: sha256_hex(raw_slab_slice),
+            raw_child_digest: sha256_hex(raw_child_bytes).into(),
+            raw_slab_slice_digest: sha256_hex(raw_slab_slice).into(),
             transformed_child_digest: t_digest,
             transform_ids: child_transform_ids,
             overlay_applied: true,

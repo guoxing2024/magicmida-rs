@@ -15,8 +15,16 @@ pub enum ThemidaError {
     NotThemida,
 
     /// PE parsing failed. Delegates to `mida_pe::PeError`.
+    ///
+    /// Boxed (WO-24): `PeError` is up to 128 bytes (large diagnostic
+    /// variants), which made this the largest variant of `ThemidaError` and
+    /// triggered `clippy::result_large_err` at every `Result<_, ThemidaError>`
+    /// return site (~62 sites). Boxing keeps the enum small; `#[from]`
+    /// preserves the `From<PeError>` conversion so all `?` call sites are
+    /// unchanged. The boxed value is never observable through the error text
+    /// (`{0}` derefs automatically).
     #[error("PE parse error: {0}")]
-    Pe(#[from] mida_pe::PeError),
+    Pe(#[from] Box<mida_pe::PeError>),
 
     /// The identified Themida version is not (yet) supported for unpacking.
     #[error("Unsupported Themida version: {0:?}")]
