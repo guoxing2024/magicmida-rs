@@ -1,0 +1,79 @@
+# Clippy warn-level baseline (WO-23 lint lock)
+#
+# Source of truth: `cargo clippy --workspace --lib --bins`
+# (JSON message format), warning counts grouped by lint name.
+#
+# POLICY:
+# 1. This gate is MONOTONIC: a count above its baseline fails CI.
+# 2. Counts may only go DOWN. When a batch lowers a count, update
+#    this file in the SAME commit as the fix (and keep the gate
+#    comment in sync). Never raise a count.
+# 3. WO-24 (Err large-variant boxing) targets clippy::result_large_err
+#    (84 here) -> goal <= 10 workspace-wide.
+# 4. Test targets are NOT counted: this gate runs --lib --bins only,
+#    matching the WO-14 test policy (test-assertion unwraps are
+#    idiomatic, never lint debt).
+#
+# Update procedure: run the JSON clippy command, recount, edit this
+# file, commit together with the code change. Verified at each
+# commit point; see ci.yml windows-clippy job.
+
+clippy::collapsible_if = 4
+clippy::collapsible_match = 1
+clippy::derivable_impls = 1
+clippy::doc_lazy_continuation = 19
+clippy::doc_overindented_list_items = 21
+clippy::duplicated_attributes = 24
+clippy::empty_line_after_doc_comments = 4
+clippy::explicit_counter_loop = 1
+clippy::field_reassign_with_default = 2
+clippy::for_kv_map = 2
+clippy::identity_op = 1
+clippy::if_same_then_else = 2
+clippy::io_other_error = 2
+clippy::large_enum_variant = 3
+clippy::len_zero = 1
+clippy::let_unit_value = 2
+clippy::manual_abs_diff = 1
+clippy::manual_c_str_literals = 5
+clippy::manual_checked_ops = 1
+clippy::manual_clamp = 5
+clippy::manual_div_ceil = 2
+clippy::manual_inspect = 1
+clippy::manual_is_multiple_of = 7
+clippy::manual_range_contains = 9
+clippy::manual_range_patterns = 1
+clippy::manual_saturating_arithmetic = 15
+clippy::map_clone = 1
+clippy::map_entry = 1
+clippy::match_like_matches_macro = 1
+clippy::missing_safety_doc = 1
+clippy::needless_borrow = 9
+clippy::needless_borrows_for_generic_args = 12
+clippy::needless_lifetimes = 2
+clippy::needless_question_mark = 2
+clippy::needless_range_loop = 12
+clippy::new_without_default = 2
+clippy::op_ref = 2
+clippy::ptr_arg = 6
+clippy::question_mark = 5
+clippy::redundant_closure = 1
+clippy::redundant_closure_call = 1
+clippy::redundant_guards = 1
+clippy::redundant_locals = 2
+clippy::result_large_err = 84
+clippy::result_unit_err = 3
+clippy::should_implement_trait = 1
+clippy::slow_vector_initialization = 1
+clippy::too_many_arguments = 61
+clippy::type_complexity = 7
+clippy::unnecessary_cast = 17
+clippy::unnecessary_lazy_evaluations = 6
+clippy::unnecessary_map_or = 12
+clippy::unnecessary_unwrap = 1
+clippy::unwrap_or_default = 1
+clippy::useless_conversion = 1
+clippy::useless_format = 4
+clippy::wrong_self_convention = 4
+unused_imports = 4
+TOTAL = 405

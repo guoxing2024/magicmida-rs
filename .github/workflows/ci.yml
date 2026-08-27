@@ -118,6 +118,16 @@ jobs:
           cargo clippy --workspace --all-targets -- -D clippy::dbg_macro
           cargo clippy --workspace --lib --bins -- -D clippy::unwrap_used -D clippy::expect_used -D clippy::manual_let_else
 
+      # WO-23 lint lock: warn-level lint counts must not regress. The
+      # remaining ~405 production warnings (result_large_err 84, etc.) are
+      # paid down in later batches (WO-24 targets result_large_err -> <=10);
+      # each lowering updates `_clippy_baseline` in the same commit.
+      # Baseline counts are MONOTONIC — a count above baseline fails here.
+      # Test targets are excluded (--lib --bins only) per the WO-14 policy.
+      - name: Clippy warn-baseline (WO-23)
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tools/check_clippy_baseline.ps1
+
   cargo-deny:
     runs-on: ubuntu-latest
     steps:
