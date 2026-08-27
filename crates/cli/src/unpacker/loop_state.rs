@@ -25,6 +25,15 @@ pub(super) struct LoopState {
     pub(super) text_prev_sample: [u8; 16],
     /// .text poll: true when .text content is stable (two consecutive reads match)
     pub(super) text_stable: bool,
+    /// XX-4 (B'): waiting for WinLicense lazy-IAT materialization at an FF15
+    /// site (software breakpoint armed, process continued).
+    pub(super) iat_materialize_wait: bool,
+    /// XX-4 (B'): the site VA currently armed (cleared on hit / timeout).
+    pub(super) iat_materialize_site: Option<usize>,
+    /// XX-4 (B'): fallback stage already tried (true once OEP fallback runs).
+    pub(super) iat_materialize_fallback: bool,
+    /// XX-4 (B'): when the current materialize wait started (30s budget).
+    pub(super) iat_materialize_start: Option<std::time::Instant>,
     /// .text poll: re-guard done, waiting for AV at OEP
     pub(super) text_reguarded: bool,
     pub(super) oep: Option<usize>,

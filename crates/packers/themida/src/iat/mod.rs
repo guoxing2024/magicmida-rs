@@ -28,6 +28,10 @@ mod boundaries;
 mod discovery;
 mod fix;
 
+// XX-4 (B'): pure byte-scan IAT-site anchor for the host's IAT-materialization
+// wait (software breakpoint at the FF15 site, continue, then re-discover).
+pub use discovery::first_out_of_image_iat_site;
+
 use tracing::{info, warn};
 
 use mida_core::DebuggerCore;

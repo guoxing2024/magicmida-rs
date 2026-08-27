@@ -43,6 +43,7 @@ mod generic_gate;
 mod gto_host;
 mod helpers;
 mod iat_evidence;
+mod iat_materialize;
 mod iat_trace;
 mod loop_state;
 mod oep_evidence;
@@ -665,6 +666,10 @@ pub fn unpack(
         text_poll_count: 0,
         text_prev_sample: [0u8; 16],
         text_stable: false,
+        iat_materialize_wait: false,
+        iat_materialize_site: None,
+        iat_materialize_fallback: false,
+        iat_materialize_start: None,
         text_reguarded: false,
         oep: None,
         oep_provenance: OepProvenance::default(),
@@ -961,13 +966,86 @@ pub fn unpack(
         }
 
         // Prefer finite wait while plugin says so (text-poll); else blocking.
+        // XX-4: also finite-wait during the IAT-materialization wait so the
+        // per-anchor 30s budget can be polled while the process runs free.
         // R2: wait via engine so we retain EngineEvent.sequence for PackerPlugin.
-        let engine_event = if plugin_ctx.prefer_short_wait {
+        let engine_event = if plugin_ctx.prefer_short_wait || ls.iat_materialize_wait {
             let wait_ms = plugin_ctx.short_wait_ms;
             match dbg.wait_engine(Some(wait_ms)) {
                 Ok(ev) => ev,
                 Err(mida_core::CoreError::Timeout) => {
-                    // No debug event ??continue loop for polling
+                    // XX-4: IAT-materialization wait — poll the per-anchor budget.
+                    if ls.iat_materialize_wait {
+                        if let Some(start) = ls.iat_materialize_start {
+                            let elapsed = start.elapsed().as_secs();
+                            match iat_materialize::timeout_materialize_step(
+                                ls.iat_materialize_fallback,
+                                ls.oep,
+                                elapsed,
+                                iat_materialize::IAT_MATERIALIZE_TIMEOUT_SECS,
+                            ) {
+                                iat_materialize::MaterializeStep::Wait => {}
+                                iat_materialize::MaterializeStep::ArmOep(oep_va) => {
+                                    // Fallback: drop the site breakpoint, arm OEP,
+                                    // and let execution reach real OEP (imports done).
+                                    log::log(
+                                        LogType::Info,
+                                        &format!(
+                                            "IAT materialize: FF15 site not hit in 30s — \
+                                             falling back to OEP {oep_va:#x}"
+                                        ),
+                                    );
+                                    let main_tid = dbg.main_thread_id();
+                                    let h_thread = dbg
+                                        .thread_handle(main_tid)
+                                        .map_err(|e| anyhow!("thread_handle for OEP fallback: {e}"))?;
+                                    let _ = unsafe { SuspendThread(h_thread) };
+                                    if let Err(e) = dbg.clear_all_soft_breakpoints() {
+                                        warn!("clear site breakpoint failed (non-fatal): {e}");
+                                    }
+                                    match dbg.set_soft_breakpoint(oep_va) {
+                                        Ok(()) => {
+                                            ls.iat_materialize_site = Some(oep_va);
+                                            ls.iat_materialize_fallback = true;
+                                            ls.iat_materialize_start = Some(std::time::Instant::now());
+                                            let _ = unsafe { ResumeThread(h_thread) };
+                                        }
+                                        Err(e) => {
+                                            warn!("arm OEP fallback breakpoint failed: {e}");
+                                            ls.iat_materialize_wait = false;
+                                            // Freeze + dump (fail-closed IAT).
+                                            log::log(
+                                                LogType::Warn,
+                                                "OEP fallback breakpoint arm failed — \
+                                                 freezing for fail-closed dump",
+                                            );
+                                            break;
+                                        }
+                                    }
+                                }
+                                iat_materialize::MaterializeStep::FreezeAndDump => {
+                                    log::log(
+                                        LogType::Warn,
+                                        "IAT materialize: anchors never hit — \
+                                         freezing for fail-closed dump",
+                                    );
+                                    let main_tid = dbg.main_thread_id();
+                                    if let Ok(h) = dbg.thread_handle(main_tid) {
+                                        let _ = unsafe { SuspendThread(h) };
+                                    }
+                                    if let Err(e) = dbg.clear_all_soft_breakpoints() {
+                                        warn!("clear breakpoints failed (non-fatal): {e}");
+                                    }
+                                    ls.iat_materialize_wait = false;
+                                    break;
+                                }
+                                iat_materialize::MaterializeStep::ArmSite(_) => {
+                                    // Unreachable in the timeout path.
+                                }
+                            }
+                        }
+                    }
+                    // No debug event ??continue loop for polling.
                     continue;
                 }
                 Err(_e) if post_attach_mode => {
@@ -1160,12 +1238,79 @@ pub fn unpack(
                                     }
                                 }
                                 // Do NOT ResumeThread ??keep process frozen.
-                                // Themida will kill the process on resume (0xDEADC0DE),
-                                // but ReadProcessMemory works on a frozen/suspended
-                                // process. We break out of the debug loop immediately
-                                // and dump from the frozen process's memory.
-                                log::log(LogType::Info,
-                                    "Process kept frozen ??will dump IAT + .text from suspended state");
+                                // XX-4 (B'): WinLicense materializes imports lazily at
+                                // execution time, so the frozen dump here would catch
+                                // the IAT slot as an unmapped hole (XX-2/XX-3). Instead,
+                                // arm a software breakpoint at the first out-of-image
+                                // FF15 site and let execution advance to the moment the
+                                // import is about to be read (IAT must be materialized).
+                                let text_buf_full = {
+                                    let text_sec0 = &state.pe_info.pe_sections[0];
+                                    let tstart = image_base_usize
+                                        + text_sec0.virtual_address as usize;
+                                    let tsize = (text_sec0.virtual_size as usize).min(0x100_000);
+                                    let mut buf = vec![0u8; tsize];
+                                    let _ = dbg.read_memory(tstart, &mut buf);
+                                    (tstart, buf)
+                                };
+                                let (tstart, text_buf_full) = text_buf_full;
+                                let tsize = (state.pe_info.pe_sections[0].virtual_size as usize)
+                                    .min(0x100_000);
+                                let site =
+                                    mida_packers_themida::first_out_of_image_iat_site(
+                                        &text_buf_full,
+                                        tstart,
+                                        tsize,
+                                    );
+                                match iat_materialize::initial_materialize_step(site, ls.oep) {
+                                    iat_materialize::MaterializeStep::ArmSite(site_va) => {
+                                        log::log(
+                                            LogType::Info,
+                                            &format!(
+                                                "IAT materialize: arming FF15 site {site_va:#x} — \
+                                                 continuing to materialize lazy IAT"
+                                            ),
+                                        );
+                                        dbg.set_soft_breakpoint(site_va)?;
+                                        ls.iat_materialize_site = Some(site_va);
+                                        ls.iat_materialize_wait = true;
+                                        ls.iat_materialize_fallback = false;
+                                        ls.iat_materialize_start =
+                                            Some(std::time::Instant::now());
+                                        // Continue execution from the suspended
+                                        // (poll) state so the breakpoint can fire.
+                                        let _ = unsafe { ResumeThread(h_thread) };
+                                    }
+                                    iat_materialize::MaterializeStep::ArmOep(oep_va) => {
+                                        log::log(
+                                            LogType::Info,
+                                            &format!(
+                                                "IAT materialize: no FF15 site — arming OEP \
+                                                 {oep_va:#x} as fallback"
+                                            ),
+                                        );
+                                        dbg.set_soft_breakpoint(oep_va)?;
+                                        ls.iat_materialize_site = Some(oep_va);
+                                        ls.iat_materialize_wait = true;
+                                        ls.iat_materialize_fallback = true;
+                                        ls.iat_materialize_start =
+                                            Some(std::time::Instant::now());
+                                        let _ = unsafe { ResumeThread(h_thread) };
+                                    }
+                                    iat_materialize::MaterializeStep::FreezeAndDump => {
+                                        // No anchor at all: keep frozen, fail-closed.
+                                        log::log(
+                                            LogType::Warn,
+                                            "IAT materialize: no anchor (site or OEP) — \
+                                             keeping frozen for fail-closed dump",
+                                        );
+                                    }
+                                    iat_materialize::MaterializeStep::Wait => {}
+                                }
+                                log::log(
+                                    LogType::Info,
+                                    "Process frozen decision: IAT-materialization wait armed",
+                                );
                             }
                         } else {
                             log::log(
@@ -1785,6 +1930,35 @@ pub fn unpack(
             // ---------------------------------------------------------------
             DebugEvent::Breakpoint { thread_id, address } => {
                 debug!(addr = %format!("{address:#x}"), "Breakpoint hit");
+
+                // XX-4 (B'): IAT-materialization anchor hit. At this point the
+                // `call [mem]` / OEP is about to execute, so the lazy IAT is
+                // materialized. Freeze the thread, disarm the breakpoint, and
+                // leave the loop for the normal post-loop IAT discovery/dump.
+                if ls.iat_materialize_wait {
+                    if ls.iat_materialize_site == Some(address as usize) {
+                        log::log(
+                            LogType::Good,
+                            &format!(
+                                "IAT materialize: anchor {address:#x} hit — IAT \
+                                 materialized, freezing for dump"
+                            ),
+                        );
+                        let main_tid = dbg.main_thread_id();
+                        if let Ok(h) = dbg.thread_handle(main_tid) {
+                            let _ = unsafe { SuspendThread(h) };
+                        }
+                        if let Err(e) = dbg.clear_all_soft_breakpoints() {
+                            warn!("clear breakpoints failed (non-fatal): {e}");
+                        }
+                        ls.iat_materialize_wait = false;
+                        ls.iat_materialize_site = None;
+                        break;
+                    }
+                    // Not our anchor: continue (e.g. an unrelated int3).
+                    dbg.continue_event(thread_id, ContinueStatus::Continue)?;
+                    continue;
+                }
 
                 // .NET target special: if this is the _CorExeMain HW BP
                 // (slot 3), dump raw memory and exit the debug loop.

@@ -56,8 +56,8 @@ pub use guard::{
     GuardAccessResult,
 };
 pub use iat::{
-    detect_compiler, determine_iat_address, fix_iat, fixup_api_call_sites, CompilerHint,
-    IatFixStrategy, IatLocation,
+    detect_compiler, determine_iat_address, first_out_of_image_iat_site, fix_iat,
+    fixup_api_call_sites, CompilerHint, IatFixStrategy, IatLocation,
 };
 pub use init::{init_pe_details, locate_themida_section, themida_pe_info_basic, ThemidaPeInfo};
 pub use oep::{

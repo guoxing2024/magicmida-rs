@@ -376,6 +376,47 @@ fn rank_candidate(c: &IatRefCandidate) -> u8 {
     }
 }
 
+/// Find the site address (absolute VA of the `FF 15/25` instruction) of the
+/// first indirect `call`/`jmp [mem]` whose memory operand points outside the
+/// `.text` section.
+///
+/// This is a pure byte-scan (no disassembler, no debugger reads) so it can
+/// run at the exact moment `.text` becomes stable — **before** the process
+/// has executed far enough to materialize the WinLicense run-time IAT. The
+/// returned site is the same class of address `find_iat_ref_from_address`
+/// discovers, but derived without needing the IAT slot to be readable yet.
+///
+/// XX-4 (B'): WinLicense materializes imports lazily at execution time. The
+/// frozen-dump moment (XX-2/XX-3) catches `.text` decrypted but the IAT slot
+/// still unmapped. The site returned here is the observation anchor the host
+/// sets a software breakpoint on and continues to — at hit time the IAT must
+/// be materialized (the `call [mem]` is about to read it).
+///
+/// Returns `None` when no out-of-image indirect call/jmp exists in `text`.
+pub fn first_out_of_image_iat_site(
+    text: &[u8],
+    text_base: usize,
+    code_size: usize,
+) -> Option<usize> {
+    let image_base = text_base;
+    // Image end is a conservative upper bound on image-local addresses; a
+    // slot above this is considered out-of-image (the real IAT lives in the
+    // data section or, for WinLicense, in a lazily-mapped run-time region).
+    let image_end = image_base.saturating_add(code_size);
+    let scan_len = text.len().saturating_sub(6);
+    for i in 0..scan_len {
+        if text[i] == 0xFF && (text[i + 1] == 0x15 || text[i + 1] == 0x25) {
+            let ip = text_base + i;
+            let disp32 = i32::from_le_bytes([text[i + 2], text[i + 3], text[i + 4], text[i + 5]]);
+            let slot = (ip as i64 + 6 + disp32 as i64) as usize;
+            if slot < image_base || slot >= image_end {
+                return Some(ip);
+            }
+        }
+    }
+    None
+}
+
 /// Scan from `start_addr`, disassembling instructions and looking for the
 /// first `call [mem]` or `jmp [mem]` whose memory operand points outside
 /// the `.text` section (i.e. into the IAT / data area).
