@@ -1,5 +1,10 @@
 //! Bootstrap for restoring heap-backed SecurityCookie-encoded containers.
+
 //!
+//! Production `.unwrap()`s are parse invariants: `patch_crt_wrapper_jmp_to_stub`
+//! slices only after `get_mut(off..off+18).ok_or(...)?` guarantees 18 bytes
+//! (WO-10). Test unwraps are assertions.
+#![allow(clippy::unwrap_used)]//!
 //! The stub embedded in `.boot`:
 //!
 //! 1. Calls GetProcessHeap

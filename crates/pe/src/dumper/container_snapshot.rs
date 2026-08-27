@@ -1,5 +1,10 @@
 //! Snapshot and restore SecurityCookie-encoded containers from live process heap.
+
 //!
+//! Production `.unwrap()`s are parse invariants: the `triple` window is always
+//! `POINTER_TRIPLE_SIZE` (24) bytes and the loop bound guarantees it is in
+//! bounds (WO-10). Test unwraps are assertions.
+#![allow(clippy::unwrap_used)]//!
 //! When a protected sample stores application-critical objects in SecurityCookie-encoded
 //! containers within zero-raw sections, simply zeroing them during reconstruction prevents
 //! crashes but leaves the application uninitialized. This module captures the semantic

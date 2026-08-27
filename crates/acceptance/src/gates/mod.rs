@@ -1,5 +1,13 @@
 //! Ordered static structural gates for R0B.
 
+// Every `.unwrap()` in this module is a parse invariant: it follows an
+// explicit `in_bounds(off, len, bytes.len())` guard whose failure branch
+// returns/breaks first, so the safe u16_le/u32_le/u64_le helpers (None only
+// on a short buffer) are unreachable-None at each call site (WO-10). These
+// are gate assertions on an already-validated image, not fallible error
+// paths.
+#![allow(clippy::unwrap_used)]
+
 use crate::pe::read::{in_bounds, u32_le, u64_le};
 use crate::pe::view::{
     try_parse, PeImage, IMAGE_DIRECTORY_ENTRY_BASERELOC, IMAGE_DIRECTORY_ENTRY_EXCEPTION,

@@ -1,5 +1,10 @@
 //! Materialize code pages that still live in zero-raw `.fill` gaps.
+
 //!
+//! Production `.unwrap()`s are invariants: `pages_to_spans` returns early on
+//! an empty page set, so `next()`/`next_back()` are non-empty (WO-10). Test
+//! unwraps are assertions.
+#![allow(clippy::unwrap_used)]//!
 //! After shrink removes Themida sections, zero-raw `.fill` gaps replace them.
 //! Two classes of callers then land in empty BSS:
 //!

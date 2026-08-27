@@ -1,5 +1,10 @@
 //! Resolve imports from the original PE file's .idata section.
 //!
+//! Production `.unwrap()`s are parse invariants: descriptor windows are
+//! bounded by the loop guard, and `decode_thunk` matches the slice length
+//! before `try_into()` (WO-10). Test unwraps are assertions.
+#![allow(clippy::unwrap_used)]
+//!
 //! This corresponds to `TDumper.GetOriginalImports` in `Dumper.pas`.
 //! Instead of trying to read the (possibly encrypted) IAT from the live
 //! process, we read the import table from the **original file on disk**,

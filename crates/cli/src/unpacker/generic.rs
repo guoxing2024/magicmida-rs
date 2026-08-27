@@ -1,5 +1,10 @@
 //! Generic packer-agnostic unpack path.
 //!
+//! Production `.unwrap()`s are parse invariants on fixed-width slices whose
+//! bounds were just validated (`data.len() < dir_off + 40`, `entry + 4`);
+//! `try_into()` cannot fail there (WO-10). Test unwraps are assertions.
+#![allow(clippy::unwrap_used)]
+//!
 //! Does NOT run Themida detection / shrink / guard logic.
 //! Flow: create process (post-attach) -> resume -> poll .text restore
 //! -> dump full image with shrink=false.

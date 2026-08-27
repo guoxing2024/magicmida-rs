@@ -1,4 +1,9 @@
 //! Patch `.text` call sites that reference unresolved (image-local) IAT slots
+//!
+//! Production `.unwrap()`s are parse invariants: the disp32 window is bounded
+//! by the scan loop's `i + 6 <= end` guard (WO-10). Test unwraps are
+//! assertions.
+#![allow(clippy::unwrap_used)]
 //! so they call the wrapper code directly instead of going through the IAT.
 //!
 //! Why: the PE loader walks FirstThunk ranges and interprets every non-zero

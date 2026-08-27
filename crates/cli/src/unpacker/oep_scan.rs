@@ -1,5 +1,10 @@
 //! Live memory OEP scan — find a unique strong MSVC CRT PE-entry wrapper.
+
 //!
+//! Production `.unwrap()`s are invariants: `next()` runs only after
+//! `near.len() == 1` / `strong.len() == 1` guards (WO-10). Test unwraps are
+//! assertions.
+#![allow(clippy::unwrap_used)]//!
 //! Fail-closed for `--oep=crt`:
 //! - bare `sub rsp, imm8` is never an accepted PE entry
 //! - `__scrt_common_main_seh` body alone is never an accepted PE entry

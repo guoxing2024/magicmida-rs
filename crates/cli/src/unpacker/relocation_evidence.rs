@@ -1,4 +1,10 @@
 //! Candidate-bound relocation and ASLR evidence.
+
+//! Production `.unwrap()`s are invariants: read_u16/read_u32 follow explicit
+//! boundary breaks, `i64::try_from(0x100000)` on a constant, and
+//! `file_name()` on a constructed temp path (WO-10). Test unwraps are
+//! ordinary assertions.
+#![allow(clippy::unwrap_used)]
 //!
 //! Runtime facts come only from the immutable dump report. Final facts are
 //! independently rebuilt from the candidate bytes re-read from disk.

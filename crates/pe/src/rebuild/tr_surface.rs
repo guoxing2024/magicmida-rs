@@ -1,5 +1,12 @@
 //! GTO-TR T2 Phase B: observed-surface assembly.
 //!
+//! Production `.unwrap()`s are parse invariants: the PE header bounds are
+//! enforced up front (e_lfanew+0xF0 covers the deepest data-directory read),
+//! so every fixed-width `try_into()` below is guaranteed in bounds (WO-10;
+//! the boundary gap this allow documents was fixed in the same pass). Test
+//! unwraps are ordinary assertions.
+#![allow(clippy::unwrap_used)]
+//!
 //! Assembles a candidate PE from the TR-line carved components (per-section
 //! bytes extracted from a trace-era memory image) plus the page-level
 //! provenance map produced by `tools/tr_pilot/carve_observed_surface.py`.
@@ -105,9 +112,14 @@ fn extract_import_dirs(dump_path: &Path) -> Result<ImportDirs, String> {
         ));
     }
     let e_lfanew = u32::from_le_bytes(data[0x3c..0x40].try_into().unwrap()) as usize;
-    if e_lfanew + 0x18 > data.len() || &data[e_lfanew..e_lfanew + 4] != b"PE\0\0" {
+    // Need e_lfanew+26 for the optional-header magic below, and e_lfanew+24+
+    // 112+12*8+8 = e_lfanew+240 for the last data directory read in read_dd.
+    // Enforce both up front so the fixed-width try_into() slices below are
+    // guaranteed in bounds (WO-10; previously only e_lfanew+0x18 was checked,
+    // leaving a 2-byte gap that could panic on a truncated header).
+    if e_lfanew + 0xF0 > data.len() || &data[e_lfanew..e_lfanew + 4] != b"PE\0\0" {
         return Err(format!(
-            "dump_source {}: PE signature missing",
+            "dump_source {}: PE signature missing or optional header truncated",
             dump_path.display()
         ));
     }

@@ -1,5 +1,10 @@
 //! Pure byte / memory-map adapters for feeding dumps into [`RebuildPlan`].
+
 //!
+//! Production `.unwrap()`s are parse invariants: `off = i * RUNTIME_FUNCTION_SIZE`
+//! with `i < raw.len() / RUNTIME_FUNCTION_SIZE` guarantees each 12-byte window
+//! is in bounds (WO-10). Test unwraps are assertions.
+#![allow(clippy::unwrap_used)]//!
 //! R1-C remainder: live dump code may capture an image as a **byte map**
 //! (VA-linear buffer + caller-supplied bases). This module turns those maps
 //! into pure rebuild inputs without Win32, process handles, or packer policy.

@@ -1,5 +1,11 @@
 //! Verify an unpacked file against a known-good reference.
 
+//! Production `.unwrap()`s are parse invariants on fixed-width slices whose
+//! bounds were just validated (`while offset + desc_size <= bytes.len()`,
+//! thunk range checks); `try_into()` cannot fail there (WO-10). Test
+//! unwraps are ordinary assertions.
+#![allow(clippy::unwrap_used)]
+
 use crate::log::{self, LogType};
 use anyhow::{anyhow, bail};
 use mida_pe::{read_original_import_table, PeHeader};

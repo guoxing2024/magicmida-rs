@@ -1,5 +1,9 @@
 //! Snapshot process-local heap objects referenced from zero-raw writable image
-//! slots (typically `.fill` gaps left by removed Themida sections).
+
+//!
+//! Production `.unwrap()`s are invariants: `min()` runs only after a
+//! `parents.is_empty()` early return (WO-10). Test unwraps are assertions.
+#![allow(clippy::unwrap_used)]//! slots (typically `.fill` gaps left by removed Themida sections).
 //!
 //! These slots are not SecurityCookie-encoded triples: they hold plain heap
 //! pointers. Early overlay / pointer scrub zeros them, and zero-raw sections

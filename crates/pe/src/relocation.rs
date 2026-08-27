@@ -1,6 +1,11 @@
-/// Base Relocation Table builder for PE dumps.
-///
-/// This module scans all sections for absolute addresses pointing to the image
+//! Base Relocation Table builder for PE dumps.
+//!
+//! Production `.unwrap()`s are parse invariants: `checked_add` + `end >
+//! image.len()` guards precede the fixed-width slices (WO-10). Test unwraps
+//! are assertions.
+#![allow(clippy::unwrap_used)]
+//!
+//! This module scans all sections for absolute addresses pointing to the image
 /// and generates a complete .reloc section so the Windows PE Loader can fix
 /// them when the image loads at a different base address.
 use std::collections::BTreeMap;

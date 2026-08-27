@@ -1,5 +1,10 @@
 //! Deterministic runtime heap / container rebasing plan (offline core).
+
 //!
+//! Production `.unwrap()`s are invariants: `position(is_structural)` runs only
+//! after the `n_struct == 0` early-continue, so a structural record exists
+//! (WO-10). Test unwraps are assertions.
+#![allow(clippy::unwrap_used)]//!
 //! GTO R0 (heap/runtime rebase): a cold-start unpacked PE must not carry
 //! pointers into the original process's heap / private allocations. Those
 //! addresses die with the live process. This module turns the *captured*

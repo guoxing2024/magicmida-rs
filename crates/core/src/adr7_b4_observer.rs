@@ -1,5 +1,12 @@
 //! ADR7-B4 dynamic instrumentation observer (debugger-side event recorder).
 //!
+//! Production `.unwrap()`s in this module are all `Mutex::lock()` on the
+//! observer's internal recorders; the module never holds a lock across a
+//! panicking operation (no user code runs under the lock), so poisoning is
+//! unreachable in practice — these are invariants, not fallible paths
+//! (WO-10). Test-block unwraps are ordinary test assertions.
+#![allow(clippy::unwrap_used)]
+//!
 //! B4 goal: instrument the runtime panic path dynamically (B3 left the
 //! runtime root cause unproven; B4 adds debugger-side observation without
 //! modifying the runtime DLL or the protected sample).

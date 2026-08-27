@@ -1,5 +1,11 @@
 //! Immutable runtime observation of a PE image's TLS directory.
 //!
+//! Production `.unwrap()`s are parse invariants: `parse_directory` runs only
+//! after an `ExactReadResult::Complete` read of the TLS directory (>= 40
+//! bytes, covering the deepest slice), and `read_ptr` matches the pointer
+//! width before the fixed-width slice (WO-10). Test unwraps are assertions.
+#![allow(clippy::unwrap_used)]
+//!
 //! This module is deliberately independent from dump mutation. It reads the
 //! initial PE header's TLS data-directory and the live process memory before
 //! any header patching, shrinking, or section reconstruction occurs.

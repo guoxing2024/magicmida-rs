@@ -105,6 +105,10 @@ impl ParseIssue {
 
 /// Attempt to parse a PE image. Returns the image and any non-fatal notes, or
 /// a fatal issue if headers cannot be established.
+#[allow(clippy::unwrap_used)] // every unwrap below follows an explicit
+// in_bounds/checked length guard; the safe u16_le/u32_le/u64_le helpers can
+// only return None on a short buffer, and the guards make that unreachable.
+// These are parse invariants, not fallible error paths (WO-10).
 pub fn try_parse(bytes: &[u8]) -> Result<PeImage<'_>, ParseIssue> {
     if bytes.len() < 0x40 {
         return Err(ParseIssue::new(

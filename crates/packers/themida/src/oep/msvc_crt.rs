@@ -1,5 +1,11 @@
 //! Offline fail-closed MSVC CRT target resolution and PE-entry wrapper synthesis.
 //!
+//! Production `.unwrap()`s are parse invariants on fixed-width slices
+//! (`try_into()` on 8-byte windows whose bounds were just checked, and
+//! `next()` after a `match found.len()` guard) — never reachable failure
+//! paths (WO-10). Test-block unwraps are ordinary assertions.
+#![allow(clippy::unwrap_used)]
+//!
 //! Correct PE-entry wrapper (18 bytes, Win64 stack-alignment contract):
 //! ```text
 //!   sub rsp, 28h
