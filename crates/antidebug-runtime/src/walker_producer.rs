@@ -1,4 +1,11 @@
 //! IMP-09-CARRIER-R5-R3: production round-1 / round-2 result section
+//!
+//! Production `.unwrap()`/`.expect()`s are invariants (WO-12 follow-up,
+//! surfaced by the --lib --bins -D audit): fixed-width slice `try_into()`
+//! behind explicit bound checks, `RUNTIME.get()` after a just-succeeded
+//! `set()`, and `slot_va(1/2)` on already-produced rounds. No production
+//! fallible path is masked. Test-block unwraps/expects are assertions.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! producer with the DONE publication protocol (pure offline, fail-closed).
 //!
 //! The walker runs TWO rounds in the SAME result section allocation:
