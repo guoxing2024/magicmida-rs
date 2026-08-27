@@ -421,7 +421,7 @@ fn covering_slab_for_child<'a>(
         }
     }
     match covering.len() {
-        0 => Err(OverlayError::ProbeCoverageMissing {
+        0 => Err(OverlayError::ProbeCoverageMissing(Box::new(ProbeCoverageMissingDetails {
             child_kind,
             child_base: child_old_base,
             child_size,
@@ -437,7 +437,7 @@ fn covering_slab_for_child<'a>(
             was_interior: false,
             containing_parent_old_base: None,
             containing_parent_size: None,
-        }),
+        }))),
         1 => {
             let (si, base, size, off) = covering[0];
             let slab = &raw_capture.slabs[si];
@@ -447,7 +447,7 @@ fn covering_slab_for_child<'a>(
             // Ambiguous coverage (contained in multiple slabs). A dedicated slab
             // that exactly duplicates a main-slab slice should have been deduped;
             // any real multi-coverage is a hard fail-closed.
-            Err(OverlayError::ProbeCoverageMissing {
+            Err(OverlayError::ProbeCoverageMissing(Box::new(ProbeCoverageMissingDetails {
                 child_kind,
                 child_base: child_old_base,
                 child_size,
@@ -466,7 +466,7 @@ fn covering_slab_for_child<'a>(
                 was_interior: false,
                 containing_parent_old_base: None,
                 containing_parent_size: None,
-            })
+            })))
         }
     }
 }
@@ -2298,38 +2298,11 @@ pub enum OverlayError {
     /// coverage. Detected at the `capture_coverage_bind` gate (before overlay /
     /// runtime plan), so an uncovered window is reported early and precisely,
     /// not deferred to runtime rebase plan validation.
-    ProbeCoverageMissing {
-        /// Kind of the child (heap_global / container).
-        child_kind: RawChildKind,
-        /// Old base of the uncovered probe/interior child.
-        child_base: u64,
-        /// Size of the uncovered child.
-        child_size: usize,
-        /// Extent kind (ProbeWindow / InteriorSubview).
-        extent_kind: Box<str>,
-        /// Number of candidate authoritative slabs considered.
-        candidate_slab_count: usize,
-        /// The nearest candidate slab authority range, if any `(base, end)`.
-        nearest_authority: Option<(u64, u64)>,
-        /// Distance from the child base to the nearest authority range, in bytes.
-        nearest_authority_gap: u64,
-        /// Deterministic capture id of the uncovered child.
-        child_capture_id: Box<str>,
-        /// Capture path that produced the uncovered child.
-        child_capture_path: Box<str>,
-        /// Root image RVA that led to the child capture, if known.
-        source_root_rva: Option<u32>,
-        /// Byte offset of the source slot within the root, if known.
-        source_slot_offset: Option<usize>,
-        /// The probe size requested for this child capture.
-        probe_requested_size: usize,
-        /// Whether the child was interior to an already-captured object.
-        was_interior: bool,
-        /// Old base of the containing parent object, if any.
-        containing_parent_old_base: Option<u64>,
-        /// Size of the containing parent, if any.
-        containing_parent_size: Option<usize>,
-    },
+    /// Route T R0-C: an uncovered ProbeWindow / InteriorSubview. Payload is
+    /// boxed (WO-24) so `OverlayError` stays under clippy's
+    /// `result_large_err` threshold (128 bytes); this variant carried ~20
+    /// fields and was the largest.
+    ProbeCoverageMissing(Box<ProbeCoverageMissingDetails>),
     /// Route T R0 AF2 (TAF2-B): two authoritative slabs overlap but are NOT a
     /// clean exact-duplicate or contained-same-bytes relation. The slab set must
     /// be normalized before coverage/raw-capture/seed; an unresolvable overlap
@@ -2360,6 +2333,43 @@ pub enum OverlayError {
         identity: Box<str>,
     },
 }
+
+/// Payload for [`OverlayError::ProbeCoverageMissing`]. Boxed (WO-24) so the
+/// error enum stays under clippy's `result_large_err` threshold (128 bytes).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeCoverageMissingDetails {
+    /// Kind of the child (heap_global / container).
+    pub child_kind: RawChildKind,
+    /// Old base of the uncovered probe/interior child.
+    pub child_base: u64,
+    /// Size of the uncovered child.
+    pub child_size: usize,
+    /// Extent kind (ProbeWindow / InteriorSubview).
+    pub extent_kind: Box<str>,
+    /// Number of candidate authoritative slabs considered.
+    pub candidate_slab_count: usize,
+    /// The nearest candidate slab authority range, if any `(base, end)`.
+    pub nearest_authority: Option<(u64, u64)>,
+    /// Distance from the child base to the nearest authority range, in bytes.
+    pub nearest_authority_gap: u64,
+    /// Deterministic capture id of the uncovered child.
+    pub child_capture_id: Box<str>,
+    /// Capture path that produced the uncovered child.
+    pub child_capture_path: Box<str>,
+    /// Root image RVA that led to the child capture, if known.
+    pub source_root_rva: Option<u32>,
+    /// Byte offset of the source slot within the root, if known.
+    pub source_slot_offset: Option<usize>,
+    /// The probe size requested for this child capture.
+    pub probe_requested_size: usize,
+    /// Whether the child was interior to an already-captured object.
+    pub was_interior: bool,
+    /// Old base of the containing parent object, if any.
+    pub containing_parent_old_base: Option<u64>,
+    /// Size of the containing parent, if any.
+    pub containing_parent_size: Option<usize>,
+}
+
 
 // Route X R0 (X0-B): an `OverlayError` surfaced by transform-run-ledger recording
 // (participant-set change, ambiguous identity, malformed empty raw id) is a PE
@@ -2650,23 +2660,22 @@ impl std::fmt::Display for OverlayError {
                 child_kind.label(),
                 child_old_base
             ),
-            OverlayError::ProbeCoverageMissing {
-                child_kind,
-                child_base,
-                child_size,
-                extent_kind,
-                candidate_slab_count,
-                nearest_authority,
-                nearest_authority_gap,
-                child_capture_id,
-                child_capture_path,
-                source_root_rva,
-                source_slot_offset,
-                probe_requested_size,
-                was_interior,
-                containing_parent_old_base,
-                containing_parent_size,
-            } => {
+            OverlayError::ProbeCoverageMissing(details) => {
+                let child_kind = &details.child_kind;
+                let child_base = details.child_base;
+                let child_size = details.child_size;
+                let extent_kind = &details.extent_kind;
+                let candidate_slab_count = details.candidate_slab_count;
+                let nearest_authority = details.nearest_authority;
+                let nearest_authority_gap = details.nearest_authority_gap;
+                let child_capture_id = &details.child_capture_id;
+                let child_capture_path = &details.child_capture_path;
+                let source_root_rva = details.source_root_rva;
+                let source_slot_offset = details.source_slot_offset;
+                let probe_requested_size = details.probe_requested_size;
+                let was_interior = details.was_interior;
+                let containing_parent_old_base = details.containing_parent_old_base;
+                let containing_parent_size = details.containing_parent_size;
                 let root_rva = source_root_rva.map(|v| format!("{v:#x}"));
                 let slot_off = source_slot_offset.map(|v| format!("{v:#x}"));
                 let parent_base = containing_parent_old_base.map(|v| format!("{v:#x}"));
@@ -3336,7 +3345,7 @@ pub fn validate_probe_coverage(
         if cover_count > 1 {
             // Ambiguous coverage (contained in multiple slabs) is also a hard
             // coverage failure (the rebase planner would reject it as ambiguous).
-            return Err(OverlayError::ProbeCoverageMissing {
+            return Err(OverlayError::ProbeCoverageMissing(Box::new(ProbeCoverageMissingDetails {
                 child_kind: RawChildKind::HeapGlobal,
                 child_base: g.live_ptr,
                 child_size: g.content.len(),
@@ -3352,7 +3361,7 @@ pub fn validate_probe_coverage(
                 was_interior: g.extent_evidence.was_interior,
                 containing_parent_old_base: g.extent_evidence.containing_parent_old_base,
                 containing_parent_size: g.extent_evidence.containing_parent_size,
-            });
+            })));
         }
         // Not covered: find the nearest authority range (T0-C precise diagnostic).
         let mut nearest: Option<(u64, u64, u64)> = None; // (base, end, gap)
@@ -3369,7 +3378,7 @@ pub fn validate_probe_coverage(
             }
         }
         let (n_base, n_end, n_gap) = nearest.unwrap_or((0, 0, u64::MAX));
-        return Err(OverlayError::ProbeCoverageMissing {
+        return Err(OverlayError::ProbeCoverageMissing(Box::new(ProbeCoverageMissingDetails {
             child_kind: RawChildKind::HeapGlobal,
             child_base: g.live_ptr,
             child_size: g.content.len(),
@@ -3389,7 +3398,7 @@ pub fn validate_probe_coverage(
             was_interior: g.extent_evidence.was_interior,
             containing_parent_old_base: g.extent_evidence.containing_parent_old_base,
             containing_parent_size: g.extent_evidence.containing_parent_size,
-        });
+        })));
     }
     Ok(())
 }
@@ -3729,7 +3738,7 @@ pub fn build_patched_backing_slab(
     let slab = raw_capture
         .slabs
         .first()
-        .ok_or(OverlayError::ProbeCoverageMissing {
+        .ok_or(OverlayError::ProbeCoverageMissing(Box::new(ProbeCoverageMissingDetails {
             child_kind: RawChildKind::HeapGlobal,
             child_base: 0,
             child_size: 0,
@@ -3745,7 +3754,7 @@ pub fn build_patched_backing_slab(
             was_interior: false,
             containing_parent_old_base: None,
             containing_parent_size: None,
-        })?;
+        })))?;
     let mut backing = slab.content.clone();
 
     // GTO R0-F.1: index raw children by (old_base, kind) preserving ALL entries.

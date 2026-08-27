@@ -7410,7 +7410,7 @@ fn m33_no_parent_evidence_probe_not_promoted() {
     assert!(candidates.is_empty());
     // Coverage gate still fails closed.
     let err = validate_probe_coverage(&[child], &[]).unwrap_err();
-    assert!(matches!(err, OverlayError::ProbeCoverageMissing { .. }));
+    assert!(matches!(err, OverlayError::ProbeCoverageMissing(_)));
 }
 
 #[test]
@@ -7419,13 +7419,9 @@ fn m33_nearest_slab_with_large_gap_still_rejected() {
     let slabs = vec![slab_of_len(0x9a3000, 0x1000)];
     let err = validate_probe_coverage(&[child], &slabs).unwrap_err();
     match err {
-        OverlayError::ProbeCoverageMissing {
-            nearest_authority,
-            nearest_authority_gap,
-            ..
-        } => {
-            assert_eq!(nearest_authority, Some((0x9a3000, 0x9a4000)));
-            assert!(nearest_authority_gap > 0x1000);
+        OverlayError::ProbeCoverageMissing(details) => {
+            assert_eq!(details.nearest_authority, Some((0x9a3000, 0x9a4000)));
+            assert!(details.nearest_authority_gap > 0x1000);
         }
         other => panic!("expected ProbeCoverageMissing, got {other:?}"),
     }
@@ -7444,7 +7440,7 @@ fn m33_multi_authority_full_cover_ambiguous_fails() {
     let child = probe_global(0x850150, 8);
     let slabs = vec![slab_of_len(0x850000, 0x1000), slab_of_len(0x850000, 0x1000)];
     let err = validate_probe_coverage(&[child], &slabs).unwrap_err();
-    assert!(matches!(err, OverlayError::ProbeCoverageMissing { .. }));
+    assert!(matches!(err, OverlayError::ProbeCoverageMissing(_)));
 }
 
 #[test]
@@ -7688,7 +7684,7 @@ fn m34_overflowed_slab_end_not_covering_authority() {
     let overflow_slab = slab_of_len(u64::MAX - 0x10, 0x100);
     // The range [u64::MAX-0x10, +0x100) wraps; the child is NOT inside it.
     let err = validate_probe_coverage(&[child.clone()], &[overflow_slab]).unwrap_err();
-    assert!(matches!(err, OverlayError::ProbeCoverageMissing { .. }));
+    assert!(matches!(err, OverlayError::ProbeCoverageMissing(_)));
     // Also: closure derivation must reject a wrapping parent range.
     let (mut child2, mut parent) = m33_probe_with_parent(
         0x850150,
@@ -7976,7 +7972,7 @@ fn m34_probe_window_pre_trunc_parent_no_closure() {
     );
     // Coverage gate still fails closed.
     let err = validate_probe_coverage(&[child], &[]).unwrap_err();
-    assert!(matches!(err, OverlayError::ProbeCoverageMissing { .. }));
+    assert!(matches!(err, OverlayError::ProbeCoverageMissing(_)));
 }
 
 /// Test 13: the current blocker-equivalent fixture — a split child with
@@ -8018,7 +8014,7 @@ fn m34_blocker_split_child_len8_no_parent_still_fails_closed_with_provenance() {
     // The coverage gate fails closed...
     let err = validate_probe_coverage(&[child.clone()], &[]).unwrap_err();
     assert!(
-        matches!(err, OverlayError::ProbeCoverageMissing { .. }),
+        matches!(err, OverlayError::ProbeCoverageMissing(_)),
         "must fail closed as ProbeCoverageMissing, got {err:?}"
     );
     // ...and the error contains the COMPLETE producer provenance.

@@ -12,21 +12,13 @@ fn route_t_r0_uncovered_probe_fails() {
     let slabs = vec![slab_of_len(0x9a3000, 0x1000)];
     let err = validate_probe_coverage(&[g], &slabs).unwrap_err();
     match err {
-        OverlayError::ProbeCoverageMissing {
-            child_base,
-            child_size,
-            extent_kind,
-            candidate_slab_count,
-            nearest_authority,
-            nearest_authority_gap,
-            ..
-        } => {
-            assert_eq!(child_base, 0x850150);
-            assert_eq!(child_size, 0x1000);
-            assert!(extent_kind.contains("ProbeWindow"));
-            assert_eq!(candidate_slab_count, 1);
-            assert_eq!(nearest_authority, Some((0x9a3000, 0x9a4000)));
-            assert!(nearest_authority_gap > 0);
+        OverlayError::ProbeCoverageMissing(details) => {
+            assert_eq!(details.child_base, 0x850150);
+            assert_eq!(details.child_size, 0x1000);
+            assert!(details.extent_kind.contains("ProbeWindow"));
+            assert_eq!(details.candidate_slab_count, 1);
+            assert_eq!(details.nearest_authority, Some((0x9a3000, 0x9a4000)));
+            assert!(details.nearest_authority_gap > 0);
         }
         other => panic!("expected ProbeCoverageMissing, got {other:?}"),
     }
@@ -78,15 +70,10 @@ fn route_t_r0_no_slabs_probe_fails_with_none_authority() {
     let slabs: Vec<HeapSlab> = Vec::new();
     let err = validate_probe_coverage(&[g], &slabs).unwrap_err();
     match err {
-        OverlayError::ProbeCoverageMissing {
-            child_base,
-            candidate_slab_count,
-            nearest_authority,
-            ..
-        } => {
-            assert_eq!(child_base, 0x850150);
-            assert_eq!(candidate_slab_count, 0);
-            assert_eq!(nearest_authority, None);
+        OverlayError::ProbeCoverageMissing(details) => {
+            assert_eq!(details.child_base, 0x850150);
+            assert_eq!(details.candidate_slab_count, 0);
+            assert_eq!(details.nearest_authority, None);
         }
         other => panic!("expected ProbeCoverageMissing, got {other:?}"),
     }
