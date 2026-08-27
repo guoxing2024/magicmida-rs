@@ -269,7 +269,7 @@ pub fn determine_iat_address(
     // If OEP scan found an IAT ref, try to find an earlier one by scanning
     // the entire .text section.  The earliest IAT ref is closer to the true
     // IAT start, which helps when the IAT spans multiple modules.
-    let mut iat_ref = if iat_ref == 0 {
+    let iat_ref = if iat_ref == 0 {
         info!("No IAT reference found via OEP scan - trying full .text scan");
         let earliest =
             discovery::find_earliest_iat_ref(debugger, text_section, text_base, code_size)?;
@@ -313,33 +313,86 @@ pub fn determine_iat_address(
 
     info!("First IAT reference: {iat_ref:#x}");
 
-    // Validate the IAT reference: if the code scan found a stale FF15
-    // reference to a non-IAT data pointer (common in Themida v3 x64 where
-    // .text has FF15 refs to vtable/CFG dispatch pointers in .rdata),
-    // the API-address density around iat_ref will be low.  Fall back to
-    // the data-section heuristic (unlicense-inspired) which scans .rdata
-    // for regions densely populated with resolved API addresses.
-    if !discovery::validate_iat_ref(debugger, iat_ref)? {
-        info!("Code-scan IAT ref failed validation - trying data heuristic");
+    // XX-3 fail-closed discovery: the single-shot code scan can land on a
+    // stale FF15 reference to a non-IAT data pointer (vtable/CFG dispatch in
+    // .rdata, or an out-of-image pointer into another module).  Instead of
+    // warning and hard-reading that invalid ref (XX-2 FATAL: 40960-byte read
+    // at 0x7ff85ace1c0c), collect ALL indirect call/jmp sites, rank them by
+    // plausibility (in-image slot first), and validate each in order.
+    let candidates = discovery::find_all_iat_refs(debugger, text_section, text_base, code_size)?;
+
+    // Attribute the first (code-scan) ref for the live-fire log — closes the
+    // "VM thunk vs stray module hit" ambiguity without extra instrumentation.
+    let attrib = discovery::attribute_address_to_module(
+        debugger.pid(),
+        iat_ref,
+    );
+    match &attrib.module {
+        Some(name) => info!(
+            iat_ref = format_args!("{iat_ref:#x}"),
+            module = %name,
+            base = format_args!("{:#x}", attrib.module_base),
+            end = format_args!("{:#x}", attrib.module_end),
+            "IAT ref module attribution: inside module"
+        ),
+        None => info!(
+            iat_ref = format_args!("{iat_ref:#x}"),
+            "IAT ref module attribution: not inside any loaded module (unmapped hole)"
+        ),
+    }
+
+    // Choose the best ref: validate the code-scan ref first; if it fails,
+    // walk the ranked candidates and accept the first that validates.
+    let mut chosen_ref = iat_ref;
+    let mut validated = discovery::validate_iat_ref(debugger, chosen_ref)?;
+    if !validated {
+        info!("Code-scan IAT ref failed validation - trying ranked candidates");
+        for c in &candidates {
+            if c.slot == chosen_ref {
+                continue;
+            }
+            if discovery::validate_iat_ref(debugger, c.slot)? {
+                info!(
+                    slot = format_args!("{:#x}", c.slot),
+                    site = format_args!("{:#x}", c.site),
+                    "Ranked candidate IAT ref validated"
+                );
+                chosen_ref = c.slot;
+                validated = true;
+                break;
+            }
+        }
+    }
+
+    if !validated {
+        // Still not validated — try the data-section heuristic before giving up.
+        info!("All code-scan refs failed validation - trying data heuristic");
         let heuristic_ref =
             discovery::find_iat_via_data_heuristic(debugger, data_section_base, data_section_size)?;
         if heuristic_ref != 0 {
             info!(
-                old = format_args!("{iat_ref:#x}"),
+                old = format_args!("{chosen_ref:#x}"),
                 new = format_args!("{heuristic_ref:#x}"),
                 "Switching to data-heuristic IAT ref"
             );
-            iat_ref = heuristic_ref;
+            chosen_ref = heuristic_ref;
         } else {
-            warn!("Data heuristic found nothing - proceeding with code-scan ref");
+            // XX-3 fail-closed: no valid ref anywhere — report IatNotFound
+            // (honest error) rather than hard-reading an invalid pointer and
+            // FATAL-ing inside scan_iat_boundaries.
+            warn!(
+                "No valid IAT reference found (code scan + data heuristic both failed) — \
+                 reporting IatNotFound (fail-closed)"
+            );
+            return Err(ThemidaError::IatNotFound);
         }
     }
 
-    // Step 2: Walk backwards from `iat_ref` to find the start of the IAT.
-    // The IAT is a contiguous array of pointers, preceded by a region of
-    // zeros (or at least non-API pointers).  We also do a forward walk to
+    // Step 2: Walk backwards from the chosen ref to find the start of the
+    // IAT.  The IAT is a contiguous array of pointers, preceded by a region
+    // of zeros (or at least non-API pointers).  We also do a forward walk to
     // determine the end.
-    let iat = boundaries::scan_iat_boundaries(debugger, iat_ref)?;
+    let iat = boundaries::scan_iat_boundaries(debugger, chosen_ref)?;
 
     Ok(Some(iat))
 }

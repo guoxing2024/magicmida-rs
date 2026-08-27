@@ -196,10 +196,6 @@ pub(super) fn scan_iat_boundaries(
     let image_base = debugger.image_base() as usize;
     let image_boundary = read_image_boundary(debugger, image_base).unwrap_or(0);
 
-    // Allocate a buffer large enough to hold the maximum IAT.
-    let max_slots = MAX_IAT_SIZE / ptr_size;
-    let mut iat_data = vec![0usize; max_slots];
-
     // Read the IAT data centred on `iat_ref` such that iat_data[high] is
     // the pointer at iat_ref.
     // Read starting FROM iat_ref (not centered on it) so the buffer
@@ -208,18 +204,54 @@ pub(super) fn scan_iat_boundaries(
     // but we keep a small backward margin (64 slots) for safety.
     let backward_margin = 64 * ptr_size;
     let read_start = iat_ref.saturating_sub(backward_margin);
-    let bytes_read = debugger
-        // SAFETY: iat_data is a Vec<usize> with len * size_of::<usize>() bytes; the aliasing slice is passed to read_memory and discarded before reuse.
-        .read_memory(read_start, unsafe {
-            std::slice::from_raw_parts_mut(
-                iat_data.as_mut_ptr() as *mut u8,
-                iat_data.len() * ptr_size,
-            )
-        })
-        .map_err(|e| ThemidaError::Debugger(format!("scan_iat_boundaries read: {e}")))?;
 
-    let actual_slots = bytes_read / ptr_size;
-    iat_data.truncate(actual_slots);
+    // XX-3 page-grained read: instead of one MAX_IAT_SIZE hard read (which
+    // FATALs on the first unmapped page — XX-2), walk forward in 4 KiB pages
+    // and truncate at the first page whose read returns fewer bytes than
+    // requested.  This supports partial IAT dumps and eliminates the
+    // 40960-byte one-shot failure.
+    const PAGE: usize = 0x1000;
+    let mut iat_data: Vec<usize> = Vec::new();
+    let mut cursor = read_start;
+    let mut read_total = 0usize;
+    while read_total < MAX_IAT_SIZE {
+        let chunk = (MAX_IAT_SIZE - read_total).min(PAGE);
+        let mut buf = vec![0u8; chunk];
+        let n = debugger
+            .read_memory(cursor, &mut buf)
+            .map_err(|e| ThemidaError::Debugger(format!("scan_iat_boundaries read: {e}")))?;
+        if n == 0 {
+            // Unmapped page — truncate here.
+            break;
+        }
+        // Append whole slots only; keep a trailing partial-slot carry is not
+        // needed since the IAT is 8-byte aligned and pages are 8-byte aligned.
+        let slot_bytes = (n / ptr_size) * ptr_size;
+        if slot_bytes == 0 {
+            break;
+        }
+        for off in (0..slot_bytes).step_by(ptr_size) {
+            let val = usize::from_le_bytes([
+                buf[off],
+                buf[off + 1],
+                buf[off + 2],
+                buf[off + 3],
+                buf[off + 4],
+                buf[off + 5],
+                buf[off + 6],
+                buf[off + 7],
+            ]);
+            iat_data.push(val);
+        }
+        read_total += n;
+        cursor += n;
+        if n < chunk {
+            // Partial page read (page boundary / guard) — stop.
+            break;
+        }
+    }
+
+    let actual_slots = iat_data.len();
 
     if actual_slots < 2 {
         return Err(ThemidaError::IatNotFound);
@@ -470,4 +502,131 @@ fn read_image_boundary(debugger: &dyn DebuggerCore, image_base: usize) -> Option
         return None;
     }
     Some(image_base.saturating_add(size_of_image))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mida_core::{ContinueStatus, CoreError, DebugEvent, DebuggerCore};
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Diagnostics::Debug::CONTEXT;
+
+    /// Page-backed debugger memory: only pages explicitly `put` are readable;
+    /// everything else returns 0 bytes (unmapped).
+    struct PageMem {
+        base: u64,
+        pages: std::collections::BTreeMap<usize, Vec<u8>>,
+    }
+
+    impl PageMem {
+        fn new(base: u64) -> Self {
+            PageMem {
+                base,
+                pages: std::collections::BTreeMap::new(),
+            }
+        }
+        fn put_page(&mut self, page: usize, bytes: &[u8]) {
+            self.pages.insert(page, bytes.to_vec());
+        }
+    }
+
+    impl DebuggerCore for PageMem {
+        fn process_handle(&self) -> HANDLE {
+            HANDLE::default()
+        }
+        fn pid(&self) -> u32 {
+            1
+        }
+        fn image_base(&self) -> u64 {
+            self.base
+        }
+        fn wait_event(&mut self) -> Result<DebugEvent, CoreError> {
+            Err(CoreError::DebugState("no events".into()))
+        }
+        fn continue_event(&mut self, _t: u32, _s: ContinueStatus) -> Result<(), CoreError> {
+            Ok(())
+        }
+        fn read_memory(&self, addr: usize, buf: &mut [u8]) -> Result<usize, CoreError> {
+            let page = addr & !0xFFF;
+            let off = addr - page;
+            match self.pages.get(&page) {
+                Some(data) => {
+                    if off >= data.len() {
+                        return Ok(0);
+                    }
+                    let n = (data.len() - off).min(buf.len());
+                    buf[..n].copy_from_slice(&data[off..off + n]);
+                    Ok(n)
+                }
+                None => Ok(0),
+            }
+        }
+        fn write_memory(&mut self, _a: usize, _d: &[u8]) -> Result<usize, CoreError> {
+            Ok(0)
+        }
+        fn get_thread_context(&self, _t: u32) -> Result<CONTEXT, CoreError> {
+            Err(CoreError::DebugState("no ctx".into()))
+        }
+        fn set_thread_context(&self, _t: u32, _c: &CONTEXT) -> Result<(), CoreError> {
+            Ok(())
+        }
+    }
+
+    /// Two consecutive pages of resolved-API IAT slots; page 3 is unmapped.
+    /// The page-grained scan must truncate at the unmapped page and return a
+    /// partial IAT instead of FATAL-ing on a hard read.
+    #[test]
+    fn scan_iat_boundaries_truncates_at_unmapped_page() {
+        let image_base = 0x140000000usize;
+        // Put the ref 0x400 into its page so the 64-slot backward margin
+        // (512 bytes) still lands inside the same mapped page.
+        let iat_ref = 0x140010400usize;
+        let page_base = iat_ref & !0xFFF;
+        let mut dbg = PageMem::new(image_base as u64);
+
+        // Page 0 (ref page): resolved API addresses.
+        let mut page0 = vec![0u8; 0x1000];
+        for (i, chunk) in page0.chunks_mut(8).enumerate() {
+            let val = 0x7ff0_0000_0000usize + i * 8;
+            chunk.copy_from_slice(&val.to_le_bytes());
+        }
+        dbg.put_page(page_base, &page0);
+
+        // Page 1: another full page.
+        let mut page1 = vec![0u8; 0x1000];
+        for (i, chunk) in page1.chunks_mut(8).enumerate() {
+            let val = 0x7ff0_0000_1000usize + i * 8;
+            chunk.copy_from_slice(&val.to_le_bytes());
+        }
+        dbg.put_page(page_base + 0x1000, &page1);
+
+        // Page 2 (unmapped) is intentionally absent.
+
+        let result = scan_iat_boundaries(&dbg, iat_ref);
+        // Must not FATAL; must return a partial IAT spanning at most 2 pages.
+        let iat = result.expect("page-grained scan must succeed on partial IAT");
+        assert!(iat.address > 0);
+        assert!(iat.size > 0);
+        assert!(iat.size <= 2 * 0x1000);
+    }
+
+    /// A single readable page around the ref must still produce a valid IAT.
+    #[test]
+    fn scan_iat_boundaries_single_page_ok() {
+        let image_base = 0x140000000usize;
+        let iat_ref = 0x140010400usize;
+        let page_base = iat_ref & !0xFFF;
+        let mut dbg = PageMem::new(image_base as u64);
+        let mut page0 = vec![0u8; 0x1000];
+        for (i, chunk) in page0.chunks_mut(8).enumerate() {
+            let val = 0x7ff0_0000_0000usize + i * 8;
+            chunk.copy_from_slice(&val.to_le_bytes());
+        }
+        dbg.put_page(page_base, &page0);
+
+        let iat = scan_iat_boundaries(&dbg, iat_ref).expect("single-page IAT");
+        assert!(iat.address > 0);
+        assert!(iat.size > 0);
+        assert!(iat.size <= 0x1000 + 64 * 8); // one page + backward margin
+    }
 }

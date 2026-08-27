@@ -289,6 +289,93 @@ pub(super) fn find_earliest_iat_ref(
     Ok(earliest_ref)
 }
 
+/// A candidate IAT reference discovered by scanning the whole `.text`
+/// section for indirect `call`/`jmp [rip+disp]` (FF 15 / FF 25) sites.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct IatRefCandidate {
+    /// Address of the memory operand (the IAT slot itself).
+    pub(super) slot: usize,
+    /// Address of the indirect call/jmp instruction that references it.
+    pub(super) site: usize,
+    /// The resolved value read from the slot (0 if unreadable).
+    pub(super) value: usize,
+    /// True when the slot address lies within the target image (data section
+    /// / IAT area) rather than pointing outside the image.
+    pub(super) slot_in_image: bool,
+}
+
+/// Collect every indirect `call`/`jmp [mem]` site in `.text` and rank them by
+/// how plausible an IAT reference they are.
+///
+/// Ranking (best first):
+/// 1. Slot address inside the image and readable with a resolved-API value;
+/// 2. Slot address inside the image (readable, value not resolved API);
+/// 3. Slot address inside the image but unreadable;
+/// 4. Slot address outside the image (unlikely to be a real IAT slot).
+///
+/// This replaces the previous single-shot behaviour where a stale FF15 to a
+/// non-IAT data pointer silently produced an invalid reference that the
+/// boundary scan then hard-read (see XX-2: scan_iat_boundaries read 40960
+/// bytes at 0x7ff85ace1c0c, an out-of-image pointer, and FATAL'd).
+pub(super) fn find_all_iat_refs(
+    debugger: &dyn DebuggerCore,
+    text: &[u8],
+    text_base: usize,
+    _code_size: usize,
+) -> Result<Vec<IatRefCandidate>, ThemidaError> {
+    let mut candidates: Vec<IatRefCandidate> = Vec::new();
+    let image_base = debugger.image_base() as usize;
+    let image_end = image_base.saturating_add(0x1000_0000);
+
+    for i in 0..text.len().saturating_sub(6) {
+        if text[i] == 0xFF && (text[i + 1] == 0x15 || text[i + 1] == 0x25) {
+            let ip = text_base + i;
+            let disp32 = i32::from_le_bytes([text[i + 2], text[i + 3], text[i + 4], text[i + 5]]);
+            let slot = (ip as i64 + 6 + disp32 as i64) as usize;
+
+            let mut ptr_buf = [0u8; 8];
+            let value = match debugger.read_memory(slot, &mut ptr_buf) {
+                Ok(n) if n >= 8 => usize::from_le_bytes(ptr_buf),
+                _ => 0usize,
+            };
+
+            let slot_in_image = slot >= image_base && slot < image_end;
+            candidates.push(IatRefCandidate {
+                slot,
+                site: ip,
+                value,
+                slot_in_image,
+            });
+            // Keep the IAT-ref search bounded: real IAT references appear in
+            // the first few thousand instructions of .text; scanning more than
+            // this risks O(n) churn on multi-MB .text for no additional value.
+            if candidates.len() >= 512 {
+                break;
+            }
+        }
+    }
+
+    // Sort: in-image slots first, then readable-with-API, then by slot order.
+    candidates.sort_by(|a, b| {
+        let a_rank = rank_candidate(a);
+        let b_rank = rank_candidate(b);
+        a_rank
+            .cmp(&b_rank)
+            .then(a.slot.cmp(&b.slot))
+    });
+
+    Ok(candidates)
+}
+
+fn rank_candidate(c: &IatRefCandidate) -> u8 {
+    match (c.slot_in_image, c.value != 0) {
+        (true, true) => 0,  // in-image, resolved value (best)
+        (true, false) => 1, // in-image, unresolved
+        (false, true) => 2, // out-of-image but has a value
+        (false, false) => 3, // out-of-image, unreadable
+    }
+}
+
 /// Scan from `start_addr`, disassembling instructions and looking for the
 /// first `call [mem]` or `jmp [mem]` whose memory operand points outside
 /// the `.text` section (i.e. into the IAT / data area).
@@ -801,6 +888,82 @@ pub(super) fn find_iat_via_data_heuristic(
     Ok(best_start)
 }
 
+// ===========================================================================
+// IAT ref module attribution (XX-3 attribution aid)
+// ===========================================================================
+
+/// Outcome of attributing an IAT reference address to a loaded module.
+#[derive(Debug, Clone, Default)]
+pub(super) struct ModuleAttribution {
+    /// Module name the address falls inside, if any.
+    pub(super) module: Option<String>,
+    /// The module's base address (when `module` is `Some`).
+    pub(super) module_base: usize,
+    /// The module's end address (`base + size`).
+    pub(super) module_end: usize,
+}
+
+/// Attribute an address to a loaded module via the ToolHelp module snapshot.
+///
+/// This closes the "VM thunk vs stray hit into another module's IAT"
+/// ambiguity observed in XX-2 (IAT pointer 0x7ff85ace1e0c, ~200MB outside
+/// the image). The attribution is logged to stdout so live-fire runs can
+/// reason about the address without re-instrumenting.
+pub(super) fn attribute_address_to_module(
+    pid: u32,
+    address: usize,
+) -> ModuleAttribution {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, MODULEENTRY32W, TH32CS_SNAPMODULE,
+        TH32CS_SNAPMODULE32,
+    };
+
+    // SAFETY: pid is the target process id from the debugger; the snapshot
+    // handle is closed before return.
+    let h_snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid) };
+    let Ok(h_snap) = h_snap else {
+        warn!("module attribution: CreateToolhelp32Snapshot failed");
+        return ModuleAttribution::default();
+    };
+
+    let mut me = MODULEENTRY32W::default();
+    // ToolHelp requires dwSize to be set after default construction; the
+    // field-reassign pattern is mandated by the API, not a code smell.
+    #[allow(clippy::field_reassign_with_default)]
+    {
+        me.dwSize = std::mem::size_of::<MODULEENTRY32W>() as u32;
+    }
+
+    let mut found: ModuleAttribution = ModuleAttribution::default();
+
+    // SAFETY: h_snap is a valid snapshot handle; me has a correct dwSize.
+    let mut ok = unsafe { Module32FirstW(h_snap, &mut me) };
+    while ok.is_ok() {
+        let base = me.modBaseAddr as usize;
+        let end = base + me.modBaseSize as usize;
+        if address >= base && address < end {
+            found = ModuleAttribution {
+                module: Some(
+                    String::from_utf16_lossy(&me.szModule)
+                        .trim_end_matches('\0')
+                        .to_string(),
+                ),
+                module_base: base,
+                module_end: end,
+            };
+            break;
+        }
+        // SAFETY: h_snap valid; me populated by prior call.
+        ok = unsafe { Module32NextW(h_snap, &mut me) };
+    }
+
+    // SAFETY: h_snap is a valid handle to close.
+    unsafe { let _ = CloseHandle(h_snap); }
+
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -913,5 +1076,129 @@ mod tests {
             "deep chain must terminate (depth cap): {:?}",
             result.err()
         );
+    }
+
+    // ------------------------------------------------------------------
+    // XX-3 multi-candidate / fail-closed / page-grained read tests
+    // ------------------------------------------------------------------
+
+    /// A DebuggerCore backed by a sparse address→bytes map, used to exercise
+    /// candidate ranking and the page-grained boundary read.
+    struct MapMem {
+        base: u64,
+        pages: std::collections::BTreeMap<usize, Vec<u8>>,
+    }
+
+    impl MapMem {
+        fn new(base: u64) -> Self {
+            MapMem {
+                base,
+                pages: std::collections::BTreeMap::new(),
+            }
+        }
+        fn put(&mut self, addr: usize, bytes: &[u8]) {
+            self.pages.insert(addr, bytes.to_vec());
+        }
+    }
+
+    impl DebuggerCore for MapMem {
+        fn process_handle(&self) -> HANDLE {
+            HANDLE::default()
+        }
+        fn pid(&self) -> u32 {
+            1
+        }
+        fn image_base(&self) -> u64 {
+            self.base
+        }
+        fn wait_event(&mut self) -> Result<DebugEvent, CoreError> {
+            Err(CoreError::DebugState("no events".into()))
+        }
+        fn continue_event(&mut self, _tid: u32, _status: ContinueStatus) -> Result<(), CoreError> {
+            Ok(())
+        }
+        fn read_memory(&self, addr: usize, buf: &mut [u8]) -> Result<usize, CoreError> {
+            let page = addr & !0xFFF;
+            let off = addr - page;
+            match self.pages.get(&page) {
+                Some(data) => {
+                    if off >= data.len() {
+                        return Ok(0);
+                    }
+                    let n = (data.len() - off).min(buf.len());
+                    buf[..n].copy_from_slice(&data[off..off + n]);
+                    Ok(n)
+                }
+                None => Ok(0),
+            }
+        }
+        fn write_memory(&mut self, _addr: usize, _data: &[u8]) -> Result<usize, CoreError> {
+            Ok(0)
+        }
+        fn get_thread_context(&self, _tid: u32) -> Result<CONTEXT, CoreError> {
+            Err(CoreError::DebugState("no ctx".into()))
+        }
+        fn set_thread_context(&self, _tid: u32, _ctx: &CONTEXT) -> Result<(), CoreError> {
+            Ok(())
+        }
+    }
+
+    /// Build a small .text with two FF15 sites: one whose slot is in-image
+    /// (rank 0), one whose slot is out-of-image (rank 3).
+    fn two_site_text(text_base: usize) -> (Vec<u8>, usize, usize) {
+        let mut t = vec![0x90u8; 0x40];
+        // A: FF 15 [rip+disp] -> slot in-image
+        t[0] = 0xFF;
+        t[1] = 0x15;
+        let slot_a = text_base + 0x2000; // in-image
+        let disp_a = (slot_a as i64 - (text_base as i64 + 6)) as i32;
+        t[2..6].copy_from_slice(&disp_a.to_le_bytes());
+        // B: FF 15 [rip+disp] -> slot out-of-image
+        t[0x10] = 0xFF;
+        t[0x11] = 0x15;
+        let slot_b = 0x1500_02000usize; // out-of-image (above image_end 0x150001000)
+        let disp_b = (slot_b as i64 - (text_base as i64 + 0x10 + 6)) as i32;
+        t[0x12..0x16].copy_from_slice(&disp_b.to_le_bytes());
+        (t, slot_a, slot_b)
+    }
+
+    #[test]
+    fn find_all_iat_refs_ranks_in_image_first() {
+        let text_base = 0x140001000usize;
+        let (text, slot_a, _slot_b) = two_site_text(text_base);
+        let mut dbg = MapMem::new(text_base as u64);
+        let mut page_a = vec![0u8; 0x1000];
+        page_a[0..8].copy_from_slice(&0x7ff0_0000_1234usize.to_le_bytes());
+        dbg.put(slot_a & !0xFFF, &page_a);
+
+        let cands = find_all_iat_refs(&dbg, &text, text_base, text.len()).unwrap();
+        assert!(!cands.is_empty());
+        assert!(cands[0].slot_in_image);
+        assert_eq!(cands[0].slot, slot_a);
+        assert_eq!(cands[0].value, 0x7ff0_0000_1234);
+    }
+
+    #[test]
+    fn find_all_iat_refs_ranks_out_of_image_last() {
+        let text_base = 0x140001000usize;
+        let (text, slot_a, slot_b) = two_site_text(text_base);
+        let mut dbg = MapMem::new(text_base as u64);
+        let mut page_a = vec![0u8; 0x1000];
+        page_a[0..8].copy_from_slice(&0x7ff0_0000_1234usize.to_le_bytes());
+        dbg.put(slot_a & !0xFFF, &page_a);
+
+        let cands = find_all_iat_refs(&dbg, &text, text_base, text.len()).unwrap();
+        let out_img: Vec<_> = cands.iter().filter(|c| !c.slot_in_image).collect();
+        assert_eq!(out_img.len(), 1);
+        assert_eq!(out_img[0].slot, slot_b);
+        assert_eq!(out_img[0].value, 0);
+    }
+
+    #[test]
+    fn validate_iat_ref_rejects_empty_read() {
+        let text_base = 0x140001000usize;
+        let dbg = MapMem::new(text_base as u64);
+        let r = validate_iat_ref(&dbg, text_base + 0x2000).unwrap();
+        assert!(!r);
     }
 }
