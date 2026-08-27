@@ -4,6 +4,11 @@
 //!
 //! 输出: gto_tr_t2\candidate\tr_candidate_v1.exe + 自解析验证打印。
 
+// This is a hand-run example binary whose sole purpose is to print its
+// assembly plan and self-check to stdout; the deny-level print_stdout lint is
+// waived at the crate root for that reason.
+#![allow(clippy::print_stdout)]
+
 use std::path::Path;
 
 const COMPONENTS: &str = r"D:\MidaVault\lab\evidence\gto_tr_t2\components";

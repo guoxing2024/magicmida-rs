@@ -47,7 +47,6 @@ windows = { version = "0.58", features = [
     "Win32_System_SystemServices",
     "Win32_UI_WindowsAndMessaging",
     "Wdk_System_Threading",
-    "Wdk_System_Threading",
 ] }
 
 # Clippy policy (2026-08 purification). Member crates inherit via

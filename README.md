@@ -205,6 +205,13 @@ cargo check --workspace --tests --offline
 cargo test --workspace --offline
 ```
 
+> **MSVC link.exe shadowing:** a plain Git-Bash/`PATH` shell may resolve
+> `link.exe` to Git's GNU coreutils `link` (hard-link tool) instead of MSVC's
+> linker, causing `link: missing operand after '@…/linker-arguments'` at link
+> time. Always initialize `vcvars64.bat` first (or run
+> `build_with_msvc.bat` / `test_with_msvc.bat`, which locate Visual Studio via
+> `vswhere`). `cargo check` (no linking) is unaffected.
+
 No sample is required for these commands. Tests that need binary fragments use
 small, source-controlled fixtures governed by the artifact policy.
 

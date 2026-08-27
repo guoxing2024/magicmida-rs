@@ -5726,6 +5726,10 @@ mod imp08_v2_production_tests {
     }
 }
 
+#[cfg(test)]
+mod imp07_v2_preflight_consumer_tests {
+    use super::*;
+
     // ------------------------------------------------------------------
     // IMP-07-R1: production V2 preflight consumer (offline seam)
     // ------------------------------------------------------------------
@@ -5891,7 +5895,9 @@ mod imp08_v2_production_tests {
             (blob_base + 0x1000) as usize,
         ).is_err());
     }
+}
 
+#[cfg(test)]
 mod imp09_carrier_r2_tests {
     use super::*;
 

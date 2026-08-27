@@ -43,3 +43,14 @@
 
 以上三篇虽属过程报告，但被代码/tools 引用，暂留原位；解除引用后可移入
 `archive/operations/reports/`。
+
+## GTO-TR 线研究报告（T0 R0 交付物集）
+
+GTO-TR 线是 TERMINAL 报告预留的「新工具/新思路走新治理」路线；其 R0 交付物
+由 `WORK_ORDER_GTO-TR-0_20260826.md` §6 指定落地在 `docs/`：
+
+| 文档 | 主题 |
+|---|---|
+| [GTO_TR_R0_FINGERPRINT_REPORT.md](GTO_TR_R0_FINGERPRINT_REPORT.md) | T0 引擎指纹收口（F1-F3） |
+| [GTO_TR_T0_F2_FINGERPRINT_MATRIX.md](GTO_TR_T0_F2_FINGERPRINT_MATRIX.md) | 公开语料「版本×特征」矩阵（F2 子报告） |
+| [GTO_TR_T0_F3_ATTRIBUTION_REFINEMENT.md](GTO_TR_T0_F3_ATTRIBUTION_REFINEMENT.md) | 归因精化（F3 子报告） |

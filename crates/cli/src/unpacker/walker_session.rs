@@ -17,7 +17,7 @@ use mida_antidebug_runtime::walker_control::WalkerIoError;
 use mida_antidebug_runtime::walker_control::WalkerMemoryProvider;
 use mida_antidebug_runtime::walker_protocol::{
     derive_session_id, encode_section, is_canonical_user_va, MappingIdentityHeaderV2,
-    ResultSectionHeaderV2, WalkerParamsV2, MIN_SECTION_HEADER_BYTES, PARAMS_HEADER_BYTES,
+    ResultSectionHeaderV2, WalkerParamsV2, MIN_SECTION_HEADER_BYTES,
     PROBE_RESULT_BYTES, WALKER_SESSION_ID_BYTES,
 };
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
@@ -830,6 +830,7 @@ mod imp09_r5_tests {
     /// lifecycle at a time. Each install test takes the lock at entry.
     static INSTALL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     use super::*;
+    use mida_antidebug_runtime::walker_protocol::PARAMS_HEADER_BYTES;
     use windows::Win32::System::Memory::{
         VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_FREE, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
     };
@@ -1637,13 +1638,7 @@ mod imp09_r5_tests {
         let sv = mem.section1_va().unwrap();
         assert!(!region_is_free(pv), "params allocated");
         assert!(!region_is_free(sv), "section allocated");
-        println!("BEFORE cleanup pv={pv:#x} sv={sv:#x}");
         mem.cleanup(self_handle());
-        println!(
-            "AFTER cleanup pv_free={} sv_free={}",
-            region_is_free(pv),
-            region_is_free(sv)
-        );
         assert!(region_is_free(pv), "params freed by teardown");
         assert!(region_is_free(sv), "section freed by teardown");
     }

@@ -54,6 +54,7 @@ pub fn exit_code_for_error(err: &(dyn Error + 'static)) -> u8 {
 /// Parse args, run the command, and return the exit code.
 ///
 /// Thin wrapper used by `main.rs` and by integration tests.
+#[allow(clippy::print_stdout)] // `--version` is a stdout contract, not debug noise.
 pub fn run() -> u8 {
     let cmd = match args::parse_args() {
         Ok(args::Command::Help) => {
@@ -130,11 +131,13 @@ pub fn build_capabilities_json() -> String {
 }
 
 /// Print the build-capabilities JSON (W0-B) to stdout.
+#[allow(clippy::print_stdout)] // W0-B is a stable, parseable stdout document.
 pub fn print_build_capabilities_json() {
     println!("{}", build_capabilities_json());
 }
 
 /// Print the CLI help/usage text (kept in lib so tests can assert on it).
+#[allow(clippy::print_stdout)] // `--help` text is a user-facing stdout contract.
 pub fn print_help() {
     println!("Magicmida-RS v{VERSION} - Unpacker CLI");
     println!();
@@ -154,6 +157,8 @@ pub fn print_help() {
     println!("  --wait-sec <N>          Wait for .text restore (default 60)");
     println!("  --stable <N>            Stable polls required (default 2)");
     println!("  --gate-profile <P>      Gate profile: packer-agnostic (default) | ahk-launcher");
+    println!("  --iat-location <VA,SZ>  Override runtime IAT table (absolute VA,size);");
+    println!("                          e.g. 0x14013F1E8,0x200 (packers wipe the IAT dir)");
     println!("  -v, --verbose           Debug logging");
     println!();
     println!("THEMIDA UNPACK OPTIONS:");

@@ -13,6 +13,13 @@
 //! Oreans validation failure; 1 = I/O or config error.
 //! Report writes never alias candidate, oracle, or evidence inputs.
 
+// The acceptance kernel's contract is to emit deterministic JSON reports and
+// the version banner to stdout so callers can pipe them (see the comment at
+// `write_report`/the JSON emitters). Unlike library debug prints, these
+// `println!`s are the product's stdout API, not accidental noise, so the
+// deny-level `clippy::print_stdout` is waived at the crate root.
+#![allow(clippy::print_stdout)]
+
 use std::env;
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{Read, Write};

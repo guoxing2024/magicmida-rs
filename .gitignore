@@ -13,6 +13,7 @@ conversations/
 .idea/
 .vscode/
 .claude/
+.serena/
 *.swp
 *.swo
 *~
