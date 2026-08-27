@@ -59,8 +59,8 @@ pub use dumper::{
 };
 pub use error::PeError;
 pub use exception_final::{
-    compare_runtime_final, ExceptionFinalDecoder, ExceptionFinalReport,
-    ExceptionPreservationComparison,
+    compare_runtime_final, compare_runtime_final_shrink, ExceptionFinalDecoder,
+    ExceptionFinalReport, ExceptionPreservationComparison,
 };
 pub use exception_observation::{
     observe_exception_runtime, ChainInfoObservation, ChainInfoStatus, ExceptionDirectoryStatus,

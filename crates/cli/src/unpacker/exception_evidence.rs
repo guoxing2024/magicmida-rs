@@ -261,9 +261,22 @@ fn preservation_to_evidence(p: &ExceptionPreservationComparison) -> ExceptionPre
 /// D2: no-reloc state observation with frozen wording — "no-reloc state
 /// observed and preserved" is the only acceptable positive text; "relocation
 /// PASS" is never emitted.
+///
+/// # Shrink-aware axes (XX-8-A problem 2)
+///
+/// `shrink_rebuilt_reloc` marks a dump whose shrink path rebuilt `.reloc` and
+/// deliberately restores the on-disk preferred image base while clearing
+/// DYNAMIC_BASE (fixed-base candidate). In that mode the D2.2-4 identity axes
+/// for DYNAMIC_BASE and runtime/final base are **false positives**: they are
+/// the documented transformation, not a preservation failure. They are
+/// replaced by expected-state checks so the gate stays non-vacuous (the final
+/// candidate MUST have DYNAMIC_BASE cleared and its image base MUST equal the
+/// on-disk preferred base). The rebuilt `.reloc` content is validated by the
+/// relocation evidence sidecar, not this no-reloc axis.
 fn no_reloc_state(
     reloc: &mida_pe::relocation_observation::RelocationObservationReport,
     final_reloc: &NoRelocFinalState,
+    shrink_rebuilt_reloc: bool,
 ) -> NoRelocStateEvidence {
     // N1 semantics: directory absent is the negative observation on the
     // directory axis alone; RELOCS_STRIPPED is a separate axis recorded
@@ -285,7 +298,19 @@ fn no_reloc_state(
     }
     // D2.2-4: runtime/final consistency (GTO-H4-D: the final axis is
     // re-parsed from the candidate PE, not the dump object).
-    if final_reloc.image_base_changed {
+    if shrink_rebuilt_reloc {
+        // Expected fixed-base semantics: DYNAMIC_BASE MUST be cleared.
+        if final_reloc.dynamic_base {
+            blockers.push("shrink rebuilt .reloc but final DYNAMIC_BASE still set".to_string());
+        }
+        // Expected base restore: final image base MUST equal the on-disk
+        // preferred base (the dump fixes the ASLR load base back).
+        if final_reloc.preferred_image_base != reloc.preferred_image_base {
+            blockers.push(
+                "shrink rebuilt .reloc but final image base differs from preferred".to_string(),
+            );
+        }
+    } else if final_reloc.image_base_changed {
         blockers.push("runtime/final base mismatch".to_string());
     }
     // D2 no-reloc preservation: a stripped+absent candidate MUST keep the
@@ -303,7 +328,9 @@ fn no_reloc_state(
     if present_but_empty != final_reloc.directory_present_but_empty {
         blockers.push("runtime/final empty base-reloc directory mismatch".to_string());
     }
-    if reloc.dynamic_base != final_reloc.dynamic_base {
+    // Shrink clears DYNAMIC_BASE (documented transformation); identity is not
+    // expected. Non-shrink still requires identity.
+    if !shrink_rebuilt_reloc && reloc.dynamic_base != final_reloc.dynamic_base {
         blockers.push("runtime/final DYNAMIC_BASE mismatch".to_string());
     }
     if reloc.runtime_image_base != final_reloc.runtime_image_base
@@ -355,9 +382,17 @@ pub(crate) fn write_exception_evidence(
     report: &mida_pe::DumpProcessReport,
     family: &str,
     final_reloc: &NoRelocFinalState,
+    shrink_rebuilt_pdata: bool,
 ) -> anyhow::Result<PathBuf> {
     let sidecar = sidecar_path(candidate)?;
-    let value = build_exception_evidence(protected_input, candidate, report, family, final_reloc)?;
+    let value = build_exception_evidence(
+        protected_input,
+        candidate,
+        report,
+        family,
+        final_reloc,
+        shrink_rebuilt_pdata,
+    )?;
     if !value.prerequisite_passes {
         let reason = value.blockers.join("; ");
         return Err(anyhow!(
@@ -376,6 +411,7 @@ pub(crate) fn build_exception_evidence(
     report: &mida_pe::DumpProcessReport,
     family: &str,
     final_reloc: &NoRelocFinalState,
+    shrink_rebuilt_pdata: bool,
 ) -> anyhow::Result<ExceptionEvidenceSidecar> {
     let schema_version = super::evidence_schema::member_schema_for_family(
         family,
@@ -408,11 +444,12 @@ pub(crate) fn build_exception_evidence(
         .map_err(|e| anyhow!("final exception decode: {e}"))?;
     let final_report = decoder.decode();
     let final_candidate = final_to_evidence(&final_report);
-    let preservation = preservation_to_evidence(&mida_pe::compare_runtime_final(
-        &report.exception_report,
-        &final_report,
-    ));
-    let nrs = no_reloc_state(&report.relocation_report, final_reloc);
+    let preservation = preservation_to_evidence(&if shrink_rebuilt_pdata {
+        mida_pe::compare_runtime_final_shrink(&report.exception_report, &final_report)
+    } else {
+        mida_pe::compare_runtime_final(&report.exception_report, &final_report)
+    });
+    let nrs = no_reloc_state(&report.relocation_report, final_reloc, shrink_rebuilt_pdata);
 
     let mut blockers = Vec::new();
     if report.exception_evidence_present != actual_present {
@@ -741,7 +778,7 @@ mod tests {
             runtime_image_base: reloc.runtime_image_base,
             preferred_image_base: reloc.preferred_image_base,
         };
-        let nrs = no_reloc_state(&reloc, &final_reloc);
+        let nrs = no_reloc_state(&reloc, &final_reloc, false);
         assert_eq!(
             nrs.state_text,
             "no-reloc state observed and preserved (directory absent)"
@@ -786,7 +823,7 @@ mod tests {
             runtime_image_base: reloc.runtime_image_base,
             preferred_image_base: reloc.preferred_image_base,
         };
-        let nrs = no_reloc_state(&reloc, &final_reloc);
+        let nrs = no_reloc_state(&reloc, &final_reloc, false);
         assert!(
             nrs.blockers
                 .iter()
@@ -847,8 +884,92 @@ mod tests {
             runtime_image_base: reloc.runtime_image_base,
             preferred_image_base: reloc.preferred_image_base,
         };
-        let nrs = no_reloc_state(&reloc, &final_reloc);
+        let nrs = no_reloc_state(&reloc, &final_reloc, false);
         assert!(!nrs.blockers.is_empty());
         assert!(nrs.blockers.iter().any(|b| b.contains("dynamic base")));
+    }
+
+    // XX-8-A problem 2: shrink rebuilds .reloc and deliberately clears
+    // DYNAMIC_BASE + fixes the image base back to the preferred base. The
+    // shrink-aware no_reloc_state must NOT flag these as mismatches, but must
+    // still enforce the expected fixed-base semantics (final DYNAMIC_BASE
+    // cleared + final preferred base preserved).
+    #[test]
+    fn shrink_rebuilt_reloc_uses_expected_state_not_identity() {
+        let reloc = mida_pe::relocation_observation::RelocationObservationReport {
+            directory_present: true,
+            pe32_plus: true,
+            pointer_size: 8,
+            runtime_image_base: 0x7ff7f3d10000,
+            preferred_image_base: 0x140000000,
+            size_of_image: 0x200000,
+            directory_rva: 0xd27000,
+            directory_size: 0x10,
+            directory_bytes_read: 0x10,
+            dynamic_base: true, // Themida runtime sets DYNAMIC_BASE for its own ASLR
+            relocs_stripped: false,
+            block_count: 1,
+            entry_count: 0,
+            non_absolute_entry_count: 0,
+            observed_types: Vec::new(),
+            targets: Vec::new(),
+            blockers: Vec::new(),
+        };
+        // Final candidate: dump fixed base to 0x140000000 and cleared DYNAMIC_BASE.
+        let final_reloc = NoRelocFinalState {
+            image_base_changed: true, // ASLR load base -> preferred base
+            directory_absent: false,
+            directory_present_but_empty: false,
+            relocs_stripped: false,
+            dynamic_base: false, // cleared by shrink fixed-base dump
+            runtime_image_base: reloc.runtime_image_base,
+            preferred_image_base: 0x140000000,
+        };
+        let nrs = no_reloc_state(&reloc, &final_reloc, true);
+        assert!(
+            nrs.blockers.is_empty(),
+            "shrink rebuilt .reloc must not produce identity false positives: {:?}",
+            nrs.blockers
+        );
+    }
+
+    // XX-8-A problem 2 (negative): shrink mode still fails when the final
+    // candidate leaves DYNAMIC_BASE set (fixed-base semantics violated).
+    #[test]
+    fn shrink_rebuilt_reloc_rejects_dynamic_base_still_set() {
+        let reloc = mida_pe::relocation_observation::RelocationObservationReport {
+            directory_present: true,
+            pe32_plus: true,
+            pointer_size: 8,
+            runtime_image_base: 0x7ff7f3d10000,
+            preferred_image_base: 0x140000000,
+            size_of_image: 0x200000,
+            directory_rva: 0xd27000,
+            directory_size: 0x10,
+            directory_bytes_read: 0x10,
+            dynamic_base: true,
+            relocs_stripped: false,
+            block_count: 1,
+            entry_count: 0,
+            non_absolute_entry_count: 0,
+            observed_types: Vec::new(),
+            targets: Vec::new(),
+            blockers: Vec::new(),
+        };
+        let final_reloc = NoRelocFinalState {
+            image_base_changed: true,
+            directory_absent: false,
+            directory_present_but_empty: false,
+            relocs_stripped: false,
+            dynamic_base: true, // NOT cleared — fabrication of ASLR capability
+            runtime_image_base: reloc.runtime_image_base,
+            preferred_image_base: 0x140000000,
+        };
+        let nrs = no_reloc_state(&reloc, &final_reloc, true);
+        assert!(
+            nrs.blockers
+                .iter()
+                .any(|b| b.contains("final DYNAMIC_BASE still set"))
+        );
     }
 }

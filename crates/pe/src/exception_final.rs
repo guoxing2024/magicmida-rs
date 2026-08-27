@@ -485,36 +485,105 @@ pub struct ExceptionPreservationComparison {
 
 /// Compare the runtime observation against the final decode. The comparison
 /// is conservative: any field mismatch is a blocker (fail-closed).
+///
+/// # Shrink-aware comparison
+///
+/// When `shrink_rebuilt_pdata` is true, the dump removed Themida sections and
+/// rebuilt `.pdata` into a new location (see `create_pdata_section`). In that
+/// mode the exception directory's **location fields** (RVA/size) and the
+/// **entry count** are expected to change — the table is relocated and entries
+/// referencing deleted sections are filtered out. The comparison therefore
+/// switches from field-identity to **content equivalence**:
+/// - every final RUNTIME_FUNCTION entry must be present in the runtime table
+///   with identical Begin/End/Unwind RVAs (no mutation, no fabrication);
+/// - the final table must be a subset of the runtime table (only entries
+///   referencing deleted sections may be absent);
+/// - UNWIND_INFO entries retained in the final table must match their runtime
+///   counterparts exactly.
+///
+/// Directory RVA/size identity is **not** required in shrink mode because
+/// relocating the table is the point of the rebuild. Identity remains the
+/// strict rule in the non-shrink (pure preservation) mode.
 #[must_use]
 pub fn compare_runtime_final(
     runtime: &ExceptionObservationReport,
     final_report: &ExceptionFinalReport,
 ) -> ExceptionPreservationComparison {
+    compare_runtime_final_inner(runtime, final_report, false)
+}
+
+/// Shrink-aware variant of [`compare_runtime_final`].
+///
+/// Callers that dump with `shrink=true` (which rebuilds `.pdata`) must use this
+/// entry point so the preservation gate compares content equivalence instead of
+/// directory-location identity. See [`compare_runtime_final`] for the contract.
+#[must_use]
+pub fn compare_runtime_final_shrink(
+    runtime: &ExceptionObservationReport,
+    final_report: &ExceptionFinalReport,
+) -> ExceptionPreservationComparison {
+    compare_runtime_final_inner(runtime, final_report, true)
+}
+
+fn compare_runtime_final_inner(
+    runtime: &ExceptionObservationReport,
+    final_report: &ExceptionFinalReport,
+    shrink_rebuilt_pdata: bool,
+) -> ExceptionPreservationComparison {
+    // Shrink mode: the .pdata table was relocated and filtered. Directory
+    // presence must still match (both present). Directory RVA/size and entry
+    // count are NOT compared for identity (they legitimately change); instead
+    // the final table must be a content-preserving subset of the runtime table.
+    let directory_present_preserved = runtime.directory_present == final_report.directory_present;
+    let directory_rva_preserved = runtime.directory_rva == final_report.directory_rva;
+    let directory_size_preserved = runtime.directory_size == final_report.directory_size;
+    let function_count_preserved = runtime.function_count == final_report.function_count;
+
+    // Content equivalence: every final entry must exist in the runtime table
+    // with identical RVAs. In shrink mode this is a subset relation (filtered
+    // entries are allowed to be absent); in non-shrink mode it must be exact
+    // (same length + same entries).
+    let functions_preserved = if shrink_rebuilt_pdata {
+        final_report.functions.iter().all(|f| runtime.functions.contains(f))
+    } else {
+        runtime.functions == final_report.functions
+    };
+    let unwind_infos_preserved = if shrink_rebuilt_pdata {
+        final_report.unwind_infos.iter().all(|u| runtime.unwind_infos.contains(u))
+    } else {
+        runtime.unwind_infos == final_report.unwind_infos
+    };
+
     let mut c = ExceptionPreservationComparison {
         all_preserved: true,
-        directory_present_preserved: runtime.directory_present == final_report.directory_present,
-        directory_rva_preserved: runtime.directory_rva == final_report.directory_rva,
-        directory_size_preserved: runtime.directory_size == final_report.directory_size,
-        function_count_preserved: runtime.function_count == final_report.function_count,
-        functions_preserved: runtime.functions == final_report.functions,
-        unwind_infos_preserved: runtime.unwind_infos == final_report.unwind_infos,
+        directory_present_preserved,
+        directory_rva_preserved,
+        directory_size_preserved,
+        function_count_preserved,
+        functions_preserved,
+        unwind_infos_preserved,
         blockers: Vec::new(),
     };
     if !c.directory_present_preserved {
         c.blockers
             .push("exception directory presence mismatch".to_string());
     }
-    if !c.directory_rva_preserved {
-        c.blockers
-            .push("exception directory RVA mismatch".to_string());
-    }
-    if !c.directory_size_preserved {
-        c.blockers
-            .push("exception directory size mismatch".to_string());
-    }
-    if !c.function_count_preserved {
-        c.blockers
-            .push("RUNTIME_FUNCTION count mismatch".to_string());
+    // In shrink mode the directory location/count legitimately change; do not
+    // emit identity blockers for them (they would be false positives). The
+    // content-subset check above is the authoritative preservation gate.
+    if !shrink_rebuilt_pdata {
+        if !c.directory_rva_preserved {
+            c.blockers
+                .push("exception directory RVA mismatch".to_string());
+        }
+        if !c.directory_size_preserved {
+            c.blockers
+                .push("exception directory size mismatch".to_string());
+        }
+        if !c.function_count_preserved {
+            c.blockers
+                .push("RUNTIME_FUNCTION count mismatch".to_string());
+        }
     }
     if !c.functions_preserved {
         c.blockers
@@ -848,5 +917,182 @@ mod tests {
         assert_eq!(r.functions[0].end_rva, 0x1100);
         assert_eq!(r.functions[0].unwind_info_rva, 0x3000);
         assert_eq!(r.functions[0].status, RuntimeFunctionStatus::Valid);
+    }
+
+    // XX-8-A problem 2: shrink rebuilds .pdata into a new location and filters
+    // entries referencing deleted sections. The shrink-aware comparison must
+    // accept a relocated directory (RVA/size/count differ) while still
+    // enforcing content equivalence (final entries are a subset of runtime).
+    #[test]
+    fn shrink_comparison_accepts_relocated_subset() {
+        use crate::exception_observation::{
+            observe_exception_runtime, RuntimeFunctionStatus as Rfs,
+        };
+
+        // Runtime observation has 3 entries: two that survive, one that will
+        // reference a deleted section (dropped during rebuild).
+        let runtime = ExceptionObservationReport {
+            directory_present: true,
+            directory_rva: 0x8175a0,
+            directory_size: 36,
+            pe32_plus: true,
+            runtime_image_base: 0x7ff7f3d10000,
+            preferred_image_base: 0x140000000,
+            size_of_image: 0x200000,
+            directory_bytes_read: 36,
+            function_count: 3,
+            functions: vec![
+                RuntimeFunctionObservation {
+                    index: 0,
+                    begin_rva: 0x1000,
+                    end_rva: 0x1100,
+                    unwind_info_rva: 0x3000,
+                    status: Rfs::Valid,
+                },
+                RuntimeFunctionObservation {
+                    index: 1,
+                    begin_rva: 0x1100,
+                    end_rva: 0x1200,
+                    unwind_info_rva: 0x3010,
+                    status: Rfs::Valid,
+                },
+                RuntimeFunctionObservation {
+                    index: 2,
+                    begin_rva: 0x7ff70000, // in a deleted Themida section
+                    end_rva: 0x7ff71000,
+                    unwind_info_rva: 0x7ff72000,
+                    status: Rfs::Valid,
+                },
+            ],
+            unwind_infos: vec![],
+            sorted_by_begin: true,
+            no_overlap: true,
+            handlers_in_executable: true,
+            blockers: vec![],
+        };
+
+        // Final decode after rebuild: relocated to 0x168000, only 2 entries
+        // (the deleted-section entry was filtered), identical RVAs for the
+        // surviving entries.
+        let final_report = ExceptionFinalReport {
+            directory_present: true,
+            directory_rva: 0x168000,
+            directory_size: 24,
+            pe32_plus: true,
+            image_base: 0x140000000,
+            size_of_image: 0x200000,
+            directory_raw_offset: Some(0x168000),
+            directory_raw_backed: true,
+            function_count: 2,
+            functions: vec![
+                RuntimeFunctionObservation {
+                    index: 0,
+                    begin_rva: 0x1000,
+                    end_rva: 0x1100,
+                    unwind_info_rva: 0x3000,
+                    status: Rfs::Valid,
+                },
+                RuntimeFunctionObservation {
+                    index: 1,
+                    begin_rva: 0x1100,
+                    end_rva: 0x1200,
+                    unwind_info_rva: 0x3010,
+                    status: Rfs::Valid,
+                },
+            ],
+            unwind_infos: vec![],
+            sorted_by_begin: true,
+            no_overlap: true,
+            handlers_in_executable: true,
+            blockers: vec![],
+        };
+
+        // Non-shrink identity comparison must FAIL (RVA/size/count changed).
+        let strict = compare_runtime_final(&runtime, &final_report);
+        assert!(!strict.all_preserved, "strict comparison must flag relocation");
+
+        // Shrink-aware comparison must PASS (content subset preserved).
+        let shrink = compare_runtime_final_shrink(&runtime, &final_report);
+        assert!(
+            shrink.all_preserved,
+            "shrink comparison must accept relocated subset: {:?}",
+            shrink.blockers
+        );
+        assert!(shrink.functions_preserved);
+        assert!(shrink.unwind_infos_preserved);
+    }
+
+    // XX-8-A problem 2 (negative): shrink-aware comparison still fails when the
+    // final table fabricates an entry absent from the runtime table.
+    #[test]
+    fn shrink_comparison_rejects_fabricated_entry() {
+        use crate::exception_observation::RuntimeFunctionStatus as Rfs;
+
+        let runtime = ExceptionObservationReport {
+            directory_present: true,
+            directory_rva: 0x8175a0,
+            directory_size: 12,
+            pe32_plus: true,
+            runtime_image_base: 0x7ff7f3d10000,
+            preferred_image_base: 0x140000000,
+            size_of_image: 0x200000,
+            directory_bytes_read: 12,
+            function_count: 1,
+            functions: vec![RuntimeFunctionObservation {
+                index: 0,
+                begin_rva: 0x1000,
+                end_rva: 0x1100,
+                unwind_info_rva: 0x3000,
+                status: Rfs::Valid,
+            }],
+            unwind_infos: vec![],
+            sorted_by_begin: true,
+            no_overlap: true,
+            handlers_in_executable: true,
+            blockers: vec![],
+        };
+
+        let final_report = ExceptionFinalReport {
+            directory_present: true,
+            directory_rva: 0x168000,
+            directory_size: 24,
+            pe32_plus: true,
+            image_base: 0x140000000,
+            size_of_image: 0x200000,
+            directory_raw_offset: Some(0x168000),
+            directory_raw_backed: true,
+            function_count: 2,
+            functions: vec![
+                RuntimeFunctionObservation {
+                    index: 0,
+                    begin_rva: 0x1000,
+                    end_rva: 0x1100,
+                    unwind_info_rva: 0x3000,
+                    status: Rfs::Valid,
+                },
+                RuntimeFunctionObservation {
+                    index: 1,
+                    begin_rva: 0x9999,
+                    end_rva: 0xaaaa,
+                    unwind_info_rva: 0x3000,
+                    status: Rfs::Valid,
+                },
+            ],
+            unwind_infos: vec![],
+            sorted_by_begin: true,
+            no_overlap: true,
+            handlers_in_executable: true,
+            blockers: vec![],
+        };
+
+        let shrink = compare_runtime_final_shrink(&runtime, &final_report);
+        assert!(!shrink.all_preserved);
+        assert!(!shrink.functions_preserved);
+        assert!(
+            shrink
+                .blockers
+                .iter()
+                .any(|b| b.contains("RUNTIME_FUNCTION table mismatch"))
+        );
     }
 }

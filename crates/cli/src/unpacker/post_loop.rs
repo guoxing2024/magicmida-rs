@@ -470,6 +470,7 @@ pub(super) fn run_post_loop_phases(
         &dump_report,
         family_id,
         &final_reloc_state,
+        shrink,
     )
     .context("write candidate-bound exception evidence sidecar")?;
     log::log(
