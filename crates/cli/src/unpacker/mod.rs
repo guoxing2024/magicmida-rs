@@ -670,6 +670,9 @@ pub fn unpack(
         iat_materialize_site: None,
         iat_materialize_fallback: false,
         iat_materialize_start: None,
+        iat_materialize_last_av_exc: None,
+        iat_materialize_last_av_target: None,
+        iat_materialize_av_streak: 0,
         text_reguarded: false,
         oep: None,
         oep_provenance: OepProvenance::default(),
@@ -1012,14 +1015,19 @@ pub fn unpack(
                                         .thread_handle(main_tid)
                                         .map_err(|e| anyhow!("thread_handle for OEP fallback: {e}"))?;
                                     let _ = unsafe { SuspendThread(h_thread) };
-                                    if let Err(e) = dbg.clear_all_soft_breakpoints() {
-                                        warn!("clear site breakpoint failed (non-fatal): {e}");
+                                    // XX-5: clear the DR2 site anchor, arm DR3 OEP.
+                                    if let Err(e) = dbg.clear_hw_breakpoint(2) {
+                                        warn!("clear site HW breakpoint failed (non-fatal): {e}");
                                     }
-                                    match dbg.set_soft_breakpoint(oep_va) {
+                                    match dbg.set_hw_breakpoint(3, oep_va, mida_core::HwbpType::Execute) {
                                         Ok(()) => {
                                             ls.iat_materialize_site = Some(oep_va);
                                             ls.iat_materialize_fallback = true;
                                             ls.iat_materialize_start = Some(std::time::Instant::now());
+                                            // Reset the AV-storm streak: a fresh anchor.
+                                            ls.iat_materialize_av_streak = 0;
+                                            ls.iat_materialize_last_av_exc = None;
+                                            ls.iat_materialize_last_av_target = None;
                                             let _ = unsafe { ResumeThread(h_thread) };
                                         }
                                         Err(e) => {
@@ -1045,9 +1053,9 @@ pub fn unpack(
                                     if let Ok(h) = dbg.thread_handle(main_tid) {
                                         let _ = unsafe { SuspendThread(h) };
                                     }
-                                    if let Err(e) = dbg.clear_all_soft_breakpoints() {
-                                        warn!("clear breakpoints failed (non-fatal): {e}");
-                                    }
+                                    // XX-5: clear any armed HW anchors (DR2/DR3).
+                                    let _ = dbg.clear_hw_breakpoint(2);
+                                    let _ = dbg.clear_hw_breakpoint(3);
                                     ls.iat_materialize_wait = false;
                                     break;
                                 }
@@ -1283,7 +1291,15 @@ pub fn unpack(
                                                  continuing to materialize lazy IAT"
                                             ),
                                         );
-                                        dbg.set_soft_breakpoint(site_va)?;
+                                        // XX-5: hardware execute breakpoint (DR2) — a
+                                        // 0xCC software breakpoint is detected by
+                                        // WinLicense's VM integrity check and traps
+                                        // the process in an AV storm (XX-4).
+                                        dbg.set_hw_breakpoint(
+                                            2,
+                                            site_va,
+                                            mida_core::HwbpType::Execute,
+                                        )?;
                                         ls.iat_materialize_site = Some(site_va);
                                         ls.iat_materialize_wait = true;
                                         ls.iat_materialize_fallback = false;
@@ -1301,7 +1317,13 @@ pub fn unpack(
                                                  {oep_va:#x} as fallback"
                                             ),
                                         );
-                                        dbg.set_soft_breakpoint(oep_va)?;
+                                        // XX-5: hardware execute breakpoint (DR3) for the
+                                        // OEP fallback anchor.
+                                        dbg.set_hw_breakpoint(
+                                            3,
+                                            oep_va,
+                                            mida_core::HwbpType::Execute,
+                                        )?;
                                         ls.iat_materialize_site = Some(oep_va);
                                         ls.iat_materialize_wait = true;
                                         ls.iat_materialize_fallback = true;
@@ -1952,35 +1974,6 @@ pub fn unpack(
             DebugEvent::Breakpoint { thread_id, address } => {
                 debug!(addr = %format!("{address:#x}"), "Breakpoint hit");
 
-                // XX-4 (B'): IAT-materialization anchor hit. At this point the
-                // `call [mem]` / OEP is about to execute, so the lazy IAT is
-                // materialized. Freeze the thread, disarm the breakpoint, and
-                // leave the loop for the normal post-loop IAT discovery/dump.
-                if ls.iat_materialize_wait {
-                    if ls.iat_materialize_site == Some(address as usize) {
-                        log::log(
-                            LogType::Good,
-                            &format!(
-                                "IAT materialize: anchor {address:#x} hit — IAT \
-                                 materialized, freezing for dump"
-                            ),
-                        );
-                        let main_tid = dbg.main_thread_id();
-                        if let Ok(h) = dbg.thread_handle(main_tid) {
-                            let _ = unsafe { SuspendThread(h) };
-                        }
-                        if let Err(e) = dbg.clear_all_soft_breakpoints() {
-                            warn!("clear breakpoints failed (non-fatal): {e}");
-                        }
-                        ls.iat_materialize_wait = false;
-                        ls.iat_materialize_site = None;
-                        break;
-                    }
-                    // Not our anchor: continue (e.g. an unrelated int3).
-                    dbg.continue_event(thread_id, ContinueStatus::Continue)?;
-                    continue;
-                }
-
                 // .NET target special: if this is the _CorExeMain HW BP
                 // (slot 3), dump raw memory and exit the debug loop.
                 if is_dotnet {
@@ -2146,6 +2139,59 @@ pub fn unpack(
                 target_address,
                 exc_type,
             } => {
+                // XX-5 (B'): storm guard during the IAT-materialization wait.
+                // WinLicense traps in an identical-AV loop when it detects the
+                // anchor breakpoint. Count identical `(exc, target)` pairs and
+                // escape once they exceed the threshold — otherwise the wait
+                // loop spins forever (XX-4 logged 2.5M identical AVs).
+                if ls.iat_materialize_wait {
+                    let same_pair = ls.iat_materialize_last_av_exc == Some(exception_addr)
+                        && ls.iat_materialize_last_av_target == Some(target_address);
+                    if same_pair {
+                        ls.iat_materialize_av_streak =
+                            ls.iat_materialize_av_streak.saturating_add(1);
+                    } else {
+                        ls.iat_materialize_av_streak = 1;
+                        ls.iat_materialize_last_av_exc = Some(exception_addr);
+                        ls.iat_materialize_last_av_target = Some(target_address);
+                    }
+
+                    // XX-5: throttled logging — first + every N-th occurrence.
+                    if iat_materialize::should_log_materialize_av(
+                        ls.iat_materialize_av_streak,
+                    ) {
+                        log::log(
+                            LogType::Info,
+                            &format!(
+                                "IAT materialize AV (streak {}): exc={exception_addr:#x}, \
+                                 target={target_address:#x}, thread={thread_id}",
+                                ls.iat_materialize_av_streak
+                            ),
+                        );
+                    }
+
+                    if iat_materialize::av_storm_triggered(ls.iat_materialize_av_streak) {
+                        log::log(
+                            LogType::Warn,
+                            &format!(
+                                "IAT materialize: AV storm ({} identical AVs) — \
+                                 execution not advancing; aborting wait \
+                                 (MaterializeWaitAvStorm)",
+                                ls.iat_materialize_av_streak
+                            ),
+                        );
+                        // Freeze, disarm anchors, leave for fail-closed dump.
+                        let main_tid = dbg.main_thread_id();
+                        if let Ok(h) = dbg.thread_handle(main_tid) {
+                            let _ = unsafe { SuspendThread(h) };
+                        }
+                        let _ = dbg.clear_hw_breakpoint(2);
+                        let _ = dbg.clear_hw_breakpoint(3);
+                        ls.iat_materialize_wait = false;
+                        break;
+                    }
+                }
+
                 // If we re-guarded .text and get an AV in .text range, this is OEP
                 if ls.text_reguarded && ls.oep.is_none() {
                     let text_sec = &state.pe_info.pe_sections[0];
@@ -2201,6 +2247,34 @@ pub fn unpack(
             // Also handles IAT tracing for v3 targets.
             // ---------------------------------------------------------------
             DebugEvent::SingleStep { thread_id, address } => {
+                // XX-5 (B'): hardware-breakpoint anchor hit during the IAT
+                // materialization wait. A #DB at the armed DR2/DR3 address means
+                // the `call [mem]` / OEP is about to execute, so the lazy IAT is
+                // materialized. Freeze, disarm, and leave for the normal
+                // post-loop IAT discovery/dump.
+                if ls.iat_materialize_wait
+                    && ls.iat_materialize_site == Some(address as usize)
+                {
+                    log::log(
+                        LogType::Good,
+                        &format!(
+                            "IAT materialize: anchor {address:#x} hit — IAT \
+                             materialized, freezing for dump"
+                        ),
+                    );
+                    let main_tid = dbg.main_thread_id();
+                    if let Ok(h) = dbg.thread_handle(main_tid) {
+                        let _ = unsafe { SuspendThread(h) };
+                    }
+                    // XX-5: disarm the HW anchors (DR2/DR3).
+                    let _ = dbg.clear_hw_breakpoint(2);
+                    let _ = dbg.clear_hw_breakpoint(3);
+                    ls.iat_materialize_wait = false;
+                    ls.iat_materialize_site = None;
+                    break;
+                }
+                // Not our anchor: fall through to the normal single-step path.
+
                 // Check if we're in IAT tracing mode.
                 let is_tracing = ls.iat_trace.as_ref().is_some_and(|t| {
                     t.trace_phase == TracePhase::Tracing && t.trace_thread_id == thread_id

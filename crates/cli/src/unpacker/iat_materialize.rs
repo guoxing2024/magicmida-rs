@@ -28,6 +28,27 @@ pub(super) enum MaterializeStep {
 /// Per-anchor budget for the materialization wait (seconds).
 pub(super) const IAT_MATERIALIZE_TIMEOUT_SECS: u64 = 30;
 
+/// XX-5: consecutive identical `(exc, target)` AVs during the materialization
+/// wait beyond this count mean execution is not advancing (WinLicense trapped
+/// in a loop after detecting the breakpoint). Triggers the storm escape.
+pub(super) const IAT_MATERIALIZE_AV_STORM_THRESHOLD: u32 = 64;
+
+/// XX-5: log one line per this many repeated identical AVs (throttle).
+pub(super) const IAT_MATERIALIZE_AV_LOG_INTERVAL: u32 = 100_000;
+
+/// XX-5: decide whether a same-address AV streak triggers the storm escape.
+///
+/// Pure so the threshold is unit-tested without a live debuggee.
+pub(super) fn av_storm_triggered(streak: u32) -> bool {
+    streak >= IAT_MATERIALIZE_AV_STORM_THRESHOLD
+}
+
+/// XX-5: decide whether to log this AV (first one, then throttled to the
+/// interval). `streak` is 1-based (first occurrence of a new pair = 1).
+pub(super) fn should_log_materialize_av(streak: u32) -> bool {
+    streak <= 1 || streak.is_multiple_of(IAT_MATERIALIZE_AV_LOG_INTERVAL)
+}
+
 /// Decide the initial anchor after `.text` is stable and RIP is not in `.text`.
 ///
 /// * `site` — the first out-of-image indirect call/jmp site (from
@@ -150,5 +171,27 @@ mod tests {
             timeout_materialize_step(true, Some(2), 30, 30),
             MaterializeStep::FreezeAndDump
         );
+    }
+
+    #[test]
+    fn av_storm_triggers_at_threshold_not_before() {
+        assert!(!av_storm_triggered(63));
+        assert!(av_storm_triggered(64));
+        assert!(av_storm_triggered(65));
+        assert!(!av_storm_triggered(0));
+    }
+
+    #[test]
+    fn av_log_throttle_first_then_interval() {
+        // First occurrence always logs.
+        assert!(should_log_materialize_av(1));
+        // Below the throttle interval: suppressed.
+        assert!(!should_log_materialize_av(2));
+        assert!(!should_log_materialize_av(99_999));
+        // At the interval and its multiples: logged.
+        assert!(should_log_materialize_av(100_000));
+        assert!(should_log_materialize_av(200_000));
+        // Just after an interval multiple: suppressed again.
+        assert!(!should_log_materialize_av(100_001));
     }
 }

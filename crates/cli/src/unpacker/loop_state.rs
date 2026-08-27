@@ -34,6 +34,15 @@ pub(super) struct LoopState {
     pub(super) iat_materialize_fallback: bool,
     /// XX-4 (B'): when the current materialize wait started (30s budget).
     pub(super) iat_materialize_start: Option<std::time::Instant>,
+    /// XX-5: the exception address of the last unrelated AV seen during the
+    /// materialization wait (for identical-AV streak detection).
+    pub(super) iat_materialize_last_av_exc: Option<u64>,
+    /// XX-5: the target address of the last unrelated AV seen during the
+    /// materialization wait (pair key with `iat_materialize_last_av_exc`).
+    pub(super) iat_materialize_last_av_target: Option<u64>,
+    /// XX-5: consecutive count of the identical `(exc, target)` AV pair seen
+    /// during the materialization wait. Reset when the pair changes.
+    pub(super) iat_materialize_av_streak: u32,
     /// .text poll: re-guard done, waiting for AV at OEP
     pub(super) text_reguarded: bool,
     pub(super) oep: Option<usize>,
