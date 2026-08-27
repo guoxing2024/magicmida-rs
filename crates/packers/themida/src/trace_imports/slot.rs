@@ -60,10 +60,34 @@ pub(crate) fn trace_one_slot(
         .set_thread_context(thread_id, &ctx)
         .map_err(|e| ThemidaError::Debugger(format!("trace_one_slot set_thread_context: {e}")))?;
 
-    // Resume from the event that brought us here.
-    debugger
-        .continue_event(thread_id, ContinueStatus::Continue)
-        .map_err(|e| ThemidaError::Debugger(format!("trace_one_slot continue: {e}")))?;
+    // Resume from the event that brought us here — OR bootstrap from a
+    // no-pending-event state (XX-8-A).
+    //
+    // Two entry states exist:
+    // - event entry: the caller (debug loop) still holds a pending debug event;
+    //   `continue_event` resumes it so the RIP+TF context write takes effect.
+    // - frozen entry: the caller left the loop via a timeout freeze (e.g. the
+    //   IAT-materialization wait's `FreezeAndDump` after 30s) with NO pending
+    //   event; the trace thread is already free-running and the RIP+TF context
+    //   write above is sufficient.  There is nothing to continue, so we must
+    //   NOT call `continue_event` (the engine rejects it as "no pending event")
+    //   and instead enter the wait loop directly to receive the first
+    //   single-step event.
+    //
+    // Fail-fast is reserved for genuinely abnormal sequences (debugger errors,
+    // unexpected exceptions on the traced thread), never for a legal frozen
+    // entry that simply lacks a pending event.
+    let had_pending_event = debugger.pending_event_thread_id().is_some();
+    if had_pending_event {
+        debugger
+            .continue_event(thread_id, ContinueStatus::Continue)
+            .map_err(|e| ThemidaError::Debugger(format!("trace_one_slot continue: {e}")))?;
+    } else {
+        log(
+            LogMsgType::Info,
+            "trace_one_slot: no pending event — bootstrapping via first wait (frozen entry)",
+        );
+    }
 
     // ---- Event loop --------------------------------------------------------
     loop {
@@ -262,5 +286,176 @@ pub(crate) fn trace_one_slot(
                     ThemidaError::Debugger(format!("trace_one_slot continue other thread: {e}"))
                 })?;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::init::ThemidaPeInfo;
+    use crate::version::ThemidaVersion;
+    use mida_core::CoreError;
+    use std::cell::RefCell;
+    use windows::Win32::{Foundation::HANDLE, System::Diagnostics::Debug::CONTEXT};
+
+    /// Scripted debugger that drives `trace_one_slot` with a controllable
+    /// pending-event identity and a fixed event stream.
+    struct ScriptedDebugger {
+        pending_tid: Option<u32>,
+        events: Vec<DebugEvent>,
+        context: RefCell<CONTEXT>,
+        continue_calls: u32,
+    }
+
+    impl ScriptedDebugger {
+        fn new(pending_tid: Option<u32>) -> Self {
+            let mut ctx: CONTEXT = unsafe { std::mem::zeroed() };
+            #[cfg(target_arch = "x86_64")]
+            {
+                ctx.Rip = 0x7ff8_0000_1000;
+                ctx.Rsp = 0x2000;
+            }
+            #[cfg(target_arch = "x86")]
+            {
+                ctx.Eip = 0x0000_1000;
+                ctx.Esp = 0x2000;
+            }
+            Self {
+                pending_tid,
+                events: Vec::new(),
+                context: RefCell::new(ctx),
+                continue_calls: 0,
+            }
+        }
+
+        fn with_event(mut self, ev: DebugEvent) -> Self {
+            self.events.push(ev);
+            self
+        }
+    }
+
+    impl DebuggerCore for ScriptedDebugger {
+        fn process_handle(&self) -> HANDLE {
+            HANDLE::default()
+        }
+        fn pid(&self) -> u32 {
+            1
+        }
+        fn image_base(&self) -> u64 {
+            0x7ff7_0000_0000
+        }
+        fn pending_event_thread_id(&self) -> Option<u32> {
+            self.pending_tid
+        }
+        fn wait_event(&mut self) -> Result<DebugEvent, CoreError> {
+            if self.events.is_empty() {
+                return Err(CoreError::Timeout);
+            }
+            Ok(self.events.remove(0))
+        }
+        fn continue_event(
+            &mut self,
+            _thread_id: u32,
+            _status: ContinueStatus,
+        ) -> Result<(), CoreError> {
+            self.continue_calls += 1;
+            Ok(())
+        }
+        fn read_memory(&self, _address: usize, _buf: &mut [u8]) -> Result<usize, CoreError> {
+            Ok(0)
+        }
+        fn write_memory(&mut self, _address: usize, _data: &[u8]) -> Result<usize, CoreError> {
+            Ok(0)
+        }
+        fn get_thread_context(&self, _thread_id: u32) -> Result<CONTEXT, CoreError> {
+            Ok(*self.context.borrow())
+        }
+        fn set_thread_context(
+            &self,
+            _thread_id: u32,
+            ctx: &CONTEXT,
+        ) -> Result<(), CoreError> {
+            // Persist the RIP+TF write so the subsequent single-step context
+            // read observes the redirected instruction pointer (matching the
+            // real backend's SetThreadContext semantics).
+            *self.context.borrow_mut() = *ctx;
+            Ok(())
+        }
+    }
+
+    fn pe_info() -> ThemidaPeInfo {
+        ThemidaPeInfo {
+            image_base: 0x7ff7_0000_0000,
+            image_boundary: 0x7ff7_0000_6000,
+            base_of_data: 0x2000,
+            pe_sections: Vec::new(),
+            major_linker_version: 14,
+            themida_version: ThemidaVersion::V3,
+            is_vm_oep: false,
+            themida_section: None,
+            tls_total: 0,
+        }
+    }
+
+    const THREAD: u32 = 42;
+    const REAL_API: usize = 0x7ff8_0000_1234;
+
+    #[test]
+    fn frozen_entry_bootstraps_without_continue() {
+        // XX-8-A problem 1: when the caller left the loop via a timeout freeze,
+        // there is NO pending debug event. The trace must NOT call
+        // continue_event (which the engine rejects), and must instead wait
+        // directly for the first single-step event.
+        let mut dbg = ScriptedDebugger::new(None).with_event(DebugEvent::SingleStep {
+            thread_id: THREAD,
+            address: REAL_API as u64,
+        });
+        let mut state = ThemidaState::new(pe_info(), false);
+        let noop = |_: LogMsgType, _: &str| {};
+
+        let result = trace_one_slot(
+            &mut dbg,
+            &mut state,
+            REAL_API as u64,
+            THREAD,
+            0x7ff7_0000_3000,
+            0x7ff7_0000_5000,
+            0x7ff7_0000_0000,
+            0x7ff7_0000_6000,
+            &noop,
+        );
+
+        assert!(result.is_ok(), "frozen entry must bootstrap: {result:?}");
+        assert_eq!(dbg.continue_calls, 0, "no continue_event on frozen entry");
+        assert_eq!(state.traced_api, REAL_API, "single-step must resolve the API");
+        assert!(!state.trace_in_vm);
+    }
+
+    #[test]
+    fn event_entry_continues_pending_event() {
+        // Event entry: the caller still holds a pending debug event for THREAD.
+        // trace_one_slot must continue it exactly once before waiting.
+        let mut dbg = ScriptedDebugger::new(Some(THREAD)).with_event(DebugEvent::SingleStep {
+            thread_id: THREAD,
+            address: REAL_API as u64,
+        });
+        let mut state = ThemidaState::new(pe_info(), false);
+        let noop = |_: LogMsgType, _: &str| {};
+
+        let result = trace_one_slot(
+            &mut dbg,
+            &mut state,
+            REAL_API as u64,
+            THREAD,
+            0x7ff7_0000_3000,
+            0x7ff7_0000_5000,
+            0x7ff7_0000_0000,
+            0x7ff7_0000_6000,
+            &noop,
+        );
+
+        assert!(result.is_ok(), "event entry must trace: {result:?}");
+        assert_eq!(dbg.continue_calls, 1, "exactly one continue on event entry");
+        assert_eq!(state.traced_api, REAL_API);
     }
 }
