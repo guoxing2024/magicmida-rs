@@ -4,11 +4,13 @@
 //! that makes the expected value unreachable-None/Err (len-matched slices,
 //! `if has_x` + `plan.x` co-check, `match`-bound states, caller-validated
 //! member names, re-serialization of an already-parsed Value, FFI
-//! kernel32/Sleep existence, or caller pre-checked Option). No production
-//! fallible path is masked; the one genuinely reachable panic (bundle_gate
-//! member lookup) was converted to error propagation. Test-block expects are
-//! ordinary assertions (WO-14).
-#![allow(clippy::expect_used)]
+//! kernel32/Sleep existence, or caller pre-checked Option). Production
+//! `.unwrap()`s are the same class of invariants (WO-10 carryover missed in
+//! that pass, surfaced by the WO-14 --tests audit): matching_ids[0] under a
+//! count==1 guard, end.unwrap() under an is_none else branch, raw_size/
+//! new_size unwraps under is_some guards. No production fallible path is
+//! masked. Test-block unwraps/expects are ordinary assertions (WO-14).
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //!
 //! P1 root cause: the production dump order transformed the heap child payloads
 //! (scrub/repair/sort/sanitize) *before* capturing the heap slab. The slab holds

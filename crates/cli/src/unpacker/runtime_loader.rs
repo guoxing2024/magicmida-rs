@@ -6,9 +6,11 @@
 //! member names, re-serialization of an already-parsed Value, FFI
 //! kernel32/Sleep existence, or caller pre-checked Option). No production
 //! fallible path is masked; the one genuinely reachable panic (bundle_gate
-//! member lookup) was converted to error propagation. Test-block expects are
-//! ordinary assertions (WO-14).
-#![allow(clippy::expect_used)]
+//! member lookup) was converted to error propagation. Production `.unwrap()`s
+//! are the same class of fixed-width-slice invariants (WO-10 carryover missed
+//! in that pass; WO-12): `self.bytes[a..b].try_into()` on ABI-frozen constant
+//! offsets. Test-block unwraps/expects are ordinary assertions (WO-14).
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //!
 //! Loads the MIDA anti-debug runtime DLL into a suspended target process
 //! and drives the full pre-resume lifecycle:

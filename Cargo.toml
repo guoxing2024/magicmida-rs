@@ -53,7 +53,15 @@ windows = { version = "0.58", features = [
 # `[lints] workspace = true`. Deliberately clippy-only: CI builds with
 # RUSTFLAGS=-D warnings, so rustc-level lint changes could break `-D warnings`
 # builds before the codebase is clean; clippy lints only fire under
-# `cargo clippy`, which is not yet a CI gate.
+# `cargo clippy`.
+#
+# WO-14 (test-policy convergence): assertion-style .unwrap()/.expect() in
+# test code is idiomatic and is NOT lint debt. cargo 1.97 does not support
+# `allow-in-tests` under [workspace.lints.clippy] (unused manifest key), and
+# `cfg_attr(test, allow)` does not apply to test targets under clippy
+# --all-targets (verified). The CI clippy gate therefore checks production
+# only (`--lib --bins`), where unwrap_used/expect_used are fully retired
+# (WO-10/WO-12); test targets stay warn-level here and are never -D in CI.
 [workspace.lints.clippy]
 unwrap_used = "warn"
 expect_used = "warn"

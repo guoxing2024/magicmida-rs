@@ -1,5 +1,10 @@
 //! Per-sample profile model, validation, and promotion (ADR-2/ADR-3).
 //!
+//! Production `.expect()`s are invariants (WO-12): `serde_json::to_string`
+//! on a plain-data profile struct cannot fail. Test-block expects are
+//! ordinary assertions (WO-14).
+#![allow(clippy::expect_used)]
+//!
 //! Profiles are pure data with deterministic validation. A profile binds:
 //!
 //! - `sample_id` / `profile_id` / `architecture` / `profile_digest`;

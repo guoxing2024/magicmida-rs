@@ -1,5 +1,9 @@
 //! Test-support verifier stub (P6.3-QA).
 //!
+//! Test-support binary: `.unwrap()`s on serde_json serialization of plain
+//! report/evidence structs are infallible (WO-12/WO-14).
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+//!
 //! A deterministic stand-in for the `mida-acceptance` binary used ONLY by
 //! the launch-attestation pass-path tests (positive control, bundle digest
 //! chain, output-path and input-identity checks that must not depend on the
