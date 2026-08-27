@@ -77,14 +77,20 @@ jobs:
   # clippy batch is paid down (see archive/operations/reports/
   # CODE_REVIEW_AND_CLEANUP_PLAN_20260826.md for the batch plan):
   #
-  #   phase 0 (this job, green now):  -D clippy::dbg_macro
-  #     (already deny-level in [workspace.lints.clippy]; 0 violations)
-  #   phase 1 (after clippy batch 1): + -D clippy::unwrap_used
-  #     (unwrap_used must drop to <=5 residual, each with allow + reason)
-  #   phase 2 (after clippy batch 2): + -D clippy::expect_used
-  #   phase 3 (after clippy batch 3): + -D clippy::manual_let_else
+  #   phase 0:  -D clippy::dbg_macro  (deny-level in workspace lints; 0)
+  #   phase 1:  + -D clippy::unwrap_used  [ACTIVE since 2026-08-27, WO-10/12]
+  #   phase 2:  + -D clippy::expect_used  [ACTIVE since 2026-08-27, WO-12]
+  #   phase 3 (next): + -D clippy::manual_let_else  (WO-15 batch)
   #   later phases: any lint promoted to deny in [workspace.lints.clippy]
   #     is mirrored here once the batch for it is fully paid down.
+  #
+  # Test-policy note (WO-14): assertion-style .unwrap()/.expect() in test
+  # code is idiomatic, not debt. cargo 1.97 has no `allow-in-tests` under
+  # [workspace.lints.clippy] and cfg_attr(test, allow) does not apply to
+  # test targets under clippy --all-targets (both verified). This gate
+  # therefore checks PRODUCTION ONLY via `--lib --bins`; test targets are
+  # never -D on these lints. Keep `--lib --bins` (not --all-targets) for
+  # the unwrap/expect phases.
   #
   # Keep the phase list in sync with the workspace lint policy: a lint that
   # is deny-level in Cargo.toml but NOT in this `-D` list still fails the
@@ -104,10 +110,12 @@ jobs:
         with:
           components: clippy
 
-      # Phase 0 gate: only dbg_macro is hard-failing for now. warn-level
-      # lints are reported (not denied) until their batch is paid down.
-      - name: Clippy (workspace, all targets) — phase 0
-        run: cargo clippy --workspace --all-targets -- -D clippy::dbg_macro
+      # Phases 0-2 gate: dbg_macro everywhere; unwrap_used/expect_used on
+      # production targets only (test targets stay warn-level per WO-14).
+      - name: Clippy (workspace, all targets) — phases 0-2
+        run: |
+          cargo clippy --workspace --all-targets -- -D clippy::dbg_macro
+          cargo clippy --workspace --lib --bins -- -D clippy::unwrap_used -D clippy::expect_used
 
   cargo-deny:
     runs-on: ubuntu-latest
