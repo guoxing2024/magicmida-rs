@@ -70,7 +70,8 @@ pub use self::dump_process::{
 };
 pub use self::helpers::is_dotnet;
 pub use self::iat_partial_accept::{
-    evaluate_partial_accept, IatPartialAcceptDecision, IatRejectedSlot, IatStaleSlot,
+    address_owned_by_loaded_module, evaluate_partial_accept, static_corroboration_candidate,
+    IatPartialAcceptDecision, IatRejectedSlot, IatStaleSlot, IatStaticCorroboration,
     PARTIAL_ACCEPT_MAX_REJECTED, PARTIAL_ACCEPT_MIN_RESOLVED_FRACTION_DENOMINATOR,
     PARTIAL_ACCEPT_MIN_RESOLVED_FRACTION_NUMERATOR,
 };

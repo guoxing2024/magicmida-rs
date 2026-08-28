@@ -14,7 +14,7 @@ use crate::error::ThemidaError;
 use super::decision::{trace_is_at_api, TraceStepDecision};
 use super::{
     instr_ptr, is_at_themida_vm, set_instr_ptr, set_stack_ptr, set_trap_flag, stack_ptr,
-    thread_id_of, PTR_SIZE, TRACE_LIMIT,
+    thread_id_of, PTR_SIZE,
 };
 
 /// Run the single-step trace for one IAT slot.
@@ -27,11 +27,20 @@ use super::{
 /// On exit, `state.traced_api` holds the resolved address (if the trace was
 /// successful) or `state.trace_in_vm` is set to `true` (if we hit the VM).
 ///
+/// # `trace_limit`
+///
+/// The instruction budget for this pass. The caller may retry a failed slot
+/// with a deepened budget (XX-10-A direction 1): a VM deobfuscation that
+/// yields a partial/non-owned address on the first pass can complete on a
+/// longer pass, so the limit is a parameter rather than a hard-coded
+/// `TRACE_LIMIT`.
+///
 /// # Returns
 ///
 /// - `Ok(())` — trace completed (check `state.traced_api` and
 ///   `state.trace_in_vm` for the result).
 /// - `Err(...)` — an OS-level debugger error occurred.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn trace_one_slot(
     debugger: &mut dyn DebuggerCore,
     state: &mut ThemidaState,
@@ -41,10 +50,11 @@ pub(crate) fn trace_one_slot(
     themida_section_end: usize,
     image_base: usize,
     image_boundary: usize,
+    trace_limit: u64,
     log: &(dyn Fn(LogMsgType, &str) + '_),
 ) -> Result<(), ThemidaError> {
     let mut counter: u64 = 0;
-    let limit: u64 = TRACE_LIMIT;
+    let limit: u64 = trace_limit;
 
     // ---- Set up the initial context ----------------------------------------
     let mut ctx = debugger
@@ -294,6 +304,7 @@ mod tests {
     use super::*;
     use crate::init::ThemidaPeInfo;
     use crate::version::ThemidaVersion;
+    use crate::trace_imports::TRACE_LIMIT;
     use mida_core::CoreError;
     use std::cell::RefCell;
     use windows::Win32::{Foundation::HANDLE, System::Diagnostics::Debug::CONTEXT};
@@ -422,6 +433,7 @@ mod tests {
             0x7ff7_0000_5000,
             0x7ff7_0000_0000,
             0x7ff7_0000_6000,
+            TRACE_LIMIT,
             &noop,
         );
 
@@ -451,6 +463,7 @@ mod tests {
             0x7ff7_0000_5000,
             0x7ff7_0000_0000,
             0x7ff7_0000_6000,
+            TRACE_LIMIT,
             &noop,
         );
 

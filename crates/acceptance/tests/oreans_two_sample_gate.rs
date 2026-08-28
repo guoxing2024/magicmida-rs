@@ -261,6 +261,7 @@ fn iat_evidence(
                     module_name: Some("KERNEL32.DLL".to_string()),
                     function_name: Some("ExitProcess".to_string()),
                     ordinal: None,
+                    resolution_source: Some("live".to_string()),
                 },
                 OreansIatSlotEvidence {
                     slot_index: 1,
@@ -274,6 +275,7 @@ fn iat_evidence(
                     module_name: None,
                     function_name: None,
                     ordinal: None,
+                    resolution_source: None,
                 },
             ],
         }),

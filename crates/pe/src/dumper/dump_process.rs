@@ -9,6 +9,7 @@ use tracing::{debug, info, warn};
 
 use crate::error::{CaptureEpochTelemetry, PeError};
 use crate::header::PeHeader;
+use crate::import_table::ImportTableBuilder;
 use crate::original_imports::{read_original_import_table, resolve_imports_via_getprocaddress};
 
 use sha2::Digest as _;
@@ -354,6 +355,203 @@ use super::output_writer::write_output_file;
 use super::sections::{create_pdata_section, create_reloc_section};
 use super::types::{DumpOptions, DumpProcessReport, EarlySectionSnapshot};
 
+/// Apply static back-fills to `ModuleNotFound` rejected slots
+/// (XX-10-A direction 2).
+///
+/// # Policy
+///
+/// Static back-fill is the *last* resort for a slot whose live trace yielded
+/// a `vm_non_module_addr` (direction 1 already re-traced it with a deepened
+/// budget and the ownership validator refused it). It is only applied when
+/// ALL THREE evidence legs hold:
+///
+/// 1. The slot maps to a UNIQUE named candidate in the original on-disk
+///    import table (`static_corroboration_candidate`).
+/// 2. `GetProcAddress(module, name)` resolves at dump time and the address
+///    falls inside a loaded module range (direction-1 ownership validator).
+/// 3. The human-verified call-site semantic note is present (the producer
+///    records it verbatim; see `XX-9 实弹` slot 0 = GetModuleHandleA handle
+///    check at `call [rip+disp]; test eax,eax; jne`).
+///
+/// Only the `ModuleNotFound` (vm_non_module_addr) class is eligible; `Stale`
+/// and `ShortRead` slots are never statically resolved. Each back-filled slot
+/// is recorded in `decision.static_corroborations` with `resolution_source =
+/// StaticCorroborated`, and its report slot is promoted to `Resolved`.
+///
+/// # Never mixed
+///
+/// The back-filled slot is added to the existing live `import_builder` (the
+/// two-pass vote table), NOT merged with the original stub table. The address
+/// is a real `GetProcAddress` export, same grade as a live resolution.
+#[allow(clippy::too_many_arguments)]
+fn apply_static_corroboration(
+    decision: &mut super::iat_partial_accept::IatPartialAcceptDecision,
+    report: &mut crate::iat_completeness::IatRecoveryReport,
+    import_builder: &mut Option<ImportTableBuilder>,
+    executable_path: Option<&Path>,
+    original_iat_rva: u32,
+    text: &[u8],
+    text_rva: u32,
+    debugger: &dyn mida_core::DebuggerCore,
+) {
+    use super::iat_partial_accept::IatStaticCorroboration;
+    use crate::iat_completeness::{IatResolutionSource, IatSlotStatus, IatUnresolvedReason};
+
+    let Some(ep) = executable_path else {
+        return;
+    };
+    let original_imports = crate::original_imports::read_original_import_table(ep);
+    if original_imports.is_empty() {
+        return;
+    }
+
+    // Resolve every original import via GetProcAddress once (reused for all
+    // eligible slots). This loads system DLLs into the *debugger* process; the
+    // addresses are valid in the target for well-known DLLs (shared ASLR base).
+    let resolved = crate::original_imports::resolve_imports_via_getprocaddress(&original_imports);
+
+    // Snapshot loaded modules for the direction-1 ownership validation.
+    let modules = match super::remote_modules::take_module_snapshot(
+        debugger.process_handle(),
+        debugger.pid(),
+        debugger.image_base(),
+        true,
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            warn!(error = %e, "static corroboration: module snapshot failed; skipping");
+            return;
+        }
+    };
+
+    let mut applied: Vec<IatStaticCorroboration> = Vec::new();
+    // Snapshot the rejected slots to iterate while mutating the decision below.
+    let rejected: Vec<super::iat_partial_accept::IatRejectedSlot> =
+        decision.rejected_slots.clone();
+    let mut backfilled_indices: std::collections::HashSet<usize> =
+        std::collections::HashSet::new();
+
+    for rejected_slot in &rejected {
+        // Only the vm_non_module_addr class is eligible.
+        if rejected_slot.unresolved_reason != Some(IatUnresolvedReason::ModuleNotFound) {
+            continue;
+        }
+        let Some((module, function)) = super::iat_partial_accept::static_corroboration_candidate(
+            rejected_slot.slot_index,
+            rejected_slot.unresolved_reason,
+            &original_imports,
+        ) else {
+            continue;
+        };
+        // Ordinal-only candidates cannot be corroborated by call-site
+        // semantics (the function spelling is required for evidence leg 3).
+        if function.starts_with('#') {
+            continue;
+        }
+        // Evidence leg 2: GetProcAddress must resolve.
+        let Some(address) = resolved.get(&(module.clone(), function.clone())) else {
+            continue;
+        };
+        // Evidence leg 2 (ownership): the resolved address must land inside a
+        // loaded module range, exactly like direction 1's validator.
+        let module_ranges: Vec<(usize, usize)> = modules
+            .iter()
+            .map(|m| (m.base as usize, m.end_off as usize))
+            .collect();
+        let ownership_verified =
+            super::iat_partial_accept::address_owned_by_loaded_module(*address, &module_ranges);
+        if !ownership_verified {
+            continue;
+        }
+
+        // All three legs hold; apply the back-fill. Evidence leg 3 is the
+        // real call-site verification (裁决 #13: index correspondence alone is
+        // never enough). Compute the slot's RVA from the original IAT base and
+        // verify a code call site targets it with the candidate API's
+        // handle-check pattern. Refuse the back-fill when the pattern is not
+        // proven.
+        let Some(slot_rva) = rejected_slot.slot_rva else {
+            continue;
+        };
+        let Some(call_site_semantics) =
+            super::iat_partial_accept::verify_call_site_semantics(text, text_rva, slot_rva)
+        else {
+            warn!(
+                slot = rejected_slot.slot_index,
+                slot_rva = format_args!("{slot_rva:#x}"),
+                "static corroboration: no verified call site for slot — refusing back-fill"
+            );
+            continue;
+        };
+        applied.push(IatStaticCorroboration::new(
+            rejected_slot.slot_index,
+            rejected_slot.slot_rva,
+            rejected_slot.unresolved_reason,
+            module.clone(),
+            function.clone(),
+            *address as u64,
+            true,
+            call_site_semantics,
+        ));
+        backfilled_indices.insert(rejected_slot.slot_index);
+
+        // Promote the report slot to Resolved with StaticCorroborated source.
+        if let Some(slot) = report.slots.iter_mut().find(|s| s.slot_index == rejected_slot.slot_index)
+        {
+            slot.status = IatSlotStatus::Resolved;
+            slot.rebuilt_value = Some(*address as u64);
+            slot.observed_value = Some(*address as u64);
+            slot.slot_value = Some(*address as u64);
+            slot.module_name = Some(module.clone());
+            slot.function_name = Some(function.clone());
+            slot.ordinal = None;
+            slot.unresolved_reason = None;
+            slot.resolution_source = Some(IatResolutionSource::StaticCorroborated);
+        }
+
+        // Add the thunk to the live import builder.
+        if let Some(builder) = import_builder.as_mut() {
+            let iat_address = original_iat_rva
+                .saturating_add((rejected_slot.slot_index * std::mem::size_of::<usize>()) as u32);
+            let module_entry = builder
+                .modules
+                .iter_mut()
+                .find(|m| m.name.to_lowercase() == module.to_lowercase());
+            let thunk = crate::import_table::ImportThunk {
+                iat_address,
+                function_name: Some(function.clone()),
+                ordinal: None,
+                is_64bit: true,
+            };
+            match module_entry {
+                Some(m) => m.thunks.push(thunk),
+                None => {
+                    let m = builder.add_module(&module);
+                    m.thunks.push(thunk);
+                }
+            }
+        }
+    }
+
+    // Move the back-filled slots out of rejected and into accepted.
+    if !backfilled_indices.is_empty() {
+        decision
+            .rejected_slots
+            .retain(|s| !backfilled_indices.contains(&s.slot_index));
+        for idx in &backfilled_indices {
+            if !decision.accepted_resolved_slots.contains(idx) {
+                decision.accepted_resolved_slots.push(*idx);
+            }
+        }
+        decision.accepted_resolved_slots.sort_unstable();
+        decision.static_corroborations = applied;
+        info!(
+            count = backfilled_indices.len(),
+            "Static corroboration: back-filled ModuleNotFound slots from original imports"
+        );
+    }
+}
+
 /// Dump a PE image from the target process into a file.
 ///
 /// This is the Rust equivalent of `TDumper.DumpToFile` in `Dumper.pas`.
@@ -646,7 +844,7 @@ pub fn dump_process_with_report(
     let is_64bit = pe.is_64bit;
 
     // 2. Rebuild import table if requested
-    let (iat_image, _iat_image_size, mut import_builder, iat_report) = if opts.fix_imports {
+    let (iat_image, _iat_image_size, mut import_builder, mut iat_report) = if opts.fix_imports {
         let (iat_image, iat_size, import_builder, report) = rebuild_import_table_complete(
             debugger,
             &mut pe,
@@ -751,6 +949,46 @@ pub fn dump_process_with_report(
                     stale = decision.stale_slots.len(),
                     "Graded IAT acceptance: keeping live table (rejected slots left as honest holes)"
                 );
+            }
+        }
+
+        // XX-10-A direction 2: static back-fill for `ModuleNotFound` rejected
+        // slots (the v3-trace `vm_non_module_addr` class). Only runs on the
+        // graded-live path (never on the original-stub fallback), and only for
+        // slots with a unique original-import candidate + a verified
+        // GetProcAddress + call-site semantics. See the helper for the full
+        // three-evidence policy.
+        if iat_partial_accepted {
+            // Read the live .text section (post-decrypt) for call-site
+            // verification (evidence leg 3). Best-effort: a short read only
+            // limits the scan window; the verification itself is optional per
+            // slot (a slot without a verified call site is refused).
+            let text_section = &pe.sections.first();
+            let (live_text, text_rva) = match text_section {
+                Some(section) => {
+                    let va = opts.image_base as usize
+                        + section.virtual_address as usize;
+                    let size = section.virtual_size as usize;
+                    let mut buf = vec![0u8; size.min(0x100_000)];
+                    let read = debugger.read_memory(va, &mut buf).unwrap_or(0);
+                    buf.truncate(read);
+                    (buf, section.virtual_address)
+                }
+                None => (Vec::new(), 0),
+            };
+            if let Some(decision) = iat_partial_accept.as_mut() {
+                if let Some(report) = iat_report.as_mut() {
+                    apply_static_corroboration(
+                        decision,
+                        report,
+                        &mut import_builder,
+                        opts.executable_path.as_deref(),
+                        original_iat_rva,
+                        &live_text,
+                        text_rva,
+                        debugger,
+                    );
+                }
             }
         }
     }

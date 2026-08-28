@@ -27,6 +27,34 @@ pub enum IatSlotStatus {
     ZeroTerminator,
 }
 
+/// Provenance of a resolved IAT slot's address.
+///
+/// XX-10-A direction 2: a slot resolved by live trace/export matching is
+/// `Live`; a slot whose address was back-filled from the original PE's import
+/// table (with the three-evidence corroboration chain) is
+/// `StaticCorroborated`. The distinction is recorded on the IAT evidence
+/// sidecar so the acceptance side can see exactly which slots were second-
+/// sourced rather than observed live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IatResolutionSource {
+    /// Address observed from the live IAT / trace (the normal path).
+    Live,
+    /// Address back-filled from the original PE import table via
+    /// `GetProcAddress`, after the three-evidence corroboration chain.
+    StaticCorroborated,
+}
+
+impl IatResolutionSource {
+    /// Stable lowercase machine identifier for reports.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::StaticCorroborated => "static_corroborated",
+        }
+    }
+}
+
 /// Deterministic reason a non-resolved IAT slot failed to resolve.
 ///
 /// This is an auditable root-cause classification, not a pass signal.  Every
@@ -143,6 +171,11 @@ pub struct IatSlotReport {
     pub function_name: Option<String>,
     /// Export ordinal selected for an ordinal-only resolved slot.
     pub ordinal: Option<u16>,
+    /// Provenance of a resolved slot's address. `None` for non-resolved slots
+    /// (or for callers that predate the field); `Some(Live)` for live-observed
+    /// resolutions, `Some(StaticCorroborated)` for back-filled resolutions
+    /// (XX-10-A direction 2).
+    pub resolution_source: Option<IatResolutionSource>,
 }
 
 /// Complete IAT recovery report.
@@ -431,6 +464,7 @@ mod tests {
             module_name: resolved.then(|| "kernel32.dll".into()),
             function_name: resolved.then(|| "CreateFileW".into()),
             ordinal: None,
+            resolution_source: resolved.then_some(IatResolutionSource::Live),
         }
     }
 

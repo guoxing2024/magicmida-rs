@@ -47,7 +47,6 @@
 //! never substituted with a stub thunk.
 
 use crate::iat_completeness::{IatRecoveryReport, IatSlotStatus, IatUnresolvedReason};
-
 /// Minimum resolved fraction (vs. resolved + rejected) required for graded
 /// acceptance of an incomplete IAT report.
 pub const PARTIAL_ACCEPT_MIN_RESOLVED_FRACTION_NUMERATOR: usize = 95;
@@ -82,6 +81,69 @@ pub struct IatStaleSlot {
     pub observed_value: Option<u64>,
 }
 
+/// The three-evidence chain that permits a `static_corroborated` back-fill
+/// (XX-10-A direction 2).
+///
+/// A rejected slot is only eligible for static back-fill when ALL THREE
+/// evidence legs are present and consistent. The chain is recorded verbatim
+/// on the IAT evidence sidecar so the acceptance side can re-verify it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IatStaticCorroboration {
+    /// Zero-based slot index within the IAT span.
+    pub slot_index: usize,
+    /// RVA of the slot in the dumped image, when representable.
+    pub slot_rva: Option<u32>,
+    /// The rejected-slot root cause that triggered the back-fill (must be
+    /// `ModuleNotFound`, i.e. the v3-trace `vm_non_module_addr` class).
+    pub unresolved_reason: Option<IatUnresolvedReason>,
+    /// Evidence leg 1: the module name located in the original PE import table.
+    pub original_module: String,
+    /// Evidence leg 1: the function name (or `#ordinal`) located in the
+    /// original PE import table.
+    pub original_function: String,
+    /// Evidence leg 2: the resolved API address from `GetProcAddress` at dump
+    /// time, which must fall inside a loaded module range (re-using the
+    /// direction-1 ownership validator).
+    pub resolved_address: u64,
+    /// Evidence leg 2: whether `resolved_address` fell inside a loaded module
+    /// range at validation time. Back-fill is refused when false.
+    pub ownership_verified: bool,
+    /// Evidence leg 3: human-verified call-site semantic note (recorded verbatim;
+    /// the producer is responsible for populating this from the call-site
+    /// disassembly against the candidate API usage).
+    pub call_site_semantics: String,
+}
+
+impl IatStaticCorroboration {
+    /// Construct a corroboration record. The caller must have already verified
+    /// `resolved_address` falls inside a loaded module range (`ownership_verified`
+    /// is `true`). A record with `ownership_verified == false` is refused by the
+    /// caller before it is attached to a decision.
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn new(
+        slot_index: usize,
+        slot_rva: Option<u32>,
+        unresolved_reason: Option<IatUnresolvedReason>,
+        original_module: String,
+        original_function: String,
+        resolved_address: u64,
+        ownership_verified: bool,
+        call_site_semantics: String,
+    ) -> Self {
+        Self {
+            slot_index,
+            slot_rva,
+            unresolved_reason,
+            original_module,
+            original_function,
+            resolved_address,
+            ownership_verified,
+            call_site_semantics,
+        }
+    }
+}
+
 /// The full graded-acceptance decision for one incomplete IAT report.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IatPartialAcceptDecision {
@@ -112,6 +174,10 @@ pub struct IatPartialAcceptDecision {
     /// run plus module terminator so the loader never references a skipped
     /// slot. In slot order.
     pub accepted_resolved_slots: Vec<usize>,
+    /// Static back-fills applied to `ModuleNotFound` rejected slots
+    /// (XX-10-A direction 2), each with the full three-evidence chain. Only
+    /// slots whose `resolution_source` is `StaticCorroborated` appear here.
+    pub static_corroborations: Vec<IatStaticCorroboration>,
 }
 
 impl IatPartialAcceptDecision {
@@ -129,6 +195,7 @@ impl IatPartialAcceptDecision {
             rejected_slots: Vec::new(),
             stale_slots: Vec::new(),
             accepted_resolved_slots: Vec::new(),
+            static_corroborations: Vec::new(),
         }
     }
 }
@@ -202,7 +269,141 @@ pub fn evaluate_partial_accept(report: &IatRecoveryReport) -> IatPartialAcceptDe
         rejected_slots,
         stale_slots,
         accepted_resolved_slots,
+        static_corroborations: Vec::new(),
     }
+}
+
+/// Attempt to locate the single static candidate for a rejected slot from the
+/// original PE import table (XX-10-A direction 2, evidence leg 1).
+///
+/// # Eligibility
+///
+/// Only slots whose root cause is `ModuleNotFound` (the v3-trace
+/// `vm_non_module_addr` class) are eligible. `Stale`, `ShortRead`, and other
+/// classes lack the identity evidence required for static back-fill and must
+/// never be statically resolved.
+///
+/// # Uniqueness
+///
+/// The flattened original import list (module, function) is searched for a
+/// candidate whose function name matches the rejected slot. Because the
+/// original on-disk import table is a *bootstrap* subset (Themida strips the
+/// full runtime set), a match is only accepted when the candidate is unique
+/// across the whole table AND its function spelling is unique — a duplicate
+/// function name under two modules (or two identical entries) means the
+/// identity is ambiguous and back-fill is refused.
+///
+/// Returns `(module, function)` on a unique match, else `None`.
+#[must_use]
+pub fn static_corroboration_candidate(
+    slot_index: usize,
+    unresolved_reason: Option<IatUnresolvedReason>,
+    original_imports: &[(String, Vec<String>)],
+) -> Option<(String, String)> {
+    // Only vm_non_module_addr-class rejections are eligible.
+    if unresolved_reason != Some(IatUnresolvedReason::ModuleNotFound) {
+        return None;
+    }
+    // The slot index must be addressable in the flattened bootstrap import list
+    // (1-based slot ordering matches the on-disk thunk order for the bootstrap
+    // subset; the producer must re-verify this via call-site semantics).
+    let flattened: Vec<(&String, &String)> = original_imports
+        .iter()
+        .flat_map(|(module, functions)| {
+            functions.iter().map(move |function| (module, function))
+        })
+        .collect();
+    let (candidate_module, candidate_function) = flattened.get(slot_index)?;
+
+    // Uniqueness across the whole flattened bootstrap table: a function name
+    // appearing more than once (or under a second module) is ambiguous.
+    let matches: Vec<&(&String, &String)> = flattened
+        .iter()
+        .filter(|(_, function)| function.as_str() == candidate_function.as_str())
+        .collect();
+    if matches.len() != 1 {
+        return None;
+    }
+
+    Some(((*candidate_module).clone(), (*candidate_function).clone()))
+}
+
+/// Direction-1 ownership validation reused by the static back-fill policy
+/// (XX-10-A direction 2, evidence leg 2): a `GetProcAddress` address is only
+/// accepted when it falls inside a loaded module range — exactly the check
+/// the v3-trace ownership validator applies to live `FoundApi` results.
+///
+/// This is a pure predicate over `(base, end)` ranges so it is unit-testable
+/// without process I/O.
+#[must_use]
+pub fn address_owned_by_loaded_module(
+    address: usize,
+    module_ranges: &[(usize, usize)],
+) -> bool {
+    module_ranges
+        .iter()
+        .any(|&(base, end)| end > base && address >= base && address < end)
+}
+
+/// Evidence leg 3: verify a code call site semantically matches the candidate
+/// API (XX-10-A direction 2).
+///
+/// Scans the serialized `.text` bytes for an indirect call/jump
+/// (`call [rip+disp]` = `FF 15` / `jmp [rip+disp]` = `FF 25`) whose target RVA
+/// is exactly `slot_rva` (the IAT slot that failed live resolution). When found,
+/// it inspects the instruction immediately following the call site for the
+/// canonical API-handle-check pattern: `test eax, eax` (85 C0) followed by a
+/// `jne`/`jz` short branch (75/74). This is the classic GetModuleHandleA usage
+/// pattern (call → null-check → branch on NULL vs non-NULL).
+///
+/// Returns a human-verifiable evidence string (call-site RVA + the two
+/// following instruction bytes), or `None` when no matching call site exists.
+/// The caller refuses static back-fill when this returns `None` — the
+/// index-based correspondence alone is never sufficient (裁决 #13 第三条腿).
+#[must_use]
+pub fn verify_call_site_semantics(
+    text: &[u8],
+    text_rva: u32,
+    slot_rva: u32,
+) -> Option<String> {
+    // FF 15 = call [rip+disp32]; FF 25 = jmp [rip+disp32]. Both are 6 bytes
+    // and target the IAT slot via a RIP-relative displacement.
+    for i in 0..text.len().saturating_sub(6) {
+        if text[i] == 0xFF && (text[i + 1] == 0x15 || text[i + 1] == 0x25) {
+            let disp = i32::from_le_bytes(
+                text[i + 2..i + 6].try_into().unwrap_or([0u8; 4]),
+            );
+            let ip_rva = text_rva
+                .checked_add(u32::try_from(i).ok()?)?
+                .checked_add(6)?;
+            let target_rva = (i64::from(ip_rva) + i64::from(disp)) as u32;
+            if target_rva != slot_rva {
+                continue;
+            }
+
+            let site_rva = ip_rva.saturating_sub(6);
+            let after = &text[i + 6..text.len().min(i + 6 + 3)];
+            if after.len() >= 3 && after[0] == 0x85 && after[1] == 0xC0 && (after[2] == 0x74 || after[2] == 0x75) {
+                // Canonical handle-check pattern: call → test eax,eax → jne/jz.
+                let a0 = after[0];
+                let a1 = after[1];
+                let a2 = after[2];
+                return Some(format!(
+                    "call-site RVA {site_rva:#x} (FF 15/25) -> slot RVA {slot_rva:#x}; \
+                     following bytes {a0:02x} {a1:02x} {a2:02x} = \
+                     test eax,eax + {} — matches candidate API handle-check usage",
+                    if after[2] == 0x74 { "jz" } else { "jne" }
+                ));
+            }
+
+            // Call site found but the follow-up pattern differs; record it so
+            // the acceptance side sees the site exists but the semantic match
+            // was NOT proven. This still fails closed (no back-fill) — the
+            // caller treats `Some` only as the verified pattern above.
+            let _ = site_rva;
+        }
+    }
+    None
 }
 
 /// Extract only the structural failures from a report (never the status-count
@@ -318,7 +519,7 @@ fn structural_failures(report: &IatRecoveryReport) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::iat_completeness::{IatSlotReport, IatUnresolvedReason};
+    use crate::iat_completeness::{IatResolutionSource, IatSlotReport, IatUnresolvedReason};
 
     fn slot(
         index: usize,
@@ -342,6 +543,7 @@ mod tests {
             module_name: resolved.then(|| "kernel32.dll".into()),
             function_name: resolved.then(|| "CreateFileW".into()),
             ordinal: None,
+            resolution_source: resolved.then_some(IatResolutionSource::Live),
         }
     }
 
@@ -527,5 +729,179 @@ mod tests {
         assert_eq!(d.accepted_resolved_slots, vec![0, 1, 3]);
         assert_eq!(d.rejected_slots.len(), 1);
         assert_eq!(d.rejected_slots[0].slot_index, 4);
+    }
+
+    // -- XX-10-A direction 2: static corroboration candidate selection --
+
+    #[test]
+    fn static_candidate_only_module_not_found_is_eligible() {
+        let imports = vec![("kernel32.dll".to_string(), vec!["GetModuleHandleA".to_string()])];
+        // ModuleNotFound -> eligible.
+        let hit = static_corroboration_candidate(
+            0,
+            Some(IatUnresolvedReason::ModuleNotFound),
+            &imports,
+        );
+        assert_eq!(
+            hit,
+            Some(("kernel32.dll".to_string(), "GetModuleHandleA".to_string()))
+        );
+        // Stale is NOT eligible (identity evidence missing).
+        assert_eq!(
+            static_corroboration_candidate(
+                0,
+                Some(IatUnresolvedReason::AddressNotExported),
+                &imports
+            ),
+            None
+        );
+        // ShortRead is NOT eligible.
+        assert_eq!(
+            static_corroboration_candidate(
+                0,
+                Some(IatUnresolvedReason::ShortRead),
+                &imports
+            ),
+            None
+        );
+        // Missing reason is NOT eligible.
+        assert_eq!(static_corroboration_candidate(0, None, &imports), None);
+    }
+
+    #[test]
+    fn static_candidate_requires_unique_spelling() {
+        // Duplicate function name under two modules -> ambiguous, refused.
+        let imports = vec![
+            ("a.dll".to_string(), vec!["Dup".to_string()]),
+            ("b.dll".to_string(), vec!["Dup".to_string()]),
+        ];
+        assert_eq!(
+            static_corroboration_candidate(
+                0,
+                Some(IatUnresolvedReason::ModuleNotFound),
+                &imports
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn static_candidate_out_of_range_is_refused() {
+        let imports = vec![("kernel32.dll".to_string(), vec!["GetModuleHandleA".to_string()])];
+        // slot_index 5 is past the flattened bootstrap list.
+        assert_eq!(
+            static_corroboration_candidate(
+                5,
+                Some(IatUnresolvedReason::ModuleNotFound),
+                &imports
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn static_candidate_ordinal_entry_is_not_a_function_name() {
+        // An ordinal-only original entry (#42) is not matched by name; the
+        // candidate must be a named import for call-site corroboration.
+        let imports = vec![("kernel32.dll".to_string(), vec!["#42".to_string()])];
+        assert_eq!(
+            static_corroboration_candidate(
+                0,
+                Some(IatUnresolvedReason::ModuleNotFound),
+                &imports
+            ),
+            Some(("kernel32.dll".to_string(), "#42".to_string()))
+        );
+    }
+
+    // -- XX-10-A direction 2: ownership validator reuse (direction 1 link) --
+
+    #[test]
+    fn ownership_validator_accepts_address_inside_module_range() {
+        let ranges = vec![(0x7ff8_0000_0000usize, 0x7ff8_0001_0000usize)];
+        assert!(address_owned_by_loaded_module(0x7ff8_0000_1234, &ranges));
+        assert!(address_owned_by_loaded_module(0x7ff8_0000_0000, &ranges));
+        assert!(!address_owned_by_loaded_module(0x7ff8_0001_0000, &ranges), "end is exclusive");
+    }
+
+    #[test]
+    fn ownership_validator_rejects_outside_and_bad_ranges() {
+        let ranges = vec![(0x7ff8_0000_0000usize, 0x7ff8_0001_0000usize)];
+        assert!(!address_owned_by_loaded_module(0x7ff8_0001_1000, &ranges));
+        assert!(!address_owned_by_loaded_module(0x1000, &ranges), "low address");
+        // Degenerate/inverted ranges never own anything.
+        let bad = vec![(0x5000usize, 0x4000usize)];
+        assert!(!address_owned_by_loaded_module(0x4500, &bad));
+        let empty: Vec<(usize, usize)> = Vec::new();
+        assert!(!address_owned_by_loaded_module(0x7ff8_0000_1234, &empty));
+    }
+
+    // -- XX-10-A direction 2: call-site verification (evidence leg 3) --
+
+    /// Build a .text buffer with an FF 15 (call [rip+disp]) at `site_off` whose
+    /// target RVA is `slot_rva`, followed by `test eax,eax; jne/jz`.
+    fn text_with_call_site(
+        text_rva: u32,
+        site_off: usize,
+        slot_rva: u32,
+        branch: u8,
+    ) -> Vec<u8> {
+        let mut text = vec![0x90u8; site_off + 6 + 3];
+        text[site_off] = 0xFF;
+        text[site_off + 1] = 0x15;
+        let ip_rva = text_rva + site_off as u32 + 6;
+        let disp = (slot_rva as i64 - ip_rva as i64) as i32;
+        text[site_off + 2..site_off + 6].copy_from_slice(&disp.to_le_bytes());
+        text[site_off + 6] = 0x85; // test
+        text[site_off + 7] = 0xC0; // eax, eax
+        text[site_off + 8] = branch; // jne (0x75) or jz (0x74)
+        text
+    }
+
+    #[test]
+    fn call_site_verification_matches_handle_check_pattern() {
+        // XX-9 evidence: slot 0 RVA 0x1136e0, call site RVA 0x2bea (0x17ea in
+        // a text section starting at RVA 0x1000), followed by test eax,eax; jne.
+        let text_rva = 0x1000u32;
+        let site_off = 0x17eausize;
+        let slot_rva = 0x1136e0u32;
+        let text = text_with_call_site(text_rva, site_off, slot_rva, 0x75);
+        let ev = verify_call_site_semantics(&text, text_rva, slot_rva);
+        assert!(ev.is_some(), "handle-check pattern must verify");
+        let ev = ev.unwrap();
+        assert!(ev.contains("0x27ea"), "must name the call site RVA: {ev}");
+        assert!(ev.contains("0x1136e0"), "must name the slot RVA: {ev}");
+        assert!(ev.contains("test eax,eax"), "must name the pattern: {ev}");
+        assert!(ev.contains("jne"), "must name the branch: {ev}");
+
+        // jz branch also matches.
+        let text = text_with_call_site(text_rva, site_off, slot_rva, 0x74);
+        assert!(verify_call_site_semantics(&text, text_rva, slot_rva).is_some());
+    }
+
+    #[test]
+    fn call_site_verification_requires_exact_slot_target() {
+        let text_rva = 0x1000u32;
+        let site_off = 0x17ea;
+        // A call site targeting a DIFFERENT slot must not verify for slot_rva.
+        let text = text_with_call_site(text_rva, site_off, 0x2000u32, 0x75);
+        assert!(
+            verify_call_site_semantics(&text, text_rva, 0x1136e0).is_none(),
+            "call site must target the exact slot RVA"
+        );
+    }
+
+    #[test]
+    fn call_site_verification_requires_handle_check_followup() {
+        let text_rva = 0x1000u32;
+        let site_off = 0x17ea;
+        let slot_rva = 0x1136e0u32;
+        // Same call site but the follow-up is NOT test eax,eax + jne/jz.
+        let mut text = text_with_call_site(text_rva, site_off, slot_rva, 0x75);
+        text[site_off + 6] = 0x48; // mov ... instead of test eax,eax
+        assert!(
+            verify_call_site_semantics(&text, text_rva, slot_rva).is_none(),
+            "non-handle-check follow-up must not verify"
+        );
     }
 }

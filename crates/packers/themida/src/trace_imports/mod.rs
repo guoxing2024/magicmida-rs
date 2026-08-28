@@ -174,6 +174,13 @@ pub(crate) fn classify_iat_slot_for_trace(
 /// We use a much smaller limit to avoid hanging on difficult slots.
 pub const TRACE_LIMIT: u64 = 500_000;
 
+/// Deepened retry budget for a slot whose first-pass trace failed
+/// (XX-10-A direction 1). A VM deobfuscation can be timing-dependent: a slot
+/// that yields a partial/non-owned address on the first pass may complete on a
+/// longer pass. 4x the default keeps the retry bounded while giving the
+/// deobfuscation path room to finish.
+pub const TRACE_LIMIT_DEEPENED: u64 = 2_000_000;
+
 // ---------------------------------------------------------------------------
 // TraceImportResult
 // ---------------------------------------------------------------------------
@@ -355,10 +362,7 @@ pub fn trace_imports(
         // Context / session errors: let trace_one_slot return Err and fail-fast
         // (no pre-check break that could yield a false 0/0 success).
 
-        state.traced_api = 0;
-        state.trace_in_vm = false;
-
-        match slot::trace_one_slot(
+        match trace_slot(
             debugger,
             state,
             current as u64,
@@ -367,95 +371,31 @@ pub fn trace_imports(
             tm_end,
             image_base,
             image_boundary,
+            &mut did_set_exit_process,
+            i,
+            slot_va,
             log,
         ) {
-            Ok(()) => {
-                if state.trace_in_vm {
-                    if !did_set_exit_process {
-                        did_set_exit_process = true;
-                        let real_exit_process = resolve_exit_process();
-                        if real_exit_process != 0 {
-                            iat_data[i] = real_exit_process;
-                            resolved_count += 1;
-                            log(
-                                LogMsgType::Info,
-                                &format!("IAT[{i}] {slot_va:#x}: VM entry → ExitProcess ({real_exit_process:#x})"),
-                            );
-                        } else {
-                            // ExitProcess could not be resolved; leave the slot
-                            // untouched and treat it as a failed VM entry so
-                            // the run continues instead of corrupting the IAT.
-                            failed_count += 1;
-                            failed_slots.push(i);
-                            log(
-                                LogMsgType::Fatal,
-                                &format!("IAT[{i}] {slot_va:#x}: VM entry, but ExitProcess unresolved — leaving slot"),
-                            );
-                        }
-                    } else {
-                        failed_count += 1;
-                        failed_slots.push(i);
-                        log(
-                            LogMsgType::Fatal,
-                            &format!("IAT[{i}] {slot_va:#x}: trace entered VM — giving up"),
-                        );
-                    }
-                } else if state.traced_api != 0 {
-                    let api = state.traced_api;
-
-                    if api < 0x10000 || (api >= image_base && api < image_boundary) {
-                        // Count failure and continue — never silent break that
-                        // leaves remaining slots unaccounted (audit residual P1).
-                        failed_count += 1;
-                        failed_slots.push(i);
-                        log(
-                            LogMsgType::Fatal,
-                            &format!(
-                                "IAT[{i}] {slot_va:#x}: discarding result {api:#x} \
-                                 (in image range or too low) — slot failed"
-                            ),
-                        );
-                        continue;
-                    }
-
-                    // XX-9-A direction 1: ownership validation. A
-                    // VM-deobfuscated address must land inside a loaded module
-                    // range (ToolHelp enumeration, XX-3-A attribution aid).
-                    // Anything else (e.g. XX-8's `0x1b370fa3810`) is classified
-                    // as Unresolved(vm_non_module_addr) at the source instead of
-                    // being written into the IAT and later surfacing as an
-                    // ambiguous `module_not_found` in the dump report.
-                    let module_ranges = crate::iat::loaded_module_ranges(debugger.pid());
-                    let owned_by_module = module_ranges
-                        .iter()
-                        .any(|&(base, end)| end > base && api >= base && api < end);
-                    if !owned_by_module {
-                        failed_count += 1;
-                        failed_slots.push(i);
-                        log(
-                            LogMsgType::Fatal,
-                            &format!(
-                                "IAT[{i}] {slot_va:#x}: discarding result {api:#x} \
-                                 (not owned by any loaded module — vm_non_module_addr)"
-                            ),
-                        );
-                        continue;
-                    }
-
-                    iat_data[i] = api;
-                    resolved_count += 1;
-                    log(
-                        LogMsgType::Good,
-                        &format!("IAT[{i}] {slot_va:#x}: {current:#x} → {api:#x}"),
-                    );
-                } else {
-                    failed_count += 1;
-                    failed_slots.push(i);
-                    log(
-                        LogMsgType::Fatal,
-                        &format!("IAT[{i}] {slot_va:#x}: tracing completed but no API resolved"),
-                    );
-                }
+            Ok(TraceSlotOutcome::Resolved(api)) => {
+                iat_data[i] = api;
+                resolved_count += 1;
+                log(
+                    LogMsgType::Good,
+                    &format!("IAT[{i}] {slot_va:#x}: {current:#x} → {api:#x}"),
+                );
+            }
+            Ok(TraceSlotOutcome::ExitProcess(real_exit_process)) => {
+                iat_data[i] = real_exit_process;
+                resolved_count += 1;
+                log(
+                    LogMsgType::Info,
+                    &format!("IAT[{i}] {slot_va:#x}: VM entry → ExitProcess ({real_exit_process:#x})"),
+                );
+            }
+            Ok(TraceSlotOutcome::Failed(reason)) => {
+                failed_count += 1;
+                failed_slots.push(i);
+                log(LogMsgType::Fatal, &format!("IAT[{i}] {slot_va:#x}: {reason}"));
             }
             Err(e) => {
                 // Fail-fast on debugger/lifecycle errors — do not count and
@@ -562,6 +502,298 @@ pub fn trace_imports(
     );
 
     Ok(result)
+}
+
+/// Outcome of one slot's trace attempt (single or deepened retry).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TraceSlotOutcome {
+    /// A real, module-owned API address was resolved.
+    Resolved(usize),
+    /// The trace entered the Themida VM; the value is the resolved ExitProcess
+    /// replacement (only for the first VM hit of the pass).
+    ExitProcess(usize),
+    /// The slot could not be resolved; carries a deterministic reason.
+    Failed(&'static str),
+}
+
+/// Trace a single IAT slot, retrying with a deepened instruction budget when
+/// the first pass yields an un-owned address (XX-10-A direction 1).
+///
+/// The first pass runs with [`TRACE_LIMIT`]; if it fails with a non-owned or
+/// in-image/too-low result (a partial VM deobfuscation), a second pass runs
+/// with [`TRACE_LIMIT_DEEPENED`]. Any result from the second pass is final:
+/// either it resolves to a module-owned address or the slot is recorded as
+/// failed with the deterministic reason.
+///
+/// # ExitProcess special case
+///
+/// The first slot whose trace enters the Themida VM (across the whole pass) is
+/// treated as ExitProcess (mirroring the legacy behaviour). `did_set_exit_process`
+/// tracks that exactly once. A VM hit is never retried: it is a terminal
+/// classification, not a partial deobfuscation.
+#[allow(clippy::too_many_arguments)]
+fn trace_slot(
+    debugger: &mut dyn DebuggerCore,
+    state: &mut ThemidaState,
+    start_address: u64,
+    main_thread_id: u32,
+    tm_start: usize,
+    tm_end: usize,
+    image_base: usize,
+    image_boundary: usize,
+    did_set_exit_process: &mut bool,
+    slot_index: usize,
+    slot_va: usize,
+    log: &(dyn Fn(LogMsgType, &str) + '_),
+) -> Result<TraceSlotOutcome, ThemidaError> {
+    // Pass 1: default budget.
+    let first = run_slot_trace(
+        debugger,
+        state,
+        start_address,
+        main_thread_id,
+        tm_start,
+        tm_end,
+        image_base,
+        image_boundary,
+        TRACE_LIMIT,
+        log,
+    )?;
+    match first {
+        SlotTraceRaw::ExitProcess => {
+            if *did_set_exit_process {
+                return Ok(TraceSlotOutcome::Failed(
+                    "trace entered VM — giving up (ExitProcess already resolved)",
+                ));
+            }
+            *did_set_exit_process = true;
+            let real_exit_process = resolve_exit_process();
+            if real_exit_process != 0 {
+                return Ok(TraceSlotOutcome::ExitProcess(real_exit_process));
+            }
+            Ok(TraceSlotOutcome::Failed(
+                "VM entry, but ExitProcess unresolved — leaving slot",
+            ))
+        }
+        SlotTraceRaw::Resolved(api) => {
+            if api < 0x10000 || (api >= image_base && api < image_boundary) {
+                // Partial deobfuscation (in-image or too low). Retry deepened.
+                log(
+                    LogMsgType::Info,
+                    &format!(
+                        "IAT[{slot_index}] {slot_va:#x}: first pass yielded {api:#x} \
+                         (in image range or too low) — retrying with deepened budget"
+                    ),
+                );
+                retry_or_fail(
+                    debugger,
+                    state,
+                    start_address,
+                    main_thread_id,
+                    tm_start,
+                    tm_end,
+                    image_base,
+                    image_boundary,
+                    did_set_exit_process,
+                    slot_index,
+                    slot_va,
+                    log,
+                )
+            } else {
+                let module_ranges = crate::iat::loaded_module_ranges(debugger.pid());
+                let owned_by_module = module_ranges
+                    .iter()
+                    .any(|&(base, end)| end > base && api >= base && api < end);
+                if owned_by_module {
+                    Ok(TraceSlotOutcome::Resolved(api))
+                } else {
+                    // Not owned by any loaded module — partial VM deobfuscation
+                    // (e.g. XX-8's `0x1b370fa3810`). Retry deepened.
+                    log(
+                        LogMsgType::Info,
+                        &format!(
+                            "IAT[{slot_index}] {slot_va:#x}: first pass yielded {api:#x} \
+                             (not owned by any loaded module) — retrying with deepened budget"
+                        ),
+                    );
+                    retry_or_fail(
+                        debugger,
+                        state,
+                        start_address,
+                        main_thread_id,
+                        tm_start,
+                        tm_end,
+                        image_base,
+                        image_boundary,
+                        did_set_exit_process,
+                        slot_index,
+                        slot_va,
+                        log,
+                    )
+                }
+            }
+        }
+        SlotTraceRaw::Failed(reason) => {
+            // No API resolved at all (limit hit without result, etc.). Retry
+            // with the deepened budget before giving up.
+            log(
+                LogMsgType::Info,
+                &format!(
+                    "IAT[{slot_index}] {slot_va:#x}: first pass failed ({reason}) \
+                     — retrying with deepened budget"
+                ),
+            );
+            retry_or_fail(
+                debugger,
+                state,
+                start_address,
+                main_thread_id,
+                tm_start,
+                tm_end,
+                image_base,
+                image_boundary,
+                did_set_exit_process,
+                slot_index,
+                slot_va,
+                log,
+            )
+        }
+    }
+}
+
+/// Raw, pre-classification result of one `trace_one_slot` invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlotTraceRaw {
+    /// The trace left the VM to a real API address (not yet ownership-checked).
+    Resolved(usize),
+    /// The trace entered the Themida VM (ExitProcess special case).
+    ExitProcess,
+    /// The trace ended without a usable result (limit hit, etc.).
+    Failed(&'static str),
+}
+
+/// Run exactly one `trace_one_slot` invocation and reduce it to a raw outcome.
+#[allow(clippy::too_many_arguments)]
+fn run_slot_trace(
+    debugger: &mut dyn DebuggerCore,
+    state: &mut ThemidaState,
+    start_address: u64,
+    main_thread_id: u32,
+    tm_start: usize,
+    tm_end: usize,
+    image_base: usize,
+    image_boundary: usize,
+    trace_limit: u64,
+    log: &(dyn Fn(LogMsgType, &str) + '_),
+) -> Result<SlotTraceRaw, ThemidaError> {
+    state.traced_api = 0;
+    state.trace_in_vm = false;
+
+    slot::trace_one_slot(
+        debugger,
+        state,
+        start_address,
+        main_thread_id,
+        tm_start,
+        tm_end,
+        image_base,
+        image_boundary,
+        trace_limit,
+        log,
+    )?;
+
+    if state.trace_in_vm {
+        Ok(SlotTraceRaw::ExitProcess)
+    } else if state.traced_api != 0 {
+        Ok(SlotTraceRaw::Resolved(state.traced_api))
+    } else {
+        Ok(SlotTraceRaw::Failed(
+            "tracing completed but no API resolved",
+        ))
+    }
+}
+
+/// Second-pass retry with [`TRACE_LIMIT_DEEPENED`]; its outcome is final.
+#[allow(clippy::too_many_arguments)]
+fn retry_or_fail(
+    debugger: &mut dyn DebuggerCore,
+    state: &mut ThemidaState,
+    start_address: u64,
+    main_thread_id: u32,
+    tm_start: usize,
+    tm_end: usize,
+    image_base: usize,
+    image_boundary: usize,
+    did_set_exit_process: &mut bool,
+    slot_index: usize,
+    slot_va: usize,
+    log: &(dyn Fn(LogMsgType, &str) + '_),
+) -> Result<TraceSlotOutcome, ThemidaError> {
+    let second = run_slot_trace(
+        debugger,
+        state,
+        start_address,
+        main_thread_id,
+        tm_start,
+        tm_end,
+        image_base,
+        image_boundary,
+        TRACE_LIMIT_DEEPENED,
+        log,
+    )?;
+    match second {
+        SlotTraceRaw::ExitProcess => {
+            if *did_set_exit_process {
+                return Ok(TraceSlotOutcome::Failed(
+                    "deepened trace entered VM — giving up (ExitProcess already resolved)",
+                ));
+            }
+            *did_set_exit_process = true;
+            let real_exit_process = resolve_exit_process();
+            if real_exit_process != 0 {
+                Ok(TraceSlotOutcome::ExitProcess(real_exit_process))
+            } else {
+                Ok(TraceSlotOutcome::Failed(
+                    "VM entry, but ExitProcess unresolved — leaving slot",
+                ))
+            }
+        }
+        SlotTraceRaw::Resolved(api) => {
+            if api < 0x10000 || (api >= image_base && api < image_boundary) {
+                Ok(TraceSlotOutcome::Failed(
+                    "deepened trace still in image range or too low",
+                ))
+            } else {
+                let module_ranges = crate::iat::loaded_module_ranges(debugger.pid());
+                let owned_by_module = module_ranges
+                    .iter()
+                    .any(|&(base, end)| end > base && api >= base && api < end);
+                if owned_by_module {
+                    log(
+                        LogMsgType::Good,
+                        &format!(
+                            "IAT[{slot_index}] {slot_va:#x}: deepened retry resolved {api:#x}"
+                        ),
+                    );
+                    Ok(TraceSlotOutcome::Resolved(api))
+                } else {
+                    Ok(TraceSlotOutcome::Failed(
+                        "deepened trace still not owned by any loaded module (vm_non_module_addr)",
+                    ))
+                }
+            }
+        }
+        SlotTraceRaw::Failed(reason) => {
+            Ok(TraceSlotOutcome::Failed(
+                match reason {
+                    "tracing completed but no API resolved" => {
+                        "deepened trace completed but no API resolved"
+                    }
+                    _ => reason,
+                },
+            ))
+        }
+    }
 }
 
 // ===========================================================================
@@ -986,5 +1218,20 @@ mod tests {
         let (start, end) = get_themida_section_bounds(&state, actual_image_base);
         assert_eq!(start, 0x400000);
         assert_eq!(end, 0x500000);
+    }
+
+    // -- XX-10-A direction 1: deepened retry budget --
+
+    #[test]
+    fn deepened_budget_is_strictly_larger_than_default() {
+        // The second-pass budget must give the VM deobfuscation more room than
+        // the first pass (4x default). A deepened budget <= default would make
+        // the retry meaningless.
+        assert!(
+            TRACE_LIMIT_DEEPENED > TRACE_LIMIT,
+            "deepened retry budget must exceed the default"
+        );
+        assert_eq!(TRACE_LIMIT_DEEPENED / TRACE_LIMIT, 4);
+        assert!(TRACE_LIMIT_DEEPENED.is_multiple_of(TRACE_LIMIT));
     }
 }

@@ -51,11 +51,13 @@ pub use dumper::{
     dump_dotnet_with_source, dump_process, dump_process_with_report, emit_pure_rebuild,
     emit_pure_rebuild_with_parity, evaluate_partial_accept, get_original_imports, is_dotnet,
     observe_encrypted_regions, plan_from_host_dump, rebuild_import_table,
-    rebuild_import_table_with_report, shannon_entropy_bits, ContainerRestoreMode, DumpCapturePolicy,
-    DumpOptions, DumpProcessReport, DumpProfile, DumpProfileCapabilities, DumpTiming,
-    EarlySectionSnapshot, EncryptedRegionObservation, ExperimentalStagePlan, IatPartialAcceptDecision,
-    IatRejectedSlot, IatStaleSlot, OepPolicy, PureRebuildEmitOptions, PureRebuildParitySnapshot,
-    SectionContentReference, ENCRYPTED_REGION_ENTROPY_THRESHOLD, R2_SAMPLE_BYTES,
+    rebuild_import_table_with_report, shannon_entropy_bits, address_owned_by_loaded_module,
+    static_corroboration_candidate, ContainerRestoreMode, DumpCapturePolicy, DumpOptions,
+    DumpProcessReport, DumpProfile, DumpProfileCapabilities, DumpTiming, EarlySectionSnapshot,
+    EncryptedRegionObservation, ExperimentalStagePlan, IatPartialAcceptDecision, IatRejectedSlot,
+    IatStaleSlot, IatStaticCorroboration, OepPolicy, PureRebuildEmitOptions,
+    PureRebuildParitySnapshot, SectionContentReference, ENCRYPTED_REGION_ENTROPY_THRESHOLD,
+    R2_SAMPLE_BYTES,
 };
 pub use error::PeError;
 pub use exception_final::{
@@ -76,7 +78,9 @@ pub use header::{
     ImageDataDirectory, ImageDosHeader, ImageFileHeader, ImageNtHeaders, ImageOptionalHeader,
     ImageSectionHeader, PeHeader, PeSection,
 };
-pub use iat_completeness::{IatRecoveryReport, IatSlotReport, IatSlotStatus};
+pub use iat_completeness::{
+    IatRecoveryReport, IatResolutionSource, IatSlotReport, IatSlotStatus, IatUnresolvedReason,
+};
 pub use import_table::{ImportModule, ImportTableBuilder, ImportThunk};
 pub use original_imports::{
     parse_final_import_identities, read_original_import_table, resolve_imports_via_getprocaddress,

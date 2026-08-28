@@ -527,6 +527,10 @@ pub struct OreansIatSlotEvidence {
     pub module_name: Option<String>,
     pub function_name: Option<String>,
     pub ordinal: Option<u16>,
+    /// Provenance of a resolved slot's address (XX-10-A direction 2).
+    /// `live` or `static_corroborated`; absent on older sidecars.
+    #[serde(default)]
+    pub resolution_source: Option<String>,
 }
 
 /// Stable per-reason counts over a recovery report's non-resolved slots.
@@ -602,6 +606,21 @@ pub struct OreansIatStaleSlotEvidence {
     pub observed_value: Option<u64>,
 }
 
+/// One static back-fill record (XX-10-A direction 2), carrying the full
+/// three-evidence chain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OreansIatStaticCorroborationEvidence {
+    pub slot_index: usize,
+    pub slot_rva: Option<u32>,
+    pub unresolved_reason: Option<String>,
+    pub original_module: String,
+    pub original_function: String,
+    pub resolved_address: u64,
+    pub ownership_verified: bool,
+    pub call_site_semantics: String,
+}
+
 /// The graded-acceptance decision carried on the IAT evidence sidecar.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -615,6 +634,9 @@ pub struct OreansIatPartialAcceptEvidence {
     pub rejected_slots: Vec<OreansIatRejectedSlotEvidence>,
     pub stale_slots: Vec<OreansIatStaleSlotEvidence>,
     pub accepted_resolved_slots: Vec<usize>,
+    /// Static back-fills (XX-10-A direction 2); empty on older sidecars.
+    #[serde(default)]
+    pub static_corroborations: Vec<OreansIatStaticCorroborationEvidence>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

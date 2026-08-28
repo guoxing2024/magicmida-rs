@@ -37,6 +37,8 @@ pub(crate) struct IatSlotEvidence {
     pub module_name: Option<String>,
     pub function_name: Option<String>,
     pub ordinal: Option<u16>,
+    /// Provenance of a resolved slot's address (XX-10-A direction 2).
+    pub resolution_source: Option<String>,
 }
 
 /// Stable per-reason counts over a recovery report's non-resolved slots.
@@ -70,6 +72,21 @@ pub(crate) struct IatStaleSlotEvidence {
     pub observed_value: Option<u64>,
 }
 
+/// One static back-fill record (XX-10-A direction 2), carrying the full
+/// three-evidence chain from the graded-acceptance decision.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct IatStaticCorroborationEvidence {
+    pub slot_index: usize,
+    pub slot_rva: Option<u32>,
+    pub unresolved_reason: Option<String>,
+    pub original_module: String,
+    pub original_function: String,
+    pub resolved_address: u64,
+    pub ownership_verified: bool,
+    pub call_site_semantics: String,
+}
+
 /// The graded-acceptance decision carried on the IAT evidence sidecar.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -83,6 +100,7 @@ pub(crate) struct IatPartialAcceptEvidence {
     pub rejected_slots: Vec<IatRejectedSlotEvidence>,
     pub stale_slots: Vec<IatStaleSlotEvidence>,
     pub accepted_resolved_slots: Vec<usize>,
+    pub static_corroborations: Vec<IatStaticCorroborationEvidence>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -241,6 +259,20 @@ pub(crate) fn build_iat_evidence(
                 })
                 .collect(),
             accepted_resolved_slots: d.accepted_resolved_slots.clone(),
+            static_corroborations: d
+                .static_corroborations
+                .iter()
+                .map(|s| IatStaticCorroborationEvidence {
+                    slot_index: s.slot_index,
+                    slot_rva: s.slot_rva,
+                    unresolved_reason: s.unresolved_reason.map(|r| r.as_str().to_string()),
+                    original_module: s.original_module.clone(),
+                    original_function: s.original_function.clone(),
+                    resolved_address: s.resolved_address,
+                    ownership_verified: s.ownership_verified,
+                    call_site_semantics: s.call_site_semantics.clone(),
+                })
+                .collect(),
         });
     Ok(IatEvidenceSidecar {
         schema_version: schema_version.clone(),
@@ -477,6 +509,7 @@ fn slot_to_evidence(slot: &IatSlotReport) -> IatSlotEvidence {
         module_name: slot.module_name.clone(),
         function_name: slot.function_name.clone(),
         ordinal: slot.ordinal,
+        resolution_source: slot.resolution_source.map(|s| s.as_str().to_string()),
     }
 }
 
@@ -866,6 +899,7 @@ mod tests {
                 module_name: Some("KERNEL32.DLL".into()),
                 function_name: (!ordinal).then(|| function.to_string()),
                 ordinal: ordinal.then_some(0),
+                resolution_source: Some(mida_pe::IatResolutionSource::Live),
             });
         }
         slots.push(IatSlotReport {
@@ -880,6 +914,7 @@ mod tests {
             module_name: None,
             function_name: None,
             ordinal: None,
+            resolution_source: None,
         });
         let requested_bytes = (count + 1) * 8;
         mida_pe::DumpProcessReport {
@@ -1278,5 +1313,59 @@ mod tests {
         // Same payload otherwise; only the schema id differs.
         assert_eq!(oreans.candidate, gto.candidate);
         assert!(build_iat_evidence(&protected, &candidate, &report, "bogus").is_err());
+    }
+
+    /// XX-10-A direction 2: the sidecar carries `resolution_source` per slot and
+    /// the full `static_corroborations` chain on the graded-acceptance evidence.
+    #[test]
+    fn static_corroboration_evidence_is_serialized() {
+        let dir = temp_dir("static_corroboration");
+        let bytes = minimal_candidate(false, false, b"GetModuleHandleA\0");
+        let (protected, candidate) = write_pair(&dir, &bytes);
+        let mut report = report_for(1, false, "GetModuleHandleA");
+        // Mark the resolved slot as static-corroborated.
+        report.iat_report.as_mut().unwrap().slots[0].resolution_source =
+            Some(mida_pe::IatResolutionSource::StaticCorroborated);
+        // Attach a graded decision carrying one static corroboration.
+        report.iat_partial_accepted = true;
+        report.iat_partial_accept = Some(mida_pe::IatPartialAcceptDecision {
+            strict_complete: false,
+            partial_accepted: true,
+            resolved_fraction_num: 1,
+            resolved_fraction_den: 1,
+            fraction_ok: true,
+            rejected_within_budget: true,
+            structural_failures: Vec::new(),
+            rejected_slots: Vec::new(),
+            stale_slots: Vec::new(),
+            accepted_resolved_slots: vec![0],
+            static_corroborations: vec![mida_pe::IatStaticCorroboration::new(
+                0,
+                Some(0x1150),
+                Some(mida_pe::IatUnresolvedReason::ModuleNotFound),
+                "kernel32.dll".to_string(),
+                "GetModuleHandleA".to_string(),
+                0x7fff_0000_1000,
+                true,
+                "call [rip+disp]; test eax,eax; jne — handle check".to_string(),
+            )],
+        });
+
+        let sidecar =
+            build_iat_evidence(&protected, &candidate, &report, "oreans_themida").unwrap();
+        let partial = sidecar.iat_partial_accept.expect("partial accept evidence");
+        assert_eq!(partial.static_corroborations.len(), 1);
+        let corr = &partial.static_corroborations[0];
+        assert_eq!(corr.original_module, "kernel32.dll");
+        assert_eq!(corr.original_function, "GetModuleHandleA");
+        assert!(corr.ownership_verified);
+        assert!(corr.call_site_semantics.contains("handle check"));
+        // The per-slot resolution_source is propagated to the slot evidence.
+        let slot0 = sidecar
+            .iat_report
+            .as_ref()
+            .and_then(|r| r.slots.first())
+            .expect("slot 0");
+        assert_eq!(slot0.resolution_source.as_deref(), Some("static_corroborated"));
     }
 }

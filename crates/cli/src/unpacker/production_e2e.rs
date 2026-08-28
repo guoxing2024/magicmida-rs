@@ -156,6 +156,7 @@ mod tests {
             module_name: Some("KERNEL32.DLL".to_string()),
             function_name: Some("ExitProcess".to_string()),
             ordinal: None,
+            resolution_source: Some(mida_pe::IatResolutionSource::Live),
         });
         iat_slots.push(IatSlotReport {
             slot_index: 1,
@@ -169,6 +170,7 @@ mod tests {
             module_name: None,
             function_name: None,
             ordinal: None,
+            resolution_source: None,
         });
         let iat_report = IatRecoveryReport {
             requested_bytes: 16,
