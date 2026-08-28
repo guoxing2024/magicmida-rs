@@ -216,6 +216,14 @@ pub struct DumpProcessReport {
     pub iat_evidence_complete: bool,
     /// The immutable IAT evidence, when `fix_imports` was requested.
     pub iat_report: Option<crate::iat_completeness::IatRecoveryReport>,
+    /// Whether a graded (partial) acceptance of an incomplete IAT report was
+    /// produced and accepted by the dump emitter (XX-9-A direction 2). Always
+    /// `false` for a strictly complete report or when the emitter fell back to
+    /// the original stub table. It never overrides the strict
+    /// `iat_evidence_complete` gate; it is a separate policy layer.
+    pub iat_partial_accepted: bool,
+    /// The full graded-acceptance decision, when one was produced.
+    pub iat_partial_accept: Option<crate::dumper::iat_partial_accept::IatPartialAcceptDecision>,
     /// Whether the initial runtime TLS data directory was present.
     pub tls_evidence_present: bool,
     /// Whether the immutable runtime TLS observation had no blocker.

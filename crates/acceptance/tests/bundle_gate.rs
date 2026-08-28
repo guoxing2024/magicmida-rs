@@ -129,6 +129,8 @@ fn iat_evidence(
         iat_evidence_complete: true,
         iat_report: None,
         final_imports: Vec::new(),
+        iat_partial_accepted: false,
+        iat_partial_accept: None,
         prerequisite_passes: true,
         blocker: None,
     }

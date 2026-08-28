@@ -935,13 +935,13 @@ pub(super) fn find_iat_via_data_heuristic(
 
 /// Outcome of attributing an IAT reference address to a loaded module.
 #[derive(Debug, Clone, Default)]
-pub(super) struct ModuleAttribution {
+pub(crate) struct ModuleAttribution {
     /// Module name the address falls inside, if any.
-    pub(super) module: Option<String>,
+    pub(crate) module: Option<String>,
     /// The module's base address (when `module` is `Some`).
-    pub(super) module_base: usize,
+    pub(crate) module_base: usize,
     /// The module's end address (`base + size`).
-    pub(super) module_end: usize,
+    pub(crate) module_end: usize,
 }
 
 /// Attribute an address to a loaded module via the ToolHelp module snapshot.
@@ -950,7 +950,7 @@ pub(super) struct ModuleAttribution {
 /// ambiguity observed in XX-2 (IAT pointer 0x7ff85ace1e0c, ~200MB outside
 /// the image). The attribution is logged to stdout so live-fire runs can
 /// reason about the address without re-instrumenting.
-pub(super) fn attribute_address_to_module(
+pub(crate) fn attribute_address_to_module(
     pid: u32,
     address: usize,
 ) -> ModuleAttribution {
@@ -1003,6 +1003,52 @@ pub(super) fn attribute_address_to_module(
     unsafe { let _ = CloseHandle(h_snap); }
 
     found
+}
+
+/// Enumerate the `(base, end)` ranges of every module loaded in the target,
+/// excluding the main image module (which is not import-relevant).
+///
+/// XX-9-A direction 1: used by the v3-trace `FoundApi` ownership validation.
+/// A VM-deobfuscated address is only accepted as a real API when it lands
+/// inside one of these ranges; anything else (e.g. XX-8's `0x1b370fa3810`)
+/// is classified as `Unresolved(vm_non_module_addr)`.
+pub(crate) fn loaded_module_ranges(pid: u32) -> Vec<(usize, usize)> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, MODULEENTRY32W, TH32CS_SNAPMODULE,
+        TH32CS_SNAPMODULE32,
+    };
+
+    // SAFETY: pid is the target process id from the debugger; the snapshot
+    // handle is closed before return.
+    let h_snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid) };
+    let Ok(h_snap) = h_snap else {
+        warn!("loaded_module_ranges: CreateToolhelp32Snapshot failed");
+        return Vec::new();
+    };
+
+    let mut me = MODULEENTRY32W::default();
+    // ToolHelp requires dwSize to be set after default construction.
+    #[allow(clippy::field_reassign_with_default)]
+    {
+        me.dwSize = std::mem::size_of::<MODULEENTRY32W>() as u32;
+    }
+
+    let mut ranges = Vec::new();
+    // SAFETY: h_snap is a valid snapshot handle; me has a correct dwSize.
+    let mut ok = unsafe { Module32FirstW(h_snap, &mut me) };
+    while ok.is_ok() {
+        let base = me.modBaseAddr as usize;
+        let end = base + me.modBaseSize as usize;
+        ranges.push((base, end));
+        // SAFETY: h_snap valid; me populated by prior call.
+        ok = unsafe { Module32NextW(h_snap, &mut me) };
+    }
+
+    // SAFETY: h_snap is a valid handle to close.
+    unsafe { let _ = CloseHandle(h_snap); }
+
+    ranges
 }
 
 #[cfg(test)]

@@ -418,6 +418,30 @@ pub fn trace_imports(
                         continue;
                     }
 
+                    // XX-9-A direction 1: ownership validation. A
+                    // VM-deobfuscated address must land inside a loaded module
+                    // range (ToolHelp enumeration, XX-3-A attribution aid).
+                    // Anything else (e.g. XX-8's `0x1b370fa3810`) is classified
+                    // as Unresolved(vm_non_module_addr) at the source instead of
+                    // being written into the IAT and later surfacing as an
+                    // ambiguous `module_not_found` in the dump report.
+                    let module_ranges = crate::iat::loaded_module_ranges(debugger.pid());
+                    let owned_by_module = module_ranges
+                        .iter()
+                        .any(|&(base, end)| end > base && api >= base && api < end);
+                    if !owned_by_module {
+                        failed_count += 1;
+                        failed_slots.push(i);
+                        log(
+                            LogMsgType::Fatal,
+                            &format!(
+                                "IAT[{i}] {slot_va:#x}: discarding result {api:#x} \
+                                 (not owned by any loaded module — vm_non_module_addr)"
+                            ),
+                        );
+                        continue;
+                    }
+
                     iat_data[i] = api;
                     resolved_count += 1;
                     log(

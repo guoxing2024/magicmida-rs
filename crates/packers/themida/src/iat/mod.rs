@@ -31,6 +31,10 @@ mod fix;
 // XX-4 (B'): pure byte-scan IAT-site anchor for the host's IAT-materialization
 // wait (software breakpoint at the FF15 site, continue, then re-discover).
 pub use discovery::first_out_of_image_iat_site;
+// XX-9-A direction 1: address-to-module ownership validation for v3-trace
+// `FoundApi` results (a VM-deobfuscated address must land inside a loaded
+// module range or it is classified Unresolved(vm_non_module_addr)).
+pub(crate) use discovery::loaded_module_ranges;
 
 use tracing::{info, warn};
 

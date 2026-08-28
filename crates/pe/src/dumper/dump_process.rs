@@ -347,6 +347,7 @@ fn relocate_export_table_rvas(
 }
 
 use super::helpers::{make_memory_readable, IMAGE_DIRECTORY_ENTRY_IAT};
+use super::iat_partial_accept::evaluate_partial_accept;
 use super::import_rebuild::rebuild_import_table_complete;
 use super::import_section::{build_import_table_from_original, create_import_section};
 use super::output_writer::write_output_file;
@@ -682,25 +683,47 @@ pub fn dump_process_with_report(
     //    (never replace a richer rebuild with a Themida-stub import table).
     let mut _resolved_imports: std::collections::HashMap<(String, String), usize> =
         std::collections::HashMap::new();
+    // XX-9-A direction 2: graded (partial) acceptance of an incomplete live
+    // IAT report. The old all-or-nothing gate reverted 185 resolved thunks to
+    // a 9-thunk Themida stub table on a single un-attributable slot (XX-8
+    // `0x1b370fa3810`), producing a load AV. The strict predicate stays the
+    // authority for the perfect-prerequisite gate; this layer decides what the
+    // dump emitter may use when the report is not strictly complete.
+    let mut iat_partial_accept: Option<super::iat_partial_accept::IatPartialAcceptDecision> =
+        None;
+    let mut iat_partial_accepted = false;
     if opts.fix_imports {
         let live_empty = import_builder.as_ref().is_none_or(|b| b.thunk_count() == 0);
+        let live_complete = iat_report.as_ref().is_some_and(|report| report.is_complete());
         let use_original = if live_empty {
             true
-        } else if !iat_report
-            .as_ref()
-            .is_some_and(|report| report.is_complete())
-        {
-            // Fail closed: an incomplete live report may be useful for
-            // diagnostics, but it is never sufficient for the perfect gate.
-            warn!(
-                reason = %iat_report
-                    .as_ref()
-                    .map_or_else(|| "IAT evidence missing".to_string(), |report| report.failure_summary()),
-                "IAT recovery incomplete; refusing to treat live table as complete"
-            );
-            true
-        } else {
+        } else if live_complete {
             false
+        } else {
+            // Not strictly complete: evaluate the graded policy. Only when it
+            // both passes the thresholds AND yields a strictly-smaller table
+            // (i.e. some resolved slots were dropped around a rejected group)
+            // do we keep the graded live table. Otherwise fall back.
+            let decision = iat_report.as_ref().map(evaluate_partial_accept);
+            let graded_usable = decision.as_ref().is_some_and(|d| {
+                d.structural_failures.is_empty()
+                    && d.fraction_ok
+                    && d.rejected_within_budget
+                    && !d.accepted_resolved_slots.is_empty()
+            });
+            if graded_usable {
+                iat_partial_accept = decision;
+                iat_partial_accepted = true;
+                false
+            } else {
+                warn!(
+                    reason = %iat_report
+                        .as_ref()
+                        .map_or_else(|| "IAT evidence missing".to_string(), |report| report.failure_summary()),
+                    "IAT recovery incomplete; refusing to treat live table as complete"
+                );
+                true
+            }
         };
 
         if use_original {
@@ -715,6 +738,19 @@ pub fn dump_process_with_report(
                     );
                     import_builder = Some(fallback_builder);
                 }
+            }
+        } else if iat_partial_accepted {
+            // The existing `import_builder` from the two-pass vote already
+            // contains only the resolved thunks (the rejected slot had no
+            // candidates). Keep it unchanged; never merge it with the original
+            // stub table (XX-9-A: half-live / half-stub is prohibited).
+            if let Some(decision) = iat_partial_accept.as_ref() {
+                info!(
+                    accepted = decision.accepted_resolved_slots.len(),
+                    rejected = decision.rejected_slots.len(),
+                    stale = decision.stale_slots.len(),
+                    "Graded IAT acceptance: keeping live table (rejected slots left as honest holes)"
+                );
             }
         }
     }
@@ -2779,6 +2815,8 @@ pub fn dump_process_with_report(
         iat_evidence_present: iat_report.is_some(),
         iat_evidence_complete,
         iat_report,
+        iat_partial_accepted,
+        iat_partial_accept,
         tls_evidence_present: tls_report.directory_present,
         tls_evidence_complete: tls_report.is_complete(),
         tls_report,

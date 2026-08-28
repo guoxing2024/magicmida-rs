@@ -1205,6 +1205,8 @@ mod tests {
             iat_evidence_present: false,
             iat_evidence_complete: true,
             iat_report: None,
+            iat_partial_accepted: false,
+            iat_partial_accept: None,
             tls_evidence_present: false,
             tls_evidence_complete: true,
             tls_report: mida_pe::TlsObservationReport {
@@ -1295,6 +1297,8 @@ mod tests {
             iat_evidence_present: false,
             iat_evidence_complete: true,
             iat_report: None,
+            iat_partial_accepted: false,
+            iat_partial_accept: None,
             tls_evidence_present: true,
             tls_evidence_complete: true,
             tls_report: mida_pe::TlsObservationReport {

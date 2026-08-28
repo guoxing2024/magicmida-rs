@@ -38,6 +38,7 @@ mod heap_bootstrap;
 mod heap_global_snapshot;
 mod helpers;
 mod iat_gap_retarget;
+mod iat_partial_accept;
 mod import_rebuild;
 mod import_section;
 mod module_identity;
@@ -68,6 +69,11 @@ pub use self::dump_process::{
     dump_dotnet_with_source, dump_process, dump_process_with_report, write_bound_transform_manifest,
 };
 pub use self::helpers::is_dotnet;
+pub use self::iat_partial_accept::{
+    evaluate_partial_accept, IatPartialAcceptDecision, IatRejectedSlot, IatStaleSlot,
+    PARTIAL_ACCEPT_MAX_REJECTED, PARTIAL_ACCEPT_MIN_RESOLVED_FRACTION_DENOMINATOR,
+    PARTIAL_ACCEPT_MIN_RESOLVED_FRACTION_NUMERATOR,
+};
 pub use self::import_rebuild::{rebuild_import_table, rebuild_import_table_with_report};
 pub use self::module_identity::{ModuleIdentity, ModuleIdentityError};
 pub use self::original_imports::get_original_imports;

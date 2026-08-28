@@ -51,6 +51,40 @@ pub(crate) struct IatReasonCounts {
     pub pending_live_confirmation: usize,
 }
 
+/// One rejected slot from a graded (partial) IAT acceptance.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct IatRejectedSlotEvidence {
+    pub slot_index: usize,
+    pub slot_rva: Option<u32>,
+    pub observed_value: Option<u64>,
+    pub unresolved_reason: Option<String>,
+}
+
+/// One stale slot from a graded (partial) IAT acceptance.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct IatStaleSlotEvidence {
+    pub slot_index: usize,
+    pub slot_rva: Option<u32>,
+    pub observed_value: Option<u64>,
+}
+
+/// The graded-acceptance decision carried on the IAT evidence sidecar.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct IatPartialAcceptEvidence {
+    pub partial_accepted: bool,
+    pub resolved_fraction_num: usize,
+    pub resolved_fraction_den: usize,
+    pub fraction_ok: bool,
+    pub rejected_within_budget: bool,
+    pub structural_failures: Vec<String>,
+    pub rejected_slots: Vec<IatRejectedSlotEvidence>,
+    pub stale_slots: Vec<IatStaleSlotEvidence>,
+    pub accepted_resolved_slots: Vec<usize>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct FinalImportEvidence {
@@ -82,6 +116,11 @@ pub(crate) struct IatEvidenceSidecar {
     pub iat_evidence_complete: bool,
     pub iat_report: Option<IatReportEvidence>,
     pub final_imports: Vec<FinalImportEvidence>,
+    /// Whether a graded (partial) acceptance of an incomplete IAT report was
+    /// produced and accepted by the dump emitter (XX-9-A direction 2).
+    pub iat_partial_accepted: bool,
+    /// The full graded-acceptance decision, when one was produced.
+    pub iat_partial_accept: Option<IatPartialAcceptEvidence>,
     pub prerequisite_passes: bool,
     pub blocker: Option<String>,
 }
@@ -146,6 +185,8 @@ pub(crate) fn build_iat_evidence(
             iat_evidence_complete: actual_complete,
             iat_report: report_evidence,
             final_imports,
+            iat_partial_accepted: false,
+            iat_partial_accept: None,
             prerequisite_passes: false,
             blocker: Some(blockers.join("; ")),
         });
@@ -170,6 +211,37 @@ pub(crate) fn build_iat_evidence(
     }
 
     let prerequisite_passes = blockers.is_empty();
+    let partial_evidence = report
+        .iat_partial_accept
+        .as_ref()
+        .map(|d| IatPartialAcceptEvidence {
+            partial_accepted: d.partial_accepted,
+            resolved_fraction_num: d.resolved_fraction_num,
+            resolved_fraction_den: d.resolved_fraction_den,
+            fraction_ok: d.fraction_ok,
+            rejected_within_budget: d.rejected_within_budget,
+            structural_failures: d.structural_failures.clone(),
+            rejected_slots: d
+                .rejected_slots
+                .iter()
+                .map(|s| IatRejectedSlotEvidence {
+                    slot_index: s.slot_index,
+                    slot_rva: s.slot_rva,
+                    observed_value: s.observed_value,
+                    unresolved_reason: s.unresolved_reason.map(|r| r.as_str().to_string()),
+                })
+                .collect(),
+            stale_slots: d
+                .stale_slots
+                .iter()
+                .map(|s| IatStaleSlotEvidence {
+                    slot_index: s.slot_index,
+                    slot_rva: s.slot_rva,
+                    observed_value: s.observed_value,
+                })
+                .collect(),
+            accepted_resolved_slots: d.accepted_resolved_slots.clone(),
+        });
     Ok(IatEvidenceSidecar {
         schema_version: schema_version.clone(),
         protected_input: protected_identity,
@@ -179,6 +251,8 @@ pub(crate) fn build_iat_evidence(
         iat_evidence_complete: actual_complete,
         iat_report: report_evidence,
         final_imports,
+        iat_partial_accepted: report.iat_partial_accepted,
+        iat_partial_accept: partial_evidence,
         prerequisite_passes,
         blocker: (!prerequisite_passes).then(|| blockers.join("; ")),
     })
@@ -818,6 +892,8 @@ mod tests {
                 slot_size: 8,
                 slots,
             }),
+            iat_partial_accepted: false,
+            iat_partial_accept: None,
             tls_evidence_present: false,
             tls_evidence_complete: true,
             tls_report: absent_tls_report(),
@@ -1151,6 +1227,8 @@ mod tests {
             iat_evidence_present: true,
             iat_evidence_complete: false,
             iat_report: None,
+            iat_partial_accepted: false,
+            iat_partial_accept: None,
             tls_evidence_present: false,
             tls_evidence_complete: true,
             tls_report: absent_tls_report(),

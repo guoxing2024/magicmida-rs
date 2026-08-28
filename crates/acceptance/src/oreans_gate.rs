@@ -571,8 +571,50 @@ pub struct OreansIatEvidence {
     pub iat_evidence_complete: bool,
     pub iat_report: Option<OreansIatReportEvidence>,
     pub final_imports: Vec<OreansFinalImportEvidence>,
+    /// Whether a graded (partial) acceptance of an incomplete IAT report was
+    /// produced and accepted by the dump emitter (XX-9-A direction 2).
+    /// Diagnostic-only; never affects the perfect-prerequisite gate verdict.
+    #[serde(default)]
+    pub iat_partial_accepted: bool,
+    /// The full graded-acceptance decision, when one was produced.
+    #[serde(default)]
+    pub iat_partial_accept: Option<OreansIatPartialAcceptEvidence>,
     pub prerequisite_passes: bool,
     pub blocker: Option<String>,
+}
+
+/// One rejected slot from a graded (partial) IAT acceptance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OreansIatRejectedSlotEvidence {
+    pub slot_index: usize,
+    pub slot_rva: Option<u32>,
+    pub observed_value: Option<u64>,
+    pub unresolved_reason: Option<String>,
+}
+
+/// One stale slot from a graded (partial) IAT acceptance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OreansIatStaleSlotEvidence {
+    pub slot_index: usize,
+    pub slot_rva: Option<u32>,
+    pub observed_value: Option<u64>,
+}
+
+/// The graded-acceptance decision carried on the IAT evidence sidecar.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OreansIatPartialAcceptEvidence {
+    pub partial_accepted: bool,
+    pub resolved_fraction_num: usize,
+    pub resolved_fraction_den: usize,
+    pub fraction_ok: bool,
+    pub rejected_within_budget: bool,
+    pub structural_failures: Vec<String>,
+    pub rejected_slots: Vec<OreansIatRejectedSlotEvidence>,
+    pub stale_slots: Vec<OreansIatStaleSlotEvidence>,
+    pub accepted_resolved_slots: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

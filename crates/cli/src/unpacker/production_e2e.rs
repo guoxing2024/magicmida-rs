@@ -275,6 +275,8 @@ mod tests {
             iat_evidence_present: true,
             iat_evidence_complete: iat_report.is_complete(),
             iat_report: Some(iat_report),
+            iat_partial_accepted: false,
+            iat_partial_accept: None,
             tls_evidence_present: true,
             tls_evidence_complete: tls_report.blockers.is_empty(),
             tls_report,

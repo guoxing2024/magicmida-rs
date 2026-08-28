@@ -283,6 +283,8 @@ fn iat_evidence(
             function_name: Some("ExitProcess".to_string()),
             ordinal: None,
         }],
+        iat_partial_accepted: false,
+        iat_partial_accept: None,
         prerequisite_passes: true,
         blocker: None,
     }
