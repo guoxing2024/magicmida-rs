@@ -63,7 +63,7 @@ pub use init::{init_pe_details, locate_themida_section, themida_pe_info_basic, T
 pub use oep::{
     cookie_complement_from_security_init_xrefs, decode_msvc_oep_wrapper, encode_msvc_oep_wrapper,
     find_cookie_complement_site, find_real_oep_by_scanning, find_real_oep_in_bytes,
-    ftrace_common_main_hint, ftrace_enter_preserve_common_main, handle_tls_callbacks,
+    find_real_oep_by_scanning_with_backtrack, ftrace_common_main_hint, ftrace_enter_preserve_common_main, handle_tls_callbacks,
     is_oep_virtualized, is_scrt_common_main_seh_bytes, is_tls_or_dynamic_init_helper_bytes,
     reject_if_tls_helper_as_common_main, require_full_section_read,
     resolve_cookie_site_via_security_init_xrefs, resolve_msvc_crt_targets,

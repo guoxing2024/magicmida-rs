@@ -1207,21 +1207,44 @@ pub fn unpack(
                                 let text_sec = &state.pe_info.pe_sections[0];
                                 let text_rva = text_sec.virtual_address;
                                 let text_vsize = text_sec.virtual_size;
-                                match mida_packers_themida::find_real_oep_by_scanning(
+                                match mida_packers_themida::find_real_oep_by_scanning_with_backtrack(
                                     &dbg,
                                     image_base_usize,
                                     text_rva,
                                     text_vsize,
                                 ) {
-                                    Ok(Some(real_oep)) => {
+                                    Ok(Some(outcome)) => {
+                                        let real_oep = outcome.final_oep;
                                         log::log(
                                             LogType::Good,
                                             &format!("OEP found via .text scan: {:#x}", real_oep),
                                         );
                                         ls.oep = Some(real_oep);
+                                        // XX-11-B (#17): record the backtrack decision in
+                                        // the provenance evidence so the sidecar exposes
+                                        // scan_hit_rva / final_oep_rva / oep_backtrack.
+                                        let backtrack_note = match outcome.backtrack {
+                                            mida_packers_themida::oep::BacktrackDecision::Backtracked { scan_hit, .. } => {
+                                                format!(
+                                                    "; oep_backtrack=backtracked scan_hit_rva={:#x} final_oep_rva={:#x}",
+                                                    scan_hit, real_oep
+                                                )
+                                            }
+                                            mida_packers_themida::oep::BacktrackDecision::AlreadyStart => {
+                                                "; oep_backtrack=already_start".to_string()
+                                            }
+                                            mida_packers_themida::oep::BacktrackDecision::Uncertain { scan_hit } => {
+                                                format!(
+                                                    "; oep_backtrack=uncertain scan_hit_rva={:#x} final_oep_rva={:#x}",
+                                                    scan_hit, real_oep
+                                                )
+                                            }
+                                        };
                                         ls.oep_provenance = OepProvenance::scan_fallback(
                                             real_oep as u64,
-                                            format!("live .text scan selected OEP: {real_oep:#x}"),
+                                            format!(
+                                                "live .text scan selected OEP: {real_oep:#x}{backtrack_note}"
+                                            ),
                                         );
                                         ls.oep_found_via_scanning = true;
                                     }

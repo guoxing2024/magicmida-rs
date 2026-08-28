@@ -92,6 +92,35 @@ pub fn find_real_oep_by_scanning(
     text_section_rva: u32,
     text_section_size: u32,
 ) -> Result<Option<usize>, ThemidaError> {
+    Ok(find_real_oep_by_scanning_with_backtrack(
+        debugger,
+        image_base,
+        text_section_rva,
+        text_section_size,
+    )?
+    .map(|o| o.final_oep))
+}
+
+/// Scan result carrying the OEP backtracking decision (XX-11-B / #17).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OepScanOutcome {
+    /// Final OEP after any prologue backtracking (what the PE EP will be set to).
+    pub final_oep: usize,
+    /// The raw scan hit before backtracking.
+    pub scan_hit: usize,
+    /// Backtracking decision (already_start / backtracked / uncertain).
+    pub backtrack: BacktrackDecision,
+}
+
+/// Like [`find_real_oep_by_scanning`] but also reports the backtracking
+/// decision so the caller can record `scan_hit_rva` / `final_oep_rva` and
+/// `oep_backtrack` in the sidecar (XX-11-B / #17).
+pub fn find_real_oep_by_scanning_with_backtrack(
+    debugger: &dyn DebuggerCore,
+    image_base: usize,
+    text_section_rva: u32,
+    text_section_size: u32,
+) -> Result<Option<OepScanOutcome>, ThemidaError> {
     let text_base = image_base + text_section_rva as usize;
     let size = text_section_size as usize;
 
@@ -136,7 +165,14 @@ pub fn find_real_oep_by_scanning(
                     rva = format_args!("{:#x}", start),
                     "Found x64 MSVC function containing sub rsp, imm32"
                 );
-                return Ok(Some(func_addr));
+                return Ok(Some(OepScanOutcome {
+                    final_oep: func_addr,
+                    scan_hit: i,
+                    backtrack: BacktrackDecision::Backtracked {
+                        scan_hit: i,
+                        reason: "MSVC 81 EC pattern recovered to prologue",
+                    },
+                }));
             }
         }
 
@@ -152,14 +188,17 @@ pub fn find_real_oep_by_scanning(
                     rva = format_args!("{:#x}", i),
                     "Found MSVC pattern (mov ebp, esp; sub esp, imm8) — using as OEP"
                 );
-                return Ok(Some(func_addr));
+                return Ok(Some(OepScanOutcome {
+                    final_oep: func_addr,
+                    scan_hit: i,
+                    backtrack: BacktrackDecision::AlreadyStart,
+                }));
             }
         }
     }
 
     // ---- Common function prologue detection ----
     let scan_end = effective_len.saturating_sub(4);
-    let mut first_function: Option<usize> = None;
 
     for i in 0..scan_end {
         let instr = text_buf[i];
@@ -179,20 +218,219 @@ pub fn find_real_oep_by_scanning(
         };
 
         if is_prologue {
-            let func_addr = text_base + i;
-            if first_function.is_none() {
-                first_function = Some(func_addr);
-                info!(
-                    addr = format_args!("{func_addr:#x}"),
-                    rva = format_args!("{:#x}", i),
-                    "Found first function prologue in .text"
+            // XX-11-B (#17): backtrack from the scan hit to the start of the
+                // containing function prologue.  A scan hit may land inside a
+                // prologue (e.g. at `48 83 EC 58` inside a `push...; sub rsp`
+                // sequence) — writing that as EP skips the pushes/sub and leaves
+                // the process with an 8-byte misaligned stack for its whole life
+                // (XX-10: wininet cold-start SSE `movdqa` AV).  Backtrack only
+                // when the boundary is provable; otherwise keep the hit + WARN.
+                let (final_start, backtrack) = backtrack_to_function_start(
+                    &text_buf[..effective_len],
+                    i,
                 );
-                break;
-            }
+                let func_addr = text_base + final_start;
+                match backtrack {
+                    BacktrackDecision::Backtracked { scan_hit, reason } => {
+                        warn!(
+                            scan_hit = format_args!("{scan_hit:#x}"),
+                            final_oep = format_args!("{func_addr:#x}"),
+                            reason,
+                            "OEP scan hit was inside a function prologue; backtracked to function start"
+                        );
+                    }
+                    BacktrackDecision::AlreadyStart => {
+                        info!(
+                            addr = format_args!("{func_addr:#x}"),
+                            rva = format_args!("{:#x}", final_start),
+                            "Found first function prologue in .text (already at function start)"
+                        );
+                    }
+                    BacktrackDecision::Uncertain { scan_hit } => {
+                        warn!(
+                            scan_hit = format_args!("{scan_hit:#x}"),
+                            final_oep = format_args!("{func_addr:#x}"),
+                            "OEP scan hit near prologue but boundary unprovable; keeping hit (no guess)"
+                        );
+                    }
+                }
+                // Record the raw scan hit (offset before backtracking) for the
+                // sidecar `scan_hit_rva` / `oep_backtrack` fields.
+                return Ok(Some(OepScanOutcome {
+                    final_oep: func_addr,
+                    scan_hit: i,
+                    backtrack,
+                }));
         }
     }
 
-    Ok(first_function)
+    Ok(None)
+}
+
+/// Decision produced by [`backtrack_to_function_start`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BacktrackDecision {
+    /// Scan hit was already the first non-prologue instruction after a
+    /// provable function prologue; no adjustment needed.
+    AlreadyStart,
+    /// Scan hit was inside a provable prologue; backtracked to the prologue's
+    /// first byte (the real function entry point).
+    Backtracked { scan_hit: usize, reason: &'static str },
+    /// No provable boundary; the scan hit is kept unchanged (conservative,
+    /// never guess).  Caller should record `oep_backtrack=uncertain`.
+    Uncertain { scan_hit: usize },
+}
+
+/// Backtrack from a scan hit offset to the start of the containing function
+/// prologue, when provable.
+///
+/// Recognises the MSVC/x64 pattern:
+///   `41 57 41 56 41 55 41 54 55 57 56 53 48 83 EC 58`  (push r15..rbx; sub rsp, imm8)
+/// i.e. a run of `push` (0x53/55/56/57, or 0x41-prefixed 0x54..=0x57) followed by
+/// `48 83 EC imm8` / `48 81 EC imm32`.  The function entry is the first byte of
+/// that run.  Boundary proof: byte before the run is `ret`/`int3`/`nop`/0xCC
+/// padding, or the hit is at section offset 0.
+///
+/// Conservative: if the boundary cannot be proven, return the original hit with
+/// [`BacktrackDecision::Uncertain`] — never guess.
+pub fn backtrack_to_function_start(
+    text_buf: &[u8],
+    scan_hit: usize,
+) -> (usize, BacktrackDecision) {
+    const MAX_BACKTRACK: usize = 32;
+
+    // If the scan hit itself is the start of a `sub rsp, imm` (`48 83 EC` /
+    // `48 81 EC`), extend the window to include that sub so it can anchor the
+    // push-run detection (XX-11-B: hit landed on 0x101c = `48 83 EC 58`).
+    let sub_len_at_hit = if scan_hit + 3 < text_buf.len()
+        && text_buf[scan_hit] == 0x48
+        && matches!(text_buf[scan_hit + 1], 0x83 | 0x81)
+        && text_buf[scan_hit + 2] == 0xEC
+    {
+        if text_buf[scan_hit + 1] == 0x83 {
+            4
+        } else {
+            7
+        }
+    } else {
+        0
+    };
+    let window_end = scan_hit.saturating_add(sub_len_at_hit).min(text_buf.len());
+
+    // Walk back at most MAX_BACKTRACK bytes looking for a push-sequence prologue.
+    let back_start = scan_hit.saturating_sub(MAX_BACKTRACK);
+    let window = &text_buf[back_start..window_end];
+
+    // Find the rightmost `sub rsp, imm` (`48 83 EC xx` or `48 81 EC xx xx xx xx`)
+    // in the window, then verify the bytes before it are a pure push run.
+    let mut best: Option<(usize, bool)> = None; // (push_run_start_abs, sub_imm32)
+    let mut w = 0usize;
+    while w + 3 < window.len() {
+        // `48 83 EC imm8`
+        if window[w] == 0x48
+            && window.get(w + 1) == Some(&0x83)
+            && window.get(w + 2) == Some(&0xEC)
+        {
+            let sub_end = w + 4;
+            if sub_end <= window.len() {
+                // Walk back from the `48` over a pure push run.
+                if let Some(push_start_rel) = push_run_start(&window[..w]) {
+                    best = Some((back_start + push_start_rel, false));
+                }
+            }
+            w += 1;
+        }
+        // `48 81 EC imm32`
+        else if window[w] == 0x48
+            && window.get(w + 1) == Some(&0x81)
+            && window.get(w + 2) == Some(&0xEC)
+        {
+            let sub_end = w + 7;
+            if sub_end <= window.len() {
+                if let Some(push_start_rel) = push_run_start(&window[..w]) {
+                    best = Some((back_start + push_start_rel, true));
+                }
+            }
+            w += 1;
+        } else {
+            w += 1;
+        }
+    }
+
+    if let Some((push_start_abs, _is_imm32)) = best {
+        // Boundary proof: the byte before the push run must be a terminator.
+        let boundary_ok = if push_start_abs == 0 {
+            true // section start is a valid function boundary
+        } else {
+            matches!(
+                text_buf.get(push_start_abs - 1),
+                Some(&0xC3 | &0xCC | &0x90 | &0x0F) // ret / int3 / nop / nop-prefix
+            )
+        };
+        if boundary_ok {
+            return (
+                push_start_abs,
+                BacktrackDecision::Backtracked {
+                    scan_hit,
+                    reason: "scan hit inside push/sub prologue",
+                },
+            );
+        }
+    }
+
+    // No provable prologue before the hit: is the hit itself the first
+    // instruction of a function (byte before it is a terminator)?
+    let hit_is_start = if scan_hit == 0 {
+        true
+    } else {
+        matches!(
+            text_buf.get(scan_hit - 1),
+            Some(&0xC3 | &0xCC | &0x90 | &0x0F)
+        )
+    };
+    if hit_is_start {
+        (scan_hit, BacktrackDecision::AlreadyStart)
+    } else {
+        (scan_hit, BacktrackDecision::Uncertain { scan_hit })
+    }
+}
+
+/// Given bytes `[0..end)` that end immediately before a `48 83 EC`/`48 81 EC`
+/// sub, find the start of a pure run of push instructions that ends exactly at
+/// `end`.  Returns the absolute offset of the first push byte if the run is
+/// pure and immediately precedes the sub, else `None`.
+///
+/// Scans forward from the first non-padding byte; the run must be contiguous
+/// push encodings (`push rbx/rbp/rsi/rdi`, or `41 54..57` push r12..r15) and
+/// its end must coincide with `bytes.len()` (the sub it belongs to).
+fn push_run_start(bytes: &[u8]) -> Option<usize> {
+    // Skip leading padding (ret/int3/nop) that terminates the previous function.
+    let mut i = 0usize;
+    while i < bytes.len() && matches!(bytes[i], 0xC3 | 0xCC | 0x90) {
+        i += 1;
+    }
+    let first = i;
+    let mut push_count = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == 0x41 && i + 1 < bytes.len() && matches!(bytes[i + 1], 0x54..=0x57) {
+            push_count += 1;
+            i += 2;
+        } else if matches!(b, 0x53 | 0x55 | 0x56 | 0x57) {
+            push_count += 1;
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    // The push run must end exactly where the sub begins (contiguous), and be
+    // non-empty.  Any non-push byte before the sub terminates the run without
+    // a match (conservative: don't guess across a gap).
+    if push_count > 0 && i == bytes.len() {
+        Some(first)
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -615,5 +853,109 @@ mod tests {
         assert!(result.oep_found);
         assert_eq!(result.oep_address, Some(0x401000));
         assert_eq!(result.tls_callbacks_executed, 2);
+    }
+
+    // -------------------------------------------------------------------
+    // XX-11-B (#17): OEP prologue backtracking
+    // -------------------------------------------------------------------
+
+    /// XX-10 scene vector: `0x1010` prologue (`41 57 ... 48 83 EC 58`),
+    /// scan hit at `0x1020` (inside the CRT code after the prologue).
+    fn xx10_scene_text() -> Vec<u8> {
+        // 0x1000: padding terminator bytes (nop/ret)
+        let mut buf = vec![0x90u8; 0x1100];
+        // 0x1000: explicit `ret` as the terminator before the function
+        buf[0x1000] = 0xC3;
+        // 0x1010..0x101e: 8-push + sub rsp,0x58 prologue
+        let prologue = [
+            0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x55, 0x57, 0x56, 0x53, 0x48, 0x83,
+            0xEC, 0x58,
+        ];
+        buf[0x1010..0x1020].copy_from_slice(&prologue);
+        // 0x1020: CRT body `mov eax,0x30; mov rax,gs:[eax]`
+        buf[0x1020..0x1025].copy_from_slice(&[0xB8, 0x30, 0x00, 0x00, 0x00]);
+        buf[0x1025..0x1027].copy_from_slice(&[0x65, 0x48]);
+        buf[0x1027..0x102b].copy_from_slice(&[0x8B, 0x04, 0x25, 0x30]);
+        buf
+    }
+
+    #[test]
+    fn xx11b_backtrack_from_hit_inside_prologue() {
+        // Scan hit at 0x1020 (first byte after the prologue): backtrack to 0x1010.
+        let buf = xx10_scene_text();
+        let (start, decision) = backtrack_to_function_start(&buf, 0x1020);
+        assert_eq!(start, 0x1010);
+        assert!(matches!(
+            decision,
+            BacktrackDecision::Backtracked { scan_hit: 0x1020, .. }
+        ));
+    }
+
+    #[test]
+    fn xx11b_backtrack_when_hit_is_sub_itself() {
+        // Scan hit lands on the `48 83 EC 58` (0x101c): still backtrack to 0x1010.
+        let buf = xx10_scene_text();
+        let (start, decision) = backtrack_to_function_start(&buf, 0x101c);
+        assert_eq!(start, 0x1010);
+        assert!(matches!(decision, BacktrackDecision::Backtracked { .. }));
+    }
+
+    #[test]
+    fn xx11b_already_at_function_start() {
+        // Hit is already the prologue start (0x1010): no adjustment.
+        let buf = xx10_scene_text();
+        let (start, decision) = backtrack_to_function_start(&buf, 0x1010);
+        assert_eq!(start, 0x1010);
+        assert_eq!(decision, BacktrackDecision::AlreadyStart);
+    }
+
+    #[test]
+    fn xx11b_conservative_when_boundary_unprovable() {
+        // Hit at 0x1020 but with NO terminator before the push run (garbage
+        // bytes between the run and the section start): must not guess.
+        let mut buf = xx10_scene_text();
+        // Remove the `ret` terminator at 0x1000, replace with junk that is not
+        // a push/sub prologue so the push run's left boundary is unprovable.
+        buf[0x1000] = 0xE8; // call — not a terminator, and 0xE8 starts a call
+        buf[0x1001] = 0x00;
+        buf[0x1002] = 0x00;
+        buf[0x1003] = 0x00;
+        buf[0x1004] = 0x00;
+        let (start, decision) = backtrack_to_function_start(&buf, 0x1020);
+        // 0x1000..0x1005 is `E8 00 00 00 00` (call rel32), then 0x1005..
+        // are the original nops; the push run 0x1010 has no provable left
+        // boundary => Uncertain keeps the original hit.
+        assert_eq!(start, 0x1020);
+        assert!(matches!(
+            decision,
+            BacktrackDecision::Uncertain { scan_hit: 0x1020 }
+        ));
+    }
+
+    #[test]
+    fn xx11b_rev1_golden_path_unchanged() {
+        // rev1 golden path: hit is a plain `sub rsp,0x28` prologue start (the
+        // classic MSVC mainCRTStartup). Backtracking must NOT move it.
+        // 0x2000: ret terminator; 0x2001: `sub rsp,0x28` (48 83 EC 28); then code.
+        let mut buf = vec![0x90u8; 0x2040];
+        buf[0x2000] = 0xC3;
+        buf[0x2001..0x2005].copy_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+        buf[0x2005..0x2009].copy_from_slice(&[0xB8, 0x30, 0x00, 0x00]);
+        buf[0x2009] = 0x00;
+        // Hit at 0x2005 (first non-prologue instruction): no push run before
+        // the sub, so no backtrack; hit is at a valid boundary after sub.
+        let (start, decision) = backtrack_to_function_start(&buf, 0x2005);
+        assert_eq!(start, 0x2005);
+        assert!(matches!(
+            decision,
+            BacktrackDecision::AlreadyStart | BacktrackDecision::Uncertain { .. }
+        ));
+        // And the prologue start 0x2001 itself must remain reachable as-is.
+        let (start2, decision2) = backtrack_to_function_start(&buf, 0x2001);
+        assert_eq!(start2, 0x2001);
+        assert!(matches!(
+            decision2,
+            BacktrackDecision::AlreadyStart | BacktrackDecision::Uncertain { .. }
+        ));
     }
 }
