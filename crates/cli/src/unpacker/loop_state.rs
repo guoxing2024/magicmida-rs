@@ -23,6 +23,10 @@ pub(super) struct LoopState {
     pub(super) text_poll_count: u32,
     /// .text poll: previous snapshot for stability check
     pub(super) text_prev_sample: [u8; 16],
+    /// Second region sample (offset +0x1000) for the dual-region stability
+    /// check (XX-11-B / #17): Themida keeps the .text head as a fixed shell
+    /// stub, so the head alone can never prove decryption of the real code.
+    pub(super) text_prev_sample2: [u8; 16],
     /// .text poll: true when .text content is stable (two consecutive reads match)
     pub(super) text_stable: bool,
     /// XX-4 (B'): waiting for WinLicense lazy-IAT materialization at an FF15

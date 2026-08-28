@@ -665,6 +665,7 @@ pub fn unpack(
         text_poll_start: None,
         text_poll_count: 0,
         text_prev_sample: [0u8; 16],
+        text_prev_sample2: [0u8; 16],
         text_stable: false,
         iat_materialize_wait: false,
         iat_materialize_site: None,
@@ -1145,13 +1146,44 @@ pub fn unpack(
                 if dbg.read_memory(text_start, &mut sample).is_ok() {
                     let non_zero = sample.iter().filter(|&&b| b != 0).count();
                     let min_nz = ls.text_poll_min_nonzero as usize;
-                    if non_zero > min_nz {
-                        if sample == ls.text_prev_sample {
-                            // .text stable ??decryption complete
+                    // XX-11-B (#17): the first 16 bytes of Themida .text stay a
+                    // fixed shell stub (`e9` jmp to the Themida section) even
+                    // while the real code below is still encrypted, so sampling
+                    // only the head gives a false "stable".  Sample a second
+                    // region at offset 0x10 (start of real code after the stub)
+                    // and require BOTH regions to hold *decrypted code* before
+                    // declaring decryption complete.  Non-zero stability alone
+                    // is insufficient (XX-11 live fire: the shell stub is also
+                    // stably non-zero); the second region must show a real
+                    // prologue-start byte (push / 41-prefixed push / 48-prefixed
+                    // mov/sub) — the shell stub bytes (e9.., b9.., high-entropy)
+                    // never match.
+                    let mut sample2 = [0u8; 16];
+                    let region2_ok = dbg
+                        .read_memory(text_start + 0x10, &mut sample2)
+                        .map(|_| {
+                            // Decrypted-code feature: first byte is a common x64
+                            // function-prologue start, OR the classic 8-push +
+                            // `48 83 EC imm8` opening at 0x10..0x1e.
+                            let b0 = sample2[0];
+                            let prologue_start = matches!(b0, 0x53 | 0x55 | 0x56 | 0x57)
+                                || (b0 == 0x41 && matches!(sample2[1], 0x54..=0x57))
+                                || (b0 == 0x48 && matches!(sample2[1], 0x83 | 0x81 | 0x8B));
+                            let classic8 = sample2[..14]
+                                == [
+                                    0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x55, 0x57,
+                                    0x56, 0x53, 0x48, 0x83,
+                                ];
+                            prologue_start || classic8
+                        })
+                        .unwrap_or(false);
+                    if non_zero > min_nz && region2_ok {
+                        if sample == ls.text_prev_sample && sample2 == ls.text_prev_sample2 {
+                            // .text stable ??decryption complete (both regions)
                             log::log(
                                 LogType::Good,
                                 &format!(
-                                    ".text decrypted and stable (poll #{}, {non_zero}/16 non-zero)",
+                                    ".text decrypted and stable (poll #{}, head {non_zero}/16, +0x10 prologue-verified)",
                                     ls.text_poll_count
                                 ),
                             );
@@ -1364,6 +1396,7 @@ pub fn unpack(
                         }
                     }
                     ls.text_prev_sample = sample;
+                    ls.text_prev_sample2 = sample2;
                 }
             }
         }

@@ -132,6 +132,21 @@ pub fn find_real_oep_by_scanning_with_backtrack(
 
     let effective_len = bytes_read.min(read_size);
 
+    // XX-11-B diagnostics: log the first 0x40 bytes read by the scan so the
+    // OEP decision can be audited against the actual runtime .text bytes
+    // (the poll sample and the scan read must agree).
+    {
+        let head: String = text_buf[..effective_len.min(0x40)]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join("");
+        info!(
+            text_base = format_args!("{text_base:#x}"),
+            head_hex = format_args!("{head}"),
+            "OEP scan .text head bytes (for audit)"
+        );
+    }
     // ---- MSVC-ification pattern: old MSVC uses E8..E9 at OEP ----
     let scan_end = effective_len.saturating_sub(16);
     for i in 0..scan_end {
@@ -358,13 +373,14 @@ pub fn backtrack_to_function_start(
     }
 
     if let Some((push_start_abs, _is_imm32)) = best {
-        // Boundary proof: the byte before the push run must be a terminator.
+        // Boundary proof: the byte before the push run must be a terminator
+        // or padding byte (ret/int3/nop/multi-byte-nop operands).
         let boundary_ok = if push_start_abs == 0 {
             true // section start is a valid function boundary
         } else {
             matches!(
                 text_buf.get(push_start_abs - 1),
-                Some(&0xC3 | &0xCC | &0x90 | &0x0F) // ret / int3 / nop / nop-prefix
+                Some(&0xC3 | &0xCC | &0x90 | &0x0F | &0x1F | &0x00 | &0x66 | &0x2E | &0x40 | &0x84)
             )
         };
         if boundary_ok {
@@ -379,18 +395,36 @@ pub fn backtrack_to_function_start(
     }
 
     // No provable prologue before the hit: is the hit itself the first
-    // instruction of a function (byte before it is a terminator)?
+    // instruction of a function (byte before it is a terminator or padding)?
     let hit_is_start = if scan_hit == 0 {
         true
     } else {
+        // Terminators: ret / int3 / nop.  Multi-byte NOP padding can put
+        // 0x00/0x66/0x2E/0x1F/0x40/0x84 bytes immediately before the function
+        // (e.g. `0F 1F 40 00`, `66 66 2E 0F 1F 84 00 00 00 00 00`), so the
+        // byte before the hit being any padding byte is a valid boundary.
         matches!(
             text_buf.get(scan_hit - 1),
-            Some(&0xC3 | &0xCC | &0x90 | &0x0F)
+            Some(&0xC3 | &0xCC | &0x90 | &0x0F | &0x1F | &0x00 | &0x66 | &0x2E | &0x40 | &0x84)
         )
     };
     if hit_is_start {
         (scan_hit, BacktrackDecision::AlreadyStart)
     } else {
+        // XX-11-B diagnostics: dump the backtrack window so an Uncertain
+        // verdict can be audited against the actual runtime .text bytes.
+        let win_hex: String = window
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join("");
+        warn!(
+            scan_hit = format_args!("{scan_hit:#x}"),
+            back_start = format_args!("{back_start:#x}"),
+            window_end = format_args!("{window_end:#x}"),
+            win_hex = format_args!("{win_hex}"),
+            "OEP backtrack uncertain: window bytes (for audit)"
+        );
         (scan_hit, BacktrackDecision::Uncertain { scan_hit })
     }
 }
@@ -404,9 +438,15 @@ pub fn backtrack_to_function_start(
 /// push encodings (`push rbx/rbp/rsi/rdi`, or `41 54..57` push r12..r15) and
 /// its end must coincide with `bytes.len()` (the sub it belongs to).
 fn push_run_start(bytes: &[u8]) -> Option<usize> {
-    // Skip leading padding (ret/int3/nop) that terminates the previous function.
+    // Skip leading padding (ret/int3/nop/multi-byte-nop operands) that
+    // terminates the previous function.
     let mut i = 0usize;
-    while i < bytes.len() && matches!(bytes[i], 0xC3 | 0xCC | 0x90) {
+    while i < bytes.len()
+        && matches!(
+            bytes[i],
+            0xC3 | 0xCC | 0x90 | 0x0F | 0x1F | 0x00 | 0x66 | 0x2E | 0x40 | 0x84
+        )
+    {
         i += 1;
     }
     let first = i;
@@ -956,6 +996,33 @@ mod tests {
         assert!(matches!(
             decision2,
             BacktrackDecision::AlreadyStart | BacktrackDecision::Uncertain { .. }
+        ));
+    }
+
+    #[test]
+    fn xx11b_multibyte_nop_padding_is_boundary() {
+        // Real scene: 0x1010 prologue preceded by `0F 1F 40 00` multi-byte NOP
+        // padding (as observed in the XX-11 dump: 0x1000 = `c3 0f 1f 40 00...`).
+        // The hit at the prologue start must be recognised as a valid function
+        // boundary (AlreadyStart), not Uncertain.
+        let mut buf = vec![0x90u8; 0x1030];
+        buf[0x1000] = 0xC3;
+        buf[0x1001..0x1005].copy_from_slice(&[0x0F, 0x1F, 0x40, 0x00]);
+        buf[0x1005..0x1010].copy_from_slice(&[0x66, 0x66, 0x2E, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        let prologue = [
+            0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x55, 0x57, 0x56, 0x53, 0x48, 0x83,
+            0xEC, 0x58,
+        ];
+        buf[0x1010..0x1020].copy_from_slice(&prologue);
+        let (start, decision) = backtrack_to_function_start(&buf, 0x1010);
+        assert_eq!(start, 0x1010);
+        assert_eq!(decision, BacktrackDecision::AlreadyStart);
+        // And a hit inside the prologue still backtracks to 0x1010.
+        let (start2, decision2) = backtrack_to_function_start(&buf, 0x1020);
+        assert_eq!(start2, 0x1010);
+        assert!(matches!(
+            decision2,
+            BacktrackDecision::Backtracked { scan_hit: 0x1020, .. }
         ));
     }
 }
