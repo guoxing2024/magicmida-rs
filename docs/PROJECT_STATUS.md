@@ -1,29 +1,44 @@
 # PROJECT_STATUS — MagicMida vNext
 
-> 最后更新：2026-08-29（冷启动接管会话）　更新人：总指挥
+> 最后更新：2026-08-29（冷启动接管会话，含收尾修正）　更新人：总指挥
 > 本文件是项目现状的唯一权威快照。工单台账见 [TICKETS.md](TICKETS.md)。
 
 ## 一句话结论
 
-这项目是**活的**（647 次提交，最后一次提交 2026-08-28，2801 个测试全绿），
-最要紧的一件事是：**过去两天所有"已完成"的成果（41 个改动文件 + 3 个新生产源文件、1906 行插入）全部只存在于本机未提交的工作区，且 `cargo fmt` 红 216 处，CI 第一个 job 就会失败。**
+这项目是**活的**（654 次提交，2801 个测试全绿，五道门禁本机全过），
+本次接管已把最要紧的风险解掉：**两天的在飞成果已分 8 个提交落到本地 git，`cargo fmt` 从红 216 处变为 0。推送按老板裁定停在本地，等他逐次确认。**
+下一件最要紧的事是 **TASK-003**（堵住会把编译失败读成"全绿"的基线门禁脚本）。
 
 ## 存活状态 [已验证]
 
+以下是在**最终提交树**上复跑的结果（`tools/_enter_msvc_env.cmd` 环境）：
+
 | 项 | 结果 | 证据 |
 |---|---|---|
-| release 构建 | ✅ 通过（1m31s） | `build_release.log`，`BUILD_EXIT=0`；`target/release/mida-cli.exe` 5.7 MB，`--help` 正常输出 |
-| 全量测试 | ✅ **65 个 target / 2801 passed / 0 failed / 2 ignored**，exit 0 | `cargo test --workspace --offline`（经 `tools/_enter_msvc_env.cmd`） |
-| `cargo check --workspace --tests` | ✅ exit 0 | 同上环境 |
-| clippy 门禁 1（`--all-targets -D dbg_macro`） | ✅ exit 0 | 同上环境 |
-| clippy 门禁 2（`--lib --bins -D unwrap_used/expect_used/manual_let_else`） | ✅ exit 0 | 同上环境 |
+| release 构建 | ✅ 通过（1m31s） | `target/release/mida-cli.exe` 5.7 MB，`--help` 正常输出 |
+| 全量测试 | ✅ **65 个 target / 2801 passed / 0 failed / 2 ignored**，exit 0 | `cargo test --workspace --offline` |
+| `cargo fmt --all -- --check` | ✅ exit 0（接管时是红 216 处） | 见 `runs/20260829-TASK-001.md` |
+| clippy 门禁 1（`--all-targets -D dbg_macro`） | ✅ exit 0 | — |
+| clippy 门禁 2（`--lib --bins -D unwrap_used/expect_used/manual_let_else`） | ✅ exit 0 | — |
 | 硬编码门禁 | ✅ `HARD-CODING GATE PASS` | `python tools/_hardcode_scan.py --gate` |
-| 工作区卫生门禁 | ✅ exit 0 | `tools/verify_workspace_hygiene.ps1` |
-| **`cargo fmt --all -- --check`** | ❌ **失败，216 处 diff** | 见 KNOWN_ISSUES / TICKETS TASK-001 |
-| CI 远端红绿 | ❓ 无法查证（本机无 `gh`） | 但 fmt job 是第一个 job → **[推断] 当前必红** |
-| 依赖锁定 | ✅ Cargo.lock 81 包，cargo-deny 已配置 | `deny.toml` |
+| `cargo check --workspace --tests` | ✅ exit 0 | — |
+| 依赖锁定 | ✅ Cargo.lock 81 包，`cargo-deny 0.20.2` 本机可用 | `deny.toml` |
+| **`tools/verify_workspace_hygiene.ps1`** | ❌ **本机 exit 1**（509 forbidden artifacts / 3 cache dirs / 138 git-dirty） | 见下方说明 |
+| CI 远端红绿 | ❓ 无法查证（本机无 `gh`，从未看到任何一次真实 CI run） | — |
 
-**结论：代码是绿的，仓库是红的。** 问题不在实现质量，在交付纪律。
+### 关于卫生门禁的 exit 1（我纠正自己的两次误判）[已验证]
+
+- **第一次误判**：接管早期我报"卫生门禁 exit 0"。错的 —— 我把输出管进了 `tail`，`$?` 读的是 `tail` 的退出码。
+- **第二次修正**：脚本实际 **exit 1**，`"status": "FAIL"`。
+- **但它对 CI 的含义和本机不同**：已逐个核查，**509 个 forbidden artifact 全部是未跟踪的本机文件** ——
+  `target/` 418 个、`lab/xx21*` 证据 73 个、`tools/__pycache__` 14 个，加上 `build_release.log`、`pin.log`、
+  `crates/cli/gto_launcher/` 下的 `snapshot.bin`（全部 untracked）。
+  仓库里**唯一**被跟踪的二进制是 `crates/packers/themida/src/oep/fixtures/` 下 8 个 `.bin`，而它们正是政策明确允许的位置。
+  CI 是 fresh checkout 且 `CARGO_TARGET_DIR` 指向仓库外，这些文件都不会存在，`git_dirty` 也会是 0。
+- **所以 [推断]：这道门在 CI 上应该是绿的，在本机永久是红的。** 代价是**它不能当作推送前的本地自检**，这一点会误导人（我就被误导了两次）。
+  已记入 `KNOWN_ISSUES.md` G-5。
+
+**结论：代码是绿的；仓库已经落地；唯一仍不可信的是"CI 到底红不红"这件事本身 —— 因为没人看过一次真实的 CI run。**
 
 ## 家底 [已验证]
 
@@ -32,7 +47,8 @@
 - 2795 个 `#[test]`；`#[ignore]` 仅 1 处；`todo!`/`unimplemented!` 仅 1 处（测试 mock）
 - `TODO`/`FIXME`/`HACK` 8 处（cli 4、packers 2、core 1、pe 1）
 - 文档：`docs/` 41 个 .md + 根目录 5 个 —— **文档通胀**，无入口、无台账（本次已建）
-- 未提交：41 个 modified + ~35 个 untracked（含 3 个新生产源文件共 1259 行）
+- 未提交：41 个 modified + ~35 个 untracked（含 3 个新生产源文件共 1259 行）→ **已于 2026-08-29 分 8 个提交落到本地**（未推送）
+- 仓库工作区里还躺着 **约 1.3 GB 未跟踪的实弹证据**（`lab/xx21b_resume/` 1.1 GB、`lab/xx21b_run_ui/` 145 MB、`lab/xx21_s4/` 31 MB 等）。按 `ARTIFACT_POLICY.md` 它们应该在 vault 里，不在这里。未处理，列为遗留项。
 
 ## 三态分布
 
@@ -81,10 +97,13 @@
 
 ## 我判断的前三件事（按优先级）
 
-1. **P0 — 落地在飞的工作区（TASK-001 + TASK-002），预估 1.5h。** 理由：现在这台机器上任何意外都会让两天的成果归零，而且 CI 处于必红状态，红着的 CI 等于没有 CI。
-2. **P0 — 堵住 `check_clippy_baseline.ps1` 的软通过（TASK-003），预估 0.5h。** 理由：一个会把编译失败读成"全绿"的门，比没有门更危险，因为它会让后面每一次放水都看起来合法。
-3. **P1 — 把 T0.7 从"完成"改回"待验证"并补齐可离线验证的部分（TASK-004），预估 3h。** 理由：这是唯一一个"引擎级正确性缺陷"被记成完成的地方，而 T0.5 已经用实锤证明它还没解决。
+1. ~~P0 — 落地在飞的工作区~~ **已完成**（2026-08-29，8 个本地提交；推送按老板裁定 D-010 停在本地）。
+2. **P0 — 堵住 `check_clippy_baseline.ps1` 的软通过（TASK-003），预估 0.5h。** 理由：一个会把编译失败读成"全绿"的门，比没有门更危险，因为它会让后面每一次放水都看起来合法。**这是现在的第一件事。**
+3. **P1 — T0.7 补齐可离线验证的闭环（TASK-004），预估 3h。** 理由：这是唯一一个"引擎级正确性缺陷"被记成完成的地方，而 T0.5 已经用实锤证明它还没解决。它同时是 TASK-006（老板已批的重脱壳）的前置。
+
+老板已批但需排队的两件实弹工作：TASK-006（重脱壳根治会话绑定，等 TASK-004）、TASK-007（GVM 定向 dump 一格，建议先做 TASK-005 复核）。
 
 ## 下一步
 
-我建议先做第 1 项。理由：它是唯一一个"不做就可能全丢"的风险，而且做完之后 CI 才能重新变成可信信号，后面所有验收才有依据。
+TASK-003 → TASK-004 → TASK-006；TASK-005 可与之并行（纯离线），完成后再开 TASK-007。
+推送时机由老板定；推送前建议补跑 `cargo deny check`（本机有 `cargo-deny 0.20.2`，本次未跑）。

@@ -1,8 +1,11 @@
 [package]
 name = "xx21_monitor"
-version = "0.1.0"
-edition = "2021"
-publish = false
+version.workspace = true
+edition.workspace = true
+description = "XX-21 experiment monitor: page-level observation of a loaded candidate"
+repository.workspace = true
+license.workspace = true
+publish.workspace = true
 
 [lib]
 name = "xx21_monitor"

@@ -1,8 +1,11 @@
 [package]
 name = "host_loader"
-version = "0.1.0"
-edition = "2021"
-publish = false
+version.workspace = true
+edition.workspace = true
+description = "XX-21 experiment host: loads a candidate DLL and drives its exports"
+repository.workspace = true
+license.workspace = true
+publish.workspace = true
 
 [lib]
 name = "host_loader"

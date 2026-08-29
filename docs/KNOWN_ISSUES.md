@@ -55,13 +55,32 @@ CI `windows-quality` 是第一个 job，fmt 是第一步 → 红着的时候推�
 也就是 **CI 的 fmt job 在提交的树上本来就是红的**。已单独成一个 `style:` 提交（`d9617f5`），与功能改动分开。
 **仍未查证**：这 31 个文件的格式债是哪个提交引入的、CI 实际红了多久 —— 本机无 `gh`，我没看到任何一次真实 CI run 结果。
 
-### G-4 提交时把构建产物 `veh_probe.obj` 带进了仓库 [已验证，已纠正]
-
-`lab/runtime/veh_probe/` 里有一个在树内编译的 `.c` 探针，它的 `veh_probe.obj`（11 KB 构建产物）在
+### G-4 提交时把构建产物 `veh_probe.obj` 带进了仓库 [已验证，已纠正]`lab/runtime/veh_probe/` 里有一个在树内编译的 `.c` 探针，它的 `veh_probe.obj`（11 KB 构建产物）在
 `cc8d12a` 里随 `git add -- lab/runtime` 一起进了仓库，违反 `ARTIFACT_POLICY.md`。
 **怎么办**：已在 `855fc23` 用 `git rm --cached` 取消跟踪（**没有 `--amend`**，让这个错误留在历史里可见），
 并给 `.gitignore` 补上 `*.obj` / `*.lib` / `*.exp`。文件本身留在磁盘上。
 **教训**：`git add -- <目录>` 会把目录里所有未被忽略的文件都带上。加目录前先 `git status --short <目录>` 看一遍。
+
+### G-5 `verify_workspace_hygiene.ps1` 在本机永久红，不能当推送前自检 [已验证]
+
+脚本 exit 1、`"status": "FAIL"`：509 forbidden artifacts / 3 cache directories / 138 git-dirty。
+**但这不代表 CI 红**。逐个核查过：**509 个全部是未跟踪的本机文件** —— `target/` 418 个、`lab/xx21*` 实弹证据 73 个、
+`tools/__pycache__` 14 个，加 `build_release.log`、`pin.log`、`crates/cli/gto_launcher/` 下的 `snapshot.bin`。
+仓库里唯一被跟踪的二进制是 `crates/packers/themida/src/oep/fixtures/` 下 8 个 `.bin`，正是政策允许的位置。
+CI 是 fresh checkout 且 `CARGO_TARGET_DIR` 指向仓库外，这些都不会存在 → **[推断] CI 上应为绿**。
+**坑在哪**：这道门在本机永远红，所以它**无法**用来做推送前的本地自检。我在接管过程中被它误导过两次 ——
+第一次把输出管进 `tail` 后读了 `tail` 的退出码，误报"exit 0"；第二次看到 FAIL 又差点误报"CI 红"。
+**怎么办**：本地跑它时只看 `counts` 里的 `fixture_manifest_violations` / `oversized_fixtures` / `unmanifested_fixtures` /
+`checker_errors`（这四项与本机杂物无关，当前都是 0），忽略 `forbidden_artifacts` / `cache_directories` / `git_dirty`。
+读退出码时不要接管道。
+
+### G-6 那 1.3 GB 实弹证据不该躺在仓库工作区里 [已验证，未处理]
+
+`lab/xx21b_resume/`（1.1 GB，115 文件）、`lab/xx21b_run_ui/`（145 MB）、`lab/xx21_s4/`（31 MB）、
+`lab/xx21b_run/`（30 MB）、`lab/xx21b_matrix/`（7.3 MB）都是未跟踪的实弹证据。
+按 `ARTIFACT_POLICY.md` 它们属于内容寻址 vault（`D:/MidaVault/lab/evidence/`），不属于仓库工作区。
+**为什么还在这**：不知道，接管前就在。**没动的原因**：搬移证据是有风险的操作（万一 vault 里没有副本就成了删除），
+且不属于任何已批工单。**怎么办**：需要先确认 vault 里已有副本，再决定搬或删。这件事要老板或熟悉 vault 布局的会话来定。
 
 ### G-3 `cargo fix` 会误删测试依赖的重导出 [已验证，已绕过]
 
