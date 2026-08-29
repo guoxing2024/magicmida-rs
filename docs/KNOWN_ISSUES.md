@@ -38,13 +38,14 @@ Git Bash 用 heredoc/`printf` 生成的 `.cmd` 是 LF 行尾，cmd.exe 会错解
 
 ## 门禁类
 
-### G-1 `tools/check_clippy_baseline.ps1` 会把编译失败读成"全绿" [已验证，R1 修复被打回]
+### G-1 `tools/check_clippy_baseline.ps1` 会把编译失败读成"全绿" [已验证，**已修（R2）**]
 
 脚本第 44-50 行拿到 `$LASTEXITCODE` 后只打印一句 `NOTE: cargo clippy exited $code (deny-level lint present)` 就继续，然后只比较各 lint 的警告计数。
 clippy 因任何原因（链接失败、语法错误、环境缺失）没跑起来时，警告计数全为 0，全部 ≤ 基线 → 打印 `OK: clippy warn baseline holds` 并 exit 0。
 本次实测复现：无 MSVC 环境下 clippy exit 101、0 条警告，脚本仍然报 OK。
 **当初为什么这么做**：clippy 在 deny-level lint 命中时确实会非零退出，而这时仍需要解析警告 —— 意图正确，但没有区分"lint 失败"和"根本没跑起来"。
-**R1 进展（2026-08-29）**：worker 交付的第 1 版已堵住**链接失败**路径（code=null 的 error → exit 3，总指挥亲测），但**E 前缀 rustc 编译错误（E0308 等）仍被放行 exit 0** —— 总指挥注入类型错误实测坐实，工单打回。其判据"deny 命中必然带 code"只对链接失败成立。返工要求见 `tickets/TASK-003.md` 文末「第 1 轮打回」，打回记录 `runs/20260829-TASK-003-REJECT-1.md`。
+**修复史**：R1 用「有无 lint code」分类，堵住了链接失败（code=null）但漏了 E 前缀编译错误（E0308 被"有 code"判成 deny 命中放行，总指挥注入探针实测 exit 0，打回）。R2 改为按 code 三分：无 code → 编译/链接失败；`clippy::` 前缀 → deny 命中放行；其他（`E` 前缀、rustc lint 名）→ 编译失败。**2026-08-29 总指挥亲自复跑四条验收全过**（链接失败 exit 3 / E0308+E0277 注入 exit 3 / 镜像基线 OK exit 0 / deny 注入不误杀 exit 0）。附带修复：warn 计数循环复用 `$code` 变量覆盖 clippy 退出码的隐患（改名 `$lintCode`）。
+**残余注意**：与 TASK-008 的基线清还联动——门禁现在是真的，基线数字必须保持真实（见 G-7）。
 
 ### G-2 `cargo fmt --all -- --check` 曾红 216 处 [已修，归因已纠正]
 

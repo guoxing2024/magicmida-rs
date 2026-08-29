@@ -19,11 +19,11 @@ Windows PE 脱壳研究平台（Rust，221k 行，11 个 crate）。把受保护
 
 ## 最要紧的一件事
 
-**TASK-003 返工 R2：`tools/check_clippy_baseline.ps1` 第 1 轮修复被打回**——总指挥注入 E0308 编译错误实测仍被判成基线通过 exit 0（打回记录 `runs/20260829-TASK-003-REJECT-1.md`，返工要求在工单文末）。
-**新增推送前置：TASK-008 清还 clippy 基线漂移**——WO-23 基线门在 HEAD 上是红的（实际 354 > 基线 349，见 `KNOWN_ISSUES.md` G-7），推送前必须完成。
+**TASK-003 已完成（R2，2026-08-29）**：`check_clippy_baseline.ps1` 软通过已堵死——按 code 三分（无 code→失败 / `clippy::`→deny 放行 / 其他→失败），四条验收由总指挥亲自复跑全过（链接失败 exit 3 / E0308 注入 exit 3 / 镜像基线 exit 0 / deny 不误杀 exit 0）。
+**当前进行中：TASK-008 清还 clippy 基线漂移**（worker 施工中，警告已从 354 降到 340，剩 manual_saturating_arithmetic 与 unnecessary_map_or 两项）——完成后 WO-23 门禁对真基线回绿，是推送前置。
 （接管时的头号风险"两天成果未提交 + fmt 红 216 处"已解决：10 个本地提交，fmt exit 0，**推送按老板裁定停在本地**，等他逐次确认。）
 
-工单顺序建议：TASK-003 R2 → TASK-004 → TASK-006；TASK-008 可与 R2 并行（文件不相交）；TASK-005 纯离线可并行，完成后再开 TASK-007。
+工单顺序建议：TASK-008 收尾验收 → TASK-004 → TASK-006；TASK-005 纯离线可并行，完成后再开 TASK-007。
 
 ## 30 秒把它跑起来
 
