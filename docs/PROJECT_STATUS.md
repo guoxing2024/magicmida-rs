@@ -106,6 +106,7 @@
 5. **P1 — TASK-009：修 dump 重建缺陷 A（fail-open）。** TASK-006 实弹验收（2026-08-29）发现重脱壳候选 `bb5ee568` 启动即 AV：`.rdata 0x1137d0` 槽被固化 `0x1401681d1`（指向自身 .pdata，NX），启动期 `call [0x1137d0]` 跳进去；管线在 IAT 重建不完整（`Unresolved=74`）时仍打印 `[GOOD] Candidate written`。缺陷不修，TASK-006/T0.5 无法复跑。归档 `runs/20260829-TASK-006.md`（四项关键声明总指挥字节级亲验坐实）。
 
 老板已批但需排队的实弹工作：TASK-006 复跑（等 TASK-009）、TASK-007（GVM 定向 dump 一格，建议先做 TASK-005 复核）。
+**TASK-006R 执行（2026-08-29）：BLOCKED（验证点不可达）**——构建/身份/ASLR 三关 PASS，重脱壳 9/9 次在本会话 text-poll AV 风暴不收敛（debuggee image_base 恒 0x7ff799fc0000 ≠ 上次 0x7ff6c0c60000），dump 从未到达，三个 TASK-009 证据点 0 命中、无产物；路径 A/B 均未到达（非修复失败，是路线阻塞）。T0.5 继续 BLOCKED。归档 `runs/20260829-TASK-006R.md`。
 
 ## 下一步
 

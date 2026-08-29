@@ -15,9 +15,10 @@
 | [TASK-005](../tickets/TASK-005.md) | P1 | GVM Phase 1：`0x8c000` 区归属矛盾复核 | ✅ **完成**（2026-08-29，定级 **(b)**：0x8c4c0 静态存在但 trace 未激活，"216K+ trace 实证"标注错误降级为静态推断；归档 [runs/20260829-TASK-005.md](../runs/20260829-TASK-005.md)；复算数字由总指挥亲跑复现一致） | qa | 复算脚本给出唯一结论并自证口径 |
 | [TASK-006](../tickets/TASK-006.md) | P1 | 原版宿主重脱壳，根治会话绑定（解开 T0.5） | ⛔ **BLOCKED**（2026-08-29，归档 [runs/20260829-TASK-006.md](../runs/20260829-TASK-006.md)；重脱壳候选 `bb5ee568` 启动即 AV，根因 = dump 重建缺陷 A + 会话绑定残留 B，四项关键声明总指挥亲验坐实；实弹计 1 格 XC-XXI-B 2/4） | developer | 新宿主 S3 load_no_crash 10/10 隔离运行 |
 | [TASK-009](../tickets/TASK-009.md) | P1 | 修 dump 重建缺陷 A：不可解析运行时指针固化进只读节（fail-open） | ✅ **完成**（2026-08-29，归档 [runs/20260829-TASK-009.md](../runs/20260829-TASK-009.md)；恰 3 授权文件 +352/-0，三条验收与两个判别力探针由总指挥亲自复跑全过；修复 = 兜底清零 + fail-closed 组合） | developer | `cargo test -p mida-pe --lib --offline` 全绿含缺陷捕获用例 |
-| [TASK-006R](../tickets/TASK-006R.md) | P1 | TASK-006 复跑：实弹验证缺陷 A 修复（构建核验→重脱壳→路径 A/B 二分；fail-closed 拒绝出产物也是合法终态） | 📋 待领取（老板已确认 1 格，XC-XXI-B 2/4→3/4；前置 TASK-009 ✅） | developer | 构建核验双字符串命中 + 三个 TASK-009 证据点日志命中 |
+| [TASK-006R](../tickets/TASK-006R.md) | P1 | TASK-006 复跑：实弹验证缺陷 A 修复（构建核验→重脱壳→路径 A/B 二分；fail-closed 拒绝出产物也是合法终态） | ⛔ **BLOCKED（执行完毕，验证点不可达）**（2026-08-29，归档 [runs/20260829-TASK-006R.md](../runs/20260829-TASK-006R.md)；构建/身份/ASLR 基线三关 PASS，但重脱壳 9/9 次 text-poll AV 风暴不收敛，dump 从未到达，三个 TASK-009 证据点 0 命中、无产物；路径 A/B 均未到达；实弹计 1 格 XC-XXI-B 2/4→3/4） | developer | 构建核验双字符串命中 + 身份核验 PASS + 重脱壳完整日志（9 次尝试全风暴） |
 | [TASK-007](../tickets/TASK-007.md) | P1 | GVM Phase 1 定向 dump 实弹（账本 GVM 1/8） | 📋 待领取（开跑前须先交"写定五项"）；授权已批 D-012 | developer | `0x184eb6` 处字节非全零 |
 | [TASK-008](../tickets/TASK-008.md) | P1 | 清还 clippy 基线漂移（10 个机械位点，推送前必做） | ✅ **完成**（2026-08-29，归档 [runs/20260829-TASK-008.md](../runs/20260829-TASK-008.md)；三条验收由总指挥亲自复跑全过，基线 349→337 只降不升） | developer | 基线脚本 exit 0 + `TOTAL=337` |
+| [TASK-010](../tickets/TASK-010.md) | P1 | 调查 C-6：重脱壳 text-poll AV 风暴与 debuggee 基址分配差异的因果链（**只读，零实弹**） | 📋 待领取（TASK-006R 收口裁决：调查优先于继续烧格；结论决定路线 a/b/c） | qa | ntdll+0x160bd8 定性 + 基址漂移机制清单 + 最终定性 (a)-(d) |
 
 ## 老板已裁定（2026-08-29）
 

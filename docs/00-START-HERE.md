@@ -20,12 +20,13 @@ Windows PE 脱壳研究平台（Rust，221k 行，11 个 crate）。把受保护
 ## 最要紧的一件事
 
 **TASK-009 已完成（2026-08-29，缺陷 A 离线级修复）**：dump 重建 fail-open 已堵——兜底清零（`zero_fill_iat_region`，IAT 未重建槽 honest hole）+ fail-closed 门（存在直接 call 指向不可解析槽 → 拒绝写出，`[GOOD]` 不再打印）。恰 3 授权文件 +352/-0，三条验收与两个判别力探针由总指挥亲自复跑全过（见 `runs/20260829-TASK-009.md`）。**注意：修复验证级别 = 离线**；`bb5ee568` 实弹替换验证留待 TASK-006 复跑。
-**下一票：TASK-006R**（TASK-006 复跑：实弹验证缺陷 A 修复，路径 A/B 二分；fail-closed 拒绝出产物也是合法终态）——老板已确认 1 格（XC-XXI-B 2/4→3/4），前置 TASK-009 ✅，工单 `tickets/TASK-006R.md` 已派发。
+**下一票：TASK-010**（只读调查 C-6：重脱壳 text-poll AV 风暴与 debuggee 基址分配差异的因果链，**零实弹**；结论决定后续走"重启后重试"还是"收敛策略/引擎修复"工单）——工单 `tickets/TASK-010.md` 已写好待派。
+**TASK-006R 执行结果（2026-08-29）：BLOCKED（验证点不可达）**——构建核验/身份核验/ASLR 基线三关全过，但重脱壳 9/9 次在本会话 text-poll 阶段全部陷入 ntdll 内部 AV 风暴（exc=0x7ffa95400bd8，debuggee image_base 恒为 0x7ff799fc0000 ≠ 上次 0x7ff6c0c60000），`.text` 永不 stable，dump 阶段从未到达：`TASK-009 zero-filled IAT region` / `TASK-009 fail-closed` / `[GOOD] Candidate written` 三个证据点全部 0 命中，无产物。路径 A/B 均未到达（不是修复失败，是路线阻塞）。见 `runs/20260829-TASK-006R.md`。
 **TASK-005 已完成（定级 (b)）**：0x8c4c0 静态存在但 trace 未激活，"216K+ trace 实证"标注作废、降级为静态推断；主链 0x8f099→0x8f374→0x9150d 不受影响，TASK-007 的 dump 目标理由仍成立（GVM 仍 0/8）。
 **流程新规（P-4）**：产物固化类工单必须含"当场存活探针"——产物写完立即跑一次，非 0/259 即阻塞上报。
 （推送按老板裁定停在本地，等他逐次确认；推送前建议补跑 `cargo deny check advisories`。）
 
-工单顺序（**串行派发，同一时间只派一单**——D-014）：TASK-006 复跑 → T0.5 续跑 → TASK-007。TASK-005/TASK-009 已完成。
+工单顺序（**串行派发，同一时间只派一单**——D-014）：TASK-010（只读调查）→ 视结论定下一单（重启后重试实弹 / 收敛策略 / 引擎修复）。TASK-005/TASK-009 已完成；TASK-006R 已收口（BLOCKED，验证点不可达，实弹 3/4）。
 
 ## 30 秒把它跑起来
 
