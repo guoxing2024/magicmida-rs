@@ -7,7 +7,7 @@
 
 这项目是**活的**（654 次提交，2801 个测试全绿），
 本次接管已把最要紧的风险解掉：**两天的在飞成果已分 8 个提交落到本地 git，`cargo fmt` 从红 216 处变为 0。推送按老板裁定停在本地，等他逐次确认。**
-下一件最要紧的事是 **TASK-008 收尾**（清还 clippy 基线漂移；worker 施工中，警告已从 354 降到 340）——完成后 WO-23 门禁对真基线回绿，是推送前置。
+下一件最要紧的事是 **TASK-004**（T0.7 会话绑定修复的可离线闭环）——它同时是 TASK-006（老板已批的重脱壳）的前置。
 **注意：WO-23 基线门在 HEAD 上是红的**（基线漂移，见 KNOWN_ISSUES G-7 / TASK-008）——推送前必须清还，否则 CI clippy 必红。
 
 ## 存活状态 [已验证]
@@ -21,7 +21,7 @@
 | `cargo fmt --all -- --check` | ✅ exit 0（接管时是红 216 处） | 见 `runs/20260829-TASK-001.md` |
 | clippy 门禁 1（`--all-targets -D dbg_macro`） | ✅ exit 0 | — |
 | clippy 门禁 2（`--lib --bins -D unwrap_used/expect_used/manual_let_else`） | ✅ exit 0 | — |
-| **clippy 门禁 3（WO-23 基线门 `check_clippy_baseline.ps1`）** | ❌ **exit 1（基线漂移：实际 354 > 基线 349，另有 3 条 lint 缺表）** | 2026-08-29 实测，见 KNOWN_ISSUES G-7 / TASK-008；修复中 |
+| **clippy 门禁 3（WO-23 基线门 `check_clippy_baseline.ps1`）** | ✅ **exit 0（TOTAL=337）** | TASK-008 清还漂移 + TASK-003 R2 修软通过，均于 2026-08-29 验收（总指挥亲测）；详见 KNOWN_ISSUES G-1/G-7 |
 | 硬编码门禁 | ✅ `HARD-CODING GATE PASS` | `python tools/_hardcode_scan.py --gate` |
 | `cargo check --workspace --tests` | ✅ exit 0 | — |
 | 依赖锁定 | ✅ Cargo.lock 81 包，`cargo-deny 0.20.2` 本机可用 | `deny.toml` |
@@ -101,7 +101,8 @@
 
 1. ~~P0 — 落地在飞的工作区~~ **已完成**（2026-08-29，8 个本地提交；推送按老板裁定 D-010 停在本地）。
 2. ~~P0 — TASK-003：堵住 `check_clippy_baseline.ps1` 的软通过~~ **已完成 R2**（2026-08-29，四条验收由总指挥亲自复跑全过：链接失败 exit 3 / E0308 注入 exit 3 / 镜像基线 exit 0 / deny 不误杀 exit 0；归档 `runs/20260829-TASK-003-R2.md`）。
-3. **P1 — 清还 clippy 基线漂移（TASK-008，推送前必做）。** 2026-08-29 实测 HEAD 实际 warn=354 > 基线 349，WO-23 门禁在本地就是红的（G-7）。10 个机械位点已定位到 file:line。**worker 施工中**（2026-08-29 晚，警告已降到 340，剩 manual_saturating_arithmetic 与 unnecessary_map_or 两项），完成后总指挥验收。
+3. ~~P1 — TASK-008：清还 clippy 基线漂移~~ **已完成**（2026-08-29，10 个机械位点最小修复，基线 349→337 只降不升；三条验收由总指挥亲自复跑全过：门禁 exit 0 / 全量测试 2801 passed 0 failed / fmt exit 0；归档 `runs/20260829-TASK-008.md`）。
+4. **P1 — T0.7 补齐可离线验证的闭环（TASK-004），预估 3h。** 理由：这是唯一一个"引擎级正确性缺陷"被记成完成的地方，而 T0.5 已经用实锤证明它还没解决。它同时是 TASK-006（老板已批的重脱壳）的前置。
 4. **P1 — T0.7 补齐可离线验证的闭环（TASK-004），预估 3h。** 理由：这是唯一一个"引擎级正确性缺陷"被记成完成的地方，而 T0.5 已经用实锤证明它还没解决。它同时是 TASK-006（老板已批的重脱壳）的前置。
 
 老板已批但需排队的两件实弹工作：TASK-006（重脱壳根治会话绑定，等 TASK-004）、TASK-007（GVM 定向 dump 一格，建议先做 TASK-005 复核）。

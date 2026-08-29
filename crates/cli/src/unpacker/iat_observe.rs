@@ -302,7 +302,7 @@ pub fn iat_observe(
                 // hint/name RVA: read the name at int_val (the IMAGE_IMPORT_BY_NAME
                 // struct starts with a hint u16 then the name).
                 let mut hdr = [0u8; 2];
-                let _ = read_at(image_base + int_val as u64, &mut hdr);
+                let _ = read_at(image_base + int_val, &mut hdr);
                 let name_rva_import = int_val as u32 + 2;
                 read_cstring_at(&read_at, image_base, name_rva_import, 128).unwrap_or_default()
             };

@@ -696,9 +696,8 @@ impl Drop for WalkerSessionMemory {
         if let Some(h) = self.target {
             // SAFETY: same handle semantics as cleanup() — kernel32
             // VirtualFreeEx on a handle we captured at allocate time.
-            let saved = self.cleanup(h);
+            self.cleanup(h);
             self.installed = false;
-            let _ = saved;
         } else {
             self.installed = false;
         }

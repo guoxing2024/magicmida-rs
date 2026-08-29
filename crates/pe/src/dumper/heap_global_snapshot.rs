@@ -403,19 +403,18 @@ pub struct PreTruncParentAuthorityEvidence {
 /// - same key + DIFFERENT bytes -> fail-closed (never overwrite the first);
 /// - different capture identity at the same old_base -> SEPARATE entry
 ///   (never merged by base alone).
+type PreTruncParentRow = (
+    std::sync::Arc<[u8]>,
+    CaptureExtentKind,
+    RegionProvenance,
+    CapturePath,
+);
+
 #[derive(Debug, Clone, Default)]
 pub struct PreTruncParentAuthorityStore {
     /// key -> (bytes, extent, provenance, path). ONE byte copy per parent
     /// identity (Arc-shared) — bindings and Path A hold no second Vec<u8>.
-    parents: std::collections::BTreeMap<
-        PreTruncParentAuthorityKey,
-        (
-            std::sync::Arc<[u8]>,
-            CaptureExtentKind,
-            RegionProvenance,
-            CapturePath,
-        ),
-    >,
+    parents: std::collections::BTreeMap<PreTruncParentAuthorityKey, PreTruncParentRow>,
     /// Emitted child bindings (insertion order). Each holds only the key.
     bindings: Vec<PreTruncParentAuthorityEvidence>,
 }

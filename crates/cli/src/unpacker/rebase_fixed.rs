@@ -58,7 +58,7 @@ fn zero_uninitialized_sections(data: &mut [u8], pe: &PeHeader) {
 /// `buf` fall in `[old_base, old_base + image_size)`.
 pub fn count_old_base_refs(buf: &[u8], old_base: u64, image_size: u64, is_64bit: bool) -> usize {
     let ptr = if is_64bit { 8usize } else { 4usize };
-    let end = old_base.checked_add(image_size).unwrap_or(u64::MAX);
+    let end = old_base.saturating_add(image_size);
     let mut count = 0usize;
     let mut i = 0usize;
     while i + ptr <= buf.len() {

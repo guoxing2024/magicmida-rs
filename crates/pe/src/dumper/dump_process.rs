@@ -871,7 +871,7 @@ pub fn dump_process_with_report(
             );
             None
         } else {
-            let export_va = opts.image_base as u64 + export_dir.virtual_address as u64;
+            let export_va = opts.image_base + export_dir.virtual_address as u64;
             match super::helpers::alloc_capped(
                 export_size,
                 super::helpers::MAX_EXPORT_DIRECTORY_BYTES,
@@ -1841,7 +1841,7 @@ pub fn dump_process_with_report(
     }
     // Zero dangling inter-object pointers that fall outside captured ranges so
     // post-CRT restore does not hand ntdll stale heap addresses (RtlpFindEntry).
-    let image_end = (opts.image_base as u64).saturating_add(pe.size_of_image() as u64);
+    let image_end = opts.image_base.saturating_add(pe.size_of_image() as u64);
     if stage_plan.scrub_uncaptured_heap_pointers {
         super::raw_slab_coherence::apply_recorded_transform(
             &mut heap_globals,
@@ -1851,7 +1851,7 @@ pub fn dump_process_with_report(
                 super::heap_global_snapshot::scrub_uncaptured_heap_pointers(
                     &mut containers,
                     heap_globals,
-                    opts.image_base as u64,
+                    opts.image_base,
                     image_end,
                 );
             },
@@ -1975,10 +1975,11 @@ pub fn dump_process_with_report(
         // NULL / small-tag range.
         avoid.push((0, super::runtime_rebase::SMALL_TAG_CEILING));
         // Source image span.
-        let image_span = (opts.image_base as u64)
+        let image_span = opts
+            .image_base
             .checked_add(pe.size_of_image() as u64)
             .unwrap_or(u64::MAX);
-        avoid.push((opts.image_base as u64, image_span));
+        avoid.push((opts.image_base, image_span));
         // Raw heap slab span(s) + raw containers + observed heap globals.
         if let Some(raw) = raw_capture.as_ref() {
             for s in &raw.slabs {

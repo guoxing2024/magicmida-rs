@@ -561,8 +561,8 @@ pub fn run_coverage_observation(
             let due = match triggers[trigger_idx] {
                 "t0" => scans.is_empty(),
                 "window" => win.is_some() && scans.len() == 1,
-                "+60s" => win.map_or(false, |w| t_ms >= w + 60_000) && scans.len() <= 2,
-                "+180s" => win.map_or(false, |w| t_ms >= w + 180_000) && scans.len() <= 3,
+                "+60s" => win.is_some_and(|w| t_ms >= w + 60_000) && scans.len() <= 2,
+                "+180s" => win.is_some_and(|w| t_ms >= w + 180_000) && scans.len() <= 3,
                 _ => false,
             };
             if due {

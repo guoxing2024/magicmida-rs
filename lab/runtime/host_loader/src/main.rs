@@ -57,6 +57,6 @@ fn main() {
     // event-object plumbing and keeps the process trivially killable.
     loop {
         // SAFETY: Sleep takes a u32 ms value.
-        unsafe { Sleep(3600_000) }; // 1 hour per tick; loop renews
+        unsafe { Sleep(3_600_000) }; // 1 hour per tick; loop renews
     }
 }

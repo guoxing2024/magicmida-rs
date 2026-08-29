@@ -476,7 +476,7 @@ impl WindowsDebugger {
     fn apply_debug_registers_all(
         &self,
         desired: &[Option<HwBreakpoint>; 4],
-        rollback: &[Option<HwBreakpoint>; 4],
+        _rollback: &[Option<HwBreakpoint>; 4],
     ) -> Result<(), CoreError> {
         let thread_ids: Vec<u32> = self.threads.keys().copied().collect();
         let mut applied = Vec::with_capacity(thread_ids.len());

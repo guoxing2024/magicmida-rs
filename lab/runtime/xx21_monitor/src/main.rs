@@ -133,8 +133,8 @@ fn snapshot(base: u64, rva: usize, size: usize) -> Snap {
 }
 
 fn main() {
-    let _ = env::set_var("NO_BYPASS", "1");
-    let _ = env::set_var("MIDA_GTO_NO_BYPASS", "1");
+    env::set_var("NO_BYPASS", "1");
+    env::set_var("MIDA_GTO_NO_BYPASS", "1");
 
     let dll = env::args().nth(1).unwrap_or_else(|| {
         eprintln!("usage: xx21_monitor.exe <core.dll> <outdir>");
@@ -178,7 +178,7 @@ fn main() {
     if let Some(p) = ver_ptr {
         let f: extern "system" fn() -> u64 = unsafe { std::mem::transmute(p as usize) };
         for _ in 0..10 {
-            let r = unsafe { f() };
+            let r = f();
             returns.push(format!("0x{r:X}"));
         }
     }

@@ -83,14 +83,14 @@ CI 是 fresh checkout 且 `CARGO_TARGET_DIR` 指向仓库外，这些都不会�
 **为什么还在这**：不知道，接管前就在。**没动的原因**：搬移证据是有风险的操作（万一 vault 里没有副本就成了删除），
 且不属于任何已批工单。**怎么办**：需要先确认 vault 里已有副本，再决定搬或删。这件事要老板或熟悉 vault 布局的会话来定。
 
-### G-7 clippy 基线自 WO-24 锁定后已漂移，HEAD 上 WO-23 门禁是红的 [已验证，TASK-008 修复中]
+### G-7 clippy 基线自 WO-24 锁定后已漂移，HEAD 上 WO-23 门禁是红的 [已验证，**已修（TASK-008）**]
 
 WO-24 于 2026-08-27（提交 `607276d`）锁定 `_clippy_baseline`（TOTAL=349）后，28 个提交（XX-8..XX-11、`exception_final.rs`、rustfmt 全局整理等）让实际 warn 计数漂到 **354**：
 5 个 lint 超基线（unnecessary_cast 18/17、manual_saturating_arithmetic 16/15、let_unit_value 4/2、type_complexity 8/7、unnecessary_map_or 14/12），3 个 lint 不在基线表（unused_variables=1、clippy::inconsistent_digit_grouping=1、unused_unsafe=1）。
 2026-08-29 总指挥在 TASK-003 验收中实测：新旧两版基线脚本同环境输出**逐字节一致、双双 exit 1**（漂移是既有债务，与 TASK-003 改动无关）；换全新 `CARGO_TARGET_DIR` 复现一致，排除缓存污染。
-**含义**：当前 HEAD 若推送，CI `windows-clippy` job 必红。之前 PROJECT_STATUS 写"五道门禁本机全过"是**口径错误**——那五道是分阶段 `-D` 门，WO-23 基线门从未在本机对真基线跑过。
+**修复（TASK-008，2026-08-29）**：10 个机械位点全部最小修复（同型 cast 删除 ×6、`saturating_add`、`is_some_and` ×2、type alias、unit let 绑定清理 ×4、unused 清理 ×2、数字分组统一）；三条验收由总指挥亲自复跑全过（门禁 exit 0 / 全量测试 2801 passed 0 failed / fmt exit 0）。基线同批只降不升（349→337）。
 **当初为什么会漂**：基线政策要求"修代码降计数时同 commit 降基线"，但没有反向约束——加代码升计数时没人复查基线，28 个提交就这么滑过去了。
-**怎么办**：TASK-008（10 个机械修复位点已定位到 file:line）。推送前必须完成。
+**遗留提醒**：manual_range_contains 9→8、unused_imports 4→0 两行下调是既有向下漂移（非 TASK-008 位点触发），worker 一并下调使门禁自洽；若要基线只记录修复位点可还原这两行（门禁仍绿）。type_complexity 的 `iat_observe.rs:169`/`runtime_loader.rs:2309` 候选因 `&dyn Fn` alias 需生命周期参数（E0373）超出最小机械修复范围被跳过，达标即可，未清的 7 个 continue 存在于基线内。
 
 ### G-3 `cargo fix` 会误删测试依赖的重导出 [已验证，已绕过]
 
