@@ -1366,6 +1366,9 @@ mod tests {
             .as_ref()
             .and_then(|r| r.slots.first())
             .expect("slot 0");
-        assert_eq!(slot0.resolution_source.as_deref(), Some("static_corroborated"));
+        assert_eq!(
+            slot0.resolution_source.as_deref(),
+            Some("static_corroborated")
+        );
     }
 }

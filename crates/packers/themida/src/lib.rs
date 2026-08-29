@@ -36,15 +36,15 @@ pub mod trace_imports;
 pub mod version;
 
 // Re-export the primary types so callers can do `use mida_packers_themida::…`
-#[cfg(target_arch = "x86")]
-pub use antiantidebug::{
-    get_nt_qip_syscall_number, handle_kifast_syscall, install_kifast_syscall_hook,
-};
 pub use antiantidebug::{
     current_mode, handle_check_remote_debugger_present, handle_nt_query_information_process,
     handle_nt_query_object, handle_nt_set_information_thread, handle_output_debug_string,
     handle_query_performance_counter, handle_rdtsc, initialize_mode, inject_scylla_hide, set_mode,
     AntidebugMode, DebuggerDriverBlacklist, ScyllaHideConfig, TimingProbeState,
+};
+#[cfg(target_arch = "x86")]
+pub use antiantidebug::{
+    get_nt_qip_syscall_number, handle_kifast_syscall, install_kifast_syscall_hook,
 };
 pub use binaries::{expected_hook_hash, expected_injector_hash, verify_sha256};
 pub use common::ThemidaState;
@@ -62,9 +62,10 @@ pub use iat::{
 pub use init::{init_pe_details, locate_themida_section, themida_pe_info_basic, ThemidaPeInfo};
 pub use oep::{
     cookie_complement_from_security_init_xrefs, decode_msvc_oep_wrapper, encode_msvc_oep_wrapper,
-    find_cookie_complement_site, find_real_oep_by_scanning, find_real_oep_in_bytes,
-    find_real_oep_by_scanning_with_backtrack, ftrace_common_main_hint, ftrace_enter_preserve_common_main, handle_tls_callbacks,
-    is_oep_virtualized, is_scrt_common_main_seh_bytes, is_tls_or_dynamic_init_helper_bytes,
+    find_cookie_complement_site, find_real_oep_by_scanning,
+    find_real_oep_by_scanning_with_backtrack, find_real_oep_in_bytes, ftrace_common_main_hint,
+    ftrace_enter_preserve_common_main, handle_tls_callbacks, is_oep_virtualized,
+    is_scrt_common_main_seh_bytes, is_tls_or_dynamic_init_helper_bytes,
     reject_if_tls_helper_as_common_main, require_full_section_read,
     resolve_cookie_site_via_security_init_xrefs, resolve_msvc_crt_targets,
     resolve_msvc_crt_targets_from_process, resolve_msvc_crt_targets_with_sections,

@@ -234,48 +234,46 @@ pub fn find_real_oep_by_scanning_with_backtrack(
 
         if is_prologue {
             // XX-11-B (#17): backtrack from the scan hit to the start of the
-                // containing function prologue.  A scan hit may land inside a
-                // prologue (e.g. at `48 83 EC 58` inside a `push...; sub rsp`
-                // sequence) — writing that as EP skips the pushes/sub and leaves
-                // the process with an 8-byte misaligned stack for its whole life
-                // (XX-10: wininet cold-start SSE `movdqa` AV).  Backtrack only
-                // when the boundary is provable; otherwise keep the hit + WARN.
-                let (final_start, backtrack) = backtrack_to_function_start(
-                    &text_buf[..effective_len],
-                    i,
-                );
-                let func_addr = text_base + final_start;
-                match backtrack {
-                    BacktrackDecision::Backtracked { scan_hit, reason } => {
-                        warn!(
+            // containing function prologue.  A scan hit may land inside a
+            // prologue (e.g. at `48 83 EC 58` inside a `push...; sub rsp`
+            // sequence) — writing that as EP skips the pushes/sub and leaves
+            // the process with an 8-byte misaligned stack for its whole life
+            // (XX-10: wininet cold-start SSE `movdqa` AV).  Backtrack only
+            // when the boundary is provable; otherwise keep the hit + WARN.
+            let (final_start, backtrack) =
+                backtrack_to_function_start(&text_buf[..effective_len], i);
+            let func_addr = text_base + final_start;
+            match backtrack {
+                BacktrackDecision::Backtracked { scan_hit, reason } => {
+                    warn!(
                             scan_hit = format_args!("{scan_hit:#x}"),
                             final_oep = format_args!("{func_addr:#x}"),
                             reason,
                             "OEP scan hit was inside a function prologue; backtracked to function start"
                         );
-                    }
-                    BacktrackDecision::AlreadyStart => {
-                        info!(
-                            addr = format_args!("{func_addr:#x}"),
-                            rva = format_args!("{:#x}", final_start),
-                            "Found first function prologue in .text (already at function start)"
-                        );
-                    }
-                    BacktrackDecision::Uncertain { scan_hit } => {
-                        warn!(
+                }
+                BacktrackDecision::AlreadyStart => {
+                    info!(
+                        addr = format_args!("{func_addr:#x}"),
+                        rva = format_args!("{:#x}", final_start),
+                        "Found first function prologue in .text (already at function start)"
+                    );
+                }
+                BacktrackDecision::Uncertain { scan_hit } => {
+                    warn!(
                             scan_hit = format_args!("{scan_hit:#x}"),
                             final_oep = format_args!("{func_addr:#x}"),
                             "OEP scan hit near prologue but boundary unprovable; keeping hit (no guess)"
                         );
-                    }
                 }
-                // Record the raw scan hit (offset before backtracking) for the
-                // sidecar `scan_hit_rva` / `oep_backtrack` fields.
-                return Ok(Some(OepScanOutcome {
-                    final_oep: func_addr,
-                    scan_hit: i,
-                    backtrack,
-                }));
+            }
+            // Record the raw scan hit (offset before backtracking) for the
+            // sidecar `scan_hit_rva` / `oep_backtrack` fields.
+            return Ok(Some(OepScanOutcome {
+                final_oep: func_addr,
+                scan_hit: i,
+                backtrack,
+            }));
         }
     }
 
@@ -290,7 +288,10 @@ pub enum BacktrackDecision {
     AlreadyStart,
     /// Scan hit was inside a provable prologue; backtracked to the prologue's
     /// first byte (the real function entry point).
-    Backtracked { scan_hit: usize, reason: &'static str },
+    Backtracked {
+        scan_hit: usize,
+        reason: &'static str,
+    },
     /// No provable boundary; the scan hit is kept unchanged (conservative,
     /// never guess).  Caller should record `oep_backtrack=uncertain`.
     Uncertain { scan_hit: usize },
@@ -308,10 +309,7 @@ pub enum BacktrackDecision {
 ///
 /// Conservative: if the boundary cannot be proven, return the original hit with
 /// [`BacktrackDecision::Uncertain`] — never guess.
-pub fn backtrack_to_function_start(
-    text_buf: &[u8],
-    scan_hit: usize,
-) -> (usize, BacktrackDecision) {
+pub fn backtrack_to_function_start(text_buf: &[u8], scan_hit: usize) -> (usize, BacktrackDecision) {
     const MAX_BACKTRACK: usize = 32;
 
     // If the scan hit itself is the start of a `sub rsp, imm` (`48 83 EC` /
@@ -342,9 +340,7 @@ pub fn backtrack_to_function_start(
     let mut w = 0usize;
     while w + 3 < window.len() {
         // `48 83 EC imm8`
-        if window[w] == 0x48
-            && window.get(w + 1) == Some(&0x83)
-            && window.get(w + 2) == Some(&0xEC)
+        if window[w] == 0x48 && window.get(w + 1) == Some(&0x83) && window.get(w + 2) == Some(&0xEC)
         {
             let sub_end = w + 4;
             if sub_end <= window.len() {
@@ -927,7 +923,10 @@ mod tests {
         assert_eq!(start, 0x1010);
         assert!(matches!(
             decision,
-            BacktrackDecision::Backtracked { scan_hit: 0x1020, .. }
+            BacktrackDecision::Backtracked {
+                scan_hit: 0x1020,
+                ..
+            }
         ));
     }
 
@@ -1008,7 +1007,9 @@ mod tests {
         let mut buf = vec![0x90u8; 0x1030];
         buf[0x1000] = 0xC3;
         buf[0x1001..0x1005].copy_from_slice(&[0x0F, 0x1F, 0x40, 0x00]);
-        buf[0x1005..0x1010].copy_from_slice(&[0x66, 0x66, 0x2E, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        buf[0x1005..0x1010].copy_from_slice(&[
+            0x66, 0x66, 0x2E, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ]);
         let prologue = [
             0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x55, 0x57, 0x56, 0x53, 0x48, 0x83,
             0xEC, 0x58,
@@ -1022,7 +1023,10 @@ mod tests {
         assert_eq!(start2, 0x1010);
         assert!(matches!(
             decision2,
-            BacktrackDecision::Backtracked { scan_hit: 0x1020, .. }
+            BacktrackDecision::Backtracked {
+                scan_hit: 0x1020,
+                ..
+            }
         ));
     }
 }

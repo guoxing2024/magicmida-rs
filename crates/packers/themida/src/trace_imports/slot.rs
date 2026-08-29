@@ -303,8 +303,8 @@ pub(crate) fn trace_one_slot(
 mod tests {
     use super::*;
     use crate::init::ThemidaPeInfo;
-    use crate::version::ThemidaVersion;
     use crate::trace_imports::TRACE_LIMIT;
+    use crate::version::ThemidaVersion;
     use mida_core::CoreError;
     use std::cell::RefCell;
     use windows::Win32::{Foundation::HANDLE, System::Diagnostics::Debug::CONTEXT};
@@ -381,11 +381,7 @@ mod tests {
         fn get_thread_context(&self, _thread_id: u32) -> Result<CONTEXT, CoreError> {
             Ok(*self.context.borrow())
         }
-        fn set_thread_context(
-            &self,
-            _thread_id: u32,
-            ctx: &CONTEXT,
-        ) -> Result<(), CoreError> {
+        fn set_thread_context(&self, _thread_id: u32, ctx: &CONTEXT) -> Result<(), CoreError> {
             // Persist the RIP+TF write so the subsequent single-step context
             // read observes the redirected instruction pointer (matching the
             // real backend's SetThreadContext semantics).
@@ -439,7 +435,10 @@ mod tests {
 
         assert!(result.is_ok(), "frozen entry must bootstrap: {result:?}");
         assert_eq!(dbg.continue_calls, 0, "no continue_event on frozen entry");
-        assert_eq!(state.traced_api, REAL_API, "single-step must resolve the API");
+        assert_eq!(
+            state.traced_api, REAL_API,
+            "single-step must resolve the API"
+        );
         assert!(!state.trace_in_vm);
     }
 

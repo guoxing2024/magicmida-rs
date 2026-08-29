@@ -26,8 +26,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|a| u32::from_str_radix(a.trim_start_matches("0x"), 16))
         .transpose()?;
 
-    let (plan, meta) =
-        mida_pe::rebuild::tr_surface::build_tr_surface_plan(comps, prov, entry)?;
+    let (plan, meta) = mida_pe::rebuild::tr_surface::build_tr_surface_plan(comps, prov, entry)?;
     println!(
         "plan: {} sections | image_base={:#x} | size_of_image={:#x} | entry={:#x} (tbd={}) | deferred={:?}",
         meta.sections.len(),

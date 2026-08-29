@@ -3,7 +3,8 @@
 //!
 //! Production `.unwrap()`s are parse invariants: `i + 6 <= end` bounds the
 //! disp32 window (WO-10). Test unwraps are assertions.
-#![allow(clippy::unwrap_used)]//! terminator slots (value 0 between two non-zero slots).
+#![allow(clippy::unwrap_used)]
+//! terminator slots (value 0 between two non-zero slots).
 //!
 //! ## Why
 //!

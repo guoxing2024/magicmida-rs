@@ -3,7 +3,8 @@
 //!
 //! Production `.unwrap()`s are invariants on non-empty collected minima /
 //! required fields (WO-10). Test unwraps are assertions.
-#![allow(clippy::unwrap_used)]//!
+#![allow(clippy::unwrap_used)]
+//!
 //! Written beside the dumped PE as `{stem}.dump_snapshot.json` so runs can be
 //! compared without parsing `.boot` payload bytes. Research / quality tool only;
 //! not part of R0B acceptance and never decides dump success.

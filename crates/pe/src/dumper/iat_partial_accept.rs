@@ -233,9 +233,7 @@ pub fn evaluate_partial_accept(report: &IatRecoveryReport) -> IatPartialAcceptDe
                     observed_value: slot.observed_value,
                 });
             }
-            IatSlotStatus::Unresolved
-            | IatSlotStatus::ShortRead
-            | IatSlotStatus::InvalidModule => {
+            IatSlotStatus::Unresolved | IatSlotStatus::ShortRead | IatSlotStatus::InvalidModule => {
                 rejected_count += 1;
                 rejected_slots.push(IatRejectedSlot {
                     slot_index: slot.slot_index,
@@ -252,10 +250,8 @@ pub fn evaluate_partial_accept(report: &IatRecoveryReport) -> IatPartialAcceptDe
     let resolved_fraction_den = resolved_count.saturating_add(rejected_count);
     // Integer ceiling: num/den >= 95/100  <==>  num*100 >= den*95.
     let fraction_ok = resolved_fraction_den == 0
-        || resolved_fraction_num
-            .saturating_mul(PARTIAL_ACCEPT_MIN_RESOLVED_FRACTION_DENOMINATOR)
-            >= resolved_fraction_den
-                .saturating_mul(PARTIAL_ACCEPT_MIN_RESOLVED_FRACTION_NUMERATOR);
+        || resolved_fraction_num.saturating_mul(PARTIAL_ACCEPT_MIN_RESOLVED_FRACTION_DENOMINATOR)
+            >= resolved_fraction_den.saturating_mul(PARTIAL_ACCEPT_MIN_RESOLVED_FRACTION_NUMERATOR);
     let rejected_within_budget = rejected_count <= PARTIAL_ACCEPT_MAX_REJECTED;
 
     IatPartialAcceptDecision {
@@ -309,9 +305,7 @@ pub fn static_corroboration_candidate(
     // subset; the producer must re-verify this via call-site semantics).
     let flattened: Vec<(&String, &String)> = original_imports
         .iter()
-        .flat_map(|(module, functions)| {
-            functions.iter().map(move |function| (module, function))
-        })
+        .flat_map(|(module, functions)| functions.iter().map(move |function| (module, function)))
         .collect();
     let (candidate_module, candidate_function) = flattened.get(slot_index)?;
 
@@ -336,10 +330,7 @@ pub fn static_corroboration_candidate(
 /// This is a pure predicate over `(base, end)` ranges so it is unit-testable
 /// without process I/O.
 #[must_use]
-pub fn address_owned_by_loaded_module(
-    address: usize,
-    module_ranges: &[(usize, usize)],
-) -> bool {
+pub fn address_owned_by_loaded_module(address: usize, module_ranges: &[(usize, usize)]) -> bool {
     module_ranges
         .iter()
         .any(|&(base, end)| end > base && address >= base && address < end)
@@ -361,18 +352,12 @@ pub fn address_owned_by_loaded_module(
 /// The caller refuses static back-fill when this returns `None` — the
 /// index-based correspondence alone is never sufficient (裁决 #13 第三条腿).
 #[must_use]
-pub fn verify_call_site_semantics(
-    text: &[u8],
-    text_rva: u32,
-    slot_rva: u32,
-) -> Option<String> {
+pub fn verify_call_site_semantics(text: &[u8], text_rva: u32, slot_rva: u32) -> Option<String> {
     // FF 15 = call [rip+disp32]; FF 25 = jmp [rip+disp32]. Both are 6 bytes
     // and target the IAT slot via a RIP-relative displacement.
     for i in 0..text.len().saturating_sub(6) {
         if text[i] == 0xFF && (text[i + 1] == 0x15 || text[i + 1] == 0x25) {
-            let disp = i32::from_le_bytes(
-                text[i + 2..i + 6].try_into().unwrap_or([0u8; 4]),
-            );
+            let disp = i32::from_le_bytes(text[i + 2..i + 6].try_into().unwrap_or([0u8; 4]));
             let ip_rva = text_rva
                 .checked_add(u32::try_from(i).ok()?)?
                 .checked_add(6)?;
@@ -383,7 +368,11 @@ pub fn verify_call_site_semantics(
 
             let site_rva = ip_rva.saturating_sub(6);
             let after = &text[i + 6..text.len().min(i + 6 + 3)];
-            if after.len() >= 3 && after[0] == 0x85 && after[1] == 0xC0 && (after[2] == 0x74 || after[2] == 0x75) {
+            if after.len() >= 3
+                && after[0] == 0x85
+                && after[1] == 0xC0
+                && (after[2] == 0x74 || after[2] == 0x75)
+            {
                 // Canonical handle-check pattern: call → test eax,eax → jne/jz.
                 let a0 = after[0];
                 let a1 = after[1];
@@ -466,9 +455,9 @@ fn structural_failures(report: &IatRecoveryReport) -> Vec<String> {
             let expected_address = first
                 .slot_address
                 .checked_add(position.saturating_mul(report.slot_size) as u64);
-            let expected_rva = first.slot_rva.and_then(|rva| {
-                rva.checked_add(position.saturating_mul(report.slot_size) as u32)
-            });
+            let expected_rva = first
+                .slot_rva
+                .and_then(|rva| rva.checked_add(position.saturating_mul(report.slot_size) as u32));
             if expected_address != Some(slot.slot_address) || expected_rva != slot.slot_rva {
                 coverage_mismatch = true;
             }
@@ -687,11 +676,10 @@ mod tests {
         r.bytes_read = 8; // short read
         let d = evaluate_partial_accept(&r);
         assert!(!d.strict_complete);
-        assert!(
-            d.structural_failures
-                .iter()
-                .any(|f| f.contains("short-read"))
-        );
+        assert!(d
+            .structural_failures
+            .iter()
+            .any(|f| f.contains("short-read")));
     }
 
     #[test]
@@ -702,11 +690,10 @@ mod tests {
             slot(2, IatSlotStatus::Resolved, None),
         ]);
         let d = evaluate_partial_accept(&r);
-        assert!(
-            d.structural_failures
-                .iter()
-                .any(|f| f.contains("missing unresolved_reason"))
-        );
+        assert!(d
+            .structural_failures
+            .iter()
+            .any(|f| f.contains("missing unresolved_reason")));
     }
 
     #[test]
@@ -735,13 +722,13 @@ mod tests {
 
     #[test]
     fn static_candidate_only_module_not_found_is_eligible() {
-        let imports = vec![("kernel32.dll".to_string(), vec!["GetModuleHandleA".to_string()])];
+        let imports = vec![(
+            "kernel32.dll".to_string(),
+            vec!["GetModuleHandleA".to_string()],
+        )];
         // ModuleNotFound -> eligible.
-        let hit = static_corroboration_candidate(
-            0,
-            Some(IatUnresolvedReason::ModuleNotFound),
-            &imports,
-        );
+        let hit =
+            static_corroboration_candidate(0, Some(IatUnresolvedReason::ModuleNotFound), &imports);
         assert_eq!(
             hit,
             Some(("kernel32.dll".to_string(), "GetModuleHandleA".to_string()))
@@ -757,11 +744,7 @@ mod tests {
         );
         // ShortRead is NOT eligible.
         assert_eq!(
-            static_corroboration_candidate(
-                0,
-                Some(IatUnresolvedReason::ShortRead),
-                &imports
-            ),
+            static_corroboration_candidate(0, Some(IatUnresolvedReason::ShortRead), &imports),
             None
         );
         // Missing reason is NOT eligible.
@@ -776,25 +759,20 @@ mod tests {
             ("b.dll".to_string(), vec!["Dup".to_string()]),
         ];
         assert_eq!(
-            static_corroboration_candidate(
-                0,
-                Some(IatUnresolvedReason::ModuleNotFound),
-                &imports
-            ),
+            static_corroboration_candidate(0, Some(IatUnresolvedReason::ModuleNotFound), &imports),
             None
         );
     }
 
     #[test]
     fn static_candidate_out_of_range_is_refused() {
-        let imports = vec![("kernel32.dll".to_string(), vec!["GetModuleHandleA".to_string()])];
+        let imports = vec![(
+            "kernel32.dll".to_string(),
+            vec!["GetModuleHandleA".to_string()],
+        )];
         // slot_index 5 is past the flattened bootstrap list.
         assert_eq!(
-            static_corroboration_candidate(
-                5,
-                Some(IatUnresolvedReason::ModuleNotFound),
-                &imports
-            ),
+            static_corroboration_candidate(5, Some(IatUnresolvedReason::ModuleNotFound), &imports),
             None
         );
     }
@@ -805,11 +783,7 @@ mod tests {
         // candidate must be a named import for call-site corroboration.
         let imports = vec![("kernel32.dll".to_string(), vec!["#42".to_string()])];
         assert_eq!(
-            static_corroboration_candidate(
-                0,
-                Some(IatUnresolvedReason::ModuleNotFound),
-                &imports
-            ),
+            static_corroboration_candidate(0, Some(IatUnresolvedReason::ModuleNotFound), &imports),
             Some(("kernel32.dll".to_string(), "#42".to_string()))
         );
     }
@@ -821,14 +795,20 @@ mod tests {
         let ranges = vec![(0x7ff8_0000_0000usize, 0x7ff8_0001_0000usize)];
         assert!(address_owned_by_loaded_module(0x7ff8_0000_1234, &ranges));
         assert!(address_owned_by_loaded_module(0x7ff8_0000_0000, &ranges));
-        assert!(!address_owned_by_loaded_module(0x7ff8_0001_0000, &ranges), "end is exclusive");
+        assert!(
+            !address_owned_by_loaded_module(0x7ff8_0001_0000, &ranges),
+            "end is exclusive"
+        );
     }
 
     #[test]
     fn ownership_validator_rejects_outside_and_bad_ranges() {
         let ranges = vec![(0x7ff8_0000_0000usize, 0x7ff8_0001_0000usize)];
         assert!(!address_owned_by_loaded_module(0x7ff8_0001_1000, &ranges));
-        assert!(!address_owned_by_loaded_module(0x1000, &ranges), "low address");
+        assert!(
+            !address_owned_by_loaded_module(0x1000, &ranges),
+            "low address"
+        );
         // Degenerate/inverted ranges never own anything.
         let bad = vec![(0x5000usize, 0x4000usize)];
         assert!(!address_owned_by_loaded_module(0x4500, &bad));
@@ -840,12 +820,7 @@ mod tests {
 
     /// Build a .text buffer with an FF 15 (call [rip+disp]) at `site_off` whose
     /// target RVA is `slot_rva`, followed by `test eax,eax; jne/jz`.
-    fn text_with_call_site(
-        text_rva: u32,
-        site_off: usize,
-        slot_rva: u32,
-        branch: u8,
-    ) -> Vec<u8> {
+    fn text_with_call_site(text_rva: u32, site_off: usize, slot_rva: u32, branch: u8) -> Vec<u8> {
         let mut text = vec![0x90u8; site_off + 6 + 3];
         text[site_off] = 0xFF;
         text[site_off + 1] = 0x15;

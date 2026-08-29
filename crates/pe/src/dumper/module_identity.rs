@@ -3,7 +3,8 @@
 //!
 //! Production `.unwrap()`s are parse invariants (fixed-width slices whose
 //! bounds were just validated) (WO-10). Test unwraps are assertions.
-#![allow(clippy::unwrap_used)]//! MIDA-SERIAL-14: identity primitive for the policy gate. Bind a
+#![allow(clippy::unwrap_used)]
+//! MIDA-SERIAL-14: identity primitive for the policy gate. Bind a
 //! `DumpCapturePolicy` to a `ModuleIdentity` so sample-specific RVA policies
 //! can never silently apply to a different PE/module/version.
 //!

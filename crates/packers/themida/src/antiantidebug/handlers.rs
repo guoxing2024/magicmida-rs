@@ -407,13 +407,17 @@ impl TimingProbeState {
                 self.consecutive_suspicious += 1;
 
                 // 打开或维持补丁窗口
-                if !self.window_open && self.consecutive_suspicious <= super::timings::TIMING_PATCH_WINDOW {
+                if !self.window_open
+                    && self.consecutive_suspicious <= super::timings::TIMING_PATCH_WINDOW
+                {
                     self.window_open = true;
                     self.probes_masked_in_window = 0;
                 }
 
                 // 在窗口内，返回掩码值
-                if self.window_open && self.probes_masked_in_window < super::timings::TIMING_PATCH_WINDOW {
+                if self.window_open
+                    && self.probes_masked_in_window < super::timings::TIMING_PATCH_WINDOW
+                {
                     self.probes_masked_in_window += 1;
                     let masked = masked_delta(self.probes_masked_in_window - 1);
                     trace!(
@@ -664,8 +668,7 @@ pub fn handle_nt_query_object(
 
     info!(
         thread_id,
-        info_class,
-        "Intercepted NtQueryObject and returned STATUS_INVALID_HANDLE"
+        info_class, "Intercepted NtQueryObject and returned STATUS_INVALID_HANDLE"
     );
 
     Ok(true)
@@ -745,12 +748,12 @@ impl DebuggerDriverBlacklist {
     pub fn default() -> Self {
         Self {
             names: vec![
-                "PROCEXP152.SYS".to_string(),    // Process Explorer
+                "PROCEXP152.SYS".to_string(), // Process Explorer
                 "PROCEXP.SYS".to_string(),
-                "SYSDBG.SYS".to_string(),        // 一些调试器
+                "SYSDBG.SYS".to_string(), // 一些调试器
                 "DBGV.SYS".to_string(),
-                "SYSER.SYS".to_string(),         // Syser Debugger
-                "SICE.SYS".to_string(),          // SoftICE (legacy)
+                "SYSER.SYS".to_string(), // Syser Debugger
+                "SICE.SYS".to_string(),  // SoftICE (legacy)
                 "NTICE.SYS".to_string(),
             ],
         }

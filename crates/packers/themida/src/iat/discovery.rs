@@ -359,9 +359,7 @@ pub(super) fn find_all_iat_refs(
     candidates.sort_by(|a, b| {
         let a_rank = rank_candidate(a);
         let b_rank = rank_candidate(b);
-        a_rank
-            .cmp(&b_rank)
-            .then(a.slot.cmp(&b.slot))
+        a_rank.cmp(&b_rank).then(a.slot.cmp(&b.slot))
     });
 
     Ok(candidates)
@@ -369,9 +367,9 @@ pub(super) fn find_all_iat_refs(
 
 fn rank_candidate(c: &IatRefCandidate) -> u8 {
     match (c.slot_in_image, c.value != 0) {
-        (true, true) => 0,  // in-image, resolved value (best)
-        (true, false) => 1, // in-image, unresolved
-        (false, true) => 2, // out-of-image but has a value
+        (true, true) => 0,   // in-image, resolved value (best)
+        (true, false) => 1,  // in-image, unresolved
+        (false, true) => 2,  // out-of-image but has a value
         (false, false) => 3, // out-of-image, unreadable
     }
 }
@@ -950,10 +948,7 @@ pub(crate) struct ModuleAttribution {
 /// ambiguity observed in XX-2 (IAT pointer 0x7ff85ace1e0c, ~200MB outside
 /// the image). The attribution is logged to stdout so live-fire runs can
 /// reason about the address without re-instrumenting.
-pub(crate) fn attribute_address_to_module(
-    pid: u32,
-    address: usize,
-) -> ModuleAttribution {
+pub(crate) fn attribute_address_to_module(pid: u32, address: usize) -> ModuleAttribution {
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, MODULEENTRY32W, TH32CS_SNAPMODULE,
@@ -1000,7 +995,9 @@ pub(crate) fn attribute_address_to_module(
     }
 
     // SAFETY: h_snap is a valid handle to close.
-    unsafe { let _ = CloseHandle(h_snap); }
+    unsafe {
+        let _ = CloseHandle(h_snap);
+    }
 
     found
 }
@@ -1046,7 +1043,9 @@ pub(crate) fn loaded_module_ranges(pid: u32) -> Vec<(usize, usize)> {
     }
 
     // SAFETY: h_snap is a valid handle to close.
-    unsafe { let _ = CloseHandle(h_snap); }
+    unsafe {
+        let _ = CloseHandle(h_snap);
+    }
 
     ranges
 }

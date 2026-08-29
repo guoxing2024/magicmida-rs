@@ -25,8 +25,8 @@
 //! exercised by in-crate unit tests (same module as the type).
 
 use mida_cli::unpacker::runtime_loader::{
-    is_valid_digest_hex, validate_digest_hex, DigestValidationError, PLACEHOLDER_RUNTIME_DIGEST,
-    RuntimeAuthorityManifest, RuntimeLoadError, DIGEST_HEX_LEN,
+    is_valid_digest_hex, validate_digest_hex, DigestValidationError, RuntimeAuthorityManifest,
+    RuntimeLoadError, DIGEST_HEX_LEN, PLACEHOLDER_RUNTIME_DIGEST,
 };
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -149,12 +149,13 @@ fn wrong_length_rejected() {
         "a".repeat(65),
         "a".repeat(32),
     ] {
-        assert!(!is_valid_digest_hex(&bad), "len {} must be rejected", bad.len());
+        assert!(
+            !is_valid_digest_hex(&bad),
+            "len {} must be rejected",
+            bad.len()
+        );
     }
-    assert_eq!(
-        validate_digest_hex(""),
-        Err(DigestValidationError::Missing)
-    );
+    assert_eq!(validate_digest_hex(""), Err(DigestValidationError::Missing));
     assert_eq!(
         validate_digest_hex(&"a".repeat(63)),
         Err(DigestValidationError::WrongLength { got: 63 })

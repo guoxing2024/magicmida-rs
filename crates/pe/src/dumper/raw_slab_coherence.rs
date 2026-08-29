@@ -421,42 +421,14 @@ fn covering_slab_for_child<'a>(
         }
     }
     match covering.len() {
-        0 => Err(OverlayError::ProbeCoverageMissing(Box::new(ProbeCoverageMissingDetails {
-            child_kind,
-            child_base: child_old_base,
-            child_size,
-            extent_kind: String::new().into(),
-            candidate_slab_count: raw_capture.slabs.len(),
-            nearest_authority: None,
-            nearest_authority_gap: 0,
-            child_capture_id: String::new().into(),
-            child_capture_path: String::new().into(),
-            source_root_rva: None,
-            source_slot_offset: None,
-            probe_requested_size: 0,
-            was_interior: false,
-            containing_parent_old_base: None,
-            containing_parent_size: None,
-        }))),
-        1 => {
-            let (si, base, size, off) = covering[0];
-            let slab = &raw_capture.slabs[si];
-            Ok((si, base, size, off, &slab.content))
-        }
-        _ => {
-            // Ambiguous coverage (contained in multiple slabs). A dedicated slab
-            // that exactly duplicates a main-slab slice should have been deduped;
-            // any real multi-coverage is a hard fail-closed.
-            Err(OverlayError::ProbeCoverageMissing(Box::new(ProbeCoverageMissingDetails {
+        0 => Err(OverlayError::ProbeCoverageMissing(Box::new(
+            ProbeCoverageMissingDetails {
                 child_kind,
                 child_base: child_old_base,
                 child_size,
                 extent_kind: String::new().into(),
                 candidate_slab_count: raw_capture.slabs.len(),
-                nearest_authority: Some((
-                    covering[0].1,
-                    covering[0].1.saturating_add(covering[0].2 as u64),
-                )),
+                nearest_authority: None,
                 nearest_authority_gap: 0,
                 child_capture_id: String::new().into(),
                 child_capture_path: String::new().into(),
@@ -466,7 +438,39 @@ fn covering_slab_for_child<'a>(
                 was_interior: false,
                 containing_parent_old_base: None,
                 containing_parent_size: None,
-            })))
+            },
+        ))),
+        1 => {
+            let (si, base, size, off) = covering[0];
+            let slab = &raw_capture.slabs[si];
+            Ok((si, base, size, off, &slab.content))
+        }
+        _ => {
+            // Ambiguous coverage (contained in multiple slabs). A dedicated slab
+            // that exactly duplicates a main-slab slice should have been deduped;
+            // any real multi-coverage is a hard fail-closed.
+            Err(OverlayError::ProbeCoverageMissing(Box::new(
+                ProbeCoverageMissingDetails {
+                    child_kind,
+                    child_base: child_old_base,
+                    child_size,
+                    extent_kind: String::new().into(),
+                    candidate_slab_count: raw_capture.slabs.len(),
+                    nearest_authority: Some((
+                        covering[0].1,
+                        covering[0].1.saturating_add(covering[0].2 as u64),
+                    )),
+                    nearest_authority_gap: 0,
+                    child_capture_id: String::new().into(),
+                    child_capture_path: String::new().into(),
+                    source_root_rva: None,
+                    source_slot_offset: None,
+                    probe_requested_size: 0,
+                    was_interior: false,
+                    containing_parent_old_base: None,
+                    containing_parent_size: None,
+                },
+            )))
         }
     }
 }
@@ -1356,7 +1360,8 @@ pub fn validate_declared_size_reinit_fields(
             reason: format!(
                 "declared size reinit child rva {:#x} != expected {:#x} for old_base {:#x}",
                 after_rva, spec.child_rva, after_live_ptr
-            ).into(),
+            )
+            .into(),
         });
     }
     let old_ok = before_len
@@ -1397,7 +1402,8 @@ pub fn validate_declared_size_reinit_fields(
                 after_content.len(),
                 spec.new_size,
                 after_live_ptr
-            ).into(),
+            )
+            .into(),
         });
     }
     if spec.zero_filled && after_content.iter().any(|&b| b != 0) {
@@ -1412,7 +1418,8 @@ pub fn validate_declared_size_reinit_fields(
             reason: format!(
                 "declared size reinit content not zero-filled for old_base {:#x}",
                 after_live_ptr
-            ).into(),
+            )
+            .into(),
         });
     }
     Ok(())
@@ -1532,7 +1539,8 @@ pub fn validate_raw_identity_across_transform(
                         a.live_ptr,
                         b.content.len(),
                         a.content.len()
-                    ).into(),
+                    )
+                    .into(),
                 });
             }
         }
@@ -1599,7 +1607,8 @@ pub fn diff_transform_write_runs(
                     reason: format!(
                         "duplicate raw participant identity at old_base {:#x}",
                         g.live_ptr
-                    ).into(),
+                    )
+                    .into(),
                 });
             }
         }
@@ -1626,7 +1635,8 @@ pub fn diff_transform_write_runs(
                 transform_id: transform_id.to_string().into(),
                 reason: format!(
                     "participant set change: raw participant old_base {base:#x} missing from after"
-                ).into(),
+                )
+                .into(),
             });
         }
     }
@@ -1643,7 +1653,8 @@ pub fn diff_transform_write_runs(
                 transform_id: transform_id.to_string().into(),
                 reason: format!(
                     "participant set change: raw participant old_base {base:#x} missing from before"
-                ).into(),
+                )
+                .into(),
             });
         }
     }
@@ -1677,7 +1688,8 @@ pub fn diff_transform_write_runs(
                 child_offset: 0,
                 length: 0,
                 transform_id: transform_id.to_string().into(),
-                reason: format!("empty raw capture id for changed participant old_base {base:#x}").into(),
+                reason: format!("empty raw capture id for changed participant old_base {base:#x}")
+                    .into(),
             });
         }
         // Route Y R0 (Y0-A): `child_size` is the TRANSFORMED (after) size — the
@@ -1924,7 +1936,8 @@ pub fn validate_run_membership(
                 reason: format!(
                     "duplicate canonical participant (capture_id, old_base) = ({:?}, {:#x})",
                     g.extent_evidence.capture_id, g.live_ptr
-                ).into(),
+                )
+                .into(),
             });
         }
     }
@@ -1944,7 +1957,8 @@ pub fn validate_run_membership(
                 reason: format!(
                     "duplicate raw child (capture_id, old_base) = ({:?}, {:#x})",
                     c.capture_id, c.old_base
-                ).into(),
+                )
+                .into(),
             });
         }
     }
@@ -1985,7 +1999,8 @@ pub fn validate_run_membership(
                 child_offset: r.child_offset,
                 length: r.length,
                 transform_id: r.transform_id.clone().into(),
-                reason: format!("run has no matching raw child by (capture_id, old_base, size)").into(),
+                reason: format!("run has no matching raw child by (capture_id, old_base, size)")
+                    .into(),
             });
         }
         if matches.len() > 1 {
@@ -2055,7 +2070,8 @@ pub fn validate_run_membership(
                             reason: format!(
                                 "declared reinit child run size {} not in (raw {:?}, new {:?})",
                                 r.child_size, raw_size, new_size
-                            ).into(),
+                            )
+                            .into(),
                         });
                     }
                 } else if participant_size != r.child_size {
@@ -2070,7 +2086,8 @@ pub fn validate_run_membership(
                         reason: format!(
                             "run child size {} != canonical participant size {}",
                             r.child_size, participant_size
-                        ).into(),
+                        )
+                        .into(),
                     });
                 }
             }
@@ -2369,7 +2386,6 @@ pub struct ProbeCoverageMissingDetails {
     /// Size of the containing parent, if any.
     pub containing_parent_size: Option<usize>,
 }
-
 
 // Route X R0 (X0-B): an `OverlayError` surfaced by transform-run-ledger recording
 // (participant-set change, ambiguous identity, malformed empty raw id) is a PE
@@ -3345,23 +3361,25 @@ pub fn validate_probe_coverage(
         if cover_count > 1 {
             // Ambiguous coverage (contained in multiple slabs) is also a hard
             // coverage failure (the rebase planner would reject it as ambiguous).
-            return Err(OverlayError::ProbeCoverageMissing(Box::new(ProbeCoverageMissingDetails {
-                child_kind: RawChildKind::HeapGlobal,
-                child_base: g.live_ptr,
-                child_size: g.content.len(),
-                extent_kind: format!("{:?}", g.extent_kind).into(),
-                candidate_slab_count: slab_ranges.len(),
-                nearest_authority: covering,
-                nearest_authority_gap: 0,
-                child_capture_id: g.extent_evidence.capture_id.clone().into(),
-                child_capture_path: format!("{:?}", g.extent_evidence.capture_path).into(),
-                source_root_rva: g.extent_evidence.source_root_rva,
-                source_slot_offset: g.extent_evidence.source_slot_offset,
-                probe_requested_size: g.extent_evidence.probe_requested_size,
-                was_interior: g.extent_evidence.was_interior,
-                containing_parent_old_base: g.extent_evidence.containing_parent_old_base,
-                containing_parent_size: g.extent_evidence.containing_parent_size,
-            })));
+            return Err(OverlayError::ProbeCoverageMissing(Box::new(
+                ProbeCoverageMissingDetails {
+                    child_kind: RawChildKind::HeapGlobal,
+                    child_base: g.live_ptr,
+                    child_size: g.content.len(),
+                    extent_kind: format!("{:?}", g.extent_kind).into(),
+                    candidate_slab_count: slab_ranges.len(),
+                    nearest_authority: covering,
+                    nearest_authority_gap: 0,
+                    child_capture_id: g.extent_evidence.capture_id.clone().into(),
+                    child_capture_path: format!("{:?}", g.extent_evidence.capture_path).into(),
+                    source_root_rva: g.extent_evidence.source_root_rva,
+                    source_slot_offset: g.extent_evidence.source_slot_offset,
+                    probe_requested_size: g.extent_evidence.probe_requested_size,
+                    was_interior: g.extent_evidence.was_interior,
+                    containing_parent_old_base: g.extent_evidence.containing_parent_old_base,
+                    containing_parent_size: g.extent_evidence.containing_parent_size,
+                },
+            )));
         }
         // Not covered: find the nearest authority range (T0-C precise diagnostic).
         let mut nearest: Option<(u64, u64, u64)> = None; // (base, end, gap)
@@ -3378,27 +3396,29 @@ pub fn validate_probe_coverage(
             }
         }
         let (n_base, n_end, n_gap) = nearest.unwrap_or((0, 0, u64::MAX));
-        return Err(OverlayError::ProbeCoverageMissing(Box::new(ProbeCoverageMissingDetails {
-            child_kind: RawChildKind::HeapGlobal,
-            child_base: g.live_ptr,
-            child_size: g.content.len(),
-            extent_kind: format!("{:?}", g.extent_kind).into(),
-            candidate_slab_count: slab_ranges.len(),
-            nearest_authority: if slab_ranges.is_empty() {
-                None
-            } else {
-                Some((n_base, n_end))
+        return Err(OverlayError::ProbeCoverageMissing(Box::new(
+            ProbeCoverageMissingDetails {
+                child_kind: RawChildKind::HeapGlobal,
+                child_base: g.live_ptr,
+                child_size: g.content.len(),
+                extent_kind: format!("{:?}", g.extent_kind).into(),
+                candidate_slab_count: slab_ranges.len(),
+                nearest_authority: if slab_ranges.is_empty() {
+                    None
+                } else {
+                    Some((n_base, n_end))
+                },
+                nearest_authority_gap: n_gap,
+                child_capture_id: g.extent_evidence.capture_id.clone().into(),
+                child_capture_path: format!("{:?}", g.extent_evidence.capture_path).into(),
+                source_root_rva: g.extent_evidence.source_root_rva,
+                source_slot_offset: g.extent_evidence.source_slot_offset,
+                probe_requested_size: g.extent_evidence.probe_requested_size,
+                was_interior: g.extent_evidence.was_interior,
+                containing_parent_old_base: g.extent_evidence.containing_parent_old_base,
+                containing_parent_size: g.extent_evidence.containing_parent_size,
             },
-            nearest_authority_gap: n_gap,
-            child_capture_id: g.extent_evidence.capture_id.clone().into(),
-            child_capture_path: format!("{:?}", g.extent_evidence.capture_path).into(),
-            source_root_rva: g.extent_evidence.source_root_rva,
-            source_slot_offset: g.extent_evidence.source_slot_offset,
-            probe_requested_size: g.extent_evidence.probe_requested_size,
-            was_interior: g.extent_evidence.was_interior,
-            containing_parent_old_base: g.extent_evidence.containing_parent_old_base,
-            containing_parent_size: g.extent_evidence.containing_parent_size,
-        })));
+        )));
     }
     Ok(())
 }
@@ -3738,23 +3758,25 @@ pub fn build_patched_backing_slab(
     let slab = raw_capture
         .slabs
         .first()
-        .ok_or(OverlayError::ProbeCoverageMissing(Box::new(ProbeCoverageMissingDetails {
-            child_kind: RawChildKind::HeapGlobal,
-            child_base: 0,
-            child_size: 0,
-            extent_kind: String::new().into(),
-            candidate_slab_count: 0,
-            nearest_authority: None,
-            nearest_authority_gap: 0,
-            child_capture_id: String::new().into(),
-            child_capture_path: String::new().into(),
-            source_root_rva: None,
-            source_slot_offset: None,
-            probe_requested_size: 0,
-            was_interior: false,
-            containing_parent_old_base: None,
-            containing_parent_size: None,
-        })))?;
+        .ok_or(OverlayError::ProbeCoverageMissing(Box::new(
+            ProbeCoverageMissingDetails {
+                child_kind: RawChildKind::HeapGlobal,
+                child_base: 0,
+                child_size: 0,
+                extent_kind: String::new().into(),
+                candidate_slab_count: 0,
+                nearest_authority: None,
+                nearest_authority_gap: 0,
+                child_capture_id: String::new().into(),
+                child_capture_path: String::new().into(),
+                source_root_rva: None,
+                source_slot_offset: None,
+                probe_requested_size: 0,
+                was_interior: false,
+                containing_parent_old_base: None,
+                containing_parent_size: None,
+            },
+        )))?;
     let mut backing = slab.content.clone();
 
     // GTO R0-F.1: index raw children by (old_base, kind) preserving ALL entries.
@@ -3988,13 +4010,15 @@ pub fn build_patched_backing_slab(
                     raw_child_bytes.len().min(child_size),
                     16,
                     64,
-                ).into(),
+                )
+                .into(),
                 raw_slab_slice_excerpt: drift_excerpt(
                     &slab.content[slab_offset_us..child_end],
                     raw_child_bytes.len().min(child_size),
                     16,
                     64,
-                ).into(),
+                )
+                .into(),
             });
         }
         // GTO R0-G three-way reconciliation: C = raw child capture (t1), S = raw
@@ -4032,8 +4056,10 @@ pub fn build_patched_backing_slab(
                     first_mismatch_offset: first_mismatch,
                     raw_child_digest: sha256_hex(raw_child_bytes).into(),
                     raw_slab_slice_digest: sha256_hex(raw_slab_slice).into(),
-                    raw_child_excerpt: drift_excerpt(raw_child_bytes, first_mismatch, 16, 64).into(),
-                    raw_slab_slice_excerpt: drift_excerpt(raw_slab_slice, first_mismatch, 16, 64).into(),
+                    raw_child_excerpt: drift_excerpt(raw_child_bytes, first_mismatch, 16, 64)
+                        .into(),
+                    raw_slab_slice_excerpt: drift_excerpt(raw_slab_slice, first_mismatch, 16, 64)
+                        .into(),
                 });
             }
         }
@@ -4550,13 +4576,15 @@ pub fn build_patched_backing_slab_q0c(
                     raw_child_bytes.len().min(child_size),
                     16,
                     64,
-                ).into(),
+                )
+                .into(),
                 raw_slab_slice_excerpt: drift_excerpt(
                     &slab_bytes[slab_offset_us..child_end],
                     raw_child_bytes.len().min(child_size),
                     16,
                     64,
-                ).into(),
+                )
+                .into(),
             });
         }
         let raw_slab_slice = &slab_bytes[slab_offset_us..child_end];
@@ -4721,8 +4749,8 @@ pub fn build_patched_backing_slab_q0c(
                 slab_size,
                 slab_offset: slab_offset_us,
                 first_mismatch_offset: 0,
-                 raw_child_digest: raw_child_digest.into(),
-                 raw_slab_slice_digest: raw_slab_slice_digest.into(),
+                raw_child_digest: raw_child_digest.into(),
+                raw_slab_slice_digest: raw_slab_slice_digest.into(),
                 raw_child_excerpt: drift_excerpt(raw_child_bytes, 0, 16, 64).into(),
                 raw_slab_slice_excerpt: drift_excerpt(raw_slab_slice, 0, 16, 64).into(),
             });
@@ -4783,13 +4811,15 @@ pub fn build_patched_backing_slab_q0c(
                         first_mismatch_offset: first_mismatch,
                         raw_child_digest: raw_child_digest.clone().into(),
                         raw_slab_slice_digest: raw_slab_slice_digest.clone().into(),
-                        raw_child_excerpt: drift_excerpt(raw_child_bytes, first_mismatch, 16, 64).into(),
+                        raw_child_excerpt: drift_excerpt(raw_child_bytes, first_mismatch, 16, 64)
+                            .into(),
                         raw_slab_slice_excerpt: drift_excerpt(
                             raw_slab_slice,
                             first_mismatch,
                             16,
                             64,
-                        ).into(),
+                        )
+                        .into(),
                     });
                 }
                 // seeded_from_slab must be false for a strict child.
@@ -4889,7 +4919,8 @@ pub fn build_patched_backing_slab_q0c(
                         spec.transform_id,
                         capture_id,
                         transition_idxs.len()
-                    ).into(),
+                    )
+                    .into(),
                 });
             }
             let t_idx = transition_idxs[0];
@@ -4909,7 +4940,8 @@ pub fn build_patched_backing_slab_q0c(
                         "declared size reinit run shape invalid for old_base {:#x}: \
                          child_size={:#x} offset={:#x} length={:#x}, expected {:#x} [0,{:#x})",
                         child_base, ev.child_size, ev.child_offset, ev.length, new_size, new_size
-                    ).into(),
+                    )
+                    .into(),
                 });
             }
             if ev.child_capture_id.is_empty() || ev.transform_id.is_empty() {
@@ -4924,7 +4956,8 @@ pub fn build_patched_backing_slab_q0c(
                     reason: format!(
                         "declared size reinit run has empty identity for old_base {:#x}",
                         child_base
-                    ).into(),
+                    )
+                    .into(),
                 });
             }
             // (P1-3 rev 3 / Audit P1-3) The transition's BEFORE evidence is the
@@ -4953,7 +4986,8 @@ pub fn build_patched_backing_slab_q0c(
                         child_offset: off,
                         length: len,
                         transform_id: r.transform_id.clone().into(),
-                        reason: format!("prior run length overflow for old_base {:#x}", child_base).into(),
+                        reason: format!("prior run length overflow for old_base {:#x}", child_base)
+                            .into(),
                     });
                 };
                 if end > current.len() || len == 0 {
@@ -4968,7 +5002,8 @@ pub fn build_patched_backing_slab_q0c(
                         reason: format!(
                             "prior run out of preimage bounds for old_base {:#x}",
                             child_base
-                        ).into(),
+                        )
+                        .into(),
                     });
                 }
                 // Self-consistency of the prior run's digest pair.
@@ -4990,7 +5025,8 @@ pub fn build_patched_backing_slab_q0c(
                         reason: format!(
                             "prior run digest/byte inconsistency for old_base {:#x}",
                             child_base
-                        ).into(),
+                        )
+                        .into(),
                     });
                 }
                 // before == current state at [off, off+len).
@@ -5026,7 +5062,8 @@ pub fn build_patched_backing_slab_q0c(
                         "declared size reinit before mismatch for old_base {:#x} (must equal \
                          prior-writer-replayed current state, not the raw prefix)",
                         child_base
-                    ).into(),
+                    )
+                    .into(),
                 });
             }
             // The transition's after bytes must be exactly the transformed new-size
@@ -5046,7 +5083,8 @@ pub fn build_patched_backing_slab_q0c(
                     reason: format!(
                         "declared size reinit after mismatch for old_base {:#x}",
                         child_base
-                    ).into(),
+                    )
+                    .into(),
                 });
             }
             // Every child run must be consumed: nothing may follow the terminal
@@ -5064,7 +5102,8 @@ pub fn build_patched_backing_slab_q0c(
                         "declared size reinit for old_base {:#x} must be the LAST run for \
                          its capture; orphan post-transition run present",
                         child_base
-                    ).into(),
+                    )
+                    .into(),
                 });
             }
             // (P1-2) Bounds: the new-size region must stay inside the covering slab.

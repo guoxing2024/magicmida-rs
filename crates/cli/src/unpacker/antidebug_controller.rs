@@ -2286,7 +2286,7 @@ mod tests {
             digest_authority,
             target_pid,
             Some(0x2040), // sealed pure-file WalkerExecute export RVA
-            None, // walker_exports: not needed by this test
+            None,         // walker_exports: not needed by this test
         )
     }
 

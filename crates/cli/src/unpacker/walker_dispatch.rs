@@ -51,7 +51,7 @@
 
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Memory::{
-    VirtualAllocEx, VirtualFreeEx, VirtualProtectEx, MEM_COMMIT, MEM_RESERVE, MEM_RELEASE,
+    VirtualAllocEx, VirtualFreeEx, VirtualProtectEx, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE,
     PAGE_EXECUTE_READWRITE, PAGE_READWRITE,
 };
 use windows::Win32::System::Threading::{
@@ -221,7 +221,8 @@ impl WalkerDispatchBridgeImpl {
             return None;
         }
         blob[0..THUNK7_PRODUCTION.len()].copy_from_slice(&THUNK7_PRODUCTION);
-        blob[THUNK_ARGS_OFFSET..THUNK_ARGS_OFFSET + THUNK_ARGS_SIZE].copy_from_slice(&args.as_bytes());
+        blob[THUNK_ARGS_OFFSET..THUNK_ARGS_OFFSET + THUNK_ARGS_SIZE]
+            .copy_from_slice(&args.as_bytes());
         let w = unsafe {
             windows::Win32::System::Diagnostics::Debug::WriteProcessMemory(
                 target,
@@ -357,7 +358,10 @@ impl WalkerDispatchBridge for WalkerDispatchBridgeImpl {
         // production dispatch; a missing output fails closed upstream at
         // the controller OutputMissing gate).
         let output = mida_antidebug_runtime::exports::take_walker_output();
-        (mida_antidebug_runtime::walker_protocol::WALKER_STATUS_OK as i32, output)
+        (
+            mida_antidebug_runtime::walker_protocol::WALKER_STATUS_OK as i32,
+            output,
+        )
     }
 }
 
@@ -539,9 +543,7 @@ mod imp09_dispatch_bridge_tests {
     /// Real verify_file()-produced LoaderResult (sealed ctor). Uses the
     /// same minimal-PE path as the controller tests.
     fn build_loader_result(module_base: u64, file_rva: u64) -> LoaderResult {
-        use crate::unpacker::runtime_loader::{
-            RuntimeAuthorityManifest, RuntimeDigestAuthority,
-        };
+        use crate::unpacker::runtime_loader::{RuntimeAuthorityManifest, RuntimeDigestAuthority};
         // Minimal valid x64 PE with a real SizeOfImage envelope.
         let mut b = vec![0u8; 0x1000];
         b[0] = b'M';
@@ -795,13 +797,19 @@ mod imp09_dispatch_bridge_tests {
         // The blob layout matches the loader's thunk contract exactly
         // (code window + args window inside one 0x100 allocation).
         assert_eq!(
-            u64::from_le_bytes(blob[THUNK_ARGS_OFFSET..THUNK_ARGS_OFFSET + 8].try_into().unwrap()),
+            u64::from_le_bytes(
+                blob[THUNK_ARGS_OFFSET..THUNK_ARGS_OFFSET + 8]
+                    .try_into()
+                    .unwrap()
+            ),
             remote_va
         );
         assert_eq!(
-            u64::from_le_bytes(blob[THUNK_ARGS_OFFSET + 8..THUNK_ARGS_OFFSET + 16]
-                .try_into()
-                .unwrap()),
+            u64::from_le_bytes(
+                blob[THUNK_ARGS_OFFSET + 8..THUNK_ARGS_OFFSET + 16]
+                    .try_into()
+                    .unwrap()
+            ),
             0x7777
         );
     }
@@ -911,42 +919,30 @@ mod imp09_dispatch_bridge_tests {
         // Both vars missing.
         clear_gate_env();
         assert!(!live_dispatch_gate());
-        assert!(try_build_live_dispatch_bridge(
-            self_handle(),
-            Some(&loader),
-            Some(&exports)
-        )
-        .is_none());
+        assert!(
+            try_build_live_dispatch_bridge(self_handle(), Some(&loader), Some(&exports)).is_none()
+        );
 
         // Only NO_BYPASS set.
         set_gate_env(Some("1"), None);
         assert!(!live_dispatch_gate());
-        assert!(try_build_live_dispatch_bridge(
-            self_handle(),
-            Some(&loader),
-            Some(&exports)
-        )
-        .is_none());
+        assert!(
+            try_build_live_dispatch_bridge(self_handle(), Some(&loader), Some(&exports)).is_none()
+        );
 
         // Only LIVE_DISPATCH set.
         set_gate_env(None, Some("1"));
         assert!(!live_dispatch_gate());
-        assert!(try_build_live_dispatch_bridge(
-            self_handle(),
-            Some(&loader),
-            Some(&exports)
-        )
-        .is_none());
+        assert!(
+            try_build_live_dispatch_bridge(self_handle(), Some(&loader), Some(&exports)).is_none()
+        );
 
         // Wrong value ("0").
         set_gate_env(Some("0"), Some("1"));
         assert!(!live_dispatch_gate());
-        assert!(try_build_live_dispatch_bridge(
-            self_handle(),
-            Some(&loader),
-            Some(&exports)
-        )
-        .is_none());
+        assert!(
+            try_build_live_dispatch_bridge(self_handle(), Some(&loader), Some(&exports)).is_none()
+        );
 
         clear_gate_env();
     }
@@ -960,11 +956,7 @@ mod imp09_dispatch_bridge_tests {
         assert!(live_dispatch_gate());
 
         let (loader, exports) = carrier_pair(0x7FF600000000, 0x2040);
-        let bridge = try_build_live_dispatch_bridge(
-            self_handle(),
-            Some(&loader),
-            Some(&exports),
-        );
+        let bridge = try_build_live_dispatch_bridge(self_handle(), Some(&loader), Some(&exports));
         let bridge = bridge.expect("gate open + complete carriers must build");
         assert!(bridge.carriers_complete());
         // Offline discipline (same as T3-T12): never CreateRemoteThread against
@@ -974,18 +966,8 @@ mod imp09_dispatch_bridge_tests {
         assert!(!bridge.cross_check_passes(0x7FF600000000 + 0x2041));
 
         // Carrier missing -> None even with the gate open (fail-closed).
-        assert!(try_build_live_dispatch_bridge(
-            self_handle(),
-            None,
-            Some(&exports)
-        )
-        .is_none());
-        assert!(try_build_live_dispatch_bridge(
-            self_handle(),
-            Some(&loader),
-            None,
-        )
-        .is_none());
+        assert!(try_build_live_dispatch_bridge(self_handle(), None, Some(&exports)).is_none());
+        assert!(try_build_live_dispatch_bridge(self_handle(), Some(&loader), None,).is_none());
 
         clear_gate_env();
     }
@@ -1003,12 +985,9 @@ mod imp09_dispatch_bridge_tests {
         let (loader, exports) = carrier_pair(0x7FF600000000, 0x2040);
         let mut bad_exports = exports.clone();
         bad_exports.walker_execute = Some(0x7FF600000000 + 0x2041); // mismatch
-        let bridge = try_build_live_dispatch_bridge(
-            self_handle(),
-            Some(&loader),
-            Some(&bad_exports),
-        )
-        .expect("gate open + carriers present constructs; mismatch is caught at dispatch");
+        let bridge =
+            try_build_live_dispatch_bridge(self_handle(), Some(&loader), Some(&bad_exports))
+                .expect("gate open + carriers present constructs; mismatch is caught at dispatch");
         let (status, output) = bridge.dispatch(0x7777);
         assert_eq!(
             status,
@@ -1116,23 +1095,18 @@ mod imp09_dispatch_bridge_tests {
             Some(exports.clone()),
         );
         // Concrete return: lets us assert carriers_complete / cross_check.
-        let bridge = try_build_live_dispatch_bridge(
+        let bridge =
+            try_build_live_dispatch_bridge(self_handle(), Some(&loader), loader.walker_exports())
+                .expect("gate open + channel carriers must build the bridge");
+        assert!(bridge.carriers_complete());
+        assert!(bridge.cross_check_passes(0x7FF600000000 + 0x2040));
+        // Boxed variant (production slot type) also yields Some.
+        assert!(try_build_live_dispatch_bridge_boxed(
             self_handle(),
             Some(&loader),
             loader.walker_exports(),
         )
-        .expect("gate open + channel carriers must build the bridge");
-        assert!(bridge.carriers_complete());
-        assert!(bridge.cross_check_passes(0x7FF600000000 + 0x2040));
-        // Boxed variant (production slot type) also yields Some.
-        assert!(
-            try_build_live_dispatch_bridge_boxed(
-                self_handle(),
-                Some(&loader),
-                loader.walker_exports(),
-            )
-            .is_some()
-        );
+        .is_some());
 
         // Channel missing (loader.walker_exports None) -> None.
         let (bare, _) = carrier_pair(0x7FF600000000, 0x2040);
@@ -1144,12 +1118,7 @@ mod imp09_dispatch_bridge_tests {
         .is_none());
 
         // Loader missing entirely -> None.
-        assert!(try_build_live_dispatch_bridge_boxed(
-            self_handle(),
-            None,
-            None,
-        )
-        .is_none());
+        assert!(try_build_live_dispatch_bridge_boxed(self_handle(), None, None,).is_none());
 
         clear_gate_env();
     }

@@ -1,9 +1,9 @@
 //! Tests for anti-anti-debug constants and helpers.
 
 use super::*;
-use mida_core::{DebugEvent, DebuggerCore, ContinueStatus};
-use windows::Win32::{Foundation::HANDLE, System::Diagnostics::Debug::CONTEXT};
+use mida_core::{ContinueStatus, DebugEvent, DebuggerCore};
 use std::collections::HashMap;
+use windows::Win32::{Foundation::HANDLE, System::Diagnostics::Debug::CONTEXT};
 
 #[test]
 fn ptr_from_bytes_x86() {
@@ -91,8 +91,11 @@ impl DebuggerCore for MockDebugger {
         unimplemented!("mock debugger: wait_event")
     }
 
-    fn continue_event(&mut self, _thread_id: u32, _status: ContinueStatus)
-        -> Result<(), mida_core::CoreError> {
+    fn continue_event(
+        &mut self,
+        _thread_id: u32,
+        _status: ContinueStatus,
+    ) -> Result<(), mida_core::CoreError> {
         Ok(())
     }
 
@@ -115,7 +118,11 @@ impl DebuggerCore for MockDebugger {
         Ok(self.context)
     }
 
-    fn set_thread_context(&self, _thread_id: u32, ctx: &CONTEXT) -> Result<(), mida_core::CoreError> {
+    fn set_thread_context(
+        &self,
+        _thread_id: u32,
+        ctx: &CONTEXT,
+    ) -> Result<(), mida_core::CoreError> {
         // 在真实场景中这里会修改 self.context，但因为需要 &mut self
         // 我们在测试中通过检查返回值来验证
         let _ = ctx;
@@ -133,18 +140,19 @@ fn crdp_forges_false_to_output_pointer() {
     let output_ptr = 0x7fff_0000u64;
 
     // 执行 CRDP 处理器
-    let result = handlers::handle_check_remote_debugger_present(
-        &mut dbg,
-        100,
-        output_ptr,
-    );
+    let result = handlers::handle_check_remote_debugger_present(&mut dbg, 100, output_ptr);
 
     assert!(result.is_ok(), "CRDP handler should succeed");
 
     // 验证写入了 FALSE (0)
-    let written = dbg.read_written(output_ptr as usize, 4)
+    let written = dbg
+        .read_written(output_ptr as usize, 4)
         .expect("output pointer should be written");
-    assert_eq!(written, [0, 0, 0, 0], "should write FALSE (0) to output pointer");
+    assert_eq!(
+        written,
+        [0, 0, 0, 0],
+        "should write FALSE (0) to output pointer"
+    );
 }
 
 #[test]
@@ -170,11 +178,7 @@ fn crdp_skips_call_and_sets_success() {
         dbg.context.Eip = 0x7700_0000; // CRDP 地址
     }
 
-    let result = handlers::handle_check_remote_debugger_present(
-        &mut dbg,
-        200,
-        output_ptr,
-    );
+    let result = handlers::handle_check_remote_debugger_present(&mut dbg, 200, output_ptr);
 
     assert!(result.is_ok(), "CRDP handler should succeed");
     // 注意：因为 MockDebugger::set_thread_context 的限制，
@@ -239,12 +243,21 @@ fn timing_state_window_is_bounded() {
     // 发送 TIMING_PATCH_WINDOW 个可疑探测
     for i in 0..TIMING_PATCH_WINDOW {
         let returned = state.handle_probe(1000 + (i as u64 + 1) * 100);
-        assert_ne!(returned, 1000 + (i as u64 + 1) * 100, "probe {} should be masked", i);
+        assert_ne!(
+            returned,
+            1000 + (i as u64 + 1) * 100,
+            "probe {} should be masked",
+            i
+        );
     }
 
     // 第 TIMING_PATCH_WINDOW+1 个可疑探测应该关闭窗口，返回真实值
     let returned = state.handle_probe(2000);
-    assert_eq!(returned, 2000, "window should close after {} probes", TIMING_PATCH_WINDOW);
+    assert_eq!(
+        returned, 2000,
+        "window should close after {} probes",
+        TIMING_PATCH_WINDOW
+    );
 }
 
 #[test]
@@ -255,7 +268,10 @@ fn timing_state_benign_probe_closes_window() {
     let _ = state.handle_probe(1100);
     // 一个良性探测（delta = 5000）
     let returned = state.handle_probe(6100);
-    assert_eq!(returned, 6100, "benign probe should close window and return real tick");
+    assert_eq!(
+        returned, 6100,
+        "benign probe should close window and return real tick"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -269,7 +285,10 @@ fn nt_query_object_intercepts_type_info() {
 
     let result = handlers::handle_nt_query_object(&mut dbg, 400, OBJECT_TYPE_INFO);
     assert!(result.is_ok());
-    assert!(result.unwrap(), "should intercept ObjectTypeInformation query");
+    assert!(
+        result.unwrap(),
+        "should intercept ObjectTypeInformation query"
+    );
 }
 
 #[test]
@@ -279,7 +298,10 @@ fn nt_query_object_intercepts_name_info() {
 
     let result = handlers::handle_nt_query_object(&mut dbg, 401, OBJECT_NAME_INFO);
     assert!(result.is_ok());
-    assert!(result.unwrap(), "should intercept ObjectNameInformation query");
+    assert!(
+        result.unwrap(),
+        "should intercept ObjectNameInformation query"
+    );
 }
 
 #[test]

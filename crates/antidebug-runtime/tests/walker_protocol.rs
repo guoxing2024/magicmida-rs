@@ -5,10 +5,10 @@
 //! fixtures and reject rules. They do NOT verify any Windows behaviour.
 
 use mida_antidebug_runtime::walker_protocol::{
-    crc32, derive_session_id, is_canonical_user_va, page_span_fits,
-    MappingIdentityHeaderV2, ProbeResultV2, ProtocolError, ResultSectionHeaderV2,
-    WalkerParamsV2, DEFAULT_PROBE_SPAN, MAX_CANDIDATE_COUNT, MIN_SECTION_HEADER_BYTES,
-    OPTION_NONE, PARAMS_CRC_RANGE_END, PROBE_RESULT_BYTES,
+    crc32, derive_session_id, is_canonical_user_va, page_span_fits, MappingIdentityHeaderV2,
+    ProbeResultV2, ProtocolError, ResultSectionHeaderV2, WalkerParamsV2, DEFAULT_PROBE_SPAN,
+    MAX_CANDIDATE_COUNT, MIN_SECTION_HEADER_BYTES, OPTION_NONE, PARAMS_CRC_RANGE_END,
+    PROBE_RESULT_BYTES,
 };
 
 fn sample_nonce() -> u64 {
@@ -39,7 +39,6 @@ fn sample_params() -> WalkerParamsV2 {
         capacity,
     )
 }
-
 
 /// Standard CRC-32 check value.
 #[test]
@@ -241,15 +240,24 @@ fn params_fixed_fields_rejected() {
     let (mut d, c) = WalkerParamsV2::from_blob_bytes(&blob).unwrap();
 
     d.magic = 0;
-    assert!(matches!(d.validate(&c), Err(ProtocolError::BadMagic { .. })));
+    assert!(matches!(
+        d.validate(&c),
+        Err(ProtocolError::BadMagic { .. })
+    ));
     let (d2, _) = WalkerParamsV2::from_blob_bytes(&blob).unwrap();
     let mut d2 = d2;
     d2.version = 1;
-    assert!(matches!(d2.validate(&c), Err(ProtocolError::BadVersion { .. })));
+    assert!(matches!(
+        d2.validate(&c),
+        Err(ProtocolError::BadVersion { .. })
+    ));
     let (d3, _) = WalkerParamsV2::from_blob_bytes(&blob).unwrap();
     let mut d3 = d3;
     d3.header_bytes = 0x20;
-    assert!(matches!(d3.validate(&c), Err(ProtocolError::BadHeaderBytes { .. })));
+    assert!(matches!(
+        d3.validate(&c),
+        Err(ProtocolError::BadHeaderBytes { .. })
+    ));
     let (d4, _) = WalkerParamsV2::from_blob_bytes(&blob).unwrap();
     let mut d4 = d4;
     d4.candidate_off = 0x50;
@@ -299,7 +307,10 @@ fn params_golden_fixture() {
         0x0102_0304_0506_0708
     );
     assert_eq!(u64::from_le_bytes(blob[48..56].try_into().unwrap()), 0x88);
-    assert_eq!(u64::from_le_bytes(blob[0x40..0x48].try_into().unwrap()), 0x1000);
+    assert_eq!(
+        u64::from_le_bytes(blob[0x40..0x48].try_into().unwrap()),
+        0x1000
+    );
     let crc = u32::from_le_bytes(blob[56..60].try_into().unwrap());
     assert_ne!(crc, 0);
     let again = p.to_blob_bytes(&cands).unwrap();
@@ -396,7 +407,6 @@ fn params_probe_span_hostile_wire_rejected() {
         );
     }
 }
-
 
 // ----------------------------------------------------------------
 // IMP-02: validated controller API (pure offline)
@@ -558,7 +568,6 @@ fn controller_read_section_rejects_crc_tamper() {
     assert!(matches!(err, ProtocolError::CrcMismatch { .. }));
 }
 
-
 // ----------------------------------------------------------------
 // IMP-02-R1: CRC-first order hostile tests
 // ----------------------------------------------------------------
@@ -616,7 +625,7 @@ fn controller_crc_first_proves_order_via_roundtrip_field() {
     let latency_off = MIN_SECTION_HEADER_BYTES + 0x20;
     let mut tampered = section.clone();
     tampered[latency_off] ^= 0x01; // latency_us LSB flip
-    // Raw CRC mismatch (CRC-first) -> reject before any field semantics.
+                                   // Raw CRC mismatch (CRC-first) -> reject before any field semantics.
     assert!(matches!(
         controller_read_section(&tampered, &expected, 1),
         Err(ProtocolError::CrcMismatch { .. })

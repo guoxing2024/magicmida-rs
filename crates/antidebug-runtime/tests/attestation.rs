@@ -551,9 +551,6 @@ impl TelemetryRequestTemplate {
     }
 }
 
-
-
-
 // ----------------------------------------------------------------
 // IMP-01-R1: attestation v2 (WO-1503 frozen contract)
 // ----------------------------------------------------------------
@@ -783,7 +780,9 @@ fn probe_summary_type_sum_mismatch_rejected() {
     };
     assert!(matches!(
         s.validate(),
-        Err(mida_antidebug_runtime::attestation::AttestationError::ProbeSummaryTypeSumMismatch { .. })
+        Err(
+            mida_antidebug_runtime::attestation::AttestationError::ProbeSummaryTypeSumMismatch { .. }
+        )
     ));
 }
 
@@ -882,7 +881,8 @@ fn sample_walker_attestation() -> WalkerAttestation {
 #[test]
 fn walker_attestation_binding_and_digest() {
     let w = sample_walker_attestation();
-    w.validate(TEST_PID, &"a".repeat(64), TEST_MODULE_BASE).unwrap();
+    w.validate(TEST_PID, &"a".repeat(64), TEST_MODULE_BASE)
+        .unwrap();
     // tamper -> digest mismatch
     let mut w2 = w.clone();
     w2.probe_summary.av_count = 99;
@@ -907,7 +907,12 @@ fn walker_attestation_round_sequence_checked() {
     w.record_digest = w.compute_digest();
     assert!(matches!(
         w.validate(TEST_PID, &"a".repeat(64), TEST_MODULE_BASE),
-        Err(mida_antidebug_runtime::attestation::AttestationError::RoundSeqGap { expected: 1, got: 2 })
+        Err(
+            mida_antidebug_runtime::attestation::AttestationError::RoundSeqGap {
+                expected: 1,
+                got: 2
+            }
+        )
     ));
 }
 
@@ -995,14 +1000,14 @@ fn v2_top_level_walker_digest_tamper_rejected() {
     assert!(parsed.validate().is_err());
 }
 
-
 // ---- IMP-01-R2: walker entry VA binding (WO-1503 §6.1) ----
 
 #[test]
 fn walker_entry_va_binding_valid() {
     let w = sample_walker_attestation();
     // valid: walker_entry_va == module_base + rva
-    w.validate(TEST_PID, &"a".repeat(64), TEST_MODULE_BASE).unwrap();
+    w.validate(TEST_PID, &"a".repeat(64), TEST_MODULE_BASE)
+        .unwrap();
 }
 
 #[test]

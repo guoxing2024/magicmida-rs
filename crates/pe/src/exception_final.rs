@@ -544,12 +544,18 @@ fn compare_runtime_final_inner(
     // entries are allowed to be absent); in non-shrink mode it must be exact
     // (same length + same entries).
     let functions_preserved = if shrink_rebuilt_pdata {
-        final_report.functions.iter().all(|f| runtime.functions.contains(f))
+        final_report
+            .functions
+            .iter()
+            .all(|f| runtime.functions.contains(f))
     } else {
         runtime.functions == final_report.functions
     };
     let unwind_infos_preserved = if shrink_rebuilt_pdata {
-        final_report.unwind_infos.iter().all(|u| runtime.unwind_infos.contains(u))
+        final_report
+            .unwind_infos
+            .iter()
+            .all(|u| runtime.unwind_infos.contains(u))
     } else {
         runtime.unwind_infos == final_report.unwind_infos
     };
@@ -1009,7 +1015,10 @@ mod tests {
 
         // Non-shrink identity comparison must FAIL (RVA/size/count changed).
         let strict = compare_runtime_final(&runtime, &final_report);
-        assert!(!strict.all_preserved, "strict comparison must flag relocation");
+        assert!(
+            !strict.all_preserved,
+            "strict comparison must flag relocation"
+        );
 
         // Shrink-aware comparison must PASS (content subset preserved).
         let shrink = compare_runtime_final_shrink(&runtime, &final_report);
@@ -1088,11 +1097,9 @@ mod tests {
         let shrink = compare_runtime_final_shrink(&runtime, &final_report);
         assert!(!shrink.all_preserved);
         assert!(!shrink.functions_preserved);
-        assert!(
-            shrink
-                .blockers
-                .iter()
-                .any(|b| b.contains("RUNTIME_FUNCTION table mismatch"))
-        );
+        assert!(shrink
+            .blockers
+            .iter()
+            .any(|b| b.contains("RUNTIME_FUNCTION table mismatch")));
     }
 }

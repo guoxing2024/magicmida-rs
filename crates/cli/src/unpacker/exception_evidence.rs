@@ -966,10 +966,9 @@ mod tests {
             preferred_image_base: 0x140000000,
         };
         let nrs = no_reloc_state(&reloc, &final_reloc, true);
-        assert!(
-            nrs.blockers
-                .iter()
-                .any(|b| b.contains("final DYNAMIC_BASE still set"))
-        );
+        assert!(nrs
+            .blockers
+            .iter()
+            .any(|b| b.contains("final DYNAMIC_BASE still set")));
     }
 }

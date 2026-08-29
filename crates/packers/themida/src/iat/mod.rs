@@ -331,10 +331,7 @@ pub fn determine_iat_address(
 
     // Attribute the first (code-scan) ref for the live-fire log — closes the
     // "VM thunk vs stray module hit" ambiguity without extra instrumentation.
-    let attrib = discovery::attribute_address_to_module(
-        debugger.pid(),
-        iat_ref,
-    );
+    let attrib = discovery::attribute_address_to_module(debugger.pid(), iat_ref);
     match &attrib.module {
         Some(name) => info!(
             iat_ref = format_args!("{iat_ref:#x}"),

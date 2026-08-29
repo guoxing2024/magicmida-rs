@@ -62,10 +62,7 @@ pub(super) fn should_log_materialize_av(streak: u32) -> bool {
 /// * `site` — the first out-of-image indirect call/jmp site (from
 ///   [`first_out_of_image_iat_site`](mida_packers_themida::first_out_of_image_iat_site)).
 /// * `oep` — the scan-resolved OEP (fallback anchor when no site exists).
-pub(super) fn initial_materialize_step(
-    site: Option<usize>,
-    oep: Option<usize>,
-) -> MaterializeStep {
+pub(super) fn initial_materialize_step(site: Option<usize>, oep: Option<usize>) -> MaterializeStep {
     match (site, oep) {
         (Some(s), _) => MaterializeStep::ArmSite(s),
         (None, Some(o)) => MaterializeStep::ArmOep(o),

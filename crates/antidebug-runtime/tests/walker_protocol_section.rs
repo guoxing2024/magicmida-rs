@@ -3,12 +3,10 @@
 
 use mida_antidebug_runtime::walker_protocol::{
     derive_session_id, encode_section, parse_section, validate_section, IdentityExpectation,
-    MappingIdentityHeaderV2, ProbeResultV2, ProtocolError, ResultSectionHeaderV2,
-    WalkerParamsV2, CLASSIFICATION_TYPE_B, CLASSIFICATION_TYPE_C, COMPLETED_FLAG_ABORT,
-    COMPLETED_FLAG_DONE,
+    MappingIdentityHeaderV2, ProbeResultV2, ProtocolError, ResultSectionHeaderV2, WalkerParamsV2,
+    CLASSIFICATION_TYPE_B, CLASSIFICATION_TYPE_C, COMPLETED_FLAG_ABORT, COMPLETED_FLAG_DONE,
     COMPLETED_FLAG_PENDING, PROBE_RESULT_BYTES, RESULT_FLAG_GUARD_SEEN, RESULT_FLAG_NONE,
-    WALKER_STATUS_ERROR_MAP_FAILED, WALKER_STATUS_ERROR_PROBE_ABORTED,
-    WALKER_STATUS_OK,
+    WALKER_STATUS_ERROR_MAP_FAILED, WALKER_STATUS_ERROR_PROBE_ABORTED, WALKER_STATUS_OK,
 };
 
 fn sample_nonce() -> u64 {
@@ -157,9 +155,8 @@ fn section_payload_crc_detected() {
     // size 0x28): the trailing zero-fill is outside payload CRC coverage.
     let payload_off = 0x60usize;
     bytes[payload_off] ^= 0xFF;
-    let res = parse_section(&bytes).and_then(|(i, h, r2)| {
-        validate_section(&i, &h, &r2, &sample_expectation(), cap)
-    });
+    let res = parse_section(&bytes)
+        .and_then(|(i, h, r2)| validate_section(&i, &h, &r2, &sample_expectation(), cap));
     assert!(matches!(res, Err(ProtocolError::CrcMismatch { .. })));
 }
 
@@ -279,8 +276,8 @@ fn hostile_counts_rejected() {
         0,
     );
     let res = p.to_blob_bytes(&[]).and_then(|b| {
-        let (d, c) = mida_antidebug_runtime::walker_protocol::WalkerParamsV2::from_blob_bytes(&b)
-            .unwrap();
+        let (d, c) =
+            mida_antidebug_runtime::walker_protocol::WalkerParamsV2::from_blob_bytes(&b).unwrap();
         d.validate(&c)
     });
     assert!(res.is_err());
@@ -313,33 +310,54 @@ fn header_closed_sets_rejected() {
 
     let mut h = hdr;
     h.completed_flag = 0x1234_5678;
-    assert!(matches!(h.validate_layout(), Err(ProtocolError::BadCompletedFlag { .. })));
+    assert!(matches!(
+        h.validate_layout(),
+        Err(ProtocolError::BadCompletedFlag { .. })
+    ));
 
     let mut h = hdr;
     h.completed_flag = COMPLETED_FLAG_ABORT;
     h.walker_status = WALKER_STATUS_OK; // abort requires non-OK status
-    assert!(matches!(h.validate_layout(), Err(ProtocolError::BadStatusForState { .. })));
+    assert!(matches!(
+        h.validate_layout(),
+        Err(ProtocolError::BadStatusForState { .. })
+    ));
 
     let mut h = hdr;
     h.completed_flag = COMPLETED_FLAG_PENDING;
     h.walker_status = WALKER_STATUS_ERROR_MAP_FAILED;
-    assert!(matches!(h.validate_layout(), Err(ProtocolError::BadStatusForState { .. })));
+    assert!(matches!(
+        h.validate_layout(),
+        Err(ProtocolError::BadStatusForState { .. })
+    ));
 
     let mut h = hdr;
     h.walker_status = 99;
-    assert!(matches!(h.validate_layout(), Err(ProtocolError::UnknownWalkerStatus { .. })));
+    assert!(matches!(
+        h.validate_layout(),
+        Err(ProtocolError::UnknownWalkerStatus { .. })
+    ));
 
     let mut h = hdr;
     h.result_stride = 8;
-    assert!(matches!(h.validate_layout(), Err(ProtocolError::BadResultStride { .. })));
+    assert!(matches!(
+        h.validate_layout(),
+        Err(ProtocolError::BadResultStride { .. })
+    ));
 
     let mut h = hdr;
     h.results_off = 8;
-    assert!(matches!(h.validate_layout(), Err(ProtocolError::ResultsOffTooSmall { .. })));
+    assert!(matches!(
+        h.validate_layout(),
+        Err(ProtocolError::ResultsOffTooSmall { .. })
+    ));
 
     let mut h = hdr;
     h.results_off = 100; // not 8-aligned
-    assert!(matches!(h.validate_layout(), Err(ProtocolError::ResultsOffUnaligned { .. })));
+    assert!(matches!(
+        h.validate_layout(),
+        Err(ProtocolError::ResultsOffUnaligned { .. })
+    ));
 }
 
 // =========================================================================
@@ -363,9 +381,7 @@ fn hostile_params_count_max_no_alloc() {
     blob[32..34].copy_from_slice(&8u16.to_le_bytes());
     blob[34..36].copy_from_slice(&16u16.to_le_bytes());
     blob[40..48].copy_from_slice(&1u64.to_le_bytes()); // nonce
-    let r = std::panic::catch_unwind(|| {
-        WalkerParamsV2::from_blob_bytes(&blob)
-    });
+    let r = std::panic::catch_unwind(|| WalkerParamsV2::from_blob_bytes(&blob));
     assert!(r.is_ok(), "from_blob_bytes panicked on hostile count");
     assert!(matches!(
         r.unwrap(),
@@ -388,7 +404,10 @@ fn hostile_params_fixed_field_reject_no_panic() {
     blob[40..48].copy_from_slice(&1u64.to_le_bytes());
     let r = std::panic::catch_unwind(|| WalkerParamsV2::from_blob_bytes(&blob));
     assert!(r.is_ok());
-    assert!(matches!(r.unwrap(), Err(ProtocolError::BadCandidateOff { .. })));
+    assert!(matches!(
+        r.unwrap(),
+        Err(ProtocolError::BadCandidateOff { .. })
+    ));
 
     let mut blob = vec![0u8; 0x40 + 8];
     blob[0..4].copy_from_slice(b"WALK");
@@ -402,7 +421,10 @@ fn hostile_params_fixed_field_reject_no_panic() {
     blob[40..48].copy_from_slice(&1u64.to_le_bytes());
     let r = std::panic::catch_unwind(|| WalkerParamsV2::from_blob_bytes(&blob));
     assert!(r.is_ok());
-    assert!(matches!(r.unwrap(), Err(ProtocolError::BadCandidateStride { .. })));
+    assert!(matches!(
+        r.unwrap(),
+        Err(ProtocolError::BadCandidateStride { .. })
+    ));
 }
 
 /// parse_section with result_count = u32::MAX (or over cap) must reject
@@ -440,14 +462,20 @@ fn hostile_section_count_stride_reject_no_panic() {
     hostile[soff..soff + 4].copy_from_slice(&0u32.to_le_bytes());
     let r = std::panic::catch_unwind(|| parse_section(&hostile));
     assert!(r.is_ok());
-    assert!(matches!(r.unwrap(), Err(ProtocolError::BadResultStride { .. })));
+    assert!(matches!(
+        r.unwrap(),
+        Err(ProtocolError::BadResultStride { .. })
+    ));
 
     // result_stride = 1 -> BadResultStride.
     let mut hostile = bytes.clone();
     hostile[soff..soff + 4].copy_from_slice(&1u32.to_le_bytes());
     let r = std::panic::catch_unwind(|| parse_section(&hostile));
     assert!(r.is_ok());
-    assert!(matches!(r.unwrap(), Err(ProtocolError::BadResultStride { .. })));
+    assert!(matches!(
+        r.unwrap(),
+        Err(ProtocolError::BadResultStride { .. })
+    ));
 }
 
 /// parse_section with section_bytes beyond the hard cap must reject, and
@@ -469,7 +497,10 @@ fn hostile_section_bytes_max_reject_no_panic() {
     let mut hostile_hdr = hdr;
     hostile_hdr.section_bytes = big;
     let r = std::panic::catch_unwind(|| encode_section(&ident, &hostile_hdr, &[]));
-    assert!(r.is_ok(), "encode_section panicked on hostile section_bytes");
+    assert!(
+        r.is_ok(),
+        "encode_section panicked on hostile section_bytes"
+    );
     assert!(matches!(
         r.unwrap(),
         Err(ProtocolError::CountTooLarge { .. }) | Err(ProtocolError::BadSectionBytes { .. })
@@ -618,7 +649,10 @@ fn encode_invalid_results_off_rejected() {
     let mut hdr = ResultSectionHeaderV2::new(section_bytes, cap).unwrap();
     hdr.results_off = 100; // not 8-aligned
     let res = encode_section(&ident, &hdr, &[]);
-    assert!(matches!(res, Err(ProtocolError::ResultsOffUnaligned { .. })));
+    assert!(matches!(
+        res,
+        Err(ProtocolError::ResultsOffUnaligned { .. })
+    ));
 }
 
 /// Header with invalid completed_flag / status consistency must be rejected
@@ -718,7 +752,13 @@ fn encode_invalid_probe_fields_rejected() {
     ));
 
     // Non-canonical probe VA must be rejected.
-    let r = make_probe(0xFFFF_8000_0000_0000, CLASSIFICATION_TYPE_C, RESULT_FLAG_NONE, 0, 0);
+    let r = make_probe(
+        0xFFFF_8000_0000_0000,
+        CLASSIFICATION_TYPE_C,
+        RESULT_FLAG_NONE,
+        0,
+        0,
+    );
     assert!(matches!(
         encode_section(&ident, &hdr, &[r]),
         Err(ProtocolError::NonCanonicalVa { .. })
@@ -769,9 +809,8 @@ fn probe_result_span_hostile_wire_rejected() {
     for span in [1u16, 15, 17, 64] {
         let mut hostile = bytes.clone();
         hostile[span_off..span_off + 2].copy_from_slice(&span.to_le_bytes());
-        let res = parse_section(&hostile).and_then(|(i, h, r2)| {
-            validate_section(&i, &h, &r2, &sample_expectation(), cap)
-        });
+        let res = parse_section(&hostile)
+            .and_then(|(i, h, r2)| validate_section(&i, &h, &r2, &sample_expectation(), cap));
         assert!(
             matches!(res, Err(ProtocolError::BadProbeSpan { .. })),
             "hostile span {span} must be rejected"
@@ -791,7 +830,13 @@ fn encode_exact_section_bytes_round_trip() {
     hdr.completed_flag = COMPLETED_FLAG_DONE;
     let results = vec![
         make_probe(0x1000, CLASSIFICATION_TYPE_C, RESULT_FLAG_NONE, 0, 0xAA),
-        make_probe(0x2000, CLASSIFICATION_TYPE_B, RESULT_FLAG_GUARD_SEEN, 1, 0xBB),
+        make_probe(
+            0x2000,
+            CLASSIFICATION_TYPE_B,
+            RESULT_FLAG_GUARD_SEEN,
+            1,
+            0xBB,
+        ),
     ];
     let bytes = encode_section(&ident, &hdr, &results).unwrap();
     assert_eq!(bytes.len(), section_bytes as usize);

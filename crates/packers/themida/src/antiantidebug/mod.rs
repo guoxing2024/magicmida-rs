@@ -32,10 +32,10 @@
 //! - x64 targets **must** use ScyllaHide (Themida64 has no fallback for
 //!   manual anti-anti-debug).
 
+pub mod config;
 mod handlers;
 mod kifast;
 mod scyllahide;
-pub mod config;
 
 #[cfg(test)]
 mod tests;

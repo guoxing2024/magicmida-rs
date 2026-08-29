@@ -430,7 +430,11 @@ pub enum AttestationError {
     #[error("probe summary type sum mismatch: sum {sum}, total {total}")]
     ProbeSummaryTypeSumMismatch { sum: u32, total: u32 },
     #[error("probe summary count exceeds: {field} {got} > total {total}")]
-    ProbeSummaryCountExceeds { field: &'static str, got: u32, total: u32 },
+    ProbeSummaryCountExceeds {
+        field: &'static str,
+        got: u32,
+        total: u32,
+    },
     #[error("counts overflow (checked add)")]
     CountsOverflow,
     #[error("walker pid mismatch: expected {expected}, got {got}")]
@@ -450,7 +454,6 @@ pub enum AttestationError {
     #[error("walker entry va mismatch: expected {expected:#x}, got {got:#x}")]
     WalkerEntryMismatch { expected: u64, got: u64 },
 }
-
 
 // ============================================================================
 // Attestation v2 (WO-1503 frozen contract, IMP-01-R1)
@@ -581,13 +584,18 @@ pub fn json_c14n(v: &serde_json::Value) -> Result<String, AttestationError> {
 
 /// Fixed digest vectors (WO-1503 §5.3) — authoritative fixtures.
 pub const C14N_VECTOR_1_HEX: &str = "7b7d";
-pub const C14N_VECTOR_1_DIGEST: &str = "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
+pub const C14N_VECTOR_1_DIGEST: &str =
+    "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
 pub const C14N_VECTOR_2_HEX: &str = "7b2261223a322c2262223a317d";
-pub const C14N_VECTOR_2_DIGEST: &str = "d3626ac30a87e6f7a6428233b3c68299976865fa5508e4267c5415c76af7a772";
-pub const C14N_VECTOR_3_HEX: &str = "7b2261223a5b312c325d2c2273223a22785c2279222c2275223a22e4b8ad222c227a223a6e756c6c7d";
-pub const C14N_VECTOR_3_DIGEST: &str = "154301026b1458e084761c0fba44c2269b5e66f7a4b0e0071ad09e69e97dd244";
+pub const C14N_VECTOR_2_DIGEST: &str =
+    "d3626ac30a87e6f7a6428233b3c68299976865fa5508e4267c5415c76af7a772";
+pub const C14N_VECTOR_3_HEX: &str =
+    "7b2261223a5b312c325d2c2273223a22785c2279222c2275223a22e4b8ad222c227a223a6e756c6c7d";
+pub const C14N_VECTOR_3_DIGEST: &str =
+    "154301026b1458e084761c0fba44c2269b5e66f7a4b0e0071ad09e69e97dd244";
 pub const C14N_VECTOR_4_HEX: &str = "7b226e6f223a66616c73652c226f6b223a747275657d";
-pub const C14N_VECTOR_4_DIGEST: &str = "ae8ab1e1b72505d8544a32bf3803333e81528159e214e4198a0271d2f60dc419";
+pub const C14N_VECTOR_4_DIGEST: &str =
+    "ae8ab1e1b72505d8544a32bf3803333e81528159e214e4198a0271d2f60dc419";
 
 /// SHA-256 hex (lowercase).
 pub fn sha256_hex(data: &[u8]) -> String {

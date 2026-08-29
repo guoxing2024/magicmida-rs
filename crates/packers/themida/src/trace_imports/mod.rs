@@ -389,13 +389,18 @@ pub fn trace_imports(
                 resolved_count += 1;
                 log(
                     LogMsgType::Info,
-                    &format!("IAT[{i}] {slot_va:#x}: VM entry → ExitProcess ({real_exit_process:#x})"),
+                    &format!(
+                        "IAT[{i}] {slot_va:#x}: VM entry → ExitProcess ({real_exit_process:#x})"
+                    ),
                 );
             }
             Ok(TraceSlotOutcome::Failed(reason)) => {
                 failed_count += 1;
                 failed_slots.push(i);
-                log(LogMsgType::Fatal, &format!("IAT[{i}] {slot_va:#x}: {reason}"));
+                log(
+                    LogMsgType::Fatal,
+                    &format!("IAT[{i}] {slot_va:#x}: {reason}"),
+                );
             }
             Err(e) => {
                 // Fail-fast on debugger/lifecycle errors — do not count and
@@ -783,16 +788,12 @@ fn retry_or_fail(
                 }
             }
         }
-        SlotTraceRaw::Failed(reason) => {
-            Ok(TraceSlotOutcome::Failed(
-                match reason {
-                    "tracing completed but no API resolved" => {
-                        "deepened trace completed but no API resolved"
-                    }
-                    _ => reason,
-                },
-            ))
-        }
+        SlotTraceRaw::Failed(reason) => Ok(TraceSlotOutcome::Failed(match reason {
+            "tracing completed but no API resolved" => {
+                "deepened trace completed but no API resolved"
+            }
+            _ => reason,
+        })),
     }
 }
 

@@ -197,7 +197,9 @@ pub(super) fn run_post_attach_path(
             scan_ids.push(main_tid);
         }
         for &tid in &scan_ids {
-            let Ok(h) = dbg.thread_handle(tid) else { continue };
+            let Ok(h) = dbg.thread_handle(tid) else {
+                continue;
+            };
             let prev = unsafe { SuspendThread(h) };
             if prev == u32::MAX {
                 continue;

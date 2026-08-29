@@ -102,7 +102,9 @@ pub fn evaluate_implementation_gate(facts: &ImplementationFacts) -> Implementati
 
     // readiness
     let readiness = ImplGateStatus::Ready;
-    reasons.push("readiness=ready: v1 foundation + v2 protocol contracts present in frozen tree".to_string());
+    reasons.push(
+        "readiness=ready: v1 foundation + v2 protocol contracts present in frozen tree".to_string(),
+    );
 
     // implemented
     let mut implemented_ok = true;
@@ -146,11 +148,16 @@ pub fn evaluate_implementation_gate(facts: &ImplementationFacts) -> Implementati
     }
     if !facts.live_authorized {
         allowed_ok = false;
-        reasons.push("acceptance_allowed=NOT: live authorization missing (LIVE-4 NOT AUTHORIZED)".to_string());
+        reasons.push(
+            "acceptance_allowed=NOT: live authorization missing (LIVE-4 NOT AUTHORIZED)"
+                .to_string(),
+        );
     }
     if !facts.windows_runtime_verified {
         allowed_ok = false;
-        reasons.push("acceptance_allowed=NOT: windows runtime not verified (no live evidence)".to_string());
+        reasons.push(
+            "acceptance_allowed=NOT: windows runtime not verified (no live evidence)".to_string(),
+        );
     }
     if !facts.evidence_sufficient {
         allowed_ok = false;
@@ -179,7 +186,6 @@ pub fn evaluate_implementation_gate(facts: &ImplementationFacts) -> Implementati
         reasons,
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -238,7 +244,10 @@ mod tests {
         let v = evaluate_implementation_gate(&f);
         assert_eq!(v.implemented, ImplGateStatus::Ready);
         assert_eq!(v.gate, ImplGateResult::Fail);
-        assert!(v.reasons.iter().any(|r| r.contains("Walker protocol production caller")));
+        assert!(v
+            .reasons
+            .iter()
+            .any(|r| r.contains("Walker protocol production caller")));
     }
 
     #[test]
