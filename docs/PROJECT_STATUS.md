@@ -7,7 +7,7 @@
 
 这项目是**活的**（654 次提交，2801 个测试全绿），
 本次接管已把最要紧的风险解掉：**两天的在飞成果已分 8 个提交落到本地 git，`cargo fmt` 从红 216 处变为 0。推送按老板裁定停在本地，等他逐次确认。**
-下一件最要紧的事是 **TASK-006R5**（**待老板批两件**：`crates/` 改动授权 + 一格实弹 6/4→7/4）：改代码把受控 ini 落到 InjectorCLI **同目录**（推荐工作区外 staging），再重跑重脱壳看 text-poll 能否首次收敛到 dump。**为什么必须改代码**：TASK-006R4 实弹实证 InjectorCLI 用 `GetModuleFileNameW` 读 `<exe目录>/scylla_hide.ini`，`C:\Windows` 落位结构性无效；而 ARTIFACT_POLICY 第 11 条禁止活动工作区出现该文件名 → 手工落位无路可走。
+下一件最要紧的事是 **TASK-006R5**（**已授权**，D-021，2026-08-30 老板批两件：`crates/` 改动授权 + 一格实弹 6/4→7/4；授权令牌已写入工单首行）：改代码把受控 ini 落到 InjectorCLI **同目录**（推荐工作区外 staging），再重跑重脱壳看 text-poll 能否首次收敛到 dump。**为什么必须改代码**：TASK-006R4 实弹实证 InjectorCLI 用 `GetModuleFileNameW` 读 `<exe目录>/scylla_hide.ini`，`C:\Windows` 落位结构性无效；而 ARTIFACT_POLICY 第 11 条禁止活动工作区出现该文件名 → 手工落位无路可走。
 **为什么**：TASK-006R3 换 boot 后再跑，13/13 次跨 3 个 boot 全部撞同一个 ScyllaHide NtContinue-hook 故障环（风暴 RIP 恒 = hook 地址 +8，两套完全不同的 ASLR 布局下都成立）。**这不是 ASLR 运气，是确定性的工具交互故障**，"重启后重试"这条路已探测过、阴性、关闭。抓手是：我们现在**在无 ini 配置的状态下注入 ScyllaHide，它默认把所有 hook 都装上**（含跟壳打架的异常分发链），而引擎里的配置口子留了没接线。
 老板 2026-08-30 三条裁定已落账：追认 TASK-006R2 那一格（D-015，4/4 成立）、扩额批 TASK-006R3 一格（D-016，→ **5/4**）、授权迁移工作区大文件证据（D-017，G-6 已关）。
 三个 fail-open/无终止缺陷都已在**离线级**修完：缺陷 A（C-4，dump 重建把不可解析运行时指针固化进只读节 → 兜底清零 + fail-closed 门，TASK-009）、C-7（text-poll 阶段无 AV 风暴终止 → 恒同元组计数 + fail-closed 中止，TASK-011）、C-7 加固（阈值 32→1024 + host 腿补测试，TASK-012）。三者的**实弹验证都还没做**，而且只能在同一次重脱壳里一起验：TASK-006R 首跑用掉 1 格但 9/9 陷在 text-poll 风暴里，dump 从未到达（正是 C-7 造成的），所以缺陷 A 的实弹替换验证既未证实也未证伪。
@@ -118,6 +118,6 @@
 
 ## 下一步
 
-① **TASK-006R5**（待老板批：`crates/` 改动 + 一格实弹 6/4→7/4——改代码把受控 ini 落到注入器同目录，再重跑看 text-poll 能否收敛到 dump）→ ② T0.5 续跑 → ③ TASK-007。TASK-013 已完成（hook 配置可控可记录），但其"只搜 Windows 目录"结论已被 **TASK-006R4** 实弹推翻（正确规则：`<exe目录>/scylla_hide.ini`）；R4 终态 STOP，未产出有效尝试，根因是我的验收失误（新 P-9）。
+① **TASK-006R5**（已授权 D-021：`crates/` 改动 + 一格实弹 6/4→7/4——改代码把受控 ini 落到注入器同目录，再重跑看 text-poll 能否收敛到 dump）→ ② T0.5 续跑 → ③ TASK-007。TASK-013 已完成（hook 配置可控可记录），但其"只搜 Windows 目录"结论已被 **TASK-006R4** 实弹推翻（正确规则：`<exe目录>/scylla_hide.ini`）；R4 终态 STOP，未产出有效尝试，根因是我的验收失误（新 P-9）。
 另有两个可另立的专项：ScyllaHide-NtContinue-hook 交互的微指令级定性（需实弹 trace）、C-5 缺陷 B（会话绑定，`/session-clean` 消费端）。
 推送时机由老板定；推送前建议补跑 `cargo deny check advisories`（本机离线跑不了）。

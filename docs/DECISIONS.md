@@ -153,3 +153,12 @@
 - **正确结论**：**不是布局运气，是配置差异**。xx11 的成功状态恰好就是 TASK-006R5 想要复现的状态（关闭异常分发 hook）——这大幅提高了 R5 走通的先验概率。
 - **证据**：15:26 那份 scratch `scylla_hide.log` 的 15 条 `Hooking X` 安装行恰不含 ini 中三个 =0 的键，`NtQueryObject`(=1) 在列（总指挥在该文件被 R4 探针覆盖前亲读，关键行已存档进 KNOWN_ISSUES C-6 块；文件本体不可恢复 → 新 P-8）。
 - **教训**：做跨时段对照时，"同条件"三个字必须逐项列出并逐项核验，不能靠"应该一样"。
+
+## D-021 批 TASK-006R5 全案（crates/ 改动授权 + 再扩一格，XC-XXI-B 6/4 → 7/4）
+
+- **日期**：2026-08-30（老板裁定："批准 TASK-006R5： 授权"——回应总指挥列明的两件批准请求，按全案解释：两件同时批）
+- **决策**：① 授权 `crates/` 代码改动（`crates/packers/themida/src/antiantidebug/scyllahide.rs` + `crates/cli/src/unpacker/helpers.rs` 及其测试模块，仅限工单授权文件清单）；② 批 1 格实弹重脱壳。账本 6/4 → **7/4**。
+- **理由**：R4 实锤 InjectorCLI 读 `<exe目录>/scylla_hide.ini`，操作员手工落位被 ARTIFACT_POLICY 第 11 条结构性封死 → 改代码是唯一路径；且 xx 线成功状态恰 = 本单要复现的状态（D-020），先验概率显著为正。
+- **风险**：① 新增运行期复制/清理代码路径（panic 安全 + 删除证明已写入工单验收）；② 受控 ini 是整套 profile，走通后归因需最小差分变体另立单；③ 关 hook 后壳可能改走其它反调试路径（工单路径 D 承接）。
+- **前置（总指挥亲验，2026-08-30）**：BootTime = `2026-08-30 1:28:40`（与 R4 同 boot，无需重启）；起点 HEAD = `5c09e7a`；工作区 `target/release/` 与 `C:\Windows` 均无 ini 残留；vault ini sha `c88e94c3…` 与样品对象 sha `78009803…` 当场复核在位。
+- **落地**：`tickets/TASK-006R5.md` 首行已按 D-015 改写为授权令牌（worker 须原文回抄）。

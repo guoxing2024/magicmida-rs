@@ -157,7 +157,7 @@ WO-24 于 2026-08-27（提交 `607276d`）锁定 `_clippy_baseline`（TOTAL=349�
 - 每次运行内**恒同元组唯一**（`sort -u` 恰 1 条）× 1024 次，C-7 判据形状再次被证实。
 - 累计 **13/13 次跨 3 个 boot** 确定性撞同一故障环（006R 9 + 006R2 2 + 006R3 2）。**"重启后重试"这条路已经走到头了**——TASK-006R2 时我把它列为"近乎免费的探测"，探测做了，结果是阴性，这条路可以关掉了。
 - **总指挥读日志发现的抓手（TASK-013 的起点）**：`target/release/` 下**没有 `scylla_hide.ini`**，运行日志里也无任何读 ini/config 的痕迹，而 `scylla_hide.log` 显示 `Hooking KiUserExceptionDispatcher` 与 `Hooking NtContinue` **都装上了**；对照 vault 参考 ini（`D:/MidaVault/quarantine/20260722/workspace/magicmida-rs/scylla_hide.ini`）那里 `KiUserExceptionDispatcherHook=0`。→ **我们是在无配置状态下注入，ScyllaHide 默认把所有 hook 都装上**，包括跟壳打架的异常分发链。引擎里配置口子其实留着（`antidebug_controller.rs:507` 的 `OracleMode.ini_path`，挂着 `#[allow(dead_code)]`），**留了没接线**。[已验证]
-- **待办**：~~TASK-013~~ 已完成并验收；~~TASK-006R4~~ **已执行并验收（2026-08-30，终态 STOP：`C:\Windows` 落位方案结构性无效）** → 下一步 TASK-006R5（需授权改代码把受控 ini 落到 InjectorCLI 同目录 + 一格实弹）。
+- **待办**：~~TASK-013~~ 已完成并验收；~~TASK-006R4~~ **已执行并验收（2026-08-30，终态 STOP：`C:\Windows` 落位方案结构性无效）** → TASK-006R5 **已授权（D-021，2026-08-30：改代码落位 + 一格实弹 6/4→7/4），待派发执行**。
 
 **TASK-013 追加（2026-08-30）+ TASK-006R4 勘误（同日实弹实证推翻其中一条）：ini 查找规则的最终定论。**
 - ~~`InjectorCLIx64.exe` 用裸相对名读配置、只搜 Windows 目录、放 exe 旁没用~~ —— **这条 TASK-013 结论错误，已由 TASK-006R4 推翻（详见本块末尾"定案版"第 1 条）**。正确结论：InjectorCLI 用 `GetModuleFileNameW` 拿自身 exe 路径，读 **`<exe目录>/scylla_hide.ini`**；放 exe 同目录**有效**，放 `C:\Windows` **无效**。TASK-013 的探针测的是裸相对名的 API 语义（该语义本身正确），但 InjectorCLI 传的是绝对路径，故不适用。**教训（新 P-9）：探针必须打在被测程序的实际调用路径上；只验 API 语义就宣布"程序行为如何"，会把一个正确的 API 结论变成一个错误的程序结论，并据此烧掉一格实弹。**
