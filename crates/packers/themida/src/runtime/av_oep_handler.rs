@@ -52,6 +52,22 @@ pub struct AvOepState {
     pub last_possible_oep: Option<usize>,
     /// Set when a non-guard AV storm forced a fallback break.
     pub storm_escape_freeze: bool,
+    /// C-7: the last guardless AV tuple `(exception_addr, target_address,
+    /// exc_type, thread_id)` seen while no code guard is installed. `None`
+    /// when no guardless AV has been observed yet (or after a tuple change
+    /// re-seeds). Only advanced on the guardless path, so a guard-installed
+    /// run never counts here.
+    pub guardless_av_tuple: Option<(u64, u64, u8, u32)>,
+    /// C-7: consecutive count of the *identical* guardless AV tuple above.
+    /// Reset to 1 whenever the tuple changes (the VM/exception source is
+    /// progressing), so a healthy diverse AV flow never trips the storm
+    /// abort. Mirrors the XX-6 identical-AV deadlock guard used in the IAT
+    /// materialization wait.
+    pub guardless_av_tuple_streak: u32,
+    /// C-7: when a guardless constant-AV storm was aborted, the human-
+    /// readable tuple description and the streak count at abort. `None`
+    /// otherwise. The host converts this into a fail-closed error.
+    pub storm_abort: Option<(String, u32)>,
 }
 
 /// Per-event inputs to the decision.
@@ -148,6 +164,22 @@ pub struct AvOepOutcome {
     pub epilogue: bool,
 }
 
+/// C-7: consecutive *identical* guardless AV tuples at or beyond this count
+/// are treated as a constant-AV storm and abort fail-closed.
+///
+/// Selection rationale: the CLI host's existing non-guard storm escape uses
+/// `unrelated_av_storm_threshold` (default 32; see `PluginCtx::default` in
+/// `crates/core/src/plugin.rs`). This constant is kept at the same value so
+/// the guardless text-poll phase and the guarded NotGuarded phase share one
+/// semantic yardstick (≈32 consecutive same-shape faults = storm). A lower
+/// bound would risk aborting a genuinely progressing VM that repeatedly
+/// probes the same address; a higher bound would burn more log budget on the
+/// constant-AV loops this ticket closes. 32 consecutive identical tuples is
+/// already far beyond any observed healthy AV cadence (the two live-fire
+/// storm geometries logged 200K–3.2M consecutive identical tuples, i.e.
+/// they overshoot this bound by orders of magnitude).
+pub const GARDLESS_AV_STORM_TUPLE_THRESHOLD: u32 = 32;
+
 /// Decide what to do with one AccessViolation event.
 ///
 /// Faithful transliteration of the CLI AV handler's decision tree; every
@@ -160,6 +192,59 @@ pub fn decide_av_oep(
     input: &AvOepInput,
 ) -> Result<AvOepOutcome, String> {
     if !state.guard_installed {
+        // C-7: the text-poll phase runs with no code guard installed, so the
+        // `NotGuarded` branch below (which is the only place the legacy
+        // `unrelated_av_streak` counter advances) never executes here — every
+        // guardless AV used to hit this early return and was swallowed
+        // unconditionally. A constant-AV loop (identical tuple repeated
+        // forever) therefore burned to the external timeout with no engine
+        // abort. Detect exactly that: count consecutive *identical*
+        // `(exception_addr, target_address, exc_type, thread_id)` tuples and
+        // reset the counter whenever the tuple changes, so a healthy diverse
+        // AV flow (the VM progressing) keeps `Continue` and only a true
+        // constant-AV storm fails closed.
+        let tuple = (
+            input.exception_addr,
+            input.target_address,
+            input.exc_type,
+            input.event_thread_id,
+        );
+        if state.guardless_av_tuple == Some(tuple) {
+            state.guardless_av_tuple_streak = state.guardless_av_tuple_streak.saturating_add(1);
+        } else {
+            state.guardless_av_tuple = Some(tuple);
+            state.guardless_av_tuple_streak = 1;
+        }
+        if state.guardless_av_tuple_streak >= GARDLESS_AV_STORM_TUPLE_THRESHOLD {
+            state.storm_abort = Some((
+                format!(
+                    "(exc={:#x}, target={:#x}, exc_type={}, thread={})",
+                    tuple.0, tuple.1, tuple.2, tuple.3
+                ),
+                state.guardless_av_tuple_streak,
+            ));
+            query.log(
+                LogLevel::Warn,
+                &format!(
+                    "C-7: guardless constant-AV storm — aborting fail-closed (tuple={}, count={})",
+                    state
+                        .storm_abort
+                        .as_ref()
+                        .map(|(t, c)| format!("{t} x{c}"))
+                        .unwrap_or_default(),
+                    state.guardless_av_tuple_streak
+                ),
+            );
+            return Ok(AvOepOutcome {
+                action: AvOepAction::Break {
+                    oep: state.oep.unwrap_or(0),
+                    provenance: state.provenance.clone(),
+                    remove_guard: false,
+                },
+                state: state.clone(),
+                epilogue: false,
+            });
+        }
         return Ok(AvOepOutcome {
             action: AvOepAction::Continue,
             state: state.clone(),

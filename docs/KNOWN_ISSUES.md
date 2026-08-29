@@ -138,7 +138,7 @@ WO-24 于 2026-08-27（提交 `607276d`）锁定 `_clippy_baseline`（TOTAL=349�
 **影响**：TASK-009 修复的实弹验证仍被阻塞（既未证实也未证伪）；T0.5 继续 BLOCKED。
 **待办**：TASK-011（修 C-7，纯离线）。ScyllaHide-NtContinue-hook 交互的微指令级定性需新 trace（实弹），另立专项。**不建议本会话继续烧格重试**——重启只改运气，不改缺口。
 
-### C-7 text-poll 阶段无 AV 风暴终止机制（引擎结构缺口，TASK-010 发现）[已验证（代码级，总指挥逐处复核），未修]
+### C-7 text-poll 阶段无 AV 风暴终止机制（引擎结构缺口，TASK-010 发现）[已验证（代码级，总指挥逐处复核），**已修（离线级）—— TASK-011**]
 
 **缺口**：guard 未安装（text-poll）阶段，任何恒同 AV 环都被无限吞掉：
 - `crates/packers/themida/src/runtime/av_oep_handler.rs:161-168`：`!state.guard_installed` → 无条件 `AvOepAction::Continue` 早返回；
@@ -147,6 +147,15 @@ WO-24 于 2026-08-27（提交 `607276d`）锁定 `_clippy_baseline`（TOTAL=349�
 - `.text`-stable 判定（`mod.rs:1214-1218`）依赖壳完成解密 → 壳卡在环里则永不达成。
 **后果**：任何 constant-AV 环（04:0x 型 VM 取指环、21:1x 型 hook 故障环）都必然 0% 收敛直到外部超时/杀进程，并产出 3.5GB 级垃圾日志。TASK-006R 的 9 次白烧格直接由此造成。
 **修复方向（TASK-011）**：guardless 路径对恒同 AV 元组（exception_addr, target, exc_type, thread）计数，超阈值 → 返回 `Err` fail-closed 中止（`av_handler.rs:92` 的 `?` 链现成可用），不 dump、不打 `[GOOD]`、日志有界。纯离线可改、可单元测试，与 TASK-009 的 fail-closed 语义同族。
+
+**已修（离线级，TASK-011，2026-08-29，总指挥亲验）**：
+- 实现：`av_oep_handler.rs` guardless 早返回前加恒同元组计数（`guardless_av_tuple` / `guardless_av_tuple_streak`，**元组变化即清零**），达 `GARDLESS_AV_STORM_TUPLE_THRESHOLD=32` → 置 `storm_abort` 并返回 `Break`；`av_handler.rs` 的 `Break` 分支见 `storm_abort` 即转 `Err`（含元组与计数），经调用点 `?` 传播出 `unpack()`，**跳过 `run_post_loop_phases`（dump）与 `[GOOD]`**；`mod.rs` 只加 2 个循环外持久化变量 + 传参。
+- 4 个授权文件 **+281/-0（纯新增，0 删除行）**；`.text`-stable 判定（`mod.rs:1214-1218`）与既有断言**零改动**，无 `#[ignore]`/`.skip`。
+- 总指挥亲跑（真 cargo 退出码，非管道 grep 码）：themida lib 167 ✅ / 集成 16 ✅（12→16，4 个新用例全绿）/ mida-pe 1049 持平 ✅ / clippy 三 `-D` 0 error ✅ / fmt ✅，5/5 EXIT=0。
+- 判别力（总指挥自选回退，与 worker 的 `if false` 不同——改成 streak 永不累加，等价复现"无持久计数"原缺陷）：恰 2 个风暴用例红（exit 101）、防误杀与守卫回归 14 绿 → 字节级恢复（`cmp` 一致）→ 16/16 绿。
+- **验证级别 = 离线**：真实 debuggee 风暴下的中止时机、日志有界性、CLI 退出行为**未实弹验证**（下一格实弹应顺带观察：恒同环 ~32 次事件内触发 `guardless constant-AV storm abort`，无 dump、无 `[GOOD]`、日志非 3.5GB 级）。
+- **遗留项（转 TASK-012）**：① 阈值 32 对硬 fail-closed 裕量偏薄（实测分布双峰：健康 0 次 / 风暴 20 万–322 万次，32 与健康侧只差 32 个事件；Themida 大量使用异常式混淆，紧循环里的合法恒同 AV 可能 >32 次 → 误杀会白烧一格实弹）；② 公开常量名拼写 `GARDLESS` 应为 `GUARDLESS`；③ host 侧 `storm_abort → Err` 这条腿**只有代码阅读证据、无自动化测试**（cli crate 未在授权清单内）。
+
 
 
 ### C-3 GVM Phase 1 有一条自报的必须修正项 [已验证，已定级 (b) —— TASK-005 复核]
@@ -178,6 +187,12 @@ CI 的 `on.push.branches` 已经把 `oreans/two-sample-mainline` 列为一等分
 
 清理我自己造的临时脚本时，把仓库根目录一个我没创建的未跟踪文件 `probe_run_out3.txt`（529 字节，2026-08-29 12:16，疑似上一会话的 probe 输出）一起删了。它未被 Git 跟踪，无法恢复。
 **教训**：清理只删自己这次创建的文件，按名字逐个删，不用通配符。
+
+### P-5 报告里的 `EXIT=0` 有可能是 grep/findstr 的退出码，不是 cargo 的 [已验证，2026-08-29 TASK-011 验收时发现]
+
+Windows 批处理里 `cargo test ... 2>&1 | findstr /C:"test result"` 之后取 `%ERRORLEVEL%`，拿到的是**管道最后一个命令（findstr）**的退出码——findstr 找到匹配就返回 0。同理 Bash 下 `cargo ... | grep ...` 的 `$?` 是 grep 的。**这意味着一份 cargo 真的失败（exit 101）的运行，报告里照样能印出 `EXIT=0`。**
+本次验收时我自己第一版验收脚本就犯了这个错，改成"先重定向到文件、紧接着取 `%ERRORLEVEL%`、再对文件 grep"后复跑，TASK-011 的 5 条命令确认全是真 0（结论未变，但取证方式此前不成立）。
+**规矩**：① 派单模板要求 worker 用"先重定向再取码"的写法；② 我做验收时**一律自己重跑并自己取真码**，不采信报告里的 `EXIT=` 数字；③ 判别力探针的红必须同时给出**非 0 的真退出码**（TASK-011 探针实测 exit 101）。
 
 ### P-4 上一 worker 见宿主存活失败仍固化候选、未阻塞上报 [已验证，档案坐实]
 

@@ -20,14 +20,16 @@ Windows PE 脱壳研究平台（Rust，221k 行，11 个 crate）。把受保护
 ## 最要紧的一件事
 
 **TASK-009 已完成（2026-08-29，缺陷 A 离线级修复）**：dump 重建 fail-open 已堵——兜底清零（`zero_fill_iat_region`，IAT 未重建槽 honest hole）+ fail-closed 门（存在直接 call 指向不可解析槽 → 拒绝写出，`[GOOD]` 不再打印）。恰 3 授权文件 +352/-0，三条验收与两个判别力探针由总指挥亲自复跑全过（见 `runs/20260829-TASK-009.md`）。**注意：修复验证级别 = 离线**；`bb5ee568` 实弹替换验证留待 TASK-006 复跑。
-**下一票：TASK-011**（修 C-7 引擎缺口：text-poll 阶段加 AV 风暴终止 fail-closed，**纯离线零实弹**）——TASK-010 定性 (c) 的主路线；不修则下次实弹格仍会白烧。工单 `tickets/TASK-011.md` 已写好待派。
+**TASK-011 已完成（2026-08-29，C-7 离线级修复）**：text-poll 阶段的 AV 风暴终止已装上——guardless 路径按恒同元组 `(exc, target, exc_type, thread)` 计数、元组变化即清零，达阈值 → `storm_abort` → host 转 `Err` fail-closed（不 dump、不打 `[GOOD]`、日志有界）。4 授权文件 **+281/-0 纯新增**，`.text`-stable 判定零改动；5 条验收命令与判别力探针由总指挥亲跑/独立重做全过（见 `runs/20260829-TASK-011.md`）。**验证级别 = 离线**，真实风暴下的中止效果留待下一格实弹顺带观察。
+**下一票：TASK-012**（C-7 加固：阈值 32 → 4 位数 + 常量拼写 `GARDLESS`→`GUARDLESS` + host 腿 `storm_abort→Err` 补测试，**纯离线零实弹**）——**必须在下一格实弹之前做完**：32 这个阈值对"硬 fail-closed"来说裕量太薄（健康侧实测 0 次 AV，风暴侧 20 万–322 万次），Themida 异常式混淆的紧循环里出现 >32 次合法恒同 AV 完全可能，误杀就白烧一格。工单 `tickets/TASK-012.md` 已写好待派。
+
 **TASK-010 已完成（只读调查，定性 (c)）**：C-6 的基址差异与 AV 风暴**无因果**（同基址成败并存），两时段风暴不同型（04:0x = VM 取指环；21:1x = ScyllaHide NtContinue-hook 区故障环）；真正的放大器是引擎缺口 **C-7**——text-poll 阶段无风暴终止（guardless 无条件 Continue + `text_poll_start` 每事件重置致 30s idle 结构上永不触发）。见 `runs/20260829-TASK-010.md`。
 **TASK-006R 执行结果（2026-08-29）：BLOCKED（验证点不可达）**——构建核验/身份核验/ASLR 基线三关全过，但重脱壳 9/9 次在本会话 text-poll 阶段全部陷入 ntdll 内部 AV 风暴（exc=0x7ffa95400bd8，debuggee image_base 恒为 0x7ff799fc0000 ≠ 上次 0x7ff6c0c60000），`.text` 永不 stable，dump 阶段从未到达：`TASK-009 zero-filled IAT region` / `TASK-009 fail-closed` / `[GOOD] Candidate written` 三个证据点全部 0 命中，无产物。路径 A/B 均未到达（不是修复失败，是路线阻塞）。见 `runs/20260829-TASK-006R.md`。
 **TASK-005 已完成（定级 (b)）**：0x8c4c0 静态存在但 trace 未激活，"216K+ trace 实证"标注作废、降级为静态推断；主链 0x8f099→0x8f374→0x9150d 不受影响，TASK-007 的 dump 目标理由仍成立（GVM 仍 0/8）。
 **流程新规（P-4）**：产物固化类工单必须含"当场存活探针"——产物写完立即跑一次，非 0/259 即阻塞上报。
 （推送按老板裁定停在本地，等他逐次确认；推送前建议补跑 `cargo deny check advisories`。）
 
-工单顺序（**串行派发，同一时间只派一单**——D-014）：TASK-011（修 C-7，离线）→ 之后才考虑再烧实弹格复跑 TASK-006R → T0.5 → TASK-007。TASK-005/009/010 已完成；TASK-006R 已收口（BLOCKED，验证点不可达，实弹 3/4）。
+工单顺序（**串行派发，同一时间只派一单**——D-014）：TASK-012（C-7 加固，离线）→ 之后才考虑再烧实弹格复跑 TASK-006R → T0.5 → TASK-007。TASK-005/009/010/011 已完成；TASK-006R 已收口（BLOCKED，验证点不可达，实弹 3/4）。
 
 ## 30 秒把它跑起来
 

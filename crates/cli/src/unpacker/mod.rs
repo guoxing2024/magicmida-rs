@@ -702,6 +702,13 @@ pub fn unpack(
     };
 
     let guard_protection = PAGE_NOACCESS.0;
+    // C-7: guardless constant-AV storm tracking (persisted across loop
+    // iterations; the AV handler maps these into AvOepState so the decision
+    // body can count identical tuples even though no code guard is installed
+    // during text-poll). Loop-local: not part of LoopState, which is shared
+    // with the guarded AV phase and must not carry text-poll-only counters.
+    let mut guardless_av_tuple: Option<(u64, u64, u8, u32)> = None;
+    let mut guardless_av_tuple_streak: u32 = 0;
     // Image boundary from PE header (pre-ASLR value). Will be rebased after
     // CreateProcess event provides the real image_base.
     let pe_image_boundary = state.pe_info.image_boundary as usize;
@@ -2400,6 +2407,8 @@ pub fn unpack(
                     exception_addr,
                     target_address,
                     exc_type,
+                    &mut guardless_av_tuple,
+                    &mut guardless_av_tuple_streak,
                 )? {
                     AvAction::Continue => {}
                     AvAction::Break => {

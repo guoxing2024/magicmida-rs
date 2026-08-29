@@ -7,7 +7,9 @@
 
 这项目是**活的**（654 次提交，2801 个测试全绿），
 本次接管已把最要紧的风险解掉：**两天的在飞成果已分 8 个提交落到本地 git，`cargo fmt` 从红 216 处变为 0。推送按老板裁定停在本地，等他逐次确认。**
-下一件最要紧的事是 **TASK-009**（修 dump 重建缺陷 A——TASK-006 实弹验收发现 `.rdata 0x1137d0` 槽被固化指向自身 .pdata 的 NX 指针，IAT 重建不完整时管线 fail-open 照常打印 `[GOOD]`）。它是 TASK-006/T0.5 复跑的硬前置。TASK-005（纯离线复核）可并行。
+下一件最要紧的事是 **TASK-012**（C-7 修复加固：风暴阈值 32 → 4 位数 + 常量拼写 + host 腿补测试，纯离线）——**必须在下一格实弹之前做完**，否则新装上的硬 fail-closed 有误杀健康运行、白烧一格的风险。
+两个 fail-open/无终止缺陷已在**离线级**修完：缺陷 A（C-4，dump 重建把不可解析运行时指针固化进只读节 → 兜底清零 + fail-closed 门，TASK-009）与 C-7（text-poll 阶段无 AV 风暴终止 → 恒同元组计数 + fail-closed 中止，TASK-011）。两者的**实弹验证都还没做**：TASK-006R 用掉 1 格但 9/9 陷在 text-poll 风暴里，dump 从未到达（正是 C-7 造成的），所以缺陷 A 的实弹替换验证既未证实也未证伪。
+
 **注意：WO-23 基线门在 HEAD 上是红的**（基线漂移，见 KNOWN_ISSUES G-7 / TASK-008）——推送前必须清还，否则 CI clippy 必红。
 
 ## 存活状态 [已验证]
@@ -103,12 +105,14 @@
 2. ~~P0 — TASK-003：堵住 `check_clippy_baseline.ps1` 的软通过~~ **已完成 R2**（2026-08-29，四条验收由总指挥亲自复跑全过：链接失败 exit 3 / E0308 注入 exit 3 / 镜像基线 exit 0 / deny 不误杀 exit 0；归档 `runs/20260829-TASK-003-R2.md`）。
 3. ~~P1 — TASK-008：清还 clippy 基线漂移~~ **已完成**（2026-08-29，10 个机械位点最小修复，基线 349→337 只降不升；三条验收由总指挥亲自复跑全过：门禁 exit 0 / 全量测试 2801 passed 0 failed / fmt exit 0；归档 `runs/20260829-TASK-008.md`）。
 4. ~~P1 — TASK-004：T0.7 可离线闭环~~ **已完成**（2026-08-29，六条验收由总指挥亲自复跑全过：pe-lib 1042 passed / cli-lib 572 passed / clippy-deny exit 0 / fmt exit 0 / `--help` 可见 / 判别力探针红→绿；归档 `runs/20260829-TASK-004.md`）。
-5. **P1 — TASK-009：修 dump 重建缺陷 A（fail-open）。** TASK-006 实弹验收（2026-08-29）发现重脱壳候选 `bb5ee568` 启动即 AV：`.rdata 0x1137d0` 槽被固化 `0x1401681d1`（指向自身 .pdata，NX），启动期 `call [0x1137d0]` 跳进去；管线在 IAT 重建不完整（`Unresolved=74`）时仍打印 `[GOOD] Candidate written`。缺陷不修，TASK-006/T0.5 无法复跑。归档 `runs/20260829-TASK-006.md`（四项关键声明总指挥字节级亲验坐实）。
+5. ~~P1 — TASK-009：修 dump 重建缺陷 A（fail-open）~~ **已完成（离线级）**（2026-08-29）。TASK-006 实弹验收发现重脱壳候选 `bb5ee568` 启动即 AV：`.rdata 0x1137d0` 槽被固化 `0x1401681d1`（指向自身 .pdata，NX），启动期 `call [0x1137d0]` 跳进去；管线在 IAT 重建不完整（`Unresolved=74`）时仍打印 `[GOOD] Candidate written`。修复 = 兜底清零 + fail-closed 门（恰 3 授权文件 +352/-0）。归档 `runs/20260829-TASK-009.md`；**实弹替换验证仍未做**（TASK-006R 未到达 dump）。
+6. ~~P1 — TASK-011：修 C-7（text-poll 阶段无 AV 风暴终止）~~ **已完成（离线级）**（2026-08-29）。guardless 路径恒同元组计数（元组变化即清零）→ 超阈值 `storm_abort` → host 转 `Err` fail-closed（不 dump、不打 `[GOOD]`、日志有界）。4 授权文件 +281/-0 纯新增，`.text`-stable 判定零改动；5 条验收命令（真 cargo 退出码）与判别力探针由总指挥亲跑/独立重做全过。归档 `runs/20260829-TASK-011.md`。
+7. **P1 — TASK-012：C-7 修复加固（下一格实弹的硬前置）。** 阈值 `32` 对硬 fail-closed 裕量偏薄——实测双峰（健康 0 次 / 风暴 20 万–322 万次），Themida 异常式混淆的紧循环里 >32 次合法恒同 AV 结构上可能 → 误杀就白烧一格；同时改 `GARDLESS`→`GUARDLESS` 拼写、给 host 侧 `storm_abort → Err` 这条腿补自动化测试（现只有代码阅读证据）。工单 `tickets/TASK-012.md`。
 
-老板已批但需排队的实弹工作：TASK-006 复跑（等 TASK-009）、TASK-007（GVM 定向 dump 一格，建议先做 TASK-005 复核）。
-**TASK-006R 执行（2026-08-29）：BLOCKED（验证点不可达）**——构建/身份/ASLR 三关 PASS，重脱壳 9/9 次在本会话 text-poll AV 风暴不收敛（debuggee image_base 恒 0x7ff799fc0000 ≠ 上次 0x7ff6c0c60000），dump 从未到达，三个 TASK-009 证据点 0 命中、无产物；路径 A/B 均未到达（非修复失败，是路线阻塞）。T0.5 继续 BLOCKED。归档 `runs/20260829-TASK-006R.md`。
+老板已批但需排队的实弹工作：TASK-006R 再复跑（需再批 1 格，会到 XC-XXI-B 4/4；**前置 = TASK-012**）、TASK-007（GVM 定向 dump 一格，D-012 已批，开跑前须交"写定五项"）。
+**TASK-006R 执行（2026-08-29）：BLOCKED（验证点不可达）**——构建/身份/ASLR 三关 PASS，重脱壳 9/9 次在本会话 text-poll AV 风暴不收敛（debuggee image_base 恒 0x7ff799fc0000 ≠ 上次 0x7ff6c0c60000），dump 从未到达，三个 TASK-009 证据点 0 命中、无产物；路径 A/B 均未到达（非修复失败，是路线阻塞）。**根因已由 TASK-010 定性 (c) 并落到 C-7，修复见 TASK-011。** T0.5 继续 BLOCKED。归档 `runs/20260829-TASK-006R.md`。
 
 ## 下一步
 
-TASK-009（修缺陷 A）→ TASK-006 复跑 → T0.5 续跑；TASK-005 纯离线可并行，完成后再开 TASK-007。
+TASK-012（C-7 加固，离线）→ 再批 1 格复跑 TASK-006R（同时顺带观察 C-7 中止的实弹效果：恒同环 ~阈值次事件内触发 `guardless constant-AV storm abort`、无 dump、无 `[GOOD]`、日志非 3.5GB 级）→ T0.5 续跑 → TASK-007。
 推送时机由老板定；推送前建议补跑 `cargo deny check advisories`（本机离线跑不了）。

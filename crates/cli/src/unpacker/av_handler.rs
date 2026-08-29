@@ -40,6 +40,8 @@ pub(super) fn handle_access_violation(
     exception_addr: u64,
     target_address: u64,
     exc_type: u8,
+    guardless_av_tuple: &mut Option<(u64, u64, u8, u32)>,
+    guardless_av_tuple_streak: &mut u32,
 ) -> Result<AvAction, anyhow::Error> {
     debug!(
         exc = %format!("{exception_addr:#x}"),
@@ -69,6 +71,9 @@ pub(super) fn handle_access_violation(
         virtualized_oep_retries: ls.virtualized_oep_retries,
         last_possible_oep: ls.last_possible_oep,
         storm_escape_freeze: false,
+        guardless_av_tuple: *guardless_av_tuple,
+        guardless_av_tuple_streak: *guardless_av_tuple_streak,
+        storm_abort: None,
     };
     let input = AvOepInput {
         event_thread_id: thread_id,
@@ -99,6 +104,9 @@ pub(super) fn handle_access_violation(
     ls.unrelated_av_streak = outcome.state.unrelated_av_streak;
     ls.virtualized_oep_retries = outcome.state.virtualized_oep_retries;
     ls.last_possible_oep = outcome.state.last_possible_oep;
+    // C-7: persist guardless tuple tracking back to the loop for the next AV.
+    *guardless_av_tuple = outcome.state.guardless_av_tuple;
+    *guardless_av_tuple_streak = outcome.state.guardless_av_tuple_streak;
     if outcome.state.storm_escape_freeze {
         ls.storm_escape_freeze = true;
     }
@@ -114,6 +122,15 @@ pub(super) fn handle_access_violation(
             // Fall through to the shared post-OEP epilogue below.
         }
         AvOepAction::Break { .. } => {
+            // C-7: a guardless constant-AV storm abort must fail closed (no
+            // dump, no [GOOD], bounded logs). The decision already recorded
+            // the tuple + count for diagnostics; surface it as an Err so the
+            // debug loop unwinds instead of falling through to IAT/dump.
+            if let Some((tuple, count)) = &outcome.state.storm_abort {
+                return Err(anyhow!(
+                    "guardless constant-AV storm abort (fail-closed): identical AV tuple {tuple} repeated {count} times without guard installed; aborting unpack"
+                ));
+            }
             // Break deliberately leaves the current AV pending so the
             // post-loop IAT phase can consume it.
             return Ok(AvAction::Break);

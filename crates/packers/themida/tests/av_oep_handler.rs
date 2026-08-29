@@ -5,6 +5,7 @@
 //! ops, redirects, continues) and which action is returned. No Win32, no
 //! debugger.
 
+use mida_packers_themida::runtime::av_oep_handler::GARDLESS_AV_STORM_TUPLE_THRESHOLD;
 use mida_packers_themida::{
     decide_av_oep, AvOepAction, AvOepInput, AvOepQuery, AvOepState, GuardAccessResult, LogLevel,
     ThemidaPeInfo, ThemidaState, ThemidaVersion, TlsCallbackResult,
@@ -173,6 +174,175 @@ fn unrelated_av_without_guard_returns_continue() {
     // No guard ops and no redirects: the host only continues once.
     assert_eq!(query.guard_removes, 0);
     assert!(query.redirects.is_empty());
+    // C-7: single guardless AV seeds the tuple with streak 1, never aborts.
+    assert!(out.storm_abort.is_none());
+    assert_eq!(out.guardless_av_tuple_streak, 1);
+    assert_eq!(
+        out.guardless_av_tuple,
+        Some((BASE + 0x1000, BASE + 0x1000, 8, 2))
+    );
+}
+
+/// C-7 defect capture: a guardless run repeating the *identical*
+/// `(exc, target, exc_type, thread)` tuple past the threshold must abort
+/// fail-closed instead of continuing forever.
+///
+/// Two live-fire geometries are exercised:
+/// - 21:1x storm (ScyllaHide NtContinue-hook fault ring):
+///   `exc=0x7ffa95400bd8, target=0x204` (low-value handle, exc_type 0 = read
+///   access; the exact live-fire exc_type was not captured, so the read-fault
+///   type is the structurally-consistent choice for a `test byte ptr` read).
+/// - 04:0x storm (VM fetch ring): `exc=target=0x1108e3761a0, exc_type=8`
+///   (execute access into an unmapped gap) — per TASK-010 the identical
+///   tuple repeated 3.22M times there.
+#[test]
+fn guardless_constant_av_tuple_aborts_fail_closed_21_1x_geometry() {
+    let mut query = ScriptedQuery::default();
+    let mut themida = state();
+    let mut av = AvOepState::default();
+    let mut input = input();
+    input.exception_addr = 0x7ffa_9540_0bd8;
+    input.target_address = 0x204;
+    input.exc_type = 0;
+    input.event_thread_id = 25252;
+
+    // Drive below the threshold: must keep Continue with a running streak.
+    for _ in 0..(GARDLESS_AV_STORM_TUPLE_THRESHOLD - 1) {
+        let (action, out) = decide(&mut query, &mut themida, &mut av, &input);
+        assert_eq!(action, AvOepAction::Continue, "below threshold continues");
+        assert!(out.storm_abort.is_none());
+        av = out;
+    }
+    assert_eq!(
+        av.guardless_av_tuple_streak,
+        GARDLESS_AV_STORM_TUPLE_THRESHOLD - 1
+    );
+
+    // The threshold hit: fail-closed abort (Break with storm_abort set).
+    let (action, out) = decide(&mut query, &mut themida, &mut av, &input);
+    assert!(
+        matches!(action, AvOepAction::Break { .. }),
+        "got {action:?}"
+    );
+    let (tuple_text, count) = out
+        .storm_abort
+        .as_ref()
+        .expect("storm abort must be recorded");
+    assert_eq!(*count, GARDLESS_AV_STORM_TUPLE_THRESHOLD);
+    assert!(
+        tuple_text.contains("0x7ffa95400bd8") && tuple_text.contains("0x204"),
+        "abort tuple must identify the storm geometry: {tuple_text}"
+    );
+}
+
+/// C-7 defect capture, second geometry: the 04:0x VM fetch ring
+/// (exc=target=0x1108e3761a0, exc_type=8 execute access).
+#[test]
+fn guardless_constant_av_tuple_aborts_fail_closed_04_0x_geometry() {
+    let mut query = ScriptedQuery::default();
+    let mut themida = state();
+    let mut av = AvOepState::default();
+    let mut input = input();
+    input.exception_addr = 0x1108_e376_1a0;
+    input.target_address = 0x1108_e376_1a0;
+    input.exc_type = 8;
+    input.event_thread_id = 12252;
+
+    for _ in 0..(GARDLESS_AV_STORM_TUPLE_THRESHOLD - 1) {
+        let (action, out) = decide(&mut query, &mut themida, &mut av, &input);
+        assert_eq!(action, AvOepAction::Continue);
+        assert!(out.storm_abort.is_none());
+        av = out;
+    }
+    let (action, out) = decide(&mut query, &mut themida, &mut av, &input);
+    assert!(
+        matches!(action, AvOepAction::Break { .. }),
+        "got {action:?}"
+    );
+    let (tuple_text, count) = out
+        .storm_abort
+        .as_ref()
+        .expect("storm abort must be recorded");
+    assert_eq!(*count, GARDLESS_AV_STORM_TUPLE_THRESHOLD);
+    assert!(
+        tuple_text.contains("0x1108e3761a0") && tuple_text.contains("exc_type=8"),
+        "abort tuple must identify the VM fetch ring: {tuple_text}"
+    );
+}
+
+/// C-7 anti-false-positive: a *changing* guardless AV tuple (the VM
+/// progressing through diverse faults) must never abort, no matter how many
+/// events arrive.
+#[test]
+fn guardless_changing_tuple_never_aborts() {
+    let mut query = ScriptedQuery::default();
+    let mut themida = state();
+    let mut av = AvOepState::default();
+    let mut input = input();
+
+    // Alternate between two tuples far more times than the threshold.
+    for i in 0..(GARDLESS_AV_STORM_TUPLE_THRESHOLD * 4) {
+        input.exception_addr = BASE + 0x1000 + u64::from(i % 2) * 0x40;
+        input.target_address = BASE + 0x2000 + u64::from(i % 2) * 0x40;
+        input.exc_type = (i % 2) as u8;
+        input.event_thread_id = 2 + (i % 2);
+        let (action, out) = decide(&mut query, &mut themida, &mut av, &input);
+        assert_eq!(
+            action,
+            AvOepAction::Continue,
+            "changing tuple must continue"
+        );
+        assert!(
+            out.storm_abort.is_none(),
+            "diverse AV flow must never abort (iter {i})"
+        );
+        assert!(
+            out.guardless_av_tuple_streak <= 1,
+            "tuple change must reset the streak (iter {i})"
+        );
+        av = out;
+    }
+}
+
+/// C-7 regression guard: with the code guard installed the legacy
+/// `unrelated_av_streak` semantics are untouched — the new guardless tuple
+/// counter must not fire, and the NotGuarded storm escape still behaves as
+/// before.
+#[test]
+fn guarded_path_unrelated_av_streak_unchanged() {
+    let mut query = ScriptedQuery::with_guard(GuardAccessResult::NotGuarded);
+    let mut themida = state();
+    let mut av = AvOepState {
+        guard_installed: true,
+        virtualized_oep_retries: 1,
+        last_possible_oep: Some((BASE + 0x13e0) as usize),
+        unrelated_av_streak: 7,
+        guardless_av_tuple: Some((BASE + 0x1000, BASE + 0x1000, 8, 2)),
+        guardless_av_tuple_streak: 31,
+        ..AvOepState::default()
+    };
+    let mut input = input();
+    input.unrelated_av_storm_threshold = 8;
+    let (action, out) = decide(&mut query, &mut themida, &mut av, &input);
+    match action {
+        AvOepAction::Break {
+            oep, provenance, ..
+        } => {
+            assert_eq!(oep as u64, BASE + 0x13e0);
+            assert_eq!(provenance.source, mida_core::OepSource::Unknown);
+        }
+        other => panic!("expected Break, got {other:?}"),
+    }
+    assert!(out.storm_escape_freeze);
+    assert_eq!(out.unrelated_av_streak, 8);
+    // The guardless tuple counter is dormant on the guarded path: the
+    // pre-seeded 31-streak tuple must NOT trigger a C-7 storm abort even
+    // though it sits above the threshold — only the guarded NotGuarded
+    // escape (unrelated_av_streak) decides here.
+    assert!(
+        out.storm_abort.is_none(),
+        "guarded path must not fire the guardless storm abort"
+    );
 }
 
 #[test]
