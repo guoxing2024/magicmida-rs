@@ -157,15 +157,19 @@ WO-24 于 2026-08-27（提交 `607276d`）锁定 `_clippy_baseline`（TOTAL=349�
 - 每次运行内**恒同元组唯一**（`sort -u` 恰 1 条）× 1024 次，C-7 判据形状再次被证实。
 - 累计 **13/13 次跨 3 个 boot** 确定性撞同一故障环（006R 9 + 006R2 2 + 006R3 2）。**"重启后重试"这条路已经走到头了**——TASK-006R2 时我把它列为"近乎免费的探测"，探测做了，结果是阴性，这条路可以关掉了。
 - **总指挥读日志发现的抓手（TASK-013 的起点）**：`target/release/` 下**没有 `scylla_hide.ini`**，运行日志里也无任何读 ini/config 的痕迹，而 `scylla_hide.log` 显示 `Hooking KiUserExceptionDispatcher` 与 `Hooking NtContinue` **都装上了**；对照 vault 参考 ini（`D:/MidaVault/quarantine/20260722/workspace/magicmida-rs/scylla_hide.ini`）那里 `KiUserExceptionDispatcherHook=0`。→ **我们是在无配置状态下注入，ScyllaHide 默认把所有 hook 都装上**，包括跟壳打架的异常分发链。引擎里配置口子其实留着（`antidebug_controller.rs:507` 的 `OracleMode.ini_path`，挂着 `#[allow(dead_code)]`），**留了没接线**。[已验证]
-- **待办**：~~TASK-013~~ **已完成并验收（2026-08-30，见下块）** → 下一格实弹 TASK-006R4 带受控 ini 重跑（待老板批格 + `C:\Windows` 落位放行）。
+- **待办**：~~TASK-013~~ 已完成并验收；~~TASK-006R4~~ **已执行并验收（2026-08-30，终态 STOP：`C:\Windows` 落位方案结构性无效）** → 下一步 TASK-006R5（需授权改代码把受控 ini 落到 InjectorCLI 同目录 + 一格实弹）。
 
-**TASK-013 追加（2026-08-30，已验收，总指挥亲验）：配置为何从未被读——ini 查找规则已实证。**
-- `InjectorCLIx64.exe` 用 `GetPrivateProfileStringW` + **裸相对名** `scylla_hide.ini` 读配置，相对名只搜 **Windows 目录**（原生 API 实证：cwd 放同名 ini NOTFOUND、绝对路径命中、Windows 目录命中）。二进制导入表亲验：`GetCurrentDirectoryW` / `SetCurrentDirectoryW` / `SearchPathW` / `GetFullPathNameW` 全部 **0 命中** → 改 cwd、把 ini 放 exe 旁**都没用**。这同时解释了 scratch 目录里与注入器同目录的 ini（两开关=0）为何从未生效——**此前所有实弹（13/13）全部处于"无 ini、全默认 hook"状态**。[已验证]
+**TASK-013 追加（2026-08-30）+ TASK-006R4 勘误（同日实弹实证推翻其中一条）：ini 查找规则的最终定论。**
+- ~~`InjectorCLIx64.exe` 用裸相对名读配置、只搜 Windows 目录、放 exe 旁没用~~ —— **这条 TASK-013 结论错误，已由 TASK-006R4 推翻（详见本块末尾"定案版"第 1 条）**。正确结论：InjectorCLI 用 `GetModuleFileNameW` 拿自身 exe 路径，读 **`<exe目录>/scylla_hide.ini`**；放 exe 同目录**有效**，放 `C:\Windows` **无效**。TASK-013 的探针测的是裸相对名的 API 语义（该语义本身正确），但 InjectorCLI 传的是绝对路径，故不适用。**教训（新 P-9）：探针必须打在被测程序的实际调用路径上；只验 API 语义就宣布"程序行为如何"，会把一个正确的 API 结论变成一个错误的程序结论，并据此烧掉一格实弹。**
 - `NtContinueHook` 是真实配置键（二进制 wide 字符串命中 + 两份 vault 参考 ini 均含 `NtContinueHook=0`）。**工单前提修正**：我当初写"参考 ini 里没有这个键"是**读漏了**（总指挥亲验 grep：quarantine 版行 35、Magicmida 版行 13），worker 如实纠正——前提错了，修法未受影响。
 - 已交付：`ini_path` 接线（去 dead_code）+ 日志行 `SCYLLAHIDE_HOOK_CONFIG_SOURCE=` + walker/failure 两个证据 sidecar 新增 `scylla_hide_config_source` 字段 + 受控 ini `D:/MidaVault/lab/config/scylla_hide_no_excdispatch.ini`（与参考基线逐键一致 42/42，异常分发两开关显式 0）。
-- **注意混杂变量（TASK-006R4 设计要点）**：受控 ini 相对"无 ini 全默认"的差异**不止两个开关**，是整套 UncoverEngine profile（约 30 键）。若 R4 走通，归因到具体开关需后续最小差分 ini 变体（另立单）。
-- **受控 ini 生效的唯一路径（授权内）= 实弹前操作员落位 `C:\Windows\scylla_hide.ini`，跑完必须删**。已核验当前 `C:\Windows` 无 scylla/test_profile 残留 ini。
-- **熊熊线旁证（2026-08-30 老板两轮追问，最终定案——此前两版都混淆了两条线，本版为勘正版）**：老板说的"熊熊线"= `D:\Tools\RE\dumps\xiongxiong\熊熊.exe`（sha256 `78009803…`，即本 case 样品本身），不是 core.dll。**老板"用了的"记忆是对的**：该线的成功实弹（xx11，2026-08-28 11:22，产出 `rev2_unpacked.exe` sha256 `36043cb4…`，与 XX21B step1 部署宿主精确匹配）**确实注入了 ScyllaHide**——XX10A 报告实弹命令原文 `MIDA_LEGACY_ANTIDEBUG=1 mida-cli /unpack …`（档案坐实），TASK-006R 报告亦载"与上次 run_dump.sh 完全一致"（同开关）。但 ini 从未被读到（Windows-dir-only，TASK-013 三重实证）→ **xx11 的成功是在"注入了、但全默认 hook"状态下取得的**（含 KiUserExceptionDispatcher + NtContinue 全开）。**由此浮出的新事实**：同一样品、同一注入器、同一全默认 hook——08-28 的 boot 上成功，08-29/30 的 boot 上 13/13 确定性撞环（xx11 dump 记 image_base `0x7ff7f3d10000`；006R 恒 `0x7ff799fc0000`）→ **环的触发是 ASLR 布局依赖的**：不是每个 boot 的布局都会踩进 NtContinue-hook+8 的故障路径。这与 C-6 的因果结论（风暴 RIP 恒 = hook+8，两 boot 实锤）**不矛盾**——因果实锤说的是"撞环时环在哪"，这里说的是"哪个布局会撞环"。对 R4 的含义：受控 ini（直接拆掉异常分发 hook）比"赌下一个 boot 布局"是更确定的路。**core.dll 支线另论**：那条线（XC-2 → XX21 → XX21B 固化 `core_perfect_candidate.dll`）走 LoadLibraryW 真宿主，成功路径确无注入（15:26 的注入日志属失败探针，档案原话"AV 风暴 → 永不达 .text-stable"）。**两次误归因的教训已入账：下结论前先钉死"哪条线、哪次运行"。**
+- **注意混杂变量（下一格实弹的设计要点）**：受控 ini 相对"全默认 hook"的差异**不止两个开关**，是整套 UncoverEngine profile（约 30 键）。若下一格走通，归因到具体开关需后续最小差分 ini 变体（另立单）。
+- ~~受控 ini 生效的唯一路径 = 落位 `C:\Windows\scylla_hide.ini`~~ —— **已被 R4 推翻**。正确路径 = 落到 **InjectorCLI 同目录**（`target/release/`），但 ARTIFACT_POLICY 第 11 条明确禁止活动工作区出现名为 `scylla_hide.ini` 的文件（gitignore 不构成例外）→ **授权内无路径，必须改代码**（见"定案版"第 4 条）。R4 落位的 `C:\Windows\scylla_hide.ini` 已删净（总指挥复核：`ls /c/Windows/*.ini` 只剩 system.ini / win.ini）。
+- **熊熊线旁证（2026-08-30 定案版——此前三版归因皆误，本版以 R4 反汇编 + 历史日志双重实证收口）**：
+  1. **TASK-013 的"InjectorCLI 只搜 Windows 目录"结论错误**（R4 发现，总指挥反汇编独立证实）：InjectorCLI 实际用 `GetModuleFileNameW` 拿自身 exe 路径、读 **`<exe目录>/scylla_hide.ini`**（IAT 槽 0x6f150=GetModuleFileNameW / 0x6f158=GetPrivateProfileSectionNamesW，调用点 0x14000ce7f / 0x14000cf9a 亲验）；notepad 注入 A/B/C 三实验：exe 同目录有 ini → 受控生效；仅 C:\Windows 有 → 全默认；cwd 无关。TASK-013 的 API 语义探针（裸相对名）测的是 Windows 对相对名的搜索规则，对 InjectorCLI 传入绝对路径的实际行为不适用——**C:\Windows 落位方案结构性无效**。
+  2. **15:26 历史 scratch 日志重读（总指挥覆盖前亲读）：那份 ini 当年就生效了**——15 个 `Hooking X` 安装行恰不含 ini 三个 =0 键（NtClose/NtContinue/KiUserExceptionDispatcher），NtQueryObject(=1) 在列；`ApplyNtdllHook -> _NtContinue …` 那行是**地址枚举清单**，不是安装记录。前两版"ini 被无视/全默认 hook"的归因错在读混了这两类行。**该日志已被 R4 探针覆盖（新 P-8），关键行内容已在此存档。**
+  3. **xx 线与 006R 线成败的统一解释（撤回 e8bda46 的"ASLR 布局依赖"假说）**：xx 时代实弹跑在 scratch 环境（mida-cli 与 InjectorCLI 同目录，ini 就在旁 → 异常分发链关闭）→ 成功；006R/R2/R3/R4 跑在 target/release（InjectorCLI 旁无 ini → 全默认 hook，异常分发链开启）→ 14/14 撞环。**不是布局运气，是配置差异**——xx11 的成功状态恰好就是"关闭异常分发 hook"（R4 的实验目标）。[xx11 具体使用 scratch 构建为推断——scratch 目录两者共存且时间吻合；ini 生效机制本身为已验证]
+  4. **对 R5 的含义**：受控 ini 落到 **InjectorCLI 同目录** = 复现 xx 线成功配置。授权内唯一路径 = 改代码（`scyllahide.rs` spawn 前落位 或 `helpers.rs` 指向工作区外 staging 目录），需老板授权。
 
 
 ### C-7 text-poll 阶段无 AV 风暴终止机制（引擎结构缺口，TASK-010 发现）[**已修 + 实弹验证通过** —— TASK-011 修 / TASK-012 加固 / TASK-006R2 实弹坐实]
@@ -254,6 +258,16 @@ CI 的 `on.push.branches` 已经把 `oreans/two-sample-mainline` 列为一等分
 
 TASK-013 落地代码里 "hook" 一词有 6+ 处写成了西里尔 `о`（U+043E）而非 ASCII `o`（`helpers.rs` 的显示串 `"无 ini（ScyllaHide 默认全 hооk）"` 与注释、`antidebug_controller.rs` 的测试断言与断言消息、报告标题同源）。测试内部自洽所以全绿，**但按 ASCII `hook` 去 grep 日志/sidecar 会漏**（`SCYLLAHIDE_HOOK_CONFIG_SOURCE=` 前缀和 `无 ini` 子串仍可 grep，实际影响面小）。
 **规矩**：① 下次任何 worker 获授权碰这三个文件时，顺手把西里尔 о 归一为 ASCII o（含对应测试断言，一处不漏）；② 我以后验收新增用户可见字符串时加一条"纯 ASCII/CJK 检查"。
+
+### P-9 探针打在 API 语义上而不是被测程序的实际调用路径上，烧掉一格实弹 [已验证，2026-08-30 TASK-006R4 实弹实证推翻 TASK-013]
+
+TASK-013 用 P/Invoke 探针验证了"裸相对名传给 `GetPrivateProfileStringW` 只搜 Windows 目录"——**这个 API 结论是对的**。但 InjectorCLI 的实际调用路径是 `GetModuleFileNameW` → 拼出 exe 同目录绝对路径 → 才调 `GetPrivateProfile*`，所以那条 API 语义**对它不适用**。我验收时复验的是导入表（`GetCurrentDirectoryW`/`SearchPathW`/`GetFullPathNameW` 0 命中——这些也都是真的，因为它用的是 `GetModuleFileNameW`，不在我列的名单里），**没有反汇编看文件名参数从哪来**，于是把一个正确的 API 结论当成了程序行为结论批了过去。据此写的 R4 工单要求落位 `C:\Windows` → 结构性无效 → **一格实弹（XC-XXI-B → 6/4）没产出任何有效尝试数据**。责任在我这一侧（验收把关不严），不在 worker。
+**规矩**：① 凡"某程序从哪读文件/怎么解析路径"这类结论，验收必须要求**实际调用点证据**（反汇编 / API monitor / 受控 A-B 对照实验），API 文档语义与导入表只能作辅证；② 用"缺失的导入"作反证时，必须先穷举**能达到同一目的的所有 API**（`GetModuleFileNameW`、`GetModuleHandleW`+拼接 等），否则"没导入 X 所以做不到 Y"是伪推理；③ 涉及实弹前置的路径类结论，**先做一次零成本受控 A/B 实验**（R4 worker 的 notepad 三实验即范本，成本几分钟）再烧格。
+
+### P-8 历史 scylla_hide.log 被新一次注入覆盖，证据窗口只有一次 [已验证，2026-08-30 发现]
+
+`scylla_hide.log` 由 ScyllaHide 写在 **InjectorCLI 同目录**且**每次注入覆盖**。scratch 目录里那份 2026-08-28 15:26 的日志（xx 线的关键旁证：证明受控 ini 当年生效——15 条 `Hooking X` 安装行恰不含 ini 中三个 =0 的键）**已在 R4 的探针注入中被覆盖**（现存内容为 08-30 03:56 的 8 行 VA 枚举）。关键行内容已在 C-6 块内存档，但原始文件不可恢复。
+**规矩**：① 任何一格实弹的 `scylla_hide.log` **必须在下一次注入前**复制进 vault（R4 worker 做到了：`scylla_hide_livefire_attempt1.log`）；② 离线探针若会触发注入，先备份当前 log 再跑；③ 引用 scylla 日志作证据时，报告里附**当次日志的 vault 副本路径**，不要引用 `target/release/` 或 scratch 里的活文件。
 
 ### P-5 报告里的 `EXIT=0` 有可能是 grep/findstr 的退出码，不是 cargo 的 [已验证，2026-08-29 TASK-011 验收时发现]
 

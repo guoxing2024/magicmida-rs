@@ -28,7 +28,10 @@ Windows PE 脱壳研究平台（Rust，221k 行，11 个 crate）。把受保护
 **TASK-006R3 已执行（2026-08-30，1 格，终态 = 路径 C）：换 boot 没换掉故障环 —— 缺陷 A 结构性不可达。**
 新 boot（`01:28:40`）的 ASLR 全变（ntdll `0x7ffa952a0000`→`0x7ff857620000`、debuggee image_base `0x7ff799fc0000`→`0x7ff729430000`），但风暴 RIP **恒等于 ScyllaHide 的 NtContinue hook 地址 +8**（两 boot 各自自洽，偏移都是 ntdll+0x160bd8）。**同一现象在两套完全不同地址下复现 = 实锤：不是 ASLR 运气，是 ScyllaHide 的 NtContinue hook 与壳的异常分发确定性打架。** 累计 **13/13 次跨 3 个 boot**。C-7 再次 2/2 主动中止（AV 恰 1024、20ms、312KB、无产物无残留），但它在 dump 之前，所以缺陷 A 三个证据点仍 0 命中。见 `runs/20260830-TASK-006R3.md`。
 **"重启后重试"这条路已经走到头**：TASK-006R2 时我把它列为"近乎免费的探测"，探测做了，结果阴性，关掉。
-**TASK-013 已完成并验收（2026-08-30，零实弹）**：ScyllaHide hook 选择已可控可记录——`ini_path` 接线（去 dead_code）、日志行 `SCYLLAHIDE_HOOK_CONFIG_SOURCE=` + 两个证据 sidecar 新增 `scylla_hide_config_source` 字段、受控 ini 入 vault（`D:/MidaVault/lab/config/scylla_hide_no_excdispatch.ini`，异常分发两开关显式 0）。TASK-013 实证：InjectorCLI 用裸相对名读 ini **只搜 Windows 目录**（cwd/exe 旁都没用）→ 受控 ini 生效的唯一路径是实弹前落位 `C:\Windows\scylla_hide.ini`（跑完必删）。**下一票：TASK-006R4（已授权 2026-08-30，可直接派，见 D-018）**——带受控 ini 重跑，看 text-poll 能否首次收敛到 dump（缺陷 A 路径 A/B 首次真正可达）。工单 `tickets/TASK-006R4.md`。
+**TASK-006R4 已执行并验收（2026-08-30，1 格，终态 STOP）：落位方案结构性无效，但换回了决定性发现。**
+`C:\Windows\scylla_hide.ini` 落位**不生效**——InjectorCLI 实际用 `GetModuleFileNameW` 拿自身 exe 路径，读 **`<exe目录>/scylla_hide.ini`**（worker 反汇编 + notepad A/B/C 三实验；总指挥独立复验 IAT 槽 0x6f150/0x6f158 精确对上）。**TASK-013 的"只搜 Windows 目录"结论错误**——它测的是裸相对名的 API 语义（那本身对），但 InjectorCLI 传的是绝对路径。**责任在我：验收时只查导入表、没反汇编看文件名参数从哪来，据此写的工单烧掉一格实弹（→ 新 P-9）**。attempt1 因 ini 未生效被强门判无效（未当路径证据），worker 未硬跑第二次，收尾满分（`C:\Windows` 删净、vault 5 件、探针环境清零）。
+**连带修正**：此前 **14/14** 次实弹全部处于"全默认 hook、异常分发链开启"状态；xx 线当年成功是因为跑在 scratch 目录（注入器旁就有受控 ini → 异常分发链关闭）。**e8bda46 的"ASLR 布局依赖"假说撤回**——不是布局运气，是配置差异。
+**下一票：TASK-006R5（待授权）** —— 改代码把受控 ini 落到注入器同目录（推荐工作区外 staging，避开 ARTIFACT_POLICY 第 11 条）+ 一格实弹重跑。需老板批两件：`crates/` 改动授权 + 一格实弹（6/4 → 7/4）。工单 `tickets/TASK-006R5.md`。
 
 
 **TASK-010 已完成（只读调查，定性 (c)）**：C-6 的基址差异与 AV 风暴**无因果**（同基址成败并存），两时段风暴不同型（04:0x = VM 取指环；21:1x = ScyllaHide NtContinue-hook 区故障环）；真正的放大器是引擎缺口 **C-7**——text-poll 阶段无风暴终止（guardless 无条件 Continue + `text_poll_start` 每事件重置致 30s idle 结构上永不触发）。见 `runs/20260829-TASK-010.md`。
@@ -37,7 +40,7 @@ Windows PE 脱壳研究平台（Rust，221k 行，11 个 crate）。把受保护
 **流程新规（P-4）**：产物固化类工单必须含"当场存活探针"——产物写完立即跑一次，非 0/259 即阻塞上报。
 （推送按老板裁定停在本地，等他逐次确认；推送前建议补跑 `cargo deny check advisories`。）
 
-工单顺序（**串行派发，同一时间只派一单**——D-014）：**TASK-006R4（已授权 2026-08-30，XC-XXI-B 5/4→6/4 + `C:\Windows` 落位放行，见 D-018）→ T0.5 续跑 → TASK-007**。TASK-005/009/010/011/012/013 已完成；TASK-006R/R2/R3 已收口（终态均路径 C，实弹 5/4）。**离线侧无待办工单。**
+工单顺序（**串行派发，同一时间只派一单**——D-014）：**TASK-006R5（待老板批：`crates/` 改动 + 一格实弹 6/4→7/4）→ T0.5 续跑 → TASK-007**。TASK-005/009/010/011/012/013 已完成；TASK-006R/R2/R3 终态路径 C、TASK-006R4 终态 STOP（实弹累计 **6/4**）。**离线侧无待办工单。**
 
 ## 30 秒把它跑起来
 
