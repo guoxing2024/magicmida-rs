@@ -75,13 +75,19 @@ CI 是 fresh checkout 且 `CARGO_TARGET_DIR` 指向仓库外，这些都不会�
 `checker_errors`（这四项与本机杂物无关，当前都是 0），忽略 `forbidden_artifacts` / `cache_directories` / `git_dirty`。
 读退出码时不要接管道。
 
-### G-6 那 1.3 GB 实弹证据不该躺在仓库工作区里 [已验证，未处理]
+### G-6 那 1.3 GB 实弹证据不该躺在仓库工作区里 [**已处理**，2026-08-30，D-017 授权]
 
 `lab/xx21b_resume/`（1.1 GB，115 文件）、`lab/xx21b_run_ui/`（145 MB）、`lab/xx21_s4/`（31 MB）、
-`lab/xx21b_run/`（30 MB）、`lab/xx21b_matrix/`（7.3 MB）都是未跟踪的实弹证据。
-按 `ARTIFACT_POLICY.md` 它们属于内容寻址 vault（`D:/MidaVault/lab/evidence/`），不属于仓库工作区。
-**为什么还在这**：不知道，接管前就在。**没动的原因**：搬移证据是有风险的操作（万一 vault 里没有副本就成了删除），
-且不属于任何已批工单。**怎么办**：需要先确认 vault 里已有副本，再决定搬或删。这件事要老板或熟悉 vault 布局的会话来定。
+`lab/xx21b_run/`（30 MB）、`lab/xx21b_matrix/`（7.3 MB）、`tools/xx21_monitor*_out/` 都是未跟踪的实弹证据。
+按 `ARTIFACT_POLICY.md` 它们属于内容寻址 vault，不属于仓库工作区。
+
+**处理（总指挥执行，老板 D-017 授权动大文件）**：
+- **目的地**：`D:/MidaVault/lab/worktree_evidence_20260830/`，**保留原相对路径结构**（`lab/xx21b_resume/...` → `<dest>/lab/xx21b_resume/...`），所以 `runs/`、`docs/` 里既有的旧路径引用（例如 TASK-010 引用的 `lab/xx21b_resume/redump2/*`）都能按同一相对路径在 vault 里找回。
+- **做法**：**先拷贝 → 全量 sha256 校验 → 才删源**，不用一步到位的移动。
+- **校验**：205 个文件、1,398,827,431 字节，源与目的两份 sha256 清单（含相对路径）`diff` **完全一致**；清单存为 `<dest>/MANIFEST.sha256`，`<dest>/README.txt` 里写了可复算的一行校验命令，并已当场复算通过一次。
+- **顺带发现的重复**：`lab/xx21b_006r2/` 的 3 个文件与 `D:/MidaVault/lab/evidence/xx21b_006r2/` 里的**字节完全相同**（sha256 逐一对上），所以直接删掉，未二次归档。
+- **结果**：`lab/` 从 1.3 GB 降到 **304 KB**；`git status` 的未跟踪项只剩 `.workbuddy-ai/` 与 3 个小文件（`tools/xx21_msvc_env.cmd`、`tools/xx21_step1_static_out.json` 28 KB、`tools/xx21_step1_static_deep_out.json` 14 KB）——后两个是 TASK-005/010 报告直接引用的静态分析产物，共 42 KB，**故意留在原地**避免打断引用链。
+- **注意**：工作区仍有 **2.7 GB 的 `target/`**，那是 Rust 构建缓存（已 gitignore），不是证据、不违反 ARTIFACT_POLICY；删它只会换来一次长时间全量重建，**不建议动**。
 
 ### G-7 clippy 基线自 WO-24 锁定后已漂移，HEAD 上 WO-23 门禁是红的 [已验证，**已修（TASK-008）**]
 
