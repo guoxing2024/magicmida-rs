@@ -113,13 +113,14 @@ WO-24 于 2026-08-27（提交 `607276d`）锁定 `_clippy_baseline`（TOTAL=349�
 **根因**：疑似 SecureEngine 类保护执行驱动逐页解密 —— 任何独立重跑都必然踩到密文页。
 **怎么办**：不要再尝试 dump 路线。已转向 GVM-0 反虚拟化战役（VM 语义还原 → lifter → 整镜像去虚拟化）。
 
-### C-4 dump 重建会把不可解析的运行时指针固化进只读节（缺陷 A，fail-open）[已验证，TASK-009 修复中]
+### C-4 dump 重建会把不可解析的运行时指针固化进只读节（缺陷 A，fail-open）[已验证，**TASK-009 已修**（离线级）]
 
 **现象**：当前会话重脱壳产物 `rev2_unpacked_fixed.exe`（`bb5ee568…`）启动初始化期即 AV（10/10 隔离运行 0xc0000005），core.dll 从未加载。
 **根因（总指挥字节级复验坐实）**：`.rdata` RVA `0x1137d0` 槽被固化 `0x1401681d1`（= 自身 .pdata 中间，NX）；`.text 0xde785` 的 `call [0x1137d0]` 启动期跳进去。对照同次脱壳的未修复宿主 `698b1172` 同槽是 hint/name RVA（可解析）——重建阶段写入的坏值。
 **管线知情却 fail-open**：`iat_evidence.json` 记录 `iat_evidence_complete: false`、`Unresolved=74`、`final=9 vs resolved=112`，但 dump 仍写出产物并打印 `[GOOD] Candidate written`。IAT 重建不完整时既不清零兜底也不判不合格。
 **当初为什么会这样**：partial-accept 链路（`iat_partial_accept.rs`）设计上允许部分接受，但没有区分"可安全部分接受"与"启动路径上的必崩指针"。
-**怎么办**：TASK-009（修复方向：不可解析槽清零或 fail-closed，外加离线缺陷捕获测试）。修复前 TASK-006/T0.5 不可复跑（两个候选宿主当前会话均不可用）。
+**修复（TASK-009，2026-08-29 验收通过）**：兜底清零（`zero_fill_iat_region`：IAT span 未重建槽整段清零，honest hole）+ fail-closed 门（`call_sites_targeting_slots`：存在直接 call/jmp 指向不可解析槽 → `Err` 拒绝写出，`[GOOD]` 不再打印）。**修复验证级别 = 离线**（单元级缺陷几何 +7 用例、判别力探针红→绿）；`bb5ee568` 上的实弹替换验证留待 TASK-006 复跑（消耗实弹格，另行授权）。
+**注意**：C-5（会话绑定 B）未修，与本项独立——修好 A 产物才能在当前会话活，修好 B 才能跨重启活。
 
 ### C-5 `keep_runtime_base` 产物 .bss 固化当次会话 ntdll（缺陷 B，C-1 的残留形态）[已验证，未修]
 

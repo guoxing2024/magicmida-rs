@@ -34,6 +34,57 @@ use crate::import_table::ImportTableBuilder;
 
 const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 
+/// Scan executable sections of a dumped image for direct `call/jmp [rip+disp32]`
+/// sites whose target RVA is one of `target_slot_rvas`. Returns `(site_rva,
+/// target_rva)` pairs in scan order.
+///
+/// TASK-009 (缺陷 A, `bb5ee568`): a direct code reference to an IAT slot that
+/// the rebuild could not resolve is a startup-path dereference of an honest
+/// hole (zero) — the candidate would AV when that code executes. This is the
+/// offline, unit-testable leg of the dump's fail-closed gate: it uses the same
+/// FF 15/25 scan as `retarget_iat_gap_call_sites` but only *reports* sites,
+/// so the emitter can refuse to ship a product whose unresolved IAT slot is
+/// referenced from code (e.g. `.text 0xde785` → `call [0x1137d0]`).
+#[must_use]
+pub(crate) fn call_sites_targeting_slots(
+    pe: &PeHeader,
+    dump_buf: &[u8],
+    target_slot_rvas: &std::collections::HashSet<u32>,
+) -> Vec<(u32, u32)> {
+    let mut hits = Vec::new();
+    if target_slot_rvas.is_empty() {
+        return hits;
+    }
+    for section in pe
+        .sections
+        .iter()
+        .filter(|s| s.characteristics & IMAGE_SCN_MEM_EXECUTE != 0 || s.name == ".text")
+    {
+        let start = section.virtual_address as usize;
+        let end = start
+            .saturating_add(section.virtual_size as usize)
+            .min(dump_buf.len());
+        if end.saturating_sub(start) < 6 {
+            continue;
+        }
+        let mut i = start;
+        while i + 6 <= end {
+            if dump_buf[i] == 0xFF && (dump_buf[i + 1] == 0x15 || dump_buf[i + 1] == 0x25) {
+                let disp = i32::from_le_bytes(dump_buf[i + 2..i + 6].try_into().unwrap_or([0; 4]));
+                let next_rva = (i + 6) as u32;
+                let slot_rva = next_rva.wrapping_add(disp as u32);
+                if target_slot_rvas.contains(&slot_rva) {
+                    hits.push((next_rva.saturating_sub(6), slot_rva));
+                }
+                i += 6;
+                continue;
+            }
+            i += 1;
+        }
+    }
+    hits
+}
+
 /// Result of a gap-retarget pass.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct GapRetargetStats {
@@ -411,5 +462,76 @@ mod tests {
         let got = i32::from_le_bytes(dump[site + 2..site + 6].try_into().unwrap());
         assert_eq!((next as i64 + got as i64) as u32, 0x1020);
         let _ = builder; // keep builder construction green
+    }
+
+    // -- TASK-009: startup-path fail-closed scan (`bb5ee568`) --
+
+    /// Reproduce the defect geometry on a synthetic dump image: a `.text`
+    /// section at RVA 0x1000 whose byte at section offset 0xcd785 holds
+    /// `FF 15 45 50 03 00` — exactly the `.text 0xde785` site that calls
+    /// `[0x1137d0]` — plus a `.pdata`-like read-only section. The scanner must
+    /// report `(0xde785, 0x1137d0)` when that slot is in the target set, and
+    /// nothing for a resolved-slot set.
+    #[test]
+    fn call_sites_targeting_slots_finds_defect_site() {
+        let pe_bytes = crate::header::make_minimal_pe64();
+        let mut pe = PeHeader::from_bytes(&pe_bytes).expect("minimal pe");
+        pe.sections[0].virtual_address = 0x1000;
+        pe.sections[0].virtual_size = 0xe0000;
+        pe.sections[0].name = ".text".into();
+        pe.sections[0].characteristics = 0x6000_0020; // code | execute | read
+
+        // dump_buf is RVA-indexed: the byte at RVA 0xde785 holds the call site.
+        let mut dump_buf = vec![0u8; 0x10_0000];
+        let site_rva = 0xde785u32;
+        let slot_rva = 0x1137d0u32;
+        dump_buf[site_rva as usize] = 0xFF;
+        dump_buf[site_rva as usize + 1] = 0x15;
+        let next_rva = site_rva + 6;
+        let disp = slot_rva as i64 - next_rva as i64;
+        dump_buf[site_rva as usize + 2..site_rva as usize + 6]
+            .copy_from_slice(&(disp as i32).to_le_bytes());
+
+        let mut unresolved = std::collections::HashSet::new();
+        unresolved.insert(slot_rva);
+        let hits = call_sites_targeting_slots(&pe, &dump_buf, &unresolved);
+        assert_eq!(hits, vec![(site_rva, slot_rva)]);
+
+        // A set without the defect slot must not report it.
+        let resolved_set = [0x1137c0u32].into_iter().collect();
+        assert!(call_sites_targeting_slots(&pe, &dump_buf, &resolved_set).is_empty());
+
+        // Empty target set never scans.
+        let empty: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        assert!(call_sites_targeting_slots(&pe, &dump_buf, &empty).is_empty());
+    }
+
+    /// The scanner must ignore sites targeting slots outside the unresolved
+    /// set and must not panic when the executable section extends past the
+    /// dump buffer.
+    #[test]
+    fn call_sites_targeting_slots_ignores_other_targets_and_clamps() {
+        let pe_bytes = crate::header::make_minimal_pe64();
+        let mut pe = PeHeader::from_bytes(&pe_bytes).expect("minimal pe");
+        pe.sections[0].virtual_address = 0x1000;
+        pe.sections[0].virtual_size = 0x200000; // extends far past dump_buf
+        pe.sections[0].name = ".text".into();
+        pe.sections[0].characteristics = 0x6000_0020;
+
+        let mut dump_buf = vec![0u8; 0x20000];
+        // Site targeting a slot NOT in the set.
+        let site = 0x1500u32;
+        dump_buf[site as usize] = 0xFF;
+        dump_buf[site as usize + 1] = 0x25;
+        let next = site + 6;
+        let disp = 0x9999u32 as i64 - next as i64;
+        dump_buf[site as usize + 2..site as usize + 6]
+            .copy_from_slice(&(disp as i32).to_le_bytes());
+
+        let targets = [0x1137d0u32].into_iter().collect();
+        assert!(
+            call_sites_targeting_slots(&pe, &dump_buf, &targets).is_empty(),
+            "site targeting a different slot must be ignored"
+        );
     }
 }

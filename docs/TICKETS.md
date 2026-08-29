@@ -14,7 +14,7 @@
 | [TASK-004](../tickets/TASK-004.md) | P1 | T0.7 会话绑定修复：补齐可离线验证的闭环 | ✅ **完成**（2026-08-29，归档 [runs/20260829-TASK-004.md](../runs/20260829-TASK-004.md)；六条验收由总指挥亲自复跑全过，含独立重做的判别力探针红→绿） | developer | `cargo test -p mida-pe --lib --offline` 全绿且含新增闭环用例 |
 | [TASK-005](../tickets/TASK-005.md) | P1 | GVM Phase 1：`0x8c000` 区归属矛盾复核 | ✅ **完成**（2026-08-29，定级 **(b)**：0x8c4c0 静态存在但 trace 未激活，"216K+ trace 实证"标注错误降级为静态推断；归档 [runs/20260829-TASK-005.md](../runs/20260829-TASK-005.md)；复算数字由总指挥亲跑复现一致） | qa | 复算脚本给出唯一结论并自证口径 |
 | [TASK-006](../tickets/TASK-006.md) | P1 | 原版宿主重脱壳，根治会话绑定（解开 T0.5） | ⛔ **BLOCKED**（2026-08-29，归档 [runs/20260829-TASK-006.md](../runs/20260829-TASK-006.md)；重脱壳候选 `bb5ee568` 启动即 AV，根因 = dump 重建缺陷 A + 会话绑定残留 B，四项关键声明总指挥亲验坐实；实弹计 1 格 XC-XXI-B 2/4） | developer | 新宿主 S3 load_no_crash 10/10 隔离运行 |
-| [TASK-009](../tickets/TASK-009.md) | P1 | 修 dump 重建缺陷 A：不可解析运行时指针固化进只读节（fail-open） | 📋 待领取（TASK-006/T0.5 复跑的硬前置） | developer | `cargo test -p mida-pe --lib --offline` 全绿含缺陷捕获用例 |
+| [TASK-009](../tickets/TASK-009.md) | P1 | 修 dump 重建缺陷 A：不可解析运行时指针固化进只读节（fail-open） | ✅ **完成**（2026-08-29，归档 [runs/20260829-TASK-009.md](../runs/20260829-TASK-009.md)；恰 3 授权文件 +352/-0，三条验收与两个判别力探针由总指挥亲自复跑全过；修复 = 兜底清零 + fail-closed 组合） | developer | `cargo test -p mida-pe --lib --offline` 全绿含缺陷捕获用例 |
 | [TASK-007](../tickets/TASK-007.md) | P1 | GVM Phase 1 定向 dump 实弹（账本 GVM 1/8） | 📋 待领取（开跑前须先交"写定五项"）；授权已批 D-012 | developer | `0x184eb6` 处字节非全零 |
 | [TASK-008](../tickets/TASK-008.md) | P1 | 清还 clippy 基线漂移（10 个机械位点，推送前必做） | ✅ **完成**（2026-08-29，归档 [runs/20260829-TASK-008.md](../runs/20260829-TASK-008.md)；三条验收由总指挥亲自复跑全过，基线 349→337 只降不升） | developer | 基线脚本 exit 0 + `TOTAL=337` |
 

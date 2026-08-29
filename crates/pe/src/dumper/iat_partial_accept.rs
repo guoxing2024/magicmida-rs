@@ -395,6 +395,30 @@ pub fn verify_call_site_semantics(text: &[u8], text_rva: u32, slot_rva: u32) -> 
     None
 }
 
+/// Collect the RVAs of every IAT slot the recovery could NOT resolve
+/// (anything that is neither `Resolved` nor a `ZeroTerminator`).
+///
+/// TASK-009 (缺陷 A, `bb5ee568`): these slots must be emitted as honest holes
+/// (zero) — never as leftover live runtime pointers that `fix_hardcoded_addresses`
+/// would rebase into image-relative NX pointers — and any direct code reference
+/// to one is a startup-path fail-closed condition. This is the offline policy
+/// leg: it is derived purely from the recovery report, so the emitter can apply
+/// the same zero-fill/fail-closed decision deterministically.
+#[must_use]
+pub fn unresolvable_slot_rvas(report: &IatRecoveryReport) -> std::collections::HashSet<u32> {
+    report
+        .slots
+        .iter()
+        .filter(|slot| {
+            !matches!(
+                slot.status,
+                IatSlotStatus::Resolved | IatSlotStatus::ZeroTerminator
+            )
+        })
+        .filter_map(|slot| slot.slot_rva)
+        .collect()
+}
+
 /// Extract only the structural failures from a report (never the status-count
 /// rows like `Unresolved=1`). Graded acceptance may tolerate rejected slots
 /// but never a structurally unsound span.
@@ -878,5 +902,81 @@ mod tests {
             verify_call_site_semantics(&text, text_rva, slot_rva).is_none(),
             "non-handle-check follow-up must not verify"
         );
+    }
+
+    // -- TASK-009: unresolvable-slot RVA collection (fail-closed policy) --
+
+    /// The `bb5ee568` defect slot: `.rdata` RVA `0x1137d0` whose live value
+    /// `0x7ff6c0dc81d1` was rebased to `0x1401681d1` (image .pdata, NX) and
+    /// called from `.text 0xde785`. It was `Unresolved`/`module_not_found` in
+    /// the evidence sidecar.
+    #[test]
+    fn unresolvable_slot_rvas_collects_defect_slot_and_excludes_resolved() {
+        use crate::iat_completeness::IatSlotReport;
+        let unresolved_slot = IatSlotReport {
+            slot_index: 30,
+            slot_address: 0x7ff6c0d736e0 + 30 * 8,
+            slot_rva: Some(0x1137d0),
+            observed_value: Some(0x7ff6_c0dc_81d1),
+            rebuilt_value: None,
+            slot_value: Some(0x7ff6_c0dc_81d1),
+            status: IatSlotStatus::Unresolved,
+            unresolved_reason: Some(IatUnresolvedReason::ModuleNotFound),
+            module_name: None,
+            function_name: None,
+            ordinal: None,
+            resolution_source: None,
+        };
+        let resolved_slot = IatSlotReport {
+            slot_index: 28,
+            slot_address: 0x7ff6c0d736e0 + 28 * 8,
+            slot_rva: Some(0x1137c0),
+            observed_value: Some(0x7ffa_9419_2060),
+            rebuilt_value: Some(0x7ffa_9419_2060),
+            slot_value: Some(0x7ffa_9419_2060),
+            status: IatSlotStatus::Resolved,
+            unresolved_reason: None,
+            module_name: Some("kernel32.dll".into()),
+            function_name: Some("GetProcAddress".into()),
+            ordinal: None,
+            resolution_source: Some(IatResolutionSource::Live),
+        };
+        let zero = IatSlotReport {
+            slot_index: 31,
+            slot_address: 0x7ff6c0d736e0 + 31 * 8,
+            slot_rva: Some(0x1137d8),
+            observed_value: Some(0),
+            rebuilt_value: None,
+            slot_value: Some(0),
+            status: IatSlotStatus::ZeroTerminator,
+            unresolved_reason: None,
+            module_name: None,
+            function_name: None,
+            ordinal: None,
+            resolution_source: None,
+        };
+        let r = report(vec![resolved_slot, unresolved_slot, zero]);
+        let rvas = unresolvable_slot_rvas(&r);
+        assert!(rvas.contains(&0x1137d0), "defect slot must be collected");
+        assert!(
+            !rvas.contains(&0x1137c0),
+            "resolved slot must not be zero-filled or gated"
+        );
+        assert!(
+            !rvas.contains(&0x1137d8),
+            "zero terminator is a deliberate separator, not a hole"
+        );
+        assert_eq!(rvas.len(), 1);
+    }
+
+    /// A strictly complete report yields no unresolvable slots, so the
+    /// fail-closed gate and the zero-fill both no-op on a clean rebuild.
+    #[test]
+    fn unresolvable_slot_rvas_empty_for_complete_report() {
+        let r = report(vec![
+            slot(0, IatSlotStatus::Resolved, None),
+            slot(1, IatSlotStatus::ZeroTerminator, None),
+        ]);
+        assert!(unresolvable_slot_rvas(&r).is_empty());
     }
 }

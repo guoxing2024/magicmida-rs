@@ -2423,6 +2423,32 @@ pub fn dump_process_with_report(
         }
     }
 
+    // TASK-009 (缺陷 A, `bb5ee568`): never leave a raw live runtime pointer in
+    // the read-only IAT region. When the rebuild does not cover the full IAT
+    // span (original-stub fallback, graded table with honest holes, or no
+    // builder at all), the uncovered slots would otherwise keep their
+    // process-local snapshot values; `fix_hardcoded_addresses` later rebases
+    // those into image-relative addresses that can point into NX data
+    // (`.pdata`, e.g. slot `0x1137d0` → `0x1401681d1`) and AV on the first
+    // `call [slot]`. Zero every slot the rebuild did not cover first; the
+    // rebuilt thunks overwrite their slots in `create_import_section` below.
+    if opts.fix_imports && original_iat_rva != 0 {
+        let iat_span_bytes = opts
+            .iat_location
+            .map(|(_, size)| size)
+            .or_else(|| iat_report.as_ref().map(|r| r.requested_bytes))
+            .unwrap_or(0);
+        let zeroed = zero_fill_iat_region(&mut dump_buf, original_iat_rva, iat_span_bytes);
+        if zeroed > 0 {
+            info!(
+                iat_rva = format_args!("{original_iat_rva:#x}"),
+                span = iat_span_bytes,
+                zeroed,
+                "TASK-009: zero-filled IAT region slots not covered by rebuild (honest holes)"
+            );
+        }
+    }
+
     let mut import_thunks: Vec<u64> = Vec::new();
     if let Some(ref builder) = import_builder {
         info!(
@@ -2814,6 +2840,43 @@ pub fn dump_process_with_report(
     // overlays, import section construction (as extra_data), and profile
     // stages; pure modules plan + rebuild PE bytes. R1-E preserves host
     // section VAs and carries host data directories for content import/IAT.
+    //
+    // TASK-009 fail-closed gate (缺陷 A, `bb5ee568`): zero-fill alone turns
+    // unresolvable slots into honest holes, but a direct `call/jmp [rip+disp]`
+    // in an executable section that targets one of those holes is a
+    // startup-path dereference of a zero/NX pointer — the product would AV as
+    // soon as that code runs (`.text 0xde785` → `call [0x1137d0]` → NX
+    // `.pdata`). Such a candidate must not be emitted (and the caller must not
+    // print `[GOOD] Candidate written`). The gate runs AFTER the in-image
+    // transforms (gap retarget may legitimately redirect some sites to rebuilt
+    // APIs first), so only genuinely-unresolvable references fail the dump.
+    let fail_closed_sites = if opts.fix_imports {
+        if let Some(report) = iat_report.as_ref().filter(|r| !r.is_complete()) {
+            let unresolved = super::iat_partial_accept::unresolvable_slot_rvas(report);
+            if unresolved.is_empty() {
+                Vec::new()
+            } else {
+                super::iat_gap_retarget::call_sites_targeting_slots(&pe, &dump_buf, &unresolved)
+            }
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+    if !fail_closed_sites.is_empty() {
+        let detail = fail_closed_sites
+            .iter()
+            .take(16)
+            .map(|(site, target)| format!("{site:#x}->{target:#x}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(PeError::Parse(format!(
+            "TASK-009 fail-closed: {} startup-path call/jmp site(s) target unresolved IAT slot(s): {detail}; zero-fill cannot make the product loadable — refusing to emit candidate",
+            fail_closed_sites.len()
+        )));
+    }
+
     let _emit_guard = super::stage_timing::StageGuard::begin("candidate_emit");
     let mut out_data = if opts.pure_rebuild {
         info!("R1-E pure rebuild emit path enabled");
@@ -3146,6 +3209,25 @@ pub fn dump_process_with_report(
         exception_report,
         output_size: out_data.len(),
     })
+}
+
+/// TASK-009 (缺陷 A, `bb5ee568`): zero `[iat_rva, iat_rva+span_bytes)` in the
+/// dump image so no raw live runtime pointer survives in the read-only IAT
+/// region. The rebuild (`create_import_section`) writes its thunk values over
+/// the slots it covers; everything else stays an honest hole (zero), which the
+/// PE loader treats as a run terminator instead of dereferencing a rebased NX
+/// pointer. Returns the number of bytes zeroed. Pure and unit-testable.
+fn zero_fill_iat_region(dump_buf: &mut [u8], iat_rva: u32, span_bytes: usize) -> usize {
+    if span_bytes == 0 {
+        return 0;
+    }
+    let start = iat_rva as usize;
+    let end = start.saturating_add(span_bytes).min(dump_buf.len());
+    if end.saturating_sub(start) == 0 {
+        return 0;
+    }
+    dump_buf[start..end].fill(0);
+    end - start
 }
 
 /// True when Exception DD [rva, rva+size) is not fully covered by any section's
@@ -5574,5 +5656,53 @@ mod session_sidecar_round_trip_tests {
             candidate_sha256_hex(candidate_bytes)
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod task009_zero_fill_tests {
+    use super::zero_fill_iat_region;
+
+    /// The `bb5ee568` geometry: IAT at RVA `0x1136e0`, span `0x648` (201
+    /// slots). Slots 19..200 are NOT covered by the 9-thunk original-stub
+    /// fallback and retain raw live runtime pointers (e.g. slot 30 at
+    /// `0x1137d0` holds `0x7ff6c0dc81d1`). After the fix the whole span is
+    /// zero except the slots the rebuild overwrites.
+    #[test]
+    fn zero_fill_clears_live_pointers_in_uncovered_iat_span() {
+        let iat_rva = 0x1136e0u32;
+        let span = 201 * 8usize; // 0x648
+        let mut dump_buf = vec![0xAAu8; 0x114000];
+        // Slot 30 (RVA 0x1137d0) = the live pointer rebased to NX .pdata.
+        let slot_off = 0x1137d0usize;
+        dump_buf[slot_off..slot_off + 8].copy_from_slice(&0x7ff6_c0dc_81d1u64.to_le_bytes());
+
+        let zeroed = zero_fill_iat_region(&mut dump_buf, iat_rva, span);
+        assert_eq!(zeroed, span);
+        for off in (iat_rva as usize..iat_rva as usize + span).step_by(8) {
+            assert_eq!(
+                u64::from_le_bytes(dump_buf[off..off + 8].try_into().unwrap()),
+                0,
+                "slot at RVA {off:#x} must be zeroed, not a leaked live pointer"
+            );
+        }
+    }
+
+    /// Zero-fill must clamp to the dump buffer and never write past it.
+    #[test]
+    fn zero_fill_clamps_to_dump_buffer() {
+        let mut dump_buf = vec![0x55u8; 0x3000];
+        let zeroed = zero_fill_iat_region(&mut dump_buf, 0x2800, 0x1000);
+        assert_eq!(zeroed, 0x800);
+        assert!(dump_buf[0x2800..].iter().all(|&b| b == 0));
+        assert_eq!(dump_buf[0], 0x55);
+    }
+
+    /// A zero span is a no-op.
+    #[test]
+    fn zero_fill_ignores_zero_span() {
+        let mut dump_buf = vec![0x55u8; 0x100];
+        assert_eq!(zero_fill_iat_region(&mut dump_buf, 0x10, 0), 0);
+        assert!(dump_buf.iter().all(|&b| b == 0x55));
     }
 }
