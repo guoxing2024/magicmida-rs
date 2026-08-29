@@ -18,7 +18,8 @@
 | [TASK-006R](../tickets/TASK-006R.md) | P1 | TASK-006 复跑：实弹验证缺陷 A 修复（构建核验→重脱壳→路径 A/B 二分；fail-closed 拒绝出产物也是合法终态） | ⛔ **BLOCKED（执行完毕，验证点不可达）**（2026-08-29，归档 [runs/20260829-TASK-006R.md](../runs/20260829-TASK-006R.md)；构建/身份/ASLR 基线三关 PASS，但重脱壳 9/9 次 text-poll AV 风暴不收敛，dump 从未到达，三个 TASK-009 证据点 0 命中、无产物；路径 A/B 均未到达；实弹计 1 格 XC-XXI-B 2/4→3/4） | developer | 构建核验双字符串命中 + 身份核验 PASS + 重脱壳完整日志（9 次尝试全风暴） |
 | [TASK-007](../tickets/TASK-007.md) | P1 | GVM Phase 1 定向 dump 实弹（账本 GVM 1/8） | 📋 待领取（开跑前须先交"写定五项"）；授权已批 D-012 | developer | `0x184eb6` 处字节非全零 |
 | [TASK-008](../tickets/TASK-008.md) | P1 | 清还 clippy 基线漂移（10 个机械位点，推送前必做） | ✅ **完成**（2026-08-29，归档 [runs/20260829-TASK-008.md](../runs/20260829-TASK-008.md)；三条验收由总指挥亲自复跑全过，基线 349→337 只降不升） | developer | 基线脚本 exit 0 + `TOTAL=337` |
-| [TASK-010](../tickets/TASK-010.md) | P1 | 调查 C-6：重脱壳 text-poll AV 风暴与 debuggee 基址分配差异的因果链（**只读，零实弹**） | 📋 待领取（TASK-006R 收口裁决：调查优先于继续烧格；结论决定路线 a/b/c） | qa | ntdll+0x160bd8 定性 + 基址漂移机制清单 + 最终定性 (a)-(d) |
+| [TASK-010](../tickets/TASK-010.md) | P1 | 调查 C-6：重脱壳 text-poll AV 风暴与 debuggee 基址分配差异的因果链（**只读，零实弹**） | ✅ **完成**（2026-08-29，定性 **(c) 共因表象 + 引擎缺口**：基址非因（同基址成败并存）、21:1x 风暴 = ScyllaHide NtContinue-hook 区故障环、04:0x 风暴 = VM 取指环，两型不同；**核心新发现 = text-poll 无风暴终止机制** → C-7；归档 [runs/20260829-TASK-010.md](../runs/20260829-TASK-010.md)；关键声明由总指挥亲验：dumpbin 字节逐一致、scylla_hide.log hook 地址坐实、fixed2 3,220,146 次 AV 元组相符、三份日志同基址成败并存、代码引用 6 处全对） | qa | ntdll+0x160bd8 定性 + 基址漂移机制清单 + 最终定性 (a)-(d) |
+| [TASK-011](../tickets/TASK-011.md) | P1 | 修 C-7：text-poll 阶段增加 AV 风暴终止（fail-closed，**纯离线零实弹**） | 📋 待领取（TASK-010 定性 (c) 的主路线；不修则下次实弹格仍会白烧） | developer | `cargo test -p mida-packers-themida --lib --offline` 全绿含风暴捕获用例 |
 
 ## 老板已裁定（2026-08-29）
 

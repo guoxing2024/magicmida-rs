@@ -126,12 +126,28 @@ WO-24 于 2026-08-27（提交 `607276d`）锁定 `_clippy_baseline`（TOTAL=349�
 
 2026-08-29 TASK-006 实测：新旧两个重脱壳宿主的 `.bss 0x112c10` 都固化 `0x7ffa953a6390`（**本**会话 ntdll+0x106390）——与 T0.5 旧宿主固化旧会话 ntdll 同型。当前会话不崩，跨 ASLR 重启必崩。**会话绑定在重脱壳产物中未根除**，`/session-clean` 消费端工具链（T0.7 §7.2 遗留项）是修复路径。注意与 C-4 独立：修好 A 产物才能在当前会话活，修好 B 才能跨重启活。
 
-### C-6 重脱壳 text-poll 阶段 AV 风暴不收敛（TASK-006R 发现，0/9）[已验证（现象），根因未定性]
+### C-6 重脱壳 text-poll 阶段 AV 风暴不收敛（TASK-006R 发现，0/9）[已定性 (c)：共因表象 —— TASK-010]
 
 2026-08-29 TASK-006R 实测（21:18-21:56，与 TASK-006 成功路径**同一 boot**、同一样品、同一命令、同一环境变量）：9 次重脱壳尝试全部在 text-poll 阶段陷入 ntdll 内部 AV 风暴（exc 恒 `0x7ffa95400bd8` = ntdll+0x160bd8，单次 20 万–300 万次），`.text` 永不 stable，dump 从未到达——TASK-009 三个证据点全部不可观测，路径 A/B 均未到达。
-**关键差异（强相关，因果未实锤）**：本时段 debuggee image_base 恒 `0x7ff799fc0000`（9/9），上次成功时段恒 `0x7ff6c0c60000`；样品 preferred ImageBase = `0x140000000`，两值均为 ASLR 运行时分配。3 种启动方式 × 3 种超时全部同 pattern = 确定性 0% 收敛，与上次"1/5 随机成功"性质不同（上次同基址也有失败，存在时序竞争；本次连基址都变了）。
-**影响**：TASK-009 修复的实弹验证被阻塞（既未证实也未证伪）；T0.5 继续 BLOCKED。
-**待办**：TASK-010（只读调查：本时段基址分配差异与 Themida 反调试风暴的因果链）。不建议在本会话继续烧格重试（0/9 确定性失败）。
+**TASK-010 定性（2026-08-29，总指挥亲验坐实）：(c) 共因表象，基址与风暴无因果。**
+- 基址**不是因**：04:0x 时段同基址 `0x7ff6c0c60000` 下成功（attempt3 03:58 / try1 04:09）与失败（fixed2 04:07，322 万次 AV）并存 —— 三份日志 CreateProcess 行 image_base 逐一相同。
+- 基址**不是果**：21:1x 风暴 RIP 在 ntdll hook 区，与 debuggee 基址无算术关系；样品 DllCharacteristics=`0x60`（DYNAMIC_BASE|HIGH_ENTROPY_VA）→ 每进程独立掷点，两值差 3.6GB 属正常范围。
+- 21:1x 风暴 = **ScyllaHide NtContinue-hook 区故障环**：dumpbin 确证 ntdll+0x160bd8 磁盘字节为 `F6 04 25 08 03 FE 7F 01` = `test byte ptr [0x7FFE0308],1`（读 KUSER_SHARED_DATA，恒可读，干净字节不可能 AV）→ debuggee 内存该处被改写；`scylla_hide.log` 明示 hook `_NtContinue 0x7FFA95400BD0`，风暴 RIP = hook 点 +8 落在覆盖区；`target=0x204` 是句柄形低值。[微指令级确切字节存疑——原始 3.5GB 日志已清理]
+- 04:0x 风暴 = **VM 取指环**（exc=target=`0x1108e3761a0` 未映射空洞，exc_type=8 执行故障）→ **与 21:1x 不同型**。
+- 把"偶发环"放大成"确定性 0% 收敛"的是 **C-7 引擎缺口**（见下）。
+**影响**：TASK-009 修复的实弹验证仍被阻塞（既未证实也未证伪）；T0.5 继续 BLOCKED。
+**待办**：TASK-011（修 C-7，纯离线）。ScyllaHide-NtContinue-hook 交互的微指令级定性需新 trace（实弹），另立专项。**不建议本会话继续烧格重试**——重启只改运气，不改缺口。
+
+### C-7 text-poll 阶段无 AV 风暴终止机制（引擎结构缺口，TASK-010 发现）[已验证（代码级，总指挥逐处复核），未修]
+
+**缺口**：guard 未安装（text-poll）阶段，任何恒同 AV 环都被无限吞掉：
+- `crates/packers/themida/src/runtime/av_oep_handler.rs:161-168`：`!state.guard_installed` → 无条件 `AvOepAction::Continue` 早返回；
+- 同文件 `:232`：风暴计数器 `unrelated_av_streak` 只在 `guard_installed && NotGuarded` 分支递增 → guardless 阶段**永不计数**（既有 `unrelated_av_storm_threshold` / `unrelated_av_null_storm_threshold` 两个阈值在此阶段完全失效）；
+- `crates/cli/src/unpacker/mod.rs:1139-1141`：`text_poll_start` 在**每个事件**上重置 → `:1159-1164` 的 30s idle 超时在连续 AV 流下**结构上永不触发**；
+- `.text`-stable 判定（`mod.rs:1214-1218`）依赖壳完成解密 → 壳卡在环里则永不达成。
+**后果**：任何 constant-AV 环（04:0x 型 VM 取指环、21:1x 型 hook 故障环）都必然 0% 收敛直到外部超时/杀进程，并产出 3.5GB 级垃圾日志。TASK-006R 的 9 次白烧格直接由此造成。
+**修复方向（TASK-011）**：guardless 路径对恒同 AV 元组（exception_addr, target, exc_type, thread）计数，超阈值 → 返回 `Err` fail-closed 中止（`av_handler.rs:92` 的 `?` 链现成可用），不 dump、不打 `[GOOD]`、日志有界。纯离线可改、可单元测试，与 TASK-009 的 fail-closed 语义同族。
+
 
 ### C-3 GVM Phase 1 有一条自报的必须修正项 [已验证，已定级 (b) —— TASK-005 复核]
 
