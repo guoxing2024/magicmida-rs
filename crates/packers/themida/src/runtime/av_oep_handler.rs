@@ -167,18 +167,27 @@ pub struct AvOepOutcome {
 /// C-7: consecutive *identical* guardless AV tuples at or beyond this count
 /// are treated as a constant-AV storm and abort fail-closed.
 ///
-/// Selection rationale: the CLI host's existing non-guard storm escape uses
-/// `unrelated_av_storm_threshold` (default 32; see `PluginCtx::default` in
-/// `crates/core/src/plugin.rs`). This constant is kept at the same value so
-/// the guardless text-poll phase and the guarded NotGuarded phase share one
-/// semantic yardstick (≈32 consecutive same-shape faults = storm). A lower
-/// bound would risk aborting a genuinely progressing VM that repeatedly
-/// probes the same address; a higher bound would burn more log budget on the
-/// constant-AV loops this ticket closes. 32 consecutive identical tuples is
-/// already far beyond any observed healthy AV cadence (the two live-fire
-/// storm geometries logged 200K–3.2M consecutive identical tuples, i.e.
-/// they overshoot this bound by orders of magnitude).
-pub const GARDLESS_AV_STORM_TUPLE_THRESHOLD: u32 = 32;
+/// Selection rationale (rewritten in TASK-012):
+/// - **This judgment's consequence is a hard fail-closed abort**: the host
+///   turns `storm_abort` into an `Err`, the whole unpack unwinds, no dump,
+///   no `[GOOD]`, bounded logs. The legacy `unrelated_av_storm_threshold`
+///   escape (default 32; see `PluginCtx::default` in
+///   `crates/core/src/plugin.rs`) is a *soft landing* — storm escape falls
+///   back to a `Break` and may still produce a dump. A heavier consequence
+///   must not borrow a lighter judgment's threshold, so this constant does
+///   **not** follow the 32 from `unrelated_av_storm_threshold`.
+/// - **Measured live-fire distribution is bimodal** (TASK-006 attempt3 /
+///   try1): healthy runs saw **0 AVs** in the text-poll phase; the two storm
+///   geometries logged **200K–3.2M consecutive identical tuples**. 32 sat
+///   4–5 orders of magnitude below the storm side but only 32 events above
+///   the healthy side. Themida leans on exception-based obfuscation, so a
+///   tight loop of >32 *legitimate* identical AVs is structurally plausible
+///   — a false abort would burn a live-fire slot for nothing.
+/// - **1024** keeps 2–3 orders of magnitude of headroom against real storms
+///   (200K–3.2M identical tuples still overshoot by 2–3 orders of
+///   magnitude) while shrinking the false-kill window by two orders of
+///   magnitude vs 32. Not yet calibrated against live fire (TASK-012).
+pub const GUARDLESS_AV_STORM_TUPLE_THRESHOLD: u32 = 1024;
 
 /// Decide what to do with one AccessViolation event.
 ///
@@ -215,7 +224,7 @@ pub fn decide_av_oep(
             state.guardless_av_tuple = Some(tuple);
             state.guardless_av_tuple_streak = 1;
         }
-        if state.guardless_av_tuple_streak >= GARDLESS_AV_STORM_TUPLE_THRESHOLD {
+        if state.guardless_av_tuple_streak >= GUARDLESS_AV_STORM_TUPLE_THRESHOLD {
             state.storm_abort = Some((
                 format!(
                     "(exc={:#x}, target={:#x}, exc_type={}, thread={})",

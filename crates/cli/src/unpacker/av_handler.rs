@@ -20,6 +20,65 @@ pub(super) enum AvAction {
     Break,
 }
 
+/// C-7: map the decision outcome's `Break` arm to the host's action,
+/// turning a guardless constant-AV storm abort into a fail-closed `Err`.
+///
+/// Pure decision (no debugger/handle access), so the fail-closed mapping is
+/// directly unit-testable without a live debuggee (TASK-012 ③).
+///
+/// - `storm_abort = Some((tuple, count))` → `Err` whose message carries the
+///   identical tuple and the streak count at abort (diagnostics preserved;
+///   the loop unwinds, no dump, no `[GOOD]`).
+/// - `storm_abort = None` (ordinary OEP-`Break`, storm-escape freeze, etc.)
+///   → `Ok(AvAction::Break)` unchanged: the pending AV stays pending for the
+///   post-loop IAT phase.
+fn map_storm_abort(storm_abort: &Option<(String, u32)>) -> Result<AvAction, String> {
+    if let Some((tuple, count)) = storm_abort {
+        return Err(format!(
+            "guardless constant-AV storm abort (fail-closed): identical AV tuple {tuple} repeated {count} times without guard installed; aborting unpack"
+        ));
+    }
+    Ok(AvAction::Break)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::map_storm_abort;
+    use super::AvAction;
+
+    #[test]
+    fn storm_abort_maps_to_fail_closed_err_with_tuple_and_count() {
+        let err = match map_storm_abort(&Some((
+            "(exc=0x7ffa95400bd8, target=0x204, exc_type=0, thread=25252)".to_string(),
+            1024,
+        ))) {
+            Err(e) => e,
+            Ok(_) => panic!("storm abort must fail closed"),
+        };
+        assert!(
+            err.contains("(exc=0x7ffa95400bd8, target=0x204, exc_type=0, thread=25252)"),
+            "Err must carry the identical tuple: {err}"
+        );
+        assert!(err.contains("1024"), "Err must carry the count: {err}");
+        assert!(
+            err.contains("fail-closed"),
+            "Err must say fail-closed: {err}"
+        );
+    }
+
+    #[test]
+    fn plain_break_without_storm_abort_stays_ok_break() {
+        // Ordinary Break (OEP capture / storm-escape freeze): no storm_abort,
+        // so the host must still get Ok(Break) — the pending AV stays pending
+        // for the post-loop IAT phase.
+        let action = match map_storm_abort(&None) {
+            Ok(action) => action,
+            Err(e) => panic!("plain Break must stay Ok, got Err({e})"),
+        };
+        assert!(matches!(action, AvAction::Break));
+    }
+}
+
 /// Handle an AccessViolation event in the debug loop.
 ///
 /// P3-D: the AV/OEP decision body lives in
@@ -126,14 +185,7 @@ pub(super) fn handle_access_violation(
             // dump, no [GOOD], bounded logs). The decision already recorded
             // the tuple + count for diagnostics; surface it as an Err so the
             // debug loop unwinds instead of falling through to IAT/dump.
-            if let Some((tuple, count)) = &outcome.state.storm_abort {
-                return Err(anyhow!(
-                    "guardless constant-AV storm abort (fail-closed): identical AV tuple {tuple} repeated {count} times without guard installed; aborting unpack"
-                ));
-            }
-            // Break deliberately leaves the current AV pending so the
-            // post-loop IAT phase can consume it.
-            return Ok(AvAction::Break);
+            return map_storm_abort(&outcome.state.storm_abort).map_err(anyhow::Error::msg);
         }
         AvOepAction::RedirectAndContinue { rip, rsp_delta, .. } => {
             // Redirect RIP/RSP (matching the legacy virtualized-OEP / FTrace

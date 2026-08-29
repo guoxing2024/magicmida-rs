@@ -153,8 +153,18 @@ WO-24 于 2026-08-27（提交 `607276d`）锁定 `_clippy_baseline`（TOTAL=349�
 - 4 个授权文件 **+281/-0（纯新增，0 删除行）**；`.text`-stable 判定（`mod.rs:1214-1218`）与既有断言**零改动**，无 `#[ignore]`/`.skip`。
 - 总指挥亲跑（真 cargo 退出码，非管道 grep 码）：themida lib 167 ✅ / 集成 16 ✅（12→16，4 个新用例全绿）/ mida-pe 1049 持平 ✅ / clippy 三 `-D` 0 error ✅ / fmt ✅，5/5 EXIT=0。
 - 判别力（总指挥自选回退，与 worker 的 `if false` 不同——改成 streak 永不累加，等价复现"无持久计数"原缺陷）：恰 2 个风暴用例红（exit 101）、防误杀与守卫回归 14 绿 → 字节级恢复（`cmp` 一致）→ 16/16 绿。
-- **验证级别 = 离线**：真实 debuggee 风暴下的中止时机、日志有界性、CLI 退出行为**未实弹验证**（下一格实弹应顺带观察：恒同环 ~32 次事件内触发 `guardless constant-AV storm abort`，无 dump、无 `[GOOD]`、日志非 3.5GB 级）。
-- **遗留项（转 TASK-012）**：① 阈值 32 对硬 fail-closed 裕量偏薄（实测分布双峰：健康 0 次 / 风暴 20 万–322 万次，32 与健康侧只差 32 个事件；Themida 大量使用异常式混淆，紧循环里的合法恒同 AV 可能 >32 次 → 误杀会白烧一格实弹）；② 公开常量名拼写 `GARDLESS` 应为 `GUARDLESS`；③ host 侧 `storm_abort → Err` 这条腿**只有代码阅读证据、无自动化测试**（cli crate 未在授权清单内）。
+- **遗留项（TASK-012 已全部清完，2026-08-29）**：① 阈值 32 对硬 fail-closed 裕量偏薄 → **改为 1024**；② 常量拼写 `GARDLESS` → **`GUARDLESS_AV_STORM_TUPLE_THRESHOLD`**；③ host 侧 `storm_abort → Err` 无自动化测试 → **抽出纯函数 `map_storm_abort` + 2 个单元测试**。
+
+**加固（离线级，TASK-012，2026-08-29，总指挥亲验）**：
+- 阈值 **32 → 1024**，doc 注释重写选值理由：本判据后果是**硬 fail-closed**（整单 Err、无产物），不沿用软着陆的 `unrelated_av_storm_threshold=32`（风暴逃逸回退 Break，仍可能出产物）——**后果更重的判据不借用更轻判据的阈值**；实测双峰（健康 0 次 / 风暴 20 万–322 万次）下 1024 对真风暴仍留 2–3 个数量级裕量，误杀窗口比 32 小两个数量级。既有 `unrelated_av_storm_threshold=32` 未动，两阈值从此显式不同。
+- host 腿抽出纯函数 `map_storm_abort`（`av_handler.rs`）：`Some((tuple,count))` → `Err`（错误串逐字保留 TASK-011 原文）／`None` → `Ok(AvAction::Break)`；配 2 个单元测试（cli lib 572→**574**）。
+- 恰 3 授权文件 **+94/-32**；`mod.rs` 未碰（`.text`-stable 判定继续零改动）；既有断言原文逐字保留，无 `#[ignore]`/`.skip`（cli 那 1 个 ignored 用例是 `plugin_host.rs:710`，来自旧提交 `a2809a6`，本单 diff 里 `ignore` 命中 0）。
+- 总指挥亲跑（真退出码）：themida 全量 ✅（集成 16 全绿）/ cli --lib **574** ✅ / mida-pe **1049 持平** ✅ / clippy 三 `-D` 0 error ✅ / fmt ✅。
+- 判别力（总指挥自选**两种**回退，均与 worker 的 no-op 不同）：(B) 从 Err 串里去掉 count → 恰 `Err must carry the count` 断言红（exit 101）；(C) 让 `Some` 臂永不命中（`.filter(|_| false)`，可编译）→ `storm abort must fail closed` 红（exit 101）。中途我第一版 (C) patch 触发 E0425 编译错误——**按 P-5 编译失败不算红**，已重做为可编译版本。字节级恢复（`cmp` 一致）→ 2/2 绿。
+- **仍是离线级**：1024 未经实弹校准；host 腿测的是抽出的纯映射函数，`handle_access_violation` 全函数 e2e 仍无法离线覆盖（依赖 debugger/ProcessSession）。
+- 低优先遗留（下次碰这些文件时顺手，不单独立项）：`guarded_path_unrelated_av_streak_unchanged` 用 `THRESHOLD-1` 作种子，改用 `>= THRESHOLD` 的种子会是更强的"守卫路径下休眠"证明。
+- **验证级别 = 离线**：真实 debuggee 风暴下的中止时机、日志有界性、CLI 退出行为**未实弹验证**（下一格实弹应顺带观察：恒同环 ~1024 次事件内触发 `guardless constant-AV storm abort`，无 dump、无 `[GOOD]`、日志非 3.5GB 级）。
+
 
 
 

@@ -5,7 +5,7 @@
 //! ops, redirects, continues) and which action is returned. No Win32, no
 //! debugger.
 
-use mida_packers_themida::runtime::av_oep_handler::GARDLESS_AV_STORM_TUPLE_THRESHOLD;
+use mida_packers_themida::runtime::av_oep_handler::GUARDLESS_AV_STORM_TUPLE_THRESHOLD;
 use mida_packers_themida::{
     decide_av_oep, AvOepAction, AvOepInput, AvOepQuery, AvOepState, GuardAccessResult, LogLevel,
     ThemidaPeInfo, ThemidaState, ThemidaVersion, TlsCallbackResult,
@@ -207,7 +207,7 @@ fn guardless_constant_av_tuple_aborts_fail_closed_21_1x_geometry() {
     input.event_thread_id = 25252;
 
     // Drive below the threshold: must keep Continue with a running streak.
-    for _ in 0..(GARDLESS_AV_STORM_TUPLE_THRESHOLD - 1) {
+    for _ in 0..(GUARDLESS_AV_STORM_TUPLE_THRESHOLD - 1) {
         let (action, out) = decide(&mut query, &mut themida, &mut av, &input);
         assert_eq!(action, AvOepAction::Continue, "below threshold continues");
         assert!(out.storm_abort.is_none());
@@ -215,7 +215,7 @@ fn guardless_constant_av_tuple_aborts_fail_closed_21_1x_geometry() {
     }
     assert_eq!(
         av.guardless_av_tuple_streak,
-        GARDLESS_AV_STORM_TUPLE_THRESHOLD - 1
+        GUARDLESS_AV_STORM_TUPLE_THRESHOLD - 1
     );
 
     // The threshold hit: fail-closed abort (Break with storm_abort set).
@@ -228,7 +228,7 @@ fn guardless_constant_av_tuple_aborts_fail_closed_21_1x_geometry() {
         .storm_abort
         .as_ref()
         .expect("storm abort must be recorded");
-    assert_eq!(*count, GARDLESS_AV_STORM_TUPLE_THRESHOLD);
+    assert_eq!(*count, GUARDLESS_AV_STORM_TUPLE_THRESHOLD);
     assert!(
         tuple_text.contains("0x7ffa95400bd8") && tuple_text.contains("0x204"),
         "abort tuple must identify the storm geometry: {tuple_text}"
@@ -248,7 +248,7 @@ fn guardless_constant_av_tuple_aborts_fail_closed_04_0x_geometry() {
     input.exc_type = 8;
     input.event_thread_id = 12252;
 
-    for _ in 0..(GARDLESS_AV_STORM_TUPLE_THRESHOLD - 1) {
+    for _ in 0..(GUARDLESS_AV_STORM_TUPLE_THRESHOLD - 1) {
         let (action, out) = decide(&mut query, &mut themida, &mut av, &input);
         assert_eq!(action, AvOepAction::Continue);
         assert!(out.storm_abort.is_none());
@@ -263,7 +263,7 @@ fn guardless_constant_av_tuple_aborts_fail_closed_04_0x_geometry() {
         .storm_abort
         .as_ref()
         .expect("storm abort must be recorded");
-    assert_eq!(*count, GARDLESS_AV_STORM_TUPLE_THRESHOLD);
+    assert_eq!(*count, GUARDLESS_AV_STORM_TUPLE_THRESHOLD);
     assert!(
         tuple_text.contains("0x1108e3761a0") && tuple_text.contains("exc_type=8"),
         "abort tuple must identify the VM fetch ring: {tuple_text}"
@@ -281,7 +281,7 @@ fn guardless_changing_tuple_never_aborts() {
     let mut input = input();
 
     // Alternate between two tuples far more times than the threshold.
-    for i in 0..(GARDLESS_AV_STORM_TUPLE_THRESHOLD * 4) {
+    for i in 0..(GUARDLESS_AV_STORM_TUPLE_THRESHOLD * 4) {
         input.exception_addr = BASE + 0x1000 + u64::from(i % 2) * 0x40;
         input.target_address = BASE + 0x2000 + u64::from(i % 2) * 0x40;
         input.exc_type = (i % 2) as u8;
@@ -318,7 +318,7 @@ fn guarded_path_unrelated_av_streak_unchanged() {
         last_possible_oep: Some((BASE + 0x13e0) as usize),
         unrelated_av_streak: 7,
         guardless_av_tuple: Some((BASE + 0x1000, BASE + 0x1000, 8, 2)),
-        guardless_av_tuple_streak: 31,
+        guardless_av_tuple_streak: GUARDLESS_AV_STORM_TUPLE_THRESHOLD - 1,
         ..AvOepState::default()
     };
     let mut input = input();
@@ -336,9 +336,10 @@ fn guarded_path_unrelated_av_streak_unchanged() {
     assert!(out.storm_escape_freeze);
     assert_eq!(out.unrelated_av_streak, 8);
     // The guardless tuple counter is dormant on the guarded path: the
-    // pre-seeded 31-streak tuple must NOT trigger a C-7 storm abort even
-    // though it sits above the threshold — only the guarded NotGuarded
-    // escape (unrelated_av_streak) decides here.
+    // pre-seeded (THRESHOLD-1)-streak tuple must NOT trigger a C-7 storm
+    // abort even though a single more identical event would reach the
+    // threshold — only the guarded NotGuarded escape
+    // (unrelated_av_streak) decides here.
     assert!(
         out.storm_abort.is_none(),
         "guarded path must not fire the guardless storm abort"
