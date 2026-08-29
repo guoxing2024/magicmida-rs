@@ -13,7 +13,8 @@
 | [TASK-003](../tickets/TASK-003.md) | P0 | 堵住 `check_clippy_baseline.ps1` 的软通过 | ✅ **完成 R2**（2026-08-29，归档 [runs/20260829-TASK-003-R2.md](../runs/20260829-TASK-003-R2.md)；四条验收由总指挥亲自复跑全过） | developer | 编译失败时脚本必须 exit≠0 |
 | [TASK-004](../tickets/TASK-004.md) | P1 | T0.7 会话绑定修复：补齐可离线验证的闭环 | ✅ **完成**（2026-08-29，归档 [runs/20260829-TASK-004.md](../runs/20260829-TASK-004.md)；六条验收由总指挥亲自复跑全过，含独立重做的判别力探针红→绿） | developer | `cargo test -p mida-pe --lib --offline` 全绿且含新增闭环用例 |
 | [TASK-005](../tickets/TASK-005.md) | P1 | GVM Phase 1：`0x8c000` 区归属矛盾复核 | 📋 待领取 | qa | 复算脚本给出唯一结论并自证口径 |
-| [TASK-006](../tickets/TASK-006.md) | P1 | 原版宿主重脱壳，根治会话绑定（解开 T0.5） | 📋 **待领取（已解锁：前置 TASK-004 完成）**；授权已批 D-011 | developer | 新宿主 S3 load_no_crash 10/10 隔离运行 |
+| [TASK-006](../tickets/TASK-006.md) | P1 | 原版宿主重脱壳，根治会话绑定（解开 T0.5） | ⛔ **BLOCKED**（2026-08-29，归档 [runs/20260829-TASK-006.md](../runs/20260829-TASK-006.md)；重脱壳候选 `bb5ee568` 启动即 AV，根因 = dump 重建缺陷 A + 会话绑定残留 B，四项关键声明总指挥亲验坐实；实弹计 1 格 XC-XXI-B 2/4） | developer | 新宿主 S3 load_no_crash 10/10 隔离运行 |
+| [TASK-009](../tickets/TASK-009.md) | P1 | 修 dump 重建缺陷 A：不可解析运行时指针固化进只读节（fail-open） | 📋 待领取（TASK-006/T0.5 复跑的硬前置） | developer | `cargo test -p mida-pe --lib --offline` 全绿含缺陷捕获用例 |
 | [TASK-007](../tickets/TASK-007.md) | P1 | GVM Phase 1 定向 dump 实弹（账本 GVM 1/8） | 📋 待领取（开跑前须先交"写定五项"）；授权已批 D-012 | developer | `0x184eb6` 处字节非全零 |
 | [TASK-008](../tickets/TASK-008.md) | P1 | 清还 clippy 基线漂移（10 个机械位点，推送前必做） | ✅ **完成**（2026-08-29，归档 [runs/20260829-TASK-008.md](../runs/20260829-TASK-008.md)；三条验收由总指挥亲自复跑全过，基线 349→337 只降不升） | developer | 基线脚本 exit 0 + `TOTAL=337` |
 
@@ -29,7 +30,7 @@
 
 | ID | 标题 | 卡在哪 | 解锁条件 |
 |---|---|---|---|
-| T0.5 | Run UI 事件驱动补测（Run verdict PARTIAL→FULL） | `BLOCKED_ENV`：机器 2026-08-29 07:58 重启后系统 DLL ASLR 重随机化，宿主 `rev2_unpacked.exe` 启动初始化期即 AV，core.dll 从未加载 | 老板已选"重脱壳根治"（D-011）。等 TASK-004 → TASK-006 产出新宿主后续跑。重跑脚本 `tools/xx21b_t05_ui_drive.py` 已就绪 |
+| T0.5 | Run UI 事件驱动补测（Run verdict PARTIAL→FULL） | **双候选宿主均不可用**：旧 `rev2_unpacked.exe`（`36043cb4`）跨 ASLR 重启即 AV（BLOCKED_ENV）；新重脱壳候选 `bb5ee568` 当前会话启动即 AV（dump 重建缺陷 A，C-4） | 硬前置 = TASK-009（修缺陷 A）→ TASK-006 复跑（重脱壳 + S1-S4 + 10 次隔离）→ T0.5 续跑。**缺陷 A 修复前不消耗实弹格重跑**（TASK-006 建议已采纳）。重跑脚本 `tools/xx21b_t05_ui_drive.py` 已就绪 |
 | GVM 门1 | Phase 1 自洽 ISA 规格书 | VM 字节码缓冲区 `0x184eb6` 在 dump 中全零未物化；取指核心是运行时动态代码（`0x8f099` 间接 call） | 老板已批一格定向 dump（D-012）→ TASK-007。建议先做 TASK-005，避免复核推翻主译码器结论后 dump 目标失效 |
 
 ## 已完成（本次接管前，2026-08-29 及以前）

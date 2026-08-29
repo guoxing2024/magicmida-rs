@@ -7,7 +7,7 @@
 
 这项目是**活的**（654 次提交，2801 个测试全绿），
 本次接管已把最要紧的风险解掉：**两天的在飞成果已分 8 个提交落到本地 git，`cargo fmt` 从红 216 处变为 0。推送按老板裁定停在本地，等他逐次确认。**
-下一件最要紧的事是 **TASK-006**（原版宿主重脱壳，老板已批 D-011；前置 TASK-004 已完成）。建议并行 TASK-005（纯离线复核）。
+下一件最要紧的事是 **TASK-009**（修 dump 重建缺陷 A——TASK-006 实弹验收发现 `.rdata 0x1137d0` 槽被固化指向自身 .pdata 的 NX 指针，IAT 重建不完整时管线 fail-open 照常打印 `[GOOD]`）。它是 TASK-006/T0.5 复跑的硬前置。TASK-005（纯离线复核）可并行。
 **注意：WO-23 基线门在 HEAD 上是红的**（基线漂移，见 KNOWN_ISSUES G-7 / TASK-008）——推送前必须清还，否则 CI clippy 必红。
 
 ## 存活状态 [已验证]
@@ -77,7 +77,7 @@
    但其存在的**唯一理由**——"产物跨 ASLR 重启可加载"——**仍未实弹验证**。走 TASK-006（重脱壳根治，老板已批 D-011）。
    **worker 自曝的未验证点**：`cleanup_artifact` 用 `section.virtual_address` 直接当 buf 偏移的假定在真实 dump 产物（VA != raw offset 的 .data 节）上未验证——实弹时注意。
 2. **`core_perfect_candidate.dll` 的 Run verdict = PARTIAL**：业务链走到 GUI 消息循环即止，`URLDownloadToFileA` 实际调用点从未触发。
-3. **T0.5 Run UI 事件驱动补测 = BLOCKED_ENV**：宿主 `rev2_unpacked.exe` 因固化了旧会话 ntdll 绝对地址，重启后启动期即 AV。这是 T0.7 那个缺陷的实锤现场，也是它必须实弹验证的原因。**待老板决策。**
+3. **T0.5 Run UI 事件驱动补测 = 双重阻塞**：旧宿主 `36043cb4` 跨 ASLR 重启即 AV（BLOCKED_ENV）；新重脱壳候选 `bb5ee568` 当前会话启动即 AV（dump 重建缺陷 A，C-4）。硬前置 = TASK-009 → TASK-006 复跑。**缺陷 A 修复前不消耗实弹格重跑**。
 4. **GVM Phase 1（反虚拟化主攻线）**：调度循环已还原、handler 候选 172 个，但 VM 字节码缓冲区 `0x184eb6` 在 dump 中全零未物化、取指核心是运行时动态代码 → "抽字节码→推演→对拍"未闭环，门 1（自洽 ISA 规格书）未过。账本 GVM 0/8。
    **自带一条必须修正项**：`0x8c000-0x8cfff` 两源 trace exec=0，与既有"0x8c4c0 主译码器 216K+ trace 实证"矛盾，尚未归属复核。
 5. **GTO preflight lane（G3）**：离线实现完整、测试覆盖，但**从未跑过真实 GTO 样品**。
@@ -102,11 +102,12 @@
 1. ~~P0 — 落地在飞的工作区~~ **已完成**（2026-08-29，8 个本地提交；推送按老板裁定 D-010 停在本地）。
 2. ~~P0 — TASK-003：堵住 `check_clippy_baseline.ps1` 的软通过~~ **已完成 R2**（2026-08-29，四条验收由总指挥亲自复跑全过：链接失败 exit 3 / E0308 注入 exit 3 / 镜像基线 exit 0 / deny 不误杀 exit 0；归档 `runs/20260829-TASK-003-R2.md`）。
 3. ~~P1 — TASK-008：清还 clippy 基线漂移~~ **已完成**（2026-08-29，10 个机械位点最小修复，基线 349→337 只降不升；三条验收由总指挥亲自复跑全过：门禁 exit 0 / 全量测试 2801 passed 0 failed / fmt exit 0；归档 `runs/20260829-TASK-008.md`）。
-4. ~~P1 — TASK-004：T0.7 可离线闭环~~ **已完成**（2026-08-29，六条验收由总指挥亲自复跑全过：pe-lib 1042 passed / cli-lib 572 passed / clippy-deny exit 0 / fmt exit 0 / `--help` 可见 / 判别力探针红→绿；归档 `runs/20260829-TASK-004.md`）。**下一步：TASK-006（重脱壳实弹，老板已批 D-011）。**
+4. ~~P1 — TASK-004：T0.7 可离线闭环~~ **已完成**（2026-08-29，六条验收由总指挥亲自复跑全过：pe-lib 1042 passed / cli-lib 572 passed / clippy-deny exit 0 / fmt exit 0 / `--help` 可见 / 判别力探针红→绿；归档 `runs/20260829-TASK-004.md`）。
+5. **P1 — TASK-009：修 dump 重建缺陷 A（fail-open）。** TASK-006 实弹验收（2026-08-29）发现重脱壳候选 `bb5ee568` 启动即 AV：`.rdata 0x1137d0` 槽被固化 `0x1401681d1`（指向自身 .pdata，NX），启动期 `call [0x1137d0]` 跳进去；管线在 IAT 重建不完整（`Unresolved=74`）时仍打印 `[GOOD] Candidate written`。缺陷不修，TASK-006/T0.5 无法复跑。归档 `runs/20260829-TASK-006.md`（四项关键声明总指挥字节级亲验坐实）。
 
-老板已批但需排队的两件实弹工作：TASK-006（重脱壳根治会话绑定，前置 TASK-004 已完成，**已解锁**）、TASK-007（GVM 定向 dump 一格，建议先做 TASK-005 复核）。
+老板已批但需排队的实弹工作：TASK-006 复跑（等 TASK-009）、TASK-007（GVM 定向 dump 一格，建议先做 TASK-005 复核）。
 
 ## 下一步
 
-TASK-006（已解锁）；TASK-005 纯离线可并行，完成后再开 TASK-007。
+TASK-009（修缺陷 A）→ TASK-006 复跑 → T0.5 续跑；TASK-005 纯离线可并行，完成后再开 TASK-007。
 推送时机由老板定；推送前建议补跑 `cargo deny check advisories`（本机离线跑不了）。
