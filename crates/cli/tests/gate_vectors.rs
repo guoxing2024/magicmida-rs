@@ -58,6 +58,7 @@ fn gate_vectors_match_rust_implementation() {
             large_rx_present: v.inputs.large_rx_present,
             large_rx_has_raw: v.inputs.large_rx_has_raw,
             has_ahk_export: v.inputs.has_ahk_export,
+            shell_sections_present: false,
         };
         let profile = profile_from_str(&v.profile);
         let r = validate_generic_dump(inputs, profile);

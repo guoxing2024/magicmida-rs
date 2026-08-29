@@ -59,6 +59,14 @@ pub(super) struct LoopState {
     /// (thread already suspended by the event) instead of a self-owned
     /// Suspend/Resume, which breaks WinLicense's exception-driven VM timing.
     pub(super) iat_materialize_arm_pending: bool,
+    /// T0.5-R2 (redump fix): when the deferred HW anchor fails to arm, the
+    /// original fail-closed path froze immediately and dumped a
+    /// half-initialized shell (.bss singleton lock non-zero -> the re-packed
+    /// host wedged on the EP lock and never loaded core.dll). Instead the
+    /// loop stays alive for this grace window so the shell finishes DLL
+    /// loading / init (matching the xx11 flow that waited on IAT
+    /// materialization), then the plugin's natural leave dumps.
+    pub(super) iat_materialize_failclosed_delay: Option<std::time::Instant>,
     /// .text poll: re-guard done, waiting for AV at OEP
     pub(super) text_reguarded: bool,
     pub(super) oep: Option<usize>,

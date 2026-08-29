@@ -480,27 +480,37 @@ impl WindowsDebugger {
     ) -> Result<(), CoreError> {
         let thread_ids: Vec<u32> = self.threads.keys().copied().collect();
         let mut applied = Vec::with_capacity(thread_ids.len());
+        let mut first_error: Option<CoreError> = None;
         for thread_id in thread_ids {
-            if let Err(apply_error) =
-                self.apply_debug_registers_thread_for_state(thread_id, desired)
-            {
-                let mut rollback_errors = Vec::new();
-                for applied_tid in applied.into_iter().rev() {
-                    if let Err(error) =
-                        self.apply_debug_registers_thread_for_state(applied_tid, rollback)
-                    {
-                        rollback_errors.push(format!("tid={applied_tid}: {error}"));
+            match self.apply_debug_registers_thread_for_state(thread_id, desired) {
+                Ok(()) => applied.push(thread_id),
+                Err(e) => {
+                    // T0.5-R2 (redump fix): a single thread's context may be
+                    // transiently inaccessible (ERROR_NOACCESS on a dying or
+                    // just-started thread — seen during the xx21b redump HW
+                    // anchor arm). Failing the whole HW-BP transaction for one
+                    // bad thread forced the unpacker into a fail-closed early
+                    // dump (half-initialized shell; .bss singleton lock
+                    // non-zero), which wedged the re-packed host. Skip the
+                    // thread instead; the anchor only needs to fire on the
+                    // threads that can take it (the target main thread). If
+                    // EVERY thread fails, fail closed with the first error.
+                    let err_str = e.to_string();
+                    if first_error.is_none() {
+                        first_error = Some(e);
                     }
+                    warn!(
+                        thread_id,
+                        error = %err_str,
+                        "skipping thread for HW-BP apply (T0.5-R2 partial tolerance)"
+                    );
                 }
-                if rollback_errors.is_empty() {
-                    return Err(apply_error);
-                }
-                return Err(CoreError::DebugState(format!(
-                    "hardware breakpoint transaction failed: {apply_error}; rollback failed for {}",
-                    rollback_errors.join(", ")
-                )));
             }
-            applied.push(thread_id);
+        }
+        if applied.is_empty() {
+            return Err(first_error.unwrap_or(CoreError::DebugState(
+                "hardware breakpoint apply: no thread applied".into(),
+            )));
         }
         Ok(())
     }

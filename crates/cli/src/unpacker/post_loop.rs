@@ -398,6 +398,7 @@ pub(super) fn run_post_loop_phases(
         dump_timing,
         section_content_reference: None,
         capture_policy,
+        keep_runtime_base: false,
     };
 
     let dump_report = mida_pe::dump_process_with_report(dbg, &dump_opts)

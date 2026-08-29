@@ -44,6 +44,7 @@ mod gto_host;
 mod helpers;
 mod iat_evidence;
 mod iat_materialize;
+pub mod iat_observe;
 mod iat_trace;
 mod loop_state;
 mod oep_evidence;
@@ -51,6 +52,7 @@ mod oep_scan;
 mod plugin_host;
 mod post_attach;
 mod post_loop;
+pub mod rebase_fixed;
 mod relocation_evidence;
 pub mod runtime_loader;
 mod section_rebuild_evidence;
@@ -99,12 +101,15 @@ use post_loop::run_post_loop_phases;
 use session::ProcessSession;
 
 // Re-export public functions for commands.rs
+pub use dump::dump_module_full;
 pub use dump::dump_process_code;
 pub use generic::generic_unpack;
 pub use generic_gate::{
     gate_inputs_from_pe, is_ahk_export_name, validate_generic_dump, GenericGateFailure,
     GenericGateInputs, GenericGateProfile, GenericGateResult, AHK_EXPORT_NAMES,
 };
+pub use iat_observe::iat_observe;
+pub use rebase_fixed::rebase_fixed;
 pub use verify::verify_unpacked;
 
 // ---------------------------------------------------------------------------
@@ -677,6 +682,7 @@ pub fn unpack(
         iat_materialize_av_streak: 0,
         iat_materialize_last_av_rip: None,
         iat_materialize_arm_pending: false,
+        iat_materialize_failclosed_delay: None,
         text_reguarded: false,
         oep: None,
         oep_provenance: OepProvenance::default(),
@@ -807,8 +813,9 @@ pub fn unpack(
                 &output_path,
             )?;
             if let Some(ctx) = evidence_ctx.take() {
-                crate::runner_preflight::complete_run_evidence(ctx, &output_path)
-                    .map_err(|e| anyhow!("evidence bundle assembly failed after a legacy run: {e:#}"))?;
+                crate::runner_preflight::complete_run_evidence(ctx, &output_path).map_err(|e| {
+                    anyhow!("evidence bundle assembly failed after a legacy run: {e:#}")
+                })?;
             }
             return Ok(());
         }
@@ -866,7 +873,10 @@ pub fn unpack(
                 walker_dispatch: walker_dispatch::try_build_live_dispatch_bridge_boxed(
                     dbg.process_handle(),
                     loader_outcome.as_ref().ok(),
-                    loader_outcome.as_ref().ok().and_then(|l| l.walker_exports()),
+                    loader_outcome
+                        .as_ref()
+                        .ok()
+                        .and_then(|l| l.walker_exports()),
                 ),
                 // IMP-09-CARRIER-R5-R2-1: the debugger drives termination
                 // AFTER the controller gate (alive window); run() must not
@@ -969,19 +979,36 @@ pub fn unpack(
         // per-anchor timeout) is what actually ends the wait.
         if let Some(reason) = plugin_leave_reason(&plugin_ctx) {
             if !ls.iat_materialize_wait {
+                // T0.5-R2: during the HW-anchor-failure grace window, defer
+                // the plugin's leave so the shell finishes init before the
+                // dump (see iat_materialize_failclosed_delay). Once the
+                // window lapses, the leave proceeds as normal.
+                let grace_open = ls
+                    .iat_materialize_failclosed_delay
+                    .map_or(true, |t| std::time::Instant::now() >= t);
+                if grace_open {
+                    log::log(
+                        LogType::Info,
+                        &format!("PackerPlugin leave_debug_loop before wait ({reason})"),
+                    );
+                    break;
+                }
                 log::log(
                     LogType::Info,
-                    &format!("PackerPlugin leave_debug_loop before wait ({reason})"),
+                    &format!(
+                        "PackerPlugin leave_debug_loop ({reason}) deferred — \
+                         HW-anchor-failure shell steady-state grace window (T0.5-R2)"
+                    ),
                 );
-                break;
+            } else {
+                log::log(
+                    LogType::Info,
+                    &format!(
+                        "PackerPlugin leave_debug_loop ({reason}) suppressed — \
+                         IAT-materialization wait armed"
+                    ),
+                );
             }
-            log::log(
-                LogType::Info,
-                &format!(
-                    "PackerPlugin leave_debug_loop ({reason}) suppressed — \
-                     IAT-materialization wait armed"
-                ),
-            );
         }
 
         // Prefer finite wait while plugin says so (text-poll); else blocking.
@@ -1307,8 +1334,8 @@ pub fn unpack(
                                 // import is about to be read (IAT must be materialized).
                                 let text_buf_full = {
                                     let text_sec0 = &state.pe_info.pe_sections[0];
-                                    let tstart = image_base_usize
-                                        + text_sec0.virtual_address as usize;
+                                    let tstart =
+                                        image_base_usize + text_sec0.virtual_address as usize;
                                     let tsize = (text_sec0.virtual_size as usize).min(0x100_000);
                                     let mut buf = vec![0u8; tsize];
                                     let _ = dbg.read_memory(tstart, &mut buf);
@@ -1317,12 +1344,11 @@ pub fn unpack(
                                 let (tstart, text_buf_full) = text_buf_full;
                                 let tsize = (state.pe_info.pe_sections[0].virtual_size as usize)
                                     .min(0x100_000);
-                                let site =
-                                    mida_packers_themida::first_out_of_image_iat_site(
-                                        &text_buf_full,
-                                        tstart,
-                                        tsize,
-                                    );
+                                let site = mida_packers_themida::first_out_of_image_iat_site(
+                                    &text_buf_full,
+                                    tstart,
+                                    tsize,
+                                );
                                 match iat_materialize::initial_materialize_step(site, ls.oep) {
                                     iat_materialize::MaterializeStep::ArmSite(site_va) => {
                                         log::log(
@@ -1346,8 +1372,7 @@ pub fn unpack(
                                         ls.iat_materialize_arm_pending = true;
                                         ls.iat_materialize_wait = true;
                                         ls.iat_materialize_fallback = false;
-                                        ls.iat_materialize_start =
-                                            Some(std::time::Instant::now());
+                                        ls.iat_materialize_start = Some(std::time::Instant::now());
                                     }
                                     iat_materialize::MaterializeStep::ArmOep(oep_va) => {
                                         log::log(
@@ -1363,8 +1388,7 @@ pub fn unpack(
                                         ls.iat_materialize_arm_pending = true;
                                         ls.iat_materialize_wait = true;
                                         ls.iat_materialize_fallback = true;
-                                        ls.iat_materialize_start =
-                                            Some(std::time::Instant::now());
+                                        ls.iat_materialize_start = Some(std::time::Instant::now());
                                     }
                                     iat_materialize::MaterializeStep::FreezeAndDump => {
                                         // No anchor at all: keep frozen, fail-closed.
@@ -1405,19 +1429,35 @@ pub fn unpack(
         refresh_plugin_loop_policy(&mut packer, &mut plugin_ctx, &ls);
         if let Some(reason) = plugin_leave_reason(&plugin_ctx) {
             if !ls.iat_materialize_wait {
+                // T0.5-R2: during the HW-anchor-failure grace window, defer
+                // the plugin's leave so the shell finishes init before the
+                // dump (see iat_materialize_failclosed_delay).
+                let grace_open = ls
+                    .iat_materialize_failclosed_delay
+                    .map_or(true, |t| std::time::Instant::now() >= t);
+                if grace_open {
+                    log::log(
+                        LogType::Info,
+                        &format!("PackerPlugin leave_debug_loop ({reason})"),
+                    );
+                    break;
+                }
                 log::log(
                     LogType::Info,
-                    &format!("PackerPlugin leave_debug_loop ({reason})"),
+                    &format!(
+                        "PackerPlugin leave_debug_loop ({reason}) deferred — \
+                         HW-anchor-failure shell steady-state grace window (T0.5-R2)"
+                    ),
                 );
-                break;
+            } else {
+                log::log(
+                    LogType::Info,
+                    &format!(
+                        "PackerPlugin leave_debug_loop ({reason}) suppressed — \
+                         IAT-materialization wait armed"
+                    ),
+                );
             }
-            log::log(
-                LogType::Info,
-                &format!(
-                    "PackerPlugin leave_debug_loop ({reason}) suppressed — \
-                     IAT-materialization wait armed"
-                ),
-            );
         }
 
         // XX-6 (L'): arm the deferred HW anchor at this natural event stop.
@@ -1445,13 +1485,24 @@ pub fn unpack(
                         warn!("arm deferred HW anchor failed: {e}");
                         ls.iat_materialize_arm_pending = false;
                         ls.iat_materialize_wait = false;
-                        // Freeze + dump (fail-closed IAT).
+                        // T0.5-R2 (redump fix): do NOT freeze immediately.
+                        // The xx11 flow armed successfully and kept the loop
+                        // alive through IAT materialization, letting the
+                        // shell finish DLL loading / init before the dump;
+                        // freezing right here dumped a half-initialized shell
+                        // (.bss singleton lock non-zero) that wedges the
+                        // re-packed host on the EP lock (never loads
+                        // core.dll, exits via ExitProcess(0)). Keep the loop
+                        // alive for a grace window so the shell reaches
+                        // steady state, then the plugin's natural leave dumps.
+                        ls.iat_materialize_failclosed_delay =
+                            Some(std::time::Instant::now() + std::time::Duration::from_secs(12));
                         log::log(
                             LogType::Warn,
                             "deferred HW anchor arm failed — \
-                             freezing for fail-closed dump",
+                             extending shell steady-state grace window before dump (T0.5-R2)",
                         );
-                        break;
+                        // continue the loop (do NOT break)
                     }
                 }
             } else {
@@ -1532,10 +1583,9 @@ pub fn unpack(
                             ini_path: None,
                             hook_delay_ms,
                         };
-                        if let Err(e) = mida_packers_themida::inject_scylla_hide(
-                            pid,
-                            &scylla_config,
-                        ) {
+                        if let Err(e) =
+                            mida_packers_themida::inject_scylla_hide(pid, &scylla_config)
+                        {
                             warn!("ScyllaHide injection failed (non-fatal): {e}");
                         } else {
                             info!("ScyllaHide injected (legacy escape hatch)");
@@ -1544,199 +1594,206 @@ pub fn unpack(
                         dbg.apis = Some(apis);
                     } else {
                         let evidence_dir = output_path
-                        .parent()
-                        .map(|p| p.to_path_buf())
-                        .unwrap_or_else(|| std::path::PathBuf::from("."));
-                    let mut ad_controller = antidebug_controller::AntidebugController::new(
-                        antidebug_controller::AntidebugStageOptions {
-                            sample_id: None, // case binding happens in preflight
-                            target_pid: pid,
-                            evidence_dir: Some(evidence_dir.clone()),
-                            oracle: None, // oracle mode is opt-in and never production
-                            cleanup_backend: Some(Box::new(
-                                antidebug_controller::Win32CleanupBackend::new(
-                                    dbg.process_handle(),
-                                ),
-                            )),
-                            // IMP-09-CARRIER-R5-R1 P0-1: production walker
-                            // target handle (same debugger handle).
-                            target_handle: Some(dbg.process_handle()),
-                            // ADR-6: audited runtime authority + artifact path.
-                            // The loader result is injected below after the
-                            // runtime is actually loaded into the target.
-                            // Manifest load failure fails closed at the
-                            // controller dependency stage.
-                            runtime_authority: crate::unpacker::runtime_loader::runtime_authority()
-                                .ok(),
-                            runtime_path: crate::unpacker::runtime_loader::runtime_artifact_path(),
-                            loader_result: None,
-                            // IMP-09-CARRIER-R3: the sealed verified target
-                            // identity flows from the launch attestation into
-                            // the controller. None when no preflight ran —
-                            // the controller then fails closed (UNBOUND).
-                            target_identity: evidence_ctx
-                                .as_ref()
-                                .map(|ctx| ctx.target_identity().clone()),
-                            // IMP-09-PROFILE-SOURCE-R1: the sealed verified
-                            // profile identity flows from the launch
-                            // attestation into the controller (same source
-                            // object as the target identity; None when no
-                            // preflight or no profile object — fail closed).
-                            profile_identity: evidence_ctx
-                                .as_ref()
-                                .and_then(|ctx| ctx.profile_identity().cloned()),
-                            // IMP-09-DISPATCH-WIRING: env-gated live
-                            // dispatch bridge. Gate contract:
-                            // MIDA_GTO_NO_BYPASS=1 AND
-                            // MIDA_GTO_LIVE_DISPATCH=1 (live_dispatch_gate
-                            // in walker_dispatch.rs). Gate closed -> None
-                            // (offline default: NOT_IMPLEMENTED at the
-                            // execute gate, Proceed blocked — unchanged).
-                            // Gate open -> construct via the sealed
-                            // dual-carrier path; missing carriers -> None.
-                            // WIRING-2 note: this construction site runs
-                            // BEFORE the runtime loader (loader_outcome is
-                            // produced later in this handler, after the
-                            // AntidebugController is constructed), so both
-                            // carriers are structurally unavailable here ->
-                            // bridge stays None (fail-closed). The
-                            // post-attach construction site carries the
-                            // full WIRING-2 channel; this site would need
-                            // a deferred/rebuild seam to ever construct
-                            // (out of scope; reported in
-                            // docs/IMP09_DISPATCH_WIRING2_REPORT_20260826.md).
-                            walker_dispatch: walker_dispatch::try_build_live_dispatch_bridge_boxed(
-                                dbg.process_handle(),
-                                None, // loader outcome not yet produced
-                                None, // remote MidaExportsV2 not in scope
-                            ),
-                            // IMP-09-CARRIER-R5-R2-1: the debugger drives
-                            // termination AFTER the controller gate (alive
-                            // window); run() must not fire the backend.
-                            defer_cleanup_to_caller: true,
-                        },
-                    );
-                    // ADR-6: run the self-owned loader (verify + load +
-                    // initialize + attestation) while the target is still
-                    // suspended; inject the result into the controller.
-                    // Profile binding: the profile id/digest are the
-                    // controller-selected values (ADR-2 origin profile);
-                    // the loader passes them to the runtime which echoes
-                    // them in the attestation for cross-check.
-                    // ADR-5B: the CREATE_PROCESS debug event freezes every target
-                    // thread until ContinueDebugEvent, so a synchronous remote
-                    // call (CreateRemoteThread + wait) can NEVER complete inside
-                    // this window. Fix: continue the CREATE_PROCESS event FIRST
-                    // (unfreeze), then run the loader whose drain callback keeps
-                    // the debug session alive (WaitForDebugEvent + Continue)
-                    // while the remote thread makes progress. The handler-end
-                    // continue below is skipped once this path ran.
-                    dbg.continue_event(thread_id, ContinueStatus::Continue)?;
-                    ad_controller_may_skip_continue = true;
-                    // ADR-5B: warm-up drain BEFORE the loader runs. The
-                    // CREATE_PROCESS continue unfroze the target, but the
-                    // process initializer (ntdll loader lock) must finish
-                    // before LoadLibraryW can succeed inside the target.
-                    // Drain the early DLL-load events first (bounded).
-                    // ADR-5B-R1: drain capability lives in the core debugger. Every
-                    // drained event passes through the unified lifecycle (pending
-                    // identity, sequence, exactly-once continue) and the full
-                    // bookkeeping (thread table register/remove, hFile close, DR
-                    // propagation, exception recording). No event bypasses the
-                    // debugger's bookkeeping anymore.
-                    // The process handle is Copy; extract it BEFORE the drain
-                    // closure so the closure can hold the only mutable borrow of
-                    // `dbg` while the loader still needs the target handle.
-                    let target_handle = dbg.process_handle();
-                    let mut drain = |timeout_ms: u32| -> Result<
-                        Option<mida_core::DrainReceipt>,
-                        mida_core::CoreError,
-                    > { dbg.drain_debug_event(timeout_ms) };
-                    let mut warm_loaddll = 0u32;
-                    let mut warm_iters = 0u32;
-                    let mut warm_receipts = Vec::new();
-                    while warm_loaddll < 16 && warm_iters < 240 {
-                        match drain(100) {
-                            Ok(Some(receipt)) => {
-                                if receipt.event_code == 6 {
-                                    warm_loaddll += 1;
+                            .parent()
+                            .map(|p| p.to_path_buf())
+                            .unwrap_or_else(|| std::path::PathBuf::from("."));
+                        let mut ad_controller = antidebug_controller::AntidebugController::new(
+                            antidebug_controller::AntidebugStageOptions {
+                                sample_id: None, // case binding happens in preflight
+                                target_pid: pid,
+                                evidence_dir: Some(evidence_dir.clone()),
+                                oracle: None, // oracle mode is opt-in and never production
+                                cleanup_backend: Some(Box::new(
+                                    antidebug_controller::Win32CleanupBackend::new(
+                                        dbg.process_handle(),
+                                    ),
+                                )),
+                                // IMP-09-CARRIER-R5-R1 P0-1: production walker
+                                // target handle (same debugger handle).
+                                target_handle: Some(dbg.process_handle()),
+                                // ADR-6: audited runtime authority + artifact path.
+                                // The loader result is injected below after the
+                                // runtime is actually loaded into the target.
+                                // Manifest load failure fails closed at the
+                                // controller dependency stage.
+                                runtime_authority:
+                                    crate::unpacker::runtime_loader::runtime_authority().ok(),
+                                runtime_path:
+                                    crate::unpacker::runtime_loader::runtime_artifact_path(),
+                                loader_result: None,
+                                // IMP-09-CARRIER-R3: the sealed verified target
+                                // identity flows from the launch attestation into
+                                // the controller. None when no preflight ran —
+                                // the controller then fails closed (UNBOUND).
+                                target_identity: evidence_ctx
+                                    .as_ref()
+                                    .map(|ctx| ctx.target_identity().clone()),
+                                // IMP-09-PROFILE-SOURCE-R1: the sealed verified
+                                // profile identity flows from the launch
+                                // attestation into the controller (same source
+                                // object as the target identity; None when no
+                                // preflight or no profile object — fail closed).
+                                profile_identity: evidence_ctx
+                                    .as_ref()
+                                    .and_then(|ctx| ctx.profile_identity().cloned()),
+                                // IMP-09-DISPATCH-WIRING: env-gated live
+                                // dispatch bridge. Gate contract:
+                                // MIDA_GTO_NO_BYPASS=1 AND
+                                // MIDA_GTO_LIVE_DISPATCH=1 (live_dispatch_gate
+                                // in walker_dispatch.rs). Gate closed -> None
+                                // (offline default: NOT_IMPLEMENTED at the
+                                // execute gate, Proceed blocked — unchanged).
+                                // Gate open -> construct via the sealed
+                                // dual-carrier path; missing carriers -> None.
+                                // WIRING-2 note: this construction site runs
+                                // BEFORE the runtime loader (loader_outcome is
+                                // produced later in this handler, after the
+                                // AntidebugController is constructed), so both
+                                // carriers are structurally unavailable here ->
+                                // bridge stays None (fail-closed). The
+                                // post-attach construction site carries the
+                                // full WIRING-2 channel; this site would need
+                                // a deferred/rebuild seam to ever construct
+                                // (out of scope; reported in
+                                // docs/IMP09_DISPATCH_WIRING2_REPORT_20260826.md).
+                                walker_dispatch:
+                                    walker_dispatch::try_build_live_dispatch_bridge_boxed(
+                                        dbg.process_handle(),
+                                        None, // loader outcome not yet produced
+                                        None, // remote MidaExportsV2 not in scope
+                                    ),
+                                // IMP-09-CARRIER-R5-R2-1: the debugger drives
+                                // termination AFTER the controller gate (alive
+                                // window); run() must not fire the backend.
+                                defer_cleanup_to_caller: true,
+                            },
+                        );
+                        // ADR-6: run the self-owned loader (verify + load +
+                        // initialize + attestation) while the target is still
+                        // suspended; inject the result into the controller.
+                        // Profile binding: the profile id/digest are the
+                        // controller-selected values (ADR-2 origin profile);
+                        // the loader passes them to the runtime which echoes
+                        // them in the attestation for cross-check.
+                        // ADR-5B: the CREATE_PROCESS debug event freezes every target
+                        // thread until ContinueDebugEvent, so a synchronous remote
+                        // call (CreateRemoteThread + wait) can NEVER complete inside
+                        // this window. Fix: continue the CREATE_PROCESS event FIRST
+                        // (unfreeze), then run the loader whose drain callback keeps
+                        // the debug session alive (WaitForDebugEvent + Continue)
+                        // while the remote thread makes progress. The handler-end
+                        // continue below is skipped once this path ran.
+                        dbg.continue_event(thread_id, ContinueStatus::Continue)?;
+                        ad_controller_may_skip_continue = true;
+                        // ADR-5B: warm-up drain BEFORE the loader runs. The
+                        // CREATE_PROCESS continue unfroze the target, but the
+                        // process initializer (ntdll loader lock) must finish
+                        // before LoadLibraryW can succeed inside the target.
+                        // Drain the early DLL-load events first (bounded).
+                        // ADR-5B-R1: drain capability lives in the core debugger. Every
+                        // drained event passes through the unified lifecycle (pending
+                        // identity, sequence, exactly-once continue) and the full
+                        // bookkeeping (thread table register/remove, hFile close, DR
+                        // propagation, exception recording). No event bypasses the
+                        // debugger's bookkeeping anymore.
+                        // The process handle is Copy; extract it BEFORE the drain
+                        // closure so the closure can hold the only mutable borrow of
+                        // `dbg` while the loader still needs the target handle.
+                        let target_handle = dbg.process_handle();
+                        let mut drain = |timeout_ms: u32| -> Result<
+                            Option<mida_core::DrainReceipt>,
+                            mida_core::CoreError,
+                        > {
+                            dbg.drain_debug_event(timeout_ms)
+                        };
+                        let mut warm_loaddll = 0u32;
+                        let mut warm_iters = 0u32;
+                        let mut warm_receipts = Vec::new();
+                        while warm_loaddll < 16 && warm_iters < 240 {
+                            match drain(100) {
+                                Ok(Some(receipt)) => {
+                                    if receipt.event_code == 6 {
+                                        warm_loaddll += 1;
+                                    }
+                                    warm_receipts.push(receipt);
                                 }
-                                warm_receipts.push(receipt);
+                                Ok(None) => {
+                                    // No event within the poll budget: keep polling.
+                                }
+                                Err(e) => {
+                                    log::log(
+                                        LogType::Fatal,
+                                        &format!("warm-up drain failed: {e:#}"),
+                                    );
+                                    return Err(e.into());
+                                }
                             }
-                            Ok(None) => {
-                                // No event within the poll budget: keep polling.
+                            warm_iters += 1;
+                        }
+                        log::log(
+                            LogType::Info,
+                            &format!(
+                                "warm-up drain done: {} events, {} LOAD_DLL, receipts: {}",
+                                warm_receipts.len(),
+                                warm_loaddll,
+                                warm_receipts
+                                    .iter()
+                                    .map(|r| format!(
+                                        "seq={} code={} disp={:?} tid={} bk={}",
+                                        r.sequence,
+                                        r.event_code,
+                                        r.disposition,
+                                        r.thread_id,
+                                        r.bookkeeping
+                                    ))
+                                    .collect::<Vec<_>>()
+                                    .join("; ")
+                            ),
+                        );
+                        // IMP-09-PROFILE-SOURCE-R1: profile id/digest come from the
+                        // sealed verified carrier (attestation-bound). None ->
+                        // the loader fails closed (no bare-string substitution).
+                        let loader_outcome = crate::unpacker::runtime_loader::run_runtime_loader(
+                            target_handle,
+                            pid,
+                            evidence_ctx.as_ref().and_then(|ctx| ctx.profile_identity()),
+                            &mut drain,
+                        );
+                        match loader_outcome {
+                            Ok(loader_result) => {
+                                ad_controller.set_loader_result(loader_result);
                             }
                             Err(e) => {
-                                log::log(LogType::Fatal, &format!("warm-up drain failed: {e:#}"));
-                                return Err(e.into());
+                                log::log(
+                                    LogType::Fatal,
+                                    &format!("anti-debug runtime loader failed: {e:#}"),
+                                );
                             }
                         }
-                        warm_iters += 1;
-                    }
-                    log::log(
-                        LogType::Info,
-                        &format!(
-                            "warm-up drain done: {} events, {} LOAD_DLL, receipts: {}",
-                            warm_receipts.len(),
-                            warm_loaddll,
-                            warm_receipts
-                                .iter()
-                                .map(|r| format!(
-                                    "seq={} code={} disp={:?} tid={} bk={}",
-                                    r.sequence,
-                                    r.event_code,
-                                    r.disposition,
-                                    r.thread_id,
-                                    r.bookkeeping
-                                ))
-                                .collect::<Vec<_>>()
-                                .join("; ")
-                        ),
-                    );
-                    // IMP-09-PROFILE-SOURCE-R1: profile id/digest come from the
-                    // sealed verified carrier (attestation-bound). None ->
-                    // the loader fails closed (no bare-string substitution).
-                    let loader_outcome = crate::unpacker::runtime_loader::run_runtime_loader(
-                        target_handle,
-                        pid,
-                        evidence_ctx.as_ref().and_then(|ctx| ctx.profile_identity()),
-                        &mut drain,
-                    );
-                    match loader_outcome {
-                        Ok(loader_result) => {
-                            ad_controller.set_loader_result(loader_result);
+                        // ADR-5B-R1 F-005: the debugger retains EVERY drain receipt
+                        // (warm-up + LoadLibraryW wait + thunk initialize +
+                        // attestation). Pull them out and log the full window so the
+                        // loader's drain bookkeeping is auditable end-to-end, not
+                        // just the warm-up events.
+                        // ADR7-B4: write the observer timeline after the loader
+                        // window (before the main unpack loop continues).
+                        if let Some(obs) = &b4_observer {
+                            let timeline_path = std::env::var("MIDA_B4_TIMELINE")
+                                .unwrap_or_else(|_| "b4_timeline.json".to_string());
+                            match obs.write_timeline(std::path::Path::new(&timeline_path)) {
+                                Ok(()) => log::log(
+                                    LogType::Info,
+                                    &format!("ADR7-B4 timeline written to {timeline_path}"),
+                                ),
+                                Err(e) => log::log(
+                                    LogType::Fatal,
+                                    &format!("ADR7-B4 timeline write FAILED: {e}"),
+                                ),
+                            }
                         }
-                        Err(e) => {
-                            log::log(
-                                LogType::Fatal,
-                                &format!("anti-debug runtime loader failed: {e:#}"),
-                            );
-                        }
-                    }
-                    // ADR-5B-R1 F-005: the debugger retains EVERY drain receipt
-                    // (warm-up + LoadLibraryW wait + thunk initialize +
-                    // attestation). Pull them out and log the full window so the
-                    // loader's drain bookkeeping is auditable end-to-end, not
-                    // just the warm-up events.
-                    // ADR7-B4: write the observer timeline after the loader
-                    // window (before the main unpack loop continues).
-                    if let Some(obs) = &b4_observer {
-                        let timeline_path = std::env::var("MIDA_B4_TIMELINE")
-                            .unwrap_or_else(|_| "b4_timeline.json".to_string());
-                        match obs.write_timeline(std::path::Path::new(&timeline_path)) {
-                            Ok(()) => log::log(
-                                LogType::Info,
-                                &format!("ADR7-B4 timeline written to {timeline_path}"),
-                            ),
-                            Err(e) => log::log(
-                                LogType::Fatal,
-                                &format!("ADR7-B4 timeline write FAILED: {e}"),
-                            ),
-                        }
-                    }
-                    let all_drain_receipts = dbg.take_drain_receipts();
-                    let drain_stats = dbg.drain_stats();
-                    log::log(
+                        let all_drain_receipts = dbg.take_drain_receipts();
+                        let drain_stats = dbg.drain_stats();
+                        log::log(
                         LogType::Info,
                         &format!(
                             "drain audit (full loader window): receipts={} events_drained={} create_threads={} exit_removed={} exit_short_lived={} exit_unmatched={} hfiles_attempted={} hfiles_ok={} hfiles_failed={} dr_ok={} dr_failed={} exceptions_continued={} exceptions_forwarded={} exceptions_failed_closed={} last_seq={}",
@@ -1757,12 +1814,12 @@ pub fn unpack(
                             drain_stats.last_sequence,
                         ),
                     );
-                    // F-006: log EVERY receipt's full content (sequence,
-                    // pid/tid, event code, disposition, continue status,
-                    // exception code/first-chance, bookkeeping) — a count
-                    // alone is not an audit trail.
-                    for r in &all_drain_receipts {
-                        log::log(
+                        // F-006: log EVERY receipt's full content (sequence,
+                        // pid/tid, event code, disposition, continue status,
+                        // exception code/first-chance, bookkeeping) — a count
+                        // alone is not an audit trail.
+                        for r in &all_drain_receipts {
+                            log::log(
                             LogType::Info,
                             &format!(
                                 "drain receipt: seq={} pid={} tid={} code={} disp={:?} cont=0x{:08X} exc={:?} first={:?} exc_addr={:?} rip={:?} rsp={:?} module={:?} mod_base={:?} mod_rva={:?} ctx_err={:?} bk={}",
@@ -1784,102 +1841,102 @@ pub fn unpack(
                                 r.bookkeeping,
                             ),
                         );
-                    }
-                    // ADR-7-A-CAPTURE-1: bind the last exception capture
-                    // receipt into the controller so the failure evidence
-                    // sidecar carries the full exception/module context
-                    // (address, RIP/RSP, module base/RVA) - not just stdout.
-                    if let Some(last_exc) = all_drain_receipts
-                        .iter()
-                        .rev()
-                        .find(|r| r.exception_address.is_some())
-                    {
-                        ad_controller.set_capture_receipt(last_exc.clone());
-                    }
-                    // IMP-09-CARRIER-R5-R2-1: the controller gate (walker
-                    // bind + execute) runs HERE, in the provably-alive
-                    // window, BEFORE terminate_and_wait(). R5-R2 forbids
-                    // bind/execute after termination. The deferred-cleanup
-                    // flag keeps run() from firing the termination backend;
-                    // the debugger drives exactly-once termination below.
-                    let outcome = ad_controller.run();
-                    // R5-R2-4: record terminate_enter into the monotonic
-                    // walker event record BEFORE the debugger termination,
-                    // so the sequence proves bind/execute ran alive.
-                    ad_controller.record_terminate_enter();
-                    // R1-HARDENING-CLEANUP-2: exactly-once explicit cleanup.
-                    // A fail-closed drain error (e.g. second-chance exception)
-                    // leaves a pending debug event UNCONTINUED, which freezes
-                    // the debuggee. terminate_and_wait() resolves the pending
-                    // event with DBG_EXCEPTION_NOT_HANDLED (never DBG_CONTINUE
-                    // for a fail-closed path), terminates the target ONCE,
-                    // waits for exit, and records cleanup_done so the Drop
-                    // fallback is skipped (no duplicate termination). The
-                    // structured report is injected into the controller for
-                    // evidence.
-                    let cleanup_report = dbg.terminate_and_wait();
-                    ad_controller.set_cleanup_report(&cleanup_report);
-                    log::log(
-                        LogType::Info,
-                        &format!(
-                            "explicit cleanup (terminate_and_wait): {}",
-                            cleanup_report.summary()
-                        ),
-                    );
-                    // IMP-09-CARRIER-R5-R2-4: write the walker evidence
-                    // sidecar (schema mida.antidebug-walker/v1) with the
-                    // monotonic raw event sequence (loader_complete,
-                    // bind_enter, bind_exit, execute_enter, execute_exit,
-                    // terminate_enter), the liveness probe and the
-                    // per-candidate mapping proof. A write failure fails
-                    // closed: never proceed without the raw record.
-                    if let Err(ew) = antidebug_controller::write_walker_evidence(
-                        &ad_controller.walker_evidence_record("create_process"),
-                        &evidence_dir,
-                    ) {
-                        return Err(anyhow::anyhow!("walker evidence write failed: {ew:#}"));
-                    }
-                    match &outcome {
-                        antidebug_controller::AntidebugOutcome::Proceed { .. } => {
-                            // Only reachable once a real MIDA runtime exists.
-                            // Keep the success path explicit so ADR-4 wiring has
-                            // a deterministic seam.
-                            info!("anti-debug lifecycle: Proceed (MIDA runtime ready)");
                         }
-                        antidebug_controller::AntidebugOutcome::Failed {
-                            state,
-                            fail_code,
-                            message,
-                        } => {
-                            // Structured evidence sidecar (atomic, schema'd,
-                            // mida.antidebug-evidence/v1 record_kind=cli-failure).
-                            // cleanup_result reflects the explicit cleanup backend
-                            // outcome (ok / failed / not-run).
-                            let evidence = ad_controller
-                                .failure_evidence(&outcome)
-                                .expect("failure outcome must produce evidence");
-                            if let Err(ew) = antidebug_controller::write_failure_evidence(
-                                &evidence,
-                                &evidence_dir,
-                            ) {
-                                // Evidence write failure must itself fail closed.
-                                return Err(anyhow::anyhow!(
+                        // ADR-7-A-CAPTURE-1: bind the last exception capture
+                        // receipt into the controller so the failure evidence
+                        // sidecar carries the full exception/module context
+                        // (address, RIP/RSP, module base/RVA) - not just stdout.
+                        if let Some(last_exc) = all_drain_receipts
+                            .iter()
+                            .rev()
+                            .find(|r| r.exception_address.is_some())
+                        {
+                            ad_controller.set_capture_receipt(last_exc.clone());
+                        }
+                        // IMP-09-CARRIER-R5-R2-1: the controller gate (walker
+                        // bind + execute) runs HERE, in the provably-alive
+                        // window, BEFORE terminate_and_wait(). R5-R2 forbids
+                        // bind/execute after termination. The deferred-cleanup
+                        // flag keeps run() from firing the termination backend;
+                        // the debugger drives exactly-once termination below.
+                        let outcome = ad_controller.run();
+                        // R5-R2-4: record terminate_enter into the monotonic
+                        // walker event record BEFORE the debugger termination,
+                        // so the sequence proves bind/execute ran alive.
+                        ad_controller.record_terminate_enter();
+                        // R1-HARDENING-CLEANUP-2: exactly-once explicit cleanup.
+                        // A fail-closed drain error (e.g. second-chance exception)
+                        // leaves a pending debug event UNCONTINUED, which freezes
+                        // the debuggee. terminate_and_wait() resolves the pending
+                        // event with DBG_EXCEPTION_NOT_HANDLED (never DBG_CONTINUE
+                        // for a fail-closed path), terminates the target ONCE,
+                        // waits for exit, and records cleanup_done so the Drop
+                        // fallback is skipped (no duplicate termination). The
+                        // structured report is injected into the controller for
+                        // evidence.
+                        let cleanup_report = dbg.terminate_and_wait();
+                        ad_controller.set_cleanup_report(&cleanup_report);
+                        log::log(
+                            LogType::Info,
+                            &format!(
+                                "explicit cleanup (terminate_and_wait): {}",
+                                cleanup_report.summary()
+                            ),
+                        );
+                        // IMP-09-CARRIER-R5-R2-4: write the walker evidence
+                        // sidecar (schema mida.antidebug-walker/v1) with the
+                        // monotonic raw event sequence (loader_complete,
+                        // bind_enter, bind_exit, execute_enter, execute_exit,
+                        // terminate_enter), the liveness probe and the
+                        // per-candidate mapping proof. A write failure fails
+                        // closed: never proceed without the raw record.
+                        if let Err(ew) = antidebug_controller::write_walker_evidence(
+                            &ad_controller.walker_evidence_record("create_process"),
+                            &evidence_dir,
+                        ) {
+                            return Err(anyhow::anyhow!("walker evidence write failed: {ew:#}"));
+                        }
+                        match &outcome {
+                            antidebug_controller::AntidebugOutcome::Proceed { .. } => {
+                                // Only reachable once a real MIDA runtime exists.
+                                // Keep the success path explicit so ADR-4 wiring has
+                                // a deterministic seam.
+                                info!("anti-debug lifecycle: Proceed (MIDA runtime ready)");
+                            }
+                            antidebug_controller::AntidebugOutcome::Failed {
+                                state,
+                                fail_code,
+                                message,
+                            } => {
+                                // Structured evidence sidecar (atomic, schema'd,
+                                // mida.antidebug-evidence/v1 record_kind=cli-failure).
+                                // cleanup_result reflects the explicit cleanup backend
+                                // outcome (ok / failed / not-run).
+                                let evidence = ad_controller
+                                    .failure_evidence(&outcome)
+                                    .expect("failure outcome must produce evidence");
+                                if let Err(ew) = antidebug_controller::write_failure_evidence(
+                                    &evidence,
+                                    &evidence_dir,
+                                ) {
+                                    // Evidence write failure must itself fail closed.
+                                    return Err(anyhow::anyhow!(
                                     "anti-debug failure evidence write failed: {ew:#}; original: {message}"
                                 ));
-                            }
-                            // Fail-closed: hard error, no candidate, no TLS/OEP
-                            // success evidence. Target cleanup was driven by the
-                            // explicit cleanup backend (CleanupFailed upgrade when
-                            // the backend failed).
-                            return Err(anyhow::anyhow!(
+                                }
+                                // Fail-closed: hard error, no candidate, no TLS/OEP
+                                // success evidence. Target cleanup was driven by the
+                                // explicit cleanup backend (CleanupFailed upgrade when
+                                // the backend failed).
+                                return Err(anyhow::anyhow!(
                                 "anti-debug lifecycle failed: {message} (state={state:?} fail_code={})",
                                 fail_code.as_str(),
                             ));
+                            }
                         }
-                    }
 
-                    // Store resolved APIs for later breakpoint comparisons.
-                    dbg.apis = Some(apis);
+                        // Store resolved APIs for later breakpoint comparisons.
+                        dbg.apis = Some(apis);
                     } // legacy_antidebug else (MIDA-ADR-3B fail-closed controller)
                 }
 
@@ -2244,13 +2301,10 @@ pub fn unpack(
                         .get_thread_context_control(thread_id)
                         .ok()
                         .map(|c| c.Rip);
-                    let rip_moved = rip_now.is_some()
-                        && rip_now != ls.iat_materialize_last_av_rip;
+                    let rip_moved = rip_now.is_some() && rip_now != ls.iat_materialize_last_av_rip;
                     ls.iat_materialize_last_av_rip = rip_now;
 
-                    if iat_materialize::should_log_materialize_av(
-                        ls.iat_materialize_av_streak,
-                    ) {
+                    if iat_materialize::should_log_materialize_av(ls.iat_materialize_av_streak) {
                         // XX-7 (N-forensics): first/second chance + the actual
                         // disposition the host will return. During the wait,
                         // guard_installed is false, so handle_access_violation
@@ -2365,9 +2419,7 @@ pub fn unpack(
                 // the `call [mem]` / OEP is about to execute, so the lazy IAT is
                 // materialized. Freeze, disarm, and leave for the normal
                 // post-loop IAT discovery/dump.
-                if ls.iat_materialize_wait
-                    && ls.iat_materialize_site == Some(address as usize)
-                {
+                if ls.iat_materialize_wait && ls.iat_materialize_site == Some(address as usize) {
                     log::log(
                         LogType::Good,
                         &format!(

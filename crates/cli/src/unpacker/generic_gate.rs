@@ -100,6 +100,10 @@ pub struct GenericGateInputs {
     pub large_rx_has_raw: bool,
     /// An AHK export name ([`AHK_EXPORT_NAMES`]) is present.
     pub has_ahk_export: bool,
+    /// XC-7-A: shell section residue present (`.winlice`/`.boot`/`.themida`,
+    /// or an all-virtual >=1 MiB non-standard section). Dumps of protected
+    /// inputs must not carry shell remnants (S1 standard).
+    pub shell_sections_present: bool,
 }
 
 /// Result of running the generic gate.
@@ -142,6 +146,9 @@ pub fn validate_generic_dump(
 
     if !inputs.text_present {
         failures.push(".text section missing");
+    }
+    if inputs.shell_sections_present {
+        failures.push("shell section residue present (.winlice/.boot/.themida)");
     }
     if !inputs.text_has_raw {
         failures.push(".text section has no raw data");
@@ -190,14 +197,18 @@ pub fn gate_inputs_from_pe(pe: &PeHeader, has_ahk_export: bool) -> GenericGateIn
     // code section stays the first executable section with the CODE flag.
     // Treat an all-blank-named executable section as the code section so the
     // gate does not reject a structurally valid dump.
-    let text = pe.sections.iter().find(|s| s.name.starts_with(".text")).or_else(|| {
-        pe.sections.iter().find(|s| {
-            s.name.trim().is_empty()
-                && is_exec(s)
-                && (s.characteristics & IMAGE_SCN_CNT_CODE) != 0
-                && s.virtual_size > 0
-        })
-    });
+    let text = pe
+        .sections
+        .iter()
+        .find(|s| s.name.starts_with(".text"))
+        .or_else(|| {
+            pe.sections.iter().find(|s| {
+                s.name.trim().is_empty()
+                    && is_exec(s)
+                    && (s.characteristics & IMAGE_SCN_CNT_CODE) != 0
+                    && s.virtual_size > 0
+            })
+        });
     let text_present = text.is_some();
     let text_has_raw = text.is_some_and(|s| s.raw_size > 0);
 
@@ -214,6 +225,28 @@ pub fn gate_inputs_from_pe(pe: &PeHeader, has_ahk_export: bool) -> GenericGateIn
     let large_rx_present = !large_rx.is_empty();
     let large_rx_has_raw = large_rx.iter().all(|s| s.raw_size > 0);
 
+    // XC-7-A: shell residue = Themida-named sections, or all-virtual (raw=0)
+    // large sections with non-standard names (>= 1 MiB virtual). A clean dump
+    // must have neither.
+    let shell_named = |s: &mida_pe::PeSection| {
+        let lower = s.name.to_lowercase();
+        lower.contains(".winlice")
+            || lower.contains(".boot")
+            || lower.contains(".themida")
+            || lower.contains(".winlic")
+    };
+    let all_virtual_large = |s: &mida_pe::PeSection| {
+        s.raw_size == 0
+            && s.virtual_size >= 0x100000
+            && !s.name.starts_with(".text")
+            && !s.name.starts_with(".data")
+            && !s.name.starts_with(".rdata")
+    };
+    let shell_sections_present = pe
+        .sections
+        .iter()
+        .any(|s| shell_named(s) || all_virtual_large(s));
+
     GenericGateInputs {
         text_present,
         text_has_raw,
@@ -221,6 +254,7 @@ pub fn gate_inputs_from_pe(pe: &PeHeader, has_ahk_export: bool) -> GenericGateIn
         large_rx_present,
         large_rx_has_raw,
         has_ahk_export,
+        shell_sections_present,
     }
 }
 
@@ -278,6 +312,7 @@ mod tests {
             large_rx_present: true,
             large_rx_has_raw: true,
             has_ahk_export: false,
+            shell_sections_present: false,
         }
     }
 

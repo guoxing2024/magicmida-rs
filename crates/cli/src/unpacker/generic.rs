@@ -209,6 +209,7 @@ pub fn generic_unpack(
         dump_timing: mida_pe::DumpTiming::Immediate,
         section_content_reference: None,
         capture_policy: mida_pe::DumpCapturePolicy::default(),
+        keep_runtime_base: false,
     };
 
     mida_pe::dump_process(&mut dbg, &dump_opts).map_err(|e| anyhow!("dump failed: {e}"))?;

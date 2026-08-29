@@ -180,17 +180,9 @@ pub fn create_data_sections(
 
 /// Dump the `.text` section from a running (de-virtualised) process.
 ///
-/// This is used in combination with **Oreans Unvirtualizer**:
-///
-/// 1. Unpack the binary normally (without restoring data sections).
-/// 2. Load the dumped binary in OllyDbg / x64dbg.
-/// 3. Run Oreans Unvirtualizer to de-virtualise the code.
-/// 4. Call this function to read the de-virtualised `.text` from the live
-///    process and write it to `output_path`.
-///
-/// The dump range is `ImageBase + .text.VirtualAddress` to `ImageBase +
-/// BaseOfData` (i.e. from the start of `.text` to the start of the data
-/// region).
+/// `image_base` is the **actual** loaded base of the target module (for an
+/// ASLR-rebased module this differs from `pe.image_base`). The dump range is
+/// `image_base + .text.VirtualAddress` to `image_base + BaseOfData`.
 ///
 /// ## Returns
 ///
@@ -207,9 +199,10 @@ pub fn create_data_sections(
 pub fn dump_process_code(
     debugger: &dyn DebuggerCore,
     pe: &PeHeader,
+    image_base: u64,
     output_path: &std::path::Path,
 ) -> Result<usize, ThemidaError> {
-    let image_base = pe.image_base as usize;
+    let image_base = image_base as usize;
     let text_start = image_base + pe.sections[0].virtual_address as usize;
 
     let base_of_data = if pe.is_64bit {
