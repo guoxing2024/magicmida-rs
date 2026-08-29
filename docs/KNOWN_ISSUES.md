@@ -121,6 +121,7 @@ WO-24 于 2026-08-27（提交 `607276d`）锁定 `_clippy_baseline`（TOTAL=349�
 **当初为什么会这样**：partial-accept 链路（`iat_partial_accept.rs`）设计上允许部分接受，但没有区分"可安全部分接受"与"启动路径上的必崩指针"。
 **修复（TASK-009，2026-08-29 验收通过）**：兜底清零（`zero_fill_iat_region`：IAT span 未重建槽整段清零，honest hole）+ fail-closed 门（`call_sites_targeting_slots`：存在直接 call/jmp 指向不可解析槽 → `Err` 拒绝写出，`[GOOD]` 不再打印）。**修复验证级别 = 离线**（单元级缺陷几何 +7 用例、判别力探针红→绿）；`bb5ee568` 上的实弹替换验证留待 TASK-006 复跑（消耗实弹格，另行授权）。
 **注意**：C-5（会话绑定 B）未修，与本项独立——修好 A 产物才能在当前会话活，修好 B 才能跨重启活。
+**实弹验证状态：仍不可达（2 次尝试，2 次都没跑到）**。TASK-006R（9/9）与 TASK-006R2（2/2）都在 dump **之前**的 text-poll 阶段结束——首跑烧到外部超时，本跑由 C-7 主动 fail-closed 中止。两次的 `zero-filled IAT region` / `TASK-009 fail-closed` / `[GOOD] Candidate written` 三个证据点**都是 0 命中**。**这既不证实也不证伪修复**（"没跑到 dump"无法说明 dump 门是否生效）。要验它必须先有一次 text-poll 能收敛的会话 —— 本 boot（BootTime `2026-08-29 07:58:23`）下 11/11 次全部撞同一个 ntdll hook 故障环，确定性不收敛，所以**下一次尝试必须在重启之后**。
 
 ### C-5 `keep_runtime_base` 产物 .bss 固化当次会话 ntdll（缺陷 B，C-1 的残留形态）[已验证，未修]
 
@@ -138,7 +139,13 @@ WO-24 于 2026-08-27（提交 `607276d`）锁定 `_clippy_baseline`（TOTAL=349�
 **影响**：TASK-009 修复的实弹验证仍被阻塞（既未证实也未证伪）；T0.5 继续 BLOCKED。
 **待办**：TASK-011（修 C-7，纯离线）。ScyllaHide-NtContinue-hook 交互的微指令级定性需新 trace（实弹），另立专项。**不建议本会话继续烧格重试**——重启只改运气，不改缺口。
 
-### C-7 text-poll 阶段无 AV 风暴终止机制（引擎结构缺口，TASK-010 发现）[已验证（代码级，总指挥逐处复核），**已修（离线级）—— TASK-011**]
+**TASK-006R2 追加实测（2026-08-29/30，同一 boot，C-7 已修）**：又是 2/2 次同一几何（exc 恒 `0x7ffa95400bd8`，exc_type=**0** read，`target` 每进程变：0x25a / 0x20e，同首跑的 0x204 一样都是低值句柄），debuggee image_base 恒 `0x7ff799fc0000`。
+- **本 boot 合计 11/11 次确定性不收敛**（首跑 9 + 本跑 2），同一 ScyllaHide NtContinue-hook 故障环。C-6 的"共因表象"定性不变，但可以加一句更强的：**在这个 boot 上它不是偶发，是确定性的。**
+- **重试的成本模型已经彻底变了**：C-7 修好之后，一次撞环的运行从"小时级 + 3.5GB 日志 + 需要外部杀进程"变成 **20ms + 312KB + 自己干净退出**。所以"重启后重试"从"烧格赌运气"变成了**近乎免费的探测**——TASK-010 当时"不建议靠重启重试当解法"的判断基于旧成本模型，现在应当更新：重启后重试是廉价且合理的下一步，代价不再是格数而是一次重启。
+- ScyllaHide-NtContinue-hook 的微指令级根因**仍未定性**（需专项 trace）。绕过它的备选路线（关 ScyllaHide 的 NtContinue hook 单项、换注入时机）尚未评估。
+
+
+### C-7 text-poll 阶段无 AV 风暴终止机制（引擎结构缺口，TASK-010 发现）[**已修 + 实弹验证通过** —— TASK-011 修 / TASK-012 加固 / TASK-006R2 实弹坐实]
 
 **缺口**：guard 未安装（text-poll）阶段，任何恒同 AV 环都被无限吞掉：
 - `crates/packers/themida/src/runtime/av_oep_handler.rs:161-168`：`!state.guard_installed` → 无条件 `AvOepAction::Continue` 早返回；
@@ -164,6 +171,21 @@ WO-24 于 2026-08-27（提交 `607276d`）锁定 `_clippy_baseline`（TOTAL=349�
 - **仍是离线级**：1024 未经实弹校准；host 腿测的是抽出的纯映射函数，`handle_access_violation` 全函数 e2e 仍无法离线覆盖（依赖 debugger/ProcessSession）。
 - 低优先遗留（下次碰这些文件时顺手，不单独立项）：`guarded_path_unrelated_av_streak_unchanged` 用 `THRESHOLD-1` 作种子，改用 `>= THRESHOLD` 的种子会是更强的"守卫路径下休眠"证明。
 - **验证级别 = 离线**：真实 debuggee 风暴下的中止时机、日志有界性、CLI 退出行为**未实弹验证**（下一格实弹应顺带观察：恒同环 ~1024 次事件内触发 `guardless constant-AV storm abort`，无 dump、无 `[GOOD]`、日志非 3.5GB 级）。
+
+**实弹验证通过（TASK-006R2，2026-08-29/30，1 格，总指挥亲验证据）**：2/2 次重脱壳在 text-poll 撞上恒同 AV 环时引擎**主动 fail-closed 中止**，全部预期数字实测坐实：
+| 观察点 | 首跑（TASK-006R，C-7 未修） | 本跑（C-7 已修 + 加固） |
+|---|---|---|
+| 终态 | 9/9 烧到外部超时/杀进程 | 2/2 引擎主动中止 |
+| AV 事件数 | 20 万 – 322 万 | **恰 1024**（阈值精确生效，第 1024 个事件上中止，之后 0 个 AV） |
+| 首次 AV → 中止 | 从未中止 | **19.6ms / 23.9ms** |
+| 日志体积 | 3.5GB / 3.2GB | **~312KB**（首跑的 0.009%） |
+| 产物 / `[GOOD]` | 无（烧死） | 无（fail-closed，设计如此） |
+| 残留 debuggee | 需外部杀 | 无（验收时全系统复查无残留） |
+- 总指挥独立复核（不采信报告表格，直接读 vault 证据）：exe `0c407a97…` 里四条门字符串各命中 1 次；两份日志各 `grep -c AccessViolation` = **1024**；abort 行含完整元组；`[GOOD]` / `zero-filled IAT region` / `TASK-009 fail-closed` 三者各 **0 命中**；时间戳算差 19.6ms / 23.9ms。
+- **顺带解决 TASK-011 的一个 [存疑]**：21:1x 几何的 `exc_type` 实测 = **0（read）**，与当初测试里按 `test byte ptr` 读操作结构自洽选的 0 一致——猜对了。
+- **元组判据被实弹验证是对的**：`target` 在**不同进程间会变**（首跑 0x204、本跑 attempt1 0x25a / attempt2 0x20e，都是低值句柄），但在**同一次运行内恒定** 1024 次——正好落在"同一运行内恒同即风暴"的判据上，且跨运行的变化不会污染计数（每次运行状态独立）。
+- 未验证：中止后的清理只确认了"进程无残留"，**未做句柄/内存泄漏检查**；`C-7 FATAL` 与 CLI 最终 `Fatal error:` 之间有恒定 **5.01s** 间隔（疑似固定拆除等待），teardown 路径**无日志**——都不影响 fail-closed 结论，记为观察项。
+
 
 
 
@@ -197,6 +219,12 @@ CI 的 `on.push.branches` 已经把 `oreans/two-sample-mainline` 列为一等分
 
 清理我自己造的临时脚本时，把仓库根目录一个我没创建的未跟踪文件 `probe_run_out3.txt`（529 字节，2026-08-29 12:16，疑似上一会话的 probe 输出）一起删了。它未被 Git 跟踪，无法恢复。
 **教训**：清理只删自己这次创建的文件，按名字逐个删，不用通配符。
+
+### P-6 红线里的样品定位符 `启动器.exe` 已经指向另一条线的样品了 [已验证，2026-08-30 TASK-006R2 发现，总指挥亲验]
+
+`D:\Tools\RE\dumps\gto\启动器.exe` 现在的字节是 `11473d2e6b00d8a7f079e0e2d7eff9cfd0c7134af3c6bd3ca2e600b637895c86`（**GTO 线样品**），而 xiongxiong_duokai 的 manifest `protected_input` / `primary_artifact_sha256` 是 `7800980301207bf2f851d00a50f7f18e0dcd61a0f2b1581ca609ddcc0f2f1ea7`。**两者不是同一个文件。**
+红线机制本身工作正常——"定位符不是身份、必须先解析到 vault 对象再比对 manifest"这条规矩正是为此而立，TASK-006R2 的 worker 照做了，直接从 `D:/MidaVault/objects/sha256/78/78009803…` 加载，身份核验 PASS 后才执行（日志 `Input:` 行可复核）。**但我在工单里照抄那个路径当红线示例，本身就是个坑**：下一个 worker 未必这么小心。
+**规矩**：① 派单红线里**直接写 vault 对象路径 + 期望 sha256**（`D:/MidaVault/objects/sha256/78/78009803…`），不再引用 `启动器.exe`；② 保留"定位符不是身份"这条原则的表述，但把它作为**通则**而非指向某个具体路径；③ 已有工单里的该路径引用，下次修改这些工单时顺手清掉。
 
 ### P-5 报告里的 `EXIT=0` 有可能是 grep/findstr 的退出码，不是 cargo 的 [已验证，2026-08-29 TASK-011 验收时发现]
 
