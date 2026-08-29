@@ -52,7 +52,19 @@ pub(crate) fn validate_and_patch_pe_header(
                 let original_image_base = disk_pe.nt_headers.optional_header.image_base;
                 let runtime_image_base = pe.nt_headers.optional_header.image_base;
 
-                if original_image_base != 0 && original_image_base != runtime_image_base {
+                if opts.keep_runtime_base {
+                    // XC-6-A strategy B: keep the runtime ASLR load base.
+                    // The live dump's absolute addresses are already rebased
+                    // to the runtime base; the on-disk preferred base is
+                    // unrecoverable (reloc stripped + data encrypted on disk).
+                    // Clear DYNAMIC_BASE so the fixed-base image needs no
+                    // .reloc directory.
+                    pe.nt_headers.optional_header.dll_characteristics &=
+                        !IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE;
+                    debug!(
+                        "keep_runtime_base: ImageBase={runtime_image_base:#x} fixed; cleared DYNAMIC_BASE (no .reloc needed)"
+                    );
+                } else if original_image_base != 0 && original_image_base != runtime_image_base {
                     pe.nt_headers.optional_header.image_base = original_image_base;
                     // Keep top-level cache in sync; pure rebuild and other
                     // paths read pe.image_base (not only optional_header).

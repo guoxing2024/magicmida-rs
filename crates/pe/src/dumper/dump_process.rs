@@ -426,10 +426,8 @@ fn apply_static_corroboration(
 
     let mut applied: Vec<IatStaticCorroboration> = Vec::new();
     // Snapshot the rejected slots to iterate while mutating the decision below.
-    let rejected: Vec<super::iat_partial_accept::IatRejectedSlot> =
-        decision.rejected_slots.clone();
-    let mut backfilled_indices: std::collections::HashSet<usize> =
-        std::collections::HashSet::new();
+    let rejected: Vec<super::iat_partial_accept::IatRejectedSlot> = decision.rejected_slots.clone();
+    let mut backfilled_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
     for rejected_slot in &rejected {
         // Only the vm_non_module_addr class is eligible.
@@ -496,7 +494,10 @@ fn apply_static_corroboration(
         backfilled_indices.insert(rejected_slot.slot_index);
 
         // Promote the report slot to Resolved with StaticCorroborated source.
-        if let Some(slot) = report.slots.iter_mut().find(|s| s.slot_index == rejected_slot.slot_index)
+        if let Some(slot) = report
+            .slots
+            .iter_mut()
+            .find(|s| s.slot_index == rejected_slot.slot_index)
         {
             slot.status = IatSlotStatus::Resolved;
             slot.rebuilt_value = Some(*address as u64);
@@ -618,6 +619,66 @@ fn persist_coverage_timeline(
             }
         }
         Err(e) => warn!(error = %e, "coverage timeline serialization failed"),
+    }
+}
+
+/// Persist the T0.7 session module table sidecar: every module range captured
+/// from the *dumped* session (system DLL real bases, e.g. ntdll/kernel32/
+/// urlmon, image itself excluded). Archiving it alongside the candidate makes
+/// the dump portable — a consumer (or a re-scrub of an old dump) can identify
+/// pointers frozen to the old session's ASLR layout and clear them.
+///
+/// Best-effort by design (same contract as the other sidecars): a failure
+/// must never fail the dump itself.
+fn persist_session_modules_sidecar(
+    opts: &DumpOptions,
+    candidate_bytes: &[u8],
+    session_modules: &[(String, u64, u64)],
+) {
+    #[derive(serde::Serialize)]
+    struct SessionModuleEntry<'a> {
+        name: &'a str,
+        base: String,
+        end: String,
+    }
+    #[derive(serde::Serialize)]
+    struct SessionModulesSidecar<'a> {
+        schema_version: &'a str,
+        candidate_sha256: String,
+        modules: Vec<SessionModuleEntry<'a>>,
+    }
+
+    let path = opts.output_path.with_extension("session_modules.json");
+    let modules: Vec<SessionModuleEntry<'_>> = session_modules
+        .iter()
+        .map(|(name, base, end)| SessionModuleEntry {
+            name: name.as_str(),
+            base: format!("{base:#x}"),
+            end: format!("{end:#x}"),
+        })
+        .collect();
+    let sidecar = SessionModulesSidecar {
+        schema_version: "mida.session-modules/v1",
+        candidate_sha256: candidate_sha256_hex(candidate_bytes),
+        modules,
+    };
+    match serde_json::to_string_pretty(&sidecar) {
+        Ok(text) => {
+            if let Err(e) = std::fs::write(&path, text) {
+                warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "failed to write session modules sidecar"
+                );
+            } else {
+                info!(
+                    path = %path.display(),
+                    modules = sidecar.modules.len(),
+                    "session module table persisted"
+                );
+            }
+        }
+        Err(e) => warn!(error = %e, "session modules sidecar serialization failed"),
     }
 }
 pub fn dump_process(
@@ -887,12 +948,13 @@ pub fn dump_process_with_report(
     // `0x1b370fa3810`), producing a load AV. The strict predicate stays the
     // authority for the perfect-prerequisite gate; this layer decides what the
     // dump emitter may use when the report is not strictly complete.
-    let mut iat_partial_accept: Option<super::iat_partial_accept::IatPartialAcceptDecision> =
-        None;
+    let mut iat_partial_accept: Option<super::iat_partial_accept::IatPartialAcceptDecision> = None;
     let mut iat_partial_accepted = false;
     if opts.fix_imports {
         let live_empty = import_builder.as_ref().is_none_or(|b| b.thunk_count() == 0);
-        let live_complete = iat_report.as_ref().is_some_and(|report| report.is_complete());
+        let live_complete = iat_report
+            .as_ref()
+            .is_some_and(|report| report.is_complete());
         let use_original = if live_empty {
             true
         } else if live_complete {
@@ -966,8 +1028,7 @@ pub fn dump_process_with_report(
             let text_section = &pe.sections.first();
             let (live_text, text_rva) = match text_section {
                 Some(section) => {
-                    let va = opts.image_base as usize
-                        + section.virtual_address as usize;
+                    let va = opts.image_base as usize + section.virtual_address as usize;
                     let size = section.virtual_size as usize;
                     let mut buf = vec![0u8; size.min(0x100_000)];
                     let read = debugger.read_memory(va, &mut buf).unwrap_or(0);
@@ -1163,10 +1224,15 @@ pub fn dump_process_with_report(
 
                             debug!("Starting to load DLL exports for ordinal restoration");
 
+                            // System-directory candidates are derived from the
+                            // OS once (GetWindowsDirectoryW/GetSystemDirectoryW),
+                            // never hard-coded to C:\Windows.
+                            let system_dirs = crate::dll_exports::system_dll_search_dirs();
+
                             for dll_name in ordinal_imports.keys() {
                                 debug!("Loading exports for {}", dll_name);
                                 if let Some(dll_path) =
-                                    crate::dll_exports::find_system_dll(dll_name)
+                                    crate::dll_exports::find_system_dll(dll_name, &system_dirs)
                                 {
                                     let exports = crate::dll_exports::read_dll_exports(&dll_path);
                                     debug!("Loaded {} exports from {}", exports.len(), dll_name);
@@ -2241,6 +2307,13 @@ pub fn dump_process_with_report(
             &pe,
             &mut dump_buf,
             opts.executable_path.as_deref(),
+            // T0.7 session module table: module ranges captured from the live
+            // (dumped) session, image itself excluded. Lets the scrubber zero
+            // stale high-ASLR pointers into old-session system DLLs (ntdll /
+            // kernel32 / …) that ASLR re-bases on the next boot. Empty when
+            // the snapshot failed — the scrubber then keeps historical
+            // behaviour (never clears the high-ASLR band).
+            &module_map,
         );
     } else {
         info!("R-GTO-UI r27: skipping .data scrub (NO_BYPASS ?VM re-executes, initializes .data itself)");
@@ -2937,6 +3010,12 @@ pub fn dump_process_with_report(
         sections = pe.sections.len(),
         "Dump written successfully"
     );
+
+    // T0.7: archive the session module table beside the candidate (best-effort
+    // sidecar, never fails the dump). Same contract as the coverage timeline.
+    // The table was already captured earlier (`module_map`); persisting it
+    // makes the dump portable and auditable across ASLR sessions.
+    persist_session_modules_sidecar(opts, &out_data, &module_map);
 
     // (WO-401A P0-1) Timeline persistence moved BEFORE candidate_refused
     // handling; see persist_post_self_decrypt_timeline above. Nothing
@@ -5007,6 +5086,7 @@ mod edata_relocation_tests {
             dump_timing: crate::DumpTiming::Immediate,
             section_content_reference: None,
             capture_policy: crate::DumpCapturePolicy::default(),
+            keep_runtime_base: false,
         };
         let out_data = write_output_file(
             &mut pe,

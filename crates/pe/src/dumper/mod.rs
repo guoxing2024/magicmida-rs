@@ -53,6 +53,7 @@ mod runtime_rebase;
 mod section_reference;
 mod sections;
 mod serialize;
+pub mod sidecar_consumer;
 mod snapshot_manifest;
 mod stage_timing;
 #[cfg(test)]

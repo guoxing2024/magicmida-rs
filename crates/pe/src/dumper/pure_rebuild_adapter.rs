@@ -752,6 +752,7 @@ mod tests {
             dump_timing: crate::DumpTiming::Immediate,
             section_content_reference: None,
             capture_policy: crate::DumpCapturePolicy::default(),
+            keep_runtime_base: false,
         };
         let mut pe_legacy = pe.clone();
         let legacy_bytes = write_output_file(

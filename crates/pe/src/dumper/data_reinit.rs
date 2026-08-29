@@ -26,13 +26,19 @@ const MAX_PROCESS_LOCAL_HEAP_POINTER: u64 = 0x0000_7fff_ffff_fffe;
 /// Typical x64 module / system image ASLR floor. Pointers in this band are
 /// treated as rebase candidates, not process-local heap garbage.
 const HIGH_ASLR_MODULE_MIN: u64 = 0x0000_7ff0_0000_0000;
+/// Session module table shape: `(image name, base, end-exclusive)` captured
+/// from the *dumped* process. The module snapshot skips the dumped image
+/// itself, so a value landing inside one of these ranges is a stale
+/// cross-module pointer of the old ASLR session (e.g. an ntdll/kernel32 base
+/// that re-randomizes on every boot).
+pub(crate) type SessionModuleRange = (String, u64, u64);
 /// Kernel-half addresses (`>= 0xffff_8000_0000_0000`) seen in Origin dumps
 /// (e.g. `.data+0xfc388 = 0xffffd466…` == `!DEFAULT_COOKIE` collision) are
 /// never valid as re-entry object heads and must be cleared even when unaligned.
 const KERNEL_CANONICAL_MIN: u64 = 0xffff_8000_0000_0000;
 const MAX_CONTAINER_SPAN: u64 = 0x1000_0000;
-const IMAGE_SCN_MEM_WRITE: u32 = 0x8000_0000;
-const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
+pub(crate) const IMAGE_SCN_MEM_WRITE: u32 = 0x8000_0000;
+pub(crate) const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 
 /// Reset SecurityCookie-encoded `{begin, end, capacity}` triples whose decoded
 /// pointers refer to process-local heap memory, and clear raw process-local
@@ -90,6 +96,7 @@ pub(crate) fn reinitialize_zero_filled_data(
     pe: &PeHeader,
     dump_buf: &mut [u8],
     executable_path: Option<&Path>,
+    session_modules: &[SessionModuleRange],
 ) -> usize {
     if !pe.is_64bit {
         return 0;
@@ -100,7 +107,13 @@ pub(crate) fn reinitialize_zero_filled_data(
 
     // Always scrub raw process-local absolute pointers from writable image
     // data. Encoded cookie triples are not raw heap addresses and survive.
-    let cleared_ptrs = clear_process_local_absolute_pointers(pe, dump_buf, image_base, image_size);
+    let cleared_ptrs = clear_process_local_absolute_pointers(
+        pe,
+        dump_buf,
+        image_base,
+        image_size,
+        session_modules,
+    );
     if cleared_ptrs > 0 {
         info!(
             cleared = cleared_ptrs,
@@ -165,11 +178,19 @@ pub(crate) fn reinitialize_zero_filled_data(
 /// space outside the image. Image-relative pointers and non-pointer scalars
 /// are preserved so CRT can reinitialize heap/stdio from a clean BSS-like
 /// baseline on the next process start.
+///
+/// `session_modules` carries the module ranges of the *dumped* session (the
+/// dumped image itself excluded). A high-ASLR pointer landing inside one of
+/// those ranges is a stale session pointer — the system DLL it referenced is
+/// re-based by ASLR on the next boot — and is zeroed so load-time resolution
+/// rebinds it. An empty table keeps the historical behaviour (never clear the
+/// high-ASLR band).
 fn clear_process_local_absolute_pointers(
     pe: &PeHeader,
     dump_buf: &mut [u8],
     image_base: u64,
     image_size: u32,
+    session_modules: &[SessionModuleRange],
 ) -> usize {
     let image_end = image_base.saturating_add(image_size as u64);
     let mut cleared = 0usize;
@@ -199,7 +220,7 @@ fn clear_process_local_absolute_pointers(
         for offset in (aligned_start..end.saturating_sub(7)).step_by(8) {
             let value =
                 u64::from_le_bytes(dump_buf[offset..offset + 8].try_into().unwrap_or_default());
-            if is_stale_absolute_pointer(value, image_base, image_end) {
+            if is_stale_absolute_pointer(value, image_base, image_end, session_modules) {
                 dump_buf[offset..offset + 8].fill(0);
                 cleared += 1;
             }
@@ -212,26 +233,42 @@ fn clear_process_local_absolute_pointers(
 /// True when a QWORD in dumped `.data` is a process-local absolute pointer that
 /// must not survive into an independent PE image.
 ///
-/// Two classes (Origin W1 / R-LOAD-FLAKE):
+/// Three classes (Origin W1 / R-LOAD-FLAKE / T0.7 session binding):
 /// 1. **Low 4GB heap-like** — aligned, `MIN_USER_POINTER..=MAX_PROCESS_LOCAL_HEAP_POINTER`,
 ///    outside the image (classic CRT/heap tables).
 /// 2. **Kernel-canonical garbage** — `>= KERNEL_CANONICAL_MIN` and not `!0`
 ///    (sentinel). Observed as object-head slots (e.g. RVA `0xfc388`) that AV at
 ///    `xchg [r10]`. Alignment is **not** required: the Origin crash pointer
 ///    ends in `…dcd`.
-fn is_stale_absolute_pointer(value: u64, image_base: u64, image_end: u64) -> bool {
+/// 3. **Stale session module pointer** — `>= HIGH_ASLR_MODULE_MIN` and landing
+///    inside a module range of the *dumped* session (system DLL base captured
+///    at dump time). ASLR re-bases those modules on every boot, so a
+///    `keep_runtime_base` product embedding the old session's absolute address
+///    (e.g. RVA `0x112c10` = old ntdll `0x7ffeeb426390`) AVs on the next
+///    session. Zeroed so load-time resolution rebinds. Image-own high-ASLR VAs
+///    are **not** in the table (the module snapshot skips the dumped image)
+///    and survive until `fix_hardcoded_addresses` rebases them.
+fn is_stale_absolute_pointer(
+    value: u64,
+    image_base: u64,
+    image_end: u64,
+    session_modules: &[SessionModuleRange],
+) -> bool {
     if (image_base..image_end).contains(&value) {
         return false;
     }
     if is_kernel_canonical_garbage(value) {
         return true;
     }
-    if value < MIN_USER_POINTER || value > MAX_PROCESS_LOCAL_HEAP_POINTER {
+    if !(MIN_USER_POINTER..=MAX_PROCESS_LOCAL_HEAP_POINTER).contains(&value) {
         return false;
     }
-    // High ASLR module VAs must survive until rebase (Origin W1).
+    // High ASLR module band. Image-own VAs must survive until rebase (Origin
+    // W1), but a value inside a captured session module is a stale session
+    // pointer (T0.7). With an empty session table (no module capture), keep
+    // the historical behaviour — never clear this band.
     if value >= HIGH_ASLR_MODULE_MIN {
-        return false;
+        return matches_session_module(session_modules, value);
     }
     // Low 4GB: prefer 8-byte aligned heap-like pointers; unaligned values are
     // more often packed constants / cookie fragments than CRT table entries.
@@ -243,12 +280,21 @@ fn is_stale_absolute_pointer(value: u64, image_base: u64, image_end: u64) -> boo
     true
 }
 
+/// True when `value` falls inside any module range of the dumped session.
+/// The snapshot excludes the dumped image itself, so a hit is a stale
+/// cross-module pointer (system DLL / dependency) of the old ASLR session.
+fn matches_session_module(session_modules: &[SessionModuleRange], value: u64) -> bool {
+    session_modules
+        .iter()
+        .any(|(_, base, end)| *base <= value && value < *end)
+}
+
 fn is_kernel_canonical_garbage(value: u64) -> bool {
     // Keep all-ones sentinel triples used next to some Origin globals.
     value >= KERNEL_CANONICAL_MIN && value != u64::MAX
 }
 
-fn is_data_like_section_name(name: &str) -> bool {
+pub(crate) fn is_data_like_section_name(name: &str) -> bool {
     if name == ".data" || name.starts_with(".data") {
         return true;
     }
@@ -259,8 +305,13 @@ fn is_data_like_section_name(name: &str) -> bool {
 
 #[cfg(test)]
 #[allow(dead_code)]
-fn is_process_local_absolute_pointer(value: u64, image_base: u64, image_end: u64) -> bool {
-    is_stale_absolute_pointer(value, image_base, image_end)
+fn is_process_local_absolute_pointer(
+    value: u64,
+    image_base: u64,
+    image_end: u64,
+    session_modules: &[SessionModuleRange],
+) -> bool {
+    is_stale_absolute_pointer(value, image_base, image_end, session_modules)
 }
 
 fn find_security_cookie(data: &[u8]) -> Option<u64> {
@@ -399,32 +450,135 @@ mod tests {
         // o+0x39e5c (xchg [r10]). Must clear even when unaligned.
         let image_base = 0x140000000u64;
         let image_end = image_base + 0x19f000;
+        // T0.7: an empty session table must preserve the historical behaviour
+        // (never clear the high-ASLR band) — the regression baseline.
+        let no_modules: &[SessionModuleRange] = &[];
         let bad = 0xffff_d466_d220_5dcd;
-        assert!(is_stale_absolute_pointer(bad, image_base, image_end));
+        assert!(is_stale_absolute_pointer(
+            bad, image_base, image_end, no_modules
+        ));
         assert!(is_kernel_canonical_garbage(bad));
         // Sentinel next door stays.
-        assert!(!is_stale_absolute_pointer(u64::MAX, image_base, image_end));
+        assert!(!is_stale_absolute_pointer(
+            u64::MAX,
+            image_base,
+            image_end,
+            no_modules
+        ));
         // Image VA stays (observed neighbor at 0xfc388+0x28).
         assert!(!is_stale_absolute_pointer(
             0x1401_0a690,
             image_base,
-            image_end
+            image_end,
+            no_modules
         ));
         // Low user heap (aligned) still cleared.
-        assert!(is_stale_absolute_pointer(0x8d3e40, image_base, image_end));
-        // High ASLR image VA must NOT be cleared (CRT fn table before rebase).
+        assert!(is_stale_absolute_pointer(
+            0x8d3e40, image_base, image_end, no_modules
+        ));
+        // High ASLR image VA must NOT be cleared (CRT fn table before rebase),
+        // even though it sits in the high-ASLR band — it is not in the table.
         assert!(!is_stale_absolute_pointer(
             0x0000_7ff7_2537_1200,
             image_base,
-            image_end
+            image_end,
+            no_modules
         ));
         // Unaligned low-user constant left alone.
-        assert!(!is_stale_absolute_pointer(0x8d3e41, image_base, image_end));
+        assert!(!is_stale_absolute_pointer(
+            0x8d3e41, image_base, image_end, no_modules
+        ));
         // Mid-user unaligned Themida heap slot is cleared (6211e6c intent).
         assert!(is_stale_absolute_pointer(
             0x0000_2b99_2ddf_a232,
             image_base,
-            image_end
+            image_end,
+            no_modules
+        ));
+    }
+
+    #[test]
+    fn clears_stale_session_system_dll_pointers() {
+        // T0.7: keep_runtime_base product embedded the old session's ntdll
+        // base (0x7ffeeb426390); after ASLR re-bases ntdll on the next boot
+        // the fixed pointer AVs at startup (T0.5: RVA 0x112c10). The session
+        // module table captured at dump time must identify it as stale.
+        let image_base = 0x140000000u64;
+        let image_end = image_base + 0x19f000;
+        let session: &[SessionModuleRange] = &[
+            ("ntdll.dll".to_string(), 0x7ffeeb320000, 0x7ffeeb620000),
+            ("kernel32.dll".to_string(), 0x7ffa952a0000, 0x7ffa95370000),
+            ("urlmon.dll".to_string(), 0x7ff9f1000000, 0x7ff9f1400000),
+        ];
+        // Old-session ntdll base from the T0.5 evidence: inside ntdll range.
+        assert!(is_stale_absolute_pointer(
+            0x7ffeeb426390,
+            image_base,
+            image_end,
+            session
+        ));
+        // A kernel32 export address inside the captured range: stale too.
+        assert!(is_stale_absolute_pointer(
+            0x7ffa952a1000,
+            image_base,
+            image_end,
+            session
+        ));
+        // Range end is exclusive: one-past-end is NOT owned by the module.
+        assert!(!is_stale_absolute_pointer(
+            0x7ffeeb620000,
+            image_base,
+            image_end,
+            session
+        ));
+        // Base start is inclusive.
+        assert!(is_stale_absolute_pointer(
+            0x7ffeeb320000,
+            image_base,
+            image_end,
+            session
+        ));
+        // Module-name payload is ignored by the range check (shape-only).
+        assert!(matches_session_module(session, 0x7ff9f1234000));
+    }
+
+    #[test]
+    fn session_table_missing_or_non_matching_preserves_high_aslr() {
+        // T0.7: no session table (dump without module capture) or a value in
+        // the high-ASLR band not owned by any captured module must keep the
+        // historical behaviour — the pointer survives for rebase (Origin W1).
+        let image_base = 0x140000000u64;
+        let image_end = image_base + 0x19f000;
+        let empty: &[SessionModuleRange] = &[];
+        let other_session: &[SessionModuleRange] =
+            &[("user32.dll".to_string(), 0x7ff8_1234_0000, 0x7ff8_1235_0000)];
+        let old_ntdll = 0x7ffeeb426390u64;
+        let image_own_va = 0x0000_7ff7_2537_1200u64;
+
+        // No table → never clear the band (regression guard).
+        assert!(!is_stale_absolute_pointer(
+            old_ntdll, image_base, image_end, empty
+        ));
+        // Table present but the value is an image-own VA (not captured) → keep.
+        assert!(!is_stale_absolute_pointer(
+            image_own_va,
+            image_base,
+            image_end,
+            other_session
+        ));
+        // Table present but the old ntdll is not in *this* table → keep.
+        assert!(!is_stale_absolute_pointer(
+            old_ntdll,
+            image_base,
+            image_end,
+            other_session
+        ));
+        // Low user heap still cleared regardless of the session table.
+        assert!(is_stale_absolute_pointer(
+            0x8d3e40,
+            image_base,
+            image_end,
+            other_session
         ));
     }
 }

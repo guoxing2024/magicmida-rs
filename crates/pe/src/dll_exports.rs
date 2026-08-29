@@ -226,20 +226,93 @@ pub fn read_dll_exports(dll_path: &Path) -> HashMap<u16, String> {
     result
 }
 
-/// Try to find a DLL in common Windows system directories.
-pub fn find_system_dll(dll_name: &str) -> Option<std::path::PathBuf> {
-    let system_dirs = [
-        "C:\\Windows\\System32",
-        "C:\\Windows\\SysWOW64",
-        "C:\\Windows\\System",
-    ];
-
-    for dir in &system_dirs {
-        let path = std::path::Path::new(dir).join(dll_name);
+/// Try to find a DLL inside the given system search directories.
+///
+/// Pure helper: the directory list is a caller-supplied parameter (see
+/// [`system_dll_search_dirs`] for the Win32-derived candidate list) so this
+/// module stays OS-free and usable in offline/parsing contexts.
+pub fn find_system_dll(
+    dll_name: &str,
+    system_dirs: &[std::path::PathBuf],
+) -> Option<std::path::PathBuf> {
+    for dir in system_dirs {
+        let path = dir.join(dll_name);
         if path.exists() {
             return Some(path);
         }
     }
 
     None
+}
+
+/// Candidate Windows system-directory list, derived from the OS at runtime.
+///
+/// A general-purpose engine must not assume the Windows directory lives on
+/// `C:`, so the candidates are built from `GetWindowsDirectoryW` /
+/// `GetSystemDirectoryW` (native system dir + the 32-bit/legacy sibling
+/// directories that historically lived under the same Windows root):
+///
+/// 1. `GetSystemDirectoryW` result (e.g. `C:\Windows\System32`);
+/// 2. `<windows>\SysWOW64`;
+/// 3. `<windows>\System`.
+///
+/// On non-Windows, or when the API cannot be queried, the list is empty and
+/// the caller's miss path (a `warn!` at the call site) applies — never a
+/// silent fallback to a hard-coded drive.
+#[cfg(windows)]
+pub fn system_dll_search_dirs() -> Vec<std::path::PathBuf> {
+    use windows::Win32::System::SystemInformation::{GetSystemDirectoryW, GetWindowsDirectoryW};
+
+    fn query(dir_fn: unsafe fn(Option<&mut [u16]>) -> u32) -> Option<String> {
+        let mut buf = [0u16; 261]; // MAX_PATH + 1
+        let len = unsafe { dir_fn(Some(&mut buf)) };
+        if len == 0 || len as usize >= buf.len() {
+            return None;
+        }
+        Some(String::from_utf16_lossy(&buf[..len as usize]))
+    }
+
+    let mut dirs = Vec::with_capacity(3);
+    if let Some(system32) = query(GetSystemDirectoryW) {
+        dirs.push(std::path::PathBuf::from(system32));
+    }
+    if let Some(windows_dir) = query(GetWindowsDirectoryW) {
+        let windows_dir = std::path::PathBuf::from(windows_dir);
+        dirs.push(windows_dir.join("SysWOW64"));
+        dirs.push(windows_dir.join("System"));
+    }
+    dirs
+}
+
+/// Non-Windows build: no system directory can be queried; the caller's miss
+/// path applies (see [`find_system_dll`]).
+#[cfg(not(windows))]
+pub fn system_dll_search_dirs() -> Vec<std::path::PathBuf> {
+    Vec::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn find_system_dll_hits_an_existing_dir() {
+        let dir = std::env::temp_dir().join(format!("mida-dll-exports-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("fake.dll"), b"x").unwrap();
+        let dirs = vec![dir.clone(), std::env::temp_dir()];
+        let found = find_system_dll("fake.dll", &dirs);
+        assert_eq!(found, Some(dir.join("fake.dll")));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn find_system_dll_misses_when_absent_or_dirs_empty() {
+        let dir =
+            std::env::temp_dir().join(format!("mida-dll-exports-miss-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(find_system_dll("absent.dll", &[dir.clone()]), None);
+        assert_eq!(find_system_dll("anything.dll", &[]), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

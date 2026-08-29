@@ -642,6 +642,7 @@ mod tests {
             dump_timing: crate::DumpTiming::Immediate,
             section_content_reference: None,
             capture_policy: crate::DumpCapturePolicy::default(),
+            keep_runtime_base: false,
         }
     }
 

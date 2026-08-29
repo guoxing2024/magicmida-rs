@@ -339,6 +339,25 @@ pub struct DumpOptions {
     /// resolves to built-in AHK/GTO defaults; OreansClassic leaves capture empty
     /// (stages still gated by profile). Future: case manifest / plugin fill this.
     pub capture_policy: super::capture_policy::DumpCapturePolicy,
+
+    /// XC-6-A (XX-III grid 3/4): keep the runtime ASLR load base as the
+    /// rebuilt PE's ImageBase instead of restoring the on-disk preferred base.
+    ///
+    /// When `true`:
+    /// - `header_patch` does NOT restore the on-disk ImageBase (the runtime
+    ///   base stays, so every absolute address captured in the live image —
+    ///   which the loader already rebased to the runtime base — is
+    ///   self-consistent; rebasing back to the preferred base would require
+    ///   a relocation table the protector wiped, and the data sections are
+    ///   encrypted on disk so the original values are unrecoverable).
+    /// - `DYNAMIC_BASE` (ASLR) is cleared: the rebuilt image is fixed-base and
+    ///   therefore needs no `.reloc` directory.
+    ///
+    /// This is the XC-6-A strategy-B (fixed new base) for WinLicense/Oreans
+    /// DLLs whose `.reloc` is trivially stripped and whose data sections are
+    /// only plaintext at runtime. Default `false` preserves the historical
+    /// restore-to-preferred-base behaviour.
+    pub keep_runtime_base: bool,
 }
 
 #[cfg(test)]
