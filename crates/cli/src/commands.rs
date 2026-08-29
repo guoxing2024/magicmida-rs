@@ -90,9 +90,44 @@ pub fn run_command(cmd: Command) -> Result<(), anyhow::Error> {
             iat_location,
             oep_policy,
         ),
-        Command::DumpProcess { pid, unpacked_file } => {
-            crate::unpacker::dump_process_code(pid, &unpacked_file)
+        Command::DumpProcess {
+            pid,
+            unpacked_file,
+            module,
+        } => crate::unpacker::dump_process_code(pid, &unpacked_file, module.as_deref()),
+        Command::IatObserve { pid, module, out } => {
+            crate::unpacker::iat_observe::iat_observe(pid, module.as_deref(), out.as_deref())?;
+            Ok(())
         }
+        Command::DumpModule {
+            pid,
+            output,
+            module,
+            keep_runtime_base,
+            shrink,
+        } => crate::unpacker::dump_module_full(
+            pid,
+            &output,
+            module.as_deref(),
+            keep_runtime_base,
+            shrink,
+        ),
+        Command::RebaseFixed {
+            input,
+            output,
+            old_base,
+            new_base,
+        } => {
+            crate::unpacker::rebase_fixed(&input, &output, old_base, new_base)?;
+            Ok(())
+        }
+        Command::SessionClean {
+            input,
+            old_table,
+            new_table,
+            output,
+            report,
+        } => session_clean(&input, &old_table, &new_table, output.as_deref(), &report),
         Command::Verify {
             unpacked,
             reference,
@@ -1284,4 +1319,86 @@ mod tests {
         assert!(!prepared.cases[0].1.starts_with(&custom_root));
         let _ = std::fs::remove_dir_all(&root);
     }
+}
+
+/// T0.11 sidecar consumer entry: rewrite an old-session-bound PE artifact
+/// against the current session's module table.
+///
+/// Reads the artifact and both session tables, runs `cleanup_artifact`, and:
+/// * always writes a machine-readable JSON report (relocated / cleared /
+///   preserved counters, input/output sha256, table sizes);
+/// * when `output` is provided, writes the cleaned artifact; otherwise the
+///   pass is scan-only (report still emitted) so an operator can inspect the
+///   blast radius before mutating anything.
+fn session_clean(
+    input: &Path,
+    old_table: &Path,
+    new_table: &Path,
+    output: Option<&Path>,
+    report: &Path,
+) -> Result<(), anyhow::Error> {
+    use mida_pe::{cleanup_artifact, load_session_table, SessionTableEntry};
+
+    let input_bytes = std::fs::read(input)
+        .map_err(|e| anyhow::anyhow!("cannot read input {}: {e}", input.display()))?;
+    let pe = mida_pe::PeHeader::from_bytes(&input_bytes)
+        .map_err(|e| anyhow::anyhow!("cannot parse PE {}: {e}", input.display()))?;
+    let old: Vec<SessionTableEntry> = load_session_table(old_table)
+        .map_err(|e| anyhow::anyhow!("cannot load old session table: {e}"))?;
+    let new: Vec<SessionTableEntry> = load_session_table(new_table)
+        .map_err(|e| anyhow::anyhow!("cannot load current session table: {e}"))?;
+
+    let mut work = input_bytes.clone();
+    let stats = cleanup_artifact(&pe, &mut work, &old, &new);
+
+    if let Some(out) = output {
+        std::fs::write(out, &work)
+            .map_err(|e| anyhow::anyhow!("cannot write cleaned artifact: {e}"))?;
+    }
+
+    #[derive(serde::Serialize)]
+    struct SessionCleanReport<'a> {
+        schema_version: &'a str,
+        task: &'a str,
+        input: String,
+        input_sha256: String,
+        input_size: usize,
+        old_table_entries: usize,
+        new_table_entries: usize,
+        output: Option<String>,
+        output_sha256: Option<String>,
+        scan_only: bool,
+        stats: mida_pe::CleanupStats,
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(bytes);
+        let d = h.finalize();
+        d.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    let out_sha = output
+        .as_ref()
+        .map(|_| sha256_hex(&work))
+        .or_else(|| Some(sha256_hex(&input_bytes)));
+    let rep = SessionCleanReport {
+        schema_version: "mida.session-clean/v1",
+        task: "T0.11 sidecar consumer",
+        input: input.display().to_string(),
+        input_sha256: sha256_hex(&input_bytes),
+        input_size: input_bytes.len(),
+        old_table_entries: old.len(),
+        new_table_entries: new.len(),
+        output: output.map(|p| p.display().to_string()),
+        output_sha256: out_sha,
+        scan_only: output.is_none(),
+        stats,
+    };
+    let text = serde_json::to_string_pretty(&rep)
+        .map_err(|e| anyhow::anyhow!("cannot serialize session-clean report: {e}"))?;
+    std::fs::write(report, text)
+        .map_err(|e| anyhow::anyhow!("cannot write session-clean report: {e}"))?;
+    Ok(())
 }

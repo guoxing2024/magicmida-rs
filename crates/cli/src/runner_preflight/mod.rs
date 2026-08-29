@@ -116,14 +116,20 @@ pub use producer::{
 // pub(crate) re-exports: internal cross-module / test-seam symbols keep the
 // `crate::runner_preflight::X` spelling working (WO-19 split; not part of the
 // public surface).
+pub(crate) use launch_gate::{is_64_hex, sha256_hex};
+// Test-seam re-exports consumed by runner_preflight_tests.rs / sample_snapshot
+// tests via `use super::*` / `crate::runner_preflight::X`. Guarded with
+// #[cfg(test)] so the production lib target stays free of unused-import
+// warnings while the test targets keep the spellings.
+#[cfg(test)]
 pub(crate) use envelope::{canonical_case_entry, case_set_digest};
-pub(crate) use launch_gate::verify_gto_sealed_root_matches;
+#[cfg(test)]
 pub(crate) use launch_gate::{
-    enforce_gto_snapshot_path_binding, is_64_hex, is_64_lower_hex, pe_evidence_command_for_family,
-    protected_input_for_evidence, rerun_verifier, sha256_hex, sidecar_path,
-    verify_bundle_verifier_identity, verify_verifier_identity,
+    enforce_gto_snapshot_path_binding, is_64_lower_hex, pe_evidence_command_for_family,
+    profile_for_case, protected_input_for_evidence, rerun_verifier, sidecar_path,
+    snapshot_root_of_snapshot, verify_bundle_verifier_identity, verify_gto_sealed_root_matches,
+    verify_verifier_identity,
 };
-pub(crate) use launch_gate::{profile_for_case, snapshot_root_of_snapshot};
 pub(crate) use producer::{
     check_chain_ready, maybe_record_verifier_spawn, maybe_test_launch_stop,
     note_sample_launch_attempted, verified_verifier_for_spawn,

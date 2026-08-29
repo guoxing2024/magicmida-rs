@@ -589,8 +589,9 @@ mod tests {
         // Directly prove the discriminator is the file's real SHA-256, not the
         // path/name: a file with the ORIGIN identity bytes must be flagged.
         // (The real locked bytes are 5MB+; here we assert the resolver keys on
-        // the SHA constant, which is the exact logic used at launch.)
-        let origin_sha = crate::origin_pure::ORIGIN_MACRO_PROTECTED_SHA256;
+        // the manifest-declared SHA, which is the exact logic used at launch.)
+        let origin_sha = crate::origin_pure::origin_macro_protected_sha256()
+            .expect("embedded origin_macro manifest");
         assert_eq!(origin_sha.len(), 64);
         assert_ne!(
             origin_sha.to_lowercase(),

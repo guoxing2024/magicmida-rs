@@ -147,7 +147,7 @@ pub fn print_help() {
     println!("COMMANDS:");
     println!("  /unpack <file> [options]           Themida-oriented unpack");
     println!("  /generic-unpack <file> [options]   Packer-agnostic full dump (no shrink)");
-    println!("  /dump-process <pid> <file>         Dump .text from running process");
+    println!("  /dump-process <pid> <file> [--module=<name>]  Dump .text from running process (optionally a loaded module)");
     println!("  /verify <unpacked> <ref>           Verify against reference");
     println!("  /offline-preflight <dir> [options] Emit runner-config envelope and run the");
     println!("                                    independent offline preflight gate");
@@ -158,7 +158,7 @@ pub fn print_help() {
     println!("  --stable <N>            Stable polls required (default 2)");
     println!("  --gate-profile <P>      Gate profile: packer-agnostic (default) | ahk-launcher");
     println!("  --iat-location <VA,SZ>  Override runtime IAT table (absolute VA,size);");
-    println!("                          e.g. 0x14013F1E8,0x200 (packers wipe the IAT dir)");
+    println!("                          e.g. 0x140000000,0x200 (generic PE32+ image-base example; packers wipe the IAT dir)");
     println!("  -v, --verbose           Debug logging");
     println!();
     println!("THEMIDA UNPACK OPTIONS:");

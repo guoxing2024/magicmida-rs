@@ -64,6 +64,64 @@ pub enum Command {
     DumpProcess {
         pid: u32,
         unpacked_file: PathBuf,
+        /// Optional module-name filter: dump the `.text` of a loaded module
+        /// whose base name contains this substring (default = process main
+        /// module). XC-3-A: enables dumping a protected DLL decrypted in a
+        /// real LoadLibrary host.
+        module: Option<String>,
+    },
+    /// XC-5 (XX-III grid 2/4): observe a loaded module's runtime IAT —
+    /// loader-direct resolution vs VM thunks — plus .edata snapshot.
+    IatObserve {
+        pid: u32,
+        /// Optional module-name filter (default = process main module).
+        module: Option<String>,
+        /// Optional JSON report output path.
+        out: Option<PathBuf>,
+    },
+    /// XC-6 (XX-III grid 3/4): full-image dump of a loaded module in a
+    /// running process (ReadOnlyProcessDebugger + dump_process pipeline).
+    /// `--keep-runtime-base` fixes the rebuilt PE's ImageBase to the runtime
+    /// ASLR base (strategy B) instead of restoring the on-disk preferred base.
+    DumpModule {
+        pid: u32,
+        output: PathBuf,
+        module: Option<String>,
+        keep_runtime_base: bool,
+        shrink: bool,
+    },
+    /// XC-7-A (XX-III grid 4/4 prep): strip Themida shell sections and
+    /// rebase a fixed-base candidate to a private low address.
+    ///
+    /// Reads a candidate PE (already dumped at its runtime base), removes
+    /// `.winlice`/`.boot` shell sections (shrink), rewrites the ImageBase to
+    /// `--new-base`, and re-runs hardcoded-address fixup so every absolute
+    /// reference captured at the old runtime base is rewritten to the new
+    /// private base. Clears DYNAMIC_BASE (fixed image). A static self-check
+    /// fails if any stale old-base reference remains.
+    RebaseFixed {
+        input: PathBuf,
+        output: PathBuf,
+        /// Old runtime base captured in the candidate's absolute references.
+        old_base: u64,
+        /// New private base (e.g. 0x1D00000000), avoiding system/EXE ranges.
+        new_base: u64,
+    },
+    /// T0.11 sidecar consumer: rewrite an old-session-bound PE artifact
+    /// against the current session's module table (consume the
+    /// `<output>.session_modules.json` sidecar T0.7 archives). Old-session
+    /// module pointers are relocated onto the current session's ASLR layout
+    /// by module name + intra-module offset; unmappable ones are zeroed.
+    SessionClean {
+        input: PathBuf,
+        /// Old-session module table (`mida.session-modules/v1`).
+        old_table: PathBuf,
+        /// Current-session module table (`mida.session-modules/v1`).
+        new_table: PathBuf,
+        /// Cleaned artifact; absent = scan-only (report stats, no rewrite).
+        output: Option<PathBuf>,
+        /// Cleanup report JSON path.
+        report: PathBuf,
     },
     Verify {
         unpacked: PathBuf,
@@ -103,6 +161,10 @@ pub fn parse_args() -> Result<Command, String> {
             parse_generic(&args)
         }
         "/dump-process" | "--dump-process" | "dump-process" => parse_dump_process(&args),
+        "/iat-observe" | "--iat-observe" | "iat-observe" => parse_iat_observe(&args),
+        "/dump-module" | "--dump-module" | "dump-module" => parse_dump_module(&args),
+        "/rebase-fixed" | "--rebase-fixed" | "rebase-fixed" => parse_rebase_fixed(&args),
+        "/session-clean" | "--session-clean" | "session-clean" => parse_session_clean(&args),
         "/verify" | "--verify" | "verify" => parse_verify(&args),
         "/offline-preflight" | "--offline-preflight" | "offline-preflight" => {
             parse_offline_preflight(&args)
@@ -407,7 +469,8 @@ fn parse_generic(args: &[String]) -> Result<Command, String> {
                 gate_profile = parse_gate_profile(&args[i])?;
             }
             // Optional runtime IAT override: absolute virtual address, size.
-            // Format: --iat-location=0x14013F1E8,0x200 or "140013F1E8,512".
+            // Format: --iat-location=0x140000000,0x200 or "536870912000,512".
+            // (0x140000000 is a generic PE32+ image-base example placeholder.)
             other if other.starts_with("--iat-location=") => {
                 let v = &other["--iat-location=".len()..];
                 iat_location = Some(parse_iat_location(v)?);
@@ -457,13 +520,14 @@ fn parse_generic(args: &[String]) -> Result<Command, String> {
 /// Accepts decimal or 0x-prefixed hex for both fields.
 fn parse_iat_location(s: &str) -> Result<(usize, usize), String> {
     let (va_s, size_s) = s.split_once(',').ok_or_else(|| {
-        format!("invalid --iat-location '{s}' (expected VA,size e.g. 0x14013F1E8,0x200)")
+        format!("invalid --iat-location '{s}' (expected VA,size e.g. 0x140000000,0x200 — generic PE32+ image-base example)")
     })?;
     let parse_num = |v: &str| -> Result<usize, String> {
         if let Some(hex) = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
             usize::from_str_radix(hex, 16).map_err(|_| format!("invalid hex number '{v}'"))
         } else {
-            v.parse::<usize>().map_err(|_| format!("invalid number '{v}'"))
+            v.parse::<usize>()
+                .map_err(|_| format!("invalid number '{v}'"))
         }
     };
     let va = parse_num(va_s.trim())?;
@@ -476,15 +540,184 @@ fn parse_iat_location(s: &str) -> Result<(usize, usize), String> {
 
 fn parse_dump_process(args: &[String]) -> Result<Command, String> {
     if args.len() < 4 {
-        return Err("Usage: mida-cli /dump-process <pid> <unpacked-file>".into());
+        return Err("Usage: mida-cli /dump-process <pid> <unpacked-file> [--module=<name>]".into());
     }
     let pid: u32 = args[2]
         .parse()
         .map_err(|_| format!("Invalid PID: {}", args[2]))?;
+    let mut unpacked_file: Option<PathBuf> = None;
+    let mut module: Option<String> = None;
+    for a in &args[3..] {
+        if let Some(v) = a.strip_prefix("--module=") {
+            module = Some(v.to_string());
+        } else if unpacked_file.is_none() {
+            unpacked_file = Some(PathBuf::from(a));
+        } else {
+            return Err(format!("Unexpected argument: {a}"));
+        }
+    }
+    let Some(unpacked_file) = unpacked_file else {
+        return Err("Usage: mida-cli /dump-process <pid> <unpacked-file> [--module=<name>]".into());
+    };
     Ok(Command::DumpProcess {
         pid,
-        unpacked_file: PathBuf::from(&args[3]),
+        unpacked_file,
+        module,
     })
+}
+
+fn parse_iat_observe(args: &[String]) -> Result<Command, String> {
+    if args.len() < 3 {
+        return Err("Usage: mida-cli /iat-observe <pid> [--module=<name>] [--out=<json>]".into());
+    }
+    let pid: u32 = args[2]
+        .parse()
+        .map_err(|_| format!("Invalid PID: {}", args[2]))?;
+    let mut module: Option<String> = None;
+    let mut out: Option<PathBuf> = None;
+    for a in &args[3..] {
+        if let Some(v) = a.strip_prefix("--module=") {
+            module = Some(v.to_string());
+        } else if let Some(v) = a.strip_prefix("--out=") {
+            out = Some(PathBuf::from(v));
+        } else {
+            return Err(format!("Unexpected argument: {a}"));
+        }
+    }
+    Ok(Command::IatObserve { pid, module, out })
+}
+
+fn parse_dump_module(args: &[String]) -> Result<Command, String> {
+    if args.len() < 4 {
+        return Err(
+            "Usage: mida-cli /dump-module <pid> <output> [--module=<name>] [--keep-runtime-base]"
+                .into(),
+        );
+    }
+    let pid: u32 = args[2]
+        .parse()
+        .map_err(|_| format!("Invalid PID: {}", args[2]))?;
+    let mut output: Option<PathBuf> = None;
+    let mut module: Option<String> = None;
+    let mut keep_runtime_base = false;
+    let mut shrink = false;
+    for a in &args[3..] {
+        if let Some(v) = a.strip_prefix("--module=") {
+            module = Some(v.to_string());
+        } else if a == "--keep-runtime-base" {
+            keep_runtime_base = true;
+        } else if a == "--shrink" {
+            shrink = true;
+        } else if output.is_none() {
+            output = Some(PathBuf::from(a));
+        } else {
+            return Err(format!("Unexpected argument: {a}"));
+        }
+    }
+    let Some(output) = output else {
+        return Err(
+            "Usage: mida-cli /dump-module <pid> <output> [--module=<name>] [--keep-runtime-base]"
+                .into(),
+        );
+    };
+    Ok(Command::DumpModule {
+        pid,
+        output,
+        module,
+        keep_runtime_base,
+        shrink,
+    })
+}
+
+fn parse_session_clean(args: &[String]) -> Result<Command, String> {
+    if args.len() < 3 {
+        return Err(
+            "Usage: mida-cli /session-clean <input> --old-table=<path> --new-table=<path> [--output=<path>] [--report=<path>]".into(),
+        );
+    }
+    let input = PathBuf::from(&args[2]);
+    let mut old_table: Option<PathBuf> = None;
+    let mut new_table: Option<PathBuf> = None;
+    let mut output: Option<PathBuf> = None;
+    let mut report: Option<PathBuf> = None;
+    for a in &args[3..] {
+        if let Some(v) = a.strip_prefix("--old-table=") {
+            old_table = Some(PathBuf::from(v));
+        } else if let Some(v) = a.strip_prefix("--new-table=") {
+            new_table = Some(PathBuf::from(v));
+        } else if let Some(v) = a.strip_prefix("--output=") {
+            output = Some(PathBuf::from(v));
+        } else if let Some(v) = a.strip_prefix("--report=") {
+            report = Some(PathBuf::from(v));
+        } else {
+            return Err(format!("Unexpected argument: {a}"));
+        }
+    }
+    let (Some(old_table), Some(new_table)) = (old_table, new_table) else {
+        return Err(
+            "Usage: mida-cli /session-clean <input> --old-table=<path> --new-table=<path> [--output=<path>] [--report=<path>]".into(),
+        );
+    };
+    let report = report.unwrap_or_else(|| {
+        let mut r = input.clone();
+        r.set_extension("session_clean_report.json");
+        r
+    });
+    Ok(Command::SessionClean {
+        input,
+        old_table,
+        new_table,
+        output,
+        report,
+    })
+}
+
+fn parse_rebase_fixed(args: &[String]) -> Result<Command, String> {
+    if args.len() < 4 {
+        return Err(
+            "Usage: mida-cli /rebase-fixed <input> <output> --old-base=<0x..> --new-base=<0x..>"
+                .into(),
+        );
+    }
+    let input = PathBuf::from(&args[2]);
+    let mut output: Option<PathBuf> = None;
+    let mut old_base: Option<u64> = None;
+    let mut new_base: Option<u64> = None;
+    for a in &args[3..] {
+        if let Some(v) = a.strip_prefix("--old-base=") {
+            old_base = Some(parse_hex64(v)?);
+        } else if let Some(v) = a.strip_prefix("--new-base=") {
+            new_base = Some(parse_hex64(v)?);
+        } else if output.is_none() {
+            output = Some(PathBuf::from(a));
+        } else {
+            return Err(format!("Unexpected argument: {a}"));
+        }
+    }
+    let (Some(output), Some(old_base), Some(new_base)) = (output, old_base, new_base) else {
+        return Err(
+            "Usage: mida-cli /rebase-fixed <input> <output> --old-base=<0x..> --new-base=<0x..>"
+                .into(),
+        );
+    };
+    if new_base == 0 || new_base % 0x10000 != 0 {
+        return Err("new-base must be non-zero and 64KiB-aligned".into());
+    }
+    Ok(Command::RebaseFixed {
+        input,
+        output,
+        old_base,
+        new_base,
+    })
+}
+
+fn parse_hex64(s: &str) -> Result<u64, String> {
+    let t = s.trim();
+    let t = t
+        .strip_prefix("0x")
+        .or_else(|| t.strip_prefix("0X"))
+        .unwrap_or(t);
+    u64::from_str_radix(t, 16).map_err(|_| format!("invalid hex value '{s}'"))
 }
 
 fn parse_verify(args: &[String]) -> Result<Command, String> {
